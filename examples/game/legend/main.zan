@@ -2049,6 +2049,11 @@ class LegendApp {
         if (actMode) {
             return LegendApp.ActionRun(app);
         }
+        // 自拍模式(无头抓真实渲染画面成 BMP,给你"看")
+        bool shotMode = (LegendApp.SysGetenv("LEGEND_SHOT") == "1");
+        if (shotMode) {
+            return LegendApp.ShotRun(app);
+        }
         // 模拟模式
         bool simMode = (LegendApp.SysGetenv("LEGEND_SIM") == "1");
         if (simMode) {
@@ -2413,5 +2418,88 @@ class LegendApp {
         }
         if (g.p.cardMaskLen < 30) { log.WriteLine("!! [" + tag + "] cardMask 位宽不足(仅 " + g.p.cardMaskLen + " 字,需 30 字覆盖 960 位)"); bad = true; }
         return !bad;
+    }
+
+    // 自拍模式:把真实渲染画面抓成 BMP 给你"看"(无头 SDL dummy 驱动 + ReadPixels 回读)。
+    // 流程:富档 → 逐面板 DrawAll → Present 提交后备缓冲 → ReadPixels 读回 RGBA → 写 24 位 BMP。
+    static int ShotRun(LegendApp app) {
+        Game g = app.g;
+        g.NewGame("SHOT", 0);
+        g.AutoEquipBest();
+        LegendApp.TourPrep(app);
+        // 富档一点,画面更"满"
+        for (int i = 0; i < 60; i = i + 1) {
+            Item it = Item.New(i % Data.SLOT_COUNT, i % 5, 1 + (i % 15), i % 8, (i * 7 + 3) % 997);
+            g.AddToBag(it);
+        }
+        g.AutoEquipBest();
+        for (int c = 0; c < Data.CUR_COUNT; c = c + 1) { g.p.cur[c] = 1000000000L; }
+        g.p.vip = 3; g.p.nobleTier = 2; g.p.turn = 2; g.p.xbTickets = 12;
+        g.p.altarMyProg = 3333; g.p.cityOwned = 0;
+        for (int i = 0; i < 5; i = i + 1) { g.p.wuxingMs[i] = 1234567L * (i + 1); }
+        for (int i = 0; i < g.p.cardMaskLen; i = i + 1) { g.p.cardMask[i] = 0x55555555; }
+
+        int[] shots = new int[8];
+        shots[0] = -1; shots[1] = 1; shots[2] = 4; shots[3] = 9;
+        shots[4] = 19; shots[5] = 23; shots[6] = 27; shots[7] = 31;
+        string[] names = new string[8];
+        names[0] = "main"; names[1] = "bosshome"; names[2] = "xunbao"; names[3] = "jiangxing";
+        names[4] = "worldboss"; names[5] = "tower"; names[6] = "map"; names[7] = "classselect";
+        for (int k = 0; k < 8; k = k + 1) {
+            app.modal = shots[k];
+            app.modalSub = 0;
+            app.DrawAll();
+            app.r.Present();
+            string path = "build/legend_shot_" + names[k] + ".bmp";
+            LegendApp.DumpBmp(app.r, path);
+            Console.WriteLine("SHOT " + names[k] + " -> " + path);
+        }
+        Console.WriteLine("=== SHOT OK ===");
+        return 0;
+    }
+
+    // 把 SDL 后备缓冲读成 24 位 BMP(仿 ra2 的 DumpScreen)
+    static void DumpBmp(SdlRenderer r, string path) {
+        int packed = r.OutputSize();
+        int w = packed & 0xFFFF;
+        int h = (packed >> 16) & 0xFFFF;
+        if (w <= 0 || h <= 0) { return; }
+        byte[] rgba = new byte[w * h * 4];
+        if (!r.ReadPixels(rgba, w, h)) { return; }
+        int rowBytes = w * 3;
+        int pad = (4 - (rowBytes % 4)) % 4;
+        int imageBytes = (rowBytes + pad) * h;
+        byte[] bmp = new byte[54 + imageBytes];
+        bmp[0] = (byte)0x42; bmp[1] = (byte)0x4D;
+        LegendApp.PutU32(bmp, 2, 54 + imageBytes);
+        LegendApp.PutU32(bmp, 10, 54);
+        LegendApp.PutU32(bmp, 14, 40);
+        LegendApp.PutI32(bmp, 18, w);
+        LegendApp.PutI32(bmp, 22, h);
+        bmp[26] = (byte)1; bmp[28] = (byte)24;
+        for (int y = 0; y < h; y = y + 1) {
+            int dstRow = 54 + y * (rowBytes + pad);
+            int srcRow = (h - 1 - y) * w * 4;
+            for (int x = 0; x < w; x = x + 1) {
+                int o = srcRow + x * 4;
+                bmp[dstRow + x * 3] = rgba[o + 2];
+                bmp[dstRow + x * 3 + 1] = rgba[o + 1];
+                bmp[dstRow + x * 3 + 2] = rgba[o];
+            }
+        }
+        System.IO.File.WriteAllBytes(path, bmp);
+    }
+
+    static void PutU32(byte[] b, int at, int v) {
+        b[at] = (byte)(v & 0xFF);
+        b[at + 1] = (byte)((v >> 8) & 0xFF);
+        b[at + 2] = (byte)((v >> 16) & 0xFF);
+        b[at + 3] = (byte)((v >> 24) & 0xFF);
+    }
+    static void PutI32(byte[] b, int at, int v) {
+        b[at] = (byte)(v & 0xFF);
+        b[at + 1] = (byte)((v >> 8) & 0xFF);
+        b[at + 2] = (byte)((v >> 16) & 0xFF);
+        b[at + 3] = (byte)((v >> 24) & 0xFF);
     }
 }
