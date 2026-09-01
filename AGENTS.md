@@ -1,9 +1,22 @@
 # AGENTS.md
 
+
 Guidance for humans and AI agents (Devin, Copilot, etc.) working in this repo.
 **Read this before creating files.** The full rules live in
 [`docs/WORKSPACE_CONVENTIONS.md`](docs/WORKSPACE_CONVENTIONS.md); this file is the
 short, enforceable summary.
+
+## AI 编码八荣八耻（行为守则，所有会话始终遵守）
+
+以瞎猜接口为耻，以认真查询为荣
+以模糊执行为耻，以寻求确认为荣
+以臆想业务为耻，以人类确认为荣
+以创造接口为耻，以复用现有为荣
+以跳过验证为耻，以主动测试为荣
+以破坏架构为耻，以遵循规范为荣
+以假装理解为耻，以诚实无知为荣
+以盲目修改为耻，以谨慎重构为荣
+以低阶模型为耻，以深度思考为荣
 
 ## Directory map — where things go
 
@@ -94,10 +107,21 @@ ZanIDE禁止任何自绘必须全部用标准库组件来完成
     `git stash`/`push`/`pop`/`apply`, run `git status` — if the tree holds
     another session's in-flight edits or untracked files, isolate your own work
     with a targeted path spec (`git stash push -- <paths>`) or use a separate
-    `git worktree`; never pop a stale snapshot over a newer HEAD. If a pop
-    conflicts, resolve by keeping the newer **committed** content and re-applying
-    only genuinely new work — never stage a bulk diff that deletes already
-    committed features.
+    `git worktree`; never pop a stale snapshot over a newer HEAD.
+    **Conflicts are repaired, never rolled back or discarded.** Hitting UU index
+    entries, `<<<<<<<` markers, or concurrent edits to the same files means two
+    lines of work must be **merged by hand**: for each conflicted file compare
+    both sides (`git show :2:<file>` = committed/HEAD side, `:3:<file>` =
+    in-flight side) against HEAD, keep committed features unconditionally, fold
+    in genuinely new work from the other side, verify with the affected test
+    tier, resolve **every** UU entry, and commit. Making the conflict "go away"
+    is forbidden — no bulk one-sided resolves (`git checkout --ours/--theirs .`,
+    `git checkout .`), no `git reset --hard`, no deleting the file or copying an
+    older version over it: all of those silently revert committed features and
+    read as a mass-revert. Drop one side only after proving it is a stale
+    duplicate of already-committed content (evidence: HEAD grep / blob compare).
+    Do not leave unresolved conflicts or markers for the next session. Full
+    procedure: `docs/WORKSPACE_CONVENTIONS.md` §9.1.
 
 ## Build / dev quickstart
 
