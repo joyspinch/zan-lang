@@ -3362,7 +3362,17 @@ void zan_co_ready(void *frame, zan_co_step_t step) {
     for (;;) {
         long long s = __atomic_load_n(&h->sched, __ATOMIC_ACQUIRE);
         if (s & CO_DEAD) return;                 /* frame is being released */
-        if (s & CO_QUEUED) return;               /* already queued: dedup */
+        /* QUEUED dedup: dropping a second ready while one task is already in
+         * flight is safe because a frame has exactly ONE step. The compiler
+         * passes the frame's unique $resume (state dispatch happens inside
+         * it) at every zan_co_ready site; the timer and gate waiters store
+         * the (frame, step) pair handed to them, which is that same $resume.
+         * Wakeups issued on behalf of ANOTHER frame carry that other frame's
+         * handle, so they never collide here. A reaper/complete wakeup that
+         * targets a running frame lands in the CO_RUNNING branch below and
+         * banks the step instead. There is therefore never a second, different
+         * step to lose -- only a redundant wake of the same one. */
+        if (s & CO_QUEUED) return;
         if (s & CO_RUNNING) {
             /* Readied while it runs (an IO completion racing the step that
              * issued the next op). Bank the resume step; the worker running
