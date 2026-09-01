@@ -283,6 +283,7 @@ static void da_expr(struct da_ctx *c, zan_ast_node_t *n) {
 
     case AST_NEW_EXPR:
         da_call_args(c, &n->new_expr.args);
+        da_call_args(c, &n->new_expr.arg_inits);
         return;
 
     case AST_MEMBER_ACCESS:

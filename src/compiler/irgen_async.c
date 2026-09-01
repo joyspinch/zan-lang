@@ -553,6 +553,9 @@ static bool anf_expr_contains_await(zan_ast_node_t *e) {
     case AST_NEW_EXPR: {
         for (int i = 0; i < e->new_expr.args.count; i++)
             if (anf_expr_contains_await(e->new_expr.args.items[i])) return true;
+        for (int i = 0; i < e->new_expr.arg_inits.count; i++)
+            if (anf_expr_contains_await(e->new_expr.arg_inits.items[i]))
+                return true;
         return false;
     }
     case AST_COLL_INIT: {
@@ -746,6 +749,8 @@ static zan_ast_node_t *anf_expr(anf_ctx_t *c, zan_ast_node_t *e) {
         }
         for (int i = 0; i < e->new_expr.args.count; i++)
             e->new_expr.args.items[i] = anf_expr(c, e->new_expr.args.items[i]);
+        for (int i = 0; i < e->new_expr.arg_inits.count; i++)
+            e->new_expr.arg_inits.items[i] = anf_expr(c, e->new_expr.arg_inits.items[i]);
         return e;
     case AST_COLL_INIT:
         for (int i = 0; i < e->coll_init.items.count; i++) {
@@ -1067,6 +1072,8 @@ static void async_scan_expr(async_scan_t *s, zan_ast_node_t *e) {
     case AST_NEW_EXPR:
         for (int i = 0; i < e->new_expr.args.count; i++)
             async_scan_expr(s, e->new_expr.args.items[i]);
+        for (int i = 0; i < e->new_expr.arg_inits.count; i++)
+            async_scan_expr(s, e->new_expr.arg_inits.items[i]);
         break;
     case AST_COLL_INIT:
         for (int i = 0; i < e->coll_init.items.count; i++)

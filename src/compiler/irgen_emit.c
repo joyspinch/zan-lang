@@ -1727,6 +1727,8 @@ static void tp_scan_expr(tp_use_scan_t *s, zan_ast_node_t *e) {
     case AST_NEW_EXPR:
         for (int i = 0; i < e->new_expr.args.count; i++)
             tp_scan_expr(s, e->new_expr.args.items[i]);
+        for (int i = 0; i < e->new_expr.arg_inits.count; i++)
+            tp_scan_expr(s, e->new_expr.arg_inits.items[i]);
         return;
     case AST_CAST_EXPR:  tp_scan_expr(s, e->cast.expr); return;
     case AST_IS_EXPR:

@@ -422,6 +422,7 @@ static void collect_shadows(nr_ctx_t *c, zan_ast_node_t *n) {
         break;
     case AST_NEW_EXPR:
         collect_shadows_list(c, &n->new_expr.args);
+        collect_shadows_list(c, &n->new_expr.arg_inits);
         break;
     case AST_CONDITIONAL:
         collect_shadows(c, n->conditional.cond);
@@ -641,6 +642,7 @@ static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
     case AST_NEW_EXPR:
         nr_walk(c, n->new_expr.type, ns, usings);
         nr_walk_list(c, &n->new_expr.args, ns, usings);
+        nr_walk_list(c, &n->new_expr.arg_inits, ns, usings);
         break;
 
     case AST_CAST_EXPR:

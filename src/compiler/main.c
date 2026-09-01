@@ -884,7 +884,12 @@ static void dump_ast_node(zan_ast_node_t *node, int depth) {
     case AST_NEW_EXPR:
         printf("NewExpr\n");
         dump_ast_node(node->new_expr.type, depth + 1);
+        if (node->new_expr.call_init) {
+            printf("%*scall_init:\n", depth * 2 + 2, "");
+            dump_ast_node(node->new_expr.call_init, depth + 2);
+        }
         dump_list("args", &node->new_expr.args, depth + 1);
+        dump_list("arg_inits", &node->new_expr.arg_inits, depth + 1);
         break;
 
     case AST_CONDITIONAL:
