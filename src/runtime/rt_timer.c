@@ -168,7 +168,12 @@ unsigned char *zan_rt_soft_scratch(void) { return g_soft_scratch; }
 
 /* One message per site per process: the same null field hit in a loop would
  * otherwise append an entry per iteration. Pointer identity of the compiler-
- * emitted global string is the site identity. */
+ * emitted global string is the site identity.
+ *
+ * Called with the timer lock held (the note/report entry points take it
+ * around zan_soft_seen): soft reports can fire on any worker thread under
+ * --async-workers, and the count+store was an unsynchronized RMW that could
+ * drop or corrupt entries -- worst case two threads store past index 255. */
 static int zan_soft_seen(const char *text) {
     for (int i = 0; i < g_soft_seen_count; i++)
         if (g_soft_seen[i] == text) return 1;

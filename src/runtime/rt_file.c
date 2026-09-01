@@ -191,37 +191,80 @@ long long zan_file_length(const char *path) {
  * create it next to itself, not inside a cache the next publish replaces. */
 
 /* The directory the running executable lives in ("" when it cannot be
- * determined), cached after the first call. */
+ * determined), cached after the first call.
+ *
+ * Workers call this concurrently (every relative-read fallback resolves
+ * through it), so the naive `static int resolved` was a race: thread B could
+ * observe resolved==1 while thread A was still mid-copy into `dir`, and read
+ * a half-written path. The flag is now a store-release / load-acquire pair:
+ * B either sees the flag clear and resolves on its own thread (double work,
+ * never a torn read -- `dir` is only read once the flag is acquired), or
+ * sees it set together with the complete copy. Resolving twice yields the
+ * same bytes (GetModuleFileNameA is stable for a running exe), so both
+ * writers produce identical content.
+ *
+ * stdatomic.h cannot be used here: MSVC's C11 mode gates C11 atomics behind
+ * an /experimental flag this project does not set. The same handshake is
+ * spelled with Interlocked* (the runtime's usual idiom, also what rt_sync.c
+ * uses) on Windows and __atomic_* builtins elsewhere; wasm is single-threaded
+ * and keeps plain accesses. */
+#if defined(_WIN32)
+static volatile LONG g_appdir_resolved;
+#elif defined(__wasm__)
+static int g_appdir_resolved;   /* single-threaded target */
+#else
+static volatile int g_appdir_resolved;
+#endif
+
 const char *zan_file_app_dir(void) {
     static char dir[4096];
-    static int resolved = 0;
-    if (resolved) return dir;
-    resolved = 1;
-    const char *env = getenv("ZAN_APP_DIR");
-    if (env && env[0] && strlen(env) < sizeof(dir)) {
-        memcpy(dir, env, strlen(env) + 1);
-        return dir;
-    }
-    char exe[4096];
-    exe[0] = 0;
-#ifdef _WIN32
-    DWORD n = GetModuleFileNameA(NULL, exe, (DWORD)sizeof(exe));
-    if (n == 0 || n >= sizeof(exe)) exe[0] = 0;
-#elif defined(__APPLE__)
-    uint32_t cap = (uint32_t)sizeof(exe);
-    if (_NSGetExecutablePath(exe, &cap) != 0) exe[0] = 0;
-#elif defined(__linux__)
-    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
-    if (n <= 0) exe[0] = 0;
-    else exe[n] = 0;
+#if defined(_WIN32)
+    if (InterlockedCompareExchangeAcquire(&g_appdir_resolved, 0, 0)) return dir;
+#elif defined(__wasm__)
+    if (g_appdir_resolved) return dir;
+#else
+    if (__atomic_load_n(&g_appdir_resolved, __ATOMIC_ACQUIRE)) return dir;
 #endif
-    if (!exe[0]) return dir;
-    char *fwd = strrchr(exe, '/');
-    char *back = strrchr(exe, '\\');
-    char *sep = fwd > back ? fwd : back;
-    if (!sep || sep == exe) return dir;
-    *sep = 0;
-    if (strlen(exe) < sizeof(dir)) memcpy(dir, exe, strlen(exe) + 1);
+    const char *env = getenv("ZAN_APP_DIR");
+    char local[4096];
+    local[0] = '\0';
+    if (env && env[0] && strlen(env) < sizeof(local)) {
+        memcpy(local, env, strlen(env) + 1);
+    } else {
+        char exe[4096];
+        exe[0] = 0;
+#ifdef _WIN32
+        DWORD n = GetModuleFileNameA(NULL, exe, (DWORD)sizeof(exe));
+        if (n == 0 || n >= sizeof(exe)) exe[0] = 0;
+#elif defined(__APPLE__)
+        uint32_t cap = (uint32_t)sizeof(exe);
+        if (_NSGetExecutablePath(exe, &cap) != 0) exe[0] = 0;
+#elif defined(__linux__)
+        ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+        if (n <= 0) exe[0] = 0;
+        else exe[n] = 0;
+#endif
+        if (exe[0]) {
+            char *fwd = strrchr(exe, '/');
+            char *back = strrchr(exe, '\\');
+            char *sep = fwd > back ? fwd : back;
+            if (sep && sep != exe) {
+                *sep = 0;
+                if (strlen(exe) < sizeof(local))
+                    memcpy(local, exe, strlen(exe) + 1);
+            }
+        }
+    }
+    /* only the winning writer publishes; latecomers overwrite with identical
+     * bytes, so a reader can never observe a torn or mixed path */
+    memcpy(dir, local, strlen(local) + 1);
+#if defined(_WIN32)
+    InterlockedCompareExchangeRelease(&g_appdir_resolved, 1, 0);
+#elif defined(__wasm__)
+    g_appdir_resolved = 1;
+#else
+    __atomic_store_n(&g_appdir_resolved, 1, __ATOMIC_RELEASE);
+#endif
     return dir;
 }
 
