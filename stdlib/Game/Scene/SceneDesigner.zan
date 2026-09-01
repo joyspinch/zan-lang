@@ -95,6 +95,10 @@ class SceneDesigner {
     /// 能够访问它。
     static SceneDesigner current;
 
+    /// 上一次 LoadJson 是否失败（文档损坏被拒绝）。宿主据此
+    /// 额外提示；设计器状态栏的 msg 也带原因。
+    bool loadError;
+
     /// 选中的资源写入选择器为之打开的字段；
     /// 第一行表示"无资源"。
     static void ResourcePicked() {
@@ -111,6 +115,7 @@ class SceneDesigner {
 
     SceneDesigner() {
         this.doc = new SceneDoc("scene", 1280, 720);
+        this.loadError = false;
         this.sel = null;
         this.lastSel = null;
         this.dragging = false;
@@ -163,7 +168,20 @@ class SceneDesigner {
     }
 
     void LoadJson(string json) {
-        this.doc = SceneDoc.Parse(json);
+        SceneDoc d = new SceneDoc("", 1280, 720);
+        // 拒绝损坏/截断的文档：宽松解析会把坏设计稿静默降级成
+        // 半份文档，下一次编辑就把它覆盖回盘，比打开失败糟糕得多。
+        // 失败原因留在 SceneDoc.LastError() 供宿主（IDE）展示。
+        this.loadError = false;
+        if (SceneDoc.TryParse(json, d)) {
+            this.doc = d;
+            this.msg = "loaded";
+        } else {
+            this.doc = new SceneDoc("", 1280, 720);
+            this.loadError = true;
+            this.msg = SceneDesigner.T("load failed: ", "加载失败：")
+                + SceneDoc.LastError();
+        }
         this.sel = null;
         this.lastSel = null;
         this.selExtra = new List<SceneElement>();
@@ -171,7 +189,6 @@ class SceneDesigner {
         this.undoStack = new List<string>();
         this.redoStack = new List<string>();
         this.bgIn.SetText(this.doc.Background());
-        this.msg = "loaded";
     }
 
     string SaveJson() {
@@ -388,7 +405,14 @@ class SceneDesigner {
 
     // `s` 的深拷贝（位置偏移两个网格单元，z 为下一个）。
     SceneElement CloneEl(SceneElement s) {
-        SceneElement e = new SceneElement(s.Kind(), s.Name() + SceneDoc.IntStr(this.doc.Count() + 1));
+        // 复制件的名字必须全新：Name()+Count()+1 只是起步，
+        // 撞上已有名字就继续追加，直到唯一。
+        string baseName = s.Name();
+        string nn = baseName + SceneDoc.IntStr(this.doc.Count() + 1);
+        while (this.UsedNameBut(nn, s)) {
+            nn = nn + "_";
+        }
+        SceneElement e = new SceneElement(s.Kind(), nn);
         e.At(s.X() + this.grid * 2, s.Y() + this.grid * 2).Size(s.W(), s.H());
         e.AnchorTo(s.AnchorX(), s.AnchorY());
         e.Order(s.Z() + 1);
@@ -399,7 +423,24 @@ class SceneDesigner {
         e.Grid(s.Rows(), s.Cols(), s.GapX(), s.GapY());
         e.SetValue(s.Value());
         e.SetItems(s.Items());
+        e.extra = s.extra;
         return e;
+    }
+
+    /// nn 是否已被文档里其它元素占用（重名会让编译期投影
+    /// 生成重复字段）。空名不算占用（尚未命名）。skip 为
+    /// 克隆来源（它自己不算冲突）。
+    bool UsedName(string nn) {
+        return this.UsedNameBut(nn, this.sel);
+    }
+
+    bool UsedNameBut(string nn, SceneElement skip) {
+        if (nn.Length == 0) { return false; }
+        for (int i = 0; i < this.doc.Count(); i = i + 1) {
+            SceneElement e = this.doc.ElementAt(i);
+            if (e != skip && e.Name() == nn) { return true; }
+        }
+        return false;
     }
 
     void DuplicateSel() {
@@ -1946,7 +1987,16 @@ class SceneDesigner {
             ix, iy + app.Scale(6), SceneDesigner.T("name", "名称"),
             app.theme.textPrimary, app.theme.fontSizeMedium);
         this.inpIdName = this.nameIn.Render(app, ix + app.Scale(52), iy, iw - app.Scale(52), app.Scale(28));
-        this.sel.ename = this.nameIn.GetText();
+        string nn = this.nameIn.GetText();
+        // 名称是代码后置的变量名：与其它元素重名会生成重复字段，
+        // 等到编译才报错。改名撞上已有名字时拒绝提交并提示。
+        if (nn != this.sel.ename && this.UsedName(nn)) {
+            this.msg = SceneDesigner.T("name already used: ", "名称已被使用：") + nn;
+            this.nameIn.SetText(this.sel.ename);
+            app.RequestRedraw();
+        } else {
+            this.sel.ename = nn;
+        }
         iy = iy + rowH;
 
         app.canvas.DrawStyledText(

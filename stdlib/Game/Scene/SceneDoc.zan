@@ -101,6 +101,10 @@ class SceneElement {
     int val;          // 进度条/滑块/滚动条 0..100，复选框 0/1
     string items;     // 下拉框/列表框/选项卡框的 ';' 分隔条目
     bool locked;      // 仅设计器使用：元素不可移动/缩放
+    // 设计器未建模的键（未来版本/手写设计稿的额外声明）。
+    // 往返时原样写回，使旧运行时打开新设计稿不丢数据——
+    // 与 Gui.Designer 的 FormField.extra 同一策略。
+    JsonValue extra;
 
     SceneElement(string kind, string name) {
         this.kind = kind;
@@ -317,6 +321,58 @@ class SceneDoc {
     // 解析 `.zscene` JSON 文档（尽力而为，工具生成的输入）。
     static SceneDoc Parse(string json) {
         JsonValue root = JsonValue.ParseLenient(json);
+        return SceneDoc.FromRoot(root);
+    }
+
+    // 最近一次 Parse 的失败原因（"" = 成功或尚未解析）。
+    // Parse 走宽松路径不会置位；TryParse 失败时携带原因。
+    static string lastError;
+
+    /// 严格解析：文档必须是完整合法的 JSON 对象，否则返回
+    /// false 且 SceneDoc.LastError() 给出原因。设计器打开文档
+    /// 走这条路径——截断/损坏的设计稿被静默降级成半份文档、
+    /// 再在用户下一次编辑时覆盖回盘，比直接拒绝打开糟糕得多。
+    /// 返回的文档经 FromRoot 构建，调用方拿到后照常使用。
+    static bool TryParse(string json, SceneDoc outDoc) {
+        SceneDoc.lastError = "";
+        JsonValue root = null;
+        try {
+            root = JsonValue.Parse(json);
+        } catch (JsonException ex) {
+            SceneDoc.lastError = ex.Message;
+            return false;
+        }
+        if (root == null || !root.IsObject()) {
+            SceneDoc.lastError = "document is not a JSON object";
+            return false;
+        }
+        SceneDoc parsed = SceneDoc.FromRoot(root);
+        outDoc.adopt(parsed);
+        return true;
+    }
+
+    static string LastError() { return SceneDoc.lastError; }
+
+    /// 用 parsed 的内容替换 this 的全部字段（TryParse 的
+    /// out 参数语义：Zan 没有 out 参数，调用方先 new 一个
+    /// 空文档传入，成功后它就是解析结果）。
+    void adopt(SceneDoc parsed) {
+        this.sname = parsed.sname;
+        this.designWidth = parsed.designWidth;
+        this.designHeight = parsed.designHeight;
+        this.scaleMode = parsed.scaleMode;
+        this.background = parsed.background;
+        this.bgR = parsed.bgR;
+        this.bgG = parsed.bgG;
+        this.bgB = parsed.bgB;
+        this.winCenter = parsed.winCenter;
+        this.winPosX = parsed.winPosX;
+        this.winPosY = parsed.winPosY;
+        this.elements = parsed.elements;
+    }
+
+    // 从已解析的根对象填充文档字段（Parse / TryParse 共用）。
+    static SceneDoc FromRoot(JsonValue root) {
         SceneDoc d = new SceneDoc(
             root.Str("name", ""),
             root.Int("designWidth", 1280),
@@ -365,10 +421,34 @@ class SceneDoc {
                 e.val = je.Int("value", 0);
                 e.items = je.Str("items", "");
                 e.locked = je.Bool("locked", false);
+                e.extra = SceneDoc.UnmodeledKeys(je);
                 d.elements.Add(e);
             }
         }
         return d;
+    }
+
+    // 收集元素对象里运行时未建模的键（含未来版本的扩展声明），
+    // 供 ToJson 原样写回。没有时返回 null。
+    static JsonValue UnmodeledKeys(JsonValue o) {
+        JsonValue extra = null;
+        for (int i = 0; i < o.Count(); i = i + 1) {
+            string key = o.KeyAt(i);
+            if (SceneDoc.IsModeledKey(key)) { continue; }
+            if (extra == null) { extra = JsonValue.NewObject(); }
+            extra.Put(key, o.ValAt(i));
+        }
+        return extra;
+    }
+
+    // SceneElement 读取的所有键。新增建模键时在这里同步加上，
+    // 否则会重复写出。
+    static bool IsModeledKey(string k) {
+        return k == "kind" || k == "name" || k == "x" || k == "y"
+            || k == "w" || k == "h" || k == "anchorX" || k == "anchorY"
+            || k == "z" || k == "image" || k == "text" || k == "color"
+            || k == "visible" || k == "rows" || k == "cols" || k == "gapX"
+            || k == "gapY" || k == "value" || k == "items" || k == "locked";
     }
 
     // 序列化为稳定、便于人工 diff 的 `.zscene` JSON 文档。
@@ -424,6 +504,13 @@ class SceneDoc {
                 el.Put("locked", JsonValue.NewBool(true));
             }
             el.Put("visible", JsonValue.NewBool(e.Visible()));
+            // 未建模的键原样写回：手写/新版设计稿里运行时
+            // 不认识的声明不能因为一次往返就消失。
+            if (e.extra != null && e.extra.IsObject()) {
+                for (int xk = 0; xk < e.extra.Count(); xk = xk + 1) {
+                    el.Put(e.extra.KeyAt(xk), e.extra.ValAt(xk));
+                }
+            }
             elems.Append(el);
         }
         o.Put("elements", elems);

@@ -224,6 +224,15 @@ partial class Designer {
         int gh = propGrid.ContentHeight(app);
         propGrid.RenderInside(app, new Rect(ix, iy, iw, gh));
         iy = iy + gh;
+        // 名称是代码后置的变量名：与其它组件重名会生成重复字段，
+        // 等到编译才报错。PropertyGrid 已经把新名字写进 f.fname，
+        // 撞名时回退到上一个唯一名并提示。
+        if (f.fname != f.name && f.fname.Length > 0 && this.UsedFieldName(f, f.fname)) {
+            f.fname = f.name;
+            msg = Designer.T("name already used: ", "名称已被使用：")
+                + propGrid.ChangedKey() + " -> " + f.name;
+            app.RequestRedraw();
+        }
         f.name = f.fname;
         if (f.span < 1) { f.span = 1; }
         if (f.span > 24) { f.span = 24; }
@@ -859,11 +868,26 @@ partial class Designer {
         selPrev = null;
         activeContainer = null;
         docRole = "";
-        JsonValue root = JsonValue.ParseLenient(s);
-        if (root == null || !root.IsObject()) {
+        loadError = false;
+        // 严格解析：截断/损坏的设计稿不能被宽松解析静默降级成
+        // 半份表单（下一次编辑就会把降级文档覆盖回盘）。
+        // IDE 打开前已用 ParseableJson 拦过一次，这里兜底防御。
+        try {
+            JsonValue.Parse(s);
+        } catch (JsonException ex) {
+            loadError = true;
+            lastError = ex.Message;
             seq = 0;
             return;
         }
+        JsonValue root = JsonValue.ParseLenient(s);
+        if (root == null || !root.IsObject()) {
+            loadError = true;
+            lastError = "document is not a JSON object";
+            seq = 0;
+            return;
+        }
+        this.ResetHistoryLocked();
         if (root.Has("name")) { formNameSig.Set(root.Str("name", formNameSig.Get())); }
         docRole = root.Str("role", "");
         labelPos = root.Int("labelPos", labelPos);
@@ -887,7 +911,9 @@ partial class Designer {
         // 被夹回 100%。
         winZoom = root.Int("winZoom", winZoom);
         if (winZoom < 0) { winZoom = 0; }
-        if (winZoom > 0 && winZoom < 250) { winZoom = 250; }
+        // 只钳上限；下限不动——100..249 的存量值被钳到 250 会在
+        // 加载期静默改写文档（保存后 zoom 就变了），运行时自身
+        // 能正确渲染这些档位。
         if (winZoom > 2000) { winZoom = 2000; }
         winRound = root.Bool("winRound", winRound);
         JsonValue wsh = root.Get("winShape");
@@ -909,6 +935,20 @@ partial class Designer {
         }
         seq = CountFields(fields);
     }
+
+    /// 载入新文档时清空撤销/重做历史：快照是整份设计 JSON，
+    /// 不清理的话，上一个文档的撤销会把别的设计灌进当前画布
+    /// 并在帧末落盘覆盖本文件（IDE 所有 .zform 标签页共用一个
+    /// 设计器单例）。JSON 抽屉 Apply 也走这里，行为一致。
+    void ResetHistoryLocked() {
+        undoStack = new List<string>();
+        redoStack = new List<string>();
+    }
+
+    /// 上一次 LoadJson 是否失败（文档损坏被拒绝）。宿主（IDE）
+    /// 据此提示；失败时表单被清空，lastError 带原因。
+    bool loadError;
+    string lastError;
 
     /// 仅解析设计 JSON 的 "fields" 数组到一个新列表，用于
     /// 在不触碰表单的情况下实例化已保存的用户组件。接受
@@ -1099,5 +1139,25 @@ partial class Designer {
             total = total + 1 + CountFields(lst[i].kids);
         }
         return total;
+    }
+
+    /// nn 是否已被 except（含其子级）之外的其它组件占用。
+    /// 重名会让编译期投影生成重复字段，提交前拒绝。
+    bool UsedFieldName(FormField except, string nn) {
+        if (nn.Length == 0) { return false; }
+        return this.FieldNameIn(fields, except, nn);
+    }
+
+    bool FieldNameIn(List<FormField> lst, FormField except, string nn) {
+        for (int i = 0; i < lst.Count; i = i + 1) {
+            FormField f = lst[i];
+            if (f != except) {
+                if (f.fname == nn) { return true; }
+                if (this.FieldNameIn(f.kids, except, nn)) { return true; }
+            } else {
+                if (this.FieldNameIn(f.kids, except, nn)) { return true; }
+            }
+        }
+        return false;
     }
 }
