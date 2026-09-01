@@ -97,8 +97,17 @@ static int embed_add_file(zan_embed_list_t *l, const char *path,
     return 1;
 }
 
-/* Walks `dir`, adding every file below it under the logical prefix `name`. */
-static void embed_walk(zan_embed_list_t *l, const char *dir, const char *name) {
+/* Walks `dir`, adding every file below it under the logical prefix `name`.
+ *
+ * Each frame carries ~2.8 KB of locals (pattern/path[1024] +
+ * WIN32_FIND_DATAW), so an unbounded directory tree would blow the 1 MB
+ * default Windows stack at ~350 levels. A depth cap turns a crafted tree
+ * into a diagnosable error instead of a crash; 32 is far beyond any real
+ * resource layout (stdlib skins: 3). */
+#define EMBED_WALK_MAX_DEPTH 32
+
+static void embed_walk_impl(zan_embed_list_t *l, const char *dir, const char *name, int depth) {
+    if (depth > EMBED_WALK_MAX_DEPTH) return;
 #ifdef _WIN32
     char pattern[1024];
     snprintf(pattern, sizeof(pattern), "%s\\*", dir);
@@ -122,7 +131,7 @@ static void embed_walk(zan_embed_list_t *l, const char *dir, const char *name) {
         if (!sub) continue;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
-                embed_walk(l, path, sub);
+                embed_walk_impl(l, path, sub, depth + 1);
         } else {
             embed_add_file(l, path, sub);
         }
@@ -142,12 +151,16 @@ static void embed_walk(zan_embed_list_t *l, const char *dir, const char *name) {
         if (lstat(path, &st) != 0) continue;
         char *sub = embed_join(name, e->d_name);
         if (!sub) continue;
-        if (S_ISDIR(st.st_mode)) embed_walk(l, path, sub);
+        if (S_ISDIR(st.st_mode)) embed_walk_impl(l, path, sub, depth + 1);
         else if (S_ISREG(st.st_mode)) embed_add_file(l, path, sub);
         free(sub);
     }
     closedir(d);
 #endif
+}
+
+static void embed_walk(zan_embed_list_t *l, const char *dir, const char *name) {
+    embed_walk_impl(l, dir, name, 1);
 }
 
 static int embed_is_dir(const char *path) {
