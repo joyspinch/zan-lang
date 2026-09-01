@@ -588,7 +588,9 @@ class HttpClient {
     /// <summary>执行请求并按策略逐跳处理重定向。默认策略的跳数为 0，
     /// 因而返回原始 3xx；显式启用时只接受绝对 HTTP(S) Location。
     /// 相对 Location 和循环会拒绝；到达显式跳数上限时返回当前 3xx，
-    /// 不会猜测另一个目标，也不会继续发出请求。</summary>
+    /// 不会猜测另一个目标，也不会继续发出请求。逐跳规则（跳数/防环/
+    /// 动作改写/下一跳派生）与字节通道共用同一组 helper
+    /// （RedirectWanted/RedirectReplay/RedirectNextClient）。</summary>
     async string RequestAsync(string method, string path, string body) {
         this.ArmTotalBudget();
         string raw = await this.RequestOnceAsync(method, path, body);
@@ -598,79 +600,43 @@ class HttpClient {
         List<string> visited = new List<string>();
         string initial = this.CanonicalRequestTarget(path);
         if (initial.Length > 0) { visited.Add(initial); }
-        int hops = 0;
         HttpClient current = this;
         string currentMethod = method;
         string currentBody = body;
+        int hops = 0;
         while (true) {
             HttpResponse response = HttpResponse.Parse(raw);
+            if (!this.RedirectWanted(response, hops)) { return raw; }
             int code = response.statusCode;
-            if (code != 301 && code != 302 && code != 303
-                && code != 307 && code != 308) {
-                return raw;
-            }
-            if (hops >= this.callPolicy.MaxRedirects()) {
-                return raw;
-            }
             string location = response.GetHeader("Location");
+            if (HttpResponse.HasCrlf(location)) {
+                current.DropAlive();
+                throw new HttpRequestException(
+                    "redirect Location header injection rejected");
+            }
             ExternalTarget target = ExternalTarget.Parse(location);
             if (target == null || visited.Contains(target.Canonical())) {
                 current.DropAlive();
-                throw new HttpRequestException("redirect target is invalid or repeated");
+                throw new HttpRequestException(
+                    "redirect target is invalid or repeated");
             }
             visited.Add(target.Canonical());
+            string nextMethod = "";
+            if (!current.RedirectReplay(currentMethod, code, out nextMethod)) {
+                current.DropAlive();
+                throw new HttpRequestException("unsafe redirect replay");
+            }
             bool sameOrigin = current.RedirectHost() == target.Host()
                 && current.port == target.Port()
                 && current.useTls == target.IsTls();
-            string nextMethod = currentMethod;
-            string nextBody = currentBody;
-            if (code == 303) {
-                if (currentMethod == "POST") {
-                    nextMethod = "GET";
-                    nextBody = "";
-                } else if (currentMethod != "GET" && currentMethod != "HEAD") {
-                    throw new HttpRequestException("unsafe redirect method");
-                }
-            } else if ((code == 301 || code == 302)
-                && currentMethod != "GET" && currentMethod != "HEAD") {
-                if (currentMethod != "POST") {
-                    throw new HttpRequestException("unsafe redirect method");
-                }
-                nextMethod = "GET";
-                nextBody = "";
-            } else if ((code == 307 || code == 308)
-                && currentMethod != "GET" && currentMethod != "HEAD") {
-                throw new HttpRequestException("unsafe redirect replay");
-            }
             bool dropEntityHeaders = nextMethod != currentMethod;
-            // Redirect hops are deliberately one-shot. Keeping a pooled socket
-            // on an intermediate client would leave it unreachable to callers;
-            // the original client remains the only owner of its own pool.
-            HttpClient next = new HttpClient(target.Host(), target.Port());
-            next.kaEnabled = false;
-            next.useTls = target.IsTls();
-            next.verifyTls = current.verifyTls;
-            next.clientCertificateFile = current.clientCertificateFile;
-            next.clientPrivateKeyFile = current.clientPrivateKeyFile;
-            next.tlsPins = current.tlsPins;
-            next.pinningEnabled = current.pinningEnabled;
-            next.certPolicy = current.certPolicy;
-            next.callPolicy = current.callPolicy;
-            next.timeout = current.timeout;
-            next.jar = current.jar;
-            next.defaultHeaders = new List<string>();
-            for (int hi = 0; hi < current.defaultHeaders.Count; hi = hi + 1) {
-                string h = current.defaultHeaders[hi];
-                if (next.IsRedirectHeader(h, sameOrigin, dropEntityHeaders)) {
-                    next.defaultHeaders.Add(h);
-                }
-            }
             // The first response may have been read from the original client's
             // keep-alive pool. It is no longer useful once the chain leaves it.
             if (current == this) { current.DropAlive(); }
-            // 同一个绝对 total 截止时间贯穿整条重定向链：中转客户端
-            // 继承发起客户端已武装的 totalDeadlineUs，而不是按跳重置。
-            next.totalDeadlineUs = current.totalDeadlineUs;
+            HttpClient next = current.RedirectNextClient(current, target,
+                sameOrigin, dropEntityHeaders);
+            // 动作改写（301/302/303 → GET）后请求正文一律丢弃。
+            string nextBody = nextMethod == currentMethod ? currentBody : "";
             raw = await next.RequestOnceAsync(nextMethod,
                 target.Path() + target.Query(), nextBody);
             current = next;
