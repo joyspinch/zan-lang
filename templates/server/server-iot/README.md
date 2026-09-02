@@ -33,7 +33,7 @@ controllers, routes and views.
 ```
 config/app.json            server + mqtt ports (edit, no recompile)
 views/index.html           dashboard (polls the /iot/* APIs)
-src/main.zan               boots the broker (Task.Spawn) + HTTP console
+src/main.zan               registers Worker("mqtt") + Worker("http") console, Worker.RunAll
 src/controller/            HTTP actions (Iot / Auth / Home) + Reply helpers
 src/framework/Config.zan   config/app.json loader
 src/framework/Db.zan       DbConnection bootstrap

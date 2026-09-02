@@ -1,53 +1,61 @@
-﻿# {{NAME}} 鈥?Gateway-Worker WebSocket Service
+﻿# {{NAME}} — Gateway-Worker WebSocket Service
 
-A horizontally-scalable WebSocket service skeleton in the Gateway/Worker style.
+A horizontally-scalable WebSocket service skeleton in the Gateway/Worker style,
+hosted on the standard-library `Worker` (workerman-style): the runtime owns the
+listener, the RFC 6455 handshake, frame codec, ping/pong and fragmentation —
+the template only supplies callbacks.
 
 ## Layout
 
 ```
-config/app.json           host / port (+ scale bus settings) 鈥?runtime, not compiled in
-src/main.zan              reads config, starts the gateway
+config/app.json           host / port (+ worker count) — runtime, not compiled in
+src/main.zan              reads config, registers a Worker("websocket"), assigns callbacks
 src/gateway/
-  Gateway.zan               handshake + connection registry + Broadcast/Push
-  ClientConn.zan            per-client state
+  Gateway.zan             connection registry + Broadcast/Push over Worker.Connection
+  ClientConn.zan          per-client wrapper state
 src/worker/
-  ChatWorker.zan            business logic (OnOpen / OnMessage / OnClose)
+  ChatWorker.zan          business logic (OnOpen / OnMessage / OnClose)
 src/framework/Config.zan  loads config/app.json
 wwwroot/client.html       open in a browser to test (chat room)
 ```
 
 ## Why gateway + worker
 
-The **Gateway** only moves bytes: it accepts sockets, does the RFC 6455
-handshake, tracks every connection, and exposes `Broadcast()` / `Push()`. The
-**Worker** (`ChatWorker`) holds the business logic and never touches sockets 鈥?
-it reacts to `OnOpen` / `OnMessage` / `OnClose` and calls the gateway's fan-out
-API. This separation is what lets you evolve either side independently.
+The **Worker** (stdlib) moves the bytes: accept, handshake, frame encode/decode,
+close handling. The template's **Gateway** tracks the live `Worker.Connection`
+list and exposes `Broadcast()` / `Push()`. The **ChatWorker** holds business
+logic and never touches sockets — it reacts to `OnOpen` / `OnMessage` /
+`OnClose` and returns the text to fan out. This separation is what lets you
+evolve either side independently.
 
 ## Run & test
 
 Run from the IDE (output streams into the terminal panel), then open
-`wwwroot/client.html` in a browser (or several tabs) and chat 鈥?every tab sees each
-other's messages via `Gateway.Broadcast`.
+`wwwroot/client.html` in a browser (or several tabs) and chat — every tab sees
+each other's messages via `Gateway.Broadcast`.
 
 ```
 zanc src/main.zan src/**/*.zan --stdlib-path <stdlib> -o app.exe
 ./app.exe        # reads ./config/app.json, ws://127.0.0.1:8090
 ```
 
-## Scaling across processes / machines
+## Scaling across processes
 
-A single gateway already serves thousands of concurrent sockets on one core via
-the coroutine event loop. For multiple gateway processes (or machines), the
-clients of gateway A are invisible to gateway B, so a cross-gateway broadcast
-needs a shared bus 鈥?the **Register** role in the Gateway/Worker/Register model:
+Set `[worker].count` in `config/app.json` to N: the same binary becomes a
+supervising master plus N worker processes (crash respawn, kernel-level accept
+spread — `SO_REUSEPORT` on Linux/macOS, duplicate-socket handoff on Windows).
+No code changes.
 
-1. each gateway subscribes to a Redis channel (`[scale].channel`);
+Clients of process A are invisible to process B, so a cross-gateway broadcast
+on multiple machines still needs a shared bus — the **Register** role in the
+Gateway/Worker/Register model:
+
+1. each gateway subscribes to a Redis channel;
 2. `Broadcast` publishes the message to Redis instead of (or in addition to)
    its local clients;
 3. every gateway receives the published message and fans it out to its LOCAL
    connections.
 
-`System.Data.Redis` provides the async pub/sub client for that bridge. It is the
-documented extension point and is intentionally left out of this single-process
-skeleton so the template compiles and runs with zero external dependencies.
+`System.Data.Redis` provides the async pub/sub client for that bridge. It is
+the documented extension point and is intentionally left out of this skeleton
+so the template compiles and runs with zero external dependencies.

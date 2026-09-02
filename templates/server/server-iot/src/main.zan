@@ -1,24 +1,26 @@
 using System;
 using System.Diagnostics;
+using System.Net;
 using System.Net.Mqtt;
 using ZanWeb;
 using System.Web;
 
 /* {{NAME}} -- EMQX 风格 MQTT 物联网管理服务器。 */
-/* 两个监听器在同一协程事件循环上运行：MQTT 3.1.1 代理（config mqtt.port，默认 1883）接收设备、跟踪会话/订阅、路由带 +/# 通配符的 PUBLISH；HTTP 管理控制台（config server.port，默认 8080）提供看板及 /iot/<wildcard> JSON API，路由表见 src/framework/Routes.gen.zan（新增控制器/动作时编辑）。 */
+/* 两个监听器都挂在 Worker 统一宿主上：MQTT 3.1.1 代理（config mqtt.port，默认 1883，Worker("mqtt") -> 内置 MqttBroker.Global()）接收设备、跟踪会话/订阅、路由带 +/# 通配符的 PUBLISH；HTTP 管理控制台（config server.port，默认 8080）提供看板及 /iot/<wildcard> JSON API，路由表见 src/framework/Routes.gen.zan（新增控制器/动作时编辑）。 */
 /* 运行期设置存于 config/app.json（改 host/port 无需重编译）。 */
 class Program {
-    static void Main() {
+    static async void Main() {
         /* config/ 和 views/ 按相对路径读取，进程需位于发布目录；双击或从其他目录启动时不满足。 */
         bool _cd = ProcessHost.UseAppDir("config/app.json");
         Config.Load("config/app.json");
 
-        /* ---- MQTT 代理 ---- */
-        MqttBroker broker = new MqttBroker(
+        /* ---- MQTT 代理（Worker 统一宿主，见 Worker.zan HandleMqtt）---- */
+        MqttBroker.Use(new MqttBroker(
             Config.Str("mqtt", "host", "0.0.0.0"),
-            Config.Int("mqtt", "port", 1883));
-        MqttBroker.Use(broker);
-        Task.Spawn(broker.RunAsync());    /* 在共享事件循环上运行 */
+            Config.Int("mqtt", "port", 1883)));
+        Worker mqttPort = new Worker("mqtt",
+            Config.Str("mqtt", "host", "0.0.0.0"),
+            Config.Int("mqtt", "port", 1883));    /* 连接由内置 MqttBroker.Global() 接管 */
 
         /* ---- HTTP 管理控制台 ---- */
         WebApp app = new WebApp(
@@ -32,9 +34,12 @@ class Program {
 
         Routes.Map(app);                  /* 路由表（src/framework/Routes.gen.zan） */
 
-        int r = await WebServer.Run(app,
-            Config.Int("worker", "count", 1),
-            Config.Bool("worker", "daemon", false));
+        /* HTTP 控制台也注册为 Worker，两个监听器同进程统一调度 */
+        Worker httpPort = new Worker("http", app.Host(), app.Port());
+        httpPort.onRawConnection = WebApp.ServeSock;
+        WebApp.SetActive(app);
+
+        await Worker.RunAll();            /* 永不返回 */
     }
 
     static bool AccessLog(HttpContext ctx) {

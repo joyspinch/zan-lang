@@ -1,14 +1,53 @@
 using System;
+using System.Net;
 using WsGateway;
 
-/* {{NAME}} -- gateway-worker WebSocket 服务。 */
-/* main.zan 仅读取配置并启动 gateway；连接处理在 src/gateway，业务逻辑在 src/worker（ChatWorker）。config/app.json 运行时加载，不编译入二进制。 */
+/* {{NAME}} -- Worker 统一宿主上的 Gateway-Worker 式 WebSocket 服务。 */
+/* 握手/帧循环全在 Worker（onOpen/onMessage/onClose 回调）；连接注册表与广播在 Gateway；业务逻辑在 ChatWorker。config/app.json 运行时加载，不编译入二进制。 */
 class Program {
-    static async void Main() {
+    static async int Run() {
         Config.Load("config/app.json");
-        Gateway gw = Gateway.Create(
+
+        Worker server = new Worker("websocket",
             Config.Str("server", "host", "127.0.0.1"),
             Config.Int("server", "port", 8090));
-        await gw.Start();
+        server.onOpen = Program.OnOpen;
+        server.onMessage = Program.OnMessage;
+        server.onClose = Program.OnClose;
+        server.SetCount(Config.Int("worker", "count", 1));
+
+        Console.WriteLine("{{NAME}} listening on ws://"
+            + Config.Str("server", "host", "127.0.0.1") + ":"
+            + Convert.ToString(Config.Int("server", "port", 8090)));
+        await Worker.RunAll();            /* 永不返回 */
+        return 0;
+    }
+
+    /* 连接建立：登记进 Gateway 注册表，欢迎私发 + 全员通报。 */
+    static async void OnOpen(Connection conn) {
+        Gateway.Add(conn);
+        Gateway.Push(conn, "* welcome, you are client #"
+            + Convert.ToString(conn.GetId()));
+        string openMsg = await ChatWorker.OnOpen(conn, Gateway.Count());
+        Gateway.Broadcast(openMsg);
+    }
+
+    /* 业务消息：ChatWorker 决定要广播什么，网关扇出。 */
+    static async void OnMessage(Connection conn, string data) {
+        string outMsg = await ChatWorker.OnMessage(conn, data);
+        if (outMsg.Length > 0) {
+            Gateway.Broadcast(outMsg);
+        }
+    }
+
+    /* 连接关闭：移出注册表并通报。 */
+    static async void OnClose(Connection conn) {
+        Gateway.Remove(conn);
+        string closeMsg = await ChatWorker.OnClose(conn, Gateway.Count());
+        Gateway.Broadcast(closeMsg);
+    }
+
+    static void Main() {
+        int r = await Run();
     }
 }
