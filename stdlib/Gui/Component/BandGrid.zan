@@ -1,0 +1,399 @@
+using System;
+
+namespace Gui;
+
+/// 单元格着色委托（BandedGrid 的 RowCellStyle 等位）：返回单元格
+/// 底色 0xAARRGGBB；返回 0 表示用默认底色。
+delegate int BandGridColorOf(int row, int col, string text, int num);
+
+/// BandGrid：带分组表头的通用单元格网格（DevExpress BandedGrid
+/// 的轻量等位）。每格一个显示文本 + 一个可选数值；支持单元格级
+/// 着色回调、格内数据条、点选 / 拖选矩形 / 右键 / 双击，选中格
+/// 可批量赋值。即时模式自绘（GraphView 同款 RegisterRect +
+/// ClickTarget 协议），数据变更后调 Poke()。
+/// 用法：
+///   BandGrid g = new BandGrid();
+///   g.Bind(7, 48).RowLabels(days).BandLabels(bands, 12)
+///    .ColorOf(MyColorOf);
+///   g.SetNum(r, c, 100);            // 逐格赋值（数值+文本）
+///   g.SetSelectedNum(30);           // 选中格批量设值
+class BandGrid : Control {
+    int rows;
+    int cols;
+    List<string> texts;
+    List<int> nums;
+    List<int> marks;
+    List<string> rowLabels;
+    List<string> bandLabels;
+    int bandSpan;
+    BandGridColorOf colorOf;
+    int cellW;
+    int cellH;
+    int hoverR;
+    int hoverC;
+    int anchorR;
+    int anchorC;
+    bool dragSet;
+    int ctxR;
+    int ctxC;
+    int actR;
+    int actC;
+    int barMax;
+    int accent;
+    App lastApp;
+    UiEvent Changed;
+    UiEvent Context;
+    UiEvent CellActivate;
+
+    BandGrid() {
+        this.InitControl("bandgrid", 1);
+        rows = 0;
+        cols = 0;
+        texts = new List<string>();
+        nums = new List<int>();
+        rowLabels = new List<string>();
+        bandLabels = new List<string>();
+        bandSpan = 0;
+        colorOf = null;
+        cellW = 14;
+        cellH = 18;
+        hoverR = 0 - 1;
+        hoverC = 0 - 1;
+        anchorR = 0 - 1;
+        anchorC = 0 - 1;
+        dragSet = true;
+        ctxR = 0 - 1;
+        ctxC = 0 - 1;
+        actR = 0 - 1;
+        actC = 0 - 1;
+        barMax = 0;
+        accent = 0xFF378ADD;
+        lastApp = null;
+        Changed = new UiEvent();
+        Context = new UiEvent();
+        CellActivate = new UiEvent();
+        wiresOwnEvents = true;
+    }
+
+    override string Kind() { return "BandGrid"; }
+
+    // ---- 配置（fluent）------------------------------------------
+
+    /// 行列数；单元格为空文本、无数值（-1）。
+    BandGrid Bind(int r, int c) {
+        rows = r;
+        cols = c;
+        texts = new List<string>();
+        nums = new List<int>();
+        marks = new List<int>();
+        for (int i = 0; i < r * c; i = i + 1) {
+            texts.Add("");
+            nums.Add(0 - 1);
+            marks.Add(0);
+        }
+        return this;
+    }
+
+    /// 行列数 + 全部单元格初始化为同一数值（文本同值）。
+    BandGrid BindInit(int r, int c, int initNum) {
+        this.Bind(r, c);
+        for (int i = 0; i < nums.Count; i = i + 1) {
+            nums[i] = initNum;
+            texts[i] = Convert.ToString(initNum);
+        }
+        return this;
+    }
+
+    /// 左侧行标签（每行一个，绘制在行首）。
+    BandGrid RowLabels(List<string> labels) {
+        rowLabels = labels;
+        return this;
+    }
+
+    /// 顶部分组表头：每段标签横跨 span 列。
+    BandGrid BandLabels(List<string> labels, int span) {
+        bandLabels = labels;
+        bandSpan = span;
+        return this;
+    }
+
+    /// 单元格级着色回调（返回 0 用默认底色）。
+    BandGrid ColorOf(BandGridColorOf d) { colorOf = d; return this; }
+
+    /// 逻辑像素格尺寸（绘制时按 DPI 缩放）。
+    BandGrid CellSize(int w, int h) { cellW = w; cellH = h; return this; }
+
+    /// 数据条满格值（0 关闭数据条，默认关）。
+    BandGrid BarMax(int v) { barMax = v; return this; }
+
+    /// 选中描边与数据条颜色（0xAARRGGBB）。
+    BandGrid Accent(int argb) { accent = argb; return this; }
+
+    /// 值/选中变化（含拖选批量赋值）后触发。
+    BandGrid OnChanged(Action a) { Changed.Add(a); return this; }
+
+    /// 右键单元格（读 ContextRow/ContextCol）。
+    BandGrid OnContext(Action a) { Context.Add(a); return this; }
+
+    /// 双击单元格（读 CellRow/CellCol）。
+    BandGrid OnCellActivate(Action a) { CellActivate.Add(a); return this; }
+
+    // ---- 状态读取 ------------------------------------------------
+
+    /// 最近右键命中的行号（无命中 -1）。
+    int ContextRow() { return ctxR; }
+
+    /// 最近右键命中的列号（无命中 -1）。
+    int ContextCol() { return ctxC; }
+
+    /// 最近双击命中的行号（无命中 -1）。
+    int CellRow() { return actR; }
+
+    /// 最近双击命中的列号（无命中 -1）。
+    int CellCol() { return actC; }
+
+    // ---- 取值赋值 ------------------------------------------------
+
+    /// 读单元格文本。
+    string TextAt(int r, int c) { return texts[r * cols + c]; }
+
+    /// 写单元格文本（改后需 Poke() 刷新）。
+    void SetText(int r, int c, string s) { texts[r * cols + c] = s; }
+
+    /// 读单元格数值（未绑定返回 -1）。
+    int NumAt(int r, int c) { return nums[r * cols + c]; }
+
+    /// 数值 + 文本一并写（文本即数值十进制串）。
+    void SetNum(int r, int c, int v) {
+        int idx = r * cols + c;
+        nums[idx] = v;
+        texts[idx] = Convert.ToString(v);
+    }
+
+    /// 全部单元格写同一数值并刷新。
+    void SetAllNum(int v) {
+        for (int i = 0; i < nums.Count; i = i + 1) {
+            nums[i] = v;
+            texts[i] = Convert.ToString(v);
+        }
+        this.Poke();
+    }
+
+    /// 当前选中格数量。
+    int SelectedCount() {
+        if (marks == null) { return 0; }
+        int n = 0;
+        for (int i = 0; i < marks.Count; i = i + 1) {
+            if (marks[i] != 0) { n = n + 1; }
+        }
+        return n;
+    }
+
+    /// 全选。
+    void SelectAll() {
+        if (marks == null) { return; }
+        for (int i = 0; i < marks.Count; i = i + 1) { marks[i] = 1; }
+        this.Poke();
+    }
+
+    /// 清空选区。
+    void ClearMarks() {
+        if (marks == null) { return; }
+        for (int i = 0; i < marks.Count; i = i + 1) { marks[i] = 0; }
+        this.Poke();
+    }
+
+    /// 对所有选中格批量写数值（文本同值）。
+    void SetSelectedNum(int v) {
+        if (marks == null) { return; }
+        for (int i = 0; i < marks.Count; i = i + 1) {
+            if (marks[i] != 0) {
+                nums[i] = v;
+                texts[i] = Convert.ToString(v);
+            }
+        }
+        this.Poke();
+    }
+
+    /// 对所有选中格批量写文本（不改数值）。
+    void SetSelectedText(string s) {
+        if (marks == null) { return; }
+        for (int i = 0; i < marks.Count; i = i + 1) {
+            if (marks[i] != 0) { texts[i] = s; }
+        }
+        this.Poke();
+    }
+
+    /// 值或选区在窗体侧变更后调用：请求下一帧重画。
+    void Poke() {
+        if (lastApp != null) { lastApp.RequestRedraw(); }
+    }
+
+    // ---- 布局与绘制 ----------------------------------------------
+
+    override void OnMeasure(App app) {
+        int bandH = this.BandH(app);
+        int labW = this.LabelW(app);
+        prefW = labW + cols * app.Scale(cellW) + app.Scale(2);
+        prefH = bandH + rows * app.Scale(cellH) + app.Scale(2);
+    }
+
+    int BandH(App app) {
+        if (bandLabels.Count == 0) { return 0; }
+        return Canvas.FontHeight(app.Scale(11)) + app.Scale(8);
+    }
+
+    int LabelW(App app) {
+        int w = app.Scale(6);
+        for (int i = 0; i < rowLabels.Count; i = i + 1) {
+            int tw = Canvas.MeasureText(rowLabels[i], app.Scale(11));
+            if (tw > w) { w = tw; }
+        }
+        return w + app.Scale(12);
+    }
+
+    /// 选区或悬停变化只伤矩阵自身矩形。
+    void Damage(App app) {
+        app.NoteDamage(bx, by, bw, bh);
+        app.window.Wake();
+    }
+
+    override void OnPaint(App app) {
+        lastApp = app;
+        if (rows <= 0 || cols <= 0 || texts.Count < rows * cols) {
+            return;
+        }
+        Canvas c = app.canvas;
+        int cw = app.Scale(cellW);
+        int ch = app.Scale(cellH);
+        int fs = app.Scale(11);
+        int labW = this.LabelW(app);
+        int bandH = this.BandH(app);
+        int ox = bx + labW;
+        int oy = by + bandH;
+
+        StyleBox head = Style.Part(app, "bandgrid", "head", "panel",
+                                   "", "", Style.SNormal());
+        StyleBox body = Style.Part(app, "bandgrid", "body", "panel",
+                                   "", "", Style.SNormal());
+        int headBg = head.BgOr(0);
+        int bodyBg = body.BgOr(0);
+        if (headBg == 0) { headBg = bodyBg; }
+        int fg = head.FgOr(0);
+
+        c.FillRect(bx, by, bw, bh, bodyBg);
+        int i;
+        for (i = 0; i < bandLabels.Count; i = i + 1) {
+            int x0 = ox + i * bandSpan * cw;
+            c.FillRect(x0, by, bandSpan * cw, bandH, headBg);
+            c.DrawTextCentered(x0, by, bandSpan * cw, bandH,
+                               bandLabels[i], fg, fs);
+        }
+        int r;
+        for (r = 0; r < rows; r = r + 1) {
+            int y0 = oy + r * ch;
+            c.FillRect(bx, y0, labW, ch, headBg);
+            if (r < rowLabels.Count) {
+                c.DrawTextCentered(bx, y0, labW, ch, rowLabels[r], fg, fs);
+            }
+        }
+
+        // 格内文本只在格子足够宽时画（窄格以色阶/数据条表达）。
+        bool showText = cw >= app.Scale(22);
+        hoverR = 0 - 1;
+        hoverC = 0 - 1;
+        for (r = 0; r < rows; r = r + 1) {
+            for (int k = 0; k < cols; k = k + 1) {
+                int idx = r * cols + k;
+                int x0 = ox + k * cw;
+                int y0 = oy + r * ch;
+                int id = app.focus.AllocId();
+                app.hitTester.RegisterRect(id, x0, y0, cw, ch, 0);
+
+                int colBg = bodyBg;
+                if (colorOf != null) {
+                    colBg = colorOf(r, k, texts[idx], nums[idx]);
+                }
+                // 留 1px 缝出网格感。
+                c.FillRect(x0, y0, cw - 1, ch - 1, colBg);
+                int nv = nums[idx];
+                if (nv > 0 && barMax > 0) {
+                    int barW = cw * nv / barMax;
+                    if (barW > cw - 1) { barW = cw - 1; }
+                    if (barW < 2) { barW = 2; }
+                    c.FillRect(x0, y0 + ch - 1 - app.Scale(3), barW,
+                               app.Scale(3), accent);
+                }
+                if (showText && texts[idx] != "") {
+                    c.DrawTextCentered(x0, y0, cw - 1, ch - 1,
+                                       texts[idx], fg, fs);
+                }
+
+                if (app.focus.IsHovered(id)) {
+                    hoverR = r;
+                    hoverC = k;
+                }
+                if (marks[idx] != 0) {
+                    c.DrawRect(x0, y0, cw - 1, ch - 1, accent, 2);
+                } else if (hoverR == r && hoverC == k) {
+                    c.DrawRect(x0, y0, cw - 1, ch - 1, fg, 1);
+                }
+
+                if (app.PressTarget() == id && anchorR < 0) {
+                    anchorR = r;
+                    anchorC = k;
+                    dragSet = marks[idx] == 0;
+                    marks[idx] = dragSet ? 1 : 0;
+                    this.Damage(app);
+                }
+                if (app.ClickTarget() == id && app.ClickAvailable()) {
+                    if (anchorR < 0) {
+                        marks[idx] = marks[idx] == 0 ? 1 : 0;
+                    }
+                    if (app.DoubleClickNow()) {
+                        actR = r;
+                        actC = k;
+                        CellActivate.Post();
+                    }
+                    anchorR = 0 - 1;
+                    anchorC = 0 - 1;
+                    Changed.Post();
+                    app.ClaimClick();
+                    this.Damage(app);
+                }
+                if (app.RightPressTarget() == id && app.EventKind() == 2) {
+                    ctxR = r;
+                    ctxC = k;
+                    Context.Post();
+                    this.Damage(app);
+                }
+            }
+        }
+
+        if (anchorR >= 0) {
+            if (app.PointerPressed() && hoverR >= 0) {
+                int r0 = anchorR < hoverR ? anchorR : hoverR;
+                int r1 = anchorR > hoverR ? anchorR : hoverR;
+                int c0 = anchorC < hoverC ? anchorC : hoverC;
+                int c1 = anchorC > hoverC ? anchorC : hoverC;
+                bool dirty = false;
+                for (int rr = r0; rr <= r1; rr = rr + 1) {
+                    for (int cc = c0; cc <= c1; cc = cc + 1) {
+                        int idx = rr * cols + cc;
+                        int want = dragSet ? 1 : 0;
+                        if (marks[idx] != want) {
+                            marks[idx] = want;
+                            dirty = true;
+                        }
+                    }
+                }
+                if (dirty) { this.Damage(app); }
+            } else if (!app.PointerPressed()) {
+                anchorR = 0 - 1;
+                anchorC = 0 - 1;
+                Changed.Post();
+                this.Damage(app);
+            }
+        }
+    }
+}
