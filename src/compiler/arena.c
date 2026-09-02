@@ -30,9 +30,16 @@ void *zan_arena_alloc(zan_arena_t *arena, size_t size) {
     size = (size + 7) & ~(size_t)7;
 
     if (arena->used + size > arena->cap) {
-        /* allocate new block */
+        /* allocate new block. An oversized request (bigger than the 1 MB
+         * standard block) gets a block of EXACTLY its own size: sizing it
+         * 2x left half of the block permanently unused whenever the next
+         * allocation did not fit the slack, so a stream of similarly sized
+         * large objects wasted ~50% of arena memory (and `size * 2` could
+         * overflow for absurd sizes). The exact-size block retires to the
+         * prev chain fully used; the next allocation opens a fresh standard
+         * block. `size` is already 8-aligned here. */
         size_t new_cap = ZAN_ARENA_BLOCK_SIZE;
-        if (size > new_cap) new_cap = size * 2;
+        if (size > new_cap) new_cap = size;
         zan_arena_t *block = (zan_arena_t *)malloc(sizeof(zan_arena_t));
         if (!block) return NULL;
         block->base = (char *)malloc(new_cap);
