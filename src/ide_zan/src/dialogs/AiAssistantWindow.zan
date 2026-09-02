@@ -1,0 +1,171 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+
+/// @component AI assistant window
+/// 小赞的独立子窗口：小助手面板（panels/AiPanel.zform + 行为在
+/// ZanIDE.AiPanel.zan）不再停靠在主窗口右侧，而是住进自己的顶层窗口。
+/// 窗口只做宿主——每一帧把客户区矩形交给 `ZanIDE.RenderAiPanel`，
+/// 全部状态（会话、任务图、团队、请求流水线）仍归外壳所有，这里只是
+/// 那块界面的新画布。渲染回调（SetRender）即 WizardHost 同款路径：
+/// 基类已在回调前后钉住 WidgetId 基线，回调自己负责
+/// BeginFrame / RenderChrome / PresentFrame。
+///
+/// 重绘判据走快照对比（Pending）：外壳侧的小赞状态变了才出帧。流式
+/// 回答的节奏由主窗口的轮询时钟带动（aiBusy 期间主循环每 100~250ms
+/// 醒一次，见 ZanIDE.zan 的 RequestWakeIn(aiPollMs)），PumpAll 每圈都会
+/// 泵到本窗口，空转时一帧都不画。
+class AiAssistantWindow : ChildWindow {
+    // ---- 重绘快照（Pending 逐项比较，AfterFrame 落盘）----
+    // 不拼签名字符串：Pending 每轮循环都会跑，逐字段比较开销可忽略。
+    int sBusy;
+    int sMsgCount;
+    int sTailLen;
+    int sPlanCount;
+    int sTaskCount;
+    string sRoot;
+    string sModelSig;
+    string sPendingCall;
+    string sActiveTask;
+    string sGraphSel;
+    string sSendTo;
+    int sSessCur;
+    bool sTeamModeB;
+    bool sAutoExecB;
+    int sTeamOpen;
+    int sProfActive;
+
+    /// 功能区的「小赞」开关：没开就请求打开，开着就收起来。
+    /// 打开请求由外壳在帧与帧之间兑现（aiWinPending，与 aiCfgPending
+    /// 同一条约束：帧内创建顶层窗口会未绘制并在下一拍崩掉）。
+    static void ToggleFromRibbon() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null) { return; }
+        if (ide.aiWin != null && ide.aiWin.IsOpen()) {
+            ide.aiWin.Close();
+            ide.aiWin = null;
+        } else {
+            ide.aiWinPending = true;
+        }
+        ide.app.RequestRedraw();
+    }
+
+    static AiAssistantWindow Open(App parent) {
+        AiAssistantWindow w = new AiAssistantWindow();
+        w.SetRender(() => {
+            App hApp = w.Host();
+            ZanIDE ide = ZanIDE.current;
+            if (ide == null || hApp == null) { return; }
+            hApp.BeginFrame();
+            int top = hApp.ContentTop();
+            Rect area = new Rect(0, top, hApp.ClientWidth(),
+                hApp.ClientHeight() - top);
+            ide.RenderAiPanel(hApp, area);
+            // 任务图节点的右键菜单（ctxKind == 7）：TeamBoard 的右键
+            // 坐标是本窗口的客户区坐标，菜单必须画在同一扇窗里。主窗口
+            // 的 ctxKind 分发对 kind 7 整体跳过（见 ZanIDE.PaintFrame）。
+            if (ide.ctxKind == 7) {
+                List<string> cmLabels = new List<string>();
+                ide.AiGraphMenuLabels(cmLabels);
+                hApp.BeginIdScope(935000);
+                hApp.BlockHitsMenu();
+                int chosen = ContextMenu.Render(hApp, ide.ctxX, ide.ctxY,
+                    cmLabels);
+                hApp.EndIdScope();
+                if (chosen == 0 - 2) {
+                    ide.ctxKind = 0;
+                    hApp.RequestRedraw();
+                } else if (chosen >= 0) {
+                    ide.AiGraphMenu(ide.ctxTaskId, chosen);
+                    ide.ctxKind = 0;
+                    hApp.RequestRedraw();
+                }
+            }
+            hApp.RenderChrome(w.Title());
+            hApp.PresentFrame();
+        });
+        w.OpenHost(parent);
+        return w;
+    }
+
+    override string Title() { return ZanIDE.T("Xiao Zan", "小赞"); }
+
+    override int Width() { return 640; }
+    override int Height() { return 720; }
+
+    /// 小赞面板停靠时代在主窗口里占的就是 750000 段；搬进子窗口沿用
+    /// 同一段（主窗口不再使用它），不与 850000 向导 / 885000 设置等
+    /// 基线冲突。
+    override int IdBase() { return 750000; }
+
+    /// 用户点了标题栏 X：外壳那一侧的引用由 FrameTick 的泵清掉；这里
+    /// 只要把可能开着的任务图右键菜单状态收掉，免得菜单悬在已经关掉
+    /// 的窗口坐标上。
+    override void OnCloseRequested() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide != null && ide.ctxKind == 7) { ide.ctxKind = 0; }
+    }
+
+    /// 数据快照对比：任何一处外壳侧的小赞状态变了就重画。这里不追踪
+    /// 子窗口自己的控件状态（滚动、选区、悬停）——它们由子窗口的事件
+    /// 直接置 needsRedraw，不走这条判据。
+    override bool Pending() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null) { return false; }
+        if (ide.aiBusy.Get() != sBusy) { return true; }
+        if (ide.aiMsgs == null) { return false; }
+        if (ide.aiMsgs.Count != sMsgCount) { return true; }
+        if (ide.aiMsgs.Count > 0) {
+            ChatMessage tail = ide.aiMsgs[ide.aiMsgs.Count - 1];
+            if (tail == null) { return true; }
+            if (tail.text.Length != sTailLen) { return true; }
+        }
+        if (ide.aiPlan != null && ide.aiPlan.Count != sPlanCount) { return true; }
+        if (ide.aiTasks != null && ide.aiTasks.Count != sTaskCount) { return true; }
+        if (ide.root != sRoot) { return true; }
+        if (ide.aiModelSelSig != sModelSig) { return true; }
+        if (ide.aiPendingCall != sPendingCall) { return true; }
+        if (ide.aiTeamSt.activeTask != sActiveTask) { return true; }
+        if (ide.aiGraphSel != sGraphSel) { return true; }
+        if (ide.aiSendTo != sSendTo) { return true; }
+        if (ide.aiSessCur != sSessCur) { return true; }
+        if (ide.aiTeamOpen.Get() != sTeamOpen) { return true; }
+        if (ide.aiTeamMode != sTeamModeB) { return true; }
+        if (ide.aiAutoExec != sAutoExecB) { return true; }
+        if (ide.aiProfActive != sProfActive) { return true; }
+        return false;
+    }
+
+    /// 帧后把当前值落进快照：下一轮 Pending 从这里起算。只在出帧后
+    /// 运行，所以「变了→出帧→落盘→安静」自然收敛。
+    override void AfterFrame() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null) { return; }
+        sBusy = ide.aiBusy.Get();
+        sMsgCount = 0;
+        sTailLen = 0;
+        if (ide.aiMsgs != null) {
+            sMsgCount = ide.aiMsgs.Count;
+            if (sMsgCount > 0) {
+                ChatMessage tail = ide.aiMsgs[sMsgCount - 1];
+                if (tail != null) { sTailLen = tail.text.Length; }
+            }
+        }
+        sPlanCount = 0;
+        if (ide.aiPlan != null) { sPlanCount = ide.aiPlan.Count; }
+        sTaskCount = 0;
+        if (ide.aiTasks != null) { sTaskCount = ide.aiTasks.Count; }
+        sRoot = ide.root;
+        sModelSig = ide.aiModelSelSig;
+        sPendingCall = ide.aiPendingCall;
+        sActiveTask = ide.aiTeamSt.activeTask;
+        sGraphSel = ide.aiGraphSel;
+        sSendTo = ide.aiSendTo;
+        sSessCur = ide.aiSessCur;
+        sTeamOpen = ide.aiTeamOpen.Get();
+        sTeamModeB = ide.aiTeamMode;
+        sAutoExecB = ide.aiAutoExec;
+        sProfActive = ide.aiProfActive;
+    }
+}

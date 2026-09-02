@@ -504,6 +504,24 @@ partial class ZanIDE {
             app.RequestRedraw();
         }
 
+        // The AI assistant window obeys the same between-frames rule
+        // (aiWinPending, set by the Ribbon toggle / sidebar). Once open it
+        // needs no shell-side rendering: ChildWindows.PumpAll drives its
+        // SetRender callback from Form.Run(). This pump only recycles the
+        // reference when the user closes the window via its own title bar,
+        // so the toggle's on-state (aiWin != null && IsOpen()) stays true.
+        if (aiWinPending) {
+            aiWinPending = false;
+            if (aiWin == null || !aiWin.IsOpen()) {
+                aiWin = AiAssistantWindow.Open(app);
+            }
+            app.RequestRedraw();
+        }
+        if (aiWin != null && !aiWin.IsOpen()) {
+            aiWin = null;
+            app.RequestRedraw();
+        }
+
         if (rescan) {
             rescan = false;
             // Keep the user's expanded folders across the rebuild: a
@@ -583,8 +601,8 @@ partial class ZanIDE {
             // project entry (so a designer/start tab can still run the app).
             bool canRun = activeIsFile || haveProj;
             // The ribbon is rebuilt each frame: its commands are pure
-            // configuration (icon, label, action id) and the View tab is
-            // just the dock's own Panels section.
+            // configuration (icon, label, action id) and the View tab holds
+            // the assistant-window toggle plus the dock's Panels section.
             List<int> ribbonActions = new List<int>();
             List<RibbonGroup> ribbonGroups =
                 ZanIDE.BuildRibbonGroups(ribbonTab.Get(), ribbonActions);
@@ -843,7 +861,7 @@ partial class ZanIDE {
                 // project component (components/<name>.zcomp) and refresh the
                 // designer's "My Components" palette group.
                 if (formDesigner.ConsumeSaveComponent()) {
-                    string compName = ZanIDE.SanitizeName(formDesigner.formNameSig.Get());
+                    string compName = ZanIDE.SanitizeName(formDesigner.FormNameText());
                     if (compName == "") { compName = fname; }
                     string compDir = root + "/components";
                     Directory.CreateDirectoryRecursive(compDir);
@@ -1281,13 +1299,13 @@ partial class ZanIDE {
             }
             app.PerfMark("sh.output");
 
-            // ---- AI 助手面板：界面在 panels/AiPanel.zform 里声明，
-            // 行为在 ZanIDE.AiPanel.zan。助手、工具、示例和 git 是四个
-            // 各自独立的停靠面板，外壳只把 dock 分给它的矩形交出来
-            // （隐藏时停在屏幕外），所以它们可以互相并成页签、换边或关闭
-            app.BeginIdScope(750000);
-            this.RenderAiPanel(app, dock.ContentParked("ai"));
-            app.EndIdScope();
+            // ---- AI assistant: it lives in its own top-level child window
+            // (dialogs/AiAssistantWindow.zan), opened between frames via
+            // aiWinPending / closed and recycled by the pumps (FrameTick's
+            // aiWinPending block and PumpSettingsWindows). The old docked
+            // "ai" panel is gone; its designed panel
+            // (panels/AiPanel.zform) and behavior (ZanIDE.AiPanel.zan)
+            // are reused as-is, just drawn into the child window's frame.
             // ---- Git panel: its own designed panel
             // (panels/GitPanel.zform): branch header, the command rows, the
             // changed-file list and the commit row. Every button is a designed
@@ -1632,7 +1650,12 @@ partial class ZanIDE {
                     this.AiChatToEnd();
                     app.RequestRedraw();
                 } else {
-                    this.PollNextIn(app, 150, dock.ContentParked("ai"));
+                    // The AI panel now renders in its own child window, so
+                    // the polling wake keeps an off-screen 1x1 rect: the
+                    // animated-clock path still fires (TakeDueFrame sets
+                    // needsRedraw -> PaintFrame runs -> this poll re-arms)
+                    // while the main window paints nothing for it.
+                    this.PollNextIn(app, 150, new Rect(0 - 30000, 0 - 30000, 1, 1));
                 }
             }
             app.PerfMark("sh.uipoll");
@@ -2077,7 +2100,12 @@ partial class ZanIDE {
                 // （一个核心跑满，界面跟着发洩），而流式文本每 100ms 追一次
                 // 已经看不出差别。节奏见上面 aiPollMs：真有文本在流才 100ms，
                 // 模型在想 / 工具在跑就 250ms。构建 / 运行 / 发布的轮询同理。
-                this.PollNextIn(app, aiPollMs, dock.ContentParked("ai"));
+                // 唤醒矩形停在屏外：面板搬进了独立子窗口，主窗口不再为它
+                // 画任何像素，但 RequestAnimationFrameIn 这条时钟链必须保
+                // 持——它是流式重绘的心跳（animNextMs 到期置 needsRedraw，
+                // PaintFrame 跑到这里再把下一拍装填；RequestWakeIn 不行，
+                // 它到拍不置 needsRedraw，心跳会断）。
+                this.PollNextIn(app, aiPollMs, new Rect(0 - 30000, 0 - 30000, 1, 1));
             }
             app.PerfMark("sh.aipoll");
 
@@ -2176,8 +2204,10 @@ partial class ZanIDE {
             // File-tree / tab right-click context menus, drawn above the
             // editor overlay. ctxKind: 1 = project tree row, 2 = stdlib
             // tree row, 3 = editor tab, 4 = Tools panel row, 5 = Examples
-            // panel row, 6 = Structure / Components panel row.
-            if (ctxKind != 0) {
+            // panel row, 6 = Structure / Components panel row. (kind 7 --
+            // the task-graph node menu -- is rendered inside the AI
+            // assistant child window, which owns those coordinates.)
+            if (ctxKind != 0 && ctxKind != 7) {
                 List<string> cmLabels = new List<string>();
                 if (ctxKind == 1) {
                     cmLabels.Add(ZanIDE.T("New File", "新建文件"));
@@ -2251,33 +2281,10 @@ partial class ZanIDE {
                         cmLabels.Add("-");
                     }
                     cmLabels.Add(ZanIDE.T("Copy Name", "复制名称"));
-                } else if (ctxKind == 7) {
-                    // 任务图节点：被前置卡住的节点不列「开工」，列不出来的
-                    // 原因由「为什么被卡住」那一项讲清楚。
-                    if (AiTeam.BlockedWhy(aiTasks, ctxTaskId) == "") {
-                        cmLabels.Add(ZanIDE.T("Start work", "开工"));
-                    } else {
-                        cmLabels.Add(ZanIDE.T("Why is it blocked?",
-                            "为什么被卡住"));
-                    }
-                    // 收尾了的节点这一项换成「重新打开」：完成不是只读——在
-                    // 某个节点上聊出新需求、要改验收标准或换负责人，都得先
-                    // 能把它重新打开。
-                    AiTask cmT = AiTeam.TaskOf(aiTasks, ctxTaskId);
-                    if (cmT != null && cmT.state == AiTeam.TaskDone()) {
-                        cmLabels.Add(ZanIDE.T("Reopen for changes",
-                            "重新打开修改"));
-                    } else {
-                        cmLabels.Add(ZanIDE.T("Mark done", "标记完成"));
-                    }
-                    // 开工能撤：被推成「进行中」的节点必须退得回去，否则点错一下
-                    // 就永远挂着一个假的进行中。
-                    cmLabels.Add(ZanIDE.T("Withdraw, back to todo",
-                        "撤回到待办"));
-                    cmLabels.Add("-");
-                    cmLabels.Add(ZanIDE.T("Acceptance criteria", "验收标准"));
-                    cmLabels.Add(ZanIDE.T("Copy task ID", "复制节点 ID"));
                 }
+                // (ctxKind == 7 — task-graph node menu — moved into the
+                // AI assistant child window; labels now live in
+                // ZanIDE.AiGraphMenuLabels.)
                 // An open context menu owns the pointer. Without this, the
                 // click that dismisses it also reached whatever was under it
                 // (a tree row got selected / a file opened / a tab switched by
@@ -2470,8 +2477,6 @@ partial class ZanIDE {
                                 if (exrReal) { ZanIDE.RevealInFileManager(exrn.path); }
                             }
                         }
-                    } else if (ctxKind == 7) {
-                        this.AiGraphMenu(ctxTaskId, chosen);
                     }
                     ctxKind = 0;
                     app.RequestRedraw();
