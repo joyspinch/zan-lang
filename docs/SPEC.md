@@ -758,20 +758,19 @@ qualified_name  = IDENT { "." IDENT } ;
 
 - `checked` / `unchecked` — 关键字存在但均为 **no-op**：溢出检查始终关闭（环绕语义），`checked(x + 1)` 与 `x + 1` 行为相同（`tests/conformance/cs_b14_checked.zan`）
 - lazy iterators (`IEnumerable<T>` protocol) — `yield` currently materializes a list
-- LINQ 查询语法的 `orderby ... descending` 与 `let` 返回空结果、`join` 生成不合法 IR（`from/where/select` 与 `orderby` 升序可用）——见 `TASKS.md` **A54**
 - tagged union 枚举（代数数据类型）
 - 命名实参之外的实参特性：`params` 之后的可选实参组合未系统验证
-- `\x` / `\u` / `\U` 字符转义
 - `$@"..."` 组合字符串、`"""` 原始字符串
 - COW（copy-on-write）集合——`List` 赋值是引用共享，修改即共享
 - `[CImport]`、`project.zan` 项目文件、`zan` CLI（实际为 `zanc`）
 
-以下曾列为未实现、**2026-08-27 实测已可用**（各带 conformance 用例）：
+以下曾列为未实现、实测已可用（各带 conformance 用例）：
 
 - `using (res) { }` 确定性释放（`cs_b02_using.zan`）
 - `init` 只写访问器（`cs_b18_init.zan`）
 - 元组 `(int, string)` 与 `var (a, b) = ...` 解构（`cs_b03_tuple.zan`；嵌套解构仍未实现）
 - `?.` null-conditional（`nullable_reference_types.zan`；见 §2.6 的更正）
-- LINQ 查询语法 `from x in xs where ... select`（`linq_query.zan`）
+- LINQ 查询语法 `from x in xs where ... select`（`linq_query.zan`）；`orderby ... descending`、`let`、三种 `join` 形态（裸 / join+orderby / join…into）（`linq_query_clauses.zan`，TASKS.md **A54** 关闭）
 - 命名实参 `F(b: 2)`（`cs_b04_named_args.zan`）、索引器 `this[int i]`（`cs_b09_indexer.zan`）
 - switch 表达式 `x switch { ... }` 与 `when` 守卫、值类型的类型模式（`cs_b06_switch_expr.zan`、`pattern_value_types.zan`）
+- `\x`（贪婪 1-4 位 hex）与 `\u`（固定 4 位 hex）字符转义，UTF-8 编码写入字符串/插值/char 三路径，代理区独立出现即编译错误（`string_escapes.zan`；`\U` 8 位形式仍不支持）
