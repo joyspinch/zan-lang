@@ -94,6 +94,118 @@ static void gen_record_class(zan_ast_node_t *unit, zan_istr_t rname,
                              zan_diag_t *diag);
 static zan_ast_node_t *parse_unary(zan_parser_t *p);
 static zan_ast_node_t *parse_parameter(zan_parser_t *p);
+static uint32_t parse_modifiers(zan_parser_t *p);
+static zan_ast_list_t parse_param_list(zan_parser_t *p);
+static void parse_attr_usages(zan_parser_t *p, zan_ast_list_t *out,
+                              zan_istr_t *out_lib, zan_istr_t *out_entry);
+static bool parse_top_level_decl(zan_parser_t *p, zan_ast_node_t *unit);
+
+/* Parses one full top-level declaration -- attributes, modifiers, class/
+ * struct/interface/enum/delegate, or a `record` lowering -- into
+ * unit->comp_unit.decls. Shared verbatim by the compilation-unit decls loop
+ * and the block-scoped `namespace X { ... }` member loop, so both spellings
+ * treat a declaration identically (attributes, StructLayout detection,
+ * partial, record). Returns false when no declaration could be parsed (an
+ * error has been emitted); the caller skips one token to recover. */
+static bool parse_top_level_decl(zan_parser_t *p, zan_ast_node_t *unit) {
+    /* parse attributes: retained on the type; [StructLayout] also toggles C layout */
+    bool has_c_layout = false;
+    bool has_explicit_layout = false;
+    zan_ast_list_t type_attrs;
+    zan_ast_list_init(&type_attrs);
+    parse_attr_usages(p, &type_attrs, NULL, NULL);
+    for (int _ai = 0; _ai < type_attrs.count; _ai++) {
+        zan_istr_t _n = type_attrs.items[_ai]->attribute.name->ident.name;
+        if (_n.str && _n.len == 12 && memcmp(_n.str, "StructLayout", 12) == 0) {
+            has_c_layout = true;
+            /* `LayoutKind.Explicit` parses as a member access whose last
+             * segment names the kind; anything else stays sequential. */
+            zan_ast_list_t *_args = &type_attrs.items[_ai]->attribute.args;
+            for (int _aj = 0; _aj < _args->count; _aj++) {
+                zan_ast_node_t *_a = _args->items[_aj];
+                zan_istr_t _k = {NULL, 0};
+                if (_a->kind == AST_MEMBER_ACCESS) _k = _a->member.name;
+                else if (_a->kind == AST_IDENTIFIER) _k = _a->ident.name;
+                if (_k.str && _k.len == 8 && memcmp(_k.str, "Explicit", 8) == 0)
+                    has_explicit_layout = true;
+            }
+        }
+    }
+
+    uint32_t mods = parse_modifiers(p);
+
+    /* `partial` is contextual: only a modifier right before a type kw */
+    if (parser_check(p, TK_IDENT) && p->current.str_val.len == 7 &&
+        memcmp(p->current.str_val.str, "partial", 7) == 0) {
+        zan_token_kind_t nk = zan_lexer_peek(p->lex).kind;
+        if (nk == TK_CLASS || nk == TK_STRUCT || nk == TK_INTERFACE) {
+            parser_advance(p);
+            mods |= MOD_PARTIAL;
+        }
+    }
+
+    /* `record Name(T a, ...);` is contextual and lowers to a class */
+    if (parser_check(p, TK_IDENT) && p->current.str_val.len == 6 &&
+        memcmp(p->current.str_val.str, "record", 6) == 0 &&
+        zan_lexer_peek(p->lex).kind == TK_IDENT) {
+        parser_advance(p); /* record */
+        parser_expect(p, TK_IDENT);
+        zan_istr_t rname = p->previous.str_val;
+        zan_ast_list_t rparams = parse_param_list(p);
+        parser_expect(p, TK_SEMICOLON);
+        gen_record_class(unit, rname, &rparams, p->arena, p->diag);
+        return true;
+    }
+
+    if (parser_check(p, TK_CLASS) || parser_check(p, TK_STRUCT) ||
+        parser_check(p, TK_INTERFACE) || parser_check(p, TK_ENUM)) {
+        zan_ast_node_t *decl = parse_type_decl(p, mods);
+        decl->type_decl.is_c_layout = has_c_layout;
+        decl->type_decl.is_explicit_layout = has_explicit_layout;
+        decl->attributes = type_attrs;
+        zan_ast_list_push(&unit->comp_unit.decls, decl, p->arena);
+        return true;
+    }
+    if (parser_check(p, TK_DELEGATE)) {
+        /* delegate ReturnType Name(params); */
+        parser_advance(p); /* consume 'delegate' */
+        zan_loc_t dloc = p->current.loc;
+        zan_ast_node_t *ret_type = parse_type_ref(p);
+        parser_expect(p, TK_IDENT);
+        zan_istr_t dname = p->previous.str_val;
+        /* optional generic type params: delegate R Name<T, R>(params); */
+        zan_ast_list_t dtype_params;
+        zan_ast_list_init(&dtype_params);
+        if (parser_match(p, TK_LESS)) {
+            while (!parser_check(p, TK_GREATER) && !parser_check(p, TK_EOF)) {
+                if (parser_check(p, TK_IDENT)) {
+                    parser_advance(p);
+                    zan_ast_node_t *tp = zan_ast_new(p->arena, AST_IDENTIFIER, p->previous.loc);
+                    tp->ident.name = p->previous.str_val;
+                    zan_ast_list_push(&dtype_params, tp, p->arena);
+                }
+                if (!parser_match(p, TK_COMMA)) break;
+            }
+            parser_expect(p, TK_GREATER);
+        }
+        zan_ast_list_t dparams = parse_param_list(p);
+        parser_expect(p, TK_SEMICOLON);
+        zan_ast_node_t *ddecl = zan_ast_new(p->arena, AST_DELEGATE_DECL, dloc);
+        ddecl->method_decl.name = dname;
+        ddecl->method_decl.return_type = ret_type;
+        ddecl->method_decl.params = dparams;
+        ddecl->method_decl.type_params = dtype_params;
+        ddecl->method_decl.body = NULL;
+        ddecl->method_decl.modifiers = mods;
+        ddecl->method_decl.extern_lib = (zan_istr_t){NULL, 0};
+        ddecl->method_decl.entry_point = (zan_istr_t){NULL, 0};
+        zan_ast_list_push(&unit->comp_unit.decls, ddecl, p->arena);
+        return true;
+    }
+    zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+                  "expected type declaration (class, struct, interface, enum, or delegate)");
+    return false;
+}
 
 /* ---- qualified name: a.b.c ---- */
 
@@ -4100,110 +4212,39 @@ zan_ast_node_t *zan_parser_parse(zan_parser_t *p) {
         }
 
         unit->comp_unit.ns = ns;
+
+        /* Block-scoped `namespace X { ... }`: parse its members now. Each
+         * member lands in comp_unit.decls alongside file-scoped declarations
+         * and carries the same ns_name/ns_usings once stamping runs -- that
+         * is how both namespace spellings were always treated downstream,
+         * because the stamping pass keys off the unit's single ns slot and
+         * the binder only ever saw comp_unit.decls. Previously the decls
+         * loop that follows stopped at this block's `}`, so every top-level
+         * declaration after the namespace block was silently dropped; the
+         * member loop here consumes the block body (including its `}`) and
+         * lets parsing fall through to the same decls loop, which keeps
+         * parsing declarations after the block. The unit keeps a single ns
+         * slot, so a *later* namespace header would join the block's name;
+         * Zan sources declare at most one namespace per file (C#'s
+         * convention) and the whole corpus uses the file-scoped spelling. */
+        if (!ns->namespace_decl.is_file_scoped) {
+            for (;;) {
+                if (parser_match(p, TK_RBRACE)) break;
+                if (parser_check(p, TK_EOF)) {
+                    zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+                                  "unexpected end of file inside namespace block; missing '}'");
+                    break;
+                }
+                if (!parse_top_level_decl(p, unit))
+                    parser_advance(p); /* skip to recover */
+            }
+        }
     }
 
     /* type declarations */
     while (!parser_check(p, TK_EOF) && !parser_check(p, TK_RBRACE)) {
-        /* parse attributes: retained on the type; [StructLayout] also toggles C layout */
-        bool has_c_layout = false;
-        bool has_explicit_layout = false;
-        zan_ast_list_t type_attrs;
-        zan_ast_list_init(&type_attrs);
-        parse_attr_usages(p, &type_attrs, NULL, NULL);
-        for (int _ai = 0; _ai < type_attrs.count; _ai++) {
-            zan_istr_t _n = type_attrs.items[_ai]->attribute.name->ident.name;
-            if (_n.str && _n.len == 12 && memcmp(_n.str, "StructLayout", 12) == 0) {
-                has_c_layout = true;
-                /* `LayoutKind.Explicit` parses as a member access whose last
-                 * segment names the kind; anything else stays sequential. */
-                zan_ast_list_t *_args = &type_attrs.items[_ai]->attribute.args;
-                for (int _aj = 0; _aj < _args->count; _aj++) {
-                    zan_ast_node_t *_a = _args->items[_aj];
-                    zan_istr_t _k = {NULL, 0};
-                    if (_a->kind == AST_MEMBER_ACCESS) _k = _a->member.name;
-                    else if (_a->kind == AST_IDENTIFIER) _k = _a->ident.name;
-                    if (_k.str && _k.len == 8 && memcmp(_k.str, "Explicit", 8) == 0)
-                        has_explicit_layout = true;
-                }
-            }
-        }
-
-        uint32_t mods = parse_modifiers(p);
-
-        /* `partial` is contextual: only a modifier right before a type kw */
-        if (parser_check(p, TK_IDENT) && p->current.str_val.len == 7 &&
-            memcmp(p->current.str_val.str, "partial", 7) == 0) {
-            zan_token_kind_t nk = zan_lexer_peek(p->lex).kind;
-            if (nk == TK_CLASS || nk == TK_STRUCT || nk == TK_INTERFACE) {
-                parser_advance(p);
-                mods |= MOD_PARTIAL;
-            }
-        }
-
-        /* `record Name(T a, ...);` is contextual and lowers to a class */
-        if (parser_check(p, TK_IDENT) && p->current.str_val.len == 6 &&
-            memcmp(p->current.str_val.str, "record", 6) == 0 &&
-            zan_lexer_peek(p->lex).kind == TK_IDENT) {
-            parser_advance(p); /* record */
-            parser_expect(p, TK_IDENT);
-            zan_istr_t rname = p->previous.str_val;
-            zan_ast_list_t rparams = parse_param_list(p);
-            parser_expect(p, TK_SEMICOLON);
-            gen_record_class(unit, rname, &rparams, p->arena, p->diag);
-            continue;
-        }
-
-        if (parser_check(p, TK_CLASS) || parser_check(p, TK_STRUCT) ||
-            parser_check(p, TK_INTERFACE) || parser_check(p, TK_ENUM)) {
-            zan_ast_node_t *decl = parse_type_decl(p, mods);
-            decl->type_decl.is_c_layout = has_c_layout;
-            decl->type_decl.is_explicit_layout = has_explicit_layout;
-            decl->attributes = type_attrs;
-            zan_ast_list_push(&unit->comp_unit.decls, decl, p->arena);
-        } else if (parser_check(p, TK_DELEGATE)) {
-            /* delegate ReturnType Name(params); */
-            parser_advance(p); /* consume 'delegate' */
-            zan_loc_t dloc = p->current.loc;
-            zan_ast_node_t *ret_type = parse_type_ref(p);
-            parser_expect(p, TK_IDENT);
-            zan_istr_t dname = p->previous.str_val;
-            /* optional generic type params: delegate R Name<T, R>(params); */
-            zan_ast_list_t dtype_params;
-            zan_ast_list_init(&dtype_params);
-            if (parser_match(p, TK_LESS)) {
-                while (!parser_check(p, TK_GREATER) && !parser_check(p, TK_EOF)) {
-                    if (parser_check(p, TK_IDENT)) {
-                        parser_advance(p);
-                        zan_ast_node_t *tp = zan_ast_new(p->arena, AST_IDENTIFIER, p->previous.loc);
-                        tp->ident.name = p->previous.str_val;
-                        zan_ast_list_push(&dtype_params, tp, p->arena);
-                    }
-                    if (!parser_match(p, TK_COMMA)) break;
-                }
-                parser_expect(p, TK_GREATER);
-            }
-            zan_ast_list_t dparams = parse_param_list(p);
-            parser_expect(p, TK_SEMICOLON);
-            zan_ast_node_t *ddecl = zan_ast_new(p->arena, AST_DELEGATE_DECL, dloc);
-            ddecl->method_decl.name = dname;
-            ddecl->method_decl.return_type = ret_type;
-            ddecl->method_decl.params = dparams;
-            ddecl->method_decl.type_params = dtype_params;
-            ddecl->method_decl.body = NULL;
-            ddecl->method_decl.modifiers = mods;
-            ddecl->method_decl.extern_lib = (zan_istr_t){NULL, 0};
-            ddecl->method_decl.entry_point = (zan_istr_t){NULL, 0};
-            zan_ast_list_push(&unit->comp_unit.decls, ddecl, p->arena);
-        } else {
-            zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
-                          "expected type declaration (class, struct, interface, enum, or delegate)");
+        if (!parse_top_level_decl(p, unit))
             parser_advance(p); /* skip to recover */
-        }
-    }
-
-    /* close file-scoped namespace's brace if applicable */
-    if (unit->comp_unit.ns && !unit->comp_unit.ns->namespace_decl.is_file_scoped) {
-        parser_expect(p, TK_RBRACE);
     }
 
     return unit;
