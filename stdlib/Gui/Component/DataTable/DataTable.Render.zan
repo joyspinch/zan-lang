@@ -41,7 +41,14 @@ partial class DataTable {
     /// 条件格式颜色仍然优先——在那里，颜色*就是*
     /// 单元格携带的信息。
     static void DrawCell(App app, DataColumn col, string val, int cx, int cy, int cw, int rowH, double cfLo, double cfHi, int fgOverride) {
-        DataTable.DrawCellIndented(app, col, val, cx, cy, cw, rowH, cfLo, cfHi, fgOverride, 0, false, false, false);
+        DataTable.DrawCellRangeCtx(app, col, val, cx, cy, cw, rowH, cfLo, cfHi, fgOverride, -1, -1, null);
+    }
+
+    /// 带行/列上下文的渲染入口：按钮列（cellType 7）的点击
+    /// 需要行号和列号填充 HitRow/HitCol。主渲染路径走这里；
+    /// 无上下文的调用方仍可用 DrawCell / DrawCellIndented。
+    static void DrawCellCtx(App app, DataColumn col, string val, int cx, int cy, int cw, int rowH, double cfLo, double cfHi, int fgOverride, int rowIdx, int cc) {
+        DataTable.DrawCellRangeCtx(app, col, val, cx, cy, cw, rowH, cfLo, cfHi, fgOverride, rowIdx, cc, null);
     }
 
     /// 树模式单元格：`indent` 层级换成左缩进；`isTreeCol`
@@ -72,11 +79,19 @@ partial class DataTable {
         // 对齐全部保持原语义），箭头/缩进已画的部分靠
         // 负偏移保护不被文本覆盖。
         int inner = cx + indentPx;
-        DataTable.DrawCellRange(app, col, val, inner, cy, cw - indentPx, rowH, cfLo, cfHi, fgOverride);
+        DataTable.DrawCellRangeCtx(app, col, val, inner, cy, cw - indentPx, rowH, cfLo, cfHi, fgOverride, -1, -1, null);
     }
 
     /// DrawCell 的主体（缩进版把 x/宽收缩后委托到这里）。
+    /// 交互列（按钮，cellType 7）需要行/列上下文来填充
+    /// CellClick 的事件语义：`rowIdx` 是数据行号，`cc` 是列号
+    /// （-1 表示调用方没有行上下文——如独立的单元格渲染器，
+    /// 此时按钮点击仅Raise事件，不设置 HitRow/HitCol）。
     static void DrawCellRange(App app, DataColumn col, string val, int cx, int cy, int cw, int rowH, double cfLo, double cfHi, int fgOverride) {
+        DataTable.DrawCellRangeCtx(app, col, val, cx, cy, cw, rowH, cfLo, cfHi, fgOverride, -1, -1, null);
+    }
+
+    static void DrawCellRangeCtx(App app, DataColumn col, string val, int cx, int cy, int cw, int rowH, double cfLo, double cfHi, int fgOverride, int rowIdx, int cc, DataTableState st) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int fs = Style.FontFallback(app, "medium");
@@ -168,6 +183,53 @@ partial class DataTable {
             return;
         }
 
+        // ---- 图片：contain 缩放居中；http(s) URL 经 ImageHttp
+        // 后台取回（就绪后整帧重绘），加载中与失败画淡色占位。
+        if (col.cellType == 5) {
+            string src = val;
+            if (src.Length >= 8 && (src.Substring(0, 7) == "http://"
+                                    || src.Substring(0, 8) == "https://")) {
+                src = ImageHttp.EnsureUrl(app, src);
+            }
+            int iw = 0;
+            int ih = 0;
+            if (src != null && src != "") {
+                iw = Canvas.ImageWidth(src);
+                ih = Canvas.ImageHeight(src);
+            }
+            int boxW = cw - pad * 2;
+            int boxH = rowH - app.Scale(4);
+            if (boxH < app.Scale(6)) { boxH = app.Scale(6); }
+            if (iw > 0 && ih > 0 && boxW > 0) {
+                int dw = boxW;
+                int dh = boxW * ih / iw;
+                if (dh > boxH) {
+                    dh = boxH;
+                    dw = boxH * iw / ih;
+                }
+                if (dw < 1) { dw = 1; }
+                if (dh < 1) { dh = 1; }
+                c.BlitImage(src, cx + (cw - dw) / 2, cy + (rowH - dh) / 2,
+                            dw, dh, 0, 0, 0, 0);
+            } else {
+                // 占位：格内淡色圆角块（URL 取回中 / 取回失败 /
+                // 空值共用；不区分文案，保持列表浏览的信息密度）。
+                int phW = boxW;
+                if (phW > app.Scale(28)) { phW = app.Scale(28); }
+                int phH = boxH;
+                if (phH > app.Scale(20)) { phH = app.Scale(20); }
+                if (phW > 0) {
+                    StyleBox ph = Style.Part(app, "datatable",
+                                             "progress-track", "", "", "",
+                                             Style.SNormal());
+                    c.FillRoundRect(cx + (cw - phW) / 2,
+                                    cy + (rowH - phH) / 2, phW, phH,
+                                    t.borderRadiusSmall, ph.BgOr(0));
+                }
+            }
+            return;
+        }
+
         if (col.cellType == 3) {
             int pct = DataTable.ParseInt(val);
             if (pct < 0) { pct = 0; }
@@ -220,6 +282,127 @@ partial class DataTable {
             c.FillCircle(cxc, cy + rowH / 2, dotR, dotColor);
             int txtY = Canvas.CenterTextY(cy, rowH, fs);
             c.DrawText(cxc + dotR + app.Scale(4), txtY, val, cfText, fs);
+            return;
+        }
+
+        // ---- 图标：单元格值即 tabler 图标名，居中绘制 ----
+        if (col.cellType == 6) {
+            if (val != "") {
+                int gsz = app.Scale(16);
+                int gcol = cfText;
+                if (fgOverride == 0) {
+                    gcol = Style.Part(app, "datatable", "icon", "", "", "",
+                                      Style.SNormal()).FgOr(0);
+                }
+                c.DrawGlyph(val, cx + (cw - gsz) / 2, cy + (rowH - gsz) / 2, gsz, gcol);
+            }
+            return;
+        }
+
+        // ---- 迷你图：逗号分隔数值序列 -> 格内等槽位迷你柱状图 ----
+        if (col.cellType == 8) {
+            List<string> seq = DataTable.NumSeries(val);
+            int n = seq.Count;
+            if (n > 0) {
+                int plotW = innerW;
+                if (plotW < app.Scale(8)) { plotW = app.Scale(8); }
+                int plotH = rowH - app.Scale(8);
+                if (plotH < app.Scale(4)) { plotH = app.Scale(4); }
+                int plotX = cx + pad;
+                int plotY = cy + app.Scale(4);
+                int mx = 0;
+                for (int si = 0; si < n; si = si + 1) {
+                    int av = DataTable.ParseInt(seq[si]);
+                    if (av < 0) { av = 0 - av; }
+                    if (av > mx) { mx = av; }
+                }
+                if (mx < 1) { mx = 1; }
+                int accent = Style.Part(app, "datatable", "accent", "", "", "",
+                                        Style.SNormal()).FgOr(0);
+                int slotW = plotW / n;
+                if (slotW < 1) { slotW = 1; }
+                int barW = slotW * 3 / 5;
+                if (barW < 1) { barW = 1; }
+                int areaTint = DataTable.ColorAlpha(accent, 45);
+                for (int bi = 0; bi < n; bi = bi + 1) {
+                    int bv = DataTable.ParseInt(seq[bi]);
+                    if (bv < 0) { bv = 0 - bv; }
+                    int bh = bv * plotH / mx;
+                    if (bh < 1 && bv > 0) { bh = 1; }
+                    int slotL = plotX + slotW * bi;
+                    int bxc = slotL + (slotW - barW) / 2;
+                    int byc = plotY + plotH - bh;
+                    if (col.sparkArea && bv > 0 && bh >= 1) {
+                        c.FillRect(bxc, plotY, barW, plotH, areaTint);
+                    }
+                    c.FillRect(bxc, byc, barW, bh, accent);
+                }
+            }
+            return;
+        }
+
+        // ---- 按钮：整格居中一个 small 按钮，点击 -> CellClick ----
+        if (col.cellType == 7) {
+            string label = val;
+            string icon = col.btnIcon;
+            int bh = t.heightSmall;
+            int bw = app.Scale(24);
+            int bFont = Style.FontFallback(app, "small");
+            if (label != "") {
+                int tw2 = Canvas.MeasureText(label, bFont);
+                bw = tw2 + app.Scale(20);
+                if (icon != "") { bw = bw + app.Scale(14) + t.gapSmall; }
+            } else if (icon != "") {
+                bw = app.Scale(26);
+            }
+            if (bw > innerW) { bw = innerW; }
+            if (bw < app.Scale(16)) { bw = app.Scale(16); }
+            int bxc = cx + (cw - bw) / 2;
+            int byc = cy + (rowH - bh) / 2;
+            string cls = col.btnClass;
+            if (cls != "") { cls = "small " + cls; } else { cls = "small"; }
+            int bId = app.focus.AllocId();
+            bool bHot = app.focus.IsHovered(bId);
+            StyleBox bs = Style.Part(app, "datatable", "button", "", cls, "",
+                                     Style.SNormal());
+            if (bHot) {
+                bs = Style.Part(app, "datatable", "button", "", cls, "",
+                                Style.SHover());
+            }
+            int rad = bs.RadiusOr(t.borderRadiusSmall);
+            c.FillRoundRect(bxc, byc, bw, bh, rad, bs.BgOr(0));
+            int contentW = 0;
+            int iconSz = app.Scale(14);
+            int labelW = 0;
+            if (label != "") { labelW = Canvas.MeasureText(label, bFont); }
+            if (icon != "" && label != "") {
+                contentW = iconSz + t.gapSmall + labelW;
+            } else if (icon != "") {
+                contentW = iconSz;
+            } else {
+                contentW = labelW;
+            }
+            int cx0 = bxc + (bw - contentW) / 2;
+            int bFg = bs.FgOr(0);
+            if (icon != "") {
+                c.DrawGlyph(icon, cx0, byc + (bh - iconSz) / 2, iconSz, bFg);
+                cx0 = cx0 + iconSz + t.gapSmall;
+            }
+            if (label != "") {
+                c.DrawText(cx0, Canvas.CenterTextY(byc, bh, bFont), label, bFg, bFont);
+            }
+            // 点击：注册热区 + 键盘激活，命中后把事件上下文指向
+            // 本格再 Raise CellClick——处理器与普通单元格点击
+            // 读取同一份 HitRow()/HitCol()。st 为 null 的调用方
+            // （独立渲染入口）只触发事件，不填事件上下文。
+            if (Ui.Activate(app, bId, bxc, byc, bw, bh)) {
+                if (st != null && rowIdx >= 0 && cc >= 0) {
+                    st.hitRow = rowIdx;
+                    st.hitCol = cc;
+                }
+                if (st != null) { st.CellClick.Raise(); }
+                app.RequestRedraw();
+            }
             return;
         }
 
@@ -1443,11 +1626,29 @@ partial class DataTable {
                     if (rowIdx == st.hitRow && cc == st.hitCol) {
                         fcX = ccl; fcY = ry; fcW = cw; fcH = rowH; fcVis = true;
                     }
+                    // 单元格控件插槽：真控件按格矩形渲染
+                    // （PropertyGrid/设计器 PvCtrl 同款 Measure+Arrange+
+                    // RenderTree 三步）。优先于自绘与内置渲染——它是
+                    // 最明确的选择；provider 返回 null 的格退回后续
+                    // 路径。控件在裁剪内渲染，异常实现不会溢出到
+                    // 相邻单元格。
+                    bool painted = false;
+                    if (st.cellWidgets != null) {
+                        c.PushClip(ccl, ry, cw, rowH);
+                        Control wc = st.cellWidgets.Provide(app, src, rowIdx, cc, ccl, ry, cw, rowH);
+                        if (wc != null) {
+                            Rect cellRect = new Rect(ccl, ry, cw, rowH);
+                            wc.MeasureTree(app);
+                            wc.Arrange(cellRect.x, cellRect.y, cellRect.width, cellRect.height);
+                            wc.RenderTree(app);
+                            painted = true;
+                        }
+                        c.PopClip();
+                    }
                     // 自定义绘制器完全接管单元格。将画布裁剪到
                     // 自身的矩形内，行为异常的绘制器不会溢出到
                     // 相邻单元格或表格之外。
-                    bool painted = false;
-                    if (st.styler != null) {
+                    if (!painted && st.styler != null) {
                         c.PushClip(ccl, ry, cw, rowH);
                         painted = st.styler.PaintCell(app, src, rowIdx, cc, ccl, ry, cw, rowH);
                         c.PopClip();
@@ -1482,8 +1683,9 @@ partial class DataTable {
                                 DataTable.CellForeground(st, src, rowIdx, cc),
                                 depth, true, canExp, isExp);
                         } else {
-                            DataTable.DrawCell(app, cols[cc], cellText, ccl, ry, cw, rowH,
-                                               cfLo, cfHi, DataTable.CellForeground(st, src, rowIdx, cc));
+                            DataTable.DrawCellRangeCtx(app, cols[cc], cellText, ccl, ry, cw, rowH,
+                                                  cfLo, cfHi, DataTable.CellForeground(st, src, rowIdx, cc),
+                                                  rowIdx, cc, st);
                         }
                     }
                     // 可编辑的 bool 单元格单击即切换，

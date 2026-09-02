@@ -5,7 +5,8 @@ using Gui.Widget;
 namespace Gui.Component.DataTable;
 
 /// DataTable 的列描述符。
-/// cellType：0 文本，1 链接，2 标签，3 进度，4 徽章
+/// cellType：0 文本，1 链接，2 标签，3 进度，4 徽章，5 图片，
+/// 6 图标，7 按钮，8 迷你图
 /// align：0 左对齐，1 居中，2 右对齐
 class DataColumn {
     string title;
@@ -86,6 +87,22 @@ class DataColumn {
     // ---- 编辑 ----
     bool editable; // 单元格值可内联编辑（需显式开启）
 
+    // ---- 图标 / 按钮 / 迷你图列（cellType 6/7/8）----
+    // 图标列（6）：单元格值即 tabler 图标名（如 "check"），
+    //   用 Canvas.DrawGlyph 以 datatable::icon 的前景色绘制；
+    //   空值画空。不参与编辑、汇总与 tooltip。
+    // 按钮列（7）：单元格值作为按钮标签（空值画图标按钮，
+    //   用 btnIcon）；整格热区居中一个 small 按钮，
+    //   点击把 hitRow/hitCol 指向本格后 Raise CellClick。
+    //   不参与编辑与内联校验。
+    // 迷你图列（8）：单元格值是以逗号分隔的数值序列
+    //   （如 "12,18,9,24"），ParseReal 宽松解析，格内
+    //   画 accent 色迷你柱状图；序列为空画空。
+    //   不参与编辑、汇总与 tooltip。
+    string btnIcon; // 按钮列的图标（值为空时的按钮内容）
+    string btnClass; // 按钮列的 class（如 "primary"、"danger text"）
+    bool sparkArea; // 迷你图是否在柱下画半透明面积
+
     // 单元格打开的编辑器：0 = 纯文本框；1 = 下拉框，从
     // `choices` 中选取；2 = 日历，用于日期列；3 = 数字微调器，按
     // `editStep` 步进。bool 列忽略此项——它们在原地切换。
@@ -152,6 +169,9 @@ class DataColumn {
         this.boolFalse = "false";
         this.editable = false;
         this.editorKind = 0;
+        this.btnIcon = "";
+        this.btnClass = "";
+        this.sparkArea = false;
         this.choices = new List<string>();
         this.choicesStrict = true;
         this.editStep = 1.0;
@@ -452,6 +472,64 @@ class DataColumn {
         DataColumn c = new DataColumn(title, width);
         c.cellType = 4;
         c.align = 1;
+        return c;
+    }
+
+    /// 图片列：单元格值是文件路径、`mem:` 已注册 key 或 http(s)
+    /// URL（URL 由 ImageHttp 后台取回，就绪后自动重绘；加载中与
+    /// 失败画淡色占位块）。图片在格内 contain 缩放居中，不参与
+    /// 条件格式、汇总与内联编辑。
+    static DataColumn ImageCol(string title, int width) {
+        DataColumn c = new DataColumn(title, width);
+        c.cellType = 5;
+        c.align = 1;
+        return c;
+    }
+
+    /// 图标列：单元格值即 tabler 图标名（"check"、"trash"、"pencil"），
+    /// 以 datatable::icon 的前景色居中绘制；空值画空。
+    /// 不可排序/筛选——图标名不是可比较的数据。
+    static DataColumn IconCol(string title, int width) {
+        DataColumn c = new DataColumn(title, width);
+        c.cellType = 6;
+        c.align = 1;
+        c.sortable = false;
+        c.filterable = false;
+        return c;
+    }
+
+    /// 按钮列：整格居中一个 small 按钮。单元格值是按钮标签；
+    /// 标签为空时用 `icon`（tabler 图标名）画图标按钮。
+    /// 点击按钮把 hitRow/hitCol 指向本格并 Raise CellClick，
+    /// 处理器与普通单元格点击走同一入口读取上下文。
+    /// `cls` 是按钮 class（"primary"、"danger outline"、"text"…），
+    /// 空串用默认外观。不可排序/筛选/编辑。
+    static DataColumn ButtonCol(string title, int width, string icon, string cls) {
+        DataColumn c = new DataColumn(title, width);
+        c.cellType = 7;
+        c.align = 1;
+        c.btnIcon = icon;
+        c.btnClass = cls;
+        c.sortable = false;
+        c.filterable = false;
+        c.editable = false;
+        return c;
+    }
+
+    /// 迷你图列：单元格值是以逗号分隔的数值序列
+    /// （"12,18,9,24,30"），ParseReal 宽松解析（"¥1,234" 也能读），
+    /// 格内以 accent 色画等槽位迷你柱状图，柱高以序列最大值为比例。
+    /// `area` 为 true 时柱下叠加半透明 accent 面积。
+    /// 不可排序/筛选——序列文本不构成可比较的键。
+    static DataColumn SparklineCol(string title, int width, bool area) {
+        DataColumn c = new DataColumn(title, width);
+        c.cellType = 8;
+        c.align = 1;
+        c.btnIcon = "";
+        c.btnClass = "";
+        c.sparkArea = area;
+        c.sortable = false;
+        c.filterable = false;
         return c;
     }
 
@@ -1088,6 +1166,12 @@ class DataTableState {
     CellStyler styler;         // 可选的行/单元格着色 + 自定义单元格绘制
                                // （null = 默认外观；见 CellStyler）
 
+    // ---- 单元格控件插槽 ----
+    // 非 null 时渲染循环对每格调用 provider.Provide 取真控件
+    // （PropertyGrid 同款控件内嵌），控件按格矩形渲染；
+    // 返回 null 的格走内置 cellType 渲染。见 CellWidgetProvider。
+    CellWidgetProvider cellWidgets;
+
     // ---- 主从详情 ----
     // 用户展开的行，以*源*行索引保存，
     // 展开状态随行经历排序和过滤，而不是钉在
@@ -1129,6 +1213,7 @@ class DataTableState {
         this.resizeStartW = 0;
         this.dirty = true;
         this.keyProvider = null;
+        this.cellWidgets = null;
         this.rowKeys = new List<RowKey>();
         this.rowKeysRevision = -1;
         this.diagnostics = new List<TableDiagnostic>();
@@ -1580,4 +1665,52 @@ class DetailProvider {
     /// 该矩形内，面板不会溢出到相邻行。
     virtual void Paint(App app, DataSource src, int row,
                        int x, int y, int w, int h) { }
+}
+
+/// 单元格控件插槽：为网格列提供*真控件*而非自绘
+/// （DevExpress 的 CustomRowCellEdit + RepositoryItem 语义）。
+///
+/// 继承并重写 <see cref="Provide"/>，赋给 <c>st.cellWidgets</c>。
+/// 渲染循环每格调用 Provide 取控件，把控件按格矩形
+/// 停靠、渲染——控件拥有完整交互（点击、编辑、悬停），
+/// 事件经控件自身的处理器派发，与独立放置无异。
+///
+/// 控件实例必须由 provider *池化复用*：每帧每格调用
+/// Provide，且 row 无固定身份（虚拟滚动下同一显示槽位
+/// 会滚过任意多行），因此 provider 以 RowKey（稳定行
+/// 身份，`src.GetRowKey(row)`）为键缓存控件实例，
+/// 同一行在帧间拿回同一个控件——文本输入不丢焦点、
+/// 复选框不闪、滚动往返不重置。列数与列身份每帧
+/// 一致（由渲染循环保证）；返回 null 表示该格
+/// 退回内置渲染。
+///
+/// ```zan
+/// class OpCellHost : CellWidgetProvider {
+///     List<Control> pool = new List<Control>();
+///     override Control Provide(App app, DataSource src, int row, int col, int x, int y, int w, int h) {
+///         RowKey k = src.GetRowKey(row);
+///         Control ctl = this.Find(k, col);
+///         if (ctl == null) {
+///             Button b = new Button("Edit");
+///             b.Class = "small text";
+///             b.Click.Add(() => { ... });
+///             ctl = b;
+///             this.Remember(k, col, ctl);
+///         }
+///         return ctl;
+///     }
+/// }
+/// st.cellWidgets = new OpCellHost();
+/// ```
+class CellWidgetProvider {
+    /// 为 (row, col) 提供控件。可返回 null——该格退回
+    /// 内置渲染路径（cellType 分派）。控件随后被渲染循环
+    /// 摆放到 [x,y,w,h] 内（列头之下的格矩形），池化由
+    /// 实现负责（见类注释）。
+    virtual Control Provide(App app, DataSource src, int row, int col,
+                            int x, int y, int w, int h) { return null; }
+
+    /// （可选）框架在销毁/重建网格状态时通知 provider
+    /// 清空池，控件随之可被 GC。
+    virtual void Reset() { }
 }

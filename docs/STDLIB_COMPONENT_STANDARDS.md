@@ -110,7 +110,34 @@
    不进 Control 基类——它属于消费方（如"模型侧确认值"快照归 ChildWindow
    的旁表所有，`Control.bindSnapshot` 已拆除）。
 
-## 7. 现存违规清单（改造 backlog）
+## 7. DataTable 单元格内嵌（Gui 组件契约）
+
+> DataTable 是即时模式自绘表格（虚拟滚动，无每格控件树），但单元格内嵌
+> 图标/按钮/图表/真控件是商业网格的基本能力。2026-09 起提供三层机制，
+> 选型从轻到重，禁止在渲染循环外自绘或绕过热区注册。
+
+1. **声明式内置列优先**（`DataColumn.IconCol / ButtonCol / SparklineCol`，
+   cellType 6/7/8）：图标走 `Canvas.DrawGlyph` tabler 名；按钮画圆角小按钮 +
+   `Ui.Activate` 热区/键盘激活，点击把 `st.hitRow/st.hitCol` 指向本格后
+   Raise `CellClick`（处理器与普通单元格点击同入口）；迷你图按 `,` 分隔
+   数值序列画 accent 迷你柱状图。三类列默认 `sortable=false/filterable=false`，
+   导出走默认文本路径无需改动。新增 cellType 必须在 `DrawCellRangeCtx` 加
+   渲染分支 + 本条登记，消费面只在 Render.zan。
+2. **真控件插槽 `CellWidgetProvider`**（`st.cellWidgets`）：需要输入框、
+   下拉、开关等真控件交互时继承它，`Provide()` 按 `(row, col)` 返回
+   `Control`（null 退回内置渲染）。渲染循环 `MeasureTree → Arrange(格矩形) →
+   RenderTree`，裁剪在格内。**池化是实现的硬责任**：以 `src.GetRowKey(row)`
+   为键缓存控件实例（虚拟滚动下同一显示槽位会滚过任意多行），否则焦点
+   丢失、状态闪变。provider 需实现 `Reset()` 供网格重建时清池。
+3. **自绘兜底 `CellStyler.PaintCell`**：返回 true 完全接管该格（画布已裁剪），
+   用于着色、徽标、城市色点这类非交互定制。交互热区自行注册时必须用
+   `app.focus.AllocId()` + `app.hitTester.RegisterRect`，点击判定走
+   `Ui.Clicked/Ui.Activate`，禁止裸比 `app.mouseX/Y`（看不见上层弹层）。
+
+选型决策：只展示 → 内置列；要真控件交互 → CellWidgetProvider；只是画 →
+PaintCell。三者在渲染循环的优先级：cellWidgets > styler > 内置 cellType。
+
+## 8. 现存违规清单（改造 backlog）
 
 以下已解决项移出待办（✅）；未解决项仍有效。
 
