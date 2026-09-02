@@ -1,0 +1,147 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Sys;
+using ZanWeb.Model.Wms;
+
+namespace ZanWeb.Admin.Wms;
+
+/* /admin/wms/stockin 入库登记：列表 + 建单。建单在 [Tx] 内同时写流水(wms_stock_in)与更新汇总(wms_inventory)，任一失败整体回滚。 */
+[Route("admin/wms/stockin/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("入库登记")]
+class StockIn : AdminController {
+    [HttpGet]
+    [Route("/admin/wms/stockin")]
+    [Custom(IsMenu = true, Icon = "mdi:package-variant", Perm = PermBit.View)]
+    [Description("入库登记")]
+    async void Index() {
+        ViewData d = await this.Layout("入库登记");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        ListQuery q = this.Paged("id", 20);
+        List<WmsStockIn> rows = await this.WmsStockIn
+            .OrderByDescending(a => a.id)
+            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        int total = await this.WmsStockIn.CountAsync();
+
+        List<WmsWarehouse> whs = await this.WmsWarehouse.OrderBy(a => a.id).ToListAsync();
+        List<WmsSku> skus = await this.WmsSku.OrderBy(a => a.id).ToListAsync();
+
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            WmsStockIn r = rows[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(r.id));
+            row.Set("billNo", r.billNo);
+            row.Set("warehouse", StockIn.NameOf(whs, r.warehouseId));
+            row.Set("sku", StockIn.NameOfSku(skus, r.skuId));
+            row.Set("qty", Convert.ToString(r.qty));
+            row.Set("createdAt", Fmt.Day(r.createdAt));
+            items.Add(row);
+        }
+        this.Pager(d, q, total);
+        this.Page(d);
+    }
+
+    [HttpGet]
+    [Custom(Perm = PermBit.Create)]
+    [Description("入库表单")]
+    async void Create() {
+        ViewData d = new ViewData();
+        List<WmsWarehouse> whs = await this.WmsWarehouse
+            .Where(a => a.status == 1).OrderBy(a => a.id).ToListAsync();
+        List<WmsSku> skus = await this.WmsSku.OrderBy(a => a.id).ToListAsync();
+        List<StrMap> wopts = d.AddList("warehouses");
+        for (int i = 0; i < whs.Count; i = i + 1) {
+            StrMap o = new StrMap();
+            o.Set("id", Convert.ToString(whs[i].id));
+            o.Set("name", whs[i].name);
+            wopts.Add(o);
+        }
+        List<StrMap> sopts = d.AddList("skus");
+        for (int i = 0; i < skus.Count; i = i + 1) {
+            StrMap o = new StrMap();
+            o.Set("id", Convert.ToString(skus[i].id));
+            o.Set("name", skus[i].name);
+            sopts.Add(o);
+        }
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Tx]
+    [Custom(Perm = PermBit.Create)]
+    [Description("提交入库单")]
+    async void Submit() {
+        int warehouseId = this.InInt("warehouseId", 0);
+        int skuId = this.InInt("skuId", 0);
+        int qty = this.InInt("qty", 0);
+        string remark = this.In("remark");
+        if (warehouseId <= 0) { this.Fail(400, "0004", "请选择仓库"); }
+        if (skuId <= 0) { this.Fail(400, "0004", "请选择商品"); }
+        if (qty <= 0) { this.Fail(400, "0004", "数量必须大于 0"); }
+
+        WmsWarehouse wh = await this.WmsWarehouse.Where(a => a.id == warehouseId).FirstAsync();
+        if (wh == null || wh.status != 1) { this.Fail(400, "0004", "仓库不可用"); }
+        WmsSku sku = await this.WmsSku.Where(a => a.id == skuId).FirstAsync();
+        if (sku == null) { this.Fail(400, "0004", "商品不存在"); }
+
+        User me = await this.Admin();
+        int operatorId = me != null ? me.id : 0;
+
+        string billNo = StockIn.NextBill();
+        WmsStockIn flow = new WmsStockIn();
+        flow.billNo = billNo;
+        flow.warehouseId = warehouseId;
+        flow.skuId = skuId;
+        flow.qty = (long)qty;
+        flow.operatorId = operatorId;
+        flow.remark = remark;
+        flow.createdAt = WebApp.NowSeconds();
+        int flowId = await this.WmsStockIn.Insert(flow).ExecuteIdentityAsync();
+        if (flowId <= 0) { this.Fail(500, "0500", "流水写入失败"); }
+
+        /* 汇总表只增不减：存在则加，不存在则建。 */
+        WmsInventory inv = await this.WmsInventory
+            .Where(a => a.warehouseId == warehouseId && a.skuId == skuId)
+            .FirstAsync();
+        if (inv == null) {
+            WmsInventory ni = new WmsInventory();
+            ni.warehouseId = warehouseId;
+            ni.skuId = skuId;
+            ni.qty = (long)qty;
+            ni.updatedAt = WebApp.NowSeconds();
+            await this.WmsInventory.Insert(ni).ExecuteIdentityAsync();
+        } else {
+            await this.WmsInventory.Update()
+                .Set(a => a.qty, inv.qty + (long)qty)
+                .Set(a => a.updatedAt, WebApp.NowSeconds())
+                .Where(a => a.id == inv.id)
+                .ExecuteAffrowsAsync();
+        }
+        await this.Note("入库登记", billNo + " +" + Convert.ToString(qty), true, "");
+        this.Saved("入库成功：" + billNo);
+    }
+
+    static string NextBill() {
+        long t = WebApp.NowSeconds();
+        return "IN" + Convert.ToString(t);
+    }
+
+    static string NameOf(List<WmsWarehouse> list, int id) {
+        for (int i = 0; i < list.Count; i = i + 1) {
+            if (list[i].id == id) { return list[i].name; }
+        }
+        return "—";
+    }
+
+    static string NameOfSku(List<WmsSku> list, int id) {
+        for (int i = 0; i < list.Count; i = i + 1) {
+            if (list[i].id == id) { return list[i].name; }
+        }
+        return "—";
+    }
+}

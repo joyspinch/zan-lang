@@ -1,0 +1,475 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Security.Cryptography;
+using System.Web;
+using ZanWeb.Model.Sys;
+using ZanWeb.Model.Wms;
+using ZanWeb.Model.Crm;
+using ZanWeb.Model.Flow;
+using ZanWeb.Dao.Sys;
+
+namespace ZanWeb;
+
+/* 表结构 + 种子数据，启动时由 main.zan 一次性应用。CodeFirst (SyncStructure) 读取数据库目录发 DDL，不做每次请求触发。种子带计数保护，重复启动不变。权限仅 seed 内置角色持有哪些 action，其余从路由表派生。*/
+class Schema {
+    /* 创建/更新全部表并填充种子数据。数据库不可达时返回 false，服务器仍启动。*/
+    static async bool Ensure(DbContext ctx) {
+        IDbConnection db = await ctx.Acquire();
+        if (db == null) { return false; }
+        try {
+            /* SQLite 启用 WAL（其他引擎无操作）：多 worker 共享文件时避免写者阻塞读者。*/
+            await DbSchema.UseWriteAheadLogAsync(db);
+            /* 编译期已知所有 [Table] 类，一行调用覆盖全部，新模型无需补行。*/
+            await db.SyncStructureAllAsync();
+
+            if (!await Schema.SeedAdmin(db)) { return false; }
+            if (!await Schema.SeedRoles(db)) { return false; }
+            if (!await Schema.SeedDepartments(db)) { return false; }
+            if (!await Schema.SeedDicts(db)) { return false; }
+            if (!await Schema.SeedSettings(db)) { return false; }
+            if (!await Schema.SeedWms(db)) { return false; }
+            if (!await Schema.SeedCrm(db)) { return false; }
+            if (!await Schema.SeedFlow(db)) { return false; }
+            return true;
+        } finally {
+            ctx.Release(db);
+        }
+    }
+
+    /* 空库创建 bootstrap 账号；密码为开发用，部署前必须修改。*/
+    static async bool SeedAdmin(IDbConnection db) {
+        UserDao users = new UserDao(db);
+        int have = await users.Count();
+        if (have > 0) { return true; }
+        string salt = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
+        User admin = new User();
+        admin.username = "admin";
+        admin.passwordSalt = salt;
+        admin.passwordHash = AuthUser.PasswordHash("admin1234", salt);
+        admin.nickname = "系统管理员";
+        admin.status = AuthUser.Active;
+        admin.isSuper = 1;
+        admin.tokenVersion = 1;
+        admin.createdAt = WebApp.NowSeconds();
+        int _id = await users.Insert(admin);
+        return _id > 0;
+    }
+
+    /* 两个内置角色：admin（全部管理）和 editor（仅内容管理）。bootstrap 账号绕过角色表，防止误操作锁死。具体权限由 SyncRoleGrants 从路由表填充。*/
+    static async bool SeedRoles(IDbConnection db) {
+        int have = await db.Select<Role>().CountAsync();
+        if (have > 0) { return true; }
+        int _admin = await Schema.AddRole(db, "系统管理员", "admin", 1,
+            "除超级管理员外的全部管理权限", DataScope.RoleAll);
+        int _editor = await Schema.AddRole(db, "内容编辑", "editor", 10,
+            "只能管理博客内容", DataScope.RoleAll);
+        return _admin > 0 && _editor > 0;
+    }
+
+    static async int AddRole(IDbConnection db, string name, string code, int rank,
+                          string description, int dataScope) {
+        Role r = new Role();
+        r.name = name;
+        r.code = code;
+        r.rank = rank;
+        r.status = 1;
+        r.description = description;
+        /* 旧行缺此列则读作 0，DataScope 视为 全部数据，升级不缩权。*/
+        r.dataScope = dataScope;
+        r.scopeDepts = "";
+        r.createdAt = WebApp.NowSeconds();
+        r.updatedAt = r.createdAt;
+        return await db.Insert<Role>(r).ExecuteIdentityAsync();
+    }
+
+    static async bool Grant(IDbConnection db, int roleId, string screen, int mask,
+                            long now) {
+        RoleGrant g = new RoleGrant();
+        g.roleId = roleId;
+        g.action = screen;
+        g.mask = mask;
+        g.createdAt = now;
+        int _id = await db.Insert<RoleGrant>(g).ExecuteIdentityAsync();
+        return _id > 0;
+    }
+
+    static async bool SeedDepartments(IDbConnection db) {
+        int have = await db.Select<Department>().CountAsync();
+        if (have > 0) { return true; }
+        if (!await Schema.AddDept(db, 0, "总部", "root", 1)) { return false; }
+        if (!await Schema.AddDept(db, 1, "技术部", "tech", 2)) { return false; }
+        return await Schema.AddDept(db, 1, "内容运营", "content", 3);
+    }
+
+    static async bool AddDept(IDbConnection db, int parentId, string name,
+                           string code, int sortOrder) {
+        Department d = new Department();
+        d.parentId = parentId;
+        d.name = name;
+        d.code = code;
+        d.leaderUserId = 0;
+        d.sortOrder = sortOrder;
+        d.status = 1;
+        int _id = await db.Insert<Department>(d).ExecuteIdentityAsync();
+        return _id > 0;
+    }
+
+    static async bool SeedDicts(IDbConnection db) {
+        int have = await db.Select<DictType>().CountAsync();
+        if (have > 0) { return true; }
+        if (!await Schema.AddDictType(db, "user_status", "账号状态")) { return false; }
+        if (!await Schema.AddDictItem(db, "user_status", "1", "启用", 1)) { return false; }
+        if (!await Schema.AddDictItem(db, "user_status", "0", "禁用", 2)) { return false; }
+        if (!await Schema.AddDictType(db, "post_status", "文章状态")) { return false; }
+        if (!await Schema.AddDictItem(db, "post_status", "1", "已发布", 1)) { return false; }
+        return await Schema.AddDictItem(db, "post_status", "0", "草稿", 2);
+    }
+
+    static async bool AddDictType(IDbConnection db, string code, string name) {
+        DictType t = new DictType();
+        t.code = code;
+        t.name = name;
+        t.status = 1;
+        t.description = "";
+        t.createdAt = WebApp.NowSeconds();
+        t.updatedAt = t.createdAt;
+        int _id = await db.Insert<DictType>(t).ExecuteIdentityAsync();
+        return _id > 0;
+    }
+
+    static async bool AddDictItem(IDbConnection db, string typeCode, string value,
+                            string label, int sortOrder) {
+        DictItem it = new DictItem();
+        it.typeCode = typeCode;
+        it.value = value;
+        it.label = label;
+        it.sortOrder = sortOrder;
+        it.status = 1;
+        it.createdAt = WebApp.NowSeconds();
+        it.updatedAt = it.createdAt;
+        int _id = await db.Insert<DictItem>(it).ExecuteIdentityAsync();
+        return _id > 0;
+    }
+
+    static async bool SeedSettings(IDbConnection db) {
+        int have = await db.Select<SiteSetting>().CountAsync();
+        if (have > 0) {
+            return await Schema.SeedFeatureSettings(db);
+        }
+        if (!await Schema.AddSetting(db, "基本", "site.title", "站点名称", "Zan",
+            "text", "浏览器标题与页脚使用", 1)) { return false; }
+        if (!await Schema.AddSetting(db, "基本", "site.subtitle", "副标题",
+            "熟悉的语法，原生的速度", "text", "", 2)) { return false; }
+        if (!await Schema.AddSetting(db, "基本", "site.description", "站点描述", "",
+            "textarea", "写入首页 meta description", 3)) { return false; }
+        if (!await Schema.AddSetting(db, "基本", "site.keywords", "关键词", "Zan,编译型语言,ZanWeb",
+            "text", "逗号分隔，写入 meta keywords", 4)) { return false; }
+        if (!await Schema.AddSetting(db, "备案", "site.icp", "ICP 备案号", "",
+            "text", "显示在页脚并链接到工信部查询页", 10)) { return false; }
+        if (!await Schema.AddSetting(db, "备案", "site.police", "公安备案号", "",
+            "text", "", 11)) { return false; }
+        if (!await Schema.AddSetting(db, "页脚", "site.copyright", "版权信息", "",
+            "text", "", 20)) { return false; }
+        if (!await Schema.AddSetting(db, "页脚", "site.contact", "联系方式", "",
+            "text", "", 21)) { return false; }
+        if (!await Schema.AddSetting(db, "统计", "site.analytics", "统计代码", "",
+            "textarea", "原样输出到页面底部，只接受可信来源的脚本", 30)) { return false; }
+        return await Schema.SeedFeatureSettings(db);
+    }
+
+    static async bool SeedFeatureSettings(IDbConnection db) {
+        if (!await Schema.EnsureSetting(db, "基本", "site.timezone", "时区偏移",
+            "480", "text",
+            "与 UTC 的分钟偏移，例如 480 表示 UTC+8（北京时间）；服务器在境外时按此换算显示",
+            5)) { return false; }
+        if (!await Schema.EnsureSetting(db, "注册登录", "auth.register.enabled",
+            "开放注册", "0", "switch", "关闭后前台隐藏注册入口并拒绝注册请求", 50)) { return false; }
+        if (!await Schema.EnsureSetting(db, "注册登录", "auth.register.verify",
+            "注册需邮箱验证码", "1", "switch", "需要先配置好邮件服务", 51)) { return false; }
+        if (!await Schema.EnsureSetting(db, "注册登录", "auth.reset.enabled",
+            "允许找回密码", "1", "switch", "通过邮箱验证码重设密码", 52)) { return false; }
+        if (!await Schema.EnsureSetting(db, "邮件服务", "mail.host", "SMTP 主机", "",
+            "text", "例如 smtp.qq.com", 60)) { return false; }
+        if (!await Schema.EnsureSetting(db, "邮件服务", "mail.port", "端口", "465",
+            "text", "465 直连 TLS，587 STARTTLS，25 明文", 61)) { return false; }
+        if (!await Schema.EnsureSetting(db, "邮件服务", "mail.ssl", "使用 TLS", "1",
+            "switch", "465 端口保持开启", 62)) { return false; }
+        if (!await Schema.EnsureSetting(db, "邮件服务", "mail.user", "账号", "",
+            "text", "", 63)) { return false; }
+        if (!await Schema.EnsureSetting(db, "邮件服务", "mail.pass", "密码 / 授权码", "",
+            "password", "多数邮箱要求使用授权码而不是登录密码", 64)) { return false; }
+        if (!await Schema.EnsureSetting(db, "邮件服务", "mail.from", "发件邮箱", "",
+            "text", "留空则使用账号", 65)) { return false; }
+        if (!await Schema.EnsureSetting(db, "邮件服务", "mail.fromName", "发件人名称", "",
+            "text", "", 66)) { return false; }
+        if (!await Schema.EnsureSetting(db, "AI 助手", "ai.enabled", "启用助手", "0",
+            "switch", "开启后右下角的助手可以对话", 70)) { return false; }
+        if (!await Schema.EnsureSetting(db, "AI 助手", "ai.provider", "服务商", "deepseek",
+            "text", "从下方预设中选择后自动填写", 71)) { return false; }
+        if (!await Schema.EnsureSetting(db, "AI 助手", "ai.baseUrl", "接口地址",
+            "https://api.deepseek.com/v1", "text",
+            "OpenAI 兼容协议，末尾不带 /chat/completions", 72)) { return false; }
+        if (!await Schema.EnsureSetting(db, "AI 助手", "ai.apiKey", "API Key", "",
+            "password", "只保存在服务端，页面不回显", 73)) { return false; }
+        if (!await Schema.EnsureSetting(db, "AI 助手", "ai.model", "模型",
+            "deepseek-chat", "text", "", 74)) { return false; }
+        if (!await Schema.EnsureSetting(db, "AI 助手", "ai.temperature", "温度", "0.3",
+            "text", "0 更稳定，1 更发散", 75)) { return false; }
+        return await Schema.EnsureSetting(db, "开发", "gen.root", "源码目录", "..",
+            "text", "生成的代码写到这里，相对服务进程的工作目录", 80);
+    }
+
+    static async bool EnsureSetting(IDbConnection db, string groupName, string name,
+                                string label, string value, string kind,
+                                string tip, int sortOrder) {
+        int have = await db.Select<SiteSetting>().Where(a => a.name == name).CountAsync();
+        if (have > 0) { return true; }
+        return await Schema.AddSetting(db, groupName, name, label, value, kind, tip, sortOrder);
+    }
+
+    static async bool AddSetting(IDbConnection db, string groupName, string name,
+                             string label, string value, string kind,
+                             string tip, int sortOrder) {
+        SiteSetting s = new SiteSetting();
+        s.groupName = groupName;
+        s.name = name;
+        s.label = label;
+        s.value = value;
+        s.kind = kind;
+        s.tip = tip;
+        s.sortOrder = sortOrder;
+        s.updatedAt = WebApp.NowSeconds();
+        int _id = await db.Insert<SiteSetting>(s).ExecuteIdentityAsync();
+        return _id > 0;
+    }
+
+
+    /* 域种子：默认仓库与一件示例 SKU，使「入库登记」开箱即可用。空表才写。 */
+    static async bool SeedWms(IDbConnection db) {
+        int wh = await db.Select<WmsWarehouse>().CountAsync();
+        if (wh == 0) {
+            WmsWarehouse w = new WmsWarehouse();
+            w.name = "默认仓库";
+            w.code = "WH01";
+            w.location = "总部";
+            w.status = 1;
+            w.createdAt = WebApp.NowSeconds();
+            w.updatedAt = w.createdAt;
+            await db.Insert<WmsWarehouse>(w).ExecuteIdentityAsync();
+        }
+        int sk = await db.Select<WmsSku>().CountAsync();
+        if (sk == 0) {
+            WmsSku s = new WmsSku();
+            s.sku = "SKU001";
+            s.name = "示例商品";
+            s.unit = "件";
+            s.spec = "";
+            s.createdAt = WebApp.NowSeconds();
+            s.updatedAt = s.createdAt;
+            await db.Insert<WmsSku>(s).ExecuteIdentityAsync();
+        }
+        return true;
+    }
+
+    /* 域种子：一个示例客户，使「商机管理」开箱即可选到客户。空表才写。 */
+    static async bool SeedCrm(IDbConnection db) {
+        int c = await db.Select<CrmCustomer>().CountAsync();
+        if (c == 0) {
+            CrmCustomer cu = new CrmCustomer();
+            cu.name = "示例客户";
+            cu.contact = "张三";
+            cu.phone = "13800000000";
+            cu.level = 2;
+            cu.ownerId = 0;
+            cu.remark = "";
+            cu.createdAt = WebApp.NowSeconds();
+            cu.updatedAt = cu.createdAt;
+            await db.Insert<CrmCustomer>(cu).ExecuteIdentityAsync();
+        }
+        return true;
+    }
+
+    /* 域种子：示例流程「商品上架流程」（运营→美工(AI)→仓库），使流程编排开箱可发起。空表才写。 */
+    static async bool SeedFlow(IDbConnection db) {
+        int have = await db.Select<FlowDef>().CountAsync();
+        if (have > 0) { return true; }
+        long now = WebApp.NowSeconds();
+        FlowDef def = new FlowDef();
+        def.name = "商品上架流程";
+        def.description = "运营申报 → AI 生成资料 → 仓库确认库存，演示三级流转";
+        def.status = 1;
+        def.createdAt = now;
+        def.updatedAt = now;
+        int defId = await db.Insert<FlowDef>(def).ExecuteIdentityAsync();
+        if (defId <= 0) { return false; }
+        if (!await Schema.AddFlowNode(db, defId, 1, "运营申报",
+            0, 0, "human", "", now)) { return false; }
+        if (!await Schema.AddFlowNode(db, defId, 2, "商品资料整理(AI)",
+            0, 0, "ai", "为商品撰写标题、卖点与详情页文案", now)) { return false; }
+        return await Schema.AddFlowNode(db, defId, 3, "仓库确认库存",
+            0, 0, "human", "", now);
+    }
+
+    static async bool AddFlowNode(IDbConnection db, int defId, int sort,
+                               string name, int deptId, int assignUserId,
+                               string kind, string aiPrompt, long now) {
+        FlowNode n = new FlowNode();
+        n.defId = defId;
+        n.name = name;
+        n.sort = sort;
+        n.deptId = deptId;
+        n.assignUserId = assignUserId;
+        n.kind = kind;
+        n.aiPrompt = aiPrompt;
+        n.createdAt = now;
+        int _id = await db.Insert<FlowNode>(n).ExecuteIdentityAsync();
+        return _id > 0;
+    }
+
+    /* ---- 路由派生授权 ---- */
+    /* 存在的权限 = 路由表。部署决策写入 sys_role_grant 行。内置 admin 始终覆盖全部管理屏，内置 editor 始终覆盖内容屏。本方法只 INSERT，操作者撤销的权限不会被重新添加。*/
+
+    /* 将 mask=0 的旧授权行按 screen 合并为一条屏掩码行；仅 mask=0 的行参与，第二次启动起即 no-op。未声明位的 action 丢弃并在 Perm.Index boot 行提示。*/
+    static async bool MigrateGrants(IDbConnection db) {
+        List<RoleGrant> old = await db.Select<RoleGrant>()
+            .Where(a => a.mask == 0).ToListAsync();
+        if (old.Count == 0) { return true; }
+
+        List<string> keys = new List<string>();
+        List<int> masks = new List<int>();
+        for (int i = 0; i < old.Count; i = i + 1) {
+            RoleGrant g = old[i];
+            int bit = Perm.BitOf(g.action);
+            if (bit == 0) { continue; }
+            string key = Convert.ToString(g.roleId) + "|"
+                + Perm.ScreenOf(g.action);
+            int at = keys.IndexOf(key);
+            if (at < 0) { keys.Add(key); masks.Add(bit); }
+            else { masks[at] = masks[at] | bit; }
+        }
+
+        int _gone = await db.Delete<RoleGrant>().Where(a => a.mask == 0)
+            .ExecuteAffrowsAsync();
+        long now = WebApp.NowSeconds();
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            string key = keys[i];
+            int bar = key.IndexOf("|");
+            int roleId = Convert.ToInt32(key.Substring(0, bar));
+            string screen = key.Substring(bar + 1);
+            RoleGrant have = await db.Select<RoleGrant>()
+                .Where(a => a.roleId == roleId && a.action == screen)
+                .FirstAsync();
+            if (have != null) {
+                int merged = have.mask | masks[i];
+                int _n = await db.Update<RoleGrant>()
+                    .Set(a => a.mask, merged)
+                    .Where(a => a.id == have.id).ExecuteAffrowsAsync();
+                continue;
+            }
+            if (!await Schema.Grant(db, roleId, screen, masks[i], now)) { return false; }
+        }
+        Console.WriteLine("[rbac] 旧授权已合并为 "
+            + Convert.ToString(keys.Count) + " 条屏掩码");
+        return true;
+    }
+
+    /* 将不再存在的旧屏键迁移到带模块前缀的新键；无匹配或多匹配的不动并在日志中标出。*/
+    static async bool MigrateGrantKeys(IDbConnection db) {
+        List<RoleGrant> rows = await db.Select<RoleGrant>()
+            .Where(a => a.mask != 0).ToListAsync();
+        int moved = 0;
+        List<string> stray = new List<string>();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            RoleGrant g = rows[i];
+            if (Perm.MaskOf(g.action) != 0) { continue; }
+            string now = Perm.Qualify(g.action);
+            if (now.Length == 0) { stray.Add(g.action); continue; }
+            int gid = g.id;
+            int _n = await db.Update<RoleGrant>().Set(a => a.action, now)
+                .Where(a => a.id == gid).ExecuteAffrowsAsync();
+            moved = moved + 1;
+        }
+        if (moved > 0) {
+            Console.WriteLine("[rbac] " + Convert.ToString(moved)
+                + " 条授权已改用带模块前缀的屏键");
+        }
+        if (stray.Count > 0) {
+            Console.WriteLine("[rbac] " + Convert.ToString(stray.Count)
+                + " 条授权的屏幕已不存在，保留未动: "
+                + Perm.Join(stray, 8));
+        }
+        return true;
+    }
+
+    /* 给内置角色补发尚未持有的受控 action。每次启动安全，永不删除。*/
+    static async bool SyncRoleGrants(WebApp app) {
+        IDbConnection db = await AuthUser.Lease();
+        if (db == null) { return false; }
+        try {
+            if (!await Schema.MigrateGrants(db)) { return false; }
+            if (!await Schema.MigrateGrantKeys(db)) { return false; }
+            Role admin = await db.Select<Role>()
+                .Where(a => a.code == "admin").FirstAsync();
+            Role editor = await db.Select<Role>()
+                .Where(a => a.code == "editor").FirstAsync();
+            if (admin == null && editor == null) { return true; }
+
+            List<RoleGrant> rows = await db.Select<RoleGrant>().ToListAsync();
+            string adminHas = ",";
+            string editorHas = ",";
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                RoleGrant g = rows[i];
+                if (admin != null && g.roleId == admin.id) {
+                    adminHas = adminHas + g.action + ",";
+                }
+                if (editor != null && g.roleId == editor.id) {
+                    editorHas = editorHas + g.action + ",";
+                }
+            }
+
+            bool fillAdmin = admin != null && adminHas == ",";
+            bool fillEditor = editor != null && editorHas == ",";
+            if (!fillAdmin && !fillEditor) { return true; }
+
+            long now = WebApp.NowSeconds();
+            List<Route> routes = app.router.All();
+            List<string> screens = new List<string>();
+            List<int> masks = new List<int>();
+            List<bool> content = new List<bool>();
+            for (int i = 0; i < routes.Count; i = i + 1) {
+                Route r = routes[i];
+                if (r.action.Length == 0 || !r.needsAuth) { continue; }
+                int bit = Perm.BitOf(r.action);
+                if (bit == 0) { continue; }
+                string screen = Perm.ScreenOf(r.action);
+                int at = screens.IndexOf(screen);
+                if (at < 0) {
+                    screens.Add(screen);
+                    masks.Add(bit);
+                    content.Add(Schema.IsContent(r.pattern));
+                } else {
+                    masks[at] = masks[at] | bit;
+                    if (Schema.IsContent(r.pattern)) { content[at] = true; }
+                }
+            }
+            for (int i = 0; i < screens.Count; i = i + 1) {
+                if (fillAdmin && !await Schema.Grant(db, admin.id, screens[i], masks[i], now)) {
+                    return false;
+                }
+                if (fillEditor && content[i] &&
+                    !await Schema.Grant(db, editor.id, screens[i], masks[i], now)) {
+                    return false;
+                }
+            }
+            return true;
+        } finally {
+            AuthUser.Give(db);
+        }
+    }
+
+    static bool IsContent(string pattern) {
+        return pattern.StartsWith("/admin/content/") || pattern == "/admin";
+    }
+
+}

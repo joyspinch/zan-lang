@@ -1,0 +1,290 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Ecbi;
+
+namespace ZanWeb.Admin.Ecbi;
+
+/* /admin/ecbi/ads 推广数据：按店铺的投放日报（外部平台报表抽取后录入）。ROI = 推广成交金额 / 花费。 */
+[Route("admin/ecbi/ads/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("推广数据")]
+class Ads : AdminController {
+    [HttpGet]
+    [Route("/admin/ecbi/ads")]
+    [Custom(IsMenu = true, Icon = "mdi:megaphone", Perm = PermBit.View)]
+    [Description("推广数据")]
+    async void Index() {
+        ViewData d = await this.Layout("推广数据");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        ListQuery q = this.Paged("day", 20);
+        List<OdsAd> rows = await this.OdsAd
+            .OrderByDescending(a => a.day).OrderByDescending(a => a.id)
+            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        int total = await this.OdsAd.CountAsync();
+        List<OdsShop> shops = await this.OdsShop.OrderBy(a => a.id).ToListAsync();
+        List<OdsPlatform> plats = await this.OdsPlatform.OrderBy(a => a.id).ToListAsync();
+
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            OdsAd a = rows[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(a.id));
+            row.Set("shop", Ads.ShopName(shops, a.shopId));
+            row.Set("platform", Ads.PlatOfShop(shops, plats, a.shopId));
+            row.Set("campaign", Fmt.Dash(a.campaign));
+            row.Set("day", Fmt.Day(a.day));
+            row.Set("cost", Convert.ToString(a.cost));
+            row.Set("impression", Convert.ToString(a.impression));
+            row.Set("click", Convert.ToString(a.click));
+            row.Set("ctr", a.impression > 0
+                ? Convert.ToString(a.click * 100 / a.impression) + "%" : "—");
+            row.Set("orderCount", Convert.ToString(a.orderCount));
+            row.Set("orderAmount", Convert.ToString(a.orderAmount));
+            row.Set("roi", a.cost > 0
+                ? Convert.ToString(a.orderAmount * 100 / a.cost) + "%" : "—");
+            items.Add(row);
+        }
+        this.Pager(d, q, total);
+        this.Page(d);
+    }
+
+    [HttpGet]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("推广表单")]
+    async void Form() {
+        int id = this.InInt("id", 0);
+        OdsAd a = null;
+        if (id > 0) {
+            a = await this.OdsAd.Where(x => x.id == id).FirstAsync();
+            if (a == null) { this.Fail(404, "0404", "记录不存在"); }
+        }
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("dialogTitle", id > 0 ? "编辑推广记录" : "录入推广数据");
+        if (id <= 0) { d.Set("new", "1"); }
+
+        List<OdsShop> shops = await this.OdsShop
+            .Where(x => x.status == 1).OrderBy(x => x.id).ToListAsync();
+        List<OdsPlatform> plats = await this.OdsPlatform.OrderBy(x => x.id).ToListAsync();
+        List<StrMap> sopts = d.AddList("shops");
+        for (int i = 0; i < shops.Count; i = i + 1) {
+            StrMap opt = new StrMap();
+            opt.Set("id", Convert.ToString(shops[i].id));
+            opt.Set("name", shops[i].name + "（"
+                + Ads.PlatName(plats, shops[i].platformId) + "）");
+            if (a != null && shops[i].id == a.shopId) { opt.Set("selected", "selected"); }
+            sopts.Add(opt);
+        }
+        if (a != null) {
+            d.Set("campaign", a.campaign);
+            d.Set("day", Fmt.Day(a.day));
+            d.Set("cost", Convert.ToString(a.cost));
+            d.Set("impression", Convert.ToString(a.impression));
+            d.Set("click", Convert.ToString(a.click));
+            d.Set("orderCount", Convert.ToString(a.orderCount));
+            d.Set("orderAmount", Convert.ToString(a.orderAmount));
+            d.Set("edit", "1");
+            d.Set("new", "");
+        }
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("保存推广数据")]
+    async void Save() {
+        int id = this.InInt("id", 0);
+        int shopId = this.InInt("shopId", 0);
+        string campaign = this.In("campaign");
+        string dayStr = this.Need("day", "日期");
+        long cost = (long)this.InInt("cost", 0);
+        long impression = (long)this.InInt("impression", 0);
+        long click = (long)this.InInt("click", 0);
+        int orderCount = this.InInt("orderCount", 0);
+        long orderAmount = (long)this.InInt("orderAmount", 0);
+        if (shopId <= 0) { this.Fail(400, "0004", "请选择店铺"); }
+
+        /* 日期 YYYY-MM-DD → 当日零点秒。 */
+        long day = Ads.DayStart(dayStr);
+        if (day <= 0) { this.Fail(400, "0004", "日期格式应为 YYYY-MM-DD"); }
+
+        if (id > 0) {
+            int n = await this.OdsAd.Update()
+                .Set(a => a.shopId, shopId)
+                .Set(a => a.campaign, campaign)
+                .Set(a => a.day, day)
+                .Set(a => a.cost, cost)
+                .Set(a => a.impression, impression)
+                .Set(a => a.click, click)
+                .Set(a => a.orderCount, orderCount)
+                .Set(a => a.orderAmount, orderAmount)
+                .Where(a => a.id == id)
+                .ExecuteAffrowsAsync();
+            await this.Note("编辑推广数据", "#" + Convert.ToString(id), n > 0, "");
+            this.Saved("推广数据已保存");
+            return;
+        }
+        OdsAd a = new OdsAd();
+        a.shopId = shopId;
+        a.campaign = campaign;
+        a.day = day;
+        a.cost = cost;
+        a.impression = impression;
+        a.click = click;
+        a.orderCount = orderCount;
+        a.orderAmount = orderAmount;
+        int newId = await this.OdsAd.Insert(a).ExecuteIdentityAsync();
+        await this.Note("录入推广数据", "#" + Convert.ToString(newId) + " " + campaign,
+            newId > 0, "");
+        this.Saved("推广数据已录入");
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Delete)]
+    [Description("删除推广数据")]
+    async void Delete() {
+        int id = this.InInt("id", 0);
+        int n = await this.OdsAd.Delete().Where(a => a.id == id).ExecuteAffrowsAsync();
+        await this.Note("删除推广数据", "#" + Convert.ToString(id), n > 0, "");
+        this.Saved("推广数据已删除");
+    }
+
+    /* 推广分析：花费/成交/ROI 按平台×店铺汇总。 */
+    [HttpGet]
+    [Custom(IsMenu = false, Perm = PermBit.View)]
+    [Description("推广分析")]
+    async void Analysis() {
+        ViewData d = await this.Layout("推广分析");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        List<OdsAd> all = await this.OdsAd.ToListAsync();
+        List<OdsShop> shops = await this.OdsShop.OrderBy(a => a.id).ToListAsync();
+        List<OdsPlatform> plats = await this.OdsPlatform.OrderBy(a => a.id).ToListAsync();
+
+        /* 店铺粒度汇总：花费、成交、ROI、点击率。 */
+        long totalCost = 0;
+        long totalAmount = 0;
+        long totalClick = 0;
+        long totalImpression = 0;
+        List<StrMap> rows = d.AddList("rows");
+        for (int i = 0; i < shops.Count; i = i + 1) {
+            long cost = 0;
+            long amount = 0;
+            long click = 0;
+            long impression = 0;
+            for (int k = 0; k < all.Count; k = k + 1) {
+                if (all[k].shopId == shops[i].id) {
+                    cost = cost + all[k].cost;
+                    amount = amount + all[k].orderAmount;
+                    click = click + all[k].click;
+                    impression = impression + all[k].impression;
+                }
+            }
+            if (cost == 0 && amount == 0) { continue; }
+            totalCost = totalCost + cost;
+            totalAmount = totalAmount + amount;
+            totalClick = totalClick + click;
+            totalImpression = totalImpression + impression;
+            StrMap row = new StrMap();
+            row.Set("shop", shops[i].name);
+            row.Set("platform", Ads.PlatName(plats, shops[i].platformId));
+            row.Set("cost", Convert.ToString(cost));
+            row.Set("orderAmount", Convert.ToString(amount));
+            row.Set("roi", cost > 0 ? Convert.ToString(amount * 100 / cost) + "%" : "—");
+            row.Set("ctr", impression > 0
+                ? Convert.ToString(click * 100 / impression) + "%" : "—");
+            rows.Add(row);
+        }
+        d.Set("totalCost", Convert.ToString(totalCost));
+        d.Set("totalAmount", Convert.ToString(totalAmount));
+        d.Set("totalRoi", totalCost > 0
+            ? Convert.ToString(totalAmount * 100 / totalCost) + "%" : "—");
+        d.Set("totalCtr", totalImpression > 0
+            ? Convert.ToString(totalClick * 100 / totalImpression) + "%" : "—");
+        d.Set("noData", rows.Count == 0 ? "1" : "");
+        this.Page(d);
+    }
+
+    /* YYYY-MM-DD → 当日零点秒（本地方案，避免依赖额外解析器）。 */
+    static long DayStart(string s) {
+        if (s.Length != 10 || s[4] != '-' || s[7] != '-') { return 0; }
+        int y = 0;
+        int mo = 0;
+        int da = 0;
+        int i = 0;
+        while (i < 4) {
+            if (s[i] < '0' || s[i] > '9') { return 0; }
+            y = y * 10 + (s[i] - '0');
+            i = i + 1;
+        }
+        i = 5;
+        while (i < 7) {
+            if (s[i] < '0' || s[i] > '9') { return 0; }
+            mo = mo * 10 + (s[i] - '0');
+            i = i + 1;
+        }
+        i = 8;
+        while (i < 10) {
+            if (s[i] < '0' || s[i] > '9') { return 0; }
+            da = da * 10 + (s[i] - '0');
+            i = i + 1;
+        }
+        if (mo < 1 || mo > 12 || da < 1 || da > 31) { return 0; }
+        return (long)Ads.DaysFromEpoch(y, mo, da) * 86400;
+    }
+
+    /* 简化天数计算：以 1970-01-01 为基准，逐年逐月累加（不用数组，与基底保守写法一致）。 */
+    static int DaysFromEpoch(int year, int month, int day) {
+        int days = 0;
+        for (int y = 1970; y < year; y = y + 1) {
+            days = days + (Ads.IsLeap(y) ? 366 : 365);
+        }
+        int feb = Ads.IsLeap(year) ? 29 : 28;
+        int m = 1;
+        while (m < month) {
+            if (m == 1) { days = days + 31; }
+            else if (m == 2) { days = days + feb; }
+            else if (m == 3) { days = days + 31; }
+            else if (m == 4) { days = days + 30; }
+            else if (m == 5) { days = days + 31; }
+            else if (m == 6) { days = days + 30; }
+            else if (m == 7) { days = days + 31; }
+            else if (m == 8) { days = days + 31; }
+            else if (m == 9) { days = days + 30; }
+            else if (m == 10) { days = days + 31; }
+            else if (m == 11) { days = days + 30; }
+            else { days = days + 31; }
+            m = m + 1;
+        }
+        return days + day - 1;
+    }
+
+    static bool IsLeap(int y) {
+        return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    }
+
+    static string ShopName(List<OdsShop> shops, int id) {
+        for (int i = 0; i < shops.Count; i = i + 1) {
+            if (shops[i].id == id) { return shops[i].name; }
+        }
+        return "—";
+    }
+
+    static string PlatName(List<OdsPlatform> plats, int id) {
+        for (int i = 0; i < plats.Count; i = i + 1) {
+            if (plats[i].id == id) { return plats[i].name; }
+        }
+        return "—";
+    }
+
+    static string PlatOfShop(List<OdsShop> shops, List<OdsPlatform> plats, int shopId) {
+        for (int i = 0; i < shops.Count; i = i + 1) {
+            if (shops[i].id == shopId) { return Ads.PlatName(plats, shops[i].platformId); }
+        }
+        return "—";
+    }
+}

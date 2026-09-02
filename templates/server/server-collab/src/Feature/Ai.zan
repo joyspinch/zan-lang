@@ -1,0 +1,524 @@
+using System;
+using System.Data;
+using System.Json;
+using System.Net.External;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Text;
+using System.Web;
+
+namespace ZanWeb;
+
+/* AI 助手：每个助手只是一段系统提示词。 */
+class AiAgent {
+    string code;
+    string name;
+    string hint;
+    string icon;
+    /* 是否允许将结果提交到数据库（建表）。 */
+    bool apply;
+    string prompt;
+
+    AiAgent(string code, string name, string hint, string icon,
+            bool apply, string prompt) {
+        this.code = code;
+        this.name = name;
+        this.hint = hint;
+        this.icon = icon;
+        this.apply = apply;
+        this.prompt = prompt;
+    }
+}
+
+/* 预设的 AI 服务商：接口地址、模型、申请链接。 */
+class AiVendor {
+    string code;
+    string name;
+    string baseUrl;
+    string model;
+    string signup;
+
+    AiVendor(string code, string name, string baseUrl, string model,
+             string signup) {
+        this.code = code;
+        this.name = name;
+        this.baseUrl = baseUrl;
+        this.model = model;
+        this.signup = signup;
+    }
+}
+
+/* 流式返回的一段文本，用作 JSON 序列化对象。 */
+class AiDeltaDoc {
+    string text;
+}
+
+/* 一次对话的返回：成功返回文本，失败返回原因。 */
+class AiReply {
+    bool ok;
+    string text;
+
+    static AiReply Good(string text) {
+        AiReply r = new AiReply();
+        r.ok = true;
+        r.text = text;
+        return r;
+    }
+
+    static AiReply Bad(string why) {
+        AiReply r = new AiReply();
+        r.ok = false;
+        r.text = why;
+        return r;
+    }
+}
+
+/* AI 入口：服务商预设、内置助手、与 OpenAI 兼容接口的调用。Key 仅存于设置表，不发送到浏览器。 */
+class Ai {
+    /* 官方预设服务商，DeepSeek 排首位。 */
+    static List<AiVendor> Vendors() {
+        List<AiVendor> v = new List<AiVendor>();
+        v.Add(new AiVendor("deepseek", "DeepSeek", "https://api.deepseek.com/v1",
+            "deepseek-chat", "https://platform.deepseek.com"));
+        v.Add(new AiVendor("openai", "OpenAI", "https://api.openai.com/v1",
+            "gpt-4o-mini", "https://platform.openai.com/api-keys"));
+        v.Add(new AiVendor("qwen", "通义千问",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus",
+            "https://bailian.console.aliyun.com"));
+        v.Add(new AiVendor("zhipu", "智谱 GLM",
+            "https://open.bigmodel.cn/api/paas/v4", "glm-4-flash",
+            "https://open.bigmodel.cn/usercenter/apikeys"));
+        v.Add(new AiVendor("moonshot", "Moonshot Kimi",
+            "https://api.moonshot.cn/v1", "moonshot-v1-8k",
+            "https://platform.moonshot.cn/console/api-keys"));
+        v.Add(new AiVendor("ollama", "本地 Ollama", "http://127.0.0.1:11434/v1",
+            "qwen2.5:7b", "https://ollama.com/download"));
+        return v;
+    }
+
+    /* 内置助手列表，每个助手对应一个独立 persona。 */
+    static List<AiAgent> Agents() {
+        List<AiAgent> a = new List<AiAgent>();
+        a.Add(new AiAgent("schema", "建表助手", "用一句话描述业务，让它设计表结构并可一键建表",
+            "mdi:table-plus", true,
+            "你是 ZanWeb 的数据库建模助手。根据业务描述设计一张表：表名用小写下划线并加业务前缀，"
+            + "字段名小写下划线，类型用 string/text/int/long/decimal/bool/datetime。不要包含主键 id，"
+            + "系统会自动加。先用一张 Markdown 表格列出字段（字段名/类型/必填/说明），"
+            + "再给出一段标准 SQL，放在 ```sql 代码块里，只包含一条 CREATE TABLE 语句，不要写 DROP。"
+            + "最后用一句话说明和哪些表关联。"));
+        a.Add(new AiAgent("data", "数据分析", "描述你想看的指标，让它给出 SQL 和口径",
+            "mdi:chart-line", false,
+            "你是数据分析助手。根据问题给出可执行的 SQL（标准 SQL，必要时说明方言差异）、"
+            + "口径说明和可能的坑，不要臆造表结构，缺少信息时先问。"));
+        a.Add(new AiAgent("ops", "网站维护", "排查报错、性能、配置与安全问题",
+            "mdi:wrench", false,
+            "你是 ZanWeb 的网站运维助手。针对报错、性能、配置、安全等问题给出定位思路和"
+            + "具体操作步骤，涉及命令时给出可直接执行的命令，并提示风险和回滚方式。"));
+        a.Add(new AiAgent("review", "评价审核", "粘贴用户评价/留言，判断是否放行",
+            "mdi:comment-check", false,
+            "你是内容审核助手。对给定的用户评价或留言，判断是否包含辱骂、广告、违法违规或"
+            + "敏感信息，给出结论（通过/驳回）、理由，以及可以直接展示的脱敏或改写版本。"));
+        a.Add(new AiAgent("content", "内容生产", "写文章、公告、商品文案、说明文档",
+            "mdi:pencil", false,
+            "你是中文内容与文案助手，写作风格简洁、具体、不堆砌形容词。可按要求产出文章、"
+            + "公告、商品描述、SEO 标题与摘要，并给出结构清晰、可直接采用的成稿。"));
+        a.Add(new AiAgent("build", "功能建设", "描述一个功能，让它给出实现思路和代码",
+            "mdi:code-braces", false,
+            "你是 ZanWeb 后台的开发助手。ZanWeb 是 Zan 语言的 Web 框架，控制器用属性路由"
+            + "（[Route]/[HttpGet]/[HttpPost]），视图是 {{变量}} 模板，数据访问用类型化查询"
+            + "构造器。回答要给出可直接使用的代码，并说明放在哪个文件。"));
+        return a;
+    }
+
+    static AiAgent AgentOf(string code) {
+        List<AiAgent> all = Ai.Agents();
+        for (int i = 0; i < all.Count; i = i + 1) {
+            if (all[i].code == code) { return all[i]; }
+        }
+        return all[0];
+    }
+
+    /* AI 服务已配置可用（启用、URL、模型、Key 齐全，本地可免 Key）。 */
+    static async bool Ready() {
+        if (!await Settings.On(SettingKeys.AiEnabled, false)) { return false; }
+        string url = await Settings.Get(SettingKeys.AiBaseUrl, "");
+        string key = await Settings.Get(SettingKeys.AiApiKey, "");
+        string model = await Settings.Get(SettingKeys.AiModel, "");
+        if (url.Length == 0 || model.Length == 0) { return false; }
+        /* URL 必须是预设的完整地址，不能把设置值当作任意外呼目标。 */
+        if (!AiEndpointPolicy.IsAllowed(url)) { return false; }
+        /* 仅固定的本机 Ollama 地址免 Key，线上服务必须有 Key。 */
+        if (key.Length == 0 && !AiEndpointPolicy.IsLocal(url)) { return false; }
+        return true;
+    }
+
+    /* 单轮对话。 */
+    static async AiReply Ask(string agentCode, string question) {
+        return await Ai.AskConv(agentCode, "[]", question);
+    }
+
+    /* 多轮对话，historyJson 仅当文本处理，角色取 user/assistant，最多保留 20 轮。 */
+    static async AiReply AskConv(string agentCode, string historyJson, string question) {
+        if (!await Ai.Ready()) { return AiReply.Bad("尚未配置 AI 服务"); }
+        string baseUrl = await Settings.Get(SettingKeys.AiBaseUrl, "");
+        string key = await Settings.Get(SettingKeys.AiApiKey, "");
+        string model = await Settings.Get(SettingKeys.AiModel, "");
+        string temp = await Settings.Get(SettingKeys.AiTemperature, "0.3");
+        AiEndpoint ep = AiEndpoint.Parse(baseUrl);
+        if (ep == null) { return AiReply.Bad("服务地址不合法"); }
+        return await Ai.Complete(ep, key, model, temp,
+            Ai.Messages(Ai.AgentOf(agentCode), historyJson, question));
+    }
+
+    /* 构造 messages 数组：系统提示词 + 历史（最多 20 轮）+ 当前问题。 */
+    static string Messages(AiAgent agent, string historyJson, string question) {
+        StringBuilder msgs = new StringBuilder();
+        msgs.Append("[{\"role\":\"system\",\"content\":");
+        msgs.Append(Ai.Q(agent.prompt));
+        msgs.Append("}");
+        JsonValue hist = JsonValue.Parse(historyJson);
+        if (hist != null && hist.IsArray()) {
+            int keep = hist.Count();
+            int start = 0;
+            if (keep > 20) { start = keep - 20; }
+            for (int i = start; i < keep; i = i + 1) {
+                JsonValue m = hist.At(i);
+                if (m == null) { continue; }
+                string role = m.Str("role", "user");
+                if (role != "user" && role != "assistant") { role = "user"; }
+                string content = m.Str("content", "");
+                if (content.Length == 0) { continue; }
+                msgs.Append(",{\"role\":");
+                msgs.Append(Ai.Q(role));
+                msgs.Append(",\"content\":");
+                msgs.Append(Ai.Q(content));
+                msgs.Append("}");
+            }
+        }
+        msgs.Append(",{\"role\":\"user\",\"content\":");
+        msgs.Append(Ai.Q(question));
+        msgs.Append("}]");
+        return msgs.ToString();
+    }
+
+    /* AI 外部调用预算：所有请求都必须有有限的大小、时间和重试预算。
+     * POST 补全没有幂等键，明确保持不可重试；本地例外只放行固定的
+     * 127.0.0.1 Ollama 端点，供应商精确白名单仍由 AiEndpointPolicy 负责。 */
+    static ExternalCallPolicy CallPolicy(AiEndpoint ep, bool streaming) {
+        int idle = streaming ? 60000 : 30000;
+        int total = streaming ? 300000 : 120000;
+        ExternalCallPolicy p = ExternalCallPolicy.Default()
+            .ConnectTimeout(10000)
+            .WriteTimeout(30000)
+            .ReadTimeout(60000)
+            .IdleTimeout(idle)
+            .TotalTimeout(total)
+            .RequestLimit(2 * 1024 * 1024)
+            .ResponseLimit(8 * 1024 * 1024)
+            .ErrorLimit(128 * 1024)
+            .StreamLimit(16 * 1024 * 1024)
+            .Redirects(0)
+            .RetryNetwork(false)
+            .RetryAttempts(0);
+        if (ep.Local()) { p.AllowLocalHttp(); }
+        return p;
+    }
+
+    static async int WaitStreamProducer(long producer) {
+        while (Task.IsDone(producer) == 0) { await Task.Delay(4); }
+        return 0;
+    }
+
+    /* 非流式调用：发送 messages，返回文本或失败原因。 */
+    static async AiReply Complete(AiEndpoint ep, string key, string model,
+                                  string temp, string messages) {
+        StringBuilder body = new StringBuilder();
+        body.Append("{\"model\":");
+        body.Append(Ai.Q(model));
+        body.Append(",\"temperature\":");
+        body.Append(Ai.Number(temp));
+        body.Append(",\"stream\":false,\"messages\":");
+        body.Append(messages);
+        body.Append("}");
+
+        HttpClient http = new HttpClient(ep.Host(), ep.Port());
+        if (ep.Tls()) { http = HttpClient.CreateHttps(ep.Host(), ep.Port()); }
+        http.SetCallPolicy(Ai.CallPolicy(ep, false));
+        http.SetHeader("Content-Type", "application/json");
+        http.SetHeader("Accept", "application/json");
+        if (key.Length > 0) { http.SetHeader("Authorization", "Bearer " + key); }
+
+        string raw = "";
+        try {
+            HttpResponse resp = await http.SendAsync("POST",
+                ep.Path() + "/chat/completions", body.ToString());
+            raw = resp.body;
+            if (resp.statusCode >= 500) {
+                return AiReply.Bad("AI 服务返回 "
+                    + Convert.ToString(resp.statusCode));
+            }
+        } catch (Exception e) {
+            return AiReply.Bad("请求 AI 服务失败：" + e.Message);
+        }
+        if (raw == null || raw.Length == 0) { return AiReply.Bad("AI 服务没有返回内容"); }
+
+        JsonValue root = JsonValue.Parse(raw);
+        if (root == null) { return AiReply.Bad("AI 服务返回的内容无法解析"); }
+        JsonValue err = root.Get("error");
+        if (err != null && err.IsObject()) {
+            /* 服务商的错误文案直接回传，不会泄露 Key。 */
+            return AiReply.Bad(err.Str("message", "AI 服务返回错误"));
+        }
+        JsonValue choices = root.Get("choices");
+        if (choices == null || !choices.IsArray() || choices.Count() == 0) {
+            return AiReply.Bad("AI 服务没有返回回答");
+        }
+        JsonValue msg = choices.At(0).Get("message");
+        if (msg == null) { return AiReply.Bad("AI 服务没有返回回答"); }
+        return AiReply.Good(msg.Str("content", ""));
+    }
+
+    /* 流式调用：delta 逐块推到浏览器。 */
+    static async AiReply StreamConv(HttpContext ctx, string agentCode,
+                                    string historyJson, string question) {
+        if (!await Ai.Ready()) { return AiReply.Bad("尚未配置 AI 服务"); }
+        string baseUrl = await Settings.Get(SettingKeys.AiBaseUrl, "");
+        string key = await Settings.Get(SettingKeys.AiApiKey, "");
+        string model = await Settings.Get(SettingKeys.AiModel, "");
+        string temp = await Settings.Get(SettingKeys.AiTemperature, "0.3");
+        AiEndpoint ep = AiEndpoint.Parse(baseUrl);
+        if (ep == null) { return AiReply.Bad("服务地址不合法"); }
+
+        StringBuilder body = new StringBuilder();
+        body.Append("{\"model\":");
+        body.Append(Ai.Q(model));
+        body.Append(",\"temperature\":");
+        body.Append(Ai.Number(temp));
+        body.Append(",\"stream\":true,\"messages\":");
+        body.Append(Ai.Messages(Ai.AgentOf(agentCode), historyJson, question));
+        body.Append("}");
+
+        HttpClient http = new HttpClient(ep.Host(), ep.Port());
+        if (ep.Tls()) { http = HttpClient.CreateHttps(ep.Host(), ep.Port()); }
+        /* 空闲超时：每个分片重设，慢响应也能存活，静默超时会被挂断。 */
+        http.SetCallPolicy(Ai.CallPolicy(ep, true));
+        http.SetHeader("Content-Type", "application/json");
+        http.SetHeader("Accept", "text/event-stream");
+        if (key.Length > 0) { http.SetHeader("Authorization", "Bearer " + key); }
+
+        SseSink sink = SseSink.ToMemory();
+        /* SseSend 失败后只标记 sink 为 aborted，并让 transport 自己收尾；
+         * 不在 producer 仍可能写入时 Dispose。 */
+        http.SetCancelProbe(() => {
+            if (!ctx.Hijacked()) {
+                sink.Abort();
+                return true;
+            }
+            return false;
+        });
+        long producer = Task.Spawn(http.PostSseToSinkAsync(
+            ep.Path() + "/chat/completions", body.ToString(), sink));
+
+        StringBuilder full = new StringBuilder();
+        string pending = "";
+        bool finished = false;
+        while (!finished) {
+            string piece = sink.Take();
+            if (piece.Length == 0) {
+                /* 传输层仅报告一次结果，退出前先把已到达的内容取光。 */
+                if (sink.Attempt().Length > 0) {
+                    piece = sink.Take();
+                    finished = true;
+                }
+                if (piece.Length == 0) {
+                    if (finished) { break; }
+                    await Task.Delay(40);
+                    continue;
+                }
+            }
+            pending = pending + piece;
+            int nl = pending.IndexOf("\n");
+            while (nl >= 0) {
+                string line = pending.Substring(0, nl).Trim();
+                pending = pending.Substring(nl + 1);
+                string delta = Ai.Delta(line);
+                if (delta.Length > 0) {
+                    full.Append(delta);
+                    AiDeltaDoc d = new AiDeltaDoc();
+                    d.text = delta;
+                    if (!await ctx.SseSend("delta",
+                            Json.Serialize<AiDeltaDoc>(d))) {
+                        /* 用户关闭面板：先让 producer 在安全的 transport
+                         * 边界拆掉上游；不能在其仍运行时 Dispose sink。 */
+                        sink.Abort();
+                        await Ai.WaitStreamProducer(producer);
+                        sink.Dispose();
+                        return AiReply.Bad("客户端已断开");
+                    }
+                }
+                nl = pending.IndexOf("\n");
+            }
+        }
+        await Ai.WaitStreamProducer(producer);
+        string outcome = sink.Attempt();
+        string text = full.ToString();
+        sink.Dispose();
+        if (text.Length == 0) {
+            if (outcome.StartsWith("err:")) {
+                return AiReply.Bad("请求 AI 服务失败：" + outcome.Substring(4).Trim());
+            }
+            return AiReply.Bad("AI 服务没有返回内容");
+        }
+        return AiReply.Good(text);
+    }
+
+    /* 从 OpenAI 流式 `data:` 行提取增量文本，keep-alive/终止行返回空串。 */
+    static string Delta(string line) {
+        if (!line.StartsWith("data:")) { return ""; }
+        string payload = line.Substring(5).Trim();
+        if (payload.Length == 0 || payload == "[DONE]") { return ""; }
+        JsonValue v = JsonValue.Parse(payload);
+        if (v == null) { return ""; }
+        JsonValue choices = v.Get("choices");
+        if (choices == null || !choices.IsArray() || choices.Count() == 0) {
+            return "";
+        }
+        JsonValue first = choices.At(0);
+        if (first == null) { return ""; }
+        JsonValue delta = first.Get("delta");
+        if (delta == null) { return ""; }
+        return delta.Str("content", "");
+    }
+
+    /* 读取服务商 /models 端点返回的模型列表。 */
+    static async List<string> Models(string baseUrl, string key) {
+        List<string> ids = new List<string>();
+        AiEndpoint ep = AiEndpoint.Parse(baseUrl);
+        if (ep == null) { return ids; }
+        HttpClient http = new HttpClient(ep.Host(), ep.Port());
+        if (ep.Tls()) { http = HttpClient.CreateHttps(ep.Host(), ep.Port()); }
+        http.SetCallPolicy(Ai.CallPolicy(ep, false));
+        http.SetHeader("Accept", "application/json");
+        if (key.Length > 0) { http.SetHeader("Authorization", "Bearer " + key); }
+        string raw = "";
+        try {
+            HttpResponse resp = await http.SendAsync("GET", ep.Path() + "/models", "");
+            raw = resp.body;
+        } catch (Exception e) {
+            return ids;
+        }
+        if (raw == null || raw.Length == 0) { return ids; }
+        JsonValue root = JsonValue.Parse(raw);
+        if (root == null) { return ids; }
+        JsonValue data = root.Get("data");
+        if (data == null || !data.IsArray()) { return ids; }
+        for (int i = 0; i < data.Count(); i = i + 1) {
+            JsonValue m = data.At(i);
+            if (m == null) { continue; }
+            string id = m.Str("id", "");
+            if (id.Length > 0) { ids.Add(id); }
+        }
+        return ids;
+    }
+
+    /* 执行助手提议的建表语句：仅允许单条 CREATE TABLE，含注释或第二条语句均拒绝。 */
+    static async AiReply ApplySchema(string sql) {
+        string s = sql.Trim();
+        while (s.EndsWith(";")) { s = s.Substring(0, s.Length - 1).Trim(); }
+        if (s.Length == 0) { return AiReply.Bad("没有可执行的建表语句"); }
+        if (s.Contains(";")) { return AiReply.Bad("一次只能执行一条建表语句"); }
+        string low = s.ToLower();
+        if (!low.StartsWith("create table ")) {
+            return AiReply.Bad("只允许执行 CREATE TABLE 语句");
+        }
+        if (low.Contains("--") || low.Contains("/*")) {
+            return AiReply.Bad("语句包含注释，已拒绝");
+        }
+        IDbConnection db = await AuthUser.Lease();
+        if (db == null) { return AiReply.Bad("数据库不可用"); }
+        try {
+            int _n = await db.ExecuteAsync(s);
+        } catch (Exception e) {
+            return AiReply.Bad("建表失败：" + e.Message);
+        } finally {
+            AuthUser.Give(db);
+        }
+        return AiReply.Good("建表成功");
+    }
+
+    /* JSON 字符串字面量，含引号。 */
+    static string Q(string v) {
+        return "\"" + Encoding.JsonEscape(v) + "\"";
+    }
+
+    /* 安全的温度值：仅数字和小数点。 */
+    static string Number(string v) {
+        if (v.Length == 0) { return "0.3"; }
+        for (int i = 0; i < v.Length; i = i + 1) {
+            string ch = v.Substring(i, 1);
+            bool digit = ch >= "0" && ch <= "9";
+            if (!digit && ch != ".") { return "0.3"; }
+        }
+        return v;
+    }
+}
+
+/* 将基础 URL 拆成 HttpClient 所需的 host/port/path/tls。 */
+class AiEndpoint {
+    string host;
+    int port;
+    string path;
+    bool tls;
+
+    string Host() { return this.host; }
+    int Port() { return this.port; }
+    string Path() { return this.path; }
+    bool Tls() { return this.tls; }
+    bool Local() { return AiEndpointPolicy.IsLocal(this.Canonical()); }
+
+    string Canonical() {
+        string scheme = this.tls ? "https://" : "http://";
+        string authority = this.host;
+        if ((this.tls && this.port != 443) || (!this.tls && this.port != 80)) {
+            authority = authority + ":" + Convert.ToString(this.port);
+        }
+        return scheme + authority + this.path;
+    }
+
+    /* 解析 URL，返回 null 表示不是允许的地址。 */
+    static AiEndpoint Parse(string url) {
+        if (!AiEndpointPolicy.IsAllowed(url)) { return null; }
+        AiEndpoint e = new AiEndpoint();
+        string rest = url;
+        e.tls = true;
+        e.port = 443;
+        if (rest.StartsWith("https://")) {
+            rest = rest.Substring(8);
+        } else if (rest.StartsWith("http://")) {
+            rest = rest.Substring(7);
+            e.tls = false;
+            e.port = 80;
+        } else {
+            return null;
+        }
+        int slash = rest.IndexOf("/");
+        string hostPort = rest;
+        e.path = "";
+        if (slash >= 0) {
+            hostPort = rest.Substring(0, slash);
+            e.path = rest.Substring(slash);
+        }
+        while (e.path.Length > 0 && e.path.EndsWith("/")) {
+            e.path = e.path.Substring(0, e.path.Length - 1);
+        }
+        int colon = hostPort.IndexOf(":");
+        if (colon > 0) {
+            e.host = hostPort.Substring(0, colon);
+            e.port = Filter.ToInt(hostPort.Substring(colon + 1), e.port);
+        } else {
+            e.host = hostPort;
+        }
+        if (e.host.Length == 0) { return null; }
+        return e;
+    }
+}

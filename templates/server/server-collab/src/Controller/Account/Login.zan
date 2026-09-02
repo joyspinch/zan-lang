@@ -1,0 +1,147 @@
+using System;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.Account;
+
+/* 管理员登录屏：与 POST /api/auth/login 发出同一 cookie（AuthUser.Login → AuthToken.Issue），浏览器会话与 API 令牌为同一机制；此处不关心密码如何加盐或令牌如何签名。独立模块以取得独立外壳（Account/layout.html 为居中卡片，非管理后台外壳——尚未可用的页面放侧边栏是噪声）。两动作都答 /admin/login（GET 渲染，POST 校验），失败重渲染 GET 视图，理由就在用户正看的页面上。 */
+[Route("[controller]/[action]")]
+[Custom(Authorization = CustomAuthorization.None)]
+[Description("登录")]
+class Login : AppController {
+    static string Tpl = "Account.Login.Index";
+
+    [HttpGet]
+    [Route("/admin/login")]
+    [Description("登录")]
+    async void Index() {
+        if (this.IsLogin()) {
+            this.Ctx().Redirect(Routes.Admin);
+            return;
+        }
+        string site = await Settings.Get(SettingKeys.SiteTitle, "ZanWeb");
+        this.ViewOf(Login.Tpl, await Login.Form(site, "", this.In("user"),
+            "/admin/login", "管理后台", true, false));
+    }
+
+    [HttpPost]
+    [Route("/admin/login")]
+    [Description("登录提交")]
+    async void Submit() {
+        await this.Attempt("/admin/login", "管理后台", true, false, "/admin");
+    }
+
+    /* 前台登录：同一机制与卡片，自有外壳与目的地——普通成员回站点首页（/），而非一个可能无权进入的管理后台。 */
+    [HttpGet]
+    [Route("/login")]
+    [Description("登录")]
+    async void Front() {
+        if (this.IsLogin()) {
+            this.Ctx().Redirect(Routes.Home);
+            return;
+        }
+        string site = await Settings.Get(SettingKeys.SiteTitle, "ZanWeb");
+        this.ViewOf(Login.Tpl, await Login.Form(site, "", this.In("user"),
+            "/login", "登录", false, true));
+    }
+
+    [HttpPost]
+    [Route("/login")]
+    [Description("登录提交")]
+    async void FrontSubmit() {
+        await this.Attempt("/login", "登录", false, true, "/");
+    }
+
+    /* 两张卡片共用一条登录路径：action/heading/demo/home 只塑造重渲的表单，redirectTo 是成功后的去向；失败重渲同卡片，理由留在用户正看的页面上。 */
+    async void Attempt(string action, string heading, bool demo, bool home,
+                       string redirectTo) {
+        string site = await Settings.Get(SettingKeys.SiteTitle, "ZanWeb");
+        string user = this.In("user");
+        string pass = this.In("pass");
+        if (user.Length == 0 || pass.Length == 0) {
+            this.ViewOf(Login.Tpl, await Login.Form(site, "请输入账号和密码",
+                user, action, heading, demo, home));
+            return;
+        }
+        if (user.Length > 32 || pass.Length > 64) {
+            this.ViewOf(Login.Tpl, await Login.Form(site, "账号或密码超出长度限制",
+                "", action, heading, demo, home));
+            return;
+        }
+        /* 空字符串同时覆盖"无此账号"与"密码错误"，页面不得向攻击者透露是哪一种。 */
+        string token = await AuthUser.Login(user, pass);
+        if (token.Length == 0) {
+            await this.Record(this.Ctx(), user, false, "账号或密码不正确");
+            if (!AuthToken.Ready()) {
+                this.ViewOf(Login.Tpl, await Login.Form(site,
+                    "服务端未配置会话密钥：请在 config/app.json 的 [auth].secret（或环境变量 ZAN_AUTH_SECRET）填入至少 32 字符",
+                    user, action, heading, demo, home));
+                return;
+            }
+            this.ViewOf(Login.Tpl, await Login.Form(site, "账号或密码不正确",
+                user, action, heading, demo, home));
+            return;
+        }
+        await this.Record(this.Ctx(), user, true, "");
+        this.Ctx().SetCookie("zsession", token, 864000);
+        this.Ctx().Redirect(redirectTo);
+    }
+
+    [HttpGet]
+    [Route("/admin/logout")]
+    [Description("退出登录")]
+    void Out() {
+        /* 让 cookie 过期足以使本浏览器失效；使所有已发令牌整体失效的是 UserDao.BumpTokenVersion。 */
+        this.Ctx().SetCookie("zsession", "", 0);
+        this.Ctx().Redirect(Routes.Login);
+    }
+
+    /* 每次尝试都入 sys_login_log，失败也记：猜测密码的记录只在失败留存时才可追溯。 */
+    async void Record(HttpContext ctx, string user, bool ok, string message) {
+        if (!this.DbReady()) { return; }
+        LoginLog row = new LoginLog();
+        row.userId = 0;
+        row.username = user;
+        row.ip = ctx.RemoteIp();
+        row.agent = ctx.Header("User-Agent");
+        row.ok = 0;
+        if (ok) { row.ok = 1; }
+        row.message = message;
+        row.createdAt = WebApp.NowSeconds();
+        int _id = await this.LoginLog.Insert(row).ExecuteIdentityAsync();
+    }
+
+    static ViewData Page(string site, string error, string user) {
+        ViewData d = new ViewData();
+        d.Set("title", "登录 · " + site);
+        d.Set("brand", site);
+        d.Set("error", error);
+        d.Set("user", user);
+        return d;
+    }
+
+    /* 按站点设置补上注册/找回链接；关闭的流程不给出会重定向回此处的页。 */
+    static async ViewData PageWithLinks(string site, string error, string user) {
+        ViewData d = Login.Page(site, error, user);
+        bool reg = await Settings.On(SettingKeys.RegisterEnabled, false);
+        bool reset = await Settings.On(SettingKeys.ResetEnabled, true);
+        if (reg) { d.Set("canRegister", "1"); }
+        if (reset) { d.Set("canReset", "1"); }
+        if (reg || reset) { d.Set("authLinks", "1"); }
+        return d;
+    }
+
+    /* 注册/找回链接 + 区分两张卡片的字段：表单提交位置 action、标题、是否打印引导账号提示 demo（仅管理后台卡）、是否给出回前台入口 home（仅前台卡）。 */
+    static async ViewData Form(string site, string error, string user,
+                               string action, string heading, bool demo,
+                               bool home) {
+        ViewData d = await Login.PageWithLinks(site, error, user);
+        d.Set("action", action);
+        d.Set("heading", heading);
+        if (demo) { d.Set("demo", "1"); }
+        if (home) { d.Set("home", "1"); }
+        return d;
+    }
+}

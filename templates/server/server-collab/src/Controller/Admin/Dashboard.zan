@@ -1,0 +1,96 @@
+using System;
+using System.Data;
+using System.Json;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Flow;
+
+namespace ZanWeb.Admin;
+
+/* /admin 仪表盘：系统当前持有的内容与运行状态；实时数字与监控同取一份快照，经 metrics 事件流推送，避免定时重载。 */
+[Route("admin/[controller]/[action]")]
+[Custom(Authorization = CustomAuthorization.Login)]
+[Description("仪表盘")]
+class Dashboard : AdminController {
+    /* 侧边栏条目即此属性——见 AdminController.Layout，向 MenuBuilder 询问该账号可到达的项。 */
+    [HttpGet]
+    [Route("/admin")]
+    [Custom(IsMenu = true, Icon = "mdi:gauge")]
+    [Description("仪表盘")]
+    async void Index() {
+        ViewData d = await this.Layout("仪表盘");
+
+        JsonValue m = JsonValue.ParseLenient(WebHost.Current().MetricsJson());
+        JsonValue req = m.Get("requests");
+        if (req == null) { req = JsonValue.NewObject(); }
+
+        d.Set("requests", Convert.ToString(req.Long("count", 0)));
+        d.Set("errors", Convert.ToString(req.Long("errors", 0)));
+        d.Set("avg", Fmt.Dur(req.Long("avg_us", 0)));
+        d.Set("uptime", Fmt.Uptime(m.Long("uptime_ms", 0)));
+
+        d.Set("users", "—");
+        d.Set("flowTodo", "—");
+        if (this.DbReady()) {
+            DataScope sc = await this.Scope();
+            List<int> scoped = sc.Depts();
+            int mine = sc.UserId();
+            int users = await this.User
+                .WhereIf(sc.ByDept(), a => scoped.Contains(a.departmentId))
+                .WhereIf(sc.Mine(), a => a.id == mine)
+                .CountAsync();
+            d.Set("users", Convert.ToString(users));
+
+            /* 我的待办数：流程任务落在当前账号头上的未完成件。 */
+            User me = await this.Admin();
+            if (me != null) {
+                int todo = await this.FlowTask
+                    .Where(a => a.assignUserId == me.id && a.status == 0)
+                    .CountAsync();
+                d.Set("flowTodo", Convert.ToString(todo));
+            }
+
+            /* 登录记录按用户名匹配（非归属）：一条登录行写于对应账号确认之前，故用本 scope 覆盖的用户名匹配——与登录日志屏同一规则。 */
+            List<string> names = new List<string>();
+            if (!sc.Any()) {
+                List<ZanWeb.Model.Sys.User> members = await this.User
+                    .WhereIf(sc.ByDept(), a => scoped.Contains(a.departmentId))
+                    .WhereIf(sc.Mine(), a => a.id == mine).ToListAsync();
+                for (int k = 0; k < members.Count; k = k + 1) {
+                    names.Add(members[k].username);
+                }
+            }
+            bool byName = !sc.Any() && names.Count > 0;
+            bool nothing = !sc.Any() && names.Count == 0;
+            List<ZanWeb.Model.Sys.LoginLog> logins = await this.LoginLog
+                .WhereIf(byName, a => names.Contains(a.username))
+                .WhereIf(nothing, a => a.id < 0)
+                .OrderByDescending(a => a.id).Take(8).ToListAsync();
+            List<StrMap> lrows = d.AddList("logins");
+            for (int i = 0; i < logins.Count; i = i + 1) {
+                ZanWeb.Model.Sys.LoginLog l = logins[i];
+                StrMap row = new StrMap();
+                row.Set("username", Fmt.Dash(l.username));
+                row.Set("ip", Fmt.Dash(l.ip));
+                row.Set("createdAt", Fmt.Stamp(l.createdAt));
+                row.Set("okText", Dashboard.OkText(l.ok));
+                row.Set("okClass", Dashboard.OkClass(l.ok));
+                lrows.Add(row);
+            }
+            if (logins.Count == 0) { d.Set("noLogins", "1"); }
+        } else {
+            d.Set("dbDown", "1");
+        }
+        this.Page(d);
+    }
+
+    static string OkText(int ok) {
+        if (ok == 1) { return "成功"; }
+        return "失败";
+    }
+
+    static string OkClass(int ok) {
+        if (ok == 1) { return "ok"; }
+        return "bad";
+    }
+}

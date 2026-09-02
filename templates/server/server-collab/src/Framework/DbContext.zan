@@ -1,0 +1,62 @@
+using System;
+using System.Data;
+
+namespace ZanWeb;
+
+/* worker 数据库访问：连接池 + 借用协议。main.zan 一次性构建池并注入。请求借出连接执行语句，finally 中归还。全部走 *Async 端点以挂起协程。忘记 Release() 会耗尽池，故 finally 不可省略。*/
+class DbContext {
+    DbPool pool;
+
+    DbContext(DbPool pool) {
+        this.pool = pool;
+    }
+
+    /* 包装启动引导创建的池。*/
+    static DbContext Of(DbPool pool) {
+        return new DbContext(pool);
+    }
+
+    /* 借出连接供请求使用；池满时挂起协程。数据库不可达或池已关闭返回 null，务必与 Release() 配对。*/
+    async IDbConnection Acquire() {
+        if (this.pool == null) { return null; }
+        IDbConnection db = await this.pool.AcquireAsync();
+        if (db == null || !db.IsConnected()) {
+            this.pool.Release(db);
+            return null;
+        }
+        /* 所有应用语句在此被借用，故在此计时：每个借用点一个包装器，避免每个 DAO 都放秒表。Metrics.db 使用独立池，不会自跟踪。*/
+        return TracedDbConnection.Wrap(db);
+    }
+
+    /* 归还连接到池，兼容 null，可直接放入 finally。*/
+    void Release(IDbConnection db) {
+        if (this.pool == null || db == null) { return; }
+        /* 归还的是底层池连接，而非请求拿到的计时包装器。*/
+        this.pool.Release(TracedDbConnection.Unwrap(db));
+    }
+
+    /* 启动时提前建连（服务器接受请求之前），返回当前空闲数；0 表示数据库不可达。*/
+    async int Warmup(int count) {
+        if (this.pool == null) { return 0; }
+        return await this.pool.WarmupAsync(count);
+    }
+
+    int IdleCount() {
+        if (this.pool == null) { return 0; }
+        return this.pool.IdleCount();
+    }
+
+    int LiveCount() {
+        if (this.pool == null) { return 0; }
+        return this.pool.LiveCount();
+    }
+
+    int WaitingCount() {
+        if (this.pool == null) { return 0; }
+        return this.pool.WaitingCount();
+    }
+
+    void Close() {
+        if (this.pool != null) { this.pool.Close(); }
+    }
+}

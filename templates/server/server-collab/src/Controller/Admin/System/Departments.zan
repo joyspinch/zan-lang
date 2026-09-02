@@ -1,0 +1,354 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.Admin.System;
+
+/* /admin/system/departments 部门；部门可携带自身角色（sys_department_role），故账号继承工作所属的权利，无需逐人分派。 */
+[Route("admin/system/departments/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("部门管理")]
+class Departments : AdminController {
+    /* 屏左侧为组织树、右侧为所选部门的成员；部门只有通过谁在里面才有意义，故浏览树与读名册为同一屏。 */
+    [HttpGet]
+    [Route("/admin/system/departments")]
+    [Custom(IsMenu = true, Icon = "mdi:sitemap", Perm = PermBit.View)]
+    [Description("部门管理")]
+    async void Index() {
+        ViewData d = await this.Layout("部门管理");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        /* 树按该账号角色可覆盖部门裁剪，旁侧名册同裁，使左右数字与姓名总一致。 */
+        DataScope sc = await this.Scope();
+        List<int> scoped = sc.Depts();
+        int myDept = (await this.Admin()).departmentId;
+        int mine = sc.UserId();
+
+        List<Department> rows = await this.Department
+            .WhereIf(sc.ByDept(), a => scoped.Contains(a.id))
+            .WhereIf(sc.Mine(), a => a.id == myDept)
+            .OrderBy(a => a.sortOrder).ToListAsync();
+        List<User> users = await this.User
+            .WhereIf(sc.ByDept(), a => scoped.Contains(a.departmentId))
+            .WhereIf(sc.Mine(), a => a.id == mine)
+            .ToListAsync();
+
+        /* 未选中取首部门，使名册旁不出现空面板。 */
+        int pick = this.InInt("id", 0);
+        if (pick == 0 && rows.Count > 0) { pick = rows[0].id; }
+
+        List<StrMap> tree = d.AddList("tree");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            Department dept = rows[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(dept.id));
+            row.Set("indent", Departments.Indent(rows, dept));
+            row.Set("name", dept.name);
+            row.Set("code", Fmt.Dash(dept.code));
+            row.Set("members", Convert.ToString(Departments.Members(users, dept.id)));
+            row.Set("statusClass", Departments.StatusClass(dept.status));
+            if (dept.id == pick) { row.Set("active", "active"); }
+            tree.Add(row);
+        }
+        d.Set("total", Convert.ToString(rows.Count));
+        if (rows.Count == 0) { d.Set("empty", "1"); }
+
+        Department picked = await this.Department.Read(pick);
+        if (picked == null || !Departments.Listed(rows, pick)) {
+            this.Page(d); return;
+        }
+        d.Set("deptId", Convert.ToString(picked.id));
+        d.Set("deptName", picked.name);
+        d.Set("deptCode", Fmt.Dash(picked.code));
+        d.Set("deptParent", Departments.NameOf(rows, picked.parentId));
+        d.Set("deptStatusText", Departments.StatusText(picked.status));
+        d.Set("deptStatusClass", Departments.StatusClass(picked.status));
+
+        /* 该部门借给其所有人的角色——账号能持无人为其分派的权利的原因。 */
+        List<Role> roles = await this.Role.ToListAsync();
+        List<DepartmentRole> lent = await this.DepartmentRole
+            .Where(a => a.departmentId == pick).ToListAsync();
+        List<StrMap> lentRows = d.AddList("deptRoles");
+        for (int i = 0; i < lent.Count; i = i + 1) {
+            StrMap row = new StrMap();
+            row.Set("name", Departments.RoleName(roles, lent[i].roleId));
+            lentRows.Add(row);
+        }
+
+        List<UserRole> held = await this.UserRole.ToListAsync();
+        List<StrMap> members = d.AddList("members");
+        for (int i = 0; i < users.Count; i = i + 1) {
+            User u = users[i];
+            if (u.departmentId != pick) { continue; }
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(u.id));
+            row.Set("username", u.username);
+            row.Set("nickname", Fmt.Dash(u.nickname));
+            row.Set("roles", Departments.RolesOf(roles, held, u.id));
+            row.Set("statusText", Departments.StatusText(u.status));
+            row.Set("statusClass", Departments.StatusClass(u.status));
+            members.Add(row);
+        }
+        d.Set("memberCount", Convert.ToString(members.Count));
+        if (members.Count == 0) { d.Set("noMembers", "1"); }
+        this.Page(d);
+    }
+
+    [HttpGet]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("部门表单")]
+    async void Form() {
+        int id = this.InInt("id", 0);
+        int parentId = 0;
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("dialogTitle", "新增部门");
+        d.Set("sortOrder", "1");
+        d.Set("status1", "selected");
+        if (id > 0) {
+            Department dept = await this.Reach(id);
+            d.Set("dialogTitle", "编辑部门");
+            d.Set("name", dept.name);
+            d.Set("code", dept.code);
+            d.Set("sortOrder", Convert.ToString(dept.sortOrder));
+            parentId = dept.parentId;
+            d.Set("status1", "");
+            if (dept.status == 1) { d.Set("status1", "selected"); }
+            else { d.Set("status0", "selected"); }
+        }
+        /* 上级选择项为树可见部分，故部门不能被归档到不可读的位置。 */
+        DataScope sc = await this.Scope();
+        List<int> scoped = sc.Depts();
+        int myDept = (await this.Admin()).departmentId;
+        List<Department> all = await this.Department
+            .WhereIf(sc.ByDept(), a => scoped.Contains(a.id))
+            .WhereIf(sc.Mine(), a => a.id == myDept)
+            .OrderBy(a => a.sortOrder).ToListAsync();
+        List<StrMap> opts = d.AddList("parents");
+        for (int i = 0; i < all.Count; i = i + 1) {
+            if (all[i].id == id) { continue; }
+            StrMap o = new StrMap();
+            o.Set("id", Convert.ToString(all[i].id));
+            o.Set("name", all[i].name);
+            if (all[i].id == parentId) { o.Set("selected", "selected"); }
+            opts.Add(o);
+        }
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("保存部门")]
+    async void Save() {
+        int id = this.InInt("id", 0);
+        string name = this.Need("name", "部门名称");
+        string code = this.In("code");
+        int parentId = this.InInt("parentId", 0);
+        int sortOrder = this.InInt("sortOrder", 1);
+        int status = this.InInt("status", 1);
+        if (status != 1) { status = 0; }
+        if (parentId == id && id > 0) {
+            this.Fail(400, "0004", "上级部门不能是自己");
+        }
+        await this.Parented(parentId);
+        if (id > 0) {
+            Department _t = await this.Reach(id);
+            int n = await this.Department.Update()
+                .Set(a => a.name, name)
+                .Set(a => a.code, code)
+                .Set(a => a.parentId, parentId)
+                .Set(a => a.sortOrder, sortOrder)
+                .Set(a => a.status, status)
+                .Where(a => a.id == id)
+                .ExecuteAffrowsAsync();
+            await this.Note("编辑部门", name, n > 0, "");
+            this.Saved("部门已保存");
+            return;
+        }
+        Department dept = new Department();
+        dept.name = name;
+        dept.code = code;
+        dept.parentId = parentId;
+        dept.sortOrder = sortOrder;
+        dept.status = status;
+        dept.leaderUserId = 0;
+        int newId = await this.Department.Insert(dept).ExecuteIdentityAsync();
+        await this.Note("新增部门", name, newId > 0, "");
+        this.Saved("部门已创建");
+    }
+
+    /* 部门角色为所属所有人继承——一次为整队授权，而非逐人。 */
+    [HttpGet]
+    [Custom(Perm = PermBit.Update)]
+    [Description("部门角色")]
+    async void Roles() {
+        int id = this.InInt("id", 0);
+        Department dept = await this.Reach(id);
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("name", dept.name);
+        List<Role> roles = await this.Role.OrderBy(a => a.rank).ToListAsync();
+        List<DepartmentRole> mine = await this.DepartmentRole
+            .Where(a => a.departmentId == id).ToListAsync();
+        List<StrMap> rows = d.AddList("roles");
+        for (int i = 0; i < roles.Count; i = i + 1) {
+            Role r = roles[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(r.id));
+            row.Set("name", r.name);
+            for (int j = 0; j < mine.Count; j = j + 1) {
+                if (mine[j].roleId == r.id) { row.Set("checked", "checked"); }
+            }
+            rows.Add(row);
+        }
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("保存部门角色")]
+    async void RolesSave() {
+        int id = this.InInt("id", 0);
+        Department dept = await this.Reach(id);
+        string picked = this.In("roleIds");
+        int _cleared = await this.DepartmentRole.Delete()
+            .Where(a => a.departmentId == id).ExecuteAffrowsAsync();
+        List<Role> roles = await this.Role.ToListAsync();
+        int granted = 0;
+        for (int i = 0; i < roles.Count; i = i + 1) {
+            if (!AuthUser.Holds(picked, Convert.ToString(roles[i].id))) { continue; }
+            DepartmentRole link = new DepartmentRole();
+            link.departmentId = id;
+            link.roleId = roles[i].id;
+            int _n = await this.DepartmentRole.Insert(link).ExecuteIdentityAsync();
+            granted = granted + 1;
+        }
+        /* 部门内所有人权利刚变更，授权缓存按账号键，故整体清除。 */
+        AuthUser.ForgetAll();
+        await this.Note("部门角色", dept.name, true,
+            Convert.ToString(granted) + " 个角色");
+        this.Saved("部门角色已保存");
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Delete)]
+    [Description("删除部门")]
+    async void Delete() {
+        int id = this.InInt("id", 0);
+        Department dept = await this.Reach(id);
+        int kids = await this.Department.Where(a => a.parentId == id).CountAsync();
+        if (kids > 0) {
+            this.Fail(400, "0004", "请先删除下级部门");
+        }
+        int members = await this.User.Where(a => a.departmentId == id).CountAsync();
+        if (members > 0) {
+            this.Fail(400, "0004", "还有 " + Convert.ToString(members)
+                + " 个账号属于该部门");
+        }
+        int n = await this.Department.Delete().Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+        int _r = await this.DepartmentRole.Delete().Where(a => a.departmentId == id)
+            .ExecuteAffrowsAsync();
+        AuthUser.ForgetAll();
+        await this.Note("删除部门", dept.name, n > 0, "");
+        this.Saved("部门已删除");
+    }
+
+    /* 请求可操作的部门：超范围的读作"不存在"，与列表上同。 */
+    async Department Reach(int id) {
+        Department dept = await this.Department.Read(id);
+        if (dept == null) { this.Fail(404, "0404", "部门不存在"); }
+        DataScope sc = await this.Scope();
+        if (sc.Any()) { return dept; }
+        /* 此处行即部门本身，故行"自己的部门"为其 id；仅本人 scope 只触及调用方所属部门。 */
+        bool ok = sc.Covers(0, dept.id);
+        if (sc.Mine()) { ok = dept.id == (await this.Admin()).departmentId; }
+        if (!ok) { this.Fail(404, "0404", "部门不存在"); }
+        return dept;
+    }
+
+    /* 部门可归档到的上级；超范围（含顶级）会造出调用方自身无法读回的部门行。 */
+    async void Parented(int parentId) {
+        DataScope sc = await this.Scope();
+        if (sc.Any()) { return; }
+        if (parentId <= 0) {
+            this.Fail(403, "0403", "数据权限不允许新增顶级部门");
+        }
+        Department _p = await this.Reach(parentId);
+    }
+
+    /* 左侧 scoped 树是否含该 id，使右侧名册无法为该树未提供的部门打开。 */
+    static bool Listed(List<Department> rows, int id) {
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            if (rows[i].id == id) { return true; }
+        }
+        return false;
+    }
+
+    /* 每层两个全角空格，使平表仍读作树。 */
+    static string Indent(List<Department> all, Department dept) {
+        string pad = "";
+        int parent = dept.parentId;
+        int guard = 0;
+        while (parent > 0 && guard < 8) {
+            pad = pad + "　";
+            parent = Departments.ParentOf(all, parent);
+            guard = guard + 1;
+        }
+        return pad;
+    }
+
+    static int ParentOf(List<Department> all, int id) {
+        for (int i = 0; i < all.Count; i = i + 1) {
+            if (all[i].id == id) { return all[i].parentId; }
+        }
+        return 0;
+    }
+
+    static string NameOf(List<Department> all, int id) {
+        for (int i = 0; i < all.Count; i = i + 1) {
+            if (all[i].id == id) { return all[i].name; }
+        }
+        return "—";
+    }
+
+    static string RoleName(List<Role> roles, int id) {
+        for (int i = 0; i < roles.Count; i = i + 1) {
+            if (roles[i].id == id) { return roles[i].name; }
+        }
+        return "—";
+    }
+
+    /* 账号本人持有的角色，作一个标签。 */
+    static string RolesOf(List<Role> roles, List<UserRole> held, int userId) {
+        string s = "";
+        for (int i = 0; i < held.Count; i = i + 1) {
+            if (held[i].userId != userId) { continue; }
+            if (s.Length > 0) { s = s + "、"; }
+            s = s + Departments.RoleName(roles, held[i].roleId);
+        }
+        if (s.Length == 0) { return "—"; }
+        return s;
+    }
+
+    static int Members(List<User> users, int deptId) {
+        int n = 0;
+        for (int i = 0; i < users.Count; i = i + 1) {
+            if (users[i].departmentId == deptId) { n = n + 1; }
+        }
+        return n;
+    }
+
+    static string StatusText(int status) {
+        if (status == 1) { return "启用"; }
+        return "停用";
+    }
+
+    static string StatusClass(int status) {
+        if (status == 1) { return "ok"; }
+        return "off";
+    }
+}

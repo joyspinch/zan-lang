@@ -1,0 +1,315 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Ecbi;
+
+namespace ZanWeb.Admin.Ecbi;
+
+/* /admin/ecbi/reports 报表编排：定义「维度 × 指标 × 图表」，运行时按定义聚合订单/推广数据并渲染。外部数据先落到 ods_order/ods_ad，再由报表消费。 */
+[Route("admin/ecbi/reports/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("报表编排")]
+class Reports : AdminController {
+    [HttpGet]
+    [Route("/admin/ecbi/reports")]
+    [Custom(IsMenu = true, Icon = "mdi:chart-bar", Perm = PermBit.View)]
+    [Description("报表编排")]
+    async void Index() {
+        ViewData d = await this.Layout("报表编排");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        List<OdsReport> rows = await this.OdsReport.OrderBy(a => a.id).ToListAsync();
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            OdsReport r = rows[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(r.id));
+            row.Set("name", r.name);
+            row.Set("dims", Reports.DimsText(r.dims));
+            row.Set("metrics", Reports.MetricsText(r.metrics));
+            row.Set("chartText", Reports.ChartText(r.chart));
+            items.Add(row);
+        }
+        d.Set("total", Convert.ToString(rows.Count));
+        this.Page(d);
+    }
+
+    /* 运行一张报表：按定义聚合并渲染。 */
+    [HttpGet]
+    [Custom(Perm = PermBit.View)]
+    [Description("查看报表")]
+    async void Run() {
+        ViewData d = await this.Layout("报表");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+        int id = this.InInt("id", 0);
+        OdsReport r = await this.OdsReport.Where(a => a.id == id).FirstAsync();
+        if (r == null) { this.Fail(404, "0404", "报表不存在"); }
+
+        d.Set("id", Convert.ToString(r.id));
+        d.Set("name", r.name);
+        await Reports.Render(d, this, r.dims, r.metrics, r.chart);
+        this.Page(d);
+    }
+
+    [HttpGet]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("报表表单")]
+    async void Form() {
+        int id = this.InInt("id", 0);
+        OdsReport r = null;
+        if (id > 0) {
+            r = await this.OdsReport.Where(a => a.id == id).FirstAsync();
+            if (r == null) { this.Fail(404, "0404", "报表不存在"); }
+        }
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("dialogTitle", id > 0 ? "编辑报表" : "新建报表");
+        if (id <= 0) { d.Set("new", "1"); d.Set("bar", "selected"); }
+        if (r != null) {
+            d.Set("name", r.name);
+            d.Set("dimPlatformChecked", r.dims.Contains("platform") ? "checked" : "");
+            d.Set("dimShopChecked", r.dims.Contains("shop") ? "checked" : "");
+            d.Set("dimCategoryChecked", r.dims.Contains("category") ? "checked" : "");
+            d.Set("dimDayChecked", r.dims.Contains("day") ? "checked" : "");
+            d.Set("mSalesChecked", r.metrics.Contains("sales") ? "checked" : "");
+            d.Set("mOrdersChecked", r.metrics.Contains("orders") ? "checked" : "");
+            d.Set("mAovChecked", r.metrics.Contains("aov") ? "checked" : "");
+            d.Set("mAdCostChecked", r.metrics.Contains("adcost") ? "checked" : "");
+            d.Set("mRoiChecked", r.metrics.Contains("roi") ? "checked" : "");
+            d.Set("bar", r.chart == "bar" ? "selected" : "");
+            d.Set("line", r.chart == "line" ? "selected" : "");
+            d.Set("table", r.chart == "table" ? "selected" : "");
+            d.Set("edit", "1");
+            d.Set("new", "");
+        }
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("保存报表")]
+    async void Save() {
+        int id = this.InInt("id", 0);
+        string name = this.Need("name", "报表名称");
+        string dims = "";
+        if (this.InInt("dimPlatform", 0) == 1) { dims = dims + "platform,"; }
+        if (this.InInt("dimShop", 0) == 1) { dims = dims + "shop,"; }
+        if (this.InInt("dimCategory", 0) == 1) { dims = dims + "category,"; }
+        if (this.InInt("dimDay", 0) == 1) { dims = dims + "day,"; }
+        if (dims.Length == 0) { this.Fail(400, "0004", "至少选择一个维度"); }
+        string metrics = "";
+        if (this.InInt("mSales", 0) == 1) { metrics = metrics + "sales,"; }
+        if (this.InInt("mOrders", 0) == 1) { metrics = metrics + "orders,"; }
+        if (this.InInt("mAov", 0) == 1) { metrics = metrics + "aov,"; }
+        if (this.InInt("mAdCost", 0) == 1) { metrics = metrics + "adcost,"; }
+        if (this.InInt("mRoi", 0) == 1) { metrics = metrics + "roi,"; }
+        if (metrics.Length == 0) { this.Fail(400, "0004", "至少选择一个指标"); }
+        string chart = this.In("chart");
+        if (chart != "line" && chart != "table") { chart = "bar"; }
+
+        if (id > 0) {
+            int n = await this.OdsReport.Update()
+                .Set(a => a.name, name)
+                .Set(a => a.dims, dims)
+                .Set(a => a.metrics, metrics)
+                .Set(a => a.chart, chart)
+                .Where(a => a.id == id)
+                .ExecuteAffrowsAsync();
+            await this.Note("编辑报表", "#" + Convert.ToString(id) + " " + name, n > 0, "");
+            this.Saved("报表已保存");
+            return;
+        }
+        OdsReport r = new OdsReport();
+        r.name = name;
+        r.dims = dims;
+        r.metrics = metrics;
+        r.chart = chart;
+        r.createdAt = WebApp.NowSeconds();
+        int newId = await this.OdsReport.Insert(r).ExecuteIdentityAsync();
+        await this.Note("新建报表", "#" + Convert.ToString(newId) + " " + name, newId > 0, "");
+        this.Saved("报表已创建");
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Delete)]
+    [Description("删除报表")]
+    async void Delete() {
+        int id = this.InInt("id", 0);
+        int n = await this.OdsReport.Delete().Where(a => a.id == id).ExecuteAffrowsAsync();
+        await this.Note("删除报表", "#" + Convert.ToString(id), n > 0, "");
+        this.Saved("报表已删除");
+    }
+
+    /* ---- 聚合渲染内核：dims × metrics → 行集 ---- */
+
+    static async bool Render(ViewData d, Reports page, string dims, string metrics,
+                           string chart) {
+        List<OdsOrder> orders = await page.OdsOrder.ToListAsync();
+        List<OdsShop> shops = await page.OdsShop.OrderBy(a => a.id).ToListAsync();
+        List<OdsPlatform> plats = await page.OdsPlatform.OrderBy(a => a.id).ToListAsync();
+
+        bool hasAd = metrics.Contains("adcost") || metrics.Contains("roi");
+        List<OdsAd> ads = new List<OdsAd>();
+        if (hasAd) { ads = await page.OdsAd.ToListAsync(); }
+
+        /* 维度桶：key → 行号。桶内累加销售额/订单数。 */
+        List<string> keys = new List<string>();
+        List<long> sales = new List<long>();
+        List<int> counts = new List<int>();
+
+        long now = WebApp.NowSeconds();
+        for (int i = 0; i < orders.Count; i = i + 1) {
+            OdsOrder o = orders[i];
+            string key = "";
+            if (dims.Contains("platform")) {
+                key = key + Reports.PlatName(plats, o.platformId) + " / ";
+            }
+            if (dims.Contains("shop")) {
+                key = key + Reports.ShopName(shops, o.shopId) + " / ";
+            }
+            if (dims.Contains("category")) {
+                key = key + (o.category.Length > 0 ? o.category : "未分类") + " / ";
+            }
+            if (dims.Contains("day")) {
+                key = key + Fmt.Day(o.payAt) + " / ";
+            }
+            if (key.EndsWith(" / ")) { key = key.Substring(0, key.Length - 3); }
+            int at = keys.IndexOf(key);
+            if (at < 0) {
+                keys.Add(key);
+                sales.Add(o.amount);
+                counts.Add(1);
+            } else {
+                sales[at] = sales[at] + o.amount;
+                counts[at] = counts[at] + 1;
+            }
+        }
+
+        /* 推广花费按相同维度并入（仅平台/店铺/日期维度可对齐）。 */
+        List<long> adCost = new List<long>();
+        for (int i = 0; i < keys.Count; i = i + 1) { adCost.Add(0); }
+        if (hasAd) {
+            for (int i = 0; i < ads.Count; i = i + 1) {
+                OdsAd a = ads[i];
+                string key = "";
+                if (dims.Contains("platform")) {
+                    key = key + Reports.PlatName(plats,
+                        Reports.ShopPlat(shops, a.shopId)) + " / ";
+                }
+                if (dims.Contains("shop")) {
+                    key = key + Reports.ShopName(shops, a.shopId) + " / ";
+                }
+                if (dims.Contains("category")) { key = key + "未分类 / "; }
+                if (dims.Contains("day")) { key = key + Fmt.Day(a.day) + " / "; }
+                if (key.EndsWith(" / ")) { key = key.Substring(0, key.Length - 3); }
+                int at = keys.IndexOf(key);
+                if (at >= 0) { adCost[at] = adCost[at] + a.cost; }
+            }
+        }
+
+        /* 汇总 KPI。 */
+        long sumSales = 0;
+        int sumOrders = 0;
+        long sumAdCost = 0;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            sumSales = sumSales + sales[i];
+            sumOrders = sumOrders + counts[i];
+            sumAdCost = sumAdCost + adCost[i];
+        }
+        d.Set("sumSales", Convert.ToString(sumSales));
+        d.Set("sumOrders", Convert.ToString(sumOrders));
+        d.Set("sumAdCost", Convert.ToString(sumAdCost));
+        d.Set("sumRoi", sumAdCost > 0
+            ? Convert.ToString(sumSales * 100 / sumAdCost) + "%" : "—");
+        d.Set("rowCount", Convert.ToString(keys.Count));
+
+        /* 行集：按所选指标输出。 */
+        List<StrMap> rows = d.AddList("rows");
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            StrMap row = new StrMap();
+            row.Set("dim", keys[i]);
+            row.Set("sales", Convert.ToString(sales[i]));
+            row.Set("orders", Convert.ToString(counts[i]));
+            row.Set("aov", counts[i] > 0
+                ? Convert.ToString(sales[i] / counts[i]) : "0");
+            row.Set("adcost", Convert.ToString(adCost[i]));
+            row.Set("roi", adCost[i] > 0
+                ? Convert.ToString(sales[i] * 100 / adCost[i]) + "%" : "—");
+            rows.Add(row);
+        }
+        d.Set("showSales", metrics.Contains("sales") ? "1" : "");
+        d.Set("showOrders", metrics.Contains("orders") ? "1" : "");
+        d.Set("showAov", metrics.Contains("aov") ? "1" : "");
+        d.Set("showAdCost", metrics.Contains("adcost") ? "1" : "");
+        d.Set("showRoi", metrics.Contains("roi") ? "1" : "");
+        d.Set("empty", keys.Count == 0 ? "1" : "");
+
+        /* 图表数据：柱/线图取 sales 比例（无 sales 则取 orders）。 */
+        long maxV = 1;
+        List<StrMap> bars = d.AddList("bars");
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            long v = metrics.Contains("sales") ? sales[i] : counts[i];
+            if (v > maxV) { maxV = v; }
+        }
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            StrMap b = new StrMap();
+            b.Set("dim", keys[i]);
+            long v = metrics.Contains("sales") ? sales[i] : counts[i];
+            b.Set("value", Convert.ToString(v));
+            b.Set("pct", Convert.ToString(v * 100 / maxV));
+            bars.Add(b);
+        }
+        d.Set("barLabel", metrics.Contains("sales") ? "销售额" : "订单数");
+        d.Set("showChart", (chart == "bar" || chart == "line") ? "1" : "");
+        d.Set("showTable", chart == "table" ? "1" : "");
+        return true;
+    }
+
+    static string DimsText(string dims) {
+        string t = "";
+        if (dims.Contains("platform")) { t = t + "平台 "; }
+        if (dims.Contains("shop")) { t = t + "店铺 "; }
+        if (dims.Contains("category")) { t = t + "品类 "; }
+        if (dims.Contains("day")) { t = t + "日期 "; }
+        return t.Trim();
+    }
+
+    static string MetricsText(string metrics) {
+        string t = "";
+        if (metrics.Contains("sales")) { t = t + "销售额 "; }
+        if (metrics.Contains("orders")) { t = t + "订单数 "; }
+        if (metrics.Contains("aov")) { t = t + "客单价 "; }
+        if (metrics.Contains("adcost")) { t = t + "推广花费 "; }
+        if (metrics.Contains("roi")) { t = t + "ROI "; }
+        return t.Trim();
+    }
+
+    static string ChartText(string chart) {
+        if (chart == "line") { return "折线图"; }
+        if (chart == "table") { return "纯表格"; }
+        return "柱状图";
+    }
+
+    static string PlatName(List<OdsPlatform> plats, int id) {
+        for (int i = 0; i < plats.Count; i = i + 1) {
+            if (plats[i].id == id) { return plats[i].name; }
+        }
+        return "未分类";
+    }
+
+    static string ShopName(List<OdsShop> shops, int id) {
+        for (int i = 0; i < shops.Count; i = i + 1) {
+            if (shops[i].id == id) { return shops[i].name; }
+        }
+        return "未分类";
+    }
+
+    static int ShopPlat(List<OdsShop> shops, int shopId) {
+        for (int i = 0; i < shops.Count; i = i + 1) {
+            if (shops[i].id == shopId) { return shops[i].platformId; }
+        }
+        return 0;
+    }
+}

@@ -1,0 +1,172 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.Admin.System;
+
+/* 审计轨迹：变更了何事（sys_operation_log）与谁登录（sys_login_log）；两者均由执行动作的代码写，非对所有请求加过滤器，故一行日志恒意味发生了事而非"访问了某 URL"。 */
+[Route("admin/system/logs/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("系统日志")]
+class Logs : AdminController {
+    [HttpGet]
+    [Route("/admin/system/logs")]
+    [Custom(IsMenu = true, Icon = "mdi:history", Perm = PermBit.View)]
+    [Description("操作日志")]
+    async void Index() {
+        ViewData d = await this.Layout("操作日志");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        ListQuery q = this.Paged("id", 30);
+        string kw = q.Kw();
+        DataScope sc = await this.Scope();
+        bool byActor = !sc.Any();
+        List<int> actors = await this.Actors(sc);
+
+        int total = await this.OperationLog
+            .WhereIf(kw.Length > 0, a => a.username.Contains(kw))
+            .WhereIf(byActor, a => actors.Contains(a.userId)).CountAsync();
+        List<OperationLog> rows = await this.OperationLog
+            .WhereIf(kw.Length > 0, a => a.username.Contains(kw))
+            .WhereIf(byActor, a => actors.Contains(a.userId))
+            .OrderByDescending(a => a.id)
+            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            OperationLog row = rows[i];
+            StrMap r = new StrMap();
+            r.Set("id", Convert.ToString(row.id));
+            r.Set("username", Fmt.Dash(row.username));
+            r.Set("title", row.title);
+            r.Set("action", Fmt.Dash(row.action));
+            r.Set("target", Fmt.Dash(row.target));
+            r.Set("method", row.method);
+            r.Set("path", row.path);
+            r.Set("ip", Fmt.Dash(row.ip));
+            r.Set("message", Fmt.Dash(row.message));
+            r.Set("okText", Logs.OkText(row.ok));
+            r.Set("okClass", Logs.OkClass(row.ok));
+            r.Set("createdAt", Fmt.Stamp(row.createdAt));
+            items.Add(r);
+        }
+        this.Pager(d, q, total);
+        this.Page(d);
+    }
+
+    [HttpGet]
+    [Route("/admin/system/logs/login")]
+    [Custom(IsMenu = true, Icon = "mdi:login", Perm = PermBit.View)]
+    [Description("登录日志")]
+    async void Login() {
+        ViewData d = await this.Layout("登录日志");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        ListQuery q = this.Paged("id", 30);
+        string kw = q.Kw();
+        DataScope sc = await this.Scope();
+        List<string> actors = await this.Names(sc);
+        bool byActor = !sc.Any() && actors.Count > 0;
+        /* 无账号的 scope 看不到任何登录；空 IN () 非过滤，故直接言明。 */
+        bool nothing = !sc.Any() && actors.Count == 0;
+
+        int total = await this.LoginLog
+            .WhereIf(kw.Length > 0, a => a.username.Contains(kw))
+            .WhereIf(byActor, a => actors.Contains(a.username))
+            .WhereIf(nothing, a => a.id < 0).CountAsync();
+        List<LoginLog> rows = await this.LoginLog
+            .WhereIf(kw.Length > 0, a => a.username.Contains(kw))
+            .WhereIf(byActor, a => actors.Contains(a.username))
+            .WhereIf(nothing, a => a.id < 0)
+            .OrderByDescending(a => a.id)
+            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            LoginLog row = rows[i];
+            StrMap r = new StrMap();
+            r.Set("id", Convert.ToString(row.id));
+            r.Set("username", Fmt.Dash(row.username));
+            r.Set("ip", Fmt.Dash(row.ip));
+            r.Set("agent", Fmt.Dash(row.agent));
+            r.Set("message", Fmt.Dash(row.message));
+            r.Set("okText", Logs.LoginText(row.ok));
+            r.Set("okClass", Logs.OkClass(row.ok));
+            r.Set("createdAt", Fmt.Stamp(row.createdAt));
+            items.Add(r);
+        }
+        this.Pager(d, q, total);
+        this.Page(d);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Delete)]
+    [Description("清空日志")]
+    async void Clear() {
+        string kind = this.In("kind");
+        /* 清空为全有或全无，仅全部数据角色可执行；按部门限定的操作员清空整条轨迹等于删不可读的列。 */
+        DataScope sc = await this.Scope();
+        if (!sc.Any()) {
+            this.Fail(403, "0403", "数据权限不允许清空全部日志");
+        }
+        if (kind == "login") {
+            int n = await this.LoginLog.Delete().Where(a => a.id > 0)
+                .ExecuteAffrowsAsync();
+            await this.Note("清空登录日志", "", true,
+                Convert.ToString(n) + " 条");
+            this.Saved("登录日志已清空");
+            return;
+        }
+        int n = await this.OperationLog.Delete().Where(a => a.id > 0)
+            .ExecuteAffrowsAsync();
+        await this.Note("清空操作日志", "", true,
+            Convert.ToString(n) + " 条");
+        this.Saved("操作日志已清空");
+    }
+
+    /* scope 内账号；日志行记账号而非部门，故部门 scope 每屏转一次——唯一处花费一次查询，否则每次列表都要 join。 */
+    async List<User> Members(DataScope sc) {
+        if (sc.Mine()) {
+            int mine = sc.UserId();
+            return await this.User.Where(a => a.id == mine).ToListAsync();
+        }
+        List<int> depts = sc.Depts();
+        return await this.User
+            .Where(a => depts.Contains(a.departmentId)).ToListAsync();
+    }
+
+    /* 请求可读的操作归属者；空返回 [-1] 使过滤无匹配；被删账号（或系统 userId=0）留下的行仅全部数据角色可见。 */
+    async List<int> Actors(DataScope sc) {
+        List<int> ids = new List<int>();
+        if (sc.Any()) { return ids; }
+        List<User> rows = await this.Members(sc);
+        for (int i = 0; i < rows.Count; i = i + 1) { ids.Add(rows[i].id); }
+        if (ids.Count == 0) { ids.Add(0 - 1); }
+        return ids;
+    }
+
+    /* 请求可读的登录归属者——按名，因登录在账号确认前记录；对 scope 外账号的尝试仅全部数据角色可见。 */
+    async List<string> Names(DataScope sc) {
+        List<string> names = new List<string>();
+        if (sc.Any()) { return names; }
+        List<User> rows = await this.Members(sc);
+        for (int i = 0; i < rows.Count; i = i + 1) { names.Add(rows[i].username); }
+        return names;
+    }
+
+    static string OkText(int ok) {
+        if (ok == 1) { return "成功"; }
+        return "失败";
+    }
+
+    static string LoginText(int ok) {
+        if (ok == 1) { return "登录成功"; }
+        return "登录失败";
+    }
+
+    static string OkClass(int ok) {
+        if (ok == 1) { return "ok"; }
+        return "bad";
+    }
+}

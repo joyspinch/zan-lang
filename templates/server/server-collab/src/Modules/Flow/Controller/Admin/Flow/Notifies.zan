@@ -1,0 +1,155 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Json;
+using System.Threading;
+using System.Web;
+using ZanWeb.Model.Flow;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.Admin.Flow;
+
+/* /admin/flow/notifies 通知中心：落库通知的查询与已读标记；
+   Stream 是实时通道——WebSocket 长连接为主（ctx.WsUpgrade），SSE 作回退；
+   FlowHub.Push 有新通知时立即推给在线者。端点有意上限存活时长，
+   收口后前端自动重连，重连会重新过一遍鉴权。 */
+[Route("admin/flow/notifies/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("通知中心")]
+class Notifies : AdminController {
+    /* 流存活时长；标签整夜开着不应永远占协程，EventSource 会自连。 */
+    static int StreamSeconds = 1800;
+
+    [HttpGet]
+    [Route("/admin/flow/notifies")]
+    [Custom(IsMenu = true, Icon = "mdi:bell", Perm = PermBit.View)]
+    [Description("通知中心")]
+    async void Index() {
+        User me = await this.Admin();
+        ViewData d = await this.Layout("通知中心");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+        ListQuery q = this.Paged("id", 20);
+        List<FlowNotify> rows = await this.FlowNotify
+            .Where(a => a.userId == me.id)
+            .OrderByDescending(a => a.id)
+            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        int total = await this.FlowNotify
+            .Where(a => a.userId == me.id).CountAsync();
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            FlowNotify n = rows[i];
+            StrMap m = new StrMap();
+            m.Set("id", Convert.ToString(n.id));
+            m.Set("kind", n.kind);
+            m.Set("kindText", n.kind == "assign" ? "派工"
+                : (n.kind == "mention" ? "提及" : "流程"));
+            m.Set("content", n.content);
+            m.Set("link", n.link);
+            m.Set("unread", n.isRead == 0 ? "1" : "");
+            m.Set("createdAt", Fmt.Day(n.createdAt));
+            items.Add(m);
+        }
+        d.Set("empty", total == 0 ? "1" : "");
+        this.Pager(d, q, total);
+        this.Page(d);
+    }
+
+    /* 未读数与最新未读列表：顶栏铃铛的轻量数据源，由前端定时拉取（SSE 只推在线实时增量）。 */
+    [HttpGet]
+    [Custom(IsMenu = false, Perm = PermBit.View)]
+    [Description("未读通知")]
+    async void Unread() {
+        User me = await this.Admin();
+        List<FlowNotify> rows = await this.FlowNotify
+            .Where(a => a.userId == me.id && a.isRead == 0)
+            .OrderByDescending(a => a.id).Take(8).ToListAsync();
+        int total = await this.FlowNotify
+            .Where(a => a.userId == me.id && a.isRead == 0).CountAsync();
+        JsonValue items = JsonValue.NewArray();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            JsonValue o = JsonValue.NewObject();
+            o.Put("content", JsonValue.NewStr(rows[i].content));
+            o.Put("link", JsonValue.NewStr(rows[i].link));
+            items.Append(o);
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("count", JsonValue.NewStr(Convert.ToString(total)));
+        body.Put("items", items);
+        this.Ctx().Json(body.ToJson());
+    }
+
+    /* 实时通知通道：WebSocket 长连接为主——ctx.WsUpgrade() 在路由/权限之后升级，
+       会话直接继承本路由的授权语义，升级前收到的管道帧由框架切进 WsReader。
+       非 WS 请求（老代理/老客户端）回落 SSE，同一端点按 Upgrade 头自动分流。
+       写方只有 FlowHub.Push：会话循环只读，客户端 20s 文本心跳唤醒 Recv 即自动
+       续期；服务端 30 分钟收口一次，前端断开后自动重连（重连重新过一遍鉴权）。 */
+    [HttpGet]
+    [Custom(IsMenu = false, Perm = PermBit.View)]
+    [Description("通知事件流")]
+    async void Stream() {
+        User me = await this.Admin();
+        HttpContext ctx = this.Ctx();
+        WsSession ws = await ctx.WsUpgrade();
+        if (ws != null) {
+            /* 首帧同步未读数——此刻尚未登记进 FlowHub，无并发写方，安全。 */
+            int unread = await this.FlowNotify
+                .Where(a => a.userId == me.id && a.isRead == 0).CountAsync();
+            if (!await ws.SendText("{\"type\":\"unread\",\"count\":"
+                    + Convert.ToString(unread) + "}")) { return; }
+            ZanWeb.Modules.Flow.FlowHub.JoinWs(me.id, ws);
+            long started = WebApp.NowSeconds();
+            while (ws.Open()) {
+                string m = await ws.Recv();
+                if (m == null) { break; }
+                if (WebApp.NowSeconds() - started >= Notifies.StreamSeconds) {
+                    await ws.Close(1000);
+                    break;
+                }
+                /* 入站文本（心跳 ping 等）一律忽略；协议级 ping/pong 在 Recv 内已答。 */
+            }
+            ZanWeb.Modules.Flow.FlowHub.LeaveWs(ws);
+            return;
+        }
+        /* SSE 回退通道：与 WS 同一端点，老代理/老客户端走原路。 */
+        if (!await ctx.SseOpen()) { return; }
+        ZanWeb.Modules.Flow.FlowHub.JoinSse(me.id, ctx);
+        /* 首帧同步一次未读数，页面打开即为最新。 */
+        int unread2 = await this.FlowNotify
+            .Where(a => a.userId == me.id && a.isRead == 0).CountAsync();
+        if (!await ctx.SseSend("unread", "{\"count\":"
+                + Convert.ToString(unread2) + "}")) {
+            ZanWeb.Modules.Flow.FlowHub.LeaveSse(ctx);
+            return;
+        }
+        int elapsed = 0;
+        while (elapsed < Notifies.StreamSeconds) {
+            await Task.Delay(15000);
+            elapsed = elapsed + 15;
+            /* 保活注释行：空闲时让代理不误判断连；FlowHub.Push 的事件不受此影响。 */
+            if (!await ctx.SseSend("", ": keep-alive")) {
+                break;
+            }
+        }
+        ZanWeb.Modules.Flow.FlowHub.LeaveSse(ctx);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("标记已读")]
+    async void Read() {
+        User me = await this.Admin();
+        int id = this.InInt("id", 0);
+        long now = WebApp.NowSeconds();
+        if (id > 0) {
+            int _n = await this.FlowNotify.Update()
+                .Set(a => a.isRead, 1)
+                .Where(a => a.id == id && a.userId == me.id)
+                .ExecuteAffrowsAsync();
+        } else {
+            int _n = await this.FlowNotify.Update()
+                .Set(a => a.isRead, 1)
+                .Where(a => a.userId == me.id).ExecuteAffrowsAsync();
+        }
+        this.Saved("已标记");
+    }
+}

@@ -1,0 +1,186 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Ecbi;
+
+namespace ZanWeb.Admin.Ecbi;
+
+/* /admin/ecbi 电商 BI：订单落地(ODS)的汇总看板。聚合在控制器内完成（ORM 无 GROUP BY），模板规模数据量下足够。 */
+[Route("admin/ecbi/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("电商BI")]
+class Bi : AdminController {
+    [HttpGet]
+    [Route("/admin/ecbi")]
+    [Custom(IsMenu = true, Icon = "mdi:chart-box", Perm = PermBit.View)]
+    [Description("电商BI")]
+    async void Index() {
+        ViewData d = await this.Layout("电商BI");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        List<OdsOrder> all = await this.OdsOrder.OrderByDescending(a => a.payAt).ToListAsync();
+        int total = all.Count;
+        long totalAmount = 0;
+        for (int i = 0; i < all.Count; i = i + 1) { totalAmount = totalAmount + all[i].amount; }
+        long avg = total > 0 ? (long)(totalAmount / (long)total) : 0;
+
+        d.Set("totalAmount", Convert.ToString(totalAmount));
+        d.Set("total", Convert.ToString(total));
+        d.Set("avg", Convert.ToString(avg));
+
+        /* 品类 / 渠道 聚合（无 GROUP BY，循环累加） */
+        List<string> catKeys = new List<string>();
+        List<long> catVals = new List<long>();
+        List<string> chKeys = new List<string>();
+        List<long> chVals = new List<long>();
+        for (int i = 0; i < all.Count; i = i + 1) {
+            OdsOrder o = all[i];
+            Bi.Bucket(catKeys, catVals, o.category, o.amount);
+            Bi.Bucket(chKeys, chVals, o.channel, o.amount);
+        }
+        List<StrMap> cats = d.AddList("categories");
+        for (int i = 0; i < catKeys.Count; i = i + 1) {
+            StrMap r = new StrMap();
+            r.Set("name", catKeys[i]);
+            r.Set("amount", Convert.ToString(catVals[i]));
+            long pct = totalAmount > 0 ? (catVals[i] * 100 / totalAmount) : 0;
+            r.Set("pct", Convert.ToString(pct));
+            cats.Add(r);
+        }
+        d.Set("catCount", Convert.ToString(catKeys.Count));
+        List<StrMap> chs = d.AddList("channels");
+        for (int i = 0; i < chKeys.Count; i = i + 1) {
+            StrMap r = new StrMap();
+            r.Set("name", chKeys[i]);
+            r.Set("amount", Convert.ToString(chVals[i]));
+            long pct = totalAmount > 0 ? (chVals[i] * 100 / totalAmount) : 0;
+            r.Set("pct", Convert.ToString(pct));
+            chs.Add(r);
+        }
+
+        /* 近 14 天销售额趋势 */
+        long now = WebApp.NowSeconds();
+        List<string> dayKeys = new List<string>();
+        List<long> dayVals = new List<long>();
+        for (int di = 13; di >= 0; di = di - 1) {
+            long dayStart = now - (long)di * 86400;
+            string key = Fmt.Day(dayStart);
+            long sum = 0;
+            for (int k = 0; k < all.Count; k = k + 1) {
+                if (Fmt.Day(all[k].payAt) == key) { sum = sum + all[k].amount; }
+            }
+            dayKeys.Add(key);
+            dayVals.Add(sum);
+        }
+        long maxDay = 1;
+        for (int i = 0; i < dayVals.Count; i = i + 1) { if (dayVals[i] > maxDay) { maxDay = dayVals[i]; } }
+        List<StrMap> days = d.AddList("days");
+        for (int i = 0; i < dayKeys.Count; i = i + 1) {
+            StrMap r = new StrMap();
+            r.Set("day", dayKeys[i]);
+            r.Set("amount", Convert.ToString(dayVals[i]));
+            long pct = (long)(dayVals[i] * 100 / maxDay);
+            r.Set("pct", Convert.ToString(pct));
+            days.Add(r);
+        }
+
+        /* 最近订单 */
+        List<StrMap> orders = d.AddList("orders");
+        int lim = total < 12 ? total : 12;
+        for (int i = 0; i < lim; i = i + 1) {
+            OdsOrder o = all[i];
+            StrMap r = new StrMap();
+            r.Set("orderNo", o.orderNo);
+            r.Set("customerName", o.customerName);
+            r.Set("productName", o.productName);
+            r.Set("category", o.category);
+            r.Set("channel", o.channel);
+            r.Set("amount", Convert.ToString(o.amount));
+            r.Set("payAt", Fmt.Day(o.payAt));
+            orders.Add(r);
+        }
+
+        this.Page(d);
+    }
+
+    /* 订单落地列表：可搜索的 ODS 原始数据。 */
+    [HttpGet]
+    [Custom(IsMenu = false, Perm = PermBit.View)]
+    [Description("订单落地")]
+    async void Orders() {
+        ViewData d = await this.Layout("订单落地");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+        ListQuery q = this.Paged("payAt", 20);
+        string kw = q.Kw();
+        List<OdsOrder> rows = await this.OdsOrder
+            .WhereIf(kw.Length > 0, a => a.customerName.Contains(kw)
+                || a.productName.Contains(kw) || a.orderNo.Contains(kw))
+            .OrderByDescending(a => a.payAt)
+            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        int total = await this.OdsOrder
+            .WhereIf(kw.Length > 0, a => a.customerName.Contains(kw)
+                || a.productName.Contains(kw) || a.orderNo.Contains(kw))
+            .CountAsync();
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            OdsOrder o = rows[i];
+            StrMap r = new StrMap();
+            r.Set("orderNo", o.orderNo);
+            r.Set("customerName", o.customerName);
+            r.Set("productName", o.productName);
+            r.Set("category", o.category);
+            r.Set("channel", o.channel);
+            r.Set("amount", Convert.ToString(o.amount));
+            r.Set("payAt", Fmt.Day(o.payAt));
+            items.Add(r);
+        }
+        this.Pager(d, q, total);
+        this.Page(d);
+    }
+
+    /* 导入示例订单：仅在空表时执行，便于模板开箱演示。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Create)]
+    [Description("导入示例订单")]
+    async void Sample() {
+        int have = await this.OdsOrder.CountAsync();
+        if (have > 0) { this.Saved("已有订单数据，无需重复导入"); return; }
+        long now = WebApp.NowSeconds();
+        List<string> cats = new List<string>();
+        cats.Add("数码"); cats.Add("家居"); cats.Add("服饰");
+        List<string> chs = new List<string>();
+        chs.Add("天猫"); chs.Add("京东"); chs.Add("自营");
+        int n = 0;
+        for (int di = 13; di >= 0; di = di - 1) {
+            long payAt = now - (long)di * 86400;
+            for (int ci = 0; ci < cats.Count; ci = ci + 1) {
+                for (int hi = 0; hi < chs.Count; hi = hi + 1) {
+                    OdsOrder o = new OdsOrder();
+                    o.orderNo = "D" + Convert.ToString(payAt)
+                        + Convert.ToString(ci) + Convert.ToString(hi);
+                    o.customerName = "客户" + Convert.ToString((ci * 3 + hi) % 9 + 1);
+                    o.productName = cats[ci] + "商品" + Convert.ToString(hi + 1);
+                    o.category = cats[ci];
+                    o.channel = chs[hi];
+                    o.province = "省份" + Convert.ToString((ci + hi) % 5 + 1);
+                    o.amount = (long)((di + 1) * 100 + ci * 50 + hi * 20 + 80);
+                    o.qty = (hi + 1) * 2;
+                    o.payAt = payAt;
+                    o.createdAt = payAt;
+                    int id = await this.OdsOrder.Insert(o).ExecuteIdentityAsync();
+                    if (id > 0) { n = n + 1; }
+                }
+            }
+        }
+        await this.Note("导入示例订单", Convert.ToString(n) + " 笔", n > 0, "");
+        this.Saved("已导入 " + Convert.ToString(n) + " 笔示例订单");
+    }
+
+    static void Bucket(List<string> keys, List<long> vals, string key, long amount) {
+        int at = keys.IndexOf(key);
+        if (at < 0) { keys.Add(key); vals.Add(amount); }
+        else { vals[at] = vals[at] + amount; }
+    }
+}

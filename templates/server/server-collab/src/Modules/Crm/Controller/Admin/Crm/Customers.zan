@@ -1,0 +1,133 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Crm;
+
+namespace ZanWeb.Admin.Crm;
+
+/* /admin/crm/customers 客户管理：搜索、建、编、删。 */
+[Route("admin/crm/customers/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("客户管理")]
+class Customers : AdminController {
+    [HttpGet]
+    [Route("/admin/crm/customers")]
+    [Custom(IsMenu = true, Icon = "mdi:account-group", Perm = PermBit.View)]
+    [Description("客户管理")]
+    async void Index() {
+        ViewData d = await this.Layout("客户管理");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        ListQuery q = this.Paged("id", 20);
+        string kw = q.Kw();
+        List<CrmCustomer> rows = await this.CrmCustomer
+            .WhereIf(kw.Length > 0, a => a.name.Contains(kw))
+            .OrderByDescending(a => a.id)
+            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        int total = await this.CrmCustomer
+            .WhereIf(kw.Length > 0, a => a.name.Contains(kw))
+            .CountAsync();
+
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            CrmCustomer c = rows[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(c.id));
+            row.Set("name", c.name);
+            row.Set("contact", Fmt.Dash(c.contact));
+            row.Set("phone", Fmt.Dash(c.phone));
+            row.Set("levelText", Customers.LevelText(c.level));
+            items.Add(row);
+        }
+        this.Pager(d, q, total);
+        this.Page(d);
+    }
+
+    [HttpGet]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("客户表单")]
+    async void Form() {
+        int id = this.InInt("id", 0);
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("dialogTitle", "新增客户");
+        d.Set("new", "1");
+        d.Set("level2", "selected");
+        if (id > 0) {
+            CrmCustomer c = await this.CrmCustomer.Where(a => a.id == id).FirstAsync();
+            if (c == null) { this.Fail(404, "0404", "客户不存在"); }
+            d.Set("dialogTitle", "编辑客户");
+            d.Set("name", c.name);
+            d.Set("contact", c.contact);
+            d.Set("phone", c.phone);
+            d.Set("remark", c.remark);
+            d.Set("edit", "1");
+            d.Set("new", "");
+            d.Set("level1", "");
+            d.Set("level2", "");
+            d.Set("level3", "");
+            if (c.level == 1) { d.Set("level1", "selected"); }
+            else if (c.level == 3) { d.Set("level3", "selected"); }
+            else { d.Set("level2", "selected"); }
+        }
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("保存客户")]
+    async void Save() {
+        int id = this.InInt("id", 0);
+        string name = this.Need("name", "客户名称");
+        string contact = this.In("contact");
+        string phone = this.In("phone");
+        int level = this.InInt("level", 2);
+        string remark = this.In("remark");
+
+        if (id > 0) {
+            int n = await this.CrmCustomer.Update()
+                .Set(a => a.name, name)
+                .Set(a => a.contact, contact)
+                .Set(a => a.phone, phone)
+                .Set(a => a.level, level)
+                .Set(a => a.remark, remark)
+                .Set(a => a.updatedAt, WebApp.NowSeconds())
+                .Where(a => a.id == id)
+                .ExecuteAffrowsAsync();
+            await this.Note("编辑客户", "#" + Convert.ToString(id) + " " + name, n > 0, "");
+            this.Saved("客户已保存");
+            return;
+        }
+        CrmCustomer c = new CrmCustomer();
+        c.name = name;
+        c.contact = contact;
+        c.phone = phone;
+        c.level = level;
+        c.remark = remark;
+        c.createdAt = WebApp.NowSeconds();
+        c.updatedAt = c.createdAt;
+        int newId = await this.CrmCustomer.Insert(c).ExecuteIdentityAsync();
+        await this.Note("新增客户", "#" + Convert.ToString(newId) + " " + name, newId > 0, "");
+        this.Saved("客户已创建");
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Delete)]
+    [Description("删除客户")]
+    async void Delete() {
+        int id = this.InInt("id", 0);
+        CrmCustomer c = await this.CrmCustomer.Where(a => a.id == id).FirstAsync();
+        if (c == null) { this.Fail(404, "0404", "客户不存在"); }
+        int n = await this.CrmCustomer.Delete().Where(a => a.id == id).ExecuteAffrowsAsync();
+        await this.Note("删除客户", "#" + Convert.ToString(id) + " " + c.name, n > 0, "");
+        this.Saved("客户已删除");
+    }
+
+    static string LevelText(int level) {
+        if (level == 1) { return "重要"; }
+        if (level == 3) { return "潜在"; }
+        return "普通";
+    }
+}

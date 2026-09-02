@@ -1,0 +1,318 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb.Model.Flow;
+using ZanWeb.Model.Sys;
+using ZanWeb.Modules.Flow;
+
+namespace ZanWeb.Admin.Flow;
+
+/* /admin/flow/flows 流程编排：定义流程（名称）并编排节点（环节名/顺序/责任部门/指定人/人工或AI）。
+   节点编辑在定义详情页整表提交——编排是「一张流程图」，碎片化保存反而失真。 */
+[Route("admin/flow/flows/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("流程编排")]
+class Flows : AdminController {
+    [HttpGet]
+    [Route("/admin/flow/flows")]
+    [Custom(IsMenu = true, Icon = "mdi:file-tree", Perm = PermBit.View)]
+    [Description("流程编排")]
+    async void Index() {
+        ViewData d = await this.Layout("流程编排");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+        ListQuery q = this.Paged("id", 20);
+        string kw = q.Kw();
+        List<FlowDef> rows = await this.FlowDef
+            .WhereIf(kw.Length > 0, a => a.name.Contains(kw))
+            .OrderBy(a => a.id)
+            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        int total = await this.FlowDef
+            .WhereIf(kw.Length > 0, a => a.name.Contains(kw)).CountAsync();
+        d.Set("empty", total == 0 ? "1" : "");
+        d.Set("kw", kw);
+        d.Set("canCreate", this.Can(PermBit.Create) ? "1" : "");
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            FlowDef r = rows[i];
+            StrMap m = new StrMap();
+            m.Set("id", Convert.ToString(r.id));
+            m.Set("name", r.name);
+            m.Set("description", r.description);
+            m.Set("status", r.status == 1 ? "启用" : "停用");
+            m.Set("toggleText", r.status == 1 ? "停用" : "启用");
+            m.Set("nextStatus", r.status == 1 ? "0" : "1");
+            m.Set("canUpdate", this.Can(PermBit.Update) ? "1" : "");
+            m.Set("canDelete", this.Can(PermBit.Delete) ? "1" : "");
+            items.Add(m);
+        }
+        this.Pager(d, q, total);
+        this.Page(d);
+    }
+
+    /* 定义详情 + 节点编排表：一次列出全部节点（按 sort），可增删改、调序、指派部门/人/AI。 */
+    [HttpGet]
+    [Custom(IsMenu = false, Perm = PermBit.View)]
+    [Description("流程详情")]
+    async void Edit() {
+        int id = this.InInt("id", 0);
+        ViewData d = await this.Layout(id > 0 ? "编辑流程" : "新建流程");
+        if (id > 0) {
+            FlowDef r = await this.FlowDef.Where(a => a.id == id).FirstAsync();
+            if (r == null) { this.Fail(404, "0404", "流程不存在"); return; }
+            d.Set("id", Convert.ToString(id));
+            d.Set("name", r.name);
+            d.Set("description", r.description);
+            d.Set("status1", r.status == 1 ? "selected" : "");
+            d.Set("status0", r.status == 1 ? "" : "selected");
+
+            List<FlowNode> nodes = await this.FlowNode
+                .Where(a => a.defId == id).ToListAsync();
+            List<FlowNode> ordered = ZanWeb.Modules.Flow.Engine.SortNodes(nodes);
+            List<StrMap> items = d.AddList("nodes");
+            for (int i = 0; i < ordered.Count; i = i + 1) {
+                FlowNode n = ordered[i];
+                StrMap m = new StrMap();
+                m.Set("id", Convert.ToString(n.id));
+                m.Set("name", n.name);
+                m.Set("sort", Convert.ToString(n.sort));
+                m.Set("deptId", Convert.ToString(n.deptId));
+                m.Set("assignUserId", Convert.ToString(n.assignUserId));
+                m.Set("kind", n.kind);
+                m.Set("aiPrompt", n.aiPrompt);
+                m.Set("selectedHuman", n.kind == "ai" ? "" : "selected");
+                m.Set("selectedAi", n.kind == "ai" ? "selected" : "");
+                string tag = Convert.ToString(i);
+                m.Set("sortField", "node_sort_" + tag);
+                m.Set("nameField", "node_name_" + tag);
+                m.Set("deptField", "node_dept_" + tag);
+                m.Set("userField", "node_user_" + tag);
+                m.Set("kindField", "node_kind_" + tag);
+                m.Set("promptField", "node_prompt_" + tag);
+                items.Add(m);
+            }
+            d.Set("slotCount", "4");
+            List<StrMap> slots = d.AddList("slots");
+            for (int s = 0; s < 4; s = s + 1) {
+                int idx = ordered.Count + s;
+                string tag = Convert.ToString(idx);
+                StrMap m = new StrMap();
+                m.Set("nextSort", Convert.ToString(idx + 1));
+                m.Set("sortField", "node_sort_" + tag);
+                m.Set("nameField", "node_name_" + tag);
+                m.Set("deptField", "node_dept_" + tag);
+                m.Set("userField", "node_user_" + tag);
+                m.Set("kindField", "node_kind_" + tag);
+                m.Set("promptField", "node_prompt_" + tag);
+                slots.Add(m);
+            }
+        } else {
+            d.Set("id", "0");
+            d.Set("name", "");
+            d.Set("description", "");
+            d.Set("status1", "selected");
+            d.Set("status0", "");
+            d.Set("slotCount", "6");
+            d.AddList("nodes");
+            List<StrMap> slots = d.AddList("slots");
+            for (int s = 0; s < 6; s = s + 1) {
+                string tag = Convert.ToString(s);
+                StrMap m = new StrMap();
+                m.Set("nextSort", Convert.ToString(s + 1));
+                m.Set("sortField", "node_sort_" + tag);
+                m.Set("nameField", "node_name_" + tag);
+                m.Set("deptField", "node_dept_" + tag);
+                m.Set("userField", "node_user_" + tag);
+                m.Set("kindField", "node_kind_" + tag);
+                m.Set("promptField", "node_prompt_" + tag);
+                slots.Add(m);
+            }
+        }
+
+        /* 部门/员工候选：编排时指派责任人。 */
+        List<Department> depts = await this.Department.ToListAsync();
+        List<StrMap> dopts = d.AddList("depts");
+        for (int i = 0; i < depts.Count; i = i + 1) {
+            StrMap m = new StrMap();
+            m.Set("id", Convert.ToString(depts[i].id));
+            m.Set("name", depts[i].name);
+            dopts.Add(m);
+        }
+        List<User> users = await this.User
+            .Where(a => a.status == 1).ToListAsync();
+        List<StrMap> uopts = d.AddList("users");
+        for (int i = 0; i < users.Count; i = i + 1) {
+            StrMap m = new StrMap();
+            m.Set("id", Convert.ToString(users[i].id));
+            m.Set("name", Fmt.Text(users[i].nickname, users[i].username));
+            uopts.Add(m);
+        }
+        this.Dialog(d);
+    }
+
+    /* 保存定义与节点：nodes 以行提交（nodeId/name/sort/deptId/assignUserId/kind/aiPrompt）。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("保存流程")]
+    async void Save() {
+        int id = this.InInt("id", 0);
+        string name = this.Need("name", "流程名称");
+        if (name.Length == 0) { this.Fail(400, "0004", "请填写流程名称"); return; }
+        long now = WebApp.NowSeconds();
+        FlowDef def;
+        if (id > 0) {
+            def = await this.FlowDef.Where(a => a.id == id).FirstAsync();
+            if (def == null) { this.Fail(404, "0404", "流程不存在"); return; }
+            int _u = await this.FlowDef.Update()
+                .Set(a => a.name, name)
+                .Set(a => a.description, this.In("description"))
+                .Set(a => a.status, this.InInt("status", 0))
+                .Set(a => a.updatedAt, now)
+                .Where(a => a.id == id).ExecuteAffrowsAsync();
+        } else {
+            def = new FlowDef();
+            def.name = name;
+            def.description = this.In("description");
+            def.status = 1;
+            def.createdAt = now;
+            def.updatedAt = now;
+            id = await this.FlowDef.Insert(def).ExecuteIdentityAsync();
+        }
+
+        /* 节点整表替换：先删后插，保持 sort 语义简单可靠。 */
+        int _d = await this.FlowNode.Delete()
+            .Where(a => a.defId == id).ExecuteAffrowsAsync();
+        int saved = 0;
+        for (int i = 0; i < 64; i = i + 1) {
+            string nodeName = this.In("node_name_" + Convert.ToString(i));
+            if (nodeName.Length == 0) { continue; }
+            FlowNode n = new FlowNode();
+            n.defId = id;
+            n.name = nodeName;
+            n.sort = this.InInt("node_sort_" + Convert.ToString(i), i + 1);
+            n.deptId = this.InInt("node_dept_" + Convert.ToString(i), 0);
+            n.assignUserId = this.InInt("node_user_" + Convert.ToString(i), 0);
+            string kind = this.In("node_kind_" + Convert.ToString(i));
+            n.kind = kind == "ai" ? "ai" : "human";
+            n.aiPrompt = this.In("node_prompt_" + Convert.ToString(i));
+            n.createdAt = now;
+            await this.FlowNode.Insert(n).ExecuteIdentityAsync();
+            saved = saved + 1;
+        }
+        await this.Note("保存流程", name + "（" + Convert.ToString(saved) + " 个节点）",
+            true, "");
+        this.Saved("已保存");
+    }
+
+    /* 发起实例：从启用的流程定义创建一次运行。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Create)]
+    [Description("发起流程")]
+    async void Start() {
+        int defId = this.InInt("defId", 0);
+        string title = this.Need("title", "实例标题");
+        FlowDef def = await this.FlowDef.Where(a => a.id == defId).FirstAsync();
+        if (def == null) { this.Fail(404, "0404", "流程不存在"); return; }
+        if (def.status != 1) { this.Fail(400, "0004", "流程已停用"); return; }
+        if (title.Length == 0) { this.Fail(400, "0004", "请填写实例标题"); return; }
+        User me = await this.Admin();
+        int instId = await ZanWeb.Modules.Flow.Engine.Start(
+            this.Held(), def, title, this.In("bizRef"), me.id);
+        await this.Note("发起流程", title, true, "");
+        this.Saved("已发起，首个任务已派发");
+    }
+
+    /* 停用/启用：停用后不能再发起新实例。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("启停流程")]
+    async void Status() {
+        int id = this.InInt("id", 0);
+        int status = this.InInt("status", 1);
+        if (status != 0 && status != 1) { this.Fail(400, "0004", "状态不合法"); return; }
+        long now = WebApp.NowSeconds();
+        int n = await this.FlowDef.Update()
+            .Set(a => a.status, status)
+            .Set(a => a.updatedAt, now)
+            .Where(a => a.id == id).ExecuteAffrowsAsync();
+        this.Saved(n > 0 ? (status == 1 ? "已启用" : "已停用") : "流程不存在");
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Delete)]
+    [Description("删除流程")]
+    async void Delete() {
+        int id = this.InInt("id", 0);
+        int used = await this.FlowInst
+            .Where(a => a.defId == id && a.status == 1).CountAsync();
+        if (used > 0) { this.Fail(400, "0004", "有进行中的实例，先终止再删除"); return; }
+        int _n1 = await this.FlowNode.Delete()
+            .Where(a => a.defId == id).ExecuteAffrowsAsync();
+        int _n2 = await this.FlowDef.Delete()
+            .Where(a => a.id == id).ExecuteAffrowsAsync();
+        await this.Note("删除流程", "defId=" + Convert.ToString(id), true, "");
+        this.Saved("已删除");
+    }
+
+    /* 实例列表：进行中/已完成的运行记录。 */
+    [HttpGet]
+    [Custom(IsMenu = false, Perm = PermBit.View)]
+    [Description("流程实例")]
+    async void Instances() {
+        ViewData d = await this.Layout("流程实例");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+        ListQuery q = this.Paged("id", 20);
+        string kw = q.Kw();
+        List<FlowInst> rows = await this.FlowInst
+            .WhereIf(kw.Length > 0, a => a.title.Contains(kw))
+            .OrderByDescending(a => a.id)
+            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        int total = await this.FlowInst
+            .WhereIf(kw.Length > 0, a => a.title.Contains(kw)).CountAsync();
+
+        List<FlowDef> defs = await this.FlowDef.ToListAsync();
+        List<StrMap> defopts = d.AddList("defs");
+        for (int i = 0; i < defs.Count; i = i + 1) {
+            if (defs[i].status != 1) { continue; }
+            StrMap m = new StrMap();
+            m.Set("id", Convert.ToString(defs[i].id));
+            m.Set("name", defs[i].name);
+            defopts.Add(m);
+        }
+
+        List<FlowNode> nodes = await this.FlowNode.ToListAsync();
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            FlowInst r = rows[i];
+            StrMap m = new StrMap();
+            m.Set("id", Convert.ToString(r.id));
+            m.Set("title", r.title);
+            m.Set("def", ZanWeb.Modules.Flow.Engine.DefName(defs, r.defId));
+            m.Set("node", ZanWeb.Modules.Flow.Engine.NodeName(nodes, r.currentNodeId));
+            m.Set("status", r.status == 1 ? "进行中"
+                : (r.status == 2 ? "已完成" : "已终止"));
+            m.Set("running", r.status == 1 ? "1" : "");
+            m.Set("canKill", this.Can(PermBit.Update) ? "1" : "");
+            m.Set("createdAt", Fmt.Day(r.createdAt));
+            items.Add(m);
+        }
+        d.Set("empty", total == 0 ? "1" : "");
+        d.Set("kw", kw);
+        this.Pager(d, q, total);
+        this.Page(d);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Delete)]
+    [Description("终止实例")]
+    async void Kill() {
+        int id = this.InInt("id", 0);
+        long now = WebApp.NowSeconds();
+        int _n = await this.FlowInst.Update()
+            .Set(a => a.status, 3)
+            .Set(a => a.currentNodeId, 0)
+            .Set(a => a.updatedAt, now)
+            .Where(a => a.id == id && a.status == 1).ExecuteAffrowsAsync();
+        this.Saved(_n > 0 ? "已终止" : "实例不在进行中");
+    }
+}

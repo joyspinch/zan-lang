@@ -1,0 +1,63 @@
+using System;
+using System.Security.Cryptography;
+using System.Web;
+
+namespace ZanWeb;
+
+/* 注册与重置密码使用的 6 位验证码：缓存存储并设置 TTL，发送间隔限制，验证后一次性消费。 */
+class VerifyCode {
+    static int TtlSeconds = 600;
+    static int ResendSeconds = 60;
+
+    static string Key(string purpose, string address) {
+        return "code:" + purpose + ":" + address.ToLower();
+    }
+
+    static CacheContext Cache() {
+        AppServices s = AppServices.Current();
+        if (s == null) { return null; }
+        return s.Cache();
+    }
+
+    /* 判断该地址是否处于发送冷却期。 */
+    static async bool TooSoon(string purpose, string address) {
+        CacheContext c = VerifyCode.Cache();
+        if (c == null) { return false; }
+        string hit = await c.GetAsync(VerifyCode.Key(purpose, address) + ":sent");
+        return hit.Length > 0;
+    }
+
+    /* 生成验证码并缓存 10 分钟，同时记录发送时间以限流。 */
+    static async string Issue(string purpose, string address) {
+        string code = VerifyCode.Digits(6);
+        CacheContext c = VerifyCode.Cache();
+        if (c == null) { return code; }
+        await c.SetTtlAsync(VerifyCode.Key(purpose, address), code, VerifyCode.TtlSeconds);
+        await c.SetTtlAsync(VerifyCode.Key(purpose, address) + ":sent", "1",
+            VerifyCode.ResendSeconds);
+        return code;
+    }
+
+    /* 校验并消费验证码，错误/过期/已用均返回 false。 */
+    static async bool Accept(string purpose, string address, string code) {
+        if (code.Length == 0) { return false; }
+        CacheContext c = VerifyCode.Cache();
+        if (c == null) { return false; }
+        string key = VerifyCode.Key(purpose, address);
+        string want = await c.GetAsync(key);
+        if (want.Length == 0 || want != code) { return false; }
+        await c.DelAsync(key);
+        return true;
+    }
+
+    static string Digits(int n) {
+        byte[] raw = RandomNumberGenerator.GetBytes(n);
+        string digits = "";
+        for (int i = 0; i < n; i = i + 1) {
+            int v = (int)raw[i];
+            if (v < 0) { v = 0 - v; }
+            digits = digits + Convert.ToString(v % 10);
+        }
+        return digits;
+    }
+}

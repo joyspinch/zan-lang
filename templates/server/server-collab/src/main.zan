@@ -1,0 +1,164 @@
+using System;
+using System.Data;
+using System.Diagnostics;
+using ZanWeb;
+using System.Web;
+
+/* {{NAME}} -- ZanWeb 企业级 Web 应用。主入口负责启动服务器与注册路由，运行时配置从 config/app.json 读取。 */
+class Program {
+    /* 慢请求阈值(ms)，启动时从 [log].slowMs 读取 */
+    static int slowMs = 1000;
+    /* 慢 SQL 阈值(微秒)，启动时从 [log].slowSqlMs 换算 */
+    static long slowSqlUs = 200000;
+
+    static void Main() {
+        /* 进程需位于发布目录，按相对路径读取 config/views/wwwroot/数据库 */
+        bool _cd = ProcessHost.UseAppDir("config/app.json");
+        Cfg.Load("config/app.json");
+
+        /* 日志优先写入文件，worker 进程可能没有控制台 */
+        if (Cfg.Log.dir.Length > 0) {
+            int level = Log.INFO;
+            if (Cfg.Log.debug) { level = Log.DEBUG; }
+            Log.Configure(Cfg.Log.dir, Cfg.Log.pattern, level);
+            /* worker 的 stdout 已重定向到日志文件，不重复输出到控制台 */
+            Log.EchoToConsole(Cfg.Log.debug);
+        }
+
+        /* 依赖注入：每个 worker 进程独立构建连接池和缓存 */
+        DbPool pool = Db.OpenPool();
+        DbContext db = DbContext.Of(pool);
+        CacheContext cache = CacheContext.Of(Db.OpenRedis());
+        AppServices services = new AppServices(db, cache);
+        AppServices.Use(services);
+
+        /* 预开两个连接，避免首请求支付连接开销 */
+        int idle = await db.Warmup(2);
+        Console.WriteLine("[db] " + Cfg.Db.driver + " pool size="
+            + Convert.ToString(Cfg.Db.poolSize) + " idle=" + Convert.ToString(idle));
+        if (Cfg.Cache.driver == "redis") {
+            bool up = await cache.Warmup();
+            if (up) {
+                Console.WriteLine("[cache] redis "
+                    + Cfg.Cache.redisHost + ":" + Convert.ToString(Cfg.Cache.redisPort)
+                    + " (shared across workers)");
+            } else {
+                Console.WriteLine("[cache] redis unreachable -- reads miss,"
+                    + " writes are dropped, handlers fall back to the database");
+            }
+        } else {
+            Console.WriteLine("[cache] worker-local memory"
+                + " -- correct only while [worker].count is 1");
+        }
+
+        /* 启动时执行一次 Schema 迁移和数据初始化 */
+        bool ready = await Schema.Ensure(db);
+        if (!ready) {
+            Console.WriteLine("[db] schema not applied (database unreachable)"
+                + " -- check config/app.json [database]");
+        }
+
+        WebApp app = new WebApp(Cfg.Server.host, Cfg.Server.port);
+        app.MaxBody(Cfg.Server.maxBodyMB * 1024 * 1024);
+        app.GlobalLimit(Cfg.Server.globalLimitPerSec);
+        WebHost.Use(app);
+        app.AuthResolver(AuthToken.Resolve);
+        app.PermissionResolver(AuthUser.Allow);
+        app.LoginPath(Routes.Login);
+        /* 视图从磁盘读取一次，之后从内存渲染 */
+        app.Views("views");
+
+        /* 静态文件挂载：仅 wwwroot/ 可被外部访问 */
+        StaticFiles.Mount(app, "/static", "wwwroot");
+
+        /* 生命周期钩子 */
+        if (Cfg.Log.access) {
+            app.Before(Program.AccessLog);
+        }
+        Program.slowMs = Cfg.Log.slowMs;
+        Program.slowSqlUs = (long)Cfg.Log.slowSqlMs * 1000;
+        app.After(Program.Metrics);
+        ServerMetrics.Global().SlowQueryMs(Cfg.Log.slowSqlMs);
+        DbTrace.Sink(Program.SqlTrace);
+        ServerMetrics.Global()
+            .ErrorLog(Cfg.Log.errorLog, Cfg.Log.debug)
+            .OnError(MetricsStore.Failed);
+
+        /* 指标历史写入独立数据库，由后台协程定期刷新 */
+        bool hist = await MetricsStore.Start();
+        if (hist) {
+            Console.WriteLine("[metrics] history " + Cfg.Metrics.path
+                + " flush=" + Convert.ToString(Cfg.Metrics.flushSeconds) + "s");
+        }
+
+        /* 路由：编译期从控制器属性生成，运行时只执行注册 */
+        __AttrRoutes.Register(app);
+
+        /* 权限索引：从路由表建立 screen->bit 映射 */
+        Perm.Index(app);
+
+        if (ready) {
+            /* 内置角色同步路由授权，然后移入共享内存（匿名表，master 建、worker 继承） */
+            bool grantsReady = await Schema.SyncRoleGrants(app);
+            if (!grantsReady) {
+                Console.WriteLine("[rbac] role grants not synchronized"
+                    + " -- check database connectivity and schema");
+            }
+            if (!PermTable.Open()) {
+                Console.WriteLine("[rbac] shared memory unavailable");
+            }
+            IDbConnection rbac = await AppServices.Current().Db().Acquire();
+            if (rbac != null) {
+                await PermTable.LoadRoles(rbac);
+                AppServices.Current().Db().Release(rbac);
+            }
+        }
+
+        /* API 文档：从属性生成，挂载到 /api/docs */
+        ApiDocs.Title(Cfg.Server.name);
+        ApiDocs.MountSpec(app, "/api/docs");
+
+        /* 启动服务器，支持 start/stop/restart/reload/status */
+        int r = await WebServer.RunCommand(app, Cfg.Worker.count,
+            Cfg.Worker.daemon);
+    }
+
+    /* 慢 SQL 追踪：记录归一化语句、归档到 metrics.db、超过阈值时写日志 */
+    static void SqlTrace(string sql, long us) {
+        ServerMetrics.Global().RecordQuery(sql, us);
+        string norm = ServerMetrics.NormalizeSql(sql);
+        if (norm.Length > 200) { norm = norm.Substring(0, 200); }
+        bool slow = us >= Program.slowSqlUs;
+        MetricsStore.RecordSql(norm, us, slow);
+        if (slow) {
+            Log.Warn("[slow-sql] " + Convert.ToString(us) + "us " + norm);
+        }
+    }
+
+    static bool AccessLog(HttpContext ctx) {
+        Console.WriteLine("[req] " + ctx.method + " " + ctx.path);
+        return true;
+    }
+
+    /* 请求指标：按毫秒统计，流式连接只计推送量 */
+    static void Metrics(HttpContext ctx, long elapsedUs) {
+        if (ctx.routePattern.Length == 0) {
+            if (elapsedUs > (long)Program.slowMs * 1000) {
+                Console.WriteLine("[slow] " + ctx.method + " " + ctx.path + " "
+                    + Convert.ToString(elapsedUs) + "us");
+            }
+            return;
+        }
+        if (ctx.MetricsExcluded()) {
+            MetricsStore.Pushed(ctx.method, ctx.routePattern, ctx.Frames(),
+                ctx.FrameBytes());
+            return;
+        }
+        MetricsStore.Record(ctx.method, ctx.routePattern, ctx.status,
+            elapsedUs);
+        if (elapsedUs > (long)Program.slowMs * 1000) {
+            Console.WriteLine("[slow] " + ctx.method + " " + ctx.path + " "
+                + Convert.ToString(elapsedUs) + "us");
+        }
+    }
+}

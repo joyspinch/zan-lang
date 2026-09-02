@@ -1,0 +1,140 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Crm;
+
+namespace ZanWeb.Admin.Crm;
+
+/* /admin/crm/contacts 联系人管理：列表(按客户名解析)、建、编、删。一个客户可有多条联系人。 */
+[Route("admin/crm/contacts/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("联系人")]
+class Contacts : AdminController {
+    [HttpGet]
+    [Route("/admin/crm/contacts")]
+    [Custom(IsMenu = true, Icon = "mdi:contacts", Perm = PermBit.View)]
+    [Description("联系人")]
+    async void Index() {
+        ViewData d = await this.Layout("联系人管理");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        ListQuery q = this.Paged("id", 20);
+        string kw = q.Kw();
+        List<CrmContact> rows = await this.CrmContact
+            .WhereIf(kw.Length > 0, a => a.name.Contains(kw) || a.phone.Contains(kw))
+            .OrderByDescending(a => a.id)
+            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        int total = await this.CrmContact
+            .WhereIf(kw.Length > 0, a => a.name.Contains(kw) || a.phone.Contains(kw))
+            .CountAsync();
+        List<CrmCustomer> custs = await this.CrmCustomer.OrderBy(a => a.id).ToListAsync();
+
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            CrmContact c = rows[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(c.id));
+            row.Set("name", c.name);
+            row.Set("title", Fmt.Dash(c.title));
+            row.Set("phone", Fmt.Dash(c.phone));
+            row.Set("email", Fmt.Dash(c.email));
+            row.Set("customer", Contacts.CustName(custs, c.customerId));
+            items.Add(row);
+        }
+        this.Pager(d, q, total);
+        this.Page(d);
+    }
+
+    [HttpGet]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("联系人表单")]
+    async void Form() {
+        int id = this.InInt("id", 0);
+        CrmContact c = null;
+        if (id > 0) {
+            c = await this.CrmContact.Where(a => a.id == id).FirstAsync();
+            if (c == null) { this.Fail(404, "0404", "联系人不存在"); }
+        }
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("dialogTitle", id > 0 ? "编辑联系人" : "新增联系人");
+        if (id <= 0) { d.Set("new", "1"); }
+
+        List<CrmCustomer> custs = await this.CrmCustomer.OrderBy(a => a.id).ToListAsync();
+        List<StrMap> copts = d.AddList("customers");
+        for (int i = 0; i < custs.Count; i = i + 1) {
+            StrMap opt = new StrMap();
+            opt.Set("id", Convert.ToString(custs[i].id));
+            opt.Set("name", custs[i].name);
+            if (c != null && custs[i].id == c.customerId) { opt.Set("selected", "selected"); }
+            copts.Add(opt);
+        }
+        if (c != null) {
+            d.Set("name", c.name);
+            d.Set("title", c.title);
+            d.Set("phone", c.phone);
+            d.Set("email", c.email);
+            d.Set("edit", "1");
+            d.Set("new", "");
+        }
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("保存联系人")]
+    async void Save() {
+        int id = this.InInt("id", 0);
+        int customerId = this.InInt("customerId", 0);
+        string name = this.Need("name", "联系人姓名");
+        string title = this.In("title");
+        string phone = this.In("phone");
+        string email = this.In("email");
+        if (customerId <= 0) { this.Fail(400, "0004", "请选择所属客户"); }
+
+        if (id > 0) {
+            int n = await this.CrmContact.Update()
+                .Set(a => a.customerId, customerId)
+                .Set(a => a.name, name)
+                .Set(a => a.title, title)
+                .Set(a => a.phone, phone)
+                .Set(a => a.email, email)
+                .Where(a => a.id == id)
+                .ExecuteAffrowsAsync();
+            await this.Note("编辑联系人", "#" + Convert.ToString(id) + " " + name, n > 0, "");
+            this.Saved("联系人已保存");
+            return;
+        }
+        CrmContact c = new CrmContact();
+        c.customerId = customerId;
+        c.name = name;
+        c.title = title;
+        c.phone = phone;
+        c.email = email;
+        c.createdAt = WebApp.NowSeconds();
+        int newId = await this.CrmContact.Insert(c).ExecuteIdentityAsync();
+        await this.Note("新增联系人", "#" + Convert.ToString(newId) + " " + name, newId > 0, "");
+        this.Saved("联系人已创建");
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Delete)]
+    [Description("删除联系人")]
+    async void Delete() {
+        int id = this.InInt("id", 0);
+        CrmContact c = await this.CrmContact.Where(a => a.id == id).FirstAsync();
+        if (c == null) { this.Fail(404, "0404", "联系人不存在"); }
+        int n = await this.CrmContact.Delete().Where(a => a.id == id).ExecuteAffrowsAsync();
+        await this.Note("删除联系人", "#" + Convert.ToString(id) + " " + c.name, n > 0, "");
+        this.Saved("联系人已删除");
+    }
+
+    static string CustName(List<CrmCustomer> list, int id) {
+        for (int i = 0; i < list.Count; i = i + 1) {
+            if (list[i].id == id) { return list[i].name; }
+        }
+        return "—";
+    }
+}

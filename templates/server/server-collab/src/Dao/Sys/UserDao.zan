@@ -1,0 +1,74 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.Dao.Sys;
+
+/* sys_user 的读写入口；登录、令牌解析和管理后台都经此路由，账号表唯一网关。DAO 由调用方连接构造，无独立生命周期。所有方法异步，认证解析器也在请求协程上运行，不阻塞工作线程。 */
+class UserDao {
+    IDbConnection db;
+
+    UserDao(IDbConnection db) {
+        this.db = db;
+    }
+
+    async User ByUsername(string username) {
+        return await this.db.Select<User>()
+            .Where(a => a.username == username)
+            .FirstAsync();
+    }
+
+    async User ById(int id) {
+        return await this.db.Select<User>().Where(a => a.id == id).FirstAsync();
+    }
+
+    /* 供 API 返回的账号摘要，不含密码。见 UserBrief。 */
+    async List<UserBrief> AllBrief() {
+        List<User> rows = await this.db.Select<User>()
+            .OrderBy(a => a.id)
+            .ToListAsync();
+        List<UserBrief> brief = new List<UserBrief>();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            brief.Add(UserDao.Brief(rows[i]));
+        }
+        return brief;
+    }
+
+    static UserBrief Brief(User row) {
+        UserBrief b = new UserBrief();
+        b.id = row.id;
+        b.username = row.username;
+        b.nickname = row.nickname;
+        b.departmentId = row.departmentId;
+        b.status = row.status;
+        b.isSuper = row.isSuper;
+        return b;
+    }
+
+    async int Count() {
+        return await this.db.Select<User>().CountAsync();
+    }
+
+    async int Insert(User user) {
+        return await this.db.Insert<User>(user).ExecuteIdentityAsync();
+    }
+
+    /* 启用(1)/禁用(0)账号；禁用后无法登录，已发令牌也失效。返回影响行数。 */
+    async int SetStatus(int id, int status) {
+        return await this.db.Update<User>()
+            .Set(a => a.status, status)
+            .Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+    }
+
+    /* 使该账号已发所有令牌失效；改密或强制登出后调用。 */
+    async int BumpTokenVersion(int id) {
+        User row = await this.ById(id);
+        if (row == null) { return 0; }
+        return await this.db.Update<User>()
+            .Set(a => a.tokenVersion, row.tokenVersion + 1)
+            .Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+    }
+}

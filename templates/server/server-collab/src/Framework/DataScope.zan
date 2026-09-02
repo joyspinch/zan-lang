@@ -1,0 +1,173 @@
+using System;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb;
+
+/* 请求可访问表的哪些行。权限检查回答"能否进入"，数据范围回答"进入后看哪些行"。角色携带 dataScope（1 全部 / 2 本部门 / 3 本部门及下级 / 4 仅本人 / 5 自定义部门）。多角色 union，不排名：只要有一个角色指定部门即贡献；全部角色均"仅本人"才归入 Self。坍缩为三种形态：All / ByDepts / Self。解析一次写入与角色行相同的共享内存，部门树已展平。不可解析账号返回 ByDept over 部门 -1（不匹配任何行，防泄漏）。*/
+class DataScope {
+    static int RoleAll = 1;
+    static int RoleDept = 2;
+    static int RoleDeptTree = 3;
+    static int RoleSelf = 4;
+    static int RoleCustom = 5;
+
+    static int All = 1;
+    static int ByDepts = 2;
+    static int Self = 4;
+
+    int mode;
+    int userId;
+    List<int> depts;
+
+    DataScope() {
+        this.mode = DataScope.ByDepts;
+        this.userId = 0;
+        this.depts = new List<int>();
+    }
+
+    bool Any() { return this.mode == DataScope.All; }
+
+    bool ByDept() { return this.mode == DataScope.ByDepts; }
+
+    bool Mine() { return this.mode == DataScope.Self; }
+
+    List<int> Depts() { return this.depts; }
+
+    int UserId() { return this.userId; }
+
+    bool Covers(int rowUserId, int rowDepartmentId) {
+        if (this.Any()) { return true; }
+        if (this.Mine()) { return rowUserId > 0 && rowUserId == this.userId; }
+        return DataScope.Has(this.depts, rowDepartmentId);
+    }
+
+    static DataScope None() {
+        DataScope sc = new DataScope();
+        sc.mode = DataScope.ByDepts;
+        sc.depts.Add(0 - 1);
+        return sc;
+    }
+
+    static DataScope Everything(int userId) {
+        DataScope sc = new DataScope();
+        sc.mode = DataScope.All;
+        sc.userId = userId;
+        return sc;
+    }
+
+    static async DataScope Of(User me, List<Department> departments) {
+        if (me == null || me.status != AuthUser.Active) {
+            return DataScope.None();
+        }
+        if (me.isSuper == 1) { return DataScope.Everything(me.id); }
+
+        string uid = Convert.ToString(me.id);
+        int cached = PermTable.UserScope(uid);
+        if (cached > 0) {
+            return DataScope.Restore(me.id, cached, PermTable.UserDepts(uid));
+        }
+
+        string roleIds = await AuthUser.RolesOf(uid);
+        if (roleIds == "*") { return DataScope.Everything(me.id); }
+        if (roleIds.Length == 0) { return DataScope.None(); }
+        if (departments == null) { return DataScope.None(); }
+
+        DataScope sc = await DataScope.Resolve(departments, me, roleIds);
+        PermTable.SetUserScope(uid, sc.mode, DataScope.Join(sc.depts));
+        return sc;
+    }
+
+    static async DataScope Resolve(List<Department> departments, User me, string roleIds) {
+        List<string> ids = PermTable.Split(roleIds);
+        List<int> depts = new List<int>();
+        bool tree = false;
+        bool own = false;
+
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            int scope = PermTable.RoleScope(ids[i]);
+            if (scope <= 0) { scope = DataScope.RoleAll; }
+            if (scope == DataScope.RoleAll) {
+                return DataScope.Everything(me.id);
+            }
+            if (scope == DataScope.RoleDept) { own = true; }
+            else if (scope == DataScope.RoleDeptTree) { own = true; tree = true; }
+            else if (scope == DataScope.RoleCustom) {
+                List<string> named = PermTable.Split(PermTable.RoleDepts(ids[i]));
+                for (int j = 0; j < named.Count; j = j + 1) {
+                    DataScope.Add(depts, Filter.ToInt(named[j], 0));
+                }
+            }
+        }
+
+        if (own && me.departmentId > 0) {
+            DataScope.Add(depts, me.departmentId);
+        }
+        if (tree && me.departmentId > 0) {
+            DataScope.Descend(departments, me.departmentId, depts);
+        }
+
+        DataScope sc = new DataScope();
+        sc.userId = me.id;
+        if (depts.Count == 0) {
+            sc.mode = DataScope.Self;
+            return sc;
+        }
+        sc.mode = DataScope.ByDepts;
+        sc.depts = depts;
+        return sc;
+    }
+
+    static void Descend(List<Department> all, int parent, List<int> outp) {
+        for (int i = 0; i < all.Count; i = i + 1) {
+            Department d = all[i];
+            if (d.parentId != parent || d.id <= 0) { continue; }
+            if (DataScope.Has(outp, d.id)) { continue; }
+            outp.Add(d.id);
+            DataScope.Descend(all, d.id, outp);
+        }
+    }
+
+    static DataScope Restore(int userId, int mode, string depts) {
+        DataScope sc = new DataScope();
+        sc.userId = userId;
+        sc.mode = mode;
+        if (mode == DataScope.ByDepts) {
+            List<string> ids = PermTable.Split(depts);
+            for (int i = 0; i < ids.Count; i = i + 1) {
+                DataScope.Add(sc.depts, Filter.ToInt(ids[i], 0));
+            }
+            if (sc.depts.Count == 0) { return DataScope.None(); }
+        }
+        return sc;
+    }
+
+    static string Join(List<int> ids) {
+        StringBuilder outp = new StringBuilder();
+        outp.Append(",");
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            outp.Append(Convert.ToString(ids[i]));
+            outp.Append(",");
+        }
+        return outp.ToString();
+    }
+
+    static void Add(List<int> list, int id) {
+        if (id == 0 || DataScope.Has(list, id)) { return; }
+        list.Add(id);
+    }
+
+    static bool Has(List<int> list, int id) {
+        for (int i = 0; i < list.Count; i = i + 1) {
+            if (list[i] == id) { return true; }
+        }
+        return false;
+    }
+
+    static string Label(int roleScope) {
+        if (roleScope == DataScope.RoleDept) { return "本部门"; }
+        if (roleScope == DataScope.RoleDeptTree) { return "本部门及下级"; }
+        if (roleScope == DataScope.RoleSelf) { return "仅本人"; }
+        if (roleScope == DataScope.RoleCustom) { return "自定义部门"; }
+        return "全部数据";
+    }
+}

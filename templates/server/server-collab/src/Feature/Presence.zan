@@ -1,0 +1,109 @@
+using System;
+using System.Diagnostics;
+
+namespace ZanWeb;
+
+/* 在线用户统计：各 worker 定期发布页面数与 IP 到共享缓存，读取时汇总去重。 */
+class Presence {
+    /* 缓存 TTL，需大于发布间隔以防计数闪烁。 */
+    static int Ttl = 20;
+
+    /* 轮询 worker 上限。 */
+    static int MaxWorkers = 32;
+
+    /* 列出 IP 上限，超出时访客数回退为页面数。 */
+    static int MaxIps = 120;
+
+    static int pages = 0;
+    static List<string> ips = new List<string>();
+
+    /* 记录一个来自 ip 的打开页面。 */
+    static void Enter(string ip) {
+        Presence.pages = Presence.pages + 1;
+        Presence.ips.Add(ip);
+    }
+
+    /* 移除对应的打开页面。 */
+    static void Leave(string ip) {
+        if (Presence.pages > 0) { Presence.pages = Presence.pages - 1; }
+        for (int i = 0; i < Presence.ips.Count; i = i + 1) {
+            if (Presence.ips[i] == ip) { Presence.ips.RemoveAt(i); return; }
+        }
+    }
+
+    /* 发布本 worker 的页面数与 IP 列表到缓存。 */
+    static async void Publish() {
+        string body = Convert.ToString(Presence.pages);
+        int n = Presence.ips.Count;
+        if (n <= Presence.MaxIps) {
+            for (int i = 0; i < n; i = i + 1) {
+                body = body + "," + Presence.ips[i];
+            }
+        }
+        await Cache.SetTtlAsync(Presence.Key(ProcessHost.WorkerId()), body,
+                                Presence.Ttl);
+    }
+
+    /* 所有 worker 的打开页面总数。 */
+    static async int Pages() {
+        int total = 0;
+        for (int w = 0; w < Presence.MaxWorkers; w = w + 1) {
+            string v = await Cache.GetAsync(Presence.Key(w));
+            if (v.Length == 0) { continue; }
+            total = total + Presence.Head(v);
+        }
+        if (total == 0) { return Presence.pages; }
+        return total;
+    }
+
+    /* 所有 worker 的去重 IP 数，超出列出上限时回退为页面数。 */
+    static async int Visitors() {
+        string seen = ",";
+        int pages = 0;
+        int unlisted = 0;
+        for (int w = 0; w < Presence.MaxWorkers; w = w + 1) {
+            string v = await Cache.GetAsync(Presence.Key(w));
+            if (v.Length == 0) { continue; }
+            int count = Presence.Head(v);
+            pages = pages + count;
+            List<string> parts = v.Split(",");
+            if (parts.Count <= 1 && count > 0) { unlisted = unlisted + count; }
+            for (int i = 1; i < parts.Count; i = i + 1) {
+                string ip = parts[i];
+                if (ip.Length == 0) { continue; }
+                if (seen.IndexOf("," + ip + ",") >= 0) { continue; }
+                seen = seen + ip + ",";
+            }
+        }
+        int distinct = 0;
+        List<string> all = seen.Split(",");
+        for (int i = 0; i < all.Count; i = i + 1) {
+            if (all[i].Length > 0) { distinct = distinct + 1; }
+        }
+        distinct = distinct + unlisted;
+        if (pages == 0) { return Presence.Local(); }
+        if (distinct > pages) { return pages; }
+        return distinct;
+    }
+
+    static int Local() {
+        return Presence.pages;
+    }
+
+    static int Head(string slot) {
+        int at = slot.IndexOf(",");
+        string head = slot;
+        if (at >= 0) { head = slot.Substring(0, at); }
+        int n = 0;
+        for (int i = 0; i < head.Length; i = i + 1) {
+            string ch = head.Substring(i, 1);
+            if (ch < "0" || ch > "9") { return 0; }
+            n = n * 10 + (Convert.ToInt32(ch));
+        }
+        return n;
+    }
+
+    static string Key(int worker) {
+        return "presence:w" + Convert.ToString(worker);
+    }
+}

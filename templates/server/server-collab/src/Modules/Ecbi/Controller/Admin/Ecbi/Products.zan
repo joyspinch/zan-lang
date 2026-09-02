@@ -1,0 +1,262 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Ecbi;
+
+namespace ZanWeb.Admin.Ecbi;
+
+/* /admin/ecbi/products 内部商品主档 + 平台链接映射。同一商品可关联 N 条店铺链接（ods_shop_product），不同平台链接不同。 */
+[Route("admin/ecbi/products/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("商品主档")]
+class Products : AdminController {
+    [HttpGet]
+    [Route("/admin/ecbi/products")]
+    [Custom(IsMenu = true, Icon = "mdi:package-variant-closed", Perm = PermBit.View)]
+    [Description("商品主档")]
+    async void Index() {
+        ViewData d = await this.Layout("商品主档");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        ListQuery q = this.Paged("id", 20);
+        string kw = q.Kw();
+        List<OdsProduct> rows = await this.OdsProduct
+            .WhereIf(kw.Length > 0, a => a.name.Contains(kw) || a.sku.Contains(kw))
+            .OrderByDescending(a => a.id)
+            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        int total = await this.OdsProduct
+            .WhereIf(kw.Length > 0, a => a.name.Contains(kw) || a.sku.Contains(kw))
+            .CountAsync();
+
+        /* 每个商品统计已关联的店铺链接数。 */
+        List<OdsShopProduct> links = await this.OdsShopProduct.ToListAsync();
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            OdsProduct p = rows[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(p.id));
+            row.Set("name", p.name);
+            row.Set("sku", Fmt.Dash(p.sku));
+            row.Set("category", Fmt.Dash(p.category));
+            row.Set("linkCount", Convert.ToString(Products.LinkCount(links, p.id)));
+            items.Add(row);
+        }
+        this.Pager(d, q, total);
+        this.Page(d);
+    }
+
+    [HttpGet]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("商品表单")]
+    async void Form() {
+        int id = this.InInt("id", 0);
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("dialogTitle", "新增商品");
+        d.Set("new", "1");
+        if (id > 0) {
+            OdsProduct p = await this.OdsProduct.Where(a => a.id == id).FirstAsync();
+            if (p == null) { this.Fail(404, "0404", "商品不存在"); }
+            d.Set("dialogTitle", "编辑商品");
+            d.Set("name", p.name);
+            d.Set("sku", p.sku);
+            d.Set("category", p.category);
+            d.Set("edit", "1");
+            d.Set("new", "");
+        }
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("保存商品")]
+    async void Save() {
+        int id = this.InInt("id", 0);
+        string name = this.Need("name", "商品名称");
+        string sku = this.In("sku");
+        string category = this.In("category");
+
+        if (id > 0) {
+            int n = await this.OdsProduct.Update()
+                .Set(a => a.name, name)
+                .Set(a => a.sku, sku)
+                .Set(a => a.category, category)
+                .Where(a => a.id == id)
+                .ExecuteAffrowsAsync();
+            await this.Note("编辑商品", "#" + Convert.ToString(id) + " " + name, n > 0, "");
+            this.Saved("商品已保存");
+            return;
+        }
+        OdsProduct p = new OdsProduct();
+        p.name = name;
+        p.sku = sku;
+        p.category = category;
+        p.status = 1;
+        p.createdAt = WebApp.NowSeconds();
+        int newId = await this.OdsProduct.Insert(p).ExecuteIdentityAsync();
+        await this.Note("新增商品", "#" + Convert.ToString(newId) + " " + name, newId > 0, "");
+        this.Saved("商品已创建");
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Delete)]
+    [Description("删除商品")]
+    async void Delete() {
+        int id = this.InInt("id", 0);
+        OdsProduct p = await this.OdsProduct.Where(a => a.id == id).FirstAsync();
+        if (p == null) { this.Fail(404, "0404", "商品不存在"); }
+        int n = await this.OdsProduct.Delete().Where(a => a.id == id).ExecuteAffrowsAsync();
+        int _m = await this.OdsShopProduct.Delete().Where(a => a.productId == id)
+            .ExecuteAffrowsAsync();
+        await this.Note("删除商品", "#" + Convert.ToString(id) + " " + p.name, n > 0, "");
+        this.Saved("商品及其平台链接已删除");
+    }
+
+    /* ---- 平台链接映射 ---- */
+
+    [HttpGet]
+    [Custom(Perm = PermBit.View)]
+    [Description("平台链接")]
+    async void Links() {
+        ViewData d = await this.Layout("平台链接");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+        int productId = this.InInt("productId", 0);
+        OdsProduct p = await this.OdsProduct.Where(a => a.id == productId).FirstAsync();
+        if (p == null) { this.Fail(404, "0404", "商品不存在"); }
+
+        d.Set("productId", Convert.ToString(productId));
+        d.Set("productName", p.name);
+        List<OdsShopProduct> rows = await this.OdsShopProduct
+            .Where(a => a.productId == productId).OrderBy(a => a.id).ToListAsync();
+        List<OdsShop> shops = await this.OdsShop.OrderBy(a => a.id).ToListAsync();
+        List<OdsPlatform> plats = await this.OdsPlatform.OrderBy(a => a.id).ToListAsync();
+
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            OdsShopProduct l = rows[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(l.id));
+            row.Set("shop", Products.ShopName(shops, l.shopId));
+            row.Set("platform", Products.PlatOfShop(shops, plats, l.shopId));
+            row.Set("outerCode", Fmt.Dash(l.outerCode));
+            row.Set("url", Fmt.Dash(l.url));
+            items.Add(row);
+        }
+        this.Page(d);
+    }
+
+    [HttpGet]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("链接表单")]
+    async void LinkForm() {
+        int id = this.InInt("id", 0);
+        int productId = this.InInt("productId", 0);
+        OdsShopProduct l = null;
+        if (id > 0) {
+            l = await this.OdsShopProduct.Where(a => a.id == id).FirstAsync();
+            if (l == null) { this.Fail(404, "0404", "链接不存在"); }
+            productId = l.productId;
+        }
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("productId", Convert.ToString(productId));
+        d.Set("dialogTitle", id > 0 ? "编辑平台链接" : "新增平台链接");
+        if (id <= 0) { d.Set("new", "1"); }
+
+        List<OdsShop> shops = await this.OdsShop
+            .Where(a => a.status == 1).OrderBy(a => a.id).ToListAsync();
+        List<OdsPlatform> plats = await this.OdsPlatform.OrderBy(a => a.id).ToListAsync();
+        List<StrMap> sopts = d.AddList("shops");
+        for (int i = 0; i < shops.Count; i = i + 1) {
+            StrMap opt = new StrMap();
+            opt.Set("id", Convert.ToString(shops[i].id));
+            opt.Set("name", shops[i].name + "（"
+                + Products.PlatName(plats, shops[i].platformId) + "）");
+            if (l != null && shops[i].id == l.shopId) { opt.Set("selected", "selected"); }
+            sopts.Add(opt);
+        }
+        if (l != null) {
+            d.Set("outerCode", l.outerCode);
+            d.Set("url", l.url);
+            d.Set("edit", "1");
+            d.Set("new", "");
+        }
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("保存链接")]
+    async void LinkSave() {
+        int id = this.InInt("id", 0);
+        int productId = this.InInt("productId", 0);
+        int shopId = this.InInt("shopId", 0);
+        string outerCode = this.In("outerCode");
+        string url = this.In("url");
+        if (shopId <= 0) { this.Fail(400, "0004", "请选择店铺"); }
+        if (id <= 0 && productId <= 0) { this.Fail(400, "0004", "缺少商品"); }
+
+        if (id > 0) {
+            int n = await this.OdsShopProduct.Update()
+                .Set(a => a.shopId, shopId)
+                .Set(a => a.outerCode, outerCode)
+                .Set(a => a.url, url)
+                .Where(a => a.id == id)
+                .ExecuteAffrowsAsync();
+            await this.Note("编辑平台链接", "#" + Convert.ToString(id), n > 0, "");
+            this.Saved("链接已保存");
+            return;
+        }
+        OdsShopProduct l = new OdsShopProduct();
+        l.productId = productId;
+        l.shopId = shopId;
+        l.outerCode = outerCode;
+        l.url = url;
+        l.createdAt = WebApp.NowSeconds();
+        int newId = await this.OdsShopProduct.Insert(l).ExecuteIdentityAsync();
+        await this.Note("新增平台链接", "#" + Convert.ToString(newId), newId > 0, "");
+        this.Saved("链接已创建");
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Delete)]
+    [Description("删除链接")]
+    async void LinkDelete() {
+        int id = this.InInt("id", 0);
+        int n = await this.OdsShopProduct.Delete().Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+        await this.Note("删除平台链接", "#" + Convert.ToString(id), n > 0, "");
+        this.Saved("链接已删除");
+    }
+
+    static int LinkCount(List<OdsShopProduct> links, int productId) {
+        int n = 0;
+        for (int i = 0; i < links.Count; i = i + 1) {
+            if (links[i].productId == productId) { n = n + 1; }
+        }
+        return n;
+    }
+
+    static string ShopName(List<OdsShop> shops, int id) {
+        for (int i = 0; i < shops.Count; i = i + 1) {
+            if (shops[i].id == id) { return shops[i].name; }
+        }
+        return "—";
+    }
+
+    static string PlatName(List<OdsPlatform> plats, int id) {
+        for (int i = 0; i < plats.Count; i = i + 1) {
+            if (plats[i].id == id) { return plats[i].name; }
+        }
+        return "—";
+    }
+
+    static string PlatOfShop(List<OdsShop> shops, List<OdsPlatform> plats, int shopId) {
+        for (int i = 0; i < shops.Count; i = i + 1) {
+            if (shops[i].id == shopId) { return Products.PlatName(plats, shops[i].platformId); }
+        }
+        return "—";
+    }
+}

@@ -1,0 +1,104 @@
+using System;
+using System.Data;
+using System.Web;
+
+namespace ZanWeb;
+
+/* 注入数据库与缓存访问的控制器基类。依赖在 main.zan 装配并经 AppServices.Use(...) 安装，动作通过 this.Conn()/this.Cache() 访问。连接按请求作用域：Conn() 首次调用时从连接池借出，同请求后续调用复用同一连接，OnAfter() 在动作返回时归还——故业务代码与 DAO 不含 Acquire/Release；按请求(非按查询)持一连接也使事务成为可能，事务内每条语句须在同一连接上执行。BEGIN/COMMIT/ROLLBACK 同其他语句一样需 await。子类清理覆盖 OnDone() 而非 OnAfterAsync()，以确保连接总是被释放。 */
+class AppController : Controller {
+    IDbConnection lease;
+    bool inTx;
+
+    /* 注入的数据库上下文（AppServices.Use 前为 null）。 */
+    protected DbContext Db() {
+        AppServices s = AppServices.Current();
+        if (s == null) { return null; }
+        return s.Db();
+    }
+
+    /* 注入的缓存上下文（AppServices.Use 前为 null）。 */
+    protected CacheContext Cache() {
+        AppServices s = AppServices.Current();
+        if (s == null) { return null; }
+        return s.Cache();
+    }
+
+    /* 本次请求的连接：首次调用借出、之后复用、动作返回自动释放。null 表示数据库不可用——处理器应答 503 而非假设结果集为空。 */
+    protected async IDbConnection Conn() {
+        if (this.lease != null) { return this.lease; }
+        DbContext ctx = this.Db();
+        if (ctx == null) { return null; }
+        this.lease = await ctx.Acquire();
+        return this.lease;
+    }
+
+    /* 本次请求已借出的连接，不 await；仅在 Conn() 或 Begin() 成功后有效。 */
+    protected IDbConnection Held() {
+        return this.lease;
+    }
+
+    /* 表访问器运行其上的连接：this.User、this.Post 编译为在此连接上的类型化查询，故租约需在 OnBeforeAsync() 取得（访问器是普通成员，无法 await）。不构造 DAO、不借还、字段名在编译期校验。 */
+    IDbConnection __Conn() {
+        return this.lease;
+    }
+
+    /* 动作运行前借出本次请求连接，供表访问器使用；数据库未配置时零开销（Conn() 答 null，动作回退到 503）。 */
+    virtual async bool OnBeforeAsync() {
+        IDbConnection _db = await this.Conn();
+        return this.OnBefore();
+    }
+
+    /* 本次请求是否有可用数据库。false 表示连接池无法借出（未配置或不可达），对调用方答 503 而非抛异常；廉价：租约在 OnBeforeAsync() 已取得。 */
+    protected bool DbReady() {
+        return this.lease != null;
+    }
+
+    /* 在本次请求连接上开启事务；false 表示数据库不可用且未开启任何事务。 */
+    protected async bool Begin() {
+        IDbConnection db = await this.Conn();
+        if (db == null) { return false; }
+        if (this.inTx) { return true; }
+        await db.BeginTransactionAsync();
+        this.inTx = true;
+        return true;
+    }
+
+    /* 提交本次请求事务；无事务时为 no-op。 */
+    protected async void Commit() {
+        if (!this.inTx) { return; }
+        this.inTx = false;
+        await this.lease.CommitAsync();
+    }
+
+    /* 回滚本次请求事务；无事务时为 no-op，可在 Commit() 之后的错误路径重复调用。 */
+    protected async void Rollback() {
+        if (!this.inTx) { return; }
+        this.inTx = false;
+        await this.lease.RollbackAsync();
+    }
+
+    /* [Tx] 蹦床钩子：声明属性即完成事务，动作体内不再出现 Begin/Commit/Rollback 阶梯。 */
+
+    /* 打开本次请求事务（租约+BEGIN）；false 表示数据库不可用，蹦床答 503。 */
+    protected override async bool __TxBegin() { return await this.Begin(); }
+
+    /* 动作成功后提交；无事务时 no-op。 */
+    protected override async void __TxCommit() { await this.Commit(); }
+
+    /* 任何失败路径回滚；可重复调用、可在提交后调用。 */
+    protected override async void __TxRollback() { await this.Rollback(); }
+
+    /* 释放请求连接（在协程上），以便未完成的务事先回滚；事务中途归还会把持着别人锁的会话交还下一个请求，回滚本身也是往返。 */
+    virtual async void OnAfterAsync() {
+        if (this.lease != null) {
+            await this.Rollback();
+            DbContext ctx = this.Db();
+            if (ctx != null) { ctx.Release(this.lease); }
+            this.lease = null;
+        }
+        this.OnDone();
+    }
+
+    /* 供子类做每请求清理；覆盖此而非 OnAfterAsync()，后者负责释放连接。 */
+    virtual void OnDone() { }
+}

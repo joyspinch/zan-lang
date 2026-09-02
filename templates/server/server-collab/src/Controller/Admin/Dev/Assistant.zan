@@ -1,0 +1,116 @@
+using System;
+using System.Json;
+using System.Web;
+using ZanWeb;
+
+namespace ZanWeb.Admin.Dev;
+
+/* 助手面板所需的数据结构。 */
+class AiAgentDoc { string code; string name; string hint; string icon; bool apply; }
+class AiStateDoc { bool ready; List<AiAgentDoc> agents; }
+class AiTextDoc { string text; }
+class AiModelsDoc { List<string> models; }
+
+/* /admin/dev/ai 端点：报告助手是否已配置及有哪些 agent（state）、模型对一次对话如何回答（chat）、某 provider 提供哪些模型（models），以及——仅在操作员确认后——执行助手提出的建表（apply）。密钥永不出服务器；/admin/dev/ai/state 只报告是否已设置，未配置时引导至设置页而非打开一个无法答问的聊天；apply 是唯一让答复触库的点，受守卫且须显式确认。 */
+[Route("admin/dev/ai/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("AI 助手")]
+class Assistant : AdminController {
+    [HttpGet]
+    [Custom(Perm = PermBit.View)]
+    [Description("助手状态")]
+    async void State() {
+        if (await this.Admin() == null) { this.Fail(401, "1001", "未登录"); }
+        AiStateDoc doc = new AiStateDoc();
+        doc.ready = await Ai.Ready();
+        doc.agents = new List<AiAgentDoc>();
+        List<AiAgent> agents = Ai.Agents();
+        for (int i = 0; i < agents.Count; i = i + 1) {
+            AiAgent a = agents[i];
+            AiAgentDoc d = new AiAgentDoc();
+            d.code = a.code;
+            d.name = a.name;
+            d.hint = a.hint;
+            d.icon = a.icon;
+            d.apply = a.apply;
+            doc.agents.Add(d);
+        }
+        this.Ok(Json.Serialize<AiStateDoc>(doc));
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("与助手对话")]
+    async void Chat() {
+        if (await this.Admin() == null) { this.Fail(401, "1001", "未登录"); }
+        string question = this.Need("q", "内容");
+        string agent = this.In("agent");
+        /* 浏览器保持对话上下文回发，使助手了解整段会话而非仅最后一行。 */
+        string history = this.In("history");
+        if (history.Length == 0) { history = "[]"; }
+        AiReply r = await Ai.AskConv(agent, history, question);
+        if (!r.ok) { this.Fail(400, "0005", r.text); }
+        this.Ok(Assistant.TextDoc(r.text));
+    }
+
+    /* 同一对话的流式版本：边写边推，答以 delta 事件流 + 一个终态 done/error；浏览器不轮询，服务器持一条连接。流不计入指标计时，按推送帧数计数（见 WebApp.Dispatch）。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("与助手对话（流式）")]
+    async void Stream() {
+        if (await this.Admin() == null) { this.Fail(401, "1001", "未登录"); }
+        string question = this.Need("q", "内容");
+        string agent = this.In("agent");
+        string history = this.In("history");
+        if (history.Length == 0) { history = "[]"; }
+
+        HttpContext ctx = this.Ctx();
+        if (!await ctx.SseOpen()) { return; }
+        AiReply r = await Ai.StreamConv(ctx, agent, history, question);
+        if (!r.ok) {
+            bool _e = await ctx.SseSend("error", Assistant.TextDoc(r.text));
+            return;
+        }
+        bool _d = await ctx.SseSend("done", Assistant.TextDoc(r.text));
+    }
+
+    /* provider 提供的模型，供操作员挑选而非手输 id；base URL 与 key 取自设置表单（key 回退到存储值），key 仅用于此次服务端调用，永不返回。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("获取模型列表")]
+    async void Models() {
+        string baseUrl = this.In("baseUrl");
+        if (baseUrl.Length == 0) { baseUrl = await Settings.Get(SettingKeys.AiBaseUrl, ""); }
+        string key = this.In("apiKey");
+        if (key.Length == 0 || key == "-") { key = await Settings.Get(SettingKeys.AiApiKey, ""); }
+        if (baseUrl.Length == 0) { this.Fail(400, "0004", "请先填写接口地址"); }
+        if (!AiEndpointPolicy.IsAllowed(baseUrl)) {
+            this.Fail(400, "0004", "接口地址不在允许列表");
+        }
+        AiModelsDoc doc = new AiModelsDoc();
+        doc.models = await Ai.Models(baseUrl, key);
+        this.Ok(Json.Serialize<AiModelsDoc>(doc));
+    }
+
+    /* 执行助手提出的 CREATE TABLE；仅带建表权限且操作员确认后抵达，Ai.ApplySchema 仍拒绝非单条 CREATE 的内容。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("确认执行建表")]
+    async void Apply() {
+        string sql = this.Need("sql", "建表语句");
+        if (this.In("confirm") != "1") {
+            this.Fail(400, "0004", "需要确认后才能执行");
+        }
+        AiReply r = await Ai.ApplySchema(sql);
+        await this.Note("AI 建表", "", r.ok, r.text);
+        if (!r.ok) { this.Fail(400, "0005", r.text); }
+        this.Ok(Assistant.TextDoc(r.text));
+    }
+
+    /* 以 {"text":...} 经 JSON 写出，含引号/换行的答语与其余响应用同一段转义代码。 */
+    static string TextDoc(string text) {
+        AiTextDoc d = new AiTextDoc();
+        d.text = text;
+        return Json.Serialize<AiTextDoc>(d);
+    }
+}

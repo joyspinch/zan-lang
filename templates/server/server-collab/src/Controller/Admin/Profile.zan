@@ -1,0 +1,98 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Security.Cryptography;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.Admin;
+
+/* 已登录账号本人屏 /admin/profile：能打开管理后台的每个人都能改自己的名字和密码，此处不会触及别人的账号。 */
+[Route("admin/[controller]/[action]")]
+[Custom(Authorization = CustomAuthorization.Login)]
+[Description("个人资料")]
+class Profile : AdminController {
+    [HttpGet]
+    [Route("/admin/profile")]
+    [Custom(IsMenu = true, Icon = "mdi:account-circle")]
+    [Description("个人资料")]
+    async void Index() {
+        ViewData d = await this.Layout("个人资料");
+        User me = await this.Admin();
+        d.Set("username", me.username);
+        d.Set("nickname", me.nickname);
+        d.Set("email", me.email);
+        d.Set("mobile", me.mobile);
+        d.Set("createdAt", Fmt.Stamp(me.createdAt));
+        if (me.isSuper == 1) { d.Set("super", "1"); }
+
+        if (this.DbReady()) {
+            int uid = me.id;
+            List<Role> roles = await this.Role.ToListAsync();
+            List<UserRole> mine = await this.UserRole
+                .Where(a => a.userId == uid).ToListAsync();
+            List<StrMap> rows = d.AddList("roles");
+            for (int i = 0; i < mine.Count; i = i + 1) {
+                for (int j = 0; j < roles.Count; j = j + 1) {
+                    if (roles[j].id != mine[i].roleId) { continue; }
+                    StrMap row = new StrMap();
+                    row.Set("name", roles[j].name);
+                    row.Set("code", roles[j].code);
+                    rows.Add(row);
+                }
+            }
+            if (mine.Count == 0) { d.Set("noRoles", "1"); }
+        }
+        this.Page(d);
+    }
+
+    [HttpPost]
+    [Description("保存个人资料")]
+    async void Save() {
+        User me = await this.Admin();
+        if (me == null) { this.Fail(403, "0403", "登录状态已失效"); }
+        string nickname = this.In("nickname");
+        string email = this.In("email");
+        string mobile = this.In("mobile");
+        int id = me.id;
+        int n = await this.User.Update()
+            .Set(a => a.nickname, nickname)
+            .Set(a => a.email, email)
+            .Set(a => a.mobile, mobile)
+            .Set(a => a.updatedAt, WebApp.NowSeconds())
+            .Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+        await this.Note("修改个人资料", me.username, n > 0, "");
+        this.Saved("资料已保存");
+    }
+
+    /* 改自己的密码须校验当前密码：无人值守的会话不应足以把本人锁在外面。 */
+    [HttpPost]
+    [Description("修改密码")]
+    async void Password() {
+        User me = await this.Admin();
+        if (me == null) { this.Fail(403, "0403", "登录状态已失效"); }
+        string current = this.Need("current", "当前密码");
+        string next = this.Need("password", "新密码");
+        if (next.Length < 8) { this.Fail(400, "0004", "新密码至少 8 位"); }
+        if (AuthUser.PasswordHash(current, me.passwordSalt) != me.passwordHash) {
+            await this.Note("修改密码", me.username, false,
+                "当前密码错误");
+            this.Fail(400, "0004", "当前密码不正确");
+        }
+        string salt = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
+        string hash = AuthUser.PasswordHash(next, salt);
+        int id = me.id;
+        int version = me.tokenVersion + 1;
+        int n = await this.User.Update()
+            .Set(a => a.passwordSalt, salt)
+            .Set(a => a.passwordHash, hash)
+            .Set(a => a.tokenVersion, version)
+            .Set(a => a.updatedAt, WebApp.NowSeconds())
+            .Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+        await this.Note("修改密码", me.username, n > 0, "");
+        this.Saved("密码已修改，请重新登录");
+    }
+}

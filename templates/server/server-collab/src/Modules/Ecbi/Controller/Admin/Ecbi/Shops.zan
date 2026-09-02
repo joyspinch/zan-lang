@@ -1,0 +1,127 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Ecbi;
+
+namespace ZanWeb.Admin.Ecbi;
+
+/* /admin/ecbi/shops 店铺管理：归属平台的店铺档案，订单/推广/链接映射的核心维度。 */
+[Route("admin/ecbi/shops/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("店铺管理")]
+class Shops : AdminController {
+    [HttpGet]
+    [Route("/admin/ecbi/shops")]
+    [Custom(IsMenu = true, Icon = "mdi:store", Perm = PermBit.View)]
+    [Description("店铺管理")]
+    async void Index() {
+        ViewData d = await this.Layout("店铺管理");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        List<OdsShop> rows = await this.OdsShop.OrderBy(a => a.id).ToListAsync();
+        List<OdsPlatform> plats = await this.OdsPlatform.OrderBy(a => a.id).ToListAsync();
+
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            OdsShop s = rows[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(s.id));
+            row.Set("name", s.name);
+            row.Set("platform", Shops.PlatName(plats, s.platformId));
+            row.Set("statusText", s.status == 1 ? "启用" : "禁用");
+            row.Set("statusClass", s.status == 1 ? "ok" : "off");
+            row.Set("nextStatus", s.status == 1 ? "0" : "1");
+            row.Set("toggleText", s.status == 1 ? "禁用" : "启用");
+            items.Add(row);
+        }
+        d.Set("total", Convert.ToString(rows.Count));
+        this.Page(d);
+    }
+
+    [HttpGet]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("店铺表单")]
+    async void Form() {
+        int id = this.InInt("id", 0);
+        OdsShop s = null;
+        if (id > 0) {
+            s = await this.OdsShop.Where(a => a.id == id).FirstAsync();
+            if (s == null) { this.Fail(404, "0404", "店铺不存在"); }
+        }
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("dialogTitle", id > 0 ? "编辑店铺" : "新增店铺");
+        if (id <= 0) { d.Set("new", "1"); }
+
+        List<OdsPlatform> plats = await this.OdsPlatform
+            .Where(a => a.status == 1).OrderBy(a => a.id).ToListAsync();
+        List<StrMap> popts = d.AddList("platforms");
+        for (int i = 0; i < plats.Count; i = i + 1) {
+            StrMap opt = new StrMap();
+            opt.Set("id", Convert.ToString(plats[i].id));
+            opt.Set("name", plats[i].name);
+            if (s != null && plats[i].id == s.platformId) { opt.Set("selected", "selected"); }
+            popts.Add(opt);
+        }
+        if (s != null) {
+            d.Set("name", s.name);
+            d.Set("edit", "1");
+            d.Set("new", "");
+        }
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("保存店铺")]
+    async void Save() {
+        int id = this.InInt("id", 0);
+        string name = this.Need("name", "店铺名称");
+        int platformId = this.InInt("platformId", 0);
+        if (platformId <= 0) { this.Fail(400, "0004", "请选择所属平台"); }
+
+        if (id > 0) {
+            int n = await this.OdsShop.Update()
+                .Set(a => a.name, name)
+                .Set(a => a.platformId, platformId)
+                .Where(a => a.id == id)
+                .ExecuteAffrowsAsync();
+            await this.Note("编辑店铺", "#" + Convert.ToString(id) + " " + name, n > 0, "");
+            this.Saved("店铺已保存");
+            return;
+        }
+        OdsShop s = new OdsShop();
+        s.name = name;
+        s.platformId = platformId;
+        s.status = 1;
+        s.createdAt = WebApp.NowSeconds();
+        int newId = await this.OdsShop.Insert(s).ExecuteIdentityAsync();
+        await this.Note("新增店铺", "#" + Convert.ToString(newId) + " " + name, newId > 0, "");
+        this.Saved("店铺已创建");
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("启用或禁用店铺")]
+    async void Status() {
+        int id = this.InInt("id", 0);
+        int status = this.InInt("status", 1);
+        if (status != 1) { status = 0; }
+        int n = await this.OdsShop.Update()
+            .Set(a => a.status, status)
+            .Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+        await this.Note("启用或禁用店铺", "#" + Convert.ToString(id), n > 0,
+            status == 1 ? "启用" : "禁用");
+        this.Saved(status == 1 ? "店铺已启用" : "店铺已禁用");
+    }
+
+    static string PlatName(List<OdsPlatform> list, int id) {
+        for (int i = 0; i < list.Count; i = i + 1) {
+            if (list[i].id == id) { return list[i].name; }
+        }
+        return "—";
+    }
+}

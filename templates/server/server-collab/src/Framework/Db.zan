@@ -1,0 +1,45 @@
+using System;
+using System.IO;
+using System.Data;
+using System.Data.MySql;
+using System.Data.Postgres;
+using System.Data.Redis;
+using System.Data.Sqlite;
+
+namespace ZanWeb;
+
+/* 数据库/Redis 启动引导，由 config/app.json 的 [database] 和 [cache] 段驱动。主进程调用 OpenPool/OpenRedis，注入 DbContext/CacheContext。消费者不自行打开连接。均为连接池而非单连接：worker 为独立进程，请求为协程，共享连接会串行化。数据库/Redis 不可达时仍启动，handler 返回友好错误。*/
+class Db {
+    /* 按 [database].poolSize 创建的连接池，首次 acquire 时才真正建连。*/
+    static DbPool OpenPool() {
+        string driver = Cfg.Db.driver;
+        int size = Cfg.Db.poolSize;
+        if (size < 1) { size = 1; }
+        if (driver == "mysql" || driver == "mariadb") {
+            /* 协程驱动：等待空闲连接和等待服务端均挂起协程，单 worker 可同时有 poolSize 个查询在途。阻塞驱动每 worker 最多并发 1 个查询。*/
+            return MySqlAsyncConnector.Pool(Cfg.Db.host, Cfg.Db.port,
+                Cfg.Db.name, Cfg.Db.user, Cfg.Db.password, size);
+        }
+        if (driver == "postgres" || driver == "postgresql") {
+            return PgConnector.Pool(Cfg.Db.host, Cfg.Db.port, Cfg.Db.name,
+                Cfg.Db.user, Cfg.Db.password, size);
+        }
+        Db.EnsureFileDir(Cfg.Db.sqlitePath);
+        return SqliteConnector.Pool(Cfg.Db.sqlitePath, size);
+    }
+
+    /* SQLite 文件所在目录不存在则创建（sqlite3_open 不创建目录）。*/
+    static void EnsureFileDir(string path) {
+        string dir = Path.GetDirectoryName(path);
+        if (dir == "") { return; }
+        /* 递归创建；已存在层级无副作用，每次启动零开销。*/
+        Directory.CreateDirectoryRecursive(dir);
+    }
+
+    /* [cache].driver=="redis" 时构造 Redis 池，否则返回 null。注入 CacheContext。*/
+    static RedisPool OpenRedis() {
+        if (Cfg.Cache.driver != "redis") { return null; }
+        return new RedisPool(Cfg.Cache.redisHost,
+            Cfg.Cache.redisPort, Cfg.Cache.poolSize, Cfg.Cache.connectTimeoutMs);
+    }
+}

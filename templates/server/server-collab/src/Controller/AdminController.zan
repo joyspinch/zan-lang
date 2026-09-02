@@ -1,0 +1,168 @@
+using System;
+using System.Text;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb;
+
+/* HTML 管理后台外壳基类：持有页面归属、外壳与渲染，授权由 [Custom(Authorization=Grant)] 由调度器在到达前拦截（导航答登录页、脚本答 401/403）。每个屏幕三步：Layout(heading) → 填充 d → Page(d)，Page() 按请求决定是否加外壳（直接 URL 出整页、标签加载出面板）。写操作答 JSON 而非重定向，因对话框失败保持、成功关闭。 */
+class AdminController : AppController {
+    /* 本次请求所属账号，由 Admin() 解析一次。 */
+    protected User who;
+
+    /* 当前屏幕标题，用于告知标签条该给新载入的标签命名。 */
+    protected string headingText;
+
+    /* 本次请求可见的数据范围，由 Scope() 解析一次。 */
+    protected DataScope scope;
+
+    /* 浏览器要面板而非整页时返回 true（标签加载或就地刷新）。 */
+    protected bool IsFragment() {
+        return this.Ctx().Header("X-Fragment").Length > 0;
+    }
+
+    /* 已登录账号；调度器已确认为非空，若该行在令牌检查后被禁用则中止。 */
+    protected async User Admin() {
+        if (this.who != null) { return this.who; }
+        if (!this.DbReady()) { this.Fail(503, "2001", "数据库不可用"); }
+        User me = await this.User.Read(Filter.ToInt(this.uid, 0));
+        if (me == null || me.status != AuthUser.Active) {
+            this.Fail(403, "0403", "该账号无法登录管理后台");
+        }
+        this.who = me;
+        return me;
+    }
+
+    /* 进入任何管理屏之前先把该账号的角色解析进共享权限表：此刻请求
+       尚未持有租约，借还只是顺序复用；此后本页渲染期的 Allow/Mask
+       全部是共享内存读，绝不在持有租约时再向池借第二条连接——
+       并发数达到上限后，那种嵌套租借会变成「人人持一条、人人等
+       第二条」的循环等待（实测过的全站假死形态）。 */
+    override async bool OnBeforeAsync() {
+        if (this.uid.Length > 0) {
+            await AuthUser.RolesOf(this.uid);
+        }
+        return await base.OnBeforeAsync();
+    }
+
+    /* 本次请求可见的数据行（见 DataScope）。列表屏幕取之传给 WhereIf；账号在屏幕运行前已加载，范围来自共享内存，无额外开销。 */
+    protected async DataScope Scope() {
+        if (this.scope != null) { return this.scope; }
+        User me = await this.Admin();
+        List<Department> departments = await this.Department.ToListAsync();
+        this.scope = await DataScope.Of(me, departments);
+        return this.scope;
+    }
+
+    /* 所有管理页起点的外壳数据：标题、登录账号、侧边栏。 */
+    protected async ViewData Layout(string heading) {
+        User me = await this.Admin();
+
+        ViewData d = new ViewData();
+        string site = await Settings.Get(SettingKeys.SiteTitle, "{{NAME}}");
+        d.Set("title", heading + " · " + site + " 管理后台");
+        d.Set("brand", site);
+        d.Set("heading", heading);
+        this.headingText = heading;
+        d.Set("account", me.username);
+        string shown = Fmt.Text(me.nickname, me.username);
+        d.Set("accountName", shown);
+        d.Set("accountMail", Fmt.Text(me.email, ""));
+        d.Set("accountInitial", Fmt.FirstChar(shown));
+        d.Set("tabPath", this.Ctx().path);
+        d.Set("tabTitle", heading);
+        if (me.isSuper == 1) { d.Set("isSuper", "1"); }
+
+        await this.Buttons(d);
+
+        /* 侧边栏即路由表，按调度器所用同一解析器裁减到该账号可打开的项。 */
+        List<MenuNode> nodes =         await MenuBuilder.ForUser(
+            WebHost.Current(), this.uid, this.Ctx().path);
+        MenuBuilder.Sort(nodes);
+        MenuBuilder.Fill(d.AddList("menu"), nodes);
+        return d;
+    }
+
+    /* 当前屏幕可显示的按钮：canView/可增/可改/可删/可导出，取自与调度器相同的授权掩码。 */
+    protected async void Buttons(ViewData d) {
+        int mask = await this.Mask();
+        if (mask == 0) { return; }
+        List<int> order = Perm.Order();
+        for (int i = 0; i < order.Count; i = i + 1) {
+            int bit = order[i];
+            if ((mask & bit) == 0) { continue; }
+            d.Set("can" + Perm.BitName(bit), "1");
+        }
+    }
+
+    /* 当前屏幕对该登录账号的授权掩码。传请求租约：掩码回填即使需要
+       查库也跑在这条连接上，不二次借用（见 AuthUser.RolesOf）。 */
+    protected async int Mask() {
+        return await AuthUser.MaskOf(this.Held(), this.uid,
+            Perm.ScreenOf(this.Ctx().routeAction));
+    }
+
+    /* 当前屏幕是否允许某按钮——与模板 {{#if canUpdate}} 取同一数字。 */
+    protected async bool Can(int bit) {
+        return (await this.Mask() & bit) != 0;
+    }
+
+
+    /* 渲染屏幕：直接打开 URL 时输出整页，标签加载时只输出面板。 */
+    protected void Page(ViewData d) {
+        if (this.IsFragment()) {
+            this.Ctx().SetHeader("X-Tab-Title", Encoding.UrlEncode(this.headingText));
+            this.Fragment(d);
+            return;
+        }
+        this.View(d);
+    }
+
+    /* 渲染对话框主体（表单）——始终是片段。 */
+    protected void Dialog(ViewData d) {
+        this.Fragment(d);
+    }
+
+    /* 写操作成功应答：toast 消息，无 payload；屏幕随后自刷新面板。 */
+    protected void Saved(string msg) {
+        this.Ctx().Api("0000", msg, "null");
+    }
+
+    /* 将写操作记入 sys_operation_log；读不记（流量主体，无审计意义）。记录动作即路由自身动作名，与授权行和文档同名。 */
+    protected async void Note(string title, string target,
+                              bool ok, string message) {
+        if (!this.DbReady()) { return; }
+        OperationLog row = new OperationLog();
+        row.userId = 0;
+        row.username = "";
+        if (this.who != null) {
+            row.userId = this.who.id;
+            row.username = this.who.username;
+        }
+        row.action = this.Ctx().routeAction;
+        row.title = title;
+        row.method = this.Ctx().method;
+        row.path = this.Ctx().path;
+        row.target = target;
+        row.ip = this.Ctx().RemoteIp();
+        row.ok = 0;
+        if (ok) { row.ok = 1; }
+        row.message = message;
+        row.createdAt = WebApp.NowSeconds();
+        int _id = await this.OperationLog.Insert(row).ExecuteIdentityAsync();
+    }
+
+    /* 写出分页页脚：total/page/pages/limit 及上下页号（不存在则空，模板据此隐藏链接）。 */
+    protected void Pager(ViewData d, ListQuery q, int total) {
+        int pages = q.Pages(total);
+        d.Set("total", Convert.ToString(total));
+        d.Set("page", Convert.ToString(q.Page()));
+        d.Set("pages", Convert.ToString(pages));
+        d.Set("limit", Convert.ToString(q.Limit()));
+        d.Set("kw", q.Kw());
+        if (q.Page() > 1) { d.Set("prev", Convert.ToString(q.Page() - 1)); }
+        if (q.Page() < pages) { d.Set("next", Convert.ToString(q.Page() + 1)); }
+        if (total == 0) { d.Set("empty", "1"); }
+    }
+}

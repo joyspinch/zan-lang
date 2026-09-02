@@ -1,0 +1,117 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Sys;
+using ZanWeb.Model.Wms;
+
+namespace ZanWeb.Admin.Wms;
+
+/* /admin/wms/skus 商品(SKU)主数据：搜索、建、编、删。库存数量不在此表，由流水汇总到 wms_inventory。 */
+[Route("admin/wms/skus/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("商品管理")]
+class Skus : AdminController {
+    [HttpGet]
+    [Route("/admin/wms/skus")]
+    [Custom(IsMenu = true, Icon = "mdi:barcode", Perm = PermBit.View)]
+    [Description("商品管理")]
+    async void Index() {
+        ViewData d = await this.Layout("商品管理");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        ListQuery q = this.Paged("id", 20);
+        string kw = q.Kw();
+        List<WmsSku> rows = await this.WmsSku
+            .WhereIf(kw.Length > 0, a => a.name.Contains(kw) || a.sku.Contains(kw))
+            .OrderByDescending(a => a.id)
+            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        int total = await this.WmsSku
+            .WhereIf(kw.Length > 0, a => a.name.Contains(kw) || a.sku.Contains(kw))
+            .CountAsync();
+
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            WmsSku s = rows[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(s.id));
+            row.Set("sku", s.sku);
+            row.Set("name", s.name);
+            row.Set("unit", Fmt.Dash(s.unit));
+            row.Set("spec", Fmt.Dash(s.spec));
+            items.Add(row);
+        }
+        this.Pager(d, q, total);
+        this.Page(d);
+    }
+
+    [HttpGet]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("商品表单")]
+    async void Form() {
+        int id = this.InInt("id", 0);
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("dialogTitle", "新增商品");
+        d.Set("new", "1");
+        if (id > 0) {
+            WmsSku s = await this.WmsSku.Where(a => a.id == id).FirstAsync();
+            if (s == null) { this.Fail(404, "0404", "商品不存在"); }
+            d.Set("dialogTitle", "编辑商品");
+            d.Set("sku", s.sku);
+            d.Set("name", s.name);
+            d.Set("unit", s.unit);
+            d.Set("spec", s.spec);
+            d.Set("edit", "1");
+            d.Set("new", "");
+        }
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("保存商品")]
+    async void Save() {
+        int id = this.InInt("id", 0);
+        string sku = this.Need("sku", "SKU 编码");
+        string name = this.Need("name", "商品名称");
+        string unit = this.In("unit");
+        string spec = this.In("spec");
+        if (id > 0) {
+            int n = await this.WmsSku.Update()
+                .Set(a => a.sku, sku)
+                .Set(a => a.name, name)
+                .Set(a => a.unit, unit)
+                .Set(a => a.spec, spec)
+                .Set(a => a.updatedAt, WebApp.NowSeconds())
+                .Where(a => a.id == id)
+                .ExecuteAffrowsAsync();
+            await this.Note("编辑商品", "#" + Convert.ToString(id) + " " + name, n > 0, "");
+            this.Saved("商品已保存");
+            return;
+        }
+        WmsSku s = new WmsSku();
+        s.sku = sku;
+        s.name = name;
+        s.unit = unit;
+        s.spec = spec;
+        s.createdAt = WebApp.NowSeconds();
+        s.updatedAt = s.createdAt;
+        int newId = await this.WmsSku.Insert(s).ExecuteIdentityAsync();
+        await this.Note("新增商品", "#" + Convert.ToString(newId) + " " + name, newId > 0, "");
+        this.Saved("商品已创建");
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Delete)]
+    [Description("删除商品")]
+    async void Delete() {
+        int id = this.InInt("id", 0);
+        WmsSku s = await this.WmsSku.Where(a => a.id == id).FirstAsync();
+        if (s == null) { this.Fail(404, "0404", "商品不存在"); }
+        int n = await this.WmsSku.Delete().Where(a => a.id == id).ExecuteAffrowsAsync();
+        await this.Note("删除商品", "#" + Convert.ToString(id) + " " + s.name, n > 0, "");
+        this.Saved("商品已删除");
+    }
+}

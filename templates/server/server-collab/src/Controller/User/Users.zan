@@ -1,0 +1,58 @@
+using System;
+using ZanWeb;
+using System.Web;
+using System.Json;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.User;
+
+/* ORM 与缓存示例：列出用户（缓存）并按路由参数展示单个；路由 /users 与 /user/{id}。 */
+[Route("[controller]/[action]")]
+[Custom(Authorization = CustomAuthorization.Login)]
+[Description("用户")]
+class Users : AppController {
+    [HttpGet]
+    [Route("/users")]
+    [Description("用户列表")]
+    async void Index() {
+        CacheContext cache = this.Cache();
+        string cached = await cache.GetAsync("users:all");
+        if (cached.Length > 0) {
+            JsonValue o = JsonValue.NewObject();
+            o.Put("code", JsonValue.NewStr("0000"));
+            o.Put("msg", JsonValue.NewStr("ok (cache)"));
+            JsonValue d = JsonValue.ParseLenient(cached);
+            if (d != null) { o.Put("data", d); }
+            this.Json(o.ToJson());
+            return;
+        }
+        if (!this.DbReady()) {
+            this.Fail(503, "2001",
+                "database not configured -- set [database] in config/app.json");
+        }
+        /* 取投影而非实体：User 含 passwordHash/passwordSalt。 */
+        List<User> users = await this.User.OrderBy(a => a.id).ToListAsync();
+        List<UserBrief> rows = new List<UserBrief>();
+        for (int i = 0; i < users.Count; i = i + 1) {
+            UserBrief b = new UserBrief();
+            b.id = users[i].id; b.username = users[i].username;
+            b.nickname = users[i].nickname; b.departmentId = users[i].departmentId;
+            b.status = users[i].status; b.isSuper = users[i].isSuper;
+            rows.Add(b);
+        }
+        string data = Json.Serialize<List<UserBrief>>(rows);
+        await cache.SetTtlAsync("users:all", data, 5);
+        this.Ok(data);
+    }
+
+    [HttpGet]
+    [Route("/user/{id}")]
+    [Description("用户详情")]
+    void Show() {
+        string id = this.Param("id");
+        JsonValue o = JsonValue.NewObject();
+        o.Put("id", JsonValue.NewStr(id));
+        o.Put("name", JsonValue.NewStr("user-" + id));
+        this.Ok(o.ToJson());
+    }
+}

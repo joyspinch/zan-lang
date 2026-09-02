@@ -1,0 +1,401 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Web;
+using ZanWeb.Model.Sys;
+using ZanWeb.Dao.Sys;
+
+namespace ZanWeb;
+
+class AuthUser {
+    /* 可登录账号的状态值。*/
+    static int Active = 1;
+
+    /* 为单次认证查询借出连接；token/权限解析在请求协程上运行（delegate 为 async），协程挂起而非阻塞 worker。null 表示数据库不可达，调用方一律降级为匿名。RBAC 阶段从共享权限表读，请求路径零查询。*/
+    static async IDbConnection Lease() {
+        AppServices s = AppServices.Current();
+        if (s == null) { return null; }
+        return await s.Db().Acquire();
+    }
+
+    static void Give(IDbConnection db) {
+        AppServices s = AppServices.Current();
+        if (s == null) { return; }
+        s.Db().Release(db);
+    }
+
+    static string PasswordHash(string password, string salt) {
+        string material = salt + ":" + password;
+        int i = 0;
+        while (i < 12000) {
+            material = Hex.Encode(Sha256.Hash(material + ":" + salt, material.Length + salt.Length + 1), 32);
+            i = i + 1;
+        }
+        return material;
+    }
+
+    static async User ByUsername(string username) {
+        IDbConnection db = await AuthUser.Lease();
+        if (db == null) { return null; }
+        try {
+            return await new UserDao(db).ByUsername(username);
+        } finally {
+            AuthUser.Give(db);
+        }
+    }
+
+    static async User ById(string uid) {
+        int id = AuthUser.ToInt(uid);
+        if (id <= 0) { return null; }
+        IDbConnection db = await AuthUser.Lease();
+        if (db == null) { return null; }
+        try {
+            return await new UserDao(db).ById(id);
+        } finally {
+            AuthUser.Give(db);
+        }
+    }
+
+    /* 校验密码并发放 Cookie token；"" = 拒绝，调用方不得区分失败原因。*/
+    static async string Login(string username, string password) {
+        User row = await AuthUser.ByUsername(username);
+        if (row == null || row.status != AuthUser.Active) { return ""; }
+        string actual = AuthUser.PasswordHash(password, row.passwordSalt);
+        if (!AuthToken.Equal(actual, row.passwordHash)) { return ""; }
+        return AuthToken.Issue(Convert.ToString(row.id), row.tokenVersion,
+            WebApp.NowSeconds());
+    }
+
+    /* 账号当前 token 版本号；无法登录时返回 -1。token 版本不同即作废，token 本身不含密码材料。
+       版本号走短 TTL 缓存：每个带 cookie 的请求都要校验一次，直查数据库会让
+       每个认证请求消耗两次池借用，白白加倍池压力。代价是 bump tokenVersion
+       后旧 token 最迟再有效 VerTtlSec 秒——对管理动作足够快，且 Forget 时主动失效。*/
+    static int VerTtlSec = 30;
+
+    static List<string> verUids = new List<string>();
+    static List<int> verVals = new List<int>();
+    static List<int> verGoodUntil = new List<int>();
+
+    /* 命中返回缓存的版本号，过期/缺失返回 -1。 */
+    static int CachedVersion(string uid, int now) {
+        lock (AuthUser.verUids) {
+            for (int i = 0; i < AuthUser.verUids.Count; i = i + 1) {
+                if (AuthUser.verUids[i] == uid && AuthUser.verGoodUntil[i] > now) {
+                    return AuthUser.verVals[i];
+                }
+            }
+        }
+        return -1;
+    }
+
+    static void StoreVersion(string uid, int version, int now) {
+        lock (AuthUser.verUids) {
+            /* 顺带清扫过期项：列表长度受活跃账号约束，线性扫描足够。 */
+            int i = 0;
+            while (i < AuthUser.verUids.Count) {
+                if (AuthUser.verGoodUntil[i] <= now) {
+                    AuthUser.verUids.RemoveAt(i);
+                    AuthUser.verVals.RemoveAt(i);
+                    AuthUser.verGoodUntil.RemoveAt(i);
+                    continue;
+                }
+                if (AuthUser.verUids[i] == uid) {
+                    AuthUser.verVals[i] = version;
+                    AuthUser.verGoodUntil[i] = now + AuthUser.VerTtlSec;
+                    return;
+                }
+                i = i + 1;
+            }
+            AuthUser.verUids.Add(uid);
+            AuthUser.verVals.Add(version);
+            AuthUser.verGoodUntil.Add(now + AuthUser.VerTtlSec);
+        }
+    }
+
+    static void DropCachedVersion(string uid) {
+        lock (AuthUser.verUids) {
+            for (int i = 0; i < AuthUser.verUids.Count; i = i + 1) {
+                if (AuthUser.verUids[i] == uid) {
+                    AuthUser.verUids.RemoveAt(i);
+                    AuthUser.verVals.RemoveAt(i);
+                    AuthUser.verGoodUntil.RemoveAt(i);
+                    return;
+                }
+            }
+        }
+    }
+
+    static async int TokenVersion(string uid) {
+        int now = WebApp.NowSeconds();
+        int cached = AuthUser.CachedVersion(uid, now);
+        if (cached >= 0) { return cached; }
+        User row = await AuthUser.ById(uid);
+        /* 负结果不缓存：禁用/删除必须尽快生效，且这类查询不在热路径上。 */
+        if (row == null || row.status != AuthUser.Active) { return -1; }
+        AuthUser.StoreVersion(uid, row.tokenVersion, now);
+        return row.tokenVersion;
+    }
+
+    static int ToInt(string s) {
+        return Filter.ToInt(s, 0);
+    }
+
+    /* ---- 授权 ---- */
+    /* 模型：用户持角色，角色持路由 action，action 是调度和菜单共问的唯一权限单位。权限数据在共享内存（PermTable），首次缺失时从数据库加载。授权变更主动写回共享内存。*/
+    /* 授权变更时同步失效版本缓存。 */
+    static void Forget(string uid) {
+        AuthUser.DropCachedVersion(uid);
+        PermTable.Forget(uid);
+    }
+
+    static void ForgetAll() {
+        lock (AuthUser.verUids) {
+            AuthUser.verUids.Clear();
+            AuthUser.verVals.Clear();
+            AuthUser.verGoodUntil.Clear();
+        }
+        PermTable.ForgetAll();
+    }
+
+    static async void RolesChanged(IDbConnection db) {
+        await PermTable.LoadRoles(db);
+        PermTable.ForgetAll();
+    }
+
+    static async void RolesChanged(List<Role> roles, List<RoleGrant> grants) {
+        await PermTable.LoadRoles(roles, grants);
+        PermTable.ForgetAll();
+    }
+
+    /* 调度器和菜单共用的权限解析：账号是否可执行该 action。Bootstrap 账号绕过查找。
+       持有请求租约的调用方（控制器动作内）必须走 <see cref="Allow"/> 的
+       带连接重载——嵌套租借（持一条再等第二条）在高并发下会把池拖成
+       循环等待，见 RolesOf 的说明。 */
+    static async bool Allow(string uid, string action) {
+        return await AuthUser.Allow(null, uid, action);
+    }
+
+    /* 带租约的权限解析：db 传调用方已持有的请求租约（Held()），角色
+       未命中时的回填查询直接跑在它上面，不再二次借连接；传 null 则
+       自行借还一次（调用方未持有任何连接时）。 */
+    static async bool Allow(IDbConnection db, string uid, string action) {
+        if (action.Length == 0) { return false; }
+        string roleIds = await AuthUser.RolesOf(db, uid);
+        if (roleIds == "*") { return true; }
+        if (roleIds.Length == 0) { return false; }
+        return PermTable.RolesAllow(roleIds, action);
+    }
+
+    /* 该账号在某屏上的按钮掩码；与 Allow() 拒之依据为同一决策。Bootstrap 账号持该屏所有位。 */
+    static async int MaskOf(string uid, string screen) {
+        return await AuthUser.MaskOf(null, uid, screen);
+    }
+
+    /* 带租约的按钮掩码：语义同 <see cref="Allow"/> 的带连接重载。 */
+    static async int MaskOf(IDbConnection db, string uid, string screen) {
+        if (screen.Length == 0) { return 0; }
+        string roleIds = await AuthUser.RolesOf(db, uid);
+        if (roleIds == "*") { return Perm.MaskOf(screen); }
+        if (roleIds.Length == 0) { return 0; }
+        return PermTable.RolesMask(roleIds, screen) & Perm.MaskOf(screen);
+    }
+
+    /* 账号角色 ",3,7,"；"*" 为 bootstrap；"" 为未知/禁用/数据库不可达。共享内存读，首次缺失从数据库填充。*/
+    static async string RolesOf(string uid) {
+        return await AuthUser.RolesOf(null, uid);
+    }
+
+    /* 共享内存未命中时的数据库回填。db 为调用方已持有的租约时查询
+       直接跑在它上——绝不在持有租约的状态下再借第二条连接：
+       并发数一旦达到池上限，「每人都持一条、每人都等第二条」就是
+       循环等待，谁也不释放（实测过的全站假死形态）。db 为 null 才
+       自行借还一次，此时本协程未持有任何连接，顺序借用是安全的。*/
+    static async string RolesOf(IDbConnection db, string uid) {
+        int id = AuthUser.ToInt(uid);
+        if (id <= 0) { return ""; }
+
+        string hit = PermTable.UserRoles(uid);
+        if (hit.Length > 0) { return hit; }
+
+        IDbConnection owned = null;
+        if (db == null) {
+            owned = await AuthUser.Lease();
+            if (owned == null) { return ""; }
+            db = owned;
+        }
+        try {
+            User me = await db.Select<User>().Where(a => a.id == id).FirstAsync();
+            if (me == null || me.status != AuthUser.Active) { return ""; }
+            if (me.isSuper == 1) {
+                PermTable.SetUser(uid, true, "");
+                return "*";
+            }
+            string joined = await AuthUser.RoleIds(db, me);
+            PermTable.SetUser(uid, false, joined);
+            return joined;
+        } finally {
+            if (owned != null) { AuthUser.Give(owned); }
+        }
+    }
+
+    /* 账号已启用的角色（自身 + 所在部门），输出 ",3,7,"。*/
+    static async string RoleIds(IDbConnection db, User me) {
+        List<int> roleIds = new List<int>();
+        List<UserRole> mine = await db.Select<UserRole>()
+            .Where(a => a.userId == me.id).ToListAsync();
+        for (int i = 0; i < mine.Count; i = i + 1) {
+            AuthUser.AddId(roleIds, mine[i].roleId);
+        }
+        int dept = me.departmentId;
+        if (dept > 0) {
+            List<DepartmentRole> byDept = await db.Select<DepartmentRole>()
+                .Where(a => a.departmentId == dept).ToListAsync();
+            for (int i = 0; i < byDept.Count; i = i + 1) {
+                AuthUser.AddId(roleIds, byDept[i].roleId);
+            }
+        }
+        if (roleIds.Count == 0) { return ""; }
+
+        StringBuilder outp = new StringBuilder();
+        outp.Append(",");
+        List<Role> roles = await db.Select<Role>().ToListAsync();
+        for (int i = 0; i < roles.Count; i = i + 1) {
+            Role r = roles[i];
+            if (r.status != 1 || !AuthUser.HasId(roleIds, r.id)) { continue; }
+            outp.Append(Convert.ToString(r.id));
+            outp.Append(",");
+        }
+        string joined = outp.ToString();
+        if (joined == ",") { return ""; }
+        return joined;
+    }
+
+    static void AddId(List<int> list, int id) {
+        if (id <= 0 || AuthUser.HasId(list, id)) { return; }
+        list.Add(id);
+    }
+
+    static bool HasId(List<int> list, int id) {
+        for (int i = 0; i < list.Count; i = i + 1) {
+            if (list[i] == id) { return true; }
+        }
+        return false;
+    }
+
+    static bool Holds(string haystack, string needle) {
+        if (needle.Length == 0) { return false; }
+        return ("," + haystack + ",").Contains("," + needle + ",");
+    }
+}
+
+class AuthToken {
+    static string Secret() { return Cfg.Auth.secret; }
+    static bool Ready() { return AuthToken.Secret().Length >= 32; }
+
+    static bool Equal(string actual, string expected) {
+        int diff = actual.Length ^ expected.Length;
+        int n = expected.Length;
+        int i = 0;
+        while (i < n) {
+            int a = 0;
+            if (i < actual.Length) { a = actual[i] & 255; }
+            diff = diff | (a ^ (expected[i] & 255));
+            i = i + 1;
+        }
+        return diff == 0;
+    }
+
+    static string EncodeUrl(string raw, int len) {
+        string text = Base64.Encode(raw, len).Replace("+", "-").Replace("/", "_");
+        while (text.Length > 0 && text.Substring(text.Length - 1) == "=") {
+            text = text.Substring(0, text.Length - 1);
+        }
+        return text;
+    }
+
+    static byte[] DecodeUrl(string text, List<int> outLen) {
+        int i = 0;
+        while (i < text.Length) {
+            int c = text[i] & 255;
+            bool valid = (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+                || (c >= 48 && c <= 57) || c == 45 || c == 95;
+            if (!valid) { outLen[0] = -1; return new byte[0]; }
+            i = i + 1;
+        }
+        string base64 = text.Replace("-", "+").Replace("_", "/");
+        int rem = base64.Length & 3;
+        if (rem == 1) { outLen[0] = -1; return new byte[0]; }
+        if (rem == 2) { base64 = base64 + "=="; }
+        else if (rem == 3) { base64 = base64 + "="; }
+        return Base64.Decode(base64, outLen);
+    }
+
+    static byte[] Key() {
+        string secret = AuthToken.Secret();
+        return Sha256.Hash(secret, secret.Length);
+    }
+
+    /* 用 AES-GCM 加密签发 Cookie：版本标记 + uid + 签发时间 + tokenVersion。不含密码材料，强制登出只需 bump 整数。*/
+    static string Issue(string uid, int tokenVersion, int now) {
+        if (!AuthToken.Ready()) { return ""; }
+        string plain = "2\t" + uid + "\t" + Convert.ToString(now) + "\t"
+            + Convert.ToString(tokenVersion);
+        byte[] key = AuthToken.Key();
+        byte[] iv = RandomNumberGenerator.GetBytes(12);
+        byte[] tag = new byte[16];
+        string aad = "zan.auth.cookie.v1";
+        byte[] cipher = AesGcm.Encrypt(key, 32, iv, aad, aad.Length,
+            plain, plain.Length, tag);
+        if (cipher == null) { return ""; }
+        byte[] packed = new byte[12 + cipher.Length + 16];
+        int i = 0;
+        while (i < 12) { packed[i] = iv[i]; i = i + 1; }
+        i = 0;
+        while (i < cipher.Length) { packed[12 + i] = cipher[i]; i = i + 1; }
+        i = 0;
+        while (i < 16) { packed[12 + cipher.Length + i] = tag[i]; i = i + 1; }
+        return AuthToken.EncodeUrl(packed, packed.Length);
+    }
+
+    static async string Resolve(string token) {
+        if (token.Length < 50 || token.Length > 512) { return ""; }
+        List<int> decodedLen = new List<int>(); decodedLen.Add(0);
+        byte[] packed = AuthToken.DecodeUrl(token, decodedLen);
+        int total = decodedLen[0];
+        if (total < 29) { return ""; }
+        int cipherLen = total - 28;
+        byte[] iv = new byte[12];
+        byte[] cipher = new byte[cipherLen];
+        byte[] tag = new byte[16];
+        int i = 0;
+        while (i < 12) { iv[i] = packed[i]; i = i + 1; }
+        i = 0;
+        while (i < cipherLen) { cipher[i] = packed[12 + i]; i = i + 1; }
+        i = 0;
+        while (i < 16) { tag[i] = packed[12 + cipherLen + i]; i = i + 1; }
+        byte[] key = AuthToken.Key();
+        List<int> ok = new List<int>(); ok.Add(0);
+        string aad = "zan.auth.cookie.v1";
+        byte[] plainBytes = AesGcm.Decrypt(key, 32, iv, aad, aad.Length,
+            cipher, cipherLen, tag, ok);
+        if (ok[0] == 0 || plainBytes == null) { return ""; }
+        string plain = plainBytes.ToStr(0, cipherLen);
+        int first = plain.IndexOf("\t");
+        int second = plain.IndexOf("\t", first + 1);
+        int third = plain.IndexOf("\t", second + 1);
+        if (first != 1 || plain.Substring(0, first) != "2"
+            || second <= first + 1 || third <= second + 1
+            || plain.IndexOf("\t", third + 1) >= 0) { return ""; }
+        string uid = plain.Substring(first + 1, second - first - 1);
+        int issued = Filter.ToInt(plain.Substring(second + 1, third - second - 1), 0);
+        int now = WebApp.NowSeconds();
+        if (issued <= 0 || issued > now + 300 || issued + 864000 <= now) { return ""; }
+        int carried = Filter.ToInt(plain.Substring(third + 1), -1);
+        int current = await AuthUser.TokenVersion(uid);
+        /* 不记录 token 或 uid，避免凭证材料泄漏。*/
+        if (carried < 0 || current < 0 || carried != current) { return ""; }
+        return uid;
+    }
+}

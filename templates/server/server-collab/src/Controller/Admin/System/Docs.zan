@@ -1,0 +1,241 @@
+using System;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.Admin.System;
+
+/* /admin/system/docs 接口文档，位于管理后台内；由编译器生成的路由表构造：路径、方法、[Description] 摘要、是否需要会话/权限、参数（编译器从动作体内 In＊/Need＊ 调用收集，即处理实际读取的）、应答。原始 OpenAPI 文档仍留 /api/docs.json 供工具，此屏供人看。 */
+[Route("admin/system/docs/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("接口文档")]
+class Docs : AdminController {
+    [HttpGet]
+    [Route("/admin/system/docs")]
+    [Custom(IsMenu = true, Icon = "mdi:api", Perm = PermBit.View)]
+    [Description("接口文档")]
+    async void Index() {
+        ViewData d = await this.Layout("接口文档");
+
+        List<Route> routes = WebHost.Current().router.All();
+        string kw = this.In("kw");
+        d.Set("kw", kw);
+
+        /* 按路径前缀分组、一次一组显示；整面在一页上是滚动，非引用。 */
+        List<string> paths = new List<string>();
+        for (int i = 0; i < routes.Count; i = i + 1) {
+            if (!Docs.Match(routes[i], kw)) { continue; }
+            string p = routes[i].pattern;
+            if (!Docs.HasPath(paths, p)) { paths.Add(p); }
+        }
+        Docs.SortPaths(paths);
+
+        List<string> groups = new List<string>();
+        for (int i = 0; i < paths.Count; i = i + 1) {
+            string g = Docs.Section(paths[i]);
+            if (!Docs.HasPath(groups, g)) { groups.Add(g); }
+        }
+        /* 默认管理面：最大组且读者多找这一组。 */
+        string active = this.In("g");
+        if (!Docs.HasPath(groups, active)) {
+            active = "";
+            if (Docs.HasPath(groups, "/admin")) { active = "/admin"; }
+            else if (groups.Count > 0) { active = groups[0]; }
+        }
+        d.Set("docsGroup", active);
+
+        List<StrMap> tabs = d.AddList("groups");
+        for (int i = 0; i < groups.Count; i = i + 1) {
+            int n = 0;
+            for (int j = 0; j < routes.Count; j = j + 1) {
+                if (!Docs.Match(routes[j], kw)) { continue; }
+                if (Docs.Section(routes[j].pattern) != groups[i]) { continue; }
+                n = n + 1;
+            }
+            StrMap t = new StrMap();
+            t.Set("name", groups[i]);
+            t.Set("count", Convert.ToString(n));
+            t.Set("kw", kw);
+            if (groups[i] == active) { t.Set("active", "1"); }
+            tabs.Add(t);
+        }
+
+        /* 标签内按第二段分块（/admin/system/users 等），使一组读作几张小表而非一条长条。 */
+        List<StrMap> rows = d.AddList("endpoints");
+        int shown = 0;
+        string block = "";
+        for (int i = 0; i < paths.Count; i = i + 1) {
+            string path = paths[i];
+            if (Docs.Section(path) != active) { continue; }
+            string sub = Docs.Block(path);
+            if (sub != block) {
+                block = sub;
+                StrMap head = new StrMap();
+                head.Set("block", sub);
+                rows.Add(head);
+            }
+            for (int j = 0; j < routes.Count; j = j + 1) {
+                Route r = routes[j];
+                if (r.pattern != path) { continue; }
+                if (!Docs.Match(r, kw)) { continue; }
+                StrMap row = new StrMap();
+                row.Set("path", path);
+                row.Set("method", r.method);
+                row.Set("methodClass", Docs.MethodClass(r.method));
+                row.Set("title", Fmt.Dash(r.title));
+                row.Set("action", r.action);
+                row.Set("authText", Docs.AuthText(r));
+                row.Set("authClass", Docs.AuthClass(r));
+                row.Set("params", Docs.Params(r, false));
+                row.Set("requestBody", Docs.Params(r, true));
+                row.Set("responses", Docs.Responses(r));
+                row.Set("sample", Docs.Sample(r));
+                rows.Add(row);
+                shown = shown + 1;
+            }
+        }
+        d.Set("total", Convert.ToString(shown));
+        if (shown == 0) { d.Set("empty", "1"); }
+        this.Page(d);
+    }
+
+    static bool Match(Route r, string kw) {
+        if (kw.Length == 0) { return true; }
+        if (r.pattern.Contains(kw)) { return true; }
+        return r.title.Contains(kw);
+    }
+
+    /* 动作读取的参数，作 "name:type* 说明"；body 选写操作表单字段，否则 query/path 字段。 */
+    static string Params(Route r, bool body) {
+        bool form = r.method != "GET" && r.method != "HEAD";
+        string s = "";
+        for (int i = 0; i < r.docParams.Count; i = i + 1) {
+            ApiParam p = r.docParams[i];
+            bool inBody = form && p.Source() != "path";
+            if (inBody != body) { continue; }
+            if (s.Length > 0) { s = s + "   "; }
+            s = s + p.Name() + ":" + p.JsonType();
+            if (p.Required()) { s = s + "*"; }
+            else if (p.Default().Length > 0) { s = s + "=" + p.Default(); }
+        }
+        if (s.Length == 0) {
+            if (body) { return ""; }
+            return "—";
+        }
+        return s;
+    }
+
+    /* 端点可答的状态及各自形态；与 /api/docs.json 同集。 */
+    static string Responses(Route r) {
+        if (Docs.IsStream(r)) {
+            return "200 text/event-stream （持续推送 metrics / series 事件）"
+                + "   401 未登录   403 无权限";
+        }
+        if (Docs.IsJson(r)) {
+            string s = "200 application/json {code:string, msg:string, data:any}"
+                + "   400 参数不合法";
+            if (Docs.Private(r)) { s = s + "   401 未登录   403 无权限"; }
+            return s + "   404 对象不存在";
+        }
+        string h = "200 text/html 页面";
+        if (Docs.Private(r)) { h = h + "   302 未登录时跳转登录页   403 无权限"; }
+        return h;
+    }
+
+    static string Sample(Route r) {
+        if (Docs.IsStream(r)) {
+            return "event: metrics / data: {\"requests\":{\"count\":128,"
+                + "\"errors\":0,\"avg_us\":312}}";
+        }
+        if (Docs.IsJson(r)) {
+            return "{\"code\":\"0000\",\"msg\":\"ok\",\"data\":null}";
+        }
+        return "HTML 文档（管理后台内以面板片段返回）";
+    }
+
+    static bool IsStream(Route r) {
+        return r.pattern.Contains("/stream");
+    }
+
+    static bool IsJson(Route r) {
+        if (r.pattern.Length >= 5 && r.pattern.Substring(0, 5) == "/api/") {
+            return true;
+        }
+        return r.method != "GET";
+    }
+
+    /* 端点是否需要授权——即路由属性本身，无第二份清单可查。 */
+    static bool Guarded(Route r) {
+        return r.needsAuth;
+    }
+
+    static bool Private(Route r) {
+        if (r.needsLogin || r.needsAuth) { return true; }
+        if (r.pattern == "/admin/login" || r.pattern == "/admin/logout") { return false; }
+        return r.pattern.Length >= 6 && r.pattern.Substring(0, 6) == "/admin";
+    }
+
+    static string AuthText(Route r) {
+        if (Docs.Guarded(r)) { return "需要权限"; }
+        if (Docs.Private(r)) { return "需要登录"; }
+        return "公开";
+    }
+
+    static string AuthClass(Route r) {
+        if (Docs.Guarded(r)) { return "warn"; }
+        if (Docs.Private(r)) { return "post"; }
+        return "ok";
+    }
+
+    static string MethodClass(string method) {
+        if (method == "GET") { return "get"; }
+        if (method == "POST") { return "post"; }
+        if (method == "PUT") { return "put"; }
+        if (method == "DELETE") { return "del"; }
+        return "";
+    }
+
+    /* 第一段路径，读者扫的就是它。 */
+    static string Section(string path) {
+        string s = path;
+        if (s.Length > 0 && s.Substring(0, 1) == "/") { s = s.Substring(1); }
+        int slash = s.IndexOf("/");
+        if (slash > 0) { s = s.Substring(0, slash); }
+        if (s.Length == 0) { return "/"; }
+        return "/" + s;
+    }
+
+    /* 端点在其标签下的两段前缀；占位段不开单块。 */
+    static string Block(string path) {
+        string s = path;
+        if (s.Length > 0 && s.Substring(0, 1) == "/") { s = s.Substring(1); }
+        int first = s.IndexOf("/");
+        if (first < 0) { return path; }
+        string head = s.Substring(0, first);
+        string rest = s.Substring(first + 1);
+        int second = rest.IndexOf("/");
+        if (second >= 0) { rest = rest.Substring(0, second); }
+        if (rest.Length == 0) { return "/" + head; }
+        if (rest.Substring(0, 1) == "{") { return "/" + head; }
+        return "/" + head + "/" + rest;
+    }
+
+    static bool HasPath(List<string> paths, string p) {
+        for (int i = 0; i < paths.Count; i = i + 1) {
+            if (paths[i] == p) { return true; }
+        }
+        return false;
+    }
+
+    static void SortPaths(List<string> paths) {
+        for (int i = 1; i < paths.Count; i = i + 1) {
+            string cur = paths[i];
+            int j = i - 1;
+            while (j >= 0 && paths[j] > cur) {
+                paths[j + 1] = paths[j];
+                j = j - 1;
+            }
+            paths[j + 1] = cur;
+        }
+    }
+}

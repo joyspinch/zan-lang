@@ -1,0 +1,297 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.Admin.System;
+
+/* /admin/system/roles 角色管理，以及决定每个角色可做什么的屏幕；角色是权利的唯一载体：账号得角色、角色得路由动作、调度器每请求问这张图。故授权对话框为带勾的路由表——可授即存在的动作，新屏幕一编译即可授权，删掉的自动消失。 */
+[Route("admin/system/roles/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("角色管理")]
+class Roles : AdminController {
+    [HttpGet]
+    [Route("/admin/system/roles")]
+    [Custom(IsMenu = true, Icon = "mdi:shield-account", Perm = PermBit.View)]
+    [Description("角色管理")]
+    async void Index() {
+        ViewData d = await this.Layout("角色管理");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        ListQuery q = this.Paged("rank", 20);
+        string kw = q.Kw();
+        int total = await this.Role
+            .WhereIf(kw.Length > 0, a => a.name.Contains(kw)).CountAsync();
+        List<Role> rows = await this.Role
+            .WhereIf(kw.Length > 0, a => a.name.Contains(kw))
+            .OrderBy(a => a.rank).Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            Role r = rows[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(r.id));
+            row.Set("name", r.name);
+            row.Set("code", r.code);
+            row.Set("rank", Convert.ToString(r.rank));
+            row.Set("description", Fmt.Dash(r.description));
+            int perms = await this.RoleGrant.Where(a => a.roleId == r.id).CountAsync();
+            int users = await this.UserRole.Where(a => a.roleId == r.id).CountAsync();
+            row.Set("perms", Convert.ToString(perms));
+            row.Set("users", Convert.ToString(users));
+            row.Set("scope", DataScope.Label(r.dataScope));
+            row.Set("statusText", Roles.StatusText(r.status));
+            row.Set("statusClass", Roles.StatusClass(r.status));
+            items.Add(row);
+        }
+        this.Pager(d, q, total);
+        this.Page(d);
+    }
+
+    [HttpGet]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("角色表单")]
+    async void Form() {
+        int id = this.InInt("id", 0);
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("dialogTitle", "新增角色");
+        d.Set("rank", "10");
+        d.Set("status1", "selected");
+        int scope = DataScope.RoleAll;
+        string picked = "";
+        if (id > 0) {
+            Role r = await this.Find(id);
+            d.Set("dialogTitle", "编辑角色");
+            d.Set("name", r.name);
+            d.Set("code", r.code);
+            d.Set("rank", Convert.ToString(r.rank));
+            d.Set("description", r.description);
+            d.Set("status1", "");
+            if (r.status == 1) { d.Set("status1", "selected"); }
+            else { d.Set("status0", "selected"); }
+            if (r.dataScope > 0) { scope = r.dataScope; }
+            picked = Fmt.Text(r.scopeDepts, "");
+        }
+        /* 数据范围与自定义选项所指的部门；勾选框总是渲染，模板只在该选项选中时显示。 */
+        d.Set("scope" + Convert.ToString(scope), "selected");
+        List<Department> depts = await this.Department
+            .OrderBy(a => a.sortOrder).ToListAsync();
+        List<StrMap> opts = d.AddList("depts");
+        for (int i = 0; i < depts.Count; i = i + 1) {
+            StrMap o = new StrMap();
+            o.Set("id", Convert.ToString(depts[i].id));
+            o.Set("name", depts[i].name);
+            if (AuthUser.Holds(picked, Convert.ToString(depts[i].id))) {
+                o.Set("checked", "checked");
+            }
+            opts.Add(o);
+        }
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("保存角色")]
+    async void Save() {
+        int id = this.InInt("id", 0);
+        string name = this.Need("name", "角色名称");
+        string code = this.Need("code", "角色标识");
+        int rank = this.InInt("rank", 10);
+        int status = this.InInt("status", 1);
+        string description = this.In("description");
+        if (status != 1) { status = 0; }
+        int dataScope = this.InInt("dataScope", DataScope.RoleAll);
+        if (dataScope < DataScope.RoleAll || dataScope > DataScope.RoleCustom) {
+            dataScope = DataScope.RoleAll;
+        }
+        /* 仅自定义保留部门列表，切离不会留下后续重用的旧集。 */
+        string scopeDepts = "";
+        if (dataScope == DataScope.RoleCustom) {
+            scopeDepts = await this.ScopeDepts(this.In("scopeDepts"));
+            if (scopeDepts.Length == 0) {
+                this.Fail(400, Codes.BadInput, "自定义数据权限至少要选一个部门");
+            }
+        }
+
+        Role clash = await this.Role.Where(a => a.code == code).FirstAsync();
+        if (clash != null && clash.id != id) {
+            this.Fail(400, Codes.Conflict, "角色标识 " + code + " 已存在");
+        }
+        if (id > 0) {
+            int n = await this.Role.Update()
+                .Set(a => a.name, name)
+                .Set(a => a.code, code)
+                .Set(a => a.rank, rank)
+                .Set(a => a.status, status)
+                .Set(a => a.description, description)
+                .Set(a => a.dataScope, dataScope)
+                .Set(a => a.scopeDepts, scopeDepts)
+                .Set(a => a.updatedAt, WebApp.NowSeconds())
+                .Where(a => a.id == id)
+                .ExecuteAffrowsAsync();
+            await this.RefreshRoles();
+            await this.Note("编辑角色", code, n > 0, "");
+            this.Saved("角色已保存");
+            return;
+        }
+        Role r = new Role();
+        r.name = name;
+        r.code = code;
+        r.rank = rank;
+        r.status = status;
+        r.description = description;
+        r.dataScope = dataScope;
+        r.scopeDepts = scopeDepts;
+        r.createdAt = WebApp.NowSeconds();
+        r.updatedAt = r.createdAt;
+        int newId = await this.Role.Insert(r).ExecuteIdentityAsync();
+        await this.RefreshRoles();
+        await this.Note("新增角色", code, newId > 0, "");
+        this.Saved("角色已创建");
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Delete)]
+    [Description("删除角色")]
+    async void Delete() {
+        int id = this.InInt("id", 0);
+        Role r = await this.Find(id);
+        int held = await this.UserRole.Where(a => a.roleId == id).CountAsync();
+        if (held > 0) {
+            this.Fail(400, Codes.Conflict, "还有 " + Convert.ToString(held)
+                + " 个账号在使用该角色，请先解除分配");
+        }
+        int n = await this.Role.Delete().Where(a => a.id == id).ExecuteAffrowsAsync();
+        int _g = await this.RoleGrant.Delete().Where(a => a.roleId == id)
+            .ExecuteAffrowsAsync();
+        await this.RefreshRoles();
+        await this.Note("删除角色", r.code, n > 0, "");
+        this.Saved("角色已删除");
+    }
+
+    /* 授权对话框：每屏一行、每按钮一格（查/增/改/删/导出），按该角色持位的勾选；某屏的位来自动作自身的 [Custom(Perm=...)]，故新屏幕一编译即出现。 */
+    [HttpGet]
+    [Custom(Perm = PermBit.Update)]
+    [Description("角色授权")]
+    async void Grant() {
+        int id = this.InInt("id", 0);
+        Role r = await this.Find(id);
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("name", r.name);
+        List<RoleGrant> held = await this.RoleGrant
+            .Where(a => a.roleId == id).ToListAsync();
+
+        List<StrMap> rows = d.AddList("perms");
+        List<string> screens = Perm.Screens();
+        List<int> order = Perm.Order();
+        for (int i = 0; i < screens.Count; i = i + 1) {
+            string screen = screens[i];
+            int exists = Perm.MaskOf(screen);
+            int mine = 0;
+            for (int j = 0; j < held.Count; j = j + 1) {
+                if (held[j].action == screen) { mine = mine | held[j].mask; }
+            }
+            StrMap row = new StrMap();
+            row.Set("screen", screen);
+            row.Set("name", Perm.TitleOf(screen));
+            for (int b = 0; b < order.Count; b = b + 1) {
+                int bit = order[b];
+                string nm = Perm.BitName(bit);
+                if ((exists & bit) == 0) { continue; }
+                row.Set("has" + nm, "1");
+                row.Set("val" + nm, screen + ":" + Convert.ToString(bit));
+                if ((mine & bit) != 0) { row.Set("on" + nm, "checked"); }
+            }
+            rows.Add(row);
+        }
+        /* 受保护却未声明位的动作无法授权；在此展示使操作员找到遗漏的声明。 */
+        List<string> gaps = Perm.Unmarked();
+        if (gaps.Count > 0) { d.Set("unmarked", Perm.Join(gaps, 20)); }
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("保存角色授权")]
+    async void GrantSave() {
+        int id = this.InInt("id", 0);
+        Role r = await this.Find(id);
+        string picked = this.In("permIds");
+        int _cleared = await this.RoleGrant.Delete()
+            .Where(a => a.roleId == id).ExecuteAffrowsAsync();
+
+        /* 仅存在的位可授权：表单提交"screen:bit"对，路由表没有的（未注册屏幕、无动作按钮）为伪造字段，丢弃而非入库。 */
+        long now = WebApp.NowSeconds();
+        List<string> screens = Perm.Screens();
+        List<int> order = Perm.Order();
+        int granted = 0;
+        for (int i = 0; i < screens.Count; i = i + 1) {
+            string screen = screens[i];
+            int exists = Perm.MaskOf(screen);
+            int mask = 0;
+            for (int b = 0; b < order.Count; b = b + 1) {
+                int bit = order[b];
+                if ((exists & bit) == 0) { continue; }
+                if (!AuthUser.Holds(picked, screen + ":" + Convert.ToString(bit))) {
+                    continue;
+                }
+                mask = mask | bit;
+            }
+            if (mask == 0) { continue; }
+            RoleGrant g = new RoleGrant();
+            g.roleId = id;
+            g.action = screen;
+            g.mask = mask;
+            g.createdAt = now;
+            int _n = await this.RoleGrant.Insert(g).ExecuteIdentityAsync();
+            granted = granted + 1;
+        }
+        await this.RefreshRoles();
+        await this.Note("角色授权", r.code, true,
+            Convert.ToString(granted) + " 项权限");
+        this.Saved("授权已保存");
+    }
+
+    async void RefreshRoles() {
+        List<Role> roles = await this.Role.ToListAsync();
+        List<RoleGrant> grants = await this.RoleGrant.ToListAsync();
+        await AuthUser.RolesChanged(roles, grants);
+    }
+
+    async Role Find(int id) {
+        Role r = await this.Role.Read(id);
+        if (r == null) { this.Fail(404, Codes.NotFound, "角色不存在"); }
+        return r;
+    }
+
+    /* 提交的部门存作 ",3,7,"；只保留存在的——与 GrantSave 仅保留存在的动作同理，防止伪造字段把不可见部门 id 写进 scope。 */
+    async string ScopeDepts(string picked) {
+        List<Department> all = await this.Department
+            .OrderBy(a => a.sortOrder).ToListAsync();
+        StringBuilder outp = new StringBuilder();
+        outp.Append(",");
+        int kept = 0;
+        for (int i = 0; i < all.Count; i = i + 1) {
+            string id = Convert.ToString(all[i].id);
+            if (!AuthUser.Holds(picked, id)) { continue; }
+            outp.Append(id);
+            outp.Append(",");
+            kept = kept + 1;
+        }
+        if (kept == 0) { return ""; }
+        return outp.ToString();
+    }
+
+    static string StatusText(int status) {
+        if (status == 1) { return "启用"; }
+        return "停用";
+    }
+
+    static string StatusClass(int status) {
+        if (status == 1) { return "ok"; }
+        return "off";
+    }
+}

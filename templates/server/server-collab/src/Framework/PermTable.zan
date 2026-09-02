@@ -1,0 +1,188 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Net;
+using System.Threading;
+using System.Web;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb;
+
+/* 共享内存授权表：角色可执行哪些 action、账号持有哪些角色。数据库仍持有 sys_role_grant / sys_user_role / sys_department_role，请求路径读共享内存，零查询。角色整表加载、授权变更时重写；账号按需加载，带短租约过期。*/
+class PermTable {
+    /* 句柄在 master 与 worker 之间传递所用的名字（ZAN_SHARE_<name>）。*/
+    static const string ShareRoles = "WEB_PERM_ROLES";
+    static const string ShareUsers = "WEB_PERM_USERS";
+
+    static long UserLeaseMs = 300000;
+
+    static SharedTable roles = null;
+    static SharedTable users = null;
+
+    /* 两张表只属于本服务实例：master 在派生 worker 之前建匿名共享内存，
+     * 句柄经 Worker.ShareHandle 下发，worker 用继承的句柄映射同一块内存。
+     * 全程没有名字，同机其他进程（包括别的 zan 服务）无法触及。*/
+    static bool Open() {
+        long roleHandle = Worker.InheritedHandle(PermTable.ShareRoles);
+        long userHandle = Worker.InheritedHandle(PermTable.ShareUsers);
+        if (roleHandle != 0 || userHandle != 0) {
+            /* worker：映射 master 下发的两张表；缺一即视为不可用，
+             * 权限判断一律失败（fail closed）。*/
+            SharedTable r = SharedTable.Attach(roleHandle);
+            SharedTable u = SharedTable.Attach(userHandle);
+            if (!r.IsOpen() || !u.IsOpen()) { return false; }
+            r.Label("web perm roles");
+            u.Label("web perm users");
+            PermTable.roles = r;
+            PermTable.users = u;
+            return true;
+        }
+
+        /* master / 单进程：创建匿名表并登记句柄，供之后派生的 worker 继承。*/
+        SharedTable nr = new SharedTable("", 256);
+        nr.KeySize(16);
+        nr.ColumnString("acts", 8192);
+        nr.ColumnInt("scope");
+        nr.ColumnString("depts", 255);
+        if (!nr.CreateAnonymous()) { return false; }
+        nr.Label("web perm roles");
+
+        SharedTable nu = new SharedTable("", 8192);
+        nu.KeySize(24);
+        nu.ColumnInt("super");
+        nu.ColumnString("roles", 192);
+        nu.ColumnInt("scope");
+        nu.ColumnString("depts", 1024);
+        if (!nu.CreateAnonymous()) { return false; }
+        nu.Label("web perm users");
+
+        Worker.ShareHandle(PermTable.ShareRoles, nr.OsHandle());
+        Worker.ShareHandle(PermTable.ShareUsers, nu.OsHandle());
+        PermTable.roles = nr;
+        PermTable.users = nu;
+        return true;
+    }
+
+    static bool Ready() {
+        return PermTable.roles != null && PermTable.users != null;
+    }
+
+    /* 从数据库重写所有角色掩码。启动时和授权变更后运行。*/
+    static async void LoadRoles(IDbConnection db) {
+        if (!PermTable.Ready()) { return; }
+        List<Role> rows = await db.Select<Role>().ToListAsync();
+        List<RoleGrant> grants = await db.Select<RoleGrant>().ToListAsync();
+        await PermTable.LoadRoles(rows, grants);
+    }
+
+    /* 发布已加载的角色行（Controller 端使用，避免暴露请求连接）。*/
+    static async void LoadRoles(List<Role> rows, List<RoleGrant> grants) {
+        if (!PermTable.Ready()) { return; }
+        if (rows == null) { rows = new List<Role>(); }
+        if (grants == null) { grants = new List<RoleGrant>(); }
+        PermTable.roles.Clear();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            Role r = rows[i];
+            if (r.status != 1) { continue; }
+            StringBuilder acts = new StringBuilder();
+            acts.Append(",");
+            for (int j = 0; j < grants.Count; j = j + 1) {
+                if (grants[j].roleId != r.id) { continue; }
+                if (grants[j].action.Length == 0) { continue; }
+                Perm.Append(acts, grants[j].action, grants[j].mask);
+            }
+            string key = Convert.ToString(r.id);
+            bool _ok = PermTable.roles.SetString(key, "acts", acts.ToString());
+            bool _s = PermTable.roles.SetInt(key, "scope", r.dataScope);
+            string depts = r.scopeDepts;
+            if (depts == null) { depts = ""; }
+            bool _d = PermTable.roles.SetString(key, "depts", depts);
+        }
+    }
+
+    static int RoleScope(string roleId) {
+        if (!PermTable.Ready()) { return 0; }
+        return PermTable.roles.GetInt(roleId, "scope");
+    }
+
+    static string RoleDepts(string roleId) {
+        if (!PermTable.Ready()) { return ""; }
+        return PermTable.roles.GetString(roleId, "depts");
+    }
+
+    static bool RolesAllow(string roleIds, string action) {
+        if (!PermTable.Ready()) { return false; }
+        int bit = Perm.BitOf(action);
+        if (bit == 0) { return false; }
+        return (PermTable.RolesMask(roleIds, Perm.ScreenOf(action)) & bit) != 0;
+    }
+
+    static int RolesMask(string roleIds, string screen) {
+        if (!PermTable.Ready() || screen.Length == 0) { return 0; }
+        int mask = 0;
+        List<string> ids = PermTable.Split(roleIds);
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            string acts = PermTable.roles.GetString(ids[i], "acts");
+            if (acts.Length == 0) { continue; }
+            mask = mask | Perm.MaskIn(acts, screen);
+        }
+        return mask;
+    }
+
+    static string UserRoles(string uid) {
+        if (!PermTable.Ready()) { return ""; }
+        if (!PermTable.users.Exists(uid)) { return ""; }
+        if (PermTable.users.GetInt(uid, "super") == 1) { return "*"; }
+        return PermTable.users.GetString(uid, "roles");
+    }
+
+    static int UserScope(string uid) {
+        if (!PermTable.Ready()) { return 0; }
+        if (!PermTable.users.Exists(uid)) { return 0; }
+        return PermTable.users.GetInt(uid, "scope");
+    }
+
+    static string UserDepts(string uid) {
+        if (!PermTable.Ready()) { return ""; }
+        return PermTable.users.GetString(uid, "depts");
+    }
+
+    static void SetUserScope(string uid, int mode, string depts) {
+        if (!PermTable.Ready()) { return; }
+        bool _m = PermTable.users.SetInt(uid, "scope", mode);
+        bool _d = PermTable.users.SetString(uid, "depts", depts);
+        bool _e = PermTable.users.Expire(uid, PermTable.UserLeaseMs);
+    }
+
+    static void SetUser(string uid, bool isSuper, string roleIds) {
+        if (!PermTable.Ready()) { return; }
+        bool _s = PermTable.users.SetInt(uid, "super", isSuper ? 1 : 0);
+        bool _r = PermTable.users.SetString(uid, "roles", roleIds);
+        bool _e = PermTable.users.Expire(uid, PermTable.UserLeaseMs);
+    }
+
+    static void Forget(string uid) {
+        if (!PermTable.Ready()) { return; }
+        bool _d = PermTable.users.Delete(uid);
+    }
+
+    static void ForgetAll() {
+        if (!PermTable.Ready()) { return; }
+        PermTable.users.Clear();
+    }
+
+    static List<string> Split(string joined) {
+        List<string> outp = new List<string>();
+        StringBuilder cur = new StringBuilder();
+        for (int i = 0; i <= joined.Length; i = i + 1) {
+            if (i == joined.Length || joined.Substring(i, 1) == ",") {
+                string one = cur.ToString();
+                if (one.Length > 0) { outp.Add(one); }
+                cur = new StringBuilder();
+            } else {
+                cur.Append(joined.Substring(i, 1));
+            }
+        }
+        return outp;
+    }
+}

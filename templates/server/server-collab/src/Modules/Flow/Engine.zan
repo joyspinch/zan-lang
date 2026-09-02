@@ -1,0 +1,302 @@
+using System;
+using System.Data;
+using System.Json;
+using System.Web;
+using ZanWeb.Model.Flow;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.Modules.Flow;
+
+/* 流程引擎：实例推进、任务落人、通知落库与实时推送的唯一实现。
+   通知双通道：flow_notify 落库（未读数/历史查询）+ FlowHub.Push 实时推给在线者。
+   流端点（Notifies.Stream）维护 userId→连接 的注册表；业务侧只管投递，不关心谁在线。 */
+class Engine {
+    /* 只读展示辅助：定义/节点名查表。 */
+    static string DefName(List<FlowDef> defs, int defId) {
+        for (int i = 0; i < defs.Count; i = i + 1) {
+            if (defs[i].id == defId) { return defs[i].name; }
+        }
+        return "-";
+    }
+
+    static string NodeName(List<FlowNode> nodes, int nodeId) {
+        if (nodeId == 0) { return "-"; }
+        for (int i = 0; i < nodes.Count; i = i + 1) {
+            if (nodes[i].id == nodeId) { return nodes[i].name; }
+        }
+        return "-";
+    }
+
+    static string InstTitle(List<FlowInst> insts, int instId) {
+        for (int i = 0; i < insts.Count; i = i + 1) {
+            if (insts[i].id == instId) { return insts[i].title; }
+        }
+        return "-";
+    }
+
+    static string UserName(List<User> users, int userId) {
+        for (int i = 0; i < users.Count; i = i + 1) {
+            if (users[i].id == userId) {
+                return Fmt.Text(users[i].nickname, users[i].username);
+            }
+        }
+        return "-";
+    }
+
+    /* 节点按 sort 升序（插入排序，节点数小）。 */
+    static List<FlowNode> SortNodes(List<FlowNode> nodes) {
+        List<FlowNode> r = new List<FlowNode>();
+        for (int i = 0; i < nodes.Count; i = i + 1) {
+            int at = 0;
+            while (at < r.Count && r[at].sort <= nodes[i].sort) {
+                at = at + 1;
+            }
+            r.Insert(at, nodes[i]);
+        }
+        return r;
+    }
+
+    /* 推进到下一节点：生成任务、按 kind 分派、通知责任人；全部节点完成则收口实例。返回新任务 id；0 = 实例已完结。 */
+    static async int Advance(IDbConnection db, FlowInst inst) {
+        List<FlowNode> nodes = await db.Select<FlowNode>()
+            .Where(a => a.defId == inst.defId)
+            .ToListAsync();
+        if (nodes.Count == 0) { return 0; }
+        /* 按 sort 升序（内存排序，模板规模节点数小）。 */
+        List<FlowNode> ordered = Engine.SortNodes(nodes);
+        FlowNode next = null;
+        if (inst.currentNodeId == 0) {
+            next = ordered[0];
+        } else {
+            int at = -1;
+            for (int i = 0; i < ordered.Count; i = i + 1) {
+                if (ordered[i].id == inst.currentNodeId) { at = i; }
+            }
+            if (at < 0 || at + 1 >= ordered.Count) {
+                /* 已是最后一环：收口。 */
+                return 0;
+            }
+            next = ordered[at + 1];
+        }
+
+        int assignTo = next.assignUserId;
+        /* 未指定人但有部门：落给部门负责人；无负责人则落给第一个启用成员。 */
+        if (assignTo == 0 && next.deptId > 0) {
+            Department dept = await db.Select<Department>()
+                .Where(a => a.id == next.deptId).FirstAsync();
+            if (dept != null && dept.leaderUserId > 0) {
+                assignTo = dept.leaderUserId;
+            } else {
+                User first = await db.Select<User>()
+                    .Where(a => a.departmentId == next.deptId && a.status == 1)
+                    .FirstAsync();
+                if (first != null) { assignTo = first.id; }
+            }
+        }
+
+        FlowTask task = new FlowTask();
+        task.instId = inst.id;
+        task.nodeId = next.id;
+        task.assignUserId = next.kind == "ai" ? 0 : assignTo;
+        task.status = 0;
+        task.result = "";
+        long now = WebApp.NowSeconds();
+        task.createdAt = now;
+        task.finishedAt = 0;
+        int taskId = await db.Insert<FlowTask>(task).ExecuteIdentityAsync();
+
+        int _u = await db.Update<FlowInst>()
+            .Set(a => a.currentNodeId, next.id)
+            .Set(a => a.updatedAt, now)
+            .Where(a => a.id == inst.id).ExecuteAffrowsAsync();
+
+        if (next.kind == "ai") {
+            /* AI 节点：系统代跑——模板内置占位执行（真实接 AI 供应商属演进项），完成后自动再推进。
+               同步本地 inst.currentNodeId，使递归 Advance 从「下一环」继续而非重复本环。 */
+            string text = next.aiPrompt.Length > 0
+                ? next.aiPrompt : next.name;
+            string summary = "[AI] " + text + "（已由系统代为执行）";
+            int _d = await db.Update<FlowTask>()
+                .Set(a => a.status, 1)
+                .Set(a => a.result, summary)
+                .Set(a => a.finishedAt, now)
+                .Where(a => a.id == taskId).ExecuteAffrowsAsync();
+            await Engine.Note(db, inst.startedBy, "done",
+                "AI 节点「" + next.name + "」已完成", "/admin/flow/instances");
+            inst.currentNodeId = next.id;
+            await Engine.Advance(db, inst);
+            return taskId;
+        }
+
+        if (assignTo > 0) {
+            await Engine.Note(db, assignTo, "assign",
+                "新任务：「" + inst.title + "」→ " + next.name,
+                "/admin/flow/tasks");
+        }
+        return taskId;
+    }
+
+    /* 发起实例：写 inst 行并把第一环节跑起来。 */
+    static async int Start(IDbConnection db, FlowDef def, string title,
+                        string bizRef, int byUserId) {
+        long now = WebApp.NowSeconds();
+        FlowInst inst = new FlowInst();
+        inst.defId = def.id;
+        inst.title = title;
+        inst.bizRef = Fmt.Text(bizRef, "");
+        inst.startedBy = byUserId;
+        inst.status = 1;
+        inst.currentNodeId = 0;
+        inst.createdAt = now;
+        inst.updatedAt = now;
+        int id = await db.Insert<FlowInst>(inst).ExecuteIdentityAsync();
+        inst.id = id;
+        await Engine.Advance(db, inst);
+        return id;
+    }
+
+    /* 完成任务并推进；汇报文本写入任务 result 并追加流水。mentions 为逗号分隔 userId。 */
+    static async bool Complete(IDbConnection db, FlowTask task, User me,
+                            string report, string mentions) {
+        long now = WebApp.NowSeconds();
+        FlowInst inst = await db.Select<FlowInst>()
+            .Where(a => a.id == task.instId).FirstAsync();
+        if (inst == null || inst.status != 1) { return false; }
+
+        FlowLog log = new FlowLog();
+        log.taskId = task.id;
+        log.userId = me.id;
+        log.content = Fmt.Text(report, "完成");
+        log.mentionIds = Fmt.Text(mentions, "");
+        log.createdAt = now;
+        await db.Insert<FlowLog>(log).ExecuteIdentityAsync();
+
+        if (mentions.Length > 0) {
+            await Engine.NoteMentions(db, mentions,
+                me.nickname + " 在「" + inst.title + "」中 @了你：" + report,
+                "/admin/flow/tasks");
+        }
+
+        int _d = await db.Update<FlowTask>()
+            .Set(a => a.status, 1)
+            .Set(a => a.result, Fmt.Text(report, "完成"))
+            .Set(a => a.finishedAt, now)
+            .Where(a => a.id == task.id).ExecuteAffrowsAsync();
+
+        int nxt = await Engine.Advance(db, inst);
+        if (nxt == 0) {
+            int _f = await db.Update<FlowInst>()
+                .Set(a => a.status, 2)
+                .Set(a => a.currentNodeId, 0)
+                .Set(a => a.updatedAt, now)
+                .Where(a => a.id == inst.id).ExecuteAffrowsAsync();
+            await Engine.Note(db, inst.startedBy, "done",
+                "流程「" + inst.title + "」已全部完成", "/admin/flow/instances");
+        }
+        return true;
+    }
+
+    /* 单条通知：落库 + 实时推送（在线则即时可见，离线靠未读数）。 */
+    static async bool Note(IDbConnection db, int userId, string kind,
+                        string content, string link) {
+        FlowNotify n = new FlowNotify();
+        n.userId = userId;
+        n.kind = kind;
+        n.content = content;
+        n.link = Fmt.Text(link, "/admin/flow/notifies");
+        n.isRead = 0;
+        n.createdAt = WebApp.NowSeconds();
+        int id = await db.Insert<FlowNotify>(n).ExecuteIdentityAsync();
+
+        JsonValue o = JsonValue.NewObject();
+        o.Put("id", JsonValue.NewStr(Convert.ToString(id)));
+        o.Put("kind", JsonValue.NewStr(kind));
+        o.Put("content", JsonValue.NewStr(content));
+        o.Put("link", JsonValue.NewStr(n.link));
+        await FlowHub.Push(userId, o);
+        return true;
+    }
+
+    /* @提及：按逗号分隔逐人生成 mention 通知。 */
+    static async void NoteMentions(IDbConnection db, string mentionIds,
+                                string content, string link) {
+        int from = 0;
+        int i = 0;
+        while (i <= mentionIds.Length) {
+            if (i == mentionIds.Length || mentionIds.Substring(i, 1) == ",") {
+                string one = mentionIds.Substring(from, i - from);
+                if (one.Length > 0) {
+                    int uid = Filter.ToInt(one, 0);
+                    if (uid > 0) {
+                        await Engine.Note(db, uid, "mention", content, link);
+                    }
+                }
+                from = i + 1;
+            }
+            i = i + 1;
+        }
+    }
+}
+
+/* 连接注册表：Notifies.Stream 打开时登记、断开时注销；业务侧 Push 只对在线者发。
+   双通道：WebSocket 长连接为主（ctx.WsUpgrade，升级前路由/权限已生效），SSE 为回退
+   （老代理/老客户端）。并行数组；协程模型下每条连接由各自协程维护，Push 只在短请求
+   协程里跑，注册表增删由 Stream 协程同步做，无跨协程撕裂。
+   写方唯一：WS 会话循环只 Recv 不写，Push 是会话出站的唯一协程——两条推送协程
+   并发写同一条会话才可能撕裂帧字节，本注册表从结构上排除了这种形态。 */
+class FlowHub {
+    /* WS 主通道（NotifyPayload 的 type 字段供客户端分派事件）。 */
+    static List<int> wsIds = new List<int>();
+    static List<WsSession> wsConns = new List<WsSession>();
+    /* SSE 回退通道。 */
+    static List<int> sseIds = new List<int>();
+    static List<HttpContext> sseConns = new List<HttpContext>();
+
+    static void JoinWs(int userId, WsSession conn) {
+        FlowHub.LeaveWs(conn);
+        FlowHub.wsIds.Add(userId);
+        FlowHub.wsConns.Add(conn);
+    }
+
+    static void LeaveWs(WsSession conn) {
+        int at = FlowHub.wsConns.IndexOf(conn);
+        if (at >= 0) {
+            FlowHub.wsConns.RemoveAt(at);
+            FlowHub.wsIds.RemoveAt(at);
+        }
+    }
+
+    static void JoinSse(int userId, HttpContext conn) {
+        FlowHub.LeaveSse(conn);
+        FlowHub.sseIds.Add(userId);
+        FlowHub.sseConns.Add(conn);
+    }
+
+    static void LeaveSse(HttpContext conn) {
+        int at = FlowHub.sseConns.IndexOf(conn);
+        if (at >= 0) {
+            FlowHub.sseConns.RemoveAt(at);
+            FlowHub.sseIds.RemoveAt(at);
+        }
+    }
+
+    /* 向某用户的在线连接推一条通知；不在线则静默跳过（落库已是可靠通道）。
+       type 字段供 WS 客户端分派（SSE 客户端走事件名）；业务 kind
+       （assign/mention/flow）原样保留，两通道收到的是同一份 JSON。 */
+    static async void Push(int userId, JsonValue payload) {
+        payload.Put("type", JsonValue.NewStr("notify"));
+        string json = payload.ToJson();
+        for (int i = FlowHub.wsConns.Count - 1; i >= 0; i = i - 1) {
+            if (FlowHub.wsIds[i] != userId) { continue; }
+            WsSession s = FlowHub.wsConns[i];
+            bool ok = await s.SendText(json);
+            if (!ok) { FlowHub.LeaveWs(s); }
+        }
+        for (int j = FlowHub.sseConns.Count - 1; j >= 0; j = j - 1) {
+            if (FlowHub.sseIds[j] != userId) { continue; }
+            HttpContext c = FlowHub.sseConns[j];
+            bool ok2 = await c.SseSend("notify", json);
+            if (!ok2) { FlowHub.LeaveSse(c); }
+        }
+    }
+}
