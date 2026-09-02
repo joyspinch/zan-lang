@@ -150,17 +150,17 @@ Difficulty is for **CLI/compute** first; GUI is a separate, larger effort on eac
 - Remaining: an actual run on Mac hardware — everything so far is link/structure
   verification only.
 
-### Android (`android-x64` / `android-arm64`) — CLI/console works, verified on an emulator
+### Android (`android-x64` / `android-arm64`) — CLI works; GUI renders, verified on an emulator
 - Objects emit for the `*-linux-android28` triple (API 28: rt_sync.c's
-  `glob()` usage needs bionic 28) and statically link with `ld.lld` against a
-  **committed NDK sysroot subset** at `toolchain/android-<arch>/`
-  (`crtbegin_static.o`, `crtend_android.o`, `libc.a`, `libm.a`, `libdl.a`,
-  `libclang_rt.builtins.a`; bionic's zstd-compressed debug sections are
-  decompressed so any lld can link it). The workflow is
-  `zanc --target android-x64 -o app` → `adb push app /data/local/tmp/` →
-  `adb shell chmod 755 + run` — verified end-to-end on an API 35 x86_64
-  emulator (try/catch, file IO, atomics, threads API surface, async
-  coroutine driver; output matches native).
+  `glob()` usage needs bionic 28). Console programs statically link with
+  `ld.lld` against a **committed NDK sysroot subset** at
+  `toolchain/android-<arch>/` (`crtbegin_static.o`, `crtend_android.o`,
+  `libc.a`, `libm.a`, `libdl.a`, `libclang_rt.builtins.a`; bionic's
+  zstd-compressed debug sections are decompressed so any lld can link it).
+  The workflow is `zanc --target android-x64 -o app` →
+  `adb push app /data/local/tmp/` → `adb shell chmod 755 + run` — verified
+  end-to-end on an API 35 x86_64 emulator (try/catch, file IO, atomics,
+  threads API surface, async coroutine driver; output matches native).
 - Runtime objects (`zanrt_io/sync/file/timer.o`, `zan_embed_api.o`) are built
   with the NDK clang per `scripts\build_cross_rt.cmd` (zig cc has no bionic
   target); bionic lacks `shm_open`, which an `__ANDROID__` shim inside
@@ -168,9 +168,23 @@ Difficulty is for **CLI/compute** first; GUI is a separate, larger effort on eac
   `/data/local/tmp`).
 - `--fast-alloc` is unavailable on Android: the wrapped-malloc allocator
   interposes bionic's own internals and crashes during their TLS bootstrap.
-- GUI would need an Android-specific back end (no X11; see A82 in TASKS.md).
-- arm64 is link-verified (matching the macOS policy); the emulator on hand is
-  x86_64.
+- **GUI**: a program that imports `[DllImport("zan_gui")]` drivers gets a
+  *dynamic pie* link (`ld.lld -pie` + `crtbegin_dynamic.o`; the
+  `libc/libm/liblog/libdl.so` stubs at `toolchain/android-<arch>/` record
+  DT_NEEDED so driver libs resolve from `nativeLibraryDir` at install
+  time). Since `SDL_Init(SDL_INIT_VIDEO)` needs a JVM/Activity (it
+  segfaults from a plain console process), the supported shape is a
+  **shared-library link**: `zanc --emit-lib --target android-x64 -o
+  libmain.so` emits an `SDL_main`-exporting shared object (a tiny
+  `SDL_main.o` in the sysroot subset adapts `SDL_main(argc, argv)` to the
+  module's `main`), which an `org.libsdl.app.SDLActivity` APK shell dlopens
+  and runs. `stdlib/Gui/drivers/android-{x64,arm64}/` ship `libzan_gui.so`
+  (SDL3 back end) + `libSDL3.so` + `zan_gui.bundle` for `--publish`
+  staging. Verified on the emulator: the SDLActivity task dlopens
+  `libmain.so`, the window paints (clear + fill-rect surfaces matched by
+  pixel-diff on screencaps), and the program exits cleanly. A gradle-less
+  APK shell (aapt2 + d8 + apksigner) exists as the publish-story template;
+  arm64 is link-verified (matching the macOS policy).
 
 ### HarmonyOS / OHOS — medium
 - OHOS native uses a musl-based NDK; for CLI/services this is close to Android.

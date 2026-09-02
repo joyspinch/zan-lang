@@ -2109,7 +2109,7 @@ EXPORT i32 zan_gui_gdi_present(void *hwnd, i32 surface_id, i32 *rects,
  * For an opaque window "premultiplied ARGB" is just the canvas pixel with the
  * alpha byte forced to 0xFF -- the same pixels GDI would have shown, since
  * SetDIBitsToDevice ignores alpha anyway. */
-
+#ifdef _WIN32
 typedef struct zan_atomic_layer_s {
     void *hwnd;
     int w, h;
@@ -2210,6 +2210,7 @@ static void zan_atomic_layer_drop(void *hwnd) {
         p = &(*p)->next;
     }
 }
+#endif /* _WIN32 (atomic layered-present internals are GDI-only) */
 
 /* Swaps the surface onto the screen atomically. Only for windows that are
  * already layered (native glass, outline shape): a plain opaque window would

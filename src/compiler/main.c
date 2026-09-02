@@ -3778,6 +3778,102 @@ int main(int argc, char **argv) {
                         snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
                                  rt_timer_obj);
                     }
+                } else if (cross_compiling &&
+                           target.os == ZAN_OS_ANDROID) {
+                    /* Android shared library: an SDLActivity-shell program
+                     * (libmain.so inside an APK). SDL3's Java activity
+                     * dlopens the app's "main" shared library and calls
+                     * SDL_main(argc, argv); SDL_main.o (in the sysroot
+                     * subset) adapts that to the module's main(i32, i8**).
+                     * The library links against the same stub .so files as
+                     * the dynamic exe path, and any [DllImport] drivers
+                     * resolve from the search dirs above at APK install
+                     * time (nativeLibraryDir holds every packaged .so). */
+                    char exe_dir3[1024] = {0};
+                    zan_exe_dir(exe_dir3, sizeof(exe_dir3));
+                    const char *asub3 = (target.arch == ZAN_ARCH_AARCH64)
+                                        ? "android-arm64" : "android-x64";
+                    char sys3[1200];
+                    snprintf(sys3, sizeof(sys3), "%s/%s", exe_dir3, asub3);
+                    char probe3[1300];
+                    snprintf(probe3, sizeof(probe3), "%s/SDL_main.o", sys3);
+                    if (!zan_file_exists(probe3)) {
+                        fprintf(stderr,
+                                "error: bundled %s sysroot subset not found "
+                                "at '%s'; reinstall zan or rebuild with "
+                                "toolchain/%s present\n",
+                                asub3, sys3, asub3);
+                        remove(obj_tmp);
+                        zan_irgen_destroy(&irgen);
+                        zan_arena_free(arena);
+                        free(source);
+                        return 1;
+                    }
+                    snprintf(cmd, sizeof(cmd),
+                             "ld.lld -shared -o \"%s\" \"%s/SDL_main.o\""
+                             " \"%s\"", obj_path, sys3, obj_tmp);
+                    for (int di = 0; di < zan_lib_ndirs; di++) {
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
+                                 zan_lib_dirs[di]);
+                    }
+                    for (int di = 0; di < extra_lib_path_count; di++) {
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
+                                 extra_lib_paths[di]);
+                    }
+                    if (rt_io_obj) {
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                                 rt_io_obj);
+                    }
+                    if (rt_sync_obj) {
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                                 rt_sync_obj);
+                    }
+                    if (rt_file_obj) {
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                                 rt_file_obj);
+                    }
+                    if (rt_embed_obj) {
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                                 rt_embed_obj);
+                    }
+                    if (rt_timer_obj) {
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                                 rt_timer_obj);
+                    }
+                    for (int li = 0; li < static_driver_lib_count; li++) {
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur, " %s",
+                                 static_driver_libs[li]);
+                    }
+                    for (int li = 0; li < irgen.extern_lib_count; li++) {
+                        if (zan_win_system_lib(irgen.extern_libs[li].str,
+                                               (int)irgen.extern_libs[li].len))
+                            continue;
+                        int nlen;
+                        const char *nm = zan_dllimport_lname(
+                            irgen.extern_libs[li].str,
+                            (int)irgen.extern_libs[li].len, &nlen);
+                        if (!nm) continue;
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur, " -l%.*s",
+                                 nlen, nm);
+                    }
+                    { size_t cur = strlen(cmd);
+                      snprintf(cmd + cur, sizeof(cmd) - cur,
+                               " \"%s/libc.so\" \"%s/libm.so\""
+                               " \"%s/liblog.so\" \"%s/libdl.so\""
+                               " \"%s/libclang_rt.builtins.a\"",
+                               sys3, sys3, sys3, sys3, sys3); }
+                    if (getenv("ZAN_VERBOSE_LINK"))
+                        fprintf(stderr, "[link] %s\n", cmd);
+                    link_ret = system(cmd);
                 } else {
                     fprintf(stderr, "error: shared libraries are not supported "
                             "for this target yet\n");
@@ -3932,31 +4028,72 @@ int main(int argc, char **argv) {
                        " --end-group \"%s/crtn.o\"", sys); }
             link_ret = system(cmd);
         } else if (cross_compiling && target.os == ZAN_OS_ANDROID) {
-            /* Cross-link an Android bionic executable: a STATIC ELF like the
-             * Linux path ("build on Windows, adb push, run" -- /data/local/tmp
-             * runs static executables fine), linked from the committed subset
-             * of the NDK sysroot at android-<arch>/ (crtbegin_static.o +
-             * crtend_android.o + libc.a/libm.a/libdl.a + compiler-rt builtins).
-             * Objects were emitted for the *-linux-android28 triple (API 28:
-             * bionic gained glob()); bionic's static libc exposes pthread,
-             * epoll and the socket API, so the same runtime objects as the
-             * Linux sysroots link here -- except zanrt_mem.o, whose
-             * --wrap=malloc interposes bionic's own internals and crashes
-             * under their TLS bootstrap, so --fast-alloc stays host/Linux
-             * only. Requires the NDK sysroot subset committed under
-             * toolchain/android-<arch>/ (staged next to zanc at build time).
-             * adb push <exe> /data/local/tmp/ && adb shell chmod 755 + run. */
+            /* Cross-link an Android bionic executable from the committed
+             * subset of the NDK sysroot at android-<arch>/ (crt objects +
+             * libc/libm/libdl + compiler-rt builtins). Objects were emitted
+             * for the *-linux-android28 triple (API 28: bionic gained
+             * glob()); bionic's static libc exposes pthread, epoll and the
+             * socket API, so the same runtime objects as the Linux sysroots
+             * link here -- except zanrt_mem.o, whose --wrap=malloc
+             * interposes bionic's own internals and crashes under their TLS
+             * bootstrap, so --fast-alloc stays host/Linux only. Requires the
+             * NDK sysroot subset committed under toolchain/android-<arch>/
+             * (staged next to zanc at build time). adb push <exe>
+             * /data/local/tmp/ && adb shell chmod 755 + run.
+             *
+             * Two link flavors, chosen per program:
+             *  - STATIC (default): a self-contained ELF like the Linux path.
+             *  - DYNAMIC (pie) when the program imports a native driver
+             *    ([DllImport("zan_gui")] and friends): Android only resolves
+             *    drivers from shared libraries that ship beside the app, so
+             *    the link just records the DT_NEEDED entries against the NDK
+             *    stub .so files in the same sysroot subset and the driver
+             *    .so bundle is published next to the executable (the APK
+             *    shell carries them in the app's nativeLibraryDir). */
             char exe_dir[1024] = {0};
             zan_exe_dir(exe_dir, sizeof(exe_dir));
             const char *asub = (target.arch == ZAN_ARCH_AARCH64)
                                ? "android-arm64" : "android-x64";
             char sys[1200];
             snprintf(sys, sizeof(sys), "%s/%s", exe_dir, asub);
-            char cmd[4096];
-            snprintf(cmd, sizeof(cmd),
-                     "ld.lld -static%s -o \"%s\" \"%s/crtbegin_static.o\""
-                     " \"%s\"",
-                     publish_mode ? " -s" : "", obj_path, sys, obj_tmp);
+            /* Which [DllImport] libs must the link record? Windows-only
+             * system libs are platform-guarded paths Android never takes;
+             * crt/libc/libm pseudo-libs resolve from the sysroot. */
+            const char *drv_libs[ZAN_LINK_MAX_LIBS];
+            int drv_lib_len[ZAN_LINK_MAX_LIBS];
+            int drv_lib_count = 0;
+            for (int li = 0; li < irgen.extern_lib_count; li++) {
+                if (zan_win_system_lib(irgen.extern_libs[li].str,
+                                       (int)irgen.extern_libs[li].len))
+                    continue;
+                int nlen;
+                const char *nm = zan_dllimport_lname(
+                    irgen.extern_libs[li].str,
+                    (int)irgen.extern_libs[li].len, &nlen);
+                if (!nm) continue;
+                if (drv_lib_count >= ZAN_LINK_MAX_LIBS)
+                    link_cap_exceeded("DllImport libraries", ZAN_LINK_MAX_LIBS);
+                drv_libs[drv_lib_count] = nm;
+                drv_lib_len[drv_lib_count] = nlen;
+                drv_lib_count++;
+            }
+            char cmd[8192];
+            if (drv_lib_count > 0) {
+                /* DYNAMIC: pie executable; the stub .so files in the sysroot
+                 * subset provide the symbol tables lld needs, and the run
+                 * time resolves the real ones from the system (libc/libm/
+                 * liblog/libdl) and from the bundled driver dir (zan_gui,
+                 * SDL3). */
+                snprintf(cmd, sizeof(cmd),
+                         "ld.lld -pie%s -o \"%s\" \"%s/crtbegin_dynamic.o\""
+                         " \"%s\"",
+                         publish_mode ? " -s" : "", obj_path, sys, obj_tmp);
+            } else {
+                snprintf(cmd, sizeof(cmd),
+                         "ld.lld -static%s -o \"%s\" \"%s/crtbegin_static.o\""
+                         " \"%s\"",
+                         publish_mode ? " -s" : "", obj_path, sys, obj_tmp);
+            }
             for (int di = 0; di < zan_lib_ndirs; di++) {
                 size_t cur = strlen(cmd);
                 snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
@@ -3992,8 +4129,16 @@ int main(int argc, char **argv) {
                          " \"%s/zan_embed_api.o\"", sys);
             }
             { size_t cur = strlen(cmd);
-              snprintf(cmd + cur, sizeof(cmd) - cur,
-                       " --start-group \"%s/libc.a\" \"%s/libm.a\"", sys, sys); }
+              if (drv_lib_count > 0) {
+                  /* dynamic: resolve libc/libm/liblog/libdl from the stub
+                   * shared libraries, and the imported drivers from the
+                   * driver search dirs above */
+                  snprintf(cmd + cur, sizeof(cmd) - cur,
+                           " --start-group");
+              } else {
+                  snprintf(cmd + cur, sizeof(cmd) - cur,
+                           " --start-group \"%s/libc.a\" \"%s/libm.a\"", sys, sys);
+              } }
             for (int d = 0; d < cross_archive_count; d++) {
                 size_t cur = strlen(cmd);
                 snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", cross_archives[d]);
@@ -4003,11 +4148,25 @@ int main(int argc, char **argv) {
                 snprintf(cmd + cur, sizeof(cmd) - cur, " %s",
                          static_driver_libs[li]);
             }
+            for (int li = 0; li < drv_lib_count; li++) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " -l%.*s",
+                         drv_lib_len[li], drv_libs[li]);
+            }
             { size_t cur = strlen(cmd);
-              snprintf(cmd + cur, sizeof(cmd) - cur,
-                       " --end-group \"%s/libdl.a\" \"%s/crtend_android.o\""
-                       " \"%s/libclang_rt.builtins.a\"",
-                       sys, sys, sys); }
+              if (drv_lib_count > 0) {
+                  snprintf(cmd + cur, sizeof(cmd) - cur,
+                           " --end-group \"%s/libc.so\" \"%s/libm.so\""
+                           " \"%s/liblog.so\" \"%s/libdl.so\""
+                           " \"%s/crtend_android.o\""
+                           " \"%s/libclang_rt.builtins.a\"",
+                           sys, sys, sys, sys, sys, sys);
+              } else {
+                  snprintf(cmd + cur, sizeof(cmd) - cur,
+                           " --end-group \"%s/libdl.a\" \"%s/crtend_android.o\""
+                           " \"%s/libclang_rt.builtins.a\"",
+                           sys, sys, sys);
+              } }
             if (getenv("ZAN_VERBOSE_LINK"))
                 fprintf(stderr, "[link] %s\n", cmd);
             link_ret = system(cmd);
