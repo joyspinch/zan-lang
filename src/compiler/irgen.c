@@ -408,6 +408,13 @@ static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
                               LLVMValueRef *args, unsigned n, const char *nm);
 static void emit_weak_runtime(zan_irgen_t *g);
 
+/* The one live irgen context. zan_call2 is a leaf helper 450+ call sites pass
+ * only the builder to, but its wasm32 try lowering needs the context's target
+ * flags and landing-pad stack; main.c drives exactly one irgen per process, so
+ * a file-static set at init/destroy (the pattern class_index_reset already
+ * uses) reaches it without touching every call site. */
+static zan_irgen_t *s_current_irgen = NULL;
+
 /* True when `word` -- a string/object second header word -- belongs to a
  * managed string. Only the high half is the tag: the low half caches the byte
  * length (see ZAN_STRING_TAG in zan_abi.h), so identity is a tag test rather
@@ -657,6 +664,63 @@ static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
          * on an opaque-pointer LLVM the types already match and this is a
          * no-op. */
         fn = LLVMBuildBitCast(b, fn, LLVMPointerType(ty, 0), "callee.fp");
+    }
+    /* wasm32 inside a try body: every call can raise, so it must carry the
+     * unwind edge (invoke) to this try's landing pad -- a plain call that
+     * raises would skip every armed handler. The invoke's "then" block
+     * continues the current block; the value flows to followers unchanged.
+     * The wasm throw intrinsic itself must stay a plain call: it is noreturn
+     * and runs inside the catch pad (a funclet that must not unwind to the
+     * pad's own catchswitch). */
+    if (s_current_irgen && s_current_irgen->target_is_wasm &&
+        s_current_irgen->wasm_try_depth > 0 &&
+        !s_current_irgen->in_wasm_throw_op &&
+        !(fn && LLVMIsAFunction(fn) && fn == s_current_irgen->wasm_eh_state_fn)) {
+        zan_irgen_t *g = s_current_irgen;
+        LLVMBasicBlockRef cur = LLVMGetInsertBlock(b);
+        LLVMValueRef parent = LLVMGetBasicBlockParent(cur);
+        LLVMBasicBlockRef lpad = g->wasm_lpad_stack[g->wasm_try_depth - 1];
+        /* only convert calls of the function that armed this try: helper
+         * functions (the out-of-line __zan_eh_* builders) are emitted with
+         * the builder switched away while a try is open, and an invoke there
+         * would name a landing pad from another function */
+        if (!lpad ||
+            LLVMGetBasicBlockParent(cur) != LLVMGetBasicBlockParent(lpad)) {
+            LLVMValueRef call = LLVMBuildCall2(b, ty, fn, args, n, nm);
+            /* Carry the callee's sub-`int` promotions onto the call site. */
+            if (callee && LLVMIsAFunction(callee)) {
+                static const char *ext[2] = { "signext", "zeroext" };
+                for (int e = 0; e < 2; e++) {
+                    unsigned kind = LLVMGetEnumAttributeKindForName(ext[e], strlen(ext[e]));
+                    if (!kind) continue;
+                    for (unsigned idx = 0; idx <= n; idx++) {
+                        unsigned at = idx == 0 ? (unsigned)LLVMAttributeReturnIndex : idx;
+                        if (!LLVMGetEnumAttributeAtIndex(callee, at, kind)) continue;
+                        LLVMAddCallSiteAttribute(call, at,
+                            LLVMCreateEnumAttribute(LLVMGetTypeContext(ty), kind, 0));
+                    }
+                }
+            }
+            return call;
+        }
+        LLVMBasicBlockRef cont =
+            LLVMAppendBasicBlockInContext(LLVMGetTypeContext(ty), parent, "invoke.cont");
+        LLVMValueRef inv = LLVMBuildInvoke2(b, ty, fn, args, n, cont, lpad, nm);
+        if (callee && LLVMIsAFunction(callee)) {
+            static const char *ext[2] = { "signext", "zeroext" };
+            for (int e = 0; e < 2; e++) {
+                unsigned kind = LLVMGetEnumAttributeKindForName(ext[e], strlen(ext[e]));
+                if (!kind) continue;
+                for (unsigned idx = 0; idx <= n; idx++) {
+                    unsigned at = idx == 0 ? (unsigned)LLVMAttributeReturnIndex : idx;
+                    if (!LLVMGetEnumAttributeAtIndex(callee, at, kind)) continue;
+                    LLVMAddCallSiteAttribute(inv, at,
+                        LLVMCreateEnumAttribute(LLVMGetTypeContext(ty), kind, 0));
+                }
+            }
+        }
+        LLVMPositionBuilderAtEnd(b, cont);
+        return inv;
     }
     LLVMValueRef call = LLVMBuildCall2(b, ty, fn, args, n, nm);
     /* Carry the callee's sub-`int` promotions onto the call site: once the
@@ -1134,6 +1198,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                             bool arc_guard) {
     memset(g, 0, sizeof(*g));
     class_index_reset();
+    s_current_irgen = g;
     g->arena = arena;
     g->diag = diag;
     g->binder = binder;
@@ -1151,6 +1216,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     if (g->target_triple[0]) {
         g->target_is_macos = strstr(g->target_triple, "apple") != NULL
                              || strstr(g->target_triple, "darwin") != NULL;
+        g->target_is_wasm = strstr(g->target_triple, "wasm") != NULL;
     } else {
 #ifdef __APPLE__
         g->target_is_macos = true;
@@ -2319,6 +2385,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
 }
 
 void zan_irgen_destroy(zan_irgen_t *g) {
+    if (s_current_irgen == g) s_current_irgen = NULL;
     free(g->catch_cleanups);
     g->catch_cleanups = NULL;
     g->catch_cleanup_count = g->catch_cleanup_cap = 0;

@@ -82,6 +82,15 @@ static void emit_eh_hook_call(zan_irgen_t *g, const char *name) {
     zan_call2(g->builder, fty, f, NULL, 0, "");
 }
 
+/* wasm32 EH lowering (see irgen_builtins.c): personality, landing pads and
+ * the wasm.throw raise path. */
+static LLVMValueRef get_wasm_throw_fn(zan_irgen_t *g);
+static LLVMValueRef get_wasm_personality_fn(zan_irgen_t *g);
+static void wasm_eh_set_personality(zan_irgen_t *g);
+static void emit_wasm_throw_op(zan_irgen_t *g, LLVMValueRef exc_obj);
+static LLVMBasicBlockRef emit_wasm_lpad(zan_irgen_t *g,
+                                        LLVMBasicBlockRef catch_bb);
+
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals);
 
 /* B5: bind a switch case's pattern variable (`case T x:`) to the discriminant.
@@ -260,8 +269,17 @@ static void emit_eh_propagate_tail(zan_irgen_t *g) {
      * emit_async_exc_epilogue), so the longjmp stays inside this invocation --
      * no cross-frame unwinding here */
     if (g->current_async_frame) emit_async_save_slots(g);
-    emit_eh_longjmp(g, emit_eh_buf_ptr(g, rtop));
-    LLVMBuildUnreachable(g->builder);
+    if (g->target_is_wasm) {
+        /* engine unwinding re-raises toward the enclosing catchswitch */
+        LLVMValueRef wexc = LLVMBuildLoad2(g->builder, i8ptr, exc_g, "wt.exc");
+        wasm_eh_set_personality(g);
+        g->in_wasm_throw_op = true;
+        emit_wasm_throw_op(g, wexc);
+        g->in_wasm_throw_op = false;
+    } else {
+        emit_eh_longjmp(g, emit_eh_buf_ptr(g, rtop));
+        LLVMBuildUnreachable(g->builder);
+    }
     LLVMPositionBuilderAtEnd(g->builder, rdie_bb);
     emit_eh_hook_call(g, "__zan_eh_unhandled");
     LLVMValueRef printf_fn = LLVMGetNamedFunction(g->mod, "printf");
@@ -1953,19 +1971,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         /* try/catch/finally via a per-program setjmp stack: entering a try
          * pushes a jmp_buf, `throw` longjmps to the innermost one with the
          * exception object in a global, catch pops the stack and binds the
-         * exception local. */
-        if (strstr(g->target_triple, "wasm") != NULL) {
-            /* wasm32 has no setjmp/longjmp to build this on: wasi-libc
-             * deliberately ships none, and the SJLJ backend feature is
-             * unfinished upstream (zig's LLVM 20.1.2 crashes on it, LLVM 19
-             * has no flag). Reject at compile time with a precise message
-             * rather than emit an object that only fails at wasm-ld. */
-            zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
-                "try/catch is not supported on the wasm32 target yet: the "
-                "exception path needs setjmp/longjmp, which WASI does not "
-                "provide");
-            break;
-        }
+         * exception local. On wasm32 the engine unwinds instead (LLVM
+         * WebAssembly EH): the handler is a catchswitch and the body's calls
+         * are invokes; the globals keep the same role either way. */
         LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
         LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
         LLVMValueRef top_g, bufs_g, exc_g;
@@ -2052,9 +2060,33 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         }
         LLVMValueRef zero = LLVMConstInt(i32t, 0, 0);
         LLVMValueRef bufp = emit_eh_buf_ptr(g, new_top);
-        LLVMValueRef r = emit_eh_setjmp(g, bufp);
-        LLVMValueRef took = zan_icmp(g->builder, LLVMIntEQ, r, zero, "eh.took");
-        LLVMBuildCondBr(g->builder, took, try_bb, catch_bb);
+        bool wasm_try = g->target_is_wasm;
+        LLVMBasicBlockRef saved_lpad = NULL;
+        int saved_try_depth = 0;
+        if (wasm_try) {
+            /* engine-unwound EH: the catch block is the landing target of a
+             * catchswitch; every call the body emits becomes an invoke whose
+             * unwind edge lands on that pad (zan_call2 consults this stack). */
+            wasm_eh_set_personality(g);
+            saved_lpad = g->wasm_try_depth > 0
+                ? g->wasm_lpad_stack[g->wasm_try_depth - 1] : NULL;
+            (void)saved_lpad;
+            saved_try_depth = g->wasm_try_depth;
+            LLVMBasicBlockRef try_entry_bb = LLVMGetInsertBlock(g->builder);
+            g->wasm_lpad_stack[g->wasm_try_depth] =
+                emit_wasm_lpad(g, catch_bb);
+            g->wasm_try_depth++;
+            /* emit_wasm_lpad leaves the builder at the end of its catchpad
+             * block (terminated by the CatchRet); the try-entry branch into
+             * the body belongs in the block the try started in */
+            LLVMPositionBuilderAtEnd(g->builder, try_entry_bb);
+            LLVMBuildBr(g->builder, try_bb);
+        } else {
+            LLVMValueRef r = emit_eh_setjmp(g, bufp);
+            LLVMValueRef took = zan_icmp(g->builder, LLVMIntEQ, r, zero, "eh.took");
+            LLVMBuildCondBr(g->builder, took, try_bb, catch_bb);
+        }
+        (void)bufp;
 
         LLVMPositionBuilderAtEnd(g->builder, try_bb);
         int try_start = locals->count;
@@ -2090,6 +2122,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         if (fin_idx >= 0) g->finallys[fin_idx].in_try_body = false;
         g->throw_locals_base = saved_throw_base;
         g->throw_catch_base = saved_throw_cbase;
+        if (wasm_try) g->wasm_try_depth = saved_try_depth;
         locals->count = try_start;
         if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
             LLVMValueRef ot = LLVMBuildLoad2(g->builder, i32t, old_top_slot, "eh.old.re");
@@ -2844,12 +2877,31 @@ throw_unwind:
             /* the handler is either a try of this invocation or this
              * invocation's trampoline, so keep the frame authoritative and
              * longjmp without touching the frames that await us */
-            if (g->current_async_frame)
+            if (g->current_async_frame) {
                 emit_async_save_slots(g);
-            else
+                if (g->target_is_wasm) {
+                    LLVMValueRef wexc = LLVMBuildLoad2(g->builder, i8ptr,
+                        exc_g, "wt.exc");
+                    wasm_eh_set_personality(g);
+                    g->in_wasm_throw_op = true;
+                    emit_wasm_throw_op(g, wexc);
+                    g->in_wasm_throw_op = false;
+                } else {
+                    emit_eh_longjmp(g, emit_eh_buf_ptr(g, top));
+                    LLVMBuildUnreachable(g->builder);
+                }
+            } else if (g->target_is_wasm) {
                 emit_eh_unwind_to_handler(g, top);
-            emit_eh_longjmp(g, emit_eh_buf_ptr(g, top));
-            LLVMBuildUnreachable(g->builder);
+                LLVMValueRef wexc = LLVMBuildLoad2(g->builder, i8ptr,
+                    exc_g, "wt.exc");
+                g->in_wasm_throw_op = true;
+                emit_wasm_throw_op(g, wexc);
+                g->in_wasm_throw_op = false;
+            } else {
+                emit_eh_unwind_to_handler(g, top);
+                emit_eh_longjmp(g, emit_eh_buf_ptr(g, top));
+                LLVMBuildUnreachable(g->builder);
+            }
             LLVMPositionBuilderAtEnd(g->builder, die_bb);
             emit_eh_hook_call(g, "__zan_eh_unhandled");
             LLVMValueRef printf_fn = LLVMGetNamedFunction(g->mod, "printf");

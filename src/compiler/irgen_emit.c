@@ -2776,7 +2776,13 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
      * doubles into FP registers). */
     const char *tm_cpu = "generic";
     const char *tm_features = "";
-    if (strncmp(triple, "riscv64", 7) == 0) {
+    if (strncmp(triple, "wasm", 4) == 0) {
+        /* WebAssembly EH: try/throw lower onto the exception-handling
+         * proposal; reference-types is a prerequisite of the backend's EH
+         * pipeline. Codegen also needs the --wasm-enable-eh option flag,
+         * parsed once in main() (LLVMParseCommandLineOptions). */
+        tm_features = "+exception-handling,+reference-types";
+    } else if (strncmp(triple, "riscv64", 7) == 0) {
         tm_cpu = "generic-rv64";
         tm_features = "+m,+a,+f,+d,+c";
         LLVMAddModuleFlag(g->mod, LLVMModuleFlagBehaviorError,

@@ -1255,6 +1255,22 @@ foreach(_src ${_conf_srcs})
     RESOURCE_LOCK src_${_name} TIMEOUT 120)
 endforeach()
 
+# ---- wasm32 try/catch: cross-compile to a linked module --------------------
+# try/catch on wasm32 lowers to WebAssembly exception handling (catchswitch /
+# invoke / __cxa_throw + zanrt_ehtag.o). The suite cannot RUN a wasm module, so
+# this case compiles AND links the program with --target wasm32 and asserts
+# zanc succeeds; runtime semantics are covered by conformance_try_catch running
+# natively (identical lowering contract, different unwind engine). Guarded on
+# the sysroot being present (fresh clones ship it under toolchain/wasm32).
+if(EXISTS "${CMAKE_SOURCE_DIR}/toolchain/wasm32/libc.a"
+   AND EXISTS "${CMAKE_SOURCE_DIR}/toolchain/wasm32/crt1.o")
+  add_test(NAME conformance_try_catch_wasm32
+    COMMAND $<TARGET_FILE:zanc> --auto-stdlib --target wasm32
+            -o ${CMAKE_BINARY_DIR}/conf_try_catch_wasm32.wasm
+            ${CMAKE_SOURCE_DIR}/tests/conformance/try_catch.zan)
+  set_tests_properties(conformance_try_catch_wasm32 PROPERTIES TIMEOUT 120)
+endif()
+
 # ---- Determinism: codegen must be a pure function of the source ----
 # Compiling the same program twice must yield byte-identical LLVM IR
 # (reproducible-build / correctness net).

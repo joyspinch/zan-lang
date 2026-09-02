@@ -49,6 +49,13 @@ rem rejects those programs before the object would be needed (see main.c's
 rem wasm_obj_refs_any gates). zanrt_wasm.o holds the libc ABI adapters
 rem (rt_wasm.c) and is compiled by clang from the same sysroot; the file/timer
 rem objects here are what every program links unconditionally.
+rem zanrt_ehtag.o is NOT built here: it needs mozbuild clang's wasm EH backend
+rem (zig's clang fails the same compile). Recipe:
+rem   <mozbuild>\clang\bin\clang.exe --target=wasm32-unknown-wasi ^
+rem     -fexceptions -mllvm -wasm-enable-eh -O2 -c ^
+rem     toolchain\wasm32\zanrt_ehtag.c -o toolchain\wasm32\zanrt_ehtag.o
+rem It defines the __cpp_exception tag and __cxa_throw for try/catch programs
+rem (main.c links it only when wasm_eh_used).
 if not exist toolchain\wasm32 mkdir toolchain\wasm32
 "%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -O2 -c %RT%\rt_file.c  -o toolchain\wasm32\zanrt_file.o  || exit /b 1
 "%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\wasm32\zanrt_timer.o || exit /b 1

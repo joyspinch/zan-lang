@@ -10,6 +10,7 @@
 #include <string.h>
 #include <llvm-c/Core.h>
 #include <llvm-c/DebugInfo.h>
+#include <llvm-c/Support.h>
 #include <llvm-c/Target.h>
 #include <llvm-c/TargetMachine.h>
 
@@ -249,6 +250,22 @@ struct zan_irgen {
     int eh_armed_base;
     /* entries armed inside the innermost loop: break/continue leave only those */
     int eh_armed_loop_base;
+
+    /* wasm32 try lowering (LLVM WebAssembly EH): the engine unwinds instead
+     * of longjmp, so every call emitted inside a try body must be an invoke
+     * whose unwind edge lands on this try's landing-pad block. Innermost
+     * last, parallel to eh_armed's nesting; zan_call2 consults the top. */
+    LLVMBasicBlockRef wasm_lpad_stack[ZAN_MAX_ARMED_TRY];
+    int wasm_try_depth;
+    bool in_wasm_throw_op; /* inside the wasm throw emission: keep its calls
+                            * plain (a funclet must not unwind to itself) */
+    /* cached per-module declarations (irgen_builtins.c) */
+    LLVMValueRef wasm_eh_throw_fn;      /* void @__cxa_throw(ptr,ptr,ptr) */
+    LLVMValueRef wasm_eh_throw_intrinsic_fn; /* @llvm.wasm.throw(i32, i8*) */
+    LLVMValueRef wasm_eh_personality_fn;/* i32 @__gxx_wasm_personality_v0(...) */
+    bool wasm_eh_used;                  /* program uses try or throw at all */
+    LLVMValueRef wasm_eh_state_fn;      /* __zan_eh_state_fast: never raises,
+                                         * stays a plain call even in try bodies */
 
     /* constructors */
     struct zan_ctor_entry {
@@ -665,6 +682,8 @@ struct zan_irgen {
     bool target_is_macos;     /* true when emitting for Darwin: libSystem exports
                                * the stdio streams as __std{in,out,err}p, not as
                                * the ELF libc `stdin`/`stdout`/`stderr` globals */
+    bool target_is_wasm;      /* true for wasm32: EH lowers to WebAssembly
+                               * exception handling instead of setjmp/longjmp */
     bool mt_scheduler;        /* --async-workers: skip the inline single-thread
                                * coroutine driver and link the multi-worker one
                                * from the zanrt_io_mt reactor object instead. */

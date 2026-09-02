@@ -57,6 +57,11 @@ ARTIFACTS = [
     ("toolchain/wasm32/zanrt_wasm.o", RT_WASM, "runtime"),
     ("toolchain/wasm32/zanrt_file.o", RT_FILE, "runtime"),
     ("toolchain/wasm32/zanrt_timer.o", RT_TIMER, "runtime"),
+    # Built with mozbuild clang -fexceptions -mllvm -wasm-enable-eh (zig's
+    # clang cannot emit the tag); source lives beside the object. The commit
+    # below it keeps the artifact fresh by hand -- see build_cross_rt.cmd.
+    ("toolchain/wasm32/zanrt_ehtag.o",
+     ["toolchain/wasm32/zanrt_ehtag.c"], "manual"),
     ("stdlib/Gui/drivers/win-x64/zan_gui.dll", GUI, "gui"),
     ("stdlib/Gui/drivers/linux-x64/static/libzan_gui.a", GUI, "gui"),
     ("stdlib/Gui/drivers/linux-arm64/static/libzan_gui.a", GUI, "gui"),

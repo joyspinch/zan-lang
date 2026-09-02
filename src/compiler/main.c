@@ -1703,6 +1703,14 @@ int main(int argc, char **argv) {
     char **utf8_argv = zan_utf8_command_line_argv(&argc);
     if (utf8_argv) argv = utf8_argv;
 #endif
+    {
+        /* WebAssembly EH codegen is gated on an LLVM cl::opt, not a target
+         * feature alone: without it the wasm backend silently drops (or
+         * crashes on) catchswitch IR. Parsed before any TargetMachine is
+         * created; harmless for every other target. */
+        const char *cl[] = { "zanc", "--wasm-enable-eh", NULL };
+        LLVMParseCommandLineOptions(2, cl, "");
+    }
     expand_arg_files(&argc, &argv);
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-v") == 0) {
@@ -4114,10 +4122,21 @@ int main(int argc, char **argv) {
              * so the link needs this archive on the command line too. */
             { size_t cur = strlen(cmd);
               snprintf(cmd + cur, sizeof(cmd) - cur,
-                       " \"%s/zanrt_timer.o\" \"%s/zanrt_wasm.o\""
+                       " \"%s/zanrt_timer.o\" \"%s/zanrt_wasm.o\"",
+                       sys, sys); }
+            if (irgen.wasm_eh_used) {
+                /* try/throw programs raise the C++ exception tag (throw 0):
+                 * zanrt_ehtag.o defines that tag symbol, which the backend
+                 * only declares as an undefined import of its own. */
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zanrt_ehtag.o\"",
+                         sys);
+            }
+            { size_t cur = strlen(cmd);
+              snprintf(cmd + cur, sizeof(cmd) - cur,
                        " \"%s/libc.a\" \"%s/libm.a\" \"%s/libzigc.a\""
                        " \"%s/libclang_rt.builtins-wasm32.a\"",
-                       sys, sys, sys, sys, sys, sys); }
+                       sys, sys, sys, sys); }
             link_ret = system(cmd);
         } else if (cross_compiling && target.os == ZAN_OS_MACOS) {
             /* Cross-link a Mach-O executable with ld64.lld against the

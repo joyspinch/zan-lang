@@ -1189,6 +1189,12 @@ static void emit_eh_tab_grow(zan_irgen_t *g, LLVMTypeRef state_ty,
 
 static LLVMValueRef get_eh_state_fn(zan_irgen_t *g);
 static LLVMValueRef get_eh_state_fast_fn(zan_irgen_t *g);
+/* Remembered in the irgen context so zan_call2's wasm32 invoke conversion can
+ * keep the state accessor a plain call: it never raises (pure runtime read of
+ * the thread slot), and as an invoke it would split whatever block the EH
+ * helpers re-enter (the function entry) mid-emission, stranding the field
+ * GEPs that follow against the new terminator. */
+static void wasm_note_state_fn(zan_irgen_t *g, LLVMValueRef state_fn);
 
 /* Position the builder in the current function's entry block, where the EH
  * state pointer and its field addresses are materialized (see irgen.h). */
@@ -1212,6 +1218,7 @@ static LLVMValueRef emit_eh_state(zan_irgen_t *g) {
         return g->eh_state_cached;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMValueRef state_fn = get_eh_state_fast_fn(g);
+    wasm_note_state_fn(g, state_fn);
     eh_enter_entry_block(g);
     LLVMValueRef p = zan_call2(g->builder, LLVMFunctionType(i8ptr, NULL, 0, 0),
         state_fn, NULL, 0, "eh.st");
@@ -1804,6 +1811,141 @@ static void emit_eh_longjmp(zan_irgen_t *g, LLVMValueRef bufp) {
     LLVMValueRef call = zan_call2(g->builder, ty, fn,
         (LLVMValueRef[]){ bufp, LLVMConstInt(i32t, 1, 0) }, 2, "");
     add_enum_attr(g, fn, call, "noreturn");
+}
+
+/* ---- WebAssembly EH (wasm32 target) ---------------------------------------
+ * wasi-libc ships no setjmp/longjmp, so the wasm32 target lowers try/catch
+ * onto the WebAssembly exception-handling proposal instead: `try` becomes a
+ * catchswitch whose unwind edges are the invokes zan_call2 emits inside the
+ * body, `throw` becomes the `wasm.throw` intrinsic with the C++ exception
+ * tag (the tag object itself is toolchain/wasm32/zanrt_ehtag.o, linked on
+ * demand). The engine unwinds, so the __zan_eh_* globals keep exactly the
+ * role they have in the longjmp lowering: in-flight object, owned flag and
+ * type descriptor for catch dispatch, armed-handler stack for cleanup. */
+
+/* void @llvm.wasm.throw(i32 tag, i8* payload), noreturn: the raise used where
+ * no same-function pad exists (a throw escaping this frame). The engine
+ * unwinds to the caller's region; no link-time symbol is involved. */
+static LLVMValueRef get_wasm_throw_intrinsic_fn(zan_irgen_t *g) {
+    if (g->wasm_eh_throw_intrinsic_fn)
+        return g->wasm_eh_throw_intrinsic_fn;
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+        (LLVMTypeRef[]){ i32t, i8ptr }, 2, 0);
+    LLVMValueRef fn = LLVMAddFunction(g->mod, "llvm.wasm.throw", ty);
+    add_enum_attr(g, fn, NULL, "noreturn");
+    g->wasm_eh_throw_intrinsic_fn = fn;
+    g->wasm_eh_used = true;
+    return fn;
+}
+
+/* void @__cxa_throw(ptr obj, ptr tinfo, ptr dtor), noreturn: the raise call
+ * WasmEHPrepare recognizes. Clang emits the same invoke for a C++ throw; the
+ * wasm backend rewrites it into the `throw` instruction (tag __cpp_exception,
+ * defined by toolchain/wasm32/zanrt_ehtag.o) and drops the symbol. */
+static LLVMValueRef get_wasm_cxa_throw_fn(zan_irgen_t *g) {
+    if (g->wasm_eh_throw_fn) return g->wasm_eh_throw_fn;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+        (LLVMTypeRef[]){ i8ptr, i8ptr, i8ptr }, 3, 0);
+    LLVMValueRef fn = LLVMAddFunction(g->mod, "__cxa_throw", ty);
+    add_enum_attr(g, fn, NULL, "noreturn");
+    g->wasm_eh_throw_fn = fn;
+    g->wasm_eh_used = true;
+    return fn;
+}
+
+/* i32 @__gxx_wasm_personality_v0(...): the name the WebAssembly backend
+ * requires on every function carrying EH IR. No libcxxabi is linked -- Zan
+ * dispatches clauses on its own globals, the personality is a marker. */
+static LLVMValueRef get_wasm_personality_fn(zan_irgen_t *g) {
+    if (g->wasm_eh_personality_fn) return g->wasm_eh_personality_fn;
+    LLVMTypeRef ty = LLVMFunctionType(LLVMInt32TypeInContext(g->ctx), NULL, 0, 1);
+    LLVMValueRef fn = LLVMAddFunction(g->mod, "__gxx_wasm_personality_v0", ty);
+    g->wasm_eh_personality_fn = fn;
+    g->wasm_eh_used = true;
+    return fn;
+}
+
+/* Attach the wasm personality to the function being emitted. Called when a
+ * try is lowered (catchswitch requires it) so lambdas and async $resume
+ * bodies pick it up through the same path. */
+static void wasm_eh_set_personality(zan_irgen_t *g) {
+    if (!g->target_is_wasm || !g->current_fn) return;
+    LLVMSetPersonalityFn(g->current_fn, get_wasm_personality_fn(g));
+}
+
+static void wasm_note_state_fn(zan_irgen_t *g, LLVMValueRef state_fn) {
+    if (g->target_is_wasm) g->wasm_eh_state_fn = state_fn;
+}
+
+/* Raising the exception: the throw-site releases have already run, the
+ * in-flight globals are stored. wasm.throw never returns; the engine unwinds
+ * to the innermost enclosing try (of this frame or a caller's). */
+static void emit_wasm_throw_op(zan_irgen_t *g, LLVMValueRef exc_obj) {
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef fn = get_wasm_cxa_throw_fn(g);
+    if (LLVMGetTypeKind(LLVMTypeOf(exc_obj)) == LLVMPointerTypeKind &&
+        LLVMTypeOf(exc_obj) != i8ptr)
+        exc_obj = LLVMBuildBitCast(g->builder, exc_obj, i8ptr, "wt.exc");
+    /* The raise is an invoke of __cxa_throw to the current try's pad -- the
+     * exact shape WasmEHPrepare rewrites into the `throw` instruction. wasm
+     * EH ties a block to its enclosing handler only through unwind edges, so
+     * a plain raise call inside the same function would never reach the
+     * catchswitch. Inside a catchpad funclet (rethrow) the current pad comes
+     * from a different function's stack or is absent, so fall back to a
+     * plain call there; the funclet's own catchswitch covers it. */
+    LLVMBasicBlockRef cur = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef lpad = g->wasm_try_depth > 0
+        ? g->wasm_lpad_stack[g->wasm_try_depth - 1] : NULL;
+    if (lpad &&
+        LLVMGetBasicBlockParent(lpad) == LLVMGetBasicBlockParent(cur) &&
+        !LLVMGetBasicBlockTerminator(cur)) {
+        LLVMBasicBlockRef cont = LLVMAppendBasicBlockInContext(g->ctx,
+            LLVMGetBasicBlockParent(cur), "wt.cont");
+        LLVMBuildInvoke2(g->builder, LLVMGlobalGetValueType(fn), fn,
+            (LLVMValueRef[]){ exc_obj, LLVMConstNull(i8ptr),
+                              LLVMConstNull(i8ptr) }, 3, cont, lpad, "");
+        LLVMPositionBuilderAtEnd(g->builder, cont);
+        LLVMBuildUnreachable(g->builder);
+        return;
+    }
+    /* No same-function pad: the throw escapes this frame and the engine
+     * unwinds into the caller's region. The intrinsic's plain call lowers
+     * straight to the `throw` opcode (__cxa_throw would never be rewritten
+     * out here and would fail to link). */
+    LLVMValueRef inl = get_wasm_throw_intrinsic_fn(g);
+    LLVMBuildCall2(g->builder,
+        LLVMGlobalGetValueType(inl), inl,
+        (LLVMValueRef[]){ LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0),
+                          exc_obj }, 2, "");
+    LLVMBuildUnreachable(g->builder);
+}
+
+/* The landing pad of one armed try: catchswitch (unwinds to the caller, i.e.
+ * the enclosing invoke) with a single catch_all handler; the catchpad ends
+ * in a CatchRet that resumes normal control flow in the try's catch block,
+ * where the longjmp lowering's catch code takes over. The pad block itself
+ * carries no payload handling: Zan reads the exception from its globals. */
+static LLVMBasicBlockRef emit_wasm_lpad(zan_irgen_t *g,
+                                        LLVMBasicBlockRef catch_bb) {
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+    LLVMBasicBlockRef lpad_bb =
+        LLVMAppendBasicBlockInContext(g->ctx, fn, "wtry.lpad");
+    LLVMBasicBlockRef pad_bb =
+        LLVMAppendBasicBlockInContext(g->ctx, fn, "wtry.pad");
+    LLVMValueRef pers = get_wasm_personality_fn(g);
+    LLVMPositionBuilderAtEnd(g->builder, lpad_bb);
+    LLVMValueRef cs = LLVMBuildCatchSwitch(g->builder, NULL, NULL, 1, "wtry.cs");
+    LLVMAddHandler(cs, pad_bb);
+    LLVMPositionBuilderAtEnd(g->builder, pad_bb);
+    LLVMValueRef cpa[1] = { LLVMConstNull(i8ptr) }; /* catch-all */
+    LLVMValueRef cp = LLVMBuildCatchPad(g->builder, cs, cpa, 1, "wtry.cp");
+    LLVMBuildCatchRet(g->builder, cp, catch_bb);
+    (void)pers;
+    return lpad_bb;
 }
 
 /* ---- EH-owned temporaries -------------------------------------------------
