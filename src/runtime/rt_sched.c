@@ -54,10 +54,16 @@ struct zan_task {
 
 /* ---- timers ---- */
 
+/* Timers live in a binary min-heap ordered by due_ms (array of structs, no
+ * per-timer allocation). The scheduler calls timers_process() on EVERY loop
+ * iteration -- including iterations that only switch coroutines -- so the
+ * pending set must be inspectable in O(1); the old unordered head-inserted
+ * linked list paid a full O(n) walk plus a clock read per iteration, which
+ * degraded to O(n^2) across a scheduling run with many timers. */
+
 typedef struct zan_timer {
-    int64_t           due_ms;
-    zan_task_t       *task;
-    struct zan_timer *next;
+    int64_t     due_ms;
+    zan_task_t *task;
 } zan_timer_t;
 
 /* ---- global scheduler state ---- */
@@ -66,7 +72,9 @@ static void        *g_sched_fiber;
 static zan_co_t    *g_current;
 static zan_co_t    *g_ready_head;
 static zan_co_t    *g_ready_tail;
-static zan_timer_t *g_timers;
+static zan_timer_t *g_timers;      /* min-heap by due_ms; NULL when empty */
+static size_t       g_timer_n;
+static size_t       g_timer_cap;
 static zan_task_t  *g_all_tasks;
 static int          g_live;
 
@@ -271,31 +279,56 @@ size_t zan_task_live(void) {
 /* ================= timers ================= */
 
 static void timer_add(zan_task_t *t, int64_t delay_ms) {
-    zan_timer_t *tm = (zan_timer_t *)calloc(1, sizeof(*tm));
-    if (!tm) abort();                 /* OOM: fail fast, like the rest of rt_* */
-    tm->due_ms = plat_now_ms() + (delay_ms < 0 ? 0 : delay_ms);
-    tm->task = t;
-    tm->next = g_timers;
-    g_timers = tm;
+    if (g_timer_n == g_timer_cap) {
+        size_t nc = g_timer_cap ? g_timer_cap * 2 : 64;
+        zan_timer_t *nt = (zan_timer_t *)realloc(g_timers, nc * sizeof(*nt));
+        if (!nt) abort();             /* OOM: fail fast, like the rest of rt_* */
+        g_timers = nt;
+        g_timer_cap = nc;
+    }
+    /* Insert at the end, then sift up toward the root. */
+    size_t i = g_timer_n++;
+    g_timers[i].due_ms = plat_now_ms() + (delay_ms < 0 ? 0 : delay_ms);
+    g_timers[i].task = t;
+    while (i > 0) {
+        size_t p = (i - 1) / 2;
+        if (g_timers[p].due_ms <= g_timers[i].due_ms) break;
+        zan_timer_t tmp = g_timers[p];
+        g_timers[p] = g_timers[i];
+        g_timers[i] = tmp;
+        i = p;
+    }
+}
+
+static void timer_pop_root(void) {
+    /* Move the last entry over the root, then sift it down. */
+    g_timers[0] = g_timers[--g_timer_n];
+    size_t i = 0;
+    for (;;) {
+        size_t l = 2 * i + 1, r = l + 1, m = i;
+        if (l < g_timer_n && g_timers[l].due_ms < g_timers[m].due_ms) m = l;
+        if (r < g_timer_n && g_timers[r].due_ms < g_timers[m].due_ms) m = r;
+        if (m == i) break;
+        zan_timer_t tmp = g_timers[m];
+        g_timers[m] = g_timers[i];
+        g_timers[i] = tmp;
+        i = m;
+    }
 }
 
 static int64_t timers_process(void) {
     int64_t now = plat_now_ms();
-    zan_timer_t **pp = &g_timers;
-    int64_t nearest = -1;
-    while (*pp) {
-        zan_timer_t *tm = *pp;
-        if (tm->due_ms <= now) {
-            complete_task(tm->task, 0);
-            *pp = tm->next;
-            free(tm);
-        } else {
-            int64_t d = tm->due_ms - now;
-            if (nearest < 0 || d < nearest) nearest = d;
-            pp = &tm->next;
-        }
+    /* Complete every due timer. complete_task only parks waiters onto the
+     * ready queue -- it never creates timers and no coroutine runs here, so
+     * the heap cannot change underneath the loop. */
+    while (g_timer_n > 0 && g_timers[0].due_ms <= now) {
+        zan_task_t *task = g_timers[0].task;
+        timer_pop_root();
+        complete_task(task, 0);
     }
-    return nearest;
+    /* The root is now the nearest deadline; report its delay, or -1 when no
+     * timer is pending (the caller treats that as "wait indefinitely"). */
+    return g_timer_n > 0 ? g_timers[0].due_ms - now : -1;
 }
 
 /* ================= coroutine trampoline ================= */
@@ -396,6 +429,8 @@ void zan_sched_init(void) {
     g_current = NULL;
     g_ready_head = g_ready_tail = NULL;
     g_timers = NULL;
+    g_timer_n = 0;
+    g_timer_cap = 0;
     g_all_tasks = NULL;
     g_live = 0;
     plat_sched_enter();
@@ -463,6 +498,10 @@ void zan_sched_shutdown(void) {
     zan_task_t *t = g_all_tasks;
     while (t) { zan_task_t *n = t->all_next; free(t); t = n; }
     g_all_tasks = NULL;
-    while (g_timers) { zan_timer_t *n = g_timers->next; free(g_timers); g_timers = n; }
+    /* The heap owns its entries inline; freeing the array releases all of
+     * them. Tasks themselves stay in g_all_tasks (already freed above). */
+    free(g_timers);
+    g_timers = NULL;
+    g_timer_n = g_timer_cap = 0;
     plat_sched_leave();
 }
