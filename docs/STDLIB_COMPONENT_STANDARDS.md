@@ -75,9 +75,11 @@
    - 不得作为 Widget 公开绑定 API 的参数/字段对外提供；
    - 变更检测统一走 immediate-mode 帧轮询（`Version()` / 值比对），
      **禁止事件式变更通知**（`Signal.Changed`/`ChangeTracker` 已删除：全仓零订阅的死器官）。
-3. **同步契约**：双向绑定控件实现 `SyncBinding()`（model→UI 拉取），在渲染路径
-   （OnPaint/Render 开头）调用；UI→model 回写统一在编辑汇聚点（如 `Edited()`）
-   调用 `data.Set(...)`。冲突解法（谁是真相）必须在控件头注释写明。
+3. **同步契约**：双向绑定控件 `override` 基类的 `SyncBinding()`（model→UI 拉取），
+   **由 `Control.RenderTree` 在每帧 OnPaint 前统一驱动**，控件无需在 OnPaint
+   开头自调（存量控件的历史自调幂等无害，随命名收敛逐步清理）；UI→model
+   回写统一在编辑汇聚点（如 `Edited()`）调用 `data.Set(...)`。
+   冲突解法（谁是真相）必须在控件头注释写明。
 4. **命名表**：同一语义角色全库同名——主值绑定 `data`；尺寸档 `Binding<string> Size`
    （`"small"`/`"medium"`/`"large"`）；标签/文案 `text`。禁止大小写漂移
    （`Value`/`value`/`data` 混指一物属违规）。
