@@ -773,21 +773,130 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
 
 /* ---- string literal ---- */
 
-static char lexer_escape_char(zan_lexer_t *lex) {
+/* Unicode escape state shared by the string/char/interpolation paths. A \u
+ * or \x sequence encodes one code point, which may be up to 4 UTF-8 bytes --
+ * wider than the single char the escape table returns, so emitters append
+ * through this small out-param struct instead of the bare char. */
+typedef struct {
+    char bytes[4];
+    int len;
+} zan_esc_out_t;
+
+/* Decode one UTF-8 code point into out->bytes and return its length
+ * (0 means the caller should fall back to the literal char). */
+static int zan_utf8_encode(uint32_t cp, zan_esc_out_t *out) {
+    if (cp < 0x80) {
+        out->bytes[0] = (char)cp;
+        return 1;
+    }
+    if (cp < 0x800) {
+        out->bytes[0] = (char)(0xC0 | (cp >> 6));
+        out->bytes[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        out->bytes[0] = (char)(0xE0 | (cp >> 12));
+        out->bytes[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out->bytes[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    out->bytes[0] = (char)(0xF0 | (cp >> 18));
+    out->bytes[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    out->bytes[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    out->bytes[3] = (char)(0x80 | (cp & 0x3F));
+    return 4;
+}
+
+/* Read `ndigits` hex characters after the escape letter. `count` is the
+ * required digit count for \u (C# fixed width); \x is C#-style 1..4
+ * variable width -- it stops at the first non-hex char. Returns -1 after
+ * emitting a diagnostic when the digits are missing/invalid. */
+static int32_t lexer_hex_escape(zan_lexer_t *lex, zan_loc_t loc, char kind,
+                                int ndigits) {
+    uint32_t val = 0;
+    int got = 0;
+    if (kind == 'x') {
+        /* \x: 1..4 hex digits, greedy stop (C# spec) */
+        while (got < 4) {
+            char ch = lexer_peek_ch(lex);
+            if (!isxdigit((unsigned char)ch)) break;
+            lexer_advance(lex);
+            int d = (ch <= '9') ? ch - '0'
+                  : (ch <= 'F') ? ch - 'A' + 10 : ch - 'a' + 10;
+            val = val * 16 + (uint32_t)d;
+            got++;
+        }
+        if (got == 0) {
+            zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                          "'\\x' escape requires at least one hex digit");
+            return -1;
+        }
+    } else {
+        /* \u: exactly 4 hex digits (C# fixed width) */
+        for (int i = 0; i < ndigits; i++) {
+            char ch = lexer_peek_ch(lex);
+            if (!isxdigit((unsigned char)ch)) {
+                zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                              "'\\u' escape requires %d hex digits", ndigits);
+                return -1;
+            }
+            lexer_advance(lex);
+            int d = (ch <= '9') ? ch - '0'
+                  : (ch <= 'F') ? ch - 'A' + 10 : ch - 'a' + 10;
+            val = val * 16 + (uint32_t)d;
+        }
+    }
+    /* Surrogate halves are not standalone code points in UTF-8; C# would
+     * produce the raw value, but here they would corrupt the encoding. */
+    if (val >= 0xD800 && val <= 0xDFFF) {
+        zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                      "'\\%c' escape value 0x%X is a surrogate code point",
+                      kind, val);
+        return -1;
+    }
+    return (int32_t)val;
+}
+
+/* Decode the escape sequence that follows a backslash into `out`. Returns
+ * the byte count written (1 for the classic single-char escapes, up to 4
+ * for \u/\x code points). The char-only callers (lexer_char) use only the
+ * first byte, which keeps single-byte code points identical to before. */
+static int lexer_escape_seq(zan_lexer_t *lex, zan_loc_t loc, zan_esc_out_t *out) {
     char ch = lexer_advance(lex);
     switch (ch) {
-    case 'n': return '\n';
-    case 'r': return '\r';
-    case 't': return '\t';
-    case '\\': return '\\';
-    case '"': return '"';
-    case '\'': return '\'';
-    case '0': return '\0';
-    default:
-        zan_diag_emit(lex->diag, DIAG_ERROR, lexer_loc(lex),
-                      "invalid escape sequence '\\%c'", ch);
-        return ch;
+    case 'n': out->bytes[0] = '\n'; return 1;
+    case 'r': out->bytes[0] = '\r'; return 1;
+    case 't': out->bytes[0] = '\t'; return 1;
+    case '\\': out->bytes[0] = '\\'; return 1;
+    case '"': out->bytes[0] = '"'; return 1;
+    case '\'': out->bytes[0] = '\''; return 1;
+    case '0': out->bytes[0] = '\0'; return 1;
+    case 'x': {
+        int32_t cp = lexer_hex_escape(lex, loc, 'x', 4);
+        if (cp < 0) { out->bytes[0] = 'x'; return 1; }
+        return zan_utf8_encode((uint32_t)cp, out);
     }
+    case 'u': {
+        int32_t cp = lexer_hex_escape(lex, loc, 'u', 4);
+        if (cp < 0) { out->bytes[0] = 'u'; return 1; }
+        return zan_utf8_encode((uint32_t)cp, out);
+    }
+    default:
+        zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                      "invalid escape sequence '\\%c'", ch);
+        out->bytes[0] = ch;
+        return 1;
+    }
+}
+
+/* Single-byte flavour for the char literal path: a char literal holds one
+ * byte, so \u/\x code points beyond 0xFF keep their low byte (matching the
+ * 8-bit char model documented in SPEC.md). */
+static char lexer_escape_char(zan_lexer_t *lex) {
+    zan_esc_out_t out;
+    int n = lexer_escape_seq(lex, lexer_loc(lex), &out);
+    return out.bytes[0]; /* n unused: char literal stores one byte */
+    (void)n;
 }
 
 static zan_token_t lexer_string(zan_lexer_t *lex) {
@@ -802,15 +911,18 @@ static zan_token_t lexer_string(zan_lexer_t *lex) {
     while (!lexer_at_end(lex) && lexer_peek_ch(lex) != '"') {
         if (lexer_peek_ch(lex) == '\\') {
             lexer_advance(lex); /* \ */
-            /* Always run the escape through lexer_escape_char, even when the
-             * buffer is full: it consumes the escaped character, so skipping
-             * it on truncation would let a `\"` be re-read as the closing
+            /* Always run the escape through the decoder, even when the
+             * buffer is full: it consumes the escaped characters, so skipping
+             * them on truncation would let a `\"` be re-read as the closing
              * quote and desynchronize the lexer for the rest of the file. */
-            char esc = lexer_escape_char(lex);
-            if (bi < sizeof(buf) - 1) {
-                buf[bi++] = esc;
-            } else {
-                truncated = true;
+            zan_esc_out_t esc;
+            int en = lexer_escape_seq(lex, loc, &esc);
+            for (int i = 0; i < en; i++) {
+                if (bi < sizeof(buf) - 1) {
+                    buf[bi++] = esc.bytes[i];
+                } else {
+                    truncated = true;
+                }
             }
         } else if (lexer_peek_ch(lex) == '\n') {
             zan_diag_emit(lex->diag, DIAG_ERROR, loc, "unterminated string literal");
@@ -888,14 +1000,17 @@ static zan_token_t lexer_interp_string_segment(zan_lexer_t *lex, zan_token_kind_
     while (!lexer_at_end(lex) && lexer_peek_ch(lex) != '"' && lexer_peek_ch(lex) != '{') {
         if (lexer_peek_ch(lex) == '\\') {
             lexer_advance(lex); /* \ */
-            /* Same desync guard as lexer_string: the escaped character must
+            /* Same desync guard as lexer_string: the escaped characters must
              * be consumed even when the buffer is full, or a truncated `\"`
              * ends the segment early and everything after is mistokenized. */
-            char esc = lexer_escape_char(lex);
-            if (bi < sizeof(buf) - 1) {
-                buf[bi++] = esc;
-            } else {
-                truncated = true;
+            zan_esc_out_t esc;
+            int en = lexer_escape_seq(lex, loc, &esc);
+            for (int i = 0; i < en; i++) {
+                if (bi < sizeof(buf) - 1) {
+                    buf[bi++] = esc.bytes[i];
+                } else {
+                    truncated = true;
+                }
             }
         } else if (lexer_peek_ch(lex) == '\n') {
             zan_diag_emit(lex->diag, DIAG_ERROR, loc, "unterminated interpolated string");
