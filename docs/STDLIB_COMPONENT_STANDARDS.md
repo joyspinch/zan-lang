@@ -60,7 +60,33 @@
 4. 修 bug 必须补 `tests/` 用例；新组件必须带 conformance 测试。
 5. 禁止"文档先行但无实现"的空壳类（现存空壳要么补齐要么删除）。
 
-## 6. 现存违规清单（改造 backlog）
+## 6. 数据绑定（Gui 组件契约）
+
+> 背景：审查发现 `Binding<T>`（System）与 `Signal*`（Gui/Reactive）两套机制在
+> Widget 中混用（56 个 Widget 中 18 个双通道并存，Switch 同挂四条通道）。
+> 本节为收敛契约，2026-09 起新代码必须遵守，存量逐步收敛。
+
+1. **外部数据绑定的唯一协议是 `Binding<T>`**（`stdlib/System/Binding.zan`）：
+   - 组件作者把可绑定属性声明为 `Binding<T>` 字段：主值命名 `data`，辅值 `dataXxx`；
+   - 使用方 `control.data = model.field;`（实时）或 `= 常量`（常量绑定），不感知机制；
+   - 禁止为同一控件再发明第二条同语义通道（历史双通道如 Switch 的
+     `model`/`data`/`value`/`valSignal` 逐步收敛为 `data` + 显式映射参数）。
+2. **`Signal*` 是控件内部状态缓冲**（编辑缓冲、滚动位置、级联选择等），不是绑定协议：
+   - 不得作为 Widget 公开绑定 API 的参数/字段对外提供；
+   - 变更检测统一走 immediate-mode 帧轮询（`Version()` / 值比对），
+     **禁止事件式变更通知**（`Signal.Changed`/`ChangeTracker` 已删除：全仓零订阅的死器官）。
+3. **同步契约**：双向绑定控件实现 `SyncBinding()`（model→UI 拉取），在渲染路径
+   （OnPaint/Render 开头）调用；UI→model 回写统一在编辑汇聚点（如 `Edited()`）
+   调用 `data.Set(...)`。冲突解法（谁是真相）必须在控件头注释写明。
+4. **命名表**：同一语义角色全库同名——主值绑定 `data`；尺寸档 `Binding<string> Size`
+   （`"small"`/`"medium"`/`"large"`）；标签/文案 `text`。禁止大小写漂移
+   （`Value`/`value`/`data` 混指一物属违规）。
+5. **每控件绑定通道声明**：Widget 类头注释必须有一段"绑定通道"说明
+   （通道字段、方向、真相归属），照 `SelectBox.zan` 头注释样式。
+6. **文档承诺必须与实现一致**：宣称"响应式/变更通知"的成员必须有真实订阅者，
+   否则删除（反例：`Signal.Changed` 曾零订阅空转）。
+
+## 7. 现存违规清单（改造 backlog）
 
 以下已解决项移出待办（✅）；未解决项仍有效。
 
@@ -76,3 +102,5 @@
 | ODBC | 无参数绑定（`OdbcConnector.zan` 无 Param/Bind） | 未解决 |
 | Thread.SleepAsync / File.*Async / Model.*Async | 同步冒充异步（如 `File.zan` 的 `ReadAllTextAsync` 仍是同步包装） | 未解决：真异步或去 Async 后缀 |
 | IO/File | 整读整写仍为主流形态，流式路径不普及 | 未解决：逐步提供 Stream 家族 |
+| Gui/Reactive | ~~`Signal.Changed` 事件通知 + `ChangeTracker`（零订阅死代码，文档承诺与实现相反）~~ | ✅ 已删除：变更检测统一帧轮询（§6.2） |
+| Gui Widget 绑定通道 | 56 个 Widget 中 18 个 Binding/Signal 双通道混用，同一角色多名（`value`/`data`/`Value`） | 未解决：按 §6.1/§6.4 逐步收敛 |
