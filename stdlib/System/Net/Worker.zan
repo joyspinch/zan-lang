@@ -208,6 +208,8 @@ class Worker {
 
     [DllImport("crt")]
     static extern void exit(int code);
+    [DllImport("crt")]
+    static extern long strlen(string str);
     static bool debugLog = false;
     static void Dbg(string msg) {
         if (!debugLog) { return; }
@@ -2215,14 +2217,19 @@ class Worker {
             } else {
                 response = message;   // default: echo
             }
-            if (response.Length > 0) {
-                WsFrame respFrame = WsFrame.TextFrame(response);
-                respFrame.opcode = msgOpcode;
+            // One length drives both the frame header and the Append count.
+            // Reading .Length twice around the handler call is not safe: a
+            // cross-unit call can invalidate the cached length of a writable
+            // string (compiler stamps strlen back into the header), so the
+            // two reads can disagree for payloads containing NUL bytes and
+            // the frame goes out with a header larger than its body. strlen
+            // is stable across calls and matches the truncation contract the
+            // old server had (a NUL-payload echo re-delivers up to the NUL).
+            int respLen = (int)strlen(response);
+            if (respLen > 0) {
+                WsFrame respFrame = WsFrame.RawFrame(msgOpcode, response, respLen);
                 byte[] encoded = respFrame.Encode();
-                int hdrLen = 2;
-                if (response.Length > 65535) { hdrLen = 10; }
-                else if (response.Length > 125) { hdrLen = 4; }
-                writer.Append(encoded, hdrLen + response.Length);
+                writer.Append(encoded, WsFrame.HeaderLen(respLen) + respLen);
                 BumpSent();
             }
         }

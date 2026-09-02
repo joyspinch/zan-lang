@@ -28,7 +28,7 @@ build/zanc.exe examples/net/tcp_echo.zan --auto-stdlib -o tcp_echo.exe
 选型速查：
 
 - 请求/响应、可缓存 → HTTP（`HttpServer` / `HttpClient`）
-- 服务器持续单向推送（行情、日志、进度） → SSE（`SseServer` / `SseClient`）
+- 服务器持续单向推送（行情、日志、进度） → SSE（`Worker("sse")` / `SseClient`）
 - 双向低延迟长连接（聊天、游戏、协同） → WebSocket
 - 自定义二进制协议、极致控制 → 直接用 TCP（`TcpListener` / `TcpClient`）
 - 允许丢包但要低开销（心跳、发现、遥测） → UDP（`UdpClient`）

@@ -1,14 +1,21 @@
 using System;
+using System.Net;
 using System.Net.Sse;
+using System.Threading;
 
+// SSE 端到端回归（loopback）：Worker("sse") + SseClient。
+// SseServer 类已退役——订阅者握手与分发的唯一实现是 Worker.HandleSse
+// （走 onSseSubscriber 回调）。本回归钉住的行为不变：
+// 1. event-stream 握手头正确、SseClient 能解析事件流；
+// 2. 具名事件 / 多行 data（\n 拆成多个 data: 行）/ 匿名事件 / Ping 注释行；
+// 3. 流关闭后 NextAsync 返回 null。
 class Program {
-    static SseServer srv;
+    static Worker srv;
+    static List<SseConnection> subs;
 
-    static async void ServerLoop() {
-        srv.Start();
-        SseConnection c = await srv.AcceptAsync();
-        if (c == null) { Console.WriteLine("accept failed"); return; }
+    static async void OnSubscriber(SseConnection c) {
         Console.WriteLine("subscriber on " + c.Path());
+        subs.Add(c);
         await c.SendAsync("tick", "hello");
         await c.PingAsync();
         await c.SendAsync("multi", "line1\nline2");
@@ -17,12 +24,17 @@ class Program {
     }
 
     static async int Run() {
-        srv = new SseServer("127.0.0.1", 9510);
-        int port = 9510;
-        Task.Spawn(ServerLoop());
-        await Task.Delay(50);
+        Socket.Initialize();
+        subs = new List<SseConnection>();
+        srv = new Worker("sse", "127.0.0.1", 9510);
+        srv.onSseSubscriber = Program.OnSubscriber;
+        nint listenSock = srv.BindSocket(false);
+        if (listenSock < 0) { Console.WriteLine("accept failed"); return 0; }
+        List<nint> socks = new List<nint>();
+        socks.Add(listenSock);
+        Task.Spawn(Worker.RunAllLoopsOnSockets(socks));
 
-        SseClient c = await SseClient.ConnectAsync("127.0.0.1", port, "/events");
+        SseClient c = await SseClient.ConnectAsync("127.0.0.1", 9510, "/events");
         Console.WriteLine("client connected: " + Convert.ToString(c.IsConnected()));
         int n = 0;
         while (true) {
@@ -34,6 +46,9 @@ class Program {
         Console.WriteLine("total " + Convert.ToString(n));
         c.Close();
         srv.Stop();
+        // 停止会复位 accept 循环；泵转让服务端协程收干净，退出时的
+        // 泄漏探测才不会把服务端对象链记为仍可达。
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
         return 0;
     }
 

@@ -3043,10 +3043,10 @@
     "zh": "SSE 服务端推送"
    },
    "body": {
-    "en": "SSE is one-way push over plain HTTP (text/event-stream), the EventSource API in a browser. AcceptAsync completes the handshake and returns a connection; SendAsync pushes a named event, PingAsync keeps idle proxies from closing the stream.",
-    "zh": "SSE 是基于普通 HTTP 的单向推送（text/event-stream），对应浏览器的 EventSource。AcceptAsync 完成握手并返回连接，SendAsync 推送命名事件，PingAsync 发注释行保活，避免中间代理断开空闲连接。"
+    "en": "SSE is one-way push over plain HTTP (text/event-stream), the EventSource API in a browser. The only host is Worker: new Worker(\"sse\", host, port) with an onSseSubscriber callback -- the worker completes the event-stream handshake and calls the callback once per subscriber with an SseConnection. Bind + accept + dispatch all live in Worker; do not start separate accept loops.",
+    "zh": "SSE 是 HTTP 上的单向服务器推送（text/event-stream），浏览器里对应 EventSource。唯一宿主是 Worker：new Worker(\"sse\", host, port) 注册 onSseSubscriber 回调——Worker 完成 event-stream 握手并为每个订阅者回调一次 SseConnection。绑定、accept、分发全在 Worker；不要再写独立的 accept 循环。"
    },
-   "code": "using System;\nusing System.Net.Sockets;\nusing System.Net.Sse;\n\nclass Program {\n    static async int Run() {\n        Socket.Initialize();\n        SseServer srv = new SseServer(\"0.0.0.0\", 8090);\n        srv.Start();\n\n        List<SseConnection> subs = new List<SseConnection>();\n        SseConnection c = await srv.AcceptAsync();\n        if (c != null) {\n            Console.WriteLine(\"subscriber on \" + c.Path());\n            subs.Add(c);\n        }\n\n        for (int tick = 0; tick < 3; tick++) {\n            foreach (SseConnection s in subs) {\n                int _n = await s.SendAsync(\"price\",\n                    \"{\\\"symbol\\\":\\\"ZAN\\\",\\\"px\\\":\" + Convert.ToString(100 + tick) + \"}\");\n            }\n            await Task.Delay(1000);\n        }\n\n        foreach (SseConnection s in subs) {\n            int _p = await s.PingAsync();     // keep-alive comment line\n            s.Close();                        // client's NextAsync returns null\n        }\n        srv.Stop();\n        return 0;\n    }\n\n    static void Main() { int r = await Run(); }\n}"
+   "code": "using System;\nusing System.Net;\nusing System.Net.Sockets;\nusing System.Net.Sse;\nusing System.Threading;\n\nclass Program {\n    static Worker srv;\n    static List<SseConnection> subs = new List<SseConnection>();\n\n    static async void OnSubscriber(SseConnection c) {\n        Console.WriteLine(\"subscriber on \" + c.Path());\n        subs.Add(c);\n        for (int tick = 0; tick < 3; tick++) {\n            int _n = await c.SendAsync(\"price\",\n                \"{\\\"symbol\\\":\\\"ZAN\\\",\\\"px\\\":\" + Convert.ToString(100 + tick) + \"}\");\n        }\n        await c.PingAsync();   // keep-alive comment line\n        c.Close();             // client's NextAsync returns null\n    }\n\n    static async int Run() {\n        Socket.Initialize();\n        srv = new Worker(\"sse\", \"0.0.0.0\", 8090);\n        srv.onSseSubscriber = Program.OnSubscriber;\n        nint ls = srv.BindSocket(false);\n        List<nint> socks = new List<nint>();\n        socks.Add(ls);\n        await Worker.RunAllLoopsOnSockets(socks);  // serves forever\n        return 0;\n    }\n\n    static void Main() { int r = await Run(); }\n}"
   },
   {
    "cat": {
@@ -3088,10 +3088,10 @@
     "zh": "WebSocket 服务端"
    },
    "body": {
-    "en": "new WebSocketServer(host, port).Start() handles the handshake, frame codec and ping/pong; the default OnMessage echoes. Subclass it and override OnMessage to implement your own protocol.",
-    "zh": "new WebSocketServer(host, port).Start() 处理握手、帧编解码和 ping/pong，默认 OnMessage 是回显。继承它并覆写 OnMessage 就能实现自己的业务协议。"
+    "en": "new Worker(\"websocket\", host, port) with an onMessage callback handles the handshake, frame codec and ping/pong; the callback's return value is sent back (default: echo). The same port also serves plain HTTP for non-upgrade requests, swoole's WebSocket\\Server style.",
+    "zh": "new Worker(\"websocket\", host, port) 注册 onMessage 回调后处理握手、帧编解码和 ping/pong，回调返回值即应答（默认回显）。同一端口对非升级请求还回落普通 HTTP（swoole 的 WebSocket\\Server 同款）。"
    },
-   "code": "using System;\nusing System.Net.Sockets;\nusing System.Net.WebSocket;\n\nclass ChatServer : WebSocketServer {\n    override async string OnMessage(string message) {\n        if (message == \"ping\") { return \"pong\"; }\n        return \"you said: \" + message;\n    }\n}\n\nclass Program {\n    static async int Run() {\n        Socket.Initialize();\n        WebSocketServer server = new WebSocketServer(\"0.0.0.0\", 8080);\n        await server.Start();\n        return 0;\n    }\n\n    static void Main() { int r = await Run(); }\n}"
+   "code": "using System;\nusing System.Net;\nusing System.Net.Sockets;\nusing System.Net.WebSocket;\nusing System.Threading;\n\nclass Program {\n    static async string Echo(Connection conn, string message) {\n        if (message == \"ping\") { return \"pong\"; }\n        return \"you said: \" + message;\n    }\n\n    static async int Run() {\n        Socket.Initialize();\n        Worker server = new Worker(\"websocket\", \"0.0.0.0\", 8080);\n        server.onMessage = Program.Echo;\n        nint ls = server.BindSocket(false);\n        List<nint> socks = new List<nint>();\n        socks.Add(ls);\n        await Worker.RunAllLoopsOnSockets(socks);  // serves forever\n        return 0;\n    }\n\n    static void Main() { int r = await Run(); }\n}"
   },
   {
    "cat": {
@@ -3287,51 +3287,6 @@
     "zh": "new SipClient(host, port, 用户) 通过 UDP 发送 SIP 请求：OptionsAsync 探测服务端能力，RegisterAsync 注册地址。返回 null 表示超时；SipMessage.Header 可读取应答里的任意头。"
    },
    "code": "using System;\nusing System.Net.Sockets;\nusing System.Net.Sip;\n\nclass Program {\n    static async int Main() {\n        SipClient c = new SipClient(\"sip.example.com\", 5060, \"zan-demo\");\n\n        SipMessage r = await c.OptionsAsync();\n        if (r == null) { Console.WriteLine(\"OPTIONS timed out\"); return 1; }\n        Console.WriteLine(Convert.ToString(r.status) + \" \" + r.reason\n            + \" allow=\" + r.Header(\"Allow\"));\n\n        SipMessage reg = await c.RegisterAsync(\"alice\", 3600);\n        Console.WriteLine(\"REGISTER -> \" + Convert.ToString(reg.status));\n        return 0;\n    }\n}"
-  },
-  {
-   "cat": {
-    "en": "Remote Calls",
-    "zh": "远程调用"
-   },
-   "title": {
-    "en": "JSON-RPC Server",
-    "zh": "JSON-RPC 服务端"
-   },
-   "body": {
-    "en": "new RpcServer(host, port, codec) dispatches by method name to registered async handlers; each peer runs on its own coroutine. Arguments and results are JsonValue, so a handler never parses a wire format itself.",
-    "zh": "new RpcServer(host, port, 编解码器) 按方法名分发到注册的异步处理函数，每个连接独立协程。参数和结果都是 JsonValue，处理函数不用碰任何线上格式。"
-   },
-   "code": "using System;\nusing System.Json;\nusing System.Net.Rpc;\n\nclass Program {\n    static async RpcResponse Add(RpcRequest req) {\n        int a = req.args.Int(\"a\", 0);\n        int b = req.args.Int(\"b\", 0);\n        return RpcResponse.Ok(req.id, JsonValue.NewNum(Convert.ToString(a + b)));\n    }\n\n    static async int Run() {\n        RpcServer s = new RpcServer(\"0.0.0.0\", 4000, new JsonRpcCodec());\n        s.On(\"add\", Program.Add);\n        await s.Start();\n        return 0;\n    }\n\n    static void Main() { int r = await Run(); }\n}"
-  },
-  {
-   "cat": {
-    "en": "Remote Calls",
-    "zh": "远程调用"
-   },
-   "title": {
-    "en": "JSON-RPC Client",
-    "zh": "JSON-RPC 客户端"
-   },
-   "body": {
-    "en": "RpcClient.ConnectAsync(host, port, codec) calls a remote method with CallAsync and gets a correlated RpcResponse; check IsError() once, whatever the protocol. NotifyAsync is fire-and-forget (no id, no reply).",
-    "zh": "RpcClient.ConnectAsync(host, port, 编解码器) 用 CallAsync 调用远程方法，返回按 id 关联的 RpcResponse，统一用 IsError() 判断失败。NotifyAsync 是通知式调用（无 id、不等回复）。"
-   },
-   "code": "using System;\nusing System.Json;\nusing System.Net.Rpc;\n\nclass Program {\n    static async int Run() {\n        RpcClient c = await RpcClient.ConnectAsync(\"127.0.0.1\", 4000,\n                                                   new JsonRpcCodec());\n\n        JsonValue args = JsonValue.NewObject();\n        args.Set(\"a\", JsonValue.NewNum(\"2\"));\n        args.Set(\"b\", JsonValue.NewNum(\"40\"));\n\n        RpcResponse r = await c.CallAsync(\"add\", args);\n        if (r.IsError()) {\n            Console.WriteLine(\"rpc failed: \" + r.error.message);\n        } else {\n            Console.WriteLine(\"sum = \" + r.result.ToJson());\n        }\n\n        await c.NotifyAsync(\"log\", args);   // no response expected\n        c.Close();\n        return 0;\n    }\n\n    static void Main() { int r = await Run(); }\n}"
-  },
-  {
-   "cat": {
-    "en": "Remote Calls",
-    "zh": "远程调用"
-   },
-   "title": {
-    "en": "Swapping the Protocol",
-    "zh": "切换 RPC 协议"
-   },
-   "body": {
-    "en": "The codec is the only protocol-specific part: pass XmlRpcCodec instead of JsonRpcCodec and the same client and server speak XML-RPC. Handlers, arguments and results are unchanged.",
-    "zh": "协议只体现在编解码器上：把 JsonRpcCodec 换成 XmlRpcCodec，同一套客户端和服务端就说 XML-RPC，处理函数、参数、结果都不用改。"
-   },
-   "code": "using System;\nusing System.Net.Rpc;\n\n// server\nRpcServer s = new RpcServer(\"0.0.0.0\", 4000, new XmlRpcCodec());\ns.On(\"add\", Program.Add);\n\n// client\nRpcClient c = await RpcClient.ConnectAsync(\"127.0.0.1\", 4000, new XmlRpcCodec());"
   },
   {
    "cat": {

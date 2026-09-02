@@ -5,8 +5,12 @@
 // 浏览器里对应 EventSource API。适合行情、日志、进度条等"服务器 -> 客户端"
 // 持续推送的场景；需要双向通信时应改用 WebSocket。
 //
+// 服务端唯一宿主是 Worker：Worker("sse") 自带 HTTP 握手（event-stream 头）
+// 与订阅者分发，onSseSubscriber 每订阅者回调一次 SseConnection。
+//
 // 演示内容：
-//   1. SseServer：接受订阅（AcceptAsync 完成 HTTP 握手，返回 SseConnection）
+//   1. Worker("sse") + BindSocket(false) + RunAllLoopsOnSockets：
+//      单进程模式直接驱动（RunAll 会打印 banner，示例输出要干净）
 //   2. SseConnection.SendAsync(event, data)：推送命名事件
 //      SendDataAsync(data)：推送默认 "message" 事件
 //      PingAsync()：注释行保活（防止中间代理断开空闲连接）
@@ -17,27 +21,23 @@
 // 运行：zanc examples/net/sse_events.zan --auto-stdlib -o sse.exe && ./sse.exe
 // ============================================================================
 using System;
+using System.Net;
 using System.Net.Sockets;
 using System.Net.Sse;
+using System.Threading;
 
 class Program {
     static int PORT = 54441;
     static int SUBSCRIBERS = 2;
-    static SseServer srv;
     static List<SseConnection> subs;    // 已订阅的连接（广播用）
     static int doneClients = 0;
 
-    // ---- 服务端：接受订阅，凑齐后广播 ----------------------------------------
-    static async void Server() {
-        // 先收满全部订阅者
-        while (subs.Count < SUBSCRIBERS) {
-            SseConnection c = await srv.AcceptAsync();
-            if (c != null) {
-                // Path() 是订阅方请求的路径，可据此区分频道
-                Console.WriteLine("server: new subscriber on " + c.Path());
-                subs.Add(c);
-            }
-        }
+    // Worker 的 SSE 订阅者回调：登记连接，凑齐后统一广播。
+    static async void OnSubscriber(SseConnection c) {
+        // Path() 是订阅方请求的路径，可据此区分频道
+        Console.WriteLine("server: new subscriber on " + c.Path());
+        subs.Add(c);
+        if (subs.Count < SUBSCRIBERS) { return; }
 
         // 广播 3 条行情事件给所有订阅者
         for (int tick = 0; tick < 3; tick = tick + 1) {
@@ -86,15 +86,27 @@ class Program {
     static async int Run() {
         Socket.Initialize();
         subs = new List<SseConnection>();
-        srv = new SseServer("127.0.0.1", PORT);
-        srv.Start();
-        Task.Spawn(Server());
+
+        // 服务端：握手 + 分发全在 Worker。未注册 onSseSubscriber 时
+        // 订阅者连上即被关闭（Worker.HandleSse 的默认行为）。
+        Worker srv = new Worker("sse", "127.0.0.1", PORT);
+        srv.onSseSubscriber = Program.OnSubscriber;
+        nint listenSock = srv.BindSocket(false);
+        if (listenSock < 0) {
+            Console.WriteLine("bind failed");
+            return 1;
+        }
+        List<nint> socks = new List<nint>();
+        socks.Add(listenSock);
+        Task.Spawn(Worker.RunAllLoopsOnSockets(socks));
 
         for (int i = 0; i < SUBSCRIBERS; i = i + 1) {
             Task.Spawn(Client(i));
         }
         while (doneClients < SUBSCRIBERS) { await Task.Delay(10); }
         srv.Stop();
+        // 让 accept 循环与订阅者协程收干净再退出。
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
         Console.WriteLine("done");
         return 0;
     }

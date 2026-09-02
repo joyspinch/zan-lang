@@ -197,7 +197,7 @@ ws.OnMessage = async (conn, WebSocketFrame f) => await conn.Send(new TextFrame(f
 |---|---|---|
 | TCP / UDP / Unix socket | `TcpServer` / `UdpServer` | `TcpClient` / `UdpClient` |
 | HTTP/1.1 | `HttpServer`（路由/中间件） | `HttpClient`（§6） |
-| WebSocket | `WebSocketServer` | `WebSocketClient` |
+| WebSocket | Worker（帧循环） | `WebSocketClient` |
 | TLS/SSL | 以上均可 `.UseTls(cert)` 包一层 | `.UseTls()` |
 | HTTP/2 · gRPC | `Http2Server` / `GrpcServer` | `GrpcClient` |
 | MQTT / Redis / 自定义 | 用 `IProtocol` 自己插 | 同 |

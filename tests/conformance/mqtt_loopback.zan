@@ -1,5 +1,8 @@
 // MQTT v3.1.1 端到端回归（loopback，进程内同时扮演 broker 与客户端）：
 //
+// MqttBroker 的独立监听循环（RunAsync/Stop）已退役——唯一的宿主是
+// Worker("mqtt")：Worker accept 后为每个连接调 MqttBroker.HandleConnection。
+// 本回归钉住的协议行为不变：
 // 1. varint remaining length：300 字节负载的 PUBLISH 需要 2 字节
 //    varint——旧客户端把它截进单字节，报文非法、broker 端流从此错位。
 //    订阅 QoS1 后由第二个客户端发布，验证订阅者原样收到 300 字节。
@@ -10,6 +13,7 @@
 //    修复后旧会话被 shutdown（EOF），新会话正常收发。
 // 打印 golden：payload_len / match / malformed_closed / dup_kicked。
 using System;
+using System.Net;
 using System.Net.Mqtt;
 using System.Net.Sockets;
 using System.Threading;
@@ -17,8 +21,18 @@ using System.Threading;
 class Program {
     static async int Run() {
         Socket.Initialize();
-        MqttBroker broker = new MqttBroker("127.0.0.1", 19731);
-        Task.Spawn(broker.RunAsync());
+        // 统一宿主：绑定 + accept + 分发全在 Worker。直接驱动
+        // RunAllLoopsOnSockets（RunAll 会打印 banner 与统计行，golden
+        // 需要稳定输出），绑一个 socket 走完全相同的分发路径。
+        Worker broker = new Worker("mqtt", "127.0.0.1", 19731);
+        nint listenSock = broker.BindSocket(false);
+        if (listenSock < 0) {
+            Console.WriteLine("payload_len=-3");
+            return 0;
+        }
+        List<nint> socks = new List<nint>();
+        socks.Add(listenSock);
+        Task.Spawn(Worker.RunAllLoopsOnSockets(socks));
 
         // 订阅者：重试连接直到 broker 完成绑定。
         MqttClient sub = null;
@@ -77,9 +91,8 @@ class Program {
         int _d2 = await sub.DisconnectAsync();
         int _d3 = await dupB.DisconnectAsync();
         broker.Stop();
-        // Stop 关闭监听句柄并唤醒挂起的 accept（Windows 上先
-        // CancelIoEx）；这几个泵转让 accept 循环与连接协程收干净，
-        // 退出时的泄漏探测才不会把 broker 对象链记为仍可达。
+        // 停止会复位 accept 循环；这几个泵转让 accept 循环与连接协程
+        // 收干净，退出时的泄漏探测才不会把 broker 对象链记为仍可达。
         for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
         return 0;
     }

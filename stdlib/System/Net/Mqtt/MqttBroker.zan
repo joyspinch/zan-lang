@@ -115,26 +115,15 @@ class MqttMetricsDoc {
 /// 主题过滤器通配符。QoS 2 会降级为 1。未实现保留消息与
 /// 持久会话。
 ///
-/// 独立运行：
-///   MqttBroker b = new MqttBroker("0.0.0.0", 1883);
-///   await b.RunAsync();                      // accept loop; never returns
-///
-/// 在 Worker 下（协议 "mqtt"），由 Worker 接受连接并为每个客户端
-/// 调用 <see cref="HandleConnection"/>，因此 broker 也能用于
-/// 主/多 worker 模式。注意多进程模式下每个 worker 持有
+/// 独立的监听循环已退役——唯一的宿主是 Worker：协议 "mqtt" 的
+/// worker 由 Worker 接受连接并为每个客户端调用
+/// <see cref="HandleConnection"/>。注意多进程模式下每个 worker 持有
 /// 自己的会话表：发布者只能触达同一 worker 接受的订阅者，
 /// 因此需要全局广播的 broker 应使用 count = 1。
 /// </summary>
 class MqttBroker {
-    string host;
-    int port;
     List<MqttSession> sessions;
     List<MqttTopicStat> topics;
-    bool running;
-    // 监听句柄由 RunAsync 落到字段上，Stop 才能在 Windows 上先
-    // CancelIoEx 唤醒挂起的 accept 再关句柄（只置 running=false
-    // 的话，accept 协程带着整个 broker 对象链永远挂起）。
-    nint listenSock;
 
     int nextId;
     int startedAt;
@@ -150,12 +139,8 @@ class MqttBroker {
     static extern long time(nint ptr);
 
     MqttBroker(string host, int port) {
-        this.host = host;
-        this.port = port;
         this.sessions = new List<MqttSession>();
         this.topics = new List<MqttTopicStat>();
-        this.running = false;
-        this.listenSock = -1;
         this.nextId = 0;
         this.startedAt = MqttBroker.Now();
         this.totalConnections = 0;
@@ -182,38 +167,6 @@ class MqttBroker {
     static MqttBroker Instance() { return MqttBroker.Global(); }
 
     int Count() { return this.sessions.Count; }
-
-    /// <summary>绑定、监听并服务客户端，直到 <see cref="Stop"/>
-    /// 被调用（Worker 集成里则随进程存活）。</summary>
-    async void RunAsync() {
-        Socket.Initialize();
-        nint s = Socket.CreateTcp();
-        Socket.SetReuseAddr(s);
-        int r = Socket.Bind(s, this.host, this.port);
-        if (r != 0) {
-            Console.WriteLine("[MqttBroker] cannot bind " + this.host + ":"
-                + Convert.ToString(this.port));
-            return;
-        }
-        Socket.Listen(s, 511);
-        Socket.SetNonBlocking(s);
-        this.listenSock = s;
-        this.running = true;
-        Console.WriteLine("[MqttBroker] listening on mqtt://" + this.host + ":"
-            + Convert.ToString(this.port));
-        while (this.running) {
-            nint c = await Socket.AcceptAsync(s);
-            if (c >= 0) {
-                Socket.SetNonBlocking(c);
-                Task.Spawn(this.HandleConnection(c));
-            }
-        }
-        // Stop() 已关句柄（或调用方放弃）：accept 以 -1 复位后到这里。
-        if (this.listenSock >= 0) {
-            this.listenSock = -1;
-            Socket.Close(s);
-        }
-    }
 
     // ---- 帧解析（二进制安全的读取；理由见 MqttClient） ----
 
@@ -547,7 +500,7 @@ class MqttBroker {
     }
 
     /// <summary>在已接受的套接字上服务一个 MQTT 客户端，直到其
-    /// 断开。RunAsync 与 "mqtt" Worker 都会使用。</summary>
+    /// 断开。"mqtt" 协议的 Worker 用它服务每个客户端连接。</summary>
     async void HandleConnection(nint sock) {
         MqttSession sess = new MqttSession(sock);
         this.nextId = this.nextId + 1;
@@ -719,18 +672,5 @@ class MqttBroker {
             }
         }
         Socket.Close(sock);
-    }
-
-    void Stop() {
-        this.running = false;
-        if (this.listenSock >= 0) {
-            #if WINDOWS
-            // CancelIoEx 必须先于关句柄：closesocket 不会给挂起的
-            // AcceptEx 投递完成包，accept 协程会永远挂起。
-            Socket.ShutdownBoth(this.listenSock);
-            #endif
-            Socket.Close(this.listenSock);
-            this.listenSock = -1;
-        }
     }
 }

@@ -2,7 +2,8 @@
 // MQTT 发布/订阅 —— 内置 Broker + 客户端完整示例
 // ----------------------------------------------------------------------------
 // 演示内容：
-//   1. MqttBroker：纯 Zan 实现的 MQTT v3.1.1 服务端，无需外部 broker
+//   1. MqttBroker：纯 Zan 实现的 MQTT v3.1.1 服务端，无需外部 broker；
+//      监听宿主是 Worker("mqtt")——accept 与分发由 Worker 统一负责
 //   2. MqttClient 连接 / 订阅 / 发布 / 接收 / 断开（全部为挂起式 async）
 //   3. 主题通配符：`+` 匹配单层，`#` 匹配多层（sensors/+/temp）
 //   4. QoS 0（至多一次）与 QoS 1（至少一次，broker 回 PUBACK）
@@ -12,8 +13,10 @@
 // 运行：zanc examples/net/mqtt_pubsub.zan --auto-stdlib -o mqtt_pubsub.exe
 // ============================================================================
 using System;
+using System.Net;
 using System.Net.Sockets;
 using System.Net.Mqtt;
+using System.Threading;
 
 class Program {
     [DllImport("crt")]
@@ -24,9 +27,16 @@ class Program {
     static async int Run() {
         Socket.Initialize();
 
-        // ---- 服务端：启动内置 broker ----------------------------------------
-        MqttBroker broker = new MqttBroker("127.0.0.1", PORT);
-        Task.Spawn(broker.RunAsync());
+        // ---- 服务端：启动内置 broker（Worker 统一宿主）------------------------
+        Worker broker = new Worker("mqtt", "127.0.0.1", PORT);
+        nint listenSock = broker.BindSocket(false);
+        if (listenSock < 0) {
+            Console.WriteLine("bind failed");
+            return 1;
+        }
+        List<nint> socks = new List<nint>();
+        socks.Add(listenSock);
+        Task.Spawn(Worker.RunAllLoopsOnSockets(socks));
         await Task.Delay(50);
 
         // ---- 订阅者 1：单层通配符 sensors/+/temp -----------------------------
@@ -74,9 +84,9 @@ class Program {
         int d2 = await sub1.DisconnectAsync();
         int d3 = await sub2.DisconnectAsync();
         broker.Stop();
+        // 让 accept 循环与连接协程收干净再退出。
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
         Console.WriteLine("done");
-        // broker 的 accept 协程仍在运行，直接退出进程
-        exit(0);
         return 0;
     }
 

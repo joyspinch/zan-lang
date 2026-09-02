@@ -1,5 +1,9 @@
-// WebSocket 端到端回归（loopback）：WebSocketServer + 裸帧客户端。
+// WebSocket 端到端回归（loopback）：Worker("websocket") + 裸帧客户端。
 //
+// WebSocketServer 类已退役——同端口的帧循环唯一实现是
+// Worker.HandleWebSocket（Worker 类的 "websocket"/"http" 协议都走它，
+// MVC 的 ctx.WsUpgrade() 会话与它共享同一套帧层）。本回归钉住的协议
+// 行为不变：
 // 1. 分片重组：一条消息拆成 Text(fin=0) + Continuation(fin=0) +
 //    Continuation(fin=1) 三个帧——旧服务器把 continuation 帧静默
 //    丢弃，消息只剩第一片。
@@ -8,14 +12,25 @@
 //    这里断言 echo 回首字节且后续文本帧仍对齐。
 // 3. 帧上限：声明 32 MiB 的帧（超过 16 MiB 上限）→ 服务器以
 //    带状态码的关闭帧（1009）断开，而不是把缓冲翻倍到 OOM。
+// 4. 大小写不敏感的 Upgrade 令牌：客户端发 "Upgrade: WebSocket"
+//    标准拼写，握手必须成功（旧实现只认两种小写形态，会 400）。
+// 5. 同端口 plain-HTTP fallback：不带 Sec-WebSocket-Key 的请求由
+//    HTTP 循环应答（http+ws 双协议同端口，与 swoole 同款）。
 using System;
-using System.Net.WebSocket;
+using System.Net;
 using System.Net.Sockets;
+using System.Net.WebSocket;
 using System.Threading;
 using System.Text;
 
 class Program {
-    static async string Echo(string m) { return m; }
+    static int PORT = 19732;
+
+    // Worker 的 WS 消息回调：echo。Worker.zan 帧循环把返回值编码成
+    // 帧发回（opcode 保真：binary 帧的应答仍标 binary）。
+    static async string Echo(Connection conn, string message) {
+        return message;
+    }
 
     // 发一个掩码帧（测试用固定掩码；服务器不校验掩码内容）。
     static void SendMasked(nint s, int opcode, bool fin, string payload, int len) {
@@ -29,9 +44,15 @@ class Program {
         int _n = Socket.Send(s, f, 6 + len);
     }
 
-    // 读一个未掩码的回显帧，返回其负载。
+    // 读一个未掩码的回显帧，返回其负载。服务器对背靠背到达的两条
+    // 消息会把两个回帧写进同一个 TCP 段（Nagle 关不掉服务器侧的
+    // write 合并），一次 recv 拿到的不止一帧——残余字节必须跨调用
+    // 保留，否则下一帧被本调用读走再丢弃，调用方就永远等不到它。
+    static string leftover = "";
+
     static async string ReadEcho(nint s) {
-        string raw = "";
+        string raw = leftover;
+        leftover = "";
         int need = 2;
         while (raw.Length < need) {
             await Socket.ReadReady(s);
@@ -41,16 +62,25 @@ class Program {
                 if (l0 < 126) { need = 2 + l0; }
             }
         }
-        int opcode = raw[0] & 15;
         int plen = raw[1] & 127;
+        if (raw.Length > 2 + plen) {
+            leftover = raw.Substring(2 + plen, raw.Length - 2 - plen);
+        }
         return raw.Substring(2, plen);
     }
 
     static async int Run() {
         Socket.Initialize();
-        WebSocketServer server = new WebSocketServer("127.0.0.1", 19732);
-        server.OnMessage(Echo);
-        Task.Spawn(server.Start());
+        // 统一宿主：绑定 + accept + 帧循环全在 Worker。直接驱动
+        // RunAllLoopsOnSockets（RunAll 会打印 banner 与统计行，golden
+        // 需要稳定输出），绑一个 socket 走完全相同的分发路径。
+        Worker ws = new Worker("websocket", "127.0.0.1", PORT);
+        ws.onMessage = Program.Echo;
+        nint listenSock = ws.BindSocket(false);
+        if (listenSock < 0) { Console.WriteLine("frag=UNREACHABLE"); return 0; }
+        List<nint> socks = new List<nint>();
+        socks.Add(listenSock);
+        Task.Spawn(Worker.RunAllLoopsOnSockets(socks));
 
         nint s = 0;
         bool ok = false;
@@ -58,7 +88,7 @@ class Program {
         // 服务端协程要等主协程首次挂起才有机会 bind；同步 connect
         // 加线程休眠从不让出，端口永远拒绝。
         for (int i = 0; i < 100; i = i + 1) {
-            TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", 19732);
+            TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", PORT);
             if (c != null) { s = c.Sock(); ok = true; break; }
             Thread.Sleep(20);
         }
@@ -119,11 +149,35 @@ class Program {
         }
         Console.WriteLine("close_code=" + closeCode);
 
+        // 4. 同端口 plain-HTTP fallback：不带 upgrade 头的请求得到
+        //    HTTP 应答（onHttpRequest 未注册 → HttpServer 默认 200 欢迎页）。
+        nint h = 0;
+        bool hok = false;
+        for (int i = 0; i < 100; i = i + 1) {
+            TcpClient hc = await TcpClient.ConnectAsync("127.0.0.1", PORT);
+            if (hc != null) { h = hc.Sock(); hok = true; break; }
+            Thread.Sleep(20);
+        }
+        if (hok) {
+            Socket.SetNonBlocking(h);
+            int _r = Socket.SendString(h, "GET /plain HTTP/1.1\r\nHost: t\r\n\r\n");
+            string resp = "";
+            while (resp.Length < 12) {
+                await Socket.ReadReady(h);
+                string part = Socket.Receive(h, 4096);
+                if (part.Length == 0) { break; }
+                resp = resp + part;
+            }
+            Console.WriteLine("http_fallback=" + (resp.Substring(9, 3) == "200" ? "1" : "0"));
+            Socket.Close(h);
+        } else {
+            Console.WriteLine("http_fallback=0");
+        }
+
         Socket.Close(s);
-        server.Stop();
-        // 停止会唤醒挂起的 accept（Windows 上 CancelIoEx 先于关句柄）；
-        // 这几个泵转让 accept 循环与连接协程收干净，退出时的泄漏
-        // 探测才不会把服务端对象链记为仍可达。
+        ws.Stop();
+        // 停止会复位 accept 循环；这几个泵转让 accept 循环与连接协程
+        // 收干净，退出时的泄漏探测才不会把服务端对象链记为仍可达。
         for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
         return 0;
     }
