@@ -939,69 +939,49 @@ class HttpContext {
 }
 
 /// <summary>
-/// Ordered string-to-string map on parallel lists. Small and predictable:
-/// route params / query / form / headers per request stay tiny, so linear
-/// lookup beats a hash table while keeping zero extra allocations.
+/// String-to-string map backed by the builtin Dictionary (a hash index over
+/// insertion-ordered parallel buffers): Set/Has/Get/GetOr are O(1) amortized
+/// where the old parallel-lists version scanned linearly. Route params /
+/// query / form per request stay tiny, but Sessions.tokens and the template
+/// caches grow with load, and that is where the O(n) scans showed up.
 ///
-/// The backing lists are created on the first Set: most requests never touch
-/// their route params, query, form or state map, and an empty map that costs
+/// The backing dict is created on the first Set: most requests never touch
+/// their route params, query, form or state map, and a null map that costs
 /// nothing keeps the per-request allocation count down.
 /// </summary>
 class StrMap {
-    List<string> keys;
-    List<string> vals;
+    Dictionary<string, string> map;
 
     StrMap() {
-        this.keys = null;
-        this.vals = null;
+        this.map = null;
     }
 
     int Count() {
-        if (this.keys == null) { return 0; }
-        return this.keys.Count;
-    }
-
-    string KeyAt(int i) { return this.keys[i]; }
-
-    string ValAt(int i) { return this.vals[i]; }
-
-    /// <summary>Position of `key`, or -1. Callers that would otherwise do
-    /// Has() followed by Get() use this to scan the map once (template
-    /// rendering resolves every variable through here).</summary>
-    int IndexOfKey(string key) {
-        if (this.keys == null) { return -1; }
-        for (int i = 0; i < this.keys.Count; i = i + 1) {
-            if (this.keys[i] == key) { return i; }
-        }
-        return -1;
+        if (this.map == null) { return 0; }
+        return this.map.Count;
     }
 
     void Set(string key, string val) {
-        if (this.keys == null) {
-            this.keys = new List<string>();
-            this.vals = new List<string>();
+        if (this.map == null) {
+            this.map = new Dictionary<string, string>();
         }
-        int at = this.IndexOfKey(key);
-        if (at >= 0) {
-            this.vals[at] = val;
-            return;
-        }
-        this.keys.Add(key);
-        this.vals.Add(val);
+        this.map[key] = val;
     }
 
-    bool Has(string key) { return this.IndexOfKey(key) >= 0; }
+    bool Has(string key) {
+        if (this.map == null) { return false; }
+        return this.map.ContainsKey(key);
+    }
 
     string Get(string key) { return this.GetOr(key, ""); }
 
     string GetOr(string key, string def) {
-        int at = this.IndexOfKey(key);
-        if (at < 0) { return def; }
-        return this.vals[at];
+        if (this.map == null) { return def; }
+        if (this.map.ContainsKey(key)) { return this.map[key]; }
+        return def;
     }
 
     void Clear() {
-        this.keys = null;
-        this.vals = null;
+        this.map = null;
     }
 }

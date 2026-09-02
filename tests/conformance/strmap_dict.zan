@@ -1,0 +1,78 @@
+// StrMap 是 Dictionary<string,string> 的门面：Set/Has/Get/GetOr/Count/Clear
+// 全部委托内建字典的哈希索引。曾因平行 List 线性扫描，在 Sessions.tokens 与
+// 模板缓存增长后成为 O(n) 热点；此测试同时覆盖空表惰性初始化、覆盖写、
+// Clear 后复用与万键量级的内容正确性（键序不保证，只验内容）。
+using System;
+using System.Web;
+
+class Program {
+    static int bad = 0;
+
+    static void Eq(string what, string got, string want) {
+        if (got == want) {
+            Console.WriteLine("ok " + what);
+        } else {
+            Console.WriteLine("FAIL " + what + ": got '" + got
+                              + "' want '" + want + "'");
+            Program.bad = Program.bad + 1;
+        }
+    }
+
+    static void Main() {
+        // 直接构造 HttpContext，走 route/query/form 三张 StrMap。
+        string raw = "GET /user/42?q=hello HTTP/1.1\r\nHost: h\r\n\r\n";
+        HttpContext c = new HttpContext(HttpRequest.Parse(raw), "127.0.0.1");
+        c.routeParams.Set("id", "42");
+        Program.Eq("route get", c.Param("id"), "42");
+        Program.Eq("query get", c.InputString("q"), "hello");
+        c.query.Set("q", "changed");
+        Program.Eq("set overwrite", c.InputString("q"), "changed");
+        c.query.Set("q", "final");
+        Program.Eq("second overwrite", c.InputString("q"), "final");
+        Program.Eq("missing empty", c.InputString("nope"), "");
+        c.query.Set("empty", "");
+        Program.Eq("empty value", c.InputString("empty"), "");
+        Program.Eq("has hit", c.query.Has("q") ? "y" : "n", "y");
+        Program.Eq("has miss", c.query.Has("zz") ? "y" : "n", "n");
+        Program.Eq("count", Convert.ToString(c.query.Count()), "2");
+
+        // GetOr 缺省语义（ParsePairs 的 name[] 合并依赖它）。
+        Program.Eq("getor hit", c.query.GetOr("q", "dflt"), "final");
+        Program.Eq("getor miss", c.query.GetOr("zz", "dflt"), "dflt");
+
+        // Clear 后回到空表语义。
+        c.query.Clear();
+        Program.Eq("after clear has", c.query.Has("q") ? "y" : "n", "n");
+        Program.Eq("after clear count", Convert.ToString(c.query.Count()), "0");
+        c.query.Set("again", "1");
+        Program.Eq("reuse after clear", c.query.Get("again"), "1");
+
+        // 一万键哈希正确性：写入后逐键读回，覆盖写不增计数。
+        StrMap big = new StrMap();
+        int i = 0;
+        while (i < 10000) {
+            big.Set("k" + Convert.ToString(i), "v" + Convert.ToString(i));
+            i = i + 1;
+        }
+        Program.Eq("big count", Convert.ToString(big.Count()), "10000");
+        bool ok = true;
+        i = 0;
+        while (i < 10000) {
+            if (big.Get("k" + Convert.ToString(i)) != "v" + Convert.ToString(i)) {
+                ok = false;
+            }
+            i = i + 1;
+        }
+        Program.Eq("big roundtrip", ok ? "y" : "n", "y");
+        big.Set("k5000", "overwritten");
+        Program.Eq("big overwrite", big.Get("k5000"), "overwritten");
+        Program.Eq("big count after overwrite",
+                   Convert.ToString(big.Count()), "10000");
+
+        if (Program.bad > 0) {
+            Console.WriteLine("fail " + Convert.ToString(Program.bad));
+        } else {
+            Console.WriteLine("all pass");
+        }
+    }
+}
