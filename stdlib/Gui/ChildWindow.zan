@@ -437,6 +437,10 @@ class ChildWindow {
 class ChildWindows {
     static List<ChildWindow> wins;
     static FilePicker picker;
+    /// 组件自建的附加选择器（Upload 内建选文件弹窗等）。单一 `picker`
+    /// 槽归应用 shell 注册的共享选择器所有（IDE 的 pathPicker）；这批
+    /// 由组件按需登记，数量不限。PumpAll/Route/Wants 统一照顾两处。
+    static List<FilePicker> pickers;
 
     static List<ChildWindow> All() {
         if (ChildWindows.wins == null) {
@@ -453,6 +457,18 @@ class ChildWindows {
     /// the picker dispatches its result through its own UiEvents.
     static void RegisterPicker(FilePicker p) {
         ChildWindows.picker = p;
+    }
+
+    /// 登记一个组件自建的选择器（Upload 内建弹窗）。同一实例重复登记
+    /// 是无操作；`PrunePickers` 在它关闭后移出，因此宿主应在每次打开
+    /// 时重新登记（组件复用同一 picker 实例）。返回 true = 首次登记。
+    static bool RegisterComponentPicker(FilePicker p) {
+        if (ChildWindows.pickers == null) {
+            ChildWindows.pickers = new List<FilePicker>();
+        }
+        if (ChildWindows.pickers.Contains(p)) { return false; }
+        ChildWindows.pickers.Add(p);
+        return true;
     }
 
     /// Forgets windows that have closed.
@@ -479,6 +495,27 @@ class ChildWindows {
         foreach (ChildWindow w in ChildWindows.All()) {
             if (w.NeedsRedraw()) { return true; }
         }
+        if (ChildWindows.AnyPickerWants()) { return true; }
+        return false;
+    }
+
+    /// 任一组件选择器开着且要求重绘（轮询判据；FilePicker 文档约定：
+    /// 弹窗开着时主循环不得阻塞在 WaitEvent 上）。
+    static bool AnyPickerWants() {
+        if (ChildWindows.pickers == null) { return false; }
+        for (int i = 0; i < ChildWindows.pickers.Count; i = i + 1) {
+            FilePicker p = ChildWindows.pickers[i];
+            if (p.IsOpen() && p.NeedsRedraw()) { return true; }
+        }
+        return false;
+    }
+
+    /// 任一组件选择器开着（主循环用它收紧阻塞等待）。
+    static bool AnyPickerOpen() {
+        if (ChildWindows.pickers == null) { return false; }
+        for (int i = 0; i < ChildWindows.pickers.Count; i = i + 1) {
+            if (ChildWindows.pickers[i].IsOpen()) { return true; }
+        }
         return false;
     }
 
@@ -493,6 +530,34 @@ class ChildWindows {
             if (f >= 0 && (d < 0 || f < d)) { d = f; }
         }
         return d;
+    }
+
+    /// 组件选择器开着时把它的重绘需求折叠进主应用：轮询判据（开着时
+    /// 不得阻塞在 WaitEvent 上）+ 弹窗要出帧时唤醒主循环。
+    static bool PumpPickers(App main) {
+        if (ChildWindows.pickers == null) { return false; }
+        bool woken = false;
+        for (int i = 0; i < ChildWindows.pickers.Count; i = i + 1) {
+            FilePicker p = ChildWindows.pickers[i];
+            if (!p.IsOpen()) { continue; }
+            if (p.NeedsRedraw() && !woken) {
+                main.RequestRedraw();
+                woken = true;
+            }
+        }
+        return woken;
+    }
+
+    /// Prunes component pickers that have closed (each Upload keeps its own
+    /// picker instance alive for the next open; only the registry entry goes).
+    static void PrunePickers() {
+        if (ChildWindows.pickers == null) { return; }
+        List<FilePicker> keep = new List<FilePicker>();
+        for (int i = 0; i < ChildWindows.pickers.Count; i = i + 1) {
+            FilePicker p = ChildWindows.pickers[i];
+            if (p.IsOpen()) { keep.Add(p); }
+        }
+        ChildWindows.pickers = keep;
     }
 
     /// Requests a repaint on every window whose deadline has passed; true when
@@ -515,6 +580,15 @@ class ChildWindows {
             if (w.OwnsWindow(hwnd)) {
                 w.ApplyEvent(hwnd);
                 return true;
+            }
+        }
+        if (ChildWindows.pickers != null) {
+            for (int i = 0; i < ChildWindows.pickers.Count; i = i + 1) {
+                FilePicker p = ChildWindows.pickers[i];
+                if (p.OwnsWindow(hwnd)) {
+                    p.ApplyEvent(hwnd);
+                    return true;
+                }
             }
         }
         return false;
@@ -549,7 +623,16 @@ class ChildWindows {
                 ChildWindows.picker.RenderWindow();
             }
         }
+        // 组件自建的选择器（Upload 内建弹窗）：开着就出一帧。RenderWindow
+        // 内部自会跳过不需要重绘的帧。
+        if (ChildWindows.pickers != null) {
+            for (int i = 0; i < ChildWindows.pickers.Count; i = i + 1) {
+                FilePicker p = ChildWindows.pickers[i];
+                if (p.IsOpen()) { p.RenderWindow(); }
+            }
+        }
         ChildWindows.Prune();
+        ChildWindows.PrunePickers();
     }
 
     /// Folds the child deadlines into the main app's idle wait and wakes the
@@ -561,6 +644,11 @@ class ChildWindows {
         if (dl >= 0) { main.RequestWakeAt(dl); }
         int now = Window.GetTickMs();
         if (ChildWindows.TickDue(now)) { main.RequestRedraw(); }
+        // 组件选择器开着时保持主循环轮询（needsRedraw 常挂），否则
+        // Form.Run 会阻塞在 WaitEvent 上，弹窗永远出不了帧。
+        if (ChildWindows.AnyPickerOpen()) {
+            main.RequestRedraw();
+        }
     }
 
     static void FollowSkin(int i) {
