@@ -138,6 +138,33 @@ typedef struct {
     int cap;
 } nr_shadow_t;
 
+/* Chained hash indexes over the declared-type table. Two views of the same
+ * items array: by_full serves find_full (the per-reference lookup), by_simple
+ * groups same-simple-name declarations for conflict detection and
+ * count_simple -- both used to be linear scans. Semantics are preserved:
+ * find_full still returns the earliest-declared match; group walks compare
+ * keys explicitly, so hash collisions never merge distinct names. */
+typedef struct nr_chain {
+    int idx;            /* index into ctx->items */
+    int next;           /* next node in the bucket chain, -1 ends */
+} nr_chain_t;
+
+typedef struct {
+    int *buckets;       /* head chain node per bucket, -1 empty */
+    uint32_t mask;
+    nr_chain_t *chains;
+    int count;
+} nr_index_t;
+
+static uint32_t nr_hash(zan_istr_t s) {
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < s.len; i++) {
+        h ^= (unsigned char)s.str[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
 typedef struct {
     nr_type_t *items;
     int count;
@@ -147,7 +174,48 @@ typedef struct {
     /* Field names of the class being walked: like locals, a field shadows a
      * type of the same name when it is used as a receiver. */
     nr_shadow_t fields;
+    /* Hash indexes over items (built once after collection). find_full and
+     * count_simple were linear scans, which made nsresolve O(N^2) in the
+     * declared-type count: every type reference paid O(N). */
+    nr_index_t by_full;
+    nr_index_t by_simple;
 } nr_ctx_t;
+
+/* key_is_full: nonzero -> index by t->full, zero -> index by t->simple */
+static void nr_index_build(nr_index_t *ix, nr_type_t *items, int count,
+                           int key_is_full, zan_arena_t *arena) {
+    int nb = 16;
+    while (nb < count * 2) nb <<= 1;
+    ix->mask = (uint32_t)(nb - 1);
+    ix->buckets = (int *)zan_arena_alloc(arena, sizeof(int) * (size_t)nb);
+    ix->chains = (nr_chain_t *)zan_arena_alloc(arena,
+                    sizeof(nr_chain_t) * (size_t)(count > 0 ? count : 1));
+    ix->count = 0;
+    for (int i = 0; i < nb; i++) ix->buckets[i] = -1;
+    for (int i = 0; i < count; i++) {
+        zan_istr_t k = key_is_full ? items[i].full : items[i].simple;
+        uint32_t b = nr_hash(k) & ix->mask;
+        ix->chains[ix->count].idx = i;
+        ix->chains[ix->count].next = ix->buckets[b];
+        ix->buckets[b] = ix->count++;
+    }
+}
+
+/* Earliest-declared item (lowest index) whose key equals `key`, or -1. */
+static int nr_index_find(nr_index_t *ix, nr_type_t *items, int key_is_full,
+                         zan_istr_t key) {
+    int best = -1;
+    for (int node = ix->buckets[nr_hash(key) & ix->mask]; node >= 0;
+         node = ix->chains[node].next) {
+        zan_istr_t k = key_is_full ? items[ix->chains[node].idx].full
+                                   : items[ix->chains[node].idx].simple;
+        if (ns_istr_eq(k, key)) {
+            int idx = ix->chains[node].idx;
+            if (best < 0 || idx < best) best = idx;
+        }
+    }
+    return best;
+}
 
 static void shadow_add(nr_shadow_t *s, zan_istr_t name) {
     if (name.len == 0) return;
@@ -187,15 +255,18 @@ static void decl_set_name(zan_ast_node_t *d, zan_istr_t name) {
 }
 
 static nr_type_t *find_full(nr_ctx_t *c, zan_istr_t full) {
-    for (int i = 0; i < c->count; i++)
-        if (ns_istr_eq(c->items[i].full, full)) return &c->items[i];
-    return NULL;
+    int i = nr_index_find(&c->by_full, c->items, 1, full);
+    return i >= 0 ? &c->items[i] : NULL;
 }
 
 static int count_simple(nr_ctx_t *c, zan_istr_t simple) {
+    /* same-simple-name groups live in one bucket chain; count them there */
     int n = 0;
-    for (int i = 0; i < c->count; i++)
-        if (ns_istr_eq(c->items[i].simple, simple)) n++;
+    for (int node = c->by_simple.buckets[nr_hash(simple) & c->by_simple.mask];
+         node >= 0; node = c->by_simple.chains[node].next) {
+        if (ns_istr_eq(c->items[c->by_simple.chains[node].idx].simple, simple))
+            n++;
+    }
     return n;
 }
 
@@ -748,13 +819,21 @@ void zan_nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena, zan_diag_t *dia
         t->final = t->simple;
         t->conflicting = false;
     }
+    nr_index_build(&c.by_full, c.items, c.count, 1, arena);
+    nr_index_build(&c.by_simple, c.items, c.count, 0, arena);
 
-    /* 2. detect cross-namespace simple-name collisions */
-    for (int i = 0; i < c.count; i++) {
-        for (int j = i + 1; j < c.count; j++) {
-            if (ns_istr_eq(c.items[i].simple, c.items[j].simple) &&
-                !ns_istr_eq(c.items[i].full, c.items[j].full)) {
-                c.items[i].conflicting = true;
+    /* 2. detect cross-namespace simple-name collisions: walk each
+     * same-simple-name group once via the simple-name index instead of
+     * comparing every pair. */
+    for (int node = 0; node < c.count; node++) {
+        zan_istr_t simple = c.items[node].simple;
+        for (int other = c.by_simple.buckets[nr_hash(simple) & c.by_simple.mask];
+             other >= 0; other = c.by_simple.chains[other].next) {
+            int j = c.by_simple.chains[other].idx;
+            if (j <= node) continue;
+            if (ns_istr_eq(c.items[j].simple, simple) &&
+                !ns_istr_eq(c.items[node].full, c.items[j].full)) {
+                c.items[node].conflicting = true;
                 c.items[j].conflicting = true;
             }
         }

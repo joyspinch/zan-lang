@@ -38,6 +38,8 @@ static zan_symbol_t *make_symbol(zan_arena_t *arena, zan_sym_kind_t kind,
     s->members = NULL;
     s->member_count = 0;
     s->member_cap = 0;
+    s->name_hash = 0;
+    s->hash_next = NULL;
     return s;
 }
 
@@ -59,13 +61,49 @@ static void symbol_add_member(zan_arena_t *arena, zan_symbol_t *parent, zan_symb
 
 /* ---- scope management ---- */
 
+/* FNV-1a over the identifier bytes. The strings are not interned, so this
+ * hash is what makes scope lookups O(1): it costs one pass over the name,
+ * the same work as the single memcmp it replaces per candidate in the old
+ * linear scan. */
+static uint32_t istr_hash(zan_istr_t name) {
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < name.len; i++) {
+        h ^= (unsigned char)name.str[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
 static zan_scope_t *scope_new(zan_arena_t *arena, zan_scope_t *parent) {
     zan_scope_t *s = (zan_scope_t *)zan_arena_alloc(arena, sizeof(zan_scope_t));
     s->parent = parent;
     s->symbols = NULL;
     s->sym_count = 0;
     s->sym_cap = 0;
+    s->buckets = NULL;
+    s->bucket_count = 0;
     return s;
+}
+
+/* P2: grow the name index to the next power-of-two bucket count and rebuild
+ * it from the symbols array. Forward walk + tail-append keeps every bucket
+ * in insertion order. Old bucket arrays and dead hash links stay in the
+ * arena (wholesale-freed at end of compile, same geometric-waste pattern as
+ * the symbols array growth). */
+static void scope_index_grow(zan_arena_t *arena, zan_scope_t *scope) {
+    int nc = scope->bucket_count < 16 ? 16 : scope->bucket_count * 2;
+    zan_symbol_t **nb = (zan_symbol_t **)zan_arena_alloc(
+        arena, sizeof(*nb) * (size_t)nc);
+    memset(nb, 0, sizeof(*nb) * (size_t)nc);
+    for (int i = 0; i < scope->sym_count; i++) {
+        zan_symbol_t *sym = scope->symbols[i];
+        zan_symbol_t **tail = &nb[sym->name_hash & (uint32_t)(nc - 1)];
+        while (*tail) tail = &(*tail)->hash_next;
+        *tail = sym;
+        sym->hash_next = NULL;
+    }
+    scope->buckets = nb;
+    scope->bucket_count = nc;
 }
 
 static void scope_add(zan_arena_t *arena, zan_scope_t *scope, zan_symbol_t *sym) {
@@ -81,12 +119,27 @@ static void scope_add(zan_arena_t *arena, zan_scope_t *scope, zan_symbol_t *sym)
         scope->sym_cap = new_cap;
     }
     scope->symbols[scope->sym_count++] = sym;
+
+    /* P2: keep the name index in step with the array. New symbols are
+     * appended at the TAIL of their bucket so a bucket reads in insertion
+     * order -- scope_find's first-match tie-break for overloaded or
+     * redeclared names is bit-for-bit the old linear scan's. */
+    sym->name_hash = istr_hash(sym->name);
+    if (scope->sym_count > scope->bucket_count)   /* load factor 1 */
+        scope_index_grow(arena, scope);
+    zan_symbol_t **tail =
+        &scope->buckets[sym->name_hash & (uint32_t)(scope->bucket_count - 1)];
+    while (*tail) tail = &(*tail)->hash_next;
+    *tail = sym;
+    sym->hash_next = NULL;
 }
 
 static zan_symbol_t *scope_find(zan_scope_t *scope, zan_istr_t name) {
+    uint32_t h = istr_hash(name);
     for (zan_scope_t *s = scope; s; s = s->parent) {
-        for (int i = 0; i < s->sym_count; i++) {
-            zan_symbol_t *sym = s->symbols[i];
+        if (!s->bucket_count) continue;      /* empty scope: no index yet */
+        zan_symbol_t *sym = s->buckets[h & (uint32_t)(s->bucket_count - 1)];
+        for (; sym; sym = sym->hash_next) {
             if (sym->name.len == name.len &&
                 memcmp(sym->name.str, name.str, (size_t)name.len) == 0) {
                 return sym;

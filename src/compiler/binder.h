@@ -90,6 +90,14 @@ struct zan_symbol {
     zan_symbol_t **members;
     int member_count;
     int member_cap;
+
+    /* P2: scope name-index chain, owned by the scope the symbol was added
+     * to. name_hash is FNV-1a over `name`, computed once at scope_add;
+     * hash_next links the other symbols of the same hash bucket. Arena
+     * memory is not zeroed, so both fields must be initialized by
+     * make_symbol. */
+    uint32_t name_hash;
+    zan_symbol_t *hash_next;
 };
 
 /* ---- scope ---- */
@@ -99,6 +107,14 @@ struct zan_scope {
     zan_symbol_t **symbols;
     int sym_count;
     int sym_cap;
+    /* P2: O(1) name index over `symbols`. The array stays the authoritative
+     * storage in insertion order; `buckets` points at the same symbols,
+     * chained via hash_next with every bucket also kept in insertion order,
+     * so the first same-name symbol per scope is still the first one added
+     * and overload / redeclaration diagnostics see exactly what the old
+     * linear scan returned. */
+    zan_symbol_t **buckets;          /* NULL until the first symbol is added */
+    int bucket_count;                /* power of two, or 0 when empty */
 };
 
 /* ---- binder context ---- */
