@@ -4532,8 +4532,14 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                  * literal so the callee reads "" instead of
                                  * faulting. Hard mode exits inside the report;
                                  * --no-runtime-checks keeps the raw pointer. */
+                                /* Order-proof extern test (see
+                                 * sym_declares_extern): body presence via
+                                 * LLVMCountBasicBlocks misreads a Zan callee
+                                 * emitted earlier in file order as an extern
+                                 * and injects null guards around its string
+                                 * arguments. */
                                 if (g->runtime_checks && g->current_fn &&
-                                    LLVMCountBasicBlocks(g->functions[fi].fn) == 0) {
+                                    sym_declares_extern(method_sym)) {
                                     for (int k = 0; k < argc; k++) {
                                         if (LLVMGetTypeKind(LLVMTypeOf(call_args[k]))
                                                 != LLVMPointerTypeKind) continue;
@@ -4711,8 +4717,13 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                              * reads "" instead of faulting. Hard mode exits
                              * inside the report; --no-runtime-checks keeps
                              * the raw pointer. */
+                            /* Order-proof extern test (see
+                             * sym_declares_extern): route_generic_method may
+                             * hand back a specialized Zan callee whose body
+                             * has no basic blocks yet -- body presence is not
+                             * an extern signal. */
                             if (g->runtime_checks && g->current_fn &&
-                                LLVMCountBasicBlocks(mfn) == 0) {
+                                sym_declares_extern(method_sym)) {
                                 for (int k = 0; k < argc; k++) {
                                     if (LLVMGetTypeKind(LLVMTypeOf(call_args[k + extra]))
                                             != LLVMPointerTypeKind) continue;

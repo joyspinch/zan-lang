@@ -1727,12 +1727,51 @@ static void emit_string_len_set(zan_irgen_t *g, LLVMValueRef payload,
  * pointer (a struct, an int buffer, an nint) would widen the header probe to
  * values ARC never inspects. The lowered argument list may carry a receiver
  * ahead of the source arguments, so the two are aligned from the end. */
+/* Declared-extern test for a resolved callee symbol. A Zan→Zan call whose
+ * callee was emitted BEFORE the call site (cross-unit, file order) presents
+ * the same LLVM shape as an extern -- `LLVMCountBasicBlocks(fn) == 0` -- so
+ * body presence must never be consulted: this check reads the DECLARATION
+ * ([DllImport] lib name or the `extern` modifier), which is order-proof. */
+static bool sym_declares_extern(zan_symbol_t *sym) {
+    if (!sym || !sym->decl || sym->decl->kind != AST_METHOD_DECL) return false;
+    return sym->decl->method_decl.extern_lib.str != NULL ||
+           (sym->decl->method_decl.modifiers & MOD_EXTERN) != 0;
+}
+
+/* Resolve the callee symbol of `call` the way the binder sees it: an
+ * unqualified name (own-class static or scope lookup) or a
+ * `Class.Method(...)` member access. */
+static zan_symbol_t *extern_check_callee_sym(zan_irgen_t *g,
+                                             zan_ast_node_t *call) {
+    zan_ast_node_t *callee = call->call.callee;
+    if (!callee) return NULL;
+    if (callee->kind == AST_IDENTIFIER) {
+        if (g->current_type_sym)
+            return get_method_sym(g->current_type_sym,
+                                  callee->ident.name);
+        return zan_binder_lookup(g->binder, callee->ident.name);
+    }
+    if (callee->kind == AST_MEMBER_ACCESS &&
+        callee->member.object->kind == AST_IDENTIFIER) {
+        zan_symbol_t *cls = zan_binder_lookup(g->binder,
+            callee->member.object->ident.name);
+        if (cls) return get_method_sym(cls, callee->member.name);
+    }
+    return NULL;
+}
+
 static void emit_extern_call_len_invalidate(zan_irgen_t *g, LLVMValueRef fn,
                                             LLVMValueRef *args, int argc,
                                             zan_ast_node_t *call,
                                             local_scope_t *locals) {
     if (!fn || !args || argc <= 0 || !call) return;
-    if (!LLVMIsAFunction(fn) || LLVMCountBasicBlocks(fn) != 0) return;
+    if (!LLVMIsAFunction(fn)) return;
+    /* Order-proof extern test (see sym_declares_extern): a previously-emitted
+     * Zan callee carries no basic blocks yet, which used to be misread as
+     * "extern" and stripped every string argument's cached length -- frames
+     * and API replies containing NUL then collapsed at the first NUL. */
+    zan_symbol_t *cs = extern_check_callee_sym(g, call);
+    if (!sym_declares_extern(cs)) return;
     int m = call->call.args.count;
     if (m <= 0 || m > argc) return;
     for (int i = 0; i < m; i++) {
