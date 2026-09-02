@@ -62,6 +62,19 @@
 | B4 | `Contains/Distinct/In` 对引用类型支持 `Equals` 语义：新增 `EqualityComparer<T>` 委托重载（虚方法 `Equals` 受泛型统一表示限制） | **已完成** | `tests/conformance/linq_equality.zan` |
 | B5 | 文档：`docs/STDLIB.md` 增补 LINQ 章节，明确与 C# 的差异清单（急切求值、无 IEnumerable） | **已完成** | STDLIB.md §3.6 |
 | B6 | 惰性迭代器：`yield` 生成真正的惰性迭代器，LINQ 算子基于 IEnumerable 惰性链 | P2 | 无限序列 + Take 用例通过；现有急切用例不回归 |
+
+> **B6 定界结论（2026-09-03，探针实锤）**：现状是 parser 期急切脱糖
+>（`src/compiler/parser.c:3249-3420` `desugar_yield_method`：返回类型
+> `IEnumerable<T>` 改写为 `List<T>`、`yield return e` → `__yield.Add(e)`、
+> `yield break` → `return __yield`），checker/irgen 看到的已是 List。
+> 与 C# 惰性语义的实测差异：①无限序列 + Take 挂死（脱糖后立即跑满）；
+> ②副作用时序——`GetNums()` 调用行即全部执行，消费时机无所谓（C# 惰性
+> 到枚举才执行）；③try/finally 的 finally 先于消费执行。**定界为「方案
+> 后做」**：真惰性需要编译器级状态机 lowering（MoveNext/Current），改动
+> 面 = parser 脱糖移除 + irgen 状态机 + foreach 协议改造 + ARC 跨挂起
+> 存活，独立成一个专项而非顺手修；当前 List 降级对「有限序列 + 立即
+> 消费」的常规用法行为正确，挂死只出现在无限序列场景。计划随 B7
+> （查询语法）一并设计 IEnumerable 协议，避免 foreach/集合接口两翻改。
 | B7 | LINQ 查询语法（`from … where … select`）脱糖为方法链 | P2 | parser/binder 支持，conformance 覆盖 join/group |
 | B8 | 语言便利特性（按需）：`using` 声明、`init`/`with`、`checked` | P2 | 逐项 SPEC + conformance |
 | B9 | 编译器：修复泛型统一表示导致的 7 项 bug（泛型比较/相等、委托返回类型重载、Dictionary 泛型值、泛型累加器泄漏等），修复后可将 OrderByStr/ContainsStr 等并回 C# 同名重载 | **已完成** | `docs/bugs/generics-uniform-repr.md` 各条最小复现通过；`tests/conformance/generics_uniform_repr.zan` + `linq_csharp_overloads.zan`（OrderBy/Contains/Distinct/GroupBy/Sum/Min/Max/Average/In 同名重载已并回） |
