@@ -2667,6 +2667,20 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         break;
     }
 
+    case AST_CHECKED_STMT: {
+        /* checked { ... } / unchecked { ... }: emit the body under the
+         * requested overflow-checking context (irgen_checked_depth > 0 makes
+         * integer + - * trap on overflow; < 0 forces plain wrapping ops).
+         * The parenthesized form `checked(expr)` shares this node: its body
+         * is the expression, emitted as an expression statement's value. */
+        int saved = g->irgen_checked_depth;
+        g->irgen_checked_depth = stmt->checked_stmt.checked ? saved + 1
+                                                            : saved - 1;
+        emit_stmt(g, stmt->checked_stmt.body, locals);
+        g->irgen_checked_depth = saved;
+        break;
+    }
+
     case AST_LOCK_STMT: {
         /* lock (expr) body — enter/exit the runtime monitor around the body */
         g->uses_sync_runtime = true;

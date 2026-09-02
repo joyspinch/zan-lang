@@ -625,6 +625,11 @@ static void da_stmt(struct da_ctx *c, zan_ast_node_t *n) {
         da_try(c, n);
         return;
 
+    case AST_CHECKED_STMT:
+        /* transparent context wrapper */
+        da_stmt(c, n->checked_stmt.body);
+        return;
+
     case AST_LOCK_STMT:
         da_expr(c, n->lock_stmt.expr);
         da_stmt(c, n->lock_stmt.body);

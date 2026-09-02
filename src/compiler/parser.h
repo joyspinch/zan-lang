@@ -15,6 +15,10 @@ struct zan_parser {
     zan_token_t previous;
     int expr_depth; /* current expression recursion depth (stack-overflow guard) */
     int stmt_depth; /* current statement/block recursion depth (stack-overflow guard) */
+    int checked_depth; /* >0 while inside checked(...)/checked{...}: binary + - *
+                        * nodes get binary.checked = 1 (see ast.h) */
+    int unchecked_depth; /* >0 while inside unchecked(...)/unchecked{...}:
+                          * explicitly wrapping semantics (binary.checked = -1) */
     int synth_counter; /* unique-id seed for synthesized locals (using temp) */
     /* Synthesized property accessor methods (get_<name>/set_<name>) queued by
      * parse_member_decl_inner; drained into the enclosing type's members list

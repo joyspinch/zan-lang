@@ -471,6 +471,9 @@ static void collect_shadows(nr_ctx_t *c, zan_ast_node_t *n) {
         collect_shadows(c, n->lock_stmt.expr);
         collect_shadows(c, n->lock_stmt.body);
         break;
+    case AST_CHECKED_STMT:
+        collect_shadows(c, n->checked_stmt.body);
+        break;
     case AST_BINARY:
     case AST_ASSIGNMENT:
         collect_shadows(c, n->binary.left);
@@ -674,6 +677,10 @@ static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
     case AST_LOCK_STMT:
         nr_walk(c, n->lock_stmt.expr, ns, usings);
         nr_walk(c, n->lock_stmt.body, ns, usings);
+        break;
+
+    case AST_CHECKED_STMT:
+        nr_walk(c, n->checked_stmt.body, ns, usings);
         break;
 
     case AST_YIELD_STMT:

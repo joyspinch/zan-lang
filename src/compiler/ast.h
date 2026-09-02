@@ -105,6 +105,8 @@ typedef enum {
     AST_WHERE_CLAUSE, /* generic constraint: where T : C1, C2 */
     AST_YIELD_STMT,   /* yield return expr; / yield break; (desugared in parser) */
     AST_LOCK_STMT,    /* lock (expr) body */
+    AST_CHECKED_STMT, /* checked { body } / unchecked { body }: an overflow-
+                       * checking context wrapper (checked/unchecked field) */
     AST_GOTO_STMT,    /* goto label; */
     AST_LABEL_STMT,   /* label: */
     AST_QUERY_EXPR,   /* from x in src where c ... select e */
@@ -178,6 +180,10 @@ struct zan_ast_node {
              * subtree as the value-side operand; irgen keys single-evaluation
              * rewriting on this. */
             zan_token_kind_t compound_base;
+            /* AST_BINARY only: 1 when the expression was written inside
+             * `checked(...)` and must trap on integer overflow. (0 = leave
+             * the context decide.) */
+            int checked;
             zan_ast_node_t *left;
             zan_ast_node_t *right;
         } binary;
@@ -467,6 +473,13 @@ struct zan_ast_node {
             zan_ast_node_t *expr;
             zan_ast_node_t *body;
         } lock_stmt;
+
+        /* checked { body } / unchecked { body }: sets the overflow-checking
+         * context the body's integer + - * emit under (AST_CHECKED_STMT) */
+        struct {
+            zan_ast_node_t *body;
+            bool checked;
+        } checked_stmt;
 
         /* from var in source [clauses]* [group e by k [into g]]? [select p]
          * -- sub-clauses (where/let/orderby/join) sit in `clauses` in source

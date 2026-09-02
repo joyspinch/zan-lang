@@ -234,6 +234,12 @@ struct zan_irgen {
     /* finallys entered inside the innermost loop: break/continue run only those */
     int finally_loop_base;
 
+    /* Overflow-checking context while emitting a statement/expression: >0
+     * inside `checked(...)`/`checked { ... }` (integer + - * get an overflow
+     * guard), <0 inside `unchecked(...)`/`unchecked { ... }` (plain wrapping
+     * ops even under an enclosing checked), 0 = default wrapping semantics. */
+    int irgen_checked_depth;
+
     /* try statements whose handler is currently armed, innermost last. Entering
      * a try raises __zan_eh_top by one and the normal fallthrough out of its
      * body lowers it again, but `return`/`break`/`continue` branch past that

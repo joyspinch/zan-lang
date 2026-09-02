@@ -2814,6 +2814,7 @@ endforeach()
 
 foreach(_runtime_case IN ITEMS
     array_oob
+    checked_overflow
     list_removeat_oob
     list_insert_oob
     member_list_field_oob
@@ -2826,6 +2827,8 @@ foreach(_runtime_case IN ITEMS
      _runtime_case STREQUAL list_insert_oob OR
      _runtime_case STREQUAL member_list_field_oob)
     set(_runtime_regex "list index out of bounds")
+  elseif(_runtime_case STREQUAL checked_overflow)
+    set(_runtime_regex "integer overflow in checked operation")
   elseif(_runtime_case STREQUAL span_window_oob)
     set(_runtime_regex "span range out of bounds")
   elseif(_runtime_case STREQUAL span_negative_length)

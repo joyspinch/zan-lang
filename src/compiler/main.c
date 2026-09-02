@@ -674,6 +674,7 @@ static void dump_ast_node(zan_ast_node_t *node, int depth) {
         printf("NamespaceDecl%s\n",
                node->namespace_decl.is_file_scoped ? " (file-scoped)" : "");
         dump_ast_node(node->namespace_decl.name, depth + 1);
+        dump_list("members", &node->namespace_decl.members, depth + 1);
         break;
 
     case AST_CLASS_DECL:
@@ -842,7 +843,9 @@ static void dump_ast_node(zan_ast_node_t *node, int depth) {
         break;
 
     case AST_BINARY:
-        printf("Binary '%s'\n", zan_token_kind_name(node->binary.op));
+        printf("Binary '%s'%s%s\n", zan_token_kind_name(node->binary.op),
+               node->binary.checked > 0 ? " [checked]" : "",
+               node->binary.checked < 0 ? " [unchecked]" : "");
         dump_ast_node(node->binary.left, depth + 1);
         dump_ast_node(node->binary.right, depth + 1);
         break;
@@ -973,6 +976,12 @@ static void dump_ast_node(zan_ast_node_t *node, int depth) {
         if (node->enum_member.value) {
             dump_ast_node(node->enum_member.value, depth + 1);
         }
+        break;
+
+    case AST_CHECKED_STMT:
+        printf(node->checked_stmt.checked ? "CheckedBlock\n"
+                                          : "UncheckedBlock\n");
+        dump_ast_node(node->checked_stmt.body, depth + 1);
         break;
 
     default:

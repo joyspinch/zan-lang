@@ -1797,6 +1797,9 @@ static void tp_scan_stmt(tp_use_scan_t *s, zan_ast_node_t *st) {
         tp_scan_expr(s, st->while_stmt.cond);
         tp_scan_stmt(s, st->while_stmt.body);
         return;
+    case AST_CHECKED_STMT:
+        tp_scan_stmt(s, st->checked_stmt.body);
+        return;
     default:
         tp_scan_expr(s, st);
         return;

@@ -2624,6 +2624,11 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
     case AST_LABEL_STMT:
         break;
 
+    case AST_CHECKED_STMT:
+        /* overflow-checking context wrapper: only the body needs checking */
+        zan_checker_check_stmt(c, stmt->checked_stmt.body);
+        break;
+
     case AST_LOCK_STMT:
         no_runtime_reject(c, stmt->loc, "`lock`");
         zan_checker_check_expr(c, stmt->lock_stmt.expr);

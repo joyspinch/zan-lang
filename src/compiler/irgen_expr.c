@@ -305,6 +305,11 @@ static bool emit_bytes_call(zan_irgen_t *g, zan_ast_node_t *expr,
               (LLVMValueRef[]){ s, src, len }, 3, "");
     LLVMValueRef endp = LLVMBuildGEP2(g->builder, i8, s, &len, 1, "ts.end");
     LLVMBuildStore(g->builder, LLVMConstInt(i8, 0, 0), endp);
+    /* Stamp the caller-declared byte length instead of leaving it UNKNOWN:
+     * the first reader would otherwise cache a strlen, and a payload with an
+     * embedded NUL (MQTT/WS frames, binary bodies) silently shrank to the
+     * bytes before that NUL — frames truncated, indexes out of bounds. */
+    emit_string_len_set(g, s, len);
     /* Same owned-receiver release as the to_bytes branch above — a chained
      * `zip.Extract(...).ToStr()` leaked the receiver array on every call. */
     emit_release_owned_call_temp(g, callee->member.object, arr, locals);
@@ -439,6 +444,10 @@ static bool emit_native_memory_call(zan_irgen_t *g, zan_ast_node_t *expr,
             s, nm_addr(g, p, off), len }, 3, "");
         LLVMValueRef endp = LLVMBuildGEP2(g->builder, i8, s, &len, 1, "nm.gs.end");
         zan_store_fit(g, LLVMConstInt(i8, 0, 0), endp);
+        /* Same reasoning as the ToStr stamp below: the byte count is known
+         * here, and leaving it UNKNOWN lets the first reader cache a strlen
+         * that stops at an embedded NUL. */
+        emit_string_len_set(g, s, len);
         *out = s;
         return true;
     }
@@ -865,6 +874,15 @@ static LLVMValueRef emit_binary_op_values(zan_irgen_t *g, zan_ast_node_t *expr,
                                           LLVMValueRef left, LLVMValueRef right,
                                           local_scope_t *locals);
 
+/* Checked integer arithmetic: the overflow-detecting lowering for
+ * `checked(x + y)` and friends. Kind selects the operation (CHK_ADD/SUB/MUL).
+ * Defined after emit_binary_op_values's implementation; declared here for the
+ * TK_PLUS/MINUS/STAR cases above. */
+enum { CHK_ADD, CHK_SUB, CHK_MUL };
+static LLVMValueRef emit_checked_int_arith(zan_irgen_t *g, zan_ast_node_t *expr,
+                                           LLVMValueRef left, LLVMValueRef right,
+                                           int kind, local_scope_t *locals);
+
 /* `int?` and friends in a binary expression: null propagates through the
  * arithmetic operators, a comparison with a null operand is false, and `??`
  * unwraps. */
@@ -1258,16 +1276,42 @@ static LLVMValueRef emit_binary_op_values(zan_irgen_t *g, zan_ast_node_t *expr,
             (expr_is_ulong(g, expr->binary.left, locals) ||
              expr_is_ulong(g, expr->binary.right, locals));
 
+        /* Integer overflow trap under `checked(...)`: decided from both the
+         * per-node stamp the parser put on the arithmetic operator and the
+         * surrounding checked/unchecked statement context, so `unchecked(x+1)`
+         * inside a `checked { ... }` stays wrapping and vice versa. Only
+         * + - * can overflow (division's only fault is /0, already guarded);
+         * the result width is the reconciled operand width from
+         * coerce_int_pair, and bool (i1) arithmetic never overflows. */
+        int check_ctx = expr->binary.checked
+            ? (expr->binary.checked > 0 ? 1 : -1)
+            : (g->irgen_checked_depth > 0 ? 1 : 0);
+        bool want_overflow_check = check_ctx > 0 && !is_float && !is_unsigned;
+        LLVMTypeRef res_ty = LLVMTypeOf(left);
+        if (want_overflow_check &&
+            !(LLVMGetTypeKind(res_ty) == LLVMIntegerTypeKind &&
+              LLVMGetIntTypeWidth(res_ty) > 1))
+            want_overflow_check = false;
+
         switch (expr->binary.op) {
         case TK_PLUS:
-            return is_float ? LLVMBuildFAdd(g->builder, left, right, "add")
-                            : zan_add(g->builder, left, right, "add");
+            if (is_float) return LLVMBuildFAdd(g->builder, left, right, "add");
+            if (want_overflow_check)
+                return emit_checked_int_arith(g, expr, left, right,
+                                              CHK_ADD, locals);
+            return zan_add(g->builder, left, right, "add");
         case TK_MINUS:
-            return is_float ? LLVMBuildFSub(g->builder, left, right, "sub")
-                            : zan_sub(g->builder, left, right, "sub");
+            if (is_float) return LLVMBuildFSub(g->builder, left, right, "sub");
+            if (want_overflow_check)
+                return emit_checked_int_arith(g, expr, left, right,
+                                              CHK_SUB, locals);
+            return zan_sub(g->builder, left, right, "sub");
         case TK_STAR:
-            return is_float ? LLVMBuildFMul(g->builder, left, right, "mul")
-                            : zan_mul(g->builder, left, right, "mul");
+            if (is_float) return LLVMBuildFMul(g->builder, left, right, "mul");
+            if (want_overflow_check)
+                return emit_checked_int_arith(g, expr, left, right,
+                                              CHK_MUL, locals);
+            return zan_mul(g->builder, left, right, "mul");
         case TK_SLASH:
             if (is_float) return LLVMBuildFDiv(g->builder, left, right, "div");
             {
@@ -1344,6 +1388,123 @@ static LLVMValueRef emit_binary_op_values(zan_irgen_t *g, zan_ast_node_t *expr,
         default:
             return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
         }
+}
+
+/* ---- checked integer arithmetic ----------------------------------------
+ * `checked(x + y)` / `x - y` under `checked { ... }` must trap on overflow
+ * instead of silently wrapping (WMS money math sits on int/long). The
+ * wrapping result and the overflow predicate are computed from the same
+ * operands; the predicate feeds emit_runtime_check, which reports
+ * "runtime error: integer overflow in checked operation" and continues with
+ * the (wrapped) result in soft mode or exits in hard mode. */
+static LLVMValueRef emit_checked_int_arith(zan_irgen_t *g, zan_ast_node_t *expr,
+                                           LLVMValueRef left, LLVMValueRef right,
+                                           int kind, local_scope_t *locals) {
+    LLVMTypeRef ty = LLVMTypeOf(left);
+    unsigned bits = LLVMGetIntTypeWidth(ty);
+    bool is_unsigned = expr_is_ulong(g, expr->binary.left, locals) ||
+                       expr_is_ulong(g, expr->binary.right, locals);
+    /* `int` operands compute in i64 here (literal widening in coerce_int_pair
+     * reconciles an int local against an int literal by sext), but the
+     * overflow contract is C#'s: the trap range is the declared operand
+     * type's, INT32.MIN..MAX. When both static types are `int` and the LLVM
+     * math width is wider, clamp-check against the i32 range instead of
+     * comparing signs in the wide type (which never traps for 32-bit
+     * inputs). 64-bit operands keep the sign-form predicates on their own
+     * width. */
+    bool clamp32 = !is_unsigned && bits > 32 &&
+                   expr_is_int32(g, expr->binary.left, locals) &&
+                   expr_is_int32(g, expr->binary.right, locals);
+    LLVMValueRef res, ovf;
+    if (kind == CHK_ADD) {
+        res = zan_add(g->builder, left, right, "ck.add");
+        if (is_unsigned)
+            ovf = zan_icmp(g->builder, LLVMIntULT, res, left, "ck.add.ovf");
+        else if (clamp32) {
+            /* res in i64: overflow iff res < INT32.MIN || res > INT32.MAX */
+            LLVMValueRef lo = LLVMConstInt(ty, -(1LL << 31), 1);
+            LLVMValueRef hi = LLVMConstInt(ty, (1LL << 31) - 1, 1);
+            LLVMValueRef under = zan_icmp(g->builder, LLVMIntSLT, res, lo,
+                "ck.lo");
+            LLVMValueRef over = zan_icmp(g->builder, LLVMIntSGT, res, hi,
+                "ck.hi");
+            ovf = zan_or(g->builder, under, over, "ck.add.ovf");
+        }
+        else {
+            /* overflow iff operands share a sign and the result's sign
+             * differs from left's: ovf = same_sign(lr) AND (res != left) */
+            LLVMValueRef lneg = zan_icmp(g->builder, LLVMIntSLT, left,
+                LLVMConstInt(ty, 0, 0), "ck.sl");
+            LLVMValueRef rneg = zan_icmp(g->builder, LLVMIntSLT, right,
+                LLVMConstInt(ty, 0, 0), "ck.sr");
+            LLVMValueRef same_sign_lr = zan_icmp(g->builder, LLVMIntEQ,
+                lneg, rneg, "ck.sign.lr");
+            LLVMValueRef res_neg = zan_icmp(g->builder, LLVMIntSLT, res,
+                LLVMConstInt(ty, 0, 0), "ck.sr2");
+            LLVMValueRef res_diff_left = zan_xor(g->builder, res_neg, lneg,
+                "ck.sign.r");
+            ovf = zan_and(g->builder, same_sign_lr, res_diff_left,
+                          "ck.add.ovf");
+        }
+    } else if (kind == CHK_SUB) {
+        res = zan_sub(g->builder, left, right, "ck.sub");
+        if (is_unsigned)
+            ovf = zan_icmp(g->builder, LLVMIntULT, left, right, "ck.sub.ovf");
+        else if (clamp32) {
+            LLVMValueRef lo = LLVMConstInt(ty, -(1LL << 31), 1);
+            LLVMValueRef hi = LLVMConstInt(ty, (1LL << 31) - 1, 1);
+            LLVMValueRef under = zan_icmp(g->builder, LLVMIntSLT, res, lo,
+                "ck.lo");
+            LLVMValueRef over = zan_icmp(g->builder, LLVMIntSGT, res, hi,
+                "ck.hi");
+            ovf = zan_or(g->builder, under, over, "ck.sub.ovf");
+        }
+        else {
+            /* overflow iff operand signs differ AND the result's sign
+             * differs from left's */
+            LLVMValueRef lneg = zan_icmp(g->builder, LLVMIntSLT, left,
+                LLVMConstInt(ty, 0, 0), "ck.sl");
+            LLVMValueRef rneg = zan_icmp(g->builder, LLVMIntSLT, right,
+                LLVMConstInt(ty, 0, 0), "ck.sr");
+            LLVMValueRef diff_sign = zan_xor(g->builder, lneg, rneg,
+                "ck.diff");
+            LLVMValueRef res_neg = zan_icmp(g->builder, LLVMIntSLT, res,
+                LLVMConstInt(ty, 0, 0), "ck.sr2");
+            LLVMValueRef res_diff_left = zan_xor(g->builder, res_neg, lneg,
+                "ck.sign.r");
+            ovf = zan_and(g->builder, diff_sign, res_diff_left, "ck.sub.ovf");
+        }
+    } else { /* CHK_MUL */
+        if (is_unsigned) {
+            /* left != 0 && res / left != right */
+            LLVMValueRef nonzero = zan_icmp(g->builder, LLVMIntNE, left,
+                LLVMConstInt(ty, 0, 0), "ck.nz");
+            LLVMValueRef q = zan_udiv(g->builder, res, left, "ck.mul.q");
+            LLVMValueRef back = zan_icmp(g->builder, LLVMIntNE, q, right,
+                "ck.mul.back");
+            ovf = zan_and(g->builder, nonzero, back, "ck.mul.ovf");
+        } else {
+            /* C# style: extend both to double-width, multiply, compare the
+             * wide product against the sign/zero extension of the narrow
+             * result. Cheaper alternative kept branch-free via signs only
+             * breaks on INT_MIN*-1, so do the width doubling. */
+            LLVMTypeRef wide = LLVMIntTypeInContext(g->ctx, bits * 2);
+            LLVMValueRef wl, wr, wp;
+            wl = LLVMBuildSExt(g->builder, left, wide, "ck.mul.wl");
+            wr = LLVMBuildSExt(g->builder, right, wide, "ck.mul.wr");
+            wp = LLVMBuildMul(g->builder, wl, wr, "ck.mul.wp");
+            LLVMValueRef narrow = LLVMBuildTrunc(g->builder, wp, ty, "ck.mul.tr");
+            LLVMValueRef back = LLVMBuildSExt(g->builder, narrow, wide,
+                "ck.mul.back");
+            ovf = zan_icmp(g->builder, LLVMIntNE, wp, back, "ck.mul.ovf");
+            /* the narrow product IS the (wrapped) result */
+            res = narrow;
+        }
+    }
+    emit_runtime_check(g, ovf, expr->loc,
+        "integer overflow in checked operation");
+    (void)locals;
+    return res;
 }
 
 /* A binary node with the same operands but a different operator, so a lifted
@@ -8077,6 +8238,19 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
     case AST_LAMBDA:
         return emit_lambda_typed(g, expr, NULL, locals);
 
+    case AST_CHECKED_STMT:
+        /* `checked(expr)` / `unchecked(expr)` in expression position: the
+         * parser wraps the expression in this node. Enter the requested
+         * context, emit the inner expression as the wrapper's value. */
+        {
+            int saved = g->irgen_checked_depth;
+            g->irgen_checked_depth = expr->checked_stmt.checked
+                ? saved + 1 : saved - 1;
+            LLVMValueRef v = emit_expr(g, expr->checked_stmt.body, locals);
+            g->irgen_checked_depth = saved;
+            return v;
+        }
+
     default:
         return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
     }
@@ -8344,6 +8518,7 @@ static void cap_scan(capture_scan_t *cs, zan_ast_node_t *n) {
                               cap_scan(cs, n->switch_case.body); return;
     case AST_LOCK_STMT:       cap_scan(cs, n->lock_stmt.expr);
                               cap_scan(cs, n->lock_stmt.body); return;
+    case AST_CHECKED_STMT:    cap_scan(cs, n->checked_stmt.body); return;
     case AST_YIELD_STMT:      cap_scan(cs, n->yield_stmt.value); return;
     default: return;
     }
@@ -8710,6 +8885,7 @@ static void body_write_collect(zan_irgen_t *g, zan_ast_node_t *n,
                               body_write_collect(g, n->switch_case.body, body, lam_depth); return;
     case AST_LOCK_STMT:       body_write_collect(g, n->lock_stmt.expr, body, lam_depth);
                               body_write_collect(g, n->lock_stmt.body, body, lam_depth); return;
+    case AST_CHECKED_STMT:    body_write_collect(g, n->checked_stmt.body, body, lam_depth); return;
     case AST_YIELD_STMT:      body_write_collect(g, n->yield_stmt.value, body, lam_depth); return;
     default: return;
     }

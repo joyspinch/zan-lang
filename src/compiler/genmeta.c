@@ -773,6 +773,9 @@ static void gm_walk_stmt(zan_ast_node_t *n, gm_ctx_t *c) {
         gm_walk_expr(n->lock_stmt.expr, c);
         gm_walk_stmt(n->lock_stmt.body, c);
         break;
+    case AST_CHECKED_STMT:
+        gm_walk_stmt(n->checked_stmt.body, c);
+        break;
     case AST_YIELD_STMT:
         gm_walk_expr(n->yield_stmt.value, c);
         break;
@@ -1155,6 +1158,9 @@ static void gm_find_stmt(zan_ast_node_t *n, gm_find_ctx_t *f) {
     case AST_LOCK_STMT:
         gm_find_expr(n->lock_stmt.expr, f);
         gm_find_stmt(n->lock_stmt.body, f);
+        break;
+    case AST_CHECKED_STMT:
+        gm_find_stmt(n->checked_stmt.body, f);
         break;
     case AST_YIELD_STMT:
         gm_find_expr(n->yield_stmt.value, f);

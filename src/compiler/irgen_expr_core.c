@@ -2248,6 +2248,16 @@ static bool expr_is_ulong(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *loca
     return t && t->kind == TYPE_ULONG;
 }
 
+/* True when an expression's static type is 32-bit int (the C# `int`). Checked
+ * arithmetic on such operands must detect overflow against the INT32 range:
+ * literal operands are widened to i64 before the add (coerce_int_pair), so
+ * without this the sign predicate compares inside i64 and silently misses
+ * INT_MAX+1. */
+static bool expr_is_int32(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {
+    zan_type_t *t = infer_expr_type(g, e, locals);
+    return t && t->kind == TYPE_INT;
+}
+
 /* True when an expression's static type is bool, so Console.WriteLine/Write
  * render it as true/false instead of falling into the integer path. */
 static bool expr_is_bool(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {

@@ -591,20 +591,39 @@ static zan_ast_node_t *parse_call_arg(zan_parser_t *p);
 static zan_ast_node_t *parse_primary(zan_parser_t *p) {
     zan_loc_t loc = p->current.loc;
 
-    /* checked/unchecked: accepted for C# source compatibility. Overflow
-     * checking is always off in this runtime (wrapping semantics), so both
-     * forms lower to a plain expression — a no-op. Contextual: only when the
-     * identifier is followed by `(` or `{`. */
+    /* checked(...) / unchecked(...): the parenthesized form is an expression
+     * in an explicit overflow-checking context -- wrap it in an AST_CHECKED_STMT
+     * node so irgen can lower the inner integer + - * with overflow guards
+     * (checked) or plain wrapping ops (unchecked). Contextual: only when the
+     * identifier is followed by `(` or `{`, so variables named checked
+     * keep working. */
     if (is_checked_use(p)) {
         bool is_checked = p->current.str_val.len == 7;
+        zan_loc_t cloc = p->current.loc;
         parser_advance(p); /* checked | unchecked */
+        if (is_checked) p->checked_depth++; else p->unchecked_depth++;
         if (parser_check(p, TK_LPAREN)) {
             parser_advance(p); /* ( */
-            zan_ast_node_t *n = parse_expression(p);
+            zan_ast_node_t *inner = parse_expression(p);
             parser_expect(p, TK_RPAREN);
+            if (is_checked) p->checked_depth--; else p->unchecked_depth--;
+            zan_ast_node_t *n = zan_ast_new(p->arena, AST_CHECKED_STMT, cloc);
+            n->checked_stmt.checked = is_checked;
+            /* an expression wrapper: reuse `body` for the expression */
+            n->checked_stmt.body = inner;
             return n;
         }
-        return parse_block(p); /* checked { ... } statement block */
+        /* checked { ... } in expression position (e.g. inside an
+         * initializer): same fresh-wrapper rule as the statement form --
+         * kind-mutating the block would alias block.stmts.items into
+         * checked_stmt.body. The parsed block rides as the body; irgen's
+         * expression-path case emits it as an expression. */
+        zan_ast_node_t *blk = parse_block(p);
+        if (is_checked) p->checked_depth--; else p->unchecked_depth--;
+        zan_ast_node_t *n = zan_ast_new(p->arena, AST_CHECKED_STMT, cloc);
+        n->checked_stmt.checked = is_checked;
+        n->checked_stmt.body = blk;
+        return n;
     }
 
     /* Type keyword as a static receiver: `int.Parse(...)`, `string.Join(...)`.
@@ -1814,6 +1833,13 @@ static zan_ast_node_t *parse_binary(zan_parser_t *p, int min_prec) {
         zan_ast_node_t *right = parse_binary(p, prec + 1);
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_BINARY, loc);
         n->binary.op = op;
+        /* Stamp the overflow-checking context on the arithmetic operators it
+         * can apply to (see ast.h binary.checked); comparison/bitwise/shift
+         * nodes stay 0. */
+        if (op == TK_PLUS || op == TK_MINUS || op == TK_STAR) {
+            if (p->checked_depth > 0) n->binary.checked = 1;
+            else if (p->unchecked_depth > 0) n->binary.checked = -1;
+        }
         n->binary.left = left;
         n->binary.right = right;
         left = n;
@@ -2864,14 +2890,24 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         return n;
     }
 
-    /* `checked { ... }` / `unchecked { ... }` statement block -- accepted
-     * for C# compatibility, lowered to a plain block (no-op). Contextual, so
+    /* `checked { ... }` / `unchecked { ... }` statement block: an explicit
+     * overflow-checking context (AST_CHECKED_STMT). Contextual, so
      * identifiers named `checked` keep working as variables/parameters. */
     if (is_checked_use(p) && zan_lexer_peek(p->lex).kind == TK_LBRACE) {
         zan_loc_t loc = p->current.loc;
+        bool is_checked = p->current.str_val.len == 7;
         parser_advance(p); /* checked | unchecked */
-        zan_ast_node_t *n = parse_block(p);
-        n->loc = loc;
+        if (is_checked) p->checked_depth++; else p->unchecked_depth++;
+        zan_ast_node_t *blk = parse_block(p);
+        if (is_checked) p->checked_depth--; else p->unchecked_depth--;
+        /* A FRESH wrapper node, not a kind-mutation of the block: the union
+         * is untagged, and AST_CHECKED_STMT's checked_stmt.body aliases
+         * AST_BLOCK's block.stmts.items -- reusing the block node makes
+         * `body` read the stmt-array pointer as a child node (garbage kind,
+         * silently dropped body). The block rides as the body. */
+        zan_ast_node_t *n = zan_ast_new(p->arena, AST_CHECKED_STMT, loc);
+        n->checked_stmt.checked = is_checked;
+        n->checked_stmt.body = blk;
         return n;
     }
 
