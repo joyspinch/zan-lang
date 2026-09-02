@@ -900,30 +900,90 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 }
             }
 
-            /* regular type inference from initializer */
+            /* regular type inference from initializer. Static inference runs
+             * FIRST: a class/List/Dict/array/delegate value is a pointer at
+             * the LLVM layer, so keying the type off the LLVM kind alone
+             * stamped every one of them `string` -- member access then died
+             * with "'string' has no member", `x.Length` read the List header
+             * via strlen, and scope exit ran the string releaser on a class
+             * instance (both a correctness and a memory-safety bug). The
+             * LLVM-kind table below is only the fallback for initializers
+             * whose static type inference cannot see through (extern ABI
+             * results, untyped bare names), where the old heuristics remain
+             * the best available guess. */
+            type = infer_expr_type(g, init, locals);
             LLVMValueRef init_val = emit_expr(g, init, locals);
             LLVMTypeRef init_type = LLVMTypeOf(init_val);
             LLVMValueRef alloca = emit_entry_alloca(g, init_type, "var");
             zan_store_fit(g, init_val, alloca);
-            if (LLVMGetTypeKind(init_type) == LLVMDoubleTypeKind) {
-                type = g->binder->type_double;
-            } else if (LLVMGetTypeKind(init_type) == LLVMFloatTypeKind) {
-                type = g->binder->type_float;
-            } else if (LLVMGetTypeKind(init_type) == LLVMPointerTypeKind) {
-                type = g->binder->type_string;
-            } else if (LLVMGetTypeKind(init_type) == LLVMIntegerTypeKind) {
-                unsigned bits = LLVMGetIntTypeWidth(init_type);
-                if (bits <= 32) type = g->binder->type_int;
-                else type = g->binder->type_long;
-            } else if (llvm_is_nullable(init_type)) {
-                /* `var v = maybe;` keeps the nullable type, so `v.HasValue`
-                 * still resolves. */
-                zan_type_t *it = infer_expr_type(g, init, locals);
-                type = (it && it->kind == TYPE_NULLABLE) ? it : g->binder->type_int;
-            } else {
-                type = g->binder->type_int;
+            if (type) {
+                /* reject a static type that cannot actually describe this
+                 * value (e.g. inference answered through an unrelated path) */
+                LLVMTypeRef mt = map_type(g, type);
+                bool shape_ok =
+                    LLVMGetTypeKind(mt) == LLVMGetTypeKind(init_type);
+                if (LLVMGetTypeKind(init_type) == LLVMPointerTypeKind)
+                    shape_ok = LLVMGetTypeKind(mt) == LLVMPointerTypeKind ||
+                        type->kind == TYPE_NULLABLE;
+                if (!shape_ok) type = NULL;
             }
-            if (type && type->kind == TYPE_STRING) {
+            if (!type) {
+                if (LLVMGetTypeKind(init_type) == LLVMDoubleTypeKind) {
+                    type = g->binder->type_double;
+                } else if (LLVMGetTypeKind(init_type) == LLVMFloatTypeKind) {
+                    type = g->binder->type_float;
+                } else if (LLVMGetTypeKind(init_type) == LLVMPointerTypeKind) {
+                    type = g->binder->type_string;
+                } else if (LLVMGetTypeKind(init_type) == LLVMIntegerTypeKind) {
+                    unsigned bits = LLVMGetIntTypeWidth(init_type);
+                    if (bits <= 32) type = g->binder->type_int;
+                    else type = g->binder->type_long;
+                } else if (llvm_is_nullable(init_type)) {
+                    /* `var v = maybe;` keeps the nullable type, so `v.HasValue`
+                     * still resolves. Static inference could not answer (or was
+                     * shape-rejected), so retry it just for the nullable kind. */
+                    zan_type_t *it = infer_expr_type(g, init, locals);
+                    type = (it && it->kind == TYPE_NULLABLE) ? it : g->binder->type_int;
+                } else {
+                    type = g->binder->type_int;
+                }
+            }
+            if (type && type->kind == TYPE_NULLABLE &&
+                !llvm_is_nullable(init_type)) {
+                /* the static type says nullable but the value arrived bare
+                 * (a struct payload): rebuild the nullable wrapper below */
+                type = NULL;
+            }
+            if (type && type->kind == TYPE_NULLABLE) {
+                /* keep the nullable type: `var v = maybe;` still answers
+                 * v.HasValue, and the slot stores the wrapper struct */
+                LLVMTypeRef nst = map_type(g, type);
+                LLVMValueRef nslot = emit_entry_alloca(g, nst, "var");
+                zan_store_fit(g, init_val, nslot);
+                local_add(locals, stmt->var_decl.name, nslot, type);
+                return;
+            }
+            bool type_is_string = type && type->kind == TYPE_STRING;
+            bool type_is_ptr_class = type &&
+                (type->kind == TYPE_CLASS || type->kind == TYPE_INTERFACE ||
+                 ((type->kind == TYPE_STRUCT) && type->sym &&
+                  get_struct_llvm_type(g, type->sym) &&
+                  LLVMGetTypeKind(get_struct_llvm_type(g, type->sym)) ==
+                      LLVMPointerTypeKind));
+            if (type_is_ptr_class || (type_is_string && init_val &&
+                LLVMGetTypeKind(init_type) != LLVMPointerTypeKind)) {
+                /* A class/interface instance captured by value into an owning
+                 * slot: `new`/call results are (+1) owned, borrowed loads are
+                 * retained -- same contract as the typed path below. */
+                LLVMTypeRef llvm_t = map_type(g, type);
+                LLVMValueRef slot = emit_entry_alloca(g, llvm_t, "var");
+                zan_store_fit(g, LLVMConstNull(llvm_t), slot);
+                emit_rc_capture_local(g, type, slot, init_val, init, locals);
+                local_add(locals, stmt->var_decl.name, slot, type);
+                arc_own_local(g, locals);
+                return;
+            }
+            if (type_is_string) {
                 LLVMTypeRef llvm_string = map_type(g, type);
                 LLVMValueRef slot = emit_entry_alloca(g, llvm_string, "var");
                 zan_store_fit(g, LLVMConstNull(llvm_string), slot);
@@ -931,6 +991,31 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 local_add(locals, stmt->var_decl.name, slot, type);
                 if (call_targets_extern(g, init))
                     locals->vars[locals->count - 1].opaque_string = 1;
+                arc_own_local(g, locals);
+                return;
+            }
+            if (type && is_rc_managed_type(type) &&
+                LLVMGetTypeKind(init_type) == LLVMPointerTypeKind &&
+                !type_is_ptr_class) {
+                /* List<T>/Dict/arrays/delegates from a static call: the slot
+                 * keeps the pointer, the local owns it for scope-exit release
+                 * (matches the typed path's arc_own handling). */
+                LLVMTypeRef llvm_t = map_type(g, type);
+                LLVMValueRef slot = emit_entry_alloca(g, llvm_t, "var");
+                zan_store_fit(g, LLVMConstNull(llvm_t), slot);
+                emit_rc_capture_local(g, type, slot, init_val, init, locals);
+                local_add(locals, stmt->var_decl.name, slot, type);
+                arc_own_local(g, locals);
+                return;
+            }
+            if (type && (type->kind == TYPE_ARRAY)) {
+                /* an array value from a static call: plain pointer slot like
+                 * the typed path, no extra capture (arrays own via their
+                 * prefix refcount and release through the typed path) */
+                LLVMTypeRef llvm_t = map_type(g, type);
+                LLVMValueRef slot = emit_entry_alloca(g, llvm_t, "var");
+                zan_store_fit(g, init_val, slot);
+                local_add(locals, stmt->var_decl.name, slot, type);
                 arc_own_local(g, locals);
                 return;
             }
