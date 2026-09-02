@@ -407,6 +407,20 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/toolchain/wasm32/libc.a")
                 $<TARGET_FILE_DIR:zanc>/wasm32)
 endif()
 
+# ---- Android bionic sysroot subset (android-x64/arm64 cross-compilation) ----
+if(EXISTS "${CMAKE_SOURCE_DIR}/toolchain/android-x64/libc.a")
+    list(APPEND _cross_sysroot_cmds
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${CMAKE_SOURCE_DIR}/toolchain/android-x64"
+                $<TARGET_FILE_DIR:zanc>/android-x64)
+endif()
+if(EXISTS "${CMAKE_SOURCE_DIR}/toolchain/android-arm64/libc.a")
+    list(APPEND _cross_sysroot_cmds
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${CMAKE_SOURCE_DIR}/toolchain/android-arm64"
+                $<TARGET_FILE_DIR:zanc>/android-arm64)
+endif()
+
 # Stage every cross sysroot on each build, so a rebuilt runtime object reaches
 # the copy zanc actually links against (see the Linux sysroot note above).
 if(_cross_sysroot_cmds)
@@ -1269,6 +1283,23 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/toolchain/wasm32/libc.a"
             -o ${CMAKE_BINARY_DIR}/conf_try_catch_wasm32.wasm
             ${CMAKE_SOURCE_DIR}/tests/conformance/try_catch.zan)
   set_tests_properties(conformance_try_catch_wasm32 PROPERTIES TIMEOUT 120)
+endif()
+
+# ---- Android: cross-compile + static bionic link ---------------------------
+# Same pattern as the wasm32 case above: the suite cannot RUN an Android
+# executable, so the assertion is "compiles AND statically links against the
+# committed NDK sysroot subset" (ld.lld runs from PATH). Runtime semantics are
+# covered by conformance_try_catch natively; the emulator run of this exact
+# binary is documented in docs/platform-targets.md. Guarded on the android
+# sysroot subset being present, and on the linker the NDK libc.a needs
+# (bionic's libc.a must not be zstd-compressed; committed copies are
+# decompressed). API 28 objects.
+if(EXISTS "${CMAKE_SOURCE_DIR}/toolchain/android-x64/libc.a")
+  add_test(NAME conformance_try_catch_android
+    COMMAND $<TARGET_FILE:zanc> --auto-stdlib --target android-x64
+            -o ${CMAKE_BINARY_DIR}/conf_try_catch_android
+            ${CMAKE_SOURCE_DIR}/tests/conformance/try_catch.zan)
+  set_tests_properties(conformance_try_catch_android PROPERTIES TIMEOUT 120)
 endif()
 
 # ---- Determinism: codegen must be a pure function of the source ----

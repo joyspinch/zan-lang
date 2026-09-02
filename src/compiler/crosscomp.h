@@ -21,6 +21,7 @@ typedef enum {
     ZAN_OS_LINUX,
     ZAN_OS_MACOS,
     ZAN_OS_WASI,
+    ZAN_OS_ANDROID,
     ZAN_OS_FREESTANDING,
 } zan_os_t;
 

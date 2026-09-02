@@ -48,6 +48,33 @@
 #include <features.h>
 #endif
 
+#if defined(__ANDROID__)
+/* bionic does not implement shm_open/shm_unlink (_POSIX_SHARED_MEMORY_OBJECTS
+ * is __BIONIC_POSIX_FEATURE_MISSING). Back the calls with regular files in a
+ * writable directory -- ZAN_SHM_DIR if set, else /data/local/tmp, where adb-run
+ * CLI programs live; an app embedding the runtime sets ZAN_SHM_DIR to its own
+ * files dir at startup. The anonymous-table path (shm_open + immediate
+ * shm_unlink) keeps its fd-open mapping semantics; the name is just a path. */
+static const char *zan_android_shm_dir(void) {
+    const char *d = getenv("ZAN_SHM_DIR");
+    return (d && d[0]) ? d : "/data/local/tmp";
+}
+static int zan_android_shm_open(const char *name, int flags, mode_t mode) {
+    char path[288];
+    if (name[0] == '/') name++;
+    snprintf(path, sizeof(path), "%s/%s", zan_android_shm_dir(), name);
+    return open(path, flags | O_CLOEXEC, mode);
+}
+static int zan_android_shm_unlink(const char *name) {
+    char path[288];
+    if (name[0] == '/') name++;
+    snprintf(path, sizeof(path), "%s/%s", zan_android_shm_dir(), name);
+    return unlink(path);
+}
+#define shm_open(n, f, m) zan_android_shm_open((n), (f), (m))
+#define shm_unlink(n) zan_android_shm_unlink((n))
+#endif
+
 #if !defined(_WIN32) && !defined(O_NOFOLLOW)
 #define O_NOFOLLOW 0
 #endif

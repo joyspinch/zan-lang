@@ -1385,6 +1385,8 @@ static const char *zan_driver_subdir(const zan_target_t *t) {
              : (t->arch == ZAN_ARCH_RISCV64) ? "linux-riscv64" : "linux-x64";
     if (t->os == ZAN_OS_MACOS)
         return (t->arch == ZAN_ARCH_AARCH64) ? "macos-arm64" : "macos-x64";
+    if (t->os == ZAN_OS_ANDROID)
+        return (t->arch == ZAN_ARCH_AARCH64) ? "android-arm64" : "android-x64";
     return (t->arch == ZAN_ARCH_AARCH64) ? "win-arm64" : "win-x64";
 }
 
@@ -2208,6 +2210,13 @@ int main(int argc, char **argv) {
             break;
         case ZAN_OS_LINUX:
             zan_lexer_define(&lex, "LINUX", "1");
+            break;
+        case ZAN_OS_ANDROID:
+            /* Android is Linux-flavored (bionic): programs written for LINUX
+             * keep compiling, but ANDROID lets them pick the differences
+             * (no GUI driver, /data/local/tmp file conventions, ...). */
+            zan_lexer_define(&lex, "LINUX", "1");
+            zan_lexer_define(&lex, "ANDROID", "1");
             break;
         case ZAN_OS_MACOS:
             zan_lexer_define(&lex, "MACOS", "1");
@@ -3093,6 +3102,9 @@ int main(int argc, char **argv) {
                 tsub = (target.arch == ZAN_ARCH_AARCH64) ? "linux-arm64"
                      : (target.arch == ZAN_ARCH_RISCV64) ? "linux-riscv64"
                      : "linux-musl";
+            } else if (target.os == ZAN_OS_ANDROID) {
+                tsub = (target.arch == ZAN_ARCH_AARCH64) ? "android-arm64"
+                                                         : "android-x64";
             } else if (target.os == ZAN_OS_WINDOWS) {
                 tsub = (target.arch == ZAN_ARCH_AARCH64) ? "win-arm64" : "win-x64";
             } else if (target.os == ZAN_OS_MACOS) {
@@ -3119,6 +3131,7 @@ int main(int argc, char **argv) {
             }
         }
         if (cross_compiling && rt_sync_obj && target.os != ZAN_OS_LINUX
+            && target.os != ZAN_OS_ANDROID
             && target.os != ZAN_OS_MACOS && target.os != ZAN_OS_WINDOWS) {
             /* For WASI the declaration-level `uses_sync_runtime` flag is too
              * coarse: auto-stdlib compiles whole namespace directories, and
@@ -3917,6 +3930,86 @@ int main(int argc, char **argv) {
             { size_t cur = strlen(cmd);
               snprintf(cmd + cur, sizeof(cmd) - cur,
                        " --end-group \"%s/crtn.o\"", sys); }
+            link_ret = system(cmd);
+        } else if (cross_compiling && target.os == ZAN_OS_ANDROID) {
+            /* Cross-link an Android bionic executable: a STATIC ELF like the
+             * Linux path ("build on Windows, adb push, run" -- /data/local/tmp
+             * runs static executables fine), linked from the committed subset
+             * of the NDK sysroot at android-<arch>/ (crtbegin_static.o +
+             * crtend_android.o + libc.a/libm.a/libdl.a + compiler-rt builtins).
+             * Objects were emitted for the *-linux-android28 triple (API 28:
+             * bionic gained glob()); bionic's static libc exposes pthread,
+             * epoll and the socket API, so the same runtime objects as the
+             * Linux sysroots link here -- except zanrt_mem.o, whose
+             * --wrap=malloc interposes bionic's own internals and crashes
+             * under their TLS bootstrap, so --fast-alloc stays host/Linux
+             * only. Requires the NDK sysroot subset committed under
+             * toolchain/android-<arch>/ (staged next to zanc at build time).
+             * adb push <exe> /data/local/tmp/ && adb shell chmod 755 + run. */
+            char exe_dir[1024] = {0};
+            zan_exe_dir(exe_dir, sizeof(exe_dir));
+            const char *asub = (target.arch == ZAN_ARCH_AARCH64)
+                               ? "android-arm64" : "android-x64";
+            char sys[1200];
+            snprintf(sys, sizeof(sys), "%s/%s", exe_dir, asub);
+            char cmd[4096];
+            snprintf(cmd, sizeof(cmd),
+                     "ld.lld -static%s -o \"%s\" \"%s/crtbegin_static.o\""
+                     " \"%s\"",
+                     publish_mode ? " -s" : "", obj_path, sys, obj_tmp);
+            for (int di = 0; di < zan_lib_ndirs; di++) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
+                         zan_lib_dirs[di]);
+            }
+            for (int di = 0; di < extra_lib_path_count; di++) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
+                         extra_lib_paths[di]);
+            }
+            if (rt_timer_obj) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", rt_timer_obj);
+            }
+            if (irgen.uses_socket_async) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zanrt_io.o\"", sys);
+            }
+            if (irgen.uses_sync_runtime) {
+                /* bionic has pthread/epoll; its missing shm_open is shimmed
+                 * inside rt_sync.c itself (__ANDROID__), so the same object
+                 * as the Linux sysroots links. */
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zanrt_sync.o\"", sys);
+            }
+            if (irgen.uses_file_runtime) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zanrt_file.o\"", sys);
+            }
+            if (irgen.uses_embed_api) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur,
+                         " \"%s/zan_embed_api.o\"", sys);
+            }
+            { size_t cur = strlen(cmd);
+              snprintf(cmd + cur, sizeof(cmd) - cur,
+                       " --start-group \"%s/libc.a\" \"%s/libm.a\"", sys, sys); }
+            for (int d = 0; d < cross_archive_count; d++) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", cross_archives[d]);
+            }
+            for (int li = 0; li < static_driver_lib_count; li++) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " %s",
+                         static_driver_libs[li]);
+            }
+            { size_t cur = strlen(cmd);
+              snprintf(cmd + cur, sizeof(cmd) - cur,
+                       " --end-group \"%s/libdl.a\" \"%s/crtend_android.o\""
+                       " \"%s/libclang_rt.builtins.a\"",
+                       sys, sys, sys); }
+            if (getenv("ZAN_VERBOSE_LINK"))
+                fprintf(stderr, "[link] %s\n", cmd);
             link_ret = system(cmd);
         } else if (cross_compiling && target.os == ZAN_OS_WINDOWS) {
             /* Cross-link a Windows PE executable with ld.lld's MinGW driver

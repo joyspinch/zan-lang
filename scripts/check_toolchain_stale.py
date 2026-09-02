@@ -27,6 +27,7 @@ RT_SYNC = ["src/runtime/rt_sync.c"]
 RT_FILE = ["src/runtime/rt_file.c"]
 RT_TIMER = ["src/runtime/rt_timer.c"]
 RT_WASM = ["src/runtime/rt_wasm.c", "src/runtime/rt_file.c"]
+ANDROID_NDK = []  # NDK-derived: no repo source drives it; never "stale" by src
 GUI = ["src/runtime/gui_runtime.c", "src/runtime/gui_runtime_text.c",
        "src/runtime/gui_runtime_font.c", "src/runtime/gui_runtime_x11.c",
        "src/runtime/gui_runtime_tray.c", "src/runtime/gui_runtime_sdl.c",
@@ -62,6 +63,30 @@ ARTIFACTS = [
     # below it keeps the artifact fresh by hand -- see build_cross_rt.cmd.
     ("toolchain/wasm32/zanrt_ehtag.o",
      ["toolchain/wasm32/zanrt_ehtag.c"], "manual"),
+    # Android (bionic) runtime objects: built with the NDK's clang per the
+    # recipe in build_cross_rt.cmd -- zig cc has no bionic target.
+    ("toolchain/android-x64/zanrt_io.o", RT_IO, "manual"),
+    ("toolchain/android-x64/zanrt_sync.o", RT_SYNC, "manual"),
+    ("toolchain/android-x64/zanrt_file.o", RT_FILE, "manual"),
+    ("toolchain/android-x64/zanrt_timer.o", RT_TIMER, "manual"),
+    ("toolchain/android-arm64/zanrt_io.o", RT_IO, "manual"),
+    ("toolchain/android-arm64/zanrt_sync.o", RT_SYNC, "manual"),
+    ("toolchain/android-arm64/zanrt_file.o", RT_FILE, "manual"),
+    ("toolchain/android-arm64/zanrt_timer.o", RT_TIMER, "manual"),
+    # The NDK sysroot subset (crt + libc/libm/libdl + compiler-rt builtins)
+    # tracks the NDK itself, not repo sources -- report-only, refreshed by hand.
+    ("toolchain/android-x64/libc.a", ANDROID_NDK, "manual"),
+    ("toolchain/android-x64/libm.a", ANDROID_NDK, "manual"),
+    ("toolchain/android-x64/libdl.a", ANDROID_NDK, "manual"),
+    ("toolchain/android-x64/crtbegin_static.o", ANDROID_NDK, "manual"),
+    ("toolchain/android-x64/crtend_android.o", ANDROID_NDK, "manual"),
+    ("toolchain/android-x64/libclang_rt.builtins.a", ANDROID_NDK, "manual"),
+    ("toolchain/android-arm64/libc.a", ANDROID_NDK, "manual"),
+    ("toolchain/android-arm64/libm.a", ANDROID_NDK, "manual"),
+    ("toolchain/android-arm64/libdl.a", ANDROID_NDK, "manual"),
+    ("toolchain/android-arm64/crtbegin_static.o", ANDROID_NDK, "manual"),
+    ("toolchain/android-arm64/crtend_android.o", ANDROID_NDK, "manual"),
+    ("toolchain/android-arm64/libclang_rt.builtins.a", ANDROID_NDK, "manual"),
     ("stdlib/Gui/drivers/win-x64/zan_gui.dll", GUI, "gui"),
     ("stdlib/Gui/drivers/linux-x64/static/libzan_gui.a", GUI, "gui"),
     ("stdlib/Gui/drivers/linux-arm64/static/libzan_gui.a", GUI, "gui"),

@@ -60,3 +60,36 @@ if not exist toolchain\wasm32 mkdir toolchain\wasm32
 "%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -O2 -c %RT%\rt_file.c  -o toolchain\wasm32\zanrt_file.o  || exit /b 1
 "%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\wasm32\zanrt_timer.o || exit /b 1
 echo built toolchain\wasm32
+
+rem Android (bionic): zig cc has no bionic target, so this block needs the
+rem Android NDK (set ANDROID_NDK to its root, e.g.
+rem %LOCALAPPDATA%\Android\Sdk\ndk\<version>; defaults to the newest under the
+rem SDK). API 28 minimum: rt_sync.c uses glob(), which bionic added in 28.
+rem bionic has no shm_open -- the __ANDROID__ shim inside rt_sync.c backs it
+rem with files under $ZAN_SHM_DIR (default /data/local/tmp). The NDK sysroot
+rem subset itself (crtbegin_static.o, crtend_android.o, libc.a, libm.a,
+rem libdl.a, libclang_rt.builtins-<arch>-android.a) is copied from
+rem <NDK>\sysroot\usr\lib\<triple>\ and
+rem <NDK>\lib\clang\<ver>\lib\linux\ into toolchain\android-<arch>\; libc.a is
+rem run through llvm-objcopy --decompress-debug-sections (zstd) so any lld
+rem links it. main.c never wraps malloc on Android (zanrt_mem.o + --wrap
+rem crashes under bionic's TLS bootstrap), so rt_mem is not built here.
+if "%ANDROID_NDK%"=="" (
+  for /d %%D in ("%LOCALAPPDATA%\Android\Sdk\ndk\*") do set ANDROID_NDK=%%D
+)
+if not exist "%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\bin\clang.exe" (
+  echo Android NDK not found: set ANDROID_NDK to the NDK root directory
+  exit /b 1
+)
+set NDKBIN=%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\bin
+for %%P in (android-x64:x86_64 android-arm64:aarch64) do (
+  for /f "tokens=1,2 delims=:" %%A in ("%%P") do (
+    if not exist toolchain\%%A mkdir toolchain\%%A
+    "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -DZAN_IO_STACKLESS_ONLY -fPIC -I %RT% -O2 -c %RT%\rt_io.c    -o toolchain\%%A\zanrt_io.o    || exit /b 1
+    "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_sync.c  -o toolchain\%%A\zanrt_sync.o  || exit /b 1
+    "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_file.c  -o toolchain\%%A\zanrt_file.o  || exit /b 1
+    "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\%%A\zanrt_timer.o || exit /b 1
+    "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -I src\common -O2 -c %RT%\zan_embed_api.c -o toolchain\%%A\zan_embed_api.o || exit /b 1
+    echo built toolchain\%%A
+  )
+)

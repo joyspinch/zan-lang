@@ -17,7 +17,7 @@ This file is the source of truth for target support. Keep it in sync with:
 
 ## 1. Target table (`--list-targets`)
 
-Ten targets are currently declared in `crosscomp.c` (`s_targets[]`):
+Twelve targets are currently declared in `crosscomp.c` (`s_targets[]`):
 
 | Name          | Triple                          | Notes                    |
 |---------------|---------------------------------|--------------------------|
@@ -31,10 +31,12 @@ Ten targets are currently declared in `crosscomp.c` (`s_targets[]`):
 | `wasm32`      | `wasm32-unknown-wasi`           | WebAssembly (WASI)       |
 | `linux-riscv64` | `riscv64-unknown-linux-musl`   | RISC-V 64-bit Linux (musl, static) |
 | `riscv64`     | `riscv64-unknown-linux-musl`    | RISC-V 64-bit Linux (alias of `linux-riscv64`) |
+| `android-x64` | `x86_64-linux-android28`        | Android x86-64 (bionic, static) |
+| `android-arm64` | `aarch64-linux-android28`     | Android ARM64 (bionic, static) |
 
 Being listed here means the triple parses and platform macros
-(`WINDOWS`/`LINUX`/`MACOS`) plus arch macros (`ARM64`/`X86_64`) are defined for the
-target. All ten now also have a working link path — see §2 for the per-target
+(`WINDOWS`/`LINUX`/`MACOS`/`ANDROID`) plus arch macros (`ARM64`/`X86_64`) are defined for the
+target. All twelve now also have a working link path — see §2 for the per-target
 runtime restrictions that apply when cross-compiling.
 
 ---
@@ -148,10 +150,27 @@ Difficulty is for **CLI/compute** first; GUI is a separate, larger effort on eac
 - Remaining: an actual run on Mac hardware — everything so far is link/structure
   verification only.
 
-### Android (`aarch64/x86_64-linux-android`) — medium
-- Linux-like: epoll reactor and pthread work; needs the **NDK sysroot** and
-  **bionic** libc FFI names, plus an `ld.lld` link path keyed on the android ABI.
-- GUI would need an Android-specific back end (no X11).
+### Android (`android-x64` / `android-arm64`) — CLI/console works, verified on an emulator
+- Objects emit for the `*-linux-android28` triple (API 28: rt_sync.c's
+  `glob()` usage needs bionic 28) and statically link with `ld.lld` against a
+  **committed NDK sysroot subset** at `toolchain/android-<arch>/`
+  (`crtbegin_static.o`, `crtend_android.o`, `libc.a`, `libm.a`, `libdl.a`,
+  `libclang_rt.builtins.a`; bionic's zstd-compressed debug sections are
+  decompressed so any lld can link it). The workflow is
+  `zanc --target android-x64 -o app` → `adb push app /data/local/tmp/` →
+  `adb shell chmod 755 + run` — verified end-to-end on an API 35 x86_64
+  emulator (try/catch, file IO, atomics, threads API surface, async
+  coroutine driver; output matches native).
+- Runtime objects (`zanrt_io/sync/file/timer.o`, `zan_embed_api.o`) are built
+  with the NDK clang per `scripts\build_cross_rt.cmd` (zig cc has no bionic
+  target); bionic lacks `shm_open`, which an `__ANDROID__` shim inside
+  `rt_sync.c` backs with files under `$ZAN_SHM_DIR` (default
+  `/data/local/tmp`).
+- `--fast-alloc` is unavailable on Android: the wrapped-malloc allocator
+  interposes bionic's own internals and crashes during their TLS bootstrap.
+- GUI would need an Android-specific back end (no X11; see A82 in TASKS.md).
+- arm64 is link-verified (matching the macOS policy); the emulator on hand is
+  x86_64.
 
 ### HarmonyOS / OHOS — medium
 - OHOS native uses a musl-based NDK; for CLI/services this is close to Android.
@@ -215,7 +234,8 @@ that would fail:
 
 ## 6. Recommended order
 
-1. Android / OHOS CLI (Linux-like reactor, per-NDK sysroot).
+1. ~~Android / OHOS CLI (Linux-like reactor, per-NDK sysroot)~~ — Android CLI
+   is done (see §4); OHOS remains.
 2. `wasm32` WASI networking/threads model.
 3. iOS, then bare-metal.
 
