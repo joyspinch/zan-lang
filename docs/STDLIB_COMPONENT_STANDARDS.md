@@ -87,6 +87,13 @@
    （通道字段、方向、真相归属），照 `SelectBox.zan` 头注释样式。
 6. **文档承诺必须与实现一致**：宣称"响应式/变更通知"的成员必须有真实订阅者，
    否则删除（反例：`Signal.Changed` 曾零订阅空转）。
+7. **字符串 `bind` 通道的边界**：`Control.bindPath`/`bindProp` 是**设计时声明
+   元数据**（设计器 Inspector、Serialize 行格式、GenForm 生成器读写），运行时
+   由 `ChildWindow` 消费——每帧把 JsonValue 状态实体按路径同步进控件/回写。
+   它服务"对话框 ↔ 状态实体"场景，与代码内实时绑定 `Binding<T>`（第 1 条）
+   分工不同、互不替代；新控件不得再开第三种绑定写法。绑定机制的派生缓存
+   不进 Control 基类——它属于消费方（如"模型侧确认值"快照归 ChildWindow
+   的旁表所有，`Control.bindSnapshot` 已拆除）。
 
 ## 7. 现存违规清单（改造 backlog）
 

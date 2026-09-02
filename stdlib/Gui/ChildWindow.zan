@@ -24,6 +24,16 @@ delegate bool ChildWindowStop();
 /// (extra repaint reasons) and `AfterFrame()` (work to do once the frame is
 /// on screen). Windows rendered by an immediate-mode widget (the Wizard) set
 /// a render callback instead of building a tree.
+///
+/// Binding channel: controls declaring a `bind` path (a design-time
+/// declaration owned by the designer, Serialize and GenForm — see
+/// `Control.bindPath`) are synced against this window's JsonValue model
+/// every frame: model -> UI before the frame (`SyncFromModel`), user
+/// edits -> model after it (`SyncChangedNode`). The per-control snapshot
+/// that detects user edits lives HERE, not on Control — it is a runtime
+/// cache of this render loop, not a declaration. This is the dialog
+/// "state entity" string channel; in-code realtime binding goes through
+/// `Binding<T>` (System/Binding.zan, stdlib standards §6.1).
 class ChildWindow {
     App host;
     Control root;
@@ -33,6 +43,13 @@ class ChildWindow {
     bool destroyed;
     int idBase;
     Action renderCb;
+    /// 绑定快照旁表（`Control.bindSnapshot` 已拆除）：SyncFromNode
+    /// 记录"模型侧确认的控件值"，SyncChangedNode 据此判断用户是否
+    /// 编辑过。按控件引用线性查找——对话框的绑定控件是个位数到
+    /// 几十个，每帧的引用比较是纳秒级。树上移除的控件残留条目
+    /// 永不命中（键是引用），随窗口生命周期一并释放。
+    List<Control> boundKeys;
+    List<string> boundSnaps;
 
     ChildWindow() {
         host = null;
@@ -43,6 +60,8 @@ class ChildWindow {
         destroyed = false;
         idBase = 900000;
         renderCb = null;
+        boundKeys = null;
+        boundSnaps = null;
     }
 
     /// OS window caption.
@@ -140,7 +159,7 @@ class ChildWindow {
                 if (prop == "") { prop = "value"; }
                 if (c.GetProp(prop) != s) { c.SetProp(prop, s); }
             }
-            c.bindSnapshot = BoundValue(c);
+            RecordSnapshot(c, BoundValue(c));
         }
         for (int j = 0; j < c.children.Count; j = j + 1) {
             SyncFromNode(c.children[j]);
@@ -151,11 +170,35 @@ class ChildWindow {
     void SyncChangedNode(Control c) {
         if (c.bindPath != "") {
             string s = BoundValue(c);
-            if (s != c.bindSnapshot) { WriteBoundValue(c, s); }
+            if (s != SnapshotOf(c)) { WriteBoundValue(c, s); }
         }
         for (int i = 0; i < c.children.Count; i = i + 1) {
             SyncChangedNode(c.children[i]);
         }
+    }
+
+    /// 记录（或更新）控件绑定属性的模型侧确认值——上次由模型
+    /// 写入/确认时 `BoundValue` 的读数，作为"用户是否编辑过"的基准。
+    void RecordSnapshot(Control c, string v) {
+        if (boundKeys == null) {
+            boundKeys = new List<Control>();
+            boundSnaps = new List<string>();
+        }
+        for (int i = 0; i < boundKeys.Count; i = i + 1) {
+            if (boundKeys[i] == c) { boundSnaps[i] = v; return; }
+        }
+        boundKeys.Add(c);
+        boundSnaps.Add(v);
+    }
+
+    /// 控件的上一次模型侧确认值；从未记录（新绑定控件首次回写
+    /// 前的防御路径）按被拆字段的原初始值语义返回 ""。
+    string SnapshotOf(Control c) {
+        if (boundKeys == null) { return ""; }
+        for (int i = 0; i < boundKeys.Count; i = i + 1) {
+            if (boundKeys[i] == c) { return boundSnaps[i]; }
+        }
+        return "";
     }
 
     string BoundValue(Control c) {
