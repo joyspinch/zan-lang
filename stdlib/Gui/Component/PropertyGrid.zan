@@ -16,12 +16,11 @@ namespace Gui.Component;
 class PropertyGrid : Control {
     List<PropSpec> data;
     /// 每行一个编辑器（按行索引对齐，未用到的槽为 null）。
+    /// 编辑器由属性协议驱动（GetProp/SetProp/GetText/SetText），
+    /// 不再持有任何外部信号——动态宿主没有编译期字段可绑。
     List<Input> texts;
-    List<SignalString> textSigs;
     List<Switch> flags;
-    List<SignalBool> flagSigs;
     List<SelectBox> picks;
-    List<SignalInt> pickSigs;
     /// 整数属性行的 -/+ 步进按钮稳定控件 id（按行索引对齐，
     /// 非整数行也占位）。
     List<int> minusIds;
@@ -41,11 +40,8 @@ class PropertyGrid : Control {
         this.InitControl("props", 5);
         data = new List<PropSpec>();
         texts = new List<Input>();
-        textSigs = new List<SignalString>();
         flags = new List<Switch>();
-        flagSigs = new List<SignalBool>();
         picks = new List<SelectBox>();
-        pickSigs = new List<SignalInt>();
         minusIds = new List<int>();
         plusIds = new List<int>();
         shadow = new List<string>();
@@ -85,11 +81,8 @@ class PropertyGrid : Control {
 
     void Rebuild() {
         texts = new List<Input>();
-        textSigs = new List<SignalString>();
         flags = new List<Switch>();
-        flagSigs = new List<SignalBool>();
         picks = new List<SelectBox>();
-        pickSigs = new List<SignalInt>();
         minusIds = new List<int>();
         plusIds = new List<int>();
         shadow = new List<string>();
@@ -97,30 +90,26 @@ class PropertyGrid : Control {
             PropSpec p = data[i];
             string cur = p.Read();
             shadow.Add(cur);
-            SignalString ts = new SignalString("");
-            SignalBool fs = new SignalBool(false);
-            SignalInt ps = new SignalInt(0);
             Input inp = null;
             Switch sw = null;
             SelectBox sb = null;
             if (p.kind == 5) {
                 // 分组标题：没有编辑器。
             } else if (p.kind == 2) {
-                fs = new SignalBool(PropSpec.IsOn(cur));
-                sw = Switch.Bind(fs);
+                // 动态宿主不走 Binding<T>（无编译期字段可指），
+                // 统一经控件的属性协议驱动（§6.1）。
+                sw = new Switch();
+                sw.SetProp("checked", PropSpec.Flag(PropSpec.IsOn(cur)));
             } else if (p.kind == 3) {
-                ps = new SignalInt(this.IndexOfValue(p, cur));
-                sb = SelectBox.Bind(p.options, ps, "");
+                sb = SelectBox.FromOptions(p.options, "");
+                sb.SetIndex(this.IndexOfValue(p, cur));
             } else {
-                ts = new SignalString(cur);
-                inp = Input.Bind(ts, "");
+                inp = new Input("");
+                inp.SetText(cur);
             }
             texts.Add(inp);
-            textSigs.Add(ts);
             flags.Add(sw);
-            flagSigs.Add(fs);
             picks.Add(sb);
-            pickSigs.Add(ps);
             minusIds.Add(WidgetId.Next());
             plusIds.Add(WidgetId.Next());
         }
@@ -164,17 +153,17 @@ class PropertyGrid : Control {
     /// 编辑器当前值的字符串形式（与 PropSpec.Read 同一种表示）。
     string Editor(int i) {
         PropSpec p = data[i];
-        if (p.kind == 2) { return PropSpec.Flag(flagSigs[i].Get()); }
-        if (p.kind == 3) { return this.PickValue(p, pickSigs[i].Get()); }
-        return textSigs[i].Get();
+        if (p.kind == 2) { return PropSpec.Flag(PropSpec.IsOn(flags[i].GetProp("value"))); }
+        if (p.kind == 3) { return this.PickValue(p, picks[i].Value()); }
+        return texts[i].GetText();
     }
 
     /// 把模型值灌回编辑器（外部改了属性时）。
     void Load(int i, string val) {
         PropSpec p = data[i];
-        if (p.kind == 2) { flagSigs[i].Set(PropSpec.IsOn(val)); return; }
-        if (p.kind == 3) { pickSigs[i].Set(this.IndexOfValue(p, val)); return; }
-        textSigs[i].Set(val);
+        if (p.kind == 2) { flags[i].SetProp("checked", PropSpec.Flag(PropSpec.IsOn(val))); return; }
+        if (p.kind == 3) { picks[i].SetIndex(this.IndexOfValue(p, val)); return; }
+        texts[i].SetText(val);
     }
 
     /// 一行的双向同步：外部改动优先灌回编辑器，否则把编辑器的新值
@@ -211,7 +200,7 @@ class PropertyGrid : Control {
         int nv = p.Clamp(cur + delta);
         string s = Convert.ToString(nv);
         p.Write(s);
-        textSigs[i].Set(s);
+        texts[i].SetText(s);
         shadow[i] = p.Read();
         hitRow = i;
         Change.Post();

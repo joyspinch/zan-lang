@@ -69,8 +69,17 @@
 1. **外部数据绑定的唯一协议是 `Binding<T>`**（`stdlib/System/Binding.zan`）：
    - 组件作者把可绑定属性声明为 `Binding<T>` 字段：主值命名 `data`，辅值 `dataXxx`；
    - 使用方 `control.data = model.field;`（实时）或 `= 常量`（常量绑定），不感知机制；
-   - 禁止为同一控件再发明第二条同语义通道（历史双通道如 Switch 的
-     `model`/`data`/`value`/`valSignal` 逐步收敛为 `data` + 显式映射参数）。
+   - 禁止为同一控件再发明第二条同语义通道（历史双通道已收敛：
+     Switch 四通道 → `data` + `dataValue`，SelectBox `size` → `Size`，
+     Input 缓冲 `model` → `editSig`）；
+   - **Signal 保留式工厂已整体移除**（2026-09-02）：`Switch.Bind` /
+     `Input.Bind` / `SelectBox.Bind` / `Slider.Bind` / `Radio.Bind` / `Rate.Bind` /
+     `InputNumber.Bind` / `TextArea.Bind` / `ColorPicker.Bind` 及 Signal 共享构造器
+     全部删除（Checkbox 因在途改动暂缓）。动态宿主（PropertyGrid / Designer /
+     FilePicker 等没有编译期字段可绑的场景）不走 Binding，统一用控件自身的
+     `GetText/SetText` / `GetProp/SetProp` 属性协议或普通字段；控件族内部组装
+     （如 ChoiceGroup 组子 Radio）可共享内部 Signal，但构造器必须注明
+     "内部组装专用"。
 2. **`Signal*` 是控件内部状态缓冲**（编辑缓冲、滚动位置、级联选择等），不是绑定协议：
    - 不得作为 Widget 公开绑定 API 的参数/字段对外提供；
    - 变更检测统一走 immediate-mode 帧轮询（`Version()` / 值比对），
@@ -90,6 +99,12 @@
 7. **字符串 `bind` 通道的边界**：`Control.bindPath`/`bindProp` 是**设计时声明
    元数据**（设计器 Inspector、Serialize 行格式、GenForm 生成器读写），运行时
    由 `ChildWindow` 消费——每帧把 JsonValue 状态实体按路径同步进控件/回写。
+8. **`Props()` 指针必须优先指向活的外部通道**：属性 spec 同时存在 Binding 与
+   内部 Signal 背书时，`data != null` 分支必须指向 Binding（`spec.num = data`），
+   仅在无外部绑定时才落到内部缓冲（`spec.snum = model`）。否则 `SetProp` 写进
+   内部缓冲后会被下一帧 SyncBinding 用旧模型值覆盖（P5 修复的真实缺陷类）。
+   `PropSpec` 的 `s*` 字段仅用于控件自身内部状态接线（如 ChoiceGroup 组子
+   Radio），不构成对外 API。
    它服务"对话框 ↔ 状态实体"场景，与代码内实时绑定 `Binding<T>`（第 1 条）
    分工不同、互不替代；新控件不得再开第三种绑定写法。绑定机制的派生缓存
    不进 Control 基类——它属于消费方（如"模型侧确认值"快照归 ChildWindow
@@ -113,4 +128,4 @@
 | IO/File | 整读整写仍为主流形态，流式路径不普及 | 未解决：逐步提供 Stream 家族 |
 | Gui/Reactive | ~~`Signal.Changed` 事件通知 + `ChangeTracker`（零订阅死代码，文档承诺与实现相反）~~ | ✅ 已删除：变更检测统一帧轮询（§6.2） |
 | Gui Widget 绑定通道命名 | ~~同一角色多名（`value`/`Value`/`data` 混指、SelectBox 尺寸档 int 漂移）~~ | ✅ 已收敛（2026-09-02）：Switch 四通道收敛为 `data` + `dataValue`（`valSignal`/`BindValue` 删除）；SelectBox `size`(int 0/1/2) → `Size`(string，顺带修掉设计器 tiny 档与 Small/Medium/Large 助手的既有错位)；ChoiceGroup `Value` → `data`；Input 私有编辑缓冲 `model` → `editSig` |
-| Gui Widget Binding/Signal 双通道 | 18 个 Widget 仍存 Signal 保留式外部通道与工厂（`Switch.Bind(SignalBool)`、Radio/Checkbox 组信号等） | 未解决：按 §6.1 逐步淘汰 Signal 外部通道 |
+| Gui Widget Binding/Signal 双通道 | ~~18 个 Widget 仍存 Signal 保留式外部通道与工厂~~ | ✅ 已移除（2026-09-02，P5）：10 个 Signal 工厂 + Signal 共享构造器删除，约 25 处调用点迁移到构造器 + `data` 绑定或 `GetText/GetProp` 属性协议；PropertyGrid 平行信号表删除、改走属性协议；`Props()` 指针统一"优先外部通道"（§6.8）；Checkbox 因在途改动暂缓，仅剩族内组装（ChoiceGroup→Radio）的注明内部 Signal |
