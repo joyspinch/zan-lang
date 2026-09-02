@@ -112,4 +112,5 @@
 | Thread.SleepAsync / File.*Async / Model.*Async | 同步冒充异步（如 `File.zan` 的 `ReadAllTextAsync` 仍是同步包装） | 未解决：真异步或去 Async 后缀 |
 | IO/File | 整读整写仍为主流形态，流式路径不普及 | 未解决：逐步提供 Stream 家族 |
 | Gui/Reactive | ~~`Signal.Changed` 事件通知 + `ChangeTracker`（零订阅死代码，文档承诺与实现相反）~~ | ✅ 已删除：变更检测统一帧轮询（§6.2） |
-| Gui Widget 绑定通道 | 56 个 Widget 中 18 个 Binding/Signal 双通道混用，同一角色多名（`value`/`data`/`Value`） | 未解决：按 §6.1/§6.4 逐步收敛 |
+| Gui Widget 绑定通道命名 | ~~同一角色多名（`value`/`Value`/`data` 混指、SelectBox 尺寸档 int 漂移）~~ | ✅ 已收敛（2026-09-02）：Switch 四通道收敛为 `data` + `dataValue`（`valSignal`/`BindValue` 删除）；SelectBox `size`(int 0/1/2) → `Size`(string，顺带修掉设计器 tiny 档与 Small/Medium/Large 助手的既有错位)；ChoiceGroup `Value` → `data`；Input 私有编辑缓冲 `model` → `editSig` |
+| Gui Widget Binding/Signal 双通道 | 18 个 Widget 仍存 Signal 保留式外部通道与工厂（`Switch.Bind(SignalBool)`、Radio/Checkbox 组信号等） | 未解决：按 §6.1 逐步淘汰 Signal 外部通道 |

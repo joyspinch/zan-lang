@@ -19,21 +19,24 @@ namespace Gui.Widget;
 /// - 加载中：`Loading = true` 时拇指上叠画弧线 spinner、轨道变暗，
 ///   且点击/键盘不再切换；
 /// - 自定义颜色：`CheckedColor` / `UncheckedColor`（0 = 跟随皮肤）；
-/// - 自定义选中值：`CheckedValue` / `UncheckedValue` + int 绑定轴
-///   `value`（或保留式 `Switch.BindValue(model, 1, 0)`），开关表达
-///   「值 == 选中值」。绑定轴优先级：`value`(int) > `data`(bool) > model。
+/// - 自定义选中值：`CheckedValue` / `UncheckedValue` + int 辅值绑定轴
+///   `dataValue`（`sw.dataValue = form.status;`），开关表达
+///   「值 == 选中值」。轴优先级：`dataValue`(int) > `data`(bool)。
+///
+/// 绑定通道（规范 §6）：外部通道 `data`(bool 主值) 与 `dataValue`
+/// (int 辅值，配 CheckedValue/UncheckedValue 映射)；`onSig` 是内部
+/// 开关状态缓冲（SignalBool，§6.2），不是绑定协议。
 class Switch : Control {
-    SignalBool model;
-    /// 双向绑定状态：`sw.data = settings.darkMode;` 保持模型
+    /// 内部开/关状态缓冲（SignalBool，§6.2）：IsOn/SetOn/SyncBinding
+    /// 的运行时真相，绘制直接读它。不是绑定协议，别对外消费。
+    SignalBool onSig;
+    /// 主值通道：`sw.data = settings.darkMode;` 保持模型
     /// 字段与开关双向同步（编译器降级的 Binding）。
     Binding<bool> data;
-    /// int 绑定轴：`sw.value = form.status;` 配 `CheckedValue` /
-    /// `UncheckedValue`，开关表达「值 == 选中值」。该轴激活时
-    /// `data`/`model` 让位（`GetProp("value")` 也应答于此轴）。
-    Binding<int> value;
-    /// int 轴的保留式变体：`Switch.BindValue(model, cv, uv)` 直持
-    /// SignalInt（与 `value` 二选一，同 Radio 的双通道模式）。
-    SignalInt valSignal;
+    /// int 辅值通道（§6.1 dataXxx 命名）：`sw.dataValue = form.status;`
+    /// 配 `CheckedValue` / `UncheckedValue`，开关表达「值 == 选中值」。
+    /// 该轴激活时 `data` 让位（`GetProp("value")` 也应答于此轴）。
+    Binding<int> dataValue;
     int wid;
     /// 开关切换时触发（C# 风格：`sw.Change += h;`）。
     UiEvent Change;
@@ -59,7 +62,7 @@ class Switch : Control {
 
     void InitSwitch(SignalBool m) {
         this.InitControl("switch", 1);
-        model = m;
+        onSig = m;
         wid = WidgetId.Next();
         wiresOwnEvents = true;
         Change = new UiEvent();
@@ -83,44 +86,32 @@ class Switch : Control {
 
     static Switch Bind(SignalBool model) {
         Switch s = new Switch();
-        s.model = model;
+        s.onSig = model;
         return s;
     }
 
-    /// 保留式 int 轴工厂：`Switch sw = Switch.BindValue(m, 1, 2);`，
-    /// 开关表达 `m == 1`，切换写回 1/2（对位 Radio 的 optionValue 模式）。
-    static Switch BindValue(SignalInt model, int checkedValue, int uncheckedValue) {
-        Switch s = new Switch();
-        s.valSignal = model;
-        s.CheckedValue = checkedValue;
-        s.UncheckedValue = uncheckedValue;
-        return s;
-    }
-
-    bool HasValueAxis() { return value != null || valSignal != null; }
+    bool HasValueAxis() { return dataValue != null; }
 
     int IntGet() {
-        if (value != null) { return value.Get(); }
-        return valSignal.Get();
+        return dataValue.Get();
     }
 
     void IntSet(int v) {
-        if (value != null) { value.Set(v); return; }
-        valSignal.Set(v);
+        dataValue.Set(v);
     }
 
     bool IsOn() {
         if (HasValueAxis()) { return IntGet() == CheckedValue; }
-        return model.Get();
+        return onSig.Get();
     }
 
     void SetOn(bool v) {
         if (HasValueAxis()) {
             if (v) { IntSet(CheckedValue); } else { IntSet(UncheckedValue); }
-            model.Set(v);
+            onSig.Set(v);
             return;
         }
-        model.Set(v);
+        onSig.Set(v);
         if (data != null) { data.Set(v); }
     }
 
@@ -128,18 +119,18 @@ class Switch : Control {
     override void SyncBinding() {
         if (HasValueAxis()) {
             bool on = IntGet() == CheckedValue;
-            if (on != model.Get()) { model.Set(on); }
+            if (on != onSig.Get()) { onSig.Set(on); }
             return;
         }
         if (data == null) { return; }
         bool cur = data.Get();
-        if (cur != model.Get()) { model.Set(cur); }
+        if (cur != onSig.Get()) { onSig.Set(cur); }
     }
 
     int Render(App app, int x, int y) {
         int id = wid;
         SyncBinding();
-        this.PaintStyled(app, id, x, y, model.Get());
+        this.PaintStyled(app, id, x, y, onSig.Get());
         app.focus.RegisterFocusable(id);
 
         bool fire = Ui.Clicked(app, id) && !this.IsDisabled() && !Loading;
@@ -149,7 +140,7 @@ class Switch : Control {
             if (kc == 32 || kc == 13) { fire = true; }
         }
         if (fire) {
-            SetOn(!model.Get());
+            SetOn(!onSig.Get());
             Change.Raise();
             app.RequestRedraw();
         }
@@ -170,7 +161,7 @@ class Switch : Control {
     override List<PropSpec> Props() {
         List<PropSpec> ps = new List<PropSpec>();
         PropSpec on = PropSpec.Bool("value", "On");
-        on.sflag = model;
+        on.sflag = onSig;
         on.Also("checked");
         on.Also("on");
         ps.Add(on);
@@ -210,11 +201,11 @@ class Switch : Control {
         ps.Add(uc);
         PropSpec cv = PropSpec.Int("checkedValue", "Checked value");
         cv.num = CheckedValue;
-        cv.WithTip("Value stored in the int `value` binding while on.");
+        cv.WithTip("Value stored in the int `dataValue` binding while on.");
         ps.Add(cv);
         PropSpec uv = PropSpec.Int("uncheckedValue", "Unchecked value");
         uv.num = UncheckedValue;
-        uv.WithTip("Value stored in the int `value` binding while off.");
+        uv.WithTip("Value stored in the int `dataValue` binding while off.");
         ps.Add(uv);
         return ps;
     }
@@ -473,7 +464,7 @@ class Switch : Control {
         if (Loading) { this.AddClass("loading"); }
         if (!Round) { this.AddClass("square"); }
         int latched = 0;
-        if (model.Get()) { latched = Style.SChecked(); }
+        if (onSig.Get()) { latched = Style.SChecked(); }
         StyleBox root = this.ResolveStyleAs(app, "switch", Class, latched);
         StyleBox trackStyle = this.ResolvePartAs(app, "switch", "track", "",
                                                  Class, latched);

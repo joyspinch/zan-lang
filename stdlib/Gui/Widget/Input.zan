@@ -31,7 +31,10 @@ delegate string InputFilterFn(string candidate);
 /// `Round` 圆角、`PassiveActivated` 回车激活、`Filter` 输入过滤、
 /// 以及 Clear/Focus/Blur/SelectAll/ScrollToEnd 手动操作。
 class Input : Control {
-    SignalString model;
+    /// 内部编辑缓冲（SignalString，§6.2 内部状态缓冲）：光标、选区、
+    /// 过滤、IME 组合等编辑操作的运行时真相。不是绑定协议，
+    /// 外部通道是 `data`（Binding<string>）。
+    SignalString editSig;
     /// 双向绑定文本：`name.data = user.name;` 使输入框与
     /// 模型双向保持同步（编译器降级的 Binding）。可选的；
     /// 未设置时，输入框仅编辑其内部 SignalString。
@@ -122,7 +125,7 @@ class Input : Control {
     /// 自动贴齐），再设置输入框专属状态。
     void InitInput(SignalString sig, string hintText) {
         this.InitControl("input", 1);
-        model = sig;
+        editSig = sig;
         hint = hintText;
         cursorPos = 0;
         selAnchor = -1;
@@ -165,7 +168,7 @@ class Input : Control {
 
     static Input Bind(SignalString sig, string hintText) {
         Input inp = new Input(hintText);
-        inp.model = sig;
+        inp.editSig = sig;
         return inp;
     }
 
@@ -177,7 +180,7 @@ class Input : Control {
         return m;
     }
 
-    string GetText() { return model.Get(); }
+    string GetText() { return editSig.Get(); }
 
     /// 宿主调整占位文字（SelectBox 的筛选框在 Filterable(true) 之后
     /// 才由 FilterHint 定文案，晚于构造）。
@@ -188,7 +191,7 @@ class Input : Control {
     int WidgetId() { return wid; }
 
     void SetText(string v) {
-        model.Set(v);
+        editSig.Set(v);
         cursorPos = v.Length;
         PushBinding();
     }
@@ -198,13 +201,13 @@ class Input : Control {
     /// 字段在 Focus 事件里调用它。
     void SelectAll() {
         selAnchor = 0;
-        cursorPos = model.Get().Length;
+        cursorPos = editSig.Get().Length;
     }
 
     /// 清空内容（Naive UI ref.clear()）。触发 Change，光标归零。
     void Clear() {
-        if (model.Get() == "") { return; }
-        model.Set("");
+        if (editSig.Get() == "") { return; }
+        editSig.Set("");
         cursorPos = 0;
         selAnchor = -1;
         Edited();
@@ -229,7 +232,7 @@ class Input : Control {
     /// 光标移到行尾（Naive UI ref.scrollTo 的等价物：渲染沿本来
     /// 就会把光标滚进视口）。
     void ScrollToEnd() {
-        cursorPos = model.Get().Length;
+        cursorPos = editSig.Get().Length;
         selAnchor = -1;
         if (liveApp != null) { liveApp.RequestRedraw(); }
     }
@@ -260,7 +263,7 @@ class Input : Control {
     }
 
     /// 当前文本的计数值。
-    int CountValue() { return this.CountOf(model.Get()); }
+    int CountValue() { return this.CountOf(editSig.Get()); }
 
     /// 字数统计的显示文本："当前 / 上限"；计数超过 99 时上限侧
     /// 截为 "99+"（Naive UI 的显示口径）。
@@ -308,8 +311,8 @@ class Input : Control {
     override void SyncBinding() {
         if (data == null) { return; }
         string cur = data.Get();
-        if (cur != model.Get()) {
-            model.Set(cur);
+        if (cur != editSig.Get()) {
+            editSig.Set(cur);
             if (cursorPos > cur.Length) { cursorPos = cur.Length; }
         }
     }
@@ -317,7 +320,7 @@ class Input : Control {
     /// 把编辑缓冲区通过绑定写回模型（UI -> model）。
     void PushBinding() {
         if (data == null) { return; }
-        data.Set(model.Get());
+        data.Set(editSig.Get());
     }
 
     /// 所有 UI 编辑都汇入此处：先写回，再通知；同时清除
@@ -329,7 +332,7 @@ class Input : Control {
     }
 
     void ClampCursor() {
-        string txt = model.Get();
+        string txt = editSig.Get();
         if (cursorPos > txt.Length) { cursorPos = txt.Length; }
         if (cursorPos < 0) { cursorPos = 0; }
         if (selAnchor > txt.Length) { selAnchor = txt.Length; }
@@ -341,16 +344,16 @@ class Input : Control {
 
     string SelText() {
         if (!HasSel()) { return ""; }
-        return model.Get().Substring(SelStart(), SelEnd() - SelStart());
+        return editSig.Get().Substring(SelStart(), SelEnd() - SelStart());
     }
 
     /// 删除选中的范围，并把光标收拢到其起点。
     void DeleteSel() {
         if (!HasSel()) { return; }
-        string txt = model.Get();
+        string txt = editSig.Get();
         int s = SelStart();
         int e = SelEnd();
-        model.Set(txt.Substring(0, s) + txt.Substring(e, txt.Length - e));
+        editSig.Set(txt.Substring(0, s) + txt.Substring(e, txt.Length - e));
         cursorPos = s;
         selAnchor = -1;
     }
@@ -362,18 +365,18 @@ class Input : Control {
     /// trim 式过滤器甩到文末。上限按 CountOf 口径计，与字数
     /// 统计显示同一个数。
     bool Insert(string s) {
-        string orig = model.Get();
+        string orig = editSig.Get();
         int origCursor = cursorPos;
         int origAnchor = selAnchor;
         bool hadSel = HasSel();
         if (hadSel) { DeleteSel(); }
-        string txt = model.Get();
+        string txt = editSig.Get();
         string cand = Text.InsertAt(txt, cursorPos, s);
         string final = cand;
         if (Filter != null) { final = Filter(cand); }
         if (final == null
             || (MaxLen > 0 && this.CountOf(final) > MaxLen)) {
-            model.Set(orig);
+            editSig.Set(orig);
             cursorPos = origCursor;
             selAnchor = origAnchor;
             return false;
@@ -387,7 +390,7 @@ class Input : Control {
             selAnchor = -1;
             return false;
         }
-        model.Set(final);
+        editSig.Set(final);
         cursorPos = cp;
         selAnchor = -1;
         Edited();
@@ -401,8 +404,8 @@ class Input : Control {
         string final = cand;
         if (Filter != null) { final = Filter(cand); }
         if (final == null) { return false; }
-        if (final == model.Get()) { return false; }
-        model.Set(final);
+        if (final == editSig.Get()) { return false; }
+        editSig.Set(final);
         if (cursorPos > final.Length) { cursorPos = final.Length; }
         if (selAnchor > final.Length) { selAnchor = final.Length; }
         Edited();
@@ -412,7 +415,7 @@ class Input : Control {
     void HandleInput(App app) {
         ClampCursor();
         int kind = app.EventKind();
-        string txt = model.Get();
+        string txt = editSig.Get();
         // 被动激活：聚焦后先用回车"解锁"，解锁前不消费任何编辑键
         // （Naive UI passively-activated：Tab 聚焦不该吞掉输入）。
         if (PassiveActivated && !passiveActive) {
@@ -550,7 +553,7 @@ class Input : Control {
         }
 
         SyncBinding();
-        string txt = model.Get();
+        string txt = editSig.Get();
         ClampCursor();
 
         // 整个外框（填充、边框、圆角、阴影、hover/focus 淡变）
@@ -855,7 +858,7 @@ class Input : Control {
 
     /// 文本经 SetText 写入，保证光标与选区不越界。
     override string GetExtra(string key) {
-        if (key == "text" || key == "value") { return model.Get(); }
+        if (key == "text" || key == "value") { return editSig.Get(); }
         return "";
     }
 
@@ -863,7 +866,7 @@ class Input : Control {
         if (key == "text" || key == "value") {
             // 同一个值再写一遍不算编辑：SetText 会把光标收到末尾，而属性
             // 写入可能每帧都来（数据绑定、文案刷新），那样方向键就白按了。
-            if (val != model.Get()) { this.SetText(val); }
+            if (val != editSig.Get()) { this.SetText(val); }
             return true;
         }
         if (key == "password") { password = (val == "true"); return true; }
