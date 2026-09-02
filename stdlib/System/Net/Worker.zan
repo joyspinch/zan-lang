@@ -127,6 +127,15 @@ class Worker {
     DatagramHandler onPacket;        // udp: datagram arrived
     HttpRequestHandler onRequest;    // http: request parsed
 
+    // WebSocket 连接注册表（对标 workerman $server->connections）：Upgrade
+    // 成功时登记，连接结束/回调关闭后移除。list 上的协程切换只发生在
+    // await 点，Add/Remove/快照拷贝都是同步段，无需加锁。多 worker 进程
+    // 时注册表是进程内的——跨进程广播属 SharedTable/事件总线范畴。
+    List<Connection> wsConns;
+    // 同步段进出 WS 连接协程用的互斥（--async-workers 下连接协程跑在
+    // 不同线程，List 本身不是线程安全）。
+    static nint wsRegLock = 0;
+
     static List<Worker> workers = new List<Worker>();
     static bool daemonize = false;
     // Set by RunCommand: the process was started through the CLI, so it also
@@ -259,6 +268,7 @@ class Worker {
         this.onReceive = null;
         this.onPacket = null;
         this.onRequest = null;
+        this.wsConns = new List<Connection>();
         workers.Add(this);
     }
 
@@ -280,6 +290,87 @@ class Worker {
     HttpRequestHandler RequestHandler() {
         if (this.onRequest != null) { return this.onRequest; }
         return this.onHttpRequest;
+    }
+
+    // ---- WebSocket 连接注册表（对标 workerman connections + push）----
+
+    static void WsRegInit() {
+        if (Worker.wsRegLock == 0) { Worker.wsRegLock = Mutex.Create(); }
+    }
+
+    // Upgrade 成功后由 HandleWebSocket 调用（单线程 accept 路径）。
+    void WsConnAdd(Connection conn) {
+        Worker.WsRegInit();
+        Mutex.Lock(Worker.wsRegLock);
+        this.wsConns.Add(conn);
+        Mutex.Unlock(Worker.wsRegLock);
+    }
+
+    // 连接结束后由 HandleWebSocket 调用。
+    void WsConnRemove(Connection conn) {
+        Worker.WsRegInit();
+        Mutex.Lock(Worker.wsRegLock);
+        int id = conn.GetId();
+        int i = 0;
+        while (i < this.wsConns.Count) {
+            if (this.wsConns[i].GetId() == id) {
+                this.wsConns.RemoveAt(i);
+                break;
+            }
+            i = i + 1;
+        }
+        Mutex.Unlock(Worker.wsRegLock);
+    }
+
+    /// <summary>本 Worker 当前在线 WebSocket 连接数（进程内）。</summary>
+    int WsConnCount() {
+        Worker.WsRegInit();
+        Mutex.Lock(Worker.wsRegLock);
+        int n = this.wsConns.Count;
+        Mutex.Unlock(Worker.wsRegLock);
+        return n;
+    }
+
+    /// <summary>按连接 id 取在线连接；不存在（已断开）返回 null。
+    /// 用于定时器等无引用上下文里找回连接后 conn.Push(...)。</summary>
+    Connection WsConnById(int id) {
+        Worker.WsRegInit();
+        Mutex.Lock(Worker.wsRegLock);
+        Connection found = null;
+        int i = 0;
+        while (i < this.wsConns.Count) {
+            if (this.wsConns[i].GetId() == id) {
+                found = this.wsConns[i];
+                break;
+            }
+            i = i + 1;
+        }
+        Mutex.Unlock(Worker.wsRegLock);
+        return found;
+    }
+
+    /// <summary>向所有在线 WebSocket 连接广播一条 Text 帧，返回成功
+    /// 投递数。快照在锁内拷出、Push 在锁外执行——Push 是 await 点，
+    /// 决不能持锁挂起。断开的连接由其帧循环稍后自行移除。</summary>
+    async int WsBroadcast(string data) {
+        Worker.WsRegInit();
+        Mutex.Lock(Worker.wsRegLock);
+        List<Connection> snap = new List<Connection>();
+        int i = 0;
+        while (i < this.wsConns.Count) {
+            snap.Add(this.wsConns[i]);
+            i = i + 1;
+        }
+        Mutex.Unlock(Worker.wsRegLock);
+        int sent = 0;
+        int j = 0;
+        while (j < snap.Count) {
+            Connection c = snap[j];
+            bool ok = await c.Push(data);
+            if (ok) { sent = sent + 1; }
+            j = j + 1;
+        }
+        return sent;
     }
 
     // Whether this worker can serve WebSocket connections, i.e. whether an HTTP
@@ -2152,6 +2243,11 @@ class Worker {
         }
         framer.Dispose();
         WsWriter writer = new WsWriter();
+        // 连接级出站能力：conn.Push/PushBinary 与帧循环共用这个 writer，
+        // 回调里（onOpen 欢迎、定时器广播）无需入站消息先行即可推帧。
+        conn.wsWriter = writer;
+        conn.wsClient = client;
+        this.WsConnAdd(conn);
         WsAssembler asm = new WsAssembler(reader.MaxLen());
         MessageHandler onFrameData = this.MessageHandlerOf();
         bool active = true;
@@ -2238,6 +2334,8 @@ class Worker {
 
         client.Close();
         conn.closed = true;
+        conn.wsWriter = null;    // Push 之后拒绝写已关闭的 socket
+        this.WsConnRemove(conn);
         this.DropConn();
         if (this.onClose != null) { await this.onClose(conn); }
     }
@@ -2326,6 +2424,11 @@ class Connection {
     string protocol;
     string userData;
     bool closed;
+    // WebSocket 连接的出站缓冲（服务端帧不掩码）。帧循环与 Push 共用
+    // 同一 writer：Append 到 Flush 之间没有 await，协程切换只发生在
+    // await 点，因此帧序天然一致，无需加锁。null = 非 WS 连接。
+    WsWriter wsWriter;
+    TcpClient wsClient;
 
     Connection(int id, nint sock, string protocol) {
         this.id = id;
@@ -2333,6 +2436,8 @@ class Connection {
         this.protocol = protocol;
         this.userData = "";
         this.closed = false;
+        this.wsWriter = null;
+        this.wsClient = null;
     }
 
     /// <summary>Arbitrary per-connection state for the application.</summary>
@@ -2357,8 +2462,8 @@ class Connection {
     }
 
     /// <summary>Queues raw bytes to the peer (fire-and-forget; usable from
-    /// synchronous callbacks). For "websocket" workers, prefer returning the
-    /// reply from onMessage so it is framed; Send writes raw bytes.</summary>
+    /// synchronous callbacks). For "websocket" workers, prefer Push (framed)
+    /// or returning the reply from onMessage; Send writes raw bytes.</summary>
     void Send(string data) {
         Task.Spawn(Socket.SendStringAsync(this.sock, data));
         Worker.BumpSent();
@@ -2369,6 +2474,42 @@ class Connection {
         int n = await Socket.SendStringAsync(this.sock, data);
         Worker.BumpSent();
         return n;
+    }
+
+    /// <summary>WebSocket push：把一条 Text 帧排进该连接的出站缓冲并立即
+    /// 写出（服务端帧不掩码）。可从任何回调上下文调用——包括 onOpen 里
+    /// 主动欢迎、定时器里广播等没有入站消息先行的场景，这正是与"从
+    /// onMessage 返回应答"的区别。连接已关或非 WS 连接返回 false。
+    /// 帧序与帧循环共用同一缓冲，Append 到 Flush 之间不让出，天然一致。</summary>
+    async bool Push(string data) {
+        if (this.closed || this.wsWriter == null) { return false; }
+        int len = (int)strlen(data);
+        WsFrame frame = WsFrame.RawFrame(WsOpcode.Text, data, len);
+        byte[] encoded = frame.Encode();
+        this.wsWriter.Append(encoded, WsFrame.HeaderLen(len) + len);
+        int n = await this.wsWriter.Flush(this.wsClient);
+        if (n < 0) {
+            this.closed = true;
+            return false;
+        }
+        Worker.BumpSent();
+        return true;
+    }
+
+    /// <summary>WebSocket 二进制 push：`data` 可含 NUL，`len` 为精确
+    /// 字节数（绝不 strlen）。语义同 Push。</summary>
+    async bool PushBinary(string data, int len) {
+        if (this.closed || this.wsWriter == null) { return false; }
+        WsFrame frame = WsFrame.RawFrame(WsOpcode.Binary, data, len);
+        byte[] encoded = frame.Encode();
+        this.wsWriter.Append(encoded, WsFrame.HeaderLen(len) + len);
+        int n = await this.wsWriter.Flush(this.wsClient);
+        if (n < 0) {
+            this.closed = true;
+            return false;
+        }
+        Worker.BumpSent();
+        return true;
     }
 
     /// <summary>Marks the connection to be closed by its worker loop.</summary>
