@@ -109,6 +109,8 @@ class HttpContext {
         this.frames = 0;
         this.framesBytes = 0;
         this.deadlineSlot = null;
+        this.streamIdleMs = 30000;
+        this.framer = null;
         HttpContext.ParsePairs(req.queryString, this.query);
         // 表单在这里解析一次，服务的是直接构造 HttpContext 的调用方
         // （此时 request.body 已是完整正文）。WebApp 的连接循环里正文
@@ -616,9 +618,25 @@ class HttpContext {
     /// null when the connection predates deadline tracking.</summary>
     HttpDeadlineToken deadlineSlot;
 
+    // The idle window a stream session (SSE/WS) re-arms on activity: the
+    // app's requestTimeoutMs, captured at attach time so WsSession.Touch
+    // re-arms with exactly the window the connection was armed with.
+    int streamIdleMs;
+    // The connection's framing buffer, handed over by the connection loop.
+    // A WebSocket upgrade slices the frame bytes that were pipelined behind
+    // the handshake head out of it (binary-safe by exact count); it is NOT
+    // disposed here — it just sits idle during the session and the
+    // connection loop releases it on teardown, like for SSE.
+    HttpFramer framer;
+
     HttpDeadlineToken DeadlineSlot() { return this.deadlineSlot; }
 
-    void __SetDeadlineSlot(HttpDeadlineToken slot) { this.deadlineSlot = slot; }
+    void __SetDeadlineSlot(HttpDeadlineToken slot, int idleMs) {
+        this.deadlineSlot = slot;
+        this.streamIdleMs = idleMs;
+    }
+
+    void __SetFramer(HttpFramer framer) { this.framer = framer; }
 
     /// <summary>Re-arms this connection's request deadline for another full
     /// window. A streaming handler calls this every time it has evidence the
@@ -721,6 +739,103 @@ class HttpContext {
         this.frames = this.frames + 1;
         this.framesBytes = this.framesBytes + 8;
         return true;
+    }
+
+    // ---- websocket upgrade (RFC 6455) ----
+    // Same-port session upgrade: the request rides the ordinary routing /
+    // hook / permission pipeline, and only after the handler decides this
+    // route IS a socket does the connection switch to frames. This is the
+    // swoole WebSocket\Server shape on the MVC port — no second server, no
+    // token-in-first-message handshake, the route's permission IS the
+    // socket's permission.
+
+    /// <summary>Whether this request asks to upgrade to WebSocket: an
+    /// Upgrade header whose token list contains "websocket" (case
+    /// insensitive) plus a non-empty Sec-WebSocket-Key. Anything else is an
+    /// ordinary request and goes down the normal response path.</summary>
+    bool IsWebSocketRequest() {
+        if (this.conn == null) { return false; }
+        string up = this.request.GetHeader("Upgrade");
+        int ul = up.Length;
+        int i = 0;
+        bool found = false;
+        while (i < ul && !found) {
+            // Skip the OWS before each token; tokens are comma separated.
+            while (i < ul && ((up[i] & 255) == 32 || (up[i] & 255) == 9)) {
+                i = i + 1;
+            }
+            int start = i;
+            while (i < ul && (up[i] & 255) != 44) { i = i + 1; }
+            int stop = i;
+            while (stop > start
+                   && ((up[stop - 1] & 255) == 32 || (up[stop - 1] & 255) == 9)) {
+                stop = stop - 1;
+            }
+            if (stop - start == 9) {
+                found = true;
+                string w = "websocket";
+                for (int j = 0; j < 9; j = j + 1) {
+                    int c = up[start + j] & 255;
+                    if (c >= 65 && c <= 90) { c = c + 32; }
+                    if (c != (w[j] & 255)) { found = false; break; }
+                }
+            }
+            i = i + 1;  // past the comma
+        }
+        if (!found) { return false; }
+        return this.request.GetHeader("Sec-WebSocket-Key").Length > 0;
+    }
+
+    /// <summary>Completes the RFC 6455 handshake and hands the connection to
+    /// a <see cref="WsSession"/>. The upgrade runs AFTER routing and
+    /// authorization, so a WebSocket session on the MVC port inherits the
+    /// route's full permission semantics — the part a standalone WS port
+    /// cannot give you.
+    ///
+    /// Session lifetime follows the SSE hijack contract: the handler that
+    /// called WsUpgrade owns the connection until it returns; the connection
+    /// loop then sees hijacked and tears down without writing a response.
+    /// null = not an upgrade request (answer normally) or the 101 write
+    /// failed (peer gone).
+    ///
+    /// An idle session is cut by the connection sweeper at the request
+    /// timeout. Recv/Send re-arm the deadline automatically on activity; a
+    /// session that may go quiet should be kept alive with periodic Ping()
+    /// pushes.</summary>
+    async WsSession WsUpgrade() {
+        if (!this.IsWebSocketRequest()) { return null; }
+        string key = this.request.GetHeader("Sec-WebSocket-Key");
+        StringBuilder sb = new StringBuilder();
+        sb.Append("HTTP/1.1 101 Switching Protocols\r\n");
+        sb.Append("Upgrade: websocket\r\n");
+        sb.Append("Connection: Upgrade\r\n");
+        sb.Append("Sec-WebSocket-Accept: ");
+        sb.Append(Encoding.WebSocketAccept(key));
+        sb.Append("\r\n\r\n");
+        bool ok = await this.SendAllTcp(sb.ToString());
+        if (!ok) { return null; }
+        this.hijacked = true;
+        this.wasHijacked = true;
+        this.ended = true;
+        ServerMetrics.Global().StreamOpened();
+        WsReader reader = new WsReader(this.conn.Sock());
+        // Frames the client pipelined behind the handshake head are already
+        // in the framer's buffer: slice them out by exact count (binary
+        // safe) and seed the reader, like Worker.HandleWebSocket does. The
+        // connection loop consumed the request itself, so everything still
+        // pending is frame bytes.
+        if (this.framer != null) {
+            int pending = this.framer.Pending();
+            if (pending > 0) {
+                reader.Prime(this.framer.Slice(0, pending), pending);
+            }
+        }
+        // The framer is not disposed here: during the session it is idle
+        // memory only, and the connection loop releases it on teardown —
+        // same lifecycle as SSE.
+        WsWriter writer = new WsWriter();
+        WsAssembler asm = new WsAssembler(reader.MaxLen());
+        return new WsSession(this.conn, reader, writer, asm, this);
     }
 
     string BuildResponse(bool keepAlive) {

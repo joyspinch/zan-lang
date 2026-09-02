@@ -1,0 +1,194 @@
+using System;
+using System.Net.Sockets;
+using System.Net.WebSocket;
+using System.Text;
+
+namespace System.Web;
+
+/// <summary>
+/// Server side of a WebSocket session on the MVC port, created by
+/// <see cref="HttpContext.WsUpgrade"/>. One object owns the upgraded
+/// connection: Recv() is the only way to read (ping/pong/close/fragment
+/// reassembly are handled inside, so a handler never sees protocol
+/// noise), Send* push to the peer without any inbound message first —
+/// the server-push shape a notification channel needs and the echo-style
+/// frame loops cannot express.
+///
+/// Concurrency model is one handler loop: Recv parks on the reactor until
+/// a complete message arrives; pushes happen between Recv calls. Two
+/// tasks pushing one session would interleave frame bytes — keep a
+/// session on one loop (a hub that fans out to many sessions pushes each
+/// session from one place).
+///
+/// Deadline: every Recv/Send re-arms the connection deadline, so an
+/// active session lives as long as it talks. A session that may go quiet
+/// (a notification bell waiting for events) must push Ping()
+/// periodically or the connection sweeper cuts it at the request timeout.
+///
+/// Send failures set Open() to false and the loop exits; the handler
+/// returning ends the session the same way the SSE hijack does.
+/// </summary>
+class WsSession {
+    TcpClient client;
+    WsReader reader;
+    WsWriter writer;
+    WsAssembler asm;
+    // The upgrade source: deadline re-arming and stream metrics ride on it.
+    // null for sessions built standalone (tests) — everything still works,
+    // minus metrics and deadline.
+    HttpContext ctx;
+    bool open;
+    // Opcode of the message Recv delivered last (Text/Binary) — the string
+    // API hides the distinction, callers that care (binary payloads) read
+    // this right after Recv.
+    int lastOpcode;
+
+    WsSession(TcpClient client, WsReader reader, WsWriter writer,
+              WsAssembler asm, HttpContext ctx) {
+        this.client = client;
+        this.reader = reader;
+        this.writer = writer;
+        this.asm = asm;
+        this.ctx = ctx;
+        this.open = true;
+        this.lastOpcode = WsOpcode.Text;
+    }
+
+    /// <summary>Whether the session can still carry frames. False after a
+    /// Close handshake, a protocol error, or a failed send.</summary>
+    bool Open() { return this.open; }
+
+    /// <summary>The opcode (WsOpcode.Text / WsOpcode.Binary) of the message
+    /// Recv returned last.</summary>
+    int LastOpcode() { return this.lastOpcode; }
+
+    /// <summary>Reads the next complete data message (fragmented messages
+    /// are reassembled first). Control frames are answered inside: Ping
+    /// becomes a queued Pong, Pong is dropped, Close is echoed and ends
+    /// the session. Protocol violations and oversized messages close with
+    /// 1002/1009. Returns null when the session is over (peer close, EOF,
+    /// protocol error) — stop the loop.</summary>
+    async string Recv() {
+        while (this.open) {
+            int total = this.reader.FrameSize();
+            while (total < 0) {
+                if (total == -2 || total == -3) {
+                    // -2 = 帧长编码违规（1002）；-3 = 消息超过单条上限
+                    // （1009）：对端声明一个 2GB 的帧不能把缓冲撑到 OOM。
+                    await this.Close(total == -3 ? 1009 : 1002);
+                    return null;
+                }
+                // Nothing complete in this batch: put pending replies
+                // (pongs, earlier pushes) on the wire before parking.
+                if (this.writer.Pending()) {
+                    bool flushed = await this.FlushOut();
+                    if (!flushed) { return null; }
+                }
+                int got = await this.reader.FillMore();
+                this.Touch();
+                if (got == 0) {
+                    this.open = false;
+                    return null;
+                }
+                total = this.reader.FrameSize();
+            }
+
+            WsFrame frame = this.reader.TakeFrame(total);
+
+            if (frame.opcode == WsOpcode.Ping) {
+                byte[] encoded = WsFrame.PongFrame().Encode();
+                this.writer.Append(encoded, 2);
+                continue;
+            }
+            if (frame.opcode == WsOpcode.Pong) { continue; }
+            if (frame.opcode == WsOpcode.Close) {
+                // 礼貌收尾：回一个空 Close 帧再断开（RFC 6455 §5.5.1）。
+                byte[] enc2 = WsFrame.CloseFrame().Encode();
+                this.writer.Append(enc2, 2);
+                int _f = await this.writer.Flush(this.client);
+                this.open = false;
+                return null;
+            }
+
+            int feed = this.asm.Feed(frame);
+            if (feed < 0) {
+                // -1 = 协议违规（1002）；-2 = 分片累计超上限（1009）。
+                await this.Close(feed == -2 ? 1009 : 1002);
+                return null;
+            }
+            if (feed == 0) { continue; }  // 分片未完，等下一帧
+
+            this.Touch();
+            this.lastOpcode = this.asm.MessageOpcode();
+            return this.asm.Complete();
+        }
+        return null;
+    }
+
+    /// <summary>Pushes one text message. false = the peer is gone; stop the
+    /// loop (Open() is now false too).</summary>
+    async bool SendText(string message) {
+        if (!this.open) { return false; }
+        WsFrame frame = WsFrame.TextFrame(message);
+        byte[] encoded = frame.Encode();
+        this.writer.Append(encoded,
+            WsFrame.HeaderLen(message.Length) + message.Length);
+        bool ok = await this.FlushOut();
+        if (ok && this.ctx != null) {
+            this.ctx.frames = this.ctx.frames + 1;
+            this.ctx.framesBytes = this.ctx.framesBytes + message.Length;
+        }
+        return ok;
+    }
+
+    /// <summary>Pushes one binary message. `data` is a byte string that may
+    /// contain NUL bytes; `len` is its exact length (never strlen).</summary>
+    async bool SendBinary(string data, int len) {
+        if (!this.open) { return false; }
+        WsFrame frame = WsFrame.BinaryFrame(data, len);
+        byte[] encoded = frame.Encode();
+        this.writer.Append(encoded, WsFrame.HeaderLen(len) + len);
+        bool ok = await this.FlushOut();
+        if (ok && this.ctx != null) {
+            this.ctx.frames = this.ctx.frames + 1;
+            this.ctx.framesBytes = this.ctx.framesBytes + len;
+        }
+        return ok;
+    }
+
+    /// <summary>Pushes a Ping. Doubles as the keep-alive for sessions that
+    /// may go quiet: the write both probes the peer (a dead socket fails
+    /// here) and re-arms the connection deadline.</summary>
+    async bool Ping() {
+        if (!this.open) { return false; }
+        byte[] encoded = WsFrame.PingFrame().Encode();
+        this.writer.Append(encoded, 2);
+        return await this.FlushOut();
+    }
+
+    /// <summary>Closes politely with a status code (1000 normal, 1002
+    /// protocol error, 1009 too big). Idempotent; Open() is false after.</summary>
+    async void Close(int code) {
+        if (!this.open) { return; }
+        this.open = false;
+        byte[] enc = WsFrame.CloseFrameWithCode(code).Encode();
+        this.writer.Append(enc, 4);
+        int _f = await this.writer.Flush(this.client);
+    }
+
+    async bool FlushOut() {
+        int n = await this.writer.Flush(this.client);
+        if (n < 0) {
+            this.open = false;
+            return false;
+        }
+        this.Touch();
+        return true;
+    }
+
+    void Touch() {
+        if (this.ctx != null) {
+            this.ctx.TouchDeadline(this.ctx.streamIdleMs);
+        }
+    }
+}

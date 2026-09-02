@@ -1,0 +1,238 @@
+// Conformance: ctx.WsUpgrade() — the MVC same-port WebSocket upgrade.
+//
+// Pins the full RFC 6455 handshake on a routed MVC handler and the
+// WsSession that comes out of it:
+// 1. 握手：RFC 示例 key 的 Sec-WebSocket-Accept 必须逐字节正确；
+//    "WebSocket" 标准拼写也要认（令牌比较大小写不敏感）。
+// 2. 握手同包管道帧：握手头后面的帧字节不能丢（framer 切出 →
+//    WsReader.Prime），echo 立即对齐。
+// 3. 服务器主动推：没有入站消息对应也能 Send 落地——echo 型帧
+//    循环做不到的事，通知通道的核心能力。
+// 4. opcode 保真：binary 帧回 binary 帧，不降级为 text。
+// 5. 礼貌关闭：handler 调 Close(1000)，客户端读到带状态码的关闭帧。
+// 6. 非 upgrade 请求打同一路由：回落为普通 HTTP 响应（升级不是
+//    门槛，路由的权限语义照常生效）。
+using System;
+using System.Net.Sockets;
+using System.Net.WebSocket;
+using System.Threading;
+using System.Web;
+
+class Program {
+    static int PORT = 9533;
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            failures = failures + 1;
+        }
+    }
+
+    // MVC 路由处理器：upgrade 成功 → WsSession 回显循环；否则按普通
+    // 请求回答。升级前的路由匹配/钩子/权限一条不少。
+    static async void WsEcho(HttpContext ctx) {
+        WsSession ws = await ctx.WsUpgrade();
+        if (ws == null) {
+            ctx.Text("not-a-websocket-request");
+            return;
+        }
+        while (ws.Open()) {
+            string msg = await ws.Recv();
+            if (msg == null) { break; }
+            if (msg == "die") {
+                await ws.Close(1000);
+                break;
+            }
+            if (msg == "sub") {
+                // 服务器主动推：没有对应的入站消息。
+                await ws.SendText("pushed");
+                continue;
+            }
+            if (ws.LastOpcode() == WsOpcode.Binary) {
+                await ws.SendBinary(msg, msg.Length);
+                continue;
+            }
+            await ws.SendText("echo:" + msg);
+        }
+    }
+
+    static TcpListener listener;
+    static bool listening = true;
+
+    static async void Accept(WebApp app) {
+        TcpListener l = new TcpListener("127.0.0.1", PORT);
+        l.Start();
+        Program.listener = l;
+        while (Program.listening) {
+            nint sock = await l.AcceptAsync();
+            if (sock >= 0) { Task.Spawn(app.HandleConnection(sock)); }
+        }
+    }
+
+    // 客户端方向的掩码帧（测试固定掩码；服务器不校验掩码内容）。
+    static string MaskedFrame(int opcode, bool fin, string payload, int len) {
+        byte[] f = new byte[2 + 4 + len + 1];
+        f[0] = (byte)((fin ? 128 : 0) | opcode);
+        f[1] = (byte)(128 | len);
+        f[2] = 1; f[3] = 2; f[4] = 3; f[5] = 4;
+        for (int i = 0; i < len; i = i + 1) {
+            f[6 + i] = (byte)((payload[i] & 255) ^ (byte)(i % 4 + 1));
+        }
+        return f.ToStr(0, 6 + len);
+    }
+
+    static void SendMasked(nint s, int opcode, bool fin, string payload, int len) {
+        int _n = Socket.SendString(s, Program.MaskedFrame(opcode, fin, payload, len));
+    }
+
+    // 读一帧（测试负载都 < 126 字节，无扩展长度）。`init` 是此前
+    // 读取时多收进来的字节（TCP 不按消息分界，101 头和第一帧常在
+    // 同一个分段里）；EOF 时返回已读到的部分，调用方的断言会失败。
+    static async string ReadFrameFrom(nint s, string init) {
+        string raw = init;
+        bool done = false;
+        while (!done) {
+            int n = raw.Length;
+            if (n >= 2) {
+                int l0 = raw[1] & 255;
+                if (l0 < 126 && n >= 2 + l0) { done = true; break; }
+            }
+            await Socket.ReadReady(s);
+            string part = Socket.Receive(s, 4096);
+            if (part.Length == 0) { return raw; }
+            raw = raw + part;
+        }
+        return raw;
+    }
+
+    static int FindHeadEnd(string s) {
+        int n = s.Length - 3;
+        for (int i = 0; i < n; i = i + 1) {
+            if ((s[i] & 255) == 13 && (s[i + 1] & 255) == 10
+                && (s[i + 2] & 255) == 13 && (s[i + 3] & 255) == 10) {
+                return i;
+            }
+        }
+        return 0 - 1;
+    }
+
+    static bool Has(string hay, string needle) {
+        int hl = hay.Length;
+        int nl = needle.Length;
+        if (nl == 0 || hl < nl) { return false; }
+        for (int i = 0; i + nl <= hl; i = i + 1) {
+            int j = 0;
+            while (j < nl && (hay[i + j] & 255) == (needle[j] & 255)) {
+                j = j + 1;
+            }
+            if (j == nl) { return true; }
+        }
+        return false;
+    }
+
+    static string BodyOf(string resp) {
+        int cut = Program.FindHeadEnd(resp);
+        if (cut < 0) { return ""; }
+        return resp.Substring(cut + 4);
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        WebApp app = new WebApp("127.0.0.1", PORT);
+        Route _r1 = app.Get("/ws", WsEcho);
+        // 直接驱动被测的连接循环，而不是 app.Start()：启动横幅会打印
+        // pid，输出不再可复现。accept 之后走的是同一个 HandleConnection。
+        Task.Spawn(Accept(app));
+        await Task.Delay(100);
+
+        nint s = 0;
+        bool connected = false;
+        // 会挂起（yield 到调度器）的异步连接重试：Task.Spawn 的服务端
+        // 协程要等主协程首次挂起才有机会 bind（见 ws_loopback 的注释）。
+        for (int i = 0; i < 100; i = i + 1) {
+            TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", PORT);
+            if (c != null) { s = c.Sock(); connected = true; break; }
+            Thread.Sleep(20);
+        }
+        if (!connected) {
+            Console.WriteLine("failures=1");
+            return 0;
+        }
+        Socket.SetNonBlocking(s);
+
+        // 1. 握手 + 同包管道帧 "pipe"（一次 send：头部块 + 掩码帧）。
+        string req = "GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: WebSocket\r\n"
+            + "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            + "Sec-WebSocket-Version: 13\r\n\r\n";
+        int _p = Socket.SendString(s, req + Program.MaskedFrame(1, true, "pipe", 4));
+        string buf = "";
+        while (Program.FindHeadEnd(buf) < 0) {
+            await Socket.ReadReady(s);
+            string hp = Socket.Receive(s, 4096);
+            if (hp.Length == 0) { break; }
+            buf = buf + hp;
+        }
+        // 切分头部块与多收进来的帧字节（同段到达是常态）。
+        int cut = Program.FindHeadEnd(buf);
+        string head = cut >= 0 ? buf.Substring(0, cut + 4) : buf;
+        string leftover = cut >= 0 ? buf.Substring(cut + 4) : "";
+        Check(head.Length > 12 && head.Substring(9, 3) == "101"
+              && Program.Has(head, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
+            "ws handshake 101 with rfc accept");
+
+        string pipe = await Program.ReadFrameFrom(s, leftover);
+        Check((pipe[0] & 15) == 1 && pipe.Substring(2) == "echo:pipe",
+            "ws pipelined frame behind handshake");
+
+        // 2. 服务器主动推（先 sub，推送先行于任何回显）。
+        Program.SendMasked(s, 1, true, "sub", 3);
+        string push = await Program.ReadFrameFrom(s, "");
+        Check((push[0] & 15) == 1 && push.Substring(2) == "pushed",
+            "ws server push without inbound");
+
+        // 3. 普通 text 回显。
+        Program.SendMasked(s, 1, true, "hello", 5);
+        string echo = await Program.ReadFrameFrom(s, "");
+        Check((echo[0] & 15) == 1 && echo.Substring(2) == "echo:hello",
+            "ws text echo");
+
+        // 4. binary 帧保真：opcode 不降级。
+        Program.SendMasked(s, 2, true, "XYZ", 3);
+        string bin = await Program.ReadFrameFrom(s, "");
+        Check((bin[0] & 15) == 2 && bin.Substring(2) == "XYZ",
+            "ws binary opcode preserved");
+
+        // 5. 礼貌关闭：Close(1000) → 客户端读到带状态码的关闭帧。
+        Program.SendMasked(s, 1, true, "die", 3);
+        string cls = await Program.ReadFrameFrom(s, "");
+        int closeCode = 0;
+        if ((cls[0] & 15) == 8 && (cls[1] & 127) == 2 && cls.Length >= 4) {
+            closeCode = ((cls[2] & 255) << 8) + (cls[3] & 255);
+        }
+        Check(closeCode == 1000, "ws close code 1000");
+        Socket.Close(s);
+
+        // 6. 非 upgrade 请求打同一路由 → 普通 HTTP 响应。
+        TcpClient c2 = await TcpClient.ConnectAsync("127.0.0.1", PORT);
+        int _g = await c2.SendAsync("GET /ws HTTP/1.1\r\nHost: t\r\n\r\n");
+        string resp = await c2.RecvAsync(4096, 2000);
+        Check(Program.BodyOf(resp) == "not-a-websocket-request",
+            "plain request falls through");
+        c2.Close();
+
+        Program.listening = false;
+        if (Program.listener != null) { Program.listener.Stop(); }
+        Console.WriteLine("failures=" + Convert.ToString(failures));
+        // 停服后留几个泵转：accept 协程以 -1 复位并退出，退出时的
+        // 泄漏探测才不会把服务端对象链记为仍可达。
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}
