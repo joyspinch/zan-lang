@@ -193,7 +193,8 @@ class CefBackend {
         return dest;
     }
 
-    // "zan-drivers/<fp>/<file>" 中的 <fp>。
+    /// 内嵌资源名 "zan-drivers/&lt;fp&gt;/&lt;file&gt;" 中的 &lt;fp&gt;（构建指纹段）；
+    /// 没有两段路径时为 "unknown"。
     static string Fingerprint(string name) {
         int end = name.LastIndexOf("/");
         if (end <= 0) { return "unknown"; }
@@ -202,6 +203,8 @@ class CefBackend {
         return head.Substring(start + 1, head.Length - start - 1);
     }
 
+    /// 解析 driver 的全部导出符号到 addr_*；任一缺失即返回 false，
+    /// 并把缺的符号名记进 Error()。
     static bool ResolveSymbols() {
         CefBackend.missing = "";
         CefBackend.addr_lastError = CefBackend.Sym("zan_cef_last_error");
@@ -254,6 +257,7 @@ class CefBackend {
 
     static string missing = "";
 
+    /// 解析单个导出符号；缺失时记下符号名并返回 0（加载即判失败）。
     static nint Sym(string name) {
         nint a = Interop.Symbol(CefBackend.mod, name);
         if (a == 0) {
@@ -294,6 +298,7 @@ class CefBackend {
         return f(runtimeDir, cachePath, helperPath, locale, switches, wl) != 0;
     }
 
+    /// CEF 浏览器进程已初始化且未 shutdown。
     static bool Ready() {
         if (!CefBackend.resolved) { return false; }
         CefIntFn f = (CefIntFn)CefBackend.addr_ready;
@@ -307,6 +312,7 @@ class CefBackend {
         f();
     }
 
+    /// 关闭全部浏览器并 shutdown CEF（进程退出前调用一次，不可逆）。
     static void Shutdown() {
         if (!CefBackend.resolved) { return; }
         CefVoidFn f = (CefVoidFn)CefBackend.addr_shutdown;
@@ -315,14 +321,18 @@ class CefBackend {
 
     // ---------------------------------------------------------- 浏览器 API
 
+    /// 以 (x,y,w,h) 在 `parent` 内创建浏览器并立即导航到 `url`，返回句柄
+    /// （driver 未加载/失败为 0）。
     static int Create(nint parent, int x, int y, int w, int h, string url) {
         if (!CefBackend.resolved) { return 0; }
         CefCreateFn f = (CefCreateFn)CefBackend.addr_create;
         return f(parent, x, y, w, h, url);
     }
 
+    /// 关闭并销毁浏览器；句柄之后失效。
     static void Close(int h) { CefBackend.CallVoid(CefBackend.addr_close, h); }
 
+    /// 浏览器是否仍然存活（无效句柄为 false）。
     static bool Alive(int h) {
         return CefBackend.CallInt(CefBackend.addr_alive, h) != 0;
     }
@@ -335,12 +345,14 @@ class CefBackend {
         return f(h);
     }
 
+    /// 把浏览器摆到父窗口客户区坐标 (x,y,w,hh)。
     static void SetBounds(int h, int x, int y, int w, int hh) {
         if (!CefBackend.resolved) { return; }
         CefBoundsFn f = (CefBoundsFn)CefBackend.addr_setBounds;
         f(h, x, y, w, hh);
     }
 
+    /// 显示或隐藏浏览器。
     static void SetVisible(int h, bool visible) {
         if (!CefBackend.resolved) { return; }
         CefIntIntFn f = (CefIntIntFn)CefBackend.addr_setVisible;
@@ -356,40 +368,51 @@ class CefBackend {
         f(h, spec);
     }
 
+    /// 把键盘焦点交给（focus=false 时收回自）浏览器。
     static void SetFocus(int h, bool focus) {
         if (!CefBackend.resolved) { return; }
         CefIntIntFn f = (CefIntIntFn)CefBackend.addr_setFocus;
         f(h, focus ? 1 : 0);
     }
 
+    /// 导航到 URL。
     static void Navigate(int h, string url) {
         if (!CefBackend.resolved) { return; }
         CefIntStrVoidFn f = (CefIntStrVoidFn)CefBackend.addr_navigate;
         f(h, url);
     }
 
+    /// 历史后退一页。
     static void Back(int h) { CefBackend.CallVoid(CefBackend.addr_back, h); }
+    /// 历史前进一页。
     static void Forward(int h) { CefBackend.CallVoid(CefBackend.addr_forward, h); }
+    /// 停止当前加载。
     static void Stop(int h) { CefBackend.CallVoid(CefBackend.addr_stop, h); }
 
+    /// 重新加载；ignoreCache=true 绕过缓存（Ctrl+F5 语义）。
     static void Reload(int h, bool ignoreCache) {
         if (!CefBackend.resolved) { return; }
         CefIntIntFn f = (CefIntIntFn)CefBackend.addr_reload;
         f(h, ignoreCache ? 1 : 0);
     }
 
+    /// 能否后退。
     static bool CanGoBack(int h) {
         return CefBackend.CallInt(CefBackend.addr_canGoBack, h) != 0;
     }
+    /// 能否前进。
     static bool CanGoForward(int h) {
         return CefBackend.CallInt(CefBackend.addr_canGoForward, h) != 0;
     }
+    /// 是否正在加载。
     static bool IsLoading(int h) {
         return CefBackend.CallInt(CefBackend.addr_isLoading, h) != 0;
     }
+    /// 每次导航/源变化自增的序号（控件轮询它发现 URL/标题可能变了）。
     static int NavSeq(int h) {
         return CefBackend.CallInt(CefBackend.addr_navSeq, h);
     }
+    /// 最近一次导航完成的状态码（无导航为 0）。
     static int LastStatus(int h) {
         return CefBackend.CallInt(CefBackend.addr_lastStatus, h);
     }
@@ -398,9 +421,11 @@ class CefBackend {
         return CefBackend.CallInt(CefBackend.addr_lastErrorCode, h);
     }
 
+    /// 当前 URL（无页面为 ""）。
     static string GetUrl(int h) {
         return CefBackend.CallStr(CefBackend.addr_url, h);
     }
+    /// 当前页面标题（无页面为 ""）。
     static string GetTitle(int h) {
         return CefBackend.CallStr(CefBackend.addr_title, h);
     }
@@ -421,6 +446,7 @@ class CefBackend {
         CefCdpSendFn f = (CefCdpSendFn)CefBackend.addr_cdpSend;
         return f(h, method, paramsJson);
     }
+    /// 队列里还没取走的 CDP 消息条数。
     static int CdpPending(int h) {
         return CefBackend.CallInt(CefBackend.addr_cdpPending, h);
     }
@@ -429,6 +455,7 @@ class CefBackend {
     static int CdpDropped(int h) {
         return CefBackend.CallInt(CefBackend.addr_cdpDropped, h);
     }
+    /// DevTools 域是否已附接（CdpSend 送达的前提）。
     static bool CdpAttached(int h) {
         return CefBackend.CallInt(CefBackend.addr_cdpAttached, h) != 0;
     }
@@ -462,6 +489,7 @@ class CefBackend {
         f(h, level);
     }
 
+    /// 当前缩放级（0 = 100%，每 +1 乘 1.2）。
     static double GetZoom(int h) {
         if (!CefBackend.resolved || CefBackend.addr_getZoom == 0) {
             return 0.0;
@@ -470,6 +498,8 @@ class CefBackend {
         return f(h);
     }
 
+    /// 页内查找：forward=false 向上、matchCase 区分大小写；findNext=false
+    /// 开始新查找，true 在既有查找里继续步进。
     static void Find(int h, string text, bool forward, bool matchCase,
                      bool findNext) {
         if (!CefBackend.resolved || CefBackend.addr_find == 0) { return; }
@@ -477,18 +507,22 @@ class CefBackend {
         f(h, text, forward ? 1 : 0, matchCase ? 1 : 0, findNext ? 1 : 0);
     }
 
+    /// 结束页内查找；clearSelection=true 时同时清掉高亮选区。
     static void StopFind(int h, bool clearSelection) {
         if (!CefBackend.resolved || CefBackend.addr_stopFind == 0) { return; }
         CefIntIntFn f = (CefIntIntFn)CefBackend.addr_stopFind;
         f(h, clearSelection ? 1 : 0);
     }
 
+    /// 弹出系统打印对话框，打印当前页面。
     static void Print(int h) { CefBackend.CallVoid(CefBackend.addr_print, h); }
 
+    /// 打开本浏览器的 DevTools 窗口（CDP 附接的前提）。
     static void ShowDevTools(int h) {
         CefBackend.CallVoid(CefBackend.addr_showDevTools, h);
     }
 
+    /// 关闭 DevTools 窗口。
     static void CloseDevTools(int h) {
         CefBackend.CallVoid(CefBackend.addr_closeDevTools, h);
     }

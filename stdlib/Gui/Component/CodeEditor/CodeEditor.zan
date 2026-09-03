@@ -106,11 +106,14 @@ class ProjType {
     }
 }
 
+/// 右键菜单的一项：标签、右侧显示的快捷键提示，以及动作编号
+/// （0 = 分隔行，其余由编辑器的菜单执行器解释）。
 class ContextMenuItem {
     string label;
     string key;
     int action;
 
+    /// `action` 为 0 时 label/key 被忽略（纯分隔行）。
     ContextMenuItem(string label, string key, int action) {
         this.label = label;
         this.key = key;
@@ -565,6 +568,8 @@ partial class CodeEditor {
         return s.Replace("\r", "").Split("\n");
     }
 
+    /// 整体替换缓冲区：保证至少一行，光标与滚动复位到开头，
+    /// 并强制下一帧重新计算诊断。
     void SetLines(List<string> ls) {
         lines = ls;
         if (lines.Count == 0) { lines.Add(""); }
@@ -575,6 +580,8 @@ partial class CodeEditor {
         lastDiagLine = -1;  // 强制对新内容重新计算诊断
     }
 
+    /// 载入整段文本（SetLines 的字符串版），同时清空 CodeLens、
+    /// 签名备忘等派生自旧内容的缓存。
     void LoadText(string s) {
         SetLines(CodeEditor.SplitLines(s));
         extRefDirty = true;
@@ -586,6 +593,7 @@ partial class CodeEditor {
         lensStamp = 0 - 1;
     }
 
+    /// 全部文本（行以 '\n' 连接）。
     string GetText() {
         return string.Join("\n", lines);
     }
@@ -600,11 +608,14 @@ partial class CodeEditor {
         return n * 131 + lines.Count;
     }
 
+    /// 缓冲区行数。
     int LineCount() {
         return lines.Count;
     }
 
+    /// 当前光标行（0 起）。
     int CurLine() { return curLine; }
+    /// 当前光标列（0 起）。
     int CurCol() { return curCol; }
 
     /// 第 `i` 行的文本（越界返回 ""）。使宿主（查找栏）
@@ -624,6 +635,7 @@ partial class CodeEditor {
     /// 首个可见行。拥有多个缓冲区的宿主把它与
     /// 光标一起保存，以恢复缓冲区离开时的状态。
     int ScrollLine() { return scrollLine; }
+    /// 设置首个可见行（钳制到 [0, 行数-1]）。
     void SetScrollLine(int line) {
         if (line < 0) { line = 0; }
         if (line >= lines.Count) { line = lines.Count - 1; }
@@ -668,8 +680,10 @@ partial class CodeEditor {
         return false;
     }
 
+    /// 替换调试变量面板的内容（宿主自己的数据，编辑器只负责显示）。
     void SetDebugVars(List<DbgVar> vars) { dbgVars = vars; }
 
+    /// 跳到某行行首（钳制行号、清除选区）。
     void GoToLine(int line) {
         if (line < 0) { line = 0; }
         if (line >= lines.Count) { line = lines.Count - 1; }
@@ -725,19 +739,23 @@ partial class CodeEditor {
         return CodeEditor.DiagHas(compErrors, ln);
     }
 
+    /// 跳到指定行列（列超界时钳到行尾）。
     void GoToLineCol(int line, int col) {
         GoToLine(line);
         curCol = col;
         ClampCol();
     }
 
-    // ---- 编辑原语 ----
+    /// ---- 编辑原语 ----
+    /// 在光标处插入一段无换行文本，光标随之前移。
     void InsertStr(string ins) {
         string ln = lines[curLine];
         lines[curLine] = Text.InsertAt(ln, curCol, ins);
         curCol = curCol + ins.Length;
     }
 
+    /// 在光标处换行：拆分当前行，并把被拆行的前导空白（自动缩进）
+    /// 带到新行，光标落在缩进之后。
     void NewLine() {
         string ln = lines[curLine];
         string left = Text.Left(ln, curCol);
@@ -757,6 +775,7 @@ partial class CodeEditor {
         curCol = ws;
     }
 
+    /// 退格：删光标前一字符；行首时与上一行合并。
     void BackspaceEdit() {
         if (curCol > 0) {
             string ln = lines[curLine];
@@ -774,6 +793,7 @@ partial class CodeEditor {
         }
     }
 
+    /// 删除光标处字符；行尾时吞掉下一行。
     void DeleteEdit() {
         string ln = lines[curLine];
         if (curCol < ln.Length) {
@@ -785,12 +805,14 @@ partial class CodeEditor {
         }
     }
 
+    /// 把光标列钳回当前行合法范围（[0, 行长]）。
     void ClampCol() {
         string ln = lines[curLine];
         if (curCol > ln.Length) { curCol = ln.Length; }
         if (curCol < 0) { curCol = 0; }
     }
 
+    /// 左移一字符；行首时退到上一行行尾。
     void MoveLeft() {
         if (curCol > 0) {
             curCol = Text.PrevCharStart(lines[curLine], curCol);
@@ -800,6 +822,7 @@ partial class CodeEditor {
         }
     }
 
+    /// 右移一字符；行尾时进到下一行行首。
     void MoveRight() {
         string ln = lines[curLine];
         if (curCol < ln.Length) {
@@ -810,6 +833,7 @@ partial class CodeEditor {
         }
     }
 
+    /// 上移一行（列号钳制到新行长）。
     void MoveUp() {
         if (curLine > 0) {
             curLine = curLine - 1;
@@ -817,6 +841,7 @@ partial class CodeEditor {
         }
     }
 
+    /// 下移一行（列号钳制到新行长）。
     void MoveDown() {
         if (curLine + 1 < lines.Count) {
             curLine = curLine + 1;
@@ -946,7 +971,9 @@ partial class CodeEditor {
         if (curCol < 0) { curCol = 0; }
     }
 
-    // ---- 撤销 / 重做 ----
+    /// ---- 撤销 / 重做 ----
+    /// 把当前全文与光标压入撤销栈（上限 50 条，超出丢最旧），
+    /// 并清空重做栈。
     void SaveUndo() {
         undoStack.Add(new EditSnapshot(GetText(), curLine, curCol));
         if (undoStack.Count > 50) {
@@ -956,6 +983,7 @@ partial class CodeEditor {
         redoStack = new List<EditSnapshot>();
     }
 
+    /// 撤销最近一次编辑：撤销前状态先压入重做栈，恢复后清除选区。
     void Undo() {
         if (undoStack.Count == 0) { return; }
         int last = undoStack.Count - 1;
@@ -970,6 +998,7 @@ partial class CodeEditor {
         selActive = false;
     }
 
+    /// 重做最近一次被撤销的编辑（对称地更新撤销栈）。
     void Redo() {
         if (redoStack.Count == 0) { return; }
         int last = redoStack.Count - 1;
@@ -983,7 +1012,8 @@ partial class CodeEditor {
         selActive = false;
     }
 
-    // ---- 选区 ----
+    /// ---- 选区 ----
+    /// 全选：锚点置 (0,0)，光标置文末。
     void SelectAll() {
         selAnchorLine = 0;
         selAnchorCol = 0;
@@ -992,6 +1022,7 @@ partial class CodeEditor {
         selActive = true;
     }
 
+    /// 取消选区（锚点保留但不再激活）。
     void ClearSelection() { selActive = false; }
 
     /// 从 (aLine, aCol) 选中到 (bLine, bCol)，光标停在
@@ -1153,7 +1184,8 @@ partial class CodeEditor {
         curCol = CodeEditor.ColFromX(lines[curLine], app.mouseX - textX, fontSize);
     }
 
-    // ---- 多光标 ----
+    /// ---- 多光标 ----
+    /// 清掉全部辅助光标（只留主光标）。
     void ClearExtraCarets() { carets = new List<Caret>(); }
 
     /// 在最下方活动光标的下一行添加辅助光标。
@@ -1205,6 +1237,7 @@ partial class CodeEditor {
         }
     }
 
+    /// 尚无选区时在当前位置埋下选区锚点（拖拽/Shift 移动前调用）。
     void StartSelection() {
         if (!selActive) {
             selAnchorLine = curLine;
@@ -1213,6 +1246,7 @@ partial class CodeEditor {
         }
     }
 
+    /// 选区文本（行间以 '\n' 连接；方向自动归一，无选区为 ""）。
     string GetSelectedText() {
         if (!selActive) { return ""; }
         int sL = selAnchorLine;
@@ -1245,6 +1279,7 @@ partial class CodeEditor {
         return result;
     }
 
+    /// 删除整个选区：光标落在选区起点，选区取消（无选区为空操作）。
     void DeleteSelection() {
         if (!selActive) { return; }
         int sL = selAnchorLine;
@@ -1279,12 +1314,14 @@ partial class CodeEditor {
         selActive = false;
     }
 
+    /// 复制选区到系统剪贴板（同时留在内部缓冲）。
     void CopySelection() {
         if (!selActive) { return; }
         clipboard = GetSelectedText();
         Clipboard.SetText(clipboard);
     }
 
+    /// 剪切：复制选区后再删除。
     void CutSelection() {
         if (!selActive) { return; }
         clipboard = GetSelectedText();
@@ -1292,9 +1329,10 @@ partial class CodeEditor {
         DeleteSelection();
     }
 
+    /// 粘贴：优先系统剪贴板（可粘其他应用复制的内容），为空时回退
+    /// 编辑器内缓冲；内容经 InsertBlock 插入（替换选区）。
     void PasteClipboard() {
         // 优先使用系统剪贴板，使其他应用复制的文本可粘贴进来；
-        // 系统剪贴板为空时回退到编辑器内缓冲区。
         // 系统剪贴板为空时回退到编辑器内缓冲区。
         string os = Clipboard.GetText();
         if (os.Length > 0) { clipboard = os; }
@@ -1402,6 +1440,7 @@ partial class CodeEditor {
         ClampCol();
     }
 
+    /// 去掉前导空格/制表符。
     static string LTrim(string s) {
         int len = s.Length;
         int i = 0;
@@ -1501,6 +1540,7 @@ partial class CodeEditor {
         app.RequestRedraw();
     }
 
+    /// 右键菜单当前是否打开。
     bool CtxMenuOpen() { return ctxOpen; }
 
     /// 将右键菜单绘制为顶层浮层（限制在整个
@@ -1599,7 +1639,10 @@ partial class CodeEditor {
         }
     }
 
-    // ---- 错误诊断 ----
+    /// ---- 错误诊断 ----
+    /// 重跑启发式诊断：按行括号缓存做花括号/圆括号配平（多余或缺失
+    /// 的闭合各报一条）、`using` 行缺分号，最后由
+    /// AnalyzeMissingUsings 标记使用了却未导入的 stdlib 类型。
     void CheckErrors() {
         errors = new List<Diagnostic>();
         EnsureLineScan();
