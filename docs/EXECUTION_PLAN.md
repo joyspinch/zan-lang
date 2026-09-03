@@ -76,7 +76,7 @@
 > 消费」的常规用法行为正确，挂死只出现在无限序列场景。计划随 B7
 > （查询语法）一并设计 IEnumerable 协议，避免 foreach/集合接口两翻改。
 | B7 | LINQ 查询语法（`from … where … select`）脱糖为方法链 | P2 | parser/binder 支持，conformance 覆盖 join/group |
-| B8 | 语言便利特性（按需）：`using` 声明、`init`/`with`、`checked` | P2 | 逐项 SPEC + conformance |
+| B8 | 语言便利特性（按需）：`using` 声明、`init`/`with`、~~`checked`~~（**已完成**：checked/unchecked 表达式+语句块全形态、C# 兼容溢出语义，802607e7，`tests/conformance/cs_b14_checked.zan` + `tests/runtime/checked_overflow.zan`） | P2 | 逐项 SPEC + conformance |
 | B9 | 编译器：修复泛型统一表示导致的 7 项 bug（泛型比较/相等、委托返回类型重载、Dictionary 泛型值、泛型累加器泄漏等），修复后可将 OrderByStr/ContainsStr 等并回 C# 同名重载 | **已完成** | `docs/bugs/generics-uniform-repr.md` 各条最小复现通过；`tests/conformance/generics_uniform_repr.zan` + `linq_csharp_overloads.zan`（OrderBy/Contains/Distinct/GroupBy/Sum/Min/Max/Average/In 同名重载已并回） |
 
 > B1–B3 收益最大、改动集中在 stdlib，一周期内可完成；B6/B7 涉及编译器，
