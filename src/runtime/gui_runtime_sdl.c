@@ -86,6 +86,78 @@ static SDL_FingerID g_touch_id = 0;   /* 0 = no finger down */
 static float g_touch_x, g_touch_y;    /* last position, window coords */
 static float g_touch_ax, g_touch_ay;  /* anchor = down position */
 static int g_touch_drag = 0;          /* past the slop: scrolling */
+static float g_touch_acc = 0;         /* sub-notch wheel remainder: a notch
+                                      * is g_dpi/300 content px, so slow
+                                      * drags move well under one notch per
+                                      * motion event — without the float
+                                      * accumulator the per-event (int)
+                                      * truncation ate that travel whole
+                                      * and the scroll stalled, then jumped */
+#define TOUCH_HIST 8                  /* release-velocity ring buffer */
+static float g_hist_y[TOUCH_HIST];
+static Uint64 g_hist_t[TOUCH_HIST];
+static int g_hist_n, g_hist_i;
+
+/* Release inertia (fling): on finger-up with enough travel speed a timer
+ * keeps pushing wheel events with exponentially decaying velocity, like
+ * every native mobile scroller. Driven from SDL's timer thread; it only
+ * pushes plain SDL_EVENT_MOUSE_WHEEL events (thread-safe SDL_PushEvent),
+ * which the main loop translates through the exact same path as real
+ * wheel input. */
+static SDL_TimerID g_fling_timer = 0; /* 0 = no fling running */
+static SDL_WindowID g_fling_win = 0;
+static float g_fling_v = 0;           /* px/s, window px, drag-sign convention */
+static float g_fling_acc = 0;         /* sub-notch remainder, as above */
+static float g_fling_x, g_fling_y;    /* wheel event coords = release point */
+static Uint64 g_fling_last = 0;
+
+#define FLING_START_PX_S 250.0f       /* slower releases just stop */
+#define FLING_STOP_PX_S 120.0f        /* decay stop band */
+#define FLING_TAU_MS 400.0f           /* exponential friction constant */
+
+/* Push `px` content pixels of travel through the wheel path (notch
+ * accumulate -> integral ±120-scale degrees), at the given coords. */
+static void fling_push_px(float px) {
+    g_fling_acc += px * 288.0f / (float)g_dpi;
+    int delta = (int)g_fling_acc;
+    if (delta == 0) return;
+    g_fling_acc -= (float)delta;
+    SDL_Event ev;
+    SDL_zero(ev);
+    ev.type = SDL_EVENT_MOUSE_WHEEL;
+    ev.wheel.windowID = g_fling_win;
+    ev.wheel.mouse_x = g_fling_x;
+    ev.wheel.mouse_y = g_fling_y;
+    ev.wheel.y = (float)delta / 120.0f;
+    SDL_PushEvent(&ev);
+}
+
+static Uint32 SDLCALL fling_tick(void *userdata, SDL_TimerID id, Uint32 interval) {
+    (void)userdata; (void)id;
+    if (g_fling_win == 0) return 0;
+    Uint64 now = SDL_GetTicks();
+    float dt = (float)(now - g_fling_last) / 1000.0f;
+    g_fling_last = now;
+    if (dt > 0) {
+        g_fling_v *= expf(-dt * 1000.0f / FLING_TAU_MS);
+        fling_push_px(g_fling_v * dt);
+    }
+    if (fabsf(g_fling_v) < FLING_STOP_PX_S) {
+        g_fling_win = 0;
+        return 0; /* cancel the timer */
+    }
+    return interval;
+}
+
+static void fling_cancel(void) {
+    if (g_fling_timer != 0) {
+        SDL_RemoveTimer(g_fling_timer);
+        g_fling_timer = 0;
+    }
+    g_fling_win = 0;
+    g_fling_v = 0;
+    g_fling_acc = 0;
+}
 
 /* Per-window renderer + streaming texture registry. The handle handed back to
  * Zan is the SDL_Window* (cast to i64), exactly like the Win32 HWND was. */
@@ -167,6 +239,22 @@ static void zq_push(int kind, int x, int y, int button, int code, int mods,
         zan_zev_t *p = &g_zq[last];
         if (p->e[0] == 1 && p->win == win) {
             p->e[1] = x; p->e[2] = y; p->e[5] = mods;
+            return;
+        }
+    }
+    /* Coalesce wheel floods the same way, by SUMMING deltas: touch drags
+     * translate finger motion into one kind-13 per sample and the app eats
+     * one event per rendered frame, so an un-coalesced wheel backlog lags
+     * the page visibly behind the finger (a fast flick kept scrolling long
+     * after lift while the early travel crawled). Deltas are additive and
+     * the freshest x/y wins, so a merged event scrolls exactly the same
+     * total in one frame — and capture-rect arbitration sees the position
+     * the pointer actually reached. */
+    if (kind == 13 && !zq_empty()) {
+        int last = (g_zq_tail + ZAN_ZQ_CAP - 1) % ZAN_ZQ_CAP;
+        zan_zev_t *p = &g_zq[last];
+        if (p->e[0] == 13 && p->win == win) {
+            p->e[1] = x; p->e[2] = y; p->e[4] += code; p->e[5] = mods;
             return;
         }
     }
@@ -403,6 +491,12 @@ static void sdl_translate(const SDL_Event *e) {
             g_touch_x = g_touch_ax = e->tfinger.x * (float)wi;
             g_touch_y = g_touch_ay = e->tfinger.y * (float)hi;
             g_touch_drag = 0;
+            g_touch_acc = 0;
+            fling_cancel(); /* a new touch always kills a coasting fling */
+            g_hist_n = 0; g_hist_i = 0;
+            g_hist_t[0] = SDL_GetTicks();
+            g_hist_y[0] = g_touch_y;
+            g_hist_n = 1; g_hist_i = 1 % TOUCH_HIST;
             break;
         }
         case SDL_EVENT_FINGER_MOTION: {
@@ -419,16 +513,26 @@ static void sdl_translate(const SDL_Event *e) {
                 g_touch_drag = 1; /* a drag scrolls and presses nothing */
             }
             /* Finger travel -> wheel deltas in the ±120 scale Gui/App's
-             * /120 math expects. A wheel notch scrolls 40 logical px at
-             * scrollSpeed = 40*dpiScale/100, dpiScale = g_dpi*100/96, so
-             * delta = dy*288/g_dpi moves content by ~dy window px. The
-             * sign mirrors natural touch scrolling: content follows the
-             * finger, so dragging up (y shrinks) must scroll DOWN, i.e.
-             * produce a negative wheel delta. */
-            int delta = (int)((y - g_touch_y) * 288.0f / (float)g_dpi);
+             * /120 math expects: content px per wheel degree is
+             * scrollSpeed/120 = (40*dpiScale/100)/120 = dpiScale/300, and
+             * dpiScale = g_dpi*100/96, so degrees = dy*288/g_dpi moves
+             * content by exactly dy window px. Sub-degree remainders
+             * accumulate in g_touch_acc — a per-event (int) cast there
+             * made slow drags stall, then jump. The sign mirrors natural
+             * touch scrolling: content follows the finger, so dragging up
+             * (y shrinks) must scroll DOWN, i.e. negative wheel delta. */
+            g_touch_acc += (y - g_touch_y) * 288.0f / (float)g_dpi;
+            int delta = (int)g_touch_acc;
             if (delta != 0) {
+                g_touch_acc -= (float)delta;
                 zq_push(13, (int)x, (int)y, 0, delta, cur_mod_bits(), w);
             }
+            /* release-velocity history (recent window only, so a reversal
+             * right before finger-up flings in the new direction) */
+            g_hist_t[g_hist_i] = SDL_GetTicks();
+            g_hist_y[g_hist_i] = y;
+            g_hist_i = (g_hist_i + 1) % TOUCH_HIST;
+            if (g_hist_n < TOUCH_HIST) g_hist_n++;
             g_touch_x = x;
             g_touch_y = y;
             break;
@@ -437,7 +541,40 @@ static void sdl_translate(const SDL_Event *e) {
         case SDL_EVENT_FINGER_CANCELED: {
             if (e->tfinger.fingerID != g_touch_id || g_touch_id == 0) break;
             g_touch_id = 0;
-            if (g_touch_drag) break; /* the drag already scrolled */
+            if (g_touch_drag) {
+                /* Release inertia: velocity from the recent travel window
+                 * (oldest sample still inside ~120 ms). CANCELED just
+                 * stops. Coordinates stay at the release point so the
+                 * wheel events land on the widget that was being dragged. */
+                if (e->type == SDL_EVENT_FINGER_UP) {
+                    int last = (g_hist_i + TOUCH_HIST - 1) % TOUCH_HIST;
+                    int old = last; /* oldest sample inside the window */
+                    for (int k = 0; k < g_hist_n; k++) {
+                        int idx = (last - k + TOUCH_HIST) % TOUCH_HIST;
+                        if (g_hist_t[idx] + 120 < g_hist_t[last]) break;
+                        old = idx;
+                    }
+                    Uint64 span = g_hist_t[last] - g_hist_t[old];
+                    if (span > 0 && g_hist_n >= 2) {
+                        float v = (g_hist_y[last] - g_hist_y[old]) * 1000.0f / (float)span;
+                        if (fabsf(v) > FLING_START_PX_S) {
+                            SDL_Window *w = SDL_GetWindowFromEvent(e);
+                            if (!w) w = g_main_win;
+                            if (w) {
+                                g_fling_v = v;
+                                g_fling_acc = 0;
+                                g_fling_x = g_touch_x;
+                                g_fling_y = g_touch_y;
+                                g_fling_win = SDL_GetWindowID(w);
+                                g_fling_last = SDL_GetTicks();
+                                g_fling_timer = SDL_AddTimer(16, fling_tick, NULL);
+                            }
+                        }
+                    }
+                }
+                g_touch_drag = 0;
+                break;
+            }
             if (e->type == SDL_EVENT_FINGER_CANCELED) break;
             /* Tap: a full click at the anchor (move so hover/state is
              * right, then press + release). */
