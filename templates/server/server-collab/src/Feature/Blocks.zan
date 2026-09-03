@@ -1,0 +1,318 @@
+using System;
+using System.Collections;
+using System.Web;
+
+namespace ZanWeb;
+
+/* 行式块语法渲染器（T9 文档中心）。语法共 10 种块：
+   `# `/`## `/`### ` 标题、`- ` 无序列表、`数字. ` 有序列表、`> ` 引用、
+   ``` 围栏代码（escape-only 多行）、`---` 分隔线、`[ ] `/`[x] ` 待办、
+   其余为段落。行内语法仅粗体/斜体/行内码/链接四种。
+   XSS 纪律：InlineMd 管线第一步即 View.HtmlEscape（escape-first），
+   后续标记解析只产出受控标签；链接经 SafeUrl 白名单
+   （/、#、http://、https://、mailto:），不在白名单一律降级为纯文本。
+   已知取舍：行内码先于粗斜/链接解析，码内若含星号或方括号等字符
+   可能被二次加标——仅样式噪声，无注入面（内容已转义）。 */
+class Blocks {
+    /* 归一换行（\r\n、\r → \n）。Save 侧存储前调用。 */
+    static string Normalize(string s) {
+        return s.Replace("\r\n", "\n").Replace("\r", "\n");
+    }
+
+    /* 保存前校验：空内容或超 30000 字符返回违规文案，"" 表示通过。 */
+    static string Validate(string s) {
+        if (s == null) { return "内容不能为空"; }
+        string flat = s.Replace("\r", "").Replace("\n", "").Trim();
+        if (flat.Length == 0) { return "内容不能为空"; }
+        if (s.Length > 30000) { return "内容过长（上限 30000 字符）"; }
+        return "";
+    }
+
+    /* 渲染为 HTML（信任输入已过 Validate；本方法自身再做 escape-first 兜底）。 */
+    static string Render(string src) {
+        string norm = Normalize(src == null ? "" : src);
+        List<string> lines = norm.Split("\n");
+        string html = "";
+        string listMode = "";
+        int i = 0;
+        while (i < lines.Count) {
+            string line = lines[i];
+            if (line.Trim().StartsWith("```")) {
+                html = Blocks.CloseList(html, listMode);
+                listMode = "";
+                string body = "";
+                int j = i + 1;
+                while (j < lines.Count && !lines[j].Trim().StartsWith("```")) {
+                    if (body.Length > 0) { body = body + "\n"; }
+                    body = body + lines[j];
+                    j = j + 1;
+                }
+                html = html + "<pre><code>" + View.HtmlEscape(body) + "</code></pre>";
+                i = j + 1;
+                continue;
+            }
+            string t = line.Trim();
+            if (t == "---") {
+                html = Blocks.CloseList(html, listMode);
+                listMode = "";
+                html = html + "<hr>";
+                i = i + 1;
+                continue;
+            }
+            if (t.Length == 0) {
+                html = Blocks.CloseList(html, listMode);
+                listMode = "";
+                i = i + 1;
+                continue;
+            }
+            if (line.StartsWith("### ")) {
+                html = Blocks.CloseList(html, listMode);
+                listMode = "";
+                html = html + "<h3>" + Blocks.InlineMd(line.Substring(4)) + "</h3>";
+                i = i + 1;
+                continue;
+            }
+            if (line.StartsWith("## ")) {
+                html = Blocks.CloseList(html, listMode);
+                listMode = "";
+                html = html + "<h2>" + Blocks.InlineMd(line.Substring(3)) + "</h2>";
+                i = i + 1;
+                continue;
+            }
+            if (line.StartsWith("# ")) {
+                html = Blocks.CloseList(html, listMode);
+                listMode = "";
+                html = html + "<h1>" + Blocks.InlineMd(line.Substring(2)) + "</h1>";
+                i = i + 1;
+                continue;
+            }
+            if (line.StartsWith("- ")) {
+                if (listMode != "ul") {
+                    html = Blocks.CloseList(html, listMode);
+                    html = html + "<ul>";
+                    listMode = "ul";
+                }
+                html = html + "<li>" + Blocks.InlineMd(line.Substring(2)) + "</li>";
+                i = i + 1;
+                continue;
+            }
+            if (line.StartsWith("[x] ") || line.StartsWith("[ ] ")) {
+                if (listMode != "todo") {
+                    html = Blocks.CloseList(html, listMode);
+                    html = html + "<ul class=\"doc-todo\">";
+                    listMode = "todo";
+                }
+                if (line.Substring(1, 1) == "x") {
+                    html = html + "<li class=\"doc-done\">" + Blocks.InlineMd(line.Substring(4)) + "</li>";
+                } else {
+                    html = html + "<li>" + Blocks.InlineMd(line.Substring(4)) + "</li>";
+                }
+                i = i + 1;
+                continue;
+            }
+            int d = 0;
+            while (d < line.Length && Blocks.DigitChar(line[d])) { d = d + 1; }
+            if (d > 0 && d + 1 < line.Length && line[d] == '.' && line[d + 1] == ' ') {
+                if (listMode != "ol") {
+                    html = Blocks.CloseList(html, listMode);
+                    html = html + "<ol>";
+                    listMode = "ol";
+                }
+                html = html + "<li>" + Blocks.InlineMd(line.Substring(d + 2)) + "</li>";
+                i = i + 1;
+                continue;
+            }
+            if (line.StartsWith("> ")) {
+                if (listMode != "quote") {
+                    html = Blocks.CloseList(html, listMode);
+                    html = html + "<blockquote>";
+                    listMode = "quote";
+                }
+                html = html + "<p>" + Blocks.InlineMd(line.Substring(2)) + "</p>";
+                i = i + 1;
+                continue;
+            }
+            html = Blocks.CloseList(html, listMode);
+            listMode = "";
+            html = html + "<p>" + Blocks.InlineMd(line) + "</p>";
+            i = i + 1;
+        }
+        html = Blocks.CloseList(html, listMode);
+        return html;
+    }
+
+    /* 行内语法渲染：escape → 行内码 → 粗体 → 斜体 → 链接。 */
+    static string InlineMd(string s) {
+        string r = View.HtmlEscape(s);
+        r = Blocks.Codes(r);
+        r = Blocks.Marks(r, "**", "strong");
+        r = Blocks.Marks(r, "*", "em");
+        r = Blocks.Links(r);
+        return r;
+    }
+
+    /* 纯文本摘要（contentText）：剥块前缀/围栏/分隔线与行内标记，链接留文字。 */
+    static string TextOf(string src) {
+        string norm = Normalize(src == null ? "" : src);
+        List<string> lines = norm.Split("\n");
+        string r = "";
+        bool inCode = false;
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string line = lines[i];
+            if (line.Trim().StartsWith("```")) {
+                inCode = !inCode;
+                continue;
+            }
+            if (inCode) { r = Blocks.AppendText(r, line); continue; }
+            string t = line.Trim();
+            if (t == "---") { continue; }
+            if (t.Length == 0) { continue; }
+            if (line.StartsWith("# ") || line.StartsWith("## ") || line.StartsWith("### ")) {
+                r = Blocks.AppendText(r, Blocks.StripMarks(line.Substring(line.IndexOf(" ") + 1)));
+                continue;
+            }
+            if (line.StartsWith("[x] ") || line.StartsWith("[ ] ")) {
+                r = Blocks.AppendText(r, Blocks.StripMarks(line.Substring(4)));
+                continue;
+            }
+            if (line.StartsWith("- ") || line.StartsWith("> ")) {
+                r = Blocks.AppendText(r, Blocks.StripMarks(line.Substring(2)));
+                continue;
+            }
+            int d = 0;
+            while (d < line.Length && Blocks.DigitChar(line[d])) { d = d + 1; }
+            if (d > 0 && d + 1 < line.Length && line[d] == '.' && line[d + 1] == ' ') {
+                r = Blocks.AppendText(r, Blocks.StripMarks(line.Substring(d + 2)));
+                continue;
+            }
+            r = Blocks.AppendText(r, Blocks.StripMarks(line));
+        }
+        return r;
+    }
+
+    /* ===== 私有 helpers ===== */
+
+    /* 收束未闭合的列表/引用块。 */
+    static string CloseList(string html, string mode) {
+        if (mode == "ul" || mode == "todo") { return html + "</ul>"; }
+        if (mode == "ol") { return html + "</ol>"; }
+        if (mode == "quote") { return html + "</blockquote>"; }
+        return html;
+    }
+
+    /* 行内码：`code` → <code>code</code>（管线入口已转义，码内容安全）。 */
+    static string Codes(string s) {
+        string r = "";
+        int i = 0;
+        while (i < s.Length) {
+            int j = s.IndexOf("`", i);
+            if (j < 0) { r = r + s.Substring(i); break; }
+            int k = s.IndexOf("`", j + 1);
+            if (k < 0) { r = r + s.Substring(i); break; }
+            if (k == j + 1) {
+                r = r + s.Substring(i, j + 1 - i);
+                i = j + 1;
+                continue;
+            }
+            r = r + s.Substring(i, j - i) + "<code>" + s.Substring(j + 1, k - j - 1) + "</code>";
+            i = k + 1;
+        }
+        return r;
+    }
+
+    /* 粗体/斜体：mark 成对出现时包裹 tag，未闭合保持原样。 */
+    static string Marks(string s, string mark, string tag) {
+        string r = "";
+        int i = 0;
+        while (i < s.Length) {
+            int j = s.IndexOf(mark, i);
+            if (j < 0) { r = r + s.Substring(i); break; }
+            int k = s.IndexOf(mark, j + mark.Length);
+            if (k < 0) { r = r + s.Substring(i); break; }
+            if (k == j + mark.Length) {
+                r = r + s.Substring(i, j + mark.Length - i);
+                i = j + mark.Length;
+                continue;
+            }
+            r = r + s.Substring(i, j - i) + "<" + tag + ">"
+                + s.Substring(j + mark.Length, k - j - mark.Length) + "</" + tag + ">";
+            i = k + mark.Length;
+        }
+        return r;
+    }
+
+    /* 链接：[text](url)，url 过 SafeUrl 白名单；text 为空或 url 不合规降级纯文本。 */
+    static string Links(string s) {
+        string r = "";
+        int i = 0;
+        while (i < s.Length) {
+            int j = s.IndexOf("[", i);
+            if (j < 0) { r = r + s.Substring(i); break; }
+            int m = s.IndexOf("](", j + 1);
+            if (m < 0) { r = r + s.Substring(i); break; }
+            int e = s.IndexOf(")", m + 2);
+            if (e < 0) { r = r + s.Substring(i); break; }
+            string text = s.Substring(j + 1, m - j - 1);
+            string url = s.Substring(m + 2, e - m - 2);
+            string safe = Blocks.SafeUrl(url);
+            if (safe == null || text.Length == 0) {
+                r = r + s.Substring(i, j + 1 - i);
+                i = j + 1;
+                continue;
+            }
+            r = r + s.Substring(i, j - i) + "<a href=\"" + safe
+                + "\" target=\"_blank\" rel=\"noopener\">" + text + "</a>";
+            i = e + 1;
+        }
+        return r;
+    }
+
+    /* scheme 白名单：/ 相对路径（// 协议相对除外）、# 锚点、
+       http://、https://、mailto:。合规返回原 url，否则 null。 */
+    static string SafeUrl(string url) {
+        if (url == null || url.Length == 0) { return null; }
+        string low = url.ToLower();
+        if (low.StartsWith("//")) { return null; }
+        if (url.StartsWith("/") || url.StartsWith("#")) { return url; }
+        if (low.StartsWith("http://") || low.StartsWith("https://") || low.StartsWith("mailto:")) {
+            return url;
+        }
+        return null;
+    }
+
+    /* StripLinks 的文字化 + 剥粗/斜/行内码标记。 */
+    static string StripMarks(string s) {
+        string r = Blocks.StripLinks(s);
+        r = r.Replace("**", "").Replace("*", "").Replace("`", "");
+        return r.Trim();
+    }
+
+    /* [text](url) → text（不校验白名单，只做文字化）。 */
+    static string StripLinks(string s) {
+        string r = "";
+        int i = 0;
+        while (i < s.Length) {
+            int j = s.IndexOf("[", i);
+            if (j < 0) { r = r + s.Substring(i); break; }
+            int m = s.IndexOf("](", j + 1);
+            if (m < 0) { r = r + s.Substring(i); break; }
+            int e = s.IndexOf(")", m + 2);
+            if (e < 0) { r = r + s.Substring(i); break; }
+            string text = s.Substring(j + 1, m - j - 1);
+            r = r + s.Substring(i, j - i) + text;
+            i = e + 1;
+        }
+        return r;
+    }
+
+    /* ASCII 数字判定。 */
+    static bool DigitChar(char c) {
+        return c >= '0' && c <= '9';
+    }
+
+    /* TextOf 拼行。 */
+    static string AppendText(string r, string line) {
+        if (r.Length == 0) { return line; }
+        return r + "\n" + line;
+    }
+}
