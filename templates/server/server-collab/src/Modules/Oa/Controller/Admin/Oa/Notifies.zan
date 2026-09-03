@@ -30,12 +30,14 @@ class Notifies : AdminController {
         ViewData d = await this.Layout("通知中心");
         if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
         ListQuery q = this.Paged("id", 20);
+        /* Bug#6（本体 B）：sys_notify 历史脏数据（跨租户提及等）按 userId
+           可见即死信泄漏——读面统一补 tenantId 双闸。 */
         List<SysNotify> rows = await this.SysNotify
-            .Where(a => a.userId == me.id)
+            .Where(a => a.tenantId == this.TenantId() && a.userId == me.id)
             .OrderByDescending(a => a.id)
             .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
         int total = await this.SysNotify
-            .Where(a => a.userId == me.id).CountAsync();
+            .Where(a => a.tenantId == this.TenantId() && a.userId == me.id).CountAsync();
         /* 免打扰现状（flow 域开关即页面上的示范位；其余模块开关随迁移渐次加入）。 */
         SysNotifyPref pref = await this.SysNotifyPref
             .Where(a => a.tenantId == this.TenantId() && a.userId == me.id
@@ -69,11 +71,14 @@ class Notifies : AdminController {
     [Description("未读通知")]
     async void Unread() {
         User me = await this.Admin();
+        /* Bug#6（本体 B）：未读数与未读列表同补租户闸（铃铛数据源）。 */
         List<SysNotify> rows = await this.SysNotify
-            .Where(a => a.userId == me.id && a.isRead == 0)
+            .Where(a => a.tenantId == this.TenantId() && a.userId == me.id
+                && a.isRead == 0)
             .OrderByDescending(a => a.id).Take(8).ToListAsync();
         int total = await this.SysNotify
-            .Where(a => a.userId == me.id && a.isRead == 0).CountAsync();
+            .Where(a => a.tenantId == this.TenantId() && a.userId == me.id
+                && a.isRead == 0).CountAsync();
         JsonValue items = JsonValue.NewArray();
         for (int i = 0; i < rows.Count; i = i + 1) {
             JsonValue o = JsonValue.NewObject();
@@ -100,9 +105,11 @@ class Notifies : AdminController {
         HttpContext ctx = this.Ctx();
         WsSession ws = await ctx.WsUpgrade();
         if (ws != null) {
-            /* 首帧同步未读数——此刻尚未登记进 NotifyHub，无并发写方，安全。 */
+            /* 首帧同步未读数——此刻尚未登记进 NotifyHub，无并发写方，安全。
+               Bug#6（本体 B）：WS 订阅首帧未读数补租户闸。 */
             int unread = await this.SysNotify
-                .Where(a => a.userId == me.id && a.isRead == 0).CountAsync();
+                .Where(a => a.tenantId == this.TenantId() && a.userId == me.id
+                    && a.isRead == 0).CountAsync();
             if (!await ws.SendText("{\"type\":\"unread\",\"count\":"
                     + Convert.ToString(unread) + "}")) { return; }
             ZanWeb.NotifyHub.JoinWs(me.id, ws);
@@ -122,9 +129,10 @@ class Notifies : AdminController {
         /* SSE 回退通道：与 WS 同一端点，老代理/老客户端走原路。 */
         if (!await ctx.SseOpen()) { return; }
         ZanWeb.NotifyHub.JoinSse(me.id, ctx);
-        /* 首帧同步一次未读数，页面打开即为最新。 */
+        /* 首帧同步一次未读数，页面打开即为最新。Bug#6（本体 B）：SSE 同补。 */
         int unread2 = await this.SysNotify
-            .Where(a => a.userId == me.id && a.isRead == 0).CountAsync();
+            .Where(a => a.tenantId == this.TenantId() && a.userId == me.id
+                && a.isRead == 0).CountAsync();
         if (!await ctx.SseSend("unread", "{\"count\":"
                 + Convert.ToString(unread2) + "}")) {
             ZanWeb.NotifyHub.LeaveSse(ctx);
@@ -150,14 +158,18 @@ class Notifies : AdminController {
         int id = this.InInt("id", 0);
         long now = WebApp.NowSeconds();
         if (id > 0) {
+            /* Bug#6（本体 B）：标记已读与读面同数据面，随读面补租户闸——
+               脏死信已被读面隐藏，写面保持一致防复活路径。 */
             int _n = await this.SysNotify.Update()
                 .Set(a => a.isRead, 1)
-                .Where(a => a.id == id && a.userId == me.id)
+                .Where(a => a.id == id && a.tenantId == this.TenantId()
+                    && a.userId == me.id)
                 .ExecuteAffrowsAsync();
         } else {
             int _n = await this.SysNotify.Update()
                 .Set(a => a.isRead, 1)
-                .Where(a => a.userId == me.id).ExecuteAffrowsAsync();
+                .Where(a => a.tenantId == this.TenantId() && a.userId == me.id)
+                .ExecuteAffrowsAsync();
         }
         this.Saved("已标记");
     }
