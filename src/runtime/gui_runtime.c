@@ -51,9 +51,11 @@
 #include <fcntl.h>
 #include <errno.h>
 #ifdef ZAN_GUI_FREETYPE
-#include <fontconfig/fontconfig.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
+#if !defined(__ANDROID__)
+#include <fontconfig/fontconfig.h>
+#endif
 #endif
 #define EXPORT __attribute__((visibility("default")))
 #else

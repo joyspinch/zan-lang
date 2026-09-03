@@ -192,10 +192,193 @@ static FT_Library g_ft_library;
 static FT_Face g_ft_face;
 static int g_ft_state;
 
+#if defined(__ANDROID__)
+/* The device's default and CJK faces as configured by the ROM. Vendors
+ * (MIUI, HarmonyOS, ...) ship their own default font and keep
+ * /system/etc/fonts.xml pointing at it, so a fixed "Roboto" path renders
+ * every ROM in Noto instead of the font the user actually sees elsewhere.
+ * AOSP marks the file deprecated in favour of AFontMatcher (API 29+), but
+ * still requires vendors to maintain it; when it disappears or stops
+ * parsing, the hardcoded chain in ft_prepare is the fallback. */
+static char g_android_def_path[256];
+static int g_android_def_idx;
+static char g_android_cjk_path[256];
+static int g_android_cjk_idx;
+static int g_android_cjk_ok;
+
+/* Pull one attribute value ("index", "weight", "lang") out of a tag body
+ * [attrs, attrs+attrlen). Returns 0 when absent. */
+static int ft_xml_attr(const char *attrs, int attrlen, const char *name,
+                       char *out, int outsz) {
+    char pat[64];
+    int n = snprintf(pat, sizeof(pat), "%s=\"", name);
+    const char *p = attrs;
+    const char *end = attrs + attrlen;
+    while (p + n < end) {
+        const char *hit = memchr(p, name[0], (size_t)(end - p));
+        if (!hit || hit + n >= end) return 0;
+        if (strncmp(hit, pat, (size_t)n) == 0) {
+            const char *v = hit + n;
+            const char *close = memchr(v, '"', (size_t)(end - v));
+            if (!close) return 0;
+            int len = (int)(close - v);
+            if (len >= outsz) len = outsz - 1;
+            memcpy(out, v, (size_t)len);
+            out[len] = 0;
+            return 1;
+        }
+        p = hit + 1;
+    }
+    return 0;
+}
+
+static int ft_fonts_xml_scan(void) {
+    FILE *f = fopen("/system/etc/fonts.xml", "rb");
+    if (!f) return 0;
+    static char buf[1 << 21]; /* 2 MiB: the file is ~80 KB today */
+    size_t len = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[len] = 0;
+
+    const char *p = buf;
+    while ((p = strstr(p, "<family")) != NULL) {
+        p += 7;
+        /* <familyset and friends are not family blocks */
+        if (*p != ' ' && *p != '>') continue;
+        const char *gt = strchr(p, '>');
+        if (!gt) break;
+        int attrlen = (int)(gt - p);
+        const char *body = gt + 1;
+        const char *fend = strstr(body, "</family>");
+        if (!fend) break;
+
+        char attrs[512];
+        if (attrlen >= (int)sizeof(attrs)) attrlen = (int)sizeof(attrs) - 1;
+        memcpy(attrs, p, (size_t)attrlen);
+        attrs[attrlen] = 0;
+
+        char lang[32] = "";
+        ft_xml_attr(attrs, attrlen, "lang", lang, sizeof(lang));
+
+        /* Within the family pick the regular upright face: weights are
+         * separate entries and often separate *files* (MiSans-Light vs
+         * MiSans-Regular), so "first" would grab whatever weight the
+         * ROM listed first. */
+        char best[256] = "";
+        int best_idx = 0, best_score = 1 << 30;
+        const char *q = body;
+        while (q < fend && (q = strstr(q, "<font")) != NULL && q < fend) {
+            q += 5;
+            if (*q != ' ' && *q != '>') continue;
+            const char *fgt = strchr(q, '>');
+            if (!fgt || fgt > fend) break;
+            int fattrlen = (int)(fgt - q);
+            char fattrs[512];
+            if (fattrlen >= (int)sizeof(fattrs)) fattrlen = (int)sizeof(fattrs) - 1;
+            memcpy(fattrs, q, (size_t)fattrlen);
+            fattrs[fattrlen] = 0;
+
+            const char *txt = fgt + 1;
+            const char *ftxt_end = strstr(txt, "</font>");
+            if (!ftxt_end || ftxt_end > fend) break;
+            /* the text run may contain nested <axis .../> elements: the
+             * file name is the leading trimmed text before '<' */
+            const char *lt = memchr(txt, '<', (size_t)(ftxt_end - txt));
+            if (!lt || lt > ftxt_end) lt = ftxt_end;
+            char path[256];
+            int ti = 0;
+            const char *s = txt;
+            while (s < lt && (*s == ' ' || *s == '\n' || *s == '\r' ||
+                              *s == '\t')) s++;
+            const char *e = lt;
+            while (e > s && (e[-1] == ' ' || e[-1] == '\n' || e[-1] == '\r' ||
+                             e[-1] == '\t')) e--;
+            while (s < e && ti < (int)sizeof(path) - 1) path[ti++] = *s++;
+            path[ti] = 0;
+
+            if (ti > 0) {
+                char w[16] = "", st[16] = "", ix[16] = "";
+                int score = 0;
+                if (ft_xml_attr(fattrs, fattrlen, "weight", w, sizeof(w)))
+                    score += abs(atoi(w) - 400);
+                if (ft_xml_attr(fattrs, fattrlen, "style", st, sizeof(st)) &&
+                    strcmp(st, "italic") == 0)
+                    score += 10000;
+                int idx = 0;
+                if (ft_xml_attr(fattrs, fattrlen, "index", ix, sizeof(ix)))
+                    idx = atoi(ix);
+                if (score < best_score) {
+                    best_score = score;
+                    snprintf(best, sizeof(best), "/system/fonts/%s", path);
+                    best_idx = idx;
+                }
+            }
+            q = ftxt_end + 7;
+        }
+
+        if (best[0]) {
+            if (!g_android_def_path[0] && !lang[0]) {
+                snprintf(g_android_def_path, sizeof(g_android_def_path),
+                         "%s", best);
+                g_android_def_idx = best_idx;
+            }
+            if (!g_android_cjk_path[0] && lang[0] == 'z' && lang[1] == 'h') {
+                snprintf(g_android_cjk_path, sizeof(g_android_cjk_path),
+                         "%s", best);
+                g_android_cjk_idx = best_idx;
+                g_android_cjk_ok = 1;
+            }
+        }
+        p = (const char *)fend;
+    }
+    return g_android_def_path[0] && g_android_cjk_ok;
+}
+
+static void ft_android_pick_fonts(void) {
+    if (ft_fonts_xml_scan()) return;
+    /* No fonts.xml (or nothing usable in it): AOSP stock layout. */
+    snprintf(g_android_def_path, sizeof(g_android_def_path),
+             "/system/fonts/Roboto-Regular.ttf");
+    g_android_def_idx = 0;
+    snprintf(g_android_cjk_path, sizeof(g_android_cjk_path),
+             "/system/fonts/NotoSansCJK-Regular.ttc");
+    g_android_cjk_idx = 2;
+    g_android_cjk_ok = access(g_android_cjk_path, R_OK) == 0;
+}
+#endif
+
 static int ft_prepare(int font_size) {
     if (g_ft_state == 0) {
         g_ft_state = -1;
-        if (!FcInit() || FT_Init_FreeType(&g_ft_library) != 0) return 0;
+        if (FT_Init_FreeType(&g_ft_library) != 0) return 0;
+#if defined(__ANDROID__)
+        /* Android ships no fontconfig; the system faces live in
+         * /system/fonts. Primary face follows the ROM's own default
+         * (fonts.xml first nameless family -- MiSans on MIUI, ...),
+         * falling back to AOSP's Roboto; CJK glyphs resolve through
+         * ft_face_for_cp's zh family below. */
+        ft_android_pick_fonts();
+        if (access(g_android_def_path, R_OK) == 0 &&
+            FT_New_Face(g_ft_library, g_android_def_path,
+                        (FT_Long)g_android_def_idx, &g_ft_face) == 0) {
+            g_ft_state = 1;
+        } else {
+            static const char *const prim_paths[] = {
+                "/system/fonts/DroidSans.ttf",
+                "/system/fonts/NotoSansCJK-Regular.ttc",
+            };
+            static const int prim_idx[] = { 0, 2 };
+            for (int i = 0; i < 2; i++) {
+                if (access(prim_paths[i], R_OK) != 0) continue;
+                if (FT_New_Face(g_ft_library, prim_paths[i], prim_idx[i],
+                                &g_ft_face) == 0) {
+                    g_ft_state = 1;
+                    break;
+                }
+            }
+        }
+#else
+        if (!FcInit()) return 0;
         FcPattern *pattern = FcNameParse((const FcChar8 *)"sans");
         if (!pattern) return 0;
         FcConfigSubstitute(NULL, pattern, FcMatchPattern);
@@ -213,6 +396,7 @@ static int ft_prepare(int font_size) {
         }
         FcPatternDestroy(match);
         g_ft_state = 1;
+#endif
     }
     if (g_ft_state != 1) return 0;
     if (font_size < 8) font_size = 8;
@@ -224,7 +408,7 @@ static FT_Face g_ft_fb[ZAN_FT_FB_MAX];
 static int g_ft_fb_count = 0;
 
 /* Return a face that can render `cp` at `font_size`, discovering a fallback
- * font via fontconfig when the primary "sans" face lacks the glyph (e.g. CJK).
+ * font when the primary face lacks the glyph (e.g. CJK on a Latin face).
  * Discovered faces are cached; falls back to the primary face when no better
  * match exists. */
 static FT_Face ft_face_for_cp(u32 cp, int font_size) {
@@ -236,6 +420,38 @@ static FT_Face ft_face_for_cp(u32 cp, int font_size) {
         }
     }
     if (g_ft_fb_count < ZAN_FT_FB_MAX) {
+#if defined(__ANDROID__)
+        /* The fallback chain mirrors fonts.xml: the zh family found at
+         * init (Noto CJK ttc face 2 on AOSP, the ROM's CJK face on
+         * vendor builds), then the serif ttc and DroidSansFallback for
+         * anything left. */
+        const char *fb_paths[3];
+        int fb_idx[3];
+        int nfb = 0;
+        if (g_android_cjk_ok) {
+            fb_paths[nfb] = g_android_cjk_path;
+            fb_idx[nfb] = g_android_cjk_idx;
+            nfb++;
+        }
+        fb_paths[nfb] = "/system/fonts/NotoSerifCJK-Regular.ttc";
+        fb_idx[nfb] = 0;
+        nfb++;
+        fb_paths[nfb] = "/system/fonts/DroidSansFallback.ttf";
+        fb_idx[nfb] = 0;
+        nfb++;
+        for (int i = 0; i < nfb; i++) {
+            FT_Face face = NULL;
+            if (access(fb_paths[i], R_OK) == 0 &&
+                FT_New_Face(g_ft_library, fb_paths[i], fb_idx[i],
+                            &face) == 0 &&
+                FT_Get_Char_Index(face, cp)) {
+                g_ft_fb[g_ft_fb_count++] = face;
+                FT_Set_Pixel_Sizes(face, 0, (FT_UInt)font_size);
+                return face;
+            }
+            if (face) FT_Done_Face(face);
+        }
+#else
         FcCharSet *charset = FcCharSetCreate();
         FcCharSetAddChar(charset, cp);
         FcPattern *pat = FcPatternCreate();
@@ -259,6 +475,7 @@ static FT_Face ft_face_for_cp(u32 cp, int font_size) {
             }
             FcPatternDestroy(match);
         }
+#endif
     }
     return g_ft_face;
 }
