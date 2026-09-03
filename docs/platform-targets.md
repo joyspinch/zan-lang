@@ -183,6 +183,14 @@ Difficulty is for **CLI/compute** first; GUI is a separate, larger effort on eac
   staging. Verified on the emulator: the SDLActivity task dlopens
   `libmain.so`, the window paints (clear + fill-rect surfaces matched by
   pixel-diff on screencaps), and the program exits cleanly.
+- **Text**: the GUI driver statically links FreeType (no new DT_NEEDED) and
+  resolves faces at runtime: `/system/etc/fonts.xml` is parsed for the
+  ROM's default family (MiSans on MIUI, HarmonySans on Huawei — the
+  weight-400 upright entry) and the `zh` fallback family (with its ttc
+  face index), so ROM-level font customization is honored; if the file is
+  missing or unparsable the build falls back to AOSP's fixed chain
+  (Roboto → DroidSans → NotoSansCJK ttc face 2, then NotoSerifCJK /
+  DroidSansFallback for CJK glyphs). Desktop builds keep fontconfig.
 - **One-shot APK**: `zanc --publish --target android-x64 --emit-apk app.apk`
   compiles, links `libmain.so`, packs the SDLActivity shell and signs it in
   one command — no Android SDK needed. Packaging lives in
@@ -193,10 +201,17 @@ Difficulty is for **CLI/compute** first; GUI is a separate, larger effort on eac
   `resources.arsc` uncompressed (Android 11+ requirement), and signing runs
   the bundled `apksigner.jar` through a discovered Java (JAVA_HOME / PATH;
   on Windows a portable JRE is auto-downloaded to `%USERPROFILE%\.zan` on
-  first use) with an auto-generated debug keystore. The IDE's publish
+  first use) with an auto-generated debug keystore. `--apk-package <name>`
+  and `--apk-label <text>` override the identity derived from the input
+  file name (multi-file programs should set them). `[DllImport]` libraries
+  that Android cannot provide (openssl, odbc, libpq — anything with no
+  bundled `android-<arch>` driver .so and no sysroot stub) are stubbed and
+  dropped from the link, same policy as the Linux/macOS cross paths: the
+  build succeeds, calls fail at runtime with a compile-time warning.
+  The IDE's publish
   dialog lists `android-x64`/`android-arm64` and emits the same APKs.
-  arm64 APKs are built and signed identically (device run still pending,
-  matching the macOS policy).
+  arm64 APKs run on device (verified on an x86_64 emulator via lib
+  translation: gallery + form demos render with correct CJK text).
 
 ### HarmonyOS / OHOS — medium
 - OHOS native uses a musl-based NDK; for CLI/services this is close to Android.
