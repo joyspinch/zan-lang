@@ -20,6 +20,12 @@
  * Chromium itself is automated with.
  */
 
+/* dladdr/Dl_info (the helper-driver lookup below) are glibc extensions guarded
+ * behind _GNU_SOURCE, which must be defined before the first system include. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
