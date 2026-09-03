@@ -1,0 +1,167 @@
+using System;
+using System.Collections;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb.Model.Oa;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.Admin.Oa;
+
+/* 站内私信（T12）：会话列表 + 双向聊天流 + 发送。会话列表内存按对端
+   分组（内部规模依据同 TodoCenter，避开 DISTINCT SQL 谓词缺口）；
+   打开会话即批量已读（收件人维度 UPDATE，勿碰 from 侧——Bug#7 同类
+   谨记：isRead 只属 to）。新私信经 Notify.Send(module="oa", kind=
+   "message") 走铃铛（在线即推、离线未读数），私信历史不进通知中心。
+   一期不做 SearchProvider：私信仅会话双方可见，Provider 权限语义不足。 */
+[Route("admin/oa/messages/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("站内私信")]
+class Messages : AdminController {
+    [HttpGet]
+    [Route("/admin/oa/messages")]
+    [Custom(IsMenu = true, Icon = "mdi:email", Perm = PermBit.View)]
+    [Description("站内私信")]
+    async void Index() {
+        User me = await this.Admin();
+        ViewData d = await this.Layout("站内私信");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+        /* 全量拉取（id DESC=最新在前），内存按对端分组取最新+未读数。 */
+        List<OaMessage> rows = await this.OaMessage
+            .Where(a => a.tenantId == this.TenantId()
+                && (a.fromId == me.id || a.toId == me.id))
+            .OrderByDescending(a => a.id).ToListAsync();
+        List<User> users = await this.User
+            .Where(a => a.tenantId == this.TenantId() && a.status == 1)
+            .ToListAsync();
+        List<int> peers = new List<int>();
+        List<int> unread = new List<int>();
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            OaMessage r = rows[i];
+            int peer = r.fromId == me.id ? r.toId : r.fromId;
+            int at = Messages.IndexOf(peers, peer);
+            if (at < 0) {
+                /* 首见即该会话最新一条（id DESC）。 */
+                peers.Add(peer);
+                unread.Add(0);
+                StrMap m = new StrMap();
+                m.Set("peerId", Convert.ToString(peer));
+                m.Set("peerName", Messages.NameOf(users, peer));
+                m.Set("lastText", Messages.Excerpt(r.content, 60));
+                m.Set("mine", r.fromId == me.id ? "1" : "");
+                m.Set("lastAt", Fmt.Stamp(r.createdAt));
+                m.Set("unread", "0");
+                items.Add(m);
+                at = peers.Count - 1;
+            }
+            if (r.toId == me.id && r.isRead == 0) {
+                unread[at] = unread[at] + 1;
+            }
+        }
+        for (int i = 0; i < items.Count; i = i + 1) {
+            items[i].Set("unread", Convert.ToString(unread[i]));
+        }
+        d.Set("empty", items.Count == 0 ? "1" : "");
+        this.Page(d);
+    }
+
+    /* 与某人的双向流（按时间正序）+ 打开即批量已读（收件人维度）。
+       对端必须本租户启用账号（跨租户/停用/不存在一律 404）。 */
+    [HttpGet]
+    [Custom(IsMenu = false, Perm = PermBit.View)]
+    [Description("私信对话")]
+    async void Chat() {
+        User me = await this.Admin();
+        int peerId = this.InInt("peer", 0);
+        User peer = await this.User
+            .Where(a => a.id == peerId && a.tenantId == this.TenantId()
+                && a.status == 1).FirstAsync();
+        if (peer == null) { this.Fail(404, "0404", "对方不存在或已停用"); return; }
+        List<User> peerList = new List<User>();
+        peerList.Add(peer);
+        string peerName = Messages.NameOf(peerList, peer.id);
+        ViewData d = await this.Layout("与 " + peerName);
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+        List<OaMessage> rows = await this.OaMessage
+            .Where(a => a.tenantId == this.TenantId()
+                && ((a.fromId == me.id && a.toId == peer.id)
+                    || (a.fromId == peer.id && a.toId == me.id)))
+            .OrderBy(a => a.id).ToListAsync();
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            OaMessage r = rows[i];
+            StrMap m = new StrMap();
+            m.Set("content", r.content);
+            m.Set("mine", r.fromId == me.id ? "1" : "");
+            m.Set("who", r.fromId == me.id ? "我" : peerName);
+            m.Set("at", Fmt.Stamp(r.createdAt));
+            items.Add(m);
+        }
+        d.Set("empty", rows.Count == 0 ? "1" : "");
+        d.Set("peerId", Convert.ToString(peer.id));
+        d.Set("peerName", peerName);
+        /* 打开即批量已读：只清 toId==me 侧，from 侧未读属于对方。 */
+        int _n = await this.OaMessage.Update()
+            .Set(a => a.isRead, 1)
+            .Where(a => a.tenantId == this.TenantId()
+                && a.toId == me.id && a.fromId == peer.id && a.isRead == 0)
+            .ExecuteAffrowsAsync();
+        this.Page(d);
+    }
+
+    /* 发送：正文必填；对端本租户启用账号校验；INSERT isRead=0 +
+       Notify.Send 走铃铛（kind=message，链接回本会话）。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("发送私信")]
+    async void Send() {
+        User me = await this.Admin();
+        int peerId = this.InInt("peer", 0);
+        string content = this.Need("content", "私信内容");
+        if (content.Length == 0) { this.Fail(400, "0004", "请填写私信内容"); return; }
+        if (content.Length > 2048) { content = content.Substring(0, 2048); }
+        if (peerId == me.id) { this.Fail(400, "0004", "不能给自己发私信"); return; }
+        User peer = await this.User
+            .Where(a => a.id == peerId && a.tenantId == this.TenantId()
+                && a.status == 1).FirstAsync();
+        if (peer == null) { this.Fail(404, "0404", "对方不存在或已停用"); return; }
+        OaMessage r = new OaMessage();
+        r.tenantId = this.TenantId();
+        r.fromId = me.id;
+        r.toId = peer.id;
+        r.content = content;
+        r.isRead = 0;
+        r.replyTo = 0;
+        r.createdAt = WebApp.NowSeconds();
+        await this.OaMessage.Insert(r).ExecuteIdentityAsync();
+        await Notify.Send(this.Held(), this.TenantId(), peer.id, "oa", "message",
+            "新私信：" + Fmt.Text(me.nickname, me.username),
+            Messages.Excerpt(content, 50),
+            "/admin/oa/messages/chat?peer=" + Convert.ToString(me.id));
+        this.Saved("已发送");
+    }
+
+    /* ---- helpers ---- */
+
+    static int IndexOf(List<int> ids, int v) {
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            if (ids[i] == v) { return i; }
+        }
+        return -1;
+    }
+
+    /* 昵称空回退用户名；对端行缺席（已删号的历史会话）显示占位。 */
+    static string NameOf(List<User> users, int id) {
+        for (int i = 0; i < users.Count; i = i + 1) {
+            if (users[i].id == id) { return Fmt.Text(users[i].nickname, users[i].username); }
+        }
+        return "用户" + Convert.ToString(id);
+    }
+
+    /* 单行摘要：换行折空格，超长截断。 */
+    static string Excerpt(string s, int max) {
+        string t = s.Replace("\r\n", " ").Replace("\n", " ").Replace("\r", " ");
+        return t.Length > max ? t.Substring(0, max) + "…" : t;
+    }
+}
