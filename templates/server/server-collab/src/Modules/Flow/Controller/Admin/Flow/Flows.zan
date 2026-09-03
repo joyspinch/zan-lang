@@ -23,11 +23,14 @@ class Flows : AdminController {
         if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
         ListQuery q = this.Paged("id", 20);
         string kw = q.Kw();
+        /* 租户硬边（#34）：流程定义/实例列表只出本租户行。 */
         List<FlowDef> rows = await this.FlowDef
+            .Where(a => a.tenantId == this.TenantId())
             .WhereIf(kw.Length > 0, a => a.name.Contains(kw))
             .OrderBy(a => a.id)
             .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
         int total = await this.FlowDef
+            .Where(a => a.tenantId == this.TenantId())
             .WhereIf(kw.Length > 0, a => a.name.Contains(kw)).CountAsync();
         d.Set("empty", total == 0 ? "1" : "");
         d.Set("kw", kw);
@@ -58,7 +61,9 @@ class Flows : AdminController {
         int id = this.InInt("id", 0);
         ViewData d = await this.Layout(id > 0 ? "编辑流程" : "新建流程");
         if (id > 0) {
-            FlowDef r = await this.FlowDef.Where(a => a.id == id).FirstAsync();
+            FlowDef r = await this.FlowDef
+                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .FirstAsync();
             if (r == null) { this.Fail(404, "0404", "流程不存在"); return; }
             d.Set("id", Convert.ToString(id));
             d.Set("name", r.name);
@@ -139,7 +144,8 @@ class Flows : AdminController {
             dopts.Add(m);
         }
         List<User> users = await this.User
-            .Where(a => a.status == 1).ToListAsync();
+            .Where(a => a.tenantId == this.TenantId() && a.status == 1)
+            .ToListAsync();
         List<StrMap> uopts = d.AddList("users");
         for (int i = 0; i < users.Count; i = i + 1) {
             StrMap m = new StrMap();
@@ -161,16 +167,20 @@ class Flows : AdminController {
         long now = WebApp.NowSeconds();
         FlowDef def;
         if (id > 0) {
-            def = await this.FlowDef.Where(a => a.id == id).FirstAsync();
+            def = await this.FlowDef
+                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .FirstAsync();
             if (def == null) { this.Fail(404, "0404", "流程不存在"); return; }
             int _u = await this.FlowDef.Update()
                 .Set(a => a.name, name)
                 .Set(a => a.description, this.In("description"))
                 .Set(a => a.status, this.InInt("status", 0))
                 .Set(a => a.updatedAt, now)
-                .Where(a => a.id == id).ExecuteAffrowsAsync();
+                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .ExecuteAffrowsAsync();
         } else {
             def = new FlowDef();
+            def.tenantId = this.TenantId();
             def.name = name;
             def.description = this.In("description");
             def.status = 1;
@@ -211,7 +221,9 @@ class Flows : AdminController {
     async void Start() {
         int defId = this.InInt("defId", 0);
         string title = this.Need("title", "实例标题");
-        FlowDef def = await this.FlowDef.Where(a => a.id == defId).FirstAsync();
+        FlowDef def = await this.FlowDef
+            .Where(a => a.id == defId && a.tenantId == this.TenantId())
+            .FirstAsync();
         if (def == null) { this.Fail(404, "0404", "流程不存在"); return; }
         if (def.status != 1) { this.Fail(400, "0004", "流程已停用"); return; }
         if (title.Length == 0) { this.Fail(400, "0004", "请填写实例标题"); return; }
@@ -234,7 +246,8 @@ class Flows : AdminController {
         int n = await this.FlowDef.Update()
             .Set(a => a.status, status)
             .Set(a => a.updatedAt, now)
-            .Where(a => a.id == id).ExecuteAffrowsAsync();
+            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .ExecuteAffrowsAsync();
         this.Saved(n > 0 ? (status == 1 ? "已启用" : "已停用") : "流程不存在");
     }
 
@@ -244,12 +257,14 @@ class Flows : AdminController {
     async void Delete() {
         int id = this.InInt("id", 0);
         int used = await this.FlowInst
-            .Where(a => a.defId == id && a.status == 1).CountAsync();
+            .Where(a => a.defId == id && a.status == 1
+                && a.tenantId == this.TenantId()).CountAsync();
         if (used > 0) { this.Fail(400, "0004", "有进行中的实例，先终止再删除"); return; }
         int _n1 = await this.FlowNode.Delete()
             .Where(a => a.defId == id).ExecuteAffrowsAsync();
         int _n2 = await this.FlowDef.Delete()
-            .Where(a => a.id == id).ExecuteAffrowsAsync();
+            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .ExecuteAffrowsAsync();
         await this.Note("删除流程", "defId=" + Convert.ToString(id), true, "");
         this.Saved("已删除");
     }
@@ -264,13 +279,16 @@ class Flows : AdminController {
         ListQuery q = this.Paged("id", 20);
         string kw = q.Kw();
         List<FlowInst> rows = await this.FlowInst
+            .Where(a => a.tenantId == this.TenantId())
             .WhereIf(kw.Length > 0, a => a.title.Contains(kw))
             .OrderByDescending(a => a.id)
             .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
         int total = await this.FlowInst
+            .Where(a => a.tenantId == this.TenantId())
             .WhereIf(kw.Length > 0, a => a.title.Contains(kw)).CountAsync();
 
-        List<FlowDef> defs = await this.FlowDef.ToListAsync();
+        List<FlowDef> defs = await this.FlowDef
+            .Where(a => a.tenantId == this.TenantId()).ToListAsync();
         List<StrMap> defopts = d.AddList("defs");
         for (int i = 0; i < defs.Count; i = i + 1) {
             if (defs[i].status != 1) { continue; }
@@ -312,7 +330,8 @@ class Flows : AdminController {
             .Set(a => a.status, 3)
             .Set(a => a.currentNodeId, 0)
             .Set(a => a.updatedAt, now)
-            .Where(a => a.id == id && a.status == 1).ExecuteAffrowsAsync();
+            .Where(a => a.id == id && a.tenantId == this.TenantId()
+                && a.status == 1).ExecuteAffrowsAsync();
         this.Saved(_n > 0 ? "已终止" : "实例不在进行中");
     }
 }

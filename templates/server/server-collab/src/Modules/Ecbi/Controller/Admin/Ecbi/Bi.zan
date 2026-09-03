@@ -20,7 +20,10 @@ class Bi : AdminController {
         ViewData d = await this.Layout("电商BI");
         if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
 
-        List<OdsOrder> all = await this.OdsOrder.OrderByDescending(a => a.payAt).ToListAsync();
+        /* 租户硬边（#34）：看板只聚合本租户订单。 */
+        List<OdsOrder> all = await this.OdsOrder
+            .Where(a => a.tenantId == this.TenantId())
+            .OrderByDescending(a => a.payAt).ToListAsync();
         int total = all.Count;
         long totalAmount = 0;
         for (int i = 0; i < all.Count; i = i + 1) { totalAmount = totalAmount + all[i].amount; }
@@ -115,11 +118,13 @@ class Bi : AdminController {
         ListQuery q = this.Paged("payAt", 20);
         string kw = q.Kw();
         List<OdsOrder> rows = await this.OdsOrder
+            .Where(a => a.tenantId == this.TenantId())
             .WhereIf(kw.Length > 0, a => a.customerName.Contains(kw)
                 || a.productName.Contains(kw) || a.orderNo.Contains(kw))
             .OrderByDescending(a => a.payAt)
             .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
         int total = await this.OdsOrder
+            .Where(a => a.tenantId == this.TenantId())
             .WhereIf(kw.Length > 0, a => a.customerName.Contains(kw)
                 || a.productName.Contains(kw) || a.orderNo.Contains(kw))
             .CountAsync();
@@ -145,7 +150,8 @@ class Bi : AdminController {
     [Custom(Perm = PermBit.Create)]
     [Description("导入示例订单")]
     async void Sample() {
-        int have = await this.OdsOrder.CountAsync();
+        int have = await this.OdsOrder
+            .Where(a => a.tenantId == this.TenantId()).CountAsync();
         if (have > 0) { this.Saved("已有订单数据，无需重复导入"); return; }
         long now = WebApp.NowSeconds();
         List<string> cats = new List<string>();
@@ -158,6 +164,7 @@ class Bi : AdminController {
             for (int ci = 0; ci < cats.Count; ci = ci + 1) {
                 for (int hi = 0; hi < chs.Count; hi = hi + 1) {
                     OdsOrder o = new OdsOrder();
+                    o.tenantId = this.TenantId();
                     o.orderNo = "D" + Convert.ToString(payAt)
                         + Convert.ToString(ci) + Convert.ToString(hi);
                     o.customerName = "客户" + Convert.ToString((ci * 3 + hi) % 9 + 1);
@@ -232,9 +239,10 @@ class Bi : AdminController {
                           List<string> keys, List<string> vals) {
         string orderNo = ExcelIo.Rec(keys, vals, "订单号");
         int dup = db.Select<OdsOrder>()
-            .Where(a => a.orderNo == orderNo).Count();
+            .Where(a => a.orderNo == orderNo && a.tenantId == tenantId).Count();
         if (dup > 0) { return "订单号=订单已存在：" + orderNo; }
         OdsOrder o = new OdsOrder();
+        o.tenantId = tenantId;
         o.orderNo = orderNo;
         o.customerName = ExcelIo.Rec(keys, vals, "客户");
         o.productName = ExcelIo.Rec(keys, vals, "商品");
@@ -256,6 +264,7 @@ class Bi : AdminController {
     async void Export() {
         bool xlsx = this.InInt("xlsx", 0) == 1;
         List<OdsOrder> rows = await this.OdsOrder
+            .Where(a => a.tenantId == this.TenantId())
             .OrderBy(a => a.id).ToListAsync();
         List<List<string>> data = new List<List<string>>();
         for (int i = 0; i < rows.Count; i = i + 1) {

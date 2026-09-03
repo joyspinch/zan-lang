@@ -20,8 +20,11 @@ class Shops : AdminController {
         ViewData d = await this.Layout("店铺管理");
         if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
 
-        List<OdsShop> rows = await this.OdsShop.OrderBy(a => a.id).ToListAsync();
-        List<OdsPlatform> plats = await this.OdsPlatform.OrderBy(a => a.id).ToListAsync();
+        /* 租户硬边（#34）：列表只出本租户店铺，平台下拉同链。 */
+        List<OdsShop> rows = await this.OdsShop
+            .Where(a => a.tenantId == this.TenantId()).OrderBy(a => a.id).ToListAsync();
+        List<OdsPlatform> plats = await this.OdsPlatform
+            .Where(a => a.tenantId == this.TenantId()).OrderBy(a => a.id).ToListAsync();
 
         List<StrMap> items = d.AddList("rows");
         for (int i = 0; i < rows.Count; i = i + 1) {
@@ -47,7 +50,9 @@ class Shops : AdminController {
         int id = this.InInt("id", 0);
         OdsShop s = null;
         if (id > 0) {
-            s = await this.OdsShop.Where(a => a.id == id).FirstAsync();
+            /* 租户硬边（#34）：跨租户店铺按不存在处理。 */
+            s = await this.OdsShop
+                .Where(a => a.id == id && a.tenantId == this.TenantId()).FirstAsync();
             if (s == null) { this.Fail(404, "0404", "店铺不存在"); }
         }
         ViewData d = new ViewData();
@@ -56,7 +61,8 @@ class Shops : AdminController {
         if (id <= 0) { d.Set("new", "1"); }
 
         List<OdsPlatform> plats = await this.OdsPlatform
-            .Where(a => a.status == 1).OrderBy(a => a.id).ToListAsync();
+            .Where(a => a.status == 1 && a.tenantId == this.TenantId())
+            .OrderBy(a => a.id).ToListAsync();
         List<StrMap> popts = d.AddList("platforms");
         for (int i = 0; i < plats.Count; i = i + 1) {
             StrMap opt = new StrMap();
@@ -83,11 +89,13 @@ class Shops : AdminController {
         if (platformId <= 0) { this.Fail(400, "0004", "请选择所属平台"); }
 
         if (id > 0) {
+            /* 租户硬边（#34）：跨租户店铺更新落空即 404。 */
             int n = await this.OdsShop.Update()
                 .Set(a => a.name, name)
                 .Set(a => a.platformId, platformId)
-                .Where(a => a.id == id)
+                .Where(a => a.id == id && a.tenantId == this.TenantId())
                 .ExecuteAffrowsAsync();
+            if (n <= 0) { this.Fail(404, "0404", "店铺不存在"); }
             await this.Note("编辑店铺", "#" + Convert.ToString(id) + " " + name, n > 0, "");
             this.Saved("店铺已保存");
             return;
@@ -96,6 +104,7 @@ class Shops : AdminController {
         s.name = name;
         s.platformId = platformId;
         s.status = 1;
+        s.tenantId = this.TenantId();
         s.createdAt = WebApp.NowSeconds();
         int newId = await this.OdsShop.Insert(s).ExecuteIdentityAsync();
         await this.Note("新增店铺", "#" + Convert.ToString(newId) + " " + name, newId > 0, "");
@@ -111,8 +120,9 @@ class Shops : AdminController {
         if (status != 1) { status = 0; }
         int n = await this.OdsShop.Update()
             .Set(a => a.status, status)
-            .Where(a => a.id == id)
+            .Where(a => a.id == id && a.tenantId == this.TenantId())
             .ExecuteAffrowsAsync();
+        if (n <= 0) { this.Fail(404, "0404", "店铺不存在"); }
         await this.Note("启用或禁用店铺", "#" + Convert.ToString(id), n > 0,
             status == 1 ? "启用" : "禁用");
         this.Saved(status == 1 ? "店铺已启用" : "店铺已禁用");

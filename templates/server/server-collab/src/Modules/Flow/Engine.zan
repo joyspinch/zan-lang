@@ -10,11 +10,6 @@ namespace ZanWeb.Modules.Flow;
    sys_notify 落库 + NotifyHub.Push 实时推给在线者；旧 flow_notify 停止新写，
    存量行由 Schema.SeedNotify 迁入 sys_notify 后旧表只读保留。 */
 class Engine {
-    /* 流程域通知的租户：发送链路（Advance/Complete）只有 db 与流程行在手，
-       无控制器句柄（静态槽已废，见 Tenant.zan 选型注释）。一期单租户恒为 1
-       （与 sys_user.tenantId 归一同策略，Schema.BackfillTenant 保证），多租户
-       上线时改为随 FlowInst 所属账号行解析 tenantId。 */
-    static int FlowTenant = 1;
     /* 只读展示辅助：定义/节点名查表。 */
     static string DefName(List<FlowDef> defs, int defId) {
         for (int i = 0; i < defs.Count; i = i + 1) {
@@ -125,7 +120,7 @@ class Engine {
                 .Set(a => a.result, summary)
                 .Set(a => a.finishedAt, now)
                 .Where(a => a.id == taskId).ExecuteAffrowsAsync();
-            await Engine.Note(db, inst.startedBy, "done",
+            await Engine.Note(db, inst.tenantId, inst.startedBy, "done",
                 "AI 节点完成", "AI 节点「" + next.name + "」已完成",
                 "/admin/flow/instances");
             inst.currentNodeId = next.id;
@@ -134,7 +129,7 @@ class Engine {
         }
 
         if (assignTo > 0) {
-            await Engine.Note(db, assignTo, "assign",
+            await Engine.Note(db, inst.tenantId, assignTo, "assign",
                 "新任务派发", "新任务：「" + inst.title + "」→ " + next.name,
                 "/admin/flow/tasks");
         }
@@ -146,6 +141,7 @@ class Engine {
                         string bizRef, int byUserId) {
         long now = WebApp.NowSeconds();
         FlowInst inst = new FlowInst();
+        inst.tenantId = def.tenantId;
         inst.defId = def.id;
         inst.title = title;
         inst.bizRef = Fmt.Text(bizRef, "");
@@ -177,7 +173,7 @@ class Engine {
         await db.Insert<FlowLog>(log).ExecuteIdentityAsync();
 
         if (mentions.Length > 0) {
-            await Engine.NoteMentions(db, mentions,
+            await Engine.NoteMentions(db, inst.tenantId, mentions,
                 me.nickname + " 在「" + inst.title + "」中 @了你：" + report,
                 "/admin/flow/tasks");
         }
@@ -195,7 +191,7 @@ class Engine {
                 .Set(a => a.currentNodeId, 0)
                 .Set(a => a.updatedAt, now)
                 .Where(a => a.id == inst.id).ExecuteAffrowsAsync();
-            await Engine.Note(db, inst.startedBy, "done",
+            await Engine.Note(db, inst.tenantId, inst.startedBy, "done",
                 "流程完结", "流程「" + inst.title + "」已全部完成",
                 "/admin/flow/instances");
         }
@@ -203,17 +199,19 @@ class Engine {
     }
 
     /* 单条通知：转调公共层 Notify.Send（module="flow"，落 sys_notify + 推 NotifyHub）。
-       kind 语义不变（assign/mention/done），title 为新增的一句话摘要。 */
-    static async bool Note(IDbConnection db, int userId, string kind,
-                        string title, string content, string link) {
-        await Notify.Send(db, Engine.FlowTenant, userId, "flow", kind,
+       kind 语义不变（assign/mention/done），title 为新增的一句话摘要。
+       tenantId 显式传参（Notify.Send 同款纪律）：发送链路只有 db 与流程行在手，
+       随 inst.tenantId 传递（#34 起实例行带租户基列）。 */
+    static async bool Note(IDbConnection db, int tenantId, int userId,
+                        string kind, string title, string content, string link) {
+        await Notify.Send(db, tenantId, userId, "flow", kind,
             title, content, Fmt.Text(link, "/admin/flow/notifies"));
         return true;
     }
 
     /* @提及：按逗号分隔逐人生成 mention 通知。 */
-    static async void NoteMentions(IDbConnection db, string mentionIds,
-                                string content, string link) {
+    static async void NoteMentions(IDbConnection db, int tenantId,
+                                string mentionIds, string content, string link) {
         int from = 0;
         int i = 0;
         while (i <= mentionIds.Length) {
@@ -222,7 +220,7 @@ class Engine {
                 if (one.Length > 0) {
                     int uid = Filter.ToInt(one, 0);
                     if (uid > 0) {
-                        await Engine.Note(db, uid, "mention", "流程提及",
+                        await Engine.Note(db, tenantId, uid, "mention", "流程提及",
                             content, link);
                     }
                 }

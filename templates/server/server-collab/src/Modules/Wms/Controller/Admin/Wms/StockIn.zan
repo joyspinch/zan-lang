@@ -22,13 +22,20 @@ class StockIn : AdminController {
         if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
 
         ListQuery q = this.Paged("id", 20);
+        /* 租户硬边（#34）：列表只出本租户行，引用解析的仓库/SKU 选项同链。 */
         List<WmsStockIn> rows = await this.WmsStockIn
+            .Where(a => a.tenantId == this.TenantId())
             .OrderByDescending(a => a.id)
             .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
-        int total = await this.WmsStockIn.CountAsync();
+        int total = await this.WmsStockIn
+            .Where(a => a.tenantId == this.TenantId()).CountAsync();
 
-        List<WmsWarehouse> whs = await this.WmsWarehouse.OrderBy(a => a.id).ToListAsync();
-        List<WmsSku> skus = await this.WmsSku.OrderBy(a => a.id).ToListAsync();
+        List<WmsWarehouse> whs = await this.WmsWarehouse
+            .Where(a => a.tenantId == this.TenantId())
+            .OrderBy(a => a.id).ToListAsync();
+        List<WmsSku> skus = await this.WmsSku
+            .Where(a => a.tenantId == this.TenantId())
+            .OrderBy(a => a.id).ToListAsync();
 
         List<StrMap> items = d.AddList("rows");
         for (int i = 0; i < rows.Count; i = i + 1) {
@@ -52,8 +59,11 @@ class StockIn : AdminController {
     async void Create() {
         ViewData d = new ViewData();
         List<WmsWarehouse> whs = await this.WmsWarehouse
-            .Where(a => a.status == 1).OrderBy(a => a.id).ToListAsync();
-        List<WmsSku> skus = await this.WmsSku.OrderBy(a => a.id).ToListAsync();
+            .Where(a => a.tenantId == this.TenantId() && a.status == 1)
+            .OrderBy(a => a.id).ToListAsync();
+        List<WmsSku> skus = await this.WmsSku
+            .Where(a => a.tenantId == this.TenantId())
+            .OrderBy(a => a.id).ToListAsync();
         List<StrMap> wopts = d.AddList("warehouses");
         for (int i = 0; i < whs.Count; i = i + 1) {
             StrMap o = new StrMap();
@@ -84,9 +94,14 @@ class StockIn : AdminController {
         if (skuId <= 0) { this.Fail(400, "0004", "请选择商品"); }
         if (qty <= 0) { this.Fail(400, "0004", "数量必须大于 0"); }
 
-        WmsWarehouse wh = await this.WmsWarehouse.Where(a => a.id == warehouseId).FirstAsync();
+        /* 引用读补租户（#34）：跨租户仓库/SKU 与不存在同错。 */
+        WmsWarehouse wh = await this.WmsWarehouse
+            .Where(a => a.id == warehouseId && a.tenantId == this.TenantId())
+            .FirstAsync();
         if (wh == null || wh.status != 1) { this.Fail(400, "0004", "仓库不可用"); }
-        WmsSku sku = await this.WmsSku.Where(a => a.id == skuId).FirstAsync();
+        WmsSku sku = await this.WmsSku
+            .Where(a => a.id == skuId && a.tenantId == this.TenantId())
+            .FirstAsync();
         if (sku == null) { this.Fail(400, "0004", "商品不存在"); }
 
         User me = await this.Admin();
@@ -94,6 +109,7 @@ class StockIn : AdminController {
 
         string billNo = StockIn.NextBill();
         WmsStockIn flow = new WmsStockIn();
+        flow.tenantId = this.TenantId();
         flow.billNo = billNo;
         flow.warehouseId = warehouseId;
         flow.skuId = skuId;
@@ -104,12 +120,14 @@ class StockIn : AdminController {
         int flowId = await this.WmsStockIn.Insert(flow).ExecuteIdentityAsync();
         if (flowId <= 0) { this.Fail(500, "0500", "流水写入失败"); }
 
-        /* 汇总表只增不减：存在则加，不存在则建。 */
+        /* 汇总表只增不减：存在则加，不存在则建（键含租户，#34）。 */
         WmsInventory inv = await this.WmsInventory
-            .Where(a => a.warehouseId == warehouseId && a.skuId == skuId)
+            .Where(a => a.warehouseId == warehouseId && a.skuId == skuId
+                && a.tenantId == this.TenantId())
             .FirstAsync();
         if (inv == null) {
             WmsInventory ni = new WmsInventory();
+            ni.tenantId = this.TenantId();
             ni.warehouseId = warehouseId;
             ni.skuId = skuId;
             ni.qty = (long)qty;

@@ -22,16 +22,20 @@ class Products : AdminController {
 
         ListQuery q = this.Paged("id", 20);
         string kw = q.Kw();
+        /* 租户硬边（#34）：列表只出本租户行，链接统计同链。 */
         List<OdsProduct> rows = await this.OdsProduct
+            .Where(a => a.tenantId == this.TenantId())
             .WhereIf(kw.Length > 0, a => a.name.Contains(kw) || a.sku.Contains(kw))
             .OrderByDescending(a => a.id)
             .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
         int total = await this.OdsProduct
+            .Where(a => a.tenantId == this.TenantId())
             .WhereIf(kw.Length > 0, a => a.name.Contains(kw) || a.sku.Contains(kw))
             .CountAsync();
 
         /* 每个商品统计已关联的店铺链接数。 */
-        List<OdsShopProduct> links = await this.OdsShopProduct.ToListAsync();
+        List<OdsShopProduct> links = await this.OdsShopProduct
+            .Where(a => a.tenantId == this.TenantId()).ToListAsync();
         List<StrMap> items = d.AddList("rows");
         for (int i = 0; i < rows.Count; i = i + 1) {
             OdsProduct p = rows[i];
@@ -57,7 +61,9 @@ class Products : AdminController {
         d.Set("dialogTitle", "新增商品");
         d.Set("new", "1");
         if (id > 0) {
-            OdsProduct p = await this.OdsProduct.Where(a => a.id == id).FirstAsync();
+            OdsProduct p = await this.OdsProduct
+                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .FirstAsync();
             if (p == null) { this.Fail(404, "0404", "商品不存在"); }
             d.Set("dialogTitle", "编辑商品");
             d.Set("name", p.name);
@@ -79,12 +85,14 @@ class Products : AdminController {
         string category = this.In("category");
 
         if (id > 0) {
+            /* 租户硬边（#34）：跨租户商品更新落空即 404。 */
             int n = await this.OdsProduct.Update()
                 .Set(a => a.name, name)
                 .Set(a => a.sku, sku)
                 .Set(a => a.category, category)
-                .Where(a => a.id == id)
+                .Where(a => a.id == id && a.tenantId == this.TenantId())
                 .ExecuteAffrowsAsync();
+            if (n <= 0) { this.Fail(404, "0404", "商品不存在"); }
             await this.Note("编辑商品", "#" + Convert.ToString(id) + " " + name, n > 0, "");
             this.Saved("商品已保存");
             return;
@@ -94,6 +102,7 @@ class Products : AdminController {
         p.sku = sku;
         p.category = category;
         p.status = 1;
+        p.tenantId = this.TenantId();
         p.createdAt = WebApp.NowSeconds();
         int newId = await this.OdsProduct.Insert(p).ExecuteIdentityAsync();
         await this.Note("新增商品", "#" + Convert.ToString(newId) + " " + name, newId > 0, "");
@@ -105,10 +114,15 @@ class Products : AdminController {
     [Description("删除商品")]
     async void Delete() {
         int id = this.InInt("id", 0);
-        OdsProduct p = await this.OdsProduct.Where(a => a.id == id).FirstAsync();
+        /* 租户硬边（#34）：读行与两段删除均限本租户，链接删除按 (productId, tenantId)。 */
+        OdsProduct p = await this.OdsProduct
+            .Where(a => a.id == id && a.tenantId == this.TenantId()).FirstAsync();
         if (p == null) { this.Fail(404, "0404", "商品不存在"); }
-        int n = await this.OdsProduct.Delete().Where(a => a.id == id).ExecuteAffrowsAsync();
-        int _m = await this.OdsShopProduct.Delete().Where(a => a.productId == id)
+        int n = await this.OdsProduct.Delete()
+            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .ExecuteAffrowsAsync();
+        int _m = await this.OdsShopProduct.Delete()
+            .Where(a => a.productId == id && a.tenantId == this.TenantId())
             .ExecuteAffrowsAsync();
         await this.Note("删除商品", "#" + Convert.ToString(id) + " " + p.name, n > 0, "");
         this.Saved("商品及其平台链接已删除");
@@ -123,15 +137,20 @@ class Products : AdminController {
         ViewData d = await this.Layout("平台链接");
         if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
         int productId = this.InInt("productId", 0);
-        OdsProduct p = await this.OdsProduct.Where(a => a.id == productId).FirstAsync();
+        /* 租户硬边（#34）：宿主商品与链接、店铺、平台下拉全限本租户。 */
+        OdsProduct p = await this.OdsProduct
+            .Where(a => a.id == productId && a.tenantId == this.TenantId()).FirstAsync();
         if (p == null) { this.Fail(404, "0404", "商品不存在"); }
 
         d.Set("productId", Convert.ToString(productId));
         d.Set("productName", p.name);
         List<OdsShopProduct> rows = await this.OdsShopProduct
-            .Where(a => a.productId == productId).OrderBy(a => a.id).ToListAsync();
-        List<OdsShop> shops = await this.OdsShop.OrderBy(a => a.id).ToListAsync();
-        List<OdsPlatform> plats = await this.OdsPlatform.OrderBy(a => a.id).ToListAsync();
+            .Where(a => a.productId == productId && a.tenantId == this.TenantId())
+            .OrderBy(a => a.id).ToListAsync();
+        List<OdsShop> shops = await this.OdsShop
+            .Where(a => a.tenantId == this.TenantId()).OrderBy(a => a.id).ToListAsync();
+        List<OdsPlatform> plats = await this.OdsPlatform
+            .Where(a => a.tenantId == this.TenantId()).OrderBy(a => a.id).ToListAsync();
 
         List<StrMap> items = d.AddList("rows");
         for (int i = 0; i < rows.Count; i = i + 1) {
@@ -155,7 +174,9 @@ class Products : AdminController {
         int productId = this.InInt("productId", 0);
         OdsShopProduct l = null;
         if (id > 0) {
-            l = await this.OdsShopProduct.Where(a => a.id == id).FirstAsync();
+            /* 租户硬边（#34）：跨租户链接按不存在处理。 */
+            l = await this.OdsShopProduct
+                .Where(a => a.id == id && a.tenantId == this.TenantId()).FirstAsync();
             if (l == null) { this.Fail(404, "0404", "链接不存在"); }
             productId = l.productId;
         }
@@ -166,8 +187,10 @@ class Products : AdminController {
         if (id <= 0) { d.Set("new", "1"); }
 
         List<OdsShop> shops = await this.OdsShop
-            .Where(a => a.status == 1).OrderBy(a => a.id).ToListAsync();
-        List<OdsPlatform> plats = await this.OdsPlatform.OrderBy(a => a.id).ToListAsync();
+            .Where(a => a.status == 1 && a.tenantId == this.TenantId())
+            .OrderBy(a => a.id).ToListAsync();
+        List<OdsPlatform> plats = await this.OdsPlatform
+            .Where(a => a.tenantId == this.TenantId()).OrderBy(a => a.id).ToListAsync();
         List<StrMap> sopts = d.AddList("shops");
         for (int i = 0; i < shops.Count; i = i + 1) {
             StrMap opt = new StrMap();
@@ -199,12 +222,14 @@ class Products : AdminController {
         if (id <= 0 && productId <= 0) { this.Fail(400, "0004", "缺少商品"); }
 
         if (id > 0) {
+            /* 租户硬边（#34）：跨租户链接更新落空即 404。 */
             int n = await this.OdsShopProduct.Update()
                 .Set(a => a.shopId, shopId)
                 .Set(a => a.outerCode, outerCode)
                 .Set(a => a.url, url)
-                .Where(a => a.id == id)
+                .Where(a => a.id == id && a.tenantId == this.TenantId())
                 .ExecuteAffrowsAsync();
+            if (n <= 0) { this.Fail(404, "0404", "链接不存在"); }
             await this.Note("编辑平台链接", "#" + Convert.ToString(id), n > 0, "");
             this.Saved("链接已保存");
             return;
@@ -214,6 +239,7 @@ class Products : AdminController {
         l.shopId = shopId;
         l.outerCode = outerCode;
         l.url = url;
+        l.tenantId = this.TenantId();
         l.createdAt = WebApp.NowSeconds();
         int newId = await this.OdsShopProduct.Insert(l).ExecuteIdentityAsync();
         await this.Note("新增平台链接", "#" + Convert.ToString(newId), newId > 0, "");
@@ -225,8 +251,11 @@ class Products : AdminController {
     [Description("删除链接")]
     async void LinkDelete() {
         int id = this.InInt("id", 0);
-        int n = await this.OdsShopProduct.Delete().Where(a => a.id == id)
+        /* 租户硬边（#34）：跨租户链接删除落空即 404。 */
+        int n = await this.OdsShopProduct.Delete()
+            .Where(a => a.id == id && a.tenantId == this.TenantId())
             .ExecuteAffrowsAsync();
+        if (n <= 0) { this.Fail(404, "0404", "链接不存在"); }
         await this.Note("删除平台链接", "#" + Convert.ToString(id), n > 0, "");
         this.Saved("链接已删除");
     }

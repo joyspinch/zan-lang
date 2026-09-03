@@ -23,11 +23,14 @@ class Skus : AdminController {
 
         ListQuery q = this.Paged("id", 20);
         string kw = q.Kw();
+        /* 租户硬边（#34）：列表只出本租户行。 */
         List<WmsSku> rows = await this.WmsSku
+            .Where(a => a.tenantId == this.TenantId())
             .WhereIf(kw.Length > 0, a => a.name.Contains(kw) || a.sku.Contains(kw))
             .OrderByDescending(a => a.id)
             .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
         int total = await this.WmsSku
+            .Where(a => a.tenantId == this.TenantId())
             .WhereIf(kw.Length > 0, a => a.name.Contains(kw) || a.sku.Contains(kw))
             .CountAsync();
 
@@ -56,7 +59,9 @@ class Skus : AdminController {
         d.Set("dialogTitle", "新增商品");
         d.Set("new", "1");
         if (id > 0) {
-            WmsSku s = await this.WmsSku.Where(a => a.id == id).FirstAsync();
+            WmsSku s = await this.WmsSku
+                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .FirstAsync();
             if (s == null) { this.Fail(404, "0404", "商品不存在"); }
             d.Set("dialogTitle", "编辑商品");
             d.Set("sku", s.sku);
@@ -85,13 +90,14 @@ class Skus : AdminController {
                 .Set(a => a.unit, unit)
                 .Set(a => a.spec, spec)
                 .Set(a => a.updatedAt, WebApp.NowSeconds())
-                .Where(a => a.id == id)
+                .Where(a => a.id == id && a.tenantId == this.TenantId())
                 .ExecuteAffrowsAsync();
             await this.Note("编辑商品", "#" + Convert.ToString(id) + " " + name, n > 0, "");
             this.Saved("商品已保存");
             return;
         }
         WmsSku s = new WmsSku();
+        s.tenantId = this.TenantId();
         s.sku = sku;
         s.name = name;
         s.unit = unit;
@@ -108,9 +114,13 @@ class Skus : AdminController {
     [Description("删除商品")]
     async void Delete() {
         int id = this.InInt("id", 0);
-        WmsSku s = await this.WmsSku.Where(a => a.id == id).FirstAsync();
+        WmsSku s = await this.WmsSku
+            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .FirstAsync();
         if (s == null) { this.Fail(404, "0404", "商品不存在"); }
-        int n = await this.WmsSku.Delete().Where(a => a.id == id).ExecuteAffrowsAsync();
+        int n = await this.WmsSku.Delete()
+            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .ExecuteAffrowsAsync();
         await this.Note("删除商品", "#" + Convert.ToString(id) + " " + s.name, n > 0, "");
         this.Saved("商品已删除");
     }
@@ -137,9 +147,10 @@ class Skus : AdminController {
                           List<string> keys, List<string> vals) {
         string sku = ExcelIo.Rec(keys, vals, "SKU编码");
         int dup = db.Select<WmsSku>()
-            .Where(a => a.sku == sku).Count();
+            .Where(a => a.sku == sku && a.tenantId == tenantId).Count();
         if (dup > 0) { return "SKU编码=SKU 已存在：" + sku; }
         WmsSku s = new WmsSku();
+        s.tenantId = tenantId;
         s.sku = sku;
         s.name = ExcelIo.Rec(keys, vals, "商品名称");
         s.unit = ExcelIo.Rec(keys, vals, "单位");
@@ -156,6 +167,7 @@ class Skus : AdminController {
     async void Export() {
         bool xlsx = this.InInt("xlsx", 0) == 1;
         List<WmsSku> rows = await this.WmsSku
+            .Where(a => a.tenantId == this.TenantId())
             .OrderBy(a => a.id).ToListAsync();
         List<List<string>> data = new List<List<string>>();
         for (int i = 0; i < rows.Count; i = i + 1) {

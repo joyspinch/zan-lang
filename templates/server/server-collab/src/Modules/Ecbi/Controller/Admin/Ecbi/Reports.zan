@@ -20,7 +20,9 @@ class Reports : AdminController {
         ViewData d = await this.Layout("报表编排");
         if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
 
-        List<OdsReport> rows = await this.OdsReport.OrderBy(a => a.id).ToListAsync();
+        /* 租户硬边（#34）：列表只出本租户报表。 */
+        List<OdsReport> rows = await this.OdsReport
+            .Where(a => a.tenantId == this.TenantId()).OrderBy(a => a.id).ToListAsync();
         List<StrMap> items = d.AddList("rows");
         for (int i = 0; i < rows.Count; i = i + 1) {
             OdsReport r = rows[i];
@@ -44,7 +46,9 @@ class Reports : AdminController {
         ViewData d = await this.Layout("报表");
         if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
         int id = this.InInt("id", 0);
-        OdsReport r = await this.OdsReport.Where(a => a.id == id).FirstAsync();
+        /* 租户硬边（#34）：跨租户报表按不存在处理，运行时不外泄他租户聚合。 */
+        OdsReport r = await this.OdsReport
+            .Where(a => a.id == id && a.tenantId == this.TenantId()).FirstAsync();
         if (r == null) { this.Fail(404, "0404", "报表不存在"); }
 
         d.Set("id", Convert.ToString(r.id));
@@ -60,7 +64,9 @@ class Reports : AdminController {
         int id = this.InInt("id", 0);
         OdsReport r = null;
         if (id > 0) {
-            r = await this.OdsReport.Where(a => a.id == id).FirstAsync();
+            /* 租户硬边（#34）：跨租户报表按不存在处理。 */
+            r = await this.OdsReport
+                .Where(a => a.id == id && a.tenantId == this.TenantId()).FirstAsync();
             if (r == null) { this.Fail(404, "0404", "报表不存在"); }
         }
         ViewData d = new ViewData();
@@ -110,13 +116,15 @@ class Reports : AdminController {
         if (chart != "line" && chart != "table") { chart = "bar"; }
 
         if (id > 0) {
+            /* 租户硬边（#34）：跨租户报表更新落空即 404。 */
             int n = await this.OdsReport.Update()
                 .Set(a => a.name, name)
                 .Set(a => a.dims, dims)
                 .Set(a => a.metrics, metrics)
                 .Set(a => a.chart, chart)
-                .Where(a => a.id == id)
+                .Where(a => a.id == id && a.tenantId == this.TenantId())
                 .ExecuteAffrowsAsync();
+            if (n <= 0) { this.Fail(404, "0404", "报表不存在"); }
             await this.Note("编辑报表", "#" + Convert.ToString(id) + " " + name, n > 0, "");
             this.Saved("报表已保存");
             return;
@@ -126,6 +134,7 @@ class Reports : AdminController {
         r.dims = dims;
         r.metrics = metrics;
         r.chart = chart;
+        r.tenantId = this.TenantId();
         r.createdAt = WebApp.NowSeconds();
         int newId = await this.OdsReport.Insert(r).ExecuteIdentityAsync();
         await this.Note("新建报表", "#" + Convert.ToString(newId) + " " + name, newId > 0, "");
@@ -137,7 +146,11 @@ class Reports : AdminController {
     [Description("删除报表")]
     async void Delete() {
         int id = this.InInt("id", 0);
-        int n = await this.OdsReport.Delete().Where(a => a.id == id).ExecuteAffrowsAsync();
+        /* 租户硬边（#34）：跨租户报表删除落空即 404。 */
+        int n = await this.OdsReport.Delete()
+            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .ExecuteAffrowsAsync();
+        if (n <= 0) { this.Fail(404, "0404", "报表不存在"); }
         await this.Note("删除报表", "#" + Convert.ToString(id), n > 0, "");
         this.Saved("报表已删除");
     }
@@ -146,13 +159,21 @@ class Reports : AdminController {
 
     static async bool Render(ViewData d, Reports page, string dims, string metrics,
                            string chart) {
-        List<OdsOrder> orders = await page.OdsOrder.ToListAsync();
-        List<OdsShop> shops = await page.OdsShop.OrderBy(a => a.id).ToListAsync();
-        List<OdsPlatform> plats = await page.OdsPlatform.OrderBy(a => a.id).ToListAsync();
+        /* 租户硬边（#34）：聚合四源（订单/店铺/平台/推广）全限本租户，
+           报表运行不外泄他租户数据。 */
+        List<OdsOrder> orders = await page.OdsOrder
+            .Where(a => a.tenantId == page.TenantId()).ToListAsync();
+        List<OdsShop> shops = await page.OdsShop
+            .Where(a => a.tenantId == page.TenantId()).OrderBy(a => a.id).ToListAsync();
+        List<OdsPlatform> plats = await page.OdsPlatform
+            .Where(a => a.tenantId == page.TenantId()).OrderBy(a => a.id).ToListAsync();
 
         bool hasAd = metrics.Contains("adcost") || metrics.Contains("roi");
         List<OdsAd> ads = new List<OdsAd>();
-        if (hasAd) { ads = await page.OdsAd.ToListAsync(); }
+        if (hasAd) {
+            ads = await page.OdsAd
+                .Where(a => a.tenantId == page.TenantId()).ToListAsync();
+        }
 
         /* 维度桶：key → 行号。桶内累加销售额/订单数。 */
         List<string> keys = new List<string>();
