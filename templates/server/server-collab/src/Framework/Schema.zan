@@ -7,6 +7,7 @@ using ZanWeb.Model.Sys;
 using ZanWeb.Model.Wms;
 using ZanWeb.Model.Crm;
 using ZanWeb.Model.Flow;
+using ZanWeb.Model.Oa;
 using ZanWeb.Dao.Sys;
 
 namespace ZanWeb;
@@ -32,6 +33,7 @@ class Schema {
             if (!await Schema.SeedWms(db)) { return false; }
             if (!await Schema.SeedCrm(db)) { return false; }
             if (!await Schema.SeedFlow(db)) { return false; }
+            if (!await Schema.SeedNotify(db)) { return false; }
             return true;
         } finally {
             ctx.Release(db);
@@ -342,6 +344,39 @@ class Schema {
         n.createdAt = now;
         int _id = await db.Insert<FlowNode>(n).ExecuteIdentityAsync();
         return _id > 0;
+    }
+
+    /* 通知中心（架构 §2.2 WP-2）：旧 flow_notify 存量一次性迁入 sys_notify
+       （module="flow"），此后 Flow 引擎只写 sys_notify，旧表停止新写、只读保留。
+       计数保护风格：迁移过的库（sys_notify 已有行）直接跳过，重复启动不变。
+       一期单租户：迁移行 tenantId=1（与 BackfillTenant 归一策略一致）。 */
+    static async bool SeedNotify(IDbConnection db) {
+        int have = await db.Select<SysNotify>().CountAsync();
+        if (have > 0) { return true; }
+        List<FlowNotify> old = await db.Select<FlowNotify>().ToListAsync();
+        if (old.Count == 0) { return true; }
+        long now = WebApp.NowSeconds();
+        int moved = 0;
+        for (int i = 0; i < old.Count; i = i + 1) {
+            FlowNotify f = old[i];
+            SysNotify n = new SysNotify();
+            n.tenantId = 1;
+            n.userId = f.userId;
+            n.module = "flow";
+            n.kind = f.kind;
+            n.title = "流程通知";
+            n.content = f.content;
+            n.link = f.link;
+            n.isRead = f.isRead;
+            n.createdAt = f.createdAt;
+            int _id = await db.Insert<SysNotify>(n).ExecuteIdentityAsync();
+            moved = moved + 1;
+        }
+        if (moved > 0) {
+            Console.WriteLine("[notify] 已迁移 " + Convert.ToString(moved)
+                + " 条 flow_notify 通知到 sys_notify；旧表停止新写");
+        }
+        return true;
     }
 
     /* ---- 路由派生授权 ---- */

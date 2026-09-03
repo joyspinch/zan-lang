@@ -6,35 +6,34 @@ namespace ZanWeb;
  *
  * 生命周期：AppController.OnBeforeAsync() 在借到请求租约、解析出账号行后 Bind(user.tenantId)；OnAfterAsync() 复位 0。匿名与登录域请求（登录、令牌解析、权限回填查询）不绑定、不判租户——二期补 [Tenant(Bypass)] 式端点白名单后再收紧到声明式豁免。
  *
- * 并发形态（重要）：槽是进程级静态，而请求协程在 await 点交错——两个并发请求会互相覆写槽值。单租户期（所有账号恒为租户 1）覆写写入同值，无可见影响；多租户上线（T2+ 引入租户谓词、T17 双租户矩阵）之前必须换协程局部存储（运行时帧槽）或改为显式传参（Notify.Send / TodoCenter.Gather / Search.Run 已按显式 tenantId 设计）。槽的读写只经本类三个方法，届时只改此处。
+ * 并发形态与存储选型（T2，重要）：本类曾是进程级静态槽。Zan 的协程是 M:1——
+ * 同一 worker 的多个请求协程在 await 点交错，两个并发请求会互相覆写静态槽值
+ * （probe7 实证）；多租户上线前必须换掉。调研结论：stdlib 无协程局部存储原语
+ * （grep ThreadLocal/CoroutineLocal/AsyncLocal 均无；Thread.CurrentId() 是线程级，
+ * M:1 模型下同线程多协程无法区分；AppServices.current 是 per-worker 单例，非
+ * 请求级，不能当租户槽）。而 stdlib Controller 注释明确路由器「每请求创建一个
+ * 控制器实例」——控制器实例字段天然是请求级存储，且表访问器（this.SysNotify）
+ * 编译为在实例 __Conn() 上跑的类型化查询，实例字段沿访问器路径自然可达。
+ * 故改为：TenantCtx 退化为纯逻辑类（哨兵断言/读槽语义集中在此），槽本体是
+ * AppController 的 per-request 实例字段（见 AppController.zan tenantSlot）。
+ * 业务代码经控制器基类方法读租户；Notify.Send 这类无控制器句柄的静态入口
+ * 显式接收 tenantId 传参（架构 §2.2 签名本就如此）。
  *
  * 开发态断言：随 [log].debug（Cfg.Log.debug）开启；生产保持 false，不抛错。 */
 class TenantCtx {
-    static int current = 0;
-
-    /* 请求内绑定：借到租约并解析账号行之后调用。 */
-    static void Bind(int tenantId) {
-        TenantCtx.current = tenantId;
-    }
-
     /* 非断言读槽：只回答「绑没绑」，供绑定前的条件检查使用——
        「检查未绑定」这个动作自身不能触发断言（Bug#1 教训：
        Id() 的断言读取与检查读取曾混用同一入口）。 */
-    static int Peek() {
-        return TenantCtx.current;
+    static int Peek(int slot) {
+        return slot;
     }
 
     /* 当前租户；0=未绑定哨兵。开发态下业务查询遇 0 即抛错（Where 链构建期求值，异常落在动作里）。仅供业务查询读取租户时调用；控制流判断一律用 Peek()。 */
-    static int Id() {
-        if (TenantCtx.current == 0 && Cfg.Log.debug) {
+    static int Id(int slot) {
+        if (slot == 0 && Cfg.Log.debug) {
             throw new Exception(
                 "[tenant] 租户上下文未绑定（0=哨兵）：业务查询不得在无租户请求中运行");
         }
-        return TenantCtx.current;
-    }
-
-    /* 请求结束复位（OnAfterAsync），防止槽值跨请求残留。 */
-    static void Reset() {
-        TenantCtx.current = 0;
+        return slot;
     }
 }

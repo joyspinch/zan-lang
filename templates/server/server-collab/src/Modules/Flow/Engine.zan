@@ -1,16 +1,20 @@
 using System;
 using System.Data;
-using System.Json;
-using System.Web;
 using ZanWeb.Model.Flow;
 using ZanWeb.Model.Sys;
 
 namespace ZanWeb.Modules.Flow;
 
 /* 流程引擎：实例推进、任务落人、通知落库与实时推送的唯一实现。
-   通知双通道：flow_notify 落库（未读数/历史查询）+ FlowHub.Push 实时推给在线者。
-   流端点（Notifies.Stream）维护 userId→连接 的注册表；业务侧只管投递，不关心谁在线。 */
+   通知已迁公共层（架构 §2.2 WP-2）：Note() 转调 Notify.Send（module="flow"），
+   sys_notify 落库 + NotifyHub.Push 实时推给在线者；旧 flow_notify 停止新写，
+   存量行由 Schema.SeedNotify 迁入 sys_notify 后旧表只读保留。 */
 class Engine {
+    /* 流程域通知的租户：发送链路（Advance/Complete）只有 db 与流程行在手，
+       无控制器句柄（静态槽已废，见 Tenant.zan 选型注释）。一期单租户恒为 1
+       （与 sys_user.tenantId 归一同策略，Schema.BackfillTenant 保证），多租户
+       上线时改为随 FlowInst 所属账号行解析 tenantId。 */
+    static int FlowTenant = 1;
     /* 只读展示辅助：定义/节点名查表。 */
     static string DefName(List<FlowDef> defs, int defId) {
         for (int i = 0; i < defs.Count; i = i + 1) {
@@ -122,7 +126,8 @@ class Engine {
                 .Set(a => a.finishedAt, now)
                 .Where(a => a.id == taskId).ExecuteAffrowsAsync();
             await Engine.Note(db, inst.startedBy, "done",
-                "AI 节点「" + next.name + "」已完成", "/admin/flow/instances");
+                "AI 节点完成", "AI 节点「" + next.name + "」已完成",
+                "/admin/flow/instances");
             inst.currentNodeId = next.id;
             await Engine.Advance(db, inst);
             return taskId;
@@ -130,7 +135,7 @@ class Engine {
 
         if (assignTo > 0) {
             await Engine.Note(db, assignTo, "assign",
-                "新任务：「" + inst.title + "」→ " + next.name,
+                "新任务派发", "新任务：「" + inst.title + "」→ " + next.name,
                 "/admin/flow/tasks");
         }
         return taskId;
@@ -191,29 +196,18 @@ class Engine {
                 .Set(a => a.updatedAt, now)
                 .Where(a => a.id == inst.id).ExecuteAffrowsAsync();
             await Engine.Note(db, inst.startedBy, "done",
-                "流程「" + inst.title + "」已全部完成", "/admin/flow/instances");
+                "流程完结", "流程「" + inst.title + "」已全部完成",
+                "/admin/flow/instances");
         }
         return true;
     }
 
-    /* 单条通知：落库 + 实时推送（在线则即时可见，离线靠未读数）。 */
+    /* 单条通知：转调公共层 Notify.Send（module="flow"，落 sys_notify + 推 NotifyHub）。
+       kind 语义不变（assign/mention/done），title 为新增的一句话摘要。 */
     static async bool Note(IDbConnection db, int userId, string kind,
-                        string content, string link) {
-        FlowNotify n = new FlowNotify();
-        n.userId = userId;
-        n.kind = kind;
-        n.content = content;
-        n.link = Fmt.Text(link, "/admin/flow/notifies");
-        n.isRead = 0;
-        n.createdAt = WebApp.NowSeconds();
-        int id = await db.Insert<FlowNotify>(n).ExecuteIdentityAsync();
-
-        JsonValue o = JsonValue.NewObject();
-        o.Put("id", JsonValue.NewStr(Convert.ToString(id)));
-        o.Put("kind", JsonValue.NewStr(kind));
-        o.Put("content", JsonValue.NewStr(content));
-        o.Put("link", JsonValue.NewStr(n.link));
-        await FlowHub.Push(userId, o);
+                        string title, string content, string link) {
+        await Notify.Send(db, Engine.FlowTenant, userId, "flow", kind,
+            title, content, Fmt.Text(link, "/admin/flow/notifies"));
         return true;
     }
 
@@ -228,7 +222,8 @@ class Engine {
                 if (one.Length > 0) {
                     int uid = Filter.ToInt(one, 0);
                     if (uid > 0) {
-                        await Engine.Note(db, uid, "mention", content, link);
+                        await Engine.Note(db, uid, "mention", "流程提及",
+                            content, link);
                     }
                 }
                 from = i + 1;
@@ -238,65 +233,3 @@ class Engine {
     }
 }
 
-/* 连接注册表：Notifies.Stream 打开时登记、断开时注销；业务侧 Push 只对在线者发。
-   双通道：WebSocket 长连接为主（ctx.WsUpgrade，升级前路由/权限已生效），SSE 为回退
-   （老代理/老客户端）。并行数组；协程模型下每条连接由各自协程维护，Push 只在短请求
-   协程里跑，注册表增删由 Stream 协程同步做，无跨协程撕裂。
-   写方唯一：WS 会话循环只 Recv 不写，Push 是会话出站的唯一协程——两条推送协程
-   并发写同一条会话才可能撕裂帧字节，本注册表从结构上排除了这种形态。 */
-class FlowHub {
-    /* WS 主通道（NotifyPayload 的 type 字段供客户端分派事件）。 */
-    static List<int> wsIds = new List<int>();
-    static List<WsSession> wsConns = new List<WsSession>();
-    /* SSE 回退通道。 */
-    static List<int> sseIds = new List<int>();
-    static List<HttpContext> sseConns = new List<HttpContext>();
-
-    static void JoinWs(int userId, WsSession conn) {
-        FlowHub.LeaveWs(conn);
-        FlowHub.wsIds.Add(userId);
-        FlowHub.wsConns.Add(conn);
-    }
-
-    static void LeaveWs(WsSession conn) {
-        int at = FlowHub.wsConns.IndexOf(conn);
-        if (at >= 0) {
-            FlowHub.wsConns.RemoveAt(at);
-            FlowHub.wsIds.RemoveAt(at);
-        }
-    }
-
-    static void JoinSse(int userId, HttpContext conn) {
-        FlowHub.LeaveSse(conn);
-        FlowHub.sseIds.Add(userId);
-        FlowHub.sseConns.Add(conn);
-    }
-
-    static void LeaveSse(HttpContext conn) {
-        int at = FlowHub.sseConns.IndexOf(conn);
-        if (at >= 0) {
-            FlowHub.sseConns.RemoveAt(at);
-            FlowHub.sseIds.RemoveAt(at);
-        }
-    }
-
-    /* 向某用户的在线连接推一条通知；不在线则静默跳过（落库已是可靠通道）。
-       type 字段供 WS 客户端分派（SSE 客户端走事件名）；业务 kind
-       （assign/mention/flow）原样保留，两通道收到的是同一份 JSON。 */
-    static async void Push(int userId, JsonValue payload) {
-        payload.Put("type", JsonValue.NewStr("notify"));
-        string json = payload.ToJson();
-        for (int i = FlowHub.wsConns.Count - 1; i >= 0; i = i - 1) {
-            if (FlowHub.wsIds[i] != userId) { continue; }
-            WsSession s = FlowHub.wsConns[i];
-            bool ok = await s.SendText(json);
-            if (!ok) { FlowHub.LeaveWs(s); }
-        }
-        for (int j = FlowHub.sseConns.Count - 1; j >= 0; j = j - 1) {
-            if (FlowHub.sseIds[j] != userId) { continue; }
-            HttpContext c = FlowHub.sseConns[j];
-            bool ok2 = await c.SseSend("notify", json);
-            if (!ok2) { FlowHub.LeaveSse(c); }
-        }
-    }
-}

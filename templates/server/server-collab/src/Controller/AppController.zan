@@ -11,6 +11,28 @@ class AppController : Controller {
     IDbConnection lease;
     bool inTx;
 
+    /* 请求租户槽（软隔离地基，见 Tenant.zan）：本请求绑定到的租户 id，0=未绑定哨兵。
+       路由器每请求创建一个控制器实例（stdlib Controller 契约），实例字段即请求级
+       存储——协程 M:1 下静态槽会被并发请求覆写（probe7 实证），实例字段不会。
+       读写只经 TenantSlot()/TenantBind()/TenantReset() 三个方法（见下），语义
+       （哨兵、Peek/Id 分工）由 TenantCtx 集中承载。 */
+    int tenantSlot;
+
+    /* 非断言读槽：只回答「绑没绑」，供绑定前的条件检查（如 OnBeforeAsync 自身）。 */
+    protected int TenantSlot() {
+        return TenantCtx.Peek(this.tenantSlot);
+    }
+
+    /* 业务查询读租户（哨兵断言在此，随 Cfg.Log.debug 生效）；控制流判断用 TenantSlot()。 */
+    protected int TenantId() {
+        return TenantCtx.Id(this.tenantSlot);
+    }
+
+    /* 请求内绑定：OnBeforeAsync 借到租约并解析账号行之后调用。 */
+    protected void TenantBind(int tenantId) {
+        this.tenantSlot = tenantId;
+    }
+
     /* 注入的数据库上下文（AppServices.Use 前为 null）。 */
     protected DbContext Db() {
         AppServices s = AppServices.Current();
@@ -47,11 +69,11 @@ class AppController : Controller {
     /* 动作运行前借出本次请求连接，供表访问器使用；数据库未配置时零开销（Conn() 答 null，动作回退到 503）。借到租约且请求已登录时解析账号行并绑定租户上下文（软隔离地基，见 Tenant.zan）：查询跑在本请求租约上，不二次借连接；查询失败（账号已删/禁用）不阻断请求——鉴权与账号状态由调度器和 Admin() 负责，此处只做尽力绑定。匿名与登录域请求不绑定，业务查询读哨兵 0，开发态断言报错。 */
     virtual async bool OnBeforeAsync() {
         IDbConnection _db = await this.Conn();
-        if (this.uid.Length > 0 && this.lease != null && TenantCtx.Peek() == 0) {
+        if (this.uid.Length > 0 && this.lease != null && this.TenantSlot() == 0) {
             User me = await this.lease.Select<User>()
                 .Where(a => a.id == Filter.ToInt(this.uid, 0)).FirstAsync();
             if (me != null) {
-                TenantCtx.Bind(me.tenantId);
+                this.TenantBind(me.tenantId);
             }
         }
         return this.OnBefore();
@@ -97,9 +119,9 @@ class AppController : Controller {
     /* 任何失败路径回滚；可重复调用、可在提交后调用。 */
     protected override async void __TxRollback() { await this.Rollback(); }
 
-    /* 释放请求连接（在协程上），以便未完成的务事先回滚；事务中途归还会把持着别人锁的会话交还下一个请求，回滚本身也是往返。租户上下文一并复位：槽值不得跨请求残留。 */
+    /* 释放请求连接（在协程上），以便未完成的务事先回滚；事务中途归还会把持着别人锁的会话交还下一个请求，回滚本身也是往返。租户槽一并复位：实例随请求终止即弃，复位是防御性收口，保证同实例被复用（若有）也不带旧租户。 */
     virtual async void OnAfterAsync() {
-        TenantCtx.Reset();
+        this.tenantSlot = 0;
         if (this.lease != null) {
             await this.Rollback();
             DbContext ctx = this.Db();

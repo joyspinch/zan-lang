@@ -1,0 +1,73 @@
+using System;
+using System.Data;
+using System.Json;
+using System.Web;
+
+namespace ZanWeb;
+
+/* 通知实时通道（架构 §2.2 WP-2）：自 Flow 的 FlowHub 泛化上移的连接注册表，
+   全模块共用。Notifies.Stream 打开时登记、断开时注销；业务侧经 Notify.Send
+   推送，只管投递，不关心谁在线。
+   双通道：WebSocket 长连接为主（ctx.WsUpgrade，升级前路由/权限已生效），SSE 为
+   回退（老代理/老客户端）。并行数组；协程模型下每条连接由各自协程维护，Push 只
+   在短请求协程里跑，注册表增删由 Stream 协程同步做，无跨协程撕裂。
+   写方唯一：WS 会话循环只 Recv 不写，Push 是会话出站的唯一协程——两条推送协程
+   并发写同一条会话才可能撕裂帧字节，本注册表从结构上排除了这种形态。
+   per-worker 注册表：跨 worker 增量一期不做（单 worker 内 Push 即全量）；落库为
+   准 + 版本号轮询机制见架构 §3.2，T13 IM 时启用。 */
+class NotifyHub {
+    /* WS 主通道（payload 的 type 字段供客户端分派事件）。 */
+    static List<int> wsIds = new List<int>();
+    static List<WsSession> wsConns = new List<WsSession>();
+    /* SSE 回退通道。 */
+    static List<int> sseIds = new List<int>();
+    static List<HttpContext> sseConns = new List<HttpContext>();
+
+    static void JoinWs(int userId, WsSession conn) {
+        NotifyHub.LeaveWs(conn);
+        NotifyHub.wsIds.Add(userId);
+        NotifyHub.wsConns.Add(conn);
+    }
+
+    static void LeaveWs(WsSession conn) {
+        int at = NotifyHub.wsConns.IndexOf(conn);
+        if (at >= 0) {
+            NotifyHub.wsConns.RemoveAt(at);
+            NotifyHub.wsIds.RemoveAt(at);
+        }
+    }
+
+    static void JoinSse(int userId, HttpContext conn) {
+        NotifyHub.LeaveSse(conn);
+        NotifyHub.sseIds.Add(userId);
+        NotifyHub.sseConns.Add(conn);
+    }
+
+    static void LeaveSse(HttpContext conn) {
+        int at = NotifyHub.sseConns.IndexOf(conn);
+        if (at >= 0) {
+            NotifyHub.sseConns.RemoveAt(at);
+            NotifyHub.sseIds.RemoveAt(at);
+        }
+    }
+
+    /* 向某用户的在线连接推一条通知；不在线则静默跳过（落库已是可靠通道）。
+       type 字段供 WS 客户端分派（SSE 客户端走事件名）；业务 kind
+       （assign/mention/done/alert/info）原样保留，两通道收到的是同一份 JSON。 */
+    static async void Push(int userId, JsonValue payload) {
+        payload.Put("type", JsonValue.NewStr("notify"));
+        string json = payload.ToJson();
+        for (int i = NotifyHub.wsConns.Count - 1; i >= 0; i = i - 1) {
+            if (NotifyHub.wsIds[i] != userId) { continue; }
+            WsSession s = NotifyHub.wsConns[i];
+            bool ok = await s.SendText(json);
+            if (!ok) { NotifyHub.LeaveWs(s); }
+        }
+        for (int j = NotifyHub.sseConns.Count - 1; j >= 0; j = j - 1) {
+            if (NotifyHub.sseIds[j] != userId) { continue; }
+            HttpContext c = NotifyHub.sseConns[j];
+            bool ok2 = await c.SseSend("notify", json);
+            if (!ok2) { NotifyHub.LeaveSse(c); }
+        }
+    }
+}

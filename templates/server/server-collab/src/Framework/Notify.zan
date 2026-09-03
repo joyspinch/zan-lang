@@ -1,0 +1,68 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Json;
+using ZanWeb.Model.Oa;
+
+namespace ZanWeb;
+
+/* 跨模块通知发送入口（架构 §2.2 WP-2）：全模块唯一——业务侧只调本类，
+   不直接写 sys_notify、不直接碰 NotifyHub。落库 sys_notify（未读数/历史查询）
+   + NotifyHub.Push 实时推给在线者；免打扰（sys_notify_pref.muted=1）只落库不推。
+   tenantId 显式传参：发送方常在无控制器句柄的静态链路里（引擎/后台协程），
+   静态槽已废（见 Tenant.zan 选型注释）——控制器动作侧经 this.TenantId() 取值传入。 */
+class Notify {
+    /* 单条通知：落库 + 实时推送（在线则即时可见，离线靠未读数）。返回通知 id。 */
+    static async int Send(IDbConnection db, int tenantId, int userId,
+                          string module, string kind, string title,
+                          string content, string link) {
+        SysNotify n = new SysNotify();
+        n.tenantId = tenantId;
+        n.userId = userId;
+        n.module = module;
+        n.kind = kind;
+        n.title = Fmt.Text(title, "通知");
+        n.content = Fmt.Text(content, "");
+        n.link = Fmt.Text(link, "");
+        n.isRead = 0;
+        n.createdAt = WebApp.NowSeconds();
+        int id = await db.Insert<SysNotify>(n).ExecuteIdentityAsync();
+
+        if (!await Notify.Muted(db, tenantId, userId, module)) {
+            JsonValue o = JsonValue.NewObject();
+            o.Put("id", JsonValue.NewStr(Convert.ToString(id)));
+            o.Put("kind", JsonValue.NewStr(kind));
+            o.Put("title", JsonValue.NewStr(n.title));
+            o.Put("content", JsonValue.NewStr(n.content));
+            o.Put("link", JsonValue.NewStr(n.link));
+            await NotifyHub.Push(userId, o);
+        }
+        return id;
+    }
+
+    /* 批量扇出：逐人 Send（接收人数量级为部门规模，逐条足够）。 */
+    static async void SendAll(IDbConnection db, int tenantId, List<int> userIds,
+                              string module, string kind, string title,
+                              string content, string link) {
+        for (int i = 0; i < userIds.Count; i = i + 1) {
+            await Notify.Send(db, tenantId, userIds[i], module, kind,
+                title, content, link);
+        }
+    }
+
+    /* 某用户当前未读数（铃铛角标数据源）。 */
+    static async int Unread(IDbConnection db, int tenantId, int userId) {
+        return await db.Select<SysNotify>()
+            .Where(a => a.tenantId == tenantId && a.userId == userId
+                && a.isRead == 0).CountAsync();
+    }
+
+    /* 免打扰判定：无偏好行视为不静默。等值谓词匹配不了缺行——查无即默认放行。 */
+    static async bool Muted(IDbConnection db, int tenantId, int userId,
+                            string module) {
+        SysNotifyPref p = await db.Select<SysNotifyPref>()
+            .Where(a => a.tenantId == tenantId && a.userId == userId
+                && a.module == module).FirstAsync();
+        return p != null && p.muted == 1;
+    }
+}
