@@ -212,6 +212,42 @@ Difficulty is for **CLI/compute** first; GUI is a separate, larger effort on eac
   dialog lists `android-x64`/`android-arm64` and emits the same APKs.
   arm64 APKs run on device (verified on an x86_64 emulator via lib
   translation: gallery + form demos render with correct CJK text).
+- **Touch & back gesture** (phone): finger events are synthesized into
+  pointer/wheel input in `gui_runtime_sdl.c` — first-finger tracking with an
+  8 px slop (tap → synthesized click, drag → 1:1 synthesized wheel scaled by
+  `g_dpi`), `SDL_HINT_TOUCH_MOUSE_EVENTS=0` so SDL's own touch→mouse mirror
+  is off. `SDL_SCANCODE_AC_BACK` becomes the regular kind-8 window-close
+  event without touching `g_quit`: the app decides (e.g. the gallery's
+  phone-mode drawer closes first; a second BACK leaves `main`, which finishes
+  the SDLActivity task). Display fit never scales below the device's native
+  density on Android (`App.Show()` `#if ANDROID` floor): UI renders at native
+  density with in-page scrolling instead of shrinking.
+- **Permissions**: the APK-shell manifest template needs
+  `<uses-permission android:name="android.permission.INTERNET"/>` — modern
+  Android returns `EPERM` from `socket()` for apps without the grant, so
+  even loopback TCP fails. The canonical text source now lives at
+  `toolchain/apk-shell/AndroidManifest.xml` (regeneration instructions
+  inside; `src/compiler/apk.c` patches exactly one `dev.zan.app` package +
+  one `Zan App` label string in the pool), and the precompiled
+  `AndroidManifest.xml.bin` next to it ships with the permission.
+- **TLS**: `System.Net.Tls` ships bionic-compatible OpenSSL drivers for both
+  ABIs at `stdlib/System/Net/Tls/drivers/android-{arm64,x64}/` — Termux
+  3.6.3 builds with the SONAME/NEEDED names shortened in place
+  (`libssl.so.3` → `libssl.so`) because Android only extracts `lib*.so` to
+  `nativeLibraryDir`; each `*.bundle` lists one `.so` so `--emit-apk` packs
+  them into `lib/<abi>/`. Verified on the emulator with a loopback probe
+  (TLS server + client in one APK on 127.0.0.1, self-signed CA embedded and
+  trusted via `AddTrustedCert`): handshake, **certificate chain
+  verification**, and a full HTTPS request/response round trip pass on both
+  arm64 (Berberis translation) and x64. PEM material passed to
+  `TlsContext.CreateServer` must be written to a real file first — OpenSSL's
+  internal `fopen` cannot see `--embed` virtual files.
+- Known Android issues (see TASKS.md A88): a `try/catch` directly in a void
+  `Thread.Start` entry hangs on android-arm64 — keep the entry try-free and
+  `await` an async method that owns the try (the `ImageHttp` shape); a TLS
+  server thread that exits immediately after writing can leave the peer's
+  `RecvAsync` waiting forever (destructor `SSL_shutdown` interplay); real
+  device + real egress HTTPS is still unverified (emulator has no network).
 
 ### HarmonyOS / OHOS — medium
 - OHOS native uses a musl-based NDK; for CLI/services this is close to Android.
