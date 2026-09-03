@@ -88,8 +88,20 @@ class Player {
     public int cardMaskLen = 30;
     public long tupuScore;     // 图谱积分
 
-    // 图鉴 9 组 × 10 槽(简化:每组记录一个最弱系数)
-    public int[] albumMinCoef = new int[Data.SLOT_COUNT * 9]; // 占位;实存 Item
+    // 图鉴 9 组 × 10 槽:实存 Item,镶入后无法取出(木桶原理计加成)
+    public Item[] albumSlots = new Item[Data.ALBUM_GROUPS * Data.ALBUM_SLOTS];
+
+    // 沙巴克
+    public bool sbkOwned;      // 我的行会占领中
+    public int sbkWins;        // 累计攻克次数
+    public long sbkDayMs;      // 上次攻城时间(日门槛)
+    public long sbkTaxMs;      // 上次收税时间
+
+    // 红包(影子群)
+    public long rbSent;        // 累计发出(元宝)
+    public long rbGot;         // 累计收回(元宝/红包币)
+    public long rbDayMs;       // 首封红包日锚(+声望)
+    public long rbGrabMs;      // 上次抢红包时间(日门槛)
 
     // 至尊极品殿堂:5 页(每页只记一件当前最强)
     public Item[] dtBest = new Item[5];
@@ -292,6 +304,8 @@ class Game {
         if (this.p.vip >= 2) { this.p.xbTickets = this.p.xbTickets + 3; }
         this.p.lastDayTs = Game.NowMs();
         this.AddChat("[系统] 每日 0 点刷新:寻宝奖池 / 个人 BOSS 次数 / 押镖次数");
+        // 沙巴克每日状态检查(影子行会可能反扑)
+        this.ShabakeLoseCheck();
     }
 
     // ---------------------------------------------------------------
@@ -444,6 +458,10 @@ class Game {
         pct = pct + cards * 0.0005;
         // 殿堂登记 +0.5%
         pct = pct + this.p.dtCount * 0.005;
+        // 图鉴:每件 +1%,整组镶满再 +5%(木桶原理)
+        int fullGroups = this.AlbumFullGroups();
+        pct = pct + this.AlbumCount() * Data.ALBUM_PCT_PER_ITEM
+                  + fullGroups * Data.ALBUM_PCT_FULL_GROUP;
         return pct;
     }
 
@@ -1948,6 +1966,168 @@ class Game {
     }
 
     // ---------------------------------------------------------------
+    // 神兵图鉴:9 组 × 10 槽,镶入后无法取出(木桶原理)
+    // 每件 +1% 全属性,整组镶满再 +5%;可被更高评分的同组装备向上替换
+    // ---------------------------------------------------------------
+    public Item AlbumAt(int group, int slot) {
+        if (group < 0 || group >= Data.ALBUM_GROUPS) { return null; }
+        if (slot < 0 || slot >= Data.ALBUM_SLOTS) { return null; }
+        return this.p.albumSlots[group * Data.ALBUM_SLOTS + slot];
+    }
+    public int AlbumCount() {
+        int n = 0;
+        for (int i = 0; i < this.p.albumSlots.Length; i = i + 1) {
+            if (this.p.albumSlots[i] != null) { n = n + 1; }
+        }
+        return n;
+    }
+    public int AlbumFullGroups() {
+        int n = 0;
+        for (int gi = 0; gi < Data.ALBUM_GROUPS; gi = gi + 1) {
+            bool full = true;
+            for (int si = 0; si < Data.ALBUM_SLOTS; si = si + 1) {
+                if (this.p.albumSlots[gi * Data.ALBUM_SLOTS + si] == null) { full = false; break; }
+            }
+            if (full) { n = n + 1; }
+        }
+        return n;
+    }
+    // 图鉴评分:品阶 ×100 万 + 系数(与换装评分一致)
+    static int AlbumScore(Item it) {
+        if (it == null) { return -1; }
+        return it.tier * 1000000 + it.coef;
+    }
+    // 从背包选中一件镶入图鉴(group=当前页,slot=自动找空位,满则顶掉最弱一件)
+    public bool AlbumInset(int group, int bagIdx) {
+        if (group < 0 || group >= Data.ALBUM_GROUPS) { return false; }
+        if (bagIdx < 0 || bagIdx >= this.p.bagCnt) { return false; }
+        Item it = this.p.bag[bagIdx];
+        if (it == null) { return false; }
+        int base_ = group * Data.ALBUM_SLOTS;
+        // 找空位;没有空位则找组内评分最低的一件
+        int slot = -1;
+        int weakIdx = -1;
+        int weakScore = 2147483647;
+        for (int si = 0; si < Data.ALBUM_SLOTS; si = si + 1) {
+            Item cur = this.p.albumSlots[base_ + si];
+            if (cur == null) { slot = si; break; }
+            int sc = AlbumScore(cur);
+            if (sc < weakScore) { weakScore = sc; weakIdx = si; }
+        }
+        if (slot < 0) {
+            // 全满:新装备必须比最弱一件强,否则拒绝(防误操作白拿)
+            if (AlbumScore(it) <= weakScore) {
+                this.AddChat("[图鉴] 该组已满,新装备未优于最弱一件,镶入取消");
+                return false;
+            }
+            slot = weakIdx;
+        }
+        // 从背包移除(与 Recycle 同款搬移)
+        for (int i = bagIdx; i < this.p.bagCnt - 1; i = i + 1) {
+            this.p.bag[i] = this.p.bag[i + 1];
+        }
+        this.p.bag[this.p.bagCnt - 1] = null;
+        this.p.bagCnt = this.p.bagCnt - 1;
+        Item old = this.p.albumSlots[base_ + slot];
+        this.p.albumSlots[base_ + slot] = it;
+        if (old == null) {
+            this.AddChat("[图鉴] 「" + Data.ALBUM_NAMES[group] + "」镶入 " + it.Name()
+                         + "(" + this.AlbumCount() + "/" + this.p.albumSlots.Length + ")");
+        } else {
+            this.AddChat("[图鉴] 「" + Data.ALBUM_NAMES[group] + "」" + old.Name()
+                         + " → " + it.Name() + "(替换,旧件销毁)");
+        }
+        return true;
+    }
+
+    // ---------------------------------------------------------------
+    // 沙巴克(单机影子攻城):无行会可膜拜蹭声望;有行会可攻城
+    // ---------------------------------------------------------------
+    public bool ShabakeOwn() {
+        if (!this.p.hasGuild) { return false; }
+        if (this.p.sbkOwned) { return false; }
+        if (!this.MatTake(Data.MAT_GOLDKEY, 1)) {
+            this.AddChat("[沙巴克] 攻城需要 1 把黄金钥匙");
+            return false;
+        }
+        // 攻城战力门槛:全攻 ≥ 2000(影子守军)
+        if (this.TotalAcMax() < 2000) {
+            this.MatAdd(Data.MAT_GOLDKEY, 1);   // 退还钥匙
+            this.AddChat("[沙巴克] 攻城失败:总攻不足 2000(守军太强),钥匙已退回");
+            return false;
+        }
+        this.p.sbkOwned = true;
+        this.p.sbkWins = this.p.sbkWins + 1;
+        this.p.sbkDayMs = Game.NowMs();
+        this.p.sbkTaxMs = Game.NowMs();
+        this.AddChat("[沙巴克] 「" + this.p.guildName + "」攻城成功!占领沙巴克城!");
+        return true;
+    }
+    // 占领期间收税:金币 = 2 万 × 占领小时数(上限 24h),黑铁 1/h
+    public bool ShabakeCollectTax() {
+        if (!this.p.sbkOwned) { return false; }
+        long now = Game.NowMs();
+        long ms = now - this.p.sbkTaxMs;
+        if (ms < 3600000L) {
+            this.AddChat("[沙巴克] 占领不足 1 小时,暂无可收税金");
+            return false;
+        }
+        long hours = ms / 3600000L;
+        if (hours > 24) { hours = 24; }
+        long gold = hours * 20000L;
+        this.p.cur[Data.CUR_GOLD] = this.p.cur[Data.CUR_GOLD] + gold;
+        this.MatAddMsg(Data.MAT_BLACK_IRON, (int)hours);
+        this.p.sbkTaxMs = now;
+        this.AddChat("[沙巴克] 收税 " + this.FormatNum(gold) + " 金币(" + hours + " 小时占领)");
+        return true;
+    }
+    // 失去占领(影子行会反扑,每日一次机会)——让"占领"是个需要维护的动态状态
+    public void ShabakeLoseCheck() {
+        if (!this.p.sbkOwned) { return; }
+        if (this.rng.NextDouble01() < 0.5) { return; }
+        this.p.sbkOwned = false;
+        this.AddChat("[沙巴克] 影子行会反扑,「" + this.p.guildName + "」失去沙巴克占领!");
+    }
+
+    // ---------------------------------------------------------------
+    // 红包(影子群):发出去抢回来,小额回收 + 每日首封 +声望
+    // ---------------------------------------------------------------
+    public bool RedBagSend(long ybAmount) {
+        if (ybAmount < 100) { return false; }
+        if (this.p.cur[Data.CUR_YB] < ybAmount) {
+            this.AddChat("[系统] 元宝不足");
+            return false;
+        }
+        this.p.cur[Data.CUR_YB] = this.p.cur[Data.CUR_YB] - ybAmount;
+        // 影子群 8 人抢:自己平均能抢回 40%~90%
+        long got = (long)(ybAmount * (0.4 + this.rng.NextDouble01() * 0.5));
+        this.p.cur[Data.CUR_RB] = this.p.cur[Data.CUR_RB] + got;
+        this.p.rbSent = this.p.rbSent + ybAmount;
+        this.p.rbGot = this.p.rbGot + got;
+        // 每日首封 +30 声望
+        if (Game.NowMs() - this.p.rbDayMs >= Data.DAY_MS) {
+            this.p.rbDayMs = Game.NowMs();
+            this.p.cur[Data.CUR_SW] = this.p.cur[Data.CUR_SW] + 30;
+            this.AddChat("[红包] 今日首封红包 +30 声望");
+        }
+        this.AddChat("[红包] 发出 " + ybAmount + " 元宝,影子群抢回 " + got + " 红包币");
+        return true;
+    }
+    public bool RedBagGrab() {
+        long now = Game.NowMs();
+        if (now - this.p.rbGrabMs < Data.DAY_MS) {
+            this.AddChat("[红包] 今日已抢过影子群红包(每日 1 次)");
+            return false;
+        }
+        long got = this.rng.Range(50, 500);
+        this.p.cur[Data.CUR_RB] = this.p.cur[Data.CUR_RB] + got;
+        this.p.rbGot = this.p.rbGot + got;
+        this.p.rbGrabMs = now;
+        this.AddChat("[红包] 抢到影子群红包 +" + got + " 红包币");
+        return true;
+    }
+
+    // ---------------------------------------------------------------
     // 设置
     // ---------------------------------------------------------------
     public void ToggleBossKey() {
@@ -2039,6 +2219,23 @@ class Game {
         lines.Add("achvc=" + this.p.achvClaimed);
         lines.Add("wbw=" + this.p.wbWindowEndMs);
         lines.Add("bagsz=" + this.p.bagSizeBase);
+        lines.Add("sbo=" + (this.p.sbkOwned ? 1 : 0));
+        lines.Add("sbw=" + this.p.sbkWins);
+        lines.Add("sbd=" + this.p.sbkDayMs);
+        lines.Add("sbt=" + this.p.sbkTaxMs);
+        lines.Add("rbs=" + this.p.rbSent);
+        lines.Add("rbg=" + this.p.rbGot);
+        lines.Add("rbd=" + this.p.rbDayMs);
+        lines.Add("rbr=" + this.p.rbGrabMs);
+        // 图鉴 9×10(实存 Item,与背包同款序列化;空槽 = -1)
+        string alb = "";
+        for (int i = 0; i < this.p.albumSlots.Length; i = i + 1) {
+            Item it = this.p.albumSlots[i];
+            if (it == null) { alb = alb + "-1"; }
+            else { alb = alb + it.slot + ":" + it.tier + ":" + it.coef + ":" + it.cls + ":" + it.seed; }
+            if (i < this.p.albumSlots.Length - 1) { alb = alb + ";"; }
+        }
+        lines.Add("alb=" + alb);
         lines.Add("stc=" + this.p.studentCount);
         lines.Add("mc=" + this.p.mailCnt);
         for (int i = 0; i < 8; i = i + 1) {
@@ -2202,6 +2399,27 @@ class Game {
             else if (k == "achvc") { this.p.achvClaimed = Game.ParseIntS(v); }
             else if (k == "wbw") { this.p.wbWindowEndMs = Game.ParseLongS(v); }
             else if (k == "bagsz") { this.p.bagSizeBase = Game.ParseIntS(v); }
+            else if (k == "sbo") { this.p.sbkOwned = (Game.ParseIntS(v) != 0); }
+            else if (k == "sbw") { this.p.sbkWins = Game.ParseIntS(v); }
+            else if (k == "sbd") { this.p.sbkDayMs = Game.ParseLongS(v); }
+            else if (k == "sbt") { this.p.sbkTaxMs = Game.ParseLongS(v); }
+            else if (k == "rbs") { this.p.rbSent = Game.ParseLongS(v); }
+            else if (k == "rbg") { this.p.rbGot = Game.ParseLongS(v); }
+            else if (k == "rbd") { this.p.rbDayMs = Game.ParseLongS(v); }
+            else if (k == "rbr") { this.p.rbGrabMs = Game.ParseLongS(v); }
+            else if (k == "alb") {
+                int aslot = 0;
+                string acur = "";
+                for (int j = 0; j <= v.Length; j = j + 1) {
+                    if (j == v.Length || v.Substring(j, 1) == ";") {
+                        if (aslot < this.p.albumSlots.Length) {
+                            this.p.albumSlots[aslot] = Game.ParseItem(acur);
+                            aslot = aslot + 1;
+                        }
+                        acur = "";
+                    } else { acur = acur + v.Substring(j, 1); }
+                }
+            }
             else if (k == "stc") { this.p.studentCount = Game.ParseIntS(v); }
             else if (k == "mc") { this.p.mailCnt = Game.ParseIntS(v); }
             else if (k.Length >= 3 && k.Substring(0, 2) == "mt") {
