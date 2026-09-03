@@ -43,7 +43,7 @@ class Schema {
     /* 存量库回填：SyncStructureAllAsync 加列不带 DEFAULT（ORM DDL 无此能力），
        旧行 tenantId 为 NULL、读作 0（哨兵值）。启动时一次性归一为 1，保证
        「一期单租户恒为 1」。NULL 用 IS NULL 命中（参数化 UPDATE 语义是
-       相等比较，绑 0 无法匹配 NULL 行）；新库行由 User.tenantId 字段初始
+       相等比较，绑 0 无法匹配 NULL 行）；新库行由各模型 tenantId 字段初始
        化器写 1，此处通常 0 行受影响。幂等，重复启动无害。 */
     static async bool BackfillTenant(IDbConnection db) {
         int n = await db.ExecuteAsync(
@@ -52,6 +52,25 @@ class Schema {
         if (n > 0) {
             Console.WriteLine("[tenant] 已回填 " + Convert.ToString(n)
                 + " 个账号的租户归属为 1");
+        }
+        /* #34 业务四域基列：加列后旧行同样 NULL/0 哨兵，单租户时代存量
+           全归租户 1。表清单与模型目录一一对应；flow_task/flow_node/
+           flow_log/flow_notify 子表不补列（恒经已闸的 inst/def 可达）。 */
+        List<string> tables = new List<string> {
+            "crm_customer", "crm_contact", "crm_opportunity",
+            "wms_sku", "wms_warehouse", "wms_stock_in", "wms_inventory",
+            "flow_def", "flow_inst",
+            "ods_order", "ods_platform", "ods_shop", "ods_product",
+            "ods_ad", "ods_report", "ods_shop_product" };
+        int total = 0;
+        for (int i = 0; i < tables.Count; i = i + 1) {
+            total = total + await db.ExecuteAsync(
+                "UPDATE " + tables[i] + " SET tenantId = 1 "
+                + "WHERE tenantId IS NULL OR tenantId = 0");
+        }
+        if (total > 0) {
+            Console.WriteLine("[tenant] 已回填 " + Convert.ToString(total)
+                + " 行业务数据的租户归属为 1");
         }
         return true;
     }
