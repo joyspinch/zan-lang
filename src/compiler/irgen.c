@@ -3106,10 +3106,27 @@ static int count_virtual_methods(zan_symbol_t *sym) {
     return count;
 }
 
-static int get_virtual_method_index(zan_symbol_t *type_sym, zan_istr_t method_name) {
+/* Declared parameter count of a method symbol, -1 when it is not a plain
+ * method declaration. Virtual slot lookup compares this against each
+ * slot-defining virtual declaration: overloaded virtual methods occupy one
+ * slot per distinct declaration, so matching on the name alone sent every
+ * same-named call to the first-declared overload's slot -- x.F(1,2,3,4)
+ * dispatched through the 2-param F's slot and ran the wrong body (the
+ * signature still verified because the slot pointer is bitcast to the
+ * resolved overload's fn type, and the extra arguments were dropped by the
+ * calling convention). This mirrors how emit_vtables fills the slots:
+ * resolve_overload(name, declared arity) picks the most-derived impl. */
+static int method_declared_param_count(zan_symbol_t *m) {
+    if (!m || !m->decl || m->decl->kind != AST_METHOD_DECL) return -1;
+    return m->decl->method_decl.params.count;
+}
+
+static int get_virtual_method_index(zan_symbol_t *type_sym,
+                                    zan_symbol_t *method_sym) {
+    if (!method_sym) return -1;
     /* search base classes first for the method slot */
     if (type_sym->type && type_sym->type->base_type && type_sym->type->base_type->sym) {
-        int idx = get_virtual_method_index(type_sym->type->base_type->sym, method_name);
+        int idx = get_virtual_method_index(type_sym->type->base_type->sym, method_sym);
         if (idx >= 0) return idx;
     }
     /* search current class virtual methods */
@@ -3117,13 +3134,19 @@ static int get_virtual_method_index(zan_symbol_t *type_sym, zan_istr_t method_na
     if (type_sym->type && type_sym->type->base_type && type_sym->type->base_type->sym) {
         base_count = count_virtual_methods(type_sym->type->base_type->sym);
     }
+    int want = method_declared_param_count(method_sym);
     int idx = base_count;
     for (int i = 0; i < type_sym->member_count; i++) {
-        if (type_sym->members[i]->kind == SYM_METHOD &&
-            (type_sym->members[i]->modifiers & MOD_VIRTUAL) &&
-            !(type_sym->members[i]->modifiers & MOD_OVERRIDE)) {
-            if (type_sym->members[i]->name.len == method_name.len &&
-                memcmp(type_sym->members[i]->name.str, method_name.str, method_name.len) == 0) {
+        zan_symbol_t *m = type_sym->members[i];
+        if (m->kind == SYM_METHOD &&
+            (m->modifiers & MOD_VIRTUAL) &&
+            !(m->modifiers & MOD_OVERRIDE)) {
+            /* a resolved override has no slot of its own: it takes the base
+             * declaration's slot, which the (name, declared arity) pair
+             * identifies -- exactly the key resolve_overload used when the
+             * vtable was filled with the most-derived implementation */
+            if (member_name_is(m, method_sym->name) &&
+                method_declared_param_count(m) == want) {
                 return idx;
             }
             idx++;

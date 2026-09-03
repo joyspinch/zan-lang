@@ -296,7 +296,12 @@ static LLVMValueRef emit_dispatch_call(zan_irgen_t *g, zan_symbol_t *static_sym,
         (method_sym->modifiers & (MOD_VIRTUAL | MOD_OVERRIDE)) &&
         class_has_virtual_methods(static_sym) && argc >= 1 && call_args[0] &&
         LLVMGetTypeKind(LLVMTypeOf(call_args[0])) == LLVMPointerTypeKind) {
-        int slot = get_virtual_method_index(static_sym, method_sym->name);
+        /* the slot key includes the resolved overload's declared arity:
+         * overloaded virtuals occupy one slot per distinct declaration, so
+         * matching the name alone dispatched every same-named call through
+         * the first-declared overload's slot (x.F(1,2,3,4) ran the 2-param
+         * F's body; the extra args were silently dropped by the bitcast). */
+        int slot = get_virtual_method_index(static_sym, method_sym);
         LLVMTypeRef st = get_struct_llvm_type(g, static_sym);
         if (slot >= 0 && st) {
             LLVMBuilderRef b = g->builder;
