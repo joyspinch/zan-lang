@@ -7,12 +7,14 @@ namespace Gui.Component.Chart;
 partial class ChartView {
     // ---- 弦图（ECharts type 'chord'；外环节点弧 + 连接 ribbon） ----
 
-    // 力导向布局的逐帧记忆化：布局是数据与几何的纯函数（局部
-    // 坐标，与卡片在屏幕上的位置无关），即时模式调用方每帧重建
-    // option，按内容指纹复用同一次弹簧模拟，滚动/悬停帧不再
-    // 重算 O(n²) 迭代。小容量即可——同屏一般只有一两个力导向图。
+    /// 力导向布局的逐帧记忆化：布局是数据与几何的纯函数（局部
+    /// 坐标，与卡片在屏幕上的位置无关），即时模式调用方每帧重建
+    /// option，按内容指纹复用同一次弹簧模拟，滚动/悬停帧不再
+    /// 重算 O(n²) 迭代。小容量即可——同屏一般只有一两个力导向图。
     static List<ForceLayoutCache> forceCache;
 
+    /// 力导向布局的内容指纹：几何参数与全部 link 的 (from, to, val)
+    /// 依次折叠进一个 < 2^31 的整数，供 ForceLayoutCache 复用比对。
     static int ForceFingerprint(List<ChartLink> links, int r, int w, int h,
                                 int scaling, int gravity) {
         int fp = (r * 17 + w * 19 + h * 23 + scaling * 29 + gravity * 31) % 2000000000;
@@ -25,6 +27,9 @@ partial class ChartView {
         return fp;
     }
 
+    /// 带记忆化的力导向布局入口：指纹命中缓存直接复用上一次的
+    /// ForceLayout，未命中才重算并存入（容量 4，挤掉最旧）；
+    /// 空 links 直接布局、不入缓存。
     static ForceLayout CachedForceLayout(List<ChartLink> links,
                                          int r, int w, int h,
                                          int scaling, int gravity) {
@@ -40,6 +45,13 @@ partial class ChartView {
         return layout;
     }
 
+    /// 弦图渲染入口：ChordLayout 输出的节点弧与 ribbon；图例为
+    /// 节点色块（LegendSliceKey 持久化隐藏，悬停图例即高亮对应
+    /// 弧）。节点弧随 g 扫入（sweepMax）；悬停优先命中外环带内
+    /// 的节点弧，其次按贝塞尔折线逐段测距命中 ribbon，命中节点
+    /// 时相关 ribbon/弧加亮。命中为 Node（value = 权重）或 Link
+    /// （dataName = "from -> to"，value = 流量）事件 + tooltip；
+    /// markPoint 画在权重最大节点弧外侧（"max N"）。
     static void DrawChord(App app, int x, int y, int w, int h,
                           ChartOption o, int g) {
         Canvas c = app.canvas;
@@ -338,6 +350,8 @@ partial class ChartView {
         }
     }
 
+    /// 把 [a0,a1] 弧离散成像素点列追加进 px/py；步数约 span/2，
+    /// 钳在 4..48。
     static void AppendArcPts(List<int> px, List<int> py,
                              int cx, int cy, int r, int a0, int a1) {
         int span = a1 - a0;
@@ -352,6 +366,8 @@ partial class ChartView {
         }
     }
 
+    /// 把以 (cx,cy) 为控制点的二次贝塞尔（(x1,y1)→(x2,y2)）按
+    /// 16 段离散追加进 px/py（不含起点）。
     static void AppendQuadPts(List<int> px, List<int> py,
                               int x1, int y1, int cx, int cy, int x2, int y2) {
         int segs = 16;
@@ -363,6 +379,8 @@ partial class ChartView {
         }
     }
 
+    /// 以 (cx,cy) 为控制点描 (x1,y1)→(x2,y2) 的二次贝塞尔
+    /// （24 段折线，1/256 定点输出）。
     static void StrokeQuad(Canvas c, int x1, int y1, int cx, int cy,
                            int x2, int y2, int color, int th) {
         List<int> fx = new List<int>();
@@ -381,6 +399,8 @@ partial class ChartView {
         c.DrawPolylineFx(fx, fy, color, th);
     }
 
+    /// 填充一条弦图 ribbon：源/目标子弧加两条贝塞尔边围成的闭合
+    /// 区域（winding 填充 + 半透明描边）；空子弧钳到 1 度。
     static void FillChordRibbon(Canvas c, int cx, int cy, int r,
                                 int sa0, int sa1, int da0, int da1,
                                 int color, int alpha) {
@@ -404,7 +424,7 @@ partial class ChartView {
         ChartView.StrokePolyFx(c, px, py, Chart.WithAlpha(color, alpha + 50), 1);
     }
 
-    // 角度（FillSector 约定，0 = 12 点）是否落在 [a0,a1)（含跨 0 回绕）。
+    /// 角度（FillSector 约定，0 = 12 点）是否落在 [a0,a1)（含跨 0 回绕）。
     static bool InSweep(int ang, int a0, int a1) {
         if (a1 > a0) { return ang >= a0 && ang < a1; }
         return ang >= a0 || ang < a1;
@@ -412,6 +432,12 @@ partial class ChartView {
 
     // ---- 力导向图（ECharts type 'force'；边 + 节点 + 标签） ----
 
+    /// 力导向图渲染入口：CachedForceLayout 在局部坐标里布局，
+    /// 绘制与命中统一平移回屏幕；g<1000 时节点位取圆周初值→
+    /// 终态的线性补间。边宽 ∝ 流量，悬停节点相邻边高亮；节点
+    /// 形状/尺寸经 ApplyShapes 按 series.tree 逐节点匹配。右侧
+    /// 图例每节点一行（LegendSliceKey 持久化隐藏）。命中为 Node
+    /// 事件（value = 节点权重，半径含 2px 容差）+ tooltip。
     static void DrawForce(App app, int x, int y, int w, int h,
                           ChartOption o, int g) {
         Canvas c = app.canvas;

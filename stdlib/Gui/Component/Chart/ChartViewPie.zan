@@ -18,6 +18,8 @@ class PieSlice {
     int ring;
     bool selected;  // data.selected：静态选中，绘制时外偏 selectedOffset
 
+    /// 构造扇区：值/色/名/系列与数据项下标/角度区间/环号按参数
+    /// 记录，selected 初始为 false（由 PieLayout 按 data.selected 置位）。
     static PieSlice Of(int value, int color, string name,
                        int seriesIndex, int dataIndex, int a0, int a1, int ring) {
         PieSlice s = new PieSlice();
@@ -55,6 +57,10 @@ class PieLayout {
     List<int> ringInner; // 每环有效内径百分比（innerPct>0 ? innerPct : donutPct）
     int rot;            // 起始边顺时针偏移（度）：90 - series.startAngle
 
+    /// 归一化布局入口：收集可见 Pie 系列的全部正值非隐藏数据项；
+    /// 环模式（pieRings）逐环独立 total，合并模式共享 total；
+    /// startAngle 换算为起始边顺时针偏移 rot。无可见 Pie 系列
+    /// 或 total < 1 时返回空布局。
     static PieLayout Of(Theme t, ChartOption o) {
         PieLayout l = new PieLayout();
         l.slices = new List<PieSlice>();
@@ -197,10 +203,15 @@ partial class ChartView {
         return raw;
     }
 
+    /// 是否配置了任何 emphasis paint（填充/边框色/边框宽任一
+    /// 非零）；全零时命中不重画高亮。
     static bool PieHasEmphasisPaint(int fill, int borderColor, int borderWidth) {
         return fill != 0 || borderColor != 0 || borderWidth > 0;
     }
 
+    /// 计算第 ring 环（0 = 最外）的内外径：非最内环 ri = ro - band；
+    /// 最内环内孔 = ringInner% × rOuter（0 = 实心，钳到 ro-minGap）；
+    /// 结果保证 0 <= ri < ro。绘制与命中必须同用本函数。
     static void PieRingBounds(PieLayout layout, int ring, int ringCount,
                               int rOuter, int band, int minGap,
                               out int ri, out int ro) {
@@ -223,6 +234,11 @@ partial class ChartView {
         if (ri < 0) { ri = 0; }
     }
 
+    /// 饼图/环图渲染入口：上方数据图例（LegendSliceKey 可点击
+    /// 开关扇区），主体按 PieLayout 扇区绘制（入场扫掠随 g，
+    /// 选中/悬停扇区沿中角外偏）；随后是百分比标签/引导线、
+    /// markPoint 极值标注、环图中心标注、扇区命中（PieSelected
+    /// 点击 + emphasis 重画）与 tooltip。
     static void DrawPie(App app, int x, int y, int w, int h,
                         ChartOption o, bool sliceLabels, int g) {
         Canvas c = app.canvas;
@@ -693,16 +709,19 @@ partial class ChartView {
         return start;
     }
 
+    /// ChartScalar -> 像素：百分比标量按 extent 取比例，固定值
+    /// 标量按 DPI 缩放。
     static int GaugeScalar(App app, ChartScalar scalar, int extent) {
         if (scalar.percent) { return extent * scalar.amount / 100; }
         return app.Scale(scalar.amount);
     }
 
-    // FillSector 以 12 点钟方向为 0 度并顺时针递增。保持
-    // 仪表盘的矢量几何处于同一坐标系。
+    /// FillSector 以 12 点钟方向为 0 度并顺时针递增。保持
+    /// 仪表盘的矢量几何处于同一坐标系。
     static int GaugeX(int angle) { return ChartView.SinDeg(angle); }
     static int GaugeY(int angle) { return 0 - ChartView.CosDeg(angle); }
 
+    /// 以 (start, sweep) 画仪表弧段；跨 0° 时拆成两段 FillSector。
     static void GaugeSector(Canvas c, int cx, int cy, int inner, int outer,
                             int start, int sweep, int color) {
         if (sweep <= 0 || outer <= inner) { return; }
@@ -715,6 +734,8 @@ partial class ChartView {
         if (rest > 0) { c.FillSector(cx, cy, inner, outer, 0, rest, color); }
     }
 
+    /// 千分比进度对应的轴带色阶色：取第一个 stop >= perMille 的
+    /// 色阶，超出取末档；未配色阶返回 0。
     static int GaugeColor(GaugeOption gauge, int perMille) {
         for (int i = 0; i < gauge.axisLine.colors.Count; i = i + 1) {
             GaugeColorStop stop = gauge.axisLine.colors[i];
@@ -743,6 +764,10 @@ partial class ChartView {
         return size;
     }
 
+    /// 仪表盘渲染入口：每条可见 Gauge 系列一个表盘——轴带色阶
+    /// （随 g 生长）、刻度/分隔线、刻度标签、指针（含阴影）、
+    /// 标题与读数（detail 背景/边框、防重叠钳制）；整盘命中
+    /// （Gauge 事件，单数据点语义）+ tooltip。
     static void DrawGauge(App app, int x, int y, int w, int h,
                           ChartOption o, int g) {
         Canvas c = app.canvas;
@@ -1026,6 +1051,9 @@ partial class ChartView {
 
     // ---- 径向柱状图（同心进度环；扫掠角随 g 增长） ----
 
+    /// 径向柱状图渲染入口：每条系列一个同心进度环（环序自外向
+    /// 内），扫掠角 = 值/gaugeMax 并随 g 生长；右侧值图例 +
+    /// 环带 hover tooltip。
     static void DrawRadialBars(App app, int x, int y, int w, int h,
                                ChartOption o, int g) {
         Canvas c = app.canvas;
@@ -1110,8 +1138,8 @@ partial class ChartView {
     }
 
     // ---- 热力图（行=序列，列=数值索引；强度随 g 渐显） ----
-    // 收集漏斗/金字塔/玫瑰图各阶段：每阶段一个值+颜色+名称，来源为
-    // 多个单值序列或一个多值序列。
+    /// 收集漏斗/金字塔/玫瑰图各阶段：每阶段一个值+颜色+名称，来源为
+    /// 多个单值系列或一个多值系列；隐藏系列/数据项被跳过。
     static List<ChartStage> GatherStages(App app, List<ChartSeries> series) {
         Theme t = app.theme;
         List<ChartStage> stages = new List<ChartStage>();
@@ -1144,6 +1172,10 @@ partial class ChartView {
 
     // ---- 漏斗图 / 金字塔图 ----
 
+    /// 漏斗（pyramid=false）/金字塔（pyramid=true，阶段序反转）
+    /// 渲染入口：阶段宽度 ∝ 值/maxV，逐行按 1/256 亚像素覆盖率
+    /// 画斜边；对齐/层间隙/转化率百分比取首系列配置；右侧可选
+    /// 图例；行命中（FunnelStage 事件）+ 横向指示线 + tooltip。
     static void DrawFunnel(App app, int x, int y, int w, int h,
                            ChartOption o, int g, bool pyramid) {
         Canvas c = app.canvas;
@@ -1291,6 +1323,7 @@ c.DrawText(labelX, labelY, lblF, Style.Part(app, "chart",
         }
     }
 
+    /// 阶段缺省名："Stage N"（N 从 1 起）。
     static string StageName(int i) { return "Stage " + Convert.ToString(i + 1); }
 
     /// 转化率（ECharts funnel 的逐层转化）：相对上一阶段的百分比
@@ -1303,6 +1336,8 @@ c.DrawText(labelX, labelY, lblF, Style.Part(app, "chart",
         return " (" + Convert.ToString(stages[idx].val * 100 / prev) + "%)";
     }
 
+    /// 横向自动换行的阶段图例（多条系列走系列开关，单系列走
+    /// 数据项开关），返回图例底部 y（图区顶部）。
     static int DrawStageLegendWrap(App app, ChartOption o, int x, int y, int w, int top) {
         int pad = app.theme.paddingMedium;
         int x0 = x + pad;
@@ -1395,6 +1430,10 @@ c.DrawText(labelX, labelY, lblF, Style.Part(app, "chart",
 
     // ---- 玫瑰图 / 南丁格尔图（等角，半径按值） ----
 
+    /// 玫瑰图/南丁格尔图渲染入口：radius 模式圆心角 ∝ 占比、
+    /// 半径线性于数值；area 模式等角、半径 ∝ √数值（面积∝数值）；
+    /// 模式与起始角取首条可见玫瑰系列。顶部换行图例 + 扇区命中
+    /// （径向指示线 + tooltip）。
     static void DrawRose(App app, int x, int y, int w, int h,
                          ChartOption o, int g) {
         Canvas c = app.canvas;
@@ -1540,11 +1579,11 @@ c.DrawText(labelX, labelY, lblF, Style.Part(app, "chart",
         }
     }
 
-    // 饼图 markPoint：在扇区中角方向延伸一个标签。线 + 圆 + 文字。
-    // idx < 0 时不画；与 SliceOutMidAngle 共享角度约定（rot + 中角），
-    // 屏幕位置按数学域 +270° 换算（与 selectOffset 路径同源）。
-    // 扇区静态选中时整体外偏 selectedOffset：引线与标签必须锚在
-    // 偏移后的圆心，否则 mark 点落在与扇区脱开的位置。
+    /// 饼图 markPoint：在扇区中角方向延伸一个标签。线 + 圆 + 文字。
+    /// idx < 0 时不画；与 SliceOutMidAngle 共享角度约定（rot + 中角），
+    /// 屏幕位置按数学域 +270° 换算（与 selectOffset 路径同源）。
+    /// 扇区静态选中时整体外偏 selectedOffset：引线与标签必须锚在
+    /// 偏移后的圆心，否则 mark 点落在与扇区脱开的位置。
     static void DrawPieMark(App app, Canvas c, int cx, int cy, int rOuter,
                             int rot, List<PieSlice> slices, int idx,
                             string lbl, Theme t, List<ChartSeries> series) {
