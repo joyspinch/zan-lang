@@ -119,8 +119,16 @@ build/zanc.exe examples/game/legend/main.zan \
 - **BOSS 立绘**：4 大教主 `assets/boss_{woma,zuma,chiyue,molong}.png`
 - **地图背景**：`assets/map_bichon.png`（比奇省）
 - **启动画面**：`assets/splash.png`（AI 生成，含 "AI生成"水印，叠层遮挡）
-- **按钮底**：`assets/btn_{dark,gold}{,_hi}.png`（4 状态，128×128 整板，九宫切 14px 边框）
-- **面板/进度条**：纯矢量绘制（`PanelImg`/`BarImg`：圆角石板 + 金色描边），不依赖贴图
+- **按钮底**：`assets/btn_{dark,gold,green}{,_hi}.png`（6 状态，128×128 整板，九宫切 14px 边框；
+  绿玉款用于强调动作，金款用于选中态）。全部按钮统一走 `BtnTex`（66 处 `Ui.Button` 已替换），
+  无贴图时才回落矢量 `Ui.Button`
+- **面板底**：`assets/panel_nine.png`（512×512，九宫切 24px 边框），`PanelImg` 优先贴图绘制
+- **列表行板**：`assets/row_plate.png`（1228×307，九宫切 40px 边框），用于面板标题条、
+  押镖/市场/地图列表行（`RowImg`）
+- **装备格**：`assets/slot.png`（128×128，九宫切 16px 边框），角色面板 12 槽装备格（`SlotImg`，
+  点击可卸下，含品阶色角标）
+- **进度条**：`assets/bar_trough.png`（1228×307，九宫切 40px 边框），`BarImg` 槽体贴图 + 矢量绿填充
+- **弹窗裁剪**：所有弹窗内容经 `ModBegin/ModEnd`（`SetClip`）裁剪在中央显示区内，不再越界
 - **货币图标**：`assets/icon_{copper,gold,iron,crystal,core}.png`（分别对应 金币/元宝/声望/灵符/积分）
 - **装备图标**：40 张 `assets/equip_c{0..7}_t{0..4}.png`，对应 8 大类 × 5 品阶
 - **音效**：`assets/{box,craft,tip,trade,up}.wav`
