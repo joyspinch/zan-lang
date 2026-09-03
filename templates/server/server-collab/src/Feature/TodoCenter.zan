@@ -1,0 +1,262 @@
+using System;
+using System.Collections;
+using System.Data;
+using System.Data.Orm;
+using ZanWeb.Model.Crm;
+using ZanWeb.Model.Flow;
+using ZanWeb.Model.Oa;
+using ZanWeb.Model.Sys;
+using ZanWeb.Model.Wms;
+using ZanWeb.Modules.Flow;
+
+namespace ZanWeb;
+
+/* 聚合待办条目：虚拟流（不入库），由各模块源实时拼出；rowId 仅 manual 源
+   使用（指向 oa_todo 真行），虚拟源为 0——完成/忽略走 (source, relatedType,
+   relatedId) 标记键。 */
+class TodoItem {
+    /* 来源注册名：manual/flow/crm/wms（视图按此取徽标文案）。 */
+    string source;
+    string title;
+    string link;
+    long dueAt;
+    string relatedType;
+    int relatedId;
+    int rowId;
+}
+
+/* 各模块待办源签名：返回"该用户当前待办流"。db/tenantId 显式传参
+   （Notify.Send / Attachment.Save 同款纪律：静态链路拿不到控制器上下文）。 */
+async delegate List<TodoItem> TodoSource(IDbConnection db, int tenantId, User me);
+
+/* 待办中心聚合器（架构 §2.4 WP-4 / T5）：模块经 TodoCenter.Register 挂源，
+   Gather 汇成一条按截止排序的流。新源（Calendar T11、form T15）只需写一个
+   TodoSource 方法 + 在 main.zan 注册一行，聚合器与聚合页零改动。 */
+class TodoCenter {
+    /* 注册序（视图分组顺序用）：Dict 不保证遍历序，模块名并行存 List。 */
+    static List<string> order = new List<string>();
+    static Dict<string, TodoSource> sources = null;
+
+    static void Init() {
+        if (TodoCenter.sources == null) {
+            TodoCenter.sources = new Dict<string, TodoSource>();
+        }
+    }
+
+    /* 模块注册：main.zan 启动时逐行挂源。 */
+    static void Register(string module, TodoSource src) {
+        TodoCenter.Init();
+        if (TodoCenter.sources.ContainsKey(module)) {
+            TodoCenter.sources.Remove(module);
+            TodoCenter.order.Remove(module);
+        }
+        TodoCenter.sources.Add(module, src);
+        TodoCenter.order.Add(module);
+    }
+
+    /* 来源是否已注册（控制器动作入参校验用）。manual 恒真。 */
+    static bool HasSource(string module) {
+        if (module == "manual") { return true; }
+        TodoCenter.Init();
+        return TodoCenter.sources.ContainsKey(module);
+    }
+
+    /* 标记键：源 + 回链类型 + 回链 id。 */
+    static string MarkKey(string source, string relatedType, int relatedId) {
+        return source + "|" + relatedType + "|" + Convert.ToString(relatedId);
+    }
+
+    /* 聚合：manual 真行 + 各虚拟源实时流，滤掉已标记完成/忽略的项目，
+       按截止时间升序（无截止排最后）。 */
+    static async List<TodoItem> Gather(IDbConnection db, int tenantId, User me) {
+        if (me == null) { return new List<TodoItem>(); }
+        List<TodoItem> items = new List<TodoItem>();
+
+        /* manual：本人真待办行直接入流。 */
+        List<OaTodo> manual = await db.Select<OaTodo>()
+            .Where(a => a.tenantId == tenantId && a.userId == me.id
+                && a.source == "manual" && a.status == 0).ToListAsync();
+        for (int i = 0; i < manual.Count; i = i + 1) {
+            OaTodo t = manual[i];
+            TodoItem it = new TodoItem();
+            it.source = "manual";
+            it.title = t.title;
+            it.link = t.link;
+            it.dueAt = t.dueAt;
+            it.relatedType = "manual";
+            it.relatedId = t.id;
+            it.rowId = t.id;
+            items.Add(it);
+        }
+
+        /* 虚拟源标记行：status=1/2 的 (source,relatedType,relatedId) 集合。 */
+        List<OaTodo> marks = await db.Select<OaTodo>()
+            .Where(a => a.tenantId == tenantId && a.userId == me.id
+                && a.status != 0 && a.source != "manual").ToListAsync();
+        Dict<string, int> done = new Dict<string, int>();
+        for (int i = 0; i < marks.Count; i = i + 1) {
+            OaTodo t = marks[i];
+            done.Add(TodoCenter.MarkKey(t.source, t.relatedType, t.relatedId),
+                t.status);
+        }
+
+        /* 逐源挂载：源内部自行按"我的"范围过滤（assignUserId/ownerId/全局）。 */
+        TodoCenter.Init();
+        for (int m = 0; m < TodoCenter.order.Count; m = m + 1) {
+            string module = TodoCenter.order[m];
+            TodoSource src = null;
+            if (!TodoCenter.sources.TryGetValue(module, out src)) { continue; }
+            List<TodoItem> part = await src(db, tenantId, me);
+            for (int i = 0; i < part.Count; i = i + 1) {
+                TodoItem it = part[i];
+                int st = 0;
+                if (done.TryGetValue(TodoCenter.MarkKey(it.source,
+                    it.relatedType, it.relatedId), out st)) { continue; }
+                items.Add(it);
+            }
+        }
+
+        /* 截止升序、无截止垫底（条目量小，插入排序足够）。 */
+        for (int i = 1; i < items.Count; i = i + 1) {
+            TodoItem it = items[i];
+            int j = i - 1;
+            while (j >= 0 && TodoCenter.Earlier(it, items[j])) {
+                items[j + 1] = items[j];
+                j = j - 1;
+            }
+            items[j + 1] = it;
+        }
+        return items;
+    }
+
+    /* a 是否应排在 b 前：有截止者优先，其次截止更早者。 */
+    static bool Earlier(TodoItem a, TodoItem b) {
+        if (a.dueAt == 0) { return false; }
+        if (b.dueAt == 0) { return true; }
+        return a.dueAt < b.dueAt;
+    }
+
+    /* 完成/忽略标记：manual 源直接改真行状态；虚拟源 upsert 一行标记
+       （同键已存在则改状态，否则插入）。返回是否命中。 */
+    static async bool Mark(IDbConnection db, int tenantId, int userId,
+                           string source, string relatedType, int relatedId,
+                           int status, string title) {
+        long now = WebApp.NowSeconds();
+        if (source == "manual") {
+            OaTodo row = await db.Select<OaTodo>()
+                .Where(a => a.tenantId == tenantId && a.userId == userId
+                    && a.id == relatedId && a.source == "manual").FirstAsync();
+            if (row == null) { return false; }
+            await db.Update<OaTodo>()
+                .Set(a => a.status, status)
+                .Set(a => a.doneAt, now)
+                .Where(a => a.id == row.id).ExecuteAffrowsAsync();
+            return true;
+        }
+        OaTodo mark = await db.Select<OaTodo>()
+            .Where(a => a.tenantId == tenantId && a.userId == userId
+                && a.source == source && a.relatedType == relatedType
+                && a.relatedId == relatedId).FirstAsync();
+        if (mark != null) {
+            await db.Update<OaTodo>()
+                .Set(a => a.status, status)
+                .Set(a => a.doneAt, now)
+                .Where(a => a.id == mark.id).ExecuteAffrowsAsync();
+            return true;
+        }
+        OaTodo t = new OaTodo();
+        t.tenantId = tenantId;
+        t.userId = userId;
+        t.source = source;
+        t.title = Fmt.Text(title, "待办");
+        t.link = "";
+        t.dueAt = 0;
+        t.status = status;
+        t.relatedType = Fmt.Text(relatedType, "0");
+        t.relatedId = relatedId;
+        t.createdAt = now;
+        t.doneAt = now;
+        await db.Insert<OaTodo>(t).ExecuteAffrowsAsync();
+        return true;
+    }
+}
+
+/* 既有三模块的待办源（T5 注册）。 */
+class TodoSources {
+    /* Flow：流转到我头上的未完成任务；办结以 flow_task.status 为准
+       （完成即从源消失，自然同步，无需标记行）。 */
+    static async List<TodoItem> Flow(IDbConnection db, int tenantId, User me) {
+        List<TodoItem> items = new List<TodoItem>();
+        List<FlowTask> tasks = await db.Select<FlowTask>()
+            .Where(a => a.assignUserId == me.id && a.status == 0).ToListAsync();
+        if (tasks.Count == 0) { return items; }
+        List<FlowInst> insts = await db.Select<FlowInst>().ToListAsync();
+        for (int i = 0; i < tasks.Count; i = i + 1) {
+            FlowTask t = tasks[i];
+            TodoItem it = new TodoItem();
+            it.source = "flow";
+            it.title = "流程审批：" + Engine.InstTitle(insts, t.instId);
+            it.link = "/admin/flow/tasks/detail?id="
+                + Convert.ToString(t.id);
+            it.dueAt = 0;
+            it.relatedType = "flow_task";
+            it.relatedId = t.id;
+            it.rowId = 0;
+            items.Add(it);
+        }
+        return items;
+    }
+
+    /* CRM：我名下未结商机且预期成交日在未来一周内——到期跟进提醒。 */
+    static async List<TodoItem> Crm(IDbConnection db, int tenantId, User me) {
+        List<TodoItem> items = new List<TodoItem>();
+        long horizon = WebApp.NowSeconds() + 7 * 86400;
+        List<CrmOpportunity> rows = await db.Select<CrmOpportunity>()
+            .Where(a => a.ownerId == me.id && a.stage >= 1 && a.stage <= 4
+                && a.expectedCloseAt > 0 && a.expectedCloseAt <= horizon)
+            .OrderBy(a => a.expectedCloseAt).ToListAsync();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            CrmOpportunity o = rows[i];
+            TodoItem it = new TodoItem();
+            it.source = "crm";
+            it.title = "商机跟进：" + o.title;
+            it.link = "/admin/crm/opportunities";
+            it.dueAt = o.expectedCloseAt;
+            it.relatedType = "crm_opportunity";
+            it.relatedId = o.id;
+            it.rowId = 0;
+            items.Add(it);
+        }
+        return items;
+    }
+
+    /* WMS：库存不高于补货阈值（Settings "wms.reorder.qty"，默认 10）的
+       补货项。全局运营项，登录即可见（阈值属运营配置，不做个人范围）。 */
+    static async List<TodoItem> Wms(IDbConnection db, int tenantId, User me) {
+        List<TodoItem> items = new List<TodoItem>();
+        long threshold = Filter.ToInt(await Settings.Get("wms.reorder.qty",
+            "10"), 10);
+        List<WmsInventory> rows = await db.Select<WmsInventory>()
+            .Where(a => a.qty <= threshold).ToListAsync();
+        if (rows.Count == 0) { return items; }
+        List<WmsSku> skus = await db.Select<WmsSku>().ToListAsync();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            WmsInventory inv = rows[i];
+            string name = Convert.ToString(inv.skuId);
+            for (int k = 0; k < skus.Count; k = k + 1) {
+                if (skus[k].id == inv.skuId) { name = skus[k].name; break; }
+            }
+            TodoItem it = new TodoItem();
+            it.source = "wms";
+            it.title = "库存补货：" + name + "（余 "
+                + Convert.ToString(inv.qty) + "）";
+            it.link = "/admin/wms/inventory";
+            it.dueAt = 0;
+            it.relatedType = "wms_inventory";
+            it.relatedId = inv.id;
+            it.rowId = 0;
+            items.Add(it);
+        }
+        return items;
+    }
+}

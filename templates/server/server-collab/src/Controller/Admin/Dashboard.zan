@@ -1,13 +1,17 @@
 using System;
 using System.Data;
+using System.Data.Orm;
 using System.Json;
 using System.Web;
 using ZanWeb;
 using ZanWeb.Model.Flow;
+using ZanWeb.Model.Sys;
 
 namespace ZanWeb.Admin;
 
-/* /admin 仪表盘：系统当前持有的内容与运行状态；实时数字与监控同取一份快照，经 metrics 事件流推送，避免定时重载。 */
+/* /admin 仪表盘（架构 §2.4 WP-4 / T5）：首屏三卡片——我的待办聚合
+   （Feature.TodoCenter.Gather 真数据）、我的日程、公告（后两者为空态
+   占位，T11/T12 接线）。运维指标收进管理员折叠区；登录记录保留。 */
 [Route("admin/[controller]/[action]")]
 [Custom(Authorization = CustomAuthorization.Login)]
 [Description("仪表盘")]
@@ -18,7 +22,9 @@ class Dashboard : AdminController {
     [Custom(IsMenu = true, Icon = "mdi:gauge")]
     [Description("仪表盘")]
     async void Index() {
+        User me = await this.Admin();
         ViewData d = await this.Layout("仪表盘");
+        d.Set("isSuper", me != null && me.isSuper == 1 ? "1" : "");
 
         JsonValue m = JsonValue.ParseLenient(WebHost.Current().MetricsJson());
         JsonValue req = m.Get("requests");
@@ -30,7 +36,6 @@ class Dashboard : AdminController {
         d.Set("uptime", Fmt.Uptime(m.Long("uptime_ms", 0)));
 
         d.Set("users", "—");
-        d.Set("flowTodo", "—");
         if (this.DbReady()) {
             DataScope sc = await this.Scope();
             List<int> scoped = sc.Depts();
@@ -41,13 +46,27 @@ class Dashboard : AdminController {
                 .CountAsync();
             d.Set("users", Convert.ToString(users));
 
-            /* 我的待办数：流程任务落在当前账号头上的未完成件。 */
-            User me = await this.Admin();
+            /* 我的待办聚合：manual 真行 + flow/crm/wms 实时流，Gather 内
+               已按截止排序并滤掉完成/忽略标记。首屏取前 8 条，全量在
+               /admin/oa/todocenter。 */
             if (me != null) {
-                int todo = await this.FlowTask
-                    .Where(a => a.assignUserId == me.id && a.status == 0)
-                    .CountAsync();
-                d.Set("flowTodo", Convert.ToString(todo));
+                List<TodoItem> items = await ZanWeb.TodoCenter.Gather(
+                    this.Held(), this.TenantId(), me);
+                long now = WebApp.NowSeconds();
+                int top = items.Count > 8 ? 8 : items.Count;
+                List<StrMap> trows = d.AddList("todos");
+                for (int i = 0; i < top; i = i + 1) {
+                    TodoItem it = items[i];
+                    StrMap row = new StrMap();
+                    row.Set("src", Dashboard.SrcText(it.source));
+                    row.Set("title", it.title);
+                    row.Set("link", it.link.Length > 0 ? it.link : "#");
+                    row.Set("due", it.dueAt > 0 ? Fmt.Day(it.dueAt) : "—");
+                    row.Set("overdue", it.dueAt > 0 && it.dueAt < now ? "1" : "");
+                    trows.Add(row);
+                }
+                d.Set("hasTodos", items.Count > 0 ? "1" : "");
+                d.Set("todoCount", Convert.ToString(items.Count));
             }
 
             /* 登录记录按用户名匹配（非归属）：一条登录行写于对应账号确认之前，故用本 scope 覆盖的用户名匹配——与登录日志屏同一规则。 */
@@ -82,6 +101,14 @@ class Dashboard : AdminController {
             d.Set("dbDown", "1");
         }
         this.Page(d);
+    }
+
+    static string SrcText(string source) {
+        if (source == "manual") { return "个人"; }
+        if (source == "flow") { return "流程"; }
+        if (source == "crm") { return "商机"; }
+        if (source == "wms") { return "库存"; }
+        return source;
     }
 
     static string OkText(int ok) {
