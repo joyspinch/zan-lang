@@ -41,7 +41,9 @@ class Tar {
     static extern int PlatFclose(nint fp);
 
     /// <summary>在内存中构建 tar 归档。目录条目应
-    /// 标记 isDirectory（或名称以 "/" 结尾）。</summary>
+    /// 标记 isDirectory（或名称以 "/" 结尾）。mode 为 0 时文件取 0644、
+    /// 目录取 0755；超过 100 字节的路径按 ustar 规则拆入 prefix 字段，
+    /// 无法拆分时截断到 100 字节。归档以两个 512 字节零块结尾。</summary>
     static byte[] Create(List<TarEntry> entries) {
         // 每个头部 512 字节；数据按 512 字节边界补齐。
         int total = 1024;   // 结尾的两个零块
@@ -69,7 +71,10 @@ class Tar {
         return out2;
     }
 
-    /// <summary>读取 tar 归档中的所有条目（含数据）。</summary>
+    /// <summary>读取 tar 归档中的所有条目（含数据）。逐块校验头部
+    /// 校验和；归档损坏（校验和不符、size 越界）返回 null。普通文件
+    /// 与目录照常解析，符号链接/设备等特殊条目 data 为 null、
+    /// isDirectory 为 false。</summary>
     static List<TarEntry> Read(byte[] tar) {
         List<TarEntry> entries = new List<TarEntry>();
         int pos = 0;
@@ -96,6 +101,7 @@ class Tar {
             if ((long)pos + 512 + dataLen > tar.Length) { return null; }
             TarEntry e = new TarEntry(name);
             e.mode = Tar.ParseOctal(tar, pos + 100, 8);
+            e.mtime = Tar.ParseSize(tar, pos + 136);
             if (type == 53) {                      // '5' = 目录
                 e.isDirectory = true;
             } else if (type == 0 || type == 48) {  // 普通文件（'0' 或 NUL）
@@ -114,6 +120,10 @@ class Tar {
         return entries;
     }
 
+    /// <summary>写出 512 字节 ustar 头部：长路径按「最靠前的 '/' 且
+    /// 名称部分 ≤100、前缀 ≤155」拆入 prefix 字段（无法拆分时截断）；
+    /// 目录 typeflag '5'、普通文件 '0'；uid/gid/devmajor/devminor 恒 0；
+    /// 末尾写校验和。mode 为 0 时按条目类型取默认权限。</summary>
     static void WriteHeader(byte[] b, int off, TarEntry e) {
         // 名称（100）+ 前缀（155）拆分，用于长路径。
         string name = e.name;
@@ -162,6 +172,8 @@ class Tar {
         Tar.WriteOctal(b, off + 148, sum, 8);
     }
 
+    /// <summary>头部校验和：512 字节求和，校验和字段本身按 8 个
+    /// 空格（0x20）计入——与读取端 ParseOctal 的期望一致。</summary>
     static int HeaderSum(byte[] b, int off) {
         int sum = 0;
         for (int i = 0; i < 512; i = i + 1) {
@@ -205,6 +217,8 @@ class Tar {
         return s;
     }
 
+    /// <summary>按 POSIX 写八进制字段：右对齐、末字节为 NUL 终止符、
+    /// 其余高位补空格；值为 0 时写单个 '0'。</summary>
     static void WriteOctal(byte[] b, int off, long v, int fieldLen) {
         // 八进制数字右对齐，最后一个字节为终止符（NUL）。
         char[] digits = new char[fieldLen];
@@ -227,6 +241,9 @@ class Tar {
         }
     }
 
+    /// <summary>解析八进制字段，忽略非八进制字符（兼容空格填充与
+    /// GNU 的 base-256 形态首字节被当作无效跳过——仅适用于 mode 等
+    /// int 范围内的字段；size 用 <see cref="ParseSize"/>）。</summary>
     static int ParseOctal(byte[] b, int off, int fieldLen) {
         int v = 0;
         for (int i = 0; i < fieldLen; i = i + 1) {
@@ -238,8 +255,9 @@ class Tar {
         return v;
     }
 
-    /// size 字段（12 位八进制）可能超过 int 范围，必须用 long
-    /// 累计，否则攻击者把 32 位截断值写进 size 就能绕过边界检查。
+    /// <summary>size 字段（12 位八进制）可能超过 int 范围，必须用
+    /// long 累计，否则攻击者把 32 位截断值写进 size 就能绕过边界
+    /// 检查。mtime 等大数值字段同样经此解析。</summary>
     static long ParseSize(byte[] b, int off) {
         long v = 0;
         for (int i = 0; i < 12; i = i + 1) {
@@ -323,7 +341,10 @@ class Tar {
         return count;
     }
 
-    // 归档内路径必须是相对路径且不含 ".." 段，否则解包会写到目标目录之外。
+    /// <summary>归档内路径防逃逸检查：必须是相对路径、无盘符、
+    /// 不含 ".." 段。注意 "\\" 仅在段边界处当分隔符参与 ".." 判定，
+    /// 普通段内的反斜杠不拒绝——Windows 上会原样成为文件名的一部分。
+    /// 非法时返回 false。</summary>
     static bool SafeName(string name) {
         if (name.Length == 0) { return false; }
         int c0 = name[0] & 255;
@@ -352,7 +373,8 @@ class Tar {
         return last;
     }
 
-    // 把条目数据（size 字节）写到 outPath；失败返回 false。
+    /// <summary>把条目数据（size 字节）按 64 KiB 分块写到 outPath；
+    /// 打不开目标文件或读写出错返回 false（目标文件可能已截断）。</summary>
     static bool WriteMember(nint fp, byte[] buf, string outPath, long size) {
         nint ofp = PlatFopen(outPath, "wb");
         if (ofp == 0) { return false; }

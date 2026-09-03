@@ -220,8 +220,9 @@ class MySqlSyncConnection : IDbConnection {
     // ============================================================
 
     /// <summary>使用 wire 协议在阻塞套接字上打开原生 MySQL/MariaDB 连接。
-    /// 失败时返回 null；<see cref="GetError"/> 携带
-    /// 失败原因。</summary>
+    /// 成功时连接已通过握手认证；失败时返回的对象 connected=false，
+    /// <see cref="GetError"/> 携带失败原因。常规入口是
+    /// <see cref="DbConnection.OpenMySQL"/> 工厂，本方法用于显式构造。</summary>
     static MySqlSyncConnection OpenParams(string host, int port,
             string database, string user, string password) {
         Socket.Initialize();
@@ -778,38 +779,53 @@ class MySqlSyncConnection : IDbConnection {
     // IDbExecutor / IDbConnection
     // ============================================================
 
+    /// <summary>带参数的查询：走 COM_STMT_PREPARE / COM_STMT_EXECUTE
+    /// 二进制协议，值带外传输、注入免疫。SQL 文本首次出现时预编译并
+    /// 缓存（每连接最多 32 条，超出后 LRU 淘汰并关闭最旧语句），同一
+    /// SQL 再次执行直接复用服务器语句句柄。</summary>
     DbResult Query(string sql, DbParams prms) {
         return this.queryParams(sql, prms);
     }
 
+    /// <summary>执行语句，返回受影响行数；语句出错时返回 -1
+    /// （错误详情见 <see cref="GetError"/>）。受 CLIENT_FOUND_ROWS
+    /// 影响，UPDATE/DELETE 报告匹配行数（值未变也算命中）。</summary>
     int Execute(string sql, DbParams prms) {
         DbResult r = this.queryParams(sql, prms);
         if (this.hadError) { return -1; }
         return this.lastAffected;
     }
 
+    /// <summary>无参数查询，走 COM_QUERY 文本协议。SELECT 返回结果集，
+    /// 行数记入受影响行数；出错时结果为空且 hadError=true。</summary>
     DbResult Query(string sql) {
         return this.querySync(sql);
     }
 
+    /// <summary>执行语句，返回受影响行数（语义同带参版本）；
+    /// 出错时返回 -1。</summary>
     int Execute(string sql) {
         DbResult r = this.querySync(sql);
         if (this.hadError) { return -1; }
         return this.lastAffected;
     }
 
+    /// <summary>取结果集第一行第一列的值（字符串形式）；无行或值为
+    /// NULL 时返回 ""。</summary>
     string ExecuteScalar(string sql) {
         DbResult r = this.querySync(sql);
         if (r.RowCount() > 0) { return r.GetString(0, 0); }
         return "";
     }
 
+    /// <summary>带参数的 ExecuteScalar（语义同无参版本）。</summary>
     string ExecuteScalar(string sql, DbParams prms) {
         DbResult r = this.queryParams(sql, prms);
         if (r.RowCount() > 0) { return r.GetString(0, 0); }
         return "";
     }
 
+    /// <summary>驱动标识，恒为 <see cref="DbProvider.MySQL"/>。</summary>
     int GetProvider() {
         return DbProvider.MySQL;
     }
@@ -819,7 +835,7 @@ class MySqlSyncConnection : IDbConnection {
         return this.lastError;
     }
 
-    /// <summary>在当前会话上开启事务。</summary>
+    /// <summary>在当前会话上开启事务（START TRANSACTION）。</summary>
     // ===== 协程孪生方法 =====
     // 该驱动的 IO 是同步的，所以这里仅转发。提供这些方法是为了让调用方
     // （以及生成的 ORM 终端）能对所有驱动统一使用异步调用链，
@@ -842,10 +858,14 @@ class MySqlSyncConnection : IDbConnection {
     /// <summary>回滚当前事务。</summary>
     void Rollback() { this.Execute("ROLLBACK"); }
 
+    /// <summary>连接是否仍处于打开状态。查询中途服务器断开也会把
+    /// 状态置为 false。</summary>
     bool IsConnected() {
         return this.connected;
     }
 
+    /// <summary>关闭套接字并清空预编译语句缓存。重复调用安全；
+    /// 未连接时也只做缓存清理。</summary>
     void Close() {
         if (this.connected || this.sock >= 0) {
             Socket.Close(this.sock);
