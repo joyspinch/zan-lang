@@ -51,6 +51,7 @@ class DbRegistry {
     static extern int KillSignal(int pid, int sig);
     #endif
 
+    /// 私有构造；统一经 <see cref="Attach"/> 创建。
     DbRegistry() {
         this.dbName = "";
         this.slot = -1;
@@ -102,6 +103,8 @@ class DbRegistry {
         return r;
     }
 
+    /// 共享内存注册表是否可用；不可用时（如平台不支持）所有
+    /// 发布/查询方法退化为单进程语义。
     bool IsShared() { return this.table.IsOpen(); }
 
     /// <summary>当前打开该数据库的进程数。</summary>
@@ -118,6 +121,7 @@ class DbRegistry {
         return this.table.GetIntAt(this.wtxnHash, "txn");
     }
 
+    /// 写入者在提交后发布新的事务 id（注册表不可用时无操作）。
     void PublishTxn(long txnid) {
         if (!this.table.IsOpen()) { return; }
         this.table.SetIntAt(this.wtxnHash, "txn", txnid);
@@ -134,6 +138,7 @@ class DbRegistry {
         return true;
     }
 
+    /// 释放写入互斥锁；未持有时无操作。
     void UnlockWrite() {
         if (!this.locked) { return; }
         this.lockFile.Unlock();
@@ -142,10 +147,13 @@ class DbRegistry {
 
     // ===== 读取者表 =====
 
+    /// 第 index 个读取者槽位的哈希键。
     long HashOfSlot(int index) {
         return SharedTable.Hash(this.dbName + "#r" + Convert.ToString(index));
     }
 
+    /// 进程是否存活：pid 0 视为死亡、本进程恒存活；
+    /// Windows 用 OpenProcess 探测，POSIX 用 kill(pid, 0)。
     bool Alive(int otherPid) {
         if (otherPid == 0) { return false; }
         if (otherPid == this.pid) { return true; }
@@ -214,6 +222,8 @@ class DbRegistry {
         return oldest;
     }
 
+    /// 释放写锁、撤销本进程的读取者槽位、递减进程计数，
+    /// 并关闭共享内存与锁文件。
     void Close() {
         UnlockWrite();
         if (this.slot >= 0 && this.table.IsOpen()) {

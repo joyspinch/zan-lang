@@ -3,15 +3,22 @@ using System.Data;
 
 namespace System.Data.Redis;
 
+/// <summary>
+/// Redis 客户端连接池：复用空闲连接、限制并发连接数，饱和时
+/// 以协程挂起等待归还（有界，超时返回 null）。建连失败的路径
+/// 带退避，避免后端不可达时每次获取都重试建连。
+/// </summary>
 class RedisPool {
     string host;
     int port;
     int connectTimeoutMs;
     PoolCore<RedisClient> core;
 
+    /// 以默认 3000ms 连接超时构建池。
     RedisPool(string host, int port, int maxSize) : this(host, port, maxSize, 3000) {
     }
 
+    /// 以显式连接超时（毫秒）构建池。
     RedisPool(string host, int port, int maxSize, int connectTimeoutMs) {
         this.host = host;
         this.port = port;
@@ -19,6 +26,8 @@ class RedisPool {
         this.core = new PoolCore<RedisClient>(maxSize);
     }
 
+    /// 新建一个客户端并用 PING 验证可用性；任何失败都关闭连接并
+    /// 返回 null（不抛出，由调用方记录建连失败）。
     async RedisClient OpenOne() {
         RedisClient client = await RedisClient.ConnectAsync(
             this.host, this.port, this.connectTimeoutMs);
@@ -87,6 +96,8 @@ class RedisPool {
         return null;
     }
 
+    /// 归还一个客户端：池已关闭或连接已死时无条件 Close 并剔除
+    /// （否则套接字泄漏），否则放回空闲列表。null 安全。
     void Release(RedisClient client) {
         if (client == null) { return; }
         if (this.core.IsClosed() || !client.IsConnected()) {
@@ -98,12 +109,20 @@ class RedisPool {
         this.core.Pool(client);
     }
 
+    /// 空闲连接数。
     int IdleCount() { return this.core.IdleCount(); }
+    /// 存活连接数（空闲 + 已借出）。
     int LiveCount() { return this.core.LiveCount(); }
+    /// 正在等待归还的协程数。
     int WaitingCount() { return this.core.WaitingCount(); }
+    /// 并发连接上限。
     int MaxSize() { return this.core.MaxSize(); }
+    /// 池是否已被关闭。
     bool IsClosed() { return this.core.IsClosed(); }
 
+    /// 关闭池：关闭所有空闲连接并唤醒全部等待者
+    /// （它们从 AcquireAsync 得到 null）。已借出的连接在
+    /// Release 时关闭。
     void Close() {
         this.core.MarkClosed();
         RedisClient client = this.core.TakeIdle();

@@ -68,6 +68,7 @@ class PrinterSettings {
     [DllImport("winspool", EntryPoint = "GetDefaultPrinterW")]
     static extern int GetDefaultPrinterW(nint buffer, nint chars);
 
+    /// EnumPrintersW（PRINTER_INFO_4）两段式枚举：先探缓冲区大小再取数据。
     static List<string> WinInstalledPrinters() {
         List<string> printers = new List<string>();
         nint neededOut = NativeMemory.Alloc(4);
@@ -107,20 +108,31 @@ class PrinterSettings {
 /// StartPage/Write/EndPage/EndDoc/Close 按此顺序调用；失败路径用
 /// Abort 替代 EndDoc。一个文档一页一份数据的简化协议。</summary>
 internal interface IRawPrinterBackend {
+    /// 打开与打印机的连接；失败返回 false。
     bool Open(string printerName);
+    /// 开始一个 RAW 文档；失败返回 false。
     bool StartDoc(string documentName);
+    /// 开始一页；失败返回 false。
     bool StartPage();
+    /// 写入一页数据，返回实际写入的字节数；失败返回 -1。
     int Write(byte[] data);
+    /// 结束当前页；失败返回 false。
     bool EndPage();
+    /// 正常结束文档并提交打印；失败返回 false。
     bool EndDoc();
+    /// 放弃当前文档（StartDoc 成功而后续失败时替代 EndDoc）。
     void Abort();
+    /// 关闭连接；关闭失败时整体结果按失败计。
     bool Close();
 }
 
 #if WINDOWS
+/// <summary>winspool RAW 后端：协议各步一一对应 OpenPrinterW/
+/// StartDocPrinterW/WritePrinter 等 spooler 调用。</summary>
 internal class WinRawPrinterBackend : IRawPrinterBackend {
     nint handle;
 
+    /// OpenPrinterW 打开打印机；调用成功且句柄非 0 才返回 true。
     bool Open(string printerName) {
         nint printerNameW = Wide.Of(printerName);
         nint handleOut = NativeMemory.Alloc(8);
@@ -132,6 +144,7 @@ internal class WinRawPrinterBackend : IRawPrinterBackend {
         return opened != 0 && this.handle != 0;
     }
 
+    /// StartDocPrinterW 以 RAW 数据类型开始作业（作业号非 0 为成功）。
     bool StartDoc(string documentName) {
         nint documentNameW = Wide.Of(documentName);
         nint rawW = Wide.Of("RAW");
@@ -147,10 +160,12 @@ internal class WinRawPrinterBackend : IRawPrinterBackend {
         return job != 0;
     }
 
+    /// StartPagePrinter。
     bool StartPage() {
         return WinRawPrinterBackend.StartPagePrinter(this.handle) != 0;
     }
 
+    /// WritePrinter 写入 data，返回实际字节数；失败返回 -1。
     int Write(byte[] data) {
         nint writtenOut = NativeMemory.Alloc(4);
         new Span<int>(writtenOut, 1)[0] = 0;
@@ -162,16 +177,20 @@ internal class WinRawPrinterBackend : IRawPrinterBackend {
         return written;
     }
 
+    /// EndPagePrinter。
     bool EndPage() {
         return WinRawPrinterBackend.EndPagePrinter(this.handle) != 0;
     }
 
+    /// EndDocPrinter 提交作业。
     bool EndDoc() {
         return WinRawPrinterBackend.EndDocPrinter(this.handle) != 0;
     }
 
+    /// AbortPrinter 丢弃当前作业。
     void Abort() { WinRawPrinterBackend.AbortPrinter(this.handle); }
 
+    /// ClosePrinter 关闭打印机句柄。
     bool Close() {
         return WinRawPrinterBackend.ClosePrinter(this.handle) != 0;
     }
@@ -204,15 +223,16 @@ internal class WinRawPrinterBackend : IRawPrinterBackend {
 #endif
 
 #if !WINDOWS
-// CUPS 没有逐页的 spooler API：把 RAW 字节流收集到临时文件，
-// EndDoc 时用 `lp -o raw` 整份提交（-o raw 让 CUPS 跳过过滤链，
-// 字节原样送给打印机，与 Windows 的 RAW 数据类型一致）。
+/// CUPS 没有逐页的 spooler API：把 RAW 字节流收集到临时文件，
+/// EndDoc 时用 `lp -o raw` 整份提交（-o raw 让 CUPS 跳过过滤链，
+/// 字节原样送给打印机，与 Windows 的 RAW 数据类型一致）。
 internal class CupsRawPrinterBackend : IRawPrinterBackend {
     string printer;
     string document;
     string spoolPath;
     bool failed;
 
+    /// 记住打印机名；系统里有 lp 命令才算打开成功。
     bool Open(string printerName) {
         this.printer = printerName;
         this.spoolPath = "";
@@ -221,6 +241,7 @@ internal class CupsRawPrinterBackend : IRawPrinterBackend {
         return Process.Capture("command -v lp").exitCode == 0;
     }
 
+    /// 创建按 PID 命名的临时 spool 文件；创建失败返回 false。
     bool StartDoc(string documentName) {
         this.spoolPath = Path.GetTempPath() + "zan_raw_"
             + Convert.ToString(ProcessHost.Pid()) + ".prn";
@@ -234,8 +255,10 @@ internal class CupsRawPrinterBackend : IRawPrinterBackend {
         return true;
     }
 
+    /// spool 文件就绪即成功（CUPS 无逐页提交的概念）。
     bool StartPage() { return this.spoolPath != ""; }
 
+    /// 追加到 spool 文件，返回写入字节数；失败返回 -1 并标记文档失败。
     int Write(byte[] data) {
         if (this.spoolPath == "") { return 0 - 1; }
         try {
@@ -247,8 +270,10 @@ internal class CupsRawPrinterBackend : IRawPrinterBackend {
         return data.Length;
     }
 
+    /// 本页是否无失败。
     bool EndPage() { return !this.failed; }
 
+    /// 用 `lp -d <printer> -t <doc> -o raw` 提交整份 spool 文件。
     bool EndDoc() {
         if (this.spoolPath == "" || this.failed) { return false; }
         string cmd = "lp -d " + CupsRawPrinterBackend.Quote(this.printer)
@@ -257,8 +282,10 @@ internal class CupsRawPrinterBackend : IRawPrinterBackend {
         return Process.Capture(cmd).exitCode == 0;
     }
 
+    /// 标记文档失败：EndDoc 将拒绝提交。
     void Abort() { this.failed = true; }
 
+    /// 删除 spool 临时文件。
     bool Close() {
         if (this.spoolPath != "") {
             File.Delete(this.spoolPath);
@@ -267,6 +294,7 @@ internal class CupsRawPrinterBackend : IRawPrinterBackend {
         return true;
     }
 
+    /// 单引号包裹 shell 参数，内部单引号按 POSIX 方式（'\''）转义。
     static string Quote(string s) {
         return "'" + s.Replace("'", "'\\''") + "'";
     }

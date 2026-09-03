@@ -11,12 +11,17 @@ class ZipEntry {
     public byte[] data;
     /// <summary>目录条目为 true。</summary>
     public bool isDirectory;
-    // 由 Zip.Read / Zip.Extract 填充：
+    /// 由 Zip.Read / Zip.Extract 填充：
+    /// 压缩方法：0 = stored，8 = deflate。
     public int method;
+    /// 未压缩数据的 CRC-32。
     public int crc32;
+    /// 压缩后字节数。
     public int compressedSize;
+    /// 未压缩字节数。
     public int uncompressedSize;
 
+    /// 构造文件条目（isDirectory 默认 false，数据待填）。
     ZipEntry(string name) {
         this.name = name;
     }
@@ -29,13 +34,15 @@ class ZipEntry {
 /// zlib 或任何原生库。
 /// </summary>
 class Zip {
-    // 本地文件头签名 PK\x03\x04
+    /// 本地文件头签名 PK\x03\x04
     static int SigLocal = 0x04034B50;
-    // 中央目录文件头签名 PK\x01\x02
+    /// 中央目录文件头签名 PK\x01\x02
     static int SigCentral = 0x02014B50;
-    // 中央目录结束签名 PK\x05\x06
+    /// 中央目录结束签名 PK\x05\x06
     static int SigEnd = 0x06054B50;
+    /// 存储（不压缩）。
     static int MethodStored = 0;
+    /// DEFLATE 压缩。
     static int MethodDeflate = 8;
 
     /// <summary>
@@ -299,6 +306,7 @@ class Zip {
         return count;
     }
 
+    /// 从头扫描本地文件头签名找名称匹配的条目，返回其偏移；找不到返回 -1。
     static int FindLocal(byte[] zip, string name) {
         for (int i = 0; i + 30 <= zip.Length; i = i + 1) {
             if (Zip.ReadU32(zip, i) == Zip.SigLocal) {
@@ -318,10 +326,12 @@ class Zip {
         return -1;
     }
 
+    /// 名称以 '/' 结尾（目录条目）时为 true。
     static bool EndsWithSlash(string s) {
         return s.Length > 0 && s[s.Length - 1] == '/';
     }
 
+    /// 从归档缓冲区读取 len 字节的条目名。
     static string ReadName(byte[] zip, int off, int len) {
         nint buf = NativeMemory.Alloc(len + 1);
         for (int i = 0; i < len; i = i + 1) {
@@ -332,21 +342,25 @@ class Zip {
         return s;
     }
 
+    /// 小端读取 16 位无符号。
     static int ReadU16(byte[] b, int off) {
         return (b[off] & 255) | ((b[off + 1] & 255) << 8);
     }
 
+    /// 小端读取 32 位并以 long 返回（保留无符号值，避免误判为负）。
     static long ReadU32(byte[] b, int off) {
         return (long)(b[off] & 255) | ((long)(b[off + 1] & 255) << 8) |
             ((long)(b[off + 2] & 255) << 16) | ((long)(b[off + 3] & 255) << 24);
     }
 
+    /// 小端写入 16 位并把 off 前移 2。
     static void WriteU16(byte[] b, ref int off, int v) {
         b[off] = (byte)(v & 255);
         b[off + 1] = (byte)((v >> 8) & 255);
         off = off + 2;
     }
 
+    /// 小端写入低 32 位并把 off 前移 4。
     static void WriteU32(byte[] b, ref int off, long v) {
         b[off] = (byte)(v & 255);
         b[off + 1] = (byte)((v >> 8) & 255);
@@ -407,6 +421,7 @@ class ZipWriter {
     long curHdrPos;
     DeflateChunker curChunker;
 
+    /// 构造空写出器；实例经 <see cref="Open"/> 创建。
     ZipWriter() {
         this.fp = 0;
         this.offsets = new List<long>();
@@ -564,8 +579,8 @@ class ZipWriter {
         ZipWriter.remove(this.path);
     }
 
-    // 30 字节本地文件头（不含名称）。签名+版本+标志+方法+时间
-    // 日期+CRC+两尺寸+两长度。
+    /// 30 字节本地文件头（不含名称）。签名+版本+标志+方法+时间
+    /// 日期+CRC+两尺寸+两长度。
     void WriteHeader(string name, int method, int crc, long csize, long usize) {
         byte[] hdr = new byte[30];
         int off = 0;
@@ -578,6 +593,7 @@ class ZipWriter {
         this.WriteRaw(nb, nb.Length);
     }
 
+    /// 把 30 字节本地头字段写进 hdr 自 off 起，并把 off 前移 30（EndEntry 回填时复用）。
     void BuildHeader(byte[] hdr, ref int off, string name, int method, int crc,
                      long csize, long usize) {
         Zip.WriteU32(hdr, ref off, Zip.SigLocal);
@@ -593,12 +609,15 @@ class ZipWriter {
         Zip.WriteU16(hdr, ref off, 0);                  // 额外字段
     }
 
+    /// 当前写入位置（距文件头的字节偏移）。
     long Tell() { return ZipWriter.ftell(this.fp); }
 
-    // 定位参数与 CRT 一致：0=文件头 1=当前位置 2=文件尾。
+    /// 定位到绝对偏移（回填本地头用）。
     void Seek(int pos) { ZipWriter.fseek(this.fp, pos, 0); }
+    /// 定位到文件尾（继续追加条目）。
     void SeekEnd() { ZipWriter.fseek(this.fp, 0, 2); }
 
+    /// 写入 len 字节；写不满抛 IOException。
     void WriteRaw(byte[] data, int len) {
         long put = ZipWriter.fwrite(data, 1, len, this.fp);
         if (put != len) {
