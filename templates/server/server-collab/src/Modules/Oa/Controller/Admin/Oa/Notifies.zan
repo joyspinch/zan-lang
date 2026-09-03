@@ -7,35 +7,60 @@ using System.Web;
 using ZanWeb.Model.Oa;
 using ZanWeb.Model.Sys;
 
-namespace ZanWeb.Admin.Flow;
+namespace ZanWeb.Admin.Oa;
 
-/* /admin/flow/notifies 兼容层（架构 §2.2 WP-2 / T3）：通知中心 canonical 页已迁
-   Oa 域（ZanWeb.Admin.Oa.Notifies，/admin/oa/notifies）——Index 301 到新页；
-   铃铛 API（unread/stream/read）是 T2 已焊死的存量契约，前端 bell.js 与收藏夹
-   零改动依赖它们，原路径照常服务，实现与 Oa 版同源（sys_notify + NotifyHub），
-   待 T13 统一事件流时收编。数据源已迁公共层：读写 sys_notify，旧 flow_notify
-   停写只读。 */
-[Route("admin/flow/notifies/[action]")]
+/* 通知中心 canonical 页（架构 §2.2 WP-2 / T3）：跨模块通知统一落到 Oa 域——
+   读写 sys_notify，WS/SSE 实时通道挂 NotifyHub。Flow 域旧路由
+   /admin/flow/notifies 保留为兼容层：页面 301 到本页，铃铛 API（unread/
+   stream/read）原路径照常服务（命名空间焊死纪律：URL 变更必留重定向）。
+   免打扰开关走 sys_notify_pref：muted=1 的模块只落库不推（Notify.Muted）。 */
+[Route("admin/oa/notifies/[action]")]
 [Custom(Authorization = CustomAuthorization.Grant)]
-[Description("通知中心(兼容)")]
+[Description("通知中心")]
 class Notifies : AdminController {
     /* 流存活时长；标签整夜开着不应永远占协程，EventSource 会自连。 */
     static int StreamSeconds = 1800;
 
-    /* 页面入口：301 永久重定向到 Oa 域新页（namespace 焊死纪律——URL 变更
-       必留重定向兼容层，不得静默 404）。鉴权之后才到这里，未登录者照旧
-       先见登录页。 */
     [HttpGet]
-    [Route("/admin/flow/notifies")]
-    [Custom(IsMenu = false, Perm = PermBit.View)]
+    [Route("/admin/oa/notifies")]
+    [Custom(IsMenu = true, Icon = "mdi:bell", Perm = PermBit.View)]
     [Description("通知中心")]
     async void Index() {
-        await this.Admin();
-        this.Ctx().Status(301, "Moved Permanently")
-            .SetHeader("Location", "/admin/oa/notifies");
-        /* Redirect() 的收尾契约：body 置空 + ended 置位，缺一则响应被判为
-           未完成（500）。Text("") 正是这两笔。 */
-        this.Ctx().Text("");
+        User me = await this.Admin();
+        ViewData d = await this.Layout("通知中心");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+        ListQuery q = this.Paged("id", 20);
+        List<SysNotify> rows = await this.SysNotify
+            .Where(a => a.userId == me.id)
+            .OrderByDescending(a => a.id)
+            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        int total = await this.SysNotify
+            .Where(a => a.userId == me.id).CountAsync();
+        /* 免打扰现状（flow 域开关即页面上的示范位；其余模块开关随迁移渐次加入）。 */
+        SysNotifyPref pref = await this.SysNotifyPref
+            .Where(a => a.tenantId == this.TenantId() && a.userId == me.id
+                && a.module == "flow").FirstAsync();
+        bool muted = pref != null && pref.muted == 1;
+        if (muted) { d.Set("muted", "1"); } else { d.Set("mutedOff", "1"); }
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            SysNotify n = rows[i];
+            StrMap m = new StrMap();
+            m.Set("id", Convert.ToString(n.id));
+            m.Set("kind", n.kind);
+            m.Set("kindText", n.kind == "assign" ? "派工"
+                : (n.kind == "mention" ? "提及"
+                : (n.kind == "done" ? "流程"
+                : (n.kind == "alert" ? "告警" : "通知"))));
+            m.Set("content", n.content);
+            m.Set("link", n.link);
+            m.Set("unread", n.isRead == 0 ? "1" : "");
+            m.Set("createdAt", Fmt.Day(n.createdAt));
+            items.Add(m);
+        }
+        d.Set("empty", total == 0 ? "1" : "");
+        this.Pager(d, q, total);
+        this.Page(d);
     }
 
     /* 未读数与最新未读列表：顶栏铃铛的轻量数据源，由前端定时拉取（SSE 只推在线实时增量）。 */
@@ -135,5 +160,36 @@ class Notifies : AdminController {
                 .Where(a => a.userId == me.id).ExecuteAffrowsAsync();
         }
         this.Saved("已标记");
+    }
+
+    /* 免打扰开关：按 module 逐个控制（一期只暴露 flow；Notify.Muted 发送侧判定，
+       muted=1 只落库不推）。行存在改 muted，不存在插行——偏好是稀疏数据，
+       等值谓词查无即默认放行，无需为每个用户预建全模块行。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("免打扰开关")]
+    async void Mute() {
+        User me = await this.Admin();
+        string module = Fmt.Text(this.In("module"), "flow");
+        int on = this.InInt("on", 0);
+        long now = WebApp.NowSeconds();
+        SysNotifyPref row = await this.SysNotifyPref
+            .Where(a => a.tenantId == this.TenantId() && a.userId == me.id
+                && a.module == module).FirstAsync();
+        if (row != null) {
+            int _u = await this.SysNotifyPref.Update()
+                .Set(a => a.muted, on)
+                .Set(a => a.updatedAt, now)
+                .Where(a => a.id == row.id).ExecuteAffrowsAsync();
+        } else {
+            SysNotifyPref p = new SysNotifyPref();
+            p.tenantId = this.TenantId();
+            p.userId = me.id;
+            p.module = module;
+            p.muted = on;
+            p.updatedAt = now;
+            int _i = await this.SysNotifyPref.Insert(p).ExecuteIdentityAsync();
+        }
+        this.Saved(on == 1 ? "已开启免打扰" : "已恢复提醒");
     }
 }

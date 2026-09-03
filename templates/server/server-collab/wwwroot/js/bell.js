@@ -1,6 +1,9 @@
-/* flow-bell.js — 顶栏通知铃铛 + 实时通知流。
-   数据通道：WebSocket 长连接 /admin/flow/notifies/stream（20s 文本心跳续期，
-   断开自动重连，连续失败回落 EventSource/SSE）；菜单内点击「前往」走既有 data-tab 标签加载。 */
+/* bell.js — 顶栏通知铃铛 + 实时通知流（架构 §2.2 WP-2 / T3：自 flow-bell.js
+   泛化更名，不再绑定 Flow 域——通知统一由 Oa 域 sys_notify 承载）。
+   数据通道：WebSocket 长连接 /admin/oa/notifies/stream（20s 文本心跳续期，
+   断开自动重连，连续失败回落 EventSource/SSE）；菜单内点击「前往」走既有
+   data-tab 标签加载。旧路径 /admin/flow/notifies/* 仍可用（兼容层保留），
+   本文件已切 canonical 新路径。 */
 (function () {
   'use strict';
 
@@ -10,6 +13,10 @@
   var menu = bell.querySelector('[data-bell-menu]');
   var badge = bell.querySelector('[data-bell-badge]');
   var list = bell.querySelector('[data-bell-list]');
+
+  var PAGE = '/admin/oa/notifies';
+  var UNREAD_API = '/admin/oa/notifies/unread';
+  var STREAM = '/admin/oa/notifies/stream';
 
   function esc(s) {
     return String(s == null ? '' : s)
@@ -35,7 +42,7 @@
     }
     var html = '';
     for (var i = 0; i < items.length; i++) {
-      html += '<a class="ad-bell-item" href="' + esc(items[i].link || '/admin/flow/notifies')
+      html += '<a class="ad-bell-item" href="' + esc(items[i].link || PAGE)
         + '" data-tab data-title="通知">' + esc(items[i].content) + '</a>';
     }
     list.innerHTML = html;
@@ -44,7 +51,7 @@
   function open() {
     if (!menu) { return; }
     menu.hidden = false;
-    fetch('/admin/flow/notifies/unread', { credentials: 'same-origin' })
+    fetch(UNREAD_API, { credentials: 'same-origin' })
       .then(function (r) { return r.json(); })
       .then(function (j) {
         renderItems(j.items || []);
@@ -71,7 +78,7 @@
       if (empty) { empty.remove(); }
       var a = document.createElement('a');
       a.className = 'ad-bell-item';
-      a.href = esc(n.link || '/admin/flow/notifies');
+      a.href = esc(n.link || PAGE);
       a.setAttribute('data-tab', '');
       a.setAttribute('data-title', '通知');
       a.textContent = n.content || '';
@@ -82,7 +89,7 @@
   /* SSE 回退：EventSource 自连，按事件名分派。 */
   function listenSse() {
     try {
-      var es = new EventSource('/admin/flow/notifies/stream');
+      var es = new EventSource(STREAM);
       es.addEventListener('notify', function (ev) {
         try { onNotify(JSON.parse(ev.data)); } catch (e) { /* 忽略单帧格式错误 */ }
       });
@@ -109,7 +116,7 @@
     function connect() {
       try {
         var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-        ws = new WebSocket(proto + location.host + '/admin/flow/notifies/stream');
+        ws = new WebSocket(proto + location.host + STREAM);
       } catch (e) { return listenSse(); }
       ws.onopen = function () { fails = 0; };
       ws.onmessage = function (ev) {
