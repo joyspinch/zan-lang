@@ -49,7 +49,8 @@ class ViewData {
 /// </summary>
 class VNode {
     // 0 literal, 1 escaped variable, 2 raw variable, 3 #if, 4 #each,
-    // 5 {{content}} (layout hole)
+    // 5 {{content}} (layout hole, or same-named variable when resolvable
+    // and no hole fill is in progress -- see Emit)
     int kind;
     string text;        // literal text, or the variable/list name
     List<VNode> body;   // children of #if / #each
@@ -259,8 +260,9 @@ class View {
 
     // Walk a compiled template, appending to `sb`. `content` are the page nodes
     // that fill a layout's {{content}} hole; without them (a plain Render) the
-    // placeholder is emitted unchanged, matching the old text-substitution
-    // behavior.
+    // placeholder resolves by precedence: a same-named variable (row field or
+    // ViewData) interpolates escaped; only when nothing resolves is it emitted
+    // unchanged, matching the old text-substitution behavior (Bug#2).
     static void Emit(List<VNode> nodes, ViewData data, StrMap row,
                      List<VNode> content, StringBuilder sb) {
         for (int i = 0; i < nodes.Count; i = i + 1) {
@@ -285,8 +287,17 @@ class View {
                     }
                 }
             } else {
-                if (content == null) { sb.Append("{{content}}"); }
-                else { View.Emit(content, data, row, null, sb); }
+                /* {{content}} 双语义（Bug#2）：编译期不区分，发射期按可解析性
+                   定优先级——layout 填洞进行中（content != null）照旧填洞；
+                   否则同名变量可解析（行字段或 ViewData）即按转义变量插值；
+                   都不满足才回落字面量占位（旧文本替换行为的兼容面）。 */
+                if (content != null) {
+                    View.Emit(content, data, row, null, sb);
+                } else if (View.HasVar("content", data, row)) {
+                    sb.Append(View.HtmlEscape(View.Lookup("content", data, row)));
+                } else {
+                    sb.Append("{{content}}");
+                }
             }
         }
     }
@@ -298,6 +309,14 @@ class View {
         if (row != null && row.Has(key)) { return row.Get(key); }
         if (data != null && data.vars.Has(key)) { return data.vars.Get(key); }
         return "";
+    }
+
+    /* 变量可解析判定：Lookup 的布尔面——供 {{content}} 双语义分派
+       （Bug#2）等需要区分「解析得到空串」与「根本没有此名」的场合。 */
+    static bool HasVar(string key, ViewData data, StrMap row) {
+        if (row != null && row.Has(key)) { return true; }
+        if (data != null && data.vars.Has(key)) { return true; }
+        return false;
     }
 
     /// <summary>Escapes &lt; &gt; &amp; " so variables are XSS-safe by default.</summary>
