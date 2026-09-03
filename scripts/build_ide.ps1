@@ -12,6 +12,29 @@ Set-Location $root
 
 Write-Output "IDE_BUILD_START"
 
+# ---- 0) clang on PATH ------------------------------------------------------
+# Sandbox/background sessions run with a trimmed PATH that may lack both the
+# mozbuild LLVM and the VS-bundled clang this repo builds with. Probe the two
+# known install locations before failing: the script needs clang, llvm-ar and
+# llvm-readobj, all in the same bin directory. NOTE: a bare "clang" command
+# name is unreliable in some restricted sessions even with the dir prepended,
+# so every native call below uses the full path via $clangExe / $clangDir.
+$clangExe = ""
+$clangHints = @(
+    "$env:USERPROFILE\.mozbuild\clang\bin",
+    "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\Llvm\x64\bin"
+)
+foreach ($hint in $clangHints) {
+    if (Test-Path (Join-Path $hint "clang.exe")) {
+        $clangExe = (Get-Item $hint).FullName + "\clang.exe"
+        break
+    }
+}
+if ($clangExe -eq "") {
+    Write-Output "CLANG_NOT_FOUND (neither .mozbuild nor VS Llvm)"; exit 1
+}
+$clangDir = Split-Path -Parent $clangExe
+
 # ---- 1) native GUI runtime (static, mingw ABI) ----------------------------
 # Win32 native backend (ZAN_GUI_STATIC, no SDL3): the IDE shell, editor and
 # all retained widgets are pure Win32. Compiled for zanc's own
@@ -19,10 +42,10 @@ Write-Output "IDE_BUILD_START"
 # Rebuilt on every run (the compiler driver auto-links the async reactor), so
 # a stale SDL-backed archive from an older build cannot leak in.
 $runtimeLib = Join-Path $root "build\libzan_gui_ide_gnu.a"
-clang --target=x86_64-w64-windows-gnu -O2 -DZAN_GUI_STATIC `
+& $clangExe --target=x86_64-w64-windows-gnu -O2 -DZAN_GUI_STATIC `
     -c src\runtime\gui_runtime.c -o build\zan_gui_ide_gnu.o
 if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_COMPILE_FAILED"; exit 1 }
-llvm-ar rcs $runtimeLib build\zan_gui_ide_gnu.o
+& (Join-Path $clangDir "llvm-ar.exe") rcs $runtimeLib build\zan_gui_ide_gnu.o
 if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_LIB_FAILED"; exit 1 }
 
 # ---- 2) embedded resources (skins, help topics, ide.css) -------------------
@@ -37,7 +60,7 @@ if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_LIB_FAILED"; exit 1 }
 # The 'ide' group is filtered to *.css because assets\ also holds docs\.
 & powershell -ExecutionPolicy Bypass -File scripts\gen_embed.ps1 `
     -Group "stdlib\Gui\skins=skins;src\ide_zan\assets\docs=docs;src\ide_zan\assets=ide:*.css" `
-    -OutC build\embed_gen.c -OutO build\embed_gen.o -Clang clang
+    -OutC build\embed_gen.c -OutO build\embed_gen.o -Clang $clangExe
 if ($LASTEXITCODE -ne 0) { Write-Output "EMBED_GEN_FAILED"; exit 1 }
 
 # ---- 3) sources: entry first, then project + Gui stdlib -------------------
@@ -199,7 +222,7 @@ $staged = @($out | ForEach-Object {
     $m = [regex]::Match([string]$_, "^\s*bundled driver '[^']+' \S+ (?<f>\S+\.dll)\s*$")
     if ($m.Success) { $m.Groups['f'].Value }
 })
-$imports = @(& llvm-readobj --coff-imports (Join-Path (Get-Location) "build\ZanIDE.exe") 2>&1 |
+$imports = @(& (Join-Path $clangDir "llvm-readobj.exe") --coff-imports (Join-Path (Get-Location) "build\ZanIDE.exe") 2>&1 |
     ForEach-Object {
         $m = [regex]::Match([string]$_, '^\s*Name:\s*(?<f>\S+\.dll)\s*$')
         if ($m.Success) { $m.Groups['f'].Value }
