@@ -114,14 +114,13 @@ build/zanc.exe examples/game/legend/main.zan \
 
 ## 4. 美术与字体
 
-- **背景**：深蓝黑渐变 + 金线边框（`assets/bg_mine.jpg` 烘焙底纹 + 金边九宫 `panel_nine.png`）
+- **背景**：`assets/bg_mine.jpg` 烘焙底纹（暗色魔幻场景，blend 叠加）
 - **角色立绘**：3 职业通过 ImageGen 生成的 `assets/class_{warrior,mage,taoist}.png`
 - **BOSS 立绘**：4 大教主 `assets/boss_{woma,zuma,chiyue,molong}.png`
 - **地图背景**：`assets/map_bichon.png`（比奇省）
 - **启动画面**：`assets/splash.png`（AI 生成，含 "AI生成"水印，叠层遮挡）
-- **按钮底**：`assets/btn_{dark,gold}{,_hi}.png`（4 状态）
-- **进度条**：`assets/bar_{chrome,fill,trough}.png`
-- **列表行**：`assets/row_stone.png`
+- **按钮底**：`assets/btn_{dark,gold}{,_hi}.png`（4 状态，128×128 整板，九宫切 14px 边框）
+- **面板/进度条**：纯矢量绘制（`PanelImg`/`BarImg`：圆角石板 + 金色描边），不依赖贴图
 - **货币图标**：`assets/icon_{copper,gold,iron,crystal,core}.png`（分别对应 金币/元宝/声望/灵符/积分）
 - **装备图标**：40 张 `assets/equip_c{0..7}_t{0..4}.png`，对应 8 大类 × 5 品阶
 - **音效**：`assets/{box,craft,tip,trade,up}.wav`
