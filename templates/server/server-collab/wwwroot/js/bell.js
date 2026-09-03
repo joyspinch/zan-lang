@@ -93,6 +93,7 @@
       es.addEventListener('notify', function (ev) {
         try { onNotify(JSON.parse(ev.data)); } catch (e) { /* 忽略单帧格式错误 */ }
       });
+      es.addEventListener('message', function (ev) { try { document.dispatchEvent(new CustomEvent('zan-rt', { detail: JSON.parse(ev.data) })); } catch (e) {} });
       es.addEventListener('unread', function (ev) {
         try { setBadge(JSON.parse(ev.data).count || 0); } catch (e) {}
       });
@@ -122,6 +123,7 @@
       ws.onmessage = function (ev) {
         try {
           var m = JSON.parse(ev.data);
+          document.dispatchEvent(new CustomEvent('zan-rt', { detail: m })); /* T13：广播给 chat.js 等消费方，本文件职责不变 */
           if (m.type === 'notify') { onNotify(m); }
           else if (m.type === 'unread') { setBadge(m.count || 0); }
         } catch (e) { /* 忽略单帧格式错误 */ }
