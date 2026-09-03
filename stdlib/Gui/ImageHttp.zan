@@ -9,12 +9,15 @@ using Gui.Widget;
 
 namespace Gui;
 
-/// <summary>Image 控件的网络图片加载器。分工与 DownloadJob 一致：
-/// 取回在后台 OS 线程上以协程 await 完成（不阻塞 UI），结果经
-/// <see cref="App.Post"/> 封送回 UI 线程再解码注册；单个共享 worker
-/// 逐条处理排队的请求。UI 线程入口是 <see cref="Fetch"/>。</summary>
+/// <summary>Image 控件与 DataTable 图片列共用的网络图片加载器。
+/// 分工与 DownloadJob 一致：取回在后台 OS 线程上以协程 await 完成
+///（不阻塞 UI），结果经 <see cref="App.Post"/> 封送回 UI 线程再解码
+/// 注册；单个共享 worker 逐条处理排队的请求。UI 线程入口是
+/// <see cref="Fetch"/>（控件模式）与 <see cref="EnsureUrl"/>（无控件
+/// 的 URL 槽模式）。</summary>
 class ImageHttp {
     /// 一次取回请求：UI 线程排队，worker 领走，完成后经 Post 通知。
+    /// img 为 null 时是 URL 槽请求（见 EnsureUrl）。
     class Req {
         string url;
         string key;
@@ -22,9 +25,38 @@ class ImageHttp {
         Image img;
     }
 
+    /// URL 槽：一段 URL 的加载状态。就绪后 key 指向已注册的
+    /// `mem:` 图像，可反复绘制；失败保持 2，不自动重试。
+    class Slot {
+        string key;
+        int state;   // 0 加载中，1 就绪，2 失败
+    }
+
     static nint lockHandle;
     static List<Req> pending;
     static bool workerStarted;
+    static Dict<string, Slot> urlSlots;
+    static int slotSeq;
+
+    /// UI 线程调用：确保 `url` 的图片取回已排队（无控件场景，例如
+    /// DataTable 图片列）。就绪返回已注册的 `mem:` key，加载中或
+    /// 失败返回 null——同一 URL 只排队一次，结果缓存供后续帧直用。
+    static string EnsureUrl(App app, string url) {
+        if (url == null || url == "") { return null; }
+        if (urlSlots == null) { urlSlots = new Dict<string, Slot>(); }
+        if (urlSlots.ContainsKey(url)) {
+            Slot have = urlSlots[url];
+            if (have.state == 1) { return have.key; }
+            return null;
+        }
+        slotSeq = slotSeq + 1;
+        Slot s = new Slot();
+        s.key = "mem:slot" + Convert.ToString(slotSeq);
+        s.state = 0;
+        urlSlots[url] = s;
+        ImageHttp.Fetch(app, null, url, s.key);
+        return null;
+    }
 
     /// UI 线程调用：排队一次 URL 取回。worker 首次需要时启动。
     static void Fetch(App app, Image img, string url, string key) {
@@ -44,8 +76,10 @@ class ImageHttp {
         Mutex.Unlock(lockHandle);
         if (needWorker) {
             if (!Thread.Start(ImageHttp.WorkerLoop)) {
-                // 线程起不来：直接把失败交回 UI 线程，控件显示失败占位。
-                app.Post(() => { img.OnFetchFailed(); });
+                // 线程起不来：统一走 Apply 失败路径（控件显示失败占位，
+                // URL 槽置失败态）。
+                Req fail = r;
+                app.Post(() => { ImageHttp.Apply(fail, null, null, 0, "no worker"); });
             }
         }
     }
@@ -127,22 +161,52 @@ class ImageHttp {
         return 0;
     }
 
-    /// UI 线程：把取回的字节注册进图像缓存并通知控件。解码必须发生
-    /// 在 UI 线程（图像注册表与光栅器只从 UI 线程触碰）。
+    /// UI 线程：把取回的字节注册进图像缓存并通知消费方。解码必须
+    /// 发生在 UI 线程（图像注册表与光栅器只从 UI 线程触碰）。
     static void Apply(Req r, byte[] bytes, string body, int len, string err) {
+        if (r.img == null) {
+            // URL 槽模式：注册 key、置状态、触发重绘（下一帧命中缓存）。
+            Slot s = null;
+            if (urlSlots != null && urlSlots.ContainsKey(r.url)) {
+                s = urlSlots[r.url];
+            }
+            if (s != null) {
+                bool ok = false;
+                if (err == "") {
+                    int w = 0;
+                    if (bytes != null) {
+                        w = Canvas.ImageLoadMem(s.key, bytes, len);
+                    } else if (body != null) {
+                        if (body.Contains("<svg")) {
+                            w = Canvas.ImageLoadSvg(s.key, body, 0, 0);
+                        } else {
+                            w = Canvas.ImageLoadMem(s.key, body, len);
+                        }
+                    }
+                    ok = w > 0;
+                }
+                if (ok) {
+                    s.state = 1;
+                } else {
+                    s.state = 2;
+                }
+                r.app.RequestRedraw();
+            }
+            return;
+        }
         if (err == "") {
-            int w = 0;
+            int w2 = 0;
             if (bytes != null) {
-                w = Canvas.ImageLoadMem(r.key, bytes, len);
+                w2 = Canvas.ImageLoadMem(r.key, bytes, len);
             } else if (body != null) {
                 if (body.Contains("<svg")) {
                     r.img.OnSvgFetched(body);
                     return;
                 }
-                w = Canvas.ImageLoadMem(r.key, body, len);
+                w2 = Canvas.ImageLoadMem(r.key, body, len);
             }
-            if (w > 0) {
-                r.img.OnFetched(r.key, w, Canvas.ImageHeight(r.key));
+            if (w2 > 0) {
+                r.img.OnFetched(r.key, w2, Canvas.ImageHeight(r.key));
                 return;
             }
         }

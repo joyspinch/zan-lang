@@ -1313,6 +1313,18 @@ EXPORT i32 zan_gui_set_cursor(i32 cursor_type) {
 
 EXPORT i32 zan_gui_get_dpi_scale(void) { return (i32)(g_dpi * 100 / 96); }
 
+/* Android-only: the app-private files directory (writable, per-user). SDL
+ * owns the Activity, so the path comes from here rather than an env var;
+ * stdlib FilePicker uses it as the default browsing root — the process cwd
+ * is "/" and listing it is SELinux-denied for an untrusted app. */
+EXPORT const char *zan_gui_android_files_dir(void) {
+#if defined(__ANDROID__)
+    return SDL_GetAndroidInternalStoragePath();
+#else
+    return "";
+#endif
+}
+
 EXPORT i64 zan_gui_get_tick_ms(void) { return (i64)SDL_GetTicks(); }
 
 EXPORT void zan_gui_sleep_ms(i32 ms) { if (ms > 0) SDL_Delay((Uint32)ms); }

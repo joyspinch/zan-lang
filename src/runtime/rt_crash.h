@@ -959,6 +959,24 @@ static void zan__crash_atexit(void) {
     zan__crash_note("exit", detail);
 }
 
+/* True when this copy of the header lives in the main exe (vs a DLL that
+ * embedded it, e.g. zan_gui). Used to keep atexit out of DLL copies: during
+ * process exit the exe copy's handler already ran inside doexit, before
+ * ExitProcess, while a DLL copy's handler runs later inside LdrShutdownProcess
+ * -- under the loader lock, where Microsoft forbids any CRT file I/O. The
+ * fopen there is also where injected sandbox hooks (third-party CreateFileW
+ * interceptors) have been observed to fail-fast the whole process
+ * (0xC0000409) on an ordinary, successful program exit. Skipping atexit in
+ * DLL copies loses nothing: the exe copy still writes the "exit" record. */
+static int zan__crash_in_main_image(void) {
+    HMODULE m = NULL;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCSTR)(ULONG_PTR)&zan__crash_in_main_image, &m))
+        return 1; /* unresolved: assume the old behavior */
+    return (uintptr_t)m == (uintptr_t)GetModuleHandleA(NULL);
+}
+
 static void zan__crash_install(void) {
     /* Shared across the copies of this header in one binary: three vectored
      * handlers doing the same work only multiply the records. */
@@ -969,7 +987,14 @@ static void zan__crash_install(void) {
      * fault is recorded (and recovered from) whatever else is installed. */
     AddVectoredExceptionHandler(1, zan__crash_veh);
     zan__crash_note("run", "");
-    atexit(zan__crash_atexit);
+    /* Only the main-image copy registers atexit. A DLL copy would have its
+     * handler called during DLL_PROCESS_DETACH, under the loader lock, where
+     * the fopen inside the record writer is both illegal (loader-lock file
+     * I/O) and -- with an injected file-op hook present -- fatal for the
+     * whole process (see zan__crash_in_main_image above). The exe copy's own
+     * atexit runs earlier, inside doexit and before ExitProcess, and already
+     * records the ordinary "exit" line for the process. */
+    if (zan__crash_in_main_image()) atexit(zan__crash_atexit);
 }
 
 #if defined(__GNUC__) || defined(__clang__)

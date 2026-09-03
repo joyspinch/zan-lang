@@ -20,7 +20,12 @@ class FileFilter {
 
 /// 可复用的应用内路径选择器，承载于独立 GUI 窗口。
 class FilePicker {
-    static int lang = 1;
+    static string lang = "zh";
+
+    /// Android 上应用私有 files 目录（SDL Activity 持有，经驱动导出）。
+    /// 进程 cwd 是 "/" 且列根目录被 SELinux 拒绝，这里作为默认浏览起点。
+    [DllImport("zan_gui")]
+    static extern string zan_gui_android_files_dir();
 
     Input pathInput;
     Input nameInput;
@@ -32,6 +37,11 @@ class FilePicker {
     SignalInt listScroll;
     SignalBool showHidden;
     App popup;
+    /// Android 降级标志：SDL 只有一个 activity 窗口，第二个 OS 窗口
+    /// 创建后不可见，对话框永远弹不出来。inlineMode=true 时选择器改由
+    /// 宿主窗口内的全屏模态承载（RenderOverlay），事件也走宿主，
+    /// OwnsWindow 恒 false。
+    bool inlineMode;
     bool open;
     bool closing;
     bool creatingFolder;
@@ -88,6 +98,7 @@ class FilePicker {
         this.listScroll = new SignalInt(0);
         this.showHidden = new SignalBool(false);
         this.popup = null;
+        this.inlineMode = false;
         this.open = false;
         this.closing = false;
         this.creatingFolder = false;
@@ -142,7 +153,7 @@ class FilePicker {
     }
 
     static string T(string en, string zh) {
-        if (FilePicker.lang == 1) { return zh; }
+        if (FilePicker.lang == "zh") { return zh; }
         return en;
     }
 
@@ -222,11 +233,24 @@ class FilePicker {
     }
 
     static bool Inside(App app, int x, int y, int w, int h) {
-        return Ui.Over(app, x, y, w, h);
+        // 内嵌模式（Android）下本组件在宿主帧里铺了全屏遮罩：
+        // PointerCaptured 因 inputBlockPrevious 恒为真，Ui.Over
+        // 会把遮罩自身内容的几何判定全部否决（OverlayPopup 的
+        // 滚轮注释同款问题——桌面窗口模式没有遮罩，不受影响）。
+        // 遮罩已铺设（blocksInputBelow 置位，BeginFrame 每帧
+        // 复位）之后的查询必然来自本次渲染段即遮罩所有者，
+        // 直接按原始几何判定；其余表面维持 PointerCaptured
+        // 约束，点击不得穿透遮罩。
+        if (!app.blocksInputBelow && app.PointerCaptured()) {
+            return false;
+        }
+        return app.mouseX >= x && app.mouseX < x + w
+            && app.mouseY >= y && app.mouseY < y + h;
     }
 
     static bool Clicked(App app, int x, int y, int w, int h) {
-        return Ui.ClickedIn(app, x, y, w, h);
+        if (!app.ClickAvailable()) { return false; }
+        return FilePicker.Inside(app, x, y, w, h);
     }
 
     static bool Pressed(App app, int x, int y, int w, int h) {
@@ -361,7 +385,42 @@ class FilePicker {
         string dir = "";
         if (initial != "") { dir = FilePicker.ValidDirectory(initial); }
         if (dir == "" && lastDir != "") { dir = FilePicker.ValidDirectory(lastDir); }
+        #if ANDROID
+        // Android 上进程工作目录是 "/"，列根目录被 SELinux 拒绝（空列表）。
+        // 依次尝试：应用私有 files 目录（驱动导出，必可读写）→ 随包解包
+        // 目录 → $HOME。都拿不到就留空，由状态条提示手输路径。
+        if (dir == "" || dir == "." || dir == "/") {
+            string filesDir = zan_gui_android_files_dir();
+            if (filesDir != null && filesDir != ""
+                    && Directory.ExistsUtf8(filesDir)) {
+                dir = FilePicker.Normalize(filesDir);
+            }
+        }
+        if (dir == "" || dir == "." || dir == "/") {
+            string unpacked = Directory.ReadPath(".");
+            if (unpacked != "" && unpacked != "."
+                    && Directory.ExistsUtf8(unpacked)) {
+                dir = FilePicker.Normalize(unpacked);
+            }
+        }
+        if (dir == "" || dir == "." || dir == "/") {
+            string home = KnownFolders.Home();
+            if (home != "" && Directory.ExistsUtf8(home)) {
+                dir = FilePicker.Normalize(home);
+            }
+        }
+        #else
         if (dir == "") { dir = FilePicker.ValidDirectory(""); }
+        #endif
+        if (dir == "" || dir == "." || dir == "/") {
+            // 兜底目录不可列（SELinux/无权限）时状态条给出提示，
+            // 用户仍可手输路径后按「转到」。
+            statusText = FilePicker.T(
+                "Cannot list the working folder — type a path above.",
+                "无法列出当前目录——请在上方输入路径。");
+        } else {
+            statusText = "";
+        }
         lastDir = dir;
         pathInput.SetText(dir);
         nameInput.SetText(defaultName);
@@ -371,11 +430,27 @@ class FilePicker {
         showHidden.Set(false);
         expanded = new List<string>();
         ExpandAncestors(dir);
+        #if ANDROID
+        // Android 只有一个 activity 窗口：SDL_CreateWindow 第二次调用拿不到
+        // 可显示的原生窗口，对话框永远不出现。降级为宿主窗口内的全屏
+        // 模态（RenderOverlay），事件随宿主走。
+        inlineMode = true;
+        popup = null;
+        #else
+        inlineMode = false;
         popup = App.CreateDark(dialogTitle, 980, 640);
-        popup.ApplySkin(skinIndex);
-        popup.SetChromeButtons(false, false, true, false);
-        popup.Show();
-        popup.RequestRedraw();
+        if (popup == null) {
+            // 平台拿不到第二窗口（无头/受限环境）时同样走内嵌模态，
+            // 按钮至少有响应。
+            inlineMode = true;
+        }
+        #endif
+        if (popup != null) {
+            popup.ApplySkin(skinIndex);
+            popup.SetChromeButtons(false, false, true, false);
+            popup.Show();
+            popup.RequestRedraw();
+        }
         open = true;
         closing = false;
     }
@@ -511,6 +586,13 @@ class FilePicker {
     int SkinIndex() { return skinIndex; }
 
     bool IsOpen() { return open; }
+    /// 弹窗是否以独立 OS 窗口承载。inlineMode（Android/无第二窗口环境）
+    /// 时恒 false：OS 窗口从未创建，内容随宿主帧经 RenderOverlay 绘制，
+    /// 宿主事件泵不应为它改变轮询/阻塞节奏（对照 IsOpen，后者在两种
+    /// 模式下都为 true）。
+    bool WindowModeOpen() {
+        return open && popup != null;
+    }
     bool NeedsRedraw() {
         return open && popup != null && popup.needsRedraw;
     }
@@ -657,6 +739,25 @@ class FilePicker {
         popup.PresentFrame();
     }
 
+    /// inlineMode（Android/无第二窗口环境）的绘制入口：宿主在自己的
+    /// 渲染回调里（页面之上、每帧一次，Layer.Render 同款时机）调用。
+    /// 先铺变暗遮罩并吞掉其下命中，再复用 RenderContent 的即时模式
+    /// 主体——它按传入 app 的画布尺寸与 ContentTop 自适应，全屏承载。
+    /// 桌面（窗口模式）本函数是 no-op，宿主可以无条件调用。
+    void RenderOverlay(App host) {
+        if (!open || !inlineMode) { return; }
+        Canvas hc = host.canvas;
+        StyleBox ov = Style.Part(host, "dialog", "overlay", "", "", "",
+                                 Style.SNormal());
+        hc.FillRect(0, 0, hc.Width(), hc.Height(), ov.bg);
+        host.BlockHitsBelow();
+        NativeLayer.Occlude(host, 0, 0, hc.Width(), hc.Height());
+        int savedSeq = WidgetId.SeqValue();
+        WidgetId.SetSeq(900000);
+        RenderContent(host);
+        WidgetId.SetSeq(savedSeq);
+    }
+
     void RenderContent(App app) {
         Canvas c = app.canvas;
         Theme t = app.theme;
@@ -779,8 +880,12 @@ class FilePicker {
         if (mode != 0) {
             footerH = t.heightMedium * 2 + t.gapMedium * 2;
         }
+        // 树窗格桌面定宽 292；手机视口（~412 逻辑宽）下列表只剩一条缝，
+        // 树最多占内容区一半，列表保持可用宽度。
         int treeW = app.Scale(292);
         int paneGap = t.gapMedium;
+        int maxTree = (W - pad * 2 - paneGap) / 2;
+        if (treeW > maxTree) { treeW = maxTree; }
         int listX = pad + treeW + paneGap;
         int listW = W - listX - pad;
         int scrollW = app.Scale(12);
@@ -808,8 +913,20 @@ class FilePicker {
         // 闸门，这样打开的菜单会吞掉本帧的点击。最后绘制。---
         bool showFilter = mode != 0 && filters.Count > 0;
         int fBtnW = app.Scale(112);
-        int fCancelX = W - pad - fBtnW - t.gapMedium - fBtnW;
         int filterW = app.Scale(210);
+        // 过滤行 [filter][cancel][open] 整行必须装进内容区：窄视口上
+        // 210+2×112+间隙超过行宽，过滤器框会算出负 x 出左界。先收
+        // 过滤器框，不够再收按钮。
+        int rowAvail = W - pad * 2 - t.gapMedium * 2 - fBtnW * 2;
+        if (filterW > rowAvail) {
+            filterW = rowAvail;
+            if (filterW < app.Scale(80)) {
+                filterW = app.Scale(80);
+                int btnAvail = (W - pad * 2 - t.gapMedium * 2 - filterW) / 2;
+                if (btnAvail < fBtnW) { fBtnW = btnAvail; }
+            }
+        }
+        int fCancelX = W - pad - fBtnW - t.gapMedium - fBtnW;
         int filterX = fCancelX - t.gapMedium - filterW;
         int filterRowY = paneY + paneH + t.gapMedium;
         if (mode != 0) { filterRowY = filterRowY + t.heightMedium + t.gapMedium; }
@@ -1272,13 +1389,22 @@ class FilePicker {
             + Canvas.MeasureText(
                 FilePicker.T("Show hidden files", "显示隐藏文件"),
                 hiddenFontSize);
-        c.DrawText(
-            infoX, footerY + app.Scale(8),
-            info, infoColor, Style.FontFallback(app, "small"));
-
+        // 窄视口上长状态文案会一路画进行尾的 Cancel/Open 按钮底下，
+        // 裁剪到按钮左侧（桌面宽度不受影响）。
         int buttonW = app.Scale(112);
         int acceptX = W - pad - buttonW;
         int cancelX = acceptX - t.gapMedium - buttonW;
+        if (info != "") {
+            int infoMaxW = cancelX - t.gapMedium - infoX;
+            if (infoMaxW > 0) {
+                c.PushClip(infoX, footerY, infoMaxW, t.heightMedium);
+            }
+            c.DrawText(
+                infoX, footerY + app.Scale(8),
+                info, infoColor, Style.FontFallback(app, "small"));
+            if (infoMaxW > 0) { c.PopClip(); }
+        }
+
         string acceptText = FilePicker.T(
             "Select Folder", "选择文件夹");
         if (mode == 1) { acceptText = FilePicker.T("Open", "打开"); }

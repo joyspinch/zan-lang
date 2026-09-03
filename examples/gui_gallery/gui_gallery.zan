@@ -2731,7 +2731,7 @@ class Gallery {
             bool uploadOpen = Gallery.AnyUploadDialogOpen();
             if (Gallery.filePicker.NeedsRedraw()
                 || Gallery.AnyUploadDialogRedraw()
-                || (!Gallery.filePicker.IsOpen() && !uploadOpen
+                || (!Gallery.filePicker.WindowModeOpen() && !uploadOpen
                     && (app.needsRedraw || driverPoll))) {
                 int since = Window.GetTickMs() - app.lastPresentMs;
                 if (app.lastPresentMs > 0 && since < 16) {
@@ -2749,7 +2749,7 @@ class Gallery {
                 if (r == 1) {
                     r = app.window.WaitEventTimeout(16);
                 }
-            } else if (!Gallery.filePicker.IsOpen() && !uploadOpen
+            } else if (!Gallery.filePicker.WindowModeOpen() && !uploadOpen
                        && (app.animNextMs >= 0 || app.fxNextMs >= 0)) {
                 // A throttled animation (spinner/skeleton) and/or the skin
                 // effect layer wants its next frame; idle until the earliest
@@ -3296,6 +3296,10 @@ class Gallery {
                 Gallery.photoIdx, Gallery.photoAnim);
             if (close) { Gallery.photosOpen.Set(false); }
         }
+
+        // FilePicker 的 Android 内嵌模态：窗口模式下是 no-op，桌面行为
+        // 不变（弹窗仍由主循环 RenderWindow 画在自己的窗口里）。
+        Gallery.filePicker.RenderOverlay(app);
 
         Layer.RenderToasts(app);
         Layer.RenderNotifs(app);
@@ -4488,6 +4492,13 @@ class Gallery {
         }
         if (name == "Chart.dashboard" && w < app.Scale(560)) {
             return app.Scale(834);
+        }
+        if (name == "Dropdown" && w < app.Scale(680)) {
+            // 窄视口三列放不下：演示退 2 列（<340 再退 1 列堆叠），
+            // 行数增加时框高跟着行数走，与 RenderDemo 的降列逻辑一致。
+            int rows = w < app.Scale(340) ? 3 : 2;
+            return rows * (app.theme.heightMedium + app.Scale(36))
+                + app.Scale(30);
         }
         return app.Scale(previewHUnscaled);
     }
@@ -11589,6 +11600,10 @@ class Gallery {
             // 各模式并排。月历/宫格弹层由 DatePicker 自己在框架的覆盖
             // 层里画（OnPaintOverlay），所以这里和普通字段没有区别：
             // 排进去就行。
+            // 两行都是 Flex.Wrapped 自适应换行；行高取实测 prefH 推
+            // 下一行起点——写死的 y+116 假设第一行只占一条 70 高度带，
+            // 手机宽度下折成多行时第二行会压上来（说明文字互相叠字）。
+            int rowW = w - app.Scale(36);
             Flex row = Flex.Wrapped().Gap(app.Scale(18)) {
                 Children = {
                     Gallery.Captioned(app, Gallery.demoDay, Gallery.T("date — the default", "date — 默认")),
@@ -11596,8 +11611,11 @@ class Gallery {
                     Gallery.Captioned(app, Gallery.demoSpan, Gallery.T("daterange — two-month panel, click start then end", "daterange — 左右双月历，点起始再点结束")),
                 },
             };
+            row.HintWrapWidth(rowW);
+            row.MeasureTree(app);
+            int row1H = row.prefH > 0 ? row.prefH : app.Scale(70);
             Gallery.LayoutAuto(app, row, name, px, y + app.Scale(34),
-                w - app.Scale(36), app.Scale(70));
+                rowW, row1H);
             // 第二行：Naive UI 其余取值粒度（周/月/季度/年 + 月区间）。
             Flex row2 = Flex.Wrapped().Gap(app.Scale(18)) {
                 Children = {
@@ -11608,8 +11626,11 @@ class Gallery {
                     Gallery.Captioned(app, Gallery.demoMonthRange, Gallery.T("monthrange — two panels, start then end", "monthrange — 双面板选月区间")),
                 },
             };
-            Gallery.LayoutAuto(app, row2, name, px, y + app.Scale(116),
-                w - app.Scale(36), app.Scale(70));
+            int row2Y = y + app.Scale(34) + row1H + app.Scale(14);
+            row2.HintWrapWidth(rowW);
+            row2.MeasureTree(app);
+            int row2H = row2.prefH > 0 ? row2.prefH : app.Scale(70);
+            Gallery.LayoutAuto(app, row2, name, px, row2Y, rowW, row2H);
         } else if (name == "ColorPicker") {
             // 弹层由 ColorPicker 自己在框架的覆盖层里画
             // （OnPaintOverlay），这里和普通字段没有区别：排进去就行。
@@ -12132,23 +12153,46 @@ class Gallery {
             // 提示语——保留选中值是 SelectBox 的事），右边 Rows(4) 长命令
             // 菜单滚动 + OnOpen/OnClose 事件。Retained：弹层延迟到覆盖层
             // 绘制，画在代码面板之上、点击不穿透、外部按下或 Esc 关闭。
+            // 三列桌面定宽 200、列距 240；窄视口按卡片内宽决定列数：
+            // 3 列放不下退 2 列，仍不够退 1 列纵向堆叠，列宽随行收缩。
+            int dgap = app.Scale(40);
+            int dcw = app.Scale(200);
+            int dcols = 3;
+            int dfit = (w - dgap * 2) / 3;
+            if (dcw > dfit) {
+                dcols = 2;
+                dfit = (w - dgap) / 2;
+                if (dfit >= app.Scale(150)) {
+                    dcw = dfit;
+                } else {
+                    dcols = 1;
+                    dcw = w < app.Scale(200) ? w : app.Scale(200);
+                }
+            }
+            int dstep = dcw + dgap;
+            int drowH = t.heightMedium + app.Scale(36);
             Gallery.demoDropdownAct.RenderInside(app,
-                new Rect(px, py, app.Scale(200), t.heightMedium));
+                new Rect(px, py, dcw, t.heightMedium));
             Gallery.demoDropdownManual.RenderInside(app,
-                new Rect(px + app.Scale(240), py, app.Scale(200), t.heightMedium));
+                new Rect(dcols == 3 ? px + dstep : px,
+                         dcols == 3 ? py : py + drowH, dcw, t.heightMedium));
             Gallery.demoDropdownTree.RenderInside(app,
-                new Rect(px + app.Scale(480), py, app.Scale(200), t.heightMedium));
-            Gallery.SelCaption(app, name, px, py + t.heightMedium + app.Scale(12),
+                new Rect(dcols == 3 ? px + dstep * 2 : (dcols == 2 ? px + dstep : px),
+                         dcols == 3 ? py : py + drowH, dcw, t.heightMedium));
+            int dcapY = py + t.heightMedium + app.Scale(12);
+            Gallery.SelCaption(app, name, px, dcapY,
                 Gallery.T("pick = run the action · trigger resets to its hint",
                           "选中即执行动作 · 触发器回到提示语"));
-            Gallery.SelCaption(app, name, px + app.Scale(240),
-                py + t.heightMedium + app.Scale(12),
-                Gallery.T("Rows(4) scrolls · open/close hit the header",
-                          "Rows(4) 长菜单滚动 · 开/关事件报在卡片头部"));
-            Gallery.SelCaption(app, name, px + app.Scale(480),
-                py + t.heightMedium + app.Scale(12),
-                Gallery.T("BindMenu: icons · submenu · disabled · danger",
-                          "BindMenu：图标 · 子菜单 · 禁用 · 危险项"));
+            if (dcols == 3) {
+                Gallery.SelCaption(app, name, px + dstep, dcapY,
+                    Gallery.T("Rows(4) scrolls · open/close hit the header",
+                              "Rows(4) 长菜单滚动 · 开/关事件报在卡片头部"));
+            }
+            if (dcols == 3) {
+                Gallery.SelCaption(app, name, px + dstep * 2, dcapY,
+                    Gallery.T("BindMenu: icons · submenu · disabled · danger",
+                              "BindMenu：图标 · 子菜单 · 禁用 · 危险项"));
+            }
         } else if (name == "Popover") {
             // Retained: click the trigger to open an anchored, word-wrapped,
             // click-blocking panel that closes on an outside press or Esc.
@@ -12314,9 +12358,14 @@ class Gallery {
     static void RenderLayerDemo(App app, Theme t, int px, int py, int w) {
         int bx = px;
         int by = py;
-        int bw = app.Scale(118);
-        int bh = t.heightMedium;
+        // 桌面三列定宽 118；窄视口（手机 ~412 逻辑宽）下 3×118+间隙超出
+        // 卡片内宽，第三列被屏幕裁掉。列宽从可用宽度反推，最小仍保
+        // Scale(84)（"Prompt password" 恰好放得下）。
         int gap = app.Scale(10);
+        int bw = app.Scale(118);
+        int fitBw = (w - gap * 2) / 3;
+        if (bw > fitBw && fitBw >= app.Scale(84)) { bw = fitBw; }
+        int bh = t.heightMedium;
         int rowGap = app.Scale(34);
 
         app.canvas.DrawStyledText(
@@ -12377,7 +12426,16 @@ class Gallery {
         }
         int w3 = new Button { Text = "Open form" }.Render(app, bx + (bw + gap) * 2, by, bw);
         if (Ui.Clicked(app, w3)) { Gallery.SpawnFormWindow(app); }
-        Gallery.PopupHint(app, bx + (bw + gap) * 3, by);
+        // 提示文本原本排第四列；窄视口上第四列出界（文本比列宽还长），
+        // 收不进时锚到最后一行按钮的顶部——文本画在 py+Scale(46)，正落在
+        // 末行按钮下方，不会压住「Prompt forms」的说明文字。
+        int hintX = bx + (bw + gap) * 3;
+        int hintY = by;
+        if (hintX + app.Scale(200) > bx + w) {
+            hintX = bx;
+            hintY = by + (bh + rowGap) * 2;
+        }
+        Gallery.PopupHint(app, hintX, hintY);
 
         by = by + bh + rowGap;
         app.canvas.DrawStyledText(
