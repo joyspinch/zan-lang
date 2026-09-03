@@ -757,8 +757,13 @@ EXPORT i32 zan_gui_show_window(iptr hwnd_val) {
         }
     }
 #endif
-    /* Route typed text (incl. IME commits) to this window. */
+    /* Route typed text (incl. IME commits) to this window. Android keeps
+     * the session closed until a text-editable takes focus
+     * (zan_gui_set_ime_open): a session latched open here summons the
+     * soft keyboard over the whole app with nothing to type into. */
+#ifndef __ANDROID__
     SDL_StartTextInput(win);
+#endif
     return 0;
 }
 
@@ -1222,6 +1227,16 @@ EXPORT void zan_gui_set_ime_pos(i32 x, i32 y) {
         SDL_Rect r = { (int)x, (int)y, 1, g_titlebar_h };
         SDL_SetTextInputArea(win, &r, 0);
     }
+}
+
+/* Open/close the text-input session. Android shows/hides the soft
+ * keyboard with the session, so the UI layer drives it from text-editable
+ * focus (FocusManager.UpdateImeSession). Desktop keeps the session open
+ * for the window's lifetime; start/stop there is idempotent. */
+EXPORT void zan_gui_set_ime_open(i32 on) {
+    SDL_Window *win = g_event_win ? g_event_win : g_main_win;
+    if (!win) { return; }
+    if (on) { SDL_StartTextInput(win); } else { SDL_StopTextInput(win); }
 }
 
 /* Native OS glass has no portable SDL equivalent; the software frosted-glass
