@@ -2,8 +2,10 @@ using System;
 using System.IO;
 using Gui.Component.CefBrowser;
 
-// CefHost 的 profile 槽位分配：多开时各占一个 profileN，占用判定是槽位目录
-// 里那个 lock 文件的独占锁，锁一释放槽位立即复用。
+// CefHost 的 profile 槽位分配：占用判定是槽位目录里那个 lock 文件的独占锁，
+// 锁一释放槽位立即复用。槽位不是固定从 1 顺排而是按可执行文件路径散列出的
+// 首选槽（PreferredSlot），所以测试不断言具体编号：先读出本进程的首选槽，
+// 占住另一个槽模拟「别副本已开」，然后断言本进程拿到自己的首选槽。
 class Program {
     static void Main() {
         // ProfileDir 拿的是运行时目录，槽位落在 <缓存>/Zan/Cache/profileN。
@@ -12,20 +14,28 @@ class Program {
         string root = CefHost.ProfileRoot(runtime);
         Console.WriteLine("root=" + (root == cache + "/Cache/profile"));
 
-        // 模拟已经开着的第一份副本：占住 profile1 的 lock 文件。
-        Directory.CreateDirectoryRecursive(root + "1");
-        long first = File.TryLock(root + "1/" + CefHost.ProfileLockName());
-        Console.WriteLine("slot1_taken=" + (first != 0));
+        // 本进程的首选槽（ProfileDir 会优先拿它）。
+        int preferred = CefHost.PreferredSlot(CefHost.MaxProfiles());
 
-        // 本进程于是拿到 profile2，并且结论会记住（同一进程只占一个槽位）。
+        // 模拟已经开着的第一份副本：占住 1 号槽的 lock 文件（1 号不一定是
+        // 本进程的首选槽，所以两个槽都可能出现；只有恰好相等时本进程才
+        // 顺位拿别的槽）。
+        int taken = preferred == 1 ? 2 : 1;
+        Directory.CreateDirectoryRecursive(root + Convert.ToString(taken));
+        long first = File.TryLock(root + Convert.ToString(taken)
+            + "/" + CefHost.ProfileLockName());
+        Console.WriteLine("slot_taken=" + (first != 0));
+
+        // 本进程于是拿到自己的首选槽，并且结论会记住（同一进程只占一个槽位）。
         string mine = CefHost.ProfileDir(runtime);
-        Console.WriteLine("mine=" + (mine == root + "2"));
+        Console.WriteLine("mine=" + (mine == root + Convert.ToString(preferred)));
         Console.WriteLine("stable=" + (CefHost.ProfileDir(runtime) == mine));
 
-        // profile1 的持有者退出（这里等价于释放锁）后槽位可复用。
-        Console.WriteLine("slot1_freed=" + File.Unlock(first));
-        long again = File.TryLock(root + "1/" + CefHost.ProfileLockName());
-        Console.WriteLine("slot1_reusable=" + (again != 0));
+        // 被占的槽释放（等价于那份副本退出）后可复用。
+        Console.WriteLine("slot_freed=" + File.Unlock(first));
+        long again = File.TryLock(root + Convert.ToString(taken)
+            + "/" + CefHost.ProfileLockName());
+        Console.WriteLine("slot_reusable=" + (again != 0));
         File.Unlock(again);
     }
 }
