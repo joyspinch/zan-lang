@@ -15,6 +15,7 @@ class DataPageKey {
     int size;
     string cursor;
 
+    /// 内部构造；文本字段 null 记空串。
     DataPageKey(string name, string canonical, int hash, int schema, int server,
                 int gen, int at, int pageSize, string token) {
         this.dataset = name;
@@ -31,6 +32,8 @@ class DataPageKey {
         if (this.cursor == null) { this.cursor = ""; }
     }
 
+    /// 以 token 携带的 generation/schema/server 身份构造页键；
+    /// token 为 null 时三者取 0。
     static DataPageKey Of(QueryDescriptor query, QueryViewport viewport,
                           QueryRequestToken token) {
         int gen = 0;
@@ -44,6 +47,7 @@ class DataPageKey {
         return DataPageKey.For(query, viewport, gen, schema, server);
     }
 
+    /// 以显式身份字段构造页键；query/viewport 为 null 时相应字段取零值。
     static DataPageKey For(QueryDescriptor query, QueryViewport viewport,
                            int gen, int schema, int server) {
         string name = "";
@@ -66,16 +70,26 @@ class DataPageKey {
             gen, at, size, cursor);
     }
 
+    /// 数据集名。
     string Dataset() { return this.dataset; }
+    /// canonical 查询文本。
     string QueryText() { return this.queryText; }
+    /// 查询指纹。
     int QueryHash() { return this.queryHash; }
+    /// schema 版本。
     int SchemaVersion() { return this.schemaVersion; }
+    /// 服务端 revision。
     int ServerRevision() { return this.serverRevision; }
+    /// 源 generation。
     int Generation() { return this.generation; }
+    /// 页起始行。
     int Start() { return this.start; }
+    /// 页大小。
     int Size() { return this.size; }
+    /// 续页 token。
     string Cursor() { return this.cursor; }
 
+    /// 九个身份字段全部相等才算同一页；other 为 null 返回 false。
     bool Same(DataPageKey other) {
         if (other == null) { return false; }
         return this.dataset == other.dataset
@@ -90,6 +104,8 @@ class DataPageKey {
     }
 }
 
+/// 页缓存条目：页键、结果与估算字节占用。pinned 的页不参与
+/// 淘汰；lastUse 记录最近使用的时钟值，供 LRU 比较。
 class DataPageCacheEntry {
     DataPageKey key;
     QueryResult result;
@@ -97,6 +113,7 @@ class DataPageCacheEntry {
     bool pinned;
     int lastUse;
 
+    /// 构造条目；pinned 初始为 false，lastUse 取时钟 stamp。
     DataPageCacheEntry(DataPageKey pageKey, QueryResult page,
                        int byteSize, int stamp) {
         this.key = pageKey;
@@ -106,10 +123,15 @@ class DataPageCacheEntry {
         this.lastUse = stamp;
     }
 
+    /// 页键。
     DataPageKey Key() { return this.key; }
+    /// 缓存的页结果。
     QueryResult Result() { return this.result; }
+    /// 估算字节占用。
     int Bytes() { return this.bytes; }
+    /// 是否被固定（不参与淘汰）。
     bool Pinned() { return this.pinned; }
+    /// 最近使用的时钟值。
     int LastUse() { return this.lastUse; }
 }
 
@@ -121,6 +143,7 @@ class DataPageCache {
     int clock;
     List<DataPageCacheEntry> entries;
 
+    /// 以字节预算构造缓存；预算钳制到 >=1。
     DataPageCache(int budget) {
         this.byteBudget = budget;
         if (this.byteBudget < 1) { this.byteBudget = 1; }
@@ -129,10 +152,14 @@ class DataPageCache {
         this.entries = new List<DataPageCacheEntry>();
     }
 
+    /// 缓存字节预算。
     int ByteBudget() { return this.byteBudget; }
+    /// 当前占用字节数。
     int Bytes() { return this.bytes; }
+    /// 缓存的页数。
     int Count() { return this.entries.Count; }
 
+    /// 按页键查找条目下标；未命中返回 -1。
     int Find(DataPageKey key) {
         for (int i = 0; i < this.entries.Count; i = i + 1) {
             if (this.entries[i].Key().Same(key)) { return i; }
@@ -140,6 +167,7 @@ class DataPageCache {
         return -1;
     }
 
+    /// 命中时返回页结果并刷新 LRU 时钟；未命中返回 null。
     QueryResult Get(DataPageKey key) {
         int at = this.Find(key);
         if (at < 0) { return null; }
@@ -148,6 +176,8 @@ class DataPageCache {
         return this.entries[at].Result();
     }
 
+    /// 按查询身份（dataset/text/hash + generation/schema/server）查找
+    /// 覆盖 row 的页并刷新 LRU；未命中返回 null。
     QueryResult GetRow(QueryDescriptor query, int generation,
                        int schema, int server, int row) {
         if (query == null || row < 0) { return null; }
@@ -169,11 +199,13 @@ class DataPageCache {
         return null;
     }
 
+    /// 设置页的固定标志；页不存在时为空操作。
     void SetPinned(DataPageKey key, bool value) {
         int at = this.Find(key);
         if (at >= 0) { this.entries[at].pinned = value; }
     }
 
+    /// 除 excluded 外最久未使用且未固定的条目下标；没有返回 -1。
     int OldestEvictableExcept(int excluded) {
         int found = -1;
         int stamp = 2147483647;
@@ -187,6 +219,7 @@ class DataPageCache {
         return found;
     }
 
+    /// 除 excluded 外可淘汰（未固定）条目的字节总量。
     int EvictableBytesExcept(int excluded) {
         int total = 0;
         for (int i = 0; i < this.entries.Count; i = i + 1) {
@@ -197,8 +230,10 @@ class DataPageCache {
         return total;
     }
 
+    /// 全缓存中最久未使用且未固定的条目下标；没有返回 -1。
     int OldestEvictable() { return this.OldestEvictableExcept(-1); }
 
+    /// 淘汰一个最久未使用的未固定页；无可淘汰返回 false。
     bool EvictOne() {
         int at = this.OldestEvictable();
         if (at < 0) { return false; }
@@ -247,6 +282,7 @@ class DataPageCache {
         return true;
     }
 
+    /// 清空缓存并归零字节数。
     void Clear() {
         this.entries.Clear();
         this.bytes = 0;

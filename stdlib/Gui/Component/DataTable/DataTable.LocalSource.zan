@@ -10,6 +10,7 @@ class LocalSortColumn {
     List<double> reals;
     List<bool> bools;
 
+    /// 以值类型 kind（0 文本、1 整数、2 实数、3 bool）建列，键数组为空。
     LocalSortColumn(int valueKind) {
         this.kind = valueKind;
         this.ints = new List<int>();
@@ -17,6 +18,7 @@ class LocalSortColumn {
         this.bools = new List<bool>();
     }
 
+    /// 追加一行的预解析键：按 kind 解析文本；kind=0（文本）不缓存。
     void Add(string value) {
         if (value == null) { value = ""; }
         if (this.kind == 1) { this.ints.Add(DataTable.ParseInt(value)); }
@@ -24,8 +26,11 @@ class LocalSortColumn {
         else if (this.kind == 3) { this.bools.Add(DataTable.ParseBool(value)); }
     }
 
+    /// 第 row 行的预解析整数键。
     int IntAt(int row) { return this.ints[row]; }
+    /// 第 row 行的预解析实数键。
     double RealAt(int row) { return this.reals[row]; }
+    /// 第 row 行的预解析 bool 键。
     bool BoolAt(int row) { return this.bools[row]; }
 }
 
@@ -46,6 +51,7 @@ class LocalFilterColumn {
     List<double> reals;
     List<bool> bools;
 
+    /// 构造过滤列：类型化（kind 1–3）的两个比较值在构造时解析一次。
     LocalFilterColumn(int valueKind, int op, string a, string b) {
         this.kind = valueKind;
         this.mode = op;
@@ -74,6 +80,7 @@ class LocalFilterColumn {
         this.bools = new List<bool>();
     }
 
+    /// 追加一行的预解析值：按 kind 解析文本；kind=0（文本）不缓存。
     void Add(string value) {
         if (value == null) { value = ""; }
         if (this.kind == 1) { this.ints.Add(DataTable.ParseInt(value)); }
@@ -81,6 +88,9 @@ class LocalFilterColumn {
         else if (this.kind == 3) { this.bools.Add(DataTable.ParseBool(value)); }
     }
 
+    /// 第 row 行是否通过本列过滤。类型化操作按预解析值比较
+    /// （Between 为闭区间；bool 只支持 Equals），Empty/NotEmpty
+    /// 始终按原始文本判断，其余模式回退 PassText 的文本语义。
     bool Pass(string raw, int row) {
         if (raw == null) { raw = ""; }
         if (this.kind == 1) {
@@ -108,6 +118,9 @@ class LocalFilterColumn {
             : this.PassText(raw));
     }
 
+    /// 对原始文本执行文本语义比较：Contains/StartsWith/EndsWith、
+    /// 字典序比较（Equals/Greater/Less 及组合）与闭区间 Between；
+    /// 未识别的模式放行。
     bool PassText(string value) {
         int cmp = DataTable.CompareStr(value, this.aText);
         if (this.mode == QueryFilterMode.Contains) {
@@ -150,6 +163,7 @@ class LocalDataSource : QueryDataSource {
     /// null 时 cell 增量按"列索引即 Field 数字"解释。
     CellFieldLookup cellFieldOf;
 
+    /// 以行快照构造本地源；null 行归一化为空 DataRow。
     LocalDataSource(List<DataRow> values) {
         this.Setup();
         this.rows = new List<DataRow>();
@@ -172,6 +186,7 @@ class LocalDataSource : QueryDataSource {
     /// 否则表头排序与列筛选对全内存数据静默失效。
     override bool ServerControlled() { return false; }
 
+    /// 列数取 schema 宽度与各行宽度的最大值。
     int ColumnCount() {
         int width = this.DescribeSchema().Count;
         for (int i = 0; i < this.rows.Count; i = i + 1) {
@@ -182,6 +197,7 @@ class LocalDataSource : QueryDataSource {
         return width;
     }
 
+    /// 深复制替换内存行，并 Refresh 使页缓存与查询失效。
     void ReplaceRows(List<DataRow> values) {
         this.rows = new List<DataRow>();
         if (values != null) {
@@ -193,6 +209,7 @@ class LocalDataSource : QueryDataSource {
         this.Refresh();
     }
 
+    /// 安装行键提供者并 Refresh；null 恢复 legacy 位置键。
     void SetKeyProvider(RowKeyProvider provider) {
         this.keyProvider = provider;
         this.Refresh();
@@ -203,6 +220,7 @@ class LocalDataSource : QueryDataSource {
         this.cellFieldOf = lookup;
     }
 
+    /// 全部内存行的深拷贝列表。
     List<DataRow> Snapshot() {
         List<DataRow> result = new List<DataRow>();
         for (int i = 0; i < this.rows.Count; i = i + 1) {
@@ -211,18 +229,22 @@ class LocalDataSource : QueryDataSource {
         return result;
     }
 
+    /// 当前结果 total 已知时为过滤后的总行数，否则为内存行数。
     override int RowCount() {
         QueryResult current = this.CurrentResult();
         if (current != null && current.TotalKnown()) { return current.Total(); }
         return this.rows.Count;
     }
 
+    /// 第 row 行的原始行键：keyProvider 优先，否则 legacy 位置键；越界返回 null。
     RowKey RawKey(int row) {
         if (row < 0 || row >= this.rows.Count) { return null; }
         if (this.keyProvider != null) { return this.keyProvider.Key(this, row); }
         return RowKey.Legacy(row);
     }
 
+    /// 显示行索引 -> 内存行索引。当前页/缓存未覆盖该行时原样返回
+    /// row（冷启动直读内存）；否则按键匹配内存行，匹配不到返回 -1。
     int SourceRowFor(int row) {
         QueryResult current = this.CurrentResult();
         if (current == null || !current.Covers(row)) {
@@ -238,6 +260,8 @@ class LocalDataSource : QueryDataSource {
         return -1;
     }
 
+    /// 当前页或缓存覆盖该行时为 true；二者皆无时仅当尚无当前结果
+    /// 且 row 在内存范围内为 true（冷启动直读内存）。
     override bool CellReady(int row, int col) {
         QueryResult current = this.CurrentResult();
         if (current != null && current.Covers(row)) { return true; }
@@ -245,6 +269,7 @@ class LocalDataSource : QueryDataSource {
         return current == null && row >= 0 && row < this.rows.Count;
     }
 
+    /// 行业务身份：当前页/缓存中的键优先，否则回退 RawKey。
     override RowKey GetRowKey(int row) {
         QueryResult current = this.CurrentResult();
         if (current != null && current.Covers(row)) {
@@ -259,6 +284,8 @@ class LocalDataSource : QueryDataSource {
         return this.RawKey(row);
     }
 
+    /// 单元格文本：当前页/缓存优先，冷启动（无当前结果）直读内存行；
+    /// 其余情况为空串。
     override string CellText(int row, int col) {
         QueryResult current = this.CurrentResult();
         if (current != null && current.Covers(row)) {
@@ -270,6 +297,7 @@ class LocalDataSource : QueryDataSource {
         return this.rows[row].At(col);
     }
 
+    /// 写单元格：把显示行解析为内存行后写值并 Refresh；无法解析时忽略。
     override void SetCell(int row, int col, string value) {
         int sourceRow = this.SourceRowFor(row);
         if (sourceRow < 0 || sourceRow >= this.rows.Count) { return; }
@@ -277,6 +305,7 @@ class LocalDataSource : QueryDataSource {
         this.Refresh();
     }
 
+    /// 本地源支持插行。
     override bool CanInsert() { return true; }
 
     /// 当前内存行里键为 `canonical` 的行索引；找不到返回 -1。
@@ -350,6 +379,7 @@ class LocalDataSource : QueryDataSource {
         return result;
     }
 
+    /// 在内存位置 at 插入空行并 Refresh；位置越界返回 false。
     override bool InsertRow(int at) {
         if (at < 0 || at > this.rows.Count) { return false; }
         this.rows.Insert(at, new DataRow());
@@ -357,6 +387,7 @@ class LocalDataSource : QueryDataSource {
         return true;
     }
 
+    /// 删除内存位置 at 的行并 Refresh；位置越界返回 false。
     override bool RemoveRow(int at) {
         if (at < 0 || at >= this.rows.Count) { return false; }
         this.rows.RemoveAt(at);
@@ -364,6 +395,8 @@ class LocalDataSource : QueryDataSource {
         return true;
     }
 
+    /// 按 kind（1 整数、2 实数、3 bool、其余文本）比较两个单元格文本，
+    /// 返回 -1/0/1。
     int CompareValue(string leftText, string rightText, int kind) {
         if (leftText == null) { leftText = ""; }
         if (rightText == null) { rightText = ""; }
@@ -385,6 +418,8 @@ class LocalDataSource : QueryDataSource {
         return DataTable.CompareStr(leftText, rightText);
     }
 
+    /// 以给定模式/值类型判断单元格文本是否通过过滤：Between 为闭
+    /// 区间，Empty/NotEmpty 按文本长度，未识别的模式放行。
     bool FilterPassValues(string value, int mode, string a, string b, int kind) {
         if (value == null) { value = ""; }
         if (a == null) { a = ""; }
@@ -418,12 +453,14 @@ class LocalDataSource : QueryDataSource {
         return true;
     }
 
+    /// FilterPassValues 的子句形式；clause 为 null 时一律不通过。
     bool FilterPass(string value, QueryFilterClause clause) {
         if (clause == null) { return false; }
         return this.FilterPassValues(value, clause.Mode(), clause.Value(),
             clause.Value2(), clause.Kind());
     }
 
+    /// 为计划的每个过滤子句预解析全部内存行，构造查询内过滤缓存。
     List<LocalFilterColumn> BuildFilterColumns(QueryPlan plan) {
         List<LocalFilterColumn> columns = new List<LocalFilterColumn>();
         for (int i = 0; i < plan.FilterCount(); i = i + 1) {
@@ -437,6 +474,7 @@ class LocalDataSource : QueryDataSource {
         return columns;
     }
 
+    /// 第 row 行是否通过计划的全部过滤子句。
     bool RowPasses(int row, QueryPlan plan, List<LocalFilterColumn> columns) {
         for (int i = 0; i < plan.FilterCount(); i = i + 1) {
             if (!columns[i].Pass(this.rows[row].At(plan.FilterColumnAt(i)), row)) {
@@ -446,6 +484,7 @@ class LocalDataSource : QueryDataSource {
         return true;
     }
 
+    /// 为计划的每个排序键预解析全部内存行。
     List<LocalSortColumn> BuildSortColumns(QueryPlan plan) {
         List<LocalSortColumn> columns = new List<LocalSortColumn>();
         for (int i = 0; i < plan.SortCount(); i = i + 1) {
@@ -458,6 +497,8 @@ class LocalDataSource : QueryDataSource {
         return columns;
     }
 
+    /// 按计划的排序键字典序比较两行：类型化键比较预解析值，dir=2
+    /// 反转该键；全键相等时按内存行序保持稳定。
     int CompareRows(int left, int right, QueryPlan plan,
                     List<LocalSortColumn> columns) {
         for (int i = 0; i < plan.SortCount(); i = i + 1) {
@@ -487,6 +528,7 @@ class LocalDataSource : QueryDataSource {
         return left < right ? -1 : (left > right ? 1 : 0);
     }
 
+    /// 对 order 做稳定归并排序（比较走 CompareRows）；无排序键时不变。
     void SortOrder(List<int> order, QueryPlan plan,
                    List<LocalSortColumn> columns) {
         int n = order.Count;
@@ -518,6 +560,8 @@ class LocalDataSource : QueryDataSource {
         }
     }
 
+    /// 单个分组列的规范化分组原子：整数/实数/bool 按解析值转文本，
+    /// 其余原样。
     string GroupAtom(string value, int kind) {
         if (value == null) { value = ""; }
         if (kind == 1) { return Convert.ToString(DataTable.ParseInt(value)); }
@@ -529,6 +573,7 @@ class LocalDataSource : QueryDataSource {
         return value;
     }
 
+    /// 一行在全部分组列下的组合键；原子带长度前缀，避免相邻值粘连歧义。
     string GroupKey(int row, QueryPlan plan) {
         string key = "";
         for (int i = 0; i < plan.GroupCount(); i = i + 1) {
@@ -539,6 +584,7 @@ class LocalDataSource : QueryDataSource {
         return key;
     }
 
+    /// 累加 key 的行计数；不存在则新建计数为 1 的桶。
     void AddGroupBucket(List<QueryGroupBucket> buckets, string key) {
         for (int i = 0; i < buckets.Count; i = i + 1) {
             if (buckets[i].Key() == key) {
@@ -550,6 +596,7 @@ class LocalDataSource : QueryDataSource {
         buckets.Add(new QueryGroupBucket(key, 1));
     }
 
+    /// 按给定行序构建分组桶（组合键 -> 行数）。
     List<QueryGroupBucket> BuildGroups(List<int> order, QueryPlan plan) {
         List<QueryGroupBucket> buckets = new List<QueryGroupBucket>();
         for (int i = 0; i < order.Count; i = i + 1) {
@@ -558,6 +605,7 @@ class LocalDataSource : QueryDataSource {
         return buckets;
     }
 
+    /// 把单元格文本按 kind 转为聚合用实数：bool 视为 1/0，其余走 ParseReal。
     double AggregateNumber(string value, int kind) {
         if (kind == 1) { return (double)DataTable.ParseInt(value); }
         if (kind == 2) { return DataTable.ParseReal(value); }
@@ -568,6 +616,8 @@ class LocalDataSource : QueryDataSource {
         return DataTable.ParseReal(value);
     }
 
+    /// 计算计划的全部聚合：count（mode 5）为行数；kind=0 的 min/max
+    /// 按字典序选原始文本；数值聚合经 AggregateNumber，空集得 0。
     List<QueryAggregateValue> BuildAggregates(List<int> order, QueryPlan plan) {
         List<QueryAggregateValue> values = new List<QueryAggregateValue>();
         for (int ai = 0; ai < plan.AggregateCount(); ai = ai + 1) {
@@ -607,6 +657,9 @@ class LocalDataSource : QueryDataSource {
         return values;
     }
 
+    /// 同步执行一页查询：校验计划 -> 过滤 -> 排序 -> 视口切片，
+    /// total 为过滤后行数，行 revision 恒为 0；带分组/聚合时附带
+    /// 形状结果。token/viewport/query 任一为 null 返回 null。
     override QueryResult Execute(QueryDescriptor query,
                                   QueryViewport viewport,
                                   QueryRequestToken token) {

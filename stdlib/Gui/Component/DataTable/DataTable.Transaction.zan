@@ -12,6 +12,7 @@ class TableMutation {
     int expectedRevision;
     string value;
 
+    /// 构造 mutation；id/value 为 null 时记为空串。
     TableMutation(string id, RowKey key, int col, int revision, string nextValue) {
         this.mutationId = id;
         this.rowKey = key;
@@ -22,22 +23,30 @@ class TableMutation {
         if (this.value == null) { this.value = ""; }
     }
 
+    /// 构造一个单元格修改；revision 为提交时客户端已知的行 revision。
     static TableMutation Cell(string id, RowKey key, int col,
                               int revision, string nextValue) {
         return new TableMutation(id, key, col, revision, nextValue);
     }
 
+    /// 事务内唯一的 mutation 标识。
     string MutationId() { return this.mutationId; }
+    /// 目标行业务身份。
     RowKey Key() { return this.rowKey; }
+    /// 目标列索引。
     int Column() { return this.column; }
+    /// 乐观并发校验的期望行 revision；服务端值不一致即冲突。
     int ExpectedRevision() { return this.expectedRevision; }
+    /// 新单元格文本。
     string Value() { return this.value; }
 
+    /// id 非空、rowKey 存在、列索引与期望 revision 均非负时为 true。
     bool IsValid() {
         return this.mutationId.Length > 0 && this.rowKey != null
             && this.column >= 0 && this.expectedRevision >= 0;
     }
 
+    /// 序列化为传输 JSON（id/key/col/rev/value）；rowKey 为 null 时 key 记空串。
     string ToJson() {
         JsonValue root = JsonValue.NewObject();
         root.Put("id", JsonValue.NewStr(this.mutationId));
@@ -51,19 +60,28 @@ class TableMutation {
 
 /// 事务提交策略。
 class TransactionMode {
+    /// 全部成功才提交，任一失败整体拒绝。
     static const int AllOrNothing = 1;
+    /// 尽力而为：允许部分 mutation 被拒绝，其余照常生效。
     static const int BestEffort = 2;
 }
 
 /// 事务生命周期：Draft -> Validating -> Pending -> Acked，
 /// 失败分支为 Rejected/Conflict/Cancelled。
 class TransactionState {
+    /// 草稿：仍可追加 mutation。
     static const int Draft = 1;
+    /// 本地校验中：不再接受修改。
     static const int Validating = 2;
+    /// 已提交，等待服务端结果。
     static const int Pending = 3;
+    /// 服务端确认全部生效。
     static const int Acked = 4;
+    /// 服务端拒绝。
     static const int Rejected = 5;
+    /// 乐观并发冲突。
     static const int Conflict = 6;
+    /// 提交前或等待中被取消。
     static const int Cancelled = 7;
 }
 
@@ -76,6 +94,7 @@ class TableTransaction {
     List<TableMutation> mutations;
     string error;
 
+    /// 构造 Draft 事务；id 为 null 记空串，mode 非法时回退为 AllOrNothing。
     TableTransaction(string id, int transactionMode) {
         this.transactionId = id;
         this.mode = transactionMode;
@@ -89,16 +108,24 @@ class TableTransaction {
         this.error = "";
     }
 
+    /// 创建 Draft 事务。
     static TableTransaction Create(string id, int transactionMode) {
         return new TableTransaction(id, transactionMode);
     }
 
+    /// 事务标识。
     string TransactionId() { return this.transactionId; }
+    /// 提交策略（TransactionMode）。
     int Mode() { return this.mode; }
+    /// 当前生命周期状态（TransactionState）。
     int State() { return this.state; }
+    /// 失败/冲突原因文本；未失败时为空串。
     string Error() { return this.error; }
+    /// 已加入的 mutation 数量。
     int Count() { return this.mutations.Count; }
 
+    /// 事务可提交：id 非空、mode 合法、至少一个 mutation 且每个
+    /// mutation 有效，mutationId 无重复。
     bool IsValid() {
         if (this.transactionId.Length == 0
             || (this.mode != TransactionMode.AllOrNothing
@@ -116,6 +143,7 @@ class TableTransaction {
         return true;
     }
 
+    /// 事务内是否已存在该 id 的 mutation；id 为 null 返回 false。
     bool HasMutationId(string id) {
         if (id == null) { return false; }
         for (int i = 0; i < this.mutations.Count; i = i + 1) {
@@ -124,6 +152,7 @@ class TableTransaction {
         return false;
     }
 
+    /// 仅在 Draft 阶段接受有效且 id 不重复的 mutation；否则返回 false。
     bool Add(TableMutation mutation) {
         if (this.state != TransactionState.Draft || mutation == null
             || !mutation.IsValid()) { return false; }
@@ -134,6 +163,7 @@ class TableTransaction {
         return true;
     }
 
+    /// 第 index 个 mutation 的复制值；越界返回 null。
     TableMutation At(int index) {
         if (index < 0 || index >= this.mutations.Count) { return null; }
         TableMutation m = this.mutations[index];
@@ -141,6 +171,7 @@ class TableTransaction {
             m.ExpectedRevision(), m.Value());
     }
 
+    /// 进入校验阶段：要求处于 Draft 且至少有一个 mutation；成功后状态为 Validating。
     bool BeginValidation() {
         if (this.state != TransactionState.Draft || this.mutations.Count == 0) {
             return false;
@@ -149,18 +180,21 @@ class TableTransaction {
         return true;
     }
 
+    /// Validating -> Pending，表示即将提交；其它状态返回 false。
     bool MarkPending() {
         if (this.state != TransactionState.Validating) { return false; }
         this.state = TransactionState.Pending;
         return true;
     }
 
+    /// Pending -> Acked；仅在 Pending 状态成功。
     bool Ack() {
         if (this.state != TransactionState.Pending) { return false; }
         this.state = TransactionState.Acked;
         return true;
     }
 
+    /// Pending -> Rejected 并记录原因 message（null 记空串）。
     bool Reject(string message) {
         if (this.state != TransactionState.Pending) { return false; }
         this.error = message;
@@ -169,6 +203,7 @@ class TableTransaction {
         return true;
     }
 
+    /// Pending -> Conflict 并记录冲突详情 message（null 记空串）。
     bool MarkConflict(string message) {
         if (this.state != TransactionState.Pending) { return false; }
         this.error = message;
@@ -177,6 +212,7 @@ class TableTransaction {
         return true;
     }
 
+    /// Draft/Validating/Pending -> Cancelled；终态不可取消。
     bool Cancel() {
         if (this.state != TransactionState.Draft
             && this.state != TransactionState.Validating
@@ -185,6 +221,7 @@ class TableTransaction {
         return true;
     }
 
+    /// 处于 Acked/Rejected/Conflict/Cancelled 任一终态时为 true。
     bool IsTerminal() {
         return this.state == TransactionState.Acked
             || this.state == TransactionState.Rejected
@@ -192,6 +229,7 @@ class TableTransaction {
             || this.state == TransactionState.Cancelled;
     }
 
+    /// 序列化为传输 JSON：事务身份加逐个 mutation 的 JSON 对象数组。
     string ToJson() {
         JsonValue root = JsonValue.NewObject();
         root.Put("ver", JsonValue.NewNum("1"));
@@ -211,6 +249,7 @@ class TableTransaction {
 
 /// 单个 mutation 的服务端结果。
 class MutationResult {
+    /// 1 接受、2 拒绝、3 冲突、4 取消。
     static const int Accepted = 1;
     static const int Rejected = 2;
     static const int Conflict = 3;
@@ -223,6 +262,7 @@ class MutationResult {
     int serverRevision;
     string message;
 
+    /// 构造结果；各文本字段为 null 时记为空串。
     MutationResult(string id, int resultStatus, string canonical,
                    string server, int revision, string detail) {
         this.mutationId = id;
@@ -237,27 +277,38 @@ class MutationResult {
         if (this.message == null) { this.message = ""; }
     }
 
+    /// 接受：canonical 为规范化后的新值，revision 为服务端行 revision。
     static MutationResult AcceptedValue(string id, string value, int revision) {
         return new MutationResult(id, MutationResult.Accepted, value, "", revision, "");
     }
+    /// 拒绝：detail 说明原因，serverRevision 为 -1。
     static MutationResult RejectedValue(string id, string detail) {
         return new MutationResult(id, MutationResult.Rejected, "", "", -1, detail);
     }
+    /// 冲突：server/serverRevision 为服务端当前值与行 revision。
     static MutationResult ConflictValue(string id, string server, int revision,
                                         string detail) {
         return new MutationResult(id, MutationResult.Conflict, "", server, revision, detail);
     }
+    /// 取消：detail 说明原因，serverRevision 为 -1。
     static MutationResult CancelledValue(string id, string detail) {
         return new MutationResult(id, MutationResult.Cancelled, "", "", -1, detail);
     }
 
+    /// 对应的 mutation 标识。
     string MutationId() { return this.mutationId; }
+    /// 结果状态（Accepted/Rejected/Conflict/Cancelled）。
     int Status() { return this.status; }
+    /// 接受时的规范化新值；其它状态为空串。
     string CanonicalValue() { return this.canonicalValue; }
+    /// 冲突时的服务端当前值；其它状态为空串。
     string ServerValue() { return this.serverValue; }
+    /// 服务端行 revision；拒绝/取消时为 -1。
     int ServerRevision() { return this.serverRevision; }
+    /// 失败/冲突说明文本。
     string Message() { return this.message; }
 
+    /// id 非空且状态为四个合法值之一时为 true。
     bool IsValid() {
         return this.mutationId.Length > 0
             && (this.status == MutationResult.Accepted
@@ -266,6 +317,7 @@ class MutationResult {
                 || this.status == MutationResult.Cancelled);
     }
 
+    /// 单个结果的传输 JSON（id/status/canonical/server/revision/message）。
     string ToJson() {
         JsonValue root = JsonValue.NewObject();
         root.Put("id", JsonValue.NewStr(this.mutationId));
@@ -281,6 +333,7 @@ class MutationResult {
 /// 一次事务的不可变结果快照。结果列表通过 Add 只在构造阶段填充，
 /// 读取时使用 ResultAt 的复制值，避免调用方修改内部对象。
 class TableTransactionResult {
+    /// 1 确认、2 拒绝、3 冲突、4 取消。
     static const int Acked = 1;
     static const int Rejected = 2;
     static const int Conflict = 3;
@@ -290,6 +343,7 @@ class TableTransactionResult {
     int status;
     List<MutationResult> results;
 
+    /// 构造结果快照；id 为 null 记空串，results 由 Add 填充。
     TableTransactionResult(string id, int resultStatus) {
         this.transactionId = id;
         this.status = resultStatus;
@@ -297,14 +351,19 @@ class TableTransactionResult {
         this.results = new List<MutationResult>();
     }
 
+    /// 创建指定状态的结果快照。
     static TableTransactionResult Create(string id, int resultStatus) {
         return new TableTransactionResult(id, resultStatus);
     }
 
+    /// 事务标识。
     string TransactionId() { return this.transactionId; }
+    /// 事务级状态（Acked/Rejected/Conflict/Cancelled）。
     int Status() { return this.status; }
+    /// 单个结果条数。
     int Count() { return this.results.Count; }
 
+    /// 结果可采信：id 非空、状态合法且至少包含一条结果。
     bool IsValid() {
         return this.transactionId.Length > 0
             && (this.status == TableTransactionResult.Acked
@@ -314,12 +373,14 @@ class TableTransactionResult {
             && this.results.Count > 0;
     }
 
+    /// 构造阶段追加一条结果；null 被忽略并返回 false。
     bool Add(MutationResult result) {
         if (result == null) { return false; }
         this.results.Add(result);
         return true;
     }
 
+    /// 第 index 个结果的复制值；越界返回 null。
     MutationResult ResultAt(int index) {
         if (index < 0 || index >= this.results.Count) { return null; }
         MutationResult r = this.results[index];
@@ -327,6 +388,7 @@ class TableTransactionResult {
             r.ServerValue(), r.ServerRevision(), r.Message());
     }
 
+    /// 状态为 Accepted 的结果条数。
     int AcceptedCount() {
         int count = 0;
         for (int i = 0; i < this.results.Count; i = i + 1) {
@@ -335,8 +397,10 @@ class TableTransactionResult {
         return count;
     }
 
+    /// 非 Accepted 的结果条数（含取消）。
     int FailedCount() { return this.results.Count - this.AcceptedCount(); }
 
+    /// 深复制：状态与全部结果逐条复制，内部列表与原对象独立。
     TableTransactionResult Copy() {
         TableTransactionResult copy = TableTransactionResult.Create(
             this.transactionId, this.status);
@@ -349,6 +413,7 @@ class TableTransactionResult {
         return copy;
     }
 
+    /// 序列化为传输 JSON：事务 id/status 加逐条结果的 JSON 对象数组。
     string ToJson() {
         JsonValue root = JsonValue.NewObject();
         root.Put("ver", JsonValue.NewNum("1"));

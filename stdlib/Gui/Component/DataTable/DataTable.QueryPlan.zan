@@ -11,6 +11,7 @@ class QueryPlanIssue {
     int column;
     int clause;
 
+    /// 构造校验问题；col 为出错列索引、at 为出错子句索引，与列/子句无关时均为 -1。
     QueryPlanIssue(int c, string msg, int col, int at) {
         this.code = c;
         this.message = msg;
@@ -18,28 +19,46 @@ class QueryPlanIssue {
         this.clause = at;
     }
 
+    /// 稳定错误码，取值见 QueryPlan 的 Invalid*/Unsupported* 常量。
     int Code() { return this.code; }
+    /// 面向日志与远端传输的错误文本。
     string Message() { return this.message; }
+    /// 出错列索引；与列无关时为 -1。
     int Column() { return this.column; }
+    /// 出错子句在其类别列表中的索引；与子句无关时为 -1。
     int Clause() { return this.clause; }
 }
 
 /// 已校验的查询快照。调用方不能通过它修改原 QueryDescriptor；过滤器
 /// 和排序键在构造时逐项复制，只通过按索引读取暴露给执行器。
 class QueryPlan {
+    /// 1：查询描述为 null，或某个子句为 null。
     static const int InvalidQuery = 1;
+    /// 2：data/query/view revision 出现负数。
     static const int InvalidRevision = 2;
+    /// 3：过滤列索引超出 schema 列数。
     static const int InvalidFilterColumn = 3;
+    /// 4：排序/分组/聚合列索引超出 schema 列数。
     static const int InvalidSortColumn = 4;
+    /// 5：数据源不支持过滤却携带过滤子句。
     static const int UnsupportedFilter = 5;
+    /// 6：数据源不支持排序却携带排序子句。
     static const int UnsupportedSort = 6;
+    /// 7：过滤操作符不在 QueryFilterMode 的 1–11 范围内。
     static const int InvalidFilterOperator = 7;
+    /// 8：子句值类型 kind 不在 0–3 范围内。
     static const int InvalidValueKind = 8;
+    /// 9：排序方向不是 1（升序）或 2（降序）。
     static const int InvalidSortDirection = 9;
+    /// 10：预留错误码，当前构建流程不会产生。
     static const int EmptyDataset = 10;
+    /// 11：子句值类型 kind 与 schema 列的 ValueType 不匹配。
     static const int SchemaValueKindMismatch = 11;
+    /// 12：数据源不支持分组却携带分组子句。
     static const int UnsupportedGroup = 12;
+    /// 13：数据源不支持聚合却携带聚合子句。
     static const int UnsupportedAggregate = 13;
+    /// 14：聚合模式不在 1–5 范围内。
     static const int InvalidAggregateMode = 14;
 
     string dataset;
@@ -54,6 +73,8 @@ class QueryPlan {
     List<QueryAggregateClause> aggregates;
     QueryPlanIssue issue;
 
+    /// 构造计划快照：四类子句逐项复制（跳过 null 项），null 列表按空处理；
+    /// dataset/queryText 为 null 时记为空串。
     QueryPlan(string name, string text, int hash, int dataRev, int queryRev,
               int caps, List<QueryFilterClause> fs, List<QuerySortClause> ss,
               List<QueryGroupClause> gs, List<QueryAggregateClause> aggs,
@@ -119,12 +140,16 @@ class QueryPlan {
             fs, ss, gs, aggs, null);
     }
 
+    /// 保留原计划的身份与子句集合，仅附加校验问题，得到失败计划副本。
     static QueryPlan Fail(QueryPlan plan, QueryPlanIssue problem) {
         return new QueryPlan(plan.Dataset(), plan.QueryText(), plan.QueryHash(),
             plan.DataRevision(), plan.QueryRevision(), plan.Capabilities(),
             plan.filters, plan.sorts, plan.groups, plan.aggregates, problem);
     }
 
+    /// 判断查询值 kind（0 文本、1 整数、2 实数、3 bool）能否作用于
+    /// schema 列的 ValueType（按 TableValue kind 编号：1 文本、2 整数、
+    /// 3 实数、4 bool）；文本查询额外接受 ValueType 0。
     static bool SchemaKindMatches(int schemaKind, int queryKind) {
         if (queryKind == 0) { return schemaKind == 0 || schemaKind == 1; }
         if (queryKind == 1) { return schemaKind == 2; }
@@ -133,6 +158,9 @@ class QueryPlan {
         return false;
     }
 
+    /// 按 schema 校验并构建计划：在无 schema 版本（列数校验、能力检查）
+    /// 通过后，追加“子句值 kind 与列 ValueType 匹配”检查，过滤/排序/
+    /// 分组/聚合逐类检查，首个不匹配即以 SchemaValueKindMismatch 失败返回。
     static QueryPlan Build(QueryDescriptor query, List<SchemaColumn> schema,
                            QueryCapabilities supported) {
         int columnCount = -1;
@@ -182,6 +210,10 @@ class QueryPlan {
         return plan;
     }
 
+    /// 校验查询并构建计划：检查 revision 非负、各类子句非空且列索引/
+    /// 操作符/方向/kind 合法，并确认所需能力在 supported 掩码内；
+    /// 首个问题即作为 issue 返回（子句列表仍原样复制进计划）。
+    /// columnCount<0 表示列数未知，跳过列越界检查。
     static QueryPlan Build(QueryDescriptor query, int columnCount,
                            QueryCapabilities supported) {
         if (query == null) {
@@ -353,82 +385,111 @@ class QueryPlan {
             query.Filters(), query.Sorts(), query.Groups(), query.Aggregates(), null);
     }
 
+    /// 计划无校验问题时为 true。
     bool IsValid() { return this.issue == null; }
+    /// 校验问题；有效计划为 null。
     QueryPlanIssue Issue() { return this.issue; }
+    /// 校验错误文本；无问题时为空串。
     string Error() { return this.issue == null ? "" : this.issue.Message(); }
+    /// 目标数据集名。
     string Dataset() { return this.dataset; }
+    /// 构建时锁定的 canonical 查询文本。
     string QueryText() { return this.queryText; }
+    /// 查询指纹（QueryDescriptor.QueryFingerprint）。
     int QueryHash() { return this.queryHash; }
+    /// 构建时的数据 revision。
     int DataRevision() { return this.dataRevision; }
+    /// 构建时的查询 revision。
     int QueryRevision() { return this.queryRevision; }
+    /// 执行器可见的能力掩码。
     int Capabilities() { return this.capabilities; }
+    /// 过滤子句数量。
     int FilterCount() { return this.filters.Count; }
+    /// 排序子句数量。
     int SortCount() { return this.sorts.Count; }
+    /// 第 index 个过滤子句的列索引；越界返回 -1。
     int FilterColumnAt(int index) {
         if (index < 0 || index >= this.filters.Count) { return -1; }
         return this.filters[index].Column();
     }
+    /// 第 index 个过滤子句的操作符（QueryFilterMode）；越界返回 0。
     int FilterModeAt(int index) {
         if (index < 0 || index >= this.filters.Count) { return 0; }
         return this.filters[index].Mode();
     }
+    /// 第 index 个过滤子句的值类型 kind；越界返回 -1。
     int FilterKindAt(int index) {
         if (index < 0 || index >= this.filters.Count) { return -1; }
         return this.filters[index].Kind();
     }
+    /// 第 index 个过滤子句的第一比较值；越界返回空串。
     string FilterValueAt(int index) {
         if (index < 0 || index >= this.filters.Count) { return ""; }
         return this.filters[index].Value();
     }
+    /// 第 index 个过滤子句的第二比较值（Between 的上界）；越界返回空串。
     string FilterValue2At(int index) {
         if (index < 0 || index >= this.filters.Count) { return ""; }
         return this.filters[index].Value2();
     }
+    /// 第 index 个排序子句的列索引；越界返回 -1。
     int SortColumnAt(int index) {
         if (index < 0 || index >= this.sorts.Count) { return -1; }
         return this.sorts[index].Column();
     }
+    /// 第 index 个排序子句的方向（1 升序、2 降序）；越界返回 0。
     int SortDirectionAt(int index) {
         if (index < 0 || index >= this.sorts.Count) { return 0; }
         return this.sorts[index].Direction();
     }
+    /// 第 index 个排序子句的值类型 kind；越界返回 -1。
     int SortKindAt(int index) {
         if (index < 0 || index >= this.sorts.Count) { return -1; }
         return this.sorts[index].Kind();
     }
+    /// 分组子句数量。
     int GroupCount() { return this.groups.Count; }
+    /// 聚合子句数量。
     int AggregateCount() { return this.aggregates.Count; }
+    /// 第 index 个分组子句的列索引；越界返回 -1。
     int GroupColumnAt(int index) {
         if (index < 0 || index >= this.groups.Count) { return -1; }
         return this.groups[index].Column();
     }
+    /// 第 index 个分组子句的值类型 kind；越界返回 -1。
     int GroupKindAt(int index) {
         if (index < 0 || index >= this.groups.Count) { return -1; }
         return this.groups[index].Kind();
     }
+    /// 第 index 个聚合子句的列索引；越界返回 -1。
     int AggregateColumnAt(int index) {
         if (index < 0 || index >= this.aggregates.Count) { return -1; }
         return this.aggregates[index].Column();
     }
+    /// 第 index 个聚合子句的模式（1 sum、2 average、3 min、4 max、5 count）；越界返回 0。
     int AggregateModeAt(int index) {
         if (index < 0 || index >= this.aggregates.Count) { return 0; }
         return this.aggregates[index].Mode();
     }
+    /// 第 index 个聚合子句的值类型 kind；越界返回 -1。
     int AggregateKindAt(int index) {
         if (index < 0 || index >= this.aggregates.Count) { return -1; }
         return this.aggregates[index].Kind();
     }
+    /// 返回第 index 个过滤子句的复制值，调用方无法改动计划内部；越界返回 null。
     QueryFilterClause FilterAt(int index) {
         if (index < 0 || index >= this.filters.Count) { return null; }
         QueryFilterClause f = this.filters[index];
         return new QueryFilterClause(f.Column(), f.Mode(), f.Value(), f.Value2(), f.Kind());
     }
+    /// 返回第 index 个排序子句的复制值；越界返回 null。
     QuerySortClause SortAt(int index) {
         if (index < 0 || index >= this.sorts.Count) { return null; }
         QuerySortClause s = this.sorts[index];
         return new QuerySortClause(s.Column(), s.Direction(), s.Kind());
     }
 
+    /// 单个过滤子句的 JSON 形式（col/op/kind/a/b，均为声明式标量）。
     JsonValue FilterJson(QueryFilterClause clause) {
         JsonValue value = JsonValue.NewObject();
         value.Put("col", JsonValue.NewNum(Convert.ToString(clause.Column())));
@@ -439,6 +500,7 @@ class QueryPlan {
         return value;
     }
 
+    /// 单个排序子句的 JSON 形式（col/dir/kind）。
     JsonValue SortJson(QuerySortClause clause) {
         JsonValue value = JsonValue.NewObject();
         value.Put("col", JsonValue.NewNum(Convert.ToString(clause.Column())));
@@ -447,6 +509,7 @@ class QueryPlan {
         return value;
     }
 
+    /// 单个分组子句的 JSON 形式（col/kind）。
     JsonValue GroupJson(QueryGroupClause clause) {
         JsonValue value = JsonValue.NewObject();
         value.Put("col", JsonValue.NewNum(Convert.ToString(clause.Column())));
@@ -454,6 +517,7 @@ class QueryPlan {
         return value;
     }
 
+    /// 单个聚合子句的 JSON 形式（col/op/kind）。
     JsonValue AggregateJson(QueryAggregateClause clause) {
         JsonValue value = JsonValue.NewObject();
         value.Put("col", JsonValue.NewNum(Convert.ToString(clause.Column())));
@@ -462,6 +526,7 @@ class QueryPlan {
         return value;
     }
 
+    /// 计划的 canonical JSON：版本、完整查询身份、四类子句数组，以及失败时的 issue 对象。
     JsonValue ToJsonValue() {
         JsonValue root = JsonValue.NewObject();
         root.Put("ver", JsonValue.NewNum("1"));
@@ -502,6 +567,7 @@ class QueryPlan {
         return root;
     }
 
+    /// ToJsonValue 的序列化文本，用于远端传输与日志。
     string ToJson() { return this.ToJsonValue().ToJson(); }
 }
 
@@ -515,6 +581,7 @@ class QueryPlanContract {
     int residualCapabilities;
     QueryPlanIssue issue;
 
+    /// 内部构造：pushed/residual 与两个能力掩码、issue 一一对应。
     QueryPlanContract(QueryPlan pushedPlan, QueryPlan residualPlan,
                       int pushedMask, int residualMask,
                       QueryPlanIssue problem) {
@@ -525,6 +592,9 @@ class QueryPlanContract {
         this.issue = problem;
     }
 
+    /// 按能力掩码把已校验计划拆成下推与残差两个子计划：数据源支持的
+    /// 操作类别整体进入 pushed，其余整体落入 residual；两个子计划均
+    /// 保留完整查询身份。full 为 null 或无效时结果携带同一 issue。
     static QueryPlanContract FromPlan(QueryPlan full, int supportedMask) {
         if (full == null) {
             return new QueryPlanContract(null, null, 0, 0,
@@ -602,6 +672,8 @@ class QueryPlanContract {
             pushedMask, residualMask, null);
     }
 
+    /// 先按“全能力”校验查询再拆分，使能力不足只影响下推范围，
+    /// 不会掩盖子句本身的校验错误；columnCount<0 表示列数未知。
     static QueryPlanContract Build(QueryDescriptor query, int columnCount,
                                    QueryCapabilities supported) {
         int supportedMask = 0;
@@ -613,6 +685,7 @@ class QueryPlanContract {
         return QueryPlanContract.FromPlan(full, supportedMask);
     }
 
+    /// 同上，但校验阶段追加 schema 值类型匹配检查。
     static QueryPlanContract Build(QueryDescriptor query,
                                    List<SchemaColumn> schema,
                                    QueryCapabilities supported) {
@@ -625,14 +698,23 @@ class QueryPlanContract {
         return QueryPlanContract.FromPlan(full, supportedMask);
     }
 
+    /// 契约无校验问题时为 true。
     bool IsValid() { return this.issue == null; }
+    /// 校验问题；有效契约为 null。
     QueryPlanIssue Issue() { return this.issue; }
+    /// 校验错误文本；无问题时为空串。
     string Error() { return this.issue == null ? "" : this.issue.Message(); }
+    /// 服务端承诺执行的下推子计划；契约无效时为 null。
     QueryPlan Pushed() { return this.pushed; }
+    /// 必须由后续执行器补执行的残差子计划；无残差时子句列表为空。
     QueryPlan Residual() { return this.residual; }
+    /// pushed 中实际出现的操作类别掩码。
     int PushedCapabilities() { return this.pushedCapabilities; }
+    /// residual 中实际出现的操作类别掩码。
     int ResidualCapabilities() { return this.residualCapabilities; }
+    /// 存在需要本地补执行的操作时为 true。
     bool HasResidual() { return this.residualCapabilities != 0; }
+    /// 有效且无残差，即查询可整体下推。
     bool IsComplete() { return this.IsValid() && !this.HasResidual(); }
 
     /// 远端传输包的 canonical JSON。子计划 JSON 各自携带完整查询身份，
