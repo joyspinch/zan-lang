@@ -1,0 +1,238 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component.DataTable;
+
+/// 组件列适配器：把 cellType 9 的单元格值（逗号分隔数值序列，
+/// 与迷你图同一序列化约定）灌进一个池化的真控件，供渲染循环
+/// Measure/Arrange/RenderTree 三步渲染。这是框架作者级扩展点——
+/// 使用层经 `DataGrid<T>.CompCol` 声明 `compId`，从不接触本接口。
+///
+/// 注册表在 DataTable.CompCell 静态块完成内置装配（"bandgrid"）；
+/// 新组件实现本抽象类并 Register 一次，即对全部网格声明式可用。
+///
+/// 池化责任在本类：以 `GetRowKey(row)` + 列为键缓存控件实例，
+/// 虚拟滚动下同一显示槽位会滚过任意多行，复用时由 Fill 只刷
+/// 数据、不重建控件——焦点不丢、状态不闪。
+abstract class CellComp {
+    public string id;
+
+    CellComp(string id) {
+        this.id = id;
+    }
+
+    /// 创建（或从池中取出）该格的控件实例。`rows`/`cols` 来自
+    /// 列声明的矩阵形状（<=0 时实现自行决定默认形状）。
+    /// 实现必须缓存：同一 (key, col) 每帧拿到同一个实例。
+    virtual Control Acquire(App app, DataSource src, int row, int col,
+                            RowKey key, int x, int y, int w, int h,
+                            int rows, int cols) { return null; }
+
+    /// 把单元格值灌进控件。`vals` 是解析后的数值序列（可能
+    /// 为空）；`rows`/`cols` 是目标矩阵形状。实现按需 SetNum、
+    /// 多余槽位清零、缺失槽位保持旧值，不得重新 Bind 清掉
+    /// 用户选区。
+    virtual void Fill(Control ctl, List<int> vals, int rows, int cols,
+                      string heatBand) { }
+
+    /// 最近一次 Fill 中命中的矩阵内位置（用于把组件内点击
+    /// 归一为 CellClick 时提供格内 (r,c)；未命中返回 false）。
+    virtual bool CompPos(Control ctl, ref int r, ref int c) { return false; }
+
+    /// 网格重建时清空池（随 CellWidgetProvider.Reset 的语义）。
+    virtual void Reset() { }
+
+    // ---- 注册表 ----
+    static List<CellComp> registry;
+
+    /// 按 id 注册适配器（重复注册覆盖，便于测试）。首次调用
+    /// 装配内置适配器。
+    static void Register(CellComp comp) {
+        if (registry == null) { registry = new List<CellComp>(); }
+        for (int i = 0; i < registry.Count; i = i + 1) {
+            if (registry[i].id == comp.id) { registry[i] = comp; return; }
+        }
+        registry.Add(comp);
+    }
+
+    static CellComp Find(string id) {
+        DataTable.EnsureCompRegistry();
+        for (int i = 0; i < registry.Count; i = i + 1) {
+            if (registry[i].id == id) { return registry[i]; }
+        }
+        return null;
+    }
+}
+
+/// "bandgrid" 适配器：把数值序列按行优先灌进 BandGrid 矩阵。
+/// 形状缺省 1×序列长度（单行条）；heatBand 经 HeatBands 映射为
+/// 底色梯度回调。点击/拖选随 BandGrid 自身交互，CompPos 读其
+/// CellRow/CellCol。
+class BandGridComp : CellComp {
+    // 池：键 = RowKey 序列化文本 + 列号。控件与形状缓存在一起，
+    // 形状变化（列配置重声明）时重建。
+    List<string> poolKeys;
+    List<Control> poolCtl;
+    List<int> poolShape;
+
+    BandGridComp() : base("bandgrid") {
+        this.poolKeys = new List<string>();
+        this.poolCtl = new List<Control>();
+        this.poolShape = new List<int>();
+    }
+
+    override Control Acquire(App app, DataSource src, int row, int col,
+                             RowKey key, int x, int y, int w, int h,
+                             int rows, int cols) {
+        string k = key.Canonical() + ":" + Convert.ToString(col);
+        int shape = rows * 1024 + cols;
+        for (int i = 0; i < this.poolKeys.Count; i = i + 1) {
+            if (this.poolKeys[i] == k) {
+                if (this.poolShape[i] != shape) {
+                    // 形状变了：换新实例（旧实例交 GC）。
+                    this.poolKeys.RemoveAt(i);
+                    this.poolCtl.RemoveAt(i);
+                    this.poolShape.RemoveAt(i);
+                    break;
+                }
+                return this.poolCtl[i];
+            }
+        }
+        BandGrid g = new BandGrid();
+        g.Bind(rows, cols);
+        g.CellSize(16, 14);
+        g.wiresOwnEvents = true;
+        this.poolKeys.Add(k);
+        this.poolCtl.Add(g);
+        this.poolShape.Add(shape);
+        return g;
+    }
+
+    override void Fill(Control ctl, List<int> vals, int rows, int cols,
+                       string heatBand) {
+        BandGrid g = (BandGrid)ctl;
+        if (heatBand != "") {
+            g.ColorOf(BandGridComp.HeatOf(heatBand));
+        }
+        int n = rows * cols;
+        for (int i = 0; i < n; i = i + 1) {
+            int v = 0;
+            if (vals != null && i < vals.Count) { v = vals[i]; }
+            if (g.NumAt(i / cols, i % cols) != v) {
+                g.SetNum(i / cols, i % cols, v);
+            }
+        }
+    }
+
+    override bool CompPos(Control ctl, ref int r, ref int c) {
+        BandGrid g = (BandGrid)ctl;
+        if (g.CellRow() < 0) { return false; }
+        r = g.CellRow();
+        c = g.CellCol();
+        return true;
+    }
+
+    override void Reset() {
+        this.poolKeys.Clear();
+        this.poolCtl.Clear();
+        this.poolShape.Clear();
+    }
+    /// 命名色带 → BandGrid 单元格着色回调（值域 0..5 固定映射，
+    /// 覆盖排班/热度这类小整数语义；更大值截到顶端）。
+    static BandGridColorOf HeatOf(string band) {
+        int lo = 0;
+        int hi = 0;
+        DataColumn.HeatBands(band, ref lo, ref hi);
+        int vlo = lo;
+        int vhi = hi;
+        return delegate(int row, int col, string text, int num) {
+            if (num <= 0) { return 0; }
+            int p = num;
+            if (p > 5) { p = 5; }
+            return DataTable.LerpColor(vlo, vhi, p * 200, 1000);
+        };
+    }
+}
+
+partial class DataTable {
+    static bool compsInited;
+
+    /// 内置组件适配器装配。幂等。
+    static void EnsureCompRegistry() {
+        if (compsInited) { return; }
+        compsInited = true;
+        CellComp.Register(new BandGridComp());
+    }
+
+    /// 测试钩子：触发注册表装配并返回已就绪标志。
+    static bool EnsureCompRegistryProbe() {
+        DataTable.EnsureCompRegistry();
+        return compsInited;
+    }
+
+    /// 组件列渲染入口：解析值 → 取适配器 → 池化 → 刷值 →
+    /// 三步渲染 → 点击归一。由 DrawCellRangeCtx 的 cellType 9
+    /// 分支调用（画布已裁剪到格矩形内）。`src` 是网格当前
+    /// 数据源，用于稳定行键池化。
+    static void DrawCompCell(App app, DataColumn col, string val,
+                             int cx, int cy, int cw, int rowH,
+                             int rowIdx, int cc, DataSource src,
+                             DataTableState st) {
+        CellComp comp = CellComp.Find(col.compId);
+        if (comp == null) {
+            // 未注册的 compId：画占位块，fail-soft 不炸帧。
+            Canvas c = app.canvas;
+            Theme t = app.theme;
+            StyleBox ph = Style.Part(app, "datatable", "progress-track",
+                                     "", "", "", Style.SNormal());
+            c.FillRoundRect(cx + t.paddingSmall, cy + app.Scale(4),
+                            cw - t.paddingSmall * 2, rowH - app.Scale(8),
+                            t.borderRadiusSmall, ph.BgOr(0));
+            return;
+        }
+        List<int> vals = new List<int>();
+        List<string> parts = DataTable.NumSeries(val);
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            vals.Add(DataTable.ParseInt(parts[i]));
+        }
+        int rows = col.shapeR;
+        int cols = col.shapeC;
+        if (cols <= 0) { cols = vals.Count; }
+        if (cols < 1) { cols = 1; }
+        if (rows <= 0) { rows = 1; }
+        // 稳定行键：优先数据源的业务键；不可用时回退位置键
+        // （与选择/详情的键回退语义一致）。
+        RowKey key = null;
+        if (src != null) { key = src.GetRowKey(rowIdx); }
+        if (key == null) { key = RowKey.Legacy(rowIdx); }
+        Control ctl = comp.Acquire(app, src, rowIdx, cc, key,
+                                   cx, cy, cw, rowH, rows, cols);
+        if (ctl == null) { return; }
+        comp.Fill(ctl, vals, rows, cols, col.heatBand);
+        ctl.MeasureTree(app);
+        ctl.Arrange(cx, cy, cw, rowH);
+        ctl.RenderTree(app);
+        // 点击归一：组件内发生了激活（如 BandGrid 双击），把
+        // 事件上下文指向本格并附上格内位置后 Raise CellClick。
+        if (st != null) {
+            int pr = 0;
+            int pc = 0;
+            if (comp.CompPos(ctl, ref pr, ref pc)) {
+                if (rowIdx >= 0 && cc >= 0) {
+                    st.hitRow = rowIdx;
+                    st.hitCol = cc;
+                }
+                st.compR = pr;
+                st.compC = pc;
+                st.CellClick.Raise();
+            }
+        }
+    }
+
+    /// 最近一次组件列点击在矩阵内的行（CellClick 处理器读取）。
+    static int CompPosR(DataTableState st) { return st.compR; }
+
+    /// 最近一次组件列点击在矩阵内的列。
+    static int CompPosC(DataTableState st) { return st.compC; }
+}

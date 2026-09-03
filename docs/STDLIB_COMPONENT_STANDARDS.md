@@ -123,6 +123,20 @@
    数值序列画 accent 迷你柱状图。三类列默认 `sortable=false/filterable=false`，
    导出走默认文本路径无需改动。新增 cellType 必须在 `DrawCellRangeCtx` 加
    渲染分支 + 本条登记，消费面只在 Render.zan。
+1a. **声明式组件列 `CompCol`**（cellType 9，2026-09）：一列内嵌"真正的
+   控件库组件"（如 BandGrid 矩阵）但仍走数据绑定——`DataColumn.CompCol(
+   title, width, compId)` 声明列，`DataColumn.Shape(c, rows, cols)` /
+   `DataColumn.Heat(c, band)` 链上配置形状与色带；绑定 `DataGrid<T>` 时用
+   `grid.CompCol(title, width, compId, u => u.field)` 传类型化读取器
+   （`GridNums<T>` 委托），单元格值 = 逗号分隔数值序列（与迷你图同一约定，
+   序列化边界在 `GridColumn.Raw()` 内）。引擎侧 `CellComp` 注册表按
+   compId 找适配器（内置 `bandgrid` → `BandGridComp`），以
+   `RowKey:col` 为键**池化真控件实例**（同 §7.2 的硬责任），形状变化
+   （rows×cols）时重建；组件内点击归一为 `st.hitRow/hitCol` +
+   `st.compR/compC`（格内矩阵位置，`DataTable.CompPosR/CompPosC` 读取）
+   后 Raise `CellClick`。未知 compId fail-soft 画占位块。选型：要在
+   单元格里内嵌整个交互组件（矩阵/表格/开关组）但不想手写 Provide/池化 →
+   CompCol；需要任意控件布局 → 下面的 CellWidgetProvider。
 2. **真控件插槽 `CellWidgetProvider`**（`st.cellWidgets`）：需要输入框、
    下拉、开关等真控件交互时继承它，`Provide()` 按 `(row, col)` 返回
    `Control`（null 退回内置渲染）。渲染循环 `MeasureTree → Arrange(格矩形) →
@@ -134,8 +148,9 @@
    `app.focus.AllocId()` + `app.hitTester.RegisterRect`，点击判定走
    `Ui.Clicked/Ui.Activate`，禁止裸比 `app.mouseX/Y`（看不见上层弹层）。
 
-选型决策：只展示 → 内置列；要真控件交互 → CellWidgetProvider；只是画 →
-PaintCell。三者在渲染循环的优先级：cellWidgets > styler > 内置 cellType。
+选型决策：只展示 → 内置列；单格内嵌完整交互组件且要数据绑定 → CompCol；
+要真控件交互 → CellWidgetProvider；只是画 → PaintCell。四者在渲染循环的
+优先级：cellWidgets > styler > 内置 cellType（6/7/8）与组件列（9）。
 
 ## 8. 现存违规清单（改造 backlog）
 

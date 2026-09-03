@@ -6,7 +6,7 @@ namespace Gui.Component.DataTable;
 
 /// DataTable 的列描述符。
 /// cellType：0 文本，1 链接，2 标签，3 进度，4 徽章，5 图片，
-/// 6 图标，7 按钮，8 迷你图
+/// 6 图标，7 按钮，8 迷你图，9 组件
 /// align：0 左对齐，1 居中，2 右对齐
 class DataColumn {
     string title;
@@ -103,6 +103,17 @@ class DataColumn {
     string btnClass; // 按钮列的 class（如 "primary"、"danger text"）
     bool sparkArea; // 迷你图是否在柱下画半透明面积
 
+    // ---- 组件列（cellType 9）----
+    // 单元格值是逗号分隔的数值序列（同迷你图约定），渲染层
+    // 按 compId 从 CellComp 注册表取适配器，把序列灌进一个
+    // 池化的真控件（BandGrid 等），控件按格矩形渲染、事件
+    // 归一为 CellClick。序列化边界在引擎内部——使用层只见
+    // 类型化访问器（GridNums<T>），不接触控件与绘制。
+    string compId;     // CellComp 注册表键（如 "bandgrid"）
+    int shapeR;        // 矩阵形状：行数（shapeC 为列数；<=0 用组件默认）
+    int shapeC;
+    string heatBand;   // 数值→色带名（"" 关闭；见 HeatBands）
+
     // 单元格打开的编辑器：0 = 纯文本框；1 = 下拉框，从
     // `choices` 中选取；2 = 日历，用于日期列；3 = 数字微调器，按
     // `editStep` 步进。bool 列忽略此项——它们在原地切换。
@@ -172,6 +183,10 @@ class DataColumn {
         this.btnIcon = "";
         this.btnClass = "";
         this.sparkArea = false;
+        this.compId = "";
+        this.shapeR = 0;
+        this.shapeC = 0;
+        this.heatBand = "";
         this.choices = new List<string>();
         this.choicesStrict = true;
         this.editStep = 1.0;
@@ -531,6 +546,56 @@ class DataColumn {
         c.sortable = false;
         c.filterable = false;
         return c;
+    }
+
+    /// 组件列：单元格值（逗号分隔数值序列，同迷你图约定）被
+    /// 灌进 `compId` 标识的池化真控件（如 "bandgrid"），控件按
+    /// 格矩形渲染。`shapeR`/`shapeC` 声明矩阵形状（<=0 用组件
+    /// 默认），`heat` 是数值→色带名（"" 关闭；"teal"/"amber"/
+    /// "coral"/"blue"…）。点击矩阵格子把 hitRow/hitCol 指向本格、
+    /// CompPos() 提供格内 (r,c) 后 Raise CellClick。
+    /// 不可排序/筛选——序列文本不构成可比较的键。
+    /// 序列化边界在引擎内部：使用层经 `DataGrid<T>.CompCol` 的
+    /// 类型化访问器提供 `List<int>`，从不接触控件与绘制。
+    static DataColumn CompCol(string title, int width, string compId) {
+        DataColumn c = new DataColumn(title, width);
+        c.cellType = 9;
+        c.align = 1;
+        c.compId = compId;
+        c.shapeR = 0;
+        c.shapeC = 0;
+        c.heatBand = "";
+        c.sortable = false;
+        c.filterable = false;
+        c.editable = false;
+        return c;
+    }
+
+    /// 组件列的矩阵形状（行 × 格）。仅对 cellType 9 有意义。
+    static DataColumn Shape(DataColumn c, int rows, int cols) {
+        c.shapeR = rows;
+        c.shapeC = cols;
+        return c;
+    }
+
+    /// 组件列的数值→色带映射（"teal"/"amber"/"coral"/"blue"/
+    /// "green"/"purple"，空串关闭）。仅对 cellType 9 有意义。
+    static DataColumn Heat(DataColumn c, string band) {
+        c.heatBand = band;
+        return c;
+    }
+
+    /// 命名色带的两端颜色（0xAARRGGBB）。`name` 不识别时返回
+    /// false，调用方回退 accent 单色。与文档第 1 节色板一致的
+    /// 内置映射，组件列着色共用。
+    static bool HeatBands(string name, ref int lo, ref int hi) {
+        if (name == "teal") { lo = 0xFFE1F5EE; hi = 0xFF0D6E56; return true; }
+        if (name == "amber") { lo = 0xFFFAEEDA; hi = 0xFFBA7517; return true; }
+        if (name == "coral") { lo = 0xFFFAECE7; hi = 0xFFD85A30; return true; }
+        if (name == "blue") { lo = 0xFFE6F1FB; hi = 0xFF185FA5; return true; }
+        if (name == "green") { lo = 0xFFEAF3DE; hi = 0xFF3B6D11; return true; }
+        if (name == "purple") { lo = 0xFFEEEDFE; hi = 0xFF534AB7; return true; }
+        return false;
     }
 
     /// 汇总由其他列聚合值派生的数值列
@@ -1172,6 +1237,12 @@ class DataTableState {
     // 返回 null 的格走内置 cellType 渲染。见 CellWidgetProvider。
     CellWidgetProvider cellWidgets;
 
+    // ---- 组件列（cellType 9）----
+    // 最近一次组件列点击在矩阵内的位置（CellClick 处理器经
+    // DataTable.CompPosR/CompPosC 读取；-1 = 无）。
+    int compR;
+    int compC;
+
     // ---- 主从详情 ----
     // 用户展开的行，以*源*行索引保存，
     // 展开状态随行经历排序和过滤，而不是钉在
@@ -1214,6 +1285,8 @@ class DataTableState {
         this.dirty = true;
         this.keyProvider = null;
         this.cellWidgets = null;
+        this.compR = 0 - 1;
+        this.compC = 0 - 1;
         this.rowKeys = new List<RowKey>();
         this.rowKeysRevision = -1;
         this.diagnostics = new List<TableDiagnostic>();
