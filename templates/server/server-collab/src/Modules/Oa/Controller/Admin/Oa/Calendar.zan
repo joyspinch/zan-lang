@@ -1,0 +1,277 @@
+using System;
+using System.Collections;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb.Model.Oa;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.Admin.Oa;
+
+/* /admin/oa/calendar 个人日程（T11）：月/周网格 + 弹窗表单 CRUD。
+   数据面=本人日程（ownerId==me.id 且租户双闸，Bug#3 范式）。
+   视图渲染受模板引擎约束（不支持嵌套 #each，Bug#4 同款）：42 格用
+   平铺 #each（行首/行尾格带 rowOpen/rowClose 标记拼 <tr>），事件条
+   为服务端预拼 HTML 经行字段 {{{eventsHtml}}} 原始输出（标题已
+   View.HtmlEscape 转义防注入）。
+   relatedType/relatedId 一期只透传存储不做白名单（T15 预留：form
+   预约进日历=一行 INSERT + 渲染侧前缀映射链接，本控制器查询面零改动）。 */
+[Route("admin/oa/calendar/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("日程")]
+class Calendar : AdminController {
+    [HttpGet]
+    [Route("/admin/oa/calendar")]
+    [Custom(IsMenu = true, Icon = "mdi:calendar", Perm = PermBit.View)]
+    [Description("日程")]
+    async void Index() {
+        User me = await this.Admin();
+        ViewData d = await this.Layout("日程");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        /* 本地墙钟基准（Fmt.OffsetMinutes 同款）：视图日界/跨月导航全在
+           本地日历域内计算。stdlib 无 AddMonths，月导航手工轮转年月。 */
+        long offset = (long)Fmt.OffsetMinutes() * 60;
+        long now = WebApp.NowSeconds();
+        long todayStart = Fmt.TodayStart(now);
+        DateTime todayD = DateTime.FromUnixSeconds(now + offset);
+        int y = todayD.Year();
+        int m = todayD.Month();
+
+        /* 视图解析：?week=YYYY-MM-DD 优先（周模式），否则 ?month=YYYY-MM
+           （缺省当月）。 */
+        bool weekMode = false;
+        long viewStart = Fmt.LocalDayStart(y, m, 1);
+        int cells = 42;
+        string label = "";
+        string weekParam = this.In("week");
+        DateTime w = weekParam.Length == 10 ? DateTime.ParseDate(weekParam) : null;
+        if (w != null) {
+            weekMode = true;
+            long baseStart = Fmt.LocalDayStart(w.Year(), w.Month(), w.Day());
+            int shift = (w.DayOfWeek() + 6) % 7;   /* 周一为一周之首 */
+            viewStart = baseStart - (long)shift * 86400;
+            cells = 7;
+            label = Fmt.Day(viewStart) + " ~ " + Fmt.Day(viewStart + 6 * 86400);
+        } else {
+            string monthParam = this.In("month");
+            DateTime mp = monthParam.Length == 7
+                ? DateTime.ParseDate(monthParam + "-01") : null;
+            if (mp != null) { y = mp.Year(); m = mp.Month(); }
+            DateTime first = DateTime.FromDate(y, m, 1);
+            int lead = (first.DayOfWeek() + 6) % 7;
+            viewStart = Fmt.LocalDayStart(y, m, 1) - (long)lead * 86400;
+            label = "" + y + "年" + Fmt.Pad2(m) + "月";
+        }
+        long viewEnd = viewStart + (long)cells * 86400;
+
+        /* 本人 + 本租户双闸（Bug#3 范式），范围=视图窗口 [start, end)。 */
+        List<OaCalendarEvent> evs = await this.OaCalendarEvent
+            .Where(a => a.tenantId == this.TenantId() && a.ownerId == me.id
+                && a.startAt >= viewStart && a.startAt < viewEnd)
+            .OrderBy(a => a.startAt).ToListAsync();
+
+        /* 平铺网格：月视图 42 格（6 行 × 7 列，跨月格灰显不出事件），
+           周视图 7 格。行首/行尾标记供模板拼 <tr>（无嵌套 each）。 */
+        List<StrMap> cellRows = d.AddList("cells");
+        for (int i = 0; i < cells; i = i + 1) {
+            long dayStart = viewStart + (long)i * 86400;
+            DateTime dayD = DateTime.FromUnixSeconds(dayStart + offset);
+            bool inMonth = weekMode
+                || (dayD.Year() == y && dayD.Month() == m);
+            StrMap c = new StrMap();
+            c.Set("cellClass", "cal-cell" + (inMonth ? "" : " cal-out")
+                + (dayStart == todayStart ? " cal-today" : ""));
+            c.Set("day", Convert.ToString(dayD.Day()));
+            c.Set("rowOpen", i % 7 == 0 ? "1" : "");
+            c.Set("rowClose", i % 7 == 6 ? "1" : "");
+            string html = "";
+            if (inMonth) {
+                long dayEnd = dayStart + 86400;
+                for (int k = 0; k < evs.Count; k = k + 1) {
+                    OaCalendarEvent ev = evs[k];
+                    if (ev.startAt < dayStart || ev.startAt >= dayEnd) {
+                        continue;
+                    }
+                    string time = ev.allDay == 1 ? ""
+                        : DateTime.FromUnixSeconds(ev.startAt + offset)
+                            .ToTimeString().Substring(0, 5) + " ";
+                    html = html + "<a class=\"cal-ev\" href=\"/admin/oa/calendar/form?id="
+                        + Convert.ToString(ev.id)
+                        + "\" data-dialog data-title=\"编辑日程\"><span class=\"cal-ev-time\">"
+                        + time + "</span>" + View.HtmlEscape(ev.title) + "</a>";
+                }
+            }
+            c.Set("eventsHtml", html);
+            cellRows.Add(c);
+        }
+
+        /* 上下月/周导航（data-load 屏内重载，Flows 筛选同款）。 */
+        if (weekMode) {
+            d.Set("prevLink", "/admin/oa/calendar?week="
+                + Fmt.Day(viewStart - 7 * 86400));
+            d.Set("nextLink", "/admin/oa/calendar?week="
+                + Fmt.Day(viewStart + 7 * 86400));
+        } else {
+            int py = y; int pm = m - 1;
+            if (pm == 0) { py = y - 1; pm = 12; }
+            int ny = y; int nm = m + 1;
+            if (nm == 13) { ny = y + 1; nm = 1; }
+            d.Set("prevLink", "/admin/oa/calendar?month="
+                + Convert.ToString(py) + "-" + Fmt.Pad2(pm));
+            d.Set("nextLink", "/admin/oa/calendar?month="
+                + Convert.ToString(ny) + "-" + Fmt.Pad2(nm));
+        }
+        d.Set("label", label);
+        d.Set("isWeek", weekMode ? "1" : "");
+        d.Set("todayText", Fmt.Day(todayStart));
+        d.Set("canCreate", this.Can(PermBit.Create) ? "1" : "");
+        this.Page(d);
+    }
+
+    /* 新建/编辑弹窗表单（data-dialog 片段）。 */
+    [HttpGet]
+    [Custom(IsMenu = false, Perm = PermBit.View)]
+    [Description("日程表单")]
+    async void Form() {
+        int id = this.InInt("id", 0);
+        User me = await this.Admin();
+        OaCalendarEvent ev = null;
+        if (id > 0) {
+            ev = await this.OaCalendarEvent
+                .Where(a => a.id == id && a.tenantId == this.TenantId()
+                    && a.ownerId == me.id)
+                .FirstAsync();
+            if (ev == null) { this.Fail(404, "0404", "日程不存在"); return; }
+        }
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("dialogTitle", id > 0 ? "编辑日程" : "新建日程");
+        if (ev != null) {
+            d.Set("title", ev.title);
+            d.Set("description", ev.description);
+            d.Set("startAt", Calendar.LocalStampValue(ev.startAt));
+            d.Set("endAt", Calendar.LocalStampValue(ev.endAt));
+            d.Set("allDay0", ev.allDay == 1 ? "" : "selected");
+            d.Set("allDay1", ev.allDay == 1 ? "selected" : "");
+            d.Set("rm0", ev.remindMinutes == 0 ? "selected" : "");
+            d.Set("rm30", ev.remindMinutes == 30 ? "selected" : "");
+            d.Set("rm60", ev.remindMinutes == 60 ? "selected" : "");
+            d.Set("rm1440", ev.remindMinutes == 1440 ? "selected" : "");
+            d.Set("relatedType", ev.relatedType);
+            d.Set("relatedId", Convert.ToString(ev.relatedId));
+            d.Set("canDelete", this.Can(PermBit.Delete) ? "1" : "");
+        } else {
+            d.Set("title", "");
+            d.Set("description", "");
+            d.Set("startAt", "");
+            d.Set("endAt", "");
+            d.Set("allDay0", "selected");
+            d.Set("allDay1", "");
+            d.Set("rm0", "selected");
+            d.Set("rm30", ""); d.Set("rm60", ""); d.Set("rm1440", "");
+            /* T15 预留：预约页经查询串透传关联键（?relatedType=..&relatedId=..）。 */
+            d.Set("relatedType", Calendar.CleanRelated(this.In("relatedType")));
+            d.Set("relatedId", Convert.ToString(this.InInt("relatedId", 0)));
+            d.Set("canDelete", "");
+        }
+        this.Dialog(d);
+    }
+
+    /* 保存：新建 tenantId=ownerId=当前值；编辑限本人行三条件
+       （id, tenantId, ownerId）。时间表单墙钟换算见 LocalStamp。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("保存日程")]
+    async void Save() {
+        int id = this.InInt("id", 0);
+        User me = await this.Admin();
+        string title = this.Need("title", "日程标题");
+        long startAt = Calendar.LocalStamp(this.In("startAt"));
+        long endAt = Calendar.LocalStamp(this.In("endAt"));
+        int remind = this.InInt("remindMinutes", 0);
+        if (title.Length == 0) { this.Fail(400, "0004", "请填写日程标题"); return; }
+        if (startAt <= 0) { this.Fail(400, "0004", "开始时间不合法"); return; }
+        if (endAt <= 0) { this.Fail(400, "0004", "结束时间不合法"); return; }
+        if (endAt <= startAt) { this.Fail(400, "0004", "结束时间须晚于开始时间"); return; }
+        if (remind != 0 && remind != 30 && remind != 60 && remind != 1440) {
+            this.Fail(400, "0004", "提醒时间不合法"); return;
+        }
+        long now = WebApp.NowSeconds();
+        if (id > 0) {
+            int n = await this.OaCalendarEvent.Update()
+                .Set(a => a.title, title)
+                .Set(a => a.description, this.In("description"))
+                .Set(a => a.startAt, startAt)
+                .Set(a => a.endAt, endAt)
+                .Set(a => a.allDay, this.InInt("allDay", 0) == 1 ? 1 : 0)
+                .Set(a => a.remindMinutes, remind)
+                /* 时间可能被改动：重置提醒位，让协程按新时刻重新触发。 */
+                .Set(a => a.reminded, 0)
+                .Set(a => a.updatedAt, now)
+                .Where(a => a.id == id && a.tenantId == this.TenantId()
+                    && a.ownerId == me.id)
+                .ExecuteAffrowsAsync();
+            if (n <= 0) { this.Fail(404, "0404", "日程不存在"); return; }
+            this.Saved("日程已保存");
+            return;
+        }
+        OaCalendarEvent ev = new OaCalendarEvent();
+        ev.tenantId = this.TenantId();
+        ev.ownerId = me.id;
+        ev.title = title;
+        ev.description = this.In("description");
+        ev.startAt = startAt;
+        ev.endAt = endAt;
+        ev.allDay = this.InInt("allDay", 0) == 1 ? 1 : 0;
+        ev.remindMinutes = remind;
+        ev.reminded = 0;
+        ev.relatedType = Calendar.CleanRelated(this.In("relatedType"));
+        ev.relatedId = this.InInt("relatedId", 0);
+        ev.createdAt = now;
+        ev.updatedAt = now;
+        int newId = await this.OaCalendarEvent.Insert(ev).ExecuteIdentityAsync();
+        this.Saved(newId > 0 ? "日程已创建" : "保存失败");
+    }
+
+    /* 删除：owner 校验 + 租户双条件（他人日程不可删）。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Delete)]
+    [Description("删除日程")]
+    async void Delete() {
+        int id = this.InInt("id", 0);
+        User me = await this.Admin();
+        int n = await this.OaCalendarEvent.Delete()
+            .Where(a => a.id == id && a.tenantId == this.TenantId()
+                && a.ownerId == me.id)
+            .ExecuteAffrowsAsync();
+        this.Saved(n > 0 ? "已删除" : "日程不存在");
+    }
+
+    /* datetime-local 提交值（"YYYY-MM-DDTHH:MM"）→ Unix 秒；墙钟按
+       服务端时区基准（Fmt.OffsetMinutes）换算。非法返回 0。 */
+    static long LocalStamp(string s) {
+        if (s == null || s.Length != 16 || s.Substring(10, 1) != "T") { return 0; }
+        DateTime dt = DateTime.ParseDate(s.Substring(0, 10));
+        if (dt == null) { return 0; }
+        int h = DateTime.ParseDigits(s, 11, 2);
+        int mi = DateTime.ParseDigits(s, 14, 2);
+        if (h < 0 || h > 23 || mi < 0 || mi > 59) { return 0; }
+        return dt.ToUnixSeconds() + (long)h * 3600 + (long)mi * 60
+            - (long)Fmt.OffsetMinutes() * 60;
+    }
+
+    /* Unix 秒 → datetime-local 值（"YYYY-MM-DDTHH:MM"）。 */
+    static string LocalStampValue(long epoch) {
+        if (epoch <= 0) { return ""; }
+        string s = Fmt.Stamp(epoch);   /* "YYYY-MM-DD HH:MM:SS" */
+        return s.Substring(0, 10) + "T" + s.Substring(11, 5);
+    }
+
+    /* T15 透传键清洗：截断到列宽、空值归零串（不做白名单，一期约定）。 */
+    static string CleanRelated(string v) {
+        string s = Fmt.Text(v, "");
+        if (s.Length > 32) { s = s.Substring(0, 32); }
+        return s;
+    }
+}
