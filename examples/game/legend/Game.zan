@@ -66,7 +66,7 @@ class Player {
     public int mjKills;
 
     // BOSS 之家
-    public int[] bhKilled = new int[8];  // 每只击破次数(今日)
+    public int[] bhKilled = new int[28]; // 每只击破次数(今日)
     public int bhTriesLeft;
     public long lastDayTs;     // 日刷新锚
     public long lastSeenTs;    // 离线锚
@@ -136,7 +136,8 @@ class Player {
     public int ybTriesLeft;
     public int jbTriesLeft;
     public int towerBest;
-    public int cityOwned;      // -1 无 / 0..7
+    public int[] cityLvl = new int[5];   // 5 条产业档位(-1 未购)
+    public int[] skillLv = new int[26];  // 26 技能等级      // -1 无 / 0..7
     public long cityLastMs;
     public int masterTier;     // 0=无师父 1=已拜师 2=师父
     public string masterName;
@@ -183,6 +184,8 @@ class Player {
 
     public Player() {
         this.cardMask = new int[this.cardMaskLen];
+        this.cityLvl[0] = 0;                 // 旧档钱庄默认已占 1 档
+        for (int i = 1; i < 5; i = i + 1) { this.cityLvl[i] = -1; }
         this.titleMask = 0;
         for (int i = 0; i < Data.CUR_COUNT; i = i + 1) { this.cur[i] = 0; }
         this.mats = new int[Data.MAT_COUNT];
@@ -203,8 +206,9 @@ class Game {
     public long curMonsterHpMax;
     public int curMonsterLvl;
     public bool curIsBoss;
-    public int curMonsterIcon; // 0 普通 1 BOSS
     public string curMonsterName;
+    public int curMobIdx = -1;   // 名册下标(MON_NAMES),Boss 时 -1
+    public int curBossIdx = -1;  // BOSS_NAMES 下标,非 Boss 时 -1
 
     // 飘字 / 战斗日志(简化)
     public string battleLog;
@@ -491,24 +495,28 @@ class Game {
     // 全属性(基础 + 装备 + 爵位 + 五行 + 将星 + 图鉴 + 殿堂 + 装备基数)
     public int TotalAcMin() {
         int raw = this.BaseAcMin() + this.EquipAtk();
-        double pct = this.AllPct();
+        double pct = this.AllPct() + this.SkillPct(0) + this.SkillPct(1) + this.SkillPct(2);
         return (int)(raw * (1.0 + pct));
     }
     public int TotalAcMax() {
         int raw = this.BaseAcMax() + this.EquipAtk();
-        double pct = this.AllPct();
+        double pct = this.AllPct() + this.SkillPct(0) + this.SkillPct(1) + this.SkillPct(2);
         return (int)(raw * (1.0 + pct));
     }
     public int TotalDef() {
         int raw = this.BaseDef() + this.EquipDef();
-        double pct = this.AllPct();
+        double pct = this.AllPct() + this.SkillPct(4);
         return (int)(raw * (1.0 + pct));
     }
     public int TotalMDef() {
-        return (int)((this.BaseMDef() + this.EquipDef() / 2) * (1.0 + this.AllPct()));
+        double pct = this.AllPct() + this.SkillPct(4) * 0.5 + this.SkillPct(5);
+        return (int)((this.BaseMDef() + this.EquipDef() / 2) * (1.0 + pct));
     }
     public int TotalHp() {
-        return this.BaseHp() + this.EquipHp();
+        return (int)((this.BaseHp() + this.EquipHp()) * (1.0 + this.SkillPct(3)));
+    }
+    public int TotalMp() {
+        return (int)(this.BaseMp() * (1.0 + this.SkillPct(6)));
     }
     // 出手速度:基础值 + 等级与转生加成(仅用于压缩出手间隔)
     public int TotalSpeed() {
@@ -517,6 +525,34 @@ class Game {
         s = s + this.p.turn * 2;
         return s;
     }
+    // 技能加成:kind 0攻 1魔 2道 3血 4防 5魔防 6法力 8全属性
+    public double SkillPct(int kind) {
+        double v = 0;
+        for (int i = 0; i < Data.SKILL_COUNT; i = i + 1) {
+            if (Data.SKILL_KIND[i] != kind) { continue; }
+            int job = Data.SKILL_JOB[i];
+            if (job >= 0 && job != this.p.cls) { continue; }
+            v = v + this.p.skillLv[i] * Data.SKILL_PCT[i];
+        }
+        return v;
+    }
+
+    // 升 1 级:耗技能书(当前级+1)本 + 金币(当前级+1)×SKILL_GOLD_COST;空串=成功
+    public string SkillUp(int i) {
+        if (i < 0 || i >= Data.SKILL_COUNT) { return "无此技能"; }
+        int lv = this.p.skillLv[i];
+        if (lv >= Data.SKILL_MAX[i]) { return "已满级"; }
+        int job = Data.SKILL_JOB[i];
+        if (job >= 0 && job != this.p.cls) { return "职业不符"; }
+        if (this.p.mats[Data.MAT_SKILLBOOK] < lv + 1) { return "技能书不足"; }
+        long cost = (long)(lv + 1) * Data.SKILL_GOLD_COST;
+        if (this.p.cur[Data.CUR_GOLD] < cost) { return "金币不足"; }
+        this.p.mats[Data.MAT_SKILLBOOK] = this.p.mats[Data.MAT_SKILLBOOK] - (lv + 1);
+        this.p.cur[Data.CUR_GOLD] = this.p.cur[Data.CUR_GOLD] - cost;
+        this.p.skillLv[i] = lv + 1;
+        return "";
+    }
+
     public double AllPct() {
         double pct = 0;
         if (this.p.nobleTier >= 0) {
@@ -545,6 +581,8 @@ class Game {
         int fullGroups = this.AlbumFullGroups();
         pct = pct + this.AlbumCount() * Data.ALBUM_PCT_PER_ITEM
                   + fullGroups * Data.ALBUM_PCT_FULL_GROUP;
+        // 技能:全属性类(五行天赋)
+        pct = pct + this.SkillPct(8);
         return pct;
     }
 
@@ -621,27 +659,31 @@ class Game {
         this.curMonsterHpMax = (long)hp;
         this.curMonsterHp = this.curMonsterHpMax;
         this.curMonsterLvl = (int)(floor * 1.2 + 5);
-        this.curMonsterIcon = isBoss ? 1 : 0;
-        this.curMonsterName = isBoss ? ("层 BOSS·第" + floor + "层") : this.MonsterName(floor);
-    }
-    public string MonsterName(int floor) {
-        // 简易命名:基于楼层取词根
-        string[] pre = new string[10];
-        pre[0] = "半兽人"; pre[1] = "多钩猫"; pre[2] = "钉耙猫";
-        pre[3] = "蝎子";   pre[4] = "稻草人"; pre[5] = "沃玛";
-        pre[6] = "祖玛";   pre[7] = "赤月";   pre[8] = "魔龙";
-        pre[9] = "牛魔";
-        int idx = floor / 20;
-        if (idx > 9) { idx = 9; }
-        string suf = "";
-        int tier = floor / 50;
-        if (tier >= 1) { suf = "·精英"; }
-        if (tier >= 3) { suf = "·强化"; }
-        return pre[idx] + suf;
+        int map = this.MapIdxAt(floor);
+        if (isBoss) {
+            int b = Data.MAP_BOSS[map];
+            if (b < 0 || b >= Data.BOSS_COUNT) { b = 0; }
+            this.curBossIdx = b;
+            this.curMobIdx = -1;
+            this.curMonsterName = Data.BOSS_NAMES[b];
+        } else {
+            this.curBossIdx = -1;
+            int st = Data.MAP_MON_START[map];
+            int len = Data.MAP_MON_LEN[map];
+            if (len < 1) { len = 1; }
+            this.curMobIdx = Data.MAP_MON[st + this.p.hjKills % len];
+            this.curMonsterName = Data.MON_NAMES[this.curMobIdx];
+        }
     }
 
-    // 地图传送(PRD 4.4):选择挂机场景。门槛层以上即可传送,
-    // 传送 = 把幻境推层进度挪到该地图的起始层(数值全由既有曲线接管)。
+    // floor 所在地图下标(35 图门槛表)
+    public int MapIdxAt(int floor) {
+        int map = 0;
+        for (int i = 0; i < Data.MAP_TOTAL; i = i + 1) {
+            if (Data.MAP_MIN_FLOOR[i] <= floor) { map = i; }
+        }
+        return map;
+    }
     public bool SelectMap(int idx) {
         if (idx < 0 || idx >= 20) { return false; }
         if (this.p.hjBest < Data.MAP_MIN_FLOOR[idx]) {
@@ -732,6 +774,11 @@ class Game {
         gold = gold * turnMult;
         xp = xp * turnMult;
         sw = sw * turnMult;
+        // Boss 概率掉技能书(技能升级材料)
+        if (boss && !this.mjMode && this.rng.NextDouble01() < Data.BOSS_BOOK_RATE) {
+            this.p.mats[Data.MAT_SKILLBOOK] = this.p.mats[Data.MAT_SKILLBOOK] + 1;
+            this.AddChat("[掉落] " + this.curMonsterName + " 掉了技能书×1");
+        }
 
         this.p.cur[Data.CUR_GOLD] = this.p.cur[Data.CUR_GOLD] + (long)gold;
         this.p.cur[Data.CUR_SW] = this.p.cur[Data.CUR_SW] + (long)sw;
@@ -1696,27 +1743,65 @@ class Game {
     // ---------------------------------------------------------------
     // 钱庄
     // ---------------------------------------------------------------
+    // 收取 5 条产业线产出(每小时一结,上限 24h;低概率被影子玩家夺走一条)
     public long CollectCity() {
-        if (this.p.cityOwned < 0 || this.p.cityOwned >= Data.CITY_TOTAL) {
-            this.AddChat("[系统] 未占领任何钱庄");
-            return 0;
+        int owned = 0;
+        for (int i = 0; i < Data.CITY_LINES; i = i + 1) {
+            if (this.p.cityLvl[i] >= 0) { owned = owned + 1; }
         }
+        if (owned == 0) { this.AddChat("[系统] 未拥有任何产业"); return 0; }
         long now = Game.NowMs();
         long ms = now - this.p.cityLastMs;
         if (ms < 1000) { return 0; }
         long hours = ms / 3600000L;
         if (hours < 1) { hours = 1; }
-        long gold = Data.CITY_PRODUCE[this.p.cityOwned] * hours;
-        // 概率被抢(影子 PvP 随机事件):5%
+        if (hours > 24) { hours = 24; }
         if (this.rng.NextDouble01() < 0.05) {
-            this.AddChat("[钱庄] 钱庄被其他玩家夺走!");
-            this.p.cityOwned = -1;
+            this.AddChat("[产业] 有产业被其他玩家夺走了!");
+            for (int i = Data.CITY_LINES - 1; i >= 0; i = i - 1) {
+                if (this.p.cityLvl[i] >= 0) { this.p.cityLvl[i] = -1; break; }
+            }
+            this.p.cityLastMs = now;
             return 0;
         }
-        this.p.cur[Data.CUR_GOLD] = this.p.cur[Data.CUR_GOLD] + gold;
-        this.AddChat("[钱庄] 收取 " + gold + " 金币 (" + hours + " 小时)");
+        for (int i = 0; i < Data.CITY_LINES; i = i + 1) {
+            int lv = this.p.cityLvl[i];
+            if (lv < 0) { continue; }
+            long amt = 0;
+            if (i == 0) { amt = (long)Data.CITY_PRODUCE[lv] * hours; }
+            else if (i == 1) { amt = (long)Data.CITY_PROD_SW[lv] * hours; }
+            else if (i == 2) { amt = (long)Data.CITY_PROD_IRON[lv] * hours; }
+            else if (i == 3) { amt = (long)Data.CITY_PROD_BOOK[lv] * hours; }
+            else { amt = (long)Data.CITY_PROD_ZG[lv] * hours; }
+            if (amt <= 0) { continue; }
+            if (Data.CITY_LINE_MAT[i] >= 0) {
+                int m = Data.CITY_LINE_MAT[i];
+                this.p.mats[m] = this.p.mats[m] + (int)amt;
+                this.AddChat("[产业] " + Data.CITY_LINE_NAMES[i] + " 产出 "
+                             + Data.MAT_NAMES[m] + "×" + amt);
+            } else {
+                int c = Data.CITY_LINE_CUR[i];
+                this.p.cur[c] = this.p.cur[c] + amt;
+                this.AddChat("[产业] " + Data.CITY_LINE_NAMES[i] + " 产出 "
+                             + Data.CUR_NAMES[c] + "×" + this.FormatNum(amt));
+            }
+        }
         this.p.cityLastMs = now;
-        return gold;
+        return 1;
+    }
+
+    // 购买/升级产业档位;空串=成功
+    public string CityBuy(int line) {
+        if (line < 0 || line >= Data.CITY_LINES) { return "无此产业"; }
+        int lv = this.p.cityLvl[line];
+        if (lv >= Data.CITY_TOTAL - 1) { return "已满档"; }
+        long cost = (long)Data.CITY_UP_BASE[line] << (lv + 1);
+        int c = Data.CITY_UP_CUR[line];
+        if (this.p.cur[c] < cost) { return Data.CUR_NAMES[c] + "不足"; }
+        this.p.cur[c] = this.p.cur[c] - cost;
+        this.p.cityLvl[line] = lv + 1;
+        this.AddChat("[产业] " + Data.CITY_LINE_NAMES[line] + " 升到第 " + (lv + 2) + " 档");
+        return "";
     }
 
     // ---------------------------------------------------------------
@@ -2019,6 +2104,19 @@ class Game {
     }
 
     // Parse 辅助(Zan 无 int.Parse/long.Parse)
+    // 逗号分隔整数串 → 数组(超长忽略,缺省保留)
+    public static void ParseIntCsv(string v, int[] dst) {
+        int mi = 0;
+        string cur2 = "";
+        for (int j = 0; j <= v.Length; j = j + 1) {
+            if (j == v.Length || v.Substring(j, 1) == ",") {
+                if (mi < dst.Length && cur2 != "") { dst[mi] = Game.ParseIntS(cur2); }
+                mi = mi + 1;
+                cur2 = "";
+            } else { cur2 = cur2 + v.Substring(j, 1); }
+        }
+    }
+
     public static int ParseIntS(string s) {
         if (s == null) { return 0; }
         int v = 0;
@@ -2295,7 +2393,7 @@ class Game {
         lines.Add("mjk=" + this.p.mjKills);
         lines.Add("mjb=" + this.p.mjBest);
         lines.Add("mju=" + this.p.mjUnlocked);
-        for (int i = 0; i < 8; i = i + 1) {
+        for (int i = 0; i < Data.BOSS_COUNT; i = i + 1) {
             lines.Add("bh" + i + "=" + this.p.bhKilled[i]);
         }
         lines.Add("bhl=" + this.p.bhTriesLeft);
@@ -2321,7 +2419,18 @@ class Game {
         lines.Add("ybl=" + this.p.ybTriesLeft);
         lines.Add("jbl=" + this.p.jbTriesLeft);
         lines.Add("tow=" + this.p.towerBest);
-        lines.Add("city=" + this.p.cityOwned);
+        string cs = "";
+        for (int i = 0; i < Data.CITY_LINES; i = i + 1) {
+            cs = cs + this.p.cityLvl[i];
+            if (i < Data.CITY_LINES - 1) { cs = cs + ","; }
+        }
+        lines.Add("citys=" + cs);
+        string skl = "";
+        for (int i = 0; i < Data.SKILL_COUNT; i = i + 1) {
+            skl = skl + this.p.skillLv[i];
+            if (i < Data.SKILL_COUNT - 1) { skl = skl + ","; }
+        }
+        lines.Add("skl=" + skl);
         lines.Add("cityms=" + this.p.cityLastMs);
         lines.Add("wbd=" + this.p.wbDamage);
         lines.Add("wbl=" + this.p.wbTriesLeft);
@@ -2476,9 +2585,9 @@ class Game {
             else if (k == "mjb") { this.p.mjBest = Game.ParseIntS(v); }
             else if (k == "mju") { this.p.mjUnlocked = Game.ParseIntS(v); }
             else if (k == "bhl") { this.p.bhTriesLeft = Game.ParseIntS(v); }
-            else if (k.Length == 3 && k.Substring(0, 2) == "bh") {
-                int idx = Game.DigitOf(k.Substring(2, 1));
-                if (idx >= 0 && idx < 8) { this.p.bhKilled[idx] = Game.ParseIntS(v); }
+            else if (k.Length >= 3 && k.Substring(0, 2) == "bh") {
+                int idx = Game.ParseIntS(k.Substring(2));
+                if (idx >= 0 && idx < Data.BOSS_COUNT) { this.p.bhKilled[idx] = Game.ParseIntS(v); }
             }
             else if (k == "ts") { this.p.lastSeenTs = Game.ParseLongS(v); }
             else if (k == "lkt") { this.lastKillTs = Game.ParseLongS(v); }
@@ -2504,7 +2613,9 @@ class Game {
             else if (k == "ybl") { this.p.ybTriesLeft = Game.ParseIntS(v); }
             else if (k == "jbl") { this.p.jbTriesLeft = Game.ParseIntS(v); }
             else if (k == "tow") { this.p.towerBest = Game.ParseIntS(v); }
-            else if (k == "city") { this.p.cityOwned = Game.ParseIntS(v); }
+            else if (k == "city") { this.p.cityLvl[0] = Game.ParseIntS(v); }
+            else if (k == "citys") { Game.ParseIntCsv(v, this.p.cityLvl); }
+            else if (k == "skl") { Game.ParseIntCsv(v, this.p.skillLv); }
             else if (k == "cityms") { this.p.cityLastMs = Game.ParseLongS(v); }
             else if (k == "wbd") { this.p.wbDamage = Game.ParseLongS(v); }
             else if (k == "wbl") { this.p.wbTriesLeft = Game.ParseIntS(v); }
