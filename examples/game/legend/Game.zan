@@ -107,10 +107,6 @@ class Player {
     // 商店/回收/铁匠铺
     public long shopLastDayMs;
 
-    // 成就:48 条 → bitmap 用 1 long
-    public long achvMask;
-    public int achvClaimed;
-
     // 排行榜:自己的快照(用于影子榜生成)
     public long rkGold;
     public int rkLevel;
@@ -140,11 +136,20 @@ class Player {
     // 世界 BOSS 伤害(今日)
     public long wbDamage;
     public int wbTriesLeft;
+    public long wbWindowEndMs;   // 30 秒挑战窗口截止(0=未开战)
+
+    // 材料(MAT_COUNT 种),存档按逗号串
+    public int[] mats = new int[Data.MAT_COUNT];
+
+    // 成就:48 位点亮位 + 高 48 位已领取
+    public long achvMask;
+    public int achvClaimed;
 
     // 帮会
     public bool hasGuild;
     public string guildName;
     public long guildGold;
+    public long guildAccTs;      // 行会资产离线累积锚
 
     // 设置
     public bool bossKey;        // F10 一键隐藏
@@ -160,6 +165,7 @@ class Player {
         this.cardMask = new int[this.cardMaskLen];
         this.titleMask = 0;
         for (int i = 0; i < Data.CUR_COUNT; i = i + 1) { this.cur[i] = 0; }
+        this.mats = new int[Data.MAT_COUNT];
     }
 }
 
@@ -275,6 +281,7 @@ class Game {
         this.p.jbTriesLeft = Data.JIEBIAO_TRIES;
         this.p.wbTriesLeft = Data.WORLD_BOSS_TRIES;
         this.p.wbDamage = 0;
+        this.p.wbWindowEndMs = 0;
         this.p.altarMyProg = 0;
         this.p.altarGlobalProg = (int)(this.rng.Range(4000, 6500));
         // 寻宝奖池:清空
@@ -286,6 +293,40 @@ class Game {
         this.p.lastDayTs = Game.NowMs();
         this.AddChat("[系统] 每日 0 点刷新:寻宝奖池 / 个人 BOSS 次数 / 押镖次数");
     }
+
+    // ---------------------------------------------------------------
+    // 材料系统(黑铁/祝福油/符文/龙珠/魂灵/金砖/灵石/钥匙/号角/屠龙/天书)
+    // ---------------------------------------------------------------
+    public int MatCount(int m) {
+        if (m < 0 || m >= Data.MAT_COUNT) { return 0; }
+        return this.p.mats[m];
+    }
+    public bool MatTake(int m, int n) {
+        if (m < 0 || m >= Data.MAT_COUNT) { return false; }
+        if (this.p.mats[m] < n) { return false; }
+        this.p.mats[m] = this.p.mats[m] - n;
+        return true;
+    }
+    public void MatAdd(int m, int n) {
+        if (m < 0 || m >= Data.MAT_COUNT || n <= 0) { return; }
+        if (this.p.mats[m] < 0) { this.p.mats[m] = 0; }
+        this.p.mats[m] = this.p.mats[m] + n;
+    }
+    public void MatAddMsg(int m, int n) {
+        this.MatAdd(m, n);
+        this.AddChat("[材料] 获得 " + Data.MAT_NAMES[m] + "×" + n);
+    }
+    // 3 个同号符文 → 高 1 号(14# 已满级)
+    public bool MergeRune(int rune1) {
+        int idx = rune1 - 1;
+        if (idx < 0 || idx >= Data.MAT_RUNE14) { return false; }
+        if (!this.MatTake(rune1, Data.RUNE_MERGE_COUNT)) { return false; }
+        this.MatAddMsg(rune1 + 1, 1);
+        this.AddChat("[符文] " + Data.MAT_NAMES[rune1] + "×3 合成 " + Data.MAT_NAMES[rune1 + 1]);
+        return true;
+    }
+    // 建行会:除金币外还需沃玛号角
+    public bool HasHorn() { return this.MatCount(Data.MAT_HORN) > 0; }
 
     // ---------------------------------------------------------------
     // 玩家属性计算
@@ -923,6 +964,164 @@ class Game {
     }
 
     // ---------------------------------------------------------------
+    // 铁匠铺 11 模式(2..10 为本轮补全的真逻辑)
+    // ---------------------------------------------------------------
+    // 2 幸运传承:把已选装备的品阶+系数整体传给另一件同槽装备(源销毁)
+    public bool InheritLucky(int srcIdx, int dstIdx) {
+        if (srcIdx < 0 || srcIdx >= this.p.bagCnt) { return false; }
+        if (dstIdx < 0 || dstIdx >= this.p.bagCnt) { return false; }
+        if (srcIdx == dstIdx) { return false; }
+        Item s = this.p.bag[srcIdx];
+        Item d = this.p.bag[dstIdx];
+        if (s == null || d == null) { return false; }
+        if (s.slot != d.slot) { this.AddChat("[传承] 只能传给同槽位的装备"); return false; }
+        long cost = 200000L;
+        if (this.p.cur[Data.CUR_GOLD] < cost) { this.AddChat("[系统] 金币不足,需 " + cost); return false; }
+        this.p.cur[Data.CUR_GOLD] = this.p.cur[Data.CUR_GOLD] - cost;
+        // 目标取两者较高评分,源消失
+        int bestTier = s.tier > d.tier ? s.tier : d.tier;
+        int bestCoef = (s.tier > d.tier ? s : d).coef;
+        d.tier = bestTier;
+        d.coef = bestCoef;
+        // 移除源
+        for (int i = srcIdx; i < this.p.bagCnt - 1; i = i + 1) { this.p.bag[i] = this.p.bag[i + 1]; }
+        this.p.bag[this.p.bagCnt - 1] = null;
+        this.p.bagCnt = this.p.bagCnt - 1;
+        this.AddChat("[传承] 传承完成 → " + d.Name() + " +" + d.coef);
+        return true;
+    }
+    // 3 淬炼锻造:黑铁×8,必 +1 系数(t4 上限按当前+品阶头room)
+    public bool ForgeQuench(int bagIdx) {
+        if (bagIdx < 0 || bagIdx >= this.p.bagCnt) { return false; }
+        Item it = this.p.bag[bagIdx];
+        if (it == null) { return false; }
+        if (!this.MatTake(Data.MAT_BLACK_IRON, Data.RUNEWORD_BLACK_IRON)) {
+            this.AddChat("[淬炼] 黑铁矿石不足,需 ×" + Data.RUNEWORD_BLACK_IRON);
+            return false;
+        }
+        int cap = it.coef + Data.TIER_COEF_CAP[it.tier];
+        it.coef = it.coef + 1;
+        if (it.coef > cap) { it.coef = cap; }
+        this.AddChat("[淬炼] " + it.Name() + " 系数提升为 +" + it.coef);
+        return true;
+    }
+    // 4 符文锻造:符文N# ×1 + 金币,按符文号提升系数(高级符文更多)
+    public bool ForgeRune(int bagIdx, int rune1) {
+        if (bagIdx < 0 || bagIdx >= this.p.bagCnt) { return false; }
+        Item it = this.p.bag[bagIdx];
+        if (it == null) { return false; }
+        if (rune1 < Data.MAT_RUNE1 || rune1 > Data.MAT_RUNE14) { return false; }
+        if (!this.MatTake(rune1, 1)) { this.AddChat("[符文锻造] 缺少 " + Data.MAT_NAMES[rune1]); return false; }
+        long cost = 10000L * (rune1 - Data.MAT_RUNE1 + 1);
+        if (this.p.cur[Data.CUR_GOLD] < cost) {
+            this.MatAdd(rune1, 1);   // 退料
+            this.AddChat("[系统] 金币不足,需 " + cost);
+            return false;
+        }
+        this.p.cur[Data.CUR_GOLD] = this.p.cur[Data.CUR_GOLD] - cost;
+        int cap = it.coef + Data.TIER_COEF_CAP[it.tier];
+        it.coef = it.coef + (rune1 - Data.MAT_RUNE1 + 2);
+        if (it.coef > cap) { it.coef = cap; }
+        this.AddChat("[符文锻造] 注入 " + Data.MAT_NAMES[rune1] + " → +" + it.coef);
+        return true;
+    }
+    // 5 灵符锻造:灵符 ×(10+tier*5),提升品阶(必成,t4 封顶)
+    public bool ForgeLingFu(int bagIdx) {
+        if (bagIdx < 0 || bagIdx >= this.p.bagCnt) { return false; }
+        Item it = this.p.bag[bagIdx];
+        if (it == null) { return false; }
+        if (it.tier >= 4) { this.AddChat("[灵符锻造] 已是传说品阶"); return false; }
+        int cost = 10 + it.tier * 5;
+        if (this.p.cur[Data.CUR_LF] < cost) { this.AddChat("[系统] 灵符不足,需 " + cost); return false; }
+        this.p.cur[Data.CUR_LF] = this.p.cur[Data.CUR_LF] - cost;
+        it.tier = it.tier + 1;
+        this.AddChat("[灵符锻造] 升阶为 " + Data.EQUIP_TIER_NAMES[it.tier]);
+        return true;
+    }
+    // 6 符文之语:传说装备 + 黑铁×8 + 符文5#×1 → 全属性微幅重掷(系数上调)
+    public bool ForgeRuneword(int bagIdx) {
+        if (bagIdx < 0 || bagIdx >= this.p.bagCnt) { return false; }
+        Item it = this.p.bag[bagIdx];
+        if (it == null) { return false; }
+        if (it.tier < 4) { this.AddChat("[符文之语] 只对传说装备有效"); return false; }
+        if (!this.MatTake(Data.MAT_BLACK_IRON, Data.RUNEWORD_BLACK_IRON)) {
+            this.AddChat("[符文之语] 黑铁矿石不足,需 ×" + Data.RUNEWORD_BLACK_IRON);
+            return false;
+        }
+        if (!this.MatTake(Data.MAT_RUNE1 + 4, 1)) {
+            this.MatAdd(Data.MAT_BLACK_IRON, Data.RUNEWORD_BLACK_IRON);
+            this.AddChat("[符文之语] 缺少 符文5#");
+            return false;
+        }
+        long cost = 1000000L;
+        if (this.p.cur[Data.CUR_GOLD] < cost) {
+            this.MatAdd(Data.MAT_BLACK_IRON, Data.RUNEWORD_BLACK_IRON);
+            this.MatAdd(Data.MAT_RUNE1 + 4, 1);
+            this.AddChat("[系统] 金币不足,需 " + cost);
+            return false;
+        }
+        this.p.cur[Data.CUR_GOLD] = this.p.cur[Data.CUR_GOLD] - cost;
+        int cap = it.coef + Data.TIER_COEF_CAP[it.tier];
+        int delta = 2 + (int)this.rng.Range(0, 4);
+        it.coef = it.coef + delta;
+        if (it.coef > cap) { it.coef = cap; }
+        this.AddChat("[符文之语] 符文之语激活!系数跃升至 +" + it.coef);
+        return true;
+    }
+    // 7 龙珠锻造:龙珠1★+2★+3★ 各1 → 系数 +3
+    public bool ForgeDragon(int bagIdx) {
+        if (bagIdx < 0 || bagIdx >= this.p.bagCnt) { return false; }
+        Item it = this.p.bag[bagIdx];
+        if (it == null) { return false; }
+        if (!this.MatTake(Data.MAT_DRAGON1, 1) || !this.MatTake(Data.MAT_DRAGON1 + 1, 1)
+            || !this.MatTake(Data.MAT_DRAGON3, 1)) {
+            // 退回已扣的
+            this.MatAdd(Data.MAT_DRAGON1, 1);
+            this.MatAdd(Data.MAT_DRAGON1 + 1, 1);
+            this.MatAdd(Data.MAT_DRAGON3, 1);
+            this.AddChat("[龙珠锻造] 需要 龙珠1★/2★/3★ 各 1");
+            return false;
+        }
+        int cap = it.coef + Data.TIER_COEF_CAP[it.tier];
+        it.coef = it.coef + Data.DRAGON_FORGE_COEF;
+        if (it.coef > cap) { it.coef = cap; }
+        this.AddChat("[龙珠锻造] 集齐三星龙珠!系数 +3 → +" + it.coef);
+        return true;
+    }
+    // 8 天书传承:消耗天书×1,把当前装备系数复制给另一件同槽装备
+    public bool ForgeTomeCopy(int srcIdx, int dstIdx) {
+        if (srcIdx < 0 || srcIdx >= this.p.bagCnt) { return false; }
+        if (dstIdx < 0 || dstIdx >= this.p.bagCnt) { return false; }
+        if (srcIdx == dstIdx) { return false; }
+        Item s = this.p.bag[srcIdx];
+        Item d = this.p.bag[dstIdx];
+        if (s == null || d == null) { return false; }
+        if (s.slot != d.slot) { this.AddChat("[天书传承] 只能传给同槽位的装备"); return false; }
+        if (!this.MatTake(Data.MAT_TOME, 1)) { this.AddChat("[天书传承] 缺少 天书"); return false; }
+        d.coef = s.coef;
+        this.AddChat("[天书传承] 系数 " + s.coef + " 已复制到 " + d.Name());
+        return true;
+    }
+    // 9 传说锻造:屠龙宝刀(神)×1 + 5000万金 → 直接造一件 t4 满系数武器
+    public bool ForgeTulong() {
+        if (!this.MatTake(Data.MAT_TULONG, 1)) { this.AddChat("[传说锻造] 缺少 屠龙宝刀"); return false; }
+        long cost = 50000000L;
+        if (this.p.cur[Data.CUR_GOLD] < cost) {
+            this.MatAdd(Data.MAT_TULONG, 1);
+            this.AddChat("[系统] 金币不足,需 " + cost);
+            return false;
+        }
+        this.p.cur[Data.CUR_GOLD] = this.p.cur[Data.CUR_GOLD] - cost;
+        Item t = Item.New(Data.SLOT_WEAPON, 4, Data.TIER_COEF_CAP[4], 0, (int)this.rng.Range(1, 1000000));
+        if (this.AddToBag(t)) {
+            this.AddBroadcast("[传说锻造]铸成神器·" + t.Name() + "!");
+            return true;
+        }
+        this.AddChat("[传说锻造] 背包已满,无法放入神器");
+        return false;
+    }
+
+    // ---------------------------------------------------------------
     // 回收
     // ---------------------------------------------------------------
     public void Recycle(int bagIdx, int currency) {
@@ -1037,16 +1236,26 @@ class Game {
     }
 
     // ---------------------------------------------------------------
-    // 世界 BOSS(影子)
+    // 世界 BOSS(影子共斗,30 秒挑战窗口)
     // ---------------------------------------------------------------
-    public long HitWorldBoss() {
+    public bool WorldBossBegin() {
         if (this.p.wbTriesLeft <= 0) {
             this.AddChat("[系统] 今日世界 BOSS 次数已用完");
-            return 0;
+            return false;
         }
-        this.p.wbTriesLeft = this.p.wbTriesLeft - 1;
+        if (this.p.wbWindowEndMs > Game.NowMs()) { return false; }  // 窗口进行中
+        this.p.wbWindowEndMs = Game.NowMs() + 30000L;
+        this.AddChat("[世界 BOSS] 挑战开始,30 秒内尽量输出!");
+        return true;
+    }
+    // 窗口内可再次点击"输出"累计伤害;窗口结束后一次性结算贡献
+    public bool WorldBossInWindow() {
+        return this.p.wbWindowEndMs > Game.NowMs();
+    }
+    public long WorldBossHit() {
+        if (!this.WorldBossInWindow()) { return 0; }
         long dmg = 0;
-        int myAc = this.TotalAcMin();
+        int myAc = this.TotalAcMax();
         if (myAc >= Data.WORLD_BOSS_TIER_BOUND0) { dmg = (long)Data.WORLD_BOSS_DAMAGE_PER_HIT[4]; }
         else if (myAc >= Data.WORLD_BOSS_TIER_BOUND1) { dmg = (long)Data.WORLD_BOSS_DAMAGE_PER_HIT[3]; }
         else if (myAc >= Data.WORLD_BOSS_TIER_BOUND2) { dmg = (long)Data.WORLD_BOSS_DAMAGE_PER_HIT[2]; }
@@ -1056,7 +1265,28 @@ class Game {
         double r = 0.5 + this.rng.NextDouble01() * 0.7;
         dmg = (long)(dmg * r);
         this.p.wbDamage = this.p.wbDamage + dmg;
-        this.AddChat("[世界 BOSS] 打出 " + dmg + " 伤害");
+        return dmg;
+    }
+    // 窗口结束 → 结算(次数扣除 + 简单奖励);返回本次窗口总伤
+    public long WorldBossFinish() {
+        if (this.p.wbWindowEndMs == 0) { return 0; }
+        if (this.WorldBossInWindow()) { return 0; }
+        this.p.wbWindowEndMs = 0;
+        this.p.wbTriesLeft = this.p.wbTriesLeft - 1;
+        long dmg = this.p.wbDamage;
+        if (dmg > 0) {
+            // 贡献奖励:每 100 万伤害折 1 元宝,再按伤害段给材料
+            long yb = dmg / 1000000L;
+            if (yb > 0) { this.p.cur[Data.CUR_YB] = this.p.cur[Data.CUR_YB] + yb; }
+            this.MatAddMsg(Data.MAT_BLACK_IRON, 1 + (int)(dmg / 5000000L));
+            if (dmg >= 2000000L && !this.p.hasGuild) {
+                this.MatAddMsg(Data.MAT_HORN, 1);
+            }
+            this.AddChat("[世界 BOSS] 挑战结束,总伤害 " + this.FormatNum(dmg)
+                         + (yb > 0 ? ",获得 " + yb + " 元宝" : ""));
+        } else {
+            this.AddChat("[世界 BOSS] 挑战结束,未造成伤害");
+        }
         return dmg;
     }
 
@@ -1079,6 +1309,140 @@ class Game {
                 }
             }
         }
+    }
+
+    // ---------------------------------------------------------------
+    // 成就(6 类 × 8 条,自动点亮,手动领取)
+    // ---------------------------------------------------------------
+    // 返回本轮新点亮的成就数
+    public int AchievementTick() {
+        int newLit = 0;
+        // 每类的当前值
+        int[] vals = new int[6];
+        vals[0] = this.p.lv;
+        vals[1] = (int)Math.Min(2100000000L, this.p.totalKills);
+        vals[2] = this.TotalAcMax();
+        vals[3] = (int)Math.Min(2100000000L, this.p.bossKilled);
+        vals[4] = this.p.hjBest;
+        vals[5] = (int)Math.Min(2100000000L, this.p.chargeTotal);
+        for (int c = 0; c < 6; c = c + 1) {
+            for (int i = 0; i < Data.ACHV_PER_CAT; i = i + 1) {
+                int idx = c * 8 + i;
+                long bit = 1L << idx;
+                if ((this.p.achvMask & bit) != 0) { continue; }
+                if (vals[c] >= Data.ACHV_REQ[idx]) {
+                    this.p.achvMask = this.p.achvMask | bit;
+                    newLit = newLit + 1;
+                }
+            }
+        }
+        return newLit;
+    }
+    public bool AchievementClaim(int idx) {
+        if (idx < 0 || idx >= 48) { return false; }
+        long bit = 1L << idx;
+        if ((this.p.achvMask & bit) == 0) { return false; }
+        // 高 48 位 = 已领取
+        long done = bit << 48;
+        if ((this.p.achvMask & done) != 0) { return false; }
+        this.p.achvMask = this.p.achvMask | done;
+        this.p.achvClaimed = this.p.achvClaimed + 1;
+        long gold = (long)Data.ACHV_REQ[idx] * 1000L;
+        this.p.cur[Data.CUR_GOLD] = this.p.cur[Data.CUR_GOLD] + gold;
+        int c = idx / 8;
+        this.AddChat("[成就] 「" + Data.ACHV_CAT_NAMES[c] + "·" + (idx % 8 + 1) + "」达成,领取 "
+                     + this.FormatNum(gold) + " 金币");
+        return true;
+    }
+    public bool AchievementClaimed(int idx) {
+        if (idx < 0 || idx >= 48) { return false; }
+        return (this.p.achvMask & ((1L << idx) << 48)) != 0;
+    }
+    public bool AchievementLit(int idx) {
+        if (idx < 0 || idx >= 48) { return false; }
+        return (this.p.achvMask & (1L << idx)) != 0;
+    }
+    public long AchievementGold(int idx) {
+        if (idx < 0 || idx >= 48) { return 0; }
+        return (long)Data.ACHV_REQ[idx] * 1000L;
+    }
+
+    // ---------------------------------------------------------------
+    // 交易市场(影子):NPC 挂牌(rkSeed 确定性派生)+ 玩家寄售
+    // ---------------------------------------------------------------
+    public int MarketOfferCls(int i) {
+        return (int)((this.rkSeed / (i + 3) + i * 5) % 8);
+    }
+    public int MarketOfferCoef(int i) {
+        return (int)(4 + (this.rkSeed / (i * 7 + 11) + i) % 12);
+    }
+    public long MarketOfferPrice(int i) {
+        // 价格 = 系数基准 × 类别加成(元宝计价)
+        double baseP = 500L + this.MarketOfferCoef(i) * 120L;
+        return (long)baseP * (1 + this.MarketOfferCls(i) / 4);
+    }
+    public bool MarketBuy(int i) {
+        if (i < 0 || i >= 8) { return false; }
+        long price = this.MarketOfferPrice(i);
+        if (this.p.cur[Data.CUR_YB] < price) {
+            this.AddChat("[市场] 元宝不足,需 " + this.FormatNum(price));
+            return false;
+        }
+        this.p.cur[Data.CUR_YB] = this.p.cur[Data.CUR_YB] - price;
+        Item it = Item.New(this.MarketOfferCls(i) % Data.SLOT_COUNT, 2 + i / 4,
+                           this.MarketOfferCoef(i), this.MarketOfferCls(i),
+                           (int)((this.rkSeed / (i + 1)) % 997));
+        if (!this.AddToBag(it)) {
+            this.p.cur[Data.CUR_YB] = this.p.cur[Data.CUR_YB] + price;
+            this.AddChat("[市场] 背包已满");
+            return false;
+        }
+        this.AddChat("[市场] 买入 " + it.Name() + " 花 " + this.FormatNum(price) + " 元宝");
+        return true;
+    }
+    // 寄售:背包第 bagIdx 件挂给影子买家,按品阶估价折元宝成交
+    public bool MarketSell(int bagIdx) {
+        if (bagIdx < 0 || bagIdx >= this.p.bagCnt) { return false; }
+        Item it = this.p.bag[bagIdx];
+        if (it == null) { return false; }
+        long price = (long)Data.RECYCLE_GOLD_PER_TIER[it.tier] * it.coef / 2;
+        long yb = price / 100 + 5;
+        this.p.cur[Data.CUR_YB] = this.p.cur[Data.CUR_YB] + yb;
+        for (int i = bagIdx; i < this.p.bagCnt - 1; i = i + 1) { this.p.bag[i] = this.p.bag[i + 1]; }
+        this.p.bag[this.p.bagCnt - 1] = null;
+        this.p.bagCnt = this.p.bagCnt - 1;
+        this.AddChat("[市场] 寄售 " + it.Name() + " 成交,获得 " + yb + " 元宝");
+        return true;
+    }
+
+    // ---------------------------------------------------------------
+    // 排行榜(影子天梯):影子值由 rkSeed 确定性派生,围绕玩家自身值分布
+    // ---------------------------------------------------------------
+    public long RankMyValue(int kind) {
+        if (kind == 0) { return this.p.lv; }
+        if (kind == 1) { return this.TotalAcMax(); }
+        if (kind == 2) { return this.p.hjBest; }
+        if (kind == 3) { return this.p.cur[Data.CUR_ZG]; }
+        if (kind == 4) { return this.p.wbDamage > 1 ? this.p.wbDamage : 1; }
+        if (kind == 5) { return this.p.donateAcc > 1 ? this.p.donateAcc : 1; }
+        return this.p.altarMyProg > 1 ? this.p.altarMyProg : 1;
+    }
+    // 第 pos 名(0=第一)影子值 = 玩家值 × 递减系数 + 种子扰动
+    public long RankSeedValue(int kind, int pos) {
+        long baseV = this.RankMyValue(kind);
+        if (baseV <= 0) { baseV = 1; }
+        double spread = 1.35 - pos * 0.09;
+        long jitter = (this.rkSeed / (pos + 1) + pos * 7919) % Math.Max(1, baseV / 50 + 1);
+        return (long)(baseV * spread) + jitter;
+    }
+    // 玩家名次(0 起):影子 10 人 + 自己降序
+    public int RankMyPos(int kind) {
+        long my = this.RankMyValue(kind);
+        int pos = 0;
+        for (int i = 0; i < 10; i = i + 1) {
+            if (this.RankSeedValue(kind, i) > my) { pos = pos + 1; }
+        }
+        return pos;
     }
 
     // ---------------------------------------------------------------
@@ -1187,10 +1551,12 @@ class Game {
             case 1: this.GainXp(50000); break;
             case 2: this.p.cur[Data.CUR_SW] = this.p.cur[Data.CUR_SW] + 100; break;
             case 3: this.p.cur[Data.CUR_ZG] = this.p.cur[Data.CUR_ZG] + 50; break;
-            case 6: this.AddChat("[寻宝] 获得符文 1#×3"); break;
-            case 7: this.AddChat("[寻宝] 获得符文 5#×1"); break;
-            case 8: this.AddChat("[寻宝] 获得龙珠 1★×5"); break;
-            case 9: this.AddChat("[寻宝] ★★★ 获得 屠龙宝刀!"); break;
+            case 4: this.MatAddMsg(Data.MAT_BLACK_IRON, 100); break;
+            case 5: this.MatAddMsg(Data.MAT_BLACK_IRON, 20); this.MatAddMsg(Data.MAT_SUPERBLESS, 2); break;
+            case 6: this.MatAddMsg(Data.MAT_RUNE1, 3); break;
+            case 7: this.MatAddMsg(Data.MAT_RUNE1 + 4, 1); break;
+            case 8: this.MatAddMsg(Data.MAT_DRAGON1, 5); break;
+            case 9: this.MatAddMsg(Data.MAT_TULONG, 1); break;
             case 10: this.p.cur[Data.CUR_YB] = this.p.cur[Data.CUR_YB] + 1000; break;
             case 11: this.p.cur[Data.CUR_LF] = this.p.cur[Data.CUR_LF] + 50; break;
             default: break;
@@ -1332,20 +1698,19 @@ class Game {
             return false;
         }
         this.p.cur[Data.CUR_YB] = this.p.cur[Data.CUR_YB] - cost;
-        // 给物品(简化:只入背包 1 件或加货币)
-        if (idx == 2) {
-            this.AddChat("[商店] 获得 黑铁矿石×10");
-        } else if (idx == 3) {
-            this.AddChat("[商店] 获得 符文 1#×1");
-        } else if (idx == 5) {
-            this.AddChat("[商店] 获得 祝福油×10");
-        } else if (idx == 6) {
-            this.AddChat("[商店] 获得 超级祝福油×5");
-        } else if (idx == 11) {
-            this.p.cur[Data.CUR_GOLD] = this.p.cur[Data.CUR_GOLD] + 100000;
-        } else {
-            this.AddChat("[商店] 购买 " + Data.SHOP_GOODS_NAME[idx] + " 成功");
-        }
+        // 真实发货:材料入包,礼包折货币
+        if (idx == 0) { this.MatAddMsg(Data.MAT_GOLDKEY, 1); }          // 改名卡→黄金钥匙? 保持名实一致:发钥匙
+        else if (idx == 1) { this.MatAddMsg(Data.MAT_GOLDKEY, 1); }
+        else if (idx == 2) { this.MatAddMsg(Data.MAT_BLACK_IRON, 10); }
+        else if (idx == 3) { this.MatAddMsg(Data.MAT_RUNE1, 1); }
+        else if (idx == 4) { this.MatAddMsg(Data.MAT_RUNE1 + 9, 1); }
+        else if (idx == 5) { this.MatAddMsg(Data.MAT_BLESS, 10); }
+        else if (idx == 6) { this.MatAddMsg(Data.MAT_SUPERBLESS, 5); }
+        else if (idx == 7) { this.p.bagSizeBase = 80; this.AddChat("[商店] 背包扩充到 80 格"); }
+        else if (idx == 8) { this.MatAddMsg(Data.MAT_SOUL, 10); }
+        else if (idx == 9) { this.MatAddMsg(Data.MAT_GOLDBRICK, 5); }
+        else if (idx == 10) { this.MatAddMsg(Data.MAT_LINGSHI, 5); }
+        else { this.MatAddMsg(Data.MAT_TOME, 2); }                      // 秘境礼包→天书×2
         return true;
     }
 
@@ -1415,11 +1780,39 @@ class Game {
             this.AddChat("[系统] 金币不足,需 " + Data.GUILD_CREATE_GOLD);
             return;
         }
+        if (!this.MatTake(Data.MAT_HORN, 1)) {
+            this.AddChat("[系统] 需要 沃玛号角×1(Boss之家/世界BOSS 掉落)");
+            return;
+        }
         this.p.cur[Data.CUR_GOLD] = this.p.cur[Data.CUR_GOLD] - Data.GUILD_CREATE_GOLD;
         this.p.hasGuild = true;
         this.p.guildName = name;
         this.p.guildGold = 0;
+        this.p.guildAccTs = Game.NowMs();
         this.AddChat("[帮会] 创建 " + name);
+    }
+    // 行会资产:按离线时长累积(成员影子产出),面板可领取
+    public long GuildAccumulate() {
+        if (!this.p.hasGuild) { return 0; }
+        long now = Game.NowMs();
+        if (this.p.guildAccTs <= 0) { this.p.guildAccTs = now; return 0; }
+        long ms = now - this.p.guildAccTs;
+        if (ms < 60000) { return 0; }   // 1 分钟内不结算
+        // 48 成员影子 × 每人每分钟 500 金
+        long gold = (ms / 60000L) * 500L * (Data.GUILD_MEMBERS_BASE / 48L + 1L);
+        this.p.guildGold = this.p.guildGold + gold;
+        this.p.guildAccTs = now;
+        return gold;
+    }
+    public long GuildClaim() {
+        if (!this.p.hasGuild) { return 0; }
+        this.GuildAccumulate();
+        long got = this.p.guildGold;
+        if (got <= 0) { return 0; }
+        this.p.cur[Data.CUR_GOLD] = this.p.cur[Data.CUR_GOLD] + got;
+        this.p.guildGold = 0;
+        this.AddChat("[帮会] 领取行会资产 " + this.FormatNum(got) + " 金币");
+        return got;
     }
 
     // ---------------------------------------------------------------
@@ -1633,6 +2026,19 @@ class Game {
         lines.Add("wbl=" + this.p.wbTriesLeft);
         lines.Add("gh=" + (this.p.hasGuild ? 1 : 0));
         lines.Add("ghn=" + this.p.guildName);
+        lines.Add("ghg=" + this.p.guildGold);
+        lines.Add("gha=" + this.p.guildAccTs);
+        // 材料(逗号串)
+        string mat = "";
+        for (int i = 0; i < Data.MAT_COUNT; i = i + 1) {
+            mat = mat + this.p.mats[i];
+            if (i < Data.MAT_COUNT - 1) { mat = mat + ","; }
+        }
+        lines.Add("mat=" + mat);
+        lines.Add("achv=" + this.p.achvMask);
+        lines.Add("achvc=" + this.p.achvClaimed);
+        lines.Add("wbw=" + this.p.wbWindowEndMs);
+        lines.Add("bagsz=" + this.p.bagSizeBase);
         lines.Add("stc=" + this.p.studentCount);
         lines.Add("mc=" + this.p.mailCnt);
         for (int i = 0; i < 8; i = i + 1) {
@@ -1778,6 +2184,24 @@ class Game {
             else if (k == "wbl") { this.p.wbTriesLeft = Game.ParseIntS(v); }
             else if (k == "gh") { this.p.hasGuild = (Game.ParseIntS(v) != 0); }
             else if (k == "ghn") { this.p.guildName = v; }
+            else if (k == "ghg") { this.p.guildGold = Game.ParseLongS(v); }
+            else if (k == "gha") { this.p.guildAccTs = Game.ParseLongS(v); }
+            else if (k == "mat") {
+                // 逗号分隔的材料数量
+                int mi = 0;
+                string cur2 = "";
+                for (int j = 0; j <= v.Length; j = j + 1) {
+                    if (j == v.Length || v.Substring(j, 1) == ",") {
+                        if (mi < Data.MAT_COUNT && cur2 != "") { this.p.mats[mi] = Game.ParseIntS(cur2); }
+                        mi = mi + 1;
+                        cur2 = "";
+                    } else { cur2 = cur2 + v.Substring(j, 1); }
+                }
+            }
+            else if (k == "achv") { this.p.achvMask = Game.ParseLongS(v); }
+            else if (k == "achvc") { this.p.achvClaimed = Game.ParseIntS(v); }
+            else if (k == "wbw") { this.p.wbWindowEndMs = Game.ParseLongS(v); }
+            else if (k == "bagsz") { this.p.bagSizeBase = Game.ParseIntS(v); }
             else if (k == "stc") { this.p.studentCount = Game.ParseIntS(v); }
             else if (k == "mc") { this.p.mailCnt = Game.ParseIntS(v); }
             else if (k.Length >= 3 && k.Substring(0, 2) == "mt") {
