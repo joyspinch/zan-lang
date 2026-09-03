@@ -110,6 +110,7 @@ add_executable(zanc
     src/compiler/crosscomp.c
     src/compiler/winres.c
     src/compiler/embedres.c
+    src/compiler/apk.c
     src/compiler/builtin_api.c
     src/compiler/symbols.c
 )
@@ -419,6 +420,14 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/toolchain/android-arm64/libc.a")
         COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${CMAKE_SOURCE_DIR}/toolchain/android-arm64"
                 $<TARGET_FILE_DIR:zanc>/android-arm64)
+endif()
+
+# ---- SDLActivity APK shell (--emit-apk packaging assets) ----
+if(EXISTS "${CMAKE_SOURCE_DIR}/toolchain/apk-shell/classes.dex")
+    list(APPEND _cross_sysroot_cmds
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${CMAKE_SOURCE_DIR}/toolchain/apk-shell"
+                $<TARGET_FILE_DIR:zanc>/apk-shell)
 endif()
 
 # Stage every cross sysroot on each build, so a rebuilt runtime object reaches

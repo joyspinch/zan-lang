@@ -31,8 +31,8 @@ Twelve targets are currently declared in `crosscomp.c` (`s_targets[]`):
 | `wasm32`      | `wasm32-unknown-wasi`           | WebAssembly (WASI)       |
 | `linux-riscv64` | `riscv64-unknown-linux-musl`   | RISC-V 64-bit Linux (musl, static) |
 | `riscv64`     | `riscv64-unknown-linux-musl`    | RISC-V 64-bit Linux (alias of `linux-riscv64`) |
-| `android-x64` | `x86_64-linux-android28`        | Android x86-64 (bionic, static) |
-| `android-arm64` | `aarch64-linux-android28`     | Android ARM64 (bionic, static) |
+| `android-x64` | `x86_64-linux-android28`        | Android x86-64 (bionic; static CLI, GUI APK) |
+| `android-arm64` | `aarch64-linux-android28`     | Android ARM64 (bionic; static CLI, GUI APK) |
 
 Being listed here means the triple parses and platform macros
 (`WINDOWS`/`LINUX`/`MACOS`/`ANDROID`) plus arch macros (`ARM64`/`X86_64`) are defined for the
@@ -182,9 +182,21 @@ Difficulty is for **CLI/compute** first; GUI is a separate, larger effort on eac
   (SDL3 back end) + `libSDL3.so` + `zan_gui.bundle` for `--publish`
   staging. Verified on the emulator: the SDLActivity task dlopens
   `libmain.so`, the window paints (clear + fill-rect surfaces matched by
-  pixel-diff on screencaps), and the program exits cleanly. A gradle-less
-  APK shell (aapt2 + d8 + apksigner) exists as the publish-story template;
-  arm64 is link-verified (matching the macOS policy).
+  pixel-diff on screencaps), and the program exits cleanly.
+- **One-shot APK**: `zanc --publish --target android-x64 --emit-apk app.apk`
+  compiles, links `libmain.so`, packs the SDLActivity shell and signs it in
+  one command — no Android SDK needed. Packaging lives in
+  `src/compiler/apk.c`: the binary `AndroidManifest.xml` comes from a
+  precompiled template (`toolchain/apk-shell/`, package + label patched in
+  its string pool — no aapt2), `classes.dex`/`resources.arsc` are fixed
+  prebuilts, the zip writer aligns STORED native libs and keeps
+  `resources.arsc` uncompressed (Android 11+ requirement), and signing runs
+  the bundled `apksigner.jar` through a discovered Java (JAVA_HOME / PATH;
+  on Windows a portable JRE is auto-downloaded to `%USERPROFILE%\.zan` on
+  first use) with an auto-generated debug keystore. The IDE's publish
+  dialog lists `android-x64`/`android-arm64` and emits the same APKs.
+  arm64 APKs are built and signed identically (device run still pending,
+  matching the macOS policy).
 
 ### HarmonyOS / OHOS — medium
 - OHOS native uses a musl-based NDK; for CLI/services this is close to Android.
