@@ -137,4 +137,92 @@ class Contacts : AdminController {
         }
         return "—";
     }
+
+    /* ---- T7 导入导出（ExcelIo 公共层）----------------------------------- */
+
+    static List<string> Headers() {
+        List<string> h = new List<string>();
+        h.Add("客户"); h.Add("姓名"); h.Add("职务");
+        h.Add("电话"); h.Add("邮箱");
+        return h;
+    }
+
+    static List<FieldRule> Rules() {
+        List<FieldRule> r = new List<FieldRule>();
+        r.Add(FieldRule.Text("客户", true, 128));
+        r.Add(FieldRule.Text("姓名", true, 64));
+        r.Add(FieldRule.Text("职务", false, 64));
+        r.Add(FieldRule.Text("电话", false, 32));
+        r.Add(FieldRule.Text("邮箱", false, 128));
+        return r;
+    }
+
+    /* ImportRow 处理器：同步 + 平行 List（ExcelIo.ImportRow 双重约定）。
+       客户列按名称解析外键，查无此客户整行报错。 */
+    static string SaveRow(IDbConnection db, int tenantId, User me,
+                          List<string> keys, List<string> vals) {
+        string custName = ExcelIo.Rec(keys, vals, "客户");
+        CrmCustomer cust = db.Select<CrmCustomer>()
+            .Where(a => a.name == custName).First();
+        if (cust == null) { return "客户=客户不存在：" + custName; }
+        CrmContact c = new CrmContact();
+        c.customerId = cust.id;
+        c.name = ExcelIo.Rec(keys, vals, "姓名");
+        c.title = ExcelIo.Rec(keys, vals, "职务");
+        c.phone = ExcelIo.Rec(keys, vals, "电话");
+        c.email = ExcelIo.Rec(keys, vals, "邮箱");
+        c.createdAt = WebApp.NowSeconds();
+        db.Insert<CrmContact>(c).ExecuteAffrows();
+        return null;
+    }
+
+    [HttpGet]
+    [Custom(Perm = PermBit.Export)]
+    [Description("导出联系人")]
+    async void Export() {
+        bool xlsx = this.InInt("xlsx", 0) == 1;
+        List<CrmContact> rows = await this.CrmContact
+            .OrderBy(a => a.id).ToListAsync();
+        List<CrmCustomer> custs = await this.CrmCustomer
+            .OrderBy(a => a.id).ToListAsync();
+        List<List<string>> data = new List<List<string>>();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            CrmContact c = rows[i];
+            List<string> r = new List<string>();
+            r.Add(Contacts.CustName(custs, c.customerId));
+            r.Add(c.name); r.Add(c.title); r.Add(c.phone); r.Add(c.email);
+            data.Add(r);
+        }
+        await ExcelIo.Download(this.Ctx(), "联系人", Contacts.Headers(),
+            data, xlsx);
+    }
+
+    [HttpGet]
+    [Custom(Perm = PermBit.Create)]
+    [Description("联系人导入模板")]
+    async void Template() {
+        List<string> sample = new List<string>();
+        sample.Add("示例客户"); sample.Add("李四"); sample.Add("采购经理");
+        sample.Add("13900000000"); sample.Add("lisi@example.com");
+        await ExcelIo.Template(this.Ctx(), "联系人导入", Contacts.Headers(),
+            sample);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Create, ApiMax = 30, Upload = true)]
+    [Description("导入联系人")]
+    async void Import() {
+        User me = await this.Admin();
+        if (this.ctx.uploadPath.Length == 0) {
+            this.Fail(400, "1002", "没有上传内容");
+        }
+        string text = File.ReadAllText(this.ctx.uploadPath);
+        int batchId = await ExcelIo.Import(this.Held(), this.TenantId(),
+            me, "crm_contact", "upload.csv", Contacts.Headers(),
+            Contacts.Rules(), Csv.Parse(text), Contacts.SaveRow);
+        await this.Note("导入联系人", "批次#" + Convert.ToString(batchId),
+            true, "");
+        this.Ok(await ExcelIo.BatchReport(this.Held(), this.TenantId(),
+            batchId));
+    }
 }

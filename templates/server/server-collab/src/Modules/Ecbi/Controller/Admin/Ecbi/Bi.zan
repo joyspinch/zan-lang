@@ -183,4 +183,120 @@ class Bi : AdminController {
         if (at < 0) { keys.Add(key); vals.Add(amount); }
         else { vals[at] = vals[at] + amount; }
     }
+
+    /* ---- T7 订单导入导出（ExcelIo 公共层）------------------------------- */
+
+    static List<string> Headers() {
+        List<string> h = new List<string>();
+        h.Add("订单号"); h.Add("客户"); h.Add("商品");
+        h.Add("品类"); h.Add("渠道"); h.Add("省份");
+        h.Add("金额(分)"); h.Add("数量"); h.Add("支付日期");
+        return h;
+    }
+
+    static List<FieldRule> Rules() {
+        List<FieldRule> r = new List<FieldRule>();
+        r.Add(FieldRule.Text("订单号", true, 32));
+        r.Add(FieldRule.Text("客户", false, 64));
+        r.Add(FieldRule.Text("商品", false, 128));
+        r.Add(FieldRule.Text("品类", false, 32));
+        r.Add(FieldRule.Text("渠道", false, 32));
+        r.Add(FieldRule.Text("省份", false, 32));
+        r.Add(FieldRule.Num("金额(分)", true, 2));
+        r.Add(FieldRule.Num("数量", false, 1));
+        r.Add(FieldRule.Text("支付日期", false, 0));
+        return r;
+    }
+
+    /* 支付日期解析：空=当前时间；纯数字=Unix 秒；否则按 YYYY-MM-DD 取
+       当天零点（days-from-civil 算法，天数结果 ×86400 转秒）。 */
+    static long PayAt(string text) {
+        if (text.Length == 0) { return WebApp.NowSeconds(); }
+        if (ExcelIo.IsInt(text)) { return Convert.ToInt64(text); }
+        int a = text.IndexOf("-");
+        int b = a > 0 ? text.IndexOf("-", a + 1) : -1;
+        if (a <= 0 || b <= a) { return WebApp.NowSeconds(); }
+        int y = Convert.ToInt32(text.Substring(0, a));
+        int m = Convert.ToInt32(text.Substring(a + 1, b - a - 1));
+        int d = Convert.ToInt32(text.Substring(b + 1));
+        y = y - (m <= 2 ? 1 : 0);
+        long era = (y >= 0 ? y : y - 399) / 400;
+        int yoe = y - (int)(era * 400);
+        int doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+        int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        return (era * 146097L + (long)doe - 719468L) * 86400L;
+    }
+
+    /* ImportRow 处理器：同步 + 平行 List（ExcelIo.ImportRow 双重约定）。 */
+    static string SaveRow(IDbConnection db, int tenantId, User me,
+                          List<string> keys, List<string> vals) {
+        string orderNo = ExcelIo.Rec(keys, vals, "订单号");
+        int dup = db.Select<OdsOrder>()
+            .Where(a => a.orderNo == orderNo).Count();
+        if (dup > 0) { return "订单号=订单已存在：" + orderNo; }
+        OdsOrder o = new OdsOrder();
+        o.orderNo = orderNo;
+        o.customerName = ExcelIo.Rec(keys, vals, "客户");
+        o.productName = ExcelIo.Rec(keys, vals, "商品");
+        o.category = ExcelIo.Rec(keys, vals, "品类");
+        o.channel = ExcelIo.Rec(keys, vals, "渠道");
+        o.province = ExcelIo.Rec(keys, vals, "省份");
+        o.amount = Convert.ToInt64(ExcelIo.Rec(keys, vals, "金额(分)"));
+        int qty = Filter.ToInt(ExcelIo.Rec(keys, vals, "数量"), 1);
+        o.qty = qty > 0 ? qty : 1;
+        o.payAt = Bi.PayAt(ExcelIo.Rec(keys, vals, "支付日期"));
+        o.createdAt = WebApp.NowSeconds();
+        db.Insert<OdsOrder>(o).ExecuteAffrows();
+        return null;
+    }
+
+    [HttpGet]
+    [Custom(Perm = PermBit.Export)]
+    [Description("导出订单")]
+    async void Export() {
+        bool xlsx = this.InInt("xlsx", 0) == 1;
+        List<OdsOrder> rows = await this.OdsOrder
+            .OrderBy(a => a.id).ToListAsync();
+        List<List<string>> data = new List<List<string>>();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            OdsOrder o = rows[i];
+            List<string> r = new List<string>();
+            r.Add(o.orderNo); r.Add(o.customerName); r.Add(o.productName);
+            r.Add(o.category); r.Add(o.channel); r.Add(o.province);
+            r.Add(Convert.ToString(o.amount));
+            r.Add(Convert.ToString(o.qty));
+            r.Add(Fmt.Day(o.payAt));
+            data.Add(r);
+        }
+        await ExcelIo.Download(this.Ctx(), "订单", Bi.Headers(), data, xlsx);
+    }
+
+    [HttpGet]
+    [Custom(Perm = PermBit.Create)]
+    [Description("订单导入模板")]
+    async void Template() {
+        List<string> sample = new List<string>();
+        sample.Add("D20260903001"); sample.Add("客户1"); sample.Add("数码商品1");
+        sample.Add("数码"); sample.Add("天猫"); sample.Add("省份1");
+        sample.Add("12800"); sample.Add("2"); sample.Add("2026-09-03");
+        await ExcelIo.Template(this.Ctx(), "订单导入", Bi.Headers(), sample);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Create, ApiMax = 30, Upload = true)]
+    [Description("导入订单")]
+    async void Import() {
+        User me = await this.Admin();
+        if (this.ctx.uploadPath.Length == 0) {
+            this.Fail(400, "1002", "没有上传内容");
+        }
+        string text = File.ReadAllText(this.ctx.uploadPath);
+        int batchId = await ExcelIo.Import(this.Held(), this.TenantId(),
+            me, "ods_order", "upload.csv", Bi.Headers(),
+            Bi.Rules(), Csv.Parse(text), Bi.SaveRow);
+        await this.Note("导入订单", "批次#" + Convert.ToString(batchId),
+            true, "");
+        this.Ok(await ExcelIo.BatchReport(this.Held(), this.TenantId(),
+            batchId));
+    }
 }

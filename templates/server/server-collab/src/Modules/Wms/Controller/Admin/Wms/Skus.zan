@@ -114,4 +114,84 @@ class Skus : AdminController {
         await this.Note("删除商品", "#" + Convert.ToString(id) + " " + s.name, n > 0, "");
         this.Saved("商品已删除");
     }
+
+    /* ---- T7 导入导出（ExcelIo 公共层）----------------------------------- */
+
+    static List<string> Headers() {
+        List<string> h = new List<string>();
+        h.Add("SKU编码"); h.Add("商品名称"); h.Add("单位"); h.Add("规格");
+        return h;
+    }
+
+    static List<FieldRule> Rules() {
+        List<FieldRule> r = new List<FieldRule>();
+        r.Add(FieldRule.Text("SKU编码", true, 64));
+        r.Add(FieldRule.Text("商品名称", true, 128));
+        r.Add(FieldRule.Text("单位", false, 32));
+        r.Add(FieldRule.Text("规格", false, 256));
+        return r;
+    }
+
+    /* ImportRow 处理器：同步 + 平行 List（ExcelIo.ImportRow 双重约定）。 */
+    static string SaveRow(IDbConnection db, int tenantId, User me,
+                          List<string> keys, List<string> vals) {
+        string sku = ExcelIo.Rec(keys, vals, "SKU编码");
+        int dup = db.Select<WmsSku>()
+            .Where(a => a.sku == sku).Count();
+        if (dup > 0) { return "SKU编码=SKU 已存在：" + sku; }
+        WmsSku s = new WmsSku();
+        s.sku = sku;
+        s.name = ExcelIo.Rec(keys, vals, "商品名称");
+        s.unit = ExcelIo.Rec(keys, vals, "单位");
+        s.spec = ExcelIo.Rec(keys, vals, "规格");
+        s.createdAt = WebApp.NowSeconds();
+        s.updatedAt = s.createdAt;
+        db.Insert<WmsSku>(s).ExecuteAffrows();
+        return null;
+    }
+
+    [HttpGet]
+    [Custom(Perm = PermBit.Export)]
+    [Description("导出商品")]
+    async void Export() {
+        bool xlsx = this.InInt("xlsx", 0) == 1;
+        List<WmsSku> rows = await this.WmsSku
+            .OrderBy(a => a.id).ToListAsync();
+        List<List<string>> data = new List<List<string>>();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            WmsSku s = rows[i];
+            List<string> r = new List<string>();
+            r.Add(s.sku); r.Add(s.name); r.Add(s.unit); r.Add(s.spec);
+            data.Add(r);
+        }
+        await ExcelIo.Download(this.Ctx(), "商品", Skus.Headers(), data, xlsx);
+    }
+
+    [HttpGet]
+    [Custom(Perm = PermBit.Create)]
+    [Description("商品导入模板")]
+    async void Template() {
+        List<string> sample = new List<string>();
+        sample.Add("SKU-0001"); sample.Add("示例商品"); sample.Add("件");
+        sample.Add("10cm x 20cm");
+        await ExcelIo.Template(this.Ctx(), "商品导入", Skus.Headers(), sample);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Create, ApiMax = 30, Upload = true)]
+    [Description("导入商品")]
+    async void Import() {
+        User me = await this.Admin();
+        if (this.ctx.uploadPath.Length == 0) {
+            this.Fail(400, "1002", "没有上传内容");
+        }
+        string text = File.ReadAllText(this.ctx.uploadPath);
+        int batchId = await ExcelIo.Import(this.Held(), this.TenantId(),
+            me, "wms_sku", "upload.csv", Skus.Headers(),
+            Skus.Rules(), Csv.Parse(text), Skus.SaveRow);
+        await this.Note("导入商品", "批次#" + Convert.ToString(batchId),
+            true, "");
+        this.Ok(await ExcelIo.BatchReport(this.Held(), this.TenantId(),
+            batchId));
+    }
 }

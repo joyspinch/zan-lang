@@ -181,4 +181,61 @@ class Opportunities : AdminController {
         if (stage >= 1 && stage < 5) { return "推进"; }
         return "已结束";
     }
+
+    /* ---- T7 商机报表发邮箱（验收场景）----------------------------------
+       xlsx 报表先落盘 data/exports/，SMTP 已配置且给了收件人则发通知邮件；
+       未配置走离线闭环（文件生成即证据）。偏差记录 ⑥：Mailer 为纯文本
+       SMTP 客户端，无 MIME 附件能力——邮件只告知报表位置，附件直发
+       留待引入 multipart 邮件后。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Export)]
+    [Description("商机报表发邮箱")]
+    async void MailExport() {
+        string to = Fmt.Text(this.In("to"), "");
+        List<CrmOpportunity> rows = await this.CrmOpportunity
+            .OrderBy(a => a.id).ToListAsync();
+        List<CrmCustomer> custs = await this.CrmCustomer
+            .OrderBy(a => a.id).ToListAsync();
+
+        List<string> headers = new List<string>();
+        headers.Add("商机"); headers.Add("客户"); headers.Add("金额(分)");
+        headers.Add("阶段");
+        List<List<string>> data = new List<List<string>>();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            CrmOpportunity o = rows[i];
+            List<string> r = new List<string>();
+            r.Add(o.title);
+            r.Add(Opportunities.CustName(custs, o.customerId));
+            r.Add(Convert.ToString(o.amount));
+            r.Add(Opportunities.StageText(o.stage));
+            data.Add(r);
+        }
+        List<List<string>> all = new List<List<string>>();
+        all.Add(headers);
+        for (int i = 0; i < data.Count; i = i + 1) { all.Add(data[i]); }
+
+        string rel = "data/exports/商机-" + Convert.ToString(WebApp.NowSeconds())
+            + ".xlsx";
+        if (!Directory.Exists("data/exports")) {
+            Directory.CreateDirectoryRecursive("data/exports");
+        }
+        File.WriteAllBytes(rel, XlsxBook.FromText(all, true).SaveToBytes());
+
+        string mail = "离线闭环：报表已生成 " + rel;
+        if (to.Length > 0) {
+            if (!await Mailer.Ready()) {
+                mail = "邮件服务未配置（离线闭环：报表已生成 " + rel + "）";
+            } else {
+                MailResult mr = await Mailer.Send(to, "商机报表",
+                    "商机报表已生成：" + rel);
+                mail = mr.Ok() ? "已发送至 " + to + "（报表：" + rel + "）"
+                    : mr.Message();
+            }
+        }
+        await this.Note("商机报表", mail, true, "");
+        JsonValue o = JsonValue.NewObject();
+        o.Put("file", JsonValue.NewStr(rel));
+        o.Put("mail", JsonValue.NewStr(mail));
+        this.Ok(o.ToJson());
+    }
 }
