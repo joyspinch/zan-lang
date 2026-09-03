@@ -8,7 +8,9 @@ namespace Gui.Component.WebView;
 delegate int WvResultFn(nint self, int hr, nint result);
 /// 事件处理器：(this, sender, args)。
 delegate int WvEventFn(nint self, nint sender, nint args);
+/// IUnknown::QueryInterface：(this, riid, ppv)，返回 HRESULT。
 delegate int WvQueryInterfaceFn(nint self, nint riid, nint ppv);
+/// IUnknown::AddRef/Release 孪生：(this)，返回名义引用计数。
 delegate int WvRefFn(nint self);
 /// CreateCoreWebView2EnvironmentWithOptions，加载器唯一的扁平导出。
 delegate int WvCreateEnvFn(nint browserFolder, nint userDataFolder,
@@ -235,6 +237,10 @@ class WebView2 {
         return h;
     }
 
+    /// 启动序列：建宿主子窗口 → 创建 Environment（泵消息至多 8s）→
+    /// 创建 Controller（泵至多 12s，成功时顺带取 core）→ 订阅
+    /// NavigationStarting/SourceChanged/NavigationCompleted 三个事件 →
+    /// 以隐藏的零尺寸空白状态收尾。任一步失败返回 false。
     bool Start(nint hwnd, string profileId) {
         host = WebView2.CreateHost(hwnd);
         if (host == 0) { return false; }
@@ -279,6 +285,7 @@ class WebView2 {
         return t;
     }
 
+    /// remove_* 撤销订阅：token 装进 8 字节临时单元按地址传给 COM。
     void Unsubscribe(int slot, long token) {
         nint cell = NativeMemory.Alloc(8);
         new Span<long>(cell, 1)[0] = token;
@@ -325,8 +332,11 @@ class WebView2 {
 
     /// 回调对象与视图同生命周期，因此引用计数只是名义上的。
     static int OnAddRef(nint self) { return 2; }
+    /// Release 回调：恒返回 1；回调对象随视图一起释放，不单独回收。
     static int OnRelease(nint self) { return 1; }
 
+    /// Environment 创建完成回调（COM）：成功则保留 env 引用，
+    /// 并唤醒 Start 里的 gate。
     static int OnEnvironment(nint self, int hr, nint result) {
         WebView2 w = WebView2.Get(ComVtbl.State(self));
         if (w == null) { return 0; }
@@ -335,6 +345,8 @@ class WebView2 {
         return 0;
     }
 
+    /// Controller 创建完成回调（COM）：成功则保留 ctrl 并取 core，
+    /// 唤醒 Start 里的 gate。
     static int OnController(nint self, int hr, nint result) {
         WebView2 w = WebView2.Get(ComVtbl.State(self));
         if (w == null) { return 0; }
@@ -346,6 +358,8 @@ class WebView2 {
         return 0;
     }
 
+    /// 导航开始回调（COM）：记录目标 URL 到 lastRequest，置 loading
+    /// （完成时由 OnNavigationCompleted 解除）。
     static int OnNavigationStarting(nint self, nint sender, nint args) {
         WebView2 w = WebView2.Get(ComVtbl.State(self));
         if (w == null) { return 0; }
@@ -391,6 +405,7 @@ class WebView2 {
         return 0;
     }
 
+    /// Eval 完成回调（COM）：成功则记下 JSON 结果，唤醒 Eval 的 gate。
     static int OnScriptCompleted(nint self, int hr, nint json) {
         WebView2 w = WebView2.Get(ComVtbl.State(self));
         if (w == null) { return 0; }
@@ -399,6 +414,8 @@ class WebView2 {
         return 0;
     }
 
+    /// GetCookies 完成回调（COM）：序列化 Cookie 列表到 cookieResult，
+    /// 唤醒 gate。
     static int OnCookiesCompleted(nint self, int hr, nint list) {
         WebView2 w = WebView2.Get(ComVtbl.State(self));
         if (w == null) { return 0; }
@@ -459,6 +476,8 @@ class WebView2 {
         clipSet = false;
     }
 
+    /// 显示或隐藏：put_IsVisible 加宿主子窗口 SW_SHOWNOACTIVATE/SW_HIDE
+    /// （出现不抢焦点）。状态未变时不重复下发。
     void SetVisible(bool visible) {
         if (ctrl == 0) { return; }
         if (visibleSet && visible == this.visible) { return; }
@@ -526,6 +545,7 @@ class WebView2 {
         this.SetVisible(true);
     }
 
+    /// 导航到 target；core 未就绪时忽略。
     void Navigate(string target) {
         if (core == 0) { return; }
         nint u = Wide.Of(target);
@@ -542,17 +562,24 @@ class WebView2 {
         Wide.Free(h);
     }
 
+    /// 历史后退一页（core 未就绪为空操作）。
     void Back() { Com.Call0(core, WebView2.SlotGoBack()); }
+    /// 历史前进一页。
     void Forward() { Com.Call0(core, WebView2.SlotGoForward()); }
+    /// 重新加载当前页。
     void Reload() { Com.Call0(core, WebView2.SlotReload()); }
+    /// 停止当前加载。
     void StopLoading() { Com.Call0(core, WebView2.SlotStop()); }
 
+    /// 能否后退。
     bool CanGoBack() {
         return Com.GetInt(core, WebView2.SlotCanGoBack()) != 0;
     }
+    /// 能否前进。
     bool CanGoForward() {
         return Com.GetInt(core, WebView2.SlotCanGoForward()) != 0;
     }
+    /// 是否正在加载（NavigationStarting 置位、Completed 复位）。
     bool IsLoading() { return loading; }
     /// 最近一次 OnNavigationStarting 捕获的目标 URL（导航发起即记录，
     /// 供挂起导航消费逻辑使用）。
@@ -560,6 +587,7 @@ class WebView2 {
 
     /// 导航序号与近似 HTTP 状态（事件域，不经 COM 往返）。
     int NavSeq() { return navSeq; }
+    /// 近似 HTTP 状态：成功 200，失败 400+WebView2 错误枚举；无导航为 0。
     int LastStatus() { return lastStatus; }
 
     /// 实时从核心对象读取当前 URL/标题（同时刷新事件缓存值）。
@@ -568,6 +596,7 @@ class WebView2 {
         return url;
     }
 
+    /// 实时从核心对象读取当前页面标题（同时刷新事件缓存值）。
     string GetTitle() {
         if (core != 0) {
             title = Com.GetString(core, WebView2.SlotGetDocumentTitle());
@@ -643,6 +672,8 @@ class WebView2 {
         Com.Release(cm);
     }
 
+    /// 清空该 profile 数据仓的全部 Cookie（运行时无 Cookie 管理器
+    /// 时为空操作）。
     void ClearCookies() {
         nint cm = this.Cookies();
         if (cm == 0) { return; }

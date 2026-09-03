@@ -10,13 +10,16 @@
  * Embedded WebView (native browser control).
  *
  * A real, navigable web view is a heavyweight, per-platform native control
- * (WKWebView on macOS, WebView2 on Windows, WebKitGTK on Linux). Only macOS
- * needs a backend here (gui_runtime_mac.m, ZAN_GUI_COCOA): a WKWebView subview
- * of the window's content view. Windows drives Edge WebView2 from Zan itself
- * (stdlib/Gui/WebView2.zan, straight against its COM interfaces) and every
- * other platform takes WebViewBackend's own fallback, so neither references
- * these exports. Only a macOS build that opts out of the Cocoa backend (the
- * SDL windowing shell) still binds them, and gets no-op stubs:
+ * (WKWebView on macOS, WebView2 on Windows, the system android.webkit.WebView
+ * on Android, WebKitGTK on Linux). Two platforms need a backend here:
+ * macOS (gui_runtime_mac.m, ZAN_GUI_COCOA): a WKWebView subview of the
+ * window's content view; Android (gui_runtime_android.c, __ANDROID__): a
+ * system WebView overlaid by the APK shell's Java bridge (org.zan.app.ZanWeb).
+ * Windows drives Edge WebView2 from Zan itself (stdlib/Gui/WebView2.zan,
+ * straight against its COM interfaces) and every other platform takes
+ * WebViewBackend's own fallback, so neither references these exports. Only a
+ * macOS build that opts out of the Cocoa backend (the SDL windowing shell)
+ * still binds them, and gets no-op stubs:
  * zan_gui_webview_create returns 0 so the Zan WebView widget detects the lack
  * of native support and paints an in-canvas placeholder instead of embedding
  * a live browser.

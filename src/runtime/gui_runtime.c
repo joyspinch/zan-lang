@@ -3806,6 +3806,7 @@ static inline int zan_gui_in_hit_guard(iptr hwnd, int x, int y) {
 #include "gui_runtime_font.c"
 #include "gui_runtime_tray.c"
 #include "gui_runtime_shims.c"
+#include "gui_runtime_android.c"
 
 /* ---- the software rasterizer as a backend ------------------------------
  * Every entry above is the code that always drew these primitives, unchanged;
