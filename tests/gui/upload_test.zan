@@ -5,6 +5,7 @@ using System.Net.Http.Client;
 using System.Net.External;
 using System.Threading;
 using Gui;
+using Gui.Component;
 using Gui.Widget;
 
 /// Gui.Upload 的无窗口回归：组件模型（Kind/Props/Events/工厂/
@@ -397,6 +398,54 @@ class UploadTest {
         Eq("multi exceed not fired", exceedCount, 0);
         mu.Clear();
 
+        // ---- 内建弹窗的上次目录缓存 + Max 上限透传 ----------------------
+        // lastDir：OpenDialog 不传初始目录，FilePicker 在生命周期内记住
+        // 上一次浏览的目录，连续打开不再回到工作目录（用户点选需求）。
+        // maxSelect：Upload.Max 透传进弹窗，窗口内显示「已选 x/N」，
+        // 选到上限后点新行被拦截。
+        Upload cu = new Upload();
+        cu.Max = 3;
+        cu.Multiple = true;
+        cu.OpenDialog();
+        True("cache dialog open", cu.DialogOpen());
+        FilePicker pk = cu.Picker();
+        True("picker exposed", pk != null);
+        if (pk != null) {
+            Eq("max passthrough", pk.MaxSelect(), 3);
+            // 模拟首次浏览到临时目录后关闭再开：lastDir 应续用。
+            // Windows 临时目录带反斜杠，FilePicker 内部统一成正斜杠。
+            string probe = Path.GetTempPath() + "upload_test_lastdir";
+            probe = probe.Replace("\\", "/");
+            if (probe.EndsWith("/")) {
+                probe = probe.Substring(0, probe.Length - 1);
+            }
+            Directory.CreateDirectoryUtf8(probe);
+            string first = pk.LastDirectory();
+            True("lastdir seeded", first != "");
+            pk.Navigate(probe);
+            EqStr("lastdir after navigate", pk.LastDirectory(), probe);
+            cu.CloseDialog();
+            cu.OpenDialog();
+            True("cache reopen open", cu.DialogOpen());
+            EqStr("lastdir remembered across opens", pk.LastDirectory(), probe);
+            True("lastdir became initial", pk.CurrentDirectory() == probe);
+            cu.CloseDialog();
+            Directory.Delete(probe);
+        }
+        // 上限 0（没配 Max 的多选）= 弹窗不设限，由宿主 Admit 门兜底。
+        Upload nu = new Upload();
+        nu.Multiple = true;
+        nu.OpenDialog();
+        True("no-max dialog open", nu.DialogOpen());
+        FilePicker npk = nu.Picker();
+        True("no-max picker exposed", npk != null);
+        if (npk != null) {
+            Eq("no max means unlimited", npk.MaxSelect(), 0);
+            nu.CloseDialog();
+        }
+        // 清场：后面注册表/路由断言要求 AnyPickerOpen 为 false。
+        cu.CloseDialog();
+
         // ---- ChildWindows 注册表：Form.Run 自动泵送的内建弹窗 ----------
         // 上面的 mu.OpenDialog 已把弹窗登记进 ChildWindows。关闭后注册表
         // 移出（PrunePickers），复用同一 picker 的第二次 OpenDialog 必须
@@ -413,6 +462,37 @@ class UploadTest {
         True("picker wakes again", ChildWindows.Wants());
         mu.CloseDialog();
         True("picker pruned again", !ChildWindows.AnyPickerOpen());
+
+        // ---- 多实例路由：关掉的弹窗不得吞别人的事件 ---------------------
+        // 复现 gallery 的「第一个演示开过弹窗后，后面演示的弹窗点不动」：
+        // 宿主按「谁拥有谁处理」折叠扫描 ApplyEventWindow 的返回值，
+        // 而 FilePicker.ApplyEvent 对非属主窗口返回 true（回路继续
+        // 语义）。组件侧按 OwnsWindow 门控后，非属主一律 false。
+        Upload ra = new Upload();
+        Upload rb = new Upload();
+        ra.OpenDialog();
+        True("a dialog open", ra.DialogOpen());
+        nint ah = ra.DialogWindowHandle();
+        True("a handle non-zero", ah != 0);
+        // 非属主：别的组件、别的窗口句柄都必须 false。
+        True("b not owner of a", !rb.ApplyEventWindow(ah));
+        True("b no own handle", rb.DialogWindowHandle() == 0);
+        ra.CloseDialog();
+        ra.SweepDialogClosed();
+        True("a closed", !ra.DialogOpen());
+        // 关闭后句柄归零：残留的旧窗口不得再认领事件。
+        True("a handle cleared", ra.DialogWindowHandle() == 0);
+        True("a not owner after close", !ra.ApplyEventWindow(ah));
+        // B 打开后收到自己窗口的事件；A（已关）不认领。
+        rb.OpenDialog();
+        True("b dialog open", rb.DialogOpen());
+        nint bh = rb.DialogWindowHandle();
+        True("b handle non-zero", bh != 0);
+        True("b owns own", rb.ApplyEventWindow(bh));
+        True("a not owner of b", !ra.ApplyEventWindow(bh));
+        rb.CloseDialog();
+        rb.SweepDialogClosed();
+        True("b closed", !rb.DialogOpen());
 
         if (fails == 0) {
             Console.WriteLine("upload_test OK");

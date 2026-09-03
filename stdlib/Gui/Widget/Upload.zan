@@ -809,8 +809,9 @@ class Upload : Control {
         picker.Accepted.Add(this.OnPicked);
     }
 
-    /// 打开内建选择弹窗：Multiple 时走多选模式（Ctrl/Shift 点选，
-    /// 确认后逐项过门入列）；Accept 生成过滤器。
+    /// 打开内建选择弹窗：Multiple 或 Max>1 时走多选模式（Ctrl/Shift
+    /// 点选，确认后逐项过门入列）；Accept 生成过滤器。弹窗皮肤跟随
+    /// 宿主当前主题；initial 留空让 FilePicker 续用上一次浏览的目录。
     /// 弹窗事件/渲染由 Form.Run 的标准循环按 ChildWindows 注册表自动
     /// 泵送；自写循环的宿主（gallery 范式）依旧可以用
     /// OwnsEventWindow/RenderDialog 自己泵——两条路互不干扰。
@@ -821,7 +822,15 @@ class Upload : Control {
         // 移出该实例，复用同一 picker 的第二次打开必须重新登记，
         // 否则标准循环不再泵它——第二次开弹窗就会卡死。
         ChildWindows.RegisterComponentPicker(picker);
-        if (Multiple) {
+        // 皮肤不跟随是组件弹窗的通病：宿主只会给自己直拉的 picker 调
+        // ApplySkin（gallery 范式），组件自持的弹窗没人管、永远是暗色。
+        // 打开前同步一次宿主当前主题。
+        if (uiApp != null) { picker.ApplySkin(uiApp.ThemeMenuIndex()); }
+        // Max 透传进弹窗：多选里选到上限就选不进（弹窗内实时显示
+        // 「已选 x/N」），确认后 Admit 的 Max 门仍兜底。Multiple 单独
+        // 开多选而没给 Max 时传 0（弹窗不限，由宿主门兜底）。
+        picker.SetMaxSelect(Max);
+        if (Multiple || Max > 1) {
             picker.BeginOpenFileFiltersMulti("", this.BuildFilters(), "选择文件");
         } else {
             picker.BeginOpenFileFilters("", this.BuildFilters(), "选择文件");
@@ -835,9 +844,13 @@ class Upload : Control {
         if (picker != null) { picker.Close(); }
     }
 
+    /// 内建弹窗本体（未开且从未打开过为 null）。测试与宿主检查
+    /// lastDir/上限透传等 picker 侧语义用；宿主正常流程无需触碰。
+    FilePicker Picker() { return picker; }
+
     void OnPicked() {
         if (picker == null) { return; }
-        if (Multiple) {
+        if (Multiple || Max > 1) {
             // 多选模式：确认时 SelectedPaths() 里有全部选中项。
             List<string> many = picker.SelectedPaths();
             if (many != null && many.Count > 0) { this.AddPaths(many); }
@@ -898,8 +911,19 @@ class Upload : Control {
         return picker != null && picker.OwnsWindow(evh);
     }
 
+    /// 内建弹窗的原生窗口句柄（未开为 0）。宿主焦点管理与路由测试用。
+    nint DialogWindowHandle() {
+        return picker != null ? picker.PopupWindowHandle() : 0;
+    }
+
+    /// 处理投递到内建弹窗的 OS 事件。按属主门控：只有 evh 确实是本
+    /// 组件弹窗的窗口时才接手并返回 true；非属主（从未开过、弹窗已
+    /// 关的实例一律在内）返回 false。FilePicker.ApplyEvent 的布尔是
+    /// 「回路是否继续」语义，对非属主窗口返回 true——宿主若按
+    /// 「谁拥有谁处理」折叠扫描（gallery 的 UploadApplyEvent 范式），
+    /// 不门控就会在第一个开过弹窗的实例处吞掉后面所有弹窗的事件。
     bool ApplyEventWindow(nint evh) {
-        if (picker == null) { return false; }
+        if (picker == null || !picker.OwnsWindow(evh)) { return false; }
         return picker.ApplyEvent(evh);
     }
 
@@ -915,6 +939,13 @@ class Upload : Control {
     int TakeDialogResult() {
         if (picker == null) { return 0; }
         return picker.TakeResult();
+    }
+
+    /// 弹窗刚关闭的收尾（对位 FilePicker.SweepClosed）：销毁程序化
+    /// Close 留下的死窗口、清空 picker 内部引用。宿主在
+    /// TakeDialogResult() != 0 的那一轮调用一次。
+    void SweepDialogClosed() {
+        if (picker != null) { picker.SweepClosed(); }
     }
 
     // ---- 样式辅助 --------------------------------------------------------

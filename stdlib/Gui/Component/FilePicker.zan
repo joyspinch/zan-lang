@@ -53,8 +53,15 @@ class FilePicker {
     /// Shift+点击范围选择的锚点（列表索引，-1 = 无锚点）。
     int anchorIdx;
     bool allowMulti;
+    /// 多选数量上限（0 = 不限）：Ctrl+点击加选与 Shift+点击范围扩展
+    /// 在达到上限后拒绝新增并提示；窗口内状态区实时显示「已选 x/N」。
+    int maxSelect;
     string statusText;
     string lastFilter;
+    /// 上一次浏览的目录：Begin 未给 initial 时从这里续起，生命周期内
+    /// 连续打开不再每次回到默认目录。Begin 解析出有效目录与 Navigate
+    /// 成功时更新。
+    string lastDir;
     List<string> expanded;
     /// 底部下拉框中显示的扩展名过滤器。每个 FileFilter 将一个
     /// 人类可读标签（如 "Zan source (*.zan)"）与 ";" 分隔的扩展名
@@ -97,8 +104,10 @@ class FilePicker {
         this.selectedPaths = new List<string>();
         this.anchorIdx = 0 - 1;
         this.allowMulti = false;
+        this.maxSelect = 0;
         this.statusText = "";
         this.lastFilter = "";
+        this.lastDir = "";
         this.expanded = new List<string>();
         this.filters = new List<FileFilter>();
         this.filterSel = new SignalInt(0);
@@ -346,7 +355,14 @@ class FilePicker {
                 + " (*.*)", ""));
         }
         result = 0;
-        string dir = FilePicker.ValidDirectory(initial);
+        // 初始目录的优先级：宿主显式给的 initial > 上一次浏览的目录
+        // （生命周期内连续打开不再回到默认目录）> 工作目录。ValidDirectory
+        // 对空串/失效路径会内部回落 "."，所以先按参数分档、最后统一兜底。
+        string dir = "";
+        if (initial != "") { dir = FilePicker.ValidDirectory(initial); }
+        if (dir == "" && lastDir != "") { dir = FilePicker.ValidDirectory(lastDir); }
+        if (dir == "") { dir = FilePicker.ValidDirectory(""); }
+        lastDir = dir;
         pathInput.SetText(dir);
         nameInput.SetText(defaultName);
         folderInput.SetText(FilePicker.T("New Folder", "新建文件夹"));
@@ -380,7 +396,10 @@ class FilePicker {
     ) {
         SetFilters(items);
         string first = "";
-        if (items.Count > 0) { first = FilePicker.FirstExt(items[0].pattern); }
+        if (items.Count > 0) {
+            first = FilePicker.FilterTokenToSuffix(
+                FilePicker.FirstExt(items[0].pattern));
+        }
         Begin(1, initial, first, "", dialogTitle);
     }
 
@@ -390,6 +409,16 @@ class FilePicker {
         allowMulti = true;
         Begin(1, initial, extension, "", dialogTitle);
     }
+
+    /// 多选数量上限（0 = 不限）。达到上限后再点新行拒绝加入并在
+    /// 状态区提示；宿主（如 Upload 的 Max）用它把上限透传进弹窗。
+    void SetMaxSelect(int n) {
+        maxSelect = n;
+        if (maxSelect < 0) { maxSelect = 0; }
+    }
+
+    /// 当前多选数量上限（0 = 不限）。测试钉语义用。
+    int MaxSelect() { return maxSelect; }
 
     /// 多选 + 显式扩展名过滤器集合的打开文件对话框。
     void BeginOpenFileFiltersMulti(
@@ -422,23 +451,42 @@ class FilePicker {
         return false;
     }
 
+    /// 模式 token → 可做字面后缀比较的形态：剥掉通配 "*"
+    /// （"*.png"→".png"、"png"→".png"、"."→"."）。EndsWith 是字面
+    /// 比较，"*" 留在里面会让每个文件都匹配不上——过滤器一选
+    /// 「接受的文件」列表就全空，即此根因。
+    static string FilterTokenToSuffix(string ext) {
+        string t = ext.Trim();
+        while (t.StartsWith("*")) { t = t.Substring(1, t.Length - 1); }
+        if (t == "" || t == ".") { return ""; }
+        if (!t.StartsWith(".")) { t = "." + t; }
+        return t;
+    }
+
     /// `name` 通过当前所选过滤器时为 true。空模式
     /// （所有文件）匹配一切；否则 ";" 分隔的
     /// 任一扩展名匹配即可。
     bool MatchesCurrentFilter(string name) {
         if (filters.Count == 0) {
-            return FilePicker.EndsWith(name, suffix);
+            return this.PatternMatches(name, suffix);
         }
         int sel = filterSel.Get();
         if (sel < 0 || sel >= filters.Count) { return true; }
-        string pattern = filters[sel].pattern;
+        return this.PatternMatches(name, filters[sel].pattern);
+    }
+
+    /// ";" 分隔模式的任一 token 命中即 true；空模式匹配一切。
+    bool PatternMatches(string name, string pattern) {
         if (pattern == "") { return true; }
         int start = 0;
         for (int i = 0; i <= pattern.Length; i = i + 1) {
             bool end = i == pattern.Length;
             if (end || pattern.Substring(i, 1) == ";") {
-                string ext = pattern.Substring(start, i - start);
-                if (ext != "" && FilePicker.EndsWith(name, ext)) { return true; }
+                string ext = FilePicker.FilterTokenToSuffix(
+                    pattern.Substring(start, i - start));
+                if (ext != "" && FilePicker.EndsWith(name, ext)) {
+                    return true;
+                }
                 start = i + 1;
             }
         }
@@ -459,6 +507,8 @@ class FilePicker {
         skinIndex = index;
         if (popup != null) { popup.ApplySkin(index); }
     }
+    /// 当前皮肤索引（0 = 默认暗色）。测试与宿主同步检查用。
+    int SkinIndex() { return skinIndex; }
 
     bool IsOpen() { return open; }
     bool NeedsRedraw() {
@@ -467,10 +517,19 @@ class FilePicker {
     bool OwnsWindow(nint hwnd) {
         return popup != null && hwnd == popup.WindowHandle();
     }
+
+    /// 弹窗的原生窗口句柄（未开为 0）。宿主焦点管理与路由测试用；
+    /// 非属主判定请用 OwnsWindow（0 不与任何真实句柄冲突）。
+    nint PopupWindowHandle() {
+        return popup != null ? popup.WindowHandle() : 0;
+    }
     string SelectedPath() { return selectedPath; }
     /// 多选确认后的全部选中路径（升序、与列表展示同序）。单选模式
     /// 返回空列表；单选宿主请继续读 SelectedPath()。
     List<string> SelectedPaths() { return selectedPaths; }
+    /// 生命周期内记住的上一次浏览目录（Begin 未传 initial 时续用）。
+    /// 测试钉住「连续打开不再回到默认目录」的语义。
+    string LastDirectory() { return lastDir; }
     string CurrentDirectory() {
         return FilePicker.Normalize(pathInput.GetText());
     }
@@ -492,6 +551,11 @@ class FilePicker {
         }
         open = false;
         closing = true;
+        // 这里只 Close（投递关闭事件），不 Destroy：Finish 全部从
+        // RenderContent 的按钮分支里调用，正处在弹窗自己的一帧中间，
+        // 当场销毁窗口会让随后的 PresentFrame 落在死 surface 上。
+        // 残留的 popup 引用由下一轮 ApplyEvent 收到 kind 8 时销毁清空；
+        // OwnsWindow 的句柄相等判定保证它不会认领别的窗口的事件。
         if (popup != null) { popup.window.Close(); }
         if (action == 1) { Accepted.Raise(); } else { Cancelled.Raise(); }
         Closed.Raise();
@@ -541,6 +605,17 @@ class FilePicker {
         return keep;
     }
 
+    /// 程序化 Close（Finish(2)）留下的 popup 引用在这里收尾：宿主在
+    /// TakeResult != 0 的那一轮（弹窗刚关闭）调用一次，销毁 OS 窗口并
+    /// 清空引用，OwnsWindow 随即回到 false。用户点叉的路径走
+    /// ApplyEvent 的 kind 8 分支，不需要这步。
+    void SweepClosed() {
+        if (popup != null && !open) {
+            popup.window.Destroy();
+            popup = null;
+        }
+    }
+
     int TakeResult() {
         int resultCode = result;
         result = 0;
@@ -559,6 +634,7 @@ class FilePicker {
         anchorIdx = 0 - 1;
         statusText = "";
         listScroll.Set(0);
+        lastDir = dir;
         PathChanged.Raise();
         ExpandAncestors(dir);
         if (popup != null) { popup.RequestRedraw(); }
@@ -619,7 +695,10 @@ class FilePicker {
         StyleBox filterHoverStyle = Style.Part(app, "filepicker", "filter", "",
                                                "", "", Style.SHover());
         StyleBox filterShadowStyle = Style.Part(app, "filepicker", "filter-shadow",
-                                                "", "", "", Style.SNormal());
+                                         "", "", "", Style.SNormal());
+        // 多选行尾对勾用 checkbox 主题的勾色，与 Checkbox 勾选态一致。
+        StyleBox checkboxCheckStyle = Style.Part(app, "checkbox", "check",
+                                         "", "", "", Style.SChecked());
         app.RenderBackground(0, 0, W, H, 6);
         int pad = t.paddingLarge;
         int top = app.ContentTop() + pad;
@@ -742,12 +821,21 @@ class FilePicker {
                 app, filterX, filterRowY, filterW, t.heightMedium);
             if (filterOpen) {
                 suppressOthers = true;
+                // 菜单的拦截区必须在选项点击判定之前铺设：
+                // ClickAvailable 对“上一帧被遮罩盖住的点”，只有本帧
+                // 遮罩已注册（BlockerAt 命中，即询问者是遮罩自身
+                // 主体）时才放行。遮罩若拖到帧末绘制阶段才注册，
+                // 选项的点击会被上一帧遮罩整个吞掉——下拉项永远
+                // 选不中。
+                app.BlockHitsRect(
+                    filterX, filterMenuY, filterW, filterMenuH);
                 for (int fi2 = 0; fi2 < filters.Count; fi2 = fi2 + 1) {
                     int iy = filterMenuY + t.paddingTiny + fi2 * t.heightMedium;
                     if (FilePicker.Clicked(app, filterX, iy, filterW, t.heightMedium)
                             && fi2 != filterSel.Get()) {
                         filterSel.Set(fi2);
-                        suffix = FilePicker.FirstExt(filters[fi2].pattern);
+                        suffix = FilePicker.FilterTokenToSuffix(
+                            FilePicker.FirstExt(filters[fi2].pattern));
                         selectedPath = "";
                         selectedPaths = new List<string>();
                         anchorIdx = 0 - 1;
@@ -935,12 +1023,32 @@ class FilePicker {
             int idx = listOff + shown;
             int rowY = paneY + shown * rowH;
             int rowId = app.focus.AllocId();
-            bool selected = selectedPath == paths[idx]
-                || (allowMulti && this.InMultiSelection(idx, paths));
+            bool multiPicked = allowMulti && this.InMultiSelection(idx, paths);
+            bool selected = selectedPath == paths[idx] || multiPicked;
             if (selected) {
-                c.FillRect(
-                    listX + 1, rowY, listW - scrollW - 2,
-                    rowH, rowSelectedStyle.BgOr(0));
+                // 多选行不做满行大色块：左侧细标记条 + 行内对勾，
+                // 满行高亮留给悬停/单选当前行，避免整屏都是绿色块。
+                if (multiPicked) {
+                    c.FillRect(
+                        listX + 1, rowY, app.Scale(3), rowH,
+                        rowSelectedStyle.BgOr(0));
+                    c.FillRoundRect(
+                        listX + listW - scrollW - app.Scale(22)
+                            - t.gapSmall, rowY + (rowH - t.iconSizeSmall) / 2,
+                        t.iconSizeSmall, t.iconSizeSmall,
+                        t.borderRadiusSmall, rowSelectedStyle.BgOr(0));
+                    c.DrawGlyphIn("check",
+                        listX + listW - scrollW - app.Scale(22)
+                            - t.gapSmall,
+                        rowY + (rowH - t.iconSizeSmall) / 2,
+                        t.iconSizeSmall, t.iconSizeSmall,
+                        t.iconSizeSmall,
+                        checkboxCheckStyle.FgOr(0));
+                } else {
+                    c.FillRect(
+                        listX + 1, rowY, listW - scrollW - 2,
+                        rowH, rowSelectedStyle.BgOr(0));
+                }
             } else if (app.focus.IsHovered(rowId)) {
                 c.FillRect(
                     listX + 1, rowY, listW - scrollW - 2,
@@ -1059,11 +1167,22 @@ class FilePicker {
                 // 多选：普通点击重置为单行；Ctrl+点击切换；Shift+点击
                 // 从锚点扩展。文件夹行永远走 Navigate。
                 int mods = app.window.EventMods();
+                bool blocked = false;
                 if (Modifiers.HasCtrl(mods)) {
                     if (this.InMultiSelection(clicked, paths)) {
                         this.RemoveSelectedPath(paths[clicked]);
+                        statusText = "";
+                    } else if (maxSelect > 0
+                               && selectedPaths.Count >= maxSelect) {
+                        // 上限拦截：加不进了，但已选中的行仍可移出。
+                        blocked = true;
+                        statusText = FilePicker.T(
+                            "Reached the limit of ", "已达数量上限 ")
+                            + Convert.ToString(maxSelect)
+                            + FilePicker.T(" files.", " 个。");
                     } else {
                         selectedPaths.Add(paths[clicked]);
+                        statusText = "";
                     }
                     anchorIdx = clicked;
                 } else if (Modifiers.HasShift(mods) && anchorIdx >= 0) {
@@ -1075,6 +1194,15 @@ class FilePicker {
                     while (r <= b) {
                         if (r < paths.Count && kinds[r] == 0
                                 && !selectedPaths.Contains(paths[r])) {
+                            if (maxSelect > 0
+                                    && selectedPaths.Count >= maxSelect) {
+                                blocked = true;
+                                statusText = FilePicker.T(
+                                    "Reached the limit of ", "已达数量上限 ")
+                                    + Convert.ToString(maxSelect)
+                                    + FilePicker.T(" files.", " 个。");
+                                break;
+                            }
                             selectedPaths.Add(paths[r]);
                         }
                         r = r + 1;
@@ -1086,7 +1214,9 @@ class FilePicker {
                 }
                 selectedPath = paths[clicked];
                 nameInput.SetText(names[clicked]);
-                statusText = "";
+                // 上限拦截信息必须存活到渲染：仅当本次点击
+                // 真正改动了选区时才清状态。
+                if (!blocked) { statusText = ""; }
                 app.RequestRedraw();
             } else {
                 selectedPath = paths[clicked];
@@ -1110,8 +1240,15 @@ class FilePicker {
         }
 
         string info = "";
+        if (allowMulti && maxSelect > 0) {
+            // 数量上限窗口内常驻可见：状态区实时显示「已选 x/N」。
+            info = FilePicker.T("Selected ", "已选 ")
+                + Convert.ToString(selectedPaths.Count) + "/"
+                + Convert.ToString(maxSelect);
+        }
         if (mode != 0 && selectedPath != "") {
-            info = Path.GetFileName(selectedPath);
+            if (info != "") { info = info + "  ·  "; }
+            info = info + Path.GetFileName(selectedPath);
         }
         if (statusText != "") { info = statusText; }
         int infoColor = statusStyle.FgOr(0);
@@ -1127,7 +1264,14 @@ class FilePicker {
             listScroll.Set(0);
             app.RequestRedraw();
         }
-        int infoX = pad + app.Scale(176);
+        // 信息列紧跟在「显示隐藏文件」复选框之后：宽度按标签实测
+        // （boxSize + gap + 文本），写死会在中文/英文两套文案下或
+        // 长文案时重叠。
+        int hiddenFontSize = Style.FontFallback(app, "medium");
+        int infoX = pad + app.Scale(18) + app.Scale(8)
+            + Canvas.MeasureText(
+                FilePicker.T("Show hidden files", "显示隐藏文件"),
+                hiddenFontSize);
         c.DrawText(
             infoX, footerY + app.Scale(8),
             info, infoColor, Style.FontFallback(app, "small"));
@@ -1223,9 +1367,10 @@ class FilePicker {
             } else if (mode == 2
                        && valid && nameInput.GetText() != "") {
                 string name = nameInput.GetText();
-                if (suffix != ""
-                    && !FilePicker.EndsWith(name, suffix)) {
-                    name = name + suffix;
+                string wantSuffix = FilePicker.FilterTokenToSuffix(suffix);
+                if (wantSuffix != ""
+                    && !FilePicker.EndsWith(name, wantSuffix)) {
+                    name = name + wantSuffix;
                 }
                 selectedPath = FilePicker.Join(dir, name);
                 Finish(1);
