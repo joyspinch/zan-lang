@@ -515,11 +515,7 @@ class LegendApp {
             }
         }
         if (this.BtnTex(x + pad + bw3 + 4, cy, bw3, 24, "福利", 1, 0)) {
-            if (this.mouseJustUp) {
-                this.g.p.cur[Data.CUR_GOLD] = this.g.p.cur[Data.CUR_GOLD] + 50000;
-                this.g.AddChat("[每日福利] 领取 5 万金币");
-                this.snd.Box();
-            }
+            if (this.mouseJustUp) { this.g.ClaimWelfare(); this.snd.Box(); }
         }
         if (this.BtnTex(x + pad + (bw3 + 4) * 2, cy, bw3, 24, "充值", 1, 1)) {
             if (this.mouseJustUp) { this.modal = 40; }
@@ -1201,6 +1197,27 @@ class LegendApp {
                 if (this.mouseJustUp) { this.g.InjectWuxing(i, 1000); this.snd.Craft(); }
             }
         }
+        // ===== 内功(PRD §7.7):8 槽,TP 点升级,等级 ×0.2% 全属性 =====
+        int ny = gy + 5 * 46 + 12;
+        Text.DrawShadow(rd, "内功 — 8 槽(TP = 等级×5 + 转生×100,每级 +0.2% 全属性)",
+                        x + 16, ny, 1, 250, 215, 130, 255);
+        ny = ny + 22;
+        for (int i = 0; i < 8; i = i + 1) {
+            int bx = x + 16 + i * 112;
+            int lv = this.g.p.neigongLv[i];
+            LegendApp.PanelImg(rd, bx, ny, 104, 44);
+            Text.DrawShadow(rd, "内功 " + (i + 1), bx + 8, ny + 5, 1, 240, 220, 180, 255);
+            Text.DrawShadow(rd, lv + "/100", bx + 74, ny + 5, 1, 200, 205, 225, 255);
+            LegendApp.BarImg(rd, bx + 8, ny + 26, 88, 12, lv, 100);
+            if (this.BtnTex(bx + 56, ny + 2, 40, 16, "升", 1, 1)) {
+                if (this.mouseJustUp) { this.g.NeigongUp(i); this.snd.Craft(); }
+            }
+        }
+        ny = ny + 52;
+        Text.DrawShadow(rd, "TP 剩余:" + (this.g.TpTotal() - this.g.TpUsed())
+                        + " / 总 " + this.g.TpTotal()
+                        + "  (内功合计加成 +" + this.g.NeigongLvSum() * 0.2 + "%)",
+                        x + 16, ny, 1, 200, 205, 225, 255);
     }
 
     public void DrawCardAlbum(int x, int y, int w, int h) {
@@ -1812,10 +1829,7 @@ class LegendApp {
         }
         if (this.BtnTex(x + 224, gy, 200, 28,
                       "领取小时薪奖励", 1, 0)) {
-            if (this.mouseJustUp) {
-                this.g.p.cur[Data.CUR_ZG] = this.g.p.cur[Data.CUR_ZG] + 200;
-                this.g.AddChat("[PK] 领取 200 战功");
-            }
+            if (this.mouseJustUp) { this.g.PKClaimHourly(); this.snd.Trade(); }
         }
         gy = gy + 44;
         // 影子对手列表
@@ -2413,7 +2427,14 @@ class LegendApp {
                 Draw.RoundRectStroke(rd, x - 3, y - 3, w + 6, h + 6, 10, 2, gr, gg, gb, 160);
             }
         } else {
-            this.BtnTex(x, y, w, h, label, scale, kind);
+            // 回落矢量按钮(不能递归调用自己,否则窄按钮无限递归爆栈)
+            Draw.RoundRectFill(rd, x, y, w, h, 6,
+                               kind == 2 ? 120 : (kind == 1 ? 60 : 70),
+                               kind == 2 ? 90 : (kind == 1 ? 130 : 75),
+                               kind == 2 ? 50 : (kind == 1 ? 200 : 110), 235);
+            int tcf = kind == 2 ? 250 : 235;
+            Text.DrawShadow(rd, label, x + w / 8, y + h / 4, scale,
+                            tcf, tcf, tcf, 255);
             clicked = hov && this.mouseJustUp;
             return clicked;
         }
@@ -2863,6 +2884,28 @@ class LegendApp {
         // 红包:三档发一档 + 抢一次
         g.RedBagSend(100); if (!LegendApp.ActCheck(log, g, "RedBagSend(100)")) { fail = true; } n = n + 1;
         g.RedBagGrab(); if (!LegendApp.ActCheck(log, g, "RedBagGrab")) { fail = true; } n = n + 1;
+        // PK 小时薪:挑战一次拿排名 → 回拨 1h 结算一次 → 立刻再领应被拒
+        g.p.pkTriesLeft = 10;
+        g.PKArena(); if (!LegendApp.ActCheck(log, g, "PKArena(hourly-setup)")) { fail = true; } n = n + 1;
+        g.p.pkHourMs = Game.NowMs() - 7200000L;   // 2h 前
+        bool hourlyOk = g.PKClaimHourly();
+        if (!LegendApp.ActCheck(log, g, "PKClaimHourly(2h)")) { fail = true; } n = n + 1;
+        log.WriteLine("[ACT] PK 小时薪 2h 结算领取: " + hourlyOk);
+        g.PKClaimHourly();   // 立刻再领 → 应走"不足 1 小时"拒绝分支
+        if (!LegendApp.ActCheck(log, g, "PKClaimHourly(reject)")) { fail = true; } n = n + 1;
+        // 每日福利:领取 → 再领应被拒
+        g.p.welfareDayMs = 0;
+        g.ClaimWelfare(); if (!LegendApp.ActCheck(log, g, "ClaimWelfare")) { fail = true; } n = n + 1;
+        g.ClaimWelfare();     // 再领 → 应拒绝
+        if (!LegendApp.ActCheck(log, g, "ClaimWelfare(reject)")) { fail = true; } n = n + 1;
+        // 符文降级:2# 降 1#
+        g.MatAdd(Data.MAT_RUNE1 + 1, 1);
+        g.DowngradeRune(Data.MAT_RUNE1 + 1); if (!LegendApp.ActCheck(log, g, "DowngradeRune(2#)")) { fail = true; } n = n + 1;
+        // 内功:升两级(先给 TP 空间)
+        g.p.neigongLv = new int[8];
+        g.NeigongUp(0); if (!LegendApp.ActCheck(log, g, "NeigongUp(0)")) { fail = true; } n = n + 1;
+        g.NeigongUp(7); if (!LegendApp.ActCheck(log, g, "NeigongUp(7)")) { fail = true; } n = n + 1;
+        log.WriteLine("[ACT] 内功 TP: 总 " + g.TpTotal() + " 已用 " + g.TpUsed());
         // 经验/转生/离线
         g.GainXp(1000000); if (!LegendApp.ActCheck(log, g, "GainXp")) { fail = true; } n = n + 1;
         g.DoTurn(); if (!LegendApp.ActCheck(log, g, "DoTurn")) { fail = true; } n = n + 1;

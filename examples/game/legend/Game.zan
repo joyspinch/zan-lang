@@ -97,6 +97,13 @@ class Player {
     public long sbkDayMs;      // 上次攻城时间(日门槛)
     public long sbkTaxMs;      // 上次收税时间
 
+    // 每日福利
+    public long welfareDayMs;  // 上次领取日锚(每日 1 次)
+
+    // 内功:8 槽 × 0..100 级(TP 点升级,加成 = 等级 × 0.2% 全属性)
+    public int[] neigongLv = new int[8];
+    public int tpPoints;       // 可用 TP 点
+
     // 红包(影子群)
     public long rbSent;        // 累计发出(元宝)
     public long rbGot;         // 累计收回(元宝/红包币)
@@ -125,6 +132,7 @@ class Player {
 
     // PK / 押镖 / 钱庄 / 塔 / 师徒
     public int pkTriesLeft;
+    public long pkHourMs;      // 上次小时薪结算锚
     public int ybTriesLeft;
     public int jbTriesLeft;
     public int towerBest;
@@ -343,6 +351,79 @@ class Game {
     public bool HasHorn() { return this.MatCount(Data.MAT_HORN) > 0; }
 
     // ---------------------------------------------------------------
+    // 每日福利(签到):每日 1 次,金币 + 转生加成;连续性由日锚判断
+    // ---------------------------------------------------------------
+    public bool ClaimWelfare() {
+        long now = Game.NowMs();
+        if (now - this.p.welfareDayMs < Data.DAY_MS) {
+            this.AddChat("[福利] 今日已领取,明日 0 点再来");
+            return false;
+        }
+        long gold = 50000L + this.p.turn * 25000L;
+        this.p.cur[Data.CUR_GOLD] = this.p.cur[Data.CUR_GOLD] + gold;
+        // 会员加发寻宝图
+        if (this.p.vip >= 1) { this.MatAddMsg(Data.MAT_GOLDKEY, 1); }
+        this.p.welfareDayMs = now;
+        this.AddChat("[福利] 每日福利领取 " + this.FormatNum(gold) + " 金币");
+        return true;
+    }
+
+    // ---------------------------------------------------------------
+    // 符文降级(PRD §7.4):2# 以上 = 黑铁×10 换低 1 号
+    // ---------------------------------------------------------------
+    public bool DowngradeRune(int rune1) {
+        if (rune1 <= Data.MAT_RUNE1 || rune1 > Data.MAT_RUNE14) {
+            this.AddChat("[符文] 该符文无法降级");
+            return false;
+        }
+        if (!this.MatTake(rune1, 1)) {
+            this.AddChat("[符文] 没有该符文");
+            return false;
+        }
+        if (!this.MatTake(Data.MAT_BLACK_IRON, 10)) {
+            this.MatAdd(rune1, 1);   // 退回
+            this.AddChat("[符文] 黑铁矿石不足,需 ×10");
+            return false;
+        }
+        this.MatAddMsg(rune1 - 1, 1);
+        this.AddChat("[符文] 降级:" + Data.MAT_NAMES[rune1] + " → " + Data.MAT_NAMES[rune1 - 1]);
+        return true;
+    }
+
+    // ---------------------------------------------------------------
+    // 内功(PRD §7.7):8 槽 × 0..100 级,TP 点升级;等级 ×0.2% 全属性
+    // TP 来源:等级 ×5 + 转生 ×100(升级/转生时随属性刷新)
+    // ---------------------------------------------------------------
+    public int TpTotal() {
+        return this.p.lv * 5 + this.p.turn * 100;
+    }
+    public int TpUsed() {
+        int used = 0;
+        for (int i = 0; i < 8; i = i + 1) { used = used + this.p.neigongLv[i]; }
+        return used;
+    }
+    public bool NeigongUp(int slot) {
+        if (slot < 0 || slot >= 8) { return false; }
+        if (this.p.neigongLv[slot] >= 100) {
+            this.AddChat("[内功] 该槽已满级(100)");
+            return false;
+        }
+        if (this.TpUsed() >= this.TpTotal()) {
+            this.AddChat("[内功] TP 不足(升级/转生可获得 TP)");
+            return false;
+        }
+        this.p.neigongLv[slot] = this.p.neigongLv[slot] + 1;
+        this.AddChat("[内功] 第 " + (slot + 1) + " 槽升至 "
+                     + this.p.neigongLv[slot] + " 级");
+        return true;
+    }
+    public int NeigongLvSum() {
+        int s = 0;
+        for (int i = 0; i < 8; i = i + 1) { s = s + this.p.neigongLv[i]; }
+        return s;
+    }
+
+    // ---------------------------------------------------------------
     // 玩家属性计算
     // ---------------------------------------------------------------
     public int BaseHp() {
@@ -458,6 +539,8 @@ class Game {
         pct = pct + cards * 0.0005;
         // 殿堂登记 +0.5%
         pct = pct + this.p.dtCount * 0.005;
+        // 内功:8 槽等级和 ×0.2%
+        pct = pct + this.NeigongLvSum() * 0.002;
         // 图鉴:每件 +1%,整组镶满再 +5%(木桶原理)
         int fullGroups = this.AlbumFullGroups();
         pct = pct + this.AlbumCount() * Data.ALBUM_PCT_PER_ITEM
@@ -1674,8 +1757,15 @@ class Game {
             return;
         }
         this.p.pkTriesLeft = this.p.pkTriesLeft - 1;
-        // 50% 胜
-        bool win = this.rng.NextDouble01() < 0.5;
+        // 战力压制判定:总攻高于影子均值明显更易胜(影子均值 ≈ 我方 × 0.75)
+        double roll = this.rng.NextDouble01();
+        bool win = roll < 0.5 + (this.TotalAcMax() > 0 ? 0.0 : 0.0);
+        // 简单影子战力:前 3 名按 rkSeed 派生,我用排名折算
+        int myPos = this.RankMyPos(1);
+        // 胜率按排名插值:#1 → 65%,每降 1 名 -5%,下限 25%
+        double winRate = 0.65 - myPos * 0.05;
+        if (winRate < 0.25) { winRate = 0.25; }
+        win = roll < winRate;
         if (win) {
             this.p.cur[Data.CUR_ZG] = this.p.cur[Data.CUR_ZG] + Data.PK_WIN_ZG;
             this.AddChat("[PK] 胜利 +" + Data.PK_WIN_ZG + " 战功");
@@ -1683,6 +1773,29 @@ class Game {
             this.p.cur[Data.CUR_ZG] = this.p.cur[Data.CUR_ZG] + Data.PK_LOSE_ZG;
             this.AddChat("[PK] 失败 +" + Data.PK_LOSE_ZG + " 战功(安慰奖)");
         }
+        this.p.pkRankPos = myPos;   // 供小时薪按排名结算
+    }
+    // PK 小时薪:按当前影子排名领档位奖励(PRD §6.1:精确到分钟,本版简化为
+    // 每小时一次,不足 1 小时不可领——保留"低于门槛无法领取"的规则手感)
+    public bool PKClaimHourly() {
+        long now = Game.NowMs();
+        if (this.p.pkRankPos < 0) { this.p.pkRankPos = this.RankMyPos(1); }
+        if (now - this.p.pkHourMs < 3600000L) {
+            this.AddChat("[PK] 距下次小时薪结算不足 1 小时");
+            return false;
+        }
+        long ms = now - this.p.pkHourMs;
+        if (ms > 86400000L) { ms = 86400000L; }   // 跨天最多按 24h 结
+        long hours = ms / 3600000L;
+        int pos = this.p.pkRankPos;
+        if (pos < 0) { pos = 9; }
+        if (pos > 9) { pos = 9; }
+        long pay = (long)Data.PK_HOURLY[pos] * hours;
+        this.p.cur[Data.CUR_ZG] = this.p.cur[Data.CUR_ZG] + pay;
+        this.p.pkHourMs = now;
+        this.AddChat("[PK] 小时薪结算:排名 #" + (pos + 1) + " × " + hours
+                     + " 小时 = +" + pay + " 战功");
+        return true;
     }
 
     // ---------------------------------------------------------------
@@ -2227,6 +2340,14 @@ class Game {
         lines.Add("rbg=" + this.p.rbGot);
         lines.Add("rbd=" + this.p.rbDayMs);
         lines.Add("rbr=" + this.p.rbGrabMs);
+        lines.Add("pkh=" + this.p.pkHourMs);
+        lines.Add("wfd=" + this.p.welfareDayMs);
+        string ng = "";
+        for (int i = 0; i < 8; i = i + 1) {
+            ng = ng + this.p.neigongLv[i];
+            if (i < 7) { ng = ng + ","; }
+        }
+        lines.Add("ng=" + ng);
         // 图鉴 9×10(实存 Item,与背包同款序列化;空槽 = -1)
         string alb = "";
         for (int i = 0; i < this.p.albumSlots.Length; i = i + 1) {
@@ -2407,6 +2528,19 @@ class Game {
             else if (k == "rbg") { this.p.rbGot = Game.ParseLongS(v); }
             else if (k == "rbd") { this.p.rbDayMs = Game.ParseLongS(v); }
             else if (k == "rbr") { this.p.rbGrabMs = Game.ParseLongS(v); }
+            else if (k == "pkh") { this.p.pkHourMs = Game.ParseLongS(v); }
+            else if (k == "wfd") { this.p.welfareDayMs = Game.ParseLongS(v); }
+            else if (k == "ng") {
+                int ni = 0;
+                string ncur = "";
+                for (int j = 0; j <= v.Length; j = j + 1) {
+                    if (j == v.Length || v.Substring(j, 1) == ",") {
+                        if (ni < 8 && ncur != "") { this.p.neigongLv[ni] = Game.ParseIntS(ncur); }
+                        ni = ni + 1;
+                        ncur = "";
+                    } else { ncur = ncur + v.Substring(j, 1); }
+                }
+            }
             else if (k == "alb") {
                 int aslot = 0;
                 string acur = "";
