@@ -1308,6 +1308,20 @@ POSIX gthr，`pthread_*` 全部未定义 → `emit_lib_windows_dll` 链接失败
 
 ---
 
+## A81 · ra2 示例被空安全收紧编译打洞 —— ⏳ 已登记未修（2026-09-04）
+
+- **现象**：`bash examples/game/ra2/build.sh` 报 17 个 error（2026-09-04 实测），
+  全部是 `ra2/game/GameController.zan` / `ra2/game/Objects.zan` 里
+  `'TypeFor' can return null; accessing 'Prereqs'/'Cost'/'Hp' on its result faults`
+ ——新版 checker 的空安全诊断，ra2 自身代码没跟上。
+- **证据**：与 GameKit/legend 无关——legend 全量回归绿（ACT 93 动作 PASS、
+  SIM CHECK PASS、TOUR 2×33 面板 OK、SHOT 9 图 OK），snake 连 GameKit 编译通过；
+  报错文件本会话未触碰（工作树仅 `ra2/main.zan` 的 2 处 DrawShadow 实参修正）。
+- **处置**：按 AGENTS.md 规则 10 登记不绕过。修法即按诊断逐处补 `?.` 或先存后判；
+  属 ra2 示例维护，另案处理。
+
+---
+
 # A58 · 全量收口执行计划（2026-08-27 定序）
 
 排序依据三条：① 先修"编译通过但结果错/编译器崩"的，因为它们会污染后面每一次
