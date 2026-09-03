@@ -1,0 +1,449 @@
+using System;
+using System.Collections;
+using System.Data;
+using System.Data.Orm;
+using System.Json;
+using System.Web;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb;
+
+/* 表单 schema 三用同源（T14，架构定案 #70）：Parse（结构校验，非法抛
+   ApiError(400) 带字段级错误清单）/ Validate（数据逐项校验，返回错误清单）/
+   Render（转视图字段行，控件 HTML 服务端拼装）。定义预览、填报、详情三处
+   共用本类，杜绝三处各写一套漂移。
+   字段类型 8 种白名单：text/textarea/number/date/select/radio/checkbox/
+   attachment。select/radio/checkbox 选项来源二选一：内联 options 数组
+   （value=label）或 optionsSrc="dict:类型code"（现查 DictItem，字典变动
+   跟随）。attachment 与行强关联（oa_attachment 多态挂载），填报期行未建
+   只出占位说明，详情页（relatedId>0）渲染附件区容器。
+   模板引擎无嵌套 each——选项/控件统一服务端拼 HTML 经三括号原始输出，
+   所有插值过 View.HtmlEscape（escape-first 不破）。 */
+class FormSchema {
+    /* ---- 结构校验 ---- */
+
+    /* 非法即抛 ApiError(400)，消息为字段级错误清单（Form 控件 toast 回显）；
+       合法返回根对象（调用方免二次解析）。 */
+    static JsonValue Parse(string schemaJson) {
+        string src = schemaJson == null ? "" : schemaJson.Trim();
+        JsonValue root = src.Length == 0 ? null : JsonValue.ParseLenient(src);
+        List<string> errs = new List<string>();
+        if (root == null || !root.IsObject()) {
+            errs.Add("schema 必须是 JSON 对象");
+        } else {
+            JsonValue fields = root.Get("fields");
+            if (fields == null || !fields.IsArray() || fields.Count() == 0) {
+                errs.Add("fields 必须是非空数组");
+            } else {
+                List<string> codes = new List<string>();
+                for (int i = 0; i < fields.Count(); i = i + 1) {
+                    FormSchema.CheckField(fields.At(i), i + 1, codes, errs);
+                }
+            }
+        }
+        if (errs.Count > 0) { throw new ApiError(400, "0004", FormSchema.Join(errs)); }
+        return root;
+    }
+
+    static void CheckField(JsonValue f, int no, List<string> codes,
+                           List<string> errs) {
+        string at = "第 " + Convert.ToString(no) + " 项：";
+        if (f == null || !f.IsObject()) { errs.Add(at + "必须是对象"); return; }
+        string code = f.Str("code", "");
+        if (!FormSchema.CodeOk(code)) {
+            errs.Add(at + "code 需为 [a-z0-9_] 且 1~64 位");
+        } else if (codes.Contains(code)) {
+            errs.Add(at + "code 重复（" + code + "）");
+        } else {
+            codes.Add(code);
+        }
+        string label = f.Str("label", "");
+        if (label.Length == 0 || label.Length > 64) {
+            errs.Add(at + "label 需 1~64 字");
+        }
+        string type = f.Str("type", "");
+        if (FormSchema.TypeOk(type).Length == 0) {
+            errs.Add(at + "type 不在 8 种白名单内（" + type + "）");
+        }
+        if (type == "select" || type == "radio" || type == "checkbox") {
+            if (!FormSchema.HasOptions(f)) {
+                errs.Add(at + "select/radio/checkbox 须带 options 或 optionsSrc");
+            }
+        }
+        if (type == "number") {
+            JsonValue mn = f.Get("min");
+            JsonValue mx = f.Get("max");
+            if (mn != null && !mn.IsNull() && !mn.IsNumber()) {
+                errs.Add(at + "min 须为数字");
+            }
+            if (mx != null && !mx.IsNull() && !mx.IsNumber()) {
+                errs.Add(at + "max 须为数字");
+            }
+            if (mn != null && mn.IsNumber() && mx != null && mx.IsNumber()
+                && mn.AsDouble(0) > mx.AsDouble(0)) {
+                errs.Add(at + "min 不得大于 max");
+            }
+        }
+        int maxlen = f.Int("maxlen", 0);
+        if (maxlen < 0 || maxlen > 60000) { errs.Add(at + "maxlen 需 0~60000"); }
+        int max = f.Int("max", 0);
+        if (max < 0 || max > 99) { errs.Add(at + "max 需 0~99"); }
+    }
+
+    static string TypeOk(string t) {
+        if (t == "text") { return "1"; }
+        if (t == "textarea") { return "1"; }
+        if (t == "number") { return "1"; }
+        if (t == "date") { return "1"; }
+        if (t == "select") { return "1"; }
+        if (t == "radio") { return "1"; }
+        if (t == "checkbox") { return "1"; }
+        if (t == "attachment") { return "1"; }
+        return "";
+    }
+
+    /* code 机器名：[a-z0-9_]，1~64 位（字符按数值码比——Zan 无 char 字面量，
+       Attachment.BaseName / Filter.Clean 同款）。 */
+    static bool CodeOk(string s) {
+        if (s.Length == 0 || s.Length > 64) { return false; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            bool ok = (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95;
+            if (!ok) { return false; }
+        }
+        return true;
+    }
+
+    /* select/radio/checkbox 选项来源：内联 options（每项非空、不得含逗号
+       ——checkbox 多值按逗号合成，逗号会撕裂值）或 optionsSrc=dict:xx。 */
+    static bool HasOptions(JsonValue f) {
+        JsonValue opts = f.Get("options");
+        if (opts != null && opts.IsArray() && opts.Count() > 0) {
+            for (int i = 0; i < opts.Count(); i = i + 1) {
+                string o = opts.At(i).AsString("");
+                if (o.Length == 0 || o.Length > 64 || o.IndexOf(",") >= 0) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        return FormSchema.DictCode(f).Length > 0;
+    }
+
+    /* optionsSrc="dict:类型code" 的类型 code；非字典来源返回空串。 */
+    static string DictCode(JsonValue f) {
+        string src = f.Str("optionsSrc", "");
+        if (src.StartsWith("dict:")) {
+            string code = src.Substring(5);
+            if (code.Length > 0 && code.Length <= 64) { return code; }
+        }
+        return "";
+    }
+
+    static string Join(List<string> errs) {
+        string s = "";
+        for (int i = 0; i < errs.Count; i = i + 1) {
+            if (i > 0) { s = s + "；"; }
+            s = s + errs[i];
+        }
+        return s;
+    }
+
+    /* ---- 数据校验（提交/再提共用）---- */
+
+    /* 逐字段校验 dataJson，返回错误清单（空=通过）。dicts 为 schema 内
+       所有 dict: 来源选项的现查结果（FormSchema.DictsFor 预取）。 */
+    static List<string> Validate(JsonValue schema, JsonValue data,
+                                 List<DictItem> dicts) {
+        List<string> errs = new List<string>();
+        if (schema == null || !schema.IsObject()) { errs.Add("schema 缺失"); return errs; }
+        JsonValue fields = schema.Get("fields");
+        if (fields == null || !fields.IsArray()) { errs.Add("schema 缺失"); return errs; }
+        JsonValue dt = data;
+        if (dt == null || !dt.IsObject()) { dt = JsonValue.NewObject(); }
+        for (int i = 0; i < fields.Count(); i = i + 1) {
+            JsonValue f = fields.At(i);
+            if (f == null || !f.IsObject()) { continue; }
+            string code = f.Str("code", "");
+            string label = f.Str("label", code);
+            string type = f.Str("type", "");
+            JsonValue v = dt.Get(code);
+            List<string> vals = FormSchema.ValuesOf(v);
+            bool has = vals.Count > 0;
+            if (f.Bool("required", false) && !has) {
+                errs.Add(label + " 必填");
+                continue;
+            }
+            if (!has) { continue; }
+            if (type == "number") {
+                string s = vals[0];
+                if (!FormSchema.NumOk(s)) {
+                    errs.Add(label + " 须为数字");
+                } else {
+                    double d = Filter.ToDouble(s, 0);
+                    JsonValue mn = f.Get("min");
+                    JsonValue mx = f.Get("max");
+                    if (mn != null && mn.IsNumber() && d < mn.AsDouble(0)) {
+                        errs.Add(label + " 不得小于下限");
+                    }
+                    if (mx != null && mx.IsNumber() && d > mx.AsDouble(0)) {
+                        errs.Add(label + " 不得大于上限");
+                    }
+                }
+            } else if (type == "text" || type == "textarea") {
+                int maxlen = f.Int("maxlen", 0);
+                if (maxlen > 0 && vals[0].Length > maxlen) {
+                    errs.Add(label + " 超 " + Convert.ToString(maxlen) + " 字上限");
+                }
+            } else if (type == "date") {
+                if (!FormSchema.DateOk(vals[0])) { errs.Add(label + " 格式须为 YYYY-MM-DD"); }
+            } else if (type == "select" || type == "radio" || type == "checkbox") {
+                List<string> allowed = FormSchema.Allowed(f, dicts);
+                for (int k = 0; k < vals.Count; k = k + 1) {
+                    if (!allowed.Contains(vals[k])) {
+                        errs.Add(label + " 不在选项内");
+                        break;
+                    }
+                }
+            } else if (type == "attachment") {
+                int max = f.Int("max", 5);
+                if (max <= 0) { max = 5; }
+                if (vals.Count > max) {
+                    errs.Add(label + " 附件超 " + Convert.ToString(max) + " 个上限");
+                }
+            }
+        }
+        return errs;
+    }
+
+    /* 值规整为数组视角：缺省/_null → 空表；标量 → 单元素；checkbox 的
+       逗号串拆开（数组本身原样）。 */
+    static List<string> ValuesOf(JsonValue v) {
+        List<string> vals = new List<string>();
+        if (v == null || v.IsNull()) { return vals; }
+        if (v.IsArray()) {
+            for (int i = 0; i < v.Count(); i = i + 1) {
+                string s = v.At(i).AsString("");
+                if (s.Length > 0) { vals.Add(s); }
+            }
+            return vals;
+        }
+        string s1 = v.AsString("");
+        if (s1.Length == 0) { return vals; }
+        vals.Add(s1);
+        return vals;
+    }
+
+    /* 选项允许值：内联 options 优先，否则按 dict:code 现查结果过滤。 */
+    static List<string> Allowed(JsonValue f, List<DictItem> dicts) {
+        List<string> allowed = new List<string>();
+        JsonValue opts = f.Get("options");
+        if (opts != null && opts.IsArray()) {
+            for (int i = 0; i < opts.Count(); i = i + 1) {
+                string o = opts.At(i).AsString("");
+                if (o.Length > 0) { allowed.Add(o); }
+            }
+            return allowed;
+        }
+        string code = FormSchema.DictCode(f);
+        for (int i = 0; i < dicts.Count; i = i + 1) {
+            if (dicts[i].typeCode == code && dicts[i].status == 1) {
+                allowed.Add(dicts[i].value);
+            }
+        }
+        return allowed;
+    }
+
+    /* 宽松数字判定：首字符可 +-，其余数字或一个小数点（科学计数法不开放，
+       填报表单用不上且易藏歧义）。 */
+    static bool NumOk(string s) {
+        if (s.Length == 0) { return false; }
+        int dot = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (c == 45 || c == 43) {
+                if (i > 0) { return false; }
+            } else if (c == 46) {
+                dot = dot + 1;
+                if (dot > 1) { return false; }
+            } else if (c < 48 || c > 57) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /* YYYY-MM-DD：位形+月份日期粗校验（1~12/1~31，不考虑历法细账——
+       浏览器 date 控件输出本就合法，此处主要拦 API 直发的脏值）。 */
+    static bool DateOk(string s) {
+        if (s.Length != 10) { return false; }
+        for (int i = 0; i < 10; i = i + 1) {
+            int c = s[i] & 255;
+            if (i == 4 || i == 7) {
+                if (c != 45) { return false; }
+            } else if (c < 48 || c > 57) {
+                return false;
+            }
+        }
+        int mm = Convert.ToInt32(s.Substring(5, 2));
+        int dd = Convert.ToInt32(s.Substring(8, 2));
+        return mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31;
+    }
+
+    /* ---- 渲染（预览/填报/详情三处共用）---- */
+
+    /* schema 内 dict: 来源的类型 code 收集 + 一次 IN 查询预取（调用方把
+       结果传回 Validate/Render，避免每字段一查）。 */
+    static async List<DictItem> DictsFor(IDbConnection db, JsonValue schema) {
+        List<string> codes = new List<string>();
+        if (schema != null && schema.IsObject()) {
+            JsonValue fields = schema.Get("fields");
+            if (fields != null && fields.IsArray()) {
+                for (int i = 0; i < fields.Count(); i = i + 1) {
+                    JsonValue f = fields.At(i);
+                    if (f == null || !f.IsObject()) { continue; }
+                    string code = FormSchema.DictCode(f);
+                    if (code.Length > 0 && !codes.Contains(code)) { codes.Add(code); }
+                }
+            }
+        }
+        List<DictItem> rows = new List<DictItem>();
+        if (codes.Count == 0) { return rows; }
+        return await db.Select<DictItem>()
+            .Where(a => a.status == 1 && codes.Contains(a.typeCode))
+            .OrderBy(a => a.sortOrder).ToListAsync();
+    }
+
+    /* 转视图字段行：d.AddList("fields") 追加。控件 HTML 服务端拼装（插值
+       全过 View.HtmlEscape），视图以三括号原始输出。dataJson 非空时回填
+       value/selected/checked。 */
+    static void Render(ViewData d, JsonValue schema, JsonValue data,
+                       int relatedId, List<DictItem> dicts) {
+        JsonValue dt = data;
+        if (dt == null || !dt.IsObject()) { dt = JsonValue.NewObject(); }
+        List<StrMap> items = d.AddList("fields");
+        JsonValue fields = schema.Get("fields");
+        if (fields == null || !fields.IsArray()) { return; }
+        for (int i = 0; i < fields.Count(); i = i + 1) {
+            JsonValue f = fields.At(i);
+            if (f == null || !f.IsObject()) { continue; }
+            string code = f.Str("code", "");
+            string type = f.Str("type", "");
+            string name = "f_" + code;
+            string req = f.Bool("required", false) ? " required" : "";
+            string val = "";
+            List<string> vals = FormSchema.ValuesOf(dt.Get(code));
+            if (vals.Count > 0) { val = vals[0]; }
+            string html = "";
+            if (type == "text") {
+                html = "<input class=\"input\" name=\"" + name + "\" value=\""
+                    + View.HtmlEscape(val) + "\"" + req
+                    + FormSchema.MaxlenAttr(f) + ">";
+            } else if (type == "textarea") {
+                html = "<textarea class=\"input\" name=\"" + name
+                    + "\" rows=\"4\"" + req + FormSchema.MaxlenAttr(f) + ">"
+                    + View.HtmlEscape(val) + "</textarea>";
+            } else if (type == "number") {
+                html = "<input class=\"input\" name=\"" + name
+                    + "\" type=\"number\" value=\"" + View.HtmlEscape(val) + "\""
+                    + req + FormSchema.RangeAttr(f) + ">";
+            } else if (type == "date") {
+                html = "<input class=\"input\" name=\"" + name
+                    + "\" type=\"date\" value=\"" + View.HtmlEscape(val) + "\"" + req + ">";
+            } else if (type == "select") {
+                html = "<select class=\"input\" name=\"" + name + "\"" + req + ">"
+                    + "<option value=\"\">请选择</option>"
+                    + FormSchema.Opts(f, dicts, vals, "option") + "</select>";
+            } else if (type == "radio") {
+                html = FormSchema.Opts(f, dicts, vals, "radio") + req;
+            } else if (type == "checkbox") {
+                html = FormSchema.Opts(f, dicts, vals, "checkbox");
+            } else if (type == "attachment") {
+                int max = f.Int("max", 5);
+                if (max <= 0) { max = 5; }
+                string tip = "最多 " + Convert.ToString(max) + " 个";
+                if (relatedId > 0) {
+                    html = "<div data-attach data-module=\"form\" data-related=\""
+                        + Convert.ToString(relatedId) + "\"></div>"
+                        + "<div class=\"muted\" style=\"font-size:12px\">" + tip + "</div>";
+                } else {
+                    html = "<div class=\"muted\" style=\"font-size:12px\">提交后在详情页上传附件（"
+                        + tip + "）</div>";
+                }
+            } else {
+                html = "<div class=\"muted\">未知类型字段</div>";
+            }
+            StrMap m = new StrMap();
+            m.Set("code", code);
+            m.Set("label", f.Str("label", code));
+            m.Set("type", type);
+            m.Set("required", req.Length > 0 ? "1" : "");
+            m.Set("ctrl", html);
+            items.Add(m);
+        }
+    }
+
+    static string MaxlenAttr(JsonValue f) {
+        int maxlen = f.Int("maxlen", 0);
+        return maxlen > 0 ? " maxlength=\"" + Convert.ToString(maxlen) + "\"" : "";
+    }
+
+    static string RangeAttr(JsonValue f) {
+        string s = "";
+        JsonValue mn = f.Get("min");
+        JsonValue mx = f.Get("max");
+        if (mn != null && mn.IsNumber()) {
+            s = s + " min=\"" + FormSchema.NumText(mn) + "\"";
+        }
+        if (mx != null && mx.IsNumber()) {
+            s = s + " max=\"" + FormSchema.NumText(mx) + "\"";
+        }
+        return s;
+    }
+
+    /* JSON 数字原样文本（避免 ToString 重排小数位）。 */
+    static string NumText(JsonValue n) {
+        return n.AsString("");
+    }
+
+    /* 选项 HTML：option/radio/checkbox 三形态。内联 options value=label；
+       dict 来源 value=DictItem.value、label=DictItem.label。 */
+    static string Opts(JsonValue f, List<DictItem> dicts, List<string> vals,
+                       string kind) {
+        string name = "f_" + f.Str("code", "");
+        string html = "";
+        JsonValue opts = f.Get("options");
+        if (opts != null && opts.IsArray() && opts.Count() > 0) {
+            for (int i = 0; i < opts.Count(); i = i + 1) {
+                string o = opts.At(i).AsString("");
+                if (o.Length == 0) { continue; }
+                html = html + FormSchema.OptOne(kind, name, o, o, vals);
+            }
+            return html;
+        }
+        string code = FormSchema.DictCode(f);
+        for (int i = 0; i < dicts.Count; i = i + 1) {
+            if (dicts[i].typeCode == code && dicts[i].status == 1) {
+                html = html + FormSchema.OptOne(kind, name, dicts[i].value,
+                    dicts[i].label, vals);
+            }
+        }
+        return html;
+    }
+
+    static string OptOne(string kind, string name, string value, string label,
+                         List<string> vals) {
+        bool hit = vals.Contains(value);
+        string v = View.HtmlEscape(value);
+        string l = View.HtmlEscape(label);
+        if (kind == "option") {
+            return "<option value=\"" + v + "\"" + (hit ? " selected" : "") + ">"
+                + l + "</option>";
+        }
+        string type = kind == "radio" ? "radio" : "checkbox";
+        return "<label style=\"display:inline-flex;align-items:center;gap:4px;"
+            + "font-weight:400;margin-right:12px\"><input type=\"" + type
+            + "\" name=\"" + name + "\" value=\"" + v + "\""
+            + (hit ? " checked" : "") + "> " + l + "</label>";
+    }
+}

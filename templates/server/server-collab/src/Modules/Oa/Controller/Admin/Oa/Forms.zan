@@ -1,0 +1,283 @@
+using System;
+using System.Collections;
+using System.Data;
+using System.Data.Orm;
+using System.Json;
+using System.Web;
+using ZanWeb.Model.Flow;
+using ZanWeb.Model.Oa;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.Admin.Oa;
+
+/* 表单定义（T14，架构定案 #70）：TEXT 存 JSON 拒 EAV。schemaJson 经
+   FormSchema.Parse 结构校验非法不入库（错误清单 toast 回显）；
+   code 租户内 UNIQUE（先查后插 + 库约束双保险）。
+   有提交记录禁删改 schema（防 OaFormData.schemaSnapshot 失对照）——
+   Delete 直接拒、Save 拒绝 schema 变更，名称/描述/流程绑定/启停照常。
+   schemaJson 读法用 InRaw（Bug#8 同族：pretty JSON 的换行不得被
+   Filter.Clean 剥除；Parse 本身容忍空白，但入库原文保真）。
+   预览与填报/详情共用 FormSchema.Render（三用同源）。 */
+[Route("admin/oa/forms/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("表单定义")]
+class Forms : AdminController {
+    [HttpGet]
+    [Route("/admin/oa/forms")]
+    [Custom(IsMenu = true, Icon = "mdi:form-textbox", Perm = PermBit.View)]
+    [Description("表单定义")]
+    async void Index() {
+        User me = await this.Admin();
+        ViewData d = await this.Layout("表单定义");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+        ListQuery q = this.Paged("id", 20);
+        string kw = q.Kw();
+        List<OaFormDef> rows = await this.OaFormDef
+            .Where(a => a.tenantId == this.TenantId())
+            .WhereIf(kw.Length > 0, a => a.name.Contains(kw))
+            .OrderByDescending(a => a.id)
+            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        int total = await this.OaFormDef
+            .Where(a => a.tenantId == this.TenantId())
+            .WhereIf(kw.Length > 0, a => a.name.Contains(kw)).CountAsync();
+        d.Set("kw", kw);
+        d.Set("empty", total == 0 ? "1" : "");
+        d.Set("canCreate", this.Can(PermBit.Create) ? "1" : "");
+        d.Set("canUpdate", this.Can(PermBit.Update) ? "1" : "");
+        d.Set("canDelete", this.Can(PermBit.Delete) ? "1" : "");
+        /* 流程绑定名映射。 */
+        List<FlowDef> defs = await this.FlowDef
+            .Where(a => a.tenantId == this.TenantId()).ToListAsync();
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            OaFormDef r = rows[i];
+            StrMap m = new StrMap();
+            m.Set("id", Convert.ToString(r.id));
+            m.Set("code", r.code);
+            m.Set("name", r.name);
+            m.Set("description", r.description);
+            m.Set("flowName", Forms.FlowName(defs, r.flowDefId));
+            m.Set("statusText", r.status == 1 ? "启用" : "停用");
+            m.Set("status", r.status == 1 ? "1" : "");
+            m.Set("statusNext", r.status == 1 ? "停用" : "启用");
+            m.Set("createdAt", Fmt.Stamp(r.createdAt));
+            int subs = await this.OaFormData
+                .Where(a => a.tenantId == this.TenantId() && a.formId == r.id)
+                .CountAsync();
+            m.Set("subs", Convert.ToString(subs));
+            m.Set("locked", subs > 0 ? "1" : "");
+            m.Set("canEdit", this.Can(PermBit.Update) ? "1" : "");
+            m.Set("canDel", this.Can(PermBit.Delete) ? "1" : "");
+            items.Add(m);
+        }
+        this.Pager(d, q, total);
+        this.Page(d);
+    }
+
+    /* 新建/编辑弹窗：locked（有提交记录）时 schema 只读展示，Save 侧
+       双重校验（视图锁可绕，服务端不可绕）。 */
+    [HttpGet]
+    [Custom(IsMenu = false, Perm = PermBit.View)]
+    [Description("表单定义表单")]
+    async void Form() {
+        int id = this.InInt("id", 0);
+        OaFormDef r = null;
+        if (id > 0) {
+            r = await this.OaFormDef
+                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .FirstAsync();
+            if (r == null) { this.Fail(404, "0404", "表单不存在"); return; }
+        }
+        int subs = 0;
+        if (r != null) {
+            subs = await this.OaFormData
+                .Where(a => a.tenantId == this.TenantId() && a.formId == r.id)
+                .CountAsync();
+        }
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("dialogTitle", id > 0 ? "编辑表单" : "新建表单");
+        d.Set("code", r == null ? "" : r.code);
+        d.Set("name", r == null ? "" : r.name);
+        d.Set("description", r == null ? "" : r.description);
+        d.Set("schemaJson", r == null ? "" : r.schemaJson);
+        d.Set("flowDefId", r == null ? "0" : Convert.ToString(r.flowDefId));
+        d.Set("locked", subs > 0 ? "1" : "");
+        List<FlowDef> defs = await this.FlowDef
+            .Where(a => a.tenantId == this.TenantId() && a.status == 1)
+            .ToListAsync();
+        int curFlow = r == null ? 0 : r.flowDefId;
+        List<StrMap> flows = d.AddList("flows");
+        for (int i = 0; i < defs.Count; i = i + 1) {
+            if (defs[i].id == curFlow) { continue; }
+            StrMap m = new StrMap();
+            m.Set("id", Convert.ToString(defs[i].id));
+            m.Set("name", defs[i].name);
+            m.Set("sel", "");
+            flows.Add(m);
+        }
+        if (curFlow > 0) {
+            /* 当前绑定即使是停用流程也要出现在下拉里（否则回显丢失）。 */
+            FlowDef cur = await this.FlowDef
+                .Where(a => a.id == curFlow && a.tenantId == this.TenantId())
+                .FirstAsync();
+            if (cur != null) {
+                StrMap m = new StrMap();
+                m.Set("id", Convert.ToString(cur.id));
+                m.Set("name", cur.name + "（已停用）");
+                m.Set("sel", "1");
+                flows.Add(m);
+            }
+        }
+        this.Dialog(d);
+    }
+
+    /* 保存：Parse 校验（非法=字段级清单 toast）+ UNIQUE 先查 + 行限软上限。
+       有提交记录时拒绝 schema 变更（原文比对），其余字段照常。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("保存表单定义")]
+    async void Save() {
+        User me = await this.Admin();
+        int id = this.InInt("id", 0);
+        string code = this.Need("code", "表单标识");
+        string name = this.Need("name", "表单名称");
+        if (!FormSchema.CodeOk(code)) {
+            this.Fail(400, "0004", "表单标识需为 [a-z0-9_] 且 1~64 位"); return;
+        }
+        if (name.Length > 128) { this.Fail(400, "0004", "表单名称过长"); return; }
+        string description = this.In("description");
+        if (description.Length > 512) { description = description.Substring(0, 512); }
+        string schemaJson = this.InRaw("schemaJson");
+        if (schemaJson.Length > 60000) {
+            this.Fail(400, "0004", "schema 过大（60000 字符上限，MySQL 行限兜底）");
+            return;
+        }
+        JsonValue _schema = FormSchema.Parse(schemaJson);
+        int flowDefId = this.InInt("flowDefId", 0);
+        if (flowDefId > 0) {
+            FlowDef fd = await this.FlowDef
+                .Where(a => a.id == flowDefId && a.tenantId == this.TenantId())
+                .FirstAsync();
+            if (fd == null) { this.Fail(400, "0004", "绑定的流程不存在"); return; }
+        }
+        OaFormDef dup = await this.OaFormDef
+            .Where(a => a.tenantId == this.TenantId() && a.code == code)
+            .FirstAsync();
+        if (dup != null && dup.id != id) {
+            this.Fail(400, "0004", "表单标识已被使用"); return;
+        }
+        long now = WebApp.NowSeconds();
+        if (id > 0) {
+            OaFormDef r = await this.OaFormDef
+                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .FirstAsync();
+            if (r == null) { this.Fail(404, "0404", "表单不存在"); return; }
+            int subs = await this.OaFormData
+                .Where(a => a.tenantId == this.TenantId() && a.formId == r.id)
+                .CountAsync();
+            if (subs > 0 && schemaJson != r.schemaJson) {
+                this.Fail(400, "0004", "已有提交记录，schema 不可修改（名称/描述/流程绑定/启停不受限）");
+                return;
+            }
+            int n = await this.OaFormDef.Update()
+                .Set(a => a.code, code)
+                .Set(a => a.name, name)
+                .Set(a => a.description, description)
+                .Set(a => a.schemaJson, schemaJson)
+                .Set(a => a.flowDefId, flowDefId)
+                .Set(a => a.updatedAt, now)
+                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .ExecuteAffrowsAsync();
+            if (n <= 0) { this.Fail(404, "0404", "表单不存在"); return; }
+            await this.Note("保存表单定义", name, true, "");
+            this.Saved("表单已保存");
+            return;
+        }
+        OaFormDef row = new OaFormDef();
+        row.tenantId = this.TenantId();
+        row.code = code;
+        row.name = name;
+        row.description = description;
+        row.schemaJson = schemaJson;
+        row.status = 1;
+        row.flowDefId = flowDefId;
+        row.createdBy = me.id;
+        row.createdAt = now;
+        row.updatedAt = now;
+        int newId = await this.OaFormDef.Insert(row).ExecuteIdentityAsync();
+        await this.Note("新建表单定义", name, true, "");
+        this.Saved(newId > 0 ? "表单已创建" : "保存失败");
+    }
+
+    /* 启停：翻转位。停用后填报入口不可再提交，历史提交与详情不受影响。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("表单启停")]
+    async void Status() {
+        int id = this.InInt("id", 0);
+        OaFormDef r = await this.OaFormDef
+            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .FirstAsync();
+        if (r == null) { this.Fail(404, "0404", "表单不存在"); return; }
+        int next = r.status == 1 ? 0 : 1;
+        await this.OaFormDef.Update()
+            .Set(a => a.status, next)
+            .Set(a => a.updatedAt, WebApp.NowSeconds())
+            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .ExecuteAffrowsAsync();
+        this.Saved(next == 1 ? "已启用" : "已停用");
+    }
+
+    /* 删除：有提交记录一律拒（快照失对照风险），提示停用替代。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Delete)]
+    [Description("删除表单定义")]
+    async void Delete() {
+        int id = this.InInt("id", 0);
+        OaFormDef r = await this.OaFormDef
+            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .FirstAsync();
+        if (r == null) { this.Fail(404, "0404", "表单不存在"); return; }
+        int subs = await this.OaFormData
+            .Where(a => a.tenantId == this.TenantId() && a.formId == r.id)
+            .CountAsync();
+        if (subs > 0) {
+            this.Fail(400, "0004", "已有 " + Convert.ToString(subs)
+                + " 条提交记录，不可删除；如需收敛入口请停用");
+            return;
+        }
+        await this.OaFormDef.Delete()
+            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .ExecuteAffrowsAsync();
+        await this.Note("删除表单定义", r.name, true, "");
+        this.Saved("表单已删除");
+    }
+
+    /* 预览（弹窗片段）：空数据渲染 8 种控件形态，字典选项实拉。 */
+    [HttpGet]
+    [Custom(IsMenu = false, Perm = PermBit.View)]
+    [Description("表单预览")]
+    async void Preview() {
+        int id = this.InInt("id", 0);
+        OaFormDef r = await this.OaFormDef
+            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .FirstAsync();
+        if (r == null) { this.Fail(404, "0404", "表单不存在"); return; }
+        JsonValue schema = FormSchema.Parse(r.schemaJson);
+        List<DictItem> dicts = await FormSchema.DictsFor(this.Held(), schema);
+        ViewData d = new ViewData();
+        d.Set("dialogTitle", "预览：" + r.name);
+        d.Set("name", r.name);
+        FormSchema.Render(d, schema, null, 0, dicts);
+        this.Dialog(d);
+    }
+
+    static string FlowName(List<FlowDef> defs, int flowDefId) {
+        if (flowDefId <= 0) { return "不绑流程"; }
+        for (int i = 0; i < defs.Count; i = i + 1) {
+            if (defs[i].id == flowDefId) { return defs[i].name; }
+        }
+        return "流程#" + Convert.ToString(flowDefId);
+    }
+}
