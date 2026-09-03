@@ -117,6 +117,8 @@ class Docs : AdminController {
         d.Set("title", doc == null ? "" : doc.title);
         d.Set("content", doc == null ? "" : doc.content);
         d.Set("version", doc == null ? "" : Convert.ToString(doc.version));
+        /* 乐观锁基准（T10）：页面载入时的版本号，Save 提交比对。 */
+        d.Set("baseVersion", Convert.ToString(doc == null ? 0 : doc.version));
         d.Set("spaceId", Convert.ToString(doc == null
             ? this.InInt("spaceId", 0) : doc.spaceId));
         this.Page(d);
@@ -144,13 +146,16 @@ class Docs : AdminController {
         this.Dialog(d);
     }
 
-    /* 保存：新建 version=1 落首版快照；编辑 version+1 落新版快照。
-       content 经 Blocks.Validate（30KB 软上限）+ Normalize + TextOf。 */
+    /* 保存：新建 version=1 落首版快照；编辑带乐观锁（T10）——提交
+       baseVersion 须等于库内 version 才写，否则 409 拒写（前端保留
+       草稿提示刷新，双标签对敲场景）。content 经 Blocks.Validate
+       （30KB 软上限）+ Normalize + TextOf。 */
     [HttpPost]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
     [Description("保存文档")]
     async void Save() {
         int id = this.InInt("id", 0);
+        int baseVersion = this.InInt("baseVersion", 0);
         User me = await this.Admin();
         string title = this.Need("title", "文档标题");
         if (title.Length == 0) { this.Fail(400, "0004", "请填写文档标题"); return; }
@@ -164,6 +169,12 @@ class Docs : AdminController {
                 .Where(a => a.id == id && a.tenantId == this.TenantId())
                 .FirstAsync();
             if (doc == null) { this.Fail(404, "0404", "文档不存在"); return; }
+            /* 乐观锁：版本不一致=并发修改已在库中落地，本提交作废。 */
+            if (doc.version != baseVersion) {
+                this.Fail(409, "0409", "文档已被他人修改（当前 v"
+                    + Convert.ToString(doc.version) + "），请刷新对比后重试");
+                return;
+            }
             int ver = doc.version + 1;
             int n = await this.OaDoc.Update()
                 .Set(a => a.title, title)
