@@ -9,6 +9,7 @@ class FbRow {
     List<string> values;
     List<bool> nulls;
 
+    /// 构造 n 格、默认全 NULL 的行。
     FbRow(int n) {
         this.values = new List<string>();
         this.nulls = new List<bool>();
@@ -18,12 +19,15 @@ class FbRow {
         }
     }
 
+    /// 写入第 i 格并清除其 NULL 标志。
     void Set(int i, string v) {
         this.values[i] = v;
         this.nulls[i] = false;
     }
 
+    /// 各格文本。
     List<string> Values() { return this.values; }
+    /// 各格 NULL 标志。
     List<bool> Nulls() { return this.nulls; }
 }
 
@@ -34,6 +38,7 @@ class FbBlobRef {
     FbBytes id;
     int subtype;
 
+    /// 记录目标行、列号、BLOB id 与子类型。
     FbBlobRef(FbRow row, int col, FbBytes id, int subtype) {
         this.row = row;
         this.col = col;
@@ -41,6 +46,7 @@ class FbBlobRef {
         this.subtype = subtype;
     }
 
+    /// 构造 <see cref="FbBlobRef"/>。
     static FbBlobRef Of(FbRow row, int col, FbBytes id, int subtype) {
         return new FbBlobRef(row, col, id, subtype);
     }
@@ -54,6 +60,7 @@ class FbResponse {
     FbBytes buf;
     FbError err;
 
+    /// 打包 op_response 的四个字段。
     FbResponse(int handle, FbBytes oid, FbBytes buf, FbError err) {
         this.handle = handle;
         this.oid = oid;
@@ -61,16 +68,23 @@ class FbResponse {
         this.err = err;
     }
 
+    /// 构造 <see cref="FbResponse"/>。
     static FbResponse Of(int handle, FbBytes oid, FbBytes buf, FbError err) {
         return new FbResponse(handle, oid, buf, err);
     }
 
+    /// 返回的对象句柄（数据库、事务、语句等）。
     int Handle() { return this.handle; }
+    /// 8 字节对象 id。
     FbBytes Oid() { return this.oid; }
+    /// 随附的 info 缓冲区。
     FbBytes Buf() { return this.buf; }
+    /// 状态向量解析出的错误。
     FbError Err() { return this.err; }
+    /// 服务器是否报告了错误。
     bool Failed() { return this.err.Failed(); }
 
+    /// 释放 oid 与 buf 缓冲。
     void Release() {
         this.oid.Release();
         this.buf.Release();
@@ -122,6 +136,7 @@ class FirebirdConnection {
     /// 损坏或恶意的长度前缀。</summary>
     static int MAX_BLOCK = 33554432;
 
+    /// 空连接；外部经 <see cref="OpenAsync"/> 构造。
     FirebirdConnection() {
         this.sock = 0 - 1;
         this.connected = false;
@@ -188,6 +203,7 @@ class FirebirdConnection {
         return true;
     }
 
+    /// 读取 4 字节大端整数；连接关闭时返回 -1 并标记断开。
     async int recvInt() {
         byte[] b = new byte[5];
         int got = await this.recvExact(b, 0, 4);
@@ -395,6 +411,8 @@ class FirebirdConnection {
         return conn;
     }
 
+    /// 完整连接序列：TCP 连接、op_connect（协议 13 + SRP 公钥）、
+    /// SRP 认证、op_attach 取数据库句柄并开启事务。
     async bool handshake(string host, int port, string db, string user, string pw) {
         this.sock = Socket.CreateTcp();
         if (this.sock < 0) {
@@ -469,6 +487,7 @@ class FirebirdConnection {
         return p.ToBytes();
     }
 
+    /// 写入单个 connect 用户项（1 字节标签 + 1 字节长度 + 值）。
     static void cnct(FbBuf b, int tag, string v) {
         b.U8(tag);
         b.U8(v.Length);
@@ -678,6 +697,7 @@ class FirebirdConnection {
         return FbResponse.Of(handle, oid, buf, err);
     }
 
+    /// 构建 op_cont_auth：认证数据（hex）、插件名与插件列表。
     static FbBytes ContAuth(FbBytes authData, string plugin, string pluginList) {
         FbBuf p = new FbBuf();
         p.Int(FbOp.CONT_AUTH);
@@ -707,6 +727,8 @@ class FirebirdConnection {
         return names;
     }
 
+    /// 发送 op_crypt 请求 Arc4 线路加密，并在发出请求之后、
+    /// 读取应答之前启用双向 ARC4 密钥流。
     async bool startCrypt(FbBytes sessionKey) {
         FbBuf p = new FbBuf();
         p.Int(FbOp.CRYPT);
@@ -755,6 +777,7 @@ class FirebirdConnection {
         return p.ToBytes();
     }
 
+    /// 写入单个 DPB 字符串项（标签 + 长度 + 值）。
     static void dpbStr(FbBuf b, int tag, string v) {
         b.U8(tag);
         b.U8(v.Length);
@@ -765,6 +788,7 @@ class FirebirdConnection {
     // 事务
     // ============================================================
 
+    /// 以 WRITE / WAIT / READ COMMITTED（REC_VERSION）开启新事务。
     async bool beginTransaction() {
         FbBuf tpb = new FbBuf();
         tpb.U8(FbOp.TPB_VERSION3);
@@ -838,6 +862,7 @@ class FirebirdConnection {
     // 语句
     // ============================================================
 
+    /// 分配语句句柄；失败返回 -1。
     async int allocStatement() {
         FbBuf p = new FbBuf();
         p.Int(FbOp.ALLOCATE_STATEMENT);
@@ -874,6 +899,8 @@ class FirebirdConnection {
         return b.ToBytes();
     }
 
+    /// prepare 语句并解析输出描述（XSQLDA）；描述超出单个缓冲区时
+    /// 按 INFO_SQLDA_START 从服务器停下的列继续读取，失败返回 null。
     async FbXsqlda prepare(int stmt, string sql) {
         FbBuf p = new FbBuf();
         p.Int(FbOp.PREPARE_STATEMENT);
@@ -944,6 +971,8 @@ class FirebirdConnection {
         return xs;
     }
 
+    /// 执行语句：无参数走空 BLR；有参数经 FbValue.Params 编码
+    /// BLR 与绑定值后随 op_execute 发送。
     async bool execute(int stmt, DbParams prms) {
         FbParamBlock pb = FbValue.Params(prms);
         FbBuf p = new FbBuf();
@@ -972,6 +1001,7 @@ class FirebirdConnection {
         return ok;
     }
 
+    /// 释放（DSQL_DROP）语句句柄。
     async bool freeStatement(int stmt) {
         FbBuf p = new FbBuf();
         p.Int(FbOp.FREE_STATEMENT);
@@ -1337,8 +1367,10 @@ class FirebirdConnection {
     /// <summary>本会话附加到的数据库。</summary>
     string Database() { return this.database; }
 
+    /// 连接是否仍打开。
     bool IsConnected() { return this.connected; }
 
+    /// 驱动标识，恒为 <see cref="DbProvider.Firebird"/>。
     int GetProvider() { return DbProvider.Firebird; }
 
     /// <summary>礼貌地分离（回滚打开的事务），然后

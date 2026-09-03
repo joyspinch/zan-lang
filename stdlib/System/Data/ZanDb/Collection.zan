@@ -38,6 +38,7 @@ class Collection {
     [DllImport("crt", EntryPoint = "memchr")]
     static extern nint MemChr(nint p, int c, long n);
 
+    /// 仅初始化空字段；真正的构造走 <see cref="Attach"/>。
     Collection() {
         this.name = "";
         this.indexedFields = new List<string>();
@@ -46,6 +47,7 @@ class Collection {
         this.metaVersion = 0 - 1;
     }
 
+    /// 绑定到底层 KvStore 的一个命名空间，并加载索引列表与字段名字典。
     static Collection Attach(KvStore kv, AsyncRwLock rw, string name) {
         Collection c = new Collection();
         c.kv = kv;
@@ -75,6 +77,7 @@ class Collection {
         LoadKeyDict();
     }
 
+    /// 集合名。
     string Name() { return this.name; }
 
     // id 出现在每个文档键和每个索引条目中，其文本形式
@@ -86,6 +89,8 @@ class Collection {
     // 之前 12 位十进制数字的一半。
     static int ID_DIGITS = 6;
 
+    /// 把 id 编码为定宽 6 位 base-64 数字（'?'..'~'）：字节序即数值序，
+    /// 且不含 0x00、':' 与 '\t'，不破坏 B+Tree 顺序与键分隔。
     static string PadId(int id) {
         ByteBuffer b = ByteBuffer.Alloc(Collection.ID_DIGITS);
         int shift = (Collection.ID_DIGITS - 1) * 6;
@@ -107,22 +112,27 @@ class Collection {
         return v;
     }
 
+    /// 文档正文键 c:{name}:{id(定宽)}。
     string DocKey(int id) {
         return "c:" + this.name + ":" + Collection.PadId(id);
     }
 
+    /// 自增 id 序列键。
     string SeqKey() {
         return "m:" + this.name + ":seq";
     }
 
+    /// 索引字段列表元数据键（逗号分隔）。
     string IdxMetaKey() {
         return "m:" + this.name + ":idx";
     }
 
+    /// 字段名字典元数据键（JSON 数组）。
     string KeysMetaKey() {
         return "m:" + this.name + ":keys";
     }
 
+    /// 批量索引构建游标键；键不存在即表示该索引已构建完成。
     string IdxPosKey(string field) {
         return "m:" + this.name + ":idxpos:" + field;
     }
@@ -135,10 +145,12 @@ class Collection {
                + val + "\t";
     }
 
+    /// 完整二级索引条目键：<see cref="IdxPrefix"/> 加定宽 id。
     string IdxKey(string field, string val, int id) {
         return IdxPrefix(field, val) + Collection.PadId(id);
     }
 
+    /// 从元数据键加载索引字段列表（逗号分隔；空则无索引）。
     void LoadIndexMeta() {
         this.indexedFields = new List<string>();
         string meta = this.kv.Get(IdxMetaKey());
@@ -160,6 +172,7 @@ class Collection {
     // 字典 id，文档正文是紧凑的二进制记录，其中是
     // 带类型的 varint 编码值（非 JSON 文本）——参见 EncodeDoc/DecodeDoc。
 
+    /// 从元数据键的 JSON 数组加载字段名字典。
     void LoadKeyDict() {
         this.keyDict = new List<string>();
         this.keyDictDirty = false;
@@ -171,6 +184,7 @@ class Collection {
         }
     }
 
+    /// 字段名的 1 起始字典 id；首次出现时追加进字典并标记待持久化（须在 kv 事务内）。
     int KeyId(string k) {
         for (int i = 0; i < this.keyDict.Count; i = i + 1) {
             if (this.keyDict[i] == k) { return i + 1; }
@@ -190,11 +204,13 @@ class Collection {
         return 0;
     }
 
+    /// 字典 id 反查字段名；越界时返回 "?" 加 id（不抛错）。
     string KeyName(int id) {
         if (id >= 1 && id <= this.keyDict.Count) { return this.keyDict[id - 1]; }
         return "?" + Convert.ToString(id);
     }
 
+    /// 字典有变更时把整个字典写回元数据键（须在 kv 事务内）。
     void PersistKeyDict() {
         if (!this.keyDictDirty) { return; }
         JsonValue arr = JsonValue.NewArray();
@@ -211,6 +227,7 @@ class Collection {
     // 载荷）、6 数组、7 对象。标签 9/10 为最常见的两个单元格
     // （0 和 ""）提供 SQLite 式“值即类型”表示——它们还
     // 让 0x00 不进入记录，因此下面的 NUL 转义几乎从不触发。
+    /// 字符串是否为纯十进制整数（可带负号，至多 18 位以留在 varint 范围内）。
     static bool IsIntStr(string s) {
         int n = s.Length;
         if (n == 0) { return false; }
@@ -225,11 +242,11 @@ class Collection {
         return true;
     }
 
-    // 解析带符号的十进制整数为 64 位。用它替代 Convert.ToInt，因为后者
-    // 目前降级为 C 的 atoi（声明返回 i64），因此无法
-    // 符号扩展——负数及大于 2^31 的值会以零扩展的
-    // 垃圾数据返回。累加器必须是 long：IsIntStr 放行最长 18 位，
-    // epoch 毫秒时间戳（13 位，>2^31）此前在 int 里静默回绕后落盘。
+    /// 解析带符号的十进制整数为 64 位。用它替代 Convert.ToInt，因为后者
+    /// 目前降级为 C 的 atoi（声明返回 i64），因此无法
+    /// 符号扩展——负数及大于 2^31 的值会以零扩展的
+    /// 垃圾数据返回。累加器必须是 long：IsIntStr 放行最长 18 位，
+    /// epoch 毫秒时间戳（13 位，>2^31）此前在 int 里静默回绕后落盘。
     static long ParseI64(string s) {
         int n = s.Length;
         int i = 0;
@@ -246,6 +263,7 @@ class Collection {
         return acc;
     }
 
+    /// 按上方标签表把一个 JsonValue 写入记录；对象键写作字典 id（须在 kv 事务内）。
     void WriteVal(ByteBuffer b, JsonValue v) {
         if (v.IsNull()) { b.WriteU8(0); return; }
         if (v.IsBool()) {
@@ -329,6 +347,7 @@ class Collection {
         return s;
     }
 
+    /// 从记录中读取 <see cref="WriteVal"/> 写出的一个值并还原为 JsonValue。
     JsonValue ReadVal(ByteBuffer b) {
         int tag = b.ReadU8();
         if (tag == 0) { return JsonValue.NewNull(); }
@@ -364,6 +383,7 @@ class Collection {
         return Collection.UnpadId(key.Substring(off, Collection.ID_DIGITS));
     }
 
+    /// <see cref="IdOfKey"/> 的字符串形式。
     static string IdFromKey(string key) {
         return Convert.ToString(Collection.IdOfKey(key));
     }
@@ -446,6 +466,8 @@ class Collection {
         return found;
     }
 
+    /// 把存储的二进制记录（见 <see cref="EncodeDoc"/>）解码回 JsonValue 对象；
+    /// "_id" 由调用方从行键附加。
     JsonValue DecodeDoc(string body) {
         ByteBuffer b = OpenRecord(body);
         int fmt = b.ReadU8();   // 'B' = 66
@@ -460,6 +482,7 @@ class Collection {
         return o;
     }
 
+    /// 为每个已索引字段写入该文档的二级索引条目（须在 kv 事务内）。
     void AddIndexEntries(int id, JsonValue doc) {
         for (int i = 0; i < this.indexedFields.Count; i = i + 1) {
             string f = this.indexedFields[i];
@@ -470,6 +493,7 @@ class Collection {
         }
     }
 
+    /// 删除一篇文档的全部二级索引条目；doc 为 null（文档已不存在）时无事可做。
     void RemoveIndexEntries(int id, JsonValue doc) {
         if (doc == null) { return; }
         for (int i = 0; i < this.indexedFields.Count; i = i + 1) {
@@ -481,6 +505,7 @@ class Collection {
         }
     }
 
+    /// 读取并推进自增 id 序列，返回新分配的 id（须在 kv 事务内）。
     int NextId() {
         string cur = this.kv.Get(SeqKey());
         int id = 1;
@@ -535,6 +560,7 @@ class Collection {
         return doc;
     }
 
+    /// 文档 id 是否存在。
     bool Exists(int id) { return this.kv.Contains(DocKey(id)); }
 
     /// <summary>替换现有文档；id 不存在时返回 false。</summary>
@@ -568,6 +594,7 @@ class Collection {
         this.kv.Commit();
     }
 
+    /// 删除文档及其索引条目；返回该 id 是否原本存在。
     bool DeleteById(int id) {
         this.kv.Begin();
         SyncMeta();
@@ -579,6 +606,7 @@ class Collection {
 
     // ===== 二级索引 =====
 
+    /// 把索引字段列表写回元数据键（须在 kv 事务内）。
     void PersistIndexMeta() {
         string meta = "";
         for (int i = 0; i < this.indexedFields.Count; i = i + 1) {
@@ -655,6 +683,7 @@ class Collection {
         return done;
     }
 
+    /// 字段是否已在索引列表中（含批量构建尚未完成的）。
     bool HasIndex(string field) {
         for (int i = 0; i < this.indexedFields.Count; i = i + 1) {
             if (this.indexedFields[i] == field) { return true; }
@@ -788,6 +817,7 @@ class Collection {
 
     // ===== 协程安全的异步 API =====
 
+    /// <see cref="FindById"/> 的协程版本：在共享读写锁的读侧执行。
     async JsonValue FindByIdAsync(int id) {
         await this.rw.EnterRead();
         JsonValue v = FindById(id);
@@ -795,6 +825,7 @@ class Collection {
         return v;
     }
 
+    /// <see cref="Insert"/> 的协程版本：在共享读写锁的写侧执行。
     async int InsertAsync(JsonValue doc) {
         await this.rw.EnterWrite();
         int id = Insert(doc);
@@ -802,6 +833,7 @@ class Collection {
         return id;
     }
 
+    /// <see cref="Update"/> 的协程版本：在共享读写锁的写侧执行。
     async bool UpdateAsync(int id, JsonValue doc) {
         await this.rw.EnterWrite();
         bool ok = Update(id, doc);
@@ -809,6 +841,7 @@ class Collection {
         return ok;
     }
 
+    /// <see cref="DeleteById"/> 的协程版本：在共享读写锁的写侧执行。
     async bool DeleteByIdAsync(int id) {
         await this.rw.EnterWrite();
         bool ok = DeleteById(id);

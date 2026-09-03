@@ -11,6 +11,7 @@ class PageIdSet {
     int count;
     List<int> keys;   // pageId + 1，0 表示空
 
+    /// 空、256 槽的集合。
     PageIdSet() {
         this.slots = 256;
         this.count = 0;
@@ -18,8 +19,11 @@ class PageIdSet {
         for (int i = 0; i < this.slots; i = i + 1) { this.keys.Add(0); }
     }
 
+    /// 集合内的页数。
     int Count() { return this.count; }
 
+    /// 开放寻址探测：命中返回槽位，未命中返回
+    /// -(空槽位 + 1)（供 <see cref="Add"/> 就地写入）。
     int SlotOf(int pageId) {
         int mask = this.slots - 1;
         int h = (pageId * 2654435761) & mask;
@@ -33,8 +37,10 @@ class PageIdSet {
         return 0;
     }
 
+    /// 页 id 是否在集合中。
     bool Has(int pageId) { return SlotOf(pageId) >= 0; }
 
+    /// 槽位数翻倍并重散列。
     void Grow() {
         List<int> old = this.keys;
         int oldSlots = this.slots;
@@ -50,6 +56,7 @@ class PageIdSet {
         }
     }
 
+    /// 加入一页（已存在时无操作）；装载因子过半先扩容。
     void Add(int pageId) {
         if (this.count * 2 >= this.slots) { Grow(); }
         int s = SlotOf(pageId);
@@ -58,6 +65,7 @@ class PageIdSet {
         this.count = this.count + 1;
     }
 
+    /// 清空集合（保留槽位容量）。
     void Clear() {
         for (int i = 0; i < this.slots; i = i + 1) { this.keys[i] = 0; }
         this.count = 0;
@@ -81,6 +89,7 @@ class PageCache {
     int lruTail;       // 最久未使用的槽位
     int count;
 
+    /// 以固定页数容量构建（槽位数为容量的 2 倍向上取 2 的幂）。
     PageCache(int cap) {
         this.capacity = cap;
         int s = 16;
@@ -103,8 +112,10 @@ class PageCache {
         this.count = 0;
     }
 
+    /// 缓存中的页数。
     int Count() { return this.count; }
 
+    /// 页 id 的槽位；未命中返回 -1。
     int FindSlot(int pageId) {
         int mask = this.slots - 1;
         int h = (pageId * 2654435761) & mask;
@@ -118,6 +129,7 @@ class PageCache {
         return -1;
     }
 
+    /// 找到首个空槽或墓碑槽（插入用）。
     int FindInsertSlot(int pageId) {
         int mask = this.slots - 1;
         int h = (pageId * 2654435761) & mask;
@@ -128,6 +140,7 @@ class PageCache {
         return h;
     }
 
+    /// 从 LRU 链摘除槽位。
     void LruUnlink(int slot) {
         int p = this.lruPrev[slot];
         int n = this.lruNext[slot];
@@ -137,6 +150,7 @@ class PageCache {
         this.lruNext[slot] = -1;
     }
 
+    /// 把槽位推到 LRU 链头（最近使用）。
     void LruPushFront(int slot) {
         this.lruPrev[slot] = -1;
         this.lruNext[slot] = this.lruHead;
@@ -145,8 +159,10 @@ class PageCache {
         if (this.lruTail < 0) { this.lruTail = slot; }
     }
 
+    /// 页是否在缓存中。
     bool Has(int pageId) { return FindSlot(pageId) >= 0; }
 
+    /// 取页缓冲区并把它标记为最近使用；未命中返回小占位缓冲。
     ByteBuffer Get(int pageId) {
         int slot = FindSlot(pageId);
         if (slot < 0) { return ByteBuffer.Alloc(16); }
@@ -155,6 +171,7 @@ class PageCache {
         return this.vals[slot];
     }
 
+    /// 设置/清除页的钉住标志。
     void SetPinned(int pageId, bool p) {
         int slot = FindSlot(pageId);
         if (slot >= 0) { this.pinned[slot] = p; }
@@ -196,6 +213,7 @@ class PageCache {
         this.count = 0;
     }
 
+    /// LRU 尾部起找第一个未钉住的槽位；全部钉住时为 -1。
     int EvictableSlot() {
         int s = this.lruTail;
         while (s >= 0) {
@@ -205,6 +223,7 @@ class PageCache {
         return -1;
     }
 
+    /// 槽位数翻倍并重散列（保留钉住状态与 LRU 顺序）。
     void Grow() {
         List<int> oldKeys = this.keys;
         List<ByteBuffer> oldVals = this.vals;
@@ -301,6 +320,8 @@ class Pager {
     // 用 `int` 保存可使每个索引、列表和缓存键只占一个字。
     // 声称更大 id 的文件要么损坏、要么由未来格式写入，
     // 因此在这里直接拒绝，而不是静默截断。
+    /// <summary>把存储的 64 位页号收窄为 32 位 id；超出
+    /// [0, 2^31-1] 视为损坏，返回 0。</summary>
     static int PageIdOf(long stored) {
         if (stored < 0 || stored > 2147483647) { return 0; }
         return (int)stored;
@@ -332,6 +353,7 @@ class Pager {
     bool freeLoaded;
     bool cacheDirty;    // 缓存已失效：BTree 必须重新加载根节点
 
+    /// 私有构造；统一经 <see cref="Open"/> 创建。
     Pager() {
         this.lastError = "";
         this.txnid = 0;
@@ -395,16 +417,22 @@ class Pager {
         return p;
     }
 
+    /// 打开是否成功（原因见 <see cref="GetError"/>）。
     bool IsOpen() { return this.lastError.Length == 0 && this.file.IsOpen(); }
 
+    /// 最近一次失败的错误文本；无错为空串。
     string GetError() { return this.lastError; }
 
+    /// 文件中的页总数（含两枚 meta 页）。
     int PageCount() { return this.pageCount; }
 
+    /// 本句柄当前快照的事务 id。
     long CommitId() { return this.txnid; }
 
+    /// B+Tree 根页 id。
     int RootId() { return this.rootId; }
 
+    /// 设置新根（提交时随 meta 页一起持久化）。
     void SetRoot(int id) { this.rootId = id; }
 
     /// <summary>空闲链表上的页数加上已可复用的页数
@@ -430,6 +458,9 @@ class Pager {
 
     // ===== meta 页 =====
 
+    /// 把 meta 字段写成交替的两枚 meta 页之一（由新事务 id 奇偶
+    /// 决定槽位），CRC 覆盖前 META_FIELDS 字节。不 fsync（由
+    /// <see cref="Commit"/> 统一做）。
     void WriteMeta(long newTxn) {
         ByteBuffer h = ByteBuffer.Alloc(Pager.PAGE_SIZE);
         h.Clear();
@@ -531,6 +562,7 @@ class Pager {
 
     // ===== 空闲链表 =====
 
+    /// 惰性加载持久化的空闲链表（首读后缓存）。
     void LoadFreeList() {
         if (this.freeLoaded) { return; }
         this.freeIds = new List<int>();
@@ -618,6 +650,7 @@ class Pager {
         this.registry.PublishSnapshot(this.txnid);
     }
 
+    /// 结束读快照：最外层退出时撤销快照发布。
     void EndRead() {
         if (this.readDepth > 0) { this.readDepth = this.readDepth - 1; }
         if (this.readDepth == 0 && this.writeDepth == 0) {
@@ -651,6 +684,7 @@ class Pager {
         return true;
     }
 
+    /// 当前是否处于写事务中（含嵌套）。
     bool InWrite() { return this.writeDepth > 0; }
 
     /// <summary>当页属于当前运行中的写事务时为 true
@@ -823,6 +857,7 @@ class Pager {
         this.commitsSinceSync = 0;
     }
 
+    /// 回滚写事务并按序关闭注册表与文件。
     void Close() {
         if (this.writeDepth > 0) { Rollback(); }
         Checkpoint();

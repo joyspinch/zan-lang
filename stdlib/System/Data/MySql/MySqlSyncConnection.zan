@@ -40,6 +40,7 @@ class MySqlSyncConnection : IDbConnection {
     bool hadError;              // 上一条语句是否返回了 ERR 数据包
     List<PreparedStmt> stmtCache;  // 预编译语句缓存（SQL -> 服务器 id）
 
+    /// 空连接；外部经 <see cref="OpenParams"/> 构造。
     MySqlSyncConnection() {
         this.sock = -1;
         this.connected = false;
@@ -104,6 +105,7 @@ class MySqlSyncConnection : IDbConnection {
     /// <summary>在游标 <c>cur[0]</c> 处解码长度编码字符串。
     /// NULL（0xFB）返回空字符串。
 
+    /// 是否为 EOF 包（0xFE 首字节且负载短于 9 字节，以区分行首恰为 0xFE 的长负载）。
     bool isEof(byte[] pkt) {
         return (pkt[0] & 255) == 254 && this.lastLen < 9;
     }
@@ -146,6 +148,9 @@ class MySqlSyncConnection : IDbConnection {
         return tok;
     }
 
+    /// 按服务器要求的认证插件生成令牌：空密码返回空令牌；
+    /// caching_sha2_password 走 scramble41，mysql_native_password 走
+    /// scrambleNative；其他插件返回 null（outLen 置 -1）。
     static byte[] authToken(string plugin, string pw, string nonce20, List<int> outLen) {
         if (pw.Length == 0) {
             outLen[0] = 0;
@@ -163,11 +168,13 @@ class MySqlSyncConnection : IDbConnection {
         return null;
     }
 
+    /// 取 n 字节加密随机数（RSA 全量认证的 OAEP seed）。
     static byte[] genSeed(int n) {
         return RandomNumberGenerator.GetBytes(n);
     }
 
 
+    /// 剥掉 PEM 头尾与换行后 base64 解码，返回服务器公钥的 DER 编码。
     static byte[] pemToDer(string pem, int pemLen, List<int> outLen) {
         int begin = MySqlWire.findSub(pem, pemLen, "-----BEGIN", 10, 0);
         if (begin < 0) { return null; }
@@ -192,6 +199,8 @@ class MySqlSyncConnection : IDbConnection {
     }
 
 
+    /// 解析 DER 公钥中的模数 n 与指数 e，用 RSA-OAEP 加密
+    /// （XOR nonce 混淆后的密码 + NUL），模数长度写入 kOut。
     static byte[] fullAuthCipher(string der, int derLen, string obf, int obfLen, string seed, List<int> kOut) {
         List<int> c = new List<int>(); c.Add(0);
         c[0] = c[0] + 1; MySqlWire.readDerLen(der, c);
@@ -235,6 +244,8 @@ class MySqlSyncConnection : IDbConnection {
         return conn;
     }
 
+    /// 完整握手与认证：解析握手包（含 auth-switch / RSA 全量认证）、
+    /// 发送握手响应并等待结果。返回认证是否成功；失败原因写入 lastError。
     bool doConnect(string host, int port, string db, string user, string pw) {
         this.sock = Socket.CreateTcp();
         if (this.sock < 0) { this.lastError = "socket create failed"; return false; }
@@ -406,6 +417,7 @@ class MySqlSyncConnection : IDbConnection {
     // 文本查询（COM_QUERY）
     // ============================================================
 
+    /// 发送 COM_QUERY 文本查询。
     int comQuery(string sql) {
         int len = sql.Length + 1;
         byte[] pay = new byte[len + 1];
@@ -414,6 +426,8 @@ class MySqlSyncConnection : IDbConnection {
         return this.writePacket(pay, len, 0);
     }
 
+    /// 执行 COM_QUERY 并收集文本结果集；语句出错或连接断开时
+    /// hadError=true 且结果为空。SELECT 的行数记入 lastAffected。
     DbResult querySync(string sql) {
         DbResult result = new DbResult();
         this.hadError = false;
@@ -495,6 +509,8 @@ class MySqlSyncConnection : IDbConnection {
 
 
 
+    /// 按列类型解码二进制协议行值，返回其文本形式（整型带符号处理，
+    /// 日期/时间/浮点按 wire 格式渲染，其余按 lenenc 字符串）。
     static string readBinValue(string buf, List<int> cur, int type, int flags) {
         int p = cur[0];
         bool uns = (flags & 32) != 0;
@@ -562,6 +578,8 @@ class MySqlSyncConnection : IDbConnection {
         return MySqlWire.readLenencStr(buf, cur);
     }
 
+    /// 发送 COM_STMT_PREPARE；成功时把语句 id、列数、参数数依次写入 outIds，
+    /// 并读掉随后的参数/列定义包。
     bool stmtPrepare(string sql, List<int> outIds) {
         int len = sql.Length + 1;
         byte[] pay = new byte[len + 1];
@@ -591,6 +609,8 @@ class MySqlSyncConnection : IDbConnection {
         return true;
     }
 
+    /// 发送 COM_STMT_EXECUTE：NULL 位图、每参数类型（NULL/8 字节整数/
+    /// lenenc 文本）与二进制参数值。
     int stmtExecute(int stmtId, DbParams prms) {
         int n = prms.Count();
         int bitmapLen = (n + 7) / 8;
@@ -648,6 +668,7 @@ class MySqlSyncConnection : IDbConnection {
         return this.writePacket(pay, q, 0);
     }
 
+    /// 发送 COM_STMT_CLOSE，释放服务器端的语句句柄。
     int stmtClose(int stmtId) {
         byte[] pay = new byte[6];
         pay[0] = (byte)(25);
@@ -655,6 +676,7 @@ class MySqlSyncConnection : IDbConnection {
         return this.writePacket(pay, 5, 0);
     }
 
+    /// 按 SQL 文本在语句缓存中查下标；未命中返回 -1。
     int stmtCacheFind(string sql) {
         for (int i = 0; i < this.stmtCache.Count; i = i + 1) {
             if (this.stmtCache[i].sql == sql) { return i; }
@@ -662,6 +684,7 @@ class MySqlSyncConnection : IDbConnection {
         return -1;
     }
 
+    /// 把语句加入缓存；满 32 条时先关闭并淘汰最旧的一条。
     void stmtCacheAdd(string sql, int stmtId) {
         if (this.stmtCache.Count >= 32) {
             this.stmtClose(this.stmtCache[0].id);
@@ -670,6 +693,7 @@ class MySqlSyncConnection : IDbConnection {
         this.stmtCache.Add(new PreparedStmt(sql, stmtId));
     }
 
+    /// 按语句 id 把出错/失效的语句从缓存移除。
     void stmtCacheRemove(int stmtId) {
         for (int i = 0; i < this.stmtCache.Count; i = i + 1) {
             if (this.stmtCache[i].id == stmtId) {
@@ -679,6 +703,8 @@ class MySqlSyncConnection : IDbConnection {
         }
     }
 
+    /// 参数化查询：SQL 首次出现时预编译并缓存句柄，随后 COM_STMT_EXECUTE
+    /// 执行并解码二进制结果集；语句出错时 hadError=true 并从缓存剔除。
     DbResult queryParams(string sql, DbParams prms) {
         DbResult result = new DbResult();
         this.hadError = false;
@@ -840,16 +866,26 @@ class MySqlSyncConnection : IDbConnection {
     // 该驱动的 IO 是同步的，所以这里仅转发。提供这些方法是为了让调用方
     // （以及生成的 ORM 终端）能对所有驱动统一使用异步调用链，
     // 在驱动支持的情况下获得真正的非阻塞 IO。
+    /// <see cref="Query"/> 的协程孪生：本驱动 IO 为同步，直接转发。
     async DbResult QueryAsync(string sql) { return this.Query(sql); }
+    /// <see cref="Query"/> 的协程孪生：本驱动 IO 为同步，直接转发。
     async DbResult QueryAsync(string sql, DbParams prms) { return this.Query(sql, prms); }
+    /// <see cref="Execute"/> 的协程孪生：本驱动 IO 为同步，直接转发。
     async int ExecuteAsync(string sql) { return this.Execute(sql); }
+    /// <see cref="Execute"/> 的协程孪生：本驱动 IO 为同步，直接转发。
     async int ExecuteAsync(string sql, DbParams prms) { return this.Execute(sql, prms); }
+    /// <see cref="ExecuteScalar"/> 的协程孪生：本驱动 IO 为同步，直接转发。
     async string ExecuteScalarAsync(string sql) { return this.ExecuteScalar(sql); }
+    /// <see cref="ExecuteScalar"/> 的协程孪生：本驱动 IO 为同步，直接转发。
     async string ExecuteScalarAsync(string sql, DbParams prms) { return this.ExecuteScalar(sql, prms); }
+    /// <see cref="BeginTransaction"/> 的协程孪生，恒返回 true。
     async bool BeginTransactionAsync() { this.BeginTransaction(); return true; }
+    /// <see cref="Commit"/> 的协程孪生，恒返回 true。
     async bool CommitAsync() { this.Commit(); return true; }
+    /// <see cref="Rollback"/> 的协程孪生，恒返回 true。
     async bool RollbackAsync() { this.Rollback(); return true; }
 
+    /// 在当前会话上开启事务（START TRANSACTION）。
     void BeginTransaction() { this.Execute("START TRANSACTION"); }
 
     /// <summary>提交当前事务。</summary>
