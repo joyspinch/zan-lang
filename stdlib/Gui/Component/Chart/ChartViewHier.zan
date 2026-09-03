@@ -4,8 +4,11 @@ using Gui;
 
 namespace Gui.Component.Chart;
 
+/// 词云单个词条的放置结果：内容（ChartData 引用）+ 轴对齐
+/// 包围盒 + 字号/颜色/旋转角。坐标相对绘图区。
 class WordCloudItem {
     ChartData data;
+    /// 包围盒左上角（rot != 0 时为旋转后的包围盒）。
     int x;
     int y;
     int w;
@@ -57,6 +60,8 @@ class WordCloudCacheEntry {
     }
 }
 
+/// 树形图布局的中间记录：节点 + 深度 + 叶子 span 起点
+/// （见 ChartView.TreeAssign）。
 class TreeLayoutNode {
     ChartNode node;
     int depth;
@@ -73,6 +78,8 @@ class TreeLayoutNode {
     }
 }
 
+/// 桑基图节点布局：按最长路径分层的层号 + 累计流量决定的
+/// 高度与 x/y 落点（见 ChartView.DrawSankey）。
 class SankeyNodeLayout {
     string name;
     int layer;
@@ -96,18 +103,21 @@ class SankeyNodeLayout {
 }
 
 partial class ChartView {
+    /// 节点安全名（null → ""）。
     static string TreeNodeName(ChartNode n) {
         if (n == null || n.name == null) { return ""; }
         return n.name;
     }
 
+    /// 直接子节点数（null → 0）。
     static int TreeChildCount(ChartNode n) {
         if (n == null || n.children == null) { return 0; }
         return n.children.Count;
     }
 
-    // Treemap 面积只接受正值；负值/零值不占像素，且累计和饱和到
-    // int 上限，避免异常输入把布局边界推进到负数或溢出。
+    /// Treemap 面积只接受正值（负值/零值不占像素）；有子节点时取
+    /// 子树累计和，且累计和饱和到 int 上限，避免异常输入把布局
+    /// 边界推进到负数或溢出。
     static int TreemapValue(ChartNode n) {
         if (n == null) { return 0; }
         int kids = n.children == null ? 0 : n.children.Count;
@@ -121,6 +131,7 @@ partial class ChartView {
         return sum;
     }
 
+    /// 同层节点列表的 TreemapValue 总和（饱和）。
     static int TreemapTotal(List<ChartNode> nodes) {
         if (nodes == null) { return 0; }
         int total = 0;
@@ -132,6 +143,7 @@ partial class ChartView {
         return total;
     }
 
+    /// 饱和加法：负数钳 0，溢出饱和 int 上限。
     static int TreemapAdd(int left, int right) {
         if (left < 0) { left = 0; }
         if (right < 0) { right = 0; }
@@ -139,8 +151,9 @@ partial class ChartView {
         return left + right;
     }
 
-    // ---- 矩形树图（递归切片，交替分割方向） ----
-
+    /// 矩形树图（treemap）绘制入口：面积按 TreemapValue 分配，
+    /// 交替方向递归切片；支持 hover tooltip 与 Node 点击事件。
+    /// `g` 为出现动画进度（千分值 0..1000）。
     static void DrawTreemap(App app, int x, int y, int w, int h,
                             ChartOption o, int g) {
         Canvas c = app.canvas;
@@ -223,8 +236,8 @@ partial class ChartView {
         }
     }
 
-    // 一层分割；单元格足够大时递归进子节点，
-    // 否则以名称 + 值标记该单元格。
+    /// 一层分割；单元格足够大时递归进子节点，
+    /// 否则以名称 + 值标记该单元格。偶数层竖切、奇数层横切。
     static void TreemapSlice(App app, int x, int y, int w, int h,
                              List<ChartNode> nodes, int depth) {
         Canvas c = app.canvas;
@@ -272,8 +285,8 @@ partial class ChartView {
         }
     }
 
-    // 矩形树图单元格内的名称（+ 值）标签，仅放得下时绘制，
-    // 并用单元格矩形裁剪，避免长名称画出格子。
+    /// 矩形树图单元格内的名称（+ 值）标签，仅放得下时绘制，
+    /// 并用单元格矩形裁剪，避免长名称画出格子。
     static void TreemapCell(App app, int x, int y, int w, int h, string name, string val) {
         Canvas c = app.canvas;
         int fs = Style.FontFallback(app, "small");
@@ -289,8 +302,9 @@ partial class ChartView {
         c.PopClip();
     }
 
-    // ---- 旭日图（同心环；最内环 = 根的子节点） ----
+    /// ---- 旭日图（同心环；最内环 = 根的子节点） ----
 
+    /// 子树最大深度（叶 = 1）。
     static int TreeDepth(ChartNode n) {
         int md = 0;
         int childCount = ChartView.TreeChildCount(n);
@@ -301,9 +315,9 @@ partial class ChartView {
         return md + 1;
     }
 
-    // Sunburst 实际绘制的是父子边数对应的环，根节点本身
-    // 不占一圈；因此 root->leaf 应为 1 圈，而不是 TreeDepth=2
-    // 再额外除以一圈，造成外径只到 rMax/3。
+    /// 旭日图实际绘制的环数 = 根到叶的父子边数（根节点本身
+    /// 不占一圈）；因此 root->leaf 应为 1 圈，而不是 TreeDepth=2
+    /// 再额外除以一圈，造成外径只到 rMax/3。
     static int SunburstRingCount(ChartNode root) {
         if (root == null) { return 0; }
         int rings = ChartView.TreeDepth(root) - 1;
@@ -311,6 +325,7 @@ partial class ChartView {
         return rings;
     }
 
+    /// 每环厚度：rMax 均分给 rings 环（至少 1px）。
     static int SunburstRingHeight(int rMax, int rings) {
         if (rMax < 1 || rings < 1) { return 0; }
         int ringH = rMax / rings;
@@ -318,12 +333,14 @@ partial class ChartView {
         return ringH;
     }
 
+    /// 单元格圆角半径：外层格 4、内层格 2（乘 scale）。
     static int TreemapCornerRadius(int depth, int scale) {
         int rr = scale * 2;
         if (depth == 0) { rr = scale * 4; }
         return rr;
     }
 
+    /// 子树节点总数（含根）。
     static int TreeNodeCount(ChartNode n) {
         if (n == null || n.children == null) { return n == null ? 0 : 1; }
         int count = 1;
@@ -333,8 +350,9 @@ partial class ChartView {
         return count;
     }
 
-    // 稳定 preorder 下标供 Tree/Treemap 的 dataIndex 使用；节点对象
-    // 没有独立 id，因此不能使用每帧重新分配的命中句柄。
+    /// 稳定 preorder 下标供 Tree/Treemap 的 dataIndex 使用；节点对象
+    /// 没有独立 id，因此不能使用每帧重新分配的命中句柄。
+    /// 不在子树内返回 -1。
     static int TreeNodeIndex(ChartNode root, ChartNode target) {
         if (root == null || target == null) { return 0 - 1; }
         if (root == target) { return 0; }
@@ -349,8 +367,11 @@ partial class ChartView {
         return 0 - 1;
     }
 
+    /// 树图漫游开关（o.roam 透传；独立 seam 便于测试）。
     static bool TreeRoamEnabled(bool roam) { return roam; }
 
+    /// 节点命中热区半径：补固定可访问性余量；zoom < 50 时减半，
+    /// 不能随 zoom 无限扩大，否则空白或相邻节点会被远距离圆点吞掉。
     static int TreeHitRadius(int radius, int zoom, int scale) {
         if (radius < 0) { radius = 0; }
         if (scale < 1) { scale = 1; }
@@ -361,6 +382,7 @@ partial class ChartView {
         return radius + extra;
     }
 
+    /// 圆角矩形包含测试（含圆角处精确判定），treemap 命中用。
     static bool TreemapContains(int px, int py, int x, int y, int w, int h, int radius) {
         if (w < 1 || h < 1 || px < x || px >= x + w || py < y || py >= y + h) {
             return false;
@@ -382,14 +404,15 @@ partial class ChartView {
         return true;
     }
 
-    // 按累计值计算像素边界；绘制和命中必须使用同一组边界，
-    // 避免逐项 floor 后在最后一列/最后一行留下不可命中的空带。
+    /// 按累计值计算像素边界；绘制和命中必须使用同一组边界，
+    /// 避免逐项 floor 后在最后一列/最后一行留下不可命中的空带。
     static int TreemapSliceStart(int dimension, int prefix, int total) {
         if (dimension < 1 || prefix < 0 || total < 1) { return 0; }
         if (prefix > total) { prefix = total; }
         return (int)((long)dimension * (long)prefix / (long)total);
     }
 
+    /// 切片末端像素 = Start(prefix+value)，与 Start 同界。
     static int TreemapSliceEnd(int dimension, int prefix, int value, int total) {
         if (dimension < 1 || prefix < 0 || value < 0 || total < 1) { return 0; }
         if (prefix > total) { prefix = total; }
@@ -398,6 +421,7 @@ partial class ChartView {
         return (int)((long)dimension * end / (long)total);
     }
 
+    /// 切片厚度 = End - Start（恒非负）。
     static int TreemapSliceSize(int dimension, int prefix, int value, int total) {
         int start = ChartView.TreemapSliceStart(dimension, prefix, total);
         int end = ChartView.TreemapSliceEnd(dimension, prefix, value, total);
@@ -405,9 +429,9 @@ partial class ChartView {
         return end - start;
     }
 
-    // 矩形树图命中测试：按 TreemapSlice 相同的切片布局遍历，
-    // 仅当指针位于子单元格内（且深度足够
-    // 被分割）时才递归。填充静态命中字段 ttName/ttVal。
+    /// 矩形树图命中测试：按 TreemapSlice 相同的切片布局遍历，
+    /// 仅当指针位于子单元格内（且深度足够
+    /// 被分割）时才递归。填充静态命中字段 ttName/ttVal。
     static void TreemapHit(App app, int x, int y, int w, int h,
                            List<ChartNode> nodes, int depth, int px, int py) {
         int total = ChartView.TreemapTotal(nodes);
@@ -454,9 +478,7 @@ partial class ChartView {
         }
     }
 
-    // 旭日图环形命中测试：按 SunburstRing 相同的角扫掠遍历，
-    // 指针位于子扇形内时递归。填充
-    // 静态命中字段 ttName/ttVal。
+    /// 旭日图可见扫掠末端：rawEnd 裁到 sweepMax（rawEnd < 0 = 完整圆）。
     static int SunburstVisibleEnd(int rawEnd, int sweepMax) {
         if (sweepMax < 0) { sweepMax = 0; }
         if (sweepMax > 360) { sweepMax = 360; }
@@ -465,6 +487,9 @@ partial class ChartView {
         return rawEnd;
     }
 
+    /// 旭日图环形命中测试：按 SunburstRing 相同的角扫掠遍历，
+    /// 指针位于子扇形内时递归。填充静态命中字段 ttName/ttVal
+    /// （角度命中不做半径早退，否则内环会挡住所有外环指针）。
     static void SunburstHit(App app, int cx, int cy, int ringH, ChartNode node,
                             int depth, int a0, int a1, int sweepMax,
                             int px, int py) {
@@ -511,6 +536,9 @@ partial class ChartView {
         }
     }
 
+    /// 旭日图绘制入口：同心环自内向外，环厚均分；中心标签为根名。
+    /// 支持 hover 高亮 + tooltip + Node 点击事件。`g` 为出现动画
+    /// 进度（千分值 0..1000，映射扫掠角）。
     static void DrawSunburst(App app, int x, int y, int w, int h,
                              ChartOption o, int g) {
         Canvas c = app.canvas;
@@ -580,6 +608,8 @@ partial class ChartView {
         }
     }
 
+    /// 递归绘制一层旭日环：子扇区按子树 Total() 分配父扇区角度，
+    /// 颜色向父色向白色插值区分层级。
     static void SunburstRing(App app, int cx, int cy, int ringH, ChartNode node,
                              int depth, int a0, int a1, int sweepMax, int parentCol) {
         Canvas c = app.canvas;
@@ -610,21 +640,27 @@ partial class ChartView {
         }
     }
 
-    // ---- 桑基图（分层节点间的流量连线） ----
+    /// ---- 桑基图（分层节点间的流量连线） ----
 
-    static int SankeyIndex(List<SankeyNodeLayout> nodes, string name) {
+    /// 节点名 → 列表下标（不存在 = -1，线性查找）。
+    static int SankeyIndexOf(List<SankeyNodeLayout> nodes, string name) {
         for (int i = 0; i < nodes.Count; i = i + 1) {
             if (nodes[i].name == name) { return i; }
         }
         return 0 - 1;
     }
 
+    /// 出现动画进度（0..1000）→ 连线/节点 alpha（0..255）。
     static int SankeyRevealAlpha(int progress) {
         if (progress < 0) { progress = 0; }
         if (progress > 1000) { progress = 1000; }
         return 255 * progress / 1000;
     }
 
+    /// 桑基图（sankey）绘制入口：links 驱动，最长路径分层（松弛
+    /// 最多 n-1 轮 + 回边压平，循环图布局稳定终止）。节点高度按
+    /// max(入, 出) 流量分配；连线按流量定宽，支持连线 hover
+    /// tooltip（Link 事件）。`g` 为出现动画进度（0..1000 → alpha）。
     static void DrawSankey(App app, int x, int y, int w, int h,
                            ChartOption o, int g) {
         Canvas c = app.canvas;
@@ -640,10 +676,10 @@ partial class ChartView {
         int li = 0;
         for (; li < links.Count; li = li + 1) {
             ChartLink lk = links[li];
-            if (ChartView.SankeyIndex(nodes, lk.from) < 0) {
+            if (ChartView.SankeyIndexOf(nodes, lk.from) < 0) {
                 nodes.Add(SankeyNodeLayout.Of(lk.from));
             }
-            if (ChartView.SankeyIndex(nodes, lk.to) < 0) {
+            if (ChartView.SankeyIndexOf(nodes, lk.to) < 0) {
                 nodes.Add(SankeyNodeLayout.Of(lk.to));
             }
         }
@@ -658,8 +694,8 @@ partial class ChartView {
             li = 0;
             while (li < links.Count) {
                 ChartLink lk = links[li];
-                int fi = ChartView.SankeyIndex(nodes, lk.from);
-                int ti = ChartView.SankeyIndex(nodes, lk.to);
+                int fi = ChartView.SankeyIndexOf(nodes, lk.from);
+                int ti = ChartView.SankeyIndexOf(nodes, lk.to);
                 if (nodes[ti].layer < nodes[fi].layer + 1) {
                     nodes[ti].layer = nodes[fi].layer + 1;
                     changed = true;
@@ -674,8 +710,8 @@ partial class ChartView {
         li = 0;
         while (li < links.Count) {
             ChartLink lk = links[li];
-            int fi = ChartView.SankeyIndex(nodes, lk.from);
-            int ti = ChartView.SankeyIndex(nodes, lk.to);
+            int fi = ChartView.SankeyIndexOf(nodes, lk.from);
+            int ti = ChartView.SankeyIndexOf(nodes, lk.to);
             if (nodes[ti].layer < nodes[fi].layer) {
                 nodes[ti].layer = nodes[fi].layer;
             }
@@ -693,8 +729,8 @@ partial class ChartView {
         li = 0;
         while (li < links.Count) {
             ChartLink lk = links[li];
-            int fi = ChartView.SankeyIndex(nodes, lk.from);
-            int ti = ChartView.SankeyIndex(nodes, lk.to);
+            int fi = ChartView.SankeyIndexOf(nodes, lk.from);
+            int ti = ChartView.SankeyIndexOf(nodes, lk.to);
             nodes[fi].flowOut = nodes[fi].flowOut + lk.val;
             nodes[ti].flowIn = nodes[ti].flowIn + lk.val;
             li = li + 1;
@@ -744,8 +780,8 @@ partial class ChartView {
         li = 0;
         while (li < links.Count) {
             ChartLink lk = links[li];
-            int fi = ChartView.SankeyIndex(nodes, lk.from);
-            int ti = ChartView.SankeyIndex(nodes, lk.to);
+            int fi = ChartView.SankeyIndexOf(nodes, lk.from);
+            int ti = ChartView.SankeyIndexOf(nodes, lk.to);
             int th = maxTh * lk.val / maxFlow;
             if (th < app.Scale(2)) { th = app.Scale(2); }
             SankeyNodeLayout fromNode = nodes[fi];
@@ -789,8 +825,8 @@ partial class ChartView {
             li = 0;
             while (li < links.Count) {
                 ChartLink lk = links[li];
-                int fi = ChartView.SankeyIndex(nodes, lk.from);
-                int ti = ChartView.SankeyIndex(nodes, lk.to);
+                int fi = ChartView.SankeyIndexOf(nodes, lk.from);
+                int ti = ChartView.SankeyIndexOf(nodes, lk.to);
                 SankeyNodeLayout fromNode = nodes[fi];
                 SankeyNodeLayout toNode = nodes[ti];
                 int x0 = fromNode.x + nodeW;
@@ -810,8 +846,8 @@ partial class ChartView {
         }
         if (bestL >= 0) {
             ChartLink hk = links[bestL];
-            int fi = ChartView.SankeyIndex(nodes, hk.from);
-            int ti = ChartView.SankeyIndex(nodes, hk.to);
+            int fi = ChartView.SankeyIndexOf(nodes, hk.from);
+            int ti = ChartView.SankeyIndexOf(nodes, hk.to);
             SankeyNodeLayout fromNode = nodes[fi];
             SankeyNodeLayout toNode = nodes[ti];
             int x0 = fromNode.x + nodeW;
@@ -872,6 +908,7 @@ partial class ChartView {
         return (int)pos;
     }
 
+    /// 子树中最宽节点标签（像素），预留树图 span 间距用。
     static int TreeLabelWidth(ChartNode n, int fs) {
         int widest = Canvas.MeasureText(ChartView.TreeNodeName(n), fs);
         int childCount = ChartView.TreeChildCount(n);
@@ -882,6 +919,7 @@ partial class ChartView {
         return widest;
     }
 
+    /// 词云放置尝试：矩形 (x,y,w,h) 与已放置词条是否都不相交。
     static bool WordCloudFits(List<WordCloudItem> placed, int x, int y, int w, int h) {
         for (int i = 0; i < placed.Count; i = i + 1) {
             WordCloudItem item = placed[i];
@@ -891,6 +929,9 @@ partial class ChartView {
         return true;
     }
 
+    /// 词云（wordCloud）绘制入口：放置结果按内容指纹缓存（每帧
+    /// 重建 option 不重算布局）；字号按权重、放不下自动缩小。
+    /// 支持 hover tooltip + WordTag 点击事件。`g` 为出现动画进度。
     static void DrawWordCloud(App app, int x, int y, int w, int h,
                               ChartOption o, int g) {
         Canvas c = app.canvas;
@@ -1097,6 +1138,8 @@ partial class ChartView {
         return placed;
     }
 
+    /// 词云内容指纹（词条 + 盒子几何 + 旋转模式）：布局缓存键，
+    /// 必须覆盖所有影响放置结果的输入。
     static int WordCloudFingerprint(List<ChartData> data, int aw, int ah,
                                     int minFs, int maxFs, int rotate) {
         int fp = (aw * 7 + ah * 13 + minFs * 17 + maxFs * 19 + rotate * 29)
@@ -1123,6 +1166,8 @@ partial class ChartView {
 
     /// 无限画布网格：世界原点落在视口 (ax - panX, ay - panY)，
     /// 间距随缩放变稀/变密，密到看不清时跳级。
+    /// 无限画布网格第一根线：从世界坐标原点向视口 [view0, view0+…)
+    /// 对齐的最近网格线。
     static int TreeGridFirst(int origin, int view0, int gs) {
         if (gs < 1) { return view0; }
         int x = origin;
@@ -1137,6 +1182,8 @@ partial class ChartView {
         return x;
     }
 
+    /// 画无限画布网格：世界原点落在视口 (ax - panX, ay - panY)，
+    /// 间距随缩放变稀/变密，密到看不清时跳级。
     static void DrawTreeCanvasGrid(App app, Canvas c, int ax, int ay, int aw, int ah,
                                    int panX, int panY, int zoom) {
         int worldStep = app.Scale(28);
@@ -1168,6 +1215,10 @@ partial class ChartView {
         }
     }
 
+    /// 树形图（tree）绘制入口：ECharts type 'tree' 的分层节点连接
+    /// 图。roam 开启时滚轮缩放（CaptureWheel 仲裁防外层滚动打架）
+    /// + 拖拽平移，首帧自动适配整树；无限画布网格背景。支持
+    /// hover tooltip + Node 点击（拖拽超过阈值时吞掉 click）。
     static void DrawTree(App app, int x, int y, int w, int h,
                          ChartOption o, int g) {
         Canvas c = app.canvas;
