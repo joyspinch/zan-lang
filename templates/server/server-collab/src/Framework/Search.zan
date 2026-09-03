@@ -1,0 +1,220 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using ZanWeb.Model.Crm;
+using ZanWeb.Model.Flow;
+using ZanWeb.Model.Sys;
+using ZanWeb.Model.Wms;
+
+namespace ZanWeb;
+
+/* 全局搜索命中项：module=来源注册键（下拉徽标中文文案由控制器层映射），
+   link=屏 URL（不做 ?id= 深链，点击进入目标屏后由用户自行定位）。 */
+class SearchHit {
+    string module;
+    string title;
+    string link;
+}
+
+/* 各模块搜索源签名：db/tenantId 显式传参（TodoSource / Notify.Send 同款
+   纪律：静态链路拿不到控制器上下文）。limit=单源上限，源内以 Take(limit)
+   落实 LIMIT。 */
+async delegate List<SearchHit> SearchSource(IDbConnection db, int tenantId,
+    User me, string kw, int limit);
+
+/* 全局搜索聚合器（架构 T8）：模块经 Search.Register 挂源，Run 按注册序
+   逐源执行、按来源分组拼接（order List 平行表保序——Dict 不保证遍历序，
+   TodoCenter 成熟形态）。新增源 = 一个 SearchSource 方法 + main.zan 一行
+   注册，本类零改动。
+   kw 由 Run 统一清洗（Trim、去 %/_ LIKE 通配符、限 50 字符）；源内查询
+   仍必须 (tenantId, kw) 双条件起 Where（#34 基列），租户硬边先于一切。
+   SQL 只允许存在于 SearchSources 一个文件——MySQL FULLTEXT 升级只改该处。 */
+class Search {
+    /* 注册序 = 下拉分组展示序。 */
+    static List<string> order = new List<string>();
+    static Dict<string, SearchSource> sources = null;
+
+    static void Init() {
+        if (Search.sources == null) {
+            Search.sources = new Dict<string, SearchSource>();
+        }
+    }
+
+    /* 模块注册：main.zan 启动时逐行挂源；同键重注册=替换并保持原位。 */
+    static void Register(string module, SearchSource src) {
+        Search.Init();
+        if (Search.sources.ContainsKey(module)) {
+            Search.sources.Remove(module);
+            Search.order.Remove(module);
+        }
+        Search.sources.Add(module, src);
+        Search.order.Add(module);
+    }
+
+    /* 聚合：空 kw / 空账号短路；逐源执行后 module 统一盖分组章（与注册
+       键强一致，源实现不必自填），单源条数以 perModule 兜底截断。 */
+    static async List<SearchHit> Run(IDbConnection db, int tenantId, User me,
+                                     string kw, int perModule) {
+        List<SearchHit> hits = new List<SearchHit>();
+        if (me == null) { return hits; }
+        kw = Search.Clean(kw);
+        if (kw.Length == 0 || perModule <= 0) { return hits; }
+        Search.Init();
+        for (int m = 0; m < Search.order.Count; m = m + 1) {
+            string module = Search.order[m];
+            SearchSource src = null;
+            if (!Search.sources.TryGetValue(module, out src)) { continue; }
+            List<SearchHit> part = await src(db, tenantId, me, kw, perModule);
+            int n = part.Count < perModule ? part.Count : perModule;
+            for (int i = 0; i < n; i = i + 1) {
+                SearchHit it = part[i];
+                it.module = module;
+                hits.Add(it);
+            }
+        }
+        return hits;
+    }
+
+    /* LIKE 注入防御：去两端空白、剥 %/_ 通配符、限 50 字符——Contains
+       语义为 %kw%，kw 内不含通配符即不可能越权匹配。 */
+    static string Clean(string kw) {
+        string s = kw == null ? "" : kw.Trim();
+        s = s.Replace("%", "").Replace("_", "");
+        if (s.Length > 50) { s = s.Substring(0, 50); }
+        return s;
+    }
+}
+
+/* 既有六源 Provider（T8 注册）。硬性纪律（QA 矩阵逐项对应）：
+   ① 每条查询 (tenantId, kw) 双条件起 Where——直接用 #34 补的基列；
+   ② 先 AuthUser.MaskOf(db, uid, 屏键) 判 View 位，无位返回空——搜索
+      不能漏出用户进不去的屏的行名（点过去 403 也是泄漏）；
+   ③ 屏键与授权行同源（Perm.ScreenOf(首屏 action)，如 Admin.Crm.Customers）；
+   ④ 不搜 flow_task——mine 语义属待办中心（T5），避免双口径。 */
+class SearchSources {
+    /* CRM 客户：name | contact | phone。 */
+    static async List<SearchHit> CrmCustomer(IDbConnection db, int tenantId,
+                                             User me, string kw, int limit) {
+        List<SearchHit> items = new List<SearchHit>();
+        int mask = await AuthUser.MaskOf(db, Convert.ToString(me.id),
+            "Admin.Crm.Customers");
+        if ((mask & (int)PermBit.View) == 0) { return items; }
+        List<CrmCustomer> rows = await db.Select<CrmCustomer>()
+            .Where(a => a.tenantId == tenantId
+                && (a.name.Contains(kw) || a.contact.Contains(kw)
+                    || a.phone.Contains(kw)))
+            .OrderByDescending(a => a.id).Take(limit).ToListAsync();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            CrmCustomer r = rows[i];
+            SearchHit it = new SearchHit();
+            it.title = r.name;
+            it.link = "/admin/crm/customers";
+            items.Add(it);
+        }
+        return items;
+    }
+
+    /* CRM 联系人：name | phone | email。 */
+    static async List<SearchHit> CrmContact(IDbConnection db, int tenantId,
+                                            User me, string kw, int limit) {
+        List<SearchHit> items = new List<SearchHit>();
+        int mask = await AuthUser.MaskOf(db, Convert.ToString(me.id),
+            "Admin.Crm.Contacts");
+        if ((mask & (int)PermBit.View) == 0) { return items; }
+        List<CrmContact> rows = await db.Select<CrmContact>()
+            .Where(a => a.tenantId == tenantId
+                && (a.name.Contains(kw) || a.phone.Contains(kw)
+                    || a.email.Contains(kw)))
+            .OrderByDescending(a => a.id).Take(limit).ToListAsync();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            CrmContact r = rows[i];
+            SearchHit it = new SearchHit();
+            it.title = r.name;
+            it.link = "/admin/crm/contacts";
+            items.Add(it);
+        }
+        return items;
+    }
+
+    /* CRM 商机：title。 */
+    static async List<SearchHit> CrmOpportunity(IDbConnection db, int tenantId,
+                                                User me, string kw, int limit) {
+        List<SearchHit> items = new List<SearchHit>();
+        int mask = await AuthUser.MaskOf(db, Convert.ToString(me.id),
+            "Admin.Crm.Opportunities");
+        if ((mask & (int)PermBit.View) == 0) { return items; }
+        List<CrmOpportunity> rows = await db.Select<CrmOpportunity>()
+            .Where(a => a.tenantId == tenantId && a.title.Contains(kw))
+            .OrderByDescending(a => a.id).Take(limit).ToListAsync();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            CrmOpportunity r = rows[i];
+            SearchHit it = new SearchHit();
+            it.title = r.title;
+            it.link = "/admin/crm/opportunities";
+            items.Add(it);
+        }
+        return items;
+    }
+
+    /* WMS 商品：sku | name。 */
+    static async List<SearchHit> WmsSku(IDbConnection db, int tenantId,
+                                        User me, string kw, int limit) {
+        List<SearchHit> items = new List<SearchHit>();
+        int mask = await AuthUser.MaskOf(db, Convert.ToString(me.id),
+            "Admin.Wms.Skus");
+        if ((mask & (int)PermBit.View) == 0) { return items; }
+        List<WmsSku> rows = await db.Select<WmsSku>()
+            .Where(a => a.tenantId == tenantId
+                && (a.sku.Contains(kw) || a.name.Contains(kw)))
+            .OrderByDescending(a => a.id).Take(limit).ToListAsync();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            WmsSku r = rows[i];
+            SearchHit it = new SearchHit();
+            it.title = r.name;
+            it.link = "/admin/wms/skus";
+            items.Add(it);
+        }
+        return items;
+    }
+
+    /* WMS 仓库：name | code。 */
+    static async List<SearchHit> WmsWarehouse(IDbConnection db, int tenantId,
+                                              User me, string kw, int limit) {
+        List<SearchHit> items = new List<SearchHit>();
+        int mask = await AuthUser.MaskOf(db, Convert.ToString(me.id),
+            "Admin.Wms.Warehouses");
+        if ((mask & (int)PermBit.View) == 0) { return items; }
+        List<WmsWarehouse> rows = await db.Select<WmsWarehouse>()
+            .Where(a => a.tenantId == tenantId
+                && (a.name.Contains(kw) || a.code.Contains(kw)))
+            .OrderByDescending(a => a.id).Take(limit).ToListAsync();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            WmsWarehouse r = rows[i];
+            SearchHit it = new SearchHit();
+            it.title = r.name;
+            it.link = "/admin/wms/warehouses";
+            items.Add(it);
+        }
+        return items;
+    }
+
+    /* 流程实例：title（屏归属 Admin.Flow.Flows——Instances 为其子动作）。 */
+    static async List<SearchHit> FlowInst(IDbConnection db, int tenantId,
+                                          User me, string kw, int limit) {
+        List<SearchHit> items = new List<SearchHit>();
+        int mask = await AuthUser.MaskOf(db, Convert.ToString(me.id),
+            "Admin.Flow.Flows");
+        if ((mask & (int)PermBit.View) == 0) { return items; }
+        List<FlowInst> rows = await db.Select<FlowInst>()
+            .Where(a => a.tenantId == tenantId && a.title.Contains(kw))
+            .OrderByDescending(a => a.id).Take(limit).ToListAsync();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            FlowInst r = rows[i];
+            SearchHit it = new SearchHit();
+            it.title = r.title;
+            it.link = "/admin/flow/flows/instances";
+            items.Add(it);
+        }
+        return items;
+    }
+}
