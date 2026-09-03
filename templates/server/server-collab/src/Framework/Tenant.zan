@@ -1,0 +1,33 @@
+using System;
+
+namespace ZanWeb;
+
+/* 请求租户上下文：软隔离（架构 §3.3 方案 C）的地基。0=未初始化哨兵——业务查询读租户时若遇 0，开发态直接抛错，把「漏加租户过滤」从静默泄露变成显式失败；生产态返回 0，等值谓词 tenant_id = 0 不匹配任何行，退化为 fail-closed。
+ *
+ * 生命周期：AppController.OnBeforeAsync() 在借到请求租约、解析出账号行后 Bind(user.tenantId)；OnAfterAsync() 复位 0。匿名与登录域请求（登录、令牌解析、权限回填查询）不绑定、不判租户——二期补 [Tenant(Bypass)] 式端点白名单后再收紧到声明式豁免。
+ *
+ * 并发形态（重要）：槽是进程级静态，而请求协程在 await 点交错——两个并发请求会互相覆写槽值。单租户期（所有账号恒为租户 1）覆写写入同值，无可见影响；多租户上线（T2+ 引入租户谓词、T17 双租户矩阵）之前必须换协程局部存储（运行时帧槽）或改为显式传参（Notify.Send / TodoCenter.Gather / Search.Run 已按显式 tenantId 设计）。槽的读写只经本类三个方法，届时只改此处。
+ *
+ * 开发态断言：随 [log].debug（Cfg.Log.debug）开启；生产保持 false，不抛错。 */
+class TenantCtx {
+    static int current = 0;
+
+    /* 请求内绑定：借到租约并解析账号行之后调用。 */
+    static void Bind(int tenantId) {
+        TenantCtx.current = tenantId;
+    }
+
+    /* 当前租户；0=未绑定哨兵。开发态下业务查询遇 0 即抛错（Where 链构建期求值，异常落在动作里）。 */
+    static int Id() {
+        if (TenantCtx.current == 0 && Cfg.Log.debug) {
+            throw new Exception(
+                "[tenant] 租户上下文未绑定（0=哨兵）：业务查询不得在无租户请求中运行");
+        }
+        return TenantCtx.current;
+    }
+
+    /* 请求结束复位（OnAfterAsync），防止槽值跨请求残留。 */
+    static void Reset() {
+        TenantCtx.current = 0;
+    }
+}

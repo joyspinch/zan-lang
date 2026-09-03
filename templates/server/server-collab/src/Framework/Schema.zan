@@ -22,6 +22,7 @@ class Schema {
             await DbSchema.UseWriteAheadLogAsync(db);
             /* 编译期已知所有 [Table] 类，一行调用覆盖全部，新模型无需补行。*/
             await db.SyncStructureAllAsync();
+            await Schema.BackfillTenant(db);
 
             if (!await Schema.SeedAdmin(db)) { return false; }
             if (!await Schema.SeedRoles(db)) { return false; }
@@ -35,6 +36,22 @@ class Schema {
         } finally {
             ctx.Release(db);
         }
+    }
+
+    /* 存量库回填：SyncStructureAllAsync 加列不带 DEFAULT（ORM DDL 无此能力），
+       旧行 tenantId 为 NULL、读作 0（哨兵值）。启动时一次性归一为 1，保证
+       「一期单租户恒为 1」。NULL 用 IS NULL 命中（参数化 UPDATE 语义是
+       相等比较，绑 0 无法匹配 NULL 行）；新库行由 User.tenantId 字段初始
+       化器写 1，此处通常 0 行受影响。幂等，重复启动无害。 */
+    static async bool BackfillTenant(IDbConnection db) {
+        int n = await db.ExecuteAsync(
+            "UPDATE sys_user SET tenantId = 1 "
+            + "WHERE tenantId IS NULL OR tenantId = 0");
+        if (n > 0) {
+            Console.WriteLine("[tenant] 已回填 " + Convert.ToString(n)
+                + " 个账号的租户归属为 1");
+        }
+        return true;
     }
 
     /* 空库创建 bootstrap 账号；密码为开发用，部署前必须修改。*/
