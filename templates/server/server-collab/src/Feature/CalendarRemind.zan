@@ -1,0 +1,98 @@
+using System;
+using System.Collections;
+using System.Data;
+using System.Data.Orm;
+using ZanWeb.Model.Oa;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb;
+
+/* 日程提醒后台协程（T11）+ 日历待办源。两者共用 OaCalendarEvent，
+   与 Oa 域 Calendar 控制器（屏面）分层：后台无请求上下文，db/tenantId
+   显式传参（Notify.Send / TodoSource 同款纪律）。 */
+
+/* 日程提醒扫描：每 30s 一拍。
+   本单核心设计——多 worker 抢占式原子置位：Task.Spawn 协程是
+   per-worker 各跑一份（Metrics.zan:551 自证），"查询→发送→置位"
+   若非原子，同一日程会被 4 个 worker 各发一遍。故先
+   UPDATE oa_calendar_event SET reminded=1 WHERE id=? AND reminded=0
+   （SQLite 单写锁下仅一个 worker 的 UPDATE 命中 1 行），
+   ExecuteAffrowsAsync()==1 者才 Notify.Send。
+   到点窗口：startAt-remindMinutes*60 <= now（已到提醒时刻）且
+   startAt > now-3600（过期 1h 内补发，更早放弃）。
+   扫描谓词不加 tenantId（后台无请求上下文），逐行按行上 tenantId
+   显式传参（Engine.Note 同款）。 */
+class CalendarRemind {
+    /* 拍间隔（秒）。 */
+    static int Interval = 30;
+    /* 过期补发窗口（秒）：开始时刻已过 1h 内仍补发。 */
+    static long GraceSeconds = 3600;
+
+    static async void Loop() {
+        while (true) {
+            await Task.Delay(CalendarRemind.Interval * 1000);
+            IDbConnection db = await AppServices.Current().Db().Acquire();
+            if (db == null) { continue; }
+            try {
+                await CalendarRemind.Sweep(db);
+            } finally {
+                AppServices.Current().Db().Release(db);
+            }
+        }
+    }
+
+    static async void Sweep(IDbConnection db) {
+        long now = WebApp.NowSeconds();
+        /* ORM 谓词不允许字段间算术（a.startAt - a.remindMinutes*60 不可编译），
+           预取上限改为按最大提醒档 1440min 扩窗取行；逐行"是否已到提醒时刻"
+           在循环内判定（普通算术）。 */
+        List<OaCalendarEvent> rows = await db.Select<OaCalendarEvent>()
+            .Where(a => a.remindMinutes > 0 && a.reminded == 0
+                && a.startAt > now - CalendarRemind.GraceSeconds
+                && a.startAt <= now + 86400)
+            .ToListAsync();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            OaCalendarEvent ev = rows[i];
+            /* 未到提醒时刻（startAt-remindMinutes*60 > now）：跳过等下一拍。 */
+            if (ev.startAt - (long)ev.remindMinutes * 60 > now) { continue; }
+            /* 抢占：UPDATE 命中 1 行的 worker 独得发送权，其余跳过。 */
+            int hit = await db.Update<OaCalendarEvent>()
+                .Set(a => a.reminded, 1)
+                .Where(a => a.id == ev.id && a.reminded == 0)
+                .ExecuteAffrowsAsync();
+            if (hit != 1) { continue; }
+            await Notify.Send(db, ev.tenantId, ev.ownerId, "calendar",
+                "remind", "日程提醒：" + ev.title,
+                Fmt.Stamp(ev.startAt) + " 开始", "/admin/oa/calendar");
+        }
+    }
+}
+
+/* 日历待办源（main.zan 注册）：今天 0 点起 7 天内开始的本人日程。
+   F2 定案：提醒协程只发 Notify，绝不写 oa_todo 标记行——待办由本源
+   实时流呈现，过期日程（超出 7 天窗口）自然出窗，防待办双条。 */
+class CalendarSources {
+    static async List<TodoItem> Calendar(IDbConnection db, int tenantId,
+                                         User me) {
+        List<TodoItem> items = new List<TodoItem>();
+        long start = Fmt.TodayStart(WebApp.NowSeconds());
+        long end = start + 7 * 86400;
+        List<OaCalendarEvent> rows = await db.Select<OaCalendarEvent>()
+            .Where(a => a.tenantId == tenantId && a.ownerId == me.id
+                && a.startAt >= start && a.startAt < end)
+            .OrderBy(a => a.startAt).ToListAsync();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            OaCalendarEvent ev = rows[i];
+            TodoItem it = new TodoItem();
+            it.source = "calendar";
+            it.title = "日程：" + ev.title;
+            it.link = "/admin/oa/calendar";
+            it.dueAt = ev.startAt;
+            it.relatedType = "calendar_event";
+            it.relatedId = ev.id;
+            it.rowId = 0;
+            items.Add(it);
+        }
+        return items;
+    }
+}
