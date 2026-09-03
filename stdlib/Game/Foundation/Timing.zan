@@ -3,8 +3,10 @@ using System;
 namespace Game.Foundation;
 
 /// <summary>
-/// 确定性固定步长累加器。模拟代码在 HasStep() 为真时反复调用 Step()，
-/// 并用 Alpha() 插值进行渲染。
+/// 确定性固定步长累加器。每帧 Advance(真实帧间隔)，然后在
+/// HasStep() 为真时反复 ConsumeStep() 驱动模拟；渲染插值用
+/// Alpha()。单帧补步数有上限（防死亡螺旋），时间缩放只影响
+/// 累加速度。
 /// </summary>
 class FixedStepClock {
     int stepMilliseconds;
@@ -25,6 +27,12 @@ class FixedStepClock {
         this.timeScale = 1.0;
     }
 
+    /// <summary>
+    /// 累加一帧的真实毫秒数并换算成本帧待执行的固定步数。
+    /// 缩放后的时间超过 步长×每帧上限 时截断（补步最多
+    /// maxStepsPerFrame 个），避免卡顿后一帧内狂补模拟。
+    /// 暂停中或 delta≤0 返回 0。每次调用会先清空上次余量。
+    /// </summary>
     int Advance(int deltaMilliseconds) {
         this.pendingSteps = 0;
         if (this.paused || deltaMilliseconds <= 0) { return 0; }
@@ -42,32 +50,51 @@ class FixedStepClock {
         return this.pendingSteps;
     }
 
+    /// 本帧是否还有未消费的固定步。
     bool HasStep() { return this.pendingSteps > 0; }
 
+    /// <summary>
+    /// 消费一个固定步，返回其毫秒数（恒等于步长，供模拟代码
+    /// 做确定性积分）；无步可消费时返回 0。
+    /// </summary>
     int ConsumeStep() {
         if (this.pendingSteps <= 0) { return 0; }
         this.pendingSteps = this.pendingSteps - 1;
         return this.stepMilliseconds;
     }
 
+    /// 固定步长毫秒数（构造时 ≤0 钳为 16）。
     int StepMilliseconds() { return this.stepMilliseconds; }
+    /// 本帧剩余待执行的固定步数。
     int PendingSteps() { return this.pendingSteps; }
 
+    /// <summary>
+    /// 渲染插值系数：accumulator/步长，0..1。渲染时用
+    /// 前后两次模拟状态按 alpha 混合可消除固定步的颗粒感。
+    /// </summary>
     double Alpha() {
         return (double)this.accumulator / (double)this.stepMilliseconds;
     }
 
+    /// 暂停/恢复累加（暂停时 Advance 直接返回 0）。
     void SetPaused(bool paused) { this.paused = paused; }
+    /// 是否暂停中。
     bool Paused() { return this.paused; }
 
+    /// <summary>
+    /// 时间流速倍率，影响 Advance 的累加速度（0=冻结，1=正常，
+    /// 2=两倍速）。超出 [0,8] 钳到边界；不影响已累计的余量。
+    /// </summary>
     void SetTimeScale(double scale) {
         if (scale < 0.0) { scale = 0.0; }
         if (scale > 8.0) { scale = 8.0; }
         this.timeScale = scale;
     }
 
+    /// 当前时间流速。
     double TimeScale() { return this.timeScale; }
 
+    /// 清零累计余量与待执行步数（不影响暂停/流速设置）。
     void Reset() {
         this.accumulator = 0;
         this.pendingSteps = 0;
@@ -82,10 +109,12 @@ class GameTimer {
     bool running;
     int triggers;
 
+    /// 创建一次性定时器（触发一次后自动停止）。
     static GameTimer Once(int durationMilliseconds) {
         return new GameTimer(durationMilliseconds, false);
     }
 
+    /// 创建循环定时器（按间隔反复触发）。
     static GameTimer Repeating(int intervalMilliseconds) {
         return new GameTimer(intervalMilliseconds, true);
     }
@@ -99,6 +128,11 @@ class GameTimer {
         this.triggers = 0;
     }
 
+    /// <summary>
+    /// 推进定时器并返回本次触发的次数（一帧可能触发多次）。
+    /// 每次调用都会重置触发计数。已停止或 delta≤0 返回 0；
+    /// 一次性定时器触发后自动停止。
+    /// </summary>
     int Tick(int deltaMilliseconds) {
         this.triggers = 0;
         if (!this.running || deltaMilliseconds <= 0) { return 0; }
@@ -115,37 +149,47 @@ class GameTimer {
         return this.triggers;
     }
 
+    /// 重置到满时长并恢复运行（触发计数清零）。
     void Restart() {
         this.remaining = this.duration;
         this.running = true;
         this.triggers = 0;
     }
 
+    /// 停止定时器（Restart 可再启动）。
     void Stop() { this.running = false; }
+    /// 是否运行中。
     bool Running() { return this.running; }
+    /// 距下次触发的剩余毫秒。
     int Remaining() { return this.remaining; }
+    /// 定时时长/循环间隔毫秒（构造时 ≤0 钳为 1）。
     int Duration() { return this.duration; }
+    /// 最近一次 Tick 的触发次数。
     int Triggers() { return this.triggers; }
 }
 
 /// <summary>
-/// 小型可复现随机源，状态对外暴露，用于存档、
-/// 确定性回放与网络同步。
+/// 小型可复现随机源（PCG 线性同余变体），状态对外暴露——保存
+/// state 即可完整恢复随机序列，用于存档、确定性回放与网络同步。
+/// 同一种子的序列永远一致；种子 0 视为 1（避免全零序列）。
 /// </summary>
 class DeterministicRandom {
     long state;
 
+    /// 用种子构造；种子 0 自动改为 1。
     DeterministicRandom(long seed) {
         this.state = seed;
         if (this.state == 0) { this.state = 1; }
     }
 
+    /// 原始 64 位 LCG 状态推进（含符号位，可直接做哈希/噪声）。
     long NextRaw() {
         this.state =
             this.state * 6364136223846793005 + 1442695040888963407;
         return this.state;
     }
 
+    /// 非负 64 位随机数（0..2^63-1）。
     long Next() {
         long result = this.NextRaw();
         if (result < 0) { result = -result; }
@@ -153,23 +197,31 @@ class DeterministicRandom {
         return result;
     }
 
+    /// [0, bound) 的随机整数；bound≤0 返回 0。
     int NextBelow(int bound) {
         if (bound <= 0) { return 0; }
         long result = this.Next();
         return (int)(result - (result / bound) * bound);
     }
 
+    /// <summary>
+    /// [minimum, maximumExclusive) 的随机整数；
+    /// 上界不大于下界时恒返回 minimum。
+    /// </summary>
     int Between(int minimum, int maximumExclusive) {
         if (maximumExclusive <= minimum) { return minimum; }
         return minimum + this.NextBelow(maximumExclusive - minimum);
     }
 
+    /// [0,1) 的随机小数（精度 1e-6）。
     double NextDouble() {
         return (double)this.NextBelow(1000000) / 1000000.0;
     }
 
+    /// 当前 LCG 状态（存档这个值即可完整恢复序列）。
     long State() { return this.state; }
 
+    /// 恢复到指定状态（0 自动改为 1），后续序列与保存时一致。
     void Restore(long state) {
         this.state = state;
         if (this.state == 0) { this.state = 1; }

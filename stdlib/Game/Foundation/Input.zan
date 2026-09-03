@@ -2,6 +2,11 @@ using System;
 
 namespace Game.Foundation;
 
+/// <summary>
+/// 单个语义动作的运行时状态。pressed/released 是边沿标志：
+/// Set 只在按下的转换沿置位，之后保持锁存，直到 BeginFrame 清除，
+/// 因此每帧开头必须调用一次 BeginFrame 才能读到正确的边沿。
+/// </summary>
 class InputActionState {
     string name;
     bool down;
@@ -17,17 +22,31 @@ class InputActionState {
         this.amount = 0.0;
     }
 
+    /// <summary>动作名，即创建时的标识符。</summary>
     string Name() { return this.name; }
+
+    /// <summary>当前是否处于按住状态（持续为 true，非边沿）。</summary>
     bool Down() { return this.down; }
+
+    /// <summary>本帧内是否发生了按下动作；锁存直到 BeginFrame。</summary>
     bool Pressed() { return this.pressed; }
+
+    /// <summary>本帧内是否发生了抬起动作；锁存直到 BeginFrame。</summary>
     bool Released() { return this.released; }
+
+    /// <summary>模拟量强度（键盘按下为 1.0，抬起时清零）。</summary>
     double Value() { return this.amount; }
 
+    /// <summary>清除 pressed/released 边沿标志；每帧开头调用一次。</summary>
     void BeginFrame() {
         this.pressed = false;
         this.released = false;
     }
 
+    /// <summary>
+    /// 更新状态并做边沿检测：down 从 false 变 true 置 pressed，
+    /// 从 true 变 false 置 released 并将强度清零。
+    /// </summary>
     void Set(bool down, double amount) {
         if (down && !this.down) { this.pressed = true; }
         if (!down && this.down) { this.released = true; }
@@ -37,11 +56,13 @@ class InputActionState {
     }
 }
 
+/// <summary>一个"动作-按键"绑定项；用静态 Key 工厂创建。</summary>
 class InputBinding {
     string action;
     int key;
     bool down;
 
+    /// <summary>创建绑定：动作名 + 后端按键码。</summary>
     static InputBinding Key(string action, int key) {
         InputBinding binding = new InputBinding();
         binding.action = action;
@@ -50,9 +71,16 @@ class InputBinding {
         return binding;
     }
 
+    /// <summary>绑定的动作名。</summary>
     string Action() { return this.action; }
+
+    /// <summary>绑定的后端按键码。</summary>
     int KeyCode() { return this.key; }
+
+    /// <summary>该按键当前是否按住。</summary>
     bool Down() { return this.down; }
+
+    /// <summary>由 InputMap 内部更新；一般不必直接调用。</summary>
     void SetDown(bool down) { this.down = down; }
 }
 
@@ -69,6 +97,7 @@ class InputMap {
         this.bindings = new List<InputBinding>();
     }
 
+    /// <summary>动作的下标；不存在返回 -1。</summary>
     int ActionIndex(string name) {
         for (int i = 0; i < this.actions.Count; i = i + 1) {
             if (this.actions[i].Name() == name) { return i; }
@@ -76,6 +105,7 @@ class InputMap {
         return -1;
     }
 
+    /// <summary>取动作状态，不存在则先创建（首次查询即注册）。</summary>
     InputActionState EnsureAction(string name) {
         int index = this.ActionIndex(name);
         if (index >= 0) { return this.actions[index]; }
@@ -84,18 +114,24 @@ class InputMap {
         return state;
     }
 
+    /// <summary>绑定按键到动作，可链式调用；同名动作可绑定多个键。</summary>
     InputMap BindKey(string action, int key) {
         this.EnsureAction(action);
         this.bindings.Add(InputBinding.Key(action, key));
         return this;
     }
 
+    /// <summary>清除所有动作的 pressed/released 边沿；每帧开头调用。</summary>
     void BeginFrame() {
         for (int i = 0; i < this.actions.Count; i = i + 1) {
             this.actions[i].BeginFrame();
         }
     }
 
+    /// <summary>
+    /// 后端按键事件入口：key 变化时刷新其绑定的所有动作。
+    /// 多键绑定同一动作时任一键按住即视为按下（OR 逻辑）。
+    /// </summary>
     void ProcessKey(int key, bool down) {
         for (int i = 0; i < this.bindings.Count; i = i + 1) {
             InputBinding binding = this.bindings[i];
@@ -106,6 +142,7 @@ class InputMap {
         }
     }
 
+    /// <summary>按全部绑定重算动作状态；供 ProcessKey 内部调用。</summary>
     void RefreshAction(string action) {
         bool down = false;
         for (int i = 0; i < this.bindings.Count; i = i + 1) {
@@ -117,31 +154,40 @@ class InputMap {
         this.EnsureAction(action).Set(down, down ? 1.0 : 0.0);
     }
 
+    /// <summary>
+    /// 直接设置动作状态：触摸、手柄、AI 等非键盘输入的入口，
+    /// amount 为模拟量强度（键盘路径固定 1.0）。
+    /// </summary>
     void SetAction(string action, bool down, double amount) {
         this.EnsureAction(action).Set(down, amount);
     }
 
+    /// <summary>动作当前是否按住；未注册的动作返回 false。</summary>
     bool Down(string action) {
         int index = this.ActionIndex(action);
         return index >= 0 && this.actions[index].Down();
     }
 
+    /// <summary>动作本帧是否按下过（边沿，锁存到 BeginFrame）。</summary>
     bool Pressed(string action) {
         int index = this.ActionIndex(action);
         return index >= 0 && this.actions[index].Pressed();
     }
 
+    /// <summary>动作本帧是否抬起过（边沿，锁存到 BeginFrame）。</summary>
     bool Released(string action) {
         int index = this.ActionIndex(action);
         return index >= 0 && this.actions[index].Released();
     }
 
+    /// <summary>动作的模拟量强度；未注册的动作返回 0。</summary>
     double Value(string action) {
         int index = this.ActionIndex(action);
         if (index < 0) { return 0.0; }
         return this.actions[index].Value();
     }
 
+    /// <summary>清空全部输入：所有绑定与动作复位为未按下。</summary>
     void Clear() {
         int i = 0;
         for (; i < this.bindings.Count; i = i + 1) {
