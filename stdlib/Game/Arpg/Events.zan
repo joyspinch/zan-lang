@@ -2,6 +2,7 @@ using System;
 
 namespace Game.Arpg;
 
+// 系统事件委托：Engine 的 SDL 事件泵在对应时机回调。
 delegate bool ArpgStarting(string arguments);
 delegate void ArpgStarted();
 delegate bool ArpgClosing();
@@ -45,7 +46,12 @@ delegate void ArpgMapChanged(
     string currentMapId,
     int portalId);
 
-/// <summary>对应 DM3 App.lua 事件的类型化系统事件接口。</summary>
+/// <summary>
+/// 对应 DM3 App.lua 事件的类型化系统事件接口。每个事件都是
+/// 单播（后注册的 handler 覆盖前者），返回 bool 的事件未注册
+/// handler 时的默认值见各 Raise 方法。经 Engine.Events() 获取，
+/// 框架在主循环里自动触发，业务代码只注册 On*。
+/// </summary>
 class ArpgEvents {
     ArpgStarting starting;
     ArpgStarted started;
@@ -60,24 +66,41 @@ class ArpgEvents {
     ArpgRichTextLinkChanged richTextLink;
 
 
+    /// 启动前回调：返回 false 中止启动（Start 返回 false）。
     void OnStarting(ArpgStarting handler) { this.starting = handler; }
+    /// 启动完成后回调（窗口/渲染器已就绪）。
     void OnStarted(ArpgStarted handler) { this.started = handler; }
+    /// 用户请求关闭时回调：返回 false 否决关闭（窗口保持打开）。
     void OnClosing(ArpgClosing handler) { this.closing = handler; }
+    /// 窗口焦点变化；focused 为是否获得焦点。
     void OnFocusChanged(ArpgFocusChanged handler) { this.focusChanged = handler; }
+    /// 窗口状态变化：1=最小化 2=最大化 3=恢复。
     void OnWindowStateChanged(ArpgWindowStateChanged handler) {
         this.windowStateChanged = handler;
     }
+    /// 窗口尺寸变化（单位为窗口像素，非逻辑坐标）。
     void OnSizeChanged(ArpgSizeChanged handler) { this.sizeChanged = handler; }
+    /// 按下回调；keycode 为 SDL 键码，修饰键为独立 bool。开启
+    /// RepeatKeys 时连发也触发，否则只触发首次按下。
     void OnKeyDown(ArpgKeyChanged handler) { this.keyDown = handler; }
+    /// 抬起回调；参数同 OnKeyDown。
     void OnKeyUp(ArpgKeyChanged handler) { this.keyUp = handler; }
+    /// 菜单项激活回调（菜单名/项名/自定义载荷）。
     void OnMenuChanged(ArpgMenuChanged handler) { this.menuChanged = handler; }
+    /// <summary>
+    /// 系统提示回调（如背包已满、技能冷却中）。code 为提示类别，
+    /// message 为英文说明。返回 true 表示业务已处理，框架不再
+    /// 弹默认提示；未注册 handler 时返回 false（走默认提示）。
+    /// </summary>
     void OnSystemPrompt(ArpgSystemPrompt handler) {
         this.systemPrompt = handler;
     }
+    /// 富文本链接点击回调（窗口 Id/控件 Id/链接原文）。
     void OnRichTextLink(ArpgRichTextLinkChanged handler) {
         this.richTextLink = handler;
     }
 
+    /// 触发启动回调；未注册时返回 true（允许启动）。
     bool RaiseStarting(string arguments) {
         ArpgStarting handler = this.starting;
         if (handler == null) { return true; }
@@ -127,6 +150,7 @@ class ArpgEvents {
         }
     }
 
+    /// 触发系统提示；未注册时返回 false（走默认提示路径）。
     bool RaiseSystemPrompt(int code, string message) {
         ArpgSystemPrompt handler = this.systemPrompt;
         if (handler == null) { return false; }
@@ -143,7 +167,11 @@ class ArpgEvents {
     }
 }
 
-/// <summary>类型化运行时发出的游戏玩法事件。</summary>
+/// <summary>
+/// 类型化运行时发出的游戏玩法事件（物品增减/使用、技能结算、
+/// buff 变化、伤害与死亡、切图）。同样单播，框架在世界更新时
+/// 自动触发；经 Engine.GameplayEvents() 获取。
+/// </summary>
 class ArpgGameplayEvents {
     ArpgItemChanged itemChanged;
     ArpgItemUsed itemUsed;
@@ -234,10 +262,15 @@ class ArpgGameplayEvents {
 // 单个定时任务：名称、载荷、触发间隔、累计时间、
 // 一次性标志与回调。用单个实体代替六个平行列表。
 class ArpgTimerTask {
+    /// 任务名（同一调度器内唯一，重名 Add 会先移除旧任务）。
     string name;
+    /// 透传给回调的不透明载荷。
     string payload;
+    /// 触发间隔毫秒（构造时钳制到 ≥1）。
     int interval;
+    /// 已累计的毫秒数（Tick 累加，触发后扣掉一个间隔）。
     int elapsed;
+    /// 是否一次性（触发后自动移除）。
     bool oneShot;
     ArpgTimedEvent handler;
 
@@ -263,6 +296,11 @@ class ArpgScheduler {
         this.tasks = new List<ArpgTimerTask>();
     }
 
+    /// <summary>
+    /// 注册具名定时事件：delayMilliseconds 后触发 handler；
+    /// autoRemove=true 触发一次后移除，false 则按间隔循环。
+    /// 同名任务先移除再注册（天然去重）。间隔最小为 1ms。
+    /// </summary>
     void Add(
         string name,
         string payload,
@@ -275,6 +313,7 @@ class ArpgScheduler {
             ArpgMath.Max(1, delayMilliseconds), autoRemove, handler));
     }
 
+    /// 按名移除任务（删掉全部同名项），删到了返回 true。
     bool Remove(string name) {
         int i = this.tasks.Count - 1;
         bool removed = false;
@@ -288,12 +327,15 @@ class ArpgScheduler {
         return removed;
     }
 
+    /// 是否存在同名任务。
     bool Contains(string name) {
         return this.IndexOf(name) >= 0;
     }
 
+    /// 当前任务数。
     int Count() { return this.tasks.Count; }
 
+    /// 第一个同名任务的下标；没有返回 -1。
     int IndexOf(string name) {
         for (int i = 0; i < this.tasks.Count; i = i + 1) {
             if (this.tasks[i].name == name) { return i; }
@@ -301,6 +343,11 @@ class ArpgScheduler {
         return -1;
     }
 
+    /// <summary>
+    /// 推进全部任务 elapsed 并触发到期的：回调参数依次为任务名、
+    /// 载荷、本次帧间隔毫秒、累计毫秒。回调可安全移除/替换自身
+    /// （框架先快照任务列表再逐个触发）。返回本次触发的任务数。
+    /// </summary>
     int Tick(int deltaMilliseconds) {
         if (deltaMilliseconds <= 0) { return 0; }
         List<string> pending = new List<string>();
