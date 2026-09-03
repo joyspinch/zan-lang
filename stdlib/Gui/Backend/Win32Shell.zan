@@ -13,6 +13,8 @@ delegate int SetWinCompAttrFn(nint hwnd, nint data);
 delegate int DwmIsCompFn(nint outEnabled);
 /// SetProcessDpiAwareness (Shcore) / SetProcessDPIAware (user32) 回退方案。
 delegate int SetProcessDpiAwarenessFn(int level);
+/// SetProcessDPIAware（user32，Vista+）：Shcore 不存在时的
+/// 系统 DPI 感知回退。
 delegate int SetProcessDpiAwareFn();
 
 /// <summary>
@@ -597,6 +599,11 @@ class Win32Shell {
     /// 注册尺寸循环就地重绘回调（窗口拖动/缩放期间保持画面）。
     static void SetSizePaint(SizePaintBody body) { Win32Shell.sizePaint = body; }
 
+    /// 窗口过程：把 Win32 消息翻译成事件六元组投进队列（见 Post），
+    /// 并承载无边框外壳的全部平台行为——WM_NCHITTEST 命中测试、
+    /// WM_SIZE/WM_PAINT 呈现、IME 重定位、文件拖放、模态尺寸循环
+    /// 与最小尺寸约束；未识别的消息交给 DefWindowProcW。
+    /// 经护栏包装注册（见 Init），单条消息内的硬故障只丢这条消息。
     static nint OnMessage(nint hwnd, int msg, nint wp, nint lp) {
         Win32Shell.eventHwnd = hwnd;
         if (msg == 0x007C && wp == (nint)(0 - 20)
@@ -881,6 +888,8 @@ class Win32Shell {
         return false;
     }
 
+    /// 窗口处于最大化（GetWindowPlacement 的 showCmd 为 SW_SHOWMAXIMIZED）
+    /// 时为 true；查询失败为 false。
     static bool IsMaximized(nint hwnd) {
         nint wpl = NativeMemory.Alloc(48);
         NativeMemory.Fill(wpl, 0, 48);
@@ -893,6 +902,9 @@ class Win32Shell {
 
     // ---- IME ----------------------------------------------------------------
 
+    /// 把 IME 组合窗口与候选窗定位到最近 SetImePos 记录的客户端
+    /// 坐标（CFS_POINT + CFS_CANDIDATEPOS）；窗口没有输入上下文时
+    /// 空操作。由 WM_IME_* 消息与 SetImePos 触发。
     static void ImeReposition(nint hwnd) {
         nint imc = Win32Shell.ImmGetContext(hwnd);
         if (imc == 0) { return; }
@@ -912,6 +924,8 @@ class Win32Shell {
         Win32Shell.ImmReleaseContext(hwnd, imc);
     }
 
+    /// 记录输入光标的客户端坐标 (x, y) 并立即对当前事件窗口
+    /// 重定位 IME；此后每次 WM_IME_* 消息都按该坐标重定位。
     static void SetImePos(int x, int y) {
         Win32Shell.Init();
         Win32Shell.imeX = x;
@@ -923,6 +937,7 @@ class Win32Shell {
 
     // ---- 呈现 -------------------------------------------------------
 
+    /// `hwnd` 最近一次 Present 使用的表面 id；从未呈现过返回 -1。
     static int SurfaceOf(nint hwnd) {
         for (int i = 0; i < Win32Shell.surfHwnd.Count; i = i + 1) {
             if (Win32Shell.surfHwnd[i] == hwnd) { return Win32Shell.surfId[i]; }
@@ -930,6 +945,8 @@ class Win32Shell {
         return 0 - 1;
     }
 
+    /// 记录 `hwnd` 与其当前表面 id 的对应关系，使 WM_PAINT/WM_SIZE
+    /// 重绘属于本窗口的帧，而非最后呈现的那个窗口的帧。
     static void RememberSurface(nint hwnd, int surface) {
         for (int i = 0; i < Win32Shell.surfHwnd.Count; i = i + 1) {
             if (Win32Shell.surfHwnd[i] == hwnd) {
@@ -952,6 +969,12 @@ class Win32Shell {
         new Span<short>(bi + 14, 1)[0] = 32;
     }
 
+    /// 把表面像素呈现到窗口：客户区不大于表面时优先 GPU 直通；
+    /// 玻璃（分层）窗口走 PresentLayered；否则经 zan_gui_gdi_present
+    /// 上传——有本窗口声明的脏矩形按矩形上传，应用声明整窗
+    /// （PresentFull）、WM_PAINT 或窗口大于表面时强制整窗，其余走
+    /// 瓦片差分。表面还没画过任何帧时丢弃脏矩形等应用画完；
+    /// 窗口比表面大的部分用 bgColor（SetBackground）补边。
     static void Blit(nint hwnd, int surface) {
         nint pixels = Win32Shell.zan_gui_get_pixels(surface);
         if (pixels == 0) { return; }
@@ -1239,6 +1262,10 @@ class Win32Shell {
         Win32Shell.ReleaseDC(0, screenDc);
     }
 
+    /// 调用未文档化的 SetWindowCompositionAttribute 设置亚克力
+    /// accent 策略：`state` 为 accent 状态（4 = 启用 Acrylic，
+    /// 3 = 模态尺寸循环中的过渡态，0 = 关闭），`tintArgb` 为 ARGB
+    /// 着色。入口不存在（Win7）时空操作。
     static void AcrylicApply(nint hwnd, int state, int tintArgb) {
         nint fn = Interop.Entry("user32.dll", "SetWindowCompositionAttribute");
         if (fn == 0) { return; }
@@ -1263,6 +1290,12 @@ class Win32Shell {
 
     // ---- 公开外壳 API ---------------------------------------------------
 
+    /// 创建一个无边框顶层窗口并返回其句柄（失败返回 0）。
+    /// width/height 为 96 DPI 逻辑像素，按显示器 DPI 放大，上限夹到
+    /// 所在显示器工作区的 82%，下限只保证画得下标题栏；首个窗口
+    /// 居中并成为主框架，后续窗口归主框架所有并在其上方居中。
+    /// 窗口接受文件拖放（WM_DROPFILES），并带 1px DWM 框架扩展以
+    /// 恢复系统投影与圆角。
     static nint CreateWindow(string title, int width, int height) {
         Win32Shell.Init();
         nint screenDc = Win32Shell.GetDC(0);
@@ -1371,6 +1404,8 @@ class Win32Shell {
         return ok != 0;
     }
 
+    /// 把窗口居中到所在显示器工作区（不会小于工作区左上角）。
+    /// 成功返回 true；取不到窗口矩形或工作区时返回 false。
     static bool CenterWindow(nint hwnd) {
         nint wr = NativeMemory.Alloc(16);
         if (Win32Shell.GetWindowRect(hwnd, wr) == 0) {
@@ -1433,11 +1468,14 @@ class Win32Shell {
         Win32Shell.SetFocus(hwnd);
     }
 
+    /// 把窗口左上角移动到屏幕工作区坐标 (x, y)，不改尺寸与
+    /// Z 序；hwnd 为 0 时空操作。
     static void SetWindowPosition(nint hwnd, int x, int y) {
         if (hwnd == 0) { return; }
         Win32Shell.SetWindowPos(hwnd, 0, x, y, 0, 0, 1 | 4 | 16);
     }
 
+    /// 最小化窗口（SW_MINIMIZE）。
     static void Minimize(nint hwnd) { Win32Shell.ShowWindow(hwnd, 6); }
 
     /// 最大/还原切换（SW_MAXIMIZE 3 / SW_RESTORE 9）。
@@ -1449,10 +1487,15 @@ class Win32Shell {
         }
     }
 
+    /// 投递 WM_CLOSE：走正常关闭流程——窗口过程把它翻译成
+    /// kind-8 事件，是否真正销毁由应用决定（见 Destroy）。
     static void CloseWindow(nint hwnd) {
         Win32Shell.PostMessageW(hwnd, 16, 0, 0);   // WM_CLOSE
     }
 
+    /// 彻底拆除窗口：清理标题按钮/工具窗口登记，释放光栅化器与
+    /// GDI 呈现阴影挂在该句柄上的资源，再销毁 OS 窗口（触发
+    /// WM_DESTROY → kind-8 事件）。
     static void Destroy(nint hwnd) {
         Win32Shell.ForgetCaptionButtons(hwnd);
         Win32Shell.zan_gui_release_window(hwnd);
@@ -1460,24 +1503,30 @@ class Win32Shell {
         Win32Shell.DestroyWindow(hwnd);
     }
 
+    /// 窗口是否最大化（IsMaximized 的公开别名）。
     static bool Maximized(nint hwnd) { return Win32Shell.IsMaximized(hwnd); }
 
+    /// 窗口任意部分可见（未最小化且 IsWindowVisible）时为 true。
     static bool Visible(nint hwnd) {
         if (Win32Shell.IsIconic(hwnd) != 0) { return false; }
         return Win32Shell.IsWindowVisible(hwnd) != 0;
     }
 
+    /// 窗口是前台窗口（持有键盘焦点）时为 true；hwnd 为 0 恒为 false。
     static bool Focused(nint hwnd) {
         if (hwnd == 0) { return false; }
         return Win32Shell.GetForegroundWindow() == hwnd;
     }
 
+    /// 置顶（HWND_TOPMOST）/取消置顶（HWND_NOTOPMOST），
+    /// 不改位置、尺寸与激活状态。
     static void SetTopmost(nint hwnd, bool on) {
         nint after = 0 - 2;                        // HWND_NOTOPMOST
         if (on) { after = 0 - 1; }                 // HWND_TOPMOST
         Win32Shell.SetWindowPos(hwnd, after, 0, 0, 0, 0, 2 | 1 | 16);
     }
 
+    /// 设置 OS 窗口标题（任务栏 / Alt-Tab 显示的文本）。
     static void SetTitle(nint hwnd, string title) {
         nint wtitle = Wide.Of(title);
         Win32Shell.SetWindowTextW(hwnd, wtitle);
@@ -1502,6 +1551,9 @@ class Win32Shell {
         return true;
     }
 
+    /// 登记窗口是否允许用户改变尺寸；false 时 WM_NCHITTEST 不再
+    /// 报告边缘/角手柄，双击标题栏与 SC_MAXIMIZE/SC_SIZE 也被吞掉。
+    /// 重复设置同值无副作用。
     static void SetResizable(nint hwnd, bool on) {
         Win32Shell.Init();
         List<nint> keep = new List<nint>();
@@ -1551,6 +1603,9 @@ class Win32Shell {
         return false;
     }
 
+    /// 为窗口登记客户区自绘标题按钮数（0..8，越界忽略），
+    /// WM_NCHITTEST 据此在标题栏右侧保留条带（未登记默认 5，
+    /// 见 CaptionButtonsOf）。
     static void SetCaptionButtons(nint hwnd, int count) {
         Win32Shell.Init();
         if (count < 0 || count > 8) { return; }
@@ -1581,16 +1636,19 @@ class Win32Shell {
         }
     }
 
+    /// 自绘标题栏保留高度（设备像素，按 DPI 缩放，默认 32@96）。
     static int TitlebarHeight() {
         Win32Shell.Init();
         return Win32Shell.titlebarH;
     }
 
+    /// 单个标题按钮的保留宽度（设备像素，默认 46@96）。
     static int CaptionButtonWidth() {
         Win32Shell.Init();
         return Win32Shell.buttonW;
     }
 
+    /// 窗口客户区宽（设备像素）；hwnd 为 0 或查询失败返回 0。
     static int ClientWidth(nint hwnd) {
         if (hwnd == 0) { return 0; }
         nint rc = Win32Shell.scratchRect;
@@ -1598,6 +1656,7 @@ class Win32Shell {
         return Win32Shell.S32(rc, 8) - Win32Shell.S32(rc, 0);
     }
 
+    /// 窗口客户区高（设备像素）；hwnd 为 0 或查询失败返回 0。
     static int ClientHeight(nint hwnd) {
         if (hwnd == 0) { return 0; }
         nint rc = Win32Shell.scratchRect;
@@ -1605,9 +1664,15 @@ class Win32Shell {
         return Win32Shell.S32(rc, 12) - Win32Shell.S32(rc, 4);
     }
 
+    /// 最近一次 WM_SIZE 上报的窗口客户区宽（设备像素）。外壳全局
+    /// 只记一个“当前窗口”，多窗口时以最后调整者为准；按句柄精确
+    /// 查询用 ClientWidth。
     static int WindowWidth() { return Win32Shell.windowWidth; }
+    /// 最近一次 WM_SIZE 上报的窗口客户区高（设备像素），同 WindowWidth。
     static int WindowHeight() { return Win32Shell.windowHeight; }
 
+    /// 设置鼠标光标形状：0 默认箭头，1 手型，2 I-beam（文本），
+    /// 3/4 水平/垂直缩放，5 十字，6 四向移动，7/8 两种对角缩放。
     static void SetCursorShape(int kind) {
         int id = 32512;
         if (kind == 1) { id = 32649; }             // 手型
@@ -1677,6 +1742,10 @@ class Win32Shell {
         return cleaned;
     }
 
+    /// 启用系统亚克力玻璃并把窗口转入分层呈现路径：此后 Present
+    /// 经 PresentLayered 预乘 alpha 交给 DWM 合成模糊。`tintArgb`
+    /// 为 ARGB 着色。宿主原生子窗口的窗口保持 GDI 呈现，仅设置
+    /// accent（分层窗的 ULW 呈现不合成子 HWND）。
     static void EnableGlass(nint hwnd, int tintArgb) {
         Win32Shell.Init();
         if (hwnd == 0) { return; }
@@ -1700,6 +1769,8 @@ class Win32Shell {
         if (own >= 0) { Win32Shell.PresentLayered(hwnd, own); }
     }
 
+    /// 关闭亚克力 accent（状态 0）并摘掉 WS_EX_LAYERED，恢复普通
+    /// GDI/直通呈现；hwnd 为 0 时空操作。
     static void DisableGlass(nint hwnd) {
         Win32Shell.Init();
         if (hwnd == 0) { return; }
@@ -1709,6 +1780,11 @@ class Win32Shell {
         Win32Shell.glassOn = false;
     }
 
+    /// 设置整窗不透明度：percent 钳制到 10..100（100 = 不透明），
+    /// 经 SetLayeredWindowAttributes 实现，因此窗口必须分层；
+    /// percent 为 100 且未开玻璃时恢复不透明并摘掉分层位。
+    /// 宿主原生子窗口的窗口不支持（分层会连子窗口一起藏掉），
+    /// 空操作。
     static void SetOpacity(nint hwnd, int percent) {
         Win32Shell.Init();
         if (hwnd == 0) { return; }
@@ -2039,6 +2115,9 @@ class Win32Shell {
         return mask;
     }
 
+    /// 呈现一帧：登记 hwnd 与 surface 的对应关系并记住 lastSurface
+    /// 后，异形窗口走 PresentLayered（逐像素 alpha 合成），普通
+    /// 窗口走 Blit。表面尚无像素时忽略。
     static void Present(nint hwnd, int surface) {
         Win32Shell.Init();
         if (Win32Shell.zan_gui_get_pixels(surface) == 0) { return; }
@@ -2054,6 +2133,10 @@ class Win32Shell {
         }
     }
 
+    /// 为 `hwnd` 的下一次呈现声明一个脏矩形（客户端像素）；
+    /// w/h <= 0 忽略，超过 2048 个后置溢出标志（该窗口下次整窗
+    /// 上传）。声明同一时刻只属于一个窗口：换窗口声明时，旧窗口
+    /// 未上传的矩形记入欠账（NoteDirtyLost），它下次整窗补齐。
     static void PresentDirty(nint hwnd, int x, int y, int w, int h) {
         Win32Shell.Init();
         if (w <= 0 || h <= 0) { return; }
@@ -2115,6 +2198,8 @@ class Win32Shell {
 
     // ---- 事件循环 ---------------------------------------------------------
 
+    /// 清空当前事件槽为“无事件”状态（kind 0，句柄 0）。
+    /// 每次 PollEvent/WaitEvent 取事件前调用。
     static void ClearEvent() {
         Win32Shell.hasEvent = false;
         Win32Shell.evHwnd = 0;
@@ -2171,6 +2256,10 @@ class Win32Shell {
         return true;
     }
 
+    /// 不阻塞取事件：优先自动化注入队列，再是窗口过程队列，最后
+    /// 泵尽线程队列里的全部 Win32 消息（其间窗口过程会补充事件）。
+    /// 返回 0 = 取到事件（EventKindValue 等读取）、1 = 无事件、
+    /// -1 = WM_QUIT。
     static int PollEvent() {
         Win32Shell.Init();
         Win32Shell.ClearEvent();
@@ -2187,6 +2276,8 @@ class Win32Shell {
         return 1;
     }
 
+    /// 阻塞直到下一个消息到达（GetMessageW，内核空闲）。
+    /// 返回 0 = 取到事件、-1 = WM_QUIT 或错误。
     static int WaitEvent() {
         Win32Shell.Init();
         Win32Shell.ClearEvent();
@@ -2200,6 +2291,9 @@ class Win32Shell {
         return 0;
     }
 
+    /// 阻塞到事件到达或 `ms` 毫秒过去（PeekMessage + 
+    /// MsgWaitForMultipleObjects，内核空闲）。返回 0 = 取到事件、
+    /// 1 = 超时、-1 = 退出；ms < 0 按 0。
     static int WaitEventTimeout(int ms) {
         Win32Shell.Init();
         Win32Shell.ClearEvent();
@@ -2225,6 +2319,8 @@ class Win32Shell {
         return 1;
     }
 
+    /// 向主窗口投递 WM_NULL，唤醒阻塞在消息等待中的 UI 线程
+    /// （App.Post 从任意线程调用）。
     static void Wake() {
         Win32Shell.Init();
         if (Win32Shell.mainHwnd != 0) {
@@ -2232,6 +2328,9 @@ class Win32Shell {
         }
     }
 
+    /// 把一个合成事件排队（临界区保护，可从任意线程调用），编码
+    /// 与窗口过程 Post 的事件六元组一致；hwnd 为 0 时投给主窗口。
+    /// 入队后 Wake 主线程。
     static void InjectEvent(nint hwnd, int kind, int x, int y, int button,
                             int keycode, int mods) {
         Win32Shell.Init();
@@ -2247,6 +2346,7 @@ class Win32Shell {
         Win32Shell.Wake();
     }
 
+    /// 尚未被取走的合成事件数量。
     static int InjectPending() {
         Win32Shell.Init();
         Win32Shell.EnterCriticalSection(Win32Shell.injectCs);
@@ -2255,13 +2355,23 @@ class Win32Shell {
         return n;
     }
 
+    /// 最近取出事件的类型（EventKind 编码）。
     static int EventKindValue() { return Win32Shell.evKind; }
+    /// 事件单调序号：每取到一个新事件 +1，没有新事件保持不变，
+    /// 用于区分“新事件”与“陈旧回读”。
     static long EventSeqValue() { return Win32Shell.evSeq; }
+    /// 最近事件 X（客户端像素；键盘类为 0）。
     static int EventXValue() { return Win32Shell.evX; }
+    /// 最近事件 Y（客户端像素；键盘类为 0）。
     static int EventYValue() { return Win32Shell.evY; }
+    /// 最近事件的鼠标键：0 左键、1 右键；非鼠标事件为 0。
     static int EventButtonValue() { return Win32Shell.evButton; }
+    /// 最近事件的键码：KeyDown/KeyUp 为虚拟键码，WM_CHAR 为字符码，
+    /// 滚轮为滚动 delta。
     static int EventKeyCodeValue() { return Win32Shell.evKeyCode; }
+    /// 最近事件按下时的修饰键组合（1 Ctrl、2 Shift、4 Alt）。
     static int EventModsValue() { return Win32Shell.evMods; }
+    /// 最近取出事件所属的窗口句柄（Post 时记录；无事件为 0）。
     static nint EventWindow() { return Win32Shell.evHwnd; }
 
     /// 窗口过程当前正在处理的消息所属的窗口。与 EventWindow()
@@ -2305,6 +2415,7 @@ class Win32Shell {
         return (int)us;
     }
 
+    /// 让调用线程休眠 `ms` 毫秒；ms <= 0 不休眠。
     static void Sleep(int ms) {
         if (ms > 0) { Win32Shell.SleepW(ms); }
     }
@@ -2327,6 +2438,9 @@ class Win32Shell {
         return false;
     }
 
+    /// 把 UTF-16 文本以 CF_UNICODETEXT（GMEM_MOVEABLE）放入剪贴板：
+    /// 成功后内存所有权归剪贴板；打不开剪贴板（被其他进程占用）时
+    /// 短暂重试，仍失败返回 false。
     static bool SetClipboard(string text) {
         Win32Shell.Init();
         nint wide = Wide.Of(text);
@@ -2357,6 +2471,8 @@ class Win32Shell {
         return true;
     }
 
+    /// 读取剪贴板 CF_UNICODETEXT 文本；格式不存在、打不开剪贴板
+    /// 或取不到数据时返回 ""。
     static string GetClipboard() {
         Win32Shell.Init();
         if (Win32Shell.IsClipboardFormatAvailable(13) == 0) { return ""; }
