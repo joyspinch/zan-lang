@@ -1,0 +1,296 @@
+using System;
+using System.Collections;
+using System.Data;
+using System.Data.Excel;
+using System.Text;
+using System.Web;
+using ZanWeb.Model.Oa;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb;
+
+/* 列规则：一个模板列的校验声明。kind 0 文本 / 1 整数 / 2 金额（长整数，
+   分）。用静态构造器声明：FieldRule.Text/Int/Money；required 的列空值
+   报错，maxLen=0 不限长。 */
+class FieldRule {
+    string name;
+    bool required;
+    int kind;
+    int maxLen;
+
+    static FieldRule Text(string name, bool required, int maxLen) {
+        FieldRule r = new FieldRule();
+        r.name = name;
+        r.required = required;
+        r.kind = 0;
+        r.maxLen = maxLen;
+        return r;
+    }
+
+    static FieldRule Num(string name, bool required, int kind) {
+        FieldRule r = new FieldRule();
+        r.name = name;
+        r.required = required;
+        r.kind = kind;
+        r.maxLen = 0;
+        return r;
+    }
+
+    string Name() { return name; }
+
+    bool Required() { return required; }
+
+    int Kind() { return kind; }
+
+    int MaxLen() { return maxLen; }
+}
+
+/* 行处理器：拿到已过列校验的一行（recKeys/recVals 平行表，键=模板列
+   名、值=单元格文本缺列补空串；取值用 ExcelIo.Rec 线性扫描）。业务侧
+   在此完成查重、外键解析与插入；返回 null/""=成功，非空=错误文本
+   （约定 "字段=消息" 格式，无 "=" 时字段记空——见 ExcelIo.Import）。
+   重要约定 1：handler 必须是同步函数（内部用同步 ORM：Count() /
+   ExecuteAffrows()），不得 await——async delegate 的续体在"await 之后
+   携带非空返回值提前结束"路径上触发空指针崩溃（zan_crash.log 取证 +
+   DWARF 定位 ExcelIoSmoke_SaveCustomer$resume，已记入偏差）。
+   重要约定 2：行数据不用 Dict 承载——Dict<string,string> 在 Import
+   特定校验分支组合下出现内部指针为 null 的空指针崩溃（梯度二分取证：
+   1~4 条规则稳定、同内容 5 条规则崩溃；故障指令 mov rax,[rax] rax=0，
+   行级定位 TestIo.zan 处理器首条 TryGetValue），平行 List 全程稳定，
+   故改为键值平行表 + Rec 线性扫描（列数 ≤20，开销可忽略）。 */
+delegate string ImportRow(IDbConnection db, int tenantId, User me,
+                          List<string> recKeys, List<string> recVals);
+
+/* 导入导出公共层（架构 §2.6 WP-6 / T6）：全站唯一的表格进出入口。
+   导出 CSV（Csv.Serialize）与 XLSX（XlsxBook，stdlib 仅写侧）双格式；
+   导入仅 CSV（一期，XLSX 无读侧）——表头按模板列名映射、列校验
+   （FieldRule）+ 行处理器（ImportRow）、每 500 行一个事务提交
+   （SQLite 写锁粒度对策）、行级错误跳过不回滚好行，报告落
+   oa_import_batch。
+   偏差记录：架构草图的 ExportSource delegate（流式供行）收敛为调用方
+   直传 rows——Zan 无闭包，delegate 方法组需把 db/me/sc/q 全部显式穿参，
+   一期万行内全量 List 内存可承受（XlsxBook.FromText 本身也是全量）。 */
+class ExcelIo {
+    /* 每批行数：SQLite 写锁持有时间与批次大小的折中。 */
+    static int BATCH = 500;
+
+    /* 错误报告上限：超出部分丢弃计数，防 errors 列膨胀。 */
+    static int ERR_KEEP = 200;
+
+    /* 导出下载：headers 表头 + rows 数据行（不含表头）。xlsx=false 走
+       CSV（Excel/WPS 直接打开）；true 走 XLSX（表头加粗+冻结首行）。
+       ctx.Binary 是二进制应答唯一正确通道（NUL 安全）。 */
+    static async void Download(HttpContext ctx, string name,
+                               List<string> headers, List<List<string>> rows,
+                               bool xlsx) {
+        List<List<string>> all = new List<List<string>>();
+        all.Add(headers);
+        for (int i = 0; i < rows.Count; i = i + 1) { all.Add(rows[i]); }
+        if (xlsx) {
+            byte[] data = XlsxBook.FromText(all, true).SaveToBytes();
+            ctx.SetHeader("Content-Disposition",
+                "attachment; filename=\"" + name + ".xlsx\"");
+            ctx.Binary("application/vnd.openxmlformats-officedocument"
+                + ".spreadsheetml.sheet", data, data.Length);
+            return;
+        }
+        string csv = Csv.Serialize(all);
+        byte[] body = csv.ToBytes();
+        ctx.SetHeader("Content-Disposition",
+            "attachment; filename=\"" + name + ".csv\"");
+        ctx.Binary("text/csv; charset=utf-8", body, body.Length);
+    }
+
+    /* CSV 模板下载：一行表头 + 一行示例（示例行帮用户对齐格式）。 */
+    static async void Template(HttpContext ctx, string name,
+                               List<string> headers, List<string> sample) {
+        List<List<string>> all = new List<List<string>>();
+        all.Add(headers);
+        if (sample != null) { all.Add(sample); }
+        string csv = Csv.Serialize(all);
+        byte[] body = csv.ToBytes();
+        ctx.SetHeader("Content-Disposition",
+            "attachment; filename=\"" + name + "-模板.csv\"");
+        ctx.Binary("text/csv; charset=utf-8", body, body.Length);
+    }
+
+    /* 导入主流程：校验 -> 分批事务 -> 报告落库。返回批次行 id。
+       dataRows[0] 为文件表头行、数据自 index 1 起（控制器把 Csv.Parse
+       结果整包传入）；表头按列名映射（顺序无关、未识别列忽略），
+       必填模板列缺失视为整个文件无效——此时也落一行 fail=全量的
+       批次报告，便于前端展示原因。
+       事务约定：ImportRow 处理器不得抛异常——业务错误一律以返回值
+       报告；因此批事务只 Commit 不 Rollback（好行入库、错行跳过）。 */
+    static async int Import(IDbConnection db, int tenantId, User me,
+                            string module, string fileName,
+                            List<string> headers, List<FieldRule> rules,
+                            List<List<string>> dataRows, ImportRow handler) {
+        long now = WebApp.NowSeconds();
+        int ok = 0;
+        int fail = 0;
+        List<string> errs = new List<string>();
+
+        /* 列映射：规则 -> 数据表头列位（平行 List，不用 Dict，见
+           ImportRow 注记约定 2）。colIdx[i] = 模板列 rules[i] 在文件
+           表头中的列位，-1 = 缺列。 */
+        List<int> colIdx = new List<int>();
+        for (int i = 0; i < rules.Count; i = i + 1) {
+            colIdx.Add(0 - 1);
+        }
+        if (dataRows.Count > 0) {
+            List<string> head = dataRows[0];
+            for (int c = 0; c < head.Count; c = c + 1) {
+                string cn = head[c].Trim();
+                for (int i = 0; i < rules.Count; i = i + 1) {
+                    if (colIdx[i] < 0 && rules[i].Name() == cn) {
+                        colIdx[i] = c;
+                    }
+                }
+            }
+        }
+
+        /* 必填模板列是否都在数据表头里（首行即表头）。 */
+        string missing = "";
+        for (int i = 0; i < rules.Count; i = i + 1) {
+            FieldRule r = rules[i];
+            if (r.Required() && colIdx[i] < 0) {
+                missing = missing.Length == 0 ? r.Name()
+                    : missing + "," + r.Name();
+            }
+        }
+        if (missing.Length > 0) {
+            fail = dataRows.Count > 0 ? dataRows.Count - 1 : 0;
+            errs.Add(ExcelIo.ErrJson(1, "", "表头缺少必填列：" + missing));
+        }
+
+        int batchLeft = 0;
+        for (int i = 1; i < dataRows.Count; i = i + 1) {
+            int rowNo = i + 1;   /* 含表头的 1-based 行号，对齐 Excel */
+            List<string> cells = dataRows[i];
+
+            /* 取列值 + 通用列校验（平行表：keys/vals 每行重建）。 */
+            List<string> keys = new List<string>();
+            List<string> vals = new List<string>();
+            string bad = "";
+            for (int r = 0; r < rules.Count && bad.Length == 0; r = r + 1) {
+                FieldRule ru = rules[r];
+                int at = colIdx[r];
+                string v = "";
+                if (at >= 0 && at < cells.Count) {
+                    v = cells[at].Trim();
+                }
+                if (ru.Required() && v.Length == 0) {
+                    bad = ExcelIo.ErrJson(rowNo, ru.Name(), "不能为空");
+                }
+                else if (v.Length > 0) {
+                    if (ru.Kind() == 1 && !ExcelIo.IsInt(v)) {
+                        bad = ExcelIo.ErrJson(rowNo, ru.Name(),
+                            "需为整数：" + v);
+                    }
+                    else if (ru.Kind() == 2 && !ExcelIo.IsInt(v)) {
+                        bad = ExcelIo.ErrJson(rowNo, ru.Name(),
+                            "需为金额（数字，单位分）：" + v);
+                    }
+                    else if (ru.MaxLen() > 0 && v.Length > ru.MaxLen()) {
+                        bad = ExcelIo.ErrJson(rowNo, ru.Name(),
+                            "超过 " + Convert.ToString(ru.MaxLen()) + " 字");
+                    }
+                }
+                keys.Add(ru.Name());
+                vals.Add(v);
+            }
+
+            /* 错行跳过不回滚好行；不用 continue 包结构（async 状态机
+               缺陷规避，同上）。 */
+            if (bad.Length > 0) {
+                fail = fail + 1;
+                if (errs.Count < ExcelIo.ERR_KEEP) { errs.Add(bad); }
+            } else {
+                /* 批事务：每 BATCH 行一个事务，行级业务错误跳过不回滚。 */
+                if (batchLeft == 0) {
+                    db.BeginTransaction();
+                }
+                /* 同步调用 handler（见 ImportRow 注：async delegate
+                   续体缺陷规避）。handler 不抛异常的约定不变。 */
+                string rowErr = handler(db, tenantId, me, keys, vals);
+                if (rowErr != null && rowErr.Length > 0) {
+                    int eq = rowErr.IndexOf("=");
+                    string f = eq > 0 ? rowErr.Substring(0, eq) : "";
+                    string m = eq > 0 ? rowErr.Substring(eq + 1) : rowErr;
+                    fail = fail + 1;
+                    if (errs.Count < ExcelIo.ERR_KEEP) {
+                        errs.Add(ExcelIo.ErrJson(rowNo, f, m));
+                    }
+                } else {
+                    ok = ok + 1;
+                }
+                batchLeft = batchLeft + 1;
+                if (batchLeft >= ExcelIo.BATCH) {
+                    db.Commit();
+                    batchLeft = 0;
+                }
+            }
+        }
+        if (batchLeft > 0) { db.Commit(); }
+
+        /* 批次报告落库。 */
+        string errJson = "[";
+        for (int i = 0; i < errs.Count; i = i + 1) {
+            if (i > 0) { errJson = errJson + ","; }
+            errJson = errJson + errs[i];
+        }
+        errJson = errJson + "]";
+        OaImportBatch b = new OaImportBatch();
+        b.tenantId = tenantId;
+        b.module = module;
+        b.fileName = Fmt.Text(fileName, "");
+        b.total = dataRows.Count > 0 ? dataRows.Count - 1 : 0;
+        b.ok = ok;
+        b.fail = fail;
+        b.errors = errJson;
+        b.operatorId = me != null ? me.id : 0;
+        b.createdAt = now;
+        return await db.Insert<OaImportBatch>(b).ExecuteIdentityAsync();
+    }
+
+    /* 行数据取值：平行表线性扫描（键即模板列名，缺列值为空串）。 */
+    static string Rec(List<string> keys, List<string> vals, string key) {
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            if (keys[i] == key) { return vals[i]; }
+        }
+        return "";
+    }
+
+    /* 错误报告条目 JSON（手拼：字段值先过转义）。 */
+    static string ErrJson(int row, string field, string msg) {
+        return "{\"row\":" + Convert.ToString(row)
+            + ",\"field\":\"" + JsonEscape(field)
+            + "\",\"msg\":\"" + JsonEscape(msg) + "\"}";
+    }
+
+    /* JSON 字符串值转义：引号、反斜杠与控制字符。 */
+    static string JsonEscape(string s) {
+        string outp = "";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (c == 34) { outp = outp + "\\\""; }
+            else if (c == 92) { outp = outp + "\\\\"; }
+            else if (c < 32) { outp = outp + " "; }
+            else { outp = outp + s.Substring(i, 1); }
+        }
+        return outp;
+    }
+
+    /* 严格十进制整数（可带负号）；空串不算数字。 */
+    static bool IsInt(string v) {
+        if (v.Length == 0) { return false; }
+        int i = 0;
+        if (v[0] == 45) { i = 1; }
+        if (i >= v.Length) { return false; }
+        for (; i < v.Length; i = i + 1) {
+            int c = v[i] & 255;
+            if (c < 48 || c > 57) { return false; }
+        }
+        return true;
+    }
+}
