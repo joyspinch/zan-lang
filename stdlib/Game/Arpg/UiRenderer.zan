@@ -16,6 +16,13 @@ delegate void ArpgTextDrawn(
     int height,
     int angle);
 
+/// <summary>
+/// UI 渲染器：把 ArpgUiRuntime 的窗口/控件/节点绘制到 SDL 渲染器。
+/// 纹理按资源 Id 惰性加载并缓存（Close 统一释放）；文本后端可经
+/// SetTextBackend 注入，未注入时走内置度量与占位方块回退绘制。
+/// 渲染顺序：窗口按非置顶先、置顶后的顺序，控件/节点按 Order 从
+/// 小到大绘制。业务一般只调用 Render 与 Close。
+/// </summary>
 class ArpgUiRenderer {
     ArpgRegistry registry;
     List<string> textureIds;
@@ -24,6 +31,7 @@ class ArpgUiRenderer {
     ArpgFontHeightMeasured fontHeightMeasured;
     ArpgTextDrawn textDrawn;
 
+    /// 构造渲染器：registry 用于把资源 Id 解析为文件路径。
     ArpgUiRenderer(ArpgRegistry registry) {
         this.registry = registry;
         this.textureIds = new List<string>();
@@ -33,6 +41,7 @@ class ArpgUiRenderer {
         this.textDrawn = null;
     }
 
+    /// 注入自定义文本后端（测量/行高/绘制）；传 null 各回调则回退到内置默认实现。应在渲染开始前调用。
     void SetTextBackend(
         ArpgTextMeasured measure,
         ArpgFontHeightMeasured fontHeight,
@@ -43,6 +52,7 @@ class ArpgUiRenderer {
         this.textDrawn = draw;
     }
 
+    /// 把资源 Id 解析为文件路径；未注册该 Id 时返回空串。
     string ResourceFile(string id) {
         for (int i = 0; i < this.registry.ResourceCount(); i = i + 1) {
             ArpgResource resource = this.registry.ResourceAt(i);
@@ -51,6 +61,7 @@ class ArpgUiRenderer {
         return "";
     }
 
+    /// 取（或惰性加载并缓存）资源 Id 对应的纹理；id 为空串、资源未注册或 BMP 加载失败时返回 null。
     SdlTexture Texture(SdlRenderer renderer, string id) {
         if (id == "") { return null; }
         for (int i = 0; i < this.textureIds.Count; i = i + 1) {
@@ -68,6 +79,7 @@ class ArpgUiRenderer {
         return texture;
     }
 
+    /// 返回按 opacity 缩放 alpha 后的新颜色（0.0~1.0；原色不被修改）。
     ArpgColor ApplyOpacity(ArpgColor color, double opacity) {
         return new ArpgColor(
             color.Red(),
@@ -76,6 +88,7 @@ class ArpgUiRenderer {
             (int)((double)color.Alpha() * opacity));
     }
 
+    /// 填充实心矩形（像素坐标）；颜色全透明或宽/高非正时为空操作。
     void Fill(
         SdlRenderer renderer,
         ArpgColor color,
@@ -90,6 +103,7 @@ class ArpgUiRenderer {
         renderer.FillRect(x, y, width, height);
     }
 
+    /// 绘制矩形边框：按 borderWidth 向内逐圈描边；颜色全透明或宽度非正时为空操作。
     void Border(
         SdlRenderer renderer,
         ArpgColor color,
@@ -108,6 +122,7 @@ class ArpgUiRenderer {
         }
     }
 
+    /// 在 x/y 处按 width/height 拉伸绘制资源贴图；资源不存在时为空操作。
     void Resource(
         SdlRenderer renderer,
         string resourceId,
@@ -122,6 +137,7 @@ class ArpgUiRenderer {
         }
     }
 
+    /// 绘制带透明度与旋转的资源贴图（angle 为度，顺时针）；绘制期间临时改写纹理透明度，完成后恢复；资源不存在时为空操作。
     void TransformedResource(
         SdlRenderer renderer,
         string resourceId,
@@ -141,6 +157,7 @@ class ArpgUiRenderer {
         }
     }
 
+    /// 绘制圆形：fillColor 填充内部，borderColor/borderWidth 描边环；radius 非正时为空操作；中心为 (centerX, centerY)，半径像素。
     void Circle(
         SdlRenderer renderer,
         ArpgColor fillColor,
@@ -194,6 +211,7 @@ class ArpgUiRenderer {
         }
     }
 
+    /// 按九宫格布局绘制贴图：四角原样、四边单向拉伸、中心双向拉伸；slice 为 null 时为空操作；留边超出目标尺寸时被钳制。
     void NineSlice(
         SdlRenderer renderer,
         ArpgNineSlice slice,
@@ -235,18 +253,21 @@ class ArpgUiRenderer {
             x + width - right, y + height - bottom, right, bottom);
     }
 
+    /// 测量文本像素宽度；已注入自定义后端则用之，否则用内置度量估算。
     int MeasureText(string text, int fontSize) {
         ArpgTextMeasured measure = this.textMeasured;
         if (measure != null) { return measure(text, fontSize); }
         return ArpgTextMetrics.Measure(text, fontSize);
     }
 
+    /// 返回指定字号的行高（像素）；未注入自定义后端时行高即 fontSize。
     int FontHeight(int fontSize) {
         ArpgFontHeightMeasured measure = this.fontHeightMeasured;
         if (measure != null) { return measure(fontSize); }
         return fontSize;
     }
 
+    /// 回退文本绘制：逐字符画占位方块与中横线（无字体依赖时的兜底显示）；由 DrawText 在未注入文本后端时调用。
     void DrawFallbackText(
         SdlRenderer renderer,
         string text,
@@ -279,6 +300,7 @@ class ArpgUiRenderer {
         }
     }
 
+    /// 绘制文本：优先用注入的文本后端，未注入时退化为 DrawFallbackText 占位绘制；文本为空或颜色全透明时为空操作。angle 为度。
     void DrawText(
         SdlRenderer renderer,
         string text,
@@ -302,6 +324,7 @@ class ArpgUiRenderer {
             renderer, text, color, fontSize, x, y);
     }
 
+    /// 渲染富文本文档：先按宽度/字号/换行/行距排版，再按垂直对齐偏移逐 item 绘制（背景、文本或内嵌图片/动画/物品图标）；链接 run 按 Link 颜色绘制并可带下划线。x/y/width/height 为目标区域像素，angle 为度。
     void RenderDocument(
         SdlRenderer renderer,
         ArpgRichTextDocument document,
@@ -375,6 +398,7 @@ class ArpgUiRenderer {
         }
     }
 
+    /// 渲染单个节点：按类型绘制背景/贴图/圆/矩形与文本（ArtText 有描边时先画四向偏移的描边层），最后画边框；不可见节点为空操作。x/y 为节点所属控件原点（节点局部坐标已含在内）。
     void RenderNode(
         SdlRenderer renderer,
         ArpgNode node,
@@ -449,6 +473,7 @@ class ArpgUiRenderer {
             nodeX, nodeY, width, height);
     }
 
+    /// 渲染单个控件：背景/九宫格/贴图、进度条填充、状态叠加色（禁用优先于按下、按下优先于悬停）、标题或富文本内容与边框，最后按 Order 从小到大渲染子节点（Clip 开启时限制在控件矩形内）；不可见控件为空操作。x/y 为窗口原点。
     void RenderControl(
         SdlRenderer renderer,
         ArpgControl control,
@@ -559,6 +584,7 @@ class ArpgUiRenderer {
         if (control.Clip()) { renderer.ResetClip(); }
     }
 
+    /// 渲染整个窗口：背景色、背景贴图与边框，然后按 Order 从小到大渲染全部控件；不可见窗口为空操作。
     void RenderWindow(SdlRenderer renderer, ArpgWindow window) {
         if (!window.Visible()) { return; }
         this.Fill(
@@ -596,6 +622,7 @@ class ArpgUiRenderer {
         }
     }
 
+    /// 渲染全部 UI：先画所有非置顶窗口，再画置顶（AlwaysOnTop）窗口；每帧在窗口 Update 之后调用。
     void Render(SdlRenderer renderer, ArpgUiRuntime runtime) {
         int i = 0;
         for (; i < runtime.WindowCount(); i = i + 1) {
@@ -612,6 +639,7 @@ class ArpgUiRenderer {
         }
     }
 
+    /// 释放全部缓存纹理并清空缓存；之后纹理可按需重新加载。程序退出或切换场景时调用。
     void Close() {
         for (int i = 0; i < this.textures.Count; i = i + 1) {
             this.textures[i].Close();

@@ -6,13 +6,25 @@ namespace Game.Arpg;
 
 // 解析后的 WebSocket 客户端地址（ws:// 或 wss://）。拆分为 scheme、host、
 // port / path；省略时端口默认为 80（ws）或 443（wss）。
+/// <summary>
+/// 解析后的 WebSocket 客户端地址（ws:// 或 wss://）：scheme、
+/// host、port、path 与 secure 标志。端口省略时默认 80（ws）
+/// 或 443（wss）；path 省略时默认 "/"。
+/// </summary>
 class WsUrl {
+    /// 协议名："ws" 或 "wss"。
     string scheme;
+    /// 主机名或 IP（authority 中端口前的部分）。
     string host;
+    /// 端口号；未显式给出时为 80（ws）或 443（wss）。
     int port;
+    /// 路径，以 "/" 开头；省略时为 "/"。
     string path;
+    /// 是否为加密连接（wss）。
     bool secure;
 
+    /// 把 s 的 [start, end) 区间数字字符转为 int，遇非数字即停
+    /// 并返回已累计值；非数字开头返回 0。
     static int DigitsToInt(string s, int start, int end) {
         int v = 0;
         int i = start;
@@ -25,6 +37,8 @@ class WsUrl {
         return v;
     }
 
+    /// 解析 ws:// 或 wss:// 地址。无法识别前缀时按 host 为空、
+    /// ws 默认端口处理；不抛异常。
     static WsUrl Parse(string url) {
         WsUrl u = new WsUrl();
         u.scheme = "ws";
@@ -73,10 +87,15 @@ class WsUrl {
         return u;
     }
 
+    /// 协议名（"ws"/"wss"）。
     string Scheme() { return this.scheme; }
+    /// 主机名或 IP。
     string Host() { return this.host; }
+    /// 端口（默认 80/443）。
     int Port() { return this.port; }
+    /// 请求路径（以 "/" 开头）。
     string Path() { return this.path; }
+    /// 是否 wss（加密）。
     bool Secure() { return this.secure; }
 }
 
@@ -84,11 +103,20 @@ class WsUrl {
 // 长度前缀记录进行帧封装，使 ArpgTcpClient/ArpgTcpServer 组合能在流上
 // 恢复消息边界。这是净室帧格式（u32 载荷
 // 长度 + u32 cid + 正文）。
+/// <summary>
+/// 以通信 id（cid）为键的 ZGM 消息。线上帧格式为
+/// u32 载荷长度 + u32 cid + 正文（各字段大端序），Encode/Decode
+/// 互为逆操作；正文按单字节字符收发。
+/// </summary>
 class ArpgMessage {
+    /// 通信 id，业务侧用于路由消息。
     int cid;
+    /// 消息正文。
     string body;
+    /// 正文长度（与 body.Length 一致）。
     int bodyLen;
 
+    /// 构造消息（显式给出正文长度）。
     static ArpgMessage Of(int cid, string body, int bodyLen) {
         ArpgMessage m = new ArpgMessage();
         m.cid = cid;
@@ -97,17 +125,23 @@ class ArpgMessage {
         return m;
     }
 
+    /// 构造文本消息（正文长度自动取 body.Length）。
     static ArpgMessage Text(int cid, string body) {
         return ArpgMessage.Of(cid, body, body.Length);
     }
 
+    /// 通信 id。
     int Cid() { return this.cid; }
+    /// 消息正文。
     string Body() { return this.body; }
+    /// 正文长度。
     int BodyLength() { return this.bodyLen; }
 
     // 编码总大小：4（长度）+ 4（cid）+ 正文。
+    /// 整帧字节数：8 字节头 + 正文长度。
     int FrameLength() { return 8 + this.bodyLen; }
 
+    /// 编码为帧字节序列（长度前缀 + cid 大端序 + 正文）。
     byte[] Encode() {
         int total = 8 + this.bodyLen;
         byte[] buf = new byte[total + 1];
@@ -128,6 +162,10 @@ class ArpgMessage {
 
     // 解码 `buf` 开头的第一条帧记录；若
     // 现有字节少于声明长度则返回 null。
+    /// <summary>
+    /// 解码 buf[0..len) 中的第一条帧记录；字节不足 8（头）或不足
+    /// 声明长度时返回 null，调用方应继续等待更多数据。
+    /// </summary>
     static ArpgMessage Decode(string buf, int len) {
         if (len < 8) { return null; }
         int payload = ((buf[0] & 0xFF) << 24) | ((buf[1] & 0xFF) << 16) |
@@ -148,12 +186,19 @@ class ArpgMessage {
 // ArpgTcpClient 组件的实时 TCP 客户端运行时。将
 // TcpClientConfig 绑定到真实的 reactor 驱动套接字，并交换长度帧封装的
 // ArpgMessages。
+/// <summary>
+/// ArpgTcpClient 组件的实时 TCP 客户端运行时：把 TcpClientConfig
+/// 绑定到非阻塞套接字，收发长度帧封装的 ArpgMessage。所有
+/// Connect/Send/Receive 均为 async；ReceiveMessageAsync 返回 null
+/// 表示连接已断开（IsConnected 随之变 false）。
+/// </summary>
 class ArpgTcpClientRuntime {
     TcpClientConfig config;
     nint sock;
     bool connected;
     byte[] recvBuf;
 
+    /// 由组件配置构造未连接的客户端运行时。
     static ArpgTcpClientRuntime FromConfig(TcpClientConfig config) {
         ArpgTcpClientRuntime c = new ArpgTcpClientRuntime();
         c.config = config;
@@ -164,6 +209,7 @@ class ArpgTcpClientRuntime {
     }
 
     // 包装一个已被接受的服务器端套接字。
+    /// 包装服务器端已接受的套接字（直接处于已连接状态）。
     static ArpgTcpClientRuntime FromSocket(TcpClientConfig config, nint sock) {
         ArpgTcpClientRuntime c = new ArpgTcpClientRuntime();
         c.config = config;
@@ -173,13 +219,17 @@ class ArpgTcpClientRuntime {
         return c;
     }
 
+    /// 是否已连接。
     bool IsConnected() { return this.connected; }
+    /// 底层套接字句柄（未连接为 -1）。
     nint Handle() { return this.sock; }
 
+    /// 异步发起连接（不等待结果，用 IsConnected 查询）。
     async void ConnectAsync() {
         await this.ConnectAndWaitAsync();
     }
 
+    /// 异步连接并等待结果，返回 Socket 约定的错误码（0 为成功）。
     async int ConnectAndWaitAsync() {
         Socket.Initialize();
         this.sock = Socket.CreateTcp();
@@ -190,6 +240,8 @@ class ArpgTcpClientRuntime {
         return rc;
     }
 
+    /// 异步发送一条帧封装消息，返回 AsyncSocket.Send 的错误码
+    /// （0 为成功）。
     async int SendMessageAsync(ArpgMessage message) {
         byte[] buf = message.Encode();
         return await AsyncSocket.Send(this.sock, buf, message.FrameLength());
@@ -197,6 +249,11 @@ class ArpgTcpClientRuntime {
 
     // 接收一条帧封装消息（假定单条小消息在一次
     // 读取中到达，对这里测试的回环/控制流量成立）。
+    /// <summary>
+    /// 异步接收一条帧封装消息（假定一次读取收到完整帧）。读到
+    /// EOF/错误时把 IsConnected 置 false 并返回 null；帧不完整时
+    /// 也返回 null。接收缓冲容量取自 config.MessageLength()。
+    /// </summary>
     async ArpgMessage ReceiveMessageAsync() {
         int cap = this.config.MessageLength();
         if (this.recvBuf == null) {
@@ -210,6 +267,7 @@ class ArpgTcpClientRuntime {
         return ArpgMessage.Decode(this.recvBuf, n);
     }
 
+    /// 关闭套接字并释放缓冲；未连接时也安全。
     void Close() {
         if (this.connected) {
             Socket.Close(this.sock);
@@ -222,6 +280,11 @@ class ArpgTcpClientRuntime {
 
 // 已连接的服务器端客户端。它使用与 ArpgTcpClientRuntime 相同的帧封装
 // ArpgMessage 协议，但消息上限取自 ServerConfig。
+/// <summary>
+/// 已连接的服务器端客户端：与客户端运行时共用同一套帧封装
+/// ArpgMessage 协议，消息上限取自 ServerConfig。收发均为 async；
+/// 断开时自动触发 ArpgServerEvents 的 ClientDisconnected。
+/// </summary>
 class ArpgServerClient {
     ServerConfig config;
     int id;
@@ -230,6 +293,7 @@ class ArpgServerClient {
     byte[] recvBuf;
     ArpgServerEvents events;
 
+    /// 包装服务器 accept 得到的套接字并分配客户端 id。
     static ArpgServerClient FromSocket(
         ServerConfig config,
         int id,
@@ -246,16 +310,26 @@ class ArpgServerClient {
         return client;
     }
 
+    /// 服务器分配的连接 id（从 1 起自增）。
     int Id() { return this.id; }
+    /// 底层套接字句柄。
     nint Handle() { return this.sock; }
+    /// 是否仍处于连接状态。
     bool IsConnected() { return this.connected; }
 
+    /// 异步发送一条帧封装消息，返回 AsyncSocket.Send 的错误码
+    /// （0 为成功）。
     async int SendMessageAsync(ArpgMessage message) {
         byte[] buf = message.Encode();
         return await AsyncSocket.Send(
             this.sock, buf, message.FrameLength());
     }
 
+    /// <summary>
+    /// 异步接收一条消息：断开时置 connected=false、触发
+    /// ClientDisconnected 并返回 null；成功时触发 MessageReceived
+    /// 后返回消息（帧不完整返回 null 且不触发事件）。
+    /// </summary>
     async ArpgMessage ReceiveMessageAsync() {
         int cap = this.config.MessageLength();
         if (this.recvBuf == null) {
@@ -277,6 +351,7 @@ class ArpgServerClient {
         return message;
     }
 
+    /// 关闭连接并触发 ClientDisconnected（已关闭时安全调用）。
     void Close() {
         if (this.connected) {
             Socket.Close(this.sock);
@@ -293,6 +368,13 @@ class ArpgServerClient {
 // ArpgTcpServer 组件的实时 TCP 服务器运行时。将
 // ServerConfig 绑定到监听套接字，并跟踪已接受的 ArpgServerClient
 // 连接。
+/// <summary>
+/// ArpgTcpServer 组件的实时 TCP 服务器运行时：绑定监听套接字
+/// （非阻塞、SO_REUSEADDR），跟踪已接受的 ArpgServerClient。
+/// Start 失败（配置为空、被 Starting 否决、bind/listen 失败）返回
+/// null；事件在 Starting/Started/Stopping/Stopped/ClientConnected/
+/// ClientDisconnected 上回调。
+/// </summary>
 class ArpgTcpServerRuntime {
     ServerConfig config;
     nint listener;
@@ -301,11 +383,17 @@ class ArpgTcpServerRuntime {
     List<ArpgServerClient> clients;
     ArpgServerEvents events;
 
+    /// 以默认事件总线启动监听（无 Starting/Stopping 否决）。
     static ArpgTcpServerRuntime Start(ServerConfig config, string bindHost) {
         return ArpgTcpServerRuntime.Start(
             config, bindHost, new ArpgServerEvents());
     }
 
+    /// <summary>
+    /// 启动监听：先触发 Starting（返回 false 则放弃），随后
+    /// bind/listen/设非阻塞，任一步失败即返回 null（套接字已
+    /// 清理）；成功后触发 Started 并返回运行中的服务器。
+    /// </summary>
     static ArpgTcpServerRuntime Start(
         ServerConfig config,
         string bindHost,
@@ -346,6 +434,7 @@ class ArpgTcpServerRuntime {
         return s;
     }
 
+    /// Start 的 async 包装（设置本身同步，无需额外让出）。
     static async ArpgTcpServerRuntime StartAsync(
         ServerConfig config,
         string bindHost
@@ -354,12 +443,15 @@ class ArpgTcpServerRuntime {
         return ArpgTcpServerRuntime.Start(config, bindHost);
     }
 
+    /// 异步接受一个裸套接字（已设为非阻塞）。
     async nint AcceptAsync() {
         nint client = await AsyncSocket.Accept(this.listener);
         Socket.SetNonBlocking(client);
         return client;
     }
 
+    /// 异步接受并登记一个客户端，分配自增 id，触发
+    /// ClientConnected 后返回客户端对象。
     async ArpgServerClient AcceptClientAsync() {
         nint clientSock = await this.AcceptAsync();
         ArpgServerClient client = ArpgServerClient.FromSocket(
@@ -372,11 +464,16 @@ class ArpgTcpServerRuntime {
         return client;
     }
 
+    /// 服务器是否处于运行状态。
     bool IsRunning() { return this.running; }
+    /// 监听端口（来自 ServerConfig）。
     int Port() { return this.config.Port(); }
+    /// 当前已接受的客户端数。
     int ClientCount() { return this.clients.Count; }
+    /// 第 index 个客户端（不查越界）。
     ArpgServerClient ClientAt(int index) { return this.clients[index]; }
 
+    /// 按 id 关闭并移除客户端；找到返回 true，否则 false。
     bool RemoveClient(int id) {
         for (int i = 0; i < this.clients.Count; i = i + 1) {
             if (this.clients[i].Id() == id) {
@@ -388,6 +485,11 @@ class ArpgTcpServerRuntime {
         return false;
     }
 
+    /// <summary>
+    /// 停止服务器：先触发 Stopping（返回 false 则中止停止），
+    /// 随后关闭全部客户端与监听套接字并触发 Stopped。未运行时
+    /// 调用为空操作。
+    /// </summary>
     void Stop() {
         if (this.running) {
             if (this.events != null && !this.events.RaiseStopping()) {
@@ -409,12 +511,18 @@ class ArpgTcpServerRuntime {
 // WebSocketClient 组件的实时 WebSocket 客户端运行时。解析
 // the config 地址 and delegates the RFC 6455 handshake/framing to
 // System.Net.WebSocket.WebSocketClient。
+/// <summary>
+/// WebSocketClient 组件的实时 WebSocket 客户端运行时：解析配置
+/// 地址为 WsUrl，把 RFC 6455 握手与帧处理委托给
+/// System.Net.WebSocket.WebSocketClient。收发均为 async。
+/// </summary>
 class ArpgWebSocketRuntime {
     WebSocketClientConfig config;
     WsUrl url;
     WebSocketClient ws;
     bool connected;
 
+    /// 由组件配置构造运行时并立即解析地址（未连接）。
     static ArpgWebSocketRuntime FromConfig(WebSocketClientConfig config) {
         ArpgWebSocketRuntime r = new ArpgWebSocketRuntime();
         r.config = config;
@@ -423,22 +531,28 @@ class ArpgWebSocketRuntime {
         return r;
     }
 
+    /// 解析出的目标地址。
     WsUrl Url() { return this.url; }
+    /// 是否已连接。
     bool IsConnected() { return this.connected; }
 
+    /// 异步执行握手连接；完成后用 IsConnected 判断结果。
     async void ConnectAsync() {
         this.ws = await WebSocketClient.ConnectAsync(this.url.Host(), this.url.Port(), this.url.Path());
         this.connected = this.ws.IsConnected();
     }
 
+    /// 异步发送一条文本帧。
     async void SendText(string text) {
         await this.ws.SendText(text);
     }
 
+    /// 异步接收一条文本帧；连接关闭时返回 null。
     async string RecvText() {
         return await this.ws.RecvText();
     }
 
+    /// 异步关闭连接（未连接时安全调用）。
     async void Close() {
         if (this.connected) {
             await this.ws.Close();

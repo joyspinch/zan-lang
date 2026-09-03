@@ -2,9 +2,13 @@ using System;
 
 namespace Game.Arpg;
 
-// 用于 ZGM 技能公式的小型整数表达式求值器。它刻意
-// 接受受限的类型化表达式语言，而非解释
-// Lua：数字、a./b. 属性、+ - * / ^、括号以及 min/max/clamp。
+/// <summary>
+/// ZGM 技能公式的小型整数表达式求值器。刻意接受受限的表达式
+/// 语言（非 Lua）：整数、a.属性/b.属性（来自左右两侧属性表）、
+/// + - * / ^、一元 +/-、括号与 min/max/clamp 函数。除法与负指数
+/// 按错误处理；任何语法/求值错误都把 valid 置 false，Evaluate
+/// 返回错误发生前的部分结果。
+/// </summary>
 class ArpgFormula {
     string text;
     int index;
@@ -12,6 +16,8 @@ class ArpgFormula {
     ArpgAttributes leftAttrs;
     ArpgAttributes rightAttrs;
 
+    /// 构造求值器：text 为表达式，leftAttrs/rightAttrs 分别对应
+    /// a.* 与 b.* 属性前缀（可为 null，此时引用前缀即报错）。
     ArpgFormula(
         string text,
         ArpgAttributes leftAttrs,
@@ -24,13 +30,16 @@ class ArpgFormula {
         this.rightAttrs = rightAttrs;
     }
 
+    /// 表达式是否完整有效（无语法/求值错误）。
     bool IsValid() { return this.valid; }
 
+    /// 返回当前字符的字节值；已到末尾返回 -1。
     int Current() {
         if (this.index >= this.text.Length) { return -1; }
         return this.text[this.index] & 255;
     }
 
+    /// 跳过当前位置的空白字符（空格/制表/换行/回车）。
     void SkipSpace() {
         while (this.index < this.text.Length) {
             int c = this.text[this.index] & 255;
@@ -39,6 +48,7 @@ class ArpgFormula {
         }
     }
 
+    /// 跳过空白后若当前字符为 expected 则消费之并返回 true。
     bool Match(int expected) {
         this.SkipSpace();
         if (this.Current() != expected) { return false; }
@@ -46,6 +56,7 @@ class ArpgFormula {
         return true;
     }
 
+    /// 解析十进制整数；无数字时置错并返回 0（不识别符号与小数）。
     int ParseNumber() {
         this.SkipSpace();
         int start = this.index;
@@ -63,6 +74,7 @@ class ArpgFormula {
         return result;
     }
 
+    /// 判断 c 是否可作为标识符字符（字母/数字/点/下划线/高位字节）。
     bool IsNameChar(int c) {
         return c >= 48 && c <= 57
             || c >= 65 && c <= 90
@@ -71,6 +83,7 @@ class ArpgFormula {
             || c >= 128;
     }
 
+    /// 解析标识符（属性名或函数名）；无有效字符时置错并返回空串。
     string ParseName() {
         this.SkipSpace();
         int start = this.index;
@@ -85,6 +98,8 @@ class ArpgFormula {
         return this.text.Substring(start, this.index - start);
     }
 
+    /// 解析属性引用：a.前缀取左属性表，b.前缀取右属性表（截断取
+    /// 整）；前缀不符或对应属性表为 null 时置错并返回 0。
     int Attribute(string name) {
         if (name.Length > 2
             && name.Substring(0, 2) == "a."
@@ -102,6 +117,8 @@ class ArpgFormula {
         return 0;
     }
 
+    /// 解析基础表达式：数字、括号子表达式、属性引用或
+    /// min/max/clamp 函数调用；语法不符时置错并返回 0。
     int ParsePrimary() {
         this.SkipSpace();
         int c = this.Current();
@@ -153,6 +170,7 @@ class ArpgFormula {
         return 0;
     }
 
+    /// 解析一元 +/- 前缀（可叠加，如 --x）。
     int ParseUnary() {
         this.SkipSpace();
         if (this.Match(45)) { return -this.ParseUnary(); }
@@ -160,6 +178,7 @@ class ArpgFormula {
         return this.ParsePrimary();
     }
 
+    /// 整数幂运算；指数为负置错并返回 0。
     int Power(int baseValue, int exponent) {
         if (exponent < 0) {
             this.valid = false;
@@ -172,6 +191,7 @@ class ArpgFormula {
         return result;
     }
 
+    /// 解析 ^ 幂层（右操作数经一元层，支持 2^-3 形式语法）。
     int ParsePower() {
         int result = this.ParseUnary();
         while (true) {
@@ -184,6 +204,7 @@ class ArpgFormula {
         return result;
     }
 
+    /// 解析 * / 乘除层；除数为 0 置错且该步结果按 0 计。
     int ParseMulDiv() {
         int result = this.ParsePower();
         while (true) {
@@ -208,6 +229,7 @@ class ArpgFormula {
         return result;
     }
 
+    /// 解析 + - 加减层（优先级最低）。
     int ParseAddSub() {
         int result = this.ParseMulDiv();
         while (true) {
@@ -226,6 +248,8 @@ class ArpgFormula {
         return result;
     }
 
+    /// 求值整个表达式并返回整数结果；有剩余未消费字符视为语法
+    /// 错误（置错）。结果是否可信以 IsValid 为准。
     int Evaluate() {
         int result = this.ParseAddSub();
         this.SkipSpace();
