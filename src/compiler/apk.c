@@ -629,6 +629,23 @@ int zan_apk_build(const char *apk_path, const char *lib_main,
     zip_add(&z, "AndroidManifest.xml", man2, man2_len, 1, 4);
     zip_add(&z, "resources.arsc", arsc, arsc_len, 0, 4);
     zip_add(&z, "classes.dex", dex, dex_len, 1, 4);
+    /* launcher icons: every PNG under <shell_dir>/res/ goes in at
+     * res/<dpi-dir>/<name>.png (paths aapt2 precompiled into the arsc) */
+    {
+        static const char *dpis[] = { "mipmap-mdpi", "mipmap-hdpi",
+            "mipmap-xhdpi", "mipmap-xxhdpi", "mipmap-xxxhdpi" };
+        for (unsigned di = 0; di < sizeof(dpis) / sizeof(dpis[0]); di++) {
+            snprintf(path, sizeof(path), "%s/res/%s/ic_launcher.png",
+                     shell_dir, dpis[di]);
+            size_t ilen = 0;
+            unsigned char *idata = read_all(path, &ilen);
+            if (!idata) continue;
+            char ename[160];
+            snprintf(ename, sizeof(ename), "res/%s-v4/ic_launcher.png", dpis[di]);
+            zip_add(&z, ename, idata, ilen, 1, 4);
+            free(idata);
+        }
+    }
     char lname[160];
     snprintf(lname, sizeof(lname), "lib/%s/libmain.so", abi);
     zip_add(&z, lname, lib, lib_len, 0, 4);

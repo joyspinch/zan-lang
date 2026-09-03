@@ -1783,6 +1783,8 @@ int main(int argc, char **argv) {
     bool emit_lib = false;          /* --emit-lib / -o lib suffix: library output */
     bool lib_shared = false;        /* library is shared (.dll/.so/.dylib), not static */
     const char *apk_path = NULL;    /* --emit-apk <file.apk>: package libmain.so */
+    const char *apk_package = NULL; /* --apk-package <name>: override manifest package */
+    const char *apk_label = NULL;   /* --apk-label <text>: override app label */
     const char *extra_link_inputs[32]; int extra_link_input_count = 0;
     const char *embed_specs[64]; int embed_spec_count = 0;
     const char *extra_link_libs[ZAN_LINK_MAX_LIBS]; int extra_link_lib_count = 0;
@@ -1897,6 +1899,10 @@ int main(int argc, char **argv) {
              * sign an SDLActivity APK (implies --emit-lib with a .so). */
             emit_lib = true;
             apk_path = argv[++i];
+        } else if (strcmp(argv[i], "--apk-package") == 0 && i + 1 < argc) {
+            apk_package = argv[++i];
+        } else if (strcmp(argv[i], "--apk-label") == 0 && i + 1 < argc) {
+            apk_label = argv[++i];
         } else if (strcmp(argv[i], "--no-icon") == 0) {
             no_icon = true;
         } else if (strcmp(argv[i], "--icon") == 0 && i + 1 < argc) {
@@ -2692,6 +2698,66 @@ int main(int argc, char **argv) {
          * `--publish`. */
         zan_driver_registry_t driver_reg;
         zan_discover_drivers(resolved_stdlib_root, &driver_reg);
+        /* Cross-linking to Android: bionic ships none of the desktop
+         * third-party natives (openssl, odbc, libpq, ...). A DllImport
+         * lib that neither the sysroot subset (libc/libm/liblog/libdl
+         * stub .so next to zanc) nor a bundled android driver .so can
+         * provide has its externs stubbed and is dropped from the link
+         * line -- the same policy as the Linux/macOS cross paths above
+         * (calls fail at runtime instead of failing the build). Runs
+         * before emission so both the APK shared-lib link and the exe
+         * link see a clean extern_libs list. */
+        if (cross_compiling && target.os == ZAN_OS_ANDROID) {
+            char aexe[1024] = {0};
+            zan_exe_dir(aexe, sizeof(aexe));
+            const char *asub = (target.arch == ZAN_ARCH_AARCH64)
+                               ? "android-arm64" : "android-x64";
+            /* Backwards: drop_extern_lib compacts extern_libs, so a
+             * forward walk would skip the entry after every drop. */
+            for (int li = irgen.extern_lib_count - 1; li >= 0; li--) {
+                if (zan_win_system_lib(irgen.extern_libs[li].str,
+                                       (int)irgen.extern_libs[li].len))
+                    continue;
+                int nlen;
+                const char *nm = zan_dllimport_lname(
+                    irgen.extern_libs[li].str,
+                    (int)irgen.extern_libs[li].len, &nlen);
+                if (!nm) continue;
+                int resolvable = 0;
+                { char stubso[1200];
+                  snprintf(stubso, sizeof(stubso), "%s/%s/lib%.*s.so",
+                           aexe, asub, nlen, nm);
+                  if (zan_file_exists(stubso)) {
+                      resolvable = 1;
+                  } else {
+                      int didx = zan_driver_find(&driver_reg, nm, nlen);
+                      if (didx >= 0 && resolved_stdlib_root[0]) {
+                          snprintf(stubso, sizeof(stubso),
+                                   "%s/%s/drivers/%s/lib%.*s.so",
+                                   resolved_stdlib_root,
+                                   driver_reg.entries[didx].module,
+                                   zan_driver_subdir(&target), nlen, nm);
+                          resolvable = zan_file_exists(stubso);
+                      }
+                  }
+                }
+                if (!resolvable) {
+                    int nst = zan_irgen_stub_extern_lib(
+                        &irgen, irgen.extern_libs[li].str,
+                        (int)irgen.extern_libs[li].len);
+                    zan_irgen_drop_extern_lib(
+                        &irgen, irgen.extern_libs[li].str,
+                        (int)irgen.extern_libs[li].len);
+                    if (nst > 0) {
+                        fprintf(stderr,
+                                "warning: no android driver for "
+                                "[DllImport(\"%.*s\")]; its %d function(s) "
+                                "are stubbed and will fail at runtime\n",
+                                nlen, nm, nst);
+                    }
+                }
+            }
+        }
         char driver_dirs[ZAN_MAX_USED_DRIVERS][1024];
         const char *used_drivers[ZAN_MAX_USED_DRIVERS]; int used_driver_count = 0;
         int used_driver_len[ZAN_MAX_USED_DRIVERS];
@@ -2936,6 +3002,59 @@ int main(int argc, char **argv) {
                                 "pinyin dictionary from '%s'; --embed "
                                 "resources limit reached\n", pinyin_path);
                         free(pinyin_spec);
+                    }
+                }
+            }
+        }
+
+        /* ---- Gui skin packs + base.css inside the executable ----------
+         * stdlib/Gui/skins holds the bundled skin packs (one folder with a
+         * skin.css per pack) plus the base.css every sheet builds on. They
+         * resolve at run time through Skin.Roots(): env ZAN_GUI_SKINS, skins/
+         * folders beside the exe or under the cwd, then embedded resources --
+         * but a GUI program that is merely RUN (the IDE's dev build) has none
+         * of those roots: publish stages and embeds skins, a run does not, so
+         * the window renders with an empty sheet floor (a black unstyled
+         * frame) and a picker listing zero packs even though the app asked
+         * for the light skin. When the compiled program actually carries the
+         * Skin module (its symbols are in the image), the stdlib packs are
+         * baked in automatically under their discovery names
+         * ("skins/<pack>/skin.css", "skins/base.css") so every GUI build
+         * finds the light/dark baseline and the full picker with nothing
+         * beside the exe. Disk packs win over embedded ones at every read
+         * (Skin.FindDir and File.Exists try the disk first), so shipping a
+         * replacement pack still overrides the baked-in table without
+         * touching zanc; and a project that embeds its own skins/ folder
+         * through --embed (the IDE publish stages exactly that, earlier in
+         * the spec list so its copies win duplicate names) makes this
+         * auto-embed skip -- one copy of each pack is enough. */
+        if (resolved_stdlib_root[0] &&
+            zan_irgen_defines_prefix(&irgen, "Skin_")) {
+            bool skins_staged = false;
+            for (int es = 0; es < embed_spec_count && !skins_staged; es++) {
+                const char *seq = strrchr(embed_specs[es], '=');
+                if (seq && strcmp(seq + 1, "skins") == 0) skins_staged = true;
+            }
+            if (!skins_staged) {
+                char skins_dir[1200];
+                snprintf(skins_dir, sizeof(skins_dir), "%s/Gui/skins",
+                         resolved_stdlib_root);
+                if (zan_file_exists(skins_dir)) {
+                    char *skin_spec = (char *)malloc(strlen(skins_dir) + 32);
+                    if (skin_spec) {
+                        /* resource names "skins/<pack>/skin.css" match the
+                         * reader's zan_embed_list("skins/") prefix scan and
+                         * Skin.Load's EmbedRead("skins/<name>/skin.css") */
+                        snprintf(skin_spec, strlen(skins_dir) + 32,
+                                 "%s=skins", skins_dir);
+                        if (embed_spec_count < 64) {
+                            embed_specs[embed_spec_count++] = skin_spec;
+                        } else {
+                            fprintf(stderr, "warning: cannot auto-embed Gui "
+                                    "skin packs from '%s'; --embed resources "
+                                    "limit reached\n", skins_dir);
+                            free(skin_spec);
+                        }
                     }
                 }
             }
@@ -5031,22 +5150,36 @@ int main(int argc, char **argv) {
                               ? "arm64-v8a" : "x86_64";
             /* default package/label from the input file name unless set */
             char pkg[128], lbl[128];
-            { const char *base = strrchr(input_file, '/');
+            if (apk_package) {
+                snprintf(pkg, sizeof(pkg), "%s", apk_package);
+            } else {
+              const char *base = strrchr(input_file, '/');
               const char *base2 = strrchr(input_file, '\\');
               if (base2 > base) base = base2;
               base = base ? base + 1 : input_file;
               snprintf(pkg, sizeof(pkg), "dev.zan.%s", base);
-              snprintf(lbl, sizeof(lbl), "%s", base);
-              { char *dot = strrchr(pkg, '.'); if (dot && strcmp(dot, ".zan") == 0) *dot = 0;
-                char *d2 = strrchr(lbl, '.'); if (d2 && strcmp(d2, ".zan") == 0) *d2 = 0; }
+              /* .zan or .zform (designer entry) suffix off */
+              { char *dot = strrchr(pkg, '.');
+                if (dot && (strcmp(dot, ".zan") == 0 ||
+                            strcmp(dot, ".zform") == 0)) *dot = 0; }
               /* package segments must be [a-zA-Z0-9_]; fold the rest */
               for (char *c = pkg; *c; c++) {
                   if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z')
                         || (*c >= '0' && *c <= '9') || *c == '_' || *c == '.'))
                       *c = '_';
               }
-              { char *c = strchr(lbl, '.');
-                if (c && strcmp(c, ".zan") == 0) *c = 0; }
+            }
+            if (apk_label) {
+                snprintf(lbl, sizeof(lbl), "%s", apk_label);
+            } else {
+              const char *base = strrchr(input_file, '/');
+              const char *base2 = strrchr(input_file, '\\');
+              if (base2 > base) base = base2;
+              base = base ? base + 1 : input_file;
+              snprintf(lbl, sizeof(lbl), "%s", base);
+              { char *d2 = strrchr(lbl, '.');
+                if (d2 && (strcmp(d2, ".zan") == 0 ||
+                           strcmp(d2, ".zform") == 0)) *d2 = 0; }
             }
             /* bundled driver libs to carry inside lib/<abi>/ */
             char *extras[64]; int nextra = 0;
