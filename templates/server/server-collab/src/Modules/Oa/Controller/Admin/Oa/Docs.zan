@@ -1,0 +1,285 @@
+using System;
+using System.Collections;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb.Model.Oa;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.Admin.Oa;
+
+/* /admin/oa/docs 文档中心（T9）：空间内文档的列表/阅读/整页编辑/版本历史。
+   读端点一律 (id, tenantId) 双条件（BatchReport 范式，ExcelIo.zan:267-271）。
+   渲染经 Blocks（escape-first + 链接 SafeUrl 白名单），视图以 {{{html}}}
+   原样输出。Save 每次 version+1 并落 oa_doc_rev 快照；Delete 闸后显式
+   受控级联删版本行（Bug#5 教训）。 */
+[Route("admin/oa/docs/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("文档中心")]
+class Docs : AdminController {
+    [HttpGet]
+    [Route("/admin/oa/docs")]
+    [Custom(IsMenu = true, Icon = "mdi:file-document", Perm = PermBit.View)]
+    [Description("文档中心")]
+    async void Index() {
+        ViewData d = await this.Layout("文档中心");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        List<OaSpace> spaces = await this.MySpaces();
+        int spaceId = this.InInt("spaceId", 0);
+        OaSpace cur = null;
+        for (int i = 0; i < spaces.Count; i = i + 1) {
+            if (spaces[i].id == spaceId) { cur = spaces[i]; break; }
+        }
+        if (cur == null && spaces.Count > 0) { cur = spaces[0]; }
+
+        List<StrMap> srows = d.AddList("spaces");
+        for (int i = 0; i < spaces.Count; i = i + 1) {
+            OaSpace s = spaces[i];
+            StrMap r = new StrMap();
+            r.Set("id", Convert.ToString(s.id));
+            r.Set("name", s.name);
+            r.Set("cur", (cur != null && s.id == cur.id) ? "1" : "");
+            srows.Add(r);
+        }
+
+        List<OaDoc> docs = new List<OaDoc>();
+        if (cur != null) {
+            docs = await this.OaDoc
+                .Where(a => a.tenantId == this.TenantId() && a.spaceId == cur.id)
+                .OrderByDescending(a => a.updatedAt).ToListAsync();
+        }
+        List<User> users = await this.User
+            .Where(a => a.tenantId == this.TenantId()).ToListAsync();
+        List<StrMap> list = d.AddList("rows");
+        for (int i = 0; i < docs.Count; i = i + 1) {
+            OaDoc doc = docs[i];
+            StrMap r = new StrMap();
+            r.Set("id", Convert.ToString(doc.id));
+            r.Set("title", doc.title);
+            r.Set("version", Convert.ToString(doc.version));
+            r.Set("updatedAt", Fmt.Stamp(doc.updatedAt));
+            r.Set("editor", Docs.NameOf(users, doc.updatedBy));
+            r.Set("excerpt", Prose.Excerpt(doc.contentText, 60));
+            list.Add(r);
+        }
+        d.Set("spaceId", Convert.ToString(cur == null ? 0 : cur.id));
+        d.Set("spaceName", cur == null ? "" : cur.name);
+        d.Set("hasDocs", docs.Count > 0 ? "1" : "");
+        d.Set("empty", (cur != null && docs.Count == 0) ? "1" : "");
+        d.Set("noSpace", cur == null ? "1" : "");
+        d.Set("canCreate", this.Can(PermBit.Create) ? "1" : "");
+        d.Set("canUpdate", this.Can(PermBit.Update) ? "1" : "");
+        d.Set("canDelete", this.Can(PermBit.Delete) ? "1" : "");
+        this.Page(d);
+    }
+
+    /* 阅读页：Blocks 渲染（escape-first），{{{html}}} 原样输出。 */
+    [HttpGet]
+    [Custom(IsMenu = false, Perm = PermBit.View)]
+    [Description("阅读文档")]
+    async void Read() {
+        int id = this.InInt("id", 0);
+        OaDoc doc = await this.OaDoc
+            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .FirstAsync();
+        if (doc == null) { this.Fail(404, "0404", "文档不存在"); return; }
+        OaSpace sp = await this.OaSpace
+            .Where(a => a.id == doc.spaceId && a.tenantId == this.TenantId())
+            .FirstAsync();
+        ViewData d = await this.Layout(doc.title);
+        d.Set("id", Convert.ToString(doc.id));
+        d.Set("title", doc.title);
+        d.Set("version", Convert.ToString(doc.version));
+        d.Set("updatedAt", Fmt.Stamp(doc.updatedAt));
+        d.Set("spaceId", Convert.ToString(doc.spaceId));
+        d.Set("spaceName", sp == null ? "" : sp.name);
+        d.Set("html", Blocks.Render(doc.content));
+        d.Set("canUpdate", this.Can(PermBit.Update) ? "1" : "");
+        this.Page(d);
+    }
+
+    /* 整页编辑壳；?id=0 为新建（spaceId 经查询串带入）。 */
+    [HttpGet]
+    [Custom(IsMenu = false, Perm = PermBit.View)]
+    [Description("编辑文档")]
+    async void Edit() {
+        int id = this.InInt("id", 0);
+        OaDoc doc = null;
+        if (id > 0) {
+            doc = await this.OaDoc
+                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .FirstAsync();
+            if (doc == null) { this.Fail(404, "0404", "文档不存在"); return; }
+        }
+        ViewData d = await this.Layout(id > 0 ? "编辑文档" : "新建文档");
+        d.Set("id", Convert.ToString(id));
+        d.Set("title", doc == null ? "" : doc.title);
+        d.Set("content", doc == null ? "" : doc.content);
+        d.Set("version", doc == null ? "" : Convert.ToString(doc.version));
+        d.Set("spaceId", Convert.ToString(doc == null
+            ? this.InInt("spaceId", 0) : doc.spaceId));
+        this.Page(d);
+    }
+
+    /* 新建文档弹窗（选空间 + 标题 + 可选初始内容）。 */
+    [HttpGet]
+    [Custom(IsMenu = false, Perm = PermBit.View)]
+    [Description("新建文档")]
+    async void Form() {
+        List<OaSpace> spaces = await this.MySpaces();
+        int pick = this.InInt("spaceId", 0);
+        ViewData d = new ViewData();
+        d.Set("dialogTitle", "新建文档");
+        d.Set("hasSpaces", spaces.Count > 0 ? "1" : "");
+        List<StrMap> srows = d.AddList("spaces");
+        for (int i = 0; i < spaces.Count; i = i + 1) {
+            OaSpace s = spaces[i];
+            StrMap r = new StrMap();
+            r.Set("id", Convert.ToString(s.id));
+            r.Set("name", s.name);
+            r.Set("cur", s.id == pick ? "selected" : "");
+            srows.Add(r);
+        }
+        this.Dialog(d);
+    }
+
+    /* 保存：新建 version=1 落首版快照；编辑 version+1 落新版快照。
+       content 经 Blocks.Validate（30KB 软上限）+ Normalize + TextOf。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("保存文档")]
+    async void Save() {
+        int id = this.InInt("id", 0);
+        User me = await this.Admin();
+        string title = this.Need("title", "文档标题");
+        if (title.Length == 0) { this.Fail(400, "0004", "请填写文档标题"); return; }
+        string err = Blocks.Validate(this.In("content"));
+        if (err.Length > 0) { this.Fail(400, "0004", err); return; }
+        string norm = Blocks.Normalize(this.In("content"));
+        string text = Blocks.TextOf(norm);
+        long now = WebApp.NowSeconds();
+        if (id > 0) {
+            OaDoc doc = await this.OaDoc
+                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .FirstAsync();
+            if (doc == null) { this.Fail(404, "0404", "文档不存在"); return; }
+            int ver = doc.version + 1;
+            int n = await this.OaDoc.Update()
+                .Set(a => a.title, title)
+                .Set(a => a.content, norm)
+                .Set(a => a.contentText, text)
+                .Set(a => a.version, ver)
+                .Set(a => a.updatedBy, me.id)
+                .Set(a => a.updatedAt, now)
+                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .ExecuteAffrowsAsync();
+            if (n <= 0) { this.Fail(404, "0404", "文档不存在"); return; }
+            OaDocRev rev = new OaDocRev();
+            rev.tenantId = this.TenantId();
+            rev.docId = id;
+            rev.version = ver;
+            rev.title = title;
+            rev.content = norm;
+            rev.editorId = me.id;
+            rev.createdAt = now;
+            await this.OaDocRev.Insert(rev).ExecuteIdentityAsync();
+            this.Saved("已保存为 v" + Convert.ToString(ver));
+            return;
+        }
+        int spaceId = this.InInt("spaceId", 0);
+        OaSpace sp = await this.OaSpace
+            .Where(a => a.id == spaceId && a.tenantId == this.TenantId())
+            .FirstAsync();
+        if (sp == null) { this.Fail(400, "0004", "请选择有效空间"); return; }
+        OaDoc nd = new OaDoc();
+        nd.tenantId = this.TenantId();
+        nd.spaceId = spaceId;
+        nd.title = title;
+        nd.content = norm;
+        nd.contentText = text;
+        nd.version = 1;
+        nd.updatedBy = me.id;
+        nd.createdAt = now;
+        nd.updatedAt = now;
+        int newId = await this.OaDoc.Insert(nd).ExecuteIdentityAsync();
+        if (newId <= 0) { this.Fail(400, "0004", "保存失败"); return; }
+        OaDocRev rv = new OaDocRev();
+        rv.tenantId = this.TenantId();
+        rv.docId = newId;
+        rv.version = 1;
+        rv.title = title;
+        rv.content = norm;
+        rv.editorId = me.id;
+        rv.createdAt = now;
+        await this.OaDocRev.Insert(rv).ExecuteIdentityAsync();
+        this.Saved("文档已创建");
+    }
+
+    /* 版本历史：按 version 倒序；只增不改（一期不提供回滚）。 */
+    [HttpGet]
+    [Custom(IsMenu = false, Perm = PermBit.View)]
+    [Description("版本历史")]
+    async void History() {
+        int id = this.InInt("id", 0);
+        OaDoc doc = await this.OaDoc
+            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .FirstAsync();
+        if (doc == null) { this.Fail(404, "0404", "文档不存在"); return; }
+        List<OaDocRev> revs = await this.OaDocRev
+            .Where(a => a.docId == doc.id && a.tenantId == this.TenantId())
+            .OrderByDescending(a => a.version).ToListAsync();
+        List<User> users = await this.User
+            .Where(a => a.tenantId == this.TenantId()).ToListAsync();
+        ViewData d = await this.Layout("版本历史");
+        d.Set("docId", Convert.ToString(doc.id));
+        d.Set("title", doc.title);
+        List<StrMap> list = d.AddList("rows");
+        for (int i = 0; i < revs.Count; i = i + 1) {
+            OaDocRev rev = revs[i];
+            StrMap r = new StrMap();
+            r.Set("version", Convert.ToString(rev.version));
+            r.Set("title", rev.title);
+            r.Set("editor", Docs.NameOf(users, rev.editorId));
+            r.Set("createdAt", Fmt.Stamp(rev.createdAt));
+            r.Set("current", rev.version == doc.version ? "1" : "");
+            list.Add(r);
+        }
+        d.Set("empty", revs.Count == 0 ? "1" : "");
+        this.Page(d);
+    }
+
+    /* 删除：先 (id, tenantId) 闸，再受控级联删版本行（Bug#5 范式）。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Delete)]
+    [Description("删除文档")]
+    async void Delete() {
+        int id = this.InInt("id", 0);
+        OaDoc doc = await this.OaDoc
+            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .FirstAsync();
+        if (doc == null) { this.Fail(404, "0404", "文档不存在"); return; }
+        int _r = await this.OaDocRev.Delete()
+            .Where(a => a.docId == doc.id && a.tenantId == this.TenantId())
+            .ExecuteAffrowsAsync();
+        int n = await this.OaDoc.Delete()
+            .Where(a => a.id == doc.id && a.tenantId == this.TenantId())
+            .ExecuteAffrowsAsync();
+        this.Saved(n > 0 ? "已删除" : "文档不存在");
+    }
+
+    /* 本租户空间清单（Index/Form 公用）。 */
+    async List<OaSpace> MySpaces() {
+        return await this.OaSpace
+            .Where(a => a.tenantId == this.TenantId())
+            .OrderBy(a => a.id).ToListAsync();
+    }
+
+    /* 编辑人昵称：本租户用户表整表取回循环匹配（模板规模小，免 join）。 */
+    static string NameOf(List<User> users, int id) {
+        for (int i = 0; i < users.Count; i = i + 1) {
+            if (users[i].id == id) { return users[i].nickname; }
+        }
+        return "";
+    }
+}

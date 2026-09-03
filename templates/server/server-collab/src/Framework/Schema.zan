@@ -34,6 +34,7 @@ class Schema {
             if (!await Schema.SeedCrm(db)) { return false; }
             if (!await Schema.SeedFlow(db)) { return false; }
             if (!await Schema.SeedNotify(db)) { return false; }
+            if (!await Schema.SeedOaDocs(db)) { return false; }
             return true;
         } finally {
             ctx.Release(db);
@@ -396,6 +397,59 @@ class Schema {
                 + " 条 flow_notify 通知到 sys_notify；旧表停止新写");
         }
         return true;
+    }
+
+    /* 域种子（T9 文档中心）：默认空间「公共空间」+ 两篇示例文档，
+       使文档中心开箱即可用。空表才写，重复启动不变。独立方法化，
+       防与 BackfillTenant / 其他并行会话改动相撞。 */
+    static async bool SeedOaDocs(IDbConnection db) {
+        int haveSpace = await db.Select<OaSpace>().CountAsync();
+        if (haveSpace > 0) { return true; }
+        long now = WebApp.NowSeconds();
+        OaSpace sp = new OaSpace();
+        sp.tenantId = 1;
+        sp.name = "公共空间";
+        sp.description = "团队共享文档空间（默认）";
+        sp.readRoles = "";
+        sp.writeRoles = "";
+        sp.createdAt = now;
+        sp.updatedAt = now;
+        int spaceId = await db.Insert<OaSpace>(sp).ExecuteIdentityAsync();
+        if (spaceId <= 0) { return false; }
+        int haveDoc = await db.Select<OaDoc>().CountAsync();
+        if (haveDoc > 0) { return true; }
+        if (!await Schema.AddOaDoc(db, spaceId, "欢迎使用文档中心",
+            "# 欢迎使用文档中心\n\n这是内置的**示例文档**，演示行式块语法。\n\n## 支持的块\n\n- 无序列表项\n1. 有序列表项\n> 引用一行\n- [ ] 待办事项\n- [x] 已完成事项\n\n```\n代码围栏：原样保留、整体转义\n```\n\n---\n\n行内语法：**粗体**、*斜体*、`行内码` 与 [链接](https://example.com)。\n",
+            now)) { return false; }
+        return await Schema.AddOaDoc(db, spaceId, "会议纪要模板",
+            "# 会议纪要\n\n- [ ] 议题一：\n- [ ] 议题二：\n\n> 参会人：\n\n1. 结论一\n2. 结论二\n",
+            now);
+    }
+
+    static async bool AddOaDoc(IDbConnection db, int spaceId, string title,
+                            string content, long now) {
+        OaDoc doc = new OaDoc();
+        doc.tenantId = 1;
+        doc.spaceId = spaceId;
+        doc.title = title;
+        doc.content = content;
+        doc.contentText = Blocks.TextOf(content);
+        doc.version = 1;
+        doc.updatedBy = 1;
+        doc.createdAt = now;
+        doc.updatedAt = now;
+        int docId = await db.Insert<OaDoc>(doc).ExecuteIdentityAsync();
+        if (docId <= 0) { return false; }
+        OaDocRev rev = new OaDocRev();
+        rev.tenantId = 1;
+        rev.docId = docId;
+        rev.version = 1;
+        rev.title = title;
+        rev.content = content;
+        rev.editorId = 1;
+        rev.createdAt = now;
+        int _rid = await db.Insert<OaDocRev>(rev).ExecuteIdentityAsync();
+        return _rid > 0;
     }
 
     /* ---- 路由派生授权 ---- */

@@ -1,0 +1,126 @@
+using System;
+using System.Collections;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb.Model.Oa;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.Admin.Oa;
+
+/* /admin/oa/spaces 文档空间（T9）：空间 CRUD + 文档计数。
+   读端点 (id, tenantId) 双条件（BatchReport 范式）；空间非空禁删、
+   不做跨表级联（Bug#5 教训：级联必须显式受控，文档删除在 Docs.zan
+   闸后受控级联删版本）。readRoles/writeRoles 一期列先建不启用，
+   故不进表单。 */
+[Route("admin/oa/spaces/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("文档空间")]
+class Spaces : AdminController {
+    [HttpGet]
+    [Route("/admin/oa/spaces")]
+    [Custom(IsMenu = true, Icon = "mdi:folder-text", Perm = PermBit.View)]
+    [Description("文档空间")]
+    async void Index() {
+        ViewData d = await this.Layout("文档空间");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        List<OaSpace> rows = await this.OaSpace
+            .Where(a => a.tenantId == this.TenantId())
+            .OrderBy(a => a.id).ToListAsync();
+        List<StrMap> list = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            OaSpace s = rows[i];
+            StrMap r = new StrMap();
+            r.Set("id", Convert.ToString(s.id));
+            r.Set("name", s.name);
+            r.Set("description", s.description);
+            int docs = await this.OaDoc
+                .Where(a => a.tenantId == this.TenantId() && a.spaceId == s.id)
+                .CountAsync();
+            r.Set("docCount", Convert.ToString(docs));
+            r.Set("updatedAt", Fmt.Stamp(s.updatedAt));
+            list.Add(r);
+        }
+        d.Set("empty", rows.Count == 0 ? "1" : "");
+        d.Set("canCreate", this.Can(PermBit.Create) ? "1" : "");
+        d.Set("canUpdate", this.Can(PermBit.Update) ? "1" : "");
+        d.Set("canDelete", this.Can(PermBit.Delete) ? "1" : "");
+        this.Page(d);
+    }
+
+    /* 新建/编辑弹窗表单（data-dialog 片段）。 */
+    [HttpGet]
+    [Custom(IsMenu = false, Perm = PermBit.View)]
+    [Description("空间表单")]
+    async void Form() {
+        int id = this.InInt("id", 0);
+        OaSpace s = null;
+        if (id > 0) {
+            s = await this.OaSpace
+                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .FirstAsync();
+            if (s == null) { this.Fail(404, "0404", "空间不存在"); return; }
+        }
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("dialogTitle", id > 0 ? "编辑空间" : "新建空间");
+        d.Set("name", s == null ? "" : s.name);
+        d.Set("description", s == null ? "" : s.description);
+        this.Dialog(d);
+    }
+
+    /* 保存：新建 tenantId=当前值；编辑 (id, tenantId) 双条件。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("保存空间")]
+    async void Save() {
+        int id = this.InInt("id", 0);
+        string name = this.Need("name", "空间名称");
+        if (name.Length == 0) { this.Fail(400, "0004", "请填写空间名称"); return; }
+        string description = this.In("description");
+        if (description.Length > 256) { description = description.Substring(0, 256); }
+        long now = WebApp.NowSeconds();
+        if (id > 0) {
+            int n = await this.OaSpace.Update()
+                .Set(a => a.name, name)
+                .Set(a => a.description, description)
+                .Set(a => a.updatedAt, now)
+                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .ExecuteAffrowsAsync();
+            if (n <= 0) { this.Fail(404, "0404", "空间不存在"); return; }
+            this.Saved("空间已保存");
+            return;
+        }
+        OaSpace s = new OaSpace();
+        s.tenantId = this.TenantId();
+        s.name = name;
+        s.description = description;
+        s.readRoles = "";
+        s.writeRoles = "";
+        s.createdAt = now;
+        s.updatedAt = now;
+        int newId = await this.OaSpace.Insert(s).ExecuteIdentityAsync();
+        this.Saved(newId > 0 ? "空间已创建" : "保存失败");
+    }
+
+    /* 删除：非空禁删（不级联清文档），(id, tenantId) 双条件。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Delete)]
+    [Description("删除空间")]
+    async void Delete() {
+        int id = this.InInt("id", 0);
+        int docs = await this.OaDoc
+            .Where(a => a.tenantId == this.TenantId() && a.spaceId == id)
+            .CountAsync();
+        if (docs > 0) {
+            this.Fail(400, "0004", "空间内还有 " + Convert.ToString(docs)
+                + " 篇文档，先删除或迁移后再删空间");
+            return;
+        }
+        int n = await this.OaSpace.Delete()
+            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .ExecuteAffrowsAsync();
+        this.Saved(n > 0 ? "已删除" : "空间不存在");
+    }
+}
