@@ -77,6 +77,16 @@ static void drop_push(const char *path) {
 static Uint32 g_wake_event = 0; /* user event type posted by zan_gui_wake */
 static int g_ime_x = 0, g_ime_y = 0;
 
+/* Touch gesture state (phones/touchscreens: no wheel exists). The first
+ * finger is the only one tracked; a tap under the 8 px slop is delivered
+ * as a full synthesized click at finger-up, a drag beyond the slop turns
+ * into synthesized wheel events (1:1 finger travel) and presses nothing.
+ * SDL's own touch->mouse synthesis is switched off at init. */
+static SDL_FingerID g_touch_id = 0;   /* 0 = no finger down */
+static float g_touch_x, g_touch_y;    /* last position, window coords */
+static float g_touch_ax, g_touch_ay;  /* anchor = down position */
+static int g_touch_drag = 0;          /* past the slop: scrolling */
+
 /* Per-window renderer + streaming texture registry. The handle handed back to
  * Zan is the SDL_Window* (cast to i64), exactly like the Win32 HWND was. */
 typedef struct {
@@ -380,8 +390,79 @@ static void sdl_translate(const SDL_Event *e) {
                     delta, cur_mod_bits(), w);
             break;
         }
+        case SDL_EVENT_FINGER_DOWN: {
+            if (g_touch_id != 0) break; /* only the first finger scrolls */
+            /* Touch events may arrive without a usable windowID (some
+             * backends route them to 0); Android is single-window anyway. */
+            SDL_Window *w = SDL_GetWindowFromEvent(e);
+            if (!w) w = g_main_win;
+            if (!w) break;
+            int wi = 1, hi = 1;
+            SDL_GetWindowSize(w, &wi, &hi);
+            g_touch_id = e->tfinger.fingerID;
+            g_touch_x = g_touch_ax = e->tfinger.x * (float)wi;
+            g_touch_y = g_touch_ay = e->tfinger.y * (float)hi;
+            g_touch_drag = 0;
+            break;
+        }
+        case SDL_EVENT_FINGER_MOTION: {
+            if (e->tfinger.fingerID != g_touch_id || g_touch_id == 0) break;
+            SDL_Window *w = SDL_GetWindowFromEvent(e);
+            if (!w) w = g_main_win;
+            if (!w) break;
+            int wi = 1, hi = 1;
+            SDL_GetWindowSize(w, &wi, &hi);
+            float x = e->tfinger.x * (float)wi, y = e->tfinger.y * (float)hi;
+            if (!g_touch_drag) {
+                float dx = x - g_touch_ax, dy = y - g_touch_ay;
+                if (dx * dx + dy * dy < 64.0f) break; /* slop: still a tap */
+                g_touch_drag = 1; /* a drag scrolls and presses nothing */
+            }
+            /* Finger travel -> wheel deltas in the ±120 scale Gui/App's
+             * /120 math expects. A wheel notch scrolls 40 logical px at
+             * scrollSpeed = 40*dpiScale/100, dpiScale = g_dpi*100/96, so
+             * delta = dy*288/g_dpi moves content by ~dy window px. The
+             * sign mirrors natural touch scrolling: content follows the
+             * finger, so dragging up (y shrinks) must scroll DOWN, i.e.
+             * produce a negative wheel delta. */
+            int delta = (int)((y - g_touch_y) * 288.0f / (float)g_dpi);
+            if (delta != 0) {
+                zq_push(13, (int)x, (int)y, 0, delta, cur_mod_bits(), w);
+            }
+            g_touch_x = x;
+            g_touch_y = y;
+            break;
+        }
+        case SDL_EVENT_FINGER_UP:
+        case SDL_EVENT_FINGER_CANCELED: {
+            if (e->tfinger.fingerID != g_touch_id || g_touch_id == 0) break;
+            g_touch_id = 0;
+            if (g_touch_drag) break; /* the drag already scrolled */
+            if (e->type == SDL_EVENT_FINGER_CANCELED) break;
+            /* Tap: a full click at the anchor (move so hover/state is
+             * right, then press + release). */
+            SDL_Window *w = SDL_GetWindowFromEvent(e);
+            if (!w) w = g_main_win;
+            if (!w) break;
+            int x = (int)g_touch_ax, y = (int)g_touch_ay;
+            zq_push(1, x, y, 0, 0, cur_mod_bits(), w);
+            zq_push(2, x, y, 0, 0, cur_mod_bits(), w);
+            zq_push(3, x, y, 0, 0, cur_mod_bits(), w);
+            break;
+        }
         case SDL_EVENT_KEY_DOWN: {
             SDL_Window *w = SDL_GetWindowFromID(e->key.windowID);
+            /* Android's back gesture/button arrives as the AC_BACK
+             * scancode. Surface it as a kind-8 close event and let the
+             * app decide: a modal may consume it to just close (drawer),
+             * so g_quit must stay clear — the app ends itself by breaking
+             * its loop on an unconsumed kind 8, which returns from main
+             * and lets SDLActivity finish the task. */
+            if (e->key.scancode == SDL_SCANCODE_AC_BACK) {
+                if (!w) w = g_main_win;
+                zq_push(8, 0, 0, 0, 0, 0, w);
+                break;
+            }
             int vk = sdl_key_to_vk(e->key.key);
             int kmods = sdl_mods_to_bits(e->key.mod);
             zq_push(4, 0, 0, 0, vk, kmods, w);
@@ -531,6 +612,10 @@ static void zan_sdl_ensure_init(void) {
      * swallowing it, so a button clicked while the window is inactive fires on
      * the first click rather than needing a second (focus-then-click). */
     SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
+    /* Touch is handled by the finger-event branch below (tap = click,
+     * drag = synthesized wheel); SDL's own touch->mouse synthesis would
+     * phantom-press every widget the finger slides across. */
+    SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
     if (!SDL_Init(SDL_INIT_VIDEO)) return;
     float scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
     if (scale <= 0.0f) scale = 1.0f;

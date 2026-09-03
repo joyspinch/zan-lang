@@ -1382,6 +1382,7 @@ class Gallery {
     static SignalInt wizSel;             // Wizard demo template selection
     static SignalInt fbScroll;           // FloatButton back-to-top demo scroll
     static Input navSearch;              // component-navigation search box
+    static SignalBool navDrawer;         // phone: nav shown as a modal drawer
 
     // Reusable visual component designer (framework component).
     static Designer designer;
@@ -2499,6 +2500,7 @@ class Gallery {
         Gallery.scrollOff = new SignalInt(0);
         Gallery.tipScroll = new SignalInt(0);
         Gallery.photosOpen = new SignalBool(false);
+        Gallery.navDrawer = new SignalBool(false);
         Gallery.loadStartMs = 0;
         Gallery.photoIdx = new SignalInt(0);
         Gallery.photoAnim = new CarouselAnim();
@@ -2786,7 +2788,14 @@ class Gallery {
                 } else if (Gallery.UploadOwnsWindow(evh)) {
                     Gallery.UploadApplyEvent(evh);
                 } else if (evh == app.WindowHandle()) {
-                    break;
+                    // Android back gesture while the drawer is open just
+                    // closes the drawer; a second back leaves the app.
+                    if (Gallery.navDrawer.Get()) {
+                        Gallery.navDrawer.Set(false);
+                        app.RequestRedraw();
+                    } else {
+                        break;
+                    }
                 }
             } else if (Gallery.filePicker.OwnsWindow(evh)) {
                 // Route each input frame to whichever window OWNS it (by native
@@ -3187,8 +3196,20 @@ class Gallery {
 
         int sw = app.Scale(272);
         Rect content = new Rect(0, top, w, h - top);
-        Gallery.RenderNav(app, c, t, content, sw);
-        Gallery.RenderDetail(app, c, t, content, sw);
+        if (w < app.Scale(700) || h > w) {
+            // Phone/narrow window (portrait included): a fixed nav pane would
+            // eat most of the screen. The detail page goes full-width and the
+            // navigation moves into a modal drawer behind a toggle chip.
+            Gallery.RenderDetail(app, c, t, content, 0);
+            if (Gallery.navDrawer.Get()) {
+                Gallery.RenderNavDrawer(app, c, t, content);
+            } else {
+                Gallery.RenderNavToggle(app, c, t, content);
+            }
+        } else {
+            Gallery.RenderNav(app, c, t, content, sw);
+            Gallery.RenderDetail(app, c, t, content, sw);
+        }
         // toast/通知队列是全局状态，任何页面的按钮都可能入队；每帧在页面
         // 之上画一次。此前挂在 RenderOverlay 末尾，Alert 这类没有 overlay
         // 演示的页面整页都不会执行到它，入队的消息永远不被绘制。
@@ -3642,6 +3663,56 @@ class Gallery {
             + app.Scale(16);
         h = h + panelH + app.Scale(26);
         return h;
+    }
+
+    /// Phone mode: the chip that opens the nav drawer, drawn top-left over
+    /// the full-width detail page. Same visual language as the EN/中 chips.
+    static void RenderNavToggle(App app, Canvas c, Theme t, Rect area) {
+        int bw = app.Scale(96);
+        int bh = app.Scale(30);
+        int bx = area.x + app.Scale(12);
+        int by = area.y + app.Scale(10);
+        Gallery.RenderLangChip(app, c, t, bx, by, bw, bh,
+            Gallery.T("Components", "组件"), false);
+        if (app.window.EventKind() == 3 && app.window.EventButton() == 0
+                && app.mouseX >= bx && app.mouseX < bx + bw
+                && app.mouseY >= by && app.mouseY < by + bh) {
+            Gallery.navDrawer.Set(true);
+            app.RequestRedraw();
+        }
+    }
+
+    /// Phone mode: the nav as a modal drawer — scrim over the whole window,
+    /// the regular RenderNav pane docked at the left edge. Tapping a row,
+    /// the scrim, or Escape (and the Android back gesture) closes it; the
+    /// block/capture calls follow the DataTable.Overlays convention so the
+    /// page below never sees the drawer's taps.
+    static void RenderNavDrawer(App app, Canvas c, Theme t, Rect area) {
+        int dw = app.Scale(300);
+        if (dw > area.width - app.Scale(48)) { dw = area.width - app.Scale(48); }
+        if (dw < app.Scale(200)) { dw = app.Scale(200); }
+
+        c.FillRect(area.x, area.y, area.width, area.height, t.overlay);
+        app.CaptureWheel(area.x, area.y, area.width, area.height);
+        app.BlockHitsRect(area.x, area.y, area.width, area.height);
+
+        int before = Gallery.selected.Get();
+        Gallery.RenderNav(app, c, t,
+            new Rect(area.x, area.y, dw, area.height), dw);
+        if (Gallery.selected.Get() != before) {
+            Gallery.navDrawer.Set(false); // picking a page closes the drawer
+        }
+
+        bool clicked = app.window.EventKind() == 3
+            && app.window.EventButton() == 0;
+        if (clicked && app.mouseX >= area.x + dw) {
+            Gallery.navDrawer.Set(false);
+            app.RequestRedraw();
+        }
+        if (app.window.EventKind() == 4 && app.window.EventKeyCode() == 27) {
+            Gallery.navDrawer.Set(false);
+            app.RequestRedraw();
+        }
     }
 
     /// Right detail pane: scrollable Naive-UI style page -- title, page
