@@ -134,46 +134,64 @@ class Flows : AdminController {
             }
         }
 
-        /* 部门/员工候选：编排时指派责任人。Bug#4（本体 A，方案 b）：
-           模板引擎 #each 只在全局 ViewData 解析列表（无行内嵌套列表），
-           {{#each ../users}} 恒渲染为空——故在服务端把候选预渲染成
-           <option> 标记串，经行字段 {{{deptOpts}}}/{{{userOpts}}} 提升
-           进节点行作用域。名称经 View.HtmlEscape 转义防注入。
+        /* 部门/员工候选：编排时指派责任人。模板引擎 #each 只在全局
+           ViewData 解析列表（无行内嵌套列表），{{#each ../users}} 恒渲染
+           为空——故在服务端把候选预渲染成 <option> 标记串，经行字段
+           {{{deptOpts}}}/{{{userOpts}}} 提升进节点行作用域。名称经
+           View.HtmlEscape 转义防注入。
+           Bug#7：候选串按行生成——节点行按已保存的 deptId/assignUserId
+           在对应 option 上补 selected（与 HtmlEscape 后文本比对用原始
+           id 数值），修「下拉停首项，操作员误以为未指派而重存覆盖」。
+           空位行（slots）传 0 不标记，浏览器停在占位首项「不限/未指定」。
            员工候选池=本租户启用账号（sys_user.tenantId，Bug#4 本体 B：
            该枚举面被编辑弹窗暴露，必须租户闸）；部门为全局组织架构
            （sys_department 无租户列，同角色/字典形态）。 */
-        string deptOpts = "";
         List<Department> depts = await this.Department.ToListAsync();
-        for (int i = 0; i < depts.Count; i = i + 1) {
-            deptOpts = deptOpts + "<option value=\""
-                + Convert.ToString(depts[i].id) + "\">"
-                + View.HtmlEscape(depts[i].name) + "</option>";
-        }
-        string userOpts = "";
         List<User> users = await this.User
             .Where(a => a.tenantId == this.TenantId() && a.status == 1)
             .ToListAsync();
-        for (int i = 0; i < users.Count; i = i + 1) {
-            userOpts = userOpts + "<option value=\""
-                + Convert.ToString(users[i].id) + "\">"
-                + View.HtmlEscape(Fmt.Text(users[i].nickname,
-                    users[i].username)) + "</option>";
-        }
         List<StrMap> nodeRows = d.ListOf("nodes");
         if (nodeRows != null) {
-            for (int i = 0; i < nodeRows.Count; i = i + 1) {
-                nodeRows[i].Set("deptOpts", deptOpts);
-                nodeRows[i].Set("userOpts", userOpts);
+            for (int i = 0; i < nodeRows.Count && i < ordered.Count; i = i + 1) {
+                nodeRows[i].Set("deptOpts", Flows.DeptOpts(depts, ordered[i].deptId));
+                nodeRows[i].Set("userOpts", Flows.UserOpts(users, ordered[i].assignUserId));
             }
         }
+        string deptOpts0 = Flows.DeptOpts(depts, 0);
+        string userOpts0 = Flows.UserOpts(users, 0);
         List<StrMap> slotRows = d.ListOf("slots");
         if (slotRows != null) {
             for (int i = 0; i < slotRows.Count; i = i + 1) {
-                slotRows[i].Set("deptOpts", deptOpts);
-                slotRows[i].Set("userOpts", userOpts);
+                slotRows[i].Set("deptOpts", deptOpts0);
+                slotRows[i].Set("userOpts", userOpts0);
             }
         }
         this.Dialog(d);
+    }
+
+    /* Bug#7：部门候选串，sel 与 option value（原始 id）相等才补 selected。 */
+    static string DeptOpts(List<Department> depts, int sel) {
+        string s = "";
+        for (int i = 0; i < depts.Count; i = i + 1) {
+            int did = depts[i].id;
+            string mark = did == sel ? " selected" : "";
+            s = s + "<option value=\"" + Convert.ToString(did) + "\"" + mark + ">"
+                + View.HtmlEscape(depts[i].name) + "</option>";
+        }
+        return s;
+    }
+
+    /* Bug#7：员工候选串，同上；昵称空时回退用户名（与原渲染一致）。 */
+    static string UserOpts(List<User> users, int sel) {
+        string s = "";
+        for (int i = 0; i < users.Count; i = i + 1) {
+            int uid = users[i].id;
+            string mark = uid == sel ? " selected" : "";
+            s = s + "<option value=\"" + Convert.ToString(uid) + "\"" + mark + ">"
+                + View.HtmlEscape(Fmt.Text(users[i].nickname, users[i].username))
+                + "</option>";
+        }
+        return s;
     }
 
     /* 保存定义与节点：nodes 以行提交（nodeId/name/sort/deptId/assignUserId/kind/aiPrompt）。 */
