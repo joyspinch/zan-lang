@@ -57,6 +57,7 @@ class MqttTopicStat {
 // 以类声明并通过 Json.Serialize<T> 序列化；字段名
 // 与文档定义的结构保持一致。
 
+/// 已连接客户端的管理快照条目。
 class MqttClientDoc {
     int id;
     string client_id;
@@ -83,18 +84,21 @@ class MqttClientDetailDoc {
     List<MqttSubDoc> subscriptions;
 }
 
+/// 订阅平铺条目（客户端 id + 过滤器 + QoS）。
 class MqttSubEntryDoc {
     string client_id;
     string filter;
     int qos;
 }
 
+/// 已见主题：名称、消息计数、最后一条负载。
 class MqttTopicDoc {
     string topic;
     int messages;
     string last;
 }
 
+/// broker 吞吐量快照（对应 MetricsJson 输出结构）。
 class MqttMetricsDoc {
     int uptime_sec;
     int clients_connected;
@@ -153,8 +157,8 @@ class MqttBroker {
     /// <summary>墙上时钟秒；用于管理快照中的时间戳。</summary>
     static int Now() { return time(0); }
 
-    // 供 Worker 集成使用的共享实例（"mqtt" 协议的 worker 会将
-    // 每个接受的连接路由到这里）。
+    /// 供 Worker 集成使用的共享实例（"mqtt" 协议的 worker 会将
+    /// 每个接受的连接路由到这里）；首次调用时惰性创建。
     static MqttBroker inst;
     static MqttBroker Global() {
         if (inst == null) { inst = new MqttBroker("", 0); }
@@ -164,12 +168,17 @@ class MqttBroker {
     /// <summary>将此 broker 发布为进程级实例，使 HTTP
     /// 控制器无需层层传递即可读取其注册表。</summary>
     static void Use(MqttBroker b) { inst = b; }
+    /// 进程级共享实例（未 Use 时返回惰性创建的默认实例）。
     static MqttBroker Instance() { return MqttBroker.Global(); }
 
+    /// 当前连接的客户端数。
     int Count() { return this.sessions.Count; }
 
     // ---- 帧解析（二进制安全的读取；理由见 MqttClient） ----
 
+    /// 阻塞式读单字节（协程停靠在可读事件上）；对端关闭或
+    /// 套接字已死时返回 -1——两种情况都必须结束会话，死套接字
+    /// 永远"可读"，重试只会让协程原地空转。
     async int ReadByteAsync(nint sock) {
         byte[] b = new byte[2];
         while (true) {
@@ -185,6 +194,7 @@ class MqttBroker {
         }
     }
 
+    /// 循环读满 `need` 字节；对端中途关闭时返回已读部分。
     async byte[] ReadBytesAsync(nint sock, int need) {
         byte[] buf = new byte[need + 1];
         byte[] tmp = new byte[need + 1];
@@ -288,6 +298,8 @@ class MqttBroker {
         return packet;
     }
 
+    /// 同一报文的线上总长（1 固定头 + varint 长度 + 剩余），
+    /// 供发送方统计字节用，不必实际构建报文。
     int PublishPacketLen(string topic, int payloadLen) {
         int topicLen = (int)strlen(topic);
         int remainLen = 2 + topicLen + payloadLen;
@@ -453,6 +465,7 @@ class MqttBroker {
         return "";
     }
 
+    /// 全部订阅（按客户端平铺）的管理 JSON。
     string SubscriptionsJson() {
         List<MqttSubEntryDoc> outp = new List<MqttSubEntryDoc>();
         for (int i = 0; i < this.sessions.Count; i = i + 1) {

@@ -115,6 +115,7 @@ class TlsContext {
         this.certPolicy = fn;
     }
 
+    /// 是否已设置证书策略（握手后逐连接裁决校验结果）。
     bool PolicyActive() { return this.certPolicy != null; }
 
     /// <summary>添加一个可接受的服务器公钥 pin：即
@@ -308,6 +309,20 @@ class TlsContext {
     // 请求都在链校验处失败。按 curl 的做法探测本机的系统 CA 包，
     // 装上第一个存在的，返回其路径；都没有则返回 ""。
     static string LoadSystemRootsUnix(string sslctx) {
+        #if ANDROID
+        // Android 没有桌面发行版的 CA 布局；系统信任库是 hash 目录
+        // /system/etc/security/cacerts（API 29+ 部分 ROM 另有
+        // /apex/com.android.conscrypt/cacerts），正是 OpenSSL
+        // SSL_CTX_load_verify_locations 的 lookdir 约定。
+        if (SSL_CTX_load_verify_locations(sslctx, null,
+                "/system/etc/security/cacerts") == 1) {
+            return "/system/etc/security/cacerts";
+        }
+        if (SSL_CTX_load_verify_locations(sslctx, null,
+                "/apex/com.android.conscrypt/cacerts") == 1) {
+            return "/apex/com.android.conscrypt/cacerts";
+        }
+        #endif
         List<string> cands = new List<string>();
         #if MACOS
         // Apple 随系统分发的 PEM 包；后两条覆盖装了 Homebrew OpenSSL 的机器。
@@ -410,10 +425,12 @@ class TlsContext {
         return added == 1;
     }
 
+    /// 底层 OpenSSL SSL_CTX 指针（interop 传递用，勿手工释放）。
     string Handle() {
         return this.ctx;
     }
 
+    /// 是否为服务器端上下文。
     bool IsServer() {
         return this.server;
     }
@@ -541,6 +558,8 @@ class TlsStream {
         this.scratch = null;
     }
 
+    /// 把 ctx 包装到套接字上（分配 SSL 与内存 BIO 对、
+    /// SCRATCH 暂存缓冲）；不执行握手。失败返回 null。
     static TlsStream Setup(TlsContext ctx, nint sock) {
         TlsStream s = new TlsStream();
         s.ssl = SSL_new(ctx.Handle());
@@ -761,7 +780,7 @@ class TlsStream {
         return Base64.Encode(dstr, 32);
     }
 
-    // 把 wbio 中待发的加密输出字节刷到套接字。
+    /// 把 wbio 中待发的加密输出字节刷到套接字。
     // 必须保证 BIO 中读出的每一块都完整发出；否则截断的 TLS
     // 记录会导致握手/数据损坏。Socket.SendAsync 在内部已经循环
     // 重发，因此其返回值应等于请求发送的字节数；若不相等则
