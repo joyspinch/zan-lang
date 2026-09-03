@@ -188,11 +188,18 @@ class Game {
     public double atkAcc;
     // 自动换装开关(掉落即穿更强的一件)
     public bool autoEquip;
+    // 自动重置开关:卡层 60 秒无击杀自动退一层(PRD 4.1"卡层自动处理")
+    public bool autoReset;
+    public long lastKillTs;    // 最近一次击杀(ms),自动重置判定用
+    // 秘境挂机模式(会话内开关,不存档;开启后主区战斗走秘境数值)
+    public bool mjMode;
 
     public Game() {
         this.p = new Player();
         this.bossMode = false;
         this.autoEquip = true;
+        this.autoReset = true;
+        this.mjMode = false;
     }
 
     // ---------------------------------------------------------------
@@ -221,6 +228,7 @@ class Game {
         this.rkSeed = seed;
         // 初始怪物
         this.SpawnMonster(this.p.hjFloor, false);
+        this.lastKillTs = Game.NowMs();
         // 初始日锚
         this.p.lastDayTs = Game.NowMs();
         this.p.lastSeenTs = this.p.lastDayTs;
@@ -463,9 +471,8 @@ class Game {
             hp = hp * Data.HJ_BOSS_HP_MULT * (1.0 + this.p.turn * 0.4);
             atk = atk * Data.HJ_BOSS_ATK_MULT * (1.0 + this.p.turn * 0.3);
         }
-        // 秘境倍率
-        if (floor < 0) {
-            int absF = -floor;
+        // 秘境倍率(显式负层 或 主区秘境挂机模式)
+        if (floor < 0 || this.mjMode) {
             hp = hp * Data.MJ_HP_MULT;
             atk = atk * Data.MJ_ATK_MULT;
         }
@@ -491,6 +498,25 @@ class Game {
         return pre[idx] + suf;
     }
 
+    // 地图传送(PRD 4.4):选择挂机场景。门槛层以上即可传送,
+    // 传送 = 把幻境推层进度挪到该地图的起始层(数值全由既有曲线接管)。
+    public bool SelectMap(int idx) {
+        if (idx < 0 || idx >= 20) { return false; }
+        if (this.p.hjBest < Data.MAP_MIN_FLOOR[idx]) {
+            this.AddChat("[地图] 「" + Data.MAP_NAMES[idx] + "」需历史最高 "
+                         + Data.MAP_MIN_FLOOR[idx] + " 层,当前最高 " + this.p.hjBest + " 层");
+            return false;
+        }
+        int from = this.p.hjFloor;
+        this.p.hjFloor = Data.MAP_MIN_FLOOR[idx];
+        this.p.hjKills = 0;
+        this.p.hjTarget = Data.HJ_KILL_TARGET + this.p.hjFloor / 4;
+        this.SpawnMonster(this.p.hjFloor, this.IsBossFloor(this.p.hjFloor));
+        this.AddChat("[地图] 传送至「" + Data.MAP_NAMES[idx] + "」"
+                     + this.p.hjFloor + " 层(原 " + from + " 层)");
+        return true;
+    }
+
     public void StepIdle(double dt) {
         // 自动战斗:按出手节拍推进,而不是每帧一刀。
         long now = Game.NowMs();
@@ -508,6 +534,7 @@ class Game {
             guard = guard + 1;
             this.DoOneHit(now);
         }
+        this.AutoResetTick(now);
     }
 
     // 出手间隔:基础 ATK_INTERVAL,受速度属性压缩(下限 0.35s)
@@ -531,7 +558,7 @@ class Game {
         this.lastHitTs = now;
         this.totalDamageDealt = this.totalDamageDealt + hit;
         if (this.curMonsterHp <= 0) {
-            this.OnMonsterKilled();
+            this.OnMonsterKilled(now);
         }
     }
 
@@ -539,7 +566,7 @@ class Game {
         return f > 0 && (f % Data.HJ_BOSS_EVERY) == 0;
     }
 
-    public void OnMonsterKilled() {
+    public void OnMonsterKilled(long now) {
         bool boss = this.curIsBoss;
         int floor = this.p.hjFloor;
         double gold = Data.HJ_KILL_GOLD * Math.Pow(Data.REWARD_GOLD_GROWTH, floor - 1);
@@ -549,6 +576,14 @@ class Game {
             gold = gold * Data.HJ_BOSS_GOLD_MULT;
             xp = xp * Data.HJ_BOSS_XP_MULT;
             sw = sw * Data.HJ_BOSS_SW_MULT;
+        }
+        // 秘境挂机:奖励乘秘境系数,击杀计入秘境进度
+        if (this.mjMode) {
+            gold = gold * Data.MJ_GOLD_MULT;
+            xp = xp * Data.MJ_XP_MULT;
+            this.p.mjKills = this.p.mjKills + 1;
+            this.p.mjFloor = floor;
+            if (floor > this.p.mjBest) { this.p.mjBest = floor; }
         }
         // 转生加成
         double turnMult = 1.0 + this.p.turn * 0.25;
@@ -564,6 +599,7 @@ class Game {
         this.p.hjKillAcc = this.p.hjKillAcc + 1;
         this.p.totalKills = this.p.totalKills + 1;
         this.p.hjKills = this.p.hjKills + 1;
+        this.lastKillTs = now;
 
         // BOSS 击破 → 累计击破数(转生用)
         if (boss) {
@@ -579,18 +615,46 @@ class Game {
             this.DropEquip(floor, boss);
         }
 
-        // 当前层目标达成 → 下一层
+        // 当前层目标达成 → 下一层(PRD 4.1:清怪 → BOSS 首杀过关)
         if (this.p.hjKills >= this.p.hjTarget) {
             this.p.hjFloor = this.p.hjFloor + 1;
             this.p.hjKills = 0;
             this.p.hjTarget = Data.HJ_KILL_TARGET + this.p.hjFloor / 4;
             if (this.p.hjFloor > this.p.hjBest) { this.p.hjBest = this.p.hjFloor; }
+            // 过关提示:BOSS 层即将出现,给玩家一个"再打一层就睡"的钩子
+            if (this.IsBossFloor(this.p.hjFloor)) {
+                this.AddChat("[幻境] 进入第 " + this.p.hjFloor
+                             + " 层,本层有守关 BOSS!");
+            } else if (this.p.hjFloor % 10 == 1 && this.p.hjFloor > 1) {
+                // 每 10 层进入新地图带(取 MAP_NAMES 门槛),顺带提示可传送
+                for (int i = 19; i >= 0; i = i - 1) {
+                    if (Data.MAP_MIN_FLOOR[i] == this.p.hjFloor) {
+                        this.AddChat("[幻境] 抵达「" + Data.MAP_NAMES[i]
+                                     + "」地界(第 " + this.p.hjFloor + " 层)");
+                        break;
+                    }
+                }
+            }
             // 自动重生下一层怪
             this.SpawnMonster(this.p.hjFloor, this.IsBossFloor(this.p.hjFloor));
         } else {
             // 重生同层怪
             this.SpawnMonster(this.p.hjFloor, this.IsBossFloor(this.p.hjFloor));
         }
+    }
+
+    // 自动重置(PRD 4.1):卡层 60 秒无击杀 → 退一层重新清怪
+    public void AutoResetTick(long now) {
+        if (!this.autoReset) { return; }
+        if (this.p.hjFloor <= 1) { return; }
+        if (this.lastKillTs <= 0) { this.lastKillTs = now; return; }
+        if (now - this.lastKillTs < 60000) { return; }
+        this.p.hjFloor = this.p.hjFloor - 1;
+        this.p.hjKills = 0;
+        this.p.hjTarget = Data.HJ_KILL_TARGET + this.p.hjFloor / 4;
+        this.lastKillTs = now;
+        this.SpawnMonster(this.p.hjFloor, this.IsBossFloor(this.p.hjFloor));
+        this.AddChat("[幻境] 卡层超时,自动重置到第 " + this.p.hjFloor + " 层");
     }
 
     public void DropEquip(int floor, bool boss) {
@@ -750,6 +814,7 @@ class Game {
         // 重生当前层怪,回来即可接着打
         this.SpawnMonster(this.p.hjFloor, this.IsBossFloor(this.p.hjFloor));
         this.p.lastSeenTs = now;
+        this.lastKillTs = now;
     }
 
     // ---------------------------------------------------------------
@@ -1541,6 +1606,7 @@ class Game {
         }
         lines.Add("bhl=" + this.p.bhTriesLeft);
         lines.Add("ts=" + this.p.lastSeenTs);
+        lines.Add("lkt=" + this.lastKillTs);
         lines.Add("d=" + this.p.lastDayTs);
         lines.Add("tpage=" + this.p.titlePage);
         lines.Add("trank=" + this.p.titleRank);
@@ -1683,6 +1749,7 @@ class Game {
                 if (idx >= 0 && idx < 8) { this.p.bhKilled[idx] = Game.ParseIntS(v); }
             }
             else if (k == "ts") { this.p.lastSeenTs = Game.ParseLongS(v); }
+            else if (k == "lkt") { this.lastKillTs = Game.ParseLongS(v); }
             else if (k == "d") { this.p.lastDayTs = Game.ParseLongS(v); }
             else if (k == "tpage") { this.p.titlePage = Game.ParseIntS(v); }
             else if (k == "trank") { this.p.titleRank = Game.ParseIntS(v); }
