@@ -90,6 +90,38 @@ class Dashboard : AdminController {
                     erows.Add(row);
                 }
                 d.Set("hasEvents", evs.Count > 0 ? "1" : "");
+
+                /* 公告（T12 接线）：受众内我未读的公告——pinned 优先，
+                   其余限 7 天内；卡片 ≤5 条，弹窗取最新一条（键=公告 id，
+                   同日不重弹、换 key 次日再弹，逻辑在 admin.js）。受众
+                   判定复用 Announcements.DeptHit（Holds 逗号精确匹配）。 */
+                long weekAgo = now - 7 * 86400;
+                List<OaAnnouncement> anns = await this.OaAnnouncement
+                    .Where(a => a.tenantId == this.TenantId())
+                    .OrderByDescending(a => a.pinned).OrderByDescending(a => a.id)
+                    .ToListAsync();
+                List<OaAnnouncementRead> annReads = await this.OaAnnouncementRead
+                    .Where(a => a.tenantId == this.TenantId() && a.userId == me.id)
+                    .ToListAsync();
+                List<StrMap> arows = d.AddList("announces");
+                int shown = 0;
+                int popId = 0;
+                for (int i = 0; i < anns.Count && shown < 5; i = i + 1) {
+                    OaAnnouncement an = anns[i];
+                    if (!ZanWeb.Admin.Oa.Announcements.DeptHit(an, me)) { continue; }
+                    if (Dashboard.Readed(annReads, an.id)) { continue; }
+                    if (an.pinned != 1 && an.createdAt < weekAgo) { continue; }
+                    StrMap row = new StrMap();
+                    row.Set("id", Convert.ToString(an.id));
+                    row.Set("title", an.title);
+                    row.Set("pinned", an.pinned == 1 ? "1" : "");
+                    row.Set("createdAt", Fmt.Stamp(an.createdAt));
+                    arows.Add(row);
+                    if (shown == 0) { popId = an.id; }
+                    shown = shown + 1;
+                }
+                d.Set("hasAnnounces", shown > 0 ? "1" : "");
+                d.Set("announcePopup", shown > 0 ? Convert.ToString(popId) : "");
             }
 
             /* 登录记录按用户名匹配（非归属）：一条登录行写于对应账号确认之前，故用本 scope 覆盖的用户名匹配——与登录日志屏同一规则。 */
@@ -132,6 +164,14 @@ class Dashboard : AdminController {
         if (source == "crm") { return "商机"; }
         if (source == "wms") { return "库存"; }
         return source;
+    }
+
+    /* 公告已读判定：明细集合内存对照（与 Announcements.Readed 同款）。 */
+    static bool Readed(List<OaAnnouncementRead> reads, int annId) {
+        for (int i = 0; i < reads.Count; i = i + 1) {
+            if (reads[i].announcementId == annId) { return true; }
+        }
+        return false;
     }
 
     static string OkText(int ok) {

@@ -1700,4 +1700,31 @@
     document.addEventListener('DOMContentLoaded', refresh);
   })();
 
+  // 公告登录弹窗（T12）：有未读公告时 Dashboard 渲染挂点，首次登录
+  // 自动弹详情；同日不重弹（day 相同），同一条公告历史日已弹不重弹
+  // （key 相同），换 key（新公告）次日再弹。
+  (function announcePopup() {
+    document.addEventListener('DOMContentLoaded', function () {
+      var host = document.querySelector('[data-announce-popup]');
+      if (!host || !window.Layer) { return; }
+      var key = host.getAttribute('data-announce-key') || '';
+      var url = host.getAttribute('data-announce-url') || '';
+      if (!key || !url) { return; }
+      var now = new Date();
+      var day = now.getFullYear() + '-' + (now.getMonth() + 1) + '-' + now.getDate();
+      var seenKey = '';
+      var seenDay = '';
+      try {
+        seenKey = localStorage.getItem('ann_popup_key') || '';
+        seenDay = localStorage.getItem('ann_popup_day') || '';
+      } catch (e) { /* 隐私模式等异常直接放弃弹窗 */ }
+      if (seenDay === day || seenKey === key) { return; }
+      try {
+        localStorage.setItem('ann_popup_key', key);
+        localStorage.setItem('ann_popup_day', day);
+      } catch (e) { /* ignore */ }
+      Layer.open({ url: url, title: '公告', width: '560px' });
+    });
+  })();
+
 })();
