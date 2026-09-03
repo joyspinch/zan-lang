@@ -59,6 +59,7 @@ class UploadFile {
     /// 让静态方法组形式的 CustomRequest 能回推 SetItemPercent/SetItemStatus。
     Upload owner;
 
+    /// 构造空白项：Pending 状态、无扩展名、全字段空。
     UploadFile() {
         id = 0;
         name = "";
@@ -95,21 +96,31 @@ class UploadFile {
 /// 范式：Enqueue 在空闲时拉起 UploadJob.Run，Run 取一项 await
 /// 一项，队列排空即退，下次入队再拉起。
 class UploadJob {
+    /// 任务队列互斥锁句柄（懒建）。
     static nint lockHandle;
+    /// 待处理作业队列（锁保护）。
     static List<UploadJob> pending;
+    /// 后台 worker 是否存活（队列排空即退出并复位）。
     static bool workerStarted;
 
+    /// 作业归属的宿主组件（进度/完成封送目标）。
     Upload host;
+    /// 传输的文件项与它的 id（封送后按 id 反查，列表可能已变）。
     UploadFile item;
     int itemId;
     /// 作业创建时从 Upload 快照的统一外部调用策略。
     ExternalCallPolicy callPolicy;
+    /// 目标连接参数（Init 从 Action URL 解析；无端口时按 scheme 补 80/443）。
     bool tls;
     string hostName;
     int port;
     string urlPart;
+    /// multipart 表单字段名。
     string field;
+    /// 上次封送的进度百分比（去重用）；-1 = 尚未报过。
     int lastPct;
+    /// 完成结果快照（ReportDone 写入，UI 线程 FlushDone 消费）：
+    /// HTTP 状态码、响应体、错误信息，donePosted 防重复封送。
     int doneCode;
     string doneBody;
     string doneErr;
@@ -251,6 +262,7 @@ class UploadJob {
         if (host != null && host.uiApp != null) { host.uiApp.Post(this.FlushProgress); }
     }
 
+    /// 记录完成结果并（仅首次）封送 FlushDone 回 UI 线程。
     void ReportDone(int code, string body, string err) {
         doneCode = code;
         doneBody = body;
@@ -260,6 +272,7 @@ class UploadJob {
         if (host != null && host.uiApp != null) { host.uiApp.Post(this.FlushDone); }
     }
 
+    /// UI 线程侧转发：进度 / 完成结果交给宿主 Upload 入账。
     void FlushProgress() { if (host != null) { host.ApplyProgress(this); } }
     void FlushDone() { if (host != null) { host.ApplyDone(this); } }
 }
@@ -351,7 +364,7 @@ class Upload : Control {
     App uiApp;
     FilePicker picker;
     List<UploadJob> jobs;
-    // 本帧拖放落区（Render 时刷新；WantsDropAt 据此判定）。
+    /// 本帧拖放落区（Render 时刷新；WantsDropAt 据此判定）。
     int dropX;
     int dropY;
     int dropW;
@@ -396,6 +409,7 @@ class Upload : Control {
         dropH = 0;
     }
 
+    /// 构造：非受控模式，自建空文件列表。
     Upload() {
         this.InitUpload();
     }
@@ -536,6 +550,7 @@ class Upload : Control {
         return added;
     }
 
+    /// 单个路径造项并过门入列（AddPaths 的内层）。
     bool TryAddPath(string path) {
         string name = Path.GetFileName(path);
         if (name == "") { name = path; }
@@ -599,6 +614,8 @@ class Upload : Control {
         return true;
     }
 
+    /// 扩展名是否命中 Accept 列表（逗号/分号分隔，容忍 "*." 与 "." 前缀；
+    /// "*" 通配；空扩展名恒通过）。
     bool AcceptAllows(string ext) {
         if (ext == "") { return true; }
         string acc = Accept.ToLower();
@@ -621,6 +638,7 @@ class Upload : Control {
         return false;
     }
 
+    /// 扩展名是否为常见图片格式（决定缩略图/图标形态）。
     static bool IsImageExt(string ext) {
         return ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "gif"
             || ext == "bmp" || ext == "webp" || ext == "ico" || ext == "svg";
@@ -662,11 +680,13 @@ class Upload : Control {
         UploadJob.Enqueue(job);
     }
 
+    /// 从活动作业表摘除已完结的作业。
     void DropJob(UploadJob job) {
         int ji = jobs.IndexOf(job);
         if (ji >= 0) { jobs.RemoveAt(ji); }
     }
 
+    /// 标记一项失败：写状态与原因，触发 Error + Change。
     void FailItem(UploadFile f, string message) {
         f.status = UploadStatus.Error();
         f.message = message;
@@ -711,6 +731,7 @@ class Upload : Control {
 
     // ---- 项操作 ----------------------------------------------------------
 
+    /// 按项 id 查找文件项；未找到返回 null。
     UploadFile Find(int id) {
         if (Files == null) { return null; }
         int i = 0;
@@ -803,6 +824,7 @@ class Upload : Control {
 
     // ---- 内建文件选择弹窗（FilePicker 路由） ------------------------------
 
+    /// 懒建内建选择弹窗并接 Accepted 回调。
     void EnsurePicker() {
         if (picker != null) { return; }
         picker = new FilePicker();
@@ -848,6 +870,7 @@ class Upload : Control {
     /// lastDir/上限透传等 picker 侧语义用；宿主正常流程无需触碰。
     FilePicker Picker() { return picker; }
 
+    /// 弹窗确认回调：按单/多选模式取选中路径，逐项过门入列。
     void OnPicked() {
         if (picker == null) { return; }
         if (Multiple || Max > 1) {
@@ -950,26 +973,31 @@ class Upload : Control {
 
     // ---- 样式辅助 --------------------------------------------------------
 
+    /// 触发区与列表行之间的间距（皮肤 gap 可覆写）。
     int StyleGap(App app) {
         StyleBox s = this.ResolveStyleAs(app, "upload", Class, Style.SNormal());
         return s.GapOr(app.theme.paddingTiny);
     }
 
+    /// 文本列表行高：带缩略图 44，否则 34（按 DPI 缩放）。
     int RowH(App app) {
         if (Thumbnail) { return app.Scale(44); }
         return app.Scale(34);
     }
 
+    /// 触发按钮样式（normal / hover / disabled 三态）。
     StyleBox TriggerStyle(App app, bool off) {
         bool hover = !off && app.focus.IsHovered(baseId);
         int st = off ? Style.SDisabled() : (hover ? Style.SHover() : Style.SNormal());
         return this.ResolvePartAs(app, "upload", "trigger", "", Class, st);
     }
 
+    /// 触发按钮高度（皮肤 height 可覆写）。
     int TriggerH(App app) {
         return this.TriggerStyle(app, true).HeightOr(app.theme.heightMedium);
     }
 
+    /// 触发按钮宽度 = 文字宽 + 左右 padding（TriggerText 空 = 默认文案）。
     int TriggerW(App app) {
         StyleBox s = this.TriggerStyle(app, true);
         int fs = s.FontOr(Style.FontFallback(app, "medium"));
@@ -978,6 +1006,7 @@ class Upload : Control {
             + s.PadLOr(app.theme.paddingLarge) + s.PadROr(app.theme.paddingLarge);
     }
 
+    /// Dragger 大框高度：图标圆 + 主文案（+ 可选副文案）装配。
     int DraggerH(App app) {
         int fs = Style.FontFallback(app, "medium");
         int h = app.Scale(22) + app.Scale(40) + app.Scale(12) + Canvas.FontHeight(fs)
@@ -988,6 +1017,7 @@ class Upload : Control {
         return h;
     }
 
+    /// 超宽文本逐字收缩截断并补「…」；不超宽原样返回。
     static string Ellipsize(string s, int maxW, int fs) {
         if (s == "" || maxW <= 0) { return s; }
         if (Canvas.MeasureText(s, fs) <= maxW) { return s; }
@@ -1102,6 +1132,7 @@ class Upload : Control {
         return baseId;
     }
 
+    /// 普通触发按钮：一张表面 + 文字 + 命中区（点击开选择弹窗）。
     void PaintTrigger(App app, int x, int y, int tw, int th, bool off) {
         Canvas c = app.canvas;
         StyleBox s = this.TriggerStyle(app, off);
@@ -1116,6 +1147,7 @@ class Upload : Control {
         app.hitTester.RegisterRect(baseId, x, y, tw, th, 0);
     }
 
+    /// 大虚线拖放框：图标圆 + 主文案 + 副文案 + 命中区。
     void PaintDragger(App app, int x, int y, int w, int h, bool off) {
         Canvas c = app.canvas;
         bool hover = !off && app.focus.IsHovered(baseId + 1);
@@ -1147,6 +1179,9 @@ class Upload : Control {
         app.hitTester.RegisterRect(baseId + 1, x, y, w, h, 0);
     }
 
+    /// 文本列表：每行缩略图/图标、文件名（成功且有 url 时为链接）、
+    /// 状态徽标、错误附言、进度条与移除/下载按钮（最多画 128 行）。
+    /// 返回列表底部 y。
     int PaintRows(App app, int x, int y, int w, bool off) {
         Canvas c = app.canvas;
         int rowH = this.RowH(app);
@@ -1260,6 +1295,8 @@ class Upload : Control {
         return y;
     }
 
+    /// 照片墙：96 方格流式排布 + hover 遮罩（移除/下载）+ 状态徽标 +
+    /// 底部进度条 +「+ 添加」块。返回内容底部 y，并刷新拖放落区。
     int PaintTiles(App app, int x, int y, int w, bool off) {
         Canvas c = app.canvas;
         int gap = this.StyleGap(app);
