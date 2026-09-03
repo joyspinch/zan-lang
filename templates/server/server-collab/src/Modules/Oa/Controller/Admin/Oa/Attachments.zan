@@ -1,0 +1,155 @@
+using System;
+using System.Data.Orm;
+using System.IO;
+using System.Json;
+using System.Web;
+using ZanWeb.Model.Oa;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.Admin.Oa;
+
+/* 附件端点（架构 §2.3 WP-3 / T4）：上传走 [Upload=true] 流式落盘——请求体
+   64KB 一段直写磁盘，20MB 也不进堆（体量上限在 main.zan 经 uploadBodyMB
+   统一配置）；登记与归位在 Attachment.Save。下载先过 CanDownload（同租户
+   + 模块授权），字节经 ctx.Binary 应答（二进制的唯一正确通道，NUL 安全）。
+   删除限上传者本人或管理权。Upload 挂 ApiMax 防刷（每路由限流属性即
+   Custom(ApiMax=n)，映射 Route.rateLimit）。 */
+[Route("admin/oa/attachments/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("附件")]
+class Attachments : AdminController {
+
+    /* 上传：流式路由不解析 multipart 字段，原始字节即请求体；module/
+       relatedId/name/mime 经 query 传入（ctx.In 覆盖 query）。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Create, ApiMax = 30, Upload = true)]
+    [Description("上传附件")]
+    async void Upload() {
+        User me = await this.Admin();
+        if (this.ctx.uploadPath.Length == 0) {
+            this.Fail(400, "1002", "没有上传内容");
+        }
+        string module = Fmt.Text(this.In("module"), "");
+        if (module.Length == 0) { this.Fail(400, "0003", "module 不能为空"); }
+        int relatedId = this.InInt("relatedId", 0);
+        string name = Attachment.BaseName(this.In("name"));
+        string mime = Attachment.MimeOf(name, this.In("mime"));
+        int id = await Attachment.Save(this.Held(), this.TenantId(), me.id,
+            module, relatedId, name, mime, this.ctx.uploadPath,
+            this.ctx.uploadSize);
+        await this.Note("上传附件", name, true, "");
+        JsonValue o = JsonValue.NewObject();
+        o.Put("id", JsonValue.NewStr(Convert.ToString(id)));
+        o.Put("name", JsonValue.NewStr(name));
+        o.Put("size", JsonValue.NewNum(Convert.ToString(this.ctx.uploadSize)));
+        this.Ok(o.ToJson());
+    }
+
+    /* 列表（JSON）：租户 + 挂载键双过滤是本动作的隔离边界——跨租户行
+       根本不在结果集里，而非靠逐行拒绝。 */
+    [HttpGet]
+    [Custom(Perm = PermBit.View)]
+    [Description("附件列表")]
+    async void List() {
+        User me = await this.Admin();
+        string module = Fmt.Text(this.In("module"), "");
+        int relatedId = this.InInt("relatedId", 0);
+        List<OaAttachment> rows = await this.OaAttachment
+            .Where(a => a.tenantId == this.TenantId() && a.module == module
+                && a.relatedId == relatedId)
+            .OrderByDescending(a => a.id).ToListAsync();
+        JsonValue items = JsonValue.NewArray();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            OaAttachment a = rows[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Put("id", JsonValue.NewStr(Convert.ToString(a.id)));
+            o.Put("fileName", JsonValue.NewStr(a.fileName));
+            o.Put("mime", JsonValue.NewStr(a.mime));
+            o.Put("size", JsonValue.NewNum(Convert.ToString(a.size)));
+            o.Put("createdAt", JsonValue.NewStr(Fmt.Day(a.createdAt)));
+            items.Append(o);
+        }
+        this.Ctx().Json(items.ToJson());
+    }
+
+    /* 下载：授权 -> 存在性 -> 字节应答。文件名经 Attachment.BaseName 清洗
+       （丢引号/分隔符/控制字符），头注入无门。 */
+    [HttpGet]
+    [Custom(Perm = PermBit.View)]
+    [Description("下载附件")]
+    async void Download() {
+        User me = await this.Admin();
+        int id = this.InInt("id", 0);
+        OaAttachment att = await this.OaAttachment
+            .Where(a => a.id == id).FirstAsync();
+        if (att == null) { this.Fail(404, "0404", "附件不存在"); }
+        DataScope sc = await this.Scope();
+        if (!await Attachment.CanDownload(me, sc, this.uid, att)) {
+            this.Fail(403, "0403", "无权下载该附件");
+        }
+        if (!File.Exists(att.path)) { this.Fail(404, "0404", "附件文件已丢失"); }
+        byte[] data = File.ReadAllBytes(att.path);
+        this.Ctx().SetHeader("Content-Disposition",
+            "attachment; filename=\"" + Attachment.BaseName(att.fileName) + "\"");
+        this.Ctx().Binary(att.mime, data, data.Length);
+    }
+
+    /* 删除：上传者本人或管理权（超管）。登记行先删，文件尽力而为——
+       无登记行即永不可达，遗留文件由备份保留策略回收。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Delete)]
+    [Description("删除附件")]
+    async void Delete() {
+        User me = await this.Admin();
+        int id = this.InInt("id", 0);
+        OaAttachment att = await this.OaAttachment
+            .Where(a => a.id == id).FirstAsync();
+        if (att == null) { this.Fail(404, "0404", "附件不存在"); }
+        if (me.isSuper != 1) {
+            if (att.tenantId != this.TenantId()) {
+                this.Fail(403, "0403", "无权删除该附件");
+            }
+            if (att.uploaderId != me.id) {
+                this.Fail(403, "0403", "仅上传者或管理员可删除");
+            }
+        }
+        int _n = await this.OaAttachment.Delete()
+            .Where(a => a.id == att.id).ExecuteAffrowsAsync();
+        File.Delete(att.path);
+        await this.Note("删除附件", att.fileName, true, "");
+        this.Saved("已删除");
+    }
+
+    /* 附件区片段：详情页 [data-attach] 容器由 attach.js 拉本动作回填
+       （X-Fragment 语义与外壳同款）。列表按 id 倒序，删除按钮只给
+       上传者本人与超管。 */
+    [HttpGet]
+    [Custom(Perm = PermBit.View)]
+    [Description("附件区")]
+    async void Blob() {
+        User me = await this.Admin();
+        string module = Fmt.Text(this.In("module"), "");
+        int relatedId = this.InInt("relatedId", 0);
+        ViewData d = new ViewData();
+        List<OaAttachment> rows = await this.OaAttachment
+            .Where(a => a.tenantId == this.TenantId() && a.module == module
+                && a.relatedId == relatedId)
+            .OrderByDescending(a => a.id).ToListAsync();
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            OaAttachment a = rows[i];
+            StrMap m = new StrMap();
+            m.Set("id", Convert.ToString(a.id));
+            m.Set("fileName", a.fileName);
+            m.Set("sizeText", Fmt.Bytes(a.size));
+            m.Set("createdAt", Fmt.Day(a.createdAt));
+            m.Set("canDel", (a.uploaderId == me.id || me.isSuper == 1)
+                ? "1" : "");
+            items.Add(m);
+        }
+        d.Set("empty", rows.Count == 0 ? "1" : "");
+        d.Set("module", module);
+        d.Set("relatedId", Convert.ToString(relatedId));
+        this.FragmentOf("Admin.Oa.Attachments.Blob", d);
+    }
+}

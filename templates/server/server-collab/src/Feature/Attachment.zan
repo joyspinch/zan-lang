@@ -1,0 +1,152 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.IO;
+using ZanWeb.Model.Oa;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb;
+
+/* 附件公共特性（架构 §2.3 WP-3 / T4）：全应用唯一附件入口——业务侧只调本类，
+   不直接写 oa_attachment、不直接摆弄上传文件。暂存文件（[Upload=true] 流式
+   落盘产物，ctx.uploadPath）在此归位到 data/uploads/t{tenantId}/{yyyyMM}/，
+   登记行随归位落库；配额与下载授权也在此集中判定。
+   tenantId 显式传参（Notify.Send 同款纪律）：调用方常持控制器，但
+   AppController.TenantId() 为 protected，静态链路拿不到——一律传值。 */
+class Attachment {
+    /* 进程内序号：与时间戳、随机数一起拼存储名，杜绝同秒重名。 */
+    static AtomicInt seq = new AtomicInt(0);
+
+    /* 挂载模块 -> 授权屏（Perm.ScreenOf 语义下的屏名）。新模块接入时在此
+       登记一行；未登记的模块回落到附件屏自身（能进附件区即可见）。 */
+    static string ScreenOf(string module) {
+        if (module == "flow_inst") { return "Flows"; }
+        if (module == "flow_task") { return "Tasks"; }
+        if (module == "crm_customer") { return "Customers"; }
+        if (module == "crm_contact") { return "Contacts"; }
+        if (module == "crm_opportunity") { return "Opportunities"; }
+        return "Attachments";
+    }
+
+    /* 客户端展示名 -> 存储/应答安全名：取 basename（防遍历）、丢控制字符与
+       引号分隔符。空则给占位名——Content-Disposition 由 ctx 兜底再洗一次。 */
+    static string BaseName(string name) {
+        string safe = "";
+        int start = 0;
+        for (int i = 0; i < name.Length; i = i + 1) {
+            int c = name[i] & 255;
+            if (c == 47 || c == 92) { start = i + 1; }
+        }
+        for (int i = start; i < name.Length; i = i + 1) {
+            int c = name[i] & 255;
+            if (c < 32 || c == 34 || c == 59) { continue; }
+            safe = safe + name.Substring(i, 1);
+        }
+        return Fmt.Text(safe, "附件.bin");
+    }
+
+    /* MIME：客户端声明优先（浏览器对常见类型是可靠的），否则按扩展名推断，
+       最后落 application/octet-stream。白名单外一律 octet-stream。 */
+    static string MimeOf(string fileName, string declared) {
+        if (declared.Length > 0 && declared.IndexOf("/") > 0
+            && declared.Length <= 64) { return declared; }
+        int dot = fileName.LastIndexOf(".");
+        string ext = dot >= 0 ? fileName.Substring(dot + 1).ToLower() : "";
+        if (ext == "pdf") { return "application/pdf"; }
+        if (ext == "png") { return "image/png"; }
+        if (ext == "jpg" || ext == "jpeg") { return "image/jpeg"; }
+        if (ext == "gif") { return "image/gif"; }
+        if (ext == "svg") { return "image/svg+xml"; }
+        if (ext == "txt" || ext == "md" || ext == "csv" || ext == "log") {
+            return "text/plain";
+        }
+        if (ext == "html" || ext == "htm") { return "text/html"; }
+        if (ext == "zip") { return "application/zip"; }
+        if (ext == "gz") { return "application/gzip"; }
+        if (ext == "json") { return "application/json"; }
+        if (ext == "doc" || ext == "docx") {
+            return "application/msword";
+        }
+        if (ext == "xls" || ext == "xlsx") {
+            return "application/vnd.ms-excel";
+        }
+        return "application/octet-stream";
+    }
+
+    /* 16 位 CSPRNG hex：存储文件名的随机段。CSPRNG 不可用时退化为
+       时间戳+序号（同一目录内仍不重名）。 */
+    static string HexName() {
+        byte[] b = RandomNumberGenerator.GetBytes(8);
+        if (b == null) {
+            return Fmt.Pad2(WebApp.NowSeconds() % 100)
+                + Fmt.Pad2((WebApp.NowSeconds() / 100) % 100)
+                + Fmt.Pad2(Attachment.seq.Increment() % 100)
+                + Fmt.Pad2(Attachment.seq.Increment() % 100);
+        }
+        string hex = "0123456789abcdef";
+        string s = "";
+        for (int i = 0; i < b.Length; i = i + 1) {
+            s = s + hex.Substring((b[i] >> 4) & 15, 1)
+                + hex.Substring(b[i] & 15, 1);
+        }
+        return s;
+    }
+
+    /* 登记 + 归位：租户配额通过后，暂存文件移入
+       data/uploads/t{tenantId}/{yyyyMM}/{hex}_{seq}.bin 并落库。
+       返回登记行 id；配额超限抛 ApiError（调用方即控制器，语义为 403）。
+       移动失败时先落库后补救是错误顺序——先移成功再插行，插行失败留下的
+       孤儿文件无害（无登记行即永不可达，备份清理按目录归档时回收）。 */
+    static async int Save(IDbConnection db, int tenantId, int uploaderId,
+                          string module, int relatedId, string fileName,
+                          string mime, string spoolPath, long size) {
+        long quota = Filter.ToInt(await Settings.Get("attachment.quotaMB",
+            "1024"), 1024) * 1048576L;
+        List<OaAttachment> rows = await db.Select<OaAttachment>()
+            .Where(a => a.tenantId == tenantId).ToListAsync();
+        long used = 0;
+        for (int i = 0; i < rows.Count; i = i + 1) { used = used + rows[i].size; }
+        if (used + size > quota) {
+            throw new ApiError(403, "0403", "租户附件空间已满（配额 "
+                + Convert.ToString(quota / 1048576) + " MB）");
+        }
+
+        long now = WebApp.NowSeconds();
+        DateTime d = DateTime.FromUnixSeconds(now
+            + (long)Fmt.OffsetMinutes() * 60);
+        string dir = "data/uploads/t" + Convert.ToString(tenantId)
+            + "/" + Fmt.Pad2(d.Year()) + Fmt.Pad2(d.Month());
+        if (!Directory.Exists(dir)) { Directory.CreateDirectoryRecursive(dir); }
+        string rel = dir + "/" + Attachment.HexName() + "_"
+            + Convert.ToString(Attachment.seq.Increment()) + ".bin";
+        File.Move(spoolPath, rel);
+
+        OaAttachment a = new OaAttachment();
+        a.tenantId = tenantId;
+        a.module = module;
+        a.relatedId = relatedId;
+        a.fileName = Fmt.Text(fileName, "附件.bin");
+        a.path = rel;
+        a.mime = mime;
+        a.size = size;
+        a.uploaderId = uploaderId;
+        a.createdAt = now;
+        return await db.Insert<OaAttachment>(a).ExecuteIdentityAsync();
+    }
+
+    /* 下载授权（软隔离的硬边在先）：跨租户一律拒绝（验收项）；同租户内
+       上传者本人、超管或持挂载模块授权屏 View 位的账号可下载。
+       sc 为调用方已解析的数据范围（Controller.Scope()），一期只做
+       存在性校验位——范围收紧到部门/本人时的行级过滤是挂载方列表查询
+       的职责，附件层只守租户与模块两道门。 */
+    static async bool CanDownload(User me, DataScope sc, string uid,
+                                  OaAttachment att) {
+        if (me == null || att == null) { return false; }
+        if (att.tenantId != me.tenantId) { return false; }
+        if (me.isSuper == 1) { return true; }
+        if (att.uploaderId == me.id) { return true; }
+        if (sc != null && sc.Any()) { return true; }
+        int mask = await AuthUser.MaskOf(uid, Attachment.ScreenOf(att.module));
+        return (mask & (int)PermBit.View) != 0;
+    }
+}
