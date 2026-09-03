@@ -1,0 +1,60 @@
+using System;
+using System.Text;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.Admin.Oa;
+
+/* 全局搜索（T8）：顶栏下拉的数据端点，聚合器见 Framework/Search.zan。
+   仅片段无整页——Query 供 search.js 防抖拉取（X-Fragment 语义同外壳）。
+   授权 Grant+View 门槛 + 源内屏闸双保险：结果是他屏行名，各 Provider
+   已按 MaskOf View 位过滤，无位源的行名不会出现在下拉里。 */
+[Route("admin/oa/search/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("全局搜索")]
+class Search : AdminController {
+
+    [HttpGet]
+    [Custom(Perm = PermBit.View, ApiMax = 60)]
+    [Description("全局搜索")]
+    async void Query() {
+        User me = await this.Admin();
+        List<SearchHit> hits = new List<SearchHit>();
+        if (this.DbReady()) {
+            hits = await ZanWeb.Search.Run(this.Held(), this.TenantId(), me,
+                this.In("kw"), 5);
+        }
+
+        /* 扁平分组：hits 已按注册序拼接（同模块天然相邻），组头随每组
+           首条携带 first 标记——模板引擎 #each 只在全局 ViewData 解析
+           列表（无嵌套行内列表），故不用 groups>items 两级结构。 */
+        ViewData d = new ViewData();
+        List<StrMap> items = d.AddList("items");
+        string prev = "";
+        for (int i = 0; i < hits.Count; i = i + 1) {
+            SearchHit h = hits[i];
+            string label = Search.LabelOf(h.module);
+            StrMap m = new StrMap();
+            m.Set("group", label);
+            m.Set("first", h.module != prev ? "1" : "");
+            m.Set("title", h.title);
+            m.Set("link", h.link.Length > 0 ? h.link : "#");
+            items.Add(m);
+            prev = h.module;
+        }
+        d.Set("empty", hits.Count == 0 ? "1" : "");
+        this.FragmentOf("Admin.Oa.Search.Query", d);
+    }
+
+    /* 徽标中文映射（module 注册键 -> 下拉组名）。 */
+    static string LabelOf(string module) {
+        if (module == "crm_customer") { return "客户"; }
+        if (module == "crm_contact") { return "联系人"; }
+        if (module == "crm_opportunity") { return "商机"; }
+        if (module == "wms_sku") { return "商品"; }
+        if (module == "wms_warehouse") { return "仓库"; }
+        if (module == "flow_inst") { return "流程"; }
+        return module;
+    }
+}
