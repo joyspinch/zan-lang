@@ -1,0 +1,75 @@
+using System;
+using System.Collections;
+using System.Data;
+using System.Data.Orm;
+using System.Json;
+using ZanWeb.Model.Oa;
+
+namespace ZanWeb;
+
+/* IM 实时层（T13，架构定案）：落库为准 + 每 worker 扫描水位 + 本 worker
+   NotifyHub 扇出。不建 sys_seq、不建跨 worker ChatHub、不开第二条 WS——
+   oa_message 表即总线：每个 worker 跑同款扫描协程，按内存水位 lastId 之上的
+   id 增量扫新落库行，各自只推本地 NotifyHub 注册表命中的连接。水位相同、
+   扇出目标互斥（同用户连接只登记在单个 worker），天然不重复，无需抢占式
+   置位——CalendarRemind 的 UPDATE 抢占适合「唯一执行权」场景（提醒只能发
+   一遍），不适合路由：抢到的 worker 若不持有目标连接，该行永远推不出去。
+   扫描谓词不带 tenantId（后台无请求上下文），逐行按行上 tenantId 装载
+   payload（CalendarRemind / Engine.Note 同款纪律）。
+   Init 取 MAX(id) 作水位初值——worker 重启不重推历史（落库为准：离线消息
+   由 Messages.Chat 打开会话时批量呈现并清已读，实时层只管「在线期间新增」，
+   已读回执按落库正确性非实时）。 */
+class MessageRelay {
+    /* 拍间隔（毫秒）：1s 一拍，验收口径 ≤2s 可达（1s 拍 + 索引读）。 */
+    static int IntervalMs = 1000;
+    /* 单拍扫描上限：突发超量时余量下拍续扫（水位只前进不回退）。 */
+    static int BatchSize = 200;
+
+    /* worker 内存水位：已扇出的最大 oa_message.id；-1 = 尚未 Init。 */
+    static long lastId = -1;
+
+    static async void Loop() {
+        while (true) {
+            await Task.Delay(MessageRelay.IntervalMs);
+            IDbConnection db = await AppServices.Current().Db().Acquire();
+            if (db == null) { continue; }
+            try {
+                await MessageRelay.Sweep(db);
+            } finally {
+                AppServices.Current().Db().Release(db);
+            }
+        }
+    }
+
+    static async void Sweep(IDbConnection db) {
+        /* 首拍 Init：水位对齐当前 MAX(id)，历史不推。 */
+        if (MessageRelay.lastId < 0) {
+            OaMessage last = await db.Select<OaMessage>()
+                .OrderByDescending(a => a.id).FirstAsync();
+            MessageRelay.lastId = last == null ? 0 : last.id;
+            return;
+        }
+        long mark = MessageRelay.lastId;
+        List<OaMessage> rows = await db.Select<OaMessage>()
+            .Where(a => a.id > mark)
+            .OrderBy(a => a.id).Take(MessageRelay.BatchSize).ToListAsync();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            OaMessage r = rows[i];
+            MessageRelay.lastId = r.id;
+            JsonValue o = JsonValue.NewObject();
+            o.Put("id", JsonValue.NewStr(Convert.ToString(r.id)));
+            o.Put("tenantId", JsonValue.NewStr(Convert.ToString(r.tenantId)));
+            o.Put("fromId", JsonValue.NewStr(Convert.ToString(r.fromId)));
+            o.Put("content", JsonValue.NewStr(r.content));
+            o.Put("createdAt", JsonValue.NewStr(Convert.ToString(r.createdAt)));
+            o.Put("excerpt", JsonValue.NewStr(MessageRelay.Excerpt(r.content, 50)));
+            await NotifyHub.PushTyped(r.toId, "message", o);
+        }
+    }
+
+    /* 单行摘要（Messages.Excerpt 同款，行内实现——Framework 不反向依赖控制器层）。 */
+    static string Excerpt(string s, int max) {
+        string t = s.Replace("\r\n", " ").Replace("\n", " ").Replace("\r", " ");
+        return t.Length > max ? t.Substring(0, max) + "…" : t;
+    }
+}
