@@ -1303,6 +1303,25 @@ ZAN_SDL_API zan_iptr zan_audio_load_wav(const char *path) {
     return zan_handle(clip);
 }
 
+/* Same as zan_audio_load_wav, but parses the WAV from caller-owned memory
+ * (e.g. a decrypted resource-pack entry). The buffer is only read inside
+ * this call -- SDL_LoadWAV_IO copies the PCM out, so ownership never moves. */
+ZAN_SDL_API zan_iptr zan_audio_load_wav_mem(const void *data, zan_i32 len) {
+    if (!data || len <= 0) return 0;
+    ZanAudioClip *clip = (ZanAudioClip *)SDL_calloc(1, sizeof(ZanAudioClip));
+    if (!clip) return 0;
+    SDL_IOStream *io = SDL_IOFromConstMem(data, (size_t)len);
+    if (!io) {
+        SDL_free(clip);
+        return 0;
+    }
+    if (!SDL_LoadWAV_IO(io, true, &clip->spec, &clip->pcm, &clip->len)) {
+        SDL_free(clip);
+        return 0;
+    }
+    return zan_handle(clip);
+}
+
 ZAN_SDL_API void zan_audio_free_clip(zan_iptr clip) {
     ZanAudioClip *c = (ZanAudioClip *)zan_ptr(clip);
     if (!c) return;
