@@ -25,11 +25,13 @@ class TracedDbConnection : IDbConnection {
         this.inner = inner;
     }
 
-    /// <summary>The connection underneath.</summary>
+    /// <summary>The connection underneath (already unwrapped to the driver
+    /// connection).</summary>
     IDbConnection Inner() { return this.inner; }
 
     /// <summary>`db` timed, or `db` itself when nothing is listening: an
-    /// untraced server must not pay for a wrapper on every lease.</summary>
+    /// untraced server must not pay for a wrapper on every lease. Idempotent
+    /// (already-wrapped connections pass through). Called by the pool on lease.</summary>
     static IDbConnection Wrap(IDbConnection db) {
         if (db == null) { return null; }
         if (!DbTrace.Enabled()) { return db; }
@@ -39,7 +41,7 @@ class TracedDbConnection : IDbConnection {
 
     /// <summary>The connection a pool handed out, however many times it was
     /// wrapped -- what has to go back to the pool is the pooled object, not a
-    /// wrapper the pool has never seen.</summary>
+    /// wrapper the pool has never seen. Null-safe (null passes through).</summary>
     static IDbConnection Unwrap(IDbConnection db) {
         IDbConnection cur = db;
         while (cur != null && cur is TracedDbConnection) {
@@ -51,8 +53,10 @@ class TracedDbConnection : IDbConnection {
     // ---- timed: everything that carries a statement ----
     // Reported after the call returns, whatever it returned: a statement that
     // failed still spent the time, and a failure that is slow is exactly what
-    // an operator goes looking for.
+    // an operator goes looking for. Each executor below has sync + params,
+    // async + params overloads; timing semantics are identical across all six.
 
+    /// <summary>Timed query; duration (µs) reported to DbTrace after return.</summary>
     DbResult Query(string sql) {
         long t = DbTrace.NowUs();
         DbResult r = this.inner.Query(sql);
@@ -67,6 +71,7 @@ class TracedDbConnection : IDbConnection {
         return r;
     }
 
+    /// <summary>Timed execute; returns affected row count.</summary>
     int Execute(string sql) {
         long t = DbTrace.NowUs();
         int n = this.inner.Execute(sql);
@@ -81,6 +86,7 @@ class TracedDbConnection : IDbConnection {
         return n;
     }
 
+    /// <summary>Timed scalar (first column of first row, as string).</summary>
     string ExecuteScalar(string sql) {
         long t = DbTrace.NowUs();
         string s = this.inner.ExecuteScalar(sql);
@@ -139,9 +145,11 @@ class TracedDbConnection : IDbConnection {
 
     // ---- forwarded: no statement of the application's, nothing to rank ----
 
+    /// <summary>Provider id of the wrapped connection (SQLite/MySQL/PG/ODBC/TDengine).</summary>
     int GetProvider() { return this.inner.GetProvider(); }
     bool IsConnected() { return this.inner.IsConnected(); }
     void Close() { this.inner.Close(); }
+    /// <summary>Transactional forwarding — transaction control itself is not timed.</summary>
     void BeginTransaction() { this.inner.BeginTransaction(); }
     void Commit() { this.inner.Commit(); }
     void Rollback() { this.inner.Rollback(); }

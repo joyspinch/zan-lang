@@ -12,7 +12,9 @@ namespace System.Compiler;
 class GenJson {
     /// 类名 → 类 JSON(含 kind/bases/fields)。
     static Dict<string, JsonValue> ClassOf;
+    /// 本单元实际引用到的类（生成 __JsonBind 的顺序）。
     static List<string> NeedNames;
+    /// 与 NeedNames 平行：该类是否需要 List 根形态（DL_/SL_ 入口）。
     static List<bool> NeedRootList;
     static JsonValue Reply;
 
@@ -28,6 +30,8 @@ class GenJson {
     static string FElemName;   /* FieldKind 的输出 */
     static int FElemKind;
 
+    /// 入口：扫描 unit 的 classes/calls，收集 Json.Deserialize<T>/
+    /// Serialize<T> 调用点，生成并回填 __JsonBind 源码与重写指令。
     static void Run(JsonValue req, JsonValue reply) {
         GenJson.Reply = reply;
         GenJson.ClassOf = new Dict<string, JsonValue>();
@@ -75,6 +79,9 @@ class GenJson {
 
     /* ---- 调用点处理 ---- */
 
+    /// 处理一个调用点：校验显式类型参数、类可达性、List<Class> 形态，
+    /// 通过后按 Deserialize/Serialize × 单个/List 组合决定 D_/S_/DL_/SL_ 前缀，
+    /// 下发 json_call 重写指令。不合法时写诊断并跳过。
     static void VisitCall(JsonValue call) {
         string recv = call.Str("recv", "");
         if (recv != "id:Json") { return; }
@@ -134,6 +141,7 @@ class GenJson {
         return -1;
     }
 
+    /// 收集/去重一个被引用的类；已存在时返回原下标。
     static int NeedAdd(string name) {
         int at = GenJson.NeedFind(name);
         if (at >= 0) { return at; }
@@ -157,7 +165,7 @@ class GenJson {
         return n == "double" || n == "float" || n == "decimal";
     }
 
-    /// 基元/枚举/类的基类分类(FK 常量)。
+    /// 基元/枚举/类的基类分类(FK 常量)。未知类型返回 0（SKIP，字段被跳过并告警）。
     static int BaseKind(string name) {
         if (GenJson.IsLongName(name)) { return 2; }
         if (GenJson.IsIntName(name)) { return 1; }
@@ -496,6 +504,8 @@ class GenJson {
 
     /* ---- 合成 __JsonBind 类 ---- */
 
+    /// 合成 __JsonBind 类：先写通用 null 转换助手，再按引用顺序生成
+    /// 每个类的 B_/T_/W_/D_/S_（及 List 形态 DL_/SL_），回填到 reply.sources。
     static void EmitBindClass() {
         StringBuilder out0 = new StringBuilder();
         out0.Append("class __JsonBind {\n");
@@ -508,6 +518,9 @@ class GenJson {
         GenCommon.AddSource(GenJson.Reply, "__JsonBind", out0);
     }
 
+    /// 为一个类生成全部 binder 代码：B_(JsonValue→实体，宽容缺省)、
+    /// T_(实体→JsonValue，null→NewNull)、W_(实体→JSON 文本直写，
+    /// 快约 4 倍)、D_/S_ 字符串入口，NeedRootList 时加 DL_/SL_。
     static void GenClass(StringBuilder out0, int idx) {
         string cls = GenJson.NeedNames[idx];
         /* binder: JsonValue -> entity (lenient) */

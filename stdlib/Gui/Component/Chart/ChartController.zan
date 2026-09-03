@@ -4,6 +4,9 @@ namespace Gui.Component.Chart;
 
 /// ChartOption 的可变持有者。用于立即模式 GUI 中的动态数据：
 /// 控件可以每帧重新绑定同一个 controller，而不需要重建 ChartView。
+/// 数据 API（SetData/AppendData/ClearData）只改系列数据；
+/// SetOption 整体替换并重置 Restore 基线；ShowLoading/SetEmptyMessage
+/// 等只切状态字。每次变更递增 Version 并抛 DataChanged。
 class ChartController {
     ChartOption option;
     ChartOption initialOption;
@@ -13,6 +16,8 @@ class ChartController {
     bool disposed;
     ChartEventHub eventHub;
 
+    /// 构造 controller。option 为 null 时用空 ChartOption 兜底；
+    /// initialOption 快照作为 Restore() 的基线。
     static ChartController Of(ChartOption option) {
         ChartController c = new ChartController();
         if (option == null) { option = ChartOption.Create(); }
@@ -26,19 +31,27 @@ class ChartController {
         return c;
     }
 
+    /// 当前 option（内部引用，勿改写——改数据走 SetData/AppendData，
+    /// 整体替换走 SetOption）。
     ChartOption Option() { return this.option; }
     /// 返回当前 option 的深复制，调用方不能通过返回值改写 controller。
     ChartOption GetOption() { return ChartOption.Clone(this.option); }
+    /// 每次 mutation（SetOption/SetData/Append/Clear/Restore/状态切换）
+    /// 递增；视图按版本号判断是否需要重绘。
     int Version() { return this.version; }
+    /// 状态字："ready" / "loading" / "empty" / "error" / "disposed"。
     string Status() { return this.status; }
+    /// 状态附带的消息（ShowLoading/SetEmptyMessage/SetErrorMessage 传入）。
     string StatusMessage() { return this.statusMessage; }
     bool IsDisposed() { return this.disposed; }
 
+    /// 注册交互事件处理器（返回 this 便于链式）； disposed 后为 no-op。
     ChartController On(ChartEventType type, ChartInteractionHandler handler) {
         if (!this.disposed) { this.eventHub.On(type, handler); }
         return this;
     }
 
+    /// 注销一个已注册的处理器（按引用匹配，移除最近一个匹配项）。
     ChartController Off(ChartEventType type, ChartInteractionHandler handler) {
         if (!this.disposed) { this.eventHub.Off(type, handler); }
         return this;
@@ -54,6 +67,7 @@ class ChartController {
             && this.eventHub.Count(type) > 0;
     }
 
+    /// 手动触发一个事件（一般由视图在交互时调用）。
     void RaiseEvent(ChartInteractionEvent eventArgs) {
         if (!this.disposed && this.eventHub != null) {
             this.eventHub.Raise(eventArgs);
@@ -64,6 +78,8 @@ class ChartController {
         this.RaiseEvent(ChartInteractionEvent.Of(type, 0));
     }
 
+    /// 便捷封装：按事件类型注册（OnClick/OnHover/OnDataZoom/OnRestore
+    /// 等一族，语义同 On(type, handler)）。
     ChartController OnClick(ChartInteractionHandler handler) {
         return this.On(ChartEventType.Click, handler);
     }
@@ -130,7 +146,8 @@ class ChartController {
         return this;
     }
 
-    /// 替换一个系列的数据项。
+    /// 替换一个系列的数据项。data 为 null 表示清空该系列。
+    /// 系列下标越界时静默返回。
     ChartController SetData(int seriesIndex, List<ChartData> data) {
         if (this.disposed || this.option == null || seriesIndex < 0 || seriesIndex >= this.option.series.Count) { return this; }
         if (data == null) { this.option.series[seriesIndex].data = new List<ChartData>(); }
@@ -142,6 +159,7 @@ class ChartController {
     }
 
     /// 追加已命名/着色的数据项，适合实时折线和滚动窗口。
+    /// data 为 null 时 no-op（SetData 的 null 才表示清空）。
     ChartController AppendData(int seriesIndex, List<ChartData> data) {
         if (this.disposed || this.option == null || seriesIndex < 0 || seriesIndex >= this.option.series.Count || data == null) { return this; }
         ChartSeries s = this.option.series[seriesIndex];
@@ -152,7 +170,7 @@ class ChartController {
         return this;
     }
 
-    /// 追加纯数值数据的快捷形式。
+    /// 追加纯数值数据的快捷形式（等价 AppendData + ChartData.Of）。
     ChartController AppendValues(int seriesIndex, List<int> values) {
         if (values == null) { return this; }
         List<ChartData> data = new List<ChartData>();
@@ -161,6 +179,7 @@ class ChartController {
     }
 
     /// 清空一个系列的数据，保留系列名称、类型、样式和轴绑定。
+    /// 状态切为 "empty"。
     ChartController ClearData(int seriesIndex) {
         if (this.disposed || this.option == null || seriesIndex < 0 || seriesIndex >= this.option.series.Count) { return this; }
         this.option.series[seriesIndex].data = new List<ChartData>();
@@ -183,7 +202,8 @@ class ChartController {
         return this;
     }
 
-    /// 恢复到最近一次 SetOption/Of 的 option 快照。
+    /// 恢复到最近一次 SetOption/Of 的 option 快照。数据类的改动
+    /// （SetData/Append）不在快照基线内，会被一并丢弃。
     ChartController Restore() {
         if (this.disposed) { return this; }
         this.option = ChartOption.Clone(this.initialOption);
@@ -195,6 +215,7 @@ class ChartController {
         return this;
     }
 
+    /// 显示加载中状态（视图层据此画 loading 遮罩），message 可为空串。
     ChartController ShowLoading(string message) {
         if (this.disposed) { return this; }
         this.status = "loading";
@@ -203,6 +224,7 @@ class ChartController {
         return this;
     }
 
+    /// 回到 ready 状态，清除 loading/error/empty 的消息。
     ChartController HideLoading() {
         if (this.disposed) { return this; }
         this.status = "ready";
@@ -211,6 +233,7 @@ class ChartController {
         return this;
     }
 
+    /// 设为空数据状态并自定义提示文案。
     ChartController SetEmptyMessage(string message) {
         if (this.disposed) { return this; }
         this.status = "empty";
@@ -219,6 +242,7 @@ class ChartController {
         return this;
     }
 
+    /// 设为错误状态并自定义错误文案（不抛异常，由视图层渲染）。
     ChartController SetErrorMessage(string message) {
         if (this.disposed) { return this; }
         this.status = "error";
