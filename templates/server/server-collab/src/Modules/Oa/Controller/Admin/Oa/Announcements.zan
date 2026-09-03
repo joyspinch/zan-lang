@@ -1,0 +1,331 @@
+using System;
+using System.Collections;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb.Model.Oa;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.Admin.Oa;
+
+/* 公告（T12）：全员/按部门公告的发布与触达。已读=明细表读时插行
+   （Detail 打开即插），受众读时现算（deptIds 空=全员，否则部门成员
+   IN 列表）——组织变动受众跟随。受众校验在 Detail 控制器内做
+   （圈外直连 URL 404，Bug#3 范式硬验收），不是视图软过滤。
+   Delete 显式受控级联清已读明细（Bug#5 教训）；附件挂 module=
+   "announce"（T4 Attachment 特性零改动，视图 data-attach 容器）。
+   一期不做 SearchProvider：公告量小可浏览，无隐私面。 */
+[Route("admin/oa/announcements/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("公告")]
+class Announcements : AdminController {
+    [HttpGet]
+    [Route("/admin/oa/announcements")]
+    [Custom(IsMenu = true, Icon = "mdi:bullhorn", Perm = PermBit.View)]
+    [Description("公告")]
+    async void Index() {
+        User me = await this.Admin();
+        ViewData d = await this.Layout("公告");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+        ListQuery q = this.Paged("id", 20);
+        string kw = q.Kw();
+        List<OaAnnouncement> rows = await this.OaAnnouncement
+            .Where(a => a.tenantId == this.TenantId())
+            .WhereIf(kw.Length > 0, a => a.title.Contains(kw))
+            .OrderByDescending(a => a.pinned).OrderByDescending(a => a.id)
+            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        int total = await this.OaAnnouncement
+            .Where(a => a.tenantId == this.TenantId())
+            .WhereIf(kw.Length > 0, a => a.title.Contains(kw)).CountAsync();
+        d.Set("empty", total == 0 ? "1" : "");
+        d.Set("kw", kw);
+        d.Set("canCreate", this.Can(PermBit.Create) ? "1" : "");
+        d.Set("canUpdate", this.Can(PermBit.Update) ? "1" : "");
+        d.Set("canDelete", this.Can(PermBit.Delete) ? "1" : "");
+        /* 我的已读集合：红点对照（读时插行，无行=未读）。 */
+        List<OaAnnouncementRead> reads = await this.OaAnnouncementRead
+            .Where(a => a.tenantId == this.TenantId() && a.userId == me.id)
+            .ToListAsync();
+        /* 发布人昵称映射（页内 id 集合一次拉取，内部规模）。 */
+        List<int> pubIds = new List<int>();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            if (!pubIds.Contains(rows[i].publisherId)) { pubIds.Add(rows[i].publisherId); }
+        }
+        List<User> pubs = await this.User
+            .WhereIf(pubIds.Count > 0, a => pubIds.Contains(a.id)).ToListAsync();
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            OaAnnouncement r = rows[i];
+            StrMap m = new StrMap();
+            m.Set("id", Convert.ToString(r.id));
+            m.Set("title", r.title);
+            m.Set("pinned", r.pinned == 1 ? "1" : "");
+            m.Set("publisher", Announcements.NameOf(pubs, r.publisherId));
+            m.Set("createdAt", Fmt.Stamp(r.createdAt));
+            m.Set("unread", (Announcements.DeptHit(r, me)
+                && !Announcements.Readed(reads, r.id)) ? "1" : "");
+            m.Set("canUpdate", this.Can(PermBit.Update) ? "1" : "");
+            m.Set("pinText", r.pinned == 1 ? "取消置顶" : "置顶");
+            m.Set("pinNext", r.pinned == 1 ? "0" : "1");
+            bool mine = r.publisherId == me.id;
+            m.Set("canEdit", (mine || me.isSuper == 1) && this.Can(PermBit.Update) ? "1" : "");
+            m.Set("canDel", (mine || me.isSuper == 1) && this.Can(PermBit.Delete) ? "1" : "");
+            m.Set("canReads", this.Can(PermBit.Update) && (mine || me.isSuper == 1) ? "1" : "");
+            items.Add(m);
+        }
+        this.Pager(d, q, total);
+        this.Page(d);
+    }
+
+    /* 公告详情弹窗：受众校验（deptIds 空=全员；否则我的部门须在列），
+       圈外直连 URL 一律 404。打开即已读：明细表无我的行则插（先查后插，
+       UNIQUE 兜底防重）。 */
+    [HttpGet]
+    [Custom(IsMenu = false, Perm = PermBit.View)]
+    [Description("公告详情")]
+    async void Detail() {
+        User me = await this.Admin();
+        int id = this.InInt("id", 0);
+        OaAnnouncement r = await this.OaAnnouncement
+            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .FirstAsync();
+        if (r == null) { this.Fail(404, "0404", "公告不存在"); return; }
+        if (!Announcements.DeptHit(r, me)) { this.Fail(404, "0404", "公告不存在"); return; }
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(r.id));
+        d.Set("dialogTitle", "公告详情");
+        d.Set("title", r.title);
+        d.Set("content", r.content);
+        d.Set("publisher", "");
+        d.Set("createdAt", Fmt.Stamp(r.createdAt));
+        List<int> pubIds = new List<int>();
+        pubIds.Add(r.publisherId);
+        List<User> pubs = await this.User
+            .Where(a => a.id == r.publisherId).ToListAsync();
+        if (pubs.Count > 0) { d.Set("publisher", Announcements.NameOf(pubs, r.publisherId)); }
+        this.Dialog(d);
+
+        /* 打开即已读（先查后插防重；插行失败由 UNIQUE 拦，读态正确性优先）。 */
+        OaAnnouncementRead hit = await this.OaAnnouncementRead
+            .Where(a => a.tenantId == this.TenantId() && a.announcementId == r.id
+                && a.userId == me.id).FirstAsync();
+        if (hit == null) {
+            OaAnnouncementRead row = new OaAnnouncementRead();
+            row.tenantId = this.TenantId();
+            row.announcementId = r.id;
+            row.userId = me.id;
+            row.readAt = WebApp.NowSeconds();
+            await this.OaAnnouncementRead.Insert(row).ExecuteIdentityAsync();
+        }
+    }
+
+    /* 新建/编辑弹窗表单：pinned 仅持 Update 位者可见（Save 侧再校验）。 */
+    [HttpGet]
+    [Custom(IsMenu = false, Perm = PermBit.View)]
+    [Description("公告表单")]
+    async void Form() {
+        int id = this.InInt("id", 0);
+        OaAnnouncement r = null;
+        if (id > 0) {
+            r = await this.OaAnnouncement
+                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .FirstAsync();
+            if (r == null) { this.Fail(404, "0404", "公告不存在"); return; }
+        }
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("dialogTitle", id > 0 ? "编辑公告" : "新建公告");
+        d.Set("title", r == null ? "" : r.title);
+        d.Set("content", r == null ? "" : r.content);
+        d.Set("pinned", r != null && r.pinned == 1 ? "checked" : "");
+        d.Set("canPinned", this.Can(PermBit.Update) ? "1" : "");
+        List<Department> depts = await this.Department.ToListAsync();
+        List<StrMap> items = d.AddList("depts");
+        for (int i = 0; i < depts.Count; i = i + 1) {
+            Department dep = depts[i];
+            StrMap m = new StrMap();
+            m.Set("id", Convert.ToString(dep.id));
+            m.Set("name", dep.name);
+            m.Set("checked", r != null && AuthUser.Holds(r.deptIds,
+                Convert.ToString(dep.id)) ? "checked" : "");
+            items.Add(m);
+        }
+        this.Dialog(d);
+    }
+
+    /* 保存：pinned 非管理员强制 0；编辑 (id, tenantId) 双条件。
+       deptIds 收多值 checkbox（In 合成逗号串，AuthUser.Holds 判定同款）。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("保存公告")]
+    async void Save() {
+        User me = await this.Admin();
+        int id = this.InInt("id", 0);
+        string title = this.Need("title", "公告标题");
+        if (title.Length == 0) { this.Fail(400, "0004", "请填写公告标题"); return; }
+        string content = this.In("content");
+        if (content.Length > 8192) { content = content.Substring(0, 8192); }
+        string deptIds = this.In("dept");
+        if (deptIds.Length > 256) { this.Fail(400, "0004", "受众部门过多"); return; }
+        int pinned = (this.Can(PermBit.Update) && this.InInt("pinned", 0) == 1) ? 1 : 0;
+        long now = WebApp.NowSeconds();
+        if (id > 0) {
+            OaAnnouncement r = await this.OaAnnouncement
+                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .FirstAsync();
+            if (r == null) { this.Fail(404, "0404", "公告不存在"); return; }
+            if (r.publisherId != me.id && me.isSuper != 1) {
+                this.Fail(403, "0403", "仅发布者或管理员可编辑"); return;
+            }
+            int n = await this.OaAnnouncement.Update()
+                .Set(a => a.title, title)
+                .Set(a => a.content, content)
+                .Set(a => a.deptIds, deptIds)
+                .Set(a => a.pinned, pinned)
+                .Set(a => a.updatedAt, now)
+                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .ExecuteAffrowsAsync();
+            if (n <= 0) { this.Fail(404, "0404", "公告不存在"); return; }
+            await this.Note("保存公告", title, true, "");
+            this.Saved("公告已保存");
+            return;
+        }
+        OaAnnouncement row = new OaAnnouncement();
+        row.tenantId = this.TenantId();
+        row.title = title;
+        row.content = content;
+        row.deptIds = deptIds;
+        row.pinned = pinned;
+        row.publisherId = me.id;
+        row.createdAt = now;
+        row.updatedAt = now;
+        int newId = await this.OaAnnouncement.Insert(row).ExecuteIdentityAsync();
+        await this.Note("发布公告", title, true, "");
+        this.Saved(newId > 0 ? "公告已发布" : "保存失败");
+    }
+
+    /* 删除：发布者或超管；(id, tenantId) 命中后显式受控级联清已读明细
+       （Bug#5 教训：级联必须闸后显式，防孤儿行累积）。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Delete)]
+    [Description("删除公告")]
+    async void Delete() {
+        User me = await this.Admin();
+        int id = this.InInt("id", 0);
+        OaAnnouncement r = await this.OaAnnouncement
+            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .FirstAsync();
+        if (r == null) { this.Fail(404, "0404", "公告不存在"); return; }
+        if (r.publisherId != me.id && me.isSuper != 1) {
+            this.Fail(403, "0403", "仅发布者或管理员可删除"); return;
+        }
+        int _c1 = await this.OaAnnouncementRead.Delete()
+            .Where(a => a.tenantId == this.TenantId() && a.announcementId == r.id)
+            .ExecuteAffrowsAsync();
+        int _c2 = await this.OaAnnouncement.Delete()
+            .Where(a => a.id == r.id && a.tenantId == this.TenantId())
+            .ExecuteAffrowsAsync();
+        await this.Note("删除公告", r.title, true, "");
+        this.Saved("已删除");
+    }
+
+    /* 置顶/取消：仅持 Update 位者，(id, tenantId) 双条件翻转。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("公告置顶")]
+    async void Pin() {
+        int id = this.InInt("id", 0);
+        int pin = this.InInt("pin", 1) == 1 ? 1 : 0;
+        OaAnnouncement r = await this.OaAnnouncement
+            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .FirstAsync();
+        if (r == null) { this.Fail(404, "0404", "公告不存在"); return; }
+        int n = await this.OaAnnouncement.Update()
+            .Set(a => a.pinned, pin)
+            .Set(a => a.updatedAt, WebApp.NowSeconds())
+            .Where(a => a.id == r.id && a.tenantId == this.TenantId())
+            .ExecuteAffrowsAsync();
+        await this.Note(pin == 1 ? "公告置顶" : "取消置顶", r.title, true, "");
+        this.Saved(n > 0 ? (pin == 1 ? "已置顶" : "已取消置顶") : "操作失败");
+    }
+
+    /* 已读明细弹窗：明细表反查+受众总数算触达率；限发布者/管理员。 */
+    [HttpGet]
+    [Custom(IsMenu = false, Perm = PermBit.Update)]
+    [Description("已读名单")]
+    async void Reads() {
+        User me = await this.Admin();
+        int id = this.InInt("id", 0);
+        OaAnnouncement r = await this.OaAnnouncement
+            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .FirstAsync();
+        if (r == null) { this.Fail(404, "0404", "公告不存在"); return; }
+        if (r.publisherId != me.id && me.isSuper != 1) {
+            this.Fail(403, "0403", "仅发布者或管理员可查看"); return;
+        }
+        /* 受众现算：组织变动受众跟随（同 Detail 口径）。 */
+        List<int> deptIds = Announcements.IdsOf(r.deptIds);
+        List<User> members = await this.User
+            .Where(a => a.tenantId == this.TenantId() && a.status == 1)
+            .WhereIf(deptIds.Count > 0, a => deptIds.Contains(a.departmentId))
+            .ToListAsync();
+        List<OaAnnouncementRead> reads = await this.OaAnnouncementRead
+            .Where(a => a.tenantId == this.TenantId() && a.announcementId == r.id)
+            .OrderByDescending(a => a.id).ToListAsync();
+        List<User> users = await this.User
+            .Where(a => a.tenantId == this.TenantId()).ToListAsync();
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(r.id));
+        d.Set("dialogTitle", "已读名单");
+        d.Set("title", r.title);
+        d.Set("total", Convert.ToString(members.Count));
+        d.Set("readCount", Convert.ToString(reads.Count));
+        d.Set("empty", reads.Count == 0 ? "1" : "");
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < reads.Count; i = i + 1) {
+            OaAnnouncementRead rd = reads[i];
+            StrMap m = new StrMap();
+            m.Set("user", Announcements.NameOf(users, rd.userId));
+            m.Set("readAt", Fmt.Stamp(rd.readAt));
+            items.Add(m);
+        }
+        this.Dialog(d);
+    }
+
+    /* ---- helpers ---- */
+
+    /* 受众判定（轻量）：deptIds 空=全员；否则我的部门在列
+       （AuthUser.Holds 逗号精确匹配，防 1 撞 11）。 */
+    static bool DeptHit(OaAnnouncement r, User me) {
+        if (r.deptIds.Length == 0) { return true; }
+        return AuthUser.Holds(r.deptIds, Convert.ToString(me.departmentId));
+    }
+
+    /* 已读判定：明细集合内存对照。 */
+    static bool Readed(List<OaAnnouncementRead> reads, int annId) {
+        for (int i = 0; i < reads.Count; i = i + 1) {
+            if (reads[i].announcementId == annId) { return true; }
+        }
+        return false;
+    }
+
+    /* deptIds 逗号串 → id 列表（受众现算用；写入侧受控全为数字）。 */
+    static List<int> IdsOf(string csv) {
+        List<int> ids = new List<int>();
+        if (csv.Length == 0) { return ids; }
+        List<string> parts = csv.Split(",");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            if (parts[i].Length == 0) { continue; }
+            ids.Add(Convert.ToInt32(parts[i]));
+        }
+        return ids;
+    }
+
+    /* 昵称映射：昵称空回退用户名（与 Flows.UserOpts 同款）。 */
+    static string NameOf(List<User> users, int id) {
+        for (int i = 0; i < users.Count; i = i + 1) {
+            if (users[i].id == id) { return Fmt.Text(users[i].nickname, users[i].username); }
+        }
+        return "—" + Convert.ToString(id);
+    }
+}
