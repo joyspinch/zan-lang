@@ -1308,7 +1308,19 @@ POSIX gthr，`pthread_*` 全部未定义 → `emit_lib_windows_dll` 链接失败
 
 ---
 
-## A81 · ra2 示例被空安全收紧编译打洞 —— ⏳ 已登记未修（2026-09-04）
+## A83 · ra2 tests 4 个 golden output differs —— ⏳ 已登记未修（2026-09-04）
+
+- **现象**：`bash examples/game/ra2/tests/run.sh` 10/14 过；余 maprender/objart/
+  objects/texture 四个 "output differs"。差异集中在像素级数值
+  （rgba=ff040404 → ffb6964d、overdrawn=30 → 0 等），输出确定性一致（重跑同值）。
+- **边界**：与 GameHud 迁移无关——迁移只改 using/KitUi 改名/null 守卫/icon
+  上传，MapRenderer/ObjectArt/Texture 渲染路径零触碰；golden 自 08-06 未更新，
+  期间 2d3c38b33 后 ra2 渲染相关提交（c3750b339 的 RoundRectStroke 真环形重写
+  等）改变了绘制输出。0.14 全 compile error（GameKit 删除后）→ 现 10/14。
+- **处置**：需逐个 diff 核对是渲染改进（更新 golden）还是回归（修代码）。
+  属 ra2 示例维护，另案处理。
+
+## A81 · ra2 示例被空安全收紧编译打洞 —— ✅ 已修（2026-09-04 晚，GameHud 迁移同窗）
 
 - **现象**：`bash examples/game/ra2/build.sh` 报 17 个 error（2026-09-04 实测），
   全部是 `ra2/game/GameController.zan` / `ra2/game/Objects.zan` 里
@@ -1317,8 +1329,14 @@ POSIX gthr，`pthread_*` 全部未定义 → `emit_lib_windows_dll` 链接失败
 - **证据**：与 GameKit/legend 无关——legend 全量回归绿（ACT 93 动作 PASS、
   SIM CHECK PASS、TOUR 2×33 面板 OK、SHOT 9 图 OK），snake 连 GameKit 编译通过；
   报错文件本会话未触碰（工作树仅 `ra2/main.zan` 的 2 处 DrawShadow 实参修正）。
-- **处置**：按 AGENTS.md 规则 10 登记不绕过。修法即按诊断逐处补 `?.` 或先存后判；
-  属 ra2 示例维护，另案处理。
+- **处置**：✅ 已按诊断逐处先存后判修完（GameHud 迁移会话顺带）：
+  GameController 2 处（TypeFor null → return/continue）、Objects.zan 1 处
+  （TypeFor null → continue）、main.zan 8 处（ProdCount/ProdUnitAt/DrawProduction
+  的 TypeFor+Selected null、 CivType null → continue）、main.zan DrawTexture(icon)
+  的 Texture→SdlTexture 转换（icon 是 CPU 侧 RGBA 图，补 CreateRgba32+Update
+  上传后绘制，同 Screens.LoadPcx 路径）。tests/ 4 个用例同步补 null 守卫
+  （objects/lzo/theater 的 TypeFor/At/SetForTile）。全量 ra2 编译 0 error，
+  tests/run.sh 10/14 过（余 4 个 output differs 见 A83）。
 
 ---
 

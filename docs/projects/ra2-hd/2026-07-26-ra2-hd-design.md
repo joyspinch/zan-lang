@@ -1,5 +1,7 @@
 # RA2 高清版演示（examples/game/ra2）设计文档
 
+> **2026-09-04 更新**：GameKit 已库化为 stdlib `Game.Kit`，文中 GameKit 落点读作 Game.Kit。
+
 日期：2026-07-26
 状态：已与用户确认
 

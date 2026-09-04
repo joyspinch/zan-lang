@@ -1,5 +1,8 @@
 # 09 · Zan 游戏开发借鉴报告 —— DM3 迁移现状与下一步
 
+> **2026-09-04 更新**：GameKit 已库化为 stdlib `Game.Kit`（examples/game/common/GameKit.zan 删除，
+> 9 个 example 全部改 `using Game.Kit;`）；文中 GameKit 落点自当日起一律读作 Game.Kit。
+>
 > 本文是 DM3（DreamMod3）文档体系分析（00~08 篇）的收口：对照仓库中已完成的 Zan 化迁移成果，
 > 回答"Zan 要开发游戏，还能从 DM3 借鉴什么"。
 > 依据：stdlib/Game/Arpg（10,191 行/30 文件）、examples/game/legend（6,306 行）、
