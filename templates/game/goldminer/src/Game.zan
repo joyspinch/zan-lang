@@ -142,7 +142,8 @@ class World {
     public int shakeFrames = 0;         // 屏幕震动
     public int shakeMag = 0;
     public int flashFrames = 0;         // 爆炸白闪
-    public int tntChain = 0;            // 连锁计数(演出)
+    public int boomSeq = 0;             // 爆炸事件序号(宿主轮询播声)
+    public int boomTnt = 0;             // 最近一次爆炸是否 TNT(选音色)
 
     // 关卡流程
     public int levelResult = 0;         // 0 进行中 1 过关 -1 失败
@@ -195,7 +196,6 @@ class World {
         this.lastSecondTick = false;
         this.bombClicks = 0;
         this.bombPulse = 0;
-        this.tntChain = 0;
         this.parts.Clear();
         this.texts.Clear();
         this.Populate();
@@ -300,8 +300,18 @@ class World {
             // 抓取判定
             Item hit = this.HitTest((int)tx, (int)ty);
             if (hit != null) {
-                this.hookedKind = hit.kind;
                 hit.alive = false;
+                if (hit.kind == 8) {
+                    // TNT:抓到即炸(ItemDef 契约)。在被抓位置原地爆炸,
+                    // 炸毁半径内物品并连锁引爆其它 TNT,空爪收回。此前
+                    // 拖回地表才炸,炸点与 TNT 位置无关、不毁任何物品,
+                    // 爆炸也没有声音。
+                    this.hookedKind = -1;
+                    this.state = World.ST_RETRACT;
+                    this.ExplodeTnt(hit.x, hit.y, 0);
+                    return;
+                }
+                this.hookedKind = hit.kind;
                 this.state = World.ST_RETRACT;
                 this.clawV = 0.0;
                 this.OnHookFx(hit);
@@ -327,12 +337,14 @@ class World {
             this.bombTimeLeft = this.bombTimeLeft - dtMs;
             this.bombPulse = this.bombPulse + dt * 9.0;
             if (this.bombTimeLeft <= 0) {
-                // 拆弹失败:爆炸,扣 100 金 + 震屏
+                // 拆弹失败:爆炸,扣 100 金 + 震屏。爆点在爪尖(随摆角),
+                // 此前写死钩点正下方,斜角抓到时特效飘离爪子。
                 this.hookedKind = -1;
                 this.state = World.ST_RETRACT;
-                this.clawV = 260.0;
+                this.BoomFx(this.TipX(), this.TipY(), 180);
+                this.boomSeq = this.boomSeq + 1;
+                this.boomTnt = 0;
                 this.AddGold(-100, "拆弹失败 -100", 255, 80, 80);
-                this.BoomFx(this.hookX, this.hookY + (int)this.clawLen, 180);
                 this.Shake(14, 320);
             }
             return;
@@ -394,7 +406,7 @@ class World {
                 this.qteDone = this.qteDone + 1;
                 this.qteBoost = 900;
                 this.qteRing = 96.0;
-                this.Spark(this.hookX, this.hookY + (int)this.clawLen, 255, 220, 90, 10);
+                this.Spark(this.TipX(), this.TipY(), 255, 220, 90, 10);
                 if (this.qteDone >= this.qteNeed) {
                     this.state = World.ST_RETRACT;      // 提前完成,纯加速收线
                 }
@@ -410,7 +422,6 @@ class World {
                 // 拆弹成功:炸弹被安全拆除,奖励 +80
                 this.hookedKind = -1;
                 this.state = World.ST_RETRACT;
-                this.clawV = 300.0;
                 this.AddGold(80, "拆除成功 +80", 120, 255, 140);
             }
             return;
@@ -428,13 +439,14 @@ class World {
         int cx = this.hookX + (int)(Math.Cos(this.angle * Math.PI / 180.0) * this.clawLen);
         int cy = this.hookY + (int)(Math.Sin(this.angle * Math.PI / 180.0) * this.clawLen);
         this.BoomFx(cx, cy, 120);
+        this.boomSeq = this.boomSeq + 1;
+        this.boomTnt = 0;
         this.Shake(8, 200);
         // 炸掉钩上物,清连击
         this.combo = 0;
         this.comboMul = 1.0;
         this.hookedKind = -1;
         if (this.state == World.ST_QTE) { this.state = World.ST_RETRACT; }
-        this.clawV = 420.0;
         return true;
     }
 
@@ -448,15 +460,7 @@ class World {
         ItemDef d = Data.DEFS[kind];
         int cx = this.hookX;
         int cy = this.hookY + 30;
-        if (kind == 8) {
-            // TNT:立即爆炸,无收益,震屏
-            this.BoomFx(cx, cy + 40, 160);
-            this.Shake(12, 280);
-            this.combo = 0;
-            this.comboMul = 1.0;
-            this.Float("轰! TNT", cx, cy, 255, 120, 80);
-            return;
-        }
+        // TNT(kind 8)不会走到这里:抓到即炸,见 Step 的 Extend 分支。
         if (kind == 9) {
             // 炸弹:进入拆弹 QTE
             this.state = World.ST_BOMB;
@@ -579,6 +583,58 @@ class World {
     public void Shake(int frames, int mag) {
         this.shakeFrames = frames;
         this.shakeMag = mag;
+    }
+
+    // 爪尖位置(随摆角):与 DrawClaw/伸出判定同一坐标约定
+    // (x = hookX + cos·len,y = hookY + sin·len)。特效一律锚在这里,
+    // 不写死"钩点正下方"。
+    public int TipX() {
+        return this.hookX + (int)(Math.Cos(this.angle * Math.PI / 180.0)
+                                  * this.clawLen);
+    }
+
+    public int TipY() {
+        return this.hookY + (int)(Math.Sin(this.angle * Math.PI / 180.0)
+                                  * this.clawLen);
+    }
+
+    // TNT 爆炸(抓到即炸/连锁):半径内物品全部炸毁(无收益,这就是
+    // 代价),半径内的其它 TNT 递归连锁引爆(先标 alive 再递归,不会
+    // 重复引爆)。连击清零与震屏只在入口做一次;深度上限防御极端摆位。
+    void ExplodeTnt(int cx, int cy, int depth) {
+        this.BoomFx(cx, cy, 130);
+        this.boomSeq = this.boomSeq + 1;
+        this.boomTnt = 1;
+        if (depth == 0) {
+            this.Shake(12, 260);
+            this.combo = 0;
+            this.comboMul = 1.0;
+        }
+        int chains = 0;
+        for (int i = 0; i < this.items.Count; i = i + 1) {
+            Item it = this.items[i];
+            if (!it.alive) { continue; }
+            int dx = it.x - cx; int dy = it.y - cy;
+            if (dx * dx + dy * dy > 150 * 150) { continue; }
+            if (it.kind == 8) {
+                if (depth < 6) {
+                    it.alive = false;
+                    chains = chains + 1;
+                    this.ExplodeTnt(it.x, it.y, depth + 1);
+                }
+            } else {
+                it.alive = false;
+                this.Spark(it.x, it.y, 215, 195, 155, 6);
+            }
+        }
+        if (depth == 0) {
+            if (chains > 0) {
+                this.Float("TNT 连锁 x" + (chains + 1) + "!",
+                           cx, cy - 40, 255, 150, 80);
+            } else {
+                this.Float("轰! TNT", cx, cy - 40, 255, 120, 80);
+            }
+        }
     }
 
     void BoomFx(int cx, int cy, int n) {

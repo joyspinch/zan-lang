@@ -416,11 +416,10 @@ class Text {
     static long tick;
 
     // 把原生 RGBA 缓冲打包成纹理可吃的 string（strings 携带显式长度，
-    // 内嵌 NUL 字节得以保留）。走 ByteBuffer 分配：`new string(char,int)`
-    // 在当前编译器上返回 null（见 TASKS.md 编译器缺陷备案）。
+    // 内嵌 NUL 字节得以保留）。走 FromRaw：Alloc 只给容量不设写水位，
+    // ToStr 按 length 取——不设长度就拿空串（同 stdlib Game.Kit Text 的修复）。
     static string PixelsToString(nint src, int bytes) {
-        ByteBuffer pixbuf = ByteBuffer.Alloc(bytes);
-        NativeMemory.Copy(pixbuf.Raw(), src, bytes);
+        ByteBuffer pixbuf = ByteBuffer.FromRaw(src, bytes);
         string s = pixbuf.ToStr();
         pixbuf.Free();
         return s;
@@ -486,8 +485,16 @@ class Text {
         for (int y = 0; y < sh; y = y + 1) {
             NativeMemory.Copy(dst + y * sw * 4, pix + y * Text.surfW * 4, sw * 4);
         }
+        // Alloc 不设写水位，ToStr 按 length 取——逐行搬完必须补上长度，
+        // 不然拿到空串，每个标签每帧重烘一次（纹理churn + Update 空串
+        // 直接进驱动读越界）。
+        pixbuf.SetLength(sw * sh * 4);
         string buf = pixbuf.ToStr();
         pixbuf.Free();
+        if (buf == null || buf.Length != sw * sh * 4) {
+            tex.Close();
+            return null;
+        }
         if (!tex.Update(buf, sw * 4)) { tex.Close(); return null; }
         tex.SetNearest(false);
         tex.SetBlendMode(1);

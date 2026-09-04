@@ -143,6 +143,7 @@ class MinerApp {
     public long lastFrameAt;
     public int lastBombTickSec = -1;
     public int lastTenSecTick = -1;
+    public int lastBoomSeq = 0;         // 已播声的爆炸事件序号
     // 素材实比(加载期从 PNG/JPG 头读出)
     public int bgW = 960;
     public int bgH = 720;
@@ -276,6 +277,12 @@ class MinerApp {
                 this.snd.Play(this.snd.bombtick, 0.5);
             }
         }
+        // 爆炸声:World 只记事件序号(boomSeq)与音色(boomTnt),
+        // 宿主每帧轮询补声——TNT 连锁/玩家炸药/拆弹失败共用一条通道。
+        if (w.boomSeq != this.lastBoomSeq) {
+            this.lastBoomSeq = w.boomSeq;
+            this.snd.Play(w.boomTnt != 0 ? this.snd.tntboom : this.snd.boom, 0.8);
+        }
         if (w.hurryPlayed && w.timeLeftMs > 0 && w.state != World.ST_RESULT) {
             int sec = w.timeLeftMs / 1000;
             if (sec <= 10 && sec != this.lastTenSecTick) {
@@ -395,9 +402,8 @@ class MinerApp {
 
     // Gui HUD 不可用(合成失败降级 / MINER_NOHUD)时的场景层兜底:
     // 半透明顶栏(关卡/金币/进度/倒计时/炸药) + 结算与拆弹信息,
-    // 保证游戏数据始终可读;配色与 gamehud 皮肤同一族。
-    // 文本用 PixelFont(纯 FillRect):gui 字体引擎在合成不可用的
-    // 环境里同样读不回像素,不可依赖。
+    // 保证游戏数据始终可读。文本与场景飘字同一套系统字体文本
+    // (Kit.Text,全 CJK 带投影),不再用单独的像素字模。
     void DrawFallbackHud(int ox, int oy) {
         SdlRenderer rd = this.r;
         World wo = this.w;
@@ -408,41 +414,49 @@ class MinerApp {
         rd.FillRect(ox, oy, Data.W, 46);
         rd.SetColor(138, 111, 51, 255);
         rd.FillRect(ox, oy + 46, Data.W, 2);
-        PixelFont.Draw(rd, "LV " + Convert.ToString(wo.level),
-                       ox + 16, oy + 15, 3, 232, 226, 212, 255);
-        PixelFont.Draw(rd, "$" + Convert.ToString(wo.gold) + "/"
-                       + Convert.ToString(wo.Target()),
-                       ox + 130, oy + 15, 3, 224, 196, 120, 255);
+        Text.DrawShadow(rd, "第 " + Convert.ToString(wo.level) + " 关",
+                        ox + 16, oy + 10, 2, 232, 226, 212, 255);
+        Text.DrawShadow(rd, "$" + Convert.ToString(wo.gold) + "/"
+                        + Convert.ToString(wo.Target()),
+                        ox + 140, oy + 10, 2, 244, 208, 120, 255);
         rd.SetColor(40, 44, 56, 255);
-        rd.FillRect(ox + 330, oy + 17, 220, 12);
+        rd.FillRect(ox + 360, oy + 17, 200, 12);
         rd.SetColor(111, 170, 94, 255);
-        rd.FillRect(ox + 322 + 10, oy + 19, 216 * pct / 100, 8);
+        rd.FillRect(ox + 360, oy + 19, 196 * pct / 100, 8);
+        // 右侧从右往左排(倒计时/连击/炸药),量宽定位互不重叠
         int secLeft = (wo.timeLeftMs + 999) / 1000;
-        PixelFont.Draw(rd, Convert.ToString(secLeft / 60) + ":"
-                       + Convert.ToString(secLeft % 60 / 10)
-                       + Convert.ToString(secLeft % 10),
-                       ox + 610, oy + 15, 3,
-                       secLeft <= 10 ? 224 : 232,
-                       secLeft <= 10 ? 120 : 226,
-                       secLeft <= 10 ? 96 : 212, 255);
+        int xr = ox + Data.W - 16;
+        string dtxt = "Q 炸药 x" + Convert.ToString(wo.dynamites);
+        int dw = Text.Width(rd, dtxt, 2);
+        Text.DrawShadow(rd, dtxt, xr - dw, oy + 10, 2, 200, 194, 174, 255);
+        xr = xr - dw - 28;
+        string ttxt = "剩余 " + Convert.ToString(secLeft) + " 秒";
+        int tw = Text.Width(rd, ttxt, 2);
+        Text.DrawShadow(rd, ttxt, xr - tw, oy + 10, 2,
+                        secLeft <= 10 ? 250 : 232,
+                        secLeft <= 10 ? 120 : 226,
+                        secLeft <= 10 ? 96 : 212, 255);
+        xr = xr - tw - 28;
         if (wo.combo >= 2) {
-            PixelFont.Draw(rd, "x" + Convert.ToString(wo.combo),
-                           ox + 740, oy + 15, 3, 240, 176, 80, 255);
+            string ctxt = "连击 x" + Convert.ToString(wo.combo);
+            int cw = Text.Width(rd, ctxt, 2);
+            Text.DrawShadow(rd, ctxt, xr - cw, oy + 10, 2, 240, 176, 80, 255);
         }
-        PixelFont.Draw(rd, "TNT x" + Convert.ToString(wo.dynamites),
-                       ox + Data.W - 170, oy + 15, 3, 180, 174, 154, 255);
         // 拆弹覆盖
         if (wo.state == World.ST_BOMB) {
             rd.SetColor(10, 12, 17, 205);
             rd.FillRect(ox + Data.W / 2 - 170, oy + 230, 340, 150);
             rd.SetColor(192, 85, 63, 255);
             rd.FillRect(ox + Data.W / 2 - 170, oy + 230, 340, 3);
-            PixelFont.Draw(rd, "BOMB!", ox + Data.W / 2 - 55,
-                           oy + 250, 4, 240, 176, 80, 255);
-            PixelFont.Draw(rd, Convert.ToString(wo.bombClicks) + "/"
-                           + Convert.ToString(wo.bombNeed) + "  "
-                           + Convert.ToString(wo.bombTimeLeft / 1000 + 1) + "s",
-                           ox + Data.W / 2 - 70, oy + 296, 3, 232, 226, 212, 255);
+            Text.DrawCenteredShadow(rd, "疯狂点击! 拆除炸弹!",
+                                    ox + Data.W / 2, oy + 252, 3,
+                                    240, 176, 80, 255);
+            Text.DrawCenteredShadow(rd, Convert.ToString(wo.bombClicks) + "/"
+                                    + Convert.ToString(wo.bombNeed) + "    "
+                                    + Convert.ToString(wo.bombTimeLeft / 1000 + 1)
+                                    + " 秒",
+                                    ox + Data.W / 2, oy + 312, 2,
+                                    232, 226, 212, 255);
         }
         // 结算覆盖
         if (wo.state == World.ST_RESULT) {
@@ -451,13 +465,16 @@ class MinerApp {
             rd.FillRect(ox + Data.W / 2 - 230, oy + 200, 460, 210);
             rd.SetColor(win ? 111 : 192, win ? 170 : 85, win ? 94 : 63, 255);
             rd.FillRect(ox + Data.W / 2 - 230, oy + 200, 460, 3);
-            PixelFont.Draw(rd, win ? "WIN!" : "TIME UP",
-                           ox + Data.W / 2 - 70, oy + 222, 4, 232, 226, 212, 255);
-            PixelFont.Draw(rd, "$" + Convert.ToString(wo.gold) + "/"
-                           + Convert.ToString(wo.Target()),
-                           ox + Data.W / 2 - 70, oy + 280, 3, 224, 196, 120, 255);
-            PixelFont.Draw(rd, "TOTAL $" + Convert.ToString(wo.totalGold),
-                           ox + Data.W / 2 - 96, oy + 314, 3, 232, 226, 212, 255);
+            Text.DrawCenteredShadow(rd, win ? "过关!" : "时间到!",
+                                    ox + Data.W / 2, oy + 224, 4,
+                                    232, 226, 212, 255);
+            Text.DrawCenteredShadow(rd, "本关 $" + Convert.ToString(wo.gold)
+                                    + " / 目标 $" + Convert.ToString(wo.Target()),
+                                    ox + Data.W / 2, oy + 306, 2,
+                                    244, 208, 120, 255);
+            Text.DrawCenteredShadow(rd, "累计 $" + Convert.ToString(wo.totalGold),
+                                    ox + Data.W / 2, oy + 350, 2,
+                                    232, 226, 212, 255);
         }
         rd.SetColor(0, 0, 0, 255);
     }
@@ -745,15 +762,31 @@ class MinerApp {
     static int ShotRun(MinerApp app) {
         StreamWriter log = new StreamWriter("miner_shot.log");
         log.WriteLine("=== MINER_SHOT ===");
-        string[] names = new string[8];
+        string[] names = new string[9];
         names[0] = "swing"; names[1] = "extend"; names[2] = "qte";
         names[3] = "bomb"; names[4] = "boom"; names[5] = "result";
-        names[6] = "ang45"; names[7] = "ang135";
-        for (int s = 0; s < 8; s = s + 1) {
+        names[6] = "ang45"; names[7] = "ang135"; names[8] = "tntgrab";
+        for (int s = 0; s < 9; s = s + 1) {
             World w = app.w;
             if (s == 0) { w.StartLevel(); }
             if (s == 6) { w.StartLevel(); w.angle = 45.0; w.clawLen = 260.0; }
             if (s == 7) { w.StartLevel(); w.angle = 135.0; w.clawLen = 260.0; }
+            if (s == 8) {
+                // TNT 抓取即炸:垂直下方 300 处摆一颗 TNT,周围两件
+                // 陪葬品,真实伸钩推进到命中(爆炸在物品原位发生),
+                // 再走 6 帧让白闪衰减、粒子展开。
+                w.StartLevel();
+                int tyy = Data.HOOK_Y + 300;
+                w.items.Add(Item.Make(8, Data.HOOK_X, tyy));
+                w.items.Add(Item.Make(0, Data.HOOK_X + 60, tyy + 24));
+                w.items.Add(Item.Make(1, Data.HOOK_X - 92, tyy - 30));
+                w.state = World.ST_EXTEND;
+                w.clawV = 900.0;
+                for (int k = 0; k < 40 && w.state == World.ST_EXTEND; k = k + 1) {
+                    w.Step(16);
+                }
+                for (int k = 0; k < 6; k = k + 1) { w.Step(16); }
+            }
             if (s == 1) { w.state = World.ST_EXTEND; w.clawLen = 260.0; }
             if (s == 2) {
                 w.StartLevel();
@@ -878,52 +911,9 @@ class MinerApp {
     }
 }
 
-// 3x5 像素字模(0-9 $ / 空格 : x L V T N s F E .),纯 FillRect 绘制,
-// 不依赖 gui 字体引擎——兜底 HUD 在 gui 运行时不可用也必然可画。
-class PixelFont {
-    static string chars = "0123456789$/ :xLVTNsFE.";
-    static int[] glyphs = PixelFont.Build();
-
-    static int[] Build() {
-        int[] g = new int[23];
-        g[0] = 0x7B6F; g[1] = 0x2C97; g[2] = 0x73E7; g[3] = 0x72CF;
-        g[4] = 0x5BC9; g[5] = 0x79CF; g[6] = 0x79EF; g[7] = 0x7252;
-        g[8] = 0x7BEF; g[9] = 0x7BCF; g[10] = 0x2F9F; g[11] = 0x12A4;
-        g[12] = 0x0000; g[13] = 0x0410; g[14] = 0x0AA8; g[15] = 0x4927;
-        g[16] = 0x5B6A; g[17] = 0x7492; g[18] = 0x5FED; g[19] = 0x388E;
-        g[20] = 0x79A4; g[21] = 0x79A7; g[22] = 0x0002;
-        return g;
-    }
-
-    static int GlyphOf(char c) {
-        for (int i = 0; i < chars.Length; i = i + 1) {
-            if (chars[i] == c) { return glyphs[i]; }
-        }
-        return glyphs[12];
-    }
-
-    public static int Width(int n, int scale) {
-        return n * 4 * scale - scale;
-    }
-
-    public static void Draw(SdlRenderer r, string text, int x, int y, int scale,
-                            int cr, int cg, int cb, int ca) {
-        int cx = x;
-        for (int i = 0; i < text.Length; i = i + 1) {
-            int g = GlyphOf(text[i]);
-            for (int row = 0; row < 5; row = row + 1) {
-                // 行 0(顶行)打包在最高 3 位,读位时反向。
-                for (int col = 0; col < 3; col = col + 1) {
-                    if (((g >> ((4 - row) * 3 + (2 - col))) & 1) != 0) {
-                        r.FillRect(cx + col * scale, y + row * scale,
-                                   scale, scale);
-                    }
-                }
-            }
-            cx = cx + 4 * scale;
-        }
-    }
-}
+// 3x5 像素字模已退役:兜底 HUD 与场景飘字统一走 Kit.Text(系统
+// 字体,全 CJK 带投影)——像素风数字与游戏画风不搭,且两套字模
+// 维护两份。
 
 // 顶栏 HUD(Gui 控件树):关卡、金币/目标、进度条、倒计时、连击、
 // 炸药持有与提示行。配色全部来自 gamehud 皮肤(hud-* class)。
