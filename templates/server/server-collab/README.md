@@ -1,53 +1,72 @@
-# {{NAME}} — ZanWeb Web MVC Framework
+# {{NAME}} — Zan 企业协同平台
 
-Enterprise web application skeleton modeled on a production swoole (ZxPHP)
-framework, rebuilt on Zan's coroutine runtime — a layered controller/model
-structure, an external config file, and the ORM and cache wired in by default.
+多租户、模块化单体的企业协同平台模板，构建在 Zan 的协程运行时与 ZanWeb
+MVC 框架之上。**零 Redis、零外部服务依赖**：默认 SQLite（WAL）+ 进程内
+缓存即可完整运行，切 MySQL/PostgreSQL 与 Redis 只改 `config/app.json`。
 
-The framework itself is **not** part of the template: routing, request context,
-hooks, views, filters, validation, sessions, rate limiting, request locks and
-the server bootstrap live in the standard library under `System.Web`
-(`WebApp`, `Router`, `HttpContext`, `Controller`, `View`, `WebServer`, …) next
-to `RouteTable` / `RouteStats` / `PermTable`. The template keeps only what is
-its own: config, DB, cache, controllers, models and views.
+功能面（管线 T1~T16 交付）：
+
+| 领域 | 能力 |
+|---|---|
+| 平台基座（T1） | 多租户隔离（全业务表 tenant_id 过滤、跨租户读写 404）、RBAC 权限位（View/Create/Update/Delete/Export）、部门数据范围、登录日志/操作日志、站点设置 |
+| 系统管理 | 用户 / 角色 / 部门 / 数据字典（含字典联动表单）、站点配置、注册与找回密码 |
+| 通知中心（T2/T3） | sys_notify 单一事实源、WS 优先 + SSE 回落事件流、铃铛未读数、免打扰偏好 |
+| 附件（T4） | 流式上传落盘（64KB 分块）、租户闸下载/删除、按模块挂载 |
+| 待办与工作台（T5） | Flow 任务 / CRM 到期 / 日程聚合待办，一键跳转 |
+| 导入导出（T6/T7） | CSV/XLSX 导出、CSV 导入（分批事务 + 逐行错误报告）、各业务模块端点 |
+| 全文搜索（T8） | 顶栏聚合搜索，逐源 MaskOf 权限闸（无权限源零泄漏）、租户内检索 |
+| 文档中心（T9/T10） | 空间-树形文档、11 种块类型渲染、块编辑器（2s 防抖自动保存、乐观锁 409）、版本历史、XSS 白名单 |
+| 日历（T11） | 月/周视图、到期触发通知 + 待办各一条（多 worker 原子抢占防重发） |
+| 站内信 + 公告（T12） | 私信（会话 + 已读回执）、全员公告 + 登录弹窗一次 |
+| IM 实时（T13） | 统一事件流（ChatHub + MessageRelay 水位扫描）、跨 worker 1s 拍内送达、离线上线补拉 |
+| 表单引擎（T14/T15） | 8 种字段 schema 定义 + 预览、字典联动（`dict:`）、服务端校验白名单、填报自动发起流程、审批状态推导回显、CSV 导出 |
+| 备份恢复（T16） | 管理页一键备份（VACUUM INTO 快照 + uploads.zip + manifest）、保留 7 份轮转、跨 worker 锁、zip 下载 |
+
+框架本身（路由、请求上下文、钩子、视图、验证、会话、限流、请求锁、
+服务器引导）在标准库 `System.Web`（`WebApp`、`Router`、`HttpContext`、
+`Controller`、`View`、`WebServer`、`ApiDocs`…）。模板只保留属于本应用的
+部分：配置、DB、缓存、各域控制器、模型与视图。
 
 ## Layout
 
 ```
 config/app.json         runtime config (host/port/limits/db/cache) — NOT compiled in
 src/main.zan            bootstrap only — routes come from controller attributes
-src/Controller/         request handlers, one directory per module
-  Index/Index.zan         HTML landing page
-  Blog/Posts.zan          list / detail / publish (ORM + cache + views)
-  Account/Login.zan       GET/POST /admin/login, /admin/logout (own bare layout)
-  Admin/Dashboard.zan     GET /admin — metrics dashboard
-  Admin/Users.zan         GET /admin/system/users + enable/disable, force logout
-  Admin/Posts.zan         GET /admin/content/posts + publish/unpublish
-  Api/Auth.zan            POST /api/auth/login, GET /api/auth/me
-  User/Users.zan          /users, /user/{id}
-src/Dao/<Module>/       every query and write for that module
-src/Model/<Module>/     entities only: table structure, no queries
-src/Framework/          application wiring that belongs to this app
-  AppController.zan       request-scoped connection + transactions
-  AdminController.zan     admin base: anonymous -> redirect to /admin/login
-  Cfg.zan                 loads config/app.json into the typed Cfg entity
-  Db.zan                  builds the DB pool + Redis from [database]/[cache]
-  DbContext.zan           per-request connection lease
-  Schema.zan              CodeFirst DDL + seed, once at startup
-  Auth.zan                token issue/verify against sys_user
+src/Controller/         平台域控制器
+  Account/                Login / Register（登录域，Bypass）
+  Admin/Dashboard.zan     工作台（聚合待办 + 公告卡片）
+  Admin/Profile.zan       个人中心
+  Admin/System/           Users / Roles / Departments / Dicts / Logs /
+                          SiteConfig / Backups / Docs（接口文档页）
+  Admin/Dev/Assistant.zan AI 助手（[Ai] 白名单策略）
+  Api/                    Auth（令牌登录）、Data、Index
+src/Modules/            业务域（模型 + 控制器同目录内聚）
+  Oa/                     通知、附件、待办、日历、文档中心、块编辑器、
+                          站内信、公告、表单引擎 + 填报、备份页、全局搜索页
+  Crm/                    客户 / 联系人 / 商机
+  Wms/                    商品 / 仓库 / 库存 / 入库
+  Ecbi/                   电商 BI：店铺 / 商品 / 广告 / 报表 / 平台
+  Flow/                   流程定义 / 实例 / 任务 + 引擎（Engine.zan）+ 通知兼容层
+src/Feature/            横切能力：Attachment、TodoCenter、ExcelIo、Blocks、
+                        FormSchema、Backup、Search、CalendarRemind、
+                        MessageRelay、Mailer、Metrics、Ai…
+src/Framework/          应用接线：Cfg、Db、DbContext、Schema（CodeFirst DDL +
+                        种子）、Auth、Tenant、Notify(Hub)、DataScope、Perm(Table)、
+                        ExcelIo、Search、MessageRelay、AppServices
+src/Model/、src/Dao/    sys_* 平台实体与查询
 views/                  templates, in the module structure of the controllers
   layout.html             the site-wide page wrapper (global {{content}} layout)
   <Module>/*.html         that module's views; a module's own layout.html
                           overrides the global one for that module only
 wwwroot/                the ONLY web-reachable directory, served at /static
+docs/deploy-collab.md   部署、备份恢复演练、升级指引
 ```
 
 `views/` and `wwwroot/` sit next to `src/`, not inside it, because both are read
 at run time: a release is a copy of the executable plus `config/`, `views/` and
-`wwwroot/` — `src/` is a build input and never ships. The view keys are
-unchanged by the split: `views/Admin/Users.Index.html` is still
-`Admin.Users.Index`, since `View.LoadRec` derives the key from the directory
-path and the module directories are the same ones the controllers use.
+`wwwroot/` — `src/` is a build input and never ships. The view keys derive from
+the directory path (`View.LoadRec`), so `views/Admin/Oa/Docs.Index.html` is
+`Admin.Oa.Docs.Index`, matching the controller namespaces.
 
 ## Attribute-driven routes
 
@@ -171,15 +190,45 @@ edit it and restart to change settings. Ship it next to the executable.
 
 ```json
 {
-  "server":   { "host": "127.0.0.1", "port": 8080, "maxBodyMB": 2, "globalLimitPerSec": 0 },
+  "server":   { "name": "{{NAME}}", "host": "127.0.0.1", "port": 8090,
+                "maxBodyMB": 2, "uploadBodyMB": 20, "globalLimitPerSec": 0 },
   "database": { "driver": "sqlite", "sqlitePath": "data/app.db",
-                "host": "127.0.0.1", "port": 3306, "name": "app", "user": "root", "password": "" },
-  "worker":   { "count": 1, "daemon": false },
-  "cache":    { "driver": "memory", "redisHost": "127.0.0.1", "redisPort": 6379 }
+                "host": "127.0.0.1", "port": 3306, "name": "app",
+                "user": "root", "password": "", "poolSize": 8 },
+  "auth":     { "secret": "32+ random chars — or env ZAN_AUTH_SECRET" },
+  "worker":   { "count": 4, "daemon": false },
+  "log":      { "access": false, "slowMs": 1000, "slowSqlMs": 200,
+                "dir": "logs", "pattern": "{yyyy}{MM}/{dd}.log" },
+  "metrics":  { "enabled": true, "path": "data/metrics.db",
+                "flushSeconds": 60, "flushRows": 2000, "keepDays": 30 },
+  "cache":    { "driver": "memory", "redisHost": "127.0.0.1",
+                "redisPort": 6379, "poolSize": 8, "connectTimeoutMs": 3000 }
 }
 ```
 
-`driver` accepts `sqlite` (default), `mysql`/`mariadb`, `postgres`. The DB
+### 配置项说明
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `server.name` | `{{NAME}}` | 站点名；进 API 文档标题与管理页 |
+| `server.host` / `server.port` | `127.0.0.1` / `8090` | 监听地址与端口 |
+| `server.maxBodyMB` | `2` | 普通（内存）请求体上限，MB |
+| `server.uploadBodyMB` | `20` | 流式上传上限（附件 T4），MB；`main.zan` 用它设 `MaxBody`/`MaxUpload` |
+| `server.globalLimitPerSec` | `0`（不限） | 全局每秒请求上限；0 关闭全局限流 |
+| `database.driver` | `sqlite` | `sqlite` / `mysql` / `mariadb` / `postgres`；连接不可达时服务器照常启动，DB 路由返回 503 |
+| `database.sqlitePath` | `data/app.db` | SQLite 文件相对路径（相对运行目录；绝对路径会落到盘根而失败） |
+| `database.host/port/name/user/password` | — | driver 为 mysql/postgres 时使用；`poolSize` 连接池大小 |
+| `auth.secret` | — | 会话令牌签名密钥，32+ 字符；被环境变量 `ZAN_AUTH_SECRET` 覆盖；缺省/过短登录报配置错误 |
+| `worker.count` | `4` | worker 进程数；Linux/macOS 走 `SO_REUSEPORT` 多进程，Windows 恒为单进程 |
+| `worker.daemon` | `false` | `true` 时 Linux 下 `setsid` 后台化；Windows 忽略 |
+| `log.access` / `log.slowMs` / `log.slowSqlMs` | `false` / `1000` / `200` | 访问日志开关、慢请求（ms）与慢 SQL（ms）阈值 |
+| `log.dir` / `log.pattern` | `logs` / `{yyyy}{MM}/{dd}.log` | 日志目录与按日分文件模板 |
+| `metrics.enabled` / `metrics.path` | `true` / `data/metrics.db` | 指标历史独立库存放（与业务库分离） |
+| `metrics.flushSeconds` / `flushRows` / `keepDays` | `60` / `2000` / `30` | 刷盘间隔、批量行数、保留天数 |
+| `cache.driver` | `memory` | `memory`（worker 本地，仅 `worker.count=1` 时语义正确）或 `redis`（跨 worker 共享，IR/轮询/会话共享的前提） |
+| `cache.redisHost/port/poolSize/connectTimeoutMs` | `127.0.0.1` / `6379` / `8` / `3000` | driver 为 redis 时使用；Redis 不可达时读未命中、写丢弃、回落数据库 |
+
+DB `driver` accepts `sqlite` (default), `mysql`/`mariadb`, `postgres`. The DB
 connection is opened lazily and tolerantly: if it is not configured/reachable,
 the server still runs and DB-backed routes return a clear 503 instead of
 crashing.
@@ -279,6 +328,24 @@ zanc src/main.zan src/**/*.zan --auto-stdlib -o build/app.exe
 build/app.exe          # cwd = project root, so ./config/app.json and ./wwwroot resolve
 ```
 
+全量编译约 295 个文件（129 业务源 + stdlib 缓存）；编译器从控制器属性与
+`In*`/`Need*` 调用派生路由表与 API 文档数据，无生成文件需要维护。
+
+**种子账号**（首次启动 `Schema.SeedAdmin` 写入，仅当 sys_user 空表时）：
+
+- 超级管理员：`admin` / `admin1234`（`isSuper=1`，绕过角色表）
+- 登录页：`/admin/login`；首个动作建议改密（个人中心）并改 `auth.secret`
+
+数据目录（运行时生成，git-ignored）：
+
+```
+data/app.db          SQLite 主库（WAL）
+data/backups/{ts}/   备份（app.db + uploads.zip + manifest.txt，保留 7 份）
+data/metrics.db      指标历史（独立库）
+data/uploads/        附件流式落盘（{year-month}/ 结构）
+logs/{yyyyMM}/dd.log 运行日志
+```
+
 The working directory matters more than where the binary sits: the server reads
 `config/app.json`, loads `views/`, serves `wwwroot/` and opens the SQLite file by
 RELATIVE path, so run it from the project root (or from a deploy directory that
@@ -306,6 +373,9 @@ seed account. Set the session key — `[auth].secret` in `config/app.json`, or t
 `ZAN_AUTH_SECRET` environment variable which overrides it — to 32+ characters,
 or sign-in fails with a configuration error.
 
+生产部署、MySQL 迁移、备份恢复**演练**步骤与旧库升级路径见
+`docs/deploy-collab.md`。
+
 **Keep generated files out of the source tree.** `-o build/app.exe` exists so the
 executable and the driver DLLs the linker copies beside it land in one throwaway
 directory. Everything the running app produces is likewise disposable and
@@ -327,22 +397,45 @@ every sign-in "wrong password").
 
 ## Endpoints
 
-- `GET /` — HTML landing page from the in-memory template cache
-- `GET /blog`, `GET /blog/{id}`, `POST /blog/create` — server-rendered blog (author = signed-in account)
-- `GET /admin/login`, `POST /admin/login`, `GET /admin/logout` — admin sign-in (seed: `admin` / `admin1234`)
-- `GET /admin` — admin dashboard (uptime, requests, CPU/RSS, slow requests, pool/cache)
-- `GET /admin/system/users`, `POST /admin/system/users/status`, `POST /admin/system/users/logout` — account administration
-- `GET /admin/content/posts`, `POST /admin/content/posts/state` — content administration (drafts included)
-- `GET /users` — ORM + cache demo (503 until a database is configured)
-- `GET /user/{id}` — route parameter demo (JSON envelope)
-- `GET /api/status` — request statistics
-- `GET /admin/stats` — runtime diagnostics (CPU, memory, requests, slow requests/queries) — **protect before exposing**
-- `POST /api/echo` — rate-limited (100 req/s) echo
-- `POST /api/gather` — `[Auth] [Rank(3)] [Lock("user")]` permissioned + locked demo
-- `POST /api/login` — `user=admin&pass=admin` issues a session token
-- `GET /api/me` — requires `Authorization: Bearer <token>` or session cookie
-- `GET /admin/menu` — admin menu built from `[Menu]` routes (`[Auth] [Rank(9)]`)
-- `POST /upload` — streaming upload
+入口与平台域（完整清单以 `/admin/system/docs` 页与 `/api/docs.json` 为准，
+由编译器从路由属性自动派生，T2~T16 新端点已全部收录）：
+
+- `GET /` — HTML 落地页
+- `GET|POST /admin/login`, `GET /admin/logout` — 后台登录（种子 `admin` / `admin1234`）
+- `POST /api/auth/login`, `GET /api/auth/me` — 令牌登录 / 当前身份
+- `GET /admin` — 工作台（聚合待办 + 公告卡片 + 运行指标）
+- `GET /admin/system/users|roles|departments|dicts|logs|settings` — 系统管理
+- `GET /admin/system/docs` — 接口文档页（分组/检索/参数/应答）
+- `GET /admin/system/backup`, `POST /admin/system/backup/create`,
+  `GET /admin/system/backup/download?id=` — 备份页 / 立即备份 / 下载 zip
+- `GET /admin/oa/notifies`（`unread` / `stream` / `read`）— 通知中心 + 铃铛 API
+- `GET|POST /admin/oa/attachments/upload|download|delete` — 附件（流式上传，
+  query 传 `module/relatedId/name/mime`）
+- `GET /admin/oa/todocenter`（`add` / `done`）— 待办中心
+- `GET /admin/oa/calendar` — 日历（月/周）
+- `GET /admin/oa/docs`, `/admin/oa/spaces`, `docs/edit|save|revisions` — 文档中心 + 块编辑器
+- `GET|POST /admin/oa/messages`（`chat?peer=` / `send`）— 站内私信
+- `GET|POST /admin/oa/announcements` — 公告（全员弹窗一次）
+- `GET /admin/oa/forms`, `/admin/oa/formfill` — 表单定义 / 填报（提交可自动起流程）
+- `GET /admin/oa/search?kw=` — 全局搜索聚合
+- `/admin/crm/*`（customers/contacts/opportunities）、`/admin/wms/*`、
+  `/admin/ecbi/*` — 业务模块 CRUD + `export|import|template` 导入导出端点
+- `/admin/flow/flows|tasks` — 流程定义/发起/审批（`flows/kill?id=`）
+- `GET /admin/flow/notifies` — 旧通知页（301 → `/admin/oa/notifies`；铃铛 API 原路径保留）
+- `GET /api/docs.json` — OpenAPI 3.0（`/api/docs` UI 已收进管理后台 docs 屏）
+
+## 已知行为说明（T17 回归观察项，非缺陷）
+
+- **私信已读双层语义（O-1）**：打开私信会话只清 `OaMessage.isRead`（会话层
+  已读回执）；对应的通知行 `SysNotify` 独立计数，需在通知中心显式标记已读。
+  两层 API 分明是有意设计（Messages 与 Notifies 各自闭环），"点开即全消"
+  与否留产品定夺。
+- **私信发送参数是 `peer`（O-2）**：`POST /admin/oa/messages/send` 用
+  `peer` 指定对方用户 id，不是 `toId`；参数错名会得到 404"对方不存在或已
+  停用"（伪造 `peer=9999` 同样 404，租户闸生效）。
+- **`Flow.Kill` 幂等 200（O-3）**：对不在进行中（status≠1）的流程实例，
+  `POST /admin/flow/flows/kill?id=` 返回 200"实例不在进行中"而非 404；
+  Update 条件含 `status==1`，语义无害且不越租户（T17 隔离矩阵 N 已验证）。
 
 ## Database & ORM (FreeSQL-style, bidirectional)
 
