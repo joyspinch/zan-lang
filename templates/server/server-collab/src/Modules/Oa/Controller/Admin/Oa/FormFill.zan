@@ -301,7 +301,18 @@ class FormFill : AdminController {
                 && a.status == 1)
             .WhereIf(mine, a => a.submitterId == me.id)
             .OrderBy(a => a.id).ToListAsync();
-        JsonValue schema = JsonValue.ParseLenient(def.schemaJson);
+        /* 列头/取值口径（Bug#12）：行 schemaSnapshot 优先——提交时已
+           快照（Detail/Summary 同口径），表单定义改版不影响历史行；
+           列头取最新一行快照（rows 按 id 升序取末位），行值仍按列头
+           快照的 code 集合取，跨版本被删除的字段自然出空；无行（空
+           导出）回落当前 def.schemaJson。 */
+        JsonValue schema = null;
+        if (rows.Count > 0) {
+            schema = JsonValue.ParseLenient(rows[rows.Count - 1].schemaSnapshot);
+        }
+        if (schema == null || !schema.IsObject()) {
+            schema = JsonValue.ParseLenient(def.schemaJson);
+        }
         JsonValue fields = null;
         if (schema != null && schema.IsObject()) { fields = schema.Get("fields"); }
         List<string> headers = new List<string>();
@@ -375,8 +386,10 @@ class FormFill : AdminController {
     }
 
     /* 逐字段收集表单值（schema 顺序遍历，值缺失=未填不入对象）。
-       checkbox 组：admin.js 把 f_<code>[] 合并为逗号串（选项本身不含
-       逗号，FormSchema.HasOptions 已挡），此处拆回数组落 dataJson；
+       checkbox 组：admin.js 把 f_<code>[] 合并为逗号串后以剥掉 [] 的
+       键名 f_<code> 提交（admin.js submit: slice(0,-2)，Bug#12），
+       故 InRaw 键名不带 []；选项本身不含逗号（FormSchema.HasOptions
+       已挡），此处拆回数组落 dataJson；
        attachment 无表单值（随行挂载）；其余标量 Trim 后存字符串值
        （OaFormData.dataJson 契约：值恒字符串或字符串数组）。 */
     JsonValue Collect(JsonValue schema) {
@@ -391,7 +404,7 @@ class FormFill : AdminController {
             if (code.Length == 0) { continue; }
             if (type == "attachment") { continue; }
             if (type == "checkbox") {
-                string raw = this.InRaw("f_" + code + "[]");
+                string raw = this.InRaw("f_" + code);
                 if (raw.Length == 0) { continue; }
                 List<string> parts = raw.Split(",");
                 JsonValue arr = JsonValue.NewArray();
