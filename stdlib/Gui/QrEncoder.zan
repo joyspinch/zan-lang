@@ -18,6 +18,7 @@ class QrMatrix {
     public QrEcl ecl;
     public bool[] modules;
 
+    /// (x,y) 处模块是否深色（行主序，不含静区）。
     public bool Get(int x, int y) { return modules[y * size + x]; }
 }
 
@@ -70,6 +71,7 @@ class QrEncoder {
         25, 25, 34, 30, 32, 35, 37, 40, 42, 45, 48, 51, 54, 57, 60, 63, 66, 70,
         74, 77, 81};
 
+    /// 该版本/级别每块纠错码字数（ISO 18004 表）。
     static int EcPerBlock(QrEcl ecl, int ver) {
         if (ecl == QrEcl.L) { return EC_PER_BLOCK_L[ver]; }
         if (ecl == QrEcl.M) { return EC_PER_BLOCK_M[ver]; }
@@ -77,6 +79,7 @@ class QrEncoder {
         return EC_PER_BLOCK_H[ver];
     }
 
+    /// 该版本/级别的纠错分块数。
     static int NumBlocks(QrEcl ecl, int ver) {
         if (ecl == QrEcl.L) { return NUM_BLOCKS_L[ver]; }
         if (ecl == QrEcl.M) { return NUM_BLOCKS_M[ver]; }
@@ -169,6 +172,7 @@ class QrEncoder {
     static int[] gfExp = null;
     static int[] gfLog = null;
 
+    /// 首次调用时构建 GF(256) 的指数/对数表（本原多项式 0x11D）。
     static void EnsureGf() {
         if (gfExp != null) { return; }
         int[] e = new int[512];
@@ -185,6 +189,7 @@ class QrEncoder {
         gfLog = l;
     }
 
+    /// GF(256) 乘法（任一操作数为 0 时结果为 0）。
     static int GfMul(int a, int b) {
         if (a == 0 || b == 0) { return 0; }
         EnsureGf();
@@ -266,8 +271,10 @@ class QrEncoder {
 
     // ---- 文本 -> 分段 -----------------------------------------------------
 
+    /// 字节是否为 ASCII 数字 0-9。
     static bool IsNumeric(int b) { return b >= 48 && b <= 57; }
 
+    /// 字符在字母数字表中的值（0-44），不在表内时 -1。
     static int AlnumValue(string ch) {
         for (int i = 0; i < 45; i = i + 1) {
             if (ALNUM_CHARS[i] == (int)(ch[0])) { return i; }
@@ -275,6 +282,7 @@ class QrEncoder {
         return -1;
     }
 
+    /// 以 lead 为首字节的 UTF-8 码点字节长度（1-4）。
     static int SeqByteLen(int lead) {
         if (lead < 128) { return 1; }
         if (lead < 224) { return 2; }
@@ -381,6 +389,7 @@ class QrEncoder {
         return outp;
     }
 
+    /// 把一段文本编码为 Byte 段（每字节 8 位，高位在前）。
     static QrEncoder.Segment MakeByteRun(string run) {
         QrEncoder.Segment s = new QrEncoder.Segment();
         s.mode = MODE_BYTE;
@@ -406,6 +415,7 @@ class QrEncoder {
 
     // ---- 版本选择 -----------------------------------------------------------
 
+    /// 模式指示符后的字符计数字段宽度（按版本 1-9/10-26/27-40 分三档）。
     static int CharCountBits(int mode, int ver) {
         int g = 0;
         if (ver <= 9) { g = 0; } else if (ver <= 26) { g = 1; } else { g = 2; }
@@ -415,6 +425,7 @@ class QrEncoder {
         return 16;
     }
 
+    /// 该版本/级别的数据码字容量（总码字减去全部纠错码字）。
     static int DataCapacity(int ver, QrEcl ecl) {
         return QrEncoder.TotalCodewords(ver)
             - EcPerBlock(ecl, ver) * NumBlocks(ecl, ver);
@@ -461,16 +472,19 @@ class QrEncoder {
         return nDataCw;
     }
 
+    /// 把 val 的低 n 位按高位在前追加进位流。
     static void AppendVal(List<int> bits, int val, int n) {
         for (int i = n - 1; i >= 0; i = i - 1) { bits.Add((val >> i) & 1); }
     }
 
     // ---- 矩阵构建 ----------------------------------------------------------
 
+    /// 标记 (x,y) 为功能模块（不可掩码、不放数据），越界忽略。
     static void SetFn(bool[] fn, int size, int x, int y) {
         if (x < 0 || y < 0 || x >= size || y >= size) { return; }
         fn[y * size + x] = true;
     }
+    /// 标记功能模块并置为深色，越界忽略。
     static void SetDark(bool[] dark, bool[] fn, int size, int x, int y) {
         if (x < 0 || y < 0 || x >= size || y >= size) { return; }
         dark[y * size + x] = true;
@@ -494,6 +508,7 @@ class QrEncoder {
         }
     }
 
+    /// 校正图形：以 (cx,cy) 为中心的 5x5 图案（同心环），越界部分丢弃。
     static void DrawAlign(bool[] dark, bool[] fn, int size, int cx, int cy) {
         for (int dy = -2; dy <= 2; dy = dy + 1) {
             for (int dx = -2; dx <= 2; dx = dx + 1) {
@@ -509,6 +524,7 @@ class QrEncoder {
         }
     }
 
+    /// 版本信息 18 位：版本号左移 12 位，低位接 BCH(18,6) 纠错位。
     static int BchVersion(int ver) {
         int d = ver << 12;
         // 消去比特 17..12 共 6 位（只循环 5 次会残留高位污染版本信息）
@@ -518,6 +534,9 @@ class QrEncoder {
         return (ver << 12) | d;
     }
 
+    /// 组装最终矩阵：画功能图形与版本/格式信息区，按 ISO 分块做
+    /// RS 纠错并交织，蛇形放入数据模块，再对八个掩码逐一应用、
+    /// 按罚分选优。
     static QrMatrix BuildMatrix(int ver, QrEcl ecl, int[] cw, int nDataCw) {
         int size = ver * 4 + 17;
         bool[] dark = new bool[size * size];
@@ -714,6 +733,7 @@ class QrEncoder {
         return outp;
     }
 
+    /// 掩码 m 在 (x,y) 处是否翻转（ISO 18004 的八种掩码条件）。
     static bool MaskBit(int m, int x, int y) {
         if (m == 0) { return (x + y) % 2 == 0; }
         if (m == 1) { return y % 2 == 0; }
@@ -727,6 +747,8 @@ class QrEncoder {
 
     // ---- 掩码罚分（ISO 18004 Table 24，与 Nayuki 一致） --------------------
 
+    /// 掩码罚分总值（ISO 18004 四条规则：同色游程、2x2 同色块、
+    /// 类定位图形 1011101、深色比例偏离 50%）。
     static int Penalty(bool[] m, int size) {
         int result = 0;
         // 规则 1：行/列同色游程 >=5
@@ -772,6 +794,7 @@ class QrEncoder {
         return result;
     }
 
+    /// 单行/列的同色游程罚分（游程 ≥5 时加 3+(长度-5)）。
     static int RunPenaltyLine(bool[] m, int size, int line, bool horizontal) {
         int pen = 0;
         int runColor = -1;
