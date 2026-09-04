@@ -1012,26 +1012,36 @@ void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
 
     /* Fixpoint: walk every kept declaration with the ref hook on; any
      * referenced type keeps its declaration. Each round the kept set can
-     * only grow; stop when a round adds nothing. */
+     * only grow; stop when a round adds nothing.
+     *
+     * The resolution indexes are built ONCE (they only read `items`, which
+     * never changes) and shared across all walks; only declarations newly
+     * kept in the previous round get walked, since a decl whose refs were
+     * already folded in cannot grow the kept set a second time. Without
+     * this, a stdlib-heavy compile re-walked hundreds of large classes per
+     * round — gallery paid +3.8s in resolve alone. */
+    unsigned char *walked = (unsigned char *)calloc((size_t)n, 1);
+    if (!walked) { free(kept); return; }
+    nr_ctx_t c;
+    memset(&c, 0, sizeof(c));
+    c.arena = arena;
+    c.diag = diag;
+    c.items = items;
+    c.count = n;
+    /* nr_walk's resolution paths call find_full/count_simple, which read
+     * these indexes: build them like zan_nsresolve_run does. */
+    nr_index_build(&c.by_full, items, n, 1, arena);
+    nr_index_build(&c.by_simple, items, n, 0, arena);
     for (;;) {
         int before = 0;
         for (int i = 0; i < n; i++) before += kept[i];
         for (int i = 0; i < n; i++) {
-            if (!kept[i]) continue;
+            if (!kept[i] || walked[i]) continue;
+            walked[i] = 1;
             zan_ast_node_t *d = items[i].decl;
             zp_refs_t refs;
             memset(&refs, 0, sizeof(refs));
-            nr_ctx_t c;
-            memset(&c, 0, sizeof(c));
-            c.arena = arena;
-            c.diag = diag;
-            c.items = items;
-            c.count = n;
             c.refs = &refs;
-            /* nr_walk's resolution paths call find_full/count_simple, which
-             * read these indexes: build them like zan_nsresolve_run does. */
-            nr_index_build(&c.by_full, items, n, 1, arena);
-            nr_index_build(&c.by_simple, items, n, 0, arena);
             nr_walk(&c, d, d->ns_name, d->ns_usings);
             /* Recorded names are FINAL simple names (t->final), so resolve
              * them against the simple-name index: a by_full lookup would
@@ -1046,6 +1056,7 @@ void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
         for (int i = 0; i < n; i++) after += kept[i];
         if (after == before) break;
     }
+    free(walked);
 
     /* Rewrite the merged decl list, dropping unreachable type declarations. */
     int w = 0;
