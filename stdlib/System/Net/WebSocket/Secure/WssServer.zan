@@ -30,6 +30,7 @@ class WssServer {
     int activeConnections;
     WssMessageHandler messageHandler;
 
+    /// 内部构造：无 TLS 上下文；经 Create 使用。
     WssServer(string host, int port) {
         this.host = host;
         this.port = port;
@@ -59,6 +60,8 @@ class WssServer {
         return this;
     }
 
+    /// 开始接受连接并逐条派发处理协程；running 置位后阻塞循环，
+    /// 直到 Stop() 被调用（从其他协程）。
     async void Start() {
         Socket.Initialize();
         this.listener = new TcpListener(this.host, this.port);
@@ -74,6 +77,7 @@ class WssServer {
         }
     }
 
+    /// 请求停止接受连接；在途连接处理完当前消息后自然收尾。
     void Stop() {
         this.running = false;
         if (this.listener != null) {
@@ -81,6 +85,8 @@ class WssServer {
         }
     }
 
+    /// Upgrade 头是否为 "websocket"（RFC 7230 令牌比较：大小写
+    /// 不敏感、容忍尾部空白）。
     static bool IsUpgradeToken(string value) {
         // 大小写不敏感并容忍尾部空白（RFC 7230 令牌比较）；
         // 此前只认 "websocket"/"Websocket" 两种拼写。
@@ -96,6 +102,11 @@ class WssServer {
         return true;
     }
 
+    /// 单条连接的生命周期：TLS 握手 → WebSocket Upgrade（缺 Upgrade
+    /// 或 Sec-WebSocket-Key 时回 400）→ 帧循环（Ping→Pong、Close 应答
+    /// 并断开、协议违规回 1002/1009 关闭帧）；每条消息交
+    /// OnMessageInternal，返回值按原 opcode 发回。任何退出路径都
+    /// 关闭流与 socket 并归还连接计数。
     async void HandleConnection(nint clientSock) {
         Socket.SetNonBlocking(clientSock);
         TlsStream stream = await TlsStream.AcceptAsync(this.tls, clientSock);
@@ -228,6 +239,7 @@ class WssServer {
         this.activeConnections = this.activeConnections - 1;
     }
 
+    /// 每消息分发：注册了委托走委托，否则走可重写的 OnMessage。
     async string OnMessageInternal(string message) {
         WssMessageHandler handler = this.messageHandler;
         if (handler != null) {

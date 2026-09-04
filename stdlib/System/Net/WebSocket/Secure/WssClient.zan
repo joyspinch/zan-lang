@@ -21,6 +21,7 @@ class WssClient {
     WsAssembler asm;
     bool connected;
 
+    /// 内部构造：未连接；经 ConnectAsync 使用。
     WssClient() {
         this.host = "";
         this.path = "/";
@@ -29,6 +30,10 @@ class WssClient {
         this.connected = false;
     }
 
+    /// 发起 wss://host:port/path 握手：TCP 连接 → TLS 握手（带 SNI
+    /// 与证书校验）→ WebSocket Upgrade（随机 key，校验 Sec-WebSocket-
+    /// Accept）。绝不返回 null：任何一步失败都返回 connected=false
+    /// 的对象（失败路径已清理连接/上下文），用 IsConnected() 判断。
     static async WssClient ConnectAsync(string host, int port, string path) {
         WssClient client = new WssClient();
         client.host = host;
@@ -82,18 +87,25 @@ class WssClient {
         return client;
     }
 
+    /// 握手是否成功且连接未断。
     bool IsConnected() { return this.connected; }
 
+    /// 发送一条 Text 消息（fire-and-forget；发送失败会就地断开）。
     async void SendText(string text) {
         await this.SendFrame(WsOpcode.Text, text, text.Length);
     }
 
+    /// 发送一条二进制消息（bytes 可含 NUL，len 为精确字节数）。
     async void SendBinary(string bytes, int len) {
         await this.SendFrame(WsOpcode.Binary, bytes, len);
     }
 
+    /// 发送空 Ping 帧（对端的 Pong 由 RecvText 静默消费）。
     async void Ping() { await this.SendFrame(WsOpcode.Ping, "", 0); }
 
+    /// 挂起直到下一个文本/二进制消息（分片消息重组到 fin 后整条
+    /// 交付；Ping 以 Pong 应答后继续；Close、协议错误（-2/-3）或
+    /// 断开返回 ""）。
     async string RecvText() {
         while (this.connected) {
             int total = this.reader.FrameSize();
@@ -123,6 +135,8 @@ class WssClient {
         return "";
     }
 
+    /// 协礼关闭：先发空关闭帧（未连接时跳过），随后无条件断开并
+    /// 释放 TLS 流与上下文；重复调用安全。
     async void Close() {
         if (this.connected) {
             await this.SendFrame(WsOpcode.Close, "", 0);
@@ -130,6 +144,8 @@ class WssClient {
         this.CloseNow();
     }
 
+    /// 客户端发送入口：RFC 6455 要求客户端帧必须掩码（每帧 CSPRNG
+    /// 掩码键）+ 正确的扩展长度编码。发送失败（<= 0）就地断开。
     async void SendFrame(int opcode, string payload, int payloadLen) {
         if (!this.connected) { return; }
         int ext = 0;
@@ -168,6 +184,7 @@ class WssClient {
         if (sent <= 0) { this.CloseNow(); }
     }
 
+    /// 立即断开并释放全部句柄（TLS 流、连接、上下文、reader）。
     void CloseNow() {
         this.connected = false;
         if (this.stream != null) { this.stream.Close(); this.stream = null; }
@@ -176,6 +193,8 @@ class WssClient {
         this.reader = null;
     }
 
+    /// 从响应头文本里取单个头值（ASCII 大小写不敏感，跳过状态行，
+    /// 去掉值前导空格）；不存在为 ""。
     static string Header(string headers, string name) {
         int pos = WssClient.IndexOf(headers, "\r\n", 0);
         if (pos < 0) { return ""; }
@@ -200,6 +219,7 @@ class WssClient {
         return "";
     }
 
+    /// ASCII 大小写不敏感的相等比较。
     static bool AsciiEquals(string a, string b) {
         if (a.Length != b.Length) { return false; }
         for (int i = 0; i < a.Length; i = i + 1) {
@@ -211,6 +231,7 @@ class WssClient {
         return true;
     }
 
+    /// 从 from 起的子串搜索；没有返回 -1。
     static int IndexOf(string hay, string needle, int from) {
         int last = hay.Length - needle.Length;
         int i = from;

@@ -11,11 +11,17 @@ namespace System.Net.WebSocket;
 /// WebSocket 帧操作码（opcode）。
 /// </summary>
 class WsOpcode {
+    /// 分片消息的后续帧（RFC 6455 §5.4）。
     static const int Continuation = 0;
+    /// UTF-8 文本消息。
     static const int Text = 1;
+    /// 二进制消息。
     static const int Binary = 2;
+    /// 连接关闭（含 2 字节状态码负载）。
     static const int Close = 8;
+    /// 心跳探测（负载原样由 Pong 回）。
     static const int Ping = 9;
+    /// 心跳应答。
     static const int Pong = 10;
 }
 
@@ -29,6 +35,7 @@ class WsFrame {
     bool fin;
     bool masked;
 
+    /// 内部构造：Text 帧、fin、不掩码；字段由各工厂方法填。
     WsFrame() {
         this.opcode = WsOpcode.Text;
         this.payload = "";
@@ -37,6 +44,7 @@ class WsFrame {
         this.masked = false;
     }
 
+    /// 载荷为整串的 Text 帧。
     static WsFrame TextFrame(string data) {
         WsFrame f = new WsFrame();
         f.opcode = WsOpcode.Text;
@@ -45,6 +53,7 @@ class WsFrame {
         return f;
     }
 
+    /// 二进制帧：data 可含 NUL，len 为精确字节数。
     static WsFrame BinaryFrame(string data, int len) {
         WsFrame f = new WsFrame();
         f.opcode = WsOpcode.Binary;
@@ -53,6 +62,7 @@ class WsFrame {
         return f;
     }
 
+    /// 不带状态码的空关闭帧。
     static WsFrame CloseFrame() {
         WsFrame f = new WsFrame();
         f.opcode = WsOpcode.Close;
@@ -73,12 +83,14 @@ class WsFrame {
         return f;
     }
 
+    /// 空 Ping 帧。
     static WsFrame PingFrame() {
         WsFrame f = new WsFrame();
         f.opcode = WsOpcode.Ping;
         return f;
     }
 
+    /// 空 Pong 帧。
     static WsFrame PongFrame() {
         WsFrame f = new WsFrame();
         f.opcode = WsOpcode.Pong;
@@ -103,6 +115,8 @@ class WsFrame {
         return 2;
     }
 
+    /// 服务端方向编码：FIN + opcode + RFC 6455 长度编码 + 载荷
+    /// （不掩码；客户端须用 EncodeMasked）。
     byte[] Encode() {
         int headerLen = WsFrame.HeaderLen(this.payloadLen);
         byte[] buf = new byte[headerLen + this.payloadLen + 1];
@@ -299,6 +313,7 @@ class WsReader {
     // 即可把无上限的 Ensure 撑到 OOM。
     int maxLen;
 
+    /// 内部构造：64KiB 缓冲、消息上限 16 MiB；经 new / WrapTls 使用。
     WsReader(nint sock) {
         this.sock = sock;
         this.tlsSrc = null;
@@ -519,12 +534,14 @@ class WsWriter {
     int len;
     int cap;
 
+    /// 内部构造：64KiB 输出缓冲。
     WsWriter() {
         this.cap = 65536;
         this.buf = new byte[this.cap + 1];
         this.len = 0;
     }
 
+    /// 扩展输出缓冲到至少 need 字节。
     void Ensure(int need) {
         if (need <= this.cap) { return; }
         int nc = this.cap * 2;
@@ -537,7 +554,7 @@ class WsWriter {
         this.cap = nc;
     }
 
-    /// <summary>追加编码后帧的 `n` 个字节。</summary>
+    /// 追加编码后帧的 `n` 个字节。
     void Append(string data, int n) {
         this.Ensure(this.len + n);
         for (int i = 0; i < n; i = i + 1) {
@@ -546,6 +563,7 @@ class WsWriter {
         this.len = this.len + n;
     }
 
+    /// 缓冲中是否有待发字节。
     bool Pending() {
         return this.len > 0;
     }
@@ -580,6 +598,8 @@ class WsAssembler {
     int dataLen;
     int maxLen;
 
+    /// 内部构造：状态复位，消息上限由调用方给定；经 WebSocketClient
+    /// / 服务器各路径使用。
     WsAssembler(int maxLen) {
         this.opcode = 0 - 1;
         this.data = "";
@@ -650,6 +670,7 @@ class WebSocketClient {
     WsReader reader;
     WsAssembler asm;
 
+    /// 内部构造：未连接；经 ConnectAsync 使用。
     WebSocketClient() {
         this.connected = false;
         this.host = "";
@@ -659,6 +680,10 @@ class WebSocketClient {
         this.asm = new WsAssembler(16777216);
     }
 
+    /// 发起 ws://host:port/path 握手（随机 Sec-WebSocket-Key，校验
+    /// Sec-WebSocket-Accept）。绝不返回 null：连接/握手失败时返回
+    /// 一个 connected=false 的对象，用 IsConnected() 判断成败（失败
+    /// 路径已顺手关闭底层连接）。
     static async WebSocketClient ConnectAsync(string host, int port, string path) {
         WebSocketClient ws = new WebSocketClient();
         ws.host = host;
@@ -732,14 +757,17 @@ class WebSocketClient {
         return true;
     }
 
+    /// 发送一条 Text 消息（fire-and-forget，失败仅置 disconnected）。
     async void SendText(string text) {
         await this.SendFrame(WsOpcode.Text, text, text.Length);
     }
 
+    /// 发送一条二进制消息（data 可含 NUL，len 为精确字节数）。
     async void SendBinary(string data, int len) {
         await this.SendFrame(WsOpcode.Binary, data, len);
     }
 
+    /// 发送空 Ping 帧（对端的 Pong 由 RecvText 静默消费）。
     async void Ping() {
         await this.SendFrame(WsOpcode.Ping, "", 0);
     }
@@ -776,11 +804,13 @@ class WebSocketClient {
         return "";
     }
 
+    /// 立即断开（不发关闭帧）；RecvText 之后返回 ""。
     void CloseNow() {
         this.connected = false;
         if (this.conn != null) { this.conn.Close(); }
     }
 
+    /// 协礼关闭：先发空关闭帧再断开。
     async void Close() {
         if (this.connected) {
             await this.SendFrame(WsOpcode.Close, "", 0);
@@ -788,6 +818,7 @@ class WebSocketClient {
         this.CloseNow();
     }
 
+    /// 握手是否成功且连接未断。
     bool IsConnected() {
         return this.connected;
     }

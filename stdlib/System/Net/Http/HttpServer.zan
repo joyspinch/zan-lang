@@ -51,6 +51,7 @@ class HttpServer {
     int workerCount;
     HttpRequestHandler requestHandler;
 
+    /// <summary>创建未启动的服务器；用 OnRequest / Workers 等配置后调用 Start。</summary>
     HttpServer(string host, int port) {
         this.host = host;
         this.port = port;
@@ -168,6 +169,7 @@ class HttpServer {
         }
     }
 
+    /// <summary>超过 maxConnections 时对下游回 503（Connection: close）并关闭。</summary>
     static async void RejectOverloaded(nint clientSock) {
         TcpClient client = TcpClient.FromSocket(clientSock);
         HttpResponse busy = HttpResponse.WithStatus(503, "Service Unavailable",
@@ -242,6 +244,9 @@ class HttpServer {
         }
     }
 
+    /// <summary>HTTP 连接循环本体：读头块 → 解析 → 读正文 → 分发
+    /// 处理器 → 按字节长度发响应，keep-alive 循环；431/413/400/501
+    /// 拒绝响应在此统一发送并关闭连接。</summary>
     static async int ServeFramedCore(nint clientSock, HttpRequestHandler handler,
                                   HttpFramer framer,
                                   int maxHeaderBytes, int maxRequestBytes,
@@ -374,15 +379,17 @@ class HttpDeadlineToken {
     int generation;
     bool disarmed;
 
+    /// <summary>token 记录槽位下标与创建时的 generation，
+    /// 用于槽位复用后旧 token 不再误操作新连接。</summary>
     HttpDeadlineToken(int slot, int generation) {
         this.slot = slot;
         this.generation = generation;
         this.disarmed = false;
     }
 
-    // A transport exception can unwind past the request body before its explicit
-    // cleanup point. Finalization is only a backstop; normal paths still disarm
-    // explicitly. Disarm is idempotent, so both paths are safe.
+    /// <summary>传输异常可能在到达显式清理点之前就把请求展开掉。
+    /// 析构只是兜底；正常路径仍然显式 Disarm。Disarm 幂等，
+    /// 两条路径都安全。</summary>
     ~HttpDeadlineToken() {
         // Backstop for an exception that unwinds past an explicit cleanup point.
         HttpDeadline.Disarm(this);
@@ -397,6 +404,7 @@ class HttpDeadlineSlot {
     bool fired;
     long totalDeadline;
 
+    /// <summary>新槽位：generation 从 1 起，槽位复用时递增。</summary>
     HttpDeadlineSlot(nint sock, long deadline) {
         this.sock = sock;
         this.deadline = deadline;
@@ -543,7 +551,8 @@ class HttpDeadline {
         }
     }
 
-    // 单次扫描：刷新粗粒度时钟并对活动连接执行挂断。
+    /// <summary>单次扫描：刷新粗粒度时钟并对过期连接执行挂断
+    /// （shutdown 而非 close，见类文档）。返回是否仍有活动 token。</summary>
     static bool SweepOnce() {
         lock (slots) {
             nowMs = Stopwatch.GetMilliseconds();
@@ -563,8 +572,9 @@ class HttpDeadline {
         }
     }
 
-    // 扫描器只在有活动 token 时存活；SweepOnce 返回后仍需在锁内
-    // 再确认一次 activeCount，避免 Arm 与扫描器退出之间丢失唤醒。
+    /// <summary>每秒扫描一次的常驻协程；只在有活动 token 时存活。
+    /// SweepOnce 返回 false 后仍需在锁内再确认一次 activeCount，
+    /// 避免 Arm 与扫描器退出之间丢失唤醒。</summary>
     static async void Sweep() {
         while (true) {
             await Task.Delay(1000);
@@ -587,6 +597,7 @@ class HttpRoute {
     string path;
     string response;
 
+    /// <summary>私有构造：由 HttpRouter 的注册方法创建。</summary>
     HttpRoute(string method, string path, string response) {
         this.method = method;
         this.path = path;
@@ -600,6 +611,7 @@ class HttpRoute {
 class HttpRouter {
     List<HttpRoute> routes;
 
+    /// <summary>创建空路由表。</summary>
     HttpRouter() {
         this.routes = new List<HttpRoute>();
     }
