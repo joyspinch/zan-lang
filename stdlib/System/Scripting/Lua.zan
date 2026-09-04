@@ -63,6 +63,7 @@ class Lua {
     static nint addr_openlibs;
     static nint addr_close;
     static nint addr_loadstring;
+    static nint addr_loadbufferx;
     static nint addr_pcallk;
     static nint addr_gettop;
     static nint addr_settop;
@@ -166,6 +167,18 @@ class Lua {
         int mark = Lua.Top();
         Lua.Load(code);
         Lua.Protected(0, 0, mark, code);
+        Lua.SetTop(mark);
+    }
+
+    /// <summary>
+    /// 执行一段字节缓冲里的 Lua chunk（源码或 <c>luac</c> 字节码，
+    /// 见 <see cref="LoadBytes"/>）。编译失败或运行出错时抛出异常。
+    /// </summary>
+    static void ExecBytes(byte[] chunk, string chunkName) {
+        Lua.EnsureReady();
+        int mark = Lua.Top();
+        Lua.LoadBytes(chunk, chunkName);
+        Lua.Protected(0, 0, mark, chunkName);
         Lua.SetTop(mark);
     }
 
@@ -492,6 +505,24 @@ class Lua {
         }
     }
 
+    /// <summary>
+    /// 编译一段字节缓冲（源码或 <c>luac</c> 字节码）并把生成的
+    /// chunk 压栈（编译失败时抛出异常）。缓冲在加载后被立即清零，
+    /// 供"密文随包、明文只在内存存活一瞬"的内嵌脚本方案使用。
+    /// 字节码必须与运行时主次版本一致（5.4.x）。
+    /// </summary>
+    static void LoadBytes(byte[] chunk, string chunkName) {
+        if (chunk == null || chunk.Length == 0) {
+            throw new InvalidOperationException("Lua chunk 为空");
+        }
+        LuaLoadBufFn f = (LuaLoadBufFn)Lua.addr_loadbufferx;
+        int rc = f(Lua.state, chunk, chunk.Length, chunkName, null);
+        for (int i = 0; i < chunk.Length; i = i + 1) { chunk[i] = 0; }
+        if (rc != 0) {
+            Lua.Fail("Lua chunk 编译失败: " + chunkName);
+        }
+    }
+
     /// 保护调用栈顶的 chunk/函数：出错时把栈恢复到 mark 再抛异常，
     /// 因此调用方看不到半截的栈。
     static void Protected(int nargs, int nres, int mark, string what) {
@@ -579,6 +610,8 @@ class Lua {
         Lua.addr_openlibs = Interop.Symbol(Lua.mod, "luaL_openlibs");
         Lua.addr_close = Interop.Symbol(Lua.mod, "lua_close");
         Lua.addr_loadstring = Interop.Symbol(Lua.mod, "luaL_loadstring");
+        // luaL_loadbuffer 是 luaL_loadbufferx 的宏（mode=NULL），DLL 只导出后者。
+        Lua.addr_loadbufferx = Interop.Symbol(Lua.mod, "luaL_loadbufferx");
         // lua_pcall 自 5.2 起是 lua_pcallk 的宏包装，导出的只有后者。
         Lua.addr_pcallk = Interop.Symbol(Lua.mod, "lua_pcallk");
         Lua.addr_gettop = Interop.Symbol(Lua.mod, "lua_gettop");
@@ -626,6 +659,7 @@ class Lua {
         Lua.addr_openlibs = 0;
         Lua.addr_close = 0;
         Lua.addr_loadstring = 0;
+        Lua.addr_loadbufferx = 0;
         Lua.addr_pcallk = 0;
         Lua.addr_gettop = 0;
         Lua.addr_settop = 0;
@@ -1050,6 +1084,7 @@ delegate int LuaIntFn(nint L);
 delegate void LuaVoidIntFn(nint L, int n);
 delegate int LuaIdxIntFn(nint L, int idx);
 delegate int LuaLoadFn(nint L, string code);
+delegate int LuaLoadBufFn(nint L, string buf, long sz, string chunkName, string mode);
 delegate int LuaPcallFn(nint L, int nargs, int nres, int errfunc, nint ctx, nint k);
 delegate double LuaNumFn(nint L, int idx, nint isnum);
 delegate long LuaIntegerFn(nint L, int idx, nint isnum);
