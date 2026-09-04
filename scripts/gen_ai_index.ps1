@@ -43,6 +43,9 @@ $lines.Add("")
 # ---- start here -------------------------------------------------------------
 $lines.Add("## Start")
 $lines.Add("- [README.txt](README.txt): what this folder is, how to run the IDE")
+if (Test-Staged 'AI_README.md') {
+    $lines.Add("- [AI_README.md](AI_README.md): how AI uses this SDK (in Chinese) -- setup, MCP tool catalog, skills, knowledge base")
+}
 if (Test-Staged 'docs/AI_ONBOARDING.md') {
     $lines.Add("- [docs/AI_ONBOARDING.md](docs/AI_ONBOARDING.md): connect Claude Code / Cursor / Copilot / Windsurf (MCP config, zan-lsp, zan-dap)")
 }

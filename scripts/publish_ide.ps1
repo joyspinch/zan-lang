@@ -340,6 +340,10 @@ if (Test-Path (Join-Path $aiPack 'AGENTS.md')) {
         New-Item -ItemType Directory -Force -Path (Join-Path $dist 'docs') | Out-Null
         Copy-Item $onboarding (Join-Path $dist 'docs\AI_ONBOARDING.md') -Force
     }
+    # The human-facing "how AI uses this SDK" guide ships at the install root,
+    # next to README.txt and llms.txt, so it is found without opening docs\.
+    $aiGuide = Join-Path $root 'docs\AI_README.md'
+    if (Test-Path $aiGuide) { Copy-Item $aiGuide (Join-Path $dist 'AI_README.md') -Force }
     foreach ($doc in @('TOOLING.md', 'ai-assist.md', 'MCP_HOSTING.md',
                        'AI_DEV_INFRASTRUCTURE.md')) {
         $p = Join-Path $root "docs\$doc"
@@ -398,6 +402,9 @@ Contents
   llms.txt       AI entry index of this folder (generated from what shipped):
                  the paths to the rules, tools, knowledge, skills and docs an
                  AI agent needs, readable without an MCP connection.
+  AI_README.md   How AI uses this SDK (in Chinese): setup, the MCP tool
+                 catalog, skills, the knowledge base. Start here when wiring
+                 up an AI coding tool.
 
 AI coding tools (Claude Code / Cursor / Copilot / Windsurf)
   Enable them per PROJECT, not here. Two ways, same implementation:
