@@ -3,7 +3,7 @@
 > 依据：参考 `D:\project\mir2\传奇放置挂机游戏-产品设计文档.md`（简称 PRD，本游戏的
 > 立项与系统框架母版）。本文回答三个问题：(1) 哪些 PRD 系统在本单机版中被实现，
 > (2) 哪些 PRD 系统被单机化（影子天梯 / 邮件化 / 离线结算化），(3) Zan 语言与
-> GameKit 框架对 PRD 的工程折中。
+> Game.Kit（stdlib）对 PRD 的工程折中。
 
 ---
 
@@ -177,7 +177,7 @@ build/zanc.exe examples/game/legend/main.zan \
 - **装备图标**：40 张 `assets/equip_c{0..7}_t{0..4}.png`，对应 8 大类 × 5 品阶
 - **音效**：`assets/{box,craft,tip,trade,up}.wav`
 
-字体走 GameKit 内嵌 8x8 ASCII + TrueType CJK 烘焙字符集（`examples/game/common/assets/`），
+字体走 Game.Kit 系统字体管线（SysFont，全字符集 CJK）+ 内嵌 8x8 ASCII/CJK 图集回退（`stdlib/Game/Kit/assets/`），
 不需要外置字体文件。
 
 ---
@@ -260,7 +260,7 @@ PRD 的"幻境 6043 层"是全网历史最高记录，**不是**可达目标。�
 ## 7. 已知工程折中
 
 - **Zan IDE 禁自绘规则**（AGENTS.md "ZanIDE禁止任何自绘必须全部用标准库组件来完成"）：
-  所有 UI 控件（按钮/进度条/面板/标签）通过 GameKit 的 `Draw.RoundRectFill` /
+  所有 UI 控件（按钮/进度条/面板/标签）通过 Game.Kit 的 `Draw.RoundRectFill` /
   `Text.Draw*` / `Ui.Button` / `Ui.Panel` 程序化绘制，或贴 9-slice 资产；不调任何
   原始像素 set 操作。
 - **音效**：直接走 SDL3 wav 短音（盒/锻造/提示/交易/升级）。
@@ -269,7 +269,7 @@ PRD 的"幻境 6043 层"是全网历史最高记录，**不是**可达目标。�
   `skl=`（26 技能等级）、`citys=`（5 产业档位，旧 `city=` 单值自动迁移到第 1 线）
   （世界 BOSS 窗口截止）、`ghg=`/`gha=`（行会资产/累积锚）、`bagsz=`（背包容量）。
   Load 只识别已知键，旧档缺键自动回落默认值，向后兼容。
-- **确定性**：所有 Rng 派生走 `GameKit.Rng.Seed(playerBest ^ tick)`；不引入系统时间
+- **确定性**：所有 Rng 派生走 `Game.Kit.Rng.Seed(playerBest ^ tick)`；不引入系统时间
   作为随机源（系统时间只用于日刷新 / 离线时长结算）。排行榜/市场影子数据由 `rkSeed`
   纯算术派生（`rkSeed/(i+1)%997` 等），断网重启不漂移。
 
