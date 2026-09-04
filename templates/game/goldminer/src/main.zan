@@ -198,8 +198,11 @@ class MinerApp {
         int[] mw = new int[2];
         string mp = Assets.Find("assets/miner.png");
         if (MinerApp.PngSize(mp, mw)) {
-            a.minerW = 120;
-            a.minerH = 120 * mw[1] / mw[0];
+            // 矿工贴地站立:高度=草地线上方整格,宽度按纹理纵横比,
+            // 保证头部不出画、脚踩草地线(此前锚定 HOOK_Y,头顶出画
+            // 42px 且双脚悬空)。
+            a.minerH = Data.SKY_H + 6;
+            a.minerW = a.minerH * mw[0] / mw[1];
         }
         int[] cw = new int[2];
         string cp = Assets.Find("assets/claw.png");
@@ -351,12 +354,12 @@ class MinerApp {
         }
         // 绳 + 爪 + 钩上物
         this.DrawClaw(ox, oy);
-        // 矿工
+        // 矿工(双脚踩草地线 SKY_H,头部完整在画内)
         if (this.texMiner != null && this.texMiner.IsValid()) {
             int mw = this.minerW;
             int mh = this.minerH;
             rd.DrawTexture(this.texMiner, ox + Data.HOOK_X - mw / 2,
-                           oy + Data.HOOK_Y - mh + 8, mw, mh);
+                           oy + Data.SKY_H + 6 - mh, mw, mh);
         } else {
             Draw.FillCircle(rd, ox + Data.HOOK_X, oy + Data.HOOK_Y - 40, 34, 220, 160, 60, 255);
         }
@@ -510,7 +513,12 @@ class MinerApp {
         if (shot) {
             return MinerApp.ShotRun(app);
         }
+        if (ProcessHost.Env("MINER_HUDSHOT") == "1") {
+            if (ProcessHost.Env("MINER_NOHUD") != "1") { app.BuildHud(); }
+            return MinerApp.HudShotRun(app, h);
+        }
         // Gui 控件树 HUD:接管宿主窗口,场景在下、Gui 在上。
+        bool hudFailLogged = false;
         if (ProcessHost.Env("MINER_NOHUD") != "1") {
             app.BuildHud();
         }
@@ -559,7 +567,12 @@ class MinerApp {
             app.DrawAll();
             h.End();
             // HUD 层:场景帧作底,Gui 控件树画在上面并合成呈现。
-            if (app.hud != null) { app.hud.Frame(app.r, h.WindowHandle()); }
+            if (app.hud != null) {
+                if (!app.hud.Frame(app.r, h.WindowHandle()) && !hudFailLogged) {
+                    hudFailLogged = true;
+                    Console.WriteLine("[hud] frame failed: " + app.hud.LastError());
+                }
+            }
         }
         app.w.Save();
         return 0;
@@ -697,6 +710,38 @@ class MinerApp {
         log.WriteLine("=== SHOT OK ===");
         log.Close();
         Console.WriteLine("=== SHOT OK ===");
+        return 0;
+    }
+
+    // MINER_HUDSHOT=1:带 HUD 合成跑 24 帧后导出第 20 帧合成结果
+    // (场景在下、Gui 控件树在上),验证 GameHud 接管链路。
+    static int HudShotRun(MinerApp app, Host h) {
+        System.IO.File.AppendAllText("miner_hudshot.log", "hudshot: enter\n");
+        for (int f = 1; f <= 24; f = f + 1) {
+            app.now = World.NowMs();
+            app.lastFrameAt = app.now;
+            app.StepFrame(16);
+            app.SyncHud();
+            app.host.Begin(12, 10, 8);
+            app.DrawAll();
+            app.host.End();
+            if (app.hud == null) {
+                System.IO.File.AppendAllText("miner_hudshot.log", "hudshot: hud null\n");
+                return 2;
+            }
+            System.IO.File.AppendAllText("miner_hudshot.log", "hudshot: frame " + Convert.ToString(f) + "\n");
+            if (!app.hud.Frame(app.r, h.WindowHandle())) {
+                System.IO.File.AppendAllText("miner_hudshot.log",
+                    "hudshot: frame failed " + app.hud.LastError() + "\n");
+                return 2;
+            }
+            if (f == 20) {
+                app.r.Present();
+                MinerApp.DumpBmp(app.r, "miner_hud_composite.bmp");
+                Console.WriteLine("=== HUD SHOT OK ===");
+            }
+        }
+        System.IO.File.AppendAllText("miner_hudshot.log", "hudshot: done\n");
         return 0;
     }
 

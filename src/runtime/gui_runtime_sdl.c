@@ -688,6 +688,11 @@ static int zan_sdl_resize_edge(SDL_Window *win, int x, int y) {
     SDL_GetWindowSize(win, &W, &H);
     int b = 8 * g_dpi / 96;
     if (SDL_GetWindowFlags(win) & SDL_WINDOW_MAXIMIZED) return 0;
+    /* Fixed-size windows (no SDL_WINDOW_RESIZABLE): no border zones at all —
+     * the game creates its canvas once from the initial output size, so a
+     * border drag would only resize the window around a picture that never
+     * follows. Edge hittest stays off, matching the missing OS sizing grips. */
+    if (!(SDL_GetWindowFlags(win) & SDL_WINDOW_RESIZABLE)) return 0;
     zan_sdl_win_t *rec = sdl_find(win);
     int nbtn = rec ? rec->caption_btns : g_caption_btn_count;
     if (y < g_titlebar_h && x >= W - nbtn * g_btn_w) return 0;

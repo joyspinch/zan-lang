@@ -49,9 +49,11 @@ class GameHud {
     // Reused scene-frame buffer. ReadPixels needs a writable byte block the
     // size of the backbuffer (w*h*4 — over 8 MB at 1080p); allocating one per
     // frame in Frame() made ARC churn hundreds of MB per second. The buffer
-    // is reallocated only when the window size actually changes.
-    ByteBuffer pixbuf;
-    string scene;
+    // is reallocated only when the window size actually changes. byte[]
+    // marshals by reference into the native calls (string would need the
+    // ByteBuffer.ToStr dance because `new string(char,int)` returns null on
+    // the current compiler — see TASKS.md compiler-defect record).
+    byte[] scene;
     int pixW;
     int pixH;
 
@@ -66,7 +68,7 @@ class GameHud {
 
     /// 接管宿主窗口并创建 HUD 应用（设计尺寸=宿主窗口客户区）。
     /// `sdlWindowHandle` 是宿主自建的 SDL 窗口句柄——接受任意宿主
-    /// （GameKit Host、GameHost、游戏自管窗口）。`sdlRendererHandle`
+    /// （Game.Kit Host、GameHost、游戏自管窗口）。`sdlRendererHandle`
     /// 是宿主渲染器句柄（复用它做合成；同窗口建第二个渲染器在
     /// D3D11 上会失败）。失败时返回的实例 Ready() 为 false，
     /// <see cref="LastError"/> 带原因。
@@ -87,9 +89,16 @@ class GameHud {
             return hud;
         }
         hud.adopted = true;
-        // HUD 画布逻辑尺寸取当前客户区像素（随窗口缩放逐帧跟随）。
-        hud.sceneW = NativeWindowSizeW(sdlWindowHandle);
-        hud.sceneH = NativeWindowSizeH(sdlWindowHandle);
+        // HUD 画布逻辑尺寸优先取宿主渲染器后备缓冲的像素尺寸：adopt
+        // 接管路径不产生 RESIZED 事件，Gui 后端的窗口尺寸缓存仍是 0，
+        // 只有后备缓冲尺寸才是 ReadPixels/合成真正需要的。
+        int initPacked = RendererOutputSize(sdlRendererHandle);
+        hud.sceneW = initPacked & 0xFFFF;
+        hud.sceneH = (initPacked >> 16) & 0xFFFF;
+        if (hud.sceneW <= 0 || hud.sceneH <= 0) {
+            hud.sceneW = NativeWindowSizeW(sdlWindowHandle);
+            hud.sceneH = NativeWindowSizeH(sdlWindowHandle);
+        }
         hud.app = new App("hud", hud.sceneW > 0 ? hud.sceneW : 320,
                           hud.sceneH > 0 ? hud.sceneH : 240);
         hud.app.SetDark(true);
@@ -102,6 +111,15 @@ class GameHud {
     static extern int zan_gui_window_width();
     [DllImport("zan_gui")]
     static extern int zan_gui_window_height();
+
+    [DllImport("zan_sdl3")]
+    static extern int zan_sdl_render_output_size(nint rendererHandle);
+
+    // 宿主渲染器后备缓冲的像素尺寸，打包 (h<<16)|w；失败返回 0。
+    static int RendererOutputSize(nint rendererHandle) {
+        if (rendererHandle == 0) { return 0; }
+        return zan_sdl_render_output_size(rendererHandle);
+    }
 
     // SDL 后端维护主窗口尺寸缓存（创建/resize 时更新），足够做画布初值。
     static int NativeWindowSizeW(nint hwnd) {
@@ -159,9 +177,18 @@ class GameHud {
     /// `renderer` 是宿主渲染器（场景画完后、Present 前调用本方法；
     /// 宿主置 hudMode 让自己的 Present 跳过）。
     bool Frame(SdlRenderer renderer, nint sdlWindowHandle) {
-        if (!this.Ready()) { return false; }
-        int w = WindowPixelW();
-        int h = WindowPixelH();
+        if (!this.Ready() || renderer == null) { return false; }
+        // 场景帧尺寸必须等于渲染器后备缓冲的像素尺寸——ReadPixels 按
+        // 后备缓冲原样读回，尺寸不符即失败。Gui 后端的窗口尺寸缓存在
+        // adopt 接管路径下不初始化（恒 0），不能作为尺寸来源。
+        int packed = renderer.OutputSize();
+        System.IO.File.AppendAllText("hudframe.log", "outputsize " + Convert.ToString(packed) + "\n");
+        int w = packed & 0xFFFF;
+        int h = (packed >> 16) & 0xFFFF;
+        if (w <= 0 || h <= 0) {
+            w = WindowPixelW();
+            h = WindowPixelH();
+        }
         if (w <= 0 || h <= 0) { return false; }
         // Scene-frame buffer: reuse the previous frame's allocation (member
         // fields) instead of allocating a fresh w*h*4 block every frame.
@@ -172,23 +199,31 @@ class GameHud {
         if (this.scene == null || this.pixW != w || this.pixH != h) {
             if (this.pixbuf != null) { this.pixbuf.Free(); }
             this.pixbuf = ByteBuffer.Alloc(w * h * 4);
+            System.IO.File.AppendAllText("hudframe.log", "alloc\n");
             this.scene = this.pixbuf.ToStr();
+            System.IO.File.AppendAllText("hudframe.log", "tostr\n");
             this.pixW = w;
             this.pixH = h;
         }
         if (this.scene == null) { return false; }
         if (!this.ReadScene(renderer, this.scene, w, h)) { return false; }
+        System.IO.File.AppendAllText("hudframe.log", "read\n");
         Window.SceneUpload(sdlWindowHandle, this.scene, w, h);
+        System.IO.File.AppendAllText("hudframe.log", "upload\n");
         App app = this.app;
         app.ProcessEvent();
         app.BeginFrame();
+        System.IO.File.AppendAllText("hudframe.log", "begin\n");
         Form root = this.root;
         if (root != null) {
             // 借 Form 的整树测量/布局/绘制（含皮肤主题背景）。
             root.RenderFrame(app);
         }
+        System.IO.File.AppendAllText("hudframe.log", "render\n");
         app.PresentFrame();
+        System.IO.File.AppendAllText("hudframe.log", "present\n");
         Window.ScenePresent(sdlWindowHandle, app.canvas.SurfaceId());
+        System.IO.File.AppendAllText("hudframe.log", "scenepresent\n");
         return true;
     }
 }

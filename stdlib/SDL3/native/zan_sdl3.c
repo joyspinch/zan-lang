@@ -130,6 +130,13 @@ static SDL_HitTestResult zan_sdl_game_hittest(SDL_Window *win,
     }
     int b = 6;
     int left = x < b, right = x >= W - b, top = y < b, bottom = y >= H - b;
+    if (!(SDL_GetWindowFlags(win) & SDL_WINDOW_RESIZABLE)) {
+        /* Fixed-size window: caption dragging stays, resize zones do not —
+         * the game canvas is baked once at the initial output size and
+         * never follows a resize, so a draggable border would only expose
+         * dead margins. */
+        left = right = top = bottom = 0;
+    }
     if (left && top) return SDL_HITTEST_RESIZE_TOPLEFT;
     if (left && bottom) return SDL_HITTEST_RESIZE_BOTTOMLEFT;
     if (right && top) return SDL_HITTEST_RESIZE_TOPRIGHT;
