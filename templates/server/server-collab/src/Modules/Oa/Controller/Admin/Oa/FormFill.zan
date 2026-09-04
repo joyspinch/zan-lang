@@ -1,0 +1,384 @@
+using System;
+using System.Collections;
+using System.Data;
+using System.Data.Orm;
+using System.Json;
+using System.Web;
+using ZanWeb.Model.Flow;
+using ZanWeb.Model.Oa;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.Admin.Oa;
+
+/* 表单填报（T15，架构定案 #70）：OaFormData 动作侧 + Flow 接线。
+   提交链路：Collect（按 schema 逐字段读 f_<code>；checkbox 组名
+   f_<code>[]，admin.js 只合并 [] 结尾的组值为逗号串，此处拆回数组）→
+   FormSchema.Validate（draft=true 跳过必填，其余规则照常）→ dataJson =
+   JsonValue 组装 ToJson()（纪律②：不手拼、不过 Filter.Clean——textarea
+   换行经 InRaw 保真、ToJson 转义为 \n 字面量落库，Bug#8 同族防线）→
+   INSERT（schemaSnapshot = def.schemaJson 提交时快照，历史强一致）→
+   绑流程时 Engine.Start（bizRef=form_data:<id>，Flow 域零代码改动）回填
+   instId → Notify.Send 提交回执（module="oa" kind="info"；审批提醒由
+   Flow 既有 notify 承担，不双发）。
+   存草稿与提交共用 Submit 端点：视图两个 submit 按钮，靠 HTML 标准
+   submitter 传值区分（点谁带谁的 name=value，存草稿按钮 draft=1）——
+   零 JS。双端点方案必须改外壳 admin.js（X-Fragment 注入的内联脚本不
+   执行），不值当。
+   状态推导（永不回写）：草稿/已提交看本行 status；instId>0 现查
+   flow_inst.status 映射 审批中/已通过/已终止——单一事实源在 flow_inst，
+   本表不落审批状态列，回写必漂移。
+   附件：填报期 relatedId=0 出占位（attach.js 既有约束），详情页按行
+   挂载 module="form"（Attachment.ScreenOf 未登记回落附件屏，能进附件
+   区即可见，一期口径）。 */
+[Route("admin/oa/formfill/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("表单填报")]
+class FormFill : AdminController {
+    [HttpGet]
+    [Route("/admin/oa/formfill")]
+    [Custom(IsMenu = true, Icon = "mdi:clipboard-text", Perm = PermBit.View)]
+    [Description("表单填报")]
+    async void Index() {
+        User me = await this.Admin();
+        ViewData d = await this.Layout("表单填报");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+        /* 只列启用定义：停用表单收敛入口，历史提交在 我的提交/详情 不受影响。 */
+        List<OaFormDef> defs = await this.OaFormDef
+            .Where(a => a.tenantId == this.TenantId() && a.status == 1)
+            .OrderByDescending(a => a.id).ToListAsync();
+        List<FlowDef> flows = await this.FlowDef
+            .Where(a => a.tenantId == this.TenantId()).ToListAsync();
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < defs.Count; i = i + 1) {
+            OaFormDef r = defs[i];
+            int mine = await this.OaFormData
+                .Where(a => a.tenantId == this.TenantId() && a.formId == r.id
+                    && a.submitterId == me.id).CountAsync();
+            StrMap m = new StrMap();
+            m.Set("id", Convert.ToString(r.id));
+            m.Set("name", r.name);
+            m.Set("description", r.description);
+            m.Set("flowName", Forms.FlowName(flows, r.flowDefId));
+            m.Set("mine", Convert.ToString(mine));
+            items.Add(m);
+        }
+        d.Set("empty", defs.Count == 0 ? "1" : "");
+        this.Page(d);
+    }
+
+    /* 填报页：空数据渲染（三用同源 FormSchema.Render，relatedId=0 出
+       附件占位）。绑流程已停用时页面预告，避免提交才撞 400。 */
+    [HttpGet]
+    [Custom(IsMenu = false, Perm = PermBit.View)]
+    [Description("填写表单")]
+    async void Fill() {
+        User me = await this.Admin();
+        int formId = this.InInt("formId", 0);
+        OaFormDef def = await this.OaFormDef
+            .Where(a => a.id == formId && a.tenantId == this.TenantId())
+            .FirstAsync();
+        if (def == null) { this.Fail(404, "0404", "表单不存在"); return; }
+        if (def.status != 1) { this.Fail(400, "0004", "表单已停用，无法填报"); return; }
+        JsonValue schema = FormSchema.Parse(def.schemaJson);
+        List<DictItem> dicts = await FormSchema.DictsFor(this.Held(), schema);
+        ViewData d = await this.Layout("填写：" + def.name);
+        d.Set("formId", Convert.ToString(def.id));
+        d.Set("name", def.name);
+        d.Set("description", def.description);
+        d.Set("canSubmit", await this.Can(PermBit.Create) ? "1" : "");
+        FormSchema.Render(d, schema, null, 0, dicts);
+        if (def.flowDefId > 0) {
+            FlowDef fd = await this.FlowDef
+                .Where(a => a.id == def.flowDefId && a.tenantId == this.TenantId())
+                .FirstAsync();
+            if (fd == null || fd.status != 1) { d.Set("flowStopped", "1"); }
+        }
+        this.Page(d);
+    }
+
+    /* 提交/存草稿共用端点（draft=1 为存草稿）。流程可用性先于落库校验，
+       避免写出行后才发现流程发不起来（孤儿已提交行）。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Create)]
+    [Description("提交表单")]
+    async void Submit() {
+        User me = await this.Admin();
+        int formId = this.InInt("formId", 0);
+        bool draft = this.InInt("draft", 0) == 1;
+        OaFormDef def = await this.OaFormDef
+            .Where(a => a.id == formId && a.tenantId == this.TenantId())
+            .FirstAsync();
+        if (def == null) { this.Fail(404, "0404", "表单不存在"); return; }
+        if (def.status != 1) { this.Fail(400, "0004", "表单已停用，无法填报"); return; }
+        JsonValue schema = FormSchema.Parse(def.schemaJson);
+        JsonValue data = this.Collect(schema);
+        List<DictItem> dicts = await FormSchema.DictsFor(this.Held(), schema);
+        List<string> errs = FormSchema.Validate(schema, data, dicts, draft);
+        if (errs.Count > 0) {
+            this.Fail(400, "0004", FormSchema.Join(errs));
+            return;
+        }
+        string dataJson = data.ToJson();
+        if (dataJson.Length > 60000) {
+            this.Fail(400, "0004", "填报数据过大（60000 字符上限，MySQL 行限兜底）");
+            return;
+        }
+        FlowDef fd = null;
+        if (!draft && def.flowDefId > 0) {
+            fd = await this.FlowDef
+                .Where(a => a.id == def.flowDefId && a.tenantId == this.TenantId())
+                .FirstAsync();
+            if (fd == null) { this.Fail(400, "0004", "绑定的流程不存在"); return; }
+            if (fd.status != 1) {
+                this.Fail(400, "0004", "绑定的流程已停用，暂时无法提交");
+                return;
+            }
+        }
+        string summary = FormFill.Summary(schema, data);
+        long now = WebApp.NowSeconds();
+        OaFormData row = new OaFormData();
+        row.tenantId = this.TenantId();
+        row.formId = def.id;
+        row.dataJson = dataJson;
+        row.schemaSnapshot = def.schemaJson;
+        row.summary = summary;
+        row.status = draft ? 0 : 1;
+        row.submitterId = me.id;
+        row.instId = 0;
+        row.createdAt = now;
+        row.updatedAt = now;
+        int id = await this.OaFormData.Insert(row).ExecuteIdentityAsync();
+        if (fd != null) {
+            string title = "表单:" + def.name + " " + summary;
+            if (title.Length > 128) { title = title.Substring(0, 128); }
+            int instId = await ZanWeb.Modules.Flow.Engine.Start(this.Held(), fd,
+                title, "form_data:" + Convert.ToString(id), me.id);
+            int _up = await this.OaFormData.Update()
+                .Set(a => a.instId, instId)
+                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .ExecuteAffrowsAsync();
+        }
+        if (!draft) {
+            await Notify.Send(this.Held(), this.TenantId(), me.id, "oa", "info",
+                "表单已提交", def.name + " " + summary,
+                "/admin/oa/formfill/detail?id=" + Convert.ToString(id));
+        }
+        await this.Note(draft ? "保存表单草稿" : "提交表单", def.name, true, "");
+        this.Saved(draft ? "草稿已保存" : (fd != null
+            ? "已提交，审批流程已发起" : "已提交"));
+    }
+
+    /* 我的提交：状态 0/1 + 流程徽标推导。 */
+    [HttpGet]
+    [Custom(IsMenu = false, Perm = PermBit.View)]
+    [Description("我的提交")]
+    async void My() {
+        User me = await this.Admin();
+        ViewData d = await this.Layout("我的提交");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+        ListQuery q = this.Paged("id", 20);
+        List<OaFormData> rows = await this.OaFormData
+            .Where(a => a.tenantId == this.TenantId() && a.submitterId == me.id)
+            .OrderByDescending(a => a.id)
+            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        int total = await this.OaFormData
+            .Where(a => a.tenantId == this.TenantId() && a.submitterId == me.id)
+            .CountAsync();
+        List<OaFormDef> defs = await this.OaFormDef
+            .Where(a => a.tenantId == this.TenantId()).ToListAsync();
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            OaFormData r = rows[i];
+            FlowInst inst = await FormFill.InstOf(this, r);
+            StrMap m = new StrMap();
+            m.Set("id", Convert.ToString(r.id));
+            m.Set("formName", FormFill.DefName(defs, r.formId));
+            m.Set("summary", r.summary);
+            m.Set("statusText", FormFill.BadgeText(r, inst));
+            m.Set("statusKind", FormFill.BadgeKind(r, inst));
+            m.Set("createdAt", Fmt.Stamp(r.createdAt));
+            items.Add(m);
+        }
+        d.Set("empty", total == 0 ? "1" : "");
+        this.Pager(d, q, total);
+        this.Page(d);
+    }
+
+    /* 详情：schemaSnapshot 渲染（历史强一致，def 改版不影响）+ 附件区
+       （module="form" relatedId=行 id）+ 流程状态推导。 */
+    [HttpGet]
+    [Custom(IsMenu = false, Perm = PermBit.View)]
+    [Description("提交详情")]
+    async void Detail() {
+        User me = await this.Admin();
+        int id = this.InInt("id", 0);
+        OaFormData r = await this.OaFormData
+            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .FirstAsync();
+        if (r == null) { this.Fail(404, "0404", "提交不存在"); return; }
+        FlowInst inst = await FormFill.InstOf(this, r);
+        JsonValue schema = JsonValue.ParseLenient(r.schemaSnapshot);
+        JsonValue data = JsonValue.ParseLenient(r.dataJson);
+        List<DictItem> dicts = await FormSchema.DictsFor(this.Held(), schema);
+        ViewData d = await this.Layout("提交详情");
+        d.Set("id", Convert.ToString(r.id));
+        d.Set("summary", r.summary);
+        d.Set("createdAt", Fmt.Stamp(r.createdAt));
+        d.Set("statusText", FormFill.BadgeText(r, inst));
+        d.Set("statusKind", FormFill.BadgeKind(r, inst));
+        d.Set("flowId", r.instId > 0 ? "1" : "");
+        FormSchema.Render(d, schema, data, r.id, dicts);
+        this.Page(d);
+    }
+
+    /* 全部提交记录（管理员复核面，Forms.Index 提交数列链接至此）。
+       草稿一并显示（带徽标）；审批状态逐行现查 flow_inst。 */
+    [HttpGet]
+    [Custom(IsMenu = false, Perm = PermBit.View)]
+    [Description("提交记录")]
+    async void All() {
+        User me = await this.Admin();
+        int formId = this.InInt("formId", 0);
+        OaFormDef def = await this.OaFormDef
+            .Where(a => a.id == formId && a.tenantId == this.TenantId())
+            .FirstAsync();
+        if (def == null) { this.Fail(404, "0404", "表单不存在"); return; }
+        ViewData d = await this.Layout("提交记录：" + def.name);
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+        ListQuery q = this.Paged("id", 20);
+        List<OaFormData> rows = await this.OaFormData
+            .Where(a => a.tenantId == this.TenantId() && a.formId == def.id)
+            .OrderByDescending(a => a.id)
+            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        int total = await this.OaFormData
+            .Where(a => a.tenantId == this.TenantId() && a.formId == def.id)
+            .CountAsync();
+        List<User> users = await this.User
+            .Where(a => a.tenantId == this.TenantId()).ToListAsync();
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            OaFormData r = rows[i];
+            FlowInst inst = await FormFill.InstOf(this, r);
+            StrMap m = new StrMap();
+            m.Set("id", Convert.ToString(r.id));
+            m.Set("who", FormFill.UserName(users, r.submitterId));
+            m.Set("summary", r.summary);
+            m.Set("statusText", FormFill.BadgeText(r, inst));
+            m.Set("statusKind", FormFill.BadgeKind(r, inst));
+            m.Set("createdAt", Fmt.Stamp(r.createdAt));
+            items.Add(m);
+        }
+        d.Set("formId", Convert.ToString(def.id));
+        d.Set("formName", def.name);
+        d.Set("empty", total == 0 ? "1" : "");
+        this.Pager(d, q, total);
+        this.Page(d);
+    }
+
+    /* ---- helpers ---- */
+
+    /* 逐字段收集表单值（schema 顺序遍历，值缺失=未填不入对象）。
+       checkbox 组：admin.js 把 f_<code>[] 合并为逗号串（选项本身不含
+       逗号，FormSchema.HasOptions 已挡），此处拆回数组落 dataJson；
+       attachment 无表单值（随行挂载）；其余标量 Trim 后存字符串值
+       （OaFormData.dataJson 契约：值恒字符串或字符串数组）。 */
+    JsonValue Collect(JsonValue schema) {
+        JsonValue o = JsonValue.NewObject();
+        JsonValue fields = schema.Get("fields");
+        if (fields == null || !fields.IsArray()) { return o; }
+        for (int i = 0; i < fields.Count(); i = i + 1) {
+            JsonValue f = fields.At(i);
+            if (f == null || !f.IsObject()) { continue; }
+            string code = f.Str("code", "");
+            string type = f.Str("type", "");
+            if (code.Length == 0) { continue; }
+            if (type == "attachment") { continue; }
+            if (type == "checkbox") {
+                string raw = this.InRaw("f_" + code + "[]");
+                if (raw.Length == 0) { continue; }
+                List<string> parts = raw.Split(",");
+                JsonValue arr = JsonValue.NewArray();
+                for (int k = 0; k < parts.Count; k = k + 1) {
+                    string one = parts[k].Trim();
+                    if (one.Length > 0) { arr.Append(JsonValue.NewStr(one)); }
+                }
+                if (arr.Count() > 0) { o.Put(code, arr); }
+                continue;
+            }
+            /* InRaw 保真多行（textarea，Bug#8 同族）；Trim 只去两端空白。 */
+            string val = this.InRaw("f_" + code).Trim();
+            if (val.Length == 0) { continue; }
+            o.Put(code, JsonValue.NewStr(val));
+        }
+        return o;
+    }
+
+    /* 摘要：按 schema 顺序取首个非空字段值（数组逗号连接），换行折空格，
+       截 60 字。 */
+    static string Summary(JsonValue schema, JsonValue data) {
+        JsonValue fields = schema.Get("fields");
+        if (fields == null || !fields.IsArray()) { return ""; }
+        for (int i = 0; i < fields.Count(); i = i + 1) {
+            JsonValue f = fields.At(i);
+            if (f == null || !f.IsObject()) { continue; }
+            JsonValue v = data.Get(f.Str("code", ""));
+            if (v == null || v.IsNull()) { continue; }
+            string s = "";
+            if (v.IsArray()) {
+                for (int k = 0; k < v.Count(); k = k + 1) {
+                    string one = v.At(k).AsString("");
+                    if (one.Length == 0) { continue; }
+                    s = s.Length == 0 ? one : s + "," + one;
+                }
+            } else {
+                s = v.AsString("");
+            }
+            if (s.Length == 0) { continue; }
+            s = s.Replace("\r", " ").Replace("\n", " ");
+            return s.Length > 60 ? s.Substring(0, 60) : s;
+        }
+        return "";
+    }
+
+    /* 行的流程实例（instId>0 才查；(id, tenantId) 双闸——Bug#6 同款纪律）。 */
+    static async FlowInst InstOf(FormFill c, OaFormData r) {
+        if (r.instId <= 0) { return null; }
+        return await c.FlowInst
+            .Where(a => a.id == r.instId && a.tenantId == c.TenantId())
+            .FirstAsync();
+    }
+
+    /* 徽标文案/色：草稿灰、已提交绿、审批中黄、已通过绿、已终止红。
+       inst 查无（被删/跨租户）按已提交兜底，不臆造状态。 */
+    static string BadgeText(OaFormData r, FlowInst inst) {
+        if (r.status == 0) { return "草稿"; }
+        if (r.instId <= 0 || inst == null) { return "已提交"; }
+        if (inst.status == 1) { return "审批中"; }
+        if (inst.status == 2) { return "已通过"; }
+        return "已终止";
+    }
+
+    static string BadgeKind(OaFormData r, FlowInst inst) {
+        if (r.status == 0) { return ""; }
+        if (r.instId <= 0 || inst == null) { return "ok"; }
+        if (inst.status == 1) { return "warn"; }
+        if (inst.status == 2) { return "ok"; }
+        return "bad";
+    }
+
+    static string DefName(List<OaFormDef> defs, int formId) {
+        for (int i = 0; i < defs.Count; i = i + 1) {
+            if (defs[i].id == formId) { return defs[i].name; }
+        }
+        return "表单#" + Convert.ToString(formId);
+    }
+
+    static string UserName(List<User> users, int userId) {
+        for (int i = 0; i < users.Count; i = i + 1) {
+            if (users[i].id == userId) {
+                return Fmt.Text(users[i].nickname, users[i].username);
+            }
+        }
+        return "用户#" + Convert.ToString(userId);
+    }
+}
