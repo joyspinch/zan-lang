@@ -150,6 +150,8 @@ class LegendApp {
     public SdlTexture texBook;      // 技能书图标
     public SdlTexture[]texSkillIc;  // 7 技能图标
     public SdlTexture texMapBichon;
+    public SdlTexture[]texMapC;     // 25 地图卡缩略图(0..19 抠自原版演示图)
+    public int mapPage;             // 地图面板页码 0/1
 
     [DllImport("crt", EntryPoint = "getenv")]
     static extern string SysGetenvRaw(string name);
@@ -262,6 +264,13 @@ class LegendApp {
             a.texSkillIc[i] = LegendApp.LoadTex(a.r, "examples/game/legend/assets/ui_skill_" + i + ".png", log);
         }
         a.texMapBichon = LegendApp.LoadTex(a.r, "examples/game/legend/assets/map_bichon.png", log);
+        // 25 张地图卡:0..19 抠自原版演示截图(带烤入名牌),20..24 生成图,
+        // 25..34 巅峰塔十层复用第 24 张按层换色
+        a.texMapC = new SdlTexture[25];
+        for (int i = 0; i < 25; i = i + 1) {
+            string mp = "examples/game/legend/assets/mapc_" + (i < 10 ? "0" : "") + i + ".png";
+            a.texMapC[i] = LegendApp.LoadTex(a.r, mp, log);
+        }
         a.texBg = LegendApp.LoadTex(a.r, "examples/game/legend/assets/bg_mine.jpg", log);
         a.texSplash = LegendApp.LoadTex(a.r, "examples/game/legend/assets/splash.png", log);
         a.texDim = LegendApp.LoadTex(a.r, "examples/game/legend/assets/dim_bg.jpg", log);
@@ -2396,52 +2405,98 @@ class LegendApp {
 
     public void DrawMap(int x, int y, int w, int h) {
         SdlRenderer rd = this.r;
-        this.DrawPanelHeader(x, y, w, "35 张经典地图(点击传送)");
+        this.DrawPanelHeader(x, y, w,
+            (this.mapPage == 0 ? "经典地图 1/2 · 点击图片传送"
+                               : "深渊 · 巅峰塔 2/2 · 点击图片传送"));
         int curMap = this.g.MapIdxAt(this.g.p.hjFloor);
-        // 当前图怪物阵容(原版 present 字段)
+        // 状态两行:当前位置 + 本图怪物阵容(截断到面板宽)
+        Text.DrawShadow(rd, "当前:「" + Data.MAP_NAMES[curMap] + "」第 "
+                        + this.g.p.hjFloor + " 层 (最高 " + this.g.p.hjBest + " 层)",
+                        x + 16, y + 80, 2, 240, 220, 170, 255);
         string ros = "本图怪物:";
         int rlen = Data.MAP_MON_LEN[curMap];
         for (int k = 0; k < rlen && k < 12; k = k + 1) {
             ros = ros + Data.MON_NAMES[Data.MAP_MON[Data.MAP_MON_START[curMap] + k]];
             if (k < rlen - 1 && k < 11) { ros = ros + " | "; }
         }
-        Text.DrawShadow(rd, ros, x + 16, y + 80, 1, 200, 205, 225, 255);
-        Text.DrawShadow(rd, "当前:「" + Data.MAP_NAMES[curMap] + "」第 "
-                        + this.g.p.hjFloor + " 层 (最高 " + this.g.p.hjBest
-                        + " 层) · 每层 Boss = 图表 Boss",
-                        x + 16, y + 94, 1, 170, 175, 195, 255);
-        // 35 图两列名单
-        int gy = y + 114;
-        int cols = 2;
-        int rows = 18;
-        int cw2 = (w - 32) / cols;
-        for (int i = 0; i < 35; i = i + 1) {
-            int col = i / rows;
-            int row = i % rows;
-            int bx = x + 16 + col * cw2;
-            int by = gy + row * 20;
-            int bw = cw2 - 10;
-            bool hov = Draw.PointIn(this.mouseX, this.mouseY, bx, by, bw, 18);
-            bool here = (i == curMap);
-            bool locked = (this.g.p.hjBest < Data.MAP_MIN_FLOOR[i]);
-            LegendApp.RowImg(rd, bx, by, bw, 18);
-            if (here) {
-                rd.SetColor(255, 210, 120, 60);
-                rd.FillRect(bx, by, bw, 18);
-                rd.SetColor(255, 255, 255, 255);
-            } else if (hov && !locked) {
-                rd.SetColor(140, 170, 220, 46);
-                rd.FillRect(bx, by, bw, 18);
+        Text.DrawShadow(rd, this.FitText(ros, w - 32, 1),
+                        x + 16, y + 104, 1, 200, 205, 225, 255);
+        // 4×5 图片卡片网格(与原版演示地图面板同构),底部翻页
+        int iw = (w - 32 - 24) / 4;
+        int ih = 62;
+        int gy = y + 118;
+        for (int n = 0; n < 20; n = n + 1) {
+            int idx = this.mapPage * 20 + n;
+            if (idx >= 35) { break; }
+            int bx = x + 16 + (n % 4) * (iw + 8);
+            int by = gy + (n / 4) * (ih + 6);
+            bool hov = Draw.PointIn(this.mouseX, this.mouseY, bx, by, iw, ih);
+            bool here = (idx == curMap);
+            bool locked = (idx > 0 && this.g.p.hjBest < Data.MAP_MIN_FLOOR[idx]);
+            int ti = idx;
+            if (ti > 24) { ti = 24; }
+            SdlTexture tex = this.texMapC[ti];
+            if (idx >= 25) {
+                int t = idx - 24;   // 巅峰塔:同一张塔景按层数渐变暖色
+                rd.SetColor(255, 236 - 6 * t, 224 - 15 * t, 255);
+            }
+            rd.DrawTexture(tex, bx, by, iw, ih);
+            rd.SetColor(255, 255, 255, 255);
+            if (locked) {
+                // 半透明压暗,保留原画可见(与原版演示一致:全图常显)
+                // 九宫/圆角助手会遗留 blend=0,半透明填充前必须显式开
+                rd.SetBlend(1);
+                rd.SetColor(8, 10, 18, 105);
+                rd.FillRect(bx, by, iw, ih);
+                rd.SetBlend(0);
                 rd.SetColor(255, 255, 255, 255);
             }
-            int tc = here ? 255 : (locked ? 130 : 220);
-            Text.DrawShadow(rd, (i + 1) + "." + Data.MAP_NAMES[i] + " "
-                            + Data.MAP_MIN_FLOOR[i] + "层"
-                            + (here ? " ·当前" : (locked ? " ·未解锁" : "")),
-                            bx + 6, by + 3, 1, tc, tc, tc, 255);
-            if (hov && !locked && this.mouseJustUp) {
-                if (this.g.SelectMap(i)) { this.snd.Tip(); }
+            // 第 1 页的卡带原版烤入名牌(在卡片顶部),只为没有名牌的图
+            // 补画同款顶条,保证两页名牌位置一致
+            if (idx >= 20) {
+                rd.SetBlend(1);
+                rd.SetColor(8, 10, 18, 170);
+                rd.FillRect(bx, by, iw, 19);
+                rd.SetBlend(0);
+                rd.SetColor(255, 255, 255, 255);
+                string nm = Data.MAP_NAMES[idx];
+                Text.DrawShadow(rd, nm,
+                                bx + iw / 2 - Text.Width(rd, nm, 2) / 2,
+                                by + 1, 2, 235, 230, 215, 255);
             }
+            if (locked) {
+                // 锁定文案放在名牌条以下居中,不压烤入的名牌
+                Text.DrawCenteredShadow(rd, "未解锁", bx + iw / 2, by + 20,
+                                        2, 250, 215, 130, 255);
+                Text.DrawCenteredShadow(rd, "需 " + Data.MAP_MIN_FLOOR[idx] + " 层",
+                                        bx + iw / 2, by + 40,
+                                        2, 225, 225, 235, 255);
+            } else {
+                if (here) {
+                    Draw.RoundRectStroke(rd, bx - 2, by - 2, iw + 4, ih + 4, 8, 2,
+                                         255, 210, 120, 255);
+                    rd.SetColor(210, 164, 64, 235);
+                    rd.FillRect(bx + 3, by + 3, 34, 16);
+                    rd.SetColor(255, 255, 255, 255);
+                    Text.Draw(rd, "当前", bx + 5, by + 6, 1, 34, 22, 6, 255);
+                } else if (hov) {
+                    Draw.RoundRectStroke(rd, bx - 2, by - 2, iw + 4, ih + 4, 8, 2,
+                                         160, 190, 240, 170);
+                }
+                if (hov && this.mouseJustUp) {
+                    if (this.g.SelectMap(idx)) { this.snd.Tip(); }
+                }
+            }
+        }
+        // 翻页(两页:0..19 / 20..34)
+        int py = gy + 5 * (ih + 6) + 2;
+        if (this.BtnTex(x + w / 2 - 160, py, 150, 24, "上一页", 1,
+                        this.mapPage == 0 ? 2 : 0)) {
+            if (this.mouseJustUp && this.mapPage > 0) { this.mapPage = 0; this.snd.Tip(); }
+        }
+        if (this.BtnTex(x + w / 2 + 10, py, 150, 24, "下一页", 1,
+                        this.mapPage == 1 ? 2 : 0)) {
+            if (this.mouseJustUp && this.mapPage < 1) { this.mapPage = 1; this.snd.Tip(); }
         }
     }
 
@@ -3389,6 +3444,7 @@ class LegendApp {
                 app.modal = all[k];
                 app.modalSub = 0;
                 app.forgeMode = an[k] == "m2_synth" ? 11 : 0;
+                app.mapPage = LegendApp.SysGetenv("LEGEND_MAP_PAGE") == "1" ? 1 : 0;
                 app.DrawAll();
                 app.r.Present();   // 与 9 图模式一致:补 Present 再读,否则回读滞后一帧
                 string path = "build/legend_all_" + an[k] + ".bmp";
