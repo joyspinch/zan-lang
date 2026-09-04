@@ -3353,6 +3353,17 @@ EXPORT void zan_gui_release_window(void *native_window) {
 #include "gui_image_svg.c"
 
 #define ZAN_IMG_CACHE_CAP 64
+/* Byte budget on top of the entry cap: an entry is w*h*4 decoded at source
+ * resolution, so a few phone-camera photos outrun the desktop-tuned entry
+ * count by hundreds of MB. 0 keeps the desktop behavior (entry cap only);
+ * Android FIFO-evicts until the cache fits -- a widget that scrolls back
+ * re-decodes from disk, and the compressed bytes stay in the page cache. */
+#if defined(__ANDROID__)
+#define ZAN_IMG_CACHE_BYTES (12u * 1024u * 1024u)
+#else
+#define ZAN_IMG_CACHE_BYTES 0
+#endif
+static size_t g_img_bytes = 0;
 typedef struct {
     char path[512];
     u32 *pix;   /* ARGB32: (a<<24)|(r<<16)|(g<<8)|b */
@@ -3501,10 +3512,15 @@ static zan_img_t *zan_img_load(const char *path) {
     pix = zan_rgba_to_argb(data, w, h);
     stbi_image_free(data);
     if (!pix) return NULL;
-    if (g_img_n >= ZAN_IMG_CACHE_CAP) {
+    g_img_bytes += (size_t)w * (size_t)h * sizeof(u32);
+    while (g_img_n >= ZAN_IMG_CACHE_CAP
+           || (ZAN_IMG_CACHE_BYTES && g_img_bytes > ZAN_IMG_CACHE_BYTES
+               && g_img_n > 1)) {
+        g_img_bytes -= (size_t)g_imgs[0].w * (size_t)g_imgs[0].h * sizeof(u32);
         free(g_imgs[0].pix);
-        memmove(&g_imgs[0], &g_imgs[1], sizeof(zan_img_t) * (ZAN_IMG_CACHE_CAP - 1));
-        g_img_n = ZAN_IMG_CACHE_CAP - 1;
+        memmove(&g_imgs[0], &g_imgs[1],
+                sizeof(zan_img_t) * (size_t)(g_img_n - 1));
+        g_img_n--;
     }
     e = &g_imgs[g_img_n++];
     strncpy(e->path, path, 511); e->path[511] = '\0';
@@ -3545,6 +3561,8 @@ EXPORT void zan_gui_image_evict(const char *path) {
     }
     for (i = 0; i < g_img_n; i++) {
         if (strncmp(g_imgs[i].path, path, 511) == 0) {
+            g_img_bytes -= (size_t)g_imgs[i].w * (size_t)g_imgs[i].h
+                           * sizeof(u32);
             free(g_imgs[i].pix);
             memmove(&g_imgs[i], &g_imgs[i+1], sizeof(zan_img_t) * (g_img_n - i - 1));
             g_img_n--;
@@ -3947,4 +3965,86 @@ EXPORT i32 zan_gui_set_render_backend(i32 mode) {
  * settings UI to show what it actually got. */
 EXPORT const char *zan_gui_render_backend(void) {
     return zan_gui_internal_backend_name();
+}
+
+/* ---- memory report -------------------------------------------------------
+ * One call returns what the rasterizer's caches hold, as one compact line a
+ * profiling HUD can show verbatim: glyph atlas, coverage pool, decoded image
+ * caches, surfaces, snapshot/blur slots, SDL textures. Values are megabytes
+ * (raw pixel bytes; malloc overhead is not in) with live slot counts. The
+ * returned buffer is retained until the next call, like the clipboard read.
+ * This exists because the process RSS mixes shared code pages and driver
+ * buffers in -- it cannot tell you which cache ate the memory. */
+EXPORT const char *zan_gui_mem_report(void) {
+    static char *rep = NULL;
+    size_t img_bytes = 0, imgmem_bytes = 0, surf_bytes = 0;
+    size_t blur_bytes = 0, snap_bytes = 0, sdl_bytes = 0;
+    int i, img_cnt = 0, blur_cnt = 0, snap_cnt = 0, atlas_live = 0;
+    for (i = 0; i < g_img_n; i++) {
+        img_bytes += (size_t)g_imgs[i].w * (size_t)g_imgs[i].h * sizeof(u32);
+        img_cnt++;
+    }
+    for (i = 0; i < g_mem_img_n; i++)
+        imgmem_bytes += (size_t)g_mem_imgs[i].w * (size_t)g_mem_imgs[i].h
+                        * sizeof(u32);
+    for (i = 0; i < g_surface_count; i++) {
+        if (g_surfaces[i])
+            surf_bytes += (size_t)g_surfaces[i]->stride
+                          * (size_t)g_surfaces[i]->height * sizeof(u32);
+    }
+    for (i = 0; i < ZAN_ATLAS_CAP; i++)
+        if (g_atlas[i].tile.cov) atlas_live++;
+    for (i = 0; i < ZAN_BLUR_CACHE_SLOTS; i++) {
+        if (g_blur_cache[i].pixels) {
+            blur_bytes += g_blur_cache[i].cap * sizeof(u32);
+            blur_cnt++;
+        }
+    }
+    for (i = 0; i < g_snap_cache_count; i++) {
+        if (g_snap_cache[i].pixels) {
+            snap_bytes += g_snap_cache[i].cap * sizeof(u32);
+            snap_cnt++;
+        }
+    }
+#ifdef ZAN_GUI_SDL
+    for (i = 0; i < g_win_count; i++) {
+        if (g_wins[i].tex)
+            sdl_bytes += (size_t)g_wins[i].tw * (size_t)g_wins[i].th
+                         * sizeof(u32);
+    }
+    if (g_scene.tex)
+        sdl_bytes += (size_t)g_scene.tw * (size_t)g_scene.th * sizeof(u32);
+#endif
+    char buf[384];
+#ifdef ZAN_GUI_SDL
+    snprintf(buf, sizeof(buf),
+             "atl %.1fM/%d cov %.2fM img %d/%.1fM mimg %.1fM "
+             "surf %.1fM blur %d/%.1fM snap %d/%.1fM tex %.1fM",
+             (double)g_atlas_bytes / 1048576.0, atlas_live,
+             (double)g_cov_pool_bytes / 1048576.0,
+             img_cnt, (double)img_bytes / 1048576.0,
+             (double)imgmem_bytes / 1048576.0,
+             (double)surf_bytes / 1048576.0,
+             blur_cnt, (double)blur_bytes / 1048576.0,
+             snap_cnt, (double)snap_bytes / 1048576.0,
+             (double)sdl_bytes / 1048576.0);
+#else
+    snprintf(buf, sizeof(buf),
+             "atl %.1fM/%d cov %.2fM img %d/%.1fM mimg %.1fM "
+             "surf %.1fM blur %d/%.1fM snap %d/%.1fM",
+             (double)g_atlas_bytes / 1048576.0, atlas_live,
+             (double)g_cov_pool_bytes / 1048576.0,
+             img_cnt, (double)img_bytes / 1048576.0,
+             (double)imgmem_bytes / 1048576.0,
+             (double)surf_bytes / 1048576.0,
+             blur_cnt, (double)blur_bytes / 1048576.0,
+             snap_cnt, (double)snap_bytes / 1048576.0);
+#endif
+    size_t n = strlen(buf);
+    char *nb = (char *)malloc(n + 1);
+    if (!nb) return "";
+    memcpy(nb, buf, n + 1);
+    free(rep);
+    rep = nb;
+    return rep;
 }

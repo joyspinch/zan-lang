@@ -43,7 +43,17 @@ typedef struct {
  * alone would not. */
 #define ZAN_ATLAS_CAP   4096
 #define ZAN_ATLAS_PROBE 8
+/* Desktop workstations never notice the atlas; phones do. A CJK page holds
+ * hundreds of whole-line run tiles and the desktop budget lands straight on
+ * the device's PSS bill (gui_gallery sat at ~32MB atlas on Android). Sweep
+ * evicts cold tiles either way -- a miss costs the font engine pass that
+ * already had to happen -- so the budget trades resident memory for an
+ * occasional re-raster, which is the right trade on a phone. */
+#if defined(__ANDROID__)
+#define ZAN_ATLAS_BYTES (4u * 1024u * 1024u)
+#else
 #define ZAN_ATLAS_BYTES (32u * 1024u * 1024u)
+#endif
 
 static zan_atlas_slot g_atlas[ZAN_ATLAS_CAP];
 static uint64_t g_atlas_clock = 0;
@@ -69,7 +79,11 @@ static uint64_t g_atlas_swept = 0;
  * bounded by one step per tile. The pool is capped by count and total bytes;
  * overflow falls back to free() as before. */
 #define ZAN_ATLAS_POOL_CAP 256
+#if defined(__ANDROID__)
+#define ZAN_ATLAS_POOL_BYTES (1u * 1024u * 1024u)
+#else
 #define ZAN_ATLAS_POOL_BYTES (4u * 1024u * 1024u)
+#endif
 static struct { void *p; size_t bytes; } g_cov_pool[ZAN_ATLAS_POOL_CAP];
 static int g_cov_pool_n = 0;
 static size_t g_cov_pool_bytes = 0;
