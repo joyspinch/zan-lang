@@ -95,6 +95,32 @@ zanc src/main.zan src/Controller/*.zan src/Controller/Api/*.zan \
   窗口标题显示 `[update available]` / `[!] update required` 徽标。
 - **包体校验与商城商品同一套**：SHA-256 摘要 + RSA-SHA256 签名，防篡改/防伪包。
 
+## 增量更新（文件级 md5 差异同步）
+
+版本频道的包体不必整包下载——发布按**文件清单**走增量：
+
+```
+发布（管理员）:
+  1. 把新版文件树放进 packages/<channel>[-<platform>]/（如 packages/ide-win-x64/）
+  2. POST /api/channeladmin/publish  → 频道指针指向新版本
+  3. POST /api/manifestadmin/publish → 扫描目录生成清单快照
+     （{path, md5, size} 逐文件，写入 version_releases.manifest 冻结）
+
+客户端同步:
+  1. POST /api/channel/sync  body: {"channel","platform","version",
+       "client": {"path": "本地md5", ...}}     （不带 client = 全量）
+     → {"match": 一致数, "download": [{path, md5, size}...]}
+  2. 对 download 里每个文件 GET /api/channel/file?...&path=...
+     （响应 ETag = 内容 md5，可自行复验；md5 一致的文件根本不会进
+       download 列表——改动多少传多少）
+  3. 本地有而清单没有的文件（服务端已移除）客户端对照 download 全集
+     自行删除
+```
+
+IDE 侧（`IdeUpdate.BeginSync`）把本地安装目录的平行 `path/md5` 清单
+发给 sync，得到 `IdeSyncPlan`（要下载哪些文件、合计字节），状态面据此
+展示"这次更新要下多少"。真正的下载落盘由安装管线消费该计划。
+
 ## 数据层约定
 
 - **Database First 与 CodeFirst 混合**：实体用 `[Table]` 声明，启动时

@@ -179,6 +179,10 @@ class IdeUpdate {
         int ch = IdeUpdate.pending;
         IdeUpdate.pending = 0;
         IdeUpdate.sink = null;
+        if (ch == 9) {
+            IdeUpdate.PollSync(done);
+            return;
+        }
         IdeUpdate.Store(ch, finished, done);
         if (ch < 3) {
             IdeUpdate.Check(ch + 1);
@@ -228,4 +232,141 @@ class IdeUpdate {
         if (IdeUpdate.AnyAvailable()) { return "[update available]"; }
         return "";
     }
+
+    /* ---- 增量同步面（清单比对，供"要装什么"的决策与展示） ----
+     * 客户端把 {path: md5} 发给 /api/channel/sync，服务端回
+     * {total, match, download:[{path,md5,size}]}；本地不在服务端清单
+     * 的文件（服务端已移除）由客户端对照 files 全集自行删除。
+     * 比对是纯展示/决策信息：真正的下载落盘走安装管线（后续任务）。 */
+    static IdeSyncPlan syncPlan;
+
+    /// 最近一次增量比对的计划（null = 尚未比对或远端无清单）。
+    static IdeSyncPlan SyncPlan() { return IdeUpdate.syncPlan; }
+
+    /// 同步 ide 频道：paths/md5s 为本地安装目录的平行清单（扫描方产出，
+    /// StrMap 无键枚举故用平行 List）。返回 "" = 已发起后台比对；
+    /// 非空 = 未发起的原因。未比对的本地文件 = 全量清单请求由服务端
+    /// 处理（client 空 = 全量）。
+    static string BeginSync(List<string> paths, List<string> md5s) {
+        if (IdeUpdate.sink != null && IdeUpdate.sink.Done() == "") {
+            return "another channel request is running";
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("channel", JsonValue.NewStr("ide"));
+        body.Put("platform", JsonValue.NewStr(IdeUpdate.Platform()));
+        body.Put("version", JsonValue.NewStr(IdeVersion.Number()));
+        if (paths != null) {
+            JsonValue client = JsonValue.NewObject();
+            for (int i = 0; i < paths.Count; i = i + 1) {
+                client.Put(paths[i],
+                    JsonValue.NewStr(i < md5s.Count ? md5s[i] : ""));
+            }
+            body.Put("client", client);
+        }
+        IdeUpdate.syncBody = body.ToJson();
+        IdeUpdate.SetUrl(IdeUpdate.BaseUrl() + "/api/channel/sync");
+        SseSink s = SseSink.ToMemory();
+        IdeUpdate.sink = s;
+        IdeUpdate.workerSink = s;
+        IdeUpdate.pending = 9; // sync 阶段
+        if (!Thread.Start(IdeUpdate.SyncWorker)) {
+            IdeUpdate.sink = null;
+            IdeUpdate.pending = 0;
+            return "could not start sync request";
+        }
+        return "";
+    }
+
+    /// sync 请求体（BeginSync 装好，SyncWorker 读走）。
+    static string syncBody;
+
+    static void SyncWorker() {
+        string body = IdeUpdate.syncBody;
+        Socket.Initialize();
+        string result = "";
+        try {
+            HttpClient cli;
+            if (IdeUpdate.tls) {
+                cli = HttpClient.CreateHttps(IdeUpdate.host, IdeUpdate.port);
+            } else {
+                cli = new HttpClient(IdeUpdate.host, IdeUpdate.port);
+            }
+            cli.SetCallPolicy(IdeUpdate.CallPolicy());
+            cli.SetTimeout(15000);
+            result = await cli.PostAsync(IdeUpdate.path, body);
+        } catch (Exception ex) {
+            IdeUpdate.workerSink.Publish("err:" + ex.Message);
+            return;
+        }
+        IdeUpdate.workerSink.Publish("ok:" + result);
+    }
+
+    /// Poll 看到 pending==9 时走这里：解析差异为计划。
+    static void PollSync(string done) {
+        IdeSyncPlan plan = IdeSyncPlan.Parse(done);
+        IdeUpdate.syncPlan = plan;
+    }
+}
+
+/// 增量比对的产物：要下载哪些文件、合计字节。
+class IdeSyncPlan {
+    List<string> downloadPaths;
+    long downloadBytes;
+    int matchCount;
+    string error;
+
+    static IdeSyncPlan Parse(string done) {
+        IdeSyncPlan plan = new IdeSyncPlan();
+        plan.downloadPaths = new List<string>();
+        plan.error = "";
+        if (done.Length > 4 && done.Substring(0, 4) == "err:") {
+            plan.error = done.Substring(4, done.Length - 4);
+            return plan;
+        }
+        if (done.Length < 3 || done.Substring(0, 3) != "ok:") {
+            plan.error = "invalid sync response";
+            return plan;
+        }
+        JsonValue envelope = null;
+        try {
+            envelope = JsonValue.Parse(done.Substring(3, done.Length - 3));
+        } catch (JsonException ex) {
+            envelope = null;
+        }
+        if (envelope == null || !envelope.IsObject()
+            || envelope.Str("code", "") != "0000") {
+            plan.error = "sync rejected";
+            return plan;
+        }
+        JsonValue data = envelope.Get("data");
+        JsonValue downloads = data != null ? data.Get("download") : null;
+        if (downloads != null && downloads.IsArray()) {
+            for (int i = 0; i < downloads.Count(); i = i + 1) {
+                JsonValue f = downloads.At(i);
+                plan.downloadPaths.Add(f.Str("path", ""));
+                plan.downloadBytes = plan.downloadBytes
+                    + IdeSyncPlan.ParseLong(f.Str("size", "0"));
+            }
+        }
+        JsonValue match = data != null ? data.Get("match") : null;
+        plan.matchCount = match != null ? match.AsInt(0) : 0;
+        return plan;
+    }
+
+    /// 无依赖的十进制解析（IDE 不编 System.Web 的 Filter）。
+    static long ParseLong(string s) {
+        long v = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (c < 48 || c > 57) { break; }
+            v = v * 10 + c - 48;
+        }
+        return v;
+    }
+
+    List<string> DownloadPaths() { return downloadPaths; }
+    long DownloadBytes() { return downloadBytes; }
+    int MatchCount() { return matchCount; }
+    string Error() { return error; }
+    bool Ok() { return error == ""; }
 }
