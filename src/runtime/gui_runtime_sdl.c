@@ -47,6 +47,14 @@ static bool g_mouse_captured = false;  /* holding a client-widget drag */
 static Uint64 g_last_event_at;         /* perf counter of newest event */
 static int    g_ev_count;              /* events since previous present */
 static void fprof_ev(const char *what, int ret); /* fwd: defined near fprof */
+/* Set when SDL reports the GL device/targets were reset (Android tears the
+ * EGL context down on every background cycle) or when a resume-class window
+ * event lands while the GL context belongs to another thread. Consumed by
+ * zan_gui_present on the app thread: textures are destroyed so the next
+ * present recreates them and re-uploads the retained CPU surface in full —
+ * otherwise idle presents patch a context-orphaned texture with a few small
+ * damage rects and the page stays black behind a live HUD. */
+static int g_gl_reset_pending;
 
 /* Manual (non-modal) window resize. Handing a border press to the OS through
  * SDL_HITTEST_RESIZE_* starts Windows' modal move/resize loop, which owns the
@@ -412,6 +420,13 @@ static void sdl_translate(const SDL_Event *e) {
             }
             zq_push(1, (int)e->motion.x, (int)e->motion.y, 0, 0,
                     cur_mod_bits(), w);
+            /* A real pointer move is never a touch twin: whether this push
+             * landed fresh or merged into a tagged twin, the resulting entry
+             * describes the physical pointer and must read untagged. */
+            if (!zq_empty()) {
+                int ul = (g_zq_tail + ZAN_ZQ_CAP - 1) % ZAN_ZQ_CAP;
+                g_zq[ul].e[6] = 0;
+            }
             break;
         }
         case SDL_EVENT_MOUSE_BUTTON_DOWN:
@@ -471,9 +486,25 @@ static void sdl_translate(const SDL_Event *e) {
              * neighbouring window's open animation). Repaint it from its own
              * last frame right away instead of leaving stale pixels. */
             SDL_Window *w = SDL_GetWindowFromID(e->window.windowID);
+#if defined(__ANDROID__)
+            /* NEVER call GL from here: on Android events are translated on
+             * the Java main thread (zan_event_watch) while the EGL context
+             * and every texture live on the app thread — an sdl_represent
+             * from this thread is a silent no-op at best. The background
+             * cycle dropped the context anyway (texture contents gone).
+             * Flag the reset; the next present on the app thread recreates
+             * the texture and re-uploads the retained CPU surface in full. */
+            (void)w;
+            g_gl_reset_pending = 1;
+#else
             sdl_represent(sdl_find(w));
+#endif
             break;
         }
+        case SDL_EVENT_RENDER_DEVICE_RESET:
+        case SDL_EVENT_RENDER_TARGETS_RESET:
+            g_gl_reset_pending = 1;
+            break;
         case SDL_EVENT_WINDOW_MOUSE_LEAVE: {
             /* Clear widget hover when the pointer leaves the window. Skipped
              * while a button is held: that drag still owns the pointer via the
@@ -559,16 +590,18 @@ static void sdl_translate(const SDL_Event *e) {
             if (g_hist_n < TOUCH_HIST) g_hist_n++;
             g_touch_x = x;
             g_touch_y = y;
-            /* Mouse-motion twin of the wheel delta above: this is what lets
-             * a held widget (Layer window drag/resize) follow the finger.
-             * zq_push merges consecutive plain moves, so this costs no
-             * extra queue depth alongside the wheel flow. Tagged via the
-             * e[6] flag channel (same one that marks a touch-drag release)
-             * so the app can skip the frame when no widget owns the press —
-             * the wheel of the same finger sample already did the scrolling,
-             * and painting an identical frame on the twin halves the drag
-             * frame rate for nothing. */
-            {
+            /* Sub-notch pointer twin: Gui reads pointer position from wheel
+             * events too (App updates mouseX/Y from kind 13), so a sample
+             * that carried a wheel delta needs NO extra motion event — the
+             * wheel IS the motion. Pushing one anyway made the queue
+             * alternate wheel,move,wheel,move, which defeats the wheel
+             * flood-merge above: a 60Hz finger on a slow-to-render page
+             * (glass theme, ~6fps) backed the queue up tens of seconds
+             * deep and the page kept scrolling long after lift-off. Push a
+             * motion twin only for sub-notch travel (delta == 0) so held
+             * widgets still follow at fine granularity; consecutive plain
+             * moves merge, so slow fingers cost one queue slot total. */
+            if (delta == 0) {
                 int t0 = g_zq_tail;
                 zq_push(1, (int)x, (int)y, 0, 0, cur_mod_bits(), w);
                 if (g_zq_tail != t0) {
@@ -852,9 +885,19 @@ EXPORT iptr zan_gui_create_window(const char *title, i32 width, i32 height) {
     if (!win) return 0;
     SDL_Renderer *ren = SDL_CreateRenderer(win, NULL);
     if (!ren) { SDL_DestroyWindow(win); return 0; }
-    /* App paces its own frames (needsRedraw + 16ms sleep); leave VSync off so a
-     * present never blocks the UI thread up to a refresh interval. */
+    /* Desktop: app paces its own frames (needsRedraw + 16ms sleep); leave
+     * VSync off so a present never blocks the UI thread up to a refresh
+     * interval. Android: vsync is what kills touch latency — with interval 0
+     * the GL queue renders ahead and the screen shows a frame the app painted
+     * 1-2 frames ago, while unthrottled swaps fight the app's pacing into
+     * jitter. Interval 1 pins present to the display deadline; the app's
+     * 16ms sleep goes inert on its own (its `since` is measured from present
+     * end, which the vblank block already stretched to a full frame). */
+#if defined(__ANDROID__)
+    SDL_SetRenderVSync(ren, 1);
+#else
     SDL_SetRenderVSync(ren, 0);
+#endif
     SDL_SetWindowHitTest(win, zan_sdl_hittest, NULL);
 #ifdef _WIN32
     /* SDL borderless windows strip the native frame and with it the DWM drop
@@ -1370,15 +1413,19 @@ static void fprof_record(Uint64 t_enter, Uint64 t_upload, Uint64 t_present_end) 
         char line[160];
         if (g_fprof == 2) {
             double f2 = (double)SDL_GetPerformanceFrequency() / 1000.0;
+            /* g_last_event_at is 0 until the first event arrives: report
+             * -1 instead of wrapping a unsigned difference around zero. */
+            double gap = g_last_event_at
+                ? (double)(t_enter - g_last_event_at) / f2 : -1.0;
+            double after = (g_last_event_at && g_last_event_at > g_fp_last_end)
+                ? (double)(g_last_event_at - g_fp_last_end) / f2 : -1.0;
             snprintf(line, sizeof line,
                      "frame cpu_render=%.2f upload=%.2f present=%.2f"
                      " up_bytes=%llu full=%d ev_gap=%.1f ev_after=%.1f evs=%d",
                      cpu, up, pr,
                      (unsigned long long)g_upload_last_bytes,
                      g_upload_last_full,
-                     (double)(t_enter - g_last_event_at) / f2,
-                     (double)(g_last_event_at - g_fp_last_end) / f2,
-                     g_ev_count);
+                     gap, after, g_ev_count);
             fprof_emit(line);
             g_ev_count = 0;
         } else {
@@ -1471,7 +1518,13 @@ EXPORT i32 zan_gui_adopt_sdl_window(iptr hwnd_val) {
     /* No renderer handed over yet: create our own (pure-GUI windows). */
     SDL_Renderer *ren = SDL_CreateRenderer(win, NULL);
     if (!ren) return 3;
+    /* Same split as create_window: desktop unthrottled (app paces itself),
+     * Android pinned to the display (see the comment there). */
+#if defined(__ANDROID__)
+    SDL_SetRenderVSync(ren, 1);
+#else
     SDL_SetRenderVSync(ren, 0);
+#endif
     SDL_SetWindowHitTest(win, zan_sdl_hittest, NULL);
     zan_sdl_win_t *rec2 = &g_wins[g_win_count++];
     rec2->win = win; rec2->ren = ren; rec2->tex = NULL;
@@ -1604,6 +1657,22 @@ EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
     if (!rec) return 1;
     zan_surface_t *s = g_surfaces[surface_id];
     g_last_surface = surface_id;
+
+    if (g_gl_reset_pending) {
+        /* GL context was reset while backgrounded (Android): texture objects
+         * survive but their contents are gone. Recreate on this (the app)
+         * thread and let the fresh-texture path below force a FULL upload
+         * from the retained CPU surface — the page repaints itself exactly
+         * as it looked, and idle HUD frames stop patching a black texture. */
+        g_gl_reset_pending = 0;
+        for (int i = 0; i < g_win_count; i++) {
+            zan_sdl_win_t *r = &g_wins[i];
+            if (r->tex) SDL_DestroyTexture(r->tex);
+            r->tex = NULL;
+            r->tw = 0;
+            r->th = 0;
+        }
+    }
 
     Uint64 t_enter = SDL_GetPerformanceCounter();
 
