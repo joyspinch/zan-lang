@@ -404,3 +404,60 @@ that turns the admin sidebar into a drawer, and tables that become cards under
 {{#each rows}}...{{/each}} loop over ViewData.AddList("rows")
 layout.html + {{content}}  page wrapper
 ```
+
+## Backup & restore
+
+Built-in backups live on the `Backup & restore` admin page (sqlite only,
+super-admin only, so no role grants appear for it by default). One backup is a
+timestamped directory under `data/backups/{YYYYMMDD}-{HHMMSS}/` containing:
+
+```
+app.db         consistent snapshot taken with VACUUM INTO (safe while the
+               server keeps running; WAL readers/writers are not blocked)
+uploads.zip    stored (not recompressed) copy of data/uploads/
+manifest.txt   taken-at, driver, db size, attachment count / bytes
+```
+
+The last 7 directories are kept (older ones are rotated away). A `.lock` file
+in `data/backups/` serializes concurrent runs across worker processes. Each
+backup can be downloaded from the page as `backup-{timestamp}.zip`.
+
+Manual restore, on or off the server:
+
+1. Stop the app so nothing writes during the restore.
+2. Get the files: download `backup-{timestamp}.zip` from the admin page, or
+   read them straight from `data/backups/{timestamp}/` on the host.
+3. Overwrite the main database file with the backup's `app.db`, then unpack
+   `uploads.zip` over `data/uploads/` (keep the `{year-month}/` layout).
+4. Restart the app and spot-check data and attachments.
+
+### Cron backups without the admin page
+
+The same VACUUM INTO trick works from a shell, no app changes needed:
+
+```
+# /etc/crontab -- daily 02:30, keep the same 7-slot layout
+30 2 * * * root mkdir -p /srv/app/data/backups/$(date +\%Y\%m\%d-\%H\%M\%S) \
+  && sqlite3 /srv/app/app.db "VACUUM INTO '/srv/app/data/backups/$(date +\%Y\%m\%d-\%H\%M\%S)/app.db'" \
+  && cd /srv/app/data && zip -qr backups/$(date +\%Y\%m\%d-\%H\%M\%S)/uploads.zip uploads \
+  && ls -1dt /srv/app/data/backups/* | tail -n +8 | xargs -r rm -rf
+```
+
+Adjust `/srv/app` to your install root. Use the admin page instead when you
+can: it also stamps a manifest and is protected against concurrent runs.
+
+### MySQL deployments
+
+The built-in page degrades explicitly on `driver=mysql` (page notice and a
+400 on create) rather than silently doing nothing. Back up with mysqldump
+plus a file copy of the uploads directory:
+
+```
+mysqldump --single-transaction --routines --triggers dbname > backup.sql
+tar -czf uploads.tar.gz data/uploads
+```
+
+Restore by piping the dump back into a fresh schema (`mysql dbname <
+backup.sql`) and unpacking `uploads.tar.gz` over `data/uploads/`. Test the
+full restore path on a staging box before you ever need it in production.
+
