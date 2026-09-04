@@ -459,10 +459,12 @@ class Lua {
 
     // ---- 内部实现 --------------------------------------------------------
 
+    /// 未初始化时自动 Initialize。
     static void EnsureReady() {
         if (!Lua.initialized) { Lua.Initialize(); }
     }
 
+    /// 创建 lua_State、打开标准库，并把注册表槽位分配器复位到 1000。
     static void OpenState() {
         LuaNewStateFn ns = (LuaNewStateFn)Lua.addr_newstate;
         Lua.state = ns();
@@ -475,12 +477,13 @@ class Lua {
         Lua.initialized = true;
     }
 
+    /// lua_settop：把栈高设为 n。
     static void SetTop(int n) {
         LuaVoidIntFn f = (LuaVoidIntFn)Lua.addr_settop;
         f(Lua.state, n);
     }
 
-    // 编译一段代码并把生成的 chunk 压栈（编译失败时抛出异常）。
+    /// 编译一段代码并把生成的 chunk 压栈（编译失败时抛出异常）。
     static void Load(string code) {
         LuaLoadFn f = (LuaLoadFn)Lua.addr_loadstring;
         int rc = f(Lua.state, code);
@@ -489,8 +492,8 @@ class Lua {
         }
     }
 
-    // 保护调用栈顶的 chunk/函数：出错时把栈恢复到 mark 再抛异常，
-    // 因此调用方看不到半截的栈。
+    /// 保护调用栈顶的 chunk/函数：出错时把栈恢复到 mark 再抛异常，
+    /// 因此调用方看不到半截的栈。
     static void Protected(int nargs, int nres, int mark, string what) {
         LuaPcallFn f = (LuaPcallFn)Lua.addr_pcallk;
         int rc = f(Lua.state, nargs, nres, 0, 0, 0);
@@ -499,15 +502,16 @@ class Lua {
         }
     }
 
-    // 读走栈顶的错误消息、清栈并抛出。消息在单独的帧里取出，
-    // 因为 `throw` 不会释放存活局部变量
-    // （见 docs/bugs/throw-leaks-live-locals.md）。
+    /// 读走栈顶的错误消息、清栈并抛出。消息在单独的帧里取出，
+    /// 因为 `throw` 不会释放存活局部变量
+    /// （见 docs/bugs/throw-leaks-live-locals.md）。
     static void Fail(string prefix) {
         string msg = Lua.TopString();
         Lua.SetTop(0);
         throw new InvalidOperationException(prefix + ": " + msg);
     }
 
+    /// 栈顶值的错误消息；非 string/number 时返回占位文案。
     static string TopString() {
         LuaIdxIntFn ty = (LuaIdxIntFn)Lua.addr_type;
         int t = ty(Lua.state, 0 - 1);
@@ -516,7 +520,7 @@ class Lua {
         return f(Lua.state, 0 - 1, 0);
     }
 
-    // 把点分路径解析出的值压栈（"string.upper" -> 全局 string 的 upper）。
+    /// 把点分路径解析出的值压栈（"string.upper" -> 全局 string 的 upper）。
     static void PushPath(string name, int mark) {
         List<string> parts = name.Split(".");
         LuaGetGlobalFn g = (LuaGetGlobalFn)Lua.addr_getglobal;
@@ -541,6 +545,7 @@ class Lua {
         }
     }
 
+    /// 定位并加载可用的 Lua 动态库、解析全部入口点；成功后缓存结果。
     static bool TryResolve() {
         if (Lua.resolved) { return true; }
         if (Lua.mod == 0) {
@@ -567,6 +572,8 @@ class Lua {
         return true;
     }
 
+    /// 解析全部入口点地址；关键符号缺失时返回 false。
+    /// 5.3 之前没有 lua_geti/lua_seti：退回 raw 访问（无 __index）。
     static bool ResolveSymbols() {
         Lua.addr_newstate = Interop.Symbol(Lua.mod, "luaL_newstate");
         Lua.addr_openlibs = Interop.Symbol(Lua.mod, "luaL_openlibs");
@@ -608,6 +615,7 @@ class Lua {
             && Lua.addr_tolstring != 0 && Lua.addr_createtable != 0;
     }
 
+    /// 卸载运行时并清空全部符号地址（状态须已先经 Finalize 关闭）。
     static void FreeModule() {
         if (Lua.mod != 0) {
             Interop.Unload(Lua.mod);
@@ -648,7 +656,7 @@ class Lua {
 
     // ---- 注册表槽位（LuaValue 的存储）---------------------------
 
-    // 把栈顶的值移入一个新的注册表槽位（弹出该值），返回槽位号。
+    /// 把栈顶的值移入一个新的注册表槽位（弹出该值），返回槽位号。
     static long StoreTop() {
         long slot = Lua.nextSlot;
         Lua.nextSlot = Lua.nextSlot + 1;
@@ -657,7 +665,7 @@ class Lua {
         return slot;
     }
 
-    // 把槽位里的值压栈（槽位 0 表示 nil）。
+    /// 把槽位里的值压栈（槽位 0 表示 nil）。
     static void PushSlot(long slot) {
         if (slot == 0) {
             LuaVoid1Fn f = (LuaVoid1Fn)Lua.addr_pushnil;
@@ -668,7 +676,7 @@ class Lua {
         int _t = g(Lua.state, Lua.REGISTRY, slot);
     }
 
-    // 释放槽位（置 nil，让 Lua 的 GC 可以回收该值）。
+    /// 释放槽位（置 nil，让 Lua 的 GC 可以回收该值）。
     static void DropSlot(long slot) {
         if (slot == 0 || Lua.state == 0 || !Lua.resolved) { return; }
         LuaVoid1Fn nil = (LuaVoid1Fn)Lua.addr_pushnil;
@@ -677,6 +685,7 @@ class Lua {
         si(Lua.state, Lua.REGISTRY, slot);
     }
 
+    /// 槽位值的 lua_type；槽位 0 即 TNIL。
     static int TypeOfSlot(long slot) {
         if (slot == 0) { return Lua.TNIL; }
         int mark = Lua.Top();
@@ -708,6 +717,7 @@ class LuaValue {
         return LuaValue.Wrap(Lua.StoreTop());
     }
 
+    /// ARC 回收包装时释放注册表槽位，Lua 的 GC 随后回收该值。
     ~LuaValue() {
         if (this.slot != 0) {
             Lua.DropSlot(this.slot);
@@ -937,22 +947,27 @@ class LuaValue {
         return self.Call(Lua.FromStr(a));
     }
 
+    /// 运算符重载：fn(a)，a 封送为 double。
     static LuaValue op_call(LuaValue self, double a) {
         return self.Call(Lua.FromDouble(a));
     }
 
+    /// 运算符重载：fn(a)，a 封送为 long。
     static LuaValue op_call(LuaValue self, long a) {
         return self.Call(Lua.FromLong(a));
     }
 
+    /// 运算符重载：fn(a)，a 封送为 bool。
     static LuaValue op_call(LuaValue self, bool a) {
         return self.Call(Lua.FromBool(a));
     }
 
+    /// 运算符重载：fn(a)，a 为另一个 LuaValue。
     static LuaValue op_call(LuaValue self, LuaValue a) {
         return self.Call(a);
     }
 
+    /// 运算符重载：fn(a, b, ...)，参数逐一封送为 double。
     static LuaValue op_call(LuaValue self, params double[] args) {
         LuaValue[] vs = new LuaValue[args.Length];
         for (int i = 0; i < args.Length; i = i + 1) {
@@ -961,6 +976,7 @@ class LuaValue {
         return self.Call(vs);
     }
 
+    /// 运算符重载：fn(a, b, ...)，参数逐一封送为 long。
     static LuaValue op_call(LuaValue self, params long[] args) {
         LuaValue[] vs = new LuaValue[args.Length];
         for (int i = 0; i < args.Length; i = i + 1) {
@@ -969,6 +985,7 @@ class LuaValue {
         return self.Call(vs);
     }
 
+    /// 运算符重载：fn(a, b, ...)，参数逐一封送为 string。
     static LuaValue op_call(LuaValue self, params string[] args) {
         LuaValue[] vs = new LuaValue[args.Length];
         for (int i = 0; i < args.Length; i = i + 1) {
@@ -977,6 +994,7 @@ class LuaValue {
         return self.Call(vs);
     }
 
+    /// 运算符重载：fn(a, b, ...)，参数逐一封送为 bool。
     static LuaValue op_call(LuaValue self, params bool[] args) {
         LuaValue[] vs = new LuaValue[args.Length];
         for (int i = 0; i < args.Length; i = i + 1) {
@@ -985,6 +1003,7 @@ class LuaValue {
         return self.Call(vs);
     }
 
+    /// 运算符重载：fn(a, b, ...)，参数均为 LuaValue。
     static LuaValue op_call(LuaValue self, params LuaValue[] args) {
         return self.Call(args);
     }
@@ -1021,6 +1040,7 @@ class LuaValue {
 }
 
 // ---- lua_CFunction 回调形式：int (*)(lua_State *) -------------------
+/// lua_CFunction 回调形式：int (*)(lua_State*)。
 delegate int LuaCFunction(nint L);
 
 // ---- 已解析入口点的内部调用形式 -----------------------

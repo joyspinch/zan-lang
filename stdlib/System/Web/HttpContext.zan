@@ -79,6 +79,9 @@ class HttpContext {
     long frames;
     long framesBytes;
 
+    /// 构造请求上下文：解析 query，并对 POST/PUT/PATCH 的 urlencoded 或
+    /// multipart 正文做一次表单解析。连接循环里正文是构造之后才缓冲齐
+    /// 的，那里会经 ParseFormBody 再解析一次；空正文不会重复解析。
     HttpContext(HttpRequest req, string remoteIp) {
         this.request = req;
         this.method = req.method;
@@ -127,8 +130,11 @@ class HttpContext {
     }
 
     string RemoteIp() { return this.remoteIp; }
+    /// 对端 IPv4 的整数形式（Socket.Ipv4ToLong）。
     long RemoteIpLong() { return Socket.Ipv4ToLong(this.remoteIp); }
 
+    /// <summary>Parses the urlencoded form body again, now that the body has
+    /// finished
     /// buffering (the initial parse only saw the first packet).</summary>
     static void ParseFormBody(HttpRequest req, HttpContext ctx) {
         if (HttpContext.StartsWith(req.contentType, "application/x-www-form-urlencoded")) {
@@ -213,6 +219,7 @@ class HttpContext {
         return head.Substring(qs, e - qs);
     }
 
+    /// 从 from 起查找子串首次出现，返回下标；无则 -1。
     static int FindFrom(string hay, string needle, int from) {
         int n = hay.Length;
         int m = needle.Length;
@@ -226,6 +233,7 @@ class HttpContext {
         return -1;
     }
 
+    /// 同 FindFrom，但 ASCII 大小写不敏感。
     static int FindNoCaseFrom(string hay, string needle, int from) {
         int n = hay.Length;
         int m = needle.Length;
@@ -246,9 +254,13 @@ class HttpContext {
 
     // ---- request accessors ----
 
+    /// 路由参数（{param} 段匹配到的值）。
     string Param(string name) { return this.routeParams.Get(name); }
+    /// query string 参数。
     string Query(string name) { return this.query.Get(name); }
+    /// 表单字段（urlencoded 或 multipart 的文本字段）。
     string Form(string name) { return this.form.Get(name); }
+    /// 原始请求正文。
     string Body() { return this.request.body; }
 
     /// <summary>Request body as JSON, parsed once and cached. Returns null
@@ -320,6 +332,8 @@ class HttpContext {
         return true;
     }
 
+    /// 严格 64 位解析，规则同 ParseIntStrict；累加中途变负（64 位回绕）
+    /// 视为解析失败。
     static long ParseLongStrict(string v, long dflt) {
         if (v == null || v.Length == 0) { return dflt; }
         int i = 0;
@@ -378,6 +392,7 @@ class HttpContext {
         return "";
     }
 
+    /// X-Requested-With 恰为 XMLHttpRequest（仅认这两种大小写写法）时为真。
     bool IsAjax() {
         string x = this.request.GetHeader("X-Requested-With");
         return x == "XMLHttpRequest" || x == "xmlhttprequest";
@@ -441,6 +456,7 @@ class HttpContext {
 
     // ---- response builders ----
 
+    /// 设置状态码与原因短语（可链式）。
     HttpContext Status(int code, string text) {
         this.status = code;
         this.statusText = text;
@@ -477,6 +493,7 @@ class HttpContext {
         return sb.ToString();
     }
 
+    /// 追加响应头；名称与值都经 HeaderSafe 清洗（可链式）。
     HttpContext SetHeader(string name, string val) {
         if (this.headers == null) { this.headers = new List<string>(); }
         this.headers.Add(HttpContext.HeaderSafe(name) + ": "
@@ -484,6 +501,7 @@ class HttpContext {
         return this;
     }
 
+    /// 设置 HttpOnly + SameSite=Lax 的会话 cookie（可链式）。
     HttpContext SetCookie(string name, string val, int maxAgeSeconds) {
         if (this.headers == null) { this.headers = new List<string>(); }
         this.headers.Add("Set-Cookie: " + HttpContext.HeaderSafe(name) + "="
@@ -507,12 +525,14 @@ class HttpContext {
         return this;
     }
 
+    /// 以 text/html; charset=utf-8 应答并结束本请求。
     void Html(string html) {
         this.contentType = "text/html; charset=utf-8";
         this.body = html;
         this.ended = true;
     }
 
+    /// 以 text/plain; charset=utf-8 应答并结束本请求。
     void Text(string text) {
         this.contentType = "text/plain; charset=utf-8";
         this.body = text;
@@ -540,6 +560,7 @@ class HttpContext {
         return this.body.Length;
     }
 
+    /// 以 application/json 应答并结束本请求。
     void Json(string json) {
         this.contentType = "application/json";
         this.body = json;
@@ -579,6 +600,7 @@ class HttpContext {
         this.Json(Json.Serialize<ApiEnvelope>(o));
     }
 
+    /// 302 跳转：Location 经 HeaderSafe 清洗，正文为空。
     void Redirect(string url) {
         this.status = 302;
         this.statusText = "Found";
@@ -631,11 +653,13 @@ class HttpContext {
 
     HttpDeadlineToken DeadlineSlot() { return this.deadlineSlot; }
 
+    /// 由连接循环注入期限槽与空闲窗口（应用的 requestTimeoutMs）。
     void __SetDeadlineSlot(HttpDeadlineToken slot, int idleMs) {
         this.deadlineSlot = slot;
         this.streamIdleMs = idleMs;
     }
 
+    /// 由连接循环注入定界缓冲（WS 升级时从中切出管线其后的帧字节）。
     void __SetFramer(HttpFramer framer) { this.framer = framer; }
 
     /// <summary>Re-arms this connection's request deadline for another full
@@ -838,6 +862,9 @@ class HttpContext {
         return new WsSession(this.conn, reader, writer, asm, this);
     }
 
+    /// 序列化为完整 HTTP/1.1 报文：状态行、Content-Type/Length、依
+    /// keepAlive 的 Connection 头、Server 头，再接已清洗的自定义头。
+    /// 字节正文不并入（防 NUL 截断），由调用方按 BodyLength 另行发送。
     string BuildResponse(bool keepAlive) {
         StringBuilder sb = new StringBuilder();
         sb.Append("HTTP/1.1 ");
@@ -885,6 +912,7 @@ class HttpContext {
         return sb.ToString();
     }
 
+    /// 单个十进制数字的字面量（d 取 0–9）。
     static string Digit(int d) {
         if (d == 0) { return "0"; }
         if (d == 1) { return "1"; }
@@ -900,6 +928,7 @@ class HttpContext {
 
     // ---- helpers ----
 
+    /// 前缀判断（大小写敏感）。
     static bool StartsWith(string s, string prefix) {
         if (s.Length < prefix.Length) { return false; }
         return s.Substring(0, prefix.Length) == prefix;
@@ -956,11 +985,13 @@ class StrMap {
         this.map = null;
     }
 
+    /// 键数；尚未写入过为 0。
     int Count() {
         if (this.map == null) { return 0; }
         return this.map.Count;
     }
 
+    /// 写入键值（首次写入时才创建底层字典）。
     void Set(string key, string val) {
         if (this.map == null) {
             this.map = new Dictionary<string, string>();
@@ -968,19 +999,23 @@ class StrMap {
         this.map[key] = val;
     }
 
+    /// 是否含该键。
     bool Has(string key) {
         if (this.map == null) { return false; }
         return this.map.ContainsKey(key);
     }
 
+    /// 取值；缺失返回空串。
     string Get(string key) { return this.GetOr(key, ""); }
 
+    /// 取值；缺失返回 def。
     string GetOr(string key, string def) {
         if (this.map == null) { return def; }
         if (this.map.ContainsKey(key)) { return this.map[key]; }
         return def;
     }
 
+    /// 释放底层字典（回到未创建状态）。
     void Clear() {
         this.map = null;
     }

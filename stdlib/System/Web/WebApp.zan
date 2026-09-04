@@ -92,6 +92,10 @@ class WebApp {
     // callback (ServeSock) can reach it. Set by Server before Worker.RunAll.
     static WebApp active;
 
+    /// 构造应用服务器并填入默认配置：请求体上限 2MB、流式上传上限
+    /// 512MB、请求超时 30s、并发连接上限 10000、上传目录 uploads；
+    /// 共享表（限流/锁/路由统计）由 InitShared 在派生 worker 之前创建，
+    /// 不在这里。
     WebApp(string host, int port) {
         this.host = host;
         this.port = port;
@@ -124,8 +128,11 @@ class WebApp {
 
     string Host() { return this.host; }
     int Port() { return this.port; }
+    /// 加载视图目录（编译进内存）并返回自身。
     WebApp Views(string dir) { this.views = View.LoadDir(dir); return this; }
+    /// 内存请求体上限（字节），超出回答 413。
     WebApp MaxBody(int bytes) { this.maxBodyBytes = bytes; return this; }
+    /// 流式上传上限（字节），只作用于 [Upload] 路由，超出回答 413。
     WebApp MaxUpload(int bytes) { this.maxUploadBytes = bytes; return this; }
     /// <summary>How long one request may take to arrive and be served before
     /// the connection is closed. Applies per request, not per connection, so a
@@ -137,12 +144,15 @@ class WebApp {
     /// number of them is how a server dies rather than sheds load. 0 removes
     /// the cap.</summary>
     WebApp MaxConnections(int n) { this.maxConnections = n; return this; }
+    /// 流式上传的落盘目录（默认 uploads）。
     WebApp UploadDir(string dir) { this.uploadDir = dir; return this; }
+    /// 全局每秒请求上限，按 uid（匿名时按对端 IP）计；0 不限，超限 429。
     WebApp GlobalLimit(int perSecond) { this.globalLimit = perSecond; return this; }
     /// <summary>The sign-in page a navigation is sent to when the route needs a
     /// session it does not have. Unset (the default) answers every refusal with
     /// the JSON body, which is what an API-only server wants.</summary>
     WebApp LoginPath(string path) { this.loginPath = path; return this; }
+    /// 多进程部署时以 SO_REUSEPORT 监听，由内核把连接分发给各 worker。
     WebApp ReusePort(bool on) { this.reusePort = on; return this; }
     /// <summary>Initialise cross-process route stats. Called by InitShared;
     /// safe to call in every process -- a worker maps the master's table via
@@ -171,8 +181,8 @@ class WebApp {
         Worker.ShareHandle(WebApp.ShareRoute, this.router.StatsOsHandle());
     }
 
-    // Worker side: map the tables the master created and handed down. False in
-    // the master and in a single-process server, which create their own.
+    /// Worker 侧：映射主进程创建并下发的各表。主进程与单进程服务没有
+    /// 可继承句柄，返回 false，由它们自己建表。
     bool AttachShared() {
         long rate = Worker.InheritedHandle(WebApp.ShareRate);
         long lockTable = Worker.InheritedHandle(WebApp.ShareLock);
@@ -186,8 +196,7 @@ class WebApp {
         return true;
     }
 
-    // Created on demand; InitShared does it up front in the process that owns
-    // the tables.
+    /// 按需创建；拥有各表的进程已在 InitShared 里提前建好。
     RateLimiter Limiter() {
         if (this.limiter == null) { this.limiter = RateLimiter.Owned(1000); }
         return this.limiter;
@@ -197,9 +206,13 @@ class WebApp {
         if (this.locks == null) { this.locks = LockManager.Owned(); }
         return this.locks;
     }
+    /// 注册 before 钩子（按注册顺序执行；返回 false 短路请求）。
     WebApp Before(HookFn fn) { this.hooks.Before(fn); return this; }
+    /// 注册 after 钩子（请求结束后按注册顺序执行，收微秒耗时）。
     WebApp After(AfterFn fn) { this.hooks.After(fn); return this; }
+    /// 安装 token→用户解析器；未安装时用内置 Sessions 表解析。
     WebApp AuthResolver(AuthFn fn) { this.authResolver = fn; return this; }
+    /// 安装权限解析器；未安装时"任何已登录用户"即被允许。
     WebApp PermissionResolver(PermissionFn fn) { this.permissionResolver = fn; return this; }
 
     /// <summary>Generic route registration used by the compiler-generated
@@ -209,11 +222,16 @@ class WebApp {
         return this.router.Add(method, pattern, h);
     }
 
+    /// 注册 GET 路由（= Map("GET", ...)）。
     Route Get(string pattern, HttpHandler h) { return this.router.Get(pattern, h); }
+    /// 注册 POST 路由。
     Route Post(string pattern, HttpHandler h) { return this.router.Post(pattern, h); }
+    /// 注册 PUT 路由。
     Route Put(string pattern, HttpHandler h) { return this.router.Put(pattern, h); }
+    /// 注册 DELETE 路由。
     Route Delete(string pattern, HttpHandler h) { return this.router.Delete(pattern, h); }
 
+    /// 渲染模板并套最近的布局；未加载视图时返回空串。
     string RenderPage(string name, ViewData data) {
         if (this.views == null) { return ""; }
         return this.views.RenderPage(name, data);
@@ -227,6 +245,7 @@ class WebApp {
         return this.views.Render(name, data);
     }
 
+    /// 墙钟秒（CRT time），上传文件名与错误日志时间戳用。
     static int NowSeconds() { return time(0); }
 
     /// <summary>Trims a message before it reaches the error log so one runaway
@@ -286,6 +305,7 @@ class WebApp {
         return 0;
     }
 
+    /// 置停标志并关闭监听 socket，accept 循环随之退出。
     void Stop() {
         this.running = false;
         if (this.listener != null) { this.listener.Stop(); }
@@ -330,6 +350,11 @@ class WebApp {
         return true;
     }
 
+    /// 一条 keep-alive 连接的完整生命周期：读入并定界请求头（超 64KB 回
+    /// 431）→ 解析（定界失败按 parseStatus 回 400/501）→ 流式上传落盘或
+    /// 缓冲内存正文（超限 413）→ 解析表单 → Dispatch → 写回应答，直到
+    /// 对端断开或非 keep-alive 为止。每个请求重置一次空闲期限（防
+    /// slowloris）；SSE/WS 劫持的连接由 handler 接管，循环随即结束。
     async void HandleConnection(nint clientSock) {
         Socket.SetNoDelay(clientSock);
         TcpClient client = TcpClient.FromSocket(clientSock);
@@ -564,6 +589,10 @@ class WebApp {
         return resp;
     }
 
+    /// 认证之后的请求管线，按序：全局限流 → before 钩子 → 404/405 →
+    /// 填路由元数据 → 路由限流 → 登录/权限门 → [Lock] 请求锁 → handler。
+    /// ApiError 变成它携带的应答；其余异常记录后回答 500，handler 结束
+    /// 时仍未写应答的也兜底 500。
     async string DispatchInner(HttpContext ctx, Route route, bool keepAlive, long startUs) {
 
         string uid = await this.AuthUser(ctx);
@@ -772,6 +801,8 @@ class WebApp {
         return this.metrics.SeriesJson(seconds);
     }
 
+    /// 构造一条完整的 HTTP/1.1 JSON 应答字符串（Connection: close），
+    /// 用于 HttpContext 尚不存在的早期拒绝（413/431/503、定界失败）。
     static string SimpleResponse(int code, string text, string msg) {
         JsonValue o = JsonValue.NewObject();
         o.Put("code", JsonValue.NewStr(Convert.ToString(code)));
@@ -783,6 +814,8 @@ class WebApp {
             + "\r\nConnection: close\r\n\r\n" + body;
     }
 
+    /// 报文中头部块的结束位置（"\n\n" 或 "\n\r\n" 之后的首下标）；
+    /// 没有空行返回 -1。
     static int FindHeaderEnd(string raw) {
         int n = raw.Length;
         for (int i = 0; i < n; i = i + 1) {
@@ -806,7 +839,9 @@ class WebApp {
 class WebHost {
     static WebApp instance;
 
+    /// 登记当前应用（main 启动时调用一次）。
     static void Use(WebApp app) { WebHost.instance = app; }
+    /// 当前应用；未设置时为 null。
     static WebApp Current() { return WebHost.instance; }
 }
 
@@ -833,7 +868,9 @@ class Hooks {
         this.after = new List<AfterFn>();
     }
 
+    /// 注册 before 钩子。
     void Before(HookFn fn) { this.before.Add(fn); }
+    /// 注册 after 钩子。
     void After(AfterFn fn) { this.after.Add(fn); }
 
     /// <summary>Runs before-hooks in order; false = request short-circuited.</summary>
@@ -845,6 +882,7 @@ class Hooks {
         return true;
     }
 
+    /// 按注册顺序执行全部 after 钩子（不可短路）。
     void RunAfter(HttpContext ctx, long elapsedUs) {
         for (int i = 0; i < this.after.Count; i = i + 1) {
             AfterFn fn = this.after[i];
@@ -863,11 +901,13 @@ class RateLimiter {
     SharedTable table;
     int windowMs;
 
+    /// 构造限流器；windowMs 为固定窗口宽度（毫秒），非正数忽略。
     RateLimiter(int windowMs) {
         if (windowMs > 0) { this.windowMs = windowMs; }
     }
 
     // The counters, before they are given a home: 65536 keys of route/ip/token.
+    /// 新建计数表：65536 个键位，每键 count 与 window_start 两列。
     static SharedTable NewTable() {
         SharedTable t = new SharedTable("", 65536);
         t.KeySize(192);
@@ -911,12 +951,15 @@ class RateLimiter {
         return this.table.OsHandle();
     }
 
+    /// 本窗口内 key 是否仍允许通过：limit<=0 恒允许；表未就绪一律拒绝
+    /// （fail closed，被限流的路由不会悄悄放开）。
     bool Allow(string key, int limit) {
         if (limit <= 0) { return true; }
         if (this.table == null) { return false; }
         return this.table.RateAllow(key, -1, this.windowMs, limit);
     }
 
+    /// key 当前窗口已计的请求数；表未就绪返回 0。
     int CountOf(string key) {
         if (this.table == null) { return 0; }
         return (int)this.table.GetInt(key, "count");
@@ -1026,6 +1069,9 @@ class WebServer {
     // every process (the master creates it, workers open the same memory), and
     // the pipeline is plugged into the worker as a raw-connection handler so
     // routing/hooks/uploads run exactly as they do single-process.
+    /// 多进程路径的公共装配：初始化共享表、登记活动应用，再建一个
+    /// `count` worker 的 Worker，把 ServeSock 接为原始连接回调，使
+    /// 路由/钩子/上传管线与单进程完全一致；daemon 时以守护进程运行。
     static void Prepare(WebApp app, int count, bool daemon) {
         app.InitShared();
         WebApp.SetActive(app);

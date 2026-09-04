@@ -539,10 +539,12 @@ class Python {
 
     // ---- 内部实现 --------------------------------------------------------
 
+    /// 未解析运行时时自动 Initialize。
     static void EnsureReady() {
         if (!Python.resolved) { Python.Initialize(); }
     }
 
+    /// 定位并加载可用的 CPython DLL、解析全部入口点；成功后缓存结果。
     static bool TryResolve() {
         if (Python.resolved) { return true; }
         if (Python.mod == 0) {
@@ -568,6 +570,8 @@ class Python {
         return true;
     }
 
+    /// 解析全部入口点地址；关键符号（Py_Initialize / PyRun_SimpleString）
+    /// 缺失时返回 false。
     static bool ResolveSymbols() {
         Python.addr_init = Interop.Symbol(Python.mod, "Py_Initialize");
         Python.addr_isInit = Interop.Symbol(Python.mod, "Py_IsInitialized");
@@ -611,6 +615,7 @@ class Python {
         return Python.addr_init != 0 && Python.addr_runSimple != 0;
     }
 
+    /// 卸载运行时并清空全部符号地址（解释器须已先经 Finalize 关闭）。
     static void FreeModule() {
         if (Python.mod != 0) {
             Interop.Unload(Python.mod);
@@ -657,6 +662,7 @@ class Python {
         Python.addr_dictSetItemString = 0;
     }
 
+    /// Py_DecRef：递减引用计数；0 为 no-op。
     static void DecRef(nint obj) {
         if (obj != 0) {
             PyVoid1Fn f = (PyVoid1Fn)Python.addr_decRef;
@@ -664,6 +670,7 @@ class Python {
         }
     }
 
+    /// Py_IncRef：递增引用计数；0 为 no-op。
     static void IncRef(nint obj) {
         if (obj != 0) {
             PyVoid1Fn f = (PyVoid1Fn)Python.addr_incRef;
@@ -672,6 +679,10 @@ class Python {
     }
 }
 
+/// <summary>
+/// PyCFunction_New 登记的 PyMethodDef* 与名称缓冲区：callable 一直
+/// 引用它们，故缓存到 Finalize 统一释放（见 <see cref="Python"/>）。
+/// </summary>
 class PyRegisteredDef {
     nint def;
     nint name;
@@ -702,6 +713,7 @@ class PyObject {
     /// <summary>该对象是 Python 空指针时为 true（罕见）。</summary>
     bool IsNull() { return this.handle == 0; }
 
+    /// ARC 回收包装时释放底层引用（Py_DECREF）。
     ~PyObject() {
         if (this.handle != 0) {
             Python.DecRef(this.handle);
@@ -819,22 +831,27 @@ class PyObject {
         return self.Call1(Python.FromStr(a));
     }
 
+    /// 运算符重载：fn(a)，a 封送为 double。
     static PyObject op_call(PyObject self, double a) {
         return self.Call1(Python.FromDouble(a));
     }
 
+    /// 运算符重载：fn(a)，a 封送为 long。
     static PyObject op_call(PyObject self, long a) {
         return self.Call1(Python.FromLong(a));
     }
 
+    /// 运算符重载：fn(a)，a 封送为 bool。
     static PyObject op_call(PyObject self, bool a) {
         return self.Call1(Python.FromBool(a));
     }
 
+    /// 运算符重载：fn(a)，a 为另一个 PyObject。
     static PyObject op_call(PyObject self, PyObject a) {
         return self.Call1(a);
     }
 
+    /// 运算符重载：fn(a, b, ...)，参数逐一封送为 double。
     static PyObject op_call(PyObject self, params double[] args) {
         PyObject[] py = new PyObject[args.Length];
         for (int i = 0; i < args.Length; i = i + 1) {
@@ -843,6 +860,7 @@ class PyObject {
         return self.Call(py);
     }
 
+    /// 运算符重载：fn(a, b, ...)，参数逐一封送为 string。
     static PyObject op_call(PyObject self, params string[] args) {
         PyObject[] py = new PyObject[args.Length];
         for (int i = 0; i < args.Length; i = i + 1) {
@@ -851,6 +869,7 @@ class PyObject {
         return self.Call(py);
     }
 
+    /// 运算符重载：fn(a, b, ...)，参数逐一封送为 long。
     static PyObject op_call(PyObject self, params long[] args) {
         PyObject[] py = new PyObject[args.Length];
         for (int i = 0; i < args.Length; i = i + 1) {
@@ -859,6 +878,7 @@ class PyObject {
         return self.Call(py);
     }
 
+    /// 运算符重载：fn(a, b, ...)，参数逐一封送为 bool。
     static PyObject op_call(PyObject self, params bool[] args) {
         PyObject[] py = new PyObject[args.Length];
         for (int i = 0; i < args.Length; i = i + 1) {
@@ -867,6 +887,7 @@ class PyObject {
         return self.Call(py);
     }
 
+    /// 运算符重载：fn(a, b, ...)，参数均为 PyObject。
     static PyObject op_call(PyObject self, params PyObject[] args) {
         return self.Call(args);
     }
@@ -959,6 +980,8 @@ class PyObject {
         return this.CallTuple(t);
     }
 
+    /// 经 PyObject_Call 以预构建的参数元组调用，并释放元组引用；
+    /// 失败时打印错误栈并抛出异常。
     PyObject CallTuple(nint tuple) {
         PyNint2Fn f = (PyNint2Fn)Python.addr_call;
         nint h = f(this.handle, tuple, 0);
@@ -1055,6 +1078,7 @@ class PyObject {
 }
 
 // ---- PyCFunction 回调形式：PyObject* (*)(PyObject*, PyObject*) ------
+/// PyCFunction 回调形式：PyObject* (*)(PyObject* self, PyObject* args)。
 delegate nint PyCFunction(nint self, nint args);
 
 // ---- 已解析入口点的内部调用形式 -----------------------

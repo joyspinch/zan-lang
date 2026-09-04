@@ -5,6 +5,7 @@ using System.Text;
 
 namespace System.Knowledge;
 
+/// <summary>Generate 的产物：schema JSON、控件清单文本、控件数与解析告警。</summary>
 class ZformResult {
     string json;
     string controlsText;
@@ -18,6 +19,7 @@ class ZformResult {
     }
 }
 
+/// <summary>一个设计器属性的静态视图：键、标签、类型、别名、选项、步长/范围等。</summary>
 class KnowledgeProp {
     string variable;
     string key;
@@ -36,6 +38,7 @@ class KnowledgeProp {
     }
 }
 
+/// <summary>一个控件类的静态视图：名称、来源位置、样式 Kind、属性/事件清单与工厂标记。</summary>
 class KnowledgeControl {
     string name;
     string file;
@@ -58,6 +61,9 @@ class KnowledgeControl {
 
 /// Static source reader for the .zform schema and control catalogue.
 class ZformSchema {
+    /// 生成 schema 文档：沿用 docPath 文档骨架的各节，扫描 stdlib 与
+    /// root 下全部 .zan，把声明了 Props() 覆写的控件类整理成 controls
+    /// 数组；返回 JSON、按名排序的控件清单与解析告警。
     static ZformResult Generate(string root, string stdlib, string docPath) {
         ZformResult result = new ZformResult();
         JsonValue doc = JsonValue.Parse(File.ReadAllText(docPath));
@@ -86,6 +92,7 @@ class ZformSchema {
         return result;
     }
 
+    /// 递归扫描目录下全部 .zan 文件。
     static void ScanDir(string dir, string root, string stdlib,
                         List<KnowledgeControl> outp, ZformResult result) {
         if (!Directory.Exists(dir)) { return; }
@@ -101,6 +108,10 @@ class ZformSchema {
         }
     }
 
+    /// 扫描单个 .zan：只关心声明了 Props() 覆写（override List&lt;PropSpec&gt;
+    /// 那个签名）的顶层类，为每个类读出一个控件条目；花括号不平衡记告警。
+    /// 注意：本文件注释里不能出现与该签名逐字相同的文本——
+    /// tests/run_zform_schema.cmake 逐行扫描时不排除注释行。
     static void ScanFile(string path, string root, string stdlib,
                           List<KnowledgeControl> outp, ZformResult result) {
         string text = File.ReadAllText(path);
@@ -148,6 +159,9 @@ class ZformSchema {
         }
     }
 
+    /// 读取一个控件类：Kind() 的样式名、Props() 里的属性声明/链式配置/
+    /// ps.Add 顺序、Events() 里 e.Add 的事件名；是否调用 base.Props()
+    /// 记入 inheritsBase。
     static KnowledgeControl ReadControl(string name, int line, string path,
                                         string root, string stdlib, string header,
                                         string body, ZformResult result) {
@@ -239,6 +253,8 @@ class ZformSchema {
         return c;
     }
 
+    /// 解析一行 "PropSpec.Xxx(...)" 声明：取构造器 kind、key、label 与
+    /// 左侧变量名；缺 key/label 或既无变量也非内联 ps.Add 返回 null。
     static KnowledgeProp ReadProp(string line, int at) {
         int kindAt = at + 9;
         int open = ZformSchema.Find(line, "(", kindAt);
@@ -260,6 +276,8 @@ class ZformSchema {
         return p;
     }
 
+    /// 解析一个属性的链式配置：Also（别名，"|" 连接）、WithTip、
+    /// Option（选项，"|" 连接）、Step(step,lo,hi)（范围）与 StepBy(step)。
     static void ReadChainText(string line, KnowledgeProp p) {
         int at = ZformSchema.Find(line, "Also(", 0);
         while (at >= 0) {
@@ -303,6 +321,8 @@ class ZformSchema {
         }
     }
 
+    /// 控件条目的 JSON 视图：name/file/line/styleKind/designer/creatable/
+    /// generic/inheritsBase/defaultOf/events（含 common 标记）/props。
     static JsonValue ControlJson(KnowledgeControl c) {
         JsonValue o = JsonValue.NewObject();
         o.Put("name", JsonValue.NewStr(c.name));
@@ -367,8 +387,10 @@ class ZformSchema {
         return o;
     }
 
+    /// ControlFactory 里 Kinds()/Create() 方法体的缓存。
     static string factoryKinds = "";
     static string factoryCreate = "";
+    /// 读入 ControlFactory 的 Kinds()/Create() 方法体，供逐控件判定。
     static void ReadFactories(string stdlib) {
         string f = stdlib + "/Gui/ControlFactory.zan";
         if (!File.Exists(f)) { return; }
@@ -376,16 +398,20 @@ class ZformSchema {
         factoryKinds = ZformSchema.MethodBody(s, "Kinds");
         factoryCreate = ZformSchema.MethodBody(s, "Create");
     }
+    /// 判定单个控件：名字出现在工厂 Kinds() 名单即 designer，
+    /// Create() 里有 "new <名>(" 即 creatable。
     static void ReadFactories(KnowledgeControl c) {
         string kinds = ZformSchema.factoryKinds;
         string create = ZformSchema.factoryCreate;
         c.designer = ZformSchema.Find(kinds, "\"" + c.name + "\"", 0) >= 0;
         c.creatable = ZformSchema.Find(create, "new " + c.name + "(", 0) >= 0;
     }
+    /// 拥有字符串默认值概念的控件（ListView/Dropdown/DataGrid）；其余为空。
     static string DefaultOf(string n) {
         if (n == "ListView" || n == "Dropdown" || n == "DataGrid") { return "string"; }
         return "";
     }
+    /// PropSpec 构造器名 → schema 类型名（未知为空串）。
     static string PropType(string k) {
         if (k == "Text") { return "text"; }
         if (k == "Int") { return "integer"; }
@@ -395,6 +421,7 @@ class ZformSchema {
         if (k == "Section") { return "section"; }
         return "";
     }
+    /// 是否所有控件共有的通用事件（点击/键盘/手势/生命周期等固定名单）。
     static bool Common(string e) {
         string[] a = new string[]{"Click","DoubleClick","RightClick","MouseDown","MouseUp",
             "Enter","Leave","Move","Wheel","Focus","Blur","KeyDown","KeyUp","KeyPress",
@@ -402,12 +429,14 @@ class ZformSchema {
         for (int i = 0; i < a.Length; i = i + 1) { if (a[i] == e) { return true; } }
         return false;
     }
+    /// 控件名排序后逐行拼接（控件清单文本）。
     static string Manifest(List<string> a) {
         ZformSchema.SortStrings(a);
         StringBuilder b = new StringBuilder();
         for (int i = 0; i < a.Count; i = i + 1) { b.Append(a[i]); b.Append("\n"); }
         return b.ToString();
     }
+    /// 插入排序（就地升序；名单很短）。
     static void SortStrings(List<string> a) {
         for (int i = 1; i < a.Count; i = i + 1) {
             string x = a[i]; int j = i - 1;
@@ -415,24 +444,28 @@ class ZformSchema {
             a[j + 1] = x;
         }
     }
+    /// 按变量名在已声明/已排序两份属性列表里查找属性。
     static KnowledgeProp ByVar(List<KnowledgeProp> a, List<KnowledgeProp> b,
                                string v) {
         for (int i = 0; i < a.Count; i = i + 1) { if (a[i].variable == v) { return a[i]; } }
         for (int i = 0; i < b.Count; i = i + 1) { if (b[i].variable == v) { return b[i]; } }
         return null;
     }
+    /// 按变量名去重后追加（保持 ps.Add 的声明顺序）。
     static void AddOrdered(List<KnowledgeProp> a, KnowledgeProp p) {
         for (int i = 0; i < a.Count; i = i + 1) {
             if (a[i].variable == p.variable) { return; }
         }
         a.Add(p);
     }
+    /// 记一条解析告警（相对路径:行号: 行内容）。
     static void Warn(ZformResult result, string path, string root, string stdlib,
                      int classLine, int offset, string line, string reason) {
         result.warnings.Add(reason + " at " + ZformSchema.Rel(root, stdlib, path)
             + ":" + Convert.ToString(classLine + offset) + ": "
             + ZformSchema.Trim(line));
     }
+    /// 提取 "override string Xxx()" 方法体里第一个 return 的字符串字面量。
     static string ReturnString(string body, string method) {
         int signature = ZformSchema.Find(body,
             "override string " + method + "()", 0);
@@ -452,6 +485,7 @@ class ZformSchema {
         }
         return "";
     }
+    /// 按已知签名（Props/Events/Kinds/Create）提取方法体原文。
     static string MethodBody(string body, string name) {
         string signature = "";
         if (name == "Props") {
@@ -472,6 +506,7 @@ class ZformSchema {
         int close = ZformSchema.Match(maskedBody, open);
         return close > open ? body.Substring(open + 1, close - open - 1) : "";
     }
+    /// 方法体开 '{' 在文本中的行偏移（告警定位用）。
     static int MethodLineOffset(string body, string name) {
         string signature = "";
         if (name == "Props") {
@@ -495,10 +530,12 @@ class ZformSchema {
         }
         return lines;
     }
+    /// 类体是否声明了 Props() 覆写。
     static bool HasProps(string body) {
         string signature = "override List<PropSpec> " + "Props()";
         return ZformSchema.Find(body, signature, 0) >= 0;
     }
+    /// 路径规范化为显示用："stdlib/..." 或相对 root；其余原样。
     static string Rel(string root, string stdlib, string path) {
         string p = ZformSchema.Replace(path, "\\", "/");
         string s = ZformSchema.Replace(stdlib, "\\", "/");
@@ -507,6 +544,7 @@ class ZformSchema {
         if (ZformSchema.Starts(p, r + "/")) { return p.Substring(r.Length + 1, p.Length - r.Length - 1); }
         return p;
     }
+    /// 每行起始处的花括号深度（行内容计入前一行之后的差量）。
     static List<int> DepthLines(string s) {
         List<int> a = new List<int>(); int d = 0; int start = 0;
         for (int i = 0; i <= s.Length; i = i + 1) {
@@ -521,6 +559,8 @@ class ZformSchema {
         }
         return a;
     }
+    /// 把字符串/字符字面量与注释抹成空格（保留换行），供签名查找与
+    /// 括号配对不受字面量干扰。
     static string Mask(string s) {
         StringBuilder b = new StringBuilder(); bool str = false; bool chr = false; bool block = false;
         for (int i = 0; i < s.Length; i = i + 1) {
@@ -534,28 +574,50 @@ class ZformSchema {
         }
         return b.ToString();
     }
+    /// 与 open 处 '{' 配对的 '}' 下标；无则 -1。
     static int Match(string s, int open) {
         int d = 0; for (int i = open; i < s.Length; i = i + 1) { string c = s.Substring(i, 1); if (c == "{") { d = d + 1; } else if (c == "}") { d = d - 1; if (d == 0) { return i; } } } return -1;
     }
+    /// 按 '\n' 切行（丢弃 '\r'）。
     static List<string> Lines(string s) { List<string> r = new List<string>(); StringBuilder b = new StringBuilder(); for (int i = 0; i < s.Length; i = i + 1) { string c = s.Substring(i, 1); if (c == "\n") { r.Add(b.ToString()); b = new StringBuilder(); } else if (c != "\r") { b.Append(c); } } r.Add(b.ToString()); return r; }
+    /// 去除首尾空格/制表符。
     static string Trim(string s) { int a = 0; int b = s.Length; while (a < b && (s.Substring(a,1)==" " || s.Substring(a,1)=="\t")) { a = a + 1; } while (b > a && (s.Substring(b-1,1)==" " || s.Substring(b-1,1)=="\t")) { b = b - 1; } return s.Substring(a,b-a); }
+    /// 前缀判断。
     static bool Starts(string s, string p) { return s.Length >= p.Length && s.Substring(0,p.Length)==p; }
+    /// 后缀判断。
     static bool Ends(string s, string p) { return s.Length >= p.Length && s.Substring(s.Length-p.Length,p.Length)==p; }
+    /// 从 at 起查找子串首次出现，返回下标；无则 -1。
     static int Find(string s, string p, int at) { for (int i = at; i + p.Length <= s.Length; i = i + 1) { if (s.Substring(i,p.Length)==p) { return i; } } return -1; }
+    /// 全部替换（无正则）。
     static string Replace(string s, string a, string b) { StringBuilder q = new StringBuilder(); int i=0; while(i<s.Length){if(i+a.Length<=s.Length&&s.Substring(i,a.Length)==a){q.Append(b);i=i+a.Length;}else{q.Append(s.Substring(i,1));i=i+1;}}return q.ToString(); }
+    /// 关键字 w 之后的标识符。
     static string AfterWord(string s, string w) { int p=Find(s,w,0)+w.Length; while(p<s.Length&&(s.Substring(p,1)==" "||s.Substring(p,1)=="\t")){p=p+1;} int e=p; while(e<s.Length&&IsIdentChar(s.Substring(e,1))){e=e+1;} return s.Substring(p,e-p); }
+    /// w 是否作为独立单词出现（两侧均非标识符字符）。
     static bool Word(string s,string w){int p=Find(s,w,0);return p>=0&&(p==0||!IsIdentChar(s.Substring(p-1,1)))&&(p+w.Length==s.Length||!IsIdentChar(s.Substring(p+w.Length,1))); }
+    /// 标识符字符：字母/数字/下划线。
     static bool IsIdentChar(string c){return (c>="a"&&c<="z")||(c>="A"&&c<="Z")||(c>="0"&&c<="9")||c=="_"; }
+    /// 从 p 起的标识符。
     static string WordAt(string s,int p){int e=p;while(e<s.Length&&IsIdentChar(s.Substring(e,1))){e=e+1;}return s.Substring(p,e-p);}
+    /// 跳过空白后从 p 起的标识符。
     static string Identifier(string s,int p){while(p<s.Length&&(s.Substring(p,1)==" "||s.Substring(p,1)=="\t")){p=p+1;}int e=p;while(e<s.Length&&IsIdentChar(s.Substring(e,1))){e=e+1;}return s.Substring(p,e-p);}
+    /// p 之前（跳过空白）最近的标识符。
     static string IdentifierBack(string s,int p){int e=p-1;while(e>=0&&(s.Substring(e,1)==" "||s.Substring(e,1)=="\t")){e=e-1;}int b=e;while(b>=0&&IsIdentChar(s.Substring(b,1))){b=b-1;}return s.Substring(b+1,e-b);}
+    /// 参数列表（open 为 '(' 下标）里第 n 个引号实参；不足为空串。
     static string QuotedArg(string s,int open,int n){int cur=open+1;int idx=0;while(cur<s.Length){while(cur<s.Length&&(s.Substring(cur,1)==" "||s.Substring(cur,1)==",")){cur=cur+1;}if(cur>=s.Length||s.Substring(cur,1)!="\""){return "";}int e=Find(s,"\"",cur+1);if(e<0){return "";}if(idx==n){return s.Substring(cur+1,e-cur-1);}idx=idx+1;cur=e+1;while(cur<s.Length&&s.Substring(cur,1)!=","){if(s.Substring(cur,1)==")"){return "";}cur=cur+1;}}return "";}
+    /// key 之后的第一个引号字符串。
     static string QuotedAfter(string s,string key){int p=Find(s,key,0);if(p<0){return "";}int q=Find(s,"\"",p+key.Length);if(q<0){return "";}int e=Find(s,"\"",q+1);return e>q?s.Substring(q+1,e-q-1):"";}
+    /// 按逗号切分并去空白。
     static List<string> SplitComma(string s){return Split(s,",");}
+    /// 按分隔符切分并去空白。
     static List<string> Split(string s,string sep){List<string> r=new List<string>();int b=0;for(int i=0;i<=s.Length;i=i+1){if(i==s.Length||s.Substring(i,1)==sep){r.Add(Trim(s.Substring(b,i-b)));b=i+1;}}return r;}
+    /// 宽松整数解析：数字前缀即取值，其余截断。
     static int Int(string s){string t=Trim(s);int sign=1;int i=0;if(t.StartsWith("-")){sign=-1;i=1;}int n=0;while(i<t.Length){string c=t.Substring(i,1);if(c<"0"||c>"9"){break;}n=n*10+(c[0]-48);i=i+1;}return n*sign;}
+    /// 原样返回（历史占位）。
     static string Without(string s){return s;}
+    /// 列表是否含该字符串。
     static bool Has(List<string>a,string x){for(int i=0;i<a.Count;i=i+1){if(a[i]==x){return true;}}return false;}
+    /// 下标 p 所在行号（1 起）。
     static int LineAt(string s,int p){int n=1;for(int i=0;i<p&&i<s.Length;i=i+1){if(s.Substring(i,1)=="\n"){n=n+1;}}return n;}
+    /// p 之后下一个换行的下标（无则文末）。
     static int NextLine(string s,int p){int i=Find(s,"\n",p);return i<0?s.Length:i;}
 }
