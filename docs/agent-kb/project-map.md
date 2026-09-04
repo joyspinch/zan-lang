@@ -18,7 +18,7 @@
 | `stdlib/` | **Zan** | 标准库：`System`（核心/IO/网络/DB/文本）、`Gui`、`Game`、`Platform`、`Sdk`、`SDL3` |
 | `templates/` | 混合 | IDE"新建项目"模板（`console/ gui/ library/ server/`） |
 | `tests/` | 混合 | 测试用例（见 [testing.md](testing.md)） |
-| `examples/` | Zan | 示例与真实项目（`examples/game/ra2` 等） |
+| `examples/` | Zan | 示例与真实项目（`templates/game/ra2` 等） |
 | `scripts/` | PowerShell/Python | 构建、打包、测试、截图、驱动 UI 的脚本 |
 | `docs/` | md | 规范与设计文档；本知识库在 `docs/agent-kb/` |
 | `build/` | — | 唯一的构建输出目录（`zanc.exe`、`ZanIDE.exe`、测试 exe、驱动 DLL） |

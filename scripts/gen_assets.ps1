@@ -1,6 +1,6 @@
 # Manifest-driven asset generator using the configured image model.
 # Reads secrets.local.ps1 for OPENAI_API_KEY / OPENAI_BASE_URL and a JSON
-# manifest: [{ "prompt": "...", "out": "examples/game/x/assets/y.png",
+# manifest: [{ "prompt": "...", "out": "templates/game/x/assets/y.png",
 #              "size": "1024x1024", "background": "transparent" }, ...]
 param(
     [Parameter(Mandatory = $true)][string]$Manifest,

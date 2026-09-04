@@ -232,7 +232,7 @@ smoke/standard 档）。皮肤命名空间 `numberanim`（base.css 三处：size
 - 守门测试 `policy_no_widget_drawing`（smoke 层）扫 `examples/` 与 `templates/`，
   出现 `FillSector/DrawSector/FillArc/DrawArc/FillPie/DrawPie` 直接失败并打印行号。
   这些原语除了表盘/圆环/饼图没别的用处，所以是很准的信号。
-- 游戏例外（`examples/game/`）：游戏本来就自己渲染整个场景，不是在冒充控件。
+- 游戏例外（`templates/game/`）：游戏本来就自己渲染整个场景，不是在冒充控件。
 - 示例画自己的外壳（面板、标题、表格行这些 `FillRect`/`DrawText`）是允许的——
   界限是「有没有在重画一个已经存在的控件」。
 - 审过一遍的结论（2026-08）：`examples/`、`templates/` 里没有 HMI/图表自绘，

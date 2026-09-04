@@ -10,8 +10,8 @@
 # 的 CLI 壳），本脚本只做文件收集与参数拼装，不实现任何加密。
 #
 # 用法示例：
-#   scripts\pack_game.ps1 -Project examples/game/snake                # 全默认
-#   scripts\pack_game.ps1 -Project examples/game/legend -SignKeyPem k.pem -KeepPlain
+#   scripts\pack_game.ps1 -Project templates/game/snake              # 全默认
+#   scripts\pack_game.ps1 -Project templates/game/legend -SignKeyPem k.pem -KeepPlain
 #
 # 密钥策略：
 #   -KeyHex 直接给 64 hex（复现/测试）；否则若 zrp.keys/<name>.share_[ab].hex

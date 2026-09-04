@@ -36,9 +36,9 @@ $sdlLibDir = Join-Path $sdlLibDir "x86_64-w64-mingw32\lib"
 
 Write-Output "[1/2] Compiling legend_hud.exe ..."
 & $zanc `
-    examples/game/legend/main.zan examples/game/legend/Game.zan examples/game/legend/Data.zan `
+    templates/game/legend/src/main.zan templates/game/legend/src/Game.zan templates/game/legend/src/Data.zan `
     --auto-stdlib `
-    --embed examples/game/legend/assets=examples/game/legend/assets `
+    --embed templates/game/legend/assets=templates/game/legend/assets `
     --embed stdlib/Game/Kit/assets=assets/common `
     --libpath build `
     --link-lib zan_gui_sdl_static `
