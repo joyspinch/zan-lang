@@ -270,12 +270,109 @@ class FormFill : AdminController {
         }
         d.Set("formId", Convert.ToString(def.id));
         d.Set("formName", def.name);
+        d.Set("canExport", await this.Can(PermBit.Export) ? "1" : "");
         d.Set("empty", total == 0 ? "1" : "");
         this.Pager(d, q, total);
         this.Page(d);
     }
 
     /* ---- helpers ---- */
+
+    /* CSV/XLSX 导出（T7 ExcelIo 范式）：列头=固定列+快照字段 label，
+       行值=Parse(dataJson) 按 code 取值（checkbox 数组逗号连接、
+       attachment 出行挂载附件文件名清单——附件按行挂载不分字段，多个
+       attachment 字段共享同一清单，一期口径）。只导已提交（status=1，
+       草稿是未完成数据不进报表）；范围默认全部（管理员复核），mine=1
+       只导本人。下载名过 Attachment.BaseName（防头注入，同私信附件）。 */
+    [HttpGet]
+    [Custom(Perm = PermBit.Export)]
+    [Description("导出提交记录")]
+    async void Export() {
+        User me = await this.Admin();
+        int formId = this.InInt("formId", 0);
+        bool mine = this.InInt("mine", 0) == 1;
+        bool xlsx = this.InInt("xlsx", 0) == 1;
+        OaFormDef def = await this.OaFormDef
+            .Where(a => a.id == formId && a.tenantId == this.TenantId())
+            .FirstAsync();
+        if (def == null) { this.Fail(404, "0404", "表单不存在"); return; }
+        List<OaFormData> rows = await this.OaFormData
+            .Where(a => a.tenantId == this.TenantId() && a.formId == def.id
+                && a.status == 1)
+            .WhereIf(mine, a => a.submitterId == me.id)
+            .OrderBy(a => a.id).ToListAsync();
+        JsonValue schema = JsonValue.ParseLenient(def.schemaJson);
+        JsonValue fields = null;
+        if (schema != null && schema.IsObject()) { fields = schema.Get("fields"); }
+        List<string> headers = new List<string>();
+        headers.Add("提交人"); headers.Add("提交时间"); headers.Add("流程状态");
+        List<string> codes = new List<string>();
+        List<string> types = new List<string>();
+        if (fields != null && fields.IsArray()) {
+            for (int i = 0; i < fields.Count(); i = i + 1) {
+                JsonValue f = fields.At(i);
+                if (f == null || !f.IsObject()) { continue; }
+                codes.Add(f.Str("code", ""));
+                types.Add(f.Str("type", ""));
+                headers.Add(f.Str("label", f.Str("code", "")));
+            }
+        }
+        List<User> users = await this.User
+            .Where(a => a.tenantId == this.TenantId()).ToListAsync();
+        List<FlowInst> insts = await this.FlowInst
+            .Where(a => a.tenantId == this.TenantId()).ToListAsync();
+        List<List<string>> data = new List<List<string>>();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            OaFormData r = rows[i];
+            FlowInst inst = FormFill.FindInst(insts, r.instId);
+            List<string> cells = new List<string>();
+            cells.Add(FormFill.UserName(users, r.submitterId));
+            cells.Add(Fmt.Stamp(r.createdAt));
+            cells.Add(FormFill.BadgeText(r, inst));
+            JsonValue dv = JsonValue.ParseLenient(r.dataJson);
+            List<OaAttachment> atts = null;
+            for (int j = 0; j < codes.Count; j = j + 1) {
+                string val = "";
+                if (types[j] == "attachment") {
+                    if (atts == null) {
+                        atts = await this.OaAttachment
+                            .Where(a => a.tenantId == this.TenantId()
+                                && a.module == "form" && a.relatedId == r.id)
+                            .OrderBy(a => a.id).ToListAsync();
+                    }
+                    for (int k = 0; k < atts.Count; k = k + 1) {
+                        val = val.Length == 0 ? atts[k].fileName
+                            : val + "," + atts[k].fileName;
+                    }
+                } else if (dv != null && dv.IsObject()) {
+                    JsonValue v = dv.Get(codes[j]);
+                    if (v != null && !v.IsNull()) {
+                        if (v.IsArray()) {
+                            for (int k = 0; k < v.Count(); k = k + 1) {
+                                string one = v.At(k).AsString("");
+                                if (one.Length == 0) { continue; }
+                                val = val.Length == 0 ? one : val + "," + one;
+                            }
+                        } else {
+                            val = v.AsString("");
+                        }
+                    }
+                }
+                cells.Add(val.Replace("\r", " ").Replace("\n", " "));
+            }
+            data.Add(cells);
+        }
+        await ExcelIo.Download(this.Ctx(),
+            Attachment.BaseName(def.name) + "-提交记录", headers, data, xlsx);
+    }
+
+    static FlowInst FindInst(List<FlowInst> insts, int instId) {
+        if (instId <= 0) { return null; }
+        for (int i = 0; i < insts.Count; i = i + 1) {
+            if (insts[i].id == instId) { return insts[i]; }
+        }
+        return null;
+    }
 
     /* 逐字段收集表单值（schema 顺序遍历，值缺失=未填不入对象）。
        checkbox 组：admin.js 把 f_<code>[] 合并为逗号串（选项本身不含
