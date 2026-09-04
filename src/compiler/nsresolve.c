@@ -875,6 +875,11 @@ void zan_nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena, zan_diag_t *dia
     c.arena = arena;
     c.diag = diag;
     c.count = 0;
+    /* Only zan_nsresolve_prune installs the ref hook; leaving this as stack
+     * residue made nr_walk's `if (c->refs)` dereference garbage whenever a
+     * prior phase happened to leave a stale pointer in the slot (input- and
+     * layout-dependent SEGV, e.g. `using System` + string concat). */
+    c.refs = NULL;
     c.shadow.items = NULL;
     c.shadow.count = 0;
     c.shadow.cap = 0;

@@ -230,6 +230,15 @@ static u32 blend_over(u32 dst, u32 src) {
 #define ZAN_HAS_SSE2 0
 #endif
 
+/* NEON is baseline on aarch64 (Android phones, Apple silicon); the same
+ * four-pixels-per-step run blend as the SSE2 path above, identical pixels. */
+#if defined(__aarch64__) || (defined(_M_ARM64) && !defined(_M_ARM64EC))
+#include <arm_neon.h>
+#define ZAN_HAS_NEON 1
+#else
+#define ZAN_HAS_NEON 0
+#endif
+
 /* Source-over of one constant colour across a run of pixels.
  *
  * The per-pixel blend_over above divides three channels by 255; a frame spends
@@ -297,6 +306,38 @@ static void blend_run_const(u32 *row, int n, u32 src) {
             hi = _mm_srli_epi16(_mm_add_epi16(_mm_add_epi16(hi, one), _mm_srli_epi16(hi, 8)), 8);
             __m128i out = _mm_or_si128(_mm_packus_epi16(lo, hi), amask);
             _mm_storeu_si128((__m128i *)(row + i), out);
+        }
+    }
+#endif
+#if ZAN_HAS_NEON
+    /* Same four-pixels-per-step shape as the SSE2 path: the group bails to
+     * the scalar tail as soon as one destination pixel is translucent (its
+     * source-over needs the general blend), otherwise dst*inv + src*sa rides
+     * in 16-bit lanes — a weighted average times 255 can't overflow — with
+     * the same (x + 1 + (x >> 8)) >> 8 divide-by-255 rounding. */
+    if (n >= 4) {
+        uint8x16_t ff8 = vdupq_n_u8(0xFF);
+        uint32x4_t amask = vdupq_n_u32(0xFF000000u);
+        uint16x8_t invv = vdupq_n_u16((uint16_t)inv);
+        uint16x8_t one = vdupq_n_u16(1);
+        uint16x8_t sav = vdupq_n_u16((uint16_t)sa);
+        uint8x16_t sbytes = vreinterpretq_u8_u32(vdupq_n_u32(src));
+        uint16x8_t sLo = vmulq_u16(vshll_n_u8(vget_low_u8(sbytes), 0), sav);
+        uint16x8_t sHi = vmulq_u16(vshll_n_u8(vget_high_u8(sbytes), 0), sav);
+        for (; i + 4 <= n; i += 4) {
+            uint8x16_t d = vld1q_u8((const uint8_t *)(row + i));
+            uint8x16_t da = vandq_u8(d, vreinterpretq_u8_u32(amask));
+            if (vminvq_u32(vreinterpretq_u32_u8(vceqq_u8(da, vreinterpretq_u8_u32(amask))))
+                    != 0xFFFFFFFFu) { break; }
+            g_blend_px_simd += 4;
+            uint16x8_t lo = vaddq_u16(vmulq_u16(vshll_n_u8(vget_low_u8(d), 0), invv), sLo);
+            uint16x8_t hi = vaddq_u16(vmulq_u16(vshll_n_u8(vget_high_u8(d), 0), invv), sHi);
+            lo = vshrq_n_u16(vaddq_u16(vaddq_u16(lo, one), vshrq_n_u16(lo, 8)), 8);
+            hi = vshrq_n_u16(vaddq_u16(vaddq_u16(hi, one), vshrq_n_u16(hi, 8)), 8);
+            uint8x16_t out = vorrq_u8(
+                vcombine_u8(vqmovn_u16(lo), vqmovn_u16(hi)),
+                vreinterpretq_u8_u32(amask));
+            vst1q_u8((uint8_t *)(row + i), out);
         }
     }
 #endif
