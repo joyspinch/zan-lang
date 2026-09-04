@@ -54,6 +54,7 @@ class Interop {
     }
 #endif
 
+    /// 最近一次 Load/Symbol 失败的原因文本。
     static string lastError = "";
 
     /// 上次失败加载的原生加载器错误文本（dlerror / Win32 错误码）；
@@ -93,6 +94,7 @@ class Interop {
         #endif
     }
 
+    /// 卸载共享库；句柄为 0 时忽略。
     static void Unload(nint mod) {
         if (mod != 0) {
             #if WINDOWS
@@ -136,6 +138,8 @@ class Interop {
     }
 }
 
+/// GetEnvironmentVariableW 的调用形式（name/buf 为宽字符指针，
+/// size 为缓冲区的 UTF-16 码元容量，返回写入的码元数）。
 delegate int GetEnvironmentVariableWFn(nint name, nint buf, int size);
 
 /// <summary>
@@ -155,6 +159,7 @@ class Wide {
     static extern int ToMulti(int page, int flags, nint wide, int wideLen,
                               nint mb, int mbLen, nint defChar, nint usedDef);
 
+    /// 代码页 CP_UTF8（65001）。
     static int Utf8() { return 65001; }
 
     /// 分配 `s` 的 NUL 结尾 UTF-16 副本。用 Free() 释放。
@@ -191,14 +196,19 @@ class Wide {
         return n;
     }
 
+    /// 释放 Of() 分配的缓冲区（即 NativeMemory.Free）。
     static void Free(nint p) {
         NativeMemory.Free(p);
     }
 }
 
+/// PeekMessageW 的调用形式（remove 非 0 时从队列取走消息）。
 delegate int PeekMessageFn(nint msg, nint hwnd, int min, int max, int remove);
+/// TranslateMessage 的调用形式。
 delegate int TranslateMessageFn(nint msg);
+/// DispatchMessageW 的调用形式。
 delegate nint DispatchMessageFn(nint msg);
+/// Win32 Sleep 的调用形式（毫秒）。
 delegate int SleepFn(int ms);
 
 /// <summary>
@@ -208,12 +218,18 @@ delegate int SleepFn(int ms);
 /// 回调而不死锁 UI 线程。
 /// </summary>
 class Pump {
+    /// 惰性解析出的 user32.dll 句柄与四个入口地址（0 为未加载/失败）。
     static nint user32;
+    /// PeekMessageW 入口。
     static nint peek;
+    /// TranslateMessage 入口。
     static nint translate;
+    /// DispatchMessageW 入口。
     static nint dispatch;
+    /// kernel32 Sleep 入口。
     static nint sleep;
 
+    /// 惰性解析 user32/kernel32 的入口（只做一次）。
     static void Resolve() {
         if (Pump.user32 != 0) { return; }
         Pump.user32 = Interop.Load("user32.dll");
@@ -262,28 +278,44 @@ class PumpGate {
         this.done = false;
     }
 
+    /// 标记完成。
     void Signal() { done = true; }
+    /// 是否已完成。
     bool IsDone() { return done; }
+    /// 复位为未完成。
     void Reset() { done = false; }
 }
 
 /// vtable 方法的调用形式：每个 COM 方法都把接口
 /// 指针作为第一个参数并返回 HRESULT，宽于
 /// 寄存器的参数（RECT、结构体出参）以地址传递。
+/// ComCall0Fn 到 ComCall5Fn 依次带 0 到 5 个指针参数。
 delegate int ComCall0Fn(nint self);
+/// 1 个指针参数的 COM 方法形式。
 delegate int ComCall1Fn(nint self, nint a);
+/// 2 个指针参数的 COM 方法形式。
 delegate int ComCall2Fn(nint self, nint a, nint b);
+/// 3 个指针参数的 COM 方法形式。
 delegate int ComCall3Fn(nint self, nint a, nint b, nint c);
+/// 4 个指针参数的 COM 方法形式。
 delegate int ComCall4Fn(nint self, nint a, nint b, nint c, nint d);
+/// 5 个指针参数的 COM 方法形式。
 delegate int ComCall5Fn(nint self, nint a, nint b, nint c, nint d, nint e);
 
+/// CoInitializeEx 的调用形式（返回 HRESULT）。
 delegate int CoInitializeExFn(nint reserved, int flags);
+/// CoUninitialize 的调用形式。
 delegate void CoUninitializeFn();
+/// TlsAlloc 的调用形式（返回 TLS 槽号）。
 delegate int TlsAllocFn();
+/// TlsGetValue 的调用形式。
 delegate nint TlsGetValueFn(int index);
+/// TlsSetValue 的调用形式（成功返回非 0）。
 delegate int TlsSetValueFn(int index, nint data);
+/// CoCreateInstance 的调用形式（返回 HRESULT）。
 delegate int CoCreateInstanceFn(nint clsid, nint outer, int ctx, nint iid,
                                 nint result);
+/// CoTaskMemFree 的调用形式。
 delegate void CoTaskMemFreeFn(nint p);
 
 /// <summary>
@@ -308,9 +340,12 @@ class Com {
         return Com.ole;
     }
 
+    /// 已解析的 ole32.dll 句柄（0 为未加载）。
     static nint ole;
+    /// 保存"本线程 COM 已初始化"的 TLS 槽号；-1 表示分配失败。
     static int comTls = Com.AllocComTls();
 
+    /// 分配记录 COM 初始化状态的 TLS 槽；失败返回 -1。
     static int AllocComTls() {
         nint fn = Interop.Entry("kernel32.dll", "TlsAlloc");
         if (fn == 0) { return 0 - 1; }
@@ -320,6 +355,7 @@ class Com {
 
     static int ComTls() { return Com.comTls; }
 
+    /// 当前线程是否已通过本类初始化过 COM。
     static bool ComInitialized() {
         int tls = Com.ComTls();
         if (tls < 0) { return false; }
@@ -329,6 +365,7 @@ class Com {
         return call(tls) != 0;
     }
 
+    /// 设置本线程的 COM 初始化标志；TLS 不可用时返回 false。
     static bool SetComInitialized(bool initialized) {
         int tls = Com.ComTls();
         if (tls < 0) { return false; }
@@ -338,6 +375,7 @@ class Com {
         return call(tls, initialized ? (nint)1 : (nint)0) != 0;
     }
 
+    /// CoInitializeEx 包装；入口缺失返回 -1。
     static int CoInit(nint reserved, int flags) {
         nint fn = Interop.Symbol(Com.Ole(), "CoInitializeEx");
         if (fn == 0) { return 0 - 1; }
@@ -345,6 +383,7 @@ class Com {
         return call(reserved, flags);
     }
 
+    /// CoUninitialize 包装；入口缺失时忽略。
     static void CoUninit() {
         nint fn = Interop.Symbol(Com.Ole(), "CoUninitialize");
         if (fn == 0) { return; }
@@ -352,6 +391,7 @@ class Com {
         call();
     }
 
+    /// CoCreateInstance 包装；入口缺失返回 -1。
     static int CoCreate(nint clsid, nint outer, int ctx, nint iid,
                         nint result) {
         nint fn = Interop.Symbol(Com.Ole(), "CoCreateInstance");
@@ -360,6 +400,7 @@ class Com {
         return call(clsid, outer, ctx, iid, result);
     }
 
+    /// CoTaskMemFree 包装；入口缺失时忽略。
     static void TaskFree(nint p) {
         nint fn = Interop.Symbol(Com.Ole(), "CoTaskMemFree");
         if (fn == 0) { return; }
@@ -377,6 +418,7 @@ class Com {
     /// CLSCTX_INPROC_SERVER.
     static int InProc() { return 1; }
 
+    /// HRESULT 是否成功（非负即成功，含 S_FALSE）。
     static bool Ok(int hr) { return hr >= 0; }
 
     /// 在调用线程上初始化 COM。S_FALSE 表示成功，且
@@ -413,6 +455,7 @@ class Com {
         return g;
     }
 
+    /// 取 s 中 off 起 len 个十六进制字符的整数值（非法字符按 0）。
     static int Hex(string s, int off, int len) {
         int v = 0;
         for (int i = 0; i < len; i = i + 1) {
@@ -422,6 +465,7 @@ class Com {
         return v;
     }
 
+    /// 单个十六进制字符的数值；非法字符按 0。
     static int Digit(string ch) {
         if (ch == "0") { return 0; }
         if (ch == "1") { return 1; }
@@ -442,6 +486,7 @@ class Com {
         return 0;
     }
 
+    /// 释放 Guid() 分配的 16 字节。
     static void FreeGuid(nint g) {
         NativeMemory.Free(g);
     }
@@ -479,6 +524,7 @@ class Com {
         return call(iface);
     }
 
+    /// 同 Call0，多一个指针参数；槽位为空返回 E_FAIL。
     static int Call1(nint iface, int index, nint a) {
         nint f = Com.Slot(iface, index);
         if (f == 0) { return Com.Fail(); }
@@ -486,6 +532,7 @@ class Com {
         return call(iface, a);
     }
 
+    /// 同 Call0，多两个指针参数；槽位为空返回 E_FAIL。
     static int Call2(nint iface, int index, nint a, nint b) {
         nint f = Com.Slot(iface, index);
         if (f == 0) { return Com.Fail(); }
@@ -493,6 +540,7 @@ class Com {
         return call(iface, a, b);
     }
 
+    /// 同 Call0，多三个指针参数；槽位为空返回 E_FAIL。
     static int Call3(nint iface, int index, nint a, nint b, nint c) {
         nint f = Com.Slot(iface, index);
         if (f == 0) { return Com.Fail(); }
@@ -500,6 +548,7 @@ class Com {
         return call(iface, a, b, c);
     }
 
+    /// 同 Call0，多四个指针参数；槽位为空返回 E_FAIL。
     static int Call4(nint iface, int index, nint a, nint b, nint c, nint d) {
         nint f = Com.Slot(iface, index);
         if (f == 0) { return Com.Fail(); }
@@ -507,6 +556,7 @@ class Com {
         return call(iface, a, b, c, d);
     }
 
+    /// 同 Call0，多五个指针参数；槽位为空返回 E_FAIL。
     static int Call5(nint iface, int index, nint a, nint b, nint c, nint d,
                      nint e) {
         nint f = Com.Slot(iface, index);
@@ -568,6 +618,7 @@ class Com {
         return iface;
     }
 
+    /// 平衡 Keep/Query/Create 得到的引用：调用 IUnknown.Release 槽位。
     static void Release(nint iface) {
         if (iface != 0) { Com.Call0(iface, Com.SlotRelease()); }
     }
@@ -603,11 +654,16 @@ class Com {
 /// 通过传入的 `self` 指针读回。
 /// </summary>
 class ComVtbl {
+    /// vtable 内存。
     nint vtbl;
+    /// Build() 分配的对象指针（0 为未构建）。
     nint obj;
+    /// vtable 容量（槽数）。
     int slots;
+    /// 已填充的槽数。
     int count;
 
+    /// 创建可容纳 slots 个条目的 vtable。
     static ComVtbl Create(int slots) {
         ComVtbl v = new ComVtbl();
         v.slots = slots;
@@ -642,11 +698,14 @@ class ComVtbl {
         if (obj != 0) { new Span<long>(obj + 8, 1)[0] = v; }
     }
 
+    /// 静态 handler 侧：从回调收到的 self 指针读回 SetState 写入的
+    /// 状态字。
     static int State(nint self) {
         if (self == 0) { return 0; }
         return new Span<long>(self + 8, 1)[0];
     }
 
+    /// 释放对象与 vtable 内存（Build 之后调用才有效）。
     void Destroy() {
         if (obj != 0) { NativeMemory.Free(obj); obj = 0; }
         if (vtbl != 0) { NativeMemory.Free(vtbl); vtbl = 0; }

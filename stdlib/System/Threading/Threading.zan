@@ -123,20 +123,25 @@ class Mutex {
         WinCloseHandle(handle);
     }
     #else
+    /// 创建 POSIX 互斥锁；句柄是内联存放 pthread_mutex_t 的
+    /// 64 字节块的地址。
     static nint Create() {
         nint mtx = PthreadCalloc(1, 64);
         PthreadMutexInit(mtx, 0);
         return mtx;
     }
 
+    /// 无限阻塞加锁（配对 Unlock）。
     static void Lock(nint handle) {
         PthreadMutexLock(handle);
     }
 
+    /// 解锁。
     static void Unlock(nint handle) {
         PthreadMutexUnlock(handle);
     }
 
+    /// 销毁并释放内存。
     static void Destroy(nint handle) {
         PthreadMutexDestroy(handle);
         PthreadFree(handle);
@@ -236,14 +241,19 @@ class Semaphore {
         WinCloseHandle(handle);
     }
     #elif MACOS
+    /// 创建 GCD 信号量：initialCount 初始许可（maxCount 由 dispatch
+    /// 信号量语义忽略，仅为 API 对齐）。
     static string Create(int initialCount, int maxCount) {
         return MacSemCreate(initialCount);
     }
 
+    /// 无限阻塞获取一个许可（配对 Release）。
     static void Wait(string handle) {
         MacSemWait(handle, -1);   // -1 表示 DISPATCH_TIME_FOREVER
     }
 
+    /// 限时获取：获取到返回 true；超时返回 false（不消耗许可）。
+    /// 负超时无限等待。
     static bool WaitFor(string handle, int timeoutMs) {
         if (timeoutMs < 0) {
             MacSemWait(handle, -1);
@@ -254,10 +264,12 @@ class Semaphore {
         return MacSemWaitUntil(handle, deadline) == 0;
     }
 
+    /// 归还一个许可。
     static void Release(string handle) {
         MacSemSignal(handle);
     }
 
+    /// 释放 dispatch 信号量。
     static void Destroy(string handle) {
         MacSemRelease(handle);
     }
@@ -343,10 +355,12 @@ class AtomicInt {
     [DllImport("crt", EntryPoint = "zan_atomic_int_add")]
     static extern long NativeAdd(nint handle, long delta);
 
+    /// 创建初始值为 initialValue 的原子整数。
     AtomicInt(long initialValue) {
         this.handle = NativeCreate(initialValue);
     }
 
+    /// 析构时销毁底层原子变量。
     ~AtomicInt() {
         if (this.handle != 0) {
             NativeDestroy(this.handle);
@@ -525,6 +539,8 @@ class SharedTable {
     [DllImport("crt", EntryPoint = "zan_shared_table_delete_at")]
     static extern int NativeDeleteAt(nint handle, long keyHash);
 
+    /// 创建一张未打开的表对象；随后用 KeySize/Column* 声明结构，
+    /// 再 Create/Open。
     SharedTable(string name, int capacity) {
         this.handle = 0;
         this.tableName = name;
@@ -543,6 +559,8 @@ class SharedTable {
         }
     }
 
+    /// 把已打开的表登记进本进程的打开表列表（Create/Open/Attach/Label
+    /// 都会走到；重复登记只更新标签）。
     static void Track(SharedTable table) {
         if (table.handle == 0) { return; }
         if (SharedTable.openHandles == null) {
@@ -561,6 +579,7 @@ class SharedTable {
         SharedTable.openLabels.Add(label);
     }
 
+    /// 把句柄从本进程的打开表列表移除。
     static void Untrack(nint handle) {
         if (SharedTable.openHandles == null) { return; }
         for (int i = 0; i < SharedTable.openHandles.Count; i = i + 1) {
@@ -785,12 +804,19 @@ class SharedTable {
     // 才会真正进入物理内存。因此「预留」远大于「占用」是正常的：
     // 报告内存时必须用 Resident，而不是 Reserved。
 
+    /// Stat 项：整块映射的预留大小（字节）。
     static int STAT_RESERVED = 0;
+    /// Stat 项：本进程驻留物理内存的部分（字节），不支持时为 -1。
     static int STAT_RESIDENT = 1;
+    /// Stat 项：表的行容量（向上取整到 2 的幂）。
     static int STAT_CAPACITY = 2;
+    /// Stat 项：当前行数。
     static int STAT_COUNT = 3;
+    /// Stat 项：每行字节数（键 + 各列 + 行头）。
     static int STAT_ROW_STRIDE = 4;
+    /// Stat 项：键的最大字节数。
     static int STAT_KEY_SIZE = 5;
+    /// Stat 项：列数。
     static int STAT_COLUMNS = 6;
 
     /// <summary>整块映射的大小（预留的虚拟地址空间，不是内存占用）。</summary>
@@ -845,12 +871,14 @@ class SharedTable {
         return NativeStat(SharedTable.openHandles[index], what);
     }
 
+    /// 左对齐补空格到 width 宽，再追加一个空格作列间隔。
     static string StatPad(string s, int width) {
         string t = s;
         while (t.Length < width) { t = t + " "; }
         return t + " ";
     }
 
+    /// 字节数的人类可读形式（B/KB/MB，整除截断）；负数返回 "n/a"。
     static string StatBytes(long bytes) {
         if (bytes < 0) { return "n/a"; }
         if (bytes < 1024) { return Convert.ToString(bytes) + "B"; }
@@ -981,6 +1009,8 @@ class Channel {
     Gate recvGate;
     nint lockHandle;
 
+    /// 创建指定容量的 channel（容量语义见类注释：0 无界，
+    /// 正值有界，1 即 CreateUnbuffered）。
     Channel(int capacity) {
         this.buffer = new List<string>();
         this.capacity = capacity;
