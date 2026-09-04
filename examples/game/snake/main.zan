@@ -260,6 +260,7 @@ class SnGame {
     string deathBy;
     bool wasRecord;
     SdlTexture menuBg;
+    SdlTexture gridTex;   // baked dot-grid tile (view + 1 cell margin)
     SdlTexture titleTex;
     bool texTried;
     bool demo;
@@ -329,6 +330,40 @@ class SnGame {
         g.demo = File.Exists("snake_demo.txt");
         if (g.demo) { g.StartGame(Sdl.Ticks()); }
         return g;
+    }
+
+    // Bake the camera-periodic dot grid once (view + one 40px cell margin
+    // so the wrap-shifted blit always covers the viewport). Baked BEFORE
+    // host.Begin targets the canvas, so SetTarget/ResetTarget here only
+    // touches the default target.
+    void EnsureGrid() {
+        if (this.gridTex != null) { return; }
+        // Bake at CANVAS resolution so DrawTexture's design->canvas mapping
+        // is 1:1 and the dots stay exactly as crisp as the old per-frame
+        // FillRects (2 design px -> Sc(px) canvas px).
+        int fnum = this.r.ScaleNum();
+        int fden = this.r.ScaleDen();
+        if (fnum < 1) { fnum = 1; }
+        if (fden < 1) { fden = 1; }
+        int w = (SnGame.VW() + 40) * fnum / fden;
+        int h = (SnGame.VH() + 40) * fnum / fden;
+        int step = 40 * fnum / fden;
+        int dot = 2 * fnum / fden;
+        if (dot < 1) { dot = 1; }
+        SdlTexture t = SdlTexture.CreateTarget(this.r, w, h);
+        if (t == null || !t.IsValid()) { return; }
+        this.r.SetTarget(t);
+        this.r.SetColor(0, 0, 0, 0);
+        this.r.Clear();
+        this.r.SetColor(120, 140, 210, 26);
+        for (int gx = 0; gx < w; gx = gx + step) {
+            for (int gy = 0; gy < h; gy = gy + step) {
+                this.r.FillRectRaw(gx, gy, dot, dot);
+            }
+        }
+        this.r.ResetTarget();
+        t.SetBlendMode(1);
+        this.gridTex = t;
     }
 
     void EnsureTex() {
@@ -815,20 +850,30 @@ class SnGame {
         this.camX = SnGame.WrapP(this.me.headX / 256, SnGame.WW());
         this.camY = SnGame.WrapP(this.me.headY / 256, SnGame.WH());
 
-        this.host.Begin(10, 13, 26);
-        // dot grid, drawn only inside the view (camera-aligned)
-        this.r.SetColor(120, 140, 210, 26);
+        // dot grid, baked once into a view-sized tile: the per-frame loop
+        // used to cost ~570 FillRect draw calls on every frame.
+        this.EnsureGrid();
         int gx0 = this.camX - SnGame.VW() / 2;
         int gy0 = this.camY - SnGame.VH() / 2;
         int gx = gx0 - SnGame.WrapP(gx0, 40);
-        while (gx < gx0 + SnGame.VW() + 40) {
-            int gy = gy0 - SnGame.WrapP(gy0, 40);
-            while (gy < gy0 + SnGame.VH() + 40) {
-                this.r.FillRect(this.ScrX(SnGame.WrapP(gx, SnGame.WW())) + shX,
-                    this.ScrY(SnGame.WrapP(gy, SnGame.WH())) + shY, 2, 2);
-                gy = gy + 40;
+        int gy0w = gy0 - SnGame.WrapP(gy0, 40);
+        this.host.Begin(10, 13, 26);
+        if (this.gridTex != null && this.gridTex.IsValid()) {
+            this.r.SetColor(120, 140, 210, 26);
+            this.r.DrawTexture(this.gridTex, gx + shX, gy0w + shY,
+                SnGame.VW() + 40, SnGame.VH() + 40);
+        } else {
+            this.r.SetColor(120, 140, 210, 26);
+            int gxw = gx;
+            while (gxw < gx0 + SnGame.VW() + 40) {
+                int gyw = gy0w;
+                while (gyw < gy0 + SnGame.VH() + 40) {
+                    this.r.FillRect(this.ScrX(SnGame.WrapP(gxw, SnGame.WW())) + shX,
+                        this.ScrY(SnGame.WrapP(gyw, SnGame.WH())) + shY, 2, 2);
+                    gyw = gyw + 40;
+                }
+                gxw = gxw + 40;
             }
-            gx = gx + 40;
         }
 
         // orbs
@@ -964,7 +1009,7 @@ class SnGame {
         } else {
             Text.DrawCenteredShadow(this.r, this.deathBy, 640, by + 34, 4, 235, 140, 150, 255);
         }
-        Text.DrawCentered(this.r, "得分 " + this.score, 640, by + 100, 5, 255, 225, 110, 255);
+        Text.DrawCentered(this.r, "得分 " + this.score.Get(), 640, by + 100, 5, 255, 225, 110, 255);
         Text.DrawCentered(this.r, "长度 " + this.me.length + " · 击败 " + this.kills + " · " + SnGame.TierName(this.titleTier), 640, by + 156, 2, 175, 200, 235, 255);
         string cheer = "再来一局，超越自己！";
         if (this.wasRecord) { cheer = "你就是新的贪吃王！"; }
@@ -1021,6 +1066,10 @@ class SnGame {
 class SnApp {
     static void Main() {
         Host h = Host.Create("蛇蛇乐", 1280, 720);
+        // 2D 场景 60fps 足够；高刷屏上 vsync-only 会让 GPU/CI 多烧 2 倍以上
+        // 帧成本。后台/失焦降到 2fps（见 Host.SetIdleFps）。
+        h.LimitFps(60);
+        h.SetIdleFps(2);
         SnGame g = SnGame.Create(h);
         while (h.Running()) {
             int now = Sdl.Ticks();

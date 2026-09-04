@@ -800,6 +800,19 @@ add_test(NAME diag_ctor_initializer_partial
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_ctor_initializer_partial PROPERTIES TIMEOUT 60)
 
+# `string + <class reference>` must be a checker error: irgen's concat
+# lowering formats only strings/numerics/char/enum/bool and would otherwise
+# strlen the object's raw bytes as text (mojibake on screen, see the snake
+# over screen regression).
+add_test(NAME diag_concat_reference
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/concat_reference.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_concat_reference${_exe_ext}
+    "-DEXPECT_REGEX=cannot concatenate 'string' and 'Score'"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_concat_reference PROPERTIES TIMEOUT 60)
+
 # A43-A16: a duplicate method (same name, same parameter types) used to
 # compile with first-wins semantics -- zero diagnostics for a silent
 # semantics swap. Same-signature duplicates must be a hard error while

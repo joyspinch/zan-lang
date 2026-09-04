@@ -1492,6 +1492,18 @@ static void check_call_arg_type(zan_checker_t *c, zan_symbol_t *sig, int index,
 /* Comparisons, which consume the *value* of both operands. `+`/`-` are left
  * out: they combine delegates and register event handlers, both of which take
  * a method group. */
+/* Operand kinds irgen's string concat/interpolation lowering can turn into
+ * text (emit_to_cstr_of): strings pass through, numerics/chars are formatted,
+ * enums and bools ride their integer carrier, null concats as "". Anything
+ * else -- a class/struct/array/delegate reference -- used to be handed to
+ * strlen over the object's raw bytes and rendered as mojibake; reject it. */
+static bool type_is_concatable(zan_type_t *t) {
+    return t->kind == TYPE_STRING || t->kind == TYPE_CHAR ||
+           t->kind == TYPE_ENUM ||
+           t->kind == TYPE_BOOL || t->kind == TYPE_ERROR ||
+           type_is_numeric(t);
+}
+
 static bool binary_op_compares(zan_token_kind_t op) {
     switch (op) {
     case TK_EQ_EQ: case TK_BANG_EQ:
@@ -1691,6 +1703,13 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         case TK_PLUS:
             /* string concatenation */
             if (left->kind == TYPE_STRING || right->kind == TYPE_STRING) {
+                zan_type_t *other = left->kind == TYPE_STRING ? right : left;
+                if (!type_is_concatable(other)) {
+                    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                                  "cannot concatenate 'string' and '%s' -- convert the operand explicitly (e.g. call .ToStr()/read the field) instead of concatenating the reference",
+                                  type_name(other));
+                    return c->binder->type_error;
+                }
                 no_runtime_reject(c, expr->loc, "string concatenation");
                 return c->binder->type_string;
             }
@@ -2077,7 +2096,14 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     case AST_STRING_INTERP: {
         no_runtime_reject(c, expr->loc, "string interpolation");
         for (int i = 0; i < expr->string_interp.parts.count; i++) {
-            zan_checker_check_expr(c, expr->string_interp.parts.items[i]);
+            zan_type_t *pt = zan_checker_check_expr(c, expr->string_interp.parts.items[i]);
+            /* Interpolated parts go through the same emit_to_cstr_of lowering
+             * as `+` concat; a reference type would strlen the object bytes. */
+            if (!type_is_concatable(pt)) {
+                zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                              "cannot interpolate '%s' -- convert the operand explicitly instead of formatting the reference",
+                              type_name(pt));
+            }
         }
         return c->binder->type_string;
     }

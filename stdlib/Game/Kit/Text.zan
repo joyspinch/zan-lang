@@ -292,16 +292,22 @@ class SysFont {
     static extern int zan_gui_font_height(int fontSize);
     [DllImport("zan_gui")]
     static extern nint zan_gui_get_pixels(int surfaceId);
+    [DllImport("zan_gui")]
+    static extern int zan_gui_set_text_family(string utf8Family);
+    [DllImport("zan_gui")]
+    static extern int zan_gui_font_face_matches(string utf8Family);
 
     // One cache entry: the rasterized run as a GPU texture + its layout box.
     class SysRun {
         public string text;
         public int scale;
         public SdlTexture tex;
-        public int drawW;   // measured run width (px at this scale)
-        public int drawH;   // font line height (px at this scale)
-        public int padX;    // surface padding subtracted from drawX
-        public int padY;    // surface padding subtracted from drawY
+        public int texW;    // texture size in real pixels (canvas resolution)
+        public int texH;
+        public int drawW;   // layout box in DESIGN units (what Draw places)
+        public int drawH;
+        public int padX;    // surface padding subtracted from drawX (design)
+        public int padY;
         public long lastUsed;
     }
 
@@ -312,24 +318,49 @@ class SysFont {
     const int MAX_RUNS = 96;    // cached textures (96 ≈ one busy frame's labels)
     static int surfA = -1;      // scratch surface A
     static int surfB = -1;      // scratch surface B
+    static int surfAW;          // surfA current size (pixels)
+    static int surfAH;
+    static int surfBW;          // surfB current size (pixels)
+    static int surfBH;
     static bool useA;
     const int PAD = 6;          // surface margin: ClearType bleed + tile.top
     static long tick;
-    // scale → pixel font size. GameKit's design grid is 57 units per cell at
-    // scale/6 (GlyphFont cellH=57, scale 2 ≈ 19px), so px = scale * 14 lands
-    // 2 号 at ~28px and keeps 1 号 readable.
-    static int PxOf(int scale) { return scale * 14; }
+    // scale → pixel font size. Games author on the bitmap-font grid: ink
+    // height ≈ 8px × scale (Font 是 8px 字模，GlyphFont cellH 57 @ scale/6)。
+    // 行高与 CJK ink 取 ~9px × scale，和旧布局逐行对齐（scale 7 → 63px 高，
+    // 顶部 score 行不再压住 y=84 的副标题行）。
+    static int PxOf(int scale) { return scale * 9; }
 
 
     /// True once zan_gui.dll is loadable and a probe run rasterized; false
     /// means the caller should fall back to the atlas pipeline.
+    // 首个文本绘制前选好字体。圆润适合游戏的 CJK 字体优先：霞鹜文楷（常装
+    // 的开源圆楷）> 微软雅黑 UI（Win10/11 全都有）。注意 GDI 字体链接会把
+    // 缺失家族的名字保留在 LOGFONT 上而字形回退宋体，face_matches 会假阳性
+    // （幼圆在本机即如此）——探测链只放验证过会真实自绘的家族。
+    static void PickFamily() {
+        string[] prefers = new string[] {
+            "LXGW WenKai", "霞鹜文楷", "Microsoft YaHei UI", "微软雅黑"
+        };
+        for (int i = 0; i < prefers.Length; i = i + 1) {
+            if (zan_gui_font_face_matches(prefers[i]) != 0) {
+                zan_gui_set_text_family(prefers[i]);
+                return;
+            }
+        }
+    }
+
     static bool Ready(SdlRenderer r) {
         if (SysFont.tried) { return SysFont.ok; }
         SysFont.tried = true;
         SysFont.runs = new List<SysRun>();
         SysFont.keys = new List<string>();
+        SysFont.PickFamily();
         int s = SysFont.CreateSurface(512, 96);
         if (s >= 0) {
+            SysFont.surfA = s;
+            SysFont.surfAW = 512;
+            SysFont.surfAH = 96;
             SysFont.useA = true;
             SysFont.ok = true;
         }
@@ -356,26 +387,58 @@ class SysFont {
     /// Rasterize `text` at `scale` into the scratch surface and upload it as
     /// a cached texture. Returns the run or null on failure.
     static SysRun Bake(SdlRenderer r, string text, int scale) {
-        int px = SysFont.PxOf(scale);
-        int w = zan_gui_measure_text(text, px);
+        // Rasterize at CANVAS resolution (renderer num/den), draw in design
+        // units: on a 150% display the texture carries 1.5x the pixels and
+        // stays sharp instead of being linearly upscaled by Sc.
+        int fnum = r.ScaleNum();
+        int fden = r.ScaleDen();
+        if (fnum < 1) { fnum = 1; }
+        if (fden < 1) { fden = 1; }
+        int px = SysFont.PxOf(scale) * fnum / fden;
+        if (px < 8) { px = 8; }
+        int wAct = zan_gui_measure_text(text, px);
         // SDL-backend measure can return garbage for runs it cannot lay out;
         // clamp so the surface math below stays inside a sane int range.
-        if (w <= 0 || w > 8192) { return null; }
-        int h = zan_gui_font_height(px);
-        if (h <= 0 || h > 512) { return null; }
-        int sw = w + SysFont.PAD * 2;
-        int sh = h + SysFont.PAD * 2;
+        if (wAct <= 0 || wAct > 16384) { return null; }
+        int hAct = zan_gui_font_height(px);
+        if (hAct <= 0 || hAct > 1024) { return null; }
+        int padAct = SysFont.PAD * fnum / fden;
+        if (padAct < 2) { padAct = 2; }
+        int sw = wAct + padAct * 2;
+        int sh = hAct + padAct * 2;
+        // Design-unit layout box (what Draw places with).
+        int w = wAct * fden / fnum;
+        int h = hAct * fden / fnum;
+        // The scratch surfaces must be at least (sw, sh): they are created
+        // once and RE-grown here when a bigger run needs more room. Drawing
+        // a wide run into a small surface and then copying sw*sh*4 out of it
+        // reads past the allocation (snow made of neighbouring heap data).
+        // EXACT fit, not grow-only: the surface stride IS its width, and the
+        // readback below uploads sw*sh pixels flat with pitch sw*4. A wider
+        // surface would shear every row after the first into snow, so rebuild
+        // whenever the size differs at all (bakes are cached, so this churns
+        // only on genuinely new run sizes).
         if (!SysFont.useA) {
-            if (SysFont.surfB < 0) { SysFont.surfB = SysFont.CreateSurface(sw, sh); }
-            if (SysFont.surfB < 0) { return null; }
+            if (SysFont.surfB < 0 || SysFont.surfBW != sw || SysFont.surfBH != sh) {
+                if (SysFont.surfB >= 0) { zan_gui_destroy_surface(SysFont.surfB); }
+                SysFont.surfB = SysFont.CreateSurface(sw, sh);
+                SysFont.surfBW = sw;
+                SysFont.surfBH = sh;
+                if (SysFont.surfB < 0) { return null; }
+            }
             zan_gui_clear(SysFont.surfB, 0);
         } else {
-            if (SysFont.surfA < 0) { SysFont.surfA = SysFont.CreateSurface(sw, sh); }
-            if (SysFont.surfA < 0) { return null; }
+            if (SysFont.surfA < 0 || SysFont.surfAW != sw || SysFont.surfAH != sh) {
+                if (SysFont.surfA >= 0) { zan_gui_destroy_surface(SysFont.surfA); }
+                SysFont.surfA = SysFont.CreateSurface(sw, sh);
+                SysFont.surfAW = sw;
+                SysFont.surfAH = sh;
+                if (SysFont.surfA < 0) { return null; }
+            }
             zan_gui_clear(SysFont.surfA, 0);
         }
         int surf = SysFont.useA ? SysFont.surfA : SysFont.surfB;
-        zan_gui_draw_text(surf, SysFont.PAD, SysFont.PAD, text, -1, px);
+        zan_gui_draw_text(surf, padAct, padAct, text, -1, px);
         nint pix = zan_gui_get_pixels(surf);
         if (pix == 0) { return null; }
 
@@ -385,11 +448,16 @@ class SysFont {
         // byte-addresses its 'pixels' string, so stage the surface bytes
         // through a raw heap block and read them back as one ARC string
         // (strings carry an explicit length, so embedded NULs survive).
-        ByteBuffer pixbuf = ByteBuffer.Alloc(sw * sh * 4);
-        NativeMemory.Copy(pixbuf.Raw(), pix, sw * sh * 4);
+        // FromRaw, not Alloc+Copy: Alloc leaves the write watermark at 0,
+        // so ToStr would hand back an empty string and every frame would
+        // re-bake (and churn a texture per label).
+        ByteBuffer pixbuf = ByteBuffer.FromRaw(pix, sw * sh * 4);
         string buf = pixbuf.ToStr();
         pixbuf.Free();
-        if (buf == null) { tex.Close(); return null; }
+        if (buf == null || buf.Length != sw * sh * 4) {
+            tex.Close();
+            return null;
+        }
         if (!tex.Update(buf, sw * 4)) { tex.Close(); return null; }
         tex.SetNearest(false);
         tex.SetBlendMode(1);
@@ -399,6 +467,8 @@ class SysFont {
         run.text = text;
         run.scale = scale;
         run.tex = tex;
+        run.texW = sw;
+        run.texH = sh;
         run.drawW = w;
         run.drawH = h;
         run.padX = SysFont.PAD;
@@ -422,21 +492,24 @@ class SysFont {
         return run;
     }
 
-    /// Run width in pixels at `scale` (measurement only; no texture touched).
-    static int Measure(string text, int scale) {
+    /// Run width in design units at `scale` (measurement only; no texture).
+    static int Measure(SdlRenderer r, string text, int scale) {
         if (text == null || text.Length == 0) { return 0; }
         if (scale < 1) { scale = 1; }
-        int px = SysFont.PxOf(scale);
-        int w = zan_gui_measure_text(text, px);
-        if (w > 0) { return w; }
+        int fnum = r.ScaleNum();
+        int fden = r.ScaleDen();
+        if (fnum < 1) { fnum = 1; }
+        if (fden < 1) { fden = 1; }
+        int w = zan_gui_measure_text(text, SysFont.PxOf(scale) * fnum / fden);
+        if (w > 0) { return w * fden / fnum; }
         return 0;
     }
 
-    /// Font line height in pixels at `scale` (for row layout math).
-    static int LineHeight(int scale) {
+    /// Font line height in design pixels at `scale` (for row layout math).
+    public static int LineHeight(int scale) {
         if (scale < 1) { scale = 1; }
         int h = zan_gui_font_height(SysFont.PxOf(scale));
-        return h > 0 ? h : scale * 20;
+        return h > 0 ? h : scale * 12;
     }
 
     /// Draw `text` with its top-left at (x, y) — same contract as
@@ -457,9 +530,12 @@ class SysFont {
         run.tex.SetOpacity(ca);
         SdlSpriteBatch b = Host.FindBatch(r);
         if (b != null) {
+            // Source rect is in TEXTURE pixels (canvas resolution); the dest
+            // box is design units and Sc scales it back up. Mixing the two
+            // clips the right/bottom of every run on a scaled canvas.
             b.Queue(run.tex, x - run.padX, y - run.padY,
                 run.drawW + run.padX * 2, run.drawH + run.padY * 2,
-                0, 0, run.drawW + run.padX * 2, run.drawH + run.padY * 2,
+                0, 0, run.texW, run.texH,
                 cr, cg, cb, ca);
             b.End();
             b.Begin();
@@ -482,12 +558,20 @@ class SysFont {
         if (SysFont.surfB >= 0) { zan_gui_destroy_surface(SysFont.surfB); }
         SysFont.surfA = -1;
         SysFont.surfB = -1;
+        SysFont.surfAW = 0;
+        SysFont.surfAH = 0;
+        SysFont.surfBW = 0;
+        SysFont.surfBH = 0;
         SysFont.ok = false;
         SysFont.tried = false;
     }
 }
 
 class Text {
+    /// Font line height in design pixels at `scale` (for row layout math
+    /// and vertical centering inside buttons/panels).
+    public static int LineHeight(int scale) { return SysFont.LineHeight(scale); }
+
     static void Draw(SdlRenderer r, string text, int x, int y, int scale,
                      int cr, int cg, int cb, int ca) {
         if (text == null) { return; }
@@ -632,7 +716,7 @@ class Text {
 
     static int Width(SdlRenderer r, string text, int scale) {
         if (SysFont.Ready(r)) {
-            int w = SysFont.Measure(text, scale);
+            int w = SysFont.Measure(r, text, scale);
             if (w > 0) { return w; }
             return 0;
         }

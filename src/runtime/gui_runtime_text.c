@@ -97,6 +97,11 @@ static void ensure_text_dc(void) {
 }
 
 static int g_font_sizes[16];
+/* Active text face (env-seeded, program-overridable via
+ * zan_gui_set_text_family -- see the exports below get_or_create_font). */
+static wchar_t g_font_family[64] = L"Segoe UI";
+static int g_font_family_env_done = 0;
+static int g_font_family_explicit = 0;
 
 static HFONT get_or_create_font(int size) {
     /* Cache by exact size match */
@@ -113,6 +118,22 @@ static HFONT get_or_create_font(int size) {
     }
     if (slot < 0) slot = 15; /* reuse last */
 
+    /* Face: ZAN_GUI_FONT_FACE seeds the default, so an app can pick a family
+     * that matches its art direction (a game HUD wants a rounder face than
+     * the OS UI font). A program can also set it at runtime via
+     * zan_gui_set_text_family -- that wins over the env var. GDI font
+     * linking resolves an absent family to the system default, so a missing
+     * face degrades instead of failing. */
+    if (!g_font_family_explicit && !g_font_family_env_done) {
+        g_font_family_env_done = 1;
+        wchar_t env[64];
+        DWORD n = GetEnvironmentVariableW(L"ZAN_GUI_FONT_FACE", env, 64);
+        if (n > 0 && n < 64) {
+            memcpy(g_font_family, env, (size_t)n * sizeof(wchar_t));
+            g_font_family[n] = 0;
+        }
+    }
+
     if (g_fonts[slot]) DeleteObject(g_fonts[slot]);
     g_fonts[slot] = CreateFontW(
         -size, 0, 0, 0,
@@ -120,11 +141,60 @@ static HFONT get_or_create_font(int size) {
         DEFAULT_CHARSET, OUT_TT_PRECIS,
         CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         DEFAULT_PITCH | FF_SWISS,
-        L"Segoe UI"
+        g_font_family
     );
     if (g_text_stats_enabled) { g_text_font_creates++; }
     g_font_sizes[slot] = size;
     return g_fonts[slot];
+}
+
+/* Programmatic face selection (games: a rounder face matching the art).
+ * Call before the first text draw/measure of the process: the glyph-run
+ * atlas keys tiles by (text,size) and would keep tiles rasterized with an
+ * earlier face. Returns 1 when the family name was stored. */
+EXPORT i32 zan_gui_set_text_family(const char *utf8_family) {
+    if (!utf8_family || !*utf8_family) return 0;
+    wchar_t want[64];
+    int n = MultiByteToWideChar(CP_UTF8, 0, utf8_family, -1, want, 64);
+    if (n <= 0 || n > 64) return 0;
+    memcpy(g_font_family, want, (size_t)n * sizeof(wchar_t));
+    g_font_family_explicit = 1;
+    /* Drop cached HFONTs so the next draw rebuilds with the new face. */
+    for (int i = 0; i < 16; i++) {
+        if (g_fonts[i]) { DeleteObject(g_fonts[i]); g_fonts[i] = NULL; }
+        g_font_sizes[i] = 0;
+    }
+    return 1;
+}
+
+/* 1 when `utf8_family` resolves to an installed face: GDI's mapper silently
+ * falls back for absent families, so the probe selects a throwaway HFONT and
+ * compares the face GDI actually kept (case-insensitive). */
+EXPORT i32 zan_gui_font_face_matches(const char *utf8_family) {
+    if (!utf8_family || !*utf8_family) return 0;
+    wchar_t want[64];
+    if (!MultiByteToWideChar(CP_UTF8, 0, utf8_family, -1, want, 64)) return 0;
+    ensure_text_dc();
+    HFONT probe = CreateFontW(
+        16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, want);
+    if (!probe) return 0;
+    HFONT old = (HFONT)SelectObject(g_text_dc, probe);
+    wchar_t got[LF_FACESIZE];
+    int ok = GetTextFaceW(g_text_dc, LF_FACESIZE, got);
+    SelectObject(g_text_dc, old);
+    DeleteObject(probe);
+    if (!ok) return 0;
+    int i = 0, j = 0;
+    while (got[i] && want[j]) {
+        wchar_t a = got[i], b = want[j];
+        if (a >= L'A' && a <= L'Z') { a = a - L'A' + L'a'; }
+        if (b >= L'A' && b <= L'Z') { b = b - L'A' + L'a'; }
+        if (a != b) return 0;
+        i++; j++;
+    }
+    return (got[i] == 0 && want[j] == 0) ? 1 : 0;
 }
 
 static uint64_t zan_text_hash(const char *s, int size) {
@@ -529,5 +599,17 @@ EXPORT i32 zan_gui_font_height(i32 font_size) {
 EXPORT void zan_gui_text_stat_enable(i32 enabled) { (void)enabled; }
 
 EXPORT i64 zan_gui_text_stat_read(i32 idx) { (void)idx; return 0; }
+
+/* Non-GDI builds keep their platform font pick; the exports exist so game
+ * programs (Game.Kit SysFont) probe and set uniformly across platforms. */
+EXPORT i32 zan_gui_set_text_family(const char *utf8_family) {
+    (void)utf8_family;
+    return 0;
+}
+
+EXPORT i32 zan_gui_font_face_matches(const char *utf8_family) {
+    (void)utf8_family;
+    return 0;
+}
 
 #endif /* _WIN32 */

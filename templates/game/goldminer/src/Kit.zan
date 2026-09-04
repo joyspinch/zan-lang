@@ -56,6 +56,25 @@ class Assets {
     }
 }
 
+// SetEnvironmentVariableW 的调用形式(两参均为 UTF-16 指针)。
+delegate int SetEnvWFn(nint name, nint value);
+
+// 进程环境变量(UTF-16)。gui 运行时的外观开关按约定走环境变量
+// (ZAN_GUI_SKINS 同款):如文字脸 ZAN_GUI_FONT_FACE,运行库首次建
+// 字体时读取。非 Windows 上 kernel32 解析不到,静默空操作。
+class Env {
+    public static void Set(string name, string value) {
+        nint fn = Interop.Entry("kernel32.dll", "SetEnvironmentVariableW");
+        if (fn == 0) { return; }
+        SetEnvWFn call = (SetEnvWFn)fn;
+        nint wn = Wide.Of(name);
+        nint wv = Wide.Of(value);
+        call(wn, wv);
+        Wide.Free(wn);
+        Wide.Free(wv);
+    }
+}
+
 // 确定性 xorshift 随机数（可复现仿真/摆放）。
 class Rng {
     long state;
@@ -130,14 +149,21 @@ class Host {
         // 只会拖出一圈死边。F11 全屏仍可用；设计单位 + Letterbox 保持
         // 玩法数学与分辨率无关。
         int flags = SdlWindowFlags.HighPixelDensity();
+        Console.WriteLine("[host] sdl init ok");
         h.window = SdlWindow.Create(title, logicalW * 3 / 2, logicalH * 3 / 2, flags);
+        Console.WriteLine("[host] window created valid=" + h.window.IsValid());
         if (!h.window.IsValid()) { Sdl.Quit(); return h; }
         h.r = SdlRenderer.Create(h.window);
+        Console.WriteLine("[host] renderer created valid=" + h.r.IsValid()
+                          + " name=" + h.r.Name());
         if (!h.r.IsValid()) { h.window.Close(); Sdl.Quit(); return h; }
         h.r.SetBlend(1);
         h.r.SetVSync(true);
+        Console.WriteLine("[host] vsync on");
         if (ss < 1) { ss = 1; }
         int outPacked = h.r.OutputSize();
+        Console.WriteLine("[host] output " + (outPacked & 65535) + "x" +
+                          (outPacked >> 16));
         int outW = outPacked & 65535;
         int outH = outPacked >> 16;
         h.canvasW = outW;
@@ -167,6 +193,10 @@ class Host {
     public SdlRenderer Renderer() { return this.r; }
     public int Width() { return this.logicalW; }
     public int Height() { return this.logicalH; }
+    /// 画布光栅尺寸(窗口输出分辨率夹在 [logical .. ss x logical])。
+    /// HUD/Gui 层与它 1:1,设计->光栅的比例用它换算。
+    public int CanvasW() { return this.canvasW; }
+    public int CanvasH() { return this.canvasH; }
     public bool Running() { return this.running; }
     public void Quit() { this.running = false; }
     public nint WindowHandle() { return this.window.Handle(); }
@@ -393,8 +423,25 @@ class Text {
     [DllImport("zan_gui")]
     static extern nint zan_gui_get_pixels(int surfaceId);
 
-    // scale → 像字号。scale 1≈14px 起步，2 号≈28px，覆盖 HUD 全部字号。
+    // scale → 像字号(设计单位)。scale 1≈14px 起步，2 号≈28px，
+    // 覆盖 HUD 全部字号。
     static int PxOf(int scale) { return scale * 14; }
+
+    // 字形烘焙像素:设计字号按渲染器 UI 缩放(逻辑 960 -> 光栅 1440,
+    // 即 3/2)放大到光栅空间再烘焙;绘制时 DrawTexture 内部把设计
+    // 坐标映射回光栅,纹素 1:1 落位——场景文字与美术同样原生清晰,
+    // 不再是"小字放大"的糊。缩放比 <1(画布被钳到逻辑尺寸)时按 1:1。
+    static int GlyphPx(SdlRenderer r, int scale) {
+        int design = PxOf(scale);
+        int px = design * r.ScaleNum() / r.ScaleDen();
+        return px > design ? px : design;
+    }
+
+    // 光栅空间的面板留边(ClearType 渗出),与设计 PAD 等比。
+    static int GlyphPad(SdlRenderer r) {
+        int p = Text.PAD * r.ScaleNum() / r.ScaleDen();
+        return p > Text.PAD ? p : Text.PAD;
+    }
 
     const int PAD = 6;          // 表面留边：ClearType 渗出
     const int MAX_RUNS = 96;    // 缓存纹理上限（≈一帧的全部文本）
@@ -451,13 +498,14 @@ class Text {
     static int surfH = 96;
 
     static Run Bake(SdlRenderer r, string text, int scale) {
-        int px = Text.PxOf(scale);
+        int px = Text.GlyphPx(r, scale);
+        int padr = Text.GlyphPad(r);
         int w = zan_gui_measure_text(text, px);
         if (w <= 0) { return null; }
         int h = zan_gui_font_height(px);
         if (h <= 0) { return null; }
-        int sw = w + Text.PAD * 2;
-        int sh = h + Text.PAD * 2;
+        int sw = w + padr * 2;
+        int sh = h + padr * 2;
         if (Text.surf >= 0 && (Text.surfW < sw || Text.surfH < sh)) {
             zan_gui_destroy_surface(Text.surf);
             Text.surf = -1;
@@ -472,7 +520,7 @@ class Text {
         }
         if (Text.surf < 0) { return null; }
         zan_gui_clear(Text.surf, 0);
-        zan_gui_draw_text(Text.surf, Text.PAD, Text.PAD, text, -1, px);
+        zan_gui_draw_text(Text.surf, padr, padr, text, -1, px);
         nint pix = zan_gui_get_pixels(Text.surf);
         if (pix == 0) { return null; }
         SdlTexture tex = SdlTexture.CreateRgba32(r, sw, sh, true);
@@ -503,8 +551,10 @@ class Text {
         run.text = text;
         run.scale = scale;
         run.tex = tex;
-        run.drawW = w;
-        run.drawH = h;
+        // 纹理在光栅空间;对外存设计单位(绘制经 DrawTexture 的 UI
+        // 缩放映射回光栅,纹素 1:1)。
+        run.drawW = w * r.ScaleDen() / r.ScaleNum();
+        run.drawH = h * r.ScaleDen() / r.ScaleNum();
         run.lastUsed = Text.tick;
         if (Text.runs.Count >= Text.MAX_RUNS) {
             // LRU 驱逐并释放纹理。
@@ -526,8 +576,9 @@ class Text {
     public static int Width(SdlRenderer r, string text, int scale) {
         if (text == null || text.Length == 0) { return 0; }
         if (scale < 1) { scale = 1; }
-        int w = zan_gui_measure_text(text, Text.PxOf(scale));
-        return w > 0 ? w : 0;
+        int w = zan_gui_measure_text(text, Text.GlyphPx(r, scale));
+        // 返回设计单位(居中/右对齐等布局数学都在设计空间)。
+        return w > 0 ? w * r.ScaleDen() / r.ScaleNum() : 0;
     }
 
     /// 左上角 (x, y) 绘制一行文本。
