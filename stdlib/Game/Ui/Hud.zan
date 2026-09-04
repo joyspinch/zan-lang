@@ -1,0 +1,149 @@
+using System;
+using SDL3;
+using Gui;
+using Gui.Backend;
+using Game.Foundation.Sdl;
+
+namespace Game.Ui;
+
+/// <summary>
+/// 游戏体验层的 HUD 桥：把 <see cref="GameHost"/> 自建的 SDL 窗口
+/// 交给 <see cref="Gui.App"/> 的 SDL 后端接管，然后每一帧
+/// <list type="bullet">
+/// <item>1. 游戏照常把场景画进自己的 <see cref="SdlRenderer"/>（不 Present）；</item>
+/// <item>2. <see cref="ReadScene"/> 把场景帧读回 CPU；</item>
+/// <item>3. <see cref="Frame"/> 里 Gui 控件树在 HUD surface 上重绘，
+/// <c>ScenePresent</c> 把"场景在下、HUD 在上"一次合成呈现。</item>
+/// </list>
+/// 游戏代码从此直接用 stdlib Gui 的控件 + CSS 皮肤写界面（面板、
+/// 聊天、背包、进度条……），配色风格全部落在皮肤文件里；不再
+/// 手算坐标、不再散落颜色魔法数字。
+///
+/// 最小用法：
+/// <code>
+///     GameHost host = new GameHost("传奇", 1280, 720, 16);
+///     host.Open();
+///     GameHud hud = GameHud.Create(host);
+///     hud.Root(() => {
+///         Panel p = new Panel();
+///         p.Class = "hud-panel";
+///         ...
+///     });
+///     while (host.Running()) {
+///         host.PumpEvents(loop);           // 游戏自己的输入处理
+///         host.Render(scene);              // 场景照常画，不 Present
+///         hud.Frame();                     // HUD 合成 + 呈现
+///     }
+/// </code>
+/// SDL 场景读回需要 renderer 后备缓冲可读（D3D/GL 均可）；
+/// 场景尺寸变化由 <see cref="Frame"/> 自动跟随。
+/// </summary>
+class GameHud {
+    GameHost host;
+    App app;
+    Form root;
+    int sceneW;
+    int sceneH;
+    bool adopted;
+    string lastError;
+
+    GameHud() {
+        this.app = null;
+        this.root = null;
+        this.sceneW = 0;
+        this.sceneH = 0;
+        this.adopted = false;
+        this.lastError = "";
+    }
+
+    /// 接管宿主窗口并创建 HUD 应用（设计尺寸=宿主窗口客户区）。
+    /// 失败时返回 null，<see cref="LastError"/> 带原因。
+    static GameHud Create(GameHost gameHost) {
+        GameHud hud = new GameHud();
+        if (gameHost == null || !gameHost.Running()) {
+            hud.lastError = "host not running";
+            return hud;
+        }
+        SdlWindow win = gameHost.Window();
+        if (win == null || !win.IsValid()) {
+            hud.lastError = "host window invalid";
+            return hud;
+        }
+        int rc = Window.AdoptSdlWindow(win.Handle());
+        if (rc != 0) {
+            hud.lastError = "adopt failed rc=" + Convert.ToString(rc)
+                + " (SDL-backend zan_gui required)";
+            return hud;
+        }
+        hud.adopted = true;
+        // 逻辑尺寸取窗口像素尺寸（游戏 HUD 直接按像素布局，
+        // GameHost 的 Letterbox 逻辑坐标只属于场景层）。
+        hud.sceneW = win.Width();
+        hud.sceneH = win.Height();
+        // App 自建 surface 作为 HUD 画布；窗口不用它的自建窗口，
+        // 呈现走 ScenePresent。
+        hud.app = new App("hud", hud.sceneW, hud.sceneH);
+        hud.app.SetDark(true);
+        hud.app.EnableSkins(0);
+        // 游戏皮肤族：半透明黑面板 + 金描边，styles 全落在
+        // skins/gamehud/skin.css（皮肤即数据，游戏不写颜色）。
+        hud.app.ApplySkinName("gamehud");
+        return hud;
+    }
+
+    /// 接管失败原因（成功时为空串）。
+    string LastError() { return this.lastError; }
+
+    /// HUD 是否就绪（接管成功且 App 有效）。
+    bool Ready() {
+        return this.adopted && this.app != null;
+    }
+
+    /// 底层 Gui.App（皮肤、主题、时钟等高级定制入口）。
+    App GetApp() { return this.app; }
+
+    /// 注册 HUD 控件树根：Form 是 Gui 的保留模式窗口根，
+    /// 游戏往它上面挂面板/列表/按钮即可（Class 用 hud-* 系列
+    /// 即落到 gamehud 皮肤）。
+    void Root(Form hudRoot) {
+        this.root = hudRoot;
+    }
+
+    /// 读取场景帧到 rgbaOut（w*h*4 字节）。游戏 Render 之后调用。
+    bool ReadScene(string rgbaOut, int w, int h) {
+        SdlRenderer r = this.host.Renderer();
+        if (r == null) { return false; }
+        return r.ReadPixels(rgbaOut, w, h);
+    }
+
+    /// 一帧 HUD：上传场景帧、重绘控件树、合成呈现。
+    /// 场景帧来自 renderer 后备缓冲（游戏 Render 之后、Present 之前）。
+    /// 游戏也可以不经 Root()，直接拿 GetApp() 自己驱动 BeginFrame/
+    /// PresentFrame（与 Form.Run 相同的顺序）。
+    bool Frame() {
+        if (!this.Ready()) { return false; }
+        SdlWindow win = this.host.Window();
+        int w = win.Width();
+        int h = win.Height();
+        if (w <= 0 || h <= 0) { return false; }
+        // 场景尺寸变化（用户拉窗口）时跟随。
+        if (w != this.sceneW || h != this.sceneH) {
+            this.sceneW = w;
+            this.sceneH = h;
+        }
+        string scene = new string('\0', w * h * 4);
+        if (!this.ReadScene(scene, w, h)) { return false; }
+        Window.SceneUpload(win.Handle(), scene, w, h);
+        App app = this.app;
+        app.ProcessEvent();
+        app.BeginFrame();
+        Form root = this.root;
+        if (root != null) {
+            // 借 Form 的整树测量/布局/绘制（含皮肤主题背景）。
+            root.RenderFrame(app);
+        }
+        app.PresentFrame();
+        Window.ScenePresent(win.Handle(), app.canvas.SurfaceId());
+        return true;
+    }
+}
