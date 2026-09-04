@@ -862,7 +862,8 @@ static zan_io_slot_t *io_slot(int fd) {
     if (fd < 0) return NULL;
     if (fd >= g_slots_cap) {
         int cap = g_slots_cap ? g_slots_cap * 2 : 256;
-        while (cap <= fd) cap *= 2;
+        while (cap > 0 && cap <= fd) cap *= 2;
+        if (cap <= 0) return NULL;   /* fd near INT_MAX: refuse, don't wrap */
         zan_io_slot_t *ns = (zan_io_slot_t *)realloc(g_slots, (size_t)cap * sizeof(*ns));
         if (!ns) return NULL;
         memset(ns + g_slots_cap, 0, (size_t)(cap - g_slots_cap) * sizeof(*ns));
@@ -1155,9 +1156,15 @@ static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t s
          * nothing will ever report it ready and the sweep skips live fds.
          * Unlink the just-queued waiter and fail it through its own sinks
          * (recv -> 0, accept -> -1) instead of parking it forever. */
+        /* io_unlink_waiter frees a heap-chained waiter, so the sinks must be
+         * read BEFORE it runs: reading w->out_n after the unlink was a
+         * use-after-free whose values io_flush_dead later wrote through.
+         * Same snapshot discipline as the kqueue registration path below. */
+        int64_t *fail_out_n = w->out_n;
+        intptr_t *fail_accept = w->out_accept;
         io_unlink_waiter(s, interest == ZAN_IO_READ ? 1 : 0, w);
         g_io_count--;
-        io_mark_dead(co, step, w->out_n, w->out_accept);
+        io_mark_dead(co, step, fail_out_n, fail_accept);
     }
 }
 
@@ -2315,9 +2322,17 @@ typedef struct zan_dns_work {
 static zan_blocking_job_t *g_blocking_pending; /* in flight, owned by workers */
 static zan_blocking_job_t *g_blocking_done;    /* completed, reactor delivery */
 static zan_blocking_job_t *g_blocking_queued;  /* accepted, awaiting worker */
+static int32_t g_blocking_queued_n;            /* length of g_blocking_queued */
 static int32_t g_blocking_active;
 
 #define ZAN_BLOCKING_MAX_ACTIVE 64
+/* Worker-pool queue cap: once all workers are busy and this many jobs are
+ * parked, new submissions fail fast (result 0) instead of queueing without
+ * bound. A dead resolver otherwise turns steady Host.Resolve traffic into
+ * ~370 bytes of pinned job per request at 10s apiece with no backpressure
+ * signal, and both the append walk and the timeout scan are O(queue) per
+ * operation -- quadratic exactly while the resolver is down. */
+#define ZAN_BLOCKING_MAX_QUEUED 1024
 
 static int64_t dns_now_ms(void) {
 #if defined(_WIN32)
@@ -2371,6 +2386,7 @@ static void blocking_finish_worker(zan_blocking_job_t *job) {
         next = g_blocking_queued;
         g_blocking_queued = next->queue_next;
         next->queue_next = NULL;
+        g_blocking_queued_n--;
         next->started = 1;
         g_blocking_active++;
     }
@@ -2445,6 +2461,7 @@ static void blocking_start_next(void) {
         next = g_blocking_queued;
         g_blocking_queued = next->queue_next;
         next->queue_next = NULL;
+        g_blocking_queued_n--;
         next->started = 1;
         g_blocking_active++;
     }
@@ -2453,21 +2470,37 @@ static void blocking_start_next(void) {
 }
 
 static void blocking_submit(zan_blocking_job_t *job) {
-    int start = 0;
+    int start = 0, oversubscribed = 0;
     dns_lock();
-    job->next = g_blocking_pending;
-    g_blocking_pending = job;
-    g_blocking_inflight++;
-    if (g_blocking_active < ZAN_BLOCKING_MAX_ACTIVE) {
-        job->started = 1;
-        g_blocking_active++;
-        start = 1;
+    if (g_blocking_active >= ZAN_BLOCKING_MAX_ACTIVE &&
+        g_blocking_queued_n >= ZAN_BLOCKING_MAX_QUEUED) {
+        oversubscribed = 1;
     } else {
-        zan_blocking_job_t **tail = &g_blocking_queued;
-        while (*tail) tail = &(*tail)->queue_next;
-        *tail = job;
+        job->next = g_blocking_pending;
+        g_blocking_pending = job;
+        g_blocking_inflight++;
+        if (g_blocking_active < ZAN_BLOCKING_MAX_ACTIVE) {
+            job->started = 1;
+            g_blocking_active++;
+            start = 1;
+        } else {
+            zan_blocking_job_t **tail = &g_blocking_queued;
+            while (*tail) tail = &(*tail)->queue_next;
+            *tail = job;
+            g_blocking_queued_n++;
+        }
     }
     dns_unlock();
+    if (oversubscribed) {
+        /* The job was never linked into any list, so failing it here mirrors
+         * the timed-out path exactly: write the failure, wake the frame, and
+         * free -- the reactor must never learn this job existed. */
+        if (job->out) *job->out = 0;
+        if (job->out64) *job->out64 = 0;
+        io_wake(job->frame, job->step);
+        free(job);
+        return;
+    }
     if (start) blocking_spawn(job);
 }
 
@@ -2529,7 +2562,10 @@ static int dns_timeout_scan(void) {
         if (!j->started) {
             zan_blocking_job_t **qp = &g_blocking_queued;
             while (*qp && *qp != j) qp = &(*qp)->queue_next;
-            if (*qp == j) *qp = j->queue_next;
+            if (*qp == j) {
+                *qp = j->queue_next;
+                g_blocking_queued_n--;
+            }
             j->queue_next = NULL;
             j->next = timed_out;
             timed_out = j;
@@ -2607,8 +2643,12 @@ static int dns_drain(void) {
          * an interior pointer into the destination frame -- is guaranteed
          * still valid here. The staging write happened-before this read via
          * the worker's dns_lock handoff in blocking_finish_worker. */
-        if (j->sabuf && j->result > 0) {
+        if (j->sabuf && j->sacap > 0 && j->result > 0) {
             size_t len = (size_t)j->result;
+            /* sacap must be re-validated positive here: the worker clamps a
+             * negative caller capacity up to the staging size and resolves
+             * fine, so result can be 16..28 while sacap is still negative --
+             * and (size_t)sacap would pass this bound as ~SIZE_MAX. */
             if (len <= (size_t)j->sacap)
                 memcpy(j->sabuf, ((zan_dns_work_t *)j)->sa_staging, len);
         }
@@ -2634,6 +2674,7 @@ static void dns_shutdown_cleanup(void) {
     }
     zan_blocking_job_t *queued = g_blocking_queued;
     g_blocking_queued = NULL;
+    g_blocking_queued_n = 0;
     while (queued) {
         zan_blocking_job_t *n = queued->queue_next;
         zan_blocking_job_t **pp = &g_blocking_pending;

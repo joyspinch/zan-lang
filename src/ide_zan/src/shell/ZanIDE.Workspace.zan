@@ -342,11 +342,21 @@ partial class ZanIDE {
         List<string> files = DirectoryTree.Flat(srcDir, PathFilter.Only(".zform"));
         for (int i = 0; i < files.Count; i = i + 1) {
             string fp = files[i];
-            JsonValue d = JsonValue.Parse(File.ReadAllText(fp));
-            if (!Designer.RetargetDoc(d, devW, devH, devId)) { continue; }
-            File.WriteAllText(fp, d.PrettyToJson());
-            log.Add("> Design canvas set to " + Convert.ToString(devW) + "x"
-                + Convert.ToString(devH) + " (" + devId + "): " + fp);
+            // 逐文件守卫：模板 src/ 里的一份坏 .zform（截断/手改的 JSON，
+            // 或目标文件被占用/只读）不能把整个"新建项目"炸成进程闪退——
+            // 记日志跳过，其余文件继续。这条链在 WizardHost 的子窗口泵里
+            // 运行，不走主框架的每帧 catch。
+            try {
+                JsonValue d = JsonValue.Parse(File.ReadAllText(fp));
+                if (!Designer.RetargetDoc(d, devW, devH, devId)) { continue; }
+                File.WriteAllText(fp, d.PrettyToJson() + "\n");
+                log.Add("> Design canvas set to " + Convert.ToString(devW) + "x"
+                    + Convert.ToString(devH) + " (" + devId + "): " + fp);
+            } catch (Exception e) {
+                log.Add(ZanIDE.T("> Skipped unreadable design file: " + fp
+                        + " (" + e.Message + ")",
+                        "> 跳过无法读取的设计文件：" + fp + "（" + e.Message + "）"));
+            }
         }
     }
 
@@ -1375,17 +1385,28 @@ partial class ZanIDE {
     }
 
     /// Whether the zanc this IDE runs supports --emit-hap (probed from its
-    /// --help output each call; only reached when a HarmonyOS target is
-    /// selected, so the cost is one process spawn per publish click).
+    /// --help output; only reached when a HarmonyOS target is selected).
     /// Older toolchains predate HarmonyOS packaging, and an OHOS target on
     /// one of them must skip with a hint instead of dying on an unknown
     /// option mid-publish.
+    static bool zancHapProbed;
+    static bool zancHapSupported;
     static bool ZancHasEmitHap(string zc) {
-        List<string> outp = Process.RunCapture("\"" + zc + "\" --help");
+        // 一次发布勾选两个鸿蒙架构会走到这里两次；探测对同一个 zanc
+        // 前缀结果不会变，缓存住，别每次都在 UI 线程上重复 spawn 进程
+        // （升级工具链后重启 IDE 会重新探测）。
+        if (zancHapProbed) { return zancHapSupported; }
+        // zc 已经是带引号的前缀（ZancCmd：'"exe" --stdlib-path "dir"'），
+        // 不能再包一层引号，否则命令损坏、探测恒 false。
+        List<string> outp = Process.RunCapture(zc + " --help");
         for (int i = 0; i < outp.Count; i = i + 1) {
-            if (ZanIDE.Has(outp[i], "--emit-hap")) { return true; }
+            if (ZanIDE.Has(outp[i], "--emit-hap")) {
+                zancHapSupported = true;
+                break;
+            }
         }
-        return false;
+        zancHapProbed = true;
+        return zancHapSupported;
     }
 
     /// OHOS build-environment preflight for a HarmonyOS publish step. zanc's

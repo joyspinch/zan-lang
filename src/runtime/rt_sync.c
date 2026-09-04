@@ -2209,7 +2209,11 @@ int32_t zan_shared_table_delete_at(int64_t handle, int64_t key_hash) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table) return 0;
     zan_struct_lock(table->header);
-    zan_purge_expired_locked(table->header, zan_wall_now_ms(), UINT64_MAX);
+    /* Batched, not UINT64_MAX: the delete below matches the row by key either
+     * way, so deferring part of the sweep to later ops cannot change the
+     * result -- it only keeps a mass shared-TTL table from holding this
+     * cross-process lock for one giant critical section. */
+    zan_purge_expired_locked(table->header, zan_wall_now_ms(), ZAN_PURGE_MAX_BATCH);
     unsigned char *row = zan_find_row_hash(
         table->header, (uint64_t)key_hash, 0);
     if (row) {
@@ -2293,7 +2297,11 @@ int32_t zan_shared_table_rate_allow(
 
     int allowed = 0;
     zan_struct_lock(table->header);
-    zan_purge_expired_locked(table->header, now_ms, UINT64_MAX);
+    /* Batched: an expired window row either was purged (fresh create) or is
+     * still found with start far enough back that the reset branch fires --
+     * both paths open a new window, so the batch cap cannot change the
+     * verdict, only shorten this cross-process critical section. */
+    zan_purge_expired_locked(table->header, now_ms, ZAN_PURGE_MAX_BATCH);
     /* Existence-first, like zan_lock_row_for: the 7/8 load-factor refusal in
      * zan_find_row(create=1) fires before the probe loop, so a direct create
      * call would deny requests for LONG-EXISTING keys once the table nears
@@ -2366,7 +2374,9 @@ int32_t zan_shared_table_lock_release(
 
     int released = 0;
     zan_struct_lock(table->header);
-    zan_purge_expired_locked(table->header, zan_wall_now_ms(), UINT64_MAX);
+    /* Batched (NOT lock_acquire): release matches the row by key and owner
+     * regardless of expiry, so a deferred sweep cannot change the outcome. */
+    zan_purge_expired_locked(table->header, zan_wall_now_ms(), ZAN_PURGE_MAX_BATCH);
     unsigned char *row = zan_find_row(table->header, key, 0);
     if (row) {
         zan_row_lock(row);
@@ -2391,7 +2401,9 @@ int32_t zan_shared_table_delete(int64_t handle, const char *key) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table) return 0;
     zan_struct_lock(table->header);
-    zan_purge_expired_locked(table->header, zan_wall_now_ms(), UINT64_MAX);
+    /* Batched: same reasoning as delete_at -- the key match below hits the row
+     * whether or not its expiry was swept this call. */
+    zan_purge_expired_locked(table->header, zan_wall_now_ms(), ZAN_PURGE_MAX_BATCH);
     unsigned char *row = zan_find_row(table->header, key, 0);
     if (row) {
         zan_row_lock(row);

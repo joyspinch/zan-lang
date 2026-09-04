@@ -326,7 +326,11 @@ void zan_rt_soft_note3(const char *file, unsigned line, unsigned col,
                      file ? file : "<unknown>", line, col,
                      msg ? msg : "");
     if (n <= 0) return;
-    if ((size_t)n >= sizeof buf) n = (int)sizeof buf - 1;
+    /* Reserve two bytes for the trailing "\n\0" pair. Clamping to size-1 made
+     * buf[n + 1] write one byte past the array when the report overflowed --
+     * precisely the long-path/long-message guard failure this handler exists
+     * to survive; guard_fail3's n + 1 < sizeof buf check is the same rule. */
+    if ((size_t)n >= sizeof buf - 1) n = (int)sizeof buf - 2;
     buf[n] = '\n';
     buf[n + 1] = '\0';
     timer_lock();
