@@ -5,14 +5,21 @@ using Game.Arpg;
 
 namespace Game.Arpg.Data;
 
-// 基于通用 SQLite 连接的 ZGM 原生存档仓库。
-// 其结构为 ZGM 私有：每个槽位一行，外加规范化的子行，用于
-// 背包、装备、已学技能与生效中的增益。它与
-// 通用 System.Data.Sqlite API 保持分离。
+/// <summary>
+/// 基于通用 SQLite 连接的 ZGM 原生存档仓库。
+/// 其结构为 ZGM 私有：每个槽位一行，外加规范化的子行，用于
+/// 背包、装备、已学技能与生效中的增益。它与
+/// 通用 System.Data.Sqlite API 保持分离。
+/// </summary>
 class ArpgSaveRepository {
     ArpgDatabase database;
     bool ready;
 
+    /// <summary>
+    /// 在已打开的数据库上打开存档仓库：database 为 null 或未打开时
+    /// 返回 null，否则建表并返回仓库；IsReady() 反映建表是否成功，
+    /// 未就绪时所有读写操作均失败。
+    /// </summary>
     static ArpgSaveRepository Open(ArpgDatabase database) {
         if (database == null || !database.IsOpen()) { return null; }
         ArpgSaveRepository repository = new ArpgSaveRepository();
@@ -21,6 +28,8 @@ class ArpgSaveRepository {
         return repository;
     }
 
+    /// 便捷入口：从项目解析名为 componentName 的 Sqlite 组件并在其
+    /// 数据库文件 path 上打开存档仓库（组件缺失时返回 null）。
     static ArpgSaveRepository OpenProject(
         ArpgProject project,
         string componentName,
@@ -31,9 +40,12 @@ class ArpgSaveRepository {
         return ArpgSaveRepository.Open(database);
     }
 
+    /// 建表是否成功；为 false 时 Save/Load 等操作一律拒绝。
     bool IsReady() { return this.ready; }
+    /// 底层数据库连接。
     ArpgDatabase Database() { return this.database; }
 
+    /// 表 table 是否已存在列 column（用 PRAGMA table_info 查询）。
     bool HasColumn(string table, string column) {
         DbResult columns = this.database.Query(
             "PRAGMA table_info(" + table + ")");
@@ -42,6 +54,8 @@ class ArpgSaveRepository {
         }
         return false;
     }
+    /// 确保表 table 存在列 column：已存在直接返回 true，缺失时
+    /// ALTER TABLE 添加（definition 为列定义），失败返回 false。
     bool EnsureColumn(string table, string column, string definition) {
         if (this.HasColumn(table, column)) { return true; }
         return this.database.Execute(
@@ -49,6 +63,11 @@ class ArpgSaveRepository {
             + column + " " + definition) >= 0;
     }
 
+    /// <summary>
+    /// 创建全部存档表（IF NOT EXISTS，含主槽表与物品/装备/技能/
+    /// 增益四张子表），并为旧库补齐 hero_experience/hero_rage 两列。
+    /// 任一步失败返回 false。
+    /// </summary>
     bool Initialize() {
         int saves = this.database.Execute(
             "CREATE TABLE IF NOT EXISTS zgm_save_slot ("
@@ -106,9 +125,11 @@ class ArpgSaveRepository {
         return buffs >= 0;
     }
 
-    // 为 SQLite 转义一个值，无需第二套 SQL 参数 API。
-    // 仓库只拼接槽位与物品标识符；数值
-    // 快照字段以整数形式输出。
+    /// <summary>
+    /// 为 SQLite 转义一个值，无需第二套 SQL 参数 API。
+    /// 仓库只拼接槽位与物品标识符；数值
+    /// 快照字段以整数形式输出。
+    /// </summary>
     static string Quote(string text) {
         string result = "'";
         for (int i = 0; i < text.Length; i = i + 1) {
@@ -122,6 +143,12 @@ class ArpgSaveRepository {
         return result + "'";
     }
 
+    /// <summary>
+    /// 将 state 全量覆写保存到槽位 slot：主行 INSERT OR REPLACE，
+    /// 四张子表先删后插，整个过程在一个事务内，任一步失败即
+    /// 回滚并返回 false。未就绪、slot 为空串或 state 为 null 时
+    /// 直接返回 false。
+    /// </summary>
     bool Save(string slot, ArpgSaveState state) {
         if (!this.ready || slot == "" || state == null) { return false; }
         string key = ArpgSaveRepository.Quote(slot);
@@ -226,6 +253,11 @@ class ArpgSaveRepository {
         return true;
     }
 
+    /// <summary>
+    /// 读取槽位 slot 为 ArpgSaveState：主行不存在、未就绪或 slot
+    /// 为空串时返回 null。物品/装备/技能/增益子行分别按名称排序
+    /// 读回（与保存顺序无关）。
+    /// </summary>
     ArpgSaveState Load(string slot) {
         if (!this.ready || slot == "") { return null; }
         string key = ArpgSaveRepository.Quote(slot);
@@ -287,6 +319,7 @@ class ArpgSaveRepository {
         return state;
     }
 
+    /// 槽位 slot 是否已有存档；未就绪或 slot 为空串时返回 false。
     bool Exists(string slot) {
         if (!this.ready || slot == "") { return false; }
         string count = this.database.Scalar(
@@ -295,6 +328,11 @@ class ArpgSaveRepository {
         return Convert.ToInt32(count) > 0;
     }
 
+    /// <summary>
+    /// 删除槽位 slot：在一个事务内删除主行与全部子行，任一步
+    /// 失败即回滚并返回 false。返回 true 表示槽位确实存在且已删除，
+    /// 槽位本不存在返回 false（此时数据已无变化）。
+    /// </summary>
     bool Delete(string slot) {
         if (!this.ready || slot == "") { return false; }
         string key = ArpgSaveRepository.Quote(slot);
@@ -321,12 +359,15 @@ class ArpgSaveRepository {
         return saveResult > 0;
     }
 
+    /// 存档槽位总数；未就绪时返回 0。
     int SlotCount() {
         if (!this.ready) { return 0; }
         return Convert.ToInt32(
             this.database.Scalar("SELECT COUNT(*) FROM zgm_save_slot"));
     }
 
+    /// 按槽位名排序后的第 index 个槽位名；未就绪、index 为负或
+    /// 越界时返回空串。
     string SlotAt(int index) {
         if (!this.ready || index < 0) { return ""; }
         DbResult slots = this.database.Query(
@@ -335,6 +376,7 @@ class ArpgSaveRepository {
         return slots.GetString(index, 0);
     }
 
+    /// 关闭底层数据库并将仓库置为未就绪；之后所有操作均失败。
     void Close() {
         if (this.database != null) {
             this.database.Close();

@@ -2,6 +2,10 @@ using System;
 
 namespace Game.Board;
 
+/// <summary>
+/// 回合状态机：轮转当前玩家与回合数，维护阶段字符串与胜负。
+/// 玩家编号从 0 起，round 从 1 起（每位玩家各行动一次为一轮）。
+/// </summary>
 class TurnState {
     int playerCount;
     int currentPlayer;
@@ -20,6 +24,7 @@ class TurnState {
         this.winner = -1;
     }
 
+    /// 轮转到下一位玩家；wrap 到 0 时回合数 +1。对局已结束后无操作。
     void NextPlayer() {
         if (this.finished) { return; }
         this.currentPlayer = this.currentPlayer + 1;
@@ -29,6 +34,7 @@ class TurnState {
         }
     }
 
+    /// 结束对局：置 finished、记录胜者并把阶段改为 "finished"。
     void Finish(int winner) {
         this.finished = true;
         this.winner = winner;
@@ -83,11 +89,13 @@ class BoardCommand {
     string payload;
     int sequence;
 
+    /// 工厂：place 指令——把格子值 cellValue 放到 (x, y)。
     static BoardCommand Place(int player, int x, int y, int cellValue) {
         return new BoardCommand(
             "place", player, -1, -1, x, y, cellValue, "");
     }
 
+    /// 工厂：move 指令——把棋子从 (fromX, fromY) 移到 (toX, toY)。
     static BoardCommand Move(
         int player,
         int fromX,
@@ -99,6 +107,8 @@ class BoardCommand {
             "move", player, fromX, fromY, toX, toY, 0, "");
     }
 
+    /// 工厂：自定义 action 指令——type 为规则层自定的类型标签，
+    /// 携带数值 amount 与字符串 payload，不含坐标。
     static BoardCommand Action(
         string type,
         int player,
@@ -165,10 +175,16 @@ class BoardReplayEntry {
         this.stateHash = stateHash;
     }
 
+    /// 本次记录的指令。
     BoardCommand Command() { return this.command; }
+    /// 指令应用后的对局状态哈希（BoardMatch.Hash 的返回值）。
     int StateHash() { return this.stateHash; }
 }
 
+/// <summary>
+/// 回放日志：按应用顺序保存指令与应用后的状态哈希，
+/// 供确定性回放与回滚（Restore 用 Truncate 截断）。
+/// </summary>
 class BoardCommandLog {
     List<BoardReplayEntry> entries;
 
@@ -176,6 +192,7 @@ class BoardCommandLog {
         this.entries = new List<BoardReplayEntry>();
     }
 
+    /// 追加一条记录（由 BoardMatch.TryApply 在指令生效后调用）。
     void Add(BoardCommand command, int stateHash) {
         this.entries.Add(new BoardReplayEntry(command, stateHash));
     }
@@ -189,16 +206,29 @@ class BoardCommandLog {
         }
     }
 
+    /// 记录条数。
     int Count() { return this.entries.Count; }
+    /// 第 index 条记录；越界行为由底层 List 决定（抛错）。
     BoardReplayEntry At(int index) { return this.entries[index]; }
+    /// 清空全部记录。
     void Clear() { this.entries.Clear(); }
 }
 
+/// <summary>
+/// 规则接口：规则层实现校验与应用，对局核心只依赖此接口，
+/// 使同一对局框架可承载不同棋类玩法。
+/// </summary>
 interface IBoardRules {
+    /// 指令是否合法（不修改状态；应校验玩家/坐标/阶段等）。
     bool Validate(BoardMatch match, BoardCommand command);
+    /// 应用指令并修改对局状态；返回 false 表示应用失败（指令不入日志）。
     bool Apply(BoardMatch match, BoardCommand command);
 }
 
+/// <summary>
+/// 某一指令序号处的对局完整快照：棋盘与回合状态均为深拷贝，
+/// 用于悔棋/回滚；由 BoardMatch.Snapshot 创建。
+/// </summary>
 class BoardSnapshot {
     GridBoard board;
     TurnState turn;
@@ -246,6 +276,12 @@ class BoardMatch {
         this.sequence = 0;
     }
 
+    /// <summary>
+    /// 尝试应用一条指令：对局未结束、指令来自当前玩家、规则
+    /// Validate 与 Apply 全部通过才生效。生效后指令顺序号 +1 并
+    /// 写回指令、连同状态哈希记入日志；任一条件不满足返回 false
+    /// 且不修改任何状态。
+    /// </summary>
     bool TryApply(BoardCommand command) {
         if (command == null || this.rules == null || this.turn.Finished()) {
             return false;
@@ -259,10 +295,16 @@ class BoardMatch {
         return true;
     }
 
+    /// 创建当前对局的完整快照（棋盘与回合状态深拷贝）。
     BoardSnapshot Snapshot() {
         return new BoardSnapshot(this.board, this.turn, this.sequence);
     }
 
+    /// <summary>
+    /// 恢复到快照时的状态（棋盘/回合/顺序号均为深拷贝回填），
+    /// 并把指令日志截断到该顺序号，丢弃之后的历史；snapshot 为
+    /// null 时无操作。
+    /// </summary>
     void Restore(BoardSnapshot snapshot) {
         if (snapshot == null) { return; }
         this.board = snapshot.Board().Clone();
@@ -271,6 +313,10 @@ class BoardMatch {
         this.log.Truncate(this.sequence);
     }
 
+    /// <summary>
+    /// 对局状态哈希：棋盘哈希混合当前玩家、回合数与指令顺序号
+    /// （乘 31 累加）。重放指令后哈希应一致，可用于回放校验。
+    /// </summary>
     int Hash() {
         int hash = this.board.Hash();
         hash = hash * 31 + this.turn.CurrentPlayer();
