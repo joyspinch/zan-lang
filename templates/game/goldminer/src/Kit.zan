@@ -1,0 +1,530 @@
+// Kit — 黄金矿工模板自带的 SDL 游戏小工具箱（自包含，不依赖
+// examples/game/common 的 GameKit）：宿主窗口、资源定位、确定性
+// 随机数、整数绘图、系统字体文本。游戏只画场景；窗口顶栏/结算/
+// 拆弹等 UI 走 stdlib Gui 控件树（GameHud + gamehud 皮肤），见
+// src/main.zan。
+//
+// 模板里的 Kit 允许随项目改：字体、按键、配色直接改这里即可。
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Resources;
+using System.Security;
+using SDL3;
+
+namespace GoldMiner;
+
+// 资源定位：从 exe 目录向上逐级找 assets/，兼容 IDE 运行（exe 在
+// build 临时目录）、发布目录与源码树三种布局；最后回退工作目录。
+class Assets {
+    static string exeDir;
+    static bool exeDirReady;
+
+    public static string ExeDir() {
+        if (Assets.exeDirReady) { return Assets.exeDir; }
+        Assets.exeDirReady = true;
+        Assets.exeDir = Assets.Parent(ProcessHost.SelfExe());
+        return Assets.exeDir;
+    }
+
+    // 目录部分；无分隔符时返回 ""。
+    static string Parent(string path) {
+        int cut = -1;
+        for (int i = 0; i < path.Length; i = i + 1) {
+            string c = path.Substring(i, 1);
+            if (c == "/" || c == "\\") { cut = i; }
+        }
+        if (cut <= 0) { return ""; }
+        return path.Substring(0, cut);
+    }
+
+    public static string Find(string rel) {
+        string dir = Assets.ExeDir();
+        for (int up = 0; dir != "" && up < 4; up = up + 1) {
+            string p = dir + "/" + rel;
+            if (File.Exists(p)) { return p; }
+            dir = Assets.Parent(dir);
+        }
+        // 最后试工作目录及其上级（IDE Run 在项目根启动、zanc run
+        // 的 exe 在临时目录等情况）。
+        string cwdRel = rel;
+        for (int outward = 0; outward < 4; outward = outward + 1) {
+            if (File.Exists(cwdRel)) { return cwdRel; }
+            cwdRel = "../" + cwdRel;
+        }
+        return rel;
+    }
+}
+
+// 确定性 xorshift 随机数（可复现仿真/摆放）。
+class Rng {
+    long state;
+
+    public static Rng Seed(long s) {
+        Rng g = new Rng();
+        if (s == 0) { s = 88172645463325252L; }
+        g.state = s;
+        return g;
+    }
+
+    long NextLong() {
+        long x = this.state;
+        x = x ^ (x << 13);
+        x = x ^ (x >> 7);
+        x = x ^ (x << 17);
+        this.state = x;
+        return x;
+    }
+
+    int Next() {
+        long v = this.NextLong();
+        if (v < 0) { v = -v; }
+        return (int)(v & 2147483647);
+    }
+
+    // 均匀整数 [lo, hi)。
+    public int Range(int lo, int hi) {
+        if (hi <= lo) { return lo; }
+        return lo + this.Next() % (hi - lo);
+    }
+
+    // 均匀浮点 [0, 1)。
+    public double NextDouble01() {
+        return (this.Next() & 16777215) / 16777216.0;
+    }
+}
+
+// SDL3 宿主窗口：固定逻辑画布 + 超采样离屏合成，帧率/事件与
+// 全屏切换。游戏全部以设计单位绘制，r.Sc() 映射到实际光栅。
+class Host {
+    #if WINDOWS
+    // F11 退出全屏后还原到原始窗口尺寸（而非最大化状态）。
+    [DllImport("SDL3", EntryPoint = "SDL_RestoreWindow")]
+    static extern int SdlRestoreWindow(nint win);
+    #endif
+
+    SdlWindow window;
+    public SdlRenderer r;
+    SdlTexture canvas;
+    int logicalW;
+    int logicalH;
+    int canvasW;
+    int canvasH;
+    bool running;
+    bool fullscreen;
+    bool ignoreMax;
+    int frameMs;
+    int nextFrame;
+    int idleMs;
+    bool minimized;
+
+    // ss = 超采样上限：画布光栅取窗口输出分辨率并夹在
+    // [logical .. ss x logical]，1:1 窗口最锐利、缩小窗口靠线性
+    // 下采样得到抗锯齿，4K 全屏仍有完整光栅。
+    public static Host CreateFull(string title, int logicalW, int logicalH,
+                                  int ss, bool customBarUnused) {
+        Sdl.Init(SdlInit.Video() + SdlInit.Events());
+        Host h = new Host();
+        int flags = SdlWindowFlags.Resizable() + SdlWindowFlags.HighPixelDensity();
+        h.window = SdlWindow.Create(title, logicalW * 3 / 2, logicalH * 3 / 2, flags);
+        if (!h.window.IsValid()) { Sdl.Quit(); return h; }
+        h.r = SdlRenderer.Create(h.window);
+        if (!h.r.IsValid()) { h.window.Close(); Sdl.Quit(); return h; }
+        h.r.SetBlend(1);
+        h.r.SetVSync(true);
+        if (ss < 1) { ss = 1; }
+        int outPacked = h.r.OutputSize();
+        int outW = outPacked & 65535;
+        int outH = outPacked >> 16;
+        h.canvasW = outW;
+        if (h.canvasW < logicalW) { h.canvasW = logicalW; }
+        if (h.canvasW > logicalW * ss) { h.canvasW = logicalW * ss; }
+        h.canvasH = outH;
+        if (h.canvasH < logicalH) { h.canvasH = logicalH; }
+        if (h.canvasH > logicalH * ss) { h.canvasH = logicalH * ss; }
+        h.r.SetLogicalSize(h.canvasW, h.canvasH,
+            SdlLogicalPresentation.Letterbox());
+        // 分数缩放因子 num/den 供 r.Sc() 使用（Go 校规约简）。
+        int num = h.canvasW;
+        int den = logicalW;
+        if (h.canvasH * den > h.canvasW * logicalH) { num = h.canvasH; den = logicalH; }
+        int g0 = num; int g1 = den;
+        while (g1 != 0) { int g = g0 % g1; g0 = g1; g1 = g; }
+        if (g0 > 1) { num = num / g0; den = den / g0; }
+        h.r.SetUiScale(num, den);
+        h.canvas = SdlTexture.CreateTarget(h.r, h.canvasW, h.canvasH);
+        h.logicalW = logicalW;
+        h.logicalH = logicalH;
+        h.running = h.canvas != null && h.canvas.IsValid();
+        h.frameMs = 0;
+        return h;
+    }
+
+    public SdlRenderer Renderer() { return this.r; }
+    public int Width() { return this.logicalW; }
+    public int Height() { return this.logicalH; }
+    public bool Running() { return this.running; }
+    public void Quit() { this.running = false; }
+    public nint WindowHandle() { return this.window.Handle(); }
+
+    // 帧率上限：睡到帧起始截止时刻（Present 之后不再补睡），
+    // 165Hz 屏上也只跑请求的 fps。
+    public void LimitFps(int fps) {
+        if (fps < 10) { fps = 10; }
+        if (fps > 240) { fps = 240; }
+        this.frameMs = 1000 / fps;
+        this.nextFrame = Sdl.Ticks();
+    }
+
+    // 最小化时空闲帧距（后台游戏几乎不耗 CPU）。
+    public void SetIdleFps(int fps) {
+        if (fps < 1) { fps = 1; }
+        this.idleMs = 1000 / fps;
+    }
+
+    void PaceFrame() {
+        int ms = this.frameMs;
+        if (this.minimized && this.idleMs > ms) { ms = this.idleMs; }
+        if (ms <= 0) { return; }
+        int now = Sdl.Ticks();
+        if (now < this.nextFrame) {
+            int slack = this.nextFrame - now;
+            if (slack > 4) { Sdl.Delay(slack - 3); }
+        }
+        this.nextFrame = this.nextFrame + ms;
+        if (this.nextFrame < now) { this.nextFrame = now + ms; }
+    }
+
+    public void ToggleFullscreen() {
+        this.fullscreen = !this.fullscreen;
+        this.window.SetFullscreen(this.fullscreen);
+        if (!this.fullscreen) {
+            this.ignoreMax = true;
+            #if WINDOWS
+            Host.SdlRestoreWindow(this.window.Handle());
+            #endif
+        }
+    }
+
+    public void OnWindowEvent(int type) {
+        if (type == SdlEventType.WindowMinimized()) {
+            this.minimized = true;
+            this.nextFrame = Sdl.Ticks() + this.frameMs;
+        }
+        if (type == SdlEventType.WindowMaximized()) {
+            if (this.ignoreMax) { this.ignoreMax = false; return; }
+            if (!this.fullscreen) {
+                this.fullscreen = true;
+                this.window.SetFullscreen(true);
+            }
+        }
+        if (type == SdlEventType.WindowRestored()) {
+            this.ignoreMax = false;
+            this.minimized = false;
+        }
+    }
+
+    // 鼠标位置换算回设计单位（含画布分数缩放）。
+    public int MouseX() {
+        return this.r.LogicalX(SdlEvent.MouseX(), SdlEvent.MouseY())
+            * this.r.ScaleDen() / this.r.ScaleNum();
+    }
+    public int MouseY() {
+        return this.r.LogicalY(SdlEvent.MouseX(), SdlEvent.MouseY())
+            * this.r.ScaleDen() / this.r.ScaleNum();
+    }
+
+    // Begin 选中离屏画布并清屏；End 合成回贴并呈现。
+    // hudMode：GameHud 接管呈现（场景帧由它 ReadPixels→SceneUpload→
+    // ScenePresent 合成），宿主自己不再 Present。
+    public bool hudMode;
+
+    public void Begin(int cr, int cg, int cb) {
+        if (this.canvas != null && this.canvas.IsValid()) {
+            this.r.SetTarget(this.canvas);
+        }
+        this.r.SetColor(cr, cg, cb, 255);
+        this.r.Clear();
+    }
+
+    public void End() {
+        if (this.canvas != null && this.canvas.IsValid()) {
+            this.r.ResetTarget();
+            this.r.SetColor(0, 0, 0, 255);
+            this.r.Clear();
+            this.r.DrawTexture(this.canvas, 0, 0, this.logicalW, this.logicalH);
+        }
+        if (!this.hudMode) { this.r.Present(); }
+        this.PaceFrame();
+    }
+}
+
+// 整数绘图辅助（SDL 封装没有的部分）：圆、圆角、渐变、圆环描边。
+// 全部在设计单位上接收坐标，内部经 r.Sc() 升到画布光栅。
+class Draw {
+    static int Isqrt(int n) {
+        if (n <= 0) { return 0; }
+        int x = n;
+        int y = (x + 1) / 2;
+        while (y < x) {
+            x = y;
+            y = (x + n / x) / 2;
+        }
+        return x;
+    }
+
+    public static void FillCircle(SdlRenderer r, int cx, int cy, int rad,
+                                  int cr, int cg, int cb, int ca) {
+        if (rad <= 0) { return; }
+        int scx = r.Sc(cx); int scy = r.Sc(cy); int srad = r.Sc(rad);
+        r.SetColor(cr, cg, cb, ca);
+        int dy = -srad;
+        while (dy <= srad) {
+            int dx = Draw.Isqrt(srad * srad - dy * dy);
+            r.FillRectRaw(scx - dx, scy + dy, dx * 2 + 1, 1);
+            dy = dy + 1;
+        }
+    }
+
+    // 垂直渐变（整屏背景用；直接扫描线，背景每帧只画一次可接受）。
+    public static void VGradient(SdlRenderer r, int x, int y, int w, int h,
+                                 int r0, int g0, int b0,
+                                 int r1, int g1, int b1, int ca) {
+        if (h <= 0) { return; }
+        for (int j = 0; j < h; j = j + 1) {
+            int cr = r0 + (r1 - r0) * j / h;
+            int cg = g0 + (g1 - g0) * j / h;
+            int cb = b0 + (b1 - b0) * j / h;
+            r.SetColor(cr, cg, cb, ca);
+            r.FillRect(x, y + j, w, 1);
+        }
+    }
+
+    // 圆角矩形（扫描线；本模板只画少量面板，无需烘焙九宫格）。
+    public static void RoundRectFill(SdlRenderer r, int x, int y, int w, int h,
+                                     int rad, int cr, int cg, int cb, int ca) {
+        if (w <= 0 || h <= 0) { return; }
+        if (rad * 2 > w) { rad = w / 2; }
+        if (rad * 2 > h) { rad = h / 2; }
+        r.SetColor(cr, cg, cb, ca);
+        if (rad < 1) { r.FillRect(x, y, w, h); return; }
+        int sx = r.Sc(x); int sy = r.Sc(y);
+        int sw = r.Sc(x + w) - sx; int sh = r.Sc(y + h) - sy;
+        int srad = r.Sc(rad);
+        for (int dy = 0; dy < sh; dy = dy + 1) {
+            int inset = 0;
+            int t = 0;
+            if (dy < srad) { t = srad - dy; }
+            if (dy > sh - 1 - srad) { t = dy - (sh - 1 - srad); }
+            if (t > 0) { inset = srad - Draw.Isqrt(srad * srad - t * t); }
+            r.FillRectRaw(sx + inset, sy + dy, sw - inset * 2, 1);
+        }
+    }
+
+    public static void RingRect(SdlRenderer r, int x, int y, int w, int h, int t,
+                                int cr, int cg, int cb, int ca) {
+        r.SetColor(cr, cg, cb, ca);
+        r.FillRect(x, y, w, t);
+        r.FillRect(x, y + h - t, w, t);
+        r.FillRect(x, y, t, h);
+        r.FillRect(x + w - t, y, t, h);
+    }
+
+    // 圆环描边（QTE 圈）；scanline 双半径差。
+    public static void CircleStroke(SdlRenderer r, int cx, int cy, int rad,
+                                    int cr, int cg, int cb, int ca) {
+        if (rad <= 0) { return; }
+        int scx = r.Sc(cx); int scy = r.Sc(cy);
+        int srad = r.Sc(rad);
+        int inR = srad - r.Sc(2);
+        if (inR < 1) { inR = srad - 1; }
+        r.SetColor(cr, cg, cb, ca);
+        int dy = -srad;
+        while (dy <= srad) {
+            int o = Draw.Isqrt(srad * srad - dy * dy);
+            int i2 = inR * inR - dy * dy;
+            int inr = i2 > 0 ? Draw.Isqrt(i2) : -1;
+            if (inr < 0) {
+                r.FillRectRaw(scx - o, scy + dy, o * 2 + 1, 1);
+            } else {
+                r.FillRectRaw(scx - o, scy + dy, o - inr + 1, 1);
+                r.FillRectRaw(scx + inr, scy + dy, o - inr + 1, 1);
+            }
+            dy = dy + 1;
+        }
+    }
+}
+
+// 系统字体文本：经 zan_gui 原生文本引擎整段光栅化进离屏表面，
+// 上传为缓存纹理后按 (text, scale) 命中复用——全 CJK 可绘，无
+// 预烘焙步骤。颜色在绘制期通过 SetColor/透明度着白色字形。
+class Text {
+    [DllImport("zan_gui")]
+    static extern int zan_gui_create_surface(int width, int height);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_destroy_surface(int surfaceId);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_clear(int surfaceId, int color);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_draw_text(
+        int surfaceId, int x, int y, string text, int color, int fontSize);
+    [DllImport("zan_gui")]
+    static extern int zan_gui_measure_text(string text, int fontSize);
+    [DllImport("zan_gui")]
+    static extern int zan_gui_font_height(int fontSize);
+    [DllImport("zan_gui")]
+    static extern nint zan_gui_get_pixels(int surfaceId);
+
+    // scale → 像字号。scale 1≈14px 起步，2 号≈28px，覆盖 HUD 全部字号。
+    static int PxOf(int scale) { return scale * 14; }
+
+    const int PAD = 6;          // 表面留边：ClearType 渗出
+    const int MAX_RUNS = 96;    // 缓存纹理上限（≈一帧的全部文本）
+
+    class Run {
+        public string text;
+        public int scale;
+        public SdlTexture tex;
+        public int drawW;
+        public int drawH;
+        public long lastUsed;
+    }
+
+    static bool tried;
+    static bool ok;
+    static List<Run> runs;
+    static List<string> keys;
+    static int surf = -1;
+    static long tick;
+
+    static void CopyPixels(nint src, string dst, int bytes) {
+        string s = NativeMemory.GetString(src, 0, bytes);
+        for (int i = 0; i < bytes; i = i + 1) {
+            dst[i] = s[i];
+        }
+    }
+
+    static bool Ready() {
+        if (Text.tried) { return Text.ok; }
+        Text.tried = true;
+        Text.runs = new List<Run>();
+        Text.keys = new List<string>();
+        int s = zan_gui_create_surface(512, 96);
+        if (s >= 0) { zan_gui_clear(s, 0); Text.surf = s; Text.ok = true; }
+        return Text.ok;
+    }
+
+    static string Key(string text, int scale) {
+        return Convert.ToString(scale) + "\x01" + text;
+    }
+
+    static Run Find(string key) {
+        for (int i = 0; i < Text.keys.Count; i = i + 1) {
+            if (Text.keys[i] == key) { return Text.runs[i]; }
+        }
+        return null;
+    }
+
+    // 光栅表面的当前尺寸（延迟到首次绘制才重建大表面）。
+    static int surfW = 512;
+    static int surfH = 96;
+
+    static Run Bake(SdlRenderer r, string text, int scale) {
+        int px = Text.PxOf(scale);
+        int w = zan_gui_measure_text(text, px);
+        if (w <= 0) { return null; }
+        int h = zan_gui_font_height(px);
+        if (h <= 0) { return null; }
+        int sw = w + Text.PAD * 2;
+        int sh = h + Text.PAD * 2;
+        if (Text.surf >= 0 && (Text.surfW < sw || Text.surfH < sh)) {
+            zan_gui_destroy_surface(Text.surf);
+            Text.surf = -1;
+        }
+        if (Text.surf < 0) {
+            Text.surf = zan_gui_create_surface(sw + 64, sh + 32);
+            if (Text.surf >= 0) {
+                zan_gui_clear(Text.surf, 0);
+                Text.surfW = sw + 64;
+                Text.surfH = sh + 32;
+            }
+        }
+        if (Text.surf < 0) { return null; }
+        zan_gui_clear(Text.surf, 0);
+        zan_gui_draw_text(Text.surf, Text.PAD, Text.PAD, text, -1, px);
+        nint pix = zan_gui_get_pixels(Text.surf);
+        if (pix == 0) { return null; }
+        SdlTexture tex = SdlTexture.CreateRgba32(r, sw, sh, true);
+        if (tex == null || !tex.IsValid()) { return null; }
+        string buf = new string('\0', sw * sh * 4);
+        Text.CopyPixels(pix, buf, sw * sh * 4);
+        if (!tex.Update(buf, sw * 4)) { tex.Close(); return null; }
+        tex.SetNearest(false);
+        tex.SetBlendMode(1);
+        Text.tick = Text.tick + 1;
+        Run run = new Run();
+        run.text = text;
+        run.scale = scale;
+        run.tex = tex;
+        run.drawW = w;
+        run.drawH = h;
+        run.lastUsed = Text.tick;
+        if (Text.runs.Count >= Text.MAX_RUNS) {
+            // LRU 驱逐并释放纹理。
+            int victim = 0;
+            for (int i = 1; i < Text.runs.Count; i = i + 1) {
+                if (Text.runs[i].lastUsed < Text.runs[victim].lastUsed) {
+                    victim = i;
+                }
+            }
+            Text.runs[victim].tex.Close();
+            Text.runs.RemoveAt(victim);
+            Text.keys.RemoveAt(victim);
+        }
+        Text.runs.Add(run);
+        Text.keys.Add(Text.Key(text, scale));
+        return run;
+    }
+
+    public static int Width(SdlRenderer r, string text, int scale) {
+        if (text == null || text.Length == 0) { return 0; }
+        if (scale < 1) { scale = 1; }
+        int w = zan_gui_measure_text(text, Text.PxOf(scale));
+        return w > 0 ? w : 0;
+    }
+
+    /// 左上角 (x, y) 绘制一行文本。
+    public static void Draw(SdlRenderer r, string text, int x, int y, int scale,
+                            int cr, int cg, int cb, int ca) {
+        if (text == null || text.Length == 0) { return; }
+        if (scale < 1) { scale = 1; }
+        if (!Text.Ready()) { return; }
+        string key = Text.Key(text, scale);
+        Run run = Text.Find(key);
+        if (run == null) {
+            run = Text.Bake(r, text, scale);
+            if (run == null) { return; }
+        }
+        Text.tick = Text.tick + 1;
+        run.lastUsed = Text.tick;
+        run.tex.SetColor(cr, cg, cb);
+        run.tex.SetOpacity(ca);
+        r.DrawTexture(run.tex, x - Text.PAD, y - Text.PAD,
+            run.drawW + Text.PAD * 2, run.drawH + Text.PAD * 2);
+    }
+
+    /// 带柔和投影的文本（背景是画面时保证可读）。
+    public static void DrawShadow(SdlRenderer r, string text, int x, int y,
+                                  int scale, int cr, int cg, int cb, int ca) {
+        int so = 2 + scale;
+        Text.Draw(r, text, x + so, y + so, scale, 0, 0, 0, 150);
+        Text.Draw(r, text, x, y, scale, cr, cg, cb, ca);
+    }
+
+    public static void DrawCenteredShadow(SdlRenderer r, string text, int centerX,
+                                          int y, int scale,
+                                          int cr, int cg, int cb, int ca) {
+        int w = Text.Width(r, text, scale);
+        Text.DrawShadow(r, text, centerX - w / 2, y, scale, cr, cg, cb, ca);
+    }
+}

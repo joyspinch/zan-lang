@@ -1,0 +1,931 @@
+// Gold Miner — 黄金矿工:数据/渲染/输入/HUD 与无头自测。
+// 界面分两层:游戏场景(抓钩/物品/粒子)自绘进 SDL 画布;窗口
+// 顶栏、结算、拆弹面板走 stdlib Gui 控件树(GameHud 合成 +
+// gamehud 皮肤),不再散落颜色/坐标魔法数字。
+using System;
+using System.IO;
+using SDL3;
+using Gui;
+using Game.Ui;
+
+namespace GoldMiner;
+
+// 静态数据与工具
+class Data {
+    public const int W = 960;
+    public const int H = 720;
+    public const int HOOK_X = 480;
+    public const int HOOK_Y = 150;      // 绳锚点(矿车口下缘)
+    public const int SKY_H = 190;       // 天空/表土分界
+
+    // 字面量数组:静态初始化不跨单元,消除初始化顺序依赖
+    public static ItemDef[] DEFS = ItemDef.All();
+    // 纹理名(assets/<name>.png) — 静态初始化,勿依赖运行期 Init
+    public static string[] KIND_TEX = Data.BuildKindTex();
+
+    public static string[] BuildKindTex() {
+        string[] k = new string[11];
+        k[0] = "gold_s";
+        k[1] = "gold_m";
+        k[2] = "gold_l";
+        k[3] = "diamond";
+        k[4] = "chest";
+        k[5] = "bag";
+        k[6] = "rock";
+        k[7] = "skull";
+        k[8] = "tnt";
+        k[9] = "bomb";
+        k[10] = "coin";
+        return k;
+    }
+
+    public static string SavePath() {
+        return Assets.ExeDir() + "/goldminer_save.txt";
+    }
+
+    // 音效加载:磁盘优先,内嵌回退
+    public static SdlAudioClip LoadWav2(string rel) {
+        string p = Assets.Find(rel);
+        SdlAudioClip c = SdlAudioClip.LoadWav(p);
+        if (c != null && c.IsValid()) { return c; }
+        if (File.EmbedExists(rel)) {
+            string tmp = Assets.ExeDir() + "/_embed_" + Path.GetFileName(rel);
+            if (File.ExtractEmbedded(rel, tmp)) {
+                c = SdlAudioClip.LoadWav(tmp);
+            }
+        }
+        return c;
+    }
+
+    // Zan 没有 int.Parse:逐位解析(可带负号)
+    public static int ParseIntS(string s) {
+        int v = 0;
+        bool neg = false;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (c == 45 && i == 0) { neg = true; continue; }
+            if (c < 48 || c > 57) { break; }
+            v = v * 10 + (c - 48);
+        }
+        if (neg) { return -v; }
+        return v;
+    }
+}
+
+// 音效包
+class Snd {
+    public SdlAudioClip swing;
+    public SdlAudioClip grab;
+    public SdlAudioClip reel;
+    public SdlAudioClip gold;
+    public SdlAudioClip coinS;
+    public SdlAudioClip boom;
+    public SdlAudioClip tntboom;
+    public SdlAudioClip tick;
+    public SdlAudioClip hurry;
+    public SdlAudioClip win;
+    public SdlAudioClip fail;
+    public SdlAudioClip bombtick;
+    public SdlAudioClip levelup;
+    public bool on = true;
+
+    public static Snd Create() {
+        Snd s = new Snd();
+        if (!SdlAudio.Open()) { return s; }
+        s.swing = Data.LoadWav2("assets/swing.wav");
+        s.grab = Data.LoadWav2("assets/grab.wav");
+        s.reel = Data.LoadWav2("assets/reel.wav");
+        s.gold = Data.LoadWav2("assets/gold.wav");
+        s.coinS = Data.LoadWav2("assets/coin.wav");
+        s.boom = Data.LoadWav2("assets/boom.wav");
+        s.tntboom = Data.LoadWav2("assets/tntboom.wav");
+        s.tick = Data.LoadWav2("assets/tick.wav");
+        s.hurry = Data.LoadWav2("assets/hurry.wav");
+        s.win = Data.LoadWav2("assets/win.wav");
+        s.fail = Data.LoadWav2("assets/fail.wav");
+        s.bombtick = Data.LoadWav2("assets/bombtick.wav");
+        s.levelup = Data.LoadWav2("assets/levelup.wav");
+        return s;
+    }
+
+    public void Play(SdlAudioClip c, double gain) {
+        if (!this.on || c == null || !c.IsValid()) { return; }
+        c.Play(gain, 0);
+    }
+}
+
+class MinerApp {
+    public Host host;
+    public SdlRenderer r;
+    public World w;
+    public Snd snd;
+    public Rng uiRng;
+
+    // Gui 控件树 HUD 层(null = 未启用/接管失败,退回场景自绘)
+    public GameHud hud;
+    public HudTop topHud;           // 顶栏面板
+    public HudOverlay ovHud;        // 结算/拆弹覆盖层
+
+    public int mouseX;
+    public int mouseY;
+    public bool mouseJustDown;
+    public long now;
+
+    // 纹理
+    public SdlTexture texBg;
+    public SdlTexture texMiner;
+    public SdlTexture texClaw;
+    public SdlTexture[] texKind;        // 11 物品
+    public SdlTexture texDynamite;
+
+    // 计时
+    public long lastFrameAt;
+    public int lastBombTickSec = -1;
+    public int lastTenSecTick = -1;
+    // 素材实比(加载期从 PNG/JPG 头读出)
+    public int bgW = 960;
+    public int bgH = 720;
+    public int minerW = 120;
+    public int minerH = 200;
+    public int clawW = 56;
+    public int clawH = 66;
+
+    public static MinerApp Create(Host h) {
+        MinerApp a = new MinerApp();
+        a.host = h;
+        a.r = h.Renderer();
+        a.uiRng = Rng.Seed(20260904L);
+        a.texBg = MinerApp.LoadTex(a.r, "assets/bg.jpg");
+        a.texMiner = MinerApp.LoadTex(a.r, "assets/miner.png");
+        a.texClaw = MinerApp.LoadTex(a.r, "assets/claw.png");
+        a.texDynamite = MinerApp.LoadTex(a.r, "assets/dynamite.png");
+        a.texKind = new SdlTexture[ItemDef.KIND_COUNT];
+        for (int i = 0; i < ItemDef.KIND_COUNT; i = i + 1) {
+            a.texKind[i] = MinerApp.LoadTex(a.r, "assets/" + Data.KIND_TEX[i] + ".png");
+        }
+        a.w = new World();
+        a.w.rng = Rng.Seed((int)(DateTime.UtcNow().ToUnixSeconds() & 2147483647));
+        a.w.Load();
+        a.w.NewRun(a.w.rng);
+        a.snd = Snd.Create();
+        a.lastFrameAt = World.NowMs();
+        // 按 PNG 头实比覆盖每个物品的绘制尺寸(保宽比,长边 = rad*2)
+        int[] wh = new int[2];
+        for (int i = 0; i < ItemDef.KIND_COUNT; i = i + 1) {
+            string p = Assets.Find("assets/" + Data.KIND_TEX[i] + ".png");
+            if (MinerApp.PngSize(p, wh)) {
+                ItemDef d = Data.DEFS[i];
+                int longEdge = d.rad * 2;
+                if (wh[0] >= wh[1]) {
+                    d.texW = longEdge;
+                    d.texH = longEdge * wh[1] / wh[0];
+                } else {
+                    d.texH = longEdge;
+                    d.texW = longEdge * wh[0] / wh[1];
+                }
+            }
+        }
+        // 背景/矿工/爪子同法取实比
+        string bp = Assets.Find("assets/bg.jpg");
+        if (File.Exists(bp)) {
+            byte[] bb = File.ReadAllBytes(bp);
+            int[] pos = new int[2];
+            if (MinerApp.JpgW(bb, pos) == 1) {
+                a.bgW = pos[1];
+                a.bgH = pos[0];
+            }
+        }
+        int[] mw = new int[2];
+        string mp = Assets.Find("assets/miner.png");
+        if (MinerApp.PngSize(mp, mw)) {
+            a.minerW = 120;
+            a.minerH = 120 * mw[1] / mw[0];
+        }
+        int[] cw = new int[2];
+        string cp = Assets.Find("assets/claw.png");
+        if (MinerApp.PngSize(cp, cw)) {
+            a.clawW = 56;
+            a.clawH = 56 * cw[1] / cw[0];
+        }
+        return a;
+    }
+
+    static SdlTexture LoadTex(SdlRenderer r, string rel) {
+        string p = Assets.Find(rel);
+        SdlTexture t = SdlTexture.LoadImage(r, p);
+        if ((t == null || !t.IsValid()) && File.EmbedExists(rel)) {
+            string tmp = Assets.ExeDir() + "/_embed_" + Path.GetFileName(rel);
+            if (File.ExtractEmbedded(rel, tmp)) {
+                t = SdlTexture.LoadImage(r, tmp);
+            }
+        }
+        if (t != null && t.IsValid()) { t.SetBlendMode(1); }
+        return t;
+    }
+
+    // 读 PNG 头 IHDR 取尺寸(大端)。素材由构建管线统一生成,尺寸可靠;
+    // 解析失败返回 false,调用方退回正方形假设。
+    static bool PngSize(string path, int[] outWH) {
+        outWH[0] = 0; outWH[1] = 0;
+        if (!File.Exists(path)) { return false; }
+        byte[] b = File.ReadAllBytes(path);
+        if (b.Length < 24) { return false; }
+        if (b[0] != 137 || b[1] != 80 || b[2] != 78 || b[3] != 71) { return false; }
+        outWH[0] = (b[16] & 255) << 24 | (b[17] & 255) << 16
+                 | (b[18] & 255) << 8 | (b[19] & 255);
+        outWH[1] = (b[20] & 255) << 24 | (b[21] & 255) << 16
+                 | (b[22] & 255) << 8 | (b[23] & 255);
+        return outWH[0] > 0 && outWH[1] > 0;
+    }
+
+    static int JpgW(byte[] b, int[] pos) {
+        // JPEG 尺寸解析:扫 SOF0/SOF2 段取高度宽度(小工具,够用即可)
+        int i = 2;
+        while (i + 9 < b.Length) {
+            if (b[i] != 255) { i = i + 1; continue; }
+            int marker = b[i + 1] & 255;
+            if (marker == 216 || marker == 1 || (marker >= 208 && marker <= 215)) {
+                i = i + 2; continue;
+            }
+            int segLen = (b[i + 2] & 255) << 8 | (b[i + 3] & 255);
+            if ((marker >= 192 && marker <= 195) || (marker >= 201 && marker <= 203)) {
+                pos[0] = (b[i + 7] & 255) << 8 | (b[i + 8] & 255);      // 高
+                pos[1] = (b[i + 9] & 255) << 8 | (b[i + 10] & 255);     // 宽
+                return 1;
+            }
+            i = i + 2 + segLen;
+        }
+        return 0;
+    }
+
+    // ---------------------------------------------------------------
+    // 逻辑推进
+    // ---------------------------------------------------------------
+    public void StepFrame(int dtMs) {
+        this.w.Step(dtMs);
+        World w = this.w;
+        // 音效钩子
+        if (w.state == World.ST_BOMB) {
+            int sec = w.bombTimeLeft / 300;
+            if (sec != this.lastBombTickSec) {
+                this.lastBombTickSec = sec;
+                this.snd.Play(this.snd.bombtick, 0.5);
+            }
+        }
+        if (w.hurryPlayed && w.timeLeftMs > 0 && w.state != World.ST_RESULT) {
+            int sec = w.timeLeftMs / 1000;
+            if (sec <= 10 && sec != this.lastTenSecTick) {
+                this.lastTenSecTick = sec;
+                this.snd.Play(this.snd.tick, 0.5);
+            }
+        }
+    }
+
+    // 输入触发(点击/空格/下)
+    public void OnActionKey() {
+        World w = this.w;
+        if (w.state == World.ST_RESULT) {
+            if (w.ConfirmResult()) {
+                if (w.levelResult > 0) {
+                    this.snd.Play(this.snd.levelup, 0.7);
+                }
+            }
+            return;
+        }
+        if (w.state == World.ST_SWING) {
+            this.snd.Play(this.snd.swing, 0.5);
+        } else if (w.state == World.ST_QTE || w.state == World.ST_BOMB) {
+            this.snd.Play(this.snd.grab, 0.35);
+        }
+        w.Action();
+    }
+
+    public void OnDynamiteKey() {
+        if (this.w.UseDynamite()) {
+            this.snd.Play(this.snd.boom, 0.8);
+            this.w.Float("炸掉了!", Data.HOOK_X, Data.HOOK_Y + 120, 255, 170, 80);
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 场景渲染(游戏世界;HUD 交给 Gui 控件树)
+    // ---------------------------------------------------------------
+    public void DrawAll() {
+        int w = Data.W;
+        int h = Data.H;
+        SdlRenderer rd = this.r;
+        World wo = this.w;
+        // 震屏偏移
+        int ox = 0;
+        int oy = 0;
+        if (wo.shakeFrames > 0) {
+            ox = this.uiRng.Range(-wo.shakeMag, wo.shakeMag + 1) / 8;
+            oy = this.uiRng.Range(-wo.shakeMag, wo.shakeMag + 1) / 8;
+        }
+        // 背景
+        if (this.texBg != null && this.texBg.IsValid()) {
+            rd.DrawTexture(this.texBg, ox, oy, w, h);
+        } else {
+            Draw.VGradient(rd, 0, 0, w, h, 96, 140, 200, 60, 40, 28, 255);
+        }
+        // FEVER 热浪(>=3 连击:边缘暖光)
+        if (wo.feverGlow > 0) {
+            int ga = wo.feverGlow * 55 / 100;
+            Draw.RingRect(rd, ox + 2, oy + 2, w - 4, h - 4, 8, 255,
+                          170 - ga / 3, 60, ga);
+        }
+        // 物品
+        for (int i = 0; i < wo.items.Count; i = i + 1) {
+            Item it = wo.items[i];
+            if (!it.alive) { continue; }
+            ItemDef d = Data.DEFS[it.kind];
+            SdlTexture t = this.texKind[it.kind];
+            double fy = Math.Sin(it.wob + this.now / 480.0) * 2.0;
+            if (t != null && t.IsValid()) {
+                int dw = d.texW;
+                int dh = d.texH;
+                rd.DrawTexture(t, ox + it.x - dw / 2, oy + it.y - dh / 2 + (int)fy, dw, dh);
+            } else {
+                Draw.FillCircle(rd, ox + it.x, oy + it.y + (int)fy, d.rad, 200, 170, 60, 255);
+            }
+        }
+        // 绳 + 爪 + 钩上物
+        this.DrawClaw(ox, oy);
+        // 矿工
+        if (this.texMiner != null && this.texMiner.IsValid()) {
+            int mw = this.minerW;
+            int mh = this.minerH;
+            rd.DrawTexture(this.texMiner, ox + Data.HOOK_X - mw / 2,
+                           oy + Data.HOOK_Y - mh + 8, mw, mh);
+        } else {
+            Draw.FillCircle(rd, ox + Data.HOOK_X, oy + Data.HOOK_Y - 40, 34, 220, 160, 60, 255);
+        }
+        // 粒子
+        for (int i = 0; i < wo.parts.Count; i = i + 1) {
+            Particle p = wo.parts[i];
+            int a = p.life * 255 / p.maxLife;
+            rd.SetColor(p.r, p.g, p.b, a);
+            rd.FillRect(ox + (int)p.x - p.size / 2, oy + (int)p.y - p.size / 2,
+                        p.size, p.size);
+        }
+        rd.SetColor(0, 0, 0, 255);
+        // 飘字(得分/提示,属于游戏世界的演出)
+        for (int i = 0; i < wo.texts.Count; i = i + 1) {
+            FloatText ft = wo.texts[i];
+            int a = ft.life * 255 / 70;
+            Text.DrawCenteredShadow(rd, ft.text, ox + ft.x, oy + ft.y - 20, 3,
+                                    ft.r, ft.g, ft.b, a > 255 ? 255 : a);
+        }
+        // 场景内 QTE 圈(圈心跟着爪走,必须画在场景层)
+        if (wo.state == World.ST_QTE) { this.DrawQte(ox, oy); }        // 爆炸白闪
+        if (wo.flashFrames > 0) {
+            int fa = wo.flashFrames * 38;
+            if (fa > 255) { fa = 255; }
+            rd.SetColor(255, 245, 220, fa);
+            rd.FillRect(0, 0, w, h);
+            rd.SetColor(0, 0, 0, 255);
+        }
+    }
+
+    void DrawClaw(int ox, int oy) {
+        SdlRenderer rd = this.r;
+        World wo = this.w;
+        double rad = wo.angle * Math.PI / 180.0;
+        int cx = ox + Data.HOOK_X + (int)(Math.Cos(rad) * wo.clawLen);
+        int cy = oy + Data.HOOK_Y + (int)(Math.Sin(rad) * wo.clawLen);
+        // 绳:矿工手 → 爪(用短线段逐段画,近似摆动弧度)
+        int segs = 8;
+        int px = ox + Data.HOOK_X;
+        int py = oy + Data.HOOK_Y - 26;
+        for (int i = 1; i <= segs; i = i + 1) {
+            double t = (double)i / segs;
+            int nx = ox + Data.HOOK_X + (int)(Math.Cos(rad) * wo.clawLen * t);
+            int ny = oy + Data.HOOK_Y + (int)(Math.Sin(rad) * wo.clawLen * t);
+            // 中段下垂感:前半段向下偏移
+            int sag = i < segs / 2 ? (segs / 2 - i) * 2 : 0;
+            rd.SetColor(70, 52, 36, 255);
+            rd.DrawLine(px, py + sag, nx, ny + (i < segs / 2 ? sag : 0));
+            px = nx;
+            py = ny;
+        }
+        rd.SetColor(0, 0, 0, 255);
+        // 爪纹理(旋转对齐摆角:0 度 = 纹理朝下)
+        int ch = this.clawH;
+        if (this.texClaw != null && this.texClaw.IsValid()) {
+            int cw = this.clawW;
+            int ang = (int)(wo.angle) - 90;
+            if (ang < 0) { ang = ang + 360; }
+            rd.DrawTextureRotated(this.texClaw, cx - cw / 2, cy - ch / 2, cw, ch, ang);
+        } else {
+            Draw.FillCircle(rd, cx, cy, 14, 160, 160, 170, 255);
+        }
+        // 钩上物跟随爪心
+        if (wo.hookedKind >= 0) {
+            ItemDef d = Data.DEFS[wo.hookedKind];
+            SdlTexture t = this.texKind[wo.hookedKind];
+            if (t != null && t.IsValid()) {
+                int dw = d.texW;
+                int dh = d.texH;
+                rd.DrawTexture(t, cx - dw / 2, cy + ch / 2 - 6, dw, dh);
+            }
+        }
+    }
+
+    void DrawQte(int ox, int oy) {
+        SdlRenderer rd = this.r;
+        World wo = this.w;
+        double rad = wo.angle * Math.PI / 180.0;
+        int cx = ox + Data.HOOK_X + (int)(Math.Cos(rad) * wo.clawLen);
+        int cy = oy + Data.HOOK_Y + (int)(Math.Sin(rad) * wo.clawLen);
+        // 金圈(命中区)
+        Draw.CircleStroke(rd, cx, cy, 44, 255, 210, 80, 255);
+        Draw.CircleStroke(rd, cx, cy, 45, 255, 210, 80, 200);
+        // 白圈(收缩)
+        int wr = (int)wo.qteRing;
+        if (wr < 8) { wr = 8; }
+        Draw.CircleStroke(rd, cx, cy, wr, 255, 255, 255, 235);
+        Draw.CircleStroke(rd, cx, cy, wr + 1, 255, 255, 255, 160);
+        // 进度点
+        for (int i = 0; i < wo.qteNeed; i = i + 1) {
+            int dx = cx - wo.qteNeed * 10 + i * 20 + 5;
+            if (i < wo.qteDone) {
+                Draw.FillCircle(rd, dx, cy + 74, 6, 130, 240, 120, 255);
+            } else {
+                Draw.FillCircle(rd, dx, cy + 74, 6, 70, 70, 80, 255);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // GameHud(Gui 控件树)
+    // ---------------------------------------------------------------
+    // 顶栏(关卡/金币/进度/倒计时/连击/炸药)与覆盖层(结算/拆弹)
+    // 全部是 stdlib Gui 控件,配色/圆角/描边落在 skins/gamehud/
+    // skin.css;保留模式:树只建一次,内容经 FrameHook 每帧同步。
+    // MINER_NOHUD=1 退回纯自绘路径(对照/兜底)。
+
+    public void BuildHud() {
+        this.topHud = new HudTop(this);
+        this.ovHud = new HudOverlay(this);
+        Form form = Form.Create("hud", Data.W, Data.H);
+        form.FrameHook(() => { this.SyncHud(); });
+        form.With(this.topHud.Build());
+        form.With(this.ovHud.BuildResult());
+        form.With(this.ovHud.BuildBomb());
+        this.hud = GameHud.CreateFor(this.host.WindowHandle(),
+                                     this.r.Handle());
+        if (!this.hud.Ready()) {
+            Console.WriteLine("[hud] takeover failed: " + this.hud.LastError());
+            this.hud = null;
+            return;
+        }
+        this.hud.Root(form);
+        this.host.hudMode = true;   // 宿主 End() 不再自己 Present
+    }
+
+    // 每帧把 World 状态同步进控件(绑定/直设文本)。
+    void SyncHud() {
+        if (this.topHud != null) { this.topHud.Sync(); }
+        if (this.ovHud != null) { this.ovHud.Sync(); }
+    }
+
+    // ---------------------------------------------------------------
+    // 入口与无头自测
+    // ---------------------------------------------------------------
+    static int Main(string[] args) {
+        // 无头平衡仿真:自动打 6 关,校验经济曲线与状态机
+        if (ProcessHost.Env("MINER_SIM") == "1") {
+            return MinerApp.SimRun();
+        }
+        // 无头截图
+        bool shot = ProcessHost.Env("MINER_SHOT") == "1";
+        Host h = Host.CreateFull("黄金矿工", Data.W, Data.H, 2, false);
+        if (!h.Running()) {
+            Console.WriteLine("host init failed");
+            return 1;
+        }
+        h.LimitFps(60);
+        h.SetIdleFps(2);
+        MinerApp app = MinerApp.Create(h);
+        if (shot) {
+            return MinerApp.ShotRun(app);
+        }
+        // Gui 控件树 HUD:接管宿主窗口,场景在下、Gui 在上。
+        if (ProcessHost.Env("MINER_NOHUD") != "1") {
+            app.BuildHud();
+        }
+        while (h.Running()) {
+            app.now = World.NowMs();
+            int dt = (int)(app.now - app.lastFrameAt);
+            if (dt < 0) { dt = 0; }
+            if (dt > 100) { dt = 100; }
+            app.lastFrameAt = app.now;
+            bool action = false;
+            bool dyn = false;
+            while (SdlEvent.Poll()) {
+                int ty = SdlEvent.Type();
+                h.OnWindowEvent(ty);
+                if (SdlEvent.IsQuit()) {
+                    app.w.Save();
+                    h.Quit();
+                    break;
+                }
+                if (ty == SdlEventType.MouseMotion()) {
+                    app.mouseX = h.MouseX();
+                    app.mouseY = h.MouseY();
+                }
+                if (ty == SdlEventType.MouseButtonDown()
+                    && SdlEvent.MouseButton() == SdlMouseButton.Left()) {
+                    action = true;
+                }
+                if (ty == SdlEventType.KeyDown() && !SdlEvent.IsRepeat()) {
+                    int sc = SdlEvent.Scancode();
+                    if (sc == SdlScancode.Space() || sc == SdlScancode.Down()
+                        || sc == SdlScancode.Enter()) { action = true; }
+                    if (sc == SdlScancode.Q() || sc == SdlScancode.E()) { dyn = true; }
+                    if (sc == SdlScancode.F11()) { h.ToggleFullscreen(); }
+                    if (sc == SdlScancode.Escape() && app.w.state == World.ST_RESULT) {
+                        app.w.Save();
+                        h.Quit();
+                    }
+                }
+            }
+            if (action) { app.OnActionKey(); }
+            if (dyn) { app.OnDynamiteKey(); }
+            app.StepFrame(dt);
+            // 与其他示例游戏一致:Begin 选中离屏画布并清屏,
+            // End 合成回贴( hudMode 下不再 Present)。
+            h.Begin(12, 10, 8);
+            app.DrawAll();
+            h.End();
+            // HUD 层:场景帧作底,Gui 控件树画在上面并合成呈现。
+            if (app.hud != null) { app.hud.Frame(app.r, h.WindowHandle()); }
+        }
+        app.w.Save();
+        return 0;
+    }
+
+    // 无头仿真:模拟一个"中等玩家"打 6 关,输出经济快照 + 不变量检查
+    static int SimRun() {
+        StreamWriter log = new StreamWriter("miner_sim.log");
+        log.WriteLine("=== MINER_SIM headless ===");
+        World w = new World();
+        w.rng = Rng.Seed(424242L);
+        w.NewRun(w.rng);
+        bool allOk = true;
+        for (int lv = 1; lv <= 6; lv = lv + 1) {
+            w.StartLevel();
+            int target = w.Target();
+            log.WriteLine("L" + lv + " target=" + target
+                          + " items=" + w.items.Count);
+            // 模拟:60fps 推进,贪心策略 —— 摆到有价物角度就放钩
+            int frames = w.LevelTimeMs() / 16;
+            int captured = 0;
+            for (int f = 0; f < frames && w.state != World.ST_RESULT; f = f + 1) {
+                // 简单 AI:沿整条摆动射线扫描(120..600),选射线近旁最优目标
+                if (w.state == World.ST_SWING) {
+                    double rad = w.angle * Math.PI / 180.0;
+                    Item best = null;
+                    int bestScore = 0;
+                    for (int i = 0; i < w.items.Count; i = i + 1) {
+                        Item it = w.items[i];
+                        if (!it.alive) { continue; }
+                        int dx = it.x - Data.HOOK_X;
+                        int dy = it.y - Data.HOOK_Y;
+                        // 物品在射线上的投影长度与垂距
+                        double proj = dx * Math.Cos(rad) + dy * Math.Sin(rad);
+                        if (proj < 110.0 || proj > 620.0) { continue; }
+                        double perp = Math.Abs(-dx * Math.Sin(rad) + dy * Math.Cos(rad));
+                        if (perp > 60.0) { continue; }
+                        int sc = Data.DEFS[it.kind].score;
+                        if (it.kind == 8 || it.kind == 9) { sc = -1; }   // 避开
+                        // 价值/重量性价比优先
+                        if (sc > 0) { sc = sc * 10 / (Data.DEFS[it.kind].weight + 4); }
+                        if (sc > bestScore) { bestScore = sc; best = it; }
+                    }
+                    if (best != null) { w.Action(); captured = captured + 1; }
+                } else if (w.state == World.ST_QTE) {
+                    // AI:白圈进入金圈时命中(50% 概率成功,模拟手残)
+                    if (w.qteRing >= 34.0 && w.qteRing <= 54.0 && f % 3 == 0) {
+                        w.Action();
+                    }
+                } else if (w.state == World.ST_BOMB) {
+                    w.Action();     // 疯狂点击
+                }
+                w.Step(16);
+            }
+            log.WriteLine("  -> gold=" + w.gold + "/" + target
+                          + " result=" + (w.levelResult > 0 ? "WIN" : "FAIL")
+                          + " actions=" + captured
+                          + " timeLeft=" + w.timeLeftMs);
+            // 不变量
+            if (w.gold < 0) { log.WriteLine("  !! gold < 0"); allOk = false; }
+            if (w.items.Count == 0) { log.WriteLine("  !! no items"); allOk = false; }
+            if (w.levelResult == 0) {
+                log.WriteLine("  !! level did not end");
+                allOk = false;
+                break;
+            }
+            if (w.levelResult > 0) {
+                w.ConfirmResult();
+            } else {
+                break;      // 经济到顶:失败即停(曲线过陡的信号)
+            }
+        }
+        log.WriteLine(allOk ? "=== SIM PASS ===" : "=== SIM FAIL ===");
+        log.WriteLine("bestLevel=" + w.bestLevel + " totalGold=" + w.totalGold);
+        log.Close();
+        Console.WriteLine(allOk ? "SIM PASS" : "SIM FAIL");
+        return allOk ? 0 : 1;
+    }
+
+    // 无头截图:摆钩/伸出/收线/炸弹/结算 各抓一张
+    static int ShotRun(MinerApp app) {
+        StreamWriter log = new StreamWriter("miner_shot.log");
+        log.WriteLine("=== MINER_SHOT ===");
+        string[] names = new string[6];
+        names[0] = "swing"; names[1] = "extend"; names[2] = "qte";
+        names[3] = "bomb"; names[4] = "boom"; names[5] = "result";
+        for (int s = 0; s < 6; s = s + 1) {
+            World w = app.w;
+            if (s == 0) { w.StartLevel(); }
+            if (s == 1) { w.state = World.ST_EXTEND; w.clawLen = 260.0; }
+            if (s == 2) {
+                w.StartLevel();
+                w.hookedKind = 2;
+                w.items.Add(Item.Make(2, Data.HOOK_X + 200, Data.HOOK_Y + 240));
+                w.items[w.items.Count - 1].alive = false;
+                w.state = World.ST_QTE;
+                w.qteRing = 60.0;
+                w.qteDone = 0;
+                w.qteNeed = 3;
+                w.clawLen = 300.0;
+                w.angle = 75.0;
+            }
+            if (s == 3) {
+                w.StartLevel();
+                w.hookedKind = 9;
+                w.state = World.ST_BOMB;
+                w.bombTimeLeft = 1800;
+                w.bombClicks = 4;
+                w.bombNeed = 12;
+                w.bombPulse = 1.2;
+            }
+            if (s == 4) {
+                w.StartLevel();
+                w.BoomFx(Data.W / 2, 480, 160);
+                w.Shake(10, 260);
+                w.flashFrames = 5;
+            }
+            if (s == 5) {
+                w.StartLevel();
+                w.gold = w.Target();
+                w.EndLevel(true);
+            }
+            app.now = World.NowMs();
+            app.StepFrame(16);
+            app.SyncHud();
+            // 画两帧:Present 后备缓冲滞后一帧,首帧回读只能拿到清屏色
+            for (int rep = 0; rep < 2; rep = rep + 1) {
+                app.host.Begin(12, 10, 8);
+                app.DrawAll();
+                app.host.End();
+            }
+            MinerApp.DumpBmp(app.r, "miner_shot_" + names[s] + ".bmp");
+            log.WriteLine("SHOT " + names[s]);
+        }
+        log.WriteLine("=== SHOT OK ===");
+        log.Close();
+        Console.WriteLine("=== SHOT OK ===");
+        return 0;
+    }
+
+    static void DumpBmp(SdlRenderer r, string path) {
+        r.Present();
+        int packed = r.OutputSize();
+        int w = packed & 0xFFFF;
+        int h = (packed >> 16) & 0xFFFF;
+        if (w <= 0 || h <= 0) { return; }
+        byte[] rgba = new byte[w * h * 4];
+        if (!r.ReadPixels(rgba, w, h)) { return; }
+        int rowBytes = w * 3;
+        int pad = (4 - (rowBytes % 4)) % 4;
+        int imageBytes = (rowBytes + pad) * h;
+        byte[] bmp = new byte[54 + imageBytes];
+        bmp[0] = (byte)0x42; bmp[1] = (byte)0x4D;
+        MinerApp.PutU32(bmp, 2, 54 + imageBytes);
+        MinerApp.PutU32(bmp, 10, 54);
+        MinerApp.PutU32(bmp, 14, 40);
+        MinerApp.PutI32(bmp, 18, w);
+        MinerApp.PutI32(bmp, 22, h);
+        bmp[26] = (byte)1; bmp[28] = (byte)24;
+        for (int y = 0; y < h; y = y + 1) {
+            int dstRow = 54 + y * (rowBytes + pad);
+            int srcRow = (h - 1 - y) * w * 4;
+            for (int x = 0; x < w; x = x + 1) {
+                int o = srcRow + x * 4;
+                bmp[dstRow + x * 3] = rgba[o + 2];
+                bmp[dstRow + x * 3 + 1] = rgba[o + 1];
+                bmp[dstRow + x * 3 + 2] = rgba[o];
+            }
+        }
+        File.WriteAllBytes(path, bmp);
+    }
+
+    static void PutU32(byte[] b, int at, int v) {
+        b[at] = (byte)(v & 0xFF);
+        b[at + 1] = (byte)((v >> 8) & 0xFF);
+        b[at + 2] = (byte)((v >> 16) & 0xFF);
+        b[at + 3] = (byte)((v >> 24) & 0xFF);
+    }
+    static void PutI32(byte[] b, int at, int v) {
+        b[at] = (byte)(v & 0xFF);
+        b[at + 1] = (byte)((v >> 8) & 0xFF);
+        b[at + 2] = (byte)((v >> 16) & 0xFF);
+        b[at + 3] = (byte)((v >> 24) & 0xFF);
+    }
+}
+
+// 顶栏 HUD(Gui 控件树):关卡、金币/目标、进度条、倒计时、连击、
+// 炸药持有与提示行。配色全部来自 gamehud 皮肤(hud-* class)。
+class HudTop {
+    MinerApp app;
+    Panel bar;
+    Label level;
+    Label gold;
+    Progress bar_;
+    Label time;
+    Label combo;
+    Label dynamite;
+    Label hint;
+
+    HudTop(MinerApp a) { this.app = a; }
+
+    Panel Build() {
+        Panel p = new Panel();
+        p.Class = "hud-panel";
+        p.Dock(Dock.Top());
+        this.bar = p;
+
+        Flex row = Flex.Row().AlignCenter().Gap(14);
+        p.Pad(10);
+        p.With(row);
+
+        this.level = new Label("");
+        this.level.Class = "hud-title";
+        row.With(this.level);
+
+        this.gold = new Label("");
+        this.gold.Class = "hud-subtitle";
+        row.With(this.gold);
+
+        this.bar_ = new Progress(0, 0);
+        this.bar_.Class = "hud";
+        this.bar_.Prefer(300, 14);
+        this.bar_.ShowText(false);
+        row.With(this.bar_);
+
+        this.time = new Label("");
+        this.time.Class = "hud-subtitle";
+        row.With(this.time);
+
+        this.combo = new Label("");
+        this.combo.Class = "hud-title";
+        row.With(this.combo);
+
+        this.dynamite = new Label("");
+        this.dynamite.Class = "hud-small";
+        row.With(this.dynamite);
+
+        this.hint = new Label("");
+        this.hint.Class = "hud-small";
+        row.With(this.hint);
+        return p;
+    }
+
+    void Sync() {
+        World w = this.app.w;
+        this.level.Text = "第 " + w.level + " 关";
+        this.gold.Text = "$" + w.gold + " / " + w.Target();
+        int pct = w.gold * 100 / w.Target();
+        if (pct > 100) { pct = 100; }
+        this.bar_.SetPercent(pct);
+        int secLeft = (w.timeLeftMs + 999) / 1000;
+        this.time.Text = "剩余 " + secLeft + "s";
+        if (w.combo >= 2) {
+            int mul10 = (int)(w.comboMul * 10.0);
+            this.combo.Text = "FEVER x" + w.combo + "  倍率 "
+                              + mul10 / 10 + "." + mul10 % 10;
+        } else {
+            this.combo.Text = "";
+        }
+        this.dynamite.Text = "Q 炸药 x" + w.dynamites;
+        if (w.state == World.ST_BOMB) {
+            this.hint.Text = "疯狂点击! 拆除炸弹!";
+        } else if (w.state == World.ST_QTE) {
+            this.hint.Text = "白圈缩进金圈时点击! 加速收线";
+        } else if (w.state == World.ST_SWING) {
+            this.hint.Text = "点击 / 空格 放钩";
+        } else {
+            this.hint.Text = "";
+        }
+    }
+}
+
+// 覆盖层 HUD:拆弹倒计时面板与过关/失败结算。只有对应状态可见。
+class HudOverlay {
+    MinerApp app;
+    Panel bomb;
+    Label bombSec;
+    Label bombCnt;
+    Progress bombBar;
+    Panel result;
+    Label resTitle;
+    Label resGold;
+    Label resTotal;
+    Label resNext;
+
+    HudOverlay(MinerApp a) { this.app = a; }
+
+    Panel BuildResult() {
+        // ---- 结算面板(居中) ----
+        Panel rp = new Panel();
+        rp.Class = "hud-panel";
+        rp.Prefer(420, 260);
+        rp.Place(Data.W / 2 - 210, 200);
+        this.result = rp;
+
+        this.resTitle = new Label("");
+        this.resTitle.Class = "hud-title";
+        rp.With(this.resTitle);
+
+        this.resGold = new Label("");
+        this.resGold.Class = "hud-subtitle";
+        rp.With(this.resGold);
+
+        this.resTotal = new Label("");
+        this.resTotal.Class = "hud-subtitle";
+        rp.With(this.resTotal);
+
+        this.resNext = new Label("");
+        this.resNext.Class = "hud-small";
+        rp.With(this.resNext);
+
+        rp.SetShown(false);
+        return rp;
+    }
+
+    Panel BuildBomb() {
+        // ---- 拆弹面板(居中) ----
+        Panel bp = new Panel();
+        bp.Class = "hud-panel";
+        bp.Prefer(320, 150);
+        bp.Place(Data.W / 2 - 160, 240);
+        this.bomb = bp;
+
+        Label title = new Label("疯狂点击! 拆除炸弹!");
+        title.Class = "hud-title";
+        bp.With(title);
+
+        this.bombSec = new Label("");
+        this.bombSec.Class = "hud-title";
+        bp.With(this.bombSec);
+
+        this.bombCnt = new Label("");
+        this.bombCnt.Class = "hud-subtitle";
+        bp.With(this.bombCnt);
+
+        this.bombBar = new Progress(0, 0);
+        this.bombBar.Class = "hud";
+        this.bombBar.Prefer(280, 14);
+        this.bombBar.ShowText(false);
+        bp.With(this.bombBar);
+
+        bp.SetShown(false);
+        return bp;
+    }
+
+    void Sync() {
+        World w = this.app.w;
+        bool showBomb = w.state == World.ST_BOMB;
+        bool showResult = w.state == World.ST_RESULT;
+        this.bomb.SetShown(showBomb);
+        this.result.SetShown(showResult);
+        if (showBomb) {
+            this.bombSec.Text = Convert.ToString(w.bombTimeLeft / 1000 + 1);
+            this.bombCnt.Text = w.bombClicks + " / " + w.bombNeed;
+            this.bombBar.SetPercent(w.bombClicks * 100 / w.bombNeed);
+        }
+        if (showResult) {
+            bool win = w.levelResult > 0;
+            this.resTitle.Text = win ? "过关!" : "时间到!";
+            this.resGold.Text = "本关 $" + w.gold + "   目标 $" + w.Target();
+            this.resTotal.Text = "累计 $" + w.totalGold;
+            if (win) {
+                this.resNext.Text = "点击继续 → 第 " + (w.level + 1) + " 关";
+            } else {
+                this.resNext.Text = "点击重新开始";
+            }
+        }
+    }
+}

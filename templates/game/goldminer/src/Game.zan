@@ -1,0 +1,680 @@
+// Gold Miner — 黄金矿工（Zan 游戏模板）
+// 核心玩法:摆钩 → 放钩 → 抓取回收 → 计分过关。
+// 刺激机制:连击 FEVER / 收线 QTE / 拆弹 QTE / TNT 连锁 / 最后 10 秒警报。
+using System;
+using System.IO;
+using SDL3;
+
+namespace GoldMiner;
+
+// 物品定义(静态表)
+class ItemDef {
+    // const(编译期常量):避免跨单元静态初始化顺序问题
+    // (main.zan 的 Data.DEFS = ItemDef.All() 可能在本类静态字段就绪前执行)
+    public const int KIND_COUNT = 11;
+    // 半径(碰撞,设计单位) / 重量(拉回速度分子) / 分值 / 是否垃圾(清连击)
+    public int rad;
+    public int weight;      // 拉回耗时 ≈ weight * dist / 300 (秒)
+    public int score;
+    public bool junk;       // 石头/骷髅:清空连击
+    public string name;
+    public int texW;        // 处理后素材尺寸(渲染用)
+    public int texH;
+
+    public static ItemDef[] All() {
+        ItemDef[] a = new ItemDef[11];
+        //            rad weight score junk  name
+        a[0] = Mk(24, 5, 50, false, "小金块");
+        a[1] = Mk(30, 9, 150, false, "金块");
+        a[2] = Mk(38, 15, 400, false, "大金块");
+        a[3] = Mk(26, 6, 600, false, "钻石");
+        a[4] = Mk(34, 12, 350, false, "宝箱");
+        a[5] = Mk(30, 10, 0, false, "神秘袋");     // 0 = 开袋随机
+        a[6] = Mk(34, 16, 20, true, "石头");
+        a[7] = Mk(26, 8, 15, true, "骷髅");
+        a[8] = Mk(30, 10, 0, false, "TNT");        // 抓到即炸
+        a[9] = Mk(24, 8, 0, false, "炸弹");        // 抓到进入拆弹 QTE
+        a[10] = Mk(18, 3, 120, false, "金币袋");   // 神秘袋开出物之一
+        return a;
+    }
+
+    static ItemDef Mk(int rad, int weight, int score, bool junk, string name) {
+        ItemDef d = new ItemDef();
+        d.rad = rad; d.weight = weight; d.score = score;
+        d.junk = junk; d.name = name;
+        d.texW = rad * 2; d.texH = rad * 2;   // 默认正方形,加载时按素材实比覆盖
+        return d;
+    }
+}
+
+// 场上的物品实例
+class Item {
+    public int kind;        // ItemDef 下标
+    public int x;
+    public int y;
+    public bool alive;
+    public double wob;      // 待机浮动相位
+
+    public static Item Make(int kind, int x, int y) {
+        Item it = new Item();
+        it.kind = kind; it.x = x; it.y = y; it.alive = true;
+        it.wob = (x * 7 + y * 13) % 628 / 100.0;
+        return it;
+    }
+}
+
+// 粒子(金色闪光/尘土/火花)
+class Particle {
+    public double x;
+    public double y;
+    public double vx;
+    public double vy;
+    public int life;        // 剩余帧
+    public int maxLife;
+    public int r;
+    public int g;
+    public int b;
+    public int size;
+}
+
+// 飘字(+150 x2 之类)
+class FloatText {
+    public string text;
+    public int x;
+    public int y;
+    public int life;
+    public int r;
+    public int g;
+    public int b;
+}
+
+// 一局的全部可变状态(与渲染解耦,便于无头仿真)
+class World {
+    public const int ST_SWING = 0;      // 摆钩中
+    public const int ST_EXTEND = 1;     // 伸出
+    public const int ST_RETRACT = 2;    // 收回
+    public const int ST_QTE = 3;        // 收线 QTE(重物)
+    public const int ST_BOMB = 4;       // 拆弹 QTE
+    public const int ST_RESULT = 5;     // 本关结算
+
+    public Rng rng;
+    public int level = 1;
+    public int gold = 0;                // 本关已入账
+    public int totalGold = 0;           // 累计
+    public int timeLeftMs = 60000;
+    public int state = ST_SWING;
+
+    // 钩子
+    public double angle = 90.0;         // 度,90 = 垂直向下
+    public double angDir = 60.0;        // 度/秒
+    public double clawLen = 70.0;       // 绳长(设计单位)
+    public double clawV = 0.0;          // 伸出/收回速度
+    public int hookedKind = -1;         // 钩住的物品,-1 无
+    public int hookX = 480;
+    public int hookY = 170;             // 绳锚点(矿车口)
+
+    // FEVER 连击
+    public int combo = 0;
+    public double comboMul = 1.0;       // 1.0 .. 2.0
+    public long lastScoreMs = 0;        // 上次有价物入账时间
+    public int feverGlow = 0;           // 0..255 视觉强度
+
+    // 收线 QTE(拉重物时)
+    public double qteRing;              // 白圈半径(收缩)
+    public int qteDone;                 // 已完成次数
+    public int qteNeed;                 // 需要次数(重量越大越多)
+    public int qteBoost;                // 命中后的加速帧数
+    public int qteMissPenalty;          // miss 次数(仅演出)
+
+    // 拆弹 QTE
+    public int bombClicks = 0;
+    public int bombNeed = 12;
+    public int bombTimeLeft = 2500;     // 毫秒
+    public double bombPulse;            // 图标脉动
+
+    // 炸药道具(玩家持有,可用 Q 炸掉钩上物)
+    public int dynamites = 1;
+
+    // 物品与特效
+    public List<Item> items = new List<Item>();
+    public List<Particle> parts = new List<Particle>();
+    public List<FloatText> texts = new List<FloatText>();
+    public int shakeFrames = 0;         // 屏幕震动
+    public int shakeMag = 0;
+    public int flashFrames = 0;         // 爆炸白闪
+    public int tntChain = 0;            // 连锁计数(演出)
+
+    // 关卡流程
+    public int levelResult = 0;         // 0 进行中 1 过关 -1 失败
+    public int resultWait = 0;          // 结算画面停留
+    public bool hurryPlayed = false;
+    public bool lastSecondTick = false;
+
+    // 存档
+    public int bestLevel = 0;
+    public int bestGold = 0;
+
+    public static long NowMs() {
+        return Sdl.Ticks();
+    }
+
+    public void NewRun(Rng rng) {
+        this.rng = rng;
+        this.level = 1;
+        this.totalGold = 0;
+        this.dynamites = 1;
+        this.StartLevel();
+    }
+
+    public int Target() {
+        // 目标曲线:首关 650,之后每关 +40%,再 +150 平滑
+        double t = 650 * Math.Pow(1.4, this.level - 1) + (this.level - 1) * 150;
+        return (int)t;
+    }
+
+    public int LevelTimeMs() {
+        return 60000;
+    }
+
+    public void StartLevel() {
+        this.gold = 0;
+        this.timeLeftMs = this.LevelTimeMs();
+        this.state = World.ST_SWING;
+        this.angle = 90.0;
+        this.angDir = 60.0 + this.level * 4.0;      // 逐关摆速加快
+        if (this.angDir > 130.0) { this.angDir = 130.0; }
+        this.clawLen = 70.0;
+        this.clawV = 0.0;
+        this.hookedKind = -1;
+        this.combo = 0;
+        this.comboMul = 1.0;
+        this.feverGlow = 0;
+        this.levelResult = 0;
+        this.resultWait = 0;
+        this.hurryPlayed = false;
+        this.lastSecondTick = false;
+        this.bombClicks = 0;
+        this.bombPulse = 0;
+        this.tntChain = 0;
+        this.parts.Clear();
+        this.texts.Clear();
+        this.Populate();
+    }
+
+    // 布置本关物品场(深度越深越值钱,石头保底密度)
+    public void Populate() {
+        this.items.Clear();
+        int w = Data.W;
+        int top = 260;                  // 天空/表土分界之下
+        int bot = Data.H - 40;
+        // 深度带:[top..top+150) 浅 [..+300) 中 [..bot] 深
+        this.SpawnKind(0, 4 + this.level / 2, top, top + 150);
+        this.SpawnKind(1, 3 + this.level / 2, top + 80, top + 260);
+        this.SpawnKind(2, 1 + this.level / 3, top + 200, bot - 30);
+        this.SpawnKind(3, this.level >= 2 ? 1 + this.level / 3 : 0, top + 260, bot - 20);
+        this.SpawnKind(4, this.level >= 2 ? 1 : 0, top + 200, bot - 40);
+        this.SpawnKind(5, 1 + this.level / 4, top + 150, bot - 40);
+        this.SpawnKind(6, 2 + this.level / 2, top + 100, bot);
+        this.SpawnKind(7, this.level >= 2 ? 1 + this.level / 4 : 1, top + 200, bot);
+        this.SpawnKind(8, 1 + this.level / 3, top + 180, bot - 20);
+        this.SpawnKind(9, this.level >= 2 ? 1 + this.level / 4 : 0, top + 220, bot - 20);
+        this.SpawnKind(10, 1 + this.level / 3, top + 220, bot - 30);
+    }
+
+    void SpawnKind(int kind, int count, int yLo, int yHi) {
+        ItemDef d = Data.DEFS[kind];
+        int tries = count * 24;
+        for (int n = 0; n < count; n = n + 1) {
+            // 泊松盘式尝试摆放,避免重叠
+            for (int t = 0; t < tries; t = t + 1) {
+                int x = this.rng.Range(d.rad + 20, Data.W - d.rad - 20);
+                int y = this.rng.Range(yLo, yHi > yLo ? yHi : yLo + 1);
+                if (!this.Overlaps(kind, x, y)) {
+                    this.items.Add(Item.Make(kind, x, y));
+                    break;
+                }
+            }
+        }
+    }
+
+    bool Overlaps(int kind, int x, int y) {
+        ItemDef d = Data.DEFS[kind];
+        for (int i = 0; i < this.items.Count; i = i + 1) {
+            Item o = this.items[i];
+            if (!o.alive) { continue; }
+            ItemDef od = Data.DEFS[o.kind];
+            int dx = o.x - x; int dy = o.y - y;
+            int rr = d.rad + od.rad + 14;
+            if (dx * dx + dy * dy < rr * rr) { return true; }
+        }
+        return false;
+    }
+
+    // ------------------ 逐帧逻辑 ------------------
+    public void Step(int dtMs) {
+        double dt = dtMs / 1000.0;
+        if (this.shakeFrames > 0) { this.shakeFrames = this.shakeFrames - 1; }
+        if (this.flashFrames > 0) { this.flashFrames = this.flashFrames - 1; }
+        this.StepFx(dtMs);
+
+        // FEVER 衰减:3.2 秒没进账清零
+        if (this.combo > 0 && this.state != World.ST_RESULT
+            && NowMs() - this.lastScoreMs > 3200) {
+            this.combo = 0;
+            this.comboMul = 1.0;
+        }
+        int glowTarget = this.combo >= 3 ? 200 : this.combo * 40;
+        if (this.feverGlow < glowTarget) { this.feverGlow = this.feverGlow + 12; }
+        else if (this.feverGlow > glowTarget) { this.feverGlow = this.feverGlow - 6; }
+
+        if (this.state == World.ST_RESULT) {
+            this.resultWait = this.resultWait + dtMs;
+            return;
+        }
+
+        // 计时
+        this.timeLeftMs = this.timeLeftMs - dtMs;
+        if (this.timeLeftMs <= 10000 && !this.hurryPlayed) {
+            this.hurryPlayed = true;
+            this.OnHurry();
+        }
+        if (this.timeLeftMs <= 0) {
+            this.timeLeftMs = 0;
+            this.EndLevel(false);
+            return;
+        }
+
+        if (this.state == World.ST_SWING) {
+            this.angle = this.angle + this.angDir * dt;
+            if (this.angle > 155.0) { this.angle = 155.0; this.angDir = -this.angDir; }
+            if (this.angle < 25.0) { this.angle = 25.0; this.angDir = -this.angDir; }
+            this.clawLen = 70.0;
+            return;
+        }
+        if (this.state == World.ST_EXTEND) {
+            this.clawLen = this.clawLen + this.clawV * dt;
+            double tx = this.hookX - Math.Cos(this.angle * Math.PI / 180.0) * this.clawLen;
+            double ty = this.hookY + Math.Sin(this.angle * Math.PI / 180.0) * this.clawLen;
+            // 抓取判定
+            Item hit = this.HitTest((int)tx, (int)ty);
+            if (hit != null) {
+                this.hookedKind = hit.kind;
+                hit.alive = false;
+                this.state = World.ST_RETRACT;
+                this.clawV = 0.0;
+                this.OnHookFx(hit);
+                return;
+            }
+            // 触壁/到底
+            if (tx < 14 || tx > Data.W - 14 || ty > Data.H - 14) {
+                this.state = World.ST_RETRACT;
+                this.clawV = 0.0;
+                return;
+            }
+            return;
+        }
+        if (this.state == World.ST_RETRACT) {
+            this.StepRetract(dtMs, dt);
+            return;
+        }
+        if (this.state == World.ST_QTE) {
+            this.StepQte(dtMs, dt);
+            return;
+        }
+        if (this.state == World.ST_BOMB) {
+            this.bombTimeLeft = this.bombTimeLeft - dtMs;
+            this.bombPulse = this.bombPulse + dt * 9.0;
+            if (this.bombTimeLeft <= 0) {
+                // 拆弹失败:爆炸,扣 100 金 + 震屏
+                this.hookedKind = -1;
+                this.state = World.ST_RETRACT;
+                this.clawV = 260.0;
+                this.AddGold(-100, "拆弹失败 -100", 255, 80, 80);
+                this.BoomFx(this.hookX, this.hookY + (int)this.clawLen, 180);
+                this.Shake(14, 320);
+            }
+            return;
+        }
+    }
+
+    void StepRetract(int dtMs, double dt) {
+        ItemDef d = this.hookedKind >= 0 ? Data.DEFS[this.hookedKind] : null;
+        int weight = d != null ? d.weight : 2;
+        // 重物基础速度慢;QTE 加速叠加
+        double baseV = 900.0 / (2.0 + weight * 0.55);
+        double v = baseV;
+        if (this.qteBoost > 0) {
+            v = v * 1.9;
+            this.qteBoost = this.qteBoost - dtMs;
+            if (this.qteBoost <= 0) { this.qteBoost = 0; }
+        }
+        this.clawLen = this.clawLen - v * dt;
+        if (this.clawLen <= 70.0) {
+            this.clawLen = 70.0;
+            this.LandHook();
+        }
+    }
+
+    void StepQte(int dtMs, double dt) {
+        // 白圈收缩,到底后重置继续,直到完成 qteNeed 次
+        this.qteRing = this.qteRing - dt * 340.0;
+        if (this.qteRing <= 14.0) {
+            this.qteRing = 96.0;
+            this.qteMissPenalty = this.qteMissPenalty + 1;
+        }
+        // 收线同时缓慢回收绳长(基础速度),QTE 命中给大加速
+        ItemDef d = Data.DEFS[this.hookedKind];
+        double baseV = 900.0 / (2.0 + d.weight * 0.55);
+        double v = baseV;
+        if (this.qteBoost > 0) {
+            v = v * 2.2;
+            this.qteBoost = this.qteBoost - dtMs;
+            if (this.qteBoost <= 0) { this.qteBoost = 0; }
+        }
+        this.clawLen = this.clawLen - v * dt;
+        if (this.clawLen <= 70.0) {
+            this.clawLen = 70.0;
+            this.LandHook();
+        }
+    }
+
+    // 玩家输入:放钩 / QTE 命中 / 拆弹点击
+    public void Action() {
+        if (this.state == World.ST_SWING) {
+            this.state = World.ST_EXTEND;
+            this.clawV = 560.0 + this.level * 12.0;
+            if (this.clawV > 780.0) { this.clawV = 780.0; }
+            return;
+        }
+        if (this.state == World.ST_QTE) {
+            // 白圈在金圈(34..54)内算命中
+            if (this.qteRing >= 34.0 && this.qteRing <= 54.0) {
+                this.qteDone = this.qteDone + 1;
+                this.qteBoost = 900;
+                this.qteRing = 96.0;
+                this.Spark(this.hookX, this.hookY + (int)this.clawLen, 255, 220, 90, 10);
+                if (this.qteDone >= this.qteNeed) {
+                    this.state = World.ST_RETRACT;      // 提前完成,纯加速收线
+                }
+            } else {
+                this.qteMissPenalty = this.qteMissPenalty + 1;
+                this.qteRing = 96.0;
+            }
+            return;
+        }
+        if (this.state == World.ST_BOMB) {
+            this.bombClicks = this.bombClicks + 1;
+            if (this.bombClicks >= this.bombNeed) {
+                // 拆弹成功:炸弹被安全拆除,奖励 +80
+                this.hookedKind = -1;
+                this.state = World.ST_RETRACT;
+                this.clawV = 300.0;
+                this.AddGold(80, "拆除成功 +80", 120, 255, 140);
+            }
+            return;
+        }
+    }
+
+    // Q/E:用炸药炸掉钩上的东西(只在自己绳上生效)
+    public bool UseDynamite() {
+        if (this.dynamites <= 0) { return false; }
+        if (this.state != World.ST_RETRACT && this.state != World.ST_QTE) {
+            return false;
+        }
+        if (this.hookedKind < 0) { return false; }
+        this.dynamites = this.dynamites - 1;
+        int cx = this.hookX + (int)(Math.Cos(this.angle * Math.PI / 180.0) * this.clawLen);
+        int cy = this.hookY + (int)(Math.Sin(this.angle * Math.PI / 180.0) * this.clawLen);
+        this.BoomFx(cx, cy, 120);
+        this.Shake(8, 200);
+        // 炸掉钩上物,清连击
+        this.combo = 0;
+        this.comboMul = 1.0;
+        this.hookedKind = -1;
+        if (this.state == World.ST_QTE) { this.state = World.ST_RETRACT; }
+        this.clawV = 420.0;
+        return true;
+    }
+
+    // 钩到东西落地入账
+    void LandHook() {
+        int kind = this.hookedKind;
+        this.hookedKind = -1;
+        this.qteBoost = 0;
+        this.state = World.ST_SWING;
+        if (kind < 0) { return; }
+        ItemDef d = Data.DEFS[kind];
+        int cx = this.hookX;
+        int cy = this.hookY + 30;
+        if (kind == 8) {
+            // TNT:立即爆炸,无收益,震屏
+            this.BoomFx(cx, cy + 40, 160);
+            this.Shake(12, 280);
+            this.combo = 0;
+            this.comboMul = 1.0;
+            this.Float("轰! TNT", cx, cy, 255, 120, 80);
+            return;
+        }
+        if (kind == 9) {
+            // 炸弹:进入拆弹 QTE
+            this.state = World.ST_BOMB;
+            this.bombClicks = 0;
+            this.bombNeed = 10 + this.level;
+            this.bombTimeLeft = 2600 - this.level * 60;
+            if (this.bombTimeLeft < 1600) { this.bombTimeLeft = 1600; }
+            this.bombPulse = 0;
+            return;
+        }
+        if (kind == 5) {
+            // 神秘袋:随机开出
+            int roll = this.rng.Range(0, 100);
+            if (roll < 42) { kind = 0; }
+            else if (roll < 68) { kind = 1; }
+            else if (roll < 82) { kind = 3; }
+            else if (roll < 92) { kind = 10; }
+            else if (roll < 97) { kind = 2; }
+            else { kind = 9; }          // 欧皇变非酋:开出炸弹
+            d = Data.DEFS[kind];
+            this.Float("是…" + d.name + "!", cx, cy - 26, 255, 230, 120);
+            if (kind == 9) {
+                this.state = World.ST_BOMB;
+                this.bombClicks = 0;
+                this.bombNeed = 10 + this.level;
+                this.bombTimeLeft = 2400;
+                this.hookedKind = 9;
+                return;
+            }
+        }
+        int score = d.score;
+        if (d.junk) {
+            // 垃圾:清连击
+            if (this.combo >= 3) { this.Float("连击中断!", cx, cy - 30, 200, 200, 210); }
+            this.combo = 0;
+            this.comboMul = 1.0;
+            this.Float(d.name + " +" + score, cx, cy, 190, 190, 200);
+            this.AddGold(score, null, 0, 0, 0);
+            return;
+        }
+        // 有价物:连击增长
+        this.combo = this.combo + 1;
+        this.lastScoreMs = NowMs();
+        this.comboMul = 1.0 + this.combo * 0.1;
+        if (this.comboMul > 2.0) { this.comboMul = 2.0; }
+        int got = (int)(score * this.comboMul);
+        string label = "+" + got;
+        if (this.combo >= 2) { label = "+" + got + "  x" + this.combo; }
+        int cr = 255; int cg = 220; int cb = 90;
+        if (this.combo >= 5) { cr = 255; cg = 150; cb = 60; }
+        if (this.combo >= 8) { cr = 255; cg = 90; cb = 90; }
+        this.Float(label, cx, cy, cr, cg, cb);
+        this.AddGold(got, null, 0, 0, 0);
+        this.Spark(cx, cy, 255, 215, 80, 14);
+    }
+
+    void AddGold(int delta, string label, int cr, int cg, int cb) {
+        this.gold = this.gold + delta;
+        if (this.gold < 0) { this.gold = 0; }
+        if (label != null) {
+            this.Float(label, this.hookX, this.hookY + 60, cr, cg, cb);
+        }
+        // 达标即时过关(还有时间剩余):给"提前完成"奖励
+        if (this.levelResult == 0 && this.gold >= this.Target()
+            && this.state != World.ST_RESULT) {
+            int bonus = this.timeLeftMs / 1000 * 5;     // 剩余每秒 +5
+            if (bonus > 0) {
+                this.gold = this.gold + bonus;
+                this.Float("提前完成! 剩余奖励 +" + bonus, Data.W / 2, 300, 120, 255, 140);
+            }
+            this.EndLevel(true);
+        }
+    }
+
+    void EndLevel(bool win) {
+        if (this.levelResult != 0) { return; }
+        this.levelResult = win ? 1 : -1;
+        this.state = World.ST_RESULT;
+        this.resultWait = 0;
+        this.totalGold = this.totalGold + this.gold;
+        if (win) {
+            if (this.level > this.bestLevel) { this.bestLevel = this.level; }
+            if (this.gold > this.bestGold) { this.bestGold = this.gold; }
+        }
+    }
+
+    // 结算画面点击 → 进入下一关 / 重来
+    public bool ConfirmResult() {
+        if (this.state != World.ST_RESULT || this.resultWait < 600) { return false; }
+        if (this.levelResult > 0) {
+            this.level = this.level + 1;
+            this.dynamites = this.dynamites + 1;
+            if (this.dynamites > 3) { this.dynamites = 3; }
+            this.StartLevel();
+        } else {
+            this.NewRun(this.rng);
+        }
+        return true;
+    }
+
+    // ------------------ 特效辅助 ------------------
+    void OnHookFx(Item it) {
+        ItemDef d = Data.DEFS[it.kind];
+        // 重物进入收线 QTE
+        if (d.weight >= 9 && it.kind != 8 && it.kind != 9) {
+            this.state = World.ST_QTE;
+            this.qteRing = 96.0;
+            this.qteDone = 0;
+            this.qteNeed = 1 + d.weight / 6;
+            this.qteBoost = 0;
+            this.qteMissPenalty = 0;
+        }
+        this.Spark(it.x, it.y, 200, 200, 210, 8);
+    }
+
+    void OnHurry() {
+        this.Shake(4, 90);
+    }
+
+    public void Shake(int frames, int mag) {
+        this.shakeFrames = frames;
+        this.shakeMag = mag;
+    }
+
+    void BoomFx(int cx, int cy, int n) {
+        this.flashFrames = 6;
+        for (int i = 0; i < n; i = i + 1) {
+            Particle p = new Particle();
+            double a = this.rng.NextDouble01() * 6.283;
+            double sp = 90.0 + this.rng.NextDouble01() * 340.0;
+            p.x = cx; p.y = cy;
+            p.vx = Math.Cos(a) * sp;
+            p.vy = Math.Sin(a) * sp - 60.0;
+            p.maxLife = 26 + this.rng.Range(0, 18);
+            p.life = p.maxLife;
+            p.size = 3 + this.rng.Range(0, 4);
+            int roll = this.rng.Range(0, 3);
+            if (roll == 0) { p.r = 255; p.g = 200; p.b = 70; }
+            else if (roll == 1) { p.r = 255; p.g = 120; p.b = 40; }
+            else { p.r = 120; p.g = 110; p.b = 100; }
+            this.parts.Add(p);
+        }
+    }
+
+    void Spark(int cx, int cy, int r, int g, int b, int n) {
+        for (int i = 0; i < n; i = i + 1) {
+            Particle p = new Particle();
+            double a = this.rng.NextDouble01() * 6.283;
+            double sp = 40.0 + this.rng.NextDouble01() * 180.0;
+            p.x = cx; p.y = cy;
+            p.vx = Math.Cos(a) * sp;
+            p.vy = Math.Sin(a) * sp - 50.0;
+            p.maxLife = 18 + this.rng.Range(0, 12);
+            p.life = p.maxLife;
+            p.size = 2 + this.rng.Range(0, 3);
+            p.r = r; p.g = g; p.b = b;
+            this.parts.Add(p);
+        }
+    }
+
+    public void Float(string text, int x, int y, int r, int g, int b) {
+        FloatText ft = new FloatText();
+        ft.text = text; ft.x = x; ft.y = y;
+        ft.life = 70; ft.r = r; ft.g = g; ft.b = b;
+        this.texts.Add(ft);
+    }
+
+    void StepFx(int dtMs) {
+        double dt = dtMs / 1000.0;
+        for (int i = this.parts.Count - 1; i >= 0; i = i - 1) {
+            Particle p = this.parts[i];
+            p.life = p.life - 1;
+            if (p.life <= 0) { this.parts.RemoveAt(i); continue; }
+            p.x = p.x + p.vx * dt;
+            p.y = p.y + p.vy * dt;
+            p.vy = p.vy + 520.0 * dt;       // 重力
+        }
+        for (int i = this.texts.Count - 1; i >= 0; i = i - 1) {
+            FloatText ft = this.texts[i];
+            ft.life = ft.life - 1;
+            ft.y = ft.y - (int)(40 * dt);
+            if (ft.life <= 0) { this.texts.RemoveAt(i); }
+        }
+    }
+
+    Item HitTest(int x, int y) {
+        for (int i = 0; i < this.items.Count; i = i + 1) {
+            Item it = this.items[i];
+            if (!it.alive) { continue; }
+            ItemDef d = Data.DEFS[it.kind];
+            int dx = it.x - x; int dy = it.y - y;
+            int rr = d.rad + 14;
+            if (dx * dx + dy * dy <= rr * rr) { return it; }
+        }
+        return null;
+    }
+
+    // ------------------ 存档 ------------------
+    public void Save() {
+        List<string> lines = new List<string>();
+        lines.Add("bestLevel=" + this.bestLevel);
+        lines.Add("bestGold=" + this.bestGold);
+        lines.Add("totalGold=" + this.totalGold);
+        lines.Add("level=" + this.level);
+        File.WriteAllLines(Data.SavePath(), lines);
+    }
+
+    public void Load() {
+        string p = Data.SavePath();
+        if (!File.Exists(p)) { return; }
+        List<string> lines = File.ReadAllLines(p);
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string ln = lines[i];
+            int eq = ln.IndexOf("=");
+            if (eq <= 0) { continue; }
+            string k = ln.Substring(0, eq);
+            string v = ln.Substring(eq + 1);
+            if (k == "bestLevel") { this.bestLevel = Data.ParseIntS(v); }
+            else if (k == "bestGold") { this.bestGold = Data.ParseIntS(v); }
+            else if (k == "totalGold") { this.totalGold = Data.ParseIntS(v); }
+        }
+    }
+}
