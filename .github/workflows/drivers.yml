@@ -44,6 +44,10 @@ env:
   SDL3_VERSION: '3.4.10'
   SQLITE_URL: 'https://sqlite.org/2024/sqlite-amalgamation-3460100.zip'
   SQLITE_DIR: 'sqlite-amalgamation-3460100'
+  # Lua 5.4.6 source tarball (drivers.yml "Stage Lua driver"); saved as
+  # lua.tar.gz on POSIX runners and lua.zip on Windows (same bytes, either name).
+  LUA_URL: 'https://www.lua.org/ftp/lua-5.4.6.tar.gz'
+  LUA_DIR: 'lua-5.4.6'
 
 jobs:
   # ---------------------------------------------------------------- Linux ----
@@ -132,6 +136,33 @@ jobs:
       - name: Stage PostgreSQL (libpq) driver
         run: bash scripts/stage_libpq_linux.sh "${{ matrix.target }}"
 
+      - name: Stage Lua driver
+        run: |
+          set -eux
+          curl -fsSL -o lua.tar.gz "$LUA_URL"
+          sh scripts/verify_dep.sh lua.tar.gz
+          tar xzf lua.tar.gz
+          DEST="stdlib/System/Scripting/drivers/${{ matrix.target }}"
+          mkdir -p "$DEST"
+          cc -O2 -fPIC -shared -Wl,-soname,liblua5.4.so \
+            -DLUA_USE_LINUX \
+            -o "$DEST/liblua5.4.so" \
+            $LUA_DIR/src/lapi.c $LUA_DIR/src/lauxlib.c $LUA_DIR/src/lbaselib.c \
+            $LUA_DIR/src/lcode.c $LUA_DIR/src/lcorolib.c $LUA_DIR/src/lctype.c \
+            $LUA_DIR/src/ldblib.c $LUA_DIR/src/ldebug.c $LUA_DIR/src/ldo.c \
+            $LUA_DIR/src/ldump.c $LUA_DIR/src/lfunc.c $LUA_DIR/src/lgc.c \
+            $LUA_DIR/src/linit.c $LUA_DIR/src/liolib.c $LUA_DIR/src/llex.c \
+            $LUA_DIR/src/lmathlib.c $LUA_DIR/src/lmem.c $LUA_DIR/src/loadlib.c \
+            $LUA_DIR/src/lobject.c $LUA_DIR/src/lopcodes.c $LUA_DIR/src/loslib.c \
+            $LUA_DIR/src/lparser.c $LUA_DIR/src/lstate.c $LUA_DIR/src/lstring.c \
+            $LUA_DIR/src/lstrlib.c $LUA_DIR/src/ltable.c $LUA_DIR/src/ltablib.c \
+            $LUA_DIR/src/ltm.c $LUA_DIR/src/lundump.c $LUA_DIR/src/lutf8lib.c \
+            $LUA_DIR/src/lvm.c $LUA_DIR/src/lzio.c -lm
+          # Lua.zan resolves liblua5.4.so first; also ship the unversioned
+          # soname alias the candidate list accepts.
+          ln -sf liblua5.4.so "$DEST/liblua.so"
+          printf 'liblua5.4.so\nliblua.so\n' > "$DEST/lua.bundle"
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: drivers-${{ matrix.target }}
@@ -139,6 +170,7 @@ jobs:
             stdlib/SDL3/drivers/${{ matrix.target }}/
             stdlib/System/Data/Sqlite/drivers/${{ matrix.target }}/
             stdlib/System/Data/Postgres/drivers/${{ matrix.target }}/
+            stdlib/System/Scripting/drivers/${{ matrix.target }}/
 
   # ---------------------------------------------------------------- macOS ----
   macos:
@@ -206,6 +238,32 @@ jobs:
 
       - name: Stage PostgreSQL (libpq) driver
         run: bash scripts/stage_libpq_macos.sh "${{ matrix.target }}"
+
+      - name: Stage Lua driver
+        run: |
+          set -eux
+          curl -fsSL -o lua.tar.gz "$LUA_URL"
+          sh scripts/verify_dep.sh lua.tar.gz
+          tar xzf lua.tar.gz
+          DEST="stdlib/System/Scripting/drivers/${{ matrix.target }}"
+          mkdir -p "$DEST"
+          xcrun clang -O2 -fPIC -dynamiclib -install_name @rpath/liblua5.4.dylib \
+            -DLUA_USE_MACOSX \
+            -o "$DEST/liblua5.4.dylib" \
+            $LUA_DIR/src/lapi.c $LUA_DIR/src/lauxlib.c $LUA_DIR/src/lbaselib.c \
+            $LUA_DIR/src/lcode.c $LUA_DIR/src/lcorolib.c $LUA_DIR/src/lctype.c \
+            $LUA_DIR/src/ldblib.c $LUA_DIR/src/ldebug.c $LUA_DIR/src/ldo.c \
+            $LUA_DIR/src/ldump.c $LUA_DIR/src/lfunc.c $LUA_DIR/src/lgc.c \
+            $LUA_DIR/src/linit.c $LUA_DIR/src/liolib.c $LUA_DIR/src/llex.c \
+            $LUA_DIR/src/lmathlib.c $LUA_DIR/src/lmem.c $LUA_DIR/src/loadlib.c \
+            $LUA_DIR/src/lobject.c $LUA_DIR/src/lopcodes.c $LUA_DIR/src/loslib.c \
+            $LUA_DIR/src/lparser.c $LUA_DIR/src/lstate.c $LUA_DIR/src/lstring.c \
+            $LUA_DIR/src/lstrlib.c $LUA_DIR/src/ltable.c $LUA_DIR/src/ltablib.c \
+            $LUA_DIR/src/ltm.c $LUA_DIR/src/lundump.c $LUA_DIR/src/lutf8lib.c \
+            $LUA_DIR/src/lvm.c $LUA_DIR/src/lzio.c -lm
+          codesign --force --sign - "$DEST/liblua5.4.dylib"
+          printf 'liblua5.4.dylib\n' > "$DEST/lua.bundle"
+          otool -L "$DEST/liblua5.4.dylib"
 
       # The Cocoa GUI runtime is the one driver that cannot be built anywhere
       # but on a Mac (Objective-C against the Apple frameworks). Building it
@@ -284,6 +342,7 @@ jobs:
             stdlib/System/Data/Sqlite/drivers/${{ matrix.target }}/
             stdlib/System/Data/Postgres/drivers/${{ matrix.target }}/
             stdlib/Gui/drivers/${{ matrix.target }}/
+            stdlib/System/Scripting/drivers/${{ matrix.target }}/
 
   # -------------------------------------------------------------- Windows ----
   windows:
@@ -477,6 +536,57 @@ jobs:
           { echo libpq.dll; ls "$GDEST" | grep -viE '^(libpq\.dll|pq\.bundle)$' | sort || true; } > "$GDEST/pq.bundle"
           ls -la "$SDEST" "$QDEST" "$GDEST"
 
+      # Both Windows targets build Lua from source with the MSVC target and
+      # dynamic-CRT import libs. The VS edition/year, MSVC toolset, SDK and
+      # LLVM paths all drift per runner image, so discover them by glob
+      # instead of hardcoding a developer-machine layout.
+      - name: Stage Lua driver (MSVC target, dynamic CRT)
+        run: |
+          set -eux
+          curl -fsSL -o lua.zip "$LUA_URL"
+          sh scripts/verify_dep.sh lua.zip
+          # Same bytes as the POSIX runners' lua.tar.gz; tar handles it
+          # regardless of the .zip name (unzip would reject the gzip).
+          tar -xzf lua.zip
+          DEST="stdlib/System/Scripting/drivers/${{ matrix.target }}"
+          mkdir -p "$DEST"
+          # MSVC target + dynamic CRT import libs. A statically linked CRT
+          # (libcmt/libucrt) crashes luaL_newstate in non-MSVC hosts (the
+          # runtime allocates before any host-provided heap state exists);
+          # the dynamic import libs keep Lua on the host's universal CRT,
+          # exactly like every other driver DLL.
+          if [ "${{ matrix.target }}" = win-x64 ]; then
+            TGT=x86_64-pc-windows-msvc; LIBARCH=x64; MACHINE=x64
+          else
+            TGT=aarch64-pc-windows-msvc; LIBARCH=arm64; MACHINE=arm64
+          fi
+          LLVM="$(ls -d /c/Program\ Files/Microsoft\ Visual\ Studio/*/*/VC/Tools/Llvm/*/bin 2>/dev/null | tail -1 || true)"
+          [ -d "$LLVM" ] || LLVM="/c/Program Files/LLVM/bin"
+          MSVC_ROOT="$(ls -d /c/Program\ Files/Microsoft\ Visual\ Studio/*/*/VC/Tools/MSVC 2>/dev/null | tail -1)"
+          MSVC_VER="$(ls "$MSVC_ROOT" | sort -V | tail -1)"
+          SDK_ROOT="/c/Program Files (x86)/Windows Kits/10/Lib"
+          SDK_VER="$(ls "$SDK_ROOT" | grep '^10\.' | sort -V | tail -1)"
+          LLVM="$(cygpath -m "$LLVM")"
+          MSVC="$(cygpath -m "$MSVC_ROOT/$MSVC_VER")"
+          SDK="$(cygpath -m "$SDK_ROOT/$SDK_VER")"
+          SRCS=""
+          for f in lapi lauxlib lbaselib lcode lcorolib lctype ldblib ldebug \
+                   ldo ldump lfunc lgc linit liolib llex lmathlib lmem loadlib \
+                   lobject lopcodes loslib lparser lstate lstring lstrlib \
+                   ltable ltablib ltm lundump lutf8lib lvm lzio; do
+            SRCS="$SRCS $LUA_DIR/src/$f.c"
+          done
+          "$LLVM/clang.exe" --target=$TGT -O2 -DLUA_BUILD_AS_DLL \
+            -D_CRT_SECURE_NO_WARNINGS $SRCS -c
+          "$LLVM/lld-link.exe" -dll -noentry -machine:$MACHINE \
+            -def:stdlib/System/Scripting/lua54.def *.obj \
+            "$MSVC/lib/$LIBARCH/msvcrt.lib" "$MSVC/lib/$LIBARCH/vcruntime.lib" \
+            "$SDK/ucrt/$LIBARCH/ucrt.lib" "$SDK/um/$LIBARCH/kernel32.Lib" \
+            -out:"$DEST/lua54.dll"
+          rm -f *.obj
+          printf 'lua54.dll\n' > "$DEST/lua.bundle"
+          file "$DEST/lua54.dll" || true
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: drivers-${{ matrix.target }}
@@ -485,6 +595,7 @@ jobs:
             stdlib/System/Data/Sqlite/drivers/${{ matrix.target }}/
             stdlib/System/Data/Postgres/drivers/${{ matrix.target }}/
             stdlib/System/Net/Tls/drivers/${{ matrix.target }}/
+            stdlib/System/Scripting/drivers/${{ matrix.target }}/
 
   # -------------------------------------------------------------- Release ----
   release:
