@@ -200,10 +200,9 @@ class MinerApp {
         int[] mw = new int[2];
         string mp = Assets.Find("assets/miner.png");
         if (MinerApp.PngSize(mp, mw)) {
-            // 矿工贴地站立:高度=草地线上方整格,宽度按纹理纵横比,
-            // 保证头部不出画、脚踩草地线(此前锚定 HOOK_Y,头顶出画
-            // 42px 且双脚悬空)。
-            a.minerH = Data.SKY_H + 6;
+            // 矿工贴地站立:脚踩草地线,头顶让出 Gui 顶栏带(半透明
+            // 顶栏 Dock.Top 约 46 设计像素,此前头盔被顶栏罩住)。
+            a.minerH = Data.SKY_H - 54;
             a.minerW = a.minerH * mw[0] / mw[1];
         }
         int[] cw = new int[2];
@@ -484,12 +483,14 @@ class MinerApp {
         double rad = wo.angle * Math.PI / 180.0;
         int cx = ox + Data.HOOK_X + (int)(Math.Cos(rad) * wo.clawLen);
         int cy = oy + Data.HOOK_Y + (int)(Math.Sin(rad) * wo.clawLen);
-        // 爪顶铰点(绿点):纹理顶缘中点绕中心随摆角旋转。绳必须接到
-        // 这里——接到爪中心会差半个爪身,看起来"绳没挂在爪上"。
+        // 爪顶铰点(绿点)= 爪心 - 指向方向·ch/2。未旋转时铰点在纹理
+        // 顶缘中点(爪心上方 ch/2),爪绕中心旋转后铰点始终在指向方向
+        // (cosA,sinA,与伸出判定同一约定)的反方向 ch/2 处。上一版把
+        // sin/cos 写反:垂直时接到左缘中点,135 度时接到反侧。
         int ch = this.clawH;
-        int pr = ch * 2 / 5;
-        int ex = cx - (int)(Math.Sin(rad) * pr);
-        int ey = cy - (int)(Math.Cos(rad) * pr);
+        int h2 = ch / 2;
+        int ex = cx - (int)(Math.Cos(rad) * h2);
+        int ey = cy - (int)(Math.Sin(rad) * h2);
         // 绳:矿工手 → 爪铰点(短线段逐段画,近似摆动弧度)
         int segs = 8;
         int sx0 = ox + Data.HOOK_X;
@@ -521,14 +522,19 @@ class MinerApp {
         } else {
             Draw.FillCircle(rd, cx, cy, 14, 160, 160, 170, 255);
         }
-        // 钩上物跟随爪心(顶部收进爪内,悬挂点在爪身下 30% 处)
+        // 钩上物挂在爪钳里:中心在爪心指向方向 0.58 爪高处,随摆角
+        // 转动(贴图保持直立)。此前固定画在爪心正下方,斜角时物品
+        // 悬在钳外与爪错位。
         if (wo.hookedKind >= 0) {
             ItemDef d = Data.DEFS[wo.hookedKind];
             SdlTexture t = this.texKind[wo.hookedKind];
             if (t != null && t.IsValid()) {
                 int dw = d.texW;
                 int dh = d.texH;
-                rd.DrawTexture(t, cx - dw / 2, cy + ch * 3 / 10 - 4, dw, dh);
+                int jr = ch * 58 / 100;
+                int ix = cx + (int)(Math.Cos(rad) * jr) - dw / 2;
+                int iy = cy + (int)(Math.Sin(rad) * jr) - dh / 2;
+                rd.DrawTexture(t, ix, iy, dw, dh);
             }
         }
     }
@@ -556,6 +562,11 @@ class MinerApp {
                 Draw.FillCircle(rd, dx, cy + 74, 6, 70, 70, 80, 255);
             }
         }
+        // 操作提示(顶栏不再放常驻提示行;圈心过深时画到圈上方)
+        int hy = cy + 96;
+        if (hy > Data.H - 20) { hy = cy - 74; }
+        Text.DrawCenteredShadow(rd, "白圈缩进金圈时点击!", cx, hy, 2,
+                                232, 226, 212, 255);
     }
 
     // ---------------------------------------------------------------
@@ -926,7 +937,6 @@ class HudTop {
     Label time;
     Label combo;
     Label dynamite;
-    Label hint;
 
     HudTop(MinerApp a) { this.app = a; }
 
@@ -940,8 +950,10 @@ class HudTop {
         p.Pad(10);
         p.With(row);
 
+        // 顶栏整行统一 hud-subtitle(14px)——此前 title/subtitle/small
+        // 三种字号混排一行,视觉杂乱。
         this.level = new Label("");
-        this.level.Class = "hud-title";
+        this.level.Class = "hud-subtitle";
         row.With(this.level);
 
         this.gold = new Label("");
@@ -950,7 +962,7 @@ class HudTop {
 
         this.bar_ = new Progress(0, 0);
         this.bar_.Class = "hud";
-        this.bar_.Prefer(300, 14);
+        this.bar_.Prefer(300, 18);
         this.bar_.ShowText(false);
         row.With(this.bar_);
 
@@ -959,16 +971,12 @@ class HudTop {
         row.With(this.time);
 
         this.combo = new Label("");
-        this.combo.Class = "hud-title";
+        this.combo.Class = "hud-subtitle";
         row.With(this.combo);
 
         this.dynamite = new Label("");
-        this.dynamite.Class = "hud-small";
+        this.dynamite.Class = "hud-subtitle";
         row.With(this.dynamite);
-
-        this.hint = new Label("");
-        this.hint.Class = "hud-small";
-        row.With(this.hint);
         return p;
     }
 
@@ -980,24 +988,13 @@ class HudTop {
         if (pct > 100) { pct = 100; }
         this.bar_.SetPercent(pct);
         int secLeft = (w.timeLeftMs + 999) / 1000;
-        this.time.Text = "剩余 " + secLeft + "s";
+        this.time.Text = "剩余 " + secLeft + " 秒";
         if (w.combo >= 2) {
-            int mul10 = (int)(w.comboMul * 10.0);
-            this.combo.Text = "FEVER x" + w.combo + "  倍率 "
-                              + mul10 / 10 + "." + mul10 % 10;
+            this.combo.Text = "连击 x" + w.combo;
         } else {
             this.combo.Text = "";
         }
         this.dynamite.Text = "Q 炸药 x" + w.dynamites;
-        if (w.state == World.ST_BOMB) {
-            this.hint.Text = "疯狂点击! 拆除炸弹!";
-        } else if (w.state == World.ST_QTE) {
-            this.hint.Text = "白圈缩进金圈时点击! 加速收线";
-        } else if (w.state == World.ST_SWING) {
-            this.hint.Text = "点击 / 空格 放钩";
-        } else {
-            this.hint.Text = "";
-        }
     }
 }
 
