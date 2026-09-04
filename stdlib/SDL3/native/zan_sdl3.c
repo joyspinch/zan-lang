@@ -418,6 +418,41 @@ ZAN_SDL_API zan_iptr zan_sdl_load_image_texture(zan_iptr renderer, const char *p
     return zan_handle(texture);
 }
 
+/* Same as zan_sdl_load_image_texture, but decodes from caller-owned memory
+ * (encrypted pack entry already decrypted in RAM -- never touches the disk).
+ * The buffer is only read synchronously inside this call; ownership stays
+ * with the caller and no lifetime beyond the return is assumed. */
+ZAN_SDL_API zan_iptr zan_sdl_load_image_texture_mem(
+    zan_iptr renderer, const void *data, zan_i32 len) {
+    if (!renderer || !data || len <= 0) return 0;
+    int width = 0;
+    int height = 0;
+    int channels = 0;
+    stbi_uc *pixels = stbi_load_from_memory(
+        (const stbi_uc *)data, (int)len, &width, &height, &channels, 4);
+    if (!pixels) {
+        const char *reason = stbi_failure_reason();
+        SDL_SetError("Unable to decode in-memory image: %s",
+                     reason ? reason : "unknown decoder error");
+        return 0;
+    }
+    SDL_Surface *surface = SDL_CreateSurfaceFrom(
+        width, height, SDL_PIXELFORMAT_RGBA32, pixels, width * 4);
+    if (!surface) {
+        stbi_image_free(pixels);
+        return 0;
+    }
+    SDL_Texture *texture = SDL_CreateTextureFromSurface(
+        (SDL_Renderer *)zan_ptr(renderer), surface);
+    if (texture) {
+        SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND);
+        SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_LINEAR);
+    }
+    SDL_DestroySurface(surface);
+    stbi_image_free(pixels);
+    return zan_handle(texture);
+}
+
 ZAN_SDL_API void zan_sdl_destroy_texture(zan_iptr texture) {
     if (texture) SDL_DestroyTexture((SDL_Texture *)zan_ptr(texture));
 }

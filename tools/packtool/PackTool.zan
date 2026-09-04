@@ -1,0 +1,265 @@
+// PackTool -- 把游戏的 assets/ 目录打成一个加密资源包（.zrp）。
+//
+// 加密逻辑不在这里重写：条目加密/AES-GCM/RSA 签名全部复用
+// stdlib 的 System.Resources.ResourcePackWriter，本工具只做
+// 「收集文件 → 生成密钥分片 → 组装 manifest → 写 .zrp」这一层壳。
+// 配套的 PowerShell 侧（scripts/pack_game.ps1）只做参数拼装与文件
+// 布局，永远不接触明文加密实现。
+//
+// !! 语言坑（byte[] → string 隐式传参）：零拷贝别名，不延长数组寿命。
+// 作为调用实参（当场用掉）是安全的；一旦存进跨分配的字段（如
+// ResourceEntry.data），数组在下一轮循环即被释放，字段成悬垂指针，
+// Write() 会把堆上被复用的垃圾当明文加密且 GCM tag "合法"，极难排查
+// （复现：Add(name, data, ...) 直传 ReadAllBytes 的 byte[]；修复：
+// 一律 .ToStr(0, len)。字节级取证见 _scratch/packtool_test/verify2.zan：
+// 修复前 ndiff=160642/161301，修复后 diff=0）。
+//
+// Build: zanc tools/packtool/PackTool.zan --auto-stdlib -o build/packtool.exe
+//
+// 用法：
+//   packtool <assets-dir> --out <pack.zrp> [--manifest <manifest.json>]
+//            [--keyhex <64hex>] [--share-a <f> --share-b <f>]
+//            [--sign-n <hex>] [--sign-d <hex>]
+//
+//   <assets-dir>     资源根目录；条目名 = 相对该目录的正斜杠路径
+//                    （"assets/ui/panel.png"），与 GameKit.PackedAssets
+//                    的 Read(name) 命名一致。
+//   --out            输出 .zrp 路径（必填）。
+//   --manifest       同时写出一份 manifest JSON（条目名+大小+sha256 摘要
+//                    不含密钥），便于 diff/审计；不传则不写。
+//   --keyhex         直接给 64 hex 主密钥（测试/复现用）。生产路径不要用
+//                    ——密钥会出现在命令行历史里。
+//   --share-a/-b     两份 XOR 分片的 hex 文件；都给了就 XOR 出主密钥。
+//   都没给           自动生成随机主密钥，并写出两份分片文件
+//                    <out>.share_a.hex / <out>.share_b.hex（配合
+//                    GameKit.PackedAssets.Open 的 MixKey 模式）。
+//   --sign-n/--sign-d  RSA 模数/私钥指数（hex）对 index 签名；不传则无签名
+//                    （PackedAssets.Open 不校验签名，两态兼容）。
+//
+// 退出码：0 成功；2 用法/参数错误；3 打包失败。
+using System;
+using System.IO;
+using System.Json;
+using System.Resources;
+using System.Security.Cryptography;
+
+namespace PackTool;
+
+class Program {
+    static int Main() {
+        string assetsDir = "";
+        string outPath = "";
+        string manifestPath = "";
+        string keyHex = "";
+        string shareAPath = "";
+        string shareBPath = "";
+        string signN = "";
+        string signD = "";
+
+        int i = 0;
+        bool noMoreFlags = false;
+        while (i < Environment.ArgCount()) {
+            string a = Environment.ArgAt(i);
+            i = i + 1;
+            if (!noMoreFlags && a == "--") { noMoreFlags = true; }
+            else if (!noMoreFlags && a == "--out" && i < Environment.ArgCount()) {
+                outPath = Environment.ArgAt(i);
+                i = i + 1;
+            } else if (!noMoreFlags && a == "--manifest" && i < Environment.ArgCount()) {
+                manifestPath = Environment.ArgAt(i);
+                i = i + 1;
+            } else if (!noMoreFlags && a == "--keyhex" && i < Environment.ArgCount()) {
+                keyHex = Environment.ArgAt(i);
+                i = i + 1;
+            } else if (!noMoreFlags && a == "--share-a" && i < Environment.ArgCount()) {
+                shareAPath = Environment.ArgAt(i);
+                i = i + 1;
+            } else if (!noMoreFlags && a == "--share-b" && i < Environment.ArgCount()) {
+                shareBPath = Environment.ArgAt(i);
+                i = i + 1;
+            } else if (!noMoreFlags && a == "--sign-n" && i < Environment.ArgCount()) {
+                signN = Environment.ArgAt(i);
+                i = i + 1;
+            } else if (!noMoreFlags && a == "--sign-d" && i < Environment.ArgCount()) {
+                signD = Environment.ArgAt(i);
+                i = i + 1;
+            } else if (!noMoreFlags && a.StartsWith("--")) {
+                Console.WriteLine("packtool: unknown option " + a);
+                return 2;
+            } else if (assetsDir.Length == 0) {
+                assetsDir = a;
+            } else {
+                Console.WriteLine("packtool: unexpected argument " + a);
+                return 2;
+            }
+        }
+
+        if (assetsDir.Length == 0 || outPath.Length == 0) {
+            Program.Usage();
+            return 2;
+        }
+        // 归一化尾部斜杠，条目名前缀剥离依赖这个形状。
+        while (assetsDir.EndsWith("/") || assetsDir.EndsWith("\\")) {
+            assetsDir = assetsDir.Substring(0, assetsDir.Length - 1);
+        }
+        if (!Directory.Exists(assetsDir)) {
+            Console.WriteLine("packtool: assets dir not found: " + assetsDir);
+            return 2;
+        }
+
+        // ---- 主密钥：--keyhex > 分片文件 > 自动生成 -------------------
+        string masterHex = keyHex;
+        string shareAHex = "";
+        string shareBHex = "";
+        if (masterHex.Length == 0 && shareAPath.Length > 0 && shareBPath.Length > 0) {
+            shareAHex = Program.ReadHexFile(shareAPath);
+            shareBHex = Program.ReadHexFile(shareBPath);
+            if (shareAHex.Length != 64 || shareBHex.Length != 64) {
+                Console.WriteLine("packtool: share files must hold 64 hex chars each");
+                return 2;
+            }
+            masterHex = Program.XorHex(shareAHex, shareBHex);
+        }
+        bool autoKey = false;
+        if (masterHex.Length == 0) {
+            autoKey = true;
+            shareAHex = Program.RandomHex(32);
+            shareBHex = Program.RandomHex(32);
+            masterHex = Program.XorHex(shareAHex, shareBHex);
+            string pathA = outPath + ".share_a.hex";
+            string pathB = outPath + ".share_b.hex";
+            File.WriteAllText(pathA, shareAHex + "\n");
+            File.WriteAllText(pathB, shareBHex + "\n");
+            Console.WriteLine("keys: wrote " + pathA);
+            Console.WriteLine("keys: wrote " + pathB);
+            Console.WriteLine("keys: keep BOTH shares (and the signed pack) together;"
+                + " either share alone is useless");
+        }
+
+        // ---- 收集条目（白名单扩展，跳过构建/隐藏目录） ----------------
+        List<string> files = DirectoryTree.Files(assetsDir,
+            PathFilter.Only(".png .jpg .jpeg .wav .txt .json .fnt")
+                .Skip("publish build bin obj dist dist").Dots(true, true));
+        if (files.Count == 0) {
+            Console.WriteLine("packtool: no eligible files under " + assetsDir);
+            return 3;
+        }
+
+        string master = Hex.Decode(masterHex).ToStr(0, 32);
+        ResourcePackWriter w = new ResourcePackWriter();
+        JsonValue manifest = JsonValue.NewObject();
+        JsonValue arr = JsonValue.NewArray();
+        long total = 0;
+
+        int idx = 0;
+        while (idx < files.Count) {
+            string full = files[idx];
+            // 条目名 = 相对 assets 根的路径（正斜杠，与 PackedAssets 一致）。
+            string name = full;
+            string prefix = assetsDir + "/";
+            if (name.StartsWith(prefix)) {
+                name = name.Substring(prefix.Length, name.Length - prefix.Length);
+            }
+            byte[] data = File.ReadAllBytes(full);
+            if (data == null || data.Length <= 0) {
+                Console.WriteLine("packtool: cannot read " + full);
+                return 3;
+            }
+            w.Add(name, data.ToStr(0, data.Length), data.Length);
+            JsonValue rec = JsonValue.NewObject();
+            rec.Set("name", JsonValue.NewStr(name));
+            rec.Set("size", JsonValue.NewNum(Program.Num(data.Length)));
+            rec.Set("sha256", JsonValue.NewStr(
+                Hex.Encode(Sha256.Hash(data.ToStr(0, data.Length), data.Length), 32)));
+            arr.Append(rec);
+            total = total + data.Length;
+            idx = idx + 1;
+        }
+        manifest.Set("entries", arr);
+        manifest.Set("count", JsonValue.NewNum(Program.Num(files.Count)));
+        manifest.Set("bytes", JsonValue.NewNum(Program.Num(total)));
+        manifest.Set("signed", JsonValue.NewBool(signN.Length > 0 && signD.Length > 0));
+
+        bool ok;
+        if (signN.Length > 0 && signD.Length > 0) {
+            ok = w.Write(outPath, master, signN, signD);
+        } else {
+            ok = w.Write(outPath, master, null, null);
+        }
+        if (!ok) {
+            Console.WriteLine("packtool: failed to write " + outPath);
+            return 3;
+        }
+        if (manifestPath.Length > 0) {
+            File.WriteAllText(manifestPath, manifest.ToJson() + "\n");
+        }
+        Console.WriteLine("packed " + files.Count + " entries (" + total
+            + " bytes) -> " + outPath
+            + (autoKey ? " [random key, shares written]" : ""));
+        return 0;
+    }
+
+    static void Usage() {
+        Console.WriteLine("usage: packtool <assets-dir> --out <pack.zrp>"
+            + " [--manifest <manifest.json>]");
+        Console.WriteLine("       [--keyhex <64hex> | --share-a <f> --share-b <f>]");
+        Console.WriteLine("       [--sign-n <hex> --sign-d <hex>]");
+        Console.WriteLine("  entry names are the files' paths relative to <assets-dir>");
+        Console.WriteLine("  no key options: generates a random key and writes two");
+        Console.WriteLine("  XOR share files next to the pack (<out>.share_[ab].hex)");
+    }
+
+    /// <summary>读一个 hex 文件并去掉首尾空白。</summary>
+    static string ReadHexFile(string path) {
+        byte[] raw = File.ReadAllBytes(path);
+        string s = raw.ToStr(0, raw.Length);
+        int start = 0;
+        int end = s.Length;
+        while (start < end && Program.IsSpace(s[start] & 255)) { start = start + 1; }
+        while (end > start && Program.IsSpace(s[end - 1] & 255)) { end = end - 1; }
+        return s.Substring(start, end - start);
+    }
+
+    static bool IsSpace(int c) {
+        return c == 32 || c == 9 || c == 10 || c == 13;
+    }
+
+    /// <summary>两份等长 hex 分片逐字节 XOR（MixKey 的 hex 层版本）。</summary>
+    static string XorHex(string aHex, string bHex) {
+        byte[] a = Hex.Decode(aHex);
+        byte[] b = Hex.Decode(bHex);
+        byte[] k = new byte[a.Length + 1];
+        int i = 0;
+        while (i < a.Length && i < b.Length) {
+            k[i] = (byte)((a[i] & 255) ^ (b[i] & 255));
+            i = i + 1;
+        }
+        return Hex.Encode(k, a.Length);
+    }
+
+    /// <summary>n 字节密码学随机数的小写 hex。CSPRNG 不可用时直接
+    /// 抛 IOException 终止（绝不回退到可预测的字节）。</summary>
+    static string RandomHex(int n) {
+        byte[] raw = RandomNumberGenerator.GetBytes(n);
+        if (raw == null) {
+            throw new IOException("packtool: OS CSPRNG unavailable");
+        }
+        return Hex.Encode(raw.ToStr(0, n), n);
+    }
+
+    /// <summary>int → 十进制字符串（JsonValue.NewNum 需要字面量）。</summary>
+    static string Num(int v) {
+        if (v == 0) { return "0"; }
+        bool neg = v < 0;
+        long x = v;
+        if (neg) { x = 0 - x; }
+        string digits = "0123456789";
+        string s = "";
+        while (x > 0) {
+            s = digits.Substring((int)(x % 10), 1) + s;
+            x = x / 10;
+        }
+        if (neg) { s = "-" + s; }
+        return s;
+    }
+}
