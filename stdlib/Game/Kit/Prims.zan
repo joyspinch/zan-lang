@@ -1,0 +1,510 @@
+// Game.Kit 渲染原语：烘焙精灵与几何绘制（原 GameKit 的 Sprite/Draw）。
+// Sprite.Ball/Glow 把圆盘光晕烘焙成纹理一次、每帧一个带色四边形；
+// Draw 提供圆角矩形（烘焙九宫）、渐变、圆/椭圆/三角、描边等
+// SDL 包装层没有的整数绘制原语，全部在原生分辨率栅格化。
+using System;
+using SDL3;
+
+namespace Game.Kit;
+
+class Sprite {
+    static SdlTexture disc;
+    static SdlTexture glow;
+    static bool baked;
+
+    static int R() { return 96; }   // baked radius, native px
+
+    static void Bake(SdlRenderer r) {
+        if (Sprite.baked) { return; }
+        Sprite.baked = true;
+        int br = Sprite.R();
+        int side = br * 2 + 2;
+        SdlTexture d = SdlTexture.CreateTarget(r, side, side);
+        if (d == null || !d.IsValid()) { return; }
+        r.SetTarget(d);
+        r.SetBlend(0);
+        r.SetColor(255, 255, 255, 0);
+        r.Clear();
+        r.SetColor(255, 255, 255, 255);
+        int dy = -br;
+        while (dy <= br) {
+            int dx = Draw.Isqrt(br * br - dy * dy);
+            r.FillRectRaw(br + 1 - dx, br + 1 + dy, dx * 2 + 1, 1);
+            dy = dy + 1;
+        }
+        d.SetBlendMode(1);
+        SdlTexture g = SdlTexture.CreateTarget(r, side, side);
+        if (g != null && g.IsValid()) {
+            r.SetTarget(g);
+            r.SetColor(255, 255, 255, 0);
+            r.Clear();
+            // radial falloff: stack translucent discs from the rim inward
+            r.SetBlend(1);
+            int ring = br;
+            while (ring >= 4) {
+                r.SetColor(255, 255, 255, 26);
+                int ry = -ring;
+                while (ry <= ring) {
+                    int rx = Draw.Isqrt(ring * ring - ry * ry);
+                    r.FillRectRaw(br + 1 - rx, br + 1 + ry, rx * 2 + 1, 1);
+                    ry = ry + 1;
+                }
+                ring = ring - br / 12;
+            }
+            g.SetBlendMode(1);
+            Sprite.glow = g;
+        }
+        r.SetBlend(1);
+        r.ResetTarget();
+        Sprite.disc = d;
+    }
+
+    // Route a tinted textured quad through the host's sprite batch when the
+    // renderer is the batch's target renderer; adjacent same-texture quads
+    // then collapse into one geometry run. Falls back to the immediate call
+    // where no batch exists (plain SdlRenderer consumers).
+    static bool QueueBatch(SdlRenderer r, SdlTexture tex,
+                           int x, int y, int w, int h,
+                           int cr, int cg, int cb, int ca) {
+        SdlSpriteBatch b = Host.FindBatch(r);
+        if (b == null) { return false; }
+        b.Queue(tex, x, y, w, h, 0, 0, 0, 0, cr, cg, cb, ca);
+        return true;
+    }
+
+    // Solid tinted disc, one draw call. Falls back to scanline FillCircle if
+    // baking failed (e.g. render targets unsupported).
+    static void Ball(SdlRenderer r, int cx, int cy, int rad,
+                     int cr, int cg, int cb, int ca) {
+        if (rad <= 0) { return; }
+        if (Sprite.disc == null) { Draw.FillCircle(r, cx, cy, rad, cr, cg, cb, ca); return; }
+        if (Sprite.QueueBatch(r, Sprite.disc, cx - rad, cy - rad, rad * 2, rad * 2, cr, cg, cb, ca)) { return; }
+        Sprite.disc.SetColor(cr, cg, cb);
+        Sprite.disc.SetOpacity(ca);
+        r.DrawTexture(Sprite.disc, cx - rad, cy - rad, rad * 2, rad * 2);
+    }
+
+    // Soft halo disc (alpha fades toward the rim), one draw call.
+    static void Glow(SdlRenderer r, int cx, int cy, int rad,
+                     int cr, int cg, int cb, int ca) {
+        if (rad <= 0) { return; }
+        if (Sprite.glow == null) { Sprite.Ball(r, cx, cy, rad, cr, cg, cb, ca); return; }
+        if (Sprite.QueueBatch(r, Sprite.glow, cx - rad, cy - rad, rad * 2, rad * 2, cr, cg, cb, ca)) { return; }
+        Sprite.glow.SetColor(cr, cg, cb);
+        Sprite.glow.SetOpacity(ca);
+        r.DrawTexture(Sprite.glow, cx - rad, cy - rad, rad * 2, rad * 2);
+    }
+}
+
+// Integer drawing helpers not provided by the SDL wrapper.
+class Draw {
+        // Filled rectangle with rounded corners, drawn as one pre-baked nine-slice
+        // style texture (baked once per host) scaled over the target rect. This
+        // replaces the per-frame scanline rasterization of every panel/button --
+        // at 3x supersampling a fullscreen RoundRectFill is 2160 FillRectRaw calls
+        // (~4000px wide each); text-heavy games stacking 30+ panels per frame
+        // pegged the GPU. Falls back to scanlines only if baking failed.
+        static SdlTexture roundTex;
+    static bool roundTried;
+    static int RP() { return 24; }   // baked corner radius, native px
+    static int S() { return 4; }     // bake supersample
+
+    static void EnsureRound(SdlRenderer r) {
+        if (Draw.roundTried) { return; }
+        Draw.roundTried = true;
+        int s = Draw.S();
+        int rad = Draw.RP();
+        int side = rad * 2 * s;
+        SdlTexture t = SdlTexture.CreateTarget(r, side, side);
+        if (t == null || !t.IsValid()) { return; }
+        r.SetTarget(t);
+        r.SetBlend(0);
+        r.SetColor(255, 255, 255, 0);
+        r.Clear();
+        // Supersampled coverage mask for smooth anti-aliased corners. The
+        // texel grid is rad*2*s wide; rows are painted full-white, and the
+        // alpha ramp comes from the linear downsample when scaled.
+        for (int oy = 0; oy < side; oy = oy + 1) {
+            double dy = (oy + 0.5) / s - rad;
+            double under = rad * rad - dy * dy;
+            if (under < 0) { continue; }
+            double dxr = rad - Math.Sqrt(under);
+            int inset = (int)(dxr * s + 0.5);
+            int wid = side - inset * 2;
+            if (wid <= 0) { continue; }
+            r.SetColor(255, 255, 255, 255);
+            r.FillRectRaw(inset, oy, wid, 1);
+        }
+        t.SetBlendMode(1);
+        r.ResetTarget();
+        Draw.roundTex = t;
+    }
+
+    // Nine-slice draw of the baked rounded rect: corners 1:1, edges stretched,
+    // center stretched. The baked texel grid is rad*2*s wide; the top-left
+    // corner block (rad*s px native) is the only curved part, everything else
+    // samples from the solid middle. All slices source from one quadrant.
+    static void RoundTex(SdlRenderer r, int x, int y, int w, int h, int rad,
+                         int cr, int cg, int cb, int ca) {
+        if (w <= 0 || h <= 0) { return; }
+        if (rad * 2 > w) { rad = w / 2; }
+        if (rad * 2 > h) { rad = h / 2; }
+        if (Draw.roundTex == null || rad != Draw.RP()) {
+            // rad != baked radius: nine-slice would distort the corners. The
+            // scanline path below handles any radius; guard against mutual
+            // recursion by never calling back into RoundRectFill.
+            Draw.RoundRectScan(r, x, y, w, h, rad, cr, cg, cb, ca);
+            return;
+        }
+        Draw.roundTex.SetColor(cr, cg, cb);
+        Draw.roundTex.SetOpacity(ca);
+        int m = Draw.S();
+        int R = Draw.RP();          // design corner radius
+        int c = R * m;              // native corner block size
+        int g = R * 2 * m;          // native texel grid size
+        int midW = w - R * 2;
+        int midH = h - R * 2;
+        // center
+        if (midW > 0 && midH > 0) {
+            r.DrawTextureRegion(Draw.roundTex, c, c, 2, 2, x + R, y + R, midW, midH);
+        }
+        // top / bottom edge
+        if (midW > 0) {
+            r.DrawTextureRegion(Draw.roundTex, c, 0, 2, c, x + R, y, midW, R);
+            r.DrawTextureRegion(Draw.roundTex, c, c, 2, c,
+                x + R, y + h - R, midW, R);
+        }
+        // left / right edge
+        if (midH > 0) {
+            r.DrawTextureRegion(Draw.roundTex, c, c, c, 2, x, y + R, R, midH);
+            r.DrawTextureRegion(Draw.roundTex, c, c, c, 2,
+                x + w - R, y + R, R, midH);
+        }
+        // corners: the four native corner blocks of the baked grid
+        r.DrawTextureRegion(Draw.roundTex, 0, 0, c, c, x, y, R, R);
+        r.DrawTextureRegion(Draw.roundTex, c, 0, c, c, x + w - R, y, R, R);
+        r.DrawTextureRegion(Draw.roundTex, 0, c, c, c, x, y + h - R, R, R);
+        r.DrawTextureRegion(Draw.roundTex, c, c, c, c, x + w - R, y + h - R, R, R);
+        Draw.roundTex.ResetColor();
+        Draw.roundTex.SetOpacity(255);
+    }
+
+    // Cached 1x-h vertical gradient strip, stretched per draw so a fullscreen
+    // gradient costs one textured quad instead of h scanline fills.
+    static SdlTexture gradTex;
+    static int gradR0 = -1;
+    static int gradG0 = -1;
+    static int gradB0 = -1;
+    static int gradR1 = -1;
+    static int gradG1 = -1;
+    static int gradB1 = -1;
+    static int gradH = -1;
+
+    // One-quad vertical gradient into rect (x,y,w,h). Bakes a 1x-h strip on
+    // first use (or when colors/height change) and stretches it -- replaces
+    // h FillRect scanlines per frame with a single textured quad.
+    static void VGradient(SdlRenderer r, int x, int y, int w, int h,
+                          int r0, int g0, int b0, int r1, int g1, int b1, int ca) {
+        if (h <= 0) { return; }
+        if (Draw.gradTex == null || h != Draw.gradH
+            || r0 != Draw.gradR0 || g0 != Draw.gradG0 || b0 != Draw.gradB0
+            || r1 != Draw.gradR1 || g1 != Draw.gradG1 || b1 != Draw.gradB1) {
+            SdlTexture t = SdlTexture.CreateTarget(r, 1, h);
+            if (t != null && t.IsValid()) {
+                r.SetTarget(t);
+                r.SetBlend(0);
+                for (int j = 0; j < h; j = j + 1) {
+                    r.SetColor(r0 + (r1 - r0) * j / h,
+                               g0 + (g1 - g0) * j / h,
+                               b0 + (b1 - b0) * j / h, 255);
+                    r.FillRectRaw(0, j, 1, 1);
+                }
+                t.SetBlendMode(1);
+                r.SetBlend(1);
+                r.ResetTarget();
+                Draw.gradTex = t;
+                Draw.gradH = h;
+                Draw.gradR0 = r0; Draw.gradG0 = g0; Draw.gradB0 = b0;
+                Draw.gradR1 = r1; Draw.gradG1 = g1; Draw.gradB1 = b1;
+            }
+        }
+        if (Draw.gradTex != null && h == Draw.gradH) {
+            Draw.gradTex.SetOpacity(ca);
+            r.DrawTexture(Draw.gradTex, x, y, w, h);
+            Draw.gradTex.SetOpacity(255);
+            return;
+        }
+        // fallback: original scanline path
+        for (int j = 0; j < h; j = j + 1) {
+            int cr = r0 + (r1 - r0) * j / h;
+            int cg = g0 + (g1 - g0) * j / h;
+            int cb = b0 + (b1 - b0) * j / h;
+            r.SetColor(cr, cg, cb, ca);
+            r.FillRect(x, y + j, w, 1);
+        }
+    }
+
+    static int Isqrt(int n) {
+        if (n <= 0) { return 0; }
+        int x = n;
+        int y = (x + 1) / 2;
+        while (y < x) {
+            x = y;
+            y = (x + n / x) / 2;
+        }
+        return x;
+    }
+
+    static void FillCircle(SdlRenderer r, int cx, int cy, int rad,
+                           int cr, int cg, int cb, int ca) {
+        if (rad <= 0) { return; }
+        // Rasterize at native resolution (after super-scale) so the circle is
+        // smooth rather than a scaled-up low-res disc.
+        int scx = r.Sc(cx); int scy = r.Sc(cy); int srad = r.Sc(rad);
+        r.SetColor(cr, cg, cb, ca);
+        int dy = -srad;
+        while (dy <= srad) {
+            int dx = Draw.Isqrt(srad * srad - dy * dy);
+            r.FillRectRaw(scx - dx, scy + dy, dx * 2 + 1, 1);
+            dy = dy + 1;
+        }
+    }
+
+    // Axis-aligned filled ellipse, rasterized at native resolution.
+    static void FillEllipse(SdlRenderer r, int cx, int cy, int rx, int ry,
+                            int cr, int cg, int cb, int ca) {
+        if (rx <= 0 || ry <= 0) { return; }
+        int scx = r.Sc(cx); int scy = r.Sc(cy);
+        int srx = r.Sc(rx); int sry = r.Sc(ry);
+        r.SetColor(cr, cg, cb, ca);
+        int dy = -sry;
+        while (dy <= sry) {
+            int t = sry * sry - dy * dy;
+            if (t < 0) { t = 0; }
+            int dx = Draw.Isqrt(srx * srx * t) / sry;
+            r.FillRectRaw(scx - dx, scy + dy, dx * 2 + 1, 1);
+            dy = dy + 1;
+        }
+    }
+
+    // Filled triangle (any orientation), rasterized at native resolution.
+    static void FillTriangle(SdlRenderer r, int ax, int ay, int bx, int by,
+                             int ccx, int ccy, int cr, int cg, int cb, int ca) {
+        int x0 = r.Sc(ax); int y0 = r.Sc(ay);
+        int x1 = r.Sc(bx); int y1 = r.Sc(by);
+        int x2 = r.Sc(ccx); int y2 = r.Sc(ccy);
+        // sort by y ascending
+        if (y1 < y0) { int t; t=x0;x0=x1;x1=t; t=y0;y0=y1;y1=t; }
+        if (y2 < y0) { int t; t=x0;x0=x2;x2=t; t=y0;y0=y2;y2=t; }
+        if (y2 < y1) { int t; t=x1;x1=x2;x2=t; t=y1;y1=y2;y2=t; }
+        r.SetColor(cr, cg, cb, ca);
+        int y = y0;
+        while (y <= y2) {
+            int xa; int xb;
+            if (y2 == y0) { xa = x0; xb = x2; }
+            else { xa = x0 + (x2 - x0) * (y - y0) / (y2 - y0); }
+            if (y < y1) {
+                if (y1 == y0) { xb = x1; }
+                else { xb = x0 + (x1 - x0) * (y - y0) / (y1 - y0); }
+            } else {
+                if (y2 == y1) { xb = x2; }
+                else { xb = x1 + (x2 - x1) * (y - y1) / (y2 - y1); }
+            }
+            if (y2 != y0) { xa = x0 + (x2 - x0) * (y - y0) / (y2 - y0); }
+            int lo = xa; int hi = xb;
+            if (lo > hi) { int t = lo; lo = hi; hi = t; }
+            r.FillRectRaw(lo, y, hi - lo + 1, 1);
+            y = y + 1;
+        }
+    }
+
+    static void RingRect(SdlRenderer r, int x, int y, int w, int h, int t,
+                         int cr, int cg, int cb, int ca) {
+        r.SetColor(cr, cg, cb, ca);
+        r.FillRect(x, y, w, t);
+        r.FillRect(x, y + h - t, w, t);
+        r.FillRect(x, y, t, h);
+        r.FillRect(x + w - t, y, t, h);
+    }
+
+    static bool PointIn(int px, int py, int x, int y, int w, int h) {
+        return px >= x && px < x + w && py >= y && py < y + h;
+    }
+
+    // Filled rectangle with rounded corners. Uses the pre-baked nine-slice
+    // texture (one quad per slice) when possible; falls back to the scanline
+    // rasterizer while baking is unavailable.
+    static void RoundRectFill(SdlRenderer r, int x, int y, int w, int h, int rad,
+                              int cr, int cg, int cb, int ca) {
+        if (w <= 0 || h <= 0) { return; }
+        if (rad * 2 > w) { rad = w / 2; }
+        if (rad * 2 > h) { rad = h / 2; }
+        if (Draw.roundTex != null) {
+            Draw.RoundTex(r, x, y, w, h, rad, cr, cg, cb, ca);
+            return;
+        }
+        Draw.RoundRectScan(r, x, y, w, h, rad, cr, cg, cb, ca);
+    }
+
+    // Scanline rasterizer for arbitrary radii (also the fallback while the
+    // baked nine-slice texture is unavailable).
+    static void RoundRectScan(SdlRenderer r, int x, int y, int w, int h, int rad,
+                              int cr, int cg, int cb, int ca) {
+        if (w <= 0 || h <= 0) { return; }
+        if (rad * 2 > w) { rad = w / 2; }
+        if (rad * 2 > h) { rad = h / 2; }
+        r.SetColor(cr, cg, cb, ca);
+        if (rad < 1) { r.FillRect(x, y, w, h); return; }
+        int sx = r.Sc(x); int sy = r.Sc(y);
+        int sw = r.Sc(x + w) - sx; int sh = r.Sc(y + h) - sy;
+        int srad = r.Sc(rad);
+        for (int dy = 0; dy < sh; dy = dy + 1) {
+            int inset = 0;
+            int t = 0;
+            if (dy < srad) { t = srad - dy; }
+            if (dy > sh - 1 - srad) { t = dy - (sh - 1 - srad); }
+            if (t > 0) { inset = srad - Draw.Isqrt(srad * srad - t * t); }
+            r.FillRectRaw(sx + inset, sy + dy, sw - inset * 2, 1);
+        }
+    }
+
+    // Rounded-rectangle ring of thickness t drawn just outside (x,y,w,h)。
+    // 旧实现直接 RoundRectFill 外扩矩形,把"描边"画成了实心色块
+    // (选中格/悬停高亮整个被糊死)——这里按行扫出真正的环形。
+    static void RoundRectStroke(SdlRenderer r, int x, int y, int w, int h, int rad,
+                                int t, int cr, int cg, int cb, int ca) {
+        if (w <= 0 || h <= 0 || t <= 0) { return; }
+        if (rad * 2 > w) { rad = w / 2; }
+        if (rad * 2 > h) { rad = h / 2; }
+        int sx = r.Sc(x); int sy = r.Sc(y);
+        int sw = r.Sc(x + w) - sx; int sh = r.Sc(y + h) - sy;
+        int srad = r.Sc(rad);
+        int st = r.Sc(t);
+        if (st < 1) { st = 1; }
+        if (st * 2 >= sh || st * 2 >= sw) {
+            Draw.RoundRectFill(r, x, y, w, h, rad, cr, cg, cb, ca);
+            return;
+        }
+        r.SetColor(cr, cg, cb, ca);
+        int radin = srad - st;
+        if (radin < 0) { radin = 0; }
+        int shin = sh - st * 2;
+        for (int dy = 0; dy < sh; dy = dy + 1) {
+            int tt = 0;
+            if (dy < srad) { tt = srad - dy; }
+            if (dy > sh - 1 - srad) { tt = dy - (sh - 1 - srad); }
+            int inset = 0;
+            if (tt > 0) { inset = srad - Draw.Isqrt(srad * srad - tt * tt); }
+            if (dy < st || dy >= sh - st) {
+                r.FillRectRaw(sx + inset, sy + dy, sw - inset * 2, 1);
+                continue;
+            }
+            int dyin = dy - st;
+            int inset2 = st;
+            int t2 = 0;
+            if (radin > 0) {
+                if (dyin < radin) { t2 = radin - dyin; }
+                if (dyin > shin - 1 - radin) { t2 = dyin - (shin - 1 - radin); }
+                if (t2 > 0) { inset2 = st + radin - Draw.Isqrt(radin * radin - t2 * t2); }
+            }
+            int lw = inset2 - inset;
+            if (lw > 0) {
+                r.FillRectRaw(sx + inset, sy + dy, lw, 1);
+                r.FillRectRaw(sx + sw - inset2, sy + dy, lw, 1);
+            }
+        }
+    }
+
+    // Bottom-weighted darkening scrim to keep foreground text legible over art.
+    static void Scrim(SdlRenderer r, int w, int h) {
+        Draw.VGradient(r, 0, 0, w, h, 6, 8, 14, 6, 8, 14, 70);
+        Draw.VGradient(r, 0, h * 3 / 5, w, h * 2 / 5, 6, 8, 14, 8, 10, 16, 150);
+    }
+
+    static bool PointInCircle(int px, int py, int cx, int cy, int rad) {
+        int dx = px - cx; int dy = py - cy;
+        return dx * dx + dy * dy <= rad * rad;
+    }
+}
+
+// Shared, polished UI kit: frosted panels, three-state stroked buttons, and a
+// cover-fitted background image. Used by every game menu so they share one
+// refined look instead of flat programmer-art rectangles.
+class KitUi {
+    // Draw a background texture stretched to fully cover the logical canvas,
+    // then a legibility scrim on top.
+    static void Backdrop(SdlRenderer r, SdlTexture bg, int w, int h) {
+        if (bg != null) {
+            r.DrawTexture(bg, 0, 0, w, h);
+        } else {
+            Draw.VGradient(r, 0, 0, w, h, 18, 22, 32, 8, 10, 16, 255);
+        }
+        Draw.Scrim(r, w, h);
+    }
+
+    // Bake a decorative background (gradient + scattered stars) into a target
+    // texture once; games blit it every frame for one draw call instead of
+    // hundreds of scanline fills. Return null when render targets are
+    // unavailable, in which case callers should fall back to VGradient.
+    static SdlTexture BakeBackdrop(SdlRenderer r, int w, int h, Rng rng,
+                                   int topR, int topG, int topB,
+                                   int botR, int botG, int botB, int stars) {
+        SdlTexture t = SdlTexture.CreateTarget(r, w, h);
+        if (t == null || !t.IsValid()) { return null; }
+        r.SetTarget(t);
+        Draw.VGradient(r, 0, 0, w, h, topR, topG, topB, botR, botG, botB, 255);
+        for (int i = 0; i < stars; i = i + 1) {
+            int sx = rng.Range(0, w);
+            int sy = rng.Range(0, h * 2 / 3);
+            int b = rng.Range(30, 130);
+            r.SetColor(200, 205, 255, b);
+            r.FillRect(sx, sy, 2, 2);
+        }
+        r.ResetTarget();
+        return t;
+    }
+
+    // Frosted translucent rounded panel with a hairline border.
+    static void Panel(SdlRenderer r, int x, int y, int w, int h,
+                      int cr, int cg, int cb, int ca) {
+        Draw.RoundRectStroke(r, x, y, w, h, 14, 1, 255, 255, 255, 22);
+        Draw.RoundRectFill(r, x, y, w, h, 14, cr, cg, cb, ca);
+        // top sheen
+        Draw.RoundRectFill(r, x + 2, y + 2, w - 4, h / 3, 12, 255, 255, 255, 12);
+    }
+
+    // Three-state stroked, glossy rounded button. kind: 0 normal, 1 accent,
+    // 2 selected. Returns true when hovered.
+    static bool Button(SdlRenderer r, int mx, int my, int x, int y, int w, int h,
+                       string label, int scale, int kind) {
+        bool hov = Draw.PointIn(mx, my, x, y, w, h);
+        // body mid color + darker bottom shade, chosen per state
+        int mr = 58; int mg = 64; int mb = 80;
+        int dr = 30; int dg = 34; int db = 46;
+        int tc = 236;
+        if (kind == 1) {
+            mr = 52; mg = 138; mb = 92; dr = 30; dg = 96; db = 62;
+            if (hov) { mr = 64; mg = 162; mb = 108; }
+        } else if (kind == 2) {
+            mr = 224; mg = 176; mb = 66; dr = 196; dg = 146; db = 40;
+            tc = 36;
+        } else if (hov) {
+            mr = 74; mg = 82; mb = 102; dr = 42; dg = 48; db = 62;
+        }
+        int rad = 12;
+        if (hov) {
+            int gr = 120; int gg = 180; int gb = 240;
+            if (kind == 1) { gr = 120; gg = 230; gb = 170; }
+            if (kind == 2) { gr = 250; gg = 210; gb = 110; }
+            Draw.RoundRectFill(r, x - 5, y - 5, w + 10, h + 10, rad + 5, gr, gg, gb, 55);
+        }
+        // dark border, then rounded body on top (true rim, does not cover body)
+        Draw.RoundRectFill(r, x - 2, y - 2, w + 4, h + 4, rad + 2, 8, 10, 16, 240);
+        Draw.RoundRectFill(r, x, y, w, h, rad, mr, mg, mb, 255);
+        // bottom shade + top sheen for a glossy read
+        Draw.RoundRectFill(r, x + 2, y + h / 2, w - 4, h / 2 - 3, rad, dr, dg, db, 150);
+        Draw.RoundRectFill(r, x + 3, y + 3, w - 6, h / 2 - 3, rad, 255, 255, 255, 38);
+        Text.DrawCenteredShadow(r, label, x + w / 2, y + h / 2 - 4 * scale, scale, tc, tc, tc, 255);
+        return hov;
+    }
+}

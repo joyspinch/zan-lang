@@ -1,0 +1,131 @@
+// Game.Kit 小件：UTF-8 解码、确定性随机、动态台词（原 GameKit 的
+// Utf8/Rng/Talker，2026-09 下沉）。
+// Rng 是 xorshift：种子可复现，洗牌/AI/影子对手全部确定性。
+using System;
+using SDL3;
+
+namespace Game.Kit;
+
+class Utf8 {
+    static int Decode(string s, int[] pos) {
+        int i = pos[0];
+        int b0 = s[i] & 255;
+        if (b0 < 128) { pos[0] = i + 1; return b0; }
+        if (b0 >= 240 && i + 3 < s.Length) {
+            int cp = ((b0 & 7) << 18) + ((s[i + 1] & 63) << 12)
+                   + ((s[i + 2] & 63) << 6) + (s[i + 3] & 63);
+            pos[0] = i + 4; return cp;
+        }
+        if (b0 >= 224 && i + 2 < s.Length) {
+            int cp = ((b0 & 15) << 12) + ((s[i + 1] & 63) << 6) + (s[i + 2] & 63);
+            pos[0] = i + 3; return cp;
+        }
+        if (b0 >= 192 && i + 1 < s.Length) {
+            int cp = ((b0 & 31) << 6) + (s[i + 1] & 63);
+            pos[0] = i + 2; return cp;
+        }
+        pos[0] = i + 1;
+        return 63;
+    }
+}
+
+// Deterministic xorshift RNG (seedable for reproducible shuffles/AI).
+class Rng {
+    long state;
+
+    static Rng Seed(long s) {
+        Rng g = new Rng();
+        if (s == 0) { s = 88172645463325252; }
+        g.state = s;
+        return g;
+    }
+
+    long NextLong() {
+        long x = this.state;
+        x = x ^ (x << 13);
+        x = x ^ (x >> 7);
+        x = x ^ (x << 17);
+        this.state = x;
+        return x;
+    }
+
+    int Next() {
+        long v = this.NextLong();
+        if (v < 0) { v = -v; }
+        return (int)(v & 2147483647);
+    }
+
+    // Uniform integer in [lo, hi).
+    int Range(int lo, int hi) {
+        if (hi <= lo) { return lo; }
+        return lo + this.Next() % (hi - lo);
+    }
+
+    // Uniform double in [0, 1).
+    double NextDouble01() {
+        return (this.Next() & 16777215) / 16777216.0;
+    }
+}
+
+// Talker: dynamic emotional commentary (praise / taunt / neutral banks).
+// Reused across games to raise the "emotional value" — mostly praise, with
+// playful jabs. Say() picks a random line from a bank and holds it on screen.
+class Talker {
+    List<string> praise;
+    List<string> taunt;
+    List<string> neutral;
+    List<string> hype;
+    string current;
+    int kind;
+    long until;
+    Rng rng;
+
+    static Talker Create(Rng rng) {
+        Talker t = new Talker();
+        t.praise = new List<string>();
+        t.taunt = new List<string>();
+        t.neutral = new List<string>();
+        t.hype = new List<string>();
+        t.current = "";
+        t.kind = 2;
+        t.until = 0;
+        t.rng = rng;
+        return t;
+    }
+
+    // bank: 0 praise, 1 taunt, 2 neutral, 3 hype
+    void Add(int bank, string line) {
+        if (bank == 0) { this.praise.Add(line); }
+        else if (bank == 1) { this.taunt.Add(line); }
+        else if (bank == 3) { this.hype.Add(line); }
+        else { this.neutral.Add(line); }
+    }
+
+    List<string> Bank(int bank) {
+        if (bank == 0) { return this.praise; }
+        if (bank == 1) { return this.taunt; }
+        if (bank == 3) { return this.hype; }
+        return this.neutral;
+    }
+
+    void Say(int bank, int nowMs, int holdMs) {
+        List<string> b = this.Bank(bank);
+        if (b.Count == 0) { return; }
+        this.current = b[this.rng.Range(0, b.Count)];
+        this.kind = bank;
+        this.until = (long)nowMs + (long)holdMs;
+    }
+
+    void SayExact(int bank, string line, int nowMs, int holdMs) {
+        this.current = line;
+        this.kind = bank;
+        this.until = (long)nowMs + (long)holdMs;
+    }
+
+    string Current(int nowMs) {
+        if ((long)nowMs > this.until) { return ""; }
+        return this.current;
+    }
+
+    int Kind() { return this.kind; }
+}

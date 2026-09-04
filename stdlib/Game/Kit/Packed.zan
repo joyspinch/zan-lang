@@ -1,0 +1,182 @@
+// Game.Kit 加密资源包消费端（原 GameKit.PackedAssets/KeyShares，2026-09 下沉）。
+// 游戏资产打成单个 AES-256-GCM 加密、RSA 签名的 .zrp 随 exe 分发，
+// 条目按工程相对名（"assets/ui/panel.png"）寻址；打包工具见
+// tools/packtool + scripts/pack_game.ps1。
+using System;
+using System.IO;
+using SDL3;
+using System.Resources;
+using System.Security;
+using System.Security.Cryptography;
+
+namespace Game.Kit;
+
+// ---------------------------------------------------------------------------
+// PackedAssets -- encrypted resource pack (.zrp) consumer layer.
+//
+// Ships game assets as a single AES-256-GCM encrypted, RSA-signed .zrp next
+// to the exe instead of a plaintext assets/ tree. Entries are addressed by
+// project-relative names ("assets/ui/panel.png"), which is the same shape as
+// Assets.Find's rel -- the {id, file} indirection lives in the entry names
+// themselves, no extra manifest at runtime.
+//
+// Key handling follows the respack_roundtrip pattern: the master key is the
+// XOR of two shares, each injected at build time (pack_game.ps1 --embed two
+// share files, or const hex strings in a generated KeyShares.zan). The real
+// key is reassembled in memory at Open() and never appears as a single
+// literal in the binary.
+//
+// NOTE: this raises the bar (no plaintext on disk, no single key literal,
+// per-entry HKDF keys so one leak doesn't cascade), it is NOT absolute
+// protection -- a memory dump or debugger can still capture the decrypted
+// buffers. Combine with Guard.Arm() (System.Security) for the debugger side;
+// the full threat model lives in the arpg resource-engineering doc.
+// ---------------------------------------------------------------------------
+class PackedAssets {
+    ResourcePack pack;
+
+    PackedAssets() {
+        this.pack = null;
+    }
+
+    /// <summary>Open a .zrp and authenticate its index.
+    /// Both shares are 64-char hex strings (32 bytes each); the real key is
+    /// their XOR, reassembled here and never stored as one literal.
+    /// Throws IOException when the pack can't be read/authenticated:
+    ///   "pack: io/magic"    (1) not a .zrp or truncated
+    ///   "pack: auth"        (2) wrong master key (index failed GCM)
+    ///   "pack: signature"   (3) index signature mismatch (repacked/tampered)
+    /// </summary>
+    public static PackedAssets Open(string packPath, string shareAHex, string shareBHex) {
+        byte[] shareA = Hex.Decode(shareAHex);
+        byte[] shareB = Hex.Decode(shareBHex);
+        byte[] master = ResourcePack.MixKey(shareA, shareB, 32);
+        // Open/Write 的 masterKey 形参是 string（字节缓冲）。ToStr 是
+        // 内建转换，把 byte[] 内容拷成独立的 string 缓冲（mini2.zan
+        // 路径对比：ToStr 与 Hex.Decode(keyHex) 同字节同结果，
+        // count=2/err=0 完全一致；Runtime/irgen_expr.c:232）。
+        return PackedAssets.OpenKeyed(packPath, master.ToStr(0, 32));
+    }
+
+    /// <summary>Open with an already-assembled master key (32 bytes as a
+    /// byte buffer). Same error contract as <see cref="Open"/>.</summary>
+    public static PackedAssets OpenKeyed(string packPath, string masterKey) {
+        PackedAssets pa = new PackedAssets();
+        List<int> err = new List<int>();
+        err.Add(0);
+        ResourcePack p = ResourcePack.Open(packPath, masterKey, null, null, err);
+        if (p == null) {
+            if (err[0] == 2) { throw new IOException("pack: auth (wrong master key?)"); }
+            if (err[0] == 3) { throw new IOException("pack: signature"); }
+            throw new IOException("pack: io/magic (" + packPath + ")");
+        }
+        pa.pack = p;
+        return pa;
+    }
+
+    /// <summary>Open a SIGNED .zrp (packed with --sign-n/--sign-d) and
+    /// authenticate AND signature-check its index before serving anything.
+    /// Games that ship signed packs should use this: a stolen master key
+    /// alone is then not enough to swap entries — the pack must be re-signed
+    /// with the private key. The verify key (RSA modulus/exponent hex) is
+    /// public material and may live in the binary — it's meant to be seen.
+    /// <paramref name="nHex"/>/<paramref name="eHex"/> = public modulus and
+    /// exponent (hex). Error contract is <see cref="Open"/>'s, plus:
+    ///   "pack: signature"   (3) index signature missing/mismatched
+    ///   (an unsigned pack is rejected too — signature is required here).</summary>
+    public static PackedAssets OpenVerified(string packPath, string shareAHex,
+        string shareBHex, string nHex, string eHex) {
+        byte[] shareA = Hex.Decode(shareAHex);
+        byte[] shareB = Hex.Decode(shareBHex);
+        byte[] master = ResourcePack.MixKey(shareA, shareB, 32);
+        // ToStr 拷出 masterKey（byte[]→string 隐式传参只在调用实参位置安全）。
+        return PackedAssets.OpenKeyedVerified(packPath, master.ToStr(0, 32), nHex, eHex);
+    }
+
+    /// <summary>OpenVerified with an already-assembled master key (32 bytes
+    /// as a byte buffer). Same error contract as <see cref="OpenVerified"/>.
+    /// </summary>
+    public static PackedAssets OpenKeyedVerified(string packPath, string masterKey,
+        string nHex, string eHex) {
+        PackedAssets pa = new PackedAssets();
+        List<int> err = new List<int>();
+        err.Add(0);
+        ResourcePack p = ResourcePack.Open(packPath, masterKey, nHex, eHex, err);
+        if (p == null) {
+            if (err[0] == 2) { throw new IOException("pack: auth (wrong master key?)"); }
+            if (err[0] == 3) { throw new IOException("pack: signature"); }
+            throw new IOException("pack: io/magic (" + packPath + ")");
+        }
+        pa.pack = p;
+        return pa;
+    }
+
+    /// <summary>Raw entry bytes. Throws IOException when the name is not in
+    /// the pack or the payload fails GCM authentication (tampered).</summary>
+    public byte[] Read(string name) {
+        List<int> len = new List<int>();
+        len.Add(0);
+        byte[] data = this.pack.Read(name, len);
+        if (data == null) { throw new IOException("pack: missing/tampered " + name); }
+        return data;
+    }
+
+    /// <summary>Decode a PNG/JPEG entry straight from the decrypted bytes to
+    /// a texture -- nothing touches the disk. Invalid handle (check
+    /// IsValid()) when the bytes aren't a decodable image.</summary>
+    public SdlTexture LoadImage(SdlRenderer renderer, string name) {
+        byte[] data = this.Read(name);
+        // ToStr 拷出为调用实参（native 侧只在本调用内同步读 buffer）。
+        return SdlTexture.LoadImageFromMem(renderer, data.ToStr(0, data.Length), data.Length);
+    }
+
+    /// <summary>Parse a WAV entry straight from the decrypted bytes -- the
+    /// PCM is copied out inside the call, nothing touches the disk. Invalid
+    /// handle when the bytes aren't a WAV.</summary>
+    public SdlAudioClip LoadWav(string name) {
+        byte[] data = this.Read(name);
+        // ToStr 拷出为调用实参（PCM 在调用内被拷出，见 Audio.zan 契约）。
+        return SdlAudioClip.LoadWavFromMem(data.ToStr(0, data.Length), data.Length);
+    }
+
+    /// <summary>Entry existence probe (no decryption).</summary>
+    public bool Contains(string name) { return this.pack.Contains(name); }
+
+    /// <summary>Number of entries in the pack.</summary>
+    public int Count() { return this.pack.Count(); }
+
+    /// <summary>Byte size of one entry (no decryption), -1 when unknown.</summary>
+    public int SizeOf(string name) { return this.pack.SizeOf(name); }
+}
+
+// ---------------------------------------------------------------------------
+// KeyShares -- build-time master-key halves for PackedAssets.
+//
+// pack_game.ps1 (or a project's build script) generates two hex share files
+// and embeds them with --embed; each game declares its own subclass supplying
+// the two embedded paths. The XOR of the shares IS the master key, so the
+// binary never contains the assembled key -- only its two independent halves.
+//
+// Games that prefer explicit code can instead hand their own hex literals to
+// PackedAssets.Open(); KeyShares.File() is just the file-backed variant.
+// ---------------------------------------------------------------------------
+class KeyShares {
+    /// <summary>Read one 64-char hex share from a file (typically an
+    /// --embed'd copy, so File.ReadAllBytes finds it without a real file on
+    /// disk). Trims whitespace/newlines.</summary>
+    public static string File(string path) {
+        byte[] raw = System.IO.File.ReadAllBytes(path);
+        string s = raw.ToStr(0, raw.Length);
+        // Trim whitespace and line breaks at both ends (builders write "\n").
+        int start = 0;
+        int end = s.Length;
+        while (start < end && KeyShares.SpaceAt(s, start)) { start = start + 1; }
+        while (end > start && KeyShares.SpaceAt(s, end - 1)) { end = end - 1; }
+        return s.Substring(start, end - start);
+    }
+
+    static bool SpaceAt(string s, int i) {
+        int c = s[i] & 255;
+        return c == 32 || c == 9 || c == 10 || c == 13;
+    }
+}

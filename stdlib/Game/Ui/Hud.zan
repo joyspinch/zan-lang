@@ -2,6 +2,7 @@ using System;
 using SDL3;
 using Gui;
 using Gui.Backend;
+using System.IO;
 using Game.Foundation.Sdl;
 
 namespace Game.Ui;
@@ -45,6 +46,14 @@ class GameHud {
     int sceneH;
     bool adopted;
     string lastError;
+    // Reused scene-frame buffer. ReadPixels needs a writable byte block the
+    // size of the backbuffer (w*h*4 — over 8 MB at 1080p); allocating one per
+    // frame in Frame() made ARC churn hundreds of MB per second. The buffer
+    // is reallocated only when the window size actually changes.
+    ByteBuffer pixbuf;
+    string scene;
+    int pixW;
+    int pixH;
 
     GameHud() {
         this.app = null;
@@ -154,9 +163,22 @@ class GameHud {
         int w = WindowPixelW();
         int h = WindowPixelH();
         if (w <= 0 || h <= 0) { return false; }
-        string scene = new string('\0', w * h * 4);
-        if (!this.ReadScene(renderer, scene, w, h)) { return false; }
-        Window.SceneUpload(sdlWindowHandle, scene, w, h);
+        // Scene-frame buffer: reuse the previous frame's allocation (member
+        // fields) instead of allocating a fresh w*h*4 block every frame.
+        // `new string(char,int)` returns null on the current compiler (see
+        // TASKS.md compiler-defect record), so the buffer starts as a
+        // ByteBuffer allocation converted once via ToStr; the string carries
+        // an explicit length and ReadPixels overwrites all of it.
+        if (this.scene == null || this.pixW != w || this.pixH != h) {
+            if (this.pixbuf != null) { this.pixbuf.Free(); }
+            this.pixbuf = ByteBuffer.Alloc(w * h * 4);
+            this.scene = this.pixbuf.ToStr();
+            this.pixW = w;
+            this.pixH = h;
+        }
+        if (this.scene == null) { return false; }
+        if (!this.ReadScene(renderer, this.scene, w, h)) { return false; }
+        Window.SceneUpload(sdlWindowHandle, this.scene, w, h);
         App app = this.app;
         app.ProcessEvent();
         app.BeginFrame();
