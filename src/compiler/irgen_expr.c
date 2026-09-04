@@ -9139,6 +9139,12 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     snprintf(lname, sizeof(lname), "lambda_%d",
              (int)__atomic_fetch_add(&lambda_id, 1, __ATOMIC_SEQ_CST));
     LLVMValueRef lambda_fn = LLVMAddFunction(g->mod, lname, fn_type);
+    /* Whole-program module: nothing outside can call the lambda by name.
+     * Internal linkage is what lets GlobalDCE / --gc-sections drop the
+     * lambda (and the stdlib code only its body references — e.g. a stray
+     * CEF closure dragging CefCdp_/CefBackend_ into every GUI exe) when no
+     * live closure record stores it. */
+    zan_set_module_local(lambda_fn);
 
     /* { ptr fn, ptr dtor, ptr target, <captures>, [ptr this] }; a lambda has no
      * bound target, so that slot stays null (see the closure record layout). */
