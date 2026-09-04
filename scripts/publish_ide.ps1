@@ -340,7 +340,8 @@ if (Test-Path (Join-Path $aiPack 'AGENTS.md')) {
         New-Item -ItemType Directory -Force -Path (Join-Path $dist 'docs') | Out-Null
         Copy-Item $onboarding (Join-Path $dist 'docs\AI_ONBOARDING.md') -Force
     }
-    foreach ($doc in @('TOOLING.md', 'ai-assist.md')) {
+    foreach ($doc in @('TOOLING.md', 'ai-assist.md', 'MCP_HOSTING.md',
+                       'AI_DEV_INFRASTRUCTURE.md')) {
         $p = Join-Path $root "docs\$doc"
         if (Test-Path $p) { Copy-Item $p (Join-Path $dist "docs\$doc") -Force }
     }
@@ -349,8 +350,8 @@ if (Test-Path (Join-Path $aiPack 'AGENTS.md')) {
     Write-Output "PUBLISH_WARN: tools\ai_pack missing; released SDK has no AGENTS.md/skills for AI clients"
 }
 
-# ---- release readme ----
-Write-Output "[5/6] Writing README.txt ..."
+# ---- release readme ---------------------------------------------------------
+Write-Output "[5/6] Writing README.txt + AI entry index ..."
 $readme = @"
 Zan IDE - self-contained release
 ================================
@@ -394,6 +395,9 @@ Contents
                  server for AI clients. See the AI section below.
   ai\            Templates installed into your own projects by
                  "tools\zan-mcp.exe --init-agent" (see below).
+  llms.txt       AI entry index of this folder (generated from what shipped):
+                 the paths to the rules, tools, knowledge, skills and docs an
+                 AI agent needs, readable without an MCP connection.
 
 AI coding tools (Claude Code / Cursor / Copilot / Windsurf)
   Enable them per PROJECT, not here. Two ways, same implementation:
@@ -452,6 +456,13 @@ Note
   drop unrelated files here -- re-run the publish script to refresh it.
 "@
 Set-Content -Path (Join-Path $dist 'README.txt') -Value $readme -Encoding UTF8
+
+# ---- AI entry index (llms.txt) ------------------------------------------------
+# Fixed path at the SDK root, regenerated from what actually got staged: the
+# file-channel twin of zan_start_here for agents without an MCP connection.
+# Non-fatal: its absence degrades onboarding, it does not break the release.
+& (Join-Path $root 'scripts\gen_ai_index.ps1') -Dist $dist -Version $version
+if ($LASTEXITCODE -ne 0) { Write-Output "PUBLISH_WARN: llms.txt generation failed (non-fatal)" }
 
 $n = (Get-ChildItem $dist -Recurse -File | Measure-Object).Count
 Write-Output "STAGE_OK -> $dist ($n files)"
