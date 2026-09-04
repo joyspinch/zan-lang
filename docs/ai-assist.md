@@ -1,5 +1,9 @@
 # AI-Assisted Development in Zan
 
+> 总体设计原则、分层契约与路线图见
+> [AI_DEV_INFRASTRUCTURE.md](AI_DEV_INFRASTRUCTURE.md)（方案层，与现状解耦）；
+> 本文件描述此刻三个机制的现状实现。
+
 This document describes the three pieces that make Zan projects easy for an AI
 (or an AI-driven MCP client) to understand and modify:
 
