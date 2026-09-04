@@ -7,6 +7,7 @@ using System.Threading;
 using System.Net.Http;
 using System.Net.Sockets;
 using System.Security.Cryptography;
+using System.Diagnostics;
 using Gui;
 using Gui.Widget;
 using Gui.Component;
@@ -383,6 +384,11 @@ class Demo {
     // spans, so rendering cannot desynchronise parallel cache indexes.
     string cacheSig;
     string cacheSrc;
+    // Font size the cache was built with. Phone pages wrap the same snippet at
+    // a larger size (the code text would otherwise be unreadably small at 2.6x
+    // density), so the render pass must lay text out with the cached size, not
+    // whatever t.fontSizeSmall says this frame.
+    int cacheFs;
     List<string> cacheDescLines;
     List<CodeDisplayLine> cacheDisplayLines;
     // Gutter width chosen in EnsureCache (from the source line count) so the
@@ -414,11 +420,18 @@ class Demo {
     /// Rebuilds the wrap/highlight cache when (width, tab, font size) change.
     /// Idempotent within a frame, so callers can invoke it freely.
     void EnsureCache(App app, Theme t, int cw, int tab) {
+        // 手机上的代码可读性下限：fontSizeSmall（13dp）在 2.6x 密度下
+        // 渲染出来仍是一行塞满几十个字形的密集小字，截图里读作乱码。
+        // 高密度窄屏把代码字号提到 fontSizeMedium 档，行数换可读性。
+        // 卡片描述行与代码行共用同一 fs，高度核算（DemoCardHeight）才不会错位。
         int fs = t.fontSizeSmall;
+        if (app.canvas.Width() < app.canvas.Height()
+            && cw < app.Scale(700)) { fs = t.fontSizeMedium; }
         string sig = Convert.ToString(cw) + "|" + Convert.ToString(tab)
             + "|" + Convert.ToString(fs) + "|" + Convert.ToString(t.bgPrimary);
         if (sig == cacheSig) { return; }
         cacheSig = sig;
+        cacheFs = fs;
 
         cacheDescLines = Gallery.WrapText(desc, cw, fs);
 
@@ -1038,6 +1051,20 @@ class Gallery {
     static Button apiCopyProps;
     static Button apiCopyEvents;
     static int evtClicks;
+
+    // ---- 资源/帧率 HUD（手机上无独立监视工具，直接画在页面上） ----------
+    // 每帧由 Render 调 Gallery.SamplePerf：以 500ms 为窗口采样 FPS 与
+    // 进程 RSS，滚动窗口存最近 60 个样本供文本化展示。CPU 时间用
+    // ServerMetrics.CpuMillis（Android=Linux 走 /proc/self/stat），
+    // 内存用 MemoryRssBytes（/proc/self/statm）。
+    static long hudWinStartUs;
+    static int hudWinFrames;
+    static int hudFps;                 // 最近一个完整窗口的 FPS
+    static long hudLastCpuMs;          // 上次采样时的累计 CPU 毫秒
+    static long hudCpuPct10;           // CPU% ×10（最近窗口）
+    static string hudRssText;          // 最近一次 RSS 文本（MB）
+    static List<string> hudLines;      // HUD 文本行缓存（无分配地重画）
+    static int hudNextRefreshMs;       // 文本节流刷新
 
     // Showcase navigation / scroll state.
     static SignalInt selected;
@@ -3194,6 +3221,72 @@ class Gallery {
     // Layout
     // ------------------------------------------------------------------
 
+    /// 资源/帧率 HUD 的每帧采样。FPS 以 500ms 窗口统计；RSS 与 CPU%
+    /// 同窗口步进（节流到窗口边界才读 /proc，避免每帧系统调用）。
+    static void SamplePerf(App app) {
+        long nowUs = ServerMetrics.MonoMicros();
+        if (Gallery.hudWinStartUs == 0) {
+            Gallery.hudWinStartUs = nowUs;
+            Gallery.hudLastCpuMs = ServerMetrics.CpuMillis();
+            return;
+        }
+        Gallery.hudWinFrames = Gallery.hudWinFrames + 1;
+        if (nowUs - Gallery.hudWinStartUs < 500000) { return; }
+        long winMs = (nowUs - Gallery.hudWinStartUs) / 1000;
+        Gallery.hudFps = (int)((long)Gallery.hudWinFrames * 1000 / winMs);
+        long cpu = ServerMetrics.CpuMillis();
+        if (cpu >= 0 && Gallery.hudLastCpuMs >= 0 && cpu > Gallery.hudLastCpuMs) {
+            Gallery.hudCpuPct10 = (cpu - Gallery.hudLastCpuMs) * 1000 / winMs;
+        }
+        Gallery.hudLastCpuMs = cpu;
+        long rss = ServerMetrics.MemoryRssBytes();
+        if (rss > 0) {
+            Gallery.hudRssText = Convert.ToString(rss / 1048576) + "."
+                + Convert.ToString((int)(rss % 1048576) * 10 / 1048576);
+        }
+        Gallery.hudWinStartUs = nowUs;
+        Gallery.hudWinFrames = 0;
+    }
+
+    /// 把 HUD 画在内容区右上角：FPS / 进程 RSS / CPU%。手机上没有
+    /// 任务管理器可用，这是排查「滑动不流畅」最直接的一手数据。
+    /// 纯绘制、不布局不换行，行内容每 500ms 由 SamplePerf 换一次。
+    static void RenderHud(App app, Canvas c, Theme t, Rect area) {
+        int fs = t.fontSizeSmall;
+        int lineH = Canvas.FontHeight(fs) + app.Scale(2);
+        if (Gallery.hudLines == null) {
+            Gallery.hudLines = new List<string>();
+        }
+        if (app.nowMs >= Gallery.hudNextRefreshMs) {
+            Gallery.hudNextRefreshMs = app.nowMs + 500;
+            Gallery.hudLines.Clear();
+            Gallery.hudLines.Add("FPS " + Convert.ToString(Gallery.hudFps));
+            if (Gallery.hudRssText != null) {
+                Gallery.hudLines.Add("RSS " + Gallery.hudRssText + " MB");
+            }
+            if (Gallery.hudLastCpuMs >= 0) {
+                Gallery.hudLines.Add("CPU " + Convert.ToString(
+                    Gallery.hudCpuPct10 / 10) + "."
+                    + Convert.ToString((int)(Gallery.hudCpuPct10 % 10)) + "%");
+            }
+        }
+        int pad = app.Scale(8);
+        int boxW = app.Scale(86);
+        int boxH = pad + Gallery.hudLines.Count * lineH + pad;
+        int bx = area.x + area.width - boxW - app.Scale(4);
+        int by = area.y + app.Scale(4);
+        c.FillRoundRect(bx, by, boxW, boxH, app.Scale(4), 0xC0202028);
+        c.DrawRect(bx, by, boxW, boxH, t.borderPrimary, 1);
+        int ty = by + pad;
+        for (int i = 0; i < Gallery.hudLines.Count; i = i + 1) {
+            c.DrawText(bx + pad, ty, Gallery.hudLines[i], t.textSecondary, fs);
+            ty = ty + lineH;
+        }
+        // HUD 每 500ms 换一次数（声明矩形 = 本盒子），空闲时也不会
+        // 忙转整窗帧；只在窗口非最小化时续约。
+        app.RequestAnimationFrameIn(500, bx, by, boxW, boxH);
+    }
+
     static void Render(App app) {
         Gallery.SyncLang();
         Canvas c = app.canvas;
@@ -3206,6 +3299,8 @@ class Gallery {
         // window feature now, so every window renders skins identically.
         app.RenderBackground(area.x, area.y, area.width, area.height, 0);
 
+        // 资源/帧率 HUD 采样（每帧一次；文本刷新节流在 SamplePerf 内）。
+        Gallery.SamplePerf(app);
         int sw = app.Scale(272);
         Rect content = new Rect(0, top, w, h - top);
         if (w < app.Scale(700) || h > w) {
@@ -3222,6 +3317,8 @@ class Gallery {
             Gallery.RenderNav(app, c, t, content, sw);
             Gallery.RenderDetail(app, c, t, content, sw);
         }
+        // 资源/帧率 HUD：画在最上层（弹层之下无所谓——弹层打开时没必要看）。
+        Gallery.RenderHud(app, c, t, content);
         // toast/通知队列是全局状态，任何页面的按钮都可能入队；每帧在页面
         // 之上画一次。此前挂在 RenderOverlay 末尾，Alert 这类没有 overlay
         // 演示的页面整页都不会执行到它，入队的消息永远不被绘制。
@@ -3667,7 +3764,7 @@ class Gallery {
     /// so it is cheap enough to run for every card each frame -- it lets the
     /// detail page cull off-screen cards instead of drawing then clipping them.
     static int DemoCardHeight(App app, Theme t, Demo d, int cw) {
-        int lineH = Canvas.FontHeight(t.fontSizeSmall) + app.Scale(4);
+        int lineH = Canvas.FontHeight(d.cacheFs) + app.Scale(4);
         int h = app.Scale(22);
         if (d.desc != "") {
             h = h + d.cacheDescLines.Count * lineH + app.Scale(4);
@@ -3704,8 +3801,10 @@ class Gallery {
     /// block/capture calls follow the DataTable.Overlays convention so the
     /// page below never sees the drawer's taps.
     static void RenderNavDrawer(App app, Canvas c, Theme t, Rect area) {
-        int dw = app.Scale(300);
-        if (dw > area.width - app.Scale(48)) { dw = area.width - app.Scale(48); }
+        // 手机屏占比有限：抽屉 72% 宽，上限随屏宽收窄到至多留 20dp。
+        int dw = area.width * 72 / 100;
+        int dwMax = area.width - app.Scale(20);
+        if (dw > dwMax) { dw = dwMax; }
         if (dw < app.Scale(200)) { dw = app.Scale(200); }
 
         c.FillRect(area.x, area.y, area.width, area.height, t.overlay);
@@ -3744,8 +3843,14 @@ class Gallery {
         if (sel < 0 || sel >= Gallery.comps.Count) { return; }
         Comp e = Gallery.comps[sel];
 
-        int cx = area.x + sw + app.Scale(28);
-        int cw = area.x + area.width - app.Scale(28) - cx - app.Scale(14);
+        // 手机模式（sw == 0）整页通吃：内容列左右各留 12dp，对称且窄。
+        // 桌面模式维持原 28dp/14dp 不变——那套内边距是按宽屏调的。
+        // 此前手机也用 28dp（≈73 设备像素@2.6x），左侧留白宽到像空了一列。
+        int padL = app.Scale(28);
+        int padR = app.Scale(14);
+        if (sw == 0) { padL = app.Scale(12); padR = app.Scale(12); }
+        int cx = area.x + sw + padL;
+        int cw = area.x + area.width - padR - cx;
         if (cw < app.Scale(220)) { cw = app.Scale(220); }
         int contentTop = area.y + app.Scale(26);
         int viewBottom = area.y + area.height - app.Scale(8);
@@ -3761,7 +3866,7 @@ class Gallery {
         // the wheel, the clip and the scrollbar and shows it automatically when
         // the content (measured last frame) overflows the viewport -- demos and
         // previews never handle scrolling themselves.
-        int clipX = cx - app.Scale(12);
+        int clipX = cx - (padL > app.Scale(12) ? app.Scale(12) : padL);
         Rect view = new Rect(clipX, contentTop,
             area.x + area.width - clipX, viewH);
         int scroll = Gallery.detailView.Begin(app, view,
@@ -3808,11 +3913,13 @@ class Gallery {
                 c.DrawText(cx, yy, d.title, t.textPrimary, t.fontSizeMedium);
                 yy = yy + app.Scale(22);
                 if (d.desc != "") {
-                    int dLineH = Canvas.FontHeight(t.fontSizeSmall) + app.Scale(4);
+                    // 描述行与代码面板共用 cacheFs（手机上同提到 fontSizeMedium），
+                    // 行高核算（DemoCardHeight）与渲染保持一致。
+                    int dLineH = Canvas.FontHeight(d.cacheFs) + app.Scale(4);
                     List<string> dl = d.cacheDescLines;
                     for (int ddi = 0; ddi < dl.Count; ddi = ddi + 1) {
                         c.DrawText(cx, yy, dl[ddi], t.textSecondary,
-                            t.fontSizeSmall);
+                            d.cacheFs);
                         yy = yy + dLineH;
                     }
                     yy = yy + app.Scale(4);
@@ -3942,7 +4049,11 @@ class Gallery {
         if (rows.Count == 0) { return yy; }
         int kind = 2;
         if (isProps) { kind = 1; }
+        // 手机窄屏上 fontSizeSmall 的 API 表同样读不清，提到 medium；
+        // 截断列宽用同一 fs 量，才不会超列。
         int fh = t.fontSizeSmall;
+        if (app.canvas.Width() < app.canvas.Height()
+            && cw < app.Scale(700)) { fh = t.fontSizeMedium; }
         c.DrawText(cx, yy, title, t.textPrimary, t.fontSizeMedium);
 
         // Copy button on the title row (right-aligned) — a real Button, one
@@ -4091,7 +4202,7 @@ class Gallery {
         d.EnsureCache(app, t, cw, tab);
         string src = d.cacheSrc;
         List<CodeDisplayLine> displayLines = d.cacheDisplayLines;
-        int fs = t.fontSizeSmall;
+        int fs = d.cacheFs;
         int codeLineH = Canvas.FontHeight(fs) + app.Scale(4);
         int hdrH = app.Scale(28);
         int panelH = hdrH + displayLines.Count * codeLineH + app.Scale(16);
@@ -4493,23 +4604,49 @@ class Gallery {
         if (name == "Chart.dashboard" && w < app.Scale(560)) {
             return app.Scale(834);
         }
-        if (name == "Dropdown" && w < app.Scale(680)) {
-            // 窄视口三列放不下：演示退 2 列（<340 再退 1 列堆叠），
-            // 行数增加时框高跟着行数走，与 RenderDemo 的降列逻辑一致。
-            int rows = w < app.Scale(340) ? 3 : 2;
-            return rows * (app.theme.heightMedium + app.Scale(36))
+        if (name == "Dropdown" && w < app.Scale(716)) {
+            // 窄视口三列放不下：演示改 3 项纵向堆叠、触发器撑满内宽
+            // （降列不减宽），框高跟 3 行走（阈值 = 内宽 680 + 左右
+            // 内边距 36，与 RenderDemo 的 dwide 判断同式）。
+            return 3 * (app.theme.heightMedium + app.Scale(36))
                 + app.Scale(30);
         }
-        if (name == "SelectBox" && w < app.Scale(580)) {
-            // 同 Dropdown：固定三列装不下时降列，单列堆叠要 4 行。
-            int rows = w < app.Scale(380) ? 4 : 2;
-            return rows * (app.theme.heightMedium + app.Scale(34))
+        if (name == "SelectBox" && w < app.Scale(616)) {
+            // 同 Dropdown：固定三列装不下时 4 项纵向堆叠、撑满内宽
+            // （阈值 = 内宽 580 + 内边距 36，与 sbCols 判断同式）。
+            return 4 * (app.theme.heightMedium + app.Scale(34))
                 + app.Scale(30);
         }
         if (name == "Wizard" && w < app.Scale(560)) {
             // 窄视口列表/表单改上下堆叠，框高跟着走（与 RenderDemo 的
             // wStack 布局一致：列表 + 名称/位置两行 + 描述 + 按钮行）。
             return app.Scale(430);
+        }
+        if (name == "Layer" && w < app.Scale(584)) {
+            // Layer 演示按内宽降列（84 下限）：3 列 5 行、2 列 9 行、
+            // 1 列 14 行；提示行顺排进末行缝隙（不再悬到框外压代码
+            // 面板）。桌面（≥584）提示内联第四列，维持 PreviewHeight。
+            int lwi = w - app.Scale(36);
+            int rows = (lwi - app.Scale(20)) / 3 >= app.Scale(84) ? 5
+                : (lwi - app.Scale(10)) / 2 >= app.Scale(84) ? 9 : 14;
+            return rows * (app.theme.heightMedium + app.Scale(34))
+                + app.Scale(8);
+        }
+        if (name == "Tag" && w < app.Scale(520)) {
+            // Tag 演示第 1 行改 ChipFlow 实测换行（6 颗在手机上多占
+            // 一行），<340 两行都可能换行。
+            return app.Scale(previewHUnscaled
+                + (w < app.Scale(340) ? 60 : 30));
+        }
+        if (name == "TreeView" && w < app.Scale(560)) {
+            // 说明列移到树下方顺排。
+            return app.Scale(475);
+        }
+        if (name == "Empty" && w < app.Scale(560)) {
+            // 两块 Empty 上下堆叠：第二块顶点 py+124、高 80，
+            // 底边 py+204；框高 = 48 + 204 + 12 边距（215 会把
+            // 第二块图标下缘裁进框底）。
+            return app.Scale(264);
         }
         return app.Scale(previewHUnscaled);
     }
@@ -6891,25 +7028,34 @@ class Gallery {
                 content.x, content.y + app.Scale(26), "Group content here; reach for Card when a header is needed.",
                 app.theme.textPrimary, app.theme.fontSizeMedium);
         } else if (name == "Tag") {
-            // Row 1: colour variants.
-            Tag.Chip(app, px, py, "Default", "");
-            Tag.Chip(app, px + app.Scale(84), py, "Primary", "primary");
-            Tag.Chip(app, px + app.Scale(168), py, "Info", "info");
-            Tag.Chip(app, px + app.Scale(240), py, "Success", "success");
-            Tag.Chip(app, px + app.Scale(330), py, "Warning", "warning");
-            Tag.Chip(app, px + app.Scale(426), py, "Error", "error");
+            // Row 1: colour variants. 宽度实测顺排、超内宽换行——
+            // 旧固定偏移排到 Scale(426)，手机卡片上 Warning/Error
+            // 直接排到卡片外被裁掉。
+            int vtw = w - app.Scale(36);
+            int vtx = px;
+            int vty = py;
+            Tag.ChipFlow(app, px, vtw, "Default", "", vtx, vty, out vtx, out vty);
+            Tag.ChipFlow(app, px, vtw, "Primary", "primary", vtx, vty, out vtx, out vty);
+            Tag.ChipFlow(app, px, vtw, "Info", "info", vtx, vty, out vtx, out vty);
+            Tag.ChipFlow(app, px, vtw, "Success", "success", vtx, vty, out vtx, out vty);
+            Tag.ChipFlow(app, px, vtw, "Warning", "warning", vtx, vty, out vtx, out vty);
+            Tag.ChipFlow(app, px, vtw, "Error", "error", vtx, vty, out vtx, out vty);
             // Row 2: interactive closable chips + an "+ Add" action.
+            // 说明行与 row2 的 y 从 row1 的实际结束行推导：桌面单行时
+            // 与旧定值 (py+30 / py+54) 相同，row1 换行成两行时整体下移。
+            int cap2y = vty + Tag.Height(app, "") + app.Scale(8);
             app.canvas.DrawStyledText(
                 Style.Of(app, "label", "secondary", Style.SNormal()),
-                px, py + app.Scale(30), "Closable · click x to remove, + Add to append",
+                px, cap2y, "Closable · click x to remove, + Add to append",
                 app.theme.textPrimary, app.theme.fontSizeMedium);
-            int ty2 = py + app.Scale(54);
+            int ty2 = cap2y + app.Scale(24);
             int tx = px;
             int ti = 0;
             while (ti < Gallery.demoTags.Count) {
                 string tg = Gallery.demoTags[ti];
-                int cid = Tag.ChipClosable(app, tx, ty2, tg, "primary");
                 int tgw = Tag.ClosableWidth(app, tg, "primary");
+                if (tx + tgw > px + vtw) { tx = px; ty2 = ty2 + app.Scale(30); }
+                int cid = Tag.ChipClosable(app, tx, ty2, tg, "primary");
                 if (Ui.Clicked(app, cid)) {
                     Gallery.demoTags.RemoveAt(ti);
                     app.RequestRedraw();
@@ -7919,17 +8065,21 @@ class Gallery {
             if (tsel >= 0 && tsel < Gallery.treeNodes.Count) {
                 picked = Gallery.treeNodes[tsel].label;
             }
-            int infoX = px + app.Scale(340);
+            // 说明列桌面在树右侧 Scale(340)；窄卡片放不下（340+文本
+            // ~200 出界）改到树下方顺排，框高由 PreviewBoxH 跟进。
+            bool tvNarrow = w < app.Scale(560);
+            int infoX = tvNarrow ? px : px + app.Scale(340);
+            int infoY = tvNarrow ? py + app.Scale(248) : py - app.Scale(16);
             app.canvas.DrawStyledText(
                 Style.Of(app, "label", "secondary", Style.SNormal()),
-                infoX, py - app.Scale(16), Gallery.T("Selected: @已选择：", "已选择：") + picked,
+                infoX, infoY, Gallery.T("Selected: @已选择：", "已选择：") + picked,
                 app.theme.textPrimary, app.theme.fontSizeMedium);
             List<string> chk = Gallery.treeTv.CheckedLabels();
             app.canvas.DrawStyledText(
                 Style.Of(app, "label", "secondary", Style.SNormal()),
-                infoX, py + app.Scale(8), Gallery.T("Checked: ", "已勾选：") + Convert.ToString(chk.Count),
+                infoX, infoY + app.Scale(24), Gallery.T("Checked: ", "已勾选：") + Convert.ToString(chk.Count),
                 app.theme.textPrimary, app.theme.fontSizeMedium);
-            int cly = py + app.Scale(32);
+            int cly = infoY + app.Scale(48);
             for (int cli = 0; cli < chk.Count && cli < 7; cli = cli + 1) {
                 app.canvas.DrawStyledText(
                     Style.Of(app, "label", "secondary", Style.SNormal()),
@@ -11060,17 +11210,24 @@ class Gallery {
             // from the same fixed-point raw counts.
             Gallery.HmiTick(app, x, y, w, h);
             int fs = t.fontSizeSmall;
+            // 窄卡片（手机）放不下五列：精简为 位号/工程值/状态 三列，
+            // 原始值与量程% 只在桌面出现——固定五列在 412 逻辑宽下
+            // State 列直接出界。
+            bool hNarrow = w < app.Scale(560);
             int c0 = px;
             int c1 = px + app.Scale(150);
-            int c2 = px + app.Scale(250);
+            int c2 = hNarrow ? px + app.Scale(280) : px + app.Scale(250);
             int c3 = px + app.Scale(330);
             int c4 = px + app.Scale(410);
             int hy = py - app.Scale(10);
             c.DrawText(c0, hy, Gallery.T("Tag", "位号"), t.textTertiary, fs);
             c.DrawText(c1, hy, Gallery.T("Value", "工程值"), t.textTertiary, fs);
-            c.DrawText(c2, hy, Gallery.T("Raw", "原始值"), t.textTertiary, fs);
-            c.DrawText(c3, hy, Gallery.T("Percent", "量程 %"), t.textTertiary, fs);
-            c.DrawText(c4, hy, Gallery.T("State", "状态"), t.textTertiary, fs);
+            if (!hNarrow) {
+                c.DrawText(c2, hy, Gallery.T("Raw", "原始值"), t.textTertiary, fs);
+                c.DrawText(c3, hy, Gallery.T("Percent", "量程 %"), t.textTertiary, fs);
+            }
+            c.DrawText(hNarrow ? c2 : c4, hy, Gallery.T("State", "状态"),
+                t.textTertiary, fs);
             int ry = hy + app.Scale(22);
             c.DrawLine(px, ry - app.Scale(6), px + w - app.Scale(52),
                 ry - app.Scale(6), t.divider, 1);
@@ -11087,10 +11244,13 @@ class Gallery {
                 }
                 c.DrawText(c0, ry, tg.Name(), t.textSecondary, fs);
                 c.DrawText(c1, ry, tg.TextWithUnit(), vc, fs);
-                c.DrawText(c2, ry, Convert.ToString(tg.Raw()), t.textSecondary, fs);
-                c.DrawText(c3, ry, Convert.ToString(tg.Percent()) + " %",
-                    t.textSecondary, fs);
-                c.DrawText(c4, ry, stt, vc, fs);
+                if (!hNarrow) {
+                    c.DrawText(c2, ry, Convert.ToString(tg.Raw()),
+                        t.textSecondary, fs);
+                    c.DrawText(c3, ry, Convert.ToString(tg.Percent()) + " %",
+                        t.textSecondary, fs);
+                }
+                c.DrawText(hNarrow ? c2 : c4, ry, stt, vc, fs);
                 ry = ry + app.Scale(24);
             }
             c.DrawText(px, ry + app.Scale(14),
@@ -11989,8 +12149,11 @@ class Gallery {
             e1.RenderInside(app, new Rect(px, py - app.Scale(8),
                 app.Scale(300), app.Scale(120)));
             Empty e2 = new Empty("Nothing here") { Class = "small" };
-            e2.RenderInside(app, new Rect(px + app.Scale(330),
-                y + app.Scale(56), app.Scale(200), app.Scale(80)));
+            // 窄卡片两块顺排（330+200 出界），框高由 PreviewBoxH 跟进。
+            bool emNarrow = w < app.Scale(560);
+            e2.RenderInside(app, new Rect(emNarrow ? px : px + app.Scale(330),
+                emNarrow ? py + app.Scale(124) : y + app.Scale(56),
+                app.Scale(200), app.Scale(80)));
         } else {
             rendered = false;
         }
@@ -12063,42 +12226,50 @@ class Gallery {
         return false;
     }
 
+    /// 触发器型单控件的演示宽度：桌面用声明的设计宽度，窄卡片
+    /// （手机）撑满内容行——固定 220/320 在手机上是半截宽，右侧
+    /// 整条留白；w 扣掉左右各 18 内边距即内容可用宽。
+    static int TriggerW(App app, int w, int wide) {
+        return w < app.Scale(560) ? w - app.Scale(36) : app.Scale(wide);
+    }
+
     static void RenderOverlay(App app, Canvas c, Theme t, string name,
             int x, int y, int w) {
         int px = x + app.Scale(18);
         int py = y + app.Scale(48);
         if (name == "SelectBox") {
-            // 手机卡片装不下固定三列（3×180+2×20=580）：按 w 降列
-            // （3/2/1），桌面能装下时与旧三列布局完全一致。
+            // 手机卡片装不下固定三列（3×180+2×20=580）时纵向堆叠、
+            // 触发器撑满内宽；桌面能装下时与旧三列布局完全一致。
+            // 降列不减宽：2 列只会让每个触发器缩在半宽、右侧留白。
             int sbGap = app.Scale(20);
             int sbw = app.Scale(180);
+            int sbwi = w - app.Scale(36);
             int sbCols = 3;
-            if (sbw * 3 + sbGap * 2 > w) { sbCols = 2; }
-            if (sbw * 2 + sbGap > w) { sbCols = 1; }
+            if (sbw * 3 + sbGap * 2 > sbwi) { sbCols = 1; sbw = sbwi; }
             int sbStep = sbw + sbGap;
             int sbRow = t.heightMedium + app.Scale(34);
             Gallery.SelCaption(app, name, px, py - app.Scale(24),
                 Gallery.T("single · clearable", "single · clearable"));
             Gallery.demoSelect.Render(app, px, py, sbw);
-            int s2x = px + (sbCols >= 2 ? sbStep : 0);
-            int s2y = py + (sbCols >= 2 ? 0 : sbRow);
+            int s2x = px + (sbCols == 3 ? sbStep : 0);
+            int s2y = py + (sbCols == 3 ? 0 : sbRow);
             Gallery.SelCaption(app, name, s2x, s2y - app.Scale(24),
                 Gallery.T("multi-select", "multi-select"));
             Gallery.demoMulti.Render(app, s2x, s2y, sbw);
             int s3x = px + (sbCols == 3 ? sbStep * 2 : 0);
-            int s3y = py + (sbCols == 3 ? 0 : (sbCols == 2 ? sbRow : sbRow * 2));
+            int s3y = py + (sbCols == 3 ? 0 : sbRow * 2);
             Gallery.SelCaption(app, name, s3x, s3y - app.Scale(24),
                 Gallery.T("long · scrolls", "long · scrolls"));
             Gallery.demoLong.Render(app, s3x, s3y, sbw);
-            int s4x = px + (sbCols == 2 ? sbStep : 0);
-            int s4y = py + sbRow * (sbCols == 3 ? 1 : (sbCols == 2 ? 1 : 3));
+            int s4x = px + (sbCols == 3 ? sbStep : 0);
+            int s4y = py + sbRow * (sbCols == 3 ? 1 : 3);
             Gallery.SelCaption(app, name, s4x, s4y - app.Scale(24),
                 Gallery.T("large · Size(Large())", "large · Size(Large())"));
             Gallery.demoLarge.Render(app, s4x, s4y, sbw);
         } else if (name == "SelectBox.filter") {
             // Filterable(true)：弹层顶部一个搜索框，键入即时过滤。
             // 四十个候选项已经不值得逐条翻了。
-            Gallery.demoFilter.Render(app, px, py, app.Scale(260));
+            Gallery.demoFilter.Render(app, px, py, Gallery.TriggerW(app, w, 260));
             Gallery.SelCaption(app, name, px, py + t.heightMedium + app.Scale(12),
                 Gallery.T("Filterable(true) · type to narrow, X clears",
                           "Filterable(true) · 键入即筛，X 清空"));
@@ -12106,7 +12277,7 @@ class Gallery {
         } else if (name == "SelectBox.table") {
             // Table(headers, widths) + AddRow(cells)：弹层是一张对齐的表，
             // 而不是把三段文字拼成一条长字符串。筛选对所有列生效。
-            Gallery.demoTablePick.Render(app, px, py, app.Scale(320));
+            Gallery.demoTablePick.Render(app, px, py, Gallery.TriggerW(app, w, 320));
             Gallery.SelCaption(app, name, px, py + t.heightMedium + app.Scale(12),
                 Gallery.T("Table(headers, widths) + AddRow(cells) · the filter hits every column",
                           "Table(headers, widths) + AddRow(cells) · 筛选命中所有列"));
@@ -12122,7 +12293,7 @@ class Gallery {
         } else if (name == "SelectBox.hover") {
             // Hover 事件 + Hovered()：指到哪条就报哪条，联动预览/详情面板
             // 靠的就是这一对。
-            Gallery.demoHoverPick.Render(app, px, py, app.Scale(220));
+            Gallery.demoHoverPick.Render(app, px, py, Gallery.TriggerW(app, w, 220));
             Gallery.SelCaption(app, name, px, py + t.heightMedium + app.Scale(12),
                 Gallery.T("Hover an option · the index is reported at the top of this card",
                           "把鼠标移到选项上 · 序号报在卡片头部"));
@@ -12136,7 +12307,7 @@ class Gallery {
         } else if (name == "SelectBox.cascade") {
             // 级联单选：点中带子级的选项在右侧展开下一列；叶子收值后
             // 触发器显示完整路径，重开弹层自动展开到选中链。
-            Gallery.demoCascade.Render(app, px, py, app.Scale(220));
+            Gallery.demoCascade.Render(app, px, py, Gallery.TriggerW(app, w, 220));
             Gallery.SelCaption(app, name, px, py + t.heightMedium + app.Scale(12),
                 Gallery.T("Cascade() · pick a leaf, columns expand to the right",
                           "Cascade() · 选到叶子为止，逐列向右展开"));
@@ -12145,21 +12316,21 @@ class Gallery {
             // 级联多选：行首勾选框父子联动（全勾=勾、部分=短横），
             // 勾选策略 child 只把叶子计入值；悬停即展开下一列，过滤
             // 平铺整棵树按完整路径搜，触发器是可单独移除的标签芯片。
-            Gallery.demoCascadeMulti.Render(app, px, py, app.Scale(300));
+            Gallery.demoCascadeMulti.Render(app, px, py, Gallery.TriggerW(app, w, 300));
             Gallery.SelCaption(app, name, px, py + t.heightMedium + app.Scale(12),
                 Gallery.T("Multi + Cascade · linked checkboxes, check-strategy child, hover expand, path filter",
                           "多选 + 级联 · 勾选父子联动、child 勾选策略、悬停展开、路径过滤"));
             Gallery.SelReport(app, name, Gallery.demoCascadeMulti);
         } else if (name == "SelectBox.tree") {
             // 树形：弹层内嵌真 TreeView，展开/折叠/滚动都是它自己的行为。
-            Gallery.demoTreePick.Render(app, px, py, app.Scale(240));
+            Gallery.demoTreePick.Render(app, px, py, Gallery.TriggerW(app, w, 240));
             Gallery.SelCaption(app, name, px, py + t.heightMedium + app.Scale(12),
                 Gallery.T("Tree() · the popup embeds a real TreeView",
                           "Tree() · 弹层内嵌真 TreeView"));
             Gallery.SelReport(app, name, Gallery.demoTreePick);
         } else if (name == "SelectBox.group") {
             // 分组 + 禁用项：标题行只是小标题，禁用项置灰不可点。
-            Gallery.demoGroupPick.Render(app, px, py, app.Scale(220));
+            Gallery.demoGroupPick.Render(app, px, py, Gallery.TriggerW(app, w, 220));
             Gallery.SelCaption(app, name, px, py + t.heightMedium + app.Scale(12),
                 Gallery.T("AddGroup(title) + AddOption(label, true) · headers are not selectable, disabled items are grayed out",
                           "AddGroup(title) + AddOption(label, true) · 标题行不可选，禁用项置灰"));
@@ -12168,7 +12339,7 @@ class Gallery {
             // Retained instance: owns its open state and defers the option list
             // to the framework overlay layer (draws above the code panel, one
             // centralized dispatch). No manual hit-testing here.
-            Gallery.demoSelectLow.Render(app, px, py, app.Scale(220));
+            Gallery.demoSelectLow.Render(app, px, py, Gallery.TriggerW(app, w, 220));
             app.canvas.DrawStyledText(
                 Style.Of(app, "label", "secondary", Style.SNormal()),
                 px, py + t.heightMedium + app.Scale(10), "click to open · Change fires on select",
@@ -12178,43 +12349,42 @@ class Gallery {
             // 提示语——保留选中值是 SelectBox 的事），右边 Rows(4) 长命令
             // 菜单滚动 + OnOpen/OnClose 事件。Retained：弹层延迟到覆盖层
             // 绘制，画在代码面板之上、点击不穿透、外部按下或 Esc 关闭。
-            // 三列桌面定宽 200、列距 240；窄视口按卡片内宽决定列数：
-            // 3 列放不下退 2 列，仍不够退 1 列纵向堆叠，列宽随行收缩。
+            // 三列桌面定宽 200、列距 40；窄视口（3 列放不下）纵向
+            // 堆叠、触发器撑满内宽——移动表单的标准形态。退成 2 列
+            // 只会让每个触发器缩在半宽、右侧整条留白（降列不减宽）。
             int dgap = app.Scale(40);
+            // 内宽：扣掉左右各 18 内边距再算列数——按全宽 w 算会把行
+            // 顶到卡片右缘外（与 Layer 演示同一处病）。
+            int dwi = w - app.Scale(36);
             int dcw = app.Scale(200);
-            int dcols = 3;
-            int dfit = (w - dgap * 2) / 3;
-            if (dcw > dfit) {
-                dcols = 2;
-                dfit = (w - dgap) / 2;
-                if (dfit >= app.Scale(150)) {
-                    dcw = dfit;
-                } else {
-                    dcols = 1;
-                    dcw = w < app.Scale(200) ? w : app.Scale(200);
-                }
-            }
+            bool dwide = dcw * 3 + dgap * 2 <= dwi;
+            if (!dwide) { dcw = dwi; }
             int dstep = dcw + dgap;
             int drowH = t.heightMedium + app.Scale(36);
             Gallery.demoDropdownAct.RenderInside(app,
                 new Rect(px, py, dcw, t.heightMedium));
             Gallery.demoDropdownManual.RenderInside(app,
-                new Rect(dcols == 3 ? px + dstep : px,
-                         dcols == 3 ? py : py + drowH, dcw, t.heightMedium));
+                new Rect(dwide ? px + dstep : px,
+                         dwide ? py : py + drowH, dcw, t.heightMedium));
             Gallery.demoDropdownTree.RenderInside(app,
-                new Rect(dcols == 3 ? px + dstep * 2 : (dcols == 2 ? px + dstep : px),
-                         dcols == 3 ? py : py + drowH, dcw, t.heightMedium));
+                new Rect(dwide ? px + dstep * 2 : px,
+                         dwide ? py : py + drowH * 2, dcw, t.heightMedium));
             int dcapY = py + t.heightMedium + app.Scale(12);
             Gallery.SelCaption(app, name, px, dcapY,
                 Gallery.T("pick = run the action · trigger resets to its hint",
                           "选中即执行动作 · 触发器回到提示语"));
-            if (dcols == 3) {
+            if (dwide) {
                 Gallery.SelCaption(app, name, px + dstep, dcapY,
                     Gallery.T("Rows(4) scrolls · open/close hit the header",
                               "Rows(4) 长菜单滚动 · 开/关事件报在卡片头部"));
-            }
-            if (dcols == 3) {
                 Gallery.SelCaption(app, name, px + dstep * 2, dcapY,
+                    Gallery.T("BindMenu: icons · submenu · disabled · danger",
+                              "BindMenu：图标 · 子菜单 · 禁用 · 危险项"));
+            } else {
+                Gallery.SelCaption(app, name, px, dcapY + drowH,
+                    Gallery.T("Rows(4) scrolls · open/close hit the header",
+                              "Rows(4) 长菜单滚动 · 开/关事件报在卡片头部"));
+                Gallery.SelCaption(app, name, px, dcapY + drowH * 2,
                     Gallery.T("BindMenu: icons · submenu · disabled · danger",
                               "BindMenu：图标 · 子菜单 · 禁用 · 危险项"));
             }
@@ -12384,14 +12554,21 @@ class Gallery {
         int bx = px;
         int by = py;
         // 桌面三列定宽 118；窄视口（手机 ~412 逻辑宽）下 3×118+间隙超出
-        // 卡片内宽，第三列被屏幕裁掉。列宽从可用宽度反推，最小仍保
-        // Scale(84)（"Prompt password" 恰好放得下）。
+        // 卡片内宽。列数从内宽反推：wi 是扣掉左右各 18 内边距后的可用
+        // 宽——按全宽 w 算会把第三列顶到卡片边界外（实测压进滚动条区）。
+        // 单列最小仍保 Scale(84)（"Prompt password" 恰好放得下）。
+        int wi = w - app.Scale(36);
         int gap = app.Scale(10);
-        int bw = app.Scale(118);
-        int fitBw = (w - gap * 2) / 3;
-        if (bw > fitBw && fitBw >= app.Scale(84)) { bw = fitBw; }
+        int cols = 3;
+        if ((wi - gap * 2) / 3 < app.Scale(84)) { cols = 2; }
+        if (cols == 2 && (wi - gap) / 2 < app.Scale(84)) { cols = 1; }
+        int bw = wi;
+        if (cols > 1) { bw = (wi - (cols - 1) * gap) / cols; }
+        if (cols == 3 && bw > app.Scale(118)) { bw = app.Scale(118); }
         int bh = t.heightMedium;
         int rowGap = app.Scale(34);
+        int stepX = bw + gap;
+        int stepY = bh + rowGap;
 
         app.canvas.DrawStyledText(
             Style.Of(app, "label", "secondary", Style.SNormal()),
@@ -12399,11 +12576,12 @@ class Gallery {
             app.theme.textPrimary, app.theme.fontSizeMedium);
         int a1 = new Button { Text = "Alert" }.Render(app, bx, by, bw);
         if (Ui.Clicked(app, a1)) { Gallery.dlgAlert.Open(); }
-        int a2 = new Button { Text = "Confirm" }.Render(app, bx + (bw + gap), by, bw);
+        int a2 = new Button { Text = "Confirm" }.Render(app, bx + stepX, by, bw);
         if (Ui.Clicked(app, a2)) { Gallery.dlgConfirm.Open(); }
-        int a3 = new Button { Text = "Prompt" }.Render(app, bx + (bw + gap) * 2, by, bw);
+        int a3 = new Button { Text = "Prompt" }.Render(
+            app, bx + (2 % cols) * stepX, by + (2 / cols) * stepY, bw);
         if (Ui.Clicked(app, a3)) { Gallery.dlgPrompt.Open(); }
-        by = by + bh + rowGap;
+        by = by + (2 / cols + 1) * stepY;
 
         app.canvas.DrawStyledText(
             Style.Of(app, "label", "secondary", Style.SNormal()),
@@ -12411,11 +12589,12 @@ class Gallery {
             app.theme.textPrimary, app.theme.fontSizeMedium);
         int m1 = new Button { Text = "Success msg" }.Render(app, bx, by, bw);
         if (Ui.Clicked(app, m1)) { Layer.Msg("Saved successfully", 3); }
-        int m2 = new Button { Text = "Warning msg" }.Render(app, bx + (bw + gap), by, bw);
+        int m2 = new Button { Text = "Warning msg" }.Render(app, bx + stepX, by, bw);
         if (Ui.Clicked(app, m2)) { Layer.Msg("Unsaved changes", 4); }
-        int m3 = new Button { Text = "Error msg" }.Render(app, bx + (bw + gap) * 2, by, bw);
+        int m3 = new Button { Text = "Error msg" }.Render(
+            app, bx + (2 % cols) * stepX, by + (2 / cols) * stepY, bw);
         if (Ui.Clicked(app, m3)) { Layer.Msg("Network error", 5); }
-        by = by + bh + rowGap;
+        by = by + (2 / cols + 1) * stepY;
 
         app.canvas.DrawStyledText(
             Style.Of(app, "label", "secondary", Style.SNormal()),
@@ -12423,46 +12602,43 @@ class Gallery {
             app.theme.textPrimary, app.theme.fontSizeMedium);
         int n1 = new Button { Text = "Notify" }.Render(app, bx, by, bw);
         if (Ui.Clicked(app, n1)) { Layer.Notify("Build completed", 3); }
-        int n2 = new Button { Text = "Loading" }.Render(app, bx + (bw + gap), by, bw);
+        int n2 = new Button { Text = "Loading" }.Render(app, bx + stepX, by, bw);
         if (Ui.Clicked(app, n2)) { Gallery.loadStartMs = Window.GetTickMs(); }
-        int tipsX = bx + (bw + gap) * 2;
+        int tipsX = bx + (2 % cols) * stepX;
+        int tipsY = by + (2 / cols) * stepY;
         bool tipsNow = Gallery.tipsOn.Get();
         string tlbl = "Tips";
         if (tipsNow) { tlbl = "Hide tips"; }
-        int n3 = new Button { Text = tlbl }.Render(app, tipsX, by, bw);
+        int n3 = new Button { Text = tlbl }.Render(app, tipsX, tipsY, bw);
         if (Ui.Clicked(app, n3)) { Gallery.tipsOn.Set(!tipsNow); }
         int tipAX = tipsX + bw / 2;
         // Anchor the tip to the button's TOP edge so the top-placed bubble sits
         // above the whole button (notch touching the top edge) instead of
         // growing up from the bottom edge and covering the label.
-        int tipAY = by;
-        by = by + bh + rowGap;
+        int tipAY = tipsY;
+        by = tipsY + (2 / cols + 1) * stepY;
 
         app.canvas.DrawStyledText(
             Style.Of(app, "label", "secondary", Style.SNormal()),
             bx, by - app.Scale(22), "Draggable windows · full-screen photo carousel",
             app.theme.textPrimary, app.theme.fontSizeMedium);
+        int sec4by = by;
         int w1 = new Button { Text = "Open window", Class = "primary" }.Render(app, bx, by, bw);
         if (Ui.Clicked(app, w1)) { Gallery.SpawnLayer(app); }
-        int w2 = new Button { Text = "Photos" }.Render(app, bx + (bw + gap), by, bw);
+        int w2 = new Button { Text = "Photos" }.Render(app, bx + stepX, by, bw);
         if (Ui.Clicked(app, w2)) {
             Gallery.photoIdx.Set(0);
             Gallery.photosOpen.Set(true);
         }
-        int w3 = new Button { Text = "Open form" }.Render(app, bx + (bw + gap) * 2, by, bw);
+        int w3 = new Button { Text = "Open form" }.Render(
+            app, bx + (2 % cols) * stepX, by + (2 / cols) * stepY, bw);
         if (Ui.Clicked(app, w3)) { Gallery.SpawnFormWindow(app); }
-        // 提示文本原本排第四列；窄视口上第四列出界（文本比列宽还长），
-        // 收不进时锚到最后一行按钮的顶部——文本画在 py+Scale(46)，正落在
-        // 末行按钮下方，不会压住「Prompt forms」的说明文字。
-        int hintX = bx + (bw + gap) * 3;
-        int hintY = by;
-        if (hintX + app.Scale(200) > bx + w) {
-            hintX = bx;
-            hintY = by + (bh + rowGap) * 2;
-        }
-        Gallery.PopupHint(app, hintX, hintY);
+        // 提示文本：桌面内联在第四列；窄视口放不下时顺排到最后一行按钮
+        // 下方（PopupHint 自带 +46 落在下一行缝隙里），绝不能悬到演示
+        // 框外——那正是压到代码面板上的旧病。
+        bool hintInline = bx + stepX * 3 + app.Scale(200) <= bx + w;
+        by = sec4by + (2 / cols + 1) * stepY;
 
-        by = by + bh + rowGap;
         app.canvas.DrawStyledText(
             Style.Of(app, "label", "secondary", Style.SNormal()),
             bx, by - app.Scale(22),
@@ -12475,11 +12651,19 @@ class Gallery {
             Gallery.dlgPromptPw.shadeClose = true;
             Gallery.dlgPromptPw.Open();
         }
-        int pw2 = new Button { Text = "Prompt multiline" }.Render(app, bx + (bw + gap), by, bw);
+        int pw2 = new Button { Text = "Prompt multiline" }.Render(
+            app, bx + (1 % cols) * stepX, by + (1 / cols) * stepY, bw);
         if (Ui.Clicked(app, pw2)) {
             Gallery.dlgPromptArea = LayerState.PromptWith("Notes",
                 "write here...", 2, "", 0);
             Gallery.dlgPromptArea.Open();
+        }
+        by = by + (1 / cols + 1) * stepY;
+
+        if (hintInline) {
+            Gallery.PopupHint(app, bx + stepX * 3, sec4by);
+        } else {
+            Gallery.PopupHint(app, bx, by - stepY);
         }
 
         if (Gallery.loadStartMs > 0) {
@@ -12502,14 +12686,25 @@ class Gallery {
 
     /// Spawns a new floating Layer window, cascaded down-right from the last
     /// one so several are visibly stacked. Each is independent and draggable.
+    /// 窄视口（手机）下桌面级联偏移 (360,150)+400 宽会把窗口大半送出
+    /// 屏幕右缘——改为按窗口实际尺寸居中，只保留小量级联错位。
     static void SpawnLayer(App app) {
         int n = Gallery.layerSeq;
         Gallery.layerSeq = n + 1;
         int off = (n % 6) * app.Scale(28);
+        int ww = app.Scale(400);
+        int wh = app.Scale(230);
+        int wx = app.Scale(360) + off;
+        int wy = app.Scale(150) + off;
+        int aw = app.canvas.Width();
+        int ah = app.canvas.Height();
+        if (wx + ww > aw || aw < app.Scale(760)) {
+            wx = (aw - ww) / 2 + off;
+            if (wx < app.Scale(8)) { wx = app.Scale(8); }
+        }
+        if (wy + wh > ah) { wy = (ah - wh) / 2 + off; }
         LayerState win = new LayerState(
-            "Window " + Convert.ToString(n + 1),
-            app.Scale(360) + off, app.Scale(150) + off,
-            app.Scale(400), app.Scale(230));
+            "Window " + Convert.ToString(n + 1), wx, wy, ww, wh);
         win.body = "Drag to move; drag edges/corners to resize.";
         win.Open();
         Gallery.demoLayers.Add(win);
@@ -12530,8 +12725,17 @@ class Gallery {
         form.With(Gallery.formNote);
         form.With(Gallery.formOk);
         Layer.EndBody();
+        int fw = app.Scale(380);
+        int fh = app.Scale(300);
+        int fx = app.Scale(300);
+        int fy = app.Scale(140);
+        int aw = app.canvas.Width();
+        int ah = app.canvas.Height();
+        if (fx + fw > aw) { fx = (aw - fw) / 2; }
+        if (fy + fh > ah) { fy = (ah - fh) / 2; }
+        if (fx < app.Scale(8)) { fx = app.Scale(8); }
         Gallery.formWin = new LayerState("Form window",
-            app.Scale(300), app.Scale(140), app.Scale(380), app.Scale(300));
+            fx, fy, fw, fh);
         Gallery.formWin.body = "Embedded components (page layer).";
         Gallery.formWin.SetBody(form);
         Gallery.formWin.Open();

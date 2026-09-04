@@ -510,7 +510,17 @@ static void sdl_translate(const SDL_Event *e) {
             if (!g_touch_drag) {
                 float dx = x - g_touch_ax, dy = y - g_touch_ay;
                 if (dx * dx + dy * dy < 64.0f) break; /* slop: still a tap */
-                g_touch_drag = 1; /* a drag scrolls and presses nothing */
+                g_touch_drag = 1;
+                /* A drag may start on a draggable widget (window title bar,
+                 * resize handle, slider) just as well as on scrollable
+                 * content. Synthesize the mouse press at the touch anchor so
+                 * Gui-level hit testing sees a press and the widget can own
+                 * the gesture; every motion below also reports mouse movement.
+                 * Scrollable areas keep their wheel stream — the two flows
+                 * coexist, and a wheel only scrolls what the finger is over
+                 * (popup blockers already sink it below floating layers). */
+                zq_push(2, (int)g_touch_ax, (int)g_touch_ay, 0, 0,
+                        cur_mod_bits(), w);
             }
             /* Finger travel -> wheel deltas in the ±120 scale Gui/App's
              * /120 math expects: content px per wheel degree is
@@ -535,6 +545,11 @@ static void sdl_translate(const SDL_Event *e) {
             if (g_hist_n < TOUCH_HIST) g_hist_n++;
             g_touch_x = x;
             g_touch_y = y;
+            /* Mouse-motion twin of the wheel delta above: this is what lets
+             * a held widget (Layer window drag/resize) follow the finger.
+             * zq_push merges consecutive plain moves, so this costs no
+             * extra queue depth alongside the wheel flow. */
+            zq_push(1, (int)x, (int)y, 0, 0, cur_mod_bits(), w);
             break;
         }
         case SDL_EVENT_FINGER_UP:
@@ -542,6 +557,19 @@ static void sdl_translate(const SDL_Event *e) {
             if (e->tfinger.fingerID != g_touch_id || g_touch_id == 0) break;
             g_touch_id = 0;
             if (g_touch_drag) {
+                /* The drag drove widgets as well as scroll: report the
+                 * mouse release at the finger position, flagged (e[6]) so
+                 * the app swallows it as a click — the finger lifted
+                 * wherever the drag ended, and treating that as a click
+                 * would press whatever sits under the release point. */
+                SDL_Window *uw = SDL_GetWindowFromEvent(e);
+                if (!uw) uw = g_main_win;
+                if (uw) {
+                    zq_push(3, (int)g_touch_x, (int)g_touch_y, 0, 0,
+                            cur_mod_bits(), uw);
+                    int ul = (g_zq_tail + ZAN_ZQ_CAP - 1) % ZAN_ZQ_CAP;
+                    g_zq[ul].e[6] = 1;
+                }
                 /* Release inertia: velocity from the recent travel window
                  * (oldest sample still inside ~120 ms). CANCELED just
                  * stops. Coordinates stay at the release point so the
@@ -742,6 +770,16 @@ static SDL_HitTestResult SDLCALL zan_sdl_hittest(SDL_Window *win,
     return SDL_HITTEST_NORMAL;
 }
 
+#if defined(__ANDROID__)
+static int zq_count(void) {
+    return (g_zq_tail + ZAN_ZQ_CAP - g_zq_head) % ZAN_ZQ_CAP;
+}
+
+static bool SDLCALL zan_event_watch(void *userdata, SDL_Event *e);
+static int zan_watch_wait(int ms);
+static int zan_watch_installed = 0;
+#endif
+
 static void zan_sdl_ensure_init(void) {
     if (g_sdl_ready) return;
     SDL_SetMainReady();
@@ -760,6 +798,13 @@ static void zan_sdl_ensure_init(void) {
     g_titlebar_h = 32 * g_dpi / 96;
     g_btn_w = 46 * g_dpi / 96;
     g_wake_event = SDL_RegisterEvents(1);
+#if defined(__ANDROID__)
+    /* See zan_event_watch / zan_watch_wait (below): Android's SDL wait
+     * functions spin instead of blocking, so waits go through the
+     * watch-fed zan queue and sleep for real. */
+    SDL_AddEventWatch(zan_event_watch, NULL);
+    zan_watch_installed = 1;
+#endif
     g_sdl_ready = 1;
 }
 
@@ -1023,6 +1068,43 @@ EXPORT i32 zan_gui_set_topmost(iptr hwnd_val, i32 on) {
     return 0;
 }
 
+#if defined(__ANDROID__)
+/* Android's SDL_WaitEvent/WaitEventTimeout spin instead of blocking (their
+ * event queue is pumped from the Java main thread), so a background-thread
+ * app waiting on them burns a full core: the gallery sat at ~100% of one
+ * CPU while idle. Instead, an event watch translates every SDL event into
+ * the zan queue as it arrives (the Java thread posts input/lifecycle
+ * events directly, so watches fire even while the SDL thread sleeps), and
+ * the wait functions below block on the zan queue with real sleeps. */
+static bool SDLCALL zan_event_watch(void *userdata, SDL_Event *e) {
+    (void)userdata;
+    if (!g_sdl_ready) return 1;
+    /* Must translate quit-class events too: sdl_translate is what sets
+     * g_quit. Skip only when the queue is full — they stay in SDL's queue
+     * and a later drain picks them up. */
+    if (zq_count() < ZAN_ZQ_CAP) sdl_translate(e);
+    return 1; /* keep the event in SDL's queue; poll just empties it */
+}
+
+/* Block until an event lands in the zan queue (fed by zan_event_watch).
+ * ms < 0: forever; 0: check once; >0: give up after ms. Returns 0 when
+ * woken, -1 on timeout. Sleeps in <=16ms slices: watch-fed input never
+ * needs sub-frame latency, and 60 light wakeups/s idle is ~0% CPU. */
+static int zan_watch_wait(int ms) {
+    Uint64 deadline = 0;
+    if (ms > 0) deadline = SDL_GetTicks() + (Uint64)ms;
+    for (;;) {
+        if (!zq_empty()) return 0;
+        if (ms == 0) return -1;
+        Uint64 now = SDL_GetTicks();
+        if (ms > 0 && now >= deadline) return -1;
+        Uint64 left = ms > 0 ? deadline - now : (Uint64)0x7FFFFFFF;
+        if (left > 0x7FFFFFFF) left = 0x7FFFFFFF;
+        SDL_Delay((Uint32)(left > 16 ? 16 : left));
+    }
+}
+#endif
+
 /* Drain every SDL event currently available into the zan queue. Motion events
  * coalesce in zq_push, so this collapses a burst of samples to the single
  * latest position and, crucially, never leaves motion piling up in SDL's own
@@ -1032,10 +1114,26 @@ static void sdl_drain(void) {
     while (SDL_PollEvent(&e)) sdl_translate(&e);
 }
 
+/* Android's SDL_WaitEvent/WaitEventTimeout spin instead of blocking (their
+ * event queue was built for the Java main thread, which keeps pumping), so a
+ * background-thread app waiting on them burns a full core: the gallery read
+ * ~100% of one CPU while idle. zan_gui_wait_event* below therefore block on
+ * the watch-fed zan queue (zan_watch_wait) instead of SDL's wait functions:
+ * real idling when nothing happens, still correct when the app polls. */
 EXPORT i32 zan_gui_poll_event(void) {
     memset(g_pending_event, 0, sizeof(g_pending_event));
     if (!g_sdl_ready) return 1;
-    sdl_drain();
+#if defined(__ANDROID__)
+    if (zan_watch_installed) {
+        /* The watch translated everything as it arrived; translating the
+         * polled copy again would enqueue every event twice. */
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {}
+    } else
+#endif
+    {
+        sdl_drain();
+    }
     if (zq_empty()) return (g_quit) ? -1 : 1;
     zq_pop();
     return 0;
@@ -1045,10 +1143,16 @@ EXPORT i32 zan_gui_wait_event(void) {
     memset(g_pending_event, 0, sizeof(g_pending_event));
     if (!g_sdl_ready) return -1;
     if (zq_empty()) {
+#if defined(__ANDROID__)
+        /* SDL_WaitEvent spins a full core on Android: sleep on the
+         * watch-fed queue instead. */
+        if (zan_watch_wait(-1) != 0) return -1;
+#else
         SDL_Event e;
         if (!SDL_WaitEvent(&e)) return -1;
         sdl_translate(&e);
         sdl_drain(); /* fold in anything already waiting behind it */
+#endif
     }
     if (!zq_empty()) zq_pop(); /* else leaves kind 0 (e.g. a wake) */
     return 0;
@@ -1060,12 +1164,18 @@ EXPORT i32 zan_gui_wait_event_timeout(i32 ms) {
     memset(g_pending_event, 0, sizeof(g_pending_event));
     if (!g_sdl_ready) return -1;
     if (zq_empty()) {
+#if defined(__ANDROID__)
+        if (zan_watch_wait(ms) != 0) {
+            return (g_quit) ? -1 : 1;
+        }
+#else
         SDL_Event e;
         if (!SDL_WaitEventTimeout(&e, (Sint32)(ms < 0 ? 0 : ms))) {
             return (g_quit) ? -1 : 1;
         }
         sdl_translate(&e);
         sdl_drain();
+#endif
     }
     if (zq_empty()) return (g_quit) ? -1 : 1;
     zq_pop();
@@ -1113,6 +1223,9 @@ EXPORT i32 zan_gui_event_y(void)       { return g_pending_event[2]; }
 EXPORT i32 zan_gui_event_button(void)  { return g_pending_event[3]; }
 EXPORT i32 zan_gui_event_keycode(void) { return g_pending_event[4]; }
 EXPORT i32 zan_gui_event_mods(void)    { return g_pending_event[5]; }
+/* Synthetic-marker channel (queue slot e[6]): 1 = this release ends a
+ * touch drag, never a click. */
+EXPORT i32 zan_gui_event_flag(void)    { return g_pending_event[6]; }
 
 EXPORT i32 zan_gui_window_width(void)  { return g_window_width; }
 EXPORT i32 zan_gui_window_height(void) { return g_window_height; }
@@ -1195,6 +1308,109 @@ EXPORT i32 zan_gui_present_dirty_add(i32 x, i32 y, i32 w, i32 h) {
     g_dirty[g_dirty_count].w = (int)w;
     g_dirty[g_dirty_count].h = (int)h;
     g_dirty_count++;
+    return 0;
+}
+
+/* ---- Game scene compositing --------------------------------------------
+ *
+ * A Game.* host owns the SDL window and paints the 3D/2D scene with its own
+ * renderer; the Gui HUD layer lives on a normal zan_gui surface. Instead of
+ * two windows, the game hands us its SDL_Window* and per-frame scene pixels:
+ * a streaming texture holds the scene, zan_gui_scene_present composites
+ * scene-below / surface-above in one renderer pass, so widgets get the full
+ * Gui stack (CSS skins, layout, text engine) over the game.
+ *
+ * zan_gui_scene_upload hands over one BGRA frame (the game renders into a
+ * locked staging buffer or reads back its target — Game.Zgm already keeps a
+ * CPU-side frame for its replay/scrub path). Alpha is preserved, so the game
+ * can also under-render the HUD area. */
+typedef struct {
+    SDL_Texture *tex;
+    int tw, th;
+} zan_scene_tex_t;
+static zan_scene_tex_t g_scene;
+
+static void sdl_upload(zan_surface_t *s, SDL_Texture *tex);
+
+EXPORT i32 zan_gui_adopt_sdl_window(iptr hwnd_val) {
+    SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
+    if (!win) return 1;
+    zan_sdl_ensure_init();
+    sdl_reclaim_closed();
+    if (!g_sdl_ready || g_win_count >= ZAN_SDL_MAX_WIN) return 2;
+    if (sdl_find(win)) return 0; /* already ours */
+    SDL_Renderer *ren = SDL_CreateRenderer(win, NULL);
+    if (!ren) return 3;
+    SDL_SetRenderVSync(ren, 0);
+    SDL_SetWindowHitTest(win, zan_sdl_hittest, NULL);
+    zan_sdl_win_t *rec = &g_wins[g_win_count++];
+    rec->win = win; rec->ren = ren; rec->tex = NULL; rec->tw = rec->th = 0;
+    rec->closed = 0;
+    rec->caption_btns = g_caption_btn_count;
+    if (!g_main_win) g_main_win = win;
+    return 0;
+}
+
+EXPORT i32 zan_gui_scene_upload(iptr hwnd_val, const void *bgra, i32 w, i32 h) {
+    (void)hwnd_val;
+    if (!bgra || w <= 0 || h <= 0 || w > 8192 || h > 8192) return 1;
+    SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
+    zan_sdl_win_t *rec = win ? sdl_find(win) : NULL;
+    SDL_Renderer *ren = rec ? rec->ren : (g_main_win ? sdl_find(g_main_win) : NULL)->ren;
+    if (!ren) return 2;
+    if (!g_scene.tex || g_scene.tw != (int)w || g_scene.th != (int)h) {
+        if (g_scene.tex) SDL_DestroyTexture(g_scene.tex);
+        g_scene.tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGBA32,
+                                        SDL_TEXTUREACCESS_STREAMING, w, h);
+        if (!g_scene.tex) { g_scene.tw = g_scene.th = 0; return 3; }
+        SDL_SetTextureBlendMode(g_scene.tex, SDL_BLENDMODE_BLEND);
+        g_scene.tw = (int)w; g_scene.th = (int)h;
+    }
+    SDL_UpdateTexture(g_scene.tex, NULL, bgra, (int)w * 4);
+    return 0;
+}
+
+EXPORT i32 zan_gui_scene_present(iptr hwnd_val, i32 surface_id) {
+    SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
+    zan_sdl_win_t *rec = win ? sdl_find(win) : NULL;
+    if (!rec || !rec->ren) return 1;
+    if (surface_id < 0 || surface_id >= g_surface_count ||
+        !g_surfaces[surface_id]) return 2;
+    zan_surface_t *s = g_surfaces[surface_id];
+    g_last_surface = surface_id;
+
+    if (!rec->tex || rec->tw != s->width || rec->th != s->height) {
+        g_dirty_count = 0;
+        g_dirty_overflow = 1;
+        if (rec->tex) SDL_DestroyTexture(rec->tex);
+        rec->tex = SDL_CreateTexture(rec->ren, SDL_PIXELFORMAT_ARGB8888,
+                                     SDL_TEXTUREACCESS_STREAMING,
+                                     s->width, s->height);
+        if (!rec->tex) return 3;
+        SDL_SetTextureScaleMode(rec->tex, SDL_SCALEMODE_NEAREST);
+        rec->tw = s->width; rec->th = s->height;
+    }
+    sdl_upload(s, rec->tex);
+    g_dirty_count = 0;
+    g_dirty_overflow = 0;
+
+    /* Composite: scene first (stretched to the window — the game owns the
+     * aspect), HUD surface above it 1:1. No background clear: the scene is
+     * the background. */
+    int ww = 0, wh = 0;
+    SDL_GetWindowSizeInPixels(rec->win, &ww, &wh);
+    if (ww <= 0) SDL_GetWindowSize(rec->win, &ww, &wh);
+    if (g_scene.tex) {
+        SDL_FRect sdst = { 0.0f, 0.0f, (float)ww, (float)wh };
+        SDL_RenderTexture(rec->ren, g_scene.tex, NULL, &sdst);
+    } else {
+        SDL_SetRenderDrawColor(rec->ren, (g_bg_color >> 16) & 0xFF,
+                               (g_bg_color >> 8) & 0xFF, g_bg_color & 0xFF, 255);
+        SDL_RenderClear(rec->ren);
+    }
+    SDL_FRect dst = { 0.0f, 0.0f, (float)s->width, (float)s->height };
+    SDL_RenderTexture(rec->ren, rec->tex, NULL, &dst);
+    SDL_RenderPresent(rec->ren);
     return 0;
 }
 
