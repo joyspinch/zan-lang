@@ -6,6 +6,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__ANDROID__)
+#include <malloc.h> /* mallinfo: process-wide malloc attribution in mem_report */
+#endif
 #include <math.h>
 #include <stdio.h>
 
@@ -1450,6 +1453,24 @@ EXPORT void zan_gui_blur_round_cached(
 #define ZAN_SNAP_CACHE_MAX_SLOTS 512
 static zan_blur_cache_t *g_snap_cache;
 static int g_snap_cache_count;
+/* Total pixel bytes the snapshot slots may hold. 0 keeps the desktop
+ * behavior (slot count is the only bound); Android caps it because each
+ * full-screen slot costs ~9MB and the ids are caller-chosen -- growth
+ * beyond the budget fails the snapshot, which callers handle as "repaint
+ * that region normally". */
+#if defined(__ANDROID__)
+#define ZAN_SNAP_CACHE_BYTES (16u * 1024u * 1024u)
+#else
+#define ZAN_SNAP_CACHE_BYTES 0
+#endif
+static size_t zan_snap_total_bytes(void) {
+    size_t total = 0;
+    for (int i = 0; i < g_snap_cache_count; i++) {
+        if (g_snap_cache[i].pixels)
+            total += g_snap_cache[i].cap * sizeof(u32);
+    }
+    return total;
+}
 static void zan_snap_ensure(int slot) {
     if (slot < 0 || slot >= ZAN_SNAP_CACHE_MAX_SLOTS) return;
     if (slot < g_snap_cache_count) return;
@@ -1497,6 +1518,21 @@ static void cpu_snapshot(zan_surface_t *s, int x, int y, int w, int h,
     ZAN_STAT(g_st_snap, (long long)rw * (long long)rh);
     size_t n = (size_t)rw * (size_t)rh;
     if (c->cap < n) {
+#if defined(__ANDROID__)
+        /* A full-screen slot is ~9MB of the phone's PSS bill, and slot ids
+         * are caller-chosen so a scrolling grid could hold hundreds of them
+         * (the array floor is 8 slots). Beyond the budget the snapshot
+         * simply fails: callers already treat an unusable snapshot as
+         * "repaint that region normally", the documented fallback. Slots
+         * already under the budget keep working untouched. */
+        size_t keep = c->pixels ? c->cap * sizeof(u32) : 0;
+        if (ZAN_SNAP_CACHE_BYTES
+            && zan_snap_total_bytes() - keep + n * sizeof(u32)
+               > (size_t)ZAN_SNAP_CACHE_BYTES) {
+            c->valid = 0;
+            return;
+        }
+#endif
         u32 *np = (u32 *)realloc(c->pixels, n * sizeof(u32));
         if (!np) { c->valid = 0; return; }
         c->pixels = np;
@@ -4016,10 +4052,17 @@ EXPORT const char *zan_gui_mem_report(void) {
         sdl_bytes += (size_t)g_scene.tw * (size_t)g_scene.th * sizeof(u32);
 #endif
     char buf[384];
+#ifdef __ANDROID__
+    struct mallinfo mi = mallinfo();
+#endif
 #ifdef ZAN_GUI_SDL
     snprintf(buf, sizeof(buf),
              "atl %.1fM/%d cov %.2fM img %d/%.1fM mimg %.1fM "
-             "surf %.1fM blur %d/%.1fM snap %d/%.1fM tex %.1fM",
+             "surf %.1fM blur %d/%.1fM snap %d/%.1fM tex %.1fM "
+#ifdef __ANDROID__
+             "heap %.1f/%.1fM "
+#endif
+             "up %.1fM%s",
              (double)g_atlas_bytes / 1048576.0, atlas_live,
              (double)g_cov_pool_bytes / 1048576.0,
              img_cnt, (double)img_bytes / 1048576.0,
@@ -4027,7 +4070,17 @@ EXPORT const char *zan_gui_mem_report(void) {
              (double)surf_bytes / 1048576.0,
              blur_cnt, (double)blur_bytes / 1048576.0,
              snap_cnt, (double)snap_bytes / 1048576.0,
-             (double)sdl_bytes / 1048576.0);
+             (double)sdl_bytes / 1048576.0,
+#ifdef __ANDROID__
+             /* bionic mallinfo: the process-wide malloc view. Subtracting
+              * the caches above attributes the rest to the Zan object heap
+             * (ARC collections, strings, parsed data) vs allocator slack
+             * (free). Fields are ints -- fine below 2GB. */
+             (double)mi.uordblks / 1048576.0,
+             (double)mi.fordblks / 1048576.0,
+#endif
+             (double)g_upload_last_bytes / 1048576.0,
+             g_upload_last_full ? " full" : " dirty");
 #else
     snprintf(buf, sizeof(buf),
              "atl %.1fM/%d cov %.2fM img %d/%.1fM mimg %.1fM "

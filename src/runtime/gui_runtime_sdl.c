@@ -1304,6 +1304,11 @@ static void fprof_record(Uint64 t_enter, Uint64 t_upload, Uint64 t_present_end) 
 static SDL_Rect g_dirty[ZAN_DIRTY_MAX];
 static int g_dirty_count;
 static int g_dirty_overflow;
+/* Last upload, for the memory/perf report: bytes pushed into the texture
+ * and whether it was a whole-surface frame (empty dirty list or overflow)
+ * or a damage-rect frame. Read by zan_gui_mem_report's up= field. */
+static size_t g_upload_last_bytes;
+static int g_upload_last_full;
 
 EXPORT i32 zan_gui_present_dirty_add(i32 x, i32 y, i32 w, i32 h) {
     if (w <= 0 || h <= 0) return 0;
@@ -1464,8 +1469,12 @@ EXPORT i32 zan_gui_scene_present(iptr hwnd_val, i32 surface_id) {
 static void sdl_upload(zan_surface_t *s, SDL_Texture *tex) {
     if (g_dirty_count == 0 || g_dirty_overflow) {
         SDL_UpdateTexture(tex, NULL, s->pixels, s->width * 4);
+        g_upload_last_bytes = (size_t)s->width * (size_t)s->height
+                              * sizeof(u32);
+        g_upload_last_full = 1;
         return;
     }
+    size_t uploaded = 0;
     for (int i = 0; i < g_dirty_count; i++) {
         SDL_Rect r = g_dirty[i];
         if (r.x < 0) { r.w += r.x; r.x = 0; }
@@ -1476,7 +1485,10 @@ static void sdl_upload(zan_surface_t *s, SDL_Texture *tex) {
         const unsigned char *px = (const unsigned char *)s->pixels
             + (size_t)r.y * (size_t)s->width * 4 + (size_t)r.x * 4;
         SDL_UpdateTexture(tex, &r, px, s->width * 4);
+        uploaded += (size_t)r.w * (size_t)r.h * sizeof(u32);
     }
+    g_upload_last_bytes = uploaded;
+    g_upload_last_full = 0;
 }
 
 EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
