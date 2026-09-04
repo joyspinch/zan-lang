@@ -43,6 +43,9 @@ zanc src/main.zan src/Controller/*.zan src/Controller/Api/*.zan \
   3 个分类、官方免费扩展、4 条版本频道初始行。
 - 数据库：默认 SQLite；改 `config/app.json` 的 `[database].driver` 即切 MySQL/PostgreSQL。
 - 包签名：`ZAN_MALL_SIGNING_KEY_FILE` 指向 PEM；私钥签发、公钥进 IDE 验签。
+- 包体存放：`wwwroot/packages/*.zpkg`（artifact_url 记 `packages/…`，
+  下载经授权闸后 302 到 `/static/packages/…` 由既有静态挂载服务；
+  静态资源启动时扫描缓存，**先放包再启动/重启**）。
 
 ## API 一览
 
