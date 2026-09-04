@@ -9,6 +9,8 @@ using System;
 using System.IO;
 using SDL3;
 using GameKit;
+using Game.Ui;
+using Gui;
 using Legend;
 
 class Snd {
@@ -88,6 +90,10 @@ class LegendApp {
     public Game g;
     public Snd snd;
     public Rng uiRng;
+    public GameHud hud;         // Gui 控件树 HUD 层（null = 未启用/接管失败）
+    public List<string> hudFilter;  // HUD 聊天行缓冲（ListView.Bind 绑定）
+    public ListView<string> hudList; // HUD 消息列表控件
+    public int hudShotFrames;   // LEGEND_HUDSHOT 调试截图帧计数
 
     public int mouseX;
     public int mouseY;
@@ -486,8 +492,9 @@ class LegendApp {
         this.DrawCharPanel(0, y0, 240, y1 - y0);
         // 中央:幻境主显示
         this.DrawHuanJingMain(240, y0, w - 240 - 240, y1 - y0);
-        // 右聊天:整列贴窗口上下边(与原版一致),其余 UI 全在左侧
-        this.DrawChatPanel(w - 240, 0, 240, h);
+        // 右聊天:整列贴窗口上下边(与原版一致),其余 UI 全在左侧。
+        // HUD 接管后聊天列由 Gui 控件树绘制（hud-chat 皮肤），场景层跳过。
+        if (this.hud == null) { this.DrawChatPanel(w - 240, 0, 240, h); }
     }
 
     public void DrawCharPanel(int x, int y, int w, int h) {
@@ -709,6 +716,106 @@ class LegendApp {
         }
         if (hi <= 0) { return "…"; }
         return s.Substring(0, hi) + "…";
+    }
+
+    // ---------------------------------------------------------------
+    // GameHud（Gui 控件树）聊天列
+    // ---------------------------------------------------------------
+    // 场景层的 DrawChatPanel 在 hud 接管后跳过右侧 240px 列（保留给
+    // Gui 树），聊天 UI 用 stdlib Gui 控件 + gamehud 皮肤重建：
+    // 频道 tab、消息列表（频道过滤/等级配色）、快捷发言按钮。
+    // 数据源不变——仍读写 g.p.chatLog / chatChannel / SayWorld。
+
+    /// 构建 Gui 控件树 HUD：右列聊天面板。每帧 RenderFrame 时
+    /// 控件从 g.p 拉最新数据（保留模式：树只建一次，内容每帧同步）。
+    public Form BuildChatHud() {
+        LegendApp self = this;
+        Form form = Form.Create("hud", 100, 100);
+        Panel col = new Panel();
+        col.Class = "hud-chat";
+        col.Dock(Dock.Right());
+        form.With(col);
+
+        // ---- 标题 ----
+        Label title = new Label("聊天 / 广播");
+        title.Class = "hud-title";
+        title.Dock(Dock.Top());
+        col.With(title);
+
+        // ---- 频道 tab（世界/行会）----
+        Flex tabs = Flex.Row().Gap(6);
+        tabs.Dock(Dock.Top());
+        Button world = new Button("世界");
+        world.Class = self.chatChannel == 0 ? "hud primary" : "hud";
+        world.Click += () => { self.chatChannel = 0; };
+        tabs.With(world);
+        Button guild = new Button("行会");
+        guild.Class = self.chatChannel == 1 ? "hud primary" : "hud";
+        guild.Click += () => { self.chatChannel = 1; };
+        tabs.With(guild);
+        col.With(tabs);
+
+        // ---- 消息列表：直接绑聊天缓冲（ListView 每帧读它）----
+        // 行颜色按前缀（[广播]/[系统]/[掉落]…）由行模板给出 class，
+        // 具体颜色值全部在 gamehud 皮肤里。
+        this.hudFilter = new List<string>();
+        for (int i = 0; i < 64; i = i + 1) { this.hudFilter.Add(""); }
+        ListView<string> logList = new ListView<string>(
+            (string m) => {
+                Label row = new Label(m);
+                row.Class = self.ChatRowClass(m);
+                return row;
+            });
+        logList.Bind(this.hudFilter);
+        logList.Class = "hud-log";
+        logList.Dock(Dock.Fill());
+        col.With(logList);
+        this.hudList = logList;
+
+        // ---- 快捷发言 ----
+        Flex quick = Flex.Row().Gap(6);
+        quick.Dock(Dock.Bottom());
+        string[] quickTexts = new string[3];
+        quickTexts[0] = "666"; quickTexts[1] = "带带我"; quickTexts[2] = "同去!";
+        for (int qi = 0; qi < 3; qi = qi + 1) {
+            string text = quickTexts[qi];
+            Button qb = new Button(text);
+            qb.Class = "hud";
+            qb.Click += () => { self.g.SayWorld(text); };
+            quick.With(qb);
+        }
+        col.With(quick);
+
+        // 每帧把 g.p.chatLog 按频道过滤后同步进绑定的行缓冲。
+        form.FrameHook(() => { self.SyncChatFilter(); });
+        return form;
+    }
+
+    /// 聊天行的皮肤 class（颜色由 gamehud/skin.css 决定）。
+    public string ChatRowClass(string m) {
+        if (m == null) { return "hud-row"; }
+        if (m.IndexOf("[广播]") >= 0) { return "hud-row broadcast"; }
+        if (m.IndexOf("[系统]") >= 0) { return "hud-row system"; }
+        if (m.IndexOf("[掉落]") >= 0 || m.IndexOf("[离线]") >= 0) {
+            return "hud-row loot";
+        }
+        if (m.IndexOf("[我]") >= 0) { return "hud-row mine"; }
+        return "hud-row";
+    }
+
+    /// 按当前频道把聊天日志过滤进 HUD 行缓冲（每帧调用）。
+    public void SyncChatFilter() {
+        if (this.hudList == null || this.hudFilter == null) { return; }
+        int n = 0;
+        for (int i = 0; i < this.g.p.chatCnt && n < this.hudFilter.Count; i = i + 1) {
+            string m = this.g.p.chatLog[i];
+            if (m == null) { continue; }
+            bool isGuild = m.IndexOf("[帮会]") >= 0 || m.IndexOf("[沙巴克]") >= 0;
+            if (this.chatChannel == 1 && !isGuild) { continue; }
+            this.hudFilter[n] = m;
+            n = n + 1;
+        }
+        while (this.hudFilter.Count > n) { this.hudFilter.RemoveAt(this.hudFilter.Count - 1); }
     }
 
     public void DrawChatPanel(int x, int y, int w, int h) {
@@ -2970,6 +3077,18 @@ class LegendApp {
         }
         app.now = Game.NowMs();
         app.lastStepAt = app.now;
+        // Gui 控件树 HUD 层：接管宿主窗口，场景在"下"，Gui 在"上"。
+        // 环境变量 LEGEND_NOHUD=1 退回纯自绘路径（对照用）。
+        if (LegendApp.SysGetenv("LEGEND_NOHUD") != "1") {
+            GameHud hud = GameHud.CreateFor(h.WindowHandle(), h.r.Handle());
+            if (hud.Ready()) {
+                app.hud = hud;
+                app.hud.Root(app.BuildChatHud());
+                h.hudMode = true;   // 宿主 End() 不再自己 Present
+            } else {
+                Console.WriteLine("[hud] takeover failed: " + hud.LastError());
+            }
+        }
         // 主循环(显式事件轮询,参照 miner 模式)
         while (h.Running()) {
             app.now = Game.NowMs();
@@ -3023,6 +3142,16 @@ class LegendApp {
                 h.Begin(8, 10, 16);
                 app.DrawAll();
                 h.End();
+                // HUD 层：场景帧作底，Gui 控件树(聊天列等)画在上面。
+                if (app.hud != null) { app.hud.Frame(app.r, h.WindowHandle()); }
+                // 调试截图：LEGEND_HUDSHOT=1 时抓第 120 帧(含 HUD 合成结果)。
+                if (LegendApp.SysGetenv("LEGEND_HUDSHOT") == "1") {
+                    app.hudShotFrames = app.hudShotFrames + 1;
+                    if (app.hudShotFrames == 20) {
+                        app.r.Present();
+                        LegendApp.DumpBmp(app.r, "build/legend_hud_composite.bmp");
+                    }
+                }
             }
         }
         app.Save();

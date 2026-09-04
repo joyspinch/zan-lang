@@ -1332,6 +1332,9 @@ static zan_scene_tex_t g_scene;
 
 static void sdl_upload(zan_surface_t *s, SDL_Texture *tex);
 
+/* Renderer handed over by the game host (see zan_gui_scene_set_renderer). */
+static SDL_Renderer *g_game_renderer = NULL;
+
 EXPORT i32 zan_gui_adopt_sdl_window(iptr hwnd_val) {
     SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
     if (!win) return 1;
@@ -1339,15 +1342,54 @@ EXPORT i32 zan_gui_adopt_sdl_window(iptr hwnd_val) {
     sdl_reclaim_closed();
     if (!g_sdl_ready || g_win_count >= ZAN_SDL_MAX_WIN) return 2;
     if (sdl_find(win)) return 0; /* already ours */
+    if (g_game_renderer) {
+        /* Reuse the renderer the game host handed over — a second SDL
+         * renderer on the same window fails on most backends (D3D11 allows
+         * exactly one swapchain per window). */
+        zan_sdl_win_t *rec = &g_wins[g_win_count++];
+        rec->win = win; rec->ren = g_game_renderer; rec->tex = NULL;
+        rec->tw = rec->th = 0; rec->closed = 0;
+        rec->caption_btns = g_caption_btn_count;
+        if (!g_main_win) g_main_win = win;
+        return 0;
+    }
+    /* No renderer handed over yet: create our own (pure-GUI windows). */
     SDL_Renderer *ren = SDL_CreateRenderer(win, NULL);
     if (!ren) return 3;
     SDL_SetRenderVSync(ren, 0);
     SDL_SetWindowHitTest(win, zan_sdl_hittest, NULL);
-    zan_sdl_win_t *rec = &g_wins[g_win_count++];
-    rec->win = win; rec->ren = ren; rec->tex = NULL; rec->tw = rec->th = 0;
-    rec->closed = 0;
-    rec->caption_btns = g_caption_btn_count;
+    zan_sdl_win_t *rec2 = &g_wins[g_win_count++];
+    rec2->win = win; rec2->ren = ren; rec2->tex = NULL;
+    rec2->tw = rec2->th = 0; rec2->closed = 0;
+    rec2->caption_btns = g_caption_btn_count;
     if (!g_main_win) g_main_win = win;
+    return 0;
+}
+
+EXPORT i32 zan_gui_scene_set_renderer(iptr hwnd_val, iptr renderer_val) {
+    SDL_Window *win = (SDL_Window *)(intptr_t)hwnd_val;
+    if (!win) return 1;
+    SDL_Renderer *ren = (SDL_Renderer *)(intptr_t)renderer_val;
+    if (!ren) return 2;
+    zan_sdl_ensure_init();
+    sdl_reclaim_closed();
+    if (!g_sdl_ready || g_win_count >= ZAN_SDL_MAX_WIN) return 3;
+    zan_sdl_win_t *rec = sdl_find(win);
+    if (rec) {
+        if (rec->ren != ren) {
+            /* Renderer changed under us: drop our streaming textures. */
+            if (rec->tex) SDL_DestroyTexture(rec->tex);
+            rec->tex = NULL; rec->tw = rec->th = 0;
+            rec->ren = ren;
+        }
+    } else {
+        rec = &g_wins[g_win_count++];
+        rec->win = win; rec->ren = ren; rec->tex = NULL;
+        rec->tw = rec->th = 0; rec->closed = 0;
+        rec->caption_btns = g_caption_btn_count;
+        if (!g_main_win) g_main_win = win;
+    }
+    g_game_renderer = ren;
     return 0;
 }
 

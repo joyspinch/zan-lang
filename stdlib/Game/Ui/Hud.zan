@@ -39,7 +39,6 @@ namespace Game.Ui;
 /// 场景尺寸变化由 <see cref="Frame"/> 自动跟随。
 /// </summary>
 class GameHud {
-    GameHost host;
     App app;
     Form root;
     int sceneW;
@@ -57,38 +56,69 @@ class GameHud {
     }
 
     /// 接管宿主窗口并创建 HUD 应用（设计尺寸=宿主窗口客户区）。
-    /// 失败时返回 null，<see cref="LastError"/> 带原因。
-    static GameHud Create(GameHost gameHost) {
+    /// `sdlWindowHandle` 是宿主自建的 SDL 窗口句柄——接受任意宿主
+    /// （GameKit Host、GameHost、游戏自管窗口）。`sdlRendererHandle`
+    /// 是宿主渲染器句柄（复用它做合成；同窗口建第二个渲染器在
+    /// D3D11 上会失败）。失败时返回的实例 Ready() 为 false，
+    /// <see cref="LastError"/> 带原因。
+    static GameHud CreateFor(nint sdlWindowHandle, nint sdlRendererHandle) {
         GameHud hud = new GameHud();
-        if (gameHost == null || !gameHost.Running()) {
-            hud.lastError = "host not running";
+        if (sdlWindowHandle == 0) {
+            hud.lastError = "window handle is 0";
             return hud;
         }
-        SdlWindow win = gameHost.Window();
-        if (win == null || !win.IsValid()) {
-            hud.lastError = "host window invalid";
-            return hud;
+        // 先交渲染器（adopt 时若已有渲染器则复用它，不再新建）。
+        if (sdlRendererHandle != 0) {
+            Window.SceneSetRenderer(sdlWindowHandle, sdlRendererHandle);
         }
-        int rc = Window.AdoptSdlWindow(win.Handle());
+        int rc = Window.AdoptSdlWindow(sdlWindowHandle);
         if (rc != 0) {
             hud.lastError = "adopt failed rc=" + Convert.ToString(rc)
                 + " (SDL-backend zan_gui required)";
             return hud;
         }
         hud.adopted = true;
-        // 逻辑尺寸取窗口像素尺寸（游戏 HUD 直接按像素布局，
-        // GameHost 的 Letterbox 逻辑坐标只属于场景层）。
-        hud.sceneW = win.Width();
-        hud.sceneH = win.Height();
-        // App 自建 surface 作为 HUD 画布；窗口不用它的自建窗口，
-        // 呈现走 ScenePresent。
-        hud.app = new App("hud", hud.sceneW, hud.sceneH);
+        // HUD 画布逻辑尺寸取当前客户区像素（随窗口缩放逐帧跟随）。
+        hud.sceneW = NativeWindowSizeW(sdlWindowHandle);
+        hud.sceneH = NativeWindowSizeH(sdlWindowHandle);
+        hud.app = new App("hud", hud.sceneW > 0 ? hud.sceneW : 320,
+                          hud.sceneH > 0 ? hud.sceneH : 240);
         hud.app.SetDark(true);
         hud.app.EnableSkins(0);
-        // 游戏皮肤族：半透明黑面板 + 金描边，styles 全落在
-        // skins/gamehud/skin.css（皮肤即数据，游戏不写颜色）。
         hud.app.ApplySkinName("gamehud");
         return hud;
+    }
+
+    [DllImport("zan_gui")]
+    static extern int zan_gui_window_width();
+    [DllImport("zan_gui")]
+    static extern int zan_gui_window_height();
+
+    // SDL 后端维护主窗口尺寸缓存（创建/resize 时更新），足够做画布初值。
+    static int NativeWindowSizeW(nint hwnd) {
+        return zan_gui_window_width();
+    }
+    static int NativeWindowSizeH(nint hwnd) {
+        return zan_gui_window_height();
+    }
+
+    /// 当前主窗口客户区像素宽（逐帧从后端取，窗口缩放自动跟随）。
+    static int WindowPixelW() { return zan_gui_window_width(); }
+    /// 当前主窗口客户区像素高。
+    static int WindowPixelH() { return zan_gui_window_height(); }
+
+    /// 接管宿主窗口并创建 HUD 应用（Game.Foundation.Sdl.GameHost 重载）。
+    static GameHud Create(GameHost gameHost) {
+        if (gameHost == null) { return CreateFor(0, 0); }
+        return CreateFor(gameHost.Window().Handle(),
+                         gameHost.Renderer().Handle());
+    }
+
+    /// 接管 Game.Kit.Host 自建的 SDL 窗口（原 GameKit 游戏的便捷重载）：
+    /// 窗口/渲染器句柄都取自宿主。失败时 Ready() 为 false。
+    static GameHud Create(Kit.Host host) {
+        if (host == null) { return CreateFor(0, 0); }
+        return CreateFor(host.WindowHandle(), host.r.Handle());
     }
 
     /// 接管失败原因（成功时为空串）。
@@ -110,30 +140,23 @@ class GameHud {
     }
 
     /// 读取场景帧到 rgbaOut（w*h*4 字节）。游戏 Render 之后调用。
-    bool ReadScene(string rgbaOut, int w, int h) {
-        SdlRenderer r = this.host.Renderer();
-        if (r == null) { return false; }
-        return r.ReadPixels(rgbaOut, w, h);
+    /// `renderer` 由宿主传入自己的 SdlRenderer（读后备缓冲）。
+    bool ReadScene(SdlRenderer renderer, string rgbaOut, int w, int h) {
+        if (renderer == null) { return false; }
+        return renderer.ReadPixels(rgbaOut, w, h);
     }
 
     /// 一帧 HUD：上传场景帧、重绘控件树、合成呈现。
-    /// 场景帧来自 renderer 后备缓冲（游戏 Render 之后、Present 之前）。
-    /// 游戏也可以不经 Root()，直接拿 GetApp() 自己驱动 BeginFrame/
-    /// PresentFrame（与 Form.Run 相同的顺序）。
-    bool Frame() {
+    /// `renderer` 是宿主渲染器（场景画完后、Present 前调用本方法；
+    /// 宿主置 hudMode 让自己的 Present 跳过）。
+    bool Frame(SdlRenderer renderer, nint sdlWindowHandle) {
         if (!this.Ready()) { return false; }
-        SdlWindow win = this.host.Window();
-        int w = win.Width();
-        int h = win.Height();
+        int w = WindowPixelW();
+        int h = WindowPixelH();
         if (w <= 0 || h <= 0) { return false; }
-        // 场景尺寸变化（用户拉窗口）时跟随。
-        if (w != this.sceneW || h != this.sceneH) {
-            this.sceneW = w;
-            this.sceneH = h;
-        }
         string scene = new string('\0', w * h * 4);
-        if (!this.ReadScene(scene, w, h)) { return false; }
-        Window.SceneUpload(win.Handle(), scene, w, h);
+        if (!this.ReadScene(renderer, scene, w, h)) { return false; }
+        Window.SceneUpload(sdlWindowHandle, scene, w, h);
         App app = this.app;
         app.ProcessEvent();
         app.BeginFrame();
@@ -143,7 +166,7 @@ class GameHud {
             root.RenderFrame(app);
         }
         app.PresentFrame();
-        Window.ScenePresent(win.Handle(), app.canvas.SurfaceId());
+        Window.ScenePresent(sdlWindowHandle, app.canvas.SurfaceId());
         return true;
     }
 }
