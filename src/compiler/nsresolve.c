@@ -983,6 +983,8 @@ void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
     for (int i = 0; i < n; i++)
         if (!items[i].decl->from_stdlib) user_roots++;
     if (user_roots == 0) return;
+    /* Escape hatch for A/B timing and for bisecting a bad prune: */
+    if (getenv("ZAN_NO_PRUNE")) return;
     unsigned char *kept = (unsigned char *)calloc((size_t)n, 1);
     if (!kept) return;
     for (int i = 0; i < n; i++) {
