@@ -39,7 +39,7 @@ Write-Output "[1/2] Compiling legend_hud.exe ..."
     examples/game/legend/main.zan examples/game/legend/Game.zan examples/game/legend/Data.zan `
     --auto-stdlib `
     --embed examples/game/legend/assets=examples/game/legend/assets `
-    --embed examples/game/common/assets=examples/game/common/assets `
+    --embed stdlib/Game/Kit/assets=assets/common `
     --libpath build `
     --link-lib zan_gui_sdl_static `
     --libpath "$sdlLibDir" `
