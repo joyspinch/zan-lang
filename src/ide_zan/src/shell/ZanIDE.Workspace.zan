@@ -254,13 +254,19 @@ partial class ZanIDE {
     /// Maps the multi-select platform flags to a comma-separated id list
     /// (e.g. "windows-x64,linux-arm64"); defaults to windows-x64 if none chosen.
     /// Order matches the wizard's column-major chip layout; the trailing
-    /// android ids belong to the opt-in Android column.
-    static string PlatformCsv(List<WizardTarget> targets) {
+    /// android and ohos ids belong to the opt-in Android/HarmonyOS columns.
+    static List<string> PlatformCsvIds() {
         List<string> ids = new List<string>{
             "windows-x64", "windows-arm64",
             "linux-x64", "linux-arm64",
             "macos-x64", "macos-arm64",
-            "android-arm64", "android-x64" };
+            "android-x64", "android-arm64",
+            "ohos-x64", "ohos-arm64" };
+        return ids;
+    }
+
+    static string PlatformCsv(List<WizardTarget> targets) {
+        List<string> ids = ZanIDE.PlatformCsvIds();
         string outp = "";
         for (int i = 0; i < targets.Count; i = i + 1) {
             if (i < ids.Count && targets[i].selected == 1) {
@@ -1329,6 +1335,10 @@ partial class ZanIDE {
         // Android GUI: one signed SDLActivity APK per ABI (zanc --emit-apk;
         // packaging assets + apksigner ship beside zanc, no Android SDK).
         ids.Add("android-x64"); ids.Add("android-arm64");
+        // HarmonyOS GUI: one HAP per ABI (zanc --emit-hap; same bundled-
+        // toolchain path as Android, the DevEco SDK is only auto-detected
+        // for on-device deploy/signing, never required to build).
+        ids.Add("ohos-x64"); ids.Add("ohos-arm64");
         return ids;
     }
 
@@ -1359,7 +1369,58 @@ partial class ZanIDE {
         if (id == "linux-arm64") { return "Linux   ARM64  (musl static)"; }
         if (id == "android-x64") { return "Android   x64  (signed APK)"; }
         if (id == "android-arm64") { return "Android   ARM64  (signed APK)"; }
+        if (id == "ohos-x64") { return "HarmonyOS   x64  (HAP, emulator)"; }
+        if (id == "ohos-arm64") { return "HarmonyOS   ARM64  (HAP)"; }
         return id;
+    }
+
+    /// Whether the zanc this IDE runs supports --emit-hap (probed from its
+    /// --help output each call; only reached when a HarmonyOS target is
+    /// selected, so the cost is one process spawn per publish click).
+    /// Older toolchains predate HarmonyOS packaging, and an OHOS target on
+    /// one of them must skip with a hint instead of dying on an unknown
+    /// option mid-publish.
+    static bool ZancHasEmitHap(string zc) {
+        List<string> outp = Process.RunCapture("\"" + zc + "\" --help");
+        for (int i = 0; i < outp.Count; i = i + 1) {
+            if (ZanIDE.Has(outp[i], "--emit-hap")) { return true; }
+        }
+        return false;
+    }
+
+    /// OHOS build-environment preflight for a HarmonyOS publish step. zanc's
+    /// OHOS compile/link is self-contained (bundled sysroot + staged GUI
+    /// driver, same as the Android APK path), so nothing here is REQUIRED to
+    /// build. The DevEco SDK matters for what comes after: hdc install to a
+    /// device/emulator and signing. Auto-detect it -- ZAN_OHOS_SDK /
+    /// ZAN_DEVECO_HOME overrides first, then the standard Windows install
+    /// location -- and export DEVECO_SDK_HOME into the step's environment
+    /// when found; when missing, log the exact hint instead of failing (a
+    /// GUI installer with a license prompt is not something to silently
+    /// download). Returns the command-line prefix that sets the environment
+    /// for one step ("set ... && " on Windows, "VAR='...' " on sh).
+    static string OhosEnvPrefix(List<string> log) {
+        string sdk = ProcessHost.Env("ZAN_OHOS_SDK");
+        string deveco = ProcessHost.Env("ZAN_DEVECO_HOME");
+        if (sdk == "" && deveco != "" && Directory.Exists(deveco + "/sdk")) {
+            sdk = deveco + "/sdk";
+        }
+        if (sdk == "") {
+            string pf = "C:/Program Files/Huawei/DevEco Studio/sdk";
+            if (Directory.Exists(pf)) { sdk = pf; }
+        }
+        if (sdk != "") {
+            log.Add("> OHOS SDK: " + sdk);
+            #if WINDOWS
+            return "set \"DEVECO_SDK_HOME=" + ZanIDE.ToWinPath(sdk) + "\" && ";
+            #else
+            return "DEVECO_SDK_HOME='" + sdk + "' ";
+            #endif
+        }
+        log.Add(ZanIDE.T(
+            "> OHOS SDK not found: install DevEco Studio (or set ZAN_OHOS_SDK to its sdk directory) for hdc install/signing. Building and packaging still work from zanc's bundled toolchain.",
+            "> 未找到 OHOS SDK：安装 DevEco Studio（或设置 ZAN_OHOS_SDK 指向其 sdk 目录）以启用 hdc 安装/签名。编译打包用 zanc 自带工具链即可，不受影响。"));
+        return "";
     }
 
     /// Reads persisted platform selection (parallel to PublishTargetIds) from
@@ -1901,6 +1962,27 @@ partial class ZanIDE {
                         + " --target " + id + " --emit-apk \"" + apk + "\"" + emb);
                     exes.Add(apk);
                     log.Add("> Publishing " + id + " APK ...");
+                } else if (id == "ohos-x64" || id == "ohos-arm64") {
+                    // One HAP per ABI, mirroring the Android APK path: zanc
+                    // --emit-hap compiles, links libmain.so and packages the
+                    // HAP shell with its own bundled OHOS toolchain. The
+                    // DevEco SDK is auto-detected and exported for what comes
+                    // after the build (hdc install/signing); its absence is
+                    // logged as a hint, never a hard failure, and a zanc
+                    // too old for --emit-hap skips with a hint instead of
+                    // dying on an unknown option.
+                    string hap = outDir + "/" + baseName + ".hap";
+                    if (!ZanIDE.ZancHasEmitHap(zc)) {
+                        log.Add(ZanIDE.T(
+                            "> HarmonyOS publish skipped: this zanc has no --emit-hap yet; update the toolchain.",
+                            "> 已跳过鸿蒙发布：当前 zanc 尚不支持 --emit-hap，请更新工具链。"));
+                    } else {
+                        steps.Add(ZanIDE.OhosEnvPrefix(log) + zc + pubFlag + " "
+                            + inputs + " --target " + id + " --emit-hap \""
+                            + hap + "\"" + emb);
+                        exes.Add(hap);
+                        log.Add("> Publishing " + id + " HAP ...");
+                    }
                 }
             }
         }
