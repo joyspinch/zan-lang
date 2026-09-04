@@ -1,0 +1,177 @@
+using System;
+using System.Collections;
+using System.Data;
+using System.IO;
+using System.IO.Compression;
+using System.Web;
+using ZanWeb.Model.Oa;
+
+namespace ZanWeb;
+
+/* 备份公共层（T16，架构定案 #75）：全站唯一备份入口——控制器只调本类，
+   不直接摆弄 VACUUM INTO / 打包 / 轮转。
+   一致性：`VACUUM INTO 'path'` 单条 SQL（stdlib SqliteConnection Execute
+   走 sqlite3_exec，无需新增 DllImport），WAL 模式下产出执行时刻完整
+   一致快照，不阻塞业务写。目标路径一律正斜杠相对路径
+   （data/backups/{ts}/app.db）——Windows 反斜杠进 SQL 字符串字面量会
+   成为转义序列（\2 等），本层绝不经手反斜杠；路径由服务端时间戳与
+   固定名拼出，无任何用户参数参与（任何用户参数禁拼 SQL 纪律）。
+   顺序纪律固定：先 VACUUM 后打包（窗口方向「多不少」=先于快照的
+   附件必在库中，后于快照的附件多打进去是孤儿不丢数据，可接受）。
+   范围：主库（Cfg.Db.sqlitePath，ZAN_DB_SQLITE_PATH 可覆盖，禁硬编码）
+   + data/uploads/ 全树；metrics.db 不备份（可再生）。
+   并发互斥：File.TryLock 锁 data/backups/.lock——内核句柄语义，进程
+   死亡自动释放、无陈旧标记；调用方（Backups.Create）持有，本层不管。
+   目录：{yyyy}{MM}{dd}-{HH}{mm}{ss}（本地时区）内 app.db + uploads.zip
+   （保留 t{n}/{yyyyMM}/ 原结构）+ manifest.txt。保留 N=7，按目录名字
+   典序删最旧（字典序即时间序），形态不符条目不动。 */
+class Backup {
+    /* 保留份数（#75 定案 N=7）。 */
+    static int Keep = 7;
+
+    /* 备份根目录（相对 CWD=发布目录；锁文件 .lock 也在此，轮转不触碰）。 */
+    static string Root = "data/backups";
+
+    /* 目录名/下载名形态：15 位 [0-9]{8}-[0-9]{6}。Zan 无正则字面量，
+       字符按数值码比对（FormSchema.CodeOk / Attachment.BaseName 同款）。
+       这是下载参数的白名单闸：形态不符一律拒绝，../ 与分隔符无从进入。 */
+    static bool NameOk(string s) {
+        if (s == null || s.Length != 15) { return false; }
+        for (int i = 0; i < 15; i = i + 1) {
+            int c = s[i] & 255;
+            if (i == 8) {
+                if (c != 45) { return false; }   /* '-' */
+                continue;
+            }
+            if (c < 48 || c > 57) { return false; }
+        }
+        return true;
+    }
+
+    /* 备份目录名：本地时区 {yyyy}{MM}{dd}-{HH}{mm}{ss}。 */
+    static string StampName(long now) {
+        DateTime d = DateTime.FromUnixSeconds(now
+            + (long)Fmt.OffsetMinutes() * 60);
+        return Convert.ToString(d.Year()) + Fmt.Pad2(d.Month())
+            + Fmt.Pad2(d.Day()) + "-" + Fmt.Pad2(d.Hour())
+            + Fmt.Pad2(d.Minute()) + Fmt.Pad2(d.Second());
+    }
+
+    /* 目录名 → 可读时间（形态已过 NameOk 才可调用）。 */
+    static string NameText(string name) {
+        return name.Substring(0, 4) + "-" + name.Substring(4, 2) + "-"
+            + name.Substring(6, 2) + " " + name.Substring(9, 2) + ":"
+            + name.Substring(11, 2) + ":" + name.Substring(13, 2);
+    }
+
+    /* 执行一次备份，返回目录名。db 为调用方持有的请求租约（VACUUM INTO
+       在其上执行）；attachCount/attachBytes 为附件统计（manifest 用），
+       全库口径由调用方查询（运维面无租户语义，豁免声明见控制器类头）。 */
+    static async string Create(IDbConnection db, int attachCount,
+                               long attachBytes) {
+        long now = WebApp.NowSeconds();
+        string name = Backup.StampName(now);
+        string dir = Backup.Root + "/" + name;
+        Directory.CreateDirectoryRecursive(dir);
+        int _n = await db.ExecuteAsync("VACUUM INTO '" + dir + "/app.db'");
+        Backup.ZipUploads(dir + "/uploads.zip");
+        long dbSize = File.GetSize(Cfg.Db.sqlitePath);
+        string manifest = "createdAt=" + Convert.ToString(now) + "\n"
+            + "app=" + Cfg.Server.name + "\n"
+            + "driver=" + Cfg.Db.driver + "\n"
+            + "dbPath=" + Cfg.Db.sqlitePath + "\n"
+            + "dbSize=" + Convert.ToString(dbSize) + "\n"
+            + "attachments=" + Convert.ToString(attachCount) + "\n"
+            + "attachBytes=" + Convert.ToString(attachBytes) + "\n";
+        File.WriteAllText(dir + "/manifest.txt", manifest);
+        Backup.Rotate();
+        return name;
+    }
+
+    /* uploads 树打包（保留 t{n}/{yyyyMM}/ 原结构）。附件本体多为已压缩
+       形态（图片/PDF），stored 直存省 CPU；单文件 ReadAllBytes 内存峰值
+       受 uploadBodyMB 上限约束（默认 20MB）。uploads 不存在（尚无附件）
+       时产出空归档，保持产物形态恒定。 */
+    static void ZipUploads(string zipPath) {
+        ZipWriter w = ZipWriter.Open(zipPath);
+        List<string> tenants = Directory.GetDirectories("data/uploads");
+        for (int i = 0; i < tenants.Count; i = i + 1) {
+            string t = tenants[i];
+            List<string> months = Directory.GetDirectories("data/uploads/"
+                + t);
+            for (int j = 0; j < months.Count; j = j + 1) {
+                string m = months[j];
+                List<string> files = Directory.GetFiles("data/uploads/"
+                    + t + "/" + m);
+                for (int k = 0; k < files.Count; k = k + 1) {
+                    byte[] data = File.ReadAllBytes("data/uploads/" + t
+                        + "/" + m + "/" + files[k]);
+                    w.AddEntry(t + "/" + m + "/" + files[k], data, 0);
+                }
+            }
+        }
+        w.Close();
+    }
+
+    /* 保留 N=7：白名单形态条目按字典序（=时间序）升序排，多出从最旧删。
+       GetDirectories 不保证顺序且会混入形态不符条目（如人工放置的
+       目录），只动白名单内的。 */
+    static void Rotate() {
+        List<string> valid = Backup.ValidNames();
+        for (int i = 0; i + Backup.Keep < valid.Count; i = i + 1) {
+            Directory.DeleteRecursive(Backup.Root + "/" + valid[i]);
+        }
+    }
+
+    /* 白名单形态的备份目录名，字典序降序（新→旧）。 */
+    static List<string> ListNames() {
+        List<string> valid = Backup.ValidNames();
+        for (int i = 1; i < valid.Count; i = i + 1) {
+            string v = valid[i];
+            int j = i - 1;
+            while (j >= 0 && String.CompareOrdinal(valid[j], v) < 0) {
+                valid[j + 1] = valid[j];
+                j = j - 1;
+            }
+            valid[j + 1] = v;
+        }
+        return valid;
+    }
+
+    /* 白名单形态过滤（原序）。 */
+    static List<string> ValidNames() {
+        List<string> dirs = Directory.GetDirectories(Backup.Root);
+        List<string> valid = new List<string>();
+        for (int i = 0; i < dirs.Count; i = i + 1) {
+            if (Backup.NameOk(dirs[i])) { valid.Add(dirs[i]); }
+        }
+        return valid;
+    }
+
+    /* 备份目录整体打包供下载：外层 zip 条目 = app.db + uploads.zip +
+       manifest.txt，全局 level 0（stored）——uploads.zip 已是归档、
+       app.db WAL 整理后页熵低，二次压缩白耗 CPU。内存峰值 ≈ 两文件
+       之和（私有化单机库量级一期可接受；库体增长后换 ZipWriter 临时
+       文件流式，落点在本方法）。条目缺失（如空站无 uploads.zip 之外
+       的异常态）跳过不打断下载。 */
+    static byte[] ZipOf(string dir, string name) {
+        List<ZipEntry> entries = new List<ZipEntry>();
+        Backup.AddFile(entries, dir + "/app.db", name + "/app.db");
+        Backup.AddFile(entries, dir + "/uploads.zip", name + "/uploads.zip");
+        Backup.AddFile(entries, dir + "/manifest.txt", name + "/manifest.txt");
+        return Zip.Create(entries, 0);
+    }
+
+    static void AddFile(List<ZipEntry> entries, string path, string inner) {
+        if (!File.Exists(path)) { return; }
+        ZipEntry e = new ZipEntry(inner);
+        e.data = File.ReadAllBytes(path);
+        entries.Add(e);
+    }
+
+    /* 文件大小可读文本（缺失显示破折号）。 */
+    static string SizeText(string path) {
+        if (!File.Exists(path)) { return "—"; }
+        return Fmt.Bytes(File.GetSize(path));
+    }
+}

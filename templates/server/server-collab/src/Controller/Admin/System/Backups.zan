@@ -1,0 +1,131 @@
+using System;
+using System.Collections;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb.Model.Oa;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.Admin.System;
+
+/* 备份恢复（T16，架构定案 #75）：运维面——列表 / 立即备份 / 下载。
+   【tenantId 豁免声明】本控制器有意不挂租户过滤：备份是全库运维动作
+   （库文件本身含全部租户），租户语义不适用——非 Bug#3 式遗漏，审计
+   勿报；manifest 附件统计同为全库口径，同此豁免。
+   【权限面】控制器 Grant + 屏 Perm 之外，每 action 首行 isSuper 硬闸
+   （RBAC 之外的第二道边：授权误配不放大运维能力；Attachment.CanDownload
+   同款先例）。菜单可见性走 RBAC——不为本屏做角色授权时仅 bootstrap
+   超管可见；admin 内置角色若被自动/手动授权将见菜单但撞 403，有意。
+   【driver 分叉】仅 sqlite 开放；mysql 页面显式「不支持内置备份」
+   （指向 mysqldump 文档路径），Create 同样显式 400——降级不静默。
+   【下载注入面（本单唯一新面，双落）】name 参数先过形态白名单
+   [0-9]{8}-[0-9]{6}（无分隔符/../可能），再断言组合路径前缀——
+   双保险防 Root 将来改可配置后引入穿越。
+   立即备份用 data-post+data-confirm（零 JS、零新片段动作），与
+   「data-dialog 确认→submit→reload」语义等价（#76 提交说明已报备）。 */
+[Route("admin/system/backup/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("备份恢复")]
+class Backups : AdminController {
+    [HttpGet]
+    [Route("/admin/system/backup")]
+    [Custom(IsMenu = true, Icon = "mdi:database-export", Perm = PermBit.View)]
+    [Description("备份恢复")]
+    async void Index() {
+        User me = await this.Admin();
+        ViewData d = await this.Layout("备份恢复");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+        if (me.isSuper != 1) {
+            this.Fail(403, "0403", "仅超级管理员可访问备份恢复");
+            return;
+        }
+        if (Cfg.Db.driver != "sqlite") {
+            d.Set("noSqlite", "1");
+            d.Set("driver", Cfg.Db.driver);
+            this.Page(d);
+            return;
+        }
+        List<string> names = Backup.ListNames();
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < names.Count; i = i + 1) {
+            string name = names[i];
+            string dir = Backup.Root + "/" + name;
+            StrMap m = new StrMap();
+            m.Set("name", name);
+            m.Set("createdAt", Backup.NameText(name));
+            m.Set("dbSize", Backup.SizeText(dir + "/app.db"));
+            m.Set("zipSize", Backup.SizeText(dir + "/uploads.zip"));
+            items.Add(m);
+        }
+        d.Set("empty", names.Count == 0 ? "1" : "");
+        this.Page(d);
+    }
+
+    /* 立即备份：TryLock 跨进程互斥（多 worker 同点/双目录并发）→
+       全库附件统计 → Backup.Create（先 VACUUM 后打包，顺序纪律见
+       Backup.zan）→ finally 解锁。同步执行；打包超 30s 再评估
+       Task.Spawn 异步 + manifest 出现即完成标记（#75 留口）。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Create)]
+    [Description("立即备份")]
+    async void Create() {
+        User me = await this.Admin();
+        if (me.isSuper != 1) {
+            this.Fail(403, "0403", "仅超级管理员可执行备份");
+            return;
+        }
+        if (Cfg.Db.driver != "sqlite") {
+            this.Fail(400, "0004", "内置备份仅支持 sqlite（当前 driver="
+                + Cfg.Db.driver + "），请使用数据库原生备份，见 README「备份与恢复」");
+            return;
+        }
+        Directory.CreateDirectoryRecursive(Backup.Root);
+        long lockH = File.TryLock(Backup.Root + "/.lock");
+        if (lockH == 0) {
+            this.Fail(409, "0409", "备份执行中，请稍候");
+            return;
+        }
+        try {
+            List<OaAttachment> atts = await this.OaAttachment.ToListAsync();
+            long bytes = 0;
+            for (int i = 0; i < atts.Count; i = i + 1) {
+                bytes = bytes + atts[i].size;
+            }
+            string name = await Backup.Create(this.Held(), atts.Count, bytes);
+            await this.Note("立即备份", name, true, "");
+            this.Saved("备份完成：" + name);
+        } finally {
+            File.Unlock(lockH);
+        }
+    }
+
+    /* 下载：白名单双闸 → 目录存在性 → 整目录打包（ZipOf）→ 字节应答
+       （ctx.Binary 二进制唯一正确通道，ExcelIo/Attachment 同款）。 */
+    [HttpGet]
+    [Custom(Perm = PermBit.View)]
+    [Description("下载备份")]
+    async void Download() {
+        User me = await this.Admin();
+        if (me.isSuper != 1) {
+            this.Fail(403, "0403", "仅超级管理员可下载备份");
+            return;
+        }
+        string name = this.In("name");
+        if (!Backup.NameOk(name)) {
+            this.Fail(400, "0004", "备份名不合法");
+            return;
+        }
+        string dir = Backup.Root + "/" + name;
+        if (!dir.StartsWith(Backup.Root + "/")) {
+            this.Fail(400, "0004", "备份名不合法");
+            return;
+        }
+        if (!Directory.ExistsOnDisk(dir)) {
+            this.Fail(404, "0404", "备份不存在");
+            return;
+        }
+        byte[] data = Backup.ZipOf(dir, name);
+        this.Ctx().SetHeader("Content-Disposition",
+            "attachment; filename=\"backup-" + name + ".zip\"");
+        this.Ctx().Binary("application/zip", data, data.Length);
+    }
+}
