@@ -1,4 +1,4 @@
-# AI_README — 怎么让 AI 用这个 SDK
+﻿# AI_README — 怎么让 AI 用这个 SDK
 
 > 这份是给**人和团队**看的总说明（中文）。AI 客户端自己读的是英文的
 > `AGENTS.md` / `llms.txt` / skills——本文解释它们各自是什么、怎么接、怎么用。
