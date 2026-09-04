@@ -93,3 +93,36 @@ for %%P in (android-x64:x86_64 android-arm64:aarch64) do (
     echo built toolchain\%%A
   )
 )
+
+rem OpenHarmony (OHOS): the NDK layout matches Android's (toolchains\llvm\
+rem prebuilt\windows-x86_64\{bin,sysroot}) but the target triples end in
+rem -linux-ohos and the sysroot libc is musl, so the same clang invocation
+rem works with -target <arch>-linux-ohos (no API level). OHOS musl libc.a
+rem exposes pthread/epoll; it lacks shm_open -- the __OHOS__ shim inside
+rem rt_sync.c (shared with Android) backs shared tables with files under
+rem $ZAN_SHM_DIR (default /data/local/tmp). Set OHOS_NDK to the NDK root
+rem (the directory containing native\). The sysroot subset itself
+rem (crt1.o crti.o crtn.o libc.a from sysroot\usr\lib\<triple>\,
+rem clang_rt.crtbegin.o clang_rt.crtend.o libclang_rt.builtins.a from
+rem llvm\lib\clang\<ver>\lib\<triple>\, libunwind.a from
+rem llvm\lib\<triple>\) is copied into toolchain\ohos-<arch>\; libm.a and
+rem libdl.a in the OHOS sysroot are empty 8-byte archives (math/dl symbols
+rem live in libc.a), so they are not committed.
+if "%OHOS_NDK%"=="" set OHOS_NDK=%ZAN_OHOS_SDK%
+if not exist "%OHOS_NDK%\native\llvm\bin\clang.exe" (
+  echo OHOS NDK not found: set OHOS_NDK to the OHOS SDK directory containing native
+  exit /b 1
+)
+set OHOSBIN=%OHOS_NDK%\native\llvm\bin
+set OHOSSYS=%OHOS_NDK%\native\sysroot
+for %%P in (ohos-x64:x86_64-unknown-linux-ohos ohos-arm64:aarch64-unknown-linux-ohos) do (
+  for /f "tokens=1,2 delims=:" %%A in ("%%P") do (
+    if not exist toolchain\%%A mkdir toolchain\%%A
+    "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -DZAN_IO_STACKLESS_ONLY -fPIC -I %RT% -O2 -c %RT%\rt_io.c    -o toolchain\%%A\zanrt_io.o    || exit /b 1
+    "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_sync.c  -o toolchain\%%A\zanrt_sync.o  || exit /b 1
+    "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_file.c  -o toolchain\%%A\zanrt_file.o  || exit /b 1
+    "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\%%A\zanrt_timer.o || exit /b 1
+    "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -I src\common -O2 -c %RT%\zan_embed_api.c -o toolchain\%%A\zan_embed_api.o || exit /b 1
+    echo built toolchain\%%A
+  )
+)

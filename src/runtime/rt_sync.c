@@ -48,10 +48,11 @@
 #include <features.h>
 #endif
 
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || (defined(__OHOS__) && !defined(ZAN_SYNC_NO_SHM_SHIM))
 /* bionic does not implement shm_open/shm_unlink (_POSIX_SHARED_MEMORY_OBJECTS
- * is __BIONIC_POSIX_FEATURE_MISSING). Back the calls with regular files in a
- * writable directory -- ZAN_SHM_DIR if set, else /data/local/tmp, where adb-run
+ * is __BIONIC_POSIX_FEATURE_MISSING); OHOS's musl libc.a also lacks shm_open
+ * (only libc.so carries it). Back the calls with regular files in a
+ * writable directory -- ZAN_SHM_DIR if set, else /data/local/tmp, where adb/hdc-run
  * CLI programs live; an app embedding the runtime sets ZAN_SHM_DIR to its own
  * files dir at startup. The anonymous-table path (shm_open + immediate
  * shm_unlink) keeps its fd-open mapping semantics; the name is just a path. */

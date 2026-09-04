@@ -17,7 +17,7 @@ This file is the source of truth for target support. Keep it in sync with:
 
 ## 1. Target table (`--list-targets`)
 
-Twelve targets are currently declared in `crosscomp.c` (`s_targets[]`):
+Fourteen targets are currently declared in `crosscomp.c` (`s_targets[]`):
 
 | Name          | Triple                          | Notes                    |
 |---------------|---------------------------------|--------------------------|
@@ -33,10 +33,13 @@ Twelve targets are currently declared in `crosscomp.c` (`s_targets[]`):
 | `riscv64`     | `riscv64-unknown-linux-musl`    | RISC-V 64-bit Linux (alias of `linux-riscv64`) |
 | `android-x64` | `x86_64-linux-android28`        | Android x86-64 (bionic; static CLI, GUI APK) |
 | `android-arm64` | `aarch64-linux-android28`     | Android ARM64 (bionic; static CLI, GUI APK) |
+| `ohos-x64`    | `x86_64-unknown-linux-ohos`     | OpenHarmony x86-64 (musl, static) |
+| `ohos-arm64`  | `aarch64-unknown-linux-ohos`    | OpenHarmony ARM64 (musl, static) |
 
 Being listed here means the triple parses and platform macros
-(`WINDOWS`/`LINUX`/`MACOS`/`ANDROID`) plus arch macros (`ARM64`/`X86_64`) are defined for the
-target. All twelve now also have a working link path — see §2 for the per-target
+(`WINDOWS`/`LINUX`/`MACOS`/`ANDROID`/`OHOS` — OHOS also implies `LINUX`+`MUSL`)
+plus arch macros (`ARM64`/`X86_64`) are defined for the
+target. All fourteen now also have a working link path — see §2 for the per-target
 runtime restrictions that apply when cross-compiling.
 
 ---
@@ -249,8 +252,20 @@ Difficulty is for **CLI/compute** first; GUI is a separate, larger effort on eac
   `RecvAsync` waiting forever (destructor `SSL_shutdown` interplay); real
   device + real egress HTTPS is still unverified (emulator has no network).
 
-### HarmonyOS / OHOS — medium
+### HarmonyOS / OpenHarmony — done for CLI (see below), GUI future
 - OHOS native uses a musl-based NDK; for CLI/services this is close to Android.
+- **`ohos-x64` / `ohos-arm64` are implemented** (`-linux-ohos` triples, static
+  `ld.lld` link against a bundled NDK sysroot subset in
+  `toolchain/ohos-<arch>/`, built per the recipe in
+  `scripts/build_cross_rt.cmd` with `OHOS_NDK` set). Deployment mirrors adb:
+  `hdc file send <exe> /data/local/tmp/` + `chmod 755` + run — verified
+  end-to-end on an OpenHarmony x86-64 QEMU VM (try/catch, file IO,
+  collections, monotonic timer). OHOS musl libc.a exposes pthread/epoll but
+  has no `shm_open`; the `__OHOS__` shim in rt_sync.c (shared with Android)
+  backs shared tables with files under `$ZAN_SHM_DIR`. OHOS also implies the
+  `LINUX`/`MUSL` platform macros plus `OHOS` for source-level guards. The
+  sysroot's `libm.a`/`libdl.a` are empty stubs (math/dl live in libc.a), so
+  they are not committed.
 - GUI would need an ArkUI/native back end.
 
 ### iOS (`arm64-apple-ios`) — medium-hard
@@ -311,8 +326,8 @@ that would fail:
 
 ## 6. Recommended order
 
-1. ~~Android / OHOS CLI (Linux-like reactor, per-NDK sysroot)~~ — Android CLI
-   is done (see §4); OHOS remains.
+1. ~~Android / OHOS CLI (Linux-like reactor, per-NDK sysroot)~~ — both done
+   (see §4): Android CLI/GUI-APK and OHOS CLI (`ohos-x64`/`ohos-arm64`).
 2. `wasm32` WASI networking/threads model.
 3. iOS, then bare-metal.
 

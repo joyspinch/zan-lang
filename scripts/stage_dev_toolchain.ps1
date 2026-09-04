@@ -98,9 +98,10 @@ if (Stage-File (Join-Path $Build "ld.exe") "ld.exe") {
     $missing += "ld.exe"
 }
 
-# cross sysroots (--target linux-* / win-arm64 / macos ... ), each optional
+# cross sysroots (--target linux-* / win-arm64 / macos / ohos ... ), each optional
 foreach ($sub in @("linux-musl", "linux-arm64", "linux-riscv64", "win-x64",
-                   "win-arm64", "wasm32", "riscv64", "macos")) {
+                   "win-arm64", "wasm32", "riscv64", "macos",
+                   "ohos-x64", "ohos-arm64")) {
     Stage-Dir (Join-Path $Build $sub) $sub | Out-Null
 }
 

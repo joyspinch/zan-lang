@@ -146,6 +146,10 @@ struct zan_ast_node {
     zan_istr_t ns_name;         /* enclosing namespace, dotted ("A.B") */
     zan_istr_t orig_name;       /* pre-mangling simple name, if renamed */
     zan_ast_list_t *ns_usings;  /* the file's `using` decls; NULL if none */
+    /* Set for declarations parsed from auto-included stdlib files (main.c).
+     * The reachability prune (nsresolve.c) treats these as droppable when
+     * nothing the program itself declares can reach them. */
+    unsigned char from_stdlib;
 
     /* On an AST_IDENTIFIER naming a generic type in expression position
      * (`Box<int>.Create(x)`): the `Box<int>` type reference. The identifier

@@ -87,6 +87,36 @@ ARTIFACTS = [
     ("toolchain/android-arm64/crtbegin_static.o", ANDROID_NDK, "manual"),
     ("toolchain/android-arm64/crtend_android.o", ANDROID_NDK, "manual"),
     ("toolchain/android-arm64/libclang_rt.builtins.a", ANDROID_NDK, "manual"),
+    # OpenHarmony (OHOS) runtime objects: built with the OHOS NDK's clang per
+    # the recipe in build_cross_rt.cmd (target *-linux-ohos, musl sysroot).
+    ("toolchain/ohos-x64/zanrt_io.o", RT_IO, "manual"),
+    ("toolchain/ohos-x64/zanrt_sync.o", RT_SYNC, "manual"),
+    ("toolchain/ohos-x64/zanrt_file.o", RT_FILE, "manual"),
+    ("toolchain/ohos-x64/zanrt_timer.o", RT_TIMER, "manual"),
+    ("toolchain/ohos-arm64/zanrt_io.o", RT_IO, "manual"),
+    ("toolchain/ohos-arm64/zanrt_sync.o", RT_SYNC, "manual"),
+    ("toolchain/ohos-arm64/zanrt_file.o", RT_FILE, "manual"),
+    ("toolchain/ohos-arm64/zanrt_timer.o", RT_TIMER, "manual"),
+    # The OHOS NDK sysroot subset (crt + libc.a + compiler-rt builtins/unwind)
+    # tracks the NDK itself, not repo sources -- report-only, refreshed by
+    # hand. libm.a/libdl.a are empty archives in the OHOS sysroot and are not
+    # committed.
+    ("toolchain/ohos-x64/libc.a", ANDROID_NDK, "manual"),
+    ("toolchain/ohos-x64/crt1.o", ANDROID_NDK, "manual"),
+    ("toolchain/ohos-x64/crti.o", ANDROID_NDK, "manual"),
+    ("toolchain/ohos-x64/crtn.o", ANDROID_NDK, "manual"),
+    ("toolchain/ohos-x64/clang_rt.crtbegin.o", ANDROID_NDK, "manual"),
+    ("toolchain/ohos-x64/clang_rt.crtend.o", ANDROID_NDK, "manual"),
+    ("toolchain/ohos-x64/libclang_rt.builtins.a", ANDROID_NDK, "manual"),
+    ("toolchain/ohos-x64/libunwind.a", ANDROID_NDK, "manual"),
+    ("toolchain/ohos-arm64/libc.a", ANDROID_NDK, "manual"),
+    ("toolchain/ohos-arm64/crt1.o", ANDROID_NDK, "manual"),
+    ("toolchain/ohos-arm64/crti.o", ANDROID_NDK, "manual"),
+    ("toolchain/ohos-arm64/crtn.o", ANDROID_NDK, "manual"),
+    ("toolchain/ohos-arm64/clang_rt.crtbegin.o", ANDROID_NDK, "manual"),
+    ("toolchain/ohos-arm64/clang_rt.crtend.o", ANDROID_NDK, "manual"),
+    ("toolchain/ohos-arm64/libclang_rt.builtins.a", ANDROID_NDK, "manual"),
+    ("toolchain/ohos-arm64/libunwind.a", ANDROID_NDK, "manual"),
     ("stdlib/Gui/drivers/win-x64/zan_gui.dll", GUI, "gui"),
     ("stdlib/Gui/drivers/linux-x64/static/libzan_gui.a", GUI, "gui"),
     ("stdlib/Gui/drivers/linux-arm64/static/libzan_gui.a", GUI, "gui"),

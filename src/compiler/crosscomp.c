@@ -22,6 +22,8 @@ static const zan_target_info_t s_targets[] = {
     { "riscv64",       "riscv64-unknown-linux-musl", "RISC-V 64-bit Linux (alias of linux-riscv64)" },
     { "android-x64",   "x86_64-linux-android28",     "Android x86-64 (bionic, API 28+)" },
     { "android-arm64", "aarch64-linux-android28",    "Android ARM64 (bionic, API 28+)" },
+    { "ohos-x64",      "x86_64-unknown-linux-ohos",  "OpenHarmony x86-64 (musl static)" },
+    { "ohos-arm64",    "aarch64-unknown-linux-ohos", "OpenHarmony ARM64 (musl static)" },
 };
 
 #define NUM_TARGETS (int)(sizeof(s_targets) / sizeof(s_targets[0]))
@@ -44,6 +46,7 @@ static zan_arch_t parse_arch(const char *s) {
 static zan_os_t parse_os(const char *s) {
     if (strstr(s, "windows") || strstr(s, "win32")) return ZAN_OS_WINDOWS;
     if (strstr(s, "android")) return ZAN_OS_ANDROID;
+    if (strstr(s, "ohos")) return ZAN_OS_OHOS;
     if (strstr(s, "linux")) return ZAN_OS_LINUX;
     if (strstr(s, "macos") || strstr(s, "darwin") || strstr(s, "apple")) return ZAN_OS_MACOS;
     if (strstr(s, "wasi")) return ZAN_OS_WASI;

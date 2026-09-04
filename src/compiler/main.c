@@ -1388,6 +1388,8 @@ static const char *zan_driver_subdir(const zan_target_t *t) {
         return (t->arch == ZAN_ARCH_AARCH64) ? "macos-arm64" : "macos-x64";
     if (t->os == ZAN_OS_ANDROID)
         return (t->arch == ZAN_ARCH_AARCH64) ? "android-arm64" : "android-x64";
+    if (t->os == ZAN_OS_OHOS)
+        return (t->arch == ZAN_ARCH_AARCH64) ? "ohos-arm64" : "ohos-x64";
     return (t->arch == ZAN_ARCH_AARCH64) ? "win-arm64" : "win-x64";
 }
 
@@ -1471,6 +1473,23 @@ static const char *zan_path_basename(const char *p) {
     for (const char *q = p; *q; q++)
         if (*q == '/' || *q == '\\') b = q + 1;
     return b;
+}
+
+/* Case-insensitive path prefix test (Windows-normalized separators): is
+ * `path` inside `root` or the root itself? Used to tell auto-included
+ * stdlib files from the program's own sources. */
+static int zan_path_is_under(const char *path, const char *root) {
+    if (!path || !root || !root[0]) return 0;
+    size_t rl = strlen(root);
+    while (rl > 0 && (root[rl - 1] == '/' || root[rl - 1] == '\\')) rl--;
+#ifdef _WIN32
+    if (_strnicmp(path, root, (size_t)rl) != 0) return 0;
+#else
+    if (strncmp(path, root, rl) != 0) return 0;
+#endif
+    char nc = path[rl];
+    if (nc == '\0') return 1;               /* the root itself */
+    return nc == '/' || nc == '\\';
 }
 
 /* WASI cross-builds: auto-stdlib compiles whole namespace directories, so the
@@ -2231,6 +2250,14 @@ int main(int argc, char **argv) {
             zan_lexer_define(&lex, "LINUX", "1");
             zan_lexer_define(&lex, "ANDROID", "1");
             break;
+        case ZAN_OS_OHOS:
+            /* OpenHarmony is musl-flavored like the linux-musl path, but OHOS
+             * marks it: no GUI driver yet and an hdc-based deployment flow,
+             * so programs can guard the differences with OHOS. */
+            zan_lexer_define(&lex, "LINUX", "1");
+            zan_lexer_define(&lex, "MUSL", "1");
+            zan_lexer_define(&lex, "OHOS", "1");
+            break;
         case ZAN_OS_MACOS:
             zan_lexer_define(&lex, "MACOS", "1");
             zan_lexer_define(&lex, "APPLE", "1");
@@ -2271,6 +2298,20 @@ int main(int argc, char **argv) {
 
         zan_ast_node_t *unit = zan_parser_parse(&parser);
         zan_nsresolve_stamp(unit, arena);
+        /* Mark stdlib-authored declarations so the reachability prune can
+         * drop the ones nothing references (see nsresolve.c). A file counts
+         * as stdlib when it was auto-included from the stdlib root, not
+         * passed on the command line -- except the entry source itself
+         * (fi == 0): a project may live inside the stdlib root (the
+         * self-hosted ZanGen generator compiles ZanGen.zan from
+         * stdlib/System/Compiler), and its Main would be pruned as
+         * unreachable, losing the executable's entry point. */
+        if (fi > 0 && auto_stdlib && resolved_stdlib_root[0] && input_files[fi] &&
+            zan_path_is_under(input_files[fi], resolved_stdlib_root)) {
+            for (int k = 0; k < unit->comp_unit.decls.count; k++)
+                if (unit->comp_unit.decls.items[k])
+                    unit->comp_unit.decls.items[k]->from_stdlib = 1;
+        }
 
         if (!ast) {
             ast = unit;
@@ -2297,6 +2338,13 @@ int main(int argc, char **argv) {
         zan_parser_desugar_events(ast, arena, diag);
         zan_compile_trace("nsresolve");
         zan_nsresolve_run(ast, arena, diag);
+        /* Drop stdlib declarations nothing references. A `using Gui.Widget;`
+         * globs 79 files into the parse even for one button; every phase
+         * after this one would otherwise chew through definitions that can
+         * never be called. Runs after nsresolve (references carry final,
+         * possibly mangled, names) and before the generators (their output
+         * only ever references types the program actually uses). */
+        zan_nsresolve_prune(ast, arena, diag);
 
         /* --gen-meta: dump the compilation-unit metadata the Zan-scripted
          * code generators consume (see genmeta.h) and exit. Must run before
@@ -2564,7 +2612,8 @@ int main(int argc, char **argv) {
          * still links, with the stubbed calls failing at runtime instead. */
         char cross_archives[ZAN_MAX_USED_DRIVERS][1200];
         int cross_archive_count = 0;
-        if (cross_compiling && target.os == ZAN_OS_LINUX) {
+        if (cross_compiling && (target.os == ZAN_OS_LINUX
+                                || target.os == ZAN_OS_OHOS)) {
             zan_driver_registry_t cross_reg;
             zan_discover_drivers(resolved_stdlib_root, &cross_reg);
             const char *dsub = zan_driver_subdir(&target);
@@ -3060,6 +3109,76 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* ---- Project assets inside the executable (publish) -------------
+         * A program's own data folder (<project>/assets/, the gallery's
+         * gallery.json, an app's config/lang packs) resolves at run time
+         * through File.Exists/ReadAllText against the cwd-relative project
+         * path first and the embedded copy second. On a developer machine the
+         * disk copy is there; a published binary carries none of the source
+         * tree, so the same reads silently return "" / missing and whole
+         * feature areas vanish (the gui_gallery catalog rendered empty). When
+         * --publish is building a program (not a library) that actually calls
+         * the embed API and an assets/ folder sits beside the entry source,
+         * bake it in under its discovery name "assets/<file>" so the reads
+         * keep working with nothing beside the executable. Disk wins at
+         * every read (File.Exists tries the disk first), so a replacement
+         * assets/ folder on the target still overrides the baked-in copy, and
+         * an explicit --embed assets spec (the IDE publish stages one)
+         * makes this auto-embed skip. --emit-apk sets emit_lib for the
+         * shared libmain.so but is still a program: its assets must bake
+         * in exactly the same way or the packaged app loses them. */
+        if (publish_mode && irgen.uses_embed_api &&
+            resolved_stdlib_root[0]) {
+            /* The discovery anchor is the entry source's own directory (a
+             * multi-project tree has no zan.proj to name the root), with the
+             * resolved project root as a second candidate so both
+             * "zanc dir/prog.zan" and "zanc prog.zan" inside a manifest
+             * project find their assets/. */
+            char assets_dir[1400];
+            snprintf(assets_dir, sizeof(assets_dir), "%s", input_file);
+            char *asep = strrchr(assets_dir, '/');
+            char *aback = strrchr(assets_dir, '\\');
+            if (!asep || (aback && aback > asep)) asep = aback;
+            char assets_cands[2][1200];
+            int assets_cand_count = 0;
+            if (asep) {
+                *asep = 0;
+                snprintf(assets_cands[assets_cand_count], 1200, "%s/assets",
+                         assets_dir);
+                assets_cand_count++;
+            }
+            if (strcmp(package_project_root, ".") != 0) {
+                snprintf(assets_cands[assets_cand_count], 1200, "%s/assets",
+                         package_project_root);
+                assets_cand_count++;
+            }
+            bool assets_staged = false;
+            for (int es = 0; es < embed_spec_count && !assets_staged; es++) {
+                const char *seq = strrchr(embed_specs[es], '=');
+                if (seq && strcmp(seq + 1, "assets") == 0) assets_staged = true;
+            }
+            for (int ac = 0; ac < assets_cand_count && !assets_staged; ac++) {
+                const char *adir = assets_cands[ac];
+                if (!zan_file_exists(adir)) { continue; }
+                assets_staged = true;
+                char *assets_spec = (char *)malloc(strlen(adir) + 32);
+                if (assets_spec) {
+                    /* resource names "assets/<file>" match the reader's
+                     * File.EmbedExists("assets/<file>") lookups */
+                    snprintf(assets_spec, strlen(adir) + 32, "%s=assets", adir);
+                    if (embed_spec_count < 64) {
+                        embed_specs[embed_spec_count++] = assets_spec;
+                    } else {
+                        fprintf(stderr, "warning: cannot auto-embed the "
+                                "project assets from '%s'; --embed resources "
+                                "limit reached\n", adir);
+                        assets_staged = false;
+                        free(assets_spec);
+                    }
+                }
+            }
+        }
+
         /* --embed: the project files that ship inside the executable rather
          * than beside it. Baked into this module (not a separately compiled
          * object) so it works for every target with no external C compiler.
@@ -3241,6 +3360,9 @@ int main(int argc, char **argv) {
             } else if (target.os == ZAN_OS_ANDROID) {
                 tsub = (target.arch == ZAN_ARCH_AARCH64) ? "android-arm64"
                                                          : "android-x64";
+            } else if (target.os == ZAN_OS_OHOS) {
+                tsub = (target.arch == ZAN_ARCH_AARCH64) ? "ohos-arm64"
+                                                         : "ohos-x64";
             } else if (target.os == ZAN_OS_WINDOWS) {
                 tsub = (target.arch == ZAN_ARCH_AARCH64) ? "win-arm64" : "win-x64";
             } else if (target.os == ZAN_OS_MACOS) {
@@ -3267,7 +3389,7 @@ int main(int argc, char **argv) {
             }
         }
         if (cross_compiling && rt_sync_obj && target.os != ZAN_OS_LINUX
-            && target.os != ZAN_OS_ANDROID
+            && target.os != ZAN_OS_ANDROID && target.os != ZAN_OS_OHOS
             && target.os != ZAN_OS_MACOS && target.os != ZAN_OS_WINDOWS) {
             /* For WASI the declaration-level `uses_sync_runtime` flag is too
              * coarse: auto-stdlib compiles whole namespace directories, and
@@ -4162,6 +4284,94 @@ int main(int argc, char **argv) {
             { size_t cur = strlen(cmd);
               snprintf(cmd + cur, sizeof(cmd) - cur,
                        " --end-group \"%s/crtn.o\"", sys); }
+            link_ret = system(cmd);
+        } else if (cross_compiling && target.os == ZAN_OS_OHOS) {
+            /* Cross-link an OpenHarmony executable with ld.lld against a
+             * bundled subset of the OHOS NDK sysroot at ohos-<arch>/
+             * (crt1/crti/crtn.o + libc.a + compiler-rt builtins/unwind).
+             * OHOS native userland is musl-based, so the link
+             * shape matches the linux-musl path above: static, no .so
+             * dependencies, "hdc push /data/local/tmp + run". Runtime
+             * objects are the target-ABI copies from the same toolchain
+             * dir (scripts/build_cross_rt.cmd, OHOS NDK clang). */
+            char exe_dir[1024] = {0};
+            zan_exe_dir(exe_dir, sizeof(exe_dir));
+            const char *osub = (target.arch == ZAN_ARCH_AARCH64)
+                               ? "ohos-arm64" : "ohos-x64";
+            char sys[1200];
+            snprintf(sys, sizeof(sys), "%s/%s", exe_dir, osub);
+            char probe[1300];
+            snprintf(probe, sizeof(probe), "%s/libc.a", sys);
+            if (!zan_file_exists(probe)) {
+                fprintf(stderr,
+                        "error: bundled %s OHOS sysroot subset not found at "
+                        "'%s'; reinstall zan or rebuild with toolchain/%s "
+                        "present\n", osub, sys, osub);
+                remove(obj_tmp);
+                zan_irgen_destroy(&irgen);
+                zan_arena_free(arena);
+                free(source);
+                return 1;
+            }
+            char cmd[8192];
+            snprintf(cmd, sizeof(cmd),
+                     "ld.lld -static%s -o \"%s\" \"%s/crt1.o\" \"%s/crti.o\""
+                     " \"%s/clang_rt.crtbegin.o\" \"%s\"",
+                     publish_mode ? " -s" : "", obj_path, sys, sys, sys, obj_tmp);
+            for (int di = 0; di < zan_lib_ndirs; di++) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
+                         zan_lib_dirs[di]);
+            }
+            for (int di = 0; di < extra_lib_path_count; di++) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " -L\"%s\"",
+                         extra_lib_paths[di]);
+            }
+            if (rt_timer_obj) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", rt_timer_obj);
+            }
+            if (irgen.uses_socket_async) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zanrt_io.o\"", sys);
+            }
+            if (irgen.uses_sync_runtime) {
+                /* OHOS musl libc.a exposes pthread/epoll; the OHOS NDK sysroot
+                 * lacks shm_open (libc.so only), so rt_sync.c's __OHOS__ shim
+                 * backs shared tables with files under $ZAN_SHM_DIR
+                 * (default /data/local/tmp), like the Android path. */
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zanrt_sync.o\"", sys);
+            }
+            if (irgen.uses_file_runtime) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zanrt_file.o\"", sys);
+            }
+            if (irgen.uses_embed_api) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur,
+                         " \"%s/zan_embed_api.o\"", sys);
+            }
+            { size_t cur = strlen(cmd);
+              snprintf(cmd + cur, sizeof(cmd) - cur,
+                       " --start-group \"%s/libc.a\" \"%s/libunwind.a\""
+                       " \"%s/libclang_rt.builtins.a\"", sys, sys, sys); }
+            for (int d = 0; d < cross_archive_count; d++) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", cross_archives[d]);
+            }
+            for (int li = 0; li < static_driver_lib_count; li++) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " %s",
+                         static_driver_libs[li]);
+            }
+            { size_t cur = strlen(cmd);
+              snprintf(cmd + cur, sizeof(cmd) - cur,
+                       " --end-group \"%s/clang_rt.crtend.o\" \"%s/crtn.o\"",
+                       sys, sys); }
+            if (getenv("ZAN_VERBOSE_LINK"))
+                fprintf(stderr, "[link] %s\n", cmd);
             link_ret = system(cmd);
         } else if (cross_compiling && target.os == ZAN_OS_ANDROID) {
             /* Cross-link an Android bionic executable from the committed

@@ -19,4 +19,19 @@ void zan_nsresolve_stamp(zan_ast_node_t *unit, zan_arena_t *arena);
  * Non-conflicting single-namespace code is left untouched. */
 void zan_nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena, zan_diag_t *diag);
 
+/* Reachability prune.  Runs right after zan_nsresolve_run on the merged unit.
+ * Drops stdlib-authored top-level declarations (from_stdlib stamped by main.c)
+ * that nothing reachable references: `using Gui.Widget;` globs in 79 widget
+ * files even when the program instantiates one button, and every phase after
+ * the parse (resolve/bind/check/irgen -- the dominant cost of a stdlib-heavy
+ * build) then processes definitions that can never be called.  The closure
+ * walks the same node kinds nsresolve walks (type refs, static receivers,
+ * bases, attributes, generic arguments), so the declaration set the binder
+ * consumes only loses definitions it could never resolve to.  User-authored
+ * declarations are always kept: the program is the root set, which also keeps
+ * compiler magic that reflects over the entry file (ORM bindings, generated
+ * __JsonBind classes, genrun rewrites) working unchanged. */
+void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
+                         zan_diag_t *diag);
+
 #endif /* ZAN_NSRESOLVE_H */

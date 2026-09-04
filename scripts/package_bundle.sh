@@ -27,7 +27,7 @@ for exe in zanc zan-lsp zan-dap zanfmt zandoc; do
 done
 
 # cross sysroot + runtime objects that travel next to zanc
-for sys in linux-musl linux-arm64 win-x64 win-arm64 wasm32 riscv64 macos; do
+for sys in linux-musl linux-arm64 win-x64 win-arm64 wasm32 riscv64 macos ohos-x64 ohos-arm64; do
     [ -d "build/$sys" ] && cp -r "build/$sys" "$stage/toolchain/"
 done
 for o in build/zanrt_*.o build/zanrt_*.obj; do
