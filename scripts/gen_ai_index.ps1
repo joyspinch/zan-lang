@@ -43,6 +43,9 @@ $lines.Add("")
 # ---- start here -------------------------------------------------------------
 $lines.Add("## Start")
 $lines.Add("- [README.txt](README.txt): what this folder is, how to run the IDE")
+if (Test-Staged 'README.CN.txt') {
+    $lines.Add("- [README.CN.txt](README.CN.txt): Chinese version of README.txt")
+}
 if (Test-Staged 'AI_README.md') {
     $lines.Add("- [AI_README.md](AI_README.md): how AI uses this SDK (in Chinese) -- setup, MCP tool catalog, skills, knowledge base")
 }
