@@ -3889,7 +3889,7 @@ class App {
         DrainPosts();
         this.PerfMark("sh.posts");
 
-        int kind = window.EventKind();
+        int kind = this.NormalizedKind();
         // 按下/释放/按键触发的那一帧必须整帧重绘（见 inputNeedsFrame）。
         // 滚轮（13）同列：滚轮的消费发生在渲染期（CaptureWheel 仲裁），
         // 且连续滚动时上一帧遗留的损伤条带只盖住上一帧的位移量，本帧
@@ -4056,10 +4056,24 @@ class App {
                 // 对照上一帧仍然完整的
                 // 命中区域（含弹层，最上层优先）解析点击目标，
                 // 在 BeginFrame 清除它们之前完成，使本帧恰好一个控件看到 Ui.Clicked。
-                clickTargetId = hitId;
-                NoteRelease(mouseX, mouseY);
-                NoteClickTarget(clickTargetId);
-                focus.ClearPress();
+                // 触摸拖拽的收尾释放不是点击（EventFlag==1，驱动在
+                // 手势松手时打的标记）：点击目标不发布（保持 -1），
+                // 所有只认 ClickTarget 的表面——Ribbon/Wizard 命令、
+                // Layer 遮罩与关闭钮、表头排序、标题栏按钮、Dock 标签
+                // ——在拖拽松手时统一失活；Ui.Clicked/ClickAvailable
+                // 另有各自的同款防线。释放本身照常完成拖拽收尾
+                // （MouseReleased 语义、ClearPress），滚动条/滑块/
+                // 窗口拖动不受影响。
+                if (window.EventFlag() == 1) {
+                    clickTargetId = -1;
+                    NoteRelease(mouseX, mouseY);
+                    focus.ClearPress();
+                } else {
+                    clickTargetId = hitId;
+                    NoteRelease(mouseX, mouseY);
+                    NoteClickTarget(clickTargetId);
+                    focus.ClearPress();
+                }
             }
             this.NoteRedrawWhy("click");
             needsRedraw = true;
@@ -4172,7 +4186,7 @@ class App {
     /// 若本窗口收到关闭事件则返回 false。
     bool ApplyEvent(nint evHwnd) {
         bool mine = evHwnd == window.GetHandle();
-        int kind = window.EventKind();
+        int kind = this.NormalizedKind();
         // 按下/释放/按键触发的那一帧必须整帧重绘（见 inputNeedsFrame）。
         // 滚轮（13）同列：滚轮的消费发生在渲染期（CaptureWheel 仲裁），
         // 且连续滚动时上一帧遗留的损伤条带只盖住上一帧的位移量，本帧
@@ -4320,11 +4334,19 @@ class App {
                 clickTargetId = -1;
                 hitTester.ClearAnchor(1);
             } else {
-                clickTargetId = hitId;
+                // 与 ProcessEvent 的点击发布同语义（见彼处注释）：
+                // 触摸拖拽收尾释放不发布点击目标，只完成拖拽收尾。
                 pointerDown = false;
-                NoteRelease(mouseX, mouseY);
-                NoteClickTarget(clickTargetId);
-                focus.ClearPress();
+                if (window.EventFlag() == 1) {
+                    clickTargetId = -1;
+                    NoteRelease(mouseX, mouseY);
+                    focus.ClearPress();
+                } else {
+                    clickTargetId = hitId;
+                    NoteRelease(mouseX, mouseY);
+                    NoteClickTarget(clickTargetId);
+                    focus.ClearPress();
+                }
             }
             this.NoteRedrawWhy("click");
             needsRedraw = true;
@@ -5329,6 +5351,23 @@ class App {
         return id;
     }
 
+    /// 事件分发前的规范化（本类三处读取点共用）：
+    /// 按压被控件持有（pressedId>=0）时到来的滚轮重标为移动。
+    /// 触屏拖动手势的每个采样都以滚轮形式到达（驱动只把不足
+    /// 一格的余量合成移动事件），而滚轮在按住时本就不滚动
+    /// （见 ProcessEvent/ApplyEvent 的 wheel-pressed 分支）——
+    /// 它携带的唯一有效信息就是指针新位置。不重标的话，
+    /// Layer 窗口拖动/缩放、文本选区延伸等一切以“kind==1
+    /// 且按住”驱动的事件期拖拽在触屏上收不到任何移动采样
+    /// （按住拖动、控件纹丝不动，手势被下层当成了滚动）。
+    /// 桌面真滚轮按住时重标为移动是安全的：滚轮不改变指针
+    /// 位置，拖拽按同一坐标重算，等于无操作。
+    int NormalizedKind() {
+        int k = window.EventKind();
+        if (k == 13 && focus.pressedId >= 0) { return 1; }
+        return k;
+    }
+
     /// 正在处理的 OS 事件类型；当事件属于
     /// 其他窗口时为 0（"无事件"）。原生事件状态是
     /// 进程全局的：直接读取 window.EventKind() 的表面也会看到
@@ -5337,7 +5376,7 @@ class App {
     /// 都必须询问其 App，而非共享的原生状态。
     int EventKind() {
         if (Window.EventHwnd() != window.GetHandle()) { return 0; }
-        return window.EventKind();
+        return this.NormalizedKind();
     }
 
     /// 当正在处理的事件投递到了本 App 的窗口时为真。

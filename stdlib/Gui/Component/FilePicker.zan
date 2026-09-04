@@ -804,25 +804,49 @@ class FilePicker {
         int pad = t.paddingLarge;
         int top = app.ContentTop() + pad;
 
+        // 窄视口（手机 ~412 逻辑宽）：工具行放不下
+        // [上一级][路径][转到][新建文件夹] 一整排——路径输入只剩
+        // ~90dp。“新建文件夹”折到第二行，路径行还给导航。
+        bool narrow = (W - pad * 2) < app.Scale(560);
+
         int upW = app.Scale(72);
         int goW = app.Scale(64);
         int newW = app.Scale(132);
         int pathX = pad + upW + t.gapSmall;
         int pathW = W - pad - pad - upW - goW - newW
             - t.gapSmall - t.gapSmall - t.gapMedium;
-        new Button { Text = FilePicker.T("Up", "上一级") }.Render(
-            app, pad, top, upW);
-        pathInput.Render(app, pathX, top, pathW, t.heightMedium);
-        int goX = pathX + pathW + t.gapSmall;
-        new Button { Text = FilePicker.T("Go", "转到") }.Render(
-            app, goX, top, goW);
-        int newX = goX + goW + t.gapMedium;
-        new Button { Text = FilePicker.T("New Folder", "新建文件夹") }.Render(
-            app, newX, top, newW);
+        // 命中测试用的 [转到]/[新建文件夹] x 坐标（宽布局位置；
+        // 窄布局下按钮折行，命中测试仍按此值兜底）。
+        int goX = 0;
+        int newX = 0;
+        int paneY = top + t.heightMedium + t.gapMedium;
+        if (narrow) {
+            int pathWn = W - pad - pad - upW - goW
+                - t.gapSmall - t.gapSmall;
+            new Button { Text = FilePicker.T("Up", "上一级") }.Render(
+                app, pad, top, upW);
+            pathInput.Render(app, pathX, top, pathWn, t.heightMedium);
+            int goXn = pathX + pathWn + t.gapSmall;
+            new Button { Text = FilePicker.T("Go", "转到") }.Render(
+                app, goXn, top, goW);
+            int row2Y = top + t.heightMedium + t.gapSmall;
+            new Button { Text = FilePicker.T("New Folder", "新建文件夹") }.Render(
+                app, pad, row2Y, newW);
+            paneY = row2Y + t.heightMedium + t.gapMedium;
+        } else {
+            new Button { Text = FilePicker.T("Up", "上一级") }.Render(
+                app, pad, top, upW);
+            pathInput.Render(app, pathX, top, pathW, t.heightMedium);
+            goX = pathX + pathW + t.gapSmall;
+            new Button { Text = FilePicker.T("Go", "转到") }.Render(
+                app, goX, top, goW);
+            newX = goX + goW + t.gapMedium;
+            new Button { Text = FilePicker.T("New Folder", "新建文件夹") }.Render(
+                app, newX, top, newW);
+        }
 
         string dir = FilePicker.Normalize(pathInput.GetText());
         bool valid = Directory.ExistsUtf8(dir);
-        int paneY = top + t.heightMedium + t.gapMedium;
 
         if (creatingFolder) {
             int labelW = app.Scale(112);
@@ -880,10 +904,12 @@ class FilePicker {
         if (mode != 0) {
             footerH = t.heightMedium * 2 + t.gapMedium * 2;
         }
-        // 树窗格桌面定宽 292；手机视口（~412 逻辑宽）下列表只剩一条缝，
-        // 树最多占内容区一半，列表保持可用宽度。
+        // 树窗格桌面定宽 292；手机视口两栏并排每栏只剩一条缝，
+        // 哪个都不可用——窄视口干脆单栏：树整个让位，列表占满
+        // 内容区，目录导航走工具行的“上一级/转到”。
         int treeW = app.Scale(292);
         int paneGap = t.gapMedium;
+        if (narrow) { treeW = 0; }
         int maxTree = (W - pad * 2 - paneGap) / 2;
         if (treeW > maxTree) { treeW = maxTree; }
         int listX = pad + treeW + paneGap;
@@ -897,11 +923,14 @@ class FilePicker {
         paneY = paneY + t.heightMedium + t.gapMedium;
         int paneH = H - paneY - footerH - pad;
 
-        c.FillRoundRect(
-            pad, paneY, treeW, paneH,
-            t.borderRadiusMedium, paneStyle.BgOr(0));
-        c.DrawRoundRect(pad, paneY, treeW, paneH, t.borderRadiusMedium,
-                        paneBorderStyle.BorderOr(0), 1);
+        if (treeW > 0) {
+            c.FillRoundRect(
+                pad, paneY, treeW, paneH,
+                t.borderRadiusMedium, paneStyle.BgOr(0));
+            c.DrawRoundRect(pad, paneY, treeW, paneH,
+                            t.borderRadiusMedium,
+                            paneBorderStyle.BorderOr(0), 1);
+        }
         c.FillRoundRect(
             listX, paneY, listW, paneH,
             t.borderRadiusMedium, paneStyle.BgOr(0));
@@ -974,11 +1003,15 @@ class FilePicker {
 
         List<string> treePaths = new List<string>();
         List<int> treeDepths = new List<int>();
-        List<string> roots = Directory.GetRootsUtf8();
-        for (int rootIndex = 0; rootIndex < roots.Count; rootIndex = rootIndex + 1) {
-            if (Directory.ExistsUtf8(roots[rootIndex])) {
-                BuildTree(
-                    roots[rootIndex], 0, treePaths, treeDepths);
+        if (treeW > 0) {
+            // 单栏（窄视口）不建树：递归枚举整个文件系统纯浪费。
+            List<string> roots = Directory.GetRootsUtf8();
+            for (int rootIndex = 0; rootIndex < roots.Count;
+                    rootIndex = rootIndex + 1) {
+                if (Directory.ExistsUtf8(roots[rootIndex])) {
+                    BuildTree(
+                        roots[rootIndex], 0, treePaths, treeDepths);
+                }
             }
         }
 
@@ -997,7 +1030,7 @@ class FilePicker {
         if (treeOff < 0) { treeOff = 0; }
         if (treeOff > treeMax) { treeOff = treeMax; }
 
-        for (int treeShown = 0; treeOff + treeShown < treePaths.Count
+        for (int treeShown = 0; treeW > 0 && treeOff + treeShown < treePaths.Count
                && treeShown < treeRows; treeShown = treeShown + 1) {
             int idx = treeOff + treeShown;
             string path = treePaths[idx];
@@ -1048,7 +1081,7 @@ class FilePicker {
             }
         }
 
-        if (treePaths.Count > treeRows) {
+        if (treeW > 0 && treePaths.Count > treeRows) {
             int trackX = pad + treeW - scrollW;
             int thumbH = paneH * treeRows / treePaths.Count;
             if (thumbH < app.Scale(24)) { thumbH = app.Scale(24); }
