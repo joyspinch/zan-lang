@@ -1,0 +1,66 @@
+using System;
+using ZanWeb;
+using System.Web;
+using System.Json;
+using System.Security.Cryptography;
+
+namespace ZanWeb.Api;
+
+/* 版本频道增量同步端点（在 check/manifest 之上）：
+ *   GET  /api/channel/manifest?channel=&platform=&version=   → 清单 JSON
+ *   POST /api/channel/sync     body: {"channel","platform","version",
+ *                                      "client":{"path":"md5",...}} → 差异
+ *   GET  /api/channel/file?channel=&platform=&path=           → 文件字节
+ *
+ * 同步契约：sync 的 download 列表里每个文件，GET file 拿到的字节
+ * md5 必然等于清单里的 md5（同一份清单快照）；客户端落盘前可自行复验。
+ * 没带 client 的 sync = 全量（download = 整个清单）。 */
+[Route("api/[controller]/[action]")]
+[Custom(Authorization = CustomAuthorization.None)]
+[Description("频道同步")]
+class ChannelSync : ApiController {
+    [HttpGet]
+    async void Manifest() {
+        if (!this.DbReady()) { this.Fail(503, "2001", "database unavailable"); }
+        string channel = this.Need("channel", "channel");
+        JsonValue m = await new ManifestFlow(this.Held()).ManifestOf(
+            channel, this.In("platform"), this.In("version"));
+        if (m == null) { this.Fail(404, "4103", "manifest not published"); }
+        this.Ok(m.ToJson());
+    }
+
+    [HttpPost]
+    async void Sync() {
+        if (!this.DbReady()) { this.Fail(503, "2001", "database unavailable"); }
+        JsonValue body = this.ctx.JsonBody();
+        if (body == null || !body.IsObject()) { this.Fail(400, "0003", "bad body"); }
+        string channel = body.Str("channel", "");
+        if (channel.Length == 0) { this.Fail(400, "0003", "channel不能为空"); }
+        string platform = body.Str("platform", "");
+        string version = body.Str("version", "");
+        JsonValue client = body.Get("client");
+        if (client != null && !client.IsObject()) { client = null; }
+        ManifestFlow flow = new ManifestFlow(this.Held());
+        JsonValue manifest = await flow.ManifestOf(channel, platform, version);
+        if (manifest == null) { this.Fail(404, "4103", "manifest not published"); }
+        this.Ok(ManifestFlow.Diff(manifest, client).ToJson());
+    }
+
+    [HttpGet]
+    void File() {
+        string channel = this.Need("channel", "channel");
+        string platform = this.In("platform");
+        string path = this.In("path");
+        if (!ManifestFlow.PathSafe(path)) { this.Fail(400, "0003", "bad path"); }
+        string dir = ManifestFlow.PackageDir(channel, platform);
+        string full = dir + "/" + path;
+        if (!System.IO.File.Exists(full)) { this.Fail(404, "4104", "no such file"); }
+        byte[] data = System.IO.File.ReadAllBytes(full);
+        if (data == null) { this.Fail(404, "4104", "no such file"); }
+        string md5 = Hex.Encode(Md5.Hash(data, data.Length), 16);
+        /* ETag = 内容 md5：客户端总是先比对本地 md5，一致就不发这个请求；
+           304 语义由客户端本地短路（框架不带空体 304 应答）。 */
+        this.ctx.SetHeader("ETag", md5);
+        this.ctx.Binary("application/octet-stream", data, data.Length);
+    }
+}

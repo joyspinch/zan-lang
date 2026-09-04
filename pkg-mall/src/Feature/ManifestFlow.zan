@@ -1,0 +1,196 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Json;
+using System.Security.Cryptography;
+using System.Web;
+using ZanWeb.Model.Mall;
+
+namespace ZanWeb;
+
+/* 增量更新清单：一条发布线（channel+platform）对应一个包目录
+ * （packages/<channel>[-<platform>]/），发布 = 扫描目录生成
+ * {file → md5, size} 清单快照（version_releases.manifest 列）。
+ *
+ * 客户端同步流程（/api/channel/sync）：
+ *   1. POST 本地文件清单 {path: md5}；
+ *   2. 服务端与目标发布快照对比，返回三类差异——
+ *      download（md5 不同或本地缺）、remove（服务端没有而本地有）、
+ *      match（一致，仅计数）；
+ *   3. 客户端按 download 列表逐个 GET /api/channel/file?...&path=，
+ *      服务端流式回文件字节（ETag = md5，本地可不校验直接落盘）。
+ *
+ * md5 取的是 32 位十六进制小写（Md5.Hash → Hex.Encode），文件内容
+ * 的指纹而非路径名——路径重命名但内容不变不触发重传。 */
+class ManifestFlow {
+    IDbConnection db;
+
+    ManifestFlow(IDbConnection db) {
+        this.db = db;
+    }
+
+    /* 包目录约定：packages/<channel>[-<platform>]/。platform 为空时
+     * 用 packages/<channel>/。目录不存在 = 该线尚未准备包体。 */
+    static string PackageDir(string channel, string platform) {
+        string name = channel;
+        if (platform.Length > 0) { name = name + "-" + platform; }
+        return "packages/" + name;
+    }
+
+    /* 递归扫描包目录，产出两个平行列表（相对路径 / "md5 size"）。
+     * StrMap 无键枚举，发布清单要按序输出，故用平行 List。
+     * 目录缺省/为空返回空表（调用方决定答 404 还是空清单）。 */
+    static void Scan(string relDir, List<string> paths, List<string> metas) {
+        ManifestFlow.Walk(relDir, "", paths, metas);
+    }
+
+    static void Walk(string absDir, string relPrefix, List<string> paths,
+                     List<string> metas) {
+        if (!Directory.Exists(absDir)) { return; }
+        List<string> files = Directory.GetFilesFiltered(absDir, false);
+        for (int i = 0; i < files.Count; i = i + 1) {
+            string name = files[i];
+            /* GetFiles 返回的是条目名；拼回完整相对路径。 */
+            string rel = relPrefix.Length > 0 ? relPrefix + "/" + name : name;
+            string full = absDir + "/" + name;
+            byte[] data = File.ReadAllBytes(full);
+            if (data == null) { continue; }
+            string md5 = Hex.Encode(Md5.Hash(data, data.Length), 16);
+            paths.Add(rel);
+            metas.Add(md5 + " " + Convert.ToString(data.Length));
+        }
+        List<string> dirs = Directory.GetDirectoriesFiltered(absDir, false);
+        for (int j = 0; j < dirs.Count; j = j + 1) {
+            string name = dirs[j];
+            string rel = relPrefix.Length > 0 ? relPrefix + "/" + name : name;
+            ManifestFlow.Walk(absDir + "/" + name, rel, paths, metas);
+        }
+    }
+
+    /* 发布：扫描当前包目录，把清单快照写进该频道的最新 release 行。
+     * 清单 JSON：{"version":..,"files":{"path":"md5 size",...}}。 */
+    async string Publish(int channelId, string version) {
+        VersionChannelDao dao = new VersionChannelDao(this.db);
+        VersionChannel ch = await this.db.Select<VersionChannel>()
+            .Where(a => a.id == channelId).FirstAsync();
+        if (ch == null) { return ""; }
+        string dir = ManifestFlow.PackageDir(ch.channel, ch.platform);
+        List<string> paths = new List<string>();
+        List<string> metas = new List<string>();
+        ManifestFlow.Scan(dir, paths, metas);
+        JsonValue root = JsonValue.NewObject();
+        root.Put("version", JsonValue.NewStr(version));
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < paths.Count; i = i + 1) {
+            JsonValue o = JsonValue.NewObject();
+            o.Put("path", JsonValue.NewStr(paths[i]));
+            string meta = metas[i];
+            int sp = meta.IndexOf(" ");
+            o.Put("md5", JsonValue.NewStr(meta.Substring(0, sp)));
+            o.Put("size", JsonValue.NewNum(meta.Substring(sp + 1)));
+            arr.Append(o);
+        }
+        root.Put("files", arr);
+        string manifest = root.ToJson();
+
+        /* 清单写入版本对应的 release 行（version 定位，channel+platform）。 */
+        VersionChannel row = await dao.ByKey(ch.channel, ch.platform);
+        if (row == null) { return ""; }
+        List<VersionRelease> rels = await dao.ReleasesOf(row.id);
+        /* 取该版本最新的发布行；历史重复行（旧 bug 遗留）不影响。 */
+        int target = 0;
+        for (int i = 0; i < rels.Count; i = i + 1) {
+            if (rels[i].version == version) { target = rels[i].id; break; }
+        }
+        if (target == 0) {
+            /* 还没有这个版本的发布行：走一次正式 Publish 语义生成它。 */
+            ChannelFlow flow = new ChannelFlow(this.db);
+            bool ok = await flow.Publish(ch.channel, ch.platform, version,
+                row.installerUrl, row.sha256, row.signature,
+                row.releaseNotes, row.rolloutPercent, row.requiredVersion);
+            if (!ok) { return ""; }
+            rels = await dao.ReleasesOf(row.id);
+            for (int i = 0; i < rels.Count; i = i + 1) {
+                if (rels[i].version == version) { target = rels[i].id; }
+            }
+            if (target == 0) { return ""; }
+        }
+        int upd = await this.db.Update<VersionRelease>()
+            .Set(a => a.manifest, manifest)
+            .Where(a => a.id == target)
+            .ExecuteAffrowsAsync();
+        if (upd != 1) { return ""; }
+        return manifest;
+    }
+
+    /* 目标版本的清单解析；version 空 = 频道当前指针版本。 */
+    async JsonValue ManifestOf(string channel, string platform, string version) {
+        VersionChannelDao dao = new VersionChannelDao(this.db);
+        VersionChannel row = await dao.ByKey(channel, platform);
+        if (row == null || row.status != "published") { return null; }
+        string want = version.Length > 0 ? version : row.latestVersion;
+        List<VersionRelease> rels = await dao.ReleasesOf(row.id);
+        for (int i = 0; i < rels.Count; i = i + 1) {
+            if (rels[i].version != want) { continue; }
+            string manifest = rels[i].manifest;
+            if (manifest.Length == 0) { continue; }
+            try {
+                return JsonValue.Parse(manifest);
+            } catch (JsonException ex) {
+                continue;
+            }
+        }
+        return null;
+    }
+
+    /* 客户端清单 vs 目标清单 → 差异三类。请求体 JSON：
+     * {"client":{"path":"md5",...}}（缺 client = 全量下载）。 */
+    static JsonValue Diff(JsonValue manifest, JsonValue client) {
+        JsonValue outp = JsonValue.NewObject();
+        JsonValue downloads = JsonValue.NewArray();
+        JsonValue removes = JsonValue.NewArray();
+        int matched = 0;
+        JsonValue files = manifest.Get("files");
+        int total = files != null && files.IsArray() ? files.Count() : 0;
+        for (int i = 0; i < total; i = i + 1) {
+            JsonValue f = files.At(i);
+            string path = f.Str("path", "");
+            string md5 = f.Str("md5", "");
+            JsonValue c = client != null ? client.Get(path) : null;
+            if (c != null && c.AsString("") == md5) {
+                matched = matched + 1;
+                continue;
+            }
+            JsonValue o = JsonValue.NewObject();
+            o.Put("path", JsonValue.NewStr(path));
+            o.Put("md5", JsonValue.NewStr(md5));
+            o.Put("size", f.Get("size"));
+            downloads.Append(o);
+        }
+        /* 移除集在客户端计算：客户端持有本地路径集合，sync 响应给出
+           服务端全集（files 数组），本地不在全集里的文件自行删除——
+           规避服务端二次遍历 client 对象（ParseLenient 嵌套对象键读
+           回不稳定，实测 Count/KeyAt 返回垃圾）。 */
+        outp.Put("version", manifest.Get("version"));
+        outp.Put("total", JsonValue.NewNum(Convert.ToString(total)));
+        outp.Put("match", JsonValue.NewNum(Convert.ToString(matched)));
+        outp.Put("download", downloads);
+        return outp;
+    }
+
+    /* 文件字节：按相对路径从包目录读（IsSafe 防穿越），GET 时
+     * If-None-Match == md5 则 304。 */
+    static string FileMime(string path) {
+        if (path.EndsWith(".exe")) { return "application/octet-stream"; }
+        if (path.EndsWith(".dll")) { return "application/octet-stream"; }
+        if (path.EndsWith(".zip")) { return "application/zip"; }
+        if (path.EndsWith(".zpkg")) { return "application/octet-stream"; }
+        return "application/octet-stream";
+    }
+
+    static bool PathSafe(string rel) {
+        if (rel.Length == 0 || rel.StartsWith("/")) { return false; }
+        if (rel.Contains("..") || rel.Contains("\\")) { return false; }
+        return true;
+    }
+}

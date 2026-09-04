@@ -1,0 +1,37 @@
+using System;
+using ZanWeb;
+using System.Web;
+using System.Json;
+
+namespace ZanWeb.Api;
+
+/* 管理端清单生成：扫描 packages/<channel>[-<platform>]/ 当前内容，
+ * 把 {path,md5,size} 快照写进指定版本的发布行。此后该版本的增量
+ * 同步（/api/channel/sync、/api/channel/file）即以此快照为准。
+ * 包目录在两次 Manifest 之间变化时重新调用即可刷新快照。 */
+[Route("api/[controller]/[action]")]
+[Custom(Authorization = CustomAuthorization.ApiAuth)]
+[Description("清单管理")]
+class ManifestAdmin : ApiController {
+    [HttpPost]
+    [Tx]
+    async void Publish() {
+        if (!this.DbReady()) { this.Fail(503, "2001", "database unavailable"); }
+        int channelId = this.InInt("channel_id", 0);
+        string version = this.Need("version", "version");
+        string manifest = await new ManifestFlow(this.Held())
+            .Publish(channelId, version);
+        if (manifest.Length == 0) {
+            this.Fail(422, "4105", "manifest publish rejected "
+                + "(unknown channel, missing package dir, or version not released)");
+        }
+        JsonValue m = JsonValue.ParseLenient(manifest);
+        int count = 0;
+        JsonValue files = m != null ? m.Get("files") : null;
+        if (files != null && files.IsArray()) { count = files.Count(); }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("published", JsonValue.NewBool(true));
+        o.Put("files", JsonValue.NewNum(Convert.ToString(count)));
+        this.Ok(o.ToJson());
+    }
+}
