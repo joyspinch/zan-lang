@@ -44,6 +44,10 @@ class WizardTemplate {
     /// form / chart / gauges / alarms / list / console / webview /
     /// server / library）。
     string sketch;
+    /// 模板声明的目标设备画像 id（manifest `device=`，见
+    /// DeviceProfile）。空串 = 自由尺寸（桌面），向导的目标
+    /// 设备行预选桌面并放开分辨率预设与自定义宽高。
+    string deviceId;
 
     /// 构造：分类/名称/图标/描述必填，形态与预览信息经
     /// Shape/Look 链式补齐。
@@ -58,6 +62,7 @@ class WizardTemplate {
         round = false;
         preview = "";
         sketch = "";
+        deviceId = "";
     }
 
     /// 链式配置形态信息，让宿主只描述它从清单里读到的内容。
@@ -73,6 +78,12 @@ class WizardTemplate {
     WizardTemplate Look(string previewPath, string sketchSpec) {
         preview = previewPath;
         sketch = sketchSpec;
+        return this;
+    }
+
+    /// 声明目标设备画像 id（manifest `device=`）。
+    WizardTemplate Device(string id) {
+        deviceId = id;
         return this;
     }
 }
@@ -168,6 +179,13 @@ class Wizard : Control {
     /// 从这些输入读取最终尺寸。
     Input iSizeW;
     Input iSizeH;
+    /// 目标设备画像选择（DeviceProfile.All() 的下标）与横竖屏
+    /// 方向（0 竖屏 / 1 横屏）。null 隐藏目标设备行（保持旧的
+    /// 纯尺寸预设行为）。选中锁定类设备时尺寸行收起，画布
+    /// 尺寸由画像给出并回填 iSizeW/iSizeH——宿主仍从这两个
+    /// 输入读取最终尺寸，契约不变。
+    SignalInt iDevSel;
+    SignalInt iDevRot;
 
     /// 设计器用无参构造；状态由静态工厂（Categorized）或实例构造器填充。
     Wizard() {
@@ -582,6 +600,24 @@ class Wizard : Control {
         return w;
     }
 
+    /// 再带目标设备画像行的分类项目向导：devSel 选中
+    /// DeviceProfile.All() 的下标（锁定类设备收起尺寸预设，
+    /// 画布由画像给出），devRot 是横竖屏方向。传 null 则退化为
+    /// 上面的纯尺寸预设行为。
+    static Wizard Categorized(string title, List<string> catNames, SignalInt catSel,
+                              List<WizardTemplate> tpls, SignalInt tplSel,
+                              Input nameInput, Input locInput,
+                              List<WizardTarget> targets, List<string> groupNames,
+                              SignalInt sizeSel, Input sizeW, Input sizeH,
+                              SignalInt devSel, SignalInt devRot) {
+        Wizard w = Wizard.Categorized(title, catNames, catSel, tpls, tplSel,
+                                      nameInput, locInput, targets, groupNames,
+                                      sizeSel, sizeW, sizeH);
+        w.iDevSel = devSel;
+        w.iDevRot = devRot;
+        return w;
+    }
+
     /// 本帧将向导绘制到其窗口中，并返回动作码
     /// （0 无、1 创建、2 取消/关闭、3 浏览）。所有状态都保存在
     /// 实例上；宿主对返回码作出响应。
@@ -589,7 +625,7 @@ class Wizard : Control {
         if (iCategorized) {
             return Wizard.RenderCategorized(app, iTitle, iCatNames, iCatSel, iTpls,
                 iTplSel, iName, iLoc, iTargets, iGroups,
-                iSizeSel, iSizeW, iSizeH);
+                iSizeSel, iSizeW, iSizeH, iDevSel, iDevRot);
         }
         return Wizard.Render(app, iTitle, iItems, iSel, iName, iLoc, iShowLoc,
                              iSizeSel, iSizeW, iSizeH);
@@ -865,6 +901,18 @@ class Wizard : Control {
                                  List<WizardTemplate> tpls, SignalInt tplSel, Input nameInput, Input locInput,
                                  List<WizardTarget> targets, List<string> groupNames,
                                  SignalInt sizeSel, Input sizeW, Input sizeH) {
+        return Wizard.RenderCategorized(app, title, catNames, catSel, tpls, tplSel,
+                                        nameInput, locInput, targets, groupNames,
+                                        sizeSel, sizeW, sizeH, null, null);
+    }
+
+    /// 完整版两级向导（带目标设备画像行）。devSel/devRot 为
+    /// null 时目标设备行隐藏，等同上一重载。
+    static int RenderCategorized(App app, string title, List<string> catNames, SignalInt catSel,
+                                 List<WizardTemplate> tpls, SignalInt tplSel, Input nameInput, Input locInput,
+                                 List<WizardTarget> targets, List<string> groupNames,
+                                 SignalInt sizeSel, Input sizeW, Input sizeH,
+                                 SignalInt devSel, SignalInt devRot) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int W = c.Width();
@@ -1076,9 +1124,10 @@ class Wizard : Control {
         WizardTemplate selTpl = null;
         if (tplSelV >= 0 && tplSelV < tpls.Count) { selTpl = tpls[tplSelV]; }
 
-        // ---- 预览列（最右）----
-        // 属于表单列之前先算，因为它从表单列里切走宽度；
-        // 窗口窄到放不下两列时预览自行让位。
+        // ---- 预览 ----
+        // 预览不再占右上一列：设备/尺寸/平台三段收紧占满右列，
+        // 预览画在平台区之下、按钮行之上的剩余空间；窗口窄到
+        // 放不下时预览自行让位。
         int prevW = app.Scale(300);
         int availRight = W - pad - (tplX + tplW + pad);
         if (availRight < app.Scale(640)) { prevW = 0; }
@@ -1086,7 +1135,6 @@ class Wizard : Control {
         // ---- 右列：名称 / 位置 / 描述 ----
         int fx = tplX + tplW + pad;
         int fw = W - pad - fx;
-        if (prevW > 0) { fw = fw - prevW - pad; }
         int fy = contentY;
         int labelFont = labelStyle.FontOr(Style.FontFallback(app, "small"));
         int descriptionFont = descriptionStyle.FontOr(
@@ -1112,9 +1160,12 @@ class Wizard : Control {
                        descriptionFont);
         }
 
-        // ---- 设备尺寸（仅针对产出设计窗口的模板）----
-        // 尺寸是同一个模板的一个参数，而不是分类里十几个长得
-        // 一样的条目；预览列同步按所选尺寸的比例绘制。
+        // ---- 目标设备 + 设备尺寸（仅针对产出设计窗口的模板）----
+        // 目标设备决定画布契约：桌面/2in1 自由尺寸（分辨率预设 +
+        // 自定义宽高），手机/平板/电视/车机/穿戴锁定为画像的基准
+        // 视口，只允许画像声明的横竖屏切换。碎片化的物理尺寸
+        // （手机有大小、折叠屏会变形）由运行时的流式重排与画布
+        // 拟合兜住，设计期锁的是基准视口，不是物理屏幕。
         int devW = 0;
         int devH = 0;
         if (selTpl != null) {
@@ -1122,75 +1173,170 @@ class Wizard : Control {
             devH = selTpl.defH;
         }
         bool wantSize = selTpl != null && selTpl.sizeable && sizeSel != null;
-        if (wantSize) {
-            int sy = ny + app.Scale(30);
-            c.DrawText(fx, sy, Wizard.TW("Device size", "设备尺寸"),
+        bool wantDev = wantSize && devSel != null;
+        if (wantDev) {
+            int dy0 = ny + app.Scale(20);
+            c.DrawText(fx, dy0, Wizard.TW("Target device", "目标设备"),
                        labelStyle.FgOr(0), labelFont);
-            List<int> szW = Wizard.SizePresetW();
-            List<int> szH = Wizard.SizePresetH();
-            int nSz = szW.Count;
-            int perRow = 4;
-            int gap2 = app.Scale(6);
-            int btnW = (fw - (perRow - 1) * gap2) / perRow;
-            int rowH2 = t.heightSmall + app.Scale(6);
-            int by2 = sy + app.Scale(20);
-            int curv = sizeSel.Get();
-            for (int k = 0; k < nSz; k = k + 1) {
-                int col = k % perRow;
-                int rowi = k / perRow;
+            List<DeviceProfile> dps = DeviceProfile.All();
+            int nDev = dps.Count;
+            int gapD = app.Scale(6);
+            int devBtnW = (fw - (nDev - 1) * gapD) / nDev;
+            int devY = dy0 + app.Scale(18);
+            int devCur = devSel.Get();
+            for (int k = 0; k < nDev; k = k + 1) {
                 string cls = "small";
-                if (k == curv) { cls = "primary small"; }
-                int bid = new Button { Text = Wizard.SizePresetName(k), Class = cls }
-                    .Render(app, fx + col * (btnW + gap2), by2 + rowi * rowH2, btnW);
+                if (k == devCur) { cls = "primary small"; }
+                int bid = new Button { Text = dps[k].Label(Wizard.lang), Class = cls }
+                    .Render(app, fx + k * (devBtnW + gapD), devY, devBtnW);
                 if (Ui.Clicked(app, bid)) {
-                    sizeSel.Set(k);
-                    if (sizeW != null) { sizeW.SetText(Convert.ToString(szW[k])); }
-                    if (sizeH != null) { sizeH.SetText(Convert.ToString(szH[k])); }
+                    devSel.Set(k);
+                    if (devRot != null) { devRot.Set(0); }
+                    if (dps[k].Locked() && sizeW != null && sizeH != null) {
+                        sizeW.SetText(Convert.ToString(dps[k].CanvasW(0)));
+                        sizeH.SetText(Convert.ToString(dps[k].CanvasH(0)));
+                    }
                     app.RequestRedraw();
                 }
             }
-            int cy2 = by2 + ((nSz + perRow - 1) / perRow) * rowH2 + app.Scale(4);
-            if (sizeW != null && sizeH != null) {
-                string custom = Wizard.TW("Custom", "自定义");
-                c.DrawText(fx, cy2 + app.Scale(6), custom, labelStyle.FgOr(0),
-                           labelFont);
-                int lw = Canvas.MeasureText(custom, labelFont) + app.Scale(10);
-                int inW2 = app.Scale(72);
-                sizeW.Render(app, fx + lw, cy2, inW2, t.heightSmall);
-                c.DrawText(fx + lw + inW2 + app.Scale(5), cy2 + app.Scale(6), "x",
-                           labelStyle.FgOr(0), labelFont);
-                sizeH.Render(app, fx + lw + inW2 + app.Scale(16), cy2, inW2, t.heightSmall);
-                int cw = Wizard.ParseDim(sizeW.GetText());
-                int chh = Wizard.ParseDim(sizeH.GetText());
-                if (cw > 0 && chh > 0) { devW = cw; devH = chh; }
-            } else if (curv >= 0 && curv < nSz) {
-                devW = szW[curv];
-                devH = szH[curv];
+            int rowY3 = devY + t.heightSmall + app.Scale(4);
+            DeviceProfile dcur = DeviceProfile.At(devCur);
+            if (dcur != null && dcur.Locked()) {
+                // 锁定类设备：只允许画像声明的横竖屏切换，画布
+                // 尺寸由画像给出；尺寸预设与自定义宽高收起。
+                int orientV = 0;
+                if (devRot != null) { orientV = devRot.Get(); }
+                if (dcur.Rotatable() && devRot != null) {
+                    c.DrawText(fx, rowY3 + app.Scale(8),
+                               Wizard.TW("Orientation", "方向"),
+                               labelStyle.FgOr(0), labelFont);
+                    int orW = app.Scale(96);
+                    int oY = rowY3 + app.Scale(22);
+                    for (int o = 0; o < 2; o = o + 1) {
+                        string lbl = Wizard.TW("Portrait", "竖屏");
+                        if (o == 1) { lbl = Wizard.TW("Landscape", "横屏"); }
+                        string ocls = "small";
+                        if (o == orientV) { ocls = "primary small"; }
+                        int oid = new Button { Text = lbl, Class = ocls }
+                            .Render(app, fx + o * (orW + gapD), oY, orW);
+                        if (Ui.Clicked(app, oid)) {
+                            devRot.Set(o);
+                            if (sizeW != null) { sizeW.SetText(Convert.ToString(dcur.CanvasW(o))); }
+                            if (sizeH != null) { sizeH.SetText(Convert.ToString(dcur.CanvasH(o))); }
+                            app.RequestRedraw();
+                        }
+                    }
+                    rowY3 = oY + t.heightSmall;
+                }
+                devW = dcur.CanvasW(orientV);
+                devH = dcur.CanvasH(orientV);
+                string cap = Wizard.TW("Canvas ", "画布 ") + Convert.ToString(devW)
+                    + " × " + Convert.ToString(devH)
+                    + Wizard.TW(" (locked by device)", "（由设备锁定）");
+                c.DrawText(fx, rowY3 + app.Scale(12), cap,
+                           descriptionStyle.FgOr(0), descriptionFont);
+                ny = rowY3 + t.heightSmall;
+                // 尺寸由画像决定：跳过下面的自由尺寸行。
+                wantSize = false;
+            } else {
+                // 桌面自由尺寸：预设行接在设备 chips 行之下，
+                // 不推进 ny 会两行叠在同一位置。
+                ny = rowY3;
             }
-            ny = cy2 + t.heightSmall;
         }
-
-        if (prevW > 0) {
-            Wizard.RenderPreview(app, W - pad - prevW, contentY, prevW, listH,
-                                 selTpl, devW, devH);
+        if (wantSize) {
+            // 设备/尺寸二选一：带目标设备行时锁定设备由画像定画布
+            // （上方分支已收起本行），桌面/2in1 只留一行"画布尺寸
+            // [W] x [H]"；预设网格只服务没有设备行的旧调用（新建
+            // 文件向导等）。
+            bool showPresets = !wantDev;
+            int sy = ny + app.Scale(12);
+            string sizeLbl = Wizard.TW("Canvas size", "画布尺寸");
+            if (showPresets) { sizeLbl = Wizard.TW("Device size", "设备尺寸"); }
+            List<int> szW = Wizard.SizePresetW();
+            List<int> szH = Wizard.SizePresetH();
+            int nSz = szW.Count;
+            int curv = sizeSel.Get();
+            if (showPresets) {
+                c.DrawText(fx, sy, sizeLbl, labelStyle.FgOr(0), labelFont);
+                int perRow = 4;
+                int gap2 = app.Scale(6);
+                int btnW = (fw - (perRow - 1) * gap2) / perRow;
+                int rowH2 = t.heightSmall + app.Scale(6);
+                int by2 = sy + app.Scale(20);
+                for (int k = 0; k < nSz; k = k + 1) {
+                    int col = k % perRow;
+                    int rowi = k / perRow;
+                    string cls = "small";
+                    if (k == curv) { cls = "primary small"; }
+                    int bid = new Button { Text = Wizard.SizePresetName(k), Class = cls }
+                        .Render(app, fx + col * (btnW + gap2), by2 + rowi * rowH2, btnW);
+                    if (Ui.Clicked(app, bid)) {
+                        sizeSel.Set(k);
+                        if (sizeW != null) { sizeW.SetText(Convert.ToString(szW[k])); }
+                        if (sizeH != null) { sizeH.SetText(Convert.ToString(szH[k])); }
+                        app.RequestRedraw();
+                    }
+                }
+                int cy2 = by2 + ((nSz + perRow - 1) / perRow) * rowH2 + app.Scale(4);
+                if (sizeW != null && sizeH != null) {
+                    string custom = Wizard.TW("Custom", "自定义");
+                    c.DrawText(fx, cy2 + app.Scale(6), custom, labelStyle.FgOr(0),
+                               labelFont);
+                    int lw = Canvas.MeasureText(custom, labelFont) + app.Scale(10);
+                    int inW2 = app.Scale(72);
+                    sizeW.Render(app, fx + lw, cy2, inW2, t.heightSmall);
+                    c.DrawText(fx + lw + inW2 + app.Scale(5), cy2 + app.Scale(6), "x",
+                               labelStyle.FgOr(0), labelFont);
+                    sizeH.Render(app, fx + lw + inW2 + app.Scale(16), cy2, inW2, t.heightSmall);
+                    int cw = Wizard.ParseDim(sizeW.GetText());
+                    int chh = Wizard.ParseDim(sizeH.GetText());
+                    if (cw > 0 && chh > 0) { devW = cw; devH = chh; }
+                } else if (curv >= 0 && curv < nSz) {
+                    devW = szW[curv];
+                    devH = szH[curv];
+                }
+                ny = cy2 + t.heightSmall;
+            } else {
+                // 单行画布尺寸，与目标设备行同一节奏。
+                if (sizeW != null && sizeH != null) {
+                    int lw = Canvas.MeasureText(sizeLbl, labelFont) + app.Scale(14);
+                    int inW2 = app.Scale(72);
+                    int inY = sy - app.Scale(2);
+                    c.DrawText(fx, sy + app.Scale(6), sizeLbl, labelStyle.FgOr(0),
+                               labelFont);
+                    sizeW.Render(app, fx + lw, inY, inW2, t.heightSmall);
+                    c.DrawText(fx + lw + inW2 + app.Scale(5), sy + app.Scale(6), "x",
+                               labelStyle.FgOr(0), labelFont);
+                    sizeH.Render(app, fx + lw + inW2 + app.Scale(16), inY, inW2,
+                                 t.heightSmall);
+                    int cw = Wizard.ParseDim(sizeW.GetText());
+                    int chh = Wizard.ParseDim(sizeH.GetText());
+                    if (cw > 0 && chh > 0) { devW = cw; devH = chh; }
+                }
+                ny = sy + t.heightSmall;
+            }
         }
 
         // ---- 目标平台：每个 OS 一列（组），架构
         //      垂直堆叠在下方，每个都是多选开关 ----
-        // 位于描述下方较远的位置，使其读起来像一个独立区域，
-        // 而不是挤占名称/位置输入框。
-        int oy = ny + app.Scale(64);
+        // 设备/尺寸/平台三段收紧上移，预览挪到平台区之下、
+        // 按钮行之上的剩余空间。
+        int oy = ny + app.Scale(14);
         c.DrawText(fx, oy, Wizard.TW("Platforms", "目标平台"),
                    labelStyle.FgOr(0), labelFont);
         int nTgt = targets.Count;
         int numCols = groupNames.Count;
         int perCol = nTgt / numCols;
         int obh = t.heightMedium;
-        int obw = app.Scale(120);
         int colGap = app.Scale(14);
         int chipGap = app.Scale(8);
-        int headerY = oy + app.Scale(22);
-        int chipsY = headerY + app.Scale(20);
+        // 列宽自适应右列宽（预览挪走后右列占满全宽），上限防过宽。
+        int obw = (fw - (numCols - 1) * colGap) / numCols;
+        int obwMax = app.Scale(150);
+        if (obw > obwMax) { obw = obwMax; }
+        int headerY = oy + app.Scale(20);
+        int chipsY = headerY + app.Scale(16);
         for (int gh = 0; gh < numCols; gh = gh + 1) {
             int cx = fx + gh * (obw + colGap);
             c.DrawText(cx, headerY, groupNames[gh], descriptionStyle.FgOr(0),
@@ -1226,6 +1372,17 @@ class Wizard : Control {
             int oty = Canvas.CenterTextY(oyy, obh, targetFont);
             c.DrawText(otx, oty, tgt.name, otc, targetFont);
             app.hitTester.RegisterRect(oid, ox, oyy, obw, obh, 0);
+        }
+
+        // ---- 预览：平台区之下的剩余空间（画布 mock 按比例
+        //      缩放居中，底部标注画布尺寸）----
+        if (prevW > 0) {
+            int prowY = chipsY + perCol * (obh + chipGap) + app.Scale(14);
+            int prowH = (H - t.heightMedium - pad - app.Scale(16)) - prowY;
+            if (prowH > app.Scale(72)) {
+                Wizard.RenderPreview(app, fx, prowY, fw, prowH,
+                                     selTpl, devW, devH);
+            }
         }
 
         // ---- 点击 ----
