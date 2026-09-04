@@ -123,6 +123,7 @@ class MinerApp {
 
     // Gui 控件树 HUD 层(null = 未启用/接管失败,退回场景自绘)
     public GameHud hud;
+    public bool guiReady;               // gui 运行时已初始化(兜底 HUD 前提)
     public HudTop topHud;           // 顶栏面板
     public HudOverlay ovHud;        // 结算/拆弹覆盖层
 
@@ -381,6 +382,8 @@ class MinerApp {
         }
         // 场景内 QTE 圈(圈心跟着爪走,必须画在场景层)
         if (wo.state == World.ST_QTE) { this.DrawQte(ox, oy); }        // 爆炸白闪
+        // Gui HUD 降级时的场景层兜底信息(顶栏/结算/拆弹)
+        if (this.hud == null && this.guiReady) { this.DrawFallbackHud(ox, oy); }
         if (wo.flashFrames > 0) {
             int fa = wo.flashFrames * 38;
             if (fa > 255) { fa = 255; }
@@ -390,30 +393,109 @@ class MinerApp {
         }
     }
 
-    void DrawClaw(int ox, int oy) {
+    // Gui HUD 不可用(合成失败降级 / MINER_NOHUD)时的场景层兜底:
+    // 半透明顶栏(关卡/金币/进度/倒计时/炸药) + 结算与拆弹信息,
+    // 保证游戏数据始终可读;配色与 gamehud 皮肤同一族。
+    // 文本用 PixelFont(纯 FillRect):gui 字体引擎在合成不可用的
+    // 环境里同样读不回像素,不可依赖。
+    void DrawFallbackHud(int ox, int oy) {
         SdlRenderer rd = this.r;
+        World wo = this.w;
+        int pct = wo.Target() > 0 ? wo.gold * 100 / wo.Target() : 0;
+        if (pct > 100) { pct = 100; }
+        // 顶栏
+        rd.SetColor(12, 14, 20, 215);
+        rd.FillRect(ox, oy, Data.W, 46);
+        rd.SetColor(138, 111, 51, 255);
+        rd.FillRect(ox, oy + 46, Data.W, 2);
+        PixelFont.Draw(rd, "LV " + Convert.ToString(wo.level),
+                       ox + 16, oy + 15, 3, 232, 226, 212, 255);
+        PixelFont.Draw(rd, "$" + Convert.ToString(wo.gold) + "/"
+                       + Convert.ToString(wo.Target()),
+                       ox + 130, oy + 15, 3, 224, 196, 120, 255);
+        rd.SetColor(40, 44, 56, 255);
+        rd.FillRect(ox + 330, oy + 17, 220, 12);
+        rd.SetColor(111, 170, 94, 255);
+        rd.FillRect(ox + 322 + 10, oy + 19, 216 * pct / 100, 8);
+        int secLeft = (wo.timeLeftMs + 999) / 1000;
+        PixelFont.Draw(rd, Convert.ToString(secLeft / 60) + ":"
+                       + Convert.ToString(secLeft % 60 / 10)
+                       + Convert.ToString(secLeft % 10),
+                       ox + 610, oy + 15, 3,
+                       secLeft <= 10 ? 224 : 232,
+                       secLeft <= 10 ? 120 : 226,
+                       secLeft <= 10 ? 96 : 212, 255);
+        if (wo.combo >= 2) {
+            PixelFont.Draw(rd, "x" + Convert.ToString(wo.combo),
+                           ox + 740, oy + 15, 3, 240, 176, 80, 255);
+        }
+        PixelFont.Draw(rd, "TNT x" + Convert.ToString(wo.dynamites),
+                       ox + Data.W - 170, oy + 15, 3, 180, 174, 154, 255);
+        // 拆弹覆盖
+        if (wo.state == World.ST_BOMB) {
+            rd.SetColor(10, 12, 17, 205);
+            rd.FillRect(ox + Data.W / 2 - 170, oy + 230, 340, 150);
+            rd.SetColor(192, 85, 63, 255);
+            rd.FillRect(ox + Data.W / 2 - 170, oy + 230, 340, 3);
+            PixelFont.Draw(rd, "BOMB!", ox + Data.W / 2 - 55,
+                           oy + 250, 4, 240, 176, 80, 255);
+            PixelFont.Draw(rd, Convert.ToString(wo.bombClicks) + "/"
+                           + Convert.ToString(wo.bombNeed) + "  "
+                           + Convert.ToString(wo.bombTimeLeft / 1000 + 1) + "s",
+                           ox + Data.W / 2 - 70, oy + 296, 3, 232, 226, 212, 255);
+        }
+        // 结算覆盖
+        if (wo.state == World.ST_RESULT) {
+            bool win = wo.levelResult > 0;
+            rd.SetColor(10, 12, 17, 205);
+            rd.FillRect(ox + Data.W / 2 - 230, oy + 200, 460, 210);
+            rd.SetColor(win ? 111 : 192, win ? 170 : 85, win ? 94 : 63, 255);
+            rd.FillRect(ox + Data.W / 2 - 230, oy + 200, 460, 3);
+            PixelFont.Draw(rd, win ? "WIN!" : "TIME UP",
+                           ox + Data.W / 2 - 70, oy + 222, 4, 232, 226, 212, 255);
+            PixelFont.Draw(rd, "$" + Convert.ToString(wo.gold) + "/"
+                           + Convert.ToString(wo.Target()),
+                           ox + Data.W / 2 - 70, oy + 280, 3, 224, 196, 120, 255);
+            PixelFont.Draw(rd, "TOTAL $" + Convert.ToString(wo.totalGold),
+                           ox + Data.W / 2 - 96, oy + 314, 3, 232, 226, 212, 255);
+        }
+        rd.SetColor(0, 0, 0, 255);
+    }
+
+    void DrawClaw(int ox, int oy) {        SdlRenderer rd = this.r;
         World wo = this.w;
         double rad = wo.angle * Math.PI / 180.0;
         int cx = ox + Data.HOOK_X + (int)(Math.Cos(rad) * wo.clawLen);
         int cy = oy + Data.HOOK_Y + (int)(Math.Sin(rad) * wo.clawLen);
-        // 绳:矿工手 → 爪(用短线段逐段画,近似摆动弧度)
+        // 爪顶铰点(绿点):纹理顶缘中点绕中心随摆角旋转。绳必须接到
+        // 这里——接到爪中心会差半个爪身,看起来"绳没挂在爪上"。
+        int ch = this.clawH;
+        int pr = ch * 2 / 5;
+        int ex = cx - (int)(Math.Sin(rad) * pr);
+        int ey = cy - (int)(Math.Cos(rad) * pr);
+        // 绳:矿工手 → 爪铰点(短线段逐段画,近似摆动弧度)
         int segs = 8;
-        int px = ox + Data.HOOK_X;
-        int py = oy + Data.HOOK_Y - 26;
+        int sx0 = ox + Data.HOOK_X;
+        int sy0 = oy + Data.HOOK_Y - 26;
+        int px = sx0;
+        int py = sy0;
         for (int i = 1; i <= segs; i = i + 1) {
             double t = (double)i / segs;
-            int nx = ox + Data.HOOK_X + (int)(Math.Cos(rad) * wo.clawLen * t);
-            int ny = oy + Data.HOOK_Y + (int)(Math.Sin(rad) * wo.clawLen * t);
+            int nx = sx0 + (int)((ex - sx0) * t);
+            int ny = sy0 + (int)((ey - sy0) * t);
             // 中段下垂感:前半段向下偏移
             int sag = i < segs / 2 ? (segs / 2 - i) * 2 : 0;
-            rd.SetColor(70, 52, 36, 255);
+            // 两遍 1px 并排成 2px 绳身,深棕+浅棕在土色背景上可读
+            rd.SetColor(74, 56, 38, 255);
+            rd.DrawLine(px, py + sag, nx, ny + (i < segs / 2 ? sag : 0));
+            rd.DrawLine(px, py + sag + 1, nx, ny + (i < segs / 2 ? sag : 0) + 1);
+            rd.SetColor(128, 100, 66, 255);
             rd.DrawLine(px, py + sag, nx, ny + (i < segs / 2 ? sag : 0));
             px = nx;
             py = ny;
         }
         rd.SetColor(0, 0, 0, 255);
         // 爪纹理(旋转对齐摆角:0 度 = 纹理朝下)
-        int ch = this.clawH;
         if (this.texClaw != null && this.texClaw.IsValid()) {
             int cw = this.clawW;
             int ang = (int)(wo.angle) - 90;
@@ -422,14 +504,14 @@ class MinerApp {
         } else {
             Draw.FillCircle(rd, cx, cy, 14, 160, 160, 170, 255);
         }
-        // 钩上物跟随爪心
+        // 钩上物跟随爪心(顶部收进爪内,悬挂点在爪身下 30% 处)
         if (wo.hookedKind >= 0) {
             ItemDef d = Data.DEFS[wo.hookedKind];
             SdlTexture t = this.texKind[wo.hookedKind];
             if (t != null && t.IsValid()) {
                 int dw = d.texW;
                 int dh = d.texH;
-                rd.DrawTexture(t, cx - dw / 2, cy + ch / 2 - 6, dw, dh);
+                rd.DrawTexture(t, cx - dw / 2, cy + ch * 3 / 10 - 4, dw, dh);
             }
         }
     }
@@ -483,6 +565,7 @@ class MinerApp {
             return;
         }
         this.hud.Root(form);
+        this.guiReady = true;
         this.host.hudMode = true;   // 宿主 End() 不再自己 Present
     }
 
@@ -733,13 +816,12 @@ class MinerApp {
             app.host.Begin(12, 10, 8);
             app.DrawAll();
             app.host.End();
-            if (app.hud == null) {
-                Console.WriteLine("[hud] takeover failed: hud is null");
-                return 2;
-            }
-            if (!app.hud.Frame(app.r, h.WindowHandle())) {
-                Console.WriteLine("[hud] frame failed: " + app.hud.LastError());
-                return 2;
+            if (app.hud != null) {
+                if (!app.hud.Frame(app.r, h.WindowHandle())) {
+                    // 与主循环一致的降级:合成失败退回宿主直呈 + 场景层兜底
+                    app.hud = null;
+                    app.host.hudMode = false;
+                }
             }
             if (f == 20) {
                 app.r.Present();
@@ -793,6 +875,53 @@ class MinerApp {
         b[at + 1] = (byte)((v >> 8) & 0xFF);
         b[at + 2] = (byte)((v >> 16) & 0xFF);
         b[at + 3] = (byte)((v >> 24) & 0xFF);
+    }
+}
+
+// 3x5 像素字模(0-9 $ / 空格 : x L V T N s F E .),纯 FillRect 绘制,
+// 不依赖 gui 字体引擎——兜底 HUD 在 gui 运行时不可用也必然可画。
+class PixelFont {
+    static string chars = "0123456789$/ :xLVTNsFE.";
+    static int[] glyphs = PixelFont.Build();
+
+    static int[] Build() {
+        int[] g = new int[23];
+        g[0] = 0x7B6F; g[1] = 0x2C97; g[2] = 0x73E7; g[3] = 0x72CF;
+        g[4] = 0x5BC9; g[5] = 0x79CF; g[6] = 0x79EF; g[7] = 0x7252;
+        g[8] = 0x7BEF; g[9] = 0x7BCF; g[10] = 0x2F9F; g[11] = 0x12A4;
+        g[12] = 0x0000; g[13] = 0x0410; g[14] = 0x0AA8; g[15] = 0x4927;
+        g[16] = 0x5B6A; g[17] = 0x7492; g[18] = 0x5FED; g[19] = 0x388E;
+        g[20] = 0x79A4; g[21] = 0x79A7; g[22] = 0x0002;
+        return g;
+    }
+
+    static int GlyphOf(char c) {
+        for (int i = 0; i < chars.Length; i = i + 1) {
+            if (chars[i] == c) { return glyphs[i]; }
+        }
+        return glyphs[12];
+    }
+
+    public static int Width(int n, int scale) {
+        return n * 4 * scale - scale;
+    }
+
+    public static void Draw(SdlRenderer r, string text, int x, int y, int scale,
+                            int cr, int cg, int cb, int ca) {
+        int cx = x;
+        for (int i = 0; i < text.Length; i = i + 1) {
+            int g = GlyphOf(text[i]);
+            for (int row = 0; row < 5; row = row + 1) {
+                // 行 0(顶行)打包在最高 3 位,读位时反向。
+                for (int col = 0; col < 3; col = col + 1) {
+                    if (((g >> ((4 - row) * 3 + (2 - col))) & 1) != 0) {
+                        r.FillRect(cx + col * scale, y + row * scale,
+                                   scale, scale);
+                    }
+                }
+            }
+            cx = cx + 4 * scale;
+        }
     }
 }
 
