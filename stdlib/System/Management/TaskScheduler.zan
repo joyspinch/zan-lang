@@ -10,9 +10,13 @@ namespace System.Management;
 /// 程序；仅由 Get() 填充（列表视图省略它）。
 /// </summary>
 class TaskInfo {
+    /// 完整任务路径（Windows）或任务名 / "cron:<行号>"（POSIX）。
     public string name;
+    /// 下次运行时间的操作系统文本表示。
     public string nextRun;
+    /// 操作系统状态文本（"Ready"、"Running"、"Disabled"...）。
     public string status;
+    /// 任务运行的程序（含参数）；仅 Get() 填充，List() 留空。
     public string command;
 }
 
@@ -202,10 +206,10 @@ class TaskScheduler {
     }
 
     #if !WINDOWS
-    // 本类写入的条目前的标记行。
+    /// 本类写入的条目前的标记行。
     static string Marker(string name) { return "# zan-task: " + name; }
 
-    // 行是标记行时返回任务名，否则返回 ""。
+    /// 行是标记行时返回任务名，否则返回 ""。
     static string MarkerName(string line) {
         string prefix = "# zan-task:";
         if (!TaskScheduler.StartsWith(line, prefix)) { return ""; }
@@ -213,6 +217,7 @@ class TaskScheduler {
             line.Substring(prefix.Length, line.Length - prefix.Length));
     }
 
+    /// 当前用户的 crontab 全部行；没有 crontab 时返回空列表。
     static List<string> CrontabLines() {
         ProcessResult r = Process.Capture("crontab -l");
         // 没有 crontab 时它以非 0 退出并在 stderr 上报 "no crontab for ..."。
@@ -220,6 +225,8 @@ class TaskScheduler {
         return r.lines;
     }
 
+    /// 把行列表整体写回当前用户的 crontab（经临时文件加
+    /// `crontab <file>`）；任一步失败返回 false。
     static bool WriteCrontab(List<string> lines) {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < lines.Count; i = i + 1) {
@@ -273,7 +280,7 @@ class TaskScheduler {
         return "";
     }
 
-    // 从 "HH:MM" 取第 `index` 个字段（0=小时，1=分钟）；无效时返回 -1。
+    /// 从 "HH:MM" 取第 `index` 个字段（0=小时，1=分钟）；无效时返回 -1。
     static int TimePart(string time, int index) {
         string t = TaskScheduler.Trim(time);
         int colon = TaskScheduler.IndexOf(t, ":", 0);
@@ -283,6 +290,7 @@ class TaskScheduler {
             t.Substring(colon + 1, t.Length - colon - 1));
     }
 
+    /// 十进制解析为 int；空串或含非数字返回 -1。
     static int ParseInt(string s) {
         string t = TaskScheduler.Trim(s);
         if (t.Length == 0) { return 0 - 1; }
@@ -295,6 +303,7 @@ class TaskScheduler {
         return v;
     }
 
+    /// ASCII 字母转大写，其余字符原样保留。
     static string Upper(string s) {
         StringBuilder sb = new StringBuilder();
         string upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -309,7 +318,7 @@ class TaskScheduler {
         return sb.ToString();
     }
 
-    // cron 行：要么 "@reboot cmd"，要么五个时间字段后接命令。
+    /// cron 行的调度字段：要么 "@reboot" 这类 @形式，要么前五个时间字段。
     static string CronSchedule(string line) {
         if (TaskScheduler.StartsWith(line, "@")) {
             int sp = TaskScheduler.IndexOf(line, " ", 0);
@@ -319,6 +328,7 @@ class TaskScheduler {
         return TaskScheduler.FieldSplit(line, 5, true);
     }
 
+    /// cron 行的命令部分（时间字段之后的剩余文本）。
     static string CronCommand(string line) {
         if (TaskScheduler.StartsWith(line, "@")) {
             int sp = TaskScheduler.IndexOf(line, " ", 0);
@@ -329,7 +339,7 @@ class TaskScheduler {
         return TaskScheduler.FieldSplit(line, 5, false);
     }
 
-    // 取前 `count` 个空白分隔字段（head），或它们后面的剩余部分。
+    /// 取前 `count` 个空白分隔字段（head=true），或它们后面的剩余部分。
     static string FieldSplit(string line, int count, bool head) {
         int i = 0;
         int fields = 0;
@@ -349,15 +359,17 @@ class TaskScheduler {
         return TaskScheduler.Trim(line.Substring(i, line.Length - i));
     }
 
+    /// 是否空白字符（空格或制表）。
     static bool IsSpace(int ch) { return ch == 32 || ch == 9; }
 
-    // 单引号引用：内部的 ' 拆成 '\'' 以保持字面量。
+    /// 单引号引用：内部的 ' 拆成 '\'' 以保持字面量。
     static string ShellQuote(string s) {
         return "'" + s.Replace("'", "'\\''") + "'";
     }
     #endif
 
     #if WINDOWS
+    /// 运行 schtasks 命令并按输出判断成败（含 "ERROR"/"Error" 行即失败）。
     static bool SchtasksOk(string cmd) {
         List<string> lines = Process.RunCapture(cmd + " 2>&1");
         // schtasks 成功时输出 "SUCCESS: ..." / "INFO: ..."，
@@ -373,19 +385,20 @@ class TaskScheduler {
         return true;
     }
 
+    /// 双引号包裹（schtasks /tn /tr 参数用）。
     static string Quote(string s) {
         return "\"" + s + "\"";
     }
 
-    // 第一个冒号之后的所有内容，去掉两端空白。
+    /// 第一个冒号之后的所有内容，去掉两端空白。
     static string AfterColon(string line) {
         int idx = TaskScheduler.IndexOf(line, ":", 0);
         if (idx < 0) { return ""; }
         return TaskScheduler.Trim(line.Substring(idx + 1, line.Length - idx - 1));
     }
 
-    // 解析一行 CSV："a","b","c" -> [a, b, c]。带引号的字段可能
-    // 包含逗号；成对引号（""）表示字面引号。
+    /// 解析一行 CSV："a","b","c" -> [a, b, c]。带引号的字段可能
+    /// 包含逗号；成对引号（""）表示字面引号。
     static List<string> ParseCsv(string line) {
         List<string> out2 = new List<string>();
         string cur = "";
@@ -419,6 +432,7 @@ class TaskScheduler {
         return out2;
     }
 
+    /// 返回第一条非空行；全是空行时返回 null。
     static string FirstNonEmpty(List<string> lines) {
         for (int i = 0; i < lines.Count; i = i + 1) {
             if (TaskScheduler.Trim(lines[i]).Length > 0) { return lines[i]; }
@@ -429,11 +443,13 @@ class TaskScheduler {
     #endif
 
     // 两个平台的解析代码共用的字符串工具。
+    /// `s` 是否以 `prefix` 开头（区分大小写）。
     static bool StartsWith(string s, string prefix) {
         if (prefix.Length > s.Length) { return false; }
         return s.Substring(0, prefix.Length) == prefix;
     }
 
+    /// 去掉两端空白（空格/制表/回车/换行）。
     static string Trim(string s) {
         int a = 0;
         int b = s.Length;
@@ -449,6 +465,7 @@ class TaskScheduler {
         return s.Substring(a, b - a);
     }
 
+    /// 从 `from` 起查找 `needle` 的首次出现，找不到返回 -1。
     static int IndexOf(string hay, string needle, int from) {
         int n = needle.Length;
         int h = hay.Length;
