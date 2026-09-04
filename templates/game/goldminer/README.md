@@ -40,17 +40,24 @@ examples/ 下的共享模块，可随项目自由修改。
 构建
 ----
 仓库根编译（产物 build/goldminer.exe，运行所需 DLL 自动落在
-同目录）：
+同目录）。**--embed 必须带上**：游戏启动先读 exe 旁 assets/，
+找不到就回退内嵌副本；不 embed 且目录里没有 assets/ 时贴图、
+背景与音效全部加载失败（黑屏）：
 
     build\zanc.exe templates\game\goldminer\src\main.zan ^
                    templates\game\goldminer\src\Game.zan ^
                    templates\game\goldminer\src\Kit.zan ^
-                   --auto-stdlib -o build\goldminer.exe
+                   --auto-stdlib ^
+                   --embed templates\game\goldminer\assets=assets ^
+                   -o build\goldminer.exe
 
 素材
 ----
 assets/ 下全部 PNG/JPG/WAV 均可替换；代码按 "assets/<name>.<ext>" 相对 exe
-向上查找（Assets.Find），打包分发保持 exe 与 assets/ 同级即可。
+向上查找（Assets.Find），找不到再读编译期 --embed 进 exe 的内嵌副本
+（File.EmbedExists / File.ExtractEmbedded），单文件分发也出声出图。
+IDE「新建项目」复制本模板后，assets/ 与 src/ 同级，用 zanc 编译时
+记得同样加 `--embed assets=assets`。
 
 文件
 ----

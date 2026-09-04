@@ -176,15 +176,25 @@ class Host {
         this.nextFrame = Sdl.Ticks();
     }
 
-    // 最小化时空闲帧距（后台游戏几乎不耗 CPU）。
+    // 后台空闲帧距：失焦或最小化（用户当前没看着窗口）时降到该节奏，
+    // 软件光栅化场景全速重绘会把一个核跑满。重新聚焦立即恢复。
     public void SetIdleFps(int fps) {
         if (fps < 1) { fps = 1; }
         this.idleMs = 1000 / fps;
     }
 
-    void PaceFrame() {
+    bool focused = true;
+
+    int EffectiveFrameMs() {
         int ms = this.frameMs;
-        if (this.minimized && this.idleMs > ms) { ms = this.idleMs; }
+        if ((this.minimized || !this.focused) && this.idleMs > ms) {
+            ms = this.idleMs;
+        }
+        return ms;
+    }
+
+    void PaceFrame() {
+        int ms = this.EffectiveFrameMs();
         if (ms <= 0) { return; }
         int now = Sdl.Ticks();
         if (now < this.nextFrame) {
@@ -207,6 +217,10 @@ class Host {
     }
 
     public void OnWindowEvent(int type) {
+        // 失焦/聚焦切换后台节奏（见 SetIdleFps）：后台窗口不再是用户的
+        // 活动表面，全速重绘只烧 CPU。
+        if (type == SdlEventType.WindowFocusLost()) { this.focused = false; }
+        if (type == SdlEventType.WindowFocusGained()) { this.focused = true; }
         if (type == SdlEventType.WindowMinimized()) {
             this.minimized = true;
             this.nextFrame = Sdl.Ticks() + this.frameMs;
@@ -397,11 +411,15 @@ class Text {
     static int surf = -1;
     static long tick;
 
-    static void CopyPixels(nint src, string dst, int bytes) {
-        string s = NativeMemory.GetString(src, 0, bytes);
-        for (int i = 0; i < bytes; i = i + 1) {
-            dst[i] = s[i];
-        }
+    // 把原生 RGBA 缓冲打包成纹理可吃的 string（strings 携带显式长度，
+    // 内嵌 NUL 字节得以保留）。走 ByteBuffer 分配：`new string(char,int)`
+    // 在当前编译器上返回 null（见 TASKS.md 编译器缺陷备案）。
+    static string PixelsToString(nint src, int bytes) {
+        ByteBuffer pixbuf = ByteBuffer.Alloc(bytes);
+        NativeMemory.Copy(pixbuf.Raw(), src, bytes);
+        string s = pixbuf.ToStr();
+        pixbuf.Free();
+        return s;
     }
 
     static bool Ready() {
@@ -456,8 +474,8 @@ class Text {
         if (pix == 0) { return null; }
         SdlTexture tex = SdlTexture.CreateRgba32(r, sw, sh, true);
         if (tex == null || !tex.IsValid()) { return null; }
-        string buf = new string('\0', sw * sh * 4);
-        Text.CopyPixels(pix, buf, sw * sh * 4);
+        string buf = Text.PixelsToString(pix, sw * sh * 4);
+        if (buf == null) { tex.Close(); return null; }
         if (!tex.Update(buf, sw * 4)) { tex.Close(); return null; }
         tex.SetNearest(false);
         tex.SetBlendMode(1);
