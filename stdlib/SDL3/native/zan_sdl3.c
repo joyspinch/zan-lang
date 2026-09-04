@@ -503,6 +503,32 @@ ZAN_SDL_API zan_i32 zan_sdl_render_texture(
         &dst));
 }
 
+/* Rotated texture draw with the angle as an explicit argument. The old
+ * packed-into-width contract (angle in the high 32 bits of `width`) could
+ * never fire: Zan `int` is 32-bit so `angle << 32` is 0, and the C side
+ * receives `width` as zan_i32 so the shift-back yields 0 too. Callers that
+ * need rotation must use this entry point. */
+ZAN_SDL_API zan_i32 zan_sdl_render_texture_rot(
+    zan_iptr renderer, zan_iptr texture, zan_i32 x, zan_i32 y,
+    zan_i32 width, zan_i32 height, zan_i32 angle_deg) {
+    if (!renderer || !texture) return 0;
+    SDL_FRect dst = zan_rect(x, y, width, height);
+    if (angle_deg % 360 == 0)
+        return zan_bool(SDL_RenderTexture(
+            (SDL_Renderer *)zan_ptr(renderer),
+            (SDL_Texture *)zan_ptr(texture),
+            NULL,
+            &dst));
+    return zan_bool(SDL_RenderTextureRotated(
+        (SDL_Renderer *)zan_ptr(renderer),
+        (SDL_Texture *)zan_ptr(texture),
+        NULL,
+        &dst,
+        (double)angle_deg,
+        NULL,
+        SDL_FLIP_NONE));
+}
+
 /* ---- 2D 渲染 backend extensions (渲染 targets, blend, clip) ----
  * These thin wrappers expose the SDL_Renderer features a GPU-accelerated GUI
  * 画布 needs: offscreen 渲染 targets (for downsample blur), source-region
