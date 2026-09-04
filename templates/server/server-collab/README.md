@@ -401,6 +401,7 @@ that turns the admin sidebar into a drawer, and tables that become cards under
 {{name}}                   escaped variable
 {{{name}}}                 raw variable
 {{#if name}}...{{/if}}     conditional
+{{#if name}}...{{else}}...{{/if}}  conditional with else branch
 {{#each rows}}...{{/each}} loop over ViewData.AddList("rows")
 layout.html + {{content}}  page wrapper
 ```

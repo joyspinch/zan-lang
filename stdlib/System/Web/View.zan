@@ -62,11 +62,13 @@ class VNode {
     int kind;
     string text;        // literal text, or the variable/list name
     List<VNode> body;   // children of #if / #each
+    List<VNode> elseBody; // kind==3: children after a same-level {{else}}
 
     VNode(int kind, string text) {
         this.kind = kind;
         this.text = text;
         this.body = null;
+        this.elseBody = null;
     }
 }
 
@@ -81,6 +83,7 @@ class VNode {
 ///   {{name}}                  HTML-escaped variable
 ///   {{{name}}}                raw (unescaped) variable
 ///   {{#if name}}...{{/if}}    emitted when var is non-empty and not "0"
+///   {{#if name}}...{{else}}...{{/if}}   else branch when var is falsy
 ///   {{#each name}}...{{/each}} repeated per row; {{key}} reads row fields
 ///   layout.html + {{content}} wraps every RenderPage() body
 /// </summary>
@@ -242,8 +245,21 @@ class View {
                     if (endIf < 0) { return nodes; }
                     VNode node = new VNode(3,
                         View.Trim(tag.Substring(4, tag.Length - 4)));
-                    node.body = View.Compile(
-                        tpl.Substring(close + 2, endIf - close - 2));
+                    // {{else}} 拆分（Bug#11）：同层 else 之前的段是真分支，
+                    // 之后的段是假分支。嵌套 if/each 内的 else 属于内层，
+                    // 由 FindElse 的深度计数跳过；无 else 时走原单段编译，
+                    // 向后兼容（修复前 else 只是被当空变量吞掉、真分支
+                    // 照样渲染假分支正文——12 处视图因此双渲染）。
+                    int anElse = View.FindElse(tpl, close + 2, endIf);
+                    if (anElse >= 0) {
+                        node.body = View.Compile(
+                            tpl.Substring(close + 2, anElse - close - 2));
+                        node.elseBody = View.Compile(
+                            tpl.Substring(anElse + 8, endIf - anElse - 8));
+                    } else {
+                        node.body = View.Compile(
+                            tpl.Substring(close + 2, endIf - close - 2));
+                    }
                     nodes.Add(node);
                     i = endIf + 7;
                 } else if (tag.Length > 6 && tag.Substring(0, 6) == "#each ") {
@@ -286,6 +302,8 @@ class View {
                 string val = View.Lookup(nd.text, data, row);
                 if (val.Length > 0 && val != "0" && val != "false") {
                     View.Emit(nd.body, data, row, content, sb);
+                } else if (nd.elseBody != null) {
+                    View.Emit(nd.elseBody, data, row, content, sb);
                 }
             } else if (nd.kind == 4) {
                 List<StrMap> rows = null;
@@ -385,6 +403,46 @@ class View {
                 i = nextClose + closeTag.Length;
             } else {
                 return nextClose;
+            }
+        }
+        return -1;
+    }
+
+    /// <summary>Finds a same-level {{else}} within [from, end): nested
+    /// if/each blocks are skipped by depth counting, so an {{else}} inside
+    /// an inner {{#if}}/{{#each}} belongs to that inner block, not to the
+    /// caller's. Returns the position of the opening brace, or -1.</summary>
+    static int FindElse(string tpl, int from, int end) {
+        int depth = 0;
+        int i = from;
+        while (i < end) {
+            int openIf = View.Find(tpl, "{{#if ", i);
+            int openEach = View.Find(tpl, "{{#each ", i);
+            int closeIf = View.Find(tpl, "{{/if}}", i);
+            int closeEach = View.Find(tpl, "{{/each}}", i);
+            int anElse = View.Find(tpl, "{{else}}", i);
+            int best = -1;
+            if (openIf >= 0) { best = openIf; }
+            if (openEach >= 0 && (best < 0 || openEach < best)) { best = openEach; }
+            if (closeIf >= 0 && (best < 0 || closeIf < best)) { best = closeIf; }
+            if (closeEach >= 0 && (best < 0 || closeEach < best)) { best = closeEach; }
+            if (anElse >= 0 && (best < 0 || anElse < best)) { best = anElse; }
+            if (best < 0 || best >= end) { return -1; }
+            if (best == anElse) {
+                if (depth == 0) { return anElse; }
+                i = anElse + 8;
+            } else if (best == openIf) {
+                depth = depth + 1;
+                i = openIf + 6;
+            } else if (best == openEach) {
+                depth = depth + 1;
+                i = openEach + 8;
+            } else if (best == closeIf) {
+                depth = depth - 1;
+                i = closeIf + 7;
+            } else {
+                depth = depth - 1;
+                i = closeEach + 9;
             }
         }
         return -1;

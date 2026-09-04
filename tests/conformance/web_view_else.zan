@@ -1,0 +1,78 @@
+// Conformance: View template {{#if}}/{{else}}/{{/if}} branches (Bug#11).
+// Before the fix the engine had no else support at all: Compile() put the
+// whole tail (including the {{else}} marker and the text after it) into the
+// if body, and Emit() rendered the else tag as an empty variable -- so a true
+// condition rendered BOTH branches ("A" + "B"). The fix splits the body at a
+// same-level {{else}} (depth counting skips nested if/each blocks) into
+// body/elseBody and renders exactly one of them. Pins: the three-state truth
+// table, the "0"/"false"/empty falsy rule, backward compatibility for
+// if-without-else, nested ownership (inner else stays inner, outer else is
+// reached only when the outer condition fails), and else inside {{#each}}.
+using System;
+using System.Web;
+
+class Program {
+    static int failures = 0;
+
+    static void Check(string got, string want, string name) {
+        if (got == want) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name + " got=[" + got + "] want=[" + want + "]");
+            failures = failures + 1;
+        }
+    }
+
+    static string R(string tpl, string x) {
+        ViewData d = new ViewData();
+        d.Set("x", x);
+        return View.RenderStr(tpl, d, null);
+    }
+
+    static string R2(string tpl, string a, string b) {
+        ViewData d = new ViewData();
+        d.Set("a", a);
+        d.Set("b", b);
+        return View.RenderStr(tpl, d, null);
+    }
+
+    static async int Run() {
+        // three-state truth table
+        Check(R("{{#if x}}A{{else}}B{{/if}}", "1"), "A", "then when non-empty");
+        Check(R("{{#if x}}A{{else}}B{{/if}}", "0"), "B", "else when zero");
+        Check(R("{{#if x}}A{{else}}B{{/if}}", ""), "B", "else when empty");
+        Check(R("{{#if x}}A{{else}}B{{/if}}", "false"), "B", "else when false");
+        // backward compatibility: if without else renders nothing when falsy
+        Check(R("{{#if x}}A{{/if}}", "1"), "A", "no-else then");
+        Check(R("{{#if x}}A{{/if}}", "0"), "", "no-else falsy empty");
+        // nested ownership, two variables so both levels can be exercised
+        string NT = "{{#if a}}X{{#if b}}Y{{else}}Z{{/if}}{{else}}W{{/if}}";
+        Check(R2(NT, "1", "1"), "XY", "nested both true");
+        Check(R2(NT, "1", "0"), "XZ", "nested inner else");
+        Check(R2(NT, "0", "1"), "W", "nested outer else");
+        // a same-level else after a closed inner block belongs to the outer if
+        Check(R2("{{#if a}}X{{#if b}}Y{{/if}}{{else}}W{{/if}}", "1", "1"),
+            "XY", "outer else skipped when true");
+        Check(R2("{{#if a}}X{{#if b}}Y{{/if}}{{else}}W{{/if}}", "0", "1"),
+            "W", "outer else taken when false");
+        // else inside an {{#each}} row body works and keeps row fields
+        ViewData d = new ViewData();
+        List<StrMap> rows = d.AddList("rows");
+        StrMap r1 = new StrMap();
+        r1.Set("v", "1");
+        rows.Add(r1);
+        StrMap r2 = new StrMap();
+        r2.Set("v", "");
+        rows.Add(r2);
+        Check(View.RenderStr("{{#each rows}}<{{#if v}}Y{{else}}N{{/if}}>{{/each}}", d, null),
+            "<Y><N>", "each row else per row");
+        // then-branch body is not swallowed: variables still interpolate
+        Check(R("{{#if x}}{{x}}{{else}}B{{/if}}", "1"), "1", "then keeps body");
+        Console.WriteLine("failures=" + failures.ToString());
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}
