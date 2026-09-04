@@ -1,0 +1,77 @@
+using System;
+using System.Data;
+using System.Web;
+using ZanWeb;
+
+namespace ZanWeb.Account;
+
+/* 商城登录/注册/退出：与 /api/auth 系列发同一张 cookie（IdentityFlow.Login
+ * → AuthToken.Issue），浏览器会话与 IDE 侧 API 令牌同一机制。
+ * 独立模块 + 居中卡片外壳（views/Account/layout.html）。
+ * 失败重渲同卡片，理由留在用户正看的页面上；成功跳 next 或首页。 */
+[Route("[controller]/[action]")]
+[Custom(Authorization = CustomAuthorization.None)]
+[Description("登录")]
+class Login : AppController {
+    static string Tpl = "Account.Login.Index";
+
+    [HttpGet]
+    [Route("/login")]
+    [Description("登录")]
+    void Index() {
+        if (this.IsLogin()) { this.Ctx().Redirect("/account"); }
+        this.ViewOf(Login.Tpl, Login.Form("", this.In("user"),
+            Login.SafeNext(this.In("next"))));
+    }
+
+    [HttpPost]
+    [Route("/login")]
+    async void Submit() {
+        string user = this.In("user");
+        string pass = this.In("password");
+        string next = Login.SafeNext(this.In("next"));
+        if (user.Length == 0 || pass.Length == 0) {
+            this.ViewOf(Login.Tpl, Login.Form("请输入账号和密码", user, next));
+            return;
+        }
+        if (user.Length > 64 || pass.Length > 128) {
+            this.ViewOf(Login.Tpl, Login.Form("账号或密码超出长度限制", "", next));
+            return;
+        }
+        if (!this.DbReady()) {
+            this.ViewOf(Login.Tpl, Login.Form("服务暂时不可用，请稍后再试", user, next));
+            return;
+        }
+        /* 空串同时覆盖"无此账号"与"密码错误"，页面不区分两种失败。 */
+        string token = await new IdentityFlow(this.Held()).Login(user, pass);
+        if (token.Length == 0) {
+            this.ViewOf(Login.Tpl, Login.Form("账号或密码不正确", user, next));
+            return;
+        }
+        this.Ctx().SetCookie("zsession", token, 2592000);
+        this.Ctx().Redirect(next.Length > 0 ? next : "/account");
+    }
+
+    [HttpGet]
+    [Route("/logout")]
+    void Out() {
+        this.Ctx().SetCookie("zsession", "", 0);
+        this.Ctx().Redirect("/");
+    }
+
+    /* next 只收站内路径，防开放重定向。 */
+    static string SafeNext(string next) {
+        if (next.Length == 0 || !next.StartsWith("/")) { return ""; }
+        if (next.StartsWith("//")) { return ""; }
+        return next;
+    }
+
+    static ViewData Form(string error, string user, string next) {
+        ViewData d = new ViewData();
+        d.Set("title", "登录 · Zan 商城");
+        d.Set("error", error);
+        d.Set("user", user);
+        d.Set("next", next);
+        return d;
+    }
+}

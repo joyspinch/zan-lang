@@ -1,0 +1,162 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Mall;
+
+namespace ZanWeb.Account;
+
+/* 账户中心 /account：积分余额、卡密兑换、我的授权（下载/许可证）、评价入口。
+ * 页面表单 POST 到本控制器的动作，动作复用 Feature 层（MallFlow + IdentityFlow），失败理由回显在页面上；与 /api/mall 系列完全同一套业务规则。
+ * 开发者入口（提交商品/版本）单独一个子页 /account/developer。 */
+[Route("account")]
+[Custom(Authorization = CustomAuthorization.Login)]
+[Description("账户中心")]
+class Account : AppController {
+    [HttpGet]
+    [Route("/account")]
+    [Description("账户中心")]
+    async void Index() {
+        if (!this.DbReady()) { this.Fail(503, "2001", "服务暂时不可用，请稍后再试"); }
+        int uid = Filter.ToInt(this.uid, 0);
+        IdentityFlow ident = new IdentityFlow(this.Held());
+        MallFlow flow = new MallFlow(this.Held());
+        User me = await ident.ById(uid);
+        if (me == null) { this.Ctx().Redirect("/login?next=/account"); }
+
+        ViewData d = await this.Page(uid, me.points, "", true);
+        this.View(d);
+    }
+
+    /* 页面数据骨架：余额 + 授权列表（含商品名），供 GET 与各 POST 动作
+     * 失败重渲共用——理由显示在用户正看的页面上。 */
+    async ViewData Page(int uid, long points, string message, bool ok) {
+        IdentityFlow ident = new IdentityFlow(this.Held());
+        MallFlow flow = new MallFlow(this.Held());
+        User me = await ident.ById(uid);
+
+        ViewData d = new ViewData();
+        await Settings.Apply(d);
+        d.Set("title", "我的账户 · Zan 商城");
+        d.Set("logged", "1");
+        d.Set("username", me != null ? me.username : "");
+        d.Set("points", Convert.ToString(points));
+        d.Set("isDeveloper", me != null
+            && (me.role == "developer" || me.role == "admin") ? "1" : "");
+        if (message.Length > 0) {
+            d.Set(ok ? "flashOk" : "flashBad", message);
+        }
+
+        JsonValue ents = await flow.Entitlements(uid);
+        List<StrMap> rows = d.AddList("entitlements");
+        if (ents.IsArray()) {
+            for (int i = 0; i < ents.Count(); i = i + 1) {
+                JsonValue o = ents.At(i);
+                StrMap m = new StrMap();
+                int productId = Filter.ToInt(o.Str("product_id", "0"), 0);
+                CatalogDao dao = new CatalogDao(this.Held());
+                Product p = await dao.ProductById(productId);
+                m.Set("product", p != null ? p.name : "#" + Convert.ToString(productId));
+                string mode = o.Str("license_mode", "");
+                m.Set("mode", mode == "periodic" ? "订阅" : "买断");
+                long expires = Filter.ToLong(o.Str("expires_at", "0"), 0);
+                m.Set("expires", expires > 0 ? Fmt.Stamp(expires) : "长期有效");
+                JsonValue dis = o.Get("disabled");
+                m.Set("disabled", dis != null && dis.AsInt(0) == 1 ? "已停用" : "有效");
+                m.Set("id", o.Str("id", ""));
+                rows.Add(m);
+            }
+        }
+        d.Set("noEnts", rows.Count == 0 ? "1" : "");
+        return d;
+    }
+
+    /* ---- 卡密兑换 ---- */
+
+    [HttpPost]
+    [Route("/account/redeem")]
+    [Tx]
+    async void Redeem() {
+        if (!this.DbReady()) { this.Fail(503, "2001", "服务暂时不可用"); }
+        int uid = Filter.ToInt(this.uid, 0);
+        IdentityFlow ident = new IdentityFlow(this.Held());
+        string code = this.In("code");
+        long before = await ident.PointsOf(uid);
+        bool ok = await new MallFlow(this.Held()).Redeem(uid, code);
+        if (!ok) {
+            this.View(await this.Page(uid, before, "卡密无效或已被使用", false));
+            return;
+        }
+        long after = await ident.PointsOf(uid);
+        this.View(await this.Page(uid, after, "兑换成功，+" + Convert.ToString(after - before) + " 积分", true));
+    }
+
+    /* ---- 购买（商品详情页方案表单跳这里）---- */
+
+    [HttpPost]
+    [Route("/mall/buy")]
+    [Tx]
+    async void Buy() {
+        if (!this.DbReady()) { this.Fail(503, "2001", "服务暂时不可用"); }
+        int uid = Filter.ToInt(this.uid, 0);
+        int planId = this.InInt("plan_id", 0);
+        int pageId = this.InInt("id", 0);
+        string no = await new MallFlow(this.Held()).Buy(uid, planId);
+        if (no.Length == 0) {
+            this.Ctx().Redirect("/mall/product?id=" + Convert.ToString(pageId)
+                + "&failed=1");
+            return;
+        }
+        this.Ctx().Redirect("/account?ordered=" + no);
+    }
+
+    /* ---- 下载（授权闸在 MallFlow.DownloadUrl）---- */
+
+    [HttpPost]
+    [Route("/account/download")]
+    async void Download() {
+        if (!this.DbReady()) { this.Fail(503, "2001", "服务暂时不可用"); }
+        int uid = Filter.ToInt(this.uid, 0);
+        int productId = this.InInt("product_id", 0);
+        CatalogDao dao = new CatalogDao(this.Held());
+        List<ProductVersion> versions = await dao.ApprovedVersions(productId);
+        if (versions.Count == 0) { this.Fail(404, "2004", "没有可下载的版本"); }
+        string url = await new MallFlow(this.Held()).DownloadUrl(uid, versions[0].id);
+        if (url.Length == 0) {
+            this.Fail(403, "2005", "下载未授权");
+        }
+        /* artifact_url 相对商城包根；公开下载走 /packages/ 静态段。 */
+        if (!url.StartsWith("http://") && !url.StartsWith("https://")
+            && url.StartsWith("packages/")) {
+            url = "/packages/" + url.Substring("packages/".Length);
+        }
+        this.Ctx().Redirect(url);
+    }
+
+    /* ---- 许可证签发 ---- */
+
+    [HttpPost]
+    [Route("/account/license")]
+    [Tx]
+    async void License() {
+        if (!this.DbReady()) { this.Fail(503, "2001", "服务暂时不可用"); }
+        int uid = Filter.ToInt(this.uid, 0);
+        int entitlementId = this.InInt("entitlement_id", 0);
+        string mode = this.In("mode");
+        string device = this.In("device_id");
+        string token = await new MallFlow(this.Held())
+            .IssueLicense(uid, entitlementId, mode, device);
+        if (token.Length == 0) {
+            this.View(await this.Page(uid, await this.Points(uid),
+                "许可证签发被拒绝（检查模式与设备号）", false));
+            return;
+        }
+        this.View(await this.Page(uid, await this.Points(uid),
+            "许可证已签发（只显示这一次，请妥善保存）：" + token, true));
+    }
+
+    async long Points(int uid) {
+        return await new IdentityFlow(this.Held()).PointsOf(uid);
+    }
+}

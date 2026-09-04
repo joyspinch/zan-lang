@@ -1,0 +1,190 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Mall;
+
+namespace ZanWeb.Admin;
+
+/* 管理后台 /admin：一次登录可用的四块面板——待审队列（开发者/商品/
+ * 版本/提现）、卡密生成、版本频道（发布/回滚/灰度）。角色闸用
+ * MallRoles.Admin（db.role 复核），未授权 302 回登录页。
+ * 动作复用 IdentityFlow / ChannelFlow，与 /api/malladmin、/api/channeladmin
+ * 完全同一套业务规则。 */
+[Route("admin")]
+[Custom(Authorization = CustomAuthorization.Login)]
+[Description("商城管理后台")]
+class Admin : AppController {
+    [HttpGet]
+    [Route("/admin")]
+    [Description("管理后台")]
+    async void Index() {
+        if (!this.DbReady()) { this.Fail(503, "2001", "服务暂时不可用，请稍后再试"); }
+        if (!await this.IsAdmin()) { this.Ctx().Redirect("/login?next=/admin"); }
+
+        ViewData d = await this.Page("", true);
+        this.View(d);
+    }
+
+    async bool IsAdmin() {
+        User me = await new IdentityFlow(this.Held()).ById(Filter.ToInt(this.uid, 0));
+        return me != null && me.role == "admin";
+    }
+
+    /* 页面数据骨架：四个待审队列 + 频道列表。 */
+    async ViewData Page(string message, bool ok) {
+        ViewData d = new ViewData();
+        await Settings.Apply(d);
+        d.Set("title", "管理后台 · Zan 商城");
+        d.Set("logged", "1");
+        if (message.Length > 0) {
+            d.Set(ok ? "flashOk" : "flashBad", message);
+        }
+
+        IDbConnection db = this.Held();
+
+        List<DeveloperProfile> devs = await db.Select<DeveloperProfile>()
+            .Where(a => a.status == "pending").ToListAsync();
+        List<StrMap> devRows = d.AddList("pendingDevelopers");
+        for (int i = 0; i < devs.Count; i = i + 1) {
+            StrMap m = new StrMap();
+            m.Set("id", Convert.ToString(devs[i].id));
+            m.Set("name", devs[i].displayName);
+            devRows.Add(m);
+        }
+        d.Set("noDevs", devRows.Count == 0 ? "1" : "");
+
+        List<Product> products = await db.Select<Product>()
+            .Where(a => a.status == "pending").ToListAsync();
+        List<StrMap> prodRows = d.AddList("pendingProducts");
+        for (int i = 0; i < products.Count; i = i + 1) {
+            StrMap m = new StrMap();
+            m.Set("id", Convert.ToString(products[i].id));
+            m.Set("name", products[i].name);
+            m.Set("type", products[i].productType);
+            prodRows.Add(m);
+        }
+        d.Set("noProducts", prodRows.Count == 0 ? "1" : "");
+
+        List<ProductVersion> versions = await db.Select<ProductVersion>()
+            .Where(a => a.status == "pending").ToListAsync();
+        List<StrMap> verRows = d.AddList("pendingVersions");
+        for (int i = 0; i < versions.Count; i = i + 1) {
+            StrMap m = new StrMap();
+            m.Set("id", Convert.ToString(versions[i].id));
+            m.Set("version", versions[i].version);
+            m.Set("sha", versions[i].artifactSha256.Length == 64 ? "✓" : "缺摘要");
+            m.Set("signed", versions[i].artifactSignature.Length > 0 ? "✓" : "缺签名");
+            verRows.Add(m);
+        }
+        d.Set("noVersions", verRows.Count == 0 ? "1" : "");
+
+        List<Withdrawal> withdrawals = await db.Select<Withdrawal>()
+            .Where(a => a.status == "pending").ToListAsync();
+        List<StrMap> wdRows = d.AddList("pendingWithdrawals");
+        for (int i = 0; i < withdrawals.Count; i = i + 1) {
+            StrMap m = new StrMap();
+            m.Set("id", Convert.ToString(withdrawals[i].id));
+            m.Set("amount", Convert.ToString(withdrawals[i].amountPoints));
+            m.Set("account", withdrawals[i].account);
+            wdRows.Add(m);
+        }
+        d.Set("noWithdrawals", wdRows.Count == 0 ? "1" : "");
+
+        /* 版本频道当前指针。 */
+        VersionChannelDao dao = new VersionChannelDao(db);
+        List<VersionChannel> channels = await dao.All();
+        List<StrMap> chRows = d.AddList("channels");
+        for (int i = 0; i < channels.Count; i = i + 1) {
+            VersionChannel c = channels[i];
+            StrMap m = new StrMap();
+            m.Set("channel", c.channel);
+            m.Set("platform", c.platform.Length > 0 ? c.platform : "全平台");
+            m.Set("latest", c.latestVersion);
+            m.Set("required", c.requiredVersion.Length > 0 ? c.requiredVersion : "—");
+            m.Set("rollout", Convert.ToString(c.rolloutPercent) + "%");
+            m.Set("status", c.status);
+            chRows.Add(m);
+        }
+        return d;
+    }
+
+    /* ---- 审核动作（approve=0 拒绝）---- */
+
+    [HttpPost]
+    [Route("/admin/review")]
+    [Tx]
+    async void Review() {
+        if (!await this.IsAdmin()) { this.Ctx().Redirect("/login?next=/admin"); }
+        string kind = this.In("kind");
+        int id = this.InInt("id", 0);
+        bool approve = this.In("approve") == "1";
+        IdentityFlow ident = new IdentityFlow(this.Held());
+        bool ok = false;
+        if (kind == "developer") { ok = await ident.ReviewDeveloper(id, approve, ""); }
+        else if (kind == "product") { ok = await ident.ReviewProduct(id, approve, ""); }
+        else if (kind == "version") { ok = await ident.ReviewVersion(id, approve, ""); }
+        else if (kind == "withdrawal") { ok = await ident.ReviewWithdrawal(id, approve, ""); }
+        if (!ok) {
+            this.View(await this.Page("审核未完成（状态已变化或校验未过）", false));
+            return;
+        }
+        this.View(await this.Page(approve ? "已批准" : "已拒绝", true));
+    }
+
+    /* ---- 卡密生成：明文只显示一次 ---- */
+
+    [HttpPost]
+    [Route("/admin/codes")]
+    [Tx]
+    async void Codes() {
+        if (!await this.IsAdmin()) { this.Ctx().Redirect("/login?next=/admin"); }
+        List<string> codes = await new IdentityFlow(this.Held()).GenerateCodes(
+            this.InInt("count", 0), Filter.ToLong(this.In("points"), 0));
+        if (codes.Count == 0) {
+            this.View(await this.Page("生成被拒绝（数量 1-100、积分 ≥1）", false));
+            return;
+        }
+        string joined = "";
+        for (int i = 0; i < codes.Count; i = i + 1) {
+            if (i > 0) { joined = joined + "\n"; }
+            joined = joined + codes[i];
+        }
+        this.View(await this.Page("已生成 " + Convert.ToString(codes.Count)
+            + " 张卡密（只显示这一次）：\n" + joined, true));
+    }
+
+    /* ---- 版本频道：发布 / 回滚 ---- */
+
+    [HttpPost]
+    [Route("/admin/channel/publish")]
+    [Tx]
+    async void Publish() {
+        if (!await this.IsAdmin()) { this.Ctx().Redirect("/login?next=/admin"); }
+        bool ok = await new ChannelFlow(this.Held()).Publish(
+            this.In("channel"), this.In("platform"), this.In("version"),
+            this.In("installer_url"), this.In("sha256"), this.In("signature"),
+            this.InText("release_notes"), this.InInt("rollout_percent", 100),
+            this.In("required_version"));
+        if (!ok) {
+            this.View(await this.Page("发布被拒绝：检查摘要格式（64 位 hex）与灰度 0-100", false));
+            return;
+        }
+        this.View(await this.Page("频道已发布", true));
+    }
+
+    [HttpPost]
+    [Route("/admin/channel/rollback")]
+    [Tx]
+    async void Rollback() {
+        if (!await this.IsAdmin()) { this.Ctx().Redirect("/login?next=/admin"); }
+        bool ok = await new ChannelFlow(this.Held()).Rollback(
+            this.In("channel"), this.In("platform"), this.In("version"));
+        if (!ok) {
+            this.View(await this.Page("回滚被拒绝：没有这条历史发布", false));
+            return;
+        }
+        this.View(await this.Page("已回滚到历史发布", true));
+    }
+}

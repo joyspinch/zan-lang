@@ -1,0 +1,163 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Mall;
+
+namespace ZanWeb.Account;
+
+/* 开发者工作台 /account/developer：申请开发者、提交商品（含类型）、
+ * 提交版本（摘要+签名）、加价格方案、提现。审批状态就地显示。
+ * 动作复用 IdentityFlow（与 /api/developer 系列同一套规则），失败理由
+ * 回显在页面上。 */
+[Route("account/developer")]
+[Custom(Authorization = CustomAuthorization.Login)]
+[Description("开发者工作台")]
+class Developer : AppController {
+    [HttpGet]
+    [Route("/account/developer")]
+    [Description("开发者工作台")]
+    async void Index() {
+        if (!this.DbReady()) { this.Fail(503, "2001", "服务暂时不可用，请稍后再试"); }
+        int uid = Filter.ToInt(this.uid, 0);
+        IdentityFlow ident = new IdentityFlow(this.Held());
+        User me = await ident.ById(uid);
+        if (me == null) { this.Ctx().Redirect("/login?next=/account/developer"); }
+
+        ViewData d = await this.Page(uid, "", true);
+        this.View(d);
+    }
+
+    async ViewData Page(int uid, string message, bool ok) {
+        IdentityFlow ident = new IdentityFlow(this.Held());
+        User me = await ident.ById(uid);
+        ViewData d = new ViewData();
+        await Settings.Apply(d);
+        d.Set("title", "开发者工作台 · Zan 商城");
+        d.Set("logged", "1");
+        d.Set("username", me != null ? me.username : "");
+        if (message.Length > 0) {
+            d.Set(ok ? "flashOk" : "flashBad", message);
+        }
+
+        DeveloperProfile profile = await this.Held().Select<DeveloperProfile>()
+            .Where(a => a.userId == uid).FirstAsync();
+        if (profile != null) {
+            d.Set("hasProfile", "1");
+            d.Set("devStatus", profile.status);
+            d.Set("devName", profile.displayName);
+            d.Set("approved", profile.status == "approved" ? "1" : "");
+        } else {
+            d.Set("hasProfile", "");
+            d.Set("devStatus", "none");
+        }
+
+        /* 我的商品（含审核状态），通过的显示版本/方案入口。 */
+        List<Product> mine = await this.Held().Select<Product>()
+            .Where(a => a.developerId == uid).OrderByDescending(a => a.id)
+            .ToListAsync();
+        CatalogDao dao = new CatalogDao(this.Held());
+        List<StrMap> rows = d.AddList("products");
+        for (int i = 0; i < mine.Count; i = i + 1) {
+            Product p = mine[i];
+            StrMap m = new StrMap();
+            m.Set("id", Convert.ToString(p.id));
+            m.Set("name", p.name);
+            m.Set("slug", p.slug);
+            m.Set("type", p.productType == "app" ? "程序" : "扩展");
+            m.Set("status", p.status);
+            List<ProductVersion> vs = await dao.ApprovedVersions(p.id);
+            m.Set("versions", Convert.ToString(vs.Count));
+            rows.Add(m);
+        }
+        d.Set("noProducts", rows.Count == 0 ? "1" : "");
+        return d;
+    }
+
+    /* ---- 申请开发者 ---- */
+
+    [HttpPost]
+    [Route("/account/developer/apply")]
+    [Tx]
+    async void Apply() {
+        int uid = Filter.ToInt(this.uid, 0);
+        bool ok = await new IdentityFlow(this.Held()).ApplyDeveloper(
+            uid, this.In("display_name"), this.InText("bio"));
+        if (!ok) {
+            this.View(await this.Page(uid, "申请被拒绝：材料不完整或已申请过", false));
+            return;
+        }
+        this.View(await this.Page(uid, "申请已提交，等待管理员审核", true));
+    }
+
+    /* ---- 提交商品 ---- */
+
+    [HttpPost]
+    [Route("/account/developer/product")]
+    [Tx]
+    async void Product() {
+        int uid = Filter.ToInt(this.uid, 0);
+        string id = await new IdentityFlow(this.Held()).SubmitProduct(
+            uid, this.InInt("category_id", 0), this.In("slug"), this.In("name"),
+            this.InText("description"), this.In("product_type"));
+        if (id.Length == 0) {
+            this.View(await this.Page(uid, "商品被拒绝：检查分类/别名/名称与开发者身份", false));
+            return;
+        }
+        this.View(await this.Page(uid, "商品已提交（id=" + id + "），等待审核", true));
+    }
+
+    /* ---- 提交版本 ---- */
+
+    [HttpPost]
+    [Route("/account/developer/version")]
+    [Tx]
+    async void Version() {
+        int uid = Filter.ToInt(this.uid, 0);
+        string id = await new IdentityFlow(this.Held()).SubmitVersion(
+            uid, this.InInt("product_id", 0), this.In("version"),
+            this.InInt("major", 0), this.In("artifact_url"),
+            this.InText("release_notes"), this.In("artifact_sha256"),
+            this.In("artifact_signature"));
+        if (id.Length == 0) {
+            this.View(await this.Page(uid, "版本被拒绝：检查归属商品、版本号与摘要格式", false));
+            return;
+        }
+        this.View(await this.Page(uid, "版本已提交（id=" + id + "），等待审核（批准时会验签）", true));
+    }
+
+    /* ---- 价格方案 ---- */
+
+    [HttpPost]
+    [Route("/account/developer/plan")]
+    [Tx]
+    async void Plan() {
+        int uid = Filter.ToInt(this.uid, 0);
+        bool ok = await new IdentityFlow(this.Held()).AddPlan(
+            uid, this.InInt("product_id", 0), this.In("name"),
+            this.In("license_mode"), Filter.ToLong(this.In("price_points"), 0),
+            this.InInt("duration_days", 0));
+        if (!ok) {
+            this.View(await this.Page(uid, "方案被拒绝：检查商品归属与订阅天数", false));
+            return;
+        }
+        this.View(await this.Page(uid, "价格方案已添加", true));
+    }
+
+    /* ---- 提现 ---- */
+
+    [HttpPost]
+    [Route("/account/developer/withdraw")]
+    [Tx]
+    async void Withdraw() {
+        int uid = Filter.ToInt(this.uid, 0);
+        bool ok = await new IdentityFlow(this.Held()).Withdraw(
+            uid, Filter.ToLong(this.In("amount_points"), 0), this.In("account"));
+        if (!ok) {
+            this.View(await this.Page(uid, "提现被拒绝：余额不足或账号信息不完整", false));
+            return;
+        }
+        this.View(await this.Page(uid, "提现申请已提交，等待审核", true));
+    }
+}
