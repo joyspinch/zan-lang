@@ -12,7 +12,12 @@ point, the build/test commands, the tool catalog and these rules, resolved
 against *this* installation. Do not crawl the tree to find out what the project
 is.
 
-Not connected? See `docs/AI_ONBOARDING.md` — connecting takes one config file.
+Not connected? Connect it yourself, no human setup needed: run
+`<ZAN_MCP> --init-agent .` from the project root. It writes the client config
+files into this project (existing files are kept), and the client then starts
+the server automatically the next time the project opens — stdio MCP servers
+are spawned by the client, not run by hand. Until it is connected, work from
+`llms.txt` in the SDK root and compile with `<ZAN_SDK>/toolchain/zanc`.
 
 ## 0a. Read once, precisely, then edit
 

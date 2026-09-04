@@ -12,11 +12,17 @@
 
 ## 2. 接入：三种方式任选其一
 
+三种方式都只是**写配置文件**，没有任何需要人工运行的常驻服务：MCP 走 stdio，
+客户端（Claude Code / Cursor / VS Code…）打开项目时会**自动把
+`tools\zan-mcp.exe --stdio <项目>` 当子进程拉起**，会话结束自动回收。
+首次连接多数客户端会让你确认一次，之后全自动。
+
 | 方式 | 操作 | 适合 |
 | --- | --- | --- |
 | IDE 一键 | ZanIDE 助手面板 →「为当前项目启用 AI 接入」 | 已打开项目 |
 | 命令行 | `tools\zan-mcp.exe --init-agent D:\path\to\project`（加 `--force` 覆盖已有） | 脚本/无 IDE |
-| 不用 MCP | 让 AI 直接读根目录 `llms.txt`（一页索引）和 `docs\AI_ONBOARDING.md`，用 `toolchain\zanc.exe` 编译验证 | 任何客户端 |
+| AI 自举 | 上面都不在？AGENTS.md 里写了：让 AI 自己跑 `<zan-mcp> --init-agent .`，重开项目即自动连上 | 没人配置、只有 AI 在场 |
+| 不用 MCP | 让 AI 直接读根目录 `llms.txt`（一页索引）和 `docs\AI_ONBOARDING.md`，用 `toolchain\zanc.exe` 编译验证 | 任何客户端，随时可用 |
 
 前两种会往**项目**里写入（占位符 `<ZAN_MCP>`/`<ZAN_SDK>`/`<ZAN_PROJECT>` 自动
 展开成这台 SDK 的真实路径，已有文件不覆盖）：
@@ -80,6 +86,13 @@ AGENTS.md            AI 在 Zan 项目里必须守的规矩（短，先读它）
 
 ## 6. 常见问题
 
+- **C# 这些语言不用 MCP，Zan 为什么要？** 因为模型见过海量 C# 代码，签名靠
+  记忆就大差不差，还有成熟的 LSP 兜底；而 **Zan 的训练数据是零**——不给工具，
+  模型只能编造 API。MCP 在这里不是锦上添花，是把"猜"换成"查"的最短路径：
+  `zan_api_search`/`zan_example`/`zan_compile` 直接对症。顺带的好处是编辑回路
+  有护栏（`edit_file` 拒绝模糊替换、编译返回结构化诊断）和默认的工作区隔离。
+  没有它也能干活——`llms.txt` + `toolchain\zanc.exe` 就是无 MCP 的完整回路，
+  只是每一步都更贵。
 - **AI 写的代码编译不过/方法不存在？** 它在猜 API。规矩（`AGENTS.md` §1）是
   写前必须 `zan_api_search` / `zan_example`；让它先调这两个再动手。
 - **`<ZAN_MCP>` 字样的文件能直接用吗？** 不能。那是模板占位符，

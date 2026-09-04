@@ -5,19 +5,39 @@ description: How to drive the Zan SDK through its MCP server (stdio or hosted HT
 
 # Using the Zan MCP server
 
-## Start it
+## Start it — or rather, let the client start it
+
+stdio servers are **spawned by the MCP client**, not run by hand: it launches
+the command from its config as a child process on project open and tears it
+down with the session. If no config exists in this project yet, write it
+yourself — no human needed:
 
 ```
-<ZAN_MCP> --stdio .        # newline-delimited JSON-RPC 2.0 on stdin/stdout
+<ZAN_MCP> --init-agent .    # writes .mcp.json / .cursor\mcp.json / .vscode\mcp.json
+                            # (+ AGENTS.md, .agents\skills\) into the project;
+                            # existing files are kept; --force overwrites
 ```
 
-The trailing argument is the workspace root (`.` = the launch directory). stdout
-carries protocol messages only — one JSON object per line, no banner — so
-anything you want logged must go to stderr.
+Then reopen the project and the client starts the server itself. Diagnostics
+why a session did not come up: the config's `command` must be the **expanded**
+SDK path (`<ZAN_MCP>` placeholders are only valid inside the SDK's own `ai\`
+templates), and the trailing argument is the workspace root (`.` = the launch
+directory).
 
-Client configs ship ready-made in the SDK: `.mcp.json` (Claude Code and most
-clients), `.cursor\mcp.json`, `.vscode\mcp.json`. Copy the matching one into the
-project. Full guide: `docs\AI_ONBOARDING.md`.
+For a one-off probe you can still run it yourself:
+
+```
+<ZAN_MCP> --stdio .         # newline-delimited JSON-RPC 2.0 on stdin/stdout
+```
+
+stdout carries protocol messages only — one JSON object per line, no banner —
+so anything you want logged must go to stderr.
+
+Config templates ship in the SDK under `ai\`: `.mcp.json` (Claude Code and
+most clients), `.cursor\mcp.json`, `.vscode\mcp.json` — install them with
+`--init-agent`, not by hand-copying (the `<ZAN_MCP>` placeholder would stay
+literal and the client would fail to launch the server). Full guide:
+`docs\AI_ONBOARDING.md`.
 
 HTTP is the same API on `POST /`, `/mcp` or `/rpc`:
 

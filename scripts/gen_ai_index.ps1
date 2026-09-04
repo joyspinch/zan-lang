@@ -60,6 +60,8 @@ if (Test-Staged 'ai/AGENTS.md') {
     $lines.Add("- [ai/AGENTS.md](ai/AGENTS.md): the rules --init-agent installs into a project (template; placeholders intact here)")
 }
 $lines.Add("- Call tools/zan-mcp.exe --stdio <project> and ask zan_start_here first: project layout, build/test commands, rules, tool catalog in one response")
+$lines.Add("- The client starts this stdio server itself on project open (config written by --init-agent); no daemon to run by hand")
+$lines.Add("- No MCP in your session? Run tools/zan-mcp.exe --init-agent <project> once and reopen the project; until then work from this file plus toolchain/zanc.exe")
 $lines.Add("")
 
 # ---- tools ------------------------------------------------------------------
