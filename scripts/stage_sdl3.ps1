@@ -93,7 +93,7 @@ if (!(Test-Path -LiteralPath $staticLib)) {
 # ---- zan_sdl3 bridge --------------------------------------------------------
 # SDL3 is linked statically INTO the bridge DLL, so the bridge itself needs no
 # separate SDL3.dll. The win-x64 bundle still ships SDL3.dll (like every other
-# target) because GameKit calls SDL_RestoreWindow directly via [DllImport("SDL3")]
+# target) because Game.Kit Host calls SDL_RestoreWindow directly via [DllImport("SDL3")]
 # (see drivers/win-x64/*.bundle).
 Write-Output "Building zan_sdl3 bridge (static SDL3)..."
 & $Compiler `

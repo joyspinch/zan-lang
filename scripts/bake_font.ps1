@@ -1,10 +1,10 @@
 # Bakes a high-resolution anti-aliased ASCII glyph atlas (code points 32..126)
-# for the GameKit smooth font. The atlas is rendered at M x the design cell size
+# for the Game.Kit smooth font. The atlas is rendered at M x the design cell size
 # so text stays razor sharp when the scene is rasterized at native 4K.
 #
 # Output:
-#   examples/game/common/assets/font.png  - white glyphs, alpha = coverage
-#   examples/game/common/assets/font.txt  - "designCellW designCellH cols pad atlasScale"
+#   stdlib/Game/Kit/assets/font.png       - white glyphs, alpha = coverage
+#   stdlib/Game/Kit/assets/font.txt       - "designCellW designCellH cols pad atlasScale"
 #                                            followed by 95 advance widths (design units)
 param(
     [string]$FontName = "Segoe UI",
@@ -90,8 +90,8 @@ $buf = New-Object byte[] $len
 [System.Runtime.InteropServices.Marshal]::Copy($buf, 0, $data.Scan0, $len)
 $bmp.UnlockBits($data)
 
-$outPng = "examples\game\common\assets\font.png"
-$outTxt = "examples\game\common\assets\font.txt"
+$outPng = "stdlib\Game\Kit\assets\font.png"
+$outTxt = "stdlib\Game\Kit\assets\font.txt"
 $bmp.Save((Join-Path (Get-Location) $outPng), [System.Drawing.Imaging.ImageFormat]::Png)
 $bmp.Dispose()
 

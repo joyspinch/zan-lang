@@ -1,10 +1,10 @@
-﻿# pack_game.ps1 -- 把一个 GameKit 游戏工程打包成可分发目录：
+﻿# pack_game.ps1 -- 把一个 Game.Kit 游戏工程打包成可分发目录：
 #   dist/<name>/game.exe        游戏可执行文件
 #   dist/<name>/assets.zrp      加密资源包（AES-256-GCM 逐条目，可选 RSA 签名）
 #   dist/<name>/zrp.keys/*      主密钥 XOR 分片（绝不进 git；见下）
 # 并删除 dist 内的明文 assets/（-KeepPlain 保留以便调试）。
 #
-# 资源包消费端：examples/game/common/GameKit.zan 的 PackedAssets
+# 资源包消费端：stdlib Game.Kit.PackedAssets
 # （条目名 = 工程相对路径，主密钥 = 两份分片 XOR 重组）。
 # 加密本体在 stdlib 的 ResourcePackWriter（tools/packtool/PackTool.zan
 # 的 CLI 壳），本脚本只做文件收集与参数拼装，不实现任何加密。
@@ -128,7 +128,7 @@ if (-not $SkipBuild) {
     # 源文件作为独立 argv 逐个传给 zanc（空格拼接成单个字符串会被 zanc
     # 当成一个路径："cannot open file 'a.zan b.zan'"）。
     $srcs = @((Get-ChildItem -Path $Project -Filter *.zan | ForEach-Object { ($_.FullName -replace '\\', '/') }))
-    $srcs += "$root/examples/game/common/GameKit.zan"
+    # Game.Kit is a stdlib namespace now; --auto-stdlib pulls it in via `using`.
     build/zanc.exe @srcs --auto-stdlib -o $exe
     if ($LASTEXITCODE -ne 0) { Write-Output "PACK_FAIL: zanc"; exit 1 }
 } elseif (-not (Test-Path $exe)) {
