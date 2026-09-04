@@ -21,6 +21,11 @@
 
 #ifdef ZAN_GUI_SDL
 
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#include <android/log.h>
+#endif
+
 /* Borderless-window chrome metrics (device px), reported to Zan so its custom
  * title bar and caption-button hit regions line up with the drag/resize
  * regions the hit-test below carves out. */
@@ -35,6 +40,13 @@ static int g_pending_event[8];
 static SDL_Window *g_event_win = NULL; /* window that produced g_pending_event */
 static SDL_Window *g_main_win = NULL;  /* first window: closing it quits */
 static bool g_mouse_captured = false;  /* holding a client-widget drag */
+/* Event-arrival stamps for the per-frame profiler line: when the newest event
+ * landed and how many events accumulated since the previous present. Splits
+ * "input arrived late" (injection/transport) from "frame painted late" (loop
+ * pacing) — the difference between a device problem and a loop problem. */
+static Uint64 g_last_event_at;         /* perf counter of newest event */
+static int    g_ev_count;              /* events since previous present */
+static void fprof_ev(const char *what, int ret); /* fwd: defined near fprof */
 
 /* Manual (non-modal) window resize. Handing a border press to the OS through
  * SDL_HITTEST_RESIZE_* starts Windows' modal move/resize loop, which owns the
@@ -347,6 +359,8 @@ static int sdl_utf8_next(const char *s, int *i) {
 
 /* Translate one SDL event into 0..N queued zan events. */
 static void sdl_translate(const SDL_Event *e) {
+    g_last_event_at = SDL_GetPerformanceCounter();
+    g_ev_count++;
     switch (e->type) {
         case SDL_EVENT_QUIT:
             zq_push(8, 0, 0, 0, 0, 0, g_main_win);
@@ -548,8 +562,20 @@ static void sdl_translate(const SDL_Event *e) {
             /* Mouse-motion twin of the wheel delta above: this is what lets
              * a held widget (Layer window drag/resize) follow the finger.
              * zq_push merges consecutive plain moves, so this costs no
-             * extra queue depth alongside the wheel flow. */
-            zq_push(1, (int)x, (int)y, 0, 0, cur_mod_bits(), w);
+             * extra queue depth alongside the wheel flow. Tagged via the
+             * e[6] flag channel (same one that marks a touch-drag release)
+             * so the app can skip the frame when no widget owns the press —
+             * the wheel of the same finger sample already did the scrolling,
+             * and painting an identical frame on the twin halves the drag
+             * frame rate for nothing. */
+            {
+                int t0 = g_zq_tail;
+                zq_push(1, (int)x, (int)y, 0, 0, cur_mod_bits(), w);
+                if (g_zq_tail != t0) {
+                    int ul = (g_zq_tail + ZAN_ZQ_CAP - 1) % ZAN_ZQ_CAP;
+                    g_zq[ul].e[6] = 1;
+                }
+            }
             break;
         }
         case SDL_EVENT_FINGER_UP:
@@ -1139,8 +1165,13 @@ EXPORT i32 zan_gui_poll_event(void) {
     {
         sdl_drain();
     }
-    if (zq_empty()) return (g_quit) ? -1 : 1;
+    if (zq_empty()) {
+        i32 r = (g_quit) ? -1 : 1;
+        fprof_ev("poll", r);
+        return r;
+    }
     zq_pop();
+    fprof_ev("poll", 0);
     return 0;
 }
 
@@ -1160,6 +1191,7 @@ EXPORT i32 zan_gui_wait_event(void) {
 #endif
     }
     if (!zq_empty()) zq_pop(); /* else leaves kind 0 (e.g. a wake) */
+    fprof_ev("wait", 0);
     return 0;
 }
 
@@ -1167,23 +1199,32 @@ EXPORT i32 zan_gui_wait_event(void) {
  * event was delivered, 1 on timeout, -1 on quit. */
 EXPORT i32 zan_gui_wait_event_timeout(i32 ms) {
     memset(g_pending_event, 0, sizeof(g_pending_event));
-    if (!g_sdl_ready) return -1;
+    if (!g_sdl_ready) { fprof_ev("waitto", -1); return -1; }
     if (zq_empty()) {
 #if defined(__ANDROID__)
         if (zan_watch_wait(ms) != 0) {
-            return (g_quit) ? -1 : 1;
+            i32 r = (g_quit) ? -1 : 1;
+            fprof_ev("waitto", r);
+            return r;
         }
 #else
         SDL_Event e;
         if (!SDL_WaitEventTimeout(&e, (Sint32)(ms < 0 ? 0 : ms))) {
-            return (g_quit) ? -1 : 1;
+            i32 r = (g_quit) ? -1 : 1;
+            fprof_ev("waitto", r);
+            return r;
         }
         sdl_translate(&e);
         sdl_drain();
 #endif
     }
-    if (zq_empty()) return (g_quit) ? -1 : 1;
+    if (zq_empty()) {
+        i32 r = (g_quit) ? -1 : 1;
+        fprof_ev("waitto", r);
+        return r;
+    }
     zq_pop();
+    fprof_ev("waitto", 0);
     return 0;
 }
 
@@ -1251,44 +1292,113 @@ EXPORT i32 zan_gui_client_height(iptr hwnd_val) {
     return h;
 }
 
-/* Lightweight opt-in frame profiler: enabled by setting env ZAN_FRAME_PROF=1.
- * Every 120 presents it appends one summary line to zan_frame_perf.log (in the
- * process CWD) breaking the frame budget into CPU-render / upload / present so
- * we can target the real bottleneck instead of guessing. Zero cost when off. */
-static int g_fprof = -1;                 /* -1 = unread, 0 = off, 1 = on */
+/* Lightweight opt-in frame profiler: enabled by env ZAN_FRAME_PROF=1 (desktop)
+ * or, where the env can't be set (Android APKs), by the debug.zan.frame_prof
+ * system property: 1 = 120-frame averages, 2 = one line per frame. Each line
+ * breaks the frame budget into CPU-render / upload / present so we can target
+ * the real bottleneck instead of guessing. Zero cost when off. */
+static int g_fprof = -1;                 /* -1 = unread, 0 = off, 1 = 120-avg,
+                                            2 = one line per frame */
 static Uint64 g_fp_last_end = 0;         /* perf counter at previous present end */
 static Uint64 g_fp_acc_interval = 0;     /* sum of gaps between successive frames */
 static Uint64 g_fp_acc_upload = 0;
 static Uint64 g_fp_acc_present = 0;
 static int    g_fp_frames = 0;
+/* Last upload, for the memory/perf report and the frame profiler: bytes
+ * pushed into the texture and whether it was a whole-surface frame (empty
+ * dirty list or overflow) or a damage-rect frame. Read by
+ * zan_gui_mem_report's up= field and fprof's up_bytes=/full= fields. */
+static size_t g_upload_last_bytes;     /* last SDL_UpdateTexture payload */
+static int    g_upload_last_full;
+
+/* APK processes fork from zygote, so ZAN_FRAME_PROF can't be set per-launch
+ * there and its CWD is not writable either. debug.* props are settable by adb
+ * shell on userdebug builds: `adb shell setprop debug.zan.frame_prof 1`
+ * (120-frame averages) or 2 (one line per frame — interaction bursts live
+ * only a few dozen frames). On Android the lines go to logcat (tag zan_fprof)
+ * since /data/data is not readable without root; elsewhere to the file. */
+static int fprof_android_prop(void) {
+#if defined(__ANDROID__)
+    char v[PROP_VALUE_MAX];
+    memset(v, 0, sizeof v);
+    __system_property_get("debug.zan.frame_prof", v);
+    if (v[0] == '1') return 1;
+    if (v[0] == '2') return 2;
+#endif
+    return 0;
+}
+
+static void fprof_emit(const char *line) {
+#if defined(__ANDROID__)
+    __android_log_print(ANDROID_LOG_INFO, "zan_fprof", "%s", line);
+#else
+    FILE *fp = fopen("zan_frame_perf.log", "a");
+    if (fp) {
+        fputs(line, fp);
+        fclose(fp);
+    }
+#endif
+}
+
+/* Temporary per-call trace of the fetch primitives (prop mode 2 only): lets a
+ * scripted drag's logcat be replayed into an exact loop timeline — which wait
+ * call woke the frame, with which event, how far ahead of the present. */
+static void fprof_ev(const char *what, int ret) {
+    if (g_fprof != 2) { return; }
+    char line[128];
+    snprintf(line, sizeof line, "t=%.1fms %s ret=%d kind=%d",
+             (double)SDL_GetPerformanceCounter()
+                 / (double)SDL_GetPerformanceFrequency() * 1000.0,
+             what, ret, g_pending_event[0]);
+    fprof_emit(line);
+}
 
 static void fprof_record(Uint64 t_enter, Uint64 t_upload, Uint64 t_present_end) {
     if (g_fprof < 0) {
         const char *e = getenv("ZAN_FRAME_PROF");
         g_fprof = (e && e[0] == '1') ? 1 : 0;
+        if (!g_fprof) { g_fprof = fprof_android_prop(); }
     }
     if (!g_fprof) return;
     if (g_fp_last_end != 0) {
         /* interval = CPU render + event handling before this present; upload =
          * SDL_UpdateTexture; present = clear+blit+RenderPresent (incl. vsync). */
-        g_fp_acc_interval += t_enter - g_fp_last_end;
-        g_fp_acc_upload   += t_upload;
-        g_fp_acc_present  += t_present_end - t_enter - t_upload;
-        g_fp_frames++;
-        if (g_fp_frames >= 120) {
-            double f = (double)SDL_GetPerformanceFrequency() / 1000.0; /* ticks per ms */
-            double n = (double)g_fp_frames;
-            double cpu = (double)g_fp_acc_interval / n / f;
-            double up  = (double)g_fp_acc_upload   / n / f;
-            double pr  = (double)g_fp_acc_present  / n / f;
-            double frame = cpu + up + pr;
-            FILE *fp = fopen("zan_frame_perf.log", "a");
-            if (fp) {
-                fprintf(fp, "frames=%d avg_frame=%.2fms fps=%.0f | cpu_render=%.2f upload=%.2f present=%.2f\n",
-                        g_fp_frames, frame, frame > 0 ? 1000.0 / frame : 0.0, cpu, up, pr);
-                fclose(fp);
+        double f = (double)SDL_GetPerformanceFrequency() / 1000.0; /* ticks per ms */
+        double cpu = (double)(t_enter - g_fp_last_end) / f;
+        double up  = (double)t_upload / f;
+        double pr  = (double)(t_present_end - t_enter - t_upload) / f;
+        char line[160];
+        if (g_fprof == 2) {
+            double f2 = (double)SDL_GetPerformanceFrequency() / 1000.0;
+            snprintf(line, sizeof line,
+                     "frame cpu_render=%.2f upload=%.2f present=%.2f"
+                     " up_bytes=%llu full=%d ev_gap=%.1f ev_after=%.1f evs=%d",
+                     cpu, up, pr,
+                     (unsigned long long)g_upload_last_bytes,
+                     g_upload_last_full,
+                     (double)(t_enter - g_last_event_at) / f2,
+                     (double)(g_last_event_at - g_fp_last_end) / f2,
+                     g_ev_count);
+            fprof_emit(line);
+            g_ev_count = 0;
+        } else {
+            g_fp_acc_interval += t_enter - g_fp_last_end;
+            g_fp_acc_upload   += t_upload;
+            g_fp_acc_present  += t_present_end - t_enter - t_upload;
+            g_fp_frames++;
+            if (g_fp_frames >= 120) {
+                double n = (double)g_fp_frames;
+                cpu = (double)g_fp_acc_interval / n / f;
+                up  = (double)g_fp_acc_upload   / n / f;
+                pr  = (double)g_fp_acc_present  / n / f;
+                double frame = cpu + up + pr;
+                snprintf(line, sizeof line,
+                         "frames=%d avg_frame=%.2fms fps=%.0f | cpu_render=%.2f upload=%.2f present=%.2f",
+                         g_fp_frames, frame, frame > 0 ? 1000.0 / frame : 0.0, cpu, up, pr);
+                fprof_emit(line);
+                g_fp_acc_interval = 0; g_fp_acc_upload = 0;
+                g_fp_acc_present = 0; g_fp_frames = 0;
             }
-            g_fp_acc_interval = 0; g_fp_acc_upload = 0; g_fp_acc_present = 0; g_fp_frames = 0;
         }
     }
     g_fp_last_end = t_present_end;
@@ -1304,11 +1414,6 @@ static void fprof_record(Uint64 t_enter, Uint64 t_upload, Uint64 t_present_end) 
 static SDL_Rect g_dirty[ZAN_DIRTY_MAX];
 static int g_dirty_count;
 static int g_dirty_overflow;
-/* Last upload, for the memory/perf report: bytes pushed into the texture
- * and whether it was a whole-surface frame (empty dirty list or overflow)
- * or a damage-rect frame. Read by zan_gui_mem_report's up= field. */
-static size_t g_upload_last_bytes;
-static int g_upload_last_full;
 
 EXPORT i32 zan_gui_present_dirty_add(i32 x, i32 y, i32 w, i32 h) {
     if (w <= 0 || h <= 0) return 0;
