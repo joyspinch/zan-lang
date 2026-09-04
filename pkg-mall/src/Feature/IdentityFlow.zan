@@ -1,0 +1,301 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Json;
+using System.Security.Cryptography;
+using System.Web;
+using ZanWeb.Model.Mall;
+
+namespace ZanWeb;
+
+/* 身份与凭据：注册（PBKDF2 风格 12000 轮加盐哈希）、登录（签发 AES-GCM
+ * cookie）、开发者申请/商品/版本/方案/提现的业务规则。哈希实现与
+ * server-mvc 模板 AuthUser 一致（salt:password 迭代 SHA-256）。 */
+class IdentityFlow {
+    IDbConnection db;
+
+    IdentityFlow(IDbConnection db) {
+        this.db = db;
+    }
+
+    async string Register(string username, string password) {
+        if (username.Length < 3 || username.Length > 64) { return ""; }
+        if (password.Length < 8 || password.Length > 128) { return ""; }
+        MallUserDao users = new MallUserDao(this.db);
+        User dup = await users.ByUsername(username);
+        if (dup != null) { return ""; }
+        User row = new User();
+        row.username = username;
+        row.passwordSalt = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
+        row.passwordHash = IdentityFlow.PasswordHashPublic(password, row.passwordSalt);
+        row.role = "user";
+        row.points = 0;
+        row.status = "active";
+        row.createdAt = WebApp.NowSeconds();
+        int id = await users.Insert(row);
+        return id > 0 ? Convert.ToString(id) : "";
+    }
+
+    async string Login(string username, string password) {
+        MallUserDao users = new MallUserDao(this.db);
+        User row = await users.ByUsername(username);
+        if (row == null || row.status != "active") { return ""; }
+        string actual = IdentityFlow.PasswordHashPublic(password, row.passwordSalt);
+        if (!AuthToken.Equal(actual, row.passwordHash)) { return ""; }
+        return AuthToken.Issue(Convert.ToString(row.id), 1, WebApp.NowSeconds());
+    }
+
+    static string PasswordHashPublic(string password, string salt) {
+        string material = salt + ":" + password;
+        int i = 0;
+        while (i < 12000) {
+            material = Hex.Encode(Sha256.Hash(material + ":" + salt,
+                material.Length + salt.Length + 1), 32);
+            i = i + 1;
+        }
+        return material;
+    }
+
+    async User ById(int uid) {
+        return await new MallUserDao(this.db).ById(uid);
+    }
+
+    /* /api/auth/me 的响应体；控制器不点名 User（与模板 RBAC 的 sys_user
+       实体同名，直呼会二义）。 */
+    async string MeJson(int uid) {
+        User me = await this.ById(uid);
+        if (me == null) { return ""; }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("id", JsonValue.NewNum(Convert.ToString(me.id)));
+        o.Put("username", JsonValue.NewStr(me.username));
+        o.Put("role", JsonValue.NewStr(me.role));
+        o.Put("points", JsonValue.NewNum(Convert.ToString(me.points)));
+        return o.ToJson();
+    }
+
+    /* ---- 开发者 ---- */
+
+    async bool ApplyDeveloper(int uid, string displayName, string bio) {
+        if (displayName.Length < 2 || displayName.Length > 128) { return false; }
+        MallUserDao users = new MallUserDao(this.db);
+        User me = await users.ById(uid);
+        if (me == null || me.status != "active") { return false; }
+        DeveloperProfile dup = await this.db.Select<DeveloperProfile>()
+            .Where(a => a.userId == uid).FirstAsync();
+        if (dup != null) { return false; }
+        DeveloperProfile row = new DeveloperProfile();
+        row.userId = uid;
+        row.displayName = displayName;
+        row.bio = bio;
+        row.status = "pending";
+        row.createdAt = WebApp.NowSeconds();
+        int _row = await this.db.Insert<DeveloperProfile>(row).ExecuteIdentityAsync();
+        return true;
+    }
+
+    /* 只有审核通过的开发者能提交商品。 */
+    async bool IsDeveloper(int uid) {
+        DeveloperProfile p = await this.db.Select<DeveloperProfile>()
+            .Where(a => a.userId == uid && a.status == "approved").FirstAsync();
+        return p != null;
+    }
+
+    async string SubmitProduct(int uid, int categoryId, string slug, string name,
+                               string description, string productType) {
+        if (slug.Length < 3 || name.Length < 2) { return ""; }
+        if (productType != "extension" && productType != "app") { return ""; }
+        if (!await this.IsDeveloper(uid)) { return ""; }
+        CatalogDao dao = new CatalogDao(this.db);
+        Category cat = await dao.CategoryById(categoryId);
+        if (cat == null) { return ""; }
+        Product dup = await dao.ProductBySlug(slug);
+        if (dup != null) { return ""; }
+        Product row = new Product();
+        row.developerId = uid;
+        row.categoryId = categoryId;
+        row.slug = slug;
+        row.name = name;
+        row.description = description;
+        row.productType = productType;
+        row.status = "pending";
+        row.createdAt = WebApp.NowSeconds();
+        int id = await dao.InsertProduct(row);
+        return id > 0 ? Convert.ToString(id) : "";
+    }
+
+    async string SubmitVersion(int uid, int productId, string version, int major,
+                               string artifactUrl, string releaseNotes,
+                               string sha256, string signature) {
+        if (version.Length == 0 || major < 1 || artifactUrl.Length == 0) { return ""; }
+        CatalogDao dao = new CatalogDao(this.db);
+        Product p = await dao.ProductById(productId);
+        if (p == null || p.developerId != uid) { return ""; }
+        if (sha256.Length > 0 && !Digests.IsHex64(sha256)) { return ""; }
+        ProductVersion row = new ProductVersion();
+        row.productId = productId;
+        row.version = version;
+        row.majorVersion = major;
+        row.artifactUrl = artifactUrl;
+        row.artifactSha256 = sha256;
+        row.artifactSignature = signature;
+        row.releaseNotes = releaseNotes;
+        row.status = "pending";
+        row.createdAt = WebApp.NowSeconds();
+        int id = await dao.InsertVersion(row);
+        return id > 0 ? Convert.ToString(id) : "";
+    }
+
+    async bool AddPlan(int uid, int productId, string name, string licenseMode,
+                       long pricePoints, int durationDays) {
+        if (licenseMode != "once" && licenseMode != "periodic") { return false; }
+        if (pricePoints < 0) { return false; }
+        if (licenseMode == "periodic" && durationDays < 1) { return false; }
+        CatalogDao dao = new CatalogDao(this.db);
+        Product p = await dao.ProductById(productId);
+        if (p == null || p.developerId != uid) { return false; }
+        PricingPlan row = new PricingPlan();
+        row.productId = productId;
+        row.name = name;
+        row.licenseMode = licenseMode;
+        row.pricePoints = pricePoints;
+        row.durationDays = durationDays;
+        row.commissionPercent = 10;
+        row.enabled = 1;
+        int _plan = await dao.InsertPlan(row);
+        return true;
+    }
+
+    /* 余额 = Σ(developer_ledger) − Σ(pending 提现)；提现只锁额度不划账，
+     * 审核通过时才记负 delta。 */
+    async bool Withdraw(int uid, long amount, string account) {
+        if (amount < 1 || account.Length < 3) { return false; }
+        if (!await this.IsDeveloper(uid)) { return false; }
+        long earned = 0;
+        List<DeveloperLedger> ledger = await this.db.Select<DeveloperLedger>()
+            .Where(a => a.developerId == uid).ToListAsync();
+        for (int i = 0; i < ledger.Count; i = i + 1) {
+            earned = earned + ledger[i].delta;
+        }
+        List<Withdrawal> pending = await this.db.Select<Withdrawal>()
+            .Where(a => a.developerId == uid && a.status == "pending").ToListAsync();
+        long locked = 0;
+        for (int i = 0; i < pending.Count; i = i + 1) {
+            locked = locked + pending[i].amountPoints;
+        }
+        if (amount > earned - locked) { return false; }
+        Withdrawal row = new Withdrawal();
+        row.developerId = uid;
+        row.amountPoints = amount;
+        row.account = account;
+        row.status = "pending";
+        row.createdAt = WebApp.NowSeconds();
+        int _w = await this.db.Insert<Withdrawal>(row).ExecuteIdentityAsync();
+        return true;
+    }
+
+    /* ---- 管理员审核 ---- */
+
+    async bool ReviewDeveloper(int id, bool approve, string note) {
+        DeveloperProfile row = await this.db.Select<DeveloperProfile>()
+            .Where(a => a.id == id).FirstAsync();
+        if (row == null || row.status != "pending") { return false; }
+        string status = approve ? "approved" : "rejected";
+        int upd = await this.db.Update<DeveloperProfile>()
+            .Set(a => a.status, status)
+            .Set(a => a.reviewNote, note)
+            .Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+        if (upd != 1) { return false; }
+        if (approve) {
+            await new MallUserDao(this.db).SetRole(row.userId, "developer");
+        }
+        return true;
+    }
+
+    async bool ReviewProduct(int id, bool approve, string note) {
+        CatalogDao dao = new CatalogDao(this.db);
+        Product p = await dao.ProductById(id);
+        if (p == null || p.status != "pending") { return false; }
+        int upd = await this.db.Update<Product>()
+            .Set(a => a.status, approve ? "approved" : "rejected")
+            .Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+        return upd == 1;
+    }
+
+    /* 版本批准闸门：必须带 64 位十六进制摘要与 RSA 私钥签名，且验签通过；
+     * 不允许出现"已批准但不可验证"的版本。 */
+    async bool ReviewVersion(int id, bool approve, string note) {
+        CatalogDao dao = new CatalogDao(this.db);
+        ProductVersion v = await dao.VersionById(id);
+        if (v == null || v.status != "pending") { return false; }
+        if (approve) {
+            if (!Digests.IsHex64(v.artifactSha256)) { return false; }
+            if (!await Signing.VerifyArtifact(this.db, v)) { return false; }
+        }
+        int upd = await dao.SetVersionStatus(id,
+            approve ? "approved" : "rejected", note);
+        return upd == 1;
+    }
+
+    async bool ReviewWithdrawal(int id, bool approve, string note) {
+        Withdrawal row = await this.db.Select<Withdrawal>()
+            .Where(a => a.id == id).FirstAsync();
+        if (row == null || row.status != "pending") { return false; }
+        int upd = await this.db.Update<Withdrawal>()
+            .Set(a => a.status, approve ? "approved" : "rejected")
+            .Set(a => a.reviewNote, note)
+            .Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+        if (upd != 1) { return false; }
+        if (approve) {
+            DeveloperLedger ledger = new DeveloperLedger();
+            ledger.developerId = row.developerId;
+            ledger.delta = 0 - row.amountPoints;
+            ledger.reason = "withdrawal";
+            ledger.referenceId = Convert.ToString(row.id);
+            ledger.createdAt = WebApp.NowSeconds();
+            int _l = await this.db.Insert<DeveloperLedger>(ledger).ExecuteIdentityAsync();
+        }
+        return true;
+    }
+
+    async bool SetEntitlementDisabled(int id, bool disabled) {
+        int upd = await this.db.Update<Entitlement>()
+            .Set(a => a.disabled, disabled ? 1 : 0)
+            .Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+        return upd == 1;
+    }
+
+    /* 卡密生成：明文只出现一次（响应里），库中只存摘要。 */
+    async List<string> GenerateCodes(int count, long points) {
+        List<string> plain = new List<string>();
+        if (count < 1 || count > 100 || points < 1) { return plain; }
+        for (int i = 0; i < count; i = i + 1) {
+            string code = "ZC-" + IdentityFlow.RandDigits(16);
+            RechargeCode row = new RechargeCode();
+            row.codeDigest = Digests.Sha256Hex(code);
+            row.points = points;
+            row.redeemedBy = 0;
+            row.redeemedAt = 0;
+            row.createdAt = WebApp.NowSeconds();
+            int _row = await this.db.Insert<RechargeCode>(row).ExecuteIdentityAsync();
+            plain.Add(code);
+        }
+        return plain;
+    }
+
+    /* 随机数字串：Guid v4 来自 CSPRNG，取其数字字符拼定长串。 */
+    static string RandDigits(int count) {
+        string outp = "";
+        while (outp.Length < count) {
+            string g = Guid.New();
+            for (int i = 0; i < g.Length && outp.Length < count; i = i + 1) {
+                char c = g[i];
+                if (c >= 48 && c <= 57) { outp = outp + c; }
+            }
+        }
+        return outp;
+    }
+}

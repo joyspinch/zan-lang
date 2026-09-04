@@ -1,0 +1,52 @@
+using System;
+using ZanWeb;
+using System.Web;
+using System.Json;
+
+namespace ZanWeb.Api;
+
+/* 版本频道端点（版本同步更新机制的公开面）：
+ *   GET /api/channel/check?channel=ide&platform=win-x64&current=0.2.4&client_id=<GUID>
+ *   GET /api/channel/list
+ * IDE 启动时对四条线（ide/stdlib/compiler/sdk）各 check 一次，
+ * 响应携带 update_available / update_required 与包体校验三元组。 */
+[Route("api/[controller]/[action]")]
+[Custom(Authorization = CustomAuthorization.None)]
+[Description("版本频道")]
+class Channel : ApiController {
+    [HttpGet]
+    async void Check() {
+        if (!this.DbReady()) { this.Fail(503, "2001", "database unavailable"); }
+        string channel = this.Need("channel", "channel");
+        string platform = this.In("platform");
+        string current = this.In("current");
+        string clientId = this.In("client_id");
+        JsonValue data = await new ChannelFlow(this.Held())
+            .Check(channel, platform, current, clientId);
+        if (data == null) { this.Fail(404, "4104", "unknown channel"); }
+        this.Ok(data.ToJson());
+    }
+
+    [HttpGet]
+    async void List() {
+        if (!this.DbReady()) { this.Fail(503, "2001", "database unavailable"); }
+        VersionChannelDao dao = new VersionChannelDao(this.Held());
+        List<VersionChannel> rows = await dao.All();
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            VersionChannel r = rows[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Put("channel", JsonValue.NewStr(r.channel));
+            o.Put("platform", JsonValue.NewStr(r.platform));
+            o.Put("latest", JsonValue.NewStr(r.latestVersion));
+            o.Put("required", JsonValue.NewStr(r.requiredVersion));
+            o.Put("rollout_percent", JsonValue.NewNum(Convert.ToString(r.rolloutPercent)));
+            o.Put("status", JsonValue.NewStr(r.status));
+            o.Put("updated_at", JsonValue.NewNum(Convert.ToString(r.updatedAt)));
+            arr.Append(o);
+        }
+        JsonValue wrap = JsonValue.NewObject();
+        wrap.Put("channels", arr);
+        this.Ok(wrap.ToJson());
+    }
+}

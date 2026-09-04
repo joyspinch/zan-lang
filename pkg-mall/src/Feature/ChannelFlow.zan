@@ -1,0 +1,173 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Json;
+using System.Web;
+using ZanWeb.Model.Mall;
+
+namespace ZanWeb;
+
+/* 版本频道业务：工具链各发布线（ide / stdlib / compiler / sdk）的
+ * 查询、发布、回滚与灰度判定。这是"版本同步更新机制"的服务端核心：
+ *
+ *   - 客户端（IDE 启动时）GET /api/channel/check?channel=ide&platform=win-x64
+ *     &current=0.2.4&client_id=<GUID>，得到是否需要更新、是否强制、
+ *     目标版本与包体校验信息（sha256 + RSA-SHA256 签名）。
+ *   - 灰度：rolloutPercent < 100 时按 client_id 稳定散列落桶，
+ *     桶值 < rolloutPercent 的客户端先拿到新版本，其余停在旧版本。
+ *   - 强制：current < requiredVersion 时 update_required=true，
+ *     IDE 侧阻塞式提示（可跳过一次），低于安全线不允许跳过。
+ *   - 回滚：POST /api/admin/channel/rollback 把 latest 指回历史发布行，
+ *     客户端下一次 check 自然回到旧版本——不需要重新分发。 */
+class ChannelFlow {
+    IDbConnection db;
+
+    ChannelFlow(IDbConnection db) {
+        this.db = db;
+    }
+
+    /* 客户端检查：无匹配频道行 = 服务端未配置该线，返回 null 由控制器答 404。 */
+    async JsonValue Check(string channel, string platform, string current,
+                          string clientId) {
+        VersionChannelDao dao = new VersionChannelDao(this.db);
+        VersionChannel row = await dao.ByKey(channel, platform);
+        if (row == null || row.status != "published") { return null; }
+        bool inRollout = ChannelFlow.InRollout(clientId, row.rolloutPercent);
+        bool newer = ChannelFlow.IsNewer(row.latestVersion, current);
+        bool required = row.requiredVersion.Length > 0
+            && ChannelFlow.IsNewer(row.requiredVersion, current);
+        JsonValue o = JsonValue.NewObject();
+        o.Put("channel", JsonValue.NewStr(row.channel));
+        o.Put("platform", JsonValue.NewStr(row.platform));
+        o.Put("current", JsonValue.NewStr(current));
+        o.Put("latest", JsonValue.NewStr(row.latestVersion));
+        o.Put("update_available", JsonValue.NewBool(newer && inRollout));
+        o.Put("update_required", JsonValue.NewBool(required));
+        o.Put("installer_url", JsonValue.NewStr(row.installerUrl));
+        o.Put("sha256", JsonValue.NewStr(row.sha256));
+        o.Put("signature", JsonValue.NewStr(row.signature));
+        o.Put("release_notes", JsonValue.NewStr(row.releaseNotes));
+        return o;
+    }
+
+    /* 管理端发布：写发布历史行并推进频道指针。 */
+    async bool Publish(string channel, string platform, string version,
+                       string installerUrl, string sha256, string signature,
+                       string notes, int rolloutPercent, string requiredVersion) {
+        if (channel.Length == 0 || version.Length == 0) { return false; }
+        if (!Digests.IsHex64(sha256)) { return false; }
+        if (rolloutPercent < 0 || rolloutPercent > 100) { return false; }
+        VersionChannelDao dao = new VersionChannelDao(this.db);
+        VersionChannel row = await dao.ByKey(channel, platform);
+        long now = WebApp.NowSeconds();
+        if (row == null) {
+            row = new VersionChannel();
+            row.channel = channel;
+            row.platform = platform;
+            row.latestVersion = version;
+            row.requiredVersion = requiredVersion;
+            row.rolloutPercent = rolloutPercent;
+            row.installerUrl = installerUrl;
+            row.sha256 = sha256;
+            row.signature = signature;
+            row.releaseNotes = notes;
+            row.status = "published";
+            row.createdAt = now;
+            row.updatedAt = now;
+            int id = await dao.Insert(row);
+            if (id <= 0) { return false; }
+            return await ChannelFlow.AddRelease(this.db, dao, id, version,
+                installerUrl, sha256, signature, notes);
+        }
+        row.latestVersion = version;
+        row.requiredVersion = requiredVersion;
+        row.rolloutPercent = rolloutPercent;
+        row.installerUrl = installerUrl;
+        row.sha256 = sha256;
+        row.signature = signature;
+        row.releaseNotes = notes;
+        row.status = "published";
+        int _upd = await dao.UpdateChannel(row);
+        return await ChannelFlow.AddRelease(this.db, dao, row.id, version,
+            installerUrl, sha256, signature, notes);
+    }
+
+    static async bool AddRelease(IDbConnection db, VersionChannelDao dao,
+                                 int channelId, string version, string url,
+                                 string sha256, string signature, string notes) {
+        VersionRelease rel = new VersionRelease();
+        rel.channelId = channelId;
+        rel.version = version;
+        rel.installerUrl = url;
+        rel.sha256 = sha256;
+        rel.signature = signature;
+        rel.releaseNotes = notes;
+        rel.status = "published";
+        rel.createdAt = WebApp.NowSeconds();
+        int _rel = await dao.InsertRelease(rel);
+        return true;
+    }
+
+    /* 回滚：把频道指针挪回某条历史发布。 */
+    async bool Rollback(string channel, string platform, string version) {
+        VersionChannelDao dao = new VersionChannelDao(this.db);
+        VersionChannel row = await dao.ByKey(channel, platform);
+        if (row == null) { return false; }
+        List<VersionRelease> rels = await dao.ReleasesOf(row.id);
+        for (int i = 0; i < rels.Count; i = i + 1) {
+            if (rels[i].version != version) { continue; }
+            VersionRelease rel = rels[i];
+            row.latestVersion = rel.version;
+            row.installerUrl = rel.installerUrl;
+            row.sha256 = rel.sha256;
+            row.signature = rel.signature;
+            row.releaseNotes = rel.releaseNotes;
+            row.rolloutPercent = 100;
+            int _upd = await dao.UpdateChannel(row);
+            return true;
+        }
+        return false;
+    }
+
+    /* 灰度落桶：clientId 稳定散列到 0-99；超出灰度的客户端拿旧版本。
+     * client_id 为空时视为灰度外（保守，不推新）。 */
+    static bool InRollout(string clientId, int rolloutPercent) {
+        if (rolloutPercent >= 100) { return true; }
+        if (rolloutPercent <= 0 || clientId.Length == 0) { return false; }
+        uint h = 2166136261;
+        for (int i = 0; i < clientId.Length; i = i + 1) {
+            h = (h ^ (uint)(clientId[i] & 255)) * 16777619;
+        }
+        return (int)(h % 100) < rolloutPercent;
+    }
+
+    /* 点分版本比较：a 是否严格大于 b（每段取数字，缺失段按 0）。 */
+    static bool IsNewer(string a, string b) {
+        if (a.Length == 0) { return false; }
+        if (b.Length == 0) { return true; }
+        List<int> pa = ChannelFlow.Parts(a);
+        List<int> pb = ChannelFlow.Parts(b);
+        int n = pa.Count > pb.Count ? pa.Count : pb.Count;
+        for (int i = 0; i < n; i = i + 1) {
+            int x = i < pa.Count ? pa[i] : 0;
+            int y = i < pb.Count ? pb[i] : 0;
+            if (x != y) { return x > y; }
+        }
+        return false;
+    }
+
+    static List<int> Parts(string version) {
+        List<int> outp = new List<int>();
+        string cur = "";
+        for (int i = 0; i <= version.Length; i = i + 1) {
+            string ch = i < version.Length ? version.Substring(i, 1) : ".";
+            if (ch == ".") {
+                outp.Add(Filter.ToInt(cur, 0));
+                cur = "";
+            } else if (ch.Length == 1 && ch[0] >= 48 && ch[0] <= 57) {
+                cur = cur + ch;
+            }
+        }
+        return outp;
+    }
+}

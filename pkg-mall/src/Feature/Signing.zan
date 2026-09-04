@@ -1,0 +1,48 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Security.Cryptography;
+using System.Web;
+using ZanWeb.Model.Mall;
+
+namespace ZanWeb;
+
+/* 包签名与摘要校验：内容固定为 packageName + "\n" + version + "\n" + sha256，
+ * 私钥在服务端（ZAN_MALL_SIGNING_KEY_FILE），公钥进 IDE。
+ * 审核批准版本与发布频道包体都必须过 VerifyArtifact。 */
+class Signing {
+    /* 批准闸门用的完整校验：取商品 slug + 版本号 + 摘要重算消息，
+     * 用 ZAN_MALL_SIGNING_KEY_FILE 指向的公钥（或同机私钥的公段）验签。 */
+    static async bool VerifyArtifact(IDbConnection db, ProductVersion v) {
+        CatalogDao dao = new CatalogDao(db);
+        Product p = await dao.ProductById(v.productId);
+        if (p == null || v.artifactSignature.Length == 0) { return false; }
+        string message = p.slug + "\n" + v.version + "\n" + v.artifactSha256;
+        string pem = Signing.PublicPem();
+        if (pem.Length == 0) { return false; }
+        RsaKey key = RsaKey.FromPublicPem(pem);
+        if (key == null) { return false; }
+        return key.VerifySha256(message, v.artifactSignature);
+    }
+
+    /* 环境变量指定的 PEM；部署时同时可指向私钥（FromPublicPem 解析不出
+     * 公钥则失败，故服务端签发与校验都用同一份证书/公钥文件）。 */
+    static string PublicPem() {
+        string path = ProcessHost.Env("ZAN_MALL_SIGNING_KEY_FILE");
+        if (path.Length == 0) { return ""; }
+        if (!File.Exists(path)) { return ""; }
+        return File.ReadAllText(path);
+    }
+
+    /* 服务端签发（管理员批准版本时可用，也可以是开发者离线签好后提交）。 */
+    static string SignMessage(string pemPath, string message) {
+        if (!File.Exists(pemPath)) { return ""; }
+        RsaKey key = RsaKey.FromPrivatePem(File.ReadAllText(pemPath));
+        if (key == null || !key.HasPrivateKey()) { return ""; }
+        return key.SignSha256(message);
+    }
+
+    static string ArtifactMessage(string slug, string version, string sha256Hex) {
+        return slug + "\n" + version + "\n" + sha256Hex;
+    }
+}

@@ -1,0 +1,142 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Security.Cryptography;
+using System.Web;
+using ZanWeb.Model.Mall;
+
+namespace ZanWeb;
+
+/* CodeFirst 建表 + 种子。SyncStructureAllAsync 按 [Table] 实体一次建全所有表；
+ * 种子带计数保护，重复启动不变。种子内容：三个分类、官方免费扩展
+ * System.Scripting.Lua（1.0.0、once、0 积分、approved）、
+ * 版本频道初始行（ide / stdlib / compiler / sdk 四条发布线）。 */
+class Schema {
+    static async bool Ensure(DbContext ctx) {
+        IDbConnection db = await ctx.Acquire();
+        if (db == null) { return false; }
+        try {
+            /* SQLite 启用 WAL：多 worker 共享文件时避免写者阻塞读者。 */
+            await DbSchema.UseWriteAheadLogAsync(db);
+            await db.SyncStructureAllAsync();
+            if (!await Schema.SeedAdmin(db)) { return false; }
+            if (!await Schema.SeedCategories(db)) { return false; }
+            if (!await Schema.SeedOfficialPackage(db)) { return false; }
+            if (!await Schema.SeedChannels(db)) { return false; }
+            return true;
+        } finally {
+            ctx.Release(db);
+        }
+    }
+
+    /* 空库创建 bootstrap 管理员（admin/admin1234，部署前必须改密）。 */
+    static async bool SeedAdmin(IDbConnection db) {
+        MallUserDao users = new MallUserDao(db);
+        int have = await users.Count();
+        if (have > 0) { return true; }
+        string salt = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
+        User admin = new User();
+        admin.username = "admin";
+        admin.passwordSalt = salt;
+        admin.passwordHash = IdentityFlow.PasswordHashPublic("admin1234", salt);
+        admin.role = "admin";
+        admin.points = 0;
+        admin.status = "active";
+        admin.createdAt = WebApp.NowSeconds();
+        int _id = await users.Insert(admin);
+        return true;
+    }
+
+    static async bool SeedCategories(IDbConnection db) {
+        int have = await db.Select<Category>().CountAsync();
+        if (have > 0) { return true; }
+        if (!await Schema.AddCategory(db, "system", "System", 0)) { return false; }
+        if (!await Schema.AddCategory(db, "scripting", "Scripting", 10)) { return false; }
+        if (!await Schema.AddCategory(db, "developer-tools", "Developer Tools", 20)) { return false; }
+        return true;
+    }
+
+    static async bool AddCategory(IDbConnection db, string slug, string name, int order) {
+        Category row = new Category();
+        row.slug = slug;
+        row.name = name;
+        row.sortOrder = order;
+        int _id = await db.Insert<Category>(row).ExecuteIdentityAsync();
+        return true;
+    }
+
+    /* 官方免费扩展种子：商城"扩展"类商品的样板（IDE 内安全安装）。 */
+    static async bool SeedOfficialPackage(IDbConnection db) {
+        CatalogDao dao = new CatalogDao(db);
+        Product p = await dao.ProductBySlug("system-scripting-lua");
+        if (p != null) { return true; }
+        Category cat = await db.Select<Category>()
+            .Where(a => a.slug == "scripting").FirstAsync();
+        if (cat == null) { return true; }
+        Product row = new Product();
+        row.developerId = 0;
+        row.categoryId = cat.id;
+        row.slug = "system-scripting-lua";
+        row.name = "System.Scripting.Lua";
+        row.description = "Official Lua scripting extension for Zan (in-process Lua 5.4 embedding).";
+        row.productType = "extension";
+        row.status = "approved";
+        row.createdAt = WebApp.NowSeconds();
+        int pid = await dao.InsertProduct(row);
+        if (pid <= 0) { return false; }
+        ProductVersion v = new ProductVersion();
+        v.productId = pid;
+        v.version = "1.0.0";
+        v.majorVersion = 1;
+        v.artifactUrl = "packages/System.Scripting.Lua-1.0.0.zpkg";
+        v.artifactSha256 = "";
+        v.artifactSignature = "";
+        v.releaseNotes = "Initial reviewed release.";
+        v.status = "approved";
+        v.createdAt = WebApp.NowSeconds();
+        int _vid = await dao.InsertVersion(v);
+        PricingPlan plan = new PricingPlan();
+        plan.productId = pid;
+        plan.name = "Free";
+        plan.licenseMode = "once";
+        plan.pricePoints = 0;
+        plan.durationDays = 0;
+        plan.commissionPercent = 0;
+        plan.enabled = 1;
+        int _pl = await dao.InsertPlan(plan);
+        return true;
+    }
+
+    /* 版本频道初始行：官方工具链的四条发布线。包体字段留空，
+     * 管理端首次 Publish 填充；status=published 但 latestVersion 为
+     * 当前树版本，客户端 check 到空 installer_url 时视为"仅提示，无包"。 */
+    static async bool SeedChannels(IDbConnection db) {
+        VersionChannelDao dao = new VersionChannelDao(db);
+        int have = await db.Select<VersionChannel>().CountAsync();
+        if (have > 0) { return true; }
+        if (!await Schema.AddChannel(db, dao, "ide", "", ZanVersion.Text())) { return false; }
+        if (!await Schema.AddChannel(db, dao, "stdlib", "", ZanVersion.Text())) { return false; }
+        if (!await Schema.AddChannel(db, dao, "compiler", "", ZanVersion.Text())) { return false; }
+        if (!await Schema.AddChannel(db, dao, "sdk", "", ZanVersion.Text())) { return false; }
+        return true;
+    }
+
+    static async bool AddChannel(IDbConnection db, VersionChannelDao dao,
+                                 string channel, string platform, string version) {
+        VersionChannel row = new VersionChannel();
+        row.channel = channel;
+        row.platform = platform;
+        row.latestVersion = version;
+        row.requiredVersion = "";
+        row.rolloutPercent = 100;
+        row.installerUrl = "";
+        row.sha256 = "";
+        row.signature = "";
+        row.releaseNotes = "";
+        row.status = "published";
+        row.createdAt = WebApp.NowSeconds();
+        row.updatedAt = row.createdAt;
+        int _id = await dao.Insert(row);
+        return true;
+    }
+}

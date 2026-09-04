@@ -1,0 +1,978 @@
+using System;
+using System.Data;
+using System.Data.Sqlite;
+using System.Diagnostics;
+using System.Text;
+using System.Threading;
+using System.Web;
+
+namespace ZanWeb;
+
+/* 单接口单分钟流量指标（调用/错误/耗时/流式帧数/字节），同时作为 metrics_minute 表实体。 */
+[Table(Name = "metrics_minute")]
+class MetricMinute {
+    [Column(IsPrimary = true)]
+    long minute;     // 截断到分钟的 epoch 秒
+    /* 接口由 method + path 两个字段组成，method 为请求方法，path 为路由或静态资源路径。 */
+    [Column(IsPrimary = true, StringLength = 16)]
+    string method;
+    [Column(IsPrimary = true, StringLength = 400)]
+    string path;
+    long calls;
+    long errors;
+    /* 微秒单位，避免毫秒级快接口被归零。 */
+    [Column(Name = "total_us")]
+    long totalUs;
+    [Column(Name = "max_us")]
+    long maxUs;
+    /* 长连接推送的帧数与字节数（SSE/WebSocket），以帧/字节代替延迟度量流式接口。 */
+    long frames;
+    long bytes;
+}
+
+/* 单日单 SQL 模板的指标（调用/慢次数/耗时），SQL 已规范化，不存储用户输入。 */
+[Table(Name = "metrics_sql_day")]
+class MetricSql {
+    [Column(IsPrimary = true)]
+    long day;        // 截断到午夜的 epoch 秒
+    [Column(IsPrimary = true, StringLength = 400)]
+    string sql;      // 规范化的语句模板
+    long calls;
+    long slow;       // 达到 [log].slowSqlMs 阈值的执行
+    [Column(Name = "total_us")]
+    long totalUs;    // 微秒单位
+    [Column(Name = "max_us")]
+    long maxUs;
+}
+
+/* 存活工作进程发布的实时行（仅读结构，age 由读取时计算）。 */
+class LiveRow {
+    int worker;
+    long age;
+    string json;
+}
+
+/* 每个工作进程的实时快照行，按 worker id 主键覆盖更新。 */
+[Table(Name = "metrics_live")]
+class MetricLive {
+    [Column(IsPrimary = true, IsIdentity = false)]
+    int worker;
+    int pid;
+    long updated;
+    string snapshot;
+    string series;
+}
+
+/* 持久化的服务端错误记录。 */
+[Table(Name = "metrics_error")]
+[Index(Name = "ix_metrics_error_ts", Fields = "ts")]
+class MetricError {
+    [Column(IsPrimary = true, IsIdentity = true)]
+    long id;
+    long ts;
+    [Column(StringLength = 64)]
+    string origin;
+    string detail;
+}
+
+/* 运行监控的历史数据存储：内存按分钟聚合后批量写入独立 SQLite 数据库。 */
+class MetricsStore {
+    static List<MetricMinute> buckets = new List<MetricMinute>();
+    static List<MetricError> errors = new List<MetricError>();
+    /* 待写入的 SQL 模板聚合（按模板聚合，每个慢查询只累加一次）。 */
+    static List<MetricSql> sqlBuckets = new List<MetricSql>();
+    /* 未刷新桶数上限，超出则丢弃最旧记录。 */
+    static int MaxBuckets = 8192;
+    static int MaxErrors = 4096;
+    /* 内存 SQL 模板数上限，超出时折叠为"其他语句"。 */
+    static int MaxSqlShapes = 512;
+    static string OtherSql = "(其他语句)";
+    static DbPool pool = null;
+    static bool ready = false;
+    static bool flushing = false;
+    static long lastSweep = 0;
+
+    /* 初始化 metrics.db，创建表并启动后台刷新；失败时继续运行但不记历史。 */
+    static async bool Start() {
+        if (!Cfg.Metrics.enabled) { return false; }
+        Db.EnsureFileDir(Cfg.Metrics.path);
+        MetricsStore.pool = SqliteConnector.Pool(Cfg.Metrics.path, 1);
+        IDbConnection db = await MetricsStore.Lease();
+        if (db == null) { return false; }
+        try {
+            /* WAL 模式：刷新写入时历史界面仍可读取。 */
+            await DbSchema.UseWriteAheadLogAsync(db);
+            /* 旧版使用不同键（route 列 + 毫秒单位），新表独立创建，旧数据归档为 _legacy。 */
+            await MetricsStore.RetireLegacyMinutes(db);
+            /* CodeFirst 建表/加列/建索引；SQL 统计按天聚合，分钟仅用于刷新时机。 */
+            await db.SyncStructureAsync<MetricMinute>();
+            await db.SyncStructureAsync<MetricError>();
+            await db.SyncStructureAsync<MetricSql>();
+            await db.SyncStructureAsync<MetricLive>();
+        } finally {
+            MetricsStore.Give(db);
+        }
+        MetricsStore.ready = true;
+        return true;
+    }
+
+    static async IDbConnection Lease() {
+        if (MetricsStore.pool == null) { return null; }
+        IDbConnection db = await MetricsStore.pool.AcquireAsync();
+        if (db == null || !db.IsConnected()) {
+            MetricsStore.pool.Release(db);
+            return null;
+        }
+        return db;
+    }
+
+    static void Give(IDbConnection db) {
+        if (MetricsStore.pool == null || db == null) { return; }
+        MetricsStore.pool.Release(db);
+    }
+
+    /* 截断到分钟的 epoch 秒。 */
+    static long Minute(long sec) { return sec - (sec % 60); }
+
+    /* 截断到午夜的 epoch 秒。 */
+    static long Day(long sec) { return sec - (sec % 86400); }
+
+    /* 检测并重命名旧版 metrics_minute 表（按 route 或 total_ms 列判断），归档为 _legacy。 */
+    static async void RetireLegacyMinutes(IDbConnection db) {
+        try {
+            bool exists = await DbSchema.TableExistsAsync(db,
+                MetricMinuteCols.Table);
+            if (!exists) { return; }
+            /* 通过 route 或 total_ms 列判断是否为旧版表结构。 */
+            List<string> gone = new List<string> { "route", "total_ms" };
+            bool old = await DbSchema.HasAnyColumnAsync(db,
+                MetricMinuteCols.Table, gone);
+            if (!old) { return; }
+            await DbSchema.RenameTableAsync(db, MetricMinuteCols.Table,
+                MetricMinuteCols.Table + "_legacy");
+            Console.WriteLine("[metrics] history schema changed: previous "
+                + "rows kept in metrics_minute_legacy");
+        } catch (Exception ex) {
+            /* 检查失败不影响服务启动。 */
+            Console.WriteLine("[metrics] legacy history check failed: "
+                + ex.Message);
+        }
+    }
+
+    /* 首次有数据可刷新时启动后台刷新协程，避免启动阶段阻塞。 */
+    static void Arm() {
+        if (MetricsStore.flushing || !MetricsStore.ready) { return; }
+        MetricsStore.flushing = true;
+        Task.Spawn(MetricsStore.Loop());
+        Task.Spawn(MetricsCluster.Loop());
+    }
+
+    /* 获取当前分钟的桶，不存在则创建。 */
+    static MetricMinute Bucket(string method, string path) {
+        MetricsStore.Arm();
+        long m = MetricsStore.Minute((long)WebApp.NowSeconds());
+        int n = MetricsStore.buckets.Count;
+        /* 当前分钟桶位于列表末尾，倒序查找即可。 */
+        for (int i = n - 1; i >= 0; i = i - 1) {
+            MetricMinute b = MetricsStore.buckets[i];
+            if (b.minute != m) { break; }
+            if (b.method == method && b.path == path) { return b; }
+        }
+        MetricMinute b2 = new MetricMinute();
+        b2.minute = m;
+        b2.method = method;
+        b2.path = path;
+        MetricsStore.buckets.Add(b2);
+        while (MetricsStore.buckets.Count > MetricsStore.MaxBuckets) {
+            MetricsStore.buckets.RemoveAt(0);
+        }
+        return b2;
+    }
+
+    /* 记录一次请求完成（含状态码与耗时）。 */
+    static void Record(string method, string path, int status, long us) {
+        if (!Cfg.Metrics.enabled) { return; }
+        MetricMinute b = MetricsStore.Bucket(method, path);
+        b.calls = b.calls + 1;
+        b.totalUs = b.totalUs + us;
+        if (us > b.maxUs) { b.maxUs = us; }
+        if (status >= 500) { b.errors = b.errors + 1; }
+    }
+
+    /* 长连接以推送帧数/字节计量，不计耗时。 */
+    static void Pushed(string method, string path, long frames, long bytes) {
+        if (!Cfg.Metrics.enabled) { return; }
+        MetricMinute b = MetricsStore.Bucket(method, path);
+        b.frames = b.frames + frames;
+        b.bytes = b.bytes + bytes;
+    }
+
+    /* 记录一条 SQL 执行结果，累加到当天模板聚合中。SQL 已规范化，耗时单位微秒。 */
+    static void RecordSql(string norm, long us, bool slow) {
+        if (!Cfg.Metrics.enabled) { return; }
+        MetricsStore.Arm();
+        MetricSql e = MetricsStore.SqlEntry(norm);
+        e.calls = e.calls + 1;
+        e.totalUs = e.totalUs + us;
+        if (us > e.maxUs) { e.maxUs = us; }
+        if (slow) { e.slow = e.slow + 1; }
+    }
+
+    /* 获取今日 SQL 模板聚合项，上限超出则折叠为"其他语句"。 */
+    static MetricSql SqlEntry(string norm) {
+        long d = MetricsStore.Day((long)WebApp.NowSeconds());
+        for (int i = MetricsStore.sqlBuckets.Count - 1; i >= 0; i = i - 1) {
+            MetricSql e = MetricsStore.sqlBuckets[i];
+            if (e.day == d && e.sql == norm) { return e; }
+        }
+        if (MetricsStore.sqlBuckets.Count >= MetricsStore.MaxSqlShapes) {
+            for (int i = 0; i < MetricsStore.sqlBuckets.Count; i = i + 1) {
+                MetricSql o = MetricsStore.sqlBuckets[i];
+                if (o.day == d && o.sql == MetricsStore.OtherSql) { return o; }
+            }
+            norm = MetricsStore.OtherSql;
+        }
+        MetricSql n = new MetricSql();
+        n.day = d;
+        n.sql = norm;
+        MetricsStore.sqlBuckets.Add(n);
+        return n;
+    }
+
+    /* 向错误队列添加一条错误记录。 */
+    static void Failed(long ts, string origin, string detail) {
+        if (!Cfg.Metrics.enabled) { return; }
+        MetricError e = new MetricError();
+        e.ts = ts;
+        e.origin = origin;
+        e.detail = detail;
+        MetricsStore.errors.Add(e);
+        while (MetricsStore.errors.Count > MetricsStore.MaxErrors) {
+            MetricsStore.errors.RemoveAt(0);
+        }
+    }
+
+    /* 后台刷新协程：每秒检查一次，到达间隔或数量阈值时刷新。 */
+    static async void Loop() {
+        int waited = 0;
+        while (true) {
+            await Task.Delay(1000);
+            waited = waited + 1;
+            bool due = waited >= Cfg.Metrics.flushSeconds;
+            bool full = MetricsStore.buckets.Count >= Cfg.Metrics.flushRows
+                || MetricsStore.errors.Count >= Cfg.Metrics.flushRows
+                || MetricsStore.sqlBuckets.Count >= Cfg.Metrics.flushRows;
+            if (!due && !full) { continue; }
+            waited = 0;
+            await MetricsStore.Flush();
+        }
+    }
+
+    /* 事务性刷新所有缓冲数据，当前分钟也写入以防进程退出丢失。 */
+    static async int Flush() {
+        if (!MetricsStore.ready) { return 0; }
+        if (MetricsStore.buckets.Count == 0 && MetricsStore.errors.Count == 0
+            && MetricsStore.sqlBuckets.Count == 0) {
+            return 0;
+        }
+        List<MetricMinute> mine = MetricsStore.buckets;
+        List<MetricError> errs = MetricsStore.errors;
+        List<MetricSql> sqls = MetricsStore.sqlBuckets;
+        MetricsStore.buckets = new List<MetricMinute>();
+        MetricsStore.errors = new List<MetricError>();
+        MetricsStore.sqlBuckets = new List<MetricSql>();
+
+        IDbConnection db = await MetricsStore.Lease();
+        if (db == null) { return 0; }
+        int written = 0;
+        try {
+            await db.BeginTransactionAsync();
+            /* 写入时按复合键合并：冲突时累加计数器、取最大 maxUs，最终每桶一行。 */
+            if (mine.Count > 0) {
+                written = written + await db.Insert<MetricMinute>(mine)
+                    .OnConflict(a => new { a.minute, a.method, a.path })
+                    .SetIncr(a => a.calls)
+                    .SetIncr(a => a.errors)
+                    .SetIncr(a => a.totalUs)
+                    .SetMax(a => a.maxUs)
+                    .SetIncr(a => a.frames)
+                    .SetIncr(a => a.bytes)
+                    .ExecuteAffrowsAsync();
+            }
+            /* 按 (day, sql) 合并，所有工作进程累积到同一行。 */
+            if (sqls.Count > 0) {
+                written = written + await db.Insert<MetricSql>(sqls)
+                    .OnConflict(a => new { a.day, a.sql })
+                    .SetIncr(a => a.calls)
+                    .SetIncr(a => a.slow)
+                    .SetIncr(a => a.totalUs)
+                    .SetMax(a => a.maxUs)
+                    .ExecuteAffrowsAsync();
+            }
+            /* 错误为事件记录，每条独立一行。 */
+            if (errs.Count > 0) {
+                written = written + await db.Insert<MetricError>(errs)
+                    .ExecuteAffrowsAsync();
+            }
+            await db.CommitAsync();
+            await MetricsStore.Sweep(db);
+        } catch (Exception ex) {
+            await db.RollbackAsync();
+            /* 刷新失败不回滚请求，且错误记录器自身不递归。 */
+            Console.WriteLine("[metrics] flush failed: " + ex.Message);
+        } finally {
+            MetricsStore.Give(db);
+        }
+        return written;
+    }
+
+    /* 按保留天数清理过期数据，每小时最多执行一次。 */
+    static async void Sweep(IDbConnection db) {
+        long now = (long)WebApp.NowSeconds();
+        if (now - MetricsStore.lastSweep < 3600) { return; }
+        MetricsStore.lastSweep = now;
+        long cut = now - (long)Cfg.Metrics.keepDays * 86400;
+        long dayCut = MetricsStore.Day(cut);
+        int _a = await db.Delete<MetricMinute>()
+            .Where(a => a.minute < cut).ExecuteAffrowsAsync();
+        int _b = await db.Delete<MetricError>()
+            .Where(a => a.ts < cut).ExecuteAffrowsAsync();
+        int _c = await db.Delete<MetricSql>()
+            .Where(a => a.day < dayCut).ExecuteAffrowsAsync();
+    }
+
+    /* 查询窗口内 SQL 模板聚合，按调用/耗时/慢次数排序，数据库端聚合，无原始行入内存。 */
+    static async List<MetricSql> SqlTotals(long from, long to, int limit,
+                                           string rank) {
+        List<MetricSql> outp = new List<MetricSql>();
+        if (!MetricsStore.ready) { return outp; }
+        IDbConnection db = await MetricsStore.Lease();
+        if (db == null) { return outp; }
+        long a0 = MetricsStore.Day(from);
+        long b0 = MetricsStore.Day(to);
+        int order = 2;
+        if (rank == "time") {
+            order = 4;
+        } else if (rank == "slow") {
+            order = 3;
+        }
+        string sql = "SELECT sql, SUM(calls), SUM(slow), SUM(total_us), "
+            + "MAX(max_us) FROM metrics_sql_day "
+            + "WHERE day >= ? AND day <= ? "
+            + "GROUP BY sql ORDER BY " + Convert.ToString(order)
+            + " DESC LIMIT " + Convert.ToString(limit);
+        DbParams prms = new DbParams().AddLong(a0).AddLong(b0);
+        try {
+            DbResult r = await db.QueryAsync(sql, prms);
+            for (int i = 0; i < r.RowCount(); i = i + 1) {
+                MetricSql e = new MetricSql();
+                e.day = a0;
+                e.sql = r.GetString(i, 0);
+                e.calls = r.GetLong(i, 1);
+                e.slow = r.GetLong(i, 2);
+                e.totalUs = r.GetLong(i, 3);
+                e.maxUs = r.GetLong(i, 4);
+                outp.Add(e);
+            }
+        } finally {
+            MetricsStore.Give(db);
+        }
+        return outp;
+    }
+
+    /* 聚合历史：按 stepSec 分桶（分钟/小时/天），可按 method/path 过滤。 */
+    static async List<MetricMinute> HistoryBuckets(long from, long to,
+                                                    string method, string path,
+                                                    long stepSec, int limit) {
+        List<MetricMinute> outp = new List<MetricMinute>();
+        if (stepSec < 1) { stepSec = 60; }
+        string sql = "SELECT minute - (minute % " + Convert.ToString(stepSec)
+            + "), SUM(calls), SUM(errors), SUM(total_us), MAX(max_us), "
+            + "SUM(frames), SUM(bytes) FROM metrics_minute "
+            + "WHERE minute >= ? AND minute <= ?";
+        DbParams prms = new DbParams().AddLong(from).AddLong(to);
+        if (method.Length > 0) {
+            sql = sql + " AND method = ?";
+            prms.Add(method);
+        }
+        if (path.Length > 0) {
+            sql = sql + " AND path = ?";
+            prms.Add(path);
+        }
+        sql = sql + " GROUP BY minute - (minute % "
+            + Convert.ToString(stepSec) + ") ORDER BY 1 DESC LIMIT "
+            + Convert.ToString(limit);
+        if (!MetricsStore.ready) { return outp; }
+        IDbConnection db = await MetricsStore.Lease();
+        if (db == null) { return outp; }
+        try {
+            DbResult r = await db.QueryAsync(sql, prms);
+            for (int i = 0; i < r.RowCount(); i = i + 1) {
+                MetricMinute b = new MetricMinute();
+                b.minute = r.GetLong(i, 0);
+                b.method = method;
+                b.path = path;
+                b.calls = r.GetLong(i, 1);
+                b.errors = r.GetLong(i, 2);
+                b.totalUs = r.GetLong(i, 3);
+                b.maxUs = r.GetLong(i, 4);
+                b.frames = r.GetLong(i, 5);
+                b.bytes = r.GetLong(i, 6);
+                outp.Add(b);
+            }
+        } finally {
+            MetricsStore.Give(db);
+        }
+        return outp;
+    }
+
+    /* 窗口内按接口聚合，按调用次数排序。 */
+    static async List<MetricMinute> RouteTotals(long from, long to,
+                                                string method, string path,
+                                                int limit) {
+        return await MetricsStore.RouteTotalsBy(from, to, method, path, limit,
+            "calls");
+    }
+
+    /* 按接口聚合，可按调用次数或耗时排序。 */
+    static async List<MetricMinute> RouteTotalsBy(long from, long to,
+                                                  string method, string path,
+                                                  int limit, string rank) {
+        List<MetricMinute> outp = new List<MetricMinute>();
+        int firstOrder = 3;
+        int secondOrder = 5;
+        if (rank == "time") {
+            firstOrder = 5;
+            secondOrder = 3;
+        }
+        string sql = "SELECT method, path, SUM(calls), SUM(errors), "
+            + "SUM(total_us), MAX(max_us), SUM(frames), SUM(bytes) "
+            + "FROM metrics_minute WHERE minute >= ? AND minute <= ?";
+        DbParams prms = new DbParams().AddLong(from).AddLong(to);
+        if (method.Length > 0) {
+            sql = sql + " AND method = ?";
+            prms.Add(method);
+        }
+        if (path.Length > 0) {
+            sql = sql + " AND path = ?";
+            prms.Add(path);
+        }
+        sql = sql + " GROUP BY method, path ORDER BY "
+            + Convert.ToString(firstOrder) + " DESC, "
+            + Convert.ToString(secondOrder) + " DESC LIMIT "
+            + Convert.ToString(limit);
+        if (!MetricsStore.ready) { return outp; }
+        IDbConnection db = await MetricsStore.Lease();
+        if (db == null) { return outp; }
+        try {
+            DbResult r = await db.QueryAsync(sql, prms);
+            for (int i = 0; i < r.RowCount(); i = i + 1) {
+                MetricMinute e = new MetricMinute();
+                e.minute = 0;
+                e.method = r.GetString(i, 0);
+                e.path = r.GetString(i, 1);
+                e.calls = r.GetLong(i, 2);
+                e.errors = r.GetLong(i, 3);
+                e.totalUs = r.GetLong(i, 4);
+                e.maxUs = r.GetLong(i, 5);
+                e.frames = r.GetLong(i, 6);
+                e.bytes = r.GetLong(i, 7);
+                outp.Add(e);
+            }
+        } finally {
+            MetricsStore.Give(db);
+        }
+        return outp;
+    }
+
+    /* 窗口整体汇总（单次聚合行，无数据时各字段为 0）。 */
+    static async MetricMinute WindowTotals(long from, long to, string method,
+                                           string path) {
+        MetricMinute b = new MetricMinute();
+        b.minute = from;
+        b.method = method;
+        b.path = path;
+        if (!MetricsStore.ready) { return b; }
+        string sql = "SELECT SUM(calls), SUM(errors), SUM(total_us), "
+            + "MAX(max_us), SUM(frames), SUM(bytes) FROM metrics_minute "
+            + "WHERE minute >= ? AND minute <= ?";
+        DbParams prms = new DbParams().AddLong(from).AddLong(to);
+        if (method.Length > 0) {
+            sql = sql + " AND method = ?";
+            prms.Add(method);
+        }
+        if (path.Length > 0) {
+            sql = sql + " AND path = ?";
+            prms.Add(path);
+        }
+        IDbConnection db = await MetricsStore.Lease();
+        if (db == null) { return b; }
+        try {
+            DbResult r = await db.QueryAsync(sql, prms);
+            if (r.RowCount() > 0) {
+                b.calls = r.GetLong(0, 0);
+                b.errors = r.GetLong(0, 1);
+                b.totalUs = r.GetLong(0, 2);
+                b.maxUs = r.GetLong(0, 3);
+                b.frames = r.GetLong(0, 4);
+                b.bytes = r.GetLong(0, 5);
+            }
+        } finally {
+            MetricsStore.Give(db);
+        }
+        return b;
+    }
+
+    /* 查询持久化的错误记录，按时间倒序。 */
+    static async List<MetricError> Errors(long from, long to, int limit) {
+        List<MetricError> outp = new List<MetricError>();
+        if (!MetricsStore.ready) { return outp; }
+        IDbConnection db = await MetricsStore.Lease();
+        if (db == null) { return outp; }
+        try {
+            outp = await db.Select<MetricError>()
+                .Where(a => a.ts >= from && a.ts <= to)
+                .OrderByDescending(a => a.id)
+                .Limit(limit)
+                .ToListAsync();
+        } finally {
+            MetricsStore.Give(db);
+        }
+        return outp;
+    }
+}
+
+/* 聚合所有工作进程的实时指标：各 worker 独立发布，读取端合并。 */
+class MetricsCluster {
+    /* 发布间隔 2 秒，秒级数据失效阈值 30 秒；累加总量不受失效阈值影响。 */
+    static int PublishSeconds = 2;
+    static int FreshSeconds = 30;
+
+    /* 每个 worker 一个后台协程，定期发布快照。 */
+    static async void Loop() {
+        while (true) {
+            await Task.Delay(MetricsCluster.PublishSeconds * 1000);
+            await MetricsCluster.Publish();
+        }
+    }
+
+    /* 覆写本 worker 的实时行（快照 + 时序）。 */
+    static async void Publish() {
+        if (!MetricsStore.ready) { return; }
+        WebApp app = WebHost.Current();
+        if (app == null) { return; }
+        IDbConnection db = await MetricsStore.Lease();
+        if (db == null) { return; }
+        try {
+            MetricLive row = new MetricLive();
+            row.worker = ProcessHost.WorkerId();
+            row.pid = ProcessHost.Pid();
+            row.updated = (long)WebApp.NowSeconds();
+            row.snapshot = app.MetricsJson();
+            row.series = app.MetricsSeriesJson(120);
+            /* 按 worker 主键冲突时覆写非计数列。 */
+            int _n = await db.Insert<MetricLive>(row)
+                .OnConflict(a => a.worker)
+                .ExecuteAffrowsAsync();
+        } catch (Exception ex) {
+            Console.WriteLine("[metrics] live publish failed: " + ex.Message);
+        } finally {
+            MetricsStore.Give(db);
+        }
+    }
+
+    /* 读取所有 worker 发布的指定列（snapshot 或 series）及年龄，可选时效过滤。 */
+    static async List<LiveRow> LiveRows(string col, int maxAgeSec) {
+        List<LiveRow> outp = new List<LiveRow>();
+        if (!MetricsStore.ready) { return outp; }
+        IDbConnection db = await MetricsStore.Lease();
+        if (db == null) { return outp; }
+        try {
+            long now = (long)WebApp.NowSeconds();
+            long cut = now - (long)maxAgeSec;
+            bool fresh = maxAgeSec > 0;
+            List<MetricLive> rows = await db.Select<MetricLive>()
+                .WhereIf(fresh, a => a.updated >= cut)
+                .OrderBy(a => a.worker)
+                .ToListAsync();
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                MetricLive m = rows[i];
+                LiveRow w = new LiveRow();
+                w.worker = m.worker;
+                w.age = now - m.updated;
+                if (w.age < 0) { w.age = 0; }
+                /* 根据参数选择返回 snapshot 或 series 字段。 */
+                w.json = col == "series" ? m.series : m.snapshot;
+                outp.Add(w);
+            }
+        } finally {
+            MetricsStore.Give(db);
+        }
+        return outp;
+    }
+
+    /* 合并所有 worker 的快照，追加 workers/processes/worker_list 字段。 */
+    static async string SnapshotJson() {
+        WebApp app = WebHost.Current();
+        await MetricsCluster.Publish();   // 本 worker 始终保持最新
+        List<LiveRow> rows = await MetricsCluster.LiveRows("snapshot", 0);
+        List<JsonValue> ms = new List<JsonValue>();
+        List<LiveRow> kept = new List<LiveRow>();
+        int live = 0;
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            LiveRow w = rows[i];
+            JsonValue m = JsonValue.ParseLenient(w.json);
+            if (m == null || !m.IsObject()) { continue; }
+            ms.Add(m);
+            kept.Add(w);
+            if (w.age <= (long)MetricsCluster.FreshSeconds) { live = live + 1; }
+        }
+
+        string own = app.MetricsJson();
+        if (ms.Count <= 1) {
+            /* 单进程场景：自身快照即服务器全貌。 */
+            JsonValue o = JsonValue.ParseLenient(own);
+            if (o == null || !o.IsObject()) { return own; }
+            List<JsonValue> self = new List<JsonValue>();
+            self.Add(o);
+            List<LiveRow> selfRow = new List<LiveRow>();
+            LiveRow r = new LiveRow();
+            r.worker = ProcessHost.WorkerId();
+            r.age = 0;
+            r.json = own;
+            selfRow.Add(r);
+            o.Put("processes", MetricsCluster.ProcessesJson(selfRow, self));
+            /* 单 worker 场景补全 fleet 字段，避免页面显示异常。 */
+            o.Put("workers", MetricsCluster.Num(1));
+            o.Put("workers_counted", MetricsCluster.Num(1));
+            o.Put("worker_list", JsonValue.NewStr(
+                Convert.ToString(ProcessHost.WorkerId())));
+            return o.ToJson();
+        }
+        JsonValue merged = JsonValue.ParseLenient(
+            MetricsCluster.MergeSnapshots(ms, live));
+        if (merged == null || !merged.IsObject()) { return own; }
+        merged.Put("processes", MetricsCluster.ProcessesJson(kept, ms));
+        return merged.ToJson();
+    }
+
+    /* 每个进程一行，含 uptime/requests/queries/load 等，age 为发布到现在的秒数。 */
+    static JsonValue ProcessesJson(List<LiveRow> rows, List<JsonValue> ms) {
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < ms.Count; i = i + 1) {
+            JsonValue m = ms[i];
+            long age = 0;
+            int wid = (int)m.Long("worker_id", 0);
+            if (i < rows.Count) {
+                age = rows[i].age;
+                wid = rows[i].worker;
+            }
+            JsonValue o = JsonValue.NewObject();
+            o.Put("worker", MetricsCluster.Num(wid));
+            o.Put("pid", MetricsCluster.Num(m.Long("pid", 0)));
+            o.Put("uptime_ms", MetricsCluster.Num(m.Long("uptime_ms", 0)));
+            o.Put("cpu_percent", MetricsCluster.Num(m.Long("cpu_percent", 0 - 1)));
+            o.Put("cpu_ms", MetricsCluster.Num(m.Long("cpu_ms", 0)));
+            o.Put("mem_rss_bytes", MetricsCluster.Num(m.Long("mem_rss_bytes", 0)));
+            JsonValue rq = m.Get("requests");
+            long n = 0;
+            if (rq != null) {
+                n = rq.Long("count", 0);
+                o.Put("errors", MetricsCluster.Num(rq.Long("errors", 0)));
+                o.Put("avg_us", MetricsCluster.Num(rq.Long("avg_us", 0)));
+                o.Put("max_us", MetricsCluster.Num(rq.Long("max_us", 0)));
+            }
+            o.Put("requests", MetricsCluster.Num(n));
+            JsonValue ld = m.Get("load");
+            if (ld != null) {
+                o.Put("concurrent", MetricsCluster.Num(ld.Long("concurrent", 0)));
+                o.Put("streams", MetricsCluster.Num(ld.Long("streams", 0)));
+            }
+            JsonValue qs = m.Get("queries");
+            if (qs != null) {
+                o.Put("queries", MetricsCluster.Num(qs.Long("count", 0)));
+            }
+            o.Put("age", MetricsCluster.Num(age));
+            long alive = 0;
+            if (age <= (long)MetricsCluster.FreshSeconds) { alive = 1; }
+            o.Put("live", MetricsCluster.Num(alive));
+            arr.Append(o);
+        }
+        return arr;
+    }
+
+    static string MergeSnapshots(List<JsonValue> ms, int live) {
+        long upt = 0;
+        long cpuPct = 0;
+        long rss = 0;
+        long rCount = 0;
+        long rErrors = 0;
+        long rFailed = 0;
+        long rRejected = 0;
+        long rAvgW = 0;
+        long rMax = 0;
+        long rSlowTh = 0;
+        long rSlowN = 0;
+        long qCount = 0;
+        long qAvgW = 0;
+        long qMax = 0;
+        long qSlowTh = 0;
+        long qSlowN = 0;
+        long lConc = 0;
+        long lPeak = 0;
+        long lStreams = 0;
+        long lFrames = 0;
+        long lBytes = 0;
+        StringBuilder wl = new StringBuilder();
+        JsonValue topReq = JsonValue.NewArray();
+        JsonValue topSql = JsonValue.NewArray();
+        for (int i = 0; i < ms.Count; i = i + 1) {
+            JsonValue m = ms[i];
+            if (i > 0) { wl.Append(","); }
+            wl.Append(Convert.ToString(m.Long("worker_id", 0)));
+            if (m.Long("uptime_ms", 0) > upt) { upt = m.Long("uptime_ms", 0); }
+            long c = m.Long("cpu_percent", 0 - 1);
+            if (c > 0) { cpuPct = cpuPct + c; }
+            long rb = m.Long("mem_rss_bytes", 0 - 1);
+            if (rb > 0) { rss = rss + rb; }
+            JsonValue rq = m.Get("requests");
+            if (rq != null) {
+                long n = rq.Long("count", 0);
+                rCount = rCount + n;
+                rErrors = rErrors + rq.Long("errors", 0);
+                rFailed = rFailed + rq.Long("failed", 0);
+                rRejected = rRejected + rq.Long("rejected", 0);
+                rAvgW = rAvgW + n * rq.Long("avg_us", 0);
+                if (rq.Long("max_us", 0) > rMax) { rMax = rq.Long("max_us", 0); }
+                rSlowTh = rq.Long("slow_threshold_us", 0);
+                rSlowN = rSlowN + rq.Long("slow_count", 0);
+            }
+            JsonValue qs = m.Get("queries");
+            if (qs != null) {
+                long n2 = qs.Long("count", 0);
+                qCount = qCount + n2;
+                qAvgW = qAvgW + n2 * qs.Long("avg_us", 0);
+                if (qs.Long("max_us", 0) > qMax) { qMax = qs.Long("max_us", 0); }
+                qSlowTh = qs.Long("slow_threshold_us", 0);
+                qSlowN = qSlowN + qs.Long("slow_count", 0);
+            }
+            JsonValue ld = m.Get("load");
+            if (ld != null) {
+                lConc = lConc + ld.Long("concurrent", 0);
+                lPeak = lPeak + ld.Long("peak", 0);
+                lStreams = lStreams + ld.Long("streams", 0);
+                lFrames = lFrames + ld.Long("stream_frames", 0);
+                lBytes = lBytes + ld.Long("stream_bytes", 0);
+            }
+            MetricsCluster.MergeTop(topReq, m.Get("top_requests"), "req");
+            MetricsCluster.MergeTop(topSql, m.Get("top_sql"), "sql");
+        }
+
+        JsonValue requests = JsonValue.NewObject();
+        requests.Put("count", MetricsCluster.Num(rCount));
+        requests.Put("errors", MetricsCluster.Num(rErrors));
+        requests.Put("failed", MetricsCluster.Num(rFailed));
+        requests.Put("rejected", MetricsCluster.Num(rRejected));
+        long rAvg = 0;
+        if (rCount > 0) { rAvg = rAvgW / rCount; }
+        requests.Put("avg_us", MetricsCluster.Num(rAvg));
+        requests.Put("max_us", MetricsCluster.Num(rMax));
+        requests.Put("slow_threshold_us", MetricsCluster.Num(rSlowTh));
+        requests.Put("slow_count", MetricsCluster.Num(rSlowN));
+
+        JsonValue queries = JsonValue.NewObject();
+        queries.Put("count", MetricsCluster.Num(qCount));
+        long qAvg = 0;
+        if (qCount > 0) { qAvg = qAvgW / qCount; }
+        queries.Put("avg_us", MetricsCluster.Num(qAvg));
+        queries.Put("max_us", MetricsCluster.Num(qMax));
+        queries.Put("slow_threshold_us", MetricsCluster.Num(qSlowTh));
+        queries.Put("slow_count", MetricsCluster.Num(qSlowN));
+
+        JsonValue load = JsonValue.NewObject();
+        load.Put("concurrent", MetricsCluster.Num(lConc));
+        load.Put("peak", MetricsCluster.Num(lPeak));
+        load.Put("streams", MetricsCluster.Num(lStreams));
+        load.Put("stream_frames", MetricsCluster.Num(lFrames));
+        load.Put("stream_bytes", MetricsCluster.Num(lBytes));
+
+        JsonValue o = JsonValue.NewObject();
+        o.Put("uptime_ms", MetricsCluster.Num(upt));
+        o.Put("pid", MetricsCluster.Num(ProcessHost.Pid()));
+        o.Put("worker_id", MetricsCluster.Num(ProcessHost.WorkerId()));
+        o.Put("workers", MetricsCluster.Num(live));
+        /* 计入所有参与合并的 worker（含已停发），停发与流量消失的区别由此区分。 */
+        o.Put("workers_counted", MetricsCluster.Num(ms.Count));
+        o.Put("worker_list", JsonValue.NewStr(wl.ToString()));
+        o.Put("cpu_percent", MetricsCluster.Num(cpuPct));
+        o.Put("mem_rss_bytes", MetricsCluster.Num(rss));
+        o.Put("requests", requests);
+        o.Put("queries", queries);
+        o.Put("load", load);
+        o.Put("top_requests", MetricsCluster.SortTop(topReq));
+        o.Put("top_sql", MetricsCluster.SortTop(topSql));
+        return o.ToJson();
+    }
+
+    /* 合并一个 worker 的 top 列表：同 key 累加 count/total_us，取较大 max_us，重算 avg。 */
+    static void MergeTop(JsonValue merged, JsonValue add, string key) {
+        if (add == null || !add.IsArray()) { return; }
+        for (int i = 0; i < add.Count(); i = i + 1) {
+            JsonValue s = add.At(i);
+            string k = s.Str(key, "");
+            JsonValue hit = null;
+            for (int j = 0; j < merged.Count(); j = j + 1) {
+                if (merged.At(j).Str(key, "") == k) { hit = merged.At(j); break; }
+            }
+            if (hit == null) {
+                JsonValue row = JsonValue.NewObject();
+                row.Put(key, JsonValue.NewStr(k));
+                row.Put("count", MetricsCluster.Num(s.Long("count", 0)));
+                row.Put("errors", MetricsCluster.Num(s.Long("errors", 0)));
+                row.Put("failed", MetricsCluster.Num(s.Long("failed", 0)));
+                row.Put("rejected", MetricsCluster.Num(s.Long("rejected", 0)));
+                row.Put("total_us", MetricsCluster.Num(s.Long("total_us", 0)));
+                row.Put("max_us", MetricsCluster.Num(s.Long("max_us", 0)));
+                MetricsCluster.Reavg(row);
+                merged.Append(row);
+                continue;
+            }
+            hit.Set("count", MetricsCluster.Num(hit.Long("count", 0)
+                + s.Long("count", 0)));
+            hit.Set("errors", MetricsCluster.Num(hit.Long("errors", 0)
+                + s.Long("errors", 0)));
+            hit.Set("failed", MetricsCluster.Num(hit.Long("failed", 0)
+                + s.Long("failed", 0)));
+            hit.Set("rejected", MetricsCluster.Num(hit.Long("rejected", 0)
+                + s.Long("rejected", 0)));
+            hit.Set("total_us", MetricsCluster.Num(hit.Long("total_us", 0)
+                + s.Long("total_us", 0)));
+            if (s.Long("max_us", 0) > hit.Long("max_us", 0)) {
+                hit.Set("max_us", MetricsCluster.Num(s.Long("max_us", 0)));
+            }
+            MetricsCluster.Reavg(hit);
+        }
+    }
+
+    static void Reavg(JsonValue row) {
+        long n = row.Long("count", 0);
+        long avg = 0;
+        if (n > 0) { avg = row.Long("total_us", 0) / n; }
+        row.Set("avg_us", MetricsCluster.Num(avg));
+    }
+
+    /* 按累计耗时降序排列，最多取 20 条，选择排序。 */
+    static JsonValue SortTop(JsonValue arr) {
+        int n = arr.Count();
+        List<JsonValue> rows = new List<JsonValue>();
+        for (int i = 0; i < n; i = i + 1) { rows.Add(arr.At(i)); }
+        for (int a = 0; a < rows.Count - 1; a = a + 1) {
+            int best = a;
+            for (int b = a + 1; b < rows.Count; b = b + 1) {
+                if (rows[b].Long("total_us", 0) > rows[best].Long("total_us", 0)) {
+                    best = b;
+                }
+            }
+            if (best != a) {
+                JsonValue tmp = rows[a];
+                rows[a] = rows[best];
+                rows[best] = tmp;
+            }
+        }
+        JsonValue outp = JsonValue.NewArray();
+        int keep = rows.Count;
+        if (keep > 20) { keep = 20; }
+        for (int i = 0; i < keep; i = i + 1) { outp.Append(rows[i]); }
+        return outp;
+    }
+
+    /* 合并秒级时序：请求/错误相加，延迟按请求数加权，p95/max 取最值，CPU/RSS 相加。 */
+    static async string SeriesJson(int seconds) {
+        WebApp app = WebHost.Current();
+        List<LiveRow> rows = await MetricsCluster.LiveRows("series",
+            MetricsCluster.FreshSeconds);
+        if (rows.Count <= 1) { return app.MetricsSeriesJson(seconds); }
+        int want = seconds;
+        if (want <= 0) { want = 120; }
+        long[] req = new long[want];
+        long[] err = new long[want];
+        long[] avgW = new long[want];
+        long[] p95 = new long[want];
+        long[] max = new long[want];
+        long[] q = new long[want];
+        long[] qavgW = new long[want];
+        long[] cpu = new long[want];
+        long[] rssArr = new long[want];
+        int merged = 0;
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            JsonValue s = JsonValue.ParseLenient(rows[i].json);
+            if (s == null || !s.IsObject()) { continue; }
+            JsonValue pts = s.Get("points");
+            if (pts == null || !pts.IsArray()) { continue; }
+            merged = merged + 1;
+            /* 各 worker 以自身时间零点编号，回移 age 使同一秒来自所有 worker 的数据对齐。 */
+            int shift = (int)rows[i].age;
+            for (int j = 0; j < pts.Count(); j = j + 1) {
+                JsonValue p = pts.At(j);
+                long t = p.Long("t", 1);
+                if (t > 0) { continue; }
+                int idx = want - 1 + (int)t - shift;    // t: -(want-1)..0
+                if (idx < 0 || idx >= want) { continue; }
+                long r = p.Long("req", 0);
+                req[idx] = req[idx] + r;
+                err[idx] = err[idx] + p.Long("err", 0);
+                avgW[idx] = avgW[idx] + r * p.Long("avg_us", 0);
+                if (p.Long("p95_us", 0) > p95[idx]) { p95[idx] = p.Long("p95_us", 0); }
+                if (p.Long("max_us", 0) > max[idx]) { max[idx] = p.Long("max_us", 0); }
+                long qn = p.Long("queries", 0);
+                q[idx] = q[idx] + qn;
+                qavgW[idx] = qavgW[idx] + qn * p.Long("query_avg_us", 0);
+                long c = p.Long("cpu_percent", 0 - 1);
+                if (c > 0) { cpu[idx] = cpu[idx] + c; }
+                long rb = p.Long("mem_rss_bytes", 0 - 1);
+                if (rb > 0) { rssArr[idx] = rssArr[idx] + rb; }
+            }
+        }
+        if (merged <= 1) { return app.MetricsSeriesJson(seconds); }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"step_ms\":1000,\"count\":");
+        sb.Append(Convert.ToString(want));
+        sb.Append(",\"workers\":");
+        sb.Append(Convert.ToString(merged));
+        sb.Append(",\"points\":[");
+        for (int idx = 0; idx < want; idx = idx + 1) {
+            if (idx > 0) { sb.Append(","); }
+            long avg = 0;
+            if (req[idx] > 0) { avg = avgW[idx] / req[idx]; }
+            long qavg = 0;
+            if (q[idx] > 0) { qavg = qavgW[idx] / q[idx]; }
+            sb.Append("{\"t\":");
+            sb.Append(Convert.ToString((long)idx - (long)want + 1));
+            sb.Append(",\"req\":");
+            sb.Append(Convert.ToString(req[idx]));
+            sb.Append(",\"err\":");
+            sb.Append(Convert.ToString(err[idx]));
+            sb.Append(",\"avg_us\":");
+            sb.Append(Convert.ToString(avg));
+            sb.Append(",\"p95_us\":");
+            sb.Append(Convert.ToString(p95[idx]));
+            sb.Append(",\"max_us\":");
+            sb.Append(Convert.ToString(max[idx]));
+            sb.Append(",\"queries\":");
+            sb.Append(Convert.ToString(q[idx]));
+            sb.Append(",\"query_avg_us\":");
+            sb.Append(Convert.ToString(qavg));
+            sb.Append(",\"cpu_percent\":");
+            sb.Append(Convert.ToString(cpu[idx]));
+            sb.Append(",\"mem_rss_bytes\":");
+            sb.Append(Convert.ToString(rssArr[idx]));
+            sb.Append("}");
+        }
+        sb.Append("]}");
+        return sb.ToString();
+    }
+
+    static JsonValue Num(long v) {
+        return JsonValue.NewNum(Convert.ToString(v));
+    }
+}

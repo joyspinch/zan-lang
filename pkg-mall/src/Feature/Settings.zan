@@ -1,0 +1,83 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb;
+
+/* 站点全局设置（标题、关键词、备案号等），每 worker 缓存一分钟，保存后本 worker 立即失效。 */
+class Settings {
+    static int CacheSeconds = 60;
+
+    /* 本 worker 的设置缓存及过期时间，用 StrMap 避免扫描与换行符转义。 */
+    static StrMap values;
+    static long expires;
+
+    /* 加载所有设置，每 worker 每分钟一次。 */
+    static async StrMap All() {
+        long now = WebApp.NowSeconds();
+        if (Settings.values != null && now < Settings.expires) {
+            return Settings.values;
+        }
+        IDbConnection db = await AuthUser.Lease();
+        if (db == null) {
+            /* 数据库不可用时返回旧缓存，下次读取时重试。 */
+            if (Settings.values != null) { return Settings.values; }
+            return new StrMap();
+        }
+        StrMap m = new StrMap();
+        try {
+            List<SiteSetting> rows = await db.Select<SiteSetting>().ToListAsync();
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                m.Set(rows[i].name, rows[i].value);
+            }
+        } finally {
+            AuthUser.Give(db);
+        }
+        Fmt.SetOffsetMinutes(Filter.ToInt(m.Get(SettingKeys.SiteTimezone), 0));
+        Settings.values = m;
+        Settings.expires = now + Settings.CacheSeconds;
+        return m;
+    }
+
+    /* 保存后清除本 worker 的缓存。 */
+    static void Forget() {
+        Settings.values = null;
+        Settings.expires = 0;
+    }
+
+    /* 读取一个设置，未配置或为空时返回默认值。 */
+    static async string Get(string name, string def) {
+        StrMap m = await Settings.All();
+        string v = m.Get(name);
+        if (v.Length == 0) { return def; }
+        return v;
+    }
+
+    /* 布尔设置：非 "0" 即为 true。 */
+    static async bool On(string name, bool def) {
+        string v = await Settings.Get(name, "");
+        if (v.Length == 0) { return def; }
+        return v != "0";
+    }
+
+    /* 将公开设置注入视图数据（站点标题、备案号、分析代码等）。 */
+    static async void Apply(ViewData d) {
+        StrMap m = await Settings.All();
+        d.Set("siteTitle", m.GetOr(SettingKeys.SiteTitle, "Zan"));
+        d.Set("siteSubtitle", m.Get(SettingKeys.SiteSubtitle));
+        d.Set("siteKeywords", m.Get(SettingKeys.SiteKeywords));
+        d.Set("siteDescription", m.Get(SettingKeys.SiteDescription));
+        d.Set("siteIcp", m.Get(SettingKeys.SiteIcp));
+        d.Set("sitePolice", m.Get(SettingKeys.SitePolice));
+        d.Set("siteCopyright", m.Get(SettingKeys.SiteCopyright));
+        d.Set("siteAnalytics", m.Get(SettingKeys.SiteAnalytics));
+        if (await Settings.On(SettingKeys.RegisterEnabled, false)) {
+            d.Set("canRegister", "1");
+        }
+        if (await Settings.On(SettingKeys.ResetEnabled, true)) {
+            d.Set("canReset", "1");
+        }
+    }
+}

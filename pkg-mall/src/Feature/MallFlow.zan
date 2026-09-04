@@ -1,0 +1,324 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Json;
+using System.Security.Cryptography;
+using System.Web;
+using ZanWeb.Model.Mall;
+
+namespace ZanWeb;
+
+/* 商城业务流程层：目录/详情 JSON 组装、原子购买、兑换、许可证与评价。
+ * 不拼 SQL——参数化语句都在 DAO；本层负责事务边界与领域规则。
+ * 全部走控制器的请求连接（事务内所有语句同一连接）。 */
+class MallFlow {
+    IDbConnection db;
+
+    MallFlow(IDbConnection db) {
+        this.db = db;
+    }
+
+    /* ---- 目录 ---- */
+
+    async JsonValue Catalog() {
+        CatalogDao dao = new CatalogDao(this.db);
+        List<Category> cats = await dao.Categories();
+        List<Product> rows = await dao.ApprovedProducts();
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            Product p = rows[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Put("id", JsonValue.NewNum(Convert.ToString(p.id)));
+            o.Put("slug", JsonValue.NewStr(p.slug));
+            o.Put("name", JsonValue.NewStr(p.name));
+            o.Put("description", JsonValue.NewStr(p.description));
+            o.Put("product_type", JsonValue.NewStr(p.productType));
+            o.Put("category", JsonValue.NewStr(MallFlow.CategoryName(cats, p.categoryId)));
+            o.Put("min_price_points", JsonValue.NewNum(
+                Convert.ToString(await MallFlow.MinPrice(this.db, p.id))));
+            arr.Append(o);
+        }
+        return arr;
+    }
+
+    static string CategoryName(List<Category> cats, int id) {
+        for (int i = 0; i < cats.Count; i = i + 1) {
+            if (cats[i].id == id) { return cats[i].slug; }
+        }
+        return "";
+    }
+
+    static async long MinPrice(IDbConnection db, int productId) {
+        List<PricingPlan> plans = await new CatalogDao(db).PlansOf(productId);
+        long min = 0;
+        bool any = false;
+        for (int i = 0; i < plans.Count; i = i + 1) {
+            if (!any || plans[i].pricePoints < min) {
+                min = plans[i].pricePoints;
+                any = true;
+            }
+        }
+        return min;
+    }
+
+    /* ---- 商品详情 ---- */
+
+    async JsonValue ProductDetail(int productId) {
+        CatalogDao dao = new CatalogDao(this.db);
+        Product p = await dao.ProductById(productId);
+        if (p == null || p.status != "approved") { return null; }
+        return await MallFlow.ProductJson(this.db, p, dao);
+    }
+
+    static async JsonValue ProductJson(IDbConnection db, Product p, CatalogDao dao) {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("id", JsonValue.NewNum(Convert.ToString(p.id)));
+        o.Put("slug", JsonValue.NewStr(p.slug));
+        o.Put("name", JsonValue.NewStr(p.name));
+        o.Put("description", JsonValue.NewStr(p.description));
+        o.Put("product_type", JsonValue.NewStr(p.productType));
+        JsonValue plans = JsonValue.NewArray();
+        List<PricingPlan> ps = await dao.PlansOf(p.id);
+        for (int i = 0; i < ps.Count; i = i + 1) {
+            PricingPlan plan = ps[i];
+            JsonValue po = JsonValue.NewObject();
+            po.Put("id", JsonValue.NewNum(Convert.ToString(plan.id)));
+            po.Put("name", JsonValue.NewStr(plan.name));
+            po.Put("license_mode", JsonValue.NewStr(plan.licenseMode));
+            po.Put("price_points", JsonValue.NewNum(Convert.ToString(plan.pricePoints)));
+            po.Put("duration_days", JsonValue.NewNum(Convert.ToString(plan.durationDays)));
+            plans.Append(po);
+        }
+        o.Put("plans", plans);
+        JsonValue versions = JsonValue.NewArray();
+        List<ProductVersion> vs = await dao.ApprovedVersions(p.id);
+        for (int i = 0; i < vs.Count; i = i + 1) {
+            ProductVersion v = vs[i];
+            JsonValue vo = JsonValue.NewObject();
+            vo.Put("id", JsonValue.NewNum(Convert.ToString(v.id)));
+            vo.Put("version", JsonValue.NewStr(v.version));
+            vo.Put("major_version", JsonValue.NewNum(Convert.ToString(v.majorVersion)));
+            vo.Put("artifact_url", JsonValue.NewStr(v.artifactUrl));
+            vo.Put("artifact_sha256", JsonValue.NewStr(v.artifactSha256));
+            vo.Put("release_notes", JsonValue.NewStr(v.releaseNotes));
+            versions.Append(vo);
+        }
+        o.Put("versions", versions);
+        return o;
+    }
+
+    /* ---- 卡密兑换：事务内按摘要抢行（redeemed_by IS NULL 语义用乐观更新表达）---- */
+
+    async bool Redeem(int uid, string code) {
+        string digest = Digests.Sha256Hex(code);
+        List<RechargeCode> hits = await this.db.Select<RechargeCode>()
+            .Where(a => a.codeDigest == digest).ToListAsync();
+        if (hits.Count != 1) { return false; }
+        RechargeCode row = hits[0];
+        if (row.redeemedBy != 0) { return false; }
+        /* 乐观更新防双花：只有仍是未兑换状态的行才能被标记。 */
+        int claimed = await this.db.Update<RechargeCode>()
+            .Set(a => a.redeemedBy, uid)
+            .Set(a => a.redeemedAt, WebApp.NowSeconds())
+            .Where(a => a.id == row.id && a.redeemedBy == 0)
+            .ExecuteAffrowsAsync();
+        if (claimed != 1) { return false; }
+        MallUserDao users = new MallUserDao(this.db);
+        int moved = await users.AdjustPoints(uid, row.points);
+        if (moved != 1) { return false; }
+        await new PointLedgerDao(this.db).Insert(uid, row.points, "recharge",
+            Convert.ToString(row.id));
+        return true;
+    }
+
+    /* ---- 购买：扣款 + 订单 + 授权 + 流水 + 佣金，任一步失败整体回滚 ---- */
+
+    async string Buy(int uid, int planId) {
+        CatalogDao dao = new CatalogDao(this.db);
+        PricingPlan plan = await dao.PlanById(planId);
+        if (plan == null || plan.enabled != 1) { return ""; }
+        Product p = await dao.ProductById(plan.productId);
+        if (p == null || p.status != "approved") { return ""; }
+        MallUserDao users = new MallUserDao(this.db);
+        User buyer = await users.ById(uid);
+        if (buyer == null || buyer.status != "active") { return ""; }
+        /* once 模式：同产品同主版本不重复卖。先在链外取当前主版本，
+           再进 Where（async 调用不能落在 lambda 里）。 */
+        int currentMajor = await MallFlow.CurrentMajor(this.db, p.id);
+        if (plan.licenseMode == "once") {
+            List<Entitlement> dup = await this.db.Select<Entitlement>()
+                .Where(a => a.userId == uid && a.productId == p.id
+                    && a.licenseMode == "once"
+                    && a.majorVersion == currentMajor)
+                .ToListAsync();
+            if (dup.Count > 0) { return ""; }
+        }
+        int paid = await users.AdjustPoints(uid, 0 - plan.pricePoints);
+        if (paid != 1) { return ""; }
+        string orderNo = "PM" + Convert.ToString(WebApp.NowSeconds())
+            + "-" + MallFlow.RandDigits(6);
+        Order order = new Order();
+        order.orderNo = orderNo;
+        order.userId = uid;
+        order.productId = p.id;
+        order.planId = plan.id;
+        order.amountPoints = plan.pricePoints;
+        long commission = plan.pricePoints * plan.commissionPercent / 100;
+        order.commissionPoints = commission;
+        order.status = "paid";
+        order.createdAt = WebApp.NowSeconds();
+        int _order = await this.db.Insert<Order>(order).ExecuteIdentityAsync();
+        Entitlement ent = new Entitlement();
+        ent.userId = uid;
+        ent.productId = p.id;
+        ent.planId = plan.id;
+        ent.licenseMode = plan.licenseMode;
+        ent.majorVersion = plan.licenseMode == "once" ? currentMajor : 0;
+        ent.expiresAt = plan.licenseMode == "periodic"
+            ? WebApp.NowSeconds() + plan.durationDays * 86400 : 0;
+        ent.disabled = 0;
+        ent.createdAt = WebApp.NowSeconds();
+        int _ent = await this.db.Insert<Entitlement>(ent).ExecuteIdentityAsync();
+        await new PointLedgerDao(this.db).Insert(uid, 0 - plan.pricePoints,
+            "purchase", orderNo);
+        if (commission > 0) {
+            DeveloperLedger dev = new DeveloperLedger();
+            dev.developerId = p.developerId;
+            dev.delta = commission;
+            dev.reason = "commission";
+            dev.referenceId = orderNo;
+            dev.createdAt = WebApp.NowSeconds();
+            int _dev = await this.db.Insert<DeveloperLedger>(dev).ExecuteIdentityAsync();
+        }
+        return orderNo;
+    }
+
+    static async int CurrentMajor(IDbConnection db, int productId) {
+        List<ProductVersion> vs = await new CatalogDao(db).ApprovedVersions(productId);
+        if (vs.Count == 0) { return 0; }
+        return vs[0].majorVersion;
+    }
+
+    /* ---- 我的授权 ---- */
+
+    async JsonValue Entitlements(int uid) {
+        List<Entitlement> rows = await this.db.Select<Entitlement>()
+            .Where(a => a.userId == uid).OrderByDescending(a => a.id).ToListAsync();
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            Entitlement e = rows[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Put("id", JsonValue.NewNum(Convert.ToString(e.id)));
+            o.Put("product_id", JsonValue.NewNum(Convert.ToString(e.productId)));
+            o.Put("license_mode", JsonValue.NewStr(e.licenseMode));
+            o.Put("major_version", JsonValue.NewNum(Convert.ToString(e.majorVersion)));
+            o.Put("expires_at", JsonValue.NewNum(Convert.ToString(e.expiresAt)));
+            o.Put("disabled", JsonValue.NewBool(e.disabled == 1));
+            arr.Append(o);
+        }
+        return arr;
+    }
+
+    /* ---- 下载：once 校验主版本，periodic 校验未过期 ---- */
+
+    async string DownloadUrl(int uid, int versionId) {
+        CatalogDao dao = new CatalogDao(this.db);
+        ProductVersion v = await dao.VersionById(versionId);
+        if (v == null || v.status != "approved") { return ""; }
+        Product p = await dao.ProductById(v.productId);
+        if (p == null || p.status != "approved") { return ""; }
+        List<Entitlement> mine = await this.db.Select<Entitlement>()
+            .Where(a => a.userId == uid && a.productId == p.id
+                && a.disabled == 0).ToListAsync();
+        long now = WebApp.NowSeconds();
+        for (int i = 0; i < mine.Count; i = i + 1) {
+            Entitlement e = mine[i];
+            if (e.licenseMode == "once" && e.majorVersion == v.majorVersion) {
+                return v.artifactUrl;
+            }
+            if (e.licenseMode == "periodic"
+                && (e.expiresAt == 0 || e.expiresAt > now)) {
+                return v.artifactUrl;
+            }
+        }
+        return "";
+    }
+
+    /* ---- 许可证 ---- */
+
+    async string IssueLicense(int uid, int entitlementId, string mode,
+                              string deviceId) {
+        if (mode != "online" && mode != "device_offline"
+            && mode != "account_offline") { return ""; }
+        if (mode == "device_offline" && deviceId.Length == 0) { return ""; }
+        Entitlement e = await this.db.Select<Entitlement>()
+            .Where(a => a.id == entitlementId && a.userId == uid
+                && a.disabled == 0).FirstAsync();
+        if (e == null) { return ""; }
+        long now = WebApp.NowSeconds();
+        long expires = e.expiresAt > 0 ? e.expiresAt : now + 86400 * 365;
+        if (e.licenseMode == "once" && e.expiresAt == 0) { expires = 0; }
+        string token = "LT-" + MallFlow.RandDigits(16);
+        License lic = new License();
+        lic.entitlementId = e.id;
+        lic.tokenDigest = Digests.Sha256Hex(token);
+        lic.mode = mode;
+        lic.deviceId = deviceId;
+        lic.expiresAt = expires;
+        lic.revoked = 0;
+        lic.createdAt = now;
+        int _lic = await this.db.Insert<License>(lic).ExecuteIdentityAsync();
+        return token;
+    }
+
+    async bool CheckLicense(string token, string deviceId) {
+        if (token.Length == 0) { return false; }
+        License lic = await this.db.Select<License>()
+            .Where(a => a.tokenDigest == Digests.Sha256Hex(token)).FirstAsync();
+        if (lic == null || lic.revoked != 0) { return false; }
+        long now = WebApp.NowSeconds();
+        if (lic.expiresAt != 0 && lic.expiresAt <= now) { return false; }
+        if (deviceId.Length > 0 && lic.deviceId.Length > 0
+            && lic.deviceId != deviceId) { return false; }
+        return true;
+    }
+
+    /* ---- 评价 ---- */
+
+    async bool Review(int uid, int productId, int rating, string content) {
+        if (rating < 1 || rating > 5) { return false; }
+        if (content.Length > 2000) { return false; }
+        Product p = await new CatalogDao(this.db).ProductById(productId);
+        if (p == null || p.status != "approved") { return false; }
+        List<Order> bought = await this.db.Select<Order>()
+            .Where(a => a.userId == uid && a.productId == productId
+                && a.status == "paid").ToListAsync();
+        if (bought.Count == 0) { return false; }
+        Review dup = await this.db.Select<Review>()
+            .Where(a => a.userId == uid && a.productId == productId).FirstAsync();
+        if (dup != null) { return false; }
+        Review row = new Review();
+        row.userId = uid;
+        row.productId = productId;
+        row.rating = rating;
+        row.content = content;
+        row.createdAt = WebApp.NowSeconds();
+        int _rev = await this.db.Insert<Review>(row).ExecuteIdentityAsync();
+        return true;
+    }
+
+    /* ---- 工具 ---- */
+
+    /* 随机数字串：Guid v4 来自 CSPRNG，取其数字字符拼定长串。 */
+    static string RandDigits(int count) {
+        string outp = "";
+        while (outp.Length < count) {
+            string g = Guid.New();
+            for (int i = 0; i < g.Length && outp.Length < count; i = i + 1) {
+                char c = g[i];
+                if (c >= 48 && c <= 57) { outp = outp + c; }
+            }
+        }
+        return outp;
+    }
+}

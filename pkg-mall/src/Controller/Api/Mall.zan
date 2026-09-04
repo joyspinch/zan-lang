@@ -1,0 +1,114 @@
+using System;
+using ZanWeb;
+using System.Web;
+using System.Json;
+using ZanWeb.Model.Mall;
+
+namespace ZanWeb.Api;
+
+/* 商城交易端点：目录 / 详情 / 兑换 / 购买 / 授权 / 下载 / 许可证 / 评价。
+ * 目录与详情公开（IDE 未登录也要能浏览）；交易动作需登录。 */
+[Route("api/[controller]/[action]")]
+[Custom(Authorization = CustomAuthorization.None)]
+[Description("商城")]
+class Mall : ApiController {
+    [HttpGet]
+    async void Catalog() {
+        if (!this.DbReady()) { this.Fail(503, "2001", "database unavailable"); }
+        this.Ok((await new MallFlow(this.Held()).Catalog()).ToJson());
+    }
+
+    [HttpGet]
+    async void Product() {
+        if (!this.DbReady()) { this.Fail(503, "2001", "database unavailable"); }
+        JsonValue data = await new MallFlow(this.Held())
+            .ProductDetail(this.InInt("id", 0));
+        if (data == null) { this.Fail(404, "2004", "product not found"); }
+        this.Ok(data.ToJson());
+    }
+
+    [HttpPost]
+    [Custom(Authorization = CustomAuthorization.Login)]
+    [Tx]
+    async void Redeem() {
+        if (!this.DbReady()) { this.Fail(503, "2001", "database unavailable"); }
+        string code = this.Need("code", "code");
+        bool ok = await new MallFlow(this.Held())
+            .Redeem(Filter.ToInt(this.uid, 0), code);
+        if (!ok) { this.Fail(422, "2002", "invalid or used code"); }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("redeemed", JsonValue.NewBool(true));
+        this.Ok(o.ToJson());
+    }
+
+    [HttpPost]
+    [Custom(Authorization = CustomAuthorization.Login)]
+    [Tx]
+    async void Buy() {
+        if (!this.DbReady()) { this.Fail(503, "2001", "database unavailable"); }
+        string no = await new MallFlow(this.Held())
+            .Buy(Filter.ToInt(this.uid, 0), this.InInt("plan_id", 0));
+        if (no.Length == 0) { this.Fail(422, "2003", "purchase rejected"); }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("order_no", JsonValue.NewStr(no));
+        this.Ok(o.ToJson());
+    }
+
+    [HttpGet]
+    [Custom(Authorization = CustomAuthorization.Login)]
+    async void Entitlements() {
+        if (!this.DbReady()) { this.Fail(503, "2001", "database unavailable"); }
+        this.Ok((await new MallFlow(this.Held())
+            .Entitlements(Filter.ToInt(this.uid, 0))).ToJson());
+    }
+
+    [HttpGet]
+    [Custom(Authorization = CustomAuthorization.Login)]
+    async void Download() {
+        if (!this.DbReady()) { this.Fail(503, "2001", "database unavailable"); }
+        string url = await new MallFlow(this.Held())
+            .DownloadUrl(Filter.ToInt(this.uid, 0), this.InInt("version_id", 0));
+        if (url.Length == 0) { this.Fail(403, "2005", "download not authorized"); }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("url", JsonValue.NewStr(url));
+        this.Ok(o.ToJson());
+    }
+
+    [HttpPost]
+    [Custom(Authorization = CustomAuthorization.Login)]
+    [Tx]
+    async void LicenseIssue() {
+        if (!this.DbReady()) { this.Fail(503, "2001", "database unavailable"); }
+        string token = await new MallFlow(this.Held()).IssueLicense(
+            Filter.ToInt(this.uid, 0), this.InInt("entitlement_id", 0),
+            this.In("mode"), this.In("device_id"));
+        if (token.Length == 0) { this.Fail(422, "2006", "license rejected"); }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("token", JsonValue.NewStr(token));
+        this.Ok(o.ToJson());
+    }
+
+    [HttpPost]
+    async void LicenseCheck() {
+        if (!this.DbReady()) { this.Fail(503, "2001", "database unavailable"); }
+        bool valid = await new MallFlow(this.Held())
+            .CheckLicense(this.In("token"), this.In("device_id"));
+        JsonValue o = JsonValue.NewObject();
+        o.Put("valid", JsonValue.NewBool(valid));
+        this.Ok(o.ToJson());
+    }
+
+    [HttpPost]
+    [Custom(Authorization = CustomAuthorization.Login)]
+    [Tx]
+    async void Review() {
+        if (!this.DbReady()) { this.Fail(503, "2001", "database unavailable"); }
+        bool ok = await new MallFlow(this.Held()).Review(
+            Filter.ToInt(this.uid, 0), this.InInt("product_id", 0),
+            this.InInt("rating", 0), this.InText("content"));
+        if (!ok) { this.Fail(422, "2007", "review rejected"); }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("created", JsonValue.NewBool(true));
+        this.Ok(o.ToJson());
+    }
+}

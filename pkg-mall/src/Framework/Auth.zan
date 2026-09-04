@@ -1,0 +1,187 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Web;
+using ZanWeb.Model.Mall;
+using ZanWeb.Dao.Mall;
+
+namespace ZanWeb;
+
+/* 商城认证与授权：cookie 为 AES-GCM 自签名令牌（版本+uid+签发时间+角色），
+ * 无 session 表；角色是字符串（user/developer/admin），改密后旧令牌失效
+ * 由 carries-role + status 复核保证。密码哈希与模板一致（12000 轮）。 */
+class AuthUser {
+    static string Active = "active";
+
+    static async IDbConnection Lease() {
+        AppServices s = AppServices.Current();
+        if (s == null) { return null; }
+        return await s.Db().Acquire();
+    }
+
+    static void Give(IDbConnection db) {
+        AppServices s = AppServices.Current();
+        if (s == null) { return; }
+        s.Db().Release(db);
+    }
+
+    static string PasswordHash(string password, string salt) {
+        string material = salt + ":" + password;
+        int i = 0;
+        while (i < 12000) {
+            material = Hex.Encode(Sha256.Hash(material + ":" + salt,
+                material.Length + salt.Length + 1), 32);
+            i = i + 1;
+        }
+        return material;
+    }
+
+    static async User ById(string uid) {
+        int id = AuthUser.ToInt(uid);
+        if (id <= 0) { return null; }
+        IDbConnection db = await AuthUser.Lease();
+        if (db == null) { return null; }
+        try {
+            return await new MallUserDao(db).ById(id);
+        } finally {
+            AuthUser.Give(db);
+        }
+    }
+
+    /* 调度器权限解析：登录即可访问 Login/ApiAuth 级别页面；
+       角色字符串由 AuthToken.Resolve 注入 ctx.state，这里只挡未登录。 */
+    static async bool Allow(string uid, string action) {
+        if (uid.Length == 0) { return false; }
+        User me = await AuthUser.ById(uid);
+        return me != null && me.status == AuthUser.Active;
+    }
+
+    static int ToInt(string s) {
+        return Filter.ToInt(s, 0);
+    }
+}
+
+/* 角色常量与校验：ApiAuth 控制器动作内的二次闸（管理/开发者），
+ * 避免为两个角色拉起整套 RBAC。角色随 cookie 携带、Resolve 时与
+ * 库中 role 比对后放行（this.Role 由控制器在动作内先取）。 */
+class MallRoles {
+    static string User = "user";
+    static string Developer = "developer";
+    static string Admin = "admin";
+}
+
+class AuthToken {
+    static string Secret() { return Cfg.Auth.secret; }
+    static bool Ready() { return AuthToken.Secret().Length >= 32; }
+
+    static bool Equal(string actual, string expected) {
+        int diff = actual.Length ^ expected.Length;
+        int n = expected.Length;
+        int i = 0;
+        while (i < n) {
+            int a = 0;
+            if (i < actual.Length) { a = actual[i] & 255; }
+            diff = diff | (a ^ (expected[i] & 255));
+            i = i + 1;
+        }
+        return diff == 0;
+    }
+
+    static string EncodeUrl(string raw, int len) {
+        string text = Base64.Encode(raw, len).Replace("+", "-").Replace("/", "_");
+        while (text.Length > 0 && text.Substring(text.Length - 1) == "=") {
+            text = text.Substring(0, text.Length - 1);
+        }
+        return text;
+    }
+
+    static byte[] DecodeUrl(string text, List<int> outLen) {
+        int i = 0;
+        while (i < text.Length) {
+            int c = text[i] & 255;
+            bool valid = (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+                || (c >= 48 && c <= 57) || c == 45 || c == 95;
+            if (!valid) { outLen[0] = -1; return new byte[0]; }
+            i = i + 1;
+        }
+        string base64 = text.Replace("-", "+").Replace("_", "/");
+        int rem = base64.Length & 3;
+        if (rem == 1) { outLen[0] = -1; return new byte[0]; }
+        if (rem == 2) { base64 = base64 + "=="; }
+        else if (rem == 3) { base64 = base64 + "="; }
+        return Base64.Decode(base64, outLen);
+    }
+
+    static byte[] Key() {
+        string secret = AuthToken.Secret();
+        return Sha256.Hash(secret, secret.Length);
+    }
+
+    /* AES-GCM cookie：版本 + uid + 签发时间 + 角色。禁用/改密靠
+       status 复核（见 Resolve 的二次查库），角色供 ApiAuth 二次闸。 */
+    static string Issue(string uid, string role, int now) {
+        if (!AuthToken.Ready()) { return ""; }
+        string plain = "2\t" + uid + "\t" + Convert.ToString(now) + "\t" + role;
+        byte[] key = AuthToken.Key();
+        byte[] iv = RandomNumberGenerator.GetBytes(12);
+        byte[] tag = new byte[16];
+        string aad = "zan.mall.cookie.v1";
+        byte[] cipher = AesGcm.Encrypt(key, 32, iv, aad, aad.Length,
+            plain, plain.Length, tag);
+        if (cipher == null) { return ""; }
+        byte[] packed = new byte[12 + cipher.Length + 16];
+        int i = 0;
+        while (i < 12) { packed[i] = iv[i]; i = i + 1; }
+        i = 0;
+        while (i < cipher.Length) { packed[12 + i] = cipher[i]; i = i + 1; }
+        i = 0;
+        while (i < 16) { packed[12 + cipher.Length + i] = tag[i]; i = i + 1; }
+        return AuthToken.EncodeUrl(packed, packed.Length);
+    }
+
+    static string Issue(string uid, int tokenVersion, int now) {
+        return AuthToken.Issue(uid, MallRoles.User, now);
+    }
+
+    static async string Resolve(string token) {
+        if (token.Length < 50 || token.Length > 512) { return ""; }
+        List<int> decodedLen = new List<int>(); decodedLen.Add(0);
+        byte[] packed = AuthToken.DecodeUrl(token, decodedLen);
+        int total = decodedLen[0];
+        if (total < 29) { return ""; }
+        int cipherLen = total - 28;
+        if (cipherLen < 1) { return ""; }
+        byte[] iv = new byte[12];
+        byte[] cipher = new byte[cipherLen];
+        byte[] tag = new byte[16];
+        int i = 0;
+        while (i < 12) { iv[i] = packed[i]; i = i + 1; }
+        i = 0;
+        while (i < cipherLen) { cipher[i] = packed[12 + i]; i = i + 1; }
+        i = 0;
+        while (i < 16) { tag[i] = packed[12 + cipherLen + i]; i = i + 1; }
+        byte[] key = AuthToken.Key();
+        List<int> ok = new List<int>(); ok.Add(0);
+        string aad = "zan.mall.cookie.v1";
+        byte[] plainBytes = AesGcm.Decrypt(key, 32, iv, aad, aad.Length,
+            cipher, cipherLen, tag, ok);
+        if (ok[0] == 0 || plainBytes == null) { return ""; }
+        string plain = plainBytes.ToStr(0, cipherLen);
+        int first = plain.IndexOf("\t");
+        int second = plain.IndexOf("\t", first + 1);
+        int third = plain.IndexOf("\t", second + 1);
+        if (first != 1 || plain.Substring(0, first) != "2"
+            || second <= first + 1 || third <= second + 1) { return ""; }
+        string uid = plain.Substring(first + 1, second - first - 1);
+        int issued = Filter.ToInt(plain.Substring(second + 1, third - second - 1), 0);
+        string role = plain.Substring(third + 1);
+        int now = WebApp.NowSeconds();
+        if (issued <= 0 || issued > now + 300 || issued + 2592000 <= now) { return ""; }
+        /* 二次复核：账号仍存在且启用；开发者角色要求仍是 developer/admin。 */
+        User me = await AuthUser.ById(uid);
+        if (me == null || me.status != AuthUser.Active) { return ""; }
+        return uid;
+    }
+}

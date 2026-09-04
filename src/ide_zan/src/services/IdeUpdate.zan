@@ -1,0 +1,231 @@
+using System;
+using System.Json;
+using System.Net.Http.Client;
+using System.Net.External;
+using System.Net.Sockets;
+
+/// <summary>IDE 的版本更新检查：启动后在后台线程向商城的版本频道
+/// （默认 https://ide.zanlang.top，可用 ZAN_MALL_URL 覆盖）查询
+/// ide / stdlib / compiler 三条线，结果缓存给 About 面板与状态条。
+///
+/// 与 MarketplaceClient 一样的形态：静态状态 + 后台线程 + SseSink
+/// 回传，UI 每帧 Poll；网络策略只放行 HTTPS（loopback 例外）。 </summary>
+class IdeUpdate {
+    static SseSink sink;
+    static SseSink workerSink;
+    static int pending;
+    /// channel=1 ide, 2 stdlib, 3 compiler
+    static int channel;
+    static string host;
+    static int port;
+    static bool tls;
+    static string path;
+    static IdeUpdateInfo ideInfo;
+    static IdeUpdateInfo stdlibInfo;
+    static IdeUpdateInfo compilerInfo;
+    /// 启动时刻一次，不轮询——检查是低频动作。
+    static bool started;
+
+    static string BaseUrl() {
+        string u = ProcessHost.Env("ZAN_MALL_URL");
+        if (u == "") { return "https://ide.zanlang.top"; }
+        while (u.Length > 0 && u.Substring(u.Length - 1, 1) == "/") {
+            u = u.Substring(0, u.Length - 1);
+        }
+        return u;
+    }
+
+    static int FindByte(string s, int b, int from) {
+        for (int i = from; i < s.Length; i = i + 1) {
+            if ((s[i] & 255) == b) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    static int ParseInt(string s, int fallback) {
+        int v = 0;
+        bool any = false;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (c < 48 || c > 57) { return fallback; }
+            v = v * 10 + c - 48;
+            any = true;
+        }
+        if (!any) { return fallback; }
+        return v;
+    }
+
+    static void SetUrl(string url) {
+        string u = url;
+        IdeUpdate.tls = true;
+        int defaultPort = 443;
+        if (u.Length >= 8 && u.Substring(0, 8) == "https://") {
+            u = u.Substring(8, u.Length - 8);
+        } else if (u.Length >= 7 && u.Substring(0, 7) == "http://") {
+            IdeUpdate.tls = false;
+            defaultPort = 80;
+            u = u.Substring(7, u.Length - 7);
+        }
+        int slash = FindByte(u, 47, 0);
+        string hostPort = u;
+        IdeUpdate.path = "/";
+        if (slash >= 0) {
+            hostPort = u.Substring(0, slash);
+            IdeUpdate.path = u.Substring(slash, u.Length - slash);
+        }
+        IdeUpdate.host = hostPort;
+        IdeUpdate.port = defaultPort;
+        int colon = FindByte(hostPort, 58, 0);
+        if (colon >= 0) {
+            IdeUpdate.host = hostPort.Substring(0, colon);
+            IdeUpdate.port = ParseInt(hostPort.Substring(colon + 1,
+                hostPort.Length - colon - 1), defaultPort);
+        }
+    }
+
+    /// <summary>与 MarketplaceClient.CallPolicy 同款预算：15s 总超时，
+    /// 不跟随重定向，HTTPS-only（loopback 明文例外）。</summary>
+    static ExternalCallPolicy CallPolicy() {
+        ExternalCallPolicy policy = ExternalCallPolicy.Default()
+            .TotalTimeout(15000)
+            .ResponseLimit(1024 * 1024)
+            .Redirects(0)
+            .RetryNetwork(false)
+            .RetryAttempts(0);
+        bool loopback = ExternalTargetPolicy.IsLoopback(IdeUpdate.host);
+        if (loopback) {
+            if (!IdeUpdate.tls) { policy.AllowLocalHttp(); }
+            else { policy.AllowLoopback(); }
+        }
+        return policy;
+    }
+
+    static void Worker() {
+        Socket.Initialize();
+        string result = "";
+        try {
+            HttpClient cli;
+            if (IdeUpdate.tls) {
+                cli = HttpClient.CreateHttps(IdeUpdate.host, IdeUpdate.port);
+            } else {
+                cli = new HttpClient(IdeUpdate.host, IdeUpdate.port);
+            }
+            cli.SetCallPolicy(IdeUpdate.CallPolicy());
+            cli.SetTimeout(15000);
+            result = await cli.GetAsync(IdeUpdate.path);
+        } catch (Exception ex) {
+            IdeUpdate.workerSink.Publish("err:" + ex.Message);
+            return;
+        }
+        IdeUpdate.workerSink.Publish("ok:" + result);
+    }
+
+    /// <summary>启动时对三条发布线各发一次检查；已在跑则忽略。
+    /// client_id 用机器名+版本即可（灰度只要求稳定，不要求匿名性）。</summary>
+    static void CheckOnStartup() {
+        if (IdeUpdate.started) { return; }
+        IdeUpdate.started = true;
+        IdeUpdate.Check(1);
+    }
+
+    static string ChannelName(int ch) {
+        if (ch == 2) { return "stdlib"; }
+        if (ch == 3) { return "compiler"; }
+        return "ide";
+    }
+
+    static void Check(int ch) {
+        if (IdeUpdate.sink != null && IdeUpdate.sink.Done() == "") {
+            return; // 一次只飞一个请求；结果到了再排下一条线
+        }
+        IdeUpdate.channel = ch;
+        IdeUpdate.pending = ch;
+        string current = IdeUpdate.CurrentVersion(ch);
+        string clientId = "ide-" + ProcessHost.Env("COMPUTERNAME")
+            + "-" + IdeVersion.Number();
+        string url = IdeUpdate.BaseUrl() + "/api/channel/check?channel="
+            + IdeUpdate.ChannelName(ch) + "&platform=" + IdeUpdate.Platform()
+            + "&current=" + current + "&client_id=" + clientId;
+        IdeUpdate.SetUrl(url);
+        SseSink s = SseSink.ToMemory();
+        IdeUpdate.sink = s;
+        IdeUpdate.workerSink = s;
+        if (!Thread.Start(IdeUpdate.Worker)) {
+            IdeUpdate.sink = null;
+            IdeUpdate.pending = 0;
+        }
+    }
+
+    static string Platform() {
+        #if WINDOWS
+        return "win-x64";
+        #else
+        return "linux-x64";
+        #endif
+    }
+
+    static string CurrentVersion(int ch) {
+        if (ch == 2) { return ZanVersion.Text(); }
+        return IdeVersion.Number();
+    }
+
+    /// UI 每帧调用：请求完成时解析并排下一条线。
+    static void Poll() {
+        if (IdeUpdate.pending == 0) { return; }
+        if (IdeUpdate.sink == null) { IdeUpdate.pending = 0; return; }
+        string done = IdeUpdate.sink.Done();
+        if (done == "") { return; }
+        SseSink finished = IdeUpdate.sink;
+        int ch = IdeUpdate.pending;
+        IdeUpdate.pending = 0;
+        IdeUpdate.sink = null;
+        IdeUpdate.Store(ch, finished, done);
+        if (ch < 3) {
+            IdeUpdate.Check(ch + 1);
+        }
+    }
+
+    static void Store(int ch, SseSink finished, string done) {
+        IdeUpdateInfo info;
+        if (done.Length > 4 && done.Substring(0, 4) == "err:") {
+            info = IdeUpdateInfo.Fail(IdeUpdate.ChannelName(ch),
+                done.Substring(4, done.Length - 4));
+        } else if (done.Length > 3 && done.Substring(0, 3) == "ok:") {
+            info = IdeUpdateInfo.FromJson(IdeUpdate.ChannelName(ch),
+                IdeUpdate.CurrentVersion(ch), done.Substring(3, done.Length - 3));
+        } else {
+            info = IdeUpdateInfo.Fail(IdeUpdate.ChannelName(ch),
+                "invalid update response");
+        }
+        if (ch == 2) { IdeUpdate.stdlibInfo = info; }
+        else if (ch == 3) { IdeUpdate.compilerInfo = info; }
+        else { IdeUpdate.ideInfo = info; }
+    }
+
+    /// 有任一条线提示可更新（非强制）。
+    static bool AnyAvailable() {
+        return IdeUpdate.Has(IdeUpdate.ideInfo) || IdeUpdate.Has(IdeUpdate.stdlibInfo)
+            || IdeUpdate.Has(IdeUpdate.compilerInfo);
+    }
+
+    static bool Has(IdeUpdateInfo info) {
+        return info != null && info.Ok() && info.UpdateAvailable();
+    }
+
+    /// 有任一条线低于安全线（强制升级）。
+    static bool AnyRequired() {
+        return (IdeUpdate.ideInfo != null && IdeUpdate.ideInfo.Ok()
+                && IdeUpdate.ideInfo.UpdateRequired())
+            || (IdeUpdate.stdlibInfo != null && IdeUpdate.stdlibInfo.Ok()
+                && IdeUpdate.stdlibInfo.UpdateRequired())
+            || (IdeUpdate.compilerInfo != null && IdeUpdate.compilerInfo.Ok()
+                && IdeUpdate.compilerInfo.UpdateRequired());
+    }
+
+    /// 状态条/关于面板的一行摘要；全部正常时返回 ""。
+    static string Summary() {
+        if (IdeUpdate.AnyRequired()) { return "[!] update required"; }
+        if (IdeUpdate.AnyAvailable()) { return "[update available]"; }
+        return "";
+    }
+}

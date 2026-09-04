@@ -10,7 +10,7 @@ Zan 语言生态的**扩展与程序商城**（package mall）：为 Zan 语言�
 
 - **扩展（extension / 库）——面向程序员**：
   - 主要展示渠道是 **IDE 内商城**：程序员在 IDE 中浏览、安装扩展，编译器缺库时自动定位并重试。
-  - 按 `stdlib/` 布局打包（官方示例 `System.Scripting.Python`），走编译器安全安装接口。
+  - 按 `stdlib/` 布局打包（官方示例 `System.Scripting.Lua`），走编译器安全安装接口。
 - **程序（app / 成品）——面向 C 端用户**：
   - 交付物为**可执行文件 + 许可证**，不安装进项目 stdlib。
   - 购买后签发许可证，第三方程序通过授权 SDK 校验（online/device_offline/account_offline）。
@@ -22,9 +22,7 @@ Zan 语言生态的**扩展与程序商城**（package mall）：为 Zan 语言�
 - IDE 内置商城：**以扩展（面向程序员）为主**，浏览、安装确认、构建缺库自动定位并重试；程序（成品）在 IDE 中可浏览展示、购买与下载引导；
 - 包下载经过 SHA-256 摘要 + RSA-SHA256 签名双重校验，安装走编译器安全接口。
 
-> 注意：`System.Scripting.Python` 仅是"扩展"类商品的官方免费示例种子，商城本身面向所有 Zan 扩展与程序，不是 Python 商城。
-
-> 注意：`System.Scripting.Python` 仅是"扩展"类商品的官方免费示例种子，商城本身面向所有 Zan 扩展与程序，不是 Python 商城。
+> 注意：`System.Scripting.Lua` 仅是"扩展"类商品的官方免费示例种子，商城本身面向所有 Zan 扩展与程序。
 
 ## 2. 技术栈与架构约束
 
@@ -87,7 +85,7 @@ Zan 语言生态的**扩展与程序商城**（package mall）：为 Zan 语言�
 `recharge_codes` / `reviews` / `withdrawals` / `licenses`（+ `_migrations`）。
 
 种子数据：3 个分类（system/scripting/developer-tools）；官方免费包
-`System.Scripting.Python 1.0.0`（once、0 积分、approved）。
+`System.Scripting.Lua 1.0.0`（once、0 积分、approved）。
 
 ### 3.5 编译器缺库诊断与安全安装（Task 7）`[完成]`
 
@@ -128,7 +126,7 @@ Zan 语言生态的**扩展与程序商城**（package mall）：为 Zan 语言�
 商城商品分两类，**流程完全分开、受众不同**：
 
 **A. 扩展（extension / 库）——面向程序员，IDE 中展示安装**
-- 按 `stdlib/` 布局打包（`System.Scripting.Python` 为官方免费示例，seed 已就绪：1.0.0、免费 once、approved）。
+- 按 `stdlib/` 布局打包（`System.Scripting.Lua` 为官方免费示例，seed 已就绪：1.0.0、免费 once、approved）。
 - 交付方式：IDE 安全安装进项目（走编译器安全安装接口），构建缺库时自动定位并重试。
 - 价格方案默认免费（price_points=0）也可付费。
 
@@ -140,9 +138,10 @@ Zan 语言生态的**扩展与程序商城**（package mall）：为 Zan 语言�
 
 **模型要求**：`products` 增加类型字段（`product_type`：`extension` / `app`），发布、目录、详情、价格方案、下载、许可证校验按类型区分；目录/详情返回类型供 IDE 区分"安装"（扩展）与"下载运行"（程序）。
 
-### 3.9 Python 自然调用示例及端到端测试（Task 13）`[未开始]`
+### 3.9 官方扩展示例及端到端测试（Task 13）`[未开始]`
 
-- `examples/python/`：Python 自然调用示例（README + python_embed.zan）——作为 Zan 扩展能力的演示。
+- 官方免费扩展示例为 `System.Scripting.Lua`（Python 示例随
+  System.Scripting.Python 模块退役移除，见 TASKS.md A87/A88）。
 - 商城端到端测试：注册→登录→/me→目录→购买→授权→许可证→下载→评价；覆盖**扩展类**与**程序类**商品各一例。
 
 ## 4. 验收标准
