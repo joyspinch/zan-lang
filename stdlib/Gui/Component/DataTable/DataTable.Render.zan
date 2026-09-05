@@ -1436,6 +1436,9 @@ partial class DataTable {
             rgC0 = DataTable.MinI(st.rangeC0, st.rangeC1);
             rgC1 = DataTable.MaxI(st.rangeC0, st.rangeC1);
         }
+        // Ctrl 追加出的归档区域同样高亮：单元格着色阶段逐区域
+        // 命中测试（区域数小，直接顺序比较即可）。
+        int multiN = DataTable.MultiCount(st);
 
         // 当前编辑单元格的屏幕矩形（循环中捕获，
         // 以便行绘制完成后在其上绘制行内编辑器）
@@ -1654,7 +1657,15 @@ partial class DataTable {
                     // 高亮之下，选中的单元格仍能看出是选中状态。
                     int cellBg = DataTable.CellBackground(st, src, rowIdx, cc);
                     if (cellBg != 0) { c.FillRect(ccl, ry, cw, rowH, cellBg); }
-                    if (rowInRange && cc >= rgC0 && cc <= rgC1) {
+                    bool cellInRange = rowInRange && cc >= rgC0 && cc <= rgC1;
+                    for (int mi = 0; mi < multiN && !cellInRange; mi = mi + 1) {
+                        int mr0 = -1; int mc0 = -1; int mr1 = -1; int mc1 = -1;
+                        if (DataTable.MultiAt(st, mi, out mr0, out mc0, out mr1, out mc1)
+                            && oiRow >= mr0 && oiRow <= mr1 && cc >= mc0 && cc <= mc1) {
+                            cellInRange = true;
+                        }
+                    }
+                    if (cellInRange) {
                         c.FillRect(ccl, ry, cw, rowH, sRowSel.BgOr(0));
                     }
                     if (st.editing && rowIdx == st.editRow && cc == st.editCol) {
@@ -2121,6 +2132,7 @@ partial class DataTable {
 
         // 左键按下
         if (ek == 2 && eb == 0 && ptrOi >= 0) {
+            bool ctrlDrag = (emods & 1) != 0;          // Ctrl：追加选区区域
             if (DataTable.DispKind(st, ptrOi) == 1) {
                 // 分组标题按下：切换该组折叠状态
                 int gi = DataTable.DispRowOf(st, ptrOi);
@@ -2145,10 +2157,22 @@ partial class DataTable {
                 // 用于显示错误信息。
                 if (st.editing) {
                     app.RequestRedraw();
-                } else if (sameCell && cols[ptrCol].editable && !cols[ptrCol].isBool) {
+                } else if (sameCell && cols[ptrCol].editable && !cols[ptrCol].isBool
+                           && !ctrlDrag) {
                     DataTable.BeginEdit(st, cols, src, DataTable.DispRowOf(st, ptrOi), ptrCol);
                     app.RequestRedraw();
                 } else {
+                    // Ctrl 按下（Excel 式追加区域）：固化当前范围、
+                    // 在其上开新区域；普通按下丢弃全部归档，回到
+                    // 单矩形选择。Ctrl+单格点击同样追加一个
+                    // 单格区域——与 Excel "Ctrl+点击加选"一致。
+                    // Ctrl 按下不复用 sameCell 快捷路径：重复
+                    // Ctrl+点击同一格是"再次追加该格"，不是打开编辑。
+                    if (ctrlDrag) {
+                        if (DataTable.HasRange(st)) { DataTable.ArchiveRange(st); }
+                    } else if (DataTable.HasMulti(st)) {
+                        DataTable.ClearMulti(st);
+                    }
                     st.rangeR0 = ptrOi;
                     st.rangeR1 = ptrOi;
                     st.rangeC0 = ptrCol;
@@ -2381,34 +2405,46 @@ partial class DataTable {
                 chipX = cwx + app.Scale(6);
             }
 
-            if (DataTable.HasRange(st)) {
-                int rC0 = DataTable.MinI(st.rangeC0, st.rangeC1);
-                int rC1 = DataTable.MaxI(st.rangeC0, st.rangeC1);
-                int rR0 = DataTable.MinI(st.rangeR0, st.rangeR1);
-                int rR1 = DataTable.MaxI(st.rangeR0, st.rangeR1);
+            if (DataTable.HasRange(st) || DataTable.HasMulti(st)) {
+                // 多区域（Ctrl 追加）时按全部区域并集汇总；单矩形时
+                // 即普通范围。跳过重叠（Excel 也不重复计重叠格）：
+                // 逐格先查是否已被更早的区域统计过。
+                int nRanges = DataTable.RangeCount(st);
                 int rsum = 0;
                 int rcount = 0;
-                int rri = rR0;
-                while (rri <= rR1 && rri < DataTable.DispCount(st)) {
-                    if (DataTable.DispKind(st, rri) == 0) {
-                        int drow = DataTable.DispRowOf(st, rri);
-                        int rci = rC0;
-                        while (rci <= rC1 && rci < cols.Count) {
-                            if (cols[rci].numeric) {
-                                // 计算列：选区统计按公式实数值累加。
-                                double frv = 0.0;
-                                if (cols[rci].formula.Length > 0
-                                    && DataTable.FormulaTryReal(cols, src, drow, rci, out frv)) {
-                                    rsum = rsum + (int)frv;
-                                } else {
-                                    rsum = rsum + src.CellNum(drow, rci);
+                for (int qi = 0; qi < nRanges; qi = qi + 1) {
+                    int qr0 = -1; int qc0 = -1; int qr1 = -1; int qc1 = -1;
+                    if (!DataTable.RangeAt(st, qi, out qr0, out qc0, out qr1, out qc1)) { continue; }
+                    int rri = qr0;
+                    while (rri <= qr1 && rri < DataTable.DispCount(st)) {
+                        if (DataTable.DispKind(st, rri) == 0) {
+                            int drow = DataTable.DispRowOf(st, rri);
+                            int rci = qc0;
+                            while (rci <= qc1 && rci < cols.Count) {
+                                bool dup = false;
+                                for (int qj = 0; qj < qi && !dup; qj = qj + 1) {
+                                    int jr0 = -1; int jc0 = -1; int jr1 = -1; int jc1 = -1;
+                                    if (DataTable.RangeAt(st, qj, out jr0, out jc0, out jr1, out jc1)
+                                        && rri >= jr0 && rri <= jr1 && rci >= jc0 && rci <= jc1) {
+                                        dup = true;
+                                    }
                                 }
-                                rcount = rcount + 1;
+                                if (!dup && cols[rci].numeric) {
+                                    // 计算列：选区统计按公式实数值累加。
+                                    double frv = 0.0;
+                                    if (cols[rci].formula.Length > 0
+                                        && DataTable.FormulaTryReal(cols, src, drow, rci, out frv)) {
+                                        rsum = rsum + (int)frv;
+                                    } else {
+                                        rsum = rsum + src.CellNum(drow, rci);
+                                    }
+                                    rcount = rcount + 1;
+                                }
+                                rci = rci + 1;
                             }
-                            rci = rci + 1;
                         }
+                        rri = rri + 1;
                     }
-                    rri = rri + 1;
                 }
                 if (rcount > 0) {
                     int ravg = rsum / rcount;
@@ -2502,8 +2538,10 @@ partial class DataTable {
             ownsBodyWheel = app.CaptureWheel(x, bodyTop, viewW, bodyH);
         }
         if (st.openMenu < 0 && !st.colChooserOpen && ownsBodyWheel
-            && maxScrollX > 0 && (app.window.EventMods() & 2) != 0) {
-            // Shift+滚轮水平平移列。
+            && maxScrollX > 0 && ((app.window.EventMods() & 4) != 0
+                                  || (app.window.EventMods() & 2) != 0)) {
+            // Alt+滚轮 / Shift+滚轮：水平平移列（Alt 为 Office 惯例，
+            // Shift 保留旧习惯）。
             int hDelta = app.window.EventKeyCode();
             int hStep = hDelta / 120;
             if (hStep == 0) { if (hDelta > 0) { hStep = 1; } else if (hDelta < 0) { hStep = 0 - 1; } }
@@ -2511,6 +2549,38 @@ partial class DataTable {
             if (nsx < 0) { nsx = 0; }
             if (nsx > maxScrollX) { nsx = maxScrollX; }
             if (nsx != st.scrollX) { st.scrollX = nsx; app.RequestRedraw(); }
+        } else if (st.openMenu < 0 && !st.colChooserOpen && ownsBodyWheel
+                   && (app.window.EventMods() & 1) != 0
+                   && !st.paged && DataTable.HasRange(st)) {
+            // Ctrl+滚轮纵向伸展当前选区（Excel 式加选的滚轮版）：
+            // 活动区域的远端边界随滚动方向逐行推进/收缩，锚点
+            // 边界不动。往上滚伸到还没选的行，往下滚收回末端。
+            // 已滚出视口的边界由 ScrollSlotIntoView 跟随。
+            int wDelta = app.window.EventKeyCode();
+            int wStep = wDelta / 120;
+            if (wStep == 0) { if (wDelta > 0) { wStep = 1; } else if (wDelta < 0) { wStep = 0 - 1; } }
+            // 滚轮向上（wStep>0）：远端行 -1 收缩，缩到锚点行为止；
+            // 向下（wStep<0）：远端行 +1 扩张。
+            // rangeR0 是拖拽/键盘的锚点，远端恒为 rangeR1，
+            // 不与 Min/Max 归一——向上拖出的选区（r0>r1）不响应
+            // 滚轮伸展，锚点在任何情况下都不移动。
+            int anchor = st.rangeR0;
+            int far = st.rangeR1;
+            if (far >= anchor && anchor >= 0) {
+                int nf = far - wStep;
+                // 远端不许越过锚点（区域翻转与拖拽行为不符），
+                // 也不越过最后一行。
+                if (nf < anchor) { nf = anchor; }
+                if (nf > DataTable.DispCount(st) - 1) { nf = DataTable.DispCount(st) - 1; }
+                if (nf != far) {
+                    st.rangeR1 = nf;
+                    st.rangeC1 = st.rangeC0;
+                    DataTable.SyncRangeChecks(st, src);
+                    DataTable.ScrollSlotIntoView(st, nf, visRows);
+                    st.SelectionChanged.Raise();
+                    app.RequestRedraw();
+                }
+            }
         } else if (st.openMenu < 0 && !st.colChooserOpen && ownsBodyWheel) {
             if (total > visRows) {
                 int delta = app.window.EventKeyCode();

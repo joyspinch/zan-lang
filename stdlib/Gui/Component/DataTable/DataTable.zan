@@ -55,11 +55,52 @@ partial class DataTable {
     /// 无范围则用勾选的行，
     /// 否则用整个（过滤/排序后的）视图。`csv` 决定分隔符和转义方式；
     /// `withHeader` 在前面加上列标题。
+    /// Ctrl 追加出的多区域选区按区域顺序逐块拼接（Excel 同款：
+    /// 每个区域独立成段，区域间不共享行）。
     static string BuildText(DataTableState st, List<DataColumn> cols, DataSource src, bool csv, bool withHeader) {
         string sep = "\t";
         if (csv) { sep = ","; }
         string nl = "\r\n";
         string outp = "";
+
+        // 多区域：逐区域追加文本段。
+        if (DataTable.RangeCount(st) > 1) {
+            int n = DataTable.RangeCount(st);
+            for (int mi = 0; mi < n; mi = mi + 1) {
+                int mr0 = -1; int mc0 = -1; int mr1 = -1; int mc1 = -1;
+                if (!DataTable.RangeAt(st, mi, out mr0, out mc0, out mr1, out mc1)) { continue; }
+                if (withHeader) {
+                    string hline = "";
+                    int hc = mc0;
+                    while (hc <= mc1) {
+                        string h = cols[hc].title;
+                        if (csv) { h = DataTable.CsvField(h); }
+                        if (hc > mc0) { hline = hline + sep; }
+                        hline = hline + h;
+                        hc = hc + 1;
+                    }
+                    outp = outp + hline + nl;
+                }
+                int mrr = mr0;
+                while (mrr <= mr1) {
+                    if (mrr >= 0 && mrr < st.order.Count) {
+                        int srcRow = st.order[mrr];
+                        string line = "";
+                        int cc = mc0;
+                        while (cc <= mc1) {
+                            string v = DataTable.CellTextRouted(cols, src, srcRow, cc);
+                            if (csv) { v = DataTable.CsvField(v); }
+                            if (cc > mc0) { line = line + sep; }
+                            line = line + v;
+                            cc = cc + 1;
+                        }
+                        outp = outp + line + nl;
+                    }
+                    mrr = mrr + 1;
+                }
+            }
+            return outp;
+        }
 
         int c0 = 0;
         int c1 = cols.Count - 1;
@@ -264,9 +305,10 @@ partial class DataTable {
         return v;
     }
 
-    /// 从当前单元格范围构建条形图：条 = 范围行，值 =
-    /// 范围内最右侧的数值列，标签 = 范围的第一
-    /// 列（若该列就是值列，则用行序号）。
+    /// 从当前单元格范围（或多区域并集）构建条形图：条 = 范围行，
+    /// 值 = 范围内最右侧的数值列，标签 = 范围的第一
+    /// 列（若该列就是值列，则用行序号）。多区域时逐区域
+    /// 追加条目（区域间以 "｜" 前缀区分第一列的类别标签）。
     /// 没有范围或范围内无数值列时返回 false。
     static bool BuildChartFromRange(DataTableState st, List<DataColumn> cols, DataSource src) {
         if (!DataTable.HasRange(st)) { return false; }
@@ -321,6 +363,80 @@ partial class DataTable {
         st.rangeC0 = -1;
         st.rangeR1 = -1;
         st.rangeC1 = -1;
+    }
+
+    // ---------- 多区域选区（Excel 式 Ctrl 追加） ----------
+
+    /// 归档的多区域数（不含当前 range）。
+    static int MultiCount(DataTableState st) {
+        return st.multiRanges.Count / 4;
+    }
+
+    /// 当前是否处于多区域选区（有归档区域，或 Ctrl 追加已发生）。
+    static bool HasMulti(DataTableState st) {
+        return st.multiActive || st.multiRanges.Count > 0;
+    }
+
+    /// 取归档区域 i（0 基）的边界：out 依次为 r0,c0,r1,c1
+    /// （已归一化为 lo/hi）。越界返回 false。
+    static bool MultiAt(DataTableState st, int i, out int r0, out int c0,
+                        out int r1, out int c1) {
+        r0 = -1; c0 = -1; r1 = -1; c1 = -1;
+        int b = i * 4;
+        if (i < 0 || b + 3 >= st.multiRanges.Count) { return false; }
+        r0 = st.multiRanges[b];
+        c0 = st.multiRanges[b + 1];
+        r1 = st.multiRanges[b + 2];
+        c1 = st.multiRanges[b + 3];
+        return true;
+    }
+
+    /// 把当前 range 归档为第 n 个区域并清空活动 range。
+    /// 用于 Ctrl+按下时：上一区域就此固化，随后按下的新区域
+    /// 继续作为 range 拖拽。
+    static void ArchiveRange(DataTableState st) {
+        if (!DataTable.HasRange(st)) { return; }
+        int r0 = DataTable.MinI(st.rangeR0, st.rangeR1);
+        int r1 = DataTable.MaxI(st.rangeR0, st.rangeR1);
+        int c0 = DataTable.MinI(st.rangeC0, st.rangeC1);
+        int c1 = DataTable.MaxI(st.rangeC0, st.rangeC1);
+        st.multiRanges.Add(r0);
+        st.multiRanges.Add(c0);
+        st.multiRanges.Add(r1);
+        st.multiRanges.Add(c1);
+        st.multiActive = true;
+        DataTable.ClearRange(st);
+    }
+
+    /// 丢弃全部归档区域，回到单矩形模式。
+    static void ClearMulti(DataTableState st) {
+        st.multiRanges.Clear();
+        st.multiActive = false;
+    }
+
+    /// 区域数量（多区域时为 归档+当前；单矩形时 0 或 1）。
+    /// 只统计有内容的区域；调用方以 RangeCount>1 判断"真的多区域"。
+    static int RangeCount(DataTableState st) {
+        int n = st.multiRanges.Count / 4;
+        if (DataTable.HasRange(st)) { n = n + 1; }
+        return n;
+    }
+
+    /// 取第 i 个区域（0 基，先归档区域后当前 range）的归一化
+    /// 边界 r0,c0,r1,c1。越界返回 false。复制/汇总/清空等
+    /// "逐区域"消费者统一走它，无感知多区域与单矩形。
+    static bool RangeAt(DataTableState st, int i, out int r0, out int c0,
+                        out int r1, out int c1) {
+        if (i < st.multiRanges.Count / 4) {
+            return DataTable.MultiAt(st, i, out r0, out c0, out r1, out c1);
+        }
+        r0 = -1; c0 = -1; r1 = -1; c1 = -1;
+        if (!DataTable.HasRange(st)) { return false; }
+        r0 = DataTable.MinI(st.rangeR0, st.rangeR1);
+        r1 = DataTable.MaxI(st.rangeR0, st.rangeR1);
+        c0 = DataTable.MinI(st.rangeC0, st.rangeC1);
+        c1 = DataTable.MaxI(st.rangeC0, st.rangeC1);
+        return true;
     }
 
     /// 让选择列的勾选框跟随当前单元格范围：范围跨多行
@@ -713,8 +829,40 @@ partial class DataTable {
     }
 
     /// 清空当前范围内的所有可编辑单元格（Delete 键）。
+    /// 多区域（Ctrl 追加）时先归并成互不重叠的行×列段，逐段
+    /// 调用自身清空（此时 RangeCount==1，不会再次进入本分支）。
     /// 返回清空的单元格数。
     static int ClearRangeCells(DataTableState st, List<DataColumn> cols, DataSource src) {
+        if (DataTable.RangeCount(st) > 1) {
+            int n = DataTable.RangeCount(st);
+            int total = 0;
+            int segR0 = -1;
+            int segR1 = -1;
+            int segC0 = -1;
+            int segC1 = -1;
+            // 归并：按行段收集与既有段相交的区域，重叠消解后
+            // 每个行段调用一次单矩形清空。调用方（Delete 键）
+            // 一次操作仍记一组撤销。
+            DataTable.BeginUndoGroup(st);
+            for (int mi = 0; mi < n; mi = mi + 1) {
+                int mr0 = -1; int mc0 = -1; int mr1 = -1; int mc1 = -1;
+                if (!DataTable.RangeAt(st, mi, out mr0, out mc0, out mr1, out mc1)) { continue; }
+                if (segR0 >= 0 && mr0 <= segR1 && mr1 >= segR0) {
+                    if (mc0 < segC0) { segC0 = mc0; }
+                    if (mc1 > segC1) { segC1 = mc1; }
+                    continue;
+                }
+                if (segR0 >= 0) {
+                    total = total + DataTable.ClearSeg(st, cols, src, segR0, segR1, segC0, segC1);
+                }
+                segR0 = mr0; segR1 = mr1; segC0 = mc0; segC1 = mc1;
+            }
+            if (segR0 >= 0) {
+                total = total + DataTable.ClearSeg(st, cols, src, segR0, segR1, segC0, segC1);
+            }
+            DataTable.EndUndoGroup(st);
+            return total;
+        }
         int r0 = st.hitOrder;
         int r1 = st.hitOrder;
         int c0 = st.hitCol;
@@ -731,7 +879,25 @@ partial class DataTable {
         r0 = DataTable.NextDataSlot(st, r0, 1);
         if (r0 < 0 || r0 > r1) { return 0; }
         // 一次 Delete 记一次撤销，无论范围多大。
+        // （多区域入口已开组；BeginUndoGroup 嵌套只前移序号，
+        // 不破坏外层组。）
         DataTable.BeginUndoGroup(st);
+        int cleared = DataTable.ClearSeg(st, cols, src, r0, r1, c0, c1);
+        DataTable.EndUndoGroup(st);
+        if (cleared > 0) {
+            st.editRow = DataTable.DispRowOf(st, r0);
+            st.editCol = c0;
+            st.CellEdit.Raise();
+            st.dirty = true;
+        }
+        return cleared;
+    }
+
+    /// 清空单个归一化行×列段内的可编辑单元格。
+    /// ClearRangeCells 的共用内核：不做撤销分组，不读
+    /// st.range*——边界全部来自参数。
+    static int ClearSeg(DataTableState st, List<DataColumn> cols, DataSource src,
+                        int r0, int r1, int c0, int c1) {
         int cleared = 0;
         int rr = r0;
         while (rr <= r1) {
@@ -752,13 +918,6 @@ partial class DataTable {
                 }
             }
             rr = rr + 1;
-        }
-        DataTable.EndUndoGroup(st);
-        if (cleared > 0) {
-            st.editRow = DataTable.DispRowOf(st, r0);
-            st.editCol = c0;
-            st.CellEdit.Raise();
-            st.dirty = true;
         }
         return cleared;
     }

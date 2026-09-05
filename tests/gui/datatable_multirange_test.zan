@@ -1,0 +1,143 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace DataTableMultiRangeTest;
+
+class Program {
+    static DataRow Row(string price, string qty) {
+        DataRow r = new DataRow();
+        r.Push(price);
+        r.Push(qty);
+        return r;
+    }
+
+    static string DumpRange(DataTableState st, int i) {
+        int r0; int c0; int r1; int c1;
+        if (!DataTable.RangeAt(st, i, out r0, out c0, out r1, out c1)) { return "none"; }
+        return Convert.ToString(r0) + "," + Convert.ToString(c0)
+            + "-" + Convert.ToString(r1) + "," + Convert.ToString(c1);
+    }
+
+    // 汇总模拟状态栏口径：逐区域求 numeric 列之和（含并集去重）。
+    static int SumRanges(DataTableState st, List<DataColumn> cols, DataSource src) {
+        int n = DataTable.RangeCount(st);
+        int sum = 0;
+        for (int qi = 0; qi < n; qi = qi + 1) {
+            int r0; int c0; int r1; int c1;
+            if (!DataTable.RangeAt(st, qi, out r0, out c0, out r1, out c1)) { continue; }
+            int ri = r0;
+            while (ri <= r1 && ri < DataTable.DispCount(st)) {
+                if (DataTable.DispKind(st, ri) == 0) {
+                    int ci = c0;
+                    while (ci <= c1 && ci < cols.Count) {
+                        bool dup = false;
+                        for (int qj = 0; qj < qi && !dup; qj = qj + 1) {
+                            int jr0; int jc0; int jr1; int jc1;
+                            if (DataTable.RangeAt(st, qj, out jr0, out jc0, out jr1, out jc1)
+                                && ri >= jr0 && ri <= jr1 && ci >= jc0 && ci <= jc1) { dup = true; }
+                        }
+                        if (!dup && cols[ci].numeric) {
+                            sum = sum + src.CellNum(DataTable.DispRowOf(st, ri), ci);
+                        }
+                        ci = ci + 1;
+                    }
+                }
+                ri = ri + 1;
+            }
+        }
+        return sum;
+    }
+
+    static void Main() {
+        List<DataRow> rows = new List<DataRow>();
+        rows.Add(Program.Row("10", "1"));
+        rows.Add(Program.Row("20", "2"));
+        rows.Add(Program.Row("30", "3"));
+        rows.Add(Program.Row("40", "4"));
+        rows.Add(Program.Row("50", "5"));
+        DataSource src = new RowListSource(rows);
+
+        List<DataColumn> cols = new List<DataColumn>();
+        cols.Add(DataColumn.Numeric("price", 80));
+        cols.Add(DataColumn.Numeric("qty", 80));
+        DataTableState st = new DataTableState();
+        DataTable.EnsureInit(st, cols, src);
+        DataTable.Recompute(st, cols, src);
+
+        // ---- 初始无范围 ----
+        Console.WriteLine("initialEmpty=" + (!DataTable.HasRange(st)
+            && DataTable.RangeCount(st) == 0 && !DataTable.HasMulti(st)));
+
+        // ---- 拖出第一个区域：行 0..1 × 列 0..1 ----
+        st.rangeR0 = 0; st.rangeR1 = 1;
+        st.rangeC0 = 0; st.rangeC1 = 1;
+        Console.WriteLine("singleRange=" + (DataTable.RangeCount(st) == 1 && !DataTable.HasMulti(st)));
+
+        // ---- Ctrl 追加：归档当前，开新区域 行3..4 × 列0 ----
+        DataTable.ArchiveRange(st);
+        st.rangeR0 = 3; st.rangeR1 = 4;
+        st.rangeC0 = 0; st.rangeC1 = 0;
+        Console.WriteLine("archived=" + (DataTable.MultiCount(st) == 1 && DataTable.HasMulti(st)));
+        Console.WriteLine("count2=" + (DataTable.RangeCount(st) == 2));
+        Console.WriteLine("region0=" + (Program.DumpRange(st, 0) == "0,0-1,1"));
+        Console.WriteLine("region1=" + (Program.DumpRange(st, 1) == "3,0-4,0"));
+
+        // ---- 并集汇总：区域0 = (10+20)+(1+2)=33，区域1 = 40+50=90 → 123 ----
+        Console.WriteLine("unionSum=" + (Program.SumRanges(st, cols, src) == 123));
+
+        // ---- 重叠区域不重复计：追加与区域0部分重叠的 行1..2 × 列1 ----
+        DataTable.ArchiveRange(st);
+        st.rangeR0 = 1; st.rangeR1 = 2;
+        st.rangeC0 = 1; st.rangeC1 = 1;
+        // 新增贡献：行2列1 = 3（行1列1 已被区域0 计过）
+        Console.WriteLine("overlapSum=" + (Program.SumRanges(st, cols, src) == 126));
+        Console.WriteLine("count3=" + (DataTable.RangeCount(st) == 3));
+
+        // ---- 多区域复制：BuildText 按区域拼接 ----
+        string txt = DataTable.BuildText(st, cols, src, false, false);
+        // 区域0 两行两列 + 区域1 两行一列 + 区域2 两行一列
+        // 行计数：尾随换行按含尾计——用手工数换行符。
+        int lines = 0;
+        for (int ci = 0; ci < txt.Length; ci = ci + 1) {
+            if ((int)txt[ci] == 10) { lines = lines + 1; }
+        }
+        Console.WriteLine("copyLines=" + (lines == 6));
+        Console.WriteLine("copyHasFirst=" + (txt.IndexOf("10\t1") >= 0));
+        Console.WriteLine("copyHasLast=" + (txt.IndexOf("50") >= 0));
+
+        // ---- 多区域清空：仅 editable 列计数。价格列设为
+        // 可编辑后，区域0 贡献 2 格、区域1 贡献 2 格、区域2
+        // 与区域0 重叠的 1 格不再重复清 → 共 4 格。 ----
+        cols[0].editable = true;
+        int cleared = DataTable.ClearRangeCells(st, cols, src);
+        Console.WriteLine("clearCells=" + (cleared == 4));
+
+        // ---- 普通点击丢弃全部归档（渲染层语义的单测等价） ----
+        DataTable.ClearMulti(st);
+        DataTable.ClearRange(st);
+        Console.WriteLine("clearMulti=" + (!DataTable.HasMulti(st)
+            && DataTable.RangeCount(st) == 0));
+
+        // ---- 滚轮扩展语义的纯逻辑等价：远端推进/收缩 ----
+        st.rangeR0 = 1; st.rangeR1 = 2;
+        st.rangeC0 = 0; st.rangeC1 = 1;
+        // 模拟 Ctrl+滚轮向下：远端 rangeR1 +1
+        st.rangeR1 = st.rangeR1 + 1;
+        Console.WriteLine("wheelGrow=" + (Program.DumpRange(st, 0) == "1,0-3,1"));
+        // 模拟 Ctrl+滚轮向上收缩：远端 rangeR1 -1（回到锚点）
+        st.rangeR1 = st.rangeR1 - 2;
+        Console.WriteLine("wheelShrink=" + (Program.DumpRange(st, 0) == "1,0-1,1"));
+
+        // ---- 单格 Ctrl 追加：归档单格区域 ----
+        DataTable.ClearMulti(st);
+        st.rangeR0 = 0; st.rangeR1 = 0;
+        st.rangeC0 = 1; st.rangeC1 = 1;
+        DataTable.ArchiveRange(st);
+        st.rangeR0 = 4; st.rangeR1 = 4;
+        st.rangeC0 = 0; st.rangeC1 = 0;
+        Console.WriteLine("cellAppend=" + (DataTable.RangeCount(st) == 2
+            && Program.DumpRange(st, 0) == "0,1-0,1"
+            && Program.DumpRange(st, 1) == "4,0-4,0"));
+    }
+}
