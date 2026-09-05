@@ -186,6 +186,7 @@ static bool emit_span_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 ? coerce_int_to(g, emit_expr(g, expr->call.args.items[1], locals), i64t)
                 : LLVMBuildSub(g->builder, len, start, "span.len");
             emit_span_window_check(g, start, window, len, expr->loc, "span");
+            emit_span_safe_window(g, &start, &window, len, expr->loc, "span");
             LLVMValueRef off = LLVMBuildMul(g->builder, start,
                 LLVMSizeOf(elem_llvm), "span.boff");
             base = LLVMBuildGEP2(g->builder, i8, base, &off, 1, "span.base2");
@@ -212,6 +213,7 @@ static bool emit_span_call(zan_irgen_t *g, zan_ast_node_t *expr,
             ? coerce_int_to(g, emit_expr(g, expr->call.args.items[1], locals), i64t)
             : LLVMBuildSub(g->builder, len, start, "sl.len2");
         emit_span_window_check(g, start, nlen, len, expr->loc, "span");
+        emit_span_safe_window(g, &start, &nlen, len, expr->loc, "span");
         LLVMValueRef off = LLVMBuildMul(g->builder, start,
             LLVMSizeOf(elem_llvm), "sl.boff");
         LLVMValueRef nbase = LLVMBuildGEP2(g->builder, i8, base, &off, 1, "sl.base2");
@@ -2188,6 +2190,7 @@ static LLVMValueRef emit_mdarray_elem_ptr(zan_irgen_t *g, LLVMValueRef arr_ptr,
     LLVMValueRef dim0 = LLVMBuildLoad2(g->builder, i64,
         LLVMBuildGEP2(g->builder, i64, dim_ptr, &zero, 1, "md.d0"), "md.dim0");
     emit_index_bounds_check(g, idx, dim0, expr->loc, "array");
+    idx = emit_index_safe_bounds(g, idx, dim0, expr->loc, "array");
     LLVMValueRef flat = idx;
     for (int d = 1; d < rank; d++) {
         LLVMValueRef off = LLVMConstInt(i64, (unsigned long long)d, 0);
@@ -2196,6 +2199,7 @@ static LLVMValueRef emit_mdarray_elem_ptr(zan_irgen_t *g, LLVMValueRef arr_ptr,
         LLVMValueRef ix = emit_expr(g, expr->index.extra.items[d - 1], locals);
         ix = emit_index_i64(g, ix, "md.ix");
         emit_index_bounds_check(g, ix, dimv, expr->loc, "array");
+        ix = emit_index_safe_bounds(g, ix, dimv, expr->loc, "array");
         flat = zan_mul(g->builder, flat, dimv, "md.fm");
         flat = zan_add(g->builder, flat, ix, "md.fa");
     }
@@ -2552,6 +2556,7 @@ binding_lowered:
                         LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64)
                         idx = LLVMBuildSExt(g->builder, idx,
                             LLVMInt64TypeInContext(g->ctx), "sps.ix");
+                    idx = emit_index_safe_bounds(g, idx, span_len, expr->loc, "span");
                     LLVMValueRef ep = LLVMBuildGEP2(g->builder, elem_llvm, typed, &idx, 1, "sps.ep");
                     LLVMValueRef sv = right;
                     if (LLVMGetTypeKind(LLVMTypeOf(sv)) == LLVMIntegerTypeKind &&
@@ -2608,6 +2613,7 @@ binding_lowered:
                         LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64) {
                         idx = LLVMBuildSExt(g->builder, idx, LLVMInt64TypeInContext(g->ctx), "idxext");
                     }
+                    idx = emit_index_safe_bounds(g, idx, count, expr->loc, "list");
                     idx = slot_word_index(g, idx,
                         elem_slot_words(g, container_elem_type(local->type)));
                     LLVMValueRef slot_ptr = LLVMBuildGEP2(g->builder, LLVMInt64TypeInContext(g->ctx), data, &idx, 1, "ep");
@@ -2624,6 +2630,7 @@ binding_lowered:
                         if (!local->opaque_string) {
                             LLVMValueRef len = emit_string_buffer_len(g, arr_ptr, expr->loc);
                             emit_index_bounds_check(g, idx, len, expr->loc, "string");
+                            idx = emit_index_safe_bounds(g, idx, len, expr->loc, "string");
                         } else {
                             /* No reliable bound: keep null/negative bare faults out. */
                             idx = emit_string_elem_guard(g, arr_ptr, idx, expr->loc, &arr_ptr);
@@ -2651,6 +2658,8 @@ binding_lowered:
                             if (local->type && local->type->kind == TYPE_ARRAY) {
                                 emit_index_bounds_check(g, idx, zan_array_len(g, arr_ptr),
                                     expr->loc, "array");
+                                idx = emit_index_safe_bounds(g, idx,
+                                    zan_array_len(g, arr_ptr), expr->loc, "array");
                             }
                             LLVMValueRef typed_arr = LLVMBuildBitCast(g->builder, arr_ptr,
                                 LLVMPointerType(elem_llvm, 0), "arrp");
@@ -2708,6 +2717,7 @@ binding_lowered:
                             expr_has_reliable_string_bounds(arr_expr, locals)) {
                             LLVMValueRef len = emit_string_buffer_len(g, arr_ptr, expr->loc);
                             emit_index_bounds_check(g, idx, len, expr->loc, "string");
+                            idx = emit_index_safe_bounds(g, idx, len, expr->loc, "string");
                         } else if (fsym->type && fsym->type->kind == TYPE_STRING) {
                             /* No reliable bound: keep null/negative bare faults out. */
                             idx = emit_string_elem_guard(g, arr_ptr, idx, expr->loc, &arr_ptr);
@@ -2715,6 +2725,8 @@ binding_lowered:
                                    fsym->type->array_rank <= 1) {
                             emit_index_bounds_check(g, idx, zan_array_len(g, arr_ptr),
                                 expr->loc, "array");
+                            idx = emit_index_safe_bounds(g, idx,
+                                zan_array_len(g, arr_ptr), expr->loc, "array");
                         }
                         if (fsym->type && type_named(fsym->type, "List", 4)) {
                             LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
@@ -2733,6 +2745,7 @@ binding_lowered:
                                 LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64) {
                                 idx = LLVMBuildSExt(g->builder, idx, i64t, "idxext");
                             }
+                            idx = emit_index_safe_bounds(g, idx, count, expr->loc, "list");
                             idx = slot_word_index(g, idx,
                                 elem_slot_words(g, container_elem_type(fsym->type)));
                             LLVMValueRef slot_ptr = LLVMBuildGEP2(g->builder, i64t, data, &idx, 1, "ep");
@@ -2849,6 +2862,7 @@ binding_lowered:
                             LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64) {
                             idx = LLVMBuildSExt(g->builder, idx, i64t, "idxext");
                         }
+                        idx = emit_index_safe_bounds(g, idx, count, expr->loc, "list");
                         idx = slot_word_index(g, idx,
                             elem_slot_words(g, container_elem_type(at)));
                         LLVMValueRef slot_ptr = LLVMBuildGEP2(g->builder, i64t, data, &idx, 1, "ep");
@@ -2879,7 +2893,7 @@ binding_lowered:
                          * first NUL says nothing about its capacity; only a
                          * literal/local receiver carries a reliable bound. */
                         if (expr_has_reliable_string_bounds(arr_expr, locals))
-                            emit_index_bounds_check(g, idx,
+                            idx = emit_index_safe_bounds(g, idx,
                                 emit_string_buffer_len(g, arr_ptr, expr->loc), expr->loc,
                                 "string");
                         else
@@ -2893,6 +2907,8 @@ binding_lowered:
                             /* rank>1 goes through emit_mdarray_elem_ptr, which
                              * checks each dimension itself */
                             emit_index_bounds_check(g, idx,
+                                zan_array_len(g, arr_ptr), expr->loc, "array");
+                            idx = emit_index_safe_bounds(g, idx,
                                 zan_array_len(g, arr_ptr), expr->loc, "array");
                         }
                         LLVMTypeRef elem_llvm = LLVMInt32TypeInContext(g->ctx);
@@ -2964,6 +2980,8 @@ binding_lowered:
                         LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
                         emit_index_bounds_check(g, idx, zan_array_len(g, arr_ptr),
                             expr->loc, "array");
+                        idx = emit_index_safe_bounds(g, idx,
+                            zan_array_len(g, arr_ptr), expr->loc, "array");
                         LLVMValueRef typed_arr = LLVMBuildBitCast(g->builder, arr_ptr,
                             LLVMPointerType(elem_llvm, 0), "arrp");
                         elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm,
@@ -3328,6 +3346,8 @@ static LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMValueRef idx = emit_expr(g, operand->index.index, locals);
                 emit_index_bounds_check(g, idx, zan_array_len(g, arr_ptr),
                     operand->loc, "array");
+                idx = emit_index_safe_bounds(g, idx, zan_array_len(g, arr_ptr),
+                    operand->loc, "array");
                 LLVMValueRef typed_arr = LLVMBuildBitCast(g->builder, arr_ptr,
                     LLVMPointerType(elem_llvm, 0), "arrp");
                 slot_ptr = LLVMBuildGEP2(g->builder, elem_llvm, typed_arr, &idx, 1, "eidx");
@@ -3340,6 +3360,7 @@ static LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             if (expr_has_reliable_string_bounds(arr_expr, locals)) {
                 LLVMValueRef str_len = emit_string_buffer_len(g, arr_ptr, operand->loc);
                 emit_index_bounds_check(g, idx, str_len, operand->loc, "string");
+                idx = emit_index_safe_bounds(g, idx, str_len, operand->loc, "string");
             } else {
                 /* No reliable bound: keep null/negative from faulting bare. */
                 idx = emit_string_elem_guard(g, arr_ptr, idx, operand->loc, &arr_ptr);
@@ -4489,6 +4510,7 @@ static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64)
                     idx = LLVMBuildSExt(g->builder, idx,
                         LLVMInt64TypeInContext(g->ctx), "spx.ix");
+                idx = emit_index_safe_bounds(g, idx, span_len, expr->loc, "span");
                 LLVMValueRef ep = LLVMBuildGEP2(g->builder, elem_llvm, typed, &idx, 1, "spx.ep");
                 LLVMValueRef ld = LLVMBuildLoad2(g->builder, elem_llvm, ep, "spx.elem");
                 LLVMSetAlignment(ld, 1);
@@ -4562,6 +4584,7 @@ static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64) {
                 idx = LLVMBuildSExt(g->builder, idx, i64, "ext");
             }
+            idx = emit_index_safe_bounds(g, idx, count, expr->loc, "list");
             zan_type_t *et = container_elem_type(arr_type);
             LLVMValueRef widx = slot_word_index(g, idx, elem_slot_words(g, et));
             LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i64, data, &widx, 1, "ep");
@@ -4623,6 +4646,7 @@ static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
             if (expr_has_reliable_string_bounds(expr->index.object, locals)) {
                 LLVMValueRef str_len = emit_string_buffer_len(g, arr_ptr, expr->loc);
                 emit_index_bounds_check(g, idx, str_len, expr->loc, "string");
+                idx = emit_index_safe_bounds(g, idx, str_len, expr->loc, "string");
             } else {
                 /* No reliable bound (field/param/extern receiver): still keep
                  * null and negative indexes from faulting bare. */
@@ -4656,6 +4680,7 @@ static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMValueRef idx = emit_expr(g, expr->index.index, locals);
                 LLVMValueRef arr_len = zan_array_len(g, arr_ptr);
                 emit_index_bounds_check(g, idx, arr_len, expr->loc, "array");
+                idx = emit_index_safe_bounds(g, idx, arr_len, expr->loc, "array");
                 LLVMValueRef typed_arr = LLVMBuildBitCast(g->builder, arr_ptr,
                     LLVMPointerType(elem_llvm, 0), "arrp");
                 elem_ptr = LLVMBuildGEP2(g->builder, elem_llvm, typed_arr, &idx, 1, "eidx");

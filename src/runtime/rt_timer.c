@@ -495,11 +495,21 @@ static void heap_swap(size_t a, size_t b) {
     g_heap[b] = entry;
 }
 
-static void heap_push(zan_timer_entry *entry) {
+/* Push onto the heap. Returns 0 on success; on allocation failure the entry is
+ * NOT queued, its removed flag is set (so cancel_delay sees it as gone) and the
+ * caller must run the failure path appropriate to its kind. The historical
+ * abort() here turned a transient allocation failure under load into an
+ * instant whole-process death -- a server running thousands of Task.Delay
+ * awaits should degrade (the await simply never fires and the awaiting frame
+ * is cancelled on its next release) instead. */
+static int heap_push(zan_timer_entry *entry) {
     if (g_heap_len == g_heap_cap) {
         size_t cap = g_heap_cap ? g_heap_cap * 2 : 64;
         zan_timer_entry **heap = (zan_timer_entry **)realloc(g_heap, cap * sizeof(*heap));
-        if (!heap) abort();
+        if (!heap) {
+            entry->removed = 1;
+            return -1;
+        }
         g_heap = heap;
         g_heap_cap = cap;
     }
@@ -512,6 +522,7 @@ static void heap_push(zan_timer_entry *entry) {
         heap_swap(index, parent);
         index = parent;
     }
+    return 0;
 }
 
 static zan_timer_entry *heap_pop(void) {
@@ -556,7 +567,8 @@ void zan_timer_runtime_reset(void) {
 void zan_timer_delay(long long ms, void *frame, zan_timer_step_t step) {
     if (!step) return;
     zan_timer_entry *entry = (zan_timer_entry *)calloc(1, sizeof(*entry));
-    if (!entry) abort();
+    if (!entry) return;   /* OOM: the await never fires; frame release still
+                             cancels nothing since no entry exists (soft). */
     entry->due_ms = zan_timer_now_ms() + (ms > 0 ? ms : 0);
     entry->kind = ZAN_TIMER_DELAY;
     entry->frame = frame;
@@ -564,7 +576,15 @@ void zan_timer_delay(long long ms, void *frame, zan_timer_step_t step) {
     timer_lock();
     g_initialized = 1;
     entry->sequence = ++g_sequence;   /* shared counter: only touch under the lock */
-    heap_push(entry);
+    if (heap_push(entry) != 0) {
+        /* Heap growth failed under load: drop the delay. The awaiting frame
+         * is parked on this resume -- with no entry it would hang forever, so
+         * ready it immediately (the delay elapses with zero remaining time
+         * from the waiter's perspective; better than a lost coroutine). */
+        timer_unlock();
+        step(frame);
+        return;
+    }
     timer_unlock();
 }
 
@@ -604,7 +624,7 @@ int zan_timer_cancel_delay(void *frame) {
 static long long timer_add(long long ms, zan_timer_callback_t callback, int repeat) {
     if (ms < 1 || !callback) return 0;
     zan_timer_entry *entry = (zan_timer_entry *)calloc(1, sizeof(*entry));
-    if (!entry) abort();
+    if (!entry) return 0;   /* OOM: report failure as an invalid timer id. */
     /* Set the callback before publishing the entry: another thread dispatching
      * due timers must never see a pushed entry with a NULL callback. */
     entry->callback = callback;
@@ -616,7 +636,11 @@ static long long timer_add(long long ms, zan_timer_callback_t callback, int repe
     entry->due_ms = zan_timer_now_ms() + ms;
     entry->sequence = ++g_sequence;
     entry->kind = ZAN_TIMER_PUBLIC;
-    heap_push(entry);
+    if (heap_push(entry) != 0) {
+        timer_unlock();
+        free(entry);
+        return 0;
+    }
     timer_unlock();
     return entry->id;
 }
@@ -690,7 +714,13 @@ long long zan_timer_dispatch_due(void) {
         if (entry->kind == ZAN_TIMER_PUBLIC && entry->interval > 0 && !entry->removed) {
             entry->due_ms = zan_timer_now_ms() + entry->interval;
             entry->sequence = ++g_sequence;
-            heap_push(entry);
+            if (heap_push(entry) != 0) {
+                /* Heap growth failed: a repeating timer that cannot be
+                 * re-queued is dropped rather than aborting the process. */
+                timer_unlock();
+                free(entry);
+                continue;
+            }
             timer_unlock();
         } else {
             timer_unlock();

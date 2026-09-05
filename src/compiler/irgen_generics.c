@@ -1398,6 +1398,48 @@ static void emit_index_bounds_check(zan_irgen_t *g, LLVMValueRef index,
     emit_index_range_check(g, index, length, false, loc, kind);
 }
 
+/* Bounds check + SAFE INDEX for the fail-soft runtime: reports the same
+ * "<kind> index out of bounds" guard as emit_index_bounds_check, but RETURNS
+ * an index value the caller must then use for the access. Soft mode folds an
+ * out-of-range index to 0, so the GEP the caller was going to build lands
+ * inside the object instead of -- as with the report-only check -- running
+ * the original wild index straight into unmapped memory (the 1-in-N crash a
+ * single report hides: a[100] survives by luck, a[100000000] segfaults with
+ * the report already on stderr). Hard mode exits inside the report, so the
+ * returned value is the caller's original index unchanged. With runtime
+ * checks disabled the index passes through untouched.
+ *
+ * `allow_end` keeps the substring/range semantics (index == length is legal).
+ * The returned index is the caller's own width -- the i64 canonicalization
+ * the check itself needs does not change what the caller indexes with. */
+static LLVMValueRef emit_index_safe_check(zan_irgen_t *g, LLVMValueRef index,
+                                          LLVMValueRef length, bool allow_end,
+                                          zan_loc_t loc, const char *kind) {
+    if (!g->runtime_checks || !g->current_fn) return index;
+    emit_index_bounds_check(g, index, length, loc, kind);
+    if (LLVMGetTypeKind(LLVMTypeOf(index)) != LLVMIntegerTypeKind)
+        return index;
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef idx = emit_index_i64(g, index, "safeidx.i64");
+    LLVMValueRef len = emit_index_i64(g, length, "safeidx.len");
+    LLVMValueRef negative = zan_icmp(g->builder, LLVMIntSLT, idx,
+                                     LLVMConstInt(i64, 0, 0), "safeidx.neg");
+    LLVMIntPredicate upper_pred = allow_end ? LLVMIntSGT : LLVMIntSGE;
+    LLVMValueRef outside = zan_icmp(g->builder, upper_pred, idx, len,
+                                    "safeidx.high");
+    LLVMValueRef unsafe = LLVMBuildOr(g->builder, negative, outside,
+                                      "safeidx.bad");
+    return LLVMBuildSelect(g->builder, unsafe,
+                           LLVMConstInt(LLVMTypeOf(index), 0, 0), index,
+                           "safeidx.ok");
+}
+
+static LLVMValueRef emit_index_safe_bounds(zan_irgen_t *g, LLVMValueRef index,
+                                           LLVMValueRef length, zan_loc_t loc,
+                                           const char *kind) {
+    return emit_index_safe_check(g, index, length, false, loc, kind);
+}
+
 /* Guard a string element access (`s[i]` read/write) whose receiver carries no
  * reliable NUL bound -- a field, a parameter or an extern result that may be
  * a raw FFI buffer. Those skip the bounds check by design (an explicit
@@ -1826,6 +1868,39 @@ static void emit_span_window_check(zan_irgen_t *g, LLVMValueRef start,
     char msg[96];
     snprintf(msg, sizeof(msg), "%s range out of bounds", kind ? kind : "span");
     emit_runtime_check(g, bad, loc, msg);
+}
+
+/* Span-window check + SAFE WINDOW for the fail-soft runtime: same report as
+ * emit_span_window_check, but on the soft path the start index folds to 0
+ * and the window length to 0, so the alloc/GEP/memcpy the caller builds
+ * reads at most a zero-length slice instead of a wild range (hard mode
+ * exits inside the report; checks-off returns the operands untouched). */
+static void emit_span_safe_window(zan_irgen_t *g, LLVMValueRef *start_out,
+                                  LLVMValueRef *window_out,
+                                  LLVMValueRef length, zan_loc_t loc,
+                                  const char *kind) {
+    if (!g->runtime_checks || !g->current_fn) return;
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef start = emit_index_i64(g, *start_out, "safe.start");
+    LLVMValueRef window = emit_index_i64(g, *window_out, "safe.count");
+    length = emit_index_i64(g, length, "safe.length");
+    LLVMValueRef bad_start = zan_icmp(g->builder, LLVMIntSLT, start,
+                                      LLVMConstInt(i64, 0, 0), "safe.start.neg");
+    LLVMValueRef bad_window = zan_icmp(g->builder, LLVMIntSLT, window,
+                                      LLVMConstInt(i64, 0, 0), "safe.count.neg");
+    LLVMValueRef after_end = zan_icmp(g->builder, LLVMIntSGT, start, length,
+                                      "safe.start.high");
+    LLVMValueRef remaining = LLVMBuildSub(g->builder, length, start,
+                                          "safe.remaining");
+    LLVMValueRef too_long = zan_icmp(g->builder, LLVMIntSGT, window, remaining,
+                                     "safe.count.high");
+    LLVMValueRef bad = LLVMBuildOr(g->builder, bad_start, bad_window, "safe.bad0");
+    bad = LLVMBuildOr(g->builder, bad, after_end, "safe.bad1");
+    bad = LLVMBuildOr(g->builder, bad, too_long, "safe.bad2");
+    *start_out = LLVMBuildSelect(g->builder, bad,
+                                 LLVMConstInt(i64, 0, 0), start, "safe.start.ok");
+    *window_out = LLVMBuildSelect(g->builder, bad,
+                                  LLVMConstInt(i64, 0, 0), window, "safe.count.ok");
 }
 
 /* Resolve the base pointer to a struct/class instance held by a local.

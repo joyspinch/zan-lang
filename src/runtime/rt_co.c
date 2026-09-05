@@ -35,8 +35,19 @@ void zan_co_set_idle(zan_co_idle_fn fn) {
 
 static void queue_grow(void) {
     size_t ncap = g_cap ? g_cap * 2 : 16;
-    zan_co_slot_t *nq = (zan_co_slot_t *)malloc(ncap * sizeof(*nq));
-    if (!nq) zan_host_oom();
+    zan_co_slot_t *nq = (zan_co_slot_t *)realloc(g_queue, ncap * sizeof(*nq));
+    if (!nq) {
+        /* A transient allocation failure must not kill a running server: drop
+         * THIS resumption instead of aborting. The frame's state word still
+         * says "running", so if it is ever resumed again through another path
+         * it continues; if not, it leaks one frame rather than taking down
+         * every live connection. The window for this is OOM at the exact
+         * queue-growth instant -- the old abort() turned that into an
+         * instant whole-process death. */
+        fprintf(stderr, "zan runtime: coroutine ready-queue grow failed "
+                        "(OOM); dropping one resumption\n");
+        return;
+    }
     /* Re-linearise the circular buffer into the new storage. */
     for (size_t i = 0; i < g_len; i++) {
         nq[i] = g_queue[(g_head + i) % g_cap];
@@ -50,6 +61,7 @@ static void queue_grow(void) {
 void zan_co_ready(void *frame, zan_co_step_t step) {
     if (!step) return;
     if (g_len == g_cap) queue_grow();
+    if (g_len == g_cap) return;   /* grow failed (OOM): resumption dropped */
     size_t tail = (g_head + g_len) % g_cap;
     g_queue[tail].frame = frame;
     g_queue[tail].step  = step;

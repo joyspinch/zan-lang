@@ -1700,12 +1700,17 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 if (expr->call.args.count == 2) {
                     slen = coerce_int_to(g,
                         emit_expr(g, expr->call.args.items[1], locals), i64);
-                    if (total)
+                    if (total) {
                         emit_span_window_check(g, start, slen, total, expr->loc,
                                                "substring");
+                        emit_span_safe_window(g, &start, &slen, total, expr->loc,
+                                              "substring");
+                    }
                 } else {
                     emit_index_range_check(g, start, total, true, expr->loc,
                                            "substring");
+                    start = emit_index_safe_check(g, start, total, true, expr->loc,
+                                                  "substring");
                     slen = zan_sub(g->builder, total, start, "subl");
                 }
                 /* A soft-mode report above continues with a null receiver and
@@ -3443,6 +3448,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         idx = LLVMBuildSExt(g->builder, idx, i64, "idx.sx");
                     }
                     emit_index_bounds_check(g, idx, count, expr->loc, "list");
+                    idx = emit_index_safe_bounds(g, idx, count, expr->loc, "list");
                     unsigned rwords = elem_slot_words(g, container_elem_type(ltype));
                     LLVMValueRef widx = slot_word_index(g, idx, rwords);
                     LLVMValueRef removed_ptr = LLVMBuildGEP2(g->builder, i64, data, &widx, 1, "rmp");
@@ -3634,6 +3640,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         emit_expr(g, expr->call.args.items[0], locals), i64);
                     emit_index_range_check(g, idx, count, true,
                                            expr->loc, "list");
+                    idx = emit_index_safe_check(g, idx, count, true,
+                                                expr->loc, "list");
                     /* Keep `item` in its natural type (pointer for string/class
                      * elements) so emit_collection_slot_store can retain it:
                      * emit_string_retain/emit_arc_retain no-op on non-pointer
