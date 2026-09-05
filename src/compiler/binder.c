@@ -1009,6 +1009,15 @@ static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
         int nif = 0;
         for (int bx = 0; bx < nbases; bx++) {
             zan_ast_node_t *base_ref = type_node->type_decl.bases.items[bx];
+            /* parse_type_ref can return a tuple-type or error node (e.g.
+             * `class C : (int, string)`); its union overlays tuple fields on
+             * type_ref.name, so reading .name blind hashes garbage. Reject
+             * anything that is not a plain type reference. */
+            if (base_ref->kind != AST_TYPE_REF) {
+                zan_diag_emit(b->diag, DIAG_ERROR, base_ref->loc,
+                              "invalid base type");
+                continue;
+            }
             zan_istr_t base_name = base_ref->type_ref.name;
             zan_symbol_t *base_sym = scope_find(b->current_scope, base_name);
             if (!base_sym) {
@@ -1183,8 +1192,9 @@ static void inherit_default_methods(zan_binder_t *b, zan_ast_node_t *type_node,
     }
     /* an interface may itself extend interfaces carrying defaults */
     for (int bx = 0; bx < iface_node->type_decl.bases.count; bx++) {
-        zan_symbol_t *bs = scope_find(b->current_scope,
-            iface_node->type_decl.bases.items[bx]->type_ref.name);
+        zan_ast_node_t *bref = iface_node->type_decl.bases.items[bx];
+        if (bref->kind != AST_TYPE_REF) continue;   /* invalid base: rejected at resolve time */
+        zan_symbol_t *bs = scope_find(b->current_scope, bref->type_ref.name);
         if (bs && bs->kind == SYM_INTERFACE && bs->decl)
             inherit_default_methods(b, type_node, bs->decl, depth + 1);
     }
@@ -1195,8 +1205,9 @@ static void bind_default_interface_methods(zan_binder_t *b, zan_ast_list_t *decl
         zan_ast_node_t *decl = decls->items[i];
         if (decl->kind != AST_CLASS_DECL && decl->kind != AST_STRUCT_DECL) continue;
         for (int bx = 0; bx < decl->type_decl.bases.count; bx++) {
-            zan_symbol_t *bs = scope_find(b->current_scope,
-                decl->type_decl.bases.items[bx]->type_ref.name);
+            zan_ast_node_t *bref = decl->type_decl.bases.items[bx];
+            if (bref->kind != AST_TYPE_REF) continue;   /* invalid base: rejected at resolve time */
+            zan_symbol_t *bs = scope_find(b->current_scope, bref->type_ref.name);
             if (bs && bs->kind == SYM_INTERFACE && bs->decl)
                 inherit_default_methods(b, decl, bs->decl, 0);
         }
@@ -1246,8 +1257,9 @@ static void validate_interface_contract(zan_binder_t *b, zan_symbol_t *cls,
         }
     }
     for (int i = 0; i < iface->type_decl.bases.count; i++) {
-        zan_symbol_t *base = scope_find(b->current_scope,
-            iface->type_decl.bases.items[i]->type_ref.name);
+        zan_ast_node_t *bref = iface->type_decl.bases.items[i];
+        if (bref->kind != AST_TYPE_REF) continue;   /* invalid base: rejected at resolve time */
+        zan_symbol_t *base = scope_find(b->current_scope, bref->type_ref.name);
         if (base && base->kind == SYM_INTERFACE && base->decl)
             validate_interface_contract(b, cls, base->decl, depth + 1);
     }

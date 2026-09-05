@@ -430,6 +430,16 @@ static void pp_handle_directive(zan_lexer_t *lex) {
             lex->cond_stack[lex->cond_depth] = active;
             lex->cond_seen_true[lex->cond_depth] = active;
             lex->cond_depth++;
+        } else {
+            /* Over the limit: push a constant-false frame anyway so the
+             * matching #endif pops OUR frame, not an enclosing one -- an
+             * unpushed #if desynced the stack and inverted outer branches. */
+            zan_diag_emit(lex->diag, DIAG_ERROR, lexer_loc(lex),
+                          "conditional-compilation nesting too deep (max %d)",
+                          ZAN_PP_MAX_COND_DEPTH);
+            lex->cond_stack[lex->cond_depth] = 0;
+            lex->cond_seen_true[lex->cond_depth] = 0;
+            lex->cond_depth++;
         }
     } else if (strcmp(dir, "ifndef") == 0) {
         pp_skip_hspaces(lex); char name[64]; pp_read_ident(lex, name, sizeof(name));
@@ -437,6 +447,13 @@ static void pp_handle_directive(zan_lexer_t *lex) {
             int active = pp_active(lex) && !pp_is_defined(lex, name);
             lex->cond_stack[lex->cond_depth] = active;
             lex->cond_seen_true[lex->cond_depth] = active;
+            lex->cond_depth++;
+        } else {
+            zan_diag_emit(lex->diag, DIAG_ERROR, lexer_loc(lex),
+                          "conditional-compilation nesting too deep (max %d)",
+                          ZAN_PP_MAX_COND_DEPTH);
+            lex->cond_stack[lex->cond_depth] = 0;
+            lex->cond_seen_true[lex->cond_depth] = 0;
             lex->cond_depth++;
         }
     } else if (strcmp(dir, "if") == 0) {
@@ -446,6 +463,13 @@ static void pp_handle_directive(zan_lexer_t *lex) {
             if (parent_active) val = pp_eval_expr(lex, 0);
             lex->cond_stack[lex->cond_depth] = parent_active && val;
             lex->cond_seen_true[lex->cond_depth] = parent_active && val;
+            lex->cond_depth++;
+        } else {
+            zan_diag_emit(lex->diag, DIAG_ERROR, lexer_loc(lex),
+                          "conditional-compilation nesting too deep (max %d)",
+                          ZAN_PP_MAX_COND_DEPTH);
+            lex->cond_stack[lex->cond_depth] = 0;
+            lex->cond_seen_true[lex->cond_depth] = 0;
             lex->cond_depth++;
         }
     } else if (strcmp(dir, "elif") == 0) {
@@ -1038,12 +1062,16 @@ static zan_token_t lexer_interp_string_segment(zan_lexer_t *lex, zan_token_kind_
             zan_diag_emit(lex->diag, DIAG_ERROR, loc,
                           "interpolated strings nested more than %d deep",
                           ZAN_MAX_INTERP_DEPTH);
+            /* Do not push: pushing would clamp the slot index to the last
+             * level, so this hole would share the enclosing hole's bracket
+             * counters and mistokenize everything after it. The diagnostic
+             * already fired; the enclosing string stays consistent. */
         } else {
             lex->interp_stack[lex->interp_depth].brace = 0;
             lex->interp_stack[lex->interp_depth].paren = 0;
             lex->interp_stack[lex->interp_depth].bracket = 0;
+            lex->interp_depth++;
         }
-        lex->interp_depth++;
         kind = start_kind; /* INTERP_START or INTERP_MID */
     } else {
         /* Closing " or EOF. The hole this segment followed was already popped
@@ -1326,6 +1354,11 @@ zan_token_t zan_lexer_peek(zan_lexer_t *lex) {
     zan_interp_level_t istack[ZAN_MAX_INTERP_DEPTH];
     if (nsave > 0)
         memcpy(istack, lex->interp_stack, sizeof(istack[0]) * (size_t)nsave);
+    /* A speculative peek can cross a `#define`/`#undef` line; without this
+     * save the directive permanently mutates the define table even though
+     * the parse backtracks (lexer.h documents restore-on-snapshot
+     * semantics for the full-struct snapshots; peek helpers must match). */
+    int dcount = lex->define_count;
 
     zan_token_t tok = zan_lexer_next(lex);
 
@@ -1336,6 +1369,7 @@ zan_token_t zan_lexer_peek(zan_lexer_t *lex) {
     lex->interp_depth = idepth;
     if (nsave > 0)
         memcpy(lex->interp_stack, istack, sizeof(istack[0]) * (size_t)nsave);
+    lex->define_count = dcount;
 
     return tok;
 }

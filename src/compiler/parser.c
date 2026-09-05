@@ -19,6 +19,10 @@
 #include <stdlib.h>
 #include <stdarg.h>
 
+/* Caps shared by every depth-guarded recursion in the parser. Defined up
+ * here because parse_type_ref sits above the statement section. */
+#define ZAN_PARSER_MAX_TYPE_DEPTH 256
+
 /* ---- helpers ---- */
 
 static void parser_advance(zan_parser_t *p) {
@@ -264,6 +268,20 @@ static int array_suffix_rank(zan_parser_t *p) {
 static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
     zan_loc_t loc = p->current.loc;
 
+    /* `List<List<...>>` / `A.B<A.B<...>>>` / `(int,(int,(...)))` recurse this
+     * function once per nesting level with no other guard on the path, so
+     * ~8k levels of hostile source would exhaust the C stack before any
+     * diagnostic. Same contract as the expression depth cap in parse_unary.
+     * zan_binder_resolve_type recurses the same shape, so cutting the tree
+     * here bounds it there too. */
+    if (++p->type_depth > ZAN_PARSER_MAX_TYPE_DEPTH) {
+        zan_diag_emit(p->diag, DIAG_ERROR, loc,
+                      "type nesting too deep (max %d)",
+                      ZAN_PARSER_MAX_TYPE_DEPTH);
+        p->type_depth--;
+        return parser_error_node(p);
+    }
+
     /* C# tuple type: `(int, string)`. Each element may itself be named
      * (`(int x, string y)`); the names are dropped -- Item1/Item2 fields back
      * the tuple regardless. */
@@ -285,6 +303,7 @@ static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
             if (!parser_match(p, TK_COMMA)) break;
         }
         parser_expect(p, TK_RPAREN);
+        p->type_depth--;
         return tn;
     }
 
@@ -342,6 +361,7 @@ static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
         }
     } else {
         zan_diag_emit(p->diag, DIAG_ERROR, loc, "expected type");
+        p->type_depth--;
         return parser_error_node(p);
     }
 
@@ -407,9 +427,11 @@ static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
             zan_ast_list_init(&w->type_ref.type_args);
             cur = w;
         }
+        p->type_depth--;
         return cur;
     }
 
+    p->type_depth--;
     return type_node;
 }
 
@@ -1964,6 +1986,9 @@ static zan_ast_node_t *parse_expression(zan_parser_t *p) {
  * before any diagnostic fires; mirror the expression depth cap. */
 #define ZAN_PARSER_MAX_STMT_DEPTH 128
 
+/* Cap on type-reference nesting (generics, tuple types, dotted qualifiers):
+ * see the definition at the top of this file. */
+
 static zan_ast_node_t *parse_block(zan_parser_t *p) {
     if (p->stmt_depth >= ZAN_PARSER_MAX_STMT_DEPTH) {
         zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
@@ -2019,6 +2044,7 @@ static zan_token_t lexer_peek_n(zan_parser_t *p, int k) {
     uint32_t line = p->lex->line;
     uint32_t col = p->lex->col;
     int idepth = p->lex->interp_depth;
+    int dcount = p->lex->define_count;
     int nsave = idepth < ZAN_MAX_INTERP_DEPTH ? idepth : ZAN_MAX_INTERP_DEPTH;
     zan_interp_level_t istack[ZAN_MAX_INTERP_DEPTH];
     if (nsave > 0)
@@ -2029,6 +2055,7 @@ static zan_token_t lexer_peek_n(zan_parser_t *p, int k) {
     p->lex->line = line;
     p->lex->col = col;
     p->lex->interp_depth = idepth;
+    p->lex->define_count = dcount;
     if (nsave > 0)
         memcpy(p->lex->interp_stack, istack, sizeof(istack[0]) * (size_t)nsave);
     return tok;
@@ -2137,6 +2164,23 @@ static zan_ast_node_t *parse_embedded_stmt(zan_parser_t *p) {
         return parse_block(p);
     }
 
+    /* The single-statement path recurses parse_statement without passing
+     * through parse_block, so `if(a)if(a)...` chains nested thousands deep
+     * would exhaust the C stack before any diagnostic. Count the depth here
+     * too (same guard as parse_block); the braces path is already counted by
+     * parse_block itself, so only the bare-statement path increments. */
+    if (p->stmt_depth >= ZAN_PARSER_MAX_STMT_DEPTH) {
+        zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+                      "statement nesting too deep (max %d)",
+                      ZAN_PARSER_MAX_STMT_DEPTH);
+        parser_advance(p); /* consume one token so parsing can resume */
+        zan_ast_node_t *empty = zan_ast_new(p->arena, AST_BLOCK,
+                                            p->current.loc);
+        zan_ast_list_init(&empty->block.stmts);
+        return empty;
+    }
+    p->stmt_depth++;
+
     zan_loc_t loc = p->current.loc;
     if (looks_like_var_decl(p)) {
         zan_diag_emit(p->diag, DIAG_ERROR, loc,
@@ -2154,6 +2198,7 @@ static zan_ast_node_t *parse_embedded_stmt(zan_parser_t *p) {
     if (p->current.loc.offset == before && !parser_check(p, TK_EOF)) {
         parser_advance(p);
     }
+    p->stmt_depth--;
     return block;
 }
 
@@ -3054,7 +3099,9 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         parser_expect(p, TK_RPAREN);
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_LOCK_STMT, loc);
         n->lock_stmt.expr = expr;
-        n->lock_stmt.body = parse_statement(p);
+        /* parse_embedded_stmt, not parse_statement: a bare `lock(o)lock(o)...`
+         * chain must be depth-counted like the other single-statement bodies */
+        n->lock_stmt.body = parse_embedded_stmt(p);
         return n;
     }
     case TK_GOTO: {
@@ -3089,7 +3136,9 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         decl->var_decl.initializer = init;
         decl->var_decl.is_const = false;
         decl->var_decl.is_let = false;
-        zan_ast_node_t *body = parse_statement(p);
+        /* parse_embedded_stmt, not parse_statement: `fixed(...)` bodies chain
+         * like if/while bodies and must hit the same depth guard */
+        zan_ast_node_t *body = parse_embedded_stmt(p);
         zan_ast_node_t *blk = zan_ast_new(p->arena, AST_BLOCK, loc);
         zan_ast_list_init(&blk->block.stmts);
         zan_ast_list_push(&blk->block.stmts, decl, p->arena);
@@ -4281,6 +4330,14 @@ zan_ast_node_t *zan_parser_parse(zan_parser_t *p) {
     while (!parser_check(p, TK_EOF) && !parser_check(p, TK_RBRACE)) {
         if (!parse_top_level_decl(p, unit))
             parser_advance(p); /* skip to recover */
+        if (parser_check(p, TK_RBRACE)) {
+            /* A stray `}` at top level used to silently end the unit loop
+             * and drop every declaration after it; diagnose and skip it so
+             * following decls still parse. */
+            zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+                          "unexpected '}' at top level");
+            parser_advance(p);
+        }
     }
 
     return unit;
