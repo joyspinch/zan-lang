@@ -105,6 +105,20 @@ static zan_istr_t flatten_qname(zan_ast_node_t *q, zan_arena_t *ar) {
 
 /* ---- stamping (called per parsed file, before merge) ---- */
 
+/* Nested declarations are hoisted only after the input units have been merged.
+ * Stamp them now, while their source namespace/import list is still known. */
+static void stamp_decl_context(zan_ast_node_t *d, zan_istr_t ns,
+                               zan_ast_list_t *usings) {
+    if (!d) return;
+    d->ns_name = ns;
+    d->ns_usings = usings;
+    if (d->kind == AST_CLASS_DECL || d->kind == AST_STRUCT_DECL ||
+        d->kind == AST_INTERFACE_DECL || d->kind == AST_ENUM_DECL) {
+        for (int i = 0; i < d->type_decl.members.count; i++)
+            stamp_decl_context(d->type_decl.members.items[i], ns, usings);
+    }
+}
+
 void zan_nsresolve_stamp(zan_ast_node_t *unit, zan_arena_t *arena) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
     zan_istr_t ns = {0};
@@ -112,9 +126,7 @@ void zan_nsresolve_stamp(zan_ast_node_t *unit, zan_arena_t *arena) {
         ns = flatten_qname(unit->comp_unit.ns->namespace_decl.name, arena);
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {
         zan_ast_node_t *d = unit->comp_unit.decls.items[i];
-        if (!d) continue;
-        d->ns_name = ns;
-        d->ns_usings = &unit->comp_unit.usings;
+        stamp_decl_context(d, ns, &unit->comp_unit.usings);
     }
 }
 

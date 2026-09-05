@@ -1416,7 +1416,7 @@ static LLVMValueRef emit_index_safe_check(zan_irgen_t *g, LLVMValueRef index,
                                           LLVMValueRef length, bool allow_end,
                                           zan_loc_t loc, const char *kind) {
     if (!g->runtime_checks || !g->current_fn) return index;
-    emit_index_bounds_check(g, index, length, loc, kind);
+    emit_index_range_check(g, index, length, allow_end, loc, kind);
     if (LLVMGetTypeKind(LLVMTypeOf(index)) != LLVMIntegerTypeKind)
         return index;
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
