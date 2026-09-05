@@ -597,6 +597,9 @@ class WsAssembler {
     string data;
     int dataLen;
     int maxLen;
+    // 双倍增量的累积缓冲（显式容量），避免每帧按全长重新分配。
+    byte[] dataBuf;
+    int bufCap;
 
     /// 内部构造：状态复位，消息上限由调用方给定；经 WebSocketClient
     /// / 服务器各路径使用。
@@ -605,6 +608,8 @@ class WsAssembler {
         this.data = "";
         this.dataLen = 0;
         this.maxLen = maxLen;
+        this.dataBuf = null;
+        this.bufCap = 0;
     }
 
     /// <summary>喂入一个已解码的完整数据帧（控制帧不进这里）。
@@ -619,22 +624,31 @@ class WsAssembler {
             return 0 - 1;
         } else {
             this.opcode = frame.opcode;
-            this.data = "";
-            this.dataLen = 0;
         }
         int newLen = this.dataLen + frame.payloadLen;
         if (newLen > this.maxLen) { return 0 - 2; }
-        if (newLen > 0) {
-            // 显式长度拼接：`+` 按 strlen 定长，会在第一个 NUL
-            // 字节处截断二进制负载。
-            byte[] nb = new byte[newLen + 1];
-            for (int i = 0; i < this.dataLen; i = i + 1) {
-                nb[i] = (byte)this.data[i];
+        if (frame.payloadLen > 0) {
+            // 双倍增量的显式长度缓冲：整条消息只在交付时转换一次。
+            // 此前每帧都按 newLen 新分配并整体拷贝前缀，一条 16MiB
+            // 消息用 125 字节帧发送就是 ~13 万次 Feed、~1TB 的拷贝。
+            int cap = this.bufCap > 0 ? this.bufCap : 1024;
+            if (newLen > cap) {
+                while (cap < newLen) { cap = cap * 2; }
+            }
+            if (cap != this.bufCap) {
+                byte[] nb = new byte[cap + 1];
+                for (int i = 0; i < this.dataLen; i = i + 1) {
+                    nb[i] = (byte)this.data[i];
+                }
+                this.dataBuf = nb;
+                this.bufCap = cap;
             }
             for (int i = 0; i < frame.payloadLen; i = i + 1) {
-                nb[this.dataLen + i] = (byte)frame.payload[i];
+                this.dataBuf[this.dataLen + i] = (byte)frame.payload[i];
             }
-            this.data = nb.ToStr(0, newLen);
+            // 显式长度转换：`+` 按 strlen 定长，会在第一个 NUL 处截断
+            // 二进制负载；ToStr 按字节计数，NUL 原样保留。
+            this.data = this.dataBuf.ToStr(0, newLen);
         }
         this.dataLen = newLen;
         if (frame.fin) { return 1; }
@@ -652,6 +666,9 @@ class WsAssembler {
 
     /// <summary>重组完成消息的 opcode（Text 或 Binary）。</summary>
     int MessageOpcode() { return this.opcode; }
+
+    /// <summary>重组负载的字节数（Complete 复位后为 0）。</summary>
+    int MessageLen() { return this.dataLen; }
 }
 
 /// <summary>
@@ -718,14 +735,31 @@ class WebSocketClient {
 
         // 响应头可能被 TCP 分段；头之后的字节已是帧（可能含 NUL）。
         // 全部落进 reader 的显式长度缓冲，按字节扫描头部结束标记。
+        // 握手接收受 30 秒空闲窗口约束：接受了连接却一个字节不发
+        // 的服务端不能再永久钉住本协程（数据阶段的空闲等待仍不设限）。
         ws.reader = new WsReader(ws.conn.GetSocket());
+        HttpDeadlineToken watch = HttpDeadline.Arm(ws.conn.GetSocket(), 30000);
         int headerEnd = -1;
         while (headerEnd < 0) {
-            if (ws.reader.Buffered() > 65536) { ws.conn.Close(); return ws; }
+            if (ws.reader.Buffered() > 65536) {
+                HttpDeadline.Disarm(watch);
+                ws.conn.Close();
+                return ws;
+            }
             int n = await ws.reader.FillMore();
-            if (n == 0) { ws.conn.Close(); return ws; }
+            if (n == 0) {
+                HttpDeadline.Disarm(watch);
+                ws.conn.Close();
+                return ws;
+            }
+            if (HttpDeadline.Expired(watch)) {
+                HttpDeadline.Disarm(watch);
+                ws.conn.Close();
+                return ws;
+            }
             headerEnd = ws.reader.FindHeaderEnd();
         }
+        HttpDeadline.Disarm(watch);
         string head = ws.reader.Slice(headerEnd);
         if (head.Length < 12 || head.Substring(9, 3) != "101") {
             ws.conn.Close();

@@ -2220,12 +2220,17 @@ class HttpClient {
                     else { c = await conn.RecvAsync(65536); }
                     if (c.Length == 0) { finished = true; }
                     else {
+                        // 无 callPolicy 时 streamLimit 为 0，守卫被跳过：
+                        // 恶意对端发一条永不终止的 chunked 长度行就能把
+                        // pending 喂到任意大小（且每轮从头重扫，O(n²)）。
+                        // 1MiB 默认上限封死这条路径；合法 SSE 流的单个
+                        // 事件远小于此。
                         int pendingLimit = streamLimit;
                         if (failed && this.callPolicy != null) {
                             pendingLimit = this.callPolicy.MaxErrorBytes();
                         }
-                        if (pendingLimit > 0
-                            && pending.Length > pendingLimit - c.Length) {
+                        if (pendingLimit <= 0) { pendingLimit = 1048576; }
+                        if (pending.Length > pendingLimit - c.Length) {
                             if (failed) {
                                 errBody = HttpClient.KeepHead(errBody, pending);
                             } else {
@@ -2833,6 +2838,17 @@ class HttpClient {
                 else { c = await conn.RecvAsync(65536); }
                 if (c.Length == 0) { finished = true; }
                 else {
+                    // pending 无上限喂大：一条永不终止的分块长度行
+                    // （或声明正文却只发数据）能把内存撑爆。1MiB 上限
+                    // 按坏帧处理，已收字节落盘收尾。
+                    if (pending.Length + c.Length > 1048576) {
+                        fclose(outfp);
+                        this.SetDownloadError("响应分块缓冲超过 1048576 bytes");
+                        HttpDeadline.Disarm(watch);
+                        if (this.useTls) { stream.Close(); conn.Close(); ctx.Free(); }
+                        else { conn.Close(); }
+                        return 0 - 1;
+                    }
                     pending = pending + c;
                     // 超过 timeout*bandwidth 的下载只要仍在推进，就不应被
                     // 切断：截止时间是一个空闲窗口，

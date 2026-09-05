@@ -1,6 +1,7 @@
 using System;
 using System.Net.Sockets;
 using System.Net.Tls;
+using System.Net.Http;
 using System.Net.WebSocket;
 using System.Security.Cryptography;
 
@@ -60,15 +61,31 @@ class WssClient {
         if (sent <= 0) { client.CloseNow(); return client; }
 
         // 响应头可能被 TLS 记录边界拆开；头之后的字节已是帧
-        // （可能含 NUL）。全部落进 reader 的显式长度缓冲。
+        // （可能含 NUL）。全部落进 reader 的显式长度缓冲。握手接收
+        // 受 30 秒空闲窗口约束，与明文 ws 客户端一致。
         client.reader = WsReader.WrapTls(client.stream);
+        HttpDeadlineToken watch = HttpDeadline.Arm(client.conn.Sock(), 30000);
         int headerEnd = -1;
         while (headerEnd < 0) {
-            if (client.reader.Buffered() > 65536) { client.CloseNow(); return client; }
+            if (client.reader.Buffered() > 65536) {
+                HttpDeadline.Disarm(watch);
+                client.CloseNow();
+                return client;
+            }
             int n = await client.reader.FillMore();
-            if (n == 0) { client.CloseNow(); return client; }
+            if (n == 0) {
+                HttpDeadline.Disarm(watch);
+                client.CloseNow();
+                return client;
+            }
+            if (HttpDeadline.Expired(watch)) {
+                HttpDeadline.Disarm(watch);
+                client.CloseNow();
+                return client;
+            }
             headerEnd = client.reader.FindHeaderEnd();
         }
+        HttpDeadline.Disarm(watch);
         string head = client.reader.Slice(headerEnd);
         if (head.Length < 12 || head.Substring(9, 3) != "101") {
             client.CloseNow();

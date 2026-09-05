@@ -179,11 +179,16 @@ class HttpServer {
         client.Close();
     }
 
-    /// <summary>处理单个客户端连接。</summary>
+    /// <summary>处理单个客户端连接。连接计数必须在 finally 中归还：
+    /// 处理器抛出的异常会跳过顺序清理，泄漏的计数会让服务器在
+    /// maxConnections 处永久 503。</summary>
     async void HandleConnection(nint clientSock) {
-        await HttpServer.ServeConnection(clientSock, this.requestHandler,
-            this.maxHeaderBytes, this.maxRequestBytes, this.requestTimeout);
-        this.activeConnections = this.activeConnections - 1;
+        try {
+            await HttpServer.ServeConnection(clientSock, this.requestHandler,
+                this.maxHeaderBytes, this.maxRequestBytes, this.requestTimeout);
+        } finally {
+            this.activeConnections = this.activeConnections - 1;
+        }
     }
 
     /// <summary>将一个 HTTP/1.1 连接服务到底：帧解析（分段
@@ -252,6 +257,26 @@ class HttpServer {
                                   int maxHeaderBytes, int maxRequestBytes,
                                   int timeoutMs, HttpDeadlineToken watch) {
         TcpClient client = TcpClient.FromSocket(clientSock);
+        // 处理器抛出的异常会跳过顺序清理语句（见
+        // docs/bugs/throw-leaks-live-locals.md）：拆包器的 64KB 复用缓冲
+        // 与待处理缓冲、连接 fd、deadline 槽位都会泄漏。cleanup 交给
+        // finally，正常路径与异常路径共用同一份释放代码。
+        try {
+            return await HttpServer.ServeFramedInner(clientSock, handler, framer,
+                maxHeaderBytes, maxRequestBytes, timeoutMs, watch, client);
+        } finally {
+            HttpDeadline.Disarm(watch);
+            framer.Dispose();
+            client.Close();
+        }
+    }
+
+    /// <summary>ServeFramedCore 的循环体；释放见 ServeFramedCore 的 finally。</summary>
+    static async int ServeFramedInner(nint clientSock, HttpRequestHandler handler,
+                                  HttpFramer framer,
+                                  int maxHeaderBytes, int maxRequestBytes,
+                                  int timeoutMs, HttpDeadlineToken watch,
+                                  TcpClient client) {
         bool keepAlive = true;
         int reject = 0;
 
@@ -349,9 +374,6 @@ class HttpServer {
             int _n = await client.SendAsync(nai.Build());
         }
 
-        HttpDeadline.Disarm(watch);
-        framer.Dispose();
-        client.Close();
         return 0;
     }
 

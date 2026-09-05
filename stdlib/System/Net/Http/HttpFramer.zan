@@ -246,17 +246,25 @@ class HttpFramer {
     /// 累积，因此块里的 NUL 不会截断正文；累计长度超过
     /// <paramref name="maxBodyBytes"/> 立即拒绝，避免用无限多个小块
     /// 撑爆内存。畸形的长度行按 400 拒绝——不能猜，猜错就等于把
-    /// 剩余字节当成下一条请求（走私）。</summary>
+    /// 剩余字节当成下一条请求（走私）。等待 LF 的字节同样有上限
+    /// （8KB）：一条不终止的"长度行"不计入正文限额，若无上限，
+    /// 单条连接就能把待处理缓冲喂到任意大小。</summary>
     async int ReadChunked(HttpRequest req, int he, int maxBodyBytes) {
         ByteBuffer acc = ByteBuffer.Alloc(4096);
         int pos = he;              // 线路上的读游标
         int decoded = 0;
         while (true) {
-            // 长度行：至少要有一个 LF 才能确定它已完整到达。
+            // 长度行：至少要有一个 LF 才能确定它已完整到达。行内字节
+            // （含扩展）超过 8KB 视为畸形——合法长度行远短于此。
+            int lineStart = this.pend.Length();
             int lf = this.IndexOfLf(pos);
             while (lf < 0) {
                 int n = await this.Fill();
                 if (n == 0) { acc.Free(); return -1; }
+                if (this.pend.Length() - lineStart > 8192) {
+                    acc.Free();
+                    return 400;
+                }
                 lf = this.IndexOfLf(pos);
             }
             int size = 0;
@@ -313,14 +321,17 @@ class HttpFramer {
     }
 
     /// <summary>跳过结束块之后的 trailer 头部，返回其后的线路下标；
-    /// 对端中途关闭返回 -1。</summary>
+    /// 对端中途关闭返回 -1。单行超过 8KB 按 -1（畸形）处理：trailer
+    /// 行与长度行一样不受正文限额约束，必须自带上限。</summary>
     async int SkipTrailer(int from) {
         int pos = from;
         while (true) {
+            int lineStart = this.pend.Length();
             int lf = this.IndexOfLf(pos);
             while (lf < 0) {
                 int n = await this.Fill();
                 if (n == 0) { return -1; }
+                if (this.pend.Length() - lineStart > 8192) { return -1; }
                 lf = this.IndexOfLf(pos);
             }
             int stop = lf;

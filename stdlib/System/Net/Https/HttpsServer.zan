@@ -23,6 +23,7 @@ class HttpsServer {
     int port;
     bool running;
     int activeConnections;
+    int maxConnections;
     int maxRequestBytes;
     int maxHeaderBytes;
     int requestTimeoutMs;
@@ -34,6 +35,7 @@ class HttpsServer {
         this.port = port;
         this.running = false;
         this.activeConnections = 0;
+        this.maxConnections = 10000;
         this.maxRequestBytes = 1048576;
         this.maxHeaderBytes = 16384;
         this.requestTimeoutMs = 30000;
@@ -90,10 +92,24 @@ class HttpsServer {
         while (this.running) {
             nint clientSock = await this.listener.AcceptAsync();
             if (clientSock >= 0) {
+                if (this.activeConnections >= this.maxConnections) {
+                    // 与 HttpServer 同闸：TLS 连接各持 SSL/BIO 与缓冲，
+                    // 超限连接直接挂断，不为它做握手/堆协程。
+                    Socket.Close(clientSock);
+                    continue;
+                }
                 this.activeConnections = this.activeConnections + 1;
                 Task.Spawn(HandleConnection(clientSock));
             }
         }
+    }
+
+    /// <summary>设置最大并发连接数；超过上限的连接立即关闭（回 503 之前
+    /// 不做 TLS 握手——每个 TLS 连接都持有 SSL/BIO 与缓冲，必须像
+    /// HttpServer 一样设闸）。</summary>
+    HttpsServer SetMaxConnections(int max) {
+        this.maxConnections = max;
+        return this;
     }
 
     /// <summary>停止接受新连接：关闭监听套接字让挂起在
@@ -110,6 +126,20 @@ class HttpsServer {
     /// <see cref="HttpServer.HandleConnection"/> 相同的帧解析
     /// 服务其上的 HTTP/1.1 请求（支持 keep-alive 与流水线）。</summary>
     async void HandleConnection(nint clientSock) {
+        // 握手/服务过程中任何一步抛出异常（处理器、TLS 层）都会跳过
+        // 顺序清理，泄漏 fd、TlsStream、framer 缓冲、deadline 槽位与
+        // 连接计数——计数不归还会让服务器在语义满载后拒绝一切新连接。
+        // 释放统一交给 finally，正常与异常路径共用。
+        this.activeConnections = this.activeConnections + 1;
+        try {
+            await HttpsServer.HandleConnectionInner(clientSock);
+        } finally {
+            this.activeConnections = this.activeConnections - 1;
+        }
+    }
+
+    /// <summary>HandleConnection 的服务体；计数归还见 HandleConnection 的 finally。</summary>
+    async void HandleConnectionInner(nint clientSock) {
         Socket.SetNonBlocking(clientSock);
         // 握手阶段受同一个请求超时约束：沉默的对端不能借固定 30 秒
         // 握手窗口绕过 SetTimeout。
@@ -122,10 +152,11 @@ class HttpsServer {
         }
         if (stream == null) {
             Socket.Close(clientSock);
-            this.activeConnections = this.activeConnections - 1;
             return;
         }
 
+        // deadline/framer/stream 的释放交给下面的 try/finally；此前的
+        // 顺序清理会被任何异常（处理器抛出等）跳过。
         HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, this.requestTimeoutMs);
         bool keepAlive = true;
         // 与明文 HTTP 用同一个拆包器（字节源换成 TLS 记录层）：跨包
@@ -134,93 +165,94 @@ class HttpsServer {
         HttpFramer framer = HttpFramer.CreateTls(stream);
         int reject = 0;
 
-        while (keepAlive) {
-            int headerEnd = await framer.ReadHead(this.maxHeaderBytes);
-            if (headerEnd == -431) { reject = 431; break; }
-            if (headerEnd <= 0) { keepAlive = false; break; }
+        try {
+            while (keepAlive) {
+                int headerEnd = await framer.ReadHead(this.maxHeaderBytes);
+                if (headerEnd == -431) { reject = 431; break; }
+                if (headerEnd <= 0) { keepAlive = false; break; }
 
-            HttpRequest request = HttpRequest.Parse(framer.Head(headerEnd),
-                                                   headerEnd);
-            // 定界失败（Content-Length 溢出/重复不一致、非数字、
-            // 未实现的 Transfer-Encoding 等）→ 拒绝，不切分正文。
-            if (request.parseStatus != 0) {
-                reject = request.parseStatus;
-                break;
-            }
-            int bodyLen = request.contentLength;
-            if (bodyLen < 0) { bodyLen = 0; }
-            if (headerEnd + bodyLen > this.maxRequestBytes) { reject = 413; break; }
-            HttpDeadline.Touch(watch, this.requestTimeoutMs);
-            int bodyStatus = await framer.ReadBody(request,
-                this.maxRequestBytes - headerEnd);
-            if (bodyStatus > 0) { reject = bodyStatus; break; }
-            if (bodyStatus < 0) { keepAlive = false; break; }
-            framer.Consume(framer.RequestBytes());
-            keepAlive = request.keepAlive;
-
-            HttpDeadline.Touch(watch, this.requestTimeoutMs);
-            HttpResponse response = await ProcessRequest(request);
-            response = response.SetKeepAlive(keepAlive);
-
-            // 与明文 HTTP 相同的二进制正文处理：SendAsync 按 strlen 定长，
-            // 正文里的 NUL 会把响应截断。二进制正文用 BuildHeaders +
-            // bodyBytes 按显式字节数分块发送（Content-Length 与发送长度
-            // 同取自 BodyLength）；ToStr 按长度复制，NUL 原样加密上线。
-            if (response.IsBinary()) {
-                string head = response.BuildHeaders();
-                int _h2 = await stream.SendAsync(head, head.Length);
-                int blen = response.BodyLength();
-                int off = 0;
-                while (blen - off > 0) {
-                    int chunk = blen - off;
-                    if (chunk > 16384) { chunk = 16384; }
-                    string part = response.bodyBytes.ToStr(off, chunk);
-                    int _b2 = await stream.SendAsync(part, chunk);
-                    off = off + chunk;
+                HttpRequest request = HttpRequest.Parse(framer.Head(headerEnd),
+                                                       headerEnd);
+                // 定界失败（Content-Length 溢出/重复不一致、非数字、
+                // 未实现的 Transfer-Encoding 等）→ 拒绝，不切分正文。
+                if (request.parseStatus != 0) {
+                    reject = request.parseStatus;
+                    break;
                 }
-            } else {
-                string responseData = response.Build();
-                int _sent = await stream.SendAsync(responseData,
-                                                  responseData.Length);
+                int bodyLen = request.contentLength;
+                if (bodyLen < 0) { bodyLen = 0; }
+                if (headerEnd + bodyLen > this.maxRequestBytes) { reject = 413; break; }
+                HttpDeadline.Touch(watch, this.requestTimeoutMs);
+                int bodyStatus = await framer.ReadBody(request,
+                    this.maxRequestBytes - headerEnd);
+                if (bodyStatus > 0) { reject = bodyStatus; break; }
+                if (bodyStatus < 0) { keepAlive = false; break; }
+                framer.Consume(framer.RequestBytes());
+                keepAlive = request.keepAlive;
+
+                HttpDeadline.Touch(watch, this.requestTimeoutMs);
+                HttpResponse response = await ProcessRequest(request);
+                response = response.SetKeepAlive(keepAlive);
+
+                // 与明文 HTTP 相同的二进制正文处理：SendAsync 按 strlen 定长，
+                // 正文里的 NUL 会把响应截断。二进制正文用 BuildHeaders +
+                // bodyBytes 按显式字节数分块发送（Content-Length 与发送长度
+                // 同取自 BodyLength）；ToStr 按长度复制，NUL 原样加密上线。
+                if (response.IsBinary()) {
+                    string head = response.BuildHeaders();
+                    int _h2 = await stream.SendAsync(head, head.Length);
+                    int blen = response.BodyLength();
+                    int off = 0;
+                    while (blen - off > 0) {
+                        int chunk = blen - off;
+                        if (chunk > 16384) { chunk = 16384; }
+                        string part = response.bodyBytes.ToStr(off, chunk);
+                        int _b2 = await stream.SendAsync(part, chunk);
+                        off = off + chunk;
+                    }
+                } else {
+                    string responseData = response.Build();
+                    int _sent = await stream.SendAsync(responseData,
+                                                      responseData.Length);
+                }
+                response.Dispose();
+                response = null;
+
+                if (!keepAlive) {
+                    break;
+                }
             }
-            response.Dispose();
-            response = null;
 
-            if (!keepAlive) {
-                break;
+            if (reject == 431) {
+                HttpResponse tooLarge = HttpResponse.WithStatus(431, "Request Header Fields Too Large", "header block exceeds limit");
+                tooLarge = tooLarge.SetKeepAlive(false);
+                string data = tooLarge.Build();
+                int _s = await stream.SendAsync(data, data.Length);
+            } else if (reject == 413) {
+                HttpResponse tooLarge = HttpResponse.WithStatus(413, "Payload Too Large", "request exceeds limit");
+                tooLarge = tooLarge.SetKeepAlive(false);
+                string data = tooLarge.Build();
+                int _s = await stream.SendAsync(data, data.Length);
+            } else if (reject == 400) {
+                // 定界冲突/畸形长度：请求走私拒绝，必须关闭连接。
+                HttpResponse bad = HttpResponse.WithStatus(400, "Bad Request",
+                    "malformed request framing");
+                bad = bad.SetKeepAlive(false);
+                string data = bad.Build();
+                int _b = await stream.SendAsync(data, data.Length);
+            } else if (reject == 501) {
+                HttpResponse nai = HttpResponse.WithStatus(501, "Not Implemented",
+                    "Transfer-Encoding is not supported");
+                nai = nai.SetKeepAlive(false);
+                string data = nai.Build();
+                int _n = await stream.SendAsync(data, data.Length);
             }
+        } finally {
+            HttpDeadline.Disarm(watch);
+            framer.Dispose();
+            stream.Close();
+            Socket.Close(clientSock);
         }
-
-        if (reject == 431) {
-            HttpResponse tooLarge = HttpResponse.WithStatus(431, "Request Header Fields Too Large", "header block exceeds limit");
-            tooLarge = tooLarge.SetKeepAlive(false);
-            string data = tooLarge.Build();
-            int _s = await stream.SendAsync(data, data.Length);
-        } else if (reject == 413) {
-            HttpResponse tooLarge = HttpResponse.WithStatus(413, "Payload Too Large", "request exceeds limit");
-            tooLarge = tooLarge.SetKeepAlive(false);
-            string data = tooLarge.Build();
-            int _s = await stream.SendAsync(data, data.Length);
-        } else if (reject == 400) {
-            // 定界冲突/畸形长度：请求走私拒绝，必须关闭连接。
-            HttpResponse bad = HttpResponse.WithStatus(400, "Bad Request",
-                "malformed request framing");
-            bad = bad.SetKeepAlive(false);
-            string data = bad.Build();
-            int _b = await stream.SendAsync(data, data.Length);
-        } else if (reject == 501) {
-            HttpResponse nai = HttpResponse.WithStatus(501, "Not Implemented",
-                "Transfer-Encoding is not supported");
-            nai = nai.SetKeepAlive(false);
-            string data = nai.Build();
-            int _n = await stream.SendAsync(data, data.Length);
-        }
-
-        HttpDeadline.Disarm(watch);
-        framer.Dispose();
-        stream.Close();
-        Socket.Close(clientSock);
-        this.activeConnections = this.activeConnections - 1;
     }
 
     /// <summary>分发到 OnRequest 注册的处理器；未注册时返回占位页。</summary>

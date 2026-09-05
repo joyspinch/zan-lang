@@ -1,6 +1,7 @@
 using System;
 using System.Text;
 using System.Net.Sockets;
+using System.Net.Http;
 
 namespace System.Net.Sse;
 
@@ -160,15 +161,37 @@ class SseClient {
             + "Connection: keep-alive\r\n"
             + "\r\n");
 
-        // 消费响应头；\r\n\r\n 之后的内容就是流数据。
+        // 消费响应头；\r\n\r\n 之后的内容就是流数据。终止符必须出现：
+        // 凑不满就按握手失败处理（此前 64KB 上限退出时 bodyAt 为 -1，
+        // 垃圾字节会直接变成首条缓冲事件并宣告连接成功）。握手接收
+        // 受 30 秒空闲窗口约束：沉默的上游不能再永久钉住本协程。
+        HttpDeadlineToken watch = HttpDeadline.Arm(c.client.GetSocket(), 30000);
         string head = "";
         while (SseText.Find(head, "\r\n\r\n", 0) < 0 && head.Length < 65536) {
             string chunk = await c.client.RecvAsync(4096);
-            if (chunk.Length == 0) { c.client.Close(); return c; }
+            if (chunk.Length == 0) {
+                HttpDeadline.Disarm(watch);
+                c.client.Close();
+                return c;
+            }
+            if (HttpDeadline.Expired(watch)) {
+                HttpDeadline.Disarm(watch);
+                c.client.Close();
+                return c;
+            }
             head = head + chunk;
         }
-        if (SseText.Find(head, " 200 ", 0) < 0) { c.client.Close(); return c; }
+        HttpDeadline.Disarm(watch);
         int bodyAt = SseText.Find(head, "\r\n\r\n", 0);
+        // 状态行必须是 "HTTP/1.x 200"：`" 200 "` 全头扫描会把正文/头里
+        // 恰好带 " 200 " 的 404 也当成功。状态码固定在状态行第 10..12 位。
+        bool ok = false;
+        if (bodyAt >= 0 && head.Length >= 12
+            && (head.Substring(0, 5) == "HTTP/")
+            && (head.Substring(9, 3) == "200")) {
+            ok = true;
+        }
+        if (!ok) { c.client.Close(); return c; }
         c.buf = head.Substring(bodyAt + 4, head.Length - bodyAt - 4);
         c.connected = true;
         return c;

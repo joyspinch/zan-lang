@@ -2224,49 +2224,59 @@ class Worker {
 
     /// TCP 连接生命周期：先触发 onConnect，再循环收取数据交给 onMessage
     /// （未设回调时默认回显），非空返回串回发；对端断开后触发 onClose 并
-    /// 归还连接计数。
+    /// 归还连接计数。回调抛出的异常会跳过顺序清理（Close/DropConn），
+    /// 计数漂移会让服务器在 maxConnections 处永久拒绝新连接，因此
+    /// 清理在 finally 中执行。
     async void HandleTcp(nint clientSock) {
         TcpClient client = TcpClient.FromSocket(clientSock);
         Connection conn = NewConnection(clientSock);
-        ConnectionHandler onUp = this.OpenHandler();
-        if (onUp != null) { await onUp(conn); }
+        try {
+            ConnectionHandler onUp = this.OpenHandler();
+            if (onUp != null) { await onUp(conn); }
 
-        MessageHandler onData = this.MessageHandlerOf();
-        bool active = true;
-        while (active && !conn.closed) {
-            string data = await client.RecvReuseAsync();
-            if (data.Length == 0) {
-                active = false;
-            } else {
-                BumpStat();
-                string response = "";
-                if (onData != null) {
-                    response = await onData(conn, data);
-                    if (response == null) { response = ""; }
+            MessageHandler onData = this.MessageHandlerOf();
+            bool active = true;
+            while (active && !conn.closed) {
+                string data = await client.RecvReuseAsync();
+                if (data.Length == 0) {
+                    active = false;
                 } else {
-                    response = data;   // default: echo
-                }
-                if (response.Length > 0) {
-                    int _n = await client.SendAsync(response);
-                    BumpSent();
+                    BumpStat();
+                    string response = "";
+                    if (onData != null) {
+                        response = await onData(conn, data);
+                        if (response == null) { response = ""; }
+                    } else {
+                        response = data;   // default: echo
+                    }
+                    if (response.Length > 0) {
+                        int _n = await client.SendAsync(response);
+                        BumpSent();
+                    }
                 }
             }
+        } finally {
+            client.Close();
+            conn.closed = true;
+            this.DropConn();
+            ConnectionCloseHandler onDown = this.onClose;
+            if (onDown != null) { await onDown(conn); }
         }
-        client.Close();
-        conn.closed = true;
-        this.DropConn();
-        if (this.onClose != null) { await this.onClose(conn); }
     }
 
     // ---- http ----
 
     /// HTTP framing, limits and dispatch live in exactly one place --
     /// HttpServer.ServeConnection -- which this protocol runs as-is, so the
-    /// Worker path and a bare HttpServer cannot drift apart.
+    /// Worker path and a bare HttpServer cannot drift apart. DropConn 在
+    /// finally 中：ServeConnection 抛出时计数同样必须归还。
     async void HandleHttp(nint clientSock) {
-        await HttpServer.ServeConnection(clientSock, this.RequestHandler(),
-            this.maxHeaderBytes, this.maxRequestBytes, this.requestTimeout);
-        this.DropConn();
+        try {
+            await HttpServer.ServeConnection(clientSock, this.RequestHandler(),
+                this.maxHeaderBytes, this.maxRequestBytes, this.requestTimeout);
+        } finally {
+            this.DropConn();
+        }
     }
 
     // ---- websocket ----
@@ -2281,8 +2291,20 @@ class Worker {
         // The head is read with the shared HTTP framer, so the bytes that
         // arrive with it (an HTTP body, pipelined WebSocket frames) keep their
         // exact count instead of being length-counted with strlen.
+        // 握手读取与明文 HTTP 一样受 requestTimeout 约束（慢速客户端
+        // 每秒滴一个字节就能永久钉住协程与 64KB 复用缓冲）；WS 循环
+        // 的空闲不设限，与 HTTP keep-alive 的请求间空闲一致。
+        HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, this.requestTimeout);
         HttpFramer framer = HttpFramer.Create(clientSock);
-        int headerEnd = await framer.ReadHead(this.maxHeaderBytes);
+        int headerEnd = 0;
+        try {
+            headerEnd = await framer.ReadHead(this.maxHeaderBytes);
+            HttpDeadline.Disarm(watch);
+            watch = null;
+        } finally {
+            // ReadHead 半途抛出时 deadline 槽位必须释放（幂等）。
+            HttpDeadline.Disarm(watch);
+        }
         if (headerEnd <= 0) {
             framer.Dispose();
             client.Close();
@@ -2301,6 +2323,8 @@ class Worker {
             this.DropConn();
             return;
         }
+        // 之后的路径全部收口到帧循环末尾的统一清理；本函数内不再
+        // 有提前 return。
 
         StringBuilder sb = new StringBuilder();
         sb.Append("HTTP/1.1 101 Switching Protocols\r\n");
@@ -2332,7 +2356,11 @@ class Worker {
         // onOpen 必须在 wsWriter/wsClient 挂载并登记之后触发：回调里的
         // conn.Push/PushBinary 依赖 wsWriter 非 null（否则静默返回 false，
         // 欢迎帧丢失且无任何错误迹象）。
+        // WS 帧循环的收尾清理在 finally 中：onOpen/onFrameData 抛出时
+        // Close/WsConnRemove/DropConn 一个都不能少——连接留在广播表里
+        // 会对死 socket 持续推送，计数漂移则自我拒绝服务。
         ConnectionHandler onUp = this.OpenHandler();
+        try {
         if (onUp != null) { await onUp(conn); }
         WsAssembler asm = new WsAssembler(reader.MaxLen());
         MessageHandler onFrameData = this.MessageHandlerOf();
@@ -2416,55 +2444,66 @@ class Worker {
                 writer.Append(encoded, WsFrame.HeaderLen(respLen) + respLen);
                 BumpSent();
             }
+        }   // while (active && !conn.closed)
+        } finally {
+            client.Close();
+            conn.closed = true;
+            conn.wsWriter = null;    // Push 之后拒绝写已关闭的 socket
+            this.WsConnRemove(conn);
+            this.DropConn();
+            ConnectionCloseHandler onDown = this.onClose;
+            if (onDown != null) { await onDown(conn); }
         }
-
-        client.Close();
-        conn.closed = true;
-        conn.wsWriter = null;    // Push 之后拒绝写已关闭的 socket
-        this.WsConnRemove(conn);
-        this.DropConn();
-        if (this.onClose != null) { await this.onClose(conn); }
     }
 
     // ---- sse ----
 
     /// SSE 订阅：读取 GET 请求头后回 200 text/event-stream（带 no-cache 与
     /// CORS 通配头），把连接包成 SseConnection 交给 onSseSubscriber（未设
-    /// 回调时立即关闭）；此后连接由应用持有。
+    /// 回调时立即关闭）；此后连接由应用持有。请求头读取与 HTTP 路径
+    /// 一样武装 requestTimeout（慢速滴字客户端不能永久钉住连接），
+    /// 清理在 finally 中执行——onSseSubscriber 抛出时 DropConn 不能丢。
     async void HandleSse(nint clientSock) {
         TcpClient client = TcpClient.FromSocket(clientSock);
+        HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, this.requestTimeout);
 
         // Read the subscriber's GET request head.
         string req = "";
-        while (HttpServer.FindHeaderEnd(req) < 0 && req.Length < 65536) {
-            string chunk = await client.RecvAsync(4096);
-            if (chunk.Length == 0) {
-                client.Close();
-                this.DropConn();
-                return;
+        try {
+            while (HttpServer.FindHeaderEnd(req) < 0 && req.Length < 65536) {
+                string chunk = await client.RecvAsync(4096);
+                if (chunk.Length == 0) {
+                    client.Close();
+                    return;
+                }
+                req = req + chunk;
             }
-            req = req + chunk;
+        } finally {
+            HttpDeadline.Disarm(watch);
         }
         string path = "/";
         HttpRequest head = HttpRequest.Parse(req);
         if (head.path.Length > 0) { path = head.path; }
 
-        int _n = await client.SendAsync("HTTP/1.1 200 OK\r\n"
-            + "Content-Type: text/event-stream\r\n"
-            + "Cache-Control: no-cache\r\n"
-            + "Connection: keep-alive\r\n"
-            + "Access-Control-Allow-Origin: *\r\n"
-            + "\r\n");
+        try {
+            int _n = await client.SendAsync("HTTP/1.1 200 OK\r\n"
+                + "Content-Type: text/event-stream\r\n"
+                + "Cache-Control: no-cache\r\n"
+                + "Connection: keep-alive\r\n"
+                + "Access-Control-Allow-Origin: *\r\n"
+                + "\r\n");
 
-        BumpStat();
-        SseConnection sse = SseConnection.Of(client, path);
-        if (this.onSseSubscriber != null) {
-            await this.onSseSubscriber(sse);
-        } else {
-            sse.Close();
+            BumpStat();
+            SseConnection sse = SseConnection.Of(client, path);
+            if (this.onSseSubscriber != null) {
+                await this.onSseSubscriber(sse);
+            } else {
+                sse.Close();
+            }
+        } finally {
+            // The application owns the SseConnection from here.
+            this.DropConn();
         }
-        // The application owns the SseConnection from here.
-        this.DropConn();
     }
 
     // ---- mqtt ----
@@ -2472,8 +2511,11 @@ class Worker {
     /// 把连接交给内置的 MqttBroker.Global() 处理；mqtt 协议没有应用回调。
     async void HandleMqtt(nint clientSock) {
         BumpStat();
-        await MqttBroker.Global().HandleConnection(clientSock);
-        this.DropConn();
+        try {
+            await MqttBroker.Global().HandleConnection(clientSock);
+        } finally {
+            this.DropConn();
+        }
     }
 
     // ---- udp ----
