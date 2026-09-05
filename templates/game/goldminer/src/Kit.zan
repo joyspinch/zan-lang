@@ -214,6 +214,44 @@ class Host {
         return ms;
     }
 
+    // ---- 事件驱动重绘门控(与 stdlib Game.Kit.Host 同一套机制) ----
+    // redrawMs > 0 时,只有"来了输入"或"心跳到期"的帧才真正渲染,
+    // 其余帧把 CPU 让出去(8ms 小片睡眠,保证输入延迟有界)。摆钩/
+    // 收线/拆弹这些场景动画每帧都在变,门控主要收益在空闲等待与
+    // 结算停留:同样的 60fps 预算,没有变化的帧不再整帧重绘+合成。
+    int redrawMs;
+    int nextRedraw;
+    bool hadEvent;
+
+    public void SetRedrawInterval(int ms) {
+        if (ms < 0) { ms = 0; }
+        this.redrawMs = ms;
+    }
+
+    public void MarkEvent() { this.hadEvent = true; }
+
+    public bool ShouldRender() {
+        if (this.redrawMs <= 0) { return true; }
+        int now = Sdl.Ticks();
+        if (this.hadEvent || now >= this.nextRedraw) {
+            this.hadEvent = false;
+            this.nextRedraw = now + this.redrawMs;
+            return true;
+        }
+        int redraw = this.redrawMs;
+        int pace = this.EffectiveFrameMs();
+        if (pace > redraw) {
+            if (this.nextRedraw < now) { this.nextRedraw = now; }
+            if (now >= this.nextRedraw) {
+                this.nextRedraw = now + pace;
+                return true;
+            }
+        }
+        int slack = this.nextRedraw - now;
+        if (slack > 8) { Sdl.Delay(8); }
+        return false;
+    }
+
     void PaceFrame() {
         int ms = this.EffectiveFrameMs();
         if (ms <= 0) { return; }
@@ -238,7 +276,9 @@ class Host {
 
     public void OnWindowEvent(int type) {
         // 失焦/聚焦切换后台节奏（见 SetIdleFps）：后台窗口不再是用户的
-        // 活动表面，全速重绘只烧 CPU。
+        // 活动表面，全速重绘只烧 CPU。窗口事件本身也算"输入"，重绘
+        // 门控据此立即渲染一帧。
+        this.hadEvent = true;
         if (type == SdlEventType.WindowFocusLost()) { this.focused = false; }
         if (type == SdlEventType.WindowFocusGained()) { this.focused = true; }
         if (type == SdlEventType.WindowMinimized()) {
