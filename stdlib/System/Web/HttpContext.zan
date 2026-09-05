@@ -153,11 +153,15 @@ class HttpContext {
     /// multipart 请求里的文本字段在服务端不可见。文件部件不在这里展开：
     /// 流式上传路径的正文已整体落盘（WebApp.StreamBodyToFile），内存路径
     /// 的文件部件由处理器按需取用——只有带 filename= 的部件被跳过，
-    /// 其余部件的值原样进入 form（multipart 值不做百分号解码）。</summary>
+    /// 其余部件的值原样进入 form（multipart 值不做百分号解码）。
+    /// 与 ParseFormBody 一样先 Clear：构造函数可能已按首个 TCP 分段的
+    /// 部分正文解析过一次，正文缓冲齐后的二次解析必须整体重放，
+    /// 不能把不完整的字段值留在表里。</summary>
     static void ParseMultipartFields(HttpRequest req, HttpContext ctx) {
         string ctype = req.contentType;
         int bIdx = HttpContext.FindNoCaseFrom(ctype, "boundary=", 0);
         if (bIdx < 0) { return; }
+        ctx.form.Clear();
         int bs = bIdx + 9;
         int be = bs;
         while (be < ctype.Length && (ctype[be] & 255) != 59) { be = be + 1; }
@@ -874,6 +878,11 @@ class HttpContext {
     /// keepAlive 的 Connection 头、Server 头，再接已清洗的自定义头。
     /// 字节正文不并入（防 NUL 截断），由调用方按 BodyLength 另行发送。
     string BuildResponse(bool keepAlive) {
+        // HEAD 的应答头必须与 GET 完全一致（含 Content-Length），
+        // 但正文一律不发送（RFC 9110 §9.3.2）。不剥离的话 keep-alive
+        // 连接上正文会被当作下一个请求解析——请求走私；非 keep-alive
+        // 的客户端则可能收到与声明不符的额外字节。
+        bool omitBody = this.method == "HEAD" && this.bodyBytes == null;
         StringBuilder sb = new StringBuilder();
         sb.Append("HTTP/1.1 ");
         sb.Append(HttpContext.Itoa(this.status));
@@ -895,7 +904,7 @@ class HttpContext {
         sb.Append("\r\n\r\n");
         // A byte body is NOT appended: it would be cut at its first NUL. The
         // caller sends this header block and then the bytes by count.
-        if (this.bodyBytes == null) { sb.Append(this.body); }
+        if (this.bodyBytes == null && !omitBody) { sb.Append(this.body); }
         return sb.ToString();
     }
 

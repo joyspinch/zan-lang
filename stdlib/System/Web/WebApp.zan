@@ -362,7 +362,21 @@ class WebApp {
     /// 缓冲内存正文（超限 413）→ 解析表单 → Dispatch → 写回应答，直到
     /// 对端断开或非 keep-alive 为止。每个请求重置一次空闲期限（防
     /// slowloris）；SSE/WS 劫持的连接由 handler 接管，循环随即结束。
+    /// 清理走 finally：即便管线里有未被 catch 的异常展开到这一层，
+    /// deadline 槽位、framer 缓冲、套接字与连接计数也必须归位。
     async void HandleConnection(nint clientSock) {
+        try {
+            await this.HandleConnectionInner(clientSock);
+        } finally {
+            Socket.Close(clientSock);
+        }
+    }
+
+    /// HandleConnection 的主体：watch/framer/client 三个局部资源
+    /// 在这里创建，正常结束路径统一清理；套接字本身的 Close 由
+    /// HandleConnection 的 finally 负责（ShutdownBoth 无法替代——
+    /// 劫持连接之后的收尾也要真正释放描述符）。
+    async void HandleConnectionInner(nint clientSock) {
         Socket.SetNoDelay(clientSock);
         TcpClient client = TcpClient.FromSocket(clientSock);
         // Framing is the shared HttpFramer: pending bytes are held with an
@@ -530,6 +544,7 @@ class WebApp {
         if (bodyInBuf > 0) {
             string firstChunk = framer.Slice(headerEnd, bodyInBuf);
             int _w0 = (int)fwrite(firstChunk, 1, bodyInBuf, fp);
+            if (_w0 < bodyInBuf) { int _c0 = fclose(fp); return ""; }
             have = bodyInBuf;
         }
         framer.Consume(headerEnd + have);
@@ -538,7 +553,11 @@ class WebApp {
             int n = await Socket.RecvIntoAsync(sock, buf, 65535);
             if (n <= 0) { int _c1 = fclose(fp); return ""; }
             if (have + n > total) { n = total - have; }
+            // fwrite 短写（磁盘满/配额）必须当失败处理：不校验的话
+            // have 照常推进，落盘文件被静默截断，调用方拿到一个
+            // 看似成功的残缺文件。
             int _w = (int)fwrite(buf, 1, n, fp);
+            if (_w < n) { int _c3 = fclose(fp); return ""; }
             have = have + n;
         }
         int _c2 = fclose(fp);

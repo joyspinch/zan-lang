@@ -86,27 +86,24 @@ class MqttClient {
     // 使控制报文解析与负载提取
     // 无论 broker 如何分段写入都能保持对齐。
 
-    // 它们通过 Socket.Recv 读取（返回实际字节数），
-    // 而非 TcpClient.RecvAsync（返回 NUL 结尾的字符串）：MQTT
-    // 报文包含 NUL 字节，因此不能依赖字符串长度来报告
-    // 实际到达的字节数。我们仍通过 ReadReady 在 reactor 上挂起。
+    // 它们通过真正的重叠接收（RecvOv）读取：单次 recv 只返回
+    // 当前可用的字节，而 ReadReady 的零字节可读性探测会在数据
+    // 尚未到达时立即完成，此时 Recv 返回的 would-block（-1）会被
+    // 误判成对端关闭。RecvOv 投递真正的接收操作，只有读到数据
+    // 或对端关闭时才完成；返回 0（或负数，运行时按对端关闭上报）
+    // 即流结束。MQTT 报文含 NUL 字节，因此也不能用依赖字符串
+    // 长度的接收接口。
 
     /// <summary>精确读取一个字节，对端关闭时返回 -1。</summary>
     async int ReadByteAsync() {
         nint sock = this.conn.GetSocket();
         byte[] b = new byte[2];
-        while (true) {
-            await Socket.ReadReady(sock);
-            int n = Socket.Recv(sock, b, 1);
-            if (n == 0) {
-                this.connected = false;
-                return -1;
-            }
-            if (n > 0) {
-                return b[0] & 255;
-            }
+        int n = await Socket.RecvOv(sock, b, 1);
+        if (n <= 0) {
+            this.connected = false;
+            return -1;
         }
-        return -1;
+        return b[0] & 255;
     }
 
     /// <summary>在 IO reactor 上挂起，精确读取 <paramref name="need"/> 字节，
@@ -117,17 +114,14 @@ class MqttClient {
         nint sock = this.conn.GetSocket();
         int got = 0;
         while (got < need) {
-            await Socket.ReadReady(sock);
-            int n = Socket.Recv(sock, tmp, need - got);
-            if (n == 0) {
+            int n = await Socket.RecvOv(sock, tmp, need - got);
+            if (n <= 0) {
                 this.connected = false;
                 return buf;
             }
-            if (n > 0) {
-                for (int i = 0; i < n; i = i + 1) {
-                    buf[got] = (byte)(tmp[i]);
-                    got = got + 1;
-                }
+            for (int i = 0; i < n; i = i + 1) {
+                buf[got] = (byte)(tmp[i]);
+                got = got + 1;
             }
         }
         return buf;
@@ -199,6 +193,16 @@ class MqttClient {
             return -1;
         }
         int remainLen = await ReadRemainingLenAsync();
+        if (remainLen < 0) {
+            return -1;
+        }
+        // 不设上限时恶意/错乱的 broker 报一个巨大 remainLen 会让
+        // ReadBytesAsync 预分配同等大小的两个缓冲——与 broker 端
+        // 同样的 16 MiB 上限。
+        if (remainLen > 16777216) {
+            this.connected = false;
+            return -1;
+        }
         if (remainLen > 0) {
             byte[] _body = await ReadBytesAsync(remainLen);
         }
@@ -381,6 +385,12 @@ class MqttClient {
             }
             int remainLen = await ReadRemainingLenAsync();
             if (remainLen < 0) {
+                this.connected = false;
+                return "";
+            }
+            if (remainLen > 16777216) {
+                // 恶意/错乱 broker 的巨型 remainLen：直接判流不可信，
+                // 不预分配两个 16 MiB+ 的缓冲。
                 this.connected = false;
                 return "";
             }
