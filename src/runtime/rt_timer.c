@@ -182,6 +182,34 @@ static int zan_soft_seen(const char *text) {
     return 0;
 }
 
+/* Dedup table for zan_rt_soft_note3, keyed on the guard site's (file, line,
+ * col) triple instead of the composed text. note3 composes into a stack
+ * buffer, so a pointer-identity table would store a dangling stack address:
+ * reports from a different thread or call depth would miss (log flood) and a
+ * later site reusing that stack slot would be suppressed without ever having
+ * reported. `file` is the emitter's per-module interned global, so pointer
+ * identity on it is stable. No allocation: the fail-soft path must not
+ * depend on the heap being healthy. */
+static struct {
+    const char *file;
+    unsigned line;
+    unsigned col;
+} g_soft_seen3[ZAN_SOFT_MAX_SITES];
+static int g_soft_seen3_count;
+
+static int zan_soft_seen3(const char *file, unsigned line, unsigned col) {
+    for (int i = 0; i < g_soft_seen3_count; i++)
+        if (g_soft_seen3[i].file == file && g_soft_seen3[i].line == line &&
+            g_soft_seen3[i].col == col) return 1;
+    if (g_soft_seen3_count < ZAN_SOFT_MAX_SITES) {
+        g_soft_seen3[g_soft_seen3_count].file = file;
+        g_soft_seen3[g_soft_seen3_count].line = line;
+        g_soft_seen3[g_soft_seen3_count].col = col;
+        g_soft_seen3_count++;
+    }
+    return 0;
+}
+
 #if defined(_WIN32)
 static void zan_soft_log_path(char *path, size_t cap) {
     DWORD n = GetModuleFileNameA(NULL, path, (DWORD)cap);
@@ -334,7 +362,7 @@ void zan_rt_soft_note3(const char *file, unsigned line, unsigned col,
     buf[n] = '\n';
     buf[n + 1] = '\0';
     timer_lock();
-    int seen = zan_soft_seen(buf);
+    int seen = zan_soft_seen3(file, line, col);
     timer_unlock();
     if (seen) return;
     fprintf(stderr, "%s", buf);
@@ -672,7 +700,11 @@ long long zan_timer_dispatch_due(void) {
 }
 
 long long zan_timer_pending(void) {
-    return g_live;
+    /* Writers mutate g_live under the timer lock, but this read is lock-free
+     * (it runs once per scheduler iteration on every --async-workers worker).
+     * A plain load tears on 32-bit targets, and a torn 0 makes the driver's
+     * idle check declare the pool finished while a timer is still pending. */
+    return __atomic_load_n(&g_live, __ATOMIC_RELAXED);
 }
 
 

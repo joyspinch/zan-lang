@@ -350,7 +350,17 @@ static void zan_make_names(const char *name, char map_name[96]) {
  * recycled from the dead holder. Mutual exclusion itself is never violated
  * (reclaim is gated on the liveness probe); fixing this properly means
  * mixing a per-process creation-time nonce into bits 30:0 across both
- * platforms and every probe site. */
+ * platforms and every probe site.
+ *
+ * The liveness probe runs between the word load and the reclaim CAS, so a
+ * second narrow window exists: the probe may see the holder dead, the OS may
+ * then recycle the pid to a NEW process that acquires the word (bit-identical
+ * value), and the CAS would clear a live holder's lock. The re-load before
+ * the CAS only proves the word did not change in between, which is exactly
+ * the hazard, so reclaim re-runs the probe and aborts if the pid has come
+ * back alive. This shrinks the window from "pid recycled between probe and
+ * CAS" to "recycled AND re-acquired AND died again within one probe"; a
+ * nonce in the word is the complete fix. */
 #define ZAN_LOCK_HELD_BIT 0x80000000u
 #define ZAN_LOCK_PID_MASK 0x7FFFFFFFu
 
@@ -392,6 +402,7 @@ static void zan_lock_word_acquire(volatile uint32_t *word) {
             LONG held = InterlockedCompareExchange((volatile LONG *)word,
                                                    0, 0);
             if ((held & (LONG)ZAN_LOCK_HELD_BIT) &&
+                !zan_pid_alive((uint32_t)held & ZAN_LOCK_PID_MASK) &&
                 !zan_pid_alive((uint32_t)held & ZAN_LOCK_PID_MASK)) {
                 InterlockedCompareExchange((volatile LONG *)word, 0, held);
             }
@@ -416,6 +427,7 @@ static void zan_lock_word_acquire(volatile uint32_t *word) {
         } else {
             uint32_t held = __atomic_load_n(word, __ATOMIC_RELAXED);
             if ((held & ZAN_LOCK_HELD_BIT) &&
+                !zan_pid_alive(held & ZAN_LOCK_PID_MASK) &&
                 !zan_pid_alive(held & ZAN_LOCK_PID_MASK)) {
                 __atomic_compare_exchange_n(word, &held, 0, 0,
                                             __ATOMIC_RELEASE,
@@ -1444,8 +1456,11 @@ int64_t zan_shared_table_create_anon(
      * runtime also builds for macOS. */
     static uint32_t anon_seq = 0;
     char shm_name[64];
+    /* Two threads creating anonymous tables concurrently raced this counter
+     * and could collide on the O_EXCL name, failing one create spuriously. */
+    uint32_t seq = __atomic_fetch_add(&anon_seq, 1, __ATOMIC_RELAXED);
     snprintf(shm_name, sizeof(shm_name), "/zan_table_%ld_%u_%u",
-             (long)getpid(), (unsigned)time(NULL), anon_seq++);
+             (long)getpid(), (unsigned)time(NULL), seq);
     int fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, 0600);
     if (fd < 0) {
         zan_shared_table_free(table);
@@ -2242,7 +2257,13 @@ int32_t zan_shared_table_expire_at(
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table || !key || expires_at_ms < 0) return 0;
     zan_struct_lock(table->header);
-    zan_purge_expired_locked(table->header, zan_wall_now_ms(), UINT64_MAX);
+    /* Batched, not UINT64_MAX: the expiry_set below overwrites the deadline
+     * regardless of whether the row's old expiry was swept, so deferring part
+     * of the sweep to later ops cannot change the result -- same argument as
+     * the delete_at batch. UINT64_MAX here let one Expire call on a mass-TTL
+     * table hold this cross-process lock for a full wipe of every row. */
+    zan_purge_expired_locked(table->header, zan_wall_now_ms(),
+                             ZAN_PURGE_MAX_BATCH);
     unsigned char *row = zan_find_row(table->header, key, 0);
     if (row) {
         zan_row_lock(row);
@@ -2566,6 +2587,9 @@ long long zan_mmap_create(const char *name, long long size) {
     DWORD hi = (DWORD)(((unsigned long long)size) >> 32);
     DWORD lo = (DWORD)((unsigned long long)size & 0xFFFFFFFFULL);
     int wlen = MultiByteToWideChar(CP_UTF8, 0, name, -1, NULL, 0);
+    if (wlen <= 0) return 0;   /* invalid UTF-8: calloc(0) would hand a
+                                * zero-byte buffer to the conversion call and
+                                * the API would scan it as a wide string */
     wchar_t *wname = (wchar_t *)calloc((size_t)wlen, sizeof(wchar_t));
     if (!wname) return 0;
     MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, wlen);
@@ -2603,6 +2627,7 @@ long long zan_mmap_open(const char *name, long long size) {
     if (!name || !name[0]) return 0;
 #ifdef _WIN32
     int wlen = MultiByteToWideChar(CP_UTF8, 0, name, -1, NULL, 0);
+    if (wlen <= 0) return 0;   /* invalid UTF-8: see zan_mmap_create */
     wchar_t *wname = (wchar_t *)calloc((size_t)wlen, sizeof(wchar_t));
     if (!wname) return 0;
     MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, wlen);
@@ -2637,6 +2662,7 @@ long long zan_mmap_from_file(const char *path, long long size) {
     if (!path || !path[0]) return 0;
 #ifdef _WIN32
     int wlen = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+    if (wlen <= 0) return 0;   /* invalid UTF-8: see zan_mmap_create */
     wchar_t *wpath = (wchar_t *)calloc((size_t)wlen, sizeof(wchar_t));
     if (!wpath) return 0;
     MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, wlen);
