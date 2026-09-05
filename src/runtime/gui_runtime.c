@@ -6,7 +6,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(ZAN_GUI_OHOS)
 #include <malloc.h> /* mallinfo: process-wide malloc attribution in mem_report */
 #endif
 #include <math.h>
@@ -4122,6 +4122,25 @@ EXPORT const char *zan_gui_mem_report(void) {
 #endif
              (double)g_upload_last_bytes / 1048576.0,
              g_upload_last_full ? " full" : " dirty");
+#else
+    /* OHOS musl provides mallinfo like bionic: attribute the process-wide
+     * malloc view the same way the Android line does (heap used/free, the
+     * Zan object heap minus the caches above). */
+#if defined(__ANDROID__) || defined(ZAN_GUI_OHOS)
+    struct mallinfo mi2 = mallinfo();
+    snprintf(buf, sizeof(buf),
+             "atl %.1fM/%d cov %.2fM img %d/%.1fM mimg %.1fM "
+             "surf %.1fM blur %d/%.1fM snap %d/%.1fM "
+             "heap %.1f/%.1fM",
+             (double)g_atlas_bytes / 1048576.0, atlas_live,
+             (double)g_cov_pool_bytes / 1048576.0,
+             img_cnt, (double)img_bytes / 1048576.0,
+             (double)imgmem_bytes / 1048576.0,
+             (double)surf_bytes / 1048576.0,
+             blur_cnt, (double)blur_bytes / 1048576.0,
+             snap_cnt, (double)snap_bytes / 1048576.0,
+             (double)mi2.uordblks / 1048576.0,
+             (double)mi2.fordblks / 1048576.0);
 #else
     snprintf(buf, sizeof(buf),
              "atl %.1fM/%d cov %.2fM img %d/%.1fM mimg %.1fM "
