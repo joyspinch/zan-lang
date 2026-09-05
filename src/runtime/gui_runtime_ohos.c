@@ -639,11 +639,16 @@ EXPORT i32 zan_gui_get_dpi_scale(void) { return (i32)(g_dpi * 100 / 96); }
 
 /* The HAP shell resolves the display density (libnative_display_manager lives
  * in the default linker namespace, out of reach of dlsym(RTLD_DEFAULT) from
- * this dlopened library) and hands it over before zan_hap_main. Without it
- * g_dpi stays at the 96 fallback and every control renders at desktop
- * physical size on a phone-class screen. */
+ * this dlopened library) and hands it over before zan_hap_main. Mobile DPI is
+ * denominated in 160 dpi (a 3.0x phone reports 480), but the SDL driver keeps
+ * g_dpi on the desktop 96-dpi base (contentScale*96) and every consumer --
+ * the percent conversion above and the wheel synthesis 288/g_dpi -- assumes
+ * that convention. Store the 96-base value: a 480 dpi device must yield
+ * scale 300 (native 3.0x), not 500 (desktop-96 math on raw mobile DPI,
+ * 67% oversized). Without any call g_dpi stays at the 96 fallback and every
+ * control renders at desktop physical size on a phone-class screen. */
 EXPORT void zan_gui_ohos_set_dpi(i32 dpi) {
-    if (dpi >= 48 && dpi <= 960) g_dpi = dpi;
+    if (dpi >= 48 && dpi <= 960) g_dpi = (int)((long)dpi * 96 / 160);
 }
 
 EXPORT i64 zan_gui_get_tick_ms(void) { return ohs_tick_ms(); }
