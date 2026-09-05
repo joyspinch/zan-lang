@@ -51,6 +51,21 @@ examples/ 下的共享模块，可随项目自由修改。
                    --embed templates\game\goldminer\assets=assets ^
                    -o build\goldminer.exe
 
+独立 exe 发布（单文件、免 DLL、双击无控制台窗口）
+------------------------------------------------
+加 `--publish --link-mode static --subsystem windows` 即把 SDL 等
+全部静态链进 exe（零第三方 DLL），并设为 GUI 子系统（不弹控制台）；
+`--subsystem windows` 必须显式给，zanc 命令行默认 console 子系统
+（IDE 会对 GUI 项目自动加，CLI 不探测）：
+
+    build\zanc.exe templates\game\goldminer\src\main.zan ^
+                   templates\game\goldminer\src\Game.zan ^
+                   templates\game\goldminer\src\Kit.zan ^
+                   --auto-stdlib ^
+                   --publish --link-mode static --subsystem windows ^
+                   --embed templates\game\goldminer\assets=assets ^
+                   -o dist\goldminer\goldminer.exe
+
 素材
 ----
 assets/ 下全部 PNG/JPG/WAV 均可替换；代码按 "assets/<name>.<ext>" 相对 exe
