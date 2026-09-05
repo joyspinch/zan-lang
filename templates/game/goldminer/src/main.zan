@@ -658,6 +658,13 @@ class MinerApp {
         if (ProcessHost.Env("MINER_NOHUD") != "1") {
             app.BuildHud();
         }
+        // HUD 合成节拍:GameHud.Frame 是"GPU 回读整帧 + Gui 全画布软件
+        // 栅格 + 双全帧纹理上传 + 合成 Present",一次约 6-10ms,跟随游戏
+        // 60fps 常态跑会把一个核吃满。合成与游戏帧解耦:每两帧合成一次
+        // (30fps,顶栏倒计时/摆钩足够顺滑);拆弹/结算切换或有点击按键
+        // 的帧立即合成,反馈不受节拍影响;失焦再降到 ~15fps。
+        int hudFrame = 0;
+        int lastState = -99;
         while (h.Running()) {
             app.now = World.NowMs();
             int dt = (int)(app.now - app.lastFrameAt);
@@ -666,6 +673,7 @@ class MinerApp {
             app.lastFrameAt = app.now;
             bool action = false;
             bool dyn = false;
+            bool inputEvent = false;
             while (SdlEvent.Poll()) {
                 int ty = SdlEvent.Type();
                 h.OnWindowEvent(ty);
@@ -677,9 +685,14 @@ class MinerApp {
                 if (ty == SdlEventType.MouseMotion()) {
                     app.mouseX = h.MouseX();
                     app.mouseY = h.MouseY();
+                } else if (ty != SdlEventType.MouseButtonUp()
+                           && ty != SdlEventType.FingerMotion()) {
+                    // 键盘/滚轮/手柄等真实输入要求下一帧立即渲染;
+                    // MouseMotion 每秒上百条,放进门控会把空闲重绘
+                    // 门彻底击穿(鼠标轻晃=恒 60fps),只记坐标。
+                    inputEvent = true;
+                    h.MarkEvent();
                 }
-                // 任何输入事件都要求下一帧立即渲染(重绘门控)。
-                if (ty != SdlEventType.WindowMinimized()) { h.MarkEvent(); }
                 if (ty == SdlEventType.MouseButtonDown()
                     && SdlEvent.MouseButton() == SdlMouseButton.Left()) {
                     action = true;
@@ -711,10 +724,19 @@ class MinerApp {
             app.DrawAll();
             h.End();
             // HUD 层:场景帧作底,Gui 控件树画在上面并合成呈现。
-            // 合成链失败时降级:hud 置空并恢复宿主直呈(场景完整可玩,
-            // Gui 顶栏待 gui 运行时修复后自动恢复)。
+            // 节拍:每两帧一次(30fps);状态切换(摆钩→伸钩→QTE→
+            // 拆弹/结算)与有点击/按键的帧立即合成;失焦降到 4 帧一拍。
+            // 场景帧在后备缓冲里保留到下一次合成,中间帧不回读。
             if (app.hud != null) {
-                if (!app.hud.Frame(app.r, h.WindowHandle())) {
+                int interval = h.Focused() ? 2 : 4;
+                int st = app.w.state;
+                bool stateChanged = st != lastState;
+                lastState = st;
+                bool composite = stateChanged || action || dyn || inputEvent
+                                 || ++hudFrame >= interval;
+                if (composite) { hudFrame = 0; }
+                if (composite
+                    && !app.hud.Frame(app.r, h.WindowHandle())) {
                     if (!hudFailLogged) {
                         hudFailLogged = true;
                         Console.WriteLine("[hud] frame failed: " + app.hud.LastError());
@@ -980,6 +1002,29 @@ class MinerApp {
                 Console.WriteLine("=== HUD SHOT OK ===");
             }
         }
+        // 过关态:驱动到 ST_RESULT 再合成数帧,验证重排后的结算面板
+        // (Flex.Column 居中排版,hud-title/subtitle/small 三档层级)。
+        app.w.gold = app.w.Target();
+        app.w.EndLevel(true);
+        for (int f = 25; f <= 31; f = f + 1) {
+            app.now = World.NowMs();
+            app.lastFrameAt = app.now;
+            app.StepFrame(16);
+            app.SyncHud();
+            app.host.Begin(12, 10, 8);
+            app.DrawAll();
+            app.host.End();
+            if (app.hud != null
+                && !app.hud.Frame(app.r, h.WindowHandle())) {
+                Console.WriteLine("[hudshot] result frame failed f=" + f +
+                                  " err=" + app.hud.LastError());
+                break;
+            }
+            h.Pace();
+        }
+        app.r.Present();
+        MinerApp.DumpBmp(app.r, "miner_hud_result.bmp");
+        Console.WriteLine("=== HUD RESULT OK ===");
         return 0;
     }
 
@@ -1125,27 +1170,37 @@ class HudOverlay {
 
     Panel BuildResult() {
         // ---- 结算面板(居中) ----
+        // 卡片定尺寸,内部 Flex.Column 三段式:标题/两行数据/提示行,
+        // 间距全部走 Ux(4 的倍数)档位,居中对齐,不再裸排 Label。
         Panel rp = new Panel();
         rp.Class = "hud-panel";
-        rp.Prefer(this.app.Ux(420), this.app.Ux(260));
-        rp.Place(this.app.Ux(Data.W / 2 - 210), this.app.Ux(200));
+        // Panel 默认 dock=5(fill)，Place() 只在 manual 停靠下生效，
+        // 不切回 manual 会被 fill 分支撑满整个 HUD 画布。
+        rp.DockManual();
+        rp.Prefer(this.app.Ux(440), this.app.Ux(280));
+        rp.Place(this.app.Ux(Data.W / 2 - 220), this.app.Ux(190));
         this.result = rp;
+
+        Flex col = Flex.Column().Justify("center").Align("center")
+                    .Gap(this.app.Ux(16));
+        rp.Pad(this.app.Ux(28));
+        rp.With(col);
 
         this.resTitle = new Label("");
         this.resTitle.Class = "hud-title";
-        rp.With(this.resTitle);
+        col.With(this.resTitle);
 
         this.resGold = new Label("");
         this.resGold.Class = "hud-subtitle";
-        rp.With(this.resGold);
+        col.With(this.resGold);
 
         this.resTotal = new Label("");
         this.resTotal.Class = "hud-subtitle";
-        rp.With(this.resTotal);
+        col.With(this.resTotal);
 
         this.resNext = new Label("");
         this.resNext.Class = "hud-small";
-        rp.With(this.resNext);
+        col.With(this.resNext);
 
         rp.SetShown(false);
         return rp;
@@ -1153,29 +1208,36 @@ class HudOverlay {
 
     Panel BuildBomb() {
         // ---- 拆弹面板(居中) ----
+        // 标题/秒数大字/点击计数/进度条四段,同结算面板一套节奏。
         Panel bp = new Panel();
         bp.Class = "hud-panel";
-        bp.Prefer(this.app.Ux(320), this.app.Ux(150));
-        bp.Place(this.app.Ux(Data.W / 2 - 160), this.app.Ux(240));
+        bp.DockManual();
+        bp.Prefer(this.app.Ux(360), this.app.Ux(180));
+        bp.Place(this.app.Ux(Data.W / 2 - 180), this.app.Ux(230));
         this.bomb = bp;
+
+        Flex col = Flex.Column().Justify("center").Align("center")
+                    .Gap(this.app.Ux(12));
+        bp.Pad(this.app.Ux(24));
+        bp.With(col);
 
         Label title = new Label("疯狂点击! 拆除炸弹!");
         title.Class = "hud-title";
-        bp.With(title);
+        col.With(title);
 
         this.bombSec = new Label("");
         this.bombSec.Class = "hud-title";
-        bp.With(this.bombSec);
+        col.With(this.bombSec);
 
         this.bombCnt = new Label("");
         this.bombCnt.Class = "hud-subtitle";
-        bp.With(this.bombCnt);
+        col.With(this.bombCnt);
 
         this.bombBar = new Progress(0, 0);
         this.bombBar.Class = "hud";
         this.bombBar.Prefer(this.app.Ux(280), this.app.Ux(14));
         this.bombBar.ShowText(false);
-        bp.With(this.bombBar);
+        col.With(this.bombBar);
 
         bp.SetShown(false);
         return bp;
