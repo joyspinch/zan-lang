@@ -1317,21 +1317,34 @@ static LLVMValueRef emit_binary_op_values(zan_irgen_t *g, zan_ast_node_t *expr,
         case TK_SLASH:
             if (is_float) return LLVMBuildFDiv(g->builder, left, right, "div");
             {
+                /* The check alone is not enough on the soft path: idiv by a
+                 * zero register raises SIGFPE on x64, so a fail-soft program
+                 * died right after its own report. Fold the divisor to 1 so
+                 * the division executes and yields the dividend (x/0 -> x,
+                 * x%0 -> 0 mirrors what a select-folded zero would leave).
+                 * Hard mode exits inside the report; checks-off keeps the
+                 * raw divisor and the historical fault. */
                 LLVMValueRef zero = LLVMConstInt(LLVMTypeOf(right), 0, 0);
+                LLVMValueRef one = LLVMConstInt(LLVMTypeOf(right), 1, 0);
                 LLVMValueRef is_zero = zan_icmp(g->builder, LLVMIntEQ, right, zero, "divz");
                 emit_runtime_check(g, is_zero, expr->loc, "division by zero");
+                LLVMValueRef divisor = LLVMBuildSelect(g->builder, is_zero,
+                    one, right, "divz.safe");
+                return is_unsigned ? zan_udiv(g->builder, left, divisor, "div")
+                                   : zan_sdiv(g->builder, left, divisor, "div");
             }
-            return is_unsigned ? zan_udiv(g->builder, left, right, "div")
-                               : zan_sdiv(g->builder, left, right, "div");
         case TK_PERCENT:
             if (is_float) return LLVMBuildFRem(g->builder, left, right, "rem");
             {
                 LLVMValueRef zero = LLVMConstInt(LLVMTypeOf(right), 0, 0);
+                LLVMValueRef one = LLVMConstInt(LLVMTypeOf(right), 1, 0);
                 LLVMValueRef is_zero = zan_icmp(g->builder, LLVMIntEQ, right, zero, "remz");
                 emit_runtime_check(g, is_zero, expr->loc, "division by zero (modulo)");
+                LLVMValueRef divisor = LLVMBuildSelect(g->builder, is_zero,
+                    one, right, "remz.safe");
+                return is_unsigned ? zan_urem(g->builder, left, divisor, "rem")
+                                   : zan_srem(g->builder, left, divisor, "rem");
             }
-            return is_unsigned ? zan_urem(g->builder, left, right, "rem")
-                               : zan_srem(g->builder, left, right, "rem");
         case TK_AMP:
             return zan_and(g->builder, left, right, "and");
         case TK_PIPE:
@@ -6300,7 +6313,15 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMConstInt(i64t, 0, 0), "arr.negative");
                 emit_runtime_check(g, negative,
                     expr->new_expr.args.items[d]->loc, "negative array length");
-                dims[d] = dv;
+                /* Soft mode continues past the report; a negative dim would
+                 * reach the alloc as a huge unsigned byte count and corrupt
+                 * the heap (or trip the overflow report a second time with
+                 * the calloc already underway). Fold it to 0: the program
+                 * gets an empty array, which every bounds check downstream
+                 * reports instead of faulting. Hard mode exits inside the
+                 * report; checks-off keeps the raw dim. */
+                dims[d] = LLVMBuildSelect(g->builder, negative,
+                    LLVMConstInt(i64t, 0, 0), dv, "arr.dim.safe");
             }
             LLVMValueRef arr;
             if (rank <= 1) {

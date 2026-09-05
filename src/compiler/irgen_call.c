@@ -512,6 +512,13 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMConstInt(i64, at->array_rank, 0), "gl.oob");
                     emit_runtime_check(g, oob, expr->loc,
                         "GetLength dimension out of range");
+                    /* Soft mode continues past the report; an out-of-range
+                     * dim would GEP past the rank words and read garbage (or
+                     * fault past the allocation for high dims). Fold it to 0
+                     * so the call answers dim 0's length instead. Hard mode
+                     * exits inside the report; checks-off keeps the raw dim. */
+                    dim = LLVMBuildSelect(g->builder, oob,
+                        LLVMConstInt(i64, 0, 0), dim, "gl.dim.safe");
                     LLVMValueRef dim_ptr = LLVMBuildBitCast(g->builder, arr,
                         LLVMPointerType(i64, 0), "gl.dp");
                     LLVMValueRef slot = LLVMBuildGEP2(g->builder, i64, dim_ptr,

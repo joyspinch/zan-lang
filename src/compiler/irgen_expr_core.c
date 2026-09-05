@@ -2476,6 +2476,16 @@ static LLVMValueRef zan_array_alloc(zan_irgen_t *g, LLVMValueRef total,
     LLVMValueRef overflow = zan_icmp(g->builder, LLVMIntUGT, total,
         max_total, "arr.overflow");
     emit_runtime_check(g, overflow, (zan_loc_t){0}, "array allocation overflow");
+    /* Soft mode continues past the report: the wrapped `total` would reach
+     * calloc as a huge unsigned count and fail (or corrupt accounting via
+     * __wrap_calloc's overflow check), leaving the caller with garbage. Fold
+     * an overflowing total to 0 so the caller gets a real, empty array --
+     * every later index into it reports instead of faulting. Hard mode exits
+     * inside the report; checks-off keeps the raw total. */
+    total = LLVMBuildSelect(g->builder, overflow,
+        LLVMConstInt(i64, 0, 0), total, "arr.total.safe");
+    count = LLVMBuildSelect(g->builder, overflow,
+        LLVMConstInt(i64, 0, 0), count, "arr.count.safe");
     LLVMValueRef bytes = LLVMBuildAdd(g->builder, total, header, "arr.bytes");
     LLVMValueRef raw = zan_call2(g->builder,
         LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64 }, 2, 0),
@@ -2530,6 +2540,12 @@ static LLVMValueRef zan_mdarray_alloc(zan_irgen_t *g, LLVMValueRef *dims,
     LLVMValueRef neg = zan_icmp(g->builder, LLVMIntSLT, total,
         LLVMConstInt(i64, 0, 0), "md.neg");
     emit_runtime_check(g, neg, (zan_loc_t){0}, "array allocation overflow");
+    /* Soft mode continues past the report: fold the wrapped product to 0 so
+     * calloc gets a small real size and the caller holds an empty array
+     * instead of a corrupt allocation. Hard mode exits inside the report;
+     * checks-off keeps the raw product. */
+    total = LLVMBuildSelect(g->builder, neg,
+        LLVMConstInt(i64, 0, 0), total, "md.total.safe");
     LLVMValueRef hdr = LLVMConstInt(i64,
         (unsigned long long)(ZAN_ARR_HDR_SIZE + 8 * rank), 0);
     LLVMValueRef bytes = zan_add(g->builder, hdr,
@@ -2537,6 +2553,8 @@ static LLVMValueRef zan_mdarray_alloc(zan_irgen_t *g, LLVMValueRef *dims,
     LLVMValueRef nbytes = zan_icmp(g->builder, LLVMIntSLT, bytes,
         LLVMConstInt(i64, 0, 0), "md.nb");
     emit_runtime_check(g, nbytes, (zan_loc_t){0}, "array allocation overflow");
+    bytes = LLVMBuildSelect(g->builder, nbytes,
+        LLVMConstInt(i64, ZAN_ARR_HDR_SIZE + 8 * rank, 0), bytes, "md.bytes.safe");
     LLVMValueRef raw = zan_call2(g->builder,
         LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64 }, 2, 0),
         get_calloc_fn(g), (LLVMValueRef[]){ bytes, LLVMConstInt(i64, 1, 0) }, 2, "md.raw");
