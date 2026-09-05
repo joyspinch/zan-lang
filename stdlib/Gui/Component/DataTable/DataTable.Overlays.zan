@@ -144,6 +144,17 @@ partial class DataTable {
             app.RequestRedraw();
         }
         iy = iy + ih;
+        DataTable.CtxItem(app, mx, iy, mw, ih, DataTable.T("Pivot from selection", "从选区生成透视表  Pivot"), "");
+        if (DataTable.CtxHit(app, mx, iy, mw, ih)) {
+            if (DataTable.BuildPivotFromRange(st, cols, src)) {
+                st.pivotOpen = true;
+            } else {
+                DataTable.Flash(st, DataTable.T("Select a range with a value column and two category columns", "请先框选含数值列与两个维度列的区域"));
+            }
+            st.ctxOpen = false;
+            app.RequestRedraw();
+        }
+        iy = iy + ih;
         if (canRows) {
             c.FillRect(mx + app.Scale(8), iy + sepH / 2, mw - app.Scale(16), 1, sGrid.BgOr(0));
             iy = iy + sepH;
@@ -342,6 +353,191 @@ partial class DataTable {
         if ((clicked && (cbHot || !inside))
             || (app.EventKind() == 4 && app.window.EventKeyCode() == 27)) {
             st.chartOpen = false;
+            app.RequestRedraw();
+        }
+    }
+
+    // ---------- 选区数据透视浮层 ----------
+    /// 绘制 BuildPivotFromRange 产出的交叉表：行标签列 +
+    /// 列键表头 + 单元格 + 总计（仅 Sum 模式）。头部提供
+    /// Sum / Average / Count 聚合切换，点击即重建。
+    static void RenderPivot(App app, int x, int y, int viewW, int viewH,
+                            List<DataColumn> cols, DataSource src, DataTableState st) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        StyleBox sMenu = Style.Part(app, "datatable", "menu", "", "", "",
+                                    Style.SNormal());
+        StyleBox sGrid = Style.Part(app, "datatable", "grid", "", "", "",
+                                    Style.SNormal());
+        StyleBox sHeader = Style.Part(app, "datatable", "header", "", "", "",
+                                      Style.SNormal());
+        StyleBox sHint = Style.Part(app, "datatable", "hint", "", "", "",
+                                    Style.SNormal());
+        StyleBox sLabel = Style.Part(app, "datatable", "label", "", "", "",
+                                     Style.SNormal());
+        StyleBox sAccent = Style.Part(app, "datatable", "accent", "", "", "",
+                                      Style.SNormal());
+        StyleBox sRowHover = Style.Part(app, "datatable", "row", "", "", "",
+                                        Style.SHover());
+
+        int m = app.Scale(20);
+        int px = x + m;
+        int py = y + m;
+        int pw = viewW - m * 2;
+        int ph = viewH - m * 2;
+        if (pw < app.Scale(120) || ph < app.Scale(100)) { st.pivotOpen = false; return; }
+
+        // 遮罩 + 面板（模态：接管滚轮、屏蔽下方命中）
+        c.FillRect(x, y, viewW, viewH, t.overlay);
+        app.CaptureWheel(x, y, viewW, viewH);
+        app.BlockHitsRect(x, y, viewW, viewH);
+        c.FillRoundRect(px, py, pw, ph, t.borderRadiusMedium, sMenu.BgOr(0));
+        c.DrawRoundRect(px, py, pw, ph, t.borderRadiusMedium, sMenu.BorderOr(0), 1);
+
+        // 标题栏 + 关闭按钮
+        int th = t.heightLarge;
+        c.FillRect(px + 1, py + 1, pw - 2, th, sHeader.BgOr(0));
+        c.FillRect(px + 1, py + th, pw - 2, 1, sGrid.BgOr(0));
+        c.DrawText(px + app.Scale(14),
+                   Canvas.CenterTextY(py, th, Style.FontFallback(app, "medium")),
+                   DataTable.T("Pivot", "透视表 Pivot") + " · " + st.pivotRowTitle,
+                   sMenu.FgOr(0), Style.FontFallback(app, "medium"));
+        int cbs = app.Scale(22);
+        int cbx = px + pw - cbs - app.Scale(8);
+        int cby = py + (th - cbs) / 2;
+        bool cbHot = app.mouseX >= cbx && app.mouseX < cbx + cbs
+                     && app.mouseY >= cby && app.mouseY < cby + cbs;
+        if (cbHot) { c.FillRoundRect(cbx, cby, cbs, cbs, app.Scale(4), sRowHover.BgOr(0)); }
+        c.DrawTextCentered(cbx, cby, cbs, cbs, "×", sMenu.FgOr(0), Style.FontFallback(app, "large"));
+
+        // 聚合切换（Sum / Average / Count）：切换即重建
+        string[] aggNames = new string[] {
+            DataTable.T("Sum", "求和"), DataTable.T("Average", "平均"),
+            DataTable.T("Count", "计数") };
+        int segW = app.Scale(70);
+        int segY = py + th + app.Scale(8);
+        int segX = px + app.Scale(14);
+        int ag = 0;
+        while (ag < 3) {
+            int ax = segX + segW * ag;
+            bool aHot = app.mouseX >= ax && app.mouseX < ax + segW
+                        && app.mouseY >= segY && app.mouseY < segY + t.heightSmall;
+            bool aOn = st.pivotAgg == ag;
+            if (aOn || aHot) {
+                c.FillRoundRect(ax, segY, segW, t.heightSmall, app.Scale(4),
+                                aOn ? sAccent.BgOr(0) : sRowHover.BgOr(0));
+            }
+            c.DrawTextCentered(ax, segY, segW, t.heightSmall, aggNames[ag],
+                               aOn ? sAccent.FgOr(0) : sLabel.FgOr(0),
+                               Style.FontFallback(app, "small"));
+            // 点击命中直接按几何判定（CtxHit 同款），不注册
+            // 命中区——BlockHitsRect 已把浮层下方全部拦截。
+            if (aHot && app.ClickAvailable() && app.window.EventButton() == 0 && !aOn) {
+                st.pivotAgg = ag;
+                if (!DataTable.BuildPivotFromRange(st, cols, src)) { st.pivotOpen = false; }
+                app.RequestRedraw();
+            }
+            ag = ag + 1;
+        }
+
+        // 交叉表区域
+        int nR = st.pivotRows.Count;
+        int nC = st.pivotCols.Count;
+        int gridTop = segY + t.heightSmall + app.Scale(10);
+        int gridLeft = px + app.Scale(14);
+        int gridRight = px + pw - app.Scale(14);
+        int gridBottom = py + ph - app.Scale(14);
+        int rowLabW = app.Scale(120);
+        int labFs = Style.FontFallback(app, "small");
+        int rowH = Canvas.FontHeight(labFs) + app.Scale(8);
+        bool hasTot = st.pivotRowTot.Count == nR && st.pivotColTot.Count == nC;
+        int bodyW = gridRight - gridLeft - rowLabW - (hasTot ? app.Scale(70) : 0);
+        if (nR > 0 && nC > 0 && bodyW > app.Scale(60)
+            && gridTop + rowH * 2 <= gridBottom) {
+            int cellW = bodyW / nC;
+            // 表头行：列键
+            c.FillRect(gridLeft, gridTop, gridRight - gridLeft, rowH, sHeader.BgOr(0));
+            c.DrawText(gridLeft + app.Scale(4),
+                       Canvas.CenterTextY(gridTop, rowH, labFs),
+                       st.pivotRowTitle, sHint.FgOr(0), labFs);
+            int cj = 0;
+            while (cj < nC) {
+                int cx = gridLeft + rowLabW + cellW * cj;
+                c.PushClip(cx, gridTop, cellW, rowH);
+                c.DrawText(cx + app.Scale(6),
+                           Canvas.CenterTextY(gridTop, rowH, labFs),
+                           st.pivotCols[cj], sHeader.FgOr(0), labFs);
+                c.PopClip();
+                cj = cj + 1;
+            }
+            if (hasTot) {
+                int tx = gridLeft + rowLabW + cellW * nC;
+                c.DrawText(tx + app.Scale(6), Canvas.CenterTextY(gridTop, rowH, labFs),
+                           DataTable.T("Total", "总计"), sHint.FgOr(0), labFs);
+            }
+            c.FillRect(gridLeft, gridTop + rowH, gridRight - gridLeft, 1, sGrid.BgOr(0));
+
+            // 数据行
+            int ri = 0;
+            while (ri < nR && gridTop + rowH * (ri + 2) <= gridBottom) {
+                int ry = gridTop + rowH * (ri + 1);
+                if (ri % 2 == 1) {
+                    c.FillRect(gridLeft, ry, gridRight - gridLeft, rowH, sGrid.BgOr(0));
+                }
+                c.DrawText(gridLeft + app.Scale(4), Canvas.CenterTextY(ry, rowH, labFs),
+                           st.pivotRows[ri], sLabel.FgOr(0), labFs);
+                int cj2 = 0;
+                while (cj2 < nC) {
+                    int cx2 = gridLeft + rowLabW + cellW * cj2;
+                    string vs = DataTable.FormatReal(st.pivotData[ri * nC + cj2],
+                                                     st.pivotAgg == 1 ? 2 : 0);
+                    c.DrawText(cx2 + cellW - app.Scale(6) - Canvas.MeasureText(vs, labFs),
+                               Canvas.CenterTextY(ry, rowH, labFs), vs,
+                               sLabel.FgOr(0), labFs);
+                    cj2 = cj2 + 1;
+                }
+                if (hasTot) {
+                    int tx2 = gridLeft + rowLabW + cellW * nC;
+                    string ts = DataTable.FormatReal(st.pivotRowTot[ri], 0);
+                    c.DrawText(tx2 + app.Scale(64) - Canvas.MeasureText(ts, labFs),
+                               Canvas.CenterTextY(ry, rowH, labFs), ts,
+                               sAccent.FgOr(0), labFs);
+                }
+                ri = ri + 1;
+            }
+            // 列总计行
+            if (hasTot && gridTop + rowH * (nR + 2) <= gridBottom) {
+                int ty = gridTop + rowH * (nR + 1);
+                c.FillRect(gridLeft, ty, gridRight - gridLeft, rowH, sHeader.BgOr(0));
+                c.DrawText(gridLeft + app.Scale(4), Canvas.CenterTextY(ty, rowH, labFs),
+                           DataTable.T("Total", "总计"), sHint.FgOr(0), labFs);
+                int cj3 = 0;
+                while (cj3 < nC) {
+                    int cx3 = gridLeft + rowLabW + cellW * cj3;
+                    string cs = DataTable.FormatReal(st.pivotColTot[cj3], 0);
+                    c.DrawText(cx3 + cellW - app.Scale(6) - Canvas.MeasureText(cs, labFs),
+                               Canvas.CenterTextY(ty, rowH, labFs), cs,
+                               sAccent.FgOr(0), labFs);
+                    cj3 = cj3 + 1;
+                }
+                string gs = DataTable.FormatReal(st.pivotGrand, 0);
+                c.DrawText(gridLeft + rowLabW + cellW * nC + app.Scale(64)
+                               - Canvas.MeasureText(gs, labFs),
+                           Canvas.CenterTextY(ty, rowH, labFs), gs,
+                           sAccent.FgOr(0), labFs);
+            }
+        } else {
+            c.DrawText(gridLeft, gridTop, DataTable.T("Not enough space", "空间不足"),
+                       sHint.FgOr(0), labFs);
+        }
+
+        // 关闭交互：[x]、点击面板外或 Escape
+        bool clicked = app.EventKind() == 3 && app.window.EventButton() == 0;
+        bool inside = app.mouseX >= px && app.mouseX < px + pw
+                      && app.mouseY >= py && app.mouseY < py + ph;
+        if ((clicked && (cbHot || !inside))
+            || (app.EventKind() == 4 && app.window.EventKeyCode() == 27)) {
+            st.pivotOpen = false;
             app.RequestRedraw();
         }
     }
