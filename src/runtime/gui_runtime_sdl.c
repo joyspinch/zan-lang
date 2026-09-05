@@ -1598,6 +1598,11 @@ EXPORT i32 zan_gui_scene_present(iptr hwnd_val, i32 surface_id) {
                                      s->width, s->height);
         if (!rec->tex) return 3;
         SDL_SetTextureScaleMode(rec->tex, SDL_SCALEMODE_NEAREST);
+        /* The HUD surface is cleared to alpha 0 and widgets paint straight
+         * (non-premultiplied) alpha over it; without BLEND the default NONE
+         * mode would ignore that alpha and the opaque windowbg background
+         * painted by RenderBackground would cover the whole scene. */
+        SDL_SetTextureBlendMode(rec->tex, SDL_BLENDMODE_BLEND);
         rec->tw = s->width; rec->th = s->height;
     }
     sdl_upload(s, rec->tex);
@@ -1686,6 +1691,7 @@ EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
                                      s->width, s->height);
         if (!rec->tex) return 1;
         SDL_SetTextureScaleMode(rec->tex, SDL_SCALEMODE_NEAREST);
+        SDL_SetTextureBlendMode(rec->tex, SDL_BLENDMODE_BLEND);
         rec->tw = s->width; rec->th = s->height;
     }
     sdl_upload(s, rec->tex);

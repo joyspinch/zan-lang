@@ -3,9 +3,17 @@
 
 #include <stdint.h>
 
+/* stb_image: the dynamic DLL build (ZAN_SDL3_STB_OWN, set by
+ * scripts/stage_sdl3.ps1) embeds its own implementation; every other build
+ * (static archive for --publish --link-mode static) declares only, so the
+ * functions resolve to the gui runtime archive's decoder — zan_gui must own
+ * stb_image because it additionally decodes webp/svg. Without this split a
+ * static publish of an SDL game fails with duplicate stbi_* definitions. */
+#ifdef ZAN_SDL3_STB_OWN
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_HDR
 #define STBI_NO_LINEAR
+#endif
 #include "stb_image.h"
 
 #if defined(_WIN32)
@@ -91,6 +99,12 @@ ZAN_SDL_API zan_i32 zan_sdl_set_window_title(zan_iptr window, const char *title)
 ZAN_SDL_API zan_i32 zan_sdl_set_window_fullscreen(zan_iptr window, zan_i32 enabled) {
     if (!window) return 0;
     return zan_bool(SDL_SetWindowFullscreen((SDL_Window *)zan_ptr(window), enabled != 0));
+}
+
+ZAN_SDL_API zan_i32 zan_sdl_restore_window(zan_iptr window) {
+    if (!window) return 0;
+    SDL_RestoreWindow((SDL_Window *)zan_ptr(window));
+    return 1;
 }
 
 ZAN_SDL_API zan_i32 zan_sdl_show_window(zan_iptr window) {

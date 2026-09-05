@@ -123,6 +123,15 @@ class MinerApp {
 
     // Gui 控件树 HUD 层(null = 未启用/接管失败,退回场景自绘)
     public GameHud hud;
+    // HUD 画布光栅宽(= 窗口输出分辨率):Gui 控件树的坐标/尺寸字面量
+    // 按光栅生效,设计数字统一过 Ux() 换算,和场景美术同一比例。
+    int uiCanvasW;
+
+    // 设计单位 -> HUD 光栅像素。
+    public int Ux(int v) {
+        if (this.uiCanvasW <= 0) { return v; }
+        return v * this.uiCanvasW / Data.W;
+    }
     public bool guiReady;               // gui 运行时已初始化(兜底 HUD 前提)
     public HudTop topHud;           // 顶栏面板
     public HudOverlay ovHud;        // 结算/拆弹覆盖层
@@ -578,6 +587,7 @@ class MinerApp {
     // MINER_NOHUD=1 退回纯自绘路径(对照/兜底)。
 
     public void BuildHud() {
+        this.uiCanvasW = this.host.CanvasW();
         this.topHud = new HudTop(this);
         this.ovHud = new HudOverlay(this);
         Form form = Form.Create("hud", Data.W, Data.H);
@@ -607,6 +617,10 @@ class MinerApp {
     // 入口与无头自测
     // ---------------------------------------------------------------
     static int Main(string[] args) {
+        // HUD 文字脸:圆体(幼圆)比系统 UI 字体(写死的 Segoe UI 经字体
+        // 链接兜到雅黑)更配游戏画风;机器上没有幼圆时 GDI 字体链接
+        // 自动回退系统默认。运行库首次建字体时读一次该变量。
+        Env.Set("ZAN_GUI_FONT_FACE", "幼圆");
         // 无头平衡仿真:自动打 6 关,校验经济曲线与状态机
         if (ProcessHost.Env("MINER_SIM") == "1") {
             return MinerApp.SimRun();
@@ -695,20 +709,43 @@ class MinerApp {
         return 0;
     }
 
-    // 无头仿真:模拟一个"中等玩家"打 6 关,输出经济快照 + 不变量检查
+    // 无头仿真:模拟一个"会连点的中等玩家"打关,输出经济快照 + 不变量检查。
+    // MINER_SIM_SEED 覆盖随机种子(默认 424242),便于多种子回归。
     static int SimRun() {
         StreamWriter log = new StreamWriter("miner_sim.log");
-        log.WriteLine("=== MINER_SIM headless ===");
+        long seed = 424242L;
+        string seedEnv = ProcessHost.Env("MINER_SIM_SEED");
+        if (seedEnv != null && seedEnv.Length > 0) {
+            seed = Data.ParseIntS(seedEnv);
+        }
+        log.WriteLine("=== MINER_SIM headless seed=" + seed + " ===");
         World w = new World();
-        w.rng = Rng.Seed(424242L);
+        w.rng = Rng.Seed(seed);
         w.NewRun(w.rng);
         bool allOk = true;
-        for (int lv = 1; lv <= 6; lv = lv + 1) {
+        int wonLevels = 0;
+        for (int lv = 1; lv <= 8; lv = lv + 1) {
+            if (lv > 1) {
+                // 与真实流程一致:上一关结算确认后才进入下一关
+                // (ConfirmResult 里 level+1)。SIM 每关限时从 L1 拍起,
+                // 这里按 w.level 对齐,失败即停。
+                if (w.level != lv) { break; }
+            }
             w.StartLevel();
             int target = w.Target();
-            log.WriteLine("L" + lv + " target=" + target
-                          + " items=" + w.items.Count);
-            // 模拟:60fps 推进,贪心策略 —— 摆到有价物角度就放钩
+            int field = 0;
+            for (int i = 0; i < w.items.Count; i = i + 1) {
+                ItemDef d = Data.DEFS[w.items[i].kind];
+                if (!d.junk && d.score > 0) { field = field + d.score; }
+            }
+            log.WriteLine("L" + w.level + " target=" + target
+                          + " items=" + w.items.Count
+                          + " field=" + field
+                          + " need=" + (field > 0 ? target * 100 / field : 0) + "%"
+                          + " swing=" + (int)w.angDir);
+            // 模拟:60fps 推进,贪心策略 —— 摆到有价物角度就放钩。
+            // 前摇:真实玩家会等扫过几轮看清全场再出手;AI 预热 2 秒,
+            // 且目标价 < 120 的小鱼不碰,省下收线时间。
             int frames = w.LevelTimeMs() / 16;
             int captured = 0;
             for (int f = 0; f < frames && w.state != World.ST_RESULT; f = f + 1) {
@@ -717,30 +754,63 @@ class MinerApp {
                     double rad = w.angle * Math.PI / 180.0;
                     Item best = null;
                     int bestScore = 0;
-                    for (int i = 0; i < w.items.Count; i = i + 1) {
-                        Item it = w.items[i];
-                        if (!it.alive) { continue; }
-                        int dx = it.x - Data.HOOK_X;
-                        int dy = it.y - Data.HOOK_Y;
-                        // 物品在射线上的投影长度与垂距
-                        double proj = dx * Math.Cos(rad) + dy * Math.Sin(rad);
-                        if (proj < 110.0 || proj > 620.0) { continue; }
-                        double perp = Math.Abs(-dx * Math.Sin(rad) + dy * Math.Cos(rad));
-                        if (perp > 60.0) { continue; }
-                        int sc = Data.DEFS[it.kind].score;
-                        if (it.kind == 8 || it.kind == 9) { sc = -1; }   // 避开
-                        // 价值/重量性价比优先
-                        if (sc > 0) { sc = sc * 10 / (Data.DEFS[it.kind].weight + 4); }
-                        if (sc > bestScore) { bestScore = sc; best = it; }
+                    if (f > 120) {
+                        for (int i = 0; i < w.items.Count; i = i + 1) {
+                            Item it = w.items[i];
+                            if (!it.alive) { continue; }
+                            int dx = it.x - Data.HOOK_X;
+                            int dy = it.y - Data.HOOK_Y;
+                            // 物品在射线上的投影长度与垂距
+                            double proj = dx * Math.Cos(rad) + dy * Math.Sin(rad);
+                            if (proj < 110.0 || proj > 620.0) { continue; }
+                            double perp = Math.Abs(-dx * Math.Sin(rad)
+                                                   + dy * Math.Cos(rad));
+                            if (perp > 26.0) { continue; }   // 爪半径内才算可抓
+                            int sc = Data.DEFS[it.kind].score;
+                            if (it.kind == 8 || it.kind == 9) { sc = -1; } // 避开
+                            if (sc > 0 && sc < 120) { sc = 0; }   // 小鱼不值当
+                            // 价值/重量性价比优先
+                            if (sc > 0) {
+                                sc = sc * 10 / (Data.DEFS[it.kind].weight + 4);
+                            }
+                            // 路径遮挡:更近处若有垃圾/TNT 挡道,收益打折
+                            // (HitTest 按数组序返回第一个命中,近物先被抓)
+                            if (sc > 0) {
+                                for (int j = 0; j < w.items.Count; j = j + 1) {
+                                    Item ob = w.items[j];
+                                    if (!ob.alive || ob == it) { continue; }
+                                    if (ob.kind == 8) { continue; } // TNT 单算
+                                    int ox = ob.x - Data.HOOK_X;
+                                    int oy = ob.y - Data.HOOK_Y;
+                                    double oproj = ox * Math.Cos(rad)
+                                                   + oy * Math.Sin(rad);
+                                    if (oproj < 110.0 || oproj > proj - 10.0) {
+                                        continue;
+                                    }
+                                    double operp = Math.Abs(
+                                        -ox * Math.Sin(rad) + oy * Math.Cos(rad));
+                                    if (operp > 26.0) { continue; }
+                                    ItemDef od = Data.DEFS[ob.kind];
+                                    if (od.junk || od.score < 120) {
+                                        sc = sc / 4;    // 大概率先抓到它
+                                        break;
+                                    }
+                                }
+                            }
+                            if (sc > bestScore) { bestScore = sc; best = it; }
+                        }
                     }
                     if (best != null) { w.Action(); captured = captured + 1; }
                 } else if (w.state == World.ST_QTE) {
-                    // AI:白圈进入金圈时命中(50% 概率成功,模拟手残)
-                    if (w.qteRing >= 34.0 && w.qteRing <= 54.0 && f % 3 == 0) {
+                    // AI:白圈进入金圈即命中(20% 空点,模拟手残)
+                    if (w.qteRing >= 34.0 && w.qteRing <= 54.0 && f % 5 != 0) {
                         w.Action();
                     }
                 } else if (w.state == World.ST_BOMB) {
                     w.Action();     // 疯狂点击
+                } else if (w.state == World.ST_RETRACT
+                           && w.hookedKind == 6 && w.dynamites > 0) {
+                    w.UseDynamite();    // 石头不上桌:用炸药止损
                 }
                 w.Step(16);
             }
@@ -757,10 +827,21 @@ class MinerApp {
                 break;
             }
             if (w.levelResult > 0) {
+                wonLevels = wonLevels + 1;
+                // ConfirmResult 要求结算画面停留 600ms;SIM 里直接推
+                // 进 1 秒再确认,走真实过关流程(level+1)。
+                w.Step(1000);
                 w.ConfirmResult();
             } else {
                 break;      // 经济到顶:失败即停(曲线过陡的信号)
             }
+        }
+        // 平衡口径:8 种子中位推进 L5+、最差 L2+。曲线过陡(中位
+        // 低于 L3)或过缓(中位 L8 通关)都会被这里拦下。
+        if (wonLevels < 2) {
+            log.WriteLine("  !! balance: only " + wonLevels
+                          + " of first levels won");
+            allOk = false;
         }
         log.WriteLine(allOk ? "=== SIM PASS ===" : "=== SIM FAIL ===");
         log.WriteLine("bestLevel=" + w.bestLevel + " totalGold=" + w.totalGold);
@@ -863,6 +944,8 @@ class MinerApp {
             if (app.hud != null) {
                 if (!app.hud.Frame(app.r, h.WindowHandle())) {
                     // 与主循环一致的降级:合成失败退回宿主直呈 + 场景层兜底
+                    Console.WriteLine("[hudshot] frame failed f=" + f +
+                                      " err=" + app.hud.LastError());
                     app.hud = null;
                     app.host.hudMode = false;
                 }
@@ -946,8 +1029,8 @@ class HudTop {
         p.Dock(Dock.Top());
         this.bar = p;
 
-        Flex row = Flex.Row().AlignCenter().Gap(14);
-        p.Pad(10);
+        Flex row = Flex.Row().AlignCenter().Gap(this.app.Ux(14));
+        p.Pad(this.app.Ux(10));
         p.With(row);
 
         // 顶栏整行统一 hud-subtitle(14px)——此前 title/subtitle/small
@@ -962,7 +1045,7 @@ class HudTop {
 
         this.bar_ = new Progress(0, 0);
         this.bar_.Class = "hud";
-        this.bar_.Prefer(300, 18);
+        this.bar_.Prefer(this.app.Ux(300), this.app.Ux(18));
         this.bar_.ShowText(false);
         row.With(this.bar_);
 
@@ -987,8 +1070,11 @@ class HudTop {
         int pct = w.gold * 100 / w.Target();
         if (pct > 100) { pct = 100; }
         this.bar_.SetPercent(pct);
-        int secLeft = (w.timeLeftMs + 999) / 1000;
-        this.time.Text = "剩余 " + secLeft + " 秒";
+        // 两位小数倒计时:厘秒连续跳动,时间感知更紧(最后 10 秒尤其)。
+        int totalCs = (w.timeLeftMs + 5) / 10;
+        int cs = totalCs % 100;
+        this.time.Text = "剩余 " + totalCs / 100 + "." +
+                         (cs < 10 ? "0" : "") + cs + " 秒";
         if (w.combo >= 2) {
             this.combo.Text = "连击 x" + w.combo;
         } else {
@@ -1017,8 +1103,8 @@ class HudOverlay {
         // ---- 结算面板(居中) ----
         Panel rp = new Panel();
         rp.Class = "hud-panel";
-        rp.Prefer(420, 260);
-        rp.Place(Data.W / 2 - 210, 200);
+        rp.Prefer(this.app.Ux(420), this.app.Ux(260));
+        rp.Place(this.app.Ux(Data.W / 2 - 210), this.app.Ux(200));
         this.result = rp;
 
         this.resTitle = new Label("");
@@ -1045,8 +1131,8 @@ class HudOverlay {
         // ---- 拆弹面板(居中) ----
         Panel bp = new Panel();
         bp.Class = "hud-panel";
-        bp.Prefer(320, 150);
-        bp.Place(Data.W / 2 - 160, 240);
+        bp.Prefer(this.app.Ux(320), this.app.Ux(150));
+        bp.Place(this.app.Ux(Data.W / 2 - 160), this.app.Ux(240));
         this.bomb = bp;
 
         Label title = new Label("疯狂点击! 拆除炸弹!");
@@ -1063,7 +1149,7 @@ class HudOverlay {
 
         this.bombBar = new Progress(0, 0);
         this.bombBar.Class = "hud";
-        this.bombBar.Prefer(280, 14);
+        this.bombBar.Prefer(this.app.Ux(280), this.app.Ux(14));
         this.bombBar.ShowText(false);
         bp.With(this.bombBar);
 

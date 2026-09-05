@@ -91,16 +91,21 @@ if (!(Test-Path -LiteralPath $staticLib)) {
 }
 
 # ---- zan_sdl3 bridge --------------------------------------------------------
-# SDL3 is linked statically INTO the bridge DLL, so the bridge itself needs no
-# separate SDL3.dll. The win-x64 bundle still ships SDL3.dll (like every other
-# target) because Game.Kit Host calls SDL_RestoreWindow directly via [DllImport("SDL3")]
-# (see drivers/win-x64/*.bundle).
-Write-Output "Building zan_sdl3 bridge (static SDL3)..."
+# The bridge links SDL3 DYNAMICALLY (import lib): every SDL participant in a
+# game process — the bridge (window/renderer), zan_gui's SDL-backend HUD
+# compositor, and any direct [DllImport("SDL3")] call — must share ONE SDL3
+# instance. SDL objects are validated against a hash table private to the SDL3
+# copy that created them, so a handle made by a statically-baked SDL3 inside
+# this DLL is rejected ("Parameter 'renderer' is invalid") by the SDL3.dll the
+# gui driver uses — that was Game.Ui.Hud scene_upload rc=3. The bundle ships
+# SDL3.dll beside the bridge; Game.Kit also calls window restore through it.
+Write-Output "Building zan_sdl3 bridge (dynamic SDL3)..."
 & $Compiler `
     -std=c11 -O2 -Wall -Wextra -Werror=implicit-function-declaration -shared `
+    "-DZAN_SDL3_STB_OWN" `
     "-I$includeDir" `
     $source `
-    "-L$libraryDir" "-l:libSDL3.a" `
+    "-L$libraryDir" "-l:libSDL3.dll.a" `
     -lm -lkernel32 -luser32 -lgdi32 -lwinmm -limm32 -lole32 -loleaut32 `
     -lversion -luuid -ladvapi32 -lsetupapi -lshell32 `
     "-Wl,--out-implib,$bridgeImport" `
@@ -109,6 +114,41 @@ Write-Output "Building zan_sdl3 bridge (static SDL3)..."
 if ($LASTEXITCODE -ne 0) {
     throw "zan_sdl3 bridge build failed with exit code $LASTEXITCODE"
 }
+
+# ---- static zan_sdl3 archive (win --publish --link-mode static) -------------
+# Publishes of SDL games link the bridge as an archive whose SDL_* symbols are
+# satisfied by ONE static libSDL3.a shared with the SDL-backend zan_gui archive
+# (drivers/win-x64/static-sdl). Without this archive a static publish would
+# still carry the shared bridge (own static SDL3 -> two instances again).
+# libSDL3.a is copied into static/ so the compiler's static-driver dependency
+# lookup (drivers/<target>/static/libSDL3.a) and plain -lSDL3 both resolve to
+# it instead of the import lib.
+Write-Output "Building static zan_sdl3 archive (win-x64)..."
+$staticDriverDir = Join-Path $driverDir "static"
+New-Item -ItemType Directory -Force -Path $staticDriverDir | Out-Null
+# No -DZAN_SDL3_STB_OWN: the static archive declares stb_image only and lets
+# the gui static archive provide the implementation (one decoder, no
+# duplicate-symbol abort when both archives link into a static publish).
+& $Compiler `
+    -std=c11 -O2 -Wall -Wextra -Werror=implicit-function-declaration `
+    "-I$includeDir" `
+    -c $source `
+    -o "$work\zan_sdl3_static.obj"
+if ($LASTEXITCODE -ne 0) {
+    throw "zan_sdl3 static compile failed with exit code $LASTEXITCODE"
+}
+& llvm-ar rcs (Join-Path $staticDriverDir "libzan_sdl3.a") "$work\zan_sdl3_static.obj"
+if ($LASTEXITCODE -ne 0) { throw "llvm-ar failed" }
+Copy-Item -LiteralPath $staticLib (Join-Path $staticDriverDir "libSDL3.a") -Force
+@(
+    '# Static zan_sdl3 bridge. Built by scripts/stage_sdl3.ps1 (mingw).',
+    '# SDL3 comes from static/libSDL3.a (single instance shared with the SDL-',
+    '# backend zan_gui archive); system deps per sdl3.pc Libs.private.',
+    '-lSDL3',
+    '-lkernel32', '-luser32', '-lgdi32', '-lwinmm', '-limm32', '-lole32',
+    '-loleaut32', '-lversion', '-luuid', '-ladvapi32', '-lsetupapi',
+    '-lshell32', '-ldinput8'
+) | Set-Content -Encoding ascii (Join-Path $staticDriverDir "zan_sdl3.libs")
 
 Copy-Item -LiteralPath $sdlLicense -Destination (Join-Path $driverDir "SDL3-LICENSE.txt") -Force
 

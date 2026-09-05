@@ -190,9 +190,25 @@ class GameHud {
         }
         if (w <= 0 || h <= 0) { return false; }
         if (this.app.canvas.Width() != w || this.app.canvas.Height() != h) {
-            // HUD 画布与渲染器后备缓冲尺寸不一致（如跨 SDL3 实例读到
-            // 垃圾窗口尺寸后画布被错误 resize）——合成结果必然错位，
-            // 交回宿主降级直呈，避免两种呈现交替闪变。
+            // 画布与渲染器后备缓冲不同步时先试着追平再失败。接管路径
+            // 下 App 构造时仍建了一个哑 Win32 外壳窗口（WINDOWS 宏编译
+            // 出的 Win32Shell.CreateWindow），其首帧 WM_SIZE/客户区查询
+            // 会把画布 resize 到外壳窗口自己的尺寸（与 DPI 缩放后的
+            // 1440x1080 请求叠加，得到 2182x1646 这类值）——那不是
+            // 渲染器后备缓冲的尺寸。此处以渲染器输出为准重建画布
+            // （SwapCanvas 同时清掉跨表面快照/损伤状态），下一帧即
+            // 正常合成；只有追平后仍不等（真分辨率漂移）才降级。
+            if (this.app.canvas.Width() != this.sceneW
+                    || this.app.canvas.Height() != this.sceneH
+                    || this.sceneW != w || this.sceneH != h) {
+                this.app.SwapCanvas(w, h);
+            }
+        }
+        if (this.app.canvas.Width() != w || this.app.canvas.Height() != h) {
+            // 追平后仍不一致：合成结果必然错位，交回宿主降级直呈，
+            // 避免两种呈现交替闪变。
+            this.lastError = "canvas " + this.app.canvas.Width() + "x" +
+                this.app.canvas.Height() + " != renderer " + w + "x" + h;
             return false;
         }
         // Scene-frame buffer: reuse the previous frame's allocation (member
@@ -207,8 +223,13 @@ class GameHud {
             this.pixH = h;
         }
         if (this.scene == null) { return false; }
-        if (!this.ReadScene(renderer, this.scene, w, h)) { return false; }
-        if (Window.SceneUpload(sdlWindowHandle, this.scene, w, h) != 0) {
+        if (!this.ReadScene(renderer, this.scene, w, h)) {
+            this.lastError = "read scene failed";
+            return false;
+        }
+        int rc = Window.SceneUpload(sdlWindowHandle, this.scene, w, h);
+        if (rc != 0) {
+            this.lastError = "scene upload rc=" + Convert.ToString(rc);
             return false;
         }
         App app = this.app;
@@ -222,6 +243,10 @@ class GameHud {
         app.PresentFrame();
         // 合成呈现失败（如 gui 运行时与宿主不在同一 SDL3 实例）返回
         // false，宿主可据此降级回自己的直呈路径。
-        return Window.ScenePresent(sdlWindowHandle, app.canvas.SurfaceId()) == 0;
+        if (Window.ScenePresent(sdlWindowHandle, app.canvas.SurfaceId()) != 0) {
+            this.lastError = "scene present failed";
+            return false;
+        }
+        return true;
     }
 }
