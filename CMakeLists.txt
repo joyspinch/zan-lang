@@ -854,6 +854,18 @@ add_test(NAME diag_implicit_ghost_call
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_implicit_ghost_call PROPERTIES TIMEOUT 60)
 
+# An instance method reached through the type name used to fall through to
+# the static call path and drop its receiver argument, failing LLVM
+# verification far from the call site; the static path must reject it.
+add_test(NAME diag_static_path_instance_call
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/static_path_instance_call.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_static_path_instance_call${_exe_ext}
+    "-DEXPECT_REGEX=cannot call instance method .Widget.Draw. via the type name"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_static_path_instance_call PROPERTIES TIMEOUT 60)
+
 # Regression (audit H4): a named argument bound past a defaulted parameter
 # used to write a NULL into the call's argument list and crash zanc with no
 # diagnostic. The rebinder must reject the shape up front.

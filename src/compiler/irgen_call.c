@@ -4191,6 +4191,20 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     if (method_sym) fill_default_args(g, expr, method_sym);
                     if (method_sym) pack_params_args(g, expr, method_sym, locals);
                     if (method_sym) {
+                        /* The receiver here is a type name (locals and fields
+                         * were ruled out above), so only a static method can
+                         * be claimed: emitting an instance method would drop
+                         * its receiver argument and fail LLVM verification
+                         * with an argument-count mismatch far from this call
+                         * site. Diagnose at the source instead. */
+                        if ((method_sym->modifiers & MOD_STATIC) == 0) {
+                            zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                                "cannot call instance method '%.*s.%.*s' via "
+                                "the type name: call it on an instance",
+                                (int)type_sym->name.len, type_sym->name.str,
+                                (int)callee->member.name.len,
+                                callee->member.name.str);
+                        }
                         int spec = try_method_spec(g, method_sym, expr, NULL, locals);
                         if (spec >= 0)
                             return emit_method_spec_call(g, spec, expr, NULL, locals);

@@ -2658,6 +2658,81 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* Cross-linking to OHOS follows the Android policy: the OHOS sysroot
+         * ships none of the desktop third-party natives (openssl, ...), so a
+         * DllImport lib that neither a bundled static driver archive
+         * (drivers/ohos-x64/static/, already collected above) nor a driver
+         * .so can provide is stubbed and dropped from extern_libs -- the
+         * link line must not keep asking for -l<lib>, which would fail the
+         * build instead of just degrading that feature at runtime. Runs
+         * before emission so the shared-library link sees a clean list. */
+        if (cross_compiling && target.os == ZAN_OS_OHOS) {
+            char oexe[1024] = {0};
+            zan_exe_dir(oexe, sizeof(oexe));
+            const char *odrop_sub = (target.arch == ZAN_ARCH_AARCH64)
+                                    ? "ohos-arm64" : "ohos-x64";
+            zan_driver_registry_t oreg;
+            zan_discover_drivers(resolved_stdlib_root, &oreg);
+            /* Backwards: drop_extern_lib compacts extern_libs, so a
+             * forward walk would skip the entry after every drop. */
+            for (int li = irgen.extern_lib_count - 1; li >= 0; li--) {
+                if (zan_win_system_lib(irgen.extern_libs[li].str,
+                                       (int)irgen.extern_libs[li].len))
+                    continue;
+                int nlen;
+                const char *nm = zan_dllimport_lname(
+                    irgen.extern_libs[li].str,
+                    (int)irgen.extern_libs[li].len, &nlen);
+                if (!nm) continue;
+                int resolvable = 0;
+                int via_static_archive = 0;
+                { char drvso[1300];
+                  snprintf(drvso, sizeof(drvso), "%s/%s/lib%.*s.so",
+                           oexe, odrop_sub, nlen, nm);
+                  if (zan_file_exists(drvso)) {
+                      resolvable = 1;
+                  } else {
+                      int didx = zan_driver_find(&oreg, nm, nlen);
+                      if (didx >= 0 && resolved_stdlib_root[0]) {
+                          snprintf(drvso, sizeof(drvso),
+                                   "%s/%s/drivers/%s/static/lib%.*s.a",
+                                   resolved_stdlib_root,
+                                   oreg.entries[didx].module,
+                                   odrop_sub, nlen, nm);
+                          if (zan_file_exists(drvso)) {
+                              resolvable = 1;
+                              via_static_archive = 1;
+                          } else {
+                              snprintf(drvso, sizeof(drvso),
+                                       "%s/%s/drivers/%s/lib%.*s.so",
+                                       resolved_stdlib_root,
+                                       oreg.entries[didx].module,
+                                       odrop_sub, nlen, nm);
+                              resolvable = zan_file_exists(drvso);
+                          }
+                      }
+                  }
+                }
+                if (via_static_archive) {
+                    /* the link already carries the static archive on its
+                     * command line; dropping the lib keeps -l<lib> (and so a
+                     * duplicate DT_NEEDED on a driver .so) off the line. No
+                     * stubs here -- a defined stub would satisfy the
+                     * references and the archive member would never load. */
+                    zan_irgen_drop_extern_lib(
+                        &irgen, irgen.extern_libs[li].str,
+                        (int)irgen.extern_libs[li].len);
+                } else if (!resolvable) {
+                    zan_irgen_stub_extern_lib(
+                        &irgen, irgen.extern_libs[li].str,
+                        (int)irgen.extern_libs[li].len);
+                    zan_irgen_drop_extern_lib(
+                        &irgen, irgen.extern_libs[li].str,
+                        (int)irgen.extern_libs[li].len);
+                }
+            }
+        }
+
         /* Cross-linking to macOS is dynamic: a [DllImport] lib resolves from
          * the per-target driver dylib shipped inside the owning stdlib module
          * (<module>/drivers/<target-sub>/lib<name>.dylib), or from the first
@@ -3117,37 +3192,47 @@ int main(int argc, char **argv) {
          * disk copy is there; a published binary carries none of the source
          * tree, so the same reads silently return "" / missing and whole
          * feature areas vanish (the gui_gallery catalog rendered empty). When
-         * --publish is building a program (not a library) that actually calls
-         * the embed API and an assets/ folder sits beside the entry source,
-         * bake it in under its discovery name "assets/<file>" so the reads
-         * keep working with nothing beside the executable. Disk wins at
+         * building a program that actually calls the embed API and an
+         * assets/ folder sits beside the entry source, bake it in under its
+         * discovery name "assets/<file>" so the reads keep working with
+         * nothing beside the executable. Disk wins at
          * every read (File.Exists tries the disk first), so a replacement
          * assets/ folder on the target still overrides the baked-in copy, and
          * an explicit --embed assets spec (the IDE publish stages one)
          * makes this auto-embed skip. --emit-apk sets emit_lib for the
          * shared libmain.so but is still a program: its assets must bake
-         * in exactly the same way or the packaged app loses them. */
-        if (publish_mode && irgen.uses_embed_api &&
+         * in exactly the same way or the packaged app loses them. Not
+         * gated on --publish: any program whose code loads embedded
+         * resources carries them (ohos --emit-lib HAP packaging included);
+         * libraries and programs that never call the embed API are
+         * unaffected. */
+        if (irgen.uses_embed_api &&
             resolved_stdlib_root[0]) {
-            /* The discovery anchor is the entry source's own directory (a
-             * multi-project tree has no zan.proj to name the root), with the
-             * resolved project root as a second candidate so both
-             * "zanc dir/prog.zan" and "zanc prog.zan" inside a manifest
-             * project find their assets/. */
-            char assets_dir[1400];
-            snprintf(assets_dir, sizeof(assets_dir), "%s", input_file);
-            char *asep = strrchr(assets_dir, '/');
-            char *aback = strrchr(assets_dir, '\\');
-            if (!asep || (aback && aback > asep)) asep = aback;
-            char assets_cands[2][1200];
+            /* The discovery anchor is the first input source whose own
+             * directory holds an assets/ folder — multi-file builds put
+             * auxiliary sources (generated registries, widgets) on the
+             * command line before the entry, so the entry alone is the
+             * wrong anchor — with the resolved project root as a fallback
+             * candidate so both "zanc dir/prog.zan" and "zanc prog.zan"
+             * inside a manifest project find their assets/. */
+            char assets_cands[3][1200];
             int assets_cand_count = 0;
-            if (asep) {
+            for (int fi = 0; fi < input_count && assets_cand_count < 2; fi++) {
+                char assets_dir[1400];
+                snprintf(assets_dir, sizeof(assets_dir), "%s",
+                         input_files[fi]);
+                char *asep = strrchr(assets_dir, '/');
+                char *aback = strrchr(assets_dir, '\\');
+                if (!asep || (aback && aback > asep)) asep = aback;
+                if (!asep) continue;
                 *asep = 0;
                 snprintf(assets_cands[assets_cand_count], 1200, "%s/assets",
                          assets_dir);
-                assets_cand_count++;
+                if (zan_file_exists(assets_cands[assets_cand_count]))
+                    assets_cand_count++;
             }
-            if (strcmp(package_project_root, ".") != 0) {
+            if (assets_cand_count < 2 &&
+                strcmp(package_project_root, ".") != 0) {
                 snprintf(assets_cands[assets_cand_count], 1200, "%s/assets",
                          package_project_root);
                 assets_cand_count++;
@@ -4129,6 +4214,83 @@ int main(int argc, char **argv) {
                                " \"%s/liblog.so\" \"%s/libdl.so\""
                                " \"%s/libclang_rt.builtins.a\"",
                                sys3, sys3, sys3, sys3, sys3); }
+                    if (getenv("ZAN_VERBOSE_LINK"))
+                        fprintf(stderr, "[link] %s\n", cmd);
+                    link_ret = system(cmd);
+                } else if (target.os == ZAN_OS_OHOS) {
+                    /* HarmonyOS shared library: the HAP's XComponent shell
+                     * dlopens the app's "main" shared library and calls
+                     * zan_hap_main(); zap_main.o (in the sysroot subset)
+                     * adapts that to the module's main(i32, i8**), exactly
+                     * like SDL_main.o does for the APK shell. libEGL/libGLESv3
+                     * (the GUI driver's present path) go on the line as sysroot
+                     * stubs, same policy as the android branch's libc/libm
+                     * stubs: a dlopened library relocates against its own
+                     * dependency group, so the dependency must be recorded
+                     * here -- preloading the libs globally from the shell is
+                     * not enough under the OHOS linker namespace. Undefined
+                     * libc symbols resolve from the OHOS global namespace at
+                     * load (the app process always has libc.so). */
+                    const char *osub = (target.arch == ZAN_ARCH_AARCH64)
+                                       ? "ohos-arm64" : "ohos-x64";
+                    char sys4[1200];
+                    snprintf(sys4, sizeof(sys4), "%s/%s", link_exe_dir, osub);
+                    char probe4[1300];
+                    snprintf(probe4, sizeof(probe4), "%s/zap_main.o", sys4);
+                    if (!zan_file_exists(probe4)) {
+                        fprintf(stderr,
+                                "error: bundled %s sysroot subset not found "
+                                "at '%s'; reinstall zan or rebuild with "
+                                "toolchain/%s present\n",
+                                osub, sys4, osub);
+                        remove(obj_tmp);
+                        zan_irgen_destroy(&irgen);
+                        zan_arena_free(arena);
+                        free(source);
+                        return 1;
+                    }
+                    snprintf(cmd, sizeof(cmd),
+                             "ld.lld -shared -o \"%s\" \"%s/zap_main.o\""
+                             " \"%s\" \"%s/libclang_rt.builtins.a\""
+                             " \"%s/libEGL.so\" \"%s/libGLESv3.so\"",
+                             obj_path, sys4, obj_tmp, sys4, sys4, sys4);
+                    /* bundled static driver archives (the GUI rasterizer,
+                     * freetype, ...): members are pulled in for the symbols
+                     * the module references, their own libc references stay
+                     * undefined and resolve from the OHOS global namespace */
+                    for (int d = 0; d < cross_archive_count; d++) {
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                                 cross_archives[d]);
+                    }
+                    /* same conditional Zan runtime objects as the exe link:
+                     * a dlopened library has no second chance to resolve
+                     * them, so whatever the module references must be inside */
+                    if (rt_timer_obj) {
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"",
+                                 rt_timer_obj);
+                    }
+                    if (irgen.uses_socket_async) {
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur,
+                                 " \"%s/zanrt_io.o\"", sys4);
+                    }
+                    if (irgen.uses_sync_runtime) {
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur,
+                                 " \"%s/zanrt_sync.o\"", sys4);
+                    }
+                    if (irgen.uses_file_runtime) {
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur,
+                                 " \"%s/zanrt_file.o\"", sys4);
+                    }
+                    if (irgen.uses_embed_api) {
+                        size_t cur = strlen(cmd);
+                        snprintf(cmd + cur, sizeof(cmd) - cur,
+                                 " \"%s/zan_embed_api.o\"", sys4);
+                    }
                     if (getenv("ZAN_VERBOSE_LINK"))
                         fprintf(stderr, "[link] %s\n", cmd);
                     link_ret = system(cmd);
