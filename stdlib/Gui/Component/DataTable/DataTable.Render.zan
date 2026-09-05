@@ -1668,6 +1668,12 @@ partial class DataTable {
                     if (cellInRange) {
                         c.FillRect(ccl, ry, cw, rowH, sRowSel.BgOr(0));
                     }
+                    // 填充拖拽的目标区域用半透明强调色铺出，
+                    // 与源块（不透明选区色）区分。
+                    if (st.fillDrag && oiRow >= st.fillTR0 && oiRow <= st.fillTR1
+                        && cc >= st.fillTC0 && cc <= st.fillTC1) {
+                        c.FillRect(ccl, ry, cw, rowH, DataTable.ColorAlpha(sAccent.BgOr(0), 40));
+                    }
                     if (st.editing && rowIdx == st.editRow && cc == st.editCol) {
                         edX = ccl; edY = ry; edW = cw; edH = rowH; edVis = true;
                     }
@@ -1767,6 +1773,29 @@ partial class DataTable {
                                        rightX, pinnedW, pinnedRW, fcY, fcH, clipRight);
                 c.DrawRect(fcX, fcY, fcW, fcH, sAccent.BgOr(0), 1);
                 c.PopClip();
+            }
+        }
+
+        // ---------------- 填充柄（Excel 式拖拽填充） ----------------
+        // 活动范围右下角的小方块。角点滚出视口或列隐藏时
+        // 不绘制也不拦截（fillHX=-1）；编辑中不显示。
+        st.fillHX = -1;
+        st.fillHY = -1;
+        if (DataTable.HasRange(st) && !st.editing) {
+            int hr1 = DataTable.MaxI(st.rangeR0, st.rangeR1);
+            int hc1 = DataTable.MaxI(st.rangeC0, st.rangeC1);
+            if (hc1 >= 0 && hc1 < st.dispW.Count && hr1 >= start && hr1 < start + r) {
+                int hy = bodyTop + (hr1 - start + 1) * rowH;
+                for (int fh = 0; fh < frameColumns.Count; fh = fh + 1) {
+                    if (frameColumns[fh].column == hc1) {
+                        int hx = frameColumns[fh].x + st.dispW[hc1];
+                        int hsz = app.Scale(7);
+                        st.fillHX = hx;
+                        st.fillHY = hy;
+                        c.FillRect(hx - hsz, hy - hsz, hsz, hsz, sAccent.BgOr(0));
+                        c.DrawRect(hx - hsz, hy - hsz, hsz, hsz, sRow.BgOr(0), 1);
+                    }
+                }
             }
         }
 
@@ -2133,7 +2162,20 @@ partial class DataTable {
         // 左键按下
         if (ek == 2 && eb == 0 && ptrOi >= 0) {
             bool ctrlDrag = (emods & 1) != 0;          // Ctrl：追加选区区域
-            if (DataTable.DispKind(st, ptrOi) == 1) {
+            // 填充柄按下：进入填充拖拽，不启动范围选择。
+            int grabW = app.Scale(6);
+            if (st.fillHX >= 0 && !st.editing
+                && app.mouseX >= st.fillHX - grabW && app.mouseX < st.fillHX + grabW
+                && app.mouseY >= st.fillHY - grabW && app.mouseY < st.fillHY + grabW) {
+                st.fillDrag = true;
+                st.fillSR0 = DataTable.MinI(st.rangeR0, st.rangeR1);
+                st.fillSR1 = DataTable.MaxI(st.rangeR0, st.rangeR1);
+                st.fillSC0 = DataTable.MinI(st.rangeC0, st.rangeC1);
+                st.fillSC1 = DataTable.MaxI(st.rangeC0, st.rangeC1);
+                st.fillTR0 = 0; st.fillTR1 = -1;
+                st.fillTC0 = 0; st.fillTC1 = -1;
+                app.RequestRedraw();
+            } else if (DataTable.DispKind(st, ptrOi) == 1) {
                 // 分组标题按下：切换该组折叠状态
                 int gi = DataTable.DispRowOf(st, ptrOi);
                 DataTable.ToggleCollapse(st, st.groups[gi].key);
@@ -2191,6 +2233,28 @@ partial class DataTable {
 
         // 拖拽移动
         if (ek == 1) {
+            // 填充拖拽：按指针位置推出单轴目标矩形
+            // （源块内→无目标），渲染层铺色反馈。
+            if (st.fillDrag) {
+                st.fillTR0 = 0; st.fillTR1 = -1;
+                st.fillTC0 = 0; st.fillTC1 = -1;
+                if (ptrOi >= 0) {
+                    if (ptrOi > st.fillSR1) {
+                        st.fillTR0 = st.fillSR1 + 1; st.fillTR1 = ptrOi;
+                        st.fillTC0 = st.fillSC0; st.fillTC1 = st.fillSC1;
+                    } else if (ptrOi < st.fillSR0) {
+                        st.fillTR0 = ptrOi; st.fillTR1 = st.fillSR0 - 1;
+                        st.fillTC0 = st.fillSC0; st.fillTC1 = st.fillSC1;
+                    } else if (ptrCol >= 0 && ptrCol > st.fillSC1) {
+                        st.fillTC0 = st.fillSC1 + 1; st.fillTC1 = ptrCol;
+                        st.fillTR0 = st.fillSR0; st.fillTR1 = st.fillSR1;
+                    } else if (ptrCol >= 0 && ptrCol < st.fillSC0) {
+                        st.fillTC0 = ptrCol; st.fillTC1 = st.fillSC0 - 1;
+                        st.fillTR0 = st.fillSR0; st.fillTR1 = st.fillSR1;
+                    }
+                    app.RequestRedraw();
+                }
+            }
             // 行号列上拖动：从锚点到当前行连续选中（多选）
             if (st.rowSelDrag && ptrOi >= 0 && DataTable.DispKind(st, ptrOi) == 0) {
                 DataTable.SelectRowSpan(st, src, st.selAnchor, ptrOi);
@@ -2216,6 +2280,21 @@ partial class DataTable {
 
         // 左键释放
         if (ek == 3 && eb == 0) {
+            // 填充释放：把源块铺进目标（数值级差外推，其余复制）。
+            if (st.fillDrag) {
+                st.fillDrag = false;
+                if (st.fillTR0 <= st.fillTR1 && st.fillTC0 <= st.fillTC1) {
+                    int filled = DataTable.FillApply(st, cols, src,
+                                                     st.fillSR0, st.fillSC0, st.fillSR1, st.fillSC1,
+                                                     st.fillTR0, st.fillTC0, st.fillTR1, st.fillTC1);
+                    if (filled > 0) {
+                        DataTable.Flash(st, DataTable.TN("Filled {n} cells", filled, "已填充 {n} 个单元格"));
+                    }
+                }
+                st.fillTR0 = 0; st.fillTR1 = -1;
+                st.fillTC0 = 0; st.fillTC1 = -1;
+                app.RequestRedraw();
+            }
             if (st.rangeDrag) { st.rangeDrag = false; st.rangeSelTouched.Clear(); app.RequestRedraw(); }
             if (st.rowSelDrag) { st.rowSelDrag = false; app.RequestRedraw(); }
             if (st.dragRow >= 0) {

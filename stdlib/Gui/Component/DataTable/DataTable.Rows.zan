@@ -118,10 +118,13 @@ partial class DataTable {
     /// 将可逆更改压入日志；达到上限时丢弃最旧的条目
     /// 。撤销本身产生的写入不会被记录——
     /// 否则撤销会立刻变成自己的重做。
+    /// 新编辑会清空 redoLog：从分支点开始，旧的重做路径作废
+    /// （与 Excel/主流编辑器一致）。
     static void Journal(DataTableState st, RowEdit e) {
         if (st.undoing) { return; }
         e.group = st.undoGroup;
         st.undoLog.Add(e);
+        if (st.redoLog.Count > 0) { st.redoLog.Clear(); }
         while (st.undoLog.Count > st.undoLimit && st.undoLog.Count > 0) {
             st.undoLog.RemoveAt(0);
         }
@@ -151,8 +154,12 @@ partial class DataTable {
         return n;
     }
 
-    /// 清空日志（例如保存后）。
-    static void ClearUndo(DataTableState st) { st.undoLog.Clear(); }
+    /// 清空日志（例如保存后）。重做历史随保存快照一并作废
+    /// ——保存后的重放可能把已持久化的状态再次改掉。
+    static void ClearUndo(DataTableState st) {
+        st.undoLog.Clear();
+        st.redoLog.Clear();
+    }
 
     /// 在数据索引 `at` 处插入空行并选中它。返回新行的索引，
     /// 源拒绝时返回 -1。
@@ -301,12 +308,15 @@ partial class DataTable {
 
         // 弹出末尾条目；若它属于某个分组，则连同
         // 该组的所有条目一起弹出——从最新开始，每次回退都作用于
-        // 前一次回退留下的行索引上。
+        // 前一次回退留下的行索引上。弹出的条目按弹出顺序压入
+        // redoLog，组的末尾因此是最旧条目——重做时从末尾
+        // 逐个弹出即恢复原始写入顺序。
         int grp = st.undoLog[st.undoLog.Count - 1].group;
         bool more = true;
         while (more && st.undoLog.Count > 0) {
             RowEdit e = st.undoLog[st.undoLog.Count - 1];
             st.undoLog.RemoveAt(st.undoLog.Count - 1);
+            st.redoLog.Add(e);
             DataTable.UndoOne(st, cols, src, e);
             more = grp != 0 && st.undoLog.Count > 0
                    && st.undoLog[st.undoLog.Count - 1].group == grp;
@@ -315,6 +325,48 @@ partial class DataTable {
         st.undoing = false;
         st.dirty = true;
         return true;
+    }
+
+    /// 重放最近一次被撤销的更改；有可重做内容时返回 true。
+    static bool Redo(DataTableState st, List<DataColumn> cols, DataSource src) {
+        if (st.redoLog.Count == 0) { return false; }
+
+        // 重放走公开操作会自我记录；与 Undo 相同，用
+        // undoing 抑制，重放的条目不会再次进入任何日志。
+        st.undoing = true;
+
+        // 从 redoLog 末尾取一组（组内最旧在末尾，弹出顺序
+        // 即原始写入顺序），逐条重新应用。
+        int grp = st.redoLog[st.redoLog.Count - 1].group;
+        bool more = true;
+        while (more && st.redoLog.Count > 0) {
+            RowEdit e = st.redoLog[st.redoLog.Count - 1];
+            st.redoLog.RemoveAt(st.redoLog.Count - 1);
+            DataTable.RedoOne(st, cols, src, e);
+            more = grp != 0 && st.redoLog.Count > 0
+                   && st.redoLog[st.redoLog.Count - 1].group == grp;
+        }
+
+        st.undoing = false;
+        st.dirty = true;
+        return true;
+    }
+
+    /// 重放一条日志条目。假定 st.undoing 已设置。
+    static void RedoOne(DataTableState st, List<DataColumn> cols, DataSource src, RowEdit e) {
+        if (e.kind == 0) {
+            if (e.row >= 0 && e.row < src.RowCount() && e.col >= 0 && e.col < cols.Count) {
+                src.SetCell(e.row, e.col, e.after);
+                st.hitRow = e.row;
+                st.hitCol = e.col;
+            }
+        } else if (e.kind == 1) {
+            // 重做插入 = 再插一次空行
+            DataTable.InsertRow(st, cols, src, e.row);
+        } else if (e.kind == 2) {
+            // 重做删除 = 再次删除该行
+            DataTable.DeleteRow(st, cols, src, e.row);
+        }
     }
 
     /// 回退一条日志条目。假定 st.undoing 已设置。

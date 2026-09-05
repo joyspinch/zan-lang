@@ -757,75 +757,323 @@ partial class DataTable {
         return DataTable.BuildText(st, cols, src, false, false);
     }
 
-    /// 从光标处开始向网格粘贴制表符分隔文本，向下
-    /// 向右填充。只有可编辑且非 bool 的列接受值；bool
-    /// 列通过 ParseBool 读取粘贴文本，“Yes”/“1”都能落库。
+    /// 写入一个单元格：bool 归一化、与键入相同的校验、
+    /// 记撤销日志。同值写入直接跳过（重复块填充不产生
+    /// 无意义的日志）。返回 1 表示写入了。
+    static int WriteCellValue(DataTableState st, List<DataColumn> cols, DataSource src,
+                              int row, int col, string v) {
+        if (row < 0 || row >= src.RowCount() || col < 0 || col >= cols.Count) { return 0; }
+        if (!cols[col].editable) { return 0; }
+        if (cols[col].isBool) {
+            if (DataTable.ParseBool(v)) { v = cols[col].boolTrue; }
+            else { v = cols[col].boolFalse; }
+        }
+        // 粘贴/填充与键入受相同规则约束，非法字段会被
+        // 跳过，而不是绕过列的校验。st.editError 报告
+        // 最后一个，供调用方展示。
+        string perr = DataTable.ValidateCell(cols[col], v);
+        if (perr.Length > 0) { st.editError = perr; return 0; }
+        string cur = src.CellText(row, col);
+        if (cur == v) { return 0; }
+        DataTable.Journal(st, RowEdit.Cell(row, col, cur, v));
+        src.SetCell(row, col, v);
+        return 1;
+    }
+
+    /// 该列是否接受粘贴/填充写入：可编辑、非必填
+    /// （留空非法的列不能被批量覆写）、非公式列
+    /// （公式列的值是算出来的，写基础值没有意义）。
+    static bool FillWritable(DataColumn col) {
+        return col.editable && !col.required && col.formula.Length == 0;
+    }
+
+    /// 把一个文本块按 Excel 语义平铺进槽位×列的矩形：
+    /// 行取 `lines[(slot-r0)%行数]`，列取 `fields[ci%bw]`，
+    /// 块比目标大则裁剪。写入前跳过分组行。
+    static int PasteSeg(DataTableState st, List<DataColumn> cols, DataSource src,
+                        List<string> lines, int bw,
+                        int slotR0, int slotR1, int c0, int ncols) {
+        int written = 0;
+        int t = slotR0;
+        while (t <= slotR1 && t < DataTable.DispCount(st)) {
+            if (DataTable.DispKind(st, t) == 0) {
+                int row = DataTable.DispRowOf(st, t);
+                List<string> fields = DataTable.SplitTabs(lines[(t - slotR0) % lines.Count]);
+                for (int ci = 0; ci < ncols && c0 + ci < cols.Count; ci = ci + 1) {
+                    int fi = ci % bw;
+                    string v = fi < fields.Count ? fields[fi] : "";
+                    written = written + DataTable.WriteCellValue(st, cols, src, row, c0 + ci, v);
+                }
+            }
+            t = t + 1;
+        }
+        return written;
+    }
+
+    /// 从光标处开始向网格粘贴制表符分隔文本。
+    /// 有选区时按 Excel 语义写入整个选区：块比选区小就
+    /// 平铺（1x1 块铺满整片），块比选区大则裁剪到选区内；
+    /// 多区域（Ctrl 追加）时逐区域独立平铺。无选区时从
+    /// 锚点向下向右铺开（块按原样流动）。一次粘贴记一组
+    /// 撤销。只有可编辑且非 bool 的列接受值；bool 列通过
+    /// ParseBool 读取粘贴文本，"Yes"/"1" 都能落库。
     /// 返回实际写入的单元格数。
     static int PasteText(DataTableState st, List<DataColumn> cols, DataSource src, string text) {
         if (text.Length == 0) { return 0; }
-        int r0 = st.hitOrder;
-        int c0 = st.hitCol;
-        if (DataTable.HasRange(st)) {
-            r0 = DataTable.MinI(st.rangeR0, st.rangeR1);
-            c0 = DataTable.MinI(st.rangeC0, st.rangeC1);
-        }
-        if (r0 < 0 || c0 < 0) { return 0; }
 
-        // 锚点可能是分组标题（例如光标停在标题上）；
-        // 从那里起第一个数据行开始写入。
-        r0 = DataTable.NextDataSlot(st, r0, 1);
-        if (r0 < 0) { return 0; }
-
-        // 一次粘贴记一次撤销，无论涉及多少单元格。
-        DataTable.BeginUndoGroup(st);
+        // 解析块：丢掉结尾空行（它们不指向任何行），
+        // 宽度取最宽行，供平铺取模对齐。
         List<string> lines = DataTable.SplitLines(text);
-        int written = 0;
-        int li = 0;
-        int slot = r0;
-        while (li < lines.Count) {
-            // 结尾换行会产生一个空行；粘贴它会清空
-            // 用户并未指向的行。
-            if (lines[li].Length == 0 && li == lines.Count - 1) { li = li + 1; }
-            else {
+        while (lines.Count > 0 && lines[lines.Count - 1].Length == 0) { lines.RemoveAt(lines.Count - 1); }
+        if (lines.Count == 0) { return 0; }
+        int bw = 1;
+        for (int li = 0; li < lines.Count; li = li + 1) {
+            int w = DataTable.SplitTabs(lines[li]).Count;
+            if (w > bw) { bw = w; }
+        }
+
+        int nRanges = DataTable.RangeCount(st);
+        if (nRanges == 0) {
+            // 无选区：从锚点向下向右铺开（旧语义）。
+            int r0 = st.hitOrder;
+            int c0 = st.hitCol;
+            if (r0 < 0 || c0 < 0) { return 0; }
+            // 锚点可能是分组标题（例如光标停在标题上）；
+            // 从那里起第一个数据行开始写入。
+            r0 = DataTable.NextDataSlot(st, r0, 1);
+            if (r0 < 0) { return 0; }
+
+            // 一次粘贴记一次撤销，无论涉及多少单元格。
+            DataTable.BeginUndoGroup(st);
+            int written = 0;
+            int slot = r0;
+            int li = 0;
+            while (li < lines.Count) {
                 slot = DataTable.NextDataSlot(st, slot, 1);
                 if (slot < 0) { li = lines.Count; }
                 else {
                     int row = DataTable.DispRowOf(st, slot);
                     List<string> fields = DataTable.SplitTabs(lines[li]);
                     for (int fi = 0; fi < fields.Count && c0 + fi < cols.Count; fi = fi + 1) {
-                        int col = c0 + fi;
-                        if (cols[col].editable) {
-                            string v = fields[fi];
-                            if (cols[col].isBool) {
-                                if (DataTable.ParseBool(v)) { v = cols[col].boolTrue; }
-                                else { v = cols[col].boolFalse; }
-                            }
-                            // 粘贴与键入受相同规则约束，
-                            // 非法字段会被跳过，而不是绕过
-                            // 列的校验。st.editError 报告最后
-                            // 一个，供调用方展示。
-                            string perr = DataTable.ValidateCell(cols[col], v);
-                            if (perr.Length > 0) { st.editError = perr; }
-                            else {
-                                DataTable.Journal(st, RowEdit.Cell(row, col, src.CellText(row, col), v));
-                                src.SetCell(row, col, v);
-                                written = written + 1;
-                            }
-                        }
+                        written = written + DataTable.WriteCellValue(st, cols, src, row, c0 + fi, fields[fi]);
                     }
                     slot = slot + 1;
                     li = li + 1;
                 }
             }
+            DataTable.EndUndoGroup(st);
+            if (written > 0) {
+                st.editRow = DataTable.DispRowOf(st, r0);
+                st.editCol = c0;
+                st.CellEdit.Raise();
+                st.dirty = true;
+            }
+            return written;
+        }
+
+        // 有选区：逐区域独立平铺（区域数少，顺序遍历即可）。
+        DataTable.BeginUndoGroup(st);
+        int total = 0;
+        int editSlot = -1;
+        int editCol = -1;
+        for (int qi = 0; qi < nRanges; qi = qi + 1) {
+            int qr0 = -1; int qc0 = -1; int qr1 = -1; int qc1 = -1;
+            if (!DataTable.RangeAt(st, qi, out qr0, out qc0, out qr1, out qc1)) { continue; }
+            if (qr0 < 0 || qc0 < 0) { continue; }
+            int ncols = qc1 - qc0 + 1;
+            total = total + DataTable.PasteSeg(st, cols, src, lines, bw, qr0, qr1, qc0, ncols);
+            if (editSlot < 0) {
+                int fs = DataTable.NextDataSlot(st, qr0, 1);
+                if (fs >= 0 && fs <= qr1) { editSlot = fs; editCol = qc0; }
+            }
         }
         DataTable.EndUndoGroup(st);
-        if (written > 0) {
-            st.editRow = DataTable.DispRowOf(st, r0);
-            st.editCol = c0;
+        if (total > 0 && editSlot >= 0) {
+            st.editRow = DataTable.DispRowOf(st, editSlot);
+            st.editCol = editCol;
             st.CellEdit.Raise();
             st.dirty = true;
         }
+        return total;
+    }
+
+    /// Ctrl+D：把选区顶行的值向下复制到选区内其余行。
+    /// 只写 FillWritable 的列。返回写入的单元格数。
+    static int FillDown(DataTableState st, List<DataColumn> cols, DataSource src) {
+        if (!DataTable.HasRange(st)) { return 0; }
+        int r0 = DataTable.MinI(st.rangeR0, st.rangeR1);
+        int r1 = DataTable.MaxI(st.rangeR0, st.rangeR1);
+        int c0 = DataTable.MinI(st.rangeC0, st.rangeC1);
+        int c1 = DataTable.MaxI(st.rangeC0, st.rangeC1);
+        int top = DataTable.NextDataSlot(st, r0, 1);
+        if (top < 0 || top > r1) { return 0; }
+        int srcRow = DataTable.DispRowOf(st, top);
+        DataTable.BeginUndoGroup(st);
+        int written = 0;
+        int t = DataTable.NextDataSlot(st, top + 1, 1);
+        while (t >= 0 && t <= r1) {
+            int row = DataTable.DispRowOf(st, t);
+            for (int c = c0; c <= c1 && c < cols.Count; c = c + 1) {
+                if (DataTable.FillWritable(cols[c])) {
+                    written = written + DataTable.WriteCellValue(st, cols, src, row, c, src.CellText(srcRow, c));
+                }
+            }
+            t = DataTable.NextDataSlot(st, t + 1, 1);
+        }
+        DataTable.EndUndoGroup(st);
+        if (written > 0) { st.CellEdit.Raise(); st.dirty = true; }
         return written;
+    }
+
+    /// Ctrl+R：把选区左列的值向右复制到选区内其余列。
+    /// 只写 FillWritable 的列。返回写入的单元格数。
+    static int FillRight(DataTableState st, List<DataColumn> cols, DataSource src) {
+        if (!DataTable.HasRange(st)) { return 0; }
+        int r0 = DataTable.MinI(st.rangeR0, st.rangeR1);
+        int r1 = DataTable.MaxI(st.rangeR0, st.rangeR1);
+        int c0 = DataTable.MinI(st.rangeC0, st.rangeC1);
+        int c1 = DataTable.MaxI(st.rangeC0, st.rangeC1);
+        if (c1 <= c0) { return 0; }
+        DataTable.BeginUndoGroup(st);
+        int written = 0;
+        int t = DataTable.NextDataSlot(st, r0, 1);
+        while (t >= 0 && t <= r1) {
+            int row = DataTable.DispRowOf(st, t);
+            for (int c = c0 + 1; c <= c1 && c < cols.Count; c = c + 1) {
+                if (DataTable.FillWritable(cols[c])) {
+                    written = written + DataTable.WriteCellValue(st, cols, src, row, c, src.CellText(row, c0));
+                }
+            }
+            t = DataTable.NextDataSlot(st, t + 1, 1);
+        }
+        DataTable.EndUndoGroup(st);
+        if (written > 0) { st.CellEdit.Raise(); st.dirty = true; }
+        return written;
+    }
+
+    /// 源矩形内的数据行索引（跳过分组行）。
+    static List<int> FillSrcRows(DataTableState st, int sr0, int sr1) {
+        List<int> rows = new List<int>();
+        int t = sr0;
+        while (t <= sr1 && t < DataTable.DispCount(st)) {
+            if (DataTable.DispKind(st, t) == 0) { rows.Add(DataTable.DispRowOf(st, t)); }
+            t = t + 1;
+        }
+        return rows;
+    }
+
+    /// 级差填充：源行/列 ≥2 格且全为非空数值时按线性级差
+    /// 外推（10/20 → 30/40…），与 Excel 拖两格数字一致；
+    /// 其余（含 bool、文本）返回 null，调用方按块复制。
+    static string FillSeriesValue(DataTableState st, List<DataColumn> cols, DataSource src,
+                                  List<int> srcRows, int col, int d, bool forward) {
+        if (srcRows.Count < 2) { return null; }
+        double first = 0.0;
+        double last = 0.0;
+        for (int i = 0; i < srcRows.Count; i = i + 1) {
+            string s = src.CellText(srcRows[i], col);
+            if (s.Length == 0) { return null; }
+            double v = DataTable.ParseReal(s);
+            if (i == 0) { first = v; }
+            last = v;
+        }
+        double step = (last - first) / (double)(srcRows.Count - 1);
+        double nv = forward ? last + step * (double)d : first - step * (double)d;
+        return DataTable.FormatReal(nv, cols[col].decimals);
+    }
+
+    /// 填充柄内核：把源矩形 [sr0..sr1]×[sc0..sc1] 的内容铺进
+    /// 相邻目标矩形（下/上/右/左之一，调用方保证单轴）。
+    /// 数值块按级差外推（FillSeriesValue），其余按块循环复制。
+    /// 一次填充一组撤销；只写 FillWritable 的列。
+    /// 返回写入的单元格数。
+    static int FillApply(DataTableState st, List<DataColumn> cols, DataSource src,
+                         int sr0, int sc0, int sr1, int sc1,
+                         int tr0, int tc0, int tr1, int tc1) {
+        if (tr0 > tr1 || tc0 > tc1) { return 0; }
+        bool down = tr0 > sr1;
+        bool up = tr1 < sr0;
+        bool right = tc0 > sc1;
+        bool left = tc1 < sc0;
+        List<int> srcRows = DataTable.FillSrcRows(st, sr0, sr1);
+        if (srcRows.Count == 0) { return 0; }
+        int srcCols = sc1 - sc0 + 1;
+        DataTable.BeginUndoGroup(st);
+        int written = 0;
+        if (down || up) {
+            int t = tr0;
+            while (t <= tr1) {
+                if (DataTable.DispKind(st, t) == 0) {
+                    int row = DataTable.DispRowOf(st, t);
+                    // 源块循环取模：距离目标端第 d 步对应源块
+                    // 的第 (d-1)%n 行（向下）或末块向前（向上）。
+                    for (int c = sc0; c <= sc1 && c < cols.Count; c = c + 1) {
+                        if (!DataTable.FillWritable(cols[c])) { continue; }
+                        string v = null;
+                        if (down || up) {
+                            int d = down ? t - sr1 : sr0 - t;
+                            if (d >= 1) {
+                                v = DataTable.FillSeriesValue(st, cols, src, srcRows, c, d, down);
+                            }
+                        }
+                        if (v == null) {
+                            int k = down ? (t - sr1 - 1) : (sr0 - t - 1);
+                            // 向下从块首循环取模；向上从块尾倒着取
+                            // （紧邻源块上方的行拿源块最后一行）。
+                            int mir = down
+                                ? ((k % srcRows.Count) + srcRows.Count) % srcRows.Count
+                                : srcRows.Count - 1 - (((k % srcRows.Count) + srcRows.Count) % srcRows.Count);
+                            v = src.CellText(srcRows[mir], c);
+                        }
+                        written = written + DataTable.WriteCellValue(st, cols, src, row, c, v);
+                    }
+                }
+                t = t + 1;
+            }
+        } else if (right || left) {
+            int t = tc0;
+            while (t <= tc1 && t < cols.Count) {
+                int k = right ? (t - sc1 - 1) : (sc0 - t - 1);
+                // 向右从块首循环取模；向左从块尾倒着取。
+                int mir = right
+                    ? ((k % srcCols) + srcCols) % srcCols
+                    : srcCols - 1 - (((k % srcCols) + srcCols) % srcCols);
+                int srcCol = right ? sc0 + mir : sc0 + mir;
+                if (!DataTable.FillWritable(cols[t])) { t = t + 1; continue; }
+                for (int ri = 0; ri < srcRows.Count; ri = ri + 1) {
+                    int row = srcRows[ri];
+                    string v = null;
+                    if (srcRows.Count >= 2) {
+                        v = DataTable.FillSeriesValueRow(st, cols, src, row, sc0, sc1, right ? t - sc1 : sc0 - t, right);
+                    }
+                    if (v == null) { v = src.CellText(row, srcCol); }
+                    written = written + DataTable.WriteCellValue(st, cols, src, row, t, v);
+                }
+                t = t + 1;
+            }
+        }
+        DataTable.EndUndoGroup(st);
+        if (written > 0) { st.CellEdit.Raise(); st.dirty = true; }
+        return written;
+    }
+
+    /// 行方向的级差外推：同一行内 [c0..c1] 的源值全为非空
+    /// 数值时线性外推第 d 步；否则 null。
+    static string FillSeriesValueRow(DataTableState st, List<DataColumn> cols, DataSource src,
+                                     int row, int c0, int c1, int d, bool forward) {
+        if (c1 - c0 + 1 < 2) { return null; }
+        double first = 0.0;
+        double last = 0.0;
+        for (int c = c0; c <= c1; c = c + 1) {
+            string s = src.CellText(row, c);
+            if (s.Length == 0) { return null; }
+            double v = DataTable.ParseReal(s);
+            if (c == c0) { first = v; }
+            last = v;
+        }
+        double step = (last - first) / (double)(c1 - c0);
+        double nv = forward ? last + step * (double)d : first - step * (double)d;
+        return DataTable.FormatReal(nv, cols[c0].decimals);
     }
 
     /// 清空当前范围内的所有可编辑单元格（Delete 键）。
