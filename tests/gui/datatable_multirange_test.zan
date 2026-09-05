@@ -213,9 +213,11 @@ class Program {
         int fr = DataTable.FillRight(st, cols, src);
         Console.WriteLine("fillRight=" + (fr == 1 && src.CellText(0, 1) == "8"));
 
-        // ---- 数据透视：行维度=第一文本列、值=数值列求和 ----
+        // ---- 透视视图：表格整体切换为交叉投影 ----
         // 三行数据：类别×区域交叉。Apples/North=10+30=40、
         // Apples/South=20、Pears/North=5、Pears/South=15。
+        // 先挂一个逐列筛选：物化只聚合“通过当前筛选”的行，
+        // 透视随之只剩 Pears（并且进入/退出视图不丢原条件）。
         List<DataRow> prows = new List<DataRow>();
         Program.PRow(prows, "Apples", "North", "10");
         Program.PRow(prows, "Apples", "South", "20");
@@ -229,23 +231,62 @@ class Program {
         pcols.Add(DataColumn.Numeric("amt", 80));
         DataTableState pst = new DataTableState();
         DataTable.EnsureInit(pst, pcols, psrc);
-        pst.rangeR0 = 0; pst.rangeR1 = 4;
-        pst.rangeC0 = 0; pst.rangeC1 = 2;
-        bool pb = DataTable.BuildPivotFromRange(pst, pcols, psrc);
-        // 2 行（Apples、Pears 保序）× 2 列（North、South）
-        int aNX = pst.pivotCols.IndexOf("North");
-        int aSX = pst.pivotCols.IndexOf("South");
-        int aA = pst.pivotRows.IndexOf("Apples");
-        int aP = pst.pivotRows.IndexOf("Pears");
-        Console.WriteLine("pivotBuild=" + (pb && pst.pivotRows.Count == 2
-            && pst.pivotCols.Count == 2 && aNX == 0 && aSX == 1
-            && aA == 0 && aP == 1));
-        Console.WriteLine("pivotSum=" + (pst.pivotData[aA * 2 + aNX] == 40.0
-            && pst.pivotData[aA * 2 + aSX] == 20.0
-            && pst.pivotData[aP * 2 + aNX] == 5.0
-            && pst.pivotData[aP * 2 + aSX] == 15.0
-            && pst.pivotRowTot[aA] == 60.0 && pst.pivotColTot[aNX] == 45.0
-            && pst.pivotGrand == 80.0));
+        pst.filters[0].textQuery = "pears";
+        bool pvSet = DataTable.SetPivot(pst, pcols, psrc, 0, 1, 2, 0);
+        Console.WriteLine("pivotSet=" + (pvSet && DataTable.IsPivotView(pst)
+            && pst.pvRowKeys.Count == 1 && pst.pvRowKeys[0] == "Pears"));
+        // 生成列：行维度 + North + South + Total（Sum 模式）
+        List<DataColumn> vcols = DataTable.PivotViewCols(pst);
+        DataSource pview = DataTable.PivotViewSource(pst, psrc);
+        Console.WriteLine("pivotCols=" + (vcols.Count == 4
+            && vcols[1].title == "North" && vcols[2].title == "South"));
+        Console.WriteLine("pivotFiltered=" + (pview.CellText(0, 0) == "Pears"
+            && pview.CellNum(0, 1) == 5 && pview.CellNum(0, 2) == 15
+            && pview.CellNum(0, 3) == 20));
+        // 退出还原：原始行数与进入前的筛选条件原样回来
+        DataTable.ExitPivot(pst);
+        Console.WriteLine("pivotExit=" + (!pst.pivotView && psrc.RowCount() == 5
+            && pst.filters[0].textQuery == "pears" && pst.colWidths.Count == 3));
+        // 清掉筛选再进入：完整 2×2 交叉表（Apples、Pears 保序）
+        pst.filters[0].textQuery = "";
+        DataTable.SetPivot(pst, pcols, psrc, 0, 1, 2, 0);
+        Console.WriteLine("pivotSum=" + (pview.CellText(0, 0) == "Apples"
+            && pview.CellText(1, 0) == "Pears"
+            && pview.CellNum(0, 1) == 40 && pview.CellNum(0, 2) == 20
+            && pview.CellNum(1, 1) == 5 && pview.CellNum(1, 2) == 15
+            && pview.CellNum(0, 3) == 60 && pview.CellNum(1, 3) == 20));
+        // 聚合切换：Count 模式（Apples/North 有两笔），
+        // 且 Sum 专属的 Total 列随之消失
+        DataTable.SetPivotAgg(pst, pcols, psrc, 2);
+        Console.WriteLine("pivotCount=" + (pview.CellNum(0, 1) == 2
+            && pview.CellNum(1, 2) == 1 && DataTable.PivotViewCols(pst).Count == 3));
+
+        // ---- 筛选面板芯片投影：逐列/筛选行/组合树 ----
+        DataTable.ExitPivot(pst);
+        pst.filters[0].textQuery = "pears";
+        List<FilterChip> chips = DataTable.FilterChips(pst, pcols);
+        Console.WriteLine("chipsCol=" + (chips.Count == 1 && chips[0].Kind() == 0
+            && chips[0].Col() == 0));
+        pst.filterRowText[1] = "north";
+        pst.showFilterRow = true;
+        FilterGroup tree = FilterGroup.And();
+        tree.Conditions().Add(FilterCondition.Equals("region", "EU"));
+        DataTable.SetFilterTree(pst, tree);
+        List<FilterChip> chips2 = DataTable.FilterChips(pst, pcols);
+        Console.WriteLine("chipsAll=" + (chips2.Count == 3 && chips2[0].Kind() == 0
+            && chips2[1].Kind() == 1 && chips2[2].Kind() == 2));
+        // 透视视图下的芯片：透视芯片常驻首张，
+        // 进入前的原始条件以 kind 4 芯片可见
+        DataTable.SetFilterTree(pst, null);
+        DataTable.SetPivot(pst, pcols, psrc, 0, 1, 2, 0);
+        List<FilterChip> chips3 = DataTable.FilterChips(pst, pcols);
+        Console.WriteLine("chipsPivot=" + (chips3.Count == 2
+            && chips3[0].Kind() == 3 && chips3[1].Kind() == 4));
+        DataTable.ExitPivot(pst);
+        DataTable.ClearAllFilters(pst);
+        List<FilterChip> chips4 = DataTable.FilterChips(pst, pcols);
+        Console.WriteLine("chipsClear=" + (chips4.Count == 0
+            && !DataTable.HasFilterTree(pst)));
     }
 
     static void PRow(List<DataRow> list, string item, string region, string amt) {

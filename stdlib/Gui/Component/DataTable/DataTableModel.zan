@@ -1137,6 +1137,14 @@ class DataTableState {
     string filterRowBuf;       // 焦点单元格的编辑缓冲区
     int filterRowCur;          // filterRowBuf 中的光标字节偏移
 
+    // ---- 筛选面板（DevExpress Filter Panel 风格、表头上方的条件芯片条） ----
+    // 把全部活动筛选（逐列 ColFilter、筛选行文本、组合树）
+    // 投影成一行芯片：点芯片直接打开该列的筛选菜单，
+    // × 清除该条件；透视视图激活时常驻一张透视芯片
+    // （点击切换聚合，× 退出视图）。透视视图开启时
+    // 面板自动出现，即使 showFilterPanel 为 false。
+    bool showFilterPanel;      // 绘制筛选面板条带（默认 false）
+
     // ---- 状态栏（DevExpress 风格底部条） ----
     // 显示当前单元格范围或选中行的
     // 行数/选中数/范围聚合（总和、平均、计数）——隐藏时零开销。
@@ -1158,19 +1166,35 @@ class DataTableState {
     List<ChartBar> chartBars;  // 每根条 {类别标签, 值}
     int chartMax;              // 最大的条值（>=1），用于缩放
 
-    // ---- 选区数据透视浮层（Excel/AG Grid 风格交叉表） ----
-    // 把选中范围投影成 行标签列 × 首个文本列的离散值列 的
-    // 交叉聚合表。pivotData 为行优先的 cells 平铺
-    // （rowMajor：[row * nColValue + col]），pivotRowTot /
-    // pivotColTot 是行列总计（Sum/Count 才有，其余模式为空）。
-    bool pivotOpen;            // 绘制透视浮层
-    string pivotRowTitle;      // 行维度列标题
-    List<string> pivotRows;    // 行标签（去重保序）
-    List<string> pivotCols;    // 列标签（去重保序）
-    List<double> pivotData;    // 聚合值，行优先平铺
-    List<double> pivotRowTot;  // 每行总计（对齐 pivotRows）
-    List<double> pivotColTot;  // 每列总计（对齐 pivotCols）
-    double pivotGrand;         // 总计
+    // ---- 透视视图（ag-Grid 风格：表格整体切换为交叉表） ----
+    // 激活后 RenderSource 用 PivotDataSource 包住原源，把
+    // “行维度 × 列维度”的交叉聚合当成普通行×列数据交给
+    // 现有管线——排序/筛选/汇总/状态栏原样可用，无需独立的
+    // Pivot Grid 组件。pvCells 行优先平铺 [row*nColKey + col]。
+    // 物化只聚合通过当前筛选（进入视图前的原始筛选状态）
+    // 的行；视图层的筛选/排序再作用于交叉结果本身。
+    bool pivotView;            // 表格当前显示透视投影而非原始数据
+    int pvRowCol;              // 行维度源列（-1 未配置）
+    int pvColDim;              // 列维度源列（-1 无第二维度 → 单值汇总列）
+    int pvValueCol;            // 值源列
+    List<string> pvRowKeys;    // 行键（去重保序）
+    List<string> pvColKeys;    // 列键（去重保序；无第二维度时为单个空串）
+    List<double> pvCells;      // 聚合值，行优先平铺
+    List<double> pvRowTot;     // 每行总计（仅 Sum 模式物化）
+    List<DataColumn> pvViewCols; // 透视视图的生成列描述
+    DataSource pvInner;        // 原始数据源（物化与 Poll 代理）
+    PivotDataSource pvSource;  // 交给渲染管线的包装源
+    bool pvDirty;              // 交叉表需要重建
+    int pvOrigCols;            // 进入视图时的列数（退出时裁掉追加的视图槽位）
+    List<DataColumn> pvOrigColsList; // 进入视图时的原始列引用（芯片标题、重建用）
+    List<ColFilter> pvSavedFilters;     // 进入前的逐列筛选（物化据此过滤）
+    List<string> pvSavedFilterRowText;  // 进入前的筛选行文本
+    List<int> pvSavedGroupCols;         // 进入前的分组列
+    List<SortKey> pvSavedSortKeys;      // 进入前的排序键
+    bool pvSavedSummary;                // 进入前的 showSummary
+    string pvRowTitle;         // 行维度列标题（筛选面板芯片显示用）
+    string pvColTitle;         // 列维度列标题
+    string pvValTitle;         // 值列标题
     int pivotAgg;              // 0 Sum，1 Average，2 Count
 
     // ---- 行分组（ag-Grid / DevExpress 风格） ----
@@ -1432,6 +1456,7 @@ class DataTableState {
         this.filterRowFocusCol = -1;
         this.filterRowBuf = "";
         this.filterRowCur = 0;
+        this.showFilterPanel = false;
         this.showStatusBar = false;
         this.colChooserOpen = false;
         this.colChooserSearch = "";
@@ -1440,14 +1465,28 @@ class DataTableState {
         this.chartTitle = "";
         this.chartBars = new List<ChartBar>();
         this.chartMax = 1;
-        this.pivotOpen = false;
-        this.pivotRowTitle = "";
-        this.pivotRows = new List<string>();
-        this.pivotCols = new List<string>();
-        this.pivotData = new List<double>();
-        this.pivotRowTot = new List<double>();
-        this.pivotColTot = new List<double>();
-        this.pivotGrand = 0.0;
+        this.pivotView = false;
+        this.pvRowCol = -1;
+        this.pvColDim = -1;
+        this.pvValueCol = -1;
+        this.pvRowKeys = new List<string>();
+        this.pvColKeys = new List<string>();
+        this.pvCells = new List<double>();
+        this.pvRowTot = new List<double>();
+        this.pvViewCols = new List<DataColumn>();
+        this.pvInner = null;
+        this.pvSource = null;
+        this.pvDirty = false;
+        this.pvOrigCols = 0;
+        this.pvOrigColsList = null;
+        this.pvSavedFilters = null;
+        this.pvSavedFilterRowText = null;
+        this.pvSavedGroupCols = null;
+        this.pvSavedSortKeys = null;
+        this.pvSavedSummary = false;
+        this.pvRowTitle = "";
+        this.pvColTitle = "";
+        this.pvValTitle = "";
         this.pivotAgg = 0;
         this.FilterChanged = new UiEvent();
         this.HeaderClick = new UiEvent();

@@ -1,0 +1,746 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component.DataTable;
+
+/// 透视视图数据源：把 DataTableState 里物化好的交叉聚合
+/// （pvRowKeys × pvColKeys → pvCells）当成普通行×列源交给
+/// 渲染管线。列 0 是行维度标签，之后每列一个列键的聚合值，
+/// Sum 模式再追加一列“Total”行总计。聚合格是派生结果，
+/// 写入被忽略、不可插入——视图层的所有排序/筛选/汇总
+/// （作用于交叉结果本身）照常工作。
+///
+/// Poll 代理到底层源：底层交付新数据时标记交叉表脏，
+/// 下一帧重物化，服务端/实时源的增量自动跟进。
+class PivotDataSource : DataSource {
+    DataTableState st;
+    DataSource inner;
+
+    PivotDataSource(DataTableState state, DataSource innerSrc) {
+        this.st = state;
+        this.inner = innerSrc;
+    }
+
+    override int RowCount() { return this.st.pvRowKeys.Count; }
+
+    override string CellText(int row, int col) {
+        int nR = this.st.pvRowKeys.Count;
+        int nC = this.st.pvColKeys.Count;
+        if (row < 0 || row >= nR) { return ""; }
+        if (col == 0) { return this.st.pvRowKeys[row]; }
+        int dec = this.st.pivotAgg == 1 ? 2 : 0;
+        // Sum 模式在生成列末尾有一列“Total”：读行总计。
+        if (this.st.pvRowTot.Count == nR && col == nC + 1) {
+            return DataTable.FormatReal(this.st.pvRowTot[row], dec);
+        }
+        if (col - 1 >= 0 && col - 1 < nC) {
+            return DataTable.FormatReal(this.st.pvCells[row * nC + (col - 1)], dec);
+        }
+        return "";
+    }
+
+    override int CellNum(int row, int col) {
+        int nR = this.st.pvRowKeys.Count;
+        int nC = this.st.pvColKeys.Count;
+        if (row < 0 || row >= nR || col < 1) { return 0; }
+        if (this.st.pvRowTot.Count == nR && col == nC + 1) {
+            return (int)this.st.pvRowTot[row];
+        }
+        if (col - 1 < nC) { return (int)this.st.pvCells[row * nC + (col - 1)]; }
+        return 0;
+    }
+
+    override double CellReal(int row, int col) {
+        int nR = this.st.pvRowKeys.Count;
+        int nC = this.st.pvColKeys.Count;
+        if (row < 0 || row >= nR || col < 1) { return 0.0; }
+        if (this.st.pvRowTot.Count == nR && col == nC + 1) {
+            return this.st.pvRowTot[row];
+        }
+        if (col - 1 < nC) { return this.st.pvCells[row * nC + (col - 1)]; }
+        return 0.0;
+    }
+
+    override bool Poll() {
+        if (this.inner != null && this.inner.Poll()) {
+            this.st.pvDirty = true;
+            return true;
+        }
+        return false;
+    }
+}
+
+/// 一张筛选条件芯片。kind：0 逐列 ColFilter，1 筛选行
+/// 文本，2 组合筛选树，3 透视视图（常驻首张），4 透视
+/// 视图下“进入前”的原始逐列筛选（已烘进聚合，× 触发
+/// 重物化）。`col` 仅对 0/1/4 有意义。纯数据投影，
+/// 测试可直接断言。
+class FilterChip {
+    int kind;
+    int col;
+    string text;
+
+    FilterChip(int chipKind, int chipCol, string chipText) {
+        this.kind = chipKind;
+        this.col = chipCol;
+        this.text = chipText;
+    }
+
+    static FilterChip Make(int kind, int col, string text) {
+        return new FilterChip(kind, col, text);
+    }
+
+    /// 芯片类别（0 逐列 / 1 筛选行 / 2 组合树 / 3 透视 / 4 原始逐列）。
+    int Kind() { return this.kind; }
+    /// 所属列索引（kind 0/1/4），其余 -1。
+    int Col() { return this.col; }
+    /// 显示文本。
+    string Text() { return this.text; }
+}
+
+partial class DataTable {
+    // ---------- 透视视图（表格整体切换为交叉表） ----------
+
+    /// 表格当前是否处于透视视图。
+    static bool IsPivotView(DataTableState st) {
+        return st.pivotView;
+    }
+
+    /// 把整个表格切换为透视投影：行维度 `rowCol`、列维度
+    /// `colDim`（-1 = 无第二维度，退化为按行维度的单值汇总列）、
+    /// 值 `valueCol` 按 `agg`（0 Sum，1 Average，2 Count）聚合。
+    /// 聚合范围是“通过当前筛选的行”——进入视图前的原始
+    /// 逐列筛选、筛选行与组合树在物化时作用于原始列；
+    /// 之后视图层的筛选/排序再作用于交叉结果。返回 false
+    /// 表示参数无效（维度/值列越界或重合）。
+    static bool SetPivot(DataTableState st, List<DataColumn> cols, DataSource src,
+                         int rowCol, int colDim, int valueCol, int agg) {
+        if (rowCol < 0 || rowCol >= cols.Count) { return false; }
+        if (valueCol < 0 || valueCol >= cols.Count || valueCol == rowCol) { return false; }
+        if (colDim == rowCol || colDim == valueCol || colDim >= cols.Count) { colDim = -1; }
+        if (agg < 0 || agg > 2) { agg = 0; }
+        if (!st.pivotView) {
+            // 快照原视图的查询状态，退出时原样恢复。逐列
+            // 筛选/筛选行在视图期间换成全新列表：视图层的
+            // 筛选作用于交叉结果，不污染原始条件。
+            st.pvSavedFilters = st.filters;
+            st.pvSavedFilterRowText = st.filterRowText;
+            st.pvSavedGroupCols = st.groupCols;
+            st.pvSavedSortKeys = st.sortKeys;
+            st.pvSavedSummary = st.showSummary;
+            st.pvOrigCols = cols.Count;
+            st.pvOrigColsList = cols;
+            st.filters = new List<ColFilter>();
+            st.filterRowText = new List<string>();
+            st.groupCols = new List<int>();
+            st.sortKeys = new List<SortKey>();
+        }
+        st.pivotView = true;
+        st.pvRowCol = rowCol;
+        st.pvColDim = colDim;
+        st.pvValueCol = valueCol;
+        st.pivotAgg = agg;
+        st.pvInner = src;
+        st.pvSource = new PivotDataSource(st, src);
+        st.pvRowTitle = cols[rowCol].title;
+        st.pvColTitle = colDim >= 0 ? cols[colDim].title : "";
+        st.pvValTitle = cols[valueCol].title;
+        st.pvDirty = true;
+        DataTable.PivotEnsure(st, cols, src);
+        DataTable.PivotResetView(st);
+        // 强制下一帧对包装源整体重算（选区/显示模型随
+        // 行列语义变化重建）。
+        DataTable.InvalidateQuery(st);
+        return true;
+    }
+
+    /// 切换聚合模式并立即重建交叉表。
+    static void SetPivotAgg(DataTableState st, List<DataColumn> cols, DataSource src, int agg) {
+        if (agg < 0 || agg > 2) { agg = 0; }
+        st.pivotAgg = agg;
+        if (st.pivotView) {
+            st.pvDirty = true;
+            DataTable.PivotEnsure(st, cols, src);
+        }
+        DataTable.InvalidateQuery(st);
+    }
+
+    /// 退出透视视图：恢复进入前的筛选/分组/排序/汇总，
+    /// 裁掉生成列在按列状态里追加的槽位。
+    static void ExitPivot(DataTableState st) {
+        if (!st.pivotView) { return; }
+        st.pivotView = false;
+        st.filters = st.pvSavedFilters != null ? st.pvSavedFilters : new List<ColFilter>();
+        st.filterRowText = st.pvSavedFilterRowText != null ? st.pvSavedFilterRowText : new List<string>();
+        st.groupCols = st.pvSavedGroupCols != null ? st.pvSavedGroupCols : new List<int>();
+        st.sortKeys = st.pvSavedSortKeys != null ? st.pvSavedSortKeys : new List<SortKey>();
+        st.showSummary = st.pvSavedSummary;
+        int n = st.pvOrigCols;
+        DataTable.TruncListI(st.colWidths, n);
+        DataTable.TruncListI(st.aggMode, n);
+        DataTable.TruncListI(st.aggValue, n);
+        DataTable.TruncListI(st.cfMin, n);
+        DataTable.TruncListI(st.cfMax, n);
+        DataTable.TruncListB(st.colHidden, n);
+        DataTable.TruncListI(st.colFreeze, n);
+        DataTable.TruncListD(st.aggReal, n);
+        DataTable.TruncListD(st.aggSumR, n);
+        DataTable.TruncListD(st.aggMinR, n);
+        DataTable.TruncListD(st.aggMaxR, n);
+        DataTable.TruncListD(st.cfMinR, n);
+        DataTable.TruncListD(st.cfMaxR, n);
+        DataTable.TruncListS(st.summaryText, n);
+        int k = st.colOrder.Count - 1;
+        while (k >= 0) {
+            if (st.colOrder[k] >= n) { st.colOrder.RemoveAt(k); }
+            k = k - 1;
+        }
+        st.pvDirty = false;
+        DataTable.PivotResetView(st);
+        DataTable.InvalidateQuery(st);
+    }
+
+    /// 选区/滚动复位：进入或退出视图后行列语义已变化，
+    /// 旧位置一律无效。
+    static void PivotResetView(DataTableState st) {
+        st.selected = new List<bool>();
+        if (st.selectionModel != null) { st.selectionModel.Clear(); }
+        DataTable.ClearMulti(st);
+        DataTable.ClearRange(st);
+        st.scrollRow = 0;
+        st.scrollX = 0;
+    }
+
+    /// 从当前单元格范围推导透视配置并切换视图（右键菜单
+    /// “从选区生成透视表”的入口）：行维度 = 范围第一列，
+    /// 列维度 = 第一列之外最左的非值列，值 = 最右侧数值列。
+    static bool PivotFromSelection(DataTableState st, List<DataColumn> cols, DataSource src) {
+        if (!DataTable.HasRange(st)) { return false; }
+        int c0 = DataTable.MinI(st.rangeC0, st.rangeC1);
+        int c1 = DataTable.MaxI(st.rangeC0, st.rangeC1);
+        int valCol = -1;
+        int cc = c1;
+        while (cc >= c0) {
+            if (cc >= 0 && cc < cols.Count && cols[cc].numeric) { valCol = cc; cc = c0 - 1; }
+            else { cc = cc - 1; }
+        }
+        if (valCol < 0) { return false; }
+        int rowCol = c0;
+        if (rowCol < 0 || rowCol >= cols.Count) { return false; }
+        int colDim = -1;
+        int scan = c0 + 1;
+        while (scan <= c1) {
+            if (scan != valCol && scan >= 0 && scan < cols.Count) { colDim = scan; scan = c1 + 1; }
+            else { scan = scan + 1; }
+        }
+        return DataTable.SetPivot(st, cols, src, rowCol, colDim, valCol, st.pivotAgg);
+    }
+
+    /// 物化交叉聚合（pvDirty 时）：收集“通过当前筛选”的
+    /// 底层行，按行/列键去重保序聚合成 pvRowKeys/pvColKeys/
+    /// pvCells，并生成视图列描述 pvViewCols。
+    static void PivotEnsure(DataTableState st, List<DataColumn> cols, DataSource src) {
+        if (!st.pvDirty) { return; }
+        st.pvDirty = false;
+        int rowCol = st.pvRowCol;
+        int valCol = st.pvValueCol;
+        int colDim = st.pvColDim;
+        if (colDim == rowCol || colDim == valCol || colDim >= cols.Count) { colDim = -1; }
+        if (rowCol < 0 || rowCol >= cols.Count
+            || valCol < 0 || valCol >= cols.Count || valCol == rowCol) {
+            st.pvRowKeys = new List<string>();
+            st.pvColKeys = new List<string>();
+            st.pvCells = new List<double>();
+            st.pvRowTot = new List<double>();
+            st.pvViewCols = new List<DataColumn>();
+            return;
+        }
+
+        // 幸存行集：进入视图前的原始筛选状态（pvSaved*）
+        // 作用于原始列。服务端控制的源自己掌握行集，
+        // 本地阶段跳过（与 Recompute 的处置一致）。
+        List<ColFilter> of = st.pvSavedFilters;
+        List<string> ofr = st.pvSavedFilterRowText;
+        bool server = src.ServerControlled();
+        int today = DataTable.Today();
+        List<int> rows = new List<int>();
+        int i = 0;
+        while (i < src.RowCount()) {
+            bool pass = true;
+            if (!server) {
+                int cn = cols.Count;
+                if (of != null && of.Count < cn) { cn = of.Count; }
+                for (int fc = 0; fc < cn; fc = fc + 1) {
+                    ColFilter flt = of[fc];
+                    if (flt.Active() && !DataTable.CellPassesCol(flt, cols[fc],
+                            DataTable.CellTextRouted(cols, src, i, fc), today)) {
+                        pass = false;
+                    }
+                }
+                if (pass && ofr != null) {
+                    int rn = ofr.Count;
+                    if (rn > cols.Count) { rn = cols.Count; }
+                    for (int fr = 0; fr < rn; fr = fr + 1) {
+                        string q = ofr[fr];
+                        if (q.Length > 0 && !DataTable.ContainsCI(
+                                DataTable.CellTextRouted(cols, src, i, fr), q)) {
+                            pass = false;
+                        }
+                    }
+                }
+                if (pass && st.filterTree != null && DataTable.HasFilterTree(st)) {
+                    pass = DataTable.RowPassesFilterTree(st, cols, src, i, today);
+                }
+            }
+            if (pass) { rows.Add(i); }
+            i = i + 1;
+        }
+
+        // 键收集（保序去重）与值聚合。无第二维度时列键
+        // 固定为单个空串（单值汇总列）。
+        List<string> rkeys = new List<string>();
+        List<string> ckeys = new List<string>();
+        if (colDim < 0) { ckeys.Add(""); }
+        int t = 0;
+        List<double> raw = new List<double>();
+        int ri = 0;
+        while (ri < rows.Count) {
+            int row = rows[ri];
+            string rk = DataTable.CellTextRouted(cols, src, row, rowCol);
+            int gi = rkeys.IndexOf(rk);
+            if (gi < 0) { rkeys.Add(rk); gi = rkeys.Count - 1; }
+            int gj = 0;
+            if (colDim >= 0) {
+                string ck = DataTable.CellTextRouted(cols, src, row, colDim);
+                gj = ckeys.IndexOf(ck);
+                if (gj < 0) { ckeys.Add(ck); gj = ckeys.Count - 1; }
+            }
+            double fv;
+            if (!DataTable.FormulaTryReal(cols, src, row, valCol, out fv)) {
+                fv = DataTable.ParseReal(src.CellText(row, valCol));
+            }
+            raw.Add((double)gi);
+            raw.Add((double)gj);
+            raw.Add(fv);
+            ri = ri + 1;
+        }
+        int nR = rkeys.Count;
+        int nC = ckeys.Count;
+        int nc2 = nR * nC;
+        List<double> sum = new List<double>();
+        List<int> cnt = new List<int>();
+        int z = 0;
+        while (z < nc2) { sum.Add(0.0); cnt.Add(0); z = z + 1; }
+        while (t + 2 < raw.Count) {
+            int gi2 = (int)raw[t];
+            int gj2 = (int)raw[t + 1];
+            int ix = gi2 * nC + gj2;
+            sum[ix] = sum[ix] + raw[t + 2];
+            cnt[ix] = cnt[ix] + 1;
+            t = t + 3;
+        }
+        List<double> cells = new List<double>();
+        z = 0;
+        while (z < nc2) {
+            double av = 0.0;
+            if (st.pivotAgg == 2) { av = (double)cnt[z]; }
+            else if (st.pivotAgg == 1) { if (cnt[z] > 0) { av = sum[z] / (double)cnt[z]; } }
+            else { av = sum[z]; }
+            cells.Add(av);
+            z = z + 1;
+        }
+        // 行总计只在 Sum 模式下物化（Average 的总计权重
+        // 未知名义，Count 的行总计等于该行各键的计数和——
+        // 同样交给 Sum 视图，保持“总计”一列语义单一）。
+        List<double> rowTot = new List<double>();
+        if (st.pivotAgg == 0) {
+            int gi3 = 0;
+            while (gi3 < nR) {
+                double rt = 0.0;
+                int gj3 = 0;
+                while (gj3 < nC) { rt = rt + cells[gi3 * nC + gj3]; gj3 = gj3 + 1; }
+                rowTot.Add(rt);
+                gi3 = gi3 + 1;
+            }
+        }
+        st.pvRowKeys = rkeys;
+        st.pvColKeys = ckeys;
+        st.pvCells = cells;
+        st.pvRowTot = rowTot;
+        st.pvViewCols = DataTable.PivotBuildCols(cols, st, colDim);
+    }
+
+    /// 生成透视视图的列描述：行维度列（克隆原列但退化为
+    /// 纯文本只读）+ 每个列键一列数值 + Sum 模式的 Total 列。
+    /// 值列的格式化（前缀/后缀/小数位）随原值列。
+    static List<DataColumn> PivotBuildCols(List<DataColumn> cols, DataTableState st, int colDim) {
+        List<DataColumn> vc = new List<DataColumn>();
+        DataColumn rowc = DataTable.CloneCol(cols[st.pvRowCol]);
+        rowc.field = "";
+        rowc.cellType = 0;
+        rowc.numeric = false;
+        rowc.editable = false;
+        rowc.summary = 0;
+        rowc.isBool = false;
+        rowc.isDate = false;
+        rowc.formula = "";
+        rowc.freeze = 0;
+        rowc.band = "";
+        rowc.compId = "";
+        vc.Add(rowc);
+        DataColumn tmpl = cols[st.pvValueCol];
+        int vsum = tmpl.summary > 0 ? tmpl.summary : 1;
+        if (colDim < 0) {
+            // 无第二维度：单值汇总列直接沿用值列标题。
+            DataColumn vcol = DataTable.CloneCol(tmpl);
+            vcol.field = "";
+            vcol.editable = false;
+            vcol.summary = vsum;
+            vc.Add(vcol);
+        } else {
+            int j = 0;
+            while (j < st.pvColKeys.Count) {
+                DataColumn kcol = DataTable.CloneCol(tmpl);
+                kcol.title = st.pvColKeys[j];
+                kcol.field = "";
+                kcol.numeric = true;
+                kcol.align = 2;
+                kcol.cellType = 0;
+                kcol.editable = false;
+                kcol.summary = vsum;
+                kcol.formula = "";
+                if (kcol.width < 60) { kcol.width = 90; }
+                vc.Add(kcol);
+                j = j + 1;
+            }
+        }
+        if (st.pivotAgg == 0) {
+            DataColumn tot = DataTable.CloneCol(tmpl);
+            tot.title = DataTable.T("Total", "总计");
+            tot.field = "";
+            tot.numeric = true;
+            tot.align = 2;
+            tot.cellType = 0;
+            tot.editable = false;
+            tot.summary = vsum;
+            tot.formula = "";
+            if (tot.width < 60) { tot.width = 90; }
+            vc.Add(tot);
+        }
+        return vc;
+    }
+
+    /// 视图列描述（进入视图后由渲染管线作为 cols 使用）。
+    static List<DataColumn> PivotViewCols(DataTableState st) {
+        return st.pvViewCols;
+    }
+
+    /// 渲染管线使用的数据源：包装后的交叉表。
+    static DataSource PivotViewSource(DataTableState st, DataSource src) {
+        if (st.pvSource == null) { st.pvSource = new PivotDataSource(st, src); }
+        return st.pvSource;
+    }
+
+    /// 按类型把按列状态列表裁剪回 n 项（退出视图时移除
+    /// 生成列追加的槽位；进入只追加，因此裁剪即还原）。
+    static void TruncListI(List<int> l, int n) {
+        while (l.Count > n) { l.RemoveAt(l.Count - 1); }
+    }
+
+    static void TruncListB(List<bool> l, int n) {
+        while (l.Count > n) { l.RemoveAt(l.Count - 1); }
+    }
+
+    static void TruncListD(List<double> l, int n) {
+        while (l.Count > n) { l.RemoveAt(l.Count - 1); }
+    }
+
+    static void TruncListS(List<string> l, int n) {
+        while (l.Count > n) { l.RemoveAt(l.Count - 1); }
+    }
+
+    /// 逐字段克隆列描述（生成列与原列必须互不影响——
+    /// 视图里拖宽/隐藏不能写回应用的列对象）。
+    static DataColumn CloneCol(DataColumn c) {
+        DataColumn r = new DataColumn(c.title, c.width);
+        r.field = c.field;
+        r.cellType = c.cellType;
+        r.align = c.align;
+        r.sortable = c.sortable;
+        r.filterable = c.filterable;
+        r.resizable = c.resizable;
+        r.tagType = c.tagType;
+        r.numeric = c.numeric;
+        r.summary = c.summary;
+        r.deriveOp = c.deriveOp;
+        r.deriveA = c.deriveA;
+        r.deriveB = c.deriveB;
+        r.cfMode = c.cfMode;
+        r.cfColor = c.cfColor;
+        r.cfColor2 = c.cfColor2;
+        r.cfThreshold = c.cfThreshold;
+        r.fmt = c.fmt;
+        r.grouped = c.grouped;
+        r.prefix = c.prefix;
+        r.suffix = c.suffix;
+        r.decimals = c.decimals;
+        r.formula = c.formula;
+        r.isDate = c.isDate;
+        r.dateOrder = c.dateOrder;
+        r.dateFmt = c.dateFmt;
+        r.dateGroup = c.dateGroup;
+        r.isBool = c.isBool;
+        r.boolStyle = c.boolStyle;
+        r.boolTrue = c.boolTrue;
+        r.boolFalse = c.boolFalse;
+        r.editable = c.editable;
+        r.editorKind = c.editorKind;
+        r.btnIcon = c.btnIcon;
+        r.btnClass = c.btnClass;
+        r.sparkArea = c.sparkArea;
+        r.compId = c.compId;
+        r.shapeR = c.shapeR;
+        r.shapeC = c.shapeC;
+        r.heatBand = c.heatBand;
+        r.choices = new List<string>(c.choices);
+        r.choicesStrict = c.choicesStrict;
+        r.editStep = c.editStep;
+        r.required = c.required;
+        r.maxLength = c.maxLength;
+        r.hasMin = c.hasMin;
+        r.hasMax = c.hasMax;
+        r.editMin = c.editMin;
+        r.editMax = c.editMax;
+        r.freeze = c.freeze;
+        r.band = c.band;
+        return r;
+    }
+
+    // ---------- 筛选面板（表头上方的条件芯片条） ----------
+
+    /// 全部活动筛选条件的芯片投影：逐列 ColFilter（按列序）、
+    /// 筛选行文本、组合树；透视视图激活时在最前面加一张
+    /// 透视芯片。渲染与测试共用同一投影。
+    static List<FilterChip> FilterChips(DataTableState st, List<DataColumn> cols) {
+        List<FilterChip> chips = new List<FilterChip>();
+        if (st.pivotView) {
+            string agg = "";
+            if (st.pivotAgg == 1) { agg = DataTable.T("Average", "平均"); }
+            else if (st.pivotAgg == 2) { agg = DataTable.T("Count", "计数"); }
+            else { agg = DataTable.T("Sum", "求和"); }
+            string cfg = st.pvRowTitle;
+            if (st.pvColTitle.Length > 0) { cfg = cfg + " × " + st.pvColTitle; }
+            chips.Add(FilterChip.Make(3, -1, DataTable.T("Pivot", "透视表") + ": " + cfg + " · " + agg));
+            // 进入前的原始条件已烘进聚合，仍然可见：
+            // × 清除后触发重物化，聚合随之更新。
+            if (st.pvSavedFilters != null && st.pvOrigColsList != null) {
+                int on = st.pvOrigColsList.Count;
+                if (st.pvSavedFilters.Count < on) { on = st.pvSavedFilters.Count; }
+                for (int oc = 0; oc < on; oc = oc + 1) {
+                    string od = DataTable.DescribeColFilter(st.pvSavedFilters[oc]);
+                    if (od.Length > 0) {
+                        chips.Add(FilterChip.Make(4, oc,
+                            DataTable.ColTitle(st.pvOrigColsList, oc) + ": " + od));
+                    }
+                }
+            }
+        }
+        int cn = cols.Count;
+        if (st.filters.Count < cn) { cn = st.filters.Count; }
+        for (int c = 0; c < cn; c = c + 1) {
+            string d = DataTable.DescribeColFilter(st.filters[c]);
+            if (d.Length > 0) {
+                chips.Add(FilterChip.Make(0, c, DataTable.ColTitle(cols, c) + ": " + d));
+            }
+        }
+        if (st.showFilterRow) {
+            int rn = st.filterRowText.Count;
+            if (rn > cols.Count) { rn = cols.Count; }
+            for (int c2 = 0; c2 < rn; c2 = c2 + 1) {
+                string q = st.filterRowText[c2];
+                if (q.Length > 0) {
+                    chips.Add(FilterChip.Make(1, c2, DataTable.ColTitle(cols, c2) + " "
+                        + DataTable.T("contains", "contains") + " " + q));
+                }
+            }
+        }
+        string tree = DataTable.DescribeFilterTree(st, 80);
+        if (tree.Length > 0) {
+            chips.Add(FilterChip.Make(2, -1, tree));
+        }
+        return chips;
+    }
+
+    /// 列标题，空标题回退 field 名（与状态栏概览条一致）。
+    static string ColTitle(List<DataColumn> cols, int c) {
+        string title = cols[c].title;
+        if (title.Length == 0) { title = cols[c].field; }
+        return title;
+    }
+
+    /// 清除全部筛选条件（逐列 + 筛选行 + 组合树；透视
+    /// 视图下连“进入前”的原始条件一起清并触发重物化）。
+    /// 透视视图本身是视图形态而非筛选条件，不在此列。
+    static void ClearAllFilters(DataTableState st) {
+        for (int c = 0; c < st.filters.Count; c = c + 1) {
+            st.filters[c].Reset();
+        }
+        for (int r = 0; r < st.filterRowText.Count; r = r + 1) {
+            st.filterRowText[r] = "";
+        }
+        if (st.pivotView && st.pvSavedFilters != null) {
+            for (int oc = 0; oc < st.pvSavedFilters.Count; oc = oc + 1) {
+                st.pvSavedFilters[oc].Reset();
+            }
+            st.pvDirty = true;
+        }
+        if (DataTable.HasFilterTree(st)) { DataTable.SetFilterTree(st, null); }
+        else { DataTable.InvalidateQuery(st); }
+    }
+
+    /// 表头上方的筛选面板条带：每张芯片一个活动条件，
+    /// × 清除该条件，点芯片主体直接打开对应入口——
+    /// 逐列芯片打开该列的筛选菜单，筛选行芯片聚焦输入框，
+    /// 透视芯片切换聚合。比 DevExpress 的独立筛选面板
+    /// 少一次跳转：条件与编辑器在同一行。
+    static void RenderFilterPanel(App app, int x, int y, int viewW, int h,
+                                  List<DataColumn> cols, DataSource src, DataTableState st) {
+        Canvas c = app.canvas;
+        int fs = Style.FontFallback(app, "small");
+        StyleBox sPanel = Style.Part(app, "datatable", "panel", "", "", "",
+                                     Style.SNormal());
+        StyleBox sGrid = Style.Part(app, "datatable", "grid", "", "", "",
+                                    Style.SNormal());
+        StyleBox sChip = Style.Part(app, "datatable", "chip", "", "", "",
+                                    Style.SNormal());
+        StyleBox sChipAcc = Style.Part(app, "datatable", "chip", "", "", "",
+                                       Style.SSelected());
+        StyleBox sHint = Style.Part(app, "datatable", "hint", "", "", "",
+                                    Style.SNormal());
+        c.FillRect(x, y, viewW, h, sPanel.BgOr(0));
+        c.FillRect(x, y + h - 1, viewW, 1, sGrid.BgOr(0));
+        c.PushClip(x, y, viewW, h);
+
+        List<FilterChip> chips = DataTable.FilterChips(st, cols);
+
+        // “清除全部”按钮（条带右缘）：多于一个条件时
+        // 批量清除才有意义，单条件直接点自己的 ×。
+        int clearW = 0;
+        if (chips.Count > 1) {
+            clearW = app.Scale(74);
+            if (DataTable.TextBtn(app, x + viewW - clearW - app.Scale(6),
+                                  y + app.Scale(5), clearW, h - app.Scale(10),
+                                  DataTable.T("Clear all", "清除全部"), false)) {
+                DataTable.ClearAllFilters(st);
+                app.RequestRedraw();
+            }
+        }
+
+        if (chips.Count == 0) {
+            c.DrawText(x + app.Scale(10), Canvas.CenterTextY(y, h, fs),
+                       DataTable.T("No active filters", "暂无筛选条件"),
+                       sHint.FgOr(0), fs);
+        }
+
+        int cx = x + app.Scale(10);
+        int chipH = h - app.Scale(10);
+        int chipY = y + app.Scale(5);
+        int limitX = x + viewW - clearW - app.Scale(8);
+        for (int i = 0; i < chips.Count; i = i + 1) {
+            FilterChip chip = chips[i];
+            int w = Canvas.MeasureText(chip.Text(), fs) + app.Scale(38);
+            if (cx + w > limitX) { break; }
+            bool isPivot = chip.Kind() == 3;
+            int fill = sChip.BgOr(0);
+            int lc = sChip.FgOr(0);
+            if (isPivot) { fill = sChipAcc.BgOr(0); lc = sChipAcc.FgOr(0); }
+            c.FillRoundRect(cx, chipY, w, chipH, chipH / 2, fill);
+            int rsz = app.Scale(14);
+            int rx = cx + w - rsz - app.Scale(6);
+            int ry = chipY + (chipH - rsz) / 2;
+            c.DrawText(cx + app.Scale(10), Canvas.CenterTextY(chipY, chipH, fs),
+                       DataTable.Truncate(chip.Text(), fs, rx - cx - app.Scale(14)),
+                       lc, fs);
+            c.DrawGlyphIn("close", rx, ry, rsz, rsz, app.Scale(10), lc);
+            int rmId = app.focus.AllocId();
+            app.hitTester.RegisterRect(rmId, rx, ry, rsz, rsz, 0);
+            int chipId = app.focus.AllocId();
+            app.hitTester.RegisterRect(chipId, cx, chipY, rx - cx, chipH, 0);
+            if (app.EventKind() == 3 && app.window.EventButton() == 0
+                && app.hitTester.HitTest(app.mouseX, app.mouseY) == rmId) {
+                DataTable.RemoveFilterChip(st, chip);
+                app.RequestRedraw();
+            } else if (app.EventKind() == 3 && app.window.EventButton() == 0
+                && app.hitTester.HitTest(app.mouseX, app.mouseY) == chipId) {
+                DataTable.OpenFilterChip(st, cols, src, chip);
+                app.RequestRedraw();
+            }
+            cx = cx + w + app.Scale(8);
+        }
+        c.PopClip();
+    }
+
+    /// 芯片 × 的语义：移除该条件。逐列筛选 Reset、
+    /// 筛选行清文本、组合树整体清除、透视芯片退出视图、
+    /// 原始条件 Reset 后触发重物化。
+    static void RemoveFilterChip(DataTableState st, FilterChip chip) {
+        int kind = chip.Kind();
+        if (kind == 0) {
+            int col = chip.Col();
+            if (col >= 0 && col < st.filters.Count) {
+                st.filters[col].Reset();
+                DataTable.InvalidateQuery(st);
+            }
+        } else if (kind == 1) {
+            int col2 = chip.Col();
+            if (col2 >= 0 && col2 < st.filterRowText.Count) {
+                st.filterRowText[col2] = "";
+                DataTable.InvalidateQuery(st);
+            }
+        } else if (kind == 2) {
+            DataTable.SetFilterTree(st, null);
+            if (st.pivotView) { st.pvDirty = true; }
+        } else if (kind == 3) {
+            DataTable.ExitPivot(st);
+        } else if (kind == 4) {
+            int col3 = chip.Col();
+            if (st.pvSavedFilters != null && col3 >= 0 && col3 < st.pvSavedFilters.Count) {
+                st.pvSavedFilters[col3].Reset();
+                st.pvDirty = true;
+                DataTable.InvalidateQuery(st);
+            }
+        }
+    }
+
+    /// 芯片主体的语义：直达编辑入口。逐列芯片打开该列的
+    /// 筛选菜单；筛选行芯片把焦点交给对应输入框；透视
+    /// 芯片循环切换 Sum → Average → Count。
+    static void OpenFilterChip(DataTableState st, List<DataColumn> cols,
+                               DataSource src, FilterChip chip) {
+        int kind = chip.Kind();
+        if (kind == 0) {
+            int col = chip.Col();
+            if (col >= 0 && col < cols.Count) {
+                DataTable.OpenFilterMenu(st, cols, src, col);
+            }
+        } else if (kind == 1) {
+            int col2 = chip.Col();
+            if (col2 >= 0 && col2 < cols.Count) {
+                st.filterRowFocusCol = col2;
+            }
+        } else if (kind == 3) {
+            // 重建需要原始列与源；芯片渲染时拿到的已是
+            // 视图列，这里回退到进入视图时保存的引用，
+            // 引用缺失则只标脏，下一帧用新鲜原始列重建。
+            List<DataColumn> orig = st.pvOrigColsList;
+            if (orig != null && st.pvInner != null) {
+                DataTable.SetPivotAgg(st, orig, st.pvInner, (st.pivotAgg + 1) % 3);
+            } else {
+                st.pivotAgg = (st.pivotAgg + 1) % 3;
+                st.pvDirty = true;
+                DataTable.InvalidateQuery(st);
+            }
+        }
+    }
+}
