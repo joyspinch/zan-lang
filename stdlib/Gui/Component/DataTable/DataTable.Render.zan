@@ -873,6 +873,8 @@ partial class DataTable {
 
         // 皮肤面：表面/表头/行/强调色全部来自 datatable 的 part 规则，
         // 每帧解析一次后在下方循环里只读局部变量。
+        // 触摸设备没有悬停，表头的手柄/筛选图标常显、长按开菜单。
+        bool touchUi = app.TouchDevice();
         StyleBox sSurface = Style.Full(app, "datatable", "", "", Style.SNormal());
         StyleBox sHeader = Style.Part(app, "datatable", "header", "", "", "",
                                       Style.SNormal());
@@ -1093,8 +1095,10 @@ partial class DataTable {
             // 同时右移，避免手柄压住列名；不悬停时表头
             // 一个像素都不让给手柄。手柄区含左侧内边距，
             // 与标题命中区严格不重叠。
+            // 触摸设备没有悬停：手柄常显，重排始终可用
+            //（排序仍走标题点击，两者不打架）。
             int gripW = 0;
-            bool showGrip = hHover || st.dragCol == i;
+            bool showGrip = hHover || st.dragCol == i || touchUi;
             if (showGrip) { gripW = pad + app.Scale(7); }
 
             int availTitle = cw - pad * 2 - menuIconW - gripW;
@@ -1135,13 +1139,15 @@ partial class DataTable {
             // 表头菜单图标——DevExpress 风格：仅当鼠标
             // 悬停在该表头单元格、该列有活动筛选或
             // 其菜单打开时显示。`menuId` 总是分配，
-            // 控件 id 不随图标显隐而变。
+            // 控件 id 不随图标显隐而变。触摸设备没有悬停：
+            // 图标常显（筛选是移动端的核心操作，不能
+            // 靠探索发现），长按表头可打开列上下文菜单。
             if (menuId >= 0) {
                 int mIx = hx + cw - menuIconW - app.Scale(1);
                 bool active = st.filters[i].Active();
                 bool cellHover = app.mouseX >= visX && app.mouseX < visR
                                  && app.mouseY >= titleTop && app.mouseY < titleTop + titleRowH;
-                bool showIcon = active || cellHover || st.openMenu == i;
+                bool showIcon = active || cellHover || st.openMenu == i || touchUi;
                 if (showIcon) {
                     int mColor = sIcon.FgOr(0);
                     if (active) { mColor = sIconSel.FgOr(0); }
@@ -1150,18 +1156,20 @@ partial class DataTable {
                     app.hitTester.RegisterRect(menuId, mIx, titleTop, menuIconW, titleRowH, 0);
                     if (!st.dragColMoved && app.EventKind() == 3 && app.window.EventButton() == 0 && app.hitTester.HitTest(app.mouseX, app.mouseY) == menuId) {
                         if (st.openMenu == i) { st.openMenu = -1; } else {
-                            st.openMenu = i;
-                            st.filterTab = 0;
-                            st.searchText = "";
-                            st.valScroll = 0;
-                            st.editFocus = 0;
-                            st.batchLines = new List<string>();
-                            st.batchLines.Add("");
-                            st.batchExactFlag = 0;
-                            st.menuVals = DataTable.DistinctFiltered(st, cols, src, i);
-                            st.menuMatched = st.menuVals;
-                            st.menuSearchCache = "";
+                            DataTable.OpenFilterMenu(st, cols, src, i);
                         }
+                        app.RequestRedraw();
+                    } else if (touchUi && st.openMenu < 0 && !st.hdrCtxOpen
+                               && app.PollLongPress(menuId)) {
+                        // 长按表头 => 列上下文菜单（排序/自动列宽/
+                        // 隐藏/冻结……）。触摸设备没有右键，长按
+                        // 是移动端的标准等价手势；只认菜单图标上的
+                        // 按住，避免与范围拖拽/滚动打架。
+                        st.hdrCtxOpen = true;
+                        st.hdrCtxCol = i;
+                        st.hdrCtxX = app.mouseX;
+                        st.hdrCtxY = app.mouseY;
+                        st.hitCol = i;
                         app.RequestRedraw();
                     }
                 }
@@ -1185,12 +1193,16 @@ partial class DataTable {
                 c.FillRect(visX, titleTop, visW, titleRowH, sHeaderHover.BgOr(0));
             }
             if (col.sortable && !st.dragColMoved && app.EventKind() == 3 && app.window.EventButton() == 0 && app.ClickTarget() == titleId) {
-                st.hitCol = i;
-                st.HeaderClick.Raise();
-                bool addSort = Modifiers.HasShift(app.window.EventMods());
-                DataTable.CycleSort(st, i, addSort);
-                st.dirty = true;
-                st.Sort.Raise();
+                // 长按菜单已命中时松开不算排序点击：触摸上长按
+                // 表头由 menuId 的按住驱动，这里只挡住随后的释放。
+                if (!app.LongPressFired()) {
+                    st.hitCol = i;
+                    st.HeaderClick.Raise();
+                    bool addSort = Modifiers.HasShift(app.window.EventMods());
+                    DataTable.CycleSort(st, i, addSort);
+                    st.dirty = true;
+                    st.Sort.Raise();
+                }
                 app.RequestRedraw();
             }
 
@@ -1212,11 +1224,16 @@ partial class DataTable {
             // 调整大小手柄（右边界）。可拖列显示水平
             // 调整光标（控件类型 4）；固定列显示禁止
             // 光标（控件类型 6），手柄明确呈禁用态。
+            // 触摸设备没有悬停光标反馈，手指目标也远大于
+            // 6px：手柄加宽一倍（命中区左右各扩 Scale(6)），
+            // 配合常显列拖动手柄，列宽调整在移动端可用。
             int rzW = app.Scale(6);
-            int rzX = hx + cw - rzW / 2;
+            int rzPad = touchUi ? app.Scale(6) : 0;
+            int rzX = hx + cw - rzW / 2 - rzPad;
+            int rzHitW = rzW + rzPad * 2;
             int rzCursor = 4;
             if (!col.resizable) { rzCursor = 6; }
-            app.hitTester.RegisterRect(rzId, rzX, titleTop, rzW, titleRowH, rzCursor);
+            app.hitTester.RegisterRect(rzId, rzX, titleTop, rzHitW, titleRowH, rzCursor);
             if (col.resizable && app.EventKind() == 2 && app.window.EventButton() == 0 && app.PressTarget() == rzId) {
                 st.resizeCol = i;
                 st.resizeStartX = app.mouseX;
@@ -1572,9 +1589,10 @@ partial class DataTable {
                 // 顺序由分组键决定）。
                 // 悬停用几何判断：按下那一帧 hoveredId 会被清空，
                 // 若依赖 id，手柄会在正好按下它时消失。
+                // 触摸设备没有悬停：手柄常显，重排在移动端可达。
                 bool rowHot = app.mouseY >= ry && app.mouseY < ry + rowH
                               && app.mouseX >= x && app.mouseX < x + viewW;
-                bool showRowGrip = st.rowReorder && (rowHot || st.dragRow == oiRow)
+                bool showRowGrip = st.rowReorder && (rowHot || st.dragRow == oiRow || touchUi)
                                    && st.groupCols.Count == 0;
                 int numTextW = numW;
                 if (showRowGrip) { numTextW = numW - rowGripW; }
@@ -1776,6 +1794,27 @@ partial class DataTable {
             }
         }
 
+        // ---------------- 空态/加载覆盖层 ----------------
+        // AG Grid 的 noRowsOverlay / loadingOverlay：数据源
+        // 尚未交付首块（HasMore 且行数为 0）→ 加载中；
+        // 确认为空 → 暂无数据。文案可经 emptyText/loadingText
+        // 覆盖；overlayKind 记录本帧渲染的覆盖层，供诊断
+        // 与驱动探针断言。
+        st.overlayKind = "";
+        if (total == 0) {
+            bool oloading = src.HasMore() && src.RowCount() == 0;
+            string omsg = oloading ? st.loadingText : st.emptyText;
+            if (omsg.Length == 0) {
+                omsg = oloading ? DataTable.T("Loading…", "加载中…")
+                                : DataTable.T("No data", "暂无数据");
+            }
+            st.overlayKind = oloading ? "loading" : "empty";
+            int otx = firstDataX + (dataViewW - Canvas.MeasureText(omsg, fs)) / 2;
+            if (otx < firstDataX) { otx = firstDataX; }
+            c.DrawText(otx, Canvas.CenterTextY(bodyTop, bodyH, fs), omsg,
+                       sHint.FgOr(0), fs);
+        }
+
         // ---------------- 填充柄（Excel 式拖拽填充） ----------------
         // 活动范围右下角的小方块。角点滚出视口或列隐藏时
         // 不绘制也不拦截（fillHX=-1）；编辑中不显示。
@@ -1925,8 +1964,11 @@ partial class DataTable {
         // 片刻后弹出完整内容。只在纯文本/链接/标签单元格上
         // 生效；编辑器、菜单、拖选进行中一律不打扰。指针停稳
         // (DefaultDelayMs) 前持续请求该区域重绘，让计时器有帧可用；
-        // 计时器在指针离开或换格时重置。
-        if (ptrOi >= 0 && ptrCol >= 0 && DataTable.DispKind(st, ptrOi) == 0
+        // 计时器在指针离开或换格时重置。触摸设备没有悬停——
+        // 手指停留即长按手势，这里必须整体跳过（st.tipOi 常驻
+        // -1），不与长按菜单抢帧。
+        if (touchUi) { st.tipOi = -1; }
+        else if (ptrOi >= 0 && ptrCol >= 0 && DataTable.DispKind(st, ptrOi) == 0
             && !st.editing && !st.ctxOpen && !st.hdrCtxOpen && !st.chartOpen
             && !st.colChooserOpen
             && st.openMenu < 0 && !st.rangeDrag && !st.rowSelDrag && st.dragRow < 0) {
@@ -2174,6 +2216,20 @@ partial class DataTable {
                 st.fillSC1 = DataTable.MaxI(st.rangeC0, st.rangeC1);
                 st.fillTR0 = 0; st.fillTR1 = -1;
                 st.fillTC0 = 0; st.fillTC1 = -1;
+                // 双击填充柄：一次性铺到最后一行（Excel 惯例），
+                // 不进入拖拽。
+                if (app.DoubleClickNow()) {
+                    st.fillDrag = false;
+                    int lastSlot = DataTable.LastDataSlot(st);
+                    if (lastSlot > st.fillSR1) {
+                        int dfilled = DataTable.FillApply(st, cols, src,
+                                                          st.fillSR0, st.fillSC0, st.fillSR1, st.fillSC1,
+                                                          st.fillSR1 + 1, st.fillSC0, lastSlot, st.fillSC1);
+                        if (dfilled > 0) {
+                            DataTable.Flash(st, DataTable.TN("Filled {n} cells", dfilled, "已填充 {n} 个单元格"));
+                        }
+                    }
+                }
                 app.RequestRedraw();
             } else if (DataTable.DispKind(st, ptrOi) == 1) {
                 // 分组标题按下：切换该组折叠状态
@@ -2225,6 +2281,10 @@ partial class DataTable {
                     st.hitOrder = ptrOi;
                     st.hitRow = DataTable.DispRowOf(st, ptrOi);
                     st.hitCol = ptrCol;
+                    // 触摸长按打开行菜单的锚点：App.PollLongPress
+                    // 比对 pressStartId，这里用 -2 哨兵把单元格
+                    // 按压与真实控件 id 区分开（桌面无副作用）。
+                    if (touchUi) { app.NotePressSentinel(-2); }
                     st.CellClick.Raise();
                     app.RequestRedraw();
                 }
@@ -2269,7 +2329,35 @@ partial class DataTable {
                 // 选择列表格：高亮矩形覆盖到哪几行，
                 // 勾选框就勾到哪几行（范围缩小时实时退勾）。
                 DataTable.SyncRangeChecks(st, src);
-                app.RequestRedraw();
+                // 触摸设备：按住未动满 500ms => 长按打开行上下文
+                // 菜单（桌面右键的移动端等价物）。PollLongPress
+                // 只在 pressStartId == -2 的按压上生效（-2 是表格
+                // 体内单元格按压的哨兵 id，不会与真实控件 id 撞车），
+                // 返回一次 true；移动超差时它置 longPressFired，
+                // 手势继续作为普通范围拖拽。长按命中后收窄选择到
+                // 该行（菜单的复制/导出要有对象可用，镜像右键行为），
+                // 并结束范围拖拽。
+                if (touchUi && st.openMenu < 0 && !st.hdrCtxOpen && !st.colChooserOpen
+                    && app.PollLongPress(-2)) {
+                    st.ctxX = app.mouseX;
+                    st.ctxY = app.mouseY;
+                    st.ctxRow = -1;
+                    st.ctxOrder = -1;
+                    if (DataTable.DispKind(st, ptrOi) == 0) {
+                        int ri = DataTable.DispRowOf(st, ptrOi);
+                        st.ctxRow = ri;
+                        st.ctxOrder = ptrOi;
+                        if (!DataTable.IsSelected(st, src, ri)) {
+                            DataTable.SelectAllRows(st, src, false);
+                            DataTable.SetSelected(st, src, ri, true);
+                            st.selAnchor = ptrOi;
+                        }
+                    }
+                    st.RowContext.Raise();
+                    if (!st.externalRowMenu) { st.ctxOpen = true; }
+                    st.rangeDrag = false;
+                    app.RequestRedraw();
+                }
             }
             if (st.dragRow >= 0) {
                 int dd = app.mouseY - st.dragStartY;
