@@ -450,7 +450,23 @@ class App {
     // 仲裁），但它的损伤条带按「谁先声明」累计——连续滚动时上一帧
     // 的条带只盖住上一帧的位移量，本帧多滚出的那一段沿用陈旧像素
     // （概率性花屏 + 滚动条与内容短暂错位，感知为滚动条回跳）。
+    // 见 wheelScrollInput：滚轮把本帧收窄为「上一帧认领视口」条带，
+    // 而不是和按下/按键一样整帧。
     bool inputNeedsFrame;
+    // 本批事件里有滚轮（kind 13）：滚轮的消费与损伤都发生在渲染期
+    // （CaptureWheel 仲裁 + 声明者 NoteScrollDamage），而声明者几何
+    // 就是上一帧的 wheelCap 矩形——滚轮不改变控件布局，矩形跨帧稳定。
+    // 因此滚轮帧不必整窗：本帧裁剪到「上一帧认领的视口 ∪ 页面滚动
+    // 声明区 ∪ 指针邻域」（见 TakeDueWheelRect），条带外的控件不重
+    // 绘但也毫无变化，命中区沿用上一帧快照。判定保留下列整帧情形：
+    // 按住拖拽/弹层/模态拥有滚轮（wheel-pressed/wheel-blocked 分支，
+    // 改的像素不止滚动区）、上一帧没有任何认领（指针刚进入滚动区，
+    // cap 过期——整帧兜底，见 wheel-unclaimed）、无认领但 contentHeight
+    // 页面滚动（滚动区=除侧栏外整页，条带近似整窗，直接整帧更省）。
+    // 这正是 commit d59d7149f「滚轮列入 inputNeedsFrame」的继续：
+    // 那次修的是「条带只盖住上一帧位移量」的错位——如今条带直接
+    // 取上一帧认领视口，位移量天然被包含，错位不再可能。
+    bool wheelScrollInput;
     int animRX;
     int animRY;
     int animRW;
@@ -799,6 +815,7 @@ class App {
         this.animRectValid = false;
         this.animRectAll = false;
         this.inputNeedsFrame = false;
+        this.wheelScrollInput = false;
         this.animRW = 0;
         this.animRH = 0;
         this.animPrevValid = false;
@@ -2099,10 +2116,65 @@ class App {
         partialPending = true;
     }
 
-    /// 把接下来绘制的区域放进以 `first` 开头的即时模式 id 段，直到
-    /// EndIdScope()。宿主用它隔开各个大区域（功能区、面板、标签条、
-    /// 编辑区）：某个区域这一帧多画 / 少画了控件，也不会让别处的
-    /// id 移位，从而把点击错投到另一个控件上。段之间要留足间隔。
+    /// 滚轮帧的裁剪条带（TakeDueFrame 在动画条带不适用时调用）。
+    /// 滚轮的消费与损伤声明都发生在渲染期，而声明者几何就是上一帧
+    /// 的 wheelCap 矩形（滚轮不改变布局，跨帧稳定）——本帧裁剪到它，
+    /// 条带外的控件既无输入也无输出。合并以下来源后仍收不住（接近
+    /// 整窗、无上一帧认领）时返回 false，调用方退回整帧：
+    /// - 上一帧认领视口（wheelCapW>0）：主来源。触摸拖动/滚轮连续
+    ///   滚动时每一帧的声明都落在这里面；
+    /// - 本帧已声明的损伤（dmgW>0，页面滚动 NotePageScrollDamage
+    ///   在事件期先行声明）：一并包住；
+    /// - 指针邻域（Scale(24)）：悬停高亮随内容滚到新行的过渡帧，
+    ///   RefreshScrollHover 补的条带下一帧自己会画，这里只要不把
+    ///   指针底下那一小块留在上一帧的样子。
+    /// 判 false 的兜底：无认领（指针刚跨入滚动区，整帧——这正是
+    /// wheel-unclaimed 注释描述的吞格场景，整帧才认得出新声明者）、
+    /// 页面级滚动（内容区近乎整窗，条带无利可图）、弹层/按住（这
+    /// 两类在泵分支已整帧承诺，走不到这里）。
+    bool TakeDueWheelRect() {
+        if (this.ForceFullFrames()) { return false; }
+        if (this.HasOverlays() || blocksInputBelow || focus.pressedId >= 0) {
+            return false;
+        }
+        // 没有上一帧认领：渲染期仲裁的结果无从预知，整帧兜底。
+        if (wheelCapW <= 0 || wheelCapH <= 0) { return false; }
+        int x0 = wheelCapX;
+        int y0 = wheelCapY;
+        int x1 = wheelCapX + wheelCapW;
+        int y1 = wheelCapY + wheelCapH;
+        if (dmgW > 0 && dmgH > 0) {
+            if (dmgX < x0) { x0 = dmgX; }
+            if (dmgY < y0) { y0 = dmgY; }
+            if (dmgX + dmgW > x1) { x1 = dmgX + dmgW; }
+            if (dmgY + dmgH > y1) { y1 = dmgY + dmgH; }
+        }
+        // 指针不在认领视口里（页面滚动越过边缘、嵌套区外滚动）也要
+        // 覆盖指针邻域，悬停预览不留旧像。
+        int pad = this.Scale(24);
+        if (mouseX - pad < x0) { x0 = mouseX - pad; }
+        if (mouseY - pad < y0) { y0 = mouseY - pad; }
+        if (mouseX + pad > x1) { x1 = mouseX + pad; }
+        if (mouseY + pad > y1) { y1 = mouseY + pad; }
+        if (x0 < 0) { x0 = 0; }
+        if (y0 < 0) { y0 = 0; }
+        if (x1 > canvas.Width()) { x1 = canvas.Width(); }
+        if (y1 > canvas.Height()) { y1 = canvas.Height(); }
+        int w = x1 - x0;
+        int h = y1 - y0;
+        if (w <= 0 || h <= 0) { return false; }
+        // 近整窗（或内容高已声明为页面滚动）时条带不值当：页面滚动
+        // 的损伤区是「侧栏以右」的全部，几乎总是整窗。
+        if (contentHeight > 0) { return false; }
+        if (w * h * 2 > canvas.Width() * canvas.Height()) { return false; }
+        dmgX = x0;
+        dmgY = y0;
+        dmgW = w;
+        dmgH = h;
+        partialPending = true;
+        return true;
+    }
+
     void BeginIdScope(int first) {
         focus.PushIds(first);
         // 分析器开着时把每个 id 段当作一个可计时的区域：它们正好是
@@ -3770,6 +3842,13 @@ class App {
         // 点击/按键改变哪些像素只有控件渲染时读到 Ui.Clicked
         // 才知道，无法提前声明；而裁剪帧只渲染条带内的控件，
         // 点击目标在条带外时点击既不被处理也不被重绘。
+        // 滚轮是例外（见 wheelScrollInput）：它的消费与损伤都在
+        // 渲染期声明，且声明者几何=上一帧认领视口，可以收窄。
+        if (!fxOnly && this.wheelScrollInput && !this.inputNeedsFrame
+            && this.TakeDueWheelRect()) {
+            this.NoteRedrawWhy("wheel-strip");
+            return true;
+        }
         if (!fxOnly && animRectValid && !animRectAll
             && !this.inputNeedsFrame
             && !this.ForceFullFrames()
@@ -3936,14 +4015,13 @@ class App {
 
         int kind = this.NormalizedKind();
         // 按下/释放/按键触发的那一帧必须整帧重绘（见 inputNeedsFrame）。
-        // 滚轮（13）同列：滚轮的消费发生在渲染期（CaptureWheel 仲裁），
-        // 且连续滚动时上一帧遗留的损伤条带只盖住上一帧的位移量，本帧
-        // 多滚出的那一段会沿用陈旧像素——表现为概率性花屏 + 滚动条与
-        // 内容短暂错位（感知为滚动条回跳，只有滚轮滚动出现）。
-        if (kind == 2 || kind == 3 || kind == 4 || kind == 5 || kind == 6
-            || kind == 13) {
+        // 滚轮（13）记入 wheelScrollInput：滚轮的消费发生在渲染期
+        // （CaptureWheel 仲裁），本帧收窄为上一帧认领视口的条带而非
+        // 整窗——见该字段与 TakeDueWheelRect 的注释。
+        if (kind == 2 || kind == 3 || kind == 4 || kind == 5 || kind == 6) {
             inputNeedsFrame = true;
         }
+        if (kind == 13) { wheelScrollInput = true; }
         // 新的释放事件：解除上一释放的帧绑定，让本次点击
         // 重新锁定到处理它的那一帧（见 ClickFrameCurrent）。
         // 只认没见过的新事件：动画到期路径可能不泵就出帧，
@@ -4233,14 +4311,13 @@ class App {
         bool mine = evHwnd == window.GetHandle();
         int kind = this.NormalizedKind();
         // 按下/释放/按键触发的那一帧必须整帧重绘（见 inputNeedsFrame）。
-        // 滚轮（13）同列：滚轮的消费发生在渲染期（CaptureWheel 仲裁），
-        // 且连续滚动时上一帧遗留的损伤条带只盖住上一帧的位移量，本帧
-        // 多滚出的那一段会沿用陈旧像素——表现为概率性花屏 + 滚动条与
-        // 内容短暂错位（感知为滚动条回跳，只有滚轮滚动出现）。
-        if (kind == 2 || kind == 3 || kind == 4 || kind == 5 || kind == 6
-            || kind == 13) {
+        // 滚轮（13）记入 wheelScrollInput：滚轮的消费发生在渲染期
+        // （CaptureWheel 仲裁），本帧收窄为上一帧认领视口的条带而非
+        // 整窗——见该字段与 TakeDueWheelRect 的注释。
+        if (kind == 2 || kind == 3 || kind == 4 || kind == 5 || kind == 6) {
             inputNeedsFrame = true;
         }
+        if (kind == 13) { wheelScrollInput = true; }
         // 新的释放事件：解除上一释放的帧绑定（见 ClickFrameCurrent）。
         // 与 ProcessEvent 相同，只认没见过的新事件——自定义循环
         // （gallery 等）的动画分支不泵就出帧，EventKind 会回读
@@ -5208,6 +5285,9 @@ class App {
         // 条带裁剪：条带外的控件本帧不渲染、不注册命中区，锚点认领
         // 与 Ui.Clicked 都会落空——表现为点击无响应/迟钝。条带是
         // 纯动画帧自己声明的，输入帧永远整帧（见 inputNeedsFrame）。
+        // 滚轮条带（TakeDueWheelRect 声明）不受此限：滚轮不发布点击
+        // 目标（ClickAvailable 只认 kind==3），条带外的控件不需要本
+        // 帧注册命中区，HitTester 上一帧快照继续有效。
         if (inputNeedsFrame) { partialPending = false; }
         if (partialPending && dmgW > 0 && dmgH > 0) {
             partialFrame = true;
@@ -5221,8 +5301,10 @@ class App {
             this.NoteRedrawWhy("force-full");
         }
         // 输入帧的整帧承诺已兑现（partialPending 已被上面的判定
-        // 消费），复位给下一个事件周期。
+        // 消费），复位给下一个事件周期。滚轮批次同拍复位：条带
+        // 判定只属于泵出它的那一帧。
         inputNeedsFrame = false;
+        wheelScrollInput = false;
         // 整窗帧重画了每一个像素，动画的旧位置已被覆盖：
         // 下一次动画帧不必再把它算进裁剪。
         if (!partialFrame) { animPrevValid = false; }
