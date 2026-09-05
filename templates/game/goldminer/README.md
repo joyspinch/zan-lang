@@ -40,15 +40,15 @@ examples/ 下的共享模块，可随项目自由修改。
 构建
 ----
 仓库根编译（产物 build/goldminer.exe，运行所需 DLL 自动落在
-同目录）。**--embed 必须带上**：游戏启动先读 exe 旁 assets/，
-找不到就回退内嵌副本；不 embed 且目录里没有 assets/ 时贴图、
-背景与音效全部加载失败（黑屏）：
+同目录）。assets/ 不需要任何编译指令：只要代码引用了内嵌读取
+API（File.EmbedExists 等），zanc 检测到源文件旁的 assets/ 目录
+就把整个目录自动内嵌进 exe（资源名 "assets/<文件>"，与代码里的
+查找路径一致）：
 
     build\zanc.exe templates\game\goldminer\src\main.zan ^
                    templates\game\goldminer\src\Game.zan ^
                    templates\game\goldminer\src\Kit.zan ^
                    --auto-stdlib ^
-                   --embed templates\game\goldminer\assets=assets ^
                    -o build\goldminer.exe
 
 独立 exe 发布（单文件、免 DLL、双击无控制台窗口）
@@ -63,16 +63,21 @@ examples/ 下的共享模块，可随项目自由修改。
                    templates\game\goldminer\src\Kit.zan ^
                    --auto-stdlib ^
                    --publish --link-mode static --subsystem windows ^
-                   --embed templates\game\goldminer\assets=assets ^
                    -o dist\goldminer\goldminer.exe
 
 素材
 ----
-assets/ 下全部 PNG/JPG/WAV 均可替换；代码按 "assets/<name>.<ext>" 相对 exe
-向上查找（Assets.Find），找不到再读编译期 --embed 进 exe 的内嵌副本
-（File.EmbedExists / File.ExtractEmbedded），单文件分发也出声出图。
-IDE「新建项目」复制本模板后，assets/ 与 src/ 同级，用 zanc 编译时
-记得同样加 `--embed assets=assets`。
+assets/ 下全部 PNG/JPG/WAV 均可替换；编译时整个目录自动内嵌进
+exe。运行时先读 exe 旁的 assets/（磁盘优先，替换即生效），没有
+磁盘副本就直接从 exe 镜像里读内嵌字节进内存（File.ReadAllBytes →
+LoadImageFromMem / LoadWavFromMem），全程不落盘，单文件分发也
+出声出图。
+IDE「新建项目」复制本模板后 assets/ 与 src/ 同级，同样自动内嵌，
+无需额外参数。
+注意：自动内嵌靠"入口源文件的目录"定位 assets/，所以命令行里要
+写带目录的入口路径（如上）；在项目根目录下裸写 `zanc main.zan`
+时编译器只能看到 `.`，会定位不到 assets/——换绝对路径或带
+`src\` 前缀即可。
 
 文件
 ----
