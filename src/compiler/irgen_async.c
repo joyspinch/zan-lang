@@ -1493,15 +1493,22 @@ static void emit_eh_rethrow_current(zan_irgen_t *g) {
         LLVMConstInt(i32, 0, 0), "reh.has");
     LLVMBasicBlockRef jmp_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "aeh.jmp");
     LLVMBasicBlockRef die_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "aeh.die");
-    LLVMBuildCondBr(g->builder, has, jmp_bb, die_bb);
-
-    LLVMPositionBuilderAtEnd(g->builder, jmp_bb);
-    {
+    /* wasm32 arms no handlers (EH-free lowering, see irgen_stmt.c
+     * AST_TRY_STMT): an armed top cannot exist there, so the rethrow goes
+     * straight to the die path; terminate the (never entered) jmp block so
+     * the pre-optimizer verification pass sees no unterminated block. */
+    if (g->target_is_wasm) {
+        LLVMBuildBr(g->builder, die_bb);
+        LLVMPositionBuilderAtEnd(g->builder, jmp_bb);
+        LLVMBuildUnreachable(g->builder);
+        LLVMPositionBuilderAtEnd(g->builder, die_bb);
+    } else {
+        LLVMBuildCondBr(g->builder, has, jmp_bb, die_bb);
+        LLVMPositionBuilderAtEnd(g->builder, jmp_bb);
         emit_eh_longjmp(g, emit_eh_buf_ptr(g, top));
         LLVMBuildUnreachable(g->builder);
+        LLVMPositionBuilderAtEnd(g->builder, die_bb);
     }
-
-    LLVMPositionBuilderAtEnd(g->builder, die_bb);
     {
         emit_eh_hook_call(g, "__zan_eh_unhandled");
         LLVMValueRef printf_fn = LLVMGetNamedFunction(g->mod, "printf");

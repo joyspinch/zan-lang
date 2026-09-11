@@ -1203,8 +1203,14 @@ static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
      * continues the current block; the value flows to followers unchanged.
      * The wasm throw intrinsic itself must stay a plain call: it is noreturn
      * and runs inside the catch pad (a funclet that must not unwind to the
-     * pad's own catchswitch). */
-    if (s_current_irgen && s_current_irgen->target_is_wasm &&
+     * pad's own catchswitch).
+     *
+     * Dead as of the EH-free wasm32 lowering (irgen_stmt.c AST_TRY_STMT):
+     * wasm32 never arms a landing pad anymore -- the mini-game V8 builds
+     * reject the Exception section, so wasm_try_depth stays 0 and every call
+     * is a plain call. Kept compiling so a future wasm EH revival flips one
+     * branch, not three files. */
+    if (false && s_current_irgen && s_current_irgen->target_is_wasm &&
         s_current_irgen->wasm_try_depth > 0 &&
         !s_current_irgen->in_wasm_throw_op &&
         !(fn && LLVMIsAFunction(fn) && fn == s_current_irgen->wasm_eh_state_fn)) {

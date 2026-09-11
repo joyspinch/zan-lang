@@ -82,15 +82,6 @@ static void emit_eh_hook_call(zan_irgen_t *g, const char *name) {
     zan_call2(g->builder, fty, f, NULL, 0, "");
 }
 
-/* wasm32 EH lowering (see irgen_builtins.c): personality, landing pads and
- * the wasm.throw raise path. */
-static LLVMValueRef get_wasm_throw_fn(zan_irgen_t *g);
-static LLVMValueRef get_wasm_personality_fn(zan_irgen_t *g);
-static void wasm_eh_set_personality(zan_irgen_t *g);
-static void emit_wasm_throw_op(zan_irgen_t *g, LLVMValueRef exc_obj);
-static LLVMBasicBlockRef emit_wasm_lpad(zan_irgen_t *g,
-                                        LLVMBasicBlockRef catch_bb);
-
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals);
 
 /* B5: bind a switch case's pattern variable (`case T x:`) to the discriminant.
@@ -263,24 +254,26 @@ static void emit_eh_propagate_tail(zan_irgen_t *g) {
         LLVMConstInt(i32t, 0, 0), "reh.has");
     LLVMBasicBlockRef rjmp_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "reh.jmp");
     LLVMBasicBlockRef rdie_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "reh.die");
-    LLVMBuildCondBr(g->builder, rhas, rjmp_bb, rdie_bb);
-    LLVMPositionBuilderAtEnd(g->builder, rjmp_bb);
-    /* an exception leaving this coroutine now travels through the frame (see
-     * emit_async_exc_epilogue), so the longjmp stays inside this invocation --
-     * no cross-frame unwinding here */
-    if (g->current_async_frame) emit_async_save_slots(g);
+    /* wasm32 arms no handlers (EH-free lowering, see AST_TRY_STMT): an armed
+     * top cannot exist there. Route the rethrow straight to the die path and
+     * terminate the (never entered) jmp block with unreachable so the
+     * pre-optimizer verification pass sees no unterminated block. */
     if (g->target_is_wasm) {
-        /* engine unwinding re-raises toward the enclosing catchswitch */
-        LLVMValueRef wexc = LLVMBuildLoad2(g->builder, i8ptr, exc_g, "wt.exc");
-        wasm_eh_set_personality(g);
-        g->in_wasm_throw_op = true;
-        emit_wasm_throw_op(g, wexc);
-        g->in_wasm_throw_op = false;
+        LLVMBuildBr(g->builder, rdie_bb);
+        LLVMPositionBuilderAtEnd(g->builder, rjmp_bb);
+        LLVMBuildUnreachable(g->builder);
+        LLVMPositionBuilderAtEnd(g->builder, rdie_bb);
     } else {
+        LLVMBuildCondBr(g->builder, rhas, rjmp_bb, rdie_bb);
+        LLVMPositionBuilderAtEnd(g->builder, rjmp_bb);
+        /* an exception leaving this coroutine now travels through the frame
+         * (see emit_async_exc_epilogue), so the longjmp stays inside this
+         * invocation -- no cross-frame unwinding here */
+        if (g->current_async_frame) emit_async_save_slots(g);
         emit_eh_longjmp(g, emit_eh_buf_ptr(g, rtop));
         LLVMBuildUnreachable(g->builder);
+        LLVMPositionBuilderAtEnd(g->builder, rdie_bb);
     }
-    LLVMPositionBuilderAtEnd(g->builder, rdie_bb);
     emit_eh_hook_call(g, "__zan_eh_unhandled");
     LLVMValueRef printf_fn = LLVMGetNamedFunction(g->mod, "printf");
     if (printf_fn) {
@@ -2078,9 +2071,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         /* try/catch/finally via a per-program setjmp stack: entering a try
          * pushes a jmp_buf, `throw` longjmps to the innermost one with the
          * exception object in a global, catch pops the stack and binds the
-         * exception local. On wasm32 the engine unwinds instead (LLVM
-         * WebAssembly EH): the handler is a catchswitch and the body's calls
-         * are invokes; the globals keep the same role either way. */
+         * exception local. On wasm32 there is no unwinder to reach: the
+         * mini-game V8 builds reject the Exception section the WebAssembly EH
+         * proposal emits, so the try body runs unconditionally and a throw
+         * takes the unhandled-exception die path (see AST_THROW_STMT). */
         LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
         LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
         LLVMValueRef top_g, bufs_g, exc_g;
@@ -2167,31 +2161,24 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         }
         LLVMValueRef zero = LLVMConstInt(i32t, 0, 0);
         LLVMValueRef bufp = emit_eh_buf_ptr(g, new_top);
-        bool wasm_try = g->target_is_wasm;
+        /* wasm32 carries no WebAssembly-EH landing pads: the devtools/mini-game
+         * V8 builds reject the Exception section outright, so try/catch lowers
+         * onto the body alone and a thrown exception dies (see AST_THROW_STMT).
+         * The catch code below is still emitted, then left unreachable by a
+         * conditional jump into the body -- dead-block stripping removes it. */
+        bool wasm_try = false;
         LLVMBasicBlockRef saved_lpad = NULL;
         int saved_try_depth = 0;
-        if (wasm_try) {
-            /* engine-unwound EH: the catch block is the landing target of a
-             * catchswitch; every call the body emits becomes an invoke whose
-             * unwind edge lands on that pad (zan_call2 consults this stack). */
-            wasm_eh_set_personality(g);
-            saved_lpad = g->wasm_try_depth > 0
-                ? g->wasm_lpad_stack[g->wasm_try_depth - 1] : NULL;
-            (void)saved_lpad;
-            saved_try_depth = g->wasm_try_depth;
-            LLVMBasicBlockRef try_entry_bb = LLVMGetInsertBlock(g->builder);
-            g->wasm_lpad_stack[g->wasm_try_depth] =
-                emit_wasm_lpad(g, catch_bb);
-            g->wasm_try_depth++;
-            /* emit_wasm_lpad leaves the builder at the end of its catchpad
-             * block (terminated by the CatchRet); the try-entry branch into
-             * the body belongs in the block the try started in */
-            LLVMPositionBuilderAtEnd(g->builder, try_entry_bb);
-            LLVMBuildBr(g->builder, try_bb);
-        } else {
+        if (!g->target_is_wasm) {
             LLVMValueRef r = emit_eh_setjmp(g, bufp);
             LLVMValueRef took = zan_icmp(g->builder, LLVMIntEQ, r, zero, "eh.took");
             LLVMBuildCondBr(g->builder, took, try_bb, catch_bb);
+        } else {
+            LLVMValueRef r = LLVMBuildLoad2(g->builder, i32t, old_top_slot,
+                                            "eh.old.nowasm");
+            LLVMBuildCondBr(g->builder,
+                zan_icmp(g->builder, LLVMIntEQ, r, r, "eh.always"), try_bb,
+                catch_bb);
         }
         (void)bufp;
 
@@ -2988,42 +2975,38 @@ throw_unwind:
              * already stored in the globals and retained) */
             emit_release_active_catch_excs(g, g->throw_catch_base);
             LLVMValueRef top = LLVMBuildLoad2(g->builder, i32t, top_g, "eh.top");
-            LLVMValueRef has = zan_icmp(g->builder, LLVMIntSGE, top,
-                LLVMConstInt(i32t, 0, 0), "eh.has");
+            (void)top;
             LLVMValueRef fn2 = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
             LLVMBasicBlockRef jmp_bb = LLVMAppendBasicBlockInContext(g->ctx, fn2, "throw.jmp");
             LLVMBasicBlockRef die_bb = LLVMAppendBasicBlockInContext(g->ctx, fn2, "throw.die");
-            LLVMBuildCondBr(g->builder, has, jmp_bb, die_bb);
-            LLVMPositionBuilderAtEnd(g->builder, jmp_bb);
-            /* the handler is either a try of this invocation or this
-             * invocation's trampoline, so keep the frame authoritative and
-             * longjmp without touching the frames that await us */
-            if (g->current_async_frame) {
-                emit_async_save_slots(g);
-                if (g->target_is_wasm) {
-                    LLVMValueRef wexc = LLVMBuildLoad2(g->builder, i8ptr,
-                        exc_g, "wt.exc");
-                    wasm_eh_set_personality(g);
-                    g->in_wasm_throw_op = true;
-                    emit_wasm_throw_op(g, wexc);
-                    g->in_wasm_throw_op = false;
+            /* wasm32 arms no handlers (EH-free lowering, see AST_TRY_STMT):
+             * route every throw straight to the die path; terminate the
+             * (never entered) jmp block so the pre-optimizer verification
+             * pass sees no unterminated block. */
+            if (g->target_is_wasm) {
+                LLVMBuildBr(g->builder, die_bb);
+                LLVMPositionBuilderAtEnd(g->builder, jmp_bb);
+                LLVMBuildUnreachable(g->builder);
+                LLVMPositionBuilderAtEnd(g->builder, die_bb);
+            } else {
+                LLVMValueRef has = zan_icmp(g->builder, LLVMIntSGE, top,
+                    LLVMConstInt(i32t, 0, 0), "eh.has");
+                LLVMBuildCondBr(g->builder, has, jmp_bb, die_bb);
+                LLVMPositionBuilderAtEnd(g->builder, jmp_bb);
+                /* the handler is either a try of this invocation or this
+                 * invocation's trampoline, so keep the frame authoritative and
+                 * longjmp without touching the frames that await us */
+                if (g->current_async_frame) {
+                    emit_async_save_slots(g);
+                    emit_eh_longjmp(g, emit_eh_buf_ptr(g, top));
+                    LLVMBuildUnreachable(g->builder);
                 } else {
+                    emit_eh_unwind_to_handler(g, top);
                     emit_eh_longjmp(g, emit_eh_buf_ptr(g, top));
                     LLVMBuildUnreachable(g->builder);
                 }
-            } else if (g->target_is_wasm) {
-                emit_eh_unwind_to_handler(g, top);
-                LLVMValueRef wexc = LLVMBuildLoad2(g->builder, i8ptr,
-                    exc_g, "wt.exc");
-                g->in_wasm_throw_op = true;
-                emit_wasm_throw_op(g, wexc);
-                g->in_wasm_throw_op = false;
-            } else {
-                emit_eh_unwind_to_handler(g, top);
-                emit_eh_longjmp(g, emit_eh_buf_ptr(g, top));
-                LLVMBuildUnreachable(g->builder);
+                LLVMPositionBuilderAtEnd(g->builder, die_bb);
             }
-            LLVMPositionBuilderAtEnd(g->builder, die_bb);
             emit_eh_hook_call(g, "__zan_eh_unhandled");
             LLVMValueRef printf_fn = LLVMGetNamedFunction(g->mod, "printf");
             if (printf_fn) {
