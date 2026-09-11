@@ -4,34 +4,493 @@ using Gui;
 using Gui.Widget;
 using Legend;
 
-/// 页 31「地图内页」——照原版 `地图-进入.png` 1:1 还原。
+/// 页 31「地图内页」——照原版 `地图-进入.png` 1:1 还原，而且是**活的**：
+/// 怪随机刷、角色走过去砍、战报往上滚（用户：「这是个动画哦 随机刷怪
+/// 角色移动攻击」）。
 ///
-/// 入口：地图传送页点一张地图卡（见 PageMap.zan 的三分支点击语义），
-/// 而不是开机首页。分区（REFERENCE_AUDIT.md 4.0 实测）：
-///   左列：BOSS 场景（玩家/BOSS 血条+立绘+怪物气泡）→ 战斗日志 → 底部操作行
-///   右列：挑战BOSS卡（血条/立绘/挑战/扫荡/自动挑战/属性两列）
+/// 入口：地图传送页点一张地图卡（PageMap.zan 的三分支点击语义）→
+/// `netInnerMap = mid; net.OpenMapPage(mid); Navigate(31);`
+///
+/// 版式（REFERENCE_AUDIT §5.4g 是完整实测表，这里只写代码里看不出来的口径）：
+///   左栏 = 地图区（名牌阵）+ 3px 分隔线 + 战报 5 行 + 底行（返回/提示/
+///          开始挂机/说明）
+///   右列 = BOSS 血字+血条 / 立绘 / 金字标题 / 挑战条 / 3px 暗线 /
+///          五行两列属性 / 结束后自动挑战BOSS
+/// 三个不能凭直觉改的点：
+///   ① 实体坐标是**名牌尾巴尖**（名牌盒底边中点），不是左上角，也不是
+///      立绘中心——名牌素材自带下尖，尖点才算「站在这儿」；
+///   ② 名字字数必须走 `MiChars`（UTF-8 码点数）：`string.Length` 是**字节
+///      数**，中文一字三字节，拿它选名牌会选到大两号的图；
+///   ③ 场景每拍**原地改控件**（`Place`/`Text`/percent），不重建整页——
+///      重建会把右列输入框里的数字和「自动挑战」勾选态一起丢掉。
 partial class LegendApp {
     /// 内页当前地图 id：地图卡点击时先置这里再 Navigate(31)。
     /// （旧版漏赋值导致内页永远看 1 号图的 BOSS，这里每条入口都赋。）
     int netInnerMap = 1;
 
-    /// 场景/卡片底板：带 css 类的列容器（原版 Col 工厂）。
-    Panel Col(string cls) {
-        Panel p = Panel.Column();
-        p.Class = cls;
-        p.Pad(4); p.Gap(4);
-        return p;
+    // ================================================================= 模型
+
+    /// 一只怪。位置是**名牌尾巴尖**的地图区坐标（设备像素）。
+    class MiEnt {
+        string name;
+        int x;
+        int y;
+        int hp;
+        int maxHp;
+        Image plate;        // 名牌（按字数选素材）
+        Label tag;          // 名牌上的名字
+        int chars;          // 当前名牌是几字版（换名要换图换宽）
     }
 
-    /// 右栏属性两列里的一个格子：「标签：值」一行。
-    Panel StatCell(string label, string value, string cls) {
-        Panel cell = Panel.Row(); cell.Gap(4); cell.Prefer(0, 24);
-        cell.With(Text(label + "：", cls, 20));
-        Label v = Text(value, "", 20); v.Grow(); cell.With(v);
-        return cell;
+    static List<MiEnt> miMobs = null;
+    static int miHeroPx = 532;
+    static int miHeroPy = 411;
+    static int miTarget = -1;
+    static bool miFighting = false;
+    static int miSwing = 0;
+    static int miSceneMap = -1;         // 已布景的图；换图要重摆
+    static Panel miLayer = null;        // 名牌层（地图区）
+    static Panel miLogHost = null;      // 战报宿主
+    static int miLogShown = -1;         // 已上屏的战报版本
+    static Image miHeroPlate = null;
+    static Label miHeroTag = null;
+    static Image miHeroArt = null;
+    static Label miHeroHpLabel = null;
+    static Progress miHeroBar = null;
+    static SignalBool miAutoSig = null;
+    static Input miCountIn = null;
+    static string miCountText = "10";
+    static int miFrozen = -1;           // LEGEND_MI_FREEZE：冻结帧复核用
+
+    // ================================================================= 工具
+
+    /// 名字字数（UTF-8 码点数）。**别用 `string.Length`**：那是字节数，
+    /// 中文一字三字节，3 字名会被当成 9 字节选到最大的名牌。
+    int MiChars(string s) {
+        int n = 0;
+        int i = 0;
+        while (i < s.Length) {
+            i = i + QrEncoder.SeqByteLen(s[i] & 255);
+            n = n + 1;
+        }
+        return n;
     }
 
-    /// 内页当前图名：从地图列表里找 id 对应的名字。
+    /// 名牌素材：怪 00021..00026 / 玩家 00031..00036，N = 名字字数（1..6）。
+    /// 7 字起没有素材，仍用 6 字图按字数外推拉伸（原版也没有九宫格）。
+    string MiPlateArt(string name, bool player) {
+        int n = MiChars(name);
+        if (n < 1) { n = 1; }
+        if (n > 6) { n = 6; }
+        return "assets/ui/" + Rules.N(player ? 30 + n : 20 + n).PadLeft(5, "0") + ".png";
+    }
+
+    /// 名牌本体高（素材 33 里去掉下面 10 设备像素的尖）。
+    int MiPlateBodyH() { return Spec.MiPlateH() - 10; }
+
+    /// 玩家名牌上的名字：联机取 self，离线用演示名（参考图那位玩家的名字，
+    /// 正好 6 字 → 00036，冻结帧与原图同宽）。
+    string MiHeroName() {
+        JsonValue st = net.Self();
+        if (st != null) {
+            string n = st.Str("name", "");
+            if (n.Length > 0) { return n; }
+        }
+        return "看见啥的就是";
+    }
+
+    int MiHeroMaxHp() {
+        JsonValue st = net.Self();
+        if (st != null) {
+            int mx = st.Int("maxhp", 0);
+            if (mx > 0) { return mx; }
+        }
+        int gmx = g.MaxHp();
+        return gmx > 0 ? gmx : 470;
+    }
+
+    int MiHeroHp() {
+        JsonValue st = net.Self();
+        int hp = st != null ? st.Int("hp", 0) : g.hp;
+        if (hp <= 0) { hp = MiHeroMaxHp(); }        // 离线演示按满血上屏
+        return hp;
+    }
+
+    /// 怪物名字池：原版这张图的怪（鸡/多钩猫/钉耙猫/羊/稻草人）。
+    static List<string> miMobPool = null;
+    List<string> MiMobPool() {
+        if (miMobPool == null) {
+            List<string> v = new List<string>();
+            v.Add("鸡");
+            v.Add("多钩猫");
+            v.Add("钉耙猫");
+            v.Add("羊");
+            v.Add("稻草人");
+            miMobPool = v;
+        }
+        return miMobPool;
+    }
+
+    /// 一只怪的满血：按名字从 monsters.csv 找（表里没有就给 40）。
+    int MiMobMaxHp(string name) {
+        List<DataRow> rows = GameTables.current.monsters.rows;
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            DataRow r = rows[i];
+            if (r != null && r.Text("name") == name) {
+                int hp = r.Int("hp");
+                return hp > 0 ? hp : 40;
+            }
+        }
+        return 40;
+    }
+
+    // ================================================================= 场景
+
+    /// 布景（首次进页/换图摆一次）：7 只怪逐只照参考图摆——坐标就是原图
+    /// 名牌尾巴尖（实测：鸡(342,138) 多钩猫(482,181) 钉耙猫(374,205)/(613,191)
+    /// 羊(324,294) 稻草人(210,329) 钉耙猫(303,398)；玩家(532,411)）。
+    void MiSceneSeed() {
+        List<MiEnt> v = new List<MiEnt>();
+        v.Add(MiEntOf("鸡", 342, 138));
+        v.Add(MiEntOf("多钩猫", 482, 181));
+        v.Add(MiEntOf("钉耙猫", 374, 205));
+        v.Add(MiEntOf("钉耙猫", 613, 191));
+        v.Add(MiEntOf("羊", 324, 294));
+        v.Add(MiEntOf("稻草人", 210, 329));
+        v.Add(MiEntOf("钉耙猫", 303, 398));
+        miMobs = v;
+        miHeroPx = 532;
+        miHeroPy = 411;
+        miTarget = -1;
+        miFighting = false;
+        miSwing = 0;
+        /* 开局静默选中最近那只：不写战报，这样第一帧的战报正好是参考图
+           那 5 行（SeedDemoMap 铺的），冻结帧能逐行对版式。 */
+        MiPickNearest(false);
+    }
+
+    MiEnt MiEntOf(string name, int x, int y) {
+        MiEnt e = new MiEnt();
+        e.name = name;
+        e.x = x;
+        e.y = y;
+        e.maxHp = MiMobMaxHp(name);
+        e.hp = e.maxHp;
+        e.chars = 0;
+        return e;
+    }
+
+    /// 场景一拍（主循环 120ms 调，只在页 31 上跑）：
+    ///   没目标 → 选最近的活怪；
+    ///   距离 > 交战线 → 角色朝它走、它也迎上来（"接近目标…"）；
+    ///   近了 → 每 3 拍砍一刀 20（"正在战斗中…"）；
+    ///   砍死 → 一条"死亡，清理战场，继续探索…"，那只**换个随机名字和
+    ///          随机位置重生**（这就是「随机刷怪」），再记"出现在 ↗(X:, Y:)"。
+    /// 和挂机演示同一口径：纯客户端自演，不产生收益、不发网络包。
+    void MiSceneStep() {
+        if (page != 31 || miMobs == null) { return; }
+        if (MiFrozen()) { return; }
+        MiEnt t = miTarget >= 0 && miTarget < miMobs.Count ? miMobs[miTarget] : null;
+        if (t == null || t.hp <= 0) {
+            MiPickNearest(true);
+            t = miTarget >= 0 ? miMobs[miTarget] : null;
+        }
+        if (t == null) { return; }
+        int dx = t.x - miHeroPx;
+        int dy = t.y - miHeroPy;
+        if (dx * dx + dy * dy > MiFightDist() * MiFightDist()) {
+            miFighting = false;
+            int sx = dx > 0 ? 1 : (dx < 0 ? 0 - 1 : 0);
+            int sy = dy > 0 ? 1 : (dy < 0 ? 0 - 1 : 0);
+            miHeroPx = Rules.Clamp(miHeroPx + sx * MiHeroStep(), 60, 690);
+            miHeroPy = Rules.Clamp(miHeroPy + sy * MiHeroStep(), 110, 430);
+            t.x = Rules.Clamp(t.x - sx * MiMobStep(), 40, 700);
+            t.y = Rules.Clamp(t.y - sy * MiMobStep(), 30, 430);
+        } else {
+            if (!miFighting) { miFighting = true; net.LogBattle("[战斗]正在战斗中…"); }
+            miSwing = miSwing + 1;
+            if (miSwing % 3 == 0) {
+                t.hp = t.hp - 20;
+                if (t.hp <= 0) {
+                    net.LogBattle("[提示]" + t.name + " 死亡，清理战场，继续探索…");
+                    MiRespawn(t);
+                    miTarget = -1;
+                    miFighting = false;
+                    MiPickNearest(true);
+                }
+            }
+        }
+        MiSyncScene();
+    }
+
+    static int MiFightDist() { return 46; }         // 交战线（尾巴尖距离，设备像素）
+    static int MiHeroStep() { return 8; }           // 角色每拍走多远（≈66 设备像素/秒）
+    static int MiMobStep() { return 3; }            // 怪每拍迎上来多少
+
+    /// 冻结帧模式：UI 自动化要跟参考图逐像素对，场景必须站住不动。
+    bool MiFrozen() {
+        if (miFrozen < 0) {
+            miFrozen = KnownFolders.GetEnv("LEGEND_MI_FREEZE").Length > 0 ? 1 : 0;
+        }
+        return miFrozen == 1;
+    }
+
+    /// 选最近的活怪；`logIt` = 是否写一条"出现在 …"。开局那次静默。
+    void MiPickNearest(bool logIt) {
+        int best = -1;
+        int bestD = 0;
+        for (int i = 0; i < miMobs.Count; i = i + 1) {
+            MiEnt e = miMobs[i];
+            if (e.hp <= 0) { continue; }
+            int dx = e.x - miHeroPx;
+            int dy = e.y - miHeroPy;
+            int d = dx * dx + dy * dy;
+            if (best < 0 || d < bestD) { best = i; bestD = d; }
+        }
+        if (best < 0) { miTarget = -1; return; }
+        miTarget = best;
+        if (!logIt) { return; }
+        MiEnt e = miMobs[best];
+        net.LogBattle("[信息]" + e.name + " 出现在 "
+            + MiArrow(e.x - miHeroPx, e.y - miHeroPy)
+            + "(X: " + Rules.N(e.x) + ", Y: " + Rules.N(e.y) + ")，接近目标…");
+    }
+
+    /// 打死的那只随机换名换位重生（原版的「随机刷怪」）。
+    void MiRespawn(MiEnt t) {
+        List<string> pool = MiMobPool();
+        t.name = pool[g.RollRange(0, pool.Count - 1)];
+        t.maxHp = MiMobMaxHp(t.name);
+        t.hp = t.maxHp;
+        t.x = g.RollRange(60, 690);
+        t.y = g.RollRange(40, 420);
+    }
+
+    string MiArrow(int dx, int dy) {
+        if (dx >= 0) { return dy < 0 ? "↗" : "↘"; }
+        return dy < 0 ? "↖" : "↙";
+    }
+
+    /// 把场景状态刷到控件上（原地改，不重建）：怪名牌、玩家那一坨、战报。
+    void MiSyncScene() {
+        if (miLayer == null) { return; }
+        for (int i = 0; i < miMobs.Count; i = i + 1) { MiPlacePlate(miMobs[i]); }
+        MiPlaceHero();
+        if (miHeroHpLabel != null) {
+            miHeroHpLabel.Text = Rules.N(MiHeroHp()) + "/" + Rules.N(MiHeroMaxHp());
+        }
+        if (miHeroBar != null) {
+            int mx = MiHeroMaxHp();
+            miHeroBar.percent = mx > 0 ? (int)((long)MiHeroHp() * 100 / mx) : 0;
+        }
+        MiSyncLog();
+        app.RequestRedraw();
+    }
+
+    /// 一只怪的名牌摆到它的尾巴尖上；换了名字（字数变了）就连素材和宽度
+    /// 一起换——名牌是按字数选图的，宽度不改会被裁字。
+    void MiPlacePlate(MiEnt e) {
+        if (e.plate == null) { return; }
+        int n = MiChars(e.name);
+        if (n < 1) { n = 1; }
+        if (n != e.chars) {
+            e.chars = n;
+            e.plate.Src = MiPlateArt(e.name, false);
+            int w0 = Spec.MiPlateW(n);
+            e.plate.Prefer(w0, Spec.MiPlateH());
+            if (e.tag != null) { e.tag.Prefer(w0, MiPlateBodyH()); }
+        }
+        int w = Spec.MiPlateW(n);
+        e.plate.Place(e.x - w / 2, e.y - Spec.MiPlateH());
+        if (e.tag != null) {
+            e.tag.Text = e.name;
+            e.tag.Place(e.x - w / 2, e.y - Spec.MiPlateH());
+        }
+    }
+
+    /// 玩家那一坨（立绘/血字/血条/金名牌）都挂在同一个尾巴尖上。
+    void MiPlaceHero() {
+        int x = miHeroPx;
+        int y = miHeroPy;
+        if (miHeroArt != null) {
+            miHeroArt.Place(x - Spec.MiHeroArtW() / 2, y - Spec.MiHeroArtTop());
+        }
+        if (miHeroHpLabel != null) {
+            miHeroHpLabel.Place(x - Spec.MiHpTextW() / 2, y - Spec.MiHpTextY());
+        }
+        if (miHeroBar != null) {
+            miHeroBar.Place(x - Spec.MiHpBarW() / 2, y - Spec.MiHpBarY());
+        }
+        if (miHeroPlate != null) {
+            int n = MiChars(MiHeroName());
+            int w = Spec.MiPlateW(n);
+            miHeroPlate.Place(x - w / 2, y - Spec.MiPlateH());
+            if (miHeroTag != null) {
+                miHeroTag.Text = MiHeroName();
+                miHeroTag.Place(x - w / 2, y - Spec.MiPlateH());
+            }
+        }
+    }
+
+    /// 战报：把最后 5 行铺到固定的 5 行上（版本没变就不动）。不足 5 行就
+    /// 空着——原版也这样，不补占位。
+    void MiSyncLog() {
+        if (miLogHost == null) { return; }
+        int ver = net.BossLogVer();
+        if (ver == miLogShown) { return; }
+        miLogShown = ver;
+        miLogHost.RemoveAll();
+        int n = net.BossLogCount();
+        int rows = Spec.MiLogRows();
+        int first = n > rows ? n - rows : 0;
+        for (int i = 0; i < rows; i = i + 1) {
+            int idx = first + i;
+            if (idx >= n) { break; }
+            Panel row = TextSegRow(MiSegs(net.BossLogAt(idx)), "mi-logrow",
+                Spec.MiLogRowH());
+            row.DockManual();
+            row.Place(Spec.MiLogX(), Spec.MiLogRowY(i) - Spec.MiLogRowY(0));
+            miLogHost.Add(row);
+        }
+    }
+
+    /// 一行战报 → 分段。原版这一页只有四处变色：标签按类别（提示洋红/
+    /// 信息青/战斗红）、怪物名与坐标黄、方向箭头红、正文灰。
+    List<TextSeg> MiSegs(string line) {
+        List<TextSeg> segs = new List<TextSeg>();
+        int rb = line.IndexOf("]");
+        if (rb < 0) {
+            segs.Add(TextSegOf(line, "mi-logbody"));
+            return segs;
+        }
+        string tag = line.Substring(0, rb + 1);
+        string cls = "mi-logbody";
+        if (tag == "[提示]") { cls = "mi-tip"; }
+        else if (tag == "[信息]") { cls = "mi-info"; }
+        else if (tag == "[战斗]") { cls = "mi-fight"; }
+        segs.Add(TextSegOf(tag, cls));
+        string rest = line.Substring(rb + 1);
+        /* 标签后可能带一个空格（`[提示] 钉耙猫 死亡…`）也可能没有
+           （`[提示]钉耙猫 死亡…`，参考图是这种）。怪名后面**必须有**空格
+           才算名字段——`[战斗]正在战斗中…` 整句是正文，不是怪名。 */
+        if (rest.Length > 0 && rest[0] == ' ') { rest = rest.Substring(1); }
+        int sp = rest.IndexOf(" ");
+        if (sp > 0) {
+            segs.Add(TextSegOf(rest.Substring(0, sp + 1), "mi-logname"));
+            rest = rest.Substring(sp + 1);
+        }
+        /* 正文里夹的箭头（U+2196..2199，UTF-8 E2 86 9x）与坐标「(X: n, Y: n)」
+           单独分段上色，其余按正文。 */
+        while (rest.Length > 0) {
+            int ar = -1;
+            for (int i = 0; i + 2 < rest.Length; i = i + 1) {
+                if ((rest[i] & 255) == 226 && (rest[i + 1] & 255) == 134) { ar = i; break; }
+            }
+            int cx = rest.IndexOf("(X:");
+            int cut = -1;
+            int kind = 0;
+            if (ar >= 0 && (cx < 0 || ar < cx)) { cut = ar; kind = 1; }
+            else if (cx >= 0) { cut = cx; kind = 2; }
+            if (cut < 0) {
+                segs.Add(TextSegOf(rest, "mi-logbody"));
+                break;
+            }
+            if (cut > 0) { segs.Add(TextSegOf(rest.Substring(0, cut), "mi-logbody")); }
+            if (kind == 1) {
+                segs.Add(TextSegOf(rest.Substring(ar, 3), "mi-logarrow"));
+                rest = rest.Substring(ar + 3);
+            } else {
+                int cp = rest.IndexOf(")");
+                int end = cp < 0 ? rest.Length : cp + 1;
+                segs.Add(TextSegOf(rest.Substring(cx, end - cx), "mi-logcoord"));
+                rest = rest.Substring(end);
+            }
+        }
+        return segs;
+    }
+
+    // ================================================================= 右列数据
+
+    /// 挑战卡要显示的字段（离线取图→怪，联机取 bossinfo 回复）。
+    class MiBoss {
+        string name = "BOSS";
+        int hp;
+        int maxHp = 1;
+        int mp;
+        int level = 1;
+        int rebirth;
+        int atkMin;
+        int atkMax;
+        int magMin;
+        int magMax;
+        int taoMin;
+        int taoMax;
+        int defMin;
+        int defMax;
+        int mdefMin;
+        int mdefMax;
+        int picture;
+        int tries;
+    }
+
+    MiBoss MiBossOf(int mapId) {
+        MiBoss b = new MiBoss();
+        JsonValue pageData = net.BossPage();
+        JsonValue bo = pageData != null ? pageData.Get("boss") : null;
+        b.tries = pageData != null ? pageData.Int("tries", 0) : 0;
+        if (bo != null && bo.IsObject()) {
+            b.name = bo.Str("name", "BOSS");
+            b.hp = bo.Int("hpLeft", 0);
+            b.maxHp = bo.Int("hp", 1);
+            if (b.maxHp <= 0) { b.maxHp = 1; }
+            b.mp = bo.Int("mp", 0);
+            b.level = bo.Int("level", 1);
+            b.rebirth = bo.Int("rebirth", 0);
+            b.atkMin = bo.Int("atkMin", 0);
+            b.atkMax = bo.Int("atk", 0);
+            b.magMin = bo.Int("magMin", 0);
+            b.magMax = bo.Int("mag", 0);
+            b.taoMin = bo.Int("taoMin", 0);
+            b.taoMax = bo.Int("tao", 0);
+            b.defMin = bo.Int("defMin", 0);
+            b.defMax = bo.Int("def", 0);
+            b.mdefMin = bo.Int("mdefMin", 0);
+            b.mdefMax = bo.Int("mdef", 0);
+            b.picture = Convert.ToInt(bo.Str("picture", "0"));
+            return b;
+        }
+        /* 离线：maps.csv 的图 → monsters.csv 的怪。1 号图配稻草人，数值与
+           参考图右列完全一致（气血 200 / 法力 50 / 2 级 / 攻 5-25 /
+           防 0-5 / 魔防 0-3）。 */
+        int mid = 1;
+        DataRow mp = GameTables.current.maps.At(mapId);
+        if (mp != null) { mid = mp.Int("monster_id"); }
+        DataRow mo = GameTables.current.monsters.At(mid);
+        if (mo == null) { mo = GameTables.current.monsters.At(1); }
+        if (mo == null) { return b; }
+        b.name = mo.Text("name");
+        b.maxHp = mo.Int("hp");
+        if (b.maxHp <= 0) { b.maxHp = 1; }
+        b.hp = b.maxHp;
+        b.mp = mo.Int("mp");
+        b.level = mo.Int("min_level");
+        b.rebirth = mo.Int("rebirth");
+        b.atkMin = mo.Int("attack_min");
+        b.atkMax = mo.Int("attack_max");
+        b.magMin = mo.Int("magic_min");
+        b.magMax = mo.Int("magic_max");
+        b.taoMin = mo.Int("tao_min");
+        b.taoMax = mo.Int("tao_max");
+        b.defMin = mo.Int("defense_min");
+        b.defMax = mo.Int("defense_max");
+        b.mdefMin = mo.Int("magic_defense_min");
+        b.mdefMax = mo.Int("magic_defense_max");
+        b.picture = mo.Int("picture");
+        b.tries = g.bossTries;
+        return b;
+    }
+
+    /// 图名（挂机提示用；地图卡点击时 netInnerMap 已置，这里只查表）。
     string MapName(int id) {
         for (int i = 0; i < net.MapCount(); i = i + 1) {
             JsonValue mp = net.MapAt(i);
@@ -50,139 +509,278 @@ partial class LegendApp {
         return File.Exists(path) ? path : "assets/item/00002.png";
     }
 
+    // ================================================================= 页面
+
     void BuildMapInner() {
-        JsonValue st = net.Self();
         int mapId = netInnerMap;
-        JsonValue page = net.BossPage();
-        string mapName = MapName(mapId);
+        MiBoss b = MiBossOf(mapId);
 
-        Panel split = Panel.Row(); split.Gap(8); split.Grow(); content.With(split);
-        Panel left = Panel.Column(); left.Grow(); left.Gap(8); split.With(left);
-
-        /* ---- BOSS 场景 ---- */
-        Panel scene = Col("boss-scene"); scene.Pad(12); scene.Gap(6);
-        scene.Prefer(0, 248); left.With(scene);
-        scene.With(Text("首次击杀本关BOSS通关", "scene-tag", 14));
-        Panel duo = Panel.Row(); duo.Grow(); duo.Gap(0); scene.With(duo);
-
-        /* 玩家半边：名+血量 → 血条 → 立绘。 */
-        Panel pside = Panel.Column(); pside.Grow(); pside.Gap(4); duo.With(pside);
-        int php = st != null ? st.Int("hp", 0) : 0;
-        int pmax = st != null ? st.Int("maxhp", 1) : 1;
-        string pname = st != null ? st.Str("name", "旅人") : " ";
-        Label phpl = Text(pname + " " + Rules.N(php) + "/" + Rules.N(pmax), "red", 18);
-        phpl.Prefer(160, 18); pside.With(phpl);
-        Progress pbar = new Progress(100, 5); pbar.Class = "health-bar";
-        pbar.Prefer(160, 6); pbar.showIndicator = false;
-        pbar.percent = pmax > 0 ? (int)((long)php * 100 / pmax) : 0; pside.With(pbar);
-        Image pimg = new Image("assets/show/00001.png", pname, "contain");
-        pimg.Prefer(76, 76); pside.With(pimg);
-        pside.With(Text(pname, "map-name", 18));
-
-        /* BOSS 半边：血量 → 血条 → 立绘/无BOSS占位。 */
-        Panel bside = Panel.Column(); bside.Grow(); bside.Gap(4); duo.With(bside);
-        JsonValue bo = page != null ? page.Get("boss") : null;
-        bool hasBoss = bo != null && bo.IsObject();
-        int bhpLeft = hasBoss ? bo.Int("hpLeft", 0) : 0;
-        int bhpMax = hasBoss ? bo.Int("hp", 1) : 1;
-        Label bhpl = Text(Rules.N(bhpLeft) + "/" + Rules.N(bhpMax), "red", 18);
-        bhpl.Prefer(160, 18); bside.With(bhpl);
-        Progress bbar = new Progress(100, 5); bbar.Class = "health-bar";
-        bbar.Prefer(160, 6); bbar.showIndicator = false;
-        bbar.percent = bhpMax > 0 ? (int)((long)bhpLeft * 100 / bhpMax) : 0; bside.With(bbar);
-        if (hasBoss) {
-            Image bimg = new Image(PicturePath("boss", Convert.ToInt(bo.Str("picture", "0"))),
-                bo.Str("name", "BOSS"), "contain");
-            bimg.Prefer(120, 108); bside.With(bimg);
-        } else {
-            bside.With(Text("本图无 BOSS", "secondary", 40));
+        /* 首次进页（或换了图）才重新布景 + 重铺战报：换图要把怪摆回参考图
+           的位置、战报换成新图的 5 行。 */
+        if (miSceneMap != mapId) {
+            miSceneMap = mapId;
+            MiSceneSeed();
+            net.SeedDemoMap(mapId);
         }
-        bside.With(Text(hasBoss ? bo.Str("name", "BOSS") : " ", "map-name", 18));
+        if (miMobs == null) { MiSceneSeed(); }
 
-        /* ---- 战斗日志 ---- */
-        Panel logPanel = Col("feed"); logPanel.Pad(8); logPanel.Gap(4);
-        logPanel.Grow(); left.With(logPanel);
-        int logN = net.BossLogCount();
-        if (logN == 0) {
-            logPanel.With(Text("尚未开战。点右侧「挑战BOSS」正面刚，胜利解锁下一张图；或底部「开始挂机」离线刷怪。", "secondary", 48));
-        }
-        for (int i = logN > 12 ? logN - 12 : 0; i < logN; i = i + 1) {
-            string ln = net.BossLogAt(i);
-            string cls = "secondary";
-            if (ln.IndexOf("[BOSS]") == 0) { cls = "yellow"; }
-            else if (ln.IndexOf("[战报]") == 0) { cls = "cyan"; }
-            else if (ln.IndexOf("[扫荡]") == 0) { cls = "cyan"; }
-            else if (ln.IndexOf("胜利") >= 0) { cls = "green"; }
-            else if (ln.IndexOf("失败") >= 0) { cls = "red"; }
-            logPanel.With(Text(ln, cls, 20));
-        }
+        Panel left = Panel.Row(); left.Class = "mi-left";
+        left.Pad(0); left.DockManual();
+        left.Place(0, Spec.MiLeftY());
+        left.Prefer(Spec.MiLeftW(), Spec.MiLeftH());
+        content.Add(left);
 
-        /* ---- 底部操作行 ---- */
-        Panel foot = Panel.Row(); foot.Pad(2); foot.Gap(8); foot.Prefer(0, 36);
-        left.With(foot);
-        foot.With(Btn("返回", "inner-back", () => { Navigate(0); }));
-        Label hint = Text("开始挂机后，可以关闭客户端，离线挂机→", "secondary", 0);
-        hint.Grow(); foot.With(hint);
-        foot.With(Btn("开始挂机", "inner-auto", () => {
-            if (net.MobCount() > 0) { net.AutoHunt(net.MobAt(0).Int("tpl", 0), true); }
-            else { net.AddFeed("本图怪物列表还没拉到，稍后再试。"); }
-        }));
-        foot.With(Btn("说明", "inner-help", () => {
-            net.AddFeed("挑战BOSS每天 20 次；打输 BOSS 留血，接着挑战继续磨；打赢解锁下一张图。");
-        }));
+        /* ---- 地图区：名牌层（绝对定位，靠 DockManual+Place 摆坐标）---- */
+        Panel map = Panel.Row(); map.Class = "mi-layer";
+        map.Pad(0); map.DockManual();
+        map.Place(0, 0);
+        map.Prefer(Spec.MiLeftW(), Spec.MiMapH());
+        left.Add(map);
+        miLayer = map;
+        for (int i = 0; i < miMobs.Count; i = i + 1) { MiAddMob(map, miMobs[i]); }
+        MiAddHero(map);
 
-        /* ---- 右栏：挑战BOSS卡（固定 320 宽，DockRight 才不会被 Grow 挤走）---- */
-        Panel right = Panel.Column(); right.Prefer(320, 0); right.DockRight();
-        right.Gap(8); split.Add(right);
-        Panel bossCard = Col("frame"); bossCard.Pad(10); bossCard.Gap(8);
-        bossCard.Grow(); right.With(bossCard);
-        bossCard.With(Text(mapName + (st != null && st.Int("map", 0) == mapId ? "（当前所在）" : ""),
-            "yellow strong", 24));
-        if (!hasBoss) {
-            bossCard.With(Text("这张图没有配置 BOSS。", "secondary", 48));
+        /* ---- 3px 分隔线 ---- */
+        Panel sep = Panel.Row(); sep.Class = "mi-sep";
+        sep.Pad(0); sep.DockManual();
+        sep.Place(0, Spec.MiMapH());
+        sep.Prefer(Spec.MiLeftW(), Spec.MiSepH());
+        left.Add(sep);
+
+        /* ---- 战报（宿主固定 5 行位；内容由 MiSyncLog 铺）---- */
+        Panel logHost = Panel.Row(); logHost.Class = "mi-layer";
+        logHost.Pad(0); logHost.DockManual();
+        logHost.Place(0, Spec.MiMapH() + Spec.MiSepH());
+        logHost.Prefer(Spec.MiLeftW(), Spec.MiLogRows() * Spec.MiLogRowH() + 20);
+        left.Add(logHost);
+        miLogHost = logHost;
+        miLogShown = -1;
+        MiSyncLog();
+
+        /* ---- 底行：返回 / 灰提示 / 开始挂机 / 说明 ---- */
+        Panel foot = Panel.Row(); foot.Class = "mi-hintrow";
+        foot.Pad(0); foot.DockManual();
+        foot.Place(0, Spec.MiFootY());
+        foot.Prefer(Spec.MiLeftW(), Spec.MiFootH());
+        left.Add(foot);
+        Button back = Btn("返回", "mi-btn", () => { Navigate(0); });
+        back.Prefer(Spec.MiBackW(), Spec.MiFootH());
+        back.DockManual(); back.Place(Spec.MiBackX(), 0); foot.Add(back);
+        Panel hintRow = Panel.Row(); hintRow.Class = "mi-hintrow";
+        hintRow.Pad(0); hintRow.DockManual();
+        hintRow.Place(Spec.MiHintX(), 0);
+        hintRow.Prefer(Spec.MiHintW(), Spec.MiFootH());
+        foot.Add(hintRow);
+        hintRow.With(Text("开始挂机后，可以关闭客户端，离线挂机→", "mi-hint", 0));
+        Button start = Btn("开始挂机", "mi-btn", () => { MiStartIdle(); });
+        start.Prefer(Spec.MiStartW(), Spec.MiFootH());
+        start.DockManual(); start.Place(Spec.MiStartX(), 0); foot.Add(start);
+        Button help = Btn("说明", "mi-btn", () => { MiHelp(); });
+        help.Prefer(Spec.MiHelpW(), Spec.MiFootH());
+        help.DockManual(); help.Place(Spec.MiHelpX(), 0); foot.Add(help);
+
+        /* ---- 右列：挑战卡 ---- */
+        Panel right = Panel.Row(); right.Class = "mi-right";
+        right.Pad(0); right.DockManual();
+        right.Place(Spec.MiRightX(), Spec.MiLeftY());
+        right.Prefer(Spec.MiRightW(), Spec.MiLeftH());
+        content.Add(right);
+
+        Panel hpTextRow = Panel.Row(); hpTextRow.Class = "mi-hintrow";
+        hpTextRow.Pad(0); hpTextRow.DockManual();
+        hpTextRow.Place(Spec.MiBhpTextX(), Spec.MiBhpTextY());
+        hpTextRow.Prefer(Spec.MiBhpTextW(), Spec.MiBhpTextH());
+        right.Add(hpTextRow);
+        hpTextRow.With(Text(Rules.N(b.hp) + "/" + Rules.N(b.maxHp), "mi-bosshp", 0));
+
+        Progress hpBar = new Progress(100, Spec.MiBhpBarH());
+        hpBar.Class = "mi-hp";
+        hpBar.showIndicator = false;
+        hpBar.percent = b.maxHp > 0 ? (int)((long)b.hp * 100 / b.maxHp) : 0;
+        hpBar.DockManual();
+        hpBar.Place(Spec.MiBhpBarX(), Spec.MiBhpBarY());
+        hpBar.Prefer(Spec.MiBhpBarW(), Spec.MiBhpBarH());
+        right.Add(hpBar);
+
+        Image portrait = new Image(
+            b.picture > 0 ? PicturePath("boss", b.picture) : "assets/item/00002.png",
+            b.name, "fill");
+        portrait.DockManual();
+        portrait.Place(Spec.MiPortraitX(), Spec.MiPortraitY());
+        portrait.Prefer(Spec.MiPortraitW(), Spec.MiPortraitH());
+        right.Add(portrait);
+
+        Label title = Text("首次擊殺本關BOSS過圖", "mi-title", 0);
+        title.DockManual();
+        title.Place(0, Spec.MiTitleY());
+        title.Prefer(Spec.MiRightW(), Spec.MiTitleH());
+        right.Add(title);
+
+        /* 挑战条：外暗橙 + 黑缝 + 内金 + 黑缝（原版三层框），右边是次数框与
+           扫荡。三层都用 Panel 叠，因为引擎没有多边框。 */
+        Panel opsFrame = Panel.Row(); opsFrame.Class = "mi-bossframe";
+        opsFrame.Pad(2);
+        opsFrame.DockManual();
+        opsFrame.Place(Spec.MiBossBtnX(), Spec.MiOpsY() + Spec.MiOpsPadT());
+        opsFrame.Prefer(Spec.MiBossBtnW(), Spec.MiOpsBtnH());
+        right.Add(opsFrame);
+        Panel opsInner = Panel.Row(); opsInner.Class = "mi-bossinner";
+        opsInner.Pad(1);
+        opsFrame.Add(opsInner);
+        Button fight = Btn("挑战BOSS(剩" + Rules.N(b.tries) + ")次", "mi-bossbtn",
+            () => { net.BossFight(mapId); });
+        fight.Grow();
+        opsInner.Add(fight);
+
+        if (miCountIn != null) { miCountText = miCountIn.GetText(); }
+        Input count = new Input(miCountText);
+        count.Class = "mi-input";
+        count.DockManual();
+        count.Place(Spec.MiInputX(), Spec.MiOpsY() + Spec.MiOpsPadT());
+        count.Prefer(Spec.MiInputW(), Spec.MiOpsBtnH());
+        right.Add(count);
+        miCountIn = count;
+        Button sweep = Btn("扫荡", "mi-sweep", () => { MiSweep(mapId); });
+        sweep.DockManual();
+        sweep.Place(Spec.MiSweepX(), Spec.MiOpsY() + Spec.MiOpsPadT());
+        sweep.Prefer(Spec.MiSweepW(), Spec.MiOpsBtnH());
+        right.Add(sweep);
+
+        Panel rule = Panel.Row(); rule.Class = "mi-rule";
+        rule.Pad(0); rule.DockManual();
+        rule.Place(0, Spec.MiRuleY());
+        rule.Prefer(Spec.MiRightW(), Spec.MiRuleH());
+        right.Add(rule);
+
+        /* 五行两列属性：原版每格「标签：值」同色（实测 气血 200 同为橙）。 */
+        MiAddStat(right, 0, 0, "气血", Rules.N(b.maxHp), "mi-c-orange");
+        MiAddStat(right, 0, 1, "等级", Rules.N(b.level), "mi-c-green");
+        MiAddStat(right, 1, 0, "法力", Rules.N(b.mp), "mi-c-blue");
+        MiAddStat(right, 1, 1, "转生", Rules.N(b.rebirth), "mi-c-magenta");
+        MiAddStat(right, 2, 0, "攻击", Rules.N(b.atkMin) + " - " + Rules.N(b.atkMax), "mi-c-cyan");
+        MiAddStat(right, 2, 1, "防御", Rules.N(b.defMin) + " - " + Rules.N(b.defMax), "mi-c-yellow");
+        MiAddStat(right, 3, 0, "魔法", Rules.N(b.magMin) + " - " + Rules.N(b.magMax), "mi-c-blue");
+        MiAddStat(right, 3, 1, "魔防", Rules.N(b.mdefMin) + " - " + Rules.N(b.mdefMax), "mi-c-magenta");
+        MiAddStat(right, 4, 0, "道术", Rules.N(b.taoMin) + " - " + Rules.N(b.taoMax), "mi-c-green");
+        MiAddStat(right, 4, 1, "幸运", "0", "mi-c-orange");
+
+        Panel autoBox = Panel.Row(); autoBox.Class = "mi-autobox";
+        autoBox.Pad(0); autoBox.DockManual();
+        autoBox.Place(Spec.MiAutoBoxX(), Spec.MiAutoBoxY());
+        autoBox.Prefer(Spec.MiAutoBoxW(), Spec.MiAutoBoxH());
+        right.Add(autoBox);
+        if (miAutoSig == null) { miAutoSig = new SignalBool(net.BossAuto()); }
+        Checkbox autoCb = Checkbox.Bind("结束后自动挑战BOSS(勾选生效)", miAutoSig);
+        autoCb.Class = "mi-check";
+        autoBox.With(autoCb);
+
+        MiPlaceHero();
+    }
+
+    /// 一行属性：「＜标签＞：＜值＞」一格（原版两列，列宽 177、行距 37）。
+    void MiAddStat(Panel right, int row, int col, string label, string value, string cls) {
+        Label l = Text(label + "：" + value, "mi-stat " + cls, 0);
+        l.DockManual();
+        l.Place(Spec.MiStatPadL() + col * Spec.MiStatColW(),
+            Spec.MiStatY() + row * Spec.MiStatRowH());
+        l.Prefer(Spec.MiStatColW(), Spec.MiStatRowH());
+        right.Add(l);
+    }
+
+    /// 往名牌层加一只怪：名牌图 + 名字标签（同位置两张，标签后加所以压在上面）。
+    void MiAddMob(Panel layer, MiEnt e) {
+        int n = MiChars(e.name);
+        if (n < 1) { n = 1; }
+        int w = Spec.MiPlateW(n);
+        Image plate = new Image(MiPlateArt(e.name, false), e.name, "fill");
+        plate.DockManual();
+        plate.Place(e.x - w / 2, e.y - Spec.MiPlateH());
+        plate.Prefer(w, Spec.MiPlateH());
+        layer.Add(plate);
+        Label tag = Text(e.name, "mi-plate-name", 0);
+        tag.DockManual();
+        tag.Place(e.x - w / 2, e.y - Spec.MiPlateH());
+        tag.Prefer(w, MiPlateBodyH());
+        layer.Add(tag);
+        e.plate = plate;
+        e.tag = tag;
+        e.chars = n;
+    }
+
+    /// 玩家：立绘在最上，往下血字、血条，最下金名牌（尾巴尖 = 脚站的点）。
+    void MiAddHero(Panel layer) {
+        string name = MiHeroName();
+        int n = MiChars(name);
+        int w = Spec.MiPlateW(n);
+        Image art = new Image("assets/ui/00017.png", "角色", "contain");
+        art.DockManual();
+        art.Prefer(Spec.MiHeroArtW(), Spec.MiHeroArtW());
+        layer.Add(art);
+        Label hpl = Text(Rules.N(MiHeroHp()) + "/" + Rules.N(MiHeroMaxHp()), "mi-herohp", 0);
+        hpl.DockManual();
+        hpl.Prefer(Spec.MiHpTextW(), Spec.MiHpTextH());
+        layer.Add(hpl);
+        Progress bar = new Progress(100, Spec.MiHpBarH());
+        bar.Class = "mi-hp";
+        bar.showIndicator = false;
+        bar.percent = 100;
+        bar.DockManual();
+        bar.Prefer(Spec.MiHpBarW(), Spec.MiHpBarH());
+        layer.Add(bar);
+        Image plate = new Image(MiPlateArt(name, true), name, "fill");
+        plate.DockManual();
+        plate.Prefer(w, Spec.MiPlateH());
+        layer.Add(plate);
+        Label tag = Text(name, "mi-plate-name", 0);
+        tag.DockManual();
+        tag.Prefer(w, MiPlateBodyH());
+        layer.Add(tag);
+        miHeroArt = art;
+        miHeroHpLabel = hpl;
+        miHeroBar = bar;
+        miHeroPlate = plate;
+        miHeroTag = tag;
+        MiPlaceHero();
+    }
+
+    // ================================================================= 动作
+
+    /// 开始挂机：真挂机走服务端（AutoHunt），离线就在战报里说清楚它是本地
+    /// 演示——原版这两个是同一件事，本模板把收益留给服务端。
+    void MiStartIdle() {
+        int mid = 1;
+        DataRow mp = GameTables.current.maps.At(netInnerMap);
+        if (mp != null) { mid = mp.Int("monster_id"); }
+        if (net.Self() != null) {
+            net.AutoHunt(mid, true);
+            net.LogBattle("[系统] 已开始挂机：" + MapName(netInnerMap) + "（收益由服务端结算）。");
+            MiSyncLog();
             return;
         }
-        bossCard.With(Text(Rules.N(bhpLeft) + "/" + Rules.N(bhpMax), "red strong", 20));
-        Progress bhpBar = new Progress(100, 5); bhpBar.Class = "health-bar";
-        bhpBar.Prefer(0, 8); bhpBar.showIndicator = false;
-        bhpBar.percent = bhpMax > 0 ? (int)((long)bhpLeft * 100 / bhpMax) : 0;
-        bossCard.With(bhpBar);
-        Image bpic = new Image(PicturePath("boss", Convert.ToInt(bo.Str("picture", "0"))),
-            bo.Str("name", "BOSS"), "contain");
-        bpic.Prefer(120, 108); bossCard.With(bpic);
-        int tries = page != null ? page.Int("tries", 0) : 0;
-        Panel ops = Panel.Row(); ops.Gap(6); ops.Prefer(0, 34); bossCard.With(ops);
-        Button fightBtn = Btn("挑战BOSS(剩" + Rules.N(tries) + ")次", "boss-fight",
-            () => { net.BossFight(mapId); });
-        fightBtn.Prefer(0, 34); fightBtn.Grow(); ops.With(fightBtn);
-        Input sweepIn = new Input("10"); sweepIn.Prefer(46, 34); ops.With(sweepIn);
-        ops.With(Btn("扫荡", "boss-sweep", () => {
-            string t = sweepIn.GetText().Trim();
-            bool digits = t.Length > 0;
-            for (int c = 0; c < t.Length; c = c + 1) {
-                if (t[c] < '0' || t[c] > '9') { digits = false; break; }
-            }
-            int n = digits ? Convert.ToInt(t) : 10;
-            if (n < 1) { n = 10; }
-            if (n > 20) { n = 20; }
-            net.BossSweep(mapId, n);
-        }));
-        Button autoBtn = Btn(net.BossAuto() ? "☑ 结束后自动挑战BOSS(勾选生效)"
-            : "☐ 结束后自动挑战BOSS(勾选生效)", "boss-auto",
-            () => { net.SetBossAuto(!net.BossAuto()); });
-        autoBtn.Prefer(0, 28); bossCard.With(autoBtn);
+        net.LogBattle("[提示] 离线壳：挂机是本页自演，收益以服务端结算为准。");
+        MiSyncLog();
+    }
 
-        Grid stat = Grid.Of(2); stat.Gap(4); bossCard.With(stat);
-        stat.With(StatCell("气血", Rules.N(bhpMax), "cyan"));
-        stat.With(StatCell("等级", Rules.N(bo.Int("level", 1)), "green"));
-        stat.With(StatCell("法力", Rules.N(bo.Int("mp", 0)), "cyan"));
-        stat.With(StatCell("转生", "0", "magenta"));
-        stat.With(StatCell("攻击", Rules.N(bo.Int("atkMin", 0)) + " - " + Rules.N(bo.Int("atk", 0)), "cyan"));
-        stat.With(StatCell("防御", "0 - " + Rules.N(bo.Int("def", 0)), "green"));
-        stat.With(StatCell("魔法", "0 - 0", "cyan"));
-        stat.With(StatCell("魔防", "0 - " + Rules.N(bo.Int("mdef", 0)), "magenta"));
-        stat.With(StatCell("道术", "0 - 0", "cyan"));
-        stat.With(StatCell("幸运", "0", "magenta"));
-        bossCard.With(Text("击败 BOSS 掉好装备并解锁下一张图；扫荡需先击败过它。", "secondary", 20));
+    void MiHelp() {
+        net.LogBattle("[信息] 挑战BOSS每日 20 次；打输 BOSS 留血，接着挑战继续磨；"
+            + "打赢解锁下一张图。扫荡需先击败过它。");
+        MiSyncLog();
+    }
+
+    void MiSweep(int mapId) {
+        string t = miCountIn != null ? miCountIn.GetText().Trim() : "";
+        bool digits = t.Length > 0;
+        for (int c = 0; c < t.Length; c = c + 1) {
+            if (t[c] < '0' || t[c] > '9') { digits = false; break; }
+        }
+        int n = digits ? Convert.ToInt(t) : 10;
+        if (n < 1) { n = 1; }
+        if (n > 20) { n = 20; }
+        if (net.Self() == null) {
+            net.LogBattle("[提示] 离线壳：扫荡 " + Rules.N(n) + " 次需连服务器（收益以服务端为准）。");
+            MiSyncLog();
+            return;
+        }
+        net.BossSweep(mapId, n);
     }
 }
