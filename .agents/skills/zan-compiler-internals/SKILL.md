@@ -757,3 +757,65 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
 - worktree zanc 的 `--auto-stdlib` 解析 exe 同目录的 stdlib；验证 stdlib 改动
   把改过的文件 `cp` 进 worktree 对应路径重编即可，泄漏 A/B 用
   `git show HEAD:path > worktree 拷贝` 还原单文件基线。
+
+## poll 内循环会吞掉入口扫描：deadline 交付要挂在超时路径上（A308，2026-09-12 已修）
+
+- recv-with-deadline（`zan_io_recv_to_co`）的截止表扫描 `rto_timeout_scan` 若
+  只挂在 `zan_io_poll` **入口**，而 poll 内部还有自己的 `for(;;)` 超时循环
+  （capped 20ms + 无限 caller 超时 + io 在途 ⇒ 永不返回），deadline 到点也
+  没人交付——Linux 上 `RecvAsync(300ms)` 永久停摆。定位链：gdb 断点只见
+  not-due 不见 DUE → strace 数 poll 轮数（200/4s，全 EAGAIN）→ 打点证明
+  `[scan]` 全程只出现一次。**入口扫描会背内循环吞掉**，新扫描挂进 poll 的
+  超时路径（dns_timeout_scan/io_sweep_slots 同位）才算数。
+- gdb/strace 先行，printf 打点收尾：先在「怀疑不到场」的函数设断点看它到
+  不到场，再用 strace 数原始轮数把"每轮做什么"量化，最后才打点看值。顺序
+  反了会浪费整轮打点-编译循环。
+- Windows 1ms ticker 的 ~65 ticks/s 是 GetTickCount64 粒度地板（Task.Delay(1)
+  每 15.6ms 才醒一次），是**预存基线**：断言要用「相对基线」（≥40/0.8s），
+  别按名义 1000 ticks/s 定阈值——同探针旧编译器快照同值证明与本改无关。
+- C 级 socketpair harness 验证 recv-to ABI：`zan_io_pump_timeout` 只泵 IO，
+  step 是经 `zan_co_ready` **入队**的，harness 必须自己 `zan_co_sched_run()`
+  排干就绪队列，否则 `steps=0` 看似 hang 其实是队列没人抽；recv 缓冲要给真
+  指针，`(void*)0x1000` 伪地址会在交付 recv 时 EFAULT 返回 0（伪 EOF），
+  误判成对端关闭。
+- 跨链接进 zanc 产物的 runtime 对象在 `build/linux-musl/zanrt_io.o`（exe 目录
+  相对解析，main.c ~5538），std::sync 变体是 `zanrt_io_mt.o`（加
+  `-DZAN_CO_DRIVER`）；改 rt_io.c 后用 `wsl zig cc -target x86_64-linux-musl
+  -DZAN_IO_STACKLESS_ONLY -fPIC -O2 -c` 重出两份并同步 `toolchain/linux-musl/`。
+  排查期可临时用 O0 打点副本顶替，收尾必须换回 O2 官方对象。
+
+## 泄漏报告的站点标签按类形状混叠；排查先做单站点最小复形（A64b，2026-09-12）
+
+- leakcheck 报告的「allocated at file:line:col」**不是泄漏物的出生地**：站点索引按
+  (类符号, 泛型实例) 去重（`reserve_arc_site`，dispatch 需要同形状共享），而
+  `__zan_site_names[idx]` 在每次分配时被无条件覆写——标签永远属于**同类各站点中
+  运行时最后分配的那个**。程序里同类有多个 `new` 站点时，报告会把真实泄漏引到
+  完全无辜的那个站点上（A64b 实锤：测试自己的 listener 停摆，报告却指着 stdlib
+  里 fwd 的 `new TcpListener`，误导排查一天）。修复登记在 TASKS.md（阻塞于并行
+  irgen WIP 车道）。
+- 排查定式：**先把形状缩到「程序里只留一个同类分配站点」**——单站点时标签才可信
+  （P1：单文件 parked listener → 报告自己的行 ✓）；再多引入第二个同类站点对照
+  （P7：+ 零流量 HttpForwarder → 标签跳到 fwd 的站点、泄漏总数不变 → 混叠实锤）。
+  `g_live` 头部总数恒可信（string 也计数但不进站点表——纯 string 泄漏只有头部没有
+  站点行）；逐站点计数也可信，只是**名字**不可信。
+- 判「报告的对象 X 是否真活」别信标签，用生命周期算账：X 的全部 +1/-1 调用点列
+  清单（字段存取、每帧 ramp/完成、容器进出），加上「停摆帧的接收者 +1」逐项核。
+  async 帧持有定式（irgen.h `current_async_this_owned`）：**ramp 对接收者 +1，
+  帧完成才释放**——协程停摆在 await 上 = 它的接收者和帧本地全部算「仍可达」，
+  这是记账正确不是误报；要它放，就得让那个 await 以任何值完成（-1/0 也行）。
+- **worktree 命令 cwd 陷阱（本轮踩中）**：`cd _scratch/xx-worktree` 后 Bash cwd 会
+  跨调用持续——之后的 `git status`/grep 全打在 worktree 拷贝上，还会把「文件被谁
+  改回去了」的幻象坐实（worktree 原版 vs 主树编辑版来回横跳）。主树操作前先
+  `cd` 回仓库根并用绝对路径 grep 复核；Edit/Read 用绝对路径不受影响。
+
+## 测试里无界 accept 循环的监听器必须可被外部 Stop（A64b，2026-09-12）
+
+- 服务端测试用例的 `while(true)` accept 循环，收尾只 Stop 一个服务时，另一个
+  listener 的停摆 accept 帧会把它钉成 leakcheck 红。有界循环（`while (served < N)`）
+  能自己退出，但 accept 数不定的用例（池化行为决定链路数）没法预设 N——把
+  listener 提成 `static` 字段，Run 收尾补一次 `Stop()`：挂起 accept 以 -1 复位、
+  循环 break、帧完成释放，leakcheck 转绿。Stop 幂等（`running=false; sock>=0`
+  守卫），循环保守起见的二次 Stop 是无害 no-op。
+- 实测定式（static 停靠不会假红）：static 字段持有的对象**不在泄漏报告里出现**
+  （static 存储不 retain，P2 探针 0 泄漏实锤）——用它当「外部可及的关闭把手」
+  安全，但别把语义依赖在它上面（对象生命周期仍由帧/局部变量掌管）。
