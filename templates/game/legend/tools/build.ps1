@@ -10,7 +10,7 @@ New-Item -ItemType Directory -Force -Path $Output | Out-Null
 $sources = @(
     'main.zan', 'Spec.zan', 'Tables.zan', 'Data.zan', 'Game.zan',
     'Save.zan', 'Net.zan', 'Shell.zan', 'PageMap.zan', 'PageMapInner.zan',
-    'PageArena.zan', 'PageBag.zan', 'PageScene.zan', 'PageBossHome.zan', 'PageEscort.zan', 'PageGuild.zan', 'PageRank.zan', 'PageMarket.zan', 'PageMail.zan', 'PageAch.zan', 'PageRecycle.zan', 'PageTujian.zan', 'PageLord.zan', 'PageShop.zan', 'PageTitle.zan', 'Slots.zan', 'TableUi.zan'
+    'PageArena.zan', 'PageBag.zan', 'PageScene.zan', 'PageBossHome.zan', 'PageEscort.zan', 'PageGuild.zan', 'PageRank.zan', 'PageMarket.zan', 'PageMail.zan', 'PageAch.zan', 'PageRecycle.zan', 'PageTujian.zan', 'PageCity.zan', 'PageStar.zan', 'PageSupreme.zan', 'PageTower.zan', 'PageLord.zan', 'PageShop.zan', 'PageTitle.zan', 'Slots.zan', 'TableUi.zan'
 ) | ForEach-Object { "$template/src/$_" }
 # 并行会话在改 stdlib/Gui/Component/Chart（`Chart.StackExtentF` 等签名变化还没
 # 落完）；--auto-stdlib 看到 `using Gui;` 会把整张 Chart 拉进编译。legend 本身
