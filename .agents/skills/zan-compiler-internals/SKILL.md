@@ -730,3 +730,30 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
   会从 flaky 绿变确定性红/挂——按 http_client_keepalive 的清理定式补显式
   Close + settle 泵（20×10ms），让挂起事件真正清零。判定哪层是根因：A/B 同一
   stdlib 只换编译器（或反之），单变量归因，别拿两棵树产物直接对跑下结论。
+- **终局语义别记错（2026-09-12 复核定案）**：`run_until` 循环头先查 root-done
+  标志，Main 一完成就退出，不经 io_bb 的 has_pending 分支——「main 返回但仍有
+  挂起 op」时退出是设计内（与 rt_sched 纤程调度器「排干全部协程」是两个语义）。
+  判别 has_pending 是否生效，必须构造「root 挂起期间被无唤醒轮误杀」的场景；
+  「main 返回后该不该挂住」型判别用例（discrim/mini）是无效的，会把有效修复
+  误判成死码。
+
+## 泄漏探测红 ≠ IO 挂死；共享 fd 的协程收尾定式（A302，2026-09-12 已修）
+
+- `zan_io_poll` 在 `cnt==0` 时早退且**不落 IOTRACE**：settle 窗口的 trace 静默
+  不代表调度器没在轮，别把「trace 停了」当「进程卡死/没跑」（A298 教训的镜像）。
+- 泄漏报告只给分配站点不给持有链。定位「哪个协程停摆」用**逐 await 打点**
+  （进/出/分支全打，`File.AppendAllText` 落盘，stdout 本身可能是被排查对象），
+  一次编译拿全生命周期；站点行号随编辑漂移，A/B 先对站点再对数量。
+- Windows 轮询式带超时 RecvAsync（stdlib 3 参版，1→16ms select-poll）对本地
+  关闭**免疫**：select 对已关句柄恒不报可读 → 循环唯一的 `IsOpen` 逃生口（只在
+  IsReadable 分支内）不可达，协程带着死 fd 空转到 idle 截止；本地 shutdown
+  也不够（select 恒报可读但 recv 返回 -1 且 fd 未关 → 同样空转，实测）。两个
+  逃生口都够不到时，外部 CancelIoEx 无 op 可取消——「Stop+settle 排水」修不了它。
+- 共享 fd 的协程收尾定式：**谁最后读谁 Close，对端只 Shutdown（半关闭）**——
+  shutdown 让对端下一轮探测以 EOF 正常退出、由它亲手 Close；Close 一侧若可能
+  有挂起重叠 op，先 ShutdownBoth(CancelIoEx)（读侧 0 字节复位、发送中表现为
+  短写）。长生命周期连接（隧道）别继承请求级空闲截止：沉默是常态，切 idle=0
+  顺带把接收换成真挂起的重叠 op，teardown 的 CancelIoEx 才有东西可取消。
+- worktree zanc 的 `--auto-stdlib` 解析 exe 同目录的 stdlib；验证 stdlib 改动
+  把改过的文件 `cp` 进 worktree 对应路径重编即可，泄漏 A/B 用
+  `git show HEAD:path > worktree 拷贝` 还原单文件基线。

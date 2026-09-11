@@ -90,6 +90,15 @@ class FwdChannel {
             this.tls = null;
         }
         if (this.sock >= 0) {
+            #if WINDOWS
+            // 隧道两端是两个方向泵共享的 fd：一个方向读到 EOF 退出时
+            // 会顺手关掉对端还挂着的套接字，而 Windows 的 closesocket
+            // 不给挂起的重叠 recv 投递完成包，兄弟泵就永远停在 await
+            // 上（退出泄漏探测把整条 Tunnel/Serve 链记为仍可达，A302）。
+            // 先 CancelIoEx 让挂起者以 0 字节复位再关——与
+            // TcpListener.Stop / TcpClient.Close 同一模式。
+            Socket.ShutdownBoth(this.sock);
+            #endif
             Socket.Close(this.sock);
             this.sock = -1;
         }
@@ -102,6 +111,25 @@ class FwdChannel {
     /// <summary>链路是否已关闭。</summary>
     bool IsClosed() {
         return this.closed;
+    }
+
+    /// <summary>调整空闲截止（毫秒；0 = 不设截止）。隧道在
+    /// <see cref="Tunnel"/> 入口把两条链路都切到 0。</summary>
+    void SetIdleMs(int ms) {
+        this.idleMs = ms;
+    }
+
+    /// <summary>半关闭：只对套接字做双向 shutdown，不释放描述符。
+    /// 隧道的对端方向泵可能还挂在本链路的读上——直接 Close 会把
+    /// 它脚下的 fd 抽掉（Windows 上 select 对已关闭的句柄不再报
+    /// 可读，轮询式接收从此永远等不到任何事件）；shutdown 让
+    /// 对端下一轮探测立即看到可读、recv 返回 0（EOF 语义）正常
+    /// 退出，由它在自己的退出路径里做完整的 Close。</summary>
+    void Shutdown() {
+        if (this.closed) { return; }
+        if (this.sock >= 0) {
+            Socket.ShutdownBoth(this.sock);
+        }
     }
 
     /// <summary>底层套接字（连接池用它做零阻塞的存活检查）。</summary>
@@ -947,6 +975,14 @@ class HttpForwarder {
     /// WhenAll 不会卡在半关闭的链路上。</summary>
     static async void Tunnel(FwdChannel a, FwdReader ar, FwdChannel b,
             FwdReader br, int chunkBytes) {
+        // 隧道切到无空闲截止的接收：连接建立后的沉默对隧道语义毫无
+        // 意义（SSH/TLS 长时间单向空闲是常态），沿用请求级的
+        // recvIdleMs 会把无流量的隧道在超时后掐断；而且带截止的
+        // 接收在 Windows 上靠轮询循环实现，对端方向退出后 shutdown
+        // 掉共享 fd 时它探不出闭合。无截止接收是真正挂起的重叠
+        // 操作，teardown 的 CancelIoEx 能把它以 0 字节（EOF）唤醒。
+        a.SetIdleMs(0);
+        b.SetIdleMs(0);
         string pendingA = ar.TakeBuffered();
         if (pendingA.Length > 0) {
             int _wa = await b.SendAllAsync(pendingA);
@@ -971,8 +1007,11 @@ class HttpForwarder {
             int w = await dst.SendAllAsync(piece);
             if (w < piece.Length) { break; }
         }
+        // 自己这一侧完整关闭；对端方向只 shutdown——它可能还挂在
+        // dst 的读上（轮询式带超时接收对已关闭的 fd 永远探不到
+        // 事件），shutdown 让它以 EOF 正常退出并亲手 Close 这条链路。
         src.Close();
-        dst.Close();
+        dst.Shutdown();
     }
 
     // ---- 头部解析辅助 ------------------------------------------------
