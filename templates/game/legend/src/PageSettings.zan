@@ -1,0 +1,415 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Legend;
+
+/// 页 30「设置」——照原版还原（`设置.png`）。
+///
+/// 版面：两栏 × 三块，每块 = 青蓝小标题 + 一张蓝框深底面板。
+///   左：偏好设置(6 行) / 改名换姓(2 行) / 界面风格(2 行)
+///   右：挂机设置(5 行) / 其他设置(2 行) / 仓库命名(2 行)
+/// 面板底 `#243040`、框 `#1f578a`、标题 `#0d8ecf`；一行两槽（第 1 槽 279
+/// 设备、第 2 槽 225 设备），复选框走标准库 `Checkbox`（本模板已有的
+/// `.scene-check::box/::check/::label` 那套皮，这里换 `.st-check` 类）。
+///
+/// 「列表类页面把数据列出来」的口径落到本页＝**每块的行就是一份数据列表**
+/// （`StPrefs()`/`StFilters()` 等），渲染只有一套 `StBox/StRow` 骨架；行里的
+/// 复选框/输入框/按钮是组件，不是手摆的方块。数值（名字、天数、缩放比）都由
+/// 服务端/配置下发，这里是 UI 准备期的占位初值。
+///
+/// 已知偏差：挂机设置第 2、3 行右侧那条三行黄字提示，原版是跨两行的一整块，
+/// 这里按「两行合成一个 Row + 右侧提示列」还原，字号比原版小半档。
+partial class LegendApp {
+
+    // ---------------------------------------------------------------- 数据
+
+    /// 偏好设置的一行（两槽复选框；`extra` = "key" 时第 2 槽后面带老板键输入框）。
+    class StOpt {
+        string a;
+        bool aOn;
+        string b;
+        bool bOn;
+        string extra;
+    }
+
+    static StOpt StOptOf(string a, bool ao, string b, bool bo, string extra) {
+        StOpt o = new StOpt();
+        o.a = a; o.aOn = ao; o.b = b; o.bOn = bo; o.extra = extra;
+        return o;
+    }
+
+    /// 偏好设置 6 行（照 `设置.png` 逐行抄；勾选态 = 参考图快照）。
+    static List<StOpt> StPrefs() {
+        List<StOpt> v = new List<StOpt>();
+        v.Add(StOptOf("允许播放音效", true, "允许死亡提示音效", true, ""));
+        v.Add(StOptOf("允许使用/出售仓库道具", false, "老板键", false, "key"));
+        v.Add(StOptOf("最小化自动隐藏到小图标", true, "显示装备对比", true, ""));
+        v.Add(StOptOf("整理装备以系数排序(不选择则以类型排序)", false, "", false, ""));
+        v.Add(StOptOf("允许系统广播(会收到系统播报信息聊天等内容)", true, "", false, ""));
+        v.Add(StOptOf("聊天显示在右侧(界面右侧扩展出界面)", true, "", false, ""));
+        return v;
+    }
+
+    /// 挂机设置的一行：复选框 + 前置说明 + 数值框（可空）+ 后置说明。
+    /// `pre` 非空且 `num` 为空 = 整行只是一句说明（安静模式/空闲警告那种）。
+    class StFilter {
+        string chk;
+        bool on;
+        string pre;
+        string num;
+        string post;
+    }
+
+    static StFilter StFilterOf(string chk, bool on, string pre, string num,
+                               string post) {
+        StFilter f = new StFilter();
+        f.chk = chk; f.on = on; f.pre = pre; f.num = num; f.post = post;
+        return f;
+    }
+
+    /// 挂机设置 5 行（照图逐行抄）。
+    static List<StFilter> StFilters() {
+        List<StFilter> v = new List<StFilter>();
+        v.Add(StFilterOf("装备过滤", true, "只保留总系数", "5", "以上的装备"));
+        v.Add(StFilterOf("保留天赋", false, "", "0", "以上的装备"));
+        v.Add(StFilterOf("保留幸运", false, "", "0", "以上的项链"));
+        v.Add(StFilterOf("安静模式", false, "静默战斗模式，右侧不显示战斗过程", "", ""));
+        v.Add(StFilterOf("空闲警告", true, "如果退出游戏是空闲状态会提示警告", "", ""));
+        return v;
+    }
+
+    /// 仓库命名：原版固定 5 格。
+    static List<string> StRepos() {
+        List<string> v = new List<string>();
+        v.Add("仓库1"); v.Add("仓库2"); v.Add("仓库3"); v.Add("仓库4"); v.Add("仓库5");
+        return v;
+    }
+
+    /// 挂机设置那块的三行黄字提示（原版跨第 2、3 行右侧）。
+    static List<string> StIdleNote() {
+        List<string> v = new List<string>();
+        v.Add("谨慎设置过滤值，设置");
+        v.Add("太高有可能无法得到装");
+        v.Add("备，满足一项就保留。");
+        return v;
+    }
+
+    // ---------------------------------------------------------------- 骨架
+
+    void BuildSettingsPage() {
+        Panel body = Panel.Column(); body.Class = "st-page";
+        body.Pad(0); body.Gap(0); body.Grow(); content.With(body);
+
+        Panel cols = Panel.Row(); cols.Pad(0);
+        cols.Gap(Spec.StColGap());
+        cols.Padding(Spec.StPadT(), 0, 0, Spec.StPadL());
+        body.With(cols);
+        cols.With(StColumnLeft());
+        cols.With(StColumnRight());
+
+        /* 末块框底到底部按钮行之间那段空隙：用**撑条**占位，不能写成 bar 的
+           Padding——Padding 是从 bar 自己的固定高里扣的，扣完只剩 1.5 设备，
+           按钮会被压成一条线（实测就是这样）。 */
+        body.With(VGap(Spec.StBarPadT()));
+        Panel bar = StBottomBar();
+        bar.Padding(0, 0, 0, Spec.StPadL());
+        body.With(bar);
+    }
+
+    /// 一栏（三块竖直排）。
+    Panel StCol() {
+        Panel c = Panel.Column(); c.Pad(0); c.Gap(0);
+        c.Prefer(Spec.StColW(), 0);
+        return c;
+    }
+
+    /// 一块 = 标题行 + 面板。
+    void StSection(Panel col, string title, Panel box) {
+        Panel t = Panel.Row(); t.Class = "st-title-row";
+        t.Pad(0); t.Prefer(0, Spec.StTitleH());
+        t.With(Text(title, "st-title", 0));
+        col.With(t);
+        col.With(box);
+    }
+
+    Panel StBox() {
+        Panel b = Panel.Column(); b.Class = "st-box";
+        b.Pad(0); b.Gap(0);
+        b.Padding(Spec.StBoxPadT(), 0, 0, Spec.StBoxPadL());
+        return b;
+    }
+
+    /// 一行：高 `h` 设备（0 = 用 StRowH）。
+    Panel StRow(int h) {
+        Panel r = Panel.Row(); r.Class = "st-row";
+        r.Pad(0); r.Gap(0);
+        r.Prefer(0, h == 0 ? Spec.StRowH() : h);
+        return r;
+    }
+
+    /// 一行里的一个槽（定宽；槽内自己排）。
+    Panel StSlot(int w) {
+        Panel c = Panel.Row(); c.Class = "st-slot";
+        c.Pad(0); c.Gap(Spec.StSlotGap());
+        c.Prefer(w, 0);
+        return c;
+    }
+
+    Checkbox StChk(string label, bool on, int w) {
+        SignalBool sig = new SignalBool(on);
+        Checkbox cb = Checkbox.Bind(label, sig);
+        cb.Class = "st-check";
+        cb.Prefer(w, Spec.StRowH());
+        cb.Change += () => {
+            StLog(label + "：" + (sig.Get() ? "开" : "关"));
+        };
+        return cb;
+    }
+
+    Input StInput(string v, int w, string cls) {
+        Input i = new Input("");
+        i.Class = cls;
+        i.SetText(v);
+        i.Prefer(w, Spec.StInputH());
+        return i;
+    }
+
+    Button StBtn(string label, int w, string cls) {
+        Button b = Btn(label, cls, () => { StLog("设置：" + label + "。"); });
+        b.Prefer(w, Spec.StInputH());
+        return b;
+    }
+
+    /// 纯标签槽。
+    Panel StLab(string t, string cls, int w) {
+        Panel c = Panel.Row(); c.Class = "st-lab-slot";
+        c.Pad(0); c.Prefer(w, 0);
+        c.With(Text(t, cls, 0));
+        return c;
+    }
+
+    // ---------------------------------------------------------------- 左栏
+
+    Panel StColumnLeft() {
+        Panel col = StCol();
+        StSection(col, "偏好设置:", StPrefBox());
+        StSection(col, "改名换姓:", StRenameBox());
+        StSection(col, "界面风格:", StStyleBox());
+        return col;
+    }
+
+    /// 偏好设置：6 行两槽复选框（第 2 行第 2 槽带老板键输入框）。
+    /// 只有单槽的行（第 4~6 行）把复选框放宽到整行——文字长，槽宽 279 会截尾
+    /// （标准库 Label 的测量宽度与画字宽度差 1~2 字，必须留余量）。
+    Panel StPrefBox() {
+        Panel box = StBox();
+        List<StOpt> rows = StPrefs();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            StOpt o = rows[i];
+            Panel r = StRow(0);
+            if (o.b.Length == 0) {
+                r.With(StChk(o.a, o.aOn, Spec.StColW() - Spec.StBoxPadL()));
+                box.With(r);
+                continue;
+            }
+            Panel s1 = StSlot(Spec.StSlotW());
+            s1.With(StChk(o.a, o.aOn, Spec.StSlotW()));
+            r.With(s1);
+            Panel s2 = StSlot(Spec.StSlot2W());
+            if (o.extra == "key") {
+                s2.With(StChk(o.b, o.bOn, Spec.StSlot2W() - Spec.StInputW()
+                                             - Spec.StSlotGap()));
+                s2.With(StInput("F10键", Spec.StInputW(), "st-input st-input-key"));
+            } else {
+                s2.With(StChk(o.b, o.bOn, Spec.StSlot2W()));
+            }
+            r.With(s2);
+            box.With(r);
+        }
+        return box;
+    }
+
+    /// 改名换姓：新名字输入 + 确认改名；下面一行品红要求说明。
+    Panel StRenameBox() {
+        Panel box = StBox();
+        Panel r1 = StRow(Spec.StRow2H());
+        r1.With(StLab("新名字:", "st-lab", Spec.Px(56)));
+        r1.With(StInput("", Spec.StRenameW(), "st-input"));
+        r1.With(SpacerW(Spec.Px(8)));
+        r1.With(StBtn("确认改名", Spec.StRenameBtnW(), "st-btn-cyan"));
+        box.With(r1);
+
+        Panel r2 = StRow(Spec.StRow2H());
+        r2.With(Text("改名要求：", "st-mag", 0));
+        r2.With(Text("改名卡*1", "st-mag", 0));
+        r2.With(StLab(" 改名过程中请耐心等待一会儿，不要操作", "st-tip",
+                      Spec.StLongLabW()));
+        box.With(r2);
+        return box;
+    }
+
+    /// 界面风格：经典风格/英雄联盟 二选一 + 缩放比例输入。
+    Panel StStyleBox() {
+        Panel box = StBox();
+        Panel r1 = StRow(Spec.StRow3H());
+        Panel s1 = StSlot(Spec.StSlotW());
+        s1.With(StChk("经典风格", true, Spec.StSlotW()));
+        r1.With(s1);
+        Panel s2 = StSlot(Spec.StSlot2W());
+        s2.With(StChk("英雄联盟", false, Spec.StSlot2W()));
+        r1.With(s2);
+        box.With(r1);
+
+        Panel r2 = StRow(Spec.StRow3H());
+        r2.With(StInput("100", Spec.StNum100W(), "st-input st-input-key"));
+        r2.With(StLab("设置界面缩放比例80%-300%之间", "st-yellow",
+                      Spec.StLongLabW()));
+        box.With(r2);
+        return box;
+    }
+
+    // ---------------------------------------------------------------- 右栏
+
+    Panel StColumnRight() {
+        Panel col = StCol();
+        StSection(col, "挂机设置:", StIdleBox());
+        StSection(col, "其他设置:", StOtherBox());
+        StSection(col, "仓库命名:", StRepoBox());
+        return col;
+    }
+
+    /// 挂机设置：5 行；第 2、3 行右侧共用一条三行黄字提示。
+    /// 行高 52.5 设备（5 行铺满原版 263 高的框）；行内是**流式**排的——原版
+    /// 的说明文字紧跟复选框，不在 279 的槽线上（实测 装备过滤 右缘 1037 →
+    /// 只保留总系数 左沿 1093）。
+    Panel StIdleBox() {
+        Panel box = StBox();
+        List<StFilter> rows = StFilters();
+
+        box.With(StFilterRow(rows[0]));
+
+        Panel mid = StRow(Spec.StIdleRowH() * 2);
+        Panel left = Panel.Column(); left.Pad(0); left.Gap(0);
+        left.Prefer(0, 0);
+        left.With(StFilterRow(rows[1]));
+        left.With(StFilterRow(rows[2]));
+        mid.With(left);
+        Panel note = Panel.Column(); note.Class = "st-note-col";
+        note.Pad(0); note.Gap(0); note.Prefer(Spec.StNoteW(), 0);
+        List<string> lines = StIdleNote();
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            note.With(Text(lines[i], "st-yellow", 0));
+        }
+        mid.With(note);
+        box.With(mid);
+
+        box.With(StFilterRow(rows[3]));
+        box.With(StFilterRow(rows[4]));
+        return box;
+    }
+
+    /// 一行挂机过滤：复选框 + 前置说明 + 数值框 + 后置说明。
+    /// 带数值框的行说明短（142 的槽），不带数值框的整行是一句长说明
+    /// （243 的槽）——两者共用一个槽宽会把长句截尾。
+    Panel StFilterRow(StFilter f) {
+        Panel r = StRow(Spec.StIdleRowH());
+        r.With(StChk(f.chk, f.on, Spec.StFilterChkW()));
+        bool hasNum = f.num.Length > 0;
+        if (f.pre.Length > 0) {
+            r.With(StLab(f.pre, "st-lab",
+                         hasNum ? Spec.StFilterLabW() : Spec.StLongLabW()));
+        }
+        if (hasNum) {
+            r.With(SpacerW(Spec.Px(4)));
+            r.With(StInput(f.num, Spec.StNumW(), "st-input st-input-key"));
+        }
+        if (f.post.Length > 0) {
+            r.With(SpacerW(Spec.Px(6)));
+            r.With(StLab(f.post, "st-lab", Spec.StFilterPostW()));
+        }
+        return r;
+    }
+
+    /// 其他设置：红包开关 + 查装备。
+    Panel StOtherBox() {
+        Panel box = StBox();
+        Panel r1 = StRow(Spec.StRow2H());
+        r1.With(StChk("不允许自动弹出红包，勾选后将不会弹出红包界面", false,
+                      Spec.StColW() - Spec.StBoxPadL()));
+        box.With(r1);
+
+        Panel r2 = StRow(Spec.StRow2H());
+        r2.With(StLab("输入玩家名字:", "st-green", Spec.StFindLabW()));
+        r2.With(SpacerW(Spec.Px(6)));
+        r2.With(StInput("", Spec.StFindW(), "st-input"));
+        r2.With(SpacerW(Spec.Px(6)));
+        r2.With(StBtn("查看装备", Spec.StFindBtnW(), "st-btn-cyan"));
+        box.With(r2);
+        return box;
+    }
+
+    /// 仓库命名：5 个命名钮 + 提示行。
+    Panel StRepoBox() {
+        Panel box = StBox();
+        Panel r1 = StRow(Spec.StRow2H());
+        r1.Padding(0, 0, 0, Spec.StRepoPadL());
+        List<string> names = StRepos();
+        for (int i = 0; i < names.Count; i = i + 1) {
+            if (i > 0) { r1.With(SpacerW(Spec.StRepoGap())); }
+            string nm = names[i];
+            Button b = Btn(nm, "st-btn-name", () => { StLog("仓库命名：" + nm + "。"); });
+            b.Prefer(Spec.StRepoW(), Spec.StInputH());
+            r1.With(b);
+        }
+        box.With(r1);
+
+        Panel r2 = StRow(Spec.StRow2H());
+        r2.With(Text("提示：", "st-mag", 0));
+        r2.With(StLab("仓库命名最多允许四个汉字", "st-tip", Spec.StLongLabW()));
+        box.With(r2);
+        return box;
+    }
+
+    // ---------------------------------------------------------------- 底栏
+
+    /// 底部一排：重新登录 + 说明；右端 将本角色转到永久区 / ? / 保存设置。
+    Panel StBottomBar() {
+        Panel r = Panel.Row(); r.Class = "st-bar";
+        r.Pad(0); r.Gap(0); r.Prefer(0, Spec.StBarH());
+        Button relogin = Btn("重新登录", "st-btn-cyan",
+                             () => { StLog("设置：重新登录（用于掉线重连或网络不同步）。"); });
+        relogin.Prefer(Spec.StReloginW(), Spec.StBarH());
+        r.With(relogin);
+        Panel note = Panel.Row(); note.Class = "st-bar-note";
+        note.Pad(0);
+        note.With(StLab("用于掉线重连或网络不同步", "st-lab", Spec.StLongLabW()));
+        r.With(note);
+        Panel fill = Panel.Row(); fill.Grow(); r.With(fill);
+
+        Button mv = Btn("将本角色转到永久区", "st-btn-cyan",
+                        () => { StLog("设置：将本角色转到永久区（需要联系客服）。"); });
+        mv.Prefer(Spec.StTransferW(), Spec.StBarH());
+        r.With(mv);
+        r.With(SpacerW(Spec.Px(6)));
+        Button q = Btn("?", "st-btn-cyan", () => { StLog("设置：永久区说明未接。"); });
+        q.Prefer(Spec.StHelpW(), Spec.StBarH());
+        r.With(q);
+        r.With(SpacerW(Spec.Px(6)));
+        Button save = Btn("保存设置", "st-btn-cyan", () => { StSaveSettings(); });
+        save.Prefer(Spec.StSaveW(), Spec.StBarH());
+        r.With(save);
+        return r;
+    }
+
+    /// 保存设置：界面上这些开关的落盘由服务端/本地配置实现，离线只回报一句。
+    void StSaveSettings() {
+        if (net.Self() != null) { net.AddChat("[系统]", "设置已保存。"); return; }
+        g.Log("设置已保存（离线占位：开关状态待接本地配置）。");
+    }
+
+    /// 设置页未接的按钮统一走这里（联机进聊天、离线进日志），不假装已实现。
+    void StLog(string msg) {
+        if (net.Self() != null) { net.AddChat("[系统]", msg); return; }
+        g.Log(msg);
+    }
+}
