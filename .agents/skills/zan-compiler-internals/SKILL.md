@@ -690,3 +690,18 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
 - stdlib 侧接运行时钩子的定式：`[DllImport("crt", EntryPoint="zan_io_*")]`
   声明成 Socket 的私有静态 extern，在 Close 这类单一入口里先钩后关；运行时四个
   后端 + wasm 桩都要有符号，否则任一目标平台链接就炸。
+
+## Worker 控制口令牌/记录文件：验证要靠 A/B 记录内容，别盯进程行为（A291②，2026-09-12 已修）
+
+- stdlib 要 CSPRNG 用根命名空间的 `RandomNumberGenerator.GetBytes(n)`（Windows
+  RtlGenRandom / POSIX /dev/urandom，无弱回退）；**别 `using System.Security.Cryptography`**
+  ——`using X.Y` 按目录整体拉入会把 20 个加密文件编进每个引用者，RNG 当年搬出
+  Cryptography 就是为了这个。几字节的 hex 编码手写即可。
+- 令牌/凭据类修复的可观察面是**记录文件内容**（temp `zan-worker-<AppId>.ctl`，
+  AppId=exe 路径哈希）：A/B 跑真实 master 写出的记录，修复前 `port pid-秒`、
+  修复后 `port 32hex`，一锤定音。POSIX 权限半（chmod 0600）在无 Linux 运行时
+  的 Windows 盒上做语义等价验证：WSL gcc 编同参数 chmod 片段看 mode=600。
+- 盒子上多进程 master 行为有噪声（本机探针实跑出 worker 甄别 FATAL）：判定
+  「与我改动无关」同样用红基线——stash 修复重编重跑，FATAL 新旧一致即既有。
+  注意 worker 的 stdout 进 logDir 不进控制台，控制台里的 FATAL 未必是被杀进程
+  的遗言；以记录文件内容和 rc 为准。

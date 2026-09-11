@@ -254,6 +254,12 @@ class Worker {
         debugLog = on;
     }
 
+    #if !WINDOWS
+    // A291②：收紧记录文件权限用（见 RecordControlPort）。
+    [DllImport("crt")]
+    static extern int chmod(string path, int mode);
+    #endif
+
     #if WINDOWS
     [DllImport("ws2_32", EntryPoint = "WSADuplicateSocketA")]
     static extern int WSADuplicateSocketA(nint s, int pid, string info);
@@ -600,6 +606,12 @@ class Worker {
     static void RecordControlPort() {
         File.WriteAllText(CtlPortFile(), Convert.ToString(ControlPort())
             + " " + CtlToken());
+        #if !WINDOWS
+        // A291②：POSIX 上 temp 里的新文件默认 0644，任何本机用户可读走令牌、
+        // 进而伪造 PONG 冒充本实例 master。收到 0600（仅属主可读写）。
+        // Windows 无需处理：%TEMP% 在用户 profile 下，ACL 天然仅本用户。
+        chmod(CtlPortFile(), 384);
+        #endif
     }
 
     /// 停机时删除控制端口记录文件。
@@ -638,13 +650,33 @@ class Worker {
     // so the fork-bomb guard still sees its own master.
     static string ctlToken = "";
 
-    /// 本实例令牌（"<pid>-<unix秒>"），用于甄别控制端口应答者是否本实例的 master。
+    /// 本实例令牌：CSPRNG 16 字节的 32 位 hex（A291②）。原先的
+    /// "<pid>-<unix秒>" 可被本机任何进程按进程表+时间预算出来，从而在
+    /// 控制端口上伪造 PONG 冒充本实例 master（影响 start 的占用判定与
+    /// stop/status 的寻址结论）。令牌只做身份甄别，不是控制命令的鉴权
+    /// 凭据——CSPRNG 不可用时退回旧形态，甄别仍然工作。
     static string CtlToken() {
         if (ctlToken == "") {
-            ctlToken = Convert.ToString(ProcessHost.Pid()) + "-"
-                + Convert.ToString(DateTime.UtcNow().ToUnixSeconds());
+            byte[] rnd = RandomNumberGenerator.GetBytes(16);
+            if (rnd != null) {
+                ctlToken = ByteHex(rnd, 16);
+            } else {
+                ctlToken = Convert.ToString(ProcessHost.Pid()) + "-"
+                    + Convert.ToString(DateTime.UtcNow().ToUnixSeconds());
+            }
         }
         return ctlToken;
+    }
+
+    /// 字节数组的低位在前 hex 编码（每字节两位）。
+    static string ByteHex(byte[] b, int n) {
+        string symbols = "0123456789abcdef";
+        string s = "";
+        for (int i = 0; i < n; i = i + 1) {
+            int v = b[i] & 255;
+            s = s + symbols.Substring(v >> 4, 1) + symbols.Substring(v & 15, 1);
+        }
+        return s;
     }
 
     /// The token of the instance that recorded the control port, or "" when
