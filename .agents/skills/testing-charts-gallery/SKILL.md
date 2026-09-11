@@ -186,6 +186,12 @@ ECharts SSR（`{renderer:'svg', ssr:true}`）出来的 SVG 里每个 `<text>` �
   当场抓住。教训：新增"覆盖/回退"分支时，回退目标必须是**已换算
   好的基位变量**，不是哨兵值；且改共享几何函数必须先跑全部相关
   golden。
+- **普查得 0 先怀疑 cwd，别急着信数据**：bash 工具的 cwd 跨调用
+  持久——上一条命令 `cd _scratch/chart_oracle` 之后，普查脚本的
+  相对 glob `examples/gui_charts/options/*.json` 落空 ⇒
+  "total pie series: 0" 的彻底假阴性（饼 demo 明明在）。写完普查
+  先 `pwd` 或一律绝对路径；"0 条"与"清单自截断"是两类假阴性，
+  一个查路径一个查 slice。
 
 ### 别用像素当"数据墨迹"的探针（本仓库无头 App 下不可用）
 
@@ -227,6 +233,18 @@ cp stdlib/Gui/Component/Chart/*.zan _scratch/stdlib_snap/Gui/Component/Chart/
   DrawPolyBatch 而工作区没有，`git status` 全绿、构建全过、改动丢了）。
   修完 Zan 源码后立刻 `diff -q` 校验；提交范围以**工作区**为准。
 - `ole32` 是并发会话的 WASAPI 音频引入的；少它链接失败时先想依赖漂移。
+- **实机坏了先做归属二分，再深挖自己的 diff**（2026-09-12 T4-1 踩的）：
+  pie-nest 塌板（扇区消失、图例掉底）一度像标签重写弄坏渲染——把标签
+  逻辑体 `if (false && …)` 屏蔽仍坏（**声明还在，不是真基线**）。
+  正确一步：`git stash push -m t41-bisect -- <自己的4个文件>`（定向
+  path spec，规则 11 许可的方式）→ 重编"HEAD 图表代码 + 当前环境"
+  → 依旧坏 ⇒ 并发会话的调度器/帧调度在途回归，与本次改动无关，
+  `git stash pop` 还原继续。屏蔽逻辑体会误导；stash 才是干净基线。
+- **塌板形态速判**：扇区不可见但引线/标签落在**最终几何** =
+  `animationType:'scale'`（elasticOut）入场停在中途（半径≈0 而布局
+  已算完），不是布局崩——加长等待（5s 重拍）区分"截早了"与"永久
+  停帧"；pie-nest/pie-roseType/pie-rich-text 塌、pie-simple/
+  pie-legend（默认展开动画）不塌，即此特征。
 - GUI 子程序**没有 stdout**：`Console.WriteLine` 不可见。追踪一律
   `System.IO.File.AppendAllText("D:/project/zan-lang/_scratch/dbg_xxx.txt", ...)`，
   绝对路径；收尾必须剥离。
