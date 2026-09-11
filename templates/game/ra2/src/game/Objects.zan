@@ -1033,6 +1033,7 @@ class StructureType {
     List<List<int>> prereqs;   // tech slots, see UnitType
     bool waterBound;     // floats: its footprint must be water (the shipyard)
     int sight;           // the shroud reveal radius (rules Sight=, default 1)
+    bool conYard;        // rules ConstructionYard=: the free-MCV crate gate
 
     static StructureType Create(BuildingDef d) {
         StructureType t = new StructureType();
@@ -1057,6 +1058,7 @@ class StructureType {
         t.prereqs = new List<List<int>>();
         t.waterBound = d.WaterBound();
         t.sight = d.Sight();
+        t.conYard = d.IsConYard();
         t.techLevel = d.TechLevel();
         return t;
     }
@@ -1080,6 +1082,7 @@ class StructureType {
     Weapon Weapon() { return this.weapon; }
     bool Powered() { return this.powered; }
     bool IsRefinery() { return this.refinery; }
+    bool IsConYard() { return this.conYard; }
     bool WaterBound() { return this.waterBound; }
     int Sight() { return this.sight; }
     bool HasWeapon() { return this.weapon != null; }
@@ -1512,6 +1515,12 @@ class World {
         return v;
     }
 
+    /// <summary>A 0..1 roll on the same deterministic hash the crate
+    /// layer's fractions ride on (the reference's generateRandom).</summary>
+    double WorldRandFrac() {
+        return this.WorldRand(1000) / 1000.0;
+    }
+
     /// <summary>Whether a blast on this cell would scar the ground -- the
     /// reference's AnimTerrainEffect.spawnSmudges preconditions: Clear land
     /// only, flat (ramp 0), inside the bounds, and no non-unit object on
@@ -1643,16 +1652,559 @@ class World {
         if (o.Kind() == ObjKind.Structure()) {
             StructureType t = this.catalog.TypeFor(this, house, o.BuildId());
             sight = t != null ? t.Sight() : 0;
-            File.AppendAllText("build/shz_mark.txt", "s"
-                + Convert.ToString(sight) + "\n");
         }
         else {
             UnitType ut = o.UnitType();
             sight = ut != null ? ut.Sight() : 0;
-            File.AppendAllText("build/shz_mark.txt", "u"
-                + Convert.ToString(sight) + "\n");
         }
         s.RevealFrom(o.X(), o.Y(), this.LevelAt(o.X(), o.Y()), sight);
+    }
+
+    // ---- crates / power-ups (the reference's CrateGeneratorTrait) ----------
+
+    // The goodie crates: live records in parallel lists (cell x, cell y,
+    // the rolled powerup index, ticks until the crate despawns), the init
+    // scan's rim columns, and the lobby switch. The reference spawns the
+    // crate as an overlay object carrying its PowerupType; the port keeps
+    // that state here and the render layer reads the same lists.
+    bool cratesOn;
+    List<int> crateX;
+    List<int> crateY;
+    List<int> cratePow;
+    List<int> crateTicks;
+    List<int> crateEdgeX;
+    List<int> crateEdgeY;
+    bool crateEdgeWater;
+    int crateMin;
+
+    // The controller owns the wallets, so it mirrors them here after
+    // draining the money events; the free-MCV crate branch reads this to
+    // gate the grant on credits. One tick stale at worst.
+    List<int> creditSnap;
+
+    /// <summary>Builds the crate layer, the reference's init: the column
+    /// scan collects each column's first and last landable cell (the rim
+    /// the spawn bias favours), records whether any land rim exists at all,
+    /// and sizes the population floor to crateMinimum per human -- this
+    /// port's skirmish seats exactly one. Nothing spawns here; the first
+    /// tick tops the field up.</summary>
+    void InitCrates(bool on) {
+        this.cratesOn = on;
+        this.crateX = new List<int>();
+        this.crateY = new List<int>();
+        this.cratePow = new List<int>();
+        this.crateTicks = new List<int>();
+        this.crateEdgeX = new List<int>();
+        this.crateEdgeY = new List<int>();
+        this.crateEdgeWater = false;
+        this.creditSnap = new List<int>();
+        int landEdges = 0;
+        for (int x = 0; x < this.width; x = x + 1) {
+            int firstY = 0 - 1;
+            int lastY = 0 - 1;
+            bool waterStart = false;
+            bool waterEnd = false;
+            for (int y = 0; y < this.height; y = y + 1) {
+                IsoTile tile = this.iso.At(x, y);
+                if (tile != null && this.CrateCanPlace(x, y)) {
+                    bool isWater = this.IsWater(tile);
+                    if (firstY < 0) {
+                        if (isWater) {
+                            waterStart = true;
+                            waterEnd = true;
+                        } else {
+                            firstY = y;
+                            lastY = y;
+                        }
+                    } else {
+                        if (!isWater) { lastY = y; }
+                        waterEnd = isWater;
+                    }
+                } else if (firstY >= 0 && tile == null) {
+                    break;   // the reference's column walk stops at a gap
+                }
+            }
+            if (firstY >= 0) {
+                this.crateEdgeX.Add(x);
+                this.crateEdgeY.Add(firstY);
+                if (lastY >= 0 && lastY != firstY) {
+                    this.crateEdgeX.Add(x);
+                    this.crateEdgeY.Add(lastY);
+                }
+                if (!waterStart && !waterEnd) { landEdges = landEdges + 1; }
+            }
+        }
+        this.crateEdgeWater = landEdges == 0;
+        this.crateMin = this.Rules().CrateMinimum();
+    }
+
+    void SetCreditSnap(int side, int amount) {
+        if (side < 0) { return; }
+        if (this.creditSnap == null) { this.creditSnap = new List<int>(); }
+        while (this.creditSnap.Count <= side) { this.creditSnap.Add(0); }
+        this.creditSnap[side] = amount;
+    }
+
+    int CreditSnap(int side) {
+        if (side < 0 || side >= this.creditSnap.Count) { return 0; }
+        return this.creditSnap[side];
+    }
+
+    /// <summary>Whether a crate may sit on this cell, the reference's
+    /// canPlaceCrateOnTile: in bounds, no ground object on the tile (walls,
+    /// scenery, ore, bridges, a crate already there), amphibiously
+    /// passable ground or water, never the Shore strip, and flat.</summary>
+    bool CrateCanPlace(int x, int y) {
+        if (!this.InBounds(x, y)) { return false; }
+        int slot = this.CellSlot(x, y);
+        if (this.occupancy[slot] != 0) { return false; }
+        if (this.IsWallCell(x, y)) { return false; }
+        if (this.statOv[slot] >= 0 || this.brOv[slot] >= 0
+         || this.oreOv[slot] >= 0) { return false; }
+        if (this.CrateAt(x, y) >= 0) { return false; }
+        if (!this.PassableForRoute(x, y, true)) { return false; }
+        IsoTile t = this.iso.At(x, y);
+        if (t == null) { return false; }
+        LandType lt = this.CellLand(t);
+        if (lt != null && lt.Value() == LandType.Beach()) { return false; }
+        if (this.CellRampAt(x, y) != 0) { return false; }
+        return true;
+    }
+
+    /// <summary>The crate record on a cell, or -1.</summary>
+    int CrateAt(int x, int y) {
+        if (this.crateX == null) { return 0 - 1; }
+        for (int i = 0; i < this.crateX.Count; i = i + 1) {
+            if (this.crateX[i] == x && this.crateY[i] == y) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    void RemoveCrateAt(int i) {
+        this.crateX.RemoveAt(i);
+        this.crateY.RemoveAt(i);
+        this.cratePow.RemoveAt(i);
+        this.crateTicks.RemoveAt(i);
+        // The terrain layer bakes the crate art in like the ore and walls,
+        // so a despawn is a scene change.
+        this.oreVersion = this.oreVersion + 1;
+    }
+
+    /// <summary>Read-only views for the render layer, which bakes the
+    /// crates into the terrain canvas from the live lists.</summary>
+    List<int> CrateXList() { return this.crateX; }
+    List<int> CrateYList() { return this.crateY; }
+    int CrateCount() {
+        return this.crateX != null ? this.crateX.Count : 0;
+    }
+
+    /// <summary>The crate heartbeat, the reference's onTick: expired crates
+    /// despawn, and while the lobby keeps crates on the field is topped
+    /// back up to the floor.</summary>
+    void TickCrates() {
+        if (this.crateX == null) { return; }
+        for (int i = this.crateX.Count - 1; i >= 0; i = i - 1) {
+            int left = this.crateTicks[i] - 1;
+            if (left <= 0) { this.RemoveCrateAt(i); }
+            else { this.crateTicks[i] = left; }
+        }
+        if (this.cratesOn) {
+            int guard = 0;
+            while (this.crateX.Count < this.crateMin && guard < 8) {
+                guard = guard + 1;
+                if (!this.SpawnCrateRandom()) { break; }
+            }
+        }
+    }
+
+    /// <summary>One random crate attempt, the reference's spawnCrateAtRandom:
+    /// two thirds of the rolls (one third off an all-water rim) draw from
+    /// the rim columns, otherwise from the open field, with up to 100
+    /// placement tries before a dense scan stands in for the reference's
+    /// read of the occupation map's empty tiles.</summary>
+    bool SpawnCrateRandom() {
+        double share = 2.0 / 3.0;
+        if (this.crateEdgeWater) { share = 1.0 / 3.0; }
+        bool useEdge = this.crateEdgeX.Count > 0
+                    && this.WorldRandFrac() < share;
+        for (int a = 0; a < 100; a = a + 1) {
+            int x = 0;
+            int y = 0;
+            if (useEdge) {
+                int k = this.WorldRand(this.crateEdgeX.Count);
+                x = this.crateEdgeX[k];
+                y = this.crateEdgeY[k];
+            } else {
+                x = this.WorldRand(this.width);
+                y = this.WorldRand(this.height);
+            }
+            if (this.CrateCanPlace(x, y)) { return this.SpawnCrateAt(x, y); }
+        }
+        int total = this.width * this.height;
+        int start = this.WorldRand(total);
+        for (int i = 0; i < total; i = i + 1) {
+            int cell = (start + i) % total;
+            int cx = cell % this.width;
+            int cy = cell / this.width;
+            if (this.CrateCanPlace(cx, cy)) { return this.SpawnCrateAt(cx, cy); }
+        }
+        return false;
+    }
+
+    /// <summary>Places one crate and rolls its powerup, the reference's
+    /// spawnCrateAt: the crate lives 60 * crateRegen * 30 * (0.5 + 1.5 *
+    /// rand) ticks before it despawns unclaimed.</summary>
+    bool SpawnCrateAt(int x, int y) {
+        if (!this.CrateCanPlace(x, y)) { return false; }
+        int pow = this.ChoosePowerup(this.IsWater(this.iso.At(x, y)));
+        if (pow < 0) { return false; }
+        this.crateX.Add(x);
+        this.crateY.Add(y);
+        this.cratePow.Add(pow);
+        int ticks = 60 * this.Rules().CrateRegen() * 30;
+        ticks = (int)(ticks * (0.5 + 1.5 * this.WorldRandFrac()));
+        this.crateTicks.Add(ticks);
+        this.oreVersion = this.oreVersion + 1;
+        return true;
+    }
+
+    /// <summary>A crate with a pinned powerup and lifetime: the shipped
+    /// game only rolls, but the selftest's determinism wants both fixed.</summary>
+    bool SpawnCratePinned(int x, int y, int pow, int ticks) {
+        if (!this.CrateCanPlace(x, y)) { return false; }
+        this.crateX.Add(x);
+        this.crateY.Add(y);
+        this.cratePow.Add(pow);
+        this.crateTicks.Add(ticks);
+        this.oreVersion = this.oreVersion + 1;
+        return true;
+    }
+
+    /// <summary>The share-weighted roll, the reference's choosePowerup:
+    /// water crates draw only from the water-allowed powerups, and the
+    /// pick is an inclusive roll across the summed shares.</summary>
+    int ChoosePowerup(bool water) {
+        Rules rules = this.Rules();
+        int total = 0;
+        int count = rules.PowerupCount();
+        for (int i = 0; i < count; i = i + 1) {
+            if (water && !rules.PowerupWaterAt(i)) { continue; }
+            total = total + rules.PowerupSharesAt(i);
+        }
+        if (total <= 0) { return 0 - 1; }
+        int roll = this.WorldRand(total + 1);
+        int sum = 0;
+        for (int i = 0; i < count; i = i + 1) {
+            if (water && !rules.PowerupWaterAt(i)) { continue; }
+            sum = sum + rules.PowerupSharesAt(i);
+            if (roll < sum) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    /// <summary>The pickup check a unit runs on every cell it steps onto,
+    /// the reference's pickupCrate: the crate is consumed, its powerup
+    /// resolves, and while the lobby keeps crates on the taken crate is
+    /// replaced at once. Neutral scenery -- cows, cars -- never picks up.</summary>
+    void PickupCrateAt(WorldObject o) {
+        if (o == null || o.IsDead()) { return; }
+        if (o.Side() == Side2.Neutral()) { return; }
+        if (this.crateX == null || this.crateX.Count == 0) { return; }
+        int i = this.CrateAt(o.X(), o.Y());
+        if (i < 0) { return; }
+        int pow = this.cratePow[i];
+        int cx = this.crateX[i];
+        int cy = this.crateY[i];
+        this.RemoveCrateAt(i);
+        this.GrantPowerup(o, pow, cx, cy);
+        if (this.cratesOn) { this.SpawnCrateRandom(); }
+    }
+
+    /// <summary>Resolves a rolled powerup, the reference's grantPowerup.
+    /// The live set is what this engine has systems for: money, heal base,
+    /// reveal, darkness, the free unit, the two bombs and the ore drop.
+    /// The bonuses that need systems still to migrate -- veteran
+    /// promotion, the armour/firepower/speed multipliers, cloak, the two
+    /// superweapon gifts -- fail their grant, and a failed crate degrades
+    /// to money exactly like the reference's own failure path.</summary>
+    void GrantPowerup(WorldObject unit, int pow, int x, int y) {
+        Rules rules = this.Rules();
+        int side = unit.Side();
+        int type = pow >= 0 && pow < rules.PowerupCount()
+                 ? rules.PowerupTypeAt(pow) : 0 - 1;
+        bool ok = false;
+        if (type == Rules.PowerupMoney()) {
+            ok = true;
+            this.GrantMoneyCrate(side, rules.PowerupDataAt(pow));
+        } else if (type == Rules.PowerupHealBase()) {
+            ok = true;
+            for (int i = 0; i < this.objects.Count; i = i + 1) {
+                WorldObject o = this.objects[i];
+                if (o == null || o.IsDead() || o.Side() != side) { continue; }
+                o.SetHp(o.MaxHp());
+            }
+        } else if (type == Rules.PowerupReveal()) {
+            ok = true;
+            MapShroud s = this.ShroudOf(side);
+            if (s != null) { s.RevealAll(); }
+        } else if (type == Rules.PowerupDarkness()) {
+            ok = true;
+            MapShroud s = this.ShroudOf(side);
+            if (s != null) {
+                s.Reset();
+                // resetShroud re-reveals the owner's own forces afterwards;
+                // the queued reveals flush in this tick's shroud update.
+                for (int i = 0; i < this.objects.Count; i = i + 1) {
+                    WorldObject o = this.objects[i];
+                    if (o == null || o.IsDead() || o.Side() != side) { continue; }
+                    this.ShroudRevealObject(o);
+                }
+            }
+        } else if (type == Rules.PowerupUnit()) {
+            ok = this.GrantCrateUnit(unit, x, y);
+        } else if (type == Rules.PowerupExplosion()
+                || type == Rules.PowerupNapalm()) {
+            ok = this.GrantCrateBoom(unit, pow, x, y);
+        } else if (type == Rules.PowerupTiberium()) {
+            ok = this.GrantCrateOre(x, y);
+        }
+        if (!ok) {
+            for (int i = 0; i < rules.PowerupCount(); i = i + 1) {
+                if (rules.PowerupTypeAt(i) == Rules.PowerupMoney()
+                 && rules.PowerupSharesAt(i) > 0) {
+                    this.GrantMoneyCrate(side, rules.PowerupDataAt(i));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// <summary>The money payout, the reference's grantMoneyPowerup: the
+    /// data field scaled into 55%..145% of itself, queued for the
+    /// controller's wallet (the world owns no credits).</summary>
+    void GrantMoneyCrate(int side, string data) {
+        int amount = this.rules_dataInt(data, 10000);
+        double roll = 0.55 + 2.0 * this.WorldRandFrac() * 0.45;
+        this.events.Add(1);
+        this.events.Add(side);
+        this.events.Add((int)(amount * roll));
+    }
+
+    /// <summary>A rules Data= payload as a plain integer, the default when
+    /// the field is missing or not numeric.</summary>
+    int rules_dataInt(string s, int dflt) {
+        if (s == null || s.Length == 0) { return dflt; }
+        int v = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 0xFF;
+            if (c < 48 || c > 57) { return dflt; }
+            v = v * 10 + (c - 48);
+        }
+        return v;
+    }
+
+    /// <summary>The two live bombs, the reference's grantExplosionPowerup:
+    /// the crate's data is raw damage through the [CombatDamage] warhead --
+    /// FlameDamage for napalm, C4Warhead for the rest -- detonated on the
+    /// picker's own cell. The wave is friendly to nobody: the reference
+    /// detonates with friendly fire allowed, so the picker's troops, the
+    /// neighbours' and the neutrals all take it. SplashAround's falloff
+    /// maths, minus its shooter-side exemption. An unresolved warhead
+    /// fails the grant, degrading the crate to money.</summary>
+    bool GrantCrateBoom(WorldObject unit, int pow, int x, int y) {
+        Rules rules = this.Rules();
+        int type = rules.PowerupTypeAt(pow);
+        string whName = type == Rules.PowerupNapalm()
+                      ? rules.FlameDamage() : rules.C4Warhead();
+        Warhead wh = rules.WarheadByName(whName);
+        if (wh == null) { return false; }
+        int dmg = this.rules_dataInt(rules.PowerupDataAt(pow), 500);
+        if (dmg <= 0) { dmg = 500; }
+        int zero = this.OccupantAt(x, y);
+        if (zero >= 0) {
+            WorldObject d = this.objects[zero];
+            int armor = this.ArmorOf(d);
+            d.TakeDamageAs(dmg * wh.Verse(armor) / 100, wh.InfDeath());
+            this.SuppressTrooper(d);
+        }
+        if (wh.Spread() <= 0) { return true; }
+        int radius = wh.Spread() + 2;
+        int half = this.Rules().SplashScale() > 0
+            ? this.Rules().SplashScale() : 50;
+        for (int i = 0; i < this.objects.Count; i = i + 1) {
+            WorldObject o = this.objects[i];
+            if (i == zero || o == null || o.IsDead()) { continue; }
+            int vx = o.X() - x;
+            if (vx < 0) { vx = 0 - vx; }
+            int vy = o.Y() - y;
+            if (vy < 0) { vy = 0 - vy; }
+            if (vx > radius || vy > radius) { continue; }
+            int d2 = vx + vy;
+            if (d2 > radius) { continue; }
+            int damp = (radius - d2) * (dmg * half / 100) / radius;
+            if (damp <= 0) { continue; }
+            o.TakeDamageAs(damp, wh.InfDeath());
+            this.SuppressTrooper(o);
+        }
+        return true;
+    }
+
+    /// <summary>The ore drop, the reference's grantTiberiumPowerup: up to
+    /// six rolls land within two cells of the crate, each growing one
+    /// value-3 bail wherever flat land takes it -- the growth pass's own
+    /// placement primitive.</summary>
+    bool GrantCrateOre(int x, int y) {
+        bool ok = false;
+        for (int a = 0; a < 6; a = a + 1) {
+            int tx = x + this.WorldRand(5) - 2;
+            int ty = y + this.WorldRand(5) - 2;
+            if (this.TibTrySpawn(tx, ty)) { ok = true; }
+        }
+        return ok;
+    }
+
+    /// <summary>The free unit, the reference's grantUnitPowerup: a
+    /// commander with no construction yard and no base unit gets his MCV
+    /// back once his wallet covers what his side's starting base cost
+    /// (the build-power and build-refinery lists); anyone else rolls the
+    /// CrateGoodie vehicles, or the [General] UnitCrateType override when
+    /// the rules name one. The unit walks out onto the first free cell
+    /// around the crate, the reference's RadialTileFinder probe.</summary>
+    bool GrantCrateUnit(WorldObject unit, int x, int y) {
+        Rules rules = this.Rules();
+        bool hasYard = false;
+        bool hasBase = false;
+        for (int i = 0; i < this.objects.Count; i = i + 1) {
+            WorldObject o = this.objects[i];
+            if (o == null || o.IsDead() || o.Side() != unit.Side()) { continue; }
+            if (o.Kind() == ObjKind.Structure()) {
+                StructureType st = this.TypeOf(o);
+                if (st != null && st.IsConYard()) { hasYard = true; }
+            } else {
+                UnitType ut = o.UnitType();
+                if (ut != null && ut.DeploysInto() != null
+                 && ut.DeploysInto().Length > 0) { hasBase = true; }
+            }
+        }
+        if (!hasYard && rules.FreeMCV() && !hasBase) {
+            if (this.CreditSnap(unit.Side())
+             >= this.StartingBaseCost(unit.Side())) {
+                UnitDef mcv = this.FindMcvDef(unit.Side());
+                if (mcv != null) {
+                    return this.SpawnDefNear(mcv, unit.Side(), x, y);
+                }
+                return false;
+            }
+            // An empty wallet falls through to the goodie roll, the
+            // reference's own path when the credits do not cover it.
+        }
+        string forced = rules.UnitCrateType();
+        if (forced != null && forced.Length > 0) {
+            for (int i = 0; i < rules.Units().Count; i = i + 1) {
+                if (rules.Units()[i].Reg() == forced) {
+                    return this.SpawnDefNear(rules.Units()[i], unit.Side(), x, y);
+                }
+            }
+            return false;
+        }
+        bool water = this.IsWater(this.iso.At(x, y));
+        List<UnitDef> pool = new List<UnitDef>();
+        if (!water) {
+            for (int i = 0; i < rules.Units().Count; i = i + 1) {
+                UnitDef d = rules.Units()[i];
+                if (d.CrateGoodie()) { pool.Add(d); }
+            }
+        }
+        if (pool.Count == 0) { return false; }
+        return this.SpawnDefNear(pool[this.WorldRand(pool.Count)], unit.Side(),
+                                 x, y);
+    }
+
+    /// <summary>What the reference charges the free MCV against: the cost
+    /// of the side's share of the AI's build-power and build-refinery
+    /// lists -- the starting base the commander is presumed to have lost.</summary>
+    int StartingBaseCost(int side) {
+        Rules rules = this.Rules();
+        int bit = side == Side2.Allied() ? 1
+                : side == Side2.Soviet() ? 2 : 4;
+        int cost = 0;
+        cost = cost + this.BaseListCost(rules.AiPower(), bit);
+        cost = cost + this.BaseListCost(rules.AiRefinery(), bit);
+        return cost;
+    }
+
+    int BaseListCost(List<string> regs, int bit) {
+        Rules rules = this.Rules();
+        int cost = 0;
+        for (int i = 0; i < regs.Count; i = i + 1) {
+            for (int b = 0; b < rules.Buildings().Count; b = b + 1) {
+                BuildingDef d = rules.Buildings()[b];
+                if (d.Reg() == regs[i] && (d.SideMask() & bit) != 0) {
+                    cost = cost + d.Cost();
+                }
+            }
+        }
+        return cost;
+    }
+
+    /// <summary>The side's deployable construction vehicle, the free-MCV
+    /// crate's gift (AMCV, SMCV, PCV in the shipped rules).</summary>
+    UnitDef FindMcvDef(int side) {
+        Rules rules = this.Rules();
+        int bit = side == Side2.Allied() ? 1
+                : side == Side2.Soviet() ? 2 : 4;
+        for (int i = 0; i < rules.Units().Count; i = i + 1) {
+            UnitDef d = rules.Units()[i];
+            if (d.DeploysInto() != null && d.DeploysInto().Length > 0
+             && (d.SideMask() & bit) != 0) { return d; }
+        }
+        return null;
+    }
+
+    /// <summary>Spawns a rules-level vehicle archetype for a house near the
+    /// crate, through its roster slot when the side trains it and from the
+    /// archetype itself when it does not -- the reference's
+    /// createUnitForPlayer is roster-blind the same way.</summary>
+    bool SpawnDefNear(UnitDef d, int side, int x, int y) {
+        if (d == null) { return false; }
+        int uid = this.units.IdOfReg(this, side, d.Reg());
+        if (uid >= 0) {
+            return this.SpawnUnitNear(side, uid, x, y, 3) >= 0;
+        }
+        for (int s = 0; s < 8; s = s + 1) {
+            int oid = this.units.IdOfReg(this, s, d.Reg());
+            if (oid >= 0) {
+                UnitType ut = this.units.ListFor(this, s)[oid];
+                return this.SpawnMapUnit(side, oid, x, y, ut.Hp(), 0, ut) >= 0;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>SpawnUnit with a Manhattan-ring probe out to radius cells:
+    /// the crate's unit walks out onto the first free passable cell around
+    /// the crate, the reference's RadialTileFinder (width 1, radius 3).</summary>
+    int SpawnUnitNear(int side, int unitId, int x, int y, int radius) {
+        for (int d = 0; d <= radius; d = d + 1) {
+            for (int dx = 0 - d; dx <= d; dx = dx + 1) {
+                int rest = d - (dx < 0 ? 0 - dx : dx);
+                int sx = x + dx;
+                if (this.UnitSpawnOk(sx, y + rest)) {
+                    return this.SpawnUnit(side, unitId, sx, y + rest);
+                }
+                if (rest != 0 && this.UnitSpawnOk(sx, y - rest)) {
+                    return this.SpawnUnit(side, unitId, sx, y - rest);
+                }
+            }
+        }
+        return 0 - 1;
+    }
+
+    bool UnitSpawnOk(int x, int y) {
+        if (!this.InBounds(x, y)) { return false; }
+        if (this.occupancy[this.CellSlot(x, y)] != 0) { return false; }
+        if (this.IsWallCell(x, y)) { return false; }
+        return this.PassableForRoute(x, y, false);
     }
 
     StructureCatalog Catalog() { return this.catalog; }
@@ -5051,6 +5603,9 @@ class World {
                     o.SetTurretFacing(stepFacing);
                 }
                 this.occupancy[this.CellSlot(o.X(), o.Y())] = i + 1;
+                // A crate underfoot is consumed by the walker, the
+                // reference's move hook into pickupCrate.
+                this.PickupCrateAt(o);
                 moved = moved + 1;
             }
             o.SetMoveAccum(bank);
@@ -5158,6 +5713,9 @@ class World {
                 this.shrouds[h].Update();
             }
         }
+        // The crates age and repopulate behind the shroud flush, the
+        // reference's CrateGeneratorTrait riding the same tick.
+        this.TickCrates();
         List<int> result = new List<int>();
         result.Add(moved);
         result.Add(fired);

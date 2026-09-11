@@ -264,6 +264,11 @@ class UnitDef {
     // shroud reveal circle.
     int sight;
 
+    // The shipped rules' CrateGoodie= key (TechnoRules, default no): a
+    // vehicle marked this way is in the pool the unit crate rolls from.
+    // No retail vehicle ships with the flag; custom rule sets can.
+    bool crateGoodie;
+
     static UnitDef Create(string reg, string label, int cost, int hp,
                           int speed, int armor, Weapon primary,
                           string producer, int sideMask, string shp) {
@@ -289,6 +294,7 @@ class UnitDef {
         d.deployer = false;
         d.storage = 0;
         d.sight = 1;
+        d.crateGoodie = false;
         return d;
     }
 
@@ -307,6 +313,8 @@ class UnitDef {
     void SetStorage(int v) { this.storage = v; }
     int Sight() { return this.sight; }
     void SetSight(int v) { this.sight = v; }
+    bool CrateGoodie() { return this.crateGoodie; }
+    void SetCrateGoodie(bool on) { this.crateGoodie = on; }
     int Role() { return this.role; }
     bool MindImmune() { return this.mindImmune; }
     string Shp() { return this.shp; }
@@ -553,6 +561,11 @@ class BuildingDef {
     // 11, default 1). Drives the shroud reveal circle.
     int sight;
 
+    // The shipped rules' ConstructionYard= key (BuildingRules, default no):
+    // the free-MCV crate branch checks the owner still has one standing
+    // before it hands out a replacement MCV.
+    bool conYard;
+
     static BuildingDef Create(string reg, string label, string shp, int fw,
                               int fh, int hp, int cost, int power, int drain,
                               int armor, int sideMask) {
@@ -572,6 +585,7 @@ class BuildingDef {
         d.refinery = false;
         d.waterBound = false;
         d.sight = 1;
+        d.conYard = false;
         d.sideMask = sideMask;
         d.prereq = new List<string>();
         d.artKey = reg;
@@ -583,6 +597,8 @@ class BuildingDef {
     string Label() { return this.label; }
     string Shp() { return this.shp; }
     void SetShp(string shp) { this.shp = shp; }
+    bool IsConYard() { return this.conYard; }
+    void SetConYard(bool on) { this.conYard = on; }
     string ArtKey() { return this.artKey; }
     void SetArtKey(string key) { this.artKey = key; }
     string Cameo() { return this.cameo; }
@@ -737,6 +753,34 @@ class Rules {
     bool oreSpreads;
     int growthRate;
 
+    // ---- the goodie crates -------------------------------------------------
+    // The [General] crate keys and the [Powerups] table (the reference's
+    // CrateRules + PowerupsRules): how many crates the field carries, what
+    // they look like on land and water, and the weighted powerup table the
+    // roll draws from. Shares weight the roll, the anim names the pickup
+    // flourish, Water= gates the sea crates, Data= the payload.
+    int crateMaximum;
+    int crateMinimum;
+    int crateRadius;
+    int crateRegen;
+    string unitCrateType;   // null = roll the CrateGoodie vehicles instead
+    string crateImg;        // the land crate overlay reg (CRATE1)
+    string waterCrateImg;   // the water crate overlay reg (CRATE2)
+    bool freeMCV;
+    List<int> powerupTypes;
+    List<int> powerupShares;
+    List<string> powerupAnims;
+    List<bool> powerupWater;
+    List<string> powerupData;
+
+    // The explosion crate's warheads, the [CombatDamage] C4Warhead /
+    // FlameDamage keys -- the reference stores them as the ini's warhead
+    // name strings and looks them up by name at the crate. The shipped ini
+    // supplies the names; this port's transcription has no fire warhead
+    // yet, so both default to the general-purpose HE.
+    string c4Warhead = "HE";
+    string flameDamage = "HE";
+
     // The neutral scenery units: the civilian vehicles and animals the
     // official maps park and scatter ([Units]/[Infantry] entries owned by
     // Neutral). They sit outside the three build rosters -- a map's cars and
@@ -768,6 +812,20 @@ class Rules {
         r.oreGrows = true;
         r.oreSpreads = true;
         r.growthRate = 5;
+        r.crateMaximum = 5;
+        r.crateMinimum = 1;
+        r.crateRadius = 2;
+        r.crateRegen = 1;
+        r.unitCrateType = null;
+        r.crateImg = "CRATE1";
+        r.waterCrateImg = "CRATE2";
+        r.freeMCV = true;
+        r.powerupTypes = new List<int>();
+        r.powerupShares = new List<int>();
+        r.powerupAnims = new List<string>();
+        r.powerupWater = new List<bool>();
+        r.powerupData = new List<string>();
+        r.DefaultPowerups();
         r.bridgeStrength = 1500;
         return r;
     }
@@ -775,6 +833,16 @@ class Rules {
     // ---- lookups -----------------------------------------------------------
 
     List<Warhead> Warheads() { return this.warheads; }
+    /// <summary>The [Warheads] entry a name addresses -- the crate
+    /// powerups pick their warheads by name (the [CombatDamage] C4Warhead /
+    /// FlameDamage keys), the reference's rules.getWarhead.</summary>
+    Warhead WarheadByName(string reg) {
+        if (reg == null || reg.Length == 0) { return null; }
+        for (int i = 0; i < this.warheads.Count; i = i + 1) {
+            if (this.warheads[i].Name() == reg) { return this.warheads[i]; }
+        }
+        return null;
+    }
     List<Weapon> Weapons() { return this.weapons; }
     List<UnitDef> Units() { return this.units; }
     List<BuildingDef> Buildings() { return this.buildings; }
@@ -806,6 +874,101 @@ class Rules {
     int RepairPercent() { return this.repairPercent; }
     int RepairStep() { return this.repairStep; }
     int RepairRateTicks() { return this.repairRateTicks; }
+    int CrateMaximum() { return this.crateMaximum; }
+    int CrateMinimum() { return this.crateMinimum; }
+    int CrateRadius() { return this.crateRadius; }
+    int CrateRegen() { return this.crateRegen; }
+    string UnitCrateType() { return this.unitCrateType; }
+    string CrateImg() { return this.crateImg; }
+    string WaterCrateImg() { return this.waterCrateImg; }
+    bool FreeMCV() { return this.freeMCV; }
+    string C4Warhead() { return this.c4Warhead; }
+    string FlameDamage() { return this.flameDamage; }
+    int PowerupCount() { return this.powerupTypes.Count; }
+    int PowerupTypeAt(int i) { return this.powerupTypes[i]; }
+    int PowerupSharesAt(int i) { return this.powerupShares[i]; }
+    string PowerupAnimsAt(int i) { return this.powerupAnims[i]; }
+    bool PowerupWaterAt(int i) { return this.powerupWater[i]; }
+    string PowerupDataAt(int i) { return this.powerupData[i]; }
+
+    /// <summary>The shipped rules' PowerupType order: the enum the
+    /// [Powerups] table's keys name and the crate grant switches on.</summary>
+    static int PowerupArmor() { return 0; }
+    static int PowerupFirepower() { return 1; }
+    static int PowerupHealBase() { return 2; }
+    static int PowerupMoney() { return 3; }
+    static int PowerupReveal() { return 4; }
+    static int PowerupSpeed() { return 5; }
+    static int PowerupVeteran() { return 6; }
+    static int PowerupUnit() { return 7; }
+    static int PowerupInvulnerability() { return 8; }
+    static int PowerupIonStorm() { return 9; }
+    static int PowerupGas() { return 10; }
+    static int PowerupTiberium() { return 11; }
+    static int PowerupPod() { return 12; }
+    static int PowerupCloak() { return 13; }
+    static int PowerupDarkness() { return 14; }
+    static int PowerupExplosion() { return 15; }
+    static int PowerupICBM() { return 16; }
+    static int PowerupNapalm() { return 17; }
+    static int PowerupSquad() { return 18; }
+
+    /// <summary>A [Powerups] key to its PowerupType, or -1 when the key is
+    /// not one of the shipped names.</summary>
+    static int PowerupTypeOf(string name) {
+        if (name == null) { return 0 - 1; }
+        string n = name.Trim().ToUpper();
+        if (n == "ARMOR") { return PowerupArmor(); }
+        if (n == "FIREPOWER") { return PowerupFirepower(); }
+        if (n == "HEALBASE") { return PowerupHealBase(); }
+        if (n == "MONEY") { return PowerupMoney(); }
+        if (n == "REVEAL") { return PowerupReveal(); }
+        if (n == "SPEED") { return PowerupSpeed(); }
+        if (n == "VETERAN") { return PowerupVeteran(); }
+        if (n == "UNIT") { return PowerupUnit(); }
+        if (n == "INVULNERABILITY") { return PowerupInvulnerability(); }
+        if (n == "IONSTORM") { return PowerupIonStorm(); }
+        if (n == "GAS") { return PowerupGas(); }
+        if (n == "TIBERIUM") { return PowerupTiberium(); }
+        if (n == "POD") { return PowerupPod(); }
+        if (n == "CLOAK") { return PowerupCloak(); }
+        if (n == "DARKNESS") { return PowerupDarkness(); }
+        if (n == "EXPLOSION") { return PowerupExplosion(); }
+        if (n == "ICBM") { return PowerupICBM(); }
+        if (n == "NAPALM") { return PowerupNapalm(); }
+        if (n == "SQUAD") { return PowerupSquad(); }
+        return 0 - 1;
+    }
+
+    /// <summary>The retail [Powerups] table, transcribed: the shipped
+    /// shares, anims, water gates and payloads. The four systems this port
+    /// has not migrated -- IonStorm, Gas, Pod, Squad -- are simply absent,
+    /// the same crates the reference's UNSUPPORTED_POWERUP_TYPES skips.</summary>
+    void DefaultPowerups() {
+        this.InstallPowerup(PowerupArmor(), 30, null, false, "2");
+        this.InstallPowerup(PowerupFirepower(), 30, null, false, "2");
+        this.InstallPowerup(PowerupHealBase(), 30, null, false, "0");
+        this.InstallPowerup(PowerupMoney(), 100, null, false, "10000");
+        this.InstallPowerup(PowerupReveal(), 30, null, false, "0");
+        this.InstallPowerup(PowerupSpeed(), 30, null, false, "2");
+        this.InstallPowerup(PowerupVeteran(), 30, null, false, "1");
+        this.InstallPowerup(PowerupUnit(), 100, null, false, "0");
+        this.InstallPowerup(PowerupInvulnerability(), 2, null, false, "0");
+        this.InstallPowerup(PowerupICBM(), 2, null, false, "0");
+        this.InstallPowerup(PowerupExplosion(), 10, "CRATEEXPLODE", false,
+                            "500");
+        this.InstallPowerup(PowerupNapalm(), 10, "CRATENAPALM", false, "600");
+        this.InstallPowerup(PowerupTiberium(), 30, null, true, "0");
+    }
+
+    void InstallPowerup(int type, int shares, string anim, bool water,
+                        string data) {
+        this.powerupTypes.Add(type);
+        this.powerupShares.Add(shares);
+        this.powerupAnims.Add(anim);
+        this.powerupWater.Add(water);
+        this.powerupData.Add(data);
+    }
 
     /// <summary>The [OverlayTypes] name at an index -- "GEM01" for the first
     /// ore overlay -- or "" when the index is out of range. The render layer
@@ -1951,10 +2114,12 @@ class Rules {
         BuildingDef gacnst = BuildingDef.Create("GACNST", "建造厂",
             "GACNST.SHP", 4, 3, 1000, 3000, 0, 0,
             ArmorClass.Concrete(), 1);
+        gacnst.SetConYard(true);
         r.buildings.Add(gacnst);
         BuildingDef nacnst = BuildingDef.Create("NACNST", "建造厂",
             "NACNST.SHP", 4, 3, 1000, 3000, 0, 0,
             ArmorClass.Concrete(), 2);
+        nacnst.SetConYard(true);
         r.buildings.Add(nacnst);
         r.buildings.Add(BuildingDef.Create("GAPOWR", "电厂",
             "GAPOWR.SHP", 2, 2, 750, 800, 200, 0, ArmorClass.Wood(), 1));
@@ -2060,9 +2225,11 @@ class Rules {
         // Yuri building SHP (checked every mount), so each takes the ally/
         // soviet counterpart art its [rules] Image= comment names; the
         // player-colour remap and the purple placeholder still read Yuri.
-        r.buildings.Add(BuildingDef.Create("YACNST", "尤里建造厂",
+        BuildingDef yacnst = BuildingDef.Create("YACNST", "尤里建造厂",
             "NACNST.SHP", 4, 3, 1000, 3000, 0, 0,
-            ArmorClass.Concrete(), 4));
+            ArmorClass.Concrete(), 4);
+        yacnst.SetConYard(true);
+        r.buildings.Add(yacnst);
         BuildingDef yapowr = BuildingDef.Create("YAPOWR", "生化反应堆",
             "NAPOWR.SHP", 2, 2, 700, 600, 150, 0, ArmorClass.Wood(), 4);
         r.buildings.Add(yapowr);
@@ -2349,6 +2516,67 @@ class Rules {
                     : Rules.LeadingInt(pd) * 100;
                 if (pct > 0) { this.proneDamagePct = pct; }
             }
+            // The crate layer's [General] keys (the reference's CrateRules).
+            this.crateMaximum = gen.GetIntOr("CrateMaximum", this.crateMaximum);
+            this.crateMinimum = gen.GetIntOr("CrateMinimum", this.crateMinimum);
+            this.crateRadius = gen.GetIntOr("CrateRadius", this.crateRadius);
+            this.crateRegen = gen.GetIntOr("CrateRegen", this.crateRegen);
+            string uct = gen.Get("UnitCrateType");
+            if (uct.Length > 0 && uct.ToUpper() != "<NONE>") {
+                this.unitCrateType = uct.ToUpper();
+            }
+            string ci = gen.Get("CrateImg");
+            if (ci.Length > 0) { this.crateImg = ci.ToUpper(); }
+            string wci = gen.Get("WaterCrateImg");
+            if (wci.Length > 0) { this.waterCrateImg = wci.ToUpper(); }
+            string fmv = gen.Get("FreeMCV");
+            if (fmv.Length > 0) { this.freeMCV = Rules.YesNo(fmv); }
+        }
+        // The [Powerups] table: an install that ships one replaces the
+        // transcribed defaults wholesale, exactly the reference's
+        // PowerupsRules.readIni. Unsupported crate types are skipped.
+        IniSection pws = ini.Section("Powerups");
+        if (pws != null && pws.Count() > 0) {
+            this.powerupTypes = new List<int>();
+            this.powerupShares = new List<int>();
+            this.powerupAnims = new List<string>();
+            this.powerupWater = new List<bool>();
+            this.powerupData = new List<string>();
+            for (int i = 0; i < pws.Count(); i = i + 1) {
+                string key = pws.EntryAt(i).Key().ToUpper();
+                int pt = Rules.PowerupTypeOf(key);
+                if (pt < 0) { continue; }
+                if (pt == Rules.PowerupIonStorm() || pt == Rules.PowerupGas()
+                 || pt == Rules.PowerupPod() || pt == Rules.PowerupSquad()) {
+                    continue;
+                }
+                string val = pws.EntryAt(i).Value();
+                List<string> parts = new List<string>();
+                int at2 = 0;
+                while (at2 <= val.Length) {
+                    int comma = val.IndexOf(",", at2);
+                    string part;
+                    if (comma < 0) {
+                        part = val.Substring(at2, val.Length - at2);
+                        parts.Add(part.Trim());
+                        break;
+                    }
+                    part = val.Substring(at2, comma - at2);
+                    parts.Add(part.Trim());
+                    at2 = comma + 1;
+                }
+                if (parts.Count < 4) { continue; }
+                int shares = Rules.LeadingInt(parts[0]);
+                string anim = parts[1].ToLower() == "<none>" || parts[1] == ""
+                    ? null : parts[1].ToUpper();
+                bool water = parts[2].ToLower() == "yes";
+                string data = parts[3];
+                this.powerupTypes.Add(pt);
+                this.powerupShares.Add(shares);
+                this.powerupAnims.Add(anim);
+                this.powerupWater.Add(water);
+                this.powerupData.Add(data);
+            }
         }
         // The electro death anim is the [Animations] list's second entry
         // (the reference spreads the rules' animation table into a set and
@@ -2373,6 +2601,12 @@ class Rules {
             if (spl.Length > 0) {
                 this.splashList = Rules.Csv(spl.ToUpper());
             }
+            // The explosion crate's warheads: the reference's
+            // combatDamage.c4Warhead / .flameDamage, warhead names.
+            string c4n = cd.Get("C4Warhead");
+            if (c4n.Length > 0) { this.c4Warhead = c4n; }
+            string fln = cd.Get("FlameDamage");
+            if (fln.Length > 0) { this.flameDamage = fln; }
         }
         // Warheads first: weapons relink against them below.
         for (int i = 0; i < this.warheads.Count; i = i + 1) {
