@@ -2,6 +2,26 @@
 
 本规范用于避免仓库根目录再次被当成临时工作区。所有贡献者（包括 Devin/AI 会话）都必须遵守。
 
+## 0. 并发踩踏防护闸门（git hooks，强制生效）
+
+本仓库通过 `core.hooksPath` 启用 `scripts/hooks/` 下的闸门脚本，把 §9/§9.1/§10
+的纪律变成机器强制，任何会话（含 AI）绕不过：
+
+- **pre-commit**：拦截带 `<<<<<<<`/`=======`/`>>>>>>>` 冲突标记的暂存内容
+  （= 一次没做手工合并的单边解决），以及混进源码扩展名的 >8 MiB 大文件
+  （构建产物/日志假扮源码）。
+- **pre-merge-commit**：`git merge` / `git pull` 前，若索引里**非冲突文件**
+  带冲突标记（= 陈旧副本要覆盖已提交内容），拒绝合并。
+- **pre-push**：推送前扫描所有待推提交，重复上述两项检查。
+
+绕过方式只有 `git commit --no-verify` / `git push --no-verify`，且仅限
+**已证实为误报**的场景，并在提交说明里写明。hook 为纯 POSIX sh + git，
+Windows（Git Bash）与 Linux 行为一致；`cmake -B build` 配置阶段会自动设置
+`core.hooksPath`（见根 CMakeLists.txt），新 clone/新 worktree 首次配置即生效。
+
+hooks 管不住的部分（untracked 堆积、stash 纪律、路径限定 add）仍是
+AGENTS.md §2/§6/§9 与 §9.1/§10 的人工义务。
+
 ## 1. 根目录保持整洁
 仓库根目录只允许存放**长期、受版本控制**的内容：源码目录（`src/`、`stdlib/`、`examples/`、`tests/`、`docs/`、`cmake/`、`scripts/`、`toolchain/`、`assets/`）、`CMakeLists.txt`、`README.md`、`LICENSE`、`.gitignore` 等。
 

@@ -1,0 +1,38 @@
+#!/bin/sh
+# pre-push gate -- last line of defense before work leaves the machine
+# (AGENTS.md rules 7/11, docs/WORKSPACE_CONVENTIONS.md 9.1).
+# Scans every commit about to be pushed for conflict markers and oversized
+# blobs. Cheap: only the not-yet-on-remote commits are inspected.
+
+. "$(dirname "$0")/gate_common.sh" || exit 1
+
+if ! repo_guard; then
+    exit 0
+fi
+gate_tmp || exit 1
+trap gate_cleanup EXIT
+
+_rc=0
+# pre-push stdin lines: <local-ref> <local-sha> <remote-ref> <remote-sha>.
+while read -r _lref _local _rref _remote; do
+    # Deleted ref (local sha = zeros): nothing to scan.
+    case "$_local" in
+        0000000000000000000000000000000000000000) continue ;;
+    esac
+    case "$_remote" in
+        0000000000000000000000000000000000000000)
+            # New remote ref: scan the whole history being published. Never
+            # happens in this repo (no branches, rule 9) but stay correct.
+            git rev-list --reverse "$_local" > "$_ZAN_GATE_TMP/commits" 2>/dev/null || continue
+            ;;
+        *)
+            git rev-list --reverse "$_remote..$_local" > "$_ZAN_GATE_TMP/commits" 2>/dev/null || continue
+            ;;
+    esac
+    [ -s "$_ZAN_GATE_TMP/commits" ] || continue
+
+    gate_check_conflict_markers push || _rc=1
+    gate_check_blob_size push || _rc=1
+done
+
+exit $_rc

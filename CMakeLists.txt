@@ -3,6 +3,23 @@ cmake_minimum_required(VERSION 3.16)
 # driven by the C++ linker where needed (see the MinGW case below).
 project(zan-lang C CXX)
 
+# ---- Git gate hooks (docs/WORKSPACE_CONVENTIONS.md §0) ----
+# Point core.hooksPath at the in-repo hooks so every clone/worktree gets the
+# conflict-marker and blob-size gates without a manual setup step. Repo-local
+# config only (never --global); failures must not break configure. GIT_EXECUTABLE
+# is not guaranteed at project() time, so find it on the fly.
+find_package(Git QUIET)
+if(Git_FOUND)
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" config core.hooksPath scripts/hooks
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        RESULT_VARIABLE _zan_hooks_result
+        ERROR_QUIET OUTPUT_QUIET)
+    if(NOT _zan_hooks_result EQUAL 0)
+        message(STATUS "git gate hooks not enabled (git config failed; enable with: git config core.hooksPath scripts/hooks)")
+    endif()
+endif()
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 

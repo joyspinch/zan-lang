@@ -44,6 +44,17 @@ short, enforceable summary.
 > its analysis/debug backends live in `src/lsp/` and `src/dap/`.
 ## ZanIDE
 ZanIDE禁止任何自绘必须全部用标准库组件来完成
+
+## Git gate hooks — enforced rules (always on)
+
+The repo enables `scripts/hooks/` via `core.hooksPath` (set automatically by
+`cmake -B build`; see `docs/WORKSPACE_CONVENTIONS.md` §0). Every commit,
+merge/pull and push is machine-checked for **leftover conflict markers**
+(rules 11/12 — a blocked commit means the conflict was "resolved" without a
+hand merge) and **>8 MiB blobs on source extensions** (rules 1–3). Fix the
+underlying problem; bypass with `--no-verify` only for a proven false
+positive, stated in the commit message.
+
 ## Hard rules — DO NOT break these
 
 1. **Keep the repo root clean.** Only long-lived, version-controlled entries

@@ -1,0 +1,46 @@
+#!/bin/sh
+# pre-merge-commit gate -- runs before `git merge` (pulls included). Blocks
+# the merge when the index still holds conflict markers in files that are not
+# themselves conflicted, so stale content cannot silently ride into committed
+# work (AGENTS.md rules 11/12, docs/WORKSPACE_CONVENTIONS.md 9.1/10).
+
+. "$(dirname "$0")/gate_common.sh" || exit 1
+
+if ! repo_guard; then
+    exit 0
+fi
+gate_tmp || exit 1
+trap gate_cleanup EXIT
+
+# During a conflicted merge the index has stage entries; `git grep --cached`
+# would report the just-conflicted files themselves. Only refuse when files
+# that are NOT currently conflicted contain markers -- those are pre-existing
+# or stale, exactly the case this gate exists for.
+: > "$_ZAN_GATE_TMP/markers"
+git grep -IlnE --cached -e '^(<{7}( |$)|\|{7}( |$)|>{7}( |$))' \
+    > "$_ZAN_GATE_TMP/markers" 2>/dev/null || true
+
+if [ -s "$_ZAN_GATE_TMP/markers" ]; then
+    # Allow files that are in conflict right now (they carry markers by
+    # definition and are handled by the manual-merge procedure).
+    : > "$_ZAN_GATE_TMP/uus"
+    git diff --name-only --diff-filter=U > "$_ZAN_GATE_TMP/uus" 2>/dev/null || true
+    _blocked=0
+    while IFS= read -r _p; do
+        [ -n "$_p" ] || continue
+        if ! grep -qxF "$_p" "$_ZAN_GATE_TMP/uus"; then
+            echo "zan-gate: conflict markers in non-conflicted file: $_p" >&2
+            _blocked=1
+        fi
+    done < "$_ZAN_GATE_TMP/markers"
+    if [ "$_blocked" -ne 0 ]; then
+        echo "  (AGENTS.md rules 11/12, WORKSPACE_CONVENTIONS.md 9.1/10)" >&2
+        echo "  Files with markers but no UU state are stale copies trying to" >&2
+        echo "  overwrite committed work. Fix forward: compare both sides" >&2
+        echo "  (git show :2:<file> / :3:<file>, git log -- <file>), merge by hand." >&2
+        echo "  A revert needs evidence of staleness (blob compare) or user approval." >&2
+        exit 1
+    fi
+fi
+
+exit 0
