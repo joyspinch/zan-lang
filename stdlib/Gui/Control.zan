@@ -715,6 +715,27 @@ class Control {
         return computedStyle.aspect;
     }
 
+    /// 此节点的 CSS `position`：0 static，1 relative，2 absolute/fixed。
+    /// absolute 子项脱离常规流（测量与排布两端都跳过），由
+    /// ArrangePositioned 按偏移边定位。
+    int StylePosition() {
+        if (computedStyle == null) { return 0; }
+        return computedStyle.position;
+    }
+
+    /// CSS `z-index`（0 = 文档序；有非零值时兄弟绘制与命中
+    /// 都按值稳定排序）。
+    int StyleZIndex() {
+        if (computedStyle == null) { return 0; }
+        return computedStyle.zIndex;
+    }
+
+    /// CSS `order`（flex 排布顺序；0 保持文档序，同值稳定）。
+    int StyleOrder() {
+        if (computedStyle == null) { return 0; }
+        return computedStyle.order;
+    }
+
     /// 样式表声明的外边距（px；未解析样式时为 0）。
     int StyleMarL() { if (computedStyle == null) { return 0; } return computedStyle.marL; }
     /// 样式表声明的外边距（px；未解析样式时为 0）。
@@ -1008,14 +1029,36 @@ class Control {
 
     /// 其已解析边界包含该点的最深层可见后代，
     /// 优先选择更靠后（最上层）的子节点。用于设计器命中选择。
+    /// 子项带非零 z-index 时按绘制序的逆序试命中（值大的先试，
+    /// 同值保持文档序靠后者优先），与 RenderTree 的绘制顺序一致。
     Control HitTest(int x, int y) {
         if (!this.StyleVisible()) { return null; }
         if (x < bx || y < by || x >= bx + bw || y >= by + bh) { return null; }
-        int i = children.Count - 1;
-        while (i >= 0) {
-            Control hit = children[i].HitTest(x, y);
+        bool anyZ = false;
+        for (int i = 0; i < children.Count; i = i + 1) {
+            if (children[i].StyleZIndex() != 0) { anyZ = true; break; }
+        }
+        if (!anyZ) {
+            int i = children.Count - 1;
+            while (i >= 0) {
+                Control hit = children[i].HitTest(x, y);
+                if (hit != null) { return hit; }
+                i = i - 1;
+            }
+            return this;
+        }
+        List<Control> tried = new List<Control>();
+        while (tried.Count < children.Count) {
+            int best = 0 - 1;
+            int bestZ = -2000000000;
+            for (int i = 0; i < children.Count; i = i + 1) {
+                if (tried.Contains(children[i])) { continue; }
+                int z = children[i].StyleZIndex();
+                if (z >= bestZ) { bestZ = z; best = i; }
+            }
+            tried.Add(children[best]);
+            Control hit = children[best].HitTest(x, y);
             if (hit != null) { return hit; }
-            i = i - 1;
         }
         return this;
     }
@@ -1169,7 +1212,7 @@ class Control {
         int cols = 0;
         for (int i = 0; i < children.Count; i = i + 1) {
             Control c = children[i];
-            if (!c.StyleVisible()) { continue; }
+            if (!c.StyleVisible() || c.StylePosition() == 2) { continue; }
             if (c.dock == 1 || c.dock == 2) {
                 sumH = sumH + c.prefH;
                 rows = rows + 1;
@@ -1239,9 +1282,9 @@ class Control {
         int mainMax = 0;
         int crossSum = 0;
         int lines = 0;
-        for (int i = 0; i < children.Count; i = i + 1) {
-            Control c = children[i];
-            if (!c.StyleVisible()) { continue; }
+        List<Control> flexKids = this.FlexKids();
+        for (int i = 0; i < flexKids.Count; i = i + 1) {
+            Control c = flexKids[i];
             // 主轴尺寸和排布时用同一个来源：flex-basis 优先，其次
             // 才是测量偏好，否则断行数会和实际排布不一致。这里的
             // 包含块尚未确定，因此百分比 basis 只能落到 0。
@@ -1340,14 +1383,22 @@ class Control {
         int ch = ph - innerPadT - innerPadB;
         if (cw < 0) { cw = 0; }
         if (ch < 0) { ch = 0; }
+        // positioned 子项的包含块是 padding box（border 内侧，
+        // 覆盖 padding 区）——停靠/flex 流只消耗内容框，这里先把
+        // padding box 存下来。
+        int pbx = px;
+        int pby = py;
+        int pbw = pw;
+        int pbh = ph;
         if (this.StyleDisplay() == 1) {
             this.ArrangeFlex(cx, cy, cw, ch, innerGap);
+            this.ArrangePositioned(pbx, pby, pbw, pbh);
             this.CheckKidsLayout();
             return;
         }
         for (int i = 0; i < children.Count; i = i + 1) {
             Control c = children[i];
-            if (c.StyleVisible()) {
+            if (c.StyleVisible() && c.StylePosition() != 2) {
                 if (c.dock == 1) {
                     int hh = Control.FitSize(c.DockSize(ch, false), ch);
                     c.Arrange(cx, cy, cw, hh);
@@ -1395,11 +1446,56 @@ class Control {
         }
         for (int i = 0; i < children.Count; i = i + 1) {
             Control c = children[i];
-            if (c.StyleVisible() && c.dock == 5) {
+            if (c.StyleVisible() && c.dock == 5
+                && c.StylePosition() != 2) {
                 c.Arrange(cx, cy, cw, ch);
             }
         }
+        this.ArrangePositioned(pbx, pby, pbw, pbh);
         this.CheckKidsLayout();
+    }
+
+    /// 排布 `position` 子项。absolute/fixed 脱离常规流（停靠/flex
+    /// 的测量与排布两端都跳过它），包含块是父内容框：top/right/
+    /// bottom/left（inset 展开成这四条）里声明的边起作用，宽度
+    /// 优先取声明值，左右两边都声明时用差值，否则取测量偏好；
+    /// relative 不脱流，在流位置上平移（left/right 同设按 CSS 用
+    /// left，top/bottom 同设用 top，未声明当 0）。
+    void ArrangePositioned(int cx, int cy, int cw, int ch) {
+        for (int i = 0; i < children.Count; i = i + 1) {
+            Control c = children[i];
+            if (!c.StyleVisible()) { continue; }
+            StyleBox sb = c.computedStyle;
+            int pos = sb == null ? 0 : sb.position;
+            if (pos != 1 && pos != 2) { continue; }
+            int posT = sb == null ? 0 - 1 : sb.posT;
+            int posR = sb == null ? 0 - 1 : sb.posR;
+            int posB = sb == null ? 0 - 1 : sb.posB;
+            int posL = sb == null ? 0 - 1 : sb.posL;
+            if (pos == 1) {
+                int dx = posL != 0 - 1 ? posL
+                    : (posR != 0 - 1 ? 0 - posR : 0);
+                int dy = posT != 0 - 1 ? posT
+                    : (posB != 0 - 1 ? 0 - posB : 0);
+                if (dx != 0 || dy != 0) {
+                    c.Arrange(c.bx + dx, c.by + dy, c.bw, c.bh);
+                }
+                continue;
+            }
+            int w = c.StyleWidthIn(cw);
+            int h = c.StyleHeightIn(ch);
+            if (posL != 0 - 1 && posR != 0 - 1) { w = cw - posL - posR; }
+            if (posT != 0 - 1 && posB != 0 - 1) { h = ch - posT - posB; }
+            if (w < 0) { w = 0; }
+            if (h < 0) { h = 0; }
+            int x = cx;
+            int y = cy;
+            if (posL != 0 - 1) { x = cx + posL; }
+            else if (posR != 0 - 1) { x = cx + cw - posR - w; }
+            if (posT != 0 - 1) { y = cy + posT; }
+            else if (posB != 0 - 1) { y = cy + ch - posB - h; }
+            c.Arrange(x, y, w, h);
+        }
     }
 
     // --- 排版重叠自检（默认关）----------------------------------
@@ -1618,6 +1714,29 @@ class Control {
     /// 之间用交叉轴间距（row 容器取 `row-gap`，column 容器取
     /// `column-gap`，都回退到 `gap`）分隔，多余的交叉轴空间按
     /// `align-content` 分配。每一行内部的规则见 ArrangeFlexLine。
+    /// flex 容器参与排布的子项：可见、非 absolute（absolute 脱离
+    /// 常规流）、按 CSS `order` 稳定排序（同 order 保持文档序）。
+    /// 测量（MeasureFlexContent）与排布（ArrangeFlex）共用同一份
+    /// 顺序，断行行数才一致。
+    List<Control> FlexKids() {
+        List<Control> items = new List<Control>();
+        for (int k = 0; k < children.Count; k = k + 1) {
+            Control c = children[k];
+            if (!c.StyleVisible() || c.StylePosition() == 2) { continue; }
+            int ord = c.StyleOrder();
+            if (ord == 0) {
+                items.Add(c);
+                continue;
+            }
+            int ins = items.Count;
+            while (ins > 0 && items[ins - 1].StyleOrder() > ord) {
+                ins = ins - 1;
+            }
+            items.Insert(ins, c);
+        }
+        return items;
+    }
+
     void ArrangeFlex(int cx, int cy, int cw, int ch, int gapPx) {
         bool row = true;
         if (computedStyle != null && computedStyle.flexDir == 1) { row = false; }
@@ -1632,10 +1751,7 @@ class Control {
             crossGap = this.StyleColGap(gapPx);
         }
 
-        List<Control> items = new List<Control>();
-        for (int k = 0; k < children.Count; k = k + 1) {
-            if (children[k].StyleVisible()) { items.Add(children[k]); }
-        }
+        List<Control> items = this.FlexKids();
         int n = items.Count;
         if (n == 0) { return; }
 
@@ -2242,11 +2358,38 @@ class Control {
         lastBh = bh;
         everLaidOut = true;
         if (children.Count > 0) {
-            app.canvas.PushClip(bx, by, bw, bh);
+            // overflow：引擎缺省裁剪（子节点不画出界）；显式
+            // `overflow: visible` 放行溢出内容。hidden/scroll 与
+            // 缺省同义（scroll 不画滚动条）。
+            bool clipKids = computedStyle == null
+                || computedStyle.overflow != 0;
+            if (clipKids) { app.canvas.PushClip(bx, by, bw, bh); }
+            // z-index：有非零值时兄弟按值稳定排序绘制（0 保持
+            // 文档序）；HitTest 用同一份顺序的逆序。
+            bool anyZ = false;
             for (int i = 0; i < children.Count; i = i + 1) {
-                children[i].RenderTree(app);
+                if (children[i].StyleZIndex() != 0) { anyZ = true; break; }
             }
-            app.canvas.PopClip();
+            if (anyZ) {
+                List<Control> ordered = new List<Control>();
+                for (int i = 0; i < children.Count; i = i + 1) {
+                    Control c = children[i];
+                    int z = c.StyleZIndex();
+                    int ins = ordered.Count;
+                    while (ins > 0 && ordered[ins - 1].StyleZIndex() > z) {
+                        ins = ins - 1;
+                    }
+                    ordered.Insert(ins, c);
+                }
+                for (int i = 0; i < ordered.Count; i = i + 1) {
+                    ordered[i].RenderTree(app);
+                }
+            } else {
+                for (int i = 0; i < children.Count; i = i + 1) {
+                    children[i].RenderTree(app);
+                }
+            }
+            if (clipKids) { app.canvas.PopClip(); }
         }
     }
 }

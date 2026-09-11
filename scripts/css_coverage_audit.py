@@ -29,8 +29,9 @@ at-rule：`@supports`/`@layer`/`@media` 的内容引擎会解析（守卫/媒体
     python scripts/css_coverage_audit.py --corpus-a --json out.json
 
 一个已知的保守处：这里把"引擎认得"当作"生效"。更严的口径还要扣掉"值确实进了
-样式盒、但绘制路径从不读那个字段"的键（position/top/left/z-index/order/
-white-space 等）。要报那一档，得先有 key -> 字段 -> 渲染处 的映射。
+样式盒、但绘制路径从不读那个字段"的键（white-space 仍在这一档；
+position/top/left/right/bottom/inset/z-index/order 已由布局/渲染端消费并
+移出名单）。要报那一档，得先有 key -> 字段 -> 渲染处 的映射。
 """
 import argparse
 import glob
@@ -56,8 +57,8 @@ CORPUS_A = [
 # 算进"支持度"分母只会让数字难看而没有行动价值。默认单独归一类，`--all` 时并入。
 FLOW_ONLY = re.compile(
     r'^(-webkit-|-moz-|-ms-|-o-|page-break|break-|content$|quotes$|counter-'
-    r'|list-style|outline|orphans$|widows$|z-index$|position$|top$|left$|right$'
-    r'|bottom$|inset|float$|clear$|white-space$|display$|vertical-align$)'
+    r'|list-style|outline|orphans$|widows$|float$|clear$|white-space$'
+    r'|display$|vertical-align$)'
 )
 
 # 有求值器的单位（StyleSheet.HasUnresolvedUnit 的白名单 + 角度补充）。
@@ -90,11 +91,13 @@ STATE_NAMES = {'hover', 'active', 'focus', 'focus-visible', 'disabled',
 
 # "解析进样式盒、但绘制路径从不读那个字段"的候选键。这是**输入**不是本脚本
 # 推导出来的事实：名单来自上一轮报告（那轮把 bootstrap 的 12% 声明、14.5% 规则
-# 归到这一类，是"静默失败比不支持更糟"的依据）。要独立复核，得先建
+# 归到这一类，是"静默失败比不支持更糟"的依据）。position/top/right/bottom/
+# left/inset/z-index/order 曾在此名单——现在布局引擎（Arrange/ArrangePositioned、
+# FlexKids 的 order 排序）与渲染/命中路径真实消费它们，css_test 的
+# Positioned/Cascade 段是行为证据，已移出。要独立复核，得先建
 # key -> StyleBox 字段 -> 渲染处 的映射，本脚本没做。`--no-consumer list`
 # 可以换成你自己的名单。
-DEFAULT_NO_CONSUMER = {'position', 'top', 'left', 'right', 'bottom', 'inset',
-                       'z-index', 'order', 'white-space'}
+DEFAULT_NO_CONSUMER = {'white-space'}
 
 
 def engine_surface():

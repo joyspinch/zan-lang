@@ -626,6 +626,21 @@ HTTP 解析、编码转换、路径处理这类纯逻辑，上移到 Zan。
 
 # A16 CSS 支持面（现状实测，参考）
 
+> 2026-09-11 第三次更新（第四轮：定位/层叠语义接入渲染路径）：此前
+> position/top/right/bottom/left/inset、z-index、order、overflow 只是"解析进
+> 样式盒"，布局与绘制路径根本不读——写而不读=语义失败。本轮真实消费：
+> absolute/fixed 脱流（测量与排布两端跳过）、包含块按 CSS 取父 **padding box**
+> （top/right/bottom/left/inset 定位、对立边同设用差值、未声明尺寸回退测量
+> 偏好）、relative 在流位置上平移（left/right 同设按 left）；z-index 驱动兄弟
+> 绘制序（RenderTree 稳定排序）与 HitTest 命中序（同一份顺序的逆序）；flex
+> `order` 参与主轴排序；`overflow: visible` 放行溢出（缺省仍裁剪=引擎既有
+> 约定，显式声明才改行为，零回归）。顺带修 Selector 解析：type 选择器折小写
+> （对齐 `StyleType()`=Kind() 小写；class/id 仍区分大小写）。行为断言：
+> tests/gui/css_test.zan 新增 Positioned（坐标+canvas 像素：叠放序、命中序、
+> 溢出可见/裁剪）与 Cascade（文档序 tie-break、class>type、type+class>class、
+> id 最高、!important 越权重且按文档序、@media 内规则按文档位置参与级联）。
+> css_coverage_audit 的 no-consumer 名单相应缩到 white-space 一项。
+
 > 2026-09-11 第二次更新（第三轮 CSS 全面支持）：选择器引擎从"扁平表"升级为
 > 复合块链——后代/子/相邻/通用兄弟组合器与结构性伪类（:first/:last/:only-child、
 > :nth-child(-of-type) 含 odd/even/an±b、:empty）在 retained 控件树内真实匹配
@@ -662,9 +677,10 @@ focus/focus-visible/disabled/selected/checked）、结构性伪类、`[class*="f
 
 **属性**（211 个键，Inert 白名单 100 条收下无效果）：盒模型、背景（linear/
 radial/conic 渐变）、文本（text-shadow/letter-spacing/word-spacing）、flex 子集、
-定位（top/right/bottom/left/inset 有字段）、效果（box-shadow/opacity/filter/
+定位（position:absolute/relative + top/right/bottom/left/inset 布局端真实消费）、效果（box-shadow/opacity/filter/
 transform/transition）、cursor 关键词近似映射（grabbing→手型、e/w-resize→横调、
-n/s-resize→纵调）。`box-sizing`/`float` 等网页布局属性 Inert。
+n/s-resize→纵调）。`box-sizing`/`float` 等网页布局属性 Inert。`z-index`/`order`/`overflow`
+同样生效（绘制序与命中序一致；overflow 显式 visible 才放行）。
 
 **取值**：颜色 `#RGB/#RGBA/#RRGGBB/#AARRGGBB`（alpha 在前）、命名色、
 `rgb()/hsl()` 逗号与空格两语法 + `/ alpha`、`hwb()/oklab()/oklch()/lab()/lch()/

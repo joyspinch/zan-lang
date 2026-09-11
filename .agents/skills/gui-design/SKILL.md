@@ -140,6 +140,15 @@ token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
   shorthand 里也认;写 `color: currentColor` 等于保持主题前景)。
 - **`var(--x, fallback)` 支持回退值**,未定义或空值时用回退;定义了就永远
   赢不了回退(CSS 语义)。所以"少给一个 token 整条声明消失"已经不是问题。
+- **`position`/`z-index`/`order`/`overflow` 现在真的生效**(此前解析进样式盒
+  但布局/绘制不读=写而不读):`position: absolute` 脱流(不占停靠/flex 的流
+  空间),包含块是父 **padding box**,`top`/`right`/`bottom`/`left`/`inset`
+  定位(对立边同设取差值,未声明宽高回退测量偏好);`relative` 在流位置上
+  平移(同设 left/right 按 left)。`z-index` 决定兄弟绘制序,**命中测试用同一
+  顺序的逆序**——画在上面的控件也先被点中。flex 容器里 `order` 改主轴
+  顺序。`overflow: visible` 放行子节点溢出(缺省引擎裁剪,显式声明才变
+  行为)。type 选择器大小写不敏感(`Button` 与 `button` 都命中,引擎按
+  `Kind()` 的小写匹配);class/id 仍区分大小写。
 - **`!important` 真的压得住 inline**:带标记的声明单独存、在普通级联
   (含宿主 inline)之后统一再套一遍,不是"剥掉标记按顺序碰运气"。
 - **渐变只认两端+中间一档**(`linear-gradient([dir,] a, b[, c])`);停靠点上的
