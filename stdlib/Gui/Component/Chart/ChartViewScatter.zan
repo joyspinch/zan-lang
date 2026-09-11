@@ -304,6 +304,19 @@ partial class ChartView {
 
         int rad = app.Scale(4);
         ChartView.PushPlotClip(app, plotX, plotY, plotW, plotH);
+        // labelLayout 系列（scatter-label-align-top 形）的标签收集：
+        // 官方 y:20 把标签钉到容器顶行 + align center + shiftX 解叠 +
+        // hideOverlap，被移位的标签画细引线回数据点。顶行在绘图区
+        // 上方，PopClip 后补画。
+        List<int> llBX = new List<int>();
+        List<int> llBY = new List<int>();
+        List<int> llBW = new List<int>();
+        List<string> llBT = new List<string>();
+        List<int> llPX = new List<int>();
+        List<int> llPY = new List<int>();
+        List<int> llPR = new List<int>();
+        List<int> llLN = new List<int>();
+        bool llShiftX = false;
         for (int r = 0; r < o.series.Count; r = r + 1) {
             ChartSeries s = o.series[r];
             if (!s.hidden) {
@@ -374,7 +387,37 @@ partial class ChartView {
                         Chart.DrawSymbol(c, px, py, jr, shape, col, bCol, bW);
                         // 系列 labelShow（ECharts itemStyle.normal.label.
                         // show + formatter {b}）：逐点名字标在符号右侧。
-                        if (s.labelShow && s.points[j].name.Length > 0) {
+                        if (s.labelShow && s.llDeclared) {
+                            // 文本缺省 = y 数值（ECharts scatter 标签
+                            // 缺省 formatter；官方顶行标的是 57.7/68
+                            // 这类值，不是点名）；声明模板走 LabelText。
+                            // SeriesNumText 走 data 表的 frac 判定，
+                            // 散点 y 存 points 定点（×pointG）会印成
+                            // "57,700"——按 pointG 直接缩放（57.7/68）。
+                            string lbt = s.labelFmt.Length > 0
+                                ? ChartView.LabelText(s, j, s.points[j].name,
+                                    s.points[j].y)
+                                : (s.pointG > 1
+                                    ? Chart.FracText(s.points[j].y)
+                                    : Chart.Commas(s.points[j].y));
+                            int lbx = px + app.Scale(s.llDx);
+                            if (s.llX != ChartSeries.LL_UNSET) {
+                                lbx = x + s.llX + app.Scale(s.llDx);
+                            }
+                            int lby = py + app.Scale(s.llDy);
+                            if (s.llY != ChartSeries.LL_UNSET) {
+                                lby = y + s.llY + app.Scale(s.llDy);
+                            }
+                            int lbw = Canvas.MeasureText(lbt, axisFs);
+                            // align 是块跑位：center/right 按块宽左移。
+                            if (s.llAlign == "center") { lbx = lbx - lbw / 2; }
+                            else if (s.llAlign == "right") { lbx = lbx - lbw; }
+                            llBX.Add(lbx); llBY.Add(lby); llBW.Add(lbw);
+                            llBT.Add(lbt);
+                            llPX.Add(px); llPY.Add(py); llPR.Add(jr);
+                            llLN.Add(s.llY != ChartSeries.LL_UNSET ? 1 : 0);
+                            if (s.llMove == "shiftX") { llShiftX = true; }
+                        } else if (s.labelShow && s.points[j].name.Length > 0) {
                             c.DrawText(px + jr + app.Scale(3),
                                 Canvas.CenterTextYAt(py, axisFs),
                                 s.points[j].name, sAxis.FgOr(0), axisFs);
@@ -431,6 +474,51 @@ partial class ChartView {
             }
         }
         c.PopClip();
+        // labelLayout 标签补画（绘图区 clip 外）：同行 shiftX 解叠
+        // （官方 shiftLayout：按盒 x 升序顶开再回贴），hideOverlap
+        // 对已保留盒判交（注册序，后到者隐藏），最后引线 + 文本。
+        if (llBT.Count > 0) {
+            int llfh = Canvas.FontHeight(axisFs);
+            if (llShiftX) {
+                List<int> llPos = new List<int>();
+                List<int> llSz = new List<int>();
+                List<int> llOrd = new List<int>();
+                for (int li = 0; li < llBT.Count; li = li + 1) {
+                    llPos.Add(llBX[li]); llSz.Add(llBW[li]); llOrd.Add(li);
+                }
+                for (int li = 1; li < llOrd.Count; li = li + 1) {
+                    int lj = li;
+                    while (lj > 0 && llPos[lj] < llPos[lj - 1]) {
+                        int tp = llPos[lj]; llPos[lj] = llPos[lj - 1]; llPos[lj - 1] = tp;
+                        int tz = llSz[lj]; llSz[lj] = llSz[lj - 1]; llSz[lj - 1] = tz;
+                        int ti = llOrd[lj]; llOrd[lj] = llOrd[lj - 1]; llOrd[lj - 1] = ti;
+                        lj = lj - 1;
+                    }
+                }
+                List<int> llMoved = Chart.LlShift1D(llPos, llSz, app.Scale(4));
+                for (int li = 0; li < llOrd.Count; li = li + 1) {
+                    llBX[llOrd[li]] = llMoved[li];
+                }
+            }
+            for (int li = 0; li < llBT.Count; li = li + 1) {
+                bool overlaid = false;
+                for (int lk = 0; lk < li; lk = lk + 1) {
+                    if (llBX[lk] < llBX[li] + llBW[li]
+                        && llBX[li] < llBX[lk] + llBW[lk]
+                        && llBY[lk] < llBY[li] + llfh
+                        && llBY[li] < llBY[lk] + llfh) {
+                        overlaid = true; break;
+                    }
+                }
+                if (overlaid) { continue; }
+                if (llLN[li] != 0) {
+                    c.DrawLine(llBX[li] + llBW[li] / 2, llBY[li] + llfh,
+                        llPX[li], llPY[li] - llPR[li] - app.Scale(2),
+                        Chart.Rgb(204, 204, 204), 1);
+                }
+                c.DrawText(llBX[li], llBY[li], llBT[li], sAxis.FgOr(0), axisFs);
+            }
+        }
 
         // 系列 markPoint/markLine（scatter1 的 Max/Min 标注 +
         // Average 标线）：复用值对折线的 marks 通道，把散点映射

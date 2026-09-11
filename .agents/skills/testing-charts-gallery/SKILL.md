@@ -519,11 +519,13 @@ ECharts line 的平滑算法不是「单调 Hermite / Cardinal / Catmull-Rom」�
     （水平+垂直都居中），换成富文本块时 plain 分支也要逐像素同位
     （vertical center 差 2px 会扰动全部 bar/line demo 的 x 标签）。
 14. **回归归属判定：HEAD 对照构建**。怀疑"我的改动把某 demo 搞空白"
-    时：`_scratch/stdlib_snap_head/`（整树复制 stdlib_snap，再 `git
-    show HEAD:<file >` 覆盖改动文件）+ 探针脚本 sed 出 `-o
-    charts_head.exe` 变体 → 同法截图。HEAD 同样错 = 先前已存在，
-    记账不修；HEAD 对而我错 = 真回归。（注意 sed 匹配 Windows 路径
-    的反斜杠要用 python replace，sed 转义会静默不命中——踩过。）
+    时：`for f in <改动文件>; do git show HEAD:"$f" >
+    _scratch/chart_head/$(basename $f); done` → cp 进 stdlib_snap →
+    探针脚本用 python replace 产出 `-o charts_pc_head.exe` 变体重编 →
+    同 demo 对拍。HEAD 同样错 = 先前已存在，记账不修；HEAD 对而我错
+    = 真回归。拍完**把工作区文件 cp 回 stdlib_snap**（快照恒留当前
+    工作态）。B14/B16 两次用此法归因（bar-race-country 空白、
+    scatter-linear-regression 挤压、line-race 崩溃）。
 15. **对照两侧都要新鲜重拍**：第一张截图出现"本次改动不可能造成的
     差异"时，先重拍一次再排查代码——重拍即消失 = 截图竞态（旧 exe/
     旧进程画面）。HEAD 对照的两侧必须在同一会话、用各自验证过的
@@ -536,3 +538,38 @@ ECharts line 的平滑算法不是「单调 Hermite / Cardinal / Catmull-Rom」�
     未声明色哨兵是 0，debug 打印色值 **-1 = #FFF 白**，不是未解析；
     recheck2 `-Ids` 从 bash 一次只传一个 id（PowerShell string[]
     绑定把 `a,b,c` 并成一个 id，产出 "a,b,c.png"）。
+
+## labelLayout / triggerOn 与截图基建（T4-2f 会话教训，全部实机踩出）
+
+1. **窗口截图一律 PrintWindow(hWnd, hdc, PW_RENDERFULLCONTENT=3)，别
+   CopyFromScreen**：屏幕区域抓取抓的是"那块屏幕"，有置顶/覆盖窗就
+   拍到覆盖物——本会话"整板深蓝空白、进程活着、无 stderr"排查半天
+   （HEAD A/B、重编 zanc 全试遍），其实是覆盖物；PrintWindow 一发即
+   真身。EnumWindows 按标题找到窗口后直接 PrintWindow，不必
+   BringToTop/SetForegroundWindow（非前台进程调用会静默失败）。
+   recheck2.ps1 已改。
+2. **PrintWindow 位图尺寸 ≠ 内容尺寸**：DPI 虚拟化下 PrintWindow 把
+   app 自渲染尺寸的内容放进 DPI-aware 请求的大位图，右/下多出黑边
+   ——内容完整即有效，裁剪按内容实际边界来。
+3. **构建前先 grep 标记确认自己的编辑还在**：并发会话的 git 操作曾把
+   本会话 ChartModel.zan 的补丁整段抹平（git diff 干净 = 被回签）。
+   python 补丁锚点先查行尾：并发 checkout 后工作区是 CRLF，读入
+   `.replace('\r\n','\n')` 归一、按 
+ 锚 patch、写回原风格。
+4. **新增 conformance 文件必须 `cmake -B build`（只配置，安全）重新
+   注册**：tests 的 `file(GLOB tests/conformance/*.zan)` 在 configure
+   时求值，配完 chart 档 38→39。`test.ps1 -Match` 是**名字正则**
+   （ctest -R），不是 label；档位用 -L。
+5. **大块补丁别用 heredoc**：160 行 `python - << 'EOF'` 会被截断/吃
+   分隔符；Write 到 `_scratch/xxx.py` 再执行，脚本内 `assert
+   src.count(anchor)==1` 自校验。
+6. **labelLayout 语义速记**（对抄 labelLayoutHelper.ts:324
+   shiftLayoutOnXY）：按 rect 位排序后**只推不拉**（delta = pos −
+   前项 end，负→推到前项 end）；hideOverlap 先到先得；x/y 容器系
+   绝对像素、dx/dy 相对偏移、align 按块宽平移；moveOverlap 与
+   hideOverlap 共用同一引擎只是维度不同。**散点 y 存 ×pointG 定点，
+   标签文本别走 SeriesNumText**（data 表 frac 判定会把 57.7 印成
+   "57,700"）——按 pointG 走 FracText/Commas。
+7. **triggerOn:"none" 解析期门控 `showTooltip=false` 即忠实**：引擎无
+   dispatchAction 通道，官方"只由 action 触发"在本引擎等价于不出
+   提示框，渲染层零改动（--nomouse 截图模式本来也压掉 tooltip）。

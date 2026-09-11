@@ -1,0 +1,103 @@
+using System;
+using Gui;
+using Gui.Component.Chart;
+
+namespace Conf;
+
+/// ECharts series.labelLayout（dx/dy/x/y/align/hideOverlap/moveOverlap）
+/// 与 tooltip.triggerOn 的解析与一维解叠算法。
+///
+/// 官方出处（labelLayoutHelper.ts shiftLayoutOnXY:324 + examples）：
+///   - moveOverlap shiftX/shiftY = 同组标签按盒位升序顶开
+///     （delta = pos - 前盒末缘，负则推到前盒末缘）。
+///   - x/y 是容器系绝对像素；dx/dy 相对偏移；align 是块跑位。
+///   - 语料形：dx:-20（scatter-*-regression 的 line 系列）、
+///     y:20+align:center+hideOverlap+moveOverlap:shiftX
+///     （scatter-label-align-top）、moveOverlap:shiftY（line-race
+///     逐系列）、hideOverlap（graph-label-overlap）。
+///   - tooltip.triggerOn:"none" = 不随鼠标触发（引擎无 action
+///     通道，等价 showTooltip=false）。
+class Program {
+    static void Main() {
+        // ---- 解析：全键（scatter-label-align-top 形）----
+        ChartOption o = ChartOption.FromJson(
+            "{\"series\":[{\"type\":\"scatter\",\"name\":\"1990\","
+            + "\"data\":[[28604,77]],"
+            + "\"label\":{\"show\":true,\"position\":\"top\"},"
+            + "\"labelLayout\":{\"y\":20,\"align\":\"center\","
+            + "\"hideOverlap\":true,\"moveOverlap\":\"shiftX\"}}]}");
+        ChartSeries s = o.series[0];
+        Console.WriteLine("ll/all:" + (s.llDeclared ? "1" : "0")
+            + ":" + Convert.ToString(s.llY) + ":" + s.llAlign
+            + ":" + (s.llHideOverlap ? "1" : "0") + ":" + s.llMove);
+        // dx（scatter-linear-regression 的 line 系列形）
+        ChartOption o2 = ChartOption.FromJson(
+            "{\"series\":[{\"type\":\"line\",\"data\":[1,2],"
+            + "\"label\":{\"show\":true,\"fontSize\":16},"
+            + "\"labelLayout\":{\"dx\":-20}}]}");
+        ChartSeries s2 = o2.series[0];
+        Console.WriteLine("ll/dx:" + Convert.ToString(s2.llDx)
+            + ":" + Convert.ToString(s2.llDy)
+            + ":" + Convert.ToString(s2.llX == ChartSeries.LL_UNSET ? 1 : 0));
+        // 未声明：llDeclared=false、x/y 哨兵 LL_UNSET、dx/dy 0
+        ChartOption o3 = ChartOption.FromJson(
+            "{\"series\":[{\"type\":\"bar\",\"data\":[1]}]}");
+        ChartSeries s3 = o3.series[0];
+        Console.WriteLine("ll/def:" + (s3.llDeclared ? "1" : "0")
+            + ":" + Convert.ToString(s3.llX == ChartSeries.LL_UNSET ? 1 : 0)
+            + ":" + Convert.ToString(s3.llDy));
+        // Clone 双分支携带
+        ChartSeries s1sh = ChartSeries.Clone(s, true);
+        ChartSeries s1dp = ChartSeries.Clone(s, false);
+        if (s1sh == null || s1dp == null) {
+            Console.WriteLine("ll/clone:null");
+            return;
+        }
+        Console.WriteLine("ll/clone:" + (s1sh.llDeclared ? "1" : "0")
+            + ":" + Convert.ToString(s1sh.llY)
+            + ":" + (s1dp.llDeclared ? "1" : "0")
+            + ":" + s1dp.llMove);
+
+        // ---- tooltip.triggerOn ----
+        ChartOption o4 = ChartOption.FromJson(
+            "{\"tooltip\":{\"triggerOn\":\"none\"},"
+            + "\"series\":[{\"type\":\"line\",\"data\":[1]}]}");
+        Console.WriteLine("ton/none:" + (o4.showTooltip ? "1" : "0")
+            + ":" + o4.tooltipTriggerOn);
+        ChartOption o5 = ChartOption.FromJson(
+            "{\"tooltip\":{\"triggerOn\":\"mousemove\"},"
+            + "\"series\":[{\"type\":\"line\",\"data\":[1]}]}");
+        Console.WriteLine("ton/mm:" + (o5.showTooltip ? "1" : "0")
+            + ":" + o5.tooltipTriggerOn);
+        ChartOption o6 = ChartOption.FromJson(
+            "{\"series\":[{\"type\":\"line\",\"data\":[1]}]}");
+        Console.WriteLine("ton/absent:" + (o6.showTooltip ? "1" : "0")
+            + ":" + o6.tooltipTriggerOn);
+
+        // ---- LlShift1D（shiftLayoutOnXY 化简的数值 oracle）----
+        // 无重叠：原样通过
+        List<int> ap = new List<int>();
+        ap.Add(10); ap.Add(30); ap.Add(60);
+        List<int> az = new List<int>();
+        az.Add(8); az.Add(8); az.Add(8);
+        List<int> a = Chart.LlShift1D(ap, az, 2);
+        Console.WriteLine("shift/free:" + Convert.ToString(a[0])
+            + ":" + Convert.ToString(a[1]) + ":" + Convert.ToString(a[2]));
+        // 级联顶开：14 顶到 10+8+2=20，30 恰好 20+8+2 原位不动
+        List<int> bp = new List<int>();
+        bp.Add(10); bp.Add(14); bp.Add(30);
+        List<int> bz = new List<int>();
+        bz.Add(8); bz.Add(8); bz.Add(8);
+        List<int> b = Chart.LlShift1D(bp, bz, 2);
+        Console.WriteLine("shift/push:" + Convert.ToString(b[0])
+            + ":" + Convert.ToString(b[1]) + ":" + Convert.ToString(b[2]));
+        // gap=0 贴排：[10,11,12] → [10,15,20]
+        List<int> cp = new List<int>();
+        cp.Add(10); cp.Add(11); cp.Add(12);
+        List<int> cz = new List<int>();
+        cz.Add(5); cz.Add(5); cz.Add(5);
+        List<int> cc = Chart.LlShift1D(cp, cz, 0);
+        Console.WriteLine("shift/tight:" + Convert.ToString(cc[0])
+            + ":" + Convert.ToString(cc[1]) + ":" + Convert.ToString(cc[2]));
+    }
+}
