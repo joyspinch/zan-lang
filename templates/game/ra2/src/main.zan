@@ -1666,6 +1666,15 @@ class Ra2App {
         else if (game.RepairModeArmed()) { Ra2App.ModeHint(r, "修理", mx, my); }
     }
 
+    // The minimap's fog-of-war overlay: black patches over every
+    // unexplored cell, rebuilt off the render path -- the version catch-up
+    // coalesces to one walk every 400ms the way the terrain recomposite
+    // coalesces ore changes. Stale by a fraction of a second at worst.
+    static R2Tex miniShroud;
+    static int miniShroudVersion = 0 - 1;
+    static int miniShroudFullVersion = 0 - 1;
+    static int miniShroudMs = 0 - 1000000;
+
     /// <summary>The in-game minimap: terrain backdrop, a frame showing the
     /// current view, and dots for every object -- green for the player's,
     /// red for the enemy's. Drawn into the sidebar's lower corner.</summary>
@@ -1675,6 +1684,56 @@ class Ra2App {
                             bool clicked, int x, int y, int w, int h) {
         if (minimap == null) { return; }
         r.DrawTexture(minimap, x, y, w, h);
+        // The fog of war: unexplored ground stays black on the radar and
+        // nothing on it shows a dot -- not for the player, not for the AI
+        // houses. Explored ground keeps its terrain, the way RA2's shroud
+        // never re-fogs.
+        MapShroud shroud = world.ShroudOf(game.Side());
+        if (shroud != null) {
+            int nowMs = Window.GetTickMs();
+            if (shroud.FullVersion() != Ra2App.miniShroudFullVersion
+             || (shroud.Version() != Ra2App.miniShroudVersion
+                 && nowMs - Ra2App.miniShroudMs >= 400)) {
+                Ra2App.miniShroudFullVersion = shroud.FullVersion();
+                Ra2App.miniShroudVersion = shroud.Version();
+                Ra2App.miniShroudMs = nowMs;
+                Texture canvas = Texture.Create(Ra2App.MiniW(), Ra2App.MiniH());
+                Ra2App.memset(canvas.Pixels(), 0, canvas.ByteLength());
+                int mw = terrain.WorldWidth();
+                int mh = terrain.WorldHeight();
+                int cw2 = world.Width();
+                int ch2 = world.Height();
+                for (int cy = 0; cy < ch2; cy = cy + 1) {
+                    for (int cx = 0; cx < cw2; cx = cx + 1) {
+                        if (shroud.At(cx, cy) != MapShroud.Unexplored()) {
+                            continue;
+                        }
+                        int wx = IsoProjection.ScreenX(cx, cy)
+                               - terrain.OriginX();
+                        int wy = IsoProjection.ScreenY(cx, cy, 0)
+                               - terrain.OriginY();
+                        int px = wx * Ra2App.MiniW() / mw;
+                        int py = wy * Ra2App.MiniH() / mh;
+                        for (int dy = 0; dy < 2; dy = dy + 1) {
+                            for (int dx = 0; dx < 2; dx = dx + 1) {
+                                int ax = px + dx;
+                                int ay = py + dy;
+                                if (ax < 0 || ay < 0 || ax >= Ra2App.MiniW()
+                                 || ay >= Ra2App.MiniH()) { continue; }
+                                canvas.SetPixel(ay * Ra2App.MiniW() + ax,
+                                    0, 0, 0, 255);
+                            }
+                        }
+                    }
+                }
+                Ra2App.miniShroud = Ra2Ui.RegisterMutable("ra2:minishroud",
+                                                          canvas);
+                canvas.Close();
+            }
+            if (Ra2App.miniShroud != null) {
+                r.DrawTexture(Ra2App.miniShroud, x, y, w, h);
+            }
+        }
         // A hairline frame.
         r.SetColor(150, 158, 172, 255);
         r.DrawRect(x, y, w, h);
@@ -1694,6 +1753,10 @@ class Ra2App {
         for (int i = 0; i < world.ObjectCount(); i = i + 1) {
             WorldObject o = world.ObjectAt(i);
             if (o.IsDead()) { continue; }
+            if (shroud != null
+             && shroud.At(o.X(), o.Y()) == MapShroud.Unexplored()) {
+                continue;
+            }
             int wx = IsoProjection.ScreenX(o.X(), o.Y()) - terrain.OriginX();
             int wy = IsoProjection.ScreenY(o.X(), o.Y(), 0) - terrain.OriginY();
             int px = x + wx * w / terrain.WorldWidth();
@@ -2882,6 +2945,9 @@ class Ra2Loop : IGuiHostLoop {
                 aiDiffs, this.shell.StartCredits());
             this.game.SetShortGame(this.shell.ShortGame());
             this.terrain.SetWorld(this.world, this.objArt, side);
+            // Fog of war: one shroud per house, seeded from the map, with
+            // every house's opening forces revealing their sight circles.
+            this.world.InitShrouds();
             this.cam = Camera.Create(Ra2App.ViewW(), Ra2App.ViewH(),
                                 this.terrain.WorldWidth(), this.terrain.WorldHeight());
             // Start the camera on the player's own base, not the map
@@ -3321,6 +3387,10 @@ class Ra2Loop : IGuiHostLoop {
                                  this.cam.X(), this.cam.Y(),
                                  this.terrain.OriginX(), this.terrain.OriginY(),
                                  this.shell.SideIndex());
+            // The fog of war over everything live: unexplored ground hides
+            // its units, structures and effects under the black decal.
+            this.terrain.RenderShroudToCanvas(this.R, this.cam.X(), this.cam.Y(),
+                                 this.world.ShroudOf(this.shell.SideIndex()));
             if (this.game != null) {
                 Ra2App.DrawSidebar(this.R, this.game, this.objArt,
                                    this.sideShell, this.mouseX, this.mouseY);
@@ -4154,6 +4224,161 @@ class Ra2Loop : IGuiHostLoop {
                         Console.WriteLine("selftest FAIL smudge: a blast"
                             + " must scar clear ground and bite the ore"
                             + " it lands on");
+                    }
+                    // Shroud: the fog of war starts covering everything the
+                    // houses have not stood near, the player's own opening
+                    // force has revealed its sight circles around the base,
+                    // and a scout dropped into the dark opens the ground it
+                    // stands on and everything it walks past.
+                    MapShroud psh = this.world.ShroudOf(this.game.Side());
+                    int shTotal = this.world.Width() * this.world.Height();
+                    int shExplored0 = 0;
+                    for (int cy = 0; cy < this.world.Height(); cy = cy + 1) {
+                        for (int cx = 0; cx < this.world.Width(); cx = cx + 1) {
+                            if (psh.At(cx, cy) != MapShroud.Unexplored()) {
+                                shExplored0 = shExplored0 + 1;
+                            }
+                        }
+                    }
+                    // A scout into the dark: park a rifleman of the
+                    // viewer's own house on an unexplored cell, let the
+                    // reveal queue flush, and the cell plus its sight halo
+                    // must come up lit. The house matters: reveals land on
+                    // the owner's shroud, and orders are refused for units
+                    // that are not the commander's.
+                    int shRing = 0;
+                    int shMarch = 0;
+                    bool shOrdered = false;
+                    int ph = this.game.Side();
+                    int e1 = Ra2App.UnitIdOfReg(this.world, ph, "E1");
+                    if (e1 < 0) { e1 = Ra2App.UnitIdOfReg(this.world, ph, "E2"); }
+                    int dgx2 = 0 - 1;
+                    int dgy2 = 0 - 1;
+                    // A second dark+passable cell far from the first: the
+                    // march candidate. Maps with water can refuse a fixed
+                    // direction, so the probe walks to another scanned
+                    // dark cell before falling back to short hops.
+                    int dbx2 = 0 - 1;
+                    int dby2 = 0 - 1;
+                    for (int cy = 8; cy < this.world.Height() - 8
+                      && (dgx2 < 0 || dbx2 < 0); cy = cy + 1) {
+                        for (int cx = 8; cx < this.world.Width() - 8;
+                          cx = cx + 1) {
+                            if (psh.At(cx, cy) == MapShroud.Unexplored()
+                             && this.world.PassableForRoute(cx, cy, false)) {
+                                if (dgx2 < 0) {
+                                    dgx2 = cx;
+                                    dgy2 = cy;
+                                }
+                                else if (cx - dgx2 >= 8 || dgx2 - cx >= 8
+                                      || cy - dgy2 >= 8 || dgy2 - cy >= 8) {
+                                    dbx2 = cx;
+                                    dby2 = cy;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (psh != null && e1 >= 0 && dgx2 >= 0) {
+                        int scout = this.world.SpawnUnit(ph, e1, dgx2, dgy2);
+                        if (scout >= 0) {
+                            this.world.Tick();
+                            WorldObject so = this.world.ObjectAt(scout);
+                            int sight = so.UnitType().Sight();
+                            for (int dy = 0 - sight; dy <= sight; dy = dy + 1) {
+                                for (int dx = 0 - sight; dx <= sight; dx = dx + 1) {
+                                    if (psh.At(dgx2 + dx, dgy2 + dy)
+                                     != MapShroud.Unexplored()) {
+                                        shRing = shRing + 1;
+                                    }
+                                }
+                            }
+                            // The march: select the scout and order him
+                            // toward the map centre; every cell step re-
+                            // casts his sight circle, so the house's lit
+                            // area grows past the spawn ring.
+                            int litNow = 0;
+                            for (int cy = 0; cy < this.world.Height();
+                              cy = cy + 2) {
+                                for (int cx = 0; cx < this.world.Width();
+                                  cx = cx + 2) {
+                                    if (psh.At(cx, cy)
+                                     != MapShroud.Unexplored()) {
+                                        litNow = litNow + 1;
+                                    }
+                                }
+                            }
+                            this.world.ClearSelection();
+                            this.world.AddSelectionByObject(so);
+                            if (dbx2 >= 0) {
+                                shOrdered = this.world.OrderMove(dbx2, dby2);
+                            }
+                            if (!shOrdered) {
+                                shOrdered = this.world.OrderMove(dgx2 + 5,
+                                                                 dgy2);
+                            }
+                            if (!shOrdered) {
+                                shOrdered = this.world.OrderMove(dgx2,
+                                                                 dgy2 + 5);
+                            }
+                            if (!shOrdered) {
+                                shOrdered = this.world.OrderMove(dgx2 - 5,
+                                                                 dgy2);
+                            }
+                            if (!shOrdered) {
+                                shOrdered = this.world.OrderMove(dgx2,
+                                                                 dgy2 - 5);
+                            }
+                            for (int t9 = 0; t9 < 300 && shOrdered;
+                              t9 = t9 + 1) {
+                                this.world.Tick();
+                                if (so.IsDead()) { break; }
+                            }
+                            int litAfter = 0;
+                            for (int cy = 0; cy < this.world.Height();
+                              cy = cy + 2) {
+                                for (int cx = 0; cx < this.world.Width();
+                                  cx = cx + 2) {
+                                    if (psh.At(cx, cy)
+                                     != MapShroud.Unexplored()) {
+                                        litAfter = litAfter + 1;
+                                    }
+                                }
+                            }
+                            shMarch = litAfter > litNow ? 1 : 0;
+                            Console.WriteLine("selftest shroud scout at="
+                                + Convert.ToString(dgx2) + ","
+                                + Convert.ToString(dgy2)
+                                + " ring=" + Convert.ToString(shRing)
+                                + " march=" + Convert.ToString(shMarch)
+                                + " ordered=" + (shOrdered ? "1" : "0")
+                                + " lost=" + (so.IsDead() ? "1" : "0"));
+                            if (!so.IsDead()) {
+                                so.TakeDamage(so.Hp());
+                            }
+                            int prevSel = this.world.SelectedIndex();
+                            this.world.ClearSelection();
+                            if (prevSel >= 0) {
+                                WorldObject ps = this.world.ObjectAt(prevSel);
+                                if (ps != null && !ps.IsDead()) {
+                                    this.world.AddToSelection(ps.X(), ps.Y());
+                                }
+                            }
+                        }
+                    }
+                    Console.WriteLine("selftest shroud cells="
+                        + Convert.ToString(shTotal)
+                        + " explored=" + Convert.ToString(shExplored0)
+                        + " ring=" + Convert.ToString(shRing)
+                        + " march=" + Convert.ToString(shMarch));
+                    if (psh == null || shExplored0 <= 0
+                     || shExplored0 >= shTotal || shRing < 1
+                     || (shOrdered && shMarch != 1)) {
+                        Console.WriteLine("selftest FAIL shroud: the map"
+                            + " must start mostly dark, the base lit, and"
+                            + " a marching scout must open the ground it"
+                            + " walks (an order refused on every candidate"
+                            + " skips the march leg -- pathing owns that)");
                     }
                     // Building idle anims: every finished structure whose
                     // art ships IdleAnim must have its loop live (the

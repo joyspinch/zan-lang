@@ -1,0 +1,372 @@
+using System;
+using System.Collections.Generic;
+using Ra2.Formats;
+
+namespace Ra2.Game;
+
+/// <summary>The fog of war over the map, ported from the reference's
+/// `game/map/MapShroud.ts`.
+///
+/// Every cell the player's forces have stood near carries Explored; the
+/// rest is Unexplored -- terrain and everything on it hidden, the minimap
+/// black. Exploring is permanent (RA2 has no re-fogging); the third state,
+/// TemporaryReveal, covers the super-weapon style spy passes that show a
+/// patch of ground for five logic seconds and then swallow it back.
+/// Reveal requests queue as invalidations and apply in Update() -- a unit
+/// walking pushes one circle per cell change instead of writing it
+/// immediately.
+///
+/// The reference stores one byte per shroud tile, keyed through an
+/// sxy/rxy dance because its map keeps several tiles per world cell at
+/// different heights. This port's map is one tile per cell with a level
+/// byte, so the shroud grid is exactly the world grid and the tile index
+/// is x + y * width; the stored elevation is the cell's own level, which
+/// is what keeps a reveal from bleeding over a ridge it cannot see past
+/// (the reference's `tileElevation < maxElevation + 4` gate).
+///
+/// Bit 3 is the Darken flag the gap generators set on their own ground;
+/// the flag rides in the byte so a later gap-generator slice only has to
+/// toggle it.</summary>
+class MapShroud {
+    // ShroudType: what the player knows about a cell.
+    static int Unexplored() { return 0; }
+    static int TemporaryReveal() { return 1; }
+    static int Explored() { return 2; }
+
+    // ShroudFlag: ancillary marks that ride above the type bits.
+    static int Darken() { return 8; }
+
+    static int TypeMask() { return 7; }
+
+    // The reference's constants: an object standing on otherwise shrouded
+    // ground always shows a 4.25-cell halo around itself (revealObject),
+    // a temporary reveal lasts five logic seconds and collapses back to a
+    // 3-cell core, and the reveal walk never tests past these.
+    static double ObjectRevealRadius() { return 4.25; }
+    static int TempRevealTicks() { return 5 * 15; }
+    static int TempCollapseRadius() { return 3; }
+
+    // The no-cliff-gate sentinel: the reference passes POSITIVE_INFINITY
+    // for reveals that see over any height. Real elevations stay small,
+    // so a big int plays infinity and the circle walk keeps integer math.
+    static int NoElevationGate() { return 30000; }
+
+    int width;
+    int height;
+    byte[] tiles;
+    byte[] tileElevation;
+
+    // Queued reveals, applied in Update(). Circles are the common case (a
+    // sight range, kept as a double so the 4.25 halos round the way the
+    // reference's radius^2 test does); rectangles the Ares-shaped area
+    // reveals.
+    List<int> invX;
+    List<int> invY;
+    List<int> invElev;
+    List<double> invRadius;
+    List<int> rectX;
+    List<int> rectY;
+    List<int> rectElev;
+    List<int> rectW;
+    List<int> rectH;
+
+    // Live temporary reveals: (sx, sy, ticksLeft) triples.
+    List<int> tmpX;
+    List<int> tmpY;
+    List<int> tmpTicks;
+
+    // Bumped on every state change: the renderer and minimap watch this
+    // instead of diffing tiles (the port's oreVersion idiom).
+    int version;
+    // Bumped on revealAll/reset/merge/flag toggles: watchers rebuild from
+    // scratch instead of catching up.
+    int fullVersion;
+
+    static MapShroud Create(int width, int height) {
+        MapShroud s = new MapShroud();
+        s.width = width;
+        s.height = height;
+        s.tiles = new byte[width * height];
+        s.tileElevation = new byte[width * height];
+        s.invX = new List<int>();
+        s.invY = new List<int>();
+        s.invElev = new List<int>();
+        s.invRadius = new List<double>();
+        s.rectX = new List<int>();
+        s.rectY = new List<int>();
+        s.rectElev = new List<int>();
+        s.rectW = new List<int>();
+        s.rectH = new List<int>();
+        s.tmpX = new List<int>();
+        s.tmpY = new List<int>();
+        s.tmpTicks = new List<int>();
+        return s;
+    }
+
+    int Version() { return this.version; }
+    int FullVersion() { return this.fullVersion; }
+
+    /// <summary>Seeds the per-cell elevation gate from the world's level
+    /// bytes -- the reference's fromTiles scan over every map tile.</summary>
+    void SeedElevation(World world) {
+        for (int y = 0; y < this.height; y = y + 1) {
+            for (int x = 0; x < this.width; x = x + 1) {
+                int lvl = world.LevelAt(x, y);
+                if (lvl < 0) { lvl = 0; }
+                if (lvl > 255) { lvl = 255; }
+                this.tileElevation[x + y * this.width] = (byte)lvl;
+            }
+        }
+    }
+
+    /// <summary>The shroud state of a world cell; out of range reads
+    /// Unexplored (off the map is always dark).</summary>
+    int At(int x, int y) {
+        if (x < 0 || y < 0 || x >= this.width || y >= this.height) {
+            return MapShroud.Unexplored();
+        }
+        return this.tiles[x + y * this.width] & MapShroud.TypeMask();
+    }
+
+    bool Darkened(int x, int y) {
+        if (x < 0 || y < 0 || x >= this.width || y >= this.height) {
+            return false;
+        }
+        return (this.tiles[x + y * this.width] & MapShroud.Darken()) != 0;
+    }
+
+    /// <summary>Queues a sight reveal around a world cell. Elevation is
+    /// the reveal's own ground height; the sentinel plays the reference's
+    /// POSITIVE_INFINITY (the walk bounds come from the map box either
+    /// way, so a huge radius only ever walks the whole map).</summary>
+    void RevealAround(int x, int y, int elevation, double radius) {
+        if (radius < 0) { return; }
+        if (radius > (double)MapShroud.NoElevationGate()) {
+            radius = (double)MapShroud.NoElevationGate();
+        }
+        this.invX.Add(x);
+        this.invY.Add(y);
+        this.invElev.Add(elevation);
+        this.invRadius.Add(radius);
+    }
+
+    void RevealRectangle(int x, int y, int elevation, int w, int h) {
+        if (w <= 0 || h <= 0) { return; }
+        this.rectX.Add(x);
+        this.rectY.Add(y);
+        this.rectElev.Add(elevation);
+        this.rectW.Add(w);
+        this.rectH.Add(h);
+    }
+
+    /// <summary>A techno's own halo: an object standing on otherwise
+    /// shrouded ground shows the ground right around it (the reference's
+    /// revealObject -- reveal-to-all buildings, spy passes).</summary>
+    void RevealObject(int x, int y, int elevation) {
+        this.RevealAround(x, y, elevation, MapShroud.ObjectRevealRadius());
+    }
+
+    /// <summary>The reference's revealFrom: the sight-range reveal a
+    /// spawn, move or elevation change queues for the owner and its
+    /// allies. Sight <= 0 sees nothing (walls).</summary>
+    void RevealFrom(int x, int y, int elevation, int sight) {
+        if (sight <= 0) { return; }
+        this.RevealAround(x, y, elevation, (double)sight);
+    }
+
+    void RevealTemporarily(int x, int y, int elevation) {
+        // One live patch per cell: re-arming refreshes the duration. The
+        // reference only registers the countdown here -- the patch itself
+        // is painted (and later collapsed) inside Update(), never through
+        // the explored set.
+        for (int i = 0; i < this.tmpX.Count; i = i + 1) {
+            if (this.tmpX[i] == x && this.tmpY[i] == y) {
+                this.tmpTicks[i] = MapShroud.TempRevealTicks();
+                return;
+            }
+        }
+        this.tmpX.Add(x);
+        this.tmpY.Add(y);
+        this.tmpTicks.Add(MapShroud.TempRevealTicks());
+    }
+
+    /// <summary>The reference's revealArea: a negative width is the
+    /// full-map sentinel, otherwise a centred rectangle (or a circle when
+    /// the height is zero).</summary>
+    void RevealArea(int x, int y, int elevation, int widthOrRange, int h) {
+        if (widthOrRange < 0) { this.RevealAll(); return; }
+        if (h > 0) {
+            this.RevealRectangle(x, y, elevation, widthOrRange, h);
+        }
+        else {
+            this.RevealAround(x, y, elevation, (double)widthOrRange);
+        }
+    }
+
+    void ToggleFlagsAround(int x, int y, int radius, int flags, bool on) {
+        this.ApplyAround(x, y, (double)radius, MapShroud.NoElevationGate(),
+            0 - 1, 0 - 1, 0 - 1, on ? flags : 0, on ? 0 : flags);
+        this.version = this.version + 1;
+        this.fullVersion = this.fullVersion + 1;
+    }
+
+    void RevealAll() {
+        for (int i = 0; i < this.tiles.Length; i = i + 1) {
+            this.tiles[i] = (byte)MapShroud.Explored();
+        }
+        this.version = this.version + 1;
+        this.fullVersion = this.fullVersion + 1;
+    }
+
+    void Reset() {
+        for (int i = 0; i < this.tiles.Length; i = i + 1) {
+            this.tiles[i] = (byte)MapShroud.Unexplored();
+        }
+        this.version = this.version + 1;
+        this.fullVersion = this.fullVersion + 1;
+    }
+
+    /// <summary>The reference's merge: union two houses' knowledge when an
+    /// alliance forms -- types take the max, Darken flags stick once set.</summary>
+    void Merge(MapShroud other) {
+        if (other == null || other.width != this.width
+         || other.height != this.height) { return; }
+        for (int i = 0; i < this.tiles.Length; i = i + 1) {
+            int a = this.tiles[i] & MapShroud.TypeMask();
+            int b = other.tiles[i] & MapShroud.TypeMask();
+            int flags = (this.tiles[i] | other.tiles[i]) & MapShroud.Darken();
+            this.tiles[i] = (byte)((a > b ? a : b) | flags);
+        }
+        this.version = this.version + 1;
+        this.fullVersion = this.fullVersion + 1;
+    }
+
+    /// <summary>Applies the queued reveals. The circle walk carries the
+    /// reference's two gates verbatim: the cell must sit within
+    /// radius^2 + 1 of the centre, and its own elevation must be below
+    /// the reveal's elevation + 4 (a reveal cannot see over the ridge it
+    /// stands under). Only Unexplored and TemporaryReveal cells move to
+    /// Explored.</summary>
+    void Update() {
+        bool changed = false;
+        for (int n = 0; n < this.invX.Count; n = n + 1) {
+            this.ApplyAround(this.invX[n], this.invY[n], this.invRadius[n],
+                this.invElev[n], MapShroud.Explored(),
+                MapShroud.Unexplored(), MapShroud.TemporaryReveal(), 0, 0);
+            changed = true;
+        }
+        this.invX.Clear();
+        this.invY.Clear();
+        this.invElev.Clear();
+        this.invRadius.Clear();
+        for (int n = 0; n < this.rectX.Count; n = n + 1) {
+            this.ApplyRectangle(this.rectX[n], this.rectY[n], this.rectElev[n],
+                this.rectW[n], this.rectH[n]);
+            changed = true;
+        }
+        this.rectX.Clear();
+        this.rectY.Clear();
+        this.rectElev.Clear();
+        this.rectW.Clear();
+        this.rectH.Clear();
+        // Temporary reveals count down; arming paints the patch
+        // TemporaryReveal over Unexplored on its first tick, expiry
+        // collapses the patch back to shroud.
+        int i = 0;
+        while (i < this.tmpTicks.Count) {
+            int left = this.tmpTicks[i] - 1;
+            if (left <= 0) {
+                this.ApplyAround(this.tmpX[i], this.tmpY[i],
+                    (double)MapShroud.TempCollapseRadius(),
+                    MapShroud.NoElevationGate(), MapShroud.Unexplored(),
+                    MapShroud.TemporaryReveal(), 0 - 1, 0, 0);
+                this.tmpTicks.RemoveAt(i);
+                this.tmpX.RemoveAt(i);
+                this.tmpY.RemoveAt(i);
+                changed = true;
+                continue;
+            }
+            if (left == MapShroud.TempRevealTicks() - 1) {
+                this.ApplyAround(this.tmpX[i], this.tmpY[i],
+                    (double)MapShroud.TempCollapseRadius(),
+                    MapShroud.NoElevationGate(), MapShroud.TemporaryReveal(),
+                    MapShroud.Unexplored(), 0 - 1, 0, 0);
+                changed = true;
+            }
+            this.tmpTicks[i] = left;
+            i = i + 1;
+        }
+        if (changed) { this.version = this.version + 1; }
+    }
+
+    /// <summary>The circle walk behind every reveal. `newValue` writes
+    /// when the cell's current type matches oldA (or oldB when >= 0; -1
+    /// disables the type gate entirely). setFlags/clearFlags move the
+    /// Darken bit without touching the type. maxElevation of the sentinel
+    /// skips the ridge gate.</summary>
+    void ApplyAround(int cx, int cy, double radius, int maxElevation,
+                     int newValue, int oldA, int oldB, int setFlags,
+                     int clearFlags) {
+        int r = (int)Math.Ceiling(radius);
+        if (r > MapShroud.NoElevationGate()) { r = MapShroud.NoElevationGate(); }
+        int minX = cx - r;
+        if (minX < 0) { minX = 0; }
+        int maxX = cx + r;
+        if (maxX > this.width - 1) { maxX = this.width - 1; }
+        int minY = cy - r;
+        if (minY < 0) { minY = 0; }
+        int maxY = cy + r;
+        if (maxY > this.height - 1) { maxY = this.height - 1; }
+        int r2 = (int)(radius * radius) + 1;
+        for (int x = minX; x <= maxX; x = x + 1) {
+            for (int y = minY; y <= maxY; y = y + 1) {
+                int index = x + y * this.width;
+                int cur = this.tiles[index] & MapShroud.TypeMask();
+                int curFlags = this.tiles[index] & MapShroud.Darken();
+                if (oldA >= 0 && cur != oldA && cur != oldB) { continue; }
+                int dx = x - cx;
+                int dy = y - cy;
+                if (dx * dx + dy * dy > r2) { continue; }
+                if (maxElevation != MapShroud.NoElevationGate()
+                 && this.tileElevation[index] >= maxElevation + 4) {
+                    continue;
+                }
+                int nextType = newValue >= 0 ? newValue : cur;
+                int nextFlags = curFlags;
+                if (setFlags != 0) { nextFlags = nextFlags | setFlags; }
+                if (clearFlags != 0) {
+                    nextFlags = nextFlags & (MapShroud.Darken() ^ clearFlags);
+                }
+                if (cur != nextType || curFlags != nextFlags) {
+                    this.tiles[index] = (byte)(nextType | nextFlags);
+                }
+            }
+        }
+    }
+
+    /// <summary>The rectangle reveal, centred like the reference's
+    /// setValueInRectangle: Unexplored and TemporaryReveal cells inside
+    /// the box (and below its elevation gate) become Explored.</summary>
+    void ApplyRectangle(int cx, int cy, int maxElevation, int w, int h) {
+        int minX = cx - w / 2;
+        int minY = cy - h / 2;
+        if (minX < 0) { minX = 0; }
+        if (minY < 0) { minY = 0; }
+        int maxX = minX + w - 1;
+        int maxY = minY + h - 1;
+        if (maxX > this.width - 1) { maxX = this.width - 1; }
+        if (maxY > this.height - 1) { maxY = this.height - 1; }
+        for (int x = minX; x <= maxX; x = x + 1) {
+            for (int y = minY; y <= maxY; y = y + 1) {
+                int index = x + y * this.width;
+                if (maxElevation != MapShroud.NoElevationGate()
+                 && this.tileElevation[index] >= maxElevation + 4) {
+                    continue;
+                }
+                if ((this.tiles[index] & MapShroud.TypeMask())
+                 == MapShroud.Explored()) { continue; }
+                this.tiles[index] = (byte)MapShroud.Explored();
+            }
+        }
+    }
+}

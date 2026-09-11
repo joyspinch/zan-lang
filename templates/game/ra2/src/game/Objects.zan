@@ -629,6 +629,8 @@ class UnitType {
     int speed;
     // The harvester hold in bails (the rules' Storage=); 0 off the miners.
     int storage;
+    // The shroud reveal radius (rules Sight=, default 1).
+    int sight;
 
     static UnitType Create(string reg, string label, int cost, int buildTime,
                            int hp, string shpName, int armor, Weapon primary,
@@ -656,6 +658,7 @@ class UnitType {
         t.newTheater = false;
         t.cameo = null;
         t.techLevel = 1;
+        t.sight = 1;
         t.deploysInto = null;
         t.deployer = false;
         t.storage = 0;
@@ -686,6 +689,8 @@ class UnitType {
     void SetSpeed(int speed) { this.speed = speed; }
     int Storage() { return this.storage; }
     void SetStorage(int v) { this.storage = v; }
+    int Sight() { return this.sight; }
+    void SetSight(int v) { this.sight = v; }
     int Role() { return this.role; }
     bool MindImmune() { return this.mindImmune; }
     List<List<int>> Prereqs() { return this.prereqs; }
@@ -893,6 +898,7 @@ class UnitCatalog {
             t.SetDeploysInto(d.DeploysInto());
             t.SetDeployer(d.Deployer());
             t.SetSpeed(d.Speed() > 0 ? d.Speed() : d.Steps() * 4);
+            t.SetSight(d.Sight());
             l.Add(t);
         }
         return l;
@@ -962,6 +968,7 @@ class UnitCatalog {
             t.SetArtKey(d.ArtKey());
             t.SetNewTheater(d.NewTheater());
             t.SetSpeed(d.Speed() > 0 ? d.Speed() : d.Steps() * 4);
+            t.SetSight(d.Sight());
             this.civTypes.Add(t);
         }
         return this.civTypes;
@@ -1025,6 +1032,7 @@ class StructureType {
     List<int> produces;  // unit ids this building can train, or null
     List<List<int>> prereqs;   // tech slots, see UnitType
     bool waterBound;     // floats: its footprint must be water (the shipyard)
+    int sight;           // the shroud reveal radius (rules Sight=, default 1)
 
     static StructureType Create(BuildingDef d) {
         StructureType t = new StructureType();
@@ -1048,6 +1056,7 @@ class StructureType {
         t.produces = null;
         t.prereqs = new List<List<int>>();
         t.waterBound = d.WaterBound();
+        t.sight = d.Sight();
         t.techLevel = d.TechLevel();
         return t;
     }
@@ -1072,6 +1081,7 @@ class StructureType {
     bool Powered() { return this.powered; }
     bool IsRefinery() { return this.refinery; }
     bool WaterBound() { return this.waterBound; }
+    int Sight() { return this.sight; }
     bool HasWeapon() { return this.weapon != null; }
     List<List<int>> Prereqs() { return this.prereqs; }
     void SetPrereqs(List<List<int>> prereqs) { this.prereqs = prereqs; }
@@ -1584,6 +1594,65 @@ class World {
         int left = amt - take;
         if (left < 0) { left = 0; }
         this.SetOre(x, y, left, val, ov);
+    }
+
+    // ---- fog of war (the reference's MapShroudTrait) -----------------------
+
+    // One shroud per skirmish house (0..7). Alliances merge shrouds in the
+    // reference; this port fights free-for-all, so a house's knowledge is
+    // its own until an alliance slice arrives.
+    List<MapShroud> shrouds;
+
+    /// <summary>Builds the per-house shrouds over the map grid and does the
+    /// reference's init reveal: every combatant's own forces (and their
+    /// allies') reveal their sight circles once, then the queues flush.
+    /// Neutral scenery reveals nothing.</summary>
+    void InitShrouds() {
+        this.shrouds = new List<MapShroud>();
+        for (int h = 0; h < 8; h = h + 1) {
+            this.shrouds.Add(MapShroud.Create(this.width, this.height));
+            this.shrouds[h].SeedElevation(this);
+        }
+        for (int i = 0; i < this.objects.Count; i = i + 1) {
+            this.ShroudRevealObject(this.objects[i]);
+        }
+        for (int h = 0; h < 8; h = h + 1) {
+            this.shrouds[h].Update();
+        }
+    }
+
+    /// <summary>The house's fog of war, or null outside the skirmish
+    /// houses (Neutral sees and is seen without a shroud of its own).</summary>
+    MapShroud ShroudOf(int house) {
+        if (house < 0 || house >= 8) { return null; }
+        if (this.shrouds == null) { return null; }
+        MapShroud s = this.shrouds[house];
+        return s;
+    }
+    /// <summary>Queues the sight reveal one object casts for its owner --
+    /// the reference's revealFrom on spawn, tile change and elevation
+    /// change. Walls are buildings in name only: their sight is zero and
+    /// they reveal nothing, exactly like the reference's wallTrait skip.</summary>
+    void ShroudRevealObject(WorldObject o) {
+        if (o == null || o.IsDead()) { return; }
+        int house = o.Side();
+        if (house == Side2.Neutral()) { return; }
+        MapShroud s = this.ShroudOf(house);
+        if (s == null) { return; }
+        int sight = 0;
+        if (o.Kind() == ObjKind.Structure()) {
+            StructureType t = this.catalog.TypeFor(this, house, o.BuildId());
+            sight = t != null ? t.Sight() : 0;
+            File.AppendAllText("build/shz_mark.txt", "s"
+                + Convert.ToString(sight) + "\n");
+        }
+        else {
+            UnitType ut = o.UnitType();
+            sight = ut != null ? ut.Sight() : 0;
+            File.AppendAllText("build/shz_mark.txt", "u"
+                + Convert.ToString(sight) + "\n");
+        }
+        s.RevealFrom(o.X(), o.Y(), this.LevelAt(o.X(), o.Y()), sight);
     }
 
     StructureCatalog Catalog() { return this.catalog; }
@@ -2642,7 +2711,9 @@ class World {
         if (t == null) { return -1; }
         if (!this.CanPlace(t, x, y)) { return -1; }
         WorldObject o = WorldObject.CreateStructure(side, buildId, x, y, t.Hp());
-        return this.AddObject(o);
+        int idx = this.AddObject(o);
+        this.ShroudRevealObject(o);
+        return idx;
     }
 
     /// <summary>Runs a unit's Deploy on the object at idx. Two semantics live
@@ -2694,6 +2765,7 @@ class World {
                     this.occupancy[this.CellSlot(ax + dx, ay + dy)] = idx + 1;
                 }
             }
+            this.ShroudRevealObject(o);
             return idx;
         }
         if (ut.Deployer()) {
@@ -2834,7 +2906,9 @@ class World {
         if (this.occupancy[this.CellSlot(x, y)] != 0
          || this.IsWallCell(x, y)) { return -1; }
         WorldObject o = WorldObject.CreateUnit(side, unitId, x, y, u.Hp(), u);
-        return this.AddObject(o);
+        int idx = this.AddObject(o);
+        this.ShroudRevealObject(o);
+        return idx;
     }
 
     /// <summary>Spawns a unit for a pre-placed map entry whose archetype the
@@ -2891,7 +2965,9 @@ class World {
         WorldObject o = WorldObject.CreateUnit(side, unitId, x, y, startHp, ut);
         o.SetFacing(facing);
         o.SetTurretFacing(facing);
-        return this.AddObject(o);
+        int idx = this.AddObject(o);
+        this.ShroudRevealObject(o);
+        return idx;
     }
 
     int SpawnMapUnit(int side, int unitId, int x, int y, int hp, int facing) {
@@ -4963,6 +5039,9 @@ class World {
                 int oldY = o.Y();
                 this.occupancy[this.CellSlot(oldX, oldY)] = 0;
                 o.Advance();
+                // Each cell step re-casts the sight circle: the reference's
+                // tile-occupation change fires revealFrom per move.
+                this.ShroudRevealObject(o);
                 o.AdvanceAnim();
                 int stepFacing = WorldObject.FacingOf(o.X() - oldX, o.Y() - oldY);
                 o.SetFacing(stepFacing);
@@ -5041,8 +5120,10 @@ class World {
                     List<int> hcell = new List<int>();
                     this.FindSpawnCell(o, hcell);
                     if (hcell.Count >= 2 && hu != null) {
-                        this.AddObject(WorldObject.CreateUnit(o.Side(), hid,
-                            hcell[0], hcell[1], hu.Hp(), hu));
+                        WorldObject h = WorldObject.CreateUnit(o.Side(), hid,
+                            hcell[0], hcell[1], hu.Hp(), hu);
+                        this.AddObject(h);
+                        this.ShroudRevealObject(h);
                     }
                 }
             }
@@ -5061,6 +5142,7 @@ class World {
             WorldObject n = WorldObject.CreateUnit(o.Side(), unitId, cell[0],
                                                    cell[1], u.Hp(), u);
             this.AddObject(n);
+            this.ShroudRevealObject(n);
             o.PopProd();
             produced = produced + 1;
         }
@@ -5069,6 +5151,13 @@ class World {
         this.TickEffects();
         this.TickFx();
         this.TickDamageSmoke();
+        // The queued sight reveals apply once per logic tick, the
+        // reference's MapShroudTrait.onTick -> shroud.update() cadence.
+        if (this.shrouds != null) {
+            for (int h = 0; h < this.shrouds.Count; h = h + 1) {
+                this.shrouds[h].Update();
+            }
+        }
         List<int> result = new List<int>();
         result.Add(moved);
         result.Add(fired);
