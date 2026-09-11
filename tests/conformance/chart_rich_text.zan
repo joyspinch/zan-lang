@@ -1,0 +1,168 @@
+using System;
+using Gui;
+using Gui.Component.Chart;
+
+namespace Conf;
+
+/// ECharts 富文本标签（label.rich + {style|content} 令牌）解析与分词。
+///
+/// 官方出处（echarts 官方"富文本标签"文档 + examples）：
+///   - `{name|content}` 段按 \n 分行；content 空 = 线/占位块（hr）。
+///   - 样式键 color/fontSize/fontWeight（官方也接受数字 800，gauge-car）/
+///     fontFamily/align/lineHeight/backgroundColor/borderColor/borderWidth/
+///     borderRadius/padding（number | [v,h] | [t,r,b,l]）/width（'100%'
+///     随整块宽）/height。
+///   - label 本体的 backgroundColor/border/padding 是整块底板
+///     （pie-rich-text 的 data.label 底板）。
+///   - data[i].label.formatter 是**模板**（pie-rich-text 的
+///     "{title|{b}}\n..."），覆盖系列级 label.formatter；模板令牌
+///     {a}{b}{c}{d} 先展开、rich 壳保留，分词时才查表。
+class Program {
+    static string ST(ChartRichStyle s) {
+        return s == null ? "-" : s.name;
+    }
+
+    static void Main() {
+        // ---- 解析：pie-nest 形（series.label.rich）----
+        ChartOption o = ChartOption.FromJson(
+            "{\"series\":[{\"type\":\"pie\",\"data\":[120,200],\"label\":{"
+            + "\"formatter\":\"{a|{b}}\\n{hr|}\\n{b|2023: {c}} {per|{d}%}\","
+            + "\"rich\":{"
+            + "\"a\":{\"color\":\"#6E7079\",\"lineHeight\":22,\"align\":\"center\"},"
+            + "\"hr\":{\"borderColor\":\"#8C8D8E\",\"width\":\"100%\","
+            + "\"borderWidth\":1,\"height\":0},"
+            + "\"b\":{\"color\":\"#4C5058\",\"fontSize\":14,"
+            + "\"fontWeight\":\"bold\",\"lineHeight\":33},"
+            + "\"per\":{\"color\":\"#fff\",\"backgroundColor\":\"#4C5058\","
+            + "\"padding\":[3,4],\"borderRadius\":4}"
+            + "}}}]}");
+        ChartSeries s = o.series[0];
+        ChartTextStyle lb = s.label;
+        Console.WriteLine("rich/count:" + Convert.ToString(lb.rich.Count));
+        ChartRichStyle a = Chart.RichStyleOf(lb, "a");
+        ChartRichStyle hr = Chart.RichStyleOf(lb, "hr");
+        ChartRichStyle b = Chart.RichStyleOf(lb, "b");
+        ChartRichStyle per = Chart.RichStyleOf(lb, "per");
+        if (a == null || hr == null || b == null || per == null) {
+            Console.WriteLine("rich/missing");
+            return;
+        }
+        // a：颜色（ParseColor + 0xFF 通道）、lineHeight、align center
+        Console.WriteLine("rich/a:" + Convert.ToString(a.color)
+            + ":" + Convert.ToString(a.lineHeight)
+            + ":" + Convert.ToString(a.align));
+        // hr：width '100%' 记 -2、borderWidth 1、height 0（声明 0 ≠ 未声明 -1）
+        Console.WriteLine("rich/hr:" + Convert.ToString(hr.width)
+            + ":" + Convert.ToString(hr.borderWidth)
+            + ":" + Convert.ToString(hr.height)
+            + ":" + Convert.ToString(hr.borderColor));
+        // b：字号/粗体/行高
+        Console.WriteLine("rich/b:" + Convert.ToString(b.fontSize)
+            + ":" + b.fontWeight + ":" + Convert.ToString(b.lineHeight));
+        // per：[3,4] = 纵 3 横 4（t=3 r=4 b=3 l=4）、底色片、圆角
+        Console.WriteLine("rich/per:" + Convert.ToString(per.backgroundColor)
+            + ":" + Convert.ToString(per.padT) + ":" + Convert.ToString(per.padR)
+            + ":" + Convert.ToString(per.padB) + ":" + Convert.ToString(per.padL)
+            + ":" + Convert.ToString(per.radTL) + ":" + Convert.ToString(per.radBR));
+
+        // ---- 分词：模板展开保留 rich 壳，按 \n 分行 ----
+        string raw = Chart.RichFmtRaw(s, s.labelFmt, "Direct", 120, 26);
+        Console.WriteLine("raw:" + raw);
+        List<RichSeg> segs = Chart.RichTokenize(raw, lb);
+        string desc = "";
+        for (int i = 0; i < segs.Count; i = i + 1) {
+            desc = desc + segs[i].line + ":" + ST(segs[i].st) + ":"
+                + segs[i].text + "|";
+        }
+        Console.WriteLine("tok:" + desc);
+        // 未知样式名 = 纯文本段（保留内容）
+        List<RichSeg> unk = Chart.RichTokenize("{zz|x}", lb);
+        Console.WriteLine("tok/unk:" + ST(unk[0].st) + ":" + unk[0].text);
+        // 无 rich 壳的纯文本一行一段
+        List<RichSeg> plain = Chart.RichTokenize("L1\nL2", lb);
+        Console.WriteLine("tok/plain:" + Convert.ToString(plain.Count)
+            + ":" + ST(plain[0].st) + ":" + ST(plain[1].st));
+        // 空串也回一段（行 0），排版层按 0 高兜底
+        List<RichSeg> empty = Chart.RichTokenize("", lb);
+        Console.WriteLine("tok/empty:" + Convert.ToString(empty.Count)
+            + ":" + empty[0].text.Length);
+
+        // ---- data[i].label：模板 + 整块底板 + rich（pie-rich-text 形）----
+        ChartOption o2 = ChartOption.FromJson(
+            "{\"series\":[{\"type\":\"pie\",\"data\":["
+            + "{\"value\":1548,\"name\":\"CityE\",\"label\":{"
+            + "\"formatter\":\"{title|{b}}{abg|}\\n{hr|}\","
+            + "\"backgroundColor\":\"#eee\",\"borderColor\":\"#777\","
+            + "\"borderWidth\":1,\"borderRadius\":4,"
+            + "\"rich\":{\"title\":{\"color\":\"#eee\",\"align\":\"center\"}}"
+            + "}}],\"label\":{\"formatter\":\"{b}: {d}%\"}}]}");
+        ChartSeries s2 = o2.series[0];
+        ChartData d0 = s2.data[0];
+        if (d0.dlabel == null) {
+            Console.WriteLine("data/nolabel");
+            return;
+        }
+        // labelText 兼容承载原串；labelFmtT 承载模板
+        Console.WriteLine("data/fmt:" + d0.labelText + "#" + d0.labelFmtT);
+        // 整块底板：bg/border/borderWidth/radius
+        Console.WriteLine("data/box:" + Convert.ToString(d0.dlabel.boxBg)
+            + ":" + Convert.ToString(d0.dlabel.boxBorder)
+            + ":" + Convert.ToString(d0.dlabel.boxBorderW)
+            + ":" + Convert.ToString(d0.dlabel.boxRadius)
+            + ":" + Convert.ToString(d0.dlabel.rich.Count));
+        // 逐扇区解析：data 有模板 → 覆盖系列级
+        PieSlice sl = PieSlice.Of(1548, 0 - 65536, "CityE", 0, 0, 0, 900, 0);
+        Console.WriteLine("slice/raw:" + ChartView.PieSliceRaw(s2, sl, 33));
+        ChartTextStyle rs2 = ChartView.PieSliceRichStyle(s2, sl);
+        Console.WriteLine("slice/rich:" + (rs2 == null
+            ? "null" : Convert.ToString(rs2.rich.Count)));
+        // 系列级 rich 兜底：data 无 dlabel 时回落系列 label
+        ChartSeries s3 = o.series[0];
+        PieSlice sl3 = PieSlice.Of(120, 0 - 65536, "Direct", 0, 0, 0, 900, 0);
+        ChartTextStyle rs3 = ChartView.PieSliceRichStyle(s3, sl3);
+        Console.WriteLine("slice/fallback:" + (rs3 == null
+            ? "null" : Convert.ToString(rs3.rich.Count)));
+        Console.WriteLine("slice/raw3:" + ChartView.PieSliceRaw(s3, sl3, 26));
+
+        // ---- padding 其余形态与 fontWeight 数字 ----
+        ChartOption o3 = ChartOption.FromJson(
+            "{\"series\":[{\"type\":\"pie\",\"data\":[1],\"label\":{"
+            + "\"padding\":5,\"borderRadius\":2,"
+            + "\"rich\":{\"w\":{\"fontWeight\":800,\"padding\":[0,0,-20,10]},"
+            + "\"n\":{\"padding\":[0,20,0,30]},"
+            + "\"abg\":{\"borderRadius\":[4,4,0,0],\"width\":\"100%\"}}}}]}");
+        ChartTextStyle lb3 = o3.series[0].label;
+        Console.WriteLine("pad/num:" + Convert.ToString(lb3.padT)
+            + ":" + Convert.ToString(lb3.padR) + ":" + Convert.ToString(lb3.padB)
+            + ":" + Convert.ToString(lb3.padL)
+            + ":" + Convert.ToString(lb3.boxRadius));
+        ChartRichStyle w = Chart.RichStyleOf(lb3, "w");
+        ChartRichStyle n = Chart.RichStyleOf(lb3, "n");
+        if (w == null || n == null) {
+            Console.WriteLine("pad/missing");
+            return;
+        }
+        Console.WriteLine("pad/neg:" + Convert.ToString(w.fontWeight)
+            + ":" + Convert.ToString(w.padT) + ":" + Convert.ToString(w.padR)
+            + ":" + Convert.ToString(w.padB) + ":" + Convert.ToString(w.padL));
+        Console.WriteLine("pad/tvth:" + Convert.ToString(n.padT)
+            + ":" + Convert.ToString(n.padR) + ":" + Convert.ToString(n.padB)
+            + ":" + Convert.ToString(n.padL));
+        ChartRichStyle abg = Chart.RichStyleOf(lb3, "abg");
+        if (abg == null) {
+            Console.WriteLine("abg/missing");
+            return;
+        }
+        // borderRadius 数组 = [左上,右上,右下,左下]（abg 只圆上两角）；
+        // width '100%' 记 -2
+        Console.WriteLine("abg/rad:" + Convert.ToString(abg.radTL)
+            + ":" + Convert.ToString(abg.radTR) + ":" + Convert.ToString(abg.radBR)
+            + ":" + Convert.ToString(abg.radBL)
+            + ":" + Convert.ToString(abg.width));
+
+        // ---- 段盒高：声明 height 或行盒，加纵向 padding（可为负）----
+        Console.WriteLine("segh:" + Convert.ToString(Chart.RichSegH(30, 16, 0, 0))
+            + ":" + Convert.ToString(Chart.RichSegH(0 - 1, 16, 2, 3))
+            + ":" + Convert.ToString(Chart.RichSegH(0 - 1, 16, 0, 0)));
+    }
+}

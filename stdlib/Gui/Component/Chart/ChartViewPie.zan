@@ -491,8 +491,17 @@ partial class ChartView {
                     yCur = yCur + rowH;
                 } else {
                     xCur = xCur + cw + gap;
-                    bodyY = yCur + rowH + app.Scale(4);
+                    int legBottom = yCur + rowH;
+                    if (legBottom > bodyY) { bodyY = legBottom; }
                 }
+            }
+            // 顶部浮层图例让出一行饼体空间；贴底图例（LegendFloatTop
+            // 落到板底）不占几何——bodyY 记到板底会把全部外标钳到
+            // tyMax（pie-nest 曾因此整排标签压底）。图例中线在板上
+            // 半区才视为"顶部占位"。
+            if (bodyY > y + h / 2) { bodyY = top; }
+            if (o.showLegend && bodyY > top) {
+                bodyY = bodyY + app.Scale(4);
             }
         }
 
@@ -720,6 +729,8 @@ partial class ChartView {
         List<int> lbLn = new List<int>();
         List<int> lbDraw = new List<int>();
         List<string> lbTxt = new List<string>();
+        List<RichBlock> lbBlk = new List<RichBlock>();
+        List<int> lbH = new List<int>();
         if (anySliceLabels || anyNativeLabel) {
             int fsO = ChartFonts.SeriesLabel(app);
             int lh = Canvas.FontHeight(fsO) + app.Scale(2);
@@ -744,6 +755,12 @@ partial class ChartView {
                 if (sl.seriesIndex >= 0 && sl.seriesIndex < o.series.Count) {
                     slS = o.series[sl.seriesIndex];
                     lblStyle = slS.label;
+                    // data[i].label 覆盖系列级文本样式（pie-rich-text
+                    // 的逐扇区底板 + rich 表挂在这层）。
+                    if (sl.dataIndex >= 0 && sl.dataIndex < slS.data.Count
+                        && slS.data[sl.dataIndex].dlabel != null) {
+                        lblStyle = slS.data[sl.dataIndex].dlabel;
+                    }
                     if (slS.pieLabels) { showPct = true; }
                     // pieLabels 扩展优先：label.show 未声明时维持旧行为。
                     bool legacyForced = showPct && slS.labelShowT == 0 - 1;
@@ -754,6 +771,9 @@ partial class ChartView {
                 }
                 int lblColor = Chart.ContrastFg(sl.color);
                 if (lblStyle != null && lblStyle.color != 0) { lblColor = lblStyle.color; }
+                // 生效 rich 表（有才走富文本排版；否则剥壳纯文本）。
+                ChartTextStyle richSt = slS != null
+                    ? ChartView.PieSliceRichStyle(slS, sl) : null;
                 int lcx = geoX[ring];
                 int lcy = geoY[ring];
                 bool popL = sl.selected
@@ -779,10 +799,18 @@ partial class ChartView {
                         lxp = geoX[ring];
                         lyp = geoY[ring];
                     }
-                    string pl = ChartView.PieLabelFmt(slS, sl.name, sl.value, pct);
-                    int pw = Canvas.MeasureText(pl, fsO);
-                    c.DrawText(lxp - pw / 2, Canvas.CenterTextYAt(lyp, fsO),
-                        pl, lblColor, fsO);
+                    if (richSt != null) {
+                        string rawP = ChartView.PieSliceRaw(slS, sl, pct);
+                        RichBlock blk = ChartView.RichLayout(app,
+                            Chart.RichTokenize(rawP, richSt), richSt, fsO);
+                        ChartView.RichDraw(app, c, lxp - blk.w / 2,
+                            lyp - blk.h / 2, blk, lblColor);
+                    } else {
+                        string pl = ChartView.PieLabelFmt(slS, sl.name, sl.value, pct);
+                        int pw = Canvas.MeasureText(pl, fsO);
+                        c.DrawText(lxp - pw / 2, Canvas.CenterTextYAt(lyp, fsO),
+                            pl, lblColor, fsO);
+                    }
                 } else if (showPct && sl.a1 <= sweepMax && pct >= 4
                            && !outerLabel && !nativeIn && !nativeOut) {
                     int roLblMid = ChartView.PieSliceRo(geoRi[ring], geoRo[ring],
@@ -826,20 +854,25 @@ partial class ChartView {
                     int y2 = lcy + dirY * (geoRo[ring] + len1) / 1000;
                     bool rightSide = dirX >= 0;
                     int x3 = rightSide ? x2 + len2 : x2 - len2;
-                    int ed = 0;
+                    // 富文本块（有 rich 声明才排版）或剥壳纯文本；
+                    // 块宽/文本宽供 alignTo:'edge' 与文本锚共用。
+                    string rawO = slS != null
+                        ? ChartView.PieSliceRaw(slS, sl, pct) : sl.name;
+                    RichBlock blkO = null;
+                    string txt = rawO;
+                    if (richSt != null) {
+                        blkO = ChartView.RichLayout(app,
+                            Chart.RichTokenize(rawO, richSt), richSt, fsO);
+                        txt = ChartView.PieStripRich(rawO);
+                    }
+                    int tw2 = blkO != null ? blkO.w : Canvas.MeasureText(txt, fsO);
                     if (slS != null && slS.labelAlignTo == 2) {
-                        ed = slS.labelEdgeDist >= 0
+                        int ed = slS.labelEdgeDist >= 0
                             ? app.Scale(slS.labelEdgeDist)
                             : app.Scale((w - 2 * pad) * 25 / 100);
                         x3 = Chart.PieEdgeX3(rightSide, x + pad, w - 2 * pad,
-                            ed, Canvas.MeasureText(
-                                ChartView.PieLabelFmt(slS, sl.name, sl.value, pct),
-                                fsO), dist);
+                            ed, tw2, dist);
                     }
-                    string txt = slS != null
-                        ? ChartView.PieLabelFmt(slS, sl.name, sl.value, pct)
-                        : sl.name;
-                    int tw2 = Canvas.MeasureText(txt, fsO);
                     int txp = rightSide ? x3 + dist : x3 - dist - tw2;
                     if (slS != null && slS.labelAlignTo == 2) {
                         txp = rightSide ? x3 + dist - tw2 : x3 - dist - tw2;
@@ -855,11 +888,14 @@ partial class ChartView {
                     lbLn.Add(sl.color);
                     lbDraw.Add(draws ? 1 : 0);
                     lbTxt.Add(txt);
+                    lbBlk.Add(blkO);
+                    lbH.Add(blkO != null ? blkO.h : lh);
                 }
             }
             // 去重叠：每半球一列，按文本顶 y 插入排序后自上而下只推
             // 不拉（源码 lastPos 起 0、首项不推，等价）；整组越界面板
-            // 时平移回视口（源码 80% 挤压的近似）。
+            // 时平移回视口（源码 80% 挤压的近似）。富文本块按各自块
+            // 高计占（pie-rich-text 的 5 行标签）。
             for (int side = 0; side < 2; side = side + 1) {
                 List<int> idxs = new List<int>();
                 for (int q = 0; q < lbYc.Count; q = q + 1) {
@@ -878,15 +914,16 @@ partial class ChartView {
                 int lastPos = 0 - 2147483647 - 1;
                 for (int a = 0; a < idxs.Count; a = a + 1) {
                     int q = idxs[a];
-                    int top = lbYc[q] - lh / 2;
+                    int top = lbYc[q] - lbH[q] / 2;
                     if (lastPos > 0 - 2147483647 - 1 && top < lastPos) {
                         lbYc[q] = lbYc[q] + (lastPos - top);
                     }
-                    lastPos = lbYc[q] + lh / 2;
+                    lastPos = lbYc[q] + lbH[q] / 2;
                 }
                 if (idxs.Count > 0) {
-                    int top0 = lbYc[idxs[0]] - lh / 2;
-                    int bot0 = lbYc[idxs[idxs.Count - 1]] + lh / 2;
+                    int top0 = lbYc[idxs[0]] - lbH[idxs[0]] / 2;
+                    int bot0 = lbYc[idxs[idxs.Count - 1]]
+                        + lbH[idxs[idxs.Count - 1]] / 2;
                     int dy = 0;
                     if (top0 < bodyY) { dy = bodyY - top0; }
                     if (bot0 + dy > y + h - pad) { dy = y + h - pad - bot0; }
@@ -898,22 +935,31 @@ partial class ChartView {
                 }
             }
             // 绘制：引线 (x1,y1)→(x2,yF)→(x3,yF)，线宽 1、扇区色；
-            // 文本锚最终位。
+            // 文本锚最终位。富文本块整块贴锚绘制（块顶 = 锚 - 块高/2）。
             for (int q = 0; q < lbYc.Count; q = q + 1) {
                 if (lbDraw[q] == 1) {
                     c.DrawLine(lbX1[q], lbY1[q], lbX2[q], lbYc[q], lbLn[q], 1);
                     c.DrawLine(lbX2[q], lbYc[q], lbX3[q], lbYc[q], lbLn[q], 1);
                 }
-                int tyo = Canvas.CenterTextYAt(lbYc[q], fsO);
+                int tyo = lbBlk[q] != null
+                    ? lbYc[q] - lbBlk[q].h / 2
+                    : Canvas.CenterTextYAt(lbYc[q], fsO);
                 if (tyo < bodyY) { tyo = bodyY; }
-                int tyMax = y + h - pad - Canvas.FontHeight(fsO);
+                int blkH = lbBlk[q] != null ? lbBlk[q].h : Canvas.FontHeight(fsO);
+                int tyMax = y + h - pad - blkH;
                 if (tyo > tyMax) { tyo = tyMax; }
                 int txp = lbTx[q];
                 if (txp < x + pad) { txp = x + pad; }
-                if (txp + Canvas.MeasureText(lbTxt[q], fsO) > x + w - pad) {
-                    txp = x + w - pad - Canvas.MeasureText(lbTxt[q], fsO);
+                int twQ = lbBlk[q] != null ? lbBlk[q].w
+                    : Canvas.MeasureText(lbTxt[q], fsO);
+                if (txp + twQ > x + w - pad) {
+                    txp = x + w - pad - twQ;
                 }
-                c.DrawText(txp, tyo, lbTxt[q], lbColor[q], fsO);
+                if (lbBlk[q] != null) {
+                    ChartView.RichDraw(app, c, txp, tyo, lbBlk[q], lbColor[q]);
+                } else {
+                    c.DrawText(txp, tyo, lbTxt[q], lbColor[q], fsO);
+                }
             }
         }
 
@@ -1852,6 +1898,30 @@ c.DrawText(labelX, labelY, lblF, Style.Part(app, "chart",
     /// 整数（不带 %，官方写法 "{d}%"）；{@dim}=数据集维度原值（饼聚
     /// 合后行维度不可得，退化为值）。{style|content} 富文本包装剥壳
     /// 取内容（分色/底色的富文本排版本待富文本层，T4-2）。
+    /// 逐扇区生效的 rich 样式表：data[i].label 覆盖系列级 label；
+    /// 无 rich 声明返回 null（走剥壳纯文本路径）。
+    static ChartTextStyle PieSliceRichStyle(ChartSeries s, PieSlice sl) {
+        ChartTextStyle st = s.label;
+        if (sl.dataIndex >= 0 && sl.dataIndex < s.data.Count
+            && s.data[sl.dataIndex].dlabel != null) {
+            st = s.data[sl.dataIndex].dlabel;
+        }
+        if (st != null && st.rich != null) { return st; }
+        return null;
+    }
+
+    /// 逐扇区模板原始串（{a}{b}{c}{d}{@dim} 已展开、rich 壳保留）：
+    /// data[i].label.formatter 模板覆盖系列级；无模板返回名称。
+    static string PieSliceRaw(ChartSeries s, PieSlice sl, int pct) {
+        string fmt = s.labelFmt;
+        if (sl.dataIndex >= 0 && sl.dataIndex < s.data.Count
+            && s.data[sl.dataIndex].labelFmtT.Length > 0) {
+            fmt = s.data[sl.dataIndex].labelFmtT;
+        }
+        if (fmt.Length == 0) { return sl.name; }
+        return Chart.RichFmtRaw(s, fmt, sl.name, sl.value, pct);
+    }
+
     static string PieLabelFmt(ChartSeries s, string name, int val, int pct) {
         string f = s.labelFmt;
         if (f.Length == 0) { return name; }

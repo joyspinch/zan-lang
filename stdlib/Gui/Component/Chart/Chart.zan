@@ -1715,6 +1715,117 @@ class Chart {
         return (int)((v * 200 + tot) / (tot * 2));
     }
 
+    // ---- 富文本标签（ECharts label.rich + {style|content} 令牌） ----
+    // 源语义：官方"富文本标签"文档 + zrender rich 段排版——按 \n 分
+    // 行，行内 {name|content} 段用 rich.name 样式，行高 = 段声明
+    // lineHeight / height 或字号行盒的最大值，width:'100%' 随整块
+    // 宽。分词在 Chart（纯字符串，conformance 可测），量测/绘制在
+    // ChartView（要 App 缩放与 Canvas 度量）。
+
+    /// 展开模板令牌 {a}{b}{c}{d}{@dim}（**保留** {style|...} 壳——
+    /// 是否剥壳由调用方按有无 rich 样式表决定）。
+    static string RichFmtRaw(ChartSeries s, string fmt,
+                             string name, int val, int pct) {
+        string f = fmt;
+        if (f.Length == 0) { return name; }
+        f = f.Replace("{a}", s.name);
+        f = f.Replace("{b}", name);
+        f = f.Replace("{c}", Convert.ToString(val));
+        f = f.Replace("{d}", Convert.ToString(pct));
+        while (true) {
+            int at = f.IndexOf("{@");
+            if (at < 0) { break; }
+            int cb = f.IndexOf("}", at);
+            if (cb < 0) { break; }
+            f = f.Substring(0, at) + Convert.ToString(val) + f.Substring(cb + 1);
+        }
+        return f;
+    }
+
+    /// rich 样式表里按名取样式；没有返回 null。
+    static ChartRichStyle RichStyleOf(ChartTextStyle st, string nm) {
+        if (st == null || st.rich == null || nm.Length == 0) { return null; }
+        for (int i = 0; i < st.rich.Count; i = i + 1) {
+            if (st.rich[i].name == nm) { return st.rich[i]; }
+        }
+        return null;
+    }
+
+    /// 富文本分词：按 \n 分行（行号记 seg.line），{name|content} 段
+    /// 挂样式（查表挂 st 引用，纯文本段 st=null）。未知样式名按纯
+    /// 文本段处理但保留内容。返回扁平段表（顺序 = 阅读序）。
+    /// 约定：空段（{hr|}）text = ""，调用方靠 width/borderWidth 识别
+    /// 线块。
+    static List<RichSeg> RichTokenize(string f, ChartTextStyle st) {
+        List<RichSeg> outSegs = new List<RichSeg>();
+        int line = 0;
+        int i = 0;
+        int segLineStart = 0;
+        bool lineHasSeg = false;
+        while (i < f.Length) {
+            char ch = f.Substring(i, 1)[0];
+            if (ch == '\n') {
+                // 行尾文本（非空）或整行空行——空行也要占行号。
+                if (i > segLineStart || !lineHasSeg) {
+                    RichSeg done = new RichSeg();
+                    done.text = f.Substring(segLineStart, i - segLineStart);
+                    done.line = line;
+                    done.st = null;
+                    outSegs.Add(done);
+                }
+                line = line + 1;
+                i = i + 1;
+                segLineStart = i;
+                lineHasSeg = false;
+                continue;
+            }
+            if (ch == '{') {
+                int cb = f.IndexOf("}", i);
+                if (cb >= 0) {
+                    int bar = f.IndexOf("|", i);
+                    if (bar >= 0 && bar < cb) {
+                        // 段前的行首文本（若非空）先行进表。
+                        if (i > segLineStart) {
+                            RichSeg pre = new RichSeg();
+                            pre.text = f.Substring(segLineStart, i - segLineStart);
+                            pre.line = line;
+                            pre.st = null;
+                            outSegs.Add(pre);
+                            lineHasSeg = true;
+                        }
+                        RichSeg sg = new RichSeg();
+                        sg.st = Chart.RichStyleOf(st,
+                            f.Substring(i + 1, bar - i - 1));
+                        sg.text = f.Substring(bar + 1, cb - bar - 1);
+                        sg.line = line;
+                        outSegs.Add(sg);
+                        lineHasSeg = true;
+                        i = cb + 1;
+                        segLineStart = i;
+                        continue;
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        if (segLineStart < f.Length || !lineHasSeg || outSegs.Count == 0) {
+            RichSeg last = new RichSeg();
+            last.text = f.Substring(segLineStart);
+            last.line = line;
+            last.st = null;
+            outSegs.Add(last);
+        }
+        return outSegs;
+    }
+
+    /// 段盒高贡献：声明 height 用 height，否则行盒 fontH；均加纵向
+    /// padding（负 padding 官方允许——gauge-speed 的 [0,0,-20,10]，
+    /// 结果可为负，排版时按 max(1, ·) 兜底）。
+    static int RichSegH(int declaredH, int fontH, int padT, int padB) {
+        int h = declaredH >= 0 ? declaredH : fontH;
+        return h + padT + padB;
+    }
+
     /// 仅索引窗口 [i0,i1]（含端点）内的最大值，供 dataZoom
     /// 的索引视图使用（渲染循环直接读原系列，不做有损克隆）。
     static int MaxOfWindow(List<ChartSeries> series, int i0, int i1) {

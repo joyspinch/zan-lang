@@ -159,6 +159,13 @@ class ChartData {
                       //   1 = 左、2 = 右（bar8 正负交错标签）
     bool labelHide;   // ECharts data[i].label.show=false：graph 节点标签
                       //   逐点隐藏（les-miserables 仅 5 个枢纽节点显标）
+    string labelFmtT; // ECharts data[i].label.formatter **模板**（含 {a}{b}
+                      //   {c}{d} 或 rich 标记，pie-rich-text 的 {title|{b}}
+                      //   多行底板标签）；"" = 跟随系列模板。与 labelText
+                      //   区分：那是无令牌的成品文本（bar10 两系列之和）。
+    ChartTextStyle dlabel; // ECharts data[i].label 完整文本样式（color/
+                      //   fontSize/rich/盒底板），非 null 时饼标签按它
+                      //   渲染（覆盖系列级 label）；null = 跟随系列。
     bool hasCat;      // graph 节点声明了 category（下文 cat 生效）
     int cat;          // graph 节点类别下标（颜色 = 类别调色板）
     ChartItemStyle itemStyle; // ECharts data 项逐根 itemStyle（bar-data-color
@@ -185,6 +192,8 @@ class ChartData {
         d.symbol = "";
         d.labelText = "";
         d.labelSide = 0;
+        d.labelFmtT = "";
+        d.dlabel = null;
         d.calDay = 0 - 1;
         return d;
     }
@@ -241,6 +250,9 @@ class ChartData {
         d.selected = src.selected; d.size = src.size; d.sizeSet = src.sizeSet;
         d.gap = src.gap; d.symbol = src.symbol;
         d.labelText = src.labelText; d.labelSide = src.labelSide;
+        d.labelFmtT = src.labelFmtT;
+        d.dlabel = ChartTextStyle.Clone(src.dlabel);
+        d.labelHide = src.labelHide;
         d.calDay = src.calDay;
         d.itemStyle = ChartItemStyle.Clone(src.itemStyle);
         return d;
@@ -846,7 +858,66 @@ class ChartPosition {
     }
 }
 
+/// 富文本单样式（ECharts label.rich.<name>，官方文档"富文本标签"；
+/// 存储按声明序的 name→样式 对——JsonValue 对象键序即声明序）。
+/// 数值字段 -1 = 未声明；color 0 = 跟随外层标签色。
+/// backgroundColor:{image:...} 素材在 Zan 不可得：bgIsImage=1 只保留
+/// width/height 占位（行高/盒宽不塌），不绘制底图。
+class ChartRichStyle {
+    string name;
+    int color;
+    int fontSize;
+    string fontWeight;
+    string fontFamily;
+    int align;         // 0 left / 1 center / 2 right；-1 未声明（左）
+    int lineHeight;
+    int backgroundColor;
+    int bgIsImage;
+    int borderColor;
+    int borderWidth;   // 官方可 0.5（pie-rich-text/treemap hr）：四舍五入存 px
+    int radTL;         // borderRadius：数字 = 四角同值；数组 [左上,右上,
+    int radTR;         //   右下,左下]（pie-rich-text abg 的 [4,4,0,0] 只
+    int radBR;         //   圆上面两角）。-1 未声明。
+    int radBL;
+    int padT;
+    int padR;
+    int padB;
+    int padL;
+    int width;         // -2 = '100%'（随富文本整块宽）；≥0 像素
+    int height;
+
+    /// 构造默认：全未声明。
+    static ChartRichStyle Create() {
+        ChartRichStyle r = new ChartRichStyle();
+        r.name = "";
+        r.color = 0;
+        r.fontSize = 0 - 1;
+        r.fontWeight = "";
+        r.fontFamily = "";
+        r.align = 0 - 1;
+        r.lineHeight = 0 - 1;
+        r.backgroundColor = 0;
+        r.bgIsImage = 0;
+        r.borderColor = 0;
+        r.borderWidth = 0 - 1;
+        r.radTL = 0 - 1;
+        r.radTR = 0 - 1;
+        r.radBR = 0 - 1;
+        r.radBL = 0 - 1;
+        r.padT = 0 - 1;
+        r.padR = 0 - 1;
+        r.padB = 0 - 1;
+        r.padL = 0 - 1;
+        r.width = 0 - 1;
+        r.height = 0 - 1;
+        return r;
+    }
+}
+
 /// 文本样式（颜色、字号、字体族、阴影），JSON 可逐字段覆盖。
+/// 另承载 ECharts label 的整块盒样式（backgroundColor/border/padding，
+/// pie-rich-text 的 data.label 底板）与 label.rich 富文本样式表；
+/// rich 非 null 即声明过富文本（可为空表——`rich:{}` 合法）。
 class ChartTextStyle {
     int color;
     int fontSize;
@@ -855,23 +926,121 @@ class ChartTextStyle {
     string fontFamily;
     int shadowColor;
     int shadowBlur;
+    List<ChartRichStyle> rich;
+    int boxBg;      // label.backgroundColor（整块底板）；0 = 无
+    int boxBorder;  // label.borderColor；0 = 无
+    int boxBorderW; // label.borderWidth；-1 未声明
+    int boxRadius;  // label.borderRadius；-1 未声明
+    int padT;       // label.padding；-1 未声明
+    int padR;
+    int padB;
+    int padL;
 
     /// 构造默认样式：颜色 0（跟随主题）、字号 0（渲染器缺省）。
     static ChartTextStyle Create() {
-        return new ChartTextStyle {
+        ChartTextStyle s = new ChartTextStyle {
             color = 0, fontSize = 0, fontStyle = "normal", fontWeight = "normal",
             fontFamily = "", shadowColor = 0, shadowBlur = 0
         };
+        s.rich = null;
+        s.boxBg = 0;
+        s.boxBorder = 0;
+        s.boxBorderW = 0 - 1;
+        s.boxRadius = 0 - 1;
+        s.padT = 0 - 1;
+        s.padR = 0 - 1;
+        s.padB = 0 - 1;
+        s.padL = 0 - 1;
+        return s;
     }
 
     /// 深复制；src 为 null 时返回 null。
     static ChartTextStyle Clone(ChartTextStyle src) {
         if (src == null) { return null; }
-        return new ChartTextStyle { color = src.color, fontSize = src.fontSize,
+        ChartTextStyle s = new ChartTextStyle { color = src.color, fontSize = src.fontSize,
             fontStyle = src.fontStyle, fontWeight = src.fontWeight,
             fontFamily = src.fontFamily, shadowColor = src.shadowColor,
             shadowBlur = src.shadowBlur };
+        s.boxBg = src.boxBg;
+        s.boxBorder = src.boxBorder;
+        s.boxBorderW = src.boxBorderW;
+        s.boxRadius = src.boxRadius;
+        s.padT = src.padT;
+        s.padR = src.padR;
+        s.padB = src.padB;
+        s.padL = src.padL;
+        if (src.rich != null) {
+            s.rich = new List<ChartRichStyle>();
+            for (int i = 0; i < src.rich.Count; i = i + 1) {
+                ChartRichStyle a = src.rich[i];
+                ChartRichStyle b = new ChartRichStyle();
+                b.name = a.name;
+                b.color = a.color;
+                b.fontSize = a.fontSize;
+                b.fontWeight = a.fontWeight;
+                b.fontFamily = a.fontFamily;
+                b.align = a.align;
+                b.lineHeight = a.lineHeight;
+                b.backgroundColor = a.backgroundColor;
+                b.bgIsImage = a.bgIsImage;
+                b.borderColor = a.borderColor;
+                b.borderWidth = a.borderWidth;
+                b.radTL = a.radTL;
+                b.radTR = a.radTR;
+                b.radBR = a.radBR;
+                b.radBL = a.radBL;
+                b.padT = a.padT;
+                b.padR = a.padR;
+                b.padB = a.padB;
+                b.padL = a.padL;
+                b.width = a.width;
+                b.height = a.height;
+                s.rich.Add(b);
+            }
+        }
+        return s;
     }
+}
+
+/// 富文本段（Chart.RichTokenize 产出；ChartView.RichLayout 填排版
+/// 结果）。x/y/w/h 是段盒（含 padding，px）；lh 为所在行行高；
+/// fsPx/tw 是解析像素字号与文本净宽。
+class RichSeg {
+    string text;
+    int line;          // 行号 0..
+    ChartRichStyle st; // null = 纯文本段
+    int x;
+    int y;
+    int w;
+    int h;
+    int fsPx;
+    int tw;
+    int lh;
+
+    static RichSeg Create() {
+        RichSeg s = new RichSeg();
+        s.text = "";
+        s.line = 0;
+        s.st = null;
+        s.x = 0;
+        s.y = 0;
+        s.w = 0;
+        s.h = 0;
+        s.fsPx = 0;
+        s.tw = 0;
+        s.lh = 0;
+        return s;
+    }
+}
+
+/// 富文本整块（ChartView.RichLayout 产出）：段表 + 块盒（含外层
+/// label.padding）+ 行数；st 为生效样式表（绘制底板用）。
+class RichBlock {
+    List<RichSeg> segs;
+    ChartTextStyle st;
+    int w;
+    int h;
+    int lines;
 }
 
 /// 线样式：颜色、线宽、线型（"solid"/"dashed"/"dotted"）与阴影。
@@ -3073,6 +3242,130 @@ class ChartOption {
         text.fontFamily = v.Str("fontFamily", text.fontFamily);
         if (v.Has("shadowColor")) { text.shadowColor = ChartOption.ParseColor(v.Get("shadowColor"), text.shadowColor); }
         text.shadowBlur = v.Int("shadowBlur", text.shadowBlur);
+        // 整块盒样式（label.backgroundColor/border/padding，官方 label
+        // 文档同名列；pie-rich-text 的 data.label 底板走这里）。
+        JsonValue bg = v.Get("backgroundColor");
+        if (bg != null) {
+            if (bg.IsObject()) {
+                // {image:...}：素材不可得，仅盒样式占位。
+                text.boxBg = 0 - 1;
+            } else {
+                text.boxBg = ChartOption.ParseColor(bg, 0);
+            }
+        }
+        if (v.Has("borderColor")) { text.boxBorder = ChartOption.ParseColor(v.Get("borderColor"), text.boxBorder); }
+        JsonValue bw = v.Get("borderWidth");
+        if (bw != null && bw.IsNumber()) {
+            text.boxBorderW = ChartOption.RoundOff(bw.AsDouble(0.0));
+        }
+        JsonValue br = v.Get("borderRadius");
+        if (br != null) {
+            if (br.IsArray() && br.Count() > 0) { br = br.At(0); }
+            if (br.IsNumber()) { text.boxRadius = ChartOption.RoundOff(br.AsDouble(0.0)); }
+        }
+        ChartOption.ParsePaddingInto(v.Get("padding"), text, null);
+        // label.rich：对象键序 = 声明序（JsonValue keys 保序）。
+        JsonValue rv = v.Get("rich");
+        if (rv != null && rv.IsObject()) {
+            text.rich = new List<ChartRichStyle>();
+            for (int i = 0; i < rv.keys.Count; i = i + 1) {
+                ChartRichStyle rs = ChartRichStyle.Create();
+                rs.name = rv.keys[i];
+                ChartOption.ParseRichStyle(rv.vals[i], rs);
+                text.rich.Add(rs);
+            }
+        }
+    }
+
+    /// padding：number → 四边；[v,h] → 纵横；[t,r,b,l] → 逐边。
+    /// 写入 text（非 null）或 rs（非 null）的 pad 四字段。负值合法
+    /// （gauge-speed 的 [0,0,-20,10]），按四舍五入（远离零）取整。
+    static void ParsePaddingInto(JsonValue pv, ChartTextStyle text, ChartRichStyle rs) {
+        int t = 0 - 1;
+        int r = 0 - 1;
+        int b = 0 - 1;
+        int l = 0 - 1;
+        if (pv != null && pv.IsNumber()) {
+            int n = ChartOption.RoundOff(pv.AsDouble(0.0));
+            t = n; r = n; b = n; l = n;
+        } else if (pv != null && pv.IsArray()) {
+            int c = pv.Count();
+            if (c == 1) {
+                int n1 = ChartOption.RoundOff(pv.At(0).AsDouble(0.0));
+                t = n1; r = n1; b = n1; l = n1;
+            } else if (c == 2) {
+                t = ChartOption.RoundOff(pv.At(0).AsDouble(0.0));
+                b = t;
+                r = ChartOption.RoundOff(pv.At(1).AsDouble(0.0));
+                l = r;
+            } else if (c >= 4) {
+                t = ChartOption.RoundOff(pv.At(0).AsDouble(0.0));
+                r = ChartOption.RoundOff(pv.At(1).AsDouble(0.0));
+                b = ChartOption.RoundOff(pv.At(2).AsDouble(0.0));
+                l = ChartOption.RoundOff(pv.At(3).AsDouble(0.0));
+            }
+        }
+        if (text != null) { text.padT = t; text.padR = r; text.padB = b; text.padL = l; }
+        if (rs != null) { rs.padT = t; rs.padR = r; rs.padB = b; rs.padL = l; }
+    }
+
+    /// double 四舍五入（负域远离零；C 的 (int) 截断朝零，-19.5 会
+    /// 变 -19——gauge-speed 的 -20 padding 需要真正的 round）。
+    static int RoundOff(double d) {
+        if (d >= 0.0) { return (int)(d + 0.5); }
+        return (int)(d - 0.5);
+    }
+
+    /// rich.<name> 单样式（官方"富文本标签"文档样式键；fontWeight
+    /// 官方也接受数字 800，gauge-car 用到）。
+    static void ParseRichStyle(JsonValue v, ChartRichStyle rs) {
+        if (v == null || !v.IsObject()) { return; }
+        if (v.Has("color")) { rs.color = ChartOption.ParseColor(v.Get("color"), rs.color); }
+        JsonValue fs = v.Get("fontSize");
+        if (fs != null && fs.IsNumber()) { rs.fontSize = fs.AsInt(rs.fontSize); }
+        JsonValue fw = v.Get("fontWeight");
+        if (fw != null) {
+            if (fw.IsString()) { rs.fontWeight = fw.AsString(rs.fontWeight); }
+            else if (fw.IsNumber()) { rs.fontWeight = Convert.ToString(fw.AsInt(0)); }
+        }
+        rs.fontFamily = v.Str("fontFamily", rs.fontFamily);
+        string al = v.Str("align", "");
+        if (al == "left") { rs.align = 0; }
+        else if (al == "center") { rs.align = 1; }
+        else if (al == "right") { rs.align = 2; }
+        rs.lineHeight = v.Int("lineHeight", rs.lineHeight);
+        JsonValue bg = v.Get("backgroundColor");
+        if (bg != null) {
+            if (bg.IsObject()) { rs.bgIsImage = 1; }
+            else { rs.backgroundColor = ChartOption.ParseColor(bg, rs.backgroundColor); }
+        }
+        if (v.Has("borderColor")) { rs.borderColor = ChartOption.ParseColor(v.Get("borderColor"), rs.borderColor); }
+        JsonValue bw = v.Get("borderWidth");
+        if (bw != null && bw.IsNumber()) {
+            rs.borderWidth = ChartOption.RoundOff(bw.AsDouble(0.0));
+        }
+        JsonValue br = v.Get("borderRadius");
+        if (br != null) {
+            if (br.IsArray() && br.Count() >= 4) {
+                rs.radTL = ChartOption.RoundOff(br.At(0).AsDouble(0.0));
+                rs.radTR = ChartOption.RoundOff(br.At(1).AsDouble(0.0));
+                rs.radBR = ChartOption.RoundOff(br.At(2).AsDouble(0.0));
+                rs.radBL = ChartOption.RoundOff(br.At(3).AsDouble(0.0));
+            } else if (br.IsArray() && br.Count() > 0) {
+                int r0 = ChartOption.RoundOff(br.At(0).AsDouble(0.0));
+                rs.radTL = r0; rs.radTR = r0; rs.radBR = r0; rs.radBL = r0;
+            } else if (br.IsNumber()) {
+                int rn = ChartOption.RoundOff(br.AsDouble(0.0));
+                rs.radTL = rn; rs.radTR = rn; rs.radBR = rn; rs.radBL = rn;
+            }
+        }
+        JsonValue wd = v.Get("width");
+        if (wd != null) {
+            if (wd.IsNumber()) { rs.width = wd.AsInt(rs.width); }
+            else if (wd.IsString() && wd.AsString("") == "100%") { rs.width = 0 - 2; }
+        }
+        rs.height = v.Int("height", rs.height);
+        ChartOption.ParsePaddingInto(v.Get("padding"), null, rs);
     }
 
     /// 把 JSON lineStyle 逐字段并入 line（color/color0 不接受数组形式）。
@@ -3312,6 +3605,9 @@ class ChartOption {
                 s.labelShowT = label.Bool("show", false) ? 1 : 0;
                 s.labelShow = s.labelShowT == 1;
             }
+            // 系列级模板（{a}{b}{c}{d} / rich 壳），饼与柱标共用；
+            // 一直缺失，此前声明 formatter 的标签全部按缺省文本渲染。
+            s.labelFmt = label.Str("formatter", s.labelFmt);
             s.pieLabels = label.Bool("pieLabels", s.pieLabels);
             string lpos = label.Str("position", "");
             if (lpos.Length > 0) { s.labelPos = lpos; }
@@ -5498,14 +5794,28 @@ class ChartOption {
                                 }
                             }
                             // 逐项 label：position 覆盖（左/右记 labelSide，
-                            // 与 bar8 同一承载），字符串 formatter 进 labelText。
+                            // 与 bar8 同一承载），字符串 formatter 进 labelText；
+                            // 模板语义（含 {} 令牌）另存 labelFmtT（饼逐扇
+                            // 区模板，pie-rich-text），完整样式进 dlabel。
                             JsonValue lbl = it.Get("label");
                             if (lbl != null && lbl.IsObject()) {
                                 string pos = lbl.Str("position", "");
                                 if (pos == "left" || pos == "insideLeft") { item.labelSide = 1; }
                                 else if (pos == "right" || pos == "insideRight") { item.labelSide = 2; }
+                                JsonValue lsh = lbl.Get("show");
+                                if (lsh != null && lsh.IsBool()) { item.labelHide = !lsh.AsBool(false); }
                                 JsonValue lf = lbl.Get("formatter");
-                                if (lf != null && lf.IsString()) { item.labelText = lf.AsString(""); }
+                                if (lf != null && lf.IsString()) {
+                                    item.labelText = lf.AsString("");
+                                    item.labelFmtT = item.labelText;
+                                }
+                                ChartTextStyle dts = ChartTextStyle.Create();
+                                ChartOption.ParseTextStyle(lbl, dts);
+                                if (dts.color != 0 || dts.fontSize != 0
+                                    || dts.rich != null || dts.boxBg != 0
+                                    || dts.boxBorder != 0) {
+                                    item.dlabel = dts;
+                                }
                             }
                             cs.data.Add(item);
                         } else if (it.IsNumber()) {

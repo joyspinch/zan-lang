@@ -466,3 +466,42 @@ ECharts line 的平滑算法不是「单调 Hermite / Cardinal / Catmull-Rom」�
 **已验证 commit**：
 - `ec24a91b` 修复了 Y-extent（dataZoom 窗口）、axisLabel.margin、
   time-axis `points.x` 去定点。**不**碰 smooth 算法。
+
+## 富文本（label.rich）语义与实现坑（T4-2 slice1，全部 SSR 解码/实机踩出）
+
+语义权威不是想象，是官方 SSR 的 SVG（`_scratch/chart_oracle/rich_nest.svg`）。
+关键定则，每条都踩过坑：
+
+1. **盒高 = 各行声明 lineHeight 之和，hr 不回落字体高**。pie-nest 官方
+   盒高 55 = 22 + 0 + 33——`height:0` 的 hr 段贡献 0，**没有**
+   "高度 0 就用字体高兜底"的逻辑。想当然兜底会多出一条空行高。
+   文本在行内垂直居中（dominant-baseline central 于行中心）。
+2. **align 是"整行内容跑位"，不是"该段自己变宽"**。无 width 且声明
+   align 的段 → 该行全部内容在块内平移（pie-nest 标题居中：61 宽块和
+   140 宽块都是内容中心对块中心）。把这种段"拉伸到块宽"会把表头
+   （Weather|Days|Percent）挤出块外——踩过。
+3. **percent/`width:'100%'` 段是覆盖层**：不进 contentW，永远锚在行
+   x=0（pie-nest 的 abg 暗带从块左缘铺满，锚到 xShift 会右溢——踩过）。
+4. **padding 在 width 之外**：zrender 段盒 = width + 水平 padding
+   （pie-rich-text 值列 width:20 + padding:[0,20,0,30] → 实宽 70）。
+   只按 width 画 → 值压进百分号（"202"叠"55.3%"——踩过）。
+5. **两遍绘制**：先全部段背景（含 borderRadius 四角掩码
+   `Corner.TL()|TR()|BR()|BL()`，mask==All 用 FillRoundRect），再全部
+   文本——否则前景段的背景盖住上一段文字。
+6. **分词器**：`\n` 后的尾随空文本段不发射，但**整行无任何段时**要发
+   一个空段占行号（空行占高）；未知样式名 `{zz|x}` 按纯文本原样保留。
+   换行把 `{name|…}` 的 name 段与下一段分行。
+7. **新增 ChartTextStyle 字段必须扩展 `ChartResolved.Materialize`**：
+   它 new 一个新 ChartTextStyle 逐字段搬旧值——rich/box/pad 忘搬时
+   解析探针全对、实机标签整体消失（rich=0），排查烧了一轮。下一个
+   给 label 加字段的人还会踩：加字段后 grep Materialize。
+8. **饼图 bodyY 别被底部图例钳死**：图例循环逐项把 bodyY 推到图例底，
+   底部浮层图例（ECharts 图例是浮层不占几何）会把全部外圈标签 clamp
+   到面板底挤成一行（pie-nest 首次实机就是这样）。修法：图例外层
+   `if (bodyY > y + h/2) { bodyY = top; }`——只有图例在上半板才占几何。
+9. **负 padding 取整要远离零**：`(int)(-20.0+0.5)` = -19（C 向零截断），
+   gauge-speed 的 padding:[0,0,-20,10] 需要 RoundOff(d) = d>=0 ?
+   (int)(d+0.5) : (int)(d-0.5)。borderWidth/borderRadius 同理。
+10. **单点解析**：rich/盒样式只在 `ParseTextStyle` 解析一次，
+    series.label / data[i].label / 以后的 axisLabel、markPoint.label、
+    gauge detail 都汇到这一处，别各自开分支。

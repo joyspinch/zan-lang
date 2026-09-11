@@ -937,6 +937,10 @@ partial class ChartView {
                 + cs.labelAlignTo * 19) % 2000000000;
             h = ChartView.FoldStr(h, cs.labelPos, 48);
             h = ChartView.FoldStr(h, cs.labelFmt, 49);
+            // 富文本声明改标签排版（块高进去重叠），入指纹。
+            if (cs.label != null && cs.label.rich != null) {
+                h = (h * 31 + 23) % 2000000000;
+            }
             if (rs.hidden) { h = (h * 31 + 7) % 2000000000; }
             for (int v = 0; v < cs.Count(); v = v + 1) {
                 h = (h * 31 + cs.Value(v)) % 2000000000;
@@ -1559,6 +1563,227 @@ partial class ChartView {
                 int fcx = x + ChartView.GaugeScalar(app, s.center.x, w);
                 ChartView.DrawFunnel(app, fcx - fw / 2, y, fw, h, tmp, g,
                     s.sort == "ascending");
+            }
+        }
+    }
+
+    // ---- 富文本排版与绘制（Chart.RichTokenize 的下游） ----
+
+    /// 量测排版：段表 → 整块盒（含外层 label.padding）。语义按官方
+    /// SSR 实测钉死（pie-nest：盒高 55 = 22+0+33）：
+    ///  - 行高 = 各段 max(声明 lineHeight, 声明 height + 纵 padding,
+    ///    字号行盒 + 纵 padding)；整行无任何声明才回退缺省行盒
+    ///    （hr 的 height:0 行高就是 0，不吃回退）。
+    ///  - 段盒在行内垂直居中（饼名/横线/数值三行的文本中线 = 行中线）。
+    ///  - width:'100%' → 全块宽，x 归行首（pie-rich-text 的 abg 底板
+    ///    同行共享：{title|..}{abg|} 底板盖整行、标题文字压在其上）。
+    ///  - 声明 width 的段：盒 = width + 横向 padding（padding 在外），
+    ///    align 在盒内排文字（表格列）。
+    ///  - 未声明 width 的 align 段：整行内容在块宽内对齐（左/中/右，
+    ///    取行内第一个这类段的 align；pie-nest a 居中：两标签块宽
+    ///    61/140，内容整体中线都是块中线）。
+    ///  - 绘制见 RichDraw：底色全部先画（abg 底板压在同行文字下）。
+    static RichBlock RichLayout(App app, List<RichSeg> segs,
+                                ChartTextStyle st, int defFs) {
+        RichBlock b = new RichBlock();
+        b.segs = segs;
+        b.st = st;
+        b.lines = 0;
+        int padT = 0;
+        int padR = 0;
+        int padB = 0;
+        int padL = 0;
+        if (st != null) {
+            if (st.padT >= 0) { padT = app.Scale(st.padT); }
+            if (st.padR >= 0) { padR = app.Scale(st.padR); }
+            if (st.padB >= 0) { padB = app.Scale(st.padB); }
+            if (st.padL >= 0) { padL = app.Scale(st.padL); }
+        }
+        for (int i = 0; i < segs.Count; i = i + 1) {
+            RichSeg sg = segs[i];
+            sg.fsPx = sg.st != null && sg.st.fontSize > 0
+                ? app.Scale(sg.st.fontSize) : defFs;
+            sg.tw = Canvas.MeasureText(sg.text, sg.fsPx);
+            int padL2 = sg.st != null && sg.st.padL >= 0 ? app.Scale(sg.st.padL) : 0;
+            int padR2 = sg.st != null && sg.st.padR >= 0 ? app.Scale(sg.st.padR) : 0;
+            if (sg.st != null && sg.st.width >= 0) {
+                // 官方 width 是内容宽，padding 加在外面（zrender token
+                // 盒 = width + 横向 padding；pie-rich-text 的 value 列
+                // width:20 + padding [0,20,0,30]）。
+                sg.w = app.Scale(sg.st.width) + padL2 + padR2;
+            } else if (sg.st != null && sg.st.width == 0 - 2) {
+                sg.w = 0 - 1;   // '100%'，第二趟展开
+            } else {
+                sg.w = sg.tw + padL2 + padR2;
+            }
+            if (sg.line + 1 > b.lines) { b.lines = sg.line + 1; }
+        }
+        // 第一趟：自然宽（百分比/撑满段计 0）定块宽。
+        int blockW = 0;
+        List<int> lineW = new List<int>();
+        for (int i = 0; i < b.lines; i = i + 1) { lineW.Add(0); }
+        for (int i = 0; i < segs.Count; i = i + 1) {
+            RichSeg sg = segs[i];
+            if (sg.w >= 0) { lineW[sg.line] = lineW[sg.line] + sg.w; }
+        }
+        for (int i = 0; i < b.lines; i = i + 1) {
+            if (lineW[i] > blockW) { blockW = lineW[i]; }
+        }
+        if (blockW <= 0) { blockW = 1; }
+        // 第二趟：'100%' 展开为全块宽。
+        for (int i = 0; i < segs.Count; i = i + 1) {
+            RichSeg sg = segs[i];
+            if (sg.w == 0 - 1) { sg.w = blockW; }
+        }
+        // 行高累计 + 段位：x 逐段累计（百分比段 x 归零），段盒在行内
+        // 垂直居中。
+        int yCur = 0;
+        int segI = 0;
+        while (segI < segs.Count) {
+            int ln = segs[segI].line;
+            int lhLine = 0;
+            bool declared = false;
+            int j = segI;
+            while (j < segs.Count && segs[j].line == ln) {
+                RichSeg sg = segs[j];
+                int hDecl = sg.st != null && sg.st.height >= 0
+                    ? sg.st.height : 0 - 1;
+                int lhDecl = sg.st != null && sg.st.lineHeight >= 0
+                    ? sg.st.lineHeight : 0 - 1;
+                if (hDecl >= 0 || lhDecl >= 0) { declared = true; }
+                int padT2 = sg.st != null && sg.st.padT >= 0 ? app.Scale(sg.st.padT) : 0;
+                int padB2 = sg.st != null && sg.st.padB >= 0 ? app.Scale(sg.st.padB) : 0;
+                int hh = Chart.RichSegH(hDecl, Canvas.FontHeight(sg.fsPx),
+                    padT2, padB2);
+                if (lhDecl >= 0) {
+                    int lhD = app.Scale(lhDecl);
+                    if (lhD > lhLine) { lhLine = lhD; }
+                }
+                if (hh > lhLine) { lhLine = hh; }
+                sg.h = hh;
+                j = j + 1;
+            }
+            if (lhLine <= 0 && !declared) { lhLine = Canvas.FontHeight(defFs); }
+            // 行内容整体在块内对齐：行内第一个"声明了 align 且未声明
+            // width"的段决定对齐（SSR 实测 pie-nest：'a' 居中时两标签
+            // 块宽 61/140，内容整体中线都落块中线；pie-rich-text 表头
+            // 的 valueHead 有 width，align 只在盒内生效不触发行对齐）。
+            int contentW = 0;
+            int lineAlign = 0 - 1;
+            for (int k = segI; k < j; k = k + 1) {
+                RichSeg sg = segs[k];
+                // '100%' 底板是覆盖层不算行内容（title|abg 同行时
+                // contentW 只算文字，标题才能在底板上居中）。
+                if (!(sg.w == blockW && sg.st != null
+                      && sg.st.width == 0 - 2)) {
+                    contentW = contentW + sg.w;
+                }
+                if (lineAlign < 0 && sg.st != null && sg.st.align >= 0
+                    && sg.st.width < 0) {
+                    lineAlign = sg.st.align;
+                }
+            }
+            int xShift = 0;
+            if (lineAlign == 1) { xShift = (blockW - contentW) / 2; }
+            else if (lineAlign == 2) { xShift = blockW - contentW; }
+            if (xShift < 0) { xShift = 0; }
+            int xCur = 0;
+            for (int k = segI; k < j; k = k + 1) {
+                RichSeg sg = segs[k];
+                sg.x = xCur + xShift;
+                sg.y = yCur + (lhLine - sg.h) / 2;
+                sg.lh = lhLine;
+                if (sg.w == blockW && sg.st != null && sg.st.width == 0 - 2) {
+                    sg.x = 0;   // '100%' 底板恒从行首铺到块尾（不随行对齐）
+                } else {
+                    xCur = xCur + sg.w;
+                }
+            }
+            yCur = yCur + lhLine;
+            segI = j;
+        }
+        b.w = blockW + padL + padR;
+        b.h = yCur + padT + padB;
+        // 外层 padding 位移进段坐标（绘制端直接加块原点）。
+        for (int i = 0; i < segs.Count; i = i + 1) {
+            segs[i].x = segs[i].x + padL;
+            segs[i].y = segs[i].y + padT;
+        }
+        return b;
+    }
+
+    /// 绘制富文本块：整块底板（boxBg/border/圆角）→ 全部段底色片
+    /// 与线块 → 全部文字（两趟：abg 这类同行底板必须压在同行文字
+    /// 之下——zrender 段底色先于本段文字，但跨段的 title|abg 需要底
+    /// 在所有文字下）。文字垂直居中在段盒内。
+    static void RichDraw(App app, Canvas c, int ox, int oy, RichBlock b,
+                         int defCol) {
+        ChartTextStyle st = b.st;
+        if (st != null && st.boxBg != 0 && b.w > 0 && b.h > 0) {
+            int rad = st.boxRadius > 0 ? app.Scale(st.boxRadius) : 0;
+            c.FillRoundRect(ox, oy, b.w, b.h, rad, st.boxBg);
+        }
+        if (st != null && st.boxBorder != 0 && st.boxBorderW > 0
+            && b.w > 0 && b.h > 0) {
+            int rad = st.boxRadius > 0 ? app.Scale(st.boxRadius) : 0;
+            c.DrawRoundRect(ox, oy, b.w, b.h, rad, st.boxBorder,
+                st.boxBorderW);
+        }
+        for (int i = 0; i < b.segs.Count; i = i + 1) {
+            RichSeg sg = b.segs[i];
+            ChartRichStyle rs = sg.st;
+            int sx = ox + sg.x;
+            int sy = oy + sg.y;
+            if (rs == null) { continue; }
+            if (rs.backgroundColor != 0 && sg.w > 0 && sg.h > 0) {
+                int mask = (rs.radTL > 0 ? Corner.TL() : 0)
+                    | (rs.radTR > 0 ? Corner.TR() : 0)
+                    | (rs.radBR > 0 ? Corner.BR() : 0)
+                    | (rs.radBL > 0 ? Corner.BL() : 0);
+                int rad = rs.radTL > 0 ? app.Scale(rs.radTL)
+                    : (rs.radTR > 0 ? app.Scale(rs.radTR)
+                       : (rs.radBR > 0 ? app.Scale(rs.radBR)
+                          : (rs.radBL > 0 ? app.Scale(rs.radBL) : 0)));
+                if (mask == Corner.All()) {
+                    c.FillRoundRect(sx, sy, sg.w, sg.h, rad, rs.backgroundColor);
+                } else {
+                    c.FillRoundRectIn(sx, sy, sg.w, sg.h, rad, mask,
+                        rs.backgroundColor);
+                }
+                if (rs.borderColor != 0 && rs.borderWidth > 0) {
+                    c.DrawRoundRect(sx, sy, sg.w, sg.h, rad, rs.borderColor,
+                        rs.borderWidth);
+                }
+            } else if (rs.borderColor != 0 && rs.borderWidth > 0
+                       && sg.text.Length == 0 && sg.w > 0) {
+                // hr 线块：height 0、只有边框——画一条 borderWidth 粗
+                // 的横线（zrender 0 高盒的边框）。
+                int bw = rs.borderWidth > 0 ? rs.borderWidth : 1;
+                c.FillRect(sx, sy + (sg.h - bw) / 2, sg.w, bw, rs.borderColor);
+            }
+        }
+        for (int i = 0; i < b.segs.Count; i = i + 1) {
+            RichSeg sg = b.segs[i];
+            ChartRichStyle rs = sg.st;
+            if (sg.text.Length == 0) { continue; }
+            int padL2 = rs != null && rs.padL >= 0 ? app.Scale(rs.padL) : 0;
+            int padR2 = rs != null && rs.padR >= 0 ? app.Scale(rs.padR) : 0;
+            int col = rs != null && rs.color != 0 ? rs.color : defCol;
+            int fh = Canvas.FontHeight(sg.fsPx);
+            int tx = ox + sg.x + padL2;
+            if (rs != null && rs.align == 1) {
+                tx = ox + sg.x + (sg.w - sg.tw) / 2;
+            } else if (rs != null && rs.align == 2) {
+                tx = ox + sg.x + sg.w - padR2 - sg.tw;
+            }
+            int ty = oy + sg.y + (sg.h - fh) / 2;
+            bool bold = rs != null && (rs.fontWeight == "bold"
+                || rs.fontWeight == "bolder" || rs.fontWeight == "600"
+                || rs.fontWeight == "700" || rs.fontWeight == "800");
+            if (bold) {
+                c.DrawTextBold(tx, ty, sg.text, col, sg.fsPx);
+            } else {
+                c.DrawText(tx, ty, sg.text, col, sg.fsPx);
             }
         }
     }
