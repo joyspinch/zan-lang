@@ -86,6 +86,18 @@ through the driver script itself — no `SetCursorPos`/`mouse_event`:
   probes caught the hover level running 1000→796→456→124→0 as real moves
   overtook the synthetic ones and the tooltip vanished before the
   screenshot (2026-09-12, gui-wechat tips verification).
+- Dump paths resolve through `ZAN_UI_OUT` (default `_scratch/uidrv`,
+  **relative to the process CWD** — pass an absolute path or you hunt for
+  the file). `screenshot` is **not** a driver command; capture from outside
+  with PrintWindow by PID.
+- Stage-per-launch pattern for multi-surface checks (one surface per app
+  launch): dump hitregions once, measure click coordinates (physical client
+  px are deterministic per build, so `click <x> <y>` replays across
+  launches), script = a few `click`s + a long final `wait`, capture every
+  top-level window of the PID from the harness while it holds, then
+  `Stop-Process`. Child windows (e.g. a separate chat-history window) show
+  up as extra HWNDs of the same PID — enumerate, don't assume one window
+  (2026-09-12, gui-wechat drawer/panels/history verification).
 
 ## Useful ZanIDE hit ids (2026-08 build, may drift — re-`dump hitregions`)
 

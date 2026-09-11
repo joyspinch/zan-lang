@@ -17,6 +17,16 @@ class WxPageChat : Control {
     int current;
     /// 宿主 App（拖出行手势要按主窗口矩形判断「拖到窗外」）。
     App app;
+    /// 「...」对应的右侧抽屉与输入区上方的弹出面板。
+    Panel drawer;
+    WxDrawerBody drawerBody;
+    Flex popup;
+    WxEmojiPanel emoPanel;
+    WxAvaPanel avaPanel;
+    WxFilePanel filePanel;
+    Control curPopup;
+    /// 输入区下排的图标条：群聊/私聊图标数不同，切会话时重建。
+    ToolStrip bar;
 
     WxPageChat() {
         this.InitControl("wxPageChat", 5);
@@ -41,6 +51,8 @@ class WxPageChat : Control {
         this.Add(col);
 
         // ---- 右侧会话标题 ----
+        // 头像右侧的四个图标：语音通话/视频通话（摆设）、聊天记录
+        // （开独立记录窗口）、...（开右侧抽屉），与原版同序。
         Flex head = Wx.Row("wxhead");
         head.dock = 1;
         Panel ht = Panel.Column();
@@ -50,7 +62,20 @@ class WxPageChat : Control {
         ht.Add(headName);
         ht.Add(headDesc);
         head.Add(ht);
-        head.Add(Wx.IconBtn("dots"));
+        Button callBtn = Wx.IconBtn("phone");
+        callBtn.Tip = "语音通话";
+        head.Add(callBtn);
+        Button videoBtn = Wx.IconBtn("video");
+        videoBtn.Tip = "视频通话";
+        head.Add(videoBtn);
+        Button histBtn = Wx.IconBtn("message");
+        histBtn.Tip = "聊天记录";
+        histBtn.OnClick(() => { WxHistoryWindow.Open(this.app, data[current]); });
+        head.Add(histBtn);
+        Button dotsBtn = Wx.IconBtn("dots");
+        dotsBtn.Tip = "更多";
+        dotsBtn.OnClick(() => { this.ToggleDrawer(); });
+        head.Add(dotsBtn);
         this.Add(head);
         this.Add(Wx.Line());
 
@@ -70,15 +95,12 @@ class WxPageChat : Control {
         bb.dock = 2;
         // 图标工具条是标准库的 ToolStrip（按钮组），项本身就是扁平
         // 按钮（text small），表面色走皮肤的 toolstrip 规则——这里
-        // 不摆裸按钮、不写一行式样；grow 把发送按钮推到最右。
-        ToolStrip bar = new ToolStrip();
+        // 不摆裸按钮、不写一行式样；grow 把右侧两个按钮推到最右。
+        // 左组五个按原版顺序：表情 / 常用头像 / 文件 / 截图(+下拉) /
+        // 麦克风，群聊再加一个 ⊙；右组是发语音圆钮与文字发送钮。
+        bar = new ToolStrip();
         bar.SetIconOnly(true);
         bar.Class = "grow";
-        bar.Add("", "mood-smile");
-        bar.Add("", "folder");
-        bar.Add("", "scissors");
-        bar.Add("", "phone");
-        bar.Add("", "video");
         bb.Add(bar);
         Button send = new Button("发送");
         send.Class = "primary small";
@@ -87,6 +109,38 @@ class WxPageChat : Control {
         comp.Add(bb);
         this.Add(comp);
         this.Add(Wx.Line());
+
+        // ---- 输入区上方的弹出面板（表情 / 常用头像 / 文件）----
+        // dock 2 的第三个子节点：排在分隔线之上、聊天记录之下，
+        // 显隐靠 visible，不做浮层。
+        // 弹出面板的宿主用 flex 列 + 交叉轴起点：面板自己的宽度
+        // （424）才会生效，否则 Panel 的列会把子项拉满整行。
+        popup = Flex.Column();
+        popup.AddClass("wxpopup");
+        popup.AlignStart();
+        popup.dock = 2;
+        popup.visible = false;
+        emoPanel = WxEmojiPanel.Of((t) => { this.Type(t); });
+        emoPanel.Root().visible = false;
+        popup.Add(emoPanel.Root());
+        avaPanel = WxAvaPanel.Of((t) => { this.Type(t); });
+        avaPanel.Root().visible = false;
+        popup.Add(avaPanel.Root());
+        filePanel = WxFilePanel.Of((t) => { this.Type(t); });
+        filePanel.Root().visible = false;
+        popup.Add(filePanel.Root());
+        this.Add(popup);
+
+        // ---- 「...」的右侧抽屉（私聊/群聊两种版式在同一列里翻）----
+        drawer = Wx.Col("wxdrawer");
+        drawer.dock = 4;
+        drawer.visible = false;
+        drawerBody = WxDrawerBody.Of(
+            () => { WxHistoryWindow.Open(this.app, data[current]); },
+            () => { this.ClearCurrent(); });
+        drawerBody.Root().dock = 5;
+        drawer.Add(drawerBody.Root());
+        this.Add(drawer);
 
         // ---- 聊天记录本体 ----
         chat = new ChatView();
@@ -99,8 +153,91 @@ class WxPageChat : Control {
         this.Select(0);
     }
 
+    /// 把一段文字（表情 / @名片 / 文件占位）追加进输入框。
+    void Type(string t) {
+        box.SetText(box.GetText() + t);
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    /// 弹出面板的显隐：再点同一个图标等于收起；互斥——开一个关
+    /// 其余，开面板时也收起抽屉。
+    void ShowPopup(Control p) {
+        if (popup.visible && curPopup == p) {
+            this.ClosePopups();
+            return;
+        }
+        curPopup = p;
+        emoPanel.Root().visible = p == emoPanel.Root();
+        avaPanel.Root().visible = p == avaPanel.Root();
+        filePanel.Root().visible = p == filePanel.Root();
+        drawer.visible = false;
+        popup.visible = true;
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    void ClosePopups() {
+        curPopup = null;
+        popup.visible = false;
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    /// 抽屉显隐；打开前把内容对齐到当前会话（私聊/群聊版式翻面）。
+    void ToggleDrawer() {
+        this.ClosePopups();
+        drawerBody.Show(data[current]);
+        drawer.visible = !drawer.visible;
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    /// 清空当前会话：共享的记录列表清掉，聊天区与列表摘要跟上
+    /// （抽屉底部那行红字）。
+    void ClearCurrent() {
+        WxSession s = data[current];
+        s.msgs.Clear();
+        s.snippet = "";
+        chat.Reset();
+        chat.Bind(s.msgs);
+        chat.Invalidate();
+        list.Refresh();
+        drawer.visible = false;
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    /// 输入区下排的图标条。两版式的并集只建一次（表情 / 常用头像 /
+    /// 文件 / 截图 / 截图下拉 / 麦克风 / 群目标 + 右组发语音），切会话
+    /// 只翻群目标图标的显隐——ToolStrip 的项表不随 RemoveAll 清空，
+    /// 每次重建会让 ItemAt 拿到旧项。
+    void BuildBar(bool group) {
+        if (bar.Count() > 0) {
+            Wx.Item(bar, 6).visible = group;
+            return;
+        }
+        bar.Add("", "mood-smile");
+        bar.Add("", "box");
+        bar.Add("", "folder");
+        bar.Add("", "scissors");
+        bar.Add("", "caret-down");
+        bar.Add("", "microphone");
+        bar.Add("", "target");
+        Wx.Item(bar, 0).Tip = "表情";
+        Wx.Item(bar, 0).OnClick(() => { this.ShowPopup(emoPanel.Root()); });
+        Wx.Item(bar, 1).Tip = "常用头像";
+        Wx.Item(bar, 1).OnClick(() => { this.ShowPopup(avaPanel.Root()); });
+        Wx.Item(bar, 2).Tip = "文件";
+        Wx.Item(bar, 2).OnClick(() => { this.ShowPopup(filePanel.Root()); });
+        Wx.Item(bar, 3).Tip = "截图";
+        Wx.Item(bar, 4).Tip = "截图范围";
+        Wx.Item(bar, 5).Tip = "麦克风";
+        Wx.Item(bar, 6).Tip = "群目标";
+        int voice = bar.AddRight("", "volume");
+        Wx.Item(bar, voice).AddClass("wxvoice");
+        Wx.Item(bar, voice).Tip = "发语音";
+        Wx.Item(bar, 6).visible = group;
+    }
+
     /// 切到一个会话：换标题，换整份记录（Reset 会清掉重排缓存与滚动），
-    /// 一对一会话关掉发言人名字、用对方的昵称当左侧气泡的署名。
+    /// 一对一会话关掉发言人名字、用对方的昵称当左侧气泡的署名；
+    /// 抽屉与弹出面板一并收起，图标条按群聊/私聊翻群目标图标。
     void Select(int i) {
         if (i < 0 || i >= data.Count) { return; }
         current = i;
@@ -111,6 +248,9 @@ class WxPageChat : Control {
         } else {
             headDesc.Text = "最后活跃 " + s.time;
         }
+        this.BuildBar(s.group);
+        this.ClosePopups();
+        drawer.visible = false;
         ChatStrings cs = ChatStrings.Default();
         cs.you = "我";
         cs.assistant = s.name;

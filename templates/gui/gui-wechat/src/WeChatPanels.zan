@@ -1,0 +1,290 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+/* 聊天页右键抽屉与输入区上方的弹出面板。
+ *
+ * 这些都**不是浮层**：抽屉是聊天区右侧的一列（dock 4），表情/头像/
+ * 文件面板是输入区上方的一行（dock 2），靠 visible 开关显隐。浮层
+ * （覆盖阶段自绘 + 自管命中）在标准库里只有 SelectBox/ContextMenu 那
+ * 套机制，面板里要放完整的控件树（输入框/开关/网格），用真控件列
+ * 既组件化又不用自己分发一次点击。
+ *
+ * 类都是「组装器」（同 WxRow 的路子）：只持有根节点和少数要在会话
+ * 切换时改写的控件，外观全部走 WeChatSkin 的样式表。
+ */
+
+/// 「...」按钮对应的右侧抽屉内容。私聊与群聊两种版式都预先搭好，
+/// Show 按会话类型翻可见——比每次清空重建稳（控件 id 不换）。
+class WxDrawerBody {
+    Flex root;
+    Flex priv;
+    Flex grp;
+    Avatar pAva;
+    Label pName;
+    Label pSub;
+    Label gName;
+    Label gNotice;
+
+    static WxDrawerBody Of(Action onFind, Action onClear) {
+        WxDrawerBody d = new WxDrawerBody();
+        d.Build(onFind, onClear);
+        return d;
+    }
+
+    Control Root() { return root; }
+
+    void Build(Action onFind, Action onClear) {
+        root = Flex.Column();
+        root.AddClass("wxdbody");
+        priv = Flex.Column();
+        priv.AddClass("wxdbody2 grow");
+        grp = Flex.Column();
+        grp.AddClass("wxdbody2 grow");
+        grp.visible = false;
+
+        // ---- 私聊版式：头像 + 名字/微信号，查找，两个开关，清空 ----
+        Flex top = Wx.Row("");
+        pAva = Wx.Ava("", 56, "primary");
+        top.Add(pAva);
+        Panel hp = Panel.Column();
+        hp.Class = "grow";
+        pName = Wx.Lbl("", "wxdtitle");
+        pSub = Wx.Lbl("", "wxdsub");
+        hp.Add(pName);
+        hp.Add(pSub);
+        top.Add(hp);
+        priv.Add(top);
+
+        Button add = new Button("添加到通讯录");
+        add.Class = "secondary small wxdadd";
+        priv.Add(add);
+
+        priv.Add(Wx.Line());
+        Button find = new Button("查找聊天内容");
+        find.Class = "text small wxdrowbtn";
+        find.Icon = "search";
+        find.OnClick(() => { onFind(); });
+        priv.Add(find);
+        priv.Add(Wx.SwRow("消息免打扰"));
+        priv.Add(Wx.SwRow("置顶聊天"));
+        priv.Add(Wx.Line());
+        priv.Add(Wx.ClearBtn(onClear));
+        root.Add(priv);
+
+        // ---- 群聊版式：搜成员 + 成员格 + 名称/公告/二维码/开关 ----
+        Input q = new Input("搜索群成员");
+        q.Class = "wxdsearch";
+        grp.Add(q);
+        // 抽屉一屏放得下是硬要求：格网只露两行（7 人 + 添加），
+        // 其余交给「查看全部成员」。cells 40 高一行 ≈ 66px。
+        Flex grid = null;
+        List<WxMate> ms = WxData.Mates();
+        int shown = 7;
+        if (shown > ms.Count) { shown = ms.Count; }
+        for (int i = 0; i < shown; i = i + 1) {
+            if (i % 4 == 0) {
+                grid = Flex.Row();
+                grid.AddClass("wxgrid");
+                grid.dock = 1;
+                grp.Add(grid);
+            }
+            grid.Add(Wx.MemberCell(ms[i].name, ms[i].ini, WxData.TintOf(i)));
+        }
+        // 成员格末尾固定一个「添加」格，再跟一行「查看更多」。
+        grid.Add(Wx.MemberCellPlus());
+        Flex more = Wx.Row("");
+        more.Justify("end");
+        more.Add(Wx.Lbl("查看全部成员 ›", "wxdmore"));
+        grp.Add(more);
+
+        grp.Add(Wx.Line());
+        Flex nameRow = Wx.Row("wxdrow");
+        nameRow.Add(Wx.Lbl("群聊名称", "wxdkey grow"));
+        gName = Wx.Lbl("", "wxdval");
+        nameRow.Add(gName);
+        grp.Add(nameRow);
+
+        Flex noticeHead = Wx.Row("wxdrow");
+        noticeHead.Add(Wx.Lbl("群公告", "wxdkey grow"));
+        noticeHead.Add(Wx.IconBtn("chevron-right"));
+        grp.Add(noticeHead);
+        gNotice = Wx.Lbl("本周五 20:00 线上评审，请提前把更新包发到共享盘。",
+            "wxdnotice");
+        grp.Add(gNotice);
+
+        Flex qr = Wx.Row("wxdrow");
+        qr.Add(Wx.Lbl("群二维码", "wxdkey grow"));
+        qr.Add(Wx.IconBtn("chevron-right"));
+        grp.Add(qr);
+        grp.Add(Wx.SwRow("保存到通讯录"));
+        grp.Add(Wx.SwRow("消息免打扰"));
+        grp.Add(Wx.SwRow("置顶聊天"));
+        grp.Add(Wx.Line());
+        grp.Add(Wx.ClearBtn(onClear));
+        root.Add(grp);
+    }
+
+    /// 会话切换时改写两个版式里跟着会话走的文字与头像。
+    void Show(WxSession s) {
+        pAva.Text = s.initial;
+        pAva.Class = s.tint;
+        pName.Text = s.name;
+        pSub.Text = "微信号：" + WxData.WxidOf(s.name, s.initial);
+        priv.visible = !s.group;
+        grp.visible = s.group;
+        if (s.group) {
+            gName.Text = s.name;
+        }
+    }
+}
+
+/// 表情面板：最近使用一行 + 所有表情六行网格 + 收藏页 + 底部标签条。
+/// 点某个表情把它追加进输入框（insert 回调由聊天页给）。
+class WxEmojiPanel {
+    Flex root;
+    Flex main;
+    Flex fav;
+    ToolStrip tabs;
+    int smileIdx;
+    int heartIdx;
+
+    static WxEmojiPanel Of(Action<string> insert) {
+        WxEmojiPanel p = new WxEmojiPanel();
+        p.Build(insert);
+        return p;
+    }
+
+    Control Root() { return root; }
+
+    void Build(Action<string> insert) {
+        // 根与内容列都用 flex：Panel 的 dock 容器会把 prefH 报小
+        //（弹出宿主按它分高度，内容被压得互相叠），flex 的自然
+        // 高度求和才是准的。
+        root = Flex.Column();
+        root.AddClass("wxemopanel");
+
+        main = Flex.Column();
+        main.AddClass("grow");
+        main.Add(Wx.Lbl("最近使用", "wxemotitle"));
+        main.Add(Wx.EmojiRow(WxData.RecentEmojis(), insert, false));
+        main.Add(Wx.Lbl("所有表情", "wxemotitle"));
+        List<string> all = WxData.Emojis();
+        for (int r = 0; r * 10 < all.Count; r = r + 1) {
+            int lo = r * 10;
+            int hi = lo + 10;
+            if (hi > all.Count) { hi = all.Count; }
+            List<string> part = new List<string>();
+            for (int i = lo; i < hi; i = i + 1) { part.Add(all[i]); }
+            main.Add(Wx.EmojiRow(part, insert, false));
+        }
+        root.Add(main);
+
+        fav = Flex.Column();
+        fav.AddClass("grow");
+        fav.visible = false;
+        fav.Add(Wx.Lbl("收藏的表情", "wxemotitle"));
+        List<string> fe = WxData.FavEmojis();
+        for (int r = 0; r * 8 < fe.Count; r = r + 1) {
+            int lo = r * 8;
+            int hi = lo + 8;
+            if (hi > fe.Count) { hi = fe.Count; }
+            List<string> part = new List<string>();
+            for (int i = lo; i < hi; i = i + 1) { part.Add(fe[i]); }
+            fav.Add(Wx.EmojiRow(part, insert, true));
+        }
+        root.Add(fav);
+
+        tabs = new ToolStrip();
+        tabs.SetIconOnly(true);
+        tabs.Class = "wxemotabs";
+        tabs.dock = 2;   // 标签条钉在面板底部（dock 1 是顶，2 才是底）
+        tabs.Add("", "search");
+        smileIdx = tabs.Add("", "mood-smile");
+        heartIdx = tabs.Add("", "heart");
+        tabs.Add("", "photo");
+        tabs.Add("", "crop");
+        Wx.Item(tabs, smileIdx).AddClass("wxemo-tab wxon");
+        Wx.Item(tabs, heartIdx).AddClass("wxemo-tab");
+        int sIdx = smileIdx;
+        int hIdx = heartIdx;
+        tabs.OnItemClick((i) => {
+            if (i == sIdx) { this.Pick(false); }
+            if (i == hIdx) { this.Pick(true); }
+        });
+        root.Add(tabs);
+    }
+
+    /// 底部标签条切换：表情页 / 收藏页。
+    void Pick(bool favPage) {
+        main.visible = !favPage;
+        fav.visible = favPage;
+        Wx.Item(tabs, smileIdx).SetClassIn("wxon", favPage ? "" : "wxon");
+        Wx.Item(tabs, heartIdx).SetClassIn("wxon", favPage ? "wxon" : "");
+    }
+}
+
+/// 「常用头像」面板（聊天框的盒子按钮）：常用联系人的头像格。
+/// 与抽屉的成员格同一批数据、同一种格子。
+class WxAvaPanel {
+    Flex root;
+
+    static WxAvaPanel Of(Action<string> insert) {
+        WxAvaPanel p = new WxAvaPanel();
+        p.Build(insert);
+        return p;
+    }
+
+    Control Root() { return root; }
+
+    void Build(Action<string> insert) {
+        root = Flex.Column();
+        root.AddClass("wxavapanel");
+        root.Add(Wx.Lbl("常用头像", "wxemotitle"));
+        Flex grid = null;
+        List<WxMate> ms = WxData.Mates();
+        for (int i = 0; i < ms.Count; i = i + 1) {
+            if (i % 4 == 0) {
+                grid = Flex.Row();
+                grid.AddClass("wxgrid");
+                grid.dock = 1;
+                root.Add(grid);
+            }
+            grid.Add(Wx.MemberCell(ms[i].name, ms[i].ini, WxData.TintOf(i)));
+        }
+        root.Add(Wx.Lbl("聊天时常@的联系人格子", "wxemotitle"));
+    }
+}
+
+/// 「选择文件」面板（聊天框的文件夹按钮）：最近文件列表，
+/// 点一行把「[文件] 名字（大小）」填进输入框——原版这里开系统
+/// 文件对话框，示例里用虚构的最近文件代替。
+class WxFilePanel {
+    Flex root;
+
+    static WxFilePanel Of(Action<string> insert) {
+        WxFilePanel p = new WxFilePanel();
+        p.Build(insert);
+        return p;
+    }
+
+    Control Root() { return root; }
+
+    void Build(Action<string> insert) {
+        root = Flex.Column();
+        root.AddClass("wxfilepanel");
+        root.Add(Wx.Lbl("选择文件", "wxemotitle"));
+        List<WxFileRow> fs = WxData.Files();
+        for (int i = 0; i < fs.Count; i = i + 1) {
+            WxFileRow f = fs[i];
+            Button b = new Button(f.name);
+            b.Icon = f.icon;
+            b.Class = "text small wxfilebtn";
+            b.Tip = f.size + " · " + f.date;
+            b.OnClick(() => { insert("[文件] " + f.name + "（" + f.size + "）"); });
+            root.Add(b);
+        }
+        root.Add(Wx.Lbl("示例不会打开系统对话框：点文件名直接填入输入框",
+            "wxemotitle"));
+    }
+}

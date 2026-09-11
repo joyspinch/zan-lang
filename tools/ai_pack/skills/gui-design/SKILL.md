@@ -437,6 +437,29 @@ CSS 里非 token 的长度由 `Style.ScaleLayout` 补乘,`StyleBox.IsPrescaled`
    修法:`styleBg = c; styleBgTo = d;` 再
    `if (computedStyle != null) { Style.Inline(computedStyle, this); }`
    把 inline 覆盖补映到已解析的 box。ToolStrip/StatusBar 都因此修过。
+5. **弹出面板/抽屉这类高度随内容的容器,根节点用 `Flex.Column()`,别用
+   `Panel.Column`。** Panel(dock 容器)把 prefH 报小,宿主按小值分高度,
+   Arrange 时内容按真实子项摆,尾部子项互相叠、被裁(微信模板表情/
+   头像/文件面板「最后一行与提示语重叠」,2026-09-12);flex 的自然
+   高度求和是准的。宿主还要 `AlignStart()`,否则列的交叉轴 stretch
+   把子项拉满整行,`width: 424` 形同虚设。
+6. **ToolStrip 的项自带皮肤类,加自有类用 `AddClass`,互斥状态类用
+   `SetClassIn("wxon", ...)`。** `item.Class = "wxvoice"` 整体顶掉
+   `text small` 后图标盒 51x43 装不下 51x51 的图标内容(lint:
+   「矩形装不下内容」);反复 AddClass("wxon") 切选中会累积旧状态类。
+   另外 `ItemAt` 返回可空,每个调用点判空太吵,收拢一个
+   「越界给哑按钮」的助手最省。
+7. **Zan 字符串按字节索引,`Substring(0, 1)` 对中文切出半个字**(渲染
+   成「?」)。头像首字/缩写一律由数据显式给出(发言人注册表带 ini
+   字段),代码里不要对中文切片(微信模板群成员格「过客云飞」头像
+   变「?」,2026-09-12)。
+8. **聊天抽屉/表情面板这类要装完整控件树的「弹出」,用 dock + visible
+   翻面的真控件列,不用覆盖层自管分发**(OverlayPopup.Host 是给选项
+   列表/菜单自绘用的)。互斥显隐:再点同一图标=收起,开一个关其余;
+   隐藏的 dock 子项不参与排版/命中/绘制,不会被布局自检报重叠。
+   emoji 字形事实:Windows 上运行时字体回退把 emoji 渲染成单色轮廓
+   (Segoe UI Symbol 一系),60 个常用 emoji 全有字形、无豆腐,但不是
+   彩色——表情面板可以直接用 emoji 字符,深浅色主题都不挑。
 
 ## 收尾自查(逐条过)
 
