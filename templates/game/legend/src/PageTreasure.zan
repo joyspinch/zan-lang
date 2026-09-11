@@ -1,0 +1,308 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Legend;
+
+/// 页 15「寻宝」——照原版还原（`寻宝.png`）。
+///
+/// 主区两块：
+///   ① **左：寻宝盘**——最底下整张 `assets/ui/00245.gif`（483×367 逻辑）当龙壁
+///      （图自带的深蓝边与主区底色几乎同色，整图贴上去无缝）；上面叠一个
+///      **8 列 × 7 行的外圈槽环**（26 格，列节距 87 / 行节距 72 / 格 60×57）、
+///      中央 `[开始寻宝]` 大钮、`自动寻宝(关闭音效)` 复选条，最下一块
+///      **12×3 记录格**（`00083.jpg` 的前 3 行）。
+///   ② **右：规则栏**——`00246.jpg` 标题带（`探寻宝藏`）+ 6 段规则文字
+///      （1/2/3 条 + `寻宝图来源` 橙标题 + 两段正文）。
+///
+/// 与用户口径一致：**环阵与记录格都是数据列表**——`TrCell` 只给「道具 + 角标」，
+/// 数量与道具最终由服务端下发，本页把结构（8×7 边框环 + 每格图标/角标、
+/// 12 列的记录格）定死，值先占位；没有辨认出来的道具图标一律留空（`itemId=0`），
+/// **不拿别的道具冒充**。
+partial class LegendApp {
+
+    // ---------------------------------------------------------------- 数据
+
+    /// 环阵/记录格的一格：`itemId` 0 = 空图（服务端下发后填），`badge` = 角标。
+    class TrCell {
+        int itemId;
+        string badge;
+    }
+
+    static TrCell TrCellOf(int itemId, string badge) {
+        TrCell c = new TrCell();
+        c.itemId = itemId; c.badge = badge;
+        return c;
+    }
+
+    /* 环阵照参考图抄（26 格逐格辨认）：**只抄看得见的结构**——哪些格有货、
+       角标是多少、能一眼认出的是不是红包/声望。认不出的图标留 0（等接服务端
+       下发，不猜）。顺序＝ `RingIndex()`：上边 8 → 右列 5 → 下边 8 → 左列 5。 */
+    static List<TrCell> TrRing() {
+        List<TrCell> v = new List<TrCell>();
+        // 上边 8 格（含左右上角）
+        v.Add(TrCellOf(0, "150")); v.Add(TrCellOf(0, "10"));
+        v.Add(TrCellOf(0, ""));    v.Add(TrCellOf(0, "8"));
+        v.Add(TrCellOf(7, ""));    v.Add(TrCellOf(0, ""));
+        v.Add(TrCellOf(0, "1000")); v.Add(TrCellOf(0, "1000"));
+        // 右列 5 格（自上而下）
+        v.Add(TrCellOf(0, "9"));      v.Add(TrCellOf(4, "10000"));
+        v.Add(TrCellOf(0, "10"));     v.Add(TrCellOf(4, "10000"));
+        v.Add(TrCellOf(0, ""));
+        // 下边 8 格
+        v.Add(TrCellOf(0, ""));    v.Add(TrCellOf(7, ""));
+        v.Add(TrCellOf(0, ""));    v.Add(TrCellOf(0, "11"));
+        v.Add(TrCellOf(7, ""));    v.Add(TrCellOf(7, ""));
+        v.Add(TrCellOf(0, ""));    v.Add(TrCellOf(4, "1000"));
+        // 左列 5 格（自上而下）
+        v.Add(TrCellOf(0, "1000"));   v.Add(TrCellOf(0, ""));
+        v.Add(TrCellOf(7, ""));       v.Add(TrCellOf(0, "12"));
+        v.Add(TrCellOf(0, "1000"));
+        return v;
+    }
+
+    /// 记录格阵：12 列 × 3 行 = 36 格，参考图只有首行前 3 格有货。
+    static List<TrCell> TrGrid() {
+        List<TrCell> v = new List<TrCell>();
+        v.Add(TrCellOf(7, ""));                       // 红包
+        v.Add(TrCellOf(0, "+5"));                     // 认不出的紫色道具，只留强化角标
+        v.Add(TrCellOf(0, ""));
+        for (int i = 3; i < 36; i = i + 1) { v.Add(TrCellOf(0, "")); }
+        return v;
+    }
+
+    /// 规则栏的一行：`segs` 是**行内分段**（同一条里要换色的词单独成段），
+    /// `gapBefore` 是本行前的额外空隙（段与段之间的节奏，实测不等距）。
+    ///
+    /// 折行在数据里就切好，和帮助页正文同一套做法：`Label` 不折行、超宽会截成
+    /// 省略号，靠宽度算折点会随字体微调漂移；参考图的断点是确定的，直接抄进
+    /// 数据，行内换色才有地方落。
+    class TrLine {
+        List<TextSeg> segs;
+        int gapBefore;
+    }
+
+    static TrLine TrLineOf(int gapBefore, List<TextSeg> segs) {
+        TrLine l = new TrLine();
+        l.segs = segs; l.gapBefore = gapBefore;
+        return l;
+    }
+
+    static List<TextSeg> TrSegs(TextSeg a) {
+        return new List<TextSeg> { a };
+    }
+
+    static List<TextSeg> TrSegs(TextSeg a, TextSeg b) {
+        return new List<TextSeg> { a, b };
+    }
+
+    static List<TextSeg> TrSegs(TextSeg a, TextSeg b, TextSeg c) {
+        return new List<TextSeg> { a, b, c };
+    }
+
+    /// 6 段规则（参考图逐行抄；行内彩色词实测：`“寻宝图”` 红、`0:00会更新寻宝列表，`
+    /// 绿、`拼人品` 黄、标题黄、`免费获得` 红）。
+    static List<TrLine> TrLines() {
+        List<TrLine> v = new List<TrLine>();
+        v.Add(TrLineOf(6, TrSegs(TextSegOf("1、每次寻找一次宝藏将会消耗掉一", "tr-text"))));
+        v.Add(TrLineOf(0, TrSegs(TextSegOf("个", "tr-text"),
+                                 TextSegOf("“寻宝图”", "tr-red"),
+                                 TextSegOf("；", "tr-text"))));
+        v.Add(TrLineOf(27, TrSegs(TextSegOf("2、每天晚上", "tr-text"),
+                                  TextSegOf("0:00会更新寻宝列表，", "tr-green"))));
+        v.Add(TrLineOf(0, TrSegs(TextSegOf("如果没有满意的道具，只能等到第二", "tr-text"))));
+        v.Add(TrLineOf(0, TrSegs(TextSegOf("天再寻宝!", "tr-text"))));
+        v.Add(TrLineOf(28, TrSegs(TextSegOf("3、寻宝等同于", "tr-text"),
+                                  TextSegOf("拼人品", "tr-yellow"),
+                                  TextSegOf("，脸黑的时候", "tr-text"))));
+        v.Add(TrLineOf(0, TrSegs(TextSegOf("请不要尝试，同时也应该适可而止!", "tr-text"))));
+        v.Add(TrLineOf(56, TrSegs(TextSegOf("寻宝图来源", "tr-src"))));
+        v.Add(TrLineOf(1, TrSegs(TextSegOf("终身会员每天签到可以", "tr-text"),
+                                 TextSegOf("免费获得", "tr-red"),
+                                 TextSegOf("2个", "tr-text"))));
+        v.Add(TrLineOf(0, TrSegs(TextSegOf("寻宝图、超级终身会员每天可以获得", "tr-text"))));
+        v.Add(TrLineOf(0, TrSegs(TextSegOf("5个寻宝图!", "tr-text"))));
+        v.Add(TrLineOf(25, TrSegs(TextSegOf("徒弟在出师时可以获得大量的寻宝", "tr-text"))));
+        v.Add(TrLineOf(0, TrSegs(TextSegOf("图，超级终身会员徒弟能获得更多的", "tr-text"))));
+        v.Add(TrLineOf(0, TrSegs(TextSegOf("寻宝图!", "tr-text"))));
+        return v;
+    }
+
+    // ---------------------------------------------------------------- 版面
+
+    void BuildTreasurePage() {
+        Panel stage = Panel.Row(); stage.Class = "tr-page";
+        stage.Pad(0); stage.Gap(0);
+        content.With(stage);
+        /* 主区要**撑满内容框**（774 设备）：只按子项偏好高排，舞台只有 634 高，
+           板子的裁剪框跟着缩到 798——记录格阵（716..875）下半截被父容器裁掉，
+           实测格线只剩 716/770 两条、底下一片空。 */
+        stage.DockFill();
+        stage.With(TreasureBoard());
+        stage.With(TreasureSide());
+    }
+
+    // ---------------------------------------------------------------- 左盘
+
+    Panel TreasureBoard() {
+        Panel board = Panel.Row(); board.Class = "tr-board";
+        board.Pad(0); board.Gap(0);
+        board.Prefer(Spec.TrSideX(), 0);
+        List<TrCell> ring = TrRing();
+        /* 整张龙壁。`stretch` 到逻辑尺寸——图是 1.5× 贴的，拉伸只是把
+           483×367 还原成 725×551 设备。 */
+        Image wall = new Image(TreasureWallPath(), "寻宝龙壁", "stretch");
+        wall.Prefer(Spec.TrArtW(), Spec.TrArtH());
+        wall.DockManual();
+        wall.Place(Spec.TrArtX(), Spec.TrArtY());
+        board.Add(wall);
+
+        /* 外圈 26 格：只摆 8×7 矩形里「在边框上」的格（r==0 / r==6 / c==0 /
+           c==7），顺序与 TrRing() 一致——上边 → 右列 → 下边 → 左列。 */
+        for (int r = 0; r < Spec.TrRows(); r = r + 1) {
+            for (int c = 0; c < Spec.TrCols(); c = c + 1) {
+                bool border = r == 0 || r == Spec.TrRows() - 1
+                              || c == 0 || c == Spec.TrCols() - 1;
+                if (!border) { continue; }
+                int i = RingIndex(c, r);
+                TrCell cell = i < ring.Count ? ring[i] : null;
+                Panel slot = ItemSlot("tr-cell", Spec.TrSlotW(),
+                                            Spec.TrSlotH(),
+                                            TrCellArt(cell), TrCellBadge(cell));
+                slot.DockManual();
+                slot.Place(Spec.TrGridX() + c * Spec.TrColPitch(),
+                           Spec.TrGridY() + r * Spec.TrRowPitch());
+                board.Add(slot);
+            }
+        }
+
+        // [开始寻宝]
+        Button start = BtnDev("开始寻宝", "tr-start", Spec.TrStartW(),
+                              Spec.TrStartH(), () => { TreasureHunt(); });
+        start.DockManual();
+        start.Place(Spec.TrStartX(), Spec.TrStartY());
+        board.Add(start);
+
+        TreasureAuto(board);
+        TreasureGrid(board);
+        return board;
+    }
+
+    /// 环序下标：上边 8 → 右列 5 → 下边 8 → 左列 5（= `TrRing()` 的排列）。
+    ///
+    /// **先判行再判列**：四个角属于所在的行，若先判列，左下角（`c==0, r==rows-1`）
+    /// 会被左列分支抢走、右下角（`c==cols-1, r==rows-1`）会与左列最后一格
+    /// 撞成同一个下标——实测左列少一格、底行多一格。左列的下标是**正序**
+    /// （`r-1`），不是倒序。
+    static int RingIndex(int c, int r) {
+        int cols = Spec.TrCols(); int rows = Spec.TrRows();
+        if (r == 0) { return c; }
+        if (r == rows - 1) { return cols + (rows - 2) + c; }
+        if (c == cols - 1) { return cols + (r - 1); }
+        return cols + (rows - 2) + cols + (r - 1);
+    }
+
+    static string TrCellArt(TrCell c) {
+        if (c == null || c.itemId <= 0) { return ""; }
+        return ItemArtById(c.itemId);
+    }
+
+    static string TrCellBadge(TrCell c) {
+        return c == null ? "" : c.badge;
+    }
+
+    /// 自动寻宝条：深底 + 方框 + 亮蓝文字。勾选状态是本地开关（玩法由服务端
+    /// 裁决），这里只把控件与文案备好——与设置页 `StChk` 同一套 Bind 写法。
+    void TreasureAuto(Panel board) {
+        Panel bar = Panel.Row(); bar.Class = "tr-auto";
+        bar.Pad(0); bar.Gap(0); bar.Prefer(Spec.TrAutoW(), Spec.TrAutoH());
+        bar.DockManual();
+        bar.Place(Spec.TrAutoX(), Spec.TrAutoY());
+        SignalBool sig = new SignalBool(false);
+        Checkbox ck = Checkbox.Bind("自动寻宝(关闭音效)", sig);
+        ck.Class = "tr-check";
+        ck.Prefer(Spec.TrAutoW(), Spec.TrAutoH());
+        ck.Change += () => {
+            TreasureSay("自动寻宝：" + (sig.Get() ? "开" : "关"));
+        };
+        bar.With(ck);
+        board.Add(bar);
+    }
+
+    /// 记录格阵：整张 `00083.jpg`（12 列 × 7 行的暗格阵）**按原尺寸贴、只露前 3 行**
+    /// ——与铁匠铺页同一张图、同一套「整图当格阵」的做法（REFERENCE_AUDIT §5.11），
+    /// 区别是原版这里是裁切的：格阵容器只有 3 行高，底图仍按 7 行的整高摆进去，
+    /// 多出来的 4 行被容器裁掉（引擎缺省裁剪子节点，实测格线落在 716/772/824/876，
+    /// 与参考图一致；若把图 stretch 进 3 行高，7 行会压成 3 行、格距全错）。
+    void TreasureGrid(Panel board) {
+        Panel g = Panel.Row(); g.Class = "tr-grid";
+        g.Pad(0); g.Gap(0); g.Prefer(Spec.TrItemGridW(), Spec.TrItemGridH());
+        g.DockManual();
+        g.Place(Spec.TrItemGridX(), Spec.TrItemGridY());
+        Image bg = new Image(TreasureGridPath(), "记录格", "stretch");
+        bg.DockManual(); bg.Place(0, 0);
+        bg.Prefer(Spec.TrItemGridW(), Spec.TrItemGridFullH());
+        g.Add(bg);
+        List<TrCell> cells = TrGrid();
+        int cw = Spec.TrItemGridW() / 12;
+        int ch = Spec.TrItemGridFullH() / Spec.TrRows();
+        for (int i = 0; i < cells.Count; i = i + 1) {
+            TrCell c = cells[i];
+            if (c.badge.Length == 0 && c.itemId <= 0) { continue; }
+            Panel s = SlotArt(cw, ch, TrCellArt(c), c.badge, "");
+            s.DockManual();
+            s.Place((i % 12) * cw, (i / 12) * ch);
+            g.Add(s);
+        }
+        board.Add(g);
+    }
+
+    static string TreasureWallPath() { return "assets/ui/00245.gif"; }
+    static string TreasureBandPath() { return "assets/ui/00246.jpg"; }
+    /// 记录格阵的底图：**`00083.jpg`**（与铁匠铺页的 `00082.jpg` 同尺寸同格距、
+    /// 只差格线颜色）。实测参考图格线 (57,46,44) 是棕褐色，`00083` 的格线
+    /// (57,40,48) 对上；`00082` 的格线是蓝灰 (24,48,74)（那是铁匠铺用的那张，
+    /// 别混用——两图肉眼远看几乎一样，串了只有格线颜色不对）。
+    static string TreasureGridPath() { return "assets/ui/00083.jpg"; }
+
+    // ---------------------------------------------------------------- 右栏
+
+    Panel TreasureSide() {
+        Panel side = Panel.Column(); side.Class = "tr-side";
+        side.Pad(0); side.Gap(0); side.Grow();
+        Image band = new Image(TreasureBandPath(), "探寻宝藏", "contain");
+        band.Prefer(Spec.TrBandW(), Spec.TrBandH());
+        /* 标题带要**按自己的宽**（385 设备）从左缘起排，不能占满右栏：Column 的
+           子节点沿列轴停靠时必定占满整行宽（414），`contain` 再把图居中，整条带
+           右移 14 设备。套一层 Row，子项按 `prefW` 取宽。 */
+        Panel bandRow = Panel.Row(); bandRow.Pad(0); bandRow.Gap(0);
+        bandRow.Prefer(Spec.TrSideW(), Spec.TrBandH());
+        bandRow.With(band);
+        side.With(TblPad(Spec.TrBandY()));
+        side.With(bandRow);
+
+        List<TrLine> lines = TrLines();
+        /* 规则栏逐行拼：行高固定 29（实测行距），段前空隙走定高撑条（不是
+           Padding——那会从行自己的高里扣，设置页踩过）。 */
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            TrLine l = lines[i];
+            if (l.gapBefore > 0) { side.With(TblPad(l.gapBefore)); }
+            Panel row = TextSegRow(l.segs, "tr-textrow", Spec.TrLineH());
+            row.Prefer(Spec.TrSideW(), Spec.TrLineH());
+            row.Padding(0, 0, 0, Spec.TrTextPadL());
+            side.With(row);
+        }
+        return side;
+    }
+
+    // ---------------------------------------------------------------- 动作
+
+    /// 寻宝/自动寻宝的结算都在服务端，这里只把「点了什么」记一条日志。
+    void TreasureHunt() {
+        TreasureSay("寻宝：消耗 1 个寻宝图（结果待服务端下发）。");
+    }
+
+    void TreasureSay(string msg) {
+        if (net.Self() != null) { net.AddChat("[系统]", msg); return; }
+        g.Log(msg);
+    }
+}
