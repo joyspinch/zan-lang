@@ -690,6 +690,30 @@ pt/pc/cm/mm/in/q）+ `calc()/min()/max()/clamp()`；`%` 在各属性原有通道
 
 ---
 
+# A44 Web 等价 GUI（进行中）
+
+> 布局引擎 CSS 语义化 → HTML/CSS 声明层 → 设计器统一。计划全文与分期状态：
+> [`docs/WEB_GUI_ROADMAP.md`](docs/WEB_GUI_ROADMAP.md)。决策：用户拍板不考虑
+> 兼容、彻底改造；声明载体为真 HTML/CSS 文件（data-on-* 事件协议）；游戏与
+> 工具共用一套窗口设计器；旧 .zform 废弃。"web 一样"由 scripts/web_oracle.py
+> （Chrome headless 与 Zan Arrange 坐标逐盒对比）裁决。
+
+* **P0 布局基建**（2026-09-12）：display 值集扩充——0 legacy（无 CSS 缺省，
+  旧 dock/手摆行为，现网零回归）/1 flex/2 none/**3 flow（真块流）**；CSS 写
+  `block`/`flow-root`/`grid`(P4 前退化) 落 3，`inline`/`inline-block` 落 3+行内级。
+  StyleBox 新字段 inlineLevel/floatSide/clearSide/boxSizing/whiteSpace/
+  lineHeightKind；`float`/`clear`/`box-sizing` 移出 Inert 真实解析；line-height
+  三态（normal/长度/倍数与 %，千分存储消费端换算）。**border 参与布局**：内容框
+  = 框 − border − padding（布局端统一走 StyleInset*，文本端 DrawLabel 扣
+  border），box-sizing: content-box 时 StyleWidthIn/HeightIn 反推框宽——此前
+  border 画在框内但不占布局的自定义语义废除。UA 样式表（Style.UaCss，web 元素
+  缺省 display/字号/margin，垫在装载链最底；与真控件 Kind 撞名的 tag 不给）+
+  Element 通用容器（kind=tag）。最小块流 MeasureFlow/ArrangeFlow 骨架（堆叠/
+  填宽/margin 全算；塌陷/auto/行盒 P1/P2）。scripts/web_oracle.py：Chrome
+  headless 输出 getBoundingClientRect 与 Zan 坐标对比。
+
+---
+
 # A17-A31 历史修复记录（全部完成，一行摘要）
 
 * **A17** ✅ 测试套件"要跑半小时"的真正原因（2026-07-28）：A17-1 三批测试没设

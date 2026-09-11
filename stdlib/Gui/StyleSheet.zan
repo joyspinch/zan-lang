@@ -667,7 +667,8 @@ class StyleSheet {
         if (sp > 0) { v = v.Substring(0, sp); }
         if (prop == "display") {
             return v == "block" || v == "inline" || v == "inline-block"
-                || v == "flex" || v == "inline-flex" || v == "none";
+                || v == "flex" || v == "inline-flex" || v == "none"
+                || v == "flow-root";
         }
         if (prop == "position") {
             return v == "static" || v == "relative"
@@ -1007,12 +1008,40 @@ class StyleSheet {
     }
 
     /// text：颜色 / 字体 / 对齐 / 变换 / 换行。
+    /// `line-height`：`normal`（未声明态）、长度（px/em/…）、百分比
+    /// 或无单位数字（倍数）。量纲记 lineHeightKind：0 未声明，1 px，
+    /// 2 千分（% 按 n*10，倍数按 n*1000；消费端乘 fontPx / 1000）。
+    static void LineHeightOf(StyleBox b, string v) {
+        string t = StyleSheet.Lower(StyleSheet.Trim(v));
+        if (t == "normal" || t == "") {
+            b.lineHeight = 0;
+            b.lineHeightKind = 0;
+            return;
+        }
+        int n = t.Length;
+        string last = t.Substring(n - 1, 1);
+        if (last == "%") {
+            double d = StyleSheet.ParseDbl(t.Substring(0, n - 1));
+            b.lineHeight = (int)(d * 10.0);
+            b.lineHeightKind = 2;
+            return;
+        }
+        if (Css.IndexFrom("0123456789", last, 0) >= 0) {
+            double d = StyleSheet.ParseDbl(t);
+            b.lineHeight = (int)(d * 1000.0);
+            b.lineHeightKind = 2;
+            return;
+        }
+        b.lineHeight = StyleSheet.Len(b, v);
+        b.lineHeightKind = 1;
+    }
+
     static bool DeclText(StyleBox b, string k, string v) {
         if (k == "color") { b.fg = StyleSheet.ParseColor(v); return true; }
         if (k == "accent-color") { b.accent = StyleSheet.ParseColor(v); return true; }
         if (k == "font-size" || k == "font") { b.fontPx = StyleSheet.Len(b, v); return true; }
         if (k == "font-weight") { b.fontWeight = StyleSheet.Weight(v); return true; }
-        if (k == "line-height") { b.lineHeight = StyleSheet.Len(b, v); return true; }
+        if (k == "line-height") { StyleSheet.LineHeightOf(b, v); return true; }
         if (k == "letter-spacing") { b.letterSpacing = StyleSheet.Len(b, v); return true; }
         if (k == "text-shadow") { StyleSheet.DeclTextShadow(b, v); return true; }
         if (k == "text-align") {
@@ -1040,7 +1069,10 @@ class StyleSheet {
         }
         if (k == "white-space") {
             b.nowrap = 0;
-            if (v == "nowrap" || v == "pre") { b.nowrap = 1; }
+            b.whiteSpace = 0;
+            if (v == "nowrap") { b.nowrap = 1; b.whiteSpace = 1; }
+            else if (v == "pre") { b.nowrap = 1; b.whiteSpace = 2; }
+            else if (v == "pre-wrap") { b.whiteSpace = 3; }
             return true;
         }
         return false;
@@ -1164,8 +1196,19 @@ class StyleSheet {
     static bool DeclLayout(StyleBox b, string k, string v) {
         if (k == "display") {
             b.display = 0;
-            if (v == "flex" || v == "inline-flex") { b.display = 1; }
-            if (v == "none") { b.display = 2; }
+            b.inlineLevel = 0;
+            if (v == "flex") { b.display = 1; }
+            else if (v == "inline-flex") { b.display = 1; b.inlineLevel = 1; }
+            else if (v == "none") { b.display = 2; }
+            else if (v == "block" || v == "flow-root" || v == "grid") {
+                // 真块流（P0 起）；grid 在 P4 落地前按块流退化
+                // （GuardValueKnown 不认 grid，@supports 兜底仍判假）。
+                b.display = 3;
+            }
+            else if (v == "inline" || v == "inline-block") {
+                b.display = 3; b.inlineLevel = 1;
+            }
+            else { b.display = 0; }
             return true;
         }
         if (k == "flex-direction") {
@@ -1280,15 +1323,28 @@ class StyleSheet {
             return true;
         }
         if (k == "cursor") { b.cursor = StyleSheet.CursorCode(v); return true; }
-        // 本引擎的盒子一律是 border-box（内边距与边框都在声明尺寸
-        // 之内），所以这条属性照收但不改任何东西——认下来是为了
-        // 让作者照常写它，而不是让它掉到 Control.SetProp 里去。
-        if (k == "box-sizing") { return true; }
-        // `float` 同理：引擎没有浮动布局（排版只有 dock 与 flex），
-        // 照收是为了不让它落到 SetProp 里被当成 class 加进控件
-        // （`float: right` 会凭空加一个 `.right` 类，撞上皮肤里
-        // 任何 `.right` 规则）。没有任何视觉效果，见 StyleSheet.Inert。
-        if (k == "float") { return true; }
+        // box-sizing 真语义（P0）：0 border-box（缺省）= 声明尺寸含
+        // border+padding；1 content-box = 声明尺寸只含内容，布局端
+        // 反推框宽。消费点：Control 的内容框计算与 StyleWidthIn/HeightIn。
+        if (k == "box-sizing") {
+            b.boxSizing = v == "content-box" ? 1 : 0;
+            return true;
+        }
+        // float 真布局（P3 完成绕排；P0 起解析存储）。此前空转是怕
+        // 键名漏到 SetProp 变 class——现在 Decl 消费它，同样不会漏。
+        if (k == "float") {
+            b.floatSide = 0;
+            if (v == "left") { b.floatSide = 1; }
+            else if (v == "right") { b.floatSide = 2; }
+            return true;
+        }
+        if (k == "clear") {
+            b.clearSide = 0;
+            if (v == "left") { b.clearSide = 1; }
+            else if (v == "right") { b.clearSide = 2; }
+            else if (v == "both") { b.clearSide = 3; }
+            return true;
+        }
         return false;
     }
 
@@ -1300,7 +1356,6 @@ class StyleSheet {
     /// 仍然走 SetProp 的 prop/class 通道。
     static bool Inert(string key) {
         string k = StyleSheet.Lower(StyleSheet.Trim(key));
-        if (k == "box-sizing" || k == "float" || k == "clear") { return true; }
         // 字体族/字重族：引擎只有字号与字重，字体名没有注册表可查。
         if (k == "font-family" || k == "font-style" || k == "font-variant"
             || k == "font-stretch" || k == "font-kerning"

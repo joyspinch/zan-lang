@@ -146,6 +146,20 @@ token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
   顺序。`overflow: visible` 放行子节点溢出(缺省引擎裁剪,显式声明才变
   行为)。type 选择器大小写不敏感(`Button` 与 `button` 都命中,引擎按
   `Kind()` 的小写匹配);class/id 仍区分大小写。
+- **Web 等价布局已落地第一批（WEB_GUI_ROADMAP P0,2026-09-12)**:`display: block`
+  现在是**真块流**(垂直堆叠/未声明宽填满/margin 全算;`flow-root` 同义,`grid`
+  暂退化,`inline`/`inline-block` 落行内级)——写成 CSS 的树走 web 语义,没写
+  display 的老代码走 legacy 零回归。**border 参与布局**:内容框 = 框 − border −
+  padding(与 `box-sizing: border-box` 一致,引擎缺省即 border-box;显式
+  `content-box` 时声明尺寸只含内容,布局反推框宽);`box-sizing`/`float`/
+  `clear` 全部真实解析(float 绕排 P3)。`line-height` 支持三态:`normal`/
+  无单位倍数/`%`(换算成像素消费)。UA 样式表内置 web 缺省(div/p/h1-h6 的
+  display/字号/margin),皮肤与应用样式按层叠覆盖它;`Element` 通用容器
+  (kind=标签名)写 web 风格容器用。块流骨架与 Chrome 的坐标一致性由
+  `scripts/web_oracle.py`(Chrome headless getBoundingClientRect 逐盒对比)
+  验证,basic 用例 5 盒 0px 偏差;已知偏差(父子 margin 塌陷=P1)记录在
+  `docs/WEB_GUI_ROADMAP.md` 台账。
+
 - **`!important` 真的压得住 inline**:带标记的声明单独存、在普通级联
   (含宿主 inline)之后统一再套一遍,不是"剥掉标记按顺序碰运气"。
 - **渐变只认两端+中间一档**(`linear-gradient([dir,] a, b[, c])`);停靠点上的

@@ -55,10 +55,12 @@ CORPUS_A = [
 
 # 浏览器/打印/原生表单控件专属：retained-mode 控件工具箱没有对应动作，把它们
 # 算进"支持度"分母只会让数字难看而没有行动价值。默认单独归一类，`--all` 时并入。
+# display/float/clear 自 WEB_GUI_ROADMAP P0 起是真实布局键（不再归入
+# 网页专属类）；white-space/vertical-align 待 P2 行盒消费后同批移出。
 FLOW_ONLY = re.compile(
     r'^(-webkit-|-moz-|-ms-|-o-|page-break|break-|content$|quotes$|counter-'
-    r'|list-style|outline|orphans$|widows$|float$|clear$|white-space$'
-    r'|display$|vertical-align$)'
+    r'|list-style|outline|orphans$|widows$|white-space$'
+    r'|vertical-align$)'
 )
 
 # 有求值器的单位（StyleSheet.HasUnresolvedUnit 的白名单 + 角度补充）。

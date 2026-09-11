@@ -633,6 +633,26 @@ class Control {
         return padB;
     }
 
+    // 内容框内衬 = border + padding（WEB_GUI_ROADMAP P0 起 border 参与
+    // 布局：box-sizing: border-box 的声明尺寸含边框）。布局端（Arrange/
+    // Measure*/PropagateWrapHint）一律用 Inset 而不是裸 pad。
+    int StyleInsetL() {
+        if (computedStyle == null) { return this.StylePadL(); }
+        return this.StylePadL() + computedStyle.BorderLeftPx();
+    }
+    int StyleInsetT() {
+        if (computedStyle == null) { return this.StylePadT(); }
+        return this.StylePadT() + computedStyle.BorderTopPx();
+    }
+    int StyleInsetR() {
+        if (computedStyle == null) { return this.StylePadR(); }
+        return this.StylePadR() + computedStyle.BorderRightPx();
+    }
+    int StyleInsetB() {
+        if (computedStyle == null) { return this.StylePadB(); }
+        return this.StylePadB() + computedStyle.BorderBottomPx();
+    }
+
     /// 此节点的 CSS `display`：0 block（子节点停靠），1 flex（子节点沿
     /// flex-direction 排列），2 none。
     int StyleDisplay() {
@@ -645,14 +665,36 @@ class Control {
     /// 回退到测量偏好（prefW/prefH）。
     int StyleWidthIn(int avail) {
         if (computedStyle == null) { return prefW; }
-        return computedStyle.ClampWIn(avail, computedStyle.WidthIn(avail, prefW));
+        int w = computedStyle.ClampWIn(avail, computedStyle.WidthIn(avail, prefW));
+        // box-sizing: content-box 的声明宽度只含内容——布局要的是
+        // 框宽，反推加上 border 与 padding。
+        if (computedStyle.boxSizing == 1 && computedStyle.width >= 0) {
+            w = w + computedStyle.BorderLeftPx() + computedStyle.BorderRightPx()
+                + this.StylePadL() + this.StylePadR();
+        } else if (computedStyle.width >= 0) {
+            // border-box：内容区不为负——声明尺寸小于 border+padding
+            // 之和时，框被钳到 border+padding（Chrome 同款行为）。
+            int minBox = computedStyle.BorderLeftPx() + computedStyle.BorderRightPx()
+                + this.StylePadL() + this.StylePadR();
+            if (w < minBox) { w = minBox; }
+        }
+        return w;
     }
 
     /// 生效高度：在 `avail` 像素包含块内解析样式声明的高度
     /// （百分比、min/max 同 StyleWidthIn），未声明时回退 prefH。
     int StyleHeightIn(int avail) {
         if (computedStyle == null) { return prefH; }
-        return computedStyle.ClampHIn(avail, computedStyle.HeightIn(avail, prefH));
+        int h = computedStyle.ClampHIn(avail, computedStyle.HeightIn(avail, prefH));
+        if (computedStyle.boxSizing == 1 && computedStyle.height >= 0) {
+            h = h + computedStyle.BorderTopPx() + computedStyle.BorderBottomPx()
+                + this.StylePadT() + this.StylePadB();
+        } else if (computedStyle.height >= 0) {
+            int minBox = computedStyle.BorderTopPx() + computedStyle.BorderBottomPx()
+                + this.StylePadT() + this.StylePadB();
+            if (h < minBox) { h = minBox; }
+        }
+        return h;
     }
 
     /// 样式表声明了宽度/高度（如 `button.large` 这样的尺寸类）时为 true，
@@ -773,6 +815,11 @@ class Control {
 
     /// 行高（CSS `line-height`，0 = 未声明：由该行最高的子项决定）。
     int StyleLineHeight() {
+        if (computedStyle != null && computedStyle.lineHeightKind == 2) {
+            int fs = computedStyle.fontPx > 0
+                ? computedStyle.fontPx : computedStyle.envRemPx;
+            return computedStyle.lineHeight * fs / 1000;
+        }
         if (computedStyle != null) { return computedStyle.lineHeight; }
         return 0;
     }
@@ -1175,7 +1222,7 @@ class Control {
         int inner = prefW;
         if (inner <= 0) { inner = hintWrapW; }
         if (inner <= 0) { return; }
-        inner = inner - this.StylePadL() - this.StylePadR();
+        inner = inner - this.StyleInsetL() - this.StyleInsetR();
         if (inner <= 0) { return; }
         bool flex = this.StyleDisplay() == 1;
         bool flexRow = flex
@@ -1192,6 +1239,68 @@ class Control {
         }
     }
 
+    /// 真块流测量（display: flow，WEB_GUI_ROADMAP P0 骨架，P1 补全
+    /// margin 塌陷/auto 语义）：块级子项垂直堆叠，容器宽取最宽子项、
+    /// 高取各行之和（gap 同样生效）。行内级子项 P0 暂按块处理（P2 行盒）。
+    void MeasureFlow(App app) {
+        if (prefW > 0 && prefH > 0) { return; }
+        int sumH = 0;
+        int maxW = 0;
+        int rows = 0;
+        List<Control> kids = this.FlexKids();
+        for (int i = 0; i < kids.Count; i = i + 1) {
+            Control c = kids[i];
+            // 高度取声明值（含 border-box 下限钳制），未声明回退测量
+            // 偏好——叶子元素的 pref 是 0，"空 div 高为零"就是对的。
+            // 包含块尚未确定，百分比高按 0（与 flex 测量同规矩）。
+            int h = c.StyleHeightIn(0) + c.MarCross(true);
+            int w = 0;
+            if (c.StyleDeclaresWidth()) { w = c.StyleWidthIn(0); }
+            else { w = c.prefW; }
+            w = w + c.MarMain(true);
+            sumH = sumH + h;
+            if (w > maxW) { maxW = w; }
+            rows = rows + 1;
+        }
+        int gapPx = this.StyleGap();
+        if (rows > 1) { sumH = sumH + gapPx * (rows - 1); }
+        if (prefH <= 0 && sumH > 0) {
+            prefH = sumH + this.StyleInsetT() + this.StyleInsetB();
+            this.fillH = true;
+        }
+        if (prefW <= 0 && maxW > 0) {
+            prefW = maxW + this.StyleInsetL() + this.StyleInsetR();
+            this.fillW = true;
+        }
+    }
+
+    /// 真块流排布（P0 骨架）：块级子项从上到下；声明了宽度的用声明
+    /// 值，未声明的填满内容框（CSS 块级 auto 宽）；高度声明了用声明
+    /// 值、否则用测量偏好。margin 四边全算（塌陷 P1）。
+    void ArrangeFlow(int cx, int cy, int cw, int ch, int gapPx) {
+        int y = cy;
+        List<Control> kids = this.FlexKids();
+        for (int i = 0; i < kids.Count; i = i + 1) {
+            Control c = kids[i];
+            int mt = c.StyleMarT();
+            int mb = c.StyleMarB();
+            int ml = c.StyleMarL();
+            int mr = c.StyleMarR();
+            int w = 0;
+            if (c.StyleDeclaresWidth()) { w = c.StyleWidthIn(cw); }
+            else { w = cw - ml - mr; }
+            int h = 0;
+            if (c.StyleDeclaresHeight()) { h = c.StyleHeightIn(ch); }
+            else { h = c.prefH; }
+            if (w < 0) { w = 0; }
+            if (h < 0) { h = 0; }
+            y = y + mt;
+            c.Arrange(cx + ml, y, w, h);
+            y = y + h + mb;
+            if (i < kids.Count - 1) { y = y + gapPx; }
+        }
+    }
+
     /// 停靠容器在没人给尺寸时按内容测量：一列停靠的行
     /// 高等于各行之和，一行停靠的控件宽等于各控件之和
     /// （加上内边距和间距）。少了这一步，设计器只能给
@@ -1199,8 +1308,13 @@ class Control {
     /// 只填补留空的那根轴：OnMeasure 或作者给过的尺寸优先。
     void MeasureDocked(App app) {
         if (children.Count == 0) { return; }
-        if (this.StyleDisplay() == 1) {
+        int disp = this.StyleDisplay();
+        if (disp == 1) {
             this.MeasureFlexContent(app);
+            return;
+        }
+        if (disp == 3) {
+            this.MeasureFlow(app);
             return;
         }
         if (prefW > 0 && prefH > 0) { return; }
@@ -1229,11 +1343,11 @@ class Control {
         if (sumH < maxH) { sumH = maxH; }
         if (sumW < maxW) { sumW = maxW; }
         if (prefH <= 0 && sumH > 0) {
-            prefH = sumH + this.StylePadT() + this.StylePadB();
+            prefH = sumH + this.StyleInsetT() + this.StyleInsetB();
             this.fillH = true;
         }
         if (prefW <= 0 && sumW > 0) {
-            prefW = sumW + this.StylePadL() + this.StylePadR();
+            prefW = sumW + this.StyleInsetL() + this.StyleInsetR();
             this.fillW = true;
         }
     }
@@ -1267,12 +1381,12 @@ class Control {
             // flexWrapMain 可用，这是它唯一能算准行数的依据。
             // 纵向容器的主轴是高度，这个提示不适用。
             if (row && hintWrapW > 0) {
-                wrapMain = hintWrapW - this.StylePadL() - this.StylePadR();
+                wrapMain = hintWrapW - this.StyleInsetL() - this.StyleInsetR();
             }
             if (row && prefW > 0) {
-                wrapMain = prefW - this.StylePadL() - this.StylePadR();
+                wrapMain = prefW - this.StyleInsetL() - this.StyleInsetR();
             } else if (!row && prefH > 0) {
-                wrapMain = prefH - this.StylePadT() - this.StylePadB();
+                wrapMain = prefH - this.StyleInsetT() - this.StyleInsetB();
             }
         }
 
@@ -1321,20 +1435,20 @@ class Control {
 
         if (row) {
             if (prefW <= 0 && mainMax > 0) {
-                prefW = mainMax + this.StylePadL() + this.StylePadR();
+                prefW = mainMax + this.StyleInsetL() + this.StyleInsetR();
                 this.fillW = true;
             }
             if (prefH <= 0 && crossSum > 0) {
-                prefH = crossSum + this.StylePadT() + this.StylePadB();
+                prefH = crossSum + this.StyleInsetT() + this.StyleInsetB();
                 this.fillH = true;
             }
         } else {
             if (prefH <= 0 && mainMax > 0) {
-                prefH = mainMax + this.StylePadT() + this.StylePadB();
+                prefH = mainMax + this.StyleInsetT() + this.StyleInsetB();
                 this.fillH = true;
             }
             if (prefW <= 0 && crossSum > 0) {
-                prefW = crossSum + this.StylePadL() + this.StylePadR();
+                prefW = crossSum + this.StyleInsetL() + this.StyleInsetR();
                 this.fillW = true;
             }
         }
@@ -1372,10 +1486,10 @@ class Control {
         by = py;
         bw = pw;
         bh = ph;
-        int innerPadL = this.StylePadL();
-        int innerPadT = this.StylePadT();
-        int innerPadR = this.StylePadR();
-        int innerPadB = this.StylePadB();
+        int innerPadL = this.StyleInsetL();
+        int innerPadT = this.StyleInsetT();
+        int innerPadR = this.StyleInsetR();
+        int innerPadB = this.StyleInsetB();
         int innerGap = this.StyleGap();
         int cx = px + innerPadL;
         int cy = py + innerPadT;
@@ -1390,7 +1504,14 @@ class Control {
         int pby = py;
         int pbw = pw;
         int pbh = ph;
-        if (this.StyleDisplay() == 1) {
+        int dispBox = this.StyleDisplay();
+        if (dispBox == 3) {
+            this.ArrangeFlow(cx, cy, cw, ch, innerGap);
+            this.ArrangePositioned(pbx, pby, pbw, pbh);
+            this.CheckKidsLayout();
+            return;
+        }
+        if (dispBox == 1) {
             this.ArrangeFlex(cx, cy, cw, ch, innerGap);
             this.ArrangePositioned(pbx, pby, pbw, pbh);
             this.CheckKidsLayout();

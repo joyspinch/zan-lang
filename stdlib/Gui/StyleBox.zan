@@ -104,7 +104,8 @@ class StyleBox {
     int columns;
 
     // ---- layout -------------------------------------------------------------
-    int display;     // 0 block，1 flex，2 none
+    int display;     // 0 legacy（无 CSS 缺省：dock/手摆），1 flex，2 none，
+                     // 3 flow（真块流，WEB_GUI_ROADMAP P0）
     int flexDir;     // 0 row，1 column
     int justify;     // 0 start，1 center，2 end，3 space-between，4 space-around
     int alignItems;  // 0 stretch，1 start，2 center，3 end
@@ -139,6 +140,24 @@ class StyleBox {
     // StyleSheet.ResolveCurrentColor 替换成最终前景色。
     int ccMask;
     int visible;     // 0 = visibility: hidden
+
+    // ---- web 布局扩展（WEB_GUI_ROADMAP P0）---------------------------------
+    /// 行内级标记：1 = inline/inline-block/inline-flex（参与父块流容器
+    /// 的行盒横排）。0 = 块级。
+    int inlineLevel;
+    /// CSS `float`：0 none，1 left，2 right（P3 完成绕排布局）。
+    int floatSide;
+    /// CSS `clear`：0 none，1 left，2 right，3 both。
+    int clearSide;
+    /// CSS `box-sizing`：0 border-box（缺省，声明尺寸含 border+padding），
+    /// 1 content-box（声明尺寸只含内容，布局端反推框宽）。
+    int boxSizing;
+    /// CSS `white-space`：0 normal，1 nowrap，2 pre，3 pre-wrap。
+    /// 旧字段 nowrap 同步维护（绘制端"不折行"位）：nowrap/pre 置 1。
+    int whiteSpace;
+    /// `line-height` 的量纲：0 未声明/normal，1 px（lineHeight），
+    /// 2 千分（lineHeight = 相对 fontPx 的倍数 * 1000，含 % 形式）。
+    int lineHeightKind;
 
     // ---- motion -------------------------------------------------------------
     int transitionMs;
@@ -236,6 +255,8 @@ class StyleBox {
         // overflow 缺省 1 = 裁剪（引擎约定：子节点不画出界）；
         // CSS 的 visible 是显式声明才落 0（放行溢出）。
         this.overflow = 1; this.zIndex = 0; this.cursor = 0; this.visible = 1;
+        this.inlineLevel = 0; this.floatSide = 0; this.clearSide = 0;
+        this.boxSizing = 0; this.whiteSpace = 0; this.lineHeightKind = 0;
         this.transitionMs = 0 - 1; this.easing = 0;
         this.anim = 0; this.animMs = 0;
         this.tx = 0; this.ty = 0; this.scale = 1000; this.rotate = 0;
@@ -289,6 +310,9 @@ class StyleBox {
         d.overflow = overflow; d.zIndex = zIndex; d.cursor = cursor;
         d.ccMask = ccMask;
         d.visible = visible;
+        d.inlineLevel = inlineLevel; d.floatSide = floatSide;
+        d.clearSide = clearSide; d.boxSizing = boxSizing;
+        d.whiteSpace = whiteSpace; d.lineHeightKind = lineHeightKind;
         d.transitionMs = transitionMs; d.easing = easing;
         d.anim = anim; d.animMs = animMs;
         d.tx = tx; d.ty = ty; d.scale = scale; d.rotate = rotate;
@@ -296,6 +320,14 @@ class StyleBox {
     }
 
     // ---- fallback accessors -------------------------------------------------
+
+    /// 各边 border 实际宽度（px）：四边声明优先，未声明回退统一
+    /// `borderW`。border 参与布局（WEB_GUI_ROADMAP P0）——
+    /// box-sizing: border-box 时内容框 = 框 − border − padding。
+    int BorderTopPx() { return borderTopW > 0 ? borderTopW : this.BorderWOr(0); }
+    int BorderRightPx() { return borderRightW > 0 ? borderRightW : this.BorderWOr(0); }
+    int BorderBottomPx() { return borderBottomW > 0 ? borderBottomW : this.BorderWOr(0); }
+    int BorderLeftPx() { return borderLeftW > 0 ? borderLeftW : this.BorderWOr(0); }
 
     /// 填充背景色；未设置（0）返回 fb。
     int BgOr(int fb)      { if (bg != 0) { return bg; } return fb; }
@@ -873,6 +905,16 @@ class StyleBox {
     /// 在 [x,y,w,h] 内绘制标签，遵循颜色、字号/字重、
     /// text-align、vertical-align、letter-spacing、text-transform 和
     /// text-overflow: ellipsis。返回实际绘制的宽度。
+    /// 行高像素：量纲 1 = lineHeight（px）；2 = 千分倍 × 字号
+    /// （`line-height: 1.5` / `150%`）。0 = 未声明/normal。
+    int LineHeightPx(int fs) {
+        if (lineHeightKind == 2) {
+            int f = fs > 0 ? fs : 16;
+            return lineHeight * f / 1000;
+        }
+        return lineHeight;
+    }
+
     int DrawLabel(App app, int x, int y, int w, int h, string label) {
         if (label == "" || visible == 0 || display == 2) { return 0; }
         Canvas c = app.canvas;
@@ -882,23 +924,29 @@ class StyleBox {
         if (textCase == 1) { s = s.ToUpper(); }
         else if (textCase == 2) { s = s.ToLower(); }
 
-        int avail = w - this.PadLOr(0) - this.PadROr(0);
+        int avail = w - this.PadLOr(0) - this.PadROr(0)
+            - this.BorderLeftPx() - this.BorderRightPx();
         int tw = StyleBox.MeasureSpaced(s, fs, letterSpacing);
         if (ellipsis == 1 && avail > 0 && tw > avail) {
             s = StyleBox.Truncate(s, fs, letterSpacing, avail);
             tw = StyleBox.MeasureSpaced(s, fs, letterSpacing);
         }
 
-        int tx0 = x + this.PadLOr(0);
+        int tx0 = x + this.PadLOr(0) + this.BorderLeftPx();
         if (align == 1) { tx0 = x + (w - tw) / 2; }
-        else if (align == 2) { tx0 = x + w - this.PadROr(0) - tw; }
+        else if (align == 2) {
+            tx0 = x + w - this.PadROr(0) - this.BorderRightPx() - tw;
+        }
 
         int fh = Canvas.FontHeight(fs);
-        int ty0 = y + this.PadTOr(0);
+        int ty0 = y + this.PadTOr(0) + this.BorderTopPx();
         if (align >= 0 && valign < 0) { ty0 = y + (h - fh) / 2; }
         if (valign == 1) { ty0 = y + (h - fh) / 2; }
-        else if (valign == 2) { ty0 = y + h - this.PadBOr(0) - fh; }
-        if (lineHeight > 0) { ty0 = y + (lineHeight - fh) / 2; }
+        else if (valign == 2) {
+            ty0 = y + h - this.PadBOr(0) - this.BorderBottomPx() - fh;
+        }
+        int lhPx = this.LineHeightPx(fs);
+        if (lhPx > 0) { ty0 = y + (lhPx - fh) / 2; }
 
         this.DrawRun(c, tx0, ty0, s, col, fs);
         return tw;
