@@ -193,6 +193,20 @@ description: 把现有程序迁移/复刻到 Zan、或以某个成熟产品为�
   的块（表格、按钮条），外面必须套一层 `Row`——`Prefer(宽,0)` 在 Column 里会被拉满。
   踩过：帮助页的公式表头蓝带被拉到页面右沿，实测 1511 对原版 1429；套 `Row` 后列宽
   按 `prefW` 取，正好等于各列宽之和。
+- **手摆坐标（`DockManual()` + `Place(x,y)`）只在"普通流"容器里生效**：容器一旦
+  `display:flex`，引擎的 `ArrangeFlex`/`FlexKids` 会把**每个**子节点都当 flex item，
+  忽略 mx/my 并按 flex 规则缩宽——编译、运行、点击全不报错。踩过：五行修炼页
+  （整页一张底图 + 叠层）给页面容器写了 `display:flex`，1117 宽的底图被压成 292、
+  所有叠加挤在一行。要手摆偏移就别给容器 flex。另外 `dock==0` 的子节点尺寸来自
+  `StyleWidth()/StyleHeight()`（CSS width/height，没有才用 `Prefer`），偏移点与
+  尺寸要成套给。
+- **部件伪类选择器（`::track`/`::fill`/`::box`…）的类串是控件自己交出去的**：解析走
+  `StyleSheet.ApplyCascadeCtx` 把控件传的**类串**按空白切成类集合，所以
+  `.my-widget::part` 能不能命中，取决于控件有没有把自己的 `Class` 传进去。踩过：
+  `Checkbox` 传（所以 `.st-check::box` 生效），`Progress` 原来只传变体类，给进度条
+  挂了用户类后 `.el-bar::track` **静默不生效**、颜色悄悄退回皮肤默认。这类"样式写了
+  没反应"先查控件交出去的类串，别在 CSS 里试参数；是组件的锅就在组件里修
+  （`PartCls() = 变体 + " " + Class` 两处调用点都换掉），并补一条 conformance 用例。
 - **`Padding` 是从盒子自己的固定高里扣的**：给一个定高盒子加 `Padding(top,…)` 当作
   "它上面的空隙"，它会把这空隙从自身高里吃掉。踩过：设置页底部按钮行高 54 设备、
   `Padding(top,…)` 扣掉后只剩 1.5 设备，按钮被压成一条线。正确做法是在它**前面**

@@ -1,0 +1,188 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Legend;
+
+/// 页 10「五行修炼」——照原版还原（`五星修炼.png`）。
+///
+/// 这一页的形态与别的页不同：**整页主体是一张图**。`assets/ui/00249.jpg`
+/// （745×475）里已经画好了左半那圈金色五行大阵、右半五行列表的五条行框、
+/// 行内那条空槽、两个按钮空框，以及「金木水火土」五个彩色字——原版这页
+/// 就是拿这张图铺上去，再叠运行时数据。所以本页只做叠加：
+///
+///   ① 右列 5 行 × [元素图标 32×32 · 进度条 · 升级 · 注入]
+///   ② 左下「修炼经验: 0」「修炼时间: 无」两行
+///   ③ 底部 [说明] [开始修炼]
+///
+/// 底图定位走实测：`device = img × 1.5 + (380,166)`（用右列 5 条行框的
+/// 上下边做多尺度 NCC，scale 命中 1.5、偏移为全局最优），故底图相对内容框
+/// 偏移 (6,2)。所有叠加坐标都以**底图左上角**为原点，见 `Spec` 的 `El*` 段。
+///
+/// 与用户口径一致：列表用一组实体（`ElRow`）驱动，进度/数量这类值最终由
+/// 服务端下发，本页把**字段结构**定死、值先占位——不去为抄准某个数字反复量图。
+partial class LegendApp {
+
+    // ---------------------------------------------------------------- 数据
+
+    /// 一行五行：元素名 + 图标 + 进度 + 两个动作钮的文案。
+    /// 名称配色/进度当前值都是服务端下发项，这里只固定结构。
+    class ElRow {
+        string name;        // 金/木/水/火/土
+        string cls;         // 名称配色类（原版画在底图里，留给后续自绘/悬浮提示）
+        int itemId;         // 该系的碎片道具号（491..495 = 金木水火土碎片）
+        int progress;       // 修炼进度
+        int progressMax;
+    }
+
+    static ElRow ElRowOf(string name, string cls, int itemId, int prog, int max) {
+        ElRow r = new ElRow();
+        r.name = name; r.cls = cls; r.itemId = itemId;
+        r.progress = prog; r.progressMax = max;
+        return r;
+    }
+
+    /// 五行顺序照原版自上而下：金 木 水 火 土（碎片道具号 491..495，
+    /// 图标 picture 2643/2647/2645/2646/2648 —— 红/蓝/绿/黄/紫，与原版五格一致）。
+    static List<ElRow> ElRows() {
+        List<ElRow> v = new List<ElRow>();
+        v.Add(ElRowOf("金", "el-n-jin", 491, 0, 100));
+        v.Add(ElRowOf("木", "el-n-mu", 492, 0, 100));
+        v.Add(ElRowOf("水", "el-n-shui", 493, 0, 100));
+        v.Add(ElRowOf("火", "el-n-huo", 494, 0, 100));
+        v.Add(ElRowOf("土", "el-n-tu", 495, 0, 100));
+        return v;
+    }
+
+    /// 左下两行信息。值由服务端下发，这里只给字段。
+    string elExp = "0";        // 修炼经验
+    string elTime = "无";      // 修炼时间
+
+    // ---------------------------------------------------------------- 版面
+
+    void BuildElementPage() {
+        Panel stage = Panel.Row(); stage.Class = "el-page";
+        stage.Pad(0); stage.Gap(0);
+        stage.Prefer(0, Spec.ElStageH());
+        content.With(stage);
+
+        /* 整张底图。`stretch` 到实测尺寸——图本身就是按 1.5× 贴的，
+           拉伸只是把 745×475 还原成 1117×712 设备。 */
+        Image bg = new Image(ElementArtPath(), "五行修炼", "stretch");
+        bg.Prefer(Spec.ElArtW(), Spec.ElArtH());
+        bg.DockManual();
+        bg.Place(Spec.ElArtX(), Spec.ElArtY());
+        stage.Add(bg);
+
+        List<ElRow> rows = ElRows();
+        for (int i = 0; i < Spec.ElRows(); i = i + 1) {
+            int idx = i;
+            ElRow r = i < rows.Count ? rows[i] : null;
+            int dy = Spec.ElArtY() + i * Spec.ElPitch();
+            ElIcon(stage, r, dy);
+            ElProgress(stage, r, dy);
+            ElRowBtn(stage, "升级", "el-mini", Spec.ElBtnUpX(), Spec.ElBtnW(),
+                     dy + Spec.ElBtnY(), () => { ElementAct(idx, "升级"); });
+            ElRowBtn(stage, "注入", "el-mini", Spec.ElBtnInX(), Spec.ElBtnW2(),
+                     dy + Spec.ElBtnY(), () => { ElementAct(idx, "注入"); });
+        }
+
+        ElementInfo(stage);
+        ElementActions(stage);
+    }
+
+    /* 底图路径收在一个函数里：素材若换名/换图只改这里（与各页一致的
+       「素材缺口收口」做法）。 */
+    static string ElementArtPath() { return "assets/ui/00249.jpg"; }
+
+    /// 槽框：原版这层是青铜绞花的专用格图，assets 里没有同款（对全 assets
+    /// 按原版槽框做过多尺度 NCC，最高 0.44 = 噪声）。按素材缺口的规矩——不拿
+    /// 截图冒充、不自己画——用尺寸最接近的现成格子底 `ui/00211.png`
+    /// （背包/祭坛页共用的空槽底，45×43 逻辑）拉伸占位，并登记为偏差。
+    static string ElementSlotPath() { return CellEmptyPath(); }
+
+    /// ①-a 槽框 + 槽内元素图标（原版这两层都是运行时叠在底图上的）。
+    void ElIcon(Panel stage, ElRow r, int dy) {
+        if (r == null) { return; }
+        Image slot = new Image(ElementSlotPath(), "元素槽", "stretch");
+        slot.Prefer(Spec.ElSlotW(), Spec.ElSlotH());
+        slot.DockManual();
+        slot.Place(Spec.ElArtX() + Spec.ElSlotX(), dy + Spec.ElSlotY());
+        stage.Add(slot);
+
+        Image ic = new Image(ItemArtById(r.itemId), r.name, "contain");
+        ic.Prefer(Spec.ElIconW(), Spec.ElIconH());
+        ic.DockManual();
+        ic.Place(Spec.ElArtX() + Spec.ElIconX(), dy + Spec.ElIconY());
+        stage.Add(ic);
+    }
+
+    /// ①-b 行内进度条：原版是空条（进度 0），数值由服务端下发。
+    void ElProgress(Panel stage, ElRow r, int dy) {
+        int cur = r != null ? r.progress : 0;
+        int max = r != null && r.progressMax > 0 ? r.progressMax : 100;
+        Progress pb = new Progress(cur * 100 / max, 1);
+        pb.ShowText(false);
+        pb.Class = "el-bar";
+        pb.Prefer(Spec.ElBarW(), Spec.ElBarH());
+        pb.DockManual();
+        pb.Place(Spec.ElArtX() + Spec.ElBarX(), dy + Spec.ElBarY());
+        stage.Add(pb);
+    }
+
+    /// ①-c 行内小按钮（升级/注入）——原版底图只画了空框，文字与命中区是控件。
+    void ElRowBtn(Panel stage, string label, string cls, int imgX, int imgW,
+                  int devY, Action fn) {
+        Button b = BtnDev(label, cls, imgW, Spec.ElBtnH(), fn);
+        b.DockManual();
+        b.Place(Spec.ElArtX() + imgX, devY);
+        stage.Add(b);
+    }
+
+    /// ② 左下「修炼经验: 0」「修炼时间: 无」两行。
+    void ElementInfo(Panel stage) {
+        ElementInfoLine(stage, "修炼经验: " + elExp, "el-info-g",
+                        Spec.ElArtY() + Spec.ElInfoY());
+        ElementInfoLine(stage, "修炼时间: " + elTime, "el-info-y",
+                        Spec.ElArtY() + Spec.ElInfoY() + Spec.ElInfoRowH());
+    }
+
+    void ElementInfoLine(Panel stage, string s, string cls, int devY) {
+        Label l = Text(s, cls, 0);
+        l.Prefer(Spec.ElInfoW(), Spec.ElInfoRowH());
+        l.DockManual();
+        l.Place(Spec.ElArtX() + Spec.ElInfoX(), devY);
+        stage.Add(l);
+    }
+
+    /// ③ 底部 [说明] [开始修炼]。
+    void ElementActions(Panel stage) {
+        int y = Spec.ElArtY() + Spec.ElActY();
+        Button help = BtnDev("说明", "el-act", Spec.ElHelpW(), Spec.ElActH(),
+                             () => { ElementAct(-1, "说明"); });
+        help.DockManual();
+        help.Place(Spec.ElArtX() + Spec.ElHelpX(), y);
+        stage.Add(help);
+
+        Button start = BtnDev("开始修炼", "el-act", Spec.ElStartW(), Spec.ElActH(),
+                              () => { ElementAct(-1, "开始修炼"); });
+        start.DockManual();
+        start.Place(Spec.ElArtX() + Spec.ElStartX(), y);
+        stage.Add(start);
+    }
+
+    // ---------------------------------------------------------------- 动作
+
+    /// 五行按钮动作。数值/消耗/成功率都由服务端裁决，这里只把「点了哪一行的
+    /// 哪个动作」记成一条日志——UI 准备工作阶段不做本地假结算。
+    void ElementAct(int row, string what) {
+        if (row < 0) { ElSay("五行修炼：" + what + "（操作待接服务端）。"); return; }
+        List<ElRow> rows = ElRows();
+        string name = row < rows.Count ? rows[row].name : "?";
+        ElSay("五行修炼：" + name + "→" + what + "（操作待接服务端）。");
+    }
+
+    void ElSay(string msg) {
+        if (net.Self() != null) { net.AddChat("[系统]", msg); return; }
+        g.Log(msg);
+    }
+}
