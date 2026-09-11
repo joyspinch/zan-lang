@@ -6,7 +6,9 @@ namespace Gui;
 /// asc = 字体 ascent + 半行距，desc = 行高 − asc；行高 = max(asc)
 /// + max(desc)，每行再叠加容器的 strut（块自身字体/行高）。
 /// 折行逐 piece 贪心；text-align 落位时分配剩余空间；
-/// vertical-align 支持 baseline/middle/top/bottom。
+/// vertical-align 支持 baseline/middle/top/bottom。P3 起 Layout 另有
+/// float 感知的 LayoutF：行可用区按行顶与 float 入侵带相交查询，
+/// 放不下整行下坠（绕排）。
 class InlinePiece {
     Control owner;      // 文本所有者（原子盒 = 盒子本身）；strut 为 null
     bool isStrut;       // 行盒支柱：只贡献行高，不落位
@@ -35,12 +37,36 @@ class FlowEntry {
     Control kid;
 }
 
-/// 一个行盒：pieces（含空格）+ 合计宽 + 基线上/下高。
+/// 一个行盒：pieces（含空格）+ 合计宽 + 基线上/下高。P3 行几何：
+/// xOff/availW 是行顶处 float 入侵收窄后的可用区（0 = 无 float 的
+/// 盲路径，落位端回退容器宽）；yOff 是行顶在段内的 y——整行下坠
+/// 后行间有空洞，段高与落位都按"段顶 + yOff"计，不能靠行高累加。
 class InlineLine {
     List<InlinePiece> pieces;
     int width;
     int asc;
     int desc;
+    int xOff;
+    int availW;
+    int yOff;
+}
+
+/// 一个 float 的入侵带（P3）：margin box 在容器内容框流坐标里的
+/// 占位；行盒收窄与 clear 下坠都查这张表。
+class FloatIntrusion {
+    int side;           // 1 left / 2 right
+    int x0;             // 左缘（right float = 压可用宽的边界）
+    int x1;             // 右缘（left float = xOff 抬到这里）
+    int yTop;
+    int yBot;
+}
+
+/// 行顶查询结果：xOff = 左侧 float 抬起的行左缘，availW = 右侧
+/// float 压剩的右边界（都是容器内容框坐标；行内 limit 用
+/// availW − xOff 现算）。
+class LineSpan {
+    int xOff;
+    int availW;
 }
 
 /// 一次行内段的排版结果（MeasureFlow/ArrangeFlow 共用同一份，
@@ -119,6 +145,54 @@ class LineBox {
         return p;
     }
 
+    /// [yTop, yBot) 带与 float 入侵的相交查询：左 float 把行左缘
+    /// 抬到 x1，右 float 把右边界压到 x0（同一带内取最窄者）。
+    static LineSpan LineAvail(List<FloatIntrusion> floats, int availW,
+                              int yTop, int yBot) {
+        LineSpan sp = new LineSpan();
+        sp.xOff = 0;
+        sp.availW = availW;
+        if (floats == null) { return sp; }
+        for (int i = 0; i < floats.Count; i = i + 1) {
+            FloatIntrusion f = floats[i];
+            if (f.yTop >= yBot || f.yBot <= yTop) { continue; }
+            if (f.side == 1) {
+                if (f.x1 > sp.xOff) { sp.xOff = f.x1; }
+            } else {
+                if (f.x0 < sp.availW) { sp.availW = f.x0; }
+            }
+        }
+        return sp;
+    }
+
+    /// clear 要求块顶边 ≥ 相关侧 float 的最低底边（side 1 左 / 2 右
+    /// / 3 双侧）；无相关 float 时原 y 返回。
+    static int ClearY(List<FloatIntrusion> floats, int side, int y) {
+        int r = y;
+        if (floats == null) { return r; }
+        for (int i = 0; i < floats.Count; i = i + 1) {
+            FloatIntrusion f = floats[i];
+            if (side == 3 || f.side == side) {
+                if (f.yBot > r) { r = f.yBot; }
+            }
+        }
+        return r;
+    }
+
+    /// 严格大于 y 的最低 float 底边（下一搁架）；没有则返回 y，
+    /// 调用方据此停止下坠、行在原地溢出（防呆不挂死）。
+    static int NextShelf(List<FloatIntrusion> floats, int y) {
+        int r = 0 - 1;
+        if (floats != null) {
+            for (int i = 0; i < floats.Count; i = i + 1) {
+                FloatIntrusion f = floats[i];
+                if (f.yBot > y && (r < 0 || f.yBot < r)) { r = f.yBot; }
+            }
+        }
+        if (r < 0) { r = y; }
+        return r;
+    }
+
     /// 把一段文本拆成 piece 序列。white-space：
     /// 0 normal / 1 nowrap——空白折叠成单空格 piece、按词可断；
     /// 2 pre / 3 pre-wrap——按 \n 硬分段，空白原样保留、段内不断
@@ -173,6 +247,7 @@ class LineBox {
         InlineLine cur = new InlineLine();
         cur.pieces = new List<InlinePiece>();
         int x = 0;
+        int yy = 0;
         for (int i = 0; i < items.Count; i = i + 1) {
             InlinePiece p = items[i];
             bool canBreak = true;
@@ -188,26 +263,151 @@ class LineBox {
                 continue;
             }
             if (canBreak && cur.pieces.Count > 0 && x + p.w > availW) {
-                x = Flush(cur, x, strut, sink);
+                yy = yy + Flush(cur, x, strut, sink, yy);
                 cur = new InlineLine();
                 cur.pieces = new List<InlinePiece>();
+                x = 0;
             }
             p.x = x;
             x = x + p.w;
             cur.pieces.Add(p);
             if (p.hardBreak) {
-                x = Flush(cur, x, strut, sink);
+                yy = yy + Flush(cur, x, strut, sink, yy);
                 cur = new InlineLine();
                 cur.pieces = new List<InlinePiece>();
+                x = 0;
             }
         }
-        Flush(cur, x, strut, sink);
+        Flush(cur, x, strut, sink, yy);
+    }
+
+    /// float 感知排版（P3）：与 Layout 同一贪心骨架，但每行的可用
+    /// 区在行顶处与 float 入侵带相交查询（yStart = 本段在流里的起
+    /// 点）。行宽只在行顶处查询（Chrome 同款：float 贴着行底擦过
+    /// 不收窄本行）；piece 放不下且行顶查询显示 xOff 已越过可用右
+    /// 缘，就整行下坠到下一搁架、从行首重排（CSS 9.5"line box 放
+    /// 不下就移到 float 之下"）。行几何随行记录，排布端据此绕排。
+    static void LayoutF(List<InlinePiece> items, InlinePiece strut,
+                        int availW, List<InlineLine> sink,
+                        List<FloatIntrusion> floats, int yStart) {
+        if (availW <= 0) { availW = 1; }
+        int strutH = strut != null ? strut.asc + strut.desc : 0;
+        if (strutH <= 0) { strutH = 1; }
+        int y = yStart;
+        LineSpan sp = LineAvail(floats, availW, y, y + strutH);
+        InlineLine cur = new InlineLine();
+        cur.pieces = new List<InlinePiece>();
+        cur.xOff = sp.xOff;
+        cur.availW = sp.availW;
+        int limit = sp.availW - sp.xOff;
+        if (limit < 0) { limit = 0; }
+        int x = 0;
+        int lineStart = 0;
+        for (int i = 0; i < items.Count; i = i + 1) {
+            InlinePiece p = items[i];
+            bool canBreak = true;
+            if (p.st != null && p.st.whiteSpace == 1 && !p.hardBreak) {
+                canBreak = false;
+            }
+            if (p.isSpace) {
+                if (cur.pieces.Count == 0) { continue; }
+                if (x + p.w > limit) { continue; }
+                p.x = x;
+                x = x + p.w;
+                cur.pieces.Add(p);
+                continue;
+            }
+            // 非空格 piece 放不下且可断：先按行顶规则复查，要下坠
+            // 就把已放入的 piece 全部回退、从行首重来。
+            if (canBreak && cur.pieces.Count > 0 && x + p.w > limit) {
+                bool restart = false;
+                for (int mv = 0; mv < 8; mv = mv + 1) {
+                    if (sp.xOff + x > sp.availW) {
+                        int shelf = NextShelf(floats, y);
+                        if (shelf <= y) { break; }   // 溢出容差
+                        y = shelf;                   // 整行下坠
+                        sp = LineAvail(floats, availW, y, y + strutH);
+                    } else {
+                        break;                       // 本行成立
+                    }
+                    limit = sp.availW - sp.xOff;
+                    if (limit < 0) { limit = 0; }
+                    cur = new InlineLine();
+                    cur.pieces = new List<InlinePiece>();
+                    cur.xOff = sp.xOff;
+                    cur.availW = sp.availW;
+                    x = 0;
+                    restart = true;
+                    break;
+                }
+                if (restart) { i = lineStart - 1; continue; }
+                y = y + Flush(cur, x, strut, sink, y);
+                sp = LineAvail(floats, availW, y, y + strutH);
+                cur = new InlineLine();
+                cur.pieces = new List<InlinePiece>();
+                cur.xOff = sp.xOff;
+                cur.availW = sp.availW;
+                limit = sp.availW - sp.xOff;
+                if (limit < 0) { limit = 0; }
+                x = 0;
+                lineStart = i;
+            }
+            p.x = x;
+            x = x + p.w;
+            cur.pieces.Add(p);
+            // pre 硬断行：断行在它之后，同样按行顶规则复查/下坠。
+            if (p.hardBreak) {
+                bool restart2 = false;
+                for (int mv = 0; mv < 8; mv = mv + 1) {
+                    if (sp.xOff + x > sp.availW) {
+                        int shelf = NextShelf(floats, y);
+                        if (shelf <= y) { break; }
+                        y = shelf;
+                        sp = LineAvail(floats, availW, y, y + strutH);
+                    } else {
+                        break;
+                    }
+                    limit = sp.availW - sp.xOff;
+                    if (limit < 0) { limit = 0; }
+                    cur = new InlineLine();
+                    cur.pieces = new List<InlinePiece>();
+                    cur.xOff = sp.xOff;
+                    cur.availW = sp.availW;
+                    x = 0;
+                    restart2 = true;
+                    break;
+                }
+                if (restart2) { i = lineStart - 1; continue; }
+                y = y + Flush(cur, x, strut, sink, y);
+                sp = LineAvail(floats, availW, y, y + strutH);
+                cur = new InlineLine();
+                cur.pieces = new List<InlinePiece>();
+                cur.xOff = sp.xOff;
+                cur.availW = sp.availW;
+                limit = sp.availW - sp.xOff;
+                if (limit < 0) { limit = 0; }
+                x = 0;
+                lineStart = i + 1;
+            }
+        }
+        // 末行：装不下就整行下坠（不再取词，piece 相对位置不变）。
+        for (int mv = 0; mv < 8; mv = mv + 1) {
+            if (cur.pieces.Count == 0) { break; }
+            if (sp.xOff + x <= sp.availW) { break; }
+            int shelf = NextShelf(floats, y);
+            if (shelf <= y) { break; }
+            y = shelf;
+            sp = LineAvail(floats, availW, y, y + strutH);
+        }
+        cur.xOff = sp.xOff;
+        cur.availW = sp.availW;
+        Flush(cur, x, strut, sink, y);
     }
 
     /// 结束当前行（裁掉行尾空白，行高 = strut 与 pieces 的 A/D 竞争）。
-    /// 返回 0 供调用方重置 x。
+    /// yOff 记入行盒；返回行高（asc+desc，空行 0）供调用方推进 y。
     static int Flush(InlineLine cur, int width, InlinePiece strut,
-                     List<InlineLine> sink) {
+                     List<InlineLine> sink, int yOff) {
         while (cur.pieces.Count > 0) {
             InlinePiece last = cur.pieces[cur.pieces.Count - 1];
             if (!last.isSpace) { break; }
@@ -225,7 +425,8 @@ class LineBox {
         cur.width = width;
         cur.asc = asc;
         cur.desc = desc;
+        cur.yOff = yOff;
         sink.Add(cur);
-        return 0;
+        return asc + desc;
     }
 }

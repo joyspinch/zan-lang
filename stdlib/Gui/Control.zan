@@ -116,6 +116,9 @@ class Control {
     /// 宿主要把子树排进一个已知宽度的矩形时，用 HintWrapWidth 直接
     /// 给出宽度，第一次测量就能算准行数。
     int hintWrapW;
+    /// 父块流传下的 float 入侵（P3 绕排，坐标已换算到本块内容框）。
+    /// float 在父级落位后回填、定位后重测高度；无 float 时为 null。
+    List<FloatIntrusion> hostFloats;
     bool visible;
     /// 画布坐标下的已解析边界（由 Arrange 设置）。
     int bx;
@@ -785,6 +788,18 @@ class Control {
         return computedStyle != null ? computedStyle.inlineLevel : 0;
     }
 
+    /// 块流 float（P3）：0 无 / 1 left / 2 right——非零时子项脱离
+    /// 垂直堆叠、行盒绕排（CSS 2.1 §9.5）。
+    int StyleFloat() {
+        return computedStyle != null ? computedStyle.floatSide : 0;
+    }
+
+    /// clear（P3）：0 无 / 1 left / 2 right / 3 both——顶边被推到
+    /// 相关 float 底边之下。
+    int StyleClear() {
+        return computedStyle != null ? computedStyle.clearSide : 0;
+    }
+
     /// 块流内容序列（P2）：按此序列分段/排布——默认只有子项
     /// （FlexKids 过滤）；Element 覆写为文档序的 文本/子项 混合
     /// 序列（AddText/AddKid 交错）。
@@ -1367,10 +1382,26 @@ class Control {
         int wrapW = hintWrapW - this.StyleInsetL() - this.StyleInsetR();
         List<FlowEntry> es = this.FlowEntries();
         List<FlowEntry> seg = new List<FlowEntry>();
+        // P3：float 入侵表（内容框坐标）+ 行内段的流起点——段在
+        // float 之后的行要绕排，段高才与排布端一致。父块下传的
+        // hostFloats 复制进来（本容器的 float 也会追加到这张表，
+        // 共享实例会把表污染回父级和下一帧）。
+        List<FloatIntrusion> floats = new List<FloatIntrusion>();
+        int ownFloats = 0;
+        if (this.hostFloats != null) {
+            for (int fi = 0; fi < this.hostFloats.Count; fi = fi + 1) {
+                floats.Add(this.hostFloats[fi]);
+            }
+            ownFloats = floats.Count;
+        }
+        int segY = 0;
         for (int i = 0; i <= es.Count; i = i + 1) {
             FlowEntry e = i < es.Count ? es[i] : null;
             Control c = e != null ? e.kid : null;
             if (e != null && (c == null || c.StyleInlineLevel() == 1)) {
+                if (seg.Count == 0) {
+                    segY = sumH + (pending > 0 ? pending : 0);
+                }
                 seg.Add(e);
                 continue;
             }
@@ -1378,7 +1409,7 @@ class Control {
             // 上下义务为 0）。
             if (seg.Count > 0) {
                 FlowSegment fs2 = this.FlowLayoutSegment(
-                    seg, wrapW > 0 ? wrapW : 0, 0);
+                    seg, wrapW > 0 ? wrapW : 0, 0, floats, segY);
                 seg = new List<FlowEntry>();
                 if (fs2.lines.Count > 0) {
                     if (pending >= 0) {
@@ -1386,14 +1417,41 @@ class Control {
                     }
                     pending = 0;
                     sumH = sumH + fs2.height;
-                    if (fs2.width > maxW) { maxW = fs2.width; }
+                    int lw = 0;
+                    for (int li = 0; li < fs2.lines.Count; li = li + 1) {
+                        int w2 = fs2.lines[li].xOff + fs2.lines[li].width;
+                        if (w2 > lw) { lw = w2; }
+                    }
+                    if (lw > maxW) { maxW = lw; }
                     rows = rows + 1;
                 }
             }
             if (c == null) { break; }
+            // P3：float 子项——脱离流，占入侵表；宽度计 shrink-to-fit。
+            if (c.StyleFloat() != 0) {
+                int fy = sumH + (pending > 0 ? pending : 0);
+                int fw = c.StyleDeclaresWidth() ? c.StyleWidthIn(wrapW) : c.prefW;
+                int fwm = (fw > 0 ? fw : 0) + c.StyleMarL() + c.StyleMarR();
+                if (fwm > maxW) { maxW = fwm; }
+                this.PlaceFloatKid(floats, c, wrapW > 0 ? wrapW : 0, fy,
+                                   0, 0, false);
+                continue;
+            }
             bool empty = this.IsEmptyFlowBlock(c);
             int kmt = empty ? c.StyleMarT() : this.FlowMarT(c);
             int kmb = empty ? c.StyleMarB() : this.FlowMarB(c);
+            // P3：clear——块顶边被推到相关 float 底边之下。clearance
+            // 不是 margin，不进塌陷链（首占位块在非分隔容器里 margin
+            // 会塌出容器、clearance 不能跟着丢），在 margin 结算后
+            // 直接推进流位置。
+            int clr = c.StyleClear();
+            int clear = 0;
+            if (clr != 0) {
+                int clearY = LineBox.ClearY(
+                    floats, clr, sumH + (pending > 0 ? pending : 0));
+                int need = clearY - sumH;
+                if (need > 0) { clear = need; }
+            }
             int h = 0;
             if (!empty) {
                 // 高度取声明值（含 border-box 下限钳制），未声明回退
@@ -1415,14 +1473,43 @@ class Control {
                 continue;
             }
             int withMt2 = pending < 0 ? kmt : CollapseMargins(pending, kmt);
+            // P3：float 下传——float 会绕进后代块的行盒，把入侵表
+            // 换算到子块内容框坐标后，auto 高子块带表重测（被 float
+            // 顶高的部分计入堆叠）；声明高的盒子高不变，只传表供其
+            // 行盒绕排。无 float 时清掉上一帧残留。
+            if (floats.Count > 0) {
+                this.SetHostFloats(c, floats,
+                                   c.StyleMarL() + c.StyleInsetL(),
+                                   sumH + withMt2 + c.StyleInsetT());
+                if (!c.StyleDeclaresHeight()) {
+                    c.prefH = 0;
+                    c.fillH = false;
+                    c.MeasureFlow(null);
+                    h = c.prefH;
+                    if (h < 0) { h = 0; }
+                }
+            } else {
+                c.hostFloats = null;
+            }
             if (pending < 0) {
                 if (sepT) { sumH = sumH + withMt2; }
             } else {
                 sumH = sumH + withMt2;
             }
             pending = kmb;
+            sumH = sumH + clear;
             sumH = sumH + h;
             rows = rows + 1;
+        }
+        // P3：BFC 容器收编 float（CSS 10.6.7）——auto 高至少到最低
+        // float 的 margin 底边；非 BFC 容器 float 溢出（Chrome 同款）。
+        // 只收编自己放的 float：祖先下传的该走"毗邻收窄"（未实现），
+        // 收编会把容器高错误地撑到祖先 float 的底边。
+        if (floats.Count > ownFloats && computedStyle != null
+            && computedStyle.bfc != 0) {
+            for (int i = ownFloats; i < floats.Count; i = i + 1) {
+                if (floats[i].yBot > sumH) { sumH = floats[i].yBot; }
+            }
         }
         if (rows > 1) { sumH = sumH + this.StyleGap() * (rows - 1); }
         if (pending > 0 && sepB && rows > 0) { sumH = sumH + pending; }
@@ -1452,6 +1539,15 @@ class Control {
         int chKids = this.fillH ? 0 : ch;
         int pending = 0 - 1;
         int placed = 0;
+        // P3：float 入侵表（内容框坐标）+ 行内段流起点（同测量端）。
+        // hostFloats 复制进来，防 PlaceFloatKid 把追加项写回共享表。
+        List<FloatIntrusion> floats = new List<FloatIntrusion>();
+        if (this.hostFloats != null) {
+            for (int fi = 0; fi < this.hostFloats.Count; fi = fi + 1) {
+                floats.Add(this.hostFloats[fi]);
+            }
+        }
+        int segY = 0;
         int align = computedStyle != null ? computedStyle.align : 0;
         this.InlineRunsBegin();
         List<FlowEntry> es = this.FlowEntries();
@@ -1461,12 +1557,16 @@ class Control {
             Control c = e != null ? e.kid : null;
             if (e != null && (c == null || c.StyleInlineLevel() == 1)) {
                 if (c != null) { c.InlineRunsBegin(); }
+                if (seg.Count == 0) {
+                    segY = (y - cy) + (pending > 0 ? pending : 0);
+                }
                 seg.Add(e);
                 continue;
             }
             // 块级边界：落位行内段（无 margin 义务，塌陷语义同测量端）。
             if (seg.Count > 0) {
-                FlowSegment fs2 = this.FlowLayoutSegment(seg, cw, cw);
+                FlowSegment fs2 = this.FlowLayoutSegment(seg, cw, cw,
+                                                         floats, segY);
                 if (fs2.lines.Count > 0) {
                     if (pending >= 0) {
                         y = y + CollapseMargins(pending, 0);
@@ -1480,9 +1580,26 @@ class Control {
                 seg = new List<FlowEntry>();
             }
             if (c == null) { break; }
+            // P3：float 子项——脱离流，占入侵表并落位（不计 gap/rows）。
+            if (c.StyleFloat() != 0) {
+                this.PlaceFloatKid(floats, c, cw,
+                                   (y - cy) + (pending > 0 ? pending : 0),
+                                   cx, cy, true);
+                continue;
+            }
             bool empty = this.IsEmptyFlowBlock(c);
             int kmt = empty ? c.StyleMarT() : this.FlowMarT(c);
             int kmb = empty ? c.StyleMarB() : this.FlowMarB(c);
+            // P3：clear——clearance 不进 margin 塌陷链，margin 结算
+            // 完直接把流位置推下去（同测量端）。
+            int clr = c.StyleClear();
+            int clear = 0;
+            if (clr != 0) {
+                int clearY = LineBox.ClearY(
+                    floats, clr, (y - cy) + (pending > 0 ? pending : 0));
+                int need = clearY - (y - cy);
+                if (need > 0) { clear = need; }
+            }
             if (empty) {
                 int withMt = pending < 0 ? kmt : CollapseMargins(pending, kmt);
                 int dy = (pending < 0 && !sepT) ? 0 : withMt;
@@ -1528,11 +1645,103 @@ class Control {
             } else if (sb != null && sb.marL == 0 - 1) {
                 x = cx + cw - mr - w;
             }
+            // P3：float 下传（同测量端）——落位前把入侵表换算给子块，
+            // auto 高子块带表重测定高，堆叠与文本绕排才一致。
+            if (floats.Count > 0) {
+                this.SetHostFloats(c, floats,
+                                   x - cx + c.StyleInsetL(),
+                                   (y - cy) + c.StyleInsetT());
+                if (!c.StyleDeclaresHeight()) {
+                    c.prefH = 0;
+                    c.fillH = false;
+                    c.MeasureFlow(null);
+                    h = c.prefH;
+                    if (h < 0) { h = 0; }
+                }
+            } else {
+                c.hostFloats = null;
+            }
+            y = y + clear;
             c.Arrange(x, y, w, h);
             y = y + h;
             placed = placed + 1;
         }
         if (pending > 0 && sepB) { y = y + pending; }
+    }
+
+    /// 把父级的 float 入侵表换算成本块内容框坐标后传给 `c`（P3 绕
+    /// 排）：float 影响后代块的行盒，而各层排版都在自己的内容框里
+    /// 做，坐标要逐级平移。无 float 时清空，防上一帧残留。
+    void SetHostFloats(Control c, List<FloatIntrusion> src, int dx, int dy) {
+        if (src == null || src.Count == 0) {
+            c.hostFloats = null;
+            return;
+        }
+        List<FloatIntrusion> shifted = new List<FloatIntrusion>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            FloatIntrusion f = src[i];
+            FloatIntrusion s = new FloatIntrusion();
+            s.side = f.side;
+            s.x0 = f.x0 - dx;
+            s.x1 = f.x1 - dx;
+            s.yTop = f.yTop - dy;
+            s.yBot = f.yBot - dy;
+            shifted.Add(s);
+        }
+        c.hostFloats = shifted;
+    }
+
+    /// 放一个 float 子项（P3，CSS 2.1 §9.5.1 简化子集）：从流位置
+    /// yFlow 起，clear 先推；左 float 贴同行左 float 右缘/内容左缘，
+    /// 右 float 镜像；放不下（越内容右缘/撞右 float）下坠到最低
+    /// float 底（NextShelf），无处可坠就原地溢出（防呆不挂死）。
+    /// 入侵记录用内容框坐标 x 与流坐标 y（margin box 语义）；place
+    /// 时把子项 Arrange 到 border box。测量/排布两端共用同一算法，
+    /// 行盒绕排的高度才与落位一致。
+    void PlaceFloatKid(List<FloatIntrusion> floats, Control c, int frameW,
+                       int yFlow, int cx, int cy, bool place) {
+        int w = c.StyleDeclaresWidth() ? c.StyleWidthIn(frameW) : c.prefW;
+        int h = c.StyleDeclaresHeight() ? c.StyleHeightIn(0) : c.prefH;
+        if (w < 0) { w = 0; }
+        if (h < 0) { h = 0; }
+        int ml = c.StyleMarL();
+        int mr = c.StyleMarR();
+        int mt = c.StyleMarT();
+        int mb = c.StyleMarB();
+        int side = c.StyleFloat();
+        int clear = c.StyleClear();
+        if (frameW <= 0) { frameW = 1; }
+        int y = yFlow;
+        if (clear == 1 || clear == 3) { y = LineBox.ClearY(floats, 1, y); }
+        if (clear == 2 || clear == 3) { y = LineBox.ClearY(floats, 2, y); }
+        int x0 = 0;
+        int yBot = y + mt + h + mb;
+        for (int guard = 0; guard < 16; guard = guard + 1) {
+            yBot = y + mt + h + mb;
+            LineSpan sp = LineBox.LineAvail(floats, frameW, y, yBot);
+            bool fits;
+            if (side == 1) {
+                x0 = sp.xOff;
+                fits = x0 + ml + w + mr <= sp.availW;
+            } else {
+                x0 = sp.availW - ml - w - mr;
+                fits = x0 >= sp.xOff;
+            }
+            if (fits) { break; }
+            int shelf = LineBox.NextShelf(floats, y);
+            if (shelf <= y) { break; }   // 无处下坠：原地溢出
+            y = shelf;
+        }
+        FloatIntrusion f = new FloatIntrusion();
+        f.side = side;
+        f.x0 = x0;
+        f.x1 = x0 + ml + w + mr;
+        f.yTop = y;
+        f.yBot = yBot;
+        floats.Add(f);
+        if (place) {
+            c.Arrange(cx + x0 + ml, cy + y + mt, w, h);
+        }
     }
 
     /// 行内文本的继承态（CSS 可继承属性在行盒里的落地）：段内文本
@@ -1562,8 +1771,11 @@ class Control {
     /// （无子且有文本 → 文本 run、否则原子盒）。wrapW 是折行宽
     /// （测量端 = 断行提示，0 = 单行；排布端 = 内容宽），wAvail 是
     /// 百分比宽的包含块（测量端按 0，shrink-to-fit 同规矩）。
+    /// floats/segY（P3）：段前的 float 入侵表与段在流里的起点——
+    /// 行盒绕排用；floats 为 null/空时与旧路径逐 bit 相同。
     FlowSegment FlowLayoutSegment(List<FlowEntry> seg,
-                                  int wrapW, int wAvail) {
+                                  int wrapW, int wAvail,
+                                  List<FloatIntrusion> floats, int segY) {
         FlowSegment fs2 = new FlowSegment();
         List<InlinePiece> items = new List<InlinePiece>();
         StyleBox sb = computedStyle;
@@ -1594,12 +1806,19 @@ class Control {
                                       c.StyleMarT(), c.StyleMarB(), cs, xhHalf));
         }
         List<InlineLine> lines = new List<InlineLine>();
-        LineBox.Layout(items, strut, wrapW, lines);
+        if (floats != null && floats.Count > 0) {
+            LineBox.LayoutF(items, strut, wrapW, lines, floats, segY);
+        } else {
+            LineBox.Layout(items, strut, wrapW, lines);
+        }
         int hh = 0;
         int ww = 0;
         for (int i = 0; i < lines.Count; i = i + 1) {
-            hh = hh + lines[i].asc + lines[i].desc;
-            if (lines[i].width > ww) { ww = lines[i].width; }
+            // 段高 = 最大行底（P3：整行下坠后行间有空洞，不能累加）。
+            int bot = lines[i].yOff + lines[i].asc + lines[i].desc;
+            if (bot > hh) { hh = bot; }
+            int lw = lines[i].xOff + lines[i].width;
+            if (lw > ww) { ww = lw; }
         }
         fs2.lines = lines;
         fs2.height = hh;
@@ -1622,15 +1841,21 @@ class Control {
         int y = y0;
         for (int li = 0; li < fs2.lines.Count; li = li + 1) {
             InlineLine ln = fs2.lines[li];
+            // P3：行顶 = 段顶 + yOff（整行下坠后行间有空洞，不能
+            // 靠上一行高度累加；floats 盲路径 yOff 就是累加值）。
+            y = y0 + ln.yOff;
             int baseline = y + ln.asc;
-            int free = availW - ln.width;
+            // P3 绕排：对齐与行内定位都用本行的可用宽/左缘位移
+            // （availW 缺省时回退容器宽，兼容旧行）。
+            int lineW = ln.availW > 0 ? ln.availW : availW;
+            int free = lineW - ln.width;
             int dx = 0;
             if (align == 1 && free > 0) { dx = free / 2; }
             else if (align == 2 && free > 0) { dx = free; }
             for (int pi = 0; pi < ln.pieces.Count; pi = pi + 1) {
                 InlinePiece p = ln.pieces[pi];
                 if (p.isStrut) { continue; }
-                int px = cx + dx + p.x;
+                int px = cx + ln.xOff + dx + p.x;
                 if (p.isBox) {
                     StyleBox bs = p.st;
                     int topY = baseline - p.boxH;   // baseline：下 margin 边坐基线
@@ -1672,7 +1897,6 @@ class Control {
                     if (cellBot > uB[oi]) { uB[oi] = cellBot; }
                 }
             }
-            y = y + ln.asc + ln.desc;
         }
         for (int k = 0; k < owners.Count; k = k + 1) {
             Control o = owners[k];
