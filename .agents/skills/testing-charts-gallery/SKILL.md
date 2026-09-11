@@ -524,3 +524,15 @@ ECharts line 的平滑算法不是「单调 Hermite / Cardinal / Catmull-Rom」�
     charts_head.exe` 变体 → 同法截图。HEAD 同样错 = 先前已存在，
     记账不修；HEAD 对而我错 = 真回归。（注意 sed 匹配 Windows 路径
     的反斜杠要用 python replace，sed 转义会静默不命中——踩过。）
+15. **对照两侧都要新鲜重拍**：第一张截图出现"本次改动不可能造成的
+    差异"时，先重拍一次再排查代码——重拍即消失 = 截图竞态（旧 exe/
+    旧进程画面）。HEAD 对照的两侧必须在同一会话、用各自验证过的
+    exe 各拍各的（B15 踩过：把 HEAD 侧整板 raw 壳文本误判成新构建
+    的回归，插桩后才发现新构建是干净的、spill 正是 HEAD 要修的病）。
+16. **绘制路径插桩直接抓 stdout，别从截图反推几何**：绘制分支里临时
+    `Console.WriteLine`（系列名/cx,cy/richN/走了哪个分支），
+    `charts_pc.exe <id> --nomouse > out 2>&1`、sleep 数秒 taskkill，
+    逐帧打印一次定位。附带两个小坑：ParseColor 恒带 0xFF 通道、
+    未声明色哨兵是 0，debug 打印色值 **-1 = #FFF 白**，不是未解析；
+    recheck2 `-Ids` 从 bash 一次只传一个 id（PowerShell string[]
+    绑定把 `a,b,c` 并成一个 id，产出 "a,b,c.png"）。

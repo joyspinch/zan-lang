@@ -926,6 +926,9 @@ class ChartTextStyle {
     string fontFamily;
     int shadowColor;
     int shadowBlur;
+    int lineHeight; // label 级 lineHeight：段未声明自身 lineHeight 时的
+                    //   行高缺省（gauge-speed detail.lineHeight 40）；
+                    //   -1 = 未声明
     List<ChartRichStyle> rich;
     int boxBg;      // label.backgroundColor（整块底板）；0 = 无
     int boxBorder;  // label.borderColor；0 = 无
@@ -942,6 +945,7 @@ class ChartTextStyle {
             color = 0, fontSize = 0, fontStyle = "normal", fontWeight = "normal",
             fontFamily = "", shadowColor = 0, shadowBlur = 0
         };
+        s.lineHeight = 0 - 1;
         s.rich = null;
         s.boxBg = 0;
         s.boxBorder = 0;
@@ -961,6 +965,7 @@ class ChartTextStyle {
             fontStyle = src.fontStyle, fontWeight = src.fontWeight,
             fontFamily = src.fontFamily, shadowColor = src.shadowColor,
             shadowBlur = src.shadowBlur };
+        s.lineHeight = src.lineHeight;
         s.boxBg = src.boxBg;
         s.boxBorder = src.boxBorder;
         s.boxBorderW = src.boxBorderW;
@@ -1673,6 +1678,15 @@ class ChartSeries {
     List<ChartMapRegion> regions;  // Map 种类
     List<ChartEvent> events;       // Event River 种类
     List<ChartMarkPoint> marks;    // markPoint.data（线/柱系列）
+    string markLabelFmt;  // series 级 markPoint.label.formatter 模板
+                          //   （bar-rich-text "{a|{a}\n}{b|{b} }{c|{c}}"；
+                          //   {a}=系列名 {b}=mark name {c}=值）
+    ChartTextStyle markLabelSt; // series 级 markPoint.label 富文本/盒样式；
+                                //   null = 未声明 rich（pin 徽标走原路径）
+    string markLabelPos;  // markPoint.label.position："right"/"top"（缺省 top）
+    int markLabelDist;    // markPoint.label.distance：-1 = 未声明（官方缺省 5）
+    int markSymbolSize;   // series 级 markPoint.symbolSize：-1 = 未声明
+                          //   （声明后显式 mark 不再画 pin 气球，画小点）
     List<ChartMarkLine> markLines; // markLine.data（阈值/平均线，线/柱系列）
 
     string graphLayout;   // ECharts graph.layout："" | "force" | "none" | "circular"
@@ -1812,6 +1826,11 @@ class ChartSeries {
         s.events = new List<ChartEvent>();
         s.marks = new List<ChartMarkPoint>();
         s.markLines = new List<ChartMarkLine>();
+        s.markLabelFmt = "";
+        s.markLabelSt = null;
+        s.markLabelPos = "";
+        s.markLabelDist = 0 - 1;
+        s.markSymbolSize = 0 - 1;
         s.graphLayout = "";
         s.nodeX = new List<int>();
         s.nodeY = new List<int>();
@@ -2304,6 +2323,11 @@ class ChartSeries {
             s.riverNames = src.riverNames;
             s.itemStyle = src.itemStyle;
             s.label = src.label;
+            s.markLabelFmt = src.markLabelFmt;
+            s.markLabelSt = src.markLabelSt;
+            s.markLabelPos = src.markLabelPos;
+            s.markLabelDist = src.markLabelDist;
+            s.markSymbolSize = src.markSymbolSize;
             s.gauge = src.gauge;
             return s;
         }
@@ -2357,6 +2381,11 @@ class ChartSeries {
         for (int i = 0; i < src.marks.Count; i = i + 1) { s.marks.Add(ChartMarkPoint.Clone(src.marks[i])); }
         s.markLines = new List<ChartMarkLine>();
         for (int i = 0; i < src.markLines.Count; i = i + 1) { s.markLines.Add(ChartMarkLine.Clone(src.markLines[i])); }
+        s.markLabelFmt = src.markLabelFmt;
+        s.markLabelSt = ChartTextStyle.Clone(src.markLabelSt);
+        s.markLabelPos = src.markLabelPos;
+        s.markLabelDist = src.markLabelDist;
+        s.markSymbolSize = src.markSymbolSize;
         s.nodeX = new List<int>();
         for (int i = 0; i < src.nodeX.Count; i = i + 1) { s.nodeX.Add(src.nodeX[i]); }
         s.nodeY = new List<int>();
@@ -3247,6 +3276,7 @@ class ChartOption {
         text.fontFamily = v.Str("fontFamily", text.fontFamily);
         if (v.Has("shadowColor")) { text.shadowColor = ChartOption.ParseColor(v.Get("shadowColor"), text.shadowColor); }
         text.shadowBlur = v.Int("shadowBlur", text.shadowBlur);
+        text.lineHeight = v.Int("lineHeight", text.lineHeight);
         // 整块盒样式（label.backgroundColor/border/padding，官方 label
         // 文档同名列；pie-rich-text 的 data.label 底板走这里）。
         JsonValue bg = v.Get("backgroundColor");
@@ -3508,6 +3538,10 @@ class ChartOption {
             gauge.detail.offsetCenter = ChartOption.ParsePoint(detail.Get("offsetCenter"), gauge.detail.offsetCenter);
             gauge.detail.formatter = detail.Str("formatter", gauge.detail.formatter);
             ChartOption.ParseTextStyle(detail.Get("textStyle"), gauge.detail.textStyle);
+            // ECharts 5 把样式键直接挂在 detail 上（gauge-speed 的
+            // lineHeight 40 / rich / 盒样式），detail.textStyle 是旧形态
+            // ——detail 级后解析、同键覆盖。
+            ChartOption.ParseTextStyle(detail, gauge.detail.textStyle);
         }
     }
 
@@ -5645,6 +5679,24 @@ class ChartOption {
                 // 层级数据（tree/treemap/sunburst 的 children 递归）。
                 ChartOption.ParseTree(s.Get("data"), cs.tree);
                 ChartOption.ParseMarks(s.Get("markPoint"), cs.marks);
+                // series 级 markPoint.label（对象形态）：模板 + 富文本/
+                // 盒样式 + 位置/距离；symbolSize 声明后 mark 点画小点
+                // 不画 pin 气球（bar-rich-text 的 symbolSize:1 摘要卡）。
+                JsonValue mpObj = s.Get("markPoint");
+                if (mpObj != null && mpObj.IsObject()) {
+                    JsonValue mpLbl = mpObj.Get("label");
+                    if (mpLbl != null && mpLbl.IsObject()) {
+                        cs.markLabelFmt = mpLbl.Str("formatter", cs.markLabelFmt);
+                        cs.markLabelPos = mpLbl.Str("position", cs.markLabelPos);
+                        cs.markLabelDist = mpLbl.Int("distance", cs.markLabelDist);
+                        if (mpLbl.Get("rich") != null) {
+                            ChartTextStyle mst = ChartTextStyle.Create();
+                            ChartOption.ParseTextStyle(mpLbl, mst);
+                            cs.markLabelSt = mst;
+                        }
+                    }
+                    cs.markSymbolSize = mpObj.Int("symbolSize", cs.markSymbolSize);
+                }
                 ChartOption.ParseMarkLines(s.Get("markLine"), cs.markLines);
                 ChartOption.ParseMarkArea(s.Get("markArea"), o);
                 JsonValue da = s.Get("data");
