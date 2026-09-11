@@ -17,6 +17,11 @@ delegate Control RowOf<T>(T item);
 /// 全部无反应，悬停/选中带不出现，SelectedIndex 不落在其上。
 delegate bool RowGate<T>(T item);
 
+/// 某行被「拖出列表」时回调（行下标）：在某行上按下、拖到列表
+/// 矩形之外再松开。宿主据此把这一行变成独立窗口（会话拖出成浮窗），
+/// 列表本身不开窗，也不定义「拖到哪里才算拖出」的下游语义。
+delegate void RowDragOut(int index);
+
 /// ListView 的一列：表头显示什么、宽度相对其他列
 /// 如何（0 = 均分），以及如何从实体读取其文本。
 class ListColumn<T> {
@@ -114,6 +119,11 @@ class ListView<T> : Control {
     /// （offset 不动 → 可见行数也不翻回 → 直到松手）。
     int rowHitBase;
     int rowHitCount;
+    /// 拖出行手势（OnDragOut）的订阅者，与按下那一刻记住的行下标
+    /// （-1 = 当前按下的不是行）。指针拖到列表外时命中测试已经
+    /// 没有行可归属，下标只能在按下那一帧记下。
+    List<RowDragOut> dragOut;
+    int dragOutFrom;
 
     /// 模板行独占的 id 段长度：够放几百行、每行十来个控件。
     static int RowIdReserve() { return 4096; }
@@ -143,6 +153,8 @@ class ListView<T> : Control {
         rowSeqBase = -1;
         rowHitBase = -1;
         rowHitCount = 0;
+        dragOut = new List<RowDragOut>();
+        dragOutFrom = -1;
         wiresOwnEvents = true;
         Select = new UiEvent();
         Activate = new UiEvent();
@@ -298,6 +310,12 @@ class ListView<T> : Control {
     /// 某行被右键点击时回调。
     ListView<T> OnContext(Action a) { Context.Add(a); return this; }
 
+    /// 订阅「行被拖出列表」手势：在某行上按下、拖到列表矩形之外
+    /// 松开时回调该行下标。列表只识别手势并报告下标，是否开窗、
+    /// 开成什么窗口由宿主决定；在列表矩形内松开不算数（那次手势
+    /// 仍归滚动/选择），右键与长按菜单不受影响。
+    ListView<T> OnDragOut(RowDragOut a) { dragOut.Add(a); return this; }
+
     /// 列表为空时显示的文本。
     ListView<T> EmptyText(string text) { Empty = text; return this; }
 
@@ -401,6 +419,34 @@ class ListView<T> : Control {
 
     /// 处理某行矩形的选择 / 激活 / 右键菜单。返回其注册的 id，
     /// 调用方可据此绘制 hover 状态。
+    /// 每帧一次的「拖出行」判定（OnPaint 顶部调用）：按下帧记下行
+    /// 下标，松开帧若指针已在列表矩形之外则回调。下标只在按下帧
+    /// 认，因为拖到窗口外时命中测试里已经没有行可归属。
+    void DragOutTick(App app) {
+        if (dragOut.Count == 0) { return; }
+        int ek = app.EventKind();
+        if (ek == 2) {
+            int hit = app.focus.pressedId;
+            if (rowHitBase >= 0 && hit >= rowHitBase
+                && hit < rowHitBase + rowHitCount) {
+                dragOutFrom = hit - rowHitBase;
+            } else {
+                dragOutFrom = -1;
+            }
+            return;
+        }
+        if (ek != 3 || dragOutFrom < 0) { return; }
+        int from = dragOutFrom;
+        dragOutFrom = -1;
+        int mx = app.mouseX;
+        int my = app.mouseY;
+        bool inside = mx >= bx && mx < bx + bw && my >= by && my < by + bh;
+        if (inside || !this.Has(from)) { return; }
+        for (int i = 0; i < dragOut.Count; i = i + 1) {
+            dragOut[i](from);
+        }
+    }
+
     int RowInteract(App app, int index, int x, int y, int w, int h) {
         this.EnsureRowIds();
         int id = rowHitBase + index;
@@ -729,6 +775,8 @@ class ListView<T> : Control {
                 s.bg, s.BorderOr(app.theme.borderSecondary), s.BorderWOr(1));
         }
         hover = -1;
+        hover = -1;
+        this.DragOutTick(app);
         int headH = this.HeaderHeight(app);
         this.PaintHeader(app, headH);
         if (this.Count() == 0) {

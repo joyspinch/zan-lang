@@ -1,0 +1,363 @@
+using System;
+using Gui.Component;
+
+/// 会话成员：群聊气泡上方的发言人名字走它。`id` 是消息的 agent 字段，
+/// 同一份示例数据里全局唯一（这样解析发言人不需要宿主再传上下文）。
+class WxMember {
+    string id;
+    string name;
+
+    WxMember(string id, string name) {
+        this.id = id;
+        this.name = name;
+    }
+
+    static WxMember Of(string id, string name) {
+        return new WxMember(id, name);
+    }
+}
+
+/// 一个会话：左侧列表的一行 + 它自己的消息记录。
+class WxSession {
+    string name;        // 列表标题（对方昵称或群名）
+    string initial;     // 头像里的首字
+    string tint;        // 头像色调类：primary / info / success / warning
+    bool group;         // 群聊：气泡上方显示发言人名字
+    int people;         // 群成员数（一对一为 0）
+    string snippet;     // 列表第二行：最后一条摘要
+    string time;        // 列表右上角时间
+    int unread;         // 未读数，0 = 不显示角标
+    List<ChatMessage> msgs;
+
+    WxSession(string name, string initial, string tint, bool group, int people,
+            string snippet, string time, int unread) {
+        this.name = name;
+        this.initial = initial;
+        this.tint = tint;
+        this.group = group;
+        this.people = people;
+        this.snippet = snippet;
+        this.time = time;
+        this.unread = unread;
+        this.msgs = new List<ChatMessage>();
+    }
+
+    static WxSession Group(string name, string initial, string tint, int people,
+            string snippet, string time, int unread) {
+        return new WxSession(name, initial, tint, true, people,
+            snippet, time, unread);
+    }
+
+    static WxSession Peer(string name, string initial, string tint,
+            string snippet, string time, int unread) {
+        return new WxSession(name, initial, tint, false, 0,
+            snippet, time, unread);
+    }
+}
+
+/// 通讯录的一行：快捷入口 / 字母分组头 / 联系人。
+/// 三类共用一种行类型，列表的行模板按 `kind` 决定长什么样，
+/// `Selectable()` 再把分组头排除在可选之外。
+class WxContact {
+    int kind;           // 0 快捷入口 1 字母分组头 2 联系人
+    string name;
+    string initial;
+    string tint;
+    string wxid;        // 微信号
+    string region;      // 地区
+    string remark;      // 备注
+    string tag;         // 标签
+    string signature;   // 个性签名
+    string source;      // 来源
+    string added;       // 添加时间
+    int count;          // 快捷入口右边的数字（新的朋友 / 群聊 / 联系人…）
+
+    WxContact(int kind, string name) {
+        this.kind = kind;
+        this.name = name;
+        this.initial = "";
+        this.tint = "primary";
+        this.count = 0;
+        this.wxid = "";
+        this.region = "";
+        this.remark = "";
+        this.tag = "";
+        this.signature = "";
+        this.source = "";
+        this.added = "";
+    }
+
+    /// 快捷入口（新的朋友 / 群聊 / 公众号 …）。`count` 是右侧的数字。
+    static WxContact Entry(string name, string icon, string tint, int count) {
+        WxContact c = new WxContact(0, name);
+        c.initial = icon;
+        c.tint = tint;
+        c.count = count;
+        return c;
+    }
+
+    /// 字母分组头（不可选）。
+    static WxContact Header(string name) {
+        return new WxContact(1, name);
+    }
+
+    /// 一位联系人（资料栏的每一行都来自这里）。
+    static WxContact Person(string name, string initial, string tint,
+            string wxid, string region, string remark, string tag,
+            string signature, string source, string added) {
+        WxContact c = new WxContact(2, name);
+        c.initial = initial;
+        c.tint = tint;
+        c.wxid = wxid;
+        c.region = region;
+        c.remark = remark;
+        c.tag = tag;
+        c.signature = signature;
+        c.source = source;
+        c.added = added;
+        return c;
+    }
+}
+
+/// 收藏列表的一张卡片。
+class WxFav {
+    string kind;        // 链接 / 图片 / 文件 / 聊天记录 / 位置，用于筛选
+    string icon;
+    string tint;
+    string title;
+    string desc;
+    string source;
+    string time;
+
+    WxFav(string kind, string icon, string tint, string title, string desc,
+            string source, string time) {
+        this.kind = kind;
+        this.icon = icon;
+        this.tint = tint;
+        this.title = title;
+        this.desc = desc;
+        this.source = source;
+        this.time = time;
+    }
+
+    static WxFav Of(string kind, string icon, string tint, string title,
+            string desc, string source, string time) {
+        return new WxFav(kind, icon, tint, title, desc, source, time);
+    }
+}
+
+/// 示例数据：全部虚构，与任何真实账号、真实联系人无关。
+class WxData {
+    // ---- 发言人注册表 ----------------------------------------------
+
+    static List<WxMember> reg;
+
+    static List<WxMember> Members() {
+        if (reg == null) { reg = new List<WxMember>(); }
+        return reg;
+    }
+
+    static void Who(string id, string name) {
+        WxData.Members().Add(WxMember.Of(id, name));
+    }
+
+    /// 把 agent id 解析成显示名；不认识返回 null（组件按默认助手画）。
+    static string NameOf(string id) {
+        List<WxMember> ms = WxData.Members();
+        for (int i = 0; i < ms.Count; i = i + 1) {
+            if (ms[i].id == id) { return ms[i].name; }
+        }
+        return null;
+    }
+
+    /// ChatView 的发言人钩子（多智能体会话那套 API 的普通人名版本）。
+    static ChatSpeaker Speaker(string id) {
+        string n = WxData.NameOf(id);
+        if (n == null) { return null; }
+        return ChatSpeaker.Of(n, 0, "");
+    }
+
+    /// 协议节拍标签：这份示例数据没有节拍，恒定返回空串。
+    static string KindLabel(string kind) {
+        return "";
+    }
+
+    // ---- 消息 ------------------------------------------------------
+
+    /// 一条消息。`off` 是它发生在「现在」之前多少秒——时刻分隔要靠
+    /// 真实间隔算出来，所以不能全用“现在”。
+    static ChatMessage At(string role, string text, string agent, long off) {
+        ChatMessage m = ChatMessage.Create(role, text);
+        m.agent = agent;
+        m.at = DateTime.UtcNow().ToUnixSeconds() - off;
+        return m;
+    }
+
+    static void Say(List<ChatMessage> into, string role, string text,
+            string agent, long off) {
+        into.Add(WxData.At(role, text, agent, off));
+    }
+
+    // ---- 会话 ------------------------------------------------------
+
+    static List<WxSession> Sessions() {
+        List<WxSession> all = new List<WxSession>();
+
+        // 产品评审群
+        WxData.Who("g1a", "陆斯年");
+        WxData.Who("g1b", "程雨");
+        WxData.Who("g1c", "何嘉树");
+        WxSession s1 = WxSession.Group("产品评审群", "产", "primary", 12,
+            "收到，我把告警级别提到 P0 并补一条对账任务", "刚刚", 3);
+        WxData.Say(s1.msgs, "assistant", "评审稿我放到共享盘了，重点看第三章的库存扣减顺序。", "g1a", 7500);
+        WxData.Say(s1.msgs, "assistant", "看了，扣减和释放的边界现在分开写了两遍。", "g1b", 7400);
+        WxData.Say(s1.msgs, "user", "那段我合并成一进一出，顺手把超卖那条用例补上了。", "", 7300);
+        WxData.Say(s1.msgs, "assistant", "好，那我把第三章的时序图也跟着改一版。", "g1a", 3600);
+        WxData.Say(s1.msgs, "assistant", "顺便问一句，回滚失败要不要直接告警？", "g1c", 3500);
+        WxData.Say(s1.msgs, "user", "要，回滚失败按最高级别报，这条不能吞。", "", 3400);
+        WxData.Say(s1.msgs, "assistant", "收到，我把告警级别提到 P0 并补一条对账任务。", "g1c", 120);
+        all.Add(s1);
+
+        // 设计稿同步
+        WxData.Who("g3a", "苏黎");
+        WxData.Who("g3b", "唐砚");
+        WxSession s2 = WxSession.Group("设计稿同步", "设", "info", 5,
+            "列表行的间距我按 4 的倍数重排了一遍", "14:32", 2);
+        WxData.Say(s2.msgs, "assistant", "新的一版在 Figma 里，导航栏图标换成线性描边了。", "g3a", 100000);
+        WxData.Say(s2.msgs, "assistant", "看到了，间距好像有半像素的偏差。", "g3b", 96000);
+        WxData.Say(s2.msgs, "assistant", "列表行的间距我按 4 的倍数重排了一遍。", "g3a", 9000);
+        all.Add(s2);
+
+        // 发布看板
+        WxData.Who("g5a", "秦望");
+        WxData.Who("g5b", "沈迟");
+        WxData.Who("g5c", "罗一舟");
+        WxSession s3 = WxSession.Group("发布看板", "发", "warning", 8,
+            "灰度批次先停在 5%，明早再看曲线", "13:07", 7);
+        WxData.Say(s3.msgs, "assistant", "2.4.0 的构建产物已经推到预发。", "g5a", 400000);
+        WxData.Say(s3.msgs, "assistant", "预发的冒烟过了，但那条老用例还在抖。", "g5b", 300000);
+        WxData.Say(s3.msgs, "user", "抖的那条先标记跳过，别让它挡发布。", "", 250000);
+        WxData.Say(s3.msgs, "assistant", "灰度批次先停在 5%，明早再看曲线。", "g5c", 20000);
+        all.Add(s3);
+
+        // 一对一会话
+        WxSession p1 = WxSession.Peer("林昭远", "林", "success",
+            "那我明天上午把接口文档发你", "11:20", 0);
+        WxData.Say(p1.msgs, "assistant", "上次说的那个导出接口，字段能不能再少几个？", "", 200000);
+        WxData.Say(p1.msgs, "user", "可以，只留 id、状态和时间三个，其余走详情接口。", "", 190000);
+        WxData.Say(p1.msgs, "assistant", "行，那我明天上午把接口文档发你。", "", 8000);
+        all.Add(p1);
+
+        WxSession p2 = WxSession.Peer("唐砚", "唐", "info",
+            "下午的评审我迟到十分钟", "10:05", 1);
+        WxData.Say(p2.msgs, "assistant", "下午的评审我迟到十分钟，先帮我占个位。", "", 30000);
+        all.Add(p2);
+
+        WxSession p3 = WxSession.Peer("苏黎", "苏", "warning",
+            "配色我出了三版，你看哪版稳一点", "昨天", 0);
+        WxData.Say(p3.msgs, "assistant", "配色我出了三版，你看哪版稳一点。", "", 150000);
+        WxData.Say(p3.msgs, "user", "第二版，深色背景下对比度够。", "", 140000);
+        all.Add(p3);
+
+        WxSession p4 = WxSession.Peer("运维值班", "运", "error",
+            "磁盘水位回到 62%，告警已恢复", "昨天", 0);
+        WxData.Say(p4.msgs, "assistant", "凌晨那波写入把日志盘顶到 91% 了。", "", 400000);
+        WxData.Say(p4.msgs, "user", "先把七天的日志归档，扩容排到下周。", "", 390000);
+        WxData.Say(p4.msgs, "assistant", "磁盘水位回到 62%，告警已恢复。", "", 380000);
+        all.Add(p4);
+
+        WxSession p5 = WxSession.Peer("素材归档", "素", "success",
+            "这批图标已经按 24 像素网格导出", "周三", 0);
+        WxData.Say(p5.msgs, "assistant", "这批图标已经按 24 像素网格导出。", "", 500000);
+        all.Add(p5);
+
+        return all;
+    }
+
+    // ---- 通讯录 ----------------------------------------------------
+
+    static List<WxContact> Contacts() {
+        List<WxContact> all = new List<WxContact>();
+        all.Add(WxContact.Entry("新的朋友", "user-plus", "warning", 6));
+        all.Add(WxContact.Entry("群聊", "users", "info", 21));
+        all.Add(WxContact.Entry("公众号与服务号", "broadcast", "error", 94));
+        all.Add(WxContact.Entry("企业微信联系人", "building", "primary", 12));
+        all.Add(WxContact.Entry("我的企业", "briefcase", "success", 3));
+        all.Add(WxContact.Entry("联系人", "address-book", "primary", 187));
+
+        all.Add(WxContact.Header("A"));
+        all.Add(WxContact.Person("安若", "安", "primary", "anruo_88", "浙江 杭州",
+            "产品-安若", "同事", "把复杂留给自己，把简单留给别人。",
+            "通过手机号搜索", "2024-11-02"));
+        all.Add(WxContact.Header("C"));
+        all.Add(WxContact.Person("程雨", "程", "info", "chengyu_dev", "江苏 南京",
+            "后端-程雨", "同事", "先跑通，再跑快。", "群聊「产品评审群」",
+            "2024-12-18"));
+        all.Add(WxContact.Header("H"));
+        all.Add(WxContact.Person("何嘉树", "何", "success", "hejiashu", "广东 深圳",
+            "何嘉树", "同学", "周末在爬山，消息可能回得慢。", "扫一扫",
+            "2025-03-06"));
+        all.Add(WxContact.Header("L"));
+        all.Add(WxContact.Person("林昭远", "林", "success", "linzhaoyuan", "北京",
+            "合作方-林昭远", "合作方", "把接口写清楚，比写快更重要。",
+            "名片推送", "2025-05-21"));
+        all.Add(WxContact.Person("陆斯年", "陆", "primary", "lusinian", "上海",
+            "陆斯年", "同事", "设计是减法的艺术。", "企业微信",
+            "2024-09-11"));
+        all.Add(WxContact.Header("S"));
+        all.Add(WxContact.Person("苏黎", "苏", "warning", "suli_design", "四川 成都",
+            "设计-苏黎", "同事", "配色不对，功能全白费。", "通过手机号搜索",
+            "2025-01-15"));
+        all.Add(WxContact.Header("T"));
+        all.Add(WxContact.Person("唐砚", "唐", "info", "tangyan", "湖北 武汉",
+            "唐砚", "同学", "慢一点，比较快。", "群聊「设计稿同步」",
+            "2025-02-27"));
+        all.Add(WxContact.Header("X"));
+        all.Add(WxContact.Person("向晚", "向", "error", "xiangwan", "湖南 长沙",
+            "向晚", "朋友", "夜里写代码的人。", "扫码加我", "2024-07-30"));
+        all.Add(WxContact.Header("Z"));
+        all.Add(WxContact.Person("周予安", "周", "success", "zhouyuan", "福建 厦门",
+            "周予安", "客户", "有问题随时找我。", "通过手机号搜索",
+            "2025-06-04"));
+        return all;
+    }
+
+    // ---- 收藏 ------------------------------------------------------
+
+    static List<WxFav> Favs() {
+        List<WxFav> all = new List<WxFav>();
+        all.Add(WxFav.Of("链接", "link", "primary",
+            "把复杂留给自己：一次接口收敛的复盘",
+            "公众号 · 工程笔记｜当接口数量开始失控时，先收回参数…",
+            "工程笔记", "今天 09:24"));
+        all.Add(WxFav.Of("图片与视频", "photo", "info",
+            "配色方案 v3（深色）",
+            "苏黎 发来的图片｜1920 × 1080",
+            "苏黎", "昨天 18:41"));
+        all.Add(WxFav.Of("文件", "file-text", "success",
+            "2.4.0 发布清单.xlsx",
+            "表格｜42.6 KB",
+            "发布看板", "昨天 15:02"));
+        all.Add(WxFav.Of("聊天记录", "message", "warning",
+            "产品评审群 · 库存扣减顺序的结论",
+            "聊天记录｜共 37 条",
+            "产品评审群", "昨天 11:30"));
+        all.Add(WxFav.Of("位置", "map-pin", "error",
+            "云栖小镇国际会展中心",
+            "浙江省杭州市西湖区｜团队活动集合点",
+            "唐砚", "周一 20:15"));
+        all.Add(WxFav.Of("链接", "link", "primary",
+            "当列表有一万行：虚拟滚动的三种做法",
+            "公众号 · 前端周报｜固定行高、动态行高与分片渲染…",
+            "前端周报", "周一 08:05"));
+        all.Add(WxFav.Of("文件", "archive", "info",
+            "图标资源_24px.zip",
+            "压缩包｜3.8 MB",
+            "素材归档", "上周五"));
+        all.Add(WxFav.Of("图片与视频", "video", "success",
+            "演示录屏_气泡布局.mp4",
+            "视频｜00:02:14",
+            "陆斯年", "上周四"));
+        return all;
+    }
+}

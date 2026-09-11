@@ -396,6 +396,28 @@ CSS 里非 token 的长度由 `Style.ScaleLayout` 补乘,`StyleBox.IsPrescaled`
   stdlib）。规则：同一元素不要两头都给——要么皮肤给 padding，要么代码给
   Padding，混用只会互相顶。
 
+## 行内分隔线、Flex 方向类与 OnMeasure 表面着色(踩过的坑)
+
+1. **行内分隔线用 `border-bottom`,不要在带 `gap` 的行里塞 dock2 分隔线
+   控件。** dock 排布的 gap 会施加在「内容 ↔ 分隔线」之间:行高 64、gap 10
+   的行,内容盒只剩 48,右列深处的徽标行被 `FitSize` 钳到 29px,33px 的
+   胶囊画满即被自己的矩形裁掉底边(微信模板「徽标底部被切割」,2026-09-12;
+   用户先看到的是「下面的留白高于上面」——同一个根因)。分隔线写成
+   `.row { border-bottom: 1 var(--divider); }`,零布局成本;行 gap 只承担
+   水平间距,或把水平间距挪到子类 `padding-left`。
+2. **行内容要垂直居中:中列/右列用 `Flex.Column()` + `Justify("center")`。**
+   `Panel.Column` 是 dock 顶对齐,文本块贴顶、行底留白偏大,肉眼即见。
+3. **`Flex.Column()` 之后不能再用 `Class = ` 赋值**——`Class` setter 整体
+   替换类列表,`column` 方向类被冲掉,纵列当场变横排(整行塌成一行)。
+   追加类用 `AddClass("...")`。
+4. **自定义控件 OnMeasure 里改表面色,直写字段,不调 `Bg()/Gradient()`。**
+   这两个 setter 会把 computedStyle 置空,而 MeasureTree 里样式解析先于
+   OnMeasure;随后父容器的 flex 排布从 computedStyle 读 `flex-grow` 拿到 0,
+   控件挂 `.grow` 也不生长(ToolStrip 在 Flex 行里永远只有内容宽)。
+   修法:`styleBg = c; styleBgTo = d;` 再
+   `if (computedStyle != null) { Style.Inline(computedStyle, this); }`
+   把 inline 覆盖补映到已解析的 box。ToolStrip/StatusBar 都因此修过。
+
 ## 收尾自查(逐条过)
 
 1. 字号只来自阶梯(含 Tailwind `text-*` 档),没有即兴值。

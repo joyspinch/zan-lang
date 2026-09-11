@@ -1,0 +1,203 @@
+using System;
+using Gui;
+using Gui.Component;
+using Gui.Widget;
+
+/// 设置窗口：一扇真正的独立子窗口（`Gui.ChildWindow`），不是主窗口里的
+/// 浮层——原版的设置就是这样一扇可以自己移动、自己关掉的窗口。
+/// 界面本体仍是 `WxSettingsView` 这棵标准库控件树，窗口只负责外壳：
+/// 标题、初始尺寸、把宿主样式表铺进来、以及随主窗口换肤。
+class WxSettingsWindow : ChildWindow {
+    /// 同时只留一扇设置窗：已经开着就重绘现有的，不叠第二扇。
+    static WxSettingsWindow live;
+    App owner;
+    WxSettingsView view;
+
+    override string Title() { return "设置"; }
+    /// 原版设置窗是一扇窄窗：左导航 166 + 右正文，760 足够。
+    override int Width() { return 760; }
+    override int Height() { return 620; }
+    /// 设置窗不是工作区，不要最大化按钮（最小化/关闭照常）。
+    override bool ShowMaximize() { return false; }
+    override int IdBase() { return 910000; }
+
+    /// 打开设置窗（主窗口导航栏的齿轮按钮调用）。
+    static void Open(App app) {
+        if (WxSettingsWindow.live != null && WxSettingsWindow.live.IsOpen()) {
+            WxSettingsWindow.live.RequestRedraw();
+            return;
+        }
+        WxSettingsWindow w = new WxSettingsWindow();
+        w.owner = app;
+        w.view = new WxSettingsView(app);
+        // 纯代码建树：没有 .zform 的 bind 通道，model 传 null。
+        w.SetRoot(w.view, null);
+        w.Wire();
+        w.OpenHost(app);
+        // 子窗口是另一个 App，主窗口用 UseAppCss 铺的 .wx* 类不会自动
+        // 跟过来；外壳类与正文类都在同一张 WxSkin 表里，铺同一份即可。
+        w.host.UseAppCss(WxSkin.Css());
+        w.RequestRedraw();
+        WxSettingsWindow.live = w;
+    }
+}
+
+/// 独立聊天窗口：把会话行拖出主窗口后，这条会话开成一扇自己的子窗口
+/// （原版微信的「拖出来成独立窗口」）。窗口里是一份完整会话视图——
+/// 标题 + 气泡记录 + 输入区——数据与主窗口共享同一个 `WxSession`，
+/// 因此两边看到的是同一份记录；在这里发送后由 `notify` 让主窗口刷新
+/// 列表摘要与当前会话。
+class WxChatWindow : ChildWindow {
+    /// 每个会话至多一扇窗（拖出同一条会话不再开第二扇）。
+    static List<WxChatWindow> wins;
+    /// 各窗口的 WidgetId 基线：同进程内窗口不许撞号，每扇窗占一段
+    /// （同基线会让两扇窗的悬停/按压 id 互相覆盖）。
+    static int nextBase = 930000;
+    WxSession sess;
+    App owner;
+    Action notify;
+    int idBaseVal;
+    ChatView chat;
+    TextArea box;
+
+    WxChatWindow() {
+        this.idBaseVal = WxChatWindow.nextBase;
+        WxChatWindow.nextBase = WxChatWindow.nextBase + 2000;
+        this.sess = null;
+        this.owner = null;
+        this.notify = null;
+    }
+
+    /// 把会话 `s` 开成独立窗口。`afterSend` 由宿主传入，用于在浮窗里
+    /// 发出消息后刷新主窗口（列表摘要 + 当前会话记录）。
+    static void Open(App app, WxSession s, Action afterSend) {
+        WxChatWindow old = WxChatWindow.Find(s);
+        if (old != null) {
+            old.notify = afterSend;
+            old.RequestRedraw();
+            return;
+        }
+        WxChatWindow w = new WxChatWindow();
+        w.sess = s;
+        w.owner = app;
+        w.notify = afterSend;
+        w.BuildWindow();
+        if (WxChatWindow.wins == null) {
+            WxChatWindow.wins = new List<WxChatWindow>();
+        }
+        WxChatWindow.wins.Add(w);
+    }
+
+    /// 已开着的该会话窗口（按会话名认：示例数据里会话名唯一）。
+    static WxChatWindow Find(WxSession s) {
+        if (WxChatWindow.wins == null) { return null; }
+        for (int i = 0; i < WxChatWindow.wins.Count; i = i + 1) {
+            WxChatWindow w = WxChatWindow.wins[i];
+            if (w.IsOpen() && w.sess.name == s.name) { return w; }
+        }
+        return null;
+    }
+
+    override string Title() { return sess.name; }
+    /// 独立会话窗比主窗口窄：一列气泡 + 一条输入区。
+    override int Width() { return 520; }
+    override int Height() { return 680; }
+    override bool ShowMaximize() { return false; }
+    override int IdBase() { return idBaseVal; }
+
+    /// 搭窗口的控件树。结构与主窗口聊天页右侧一致（标题条 / 气泡记录 /
+    /// 输入区），所以沿用同一批 wx* 类；这里一个像素也不画。
+    void BuildWindow() {
+        Panel root = Wx.Col("wxchatwin");
+
+        Flex head = Wx.Row("wxhead");
+        head.dock = 1;
+        head.Add(Wx.Ava(sess.initial, 34, sess.tint));
+        Panel hp = Panel.Column();
+        hp.Class = "grow";
+        hp.Add(Wx.Lbl(sess.name, "wxheadname"));
+        if (sess.group) {
+            hp.Add(Wx.Lbl("群聊 · " + Convert.ToString(sess.people) + " 人",
+                "wxheaddesc"));
+        } else {
+            hp.Add(Wx.Lbl("独立窗口", "wxheaddesc"));
+        }
+        head.Add(hp);
+        head.Add(Wx.IconBtn("dots"));
+        root.Add(head);
+        root.Add(Wx.Line());
+
+        Panel comp = Wx.Col("wxcomposer");
+        comp.dock = 2;
+        // 与主窗口聊天页同款：输入框在上，图标 + 发送在底部。
+        Panel tw = Wx.Col("wxtypewrap");
+        tw.dock = 5;
+        box = new TextArea("");
+        box.Class = "wxtype";
+        box.dock = 5;
+        tw.Add(box);
+        comp.Add(tw);
+        ToolStrip bar = new ToolStrip();
+        bar.SetIconOnly(true);
+        bar.Class = "grow";
+        bar.Add("", "mood-smile");
+        bar.Add("", "folder");
+        bar.Add("", "scissors");
+        Flex bb = Wx.Row("wxbottom");
+        bb.dock = 2;
+        bb.Add(bar);
+        Button send = new Button("发送");
+        send.Class = "primary small";
+        send.OnClick(() => { this.Send(); });
+        bb.Add(send);
+        comp.Add(bb);
+        root.Add(comp);
+        root.Add(Wx.Line());
+
+        chat = new ChatView();
+        chat.Class = "wxchat";
+        chat.dock = 5;
+        chat.WithStyle(ChatStyle.Bubble());
+        chat.WithBubbleWidth(560);
+        this.BindChat();
+        root.Add(chat);
+
+        this.SetRoot(root, null);
+        this.Wire();
+        this.OpenHost(this.owner);
+        // 子窗口是另一个 App：主窗口铺的 .wx* 应用样式表要再铺一遍，
+        // 否则这扇窗里只有皮肤基线、没有会话布局类。
+        this.host.UseAppCss(WxSkin.Css());
+        this.RequestRedraw();
+    }
+
+    /// 与主窗口同一套气泡配置（发言人解析走同一份虚构数据）。
+    void BindChat() {
+        ChatStrings cs = ChatStrings.Default();
+        cs.you = "我";
+        cs.assistant = sess.name;
+        cs.empty = "还没有消息";
+        chat.WithStrings(cs);
+        chat.WithSpeakerNames(sess.group);
+        chat.WithSpeakers(WxData.Speaker, WxData.KindLabel);
+        chat.Reset();
+        chat.Bind(sess.msgs);
+        chat.Invalidate();
+    }
+
+    /// 在浮窗里发送：写进共享的会话记录，再让主窗口跟上。
+    void Send() {
+        string t = box.GetText();
+        if (t == "") { return; }
+        ChatMessage m = ChatMessage.Create("user", t);
+        m.at = DateTime.UtcNow().ToUnixSeconds();
+        sess.msgs.Add(m);
+        sess.snippet = t;
+        sess.time = "刚刚";
+        sess.unread = 0;
+        box.SetText("");
+        chat.Invalidate();
+        this.RequestRedraw();
+        if (notify != null) { notify(); }
+    }
+}

@@ -62,6 +62,31 @@ tens of seconds later (add the cursor-nudge keep-alive to speed this up), and a
 click that appears to close the dialog *without* starting the action has been seen
 once — always confirm from the output panel/log, never from "the dialog closed".
 
+## Driving ordinary GUI apps: synthetic events beat real-OS clicks
+
+For main-window UI of any Zan GUI app (not just the IDE), drive everything
+through the driver script itself — no `SetCursorPos`/`mouse_event`:
+
+- `dump hitregions <file>` writes physical **client** pixels of every
+  registered hit region (`id/x/y/w/h`). Ids are allocation-order per build:
+  stable within one build, shifted whenever controls are added — re-dump in
+  the same run you click, never reuse ids from an older build.
+- `clickid <id>` resolves the region at click time and injects
+  move+down+up at its center. This always lands, independent of window
+  frame/DWM offsets. Real-OS clicks need GetWindowRect→client mapping (the
+  non-client frame eats tens of px) and silently hit the wrong row otherwise.
+- `move <x> <y>` synthesizes WM_MOUSEMOVE for hover. The hover anim needs
+  ~0.3 s of frames after the move (the app self-schedules redraw frames
+  until the level hits 1000; the tooltip threshold is 900). The tooltip is
+  painted **inside the window** at `Tooltip.Flush` (frame end) and stays on
+  the last presented frame — but any later input erases it. **Park the real
+  cursor outside the window rect first** (`SetCursorPos` just right of
+  `GetWindowRect`): a real cursor left inside keeps producing
+  WM_MOUSEMOVE on any jitter, overwriting the synthetic hover — pixel
+  probes caught the hover level running 1000→796→456→124→0 as real moves
+  overtook the synthetic ones and the tooltip vanished before the
+  screenshot (2026-09-12, gui-wechat tips verification).
+
 ## Useful ZanIDE hit ids (2026-08 build, may drift — re-`dump hitregions`)
 
 - Ribbon 运行/调试/热重载/发布 = `100007..100010` (发布 = `100010`).

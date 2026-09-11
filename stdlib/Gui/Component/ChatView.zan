@@ -28,6 +28,10 @@ class ChatMessage {
     /// 字段），头行就不显示时刻。流式那条气泡在建出来时定下这个值，后面
     /// 每一拍只改正文，因此显示的是「这一轮开始说话的时间」。
     long at;
+    /// 图片附件路径（本地文件 / http(s) / data URI，交给 `Gui.Widget.Image`
+    /// 解码）。非空时这一轮在气泡模式里画成一张图片气泡；正文仍然保留，
+    /// 供记录模式（ChatStyle.Log）与复制使用。
+    string img;
 
     /// 一条普通消息：无思考、无信封，时间戳取当前 UTC 时刻。
     static ChatMessage Create(string role, string text) {
@@ -42,6 +46,14 @@ class ChatMessage {
         m.progress = 0;
         m.call = "";
         m.at = DateTime.UtcNow().ToUnixSeconds();
+        m.img = "";
+        return m;
+    }
+
+    /// 一条带图片的消息（气泡模式画图片，记录模式画正文）。
+    static ChatMessage CreateImage(string role, string path, string text) {
+        ChatMessage m = ChatMessage.Create(role, text);
+        m.img = path;
         return m;
     }
 
@@ -87,6 +99,81 @@ delegate ChatSpeaker ChatSpeakerOf(string agent);
 
 /// 把协议节拍（`ChatMessage.kind`）翻成头行右侧的状态标签。
 delegate string ChatKindLabel(string kind);
+
+/// 把消息时刻翻成要显示的文本（气泡模式下是分隔时刻与气泡尾巴上的小字）。
+/// 给了它就由宿主决定格式（含时区与本地化）；不给时组件用本机时区的 HH:MM。
+delegate string ChatClock(long at);
+
+/// 聊天视图的排版模式。
+class ChatStyle {
+    /// 工具调用式记录（默认）：整宽行、轮次色块、头行横幅。适合助手/工具
+    /// 会话——那里每一条背后都跟着一大段工件，气泡会把它挤成窄柱。
+    static int Log() { return 0; }
+    /// IM 气泡：左右分置的圆角气泡、头像、时刻与发送者名字在外的聊天记录。
+    /// 适合人对人的会话（微信/QQ 那种一次一两句的往来）。
+    static int Bubble() { return 1; }
+}
+
+/// 气泡模式里的一条：一条消息在内容坐标里的位置，以及它要画的东西。
+/// 由 `ChatView.BuildBubbles` 生成、`PaintBubbles` 消费，宿主看不到。
+///
+/// 与记录模式的行表（`TextRun`）分开，是因为两者不是一回事：记录模式
+/// 的消息是「若干等高的展示行」，气泡模式的消息是「一个宽度按内容、
+/// 高度按换行结果的可变盒子」。把气泡硬塞进行表，量出来的宽度与画出来
+/// 的盒子迟早对不上。
+class ChatBubble {
+    /// 消息在 `data` 里的下标；-1 表示这不是一条消息（busy 提示行）。
+    int idx;
+    /// 内容坐标里的顶边，以及这块占的高度（含名字行与时刻分隔）。
+    int top;
+    int h;
+    /// 顶部为时刻分隔预留的高度（0 = 这条不画分隔）与要画的文本。
+    int divH;
+    string divText;
+    /// 名字行高度（群聊里别人的消息才有）与名字。
+    int nameH;
+    string name;
+    /// 气泡正文的换行结果与最长行宽（图片气泡为空 / 0）。
+    List<string> lines;
+    int textW;
+    /// 图片气泡的画面尺寸（0 = 文本气泡）。
+    int imgW;
+    int imgH;
+    /// 图片气泡的图片路径（`imgW > 0` 时有效）。
+    string imgPath;
+    /// 头像首字与配色类名（busy 行没有头像）。
+    string initial;
+    string avaCls;
+    /// 这条是「我」发的（右对齐、头像在右）。
+    bool mine;
+    /// 气泡自身的宽高（含内边距）。
+    int bw;
+    int bh;
+    /// busy 提示行：气泡用弱色画、不跟任何消息关联。
+    bool waiting;
+
+    /// 全部字段显式归零：`new` 出来的实例不依赖语言对未赋值字段的默认值。
+    ChatBubble() {
+        idx = 0 - 1;
+        top = 0;
+        h = 0;
+        divH = 0;
+        divText = "";
+        nameH = 0;
+        name = "";
+        lines = new List<string>();
+        textW = 0;
+        imgW = 0;
+        imgH = 0;
+        imgPath = "";
+        initial = "";
+        avaCls = "";
+        mine = false;
+        bw = 0;
+        bh = 0;
+        waiting = false;
+    }
+}
 
 /// 聊天视图要显示的所有文案。全部由宿主给出，组件本身不依赖任何
 /// 翻译层，于是同一个组件可以出现在任意语言的程序里。
@@ -140,6 +227,10 @@ class ChatView : Control {
     ChatStrings str;
     ChatSpeakerOf speakerOf;
     ChatKindLabel kindLabelOf;
+    /// 排版模式（ChatStyle.Log / ChatStyle.Bubble）。
+    int style;
+    /// 时刻格式化钩子（null = 组件内置的本机时区 HH:MM）。
+    ChatClock clockOf;
 
     /// 正在排的那份行表，以及增量重排用的水位线：`cacheTurns` 之前的
     /// 轮次已定型，`cachePrefix` 是它们占的行数。
@@ -165,6 +256,30 @@ class ChatView : Control {
     StyledText grid;
     Label emptyLbl;
 
+    // ---- 气泡模式（ChatStyle.Bubble）----------------------------------
+    //
+    // 气泡不是等高行：每条消息是一个宽度按内容、高度按换行结果的可变
+    // 盒子，所以它不走 StyledText 的行网格，而是在这里量一遍、
+    // 在 OnPaint 里按同一份几何画。几何按「宽度 + 字号 + 数据签名」
+    // 缓存，只在真正变了的那一帧重算——否则每帧重新量一遍
+    // MeasureText 会把一段长会话的帧预算吃光。
+    /// 量好的气泡几何（内容坐标，不含滚动偏移）。
+    List<ChatBubble> bub;
+    /// 几何缓存对应的输入签名（"" = 还没量过）。
+    string bubKey;
+    /// 几何的总高度（内容坐标），滚动条的界限由它和视口高算出。
+    int bubH;
+    /// 本次几何是整份重排（会丢弃选区）。
+    bool bubStale;
+    /// 气泡模式的像素滚动信号（0 = 贴住最新一条）。
+    SignalInt bscr;
+    /// 气泡正文的最大宽度比例（千分比），由 `WithBubbleWidth` 给。
+    int bubWMille;
+    /// 上次量气泡用的布局签名（`BubbleLayoutSig`），变了就是整份重排。
+    string bubSig;
+    /// 别人的气泡上方显示发言人名字（群聊）。自己发的永远不显示。
+    bool showNames;
+
     /// 空视图：英文默认文案，常驻的记录网格与空态提示都已建好
     /// （是否显示由每帧绘制决定）。
     ChatView() {
@@ -175,6 +290,8 @@ class ChatView : Control {
         str = ChatStrings.Default();
         speakerOf = null;
         kindLabelOf = null;
+        style = 0;
+        clockOf = null;
         cache = new List<TextRun>();
         cacheTurns = 0;
         cachePrefix = 0;
@@ -185,15 +302,28 @@ class ChatView : Control {
         toolOpen = new List<int>();
         thinkOpen = new SignalInt(0);
         scrollSig = new SignalInt(0);
+        bub = new List<ChatBubble>();
+        bubKey = "";
+        bubH = 0;
+        bubStale = false;
+        bscr = new SignalInt(0);
+        bubWMille = 620;
+        bubSig = "";
+        showNames = false;
         sel = new LogState();
         busy = false;
         grid = new StyledText();
         grid.DockFill();
+        // 两个子控件按数据互斥显示：显示与否由 OnPaint 决定，而绘制发生在
+        // 同一帧的排版之后，所以出生时先都收起来——否则首帧排版会看到两个
+        // 满框的兄弟叠在一起（重叠自检会把它报成手打布局事故）。
+        grid.SetShown(false);
         this.Add(grid);
         emptyLbl = new Label();
         emptyLbl.wrap = true;
         emptyLbl.Class = "hint small";
         emptyLbl.DockFill();
+        emptyLbl.SetShown(false);
         this.Add(emptyLbl);
     }
 
@@ -226,6 +356,50 @@ class ChatView : Control {
         return this;
     }
 
+    /// 排版模式（ChatStyle.Log / ChatStyle.Bubble）。换了模式要整份重排。
+    ChatView WithStyle(int st) {
+        style = st;
+        this.Invalidate();
+        return this;
+    }
+
+    /// 时刻格式化钩子（气泡模式的时刻分隔与气泡尾巴小字都走它）。
+    ChatView WithClock(ChatClock c) {
+        clockOf = c;
+        this.Invalidate();
+        return this;
+    }
+
+    /// 气泡正文的最大宽度（占视口宽的千分比，默认 620 = 六成）。窗口
+    /// 很宽时一条短消息拉满整屏并不好读，这个上限就是「一句话最长能
+    /// 占多宽」；窗口变窄时气泡仍然按可用宽度收窄，不会溢出。
+    ChatView WithBubbleWidth(int mille) {
+        if (mille < 250) { mille = 250; }
+        if (mille > 1000) { mille = 1000; }
+        bubWMille = mille;
+        this.Invalidate();
+        return this;
+    }
+
+    /// 当前排版模式。
+    int Style() { return style; }
+
+    /// 别人的气泡上方是否显示发言人名字（群聊场景）。一对一聊天关掉它：
+    /// 左边永远只有一个人，名字行只是白占一行高度。
+    ChatView WithSpeakerNames(bool on) {
+        showNames = on;
+        this.Invalidate();
+        return this;
+    }
+
+    /// 本机时区下这条消息的显示文本；没有记时间的旧消息返回 ""。
+    string Clock(long at) {
+        if (clockOf != null) { return clockOf(at); }
+        if (at <= 0) { return ""; }
+        DateTime d = DateTime.FromUnixSeconds(at).ToLocalTime();
+        return Text.Left(d.ToTimeString(), 5);
+    }
+
     /// 一条消息头行右侧的本机时区时刻（HH:MM）；没有记时间的旧消息返回 ""。
     static string ClockText(long at) {
         if (at <= 0) { return ""; }
@@ -242,6 +416,10 @@ class ChatView : Control {
     /// 底端锚定的滚动偏移信号（0 = 贴住最新一行）。
     SignalInt Scroll() { return scrollSig; }
 
+    /// 气泡模式的像素滚动偏移信号（0 = 贴住最新一条）。宿主把它接到
+    /// 自己的滚动记忆上时用；不接也不影响滚轮与拖动。
+    SignalInt BubbleScroll() { return bscr; }
+
     /// 换掉一整份记录（切换会话）：缓存、折叠、选区与滚动全部归零。
     void Reset() {
         cache = new List<TextRun>();
@@ -252,6 +430,11 @@ class ChatView : Control {
         show = new List<TextRun>();
         showStale = false;
         toolOpen = new List<int>();
+        bub = new List<ChatBubble>();
+        bubKey = "";
+        bubH = 0;
+        bubStale = false;
+        bscr.Set(0);
         sel.Reset();
         scrollSig.Set(0);
     }
@@ -260,6 +443,7 @@ class ChatView : Control {
     void Invalidate() {
         cacheKey = "";
         cacheSig = "";
+        bubKey = "";
     }
 
     /// 当前选中的文本（未选中则 ""）。
@@ -272,10 +456,19 @@ class ChatView : Control {
     /// 状态交给常驻的 StyledText 呈现。
     override void OnPaint(App app) {
         bool has = data != null && data.Count > 0;
+        bool bubMode = style == ChatStyle.Bubble();
         emptyLbl.SetShown(!has && !busy);
-        grid.SetShown(has || busy);
+        // 记录网格只在记录模式下出现：气泡模式的行不是等高的展示行，
+        // 走的是这里自己的几何，网格留着只会把上一份记录又画一遍。
+        grid.SetShown(!bubMode && (has || busy));
         if (!has && !busy) {
             emptyLbl.Text = str.empty;
+            return;
+        }
+        if (bubMode) {
+            this.TakeBubbleWheel(app);
+            this.BuildBubble(app);
+            this.PaintBubbles(app);
             return;
         }
         this.TakeWheel(app);
@@ -297,6 +490,26 @@ class ChatView : Control {
         if (scrollSig.Get() > max) { scrollSig.Set(max); }
         if (scrollSig.Get() < 0) { scrollSig.Set(0); }
         this.TakeCopy(app);
+    }
+
+    /// 指针在气泡区上时滚轮滚动：气泡是像素滚动的，一档滚 40px（约一
+    /// 行多一点），而不是记录模式的一整行。
+    void TakeBubbleWheel(App app) {
+        if (!app.CaptureWheel(bx, by, bw, bh)) { return; }
+        int d = app.window.EventKeyCode();
+        int step = d / 120;
+        if (step == 0) {
+            if (d > 0) { step = 1; }
+            else if (d < 0) { step = 0 - 1; }
+        }
+        int padV = app.Scale(10);
+        int viewH = bh - padV * 2;
+        int over = bubH - viewH;
+        if (over < 0) { over = 0; }
+        bscr.Set(bscr.Get() - step * app.Scale(40));
+        if (bscr.Get() > over) { bscr.Set(over); }
+        if (bscr.Get() < 0) { bscr.Set(0); }
+        app.RequestRedraw();
     }
 
     /// 指针在记录上时滚轮滚动。
@@ -327,10 +540,6 @@ class ChatView : Control {
     /// 换行缓存：只有记录、宽度、字号或折叠状态变了才重建，而且只有
     /// 正在流式输出的最后一轮会重排——1000 轮的会话和空会话一样便宜。
     void Build(App app) {
-        // 还没量到尺寸（第一帧之前，或者窗口被最小化压成 0×0）：这时候
-        // 排出来的每一行都作废，而且是按最小宽度排整份记录——把一份长
-        // 记录排成几十万行的代价，正好落在恢复窗口的那一下。留着缓存
-        // 原样等有尺寸的那一帧。
         if (bw <= 0 || bh <= 0) { return; }
         // 纵向滚动条的宽度始终预留：换行宽度跟着滚动条的有无变，就会在「刚
         // 好多一行」附近每帧重排一次。
@@ -796,6 +1005,352 @@ class ChatView : Control {
             int at = togPos[tpi];
             if (at >= 0 && at < cache.Count) { cache[at].meta = togMsg[tpi]; }
         }
+    }
+
+    // ---- 气泡排版（ChatStyle.Bubble）----------------------------------
+
+    /// 两条消息相隔多久才插一条时刻分隔。5 分钟内连着说的几句算一轮，
+    /// 只在轮次开头报一次时间——和 IM 客户端的手感一致。
+    static int BubbleTimeGap() { return 300; }
+
+    /// 气泡正文的字号。
+    static int BubbleFont(App app) {
+        return Style.FontFallback(app, "small");
+    }
+
+    /// 话轮几何的输入签名。它一变，整份重排（行宽全变），因此与
+    /// 缓存键分开算：`layoutSig` 记账、`keyNow` 判断这一帧要不要干活。
+    string BubbleLayoutSig(App app) {
+        return Convert.ToString(bw) + ":" + Convert.ToString(ChatView.BubbleFont(app))
+            + ":" + Convert.ToString(bubWMille)
+            + ":" + Convert.ToString(app.bgThemeGen)
+            + ":" + (showNames ? "1" : "0");
+    }
+
+    /// 把消息流量成一列可变高的气泡盒子（内容坐标）。换行结果缓存在
+    /// `bub` 里，只有签名变了才重算——`TextWrap.Lines` 是逐字符量宽，
+    /// 每次绘制都重排一份长会话会把帧预算吃光。
+    void BuildBubble(App app) {
+        if (bw <= 0 || bh <= 0) { return; }
+        int count = 0;
+        if (data != null) { count = data.Count; }
+        if (count == 0 && !busy) {
+            bub = new List<ChatBubble>();
+            bubH = 0;
+            bubKey = "empty";
+            return;
+        }
+        int fontPx = ChatView.BubbleFont(app);
+        string tailSig = "-";
+        if (count > 0) {
+            ChatMessage tm = data[count - 1];
+            tailSig = Convert.ToString(tm.text.Length + tm.img.Length)
+                + "/" + tm.role;
+        }
+        string layoutSig = this.BubbleLayoutSig(app);
+        string keyNow = layoutSig + ":" + Convert.ToString(count) + ":" + tailSig
+            + ":" + (busy ? "1" : "0");
+        if (keyNow == bubKey) { return; }
+        // 行宽变了就整份重排：留着的选区会框住错的文本，换上来的那一帧
+        // 一起丢掉（与记录模式同一条约定）。
+        bubStale = layoutSig != bubSig;
+        bubSig = layoutSig;
+
+        int pad = app.Scale(12);
+        int padV = app.Scale(10);
+        int avaD = app.Scale(34);
+        int gapA = app.Scale(8);
+        int tailW = app.Scale(6);
+        int padX = app.Scale(12);
+        int padY = app.Scale(9);
+        int lineH = Canvas.FontHeight(fontPx) + app.Scale(3);
+        int nameH = 0;
+        if (showNames) {
+            nameH = Canvas.FontHeight(Style.FontFallback(app, "tiny"))
+                + app.Scale(3);
+        }
+        int maxBub = bw - pad * 2 - avaD - gapA - tailW;
+        int cap = bw * bubWMille / 1000;
+        if (cap < maxBub && cap > app.Scale(120)) { maxBub = cap; }
+        if (maxBub < app.Scale(120)) { maxBub = app.Scale(120); }
+        int textW = maxBub - padX * 2;
+        if (textW < app.Scale(40)) { textW = app.Scale(40); }
+
+        List<ChatBubble> rows = new List<ChatBubble>();
+        List<int> prevAt = new List<int>();
+        prevAt.Add(0);
+        int yy = 0;
+        int i = 0;
+        while (i < count) {
+            ChatMessage msg = data[i];
+            // 一拍只发了工具调用（正文、图片、思考全空）时留下的是空壳，
+            // 记录模式不画它，气泡模式同样不画。
+            if (msg.text == "" && msg.img == "" && msg.reason == ""
+                && i < count - 1) {
+                i = i + 1;
+                continue;
+            }
+            bool mine = msg.role == "user";
+            ChatBubble b = new ChatBubble();
+            b.idx = i;
+            b.mine = mine;
+            if (mine) {
+                b.initial = this.InitialOf(str.you);
+                b.avaCls = "bubble-mine";
+            } else {
+                b.initial = this.SpeakerInitial(msg);
+                b.avaCls = "bubble-other";
+            }
+            if (showNames && !mine) {
+                b.nameH = nameH;
+                b.name = this.SpeakerName(msg);
+            }
+            // 时刻分隔：轮次开头、或与上一句隔得够久。
+            if (msg.at > 0 && msg.at - prevAt[0] >= ChatView.BubbleTimeGap()) {
+                b.divH = lineH + app.Scale(8);
+                b.divText = this.Clock(msg.at);
+                prevAt[0] = msg.at;
+            }
+            // 图片气泡：按图片的自然尺寸缩进可用盒子，不放大。
+            if (msg.img != "") {
+                int natW = Canvas.ImageWidth(msg.img);
+                int natH = Canvas.ImageHeight(msg.img);
+                if (natW > 0 && natH > 0) {
+                    int iw = natW;
+                    int ih = natH;
+                    int maxH = app.Scale(260);
+                    if (iw > textW) {
+                        ih = ih * textW / iw;
+                        iw = textW;
+                    }
+                    if (ih > maxH) {
+                        iw = iw * maxH / ih;
+                        ih = maxH;
+                    }
+                    b.imgW = iw;
+                    b.imgH = ih;
+                    b.imgPath = msg.img;
+                    b.bw = iw + padX * 2;
+                    b.bh = ih + padY * 2;
+                }
+            }
+            if (b.imgW <= 0) {
+                List<string> ls = TextWrap.Lines(msg.text, textW, fontPx);
+                int widest = 0;
+                for (int li = 0; li < ls.Count; li = li + 1) {
+                    int lw = Canvas.MeasureText(ls[li], fontPx);
+                    if (lw > widest) { widest = lw; }
+                }
+                b.lines = ls;
+                b.textW = widest;
+                b.bw = widest + padX * 2;
+                if (b.bw > maxBub) { b.bw = maxBub; }
+                b.bh = ls.Count * lineH + padY * 2;
+            }
+            b.top = yy + b.divH + b.nameH;
+            int rowH = avaD;
+            if (b.bh > rowH) { rowH = b.bh; }
+            b.h = b.divH + b.nameH + rowH;
+            yy = b.top + rowH + app.Scale(10);
+            rows.Add(b);
+            i = i + 1;
+        }
+        if (busy) {
+            ChatBubble b = new ChatBubble();
+            b.waiting = true;
+            b.lines = TextWrap.Lines(str.busy, textW, fontPx);
+            int widest = 0;
+            for (int li = 0; li < b.lines.Count; li = li + 1) {
+                int lw = Canvas.MeasureText(b.lines[li], fontPx);
+                if (lw > widest) { widest = lw; }
+            }
+            b.textW = widest;
+            b.bw = widest + padX * 2;
+            b.bh = b.lines.Count * lineH + padY * 2;
+            b.top = yy;
+            b.h = b.bh;
+            yy = b.top + b.bh + app.Scale(10);
+            rows.Add(b);
+        }
+        bub = rows;
+        bubH = yy + padV;
+        bubKey = keyNow;
+    }
+
+    /// 发言者显示名（多智能体会话走 `speakerOf`，否则用文案里的助手名）。
+    string SpeakerName(ChatMessage msg) {
+        if (msg.agent != "" && speakerOf != null) {
+            ChatSpeaker who = speakerOf(msg.agent);
+            if (who != null) { return who.name; }
+        }
+        return str.assistant;
+    }
+
+    /// 发言者头像里的首字。
+    string SpeakerInitial(ChatMessage msg) {
+        return StyledText.Initial(this.SpeakerName(msg));
+    }
+
+    /// 名字首字（与 `StyledText.Initial` 同一套字符边界规则）。
+    string InitialOf(string name) {
+        return StyledText.Initial(name);
+    }
+
+    /// 画一列气泡：时刻分隔居中、气泡靠发送者一侧、头像在最外侧，
+    /// 图片气泡按 contain 铺进盒内。滚动是「离底部多少像素」，
+    /// 滚轮与滚动条动的是同一个量。
+    void PaintBubbles(App app) {
+        if (bubKey == "") { return; }
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        StyleBox mineBox = Style.Part(app, "chatview", "bubble", "",
+                                      "mine", "", Style.SNormal());
+        StyleBox otherBox = Style.Part(app, "chatview", "bubble", "",
+                                       "other", "", Style.SNormal());
+        StyleBox waitBox = Style.Part(app, "chatview", "bubble", "",
+                                      "waiting", "", Style.SNormal());
+        StyleBox timeBox = Style.Part(app, "chatview", "time", "",
+                                      "", "", Style.SNormal());
+        StyleBox nameBox = Style.Part(app, "chatview", "name", "",
+                                      "", "", Style.SNormal());
+        int pad = app.Scale(12);
+        int padV = app.Scale(10);
+        int avaD = app.Scale(34);
+        int gapA = app.Scale(8);
+        int tailW = app.Scale(6);
+        // 尾巴不是贴在气泡外角，而是沿外缘下移一段：四角保持圆角，
+        // 尾巴变成侧缘上的一枚小鼓包，压在头像与气泡之间。
+        int tailDrop = app.Scale(12);
+        int padX = app.Scale(12);
+        int padY = app.Scale(9);
+        int fontPx = ChatView.BubbleFont(app);
+        int lineH = Canvas.FontHeight(fontPx) + app.Scale(3);
+        int radius = app.Scale(6);
+        int viewH = bh - padV * 2;
+        if (viewH < 0) { viewH = 0; }
+        int over = bubH - viewH;
+        if (over < 0) { over = 0; }
+        if (bscr.Get() > over) { bscr.Set(over); }
+        if (bscr.Get() < 0) { bscr.Set(0); }
+        int y0 = by + padV - (over - bscr.Get());
+        c.PushClip(bx, by, bw, bh);
+        for (int i = 0; i < bub.Count; i = i + 1) {
+            ChatBubble b = bub[i];
+            // 分隔与名字行都在 `b.top` 之上，先算它们的绝对 y。
+            int dvy = y0 + b.top - b.divH - b.nameH;
+            if (b.divH > 0) {
+                int tf = timeBox.FontOr(Style.FontFallback(app, "tiny"));
+                int tw = Canvas.MeasureText(b.divText, tf);
+                int tx = bx + (bw - tw) / 2;
+                int ty = dvy + (b.divH - Canvas.FontHeight(tf)) / 2;
+                if (ty + Canvas.FontHeight(tf) > by
+                    && ty < by + bh) {
+                    c.DrawText(tx, ty, b.divText, timeBox.FgOr(0), tf);
+                }
+            }
+            int ry = y0 + b.top;
+            int rowH = avaD;
+            if (b.bh > rowH) { rowH = b.bh; }
+            if (ry + rowH < by || ry > by + bh) { continue; }
+            int bx0 = 0;
+            int avaX = 0;
+            int mask = 0;
+            int cy = 0;
+            if (b.waiting || !b.mine) {
+                avaX = bx + pad;
+                bx0 = avaX + avaD + gapA + tailW;
+                mask = 15;   // 四角全圆：尾巴已下移到侧缘
+                cy = ry;
+            } else {
+                avaX = bx + bw - pad - avaD;
+                bx0 = avaX - gapA - tailW - b.bw;
+                mask = 15;
+                cy = ry;
+            }
+            if (b.nameH > 0 && !b.waiting) {
+                int nf = nameBox.FontOr(Style.FontFallback(app, "tiny"));
+                int ny = ry - b.nameH
+                    + (b.nameH - Canvas.FontHeight(nf)) / 2;
+                if (b.mine) {
+                    int nw = Canvas.MeasureText(b.name, nf);
+                    c.DrawText(bx0 + b.bw - nw, ny, b.name, nameBox.FgOr(0), nf);
+                } else {
+                    c.DrawText(bx0, ny, b.name, nameBox.FgOr(0), nf);
+                }
+            }
+            int fill = mineBox.BgOr(0);
+            int fg = mineBox.FgOr(0);
+            if (b.waiting) {
+                fill = waitBox.BgOr(0);
+                fg = waitBox.FgOr(0);
+            } else if (!b.mine) {
+                fill = otherBox.BgOr(0);
+                fg = otherBox.FgOr(0);
+            }
+            c.FillRoundRectIn(bx0, ry, b.bw, b.bh, radius, mask, fill);
+            // 尾巴：贴在侧缘（外角下方 tailDrop 处）的一枚四分之一圆，
+            // 直边与气泡的边缘重合，并起来就是带小鼓包的完整气泡。
+            if (b.waiting || !b.mine) {
+                c.FillSector(bx0, ry + tailDrop, 0, tailW, 180, 270, fill);
+            } else {
+                c.FillSector(bx0 + b.bw, ry + tailDrop, 0, tailW, 90, 180, fill);
+            }
+            if (b.imgW > 0) {
+                c.BlitImage(b.imgPath, bx0 + padX, ry + padY, b.imgW, b.imgH,
+                    0, 0, 0, 0);
+            } else {
+                int ty = ry + padY;
+                for (int li = 0; li < b.lines.Count; li = li + 1) {
+                    c.DrawText(bx0 + padX, ty, b.lines[li], fg, fontPx);
+                    ty = ty + lineH;
+                }
+            }
+            if (!b.waiting) {
+                Avatar av = ChatView.BubbleAvatar();
+                av.Text = b.initial;
+                av.Size = 34;
+                av.Class = b.avaCls;
+                int d = av.Diameter(app);
+                int ay = ry;
+                if (d > avaD) { d = avaD; }
+                av.RenderAt(app, avaX, ay, d);
+            }
+        }
+        c.PopClip();
+        // 滚动条：它说的是「从顶算的像素」，这里换一下再把拖动结果写回
+        // 调用方的「从底算」信号。
+        if (over > 0) {
+            int barW = app.Scale(10);
+            SignalInt px = ChatView.BubbleBarSig();
+            px.Set(over - bscr.Get());
+            Scrollbar.RenderVerticalScrollIn(app, bx + bw - barW, by + padV,
+                viewH, viewH, bubH, px, bx, by, bw, bh);
+            int top = px.Get();
+            int want = over - top;
+            if (want < 0) { want = 0; }
+            if (want > over) { want = over; }
+            if (want != bscr.Get()) { bscr.Set(want); app.RequestRedraw(); }
+        }
+    }
+
+    /// 滚动条要的是「像素、从顶算」，气泡滚动是「像素、从底算」；
+    /// 常驻一个转换信号，免得每帧新分配。
+    static SignalInt bubbleBar;
+    static SignalInt BubbleBarSig() {
+        if (ChatView.bubbleBar == null) {
+            ChatView.bubbleBar = new SignalInt(0);
+        }
+        return ChatView.bubbleBar;
+    }
+
+    /// 气泡头像复用同一实例：每个可见气泡都要一枚，每帧每气泡新分配
+    /// 一个控件正是长会话卡顿的来源（与 StyledText 的头行头像同理）。
+    static Avatar bubbleAva;
+    static Avatar BubbleAvatar() {
+        if (ChatView.bubbleAva == null) {
+            ChatView.bubbleAva = new Avatar();
+        }
+        return ChatView.bubbleAva;
     }
 
     /// `cache` 中选中的文本（换行拼接，未选中则 ""）。

@@ -475,6 +475,14 @@ class ChildWindow {
 class ChildWindows {
     static List<ChildWindow> wins;
     static FilePicker picker;
+    /// 最近一次已路由的事件序号与结果（`Route` 幂等）。标准循环
+    /// `Form.Run` 与自带帧钩子的宿主（ZanIDE 外壳）都会按 hwnd 路由，
+    /// 同一事件经两处必然把一次按压/释放重放一遍——双击计数、长按
+    /// 计时、拖拽起点都会被算两遍。事件序号是"每投递一个新事件 +1"，
+    /// 正好是那件事件的身份证；它同时挡住动画帧里 `EventKind()` 的
+    /// 陈旧回读（没有新事件时序号不变）。
+    static long routedSeq;
+    static bool routedHandled;
     /// 组件自建的附加选择器（Upload 内建选文件弹窗等）。单一 `picker`
     /// 槽归应用 shell 注册的共享选择器所有（IDE 的 pathPicker）；这批
     /// 由组件按需登记，数量不限。PumpAll/Route/Wants 统一照顾两处。
@@ -626,20 +634,38 @@ class ChildWindows {
         return due;
     }
 
-    /// Hands the event to the window it is addressed to; false when no child
-    /// owns it (it belongs to the main window or the file picker).
+    /// 把事件交给它所属的那扇顶层窗口（子窗口 / 共享选择器 / 组件
+    /// 选择器）；都不属于时返回 false（那是主窗口自己的事件）。
+    /// 由事件泵 `App.ProcessEvent` 对每一件非本窗口事件调用一次，
+    /// 宿主循环因此不必知道 hwnd 路由这回事。幂等（按事件序号）：
+    /// 自带循环/帧钩子的宿主若再调一次，同一件事件不会被送第二遍。
     static bool Route(nint hwnd) {
+        // 幂等：同一件事件（序号相同）只交付一次，重复调用返回上次结果。
+        long seq = Window.EventSeqGlobal();
+        if (seq == ChildWindows.routedSeq) { return ChildWindows.routedHandled; }
+        ChildWindows.routedSeq = seq;
+        ChildWindows.routedHandled = false;
         foreach (ChildWindow w in ChildWindows.All()) {
             if (w.OwnsWindow(hwnd)) {
                 w.ApplyEvent(hwnd);
+                ChildWindows.routedHandled = true;
                 return true;
             }
+        }
+        // 共享文件选择器（应用外壳注册的 pathPicker）：它的弹窗也是
+        // 独立顶层窗口，路由由这里一并负责，外壳不必自己再判断一遍。
+        if (ChildWindows.picker != null
+            && ChildWindows.picker.OwnsWindow(hwnd)) {
+            ChildWindows.picker.ApplyEvent(hwnd);
+            ChildWindows.routedHandled = true;
+            return true;
         }
         if (ChildWindows.pickers != null) {
             for (int i = 0; i < ChildWindows.pickers.Count; i = i + 1) {
                 FilePicker p = ChildWindows.pickers[i];
                 if (p.OwnsWindow(hwnd)) {
                     p.ApplyEvent(hwnd);
+                    ChildWindows.routedHandled = true;
                     return true;
                 }
             }
