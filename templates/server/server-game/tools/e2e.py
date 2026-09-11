@@ -807,6 +807,14 @@ ok(m is not None and "push" in m, "attach claims push channel for http session")
 j = api("/api/game/login", {"user": "e2e_push", "pass": "pass123"})
 ok(j.get("ok") == 1 and j.get("token") != tok, "relogin mints a fresh token")
 tok2 = j["token"]
+# relogin revokes the old token immediately (A303 建议 ①)：旧 token 的
+# HTTP op 拒绝（登录已过期）；新 token 正常。attach 侧由下一段
+# 「old push channel receives relogin kick」+ 拒绝形态覆盖。
+j = api("/api/game/enter", {"op": "enter", "token": tok, "realm": 1})
+ok(j.get("ok") == 0 and j.get("err") == "登录已过期，请重新登录",
+   "old token rejected on HTTP op after relogin (revoke)")
+j = api("/api/game/enter", {"op": "enter", "token": tok2, "realm": 1})
+ok(j.get("ok") == 1, "new token still valid after relogin")
 m = p.recv()
 ok(m is not None and m.get("ev") == "kick",
    "old push channel receives relogin kick")
