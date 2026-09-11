@@ -59,14 +59,16 @@ class WxSessionRow : Control {
     }
 }
 
-/// 通讯录的一行。三种行共用这一个模板：快捷入口（图标 + 名字 + 数量）、
-/// 字母分组头（一行小字）、联系人（头像 + 名字）。分组头不可选。
+/// 通讯录的一行。按行种类分型：分组节（chevron + 名字 + 计数，整行
+/// 可点折叠/展开）、字母分组头（一行小字，不可选）、联系人/群聊/
+/// 公众号（头像 + 名字）、好友申请（头像 + 名字与申请语 + 接受按钮）、
+/// 企业（公司行用蓝色楼宇图标，联系人行用首字头像）。
 class WxContactRow : Control {
     WxContact item;
 
     static Control Of(WxContact it) { return new WxContactRow(it); }
 
-    /// ListView 的可选门控：分组头只是一个分节标题，不是选项。
+    /// ListView 的可选门控：字母分组头只是分节标题，不是选项。
     static bool Selectable(WxContact it) { return it.kind != 1; }
 
     WxContactRow(WxContact it) {
@@ -77,19 +79,66 @@ class WxContactRow : Control {
             this.Add(Wx.Lbl(it.name, "wxhead2"));
             return;
         }
+        if (it.kind == 0) {
+            this.Class = "wxsec";
+            IconView ch = new IconView(
+                it.open ? "chevron-down" : "chevron-right", 14);
+            ch.dock = 3;
+            this.Add(ch);
+            Label nm = Wx.Lbl(it.name, "wxcatname");
+            nm.dock = 5;
+            this.Add(nm);
+            if (it.count > 0) {
+                Flex cr = Wx.Row("");
+                cr.Justify("end");
+                cr.Add(Wx.Lbl(Convert.ToString(it.count), "wxcatcount"));
+                cr.dock = 4;
+                this.Add(cr);
+            }
+            return;
+        }
         this.Class = "wxcat";
         Avatar av = null;
-        if (it.kind == 0) { av = Wx.AvaIcon(it.initial, 36, it.tint); }
-        else { av = Wx.Ava(it.initial, 36, it.tint); }
+        if (it.kind == 6 && it.initial == "") {
+            av = Wx.AvaIcon("building", 36, "info");
+        } else {
+            av = Wx.Ava(it.initial, 36, it.tint);
+        }
         av.dock = 3;
         this.Add(av);
+        if (it.kind == 3) {
+            // 好友申请：名字下面还有一行申请语，右侧是通过按钮
+            // （通过后就地变灰字，与原版「接受 → 已添加」一致）。
+            Flex mp = Flex.Column();
+            mp.AddClass("grow");
+            mp.Justify("center");
+            mp.dock = 5;
+            mp.Add(Wx.Lbl(it.name, "wxcatname"));
+            mp.Add(Wx.Lbl(it.msg, "wxreqmsg"));
+            this.Add(mp);
+            Label ok = Wx.Lbl("已添加", "wxreqdone");
+            Button acc = new Button("接受");
+            acc.Class = "primary small wxreqbtn";
+            acc.OnClick(() => {
+                it.done = true;
+                acc.visible = false;
+                ok.visible = true;
+            });
+            acc.dock = 4;
+            ok.dock = 4;
+            ok.visible = it.done;
+            acc.visible = !it.done;
+            this.Add(acc);
+            this.Add(ok);
+            return;
+        }
         Label nm = Wx.Lbl(it.name, "wxcatname");
         nm.dock = 5;
         this.Add(nm);
-        if (it.count > 0) {
+        if (it.kind == 4 && it.people > 0) {
             Flex cr = Wx.Row("");
             cr.Justify("end");
-            cr.Add(Wx.Lbl(Convert.ToString(it.count), "wxcatcount"));
+            cr.Add(Wx.Lbl(Convert.ToString(it.people) + " 人", "wxcatcount"));
             cr.dock = 4;
             this.Add(cr);
         }
@@ -99,11 +148,13 @@ class WxContactRow : Control {
     override string StyleType() { return "listrow"; }
 
     override void OnMeasure(App app) {
-        // 行高归样式表（.wxcat / .wxhead2 的 height）；分组头矮一档，
-        // 兜底值随行种类给出。
+        // 行高归样式表（.wxcat / .wxsec / .wxhead2 的 height）；兜底值
+        // 随行种类给出：申请行带两行文字高一档，字母头矮一档。
         StyleBox s = Style.Of(app, this.StyleType(), this.Class, 0);
         int nat = 56;
+        if (item.kind == 0) { nat = 44; }
         if (item.kind == 1) { nat = 28; }
+        if (item.kind == 3) { nat = 66; }
         prefH = s.HeightOr(app.Scale(nat));
         prefW = app.Scale(280);
     }
@@ -221,5 +272,101 @@ class WxHistRowTpl : Control {
         StyleBox s = Style.Of(app, this.StyleType(), this.Class, 0);
         prefH = s.HeightOr(app.Scale(58));
         prefW = app.Scale(620);
+    }
+}
+
+/// 「通讯录管理」表格的一行：外壳只负责行高与分隔线，内容是一整条
+/// 流式 Flex（勾选圈 + 头像 + 昵称 grow + 备注列 + 标签列 + 朋友权限
+/// 列），列宽 wxmgc1/2/3 与表头共用——两边同构才上下对齐。勾选状态
+/// 只在行模型上；整行的选中交给 ListView。
+class WxMgRowTpl : Control {
+    WxMgRow item;
+
+    static Control Of(WxMgRow it) { return new WxMgRowTpl(it); }
+
+    WxMgRowTpl(WxMgRow it) {
+        this.InitControl("wxmgrow", 5);
+        this.Class = "wxmgrow";
+        item = it;
+        Flex row = Wx.Row("wxmgrowin");
+        row.dock = 5;
+        row.Add(WxMgHeadRow.Dot(it.picked));
+        row.Add(Wx.Ava(it.ini, 32, it.tint));
+        row.Add(Wx.Lbl(it.name, "wxmgname grow"));
+        row.Add(WxMgHeadRow.Col(it.remark, "wxmgc1", "wxmgcell"));
+        row.Add(WxMgHeadRow.Col(it.tag, "wxmgc2", "wxmgcell"));
+        row.Add(WxMgHeadRow.Col(it.perm, "wxmgc3", "wxmgcell"));
+        this.Add(row);
+    }
+
+    override string Kind() { return "WxMgRowTpl"; }
+    override string StyleType() { return "listrow"; }
+
+    override void OnMeasure(App app) {
+        StyleBox s = Style.Of(app, this.StyleType(), this.Class, 0);
+        prefH = s.HeightOr(app.Scale(52));
+        prefW = app.Scale(700);
+    }
+}
+
+/// 「通讯录管理」表格的表头行：与数据行同一套内部流式结构（勾选圈 +
+/// 昵称 + 右缘三列），没有头像、文字用表头样式——同构才像素对齐。
+/// 全选勾选圈经 Circle() 交给窗口接行为。
+class WxMgHeadRow : Control {
+    Button circleBtn;
+
+    Button Circle() { return circleBtn; }
+
+    /// 一个定宽数据列：列宽类写在 Flex 上（Label 上的 width 类不被
+    /// 测量消费，必须包一层定宽容器）。
+    static Flex Col(string txt, string wcls, string lblCls) {
+        Flex c = Wx.Row(wcls);
+        c.Add(Wx.Lbl(txt, lblCls));
+        return c;
+    }
+
+    /// 勾选圈（on = 绿底白勾）。表头用 Button 版（Circle），点击行为
+    /// 由窗口接；数据行用 Dot 版——按钮会把点击吃掉，ListView 的
+    /// 行选中（Select）就不再触发，整行勾选会失灵。
+    static Button Circle(bool on) {
+        Button c = new Button("");
+        if (on) { c.Icon = "check"; }
+        c.Class = on ? "wxcircle on" : "wxcircle";
+        return c;
+    }
+
+    /// 数据行的勾选圈：纯视觉，点击穿透到行。
+    static Flex Dot(bool on) {
+        Flex d = new Flex();
+        d.Class = on ? "wxcircle on" : "wxcircle";
+        if (on) {
+            d.Justify("center");
+            d.Align("center");
+            d.Add(new IconView("check", 12));
+        }
+        return d;
+    }
+
+    WxMgHeadRow() {
+        this.InitControl("wxmgrow", 5);
+        this.Class = "wxmghead";
+        Flex row = Wx.Row("wxmgrowin");
+        row.dock = 5;
+        circleBtn = WxMgHeadRow.Circle(false);
+        row.Add(circleBtn);
+        row.Add(Wx.Lbl("昵称", "wxmgname grow"));
+        row.Add(WxMgHeadRow.Col("备注", "wxmgc1", "wxmgheadcell"));
+        row.Add(WxMgHeadRow.Col("标签", "wxmgc2", "wxmgheadcell"));
+        row.Add(WxMgHeadRow.Col("朋友权限", "wxmgc3", "wxmgheadcell"));
+        this.Add(row);
+    }
+
+    override string Kind() { return "WxMgHeadRow"; }
+    override string StyleType() { return "listrow"; }
+
+    override void OnMeasure(App app) {
+        StyleBox s = Style.Of(app, this.StyleType(), this.Class, 0);
+        prefH = s.HeightOr(app.Scale(40));
+        prefW = app.Scale(700);
     }
 }

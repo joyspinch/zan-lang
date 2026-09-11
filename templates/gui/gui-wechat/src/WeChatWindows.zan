@@ -284,3 +284,308 @@ class WxHistoryWindow : ChildWindow {
         this.RequestRedraw();
     }
 }
+
+
+/// 「通讯录管理」的界面本体：左导航（全部 + 筛选，朋友权限可再展开
+/// 三档）+ 勾选式联系人表格 + 底部批量操作栏（修改权限/设置标签/删除
+/// 只作用于勾选行，操作后计数与表格就地刷新）。做成独立控件树——
+/// 与 WxSettingsView 同一个路数：窗口只当外壳，这棵树也能直接长在
+/// 主窗口里（探针驱动就是这么验证交互的）。
+class WxContactManagerView : Control {
+    List<WxMgRow> rows;     // 全量数据（删行从这里扣）
+    List<WxMgRow> shown;    // 按权限筛选后的可见行
+    string filter;          // "" = 全部，否则是权限档名
+    ListView<WxMgRow> table;
+    Button allBtn;
+    Button permHeadBtn;
+    Button[] permBtns;
+    string[] permNames;
+    IconView permChev;
+    Flex permBox;
+    Button headAll;
+    Label countLbl;
+    Input search;
+
+    WxContactManagerView() {
+        this.InitControl("wxmg", 5);
+        this.Class = "wxmg";
+        rows = WxData.Manager();
+        shown = new List<WxMgRow>();
+        filter = "";
+        this.Build();
+    }
+
+    void Build() {
+        Panel body = Panel.Row();
+        body.Class = "wxmgbody";
+        body.dock = 5;
+
+        // ---- 左栏：全部 + 筛选 ----
+        // 侧栏用 Flex 流式：Panel 对默认 dock 的子项不保证按 add 序
+        // 排列（permBox 实测被排到了侧栏末尾），flow 顺序才可靠。
+        Flex side = Flex.Column();
+        // Class 是整串覆盖，会把 Column() 挂的 column 类抹掉、方向
+        // 退回 row——变体类一律 AddClass 追加（permBox/Op 同此）。
+        side.AddClass("wxmgside");
+        side.dock = 3;
+        allBtn = new Button("");
+        allBtn.Class = "wxmgall wxon";
+        allBtn.OnClick(() => { this.SetFilter(""); });
+        side.Add(allBtn);
+        side.Add(Wx.Lbl("筛选", "wxmgsec"));
+        permHeadBtn = new Button("朋友权限");
+        permHeadBtn.Class = "wxmgitem";
+        // flex 里 dock 不拉伸：不加 grow 按钮只有 pref 宽，行右侧
+        // 一大块空白点了没反应。grow 让整行可点，箭头也被推到最右。
+        permHeadBtn.AddClass("grow");
+        permChev = new IconView("chevron-down", 14);
+        permBox = Flex.Column();
+        permBox.AddClass("wxpermbox");
+        Action togglePerm = () => {
+            permBox.visible = !permBox.visible;
+            permChev.Name = permBox.visible ? "chevron-down" : "chevron-right";
+        };
+        permHeadBtn.OnClick(togglePerm);
+        permChev.OnClick(togglePerm);
+        Flex permHead = Wx.Row("wxpermhead");
+        permHeadBtn.dock = 5;
+        permChev.dock = 4;
+        permHead.Add(permHeadBtn);
+        permHead.Add(permChev);
+        side.Add(permHead);
+        permNames = new string[]{ "仅聊天", "不让他（她）看", "不看他（她）" };
+        permBtns = new Button[]{ new Button(""), new Button(""),
+            new Button("") };
+        for (int i = 0; i < permBtns.Length; i = i + 1) {
+            string name = permNames[i];
+            permBtns[i].Class = "wxmgsub";
+            permBtns[i].OnClick(() => { this.SetFilter(name); });
+            permBox.Add(permBtns[i]);
+        }
+        side.Add(permBox);
+        Button tags = new Button("标签");
+        tags.Class = "wxmgitem";
+        side.Add(tags);
+        Button recent = new Button("最近群聊");
+        recent.Class = "wxmgitem";
+        side.Add(recent);
+        body.Add(side);
+
+        // ---- 右栏：搜索 + 表头 + 表格 ----
+        Panel main = Wx.Col("wxmgmain");
+        main.dock = 5;
+        search = new Input("搜索");
+        search.Class = "wxmgsearch";
+        search.dock = 1;
+        main.Add(search);
+        WxMgHeadRow head = new WxMgHeadRow();
+        head.dock = 1;
+        headAll = head.Circle();
+        headAll.OnClick(() => { this.ToggleAll(); });
+        main.Add(head);
+        table = new ListView<WxMgRow>(WxMgRowTpl.Of);
+        table.Class = "wxmgtable";
+        table.dock = 5;
+        table.Bind(shown);
+        table.OnSelect(() => {
+            int i = table.SelectedIndex();
+            if (i < 0 || i >= shown.Count) { return; }
+            shown[i].picked = !shown[i].picked;
+            table.Refresh();
+            this.UpdateBar();
+        });
+        main.Add(table);
+        body.Add(main);
+
+        // ---- 底部：已选计数 + 批量操作 ----
+        Flex bar = Wx.Row("wxmgbottom");
+        bar.dock = 2;
+        countLbl = Wx.Lbl("已选择 0 人", "wxmgcount");
+        countLbl.dock = 3;
+        bar.Add(countLbl);
+        Button clear = new Button("取消选择");
+        clear.Class = "text small";
+        clear.dock = 3;
+        clear.OnClick(() => { this.ClearPicked(); });
+        bar.Add(clear);
+        Flex sp = Flex.Row();
+        sp.Class = "grow";
+        sp.dock = 5;
+        bar.Add(sp);
+        // Flex 行按 add 序从左到右排（dock 在 flex 里不参与定位），
+        // 与原版一致：修改权限、设置标签、删除（删除最靠右）。
+        bar.Add(this.Op("lock", "修改权限", () => { this.DoPerm(); }));
+        bar.Add(this.Op("tag", "设置标签", () => { this.DoTag(); }));
+        bar.Add(this.Op("trash", "删除", () => { this.DoDelete(); }));
+        this.Add(body);
+        this.Add(bar);
+
+        this.ApplyFilter();
+        this.UpdateCounts();
+        this.UpdateBar();
+    }
+
+    /// 底部的一个操作：图标在文字上方的竖排按钮（整格可点）。
+    Flex Op(string icon, string txt, Action run) {
+        Flex op = Flex.Column();
+        op.AddClass("wxmgop");
+        op.Align("center");
+        op.dock = 4;
+        IconView ic = new IconView(icon, 18);
+        Label tl = Wx.Lbl(txt, "wxmgoptext");
+        op.OnClick(run);
+        ic.OnClick(run);
+        tl.OnClick(run);
+        op.Add(ic);
+        op.Add(tl);
+        return op;
+    }
+
+    int PickedCount() {
+        int n = 0;
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            if (rows[i].picked) { n = n + 1; }
+        }
+        return n;
+    }
+
+    int PermCount(string perm) {
+        int n = 0;
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            if (rows[i].perm == perm) { n = n + 1; }
+        }
+        return n;
+    }
+
+    void UpdateBar() {
+        countLbl.Text = "已选择 " + Convert.ToString(this.PickedCount()) + " 人";
+    }
+
+    /// 左栏计数与选中态：全部按钮 + 三档权限按钮的文字里带条数。
+    void UpdateCounts() {
+        allBtn.Text = "全部 (" + Convert.ToString(rows.Count) + ")";
+        for (int i = 0; i < permBtns.Length; i = i + 1) {
+            permBtns[i].Text = permNames[i] + " ("
+                + Convert.ToString(this.PermCount(permNames[i])) + ")";
+        }
+        this.RestyleSide();
+    }
+
+    /// 侧栏选中态只亮一个：全部或某档权限。
+    void RestyleSide() {
+        bool allOn = filter == "";
+        allBtn.SetClassIn("wxon", allOn ? "wxon" : "");
+        for (int i = 0; i < permBtns.Length; i = i + 1) {
+            bool on = filter == permNames[i];
+            permBtns[i].SetClassIn("wxon", on ? "wxon" : "");
+        }
+    }
+
+    void SetFilter(string f) {
+        filter = f;
+        this.RestyleSide();
+        this.ApplyFilter();
+    }
+
+    void ApplyFilter() {
+        shown.Clear();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            WxMgRow r = rows[i];
+            if (filter == "" || r.perm == filter) { shown.Add(r); }
+        }
+        table.Bind(shown);
+        table.Refresh();
+    }
+
+    void ToggleAll() {
+        bool any = false;
+        for (int i = 0; i < shown.Count; i = i + 1) {
+            if (!shown[i].picked) { any = true; break; }
+        }
+        for (int i = 0; i < shown.Count; i = i + 1) {
+            shown[i].picked = any;
+        }
+        if (headAll != null) {
+            headAll.Icon = any ? "check" : "";
+            headAll.SetClassIn("on", any ? "on" : "");
+        }
+        table.Refresh();
+        this.UpdateBar();
+    }
+
+    void ClearPicked() {
+        for (int i = 0; i < rows.Count; i = i + 1) { rows[i].picked = false; }
+        if (headAll != null) {
+            headAll.Icon = "";
+            headAll.SetClassIn("on", "");
+        }
+        table.Refresh();
+        this.UpdateBar();
+    }
+
+    /// 批量把勾选行改成仅聊天（演示「修改权限」；权限变了，筛选项
+    /// 的计数与可见行都要跟着刷新）。
+    void DoPerm() {
+        bool hit = false;
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            if (rows[i].picked) { rows[i].perm = "仅聊天"; hit = true; }
+        }
+        if (!hit) { return; }
+        this.ApplyFilter();
+        this.UpdateCounts();
+        this.UpdateBar();
+    }
+
+    void DoTag() {
+        bool hit = false;
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            if (rows[i].picked) { rows[i].tag = "常用"; hit = true; }
+        }
+        if (hit) { table.Refresh(); }
+    }
+
+    void DoDelete() {
+        List<WxMgRow> keep = new List<WxMgRow>();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            if (!rows[i].picked) { keep.Add(rows[i]); }
+        }
+        rows = keep;
+        this.ApplyFilter();
+        this.UpdateCounts();
+        this.UpdateBar();
+    }
+}
+
+/// 通讯录管理窗口：通讯录页左上「通讯录管理」打开的独立子窗口（原版
+/// 的同名窗口），界面本体是 WxContactManagerView 这棵控件树，窗口
+/// 只负责外壳：标题、尺寸、铺样式表。
+class WxContactManagerWindow : ChildWindow {
+    /// 同时只留一扇。
+    static WxContactManagerWindow live;
+    App owner;
+
+    override string Title() { return "通讯录管理"; }
+    /// 原版这扇窗是一张宽表：左导航 250 + 表格。
+    override int Width() { return 1000; }
+    override int Height() { return 680; }
+    override bool ShowMaximize() { return false; }
+    override int IdBase() { return 960000; }
+
+    static void Open(App app) {
+        if (WxContactManagerWindow.live != null
+                && WxContactManagerWindow.live.IsOpen()) {
+            WxContactManagerWindow.live.RequestRedraw();
+            return;
+        }
+        WxContactManagerWindow w = new WxContactManagerWindow();
+        w.owner = app;
+        // 纯代码建树：没有 .zform 的 bind 通道，model 传 null。
+        w.SetRoot(new WxContactManagerView(), null);
+        w.Wire();
+        w.OpenHost(app);
+        // 子窗口是另一个 App：主窗口铺的 .wx* 应用样式表要再铺一遍。
+        w.host.UseAppCss(WxSkin.Css());
+        w.RequestRedraw();
+        WxContactManagerWindow.live = w;
+    }
+}

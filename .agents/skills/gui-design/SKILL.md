@@ -467,6 +467,20 @@ CSS 里非 token 的长度由 `Style.ScaleLayout` 补乘,`StyleBox.IsPrescaled`
    emoji 字形事实:Windows 上运行时字体回退把 emoji 渲染成单色轮廓
    (Segoe UI Symbol 一系),60 个常用 emoji 全有字形、无豆腐,但不是
    彩色——表情面板可以直接用 emoji 字符,深浅色主题都不挑。
+9. **Flex 容器里 dock 不参与排布**:add 序即排布序(dock=4 不会跑到
+   最右,「从右往左排」的注释在 flex 里是错的),拉伸要给子项挂
+   `.grow`,否则按 pref 宽摆下一条,行右侧留一截「点了没反应」的
+   死角(微信模板管理窗「朋友权限」行只有按钮那截可点、底部操作钮
+   顺序反了,2026-09-12)。顺序敏感的左右分栏容器用 Flex flow,别用
+   Panel——Panel 对默认 dock 子项不保证 add 序(实测子项被排到尾部)。
+10. **ListView 行模板里别放无行为的 Button**:按钮把点击吃掉,行的
+    Select 就不触发了(点勾选圈勾不中行,2026-09-12)。纯视觉件
+    (行内勾选圈)用 Flex+样式做,点击穿透给行;要接行为的圈(表头
+    全选)才用 Button 并自己绑 OnClick。
+11. **ListView 对同一行的第二次点击走 Activate 不走 Select**
+    (`again = (sel == index)` 才发 Activate):「再点一下收起」这类
+    切换语义必须同时绑 OnSelect 与 OnActivate,只绑 Select 的点开
+    就收不起(微信模板通讯录折叠分组,2026-09-12)。
 
 ## 收尾自查(逐条过)
 
@@ -500,6 +514,10 @@ CSS 里非 token 的长度由 `Style.ScaleLayout` 补乘,`StyleBox.IsPrescaled`
 - 跑起来真实看一眼,截图对照自查清单(截图必须锚定被调试窗口的 PID、按窗口
   截取并先验证再判断,规范见 `testing-gui-screenshot` skill);交互(点击/拖拽/键盘)用
   `ZAN_UI_SCRIPT` UiDriver 驱动做可重复流程,不要手点一次就算完。
+- UiDriver 只绑进程里第一个 App:ChildWindow 里的树驱动不到。要端到端
+  驱动子窗口界面,拆成 View 控件(真实整棵树)+ 薄 ChildWindow 壳
+  (`SetRoot(new View(), null)`):探针把 View 挂进主窗口驱动全部交互,
+  生产路径仍走子窗口壳,两边同源(微信模板通讯录管理窗,2026-09-12)。
 
 ## 在 zan-lang 仓库内工作(仅仓库内,发布给用户的版面无此节内容)
 
