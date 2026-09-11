@@ -255,6 +255,9 @@ class UnitDef {
     List<string> damageParticles;
     int smokeOffX;
     int smokeOffY;
+    // The harvester hold in bails, the shipped rules' Storage= key (CMIN
+    // and SMIN 20, HARV 40). Zero for everything that does not mine.
+    int storage;
 
     static UnitDef Create(string reg, string label, int cost, int hp,
                           int speed, int armor, Weapon primary,
@@ -279,6 +282,7 @@ class UnitDef {
         d.newTheater = false;
         d.deploysInto = null;
         d.deployer = false;
+        d.storage = 0;
         return d;
     }
 
@@ -293,6 +297,8 @@ class UnitDef {
     string Producer() { return this.producer; }
     List<string> Prereq() { return this.prereq; }
     int SideMask() { return this.sideMask; }
+    int Storage() { return this.storage; }
+    void SetStorage(int v) { this.storage = v; }
     int Role() { return this.role; }
     bool MindImmune() { return this.mindImmune; }
     string Shp() { return this.shp; }
@@ -689,6 +695,7 @@ class Rules {
         r.oreGrows = true;
         r.oreSpreads = true;
         r.growthRate = 5;
+        r.bridgeStrength = 1500;
         return r;
     }
 
@@ -745,6 +752,125 @@ class Rules {
         return (name[0] & 0xDF) == 'G' && (name[1] & 0xDF) == 'E'
             && (name[2] & 0xDF) == 'M';
     }
+
+    // Tiberium overlay union, cached like the wall facts: the GEM* names
+    // the port already treats as ore, plus every type whose own section
+    // declares Tiberium=yes (the TIB01..12 fields the reference's growth
+    // spawns). -1 not looked up, 0 no, 1 yes.
+    List<int> overlayTibCache;
+
+    // Land= / NoUseTileLandType= per overlay type, cached: low byte the
+    // LandType value (255 = none declared), bit 8 the NoUseTileLandType
+    // flag. A static overlay with both overrides the tile's own land class
+    // -- that is what makes a fence or a sand-rock impassable and a low
+    // bridge driveable over water (the reference's tile-land rules).
+    List<int> overlayLandCache;
+
+    // Terrain growth facts per terrain type name, cached like the overlay
+    // tables: the cooldown in ticks between spawn rolls for the types that
+    // declare SpawnsTiberium=yes (TIBTRE01..03, AnimationProbability .003
+    // -> 333 ticks), -1 for everything else. The reference's TerrainRules
+    // reads the same keys; a probability of zero never fires, exactly as
+    // the reference's floor(1/0) idle does.
+    List<string> terrainGrowNames;
+    List<int> terrainGrowCds;
+
+    // The [CombatDamage] BridgeStrength: every bridge piece's hit points
+    // (1500 shipped). A field default so the transcribed rules stand alone.
+    int bridgeStrength;
+
+    /// <summary>Whether a map overlay index carries tiberium: a GEM name,
+    /// or its own section declares Tiberium=yes. Unknown indices never
+    /// do.</summary>
+    bool IsTiberiumOverlay(int idx) {
+        if (idx < 0 || idx >= this.overlayTypes.Count) { return false; }
+        if (this.overlayTibCache == null) {
+            this.overlayTibCache = new List<int>();
+        }
+        while (this.overlayTibCache.Count <= idx) {
+            this.overlayTibCache.Add(0 - 1);
+        }
+        int cached = this.overlayTibCache[idx];
+        if (cached >= 0) { return cached == 1; }
+        bool tib = this.IsOreOverlay(idx)
+            || Rules.YesNo(this.SourceIniSection(this.overlayTypes[idx])
+                .GetOr("Tiberium", "no"));
+        this.overlayTibCache[idx] = tib ? 1 : 0;
+        return tib;
+    }
+
+    /// <summary>The overlay type's land override, packed as the caches
+    /// above document. The reference's OverlayRules reads Land= and
+    /// NoUseTileLandType= off the same section.</summary>
+    int OverlayLandFlags(int idx) {
+        if (idx < 0 || idx >= this.overlayTypes.Count) { return 255; }
+        if (this.overlayLandCache == null) {
+            this.overlayLandCache = new List<int>();
+        }
+        while (this.overlayLandCache.Count <= idx) {
+            this.overlayLandCache.Add(0 - 1);
+        }
+        int cached = this.overlayLandCache[idx];
+        if (cached >= 0) { return cached; }
+        IniSection s = this.SourceIniSection(this.overlayTypes[idx]);
+        bool noTile = s.Get("NoUseTileLandType").Length > 0;
+        int land = Rules.LandFromName(s.Get("Land"));
+        int packed = (land >= 0 ? land : 255) | (noTile ? 256 : 0);
+        this.overlayLandCache[idx] = packed;
+        return packed;
+    }
+
+    /// <summary>A rules Land= name to its LandType value, -1 when the name
+    /// is empty or unknown (the reference's enum lookup raises; a renderer
+    /// and a movement grid must keep going).</summary>
+    static int LandFromName(string nm) {
+        if (nm == null) { return 0 - 1; }
+        string s = nm.ToUpper();
+        if (s == "CLEAR") { return LandType.Clear(); }
+        if (s == "ROAD") { return LandType.Road(); }
+        if (s == "ROCK") { return LandType.Rock(); }
+        if (s == "BEACH") { return LandType.Beach(); }
+        if (s == "ROUGH") { return LandType.Rough(); }
+        if (s == "RAILROAD") { return LandType.Railroad(); }
+        if (s == "WEEDS") { return LandType.Weeds(); }
+        if (s == "WATER") { return LandType.Water(); }
+        if (s == "WALL") { return LandType.Wall(); }
+        if (s == "TIBERIUM") { return LandType.Tiberium(); }
+        if (s == "CLIFF") { return LandType.Cliff(); }
+        return 0 - 1;
+    }
+
+    /// <summary>Ticks between spawn rolls for a terrain type that grows
+    /// tiberium (SpawnsTiberium=yes), from its AnimationProbability: the
+    /// reference's floor(1/prob). -1 when the type grows nothing or the
+    /// probability is zero (a zero prob never fires in the reference
+    /// either -- floor(1/0) never counts up to it).</summary>
+    int TerrainGrowthTicks(string name) {
+        if (name == null || name.Length == 0) { return 0 - 1; }
+        if (this.terrainGrowNames == null) {
+            this.terrainGrowNames = new List<string>();
+            this.terrainGrowCds = new List<int>();
+        }
+        for (int i = 0; i < this.terrainGrowNames.Count; i = i + 1) {
+            if (this.terrainGrowNames[i] == name) {
+                return this.terrainGrowCds[i];
+            }
+        }
+        IniSection s = this.SourceIniSection(name);
+        int cd = 0 - 1;
+        if (Rules.YesNo(s.GetOr("SpawnsTiberium", "no"))) {
+            // ".003" parses as 0 in a bare atof; give it the leading zero.
+            string pv = s.GetOr("AnimationProbability", "0").Trim();
+            if (pv.Length > 0 && pv[0] == 46) { pv = "0" + pv; }
+            double p = pv.Length > 0 ? Convert.ToDouble(pv) : 0.0;
+            if (p > 0) { cd = (int)Math.Floor(1.0 / p); }
+        }
+        this.terrainGrowNames.Add(name);
+        this.terrainGrowCds.Add(cd);
+        return cd;
+    }
+
+    int BridgeStrength() { return this.bridgeStrength; }
 
     // Overlay wall facts, read from the type's own rules section and
     // cached: -1 not looked up, 0 no, 1 yes.
@@ -805,6 +931,9 @@ class Rules {
     /// GEM overlays are plain gold ore, the last six the sparkly crystal
     /// fields the original pays double for.</summary>
     int OreValue(int idx) {
+        // The growth's own fields are Riparius -- plain gold ore, worth 25
+        // a bail like the shipped [Riparius] Value=.
+        if (idx >= 102 && idx <= 113) { return 1; }
         int first = this.FirstOreOverlay();
         if (first < 0 || idx < first + 6) { return 1; }
         return 2;
@@ -1500,6 +1629,7 @@ class Rules {
         // chrono layer exists.
         UnitDef cmin = UnitDef.Create("CMIN", "超时空采矿车", 1400, 1000, 4,
             ArmorClass.Medium(), null, "GAWEAP", 1, "CMIN.VXL");
+        cmin.SetStorage(20);
         cmin.SetRole(UnitRole.Harvester());
         r.units.Add(cmin);
 
@@ -1585,6 +1715,7 @@ class Rules {
             ArmorClass.Heavy(), r.WeaponNamed("20mmRapid"), "NAWEAP", 2,
             "HARV.VXL");
         harv.SetTurretVxl("HARVTUR.VXL");
+        harv.SetStorage(40);
         harv.SetRole(UnitRole.Harvester());
         r.units.Add(harv);
         r.units.Add(UnitDef.Create("DRON", "恐怖机器人", 500, 100, 10,
@@ -1665,6 +1796,7 @@ class Rules {
             ArmorClass.Medium(), r.WeaponNamed("20mmRapid"), "YAWEAP", 4,
             "SMIN.VXL");
         smin.SetTurretVxl("SMINTUR.VXL");
+        smin.SetStorage(20);
         smin.SetRole(UnitRole.Harvester());
         r.units.Add(smin);
         // The Yuri MCV, for parity with the other sides' buildable MCVs.
@@ -2170,6 +2302,9 @@ class Rules {
                 d.SetSmokeOffX(offU[0]);
                 d.SetSmokeOffY(offU[1]);
             }
+            if (s.Contains("Storage")) {
+                d.SetStorage(s.GetIntOr("Storage", d.Storage()));
+            }
             string armor = s.Get("Armor");
             if (armor.Length > 0) { d.SetArmor(ArmorClass.Parse(armor)); }
             // The shipped tech tree, not a transcription of it: the rules
@@ -2283,6 +2418,11 @@ class Rules {
                                                         "yes"));
             this.growthRate = Rules.LeadingInt(general.GetOr("GrowthRate",
                                                              "5"));
+        }
+        IniSection combat = ini.Section("CombatDamage");
+        if (combat != null && combat.Contains("BridgeStrength")) {
+            this.bridgeStrength = combat.GetIntOr("BridgeStrength",
+                                                  this.bridgeStrength);
             this.preqPower = Rules.CsvOr(general, "PrerequisitePower",
                                          this.preqPower);
             this.preqFactory = Rules.CsvOr(general, "PrerequisiteFactory",

@@ -94,6 +94,7 @@ class WorldObject {
     // that keeps a stranded harvester from re-running whole-map pathing
     // every single tick.
     int cargo;
+    int bails;           // bails mined since the last unload (Storage=)
     int dockTimer;
     int routeCooldown;
 
@@ -278,6 +279,8 @@ class WorldObject {
     void SetCiv(bool on) { this.civ = on; }
     int Cargo() { return this.cargo; }
     void SetCargo(int credits) { this.cargo = credits; }
+    int Bails() { return this.bails; }
+    void SetBails(int v) { this.bails = v; }
     bool Repairing() { return this.repairing; }
     void SetRepairing(bool on) {
         this.repairing = on;
@@ -587,6 +590,8 @@ class UnitType {
     // accumulator that buys one cell per 64 banked, so the raw number, not
     // the per-tick step count, is what drives pace.
     int speed;
+    // The harvester hold in bails (the rules' Storage=); 0 off the miners.
+    int storage;
 
     static UnitType Create(string reg, string label, int cost, int buildTime,
                            int hp, string shpName, int armor, Weapon primary,
@@ -616,6 +621,7 @@ class UnitType {
         t.techLevel = 1;
         t.deploysInto = null;
         t.deployer = false;
+        t.storage = 0;
         t.hasSeq = false;
         t.readyStart = 0;
         t.walkStart = 0;
@@ -641,6 +647,8 @@ class UnitType {
     int Steps() { return this.steps; }
     int Speed() { return this.speed; }
     void SetSpeed(int speed) { this.speed = speed; }
+    int Storage() { return this.storage; }
+    void SetStorage(int v) { this.storage = v; }
     int Role() { return this.role; }
     bool MindImmune() { return this.mindImmune; }
     List<List<int>> Prereqs() { return this.prereqs; }
@@ -789,6 +797,7 @@ class UnitCatalog {
                 d.Primary(), d.Secondary(), d.Steps(), d.Role(),
                 d.MindImmune());
             t.SetTurretVxl(d.TurretVxl());
+            t.SetStorage(d.Storage());
             t.SetPrereqs(Rules.ResolvePrereqs(rules, d.Prereq(), bdefs));
             t.SetSequence(d.HasSeq(), d.ReadyStart(), d.WalkStart(),
                           d.WalkFrames());
@@ -1238,6 +1247,45 @@ class World {
     int[] wallOv;
     int[] wallHp;
     int[] wallData;
+    // Per-cell overlay type for the ore fields (the GEM id the map shipped
+    // or the TIB id the growth spawned, -1 otherwise): the art variant is
+    // per-cell state, not derivable from amount+value.
+    int[] oreOv;
+    // Static overlays: the map's non-ore, non-wall, non-bridge decal art
+    // (rocks, fences, crates, drums, tracks) -- per-cell type id (-1 none)
+    // and data byte (the art frame). No health, no occupancy: decals with
+    // a land override, exactly the reference's flat overlay layer.
+    int[] statOv;
+    int[] statData;
+    // Low bridges: live pieces chained head-to-tail. The overlay id lives
+    // on every cell the piece's art covers (anchor + 2 along the axis) so
+    // a land query finds it anywhere on the span; the anchor cell alone
+    // carries the piece flags in brData (head 0 none / 1 start / 2 end,
+    // bit 4 axis-Y, bit 8 anchor) and brAnchors lists the anchors in
+    // placement order. Hit points are the [CombatDamage] BridgeStrength.
+    int[] brOv;
+    int[] brHp;
+    int[] brData;
+    List<int> brAnchors;
+    // The tiberium trees (TIBTRE01..03 terrain objects): their cells and
+    // per-tree cooldown ticks. On expiry each tree rolls the reference's
+    // spawn -- one free Clear/Road/Rough cell in radius 1-2, else one bail
+    // onto an existing pile nearby.
+    List<int> tibTreeX;
+    List<int> tibTreeY;
+    List<int> tibTreeCd;
+    List<int> tibTreeCd0;
+    // Cells the map carried a [Terrain] object on: ore may not spawn under
+    // scenery (the reference's createInitialMapOverlays skips tiberium
+    // where terrain stands, and TiberiumTrait.canBePlacedOn demands a bare
+    // tile).
+    byte[] hasTerrain;
+    // The low-bridge seeding table: map cells carrying a low-bridge overlay
+    // (id, value) so the value==1 pieces can check their neighbours' 0/2
+    // pattern -- the reference's createInitialMapOverlays bridge pass.
+    List<int> segSlot;
+    List<int> segVal;
+    List<int> segId;
 
     // Map smudges: the craters and burn marks a map declares in its own
     // [Smudge] section. Name + cell, no owner and no occupancy -- a decal
@@ -1291,6 +1339,51 @@ class World {
             w.wallHp[i] = 0;
             w.wallData[i] = 0;
         }
+        w.oreOv = new int[w.width * w.height];
+        w.statOv = new int[w.width * w.height];
+        w.statData = new int[w.width * w.height];
+        w.brOv = new int[w.width * w.height];
+        w.brHp = new int[w.width * w.height];
+        w.brData = new int[w.width * w.height];
+        for (int i = 0; i < w.oreOv.Length; i = i + 1) {
+            w.oreOv[i] = 0 - 1;
+            w.statOv[i] = 0 - 1;
+            w.statData[i] = 0;
+            w.brOv[i] = 0 - 1;
+            w.brHp[i] = 0;
+            w.brData[i] = 0;
+        }
+        w.brAnchors = new List<int>();
+        w.tibTreeX = new List<int>();
+        w.tibTreeY = new List<int>();
+        w.tibTreeCd = new List<int>();
+        w.hasTerrain = new byte[w.width * w.height];
+        w.segSlot = new List<int>();
+        w.segVal = new List<int>();
+        w.segId = new List<int>();
+        w.oreOv = new int[w.width * w.height];
+        w.statOv = new int[w.width * w.height];
+        w.statData = new int[w.width * w.height];
+        w.brOv = new int[w.width * w.height];
+        w.brHp = new int[w.width * w.height];
+        w.brData = new int[w.width * w.height];
+        for (int i = 0; i < w.oreOv.Length; i = i + 1) {
+            w.oreOv[i] = 0 - 1;
+            w.statOv[i] = 0 - 1;
+            w.statData[i] = 0;
+            w.brOv[i] = 0 - 1;
+            w.brHp[i] = 0;
+            w.brData[i] = 0;
+        }
+        w.brAnchors = new List<int>();
+        w.tibTreeX = new List<int>();
+        w.tibTreeY = new List<int>();
+        w.tibTreeCd = new List<int>();
+        w.tibTreeCd0 = new List<int>();
+        w.hasTerrain = new byte[w.width * w.height];
+        w.segSlot = new List<int>();
+        w.segVal = new List<int>();
+        w.segId = new List<int>();
         w.oreLeft = 0;
         // Map smudges -- the battle scars the map itself ships ([Smudge]
         // entries). They are pure ground decals with no owner and no object
@@ -1442,14 +1535,16 @@ class World {
 
     // ---- ore fields --------------------------------------------------------
 
-    /// <summary>Seeds one cell's ore from the map overlay plane: amt is the
-    /// overlay's data byte (0 clears), val the credits per unit.</summary>
-    void SetOre(int x, int y, int amt, int val) {
+    /// <summary>Seeds one cell's ore: amt is the overlay's data byte (0
+    /// clears), val the credits per unit, ov the cell's overlay type id
+    /// (the art variant, -1 when the caller does not know).</summary>
+    void SetOre(int x, int y, int amt, int val, int ov) {
         if (!this.InBounds(x, y)) { return; }
         int slot = this.CellSlot(x, y);
         bool was = this.oreAmt[slot] > 0;
         this.oreAmt[slot] = amt;
         this.oreVal[slot] = amt > 0 ? val : 0;
+        this.oreOv[slot] = amt > 0 ? ov : 0 - 1;
         if (amt > 0 && !was) { this.oreLeft = this.oreLeft + 1; }
         if (amt <= 0 && was) { this.oreLeft = this.oreLeft - 1; }
         // The terrain layer bakes ore art in, so any change is a scene
@@ -1590,6 +1685,349 @@ class World {
         return n;
     }
 
+    // ---- static overlays ------------------------------------------------
+
+    /// <summary>Parks one static overlay decal (rock, fence, crate, drum,
+    /// track) with its data byte -- the art frame.</summary>
+    void SetStaticOverlay(int x, int y, int ov, int data) {
+        if (ov < 0 || !this.InBounds(x, y)) { return; }
+        int slot = this.CellSlot(x, y);
+        this.statOv[slot] = ov;
+        this.statData[slot] = data;
+        this.oreVersion = this.oreVersion + 1;
+    }
+
+    int StaticOvAt(int x, int y) {
+        if (!this.InBounds(x, y)) { return 0 - 1; }
+        return this.statOv[this.CellSlot(x, y)];
+    }
+
+    int StaticDataAt(int x, int y) {
+        if (!this.InBounds(x, y)) { return 0; }
+        return this.statData[this.CellSlot(x, y)];
+    }
+
+    int StaticOverlayCount() {
+        if (this.statOv == null) { return 0; }
+        int n = 0;
+        for (int i = 0; i < this.statOv.Length; i = i + 1) {
+            if (this.statOv[i] >= 0) { n = n + 1; }
+        }
+        return n;
+    }
+
+    // ---- low bridges (the reference's Bridges + BridgeOverlayTypes) -----
+
+    static bool IsLowBridgeId(int id) {
+        return (id >= 74 && id <= 99) || (id >= 205 && id <= 230);
+    }
+
+    static bool IsBridgePlaceholderId(int id) {
+        return id == 100 || id == 101 || id == 231 || id == 232;
+    }
+
+    static bool IsHighBridgeId(int id) {
+        return id == 24 || id == 25 || id == 237 || id == 238;
+    }
+
+    /// <summary>X-bridges chain along map-Y (their art runs the other
+    /// diagonal) -- the reference's isXBridge id classes.</summary>
+    static bool IsXBridgeId(int id) {
+        if (id == 74 || id == 205) { return true; }
+        if (id >= 74 && id <= 82) { return true; }
+        if (id >= 92 && id <= 95) { return true; }
+        if (id >= 205 && id <= 213) { return true; }
+        if (id >= 223 && id <= 226) { return true; }
+        return false;
+    }
+
+    static bool IsLowBridgeHeadId(int id) {
+        return (id >= 92 && id <= 99) || (id >= 223 && id <= 230);
+    }
+
+    static bool IsLowBridgeHeadStartId(int id) {
+        return (id >= 94 && id <= 97) || (id >= 225 && id <= 228);
+    }
+
+    /// <summary>Stands one low-bridge piece at an anchor cell: the piece
+    /// covers its anchor and two cells along its axis, the anchor carries
+    /// the piece flags, and hit points are the rules' BridgeStrength.
+    /// Used by the map seed and the selftest probe alike; ids rewrite in
+    /// ReconnectBridgeAll once the run's neighbours are known.</summary>
+    void SetBridgePiece(int x, int y, bool axisY, int head) {
+        if (!this.InBounds(x, y)) { return; }
+        int id = 74;             // placeholder id; the reconnect rewrites it
+        int slot = this.CellSlot(x, y);
+        // One overlay object per piece, on the anchor cell exactly like the
+        // map ships it: the id, the hit points and the piece flags all live
+        // here. The art (and the Road land class) spans three cells, but
+        // that is render/projection state -- the grid keeps the anchor.
+        this.brOv[slot] = id;
+        this.brHp[slot] = this.Rules().BridgeStrength();
+        this.brData[slot] = (head & 3) | (axisY ? 4 : 0) | 8;
+        this.brAnchors.Add(slot);
+        this.oreVersion = this.oreVersion + 1;
+    }
+
+    bool IsBridgeAnchor(int x, int y) {
+        if (!this.InBounds(x, y)) { return false; }
+        int slot = this.CellSlot(x, y);
+        return this.brOv[slot] >= 0 && (this.brData[slot] & 8) != 0;
+    }
+
+    /// <summary>The piece flags at a covered cell's piece: walks back along
+    /// the axis to the anchor. 0 when no piece covers the cell.</summary>
+    int BridgeFlagsAt(int x, int y) {
+        if (!this.InBounds(x, y)) { return 0; }
+        int slot = this.CellSlot(x, y);
+        if (this.brOv[slot] >= 0) { return this.brData[slot]; }
+        // A covered cell of a piece's three-cell span (not an anchor)
+        // walks back up the diagonal to its anchor: the art covers the
+        // two cells behind the anchor too, so a land query anywhere on
+        // the span answers. The diagonal test keeps a piece of the other
+        // axis from claiming the cell.
+        for (int k = 1; k <= 2; k = k + 1) {
+            int cx = x - k;
+            int cy = y - k;
+            if (!this.InBounds(cx, cy)) { break; }
+            int cs = this.CellSlot(cx, cy);
+            if (this.brOv[cs] >= 0 && (this.brData[cs] & 8) != 0) {
+                return this.brData[cs];
+            }
+        }
+        return 0;
+    }
+
+    int BridgePieceCount() { return this.brAnchors.Count; }
+
+    /// <summary>The bridge piece's overlay id at anchor index i (the
+    /// renderer's and the probe's read).</summary>
+    int BridgeIdAt(int i) {
+        if (i < 0 || i >= this.brAnchors.Count) { return 0 - 1; }
+        return this.brOv[this.brAnchors[i]];
+    }
+
+    int BridgeSlotAt(int i) {
+        if (i < 0 || i >= this.brAnchors.Count) { return 0 - 1; }
+        return this.brAnchors[i];
+    }
+
+    /// <summary>Removes one piece: its anchor cell clears, its neighbours
+    /// re-read the run.</summary>
+    void ClearBridgePiece(int slot) {
+        this.brOv[slot] = 0 - 1;
+        this.brHp[slot] = 0;
+        this.brData[slot] = 0;
+        for (int i = this.brAnchors.Count - 1; i >= 0; i = i - 1) {
+            if (this.brAnchors[i] == slot) { this.brAnchors.RemoveAt(i); }
+        }
+    }
+
+    /// <summary>Drops a unit standing on a collapsed bridge cell: the
+    /// reference's BridgeTrait onDestroy drowns (destroys) everyone whose
+    /// footing goes out from under them.</summary>
+    void SinkUnitAt(int x, int y) {
+        if (!this.InBounds(x, y)) { return; }
+        int occ = this.occupancy[this.CellSlot(x, y)];
+        if (occ <= 0) { return; }
+        WorldObject o = this.objects[occ - 1];
+        if (o.Kind() != ObjKind.Unit() || o.IsDead()) { return; }
+        o.TakeDamageAs(o.Hp(), 0);
+    }
+
+    /// <summary>Records one map low-bridge cell for the seed pass: every
+    /// non-placeholder piece reports (cell, value, id), the value==1 cells
+    /// become the live pieces.</summary>
+    void SeedBridgeCell(int x, int y, int id, int value) {
+        this.segSlot.Add(this.CellSlot(x, y));
+        this.segVal.Add(value);
+        this.segId.Add(id);
+    }
+
+    /// <summary>The seed pass's second half, the reference's bridge
+    /// assembly: each value==1 cell becomes a piece one cell back (where
+    /// its neighbour segment reads 0 ahead or 2 behind), then every piece
+    /// rewrites its id from the chain. High bridges are deferred until an
+    /// elevation layer exists.</summary>
+    void FinishBridges() {
+        for (int i = 0; i < this.segSlot.Count; i = i + 1) {
+            if (this.segVal[i] != 1) { continue; }
+            int slot = this.segSlot[i];
+            int id = this.segId[i];
+            int x = slot % this.width;
+            int y = slot / this.width;
+            bool axisY = World.IsXBridgeId(id);
+            int px = axisY ? x : x - 1;
+            int py = axisY ? y - 1 : y;
+            int nx = axisY ? x : x + 1;
+            int ny = axisY ? y + 1 : y;
+            int pv = this.SegmentValueAt(px, py);
+            int nv = this.SegmentValueAt(nx, ny);
+            if (pv == 0 || nv == 2) {
+                int head = World.IsLowBridgeHeadStartId(id) ? 1
+                    : World.IsLowBridgeHeadId(id) ? 2 : 0;
+                this.SetBridgePiece(px, py, axisY, head);
+            }
+        }
+        this.segSlot.Clear();
+        this.segVal.Clear();
+        this.segId.Clear();
+        this.ReconnectBridgeAll();
+    }
+
+    int SegmentValueAt(int x, int y) {
+        if (!this.InBounds(x, y)) { return 0 - 1; }
+        int slot = this.CellSlot(x, y);
+        for (int i = 0; i < this.segSlot.Count; i = i + 1) {
+            if (this.segSlot[i] == slot) { return this.segVal[i]; }
+        }
+        return 0 - 1;
+    }
+
+    /// <summary>The reference's Bridges.updateOverlayData for every piece:
+    /// each piece's overlay id rewrites from its own and its neighbours'
+    /// wounds -- the damaged set (4/5/6) and the dangling-head ids -- so
+    /// the drawn frame always tells the run's true state.</summary>
+    void ReconnectBridgeAll() {
+        for (int i = 0; i < this.brAnchors.Count; i = i + 1) {
+            this.ReconnectBridgeAt(this.brAnchors[i]);
+        }
+    }
+
+    void ReconnectBridgeAt(int slot) {
+        if (slot < 0 || slot >= this.brOv.Length) { return; }
+        if (this.brOv[slot] < 0 || (this.brData[slot] & 8) == 0) { return; }
+        int x = slot % this.width;
+        int y = slot / this.width;
+        int flags = this.brData[slot];
+        bool axisY = (flags & 4) != 0;
+        int head = flags & 3;
+        bool concrete = this.brOv[slot] >= 205;
+        int min = concrete ? 205 : 74;
+        int maxHp = this.Rules().BridgeStrength();
+        bool damaged = this.brHp[slot] * 2 <= maxHp;
+        // Neighbour pieces sit one cell along the axis, heads excluded
+        // from the "middle" counting the way the reference reads them.
+        int preSlot = this.CellSlot(axisY ? x : x - 1, axisY ? y - 1 : y);
+        int nxtSlot = this.CellSlot(axisY ? x : x + 1, axisY ? y + 1 : y);
+        bool hasPrev = this.brOv[preSlot] >= 0 && preSlot != slot;
+        bool hasNext = this.brOv[nxtSlot] >= 0 && nxtSlot != slot;
+        bool prevDamaged = hasPrev && this.brHp[preSlot] * 2 <= maxHp;
+        bool nextDamaged = hasNext && this.brHp[nxtSlot] * 2 <= maxHp;
+        int value;
+        if (head == 1) {
+            if (hasNext) {
+                value = damaged ? 6 : nextDamaged ? 5 : 20;
+            } else {
+                value = 21;
+            }
+        } else if (head == 2) {
+            if (hasPrev) {
+                value = damaged ? 6 : prevDamaged ? 4 : 18;
+            } else {
+                value = 19;
+            }
+        } else {
+            // The reference swaps prev/next for non-X bridges so the
+            // art's own front/back reads the run in one direction.
+            bool aPrev = axisY ? hasPrev : hasNext;
+            bool aNext = axisY ? hasNext : hasPrev;
+            bool aPrevDamaged = axisY ? prevDamaged : nextDamaged;
+            bool aNextDamaged = axisY ? nextDamaged : prevDamaged;
+            if (aPrev && aNext) {
+                value = damaged || (aPrevDamaged && aNextDamaged) ? 6
+                    : aPrevDamaged ? 4 : aNextDamaged ? 5 : 0;
+            } else if (aPrev) {
+                value = 8;
+            } else if (aNext) {
+                value = 7;
+            } else {
+                value = 0;
+            }
+            if (!axisY) { value = value + 9; }
+        }
+        this.brOv[slot] = min + value;
+    }
+
+    /// <summary>Hits the bridge piece covering a cell. A piece at zero
+    /// collapses and the domino takes its fragment: the reference's
+    /// findDominoPieces -- walk both ways from the break; a side that
+    /// never meets a head piece comes down with it, a run with intact
+    /// ends on both sides loses only the broken piece. Units standing on
+    /// the fallen cells go with it.</summary>
+    void DamageBridgeAt(int x, int y, int dmg) {
+        if (dmg <= 0) { return; }
+        int flags = this.BridgeFlagsAt(x, y);
+        if (flags == 0) { return; }
+        bool axisY = (flags & 4) != 0;
+        int ax = x;
+        int ay = y;
+        for (int k = 0; k <= 2; k = k + 1) {
+            int cx = x - k;
+            int cy = y - k;
+            if (this.IsBridgeAnchor(cx, cy)) { ax = cx; ay = cy; break; }
+        }
+        int slot = this.CellSlot(ax, ay);
+        this.brHp[slot] = this.brHp[slot] - dmg;
+        if (this.brHp[slot] > 0) {
+            this.oreVersion = this.oreVersion + 1;
+            this.ReconnectBridgeAt(slot);
+            this.ReconnectBridgeAt(this.CellSlot(axisY ? ax : ax - 1,
+                                                 axisY ? ay - 1 : ay));
+            this.ReconnectBridgeAt(this.CellSlot(axisY ? ax : ax + 1,
+                                                 axisY ? ay + 1 : ay));
+            return;
+        }
+        // The domino: the broken piece itself always comes down; each
+        // side that walks outward without ever meeting a head piece is
+        // headless and falls with it (the reference's findDominoPieces
+        // returns empty only when both ends are intact -- and then only
+        // the broken piece dies).
+        List<int> doomed = new List<int>();
+        doomed.Add(slot);
+        bool forwardEnd = false;
+        int cx2 = ax;
+        int cy2 = ay;
+        for (int step = 0; step < 4096; step = step + 1) {
+            cx2 = axisY ? cx2 : cx2 + 1;
+            cy2 = axisY ? cy2 + 1 : cy2;
+            if (!this.IsBridgeAnchor(cx2, cy2)) { break; }
+            if ((this.BridgeFlagsAt(cx2, cy2) & 3) != 0) {
+                forwardEnd = true;
+                break;
+            }
+            doomed.Add(this.CellSlot(cx2, cy2));
+        }
+        bool backwardEnd = false;
+        cx2 = ax;
+        cy2 = ay;
+        for (int step = 0; step < 4096; step = step + 1) {
+            cx2 = axisY ? cx2 : cx2 - 1;
+            cy2 = axisY ? cy2 - 1 : cy2;
+            if (!this.IsBridgeAnchor(cx2, cy2)) { break; }
+            if ((this.BridgeFlagsAt(cx2, cy2) & 3) != 0) {
+                backwardEnd = true;
+                break;
+            }
+            doomed.Add(this.CellSlot(cx2, cy2));
+        }
+        for (int i = 0; i < doomed.Count; i = i + 1) {
+            int ds = doomed[i];
+            int dxp = ds % this.width;
+            int dyp = ds / this.width;
+            bool dAxisY = (this.brData[ds] & 4) != 0;
+            for (int k = 0; k < 3; k = k + 1) {
+                int cx = dAxisY ? dxp : dxp + k;
+                int cy = dAxisY ? dyp + k : dyp;
+                if (!this.InBounds(cx, cy)) { break; }
+                this.SinkUnitAt(cx, cy);
+            }
+            this.ClearBridgePiece(ds);
+        }
+        this.oreVersion = this.oreVersion + 1;
+        this.ReconnectBridgeAll();
+    }
+
     /// <summary>Breadth-first path searches since the world was created --
     /// the selftest's perf line reports it so the search volume of a battle
     /// stays visible.</summary>
@@ -1604,6 +2042,14 @@ class World {
     int OreValueAt(int x, int y) {
         if (!this.InBounds(x, y)) { return 0; }
         return this.oreVal[this.CellSlot(x, y)];
+    }
+
+    /// <summary>The ore cell's overlay type id (GEM01.. / TIB01..), -1 when
+    /// none or unknown. The renderer draws the id's own art the way the
+    /// original draws each overlay object by its type.</summary>
+    int OreOvAt(int x, int y) {
+        if (!this.InBounds(x, y)) { return 0 - 1; }
+        return this.oreOv[this.CellSlot(x, y)];
     }
 
     /// <summary>A mining pass: takes up to take units from the cell and
@@ -1623,45 +2069,154 @@ class World {
         return take;
     }
 
-    /// <summary>Raises a random ore cell by one stage and, now and then,
-    /// spreads to a neighbouring clear ground cell -- the shipped
-    /// TiberiumGrows / TiberiumSpreads rules. Tick calls this on the growth
-    /// cadence derived from the rules' GrowthRate.</summary>
-    void GrowOre() {
-        if (this.oreLeft <= 0) { return; }
-        // A handful of cells richen each pass.
-        for (int g = 0; g < 8; g = g + 1) {
-            int c = this.worldTick * 7 + g * 131 + g * g * 31;
-            int x = c % this.width;
-            int y = (c / this.width) % this.height;
-            if (this.oreAmt[this.CellSlot(x, y)] > 0) {
-                int amt = this.oreAmt[this.CellSlot(x, y)];
-                if (amt < 30) { this.oreAmt[this.CellSlot(x, y)] = amt + 1; }
+    // ---- tiberium growth (the reference's TiberiumTreeTrait) -----------
+
+    /// <summary>Registers a terrain object cell. Scenery blocks ore spawn
+    /// and registers growth when the type declares SpawnsTiberium=yes.</summary>
+    void SetMapTerrain(int x, int y) {
+        if (!this.InBounds(x, y)) { return; }
+        this.hasTerrain[this.CellSlot(x, y)] = 1;
+    }
+
+    bool HasMapTerrain(int x, int y) {
+        return this.InBounds(x, y)
+            && this.hasTerrain[this.CellSlot(x, y)] != 0;
+    }
+
+    /// <summary>Registers one tiberium tree with its spawn cooldown in
+    /// ticks (the rules' floor(1/AnimationProbability)); the slot keeps
+    /// the initial period in tibTreeCd until the first fire re-arms it.</summary>
+    void AddTibTree(int x, int y, int cdTicks) {
+        if (!this.InBounds(x, y) || cdTicks <= 0) { return; }
+        this.tibTreeX.Add(x);
+        this.tibTreeY.Add(y);
+        this.tibTreeCd.Add(cdTicks);
+        this.tibTreeCd0.Add(cdTicks);
+    }
+
+    int TibTreeCount() { return this.tibTreeX.Count; }
+
+    /// <summary>The deterministic overlay-variant offset the reference's
+    /// OreSpread.calculateOverlayId derives from the cell: a float hash of
+    /// the coordinates folded to 0..11, added to the type's first overlay
+    /// id. Same cell, same variant, every game.</summary>
+    static int OreSpreadIndex(int x, int y) {
+        double t = (((y - 9) / 2.0) % 12) * (((y - 8) / 2.0) % 12) % 12;
+        double u = (((x - 13) / 2.0) % 12) * (((x - 12) / 2.0) % 12) % 12;
+        double v = Math.Floor(t - u + 120000.0);
+        int n = (int)v;
+        n = n - n / 12 * 12;
+        if (n < 0) { n = n + 12; }
+        return n;
+    }
+
+    /// <summary>The reference's TiberiumTrait.canBePlacedOn: bare ground
+    /// (Clear, Road or Rough), no scenery, no structure, no wall, no ore.
+    /// Units do not block -- the original splices new ore under standing
+    /// vehicles.</summary>
+    bool TibCanPlace(int x, int y) {
+        if (!this.InBounds(x, y)) { return false; }
+        if (this.HasMapTerrain(x, y)) { return false; }
+        if (this.occupancy[this.CellSlot(x, y)] != 0) { return false; }
+        if (this.IsWallCell(x, y)) { return false; }
+        if (this.brOv[this.CellSlot(x, y)] >= 0) { return false; }
+        if (this.statOv[this.CellSlot(x, y)] >= 0) { return false; }
+        if (this.OreAt(x, y) > 0) { return false; }
+        IsoTile t = this.iso.At(x, y);
+        if (t == null) { return false; }
+        LandType lt = this.CellLand(t);
+        if (lt == null) { return false; }
+        int v = lt.Value();
+        return v == LandType.Clear() || v == LandType.Road()
+            || v == LandType.Rough();
+    }
+
+    /// <summary>One tree's spawn roll, the reference's TiberiumTreeTrait
+    /// tick: rings at radius 1 then 2 in the RadialTileFinder's walk order;
+    /// the first placeable cell takes a new Riparius pile (value byte 3),
+    /// otherwise the first pile that can still richen takes one bail.
+    /// TiberiumGrows gates the whole pass, as shipped.</summary>
+    void TibTreeSpawn(int tx, int ty) {
+        for (int r = 1; r <= 2; r = r + 1) {
+            int left = tx - r;
+            int right = tx + r;
+            int top = ty - r;
+            int bottom = ty + r;
+            // The RadialTileFinder's ring order: bottom row right-to-left,
+            // right column up, top row left-to-right, left column down.
+            for (int xx = right; xx >= left; xx = xx - 1) {
+                if (this.TibTrySpawn(xx, bottom)) { return; }
+            }
+            for (int yy = bottom - 1; yy >= top; yy = yy - 1) {
+                if (this.TibTrySpawn(right, yy)) { return; }
+            }
+            for (int xx = left; xx <= right - 1; xx = xx + 1) {
+                if (this.TibTrySpawn(xx, top)) { return; }
+            }
+            for (int yy = top + 1; yy <= bottom - 1; yy = yy + 1) {
+                if (this.TibTrySpawn(left, yy)) { return; }
+            }
+            // No bare cell this ring: the first existing pile whose bail
+            // count can still grow (bailCount + 1 <= maxBails) gains one.
+            for (int xx = right; xx >= left; xx = xx - 1) {
+                if (this.TibTryBail(xx, bottom)) { return; }
+            }
+            for (int yy = bottom - 1; yy >= top; yy = yy - 1) {
+                if (this.TibTryBail(right, yy)) { return; }
+            }
+            for (int xx = left; xx <= right - 1; xx = xx + 1) {
+                if (this.TibTryBail(xx, top)) { return; }
+            }
+            for (int yy = top + 1; yy <= bottom - 1; yy = yy + 1) {
+                if (this.TibTryBail(left, yy)) { return; }
             }
         }
-        // Spreading: a clear, walkable neighbour of an ore cell becomes ore.
-        if (!this.Rules().OreSpreads()) { return; }
-        for (int s = 0; s < 2; s = s + 1) {
-            int c = this.worldTick * 13 + s * 211 + s * s * 17;
-            int x = c % this.width;
-            int y = (c / this.width) % this.height;
-            if (this.oreAmt[this.CellSlot(x, y)] <= 0) { continue; }
-            int dx = (c >> 3) % 3 - 1;
-            int dy = (c >> 5) % 3 - 1;
-            if (dx == 0 && dy == 0) { continue; }
-            int nx = x + dx;
-            int ny = y + dy;
-            if (this.OreAt(nx, ny) > 0) { continue; }
-            if (!this.PassableForRoute(nx, ny, false)) { continue; }
-            int val = this.oreVal[this.CellSlot(x, y)];
-            this.SetOre(nx, ny, 2, val);
-            break;
+    }
+
+    bool TibTrySpawn(int x, int y) {
+        if (!this.TibCanPlace(x, y)) { return false; }
+        this.SetOre(x, y, 3, 1, 102 + World.OreSpreadIndex(x, y));
+        return true;
+    }
+
+    bool TibTryBail(int x, int y) {
+        if (!this.InBounds(x, y)) { return false; }
+        int slot = this.CellSlot(x, y);
+        int amt = this.oreAmt[slot];
+        // bailCount = value + 1, maxBails 11: a bail still fits while
+        // value <= 9 -- the reference's bailCount + 1 <= maxBails.
+        if (amt < 1 || amt > 9) { return false; }
+        this.oreAmt[slot] = amt + 1;
+        this.oreVersion = this.oreVersion + 1;
+        return true;
+    }
+
+    /// <summary>Per-tree cooldown rolls, run every tick -- the trees'
+    /// AnimationProbability cadence, not the unused GrowthRate. Trees may
+    /// carry different periods, so the fire re-arms from the period the
+    /// tree was registered with (tibTreePeriod holds the last one handed
+    /// to AddTibTree, which registration order makes each tree's own).</summary>
+    void TickTiberiumGrowth() {
+        for (int i = 0; i < this.tibTreeX.Count; i = i + 1) {
+            int cd = this.tibTreeCd[i] - 1;
+            if (cd > 0) { this.tibTreeCd[i] = cd; continue; }
+            this.TibTreeSpawn(this.tibTreeX[i], this.tibTreeY[i]);
+            this.tibTreeCd[i] = this.tibTreeCd0[i];
         }
     }
 
     /// <summary>How many credits a full ore hold is worth -- the shipped
     /// harvester payload the original unloads at the refinery.</summary>
     static int OreCapacity() { return 700; }
+
+    /// <summary>The miner's hold in bails against its type's Storage=:
+    /// the shipped [CMIN]/[SMIN] 20 and [HARV] 40. A unit with no type
+    /// falls back to the old full-hold constant.</summary>
+    int StorageOf(WorldObject o) {
+        UnitType t = o.UnitType();
+        return t != null && t.Storage() > 0 ? t.Storage()
+                                            : World.OreCapacity();
+    }
 
     /// <summary>One harvester's mine-and-unload loop, run every tick. With
     /// room in the hold it mines the cell underfoot and, when that runs
@@ -1678,13 +2233,14 @@ class World {
         // A countdown paces mining passes and unloading.
         if (o.DockTimer() > 0) {
             o.SetDockTimer(o.DockTimer() - 1);
-            if (o.DockTimer() == 0 && o.Cargo() >= World.OreCapacity()) {
+            if (o.DockTimer() == 0 && o.Bails() >= this.StorageOf(o)) {
                 this.AddMoneyEvent(o.Side(), o.Cargo());
                 o.SetCargo(0);
+                o.SetBails(0);
             }
             return;
         }
-        if (o.Cargo() >= World.OreCapacity()) {
+        if (o.Bails() >= this.StorageOf(o)) {
             if (this.AtRefineryDock(o)) {
                 o.SetDockTimer(360);
                 return;
@@ -1702,14 +2258,17 @@ class World {
         if (!o.HasRoute()) {
             int amt = this.OreAt(o.X(), o.Y());
             if (amt > 0) {
-                // The pass can empty the cell, which zeroes its value, so
-                // the price is read before the take, not after.
+                // One bail per pass, the reference's GatherOreTask cadence
+                // (a 1/60-minute wait between bails): a gold bail pays the
+                // shipped Value=25, a crystal bail the doubled 50 -- our
+                // OreValue 1 and 2 times 25.
                 int val = this.OreValueAt(o.X(), o.Y());
-                int taken = this.TakeOre(o.X(), o.Y(), 25);
+                int taken = this.TakeOre(o.X(), o.Y(), 1);
                 if (taken > 0) {
-                    o.SetCargo(o.Cargo() + taken * val);
+                    o.SetCargo(o.Cargo() + val * 25);
+                    o.SetBails(o.Bails() + 1);
                 }
-                o.SetDockTimer(60);
+                o.SetDockTimer(36);
                 return;
             }
             if (!this.RouteToOre(o)) { o.SetDockTimer(45); }
@@ -2183,6 +2742,8 @@ class World {
     /// The land class and the ramp flag are what carry that information.</summary>
     LandType CellLand(IsoTile t) {
         if (t == null) { return null; }
+        LandType ov = this.OverlayLandAt(t.X(), t.Y());
+        if (ov != null) { return ov; }
         if (this.theater != null) {
             LandType lt = this.theater.CellLandType(t.Tile(), t.SubTile());
             if (lt != null) { return lt; }
@@ -2193,6 +2754,28 @@ class World {
         if (this.IsBridge(t)) { return LandType.Of(LandType.Road()); }
         if (t.IsClear()) { return LandType.Of(LandType.Clear()); }
         return LandType.Of(LandType.Rock());
+    }
+
+    /// <summary>The land override a static overlay or bridge piece lays
+    /// on a cell: only types that declare NoUseTileLandType with a Land=
+    /// class replace the terrain's own (the reference's tile-land rule).
+    /// Low bridges read Road over water, fences and rocks read Rock.</summary>
+    LandType OverlayLandAt(int x, int y) {
+        if (!this.InBounds(x, y)) { return null; }
+        int slot = this.CellSlot(x, y);
+        int ov = this.brOv[slot] >= 0 ? this.brOv[slot] : this.statOv[slot];
+        if (ov < 0) { return null; }
+        int flags = this.Rules().OverlayLandFlags(ov);
+        if ((flags & 256) == 0 || (flags & 255) == 255) { return null; }
+        return LandType.Of(flags & 255);
+    }
+
+    /// <summary>A cell's land class value, -1 when nothing classifies it
+    /// (the probes and the bridge checks read this).</summary>
+    int CellLandClassAt(int x, int y) {
+        if (!this.InBounds(x, y)) { return 0 - 1; }
+        LandType lt = this.CellLand(this.iso.At(x, y));
+        return lt != null ? lt.Value() : 0 - 1;
     }
 
     /// <summary>A cell's ramp flag: non-zero means a graded slope, the only
@@ -3798,6 +4381,38 @@ class World {
         }
         return n;
     }
+    /// <summary>Once-fx alive on one cell. The selftest's deaths probe
+    /// counts only its own kills: a war map keeps generating unrelated
+    /// deaths (an AI rush shooting a defender), and a global sample would
+    /// catch a bystander's death sequence mid-play and blame the corpse
+    /// lifecycle for it.</summary>
+    int OnceFxCountAt(int x, int y) {
+        int n = 0;
+        for (int i = 0; i < this.anims.Count; i = i + 1) {
+            FxAnim a = this.anims[i];
+            if (a.once && (int)a.px == x && (int)a.py == y) { n = n + 1; }
+        }
+        return n;
+    }
+
+    /// <summary>Selftest diagnostic: every live once-fx as
+    /// name@x,y:ticks/frames -- a death sequence is labelled by the unit's
+    /// own SHP until the corpse morph renames it to the DeadBodies art.</summary>
+    string OnceFxDump() {
+        string s = "";
+        for (int i = 0; i < this.anims.Count; i = i + 1) {
+            FxAnim a = this.anims[i];
+            if (!a.once) { continue; }
+            string nm = a.name;
+            if (nm.Length == 0) { nm = a.unitShp == null ? "" : a.unitShp; }
+            s = s + nm + "@"
+                + Convert.ToString((int)a.px) + ","
+                + Convert.ToString((int)a.py)
+                + ":" + Convert.ToString(a.ticks)
+                + "/" + Convert.ToString(a.frames) + " ";
+        }
+        return s;
+    }
 
     /// <summary>Idle loops actually live across all structures.</summary>
     int IdleLoopCount() {
@@ -4166,9 +4781,8 @@ class World {
              || o.UnitType().Role() != UnitRole.Harvester()) { continue; }
             this.TickHarvester(o);
         }
-        if (this.Rules().OreGrows()
-         && this.worldTick % (this.Rules().GrowthRateMinutes() * 3600) == 0) {
-            this.GrowOre();
+        if (this.Rules().OreGrows()) {
+            this.TickTiberiumGrowth();
         }
         // Production: every structure with a queue counts its head down and,
         // when one finishes, walks the new unit out onto a free neighbour. If

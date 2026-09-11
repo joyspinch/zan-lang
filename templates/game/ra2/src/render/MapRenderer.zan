@@ -48,6 +48,18 @@ class MapRenderer {
     List<int> terrY;
     List<int> terrLevel;
     List<string> terrName;
+    // Static overlays + low bridges, pre-projected into painter order at
+    // SetWorld time so the terrain recomposite walks flat arrays (a busy
+    // field recomposites often; per-draw projection there is what showed
+    // in the frame budget). Static: cell + art name + data frame. Bridge:
+    // middle-cell screen spot + type + variant value.
+    List<int> stOvIdx;
+    List<string> stOvName;
+    List<int> stOvData;
+    List<int> brMidX;
+    List<int> brMidY;
+    List<int> brKind;     // 0 wood, 1 concrete
+    List<int> brValue;
     // Map smudges ([Smudge] decals: craters, burn marks), in painter order
     // like the terrain scatter. Resolved once at load into screen positions
     // and art, so RenderInto's loop is array reads.
@@ -155,6 +167,64 @@ class MapRenderer {
         // cell's amount as the SHP frame.
         Rules rules = world.Rules();
         this.gemFirst = rules != null ? rules.FirstOreOverlay() : -1;
+        this.ProjectOverlays();
+    }
+
+    /// <summary>Pre-projects the world's static overlays and bridge
+    /// pieces into painter order (x+y, then level) -- the SetTerrain
+    /// pattern. Called from SetWorld and after any wholesale bridge or
+    /// overlay change the world reports; the per-cell ore/wall loops
+    /// stay where they are (they carry live per-frame state: amounts,
+    /// connection masks, damaged frames).</summary>
+    void ProjectOverlays() {
+        if (this.world == null) { return; }
+        this.stOvIdx = new List<int>();
+        this.stOvName = new List<string>();
+        this.stOvData = new List<int>();
+        this.brMidX = new List<int>();
+        this.brMidY = new List<int>();
+        this.brKind = new List<int>();
+        this.brValue = new List<int>();
+        Rules rules = this.world.Rules();
+        List<int> keys = new List<int>();
+        int span = this.world.Width() > this.world.Height()
+            ? this.world.Width() : this.world.Height();
+        // A linear walk over the world grid is too big (512x512 worst
+        // case); the order indices give painter order for free.
+        for (int i = 0; i < this.order.Count; i = i + 1) {
+            IsoTile t = this.iso.TileAt(this.order[i]);
+            int ov = this.world.StaticOvAt(t.X(), t.Y());
+            if (ov < 0 || rules == null) { continue; }
+            string name = rules.OverlayName(ov);
+            if (name == null || name.Length == 0) { continue; }
+            int key = t.X() + t.Y();
+            int at = 0;
+            while (at < keys.Count && keys[at] <= key) { at = at + 1; }
+            keys.Insert(at, key);
+            this.stOvIdx.Insert(at, this.order[i]);
+            this.stOvName.Insert(at, name);
+            this.stOvData.Insert(at, this.world.StaticDataAt(t.X(), t.Y()));
+        }
+        for (int bi = 0; bi < this.world.BridgePieceCount(); bi = bi + 1) {
+            int slot = this.world.BridgeSlotAt(bi);
+            if (slot < 0) { continue; }
+            int btx = slot % this.world.Width();
+            int bty = slot / this.world.Width();
+            int id = this.world.BridgeIdAt(bi);
+            if (id < 0) { continue; }
+            int fx = this.world.BridgeFlagsAt(btx, bty);
+            bool axisY = (fx & 4) != 0;
+            int midX = axisY ? btx : btx + 1;
+            int midY = axisY ? bty + 1 : bty;
+            int key = midX + midY;
+            int at = 0;
+            while (at < keys.Count && keys[at] <= key) { at = at + 1; }
+            keys.Insert(at, key);
+            this.brMidX.Insert(at, midX);
+            this.brMidY.Insert(at, midY);
+            this.brKind.Insert(at, id >= 205 ? 1 : 0);
+            this.brValue.Insert(at, id - (id >= 205 ? 205 : 74));
+        }
     }
 
     /// <summary>Takes the map's [Terrain] objects, sorted into painter order
@@ -369,7 +439,25 @@ class MapRenderer {
                 if (sx > 0 - IsoProjection.TileW() && sx < cw
                  && sy > 0 - IsoProjection.TileH() && sy < ch) {
                     int kind = this.world.OreValueAt(t.X(), t.Y()) >= 2 ? 1 : 0;
-                    Texture ore = this.OreTexture(gemFirst + kind * 6, amt);
+                    // The cell's own overlay id first (the growth's TIB01..
+                    // fields are not GEM art); the GEM pair by value, then
+                    // the procedural lumps, as before.
+                    Texture ore = null;
+                    int oov = this.world.OreOvAt(t.X(), t.Y());
+                    if (oov >= 0) {
+                        string on = this.world.Rules().OverlayName(oov);
+                        if (on != null && on.Length > 0) {
+                            int oframes = this.theater.OverlayFrameCount(on);
+                            if (oframes > 0) {
+                                int of = amt;
+                                if (of >= oframes) { of = oframes - 1; }
+                                ore = this.theater.OverlaySprite(on, of);
+                            }
+                        }
+                    }
+                    if (ore == null) {
+                        ore = this.OreTexture(gemFirst + kind * 6, amt);
+                    }
                     if (ore == null) {
                         int bucket = amt >= 12 ? 7 : amt * 8 / 12;
                         ore = this.OreSprite(bucket, kind);
@@ -387,6 +475,32 @@ class MapRenderer {
                     canvas.Blit(ore, px, py);
                     drawn = drawn + 1;
                 }
+            }
+        }
+
+        // Low bridges span their cells: one assembled sprite per piece,
+        // centred on the middle cell of its three-cell span (the
+        // reference's container offset -- anchor plus one and a half tiles
+        // along the span). The piece's overlay id picks the variant frame
+        // from the assembled LOBRDG/LOBRDB set, so a wounded or dangling
+        // piece draws the damaged or dropped-end art the chain state
+        // names. Bridge art rides over the water tiles it crosses and
+        // under everything that moves.
+        if (this.brMidX != null) {
+            for (int bi = 0; bi < this.brMidX.Count; bi = bi + 1) {
+                int msx = IsoProjection.ScreenX(this.brMidX[bi],
+                                                this.brMidY[bi])
+                        - this.originX - camX;
+                int msy = IsoProjection.ScreenY(this.brMidX[bi],
+                                                this.brMidY[bi], 0)
+                        - this.originY - camY;
+                Texture spr = this.theater.LowBridgeSprite(
+                    this.brKind[bi] == 1, this.brValue[bi]);
+                if (spr == null) { continue; }
+                int px = msx + IsoProjection.TileW() / 2 - spr.Width() / 2;
+                int py = msy + IsoProjection.TileH() / 2 - spr.Height() / 2;
+                canvas.Blit(spr, px, py);
+                drawn = drawn + 1;
             }
         }
 
@@ -425,6 +539,39 @@ class MapRenderer {
                 // Overlay art sits bottom-aligned on the diamond (the ore
                 // loop's anchor): the wall base meets the tile's bottom
                 // corner.
+                int px = sx + IsoProjection.TileW() / 2 - spr.Width() / 2;
+                int py = sy + IsoProjection.TileH() - spr.Height();
+                canvas.Blit(spr, px, py);
+                drawn = drawn + 1;
+            }
+        }
+
+        // Static overlays -- the map's rocks, fences, crates and tracks
+        // that are neither ore, wall nor bridge -- draw bottom-aligned on
+        // their cells like the walls do, the data byte picking the art
+        // frame. They are decals: no health, no occupancy, but their
+        // Land= overrides the ground class, which is what sinks a unit's
+        // passability into a rock or holds a fence line.
+        if (this.stOvName != null) {
+            for (int i = 0; i < this.stOvName.Count; i = i + 1) {
+                IsoTile t = this.iso.TileAt(this.stOvIdx[i]);
+                int sx = IsoProjection.ScreenX(t.X(), t.Y()) - this.originX
+                       - camX;
+                int sy = IsoProjection.ScreenY(t.X(), t.Y(), t.Level())
+                       - this.originY - camY;
+                if (sx <= 0 - IsoProjection.TileW() || sx >= cw
+                 || sy <= 0 - IsoProjection.TileH() || sy >= ch) {
+                    continue;
+                }
+                int frames = this.theater.OverlayFrameCount(
+                    this.stOvName[i]);
+                if (frames <= 0) { continue; }
+                int frame = this.stOvData[i];
+                if (frame >= frames) { frame = frames - 1; }
+                if (frame < 0) { frame = 0; }
+                Texture spr = this.theater.OverlaySprite(this.stOvName[i],
+                                                         frame);
+                if (spr == null) { continue; }
                 int px = sx + IsoProjection.TileW() / 2 - spr.Width() / 2;
                 int py = sy + IsoProjection.TileH() - spr.Height();
                 canvas.Blit(spr, px, py);
