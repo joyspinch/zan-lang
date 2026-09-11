@@ -8202,6 +8202,67 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             }
         }
 
+        /* await Socket.RecvToOv(fd, buf, len, timeoutMs) — overlapped receive
+         * with a deadline. Same lowering as RecvOv plus the timeout: the
+         * reactor races the recv against the deadline and delivers whichever
+         * comes first — the byte count (0 = peer close) or -1 for timeout —
+         * into the frame's RESULT slot before re-readying. This is what makes
+         * Socket.RecvAsync(sock, size, timeout) event-driven: the old Zan-side
+         * 1→16ms poll loop flooded the ready queue under bursts (A268(b)). */
+        {
+            if (is_call_to(expr->await_expr.expr, "Socket", "RecvToOv") &&
+                expr->await_expr.expr->call.args.count == 4) {
+                LLVMTypeRef di64 = LLVMInt64TypeInContext(g->ctx);
+                LLVMTypeRef di32 = LLVMInt32TypeInContext(g->ctx);
+                LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                if (!(g->current_async_frame && g->current_async_switch)) {
+                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                        "await Socket.RecvToOv is only supported inside an async method");
+                    return LLVMConstInt(di64, 0, 0);
+                }
+                LLVMValueRef fd = emit_expr(g, expr->await_expr.expr->call.args.items[0], locals);
+                if (LLVMTypeOf(fd) != di64)
+                    fd = LLVMBuildIntCast2(g->builder, fd, di64, 1, "fd64");
+                LLVMValueRef buf = emit_expr(g, expr->await_expr.expr->call.args.items[1], locals);
+                if (LLVMTypeOf(buf) != di8ptr)
+                    buf = LLVMBuildBitCast(g->builder, buf, di8ptr, "recvbuf");
+                LLVMValueRef len = emit_expr(g, expr->await_expr.expr->call.args.items[2], locals);
+                if (LLVMTypeOf(len) != di32)
+                    len = LLVMBuildIntCast2(g->builder, len, di32, 1, "len32");
+                LLVMValueRef tmo = emit_expr(g, expr->await_expr.expr->call.args.items[3], locals);
+                if (LLVMTypeOf(tmo) != di64)
+                    tmo = LLVMBuildIntCast2(g->builder, tmo, di64, 1, "tmo64");
+                g->uses_socket_async = true;
+
+                int k = g->current_async_next_state++;
+                LLVMValueRef selfframe = g->current_async_frame;
+                LLVMTypeRef self_ft = g->current_async_frame_type;
+                LLVMValueRef self_i8 = LLVMBuildBitCast(g->builder, selfframe, di8ptr, "self");
+                /* &self.result — the reactor stores the byte count or -1 here. */
+                LLVMValueRef out_n = LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
+                    ASYNC_FRAME_RESULT, "self.iores");
+                emit_async_save_slots(g);
+                zan_store_fit(g, LLVMConstInt(di32, (unsigned)k, 0),
+                    LLVMBuildStructGEP2(g->builder, self_ft, selfframe, ASYNC_FRAME_STATE, "self.state"));
+                zan_call2(g->builder, g->rt_io_recv_to_co_type, g->rt_io_recv_to_co,
+                    (LLVMValueRef[]){ fd, buf, len, tmo, self_i8,
+                        g->current_async_resume_fn, out_n }, 7, "");
+                emit_async_eh_unarm(g);
+                LLVMBuildRetVoid(g->builder);
+
+                LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
+                    g->current_async_resume_fn, "co.resume");
+                LLVMAddCase(g->current_async_switch, LLVMConstInt(di32, (unsigned)k, 0), rk);
+                LLVMPositionBuilderAtEnd(g->builder, rk);
+                emit_async_reload_slots(g);
+                /* recompute the result GEP: entry dominates rk, the pre-suspend
+                 * block does not. */
+                LLVMValueRef res_slot = LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
+                    ASYNC_FRAME_RESULT, "self.iores2");
+                return LLVMBuildLoad2(g->builder, di64, res_slot, "recvton");
+            }
+        }
+
         /* await Socket.AcceptOv(fd) — Windows AcceptEx completion. The
          * accepted socket is written into the frame result slot before the
          * suspended state machine is re-readied. */

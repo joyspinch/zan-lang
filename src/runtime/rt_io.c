@@ -162,6 +162,7 @@ static int dns_drain(void);           /* deliver completed lookups (reactor) */
 static int64_t dns_wait_ms(int64_t caller_ms);  /* cap a backend wait at the
                                                    earliest lookup deadline */
 static int dns_timeout_scan(void);    /* deliver failures for late lookups */
+static int64_t dns_now_ms(void);      /* reactor clock (ms, monotonic) */
 static void dns_wake_read(void);      /* consume the wake fd signal (POSIX) */
 static void dns_wake_notify(void);    /* worker -> reactor wake (all backends) */
 static void dns_shutdown_cleanup(void); /* free DNS jobs at shutdown */
@@ -249,9 +250,72 @@ static int io_fd_usable(intptr_t fd) {
     return zan_io_socket_alive(fd) != 0;
 }
 
+/* ---- recv with deadline (Socket.RecvToOv, POSIX readiness backends) ----
+ *
+ * A recv-with-timeout parks the frame on the fd's read watcher AND a deadline
+ * entry here; whoever comes first delivers and retires the other. The deadline
+ * deliberately does NOT use the timer heap: a timer entry naming a frame the
+ * recv already resumed would fire again mid-execution (re-entering a CPS state
+ * block corrupts live slots), and cancelling it from the recv delivery path
+ * widens every wake race. Instead the entry is retired the moment its waiter
+ * leaves the slot -- io_take (event/sweep/close delivery) and io_mark_dead
+ * (every failure path) drop it -- and rto_timeout_scan, run at the top of each
+ * backend's poll turn, delivers -1 (timeout) for whatever is still parked.
+ * The POSIX reactors are single-threaded, so no claim flag is needed: each
+ * retire path is unreachable once the waiter is gone from its slot. Frames
+ * only run between poll turns, so reuse of a frame address before the next
+ * scan is impossible; and a fresh rto_arm drops any same-frame entry anyway. */
+typedef struct zan_io_rto {
+    int fd;
+    void *frame;
+    zan_co_step_t step;
+    int64_t *out_n;
+    long long due_ms;
+    struct zan_io_rto *next;
+} zan_io_rto_t;
+
+static zan_io_rto_t *g_rto;
+
+/* Retire the deadline entry naming `frame` (if any). Idempotent; O(len(g_rto)),
+ * which stays tiny -- only recv-with-timeout awaits ever park here. */
+static void rto_drop(void *frame) {
+    zan_io_rto_t **pp = &g_rto;
+    while (*pp) {
+        zan_io_rto_t *e = *pp;
+        if (e->frame == frame) {
+            *pp = e->next;
+            free(e);
+            return;
+        }
+        pp = &e->next;
+    }
+}
+
+/* Arm the deadline for a recv-to await. Called BEFORE the watcher registers so
+ * that a registration failure fails through io_mark_dead, whose hook retires
+ * this entry; on success the entry's fd/frame stay live until the recv wins
+ * (retired by io_take) or the deadline does (delivered by rto_timeout_scan). */
+static void rto_arm(int fd, void *frame, zan_co_step_t step, int64_t *out_n,
+                    int64_t timeout_ms) {
+    zan_io_rto_t *e = (zan_io_rto_t *)calloc(1, sizeof(*e));
+    if (!e) return;   /* no deadline: the recv degrades to the plain (unbounded)
+                       * RecvOv shape -- the watcher is still armed and wakes */
+    e->fd = fd;
+    e->frame = frame;
+    e->step = step;
+    e->out_n = out_n;
+    e->due_ms = dns_now_ms() + (timeout_ms > 0 ? timeout_ms : 0);
+    e->next = g_rto;
+    g_rto = e;
+}
+
 static void io_mark_dead(void *co, zan_co_step_t step, int64_t *out_n,
                          intptr_t *out_accept) {
     zan_io_dead_t *d = (zan_io_dead_t *)calloc(1, sizeof(*d));
+    /* A waiter failed at registration can never be delivered by an event, so
+     * its deadline (if any) must not survive it. Dropped before the calloc
+     * return so even the calloc-failure path (waiter lost) retires cleanly. */
+    rto_drop(co);
     if (!d) return;
     d->co = co;
     d->step = step;
@@ -965,6 +1029,11 @@ static int io_take(zan_io_slot_t *s, int fd, int read_dir,
         *has = 0;
     }
     (void)fd;
+    /* Every consumer of io_take (event delivery, dead-fd sweep, close
+     * notification) ends the waiter's life here, so this is where a recv-to
+     * deadline must learn its recv won. No-op unless g_rto is live. */
+    if (g_rto)
+        for (int i = 0; i < n; i++) rto_drop(out[i].co);
     return n;
 }
 
@@ -993,6 +1062,15 @@ static void io_unlink_waiter(zan_io_slot_t *s, int read_dir,
     if (!p) return;   /* not reachable: nothing to undo */
     p->next = w->next;
     free(w);
+}
+
+/* Find the parked READ waiter naming `co` (recv-to deadline delivery). */
+static zan_io_waiter_t *io_find_read_waiter(zan_io_slot_t *s, void *co) {
+    if (!s->has_r) return NULL;
+    if (s->r.co == co) return &s->r;
+    for (zan_io_waiter_t *x = s->r.next; x; x = x->next)
+        if (x->co == co) return x;
+    return NULL;
 }
 
 /* Fail every waiter still parked on this slot (both directions). Used when
@@ -1112,6 +1190,7 @@ void zan_io_shutdown(void) {
     g_io_entries = NULL;
     g_io_count = 0;
     io_dead_clear();
+    while (g_rto) { zan_io_rto_t *e = g_rto; g_rto = e->next; free(e); }
     dns_shutdown_cleanup();
     if (g_epoll_fd >= 0) { close(g_epoll_fd); g_epoll_fd = -1; }
     if (g_dns_wake_fd >= 0) { close(g_dns_wake_fd); g_dns_wake_fd = -1; }
@@ -1219,8 +1298,44 @@ static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t s
  * the same fd+direction chains through `next`. */
 
 
+/* Deliver -1 for recv-to waiters whose fd never became readable in time.
+ * Unlinks the parked waiter first so a later readiness cannot double-wake the
+ * frame, then re-arms for any remaining waiters. A waiter already gone (taken
+ * by an event, failed via io_mark_dead) means the entry is stale: drop it
+ * without touching the frame. Runs at the top of every poll turn. */
+static int rto_timeout_scan(void) {
+    if (!g_rto) return 0;
+    int woke = 0;
+    long long now = dns_now_ms();
+    zan_io_rto_t **pp = &g_rto;
+    while (*pp) {
+        zan_io_rto_t *e = *pp;
+        if (e->due_ms > now) { pp = &e->next; continue; }
+        *pp = e->next;
+        int fd = e->fd;
+        zan_io_slot_t *s = (fd >= 0 && fd < g_slots_cap) ? &g_slots[fd] : NULL;
+        zan_io_waiter_t *w = s ? io_find_read_waiter(s, e->frame) : NULL;
+        if (w) {
+            io_unlink_waiter(s, 1, w);
+            g_io_count--;
+            if (s->has_r || s->has_w) {
+                if (!io_arm(fd, s)) io_fail_slot_waiters(s);
+            }
+            if (e->out_n) *e->out_n = -1;
+            io_wake(e->frame, e->step);
+            woke++;
+        }
+        free(e);
+    }
+    return woke;
+}
+
 int32_t zan_io_poll(int64_t timeout_ms) {
     if (g_io_dead) return io_flush_dead();
+    if (g_rto) {   /* recv-to deadlines: bound the overshoot to one turn */
+        int wr = rto_timeout_scan();
+        if (wr) return wr;
+    }
     if (g_io_count == 0 && g_blocking_inflight == 0) return 0;
     /* A waiter whose fd was closed under it is invisible to the backend, so it
      * is the sweep below -- reached when the (now bounded) wait times out --
@@ -1247,6 +1362,15 @@ int32_t zan_io_poll(int64_t timeout_ms) {
         if (w3) return w3;
         int w4 = io_sweep_slots();
         if (w4) return w4;
+        /* The deadline scan above ran once, at poll entry; this internal loop
+         * can keep turning indefinitely (capped 20ms waits with io in flight
+         * and an infinite caller timeout), so due recv-to entries must be
+         * delivered HERE too or a timed-out recv parks until some external
+         * event happens to wake the reactor (A268(b) Linux hang). */
+        {
+            int w5 = rto_timeout_scan();
+            if (w5) return w5;
+        }
         /* A wait shortened only to schedule the sweep has not expired for the
          * caller: keep waiting rather than report "nothing to wait for". */
         if (!capped || (g_io_count == 0 && g_blocking_inflight == 0)) return 0;
@@ -1373,6 +1497,7 @@ void zan_io_shutdown(void) {
     }
     g_io_count = 0;
     io_dead_clear();
+    while (g_rto) { zan_io_rto_t *e = g_rto; g_rto = e->next; free(e); }
     dns_shutdown_cleanup();
     if (g_kq_fd >= 0) { close(g_kq_fd); g_kq_fd = -1; }
     if (g_dns_wake_fd >= 0) { close(g_dns_wake_fd); g_dns_wake_fd = -1; }
@@ -1457,8 +1582,41 @@ static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t s
     }
 }
 
+/* Deliver -1 for recv-to waiters whose fd never became readable in time.
+ * Same contract as the epoll scan. No re-arm after the unlink: the fd's
+ * EV_ONESHOT kevent was armed at io_register and stays armed until an event
+ * consumes it; remaining waiters (if any) are woken by that event, and a
+ * kevent with no waiters is consumed harmlessly at the next delivery. */
+static int rto_timeout_scan(void) {
+    if (!g_rto) return 0;
+    int woke = 0;
+    long long now = dns_now_ms();
+    zan_io_rto_t **pp = &g_rto;
+    while (*pp) {
+        zan_io_rto_t *e = *pp;
+        if (e->due_ms > now) { pp = &e->next; continue; }
+        *pp = e->next;
+        int fd = e->fd;
+        zan_io_slot_t *s = (fd >= 0 && fd < g_slots_cap) ? &g_slots[fd] : NULL;
+        zan_io_waiter_t *w = s ? io_find_read_waiter(s, e->frame) : NULL;
+        if (w) {
+            io_unlink_waiter(s, 1, w);
+            g_io_count--;
+            if (e->out_n) *e->out_n = -1;
+            io_wake(e->frame, e->step);
+            woke++;
+        }
+        free(e);
+    }
+    return woke;
+}
+
 int32_t zan_io_poll(int64_t timeout_ms) {
     if (g_io_dead) return io_flush_dead();
+    if (g_rto) {   /* recv-to deadlines: bound the overshoot to one turn */
+        int wr = rto_timeout_scan();
+        if (wr) return wr;
+    }
     if (g_io_count == 0 && g_blocking_inflight == 0) return 0;
     /* A waiter whose fd was closed under it is invisible to the backend, so it
      * is the sweep below -- reached when the (now bounded) wait times out --
@@ -1486,6 +1644,13 @@ int32_t zan_io_poll(int64_t timeout_ms) {
         if (w3) return w3;
         int w4 = io_sweep_slots();
         if (w4) return w4;
+        /* Twin of the epoll fix: the deadline scan ran once at poll entry, but
+         * this internal loop can spin forever with io in flight; deliver due
+         * recv-to entries here or their frames park past their deadline. */
+        {
+            int w5 = rto_timeout_scan();
+            if (w5) return w5;
+        }
         /* A wait shortened only to schedule the sweep has not expired for the
          * caller: keep waiting rather than report "nothing to wait for". */
         if (!capped || (g_io_count == 0 && g_blocking_inflight == 0)) return 0;
@@ -1594,6 +1759,9 @@ typedef struct zan_io_op {
     SOCKET     sock;
     int        interest;     /* ZAN_IO_READ / ZAN_IO_WRITE */
     int        kind;         /* readiness/recv/accept */
+    int        rto;          /* recv-with-deadline op: the completion must
+                              * claim the frame's deadline entry before it may
+                              * touch *out_n or wake -- see the rto block below */
     void      *co;           /* fiber handle, or stackless frame pointer */
     zan_co_step_t step;      /* stackless resume fn (NULL => stackful fiber) */
     int64_t   *out_n;        /* recv byte-count sink (NULL => readiness probe) */
@@ -1608,6 +1776,13 @@ enum {
 };
 
 static HANDLE g_iocp;
+
+/* Forward decls for the recv-with-deadline registry (defined after
+ * zan_io_recv_co below); zan_io_init/shutdown touch its storage. */
+typedef struct zan_io_rto zan_io_rto_t;
+static zan_io_rto_t *g_rto;
+static CRITICAL_SECTION g_rto_lock;
+
 #if defined(ZAN_CO_DRIVER)
 /* Opt-in synchronous-completion fast path (see ensure_assoc). */
 static volatile LONG g_syncfast = -1;   /* -1 unread, 1 on, 0 off */
@@ -1822,6 +1997,7 @@ void zan_io_init(void) {
     WSAStartup(MAKEWORD(2, 2), &wsa);
     g_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
     if (g_iocp == NULL) g_io_broken = 1;
+    InitializeCriticalSection(&g_rto_lock);
 #if defined(ZAN_CO_DRIVER)
     InitializeSListHead(&g_op_slist);   /* lock-free op pool for the workers */
 #endif
@@ -1837,6 +2013,11 @@ void zan_io_shutdown(void) {
     /* Drop pooled ops: the completion port is gone, so recycled op structs are
      * all stale for any future zan_io_init(). */
     dns_shutdown_cleanup();
+    while (g_rto) {   /* the coroutines are gone; deadlines owe nobody a wake */
+        void *e = g_rto;
+        g_rto = *(zan_io_rto_t **)e;   /* next @ offset 0 (fwd-decl'd type) */
+        free(e);
+    }
 #if defined(ZAN_CO_DRIVER)
     for (;;) {
         PSLIST_ENTRY e = InterlockedPopEntrySList(&g_op_slist);
@@ -2064,6 +2245,201 @@ void zan_io_recv_co(intptr_t fd, void *buf, int32_t len, void *frame,
     }
 }
 
+/* ---- recv with deadline (Socket.RecvToOv, Windows IOCP) ----
+ *
+ * A real WSARecv raced against a deadline. The deadline lives in g_rto, NOT in
+ * the timer heap, so no timer entry can outlive the op and fire again while the
+ * frame is mid-step (a re-entered CPS state block corrupts live slots). Exactly
+ * one arm wins a registry entry named by the frame:
+ *   - recv completion (either dequeue site): rto_claim removes the entry before
+ *     io_complete_op writes *out_n and the frame is re-readied;
+ *   - deadline scan (rto_timeout_scan, run from the same places the DNS
+ *     deadline scan runs): removes the entry, CancelIoEx aborts the in-flight
+ *     recv, delivers *out_n = -1 and re-readies the frame.
+ * A completion that arrives after the deadline claim finds no entry and must
+ * touch nothing the frame owns -- *out_n points into a frame that may already
+ * be freed -- so it is dropped with only the op recycled. CancelIoEx makes that
+ * late packet prompt (OPERATION_ABORTED), and claiming under the lock means it
+ * can never race the deadline delivery back in. */
+struct zan_io_rto {
+    SOCKET          s;
+    void           *frame;
+    zan_co_step_t   step;
+    OVERLAPPED     *ov;      /* the in-flight op's OVERLAPPED, for CancelIoEx */
+    int64_t        *out_n;
+    long long       due_ms;
+    struct zan_io_rto *next;
+};
+
+static void rto_insert(zan_io_rto_t *e) {
+    EnterCriticalSection(&g_rto_lock);
+    e->next = g_rto;
+    g_rto = e;
+    LeaveCriticalSection(&g_rto_lock);
+}
+
+/* Remove and retire the entry naming `frame`; 1 if found. The completion path
+ * calls this before touching the frame's sinks; the winner of the claim owns
+ * the delivery. */
+static int rto_claim(void *frame) {
+    int found = 0;
+    EnterCriticalSection(&g_rto_lock);
+    zan_io_rto_t **pp = &g_rto;
+    while (*pp) {
+        if ((*pp)->frame == frame) {
+            zan_io_rto_t *e = *pp;
+            *pp = e->next;
+            free(e);
+            found = 1;
+            break;
+        }
+        pp = &(*pp)->next;
+    }
+    LeaveCriticalSection(&g_rto_lock);
+    return found;
+}
+
+/* Cap a backend wait at the earliest recv-to deadline (dns_wait_ms's twin), so
+ * a parked worker wakes in time to deliver it. */
+static long long rto_wait_ms(long long caller_ms) {
+    if (!g_rto) return caller_ms;
+    long long now = dns_now_ms();
+    long long nearest = -1;
+    EnterCriticalSection(&g_rto_lock);
+    for (zan_io_rto_t *e = g_rto; e; e = e->next)
+        if (nearest < 0 || e->due_ms < nearest) nearest = e->due_ms;
+    LeaveCriticalSection(&g_rto_lock);
+    if (nearest < 0) return caller_ms;
+    long long wait = nearest - now;
+    if (wait < 0) wait = 0;
+    if (caller_ms < 0) return wait;
+    return wait < caller_ms ? wait : caller_ms;
+}
+
+static int rto_timeout_scan(void) {
+    if (!g_rto) return 0;
+    int woke = 0;
+    long long now = dns_now_ms();
+    for (;;) {
+        zan_io_rto_t *e = NULL;
+        EnterCriticalSection(&g_rto_lock);
+        zan_io_rto_t **pp = &g_rto;
+        while (*pp) {
+            if ((*pp)->due_ms <= now) {
+                e = *pp;
+                *pp = e->next;
+                break;
+            }
+            pp = &(*pp)->next;
+        }
+        LeaveCriticalSection(&g_rto_lock);
+        if (!e) break;
+        /* The frame stays parked until we wake it below (the completion path
+         * can no longer claim: the entry is gone), so *out_n is safe to write. */
+        CancelIoEx((HANDLE)e->s, e->ov);   /* its late packet finds no entry: no wake */
+        if (e->out_n) *e->out_n = -1;
+        io_wake(e->frame, e->step);
+        free(e);
+        woke++;
+    }
+    return woke;
+}
+
+void zan_io_recv_to_co(intptr_t fd, void *buf, int32_t len, int64_t timeout_ms,
+                       void *frame, zan_co_step_t step, int64_t *out_n) {
+    zan_io_init();
+    if (g_io_broken) {
+        if (out_n) *out_n = 0;
+        if (step) zan_co_ready(frame, step);
+        return;
+    }
+    SOCKET s = (SOCKET)fd;
+    int skip = ensure_assoc(s);
+    (void)skip;
+    /* A negative or >INT_MAX length would wrap in the WSABUF cast and come
+     * back as WSAEINVAL -- reported as EOF. Reject it explicitly instead. */
+    if (len <= 0 || len > 0x7FFFFFF0) {
+        if (out_n) *out_n = 0;
+        if (step) zan_co_ready(frame, step);
+        return;
+    }
+    zan_io_op_t *op = op_alloc();
+    if (!op) {
+        if (out_n) *out_n = 0;   /* peer-close semantics, as for a hard error */
+        if (step) zan_co_ready(frame, step);
+        return;
+    }
+    op->sock = s;
+    op->interest = ZAN_IO_READ;
+    op->kind = ZAN_IO_OP_RECV;
+    op->rto = 1;
+    op->co = frame;
+    op->step = step;
+    op->out_n = out_n;
+    IO_CNT_INC();
+    /* The entry goes in BEFORE the WSARecv: from the moment the op can
+     * complete, a dequeue must find either the entry (recv wins) or its
+     * absence (deadline won) -- never a not-yet-armed deadline, which would
+     * make the completion skip the wake and park the frame forever. */
+    zan_io_rto_t *e = (zan_io_rto_t *)calloc(1, sizeof(*e));
+    if (e) {
+        e->s = s;
+        e->frame = frame;
+        e->step = step;
+        e->ov = &op->ov;
+        e->out_n = out_n;
+        e->due_ms = dns_now_ms() + (timeout_ms > 0 ? timeout_ms : 0);
+        rto_insert(e);
+    }
+    /* calloc failure: op->rto stays 1 but the scan can never fire -- degrade
+     * to an unbounded recv by clearing the flag (the op and sinks are all set,
+     * identical to the plain RecvOv shape). */
+    else op->rto = 0;
+
+    WSABUF b;
+    b.len = (ULONG)len;
+    b.buf = (char *)buf;
+    DWORD flags = 0, got = 0;
+    int r = WSARecv(s, &b, 1, &got, &flags, &op->ov, NULL);
+    IOTRACE("recv_to_co fd=%lld len=%d to=%lld op=%p -> r=%d got=%lu err=%d cnt=%d",
+            (long long)fd, len, (long long)timeout_ms, (void*)op, r,
+            (unsigned long)got, r ? WSAGetLastError() : 0, g_io_count);
+    if (r == 0) {
+#if defined(ZAN_CO_DRIVER)
+        if (skip) {
+            /* Immediate completion: the deadline can never win (we hold the
+             * data), so retire the entry claim-free and deliver inline. */
+            rto_claim(frame);
+            if (out_n) *out_n = (int64_t)got;
+            op_free(op);
+            IO_CNT_DEC();
+            InterlockedIncrement(&g_sync_inline);
+            if (step) zan_co_ready(frame, step);
+        }
+        return;
+#else
+        return;   /* single-thread reactor: packet still queued to the IOCP */
+#endif
+    }
+    int err = WSAGetLastError();
+    if (err == WSA_IO_PENDING) return;
+    /* Hard error: report 0 bytes (peer-close semantics) via a queued packet;
+     * its completion claims the entry, which also retires the deadline. */
+    if (out_n) *out_n = 0;
+#if defined(ZAN_CO_DRIVER)
+    if (!PostQueuedCompletionStatus(io_shard_of(s), 0, (ULONG_PTR)s, &op->ov)) {
+#else
+    if (!PostQueuedCompletionStatus(g_iocp, 0, (ULONG_PTR)s, &op->ov)) {
+#endif
+        /* Nothing will dequeue the packet: deliver inline like recv_co's
+         * failure path does, after retiring the deadline. */
+        rto_claim(frame);
+        if (step) zan_co_ready(frame, step);
+        op_free(op);
+        IO_CNT_DEC();
+    }
+}
+
 void zan_io_accept_co(intptr_t fd, void *frame, zan_co_step_t step,
                       intptr_t *out_fd) {
     zan_io_init();
@@ -2217,9 +2593,13 @@ static BOOL io_poll_any(OVERLAPPED_ENTRY *entries, ULONG cap, ULONG *removed,
 
 int32_t zan_io_poll(int64_t timeout_ms) {
     if (g_io_count == 0 && g_blocking_inflight == 0) return 0;
+    if (g_rto) {   /* recv-to deadlines: bound the overshoot to one turn */
+        int wr = rto_timeout_scan();
+        if (wr) return wr;
+    }
     OVERLAPPED_ENTRY entries[64];
     ULONG removed = 0;
-    int64_t wait = dns_wait_ms(timeout_ms);
+    int64_t wait = rto_wait_ms(dns_wait_ms(timeout_ms));
     DWORD to = (wait < 0) ? INFINITE : (DWORD)wait;
 #if defined(ZAN_CO_DRIVER)
     if (!io_poll_any(entries, 64, &removed, to)) {
@@ -2229,6 +2609,8 @@ int32_t zan_io_poll(int64_t timeout_ms) {
         IOTRACE("poll GQCS=0 err=%lu to=%lu cnt=%d", (unsigned long)GetLastError(), (unsigned long)to, g_io_count);
         int w = dns_timeout_scan();
         if (w) return w;
+        int wr = rto_timeout_scan();
+        if (wr) return wr;
         return dns_drain();
     }
     IOTRACE("poll removed=%lu cnt=%d", (unsigned long)removed, g_io_count);
@@ -2244,6 +2626,15 @@ int32_t zan_io_poll(int64_t timeout_ms) {
                                             zan_io_op_t, ov);
         void *co = op->co;
         zan_co_step_t step = op->step;
+        if (op->rto && !rto_claim(co)) {
+            /* The deadline won: the frame was already re-readied with -1 (and
+             * may since have completed and been freed) -- io_complete_op's
+             * *out_n write and the wake would both be a UAF. Recycle the op. */
+            IOTRACE("poll_op rto-late op=%p kind=%d", (void*)op, op->kind);
+            op_free(op);
+            g_io_count--;
+            continue;
+        }
         IOTRACE("poll_op op=%p kind=%d bytes=%lu status=%llu", (void*)op, op->kind, (unsigned long)entries[i].dwNumberOfBytesTransferred, (unsigned long long)entries[i].Internal);
         io_complete_op(op, entries[i].dwNumberOfBytesTransferred,
                        entries[i].Internal);
@@ -2293,6 +2684,7 @@ void zan_io_shutdown(void) {
     g_io_entries = NULL;
     g_io_count = 0;
     io_dead_clear();
+    while (g_rto) { zan_io_rto_t *e = g_rto; g_rto = e->next; free(e); }
     dns_shutdown_cleanup();
     if (g_dns_wake_fd >= 0) { close(g_dns_wake_fd); g_dns_wake_fd = -1; }
     if (g_dns_wake_wfd >= 0) { close(g_dns_wake_wfd); g_dns_wake_wfd = -1; }
@@ -2324,6 +2716,10 @@ static void io_register(intptr_t fd, int32_t interest, void *co, zan_co_step_t s
 
 int32_t zan_io_poll(int64_t timeout_ms) {
     if (g_io_dead) return io_flush_dead();
+    if (g_rto) {   /* recv-to deadlines: bound the overshoot to one turn */
+        int wr = rto_timeout_scan();
+        if (wr) return wr;
+    }
     if (g_io_count == 0 && g_blocking_inflight == 0) return 0;
 
     /* Every fd goes into an fd_set below, so a watcher whose socket has been
@@ -2359,7 +2755,7 @@ int32_t zan_io_poll(int64_t timeout_ms) {
         e = e->next;
     }
 
-    int64_t wait = dns_wait_ms(timeout_ms);
+    int64_t wait = rto_wait_ms(dns_wait_ms(timeout_ms));
     struct timeval tv;
     tv.tv_sec  = (long)(wait / 1000);
     tv.tv_usec = (long)((wait % 1000) * 1000);
@@ -2369,6 +2765,8 @@ int32_t zan_io_poll(int64_t timeout_ms) {
     if (n <= 0) {
         int w2 = dns_timeout_scan();
         if (w2) return w2;
+        int wr = rto_timeout_scan();
+        if (wr) return wr;
         return dns_drain();
     }
 
@@ -2392,11 +2790,43 @@ int32_t zan_io_poll(int64_t timeout_ms) {
             io_deliver_recv(cur);
             free(cur);
             g_io_count--;
+            rto_drop(co);   /* the recv won; retire its deadline */
             io_wake(co, step);
             woke++;
         } else {
             pp = &cur->next;
         }
+    }
+    return woke;
+}
+
+/* Deliver -1 for recv-to waiters whose fd never became readable in time
+ * (select-backend form: the watcher is a g_io_entries node, so the unlink is a
+ * plain list removal -- select rebuilds its fd_sets every poll). A watcher
+ * already gone means the entry is stale: drop it without touching the frame. */
+static int rto_timeout_scan(void) {
+    if (!g_rto) return 0;
+    int woke = 0;
+    long long now = dns_now_ms();
+    zan_io_rto_t **ep = &g_rto;
+    while (*ep) {
+        zan_io_rto_t *e = *ep;
+        if (e->due_ms > now) { ep = &e->next; continue; }
+        *ep = e->next;
+        zan_io_entry_t **pp = &g_io_entries;
+        while (*pp && !((*pp)->fd == e->fd && (*pp)->co == e->frame &&
+                        (*pp)->interest == ZAN_IO_READ))
+            pp = &(*pp)->next;
+        if (*pp) {
+            zan_io_entry_t *x = *pp;
+            *pp = x->next;
+            free(x);
+            g_io_count--;
+            if (e->out_n) *e->out_n = -1;
+            io_wake(e->frame, e->step);
+            woke++;
+        }
+        free(e);
     }
     return woke;
 }
@@ -2998,6 +3428,34 @@ void zan_io_recv_co(intptr_t fd, void *buf, int32_t len, void *frame,
         }
     }
 #endif
+    g_pending_rbuf = buf;
+    g_pending_rlen = len;
+    g_pending_out_n = out_n;
+    io_register(fd, ZAN_IO_READ, frame, step);
+}
+
+/* POSIX recv with a deadline (Socket.RecvToOv): same shape as zan_io_recv_co,
+ * plus a deadline entry (see the rto block near the top of this file) that the
+ * poll loop's scan delivers as *out_n = -1 if no data (and no EOF) arrives in
+ * time. Arming happens BEFORE io_register so a registration failure fails the
+ * waiter through io_mark_dead, whose hook retires the just-armed entry. */
+void zan_io_recv_to_co(intptr_t fd, void *buf, int32_t len, int64_t timeout_ms,
+                       void *frame, zan_co_step_t step, int64_t *out_n) {
+    zan_io_init();
+#if defined(MSG_DONTWAIT)
+    if (fd >= 0 && buf && len > 0 && out_n && g_io_fast_budget > 0) {
+        ssize_t rn = recv((int)fd, buf, (size_t)len, MSG_DONTWAIT);
+        int again = (rn < 0 && (errno == EAGAIN || errno == EWOULDBLOCK
+                               || errno == EINTR));
+        if (!again) {
+            g_io_fast_budget--;
+            *out_n = (rn < 0) ? 0 : (int64_t)rn;
+            io_wake(frame, step);
+            return;
+        }
+    }
+#endif
+    rto_arm((int)fd, frame, step, out_n, timeout_ms);
     g_pending_rbuf = buf;
     g_pending_rlen = len;
     g_pending_out_n = out_n;
@@ -3853,6 +4311,7 @@ static void co_wait_io(zan_co_worker_t *w, long long timeout_ms) {
          * lost wake packet (the single-threaded path did the same, the
          * multi-worker one did not -- A285). */
         dns_timeout_scan();
+        rto_timeout_scan();   /* recv-to deadlines past their due */
         dns_drain();
         return;
     }
@@ -3871,6 +4330,15 @@ static void co_wait_io(zan_co_worker_t *w, long long timeout_ms) {
                                             zan_io_op_t, ov);
         void *co = op->co;
         zan_co_step_t step = op->step;
+        if (op->rto && !rto_claim(co)) {
+            /* The deadline won: the frame was already re-readied with -1 (and
+             * may since have completed and been freed) -- io_complete_op's
+             * *out_n write and the wake would both be a UAF. Recycle the op. */
+            IOTRACE("poll_op rto-late op=%p kind=%d", (void*)op, op->kind);
+            op_free(op);
+            IO_CNT_DEC();
+            continue;
+        }
         IOTRACE("poll_op op=%p kind=%d bytes=%lu status=%llu", (void*)op, op->kind, (unsigned long)entries[i].dwNumberOfBytesTransferred, (unsigned long long)entries[i].Internal);
         io_complete_op(op, entries[i].dwNumberOfBytesTransferred,
                        entries[i].Internal);
@@ -3967,6 +4435,13 @@ static void co_worker(int worker) {
         if (g_blocking_inflight > 0) {
             long long dw = dns_wait_ms(-1);
             if (dw >= 0 && dw < to) to = dw;
+        }
+        /* A parked recv-to deadline must wake the worker at its due time or
+        * the timeout deliverer only runs on some other turn (rto_wait_ms is
+        * rto_timeout_scan's dns_wait_ms twin). */
+        {
+            long long rw = rto_wait_ms(-1);
+            if (rw >= 0 && rw < to) to = rw;
         }
         /* Publish the parked state before the final scan. A producer that
          * pushes first is found by the scan; one that pushes afterward

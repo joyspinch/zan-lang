@@ -183,7 +183,8 @@ class Socket {
 
     // POSIX errno：bionic 导出 __errno()，glibc/musl 导出 __errno_location()，
     // Darwin 导出 __error()，都返回 int*。ANDROID 也定义 LINUX，
-    // 所以安卓分支必须排在 LINUX 之前。
+    // 所以安卓分支必须排在 LINUX 之前。WASI 用 wasi-libc 的
+    // __errno_location（musl 同源）。
     #if ANDROID
     [DllImport("crt", EntryPoint = "__errno")]
     static extern nint NativeErrnoLocation();
@@ -192,6 +193,9 @@ class Socket {
     static extern nint NativeErrnoLocation();
     #elif MACOS
     [DllImport("crt", EntryPoint = "__error")]
+    static extern nint NativeErrnoLocation();
+    #elif WASI
+    [DllImport("crt", EntryPoint = "__errno_location")]
     static extern nint NativeErrnoLocation();
     #endif
 
@@ -220,7 +224,66 @@ class Socket {
     static int SysRecvFrom(nint s, string buf, int len, int flags, string from, string fromlen) {
         return recvfrom((int)s, buf, len, flags, from, fromlen);
     }
+    #elif WASI
+    // wasm32（WASI）：没有套接字系统调用，全部退"失败"桩（-1），
+    // 与 zanrt_syncw.o 的运行时桩同一姿态——wasm 上套接字不存在，
+    // GUI 程序引用这些符号只为编译通过，真调用者先撞 zan_io_* 桩。
+    static int SysClose(nint s) { return -1; }
+    static int SysShutdown(nint s, int how) { return -1; }
+    static int SysBind(nint s, string addr, int addrlen) { return -1; }
+    static int SysListen(nint s, int backlog) { return -1; }
+    static nint SysAccept(nint s, string addr, string addrlen) { return -1; }
+    static int SysConnect(nint s, string addr, int addrlen) { return -1; }
+    static int SysSetSockOpt(nint s, int level, int optname, string optval, int optlen) {
+        return -1;
+    }
+    static int SysSendTo(nint s, string buf, int len, int flags, string to, int tolen) {
+        return -1;
+    }
+    static int SysRecvFrom(nint s, string buf, int len, int flags, string from, string fromlen) {
+        return -1;
+    }
     #endif
+
+    // wasm32（WASI）：wasi-libc 有 htons（libc.a），inet_addr 没有——
+    // 语义由下面的纯 Zan InetAddr 顶替。POSIX/Windows 用原生版本。
+    #if WASI
+    [DllImport("crt")]
+    static extern ushort htons(ushort hostshort);
+    #endif
+
+    /// 纯 Zan 的 inet_addr（点分 IPv4 → 网络字节序整数，第一段在
+    /// 低字节；失败返回 -1）。wasi-libc 不导出 inet_addr，wasm32 走
+    /// 这里；其他平台转发原生 inet_addr。255.255.255.255 按 inet_addr
+    /// 惯例也返回 -1，调用方自行特判。
+    static int InetAddr(string cp) {
+        #if WASI
+        int value = 0;
+        int part = 0;
+        int count = 0;
+        int i = 0;
+        while (i < cp.Length) {
+            string ch = cp.Substring(i, 1);
+            if (ch == ".") {
+                if (part > 255) { return -1; }
+                value = value | (part << (count * 8));
+                count = count + 1;
+                part = 0;
+                if (count > 3) { return -1; }
+            } else if (ch >= "0" && ch <= "9") {
+                part = part * 10 + (int)ch[0] - 48;
+                if (part > 255) { return -1; }
+            } else {
+                return -1;
+            }
+            i = i + 1;
+        }
+        if (count != 3 || part > 255) { return -1; }
+        return value | (part << 24);
+        #else
+        return inet_addr(cp);
+        #endif
+    }
 
     // 主机名解析由运行时提供（rt_io.c），三个平台都有；
     // 曾经只声明在 WINDOWS 分支里，于是 ResolveIpv4/ResolveHostName
@@ -308,17 +371,24 @@ class Socket {
         #endif
     }
 
-    /// <summary>创建 TCP 套接字。</summary>
+    /// <summary>创建 TCP 套接字。wasm32 无套接字：恒失败。</summary>
     static nint CreateTcp() {
+        #if WASI
+        return -1;
+        #else
         nint s = socket(2, 1, 6);
         if (s < 0) { Socket.CaptureLastError(); }
         return s;
+        #endif
     }
 
     /// <summary>创建 IPv6 TCP 套接字（AF_INET6）。IPv6 连接
     /// 也可用 IPv4 套接字配 ::ffff: 映射地址，但原生 v6 套接字
     /// 才能直接绑定/监听 [::1] 这类纯 v6 地址。</summary>
     static nint CreateTcp6() {
+        #if WASI
+        return -1;
+        #else
         // AF_INET6 的平台常量不同：Windows 23（winsock2），
         // POSIX 10。
         #if WINDOWS
@@ -328,17 +398,25 @@ class Socket {
         #endif
         if (s < 0) { Socket.CaptureLastError(); }
         return s;
+        #endif
     }
 
-    /// <summary>创建 UDP 套接字。</summary>
+    /// <summary>创建 UDP 套接字。wasm32 无套接字：恒失败。</summary>
     static nint CreateUdp() {
+        #if WASI
+        return -1;
+        #else
         nint s = socket(2, 2, 17);
         if (s < 0) { Socket.CaptureLastError(); }
         return s;
+        #endif
     }
 
-    /// <summary>创建 IPv6 UDP 套接字（AF_INET6）。</summary>
+    /// <summary>创建 IPv6 UDP 套接字（AF_INET6）。wasm32 恒失败。</summary>
     static nint CreateUdp6() {
+        #if WASI
+        return -1;
+        #else
         #if WINDOWS
         nint s = socket(23, 2, 17);
         #else
@@ -346,6 +424,7 @@ class Socket {
         #endif
         if (s < 0) { Socket.CaptureLastError(); }
         return s;
+        #endif
     }
 
     /// <summary>关闭套接字。</summary>
@@ -371,9 +450,11 @@ class Socket {
         #endif
     }
 
-    /// <summary>将套接字设为非阻塞模式。</summary>
+    /// <summary>将套接字设为非阻塞模式。wasm32（WASI）没有
+    /// fcntl/ioctlsocket：一律报"已是阻塞模型失败"（返回 -1），
+    /// GUI 程序引用此符号只是超时管道、从不开真套接字。</summary>
     static int SetNonBlocking(nint sock) {
-        int rc;
+        int rc = -1;
         #if WINDOWS
         byte[] argp = new byte[4];
         argp[0] = 1;
@@ -470,7 +551,7 @@ class Socket {
     static bool IsNumericHost(string ip) {
         if (ip == "") { return false; }
         if (ip.IndexOf(":") >= 0) { return true; }
-        if (inet_addr(ip) != 0 - 1) { return true; }
+        if (InetAddr(ip) != 0 - 1) { return true; }
         return ip == "255.255.255.255";
     }
 
@@ -512,6 +593,11 @@ class Socket {
     /// 数，失败返回 0；解析失败绝不伪造 0.0.0.0。</summary>
     static async int ResolveAllAsync(string host, int port, byte[] records) {
         if (host == "" || records == null || records.Length < 32) { return 0; }
+        #if WASI
+        // wasm32：await 直接 extern 被编译器拒绝，且 zanrt_syncw.o 的
+        // 桩本来就是同步失败——直接退桩，不进协程。
+        return 0;
+        #else
         // Convert managed values to stable raw addresses before crossing the
         // async boundary. The frame retains host and records while the worker
         // writes only within this caller-owned buffer.
@@ -521,6 +607,7 @@ class Socket {
                                                     records.Length);
         if (n <= 0) { return 0; }
         return (int)n;
+        #endif
     }
 
     /// 返回 sockaddr 记录的地址族常量（平台原生值）。
@@ -552,6 +639,11 @@ class Socket {
     /// 二进制地址给 runtime，不会再次按主机名解析。</summary>
     static async int ConnectSockAddrAsync(nint sock, byte[] record, int len,
                                           int timeoutMs) {
+        #if WASI
+        // wasm32：await 直接 extern 被编译器拒绝；连接本就不可能
+        // 成功，直接报失败（-1）。
+        return -1;
+        #else
         nint p = (nint)record;
         // The exact-connect ABI performs the nonblocking connect and waits on a
         // worker. It receives only the binary sockaddr; hostname resolution is
@@ -559,6 +651,7 @@ class Socket {
         // overall candidate deadline (the native wait itself has no deadline).
         long r = await Socket.NativeConnectSockAddr(sock, p, len, timeoutMs);
         return (int)r;
+        #endif
     }
 
     /// <summary>从已解析的 IPv4 整数地址构建 sockaddr_in（字节序与
@@ -670,7 +763,7 @@ class Socket {
         if (ip == "0.0.0.0" || ip == "") {
             return 0;
         }
-        int ipAddr = inet_addr(ip);
+        int ipAddr = InetAddr(ip);
         if (ipAddr == 0 - 1) {
             ipAddr = await Socket.ResolveAsync(ip);
         }
@@ -798,34 +891,25 @@ class Socket {
     /// 没有数据到达时返回空串（用 LastRecvTimedOut 与对端关闭区分）。
     /// 非正超时表示"不设截止时间"，转而使用 reactor 驱动的重载。
     ///
-    /// 用零超时的 select() 轮询可读性，而不是等 reactor 唤醒：唤醒
-    /// 无法取消，所以对一个接受了连接却永不回话的对端，不带截止
-    /// 时间的接收会永远挂起。</summary>
+    /// RecvToOv 把真正的接收与截止时间一起交给 reactor 竞速：谁先到
+    /// 谁交付（数据/对端关闭交付字节数，超时交付 -1），接收胜出时
+    /// reactor 自己撤掉截止时间，超时胜出时撤掉在途接收。纯事件驱动
+    /// ——挂起的协程不再按 1→16ms 周期生成轮询帧，高并发突发下就绪
+    /// 队列不再被灌爆（A268(b) 停摆悬崖的根修）。</summary>
     static async string RecvAsync(nint sock, int bufSize, int timeoutMs) {
         if (timeoutMs <= 0) {
             string plain = await Socket.RecvAsync(sock, bufSize);
             return plain;
         }
-        Socket.MarkRecvTimeout(false);
-        long deadlineUs = NativeMonotonicUs() + timeoutMs * 1000;
-        int stepMs = 1;
-        while (true) {
-            if (Socket.IsReadable(sock)) {
-                byte[] buf = new byte[bufSize + 1];
-                int n = (int)ReactorRecv(sock, buf, bufSize, 0);
-                if (n > 0) { return buf.ToStr(0, n); }
-                // 0 是对端关闭；负数是"会阻塞"或错误——套接字还活着
-                // 就继续等，否则按对端关闭处理。
-                if (n == 0 || !Socket.IsOpen(sock)) { return ""; }
-            }
-            if (NativeMonotonicUs() >= deadlineUs) {
-                Socket.MarkRecvTimeout(true);
-                return "";
-            }
-            await Task.Delay(stepMs);
-            if (stepMs < 16) { stepMs = stepMs * 2; }
+        byte[] buf = new byte[bufSize + 1];
+        int n = await Socket.RecvToOv(sock, buf, bufSize, timeoutMs);
+        if (n < 0) {
+            // 截止时间到了：撤收。-1 只在超时分支出现，不会混入 0（对端关闭）。
+            Socket.MarkRecvTimeout(true);
+            return "";
         }
-        return "";
+        Socket.MarkRecvTimeout(false);
+        return buf.ToStr(0, n);
     }
 
     /// <summary>本协程最近一次带超时的接收是因超时放弃、而非对端
@@ -1060,7 +1144,7 @@ class Socket {
     /// 解析失败返回 -1（255.255.255.255 例外，inet_addr 对它返回 -1
     /// 但它是合法地址）。
     static long Ipv4ToLong(string ip) {
-        int address = inet_addr(ip);
+        int address = InetAddr(ip);
         if (address == 0 - 1 && ip != "255.255.255.255") { return -1; }
         return (long)(address & 255) * 16777216
             + (long)((address >> 8) & 255) * 65536

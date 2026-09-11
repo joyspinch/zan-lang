@@ -149,6 +149,17 @@ void zan_io_wait_co(intptr_t fd, int32_t interest, void *frame, zan_co_step_t st
 void zan_io_recv_co(intptr_t fd, void *buf, int32_t len, void *frame,
                     zan_co_step_t step, int64_t *out_n);
 
+/* Overlapped receive with a deadline: like zan_io_recv_co, but the await also
+ * carries `timeout_ms`. Data (or a peer close) delivers the byte count exactly
+ * as zan_io_recv_co does; if the deadline passes first, *out_n is set to -1
+ * and the frame is re-readied (0 stays reserved for peer close). The deadline
+ * is enforced by the reactor itself -- a deadline registry scanned at every
+ * poll turn -- not by the timer heap, so no timer entry can outlive the recv
+ * and no recv/timer cancel race exists: whichever arm arrives first retires
+ * the other before waking the frame. */
+void zan_io_recv_to_co(intptr_t fd, void *buf, int32_t len, int64_t timeout_ms,
+                       void *frame, zan_co_step_t step, int64_t *out_n);
+
 /* Overlapped accept: post AcceptEx for listener `fd` and suspend `frame`
  * until a connection completes. The accepted socket is stored in `*out_fd`,
  * or -1 when the operation cannot be posted or completed. */
