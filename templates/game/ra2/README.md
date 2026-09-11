@@ -160,6 +160,7 @@ cd 仓库根目录
   templates/game/ra2/src/game/*.zan \
   templates/game/ra2/src/formats/*.zan \
   templates/game/ra2/src/Assets/*.zan \
+  templates/game/ra2/src/render/RenderShim.zan \
   --auto-stdlib -o build/winchain.exe
 ./build/winchain.exe   # 输出 winchain ok,否则逐项列 FAIL 并返回非零
 ```

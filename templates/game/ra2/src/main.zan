@@ -2574,7 +2574,6 @@ class Ra2Loop : IGuiHostLoop {
             theater = Theater.Load(this.vfs, this.db, this.map.Theater());
             this.terrain = MapRenderer.Create(this.map.Terrain(), theater);
             this.terrain.SetTerrain(this.map);
-            this.terrain.SetSmudges(this.map);
             // A fresh game: an empty world over the map's terrain, the
             // player's side, and the starter base. The bases sit on the
             // map's own waypoints -- the old hardcoded (1,2) is outside
@@ -4056,6 +4055,105 @@ class Ra2Loop : IGuiHostLoop {
                         Console.WriteLine("selftest FAIL deployseq: a"
                             + " Deployer must sit through the Deploy"
                             + " block and pack through Undeploy");
+                    }
+                    // Smudges: the ground scars a blast leaves. The table
+                    // must parse from the install's [SmudgeTypes], the art
+                    // flags must read off the animation sections (TWLT070
+                    // is crater+scorch, S_CLSN16 crater-only), a placed
+                    // decal must land in the world list, and a crater bite
+                    // must strip its bails off a tiberium pile. The live
+                    // window then waits for the war itself to leave one --
+                    // S_CLSN/AP fire on every rush, so eligible ground
+                    // gets hit fast.
+                    int smOk = 1;
+                    int smRegs = this.world.Rules().SmudgeRegCount();
+                    int smTwlt = this.world.Rules().AnimArtFlags("TWLT070");
+                    int smClsn = this.world.Rules().AnimArtFlags("S_CLSN16");
+                    int smC12 = this.world.Rules().SmudgeRegIndex("CRATER12");
+                    int smB03 = this.world.Rules().SmudgeRegIndex("BURNT03");
+                    Console.WriteLine("selftest smudge regs="
+                        + Convert.ToString(smRegs)
+                        + " twlt=" + Convert.ToString(smTwlt)
+                        + " clsn=" + Convert.ToString(smClsn)
+                        + " c12=" + Convert.ToString(smC12)
+                        + " b03=" + Convert.ToString(smB03));
+                    if (smRegs <= 0 || (smTwlt & 1) == 0 || (smTwlt & 2) == 0
+                     || (smClsn & 1) == 0 || (smClsn & 2) != 0 || smC12 < 0
+                     || smB03 < 0) {
+                        smOk = 0;
+                    }
+                    if (smOk == 1 && (this.world.Rules().SmudgeCraterAt(smC12) != true
+                     || this.world.Rules().SmudgeBurnAt(smC12) == true
+                     || this.world.Rules().SmudgeWidthAt(smC12) != 2
+                     || this.world.Rules().SmudgeHeightAt(smC12) != 2
+                     || this.world.Rules().SmudgeBurnAt(smB03) != true
+                     || this.world.Rules().SmudgeCraterAt(smB03) == true)) {
+                        smOk = 0;
+                    }
+                    // A deterministic placement: find one eligible cell,
+                    // fire a crater-bearing blast's decal at it, and the
+                    // world list must grow by exactly one reg.
+                    int smX2 = 0 - 1;
+                    int smY2 = 0 - 1;
+                    int w2 = this.world.Width();
+                    int h2 = this.world.Height();
+                    for (int sy = 8; sy < h2 - 8 && smX2 < 0; sy = sy + 1) {
+                        for (int sx = 8; sx < w2 - 8; sx = sx + 1) {
+                            if (this.world.SmudgeCanLand(sx, sy)) {
+                                smX2 = sx;
+                                smY2 = sy;
+                                break;
+                            }
+                        }
+                    }
+                    int smBefore = this.world.SmudgeCount();
+                    string smPlaced = "";
+                    if (smOk == 1 && smX2 >= 0) {
+                        this.world.SpawnSmudge("TWLT070", smX2, smY2);
+                        if (this.world.SmudgeCount() == smBefore + 1) {
+                            smPlaced = this.world.SmudgeNameAt(smBefore);
+                        }
+                    }
+                    // The ore bite: seed a pile, let an S_CLSN blast strip
+                    // its fixed 6, then a rolled blast take 1..6 more.
+                    int smOre = 0 - 1;
+                    if (smOk == 1 && smX2 >= 0) {
+                        int smOv = 0 - 1;
+                        for (int i = 0; i < 255; i = i + 1) {
+                            if (this.world.Rules().IsTiberiumOverlay(i)) {
+                                smOv = i;
+                                break;
+                            }
+                        }
+                        if (smOv >= 0) {
+                            this.world.SetOre(smX2, smY2, 9, 1, smOv);
+                            this.world.DestroyOre("S_CLSN16", smX2, smY2);
+                            int afterFixed = this.world.OreAt(smX2, smY2);
+                            this.world.DestroyOre("TWLT070", smX2, smY2);
+                            int afterRoll = this.world.OreAt(smX2, smY2);
+                            smOre = afterFixed == 3 && afterRoll >= 0
+                                 && afterRoll <= 2 ? 1 : 0;
+                        }
+                    }
+                    // Live wiring: the running battle must eventually mark
+                    // the ground on its own.
+                    int smLive = 0;
+                    int smLive0 = this.world.SmudgeCount();
+                    for (int t8 = 0; t8 < 1500 && smLive == 0; t8 = t8 + 1) {
+                        this.world.Tick();
+                        if (this.world.SmudgeCount() > smLive0) { smLive = 1; }
+                    }
+                    Console.WriteLine("selftest smudge place="
+                        + (smPlaced.Length > 0 ? 1 : 0)
+                        + " reg=" + smPlaced
+                        + " ore=" + Convert.ToString(smOre)
+                        + " live=" + Convert.ToString(smLive)
+                        + " total=" + Convert.ToString(this.world.SmudgeCount()));
+                    if (smOk != 1 || smPlaced.Length == 0 || smOre != 1
+                     || smLive != 1) {
+                        Console.WriteLine("selftest FAIL smudge: a blast"
+                            + " must scar clear ground and bite the ore"
+                            + " it lands on");
                     }
                     // Building idle anims: every finished structure whose
                     // art ships IdleAnim must have its loop live (the

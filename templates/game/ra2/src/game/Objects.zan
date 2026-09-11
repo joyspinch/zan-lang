@@ -1439,28 +1439,6 @@ class World {
         w.tibTreeX = new List<int>();
         w.tibTreeY = new List<int>();
         w.tibTreeCd = new List<int>();
-        w.hasTerrain = new byte[w.width * w.height];
-        w.segSlot = new List<int>();
-        w.segVal = new List<int>();
-        w.segId = new List<int>();
-        w.oreOv = new int[w.width * w.height];
-        w.statOv = new int[w.width * w.height];
-        w.statData = new int[w.width * w.height];
-        w.brOv = new int[w.width * w.height];
-        w.brHp = new int[w.width * w.height];
-        w.brData = new int[w.width * w.height];
-        for (int i = 0; i < w.oreOv.Length; i = i + 1) {
-            w.oreOv[i] = 0 - 1;
-            w.statOv[i] = 0 - 1;
-            w.statData[i] = 0;
-            w.brOv[i] = 0 - 1;
-            w.brHp[i] = 0;
-            w.brData[i] = 0;
-        }
-        w.brAnchors = new List<int>();
-        w.tibTreeX = new List<int>();
-        w.tibTreeY = new List<int>();
-        w.tibTreeCd = new List<int>();
         w.tibTreeCd0 = new List<int>();
         w.hasTerrain = new byte[w.width * w.height];
         w.segSlot = new List<int>();
@@ -1487,19 +1465,127 @@ class World {
     /// <summary>Records one map smudge decal. The name is the rules' own reg
     /// (CRATER07, BURNT02); the renderer resolves the art from it. Out-of-
     /// range cells are dropped: a map's smudge list occasionally names a cell
-    /// past the playable diamond.</summary>
+    /// past the playable diamond. Explosions append here too -- a decal is
+    /// the same thing whether the map shipped it or a shell just made it --
+    /// and the version bump is what tells the terrain layer to bake it in.</summary>
     void AddSmudge(string name, int x, int y) {
         if (name == null || name.Length == 0) { return; }
         if (!this.InBounds(x, y)) { return; }
         this.smudgeName.Add(name);
         this.smudgeX.Add(x);
         this.smudgeY.Add(y);
+        this.oreVersion = this.oreVersion + 1;
     }
 
     int SmudgeCount() { return this.smudgeName.Count; }
     string SmudgeNameAt(int i) { return this.smudgeName[i]; }
     int SmudgeXAt(int i) { return this.smudgeX[i]; }
     int SmudgeYAt(int i) { return this.smudgeY[i]; }
+
+    // Deterministic picks for the smudge roll (which valid reg a blast
+    // leaves, how many ore bails a crater bites). The reference rolls its
+    // game RNG (generateRandomInt); this port keeps every match
+    // reproducible for the selftest, so the roll hashes a salt that
+    // advances with each call -- a different result every call, the same
+    // sequence every run.
+    int smudgeSalt;
+
+    int WorldRand(int n) {
+        if (n <= 1) { return 0; }
+        double h = (this.smudgeSalt * 0.1031 + this.worldTick * 0.0618)
+                   * 43758.5453;
+        h = h - Math.Floor(h);
+        this.smudgeSalt = this.smudgeSalt + 1;
+        int v = (int)(h * n);
+        if (v < 0) { v = 0; }
+        if (v >= n) { v = n - 1; }
+        return v;
+    }
+
+    /// <summary>Whether a blast on this cell would scar the ground -- the
+    /// reference's AnimTerrainEffect.spawnSmudges preconditions: Clear land
+    /// only, flat (ramp 0), inside the bounds, and no non-unit object on
+    /// the tile. Infantry and vehicles do not block -- the original drops
+    /// the crater right under them -- but scenery, walls, every overlay
+    /// (bridges, ore) and structures do.</summary>
+    bool SmudgeCanLand(int x, int y) {
+        if (!this.InBounds(x, y)) { return false; }
+        IsoTile t = this.iso.At(x, y);
+        if (t == null) { return false; }
+        LandType lt = this.CellLand(t);
+        if (lt == null || lt.Value() != LandType.Clear()) { return false; }
+        if (this.CellRampAt(x, y) != 0) { return false; }
+        if (this.HasMapTerrain(x, y)) { return false; }
+        int slot = this.CellSlot(x, y);
+        if (this.IsWallCell(x, y)) { return false; }
+        if (this.statOv[slot] >= 0 || this.brOv[slot] >= 0) { return false; }
+        if (this.OreAt(x, y) > 0) { return false; }
+        int occ = this.OccupantAt(x, y);
+        if (occ >= 0 && this.objects[occ].Kind() == ObjKind.Structure()) {
+            return false;
+        }
+        return true;
+    }
+
+    /// <summary>The reference's AnimTerrainEffect.spawnSmudges: when the
+    /// blast's animation art carries Crater=, roll which smudge reg the
+    /// ground takes. Crater regs match the art's crater size (2x2 when
+    /// ForceBigCraters=, else 1x1); when the art is also Scorch=, the burn
+    /// regs join the pick; a Width=/Height= oversized reg needs a southern
+    /// neighbour ring to sit on. One random match wins and becomes a decal.</summary>
+    void SpawnSmudge(string animName, int x, int y) {
+        Rules rules = this.Rules();
+        if (rules == null || rules.SmudgeRegCount() == 0) { return; }
+        if (!this.SmudgeCanLand(x, y)) { return; }
+        int flags = rules.AnimArtFlags(animName);
+        if ((flags & 1) == 0) { return; }
+        int craterSize = (flags & 4) != 0 ? 2 : 1;
+        bool isScorch = (flags & 2) != 0;
+        bool hasNeighbors = this.InBounds(x - 1, y + 1)
+            && this.InBounds(x, y + 1) && this.InBounds(x + 1, y + 1);
+        List<int> valid = new List<int>();
+        for (int i = 0; i < rules.SmudgeRegCount(); i = i + 1) {
+            bool crater = rules.SmudgeCraterAt(i)
+                && rules.SmudgeWidthAt(i) == craterSize
+                && rules.SmudgeHeightAt(i) == craterSize;
+            bool burn = isScorch && rules.SmudgeBurnAt(i);
+            if (!crater && !burn) { continue; }
+            if ((rules.SmudgeWidthAt(i) > 1 || rules.SmudgeHeightAt(i) > 1)
+             && !hasNeighbors) {
+                continue;
+            }
+            valid.Add(i);
+        }
+        if (valid.Count == 0) { return; }
+        string pick = rules.SmudgeRegAt(valid[this.WorldRand(valid.Count)]);
+        this.AddSmudge(pick, x, y);
+    }
+
+    /// <summary>The reference's AnimTerrainEffect.destroyOre: a crater
+    /// bite takes half the tiberium pile it lands on -- bailCount is
+    /// ceil(maxBails / 2) = 6 of the TiberiumTrait's 11; the S_CLSN blasts
+    /// strip that whole bite, every other blast rolls 1..6. An emptied
+    /// pile unspawns (SetOre with amount 0).</summary>
+    void DestroyOre(string animName, int x, int y) {
+        int amt = this.OreAt(x, y);
+        if (amt <= 0) { return; }
+        Rules rules = this.Rules();
+        int ov = this.OreOvAt(x, y);
+        if (rules == null || ov < 0 || !rules.IsTiberiumOverlay(ov)) { return; }
+        if ((rules.AnimArtFlags(animName) & 1) == 0) { return; }
+        string upper = animName != null ? animName.ToUpper() : "";
+        string clsn = "S_CLSN";
+        bool fixedBite = upper.Length >= clsn.Length;
+        for (int i = 0; fixedBite && i < clsn.Length; i = i + 1) {
+            if (upper[i] != clsn[i]) { fixedBite = false; }
+        }
+        int take = fixedBite ? 6 : 1 + this.WorldRand(6);
+        int val = this.OreValueAt(x, y);
+        int left = amt - take;
+        if (left < 0) { left = 0; }
+        this.SetOre(x, y, left, val, ov);
+    }
+
     StructureCatalog Catalog() { return this.catalog; }
     UnitCatalog Units() { return this.units; }
     Rules Rules() { return this.units.Rules(); }
@@ -4089,6 +4175,16 @@ class World {
         }
         if (anim == null) { anim = this.PickWarheadAnim(w); }
         if (anim != null) { this.SpawnAnim(anim, p.ax, p.ay); }
+        // The ground zone bite (Warhead.detonate -> AnimTerrainEffect): a
+        // crater-bearing blast first tears up the tiberium it lands on,
+        // then leaves its decal. The reference's other call here -- the
+        // area-effect smudge -- is undefined at every shipped detonation
+        // site, so the animation's own Crater=/Scorch= art is what drives
+        // the pick, exactly as shipped. Water takes neither.
+        if (anim != null && !this.IsWater(this.iso.At(gx, gy))) {
+            this.DestroyOre(anim, gx, gy);
+            this.SpawnSmudge(anim, gx, gy);
+        }
     }
 
     /// <summary>The warhead's impact anim for the damage tier: the

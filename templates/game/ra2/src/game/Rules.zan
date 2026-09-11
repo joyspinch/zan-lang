@@ -698,6 +698,23 @@ class Rules {
     // plane's byte values index into. The GEM* entries are RA2's ore fields.
     List<string> overlayTypes;
 
+    // The [SmudgeTypes] table: the decal regs a blast can leave on the
+    // ground (craters, burn marks), in rules order. Each reg's own section
+    // carries the facts the reference's SmudgeRules parses -- Burn=, Crater=,
+    // Width= and Height= (both default 1) -- read here into parallel lists.
+    List<string> smudgeTypes;
+    List<int> smudgeBurn;
+    List<int> smudgeCrater;
+    List<int> smudgeWidth;
+    List<int> smudgeHeight;
+
+    // Art flag lookups for the impact animations (the reference reads
+    // Crater=/Scorch=/ForceBigCraters= off each animation's art section).
+    // Animations repeat every shot, so the parse caches: names seen and
+    // their bits -- 1 crater, 2 scorch, 4 force-big-craters.
+    List<string> animFlagNames;
+    List<int> animFlagBits;
+
     // Ore regrowth, the shipped [General] TiberiumGrows / TiberiumSpreads /
     // GrowthRate keys: whether fields richen and spread, and how many
     // minutes pass between growth passes.
@@ -819,6 +836,74 @@ class Rules {
     // The [CombatDamage] BridgeStrength: every bridge piece's hit points
     // (1500 shipped). A field default so the transcribed rules stand alone.
     int bridgeStrength;
+
+    /// <summary>How many smudge regs the [SmudgeTypes] table holds.</summary>
+    int SmudgeRegCount() { return this.smudgeTypes == null ? 0 : this.smudgeTypes.Count; }
+
+    /// <summary>The smudge reg name at an index, uppercased at parse.</summary>
+    string SmudgeRegAt(int idx) {
+        if (idx < 0 || idx >= this.SmudgeRegCount()) { return ""; }
+        return this.smudgeTypes[idx];
+    }
+
+    bool SmudgeBurnAt(int idx) {
+        return idx >= 0 && idx < this.SmudgeRegCount() && this.smudgeBurn[idx] == 1;
+    }
+
+    bool SmudgeCraterAt(int idx) {
+        return idx >= 0 && idx < this.SmudgeRegCount() && this.smudgeCrater[idx] == 1;
+    }
+
+    int SmudgeWidthAt(int idx) {
+        return idx >= 0 && idx < this.SmudgeRegCount() ? this.smudgeWidth[idx] : 1;
+    }
+
+    int SmudgeHeightAt(int idx) {
+        return idx >= 0 && idx < this.SmudgeRegCount() ? this.smudgeHeight[idx] : 1;
+    }
+
+    /// <summary>The smudge reg index for a name -- "CRATER12" -> its
+    /// [SmudgeTypes] slot -- or -1 when the table carries no such reg.</summary>
+    int SmudgeRegIndex(string name) {
+        if (name == null || name.Length == 0) { return 0 - 1; }
+        string key = name.ToUpper();
+        for (int i = 0; i < this.SmudgeRegCount(); i = i + 1) {
+            if (this.smudgeTypes[i] == key) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    /// <summary>An impact animation's art flags: bit 0 the Crater= decal
+    /// gate, bit 1 Scorch= (burn regs join the crater pick), bit 2
+    /// ForceBigCraters= (the 2x2 crater size). The reference reads the same
+    /// three off the animation's art section (ObjectArt.ts:230-232); a
+    /// section that does not exist carries none. Parsed once per name --
+    /// blasts repeat every shot.</summary>
+    int AnimArtFlags(string name) {
+        if (name == null || name.Length == 0) { return 0; }
+        string key = name.ToUpper();
+        if (this.animFlagNames != null) {
+            for (int i = 0; i < this.animFlagNames.Count; i = i + 1) {
+                if (this.animFlagNames[i] == key) { return this.animFlagBits[i]; }
+            }
+        }
+        int bits = 0;
+        if (this.artIni != null) {
+            IniSection sec = this.artIni.Section(key);
+            if (sec != null) {
+                if (Rules.YesNo(sec.GetOr("Crater", "no"))) { bits = bits + 1; }
+                if (Rules.YesNo(sec.GetOr("Scorch", "no"))) { bits = bits + 2; }
+                if (Rules.YesNo(sec.GetOr("ForceBigCraters", "no"))) { bits = bits + 4; }
+            }
+        }
+        if (this.animFlagNames == null) {
+            this.animFlagNames = new List<string>();
+            this.animFlagBits = new List<int>();
+        }
+        this.animFlagNames.Add(key);
+        this.animFlagBits.Add(bits);
+        return bits;
+    }
 
     /// <summary>Whether a map overlay index carries tiberium: a GEM name,
     /// or its own section declares Tiberium=yes. Unknown indices never
@@ -2508,6 +2593,36 @@ class Rules {
                 }
                 if (semi >= 0) { name = name.Substring(0, semi).Trim(); }
                 this.overlayTypes.Add(name);
+            }
+        }
+        // The smudge table: numbered keys like OverlayTypes, and each reg's
+        // own section (the same ini) carries Burn=/Crater=/Width=/Height=.
+        // The section lookup is exact-match, so the reg name uppercases
+        // first -- the shipped sections are all caps.
+        IniSection smt = ini.Section("SmudgeTypes");
+        if (smt != null) {
+            this.smudgeTypes = new List<string>();
+            this.smudgeBurn = new List<int>();
+            this.smudgeCrater = new List<int>();
+            this.smudgeWidth = new List<int>();
+            this.smudgeHeight = new List<int>();
+            for (int i = 0; i < smt.Count(); i = i + 1) {
+                string name = smt.EntryAt(i).Value().Trim();
+                int semi = -1;
+                for (int c = 0; c < name.Length; c = c + 1) {
+                    if (name[c] == 59) { semi = c; break; }
+                }
+                if (semi >= 0) { name = name.Substring(0, semi).Trim(); }
+                if (name.Length == 0) { continue; }
+                name = name.ToUpper();
+                this.smudgeTypes.Add(name);
+                IniSection sec = ini.Section(name);
+                this.smudgeBurn.Add(sec != null && Rules.YesNo(sec.GetOr("Burn", "no")) ? 1 : 0);
+                this.smudgeCrater.Add(sec != null && Rules.YesNo(sec.GetOr("Crater", "no")) ? 1 : 0);
+                List<int> w = sec != null ? Rules.LeadingInts(sec.GetOr("Width", "1")) : new List<int>();
+                List<int> hh = sec != null ? Rules.LeadingInts(sec.GetOr("Height", "1")) : new List<int>();
+                this.smudgeWidth.Add(w.Count > 0 ? w[0] : 1);
+                this.smudgeHeight.Add(hh.Count > 0 ? hh[0] : 1);
             }
         }
         // Sidebar names come from the install's own string table, the same

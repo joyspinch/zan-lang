@@ -62,10 +62,15 @@ class MapRenderer {
     List<int> brValue;
     // Map smudges ([Smudge] decals: craters, burn marks), in painter order
     // like the terrain scatter. Resolved once at load into screen positions
-    // and art, so RenderInto's loop is array reads.
+    // and art, so RenderInto's loop is array reads. The world's own smudge
+    // list is the single source -- the map's decals load into it at game
+    // start and explosions append -- so SyncSmudges pulls in any tail the
+    // world has grown since the last frame.
     List<int> smX;
     List<int> smY;
     List<string> smName;
+    List<int> smKeys;
+    int smSynced;
     // Name -> decal texture, built on first draw. The install this builds
     // against carries no smudge art at all, so every entry resolves to the
     // procedural decal; the cache still keys by name so an install that does
@@ -252,28 +257,34 @@ class MapRenderer {
         }
     }
 
-    /// <summary>Takes the map's [Smudge] decals into painter order (x+y), so a
-    /// crater in front covers the one behind it the way the scatter does.
-    /// These come from the map file, not the world: a smudge has no owner, no
-    /// health and no occupancy, so it never becomes a world object.</summary>
-    void SetSmudges(MapFile map) {
-        this.smX = new List<int>();
-        this.smY = new List<int>();
-        this.smName = new List<string>();
-        List<int> keys = new List<int>();
-        for (int i = 0; i < map.SmudgeCount(); i = i + 1) {
-            List<string> f = new List<string>();
-            if (!map.SmudgeEntry(i, f)) { continue; }
-            int x = Convert.ToInt32(f[1]);
-            int y = Convert.ToInt32(f[2]);
+    /// <summary>Pulls the world's smudge decals into painter order (x+y), so
+    /// a crater in front covers the one behind it the way the scatter does.
+    /// A smudge has no owner, no health and no occupancy, so it never becomes
+    /// a world object -- but the world's decal list is where both the map's
+    /// shipped scars and the explosions' fresh ones land, and entries only
+    /// ever append, so each call walks just the tail it has not seen.</summary>
+    void SyncSmudges() {
+        if (this.world == null) { return; }
+        int n = this.world.SmudgeCount();
+        if (n <= this.smSynced) { return; }
+        if (this.smX == null) {
+            this.smX = new List<int>();
+            this.smY = new List<int>();
+            this.smName = new List<string>();
+            this.smKeys = new List<int>();
+        }
+        for (int i = this.smSynced; i < n; i = i + 1) {
+            int x = this.world.SmudgeXAt(i);
+            int y = this.world.SmudgeYAt(i);
             int key = x + y;
             int at = 0;
-            while (at < keys.Count && keys[at] <= key) { at = at + 1; }
-            keys.Insert(at, key);
+            while (at < this.smKeys.Count && this.smKeys[at] <= key) { at = at + 1; }
+            this.smKeys.Insert(at, key);
             this.smX.Insert(at, x);
             this.smY.Insert(at, y);
-            this.smName.Insert(at, f[0].ToUpper());
+            this.smName.Insert(at, this.world.SmudgeNameAt(i));
         }
+        this.smSynced = n;
     }
 
     int WorldWidth() { return this.worldW; }    int WorldHeight() { return this.worldH; }
@@ -374,6 +385,7 @@ class MapRenderer {
 
         // Map smudges draw right after the ground: a crater is part of the
         // terrain, so trees and everything that moves go over it.
+        this.SyncSmudges();
         if (this.smX != null) {
             for (int i = 0; i < this.smX.Count; i = i + 1) {
                 int sx = IsoProjection.ScreenX(this.smX[i], this.smY[i])
