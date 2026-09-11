@@ -26,17 +26,22 @@ class Prog {
     static int accepted;
     static int requests;
     static bool killIdle;
+    // Run() must be able to stop the listener from outside: the accept count
+    // here is not known up front (it depends on how the pool behaves), so the
+    // loop cannot be bounded like tunnel's. Without a Stop the parked accept
+    // frame keeps the listener alive at exit and the leak probe counts it.
+    static TcpListener upL;
 
     static async void Upstream() {
-        TcpListener l = new TcpListener("127.0.0.1", Prog.UP_PORT);
-        l.Start();
+        Prog.upL = new TcpListener("127.0.0.1", Prog.UP_PORT);
+        Prog.upL.Start();
         while (true) {
-            nint c = await l.AcceptAsync();
+            nint c = await Prog.upL.AcceptAsync();
             if (c < 0) { break; }
             Prog.accepted = Prog.accepted + 1;
             Task.Spawn(Prog.ServeUpstream(c));
         }
-        l.Stop();
+        Prog.upL.Stop();
     }
 
     /// Serves requests on one connection until the peer goes away (or the
@@ -213,6 +218,9 @@ class Prog {
             + Convert.ToString(Prog.accepted == accBefore + 2 ? 1 : 0));
 
         fwd.Stop();
+        // 停掉上游监听：挂着的 accept 以 -1 复位，Upstream 协程退出，
+        // 退出时的泄漏探测才不会把它记为仍可达。
+        Prog.upL.Stop();
         Console.WriteLine("keepalive-ok: 1");
         // 停服后留几个泵转：accept 协程以 -1 复位并退出，退出时的
         // 泄漏探测才不会把服务端对象链记为仍可达。
