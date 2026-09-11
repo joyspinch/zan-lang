@@ -189,6 +189,23 @@ token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
   不继承(Chrome 会从 body 传下来),需要字号的块要显式声明,否则 strut
   落 16px 缺省。
 
+- **grid 布局(display:grid,P4)**:真网格——`grid-template-columns/rows`
+  认 `px`/`%`/`auto`/`fr`(整数)/`minmax(a,b)`/`repeat(N, 轨道)`;没显式
+  模板的行吃 `grid-auto-rows`(轨道列表短了会**循环取用**,写一个值多行
+  全用)。`gap: 10px` 或 `gap: 行 列` 双轴。条目放置:`grid-column/row:
+  线号 / 线号` 或 `span N` 显式跨格,不写的走 auto-placement(行主序、
+  放不下换行、只进不退)。定宽:px/% 先定,fr 分剩余,无 fr 时剩余均分给
+  auto 轨(等于 Chrome 缺省的拉伸);条目高度按所在列宽**重测**(文本在
+  窄列里会折行)。格内对齐 `justify-items`(水平)/`align-items`(垂直),
+  写了尺寸的条目不拉伸、按 start 落。与 Chrome 逐盒 0px 对齐(oracle
+  grid 19 盒)。坑:① `grid-column: 2` 的线号是**1 基**,span 是数量,
+  `"1 / 3"` = 从线 1 跨到线 3(占 2 格);② 类名/组件名撞车——Zan 里
+  `Grid` 已是 Widget 布局组件,CSS grid 引擎类叫 `CssGrid`,自己写
+  Zan 代码别 import 锋利的 `Grid` 名;③ 命名线/命名区/负线号/
+  `fit-content()`/`dense` 不认(按 auto 兜底),条目级
+  justify-self/align-self 未接入,跨 span>1 的条目不参与 auto 轨的
+  内容定宽。
+
 - **`!important` 真的压得住 inline**:带标记的声明单独存、在普通级联
   (含宿主 inline)之后统一再套一遍,不是"剥掉标记按顺序碰运气"。
 - **渐变只认两端+中间一档**(`linear-gradient([dir,] a, b[, c])`);停靠点上的

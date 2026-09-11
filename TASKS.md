@@ -789,6 +789,33 @@ pt/pc/cm/mm/in/q）+ `calc()/min()/max()/clamp()`；`%` 在各属性原有通道
   conformance_gui_css Passed；smoke 256 仅 HEAD 已知失败
   （pagination/transfer）。
 
+* **P4 grid**（2026-09-12，1b1c5375 + db19356e）：**display:grid 真网格**
+  （display=4）——容器模板（grid-template-\*/grid-auto-\*）在 StyleBox 存
+  原文串（Clone 直拷、排版时 CssGrid 现解析）；**放置四相**（双显式 →
+  行定列自 → 列定行自 → 全 auto 稀疏行主序游标只进不退），占用表行主序
+  平铺、按终态行列数一次分配、扩列 Widen 重建；**定尺寸三步**（基尺寸：
+  px/%/auto 取跨 1 条目内容最大/minmax 下限 → 非弹性轨均分放大冻结上限 →
+  fr 按比例吃剩余；无 fr 时剩余均分给 auto 轨 = Chrome
+  align-content:normal 的 stretch）；条目按定宽重测行高（HintWrapWidth
+  下传，同 float 模式）；格内 justify-items/align-items 对齐（声明尺寸按
+  start，Chrome 同款）；隐式轨道列表**循环取用**；`@supports (display:
+  grid)` 转 true（golden 9 行语义翻转）。**oracle grid 19 盒全部 0px**
+  （tests/weboracle/grid.json：px/1fr/minmax/repeat、隐式行、双轴 gap、
+  span 2、网格线显式放置、auto 列 stretch 均分）。db19356e 修四个确定性
+  bug：SpanSum 对 span=0 返回 -gap（前缀和调用形式下所有首格整体 -gap）；
+  隐式轨道列表短于隐式轨道数时该循环取用（g2 第二行高塌 0）；Place 输出
+  按相序 append 与消费端按 items 文档序配对错位（条目互拿格子，改按下标
+  直写）；格子原点复用 SpanSum 少一道 gap（新增 TrackOffset = 前 k 条
+  尺寸 + k 道 gap）。**引擎类改名 CssGrid**——`Grid` 与既有
+  Widget/Grid.zan 的 Grid : Control 布局组件撞名，ControlFactory "Grid"
+  挡位 `new Grid()` 解析到引擎类，10 个 GUI 用例批量编译红（改名后 smoke
+  复绿，教训：stdlib 新类名先 grep `class X\b` 查重，ControlFactory 的
+  kind 挡位是隐式命名空间）。台账新增五条：span>1 条目不参与轨道内在
+  定尺寸、fr 只认整数、命名线/区/负线号/fit-content/dense 按 auto 兜底、
+  条目级 justify-self/align-self 未接入、条目 % 宽按 0（块流同款）。
+  css_test 新增 DisplayGrid 断言段（20 行）；conformance_gui_css Passed；
+  smoke 仅 HEAD 已知失败。
+
 ---
 
 # A17-A31 历史修复记录（全部完成，一行摘要）

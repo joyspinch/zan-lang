@@ -16,7 +16,7 @@
 | P1 | 块流完整语义：margin 塌陷（CSS 2.1）、auto 宽高、百分比、margin:0 auto、匿名文本块 | ✅ 2026-09-12 | oracle basic 7 盒 + collapse 8 盒均 0px 偏差 |
 | P2 | 行盒与 inline 流：横排/换行/text-align/vertical-align/line-height 三态消费、FontAscent 真 baseline、inline 文本混排（run+控件盒）、white-space | ✅ 2026-09-12 | oracle inline 4 盒（tol 3）：y/行高/盒高 0 偏差，x ≤3px 步进台账 |
 | P3 | float：left/right 贴边、行盒绕排、clear、BFC 收编 | ✅ 2026-09-12 | b432d5c0 引擎 + 9ddcffa5 规则 2 + 本条（断言/文档）；oracle float 17 盒：11 精确、6 处 ≤2px（行高取整台账） |
-| P4 | grid：track sizing（auto/fr/minmax/px/%）、span、隐式轨道、gap、网格线放置 | ☐ | |
+| P4 | grid：track sizing（auto/fr/minmax/px/%）、span、隐式轨道、gap、网格线放置 | ✅ 2026-09-12 | 1b1c5375 引擎 + db19356e 修复/断言/文档；oracle grid 19 盒全部 0px |
 | P5 | HTML 声明层：Html.zan parser、tag→控件映射、data-on-* 事件、data-bind、style/link 接线、GenHtml 编译期生成器、App.LoadHtml()、oracle 闭环 | ☐ | |
 | P6 | overflow 滚动：auto/scroll 真语义（clip+偏移+滚动条） | ☐ | |
 | P7 | 设计器 + HUD：存取格式 = .html、Inspector CSS 编辑、拖拽翻译 CSS、游戏窗口层嵌入帧循环、IDE 自用窗体重写 | ☐ | |
@@ -98,6 +98,25 @@ golden/audit/Inert 名单同步 → 提交 `gui-web(Pn): 主题`。
   margin 会塌出容器，clearance 跟着丢就错（cbox 70 高依赖它）。
   BFC 容器（flow-root）auto 高收编自己放的 float 底（CSS 10.6.7）；
   非 BFC 容器 float 溢出（Chrome 同款），clear 的兄弟把高撑起来。
+- **grid 引擎（P4）**：`display: grid` = display 4，真网格。容器模板
+  （grid-template-\*、grid-auto-\*）在 StyleBox 里**存原文串**（Clone 直拷、
+  排版时 CssGrid 现解析）——避免给每个盒深拷轨道结构。条目放置四相：
+  双显式 → 行定列自（该行扫空闲列，放不下扩隐式列）→ 列定行自 → 全 auto
+  稀疏行主序游标（只进不退）；占用表行主序平铺、按终态行列数一次分配、
+  扩列 Widen 重建。定尺寸三步：基尺寸（px/%/auto 取跨 1 条目的内容最大/
+  minmax 下限）→ 非弹性 auto/minmax(auto,…) 轨均分放大并冻结增长上限 →
+  fr 按比例吃剩余；无 fr 时剩余均分给 auto 轨（= Chrome
+  align-content:normal 的 stretch，oracle 实测 auto auto 200 宽 → 105/95）。
+  条目按定宽重测行高（HintWrapWidth + prefH=0 下传，同 float 模式）。
+  格内对齐 justify-items（inline 轴）/align-items（block 轴），声明了
+  尺寸的条目按 start（Chrome 同款）。隐式轨道列表短于隐式轨道数时
+  **循环取用**（CSS auto 轨道列表语义）。`@supports (display: grid)`
+  转 true（GuardValueKnown，golden 9 行语义翻转）。
+  **引擎类名 CssGrid**——`Grid` 已被 Widget/Grid.zan 的 Grid : Control
+  布局组件占用（ControlFactory "Grid" 挡位），同名会让 `new Grid()`
+  解析到引擎类、走 ControlFactory 的用例批量编译红（db19356e 实录）。
+  格子原点 = 前 k 条轨道尺寸 + k 道 gap（TrackOffset），与跨内
+  span-1 道 gap（SpanSum）是两个语义，混用会把所有首格整体平移 -gap。
 
 ## 已知偏差台账
 
@@ -157,3 +176,19 @@ golden/audit/Inert 名单同步 → 提交 `gui-web(Pn): 主题`。
   flow-root 块会收窄到剩余空间；引擎的 BFC 盒仍占全宽（行内内容经
   hostFloats 绕排，盒矩形不缩）。普通块盒两边行为一致（Chrome 普通
   块也不避让 float，只有行内内容绕排）。
+- **（P4 台账）跨 span>1 条目不参与轨道内在定尺寸**：auto/minmax(auto,·)
+  轨道的内容基尺寸只取跨 1 条目的测量值（span1 通道）；CSS 里 span 项
+  也要均摊进被跨轨道。oracle 未覆盖 span+auto 轨组合。
+- **（P4 台账）fr 只认整数**：`2fr` 解析为 ×1000 的比例权重，
+  `1.5fr` 这类小数 ParseInt 截断——AI 写 fr 极少带小数，先不收。
+- **（P4 台账）不认的 grid 语法按 auto 兜底**：命名线（[line-name]）、
+  命名区（grid-template-areas）、负线号（-1 = 显式末端）、
+  fit-content()/min-content/max-content 关键字、`dense` 紧凑变体、
+  subgrid/masonry 均不识别（lint 报 "selector/declaration" 侧不认的
+  走既有 unknown 通道，值解析按 auto）。
+- **（P4 台账）条目级 justify-self/align-self 不参与 grid**：格内对齐
+  只消费容器级 justify-items/align-items（含 place-items 简写）；
+  条目覆盖待 P5 声明层一起补。
+- **（P4 台账）网格条目声明 % 宽按 0**：与块流 shrink-to-fit 的同款
+  限制（见上 P1 条）；格宽已定时条目 stretch/auto 尺寸不受影响
+  （oracle g1-g4 全绿即证）。
