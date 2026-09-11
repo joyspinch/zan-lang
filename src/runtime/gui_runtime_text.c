@@ -103,6 +103,13 @@ static int g_font_bold[16];   /* 1 = FW_BOLD slot; the table is keyed by (size, 
 static wchar_t g_font_family[64] = L"Segoe UI";
 static int g_font_family_env_done = 0;
 static int g_font_family_explicit = 0;
+/* Chrome/DirectWrite-equivalent vertical metrics (see
+ * load_os2_vertical_metrics): font units straight from OS/2, so
+ * ascent/height match the browser instead of GDI's grid-fitted values. */
+static int g_os2_asc = 0;    /* usWinAscent, font units */
+static int g_os2_desc = 0;   /* usWinDescent, font units */
+static int g_os2_upem = 0;   /* unitsPerEm ('head'), 0 = fall back to GDI */
+static int g_os2_tried = 0;
 
 static HFONT get_or_create_font(int size, int bold) {
     /* Cache by exact (size, weight) match. Bold shares the 16-slot table with
@@ -168,6 +175,9 @@ EXPORT i32 zan_gui_set_text_family(const char *utf8_family) {
         g_font_sizes[i] = 0;
         g_font_bold[i] = 0;
     }
+    /* OS/2 vertical metrics belong to the face: force a reload. */
+    g_os2_tried = 0;
+    g_os2_upem = 0;
     return 1;
 }
 
@@ -592,6 +602,65 @@ static int g_fh_size[16];
 static int g_fh_val[16];
 static int g_fh_count = 0;
 
+static int g_fa_size[16];
+static int g_fa_val[16];
+static int g_fa_count = 0;
+
+static void load_os2_vertical_metrics(void) {
+    if (g_os2_tried) { return; }
+    g_os2_tried = 1;
+    ensure_text_dc();
+    HFONT font = get_or_create_font(16, 0);
+    HFONT old_font = (HFONT)SelectObject(g_text_dc, font);
+    uint8_t buf[2];
+    /* GetFontData wants each table tag byte-swapped in the DWORD
+     * ('head' = 0x64616568, 'OS/2' = 0x322F534F -- verified via GDI;
+     * the natural reading 0x68656164/0x4F532F32 returns GDI_ERROR).
+     * offsets: head.unitsPerEm 18, OS/2.usWinAscent 74, OS/2.usWinDescent 76. */
+    if (GetFontData(g_text_dc, 0x64616568, 18, buf, 2) == 2) {
+        g_os2_upem = (int)((buf[0] << 8) | buf[1]);
+    }
+    if (GetFontData(g_text_dc, 0x322F534F, 74, buf, 2) == 2) {
+        g_os2_asc = (int)((buf[0] << 8) | buf[1]);
+    }
+    if (GetFontData(g_text_dc, 0x322F534F, 76, buf, 2) == 2) {
+        g_os2_desc = (int)((buf[0] << 8) | buf[1]);
+    }
+    SelectObject(g_text_dc, old_font);
+    if (g_os2_upem <= 0 || g_os2_asc <= 0 || g_os2_desc <= 0) {
+        g_os2_upem = 0;
+    }
+}
+
+/* Ascent above the baseline (Chrome fontBoundingBoxAscent semantics:
+ * floor(size * usWinAscent / unitsPerEm); GDI tmAscent fallback). Line-box
+ * baseline math needs the browser's metric, not GDI's rounded one. */
+EXPORT i32 zan_gui_font_ascent(i32 font_size) {
+    int size = (int)font_size;
+    if (size < 8) size = 8;
+    load_os2_vertical_metrics();
+    if (g_os2_upem > 0) {
+        int v = (size * g_os2_asc) / g_os2_upem;
+        return (i64)(v > 0 ? v : 1);
+    }
+    for (int i = 0; i < g_fa_count; i++) {
+        if (g_fa_size[i] == size) { return (i64)g_fa_val[i]; }
+    }
+    ensure_text_dc();
+    HFONT font = get_or_create_font(size, 0);
+    HFONT old_font = (HFONT)SelectObject(g_text_dc, font);
+    TEXTMETRICW tm;
+    GetTextMetricsW(g_text_dc, &tm);
+    SelectObject(g_text_dc, old_font);
+    int val = (int)tm.tmAscent;
+    if (g_fa_count < 16) {
+        g_fa_size[g_fa_count] = size;
+        g_fa_val[g_fa_count] = val;
+        g_fa_count = g_fa_count + 1;
+    }
+    return (i64)val;
+}
+
 EXPORT i32 zan_gui_font_height(i32 font_size) {
     int size = (int)font_size;
     if (size < 8) size = 8;
@@ -611,14 +680,22 @@ EXPORT i32 zan_gui_font_height(i32 font_size) {
         }
     }
 
-    ensure_text_dc();
-    HFONT font = get_or_create_font(size, 0);
-    HFONT old_font = (HFONT)SelectObject(g_text_dc, font);
-    TEXTMETRICW tm;
-    GetTextMetricsW(g_text_dc, &tm);
-    SelectObject(g_text_dc, old_font);
-
-    int val = (int)tm.tmHeight;
+    load_os2_vertical_metrics();
+    int val;
+    if (g_os2_upem > 0) {
+        /* Chrome content box: floor(size*usWinAscent/upem)
+         * + floor(size*usWinDescent/upem). */
+        val = (size * g_os2_asc) / g_os2_upem
+            + (size * g_os2_desc) / g_os2_upem;
+    } else {
+        ensure_text_dc();
+        HFONT font = get_or_create_font(size, 0);
+        HFONT old_font = (HFONT)SelectObject(g_text_dc, font);
+        TEXTMETRICW tm;
+        GetTextMetricsW(g_text_dc, &tm);
+        SelectObject(g_text_dc, old_font);
+        val = (int)tm.tmHeight;
+    }
     if (g_fh_count < 16) {
         g_fh_size[g_fh_count] = size;
         g_fh_val[g_fh_count] = val;

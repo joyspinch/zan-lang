@@ -779,6 +779,26 @@ class Control {
     }
 
     /// 样式表声明的外边距（px；未解析样式时为 0）。
+    /// 行内级（P2 行盒）：`inline`/`inline-block`/`inline-flex` 置 1，
+    /// 块流容器把它排进行盒而不是当独立块。
+    int StyleInlineLevel() {
+        return computedStyle != null ? computedStyle.inlineLevel : 0;
+    }
+
+    /// 块流内容序列（P2）：按此序列分段/排布——默认只有子项
+    /// （FlexKids 过滤）；Element 覆写为文档序的 文本/子项 混合
+    /// 序列（AddText/AddKid 交错）。
+    virtual List<FlowEntry> FlowEntries() {
+        List<Control> kids = this.FlexKids();
+        List<FlowEntry> es = new List<FlowEntry>();
+        for (int i = 0; i < kids.Count; i = i + 1) {
+            FlowEntry e = new FlowEntry();
+            e.kid = kids[i];
+            es.Add(e);
+        }
+        return es;
+    }
+
     int StyleMarL() { if (computedStyle == null) { return 0; }
         int v = computedStyle.marL; return v < 0 ? 0 : v; }
     /// 样式表声明的外边距（px；未解析样式时为 0）。
@@ -1305,8 +1325,7 @@ class Control {
     /// （`height: 0` 仍是零，塌穿；`height: 30px` 不塌）。
     bool IsEmptyFlowBlock(Control c) {
         if (c.StyleDisplay() != 3) { return false; }
-        if (c.FlexKids().Count > 0) { return false; }
-        if (c.HasFlowText()) { return false; }
+        if (c.FlowEntries().Count > 0) { return false; }
         StyleBox sb = c.computedStyle;
         if (sb != null) {
             if (sb.height > 0 || sb.minH > 0) { return false; }
@@ -1316,16 +1335,21 @@ class Control {
         return true;
     }
 
-    /// 匿名文本块（P1）：容器直接持有的裸文本（Element.SetText）。
-    /// Control 没有；Element 覆写。文本块作为整体参与块流，
-    /// 高度 = 行数 × 行高，宽度在给定可用宽内断行；availW <= 0
-    /// （shrink-to-fit 测量）按一行。
-    virtual bool HasFlowText() { return false; }
-    virtual int FlowTextHeight(int availW) { return 0; }
+    /// 行内内容（P2 行盒）：元素直接持有的裸文本（Element.SetText）。
+    /// Control 没有；Element 覆写。块流容器把它与行内级子项一起排成
+    /// 行盒（自身文本在前——"<div>text<span>…</span></div>" 的文档序
+    /// 简化；文本与块子项交错的真实序要等 P5 HTML 层）。
+    virtual string FlowText() { return ""; }
 
-    /// 排布期记录文本块在内容框内的相对 Y 与可用宽（Element 覆写，
-    /// 绘制时用）。
-    virtual void FlowTextPlace(int relY, int availW) { }
+    /// 行盒排布期钩子：本节点将作为行内参与者被落位——先清上一帧
+    /// 的 run 缓存（Element 覆写；绘制端以"本帧是否 fresh"防陈旧）。
+    virtual void InlineRunsBegin() { }
+
+    /// 行盒排布期钩子：落位一个文本 run。坐标与 Arrange 同一空间
+    /// （窗口根相对）；topY = piece 顶（基线 − asc），drawOff =
+    /// 半行距下移，DrawText y = topY + drawOff。
+    virtual void InlineRunPlace(int x, int topY, int w, int h, int drawOff,
+                                int fs, string text) { }
 
     /// 真块流测量（P1）：margin 塌陷后取各块高度之和——兄弟相邻
     /// margin 合并、容器不塌陷（FlowSepT/B）时首/尾 margin 计入
@@ -1337,12 +1361,36 @@ class Control {
         int sumH = 0;
         int maxW = 0;
         int rows = 0;
-        List<Control> kids = this.FlexKids();
         bool sepT = this.FlowSepT();
         bool sepB = this.FlowSepB();
         int pending = 0 - 1;   // 待结算的塌陷链（-1 = 还没有占高块）
-        for (int i = 0; i < kids.Count; i = i + 1) {
-            Control c = kids[i];
+        int wrapW = hintWrapW - this.StyleInsetL() - this.StyleInsetR();
+        List<FlowEntry> es = this.FlowEntries();
+        List<FlowEntry> seg = new List<FlowEntry>();
+        for (int i = 0; i <= es.Count; i = i + 1) {
+            FlowEntry e = i < es.Count ? es[i] : null;
+            Control c = e != null ? e.kid : null;
+            if (e != null && (c == null || c.StyleInlineLevel() == 1)) {
+                seg.Add(e);
+                continue;
+            }
+            // 块级边界：结算行内段（段是无 margin 的匿名块，塌陷
+            // 上下义务为 0）。
+            if (seg.Count > 0) {
+                FlowSegment fs2 = this.FlowLayoutSegment(
+                    seg, wrapW > 0 ? wrapW : 0, 0);
+                seg = new List<FlowEntry>();
+                if (fs2.lines.Count > 0) {
+                    if (pending >= 0) {
+                        sumH = sumH + CollapseMargins(pending, 0);
+                    }
+                    pending = 0;
+                    sumH = sumH + fs2.height;
+                    if (fs2.width > maxW) { maxW = fs2.width; }
+                    rows = rows + 1;
+                }
+            }
+            if (c == null) { break; }
             bool empty = this.IsEmptyFlowBlock(c);
             int kmt = empty ? c.StyleMarT() : this.FlowMarT(c);
             int kmb = empty ? c.StyleMarB() : this.FlowMarB(c);
@@ -1376,16 +1424,6 @@ class Control {
             sumH = sumH + h;
             rows = rows + 1;
         }
-        // 匿名文本块总在子项之后（P1 简化；混排 P2 引入行盒）。
-        // 测量期可用宽只有断行提示（PropagateWrapHint），没有就按一行。
-        int tW = hintWrapW - this.StyleInsetL() - this.StyleInsetR();
-        int textH = this.FlowTextHeight(tW > 0 ? tW : 0);
-        if (textH > 0) {
-            if (pending >= 0) { sumH = sumH + CollapseMargins(pending, 0); }
-            pending = 0;
-            sumH = sumH + textH;
-            rows = rows + 1;
-        }
         if (rows > 1) { sumH = sumH + this.StyleGap() * (rows - 1); }
         if (pending > 0 && sepB && rows > 0) { sumH = sumH + pending; }
         else if (pending > 0 && sepT && sepB && rows == 0) {
@@ -1409,14 +1447,39 @@ class Control {
     /// 测量端一致。
     void ArrangeFlow(int cx, int cy, int cw, int ch, int gapPx) {
         int y = cy;
-        List<Control> kids = this.FlexKids();
         bool sepT = this.FlowSepT();
         bool sepB = this.FlowSepB();
         int chKids = this.fillH ? 0 : ch;
         int pending = 0 - 1;
         int placed = 0;
-        for (int i = 0; i < kids.Count; i = i + 1) {
-            Control c = kids[i];
+        int align = computedStyle != null ? computedStyle.align : 0;
+        this.InlineRunsBegin();
+        List<FlowEntry> es = this.FlowEntries();
+        List<FlowEntry> seg = new List<FlowEntry>();
+        for (int i = 0; i <= es.Count; i = i + 1) {
+            FlowEntry e = i < es.Count ? es[i] : null;
+            Control c = e != null ? e.kid : null;
+            if (e != null && (c == null || c.StyleInlineLevel() == 1)) {
+                if (c != null) { c.InlineRunsBegin(); }
+                seg.Add(e);
+                continue;
+            }
+            // 块级边界：落位行内段（无 margin 义务，塌陷语义同测量端）。
+            if (seg.Count > 0) {
+                FlowSegment fs2 = this.FlowLayoutSegment(seg, cw, cw);
+                if (fs2.lines.Count > 0) {
+                    if (pending >= 0) {
+                        y = y + CollapseMargins(pending, 0);
+                        if (placed > 0) { y = y + gapPx; }
+                    }
+                    pending = 0;
+                    this.FlowSegmentPlace(fs2, cx, y, cw, align, seg);
+                    y = y + fs2.height;
+                    placed = placed + 1;
+                }
+                seg = new List<FlowEntry>();
+            }
+            if (c == null) { break; }
             bool empty = this.IsEmptyFlowBlock(c);
             int kmt = empty ? c.StyleMarT() : this.FlowMarT(c);
             int kmb = empty ? c.StyleMarB() : this.FlowMarB(c);
@@ -1469,18 +1532,158 @@ class Control {
             y = y + h;
             placed = placed + 1;
         }
-        int textH = this.FlowTextHeight(cw > 0 ? cw : 0);
-        if (textH > 0) {
-            if (pending >= 0) {
-                y = y + CollapseMargins(pending, 0);
-                if (placed > 0) { y = y + gapPx; }
-            }
-            pending = 0;
-            this.FlowTextPlace(y - cy, cw);
-            y = y + textH;
-            placed = placed + 1;
-        }
         if (pending > 0 && sepB) { y = y + pending; }
+    }
+
+    /// 行内文本的继承态（CSS 可继承属性在行盒里的落地）：段内文本
+    /// 未声明 font-size / line-height / white-space 时随容器——span
+    /// 不写 line-height 时浏览器用的就是父级行高，少了这一步混排
+    /// 基线整体错位。只服务行盒 piece；块级子树的样式解析不受影响。
+    StyleBox InheritText(StyleBox parent, StyleBox own) {
+        int pfs = parent.fontPx > 0 ? parent.fontPx
+            : (parent.envRemPx > 0 ? parent.envRemPx : 14);
+        bool need = own.fontPx <= 0
+            || (own.lineHeightKind == 0 && parent.lineHeightKind != 0)
+            || (own.whiteSpace == 0 && parent.whiteSpace != 0);
+        if (!need) { return own; }
+        StyleBox d = own.Clone();
+        if (d.fontPx <= 0) { d.fontPx = pfs; }
+        if (d.lineHeightKind == 0) {
+            d.lineHeight = parent.lineHeight;
+            d.lineHeightKind = parent.lineHeightKind;
+        }
+        if (d.whiteSpace == 0 && parent.whiteSpace != 0) {
+            d.whiteSpace = parent.whiteSpace;
+        }
+        return d;
+    }
+
+    /// 排版一个行内段（P2）：条目 = 文本块（容器自身）或行内子项
+    /// （无子且有文本 → 文本 run、否则原子盒）。wrapW 是折行宽
+    /// （测量端 = 断行提示，0 = 单行；排布端 = 内容宽），wAvail 是
+    /// 百分比宽的包含块（测量端按 0，shrink-to-fit 同规矩）。
+    FlowSegment FlowLayoutSegment(List<FlowEntry> seg,
+                                  int wrapW, int wAvail) {
+        FlowSegment fs2 = new FlowSegment();
+        List<InlinePiece> items = new List<InlinePiece>();
+        StyleBox sb = computedStyle;
+        if (sb == null) { sb = new StyleBox(); }
+        InlinePiece strut = LineBox.MakeStrut(sb);
+        // va:middle 的 x 高取父字体（CSS 10.8.1）：FontHeight×5/12 是
+        // Segoe UI 的真实 x 高比例（Chrome 实测校准），/24 即再取半。
+        int pf = sb.fontPx > 0 ? sb.fontPx : (sb.envRemPx > 0 ? sb.envRemPx : 14);
+        int xhHalf = Canvas.FontHeight(pf) * 5 / 24;
+        for (int i = 0; i < seg.Count; i = i + 1) {
+            FlowEntry en = seg[i];
+            if (en.kid == null) {
+                LineBox.PushText(items, this, sb, en.text);
+                continue;
+            }
+            Control c = en.kid;
+            StyleBox cs = c.computedStyle;
+            if (cs == null) { cs = new StyleBox(); }
+            if (c.FlexKids().Count == 0 && c.FlowText() != "") {
+                LineBox.PushText(items, c, this.InheritText(sb, cs), c.FlowText());
+                continue;
+            }
+            int w = c.StyleDeclaresWidth() ? c.StyleWidthIn(wAvail) : c.prefW;
+            int h = c.StyleDeclaresHeight() ? c.StyleHeightIn(0) : c.prefH;
+            if (w < 0) { w = 0; }
+            if (h < 0) { h = 0; }
+            items.Add(LineBox.MakeBox(c, w, h, c.StyleMarL(), c.StyleMarR(),
+                                      c.StyleMarT(), c.StyleMarB(), cs, xhHalf));
+        }
+        List<InlineLine> lines = new List<InlineLine>();
+        LineBox.Layout(items, strut, wrapW, lines);
+        int hh = 0;
+        int ww = 0;
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            hh = hh + lines[i].asc + lines[i].desc;
+            if (lines[i].width > ww) { ww = lines[i].width; }
+        }
+        fs2.lines = lines;
+        fs2.height = hh;
+        fs2.width = ww;
+        return fs2;
+    }
+
+    /// 落位一个行内段（P2）：text-align 分配行内剩余空间；文本 piece
+    /// 回填 owner 的 run 缓存（InlineRunPlace）；原子盒按
+    /// vertical-align（baseline 下 margin 边坐基线 / middle 对
+    /// baseline + x 高一半 / top、bottom 对行盒上下）落位；文本型
+    /// owner 的矩形 = 全部 run 的并集（inline 盒的 Chrome 矩形语义）。
+    void FlowSegmentPlace(FlowSegment fs2, int cx, int y0, int availW,
+                          int align, List<FlowEntry> seg) {
+        List<Control> owners = new List<Control>();
+        List<int> uL = new List<int>();
+        List<int> uT = new List<int>();
+        List<int> uR = new List<int>();
+        List<int> uB = new List<int>();
+        int y = y0;
+        for (int li = 0; li < fs2.lines.Count; li = li + 1) {
+            InlineLine ln = fs2.lines[li];
+            int baseline = y + ln.asc;
+            int free = availW - ln.width;
+            int dx = 0;
+            if (align == 1 && free > 0) { dx = free / 2; }
+            else if (align == 2 && free > 0) { dx = free; }
+            for (int pi = 0; pi < ln.pieces.Count; pi = pi + 1) {
+                InlinePiece p = ln.pieces[pi];
+                if (p.isStrut) { continue; }
+                int px = cx + dx + p.x;
+                if (p.isBox) {
+                    StyleBox bs = p.st;
+                    int topY = baseline - p.boxH;   // baseline：下 margin 边坐基线
+                    if (bs.vaInline == 2) {
+                        topY = y;
+                    } else if (bs.vaInline == 3) {
+                        topY = y + ln.asc + ln.desc - p.boxH;
+                    } else if (bs.vaInline == 1) {
+                        // 浏览器把盒中点对到基线向上半个 x 高（Chrome 基线
+                        // 探针实测：盒顶 = baseline − xh/2 − 盒高/2）。
+                        StyleBox sbp = computedStyle;
+                        int pfp = sbp != null && sbp.fontPx > 0 ? sbp.fontPx
+                            : (sbp != null && sbp.envRemPx > 0 ? sbp.envRemPx : 14);
+                        int xh2 = Canvas.FontHeight(pfp) * 5 / 24;
+                        topY = baseline - xh2 - p.boxH / 2;
+                    }
+                    p.owner.Arrange(px + p.ml, topY, p.w - p.ml - p.mr, p.boxH);
+                    continue;
+                }
+                if (p.isSpace) { continue; }
+                int topY2 = baseline - p.asc;
+                p.owner.InlineRunPlace(px, topY2, p.w, p.lh, p.ascOff, p.fs, p.text);
+                // 行内盒的并集矩形按字型内容区（基线 − FontAscent、
+                // 高 FontHeight）——Chrome 对 inline span 的
+                // getBoundingClientRect 语义，行高不参与盒矩形。
+                int cellTop = topY2 + p.ascOff;
+                int cellBot = cellTop + Canvas.FontHeight(p.fs);
+                int oi = -1;
+                for (int k = 0; k < owners.Count; k = k + 1) {
+                    if (owners[k] == p.owner) { oi = k; break; }
+                }
+                if (oi < 0) {
+                    owners.Add(p.owner);
+                    uL.Add(px); uT.Add(cellTop); uR.Add(px + p.w); uB.Add(cellBot);
+                } else {
+                    if (px < uL[oi]) { uL[oi] = px; }
+                    if (cellTop < uT[oi]) { uT[oi] = cellTop; }
+                    if (px + p.w > uR[oi]) { uR[oi] = px + p.w; }
+                    if (cellBot > uB[oi]) { uB[oi] = cellBot; }
+                }
+            }
+            y = y + ln.asc + ln.desc;
+        }
+        for (int k = 0; k < owners.Count; k = k + 1) {
+            Control o = owners[k];
+            if (o == this) { continue; }   // 自身矩形由父给，run 已是绝对坐标
+            // 文本型行内 owner 不走 Arrange：它的内容已由本段排好，
+            // 再 Arrange 会重跑它的流布局并对集回自己（递归）。
+            o.bx = uL[k];
+            o.by = uT[k];
+            o.bw = uR[k] - uL[k];
+            o.bh = uB[k] - uT[k];
+        }
     }
 
     /// 停靠容器在没人给尺寸时按内容测量：一列停靠的行
@@ -1489,7 +1692,7 @@ class Control {
     /// 每个容器写死一个高度，字号或 DPI 一变就错位。
     /// 只填补留空的那根轴：OnMeasure 或作者给过的尺寸优先。
     void MeasureDocked(App app) {
-        if (children.Count == 0 && !this.HasFlowText()) { return; }
+        if (children.Count == 0 && this.FlowEntries().Count == 0) { return; }
         int disp = this.StyleDisplay();
         if (disp == 1) {
             this.MeasureFlexContent(app);

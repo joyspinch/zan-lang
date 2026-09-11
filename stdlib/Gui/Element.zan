@@ -1,24 +1,39 @@
 namespace Gui;
 
+/// 一个落位的行内文本 run（P2 行盒）：坐标与 Arrange 同一空间
+/// （窗口根相对），绘制端直接用。
+class ElementRun {
+    string text;
+    int x;          // run 左（含对齐偏移）
+    int topY;       // piece 顶（基线 − asc，含半行距）
+    int w;
+    int h;          // 行高（inline 盒矩形的高）
+    int drawOff;    // DrawText y = topY + drawOff（半行距下移）
+    int fs;
+}
+
 /// 通用元素容器（WEB_GUI_ROADMAP P0/P5）：kind 即 CSS type 选择器
-/// 匹配的标签名（div/p/section/...）。HTML 声明层（P5）建树的容器
-/// 节点直接落成 Element；代码里也可以用它写 web 风格的布局容器。
-/// 纯文本内容（P1 匿名文本块）经 SetText 提供。
+/// 匹配的标签名（div/p/span/section/...）。HTML 声明层（P5）建树的
+/// 容器节点直接落成 Element；代码里也可以用它写 web 风格的布局
+/// 容器。纯文本内容经 SetText 提供——块容器里是匿名文本块，
+/// 行内级（span）里被父容器拆成 run 排进行盒。
 class Element : Control {
     string elTag;
     string elText;
-    int elTextY;    // 文本块在内容框内的相对 Y（ArrangeFlow 落位）
-    int elTextW;    // 文本块可用宽（内容框宽）
+    List<ElementRun> elRuns;
+    bool elRunsFresh;   // 本帧行盒是否落位过（防陈旧 run 重画）
+    List<FlowEntry> elOrder;    // 文档序（AddText/AddKid 交错记录）
 
     void InitElement(string tag, string nodeName) {
         this.InitControl(nodeName, 0);
         elTag = tag;
+        elRuns = new List<ElementRun>();
     }
 
     /// 标签名（StyleType() 折小写后与 CSS type 选择器匹配）。
     override string Kind() { return elTag; }
 
-    /// 元素的纯文本内容：块流布局（P1）把它当作匿名文本块参与排版。
+    /// 元素的纯文本内容：块流布局（P2）把它排进行盒参与排版。
     Element SetText(string t) {
         elText = t;
         return this;
@@ -27,6 +42,70 @@ class Element : Control {
     /// 元素的纯文本内容。
     string Text() { return elText; }
 
+    /// 文档序追加一段裸文本（P2 行内混排："text " + span + " more"）。
+    /// 与 AddKid 的交错顺序即行盒的分段顺序。
+    Element AddText(string t) {
+        if (elOrder == null) { elOrder = new List<FlowEntry>(); }
+        FlowEntry e = new FlowEntry();
+        e.text = t;
+        elOrder.Add(e);
+        return this;
+    }
+
+    /// 文档序追加子项（同 Add，但记录与 AddText 的交错顺序）。
+    Element AddKid(Control c) {
+        this.Add(c);
+        if (elOrder == null) { elOrder = new List<FlowEntry>(); }
+        FlowEntry e = new FlowEntry();
+        e.kid = c;
+        elOrder.Add(e);
+        return this;
+    }
+
+    /// 块流内容序列（Control.FlowEntries 覆写）：SetText 的整块文本
+    /// 最先，其后按 elOrder 文档序；从未用 AddText/AddKid 记录顺序时
+    /// 子项照旧按 FlexKids 序追加（P0/P1 代码零改动）。
+    override List<FlowEntry> FlowEntries() {
+        List<FlowEntry> es = new List<FlowEntry>();
+        if (elText != "") {
+            FlowEntry e = new FlowEntry();
+            e.text = elText;
+            es.Add(e);
+        }
+        if (elOrder == null || elOrder.Count == 0) {
+            List<Control> kids = this.FlexKids();
+            for (int i = 0; i < kids.Count; i = i + 1) {
+                FlowEntry e = new FlowEntry();
+                e.kid = kids[i];
+                es.Add(e);
+            }
+            return es;
+        }
+        List<Control> tracked = new List<Control>();
+        for (int i = 0; i < elOrder.Count; i = i + 1) {
+            FlowEntry o = elOrder[i];
+            if (o.kid != null) {
+                if (!o.kid.StyleVisible() || o.kid.StylePosition() == 2) {
+                    continue;
+                }
+                tracked.Add(o.kid);
+            }
+            es.Add(o);
+        }
+        List<Control> kids2 = this.FlexKids();
+        for (int i = 0; i < kids2.Count; i = i + 1) {
+            bool seen = false;
+            for (int k = 0; k < tracked.Count; k = k + 1) {
+                if (tracked[k] == kids2[i]) { seen = true; break; }
+            }
+            if (seen) { continue; }
+            FlowEntry e = new FlowEntry();
+            e.kid = kids2[i];
+            es.Add(e);
+        }
+        return es;
+    }
+
     int ElFontSize() {
         StyleBox sb = computedStyle;
         if (sb == null) { return 14; }
@@ -34,53 +113,41 @@ class Element : Control {
         return sb.envRemPx > 0 ? sb.envRemPx : 14;
     }
 
-    int ElRowHeight() {
-        StyleBox sb = computedStyle;
-        if (sb == null) { return Canvas.FontHeight(14); }
-        int fs = this.ElFontSize();
-        int lh = sb.LineHeightPx(fs);
-        return lh > 0 ? lh : Canvas.FontHeight(fs);
+    /// 行内内容（Control.FlowText 覆写）。
+    override string FlowText() { return elText; }
+
+    /// 行盒排布期：清上一帧的 run 缓存并标记本帧 fresh。
+    override void InlineRunsBegin() {
+        elRuns.Clear();
+        elRunsFresh = true;
     }
 
-    /// 匿名文本块参与块流测量（Control.HasFlowText/FlowTextHeight）。
-    override bool HasFlowText() { return elText != ""; }
-
-    override int FlowTextHeight(int availW) {
-        if (elText == "") { return 0; }
-        int rowH = this.ElRowHeight();
-        if (availW <= 0) { return rowH; }
-        List<string> lines = TextWrap.Lines(elText, availW, this.ElFontSize());
-        return lines.Count * rowH;
+    override void InlineRunPlace(int x, int topY, int w, int h, int drawOff,
+                                 int fs, string text) {
+        ElementRun r = new ElementRun();
+        r.text = text;
+        r.x = x;
+        r.topY = topY;
+        r.w = w;
+        r.h = h;
+        r.drawOff = drawOff;
+        r.fs = fs;
+        elRuns.Add(r);
     }
 
-    override void FlowTextPlace(int relY, int availW) {
-        elTextY = relY;
-        elTextW = availW;
-    }
-
-    /// 保留模式绘制：背景/边框由基类 PaintStyleBox 完成，这里画
-    /// 匿名文本块的各行（text-align 对齐、行高行进、断行按落位宽）。
+    /// 保留模式绘制：背景/边框由基类 PaintStyleBox 完成。块容器里
+    /// 画落位好的 run（text-align/折行由行盒决定）；非 fresh 的
+    /// 缓存（上帧行内、本帧没被行盒排到）直接丢弃。
     override void OnPaint(App app) {
-        if (elText == "" || elTextW <= 0) { return; }
+        if (elRuns.Count == 0) { return; }
+        if (!elRunsFresh) { elRuns.Clear(); return; }
         StyleBox sb = computedStyle;
         if (sb == null) { return; }
-        int fs = this.ElFontSize();
-        int rowH = this.ElRowHeight();
         int col = sb.Fade(sb.FgOr(app.theme.textPrimary));
-        List<string> lines = TextWrap.Lines(elText, elTextW, fs);
-        int y = by + elTextY;
-        for (int i = 0; i < lines.Count; i = i + 1) {
-            string ln = lines[i];
-            int x = bx;
-            if (sb.align == 1) {
-                int tw = StyleBox.MeasureSpaced(ln, fs, sb.letterSpacing);
-                x = bx + (elTextW - tw) / 2;
-            } else if (sb.align == 2) {
-                int tw = StyleBox.MeasureSpaced(ln, fs, sb.letterSpacing);
-                x = bx + elTextW - tw;
-            }
-            sb.DrawRun(app.canvas, x, y, ln, col, fs);
-            y = y + rowH;
+        for (int i = 0; i < elRuns.Count; i = i + 1) {
+            ElementRun r = elRuns[i];
+            sb.DrawRun(app.canvas, r.x, r.topY + r.drawOff, r.text, col, r.fs);
         }
+        elRunsFresh = false;
     }
 }

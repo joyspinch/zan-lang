@@ -14,7 +14,7 @@
 |----|------|------|------|
 | P0 | 布局基建：display 值集（flow=3/inlineLevel）、StyleBox 新字段（inlineLevel/floatSide/clearSide/boxSizing/whiteSpace/lineHeightKind）、UA 样式表 + Element 容器、border 参与布局（box-sizing 真语义）、最小块流骨架、web_oracle.py | ✅ 2026-09-12 | oracle basic 5 盒 0px 偏差 |
 | P1 | 块流完整语义：margin 塌陷（CSS 2.1）、auto 宽高、百分比、margin:0 auto、匿名文本块 | ✅ 2026-09-12 | oracle basic 7 盒 + collapse 8 盒均 0px 偏差 |
-| P2 | 行盒与 inline 流：横排/换行/text-align/vertical-align/line-height 三态消费、FontAscent 真 baseline、inline 文本混排（run+控件盒）、white-space | ☐ | |
+| P2 | 行盒与 inline 流：横排/换行/text-align/vertical-align/line-height 三态消费、FontAscent 真 baseline、inline 文本混排（run+控件盒）、white-space | ✅ 2026-09-12 | oracle inline 4 盒（tol 3）：y/行高/盒高 0 偏差，x ≤3px 步进台账 |
 | P3 | float：left/right 贴边、行盒绕排、clear | ☐ | |
 | P4 | grid：track sizing（auto/fr/minmax/px/%）、span、隐式轨道、gap、网格线放置 | ☐ | |
 | P5 | HTML 声明层：Html.zan parser、tag→控件映射、data-on-* 事件、data-bind、style/link 接线、GenHtml 编译期生成器、App.LoadHtml()、oracle 闭环 | ☐ | |
@@ -60,6 +60,29 @@ golden/audit/Inert 名单同步 → 提交 `gui-web(Pn): 主题`。
 - **BFC 判据用真实声明通道**：`StyleBox.overflow` 缺省 1 是引擎渲染裁剪
   约定（子不画出界），不能当 BFC 依据；新增 `overflowCss`（-1 未声明/
   0 visible/1 hidden…）只在样式真声明时置位，`FlowSepT/B` 用它。
+- **字体度量与 Chrome 同源（P2）**：`zan_gui_font_ascent/height` 从字体
+  OS/2 表读 usWinAscent/usWinDescent + head.unitsPerEm（GetFontData，tag
+  需字节交换传 0x322F534F/0x64616568），按 `floor(size×units/upem)` 逐项
+  计算——与 Chrome/Skia(DirectWrite) fontBoundingBox 完全一致；GDI
+  GetTextMetrics 自己取整（16px 相同、28px 起 asc 多 1、14px h 多 1），
+  只作位图字体回退。FreeType 端同理 ascender/descender 各自 floor（不含
+  lineGap），不再用 round(height)。
+- **行盒模型（P2）**：piece（带样式文本 run / 原子盒 / 行首 strut）→
+  贪心折行 → 行 A/D = 各 piece `asc = cellAsc + floor(lead/2)`、
+  `desc = lh − asc` 的最大值（**负 lead 向下取整**，Chrome 基线探针实测；
+  C 的 `/` 向零截断会整体抬 1px）。行内段的真混排 = `FlowEntry` 文档序
+  （`Element.AddText/AddKid` 交错记录），块级边界 flush 成段；文本 piece
+  回填 owner 的 run 缓存（`InlineRunPlace`），原子盒按 vertical-align
+  落位（baseline 下 margin 边坐基线 / **middle = 盒中点对基线向上半个
+  x 高**——CSS 原文 "baseline + 半 x 高" 是排版向上方向的加法，浏览器
+  实测即 `top = baseline − xh/2 − boxH/2`，x 高用父字体
+  `FontHeight×5/12` 近似 / top、bottom 对行盒上下）。
+- **行内盒的矩形 = 字型内容区**：inline span 的并集矩形取
+  `(基线 − FontAscent, FontHeight)`，不是行高——Chrome 对 inline 元素
+  getBoundingClientRect 的语义（.big 28px 盒高 37 非 20）。
+- **行内文本继承（P2）**：段内文本 piece 未声明 font-size/line-height/
+  white-space 时随容器 strut（`InheritText`）——span 不写 line-height 时
+  浏览器用的就是父级行高；块级子树样式解析不受影响。
 
 ## 已知偏差台账
 
@@ -72,11 +95,12 @@ golden/audit/Inert 名单同步 → 提交 `gui-web(Pn): 主题`。
   正值链（绝对多数）逐边折叠即取大，无歧义。未做负值 oracle 用例。
 - **gap 只加在相邻"已放置"块之间**：空块不产生 gap（Zan 扩展语义，
   CSS row-gap 不参与塌陷，行为一致）。
-- **匿名文本块总在子项之后**：P1 不做文本与块交错的真混排（需要行盒，
-  P2 引入）；`Element.SetText` 的文本作为整体块参与塌陷（与首/尾子塌陷
-  语义简化为 mt=0 参与）。
+- **匿名文本块总在子项之后**：P1 不做文本与块交错的真混排；P2 起
+  `Element.AddText/AddKid` 文档序交错 = 真混排（仅显式用 AddText/AddKid
+  建树的元素），`SetText` 整块文本仍最先入段。
 - **shrink-to-fit 测量的文本断行**：测量期只有 hint 宽（PropagateWrapHint），
-  无 hint 按一行估高；容器最终更窄时文本可能溢出容器（P2 行盒复查）。
+  无 hint 按一行估高；容器最终更窄时文本可能溢出容器（P2 复查结论见
+  下方"流文本块测量/排布高度不一致"条）。
 - **缺省 box-sizing：引擎 border-box，Chrome UA 缺省 content-box**：这是
   有意的决策——AI 生成的 CSS 几乎都带 `* { box-sizing: border-box }` reset
   （Tailwind 时代惯例），引擎缺省与之一致；oracle 用例按"现代实践"对齐
@@ -85,3 +109,21 @@ golden/audit/Inert 名单同步 → 提交 `gui-web(Pn): 主题`。
 - **块流容器的 shrink-to-fit 测量中百分比子项宽按 0**（Chrome 同款；
   basic 用例 root pref 70x145 即 .a 的 100% 落 0 后的结果）。声明了宽度的
   容器布局端不受影响。
+- **（P2 已修）流文本块测量/排布高度不一致**：流文本的高取决于宽，测量期
+  hint 缺失时按一词一行估高，排布端叠放却用测量高度 → 容器整体下坠。
+  解法沿用 flex-wrap 的 hint 通道：宿主/驱动在 MeasureTree 前
+  `HintWrapWidth(实际宽)`（real app 每帧有上一帧宽度，自然收敛）。
+  inline oracle 用例即按此写法。
+- **（P2 台账）行内 run 的 x 累计步进 ±3px**：GDI TextOut/度量按整数
+  步进（"some text " @16 = 71px），DirectWrite/Chrome 按小数步进
+  （73.64px），长 run 累计 ~0.3px/字符。基线、行高、盒高、原子盒落位
+  与 Chrome 逐像素一致（oracle inline 4 盒 tol3 全过，残差全在 x）；
+  逐字符像素级等价需要 DirectWrite 渲染管线，不在本路线图范围。
+- **（P2 台账）x 高用 FontHeight×5/12 近似**：Segoe UI 真值 0.546em /
+  1.3125em ≈ 0.416（Chrome 实测校准）；vertical-align:middle 的盒顶
+  残差 ≤1px。其他字体族比例不同（引擎缺省 Segoe UI，可
+  ZAN_GUI_FONT_FACE 换）。
+- **（P2 台账）inline-block 声明文本时基线不取末行基线**：CSS 对有行内
+  内容的 inline-block 取最后一行基线；引擎里"无子有文本"的行内子项直接
+  PushText 成文本 run（视觉等价），"有子"的一律原子盒按 margin 边坐
+  基线。极端嵌套（inline-block 内多行文本参与外层基线）未模拟。

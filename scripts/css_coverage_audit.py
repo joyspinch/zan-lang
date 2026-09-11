@@ -29,9 +29,9 @@ at-rule：`@supports`/`@layer`/`@media` 的内容引擎会解析（守卫/媒体
     python scripts/css_coverage_audit.py --corpus-a --json out.json
 
 一个已知的保守处：这里把"引擎认得"当作"生效"。更严的口径还要扣掉"值确实进了
-样式盒、但绘制路径从不读那个字段"的键（white-space 仍在这一档；
-position/top/left/right/bottom/inset/z-index/order 已由布局/渲染端消费并
-移出名单）。要报那一档，得先有 key -> 字段 -> 渲染处 的映射。
+样式盒、但绘制路径从不读那个字段"的键（white-space/vertical-align 已由 P2
+行盒消费并移出名单；position/top/left/right/bottom/inset/z-index/order 已由
+布局/渲染端消费并移出名单）。要报那一档，得先有 key -> 字段 -> 渲染处 的映射。
 """
 import argparse
 import glob
@@ -56,11 +56,11 @@ CORPUS_A = [
 # 浏览器/打印/原生表单控件专属：retained-mode 控件工具箱没有对应动作，把它们
 # 算进"支持度"分母只会让数字难看而没有行动价值。默认单独归一类，`--all` 时并入。
 # display/float/clear 自 WEB_GUI_ROADMAP P0 起是真实布局键（不再归入
-# 网页专属类）；white-space/vertical-align 待 P2 行盒消费后同批移出。
+# 网页专属类）；white-space/vertical-align 自 WEB_GUI_ROADMAP P2 起
+# 由行盒/落位消费，同批移出。
 FLOW_ONLY = re.compile(
     r'^(-webkit-|-moz-|-ms-|-o-|page-break|break-|content$|quotes$|counter-'
-    r'|list-style|outline|orphans$|widows$|white-space$'
-    r'|vertical-align$)'
+    r'|list-style|outline|orphans$|widows$)'
 )
 
 # 有求值器的单位（StyleSheet.HasUnresolvedUnit 的白名单 + 角度补充）。
@@ -99,7 +99,7 @@ STATE_NAMES = {'hover', 'active', 'focus', 'focus-visible', 'disabled',
 # Positioned/Cascade 段是行为证据，已移出。要独立复核，得先建
 # key -> StyleBox 字段 -> 渲染处 的映射，本脚本没做。`--no-consumer list`
 # 可以换成你自己的名单。
-DEFAULT_NO_CONSUMER = {'white-space'}
+DEFAULT_NO_CONSUMER = set()
 
 
 def engine_surface():

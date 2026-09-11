@@ -734,6 +734,35 @@ pt/pc/cm/mm/in/q）+ `calc()/min()/max()/clamp()`；`%` 在各属性原有通道
   + P1 新行），smoke 256 全层仅 HEAD 已知失败（pagination/transfer
   Props 漂移、scrollbar_drag 并发超时单跑通过）。
 
+* **P2 行盒与 inline 流**（2026-09-12）：**Chrome 同源字体度量**——
+  `zan_gui_font_ascent/height` 从字体 OS/2 表读 usWinAscent/usWinDescent +
+  head.unitsPerEm（GetFontData，tag 需字节交换传 0x322F534F/0x64616568，
+  正读返回 GDI_ERROR），`floor(size×units/upem)` 逐项计算 = Chrome
+  fontBoundingBox；GDI GetTextMetrics 自行取整（16px 相同、28px asc 多 1、
+  14px h 19→18），FreeType 端 ascender/descender 各自 floor 不含 lineGap。
+  **行盒**（LineBox.zan）——piece（文本 run/原子盒/strut）+ 贪心折行 +
+  `asc = cellAsc + floor(lead/2)`（负 lead 向下取整，Chrome 基线探针实测；
+  截断会整体抬 1px）、`desc = lh − asc`、行 A/D 取 max；text-align 分配
+  行内剩余空间。**真混排**——`FlowEntry` 文档序（`Element.AddText/AddKid`
+  交错记录，FlowEntries 虚方法替换 P1 的 blob-first），块级边界 flush 成段；
+  文本 piece 回填 owner 的 run 缓存（InlineRunPlace，Element 多 run 绘制），
+  原子盒 vertical-align 落位（baseline 下 margin 边坐基线 / middle =
+  **基线向上半个 x 高对中**（浏览器实测语义，CSS 原文是排版向上方向），
+  x 高 = 父字体 FontHeight×5/12；top/bottom 对行盒上下）。**行内盒矩形 =
+  字型内容区**（基线−FontAscent、高 FontHeight，Chrome inline span 的
+  getBoundingClientRect 语义，非行高）。**行内文本继承**（InheritText）——
+  段内文本未声明 font-size/line-height/white-space 时随容器 strut。
+  **white-space**——normal 折叠/nowrap 单行（prefW=整段宽）/pre 硬分段
+  （\n 分行、空行占高）/pre-wrap；解析 0/1/2/3。css_test 新增 DisplayInline
+  断言段（ascent/cellh、va/ws 解析、混排盒、pre/nowrap 行为）。
+  **验证**：P1 golden 逐行零差异（引擎重构对存量几何透明）；oracle inline
+  4 盒（tests/weboracle/inline.json）：y/行高/盒高/原子盒落位 0 偏差，
+  x ≤3px（GDI 整数步进 vs DirectWrite 小数步进，台账）；conformance_gui_css
+  Passed；smoke 256 仅 HEAD 已知失败 + scrollbar_drag 满载超时单跑通过；
+  web_oracle.py 解析器修浮点坐标（Chrome 小数 rect 之前解析崩溃）；
+  css_coverage_audit：white-space/vertical-align 移出 FLOW_ONLY 与
+  no-consumer 名单（P2 行盒真实消费）。
+
 ---
 
 # A17-A31 历史修复记录（全部完成，一行摘要）

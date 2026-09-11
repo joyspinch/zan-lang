@@ -149,7 +149,7 @@ token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
   顺序。`overflow: visible` 放行子节点溢出(缺省引擎裁剪,显式声明才变
   行为)。type 选择器大小写不敏感(`Button` 与 `button` 都命中,引擎按
   `Kind()` 的小写匹配);class/id 仍区分大小写。
-- **Web 等价布局已落地前两批（WEB_GUI_ROADMAP P0+P1,2026-09-12)**:
+- **Web 等价布局已落地前三批（WEB_GUI_ROADMAP P0-P2,2026-09-12)**:
   `display: block` 是**真块流**——写成 CSS 的树走 web 语义,没写 display 的
   老代码走 legacy 零回归。**margin 是塌陷的(CSS 2.1)**:相邻兄弟取大合并,
   首子的 margin-top 塌出无内衬的父框把它整体顶开;空块(height:0/无内容/
@@ -167,8 +167,15 @@ token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
   Chrome 时用带 padding 的接收者或 oracle 驱动的 escT 公式)。与 Chrome 的
   逐盒一致性由 `scripts/web_oracle.py` 裁决:用例 JSON(tests/weboracle/*.json)
   + Zan 侧驱动(*_driver.zan)输出同名 `sel x,y wxh` 行 `--compare` 对比;
-  basic 7 盒 + collapse 8 盒(塌陷/塌穿/BFC 关链/auto 居中/文本块)均 0px
-  偏差;其余偏差记录在 `docs/WEB_GUI_ROADMAP.md` 台账。
+  其余偏差记录在 `docs/WEB_GUI_ROADMAP.md` 台账。
+- **行内混排(行盒,P2)**:`AddText("...")`/`AddKid(span)` 文档序交错 =
+  真混排(16px 文本里混 28px span、inline-block 徽标都按浏览器行盒模型
+  摆);span 不写 line-height/font-size 会**继承父级行高字号**(浏览器同款)。
+  `vertical-align: middle` 对 inline-block = 盒中点对基线向上半个 x 高
+  (浏览器实测语义);`white-space: nowrap` 单行不折、`pre` 把 \n 当硬
+  分段(空行也占高)。字体度量与 Chrome 同源(OS/2 比例下取整),行盒
+  基线/行高逐像素一致;仅行内 run 的 x 有 GDI 整数步进 vs 浏览器小数
+  步进的 ~3px 累计差(台账,自洽渲染不受影响)。
 
 - **`!important` 真的压得住 inline**:带标记的声明单独存、在普通级联
   (含宿主 inline)之后统一再套一遍,不是"剥掉标记按顺序碰运气"。

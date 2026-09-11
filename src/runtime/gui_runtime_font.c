@@ -1083,8 +1083,24 @@ EXPORT i32 zan_gui_measure_text(const char *text, i32 font_size) {
 
 EXPORT i32 zan_gui_font_height(i32 font_size) {
 #ifdef ZAN_GUI_FREETYPE
+    if (ft_prepare((int)font_size)) {
+        /* Chrome content box: floor(ascender) + floor(|descender|), no
+         * lineGap -- not round(height), which can differ by a pixel. */
+        FT_Size_Metrics m = g_ft_face->size->metrics;
+        i32 asc = (i32)(m.ascender >> 6);
+        i32 desc = (i32)((0 - m.descender) >> 6);
+        return (i64)(asc + desc);
+    }
+#endif
+    return bitmap_font_height(font_size);
+}
+
+/* Baseline ascent (FreeType hhea ascender, 26.6 -> px). The software
+ * bitmap raster has no real metrics, so it reports the full cell height. */
+EXPORT i32 zan_gui_font_ascent(i32 font_size) {
+#ifdef ZAN_GUI_FREETYPE
     if (ft_prepare((int)font_size))
-        return (i64)(g_ft_face->size->metrics.height >> 6);
+        return (i64)(g_ft_face->size->metrics.ascender >> 6);
 #endif
     return bitmap_font_height(font_size);
 }

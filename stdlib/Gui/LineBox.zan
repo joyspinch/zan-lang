@@ -1,0 +1,231 @@
+namespace Gui;
+
+/// 行盒排版（WEB_GUI_ROADMAP P2）：把块流容器里的行内内容——容器
+/// 自身文本 + `inline`/`inline-block` 子项——排成一行或多行，几何
+/// 按 CSS 2.1 的 A/D（基线上/下）模型：每 piece 贡献
+/// asc = 字体 ascent + 半行距，desc = 行高 − asc；行高 = max(asc)
+/// + max(desc)，每行再叠加容器的 strut（块自身字体/行高）。
+/// 折行逐 piece 贪心；text-align 落位时分配剩余空间；
+/// vertical-align 支持 baseline/middle/top/bottom。
+class InlinePiece {
+    Control owner;      // 文本所有者（原子盒 = 盒子本身）；strut 为 null
+    bool isStrut;       // 行盒支柱：只贡献行高，不落位
+    bool isBox;         // 原子盒（inline-block/带子元素的行内容器）
+    bool isSpace;       // 可折叠空白（normal 分词；行首/断点处消失，不绘制）
+    bool hardBreak;     // 此 piece 后强制断行（white-space:pre 的 \n）
+    string text;        // 文本内容（空格 piece 为单个空格）
+    StyleBox st;        // 生效样式（owner 的计算样式）
+    int fs;             // 字号
+    int w;              // 度量宽（原子盒含水平 margin）
+    int lh;             // 行高贡献
+    int asc;            // 基线上高（原子盒 = margin-top + 盒高）
+    int desc;           // 基线下高（= lh − asc；原子盒 = margin-bottom）
+    int ascOff;         // 绘制偏移：DrawText y = 行内 top + ascOff
+    int boxH;           // 原子盒高（不含 margin）
+    int ml;             // 原子盒水平 margin
+    int mr;
+    int x;              // Layout 输出：行内 x（未含对齐偏移）
+}
+
+/// 块流内容序列的条目（P2）：文本块（text 非空）或子项。块流容器
+/// 按文档序分段——文本与行内子项连续的区段合成匿名块排行盒，
+/// 块级子项截断段（CSS 匿名块模型）。
+class FlowEntry {
+    string text;
+    Control kid;
+}
+
+/// 一个行盒：pieces（含空格）+ 合计宽 + 基线上/下高。
+class InlineLine {
+    List<InlinePiece> pieces;
+    int width;
+    int asc;
+    int desc;
+}
+
+/// 一次行内段的排版结果（MeasureFlow/ArrangeFlow 共用同一份，
+/// 测量端读 height/width，排布端落位 lines）。
+class FlowSegment {
+    List<InlineLine> lines;
+    int height;         // Σ 行高
+    int width;          // 最宽行
+}
+
+class LineBox {
+    /// 文本 piece：按样式折算字号/行高/基线（半行距模型）。
+    static InlinePiece MakeText(Control owner, StyleBox st, string text,
+                                bool space) {
+        InlinePiece p = new InlinePiece();
+        p.owner = owner;
+        p.st = st;
+        p.text = text;
+        p.isSpace = space;
+        p.fs = st.fontPx > 0 ? st.fontPx
+            : (st.envRemPx > 0 ? st.envRemPx : 14);
+        if (space) {
+            p.w = StyleBox.MeasureSpaced(" ", p.fs, st.letterSpacing);
+        } else {
+            p.w = StyleBox.MeasureSpaced(text, p.fs, st.letterSpacing);
+        }
+        p.lh = st.LineHeightPx(p.fs);
+        if (p.lh <= 0) { p.lh = Canvas.FontHeight(p.fs); }
+        int cellAsc = Canvas.FontAscent(p.fs);
+        int cellDesc = Canvas.FontHeight(p.fs) - cellAsc;
+        int lead = p.lh - cellAsc - cellDesc;
+        // Chrome 的半行距分配对负 lead 向下取整（lead=-1 时 asc 也减 1，
+        // 基线探针实测），C 风格的 / 向零截断会把基线整体抬高 1px。
+        int half = lead / 2;
+        if (lead < 0 && lead % 2 != 0) { half = half - 1; }
+        p.asc = cellAsc + half;
+        p.desc = p.lh - p.asc;
+        p.ascOff = p.asc - cellAsc;
+        return p;
+    }
+
+    /// 原子盒 piece（inline-block 等）：基线对齐时下 margin 边坐在
+    /// 基线上（CSS 10.8.1），asc = margin-top + 盒高、desc = margin-bottom。
+    /// va:middle 时盒中点对到基线向上半个 x 高（浏览器实测语义，
+    /// CSS 原文的 "baseline + 半 x 高" 是排版向上方向的加法），
+    /// 行内 A/D 贡献改为盒相对基线上下伸出的部分。
+    static InlinePiece MakeBox(Control kid, int w, int h,
+                               int ml, int mr, int mt, int mb, StyleBox st,
+                               int xhHalf) {
+        InlinePiece p = new InlinePiece();
+        p.owner = kid;
+        p.isBox = true;
+        p.st = st;
+        p.fs = st.fontPx > 0 ? st.fontPx
+            : (st.envRemPx > 0 ? st.envRemPx : 14);
+        p.boxH = h;
+        p.ml = ml;
+        p.mr = mr;
+        p.w = w + ml + mr;
+        if (st.vaInline == 1 && xhHalf > 0) {
+            p.asc = h / 2 + xhHalf;
+            p.desc = h - p.asc;
+        } else {
+            p.asc = mt + h;
+            p.desc = mb;
+        }
+        p.lh = p.asc + p.desc;
+        return p;
+    }
+
+    /// 容器支柱（strut）：块的字体/行高参与每一行的 A/D 竞争。
+    static InlinePiece MakeStrut(StyleBox st) {
+        InlinePiece p = MakeText(null, st, "", false);
+        p.isStrut = true;
+        p.w = 0;
+        return p;
+    }
+
+    /// 把一段文本拆成 piece 序列。white-space：
+    /// 0 normal / 1 nowrap——空白折叠成单空格 piece、按词可断；
+    /// 2 pre / 3 pre-wrap——按 \n 硬分段，空白原样保留、段内不断
+    /// （空段也给 piece，保住空行的高度）。
+    static void PushText(List<InlinePiece> sink, Control owner, StyleBox st,
+                         string text) {
+        int mode = st.whiteSpace;
+        if (mode == 2 || mode == 3) {
+            int start = 0;
+            int len = text.Length;
+            for (int i = 0; i <= len; i = i + 1) {
+                if (i == len || text[i] == 10) {
+                    string seg = text.Substring(start, i - start);
+                    InlinePiece p = MakeText(owner, st, seg, false);
+                    if (i < len) { p.hardBreak = true; }
+                    sink.Add(p);
+                    start = i + 1;
+                }
+            }
+            return;
+        }
+        int n = text.Length;
+        int k = 0;
+        while (k < n) {
+            int b = text[k];
+            if (b == 32 || b == 9 || b == 13 || b == 10) {
+                while (k < n) {
+                    int c = text[k];
+                    if (c != 32 && c != 9 && c != 13 && c != 10) { break; }
+                    k = k + 1;
+                }
+                sink.Add(MakeText(owner, st, " ", true));
+            } else {
+                int e = k;
+                while (e < n) {
+                    int c = text[e];
+                    if (c == 32 || c == 9 || c == 13 || c == 10) { break; }
+                    e = e + 1;
+                }
+                sink.Add(MakeText(owner, st, text.Substring(k, e - k), false));
+                k = e;
+            }
+        }
+    }
+
+    /// 排版：贪心填行。nowrap 的 piece 自身不引发行首断行
+    /// （white-space 是逐 owner 的）；pre 的硬断行永远生效。
+    /// strut 参与（但不属于）每一行。
+    static void Layout(List<InlinePiece> items, InlinePiece strut,
+                       int availW, List<InlineLine> sink) {
+        if (availW <= 0) { availW = 1; }
+        InlineLine cur = new InlineLine();
+        cur.pieces = new List<InlinePiece>();
+        int x = 0;
+        for (int i = 0; i < items.Count; i = i + 1) {
+            InlinePiece p = items[i];
+            bool canBreak = true;
+            if (p.st != null && p.st.whiteSpace == 1 && !p.hardBreak) {
+                canBreak = false;
+            }
+            if (p.isSpace) {
+                if (cur.pieces.Count == 0) { continue; }
+                if (x + p.w > availW) { continue; }
+                p.x = x;
+                x = x + p.w;
+                cur.pieces.Add(p);
+                continue;
+            }
+            if (canBreak && cur.pieces.Count > 0 && x + p.w > availW) {
+                x = Flush(cur, x, strut, sink);
+                cur = new InlineLine();
+                cur.pieces = new List<InlinePiece>();
+            }
+            p.x = x;
+            x = x + p.w;
+            cur.pieces.Add(p);
+            if (p.hardBreak) {
+                x = Flush(cur, x, strut, sink);
+                cur = new InlineLine();
+                cur.pieces = new List<InlinePiece>();
+            }
+        }
+        Flush(cur, x, strut, sink);
+    }
+
+    /// 结束当前行（裁掉行尾空白，行高 = strut 与 pieces 的 A/D 竞争）。
+    /// 返回 0 供调用方重置 x。
+    static int Flush(InlineLine cur, int width, InlinePiece strut,
+                     List<InlineLine> sink) {
+        while (cur.pieces.Count > 0) {
+            InlinePiece last = cur.pieces[cur.pieces.Count - 1];
+            if (!last.isSpace) { break; }
+            width = width - last.w;
+            cur.pieces.RemoveAt(cur.pieces.Count - 1);
+        }
+        if (cur.pieces.Count == 0) { return 0; }
+        int asc = strut != null ? strut.asc : 0;
+        int desc = strut != null ? strut.desc : 0;
+        for (int i = 0; i < cur.pieces.Count; i = i + 1) {
+            InlinePiece p = cur.pieces[i];
+            if (p.asc > asc) { asc = p.asc; }
+            if (p.desc > desc) { desc = p.desc; }
+        }
+        cur.width = width;
+        cur.asc = asc;
+        cur.desc = desc;
+        sink.Add(cur);
+        return 0;
+    }
+}

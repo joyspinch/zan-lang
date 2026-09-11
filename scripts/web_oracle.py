@@ -76,13 +76,25 @@ def chrome_rects(case):
     return m.group(1)[len("RECTS:"):].split("|")
 
 
+RECT_RE = re.compile(r"(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)\s+"
+                     r"(-?\d+(?:\.\d+)?)x(-?\d+(?:\.\d+)?)")
+
+
+def rect_ints(text):
+    """`x,y wxh` 四元组（Chrome 会给小数坐标，四舍五入到整像素）。"""
+    m = RECT_RE.search(text)
+    if not m:
+        return None
+    return tuple(int(round(float(g))) for g in m.groups())
+
+
 def parse_side(path):
     """Zan 侧输出：`任意前缀 x,y wxh` —— 按行顺序与 selectors 对齐。"""
     rows = []
     for line in io_code(path):
-        m = re.search(r"(-?\d+),(-?\d+)\s+(-?\d+)x(-?\d+)", line)
-        if m:
-            rows.append(tuple(int(g) for g in m.groups()))
+        r = rect_ints(line)
+        if r is not None:
+            rows.append(r)
     return rows
 
 
@@ -115,8 +127,12 @@ def main():
         for i, sel in enumerate(sels):
             if i >= len(zan):
                 break
-            m = re.search(r"(-?\d+),(-?\d+)\s+(-?\d+)x(-?\d+)", rects[i])
-            cx, cy, cw, chh = (int(g) for g in m.groups())
+            cr = rect_ints(rects[i])
+            if cr is None:
+                print(f"  [DIFF] {sel}: unparseable chrome rect {rects[i]!r}")
+                bad += 1
+                continue
+            cx, cy, cw, chh = cr
             zx, zy, zw, zh = zan[i]
             diff = max(abs(cx - zx), abs(cy - zy), abs(cw - zw), abs(chh - zh))
             tag = "ok" if diff <= args.tol else "DIFF"
