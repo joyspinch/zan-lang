@@ -1,0 +1,381 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Legend;
+
+/// 页 21「铁匠铺」——照原版还原（`铁匠铺.png`）。
+///
+/// 四块：
+///   ① 左上「装备洗炼」面板（384..634 × 170..540）：主材料格 + 大片展示区 + 底部价格
+///   ② 左下一列操作钮（661..746）：切换仓库/入库(E)/加锁/放入/整理 + 贴底「清空材料」
+///   ③ 右上材料格阵（753..1485 × 173..540）：**12 列 × 7 行**，格子里的道具只叠
+///      图标 + 角标（堆叠数白字、强化 `+N` 黄字）
+///   ④ 左下「开始锻造(D)」+ 当前模式 + 3×4 功能钮；右下「金币洗炼」说明面板
+///
+/// 格阵底图用 `assets/ui/00082.jpg`（488×249，**本来就是 12×7 的暗格阵**），
+/// `stretch` 到实测尺寸即严丝合缝——格子不是一格格画出来的（同一课在背包页
+/// 已经踩过：`REFERENCE_AUDIT §5.11`）。格内道具走共享 `Slots.SlotArt`（只叠
+/// 图标 + 角标，不画格框），说明文字的分段换色走共享 `TableUi.TextSeg`。
+///
+/// **素材缺口（登记）**：① 装备洗炼面板那层深青铜绞纹底图在 assets 里没有
+/// （对全 assets 做多尺度 NCC，最高仅 0.35 = 噪声），这里用深底 + 亮边近似；
+/// ② 「开始锻造(D)」原版是米金几何外框 + 暗红渐变面板的专用图，同样没找到，
+/// 用纯色暗红 + 米金描边近似；③ 格阵里那个扁平米金道具没在 items.csv 里认出
+/// 同款，占位用黑铁矿石(id 223，`forge.csv` 的 `iron` 列真正消耗的材料)。
+/// 格里的数量/强化等级都是服务端下发项，本页只把数据结构与版式准备好。
+partial class LegendApp {
+
+    // ---------------------------------------------------------------- 数据
+
+    /// 材料格阵的可见快照（照 `铁匠铺.png` 逐格抄前 5 行，其余 2 行为空）。
+    /// 令牌语义：`166` = 堆叠数（白字），`+5` = 强化等级（黄字），`""` = 空格。
+    static List<string> SmgGridTokens() {
+        List<string> v = new List<string>();
+        v.Add("166"); v.Add("162"); v.Add("175"); v.Add("181"); v.Add("170"); v.Add("183");
+        v.Add(""); v.Add("+5"); v.Add("+1"); v.Add("+1"); v.Add(""); v.Add("");
+        v.Add(""); v.Add("+5"); v.Add(""); v.Add("+3"); v.Add(""); v.Add("");
+        v.Add(""); v.Add(""); v.Add(""); v.Add("+2"); v.Add(""); v.Add("");
+        v.Add(""); v.Add(""); v.Add(""); v.Add(""); v.Add("+1"); v.Add("");
+        v.Add(""); v.Add("+2"); v.Add("+4"); v.Add(""); v.Add(""); v.Add("+2");
+        v.Add("+3"); v.Add(""); v.Add(""); v.Add(""); v.Add("+4"); v.Add("");
+        v.Add(""); v.Add(""); v.Add("+1"); v.Add("+3"); v.Add(""); v.Add("");
+        v.Add(""); v.Add(""); v.Add(""); v.Add(""); v.Add("+10"); v.Add("");
+        v.Add(""); v.Add(""); v.Add(""); v.Add(""); v.Add(""); v.Add("+2");
+        for (int i = 0; i < 24; i = i + 1) { v.Add(""); }
+        return v;
+    }
+
+    /// 格阵里材料的道具号（占位：黑铁矿石，见类注释的素材缺口③）。
+    static int SmgMatItemId() { return 223; }
+
+    /// 格阵里的道具图（黑铁矿石 `picture = 285`）。
+    static string SmgMatArt() { return ItemArtById(SmgMatItemId()); }
+
+    /// 左列操作钮（顺序即原版自上而下）。
+    static List<string> SmgOps() {
+        List<string> v = new List<string>();
+        v.Add("切换仓库"); v.Add("入库(E)"); v.Add("加锁"); v.Add("放入"); v.Add("整理");
+        return v;
+    }
+
+    /// 3×4 功能钮（`""` = 原版那个空位）。前 4 个来自 `data/forge.csv` 的
+    /// 四种洗炼/升级操作，其余是装备/符文/天赋类的进阶玩法。
+    static List<string> SmgFuncs() {
+        List<string> v = new List<string>();
+        v.Add("金币洗炼"); v.Add("元宝洗炼"); v.Add(""); v.Add("幸运传承");
+        v.Add("黑铁升级"); v.Add("装备升级"); v.Add("符文吞噬"); v.Add("天赋转换");
+        v.Add("符文之语"); v.Add("龙珠升级"); v.Add("天赋转移"); v.Add("传说培养");
+        return v;
+    }
+
+    /// 右下说明面板的 tab 条（右对齐的一组）。
+    static List<string> SmgTabs() {
+        List<string> v = new List<string>();
+        v.Add("取出"); v.Add("说明"); v.Add("天书"); v.Add("内功"); v.Add("宝石"); v.Add("介绍");
+        return v;
+    }
+
+    /// 说明面板的正文——**按面板宽度预折行**（约 45 字/行）。
+    /// 返回的是「行」的列表：空列表 = 段落之间的空行（原版段间距比行距大）。
+    /// 行内换色靠分段，跨行的彩色词（如「主材料」）在两行里各带一次类。
+    static List<TextSeg> SmgL1(string t1, string c1) {
+        List<TextSeg> v = new List<TextSeg>();
+        v.Add(TextSegOf(t1, c1));
+        return v;
+    }
+
+    static List<TextSeg> SmgL2(string t1, string c1, string t2, string c2) {
+        List<TextSeg> v = SmgL1(t1, c1);
+        v.Add(TextSegOf(t2, c2));
+        return v;
+    }
+
+    static List<TextSeg> SmgL3(string t1, string c1, string t2, string c2,
+                               string t3, string c3) {
+        List<TextSeg> v = SmgL2(t1, c1, t2, c2);
+        v.Add(TextSegOf(t3, c3));
+        return v;
+    }
+
+    static List<TextSeg> SmgL4(string t1, string c1, string t2, string c2,
+                               string t3, string c3, string t4, string c4) {
+        List<TextSeg> v = SmgL3(t1, c1, t2, c2, t3, c3);
+        v.Add(TextSegOf(t4, c4));
+        return v;
+    }
+
+    static List<TextSeg> SmgL5(string t1, string c1, string t2, string c2,
+                               string t3, string c3, string t4, string c4,
+                               string t5, string c5) {
+        List<TextSeg> v = SmgL4(t1, c1, t2, c2, t3, c3, t4, c4);
+        v.Add(TextSegOf(t5, c5));
+        return v;
+    }
+
+    static List<TextSeg> SmgEmptyLine() { return new List<TextSeg>(); }
+
+    static List<List<TextSeg>> SmgBody() {
+        List<List<TextSeg>> v = new List<List<TextSeg>>();
+
+        /* 每行控制在 ~34 个汉字以内（34 × 17.6 ≈ 600 设备）：面板可用宽
+           约 800 设备，留足余量——原版是折行的，且标准库 Label 的测量宽比
+           画字宽窄，行太长会一段段截尾。 */
+        v.Add(SmgL5("普通洗炼可以将装备的", "smg-txt", "系数重组", "smg-yellow",
+                    "，可以使装备发挥它最", "smg-txt", "强", "smg-green",
+                    "的光芒。", "smg-txt"));
+        v.Add(SmgEmptyLine());
+
+        v.Add(SmgL3("消耗", "smg-txt", "金币", "smg-yellow",
+                    "就可以对装备进行普通洗炼，但是有几率会", "smg-txt"));
+        v.Add(SmgL3("降低系数", "smg-red",
+                    "，请慎重选择右击需要洗炼的装备到", "smg-txt",
+                    "主材料", "smg-bold"));
+        v.Add(SmgL3("栏中，然后点击“", "smg-txt", "普通洗炼", "smg-yellow",
+                    "”开始洗炼。", "smg-txt"));
+        v.Add(SmgEmptyLine());
+
+        v.Add(SmgL1("装备的系数越高，所需要的费用越多，请注意金币是否足够。", "smg-txt"));
+        v.Add(SmgEmptyLine());
+
+        v.Add(SmgL3("如果对当前的洗炼效果不满意，可以选择", "smg-txt",
+                    "特殊洗炼", "smg-cyan",
+                    "，消耗元宝进行洗炼。", "smg-txt"));
+        v.Add(SmgL1("普通洗炼有风险需要谨慎进行，祝你好运！", "smg-txt"));
+        return v;
+    }
+
+    /// 当前锻造模式（原版「当前模式：普通洗炼」）。
+    string smgMode = "普通洗炼";
+
+    // ---------------------------------------------------------------- 版面
+
+    void BuildSmithyPage() {
+        Panel row = Panel.Row(); row.Class = "smg-page";
+        row.Pad(0); row.Gap(0);
+        row.Padding(Spec.SmgPadT(), 0, 0, Spec.SmgPadL());
+        content.With(row);
+
+        Panel left = Panel.Column(); left.Pad(0); left.Gap(Spec.SmgLeftGap());
+        left.Prefer(Spec.SmgLeftW(), 0);
+        left.With(SmgWashPanel());
+        left.With(SmgForgePanel());
+        row.With(left);
+
+        row.With(SpacerW(Spec.SmgColGap()));
+
+        Panel right = Panel.Column(); right.Pad(0); right.Gap(Spec.SmgRightGap());
+        Panel top = Panel.Row(); top.Pad(0); top.Gap(Spec.SmgBtnToGrid());
+        top.With(SmgOpColumn());
+        top.With(SmgGrid());
+        right.With(top);
+        right.With(SmgTextPanel());
+        row.With(right);
+    }
+
+    /// ① 装备洗炼面板：标题 + 主材料格 + 展示区 + 底部价格。
+    Panel SmgWashPanel() {
+        Panel p = Panel.Column(); p.Class = "smg-wash";
+        p.Pad(0); p.Gap(0);
+        p.Prefer(Spec.SmgLeftW(), Spec.SmgWashH());
+
+        Panel t = Panel.Row(); t.Class = "smg-wash-t";
+        t.Pad(0); t.Prefer(0, Spec.SmgTitleH());
+        t.With(Text("装备洗炼", "smg-title", 0));
+        p.With(t);
+
+        Panel slot = Panel.Row(); slot.Class = "smg-matslot";
+        slot.Pad(0); slot.Prefer(Spec.SmgMatSlotW(), Spec.SmgMatSlotH());
+        slot.With(Text("主材料", "smg-mat-t", 0));
+        Panel slotRow = Panel.Row(); slotRow.Pad(0);
+        slotRow.Padding(0, 0, 0, Spec.SmgMatPadL());
+        slotRow.With(slot);
+        p.With(slotRow);
+
+        /* 展示区：原版是一大片空的面板底（放待洗炼装备的立绘），这里留白。 */
+        Panel view = Panel.Row(); view.Class = "smg-view";
+        view.Pad(0); view.Grow(); p.With(view);
+
+        Panel price = Panel.Row(); price.Class = "smg-price";
+        price.Pad(0); price.Prefer(0, Spec.SmgPriceH());
+        price.Padding(0, 0, 0, Spec.SmgMatPadL());
+        price.With(Text("价格", "smg-yellow", 0));
+        p.With(price);
+        return p;
+    }
+
+    /// ② 左列操作钮：5 个自上而下 + 贴底「清空材料」。
+    Panel SmgOpColumn() {
+        Panel col = Panel.Column(); col.Pad(0); col.Gap(Spec.SmgOpGap());
+        col.Prefer(Spec.SmgBtnW(), Spec.SmgGridH());
+        List<string> ops = SmgOps();
+        for (int i = 0; i < ops.Count; i = i + 1) {
+            string lbl = ops[i];
+            Button b = Btn(lbl, "smg-op", () => { SmgAct(lbl); });
+            b.Prefer(Spec.SmgBtnW(), Spec.SmgBtnH());
+            col.With(b);
+        }
+        /* 贴底：先 DockBottom 再 Add（`With` 会按流式布局把 dock 改回 1，
+           所以这里不能用 With）。 */
+        Button clr = Btn("清空材料", "smg-op", () => { SmgAct("清空材料"); });
+        clr.Prefer(Spec.SmgBtnW(), Spec.SmgBtnH());
+        clr.DockBottom();
+        col.Add(clr);
+        return col;
+    }
+
+    /// ③ 材料格阵：底图 `00082.jpg`（12×7 暗格阵）stretch + 逐格叠道具。
+    Panel SmgGrid() {
+        Panel grid = Panel.Row(); grid.Class = "smg-grid";
+        grid.Pad(0); grid.Prefer(Spec.SmgGridW(), Spec.SmgGridH());
+        Image bg = new Image(TableGridPath(), "材料格阵", "stretch");
+        bg.DockFill(); grid.Add(bg);
+
+        List<string> toks = SmgGridTokens();
+        for (int i = 0; i < Spec.SmgCols() * Spec.SmgRows(); i = i + 1) {
+            int c = i % Spec.SmgCols();
+            int r = i / Spec.SmgCols();
+            int x0 = (c * Spec.SmgGridW()) / Spec.SmgCols();
+            int x1 = ((c + 1) * Spec.SmgGridW()) / Spec.SmgCols();
+            int y0 = (r * Spec.SmgGridH()) / Spec.SmgRows();
+            int y1 = ((r + 1) * Spec.SmgGridH()) / Spec.SmgRows();
+            string tok = i < toks.Count ? toks[i] : "";
+            Panel cell = SmgCell(tok, x1 - x0, y1 - y0);
+            cell.DockManual(); cell.Place(x0, y0);
+            grid.Add(cell);
+        }
+        return grid;
+    }
+
+    /// 一格：空格什么都不叠（格框由底图给）；有道具才叠图标 + 角标。
+    Panel SmgCell(string tok, int w, int h) {
+        if (tok.Length == 0) { return SlotArt(w, h, "", "", ""); }
+        bool up = tok.StartsWith("+");
+        string badge = up ? tok : tok;
+        string cls = up ? "slot-badge slot-badge-up" : "slot-badge";
+        return SlotArt(w, h, SmgMatArt(), badge, cls);
+    }
+
+    /// ④ 左下：开始锻造(D) + 当前模式 + 3×4 功能钮。
+    Panel SmgForgePanel() {
+        Panel p = Panel.Column(); p.Class = "smg-forge";
+        p.Pad(0); p.Gap(0);
+        p.Prefer(Spec.SmgLeftW(), Spec.SmgForgeH());
+
+        Button forge = Btn("开始锻造(D)", "smg-forge-btn", () => { SmgForge(); });
+        forge.Prefer(Spec.SmgForgeBtnW(), Spec.SmgForgeBtnH());
+        Panel fr = Panel.Row(); fr.Pad(0); fr.Prefer(0, Spec.SmgForgeBtnH());
+        fr.With(forge);
+        p.With(fr);
+
+        p.With(VGap(Spec.SmgModeGap()));
+        Panel mode = Panel.Row(); mode.Class = "smg-mode";
+        mode.Pad(0); mode.Prefer(0, Spec.SmgModeH());
+        mode.With(Text("当前模式:", "smg-cyan", 0));
+        mode.With(Text(" " + smgMode, "smg-mode-v", 0));
+        p.With(mode);
+
+        p.With(VGap(Spec.SmgFuncPadT()));
+        List<string> fns = SmgFuncs();
+        for (int r = 0; r < 3; r = r + 1) {
+            Panel row = Panel.Row(); row.Pad(0); row.Gap(Spec.SmgFuncGap());
+            row.Prefer(0, Spec.SmgFuncH());
+            for (int c = 0; c < 4; c = c + 1) {
+                int idx = r * 4 + c;
+                string lbl = idx < fns.Count ? fns[idx] : "";
+                if (lbl.Length == 0) {
+                    row.With(SpacerW(Spec.SmgFuncW()));
+                    continue;
+                }
+                row.With(SmgFuncBtn(lbl));
+            }
+            p.With(row);
+        }
+        return p;
+    }
+
+    /// 功能钮：原版是 4 字标签**折成两行**（「金币」/「洗炼」）的小方块。
+    /// 按钮本体用共享 `Button` 的皮（`.smg-func` 类），文字用两行 Label——
+    /// 单行 4 字在 60 设备的格子里放不下（实测只剩「金币…」）。
+    Panel SmgFuncBtn(string lbl) {
+        Panel b = Panel.Column(); b.Class = "smg-func";
+        b.Pad(0); b.Gap(0); b.Prefer(Spec.SmgFuncW(), Spec.SmgFuncH());
+        b.Named("smg-func-" + lbl);
+        string label = lbl;
+        b.OnClick(() => { SmgPickMode(label); });
+        /* Zan 的字符串下标是**字节**（UTF-8）不是字符：`Substring(0, 2)` 在
+           「金币洗炼」上会把「金」的 3 字节截成 2 字节——实测出来是两行
+           「金…」「币洗炼」这种半个字。汉字按 3 字节算，前 2 个字 =
+           Substring(0, 6)。 */
+        int cut = Spec.Px(4);  // 6 字节 = 2 个汉字
+        string a = label.Length > cut ? label.Substring(0, cut) : label;
+        string c = label.Length > cut ? label.Substring(cut, label.Length - cut) : "";
+        b.With(Text(a, "smg-func-t", 0));
+        if (c.Length > 0) { b.With(Text(c, "smg-func-t", 0)); }
+        return b;
+    }
+
+    /// ④ 右下：说明面板（标题 + 4 段正文 + 右上 tab 条）。
+    Panel SmgTextPanel() {
+        Panel p = Panel.Column(); p.Class = "smg-text";
+        p.Pad(0); p.Gap(0);
+        p.Prefer(Spec.SmgTextW(), Spec.SmgTextH());
+
+        Panel tabs = Panel.Row(); tabs.Class = "smg-tabs";
+        tabs.Pad(0); tabs.Gap(Spec.SmgTabGap());
+        tabs.Prefer(0, Spec.SmgTabH());
+        List<string> names = SmgTabs();
+        for (int i = 0; i < names.Count; i = i + 1) {
+            int idx = i;
+            Button b = Btn(names[i], i == 1 ? "smg-tab smg-tab-on" : "smg-tab",
+                           () => { SmgTab(idx, names[idx]); });
+            b.Prefer(Spec.SmgTabW(), Spec.SmgTabH());
+            tabs.With(b);
+        }
+        Panel tabRow = Panel.Row(); tabRow.Pad(0); tabRow.Prefer(0, Spec.SmgTabH());
+        Panel tabFill = Panel.Row(); tabFill.Grow(); tabRow.With(tabFill);
+        tabRow.With(tabs);
+        p.With(tabRow);
+
+        Panel title = Panel.Row(); title.Class = "smg-body-t";
+        title.Pad(0); title.Prefer(0, Spec.SmgBodyTitleH());
+        title.Padding(0, 0, 0, Spec.SmgTextPadL());
+        title.With(Text("金币", "smg-yellow", 0));
+        title.With(Text("洗炼", "smg-cyan", 0));
+        p.With(title);
+
+        List<List<TextSeg>> body = SmgBody();
+        for (int i = 0; i < body.Count; i = i + 1) {
+            if (body[i].Count == 0) { p.With(VGap(Spec.SmgParaGap())); continue; }
+            Panel row = TextSegRow(body[i], "smg-body", Spec.SmgBodyH());
+            row.Padding(0, 0, 0, Spec.SmgTextPadL());
+            p.With(row);
+        }
+        return p;
+    }
+
+    // ---------------------------------------------------------------- 事件
+
+    /// 格阵/操作钮：玩法逻辑接服务端，离线只回一句，不假装已实现。
+    void SmgAct(string what) {
+        SmgSay("铁匠铺：" + what + "（操作待接服务端）。");
+    }
+
+    void SmgPickMode(string mode) {
+        smgMode = mode;
+        SmgSay("当前模式切换为：" + mode + "。");
+        BuildPage(); Refresh();
+    }
+
+    void SmgForge() {
+        SmgSay("开始锻造（" + smgMode + "）：材料与费用校验待接服务端。");
+    }
+
+    void SmgTab(int i, string name) {
+        SmgSay("说明面板「" + name + "」页签待接。");
+    }
+
+    void SmgSay(string msg) {
+        if (net.Self() != null) { net.AddChat("[系统]", msg); return; }
+        g.Log(msg);
+    }
+}
