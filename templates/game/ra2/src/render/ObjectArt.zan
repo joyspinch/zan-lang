@@ -337,6 +337,17 @@ class ObjectArt {
     Texture UnitTexture(UnitType ut, bool moving, int animFrame, int facing,
                         int side, bool deployed, int fireTicks,
                         int proneState) {
+        return this.UnitTexture(ut, moving, animFrame, facing, side,
+                                deployed, fireTicks, proneState, 0, 0);
+    }
+
+    /// <summary>As above, with the deploy transitions: depPoseSeq 0 plays
+    /// the sit-down block going into the emplacement, 1 the pack-up block
+    /// coming out (depPoseTicks counts the two-ticks-a-frame clock down);
+    /// fireTicks draws the DeployedFire block while deployed.</summary>
+    Texture UnitTexture(UnitType ut, bool moving, int animFrame, int facing,
+                        int side, bool deployed, int fireTicks,
+                        int proneState, int depPoseSeq, int depPoseTicks) {
         if (ut == null) { return null; }
         string name = this.ArcticName(ut.ShpName());
         if (name == null || name.Length == 0) { return null; }
@@ -349,6 +360,40 @@ class ObjectArt {
             int sit = ut.DeployedStart() + ring * ut.DeployedFrames();
             if (sit < count) {
                 return this.ShapeTextureFrame(name, sit,
+                                              this.UnitPalFor(side));
+            }
+        }
+        // The Deploy/Undeploy transitions play block frames forward while
+        // their clock runs: seq 0 is the sit-down (Deploy), 1 the pack-up
+        // (Undeploy). Each block is one strip per facing like Walk.
+        if (depPoseTicks > 0) {
+            int ts = depPoseSeq == 0 && ut.HasDeploySeq()
+                ? ut.DeploySeqStart()
+                : depPoseSeq != 0 && ut.HasUndeploySeq()
+                    ? ut.UndeploySeqStart() : 0 - 1;
+            int tf = depPoseSeq == 0 && ut.HasDeploySeq()
+                ? ut.DeploySeqFrames()
+                : depPoseSeq != 0 && ut.HasUndeploySeq()
+                    ? ut.UndeploySeqFrames() : 0;
+            if (tf > 0) {
+                int idx = tf - 1 - depPoseTicks / 2;
+                if (idx < 0) { idx = 0; }
+                int tfr = ts + ring * tf + idx;
+                if (tfr < count) {
+                    return this.ShapeTextureFrame(name, tfr,
+                                                  this.UnitPalFor(side));
+                }
+            }
+        }
+        // The emplacement's own firing block: a deployed man shoots from
+        // DeployedFire, the standing man from FireUp below.
+        if (fireTicks > 0 && deployed && ut.HasDeployedFire()) {
+            int df = ut.DeployedFireFrames() - 1 - fireTicks / 2;
+            if (df < 0) { df = 0; }
+            int dframe = ut.DeployedFireStart()
+                + ring * ut.DeployedFireMult() + df;
+            if (dframe < count) {
+                return this.ShapeTextureFrame(name, dframe,
                                               this.UnitPalFor(side));
             }
         }
@@ -1285,23 +1330,30 @@ class ObjectRenderer {
                                | ((o.PoseSeq() & 1) << 1)
                                | (o.PoseTicks() > 0 ? 4 : 0)
                                | ((o.PoseTicks() / 2 & 63) << 3);
+                int depState = ((o.DepPoseSeq() & 1) << 8)
+                             | (o.DepPoseTicks() & 255);
                 int stamp = (o.Facing() & 15)
                           | ((o.AnimFrame() & 65535) << 4)
                           | ((o.HasRoute() ? 1 : 0) << 20)
                           | ((o.Deployed() ? 1 : 0) << 21)
                           | ((o.Side() & 3) << 22)
-                          | ((proneState & 255) << 24);
+                          | ((proneState & 255) << 24)
+                          | (depState << 32);
                 img = o.ArtStampA() == stamp ? o.ArtTexA() : null;
                 if (img == null) {
                     tex = art.UnitTexture(u, o.HasRoute(), o.AnimFrame(),
                                           o.Facing(), o.Side(), o.Deployed(),
-                                          o.FireTicks(), proneState);
+                                          o.FireTicks(), proneState,
+                                          o.DepPoseSeq(), o.DepPoseTicks());
                     if (tex != null) {
                         string key = "ra2:obj:u:" + u.Reg() + ":" + o.Side()
                             + ":" + Convert.ToString(o.Facing()) + ":"
                             + Convert.ToString(o.AnimFrame())
                             + (o.Deployed() ? ":d"
-                                            : (o.HasRoute() ? ":w" : ":s"));
+                                            : (o.HasRoute() ? ":w" : ":s"))
+                            + (o.DepPoseTicks() > 0
+                               ? ":t" + Convert.ToString(o.DepPoseTicks())
+                               : "");
                         img = Ra2Ui.TexOf(key, tex);
                         o.SetArtCacheA(stamp, img);
                     }

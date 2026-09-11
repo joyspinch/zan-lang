@@ -41,6 +41,9 @@ class WorldObject {
     int suppTicks;       // suppression: the trooper stays prone while > 0
     int poseTicks;       // ticks left in the Down/Up transition
     int poseSeq;         // 0 dropping prone, 1 rising
+    int deposeTicks;     // ticks left in the Deploy/Undeploy transition
+    int deposeSeq;       // 0 sitting down, 1 packing up
+    // (accessors DepPoseTicks/DepPoseSeq below read these)
     int infDeath = 1;    // the killing warhead's InfDeath (retail default
                          // Gunfire on the object; the warhead overwrites)
 
@@ -138,6 +141,8 @@ class WorldObject {
         o.repairAt = 0;
         o.repairCarry = 0;
         o.deployed = false;
+        o.deposeTicks = 0;
+        o.deposeSeq = 0;
         return o;
     }
 
@@ -176,6 +181,8 @@ class WorldObject {
         o.repairAt = 0;
         o.repairCarry = 0;
         o.deployed = false;
+        o.deposeTicks = 0;
+        o.deposeSeq = 0;
         return o;
     }
 
@@ -205,6 +212,8 @@ class WorldObject {
     int SuppTicks() { return this.suppTicks; }
     int PoseTicks() { return this.poseTicks; }
     int PoseSeq() { return this.poseSeq; }
+    int DepPoseTicks() { return this.deposeTicks; }
+    int DepPoseSeq() { return this.deposeSeq; }
 
     /// <summary>Suppress the trooper: he drops prone for 30 ticks (the
     /// reference's SuppressionTrait), playing the Down block first; a
@@ -335,6 +344,8 @@ class WorldObject {
         this.cargo = 0;
         this.dockTimer = 0;
         this.routeCooldown = 0;
+        this.deposeTicks = 0;
+        this.deposeSeq = 0;
         this.repairing = false;
         this.repairAt = 0;
         this.repairCarry = 0;
@@ -498,13 +509,39 @@ class WorldObject {
 
     void SetRoute(List<int> xs, List<int> ys) {
         // A fresh order stands a sat-down trooper back up: the original's
-        // deployed GI packs his emplacement the moment he is told to move.
+        // deployed GI packs his emplacement the moment he is told to move,
+        // and the Undeploy block plays over the transition first.
         if (xs != null && xs.Count > 0 && this.deployed) {
             this.deployed = false;
+            this.StartUndeployPose();
         }
         this.pathX = xs;
         this.pathY = ys;
         this.pathAt = 0;
+    }
+
+    /// <summary>Starts the Undeploy transition art (the pack-up block);
+    /// a no-op when the art ships none.</summary>
+    void StartUndeployPose() {
+        if (this.unitType == null || !this.unitType.HasUndeploySeq()) {
+            return;
+        }
+        this.deposeSeq = 1;
+        this.deposeTicks = this.unitType.UndeploySeqFrames() * 2;
+    }
+
+    /// <summary>Starts the Deploy transition art (the sit-down block);
+    /// the deployed stance itself flips when the block runs out, like the
+    /// reference's transition-then-stance sequencing.</summary>
+    void StartDeployPose() {
+        if (this.unitType == null) { return; }
+        if (this.unitType.HasDeploySeq()) {
+            this.deposeSeq = 0;
+            this.deposeTicks = this.unitType.DeploySeqFrames() * 2;
+            return;
+        }
+        // No transition art shipped: sit down on the spot.
+        this.deployed = true;
     }
 
     /// <summary>The next cell on the route, or -1 when finished.</summary>
@@ -684,6 +721,44 @@ class UnitType {
         this.deployedStart = start;
         this.deployedFrames = frames < 1 ? 1 : frames;
     }
+    // The Deploy/Undeploy transition blocks and the DeployedFire pose,
+    // the reference's getStanceTransitionSequenceBy and DeployedFire
+    // sequence picks for the troops that toggle an emplacement.
+    bool hasDeploySeq;
+    int deploySeqStart;
+    int deploySeqFrames;
+    bool hasUndeploySeq;
+    int undeploySeqStart;
+    int undeploySeqFrames;
+    bool hasDeployedFire;
+    int deployedFireStart;
+    int deployedFireFrames;
+    int deployedFireMult;
+    bool HasDeploySeq() { return this.hasDeploySeq; }
+    int DeploySeqStart() { return this.deploySeqStart; }
+    int DeploySeqFrames() { return this.deploySeqFrames; }
+    bool HasUndeploySeq() { return this.hasUndeploySeq; }
+    int UndeploySeqStart() { return this.undeploySeqStart; }
+    int UndeploySeqFrames() { return this.undeploySeqFrames; }
+    bool HasDeployedFire() { return this.hasDeployedFire; }
+    int DeployedFireStart() { return this.deployedFireStart; }
+    int DeployedFireFrames() { return this.deployedFireFrames; }
+    int DeployedFireMult() { return this.deployedFireMult; }
+    void SetDeploySequences(bool hasD, int ds, int df,
+                            bool hasU, int us, int uf) {
+        this.hasDeploySeq = hasD;
+        this.deploySeqStart = ds;
+        this.deploySeqFrames = df < 1 ? 1 : df;
+        this.hasUndeploySeq = hasU;
+        this.undeploySeqStart = us;
+        this.undeploySeqFrames = uf < 1 ? 1 : uf;
+    }
+    void SetDeployedFireSeq(bool has, int start, int frames, int mult) {
+        this.hasDeployedFire = has;
+        this.deployedFireStart = start;
+        this.deployedFireFrames = frames < 1 ? 1 : frames;
+        this.deployedFireMult = mult;
+    }
     // The firing pose and the two death sequences, copied from the
     // rules-side UnitDef once its art section has been read.
     int fireStart;
@@ -803,6 +878,13 @@ class UnitCatalog {
                           d.WalkFrames());
             t.SetDeployedSequence(d.HasDeployedSeq(), d.DeployedStart(),
                                   d.DeployedFrames());
+            t.SetDeploySequences(d.HasDeploySeq(), d.DeployStart(),
+                                 d.DeployFrames(), d.HasUndeploySeq(),
+                                 d.UndeployStart(), d.UndeployFrames());
+            t.SetDeployedFireSeq(d.HasDeployedFireSeq(),
+                                 d.DeployedFireStart(),
+                                 d.DeployedFireFrames(),
+                                 d.DeployedFireMult());
             t.SetCombatSequences(d);
             t.SetArtKey(d.ArtKey());
             t.SetNewTheater(d.NewTheater());
@@ -2529,8 +2611,14 @@ class World {
             return idx;
         }
         if (ut.Deployer()) {
-            o.SetDeployed(!o.Deployed());
-            o.StopAttack();
+            if (!o.Deployed()) {
+                o.StopAttack();
+                o.StartDeployPose();
+            } else {
+                o.SetDeployed(false);
+                o.StopAttack();
+                o.StartUndeployPose();
+            }
             return idx;
         }
         return -1;
@@ -4624,6 +4712,12 @@ class World {
                     if (o.UnitType().TurretVxl() != null) {
                         o.TurnTurretToward(o.FacingToward(t.X(), t.Y()));
                     }
+                    // A sitting-down or mid-packing man holds his fire --
+                    // the reference's DeployerTrait fires only from the
+                    // Deployed state, never during the transitions.
+                    if (o.Deployed() || o.deposeTicks > 0) {
+                        if (o.deposeTicks > 0) { continue; }
+                    }
                     // Steady fire: reload ticks down each frame, and a shot
                     // lands when the counter reaches zero.
                     int r = o.Reload();
@@ -4631,9 +4725,15 @@ class World {
                         if (this.FireUnit(o, t)) {
                             fired = fired + 1;
                             // The firing pose: one pass through the art's
-                            // FireUp block per shot (two ticks a frame,
-                            // like every other sprite clock here).
-                            if (o.UnitType().HasFire()) {
+                            // fire block per shot (two ticks a frame, like
+                            // every other sprite clock here) -- the
+                            // emplacement shoots from DeployedFire, the
+                            // standing man from FireUp.
+                            if (o.Deployed()
+                             && o.UnitType().HasDeployedFire()) {
+                                o.SetFireTicks(
+                                    o.UnitType().DeployedFireFrames() * 2);
+                            } else if (o.UnitType().HasFire()) {
                                 o.SetFireTicks(
                                     o.UnitType().FireFrames() * 2);
                             }
@@ -4737,6 +4837,14 @@ class World {
             if (o.Kind() != ObjKind.Unit()) { continue; }
             if (o.fireTicks > 0) { o.fireTicks = o.fireTicks - 1; }
             if (o.poseTicks > 0) { o.poseTicks = o.poseTicks - 1; }
+            if (o.deposeTicks > 0) {
+                o.deposeTicks = o.deposeTicks - 1;
+                // The sit-down block ran out: the emplacement stands.
+                if (o.deposeTicks <= 0 && o.deposeSeq == 0
+                 && !o.Deployed()) {
+                    o.SetDeployed(true);
+                }
+            }
             if (o.suppTicks > 0) {
                 o.suppTicks = o.suppTicks - 1;
                 if (o.suppTicks <= 0 && !o.IsDead()) {
@@ -4746,7 +4854,8 @@ class World {
                     o.poseTicks = o.PoseBlockFrames(1) * 2;
                 }
             }
-            if (o.Frozen() > 0 || o.Deployed() || !o.HasRoute()) { continue; }
+            if (o.Frozen() > 0 || o.Deployed() || o.deposeTicks > 0
+             || !o.HasRoute()) { continue; }
             int bank = o.MoveAccum() + o.UnitType().Speed();
             while (bank >= Rules.CellMoveCost() && o.HasRoute()) {
                 bank = bank - Rules.CellMoveCost();
