@@ -763,6 +763,32 @@ pt/pc/cm/mm/in/q）+ `calc()/min()/max()/clamp()`；`%` 在各属性原有通道
   css_coverage_audit：white-space/vertical-align 移出 FLOW_ONLY 与
   no-consumer 名单（P2 行盒真实消费）。
 
+* **P3 float**（2026-09-12，b432d5c0 + 9ddcffa5）：**float 放位**
+  （PlaceFloatKid，测量/排布两端同式）——clear 先推 → 左 float 贴同行
+  同侧右缘/右 float 镜像贴右 → 放不下 `NextShelf` 下坠（16 次防呆原地
+  溢出）；**CSS 9.5.1 规则 2**——后声明 float 顶边不低于先声明 float
+  顶边（oracle 实测：f3 坠到 61 后 f4 不能回 y=1 的空档，被顶到 61 起
+  找位、撞 f3 再坠 100）。**行盒绕排**——`FloatIntrusion` 入侵表
+  （容器内容框流坐标）经 `SetHostFloats` 按位移换算下传子块，auto 高
+  子块带表重测；`LayoutF` 在**行顶处**查 `LineAvail`（Chrome 同款：
+  float 贴着行底擦过不收窄本行），piece 放不下且 xOff 越过可用右缘 →
+  整行下坠下一搁架、从行首重排；行几何（xOff/availW/yOff）随
+  `InlineLine` 记录，**InlineLine.yOff**——下坠后行间有空洞，段高 =
+  最大行底、落位 = 段顶+yOff（盲路径 yOff=累加值，P2 几何逐 bit 不变，
+  LineAD 整行复查方案废弃：会把行错误滑过贴底 float）。**clearance 不进
+  margin 塌陷链**——物理位移在 margin 结算后直接推进流位置（非分隔
+  容器首占位块的 margin-top 会塌出容器，clearance 混进 kmt 就跟着丢：
+  cbox 50+20=70 依赖此修复，测量/排布两端同修）。**BFC 收编**（CSS
+  10.6.7）——flow-root auto 高至少到自己放的最低 float 底；非 BFC
+  float 溢出（Chrome 同款）。css_test 新增 DisplayFloat 断言段（17 盒
+  几何 + BFC/clearance 标量）；oracle float（tests/weboracle/float.json
+  + *_driver.zan）：17 盒 11 精确、6 处 ≤2px 同根因（Chrome strut desc
+  进位 vs Zan floor 的逐行累计，台账；x 几何与单行内逐像素一致）。
+  台账新增三条：行高分数取整逐行累计、块级 strut font-size 不继承
+  （fixture 显式声明，继承链留 P5）、BFC 盒被祖先 float 挤窄未实现。
+  conformance_gui_css Passed；smoke 256 仅 HEAD 已知失败
+  （pagination/transfer）。
+
 ---
 
 # A17-A31 历史修复记录（全部完成，一行摘要）
@@ -1696,7 +1722,7 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
 * **WSL soak：mallocng 高压下概率崩溃（09-09 WSL 稳定性测试定位，待根因）**：server-game 模板 musl 静态链（`--target linux-musl`，cross 链路带 zanrt_mem.o + --wrap=malloc/calloc/realloc，小对象走 zan 槽位分配器、>2048B 落 musl mallocng）在 soak 驱动 ~6700 req/s 混合压（HTTP /api/auth/login + /register 表单 + TCP 网关 register/login 6 worker）约 11 分钟、累计 ~22 万请求后 SIGSEGV：faulting ip 落 musl `__malloc_allzerop`（mallocng 元数据一致性检查内），addr=0x85a414e5d（野值），无 Zan 侧栈帧（FP 链断），日志无前置异常。当时 RSS≈74MB、CPU 30-57%。归因：复跑 24 轮同形状压测（每轮 360 注册/登录×6 并发、1080 TCP op）+ 2400 串行化 admin 登录 + 1600 短连接 + 200 空闲连接悬挂，全部稳定（RSS 爬升到 82-86MB 后平台化，TokenBox 10 天 TTL 不回收是预期），未能复现——首轮崩溃发生时段恰是压测速率最高（6700/s，是复跑的 ~5 倍）+ register 落库风暴，嫌疑集中在 mallocng 多线程竞争（单线程 M:1 调度器但 runtime 侧 CreateThread/blocking-worker 仍并发 malloc）或某个高频路径的堆破坏只在特定节奏触发。修复方向：① musl mallocng 崩溃面用 musl 自己的 `malloc_usable_size`/调试配置先抓现行（`MALLOC_ARENA` 不适用，考虑换 `--target linux-x64` glibc 版对照复跑）；② zanrt_mem.o 把 >2048B 的中块也纳入槽位管理（现 4096 的 byte[]/大 frame 全落 mallocng）；③ zan 内存审计工具（arc_guard/quarantine）在 musl 静态链下开 `-DZAN_DEBUG` 复跑抓 first-fault。注：HTTP 安全扫描发现模板层 MEDIUM（/api/auth/login 无速率限制/锁定，12 连败无退避）与 LOW（缺 X-Frame-Options/CSP/X-Content-Type-Options/HSTS 四个防御头，Server banner 泄露版本）——模板/框架层决策，另行处理；TCP 网关对裸连接无帧长上限（9KB op 名照收）与无握手超时（半开连接 8s 不超时），属网关加固项。
 * **leakcheck_checkbox_group 引用环**（A57 顺带定位，未修）：`FormBuilder.zan` 的 `MakeItem` 每个选项泄漏一个闭包（15 选项 15 泄漏）——组持有子 Checkbox、子的 `Change` 事件表持有捕获了组的闭包（ARC 不回收环）；同源 `Gui/Event.zan:142` 的 490 个 `List<Action>`。可选修法：`Control.OnChildChanged` 虚钩子由子控件经 parent 反向通知、彻底不建闭包；会动 `Control.zan`（= A58 4.1），与 GUI 并行编辑协调后做。
 * **A64b leakcheck（keepalive/tunnel 已修，余 4 项待查）**：http_forwarder_tunnel 的 29 对象已修（见 A302）；**http_forwarder_keepalive 的 1 对象已修（2026-09-12，用例侧）**——泄漏物是用例**自己的上游 listener**（9631 端口），不是 fwd 的：`Upstream()` 是 `while(true)` 无界 accept 循环，`Run()` 收尾只 `fwd.Stop()`，上游监听器永远没人停 → 第 7 个 accept 帧永久停摆，ramp 对接收者的 +1 与帧本地 `l` 的 +1 在退出时都还在（async 帧持有定式：接收者 +1 由帧完成时释放，见 zan-compiler-internals skill）——泄漏探测记账本身正确。排查被引偏一天是因为**报告站点张冠李戴**（见下条 compiler 项）：`HttpForwarder.zan:542:25` 只是同类站点里运行时最后分配的那个的位置。修：listener 提为 `static TcpListener upL`，`Run()` 在 `fwd.Stop()` 后补 `Prog.upL.Stop()`（挂起的 accept 以 -1 复位、Upstream 帧完成释放；Stop 幂等，Upstream 退出路径再调一次是无害 no-op；与 tunnel 的有界 accept 循环等价，适配这里的无界 accept 数）——leakcheck **0 对象** + golden 逐字（直接以 workspace zanc + `--check-leaks` 验证，即 `leakcheck_http_forwarder_keepalive` 所做之事）。其余 reflect_members / server_mvc_timezone / sqlserver_tds / tdengine_rest 与 `db_error_throw` 的 5 对象漂移仍待查。
-* **check-leaks 泄漏站点按类形状混叠，报告的 file:line:col 会张冠李戴（2026-09-12 定位，待修）[P3/compiler]**：`reserve_arc_site`（src/compiler/irgen.c:1089）按 (类符号, 泛型实例) 去重——索引按形状共享是 release dispatch 的需要（`zan_rt_release_dyn` 用对象头记录的站点索引查 `__zan_site_dtors` 分发具体类析构）；但 `__zan_site_names[idx]` 在**每次分配时被无条件覆写**（irgen.c:2743），于是泄漏报告打印的「allocated at file:line:col」= **同类各站点中运行时最后分配的那个**的位置，不是泄漏对象的真实出生地。实锤：最小探针（自身 listener 永久停摆在 accept + 一个零流量、生命周期干净（accept 一次被 Stop 以 -1 收口）的 HttpForwarder）报告 1 对象 `HttpForwarder.zan:542:25`；同形状单文件版（程序里只有一个同类分配站点）则报告正确位置。闭包已有正确先例（irgen.c:1127 注释：闭包站点「must be unique per lambda」）。修法方向：check-leaks 构建下把去重键扩成 (形状, file, line, col)——`__zan_site_dtors`/`__zan_site_tynames` 本来就按索引逐格从 site_syms/site_inst 填充（irgen_arc.c `emit_site_dtor_table`），位置唯一后同形状多格各填同一析构即可，机制安全；代价是 ZAN_MAX_LEAK_SITES=4096 上限改约束「形状×位置」，可能需上调。**阻塞**：src/compiler/irgen.c / irgen_expr.c 是并行会话 WIP 文件，待该车道落地后修；修后补 conformance 用例（同类两站点、只泄其一，断言报告各自位置）。
+* **check-leaks 泄漏站点按类形状混叠，报告的 file:line:col 会张冠李戴（2026-09-12 定位，同日已修）[P3/compiler→已修]**：`reserve_arc_site`（src/compiler/irgen.c）原按 (类符号, 泛型实例) 去重——索引按形状共享是 release dispatch 的需要（`zan_rt_release_dyn` 用对象头记录的站点索引查 `__zan_site_dtors` 分发具体类析构）；但 `__zan_site_names[idx]` 在**每次分配时被无条件覆写**，于是泄漏报告打印的「allocated at file:line:col」= **同类各站点中运行时最后分配的那个**的位置，不是泄漏对象的真实出生地（A64b 排查因此被引偏一天）。闭包先例（`reserve_closure_site` 注释：闭包站点「must be unique per lambda」）。**修法（已落地）**：新增 `site_loc_file`/`site_loc_line` 主机侧并行表（init 处 calloc 256、`site_arrays_reserve` 同步扩容），check-leaks 构建下去重键扩成 (形状, di_cur_file, di_cur_line)——`__zan_site_dtors`/`__zan_site_tynames` 本就按索引逐格从 site_syms/site_inst 填充，位置唯一后同形状多格各填同一析构，机制安全；**无 -g 时 di_cur_* 为 0，键退化为纯形状=修复前行为**（R1 探针实证：`-g --check-leaks` 报真实泄漏站点 18:20，仅 `--check-leaks` 报最后分配者 25:21 与旧版一致）；非 check-leaks 构建键恒 0，索引序列不变。4096 上限改约束「形状×位置」（check-leaks 专属，超限大声 exit(1)，报错文本改「too many distinct ARC allocation sites」）。**验证**：worktree（f7d8833d）隔离修+全量 leakcheck，再移植主树（a57b9a9a+）重建复验——新 conformance 用例 `arc_leak_site_label`（同类两站点、只泄先分配者，`EXPECT_LEAK_SITE` 反极性断言报告点名 `:20:`）四孪生全绿（conformance/leakcheck/arcguard/determinism），`leakcheck_http_forwarder_keepalive` 回归绿。全量 leakcheck 中 ws_loopback / ws_protocol_gate / tdengine_rest 仍红，经主树**旧 zanc**（修复前二进制）交叉复跑证实为**既有真泄漏**（ws 各 5 对象：用例 2 + `Net\Worker.zan:280/297` 2；标签因四站点形状互异与旧版一致），与本次改动无关——已属 A64b 兄弟项，按账登记待查。
 * **A76 crasher（应用层/悬垂，另行处理）**：① `TlsStream.Close`（TlsStream.zan:909）`SSL_free` 后 wbio 悬垂访问崩溃——SSL_set_bio 转移了 BIO 所有权但 Zan 侧 string 字段仍持指针，需按 Ownership 约定重审 Setup/Close 的 BIO 生命周期；② sqlserver_tds `Program_Live$resume`（pool.Close 场景）协程 resume 路径 null 实例字段，非确定性复现。
 * **Windows IOCP blocking-worker 唤醒包偶发丢失（09-09 全链路稳定性测试定位，先于本次会话，待根因）**：`conformance_http_forwarder_keepalive` / `http_forwarder_stream` 在 Windows 上概率性（约 1/6~1/2 次）中途静默截断（exit=0、金样 18 行只出 8/11/14 行不等），或转发器 `ConnectAsync` 的 blocking-worker 结果永不送达（实测 1/6：`NativeConnectSockAddr` 经 `zan_rt_blocking_co` 提交后协程永不恢复，`DBG connected-up` 永不打印，整程序 10s 后靠上游 idle 超时才走完）；带 ZAN_IO_TRACE 的坏例 trace 都停在 `poll removed=1` 后不再有任何 reactor 活动——怀疑 DNS/完成唤醒包（`PostQueuedCompletionStatus(key=-2, lpOverlapped=NULL)` → `zan_io_poll` 的 `dns_drain` 路径）与 GQCS 超时路径竞态丢包。对照实验：纯串行 connect 150/150、单 RecvOv 挂起 + connect 150/150、双 AcceptEx + RecvOv + connect 200/200 都不复现，坏例只在 HttpForwarder 完整形状（2 监听 AcceptEx + 下游 RecvOv + 上游 blocking connect + 定时器轮询混跑）出现。归因证据：rt_io.c 最后一次改动是 09-05 的 0e55108a（本会话两提交 454c72f0/fc97defd 未触碰 rt_io/rt_co/DNS 唤醒），复现所用 build/zanc.exe 是 09:35 编译——早于本会话首个提交 12:54，故非本次改动引入。修复方向：给 `dns_wake_notify` 的包加序号/与 `g_blocking_done` 快照配对，或 blocking-worker 完成路径改走与 IO op 同形的 real-overlapped 包，消除 NULL-overlapped 特判路径。受影响测试需先容忍重跑（ctest RESOURCE_LOCK 已防同源并发，但单例本身翻车）。
 * **A67 字节×码点语义冲突（语言级，待定夺）**：string 按字节（索引/NUL 守卫/Length；FbReader/TDS codec 按字节索引），char 按码点（拼接/打印 UTF-8 编码），`s + s[i]` 对非 ASCII 必然膨胀；两侧皆有意设计，修复任何一侧破坏面都大。语言级出路（Rune/ByteAt API、解码式索引等）留待专项。

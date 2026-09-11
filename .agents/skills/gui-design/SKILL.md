@@ -177,6 +177,18 @@ token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
   基线/行高逐像素一致;仅行内 run 的 x 有 GDI 整数步进 vs 浏览器小数
   步进的 ~3px 累计差(台账,自洽渲染不受影响)。
 
+- **float 布局(块流,P3)**:`float: left/right` 真贴边绕排——后续块的
+  行内内容整行绕到 float 旁,放不下整行坠到 float 底下(Chrome 同款:
+  float 贴着行底擦过不收窄本行);`clear: left/right/both` 把块顶压到
+  相关 float 底下,且 clearance 是物理位移、不受 margin 塌陷影响。
+  两个坑:① **后声明的 float 顶边不会高于先声明的 float**(CSS 9.5.1
+  规则 2,oracle 实测)——右边看着还空着也不能"飘回去",它从上一个
+  float 的顶边起找位、撞了照样下坠;② 容器要包住 float 高度必须写
+  `display: flow-root`(BFC 收编),普通 div 的 auto 高无视 float
+  (Chrome 同款),靠 clear 的兄弟把高撑起来。块级子树的 font-size 目前
+  不继承(Chrome 会从 body 传下来),需要字号的块要显式声明,否则 strut
+  落 16px 缺省。
+
 - **`!important` 真的压得住 inline**:带标记的声明单独存、在普通级联
   (含宿主 inline)之后统一再套一遍,不是"剥掉标记按顺序碰运气"。
 - **渐变只认两端+中间一档**(`linear-gradient([dir,] a, b[, c])`);停靠点上的

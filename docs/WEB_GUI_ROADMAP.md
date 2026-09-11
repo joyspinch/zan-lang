@@ -15,7 +15,7 @@
 | P0 | 布局基建：display 值集（flow=3/inlineLevel）、StyleBox 新字段（inlineLevel/floatSide/clearSide/boxSizing/whiteSpace/lineHeightKind）、UA 样式表 + Element 容器、border 参与布局（box-sizing 真语义）、最小块流骨架、web_oracle.py | ✅ 2026-09-12 | oracle basic 5 盒 0px 偏差 |
 | P1 | 块流完整语义：margin 塌陷（CSS 2.1）、auto 宽高、百分比、margin:0 auto、匿名文本块 | ✅ 2026-09-12 | oracle basic 7 盒 + collapse 8 盒均 0px 偏差 |
 | P2 | 行盒与 inline 流：横排/换行/text-align/vertical-align/line-height 三态消费、FontAscent 真 baseline、inline 文本混排（run+控件盒）、white-space | ✅ 2026-09-12 | oracle inline 4 盒（tol 3）：y/行高/盒高 0 偏差，x ≤3px 步进台账 |
-| P3 | float：left/right 贴边、行盒绕排、clear | ☐ | |
+| P3 | float：left/right 贴边、行盒绕排、clear、BFC 收编 | ✅ 2026-09-12 | b432d5c0 引擎 + 9ddcffa5 规则 2 + 本条（断言/文档）；oracle float 17 盒：11 精确、6 处 ≤2px（行高取整台账） |
 | P4 | grid：track sizing（auto/fr/minmax/px/%）、span、隐式轨道、gap、网格线放置 | ☐ | |
 | P5 | HTML 声明层：Html.zan parser、tag→控件映射、data-on-* 事件、data-bind、style/link 接线、GenHtml 编译期生成器、App.LoadHtml()、oracle 闭环 | ☐ | |
 | P6 | overflow 滚动：auto/scroll 真语义（clip+偏移+滚动条） | ☐ | |
@@ -83,6 +83,21 @@ golden/audit/Inert 名单同步 → 提交 `gui-web(Pn): 主题`。
 - **行内文本继承（P2）**：段内文本 piece 未声明 font-size/line-height/
   white-space 时随容器 strut（`InheritText`）——span 不写 line-height 时
   浏览器用的就是父级行高；块级子树样式解析不受影响。
+- **float 引擎（P3）**：`FloatIntrusion`（margin box，容器内容框流坐标）
+  入侵表随块树下传（`SetHostFloats` 按 dx/dy 换算到子块内容框），
+  auto 高子块带表重测（被 float 顶高的部分计入堆叠）。行盒侧 `LineAvail`
+  在**行顶处**查询可用区（Chrome 同款：float 贴着行底擦过不收窄本行），
+  piece 放不下且 xOff 已越过可用右缘 → 整行下坠到 `NextShelf` 搁架、
+  从行首重排；行几何（xOff/availW/yOff）随 `InlineLine` 记录，落位端
+  按段顶+yOff 放（下坠行间有空洞，不能靠行高累加——盲路径 yOff=累加值，
+  P2 行为逐 bit 不变）。放位 `PlaceFloatKid`：clear 先推 → 左 float 贴
+  同侧右缘/右 float 镜像 → 放不下 NextShelf 下坠（16 次防呆原地溢出）；
+  **CSS 9.5.1 规则 2**：后声明 float 顶边不低于先声明 float 顶边（oracle
+  实测：f4 不能回 f3 之上的空档，被顶到 101 再撞 f3 坠 100）。
+  **clearance 不进 margin 塌陷链**——它是物理位移，非分隔容器的首占位块
+  margin 会塌出容器，clearance 跟着丢就错（cbox 70 高依赖它）。
+  BFC 容器（flow-root）auto 高收编自己放的 float 底（CSS 10.6.7）；
+  非 BFC 容器 float 溢出（Chrome 同款），clear 的兄弟把高撑起来。
 
 ## 已知偏差台账
 
@@ -127,3 +142,18 @@ golden/audit/Inert 名单同步 → 提交 `gui-web(Pn): 主题`。
   内容的 inline-block 取最后一行基线；引擎里"无子有文本"的行内子项直接
   PushText 成文本 run（视觉等价），"有子"的一律原子盒按 margin 边坐
   基线。极端嵌套（inline-block 内多行文本参与外层基线）未模拟。
+- **（P3 台账）行高分数取整的逐行累计**：Chrome strut = winAsc/winDesc
+  分数（Segoe UI 14px asc 15.1/desc 3.5，行盒 desc 取进位 4 → 行高 24），
+  Zan 整数度量 asc 15/desc 3（行高 23）→ 多行块每行差 1px 累计
+  （float oracle：words 146 vs 148、wrap 288 vs 290；x 几何与单行内
+  逐像素一致）。修法 = 度量管线浮点化（牵动 P2 golden 全链），留 P5
+  HTML 层一并评估。
+- **（P3 台账）块级 strut 的 font-size 不继承**：`InheritText` 只服务
+  行内 piece；块级子树未声明 font-size 时 strut 用引擎缺省（16px），
+  Chrome 从 body 继承（14px）→ float oracle 的 #words 需显式
+  `font-size: 14px` 才对齐。修法 = 样式解析加继承链（computed 传递），
+  P5 声明层一起做。
+- **（P3 台账）BFC 盒被祖先 float 挤窄未实现**：Chrome 里 float 旁的
+  flow-root 块会收窄到剩余空间；引擎的 BFC 盒仍占全宽（行内内容经
+  hostFloats 绕排，盒矩形不缩）。普通块盒两边行为一致（Chrome 普通
+  块也不避让 float，只有行内内容绕排）。
