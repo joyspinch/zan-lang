@@ -712,6 +712,28 @@ pt/pc/cm/mm/in/q）+ `calc()/min()/max()/clamp()`；`%` 在各属性原有通道
   填宽/margin 全算；塌陷/auto/行盒 P1/P2）。scripts/web_oracle.py：Chrome
   headless 输出 getBoundingClientRect 与 Zan 坐标对比。
 
+* **P1 块流完整语义**（2026-09-12）：**margin 塌陷**（CSS 2.1）——
+  pending-margin 状态机（下义务 margin 与下一块的上边距 CollapseMargins
+  合并落位：同正取大/同负取绝对值大/正负相加）；首/尾链在分隔容器
+  （FlowSepT/B：BFC=flow-root/行内级/真声明 overflow≠visible/absolute，
+  或 border/padding 内衬）计入内容高，普通容器塌出容器外；空块
+  （无子/无文本/块尺寸为零，height:0 算零）自塌塌穿；"只有空块的 BFC"
+  链关在内容框占高（oracle 实测 25px 同 Chrome）。**auto 关键字**——
+  width/height auto=保持未声明（此前被当裸数字静默写 0），margin 边
+  auto=哨兵 -1（StyleMarX 消费端按 0，排布端读哨兵分剩余空间：
+  0 auto 居中/单边 auto 贴边）。**视口模型**——RenderInside 把根塌陷链
+  落地为内容偏移 escT（等价 Chrome 的 html 外边距推内容；直接 Arrange
+  的子树根丢弃逃逸链，oracle 驱动按同款公式对齐）。**匿名文本块**——
+  Element.SetText：TextWrap.Lines 断行 × LineHeightPx 行高测量、
+  FlowTextPlace 落位、OnPaint 逐行 DrawRun（text-align 对齐）。
+  **BFC 判据**——新增 StyleBox.overflowCss 真实声明通道（-1/0/1）：
+  overflow 字段缺省 1 是渲染裁剪约定，曾被误当 BFC 判据导致塌陷整体
+  短路（探针定位）。oracle：basic 7 盒 + collapse 8 盒（塌陷/塌穿/BFC/
+  auto 居中/文本块）均 0px 偏差；塌陷用例资产 tests/weboracle/
+  collapse.json + *_driver.zan 入库。gui_css golden 更新（P0 盒塌陷位移
+  + P1 新行），smoke 256 全层仅 HEAD 已知失败（pagination/transfer
+  Props 漂移、scrollbar_drag 并发超时单跑通过）。
+
 ---
 
 # A17-A31 历史修复记录（全部完成，一行摘要）

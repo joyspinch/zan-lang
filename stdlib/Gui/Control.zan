@@ -779,13 +779,17 @@ class Control {
     }
 
     /// 样式表声明的外边距（px；未解析样式时为 0）。
-    int StyleMarL() { if (computedStyle == null) { return 0; } return computedStyle.marL; }
+    int StyleMarL() { if (computedStyle == null) { return 0; }
+        int v = computedStyle.marL; return v < 0 ? 0 : v; }
     /// 样式表声明的外边距（px；未解析样式时为 0）。
-    int StyleMarT() { if (computedStyle == null) { return 0; } return computedStyle.marT; }
+    int StyleMarT() { if (computedStyle == null) { return 0; }
+        int v = computedStyle.marT; return v < 0 ? 0 : v; }
     /// 样式表声明的外边距（px；未解析样式时为 0）。
-    int StyleMarR() { if (computedStyle == null) { return 0; } return computedStyle.marR; }
+    int StyleMarR() { if (computedStyle == null) { return 0; }
+        int v = computedStyle.marR; return v < 0 ? 0 : v; }
     /// 样式表声明的外边距（px；未解析样式时为 0）。
-    int StyleMarB() { if (computedStyle == null) { return 0; } return computedStyle.marB; }
+    int StyleMarB() { if (computedStyle == null) { return 0; }
+        int v = computedStyle.marB; return v < 0 ? 0 : v; }
 
     /// 生效的子项间距：样式表的 `gap` 优先，其次 Gap() 设置值。
     int StyleGap() {
@@ -1239,31 +1243,154 @@ class Control {
         }
     }
 
-    /// 真块流测量（display: flow，WEB_GUI_ROADMAP P0 骨架，P1 补全
-    /// margin 塌陷/auto 语义）：块级子项垂直堆叠，容器宽取最宽子项、
-    /// 高取各行之和（gap 同样生效）。行内级子项 P0 暂按块处理（P2 行盒）。
+    // ---- 块流（display: flow）与 margin 塌陷（WEB_GUI_ROADMAP P1）----
+
+    /// 相邻两个塌陷 margin 的合并值（CSS 2.1 §8.3.1）：同为非负取大；
+    /// 同为负取绝对值大的；一正一负相加。
+    static int CollapseMargins(int a, int b) {
+        if (a >= 0 && b >= 0) { return a > b ? a : b; }
+        if (a < 0 && b < 0) { return a < b ? a : b; }
+        int hi = a > b ? a : b;
+        int lo = a < b ? a : b;
+        return hi + lo;
+    }
+
+    /// 顶部是否有"分隔"（即不与首子的 margin-top 塌陷）：BFC
+    /// （flow-root/行内级/overflow != visible/absolute 定位容器）、
+    /// 非 block 流容器，或 border-top/padding-top 把首子隔开。
+    bool FlowSepT() {
+        StyleBox sb = computedStyle;
+        if (sb == null) { return true; }
+        if (sb.bfc != 0 || sb.overflowCss == 1 || sb.position == 2) {
+            return true;
+        }
+        if (sb.display != 3) { return true; }
+        return this.StyleInsetT() > 0;
+    }
+
+    /// 底部分隔（不与尾子的 margin-bottom 塌陷），规则同 FlowSepT。
+    bool FlowSepB() {
+        StyleBox sb = computedStyle;
+        if (sb == null) { return true; }
+        if (sb.bfc != 0 || sb.overflowCss == 1 || sb.position == 2) {
+            return true;
+        }
+        if (sb.display != 3) { return true; }
+        return this.StyleInsetB() > 0;
+    }
+
+    /// 子项 `c` 在块流父里的有效上外边距：display:flow 的普通容器
+    /// （非 BFC、无分隔内衬）与首子塌陷——递归取链上合并值；
+    /// 其余原样返回自身 margin-top。空块的双边自塌在兄弟链合并。
+    int FlowMarT(Control c) {
+        int m = c.StyleMarT();
+        if (c.StyleDisplay() != 3 || c.FlowSepT()) { return m; }
+        List<Control> kk = c.FlexKids();
+        if (kk.Count == 0) { return m; }
+        return CollapseMargins(m, this.FlowMarT(kk[0]));
+    }
+
+    /// 子项 `c` 的有效下外边距，规则同 FlowMarT（对最后一个流内子项）。
+    int FlowMarB(Control c) {
+        int m = c.StyleMarB();
+        if (c.StyleDisplay() != 3 || c.FlowSepB()) { return m; }
+        List<Control> kk = c.FlexKids();
+        if (kk.Count == 0) { return m; }
+        return CollapseMargins(m, this.FlowMarB(kk[kk.Count - 1]));
+    }
+
+    /// 块流意义上的空块（CSS 2.1 §8.3.1 自塌条件）：display:flow、
+    /// 无流内子项、无匿名文本、块尺寸为零——声明高 >0、min-height
+    /// >0、上下 border/padding 任一非零都使它成为真实盒子
+    /// （`height: 0` 仍是零，塌穿；`height: 30px` 不塌）。
+    bool IsEmptyFlowBlock(Control c) {
+        if (c.StyleDisplay() != 3) { return false; }
+        if (c.FlexKids().Count > 0) { return false; }
+        if (c.HasFlowText()) { return false; }
+        StyleBox sb = c.computedStyle;
+        if (sb != null) {
+            if (sb.height > 0 || sb.minH > 0) { return false; }
+            if (sb.BorderTopPx() > 0 || sb.BorderBottomPx() > 0) { return false; }
+            if (c.StyleInsetT() > 0 || c.StyleInsetB() > 0) { return false; }
+        }
+        return true;
+    }
+
+    /// 匿名文本块（P1）：容器直接持有的裸文本（Element.SetText）。
+    /// Control 没有；Element 覆写。文本块作为整体参与块流，
+    /// 高度 = 行数 × 行高，宽度在给定可用宽内断行；availW <= 0
+    /// （shrink-to-fit 测量）按一行。
+    virtual bool HasFlowText() { return false; }
+    virtual int FlowTextHeight(int availW) { return 0; }
+
+    /// 排布期记录文本块在内容框内的相对 Y 与可用宽（Element 覆写，
+    /// 绘制时用）。
+    virtual void FlowTextPlace(int relY, int availW) { }
+
+    /// 真块流测量（P1）：margin 塌陷后取各块高度之和——兄弟相邻
+    /// margin 合并、容器不塌陷（FlowSepT/B）时首/尾 margin 计入
+    /// 内容高、塌陷时塌出容器外由父结算。gap 在相邻已放置块之间
+    /// 追加。空块（无内容无子）只贡献一条塌陷链不占高；"只有空块
+    /// 的 BFC 容器"把链关在内容框里占高。
     void MeasureFlow(App app) {
         if (prefW > 0 && prefH > 0) { return; }
         int sumH = 0;
         int maxW = 0;
         int rows = 0;
         List<Control> kids = this.FlexKids();
+        bool sepT = this.FlowSepT();
+        bool sepB = this.FlowSepB();
+        int pending = 0 - 1;   // 待结算的塌陷链（-1 = 还没有占高块）
         for (int i = 0; i < kids.Count; i = i + 1) {
             Control c = kids[i];
-            // 高度取声明值（含 border-box 下限钳制），未声明回退测量
-            // 偏好——叶子元素的 pref 是 0，"空 div 高为零"就是对的。
-            // 包含块尚未确定，百分比高按 0（与 flex 测量同规矩）。
-            int h = c.StyleHeightIn(0) + c.MarCross(true);
+            bool empty = this.IsEmptyFlowBlock(c);
+            int kmt = empty ? c.StyleMarT() : this.FlowMarT(c);
+            int kmb = empty ? c.StyleMarB() : this.FlowMarB(c);
+            int h = 0;
+            if (!empty) {
+                // 高度取声明值（含 border-box 下限钳制），未声明回退
+                // 测量偏好——叶子 pref 是 0，"空 div 高为零"就是对的。
+                // 包含块未定，百分比高按 0（与 flex 测量同规矩）。
+                h = c.StyleHeightIn(0);
+                if (h < 0) { h = 0; }
+            }
             int w = 0;
             if (c.StyleDeclaresWidth()) { w = c.StyleWidthIn(0); }
             else { w = c.prefW; }
-            w = w + c.MarMain(true);
-            sumH = sumH + h;
+            w = w + c.MarMain(true);   // 水平 margin 不塌陷，照常计宽
             if (w > maxW) { maxW = w; }
+            if (empty) {
+                // 空块塌穿：上边与既有链合并定出它自己的位置，
+                // 双边再依次并入链（逐边折叠，保持与排布端同式）。
+                int withMt = pending < 0 ? kmt : CollapseMargins(pending, kmt);
+                pending = CollapseMargins(withMt, kmb);
+                continue;
+            }
+            int withMt2 = pending < 0 ? kmt : CollapseMargins(pending, kmt);
+            if (pending < 0) {
+                if (sepT) { sumH = sumH + withMt2; }
+            } else {
+                sumH = sumH + withMt2;
+            }
+            pending = kmb;
+            sumH = sumH + h;
             rows = rows + 1;
         }
-        int gapPx = this.StyleGap();
-        if (rows > 1) { sumH = sumH + gapPx * (rows - 1); }
+        // 匿名文本块总在子项之后（P1 简化；混排 P2 引入行盒）。
+        // 测量期可用宽只有断行提示（PropagateWrapHint），没有就按一行。
+        int tW = hintWrapW - this.StyleInsetL() - this.StyleInsetR();
+        int textH = this.FlowTextHeight(tW > 0 ? tW : 0);
+        if (textH > 0) {
+            if (pending >= 0) { sumH = sumH + CollapseMargins(pending, 0); }
+            pending = 0;
+            sumH = sumH + textH;
+            rows = rows + 1;
+        }
+        if (rows > 1) { sumH = sumH + this.StyleGap() * (rows - 1); }
+        if (pending > 0 && sepB && rows > 0) { sumH = sumH + pending; }
+        else if (pending > 0 && sepT && sepB && rows == 0) {
+            sumH = sumH + pending;
+        }
         if (prefH <= 0 && sumH > 0) {
             prefH = sumH + this.StyleInsetT() + this.StyleInsetB();
             this.fillH = true;
@@ -1274,31 +1401,86 @@ class Control {
         }
     }
 
-    /// 真块流排布（P0 骨架）：块级子项从上到下；声明了宽度的用声明
-    /// 值，未声明的填满内容框（CSS 块级 auto 宽）；高度声明了用声明
-    /// 值、否则用测量偏好。margin 四边全算（塌陷 P1）。
+    /// 真块流排布（P1）：pending 携带"已塌陷未结算"的下义务 margin，
+    /// 遇到下一个块的上 margin 时合并落位；首/尾链在分隔容器里计入
+    /// 内容位，普通容器里塌出容器外。`margin-left/right: auto` 把
+    /// 声明宽以外的剩余空间分给对应边（两边 auto = 水平居中，
+    /// CSS 10.3.3）。容器高 auto（fillH）时子项百分比高按 0，与
+    /// 测量端一致。
     void ArrangeFlow(int cx, int cy, int cw, int ch, int gapPx) {
         int y = cy;
         List<Control> kids = this.FlexKids();
+        bool sepT = this.FlowSepT();
+        bool sepB = this.FlowSepB();
+        int chKids = this.fillH ? 0 : ch;
+        int pending = 0 - 1;
+        int placed = 0;
         for (int i = 0; i < kids.Count; i = i + 1) {
             Control c = kids[i];
-            int mt = c.StyleMarT();
-            int mb = c.StyleMarB();
+            bool empty = this.IsEmptyFlowBlock(c);
+            int kmt = empty ? c.StyleMarT() : this.FlowMarT(c);
+            int kmb = empty ? c.StyleMarB() : this.FlowMarB(c);
+            if (empty) {
+                int withMt = pending < 0 ? kmt : CollapseMargins(pending, kmt);
+                int dy = (pending < 0 && !sepT) ? 0 : withMt;
+                // 空块也落矩形（塌穿边界处，高 0），矩形才可被对比。
+                StyleBox sbE = c.computedStyle;
+                int mlE = c.StyleMarL();
+                int mrE = c.StyleMarR();
+                int wE = 0;
+                if (c.StyleDeclaresWidth()) { wE = c.StyleWidthIn(cw); }
+                else { wE = cw - mlE - mrE; }
+                if (wE < 0) { wE = 0; }
+                int xE = cx + mlE;
+                if (sbE != null && sbE.marL == 0 - 1 && sbE.marR == 0 - 1) {
+                    xE = cx + (cw - wE) / 2;
+                }
+                c.Arrange(xE, y + dy, wE, 0);
+                pending = CollapseMargins(withMt, kmb);
+                continue;
+            }
+            int h = 0;
+            if (c.StyleDeclaresHeight()) { h = c.StyleHeightIn(chKids); }
+            else { h = c.prefH; }
+            if (h < 0) { h = 0; }
+            if (pending < 0) {
+                if (sepT) { y = y + kmt; }
+            } else {
+                y = y + CollapseMargins(pending, kmt);
+                if (placed > 0) { y = y + gapPx; }
+            }
+            pending = kmb;
+            // 水平：声明宽用声明值；未声明填满内容框。margin 的
+            // auto 哨兵（computedStyle.marX == -1）分剩余空间。
+            StyleBox sb = c.computedStyle;
             int ml = c.StyleMarL();
             int mr = c.StyleMarR();
             int w = 0;
             if (c.StyleDeclaresWidth()) { w = c.StyleWidthIn(cw); }
             else { w = cw - ml - mr; }
-            int h = 0;
-            if (c.StyleDeclaresHeight()) { h = c.StyleHeightIn(ch); }
-            else { h = c.prefH; }
             if (w < 0) { w = 0; }
-            if (h < 0) { h = 0; }
-            y = y + mt;
-            c.Arrange(cx + ml, y, w, h);
-            y = y + h + mb;
-            if (i < kids.Count - 1) { y = y + gapPx; }
+            int x = cx + ml;
+            if (sb != null && sb.marL == 0 - 1 && sb.marR == 0 - 1) {
+                x = cx + (cw - w) / 2;
+            } else if (sb != null && sb.marL == 0 - 1) {
+                x = cx + cw - mr - w;
+            }
+            c.Arrange(x, y, w, h);
+            y = y + h;
+            placed = placed + 1;
         }
+        int textH = this.FlowTextHeight(cw > 0 ? cw : 0);
+        if (textH > 0) {
+            if (pending >= 0) {
+                y = y + CollapseMargins(pending, 0);
+                if (placed > 0) { y = y + gapPx; }
+            }
+            pending = 0;
+            this.FlowTextPlace(y - cy, cw);
+            y = y + textH;
+            placed = placed + 1;
+        }
+        if (pending > 0 && sepB) { y = y + pending; }
     }
 
     /// 停靠容器在没人给尺寸时按内容测量：一列停靠的行
@@ -1307,7 +1489,7 @@ class Control {
     /// 每个容器写死一个高度，字号或 DPI 一变就错位。
     /// 只填补留空的那根轴：OnMeasure 或作者给过的尺寸优先。
     void MeasureDocked(App app) {
-        if (children.Count == 0) { return; }
+        if (children.Count == 0 && !this.HasFlowText()) { return; }
         int disp = this.StyleDisplay();
         if (disp == 1) {
             this.MeasureFlexContent(app);
@@ -2412,7 +2594,18 @@ class Control {
     /// 即可把矩形交给保留组件（测量、停靠、绘制）。
     void RenderInside(App app, Rect area) {
         this.MeasureTree(app);
-        this.Arrange(area.x, area.y, area.width, area.height);
+        // 视口模型（P1）：Chrome 里塌陷链逃出 body 后成为 html 的
+        // 外边距，把内容从视口顶部推下来。窗口渲染入口等价于
+        // html/视口，根的塌陷链在这里落地为内容偏移（legacy/
+        // flex 根与 BFC 根 escT= 0，不受影响）。
+        int escT = 0;
+        StyleBox sbR = computedStyle;
+        if (sbR != null && sbR.display == 3 && !this.FlowSepT()) {
+            escT = this.FlowMarT(this);
+            if (escT < 0) { escT = 0; }
+            if (escT > area.height) { escT = area.height; }
+        }
+        this.Arrange(area.x, area.y + escT, area.width, area.height - escT);
         this.RenderTree(app);
     }
 

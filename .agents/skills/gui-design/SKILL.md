@@ -149,29 +149,35 @@ token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
   顺序。`overflow: visible` 放行子节点溢出(缺省引擎裁剪,显式声明才变
   行为)。type 选择器大小写不敏感(`Button` 与 `button` 都命中,引擎按
   `Kind()` 的小写匹配);class/id 仍区分大小写。
-- **Web 等价布局已落地第一批（WEB_GUI_ROADMAP P0,2026-09-12)**:`display: block`
-  现在是**真块流**(垂直堆叠/未声明宽填满/margin 全算;`flow-root` 同义,`grid`
-  暂退化,`inline`/`inline-block` 落行内级)——写成 CSS 的树走 web 语义,没写
-  display 的老代码走 legacy 零回归。**border 参与布局**:内容框 = 框 − border −
-  padding(与 `box-sizing: border-box` 一致,引擎缺省即 border-box;显式
-  `content-box` 时声明尺寸只含内容,布局反推框宽);`box-sizing`/`float`/
-  `clear` 全部真实解析(float 绕排 P3)。`line-height` 支持三态:`normal`/
-  无单位倍数/`%`(换算成像素消费)。UA 样式表内置 web 缺省(div/p/h1-h6 的
-  display/字号/margin),皮肤与应用样式按层叠覆盖它;`Element` 通用容器
-  (kind=标签名)写 web 风格容器用。块流骨架与 Chrome 的坐标一致性由
-  `scripts/web_oracle.py`(Chrome headless getBoundingClientRect 逐盒对比)
-  验证,basic 用例 5 盒 0px 偏差;已知偏差(父子 margin 塌陷=P1)记录在
-  `docs/WEB_GUI_ROADMAP.md` 台账。
+- **Web 等价布局已落地前两批（WEB_GUI_ROADMAP P0+P1,2026-09-12)**:
+  `display: block` 是**真块流**——写成 CSS 的树走 web 语义,没写 display 的
+  老代码走 legacy 零回归。**margin 是塌陷的(CSS 2.1)**:相邻兄弟取大合并,
+  首子的 margin-top 塌出无内衬的父框把它整体顶开;空块(height:0/无内容/
+  无边距内衬)上下边自塌塌穿。不塌陷的"分隔":容器写了 `flow-root`、
+  `overflow: hidden`(必须真声明,引擎缺省的裁剪不是)、absolute 定位,或
+  有 border/padding——AI 想避免塌陷用 `flow-root`,别学 overflow hack。
+  **auto 关键字真语义**:`margin: 0 auto` 水平居中、`margin-left: auto`
+  贴右、`width/height: auto` 等于没写(此前 auto 被静默当 0)。**匿名文本
+  块**:`Element.SetText("...")` 的文本按行高断行占位参与块流。**border
+  参与布局**:内容框 = 框 − border − padding(引擎缺省 border-box;显式
+  `content-box` 反推框宽);`line-height` 三态(normal/倍数/%);UA 样式表
+  内置 web 缺省(div/p/h1-h6 的 display/字号/margin),`Element` 通用容器
+  (kind=标签名)写 web 风格容器用。**窗口根的塌陷链会推内容**
+  (等价 Chrome 的 html 外边距;直接 `Arrange` 子树根则丢弃——测试对齐
+  Chrome 时用带 padding 的接收者或 oracle 驱动的 escT 公式)。与 Chrome 的
+  逐盒一致性由 `scripts/web_oracle.py` 裁决:用例 JSON(tests/weboracle/*.json)
+  + Zan 侧驱动(*_driver.zan)输出同名 `sel x,y wxh` 行 `--compare` 对比;
+  basic 7 盒 + collapse 8 盒(塌陷/塌穿/BFC 关链/auto 居中/文本块)均 0px
+  偏差;其余偏差记录在 `docs/WEB_GUI_ROADMAP.md` 台账。
 
 - **`!important` 真的压得住 inline**:带标记的声明单独存、在普通级联
   (含宿主 inline)之后统一再套一遍,不是"剥掉标记按顺序碰运气"。
 - **渐变只认两端+中间一档**(`linear-gradient([dir,] a, b[, c])`);停靠点上的
   百分比位置(`#fff 40%`)被丢掉,运行时的 `grad_sample` 只采样 0/500/1000。
   `to left`/`270deg` 靠交换首末停靠点实现。
-- **`box-sizing`/`float` 收下但不生效**(引擎没有对应布局);网页布局属性
-  (content/quotes/counter-*/list-style*/user-select/outline* 等 100 条)进了
-  Inert 白名单:收下、不变成 class、Lint 报 inert,不会有"漏进 SetProp 变
-  class"的灵异效果。
+- **网页布局专属属性**(content/quotes/counter-*/list-style*/user-select/
+  outline* 等)进了 Inert 白名单:收下、不变成 class、Lint 报 inert,不会有
+  "漏进 SetProp 变 class"的灵异效果。
 - **`text-shadow` 现在是真属性**(此前写了没反应):取第一层几何,≥3 层零模糊
   投影按四向描边绘制——压在图片上的白字用这个惯用法保可读性。
 - **`border` 的 style 词生效**:`dashed`/`dotted` 走 `Fx.DashedBorder`,
@@ -431,6 +437,29 @@ CSS 里非 token 的长度由 `Style.ScaleLayout` 补乘,`StyleBox.IsPrescaled`
    修法:`styleBg = c; styleBgTo = d;` 再
    `if (computedStyle != null) { Style.Inline(computedStyle, this); }`
    把 inline 覆盖补映到已解析的 box。ToolStrip/StatusBar 都因此修过。
+5. **弹出面板/抽屉这类高度随内容的容器,根节点用 `Flex.Column()`,别用
+   `Panel.Column`。** Panel(dock 容器)把 prefH 报小,宿主按小值分高度,
+   Arrange 时内容按真实子项摆,尾部子项互相叠、被裁(微信模板表情/
+   头像/文件面板「最后一行与提示语重叠」,2026-09-12);flex 的自然
+   高度求和是准的。宿主还要 `AlignStart()`,否则列的交叉轴 stretch
+   把子项拉满整行,`width: 424` 形同虚设。
+6. **ToolStrip 的项自带皮肤类,加自有类用 `AddClass`,互斥状态类用
+   `SetClassIn("wxon", ...)`。** `item.Class = "wxvoice"` 整体顶掉
+   `text small` 后图标盒 51x43 装不下 51x51 的图标内容(lint:
+   「矩形装不下内容」);反复 AddClass("wxon") 切选中会累积旧状态类。
+   另外 `ItemAt` 返回可空,每个调用点判空太吵,收拢一个
+   「越界给哑按钮」的助手最省。
+7. **Zan 字符串按字节索引,`Substring(0, 1)` 对中文切出半个字**(渲染
+   成「?」)。头像首字/缩写一律由数据显式给出(发言人注册表带 ini
+   字段),代码里不要对中文切片(微信模板群成员格「过客云飞」头像
+   变「?」,2026-09-12)。
+8. **聊天抽屉/表情面板这类要装完整控件树的「弹出」,用 dock + visible
+   翻面的真控件列,不用覆盖层自管分发**(OverlayPopup.Host 是给选项
+   列表/菜单自绘用的)。互斥显隐:再点同一图标=收起,开一个关其余;
+   隐藏的 dock 子项不参与排版/命中/绘制,不会被布局自检报重叠。
+   emoji 字形事实:Windows 上运行时字体回退把 emoji 渲染成单色轮廓
+   (Segoe UI Symbol 一系),60 个常用 emoji 全有字形、无豆腐,但不是
+   彩色——表情面板可以直接用 emoji 字符,深浅色主题都不挑。
 
 ## 收尾自查(逐条过)
 

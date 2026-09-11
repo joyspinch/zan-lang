@@ -1149,10 +1149,10 @@ class StyleSheet {
         if (k == "padding-right") { b.padR = StyleSheet.Len(b, v); return true; }
         if (k == "padding-bottom") { b.padB = StyleSheet.Len(b, v); return true; }
         if (k == "margin") { StyleSheet.DeclSides(b, v, 1); return true; }
-        if (k == "margin-left") { b.marL = StyleSheet.Len(b, v); return true; }
-        if (k == "margin-top") { b.marT = StyleSheet.Len(b, v); return true; }
-        if (k == "margin-right") { b.marR = StyleSheet.Len(b, v); return true; }
-        if (k == "margin-bottom") { b.marB = StyleSheet.Len(b, v); return true; }
+        if (k == "margin-left") { b.marL = StyleSheet.SideVal(b, v, true); return true; }
+        if (k == "margin-top") { b.marT = StyleSheet.SideVal(b, v, true); return true; }
+        if (k == "margin-right") { b.marR = StyleSheet.SideVal(b, v, true); return true; }
+        if (k == "margin-bottom") { b.marB = StyleSheet.SideVal(b, v, true); return true; }
         if (k == "width") { StyleSheet.DeclMetric(b, 0, v); return true; }
         if (k == "height") { StyleSheet.DeclMetric(b, 1, v); return true; }
         if (k == "min-width") { StyleSheet.DeclMetric(b, 2, v); return true; }
@@ -1181,6 +1181,13 @@ class StyleSheet {
     /// 单个盒子度量（0 宽、1 高、2/3 min、4/5 max）：`%` 值保留
     /// 为包含块的比例（千分数），其余按像素处理。
     static void DeclMetric(StyleBox b, int which, string v) {
+        string tv = StyleSheet.Lower(StyleSheet.Trim(v));
+        if (tv == "auto") {
+            // `width/height: auto` = 未声明（块流里宽填满、高按内容，
+            // 语义由布局端给出）——保持哨兵 -1，此前 "auto" 会被当
+            // 裸数字静默写成 0。
+            return;
+        }
         bool pct = StyleSheet.IndexOf(v, "%") >= 0;
         int n = StyleSheet.Len(b, v);
         if (pct) { n = n * 10; }
@@ -1198,15 +1205,23 @@ class StyleSheet {
             b.display = 0;
             b.inlineLevel = 0;
             if (v == "flex") { b.display = 1; }
-            else if (v == "inline-flex") { b.display = 1; b.inlineLevel = 1; }
+            else if (v == "inline-flex") {
+                b.display = 1; b.inlineLevel = 1; b.bfc = 1;
+            }
             else if (v == "none") { b.display = 2; }
-            else if (v == "block" || v == "flow-root" || v == "grid") {
-                // 真块流（P0 起）；grid 在 P4 落地前按块流退化
-                // （GuardValueKnown 不认 grid，@supports 兜底仍判假）。
+            else if (v == "block") {
+                // 普通块容器（P1）：与首/尾子 margin 塌陷。
                 b.display = 3;
             }
+            else if (v == "flow-root" || v == "grid") {
+                // flow-root 建立 BFC：不与首尾子塌陷。grid 在 P4
+                // 落地前按 BFC 块流退化（GuardValueKnown 不认 grid，
+                // @supports 兜底仍判假）。
+                b.display = 3; b.bfc = 1;
+            }
             else if (v == "inline" || v == "inline-block") {
-                b.display = 3; b.inlineLevel = 1;
+                // 行内级（P2 行盒；P1 暂按块排）。inline-block 是 BFC。
+                b.display = 3; b.inlineLevel = 1; b.bfc = 1;
             }
             else { b.display = 0; }
             return true;
@@ -1311,8 +1326,10 @@ class StyleSheet {
         }
         if (k == "overflow" || k == "overflow-y" || k == "overflow-x") {
             b.overflow = 0;
+            b.overflowCss = 0;
             if (v == "hidden" || v == "clip" || v == "auto" || v == "scroll") {
                 b.overflow = 1;
+                b.overflowCss = 1;
             }
             return true;
         }
@@ -1843,24 +1860,32 @@ class StyleSheet {
     }
 
     /// `padding/margin: all | v h | t h b | t r b l`。
+    /// margin/padding 单边值：margin 的 `auto` 记哨兵 -1（布局端做
+    /// 水平居中/贴边），padding 的 `auto` 按 0。
+    static int SideVal(StyleBox b, string tok, bool margin) {
+        if (tok == "auto") { return margin ? 0 - 1 : 0; }
+        return StyleSheet.Len(b, tok);
+    }
+
     static void DeclSides(StyleBox b, string val, int which) {
         List<string> toks = StyleSheet.Tokens(val);
         if (toks.Count == 0) { return; }
-        int t = StyleSheet.Len(b, toks[0]);
+        bool margin = which == 1;
+        int t = StyleSheet.SideVal(b, toks[0], margin);
         int r = t;
         int bo = t;
         int l = t;
         if (toks.Count == 2) {
-            r = StyleSheet.Len(b, toks[1]);
+            r = StyleSheet.SideVal(b, toks[1], margin);
             l = r;
         } else if (toks.Count == 3) {
-            r = StyleSheet.Len(b, toks[1]);
+            r = StyleSheet.SideVal(b, toks[1], margin);
             l = r;
-            bo = StyleSheet.Len(b, toks[2]);
+            bo = StyleSheet.SideVal(b, toks[2], margin);
         } else if (toks.Count >= 4) {
-            r = StyleSheet.Len(b, toks[1]);
-            bo = StyleSheet.Len(b, toks[2]);
-            l = StyleSheet.Len(b, toks[3]);
+            r = StyleSheet.SideVal(b, toks[1], margin);
+            bo = StyleSheet.SideVal(b, toks[2], margin);
+            l = StyleSheet.SideVal(b, toks[3], margin);
         }
         if (which == 0) {
             b.padT = t; b.padR = r; b.padB = bo; b.padL = l;

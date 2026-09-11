@@ -146,29 +146,35 @@ token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
   顺序。`overflow: visible` 放行子节点溢出(缺省引擎裁剪,显式声明才变
   行为)。type 选择器大小写不敏感(`Button` 与 `button` 都命中,引擎按
   `Kind()` 的小写匹配);class/id 仍区分大小写。
-- **Web 等价布局已落地第一批（WEB_GUI_ROADMAP P0,2026-09-12)**:`display: block`
-  现在是**真块流**(垂直堆叠/未声明宽填满/margin 全算;`flow-root` 同义,`grid`
-  暂退化,`inline`/`inline-block` 落行内级)——写成 CSS 的树走 web 语义,没写
-  display 的老代码走 legacy 零回归。**border 参与布局**:内容框 = 框 − border −
-  padding(与 `box-sizing: border-box` 一致,引擎缺省即 border-box;显式
-  `content-box` 时声明尺寸只含内容,布局反推框宽);`box-sizing`/`float`/
-  `clear` 全部真实解析(float 绕排 P3)。`line-height` 支持三态:`normal`/
-  无单位倍数/`%`(换算成像素消费)。UA 样式表内置 web 缺省(div/p/h1-h6 的
-  display/字号/margin),皮肤与应用样式按层叠覆盖它;`Element` 通用容器
-  (kind=标签名)写 web 风格容器用。块流骨架与 Chrome 的坐标一致性由
-  `scripts/web_oracle.py`(Chrome headless getBoundingClientRect 逐盒对比)
-  验证,basic 用例 5 盒 0px 偏差;已知偏差(父子 margin 塌陷=P1)记录在
-  `docs/WEB_GUI_ROADMAP.md` 台账。
+- **Web 等价布局已落地前两批（WEB_GUI_ROADMAP P0+P1,2026-09-12)**:
+  `display: block` 是**真块流**——写成 CSS 的树走 web 语义,没写 display 的
+  老代码走 legacy 零回归。**margin 是塌陷的(CSS 2.1)**:相邻兄弟取大合并,
+  首子的 margin-top 塌出无内衬的父框把它整体顶开;空块(height:0/无内容/
+  无边距内衬)上下边自塌塌穿。不塌陷的"分隔":容器写了 `flow-root`、
+  `overflow: hidden`(必须真声明,引擎缺省的裁剪不是)、absolute 定位,或
+  有 border/padding——AI 想避免塌陷用 `flow-root`,别学 overflow hack。
+  **auto 关键字真语义**:`margin: 0 auto` 水平居中、`margin-left: auto`
+  贴右、`width/height: auto` 等于没写(此前 auto 被静默当 0)。**匿名文本
+  块**:`Element.SetText("...")` 的文本按行高断行占位参与块流。**border
+  参与布局**:内容框 = 框 − border − padding(引擎缺省 border-box;显式
+  `content-box` 反推框宽);`line-height` 三态(normal/倍数/%);UA 样式表
+  内置 web 缺省(div/p/h1-h6 的 display/字号/margin),`Element` 通用容器
+  (kind=标签名)写 web 风格容器用。**窗口根的塌陷链会推内容**
+  (等价 Chrome 的 html 外边距;直接 `Arrange` 子树根则丢弃——测试对齐
+  Chrome 时用带 padding 的接收者或 oracle 驱动的 escT 公式)。与 Chrome 的
+  逐盒一致性由 web_oracle 脚本(Chrome headless getBoundingClientRect 与
+  Zan 坐标对比)裁决:用例 JSON + Zan 侧驱动输出同名 `sel x,y wxh` 行
+  `--compare` 对比;basic 7 盒 + collapse 8 盒(塌陷/塌穿/BFC 关链/auto
+  居中/文本块)均 0px 偏差;其余偏差记录在路线图台账。
 
 - **`!important` 真的压得住 inline**:带标记的声明单独存、在普通级联
   (含宿主 inline)之后统一再套一遍,不是"剥掉标记按顺序碰运气"。
 - **渐变只认两端+中间一档**(`linear-gradient([dir,] a, b[, c])`);停靠点上的
   百分比位置(`#fff 40%`)被丢掉,运行时只采样三档。`to left`/`270deg` 靠交换
   首末停靠点实现。
-- **`box-sizing`/`float` 收下但不生效**(引擎没有对应布局);网页布局属性
-  (content/quotes/counter-*/list-style*/user-select/outline* 等一批)进了
-  Inert 白名单:收下、不变成 class、Lint 报 inert,不会有"漏进 SetProp 变
-  class"的灵异效果。
+- **网页布局专属属性**(content/quotes/counter-*/list-style*/user-select/
+  outline* 等一批)进了 Inert 白名单:收下、不变成 class、Lint 报 inert,
+  不会有"漏进 SetProp 变 class"的灵异效果。
 - **现代颜色函数**:`rgb(0 128 255)`/`rgb(0 128 255 / 50%)`(空格语法 + 斜杠
   alpha,逗号旧语法也认)、hue 单位 `0.5turn`/`200grad`/`3.14rad`、
   `hwb(h w% b%)`、`oklab()/oklch()`(Tailwind 调色板的缺省写法)、
