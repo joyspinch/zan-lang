@@ -1,0 +1,443 @@
+namespace Gui;
+
+/// grid 轨道与放置解析（WEB_GUI_ROADMAP P4）：容器模板在 StyleBox 里
+/// 存原文串，排版时在这里展开；条目放置折成线号 + span。只认 AI 常写
+/// 的良构子集：px / % / auto / fr（整数）/ minmax(a,b) / repeat(N, 轨道)；
+/// 命名线/命名区/负线号/fit-content 不认（按 auto 兜底，台账）。
+
+/// 一条 grid-column/row 声明的解析结果。
+class GridLine {
+    int start;      // 1 基线号，0 = auto
+    int end;        // 1 基线号（不含），0 = auto
+    int span;       // >0 = 显式 span（"span N"）
+}
+
+/// 一条轨道定义。kind：0 px，1 %（千分），2 auto，3 fr，4 minmax；
+/// minmax 的上下限用同一套 kind/val 编码存在 min*/max* 里。
+class GridTrack {
+    int kind;
+    int val;
+    int minKind; int minVal;
+    int maxKind; int maxVal;
+}
+
+/// 一次放置的输出：条目平行数组（0 基格子坐标 + span），以及网格
+/// 最终的列/行数（含隐式轨道）。测量与排布端各算一遍，结果一致
+/// （纯函数，无状态）。
+class GridPlace {
+    List<Control> items;
+    List<int> colStart;   // 0 基
+    List<int> colSpan;
+    List<int> rowStart;
+    List<int> rowSpan;
+    int nCols;
+    int nRows;
+}
+
+class Grid {
+    /// "1 / 3"、"span 2"、"2 / span 3"、"auto"、"3"。命名线/负线号
+    /// 不认（负线号按 auto 兜底）。
+    static GridLine ParseLine(string v) {
+        GridLine gl = new GridLine();
+        List<string> t = StyleSheet.Tokens(v);
+        int nums = 0;
+        for (int i = 0; i < t.Count; i = i + 1) {
+            string w = t[i];
+            if (w == "/" || w == "auto") { continue; }
+            if (w == "span") {
+                if (i + 1 < t.Count) {
+                    int n = StyleSheet.ParseInt(t[i + 1]);
+                    if (n > 0) { gl.span = n; }
+                    i = i + 1;
+                }
+                if (gl.span <= 0) { gl.span = 1; }
+                continue;
+            }
+            int num = StyleSheet.ParseInt(w);
+            if (num <= 0) { continue; }   // 非法/负线号：忽略
+            if (nums == 0) { gl.start = num; }
+            else if (nums == 1) { gl.end = num; }
+            nums = nums + 1;
+        }
+        if (gl.span <= 0 && gl.end > gl.start) { gl.span = gl.end - gl.start; }
+        if (gl.span <= 0) { gl.span = 0; }   // 0 = 未声明（消费端按 1）
+        return gl;
+    }
+
+    /// 轨道列表：顶层按空白切（括号内不切），repeat(N, …) 展开。
+    static List<GridTrack> ParseTracks(string v) {
+        List<GridTrack> out2 = new List<GridTrack>();
+        if (v == null || v == "") { return out2; }
+        List<string> t = Grid.SplitTop(v);
+        for (int i = 0; i < t.Count; i = i + 1) {
+            string w = t[i];
+            if (Grid.StartsWith(w, "repeat(") && Grid.EndsWith(w, ")")) {
+                string inner = w.Substring(7, w.Length - 8);
+                int depth = 0;
+                int comma = 0 - 1;
+                for (int k = 0; k < inner.Length; k = k + 1) {
+                    if (inner[k] == 40) { depth = depth + 1; }
+                    else if (inner[k] == 41) { depth = depth - 1; }
+                    else if (inner[k] == 44 && depth == 0) { comma = k; break; }
+                }
+                if (comma < 0) { continue; }
+                int n = StyleSheet.ParseInt(StyleSheet.Trim(
+                    inner.Substring(0, comma)));
+                if (n < 0) { n = 0; }
+                List<GridTrack> sub = Grid.ParseTracks(
+                    inner.Substring(comma + 1));
+                for (int r2 = 0; r2 < n; r2 = r2 + 1) {
+                    for (int k2 = 0; k2 < sub.Count; k2 = k2 + 1) {
+                        GridTrack cp = new GridTrack();
+                        cp.kind = sub[k2].kind; cp.val = sub[k2].val;
+                        cp.minKind = sub[k2].minKind;
+                        cp.minVal = sub[k2].minVal;
+                        cp.maxKind = sub[k2].maxKind;
+                        cp.maxVal = sub[k2].maxVal;
+                        out2.Add(cp);
+                    }
+                }
+                continue;
+            }
+            out2.Add(Grid.ParseOne(w));
+        }
+        return out2;
+    }
+
+    /// 单条轨道。
+    static GridTrack ParseOne(string w) {
+        GridTrack tr = new GridTrack();
+        if (w == "auto") { tr.kind = 2; return tr; }
+        if (Grid.EndsWith(w, "fr")) {
+            tr.kind = 3;
+            tr.val = StyleSheet.ParseInt(
+                w.Substring(0, w.Length - 2)) * 1000;
+            if (tr.val <= 0) { tr.val = 1000; }
+            return tr;
+        }
+        if (Grid.EndsWith(w, "%")) {
+            tr.kind = 1;
+            tr.val = StyleSheet.ParseInt(
+                w.Substring(0, w.Length - 1)) * 10;
+            return tr;
+        }
+        if (Grid.StartsWith(w, "minmax(") && Grid.EndsWith(w, ")")) {
+            string inner = w.Substring(7, w.Length - 8);
+            int depth = 0;
+            int comma = 0 - 1;
+            for (int k = 0; k < inner.Length; k = k + 1) {
+                if (inner[k] == 40) { depth = depth + 1; }
+                else if (inner[k] == 41) { depth = depth - 1; }
+                else if (inner[k] == 44 && depth == 0) { comma = k; break; }
+            }
+            tr.kind = 4;
+            GridTrack lo = comma > 0
+                ? Grid.ParseOne(StyleSheet.Trim(inner.Substring(0, comma)))
+                : Grid.ParseOne("auto");
+            GridTrack hi = comma > 0
+                ? Grid.ParseOne(StyleSheet.Trim(inner.Substring(comma + 1)))
+                : Grid.ParseOne("auto");
+            tr.minKind = lo.kind; tr.minVal = lo.val;
+            tr.maxKind = hi.kind; tr.maxVal = hi.val;
+            return tr;
+        }
+        // <length>：带 px 后缀或裸数字都按 px（CSS 裸 0 常见）。
+        tr.kind = 0;
+        string num = Grid.EndsWith(w, "px")
+            ? w.Substring(0, w.Length - 2) : w;
+        tr.val = StyleSheet.ParseInt(num);
+        return tr;
+    }
+
+    /// 括号感知的顶层切分（"minmax(100px, 1fr) 2fr" → 2 段）。
+    static List<string> SplitTop(string v) {
+        List<string> out2 = new List<string>();
+        int depth = 0;
+        int start = 0;
+        for (int i = 0; i < v.Length; i = i + 1) {
+            int ch = v[i];
+            if (ch == 40) { depth = depth + 1; }
+            else if (ch == 41) { depth = depth - 1; }
+            else if (depth == 0
+                     && (ch == 32 || ch == 9 || ch == 10 || ch == 13)) {
+                if (i > start) { out2.Add(v.Substring(start, i - start)); }
+                start = i + 1;
+            }
+        }
+        if (v.Length > start) { out2.Add(v.Substring(start)); }
+        return out2;
+    }
+
+    static bool StartsWith(string s, string pre) {
+        if (s.Length < pre.Length) { return false; }
+        return s.Substring(0, pre.Length) == pre;
+    }
+
+    static bool EndsWith(string s, string suf) {
+        if (s.Length < suf.Length) { return false; }
+        return s.Substring(s.Length - suf.Length) == suf;
+    }
+
+    /// 放置（CSS 8.5 简化）：显式位置先落，再"行定列自"、"列定行自"，
+    /// 最后全 auto 的稀疏行主序游标。expCols/expRows 是模板声明的
+    /// 显式轨道数（空轨道也占位）。隐式列/行按需扩展（列扩展要按
+    /// 行主序重建占用表）。
+    static GridPlace Place(List<Control> items, int expCols, int expRows) {
+        GridPlace pl = new GridPlace();
+        pl.items = items;
+        pl.colStart = new List<int>();
+        pl.colSpan = new List<int>();
+        pl.rowStart = new List<int>();
+        pl.rowSpan = new List<int>();
+        int n = items.Count;
+        List<int> c0 = new List<int>();
+        List<int> cN = new List<int>();
+        List<int> r0 = new List<int>();
+        List<int> rN = new List<int>();
+        int nCols = expCols > 0 ? expCols : 1;
+        int nRows = expRows > 0 ? expRows : 1;
+        for (int i = 0; i < n; i = i + 1) {
+            StyleBox sb = items[i].computedStyle;
+            int cs = sb != null ? sb.gColStart : 0;
+            int ce = sb != null ? sb.gColEnd : 0;
+            int cp = sb != null && sb.gColSpan > 0 ? sb.gColSpan : 1;
+            if (ce > cs && cp <= 1) { cp = ce - cs; }
+            int rs = sb != null ? sb.gRowStart : 0;
+            int re = sb != null ? sb.gRowEnd : 0;
+            int rp = sb != null && sb.gRowSpan > 0 ? sb.gRowSpan : 1;
+            if (re > rs && rp <= 1) { rp = re - rs; }
+            c0.Add(cs - 1);            // 0 基；-1 = auto
+            cN.Add(cp);
+            r0.Add(rs - 1);
+            rN.Add(rp);
+            if (c0[i] >= 0 && c0[i] + cN[i] > nCols) {
+                nCols = c0[i] + cN[i];
+            }
+            if (r0[i] >= 0 && r0[i] + rN[i] > nRows) {
+                nRows = r0[i] + rN[i];
+            }
+        }
+        // 占用表（行主序平铺），行按需扩展；扩列单独重建。
+        List<bool> occ = new List<bool>();
+        int capRows = nRows;
+        for (int k = 0; k < nCols * capRows; k = k + 1) { occ.Add(false); }
+        // 1）行列都显式。
+        for (int i = 0; i < n; i = i + 1) {
+            if (c0[i] < 0 || r0[i] < 0) { continue; }
+            pl.colStart.Add(c0[i]); pl.colSpan.Add(cN[i]);
+            pl.rowStart.Add(r0[i]); pl.rowSpan.Add(rN[i]);
+            Grid.Mark(occ, nCols, c0[i], r0[i], cN[i], rN[i]);
+        }
+        // 2）行定列自：该行扫空闲列，放不下扩列（隐式列）。
+        for (int i = 0; i < n; i = i + 1) {
+            if (r0[i] < 0 || c0[i] >= 0) { continue; }
+            int c = Grid.FindFreeInRow(occ, nCols, r0[i], cN[i]);
+            if (c < 0) {
+                c = nCols;
+                occ = Grid.Widen(occ, nCols, capRows, c + cN[i]);
+                nCols = c + cN[i];
+            }
+            pl.colStart.Add(c); pl.colSpan.Add(cN[i]);
+            pl.rowStart.Add(r0[i]); pl.rowSpan.Add(rN[i]);
+            Grid.Mark(occ, nCols, c, r0[i], cN[i], rN[i]);
+        }
+        // 3）列定行自：该列扫空闲行，放不下扩行（隐式行）。
+        for (int i = 0; i < n; i = i + 1) {
+            if (c0[i] < 0 || r0[i] >= 0) { continue; }
+            int r = Grid.FindFreeInCol(occ, nCols, capRows, c0[i], rN[i]);
+            if (r < 0) {
+                r = capRows;
+                while (capRows < r + rN[i]) {
+                    for (int k = 0; k < nCols; k = k + 1) { occ.Add(false); }
+                    capRows = capRows + 1;
+                }
+            }
+            if (r + rN[i] > nRows) { nRows = r + rN[i]; }
+            pl.colStart.Add(c0[i]); pl.colSpan.Add(cN[i]);
+            pl.rowStart.Add(r); pl.rowSpan.Add(rN[i]);
+            Grid.Mark(occ, nCols, c0[i], r, cN[i], rN[i]);
+        }
+        // 4）全 auto：稀疏行主序游标（只进不退）。
+        int cr = 0;
+        int cc = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            if (c0[i] >= 0 || r0[i] >= 0) { continue; }
+            while (true) {
+                while (cr + rN[i] > capRows) {
+                    for (int k = 0; k < nCols; k = k + 1) { occ.Add(false); }
+                    capRows = capRows + 1;
+                }
+                if (cc + cN[i] <= nCols
+                    && Grid.Free(occ, nCols, cc, cr, cN[i], rN[i])) {
+                    break;
+                }
+                cc = cc + 1;
+                if (cc + cN[i] > nCols) { cr = cr + 1; cc = 0; }
+            }
+            if (cr + rN[i] > nRows) { nRows = cr + rN[i]; }
+            pl.colStart.Add(cc); pl.colSpan.Add(cN[i]);
+            pl.rowStart.Add(cr); pl.rowSpan.Add(rN[i]);
+            Grid.Mark(occ, nCols, cc, cr, cN[i], rN[i]);
+            cc = cc + cN[i];
+        }
+        pl.nCols = nCols;
+        pl.nRows = nRows;
+        return pl;
+    }
+
+    static bool Free(List<bool> occ, int nCols, int c, int r, int cs, int rs) {
+        for (int rr = r; rr < r + rs; rr = rr + 1) {
+            for (int cx = c; cx < c + cs; cx = cx + 1) {
+                if (occ[rr * nCols + cx]) { return false; }
+            }
+        }
+        return true;
+    }
+
+    static void Mark(List<bool> occ, int nCols, int c, int r, int cs, int rs) {
+        for (int rr = r; rr < r + rs; rr = rr + 1) {
+            for (int cx = c; cx < c + cs; cx = cx + 1) {
+                occ[rr * nCols + cx] = true;
+            }
+        }
+    }
+
+    static int FindFreeInRow(List<bool> occ, int nCols, int r, int cs) {
+        for (int c = 0; c + cs <= nCols; c = c + 1) {
+            if (Grid.Free(occ, nCols, c, r, cs, 1)) { return c; }
+        }
+        return 0 - 1;
+    }
+
+    static int FindFreeInCol(List<bool> occ, int nCols, int capRows,
+                             int c, int rs) {
+        for (int r = 0; r + rs <= capRows; r = r + 1) {
+            if (Grid.Free(occ, nCols, c, r, 1, rs)) { return r; }
+        }
+        return 0 - 1;
+    }
+
+    /// 扩列：行主序平铺表在每行尾补 (newCols-oldCols) 个空位。
+    static List<bool> Widen(List<bool> occ, int oldCols, int rows,
+                            int newCols) {
+        List<bool> out2 = new List<bool>();
+        for (int r = 0; r < rows; r = r + 1) {
+            for (int c = 0; c < oldCols; c = c + 1) {
+                out2.Add(occ[r * oldCols + c]);
+            }
+            for (int c2 = oldCols; c2 < newCols; c2 = c2 + 1) {
+                out2.Add(false);
+            }
+        }
+        return out2;
+    }
+
+    /// 定尺寸（CSS 12 简化）：基尺寸 → 非弹性轨道均分放大（钉在增长
+    /// 上限）→ fr 按比例吃掉剩余 → 无 fr 时剩余均分给 auto（stretch，
+    /// Chrome 对 align-content: normal 的行为）。avail < 0（auto 容器）
+    /// 只给基尺寸。contentOf(i, track) 回调不可用，调用方直接把每条
+    /// 轨道的"跨 1 格条目最大外围尺寸"传进来。
+    static List<int> SizeTracks(List<GridTrack> defs, List<GridTrack> auto,
+                                int n, List<int> span1At, List<int> span1Sz,
+                                int avail, int gap) {
+        List<int> size = new List<int>();
+        List<int> limit = new List<int>();
+        List<bool> flex = new List<bool>();
+        List<int> frVal = new List<int>();
+        int big = 1 << 28;
+        for (int i = 0; i < n; i = i + 1) {
+            GridTrack d = null;
+            if (i < defs.Count) { d = defs[i]; }
+            else if (auto != null && i - defs.Count < auto.Count) {
+                d = auto[i - defs.Count];
+            }
+            int content = 0;
+            for (int k = 0; k < span1At.Count; k = k + 1) {
+                if (span1At[k] == i && span1Sz[k] > content) {
+                    content = span1Sz[k];
+                }
+            }
+            int b = content;
+            int lim = big;
+            bool fx = false;
+            int fv = 0;
+            if (d == null) { d = Grid.ParseOne("auto"); }
+            if (d.kind == 0) { b = d.val; lim = d.val; }
+            else if (d.kind == 1) {
+                if (avail >= 0) { b = d.val * avail / 1000; lim = b; }
+            } else if (d.kind == 3) {
+                fx = true; fv = d.val;
+            } else if (d.kind == 4) {
+                if (d.minKind == 0) { b = d.minVal; }
+                else if (d.minKind == 1 && avail >= 0) {
+                    b = d.minVal * avail / 1000;
+                }
+                if (d.maxKind == 0) { lim = d.maxVal; }
+                else if (d.maxKind == 1 && avail >= 0) {
+                    lim = d.maxVal * avail / 1000;
+                } else if (d.maxKind == 3) {
+                    fx = true; fv = d.maxVal;
+                }
+            }
+            size.Add(b);
+            limit.Add(fx ? b : lim);
+            flex.Add(fx);
+            frVal.Add(fv);
+        }
+        if (avail >= 0) {
+            int used = gap * (n > 0 ? n - 1 : 0);
+            for (int i = 0; i < n; i = i + 1) { used = used + size[i]; }
+            int free = avail - used;
+            // 非弹性轨道均分放大（冻结在增长上限）。
+            int rounds = 0;
+            while (free > 0 && rounds < 64) {
+                int cand = 0;
+                for (int i = 0; i < n; i = i + 1) {
+                    if (!flex[i] && size[i] < limit[i]) { cand = cand + 1; }
+                }
+                if (cand == 0) { break; }
+                int share = free / cand;
+                if (share <= 0) { share = 1; }
+                bool grew = false;
+                for (int i = 0; i < n && free > 0; i = i + 1) {
+                    if (flex[i] || size[i] >= limit[i]) { continue; }
+                    int add = limit[i] - size[i];
+                    if (add > share) { add = share; }
+                    if (add > free) { add = free; }
+                    size[i] = size[i] + add;
+                    free = free - add;
+                    if (add > 0) { grew = true; }
+                }
+                if (!grew) { break; }
+                rounds = rounds + 1;
+            }
+            // fr 按比例分剩余。
+            int frTotal = 0;
+            for (int i = 0; i < n; i = i + 1) {
+                if (flex[i]) { frTotal = frTotal + frVal[i]; }
+            }
+            if (frTotal > 0) {
+                used = gap * (n > 0 ? n - 1 : 0);
+                for (int i = 0; i < n; i = i + 1) { used = used + size[i]; }
+                int free2 = avail - used;
+                if (free2 > 0) {
+                    for (int i = 0; i < n; i = i + 1) {
+                        if (flex[i]) {
+                            size[i] = size[i] + free2 * frVal[i] / frTotal;
+                        }
+                    }
+                }
+            }
+        }
+        return size;
+    }
+
+    /// Σ 轨道 + 间距（span 个格子从第 start 条起）。
+    static int SpanSum(List<int> size, int gap, int start, int span) {
+        int s = 0;
+        for (int i = start; i < start + span && i < size.Count; i = i + 1) {
+            s = s + size[i];
+        }
+        return s + gap * (span - 1);
+    }
+}

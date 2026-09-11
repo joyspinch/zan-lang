@@ -668,7 +668,7 @@ class StyleSheet {
         if (prop == "display") {
             return v == "block" || v == "inline" || v == "inline-block"
                 || v == "flex" || v == "inline-flex" || v == "none"
-                || v == "flow-root";
+                || v == "flow-root" || v == "grid" || v == "inline-grid";
         }
         if (prop == "position") {
             return v == "static" || v == "relative"
@@ -1178,6 +1178,45 @@ class StyleSheet {
         }
         if (k == "row-gap") { b.rowGap = StyleSheet.Len(b, v); return true; }
         if (k == "column-gap") { b.colGap = StyleSheet.Len(b, v); return true; }
+        // P4 grid：容器轨道模板存原文（排版时经 Grid.ParseTracks 展开
+        // repeat()/minmax()）；条目放置按 CSS 语法折成线号 + span。
+        if (k == "grid-template-columns") { b.gridCols = StyleSheet.Trim(v); return true; }
+        if (k == "grid-template-rows") { b.gridRows = StyleSheet.Trim(v); return true; }
+        if (k == "grid-auto-columns") { b.gridAutoCols = StyleSheet.Trim(v); return true; }
+        if (k == "grid-auto-rows") { b.gridAutoRows = StyleSheet.Trim(v); return true; }
+        if (k == "grid-column" || k == "grid-row") {
+            GridLine gl = Grid.ParseLine(v);
+            if (k == "grid-column") {
+                b.gColStart = gl.start; b.gColEnd = gl.end;
+                if (gl.span > 0) { b.gColSpan = gl.span; }
+            } else {
+                b.gRowStart = gl.start; b.gRowEnd = gl.end;
+                if (gl.span > 0) { b.gRowSpan = gl.span; }
+            }
+            return true;
+        }
+        if (k == "grid-column-start" || k == "grid-row-start") {
+            GridLine gl = Grid.ParseLine(v);
+            if (k == "grid-column-start") { b.gColStart = gl.start; if (gl.span > 0) { b.gColSpan = gl.span; } }
+            else { b.gRowStart = gl.start; if (gl.span > 0) { b.gRowSpan = gl.span; } }
+            return true;
+        }
+        if (k == "grid-column-end" || k == "grid-row-end") {
+            GridLine gl = Grid.ParseLine(v);
+            if (k == "grid-column-end") { b.gColEnd = gl.end; if (gl.span > 0) { b.gColSpan = gl.span; } }
+            else { b.gRowEnd = gl.end; if (gl.span > 0) { b.gRowSpan = gl.span; } }
+            return true;
+        }
+        if (k == "place-items") {
+            List<string> pi = StyleSheet.Tokens(v);
+            b.alignItems = StyleSheet.AlignItemCode(pi[0]);
+            if (pi.Count >= 2) { b.justifyItems = StyleSheet.AlignItemCode(pi[1]); }
+            return true;
+        }
+        if (k == "justify-items") {
+            b.justifyItems = StyleSheet.AlignItemCode(v);
+            return true;
+        }
         if (k == "columns") { b.columns = StyleSheet.Num(v); return true; }
         return false;
     }
@@ -1217,11 +1256,17 @@ class StyleSheet {
                 // 普通块容器（P1）：与首/尾子 margin 塌陷。
                 b.display = 3;
             }
-            else if (v == "flow-root" || v == "grid") {
-                // flow-root 建立 BFC：不与首尾子塌陷。grid 在 P4
-                // 落地前按 BFC 块流退化（GuardValueKnown 不认 grid，
-                // @supports 兜底仍判假）。
+            else if (v == "flow-root") {
+                // flow-root 建立 BFC：不与首尾子塌陷。
                 b.display = 3; b.bfc = 1;
+            }
+            else if (v == "grid") {
+                // 真 grid（P4）：轨道模板排版；容器是天然的分隔
+                // （子项 margin 不与容器塌陷）。
+                b.display = 4; b.bfc = 1;
+            }
+            else if (v == "inline-grid") {
+                b.display = 4; b.inlineLevel = 1; b.bfc = 1;
             }
             else if (v == "inline" || v == "inline-block") {
                 // 行内级（P2 行盒；P1 暂按块排）。inline-block 是 BFC。
@@ -1240,10 +1285,7 @@ class StyleSheet {
             return true;
         }
         if (k == "align-items") {
-            b.alignItems = 0;
-            if (v == "flex-start" || v == "start" || v == "top") { b.alignItems = 1; }
-            if (v == "center") { b.alignItems = 2; }
-            if (v == "flex-end" || v == "end" || v == "bottom") { b.alignItems = 3; }
+            b.alignItems = StyleSheet.AlignItemCode(v);
             return true;
         }
         // `flex-flow: <direction> || <wrap>`——两个值顺序任意，各自
@@ -1451,6 +1493,15 @@ class StyleSheet {
 
     /// `justify-content` 的取值码：0 start，1 center，2 end，
     /// 3 space-between，4 space-around/evenly。
+    /// 对齐关键词 → alignItems/justifyItems 编码（0 stretch/normal、
+    /// 1 start 系、2 center、3 end 系）；grid 与 flex 共用。
+    static int AlignItemCode(string v) {
+        if (v == "flex-start" || v == "start" || v == "top") { return 1; }
+        if (v == "center") { return 2; }
+        if (v == "flex-end" || v == "end" || v == "bottom") { return 3; }
+        return 0;
+    }
+
     static int JustifyCode(string v) {
         if (v == "center") { return 1; }
         if (v == "flex-end" || v == "end" || v == "right") { return 2; }

@@ -1921,6 +1921,193 @@ class Control {
         }
     }
 
+    // ---- grid（WEB_GUI_ROADMAP P4）------------------------------------------
+
+    /// grid 条目：可见、非定位、非 none 的直接子项（文档序）。
+    List<Control> GridItems() {
+        List<Control> items = new List<Control>();
+        for (int i = 0; i < children.Count; i = i + 1) {
+            Control c = children[i];
+            if (!c.StyleVisible() || c.StylePosition() == 2
+                || c.StyleDisplay() == 2) { continue; }
+            items.Add(c);
+        }
+        return items;
+    }
+
+    /// 条目外围宽（轨道尺寸用）：声明宽用声明值（% 按容器未定给 0，
+    /// 与块流测量同规矩），否则测量偏好；加水平 margin。
+    int GridOuterW(Control c) {
+        int w = c.StyleDeclaresWidth() ? c.StyleWidthIn(0) : c.prefW;
+        if (w < 0) { w = 0; }
+        return w + c.StyleMarL() + c.StyleMarR();
+    }
+
+    int GridOuterH(Control c) {
+        int h = c.StyleDeclaresHeight() ? c.StyleHeightIn(0) : c.prefH;
+        if (h < 0) { h = 0; }
+        return h + c.StyleMarT() + c.StyleMarB();
+    }
+
+    /// 按内容测量一个 `display: grid` 容器：列轨先定宽（声明宽的容器
+    /// 按声明内容宽放大 fr/auto，auto 容器只按内容基尺寸），宽度相关
+    /// 的条目高度按所在列宽重测后定行轨。只填补留空的轴。
+    void MeasureGridContent(App app) {
+        if (prefW > 0 && prefH > 0) { return; }
+        StyleBox sb = computedStyle;
+        if (sb == null) { sb = new StyleBox(); }
+        int colGap = this.StyleColGap(this.StyleGap());
+        int rowGap = this.StyleRowGap(this.StyleGap());
+        List<GridTrack> colDefs = Grid.ParseTracks(sb.gridCols);
+        List<GridTrack> rowDefs = Grid.ParseTracks(sb.gridRows);
+        List<GridTrack> autoCols = Grid.ParseTracks(sb.gridAutoCols);
+        List<GridTrack> autoRows = Grid.ParseTracks(sb.gridAutoRows);
+        List<Control> items = this.GridItems();
+        GridPlace pl = Grid.Place(items, colDefs.Count, rowDefs.Count);
+        // 列：跨 1 格条目的外围宽喂给 auto 轨道。
+        List<int> at = new List<int>();
+        List<int> sz = new List<int>();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            if (pl.colSpan[i] != 1) { continue; }
+            at.Add(pl.colStart[i]);
+            sz.Add(this.GridOuterW(items[i]));
+        }
+        int colAvail = 0 - 1;
+        if (this.StyleDeclaresWidth()) {
+            colAvail = this.StyleWidthIn(0)
+                - this.StyleInsetL() - this.StyleInsetR();
+            if (colAvail < 0) { colAvail = 0; }
+        }
+        List<int> colW = Grid.SizeTracks(colDefs, autoCols, pl.nCols,
+                                         at, sz, colAvail, colGap);
+        // 行：高度依赖宽度的条目按所在列宽重测（流容器断行）。
+        at = new List<int>();
+        sz = new List<int>();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            Control c = items[i];
+            if (!c.StyleDeclaresHeight() && c.StyleDisplay() == 3) {
+                int inner = Grid.SpanSum(colW, colGap, pl.colStart[i],
+                                         pl.colSpan[i])
+                    - c.StyleMarL() - c.StyleMarR();
+                if (inner < 0) { inner = 0; }
+                c.HintWrapWidth(inner);
+                c.prefH = 0;
+                c.fillH = false;
+                c.MeasureFlow(null);
+            }
+            if (pl.rowSpan[i] != 1) { continue; }
+            at.Add(pl.rowStart[i]);
+            sz.Add(this.GridOuterH(items[i]));
+        }
+        int rowAvail = 0 - 1;
+        if (this.StyleDeclaresHeight()) {
+            rowAvail = this.StyleHeightIn(0)
+                - this.StyleInsetT() - this.StyleInsetB();
+            if (rowAvail < 0) { rowAvail = 0; }
+        }
+        List<int> rowH = Grid.SizeTracks(rowDefs, autoRows, pl.nRows,
+                                         at, sz, rowAvail, rowGap);
+        int sumW = Grid.SpanSum(colW, colGap, 0, pl.nCols);
+        int sumH = Grid.SpanSum(rowH, rowGap, 0, pl.nRows);
+        if (prefH <= 0 && sumH > 0) {
+            prefH = sumH + this.StyleInsetT() + this.StyleInsetB();
+            this.fillH = true;
+        }
+        if (prefW <= 0 && sumW > 0) {
+            prefW = sumW + this.StyleInsetL() + this.StyleInsetR();
+            this.fillW = true;
+        }
+    }
+
+    /// grid 排布（P4）：列轨按实际内容宽定尺寸 → 宽度相关条目重测 →
+    /// 行轨定尺寸 → 逐条目落格。格内对齐：inline 轴 justify-items、
+    /// block 轴 align-items（0 stretch / 1 start / 2 center / 3 end）；
+    /// stretch 只对未声明尺寸的条目生效，声明了尺寸按 start（Chrome
+    /// 同款）。
+    void ArrangeGrid(int cx, int cy, int cw, int ch) {
+        StyleBox sb = computedStyle;
+        if (sb == null) { sb = new StyleBox(); }
+        int colGap = this.StyleColGap(this.StyleGap());
+        int rowGap = this.StyleRowGap(this.StyleGap());
+        List<GridTrack> colDefs = Grid.ParseTracks(sb.gridCols);
+        List<GridTrack> rowDefs = Grid.ParseTracks(sb.gridRows);
+        List<GridTrack> autoCols = Grid.ParseTracks(sb.gridAutoCols);
+        List<GridTrack> autoRows = Grid.ParseTracks(sb.gridAutoRows);
+        List<Control> items = this.GridItems();
+        GridPlace pl = Grid.Place(items, colDefs.Count, rowDefs.Count);
+        List<int> at = new List<int>();
+        List<int> sz = new List<int>();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            if (pl.colSpan[i] != 1) { continue; }
+            at.Add(pl.colStart[i]);
+            sz.Add(this.GridOuterW(items[i]));
+        }
+        if (cw < 0) { cw = 0; }
+        List<int> colW = Grid.SizeTracks(colDefs, autoCols, pl.nCols,
+                                         at, sz, cw, colGap);
+        at = new List<int>();
+        sz = new List<int>();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            Control c = items[i];
+            if (!c.StyleDeclaresHeight() && c.StyleDisplay() == 3) {
+                int inner = Grid.SpanSum(colW, colGap, pl.colStart[i],
+                                         pl.colSpan[i])
+                    - c.StyleMarL() - c.StyleMarR();
+                if (inner < 0) { inner = 0; }
+                c.HintWrapWidth(inner);
+                c.prefH = 0;
+                c.fillH = false;
+                c.MeasureFlow(null);
+            }
+            if (pl.rowSpan[i] != 1) { continue; }
+            at.Add(pl.rowStart[i]);
+            sz.Add(this.GridOuterH(items[i]));
+        }
+        if (ch < 0) { ch = 0; }
+        List<int> rowH = Grid.SizeTracks(rowDefs, autoRows, pl.nRows,
+                                         at, sz, ch, rowGap);
+        for (int i = 0; i < items.Count; i = i + 1) {
+            Control c = items[i];
+            int cellX = cx + Grid.SpanSum(colW, colGap, 0, pl.colStart[i]);
+            int cellY = cy + Grid.SpanSum(rowH, rowGap, 0, pl.rowStart[i]);
+            int cellW = Grid.SpanSum(colW, colGap, pl.colStart[i],
+                                     pl.colSpan[i]);
+            int cellH = Grid.SpanSum(rowH, rowGap, pl.rowStart[i],
+                                     pl.rowSpan[i]);
+            int ml = c.StyleMarL();
+            int mr = c.StyleMarR();
+            int mt = c.StyleMarT();
+            int mb = c.StyleMarB();
+            int innerW = cellW - ml - mr;
+            if (innerW < 0) { innerW = 0; }
+            int innerH = cellH - mt - mb;
+            if (innerH < 0) { innerH = 0; }
+            int jc = sb.justifyItems;
+            int px = cellX + ml;
+            int w = innerW;
+            if (jc != 0 || c.StyleDeclaresWidth()) {
+                w = c.StyleDeclaresWidth()
+                    ? c.StyleWidthIn(cellW) : c.prefW;
+                if (w < 0) { w = 0; }
+                int free = innerW - w;
+                if (jc == 2) { px = px + free / 2; }
+                else if (jc == 3) { px = px + free; }
+            }
+            int ac = sb.alignItems;
+            int py = cellY + mt;
+            int h = innerH;
+            if (ac != 0 || c.StyleDeclaresHeight()) {
+                h = c.StyleDeclaresHeight()
+                    ? c.StyleHeightIn(cellH) : c.prefH;
+                if (h < 0) { h = 0; }
+                int free = innerH - h;
+                if (ac == 2) { py = py + free / 2; }
+                else if (ac == 3) { py = py + free; }
+            }
+            c.Arrange(px, py, w, h);
+        }
+    }
+
     /// 停靠容器在没人给尺寸时按内容测量：一列停靠的行
     /// 高等于各行之和，一行停靠的控件宽等于各控件之和
     /// （加上内边距和间距）。少了这一步，设计器只能给
@@ -1935,6 +2122,10 @@ class Control {
         }
         if (disp == 3) {
             this.MeasureFlow(app);
+            return;
+        }
+        if (disp == 4) {
+            this.MeasureGridContent(app);
             return;
         }
         if (prefW > 0 && prefH > 0) { return; }
@@ -2133,6 +2324,12 @@ class Control {
         }
         if (dispBox == 1) {
             this.ArrangeFlex(cx, cy, cw, ch, innerGap);
+            this.ArrangePositioned(pbx, pby, pbw, pbh);
+            this.CheckKidsLayout();
+            return;
+        }
+        if (dispBox == 4) {
+            this.ArrangeGrid(cx, cy, cw, ch);
             this.ArrangePositioned(pbx, pby, pbw, pbh);
             this.CheckKidsLayout();
             return;
