@@ -1,0 +1,125 @@
+using System;
+using Gui;
+using Gui.Component.Chart;
+
+namespace Conf;
+
+/// ECharts axisLine 三态（'auto'）与 axisLine.onZero 骑线。
+///
+/// 官方出处（`_scratch/echarts-master`）：
+///   - `coord/axisDefault.ts:162/176` —— 类目轴 axisLine.show 缺省
+///     true（声明态）；value 轴缺省 **'auto'**（time/log 同）。
+///   - `coord/cartesian/cartesianAxisHelper.ts:169-181` —— 'auto' 只在
+///     **同网格对侧轴是 interval/log** 时画（isIntervalOrLogScale，
+///     time 不算），与本轴自身类型无关 ⇒ 标准 bar/line（x 类目 + y
+///     数值）只有底部一根线，Zan 旧实现两根都画。
+///   - `coord/axisDefault.ts:62` + `Grid.ts:614-671` —— axisLine.onZero
+///     缺省 **'auto'**（≠ true/false 的第三态）：骑到目标轴的 0 位；
+///     迭代序 x 先 y 后、目标被认领后不复用（onzero_multi.js 实测）。
+///   - `Grid.ts:677-717` canOnZeroToAxis —— 目标轴必须 value/log、0 在
+///     目标域**外**禁止（EDGE 恰为端点允许），骑线轴声明 onZero:false
+///     禁止。骑线只搬轴线与 start/end 轴名；tick 标签与 middle 轴名
+///     不随动（AxisBuilder.ts:1566 / 869 的 labelOffset 抵偿，实测
+///     onzero_namemid.js）。
+///
+/// 数值出处：`_scratch/chart_oracle/onzero.js`（SSR 轴线 y=269.5 对
+/// plotBot=320.5）、`axisline_hook.js`/`axisline_scan.js`（69/15 清单）、
+/// `onzero_now.js`（逐 demo 轴线位置）。
+class Program {
+    static int PX = 50;
+    static int PY = 40;
+    static int PW = 410;
+    static int PH = 310;   // plotBot = 350、plotRight = 460
+
+    static string B(bool v) { return v ? "1" : "0"; }
+
+    static ChartAxis AxisOf(string type) {
+        ChartAxis a = ChartAxis.Value();
+        a.type = ChartKinds.AxisOf(type);
+        return a;
+    }
+
+    static void Main() {
+        // ---- axisLine.show 三态判定 ----
+        // 显式 true/false 照办；'auto'（未声明 -1）看对侧轴。
+        Console.WriteLine("show/explicit:" + Program.B(Chart.AxisLineDraws(1, false))
+            + Program.B(Chart.AxisLineDraws(0, true)));
+        // auto：对侧 value/log 才画（time/category 都不算 interval）
+        Console.WriteLine("auto/other-value:" + Program.B(Chart.AxisLineDraws(0 - 1, true)));
+        Console.WriteLine("auto/other-cat:" + Program.B(Chart.AxisLineDraws(0 - 1, false)));
+
+        // ---- 0 相对域的位置：0=域外 1=EDGE 2=严格在内 ----
+        Console.WriteLine("kind:" + Convert.ToString(Chart.ZeroKindOf(2, 100))
+            + Convert.ToString(Chart.ZeroKindOf(0, 100))
+            + Convert.ToString(Chart.ZeroKindOf(0 - 40, 0))
+            + Convert.ToString(Chart.ZeroKindOf(0 - 40, 60))
+            + Convert.ToString(Chart.ZeroKindOf(10, 20)));
+
+        // ---- canOnZeroToAxis：目标 value/log、0 不在域外、骑线轴非 false ----
+        ChartAxis val = Program.AxisOf("value");
+        ChartAxis cat = Program.AxisOf("category");
+        ChartAxis log = Program.AxisOf("log");
+        Console.WriteLine("ride/in:" + Program.B(Chart.CanOnZeroTo(val, 0 - 40, 60, 0 - 1)));
+        Console.WriteLine("ride/edge:" + Program.B(Chart.CanOnZeroTo(val, 0, 100, 0 - 1)));
+        Console.WriteLine("ride/out:" + Program.B(Chart.CanOnZeroTo(val, 10, 100, 0 - 1)));
+        Console.WriteLine("ride/cat:" + Program.B(Chart.CanOnZeroTo(cat, 0 - 40, 60, 0 - 1)));
+        Console.WriteLine("ride/log:" + Program.B(Chart.CanOnZeroTo(log, 1, 1000, 0 - 1)));
+        Console.WriteLine("ride/off:" + Program.B(Chart.CanOnZeroTo(val, 0 - 40, 60, 0)));
+
+        // ---- 解析层：三态字段与 axisLine.lineStyle.color、轴级 position ----
+        ChartOption o = ChartOption.FromJson(
+            "{\"xAxis\":[{\"type\":\"category\",\"position\":\"top\",\"axisLine\":"
+            + "{\"onZero\":false,\"lineStyle\":{\"color\":\"#ff0000\"}}},"
+            + "{\"type\":\"value\",\"axisLine\":{\"show\":false}}],"
+            + "\"yAxis\":[{\"type\":\"value\"}]}");
+        Console.WriteLine("parse/x0:" + Convert.ToString(o.xAxes[0].onZero)
+            + ":" + Convert.ToString(o.xAxes[0].axisLineShow)
+            + ":" + Convert.ToString(o.xAxes[0].axisLineColor)
+            + ":" + o.xAxes[0].position);
+        Console.WriteLine("parse/x1:" + Convert.ToString(o.xAxes[1].axisLineShow)
+            + ":" + Convert.ToString(o.xAxes[1].onZero));
+        // 未声明的缺省：category 恒画、value 'auto'、onZero 'auto'
+        Console.WriteLine("parse/def:" + Convert.ToString(o.yAxes[0].axisLineShow)
+            + ":" + Convert.ToString(o.yAxes[0].onZero)
+            + ":" + Convert.ToString(o.xAxes[0].axisLineShow));
+
+        // ---- 骑线落点：ChartFrame 的 0 像素（钳在绘图区内）----
+        ChartFrame f = new ChartFrame();
+        f.plotX = Program.PX;
+        f.plotY = Program.PY;
+        f.plotW = Program.PW;
+        f.plotH = Program.PH;
+        f.leftMin = 0 - 100;
+        f.leftMax = 100;         // 0 在正中 → ZeroLineY = plotY + PH/2
+        f.xLo = 0 - 50;
+        f.xHi = 50;
+        Console.WriteLine("px/y0:" + Convert.ToString(f.ZeroLineY(0)));
+        Console.WriteLine("px/x0:" + Convert.ToString(f.ZeroLineX()));
+        // EDGE：0 恰为端点 → 落在边界；OUTSIDE → 钳回边界
+        f.leftMin = 0;
+        f.leftMax = 100;
+        Console.WriteLine("px/edge:" + Convert.ToString(f.ZeroLineY(0)));
+        f.leftMin = 20;
+        Console.WriteLine("px/out:" + Convert.ToString(f.ZeroLineY(0)));
+
+        // ---- 轴名随动：start/end 贴骑线走，middle 留在边界 ----
+        // （回归钉：middle 曾被错误地跟随骑线覆盖）
+        ChartAxis nx = ChartAxis.Value();
+        nx.title = "T";
+        ChartAxisName n1 = Chart.AxisNamePosPx(nx, true, Program.PX, Program.PY,
+            Program.PW, Program.PH, false, 15, 16, 0 - 10, Program.PY + 100);
+        ChartAxisName n2 = Chart.AxisNamePosPx(nx, true, Program.PX, Program.PY,
+            Program.PW, Program.PH, false, 15, 16, 0 - 10, 0 - 1);
+        // start 态 ay 负向随骑线（350+100 处的线 → ay = 450 + centerTop）
+        Console.WriteLine("name/ride:" + Convert.ToString(n1.ay));
+        // 无覆盖（-1）回退边界基位：plotBot + centerTop
+        Console.WriteLine("name/base:" + Convert.ToString(n2.ay));
+        ChartAxis nm = ChartAxis.Value();
+        nm.title = "T";
+        nm.nameLocation = "middle";
+        ChartAxisName n3 = Chart.AxisNamePosPx(nm, true, Program.PX, Program.PY,
+            Program.PW, Program.PH, false, 15, 16, 0 - 10, Program.PY + 100);
+        // middle 恒在边界：ay = plotBot + gap，不受骑线覆盖影响
+        Console.WriteLine("name/mid:" + Convert.ToString(n3.ay));
+    }
+}

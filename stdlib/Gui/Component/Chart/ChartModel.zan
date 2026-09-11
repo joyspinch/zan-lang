@@ -2216,9 +2216,21 @@ class ChartAxis {
                        // 的等价开关：刻度/工具提示按 -值 显示（雨量图负值轴）
     bool boundaryGap;  // ECharts boundaryGap（类目轴默认 true：点落在格中）
     int axisLineColor; // ECharts axisLine.lineStyle.color；0 = 主题色
+    int axisLineShow;  // ECharts axisLine.show 三态：-1 = 未声明（走 'auto'）、
+                       //   0 = 显式 false、1 = 显式 true。'auto' 的判定：
+                       //   类目轴恒画（axisDefault.ts:162 的 show:true，
+                       //   categoryAxis 不覆盖）；value/log/time 在
+                       //   cartesianAxisHelper.ts:169-181 里只有当**同网格**
+                       //   对侧轴是 value/log 时才画。
+    int onZero;        // ECharts axisLine.onZero 三态：-1 = 未声明（按 'auto'）、
+                       //   0 = 显式 false、1 = 显式 true。'auto' 与 true 在
+                       //   本引擎里等价（discourageOnAxisZero 只在
+                       //   containShape 真的扩过量程时才置位，见 Grid.ts:677）。
     bool show;         // ECharts axis.show：false = 整条轴（线/刻度/标签）不画
-    string position;   // ECharts yAxis.position："left"（默认）| "right"
-                       //   （目前散点视图实现；"" = 左）
+    string position;   // ECharts xAxis/yAxis.position，轴级键（不是
+                       //   axisLabel.position）：x = "bottom"/"top"，
+                       //   y = "left"/"right"；"" = 未声明（官方缺省
+                       //   bottom/left，见 Grid.ts:464-479）。
     string axisId;     // ECharts axis.id：series 经 xAxisId/yAxisId 按名引用
     List<string> categories;
 
@@ -2242,6 +2254,10 @@ class ChartAxis {
         a.labelFormatter = "";
         a.labelNegate = false;
         a.axisLineColor = 0;
+        // 类目轴：axisLine.show 官方缺省 true、axisLine.onZero 'auto'
+        // （axisDefault.ts:162 / :66）。
+        a.axisLineShow = 1;
+        a.onZero = 0 - 1;
         a.show = true;
         a.boundaryGap = true;
         a.axisId = "";
@@ -2277,6 +2293,10 @@ class ChartAxis {
         a.labelFormatter = "";
         a.labelNegate = false;
         a.axisLineColor = 0;
+        // 数值轴：axisLine.show 官方缺省 'auto'（axisDefault.ts:176，
+        // valueAxis 覆盖），故记 -1；onZero 仍是 'auto'。
+        a.axisLineShow = 0 - 1;
+        a.onZero = 0 - 1;
         a.show = true;
         a.boundaryGap = false;
         a.axisId = "";
@@ -2345,6 +2365,8 @@ class ChartAxis {
         a.labelFormatter = src.labelFormatter;
         a.labelNegate = src.labelNegate;
         a.axisLineColor = src.axisLineColor;
+        a.axisLineShow = src.axisLineShow;
+        a.onZero = src.onZero;
         a.show = src.show;
         a.position = src.position;
         a.axisId = src.axisId;
@@ -6009,9 +6031,21 @@ class ChartOption {
     /// axisLabel.interval 通用。
     static void ParseAxisOne(JsonValue v, List<ChartAxis> into, bool isX) {
         if (v == null || !v.IsObject()) { return; }
-        // ECharts 缺省 type：x 轴 category、y 轴 value（不写 type 的
-        // yAxis 极常见，默认成 category 会把整图切成轴互换模式）。
-        ChartAxisType ty = ChartKinds.AxisOf(v.Str("type", isX ? "category" : "value"));
+        // ECharts 缺省 type（axisModelCreator.ts:143）：option.type ||
+        // (option.data ? 'category' : 'value') —— x/y 同一规则，"轴自己
+        // 带 data 才是类目轴"。type-less 又无 data 的空对象（scatter-large
+        // 的 xAxis:[{}]、scatter-simple 的 xAxis:{}）是**数值轴**；按 x
+        // 一律缺省 category 会把散点图的 y 轴线 'auto' 判定错（对侧
+        // 类目 ⇒ 不画），而官方画出双线。
+        string tyS = v.Str("type", "");
+        ChartAxisType ty;
+        if (tyS.Length > 0) {
+            ty = ChartKinds.AxisOf(tyS);
+        } else {
+            JsonValue dflt = v.Get("data");
+            ty = dflt != null && dflt.IsArray()
+                ? ChartAxisType.Category : ChartAxisType.Value;
+        }
         ChartAxis a;
         if (ty == ChartAxisType.Category) {
             List<string> cats = new List<string>();
@@ -6052,6 +6086,37 @@ class ChartOption {
         a.splitArea = v.Bool("splitArea", a.splitArea);
         // ECharts axis.show：整条轴（轴线/刻度/标签）显隐。
         a.show = v.Bool("show", a.show);
+        // 轴级 position（**不是** axisLabel.position——旧实现读错了键，
+        // 语料里轴级 37 处、axisLabel 级 0 处）。官方对非法/缺省值按
+        // "该边已被占则翻对边"定缺省（Grid.ts:464-479），这里保留空串
+        // 让消费方按 left/bottom 缺省处理。
+        a.position = v.Str("position", a.position);
+        // axisLine：onZero 三态（未声明 = 'auto'）、show 三态
+        // （未声明 = 'auto'，但类目轴工厂已把缺省记成显式 true，
+        // 与官方 axisDefault/categoryAxis 的合并结果一致）、
+        // lineStyle.color（24 处语料此前整块丢弃）。
+        JsonValue aln = v.Get("axisLine");
+        if (aln != null && aln.IsObject()) {
+            bool hasOnZero = aln.Has("onZero");
+            JsonValue oz = aln.Get("onZero");
+            if (hasOnZero && oz != null && oz.IsBool()) {
+                a.onZero = oz.AsBool(true) ? 1 : 0;
+            } else if (hasOnZero) {
+                // 'auto' 或非法值：等价未声明。
+                a.onZero = 0 - 1;
+            }
+            bool hasShow = aln.Has("show");
+            JsonValue ls = aln.Get("show");
+            if (hasShow && ls != null && ls.IsBool()) {
+                a.axisLineShow = ls.AsBool(true) ? 1 : 0;
+            } else if (hasShow) {
+                a.axisLineShow = 0 - 1;
+            }
+            JsonValue lstyle = aln.Get("lineStyle");
+            if (lstyle != null && lstyle.IsObject()) {
+                a.axisLineColor = ChartOption.ParseColor(lstyle.Get("color"), a.axisLineColor);
+            }
+        }
         // boundaryGap：类目轴点/柱落在格子中间（默认）还是刻度线上。
         if (v.Has("boundaryGap")) {
             JsonValue bg = v.Get("boundaryGap");
@@ -6068,7 +6133,6 @@ class ChartOption {
             a.labelMargin = al.Int("margin", a.labelMargin);
             // 模板标签："{value} °C"——{value} 替换为刻度值。
             a.labelFormatter = al.Str("formatter", a.labelFormatter);
-            a.position = al.Str("position", a.position);
         }
         into.Add(a);
     }

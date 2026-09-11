@@ -223,6 +223,37 @@ class ChartFrame {
         return zy;
     }
 
+    /// 目标值轴（0 左 / 1 右）的 0 像素——axisLine.onZero 骑线的
+    /// 落点（cartesianAxisHelper.ts 的 otherAxis.toGlobalCoord(
+    /// dataToCoord(0))）。小数轴走 ×1000 定点域保亚像素精度；
+    /// 结果钳制进绘图区（官方同样 clamp 进网格矩形）。
+    int ZeroLineY(int axisIndex) {
+        bool frac = axisIndex == 1
+            ? (this.rightMinF != 0 || this.rightMaxF != 0)
+            : (this.leftMinF != 0 || this.leftMaxF != 0);
+        int zy;
+        if (frac) {
+            int loF = this.leftMinF;
+            int hiF = this.leftMaxF;
+            if (axisIndex == 1) { loF = this.rightMinF; hiF = this.rightMaxF; }
+            zy = Chart.ValueYF1000(this.plotY, this.plotH, loF, hiF, 0);
+        } else {
+            zy = this.YOf(0, axisIndex);
+        }
+        if (zy < this.plotY) { zy = this.plotY; }
+        if (zy > this.plotY + this.plotH) { zy = this.plotY + this.plotH; }
+        return zy;
+    }
+
+    /// X 数值轴（catY / 值 X）的 0 像素——y 轴骑线时的落点，
+    /// 同样钳制进绘图区。
+    int ZeroLineX() {
+        int zx = this.XOfValue(0);
+        if (zx < this.plotX) { zx = this.plotX; }
+        if (zx > this.plotX + this.plotW) { zx = this.plotX + this.plotW; }
+        return zx;
+    }
+
     /// Y 类目轴第 i 槽的垂直中线（轴互换折线的点行）。
     int CatMidY(int i, int n) {
         if (n < 1) { return this.plotY + this.plotH / 2; }
@@ -1612,6 +1643,39 @@ class Chart {
             - (int)(((long)vF - (long)loF) * (long)plotH / span);
     }
 
+    /// ECharts axisLine.show 三态判定（cartesianAxisHelper.ts:169-181
+    /// axisLineAutoShow）：显式 true/false 照办；未声明（-1）按 'auto'
+    /// ——只有当**同网格**对侧轴是 value/log（isIntervalOrLogScale）
+    /// 时才画，与本轴自身类型无关。time 轴也走 'auto'（实测
+    /// x时间/y时间 一条线都不画）。
+    static bool AxisLineDraws(int axisLineShow, bool otherIsValueOrLog) {
+        if (axisLineShow > 0) { return true; }
+        if (axisLineShow == 0) { return false; }
+        return otherIsValueOrLog;
+    }
+
+    /// 0 相对数值域 [lo,hi] 的位置：2 = 严格在内，1 = 恰是端点
+    /// （EDGE——官方允许骑线），0 = 在域外（禁止骑线）。
+    /// scale/helper.ts getScaleValuePositionKind 的语义。
+    static int ZeroKindOf(int lo, int hi) {
+        if (lo > 0 || hi < 0) { return 0; }
+        if (lo == 0 || hi == 0) { return 1; }
+        return 2;
+    }
+
+    /// ECharts Grid.canOnZeroToAxis（Grid.ts:677-717）：目标轴是
+    /// value/log（category/time 的 0 无数值意义）、0 不在目标域外
+    /// （EDGE 允许）、骑线轴的 axisLine.onZero 非 false（-1 未声明
+    /// 按 'auto'，与 true 等价——discourageOnAxisZero 只在
+    /// containShape 真的扩过量程时置位，本引擎不产生）。
+    static bool CanOnZeroTo(ChartAxis target, int targetLo, int targetHi,
+                            int riderOnZero) {
+        if (riderOnZero == 0) { return false; }
+        if (target.type != ChartAxisType.Value
+            && target.type != ChartAxisType.Log) { return false; }
+        return Chart.ZeroKindOf(targetLo, targetHi) > 0;
+    }
+
     /// 仅索引窗口 [i0,i1]（含端点）内的最大值，供 dataZoom
     /// 的索引视图使用（渲染循环直接读原系列，不做有损克隆）。
     static int MaxOfWindow(List<ChartSeries> series, int i0, int i1) {
@@ -2517,12 +2581,17 @@ class Chart {
         if (a.reversed) { ext0 = len; }
         int ext1 = len - ext0;
         int plotBot = plotY + plotH;
-        if (axisLine < 0) {
-            axisLine = plotBot;
-            if (!isX) { axisLine = plotX; if (far) { axisLine = plotX + plotW; } }
-        }
+        // 未移动的边界基位（骑线覆盖只搬 start/end，middle 永远回到这里）。
+        int baseLine = plotBot;
+        if (!isX) { baseLine = plotX; if (far) { baseLine = plotX + plotW; } }
+        if (axisLine < 0) { axisLine = baseLine; }
         string loc = a.nameLocation;
         if (loc != "start" && loc != "middle") { loc = "end"; }
+        // onZero 只搬 start/end 态的名字（贴轴线走）；middle 的官方
+        // pos.y = labelOffset + nameDirection*gap，labelOffset 是轴线
+        // 位移的补偿，页面坐标里抵回原位 ⇒ 名字留在绘图区边界
+        // （_scratch/chart_oracle/onzero_namemid.js 实测）。
+        if (loc == "middle") { axisLine = baseLine; }
         ChartAxisName n = new ChartAxisName();
         n.rot = 0;
         n.anchor = 1;
@@ -2634,9 +2703,20 @@ class Chart {
     static void DrawAxisName(App app, Canvas c, ChartAxis a, bool isX,
                             int plotX, int plotY, int plotW, int plotH, bool far,
                             StyleBox sTitle, int fs) {
+        Chart.DrawAxisNameAt(app, c, a, isX, plotX, plotY, plotW, plotH, far,
+            sTitle, fs, 0 - 1);
+    }
+
+    /// 同上，另给轴线位置覆盖（page 坐标）：onZero 让轴线骑到零线上时，
+    /// start/end 态的名字贴轴线走，middle 态留在绘图区边界（官方
+    /// AxisBuilder.ts:869 的 middle pos.y = labelOffset + nameDir*gap，
+    /// labelOffset 恰好抵回原位；start/end 的 pos.y=0 直接收组的平移）。
+    static void DrawAxisNameAt(App app, Canvas c, ChartAxis a, bool isX,
+                              int plotX, int plotY, int plotW, int plotH, bool far,
+                              StyleBox sTitle, int fs, int axisLine) {
         if (a == null || a.title.Length == 0 || !a.show) { return; }
         ChartAxisName n = Chart.AxisNamePos(app, a, isX, plotX, plotY, plotW,
-            plotH, far, fs);
+            plotH, far, fs, axisLine);
         int ax = Chart.AxisNameX(app, a, n, fs);
         int ay = Chart.AxisNameY(app, a, n, fs);
         if (n.rot == 0) {
@@ -3084,6 +3164,38 @@ class Chart {
         }
     }
 
+    /// 轴线公共尾（DrawFrameTO/DrawFrameLoHiO 用）：竖线 = y 轴、
+    /// 横线 = x 轴，按 axisLine 三态/'auto'（cartesianAxisHelper.ts
+    /// axisLineAutoShow：'auto' 只画对侧为 value/log 的轴）定画不画，
+    /// onZero 骑线把 x 轴线搬到 y 轴的 0 位（Grid.ts:614-717，
+    /// EDGE 也算、钳在绘图区内）。yLo/yHi 为 y 轴数值域；
+    /// o = null 时两根线都画（旧形态）。
+    static void FrameLines(App app, Canvas c, ChartOption o, int yLo, int yHi,
+                           int plotX, int plotY, int plotW, int plotH, int ink) {
+        ChartAxis frX = o == null ? null : o.XAxis0();
+        ChartAxis frY = o == null ? null : o.YAxis0();
+        bool frXIsVL = frX != null && (frX.type == ChartAxisType.Value
+            || frX.type == ChartAxisType.Log);
+        bool frYIsVL = frY != null && (frY.type == ChartAxisType.Value
+            || frY.type == ChartAxisType.Log);
+        bool yLine = frY == null || (frY.show
+            && Chart.AxisLineDraws(frY.axisLineShow, frXIsVL));
+        bool xLine = frX == null || (frX.show
+            && Chart.AxisLineDraws(frX.axisLineShow, frYIsVL));
+        int xLineY = plotY + plotH;
+        if (o != null && Chart.CanOnZeroTo(frY, yLo, yHi, frX.onZero)) {
+            long spanL = (long)yHi - (long)yLo;
+            if (spanL < 1) { spanL = 1; }
+            int zy = plotY + plotH
+                - (int)((long)(0 - yLo) * (long)plotH / spanL);
+            if (zy < plotY) { zy = plotY; }
+            if (zy > plotY + plotH) { zy = plotY + plotH; }
+            xLineY = zy;
+        }
+        if (yLine) { c.FillRect(plotX, plotY, app.Scale(2), plotH, ink); }
+        if (xLine) { c.FillRect(plotX, xLineY, plotW, app.Scale(2), ink); }
+    }
+
     /// 带数值网格线（左）+ 分类标签（底部）的直角坐标系框架。
     /// 轴范围 [0, maxV]。需要双轴/固定范围/时间轴时用 BuildAxes。
     static ChartFrame DrawFrame(App app, int x, int y, int w, int h, int plotTop,
@@ -3095,6 +3207,16 @@ class Chart {
     /// 刻度数可不同于 5，如 0..1400 每 200 = 7 格）。
     static ChartFrame DrawFrameT(App app, int x, int y, int w, int h, int plotTop,
                                  List<string> labels, int maxV, int ticks) {
+        return Chart.DrawFrameTO(app, x, y, w, h, plotTop, labels, maxV, ticks,
+            null);
+    }
+
+    /// 同 DrawFrameT，另吃 ChartOption：按 axisLine 三态/骑线画
+    /// 轴线（o = null 保持旧形态，两根线都画）。y 域 [0, maxV] 的
+    /// 0 是 EDGE，x 轴线骑过去仍是底边。
+    static ChartFrame DrawFrameTO(App app, int x, int y, int w, int h, int plotTop,
+                                  List<string> labels, int maxV, int ticks,
+                                  ChartOption o) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int pad = t.paddingMedium;
@@ -3124,8 +3246,8 @@ class Chart {
             int vw = Canvas.MeasureText(vs, axisFs);
             c.DrawText(plotX - app.Scale(6) - vw, Canvas.CenterTextYAt(gy, axisFs), vs, sAxis.FgOr(0), axisFs);
         }
-        c.FillRect(plotX, plotY, app.Scale(2), plotH, sAxis.BgOr(0));
-        c.FillRect(plotX, plotY + plotH, plotW, app.Scale(2), sAxis.BgOr(0));
+        Chart.FrameLines(app, c, o, 0, maxV, plotX, plotY, plotW, plotH,
+            sAxis.BgOr(0));
 
         int n = labels.Count;
         if (n > 0) {
@@ -3159,6 +3281,16 @@ class Chart {
     /// 步长数可为 4..7，如 2200..2450 每 50 = 5 格）。
     static ChartFrame DrawFrameLoHiT(App app, int x, int y, int w, int h, int plotTop,
                                      List<string> labels, int lo, int hi, int ticks) {
+        return Chart.DrawFrameLoHiO(app, x, y, w, h, plotTop, labels, lo, hi,
+            ticks, null);
+    }
+
+    /// 同 DrawFrameLoHiT，另吃 ChartOption：按 axisLine 三态/'auto'
+    /// 与 onZero 骑线画轴线（boxplot-multi 的 x 轴线骑 y0 零线；
+    /// 蜡烛/箱线 y 'auto' 不画左线）。o = null 保持旧形态。
+    static ChartFrame DrawFrameLoHiO(App app, int x, int y, int w, int h, int plotTop,
+                                     List<string> labels, int lo, int hi, int ticks,
+                                     ChartOption o) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int pad = t.paddingMedium;
@@ -3194,8 +3326,8 @@ class Chart {
             int vw = Canvas.MeasureText(vs, axisFs);
             c.DrawText(plotX - app.Scale(6) - vw, Canvas.CenterTextYAt(gy, axisFs), vs, sAxis.FgOr(0), axisFs);
         }
-        c.FillRect(plotX, plotY, app.Scale(2), plotH, sAxis.BgOr(0));
-        c.FillRect(plotX, plotY + plotH, plotW, app.Scale(2), sAxis.BgOr(0));
+        Chart.FrameLines(app, c, o, lo, hi, plotX, plotY, plotW, plotH,
+            sAxis.BgOr(0));
 
         // 类目标签 auto 抽稀（ECharts2 axisLabel.interval 缺省 'auto'）：
         // 宽日期标签逐个画会互相叠字，贪心让位规则与 BuildAxesR/
@@ -3711,14 +3843,12 @@ class Chart {
         int ticks = y0.ticks;
         if (ticks < 1) { ticks = 5; }
 
-        // dataZoom 可见窗口 [zI0, zI1]（-1,-1 = 无窗口，按全量）。
+        // dataZoom 可见窗口（-1,-1 = 无窗口，按全量）。窗口由调用方
+        // 传入——本函数收到的 labels 已经是窗口切片，不能再自行反解。
         // ECharts 6 默认 filterMode 下 Y 量程随窗口重定：窗口化只
         // 在真的缩放（窗口 ≠ 全量）时生效，未缩放图与旧行为逐像素
         // 一致。长度基准与渲染器 DrawLines/Scatter 的 fullN 同源：
         // 类目 X 用 labels.Count，数值/时间 X 用最长系列长度。
-        int zI0 = 0 - 1;
-        // dataZoom 可见窗口（-1,-1 = 无窗口，按全量）。窗口由调用方
-        // 传入——本函数收到的 labels 已经是窗口切片，不能再自行反解。
         int zI0 = winI0;
         int zI1 = winI1;
 
@@ -3890,6 +4020,36 @@ class Chart {
             }
         }
 
+        // ---- axisLine 解算（Grid.ts:614-717 fixAxisOnZero +
+        // cartesianAxisHelper.ts axisLineAutoShow）----
+        // 骑线：x 轴先挑目标（候选按 y 轴序），y 轴后挑；目标被认领
+        // 后不再复用（双 y 轴都够得着 x0 时 y0 赢、y1 留在原位——
+        // _scratch/chart_oracle/onzero_multi.js 实测）。TARGET 必须是
+        // value/log 且 0 不在域外（EDGE 也算）。像素在 plot 矩形
+        // （含 markPad 外扩）定下后再落，这里只定「骑不骑」。
+        bool x0RidesY0 = Chart.CanOnZeroTo(y0, leftLo, leftHi, x0.onZero);
+        bool x0RidesY1 = false;
+        if (!x0RidesY0 && hasRight && o.yAxes.Count > 1) {
+            x0RidesY1 = Chart.CanOnZeroTo(y1, rightLo, rightHi, x0.onZero);
+        }
+        bool y0RidesX0 = Chart.CanOnZeroTo(x0, xLo, xHi, y0.onZero);
+        bool y1RidesX0 = false;
+        if (!y0RidesX0 && hasRight && o.yAxes.Count > 1) {
+            y1RidesX0 = Chart.CanOnZeroTo(x0, xLo, xHi, y1.onZero);
+        }
+        // axisLine.show 三态：'auto' 只画「对侧是 value/log」的轴
+        // （isIntervalOrLogScale；time 不算）。类目轴缺省恒画、
+        // value/time/log 缺省 'auto'——标准柱/线图从此只画底部一
+        // 根线，与官方 SSR 逐一致（axisline.scan.txt 69/15 清单）。
+        bool x0IsVL = x0.type == ChartAxisType.Value
+            || x0.type == ChartAxisType.Log;
+        bool y0IsVL = y0.type == ChartAxisType.Value
+            || y0.type == ChartAxisType.Log;
+        bool y0Line = y0.show && Chart.AxisLineDraws(y0.axisLineShow, x0IsVL);
+        bool x0Line = x0.show && Chart.AxisLineDraws(x0.axisLineShow, y0IsVL);
+        bool y1Line = hasRight && y1.show
+            && Chart.AxisLineDraws(y1.axisLineShow, x0IsVL);
+
         int leftGut;
         if (catY && y0.categories.Count > 0) {
             // 类目 Y：左栏取最宽类目标签（含 formatter 展开）。
@@ -3924,7 +4084,9 @@ class Chart {
         // 轴线下方（middle 再多一整个 gap）、start 骑在轴线上。量出名字
         // 盒底相对"轴线 + 半个行高"多出来的部分补进底栏，否则名字压住
         // 刻度标签。start 态盒底高于轴线下缘，不补。
-        if (x0.title.Length > 0 && x0.show) {
+        // onZero 骑线时例外：end/start 名字贴轴线走进绘图区（middle
+        // 留在边界），底部不再需要让位——官方网格从不为轴名留白。
+        if (x0.title.Length > 0 && x0.show && !(x0RidesY0 || x0RidesY1)) {
             int xTw = Canvas.MeasureText(x0.title, fs);
             ChartNameBox xb = Chart.AxisNameBoxPx(x0, true, 0, 0, 100, 100,
                 false, Chart.NameGapPx(app, x0), fh, Canvas.CenterTextYAt(0, fs),
@@ -4223,11 +4385,25 @@ class Chart {
                 }
             }
         }
-        c.FillRect(plotX, plotY, app.Scale(2), plotH,
-            y0.show && y0.axisLineColor != 0 ? y0.axisLineColor : sAxis.BgOr(0));
-        if (x0.show) { c.FillRect(plotX, plotY + plotH, plotW, app.Scale(2), sAxis.BgOr(0)); }
-        if (hasRight) {
-            c.FillRect(plotX + plotW, plotY, 1, plotH,
+        // 轴线落点：骑线像素取目标轴的 0 位（钳在绘图区内，EDGE 态
+        // 就是边界本身）；不骑线回退各自的边界基位。tick 标签不随
+        // 骑线移动（官方实测标签恒在网格边界，见 T3b 账本 B10）。
+        int xLineY = plotY + plotH;
+        if (x0RidesY0) { xLineY = f.ZeroLineY(0); }
+        else if (x0RidesY1) { xLineY = f.ZeroLineY(1); }
+        int yLineX = plotX;
+        if (y0RidesX0) { yLineX = f.ZeroLineX(); }
+        int y1LineX = plotX + plotW;
+        if (y1RidesX0) { y1LineX = f.ZeroLineX(); }
+        if (y0Line) {
+            c.FillRect(yLineX, plotY, app.Scale(2), plotH,
+                y0.axisLineColor != 0 ? y0.axisLineColor : sAxis.BgOr(0));
+        }
+        if (x0Line) {
+            c.FillRect(plotX, xLineY, plotW, app.Scale(2), sAxis.BgOr(0));
+        }
+        if (y1Line) {
+            c.FillRect(y1LineX, plotY, 1, plotH,
                 y1.axisLineColor != 0 ? y1.axisLineColor : sAxis.BgOr(0));
         }
 
@@ -4322,16 +4498,18 @@ class Chart {
         }
 
         // 轴名：ECharts 三态（缺省 'end'）+ nameGap（缺省 15）。
-        // 几何与实测出处见 Chart.AxisNamePos。
-        Chart.DrawAxisName(app, c, x0, true, plotX, plotY, plotW, plotH, false,
-            sAxisTitle, fs);
-        Chart.DrawAxisName(app, c, y0, false, plotX, plotY, plotW, plotH,
-            y0.position == "right", sAxisTitle, fs);
+        // 几何与实测出处见 Chart.AxisNamePos。骑线时 start/end 态
+        // 的名字贴轴线走（middle 留在边界，AxisBuilder.ts:869 的
+        // labelOffset 抵回原位）。
+        Chart.DrawAxisNameAt(app, c, x0, true, plotX, plotY, plotW, plotH, false,
+            sAxisTitle, fs, xLineY);
+        Chart.DrawAxisNameAt(app, c, y0, false, plotX, plotY, plotW, plotH,
+            y0.position == "right", sAxisTitle, fs, yLineX);
         // 右轴名只在真的存在第二条轴时画（YAxis1 在单轴时会回退
         // 到 YAxis0，不设防会把左轴名镜像到右缘）。
         if (hasRight && o.yAxes.Count > 1) {
-            Chart.DrawAxisName(app, c, y1, false, plotX, plotY, plotW, plotH,
-                y1.position == "right", sAxisTitle, fs);
+            Chart.DrawAxisNameAt(app, c, y1, false, plotX, plotY, plotW, plotH,
+                y1.position == "right", sAxisTitle, fs, y1LineX);
         }
 
         return f;

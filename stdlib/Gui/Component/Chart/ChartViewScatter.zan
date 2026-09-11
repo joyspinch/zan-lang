@@ -138,6 +138,19 @@ partial class ChartView {
         int ySpan = maxYN - yLo;
         if (xSpan < 1) { xSpan = 1; }
         if (ySpan < 1) { ySpan = 1; }
+        // 轴线三态 + onZero 骑线判定（与 BuildAxesR 同式，官方
+        // Grid.ts:614-717 fixAxisOnZero + axisLineAutoShow）：'auto'
+        // 只画对侧为 value/log 的轴；骑线把线搬到目标轴的 0 位。
+        ChartAxis sxa = o.XAxis0();
+        ChartAxis sya = o.YAxis0();
+        bool sxaIsVL = sxa.type == ChartAxisType.Value
+            || sxa.type == ChartAxisType.Log;
+        bool syaIsVL = sya.type == ChartAxisType.Value
+            || sya.type == ChartAxisType.Log;
+        bool syaLine = sya.show && Chart.AxisLineDraws(sya.axisLineShow, sxaIsVL);
+        bool sxaLine = sxa.show && Chart.AxisLineDraws(sxa.axisLineShow, syaIsVL);
+        bool sxaRidesY = Chart.CanOnZeroTo(sya, yLo, maxYN, sxa.onZero);
+        bool syaRidesX = Chart.CanOnZeroTo(sxa, xLo, maxXN, sya.onZero);
         // ECharts yAxis.position："right" 把 y 刻度标签挂到绘图区
         // 右侧（dataRange1 原例）；Core/Hover 布局必须一致。
         bool yRight = o.yAxes.Count > 0 && o.yAxes[0].position == "right";
@@ -148,7 +161,9 @@ partial class ChartView {
         // ECharts value 轴 nameLocation 缺省 'end'：x 轴名在刻度标签
         // 下方再占一行（Core/Hover 布局必须一致，绘制侧也走同一几何）。
         // 名字盒底相对"刻度标签行下缘"多出的部分才补进底栏。
-        if (o.xAxes.Count > 0 && o.xAxes[0].title.Length > 0) {
+        // onZero 骑线时 x 轴名贴轴线走进绘图区，不再让位（官方
+        // 网格从不为轴名留白）。
+        if (o.xAxes.Count > 0 && o.xAxes[0].title.Length > 0 && !sxaRidesY) {
             int xTw = Canvas.MeasureText(o.xAxes[0].title, axisFs);
             ChartNameBox xb2 = Chart.AxisNameBoxPx(o.xAxes[0], true, 0, 0, 100,
                 100, false, Chart.NameGapPx(app, o.xAxes[0]),
@@ -247,19 +262,40 @@ partial class ChartView {
                 c.DrawTextCentered(gx - xw / 2, plotY + plotH + app.Scale(4), xw, botGut, xs, sAxis.FgOr(0), axisFs);
             }
         }
-        // y 轴线随 position 挂左/右；x 轴线始终在底部。
+        // 轴线落点：y 轴线随 position 挂左/右，onZero 骑线时搬到
+        // 对侧轴的 0 位（钳在绘图区内，EDGE 态即边界）。'auto' 三态
+        // 不画的轴（对侧同为类目等）不再出线——与官方 SSR 逐一致。
+        int xLineY = plotY + plotH;
+        if (sxaRidesY) {
+            int zy = plotY + plotH
+                - (int)(((long)(0 - yLo)) * (long)plotH / ySpan);
+            if (zy < plotY) { zy = plotY; }
+            if (zy > plotY + plotH) { zy = plotY + plotH; }
+            xLineY = zy;
+        }
         int yaxX = yRight ? plotX + plotW - app.Scale(2) : plotX;
-        c.FillRect(yaxX, plotY, app.Scale(2), plotH, sAxis.BgOr(0));
-        c.FillRect(plotX, plotY + plotH, plotW, app.Scale(2), sAxis.BgOr(0));
-        // 轴名走与笛卡尔视图同一套三态几何（Chart.DrawAxisName）：
-        // 缺省 'end'、nameGap 15、inverse 翻端、y 轴 position=right。
+        if (syaRidesX) {
+            int zx = plotX + (int)(((long)(0 - xLo)) * (long)plotW / xSpan);
+            if (zx < plotX) { zx = plotX; }
+            if (zx > plotX + plotW) { zx = plotX + plotW; }
+            yaxX = yRight ? zx - app.Scale(2) : zx;
+        }
+        if (syaLine) {
+            c.FillRect(yaxX, plotY, app.Scale(2), plotH, sAxis.BgOr(0));
+        }
+        if (sxaLine) {
+            c.FillRect(plotX, xLineY, plotW, app.Scale(2), sAxis.BgOr(0));
+        }
+        // 轴名走与笛卡尔视图同一套三态几何（Chart.DrawAxisNameAt）：
+        // 缺省 'end'、nameGap 15、inverse 翻端、y 轴 position=right；
+        // 骑线时 start/end 态的名字贴轴线走。
         if (o.xAxes.Count > 0) {
-            Chart.DrawAxisName(app, c, o.xAxes[0], true, plotX, plotY, plotW,
-                plotH, false, sAxis, axisFs);
+            Chart.DrawAxisNameAt(app, c, o.xAxes[0], true, plotX, plotY, plotW,
+                plotH, false, sAxis, axisFs, xLineY);
         }
         if (o.yAxes.Count > 0) {
-            Chart.DrawAxisName(app, c, o.yAxes[0], false, plotX, plotY, plotW,
-                plotH, yRight, sAxis, axisFs);
+            Chart.DrawAxisNameAt(app, c, o.yAxes[0], false, plotX, plotY, plotW,
+                plotH, yRight, sAxis, axisFs, yaxX);
         }
         if (zoomH > 0) {
             Chart.DrawZoomBar(app, plotX, plotW, y + h - app.Scale(18),
@@ -477,6 +513,11 @@ partial class ChartView {
         int ySpan = maxYN - yLo;
         if (xSpan < 1) { xSpan = 1; }
         if (ySpan < 1) { ySpan = 1; }
+        // 骑线判定与 Core 同式（botGut 是否为 x 轴名让位必须一致，
+        // 否则命中矩形和绘制差一行）。Hover 只用 sxaRidesY。
+        ChartAxis sxa = o.XAxis0();
+        ChartAxis sya = o.YAxis0();
+        bool sxaRidesY = Chart.CanOnZeroTo(sya, yLo, maxYN, sxa.onZero);
         // ECharts yAxis.position："right" 把 y 刻度标签挂到绘图区
         // 右侧（dataRange1 原例）；Core/Hover 布局必须一致。
         bool yRight = o.yAxes.Count > 0 && o.yAxes[0].position == "right";
@@ -487,7 +528,9 @@ partial class ChartView {
         // ECharts value 轴 nameLocation 缺省 'end'：x 轴名在刻度标签
         // 下方再占一行（Core/Hover 布局必须一致，绘制侧也走同一几何）。
         // 名字盒底相对"刻度标签行下缘"多出的部分才补进底栏。
-        if (o.xAxes.Count > 0 && o.xAxes[0].title.Length > 0) {
+        // onZero 骑线时 x 轴名贴轴线走进绘图区，不再让位（官方
+        // 网格从不为轴名留白）。
+        if (o.xAxes.Count > 0 && o.xAxes[0].title.Length > 0 && !sxaRidesY) {
             int xTw = Canvas.MeasureText(o.xAxes[0].title, axisFs);
             ChartNameBox xb2 = Chart.AxisNameBoxPx(o.xAxes[0], true, 0, 0, 100,
                 100, false, Chart.NameGapPx(app, o.xAxes[0]),

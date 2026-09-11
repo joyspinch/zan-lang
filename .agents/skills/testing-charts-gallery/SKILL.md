@@ -166,6 +166,26 @@ ECharts SSR（`{renderer:'svg', ssr:true}`）出来的 SVG 里每个 `<text>` �
   个文本宽）。
 - **`base` 是 Zan 保留字**（`src/compiler/lexer.c:28` 的 `TK_BASE`）：
   写 `int base = …;` 报 `expected variable name`。改叫 `endY`/`startY`。
+- **普查清单会自截断，结论前直渲染复核**：普查脚本里
+  `slice(0,40)`/`slice(0,30)` 只打印清单头部，"不在打印清单里"≠"在
+  两者都有桶"（126 个"都没有"绝大多数不打印）。给结论前用
+  `onzero_lib.js` 的 `render()` 对可疑 demo **逐个直渲**看
+  `#54555a` 线——pictorialBar-spirit/bar-race/pie-simple 这类被
+  想当然归进"两根都画"的，官方 SSR 本就一根轴线都不画
+  （2026-09-12 T3b 复核时抓的）。
+- **轴线/轴名的随动矩阵（onZero，已实测钉死）**：骑线只搬
+  ① 轴线本身、② start/end 轴名（贴线走）；**tick 标签不动**
+  （`AxisBuilder.ts:1566` 的 labelOffset 抵偿）、**middle 轴名不动**
+  （`AxisBuilder.ts:869` pos.y=labelOffset+nameDir×gap 抵回边界）。
+  官方 `__getRawCfg().labelOffset` 在最终 resize 后是**陈旧值**
+  （dynamic-data 报 -255 而 SVG 线在边界），判"有没有动"以 SVG
+  线位置为准。
+- **改完纯函数跑旧 golden**：给 `AxisNamePosPx` 加骑线覆盖时曾把
+  middle 态的 axisLine 置 -1"回边界"，实际把 `-1` 喂进了
+  `ay = axisLine + gap`（ay=14）——`chart_axis_name` 的旧 golden
+  当场抓住。教训：新增"覆盖/回退"分支时，回退目标必须是**已换算
+  好的基位变量**，不是哨兵值；且改共享几何函数必须先跑全部相关
+  golden。
 
 ### 别用像素当"数据墨迹"的探针（本仓库无头 App 下不可用）
 
