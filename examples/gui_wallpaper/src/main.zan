@@ -1,0 +1,419 @@
+// Zan 动态桌面壁纸 — 把一张静态图钉在桌面图标后面并让它动起来。
+//
+// 原理：Gui 无框舞台窗口（CreateDarkStage，客户区=物理像素 1:1）经
+// user32 SetParent 嵌到桌面 WorkerW（图标层之下、壁纸之上）后面，
+// 每帧重绘：原图整幅 cover 铺满 + 缓慢呼吸缩放，元宝/灯笼两处暖光
+// 呼吸，金币飘落、星芒闪烁、微尘上浮。
+//
+// 图源：环境变量 ZAN_WALL_IMAGE（任意 PNG/JPG/WebP），缺省取 exe
+// 旁边的 wallpaper.png；都不在时画程序化的红金渐变背景，动画照常。
+// 退出：任务管理器/taskkill 结束进程即可（壁纸窗口不进任务栏）。
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Gui;
+
+namespace LiveWallpaper;
+
+class Coin {
+    float x;
+    float y;
+    float vy;
+    float sway;
+    float swayHz;
+    float phase;
+    float r;
+}
+
+class Twinkle {
+    float x;
+    float y;
+    float r;
+    float hz;
+    float phase;
+}
+
+class Mote {
+    float x;
+    float y;
+    float vy;
+    float sway;
+    float phase;
+    float r;
+}
+
+class Wallpaper {
+    // ---- Win32：Progman/WorkerW 桌面钉嵌 + 屏幕尺寸 + 帧节奏 ----
+    [DllImport("user32")]
+    static extern nint FindWindowA(string cls, nint title);
+    [DllImport("user32")]
+    static extern nint FindWindowExA(nint parent, nint after, string cls,
+                                     nint title);
+    [DllImport("user32")]
+    static extern nint SendMessageTimeoutA(nint hwnd, int msg, nint wparam,
+                                           nint lparam, int flags,
+                                           int timeout, nint result);
+    [DllImport("user32")]
+    static extern nint SetParent(nint child, nint parent);
+    [DllImport("user32")]
+    static extern int SetWindowPos(nint hwnd, nint after, int x, int y,
+                                   int w, int h, int flags);
+    [DllImport("user32")]
+    static extern int GetSystemMetrics(int index);
+    [DllImport("user32")]
+    static extern nint GetForegroundWindow();
+    [DllImport("user32")]
+    static extern int GetWindowRect(nint hwnd, nint rect);
+    [DllImport("kernel32")]
+    static extern int GetTickCount();
+    [DllImport("kernel32")]
+    static extern void Sleep(int ms);
+    [DllImport("crt")]
+    static extern string getenv(string name);
+
+    static int screenW;
+    static int screenH;
+    static List<Coin> coins;
+    static List<Twinkle> twinkles;
+    static List<Mote> motes;
+    static uint rngState = 0x20260212;
+
+    // 确定性 xorshift：壁纸每次启动的粒子分布一致，便于回归对比。
+    static float Rnd() {
+        rngState = rngState ^ (rngState << 13);
+        rngState = rngState ^ (rngState >> 17);
+        rngState = rngState ^ (rngState << 5);
+        return (rngState & 0xFFFFFF) / 16777215.0f;
+    }
+
+    static void Main() {
+        string img = Wallpaper.getenv("ZAN_WALL_IMAGE");
+        if (img == null || img.Length == 0) { img = "wallpaper.png"; }
+        if (!File.Exists(img)) { img = ""; }
+
+        // 先建窗口再量屏幕：外壳启动时才完成进程 DPI 感知提升，
+// 之后 GetSystemMetrics 才是物理像素（建窗口本身与 DPI 无关，
+        // 客户区=请求值的物理 1:1，随后的 SetWindowPos 拉满到全屏）。
+        App app = App.CreateDarkStage("zan-wallpaper", 1280, 720);
+        if (app == null) { return; }
+        app.Show();
+        app.SetPollEventMode();
+        Wallpaper.screenW = Wallpaper.GetSystemMetrics(0);
+        Wallpaper.screenH = Wallpaper.GetSystemMetrics(1);
+        if (Wallpaper.screenW < 64 || Wallpaper.screenH < 64) {
+            Wallpaper.screenW = 1280;
+            Wallpaper.screenH = 720;
+        }
+        Wallpaper.InitParticles();
+        Wallpaper.selfHwnd = app.WindowHandle();
+        nint parent = 0;
+        string noPin = Wallpaper.getenv("ZAN_WALL_NO_PIN");
+        if (noPin == null || noPin != "1") {
+            parent = Wallpaper.PinToDesktop(Wallpaper.selfHwnd);
+        }
+        Console.WriteLine("wallpaper screen="
+            + Convert.ToString(Wallpaper.screenW) + "x"
+            + Convert.ToString(Wallpaper.screenH)
+            + " pin=" + (parent != 0 ? "ok" : "fail"));
+
+        // ZAN_WALL_EXIT_SECONDS 供无人值守验证自动退出；常驻运行不设它。
+        int exitMs = 0;
+        string exitEnv = Wallpaper.getenv("ZAN_WALL_EXIT_SECONDS");
+        if (exitEnv != null && exitEnv.Length > 0) {
+            exitMs = Convert.ToInt32(exitEnv) * 1000;
+        }
+        int start = Wallpaper.GetTickCount();
+        while (app.ProcessEvent()) {
+            // 有全屏窗口盖住桌面时壁纸不可见：跳过整帧绘制，只留轮询，
+            // 省下 GPU/CPU（桌面本身在前台时不算——WorkerW/Progman 放行）。
+            if (Wallpaper.DesktopCovered()) {
+                Wallpaper.Sleep(200);
+                if (exitMs > 0 && Wallpaper.GetTickCount() - start > exitMs) {
+                    break;
+                }
+                continue;
+            }
+            app.BeginFrame();
+            Wallpaper.Render(app.canvas, img,
+                             (Wallpaper.GetTickCount() - start) / 1000.0f);
+            app.PresentFrame();
+            app.RequestRedraw();
+            if (exitMs > 0 && Wallpaper.GetTickCount() - start > exitMs) {
+                break;
+            }
+            // 壁纸档帧率：约 30fps 足够顺滑，功耗和占用减半。
+            Wallpaper.Sleep(20);
+        }
+        app.StopLoop();
+    }
+
+    static nint pinProgman;
+    static nint pinWorker;
+    static nint selfHwnd;
+    static nint rectBuf;
+
+    /// 前台窗口矩形盖住绝大多数屏幕时桌面不可见（全屏应用，或
+    /// 最大化窗口——只露出任务栏条，不值得为一strip壁纸空转）。
+    /// 之前按"完整覆盖"判，最大化窗口(98.7%面积)漏判烧满单核。
+    /// rectBuf 是 16 字节 RECT（4×i32），进程级复用。
+    static bool DesktopCovered() {
+        if (Wallpaper.rectBuf == 0) {
+            Wallpaper.rectBuf = NativeMemory.Alloc(16);
+        }
+        nint fg = Wallpaper.GetForegroundWindow();
+        if (fg == 0 || fg == Wallpaper.pinProgman
+                || fg == Wallpaper.pinWorker
+                || fg == Wallpaper.selfHwnd) {
+            return false;
+        }
+        if (Wallpaper.GetWindowRect(fg, Wallpaper.rectBuf) == 0) {
+            return false;
+        }
+        int l = new Span<int>(Wallpaper.rectBuf, 1)[0];
+        int tp = new Span<int>(Wallpaper.rectBuf + 4, 1)[0];
+        int r = new Span<int>(Wallpaper.rectBuf + 8, 1)[0];
+        int b = new Span<int>(Wallpaper.rectBuf + 12, 1)[0];
+        long area = (long)(r - l) * (b - tp);
+        long screen = (long)Wallpaper.screenW * Wallpaper.screenH;
+        return area * 100 >= screen * 93;
+    }
+
+    /// 经典 WorkerW 钉嵌：向 Progman 发 0x052C 让 shell 在图标层下
+    /// 再生一个 WorkerW，把本窗口 SetParent 过去——窗口从此躺在
+    /// 图标之后、原壁纸之前。个别系统 DefView 不在 Progman 直下，
+    /// 退回直接挂在 Progman 上（同一层面的老技巧）。
+    static nint PinToDesktop(nint hwnd) {
+        nint progman = Wallpaper.FindWindowA("Progman", 0);
+        if (progman == 0) { return 0; }
+        Wallpaper.SendMessageTimeoutA(progman, 0x052C, 0, 0, 0, 1000, 0);
+        nint defview = Wallpaper.FindWindowExA(progman, 0,
+                                               "SHELLDLL_DefView", 0);
+        nint worker = defview != 0
+            ? Wallpaper.FindWindowExA(0, defview, "WorkerW", 0) : 0;
+        if (worker != 0) {
+            Wallpaper.SetParent(hwnd, worker);
+        } else {
+            Wallpaper.SetParent(hwnd, progman);
+        }
+        Wallpaper.pinProgman = progman;
+        Wallpaper.pinWorker = worker;
+        // SWP_NOZORDER | SWP_NOACTIVATE：父客户区即屏幕，(0,0) 拉满。
+        Wallpaper.SetWindowPos(hwnd, 0, 0, 0, Wallpaper.screenW,
+                               Wallpaper.screenH, 0x0004 | 0x0010);
+        return worker != 0 ? worker : progman;
+    }
+
+    static void InitParticles() {
+        // 币径按屏高定标（1080p 基准），2K/4K 上不显碎；封顶 1.6 免得糊脸。
+        Wallpaper.coinScale = Wallpaper.Min(1.6f,
+                                            Wallpaper.screenH / 1080.0f);
+        Wallpaper.coins = new List<Coin>();
+        for (int i = 0; i < 26; i = i + 1) {
+            Coin c = new Coin();
+            Wallpaper.RespawnCoin(c, true);
+            Wallpaper.coins.Add(c);
+        }
+        Wallpaper.twinkles = new List<Twinkle>();
+        for (int i = 0; i < 36; i = i + 1) {
+            Twinkle t = new Twinkle();
+            t.x = Wallpaper.Rnd();
+            t.y = Wallpaper.Rnd();
+            t.r = 1.0f + Wallpaper.Rnd() * 1.8f;
+            t.hz = 0.35f + Wallpaper.Rnd() * 0.8f;
+            t.phase = Wallpaper.Rnd() * 6.2831853f;
+            Wallpaper.twinkles.Add(t);
+        }
+        Wallpaper.motes = new List<Mote>();
+        for (int i = 0; i < 18; i = i + 1) {
+            Mote m = new Mote();
+            m.x = Wallpaper.Rnd();
+            m.y = Wallpaper.Rnd();
+            m.vy = 8 + Wallpaper.Rnd() * 14;
+            m.sway = 6 + Wallpaper.Rnd() * 18;
+            m.phase = Wallpaper.Rnd() * 6.2831853f;
+            m.r = 1.5f + Wallpaper.Rnd() * 2.5f;
+            Wallpaper.motes.Add(m);
+        }
+    }
+
+    /// 金币落到屏下（或首次铺场）后从顶部随机重生。
+    static void RespawnCoin(Coin c, bool scatter) {
+        c.x = 0.03f + Wallpaper.Rnd() * 0.94f;
+        c.y = scatter ? Wallpaper.Rnd() * 1.2f - 0.1f
+                      : -0.05f - Wallpaper.Rnd() * 0.2f;
+        c.vy = 0.05f + Wallpaper.Rnd() * 0.11f;      // 屏高/秒
+        c.sway = 0.012f + Wallpaper.Rnd() * 0.035f;  // 屏宽摆幅
+        c.swayHz = 0.4f + Wallpaper.Rnd() * 0.7f;
+        c.phase = Wallpaper.Rnd() * 6.2831853f;
+        c.r = (4 + Wallpaper.Rnd() * 7) * Wallpaper.coinScale;
+    }
+
+    /// 一帧：原图 cover+呼吸 → 三处暖光 → 金币/星芒/微尘。
+    /// img 为空时画程序化红金底（示例无图也可跑）。
+    static void Render(Canvas c, string img, float t) {
+        int w = c.Width();
+        int h = c.Height();
+        if (w < 8 || h < 8) { return; }
+
+        // 图内锚点（0..1）：元宝、灯笼、"接财"横幅——cover 变换后发光。
+        if (img.Length > 0) {
+            int iw = Canvas.ImageWidth(img);
+            int ih = Canvas.ImageHeight(img);
+            if (iw < 1 || ih < 1) { img = ""; }
+        }
+        if (img.Length > 0) {
+            // 人物摆动场：整幅图按 72 条水平带扭曲。摆幅自下而上生长
+            // （坐姿底部钉死、头部/发丝最大），相位随高度偏移形成
+            // 鞭梢式拖曳；肩部叠加高斯窗的呼吸起伏。条带互相重叠
+            // 1px 防裂缝，外扩 16px 防摆动露出黑边。
+            int iw = Canvas.ImageWidth(img);
+            int ih = Canvas.ImageHeight(img);
+            float cover = Wallpaper.Max(w / (float)iw, h / (float)ih);
+            cover = cover * (1 + 32.0f / Wallpaper.Max(1, w));
+            int dw = (int)(iw * cover);
+            int dh = (int)(ih * cover);
+            int dx = (w - dw) / 2;
+            int dy = (h - dh) / 2;
+            int strips = 72;
+            int srcH = ih / strips;
+            int dstH = dh / strips + 1;
+            for (int i = 0; i < strips; i = i + 1) {
+                float yn = (i + 0.5f) / strips;
+                float e = (0.88f - yn) / 0.7f;
+                if (e < 0) { e = 0; }
+                if (e > 1) { e = 1; }
+                e = e * e * (3 - 2 * e);          // smoothstep 摆幅包络
+                float sway = 4.5f * e * (float)Math.Sin(
+                    t * 6.2831853 / 7.5 + (1 - yn) * 1.8);
+                float dn = (yn - 0.40f) / 0.12f;
+                float breathe = 2.2f * (float)Math.Exp(-dn * dn)
+                    * (float)Math.Sin(t * 6.2831853 / 4.2);
+                int sx = dx + (int)(sway * cover);
+                int sy = dy + (int)(i * (float)dh / strips
+                                    + breathe * cover);
+                c.BlitImage(img, sx, sy, dw, dstH,
+                            0, i * srcH, iw, srcH);
+            }
+            Wallpaper.DrawGlows(c, w, h, dx + 0.735f * dw, dy + 0.47f * dh,
+                                dx + 0.945f * dw, dy + 0.10f * dh,
+                                dx + 0.18f * dw, dy + 0.22f * dh, t);
+            // 人脸避让窗（图内相对坐标）：粒子不落在脸上——飘过脸
+            // 会像一颗痣。外扩 14px 容住摆动位移。
+            Wallpaper.faceL = dx + 0.40f * dw - 14;
+            Wallpaper.faceT = dy - 14;
+            Wallpaper.faceR = dx + 0.64f * dw + 14;
+            Wallpaper.faceB = dy + 0.40f * dh + 14;
+        } else {
+            c.FillVGrad(0, 0, w, h, WArgb(255, 122, 22, 26),
+                        WArgb(255, 58, 8, 14));
+            Wallpaper.DrawGlows(c, w, h, 0.72f * w, 0.45f * h,
+                                0.93f * w, 0.10f * h,
+                                0.18f * w, 0.22f * h, t);
+            Wallpaper.faceL = 1.0e9f;   // 程序化底无人脸，不避让
+            Wallpaper.faceT = 0;
+            Wallpaper.faceR = 0;
+            Wallpaper.faceB = 0;
+        }
+
+        Wallpaper.DrawCoins(c, w, h, t);
+        Wallpaper.DrawTwinkles(c, w, h, t);
+        Wallpaper.DrawMotes(c, w, h, t);
+    }
+
+    static float Max(float a, float b) { return a > b ? a : b; }
+
+    // 人脸避让窗（屏幕坐标），Render 每帧按 cover 变换更新。
+    static float faceL;
+    static float faceT;
+    static float faceR;
+    static float faceB;
+
+    static bool InFace(float x, float y) {
+        return x > Wallpaper.faceL && x < Wallpaper.faceR
+            && y > Wallpaper.faceT && y < Wallpaper.faceB;
+    }
+
+    static float Min(float a, float b) { return a < b ? a : b; }
+
+    static float coinScale = 1.0f;
+
+    /// ARGB 打包（与 stdlib CDraw.Argb 同式）。
+    static int WArgb(int a, int r, int g, int b) {
+        return a * 16777216 + r * 65536 + g * 256 + b;
+    }
+
+    /// 三处呼吸暖光：元宝金光（5.3s 主脉冲）、灯笼橘光（快闪烁）、
+    /// "接财"横幅淡金（9s 慢涌）。FillRadial 中心 innerAlpha、
+    /// 半径处归零，叠在画面上即柔光。
+    static void DrawGlows(Canvas c, int w, int h, float ix, float iy,
+                          float lx, float ly, float bx, float by, float t) {
+        int r1 = (int)(0.17f * h);
+        int a1 = 62 + (int)(34 * (float)Math.Sin(t * 6.2831853 / 5.3));
+        c.FillRadial((int)ix, (int)iy, r1, WArgb(255, 255, 196, 92),
+                     a1);
+        float fl = 0.75f + 0.25f
+            * (float)Math.Sin(t * 11.0)
+            * (float)Math.Sin(t * 2.9 + 1.3);
+        int a2 = (int)(46 * fl);
+        c.FillRadial((int)lx, (int)ly, (int)(0.11f * h),
+                     WArgb(255, 255, 128, 64), a2);
+        int a3 = 30 + (int)(16 * (float)Math.Sin(t * 6.2831853 / 9.0 + 2.0));
+        c.FillRadial((int)bx, (int)by, (int)(0.20f * h),
+                     WArgb(255, 255, 214, 120), a3);
+    }
+
+    static void DrawCoins(Canvas c, int w, int h, float t) {
+        for (int i = 0; i < Wallpaper.coins.Count; i = i + 1) {
+            Coin p = Wallpaper.coins[i];
+            p.y = p.y + p.vy / 30.0f;
+            if (p.y > 1.08f) { Wallpaper.RespawnCoin(p, false); }
+            float x = (p.x + p.sway
+                       * (float)Math.Sin(t * 6.2831853 * p.swayHz
+                                         + p.phase)) * w;
+            float y = p.y * h;
+            if (Wallpaper.InFace(x, y)) { continue; }
+            int r = (int)p.r;
+            if (r < 3) { r = 3; }
+            // 铜钱：深缘 + 亮身 + 方孔，小尺寸下足够读出"钱"。
+            c.FillCircle((int)x, (int)y, r + 1,
+                         WArgb(210, 176, 128, 36));
+            c.FillCircle((int)x, (int)y, r,
+                         WArgb(235, 255, 205, 92));
+            int hole = r * 2 / 3;
+            if (hole >= 2) {
+                c.FillRect((int)x - hole / 2, (int)y - hole / 2, hole, hole,
+                           WArgb(200, 150, 96, 24));
+            }
+        }
+    }
+
+    static void DrawTwinkles(Canvas c, int w, int h, float t) {
+        for (int i = 0; i < Wallpaper.twinkles.Count; i = i + 1) {
+            Twinkle k = Wallpaper.twinkles[i];
+            float kx = k.x * w;
+            float ky = k.y * h;
+            if (Wallpaper.InFace(kx, ky)) { continue; }
+            float s = (float)Math.Sin(t * 6.2831853 * k.hz + k.phase);
+            if (s < 0) { continue; }
+            s = s * s * s * s * s * s;   // 只在峰尖亮一下，像星芒
+            int a = (int)(200 * s);
+            if (a < 8) { continue; }
+            c.FillCircle((int)kx, (int)ky, (int)(k.r + 0.9f),
+                         WArgb(a / 3, 255, 220, 140));
+            c.FillCircle((int)kx, (int)ky, (int)k.r,
+                         WArgb(a, 255, 240, 180));
+        }
+    }
+
+    static void DrawMotes(Canvas c, int w, int h, float t) {
+        for (int i = 0; i < Wallpaper.motes.Count; i = i + 1) {
+            Mote m = Wallpaper.motes[i];
+            m.y = m.y - m.vy / 30.0f / h;
+            if (m.y < -0.02f) { m.y = 1.02f; m.x = Wallpaper.Rnd(); }
+            float x = (m.x + 0.008f
+                       * (float)Math.Sin(t * 0.7f + m.phase)) * w;
+            c.FillCircle((int)x, (int)(m.y * h), (int)m.r,
+                         WArgb(26, 255, 236, 200));
+        }
+    }
+}

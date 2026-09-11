@@ -40,6 +40,29 @@ description: Zan 上做 2D 游戏(templates/game/* 与 stdlib/Game)的帧循环�
 - 失焦"几秒一刷新"的教训：放宽档位的同时必须保留**唤醒源**（状态切换、
   输入事件立即合成的那条路）。节流节掉唤醒源，窗口就像死了一样。
 
+## 动态桌面壁纸：WorkerW 钉嵌定式（examples/gui_wallpaper）
+
+- 钉嵌序列：`App.CreateDarkStage` 无框窗（客户区=物理 1:1）→ user32
+  `FindWindowA("Progman")` 发 `0x052C` → `FindWindowExA(progman,0,"SHELLDLL_DefView")`
+  → `FindWindowExA(0,defview,"WorkerW")` → `SetParent` 过去 →
+  `SetWindowPos` 拉满。DefView 不在 Progman 直下时退回直接挂 Progman。
+- **DPI 感知是外壳启动时才提升的**：`GetSystemMetrics` 必须在
+  CreateDarkStage **之后**读才是物理像素；先读后建拿到的是 DPI 虚拟化
+  尺寸，壁纸差出一截（2026-09 实测）。
+- SetParent 成 WorkerW 子窗后，**顶层枚举（EnumWindows/win-shot）再也
+  看不到它**——按 PID 抓窗会 NO-WINDOW。验证钉嵌靠全屏 CopyFromScreen
+  （图标应浮在动画上）+ NO_PIN 对照组抓窗口自身。
+- 壁纸省电门控判"前台是否盖住桌面"要**按面积 ≥93%**，不能按"完整
+  覆盖"：最大化窗口只露一条任务栏（面积 98.7%），完整覆盖判漏掉它，
+  为一条 38px 的条空转烧 0.6 核（2026-09 实测）。放行
+  Progman/WorkerW/自己，否则桌面空闲时误判成被盖住。
+- 单张静图让"人物动起来"：72 条水平带 `BlitImage` 逐条位移——摆幅
+  smoothstep 包络自下而上（坐姿底部钉死、头部最大）、相位随高度偏移
+  成鞭梢拖曳、肩部叠加高斯窗呼吸；条带重叠 1px 防缝、整幅外扩 32px
+  防摆动露黑边。真·眨眼微笑需要图生视频模型（常用 image API 端点没有）。
+- 粒子要**避开人脸框**（金币飘过脸像一颗痣），币径按屏高定标，
+  xorshift 固定种子让每次启动分布一致、可回归对比。
+
 ## 合成契约：重绘后才能 present
 
 - 画布内容在 present 后不保留。**拿旧画布凑帧会把空 HUD 贴上屏**（整条
