@@ -111,7 +111,15 @@ positive, stated in the commit message.
    `build_gallery`/`build_ide` makes unrelated cases fail en masse.
 9. **Never create branches.** Do NOT create local or remote branches; commit
    directly to `main` and push. Delete any stray branch you find after making
-   sure its commits are merged into `main`.
+   sure its commits are merged into `main`. Content check, not name check:
+   `git log main..<branch>` alone is not proof of unmerged work — a
+   cherry-picked or re-committed fix has no ancestry link. Before deleting,
+   prove every unique commit's content lives in main (blob-compare per file
+   `git rev-parse <branch>:<file>` vs `main:<file>`, or find the equivalent
+   commit), keep the tip reachable (`git tag archive/<name>-<date> <tip>`),
+   then `git branch -D`. Ancestry-only reasoning ("tip is ancestor of main")
+   plus grep of the main-side feature is the evidence to write into the
+   delivery notes.
 10. **Fix the compiler, don't route around it.** When Zan code fails because the
     compiler/runtime has a bug or a missing capability, the default is to fix
     the compiler or runtime. Do NOT rewrite the Zan code into a shape that
