@@ -2075,6 +2075,9 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMTypeRef rc_args[] = { i64d, i8ptr, i32d, i8ptr, g->co_step_ptr, i64ptr };
         g->rt_io_recv_co_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), rc_args, 6, 0);
         g->rt_io_recv_co = LLVMAddFunction(g->mod, "zan_io_recv_co", g->rt_io_recv_co_type);
+        LLVMTypeRef rtc_args[] = { i64d, i8ptr, i32d, i64d, i8ptr, g->co_step_ptr, i64ptr };
+        g->rt_io_recv_to_co_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), rtc_args, 7, 0);
+        g->rt_io_recv_to_co = LLVMAddFunction(g->mod, "zan_io_recv_to_co", g->rt_io_recv_to_co_type);
         LLVMTypeRef ac_args[] = { i64d, i8ptr, g->co_step_ptr, i64ptr };
         g->rt_io_accept_co_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), ac_args, 4, 0);
         g->rt_io_accept_co = LLVMAddFunction(g->mod, "zan_io_accept_co", g->rt_io_accept_co_type);
@@ -2101,6 +2104,14 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         g->rt_io_pump_timeout = LLVMAddFunction(g->mod, "zan_io_pump_timeout",
             g->rt_io_pump_timeout_type);
         LLVMSetLinkage(g->rt_io_pump_timeout,
+            g->mt_scheduler ? LLVMExternalLinkage : LLVMWeakAnyLinkage);
+
+        /* Pending-work predicate for the scheduler's termination decision;
+         * same weak pattern as the pump so timer-only programs link. */
+        g->rt_io_has_pending_type = LLVMFunctionType(i32d, NULL, 0, 0);
+        g->rt_io_has_pending = LLVMAddFunction(g->mod, "zan_io_has_pending",
+            g->rt_io_has_pending_type);
+        LLVMSetLinkage(g->rt_io_has_pending,
             g->mt_scheduler ? LLVMExternalLinkage : LLVMWeakAnyLinkage);
 
         LLVMTypeRef legacy_pump_type = LLVMFunctionType(i32d, NULL, 0, 0);
@@ -2201,6 +2212,16 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildBr(g->builder, ret);
 
             LLVMPositionBuilderAtEnd(g->builder, ret);
+            LLVMBuildRet(g->builder, LLVMConstInt(i32t, 0, 0));
+        }
+
+        /* Weak has-pending fallback for programs that do not link the IO
+         * reactor: nothing can be pending, so the scheduler's termination
+         * rule degenerates to the old woke/timer check. */
+        {
+            LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx,
+                g->rt_io_has_pending, "entry");
+            LLVMPositionBuilderAtEnd(g->builder, entry);
             LLVMBuildRet(g->builder, LLVMConstInt(i32t, 0, 0));
         }
 
@@ -2392,9 +2413,22 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                 g->rt_io_pump_timeout_type, g->rt_io_pump_timeout,
                 (LLVMValueRef[]){ timeout }, 1, "woke");
             LLVMValueRef more = zan_icmp(g->builder, LLVMIntSGT, woke,
-                LLVMConstInt(i32t, 0, 0), "io.more");
-            LLVMValueRef continue_run = LLVMBuildOr(g->builder, more, has_timer,
+                LLVMConstInt(i64t, 0, 0), "io.more");
+            /* A wake-less pump turn is NOT quiescence while IO ops or
+             * blocking jobs are still in flight: their completions (and a
+             * blocking worker's wake packet that outlived its already-drained
+             * job) arrive through later pumps. Exiting here silently killed
+             * parked frames mid-program (A298); keep running until nothing is
+             * parked anywhere -- no ready work, no timer, no pending IO. */
+            LLVMValueRef pend = zan_call2(g->builder,
+                g->rt_io_has_pending_type, g->rt_io_has_pending, NULL, 0,
+                "io.pending");
+            LLVMValueRef has_pending = zan_icmp(g->builder, LLVMIntSGT, pend,
+                LLVMConstInt(i64t, 0, 0), "io.has_pending");
+            LLVMValueRef cont_timer = LLVMBuildOr(g->builder, more, has_timer,
                 "sched.more");
+            LLVMValueRef continue_run = LLVMBuildOr(g->builder, cont_timer,
+                has_pending, "sched.more2");
             LLVMBuildCondBr(g->builder, continue_run, head_bb, exit_bb);
 
             LLVMPositionBuilderAtEnd(g->builder, exit_bb);

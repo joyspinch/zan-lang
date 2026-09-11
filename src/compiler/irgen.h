@@ -582,6 +582,10 @@ struct zan_irgen {
     LLVMTypeRef  rt_io_wait_co_type;
     LLVMValueRef rt_io_recv_co;   /* void zan_io_recv_co(iptr fd,i8* buf,i32 len,i8* frame,step,i64* out_n) */
     LLVMTypeRef  rt_io_recv_co_type;
+    LLVMValueRef rt_io_recv_to_co; /* void zan_io_recv_to_co(iptr fd,i8* buf,i32 len,
+                                       i64 timeout_ms,i8* frame,step,i64* out_n);
+                                       deadline delivers *out_n = -1 */
+    LLVMTypeRef  rt_io_recv_to_co_type;
     LLVMValueRef rt_io_accept_co; /* void zan_io_accept_co(iptr fd,i8* frame,step,iptr* out_fd) */
     LLVMTypeRef  rt_io_accept_co_type;
     LLVMValueRef rt_io_resolve_co; /* void zan_io_resolve_co(i8* host,i8* frame,step,i32* out) */
@@ -594,6 +598,8 @@ struct zan_irgen {
     LLVMTypeRef  rt_blocking_co_type;
     LLVMValueRef rt_io_pump_timeout;      /* i32 zan_io_pump_timeout(i64 timeout_ms) */
     LLVMTypeRef  rt_io_pump_timeout_type;
+    LLVMValueRef rt_io_has_pending;       /* i32 zan_io_has_pending(void) */
+    LLVMTypeRef  rt_io_has_pending_type;
     /* rt_io.o provides socket readiness and generic blocking-await jobs. */
     bool         uses_socket_async; /* set when either IO await is lowered */
     bool         uses_timer_runtime; /* set by Timer API externs */

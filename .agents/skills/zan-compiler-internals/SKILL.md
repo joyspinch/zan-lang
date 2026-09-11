@@ -705,3 +705,28 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
   「与我改动无关」同样用红基线——stash 修复重编重跑，FATAL 新旧一致即既有。
   注意 worker 的 stdout 进 logDir 不进控制台，控制台里的 FATAL 未必是被杀进程
   的遗言；以记录文件内容和 rc 为准。
+
+## 无栈调度器终局条件：woke==0 ≠ 静止；「摇奖绿」用例要按挂起事件清零来修（A298，2026-09-12 已修）
+
+- irgen 内联发射的 `zan_co_sched_run_until` 曾以「`woke>0 || has_timer`」决定退出。
+  阻塞任务线程（DNS/Resolve 等）完成时在**锁外** post NULL-overlapped 唤醒包，而
+  reactor 的 GQCS 超时路径每轮都 drain 完成列表——包落在 drain 之后，dequeue 时
+  drain 为空 → woke==0 一轮 → 带着 N 个在途 IO op 和 parked 帧**静默退出**（rc=0、
+  输出在截断处戛然而止）。IOTRACE 指纹：末行 `poll removed=1 cnt=N` 且**无**
+  `poll_op` 行（NULL-overlapped 包不打印 poll_op）。修法：终局条件追加
+  `zan_io_has_pending()`（weak 声明 + 无 IO 程序 weak 回退 0），对齐 rt_sched
+  纤程调度器的既有判据。凡「偶发空输出/中途截断 rc=0」先查这条，别先怀疑 IO 丢数据。
+- 排查定式：`ZAN_IO_TRACE=1` 跑 N 次抓失败样本 + 用 File.AppendAllText 打点
+  （stdout 不可信——正被排查的就是它）；标记序列直接指认退出点在哪个 await 之间。
+  共享树 zanc 被并行会话的在途 rt_io.c 卡住编译时，`git worktree add _scratch/xx HEAD`
+  + 只拷自己的编译器改动进去独立构建，验证与提交两不误（A/B 时务必记得把修复
+  拷回去再重编——忘拷会拿旧编译器跑出一堆假回归/假修复）。
+- 「关闭不唤醒」是 Windows 缺省：closesocket 不给挂起重叠操作投递完成包，POSIX
+  的 shutdown/对端 FIN 才免费给 0 字节唤醒。**TcpClient.Close 必须先
+  `Socket.ShutdownBoth`（= shutdown + CancelIoEx）再 Close**，与 TcpListener.Stop
+  同型；否则 keep-alive 池对端停在 RecvAsync 的协程永久挂起，HttpClient 池清扫
+  定时器常驻——调度器表现为「提前退出」或「有定时器时的活锁挂死（rc=124）」。
+- 用例面：依赖旧 bug「摇奖退出」的用例（进程结束不关池化连接）在终局条件收紧后
+  会从 flaky 绿变确定性红/挂——按 http_client_keepalive 的清理定式补显式
+  Close + settle 泵（20×10ms），让挂起事件真正清零。判定哪层是根因：A/B 同一
+  stdlib 只换编译器（或反之），单变量归因，别拿两棵树产物直接对跑下结论。
