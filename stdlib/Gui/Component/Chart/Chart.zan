@@ -833,6 +833,11 @@ class Chart {
             if (x0.labelFormatter.Length > 0) {
                 lab = x0.labelFormatter.Replace("{value}", lab);
             }
+            // 富文本轴标签量宽用剥壳文本（图标宽不进文本测量——
+            // 图标段是 backgroundColor image，本引擎退化留白）。
+            if (x0.labelSt != null && x0.labelSt.rich != null) {
+                lab = Chart.RichStrip(lab);
+            }
             int labelW = Canvas.MeasureText(lab, fs);
             int cxs = f.CatLeft(ci, n);
             int cellW = f.CatWidth(ci, n);
@@ -1824,6 +1829,56 @@ class Chart {
     static int RichSegH(int declaredH, int fontH, int padT, int padB) {
         int h = declaredH >= 0 ? declaredH : fontH;
         return h + padT + padB;
+    }
+
+    /// 剥壳文本：富文本格式串去掉 `{name|…}` 壳后的纯内容（未知样式
+    /// 名同样保留内容）。供量宽（CategoryTicks）、旋转/退化路径和
+    /// 系列标签文本（LabelText）——带壳串直接 DrawText 会把花括号
+    /// 画出来。无 `{` 快速返回原串。
+    static string RichStrip(string f) {
+        if (f.IndexOf("{") < 0) { return f; }
+        List<RichSeg> segs = Chart.RichTokenize(f, null);
+        string r = "";
+        for (int i = 0; i < segs.Count; i = i + 1) {
+            r = r + segs[i].text;
+        }
+        return r;
+    }
+
+    /// 轴刻度标签绘制：轴声明了 axisLabel.rich 且文本带壳时走富文本
+    /// 块（RichLayout+RichDraw，锚 = 块左上，调用方按原纯文本左缘
+    /// 定位），否则原样 DrawText。旋转路径不在此（块不能整体旋转，
+    /// 调用方先 RichStrip 后走 DrawTextRot）。
+    static void DrawAxisLabel(App app, Canvas c, ChartAxis a, string lab,
+                              int bx, int by, int defCol, int fs) {
+        if (a.labelSt != null && a.labelSt.rich != null
+            && lab.IndexOf("{") >= 0) {
+            RichBlock blk = ChartView.RichLayout(app,
+                Chart.RichTokenize(lab, a.labelSt), a.labelSt, fs);
+            ChartView.RichDraw(app, c, bx, by, blk, defCol);
+            return;
+        }
+        c.DrawText(bx, by, lab, defCol, fs);
+    }
+
+    /// DrawTextCentered 语义的富文本版：矩形内水平+垂直居中；富文本
+    /// 块按矩形居中（几何与 plain 路径逐像素同位——带状类目标签
+    /// 此前走 DrawTextCentered，不能因换路漂移 2px）。
+    static void DrawAxisLabelCentered(App app, Canvas c, ChartAxis a, string lab,
+                                      int rx, int ry, int rw, int rh,
+                                      int defCol, int fs) {
+        if (a.labelSt != null && a.labelSt.rich != null
+            && lab.IndexOf("{") >= 0) {
+            RichBlock blk = ChartView.RichLayout(app,
+                Chart.RichTokenize(lab, a.labelSt), a.labelSt, fs);
+            int bx = rx + (rw - blk.w) / 2;
+            int by = ry + (rh - blk.h) / 2;
+            if (bx < rx) { bx = rx; }
+            if (by < ry) { by = ry; }
+            ChartView.RichDraw(app, c, bx, by, blk, defCol);
+            return;
+        }
+        c.DrawTextCentered(rx, ry, rw, rh, lab, defCol, fs);
     }
 
     /// 仅索引窗口 [i0,i1]（含端点）内的最大值，供 dataZoom
@@ -4573,11 +4628,14 @@ class Chart {
                 if (gridX) { c.FillRect(gx, plotY, 1, plotH, sGrid.BgOr(0)); }
                 string xs2 = Chart.Commas(xv);
                 if (x0.labelFormatter.Length > 0) { xs2 = x0.labelFormatter.Replace("{value}", xs2); }
-                int lw = Canvas.MeasureText(xs2, fs);
+                string xs2m = x0.labelSt != null && x0.labelSt.rich != null
+                    ? Chart.RichStrip(xs2) : xs2;
+                int lw = Canvas.MeasureText(xs2m, fs);
                 int lx = gx - lw / 2;
                 if (lx < plotX) { lx = plotX; }
                 if (lx + lw > plotX + plotW) { lx = plotX + plotW - lw; }
-                c.DrawText(lx, plotBot + app.Scale(4), xs2, sAxis.FgOr(0), fs);
+                Chart.DrawAxisLabel(app, c, x0, xs2, lx, plotBot + app.Scale(4),
+                    sAxis.FgOr(0), fs);
             }
         } else if (x0.show && (n > 0 || isTime)) {
             if (isTime) {
@@ -4585,11 +4643,15 @@ class Chart {
                 for (int ti = 0; ti < tts.Count; ti = ti + 1) {
                     int tx = f.XOfTime(tts[ti]);
                     string ls = Chart.TimeLabel(tts[ti]);
-                    int lw = Canvas.MeasureText(ls, fs);
+                    if (x0.labelFormatter.Length > 0) { ls = x0.labelFormatter.Replace("{value}", ls); }
+                    string lsm = x0.labelSt != null && x0.labelSt.rich != null
+                        ? Chart.RichStrip(ls) : ls;
+                    int lw = Canvas.MeasureText(lsm, fs);
                     int lx = tx - lw / 2;
                     if (lx < plotX) { lx = plotX; }
                     if (lx + lw > plotX + plotW) { lx = plotX + plotW - lw; }
-                    c.DrawText(lx, plotBot + app.Scale(4), ls, sAxis.FgOr(0), fs);
+                    Chart.DrawAxisLabel(app, c, x0, ls, lx, plotBot + app.Scale(4),
+                        sAxis.FgOr(0), fs);
                 }
             } else {
                 int labelGap = app.Scale(6);
@@ -4620,9 +4682,11 @@ class Chart {
                     int ci = tickShown[ti5];
                     string lab = labels[ci];
                     if (x0.labelFormatter.Length > 0) { lab = x0.labelFormatter.Replace("{value}", lab); }
+                    bool labRich = x0.labelSt != null && x0.labelSt.rich != null;
+                    string labm = labRich ? Chart.RichStrip(lab) : lab;
                     int cxs = f.CatLeft(ci, n);
                     int cellW = f.CatWidth(ci, n);
-                    int labelW = Canvas.MeasureText(lab, fs);
+                    int labelW = Canvas.MeasureText(labm, fs);
                     int labelLeft = tickX ? cxs - labelW / 2
                         : cxs + (cellW - labelW) / 2;
                     if (!tickX && labelLeft < cxs) { labelLeft = cxs; }
@@ -4632,16 +4696,18 @@ class Chart {
                         // DrawTextRot 绕未旋转行盒左上角顺时针旋转：
                         // 负角取行盒右缘为锚（文本向右下伸展、标签尾
                         // 对齐格子中线），正角取左缘（文本向右上收）。
+                        // 富文本块不能整体旋转——画剥壳文本。
                         int ax = labelLeft + labelW;
                         if (rot > 0) { ax = labelLeft; }
-                        c.DrawTextRot(ax, plotBot + app.Scale(4), lab,
+                        c.DrawTextRot(ax, plotBot + app.Scale(4), labm,
                             sAxis.FgOr(0), fs, rot);
                     } else if (tickX) {
-                        c.DrawText(cxs - labelW / 2, plotBot + app.Scale(4),
-                            lab, sAxis.FgOr(0), fs);
+                        Chart.DrawAxisLabel(app, c, x0, lab, cxs - labelW / 2,
+                            plotBot + app.Scale(4), sAxis.FgOr(0), fs);
                     } else {
-                        c.DrawTextCentered(cxs, plotBot + app.Scale(4), cellW,
-                            fh + app.Scale(4), lab, sAxis.FgOr(0), fs);
+                        Chart.DrawAxisLabelCentered(app, c, x0, lab, cxs,
+                            plotBot + app.Scale(4), cellW, fh + app.Scale(4),
+                            sAxis.FgOr(0), fs);
                     }
                 }
             }

@@ -505,3 +505,22 @@ ECharts line 的平滑算法不是「单调 Hermite / Cardinal / Catmull-Rom」�
 10. **单点解析**：rich/盒样式只在 `ParseTextStyle` 解析一次，
     series.label / data[i].label / 以后的 axisLabel、markPoint.label、
     gauge detail 都汇到这一处，别各自开分支。
+11. **JSON 导出丢失函数型 formatter——别照 ported 语料对齐视觉**。官方
+    demo 的 axisLabel.formatter 常是 JS 函数（bar-race-country 旗标、
+    bar-rich-text 天气图标、intraday-breaks-1 周末置灰），gallery 的
+    options/*.json 只剩 rich 样式表、没有令牌来源——照 JSON 渲染出
+    "朴素标签"就是忠实；引擎要补的是**字符串模板 + `{name|…}` 壳**
+    的通用路径，不是给单个 demo 硬编码图标。
+12. **壳（rich 样式空 `{}`）≠ 有视觉**：bar-label-rotation 的
+    `rich.name` 是空对象——官方与 plain 同像素。formatter 带壳时
+    量宽/旋转/LabelText 走 `Chart.RichStrip` 剥壳，直接 DrawText 会
+    把花括号画出来（s.labelFmt 修复的暴露面，踩过）。
+13. **换绘制路径必须保几何**：带状类目标签原来走 DrawTextCentered
+    （水平+垂直都居中），换成富文本块时 plain 分支也要逐像素同位
+    （vertical center 差 2px 会扰动全部 bar/line demo 的 x 标签）。
+14. **回归归属判定：HEAD 对照构建**。怀疑"我的改动把某 demo 搞空白"
+    时：`_scratch/stdlib_snap_head/`（整树复制 stdlib_snap，再 `git
+    show HEAD:<file >` 覆盖改动文件）+ 探针脚本 sed 出 `-o
+    charts_head.exe` 变体 → 同法截图。HEAD 同样错 = 先前已存在，
+    记账不修；HEAD 对而我错 = 真回归。（注意 sed 匹配 Windows 路径
+    的反斜杠要用 python replace，sed 转义会静默不命中——踩过。）
