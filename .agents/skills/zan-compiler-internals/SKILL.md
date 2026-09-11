@@ -784,15 +784,21 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
   -DZAN_IO_STACKLESS_ONLY -fPIC -O2 -c` 重出两份并同步 `toolchain/linux-musl/`。
   排查期可临时用 O0 打点副本顶替，收尾必须换回 O2 官方对象。
 
-## 泄漏报告的站点标签按类形状混叠；排查先做单站点最小复形（A64b，2026-09-12）
+## 泄漏报告的站点标签按类形状混叠；排查先做单站点最小复形（A64b，2026-09-12；已修同日）
 
-- leakcheck 报告的「allocated at file:line:col」**不是泄漏物的出生地**：站点索引按
-  (类符号, 泛型实例) 去重（`reserve_arc_site`，dispatch 需要同形状共享），而
+- leakcheck 报告的「allocated at file:line:col」**（修复前）不是泄漏物的出生地**：站点
+  索引按 (类符号, 泛型实例) 去重（`reserve_arc_site`，dispatch 需要同形状共享），而
   `__zan_site_names[idx]` 在每次分配时被无条件覆写——标签永远属于**同类各站点中
   运行时最后分配的那个**。程序里同类有多个 `new` 站点时，报告会把真实泄漏引到
   完全无辜的那个站点上（A64b 实锤：测试自己的 listener 停摆，报告却指着 stdlib
-  里 fwd 的 `new TcpListener`，误导排查一天）。修复登记在 TASKS.md（阻塞于并行
-  irgen WIP 车道）。
+  里 fwd 的 `new TcpListener`，误导排查一天）。**已修（2026-09-12 同日）**：
+  新增 `site_loc_file`/`site_loc_line` 并行表，check-leaks 构建下去重键扩成
+  (形状, di_cur_file, di_cur_line)；无 `-g` 时 di_cur_* 恒 0、键退化为纯形状=修复前
+  行为；非 check-leaks 构建键恒 0、索引序列不变（对正常构建零扰动）。4096 站点上限
+  从此约束「形状×位置」（仅 check-leaks，超限大声 exit(1)）。conformance 用例
+  `arc_leak_site_label`（同类两站点只泄先分配者，`EXPECT_LEAK_SITE` 反极性断言报告
+  点名 `:20:`）钉死行为；`run_leakcheck.cmake` 的 `EXPECT_LEAK_SITE=` 空值保持原
+  极性，不碰既有用例。
 - 排查定式：**先把形状缩到「程序里只留一个同类分配站点」**——单站点时标签才可信
   （P1：单文件 parked listener → 报告自己的行 ✓）；再多引入第二个同类站点对照
   （P7：+ 零流量 HttpForwarder → 标签跳到 fwd 的站点、泄漏总数不变 → 混叠实锤）。
@@ -807,6 +813,14 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
   跨调用持续——之后的 `git status`/grep 全打在 worktree 拷贝上，还会把「文件被谁
   改回去了」的幻象坐实（worktree 原版 vs 主树编辑版来回横跳）。主树操作前先
   `cd` 回仓库根并用绝对路径 grep 复核；Edit/Read 用绝对路径不受影响。
+- **ctest 输出必须整场落盘再 grep，别 `| tail -N`（本轮两次被 tail 截断坑）**：
+  失败清单可能长于 N 行，`LastTestsFailed.log` 又会被并行/后继 ctest 覆写，tail 截断
+  后「只见 3 个失败」与真貌（14 个）对不上，归因全乱。`ctest ... > _scratch/x.log 2>&1`
+  后台跑，结束再 grep。
+- **判红是不是自己引入的：拿「修复前二进制」交叉复跑同一用例**——泄漏**计数**与
+  去重键无关（键只改标签与索引数），修复前后计数应逐个相同；主树旧 zanc 跑出同样
+  5 对象即既有真泄漏，与本改无关。怀疑某 twin 是「本来就坏」时，看 CMake 里各
+  foreach 的 `_extra_args` 链是否一致（见下条）。
 
 ## 测试里无界 accept 循环的监听器必须可被外部 Stop（A64b，2026-09-12）
 
@@ -819,3 +833,13 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
 - 实测定式（static 停靠不会假红）：static 字段持有的对象**不在泄漏报告里出现**
   （static 存储不 retain，P2 探针 0 泄漏实锤）——用它当「外部可及的关闭把手」
   安全，但别把语义依赖在它上面（对象生命周期仍由帧/局部变量掌管）。
+- **leakcheck/arcguard 这些「conformance 派生 foreach」的 `_extra_args` 链必须随
+  conformance 主链同步（本轮实锤）**：conformance foreach 有
+  server_mvc_timezone（+Fmt.zan 源）、file_embed_bytes（`--embed`）等特例分支，
+  leakcheck foreach 漏配时这两个 twin **静默红到底**（embed 缺失 → File.Exists 首断言
+  出 0 → 用例自己抛的 FileNotFoundException 变 unhandled → 泄漏报告雪上加霜），
+  又因 leakcheck 层不常跑、失败清单被 tail 截断，一直没人发现。修法照 arcguard
+  的先例（它注明「Same branch as the conformance loop above」）把分支抄齐。配套：
+  `run_leakcheck.cmake` 的产物 up-to-date 判定原来只看 (源, zanc, stdlib stamp)
+  **不看 ZANC_ARGS**，args 修好后旧 exe 依旧复用、红不变——已加 `.args` sidecar
+  记录编译参数，args 变了强制重编；`zan_drop_artifact` 同步删 sidecar。

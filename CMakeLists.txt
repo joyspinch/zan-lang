@@ -1544,10 +1544,26 @@ set(_known_leaky
 foreach(_src ${_conf_srcs})
   get_filename_component(_name ${_src} NAME_WE)
   zan_uses_gui_driver(${_src} _needs_gui_driver)
+  set(_expect_leak_site "")
   if(_name MATCHES "^async_mt")
     set(_extra_args "--async-workers")
+  elseif(_name STREQUAL "server_mvc_timezone")
+    set(_extra_args
+      "${CMAKE_SOURCE_DIR}/templates/server/server-mvc/src/Framework/Fmt.zan")
+  elseif(_name STREQUAL "file_embed_bytes")
+    # Same branch as the conformance/arcguard loops: the fixtures only exist
+    # through the embedded-resource API, registered via --embed.
+    set(_extra_args
+      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/embed_assets=assets")
   elseif(_needs_gui_driver)
     set(_extra_args "${_gui_driver_args}")
+  elseif(_name STREQUAL "arc_leak_site_label")
+    # Pins leak-report site attribution (A64b): the case keeps one object
+    # alive on purpose and asserts the report names THAT site's own
+    # file:line. -g gives sites their (file, line) key; without it sites
+    # would alias by shape onto the last same-shape allocation again.
+    set(_extra_args "-g")
+    set(_expect_leak_site "arc_leak_site_label.zan:20:")
   else()
     set(_extra_args "")
   endif()
@@ -1558,6 +1574,7 @@ foreach(_src ${_conf_srcs})
       -DOUT_EXE=${CMAKE_BINARY_DIR}/leak_${_name}${_exe_ext}
       -DSTDLIB_STAMP=${_stdlib_stamp}
       "-DZANC_ARGS=${_extra_args}"
+      "-DEXPECT_LEAK_SITE=${_expect_leak_site}"
       -P ${CMAKE_SOURCE_DIR}/tests/run_leakcheck.cmake)
   set_tests_properties(leakcheck_${_name} PROPERTIES
     RESOURCE_LOCK src_${_name} TIMEOUT 120)

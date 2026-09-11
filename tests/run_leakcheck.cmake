@@ -20,12 +20,23 @@ endif()
 
 # ---- up-to-date check ------------------------------------------------------
 # Re-running the suite must not recompile programs whose inputs did not change:
-# the artifact is a pure function of (source, compiler, stdlib), so a target
-# newer than all three is reused. STDLIB_STAMP is touched by the build whenever
-# any stdlib source changes.
+# the artifact is a pure function of (source, compiler, stdlib, ZANC_ARGS), so
+# a target newer than all three is reused. STDLIB_STAMP is touched by the build
+# whenever any stdlib source changes. The compile args are remembered in a
+# sidecar file: the args come from CMakeLists loops that have grown special
+# cases over time (e.g. --embed for file_embed_bytes), and reusing an artifact
+# built under older args silently keeps failing the case forever.
 function(zan_artifact_is_current out_var artifact)
   set(${out_var} FALSE PARENT_SCOPE)
   if(NOT EXISTS ${artifact})
+    return()
+  endif()
+  if(EXISTS "${artifact}.args")
+    file(READ "${artifact}.args" _recorded_args)
+  else()
+    set(_recorded_args "<none>")
+  endif()
+  if(NOT _recorded_args STREQUAL "<args:${ZANC_ARGS}>")
     return()
   endif()
   if(${SRC} IS_NEWER_THAN ${artifact})
@@ -47,6 +58,7 @@ endfunction()
 # considered "current" forever).
 function(zan_drop_artifact)
   file(REMOVE ${OUT_EXE})
+  file(REMOVE "${OUT_EXE}.args")
 endfunction()
 
 # ---- compile with leak instrumentation ----
@@ -60,6 +72,7 @@ if(NOT _current)
   if(NOT compile_rc EQUAL 0)
     message(FATAL_ERROR "compile failed (rc=${compile_rc})\n${compile_out}${compile_err}")
   endif()
+  file(WRITE "${OUT_EXE}.args" "<args:${ZANC_ARGS}>")
 endif()
 
 # ---- run and capture the leak report (the checker may print to either stream) ----
@@ -82,6 +95,23 @@ while(TRUE)
   endif()
   break()
 endwhile()
+
+# EXPECT_LEAK_SITE flips the polarity for cases that keep an object alive on
+# purpose: the run must print a leak report AND that report must name the
+# expected site (a "file.zan:LINE:" fragment), pinning the report's per-site
+# attribution instead of just the total count.
+if(EXPECT_LEAK_SITE)
+  if(NOT run_out MATCHES "memory leak detected" AND NOT run_err MATCHES "memory leak detected")
+    zan_drop_artifact()
+    message(FATAL_ERROR "expected a leak report in ${SRC} but none was printed\nstdout:\n${run_out}\nstderr:\n${run_err}")
+  endif()
+  if(NOT run_out MATCHES "${EXPECT_LEAK_SITE}" AND NOT run_err MATCHES "${EXPECT_LEAK_SITE}")
+    zan_drop_artifact()
+    message(FATAL_ERROR "leak report in ${SRC} does not name the expected site '${EXPECT_LEAK_SITE}':\nstdout:\n${run_out}\nstderr:\n${run_err}")
+  endif()
+  message(STATUS "leak-site ok: ${SRC}")
+  return()
+endif()
 
 if(run_out MATCHES "memory leak detected" OR run_err MATCHES "memory leak detected")
   zan_drop_artifact()

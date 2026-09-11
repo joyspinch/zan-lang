@@ -1059,7 +1059,13 @@ static bool site_arrays_reserve(zan_irgen_t *g, int want) {
     zan_type_t **ni = (zan_type_t **)realloc(g->site_inst,
         (size_t)newcap * sizeof(zan_type_t *));
     if (ni) g->site_inst = ni;
-    if (!ns || !nc || !nce || !ni) return false;
+    uint32_t *nlf = (uint32_t *)realloc(g->site_loc_file,
+        (size_t)newcap * sizeof(uint32_t));
+    if (nlf) g->site_loc_file = nlf;
+    uint32_t *nll = (uint32_t *)realloc(g->site_loc_line,
+        (size_t)newcap * sizeof(uint32_t));
+    if (nll) g->site_loc_line = nll;
+    if (!ns || !nc || !nce || !ni || !nlf || !nll) return false;
     memset(g->site_syms + g->leak_site_cap, 0,
         (size_t)(newcap - g->leak_site_cap) * sizeof(zan_symbol_t *));
     memset(g->site_coll + g->leak_site_cap, 0,
@@ -1068,6 +1074,10 @@ static bool site_arrays_reserve(zan_irgen_t *g, int want) {
         (size_t)(newcap - g->leak_site_cap) * sizeof(zan_type_t *));
     memset(g->site_inst + g->leak_site_cap, 0,
         (size_t)(newcap - g->leak_site_cap) * sizeof(zan_type_t *));
+    memset(g->site_loc_file + g->leak_site_cap, 0,
+        (size_t)(newcap - g->leak_site_cap) * sizeof(uint32_t));
+    memset(g->site_loc_line + g->leak_site_cap, 0,
+        (size_t)(newcap - g->leak_site_cap) * sizeof(uint32_t));
     g->leak_site_cap = newcap;
     return true;
 }
@@ -1089,9 +1099,20 @@ static bool desc_gv_reserve(zan_irgen_t *g, int want) {
 static int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym,
                             zan_type_t *inst, int coll_kind,
                             zan_type_t *coll_elem) {
+    /* check-leaks reports name each site's own "file:line:col", so the site
+     * must be per LOCATION there: keyed by shape alone, every same-class
+     * `new` would share one slot and the report's name (stored on every
+     * allocation) would pin the site that allocated last, not the leaking
+     * one (A64b). Without -g the debug location is unknown (0/0) and the key
+     * degrades to shape-only -- same aliasing as before, same counts. Other
+     * builds never report, so they keep the compact shape key. */
+    uint32_t key_file = g->check_leaks ? g->di_cur_file : 0;
+    uint32_t key_line = g->check_leaks ? g->di_cur_line : 0;
     for (int i = 0; i < g->leak_site_count; i++) {
         int existing_kind = g->site_coll ? g->site_coll[i] : 0;
         if (existing_kind != coll_kind) continue;
+        if (g->site_loc_file && g->site_loc_file[i] != key_file) continue;
+        if (g->site_loc_line && g->site_loc_line[i] != key_line) continue;
         if (coll_kind != 0) {
             zan_type_t *existing_elem = g->site_coll_elem
                 ? g->site_coll_elem[i] : NULL;
@@ -1106,7 +1127,7 @@ static int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym,
      * tables, so their cap is real; every other build grows. */
     if (g->leak_site_count >= ZAN_MAX_LEAK_SITES && g->check_leaks) {
         fprintf(stderr,
-            "zanc: too many distinct ARC destructor shapes "
+            "zanc: too many distinct ARC allocation sites "
             "(check-leaks maximum %d)\n",
             ZAN_MAX_LEAK_SITES);
         exit(1);
@@ -1121,6 +1142,8 @@ static int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym,
     if (g->site_inst) g->site_inst[site_idx] = inst;
     if (g->site_coll) g->site_coll[site_idx] = coll_kind;
     if (g->site_coll_elem) g->site_coll_elem[site_idx] = coll_elem;
+    if (g->site_loc_file) g->site_loc_file[site_idx] = key_file;
+    if (g->site_loc_line) g->site_loc_line[site_idx] = key_line;
     if (g->desc_hdr) create_arc_desc(g, site_idx);
     return site_idx;
 }
@@ -1875,6 +1898,8 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         g->site_coll = (int *)calloc(g->leak_site_cap, sizeof(int));
         g->site_coll_elem = (zan_type_t **)calloc(g->leak_site_cap, sizeof(zan_type_t *));
         g->site_inst = (zan_type_t **)calloc(g->leak_site_cap, sizeof(zan_type_t *));
+        g->site_loc_file = (uint32_t *)calloc(g->leak_site_cap, sizeof(uint32_t));
+        g->site_loc_line = (uint32_t *)calloc(g->leak_site_cap, sizeof(uint32_t));
     }
 
     /* declare printf */

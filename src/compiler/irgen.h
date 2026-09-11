@@ -413,6 +413,12 @@ struct zan_irgen {
                                   * fields its type arguments really hold */
     int          *site_coll;     /* per site: 0=class, 1=List, 2=StringBuilder */
     zan_type_t   **site_coll_elem; /* per site: List element type (for release) */
+    /* Where the new-expression sits, so a check-leaks report can name each
+     * allocation site's own file:line instead of aliasing every same-shape
+     * site onto the one that allocated last. 0/0 = unknown (no -g), which
+     * keys shape-only, i.e. the pre-location behavior. */
+    uint32_t     *site_loc_file;
+    uint32_t     *site_loc_line;
     int          leak_site_count; /* number of distinct `new` sites assigned */
     int          leak_site_cap;   /* capacity of the site_* host-side arrays */
     /* Per-shape descriptor globals (non-check-leaks builds): one
