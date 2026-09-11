@@ -471,7 +471,10 @@ CSS 里非 token 的长度由 `Style.ScaleLayout` 补乘,`StyleBox.IsPrescaled`
 7. **Zan 字符串按字节索引,`Substring(0, 1)` 对中文切出半个字**(渲染
    成「?」)。头像首字/缩写一律由数据显式给出(发言人注册表带 ini
    字段),代码里不要对中文切片(微信模板群成员格「过客云飞」头像
-   变「?」,2026-09-12)。
+   变「?」,2026-09-12)。需要**字数**时同样别用 `s.Length`——它是
+   UTF-8 **字节**数;逐字走 `QrEncoder.SeqByteLen(s[i] & 255)` 才是
+   字数(legend 名牌按 1..6 字选素材宽,用 `Length` 会把 2 字名字
+   算成 6 字节、选错名牌素材,2026-09-12)。
 8. **聊天抽屉/表情面板这类要装完整控件树的「弹出」,用 dock + visible
    翻面的真控件列,不用覆盖层自管分发**(OverlayPopup.Host 是给选项
    列表/菜单自绘用的)。互斥显隐:再点同一图标=收起,开一个关其余;
@@ -493,6 +496,19 @@ CSS 里非 token 的长度由 `Style.ScaleLayout` 补乘,`StyleBox.IsPrescaled`
     (`again = (sel == index)` 才发 Activate):「再点一下收起」这类
     切换语义必须同时绑 OnSelect 与 OnActivate,只绑 Select 的点开
     就收不起(微信模板通讯录折叠分组,2026-09-12)。
+12. **Label 的文字从盒子左缘起画,`text-align` 对它无效**。`Label.OnPaint`
+    只做垂直居中(`Canvas.CenterTextY`),水平方向不做对齐——给标签挂
+    `text-align:center` 是**静默无效**的(legend 页 31 血字实测贴左约 10
+    设备像素)。要水平居中就把标签装进挂
+    `display:flex; justify-content:center` 的盒子(皮肤里已有先例
+    `.tbl-cell`),或容器用 Flex 的 `Justify("center")`;别指望标签自己
+    居中,也别用一个"和字一样宽"的盒子去蒙(字宽随字体度量变)。
+13. **要手摆子项的宿主容器不能是 flex**。给子项 `DockManual()` +
+    `Place(x,y)` 的宿主,皮肤类里不能有 `display:flex`——flex 把子项按
+    add 序流式排,`Place` 与 dock 一起被忽略(同第 9 条,2026-09-12
+    legend 页 31 名牌阵)。**分工写死**:手摆宿主只给背景/边框,子项一个
+    个 `Place`;自己需要 `display:flex` 的行盒(如要横排分段文字),只能
+    当别人手摆的**子项**,不能再当"手摆子项的宿主"。
 
 ## 收尾自查(逐条过)
 
