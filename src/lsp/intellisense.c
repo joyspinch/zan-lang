@@ -434,6 +434,152 @@ static void intel_parse_zform(intellisense_t *is, const char *filepath,
     json_free(root);
 }
 
+/* ---- .html designer-document indexing (P7d storage format) ----
+ *
+ * A .html design doc (stdlib/System/Web/DesignerHtml) is the same form
+ * model as .zform serialized as HTML: the body tag carries the
+ * data-zan-design marker + id="FormName" (+ data-submit for the form-level
+ * submit handler), each field element carries id="Name" +
+ * data-kind="WidgetType", and event handlers ride data-on-<event>="Handler".
+ * The encoder writes one element per line, so the index scans line-wise and
+ * flattens nested containers (the .zform path flattens field names the same
+ * way). Hand-edited elements wrapped across lines are not seen until the
+ * designer re-saves - the same class of line assumption as the .zform
+ * name-key scanner. Only docs carrying the marker are indexed; plain HTML
+ * pages produce no symbols. */
+
+/* Read attr="value" off one HTML line. `attr` must sit at a tag boundary
+ * (start of line, or preceded by space/tab/'<') so "id" does not match
+ * inside "data-id". */
+static bool intel_html_attr(const char *line, size_t len, const char *attr,
+                            char *out, size_t cap) {
+    size_t al = strlen(attr);
+    for (size_t i = 0; i + al + 2 < len; i++) {
+        if (line[i] != attr[0]) continue;
+        if (memcmp(line + i, attr, al) != 0 || line[i + al] != '=') continue;
+        if (i > 0 && line[i - 1] != ' ' && line[i - 1] != '\t' &&
+            line[i - 1] != '<') continue;
+        if (line[i + al + 1] != '"') continue;
+        const char *v = line + i + al + 2;
+        size_t n = 0;
+        while (v + n < line + len && v[n] != '"') n++;
+        if (n >= cap) return false;
+        memcpy(out, v, n);
+        out[n] = '\0';
+        return true;
+    }
+    return false;
+}
+
+static bool intel_html_has(const char *line, size_t len, const char *needle) {
+    size_t nl = strlen(needle);
+    if (len < nl) return false;
+    for (size_t i = 0; i + nl <= len; i++) {
+        if (line[i] == needle[0] && memcmp(line + i, needle, nl) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Every data-on-<event>="Handler" value on one line (fields can carry
+ * several, e.g. data-on-click + data-on-submit). */
+static int intel_html_handlers(const char *line, size_t len,
+                               char outs[][128], int max) {
+    static const char kOn[] = "data-on-";
+    const size_t kl = sizeof(kOn) - 1;
+    int n = 0;
+    size_t i = 0;
+    while (i + kl <= len && n < max) {
+        size_t j = i;
+        while (j + kl <= len && memcmp(line + j, kOn, kl) != 0) j++;
+        if (j + kl > len) break;
+        size_t k = j + kl;
+        while (k < len && line[k] != '=') k++;
+        if (k + 1 >= len || line[k + 1] != '"') { i = j + kl; continue; }
+        const char *v = line + k + 2;
+        size_t m = 0;
+        while (v + m < line + len && v[m] != '"') m++;
+        if (m > 0 && m < 128) {
+            memcpy(outs[n], v, m);
+            outs[n][m] = '\0';
+            n++;
+        }
+        i = (size_t)(v - line) + m + 1;
+    }
+    return n;
+}
+
+static void intel_parse_zform_html(intellisense_t *is, const char *filepath,
+                                   const char *content, size_t len) {
+    /* pass 1: the marker line names the form and the form-level handlers */
+    bool has_marker = false;
+    char class_name[128] = {0};
+    char submit[128] = {0};
+    char form_handlers[8][128];
+    int form_handler_count = 0;
+    const char *p = content, *end = content + len;
+    while (p < end && !has_marker) {
+        const char *nl = memchr(p, '\n', (size_t)(end - p));
+        size_t ll = (size_t)((nl ? nl : end) - p);
+        if (intel_html_has(p, ll, "data-zan-design")) {
+            has_marker = true;
+            intel_html_attr(p, ll, "id", class_name, sizeof(class_name));
+            intel_html_attr(p, ll, "data-submit", submit, sizeof(submit));
+            form_handler_count = intel_html_handlers(p, ll, form_handlers, 8);
+        }
+        if (!nl) break;
+        p = nl + 1;
+    }
+    if (!has_marker || !class_name[0] ||
+        !isalpha((unsigned char)class_name[0])) return;
+
+    /* the form class, base type Form (member completion walks inheritance) */
+    add_symbol_ex(is, class_name, "Form", NULL, NULL, filepath, NULL,
+                  ISYM_CLASS, 0, 0, false, 0);
+    if (submit[0])
+        add_symbol(is, submit, "void", class_name, "void handler()",
+                   filepath, ISYM_METHOD, 0, 0);
+    for (int h = 0; h < form_handler_count; h++) {
+        add_symbol(is, form_handlers[h], "void", class_name, "void handler()",
+                   filepath, ISYM_METHOD, 0, 0);
+    }
+
+    /* pass 2: one line per field element */
+    p = content;
+    int line = 0;
+    while (p < end) {
+        const char *nl = memchr(p, '\n', (size_t)(end - p));
+        size_t ll = (size_t)((nl ? nl : end) - p);
+        char kind[128];
+        if (intel_html_attr(p, ll, "data-kind", kind, sizeof(kind)) &&
+            kind[0]) {
+            char fname[128];
+            if (intel_html_attr(p, ll, "id", fname, sizeof(fname)) &&
+                fname[0] && isalpha((unsigned char)fname[0])) {
+                /* data-kind holds the widget class name; a bare number is
+                 * the legacy numeric field type */
+                const char *wtype = "Panel";
+                if (isalpha((unsigned char)kind[0])) {
+                    wtype = kind;
+                } else if (kind[0] >= '0' && kind[0] <= '9') {
+                    wtype = intel_zform_widget(atoi(kind));
+                }
+                add_symbol(is, fname, wtype, class_name, NULL,
+                           filepath, ISYM_FIELD, line, 0);
+            }
+            char hs[8][128];
+            int hn = intel_html_handlers(p, ll, hs, 8);
+            for (int h = 0; h < hn; h++) {
+                add_symbol(is, hs[h], "void", class_name, "void handler()",
+                           filepath, ISYM_METHOD, line, 0);
+            }
+        }
+        if (!nl) break;
+        p = nl + 1;
+        line++;
+    }
+}
+
 /* ---- .zscene design-document indexing ----
  *
  * A .zscene file is the scene designer's JSON description (see
@@ -519,8 +665,9 @@ void intel_parse_file(intellisense_t *is, const char *filepath,
 
     if (!content || len == 0) return;
 
-    /* .zform design documents are JSON, not Zan source: index their
-     * compile-time projection (class + typed fields + event handlers). */
+    /* designer documents are not Zan source (.zform/.zscene JSON,
+     * .html P7d): index their compile-time projection (class + typed
+     * fields + event handlers) instead. */
     {
         size_t fl = strlen(filepath);
         if (fl > 6 && strcmp(filepath + fl - 6, ".zform") == 0) {
@@ -529,6 +676,14 @@ void intel_parse_file(intellisense_t *is, const char *filepath,
         }
         if (fl > 7 && strcmp(filepath + fl - 7, ".zscene") == 0) {
             intel_parse_zscene(is, filepath, content, len);
+            return;
+        }
+        if (fl > 5 && strcmp(filepath + fl - 5, ".html") == 0) {
+            intel_parse_zform_html(is, filepath, content, len);
+            return;
+        }
+        if (fl > 4 && strcmp(filepath + fl - 4, ".htm") == 0) {
+            intel_parse_zform_html(is, filepath, content, len);
             return;
         }
     }
@@ -1823,7 +1978,7 @@ static void index_directory_recursive(intellisense_t *is, const char *dir_path) 
                 index_directory_recursive(is, full_path);
             }
         } else {
-            /* check if it's a .zan or .zform file */
+            /* check if it's a .zan or designer document file */
             size_t name_len = strlen(fd.cFileName);
             bool is_zan = name_len > 4 &&
                           strcmp(fd.cFileName + name_len - 4, ".zan") == 0;
@@ -1831,7 +1986,11 @@ static void index_directory_recursive(intellisense_t *is, const char *dir_path) 
                             strcmp(fd.cFileName + name_len - 6, ".zform") == 0;
             bool is_zscene = name_len > 7 &&
                              strcmp(fd.cFileName + name_len - 7, ".zscene") == 0;
-            if (is_zan || is_zform || is_zscene) {
+            bool is_html = name_len > 5 &&
+                           strcmp(fd.cFileName + name_len - 5, ".html") == 0;
+            bool is_htm = name_len > 4 &&
+                          strcmp(fd.cFileName + name_len - 4, ".htm") == 0;
+            if (is_zan || is_zform || is_zscene || is_html || is_htm) {
                 /* read file and parse it */
                 HANDLE hFile = CreateFileA(full_path, GENERIC_READ, FILE_SHARE_READ,
                                           NULL, OPEN_EXISTING, 0, NULL);
@@ -1887,7 +2046,11 @@ static void index_directory_recursive(intellisense_t *is, const char *dir_path) 
                             strcmp(entry->d_name + name_len - 6, ".zform") == 0;
             bool is_zscene = name_len > 7 &&
                              strcmp(entry->d_name + name_len - 7, ".zscene") == 0;
-            if (is_zan || is_zform || is_zscene) {
+            bool is_html = name_len > 5 &&
+                           strcmp(entry->d_name + name_len - 5, ".html") == 0;
+            bool is_htm = name_len > 4 &&
+                          strcmp(entry->d_name + name_len - 4, ".htm") == 0;
+            if (is_zan || is_zform || is_zscene || is_html || is_htm) {
                 FILE *f = fopen(full_path, "rb");
                 if (f) {
                     fseek(f, 0, SEEK_END);

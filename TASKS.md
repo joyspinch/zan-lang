@@ -2144,3 +2144,17 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
   ④ **账号级登录失败锁定**：IP 限流（5/5s/worker）防单源扫描，防不住分布式按账号撞库——game_account 加 `loginFails/loginFailAt` 列（SyncStructureAll 自动 ALTER 补列，旧行读 0=未锁定），AccountDao 补 `LoginLocked/NoteLoginFail/ClearLoginFails`（与密保 answerFails 同构的 1h 窗口语义，阈值 10 次）；Gateway.Login 密码校验前查锁、错一次计一次、成功登录与密码重置清零。锁定拒绝文案不带「账号不存在」信息，不透露账号存在性。e2e +12 断言（10 次错密逐一确认文案 + 第 11 次正确密码被拒）114→125→127→**138/138**。
   ② **默认口令启动告警**：Schema.WarnBootstrapPassword 在启动时对 admin 账号散列比对 admin1234，命中即响亮打印（实测 `[security] *** 默认口令 admin/admin1234 仍可登录… ***` 上墙）。**不做强锁**：报告观察项 1 原文「模板演示预期 admin/admin1234 可登录」，e2e 也依赖默认口令登录管理后台；强锁（首登强制改密流）留给二开按需收紧。
   ⑤ **README/头注 ev 推送清单对齐实际代码**：删 `ev online`（在线数走 realms/hb 响应字段，无推送）、`ev fight`（手动 hunt 的回合详情在 op 应答 fight 字段，不单独推）、`ev hb-notice`（Gateway 头注残留，代码无此事件）；补 `ev idlesum`（挂机每 60s 批量结算，原文档漏写）；auto 挂机描述从「每 tickMs 打一回合推 ev fight」更正为批量结算语义。逐 Ev("…")/NewStr("…") 调用点枚举核对，全部对齐。
+
+* **P7d 收尾：LSP 索引 .html 设计稿（用户点名补齐的迁移缺口）**（2026-09-12）：
+  P7d 把设计稿全迁 .html 时漏了 zan-lsp——intel_parse_zform 只认 .zform JSON，
+  新项目设计控件的补全/goto-def 静默失效。修法：intellisense.c 新增
+  intel_parse_zform_html（行扫描投影：body data-zan-design 标记 + id= 表单名 +
+  data-kind 控件类型 + data-on-*/data-submit handler，嵌套容器拍平，与 .zform
+  路径同假设）；intel_parse_file 派发 .html/.htm；两个目录扫描点（Win32
+  FindFirstFile / POSIX readdir）都加扩展名；publish_diagnostics 对 .html/.htm
+  发空诊断（顺带补上 .zscene 此前就缺的同款守卫）。didOpen/didChange 自动走
+  update_project_index，设计器实时编辑即入索引。探针四断言全过（补全命中
+  UserName:Input / goto-def 逐行落 id="UserName" / .html 空诊断 / didChange 后
+  Extra:Checkbox 实时可见），lsp_baseline_probe gallery 模式无回归（hit-rate
+  2/2、def ok）。教训进 zan-lsp-intellisense skill：新存储格式落地必须同步加
+  LSP 索引通道 + 双扫描点同步 + 设计稿扩展名空诊断三件套。

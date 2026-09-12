@@ -30,6 +30,19 @@ description: Zan LSP（src/lsp/zan-lsp）与 intellisense 引擎的供数定式�
   只覆盖 File/Math/Thread 等一小撮）——表外的类型（App、Control、
   Designer…）要靠索引里的类体解析。手写表补条目是权宜，正解是
   前端类型信息。
+- **设计稿文档走各自的索引投影**：设计器文档不是 Zan 源码——
+  `.zform`/`.zscene` 是 JSON（intel_parse_zform/_zscene），`.html` 是
+  P7d 存储格式（intel_parse_zform_html：body 带 data-zan-design 标记 +
+  id="FormName"，字段元素一行一个 `id="Name" data-kind="Widget"`，
+  事件走 data-on-*，data-submit 是表单级 handler）。为什么：GenForm
+  编译期把设计稿投影成 partial class 的静态控件字段，LSP 必须镜像同
+  一投影业务文件的补全/goto-def 才能看到设计控件；**新存储格式落地
+  时必须同步加索引通道**——P7d 迁移 .html 时漏了，设计控件补全静默
+  失效，是用户点名才发现的。配套两处：目录扫描点（Win32 FindFirstFile
+  与 POSIX readdir **两处都要**）加扩展名；publish_diagnostics 对设计
+  稿扩展名发空诊断（zanc 前端解析不了它们，.zscene 此前就漏了这层
+  守卫）。行扫描假设：编码器一行一个元素，手写换行的元素要等设计器
+  重存才入索引。
 
 ## 已量过的坑（别再踩）
 
@@ -75,3 +88,8 @@ description: Zan LSP（src/lsp/zan-lsp）与 intellisense 引擎的供数定式�
    不收敛，改索引路径后必跑，timeout 420s 内应完成）。
 3. 基线数字与前后对比记 TASKS.md 对应批次条目（探针在 _scratch
    的临时版会丢，正式版在 scripts/）。
+4. 改设计稿索引通道跑专项探针四断言：前缀补全命中投影字段（光标
+   落标识符尾，不是 `.` 后）/ goto-def 落在 `id="..."` 行 / 打开
+   .html 文档发布空诊断 / didChange 设计稿后新字段立刻可见
+   （didChange 走 update_project_index，开着的业务文件补全实时
+   刷新）。光标位置踩坑见上面"探针 offset"条。

@@ -636,25 +636,32 @@ static void method_call_context(const char *text, size_t offset,
 
 /* ============================ diagnostics ============================ */
 
+/* Designer documents (.zform/.zscene JSON, .html/.htm P7d) are never Zan
+ * source: GenForm/GenScene project them at compile time and the designers
+ * validate them live. Publish an empty list so any previously shown errors
+ * clear on close, and so the zanc front-end never runs over them. */
+static void publish_empty_diagnostics(lsp_server_t *s, const char *uri) {
+    json_value *params = json_new_obj();
+    json_obj_set(params, "uri", json_new_str(uri));
+    json_obj_set(params, "diagnostics", json_new_arr());
+    json_value *note = json_new_obj();
+    json_obj_set(note, "jsonrpc", json_new_str("2.0"));
+    json_obj_set(note, "method", json_new_str("textDocument/publishDiagnostics"));
+    json_obj_set(note, "params", params);
+    char *payload = json_serialize(note);
+    lsp_write(s, payload);
+    free(payload);
+    json_free(note);
+}
+
 /* Run the front-end over `text` and publish diagnostics for `uri`. */
 static void publish_diagnostics(lsp_server_t *s, const char *uri, const char *text) {
     size_t ul = strlen(uri);
-    if (ul > 6 && strcmp(uri + ul - 6, ".zform") == 0) {
-        /* .zform is the designer's JSON document, not Zan source: the zanc
-         * front-end cannot parse it (formgen projects it at compile time),
-         * and the designer itself validates the JSON. Publish an empty list
-         * so any previously shown errors clear on close. */
-        json_value *params = json_new_obj();
-        json_obj_set(params, "uri", json_new_str(uri));
-        json_obj_set(params, "diagnostics", json_new_arr());
-        json_value *note = json_new_obj();
-        json_obj_set(note, "jsonrpc", json_new_str("2.0"));
-        json_obj_set(note, "method", json_new_str("textDocument/publishDiagnostics"));
-        json_obj_set(note, "params", params);
-        char *payload = json_serialize(note);
-        lsp_write(s, payload);
-        free(payload);
-        json_free(note);
+    if ((ul > 6 && strcmp(uri + ul - 6, ".zform") == 0) ||
+        (ul > 7 && strcmp(uri + ul - 7, ".zscene") == 0) ||
+        (ul > 5 && strcmp(uri + ul - 5, ".html") == 0) ||
+        (ul > 4 && strcmp(uri + ul - 4, ".htm") == 0)) {
+        publish_empty_diagnostics(s, uri);
         return;
     }
 
