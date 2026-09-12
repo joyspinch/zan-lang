@@ -49,7 +49,7 @@ src/Modules/            业务域（模型 + 控制器同目录内聚）
   Flow/                   流程定义 / 实例 / 任务 + 引擎（Engine.zan）+ 通知兼容层
 src/Feature/            横切能力：Attachment、TodoCenter、ExcelIo、Blocks、
                         FormSchema、Backup、Search、CalendarRemind、
-                        MessageRelay、ChatLog、Mailer、Metrics、Ai…
+                        MessageRelay、Mailer、Metrics、Ai…
 src/Framework/          应用接线：Cfg、Db、DbContext、Schema（CodeFirst DDL +
                         种子）、Auth、Tenant、Notify(Hub)、DataScope、Perm(Table)、
                         ExcelIo、Search、MessageRelay、AppServices
@@ -343,7 +343,6 @@ data/app.db          SQLite 主库（WAL）
 data/backups/{ts}/   备份（app.db + uploads.zip + manifest.txt，保留 7 份）
 data/metrics.db      指标历史（独立库）
 data/uploads/        附件流式落盘（{year-month}/ 结构）
-data/chat/           私信本地历史（t{租户}/{a}-{b}.jsonl，send/read/ack 事件流水）
 logs/{yyyyMM}/dd.log 运行日志
 ```
 

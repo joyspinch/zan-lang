@@ -2,7 +2,6 @@ using System;
 using System.Collections;
 using System.Data;
 using System.Data.Orm;
-using System.Json;
 using System.Web;
 using ZanWeb.Model.Oa;
 using ZanWeb.Model.Sys;
@@ -16,8 +15,8 @@ namespace ZanWeb.Admin.Oa;
    "message") 走铃铛（在线即推、离线未读数），私信历史不进通知中心。
    已读/送达回执（本单）：对方客户端收帧即 Ack 置送达位、打开会话/会话
    内新消息即 Read 置已读位，都经 oa_message_event 事件表由 MessageRelay
-   向发送方实时扇出 ack/read 帧；send/read/ack 同时以 JSONL 追加到
-   运行路径 data/chat/（旁路存证，见 ChatLog）。
+   向发送方实时扇出 ack/read 帧；事件表只增不改，回执时序即落库即存证，
+   不另设文件副本（查询全走主库，附件才落文件，见 data/uploads）。
    一期不做 SearchProvider：私信仅会话双方可见，Provider 权限语义不足。 */
 [Route("admin/oa/messages/[action]")]
 [Custom(Authorization = CustomAuthorization.Grant)]
@@ -159,20 +158,11 @@ class Messages : AdminController {
         r.isRead = 0;
         r.replyTo = 0;
         r.createdAt = WebApp.NowSeconds();
-        await this.OaMessage.Insert(r).ExecuteIdentityAsync();
+        int msgId = await this.OaMessage.Insert(r).ExecuteIdentityAsync();
         await Notify.Send(this.Held(), this.TenantId(), peer.id, "oa", "message",
             "新私信：" + Fmt.Text(me.nickname, me.username),
             Messages.Excerpt(content, 50),
             "/admin/oa/messages/chat?peer=" + Convert.ToString(me.id));
-        /* 本地历史（data/chat/）：send 事件旁路追加。 */
-        JsonValue h = JsonValue.NewObject();
-        h.Put("kind", JsonValue.NewStr("send"));
-        h.Put("id", JsonValue.NewStr(Convert.ToString(r.id)));
-        h.Put("from", JsonValue.NewStr(Convert.ToString(me.id)));
-        h.Put("to", JsonValue.NewStr(Convert.ToString(peer.id)));
-        h.Put("content", JsonValue.NewStr(content));
-        h.Put("at", JsonValue.NewStr(Convert.ToString(r.createdAt)));
-        ChatLog.AppendEvent(this.TenantId(), me.id, peer.id, h);
         this.Saved("已发送");
     }
 
@@ -239,9 +229,9 @@ class Messages : AdminController {
 
     /* ---- helpers ---- */
 
-    /* 回执事件落库 + 本地历史（data/chat/）同点追加：read/ack 共用。
-       事件表即总线，MessageRelay 水位扫描后向消息发送方（ev.fromId）
-       扇出实时帧；kind 1=送达 2=已读，与 OaMessageEvent.kind 对应。 */
+    /* 回执事件落库：read/ack 共用。事件表即总线，MessageRelay 水位扫描
+       后向消息发送方（ev.fromId）扇出实时帧；kind 1=送达 2=已读，与
+       OaMessageEvent.kind 对应。只增不改，回执时序即存证（主库可查）。 */
     async void Receipt(int tenantId, int msgId, int senderId, int byId,
         int kind) {
         OaMessageEvent ev = new OaMessageEvent();
@@ -252,12 +242,6 @@ class Messages : AdminController {
         ev.kind = kind;
         ev.createdAt = WebApp.NowSeconds();
         await this.OaMessageEvent.Insert(ev).ExecuteIdentityAsync();
-        JsonValue h = JsonValue.NewObject();
-        h.Put("kind", JsonValue.NewStr(kind == 1 ? "ack" : "read"));
-        h.Put("id", JsonValue.NewStr(Convert.ToString(msgId)));
-        h.Put("by", JsonValue.NewStr(Convert.ToString(byId)));
-        h.Put("at", JsonValue.NewStr(Convert.ToString(ev.createdAt)));
-        ChatLog.AppendEvent(tenantId, senderId, byId, h);
     }
 
     static int IndexOf(List<int> ids, int v) {
