@@ -446,6 +446,32 @@ static void emit_intrinsic_drop_recv(zan_irgen_t *g, zan_ast_node_t *lobj,
     emit_release_owned_call_temp(g, lobj, recv, locals);
 }
 
+/* Register one argument temporary with the exception unwinder while the
+ * callee runs. The generic-spec call path (emit_method_spec_call) does this
+ * for every owned argument; the plain paths below had it only on the
+ * receiver, so `db.Execute(sql, new DbParams())` where Execute throws
+ * leaked the parameter object every time — the success-path release never
+ * runs after a longjmp (A64b sibling: db_error_throw). Same condition and
+ * slot-kind handling as the spec path. */
+static int emit_call_arg_eh_push(zan_irgen_t *g, zan_ast_node_t *arg,
+                                 LLVMValueRef val, local_scope_t *locals) {
+    zan_type_t *at = infer_expr_type(g, arg, locals);
+    if (!at || !is_rc_managed_type(at) ||
+        expr_is_local_ident(arg, locals) ||
+        !expr_yields_owned_rc_value(g, arg, locals) ||
+        LLVMGetTypeKind(LLVMTypeOf(val)) != LLVMPointerTypeKind) return 0;
+    int ehk = eh_slot_kind_of(at);
+    if (ehk != ZAN_EH_SLOT_OBJ) {
+        LLVMValueRef slot = emit_entry_alloca(g,
+            LLVMTypeOf(val), "arg.eh");
+        LLVMBuildStore(g->builder, val, slot);
+        emit_eh_tmp_push_slot(g, slot, ehk);
+    } else {
+        emit_eh_tmp_push(g, val);
+    }
+    return 1;
+}
+
 static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         /* nameof(name): compile-time spelling of the argument's final
@@ -4333,6 +4359,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                 emit_eh_tmp_push(g, recv_val);
                                 recv_eh_pushed = 1;
                             }
+                            int n_eh_args = 0;
                             for (int k = 0; k < expr->call.args.count; k++) {
                                 /* declared parameter k+self_off: slot 0 is the
                                  * injected receiver (static op_call's explicit
@@ -4344,6 +4371,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                     method_param_type_at(g, op_sym,
                                         k + self_off, expr,
                                         expr->call.callee, locals), locals);
+                                n_eh_args += emit_call_arg_eh_push(g,
+                                    expr->call.args.items[k],
+                                    call_args[k + 1], locals);
                             }
                             LLVMTypeRef mft = g->functions[fi].fn_type;
                             LLVMValueRef mfn = route_generic_method(g, oc_ty,
@@ -4352,6 +4382,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             LLVMValueRef result = emit_dispatch_call(g,
                                 oc_ty->sym, op_sym, mfn, mft, call_args, argc, cn);
                             result = coerce_generic_result(g, result, op_sym, oc_ty);
+                            for (int k = 0; k < n_eh_args; k++)
+                                emit_eh_tmp_pop(g);
                             if (recv_eh_pushed) emit_eh_tmp_pop(g);
                             emit_release_owned_call_temp(g, expr->call.callee,
                                 recv_val, locals);
@@ -4410,10 +4442,14 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                         call_args[0] = local->alloca;
                                     }
                                 }
+                                int n_eh_args = 0;
                                 for (int k = 0; k < expr->call.args.count; k++) {
                                     call_args[k + recv_off] = emit_arg_typed(g, expr->call.args.items[k],
                                         method_param_type_at(g, method_sym, k, expr,
                                                              callee->member.object, locals), locals);
+                                    n_eh_args += emit_call_arg_eh_push(g,
+                                        expr->call.args.items[k],
+                                        call_args[k + recv_off], locals);
                                 }
                                 LLVMTypeRef mft = g->functions[fi].fn_type;
                                 LLVMValueRef mfn = route_generic_method(g, local->type,
@@ -4423,6 +4459,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                     callee_static ? NULL : type_sym, method_sym,
                                     mfn, mft, call_args, argc, cn);
                                 result = coerce_generic_result(g, result, method_sym, local->type);
+                                for (int k = 0; k < n_eh_args; k++)
+                                    emit_eh_tmp_pop(g);
                                 for (int k = 0; k < expr->call.args.count; k++) {
                                     emit_release_owned_call_temp(g, expr->call.args.items[k],
                                         call_args[k + recv_off], locals);
@@ -4606,11 +4644,15 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                     }
                                 }
                             }
+                            int n_eh_args = 0;
                             for (int k = 0; k < expr->call.args.count; k++) {
                                 call_args[k + recv_off] = emit_arg_typed(g, expr->call.args.items[k],
                                     method_param_type_at(g, method_sym, k, expr,
                                                          callee->member.object, locals),
                                     locals);
+                                n_eh_args += emit_call_arg_eh_push(g,
+                                    expr->call.args.items[k],
+                                    call_args[k + recv_off], locals);
                             }
                             zan_type_t *recv_ty = callee_static ? g->cur_inst
                                 : infer_expr_type(g, callee->member.object, locals);
@@ -4630,6 +4672,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                 (callee_static || base_recv) ? NULL : recv_cls,
                                 method_sym, mfn, mft, call_args, argc, cn);
                             result = coerce_generic_result(g, result, method_sym, recv_ty);
+                            for (int k = 0; k < n_eh_args; k++)
+                                emit_eh_tmp_pop(g);
                             if (recv_eh_pushed) emit_eh_tmp_pop(g);
                             if (!callee_static) {
                                 emit_release_owned_call_temp(g, callee->member.object, recv_val, locals);
@@ -4680,15 +4724,19 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                                  : (has_res ? map_type(g, rty) : NULL);
 
                     int uargc = expr->call.args.count;
+                    int n_eh_args = 0;
                     /* emit receiver + argument values once, before branching */
                     LLVMValueRef recv = emit_guarded_member_object(g, callee, locals);
                     LLVMValueRef *avals = (LLVMValueRef *)calloc((size_t)(uargc > 0 ? uargc : 1),
                                                                 sizeof(LLVMValueRef));
-                    for (int k = 0; k < uargc; k++)
+                    for (int k = 0; k < uargc; k++) {
                         avals[k] = emit_arg_typed(g, expr->call.args.items[k],
                                                   method_param_type_at(g, iface_m, k, expr,
                                                       callee->member.object, locals),
                                                   locals);
+                        n_eh_args += emit_call_arg_eh_push(g, expr->call.args.items[k],
+                                                          avals[k], locals);
+                    }
                     LLVMValueRef recv_pp = LLVMBuildBitCast(g->builder, recv,
                                               LLVMPointerType(i8ptr, 0), "ifc.recvpp");
                     LLVMValueRef tag = LLVMBuildLoad2(g->builder, i8ptr, recv_pp, "ifc.tag");
@@ -4760,6 +4808,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     }
                     /* the merge block post-dominates every dispatch arm, so
                      * owned receiver/argument temps are released once here. */
+                    for (int k = 0; k < n_eh_args; k++)
+                        emit_eh_tmp_pop(g);
                     for (int k = 0; k < uargc; k++)
                         emit_release_owned_call_temp(g, expr->call.args.items[k],
                                                      avals[k], locals);
@@ -4794,9 +4844,12 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             if (g->functions[fi].sym == method_sym) {
                                 int argc = expr->call.args.count;
                                 LLVMValueRef *call_args = (LLVMValueRef *)calloc((size_t)(argc > 0 ? argc : 1), sizeof(LLVMValueRef));
+                                int n_eh_args = 0;
                                 for (int k = 0; k < argc; k++) {
                                     call_args[k] = emit_arg_typed(g, expr->call.args.items[k],
                                         method_param_type_at(g, method_sym, k, expr, NULL, locals), locals);
+                                    n_eh_args += emit_call_arg_eh_push(g, expr->call.args.items[k],
+                                                          call_args[k], locals);
                                 }
                                 /* A null string handed to a bodyless
                                  * [DllImport] method (no Zan null checks run
@@ -4859,6 +4912,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                 emit_extern_call_len_invalidate(g,
                                     g->functions[fi].fn, call_args, argc,
                                     expr, locals);
+                                for (int k = 0; k < n_eh_args; k++)
+                                    emit_eh_tmp_pop(g);
                                 for (int k = 0; k < argc; k++) {
                                     if (!consumes_free_arg || k != 0) {
                                         emit_release_owned_call_temp(g, expr->call.args.items[k],
@@ -4895,10 +4950,13 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMValueRef *call_args = (LLVMValueRef *)calloc((size_t)argc, sizeof(LLVMValueRef));
                         call_args[0] = emit_arg_typed(g, callee->member.object,
                             method_param_type(g, method_sym, 0), locals);
+                        int n_eh_args = 0;
                         for (int k = 0; k < expr->call.args.count; k++) {
                             call_args[k + 1] = emit_arg_typed(g, expr->call.args.items[k],
                                 method_param_type_at(g, method_sym, k + 1, expr,
                                                      callee->member.object, locals), locals);
+                            n_eh_args += emit_call_arg_eh_push(g, expr->call.args.items[k],
+                                                  call_args[k + 1], locals);
                         }
                         const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(g->functions[fi].fn_type)) == LLVMVoidTypeKind) ? "" : "extcall";
                         coerce_args_to_params(g, g->functions[fi].fn_type, call_args, argc);
@@ -4917,6 +4975,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                     emit_arc_retain(g, result);
                             }
                         }
+                        for (int k = 0; k < n_eh_args; k++)
+                            emit_eh_tmp_pop(g);
                         emit_release_owned_call_temp(g, callee->member.object, call_args[0], locals);
                         for (int k = 0; k < expr->call.args.count; k++) {
                             emit_release_owned_call_temp(g, expr->call.args.items[k],
@@ -4950,6 +5010,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             int argc = expr->call.args.count;
                             bool is_static = (method_sym->modifiers & MOD_STATIC) != 0;
                             int extra = is_static ? 0 : 1;
+                            int n_eh_args = 0;
                             LLVMValueRef *call_args = (LLVMValueRef *)calloc(
                                 (size_t)(argc + extra > 0 ? argc + extra : 1), sizeof(LLVMValueRef));
                             if (!is_static && g->current_this) {
@@ -4977,6 +5038,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                     method_param_type_at(g, method_sym, k, expr,
                                                          NULL, locals),
                                     locals);
+                                n_eh_args += emit_call_arg_eh_push(g,
+                                    expr->call.args.items[k],
+                                    call_args[k + extra], locals);
                             }
                             /* self-call inside a specialized variant stays in
                              * the same instantiation (receiver is `this`). */
@@ -5028,6 +5092,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             emit_extern_call_len_invalidate(g,
                                 g->functions[fi].fn, call_args, argc + extra,
                                 expr, locals);
+                            for (int k = 0; k < n_eh_args; k++)
+                                emit_eh_tmp_pop(g);
                             for (int k = 0; k < argc; k++) {
                                 if (!consumes_free_arg || k != 0) {
                                     emit_release_owned_call_temp(g, expr->call.args.items[k],
@@ -5049,6 +5115,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMValueRef global_fn = LLVMGetNamedFunction(g->mod, name_buf);
             if (global_fn) {
                 int argc = expr->call.args.count;
+                int n_eh_args = 0;
                 LLVMValueRef *call_args = (LLVMValueRef *)calloc(
                     (size_t)(argc > 0 ? argc : 1), sizeof(LLVMValueRef));
                 LLVMTypeRef fn_type = LLVMGlobalGetValueType(global_fn);
@@ -5071,6 +5138,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 else LLVMGetParamTypes(fn_type, ptypes);
                 for (int k = 0; k < argc; k++) {
                     call_args[k] = emit_expr(g, expr->call.args.items[k], locals);
+                    n_eh_args += emit_call_arg_eh_push(g, expr->call.args.items[k],
+                                          call_args[k], locals);
                     if ((unsigned)k >= nparams) { continue; }
                     LLVMTypeRef at = LLVMTypeOf(call_args[k]);
                     LLVMTypeRef pt = ptypes[k];
@@ -5127,6 +5196,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 }
                 emit_extern_call_len_invalidate(g, global_fn, call_args, argc,
                                                expr, locals);
+                for (int k = 0; k < n_eh_args; k++)
+                    emit_eh_tmp_pop(g);
                 for (int k = 0; k < argc; k++) {
                     if (!consumes_free_arg || k != 0) {
                         emit_release_owned_call_temp(g, expr->call.args.items[k],

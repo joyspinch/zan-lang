@@ -882,6 +882,33 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
 - conformance 用例 `arc_lookup_owned_arg` 六形态全调用实参化，leakcheck 孪生
   钉零泄漏；语义结果（at=-1 等）同 golden 钉死，防「释放修没修对、答案先错」。
 
+## 抛出被调方吞掉 owned 实参临时：非泛型调用路径漏注册 EH unwind（2026-09-12 同日根修）
+
+- **坑**：setjmp/longjmp 异常路径下，调用方必须把 owned 实参/接收者临时注册进
+  每线程 unwind 栈（`__zan_eh_tmp_push` / `emit_eh_tmp_push_slot` 打标），throw 时
+  `emit_eh_unwind_to_handler` 才会释放到 handler 标记之上的一切。但代码生成里
+  **只有泛型 spec 路径**（`emit_method_spec_call`）和一处 static-scall 块做了这件事；
+  八条普通非泛型路径（本地接收者 mcall / 一般实例 mcall / 命名空间限定 static /
+  扩展方法 extcall / 裸名 bcall / 全局 gcall / 接口分发 / 运算符调用）**只在成功路径
+  释放实参**——被调方一 throw，longjmp 跳过释放，实参临时每次抛漏一个引用。
+- **最小复形**：`Boom(Make(1))`，Boom 首行 throw，Make 的结果泄漏。IR 指纹：
+  `%bcall = call ptr @Bag_Make` → `call i32 @Bag_Boom(ptr %bcall)` →
+  **只有成功路径**才有 `zan_rt_release_dyn`，`call` 前没有任何 eh push。
+  stdlib 层真实形状 = `db.Execute(sql, new DbParams())` 的 prepare 失败路径
+  （Execute→Fail 抛出、BindAll 还没跑）——`db_error_throw` 的 5 对象漂移即此。
+- **修法定式**：帮手 `emit_call_arg_eh_push`（与 spec 路径同守卫：RC 管理类型 +
+  非局部标识 + owned 产出 + 指针类型；非 OBJ 类槽走 `emit_eh_tmp_push_slot` 打标，
+  OBJ 直推），八条路径逐实参调用，**调用返回后按计数逐次 `emit_eh_tmp_pop`**。
+- **自踩的坑（务必记住）**：push 是**条件式**的（借用实参不推），pop 若按 `argc`
+  无条件弹就会**偷掉别的帧的注册**——首版即因此把 `db_error_throw` 从 5 对象
+  **劣化成 14 对象**，且冒出全新站点（DbResult.zan:28/29、Model.zan:849、
+  SqliteConnection.zan:292、test:146）。**pop 次数必须等于 push 次数**
+  （`n_eh_args` 计数或 `arg_eh_pushed[]` 标志数组，LIFO 序）；运算符调用块原本
+  连 pop 都完全没有，也要一并补。判据：泄漏站点从「预期形状」变成「一堆新形状」
+  时，先怀疑自己的 pop 不平衡，别去查被调方。
+- conformance 用例 `arc_throw_owned_arg`（**双实参** + 抛出被调方）：单实参时
+  push/pop 偶发自动平衡，多实参才会把不平衡暴露出来——写这类用例别只用一参。
+
 ## Binding 活绑定悬空与 out 字段写穿丢失（2026-09-12 gui-wechat 名片会话，均未修）
 
 - **A310**：`label.Text = someObj.field;`（Binding<T> 属性 ← 裸字段左值）合成活绑定
