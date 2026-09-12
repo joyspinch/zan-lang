@@ -8,7 +8,7 @@
 # a stdlib API rename silently rots them until a user hits the error in the
 # IDE. So scaffold each one exactly the way ZanIDE.CreateProject does --
 # substitute {{NAME}} in file *contents*, then rename the GUI pair
-# src/App.zan + src/App.zform to the project name -- and build it.
+# src/App.zan + src/App.html to the project name -- and build it.
 
 cmake_policy(SET CMP0012 NEW)
 
@@ -69,7 +69,7 @@ foreach(_proj IN LISTS _projs)
       continue()
     endif()
     get_filename_component(_ext ${_f} EXT)
-    if(_ext MATCHES "^\\.(zan|zform|proj|json|css|html|md|txt)$")
+    if(_ext MATCHES "^\\.(zan|proj|json|css|html|md|txt)$")
       file(READ ${_dir}/${_f} _body)
       string(REPLACE "{{NAME}}" "${NAME}" _body "${_body}")
       file(WRITE ${_out}/${_f} "${_body}")
@@ -79,13 +79,13 @@ foreach(_proj IN LISTS _projs)
   endforeach()
 
   if(_type STREQUAL "gui")
-    foreach(_ext zan zform)
+    foreach(_ext zan html)
       if(EXISTS ${_out}/src/App.${_ext})
         file(RENAME ${_out}/src/App.${_ext} ${_out}/src/${NAME}.${_ext})
       endif()
     endforeach()
-    if(EXISTS ${_out}/src/${NAME}.zform)
-      set(_entry "src/${NAME}.zform")
+    if(EXISTS ${_out}/src/${NAME}.html)
+      set(_entry "src/${NAME}.html")
     endif()
   endif()
 
@@ -94,9 +94,10 @@ foreach(_proj IN LISTS _projs)
     continue()
   endif()
 
-  # The .zform entry must come first: zanc emits Main from the first design.
+  # The .html design entry must come first: zanc emits Main from the first
+  # design document on the command line.
   set(_srcs "")
-  if(_entry MATCHES "\\.zform$")
+  if(_entry MATCHES "\\.html$")
     list(APPEND _srcs ${_out}/${_entry})
   endif()
   file(GLOB_RECURSE _zan ${_out}/src/*.zan)

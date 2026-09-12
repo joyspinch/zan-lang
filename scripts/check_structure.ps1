@@ -4,9 +4,10 @@ Set-Location $root
 
 # ---- ZanIDE structure guard ------------------------------------------------
 # Enforces docs/projects/zanide/STRUCTURE.md so the project keeps its shape as
-# it grows: one .zform per visual unit with a same-named code-behind, a fixed
-# directory layering, no UI dependency inside services/models, and a file-size
-# ceiling with a shrink-only baseline for the files still being split up.
+# it grows: one .html design doc per visual unit with a same-named code-behind,
+# a fixed directory layering, no UI dependency inside services/models, and a
+# file-size ceiling with a shrink-only baseline for the files still being split
+# up.
 
 $src        = Join-Path $root "src\ide_zan\src"
 $baselineFn = Join-Path $root "docs\projects\zanide\oversize.baseline.txt"
@@ -16,7 +17,7 @@ $allowedDirs = @("shell", "panels", "editor", "dialogs", "pages", "services",
 $errors = @()
 
 # 1) every design document has a code-behind next to it
-foreach ($f in Get-ChildItem $src -Recurse -Include *.zform) {
+foreach ($f in Get-ChildItem $src -Recurse -Include *.html) {
     $behind = [System.IO.Path]::ChangeExtension($f.FullName, ".zan")
     if (!(Test-Path -LiteralPath $behind)) {
         $errors += "missing code-behind: " + $f.FullName.Substring($root.Length + 1)

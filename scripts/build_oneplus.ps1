@@ -1,10 +1,10 @@
 # Standard Zan GUI project build for oneplus\app (群爆款优化神器).
 #
 # oneplus\app is a normal zan.proj project: `entry` names the program's Main
-# (src\OnePlusApp.zan), every .zform under src\ is a designed document whose
-# code-behind is the same-named .zan, and the custom components (pages,
-# toolbars, the command bar) are discovered by scan_components.ps1 so the
-# designer palette and the JSON loader know them.
+# (src\OnePlusApp.zan), every .html design doc under src\ is a designed
+# document whose code-behind is the same-named .zan, and the custom components
+# (pages, toolbars, the command bar) are discovered by scan_components.ps1 so
+# the designer palette and the JSON loader know them.
 #
 #   -Console  build a console-subsystem exe so Console.WriteLine (CEF bootstrap
 #             diagnostics) shows up in a redirected log.
@@ -23,7 +23,7 @@ $zanc = if (Test-Path "build\zanc.exe") { "build\zanc.exe" } else { "dist\win-x6
 Write-Output "[zanc] $zanc"
 
 # Project components (pages/toolbars marked with `/// @component`): the registry
-# is what lets ControlFactory build them from a .zform `kind`, so an empty one
+# is what lets ControlFactory build them from a design `kind`, so an empty one
 # means every designed page silently loses its custom children.
 $registryPath = Join-Path $root "build\ProjectComponents.oneplus.zan"
 & powershell -ExecutionPolicy Bypass -File scripts\scan_components.ps1 `
@@ -51,7 +51,7 @@ $files += @(Get-ChildItem $proj -Recurse -File -Filter *.zan |
     Where-Object { $_.FullName -ne $entry } |
     ForEach-Object { $_.FullName })
 $files += $registryPath
-$files += @(Get-ChildItem $proj -Recurse -File -Filter *.zform |
+$files += @(Get-ChildItem $proj -Recurse -File -Filter *.html |
     ForEach-Object { $_.FullName })
 
 $exeOut = Join-Path $root "build\oneplus.exe"

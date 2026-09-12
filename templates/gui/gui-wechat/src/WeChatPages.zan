@@ -1,5 +1,6 @@
 using System;
 using Gui;
+using Gui.Backend;
 using Gui.Component;
 using Gui.Widget;
 
@@ -15,6 +16,44 @@ class WxPageChat : Control {
     TextArea box;
     List<WxSession> data;
     int current;
+    /// 输入框上方的引用条（点气泡菜单「引用」后出现）。
+    /// Wx.Row 返回 Flex（横排 flex 行），引用条声明为它的真类型。
+    Flex quoteBar;
+    Label quoteLbl;
+    /// 气泡右键菜单的锚点与载荷（跨帧持有，覆盖阶段画）。
+    bool ctxOpen;
+    int ctxMsg;
+    string ctxText;
+    int ctxX;
+    int ctxY;
+
+    /// 覆盖阶段：画右键菜单。菜单开启时拥有整窗（ContextMenu.Render
+    /// 内部 BlockHitsMenu），返回 -2（点外部/再右键）即收起。
+    override void OnPaintOverlay(App app) {
+        if (!ctxOpen) { return; }
+        app.BeginIdScope(730000);
+        List<string> items = new List<string>();
+        items.Add("复制");
+        items.Add("引用");
+        int pick = ContextMenu.Render(app, ctxX, ctxY, items);
+        if (pick == 0 - 2) {
+            ctxOpen = false;
+            app.RequestRedraw();
+            return;
+        }
+        if (pick == 0) {
+            string clip = ctxText != null ? ctxText : "";
+            if (clip.Length > 0) { Clipboard.SetText(clip); }
+            ctxOpen = false;
+            app.RequestRedraw();
+            return;
+        }
+        if (pick == 1) {
+            ctxOpen = false;
+            WxIm.SetQuoteDraft(ctxMsg, ctxText);
+            app.RequestRedraw();
+        }
+    }
     /// 宿主 App（拖出行手势要按主窗口矩形判断「拖到窗外」）。
     App app;
     /// 「...」对应的右侧抽屉与输入区上方的弹出面板。
@@ -86,6 +125,20 @@ class WxPageChat : Control {
         //      子节点按插入顺序自下而上排） ----
         Panel comp = Wx.Col("wxcomposer");
         comp.dock = 2;
+        // 引用条：点气泡菜单「引用」后出现在输入框上方（dock 2 的
+        // 子节点自下而上排：发送条 → 分隔线 → 输入框 → 引用条），
+        // 平时收起，随草稿显隐。
+        quoteBar = Wx.Row("wxquote");
+        quoteBar.dock = 2;
+        quoteBar.visible = false;
+        quoteLbl = Wx.Lbl("", "wxquotetext");
+        quoteLbl.dock = 5;
+        quoteBar.Add(quoteLbl);
+        Button quoteX = Wx.IconBtn("close");
+        quoteX.Tip = "取消引用";
+        quoteX.OnClick(() => { WxIm.DismissQuoteDraft(); });
+        quoteBar.Add(quoteX);
+        comp.Add(quoteBar);
         Panel tw = Wx.Col("wxtypewrap");
         tw.dock = 5;
         box = new TextArea("");
@@ -158,6 +211,8 @@ class WxPageChat : Control {
         chat.WithBubbleWidth(620);
         // 点气泡里的头像 = 弹发言人名片（原版同款交互）。
         chat.OnAvatarClick((idx) => { this.OpenMsgProfile(idx); });
+        // 右键气泡 = 复制 / 引用；「引用」把草稿交给桥，随下一条发送。
+        chat.OnBubbleMenu((idx, sel) => { this.OpenBubbleMenu(idx, sel); });
         this.Add(chat);
 
         this.Select(0);
@@ -167,6 +222,36 @@ class WxPageChat : Control {
     void Type(string t) {
         box.SetText(box.GetText() + t);
         { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    /// 引用条显隐（草稿由 WxIm 持有，这里只管画）。
+    void ShowQuoteBar(string who, string text) {
+        quoteLbl.Text = "引用 " + who + "：" + text;
+        quoteBar.visible = true;
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    void HideQuoteBar() {
+        quoteBar.visible = false;
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    /// 桥要的当前会话本体（引用草稿按消息下标取被引消息）。
+    WxSession CurrentSession() {
+        if (current < 0 || current >= data.Count) { return null; }
+        return data[current];
+    }
+
+    /// 气泡右键菜单：复制（选中部分或整条）+ 引用。菜单是即时模式
+    /// 的（ContextMenu.Render），挂在覆盖阶段末尾、按右键坐标锚定，
+    /// 与 IDE 外壳同一套画法；ctxOpen 跨帧持有开关状态。
+    void OpenBubbleMenu(int msgIndex, string selText) {
+        ctxMsg = msgIndex;
+        ctxText = selText;
+        ctxX = app.mouseX;
+        ctxY = app.mouseY;
+        ctxOpen = true;
+        app.RequestRedraw();
     }
 
     /// 弹出面板的显隐：再点同一个图标等于收起；互斥——开一个关
@@ -308,23 +393,76 @@ class WxPageChat : Control {
         chat.Reset();
         chat.Bind(s.msgs);
         chat.Invalidate();
+        shownCount = s.msgs.Count;
+        // 接了服务端的会话：拉全量消息流（服务端顺带把未读落账已读）。
+        WxIm.Open(s);
     }
 
-    /// 发送：把输入框里的正文追加到当前会话，并同步列表行上的摘要。
+    /// 发送：接了服务端的会话走 WxIm.Send（本地气泡 → /api/im/send →
+    /// 回执轮询；输入区上方有引用条时随带 replyTo）；纯示例行维持原来
+    /// 的本地追加。
     void Send() {
         string t = box.GetText();
         if (t == "") { return; }
         WxSession s = data[current];
-        ChatMessage m = ChatMessage.Create("user", t);
-        m.at = DateTime.UtcNow().ToUnixSeconds();
-        s.msgs.Add(m);
-        s.snippet = t;
-        s.time = "刚刚";
-        s.unread = 0;
+        if (s.peer.Length > 0) {
+            // 引用草稿挂着就按引用回复发送（草稿由 WxIm 持有并清掉）。
+            WxIm.SendWithDraft(s, t);
+        } else {
+            ChatMessage m = ChatMessage.Create("user", t);
+            m.at = DateTime.UtcNow().ToUnixSeconds();
+            s.msgs.Add(m);
+            s.snippet = t;
+            s.time = "刚刚";
+            s.unread = 0;
+            chat.Invalidate();
+        }
         box.SetText("");
-        chat.Invalidate();
         list.Refresh();
     }
+
+    /// 桥（WxIm）在数据并入后调：标题区/列表行跟新值走；当前会话的
+    /// 消息数变了才整体重绑（Reset 清滚动缓存，不重绑的话 ChatView
+    /// 还捏着旧的 List 引用——会话槽是复用的，对象换了内容）。
+    void OnDataChanged() {
+        if (current >= 0 && current < data.Count) {
+            WxSession s = data[current];
+            headName.Text = s.name;
+            if (s.group) {
+                headDesc.Text = "群聊 · " + Convert.ToString(s.people) + " 人";
+            } else {
+                headDesc.Text = "最后活跃 " + s.time;
+            }
+            if (s.msgs.Count != shownCount) {
+                shownCount = s.msgs.Count;
+                chat.Reset();
+                chat.Bind(s.msgs);
+            }
+            chat.Invalidate();
+        }
+        list.Refresh();
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    /// 当前会话已重绑时的消息条数（变了才 Reset+Bind，保滚动位置）。
+    int shownCount = 0 - 1;
+
+    /// 接桥（登录成功）：示例会话整批退场——登录是硬门，进了主窗口
+    /// 就只认服务端数据；残留的示例会话会把首屏聊天区画成别人的记录。
+    void BeginServerMode() {
+        data.Clear();
+        current = 0 - 1;
+        shownCount = 0 - 1;
+        chat.Reset();
+        chat.Bind(new List<ChatMessage>());
+        list.Refresh();
+    }
+
+    /// 桥要的当前会话下标（轮询判断"打开的会话是否正在看"）。
+    int CurrentIndex() { return current; }
+
+    /// 桥要的会话模型本体（WxIm.Use 与页共享同一份 List）。
+    List<WxSession> Model() { return data; }
 
     /// 绑定宿主 App，并接上「会话行拖出列表成独立窗口」手势。
     void UseDetach(App a) {
@@ -464,6 +602,48 @@ class WxPageContacts : Control {
     /// 宿主 App（「通讯录管理」要开子窗口）。
     void UseApp(App a) { this.app = a; }
 
+    /// 接服务端通讯录：把「联系人」节的内容换成 /api/im/contacts 的
+    /// 真实账号（示例六节保留——它们是外壳的一部分，聊天页才需要
+    /// "只认服务端"）。
+    List<WxContact> serverPeople;
+
+    /// 拉服务端联系人并重建「联系人」节。
+    void RefreshServerContacts() {
+        if (!WxNet.LoggedIn()) { return; }
+        WxNetReq req = WxNet.NewReq();
+        WxNet.Get(req, "contacts", () => {
+            if (!WxNet.OkOf(req)) { return; }
+            JsonValue d = WxNet.DataOf(req);
+            if (d == null) { return; }
+            JsonValue items = d.Get("contacts");
+            if (items == null) { return; }
+            this.ApplyContacts(items);
+        });
+    }
+
+    /// 用服务端账号重建「联系人」节：按名字首字母插字母分组头。
+    void ApplyContacts(JsonValue items) {
+        if (items.Count() == 0) { return; }
+        this.serverPeople = new List<WxContact>();
+        string lastHead = "";
+        for (int i = 0; i < items.Count(); i = i + 1) {
+            JsonValue o = items.At(i);
+            string nm = o.Str("name", "?");
+            // 首字按字符边界取：CJK 名字每字 3 字节，按字节切会切出
+            // 半个字（StyledText.Initial 这套边界规则与头像一致）。
+            string ini = StyledText.Initial(nm);
+            if (ini != lastHead) {
+                this.serverPeople.Add(WxContact.Header(ini));
+                lastHead = ini;
+            }
+            WxContact c = WxContact.Person(nm, ini, WxData.TintOf(i),
+                o.Str("id", ""), "", "", "同事",
+                "server-collab 账号", "服务端", "");
+            this.serverPeople.Add(c);
+        }
+        this.Rebuild();
+    }
+
     // ---- 左栏：折叠分组 ------------------------------------------------
 
     /// 写某节的展开状态（节行在 all 里，open 挂在行模型上）。
@@ -475,6 +655,8 @@ class WxPageContacts : Control {
     }
 
     /// 按展开状态重建可见行：节行永远在，内容行只跟展开的节走。
+    /// 「联系人」节（下标 5）接上服务端之后，该节的内容行换成真实
+    /// 账号——示例那两千多号人只是外壳的填充物。
     void Rebuild() {
         view.Clear();
         WxContact sec = null;
@@ -483,9 +665,19 @@ class WxPageContacts : Control {
             if (c.kind == 0) {
                 view.Add(c);
                 sec = c;
+                if (this.serverPeople != null && c.section == 5) {
+                    for (int j = 0; j < this.serverPeople.Count; j = j + 1) {
+                        WxContact sc = this.serverPeople[j];
+                        sc.open = c.open;
+                        if (c.open) { view.Add(sc); }
+                    }
+                }
                 continue;
             }
-            if (sec != null && sec.open) { view.Add(c); }
+            if (sec != null && sec.open) {
+                if (this.serverPeople != null && sec.section == 5) { continue; }
+                view.Add(c);
+            }
         }
         list.Bind(view);
         if (this.app != null) { this.app.RequestRedraw(); }

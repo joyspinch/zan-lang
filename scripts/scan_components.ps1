@@ -16,7 +16,7 @@
 #     recommended so JSON `type` and the class agree).
 #
 # A component whose interface is declared in a design document is written as a
-# `partial class X : Control` next to `X.zform`: the generator emits the
+# `partial class X : Control` next to `X.html`: the generator emits the
 # constructor (and Kind()) into the other half of the class, so the code-behind
 # holds only the logic and both requirements above are met by the pair.
 #
@@ -60,10 +60,10 @@ if (Test-Path $srcPath) {
                 $isPartial = $Matches[1] -ne ""
                 $name = $Matches[2]
                 # A component either derives from Control here, or is the
-                # code-behind half of a designed control: `X.zform` next to it
+                # code-behind half of a designed control: `X.html` next to it
                 # carries the `: Control` base, the constructor and Kind().
                 $designed = Test-Path -LiteralPath (
-                    [System.IO.Path]::ChangeExtension($f.FullName, ".zform"))
+                    [System.IO.Path]::ChangeExtension($f.FullName, ".html"))
                 $derives = $Matches[3] -match ':\s*Control\b'
                 if (-not $derives -and -not ($isPartial -and $designed)) {
                     $pending = $false
