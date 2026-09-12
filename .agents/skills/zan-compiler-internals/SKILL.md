@@ -382,8 +382,25 @@ description: zanc 编译器内部（parser/checker/irgen）的实测定式与坑
     不进种子（ZanGen 的 Main 整个在 `#if ZAN_GEN_MAIN` 里，Gen* 类全靠
     它引用）。
 - **用户同名类遮蔽**：用户自己 `class App` 时未限定 `App` 永远解析到用户
-  自己的，不拉 stdlib 同名文件；限定 `Gui.App` 仍拉。这是 stdlib 模板
-  （App/Window/Button 全是常见词）不级联的关键。
+  自己的，不拉 stdlib 同名文件。这是 stdlib 模板（App/Window/Button 全是
+  常见词）不级联的关键。**这条与 C# 同规则**（`class Panel` + 裸
+  `Panel.Column()` → C# CS0117 / Zan `'Panel' has no member 'Column'`）。
+- **限定名逃逸当前失效（A312，未修）——别信代码注释和 SPEC**：`main.c:1051`
+  与 `docs/SPEC.md:658` 都写「限定 `Gui.App` 仍拉」，实测**不拉**，且有两种
+  坏法：① 无同名用户类时 `Gui.App a = null;` 报 `undefined type 'App'`
+  （`Gui/App.zan` 被 `skip`，`ZAN_PULLIN_DEBUG=1` 可证；同程序
+  `ZAN_NO_PULLIN_FILTER=1` 才编过）；② 有同名用户类时 `Gui.App` **静默改绑
+  到用户类**——`class App{ static string Marker()=>"USER-CLASS"; }` +
+  `Gui.App.Marker()` 编译并打印 `USER-CLASS`。根因：seed 的 `chain` 在设置它
+  的同一轮被后置守卫 `main.c:1287` 清空（default 再清一次），`chain->ns_root`
+  分支（`main.c:1265`）恒不可达；限定名掉进 `nsresolve.c:363-372` 的
+  「未声明 → 归约成最后一段」回退，被用户类接住。C# 恰恰**能**用
+  `Lib.Panel.Column()` 逃出遮蔽，所以这是 Zan 独有的洞，不是"语言如此"。
+  - 判别性探针：**必须让用户类带一个 stdlib 类没有的成员**（`Marker()`），
+    再去调 `Gui.App.Marker()`。`pullin_qualified_escape` 只写
+    `Gui.App a = null; a == null`，改绑与正确解析**输出同为 `true`**，用例
+    恒真（vacuous）——这类"输出与错误行为同值"的断言是假绿，写 conformance
+    时先问一句"改绑/漏解析会不会也通过"。
 - 门控：`--emit-symbols` 恒全量（IDE 索引要完整 stdlib），`ZAN_NO_PULLIN_FILTER=1`
   回退旧行为，`ZAN_PULLIN_DEBUG=1` 打印每个文件的拉入原因（含命中名）。
 - 语义等价验证定式：同一程序 `ZAN_NO_PULLIN_FILTER=1` 开关两态编译运行
