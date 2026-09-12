@@ -46,6 +46,25 @@ class WorldObject {
     // (accessors DepPoseTicks/DepPoseSeq below read these)
     int infDeath = 1;    // the killing warhead's InfDeath (retail default
                          // Gunfire on the object; the warhead overwrites)
+    // How the object died, the reference's DeathType: Normal by default,
+    // Crush when a crusher ran it over. The crush path matters to the
+    // renderer (a crushed trooper leaves no corpse) and to the game
+    // (a crushed wall plays its own squish key instead of the die cry).
+    int deathType = 0;
+    // The crushing hull's rocking request, the reference's Vehicle.rocking:
+    // a vehicle that flattens a wall gets a brief tilt, its facing and
+    // intensity carried here for the renderer. rockFactor is in thousandths
+    // (500 = the reference's 0.5). rockTicks counts down; 0 = no rocking.
+    int rockTicks = 0;
+    int rockFacing = 0;
+    int rockFactor = 0;
+    // The live Crusher= flag, the reference's Techno.crusher: seeded from
+    // the type at spawn and flipped on by the veteran CRUSHER ability at
+    // promotion (VeteranTrait.handlePromotion).
+    bool crusher = false;
+    // A trooper's suppression pause after a near miss (the reference's
+    // isPanicked), which the scatter order also sets.
+    bool panicked = false;
 
     // Movement (units only): the planned route as cells, and how far along it
     // the unit has walked this frame.
@@ -157,6 +176,11 @@ class WorldObject {
         o.crateArmor = 1;
         o.crateFirepower = 1;
         o.crateSpeed = 1;
+        o.deathType = DeathType.Normal();
+        o.rockTicks = 0;
+        o.rockFacing = 0;
+        o.rockFactor = 0;
+        o.panicked = false;
         return o;
     }
 
@@ -202,6 +226,12 @@ class WorldObject {
         o.crateArmor = 1;
         o.crateFirepower = 1;
         o.crateSpeed = 1;
+        o.deathType = DeathType.Normal();
+        o.rockTicks = 0;
+        o.rockFacing = 0;
+        o.rockFactor = 0;
+        o.crusher = ut != null && ut.Crusher();
+        o.panicked = false;
         return o;
     }
 
@@ -255,7 +285,30 @@ class WorldObject {
                         : this.unitType.ProneAt(11);
     }
     int InfDeath() { return this.infDeath; }
-
+    void SetInfDeath(int d) { this.infDeath = d; }
+    int DeathType() { return this.deathType; }
+    void SetDeathType(int t) { this.deathType = t; }
+    bool Crusher() { return this.crusher; }
+    void SetCrusher(bool on) { this.crusher = on; }
+    bool Panicked() { return this.panicked; }
+    void SetPanicked(bool on) { this.panicked = on; }
+    /// <summary>Requests the crush rocking, the reference's
+    /// Vehicle.applyRocking: a hull already rocking keeps its remaining
+    /// ticks rather than restarting, and the run lasts ROCKING_TICKS. The
+    /// reference also exempts consideredAircraft; the port models no
+    /// aircraft yet, so that clause waits with them.</summary>
+    void ApplyRocking(int facing, int factor) {
+        if (this.rockTicks <= 0) { this.rockTicks = WorldObject.RockingTicks(); }
+        this.rockFacing = facing;
+        this.rockFactor = factor;
+    }
+    /// <summary>The reference's ROCKING_TICKS: how many ticks a rocking
+    /// hull takes to settle.</summary>
+    static int RockingTicks() { return 34; }
+    int RockTicks() { return this.rockTicks; }
+    int RockFacing() { return this.rockFacing; }
+    int RockFactor() { return this.rockFactor; }
+    void SetRockTicks(int t) { this.rockTicks = t; }
     /// <summary>Damage that also records which warhead is killing the
     /// object, so an infantry death can pick its art the way the
     /// reference's Warhead.inflictDamage does.</summary>
@@ -608,6 +661,18 @@ class ObjKind {
     static int Unit() { return 1; }
 }
 
+/// <summary>How an object died, the reference's DeathType enum. Normal is
+/// the default; Crush marks a run-over death (no corpse art, the squish
+/// sound instead of the die cry).</summary>
+class DeathType {
+    static int None() { return 0; }
+    static int Normal() { return 1; }
+    static int Demolish() { return 2; }
+    static int Crush() { return 3; }
+    static int Temporal() { return 4; }
+    static int Sink() { return 5; }
+}
+
 /// <summary>One unit archetype: the numbers a placed soldier fights with.
 /// Everything is built from the Rules (the RULES.INI values), so damage lands
 /// through the weapon's warhead against the target's armour instead of as a
@@ -673,6 +738,18 @@ class UnitType {
     // already holds the veteran union).
     List<int> veteranAbilities;
     List<int> eliteAbilities;
+    // The crush facts, copied off the def: Crusher= (this unit runs over
+    // crushable things under its tracks), Crushable= (this unit can be run
+    // over), CrushSound= (the sound.ini squish key, "" = unset) and Weight=
+    // (the rocking falloff a heavy hull uses on a crushed wall). `infantry`
+    // is the reference's ObjectType classification (membership in the
+    // install's [InfantryTypes]), which the corpse/death-art paths key off.
+    bool crusher;
+    bool crushable;
+    string crushSound;
+    int weight;
+    bool infantry;
+    int speedType;     // SpeedType: only Track/Hover hulls roll over things
 
     static UnitType Create(string reg, string label, int cost, int buildTime,
                            int hp, string shpName, int armor, Weapon primary,
@@ -718,6 +795,12 @@ class UnitType {
         t.dieSound = "";
         t.veteranAbilities = new List<int>();
         t.eliteAbilities = new List<int>();
+        t.crusher = false;
+        t.crushable = false;
+        t.crushSound = "";
+        t.weight = 1;
+        t.infantry = false;
+        t.speedType = SpeedType.Wheel();
         return t;
     }
 
@@ -745,6 +828,22 @@ class UnitType {
         this.veteranAbilities = vet;
         this.eliteAbilities = elite;
     }
+    bool Crusher() { return this.crusher; }
+    void SetCrusher(bool on) { this.crusher = on; }
+    bool Crushable() { return this.crushable; }
+    string CrushSound() { return this.crushSound; }
+    int Weight() { return this.weight; }
+    bool Infantry() { return this.infantry; }
+    int SpeedTypeValue() { return this.speedType; }
+    void SetCrushKeys(bool crusher, bool crushable, string crushSound,
+                      int weight, bool infantry) {
+        this.crusher = crusher;
+        this.crushable = crushable;
+        this.crushSound = crushSound;
+        this.weight = weight;
+        this.infantry = infantry;
+    }
+    void SetSpeedType(int st) { this.speedType = st; }
     bool Amphibious() { return this.amphibious; }
     string ShpName() { return this.shpName; }
     string TurretVxl() { return this.turretVxl; }
@@ -971,6 +1070,9 @@ class UnitCatalog {
             t.SetSoundKeys(d.CreateSound(), d.DeploySound(),
                            d.UndeploySound(), d.DieSound());
             t.SetVeteranAbilities(d.VeteranAbilities(), d.EliteAbilities());
+            t.SetCrushKeys(d.Crusher(), d.Crushable(), d.CrushSound(),
+                           d.Weight(), d.Infantry());
+            t.SetSpeedType(d.SpeedTypeValue());
             l.Add(t);
         }
         return l;
@@ -1041,6 +1143,9 @@ class UnitCatalog {
             t.SetNewTheater(d.NewTheater());
             t.SetSpeed(d.Speed() > 0 ? d.Speed() : d.Steps() * 4);
             t.SetSight(d.Sight());
+            t.SetCrushKeys(d.Crusher(), d.Crushable(), d.CrushSound(),
+                           d.Weight(), d.Infantry());
+            t.SetSpeedType(d.SpeedTypeValue());
             this.civTypes.Add(t);
         }
         return this.civTypes;
@@ -1110,6 +1215,9 @@ class StructureType {
     string slamSound;    // TechnoRules SlamSound=: the placement thud
     string dieSound;     // TechnoRules DieSound=: the death cry (falls back
                          // to the BuildingDieSound key when unset)
+    bool crushable;      // rules Crushable= (default no: buildings are run
+                         // over only when their section says so)
+    string crushSound;   // rules CrushSound=: the squish key when run over
 
     static StructureType Create(BuildingDef d) {
         StructureType t = new StructureType();
@@ -1139,6 +1247,8 @@ class StructureType {
         t.voices = d.Voices();
         t.slamSound = d.SlamSound();
         t.dieSound = d.DieSound();
+        t.crushable = d.Crushable();
+        t.crushSound = d.CrushSound();
         return t;
     }
 
@@ -1152,6 +1262,8 @@ class StructureType {
     TechnoVoices Voices() { return this.voices; }
     string SlamSound() { return this.slamSound; }
     string DieSound() { return this.dieSound; }
+    bool Crushable() { return this.crushable; }
+    string CrushSound() { return this.crushSound; }
     int FootprintW() { return this.footprintW; }
     int FootprintH() { return this.footprintH; }
     int Hp() { return this.hp; }
@@ -1860,8 +1972,21 @@ class World {
         if (gain <= 0) { return; }
         o.SetVeteranXp(o.VeteranXp() - gain * thresh);
         o.SetVeteranLevel(newLevel);
+        this.HandlePromotion(o);
         if (this.sndSink != null) {
             this.sndSink.PromoteFeedback(o.Side(), newLevel);
+        }
+    }
+
+    /// <summary>The ability effects a fresh rank grants, the reference's
+    /// handlePromotion. Only CRUSHER is live in this engine: the rest --
+    /// SELF_HEAL, CLOAK, EXPLODES, RADAR_INVISIBLE, SENSORS, FEARLESS, C4,
+    /// GUARD_AREA -- need systems still to migrate, and their abilities are
+    /// read straight off the veteran lists wherever they are consulted.</summary>
+    void HandlePromotion(WorldObject o) {
+        if (o == null || o.Kind() != ObjKind.Unit()) { return; }
+        if (this.HasVetAbility(o, VetAbility.Crusher()) && !o.Crusher()) {
+            o.SetCrusher(true);
         }
     }
 
@@ -1874,6 +1999,169 @@ class World {
         if (!this.Rules().InitialVeteran()) { return; }
         if (o == null || o.Kind() != ObjKind.Unit()) { return; }
         o.SetVeteranLevel(VetLevel.Elite());
+    }
+
+    // ---- crushing (the reference's MoveTrait crusher pass) -----------------
+
+    /// <summary>Whether `o` carries the Crusher= flag: the type's own key,
+    /// flipped on at promotion by the veteran CRUSHER ability. This is the
+    /// reference's `gameObject.crusher` -- the flag alone, with no
+    /// locomotion check. The tracked/hover class gate belongs to the
+    /// movement obstacle test (CanCrushInto), exactly where the reference
+    /// puts it.</summary>
+    bool HasCrusherFlag(WorldObject o) {
+        return o != null && o.Kind() == ObjKind.Unit() && o.Crusher();
+    }
+
+    /// <summary>Whether `o` may roll over crushable things: the Crusher=
+    /// flag and a locomotion class that rolls -- the reference's MoveTask
+    /// gate, `[SpeedType.Track, SpeedType.Hover].includes(speedType) &&
+    /// unit.crusher`. A wheeled vehicle is stopped by a sandbag line even
+    /// when a veteran ability hands it the flag.</summary>
+    bool IsCrusher(WorldObject o) {
+        if (o == null || o.Kind() != ObjKind.Unit() || o.UnitType() == null) {
+            return false;
+        }
+        if (!o.Crusher()) { return false; }
+        return SpeedType.CrusherClass(o.UnitType().SpeedTypeValue());
+    }
+
+    /// <summary>Whether a crusher driving onto (x,y) flattens `o`: the
+    /// reference's crush filter -- crushable, and either non-techno
+    /// scenery or a non-friendly (friendly units are never run over). A
+    /// paratrooper still under canopy is exempt in the reference; this
+    /// engine has no paradrop stance yet, so that clause waits with it.</summary>
+    bool CrushApplies(WorldObject crusher, WorldObject o) {
+        if (o == null || o.IsDead() || o == crusher) { return false; }
+        if (o.Kind() == ObjKind.Unit() && o.UnitType() != null) {
+            if (!o.UnitType().Crushable()) { return false; }
+        } else if (o.Kind() == ObjKind.Structure()) {
+            StructureType t = this.TypeOf(o);
+            if (t == null || !t.Crushable()) { return false; }
+        } else {
+            return false;
+        }
+        // areFriendly: same owner (or allied) things are spared, so only
+        // neutrals and enemies go under the tracks.
+        return !this.AreFriendly(crusher, o);
+    }
+
+    /// <summary>The reference's Game.areFriendly: same owner or allied.
+    /// This engine has no alliance graph yet, so same-side stands in --
+    /// the port's own areFriendly call sites all reduce to it.</summary>
+    bool AreFriendly(WorldObject a, WorldObject b) {
+        if (a == null || b == null) { return false; }
+        return a.Side() == b.Side();
+    }
+
+    /// <summary>Whether the hull at `o` may drive into the occupied or
+    /// walled cell (nx,ny) instead of queueing behind it -- the reference's
+    /// MoveTask obstacle pass: a crushable obstacle is passable when the
+    /// unit is a crusher and the thing is not friendly (or is scenery).</summary>
+    bool CanCrushInto(WorldObject o, int nx, int ny) {
+        if (!this.IsCrusher(o)) { return false; }
+        // A wall piece the overlay rules call Crushable= (sandbags, the
+        // fences) flattens; the concrete walls stop even a crusher.
+        if (this.IsWallCell(nx, ny)) {
+            return this.Rules().OverlayCrushable(this.WallOvAt(nx, ny));
+        }
+        int occ = this.occupancy[this.CellSlot(nx, ny)];
+        if (occ == 0) { return false; }
+        WorldObject e = this.objects[occ - 1];
+        if (e == null || e.IsDead()) { return false; }
+        if (e.Kind() == ObjKind.Structure()) { return false; }
+        return this.CrushApplies(o, e);
+    }
+
+    /// <summary>Runs the crusher pass over the cell the hull just entered,
+    /// the reference's MoveTrait tile-change block: every crushable thing
+    /// on the tile is destroyed with DeathType.Crush -- infantry leave no
+    /// corpse (their death art is skipped) and the hull that flattens a
+    /// wall takes the rocking tilt. Friendly units and the hull itself are
+    /// exempt. The pass keys off the flag alone, the reference's
+    /// `if (gameObject.crusher)`: the class gate lives in the movement
+    /// test that decides whether the hull may enter at all.</summary>
+    void CrushOnCell(WorldObject crusher, int x, int y) {
+        if (!this.HasCrusherFlag(crusher)) { return; }
+        int i = 0;
+        while (i < this.objects.Count) {
+            WorldObject o = this.objects[i];
+            if (o == null || o.X() != x || o.Y() != y) { i = i + 1; continue; }
+            if (!this.CrushApplies(crusher, o)) { i = i + 1; continue; }
+            if (o.Kind() == ObjKind.Unit() && o.UnitType() != null) {
+                o.SetInfDeath(0);   // no death art: the corpse never plays
+            }
+            o.SetDeathType(DeathType.Crush());
+            this.SndCrushFeedback(o);
+            this.AwardKillXP(crusher, o);
+            o.SetHp(0);
+            i = i + 1;
+        }
+        // The wall piece under the tracks, if any: a vehicle flattening a
+        // crushable wall rocks over the debris, the reference's
+        // `applyRocking(0, 0.5)` on the overlay branch.
+        if (this.IsWallCell(x, y)) {
+            this.CrushWallAt(crusher, x, y);
+        }
+    }
+
+    /// <summary>The squish a crushed thing plays: its own CrushSound= key
+    /// when the section names one (infantry ship InfantrySquish). The
+    /// reference reads the key into ObjectRules but never plays it -- the
+    /// retail game does, so the port routes it through the sound sink and
+    /// the gap is recorded in the README rather than silently dropped.</summary>
+    void SndCrushFeedback(WorldObject victim) {
+        if (this.sndSink == null) { return; }
+        string key = null;
+        if (victim.Kind() == ObjKind.Unit() && victim.UnitType() != null) {
+            key = victim.UnitType().CrushSound();
+        } else if (victim.Kind() == ObjKind.Structure()) {
+            StructureType t = this.TypeOf(victim);
+            if (t != null) { key = t.CrushSound(); }
+        }
+        if (key == null || key.Length == 0) { return; }
+        this.sndSink.CrushSoundFeedback(key, victim.Side(), victim.X(),
+                                        victim.Y());
+    }
+
+    /// <summary>Flattens a wall piece under the hull: the reference's crush
+    /// pass treats a crushable wall overlay like any other victim -- it is
+    /// destroyed outright (no linked half-damage to its neighbours, which
+    /// only a warhead hit spreads) and the vehicle that ran it over rocks.
+    /// The reference's `if (this.bodyVxlBuilder)` gate is a voxel-model
+    /// check; the rocking request is stored on the hull either way and the
+    /// render layer draws it for the models it can tilt.</summary>
+    void CrushWallAt(WorldObject crusher, int x, int y) {
+        int ov = this.WallOvAt(x, y);
+        if (ov < 0) { return; }
+        if (!this.Rules().OverlayCrushable(ov)) { return; }
+        if (this.sndSink != null) {
+            string key = this.Rules().OverlayCrushSound(ov);
+            if (key != null && key.Length > 0) {
+                this.sndSink.CrushSoundFeedback(key, crusher.Side(), x, y);
+            }
+        }
+        // The hull tilts over the debris, the reference's
+        // `applyRocking(0, 0.5)` -- factor 500 in thousandths.
+        crusher.ApplyRocking(0, 500);
+        this.BreakWallAt(x, y);
+    }
+
+    /// <summary>Takes a wall piece down without the linked half-damage a
+    /// warhead hit spreads (WallTrait's onDamage only runs for damage; a
+    /// crush destroys the overlay outright). Neighbours rebuild their
+    /// connection faces around the gap.</summary>
+    void BreakWallAt(int x, int y) {
+        if (!this.IsWallCell(x, y)) { return; }
+        int slot = this.CellSlot(x, y);
+        this.wallOv[slot] = 0 - 1;
+        this.wallHp[slot] = 0;
+        this.wallData[slot] = 0;
+        this.oreVersion = this.oreVersion + 1;
+        this.ReconnectWallAt(x, y - 1);
+        this.ReconnectWallAt(x + 1, y);
+        this.ReconnectWallAt(x, y + 1);
+        this.ReconnectWallAt(x - 1, y);
     }
 
     // ---- veterancy crates (grantVeteran/Armor/Firepower/SpeedPowerup) ------
@@ -1912,7 +2200,10 @@ class World {
             int cap = this.Rules().VeteranCap();
             int nl = o.VeteranLevel() + levels;
             if (nl > cap) { nl = cap; }
-            if (nl > o.VeteranLevel()) { o.SetVeteranLevel(nl); }
+            if (nl > o.VeteranLevel()) {
+                o.SetVeteranLevel(nl);
+                this.HandlePromotion(o);
+            }
         }
     }
 
@@ -4120,6 +4411,16 @@ class World {
         return this.objects.Count - 1;
     }
 
+    /// <summary>Moves an existing object onto a cell without the occupancy
+    /// bookkeeping the spawn paths do -- the reference's tile occupation
+    /// holds several objects on one tile (a hull and the infantry under
+    /// it), which is exactly the state the crush pass reads. Used by the
+    /// probes to stage that overlap.</summary>
+    void PlaceObjectAt(WorldObject o, int x, int y) {
+        if (o == null || !this.InBounds(x, y)) { return; }
+        o.SetCell(x, y);
+    }
+
     /// <summary>Enqueues a unit of unitId on a structure's production queue.
     /// Returns false when the index is not a structure or the unit id is not
     /// one the structure can train. The money is the caller's business.</summary>
@@ -6017,6 +6318,9 @@ class World {
             if (o.Kind() != ObjKind.Unit()) { continue; }
             if (o.fireTicks > 0) { o.fireTicks = o.fireTicks - 1; }
             if (o.poseTicks > 0) { o.poseTicks = o.poseTicks - 1; }
+            // The rocking settles, the reference's Vehicle.update: the
+            // counter runs down and the request dies with it.
+            if (o.rockTicks > 0) { o.SetRockTicks(o.RockTicks() - 1); }
             if (o.deposeTicks > 0) {
                 o.deposeTicks = o.deposeTicks - 1;
                 // The sit-down block ran out: the emplacement stands.
@@ -6048,8 +6352,16 @@ class World {
                 bank = bank - Rules.CellMoveCost();
                 int nx = o.StepCellX();
                 int ny = o.StepCellY();
-                if (nx < 0 || this.occupancy[this.CellSlot(nx, ny)] != 0
-                 || this.IsWallCell(nx, ny)) { break; }
+                if (nx < 0) { break; }
+                // The step gate, the reference's obstacle pass: a cell held
+                // by a unit stops the column, a wall stops it -- unless the
+                // hull is a crusher, which rolls straight over a crushable
+                // blocker (a wall it may flatten, an enemy it may run down)
+                // instead of queueing behind it.
+                bool crushStep = this.CanCrushInto(o, nx, ny);
+                if (this.occupancy[this.CellSlot(nx, ny)] != 0
+                 && !crushStep) { break; }
+                if (this.IsWallCell(nx, ny) && !crushStep) { break; }
                 int oldX = o.X();
                 int oldY = o.Y();
                 this.occupancy[this.CellSlot(oldX, oldY)] = 0;
@@ -6066,6 +6378,9 @@ class World {
                     o.SetTurretFacing(stepFacing);
                 }
                 this.occupancy[this.CellSlot(o.X(), o.Y())] = i + 1;
+                // The hull is in the new cell: the crush pass runs before
+                // the crate hook, the reference's onTileChange order.
+                this.CrushOnCell(o, o.X(), o.Y());
                 // A crate underfoot is consumed by the walker, the
                 // reference's move hook into pickupCrate.
                 this.PickupCrateAt(o);
@@ -6540,14 +6855,21 @@ class World {
             if (!o.IsDead()) { i = i + 1; continue; }
             this.SndDeathFeedback(o);
             // A trooper does not pop: the reference plays his death art
-            // (sequence or anim) and leaves the corpse.
+            // (sequence or anim) and leaves the corpse. A crushed one
+            // leaves nothing at all -- the reference's renderer skips the
+            // death sequence for DeathType.Crush, and InfDeathType.None
+            // finds no death anim either.
             if (o.Kind() == ObjKind.Unit() && o.UnitType() != null
-             && o.UnitType().ShpName().Length > 0) {
+             && o.UnitType().ShpName().Length > 0
+             && o.DeathType() != DeathType.Crush()) {
                 this.SpawnInfantryDeath(o, i);
-            } else {
+            } else if (o.DeathType() != DeathType.Crush()) {
                 this.SpawnExplosion(o.X(), o.Y());
             }
-            // Free the unit's cell or the structure's whole footprint.
+            // Free the unit's cell or the structure's whole footprint. The
+            // cell is only cleared when this object still holds it: a
+            // crushed victim shares its tile with the hull that ran it
+            // over, and the occupancy slot belongs to the crusher.
             if (o.Kind() == ObjKind.Structure()) {
                 StructureType t = this.TypeOf(o);
                 for (int dy = 0; dy < t.FootprintH(); dy = dy + 1) {
@@ -6555,7 +6877,7 @@ class World {
                         this.occupancy[this.CellSlot(o.X() + dx, o.Y() + dy)] = 0;
                     }
                 }
-            } else {
+            } else if (this.occupancy[this.CellSlot(o.X(), o.Y())] == i + 1) {
                 this.occupancy[this.CellSlot(o.X(), o.Y())] = 0;
             }
             if (this.selectedIndex == i) {

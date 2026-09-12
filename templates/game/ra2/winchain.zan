@@ -1352,6 +1352,205 @@ class WinChainTest {
             Report("spawn default rookie",
                    v4.VeteranLevel() == 0 ? 1 : 0, 1);
         }
+        // 碾压:规则键解析(Crusher/Crushable 默认/CrushSound/Weight/
+        // SpeedType 默认与覆盖)、门控(Track/Hover)、友军豁免、进格轧杀
+        // (DeathType.Crush + InfDeath 0 + 尸体不留)、墙的碾压(可碾墙倒
+        // 下不带连锁半伤 + 车辆 rocking 请求)与老兵 CRUSHER 能力的授予。
+        Rules crushRules = Rules.Default();
+        UnitDef crushMtnk = crushRules.UnitDefNamed("MTNK");
+        UnitDef crushFv = crushRules.UnitDefNamed("FV");
+        UnitDef crushGi = crushRules.UnitDefNamed("E1");
+        UnitDef crushGgi = crushRules.UnitDefNamed("GGI");
+        Report("rules mtnk crusher",
+               crushMtnk != null && crushMtnk.Crusher() ? 1 : 0, 1);
+        Report("rules mtnk track default",
+               crushMtnk != null
+               && crushMtnk.SpeedTypeValue() == SpeedType.Track() ? 1 : 0, 1);
+        Report("rules fv wheel no crusher",
+               crushFv != null && !crushFv.Crusher()
+               && crushFv.SpeedTypeValue() == SpeedType.Wheel() ? 1 : 0, 1);
+        Report("rules gi crushable default",
+               crushGi != null && crushGi.Crushable() ? 1 : 0, 1);
+        Report("rules gi squish key",
+               crushGi != null && crushGi.CrushSound() == "InfantrySquish"
+                   ? 1 : 0, 1);
+        Report("rules ggi not crushable",
+               crushGgi != null && !crushGgi.Crushable() ? 1 : 0, 1);
+        // INI 解析:SpeedType= 覆盖默认,Crusher=no 关掉,Track 之外的
+        // 滚动类(Hover)也放行,Hover 是碾得动的。
+        Rules crushIniRules = Rules.Default();
+        crushIniRules.ApplyIni(IniParser.Parse(
+            "[General]\nVeteranRatio=10\n"
+            + "[E1]\nCrusher=yes\nSpeedType=Hover\nCrushable=no\n"
+            + "Weight=3.5\n"));
+        UnitDef iniGi = crushIniRules.UnitDefNamed("E1");
+        Report("ini crusher yes",
+               iniGi != null && iniGi.Crusher() ? 1 : 0, 1);
+        Report("ini speedtype override",
+               iniGi != null && iniGi.SpeedTypeValue() == SpeedType.Hover()
+                   ? 1 : 0, 1);
+        Report("ini crushable no",
+               iniGi != null && !iniGi.Crushable() ? 1 : 0, 1);
+        Report("ini weight parsed",
+               iniGi != null && iniGi.Weight() == 3 ? 1 : 0, 1);
+        // 运行时:一座 20x20 的平地世界。把灰熊(MTNK,履带+碾压)和一辆
+        // 多功能车(FV,轮式)摆上场,验门控与轧杀。
+        Rules crushWorldRules = Rules.Default();
+        World crushWorld = World.Create(
+            MapFile.Parse("[Map]\nSize=0,0,20,20\nLocalSize=0,0,20,20\n")
+                .Terrain(),
+            StructureCatalog.CreateWith(crushWorldRules),
+            UnitCatalog.CreateWith(crushWorldRules));
+        int mtnkId = crushWorld.Units().IdOfReg(crushWorld, 0, "MTNK");
+        int fvId = crushWorld.Units().IdOfReg(crushWorld, 0, "FV");
+        int e1Id = crushWorld.Units().IdOfReg(crushWorld, 0, "E1");
+        int e2Id = crushWorld.Units().IdOfReg(crushWorld, 1, "E2");
+        Report("crush units present",
+               mtnkId >= 0 && fvId >= 0 && e1Id >= 0 && e2Id >= 0 ? 1 : 0, 1);
+        if (mtnkId >= 0 && fvId >= 0 && e1Id >= 0 && e2Id >= 0) {
+            WorldObject tank = crushWorld.SpawnUnit(0, mtnkId, 5, 5) >= 0
+                ? crushWorld.ObjectAt(crushWorld.ObjectCount() - 1) : null;
+            WorldObject fv = crushWorld.SpawnUnit(0, fvId, 5, 8) >= 0
+                ? crushWorld.ObjectAt(crushWorld.ObjectCount() - 1) : null;
+            Report("tank is crusher",
+                   crushWorld.IsCrusher(tank) ? 1 : 0, 1);
+            Report("fv not crusher",
+                   crushWorld.IsCrusher(fv) ? 0 : 1, 1);
+            // 敌方步兵先落在旁边的空格,再走位到坦克格上(直接落在占用格
+            // 会被 SpawnUnit 拒绝,拿到的会是另一个对象)。
+            WorldObject prey = crushWorld.SpawnUnit(1, e2Id, 5, 6) >= 0
+                ? crushWorld.ObjectAt(crushWorld.ObjectCount() - 1) : null;
+            WorldObject pal = crushWorld.SpawnUnit(0, e1Id, 5, 7) >= 0
+                ? crushWorld.ObjectAt(crushWorld.ObjectCount() - 1) : null;
+            Report("prey crushable",
+                   crushWorld.CrushApplies(tank, prey) ? 1 : 0, 1);
+            // 友军豁免:同一屋的兵不进轧杀集合。
+            Report("friendly spared",
+                   crushWorld.CrushApplies(tank, pal) ? 0 : 1, 1);
+            // 走位到同一格:进格轧杀读的是格子,不是对象状态。
+            crushWorld.PlaceObjectAt(prey, 5, 5);
+            crushWorld.PlaceObjectAt(pal, 5, 5);
+            crushWorld.CrushOnCell(tank, 5, 5);
+            Report("crush kills",
+                   prey.Hp() == 0 ? 1 : 0, 1);
+            Report("crush death type",
+                   prey.DeathType() == DeathType.Crush() ? 1 : 0, 1);
+            Report("crush infdeath none",
+                   prey.InfDeath() == 0 ? 1 : 0, 1);
+            Report("friendly survives",
+                   pal.Hp() > 0 ? 1 : 0, 1);
+            // 轮式车进不了有人的格子:CanCrushInto 对 FV 恒假。
+            Report("fv cannot crush into",
+                   crushWorld.CanCrushInto(fv, 5, 5) ? 0 : 1, 1);
+            // 轧杀进账:坦克击杀敌方步兵,拿到 cost * (0+1) 的经验。
+            int mtnkXp = tank.VeteranXp();
+            int giCost = prey.UnitType() != null ? prey.UnitType().Cost() : 0;
+            Report("crush awards xp",
+                   mtnkXp == giCost ? 1 : 0, 1);
+            // 墙:先摆一排三格沙袋(可碾),坦克碾中段 -> 该格倒下、
+            // 邻格不被连锁半伤带走(WallTrait 的半伤只走弹伤路径),
+            // 坦克拿到 rocking 请求。
+            Rules wr = crushWorld.Rules();
+            int sandIdx = 0 - 1;
+            for (int i = 0; i < wr.OverlayTypeCount(); i = i + 1) {
+                if (wr.OverlayName(i) == "GASAND") { sandIdx = i; break; }
+            }
+            Report("sandbag overlay present", sandIdx >= 0 ? 1 : 0, 1);
+            if (sandIdx >= 0) {
+                Report("sandbag crushable",
+                       wr.OverlayCrushable(sandIdx) ? 1 : 0, 1);
+                Report("sandbag squish key",
+                       wr.OverlayCrushSound(sandIdx) == "WallCrushSandbag"
+                           ? 1 : 0, 1);
+                crushWorld.SetWall(8, 8, sandIdx);
+                crushWorld.SetWall(9, 8, sandIdx);
+                crushWorld.SetWall(10, 8, sandIdx);
+                int beforeHp9 = crushWorld.WallHpAt(9, 8);
+                tank.ApplyRocking(0, 500);
+                Report("rocking armed",
+                       tank.RockTicks() == WorldObject.RockingTicks() ? 1 : 0,
+                       1);
+                crushWorld.CrushOnCell(tank, 9, 8);
+                Report("wall crushed",
+                       crushWorld.WallOvAt(9, 8) < 0 ? 1 : 0, 1);
+                Report("wall neighbours intact",
+                       crushWorld.WallHpAt(8, 8) == beforeHp9
+                       && crushWorld.WallHpAt(10, 8) == beforeHp9 ? 1 : 0, 1);
+                Report("wall neighbours reconnect",
+                       crushWorld.WallDataAt(8, 8) == 0
+                       && crushWorld.WallDataAt(10, 8) == 0 ? 1 : 0, 1);
+            }
+            // 混凝土墙不可碾:GAWALL 的 Crushable= 缺省为 no。
+            int concIdx = 0 - 1;
+            for (int i = 0; i < wr.OverlayTypeCount(); i = i + 1) {
+                if (wr.OverlayName(i) == "GAWALL") { concIdx = i; break; }
+            }
+            Report("concrete wall not crushable",
+                   concIdx >= 0 && !wr.OverlayCrushable(concIdx) ? 1 : 0, 1);
+            if (concIdx >= 0) {
+                crushWorld.SetWall(12, 12, concIdx);
+                crushWorld.CrushOnCell(tank, 12, 12);
+                Report("concrete wall stands",
+                       crushWorld.WallOvAt(12, 12) >= 0 ? 1 : 0, 1);
+                Report("concrete blocks step",
+                       crushWorld.CanCrushInto(tank, 12, 12) ? 0 : 1, 1);
+            }
+            // 老兵 CRUSHER 能力:换一个规则世界,让 FV 的精英能力表带上
+            // CRUSHER,晋级后 crusher 标志翻起 —— 参考的
+            // VeteranTrait.handlePromotion。FV 是轮式,能力翻起的标志
+            // 仍被 SpeedType 门挡住(IsCrusher 要求 Track/Hover)。
+            Rules promoRules = Rules.Default();
+            promoRules.ApplyIni(IniParser.Parse(
+                "[General]\nVeteranRatio=10\n"
+                + "[FV]\nEliteAbilities=CRUSHER\n"));
+            World promoWorld = World.Create(
+                MapFile.Parse("[Map]\nSize=0,0,20,20\nLocalSize=0,0,20,20\n")
+                    .Terrain(),
+                StructureCatalog.CreateWith(promoRules),
+                UnitCatalog.CreateWith(promoRules));
+            int promoFv = promoWorld.Units().IdOfReg(promoWorld, 0, "FV");
+            WorldObject pv = null;
+            if (promoFv >= 0 && promoWorld.SpawnUnit(0, promoFv, 4, 4) >= 0) {
+                pv = promoWorld.ObjectAt(promoWorld.ObjectCount() - 1);
+            }
+            if (pv != null) {
+                Report("promotion flag off at rookie",
+                       pv.Crusher() ? 0 : 1, 1);
+                pv.SetVeteranLevel(VetLevel.Elite());
+                promoWorld.HandlePromotion(pv);
+                Report("promotion grants crusher",
+                       pv.Crusher() ? 1 : 0, 1);
+                Report("promoted wheel still gated",
+                       promoWorld.IsCrusher(pv) ? 0 : 1, 1);
+            }
+            // 履带车走同一条授予路径:把 MTNK 的精英能力也带上 CRUSHER,
+            // 它本来就是 crusher,晋级后仍成立(幂等)。
+            int promoMtnk = promoWorld.Units().IdOfReg(promoWorld, 0, "MTNK");
+            WorldObject pm = null;
+            if (promoMtnk >= 0
+             && promoWorld.SpawnUnit(0, promoMtnk, 6, 6) >= 0) {
+                pm = promoWorld.ObjectAt(promoWorld.ObjectCount() - 1);
+            }
+            if (pm != null) {
+                Report("stock mtnk crusher",
+                       promoWorld.IsCrusher(pm) ? 1 : 0, 1);
+            }
+            // 被轧死的单位在 RemoveDead 后从场上消失,而坦克还在。猎物在
+            // 轧杀那一刻 Hp 归零,但收尸发生在下一次 Tick 的 RemoveDead
+            // ——所以先量场上人数,再 tick,再量。
+            int aliveBefore = crushWorld.ObjectCount();
+            // rocking 的衰减:逻辑 tick 递减;同一次 tick 顺手收走尸体。
+            tank.SetRockTicks(2);
+            crushWorld.Tick();
+            Report("rocking decays",
+                   tank.RockTicks() == 1 ? 1 : 0, 1);
+            Report("crushed removed",
+                   crushWorld.ObjectCount() < aliveBefore ? 1 : 0, 1);
+            Report("crusher survives cleanup",
+                   tank.Hp() > 0 ? 1 : 0, 1);
+            Report("crusher cell kept",
+                   crushWorld.OccupantAt(5, 5) >= 0 ? 1 : 0, 1);
+        }
         // 真实安装的表状态:本机 rip 没有音频表,引擎必须以空表静音装载
         // 而不是崩。表数打印出来,有表/无表都算通过。
         string instDir = "data";

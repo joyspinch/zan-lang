@@ -350,6 +350,27 @@ class UnitDef {
     List<int> veteranAbilities;
     List<int> eliteAbilities;
 
+    // The crush facts, the reference's TechnoRules/ObjectRules reads:
+    // Crusher= (this unit runs over crushable things it drives across,
+    // the Apocalypse and the miners; default no), Crushable= (this unit
+    // can be run over -- infantry default yes, everything else no),
+    // CrushSound= (the sound.ini key the squish plays) and Weight= (the
+    // rocking falloff a heavy hull uses when it crushes a wall).
+    bool crusher;
+    bool crushable;
+    string crushSound;
+    int weight;
+    // The reference's ObjectType classification, which the crushable
+    // default keys off: membership in the install's [InfantryTypes] list.
+    // The art extension is NOT the test (the terror drone is a vehicle
+    // drawn with an SHP), so the flag is carried explicitly.
+    bool infantry;
+    // The locomotion class (SpeedType=), the reference's TechnoRules
+    // read: default Foot for infantry, Track for a crusher vehicle, Wheel
+    // for any other vehicle. Only Track/Hover hulls roll over crushable
+    // things, so the default matters to the crush gate.
+    int speedType;
+
     static UnitDef Create(string reg, string label, int cost, int hp,
                           int speed, int armor, Weapon primary,
                           string producer, int sideMask, string shp) {
@@ -384,6 +405,12 @@ class UnitDef {
         d.dieSound = "";
         d.veteranAbilities = new List<int>();
         d.eliteAbilities = new List<int>();
+        d.crusher = false;
+        d.crushable = false;
+        d.crushSound = "";
+        d.weight = 1;
+        d.infantry = false;
+        d.speedType = SpeedType.Wheel();
         return d;
     }
 
@@ -445,6 +472,61 @@ class UnitDef {
                     this.eliteAbilities.Add(extra[i]);
                 }
             }
+        }
+    }
+
+    bool Crusher() { return this.crusher; }
+    bool Crushable() { return this.crushable; }
+    string CrushSound() { return this.crushSound; }
+    int Weight() { return this.weight; }
+    bool Infantry() { return this.infantry; }
+    void SetInfantry(bool on) { this.infantry = on; }
+    int SpeedTypeValue() { return this.speedType; }
+    void SetSpeedType(int st) { this.speedType = st; }
+
+    /// <summary>States the crush facts directly, for the built-in ruleset
+    /// (which carries the shipped values with no install to read them
+    /// from). The INI path is ReadCrushKeys.</summary>
+    void SetCrushKeys(bool crusher, bool crushable, string crushSound,
+                      int weight, bool infantry) {
+        this.crusher = crusher;
+        this.crushable = crushable;
+        this.crushSound = crushSound;
+        this.weight = weight < 1 ? 1 : weight;
+        this.infantry = infantry;
+        this.speedType = infantry ? SpeedType.Foot()
+                       : crusher ? SpeedType.Track() : SpeedType.Wheel();
+    }
+
+    /// <summary>The crush keys off the unit's own rules section, the
+    /// reference's ObjectRules/TechnoRules reads: Crusher= (default no),
+    /// Crushable= (default yes for infantry -- the type the caller
+    /// declares -- and no for everything else), CrushSound= (a sound.ini
+    /// key, empty = unset) and Weight= (default 1, the rocking falloff a
+    /// heavy hull uses on a crushed wall).</summary>
+    void ReadCrushKeys(IniSection s, bool isInfantry) {
+        string cr = s.Get("Crusher");
+        if (cr.Length > 0) { this.crusher = Rules.YesNo(cr); }
+        string ca = s.Get("Crushable");
+        if (ca.Length > 0) {
+            this.crushable = Rules.YesNo(ca);
+        } else {
+            this.crushable = isInfantry;
+        }
+        this.crushSound = s.Get("CrushSound");
+        if (s.Contains("Weight")) {
+            this.weight = Rules.LeadingInt(s.Get("Weight"));
+            if (this.weight <= 0) { this.weight = 1; }
+        }
+        // The locomotion default, the reference's TechnoRules: infantry
+        // walk, a crusher vehicle rides tracks, any other vehicle rolls on
+        // wheels; SpeedType= overrides.
+        this.speedType = isInfantry ? SpeedType.Foot()
+                       : this.crusher ? SpeedType.Track() : SpeedType.Wheel();
+        string st = s.Get("SpeedType");
+        if (st.Length > 0) {
+            int parsed = SpeedType.Parse(st);
+            if (parsed >= 0) { this.speedType = parsed; }
         }
     }
     int Role() { return this.role; }
@@ -658,6 +740,43 @@ class UnitRole {
     static int Harvester() { return 3; }  // mines ore, unloads at a refinery
 }
 
+/// <summary>The locomotion class, the reference's SpeedType enum. The crush
+/// gate keys off Track and Hover: only those two hull types roll over a
+/// crushable thing (a wheeled vehicle is stopped by a sandbag line). The
+/// default per object type is the reference's TechnoRules default --
+/// aircraft Winged, a crusher vehicle Track, any other vehicle Wheel,
+/// infantry Foot.</summary>
+class SpeedType {
+    static int Foot() { return 0; }
+    static int Track() { return 1; }
+    static int Wheel() { return 2; }
+    static int Hover() { return 3; }
+    static int Float() { return 4; }
+    static int FloatBeach() { return 5; }
+    static int Amphibious() { return 6; }
+    static int Winged() { return 7; }
+
+    /// <summary>One SpeedType= name off a rules section, -1 when unknown.</summary>
+    static int Parse(string name) {
+        if (name == null) { return 0 - 1; }
+        if (SndSpecText.SameWord(name, "Foot")) { return Foot(); }
+        if (SndSpecText.SameWord(name, "Track")) { return Track(); }
+        if (SndSpecText.SameWord(name, "Wheel")) { return Wheel(); }
+        if (SndSpecText.SameWord(name, "Hover")) { return Hover(); }
+        if (SndSpecText.SameWord(name, "Float")) { return Float(); }
+        if (SndSpecText.SameWord(name, "FloatBeach")) { return FloatBeach(); }
+        if (SndSpecText.SameWord(name, "Amphibious")) { return Amphibious(); }
+        if (SndSpecText.SameWord(name, "Winged")) { return Winged(); }
+        return 0 - 1;
+    }
+
+    /// <summary>Whether this locomotion class rolls over crushable things,
+    /// the reference's [Track, Hover].includes(speedType).</summary>
+    static bool CrusherClass(int st) {
+        return st == Track() || st == Hover();
+    }
+}
+
 /// <summary>The veterancy levels, the reference's VeteranLevel enum.</summary>
 class VetLevel {
     static int None() { return 0; }
@@ -767,6 +886,23 @@ class BuildingDef {
     // before it hands out a replacement MCV.
     bool conYard;
 
+    // The crush facts, the reference's ObjectRules reads applied to the
+    // building list: Crushable= (default no -- only the type declares it)
+    // and CrushSound=. Buildings carry no Crusher= (they never drive).
+    bool crushable;
+    string crushSound;
+
+    /// <summary>The crush keys off the building's own rules section, the
+    /// reference's ObjectRules reads. Unlike infantry the default is no:
+    /// a building is run over only when its section says Crushable=yes.</summary>
+    void ReadCrushKeys(IniSection s) {
+        string ca = s.Get("Crushable");
+        if (ca.Length > 0) { this.crushable = Rules.YesNo(ca); }
+        this.crushSound = s.Get("CrushSound");
+    }
+    bool Crushable() { return this.crushable; }
+    string CrushSound() { return this.crushSound; }
+
     static BuildingDef Create(string reg, string label, string shp, int fw,
                               int fh, int hp, int cost, int power, int drain,
                               int armor, int sideMask) {
@@ -787,6 +923,8 @@ class BuildingDef {
         d.waterBound = false;
         d.sight = 1;
         d.conYard = false;
+        d.crushable = false;
+        d.crushSound = "";
         d.sideMask = sideMask;
         d.prereq = new List<string>();
         d.artKey = reg;
@@ -1072,7 +1210,40 @@ class Rules {
         r.buildings = new List<BuildingDef>();
         r.civs = new List<BuildingDef>();
         r.civUnits = new List<UnitDef>();
-        r.overlayTypes = new List<string>();
+        // The overlay type table, the shipped [OverlayTypes] list transcribed
+        // 1:1. The map's OverlayPack bytes index this list directly, so the
+        // built-in table has to match the retail install key for key: the
+        // gaps in the shipped numbering (40, 41, 183) are the DUMMY fillers
+        // below, which is why GASAND sits at 0, GAWALL at 2, NAWALL at 26,
+        // CAFNCB at 206 and CAFNCP at 244 -- the indices the wall and bridge
+        // code below already hardcodes. An install's own rules.ini overwrites
+        // this list wholesale (see ApplyIni).
+        r.overlayTypes = Rules.Csv(
+            "GASAND,CYCL,GAWALL,BARB,WOOD,DUMMY,DUMMY2,DUMMY3,DUMMY4,DUMMY5,"
+            + "DUMMY6,DUMMY7,DUMMY8,DUMMY9,DUMMY10,DUMMY11,DUMMY12,V16,V17,V18,"
+            + "DUMMY13,DUMMY14,FENC,DUMMY15,BRIDGE1,BRIDGE2,NAWALL,GEM01,GEM02,GEM03,"
+            + "GEM04,GEM05,GEM06,GEM07,GEM08,GEM09,GEM10,GEM11,GEM12,DUMMY,"
+            + "DUMMY,TRACKS01,TRACKS02,TRACKS03,TRACKS04,TRACKS05,TRACKS06,TRACKS07,TRACKS08,TRACKS09,"
+            + "TRACKS10,TRACKS11,TRACKS12,TRACKS13,TRACKS14,TRACKS15,TRACKS16,TRACKTUNNEL01,TRACKTUNNEL02,TRACKTUNNEL03,"
+            + "TRACKTUNNEL04,RAILBRDG1,RAILBRDG2,CRAT01,CRAT02,CRAT03,CRAT04,CRAT0A,CRAT0B,CRAT0C,"
+            + "DRUM01,DRUM02,PALET01,PALET02,PALET03,PALET04,LOBRDG01,LOBRDG02,LOBRDG03,LOBRDG04,"
+            + "LOBRDG05,LOBRDG06,LOBRDG07,LOBRDG08,LOBRDG09,LOBRDG10,LOBRDG11,LOBRDG12,LOBRDG13,LOBRDG14,"
+            + "LOBRDG15,LOBRDG16,LOBRDG17,LOBRDG18,LOBRDG19,LOBRDG20,LOBRDG21,LOBRDG22,LOBRDG23,LOBRDG24,"
+            + "LOBRDG25,LOBRDG26,LOBRDG27,LOBRDG28,TIB01,TIB02,TIB03,TIB04,TIB05,TIB06,"
+            + "TIB07,TIB08,TIB09,TIB10,TIB11,TIB12,TIB13,TIB14,TIB15,TIB16,"
+            + "TIB17,TIB18,TIB19,TIB20,LOBRDGE1,LOBRDGE2,LOBRDGE3,LOBRDGE4,VEINS,TIB2_01,"
+            + "TIB2_02,TIB2_03,TIB2_04,TIB2_05,TIB2_06,TIB2_07,TIB2_08,TIB2_09,TIB2_10,TIB2_11,"
+            + "TIB2_12,TIB2_13,TIB2_14,TIB2_15,TIB2_16,TIB2_17,TIB2_18,TIB2_19,TIB2_20,TIB3_01,"
+            + "TIB3_02,TIB3_03,TIB3_04,TIB3_05,TIB3_06,TIB3_07,TIB3_08,TIB3_09,TIB3_10,TIB3_11,"
+            + "TIB3_12,TIB3_13,TIB3_14,TIB3_15,TIB3_16,TIB3_17,TIB3_18,TIB3_19,TIB3_20,VEINHOLE,"
+            + "SROCK01,SROCK02,SROCK03,SROCK04,SROCK05,TROCK01,TROCK02,TROCK03,TROCK04,TROCK05,"
+            + "VEINHOLEDUMMY,CRATE,DUMMY,FENCE01,FENCE02,FENCE03,FENCE04,FENCE05,FENCE06,FENCE07,"
+            + "FENCE08,FENCE09,FENCE10,FENCE11,FENCE12,FENCE13,FENCE14,FENCE15,FENCE16,FENCE17,"
+            + "FENCE18,FENCE19,FENCE20,FENCE21,FENCE22,GAGATE_A,CAFNCB,CAFNCW,LOBRDB01,LOBRDB02,"
+            + "LOBRDB03,LOBRDB04,LOBRDB05,LOBRDB06,LOBRDB07,LOBRDB08,LOBRDB09,LOBRDB10,LOBRDB11,LOBRDB12,"
+            + "LOBRDB13,LOBRDB14,LOBRDB15,LOBRDB16,LOBRDB17,LOBRDB18,LOBRDB19,LOBRDB20,LOBRDB21,LOBRDB22,"
+            + "LOBRDB23,LOBRDB24,LOBRDB25,LOBRDB26,LOBRDB27,LOBRDB28,LOBRDGB1,LOBRDGB2,LOBRDGB3,LOBRDGB4,"
+            + "BRIDGEB1,BRIDGEB2,RUBBLE_OVERLAY,CAKRMW,CAFNCP,WCRATE");
         r.oreGrows = true;
         r.oreSpreads = true;
         r.growthRate = 5;
@@ -1242,6 +1413,45 @@ class Rules {
     string OverlayName(int idx) {
         if (idx < 0 || idx >= this.overlayTypes.Count) { return ""; }
         return this.overlayTypes[idx];
+    }
+
+    /// <summary>An overlay's CrushSound= key (its own rules section, the
+    /// reference's ObjectRules read): the sound.ini name a hull rolling
+    /// over the piece plays -- [GASAND] WallCrushSandbag, [CAFNCB]
+    /// WallCrushBlack. Empty when the section names none.</summary>
+    string OverlayCrushSound(int idx) {
+        if (idx < 0 || idx >= this.overlayTypes.Count) { return ""; }
+        string key = this.SourceIniSection(this.overlayTypes[idx])
+            .Get("CrushSound");
+        if (key.Length > 0) { return key; }
+        // No install ini (or a section that names none): the transcribed
+        // shipped value. An install that does carry the key always wins.
+        if (this.overlayCrushSounds != null
+         && idx < this.overlayCrushSounds.Count) {
+            return this.overlayCrushSounds[idx];
+        }
+        return "";
+    }
+
+    /// <summary>Whether an overlay type may be flattened: its section's
+    /// Crushable=, default no -- the reference's ObjectRules read for the
+    /// Overlay object type (only infantry default to yes). Sandbags and
+    /// fences ship Crushable=yes, the concrete walls do not, so a crusher
+    /// rolls over the first two and is stopped by the third.</summary>
+    bool OverlayCrushable(int idx) {
+        if (idx < 0 || idx >= this.overlayTypes.Count) { return false; }
+        if (this.overlayCrushCache == null) {
+            this.overlayCrushCache = new List<int>();
+        }
+        while (this.overlayCrushCache.Count <= idx) {
+            this.overlayCrushCache.Add(0 - 1);
+        }
+        int cached = this.overlayCrushCache[idx];
+        if (cached >= 0) { return cached == 1; }
+        bool crushable = Rules.YesNo(this.SourceIniSection(this.overlayTypes[idx])
+            .GetOr("Crushable", "no"));
+        this.overlayCrushCache[idx] = crushable ? 1 : 0;
+        return crushable;
     }
 
     /// <summary>Whether a map overlay index carries ore: its [OverlayTypes]
@@ -1445,6 +1655,16 @@ class Rules {
     // Overlay wall facts, read from the type's own rules section and
     // cached: -1 not looked up, 0 no, 1 yes.
     List<int> overlayWallCache;
+
+    // Crushable= per overlay type, cached like the wall facts: -1 not
+    // looked up, 0 no, 1 yes. The built-in ruleset seeds it directly
+    // (ApplyDefaultCrushFacts); an install layers its own sections on top.
+    List<int> overlayCrushCache;
+
+    // CrushSound= per overlay type, the shipped value the built-in ruleset
+    // carries because it has no ini document to read it from. Parallel to
+    // overlayTypes; an install's own section overrides an entry.
+    List<string> overlayCrushSounds;
 
     /// <summary>How many [OverlayTypes] the rules name.</summary>
     int OverlayTypeCount() { return this.overlayTypes.Count; }
@@ -2667,7 +2887,75 @@ class Rules {
         r.repairPercent = 15;
         r.repairStep = 8;
         r.repairRateTicks = 60;
+        r.ApplyDefaultCrushFacts();
         return r;
+    }
+
+    /// <summary>The shipped Crusher=/Crushable=/CrushSound=/Weight= values
+    /// for the built-in roster, transcribed from RULES.INI so a run with no
+    /// install still crushes the way the retail game does. The install
+    /// layers its own keys on top through ReadCrushKeys, which recomputes
+    /// every one of these from the file.</summary>
+    void ApplyDefaultCrushFacts() {
+        // Infantry: crushable unless the section says otherwise, with the
+        // squish key the shipped file gives them. SHK/GGI/TANY/DESO/YURIPR
+        // ship Crushable=no (a tesla trooper's rig is not run over).
+        List<string> infRegs = Rules.Csv("E1,GGI,E2,ADOG,SNIPE,SPY,CLEG,"
+            + "TANY,SHK,FLAKT,IVAN,DESO,YURI,YURIPR");
+        for (int i = 0; i < infRegs.Count; i = i + 1) {
+            UnitDef d = this.UnitDefNamed(infRegs[i]);
+            if (d == null) { continue; }
+            string reg = d.Reg();
+            bool crushable = reg != "GGI" && reg != "TANY" && reg != "SHK"
+                && reg != "DESO" && reg != "YURIPR";
+            d.SetCrushKeys(false, crushable, "InfantrySquish", 1, true);
+        }
+        // The tracked hulls with Crusher=yes in the shipped file. The
+        // amphibious CHAR/CHOR ship SpeedType=Amphibious, which is not a
+        // rolling class -- the crush gate then refuses them, as in the
+        // original. The terror drone ships Crusher=no.
+        List<string> crushers = Rules.Csv("MTNK,AMCV,TNKD,SREF,CMIN,HTNK,"
+            + "SMCV,HTK,V3,TTNK,APOC,HARV,LTNK");
+        for (int i = 0; i < crushers.Count; i = i + 1) {
+            UnitDef d = this.UnitDefNamed(crushers[i]);
+            if (d == null) { continue; }
+            d.SetCrushKeys(true, false, "", 4, false);
+        }
+        // The wheeled hulls and the drone: no crusher, so a sandbag line
+        // stops them.
+        List<string> noCrush = Rules.Csv("FV,DRON");
+        for (int i = 0; i < noCrush.Count; i = i + 1) {
+            UnitDef d = this.UnitDefNamed(noCrush[i]);
+            if (d == null) { continue; }
+            d.SetCrushKeys(false, false, "", 1, false);
+        }
+        // The walls the shipped rules let a hull flatten, with their own
+        // squish keys; the concrete walls (GAWALL/NAWALL) carry no
+        // Crushable=, so they stop a crusher cold.
+        List<string> walls = Rules.Csv("GASAND,CAFNCB,CAFNCW,CAFNCP");
+        this.overlayCrushCache = new List<int>();
+        this.overlayCrushSounds = new List<string>();
+        for (int i = 0; i < this.overlayTypes.Count; i = i + 1) {
+            string name = this.overlayTypes[i];
+            bool crushable = false;
+            for (int j = 0; j < walls.Count; j = j + 1) {
+                if (name == walls[j]) { crushable = true; }
+            }
+            this.overlayCrushCache.Add(crushable ? 1 : 0);
+            this.overlayCrushSounds.Add(Rules.DefaultWallCrushSound(name));
+        }
+    }
+
+    /// <summary>The shipped CrushSound= of a wall overlay type, transcribed
+    /// from RULES.INI: sandbags squish, the three fence walls crack by
+    /// colour. Anything else (concrete, the scenery overlays) names none.
+    /// The built-in ruleset has no ini document to read these from, so it
+    /// carries them here; an install's own file wins when it has them.</summary>
+    static string DefaultWallCrushSound(string name) {
+        if (name == "GASAND") { return "WallCrushSandbag"; }
+        if (name == "CAFNCW") { return "WallCrushWhite"; }
+        if (name == "CAFNCB" || name == "CAFNCP") { return "WallCrushBlack"; }
+        return "";
     }
 
     // ---- reading the player's RULES.INI --------------------------------------
@@ -2776,6 +3064,25 @@ class Rules {
             if ((shp[dot + i] & 0xDF) != (want[i] & 0xDF)) { vxl = false; break; }
         }
         return vxl ? ".VXL" : ".SHP";
+    }
+
+    /// <summary>Whether a reg names an infantry, the reference's ObjectType
+    /// classification: membership in the install's [InfantryTypes] list.
+    /// The art extension is deliberately not the test -- the terror drone
+    /// is a vehicle drawn with an SHP -- so the crushable default keys off
+    /// this. Null/absent install sections answer no.</summary>
+    bool IsInfantryReg(string reg) {
+        if (reg == null || reg.Length == 0) { return false; }
+        if (this.sourceIni == null) { return false; }
+        IniSection list = this.sourceIni.Section("InfantryTypes");
+        if (list == null) { return false; }
+        string want = reg.ToUpper();
+        for (int i = 0; i < list.Count(); i = i + 1) {
+            if (list.EntryAt(i).Value().Trim().ToUpper() == want) {
+                return true;
+            }
+        }
+        return false;
     }
 
     void ApplyIni(IniDocument ini) {
@@ -3077,6 +3384,8 @@ class Rules {
             d.Voices().ReadIni(s);
             d.ReadSoundKeys(s);
             d.ReadVeteranAbilities(s);
+            d.SetInfantry(this.IsInfantryReg(d.Reg()));
+            d.ReadCrushKeys(s, d.Infantry());
         }
         // The neutral scenery units layer the same way, so an install that
         // restats its cows or gives a car an Image= override is honoured.
@@ -3096,6 +3405,8 @@ class Rules {
             d.Voices().ReadIni(s);
             d.ReadSoundKeys(s);
             d.ReadVeteranAbilities(s);
+            d.SetInfantry(this.IsInfantryReg(d.Reg()));
+            d.ReadCrushKeys(s, d.Infantry());
         }
         for (int i = 0; i < this.buildings.Count; i = i + 1) {
             BuildingDef d = this.buildings[i];
@@ -3154,6 +3465,7 @@ class Rules {
             d.Voices().ReadIni(s);
             d.ReadSoundKeys(s);
             d.ReadVeteranAbilities(s);
+            d.ReadCrushKeys(s);
         }
         IniSection general = ini.Section("General");
         if (general != null) {
@@ -3205,6 +3517,11 @@ class Rules {
         IniSection ov = ini.Section("OverlayTypes");
         if (ov != null) {
             this.overlayTypes = new List<string>();
+            // The per-index caches key off the old numbering; drop them so
+            // the install's own Crushable=/Wall= sections are read fresh.
+            this.overlayCrushCache = null;
+            this.overlayCrushSounds = null;
+            this.overlayWallCache = null;
             for (int i = 0; i < ov.Count(); i = i + 1) {
                 string name = ov.EntryAt(i).Value().Trim();
                 int semi = -1;
