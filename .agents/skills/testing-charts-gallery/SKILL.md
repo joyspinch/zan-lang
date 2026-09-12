@@ -698,3 +698,53 @@ ECharts line 的平滑算法不是「单调 Hermite / Cardinal / Catmull-Rom」�
 已并入 `tests/gui/chart_barminheight_test.zan` 第 5 组断言；
 只回退这一处、保留 barMinHeight 的 A/B 显示该断言单独变红。
 影响 `bar-negative`（stack:"Total" 负段）等 demo。
+
+## 组件级坐标系的分派与"过河"（C5 会话，geo 系 4 处同源缺陷）
+
+geo 系 demo 底图整体不画的根因是**四处**，只修一处不够，而且前两处
+能在"直接调 API"的探针里假装正常——**必须走完整 Render 才算验过**：
+
+1. `DispatchKind` 按首个可见系列分发。geo 底图是**面板骨架**（与
+   calendar/polar 同级），挂在它上面的 scatter/lines/graph/custom/pie
+   都只是投影装饰。真实示例的 series[0] 就是 `coordinateSystem:"geo"`
+   的 scatter，于是 kind=scatter，`DrawMap`/`DrawGeoOverlay` 永不执行。
+   判据必须是**组件级**：`if (o.geos.Count > 0) { return "map"; }`。
+   加坐标系骨架时先想"这个坐标系是面板还是系列"，日历/极坐标已踩过。
+2. `DrawMap` 取几何载体不能用 `LeadSeries`——它取到的是那个没有
+   `regions` 的 scatter。加 `MapBaseSeries(o)`：优先可见 `isGeoBase`，
+   其次首个可见且**真带 regions** 的 Map 系列。
+3. **`ResolvedChart.DrawOption` 漏拷 `geos`**：渲染期分派读的是
+   `drawOption` 而非 `source`，`geos.Count` 恒 0，第 1 条的组件级判定
+   永不命中。这是最阴的一处——直接调 `ChartView.DispatchKind(o2)` 返回
+   "map"，但 `v.Render(...)` 画出来还是空散点坐标系。**教训：任何
+   "解析期新字段"都要同时问一句"DrawOption 拷了吗"**，同类的还有
+   `calendars`/`angleAxes`/`radiusAxes`（后两者已拷，`calendars` 是
+   另一条路径）。
+4. 真实示例的 map 系列写 `{type:'map', geoIndex:0}` 而 **`map` 缺省或
+   空串**：ECharts `MapSeries.getMapType()` 是
+   `(getHostGeoModel() || this).option.map`——有宿主 geo 时 option.map
+   被忽略。判定必须用 **`s.Has("geoIndex")` 显式声明**，不能看字段值：
+   `geoIndex` 缺省 0 与显式 0 数值上无法区分，而 ECharts 的
+   `getHostGeoModel()` 走 `getReferringComponents(..., {useDefault:false})`，
+   没写 geoIndex 的 map 系列自建独占 geo、自己的 map 优先。
+
+**A/B 的做法**：`MapBaseSeries` 的调用点与定义在同一处，单独回退
+`ChartView.zan` 会**编译失败**（`has no member 'MapBaseSeries'`），
+拿不到干净的 A/B。改做**外科 A/B**：只把 `if (o.geos.Count>0)` 那行
+注释掉，其余三处保留 → 断言 `B: geo+map dispatches to map` 变红、
+`B lead regions=0`、绘图区墨迹 3680（A 形态基准 68981）。恢复即过。
+**回退整文件拿不到 A/B 时，回退那一行。**
+
+**真图 A/B 别只看自己造的形态**：`_scratch/c5_realdemos.zan` 逐 demo
+数像素指纹（ink + sum）对比 HEAD——`geo-choropleth-scatter` HEAD
+kind=scatter ink=9978 → 修后 kind=map ink=268800，`geo-map-scatter`
+HEAD kind=scatter ink=16988 → 修后 kind=map ink=100122，**其余 10 个
+geo/map demo 指纹逐字节同 HEAD**。只跑自造的小地图会漏掉"底图名来自
+注册表（china 走 `MapChinaData.Regions()` 而非 JSON 文件）"这类差别：
+探针里没注册 `china` 时 `regions=0`，底图当然不画，读数是假的。
+
+**遗留（下一步，非本条）**：`o.rampColors` 只从 `dataRange.color`
+（2.x 遗留）填，`visualMap.inRange.color` 只进 `visualMaps[]`，
+地图渲染器读 `o.rampColors`/`MapRamp` 的缺省浅蓝→深蓝——7 个 demo
+的分级着色仍走缺省色域；`o.rampLo/rampHi` 同理未从
+`visualMap.min/max` 接线。

@@ -2295,6 +2295,25 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_chart_barminheight${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # C5 回归：geo 组件形态（geo-choropleth-scatter / geo-map-scatter /
+  # scatter-map-brush）的地图底图与按经纬度投影的散点必须绘制。
+  # 四处缺陷同源：DispatchKind 按首个可见系列分发（geo 底图是面板骨架，
+  # 与 calendar/polar 同级）、DrawMap 用 LeadSeries 取几何载体（取到的是
+  # 没有 regions 的 scatter）、ResolvedChart.DrawOption 漏拷 geos（渲染期
+  # 读的是 drawOption，geos.Count 恒 0）、map 系列的 map 名不继承宿主 geo
+  # （ECharts getMapType()）。用例按真实示例的系列形态构造
+  # （s0 = coordinateSystem:"geo" 的 scatter、s1 = {type:'map',geoIndex:0}），
+  # 离屏渲染后逐像素数投影点与绘图区墨迹（Canvas.GetPixel，与
+  # chart_barminheight / chart_background 同一套无窗口装置）。
+  add_test(NAME conformance_gui_chart_geodispatch
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/chart_geodispatch_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_chart_geodispatch.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_chart_geodispatch${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   add_test(NAME conformance_gui_layer
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>

@@ -1,0 +1,168 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Component.Chart;
+
+/// C5 回归：geo 组件形态的地图必须画出底图与按经纬度投影的散点。
+///
+/// 缺口原状（四处，缺一不可；前三处是"底图与投影点整体不绘制"，
+/// 第四处让系列数据落不到区域上）：
+///   1. `DispatchKind` 取首个可见系列的 type —— geo-choropleth-scatter /
+///      geo-map-scatter / scatter-map-brush 的 series[0] 是挂在 geo 上的
+///      scatter，kind 判成 scatter → DrawMap/DrawGeoOverlay 根本不跑；
+///   2. `DrawMap` 用 `LeadSeries` 取几何载体 —— 即便分派对了，取到的仍是
+///      那个没有 regions 的 scatter，下一行 `regions.Count < 1` 直接 return。
+///      真正的区域表在 ChartModel 合成的 isGeoBase 系列里；
+///   3. `ResolvedChart.DrawOption` 漏拷 `geos` —— 渲染期分派读的是
+///      drawOption 而非 source，geos.Count 恒 0，第 1 条永不命中；
+///   4. 真实示例的 map 系列写的是 `{type:'map', geoIndex:0}` 且
+///      `map` 缺省/空串（ECharts `MapSeries.getMapType()`：有宿主 geo 时
+///      option.map 被忽略）—— 不继承宿主地图名，系列名空，BindSeries
+///      直接返回，系列 data 的值落不到区域上。
+///
+/// 用例按真实 demo 的系列形态构造（s0 = coordinateSystem:"geo" 的 scatter、
+/// s1 = `{type:'map', geoIndex:0, map:''}`）—— 正是"有用户 map 系列"这一点
+/// 让合成底图被**追加**到队尾而不是插到队首，LeadSeries 因此取到没有
+/// 几何的 scatter，四个缺口才会同时暴露。
+class Program {
+    static int fails;
+
+    static void True(string what, bool got) {
+        if (got) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    static void Note(string s) {
+        if (fails > 0) { Console.WriteLine(s); }
+    }
+
+    /// 两个方块区域的小地图（左"甲"右"乙"），坐标量级贴近真实
+    /// geoJson（度 ×100、y 已翻成北朝上）。
+    static void RegisterToy() {
+        List<ChartMapRegion> rs = new List<ChartMapRegion>();
+        rs.Add(ChartMapRegion.Of("甲", 0, new List<ChartMapRing>{
+            ChartMapRing.Of(new List<ChartMapPoint>{
+                ChartMapPoint.Of(1000, -1000), ChartMapPoint.Of(4000, -1000),
+                ChartMapPoint.Of(4000, -4000), ChartMapPoint.Of(1000, -4000) },
+                false) }));
+        rs.Add(ChartMapRegion.Of("乙", 0, new List<ChartMapRing>{
+            ChartMapRing.Of(new List<ChartMapPoint>{
+                ChartMapPoint.Of(6000, -1000), ChartMapPoint.Of(9000, -1000),
+                ChartMapPoint.Of(9000, -4000), ChartMapPoint.Of(6000, -4000) },
+                false) }));
+        ChartMaps.RegisterRegions("toymap", rs);
+    }
+
+    static Canvas Render(string json, int w, int h) {
+        ChartOption o = ChartOption.FromJson(json);
+        App app = new App("c5", w, h);
+        app.BeginFrame();
+        // KeyedStatic：离屏探针必须量最终形态（见 A5 会话的
+        // testing-charts-gallery 硬规矩第 1 条）。
+        ChartView v = ChartView.KeyedStatic(o, 13);
+        v.Render(app, 0, 0, w, h);
+        return app.canvas;
+    }
+
+    static int CountColor(Canvas c, int w, int h, int rgb) {
+        int n = 0;
+        for (int y = 0; y < h; y = y + 1) {
+            for (int x = 0; x < w; x = x + 1) {
+                if ((c.GetPixel(x, y) & 0x00FFFFFF) == rgb) { n = n + 1; }
+            }
+        }
+        return n;
+    }
+
+    /// 绘图区内的墨迹数（非纯白像素）。底图两个方块占绘图区中部
+    /// 一大片，底图丢失时该值会掉一个数量级。
+    static int PlotInk(Canvas c, int w, int h) {
+        int n = 0;
+        for (int y = 100; y < 340; y = y + 1) {
+            for (int x = 20; x < w - 20; x = x + 1) {
+                if ((c.GetPixel(x, y) & 0x00FFFFFF) != 0xFFFFFF) { n = n + 1; }
+            }
+        }
+        return n;
+    }
+
+    static void Main() {
+        fails = 0;
+        RegisterToy();
+        int W = 520;
+        int H = 400;
+        int dot = Chart.Rgb(255, 0, 0) & 0x00FFFFFF;
+
+        // ---- 形态 A：只有 geo 组件（scatter-map 的形态）----
+        // 合成 isGeoBase 系列插到队首（无用户 map 系列 → Insert(0)），
+        // geo.itemStyle.areaColor 落在它身上。geo 点坐标写成**度**
+        // （真实 demo 是 {value:[121.15,31.89]}），解析期 ×100 定点；
+        // 底图区域表本身已是 ×100 量级。
+        string geoOnly = "{\"geo\":{\"map\":\"toymap\","
+            + "\"itemStyle\":{\"areaColor\":\"#323c48\"}},"
+            + "\"series\":[{\"type\":\"scatter\",\"coordinateSystem\":\"geo\","
+            + "\"itemStyle\":{\"color\":\"#ff0000\"},\"symbolSize\":14,"
+            + "\"data\":[[25,25],[75,25]]}]}";
+        ChartOption o1 = ChartOption.FromJson(geoOnly);
+        string kind1 = ChartView.DispatchKind(o1);
+        Note("A kind=" + kind1);
+        True("A: geo-only dispatches to map", kind1 == "map");
+        Canvas c1 = Render(geoOnly, W, H);
+        int d1 = CountColor(c1, W, H, dot);
+        int inkA = PlotInk(c1, W, H);
+        Note("A dot px=" + Convert.ToString(d1)
+            + " ink=" + Convert.ToString(inkA));
+        True("A: geo projected points painted", d1 > 30);
+        True("A: geo base map painted", inkA > 20000);
+
+        // ---- 形态 B：真实示例形态（geo + `{type:'map',geoIndex:0,map:''}`）----
+        // 有用户 map 系列 → 合成底图被**追加**到队尾（ChartModel 的
+        // HasUserMapSeries 分支），LeadSeries 取到的是没有 regions 的
+        // scatter —— 缺口 1/2/4 同时暴露。
+        string realDemo = "{\"geo\":{\"map\":\"toymap\"},"
+            + "\"series\":[{\"type\":\"scatter\",\"coordinateSystem\":\"geo\","
+            + "\"itemStyle\":{\"color\":\"#ff0000\"},\"symbolSize\":14,"
+            + "\"data\":[[25,25],[75,25]]},"
+            + "{\"type\":\"map\",\"geoIndex\":0,\"map\":\"\","
+            + "\"data\":[{\"name\":\"甲\",\"value\":3},{\"name\":\"乙\",\"value\":7}]}]}";
+        ChartOption o2 = ChartOption.FromJson(realDemo);
+        string kind2 = ChartView.DispatchKind(o2);
+        Note("B kind=" + kind2);
+        True("B: geo+map dispatches to map", kind2 == "map");
+
+        // 缺口 4：系列名继承宿主 geo 的地图名（否则 BindSeries 空转）。
+        True("B: map series inherits host geo map name",
+            o2.series[1].mapName == "toymap");
+
+        // 首个可见系列是没有几何的 scatter（缺口 1/2 的触发条件）。
+        ChartSeries lead = ChartView.LeadSeries(o2);
+        Note("B lead regions=" + (lead == null ? "null"
+            : Convert.ToString(lead.regions.Count)));
+        True("B: lead series is the geo scatter (no regions)",
+            lead != null && lead.regions.Count < 1);
+
+        ChartSeries mb = ChartView.MapBaseSeries(o2);
+        Note("B mapBase=" + (mb == null ? "null"
+            : "regions=" + Convert.ToString(mb.regions.Count)));
+        True("B: map base series carries regions",
+            mb != null && mb.regions.Count >= 2);
+
+        // 缺口 3：drawOption 必须带 geos，否则渲染期分派退回 scatter
+        // （底图与投影点一起丢）。投影点数量是最灵敏的探针：分派错
+        // 则 scatter 走 DrawScatterCore，geo 坐标解不出像素，点全丢。
+        Canvas c2 = Render(realDemo, W, H);
+        int d2 = CountColor(c2, W, H, dot);
+        int inkB = PlotInk(c2, W, H);
+        Note("B dot px=" + Convert.ToString(d2)
+            + " ink=" + Convert.ToString(inkB));
+        True("B: geo projected points painted", d2 > 30);
+        // 底图必须真的落墨。B 的底图来自用户 map 系列（值 3/7 走
+        // MapRamp 渐变），填色与 A 的 areaColor 不同，所以不比色值
+        // 只比墨迹量级（A 的实测值作基准，放宽到 70%）。
+        True("B: geo base map painted (ink comparable to A)",
+            inkB > inkA * 7 / 10);
+
+        Console.WriteLine("c5-geo-dispatch:" + Convert.ToString(fails == 0 ? 1 : 0));
+    }
+}
