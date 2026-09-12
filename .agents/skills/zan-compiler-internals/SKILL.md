@@ -843,3 +843,41 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
   `run_leakcheck.cmake` 的产物 up-to-date 判定原来只看 (源, zanc, stdlib stamp)
   **不看 ZANC_ARGS**，args 修好后旧 exe 依旧复用、红不变——已加 `.args` sidecar
   记录编译参数，args 变了强制重编；`zan_drop_artifact` 同步删 sidecar。
+
+## Worker.Stop() 只翻标志；停摆 accept 靠「关监听 fd」复位（2026-09-12 net 系六项收口）
+
+- `Worker.Stop()` 语义是协作式（`running=false`，注释明言「不中断运行中的协程」）：
+  循环 `while (running) { await AcceptAsync(sock); }` **停在 accept 里时永远看不到
+  标志翻转**。与 TcpListener.Stop 的差别就在这里——后者会关 fd，挂起 accept 以
+  -1 复位。Worker 用例的收尾定式：`Stop()` 之后必须补 `Socket.Close(listenSock)`
+  （accept 返回 -1 → 回到 while 条件见 running=false → 循环退出 → `RunAllLoopsOnSockets`
+  帧完成，socks List 与 Worker 对象链整体释放）。ws_loopback / ws_protocol_gate /
+  mqtt_loopback / sse_stream 四用例的「用例 2 对象 + Worker.zan:280/297 2 对象」
+  常红形状全是这一个缺口。
+- 判「accept 靠什么唤醒」别信用例注释，读循环实现：注释说「停止会复位 accept 循环」
+  的用例照红——写注释的人把 TcpListener 的语义记串了。
+
+## 集合查找内建吞掉 owned 实参临时：Contains/IndexOf/Dict 三兄弟（2026-09-12 同日根修）
+
+- **坑**：`List.Contains/IndexOf(item)`、`Dict.Remove/ContainsKey/TryGetValue(key)`、
+  `d[key]` 读的代码生成把实参 `emit_expr` 出来后从不释放。实参是局部变量/字面量时
+  无恙（帧收尾释放/借用/驻留）；写成**内联调用**——临时串唯一持有者是本次表达式——
+  每次执行漏 1 条。真实形状藏在 HttpClient 重定向防环
+  `visited.Contains(target.Canonical())`：每跟一跳漏一条 URL 串，
+  http_bytes_redirect 漏 4 = 4 跳、http_client_redirect 漏 10 = 10 跳，
+  泄漏数与业务跳数严丝合缝即是此坑的指纹。
+- **缩小阶梯**（从真实形状到七行复形，一层层换血）：HTTP 重定向链 →
+  裸 socket 服务器仍漏（锁定客户端）→ `RedirectNextClient` 换裸客户端仍漏
+  （排除共享字段）→ 去掉 DropAlive 仍漏 → 常量实参仍漏（排除 URL 拼接）→
+  同客户端二跳仍漏（排除派生客户端）→ 极小 while 循环干净 → 逐个加回
+  Parse/GetHeader/ExternalTarget 都干净 → **只剩 `visited.Contains(...)` 漏** →
+  语言级 `v.Contains(P.Build(2))` 七行复形。反向排除同样要逐件做：Add(调用())、
+  普通方法实参、`List<int>`（值类型）全不漏——只有「RC 管理实参 + 查找类内建」
+  组合踩坑。
+- **修法定式**：查找类内建的 done/return 前统一补
+  `emit_release_owned_call_temp(g, 实参节点, search, locals)`——帮手自带守卫
+  （局部标识/非指针/非 RC/借用表达式自动跳过），str.Contains 早已是这么写的，
+  List/Dict 五处（irgen_call.c 四处 + irgen_expr.c 的 `d[key]` 读）是漏网之鱼。
+  新写消费 RC 实参的内建时必须过这个帮手，别自己判断要不要释放。
+- conformance 用例 `arc_lookup_owned_arg` 六形态全调用实参化，leakcheck 孪生
+  钉零泄漏；语义结果（at=-1 等）同 golden 钉死，防「释放修没修对、答案先错」。

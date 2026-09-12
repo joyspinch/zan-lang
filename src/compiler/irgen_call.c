@@ -3669,6 +3669,12 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMBuildStore(g->builder, ni, idx_a);
                     LLVMBuildBr(g->builder, cond_bb);
                     LLVMPositionBuilderAtEnd(g->builder, done_bb);
+                    /* `items.IndexOf(P.Make())` hands the search key's rc to
+                     * this expression; a temporary argument has no other
+                     * owner, so drop it here (A64b sibling: the leak checker
+                     * traced stray strings to exactly this window). */
+                    emit_release_owned_call_temp(g, expr->call.args.items[0],
+                                                 search, locals);
                     return LLVMBuildLoad2(g->builder, i64, res, "iofres");
                 }
             }
@@ -3727,6 +3733,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMBuildStore(g->builder, ni, idx_a);
                     LLVMBuildBr(g->builder, cond_bb);
                     LLVMPositionBuilderAtEnd(g->builder, done_bb);
+                    /* Same search-key ownership as IndexOf above. */
+                    emit_release_owned_call_temp(g, expr->call.args.items[0],
+                                                 search, locals);
                     return LLVMBuildLoad2(g->builder, LLVMInt32TypeInContext(g->ctx), res, "ctres");
                 }
             }
@@ -4002,6 +4011,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMValueRef found = emit_dict_find(g, dict_type, raw, search);
                         LLVMValueRef hit = zan_icmp(g->builder, LLVMIntSGE, found,
                             LLVMConstInt(i64, 0, 0), "ckhit");
+                        emit_release_owned_call_temp(g, expr->call.args.items[0], search, locals);
                         emit_release_owned_call_temp(g, callee_d->member.object, raw, locals);
                         return LLVMBuildZExt(g->builder, hit, i32t, "ckres");
                     }
@@ -4048,6 +4058,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMBuildStore(g->builder, LLVMConstInt(i32t, 0, 0), res_a);
                         LLVMBuildBr(g->builder, done_bb);
                         LLVMPositionBuilderAtEnd(g->builder, done_bb);
+                        emit_release_owned_call_temp(g, expr->call.args.items[0], search, locals);
                         emit_release_owned_call_temp(g, callee_d->member.object, raw, locals);
                         return LLVMBuildLoad2(g->builder, i32t, res_a, "tgv.out");
                     }
@@ -4258,6 +4269,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMPositionBuilderAtEnd(g->builder, miss_bb);
                         LLVMBuildBr(g->builder, done_bb);
                         LLVMPositionBuilderAtEnd(g->builder, done_bb);
+                        emit_release_owned_call_temp(g, expr->call.args.items[0], search, locals);
                         emit_release_owned_call_temp(g, callee_d->member.object, raw, locals);
                         return LLVMBuildLoad2(g->builder, i32t, res_a, "dr.out");
             }

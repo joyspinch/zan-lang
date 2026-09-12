@@ -5437,6 +5437,9 @@ static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
             zan_store_fit(g, load_collection_slot_value(g, dvt, vslot), res);
             LLVMBuildBr(g->builder, done_bb);
             LLVMPositionBuilderAtEnd(g->builder, done_bb);
+            /* The index expression's rc belongs to this read when it is a
+             * temporary (`d[P.MakeKey()]`); drop it before returning. */
+            emit_release_owned_call_temp(g, expr->index.index, search, locals);
             LLVMValueRef dout = LLVMBuildLoad2(g->builder, value_llvm, res, "dval");
             return finish_index_of_temp(g, expr, locals, arr_type, dvt,
                                         arr_ptr, dout);
