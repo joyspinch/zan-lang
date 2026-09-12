@@ -113,6 +113,28 @@ to its dedicated `Click` field — assert `((Button)b).Click.Count()`, not
 block strut font-size) apply — write explicit `line-height`/`font-size`
 in fixtures. Full spec: `docs/HTML_UI.md` in the SDK.
 
+## 6c. Designer documents are .html (Gui P7a)
+
+The visual window designer's storage format is HTML — a doc whose
+`<body>` carries the bare `data-zan-design` marker. The old .zform JSON is
+now an internal representation only (undo/redo snapshots, the JSON drawer,
+the LSP feed); don't hand-write it.
+
+- **Compile channel**: zanc sends a `body[data-zan-design]` .html to the
+  same GenForm projection .zform used (typed partial class); a plain .html
+  goes to the GenHtml build-tree class instead. Keep the marker intact —
+  it is the routing bit.
+- **Round-trip is key-faithful** (tested): doc-level keys become body
+  `data-<kebab>` attrs, `on<Event>` becomes `data-on-<kebab>` (Pascal
+  restored on read), pass-through objects (`props`, `columns`) ride
+  `data-x-<kebab>` as compact JSON. Bare attributes mean `true` on read.
+- **Designer API**: `Designer.SaveHtml()` / `LoadHtmlText(text)`. Loading
+  a non-design HTML imports it (tags fall back to kinds) — HTML has no
+  "corrupt" form, so `loadError` is nearly unreachable for .html input.
+- **Zan trap hit here**: `((char)c).ToString()` returns the code point
+  ("M" -> "77") — capitalize via `char + string` concatenation instead
+  (`(char)(c - 32) + rest`).
+
 ## 7. Evidence discipline (the anti-rework rules)
 
 Two real projects (a 420-file gateway port, a 634-file WinForms port) lost days

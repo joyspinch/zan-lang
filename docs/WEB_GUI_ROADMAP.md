@@ -19,7 +19,7 @@
 | P4 | grid：track sizing（auto/fr/minmax/px/%）、span、隐式轨道、gap、网格线放置 | ✅ 2026-09-12 | 1b1c5375 引擎 + db19356e 修复/断言/文档；oracle grid 19 盒全部 0px |
 | P5 | HTML 声明层：Html.zan parser、tag→控件映射、data-on-* 事件、data-bind、style/link 接线、GenHtml 编译期生成器、App.LoadHtml()、oracle 闭环 | ✅ 2026-09-12 | 09d73369 运行时 + dc3b55f9 生成器；oracle html 13 盒（tol 3）；编译期建树与运行时解析 13 盒 diff 全等；主文档 docs/HTML_UI.md |
 | P6 | overflow 滚动：auto/scroll 真语义（clip+偏移+滚动条） | ✅ 2026-09-12 | oracle scroll 16 盒全部 0px（auto/hidden/scroll 三态、程序滚动、钳制、嵌套组合）；UiDriver 实机滚轮验证（注入滚轮→子树精确平移） |
-| P7 | 设计器 + HUD：存取格式 = .html、Inspector CSS 编辑、拖拽翻译 CSS、游戏窗口层嵌入帧循环、IDE 自用窗体重写 | ☐ | |
+| P7 | 设计器 + HUD：存取格式 = .html、Inspector CSS 编辑、拖拽翻译 CSS、游戏窗口层嵌入帧循环、IDE 自用窗体重写 | 🚧 2026-09-12 | P7a ✅：DesignerHtml 编解码器全键往返、GenForm .html 设计稿投影（与 .zform 同一生成）、生成器缓存键全 stdlib 哈希（genrun.c）、Designer.SaveHtml/LoadHtmlText 桥、IDE .html 设计稿九处接线；P7b（Inspector style）/P7c（HUD 帧内）/P7d（IDE 31 个 .zform 迁移）进行中 |
 
 ## 每期验收纪律
 
@@ -228,6 +228,12 @@ golden/audit/Inert 名单同步 → 提交 `gui-web(Pn): 主题`。
   命中都用平移后的绝对坐标，HitTest 零改动即正确；下一帧从自然
   位置重排，不累积。流/flex/grid/legacy 四条排布路径统一走
   ArrangeScrollTail 收口（非滚动容器零开销）。
+- **设计器存取格式 = .html（P7a）**：同一份 JSON 文档模型（原 .zform）
+  的序列化格式换成 HTML——`System.Web.DesignerHtml` 纯层编解码器两端共用
+  （设计器 SaveHtml/LoadHtmlText、GenForm 编译期投影先 ToJsonDoc 再走原通
+  道）。data-zan-design 裸标记区分设计稿与运行期 HTML UI 文档：前者归
+  GenForm（合成 partial class 窗体），后者归 GenHtml（建树类）；`.zform`
+  JSON 不再手写，成为内部表示（Undo 快照/JSON 抽屉/LSP 契约仍用 JSON）。
 - **滚动条覆盖式（P6）**：滚动条画在内容上、不占布局宽——Chrome
   经典滚动条占 17px 布局宽（内容收窄、出现/消失引起 reflow 抖动），
   这里不模拟；oracle 侧用 `--hide-scrollbars` 对齐（headless 无占位

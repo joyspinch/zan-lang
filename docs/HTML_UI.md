@@ -125,6 +125,31 @@ P0-P4 节）。CSS 支持面（含 grid/flex/float）见 TASKS.md A16。
 - **端到端**：同一份 html 喂 GenHtml（UiHtml.Build）与运行时
   （LoadHtmlWith），13 盒输出 diff 全等。
 
+## 设计器文档格式（P7a）
+
+窗口设计器的存取格式就是本文件的 HTML 子集：文档 `<body>` 带裸属性
+`data-zan-design`（区分设计稿与运行期 UI 文档——编译期前者进 GenForm 窗体
+投影，后者进 GenHtml 建树类；IDE 里前者开设计器）。同一份 JSON 文档模型
+（原 .zform）经 `System.Web.DesignerHtml` 与 HTML 互转，全键保真往返：
+
+- 文档级键（winW/role/layoutMode/…）→ `<body>` 的 `data-<kebab>` 属性；
+  `name` 另发 `<body id>`；裸属性即 `true`；`0`/`""`/`false` 不发（读端有
+  缺省）。
+- 字段 → 元素：`kind` 决定 tag（Panel/自定义→div、Label→label、Button→
+  button、Input→input、TextArea→textarea、Image→img），`data-kind` 是权
+  威标记；`name` → `id`、`class` → `class`、`kids` → 子元素。
+- 标量键 → `data-<kebab>`（camelCase kebab 化，读端还原）；数字/布尔自动
+  嗅探。
+- 事件键 `onClick` 等 → `data-on-click`（与运行时 data-on-* 协议同形）。
+- 复合值（props 直通表、DataGrid columns、winShape）→
+  `data-x-<kebab>` = 紧凑 JSON；字符串值不作数字嗅探（`"min":"0"` 不漂）。
+- `options`（SelectBox 等）→ `data-options="a|b|c"`（`|` 分隔，与
+  JoinOpts 同约定）。
+
+设计器侧 API：`Designer.SaveHtml()` / `LoadHtmlText(text)`；IDE 的 .html
+设计稿标签页（body 有标记）自动进设计器并回存 HTML。`.zform` JSON 仍作为
+内部表示存在（撤销快照、JSON 抽屉、LSP 供数），不再手写。
+
 ## 与浏览器的差异清单（台账）
 
 - **select 没有下拉语义**：映射 Element 占位（容器盒），选项当文本。

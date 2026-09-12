@@ -1,0 +1,320 @@
+using System;
+using System.Json;
+using System.Text;
+
+namespace System.Web;
+
+/// 设计器文档的 HTML 存取编解码器（WEB_GUI_ROADMAP P7）：把设计器
+/// 的 JSON 文档（原 .zform）与 HTML 文本互相转换——HTML 从此是设计器
+/// 的存取格式，.zform 退役。纯字符串层，不依赖 Gui：设计器
+/// (Gui.Designer)、编译期生成器 (GenForm/GenHtml) 两端共用。
+///
+/// 编码规则（全键保真往返）：
+///   - 文档级键（name/winW/role/...）→ <body> 的 data-<kebab> 属性；
+///     name 另发 id 便于阅读；body 带 data-zan-design 标记（IsDesignDoc
+///     据此区分设计稿与普通 HTML UI 文档）。
+///   - 字段对象 → 元素：kind 决定 tag（Panel→div、Label→label、
+///     Button→button、Input→input、TextArea→textarea、Image→img，
+///     其余 div），kind 本身存 data-kind（自定义组件/共享控件的
+///     权威标记）；name → id；class → class；kids → 子元素。
+///   - 其余标量键 → data-<kebab>="值"（camelCase 键名 kebab 化——
+///     解析器把属性名整体小写，kebab 保大小写信息；false/""/0 跳过，
+///     与 HTML 布尔属性同趣，读端有缺省）。
+///   - 事件键 on<Event> → data-on-<kebab 事件名>：与 P5 运行时事件
+///     协议 data-on-<evt>="名" 完全同形（LoadHtml 与设计稿一致）。
+///   - 复合值（props 直通表、DataGrid columns、winShape 区域数组…）
+///     → data-x-<kebab>='<紧凑 JSON>'，读端原样解析回对象/数组——
+///     字符串值不作数字/布尔嗅探，props 的 "min":"0" 不会漂成数字。
+///   - options（字符串数组）→ data-options="a|b|c"（与 JoinOpts 同
+///     分隔，| 内嵌限制相同）。
+///   - 属性值统一实体转义（& < > "）；元素不发裸文本（文本内容全在
+///     属性里），规避 HTML 空白塌缩。
+class DesignerHtml {
+    /// 是否设计器文档：body 带 data-zan-design 标记。标记是裸属性
+    /// （值为空串），不能用 Attr(...) != "" 判——那样存在与缺失
+    /// 不可区分，永远返回 false。
+    static bool IsDesignDoc(string html) {
+        WDoc wd = HtmlParser.Parse(html, "");
+        if (wd.nodes.Count == 0) { return false; }
+        WNode body = wd.nodes[0];
+        for (int i = 0; i < wd.nodes.Count; i = i + 1) {
+            if (wd.nodes[i].tag == "body") { body = wd.nodes[i]; break; }
+        }
+        for (int i = 0; i < body.attrNames.Count; i = i + 1) {
+            if (body.attrNames[i] == "data-zan-design") { return true; }
+        }
+        return false;
+    }
+
+    /// 设计器 JSON 文档 → HTML 文本。
+    static string FromJsonDoc(string json) {
+        JsonValue doc = JsonValue.ParseLenient(json);
+        if (doc == null || !doc.IsObject()) { return ""; }
+        StringBuilder b = new StringBuilder();
+        b.Append("<!doctype html>\n<html>\n<head>\n");
+        b.Append("<meta charset=\"utf-8\">\n");
+        string nm = doc.Str("name", "");
+        if (nm != "") {
+            b.Append("<title>" + EscapeAttr(nm) + "</title>\n");
+        }
+        b.Append("</head>\n<body data-zan-design");
+        if (nm != "") { b.Append(" id=\"" + EscapeAttr(nm) + "\""); }
+        for (int i = 0; i < doc.Count(); i = i + 1) {
+            string key = doc.KeyAt(i);
+            if (key == "fields" || key == "name") { continue; }
+            AppendKey(b, doc.ValAt(i), key, 0);
+        }
+        b.Append(">\n");
+        JsonValue fields = doc.Get("fields");
+        if (fields != null && fields.IsArray()) {
+            for (int i = 0; i < fields.Count(); i = i + 1) {
+                FieldHtml(b, fields.At(i), 1);
+            }
+        }
+        b.Append("</body>\n</html>\n");
+        return b.ToString();
+    }
+
+    /// HTML 文本 → 设计器 JSON 文档（PrettyToJson 字符串）。
+    static string ToJsonDoc(string html) {
+        WDoc wd = HtmlParser.Parse(html, "");
+        WNode body = wd.nodes.Count > 0 ? wd.nodes[0] : null;
+        for (int i = 0; i < wd.nodes.Count; i = i + 1) {
+            if (wd.nodes[i].tag == "body") { body = wd.nodes[i]; break; }
+        }
+        if (body == null) { return ""; }
+        JsonValue doc = JsonValue.NewObject();
+        for (int i = 0; i < body.attrNames.Count; i = i + 1) {
+            string a = body.attrNames[i];
+            string v = body.attrVals[i];
+            if (a == "data-zan-design") { continue; }
+            if (a == "id") { doc.Put("name", JsonValue.NewStr(v)); continue; }
+            if (a.Length > 5 && HtmlText.StartsWith(a, "data-")) {
+                PutAttr(doc, a.Substring(5), v);
+            }
+        }
+        JsonValue fields = JsonValue.NewArray();
+        for (int i = 0; i < body.items.Count; i = i + 1) {
+            WItem it = body.items[i];
+            if (it.kid < 0) { continue; }
+            fields.Append(FieldJson(wd, wd.nodes[it.kid]));
+        }
+        doc.Put("fields", fields);
+        return doc.PrettyToJson() + "\n";
+    }
+
+    // ---- 元素 ↔ 字段 -----------------------------------------------------
+
+    static void FieldHtml(StringBuilder b, JsonValue o, int depth) {
+        string kind = o.Str("kind", "");
+        string tag = KindTag(kind);
+        string pad = "";
+        for (int i = 0; i < depth; i = i + 1) { pad = pad + "  "; }
+        b.Append(pad + "<" + tag);
+        string nm = o.Str("name", "");
+        if (nm != "") { b.Append(" id=\"" + EscapeAttr(nm) + "\""); }
+        b.Append(" data-kind=\"" + EscapeAttr(kind) + "\"");
+        for (int i = 0; i < o.Count(); i = i + 1) {
+            string key = o.KeyAt(i);
+            JsonValue v = o.ValAt(i);
+            if (v == null) { continue; }
+            if (key == "kind" || key == "name") { continue; }
+            if (key == "class") {
+                string cv = v.IsString() ? v.AsString("") : "";
+                if (cv != "") { b.Append(" class=\"" + EscapeAttr(cv) + "\""); }
+                continue;
+            }
+            if (key == "kids") {
+                continue;   // 收尾统一发子元素
+            }
+            AppendKey(b, v, key, 1);
+        }
+        JsonValue kids = o.Get("kids");
+        if (kids != null && kids.IsArray() && kids.Count() > 0) {
+            b.Append(">\n");
+            for (int i = 0; i < kids.Count(); i = i + 1) {
+                FieldHtml(b, kids.At(i), depth + 1);
+            }
+            b.Append(pad + "</" + tag + ">\n");
+            return;
+        }
+        if (tag == "input" || tag == "img") {
+            b.Append(" />\n");
+            return;
+        }
+        b.Append("></" + tag + ">\n");
+    }
+
+    static JsonValue FieldJson(WDoc doc, WNode n) {
+        JsonValue o = JsonValue.NewObject();
+        string kind = HtmlText.Attr(n.attrNames, n.attrVals, "data-kind");
+        if (kind == "") { kind = TagKind(n.tag); }
+        if (kind == "") { kind = "Panel"; }
+        o.Put("kind", JsonValue.NewStr(kind));
+        string id = HtmlText.Attr(n.attrNames, n.attrVals, "id");
+        if (id != "") { o.Put("name", JsonValue.NewStr(id)); }
+        for (int i = 0; i < n.attrNames.Count; i = i + 1) {
+            string a = n.attrNames[i];
+            string v = n.attrVals[i];
+            if (a == "id" || a == "data-kind") { continue; }
+            if (a == "class") {
+                if (v != "") { o.Put("class", JsonValue.NewStr(v)); }
+                continue;
+            }
+            if (a.Length > 5 && HtmlText.StartsWith(a, "data-")) {
+                PutAttr(o, a.Substring(5), v);
+            }
+        }
+        JsonValue kids = JsonValue.NewArray();
+        for (int i = 0; i < n.items.Count; i = i + 1) {
+            WItem it = n.items[i];
+            if (it.kid < 0) { continue; }
+            kids.Append(FieldJson(doc, doc.nodes[it.kid]));
+        }
+        if (kids.Count() > 0) { o.Put("kids", kids); }
+        return o;
+    }
+
+    /// 一个 data- 后缀属性折进对象：on-<kebab> → "on"+Pascal 事件键；
+    /// x-<kebab> → 复合 JSON 或字符串的未建模键；其余 → Unkebab 键 +
+    /// 标量嗅探（true/false → 布尔，整数/小数字面 → 数字，其余字符串）。
+    static void PutAttr(JsonValue o, string suffix, string v) {
+        if (HtmlText.StartsWith(suffix, "on-")) {
+            // 事件键恢复 Pascal（"on-click" → "onClick"；多段
+            // "on-row-click" → "onRowClick"）。
+            string ev = suffix.Substring(3);
+            if (ev.Length > 0 && ev[0] >= 97 && ev[0] <= 122) {
+                ev = (char)(ev[0] - 32) + ev.Substring(1);
+            }
+            o.Put("on" + Unkebab(ev), JsonValue.NewStr(v));
+            return;
+        }
+        if (HtmlText.StartsWith(suffix, "x-")) {
+            string key = Unkebab(suffix.Substring(2));
+            if (v != "" && (v[0] == 123 || v[0] == 91)) {
+                JsonValue parsed = null;
+                try { parsed = JsonValue.Parse(v); } catch (Exception ex) {
+                    parsed = null;
+                }
+                if (parsed != null) { o.Put(key, parsed); return; }
+            }
+            o.Put(key, JsonValue.NewStr(v));
+            return;
+        }
+        string key2 = Unkebab(suffix);
+        if (v == "true" || v == "false") {
+            o.Put(key2, JsonValue.NewBool(v == "true"));
+            return;
+        }
+        if (IsNumeric(v)) { o.Put(key2, JsonValue.NewNum(v)); return; }
+        o.Put(key2, JsonValue.NewStr(v));
+    }
+
+    /// 键值 → 属性写出发射（标量 false/""/0 跳过；复合值走 x- JSON）。
+    static void AppendKey(StringBuilder b, JsonValue v, string key,
+                          int mode) {
+        if (v.IsBool()) {
+            if (v.AsBool(false)) {
+                b.Append(" data-" + KebabKey(key) + "=\"true\"");
+            }
+            return;
+        }
+        if (v.IsNumber()) {
+            string t = v.ToJson();
+            if (t != "0") { b.Append(" data-" + KebabKey(key) + "=\"" + t + "\""); }
+            return;
+        }
+        if (v.IsString()) {
+            string s = v.AsString("");
+            if (s != "") { b.Append(" data-" + KebabKey(key) + "=\"" + EscapeAttr(s) + "\""); }
+            return;
+        }
+        // 复合值（数组/对象）：紧凑 JSON 进 x- 属性
+        b.Append(" data-x-" + KebabKey(key) + "=\""
+                 + EscapeAttr(v.ToJson()) + "\"");
+    }
+
+    // ---- 键名 kebab ↔ camel ----------------------------------------------
+
+    /// "winW" → "win-w"；"onClick" → "on-click" 由调用方拆 on 前缀后
+    /// 调用（这里只处理纯 Pascal/camel 段）。
+    static string KebabKey(string s) {
+        string outp = "";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i];
+            if (c >= 65 && c <= 90) {
+                if (i > 0) { outp = outp + "-"; }
+                outp = outp + (char)(c + 32);
+            } else {
+                outp = outp + s.Substring(i, 1);
+            }
+        }
+        return outp;
+    }
+
+    /// "win-w" → "winW"；"row-click" → "RowClick"（事件端用）。
+    static string Unkebab(string s) {
+        List<string> parts = s.Split("-");
+        string outp = parts.Count > 0 ? parts[0] : "";
+        for (int i = 1; i < parts.Count; i = i + 1) {
+            string p = parts[i];
+            if (p.Length == 0) { continue; }
+            int c0 = p[0];
+            // 首字母大写用 char+string 拼接——char 上直接调 ToString()
+            // 会得到码点数字（'M'.ToString() == "77"）。
+            string head = p;
+            if (c0 >= 97 && c0 <= 122) { head = (char)(c0 - 32) + p.Substring(1); }
+            outp = outp + head;
+        }
+        return outp;
+    }
+
+    static bool IsNumeric(string s) {
+        if (s == "") { return false; }
+        int i = s[0] == 45 ? 1 : 0;
+        int digits = 0;
+        int dots = 0;
+        while (i < s.Length) {
+            int c = s[i];
+            if (c >= 48 && c <= 57) { digits = digits + 1; }
+            else if (c == 46) { dots = dots + 1; }
+            else { return false; }
+            i = i + 1;
+        }
+        return digits > 0 && dots <= 1;
+    }
+
+    /// 属性值实体转义。
+    static string EscapeAttr(string s) {
+        string outp = "";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            if (ch == "&") { outp = outp + "&amp;"; }
+            else if (ch == "<") { outp = outp + "&lt;"; }
+            else if (ch == ">") { outp = outp + "&gt;"; }
+            else if (ch == "\"") { outp = outp + "&quot;"; }
+            else { outp = outp + ch; }
+        }
+        return outp;
+    }
+
+    /// kind → 存储 tag（只为可读性；data-kind 是权威标记）。
+    static string KindTag(string kind) {
+        if (kind == "Label") { return "label"; }
+        if (kind == "Button") { return "button"; }
+        if (kind == "Input") { return "input"; }
+        if (kind == "TextArea") { return "textarea"; }
+        if (kind == "Image") { return "img"; }
+        return "div";
+    }
+
+    /// tag → kind（读端兜底；data-kind 缺失时）。
+    static string TagKind(string tag) {
+        if (tag == "label") { return "Label"; }
+        if (tag == "button") { return "Button"; }
+        if (tag == "input") { return "Input"; }
+        if (tag == "textarea") { return "TextArea"; }
+        if (tag == "img") { return "Image"; }
+        return "Panel";
+    }
+}

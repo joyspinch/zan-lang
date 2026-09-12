@@ -924,7 +924,19 @@ pt/pc/cm/mm/in/q）+ `calc()/min()/max()/clamp()`；`%` 在各属性原有通道
   经编解码器转换入库）+ conformance_gui_zform_html（同一 zform_control 测
   试与金标，设计稿改吃 .html——生成的 ZfPanel partial class 逐字节等价）；
   conformance glob 自动注册 designer_html（Gui 检测→gui 驱动），手工注册
-  撞名一次。standard 层全绿后提交。
+  撞名一次。standard 层 394/399（pagination/transfer=HEAD 已知；
+  win_automation/tray 复测绿；http_forwarder_stream 层内固定端口争用，
+  直跑绿）。**遗留阻塞记档（与 P7a 无关）**：ZanIDE 全量构建在当前 HEAD
+  即失败（clean worktree 复现）：ChartView.zan:177-183 四处 "ambiguous
+  type 'Action'"——Gui/Event.zan 与 Gui/Reactive/Events.zan 各有一个
+  `delegate void Action()`（均 ≥2026-07-15 已在），IDE 闭包内
+  count_simple(Action)>=2 触发 nsresolve 歧义改名，改名重写又打断
+  using-Gui 的解析（A311 类已锁定未修的改名重写缺陷形态）。二分实测
+  92ef35c5、dc3b55f9、2d7da4f1（P5 之前，仅判定未复核错误正文）均
+  FAIL——回归早于整个 Web-GUI 工程；画廊 344 文件同一 stdlib 绿、窄探针
+  绿 → IDE 显式清单+31 设计稿闭包特有。IDE 侧 .zan 改动经语法级单文件
+  检查验证（无解析错误），全量编译待该回归修复后补验；修向=nsresolve
+  改名重写根修（ctx_ns 命中即应短路，不得被改名表污染）。
 
 # A17-A31 历史修复记录（全部完成，一行摘要）
 

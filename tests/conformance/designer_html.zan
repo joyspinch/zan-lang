@@ -1,0 +1,132 @@
+using System;
+using System.Json;
+using System.Web;
+using Gui.Designer;
+
+/// WEB_GUI_ROADMAP P7a：设计器 HTML 存取格式的编解码器测试。
+///
+/// 覆盖三层，全部以"逐键保真往返"为准绳：
+///   1. DesignerHtml 纯层：设计 JSON → HTML → 设计 JSON 的全键
+///      往返（文档级键、字段树、事件键 Pascal 还原、props 直通
+///      JSON、未建模键的 x- 通道）；IsDesignDoc 对设计稿/运行期
+///      HTML/空文本的三态判定。
+///   2. 设计器桥：LoadHtmlText → SaveHtml 再入 LoadHtmlText 的
+///      序列稳定（第二遍 SaveHtml 与第一遍逐字节一致），解析失败
+///      走 loadError。
+///   3. 编译期通道由 conformance_gui_zform_html 覆盖：同一份
+///      zform_control 测试改吃 .html 设计稿，断言输出与 .zform 版
+///      逐字节同金标准。
+class DesignerHtmlTest {
+    static int fails;
+
+    static void Eq(string what, string got, string want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got '" + got
+            + "' want '" + want + "'");
+    }
+
+    /// 递归逐键比较（对象按插入序、数组按序、标量比 JSON 文本）。
+    static void Cmp(JsonValue a, JsonValue b, string path) {
+        if (a == null || b == null) {
+            if (a != b) {
+                Console.WriteLine("DIFF null " + path);
+                fails = fails + 1;
+            }
+            return;
+        }
+        if (a.IsObject() && b.IsObject()) {
+            if (a.Count() != b.Count()) {
+                Console.WriteLine("DIFF size " + path + " "
+                    + a.Count() + " vs " + b.Count());
+                fails = fails + 1;
+            }
+            for (int i = 0; i < a.Count(); i = i + 1) {
+                string k = a.KeyAt(i);
+                Cmp(a.ValAt(i), b.Get(k), path + "." + k);
+            }
+            return;
+        }
+        if (a.IsArray() && b.IsArray()) {
+            if (a.Count() != b.Count()) {
+                Console.WriteLine("DIFF arr " + path);
+                fails = fails + 1;
+                return;
+            }
+            for (int i = 0; i < a.Count(); i = i + 1) {
+                Cmp(a.At(i), b.At(i), path + "[" + i + "]");
+            }
+            return;
+        }
+        string sa = a.IsNumber() ? a.ToJson() : a.AsString("");
+        string sb = b == null ? "<missing>"
+            : (b.IsNumber() ? b.ToJson() : b.AsString(""));
+        if (sa != sb) {
+            Console.WriteLine("DIFF val " + path + " '" + sa
+                + "' vs '" + sb + "'");
+            fails = fails + 1;
+        }
+    }
+
+    static void Main() {
+        fails = 0;
+
+        // ---- 1. 纯层往返 -------------------------------------------------
+        // 覆盖面：文档级字符串/数字/布尔键、role=control、layoutMode、
+        // 字段树（dock/fh/label/class）、复合 props 直通表、事件键
+        // onClick、未建模键（DataGrid columns 走 x- 通道）。
+        string json = "{\n"
+            + "  \"name\": \"RunStrip\",\n"
+            + "  \"role\": \"control\",\n"
+            + "  \"layoutMode\": 1,\n"
+            + "  \"winW\": 320,\n"
+            + "  \"winRound\": true,\n"
+            + "  \"fields\": [\n"
+            + "    { \"kind\": \"Divider\", \"name\": \"Rule\", \"dock\": 2, \"fh\": 3 },\n"
+            + "    { \"kind\": \"Panel\", \"name\": \"Line\", \"class\": \"runstrip\", \"dock\": 5,\n"
+            + "      \"props\": { \"min\": \"0\", \"max\": \"100\" },\n"
+            + "      \"columns\": [ { \"w\": 40 }, { \"w\": 60 } ],\n"
+            + "      \"kids\": [\n"
+            + "        { \"kind\": \"Label\", \"name\": \"StatusLbl\", \"label\": \"OK\", \"class\": \"small secondary\", \"dock\": 5 },\n"
+            + "        { \"kind\": \"Button\", \"name\": \"GoBtn\", \"onClick\": \"OnGo\" }\n"
+            + "      ] }\n"
+            + "  ]\n"
+            + "}\n";
+        string html = DesignerHtml.FromJsonDoc(json);
+        string back = DesignerHtml.ToJsonDoc(html);
+        Cmp(JsonValue.ParseLenient(json), JsonValue.ParseLenient(back), "");
+
+        // IsDesignDoc 三态：设计稿 true；运行期 UI 文档 false；空 false。
+        Eq("isdesign doc", DesignerHtml.IsDesignDoc(html) ? "1" : "0", "1");
+        Eq("isdesign ui",
+            DesignerHtml.IsDesignDoc("<div class=\"card\"><p>Hi</p></div>")
+                ? "1" : "0", "0");
+        Eq("isdesign empty", DesignerHtml.IsDesignDoc("") ? "1" : "0", "0");
+
+        // ---- 2. 设计器桥 -------------------------------------------------
+        Designer d = new Designer();
+        d.LoadHtmlText(html);
+        Eq("bridge loadError", d.loadError ? "1" : "0", "0");
+        string saved = d.SaveHtml();
+        Designer d2 = new Designer();
+        d2.LoadHtmlText(saved);
+        Eq("bridge reload", d2.loadError ? "1" : "0", "0");
+        Eq("bridge stable", d2.SaveHtml() == saved ? "1" : "0", "1");
+
+        // 空文档：HTML 解析对任何输入都产出（隐式）body——空文档
+        // 降级成空表单而非错误。HTML 没有 JSON 那样的"损坏"形态，
+        // loadError 通道对 .html 输入基本不可达（这是格式的诚实契约）。
+        Designer d3 = new Designer();
+        d3.LoadHtmlText("");
+        Eq("bridge empty", d3.loadError ? "1" : "0", "0");
+        Eq("bridge empty fields",
+           d3.SaveHtml().Contains("<div") || d3.SaveHtml().Contains("<label")
+           ? "1" : "0", "0");
+
+        if (fails == 0) {
+            Console.WriteLine("P7 designer html OK");
+        } else {
+            Console.WriteLine("P7 designer html FAILS " + fails);
+        }
+    }
+}

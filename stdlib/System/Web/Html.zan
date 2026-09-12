@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Json;
 using System.Text;
 
 namespace System.Web;
@@ -304,12 +305,21 @@ class WOpenResult {
 }
 
 class HtmlParser {
+    /// head 的 data-* 属性暂存（head 是透明容器；P7 设计器文档把
+    /// 文档级元数据放 body 属性，head 侧只透传 data- 键）。
+    static JsonValue pendingHeadAttr;
+    /// 解析游标是否在 <head> 区内（head 透明，子元素按 head 语义
+    /// 处理：不建节点、不触发隐式 body；</head> 之后当正文）。
+    static bool inHead;
+
     /// 解析 `html`（整文档或片段）为声明记录。`baseDir` 是 `<link>`
     /// 相对路径的基目录（空 = 不解析 link）。
     static WDoc Parse(string html, string baseDir) {
         WDoc doc = new WDoc();
         doc.css = "";
         doc.nodes = new List<WNode>();
+        pendingHeadAttr = JsonValue.NewObject();
+        inHead = false;
         List<WFrame> st = new List<WFrame>();
         int n = html.Length;
         int i = 0;
@@ -452,9 +462,58 @@ class HtmlParser {
                 return;   // 捕获帧（button/textarea）内嵌元素：忽略
             }
         }
-        if (name == "html" || name == "head") { return; }   // 透明容器
+        if (name == "html") { return; }   // 透明容器
+        if (name == "head") {
+            // head 透明，但它的属性要保真（设计器文档的
+            // <title> 等经 head 属性透传——title 元素本身丢弃）。
+            for (int hi = 0; hi < an.Count; hi = hi + 1) {
+                if (HtmlText.StartsWith(an[hi], "data-")) {
+                    pendingHeadAttr.Put(an[hi], JsonValue.NewStr(av[hi]));
+                }
+            }
+            inHead = true;
+            return;
+        }
+        // head 区元素（meta/link/style/script/title）不能触发隐式
+        // body——否则整文档的真 body 到来时已被占位当"迟到"丢弃。
+        // head 之后的第一个正文级标签恢复正常语义。
+        if (inHead) {
+            if (name == "meta" || name == "base") { return; }
+            if (name == "link") {
+                string rel0 = HtmlText.Attr(an, av, "rel").ToLower();
+                string href0 = HtmlText.Attr(an, av, "href");
+                if (rel0 == "stylesheet" && href0 != "" && baseDir != "") {
+                    string path0 = baseDir + "/" + href0;
+                    if (File.Exists(path0)) {
+                        string css0 = File.ReadAllText(path0);
+                        doc.css = doc.css + css0 + "\n";
+                    }
+                }
+                return;
+            }
+            if (name == "style") {
+                st.Add(HtmlParser.Frame(doc, 0 - 1, "style", 2));
+                return;
+            }
+            if (name == "script" || name == "title") {
+                st.Add(HtmlParser.Frame(doc, 0 - 1, name, 3));
+                return;
+            }
+            inHead = false;   // head 之外的其他标签：当正文
+        }
         if (name == "body") {
             if (doc.nodes.Count > 0) { return; }   // 重复/迟到 body 忽略
+            for (int hi = 0; hi < pendingHeadAttr.Count(); hi = hi + 1) {
+                string hk = pendingHeadAttr.KeyAt(hi);
+                bool dup = false;
+                for (int bi = 0; bi < an.Count; bi = bi + 1) {
+                    if (an[bi] == hk) { dup = true; break; }
+                }
+                if (!dup) {
+                    an.Add(hk);
+                    av.Add(pendingHeadAttr.ValAt(hi).AsString(""));
+                }
+            }
             HtmlParser.PushNode(doc, "body", 0 - 1, an, av);
             st.Add(HtmlParser.Frame(doc, doc.nodes.Count - 1, "body", 0));
             return;

@@ -990,3 +990,18 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
 - 最小复现：`_min.zform name="App"` + `partial class App` + `--auto-stdlib`。
 - 修向：GenForm 回退基名时检查 stdlib 已占用类名（撞则报错或加后缀）；
   nsresolve 已解析的命名空间内部引用不得被用户全局改名表污染。
+## 生成器缓存键曾漏哈希闭包内文件（2026-09-12 P7a 根修，现已全 stdlib 哈希）
+
+**坑**：`zan_gen_ensure` 的缓存键原先只哈希 `System/Compiler/` 下 9 个固定
+文件；而生成器 exe 是 `zanc ZanGen.zan --auto-stdlib` 编的，其行为由整个
+stdlib 闭包定义（GenForm P7a 起引用 System/Web/DesignerHtml.zan，GenHtml
+本就引用 Html.zan）。结果：改了闭包内非 Compiler 文件 → 键不变 → 复用旧
+生成器 → "stdlib 已修、行为依旧"的幽灵，且无任何诊断（编译/链接全绿）。
+**实锤过程**：e2e 里 .zform 版全绿、.html 版静默不投影；清缓存强制重建后
+立刻好——与代码逻辑无关，纯缓存键漏文件。
+
+**现状（已修）**：键哈希 stdlib 根下全部 `.zan`（FindFirstFile/POSIX
+recurse 收集相对路径 → qsort 定序 → 逐文件哈希路径+内容）。以后给生成器
+加源/改 stdlib 闭包内任何文件，无需再动 genrun.c 的清单；kGenSources 清
+单已删。临时绕过手段（诊断用）：删 `%LOCALAPPDATA%/Zan/gen/ZanGen_*.exe`
+强制重建——看到 "zan: compiling code generators" 才是真重建。

@@ -2578,6 +2578,20 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_zform_control${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # WEB_GUI_ROADMAP P7a: the designer's HTML storage format is exercised by
+  # tests/conformance/designer_html.zan (codec roundtrip + designer bridge),
+  # auto-registered by the conformance glob above; the compile-time channel
+  # (.html design doc -> the same GenForm projection as .zform) by the case
+  # below, which reuses the zform_control golden byte for byte.
+  add_test(NAME conformance_gui_zform_html
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/zform_control_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/zform_control.html;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_zform_control.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_zform_html${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # Declarative typed grid: a DataGrid field with "of" + "columns" projects
   # typed accessor lambdas onto the generic column API, binds the caller's
   # List<T> directly (no DataRow), and "props"/"rowFactory" reach the state.

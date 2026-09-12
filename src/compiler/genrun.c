@@ -60,14 +60,10 @@ void zan_gen_take_source_texts(char ***texts, int *count) {
 #define GEN_EXE_SUFFIX ""
 #endif
 
-/* The generator sources, relative to <stdlib_root>/System/Compiler/. A
- * fixed list (no directory scan): adding a source file means extending it. */
-static const char *const kGenSources[] = {
-    "ZanGen.zan", "GenCommon.zan", "GenForm.zan", "GenScene.zan",
-    "GenHtml.zan",
-    "GenJson.zan", "GenRoute.zan", "GenDb.zan", "GenDbEmit.zan"
-};
-#define GEN_SOURCE_COUNT ((int)(sizeof(kGenSources) / sizeof(kGenSources[0])))
+/* The generator entry source is <stdlib_root>/System/Compiler/ZanGen.zan,
+ * compiled with --auto-stdlib, so its whole stdlib closure (System.Web and
+ * anything else it reaches) comes along without being listed here; the
+ * cache key hashes the stdlib tree instead (see zan_gen_hash_stdlib). */
 
 /* Full path of the running zanc executable (needed to compile the generator
  * with ourselves). */
@@ -377,6 +373,129 @@ static void zan_gen_sweep(const char *dir) {
     zan_gen_scan_dir(dir, zan_gen_sweep_one, (void *)dir);
 }
 
+/* The generator's behavior is defined by its whole stdlib closure, not just
+ * the System/Compiler sources: ZanGen.zan is compiled with --auto-stdlib, so
+ * GenForm/GenHtml freely reach into System.Web (HtmlParser, DesignerHtml)
+ * and every other stdlib module. The cache key therefore hashes every .zan
+ * under the stdlib root (deterministic order), so any stdlib edit yields a
+ * fresh generator image. */
+
+typedef struct zan_gen_strlist {
+    char **v;
+    size_t n;
+    size_t cap;
+} zan_gen_strlist;
+
+static void zan_gen_strlist_push(zan_gen_strlist *l, const char *s) {
+    if (l->n == l->cap) {
+        size_t ncap = l->cap ? l->cap * 2 : 64;
+        char **nv = (char **)realloc(l->v, ncap * sizeof(char *));
+        if (!nv) return; /* oom: the walk reports fewer files, cache may */
+        l->v = nv;       /* collide after an edit - acceptable degradation */
+        l->cap = ncap;
+    }
+    size_t len = strlen(s);
+    char *copy = (char *)malloc(len + 1);
+    if (!copy) return;
+    memcpy(copy, s, len + 1);
+    l->v[l->n++] = copy;
+}
+
+static int zan_gen_relcmp(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+/* Collect relative paths of every .zan under `root` (any nesting depth).
+ * Returns 0 on success, -1 when the root itself cannot be entered. */
+static int zan_gen_collect_zan(char *abs, size_t abscap, const char *rel,
+                               size_t rellen, zan_gen_strlist *out) {
+#ifdef _WIN32
+    char pattern[ZAN_GEN_MAX_PATH];
+    if (abscap < ZAN_GEN_MAX_PATH) return -1;
+    snprintf(pattern, sizeof(pattern), "%s\\*", abs);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return rellen == 0 ? -1 : 0;
+    do {
+        const char *name = fd.cFileName;
+        if (name[0] == '.' && (name[1] == '\0' ||
+                               (name[1] == '.' && name[2] == '\0'))) continue;
+        size_t alen = strlen(abs);
+        size_t nlen = strlen(name);
+        if (alen + 1 + nlen + 1 > abscap) continue;
+        char relbuf[ZAN_GEN_MAX_PATH];
+        snprintf(relbuf, sizeof(relbuf), "%s%s%.*s", rel,
+                 rellen ? "/" : "", (int)nlen, name);
+        abs[alen] = '\\';
+        memcpy(abs + alen + 1, name, nlen + 1);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            zan_gen_collect_zan(abs, abscap, relbuf, strlen(relbuf), out);
+        } else if (nlen > 4 && strcmp(name + nlen - 4, ".zan") == 0) {
+            zan_gen_strlist_push(out, relbuf);
+        }
+        abs[alen] = '\0';
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return 0;
+#else
+    DIR *d = opendir(abs[0] ? abs : ".");
+    if (!d) return rellen == 0 ? -1 : 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        const char *name = e->d_name;
+        if (name[0] == '.' && (name[1] == '\0' ||
+                               (name[1] == '.' && name[2] == '\0'))) continue;
+        size_t alen = strlen(abs);
+        size_t nlen = strlen(name);
+        if (alen + 1 + nlen + 1 > abscap) continue;
+        abs[alen] = '/';
+        memcpy(abs + alen + 1, name, nlen + 1);
+        char relbuf[ZAN_GEN_MAX_PATH];
+        struct stat st;
+        if (stat(abs, &st) != 0) { abs[alen] = '\0'; continue; }
+        if (S_ISDIR(st.st_mode)) {
+            snprintf(relbuf, sizeof(relbuf), "%s%s%.*s", rel,
+                     rellen ? "/" : "", (int)nlen, name);
+            zan_gen_collect_zan(abs, abscap, relbuf, strlen(relbuf), out);
+        } else if (nlen > 4 && strcmp(name + nlen - 4, ".zan") == 0) {
+            snprintf(relbuf, sizeof(relbuf), "%s%s%.*s", rel,
+                     rellen ? "/" : "", (int)nlen, name);
+            zan_gen_strlist_push(out, relbuf);
+        }
+        abs[alen] = '\0';
+    }
+    closedir(d);
+    return 0;
+#endif
+}
+
+/* Hash every .zan file under the stdlib root into `key`: first the relative
+ * path (renames/moves count), then the bytes. */
+static int zan_gen_hash_stdlib(uint64_t *key, const char *root) {
+    char abs[ZAN_GEN_MAX_PATH];
+    snprintf(abs, sizeof(abs), "%s", root);
+    zan_gen_strlist list;
+    list.v = NULL;
+    list.n = 0;
+    list.cap = 0;
+    if (zan_gen_collect_zan(abs, sizeof(abs), "", 0, &list) != 0) return -1;
+    qsort(list.v, list.n, sizeof(char *), zan_gen_relcmp);
+    for (size_t i = 0; i < list.n; i++) {
+        zan_gen_hash_text(key, list.v[i]);
+        char full[ZAN_GEN_MAX_PATH];
+        snprintf(full, sizeof(full), "%s%c%s", root, GEN_DIR_SEP_STR[0],
+                 list.v[i]);
+        if (zan_gen_hash_file(key, full) != 0) {
+            for (size_t j = 0; j < list.n; j++) free(list.v[j]);
+            free(list.v);
+            return -1;
+        }
+    }
+    for (size_t j = 0; j < list.n; j++) free(list.v[j]);
+    free(list.v);
+    return 0;
+}
+
 int zan_gen_ensure(const char *stdlib_root, char *exe, size_t exe_size) {
     if (!zan_gen_enabled) return -1;
     char dir[ZAN_GEN_MAX_PATH];
@@ -406,16 +525,10 @@ int zan_gen_ensure(const char *stdlib_root, char *exe, size_t exe_size) {
         return -1;
     }
     zan_gen_hash_text(&key, stdlib_root);
-    for (int i = 0; i < GEN_SOURCE_COUNT; i++) {
-        char src[ZAN_GEN_MAX_PATH];
-        snprintf(src, sizeof(src), "%s%cSystem%cCompiler%c%s",
-                 stdlib_root, GEN_DIR_SEP_STR[0], GEN_DIR_SEP_STR[0],
-                 GEN_DIR_SEP_STR[0], kGenSources[i]);
-        zan_gen_hash_text(&key, kGenSources[i]);
-        if (zan_gen_hash_file(&key, src) != 0) {
-            fprintf(stderr, "error: cannot hash code-generator source '%s'\n", src);
-            return -1;
-        }
+    if (zan_gen_hash_stdlib(&key, stdlib_root) != 0) {
+        fprintf(stderr, "error: cannot hash stdlib for the code-generator"
+                        " cache\n");
+        return -1;
     }
     snprintf(exe, exe_size, "%s%sZanGen_%016llx%s", dir, GEN_DIR_SEP_STR,
              (unsigned long long)key, GEN_EXE_SUFFIX);
