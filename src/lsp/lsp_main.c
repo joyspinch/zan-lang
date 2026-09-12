@@ -636,7 +636,7 @@ static void method_call_context(const char *text, size_t offset,
 
 /* ============================ diagnostics ============================ */
 
-/* Designer documents (.zform/.zscene JSON, .html/.htm P7d) are never Zan
+/* Designer documents (.zscene JSON, .html/.htm P7d) are never Zan
  * source: GenForm/GenScene project them at compile time and the designers
  * validate them live. Publish an empty list so any previously shown errors
  * clear on close, and so the zanc front-end never runs over them. */
@@ -657,8 +657,7 @@ static void publish_empty_diagnostics(lsp_server_t *s, const char *uri) {
 /* Run the front-end over `text` and publish diagnostics for `uri`. */
 static void publish_diagnostics(lsp_server_t *s, const char *uri, const char *text) {
     size_t ul = strlen(uri);
-    if ((ul > 6 && strcmp(uri + ul - 6, ".zform") == 0) ||
-        (ul > 7 && strcmp(uri + ul - 7, ".zscene") == 0) ||
+    if ((ul > 7 && strcmp(uri + ul - 7, ".zscene") == 0) ||
         (ul > 5 && strcmp(uri + ul - 5, ".html") == 0) ||
         (ul > 4 && strcmp(uri + ul - 4, ".htm") == 0)) {
         publish_empty_diagnostics(s, uri);
@@ -976,7 +975,7 @@ static void uri_to_native_path(const char *uri, char *out, size_t cap) {
 
 /* Re-index one changed document into the shared project index so completion
  * from OTHER files (e.g. a form's code-behind after the designer edited the
- * .zform) sees the change immediately, without a full project rescan. */
+ * design doc) sees the change immediately, without a full project rescan. */
 static void update_project_index(lsp_server_t *s, const char *uri,
                                  const char *text) {
     if (!g_project_intel || !uri || !text) return;
@@ -1308,8 +1307,8 @@ static void handle_hover(lsp_server_t *s, json_value *id, json_value *params) {
     intel_init(is);
     intel_parse_file(is, uri, doc->text, strlen(doc->text));
     hover_info_t h = intel_hover(is, word);
-    /* cross-file symbols (e.g. a .zform-projected widget field referenced from
-     * the business file) live in the project index */
+    /* cross-file symbols (e.g. a design-doc-projected widget field referenced
+     * from the business file) live in the project index */
     if (!h.valid && g_project_intel)
         h = intel_hover(g_project_intel, word);
     intel_free(is);
@@ -1357,9 +1356,9 @@ static void handle_definition(lsp_server_t *s, json_value *id, json_value *param
 
     int dl, dc;
     if (g.file[0] && strcmp(g.file, uri) != 0) {
-        /* cross-file symbol (e.g. a .zform-projected field): the target file
-         * is not open here, so use the recorded line directly; .zform symbols
-         * carry the JSON line of their "name" key. */
+        /* cross-file symbol (e.g. a design-doc-projected field): the target
+         * file is not open here, so use the recorded line directly; design-doc
+         * symbols carry their definition line. */
         dl = g.line;
         dc = 0;
     } else {

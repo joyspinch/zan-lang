@@ -525,6 +525,7 @@ add_executable(zan-lsp
     src/common/json.c
     src/common/rpc.c
     src/compiler/arena.c
+    src/compiler/builtin_api.c
     src/compiler/diag.c
     src/compiler/lexer.c
     src/compiler/ast.c

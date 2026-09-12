@@ -266,26 +266,28 @@ void intel_register_snippets(intellisense_t *is) {
     }
 }
 
-/* ---- .zform design-document indexing ----
+/* ---- design-document indexing helpers ----
  *
- * A .zform file is the visual designer's JSON description of a form (see
- * stdlib/Gui/Designer and src/ide_zan/ZanIDE.CodeNav.zan GenFormFile for the
- * format). At compile time the GenForm generator (stdlib/System/Compiler) projects it onto a synthetic
- * `partial class <Name>` with a static widget field per entry and event
- * bindings wired by handler name. The index mirrors that projection so the
- * business file's autocomplete, go-to-def and hover see the typed fields and
- * event handlers without the compiler having to run:
+ * Design documents (.zscene JSON, .html/.htm designer docs) are not Zan
+ * source: the GenForm/GenScene generators (stdlib/System/Compiler) project
+ * them onto synthetic `partial class <Name>` code with a widget field per
+ * entry and event bindings wired by handler name. The index mirrors that
+ * projection so the business file's autocomplete, go-to-def and hover see
+ * the typed fields and event handlers without the compiler having to run:
  *
- *   - the form name becomes a class symbol whose base type is Form,
- *   - each field (recursing into container kids) becomes a static field whose
- *     type is the mapped widget class (same table as GenForm's widget map),
- *   - each on*Event handler name and the top-level "submit" name become method
- *     symbols on the class.
+ *   - the doc name becomes a class symbol (Form for .html design docs,
+ *     object for .zscene),
+ *   - each field/element becomes a static field whose type is the mapped
+ *     widget class,
+ *   - each on*Event handler name and the top-level "submit" name become
+ *     method symbols on the class.
  */
 
-/* Concrete Gui widget type for a field type (must match the
- * stdlib/System/Compiler/GenForm.zan widget map). */
-static const char *intel_zform_widget(int ft) {
+/* Concrete Gui widget type for a legacy numeric field type (must match the
+ * stdlib/System/Compiler/GenForm.zan widget map). .html design docs carry
+ * the widget class name directly in data-kind; a bare number only survives
+ * in hand-written docs. */
+static const char *intel_design_widget(int ft) {
     if (ft == 0 || ft == 2 || ft == 3) return "Input";
     if (ft == 1 || ft == 14) return "TextArea";
     if (ft == 4) return "Radio";
@@ -300,54 +302,10 @@ static const char *intel_zform_widget(int ft) {
     return "Label";
 }
 
-/* Recursively index one .zform field object: its typed field symbol plus the
- * handlers named by its on*Event keys, then its container kids. */
-static void intel_zform_field(intellisense_t *is, const char *filepath,
-                              const char *class_name, json_value *field,
-                              int line, int col,
-                              const char *const *name_lines,
-                              const char *const *name_vals, int name_count) {
-    if (!field || field->type != JSON_OBJ) return;
-
-    const char *fname = json_get_str(json_obj_get(field, "name"));
-    if (fname && fname[0] && isalpha((unsigned char)fname[0])) {
-        json_value *tv = json_obj_get(field, "type");
-        int ft = (tv && tv->type == JSON_NUM) ? (int)tv->as.num : 0;
-        /* locate the "name" key's JSON line so go-to-def lands on the field */
-        int fline = line;
-        for (int k = 0; k < name_count; k++) {
-            if (name_vals[k] && strcmp(name_vals[k], fname) == 0) {
-                fline = atoi(name_lines[k]);
-                break;
-            }
-        }
-        add_symbol(is, fname, intel_zform_widget(ft), class_name, NULL,
-                   filepath, ISYM_FIELD, fline, col);
-    }
-
-    /* event handler names: every key starting with "on" whose value is a
-     * non-empty string names a handler the business file may implement. */
-    for (int i = 0; i < field->as.obj.count; i++) {
-        const char *key = field->as.obj.keys[i];
-        if (!key || key[0] != 'o' || key[1] != 'n') continue;
-        const char *h = json_get_str(field->as.obj.vals[i]);
-        if (h && h[0])
-            add_symbol(is, h, "void", class_name, "void handler()",
-                       filepath, ISYM_METHOD, line, col);
-    }
-
-    json_value *kids = json_obj_get(field, "kids");
-    if (kids && kids->type == JSON_ARR) {
-        for (int i = 0; i < kids->as.arr.count; i++)
-            intel_zform_field(is, filepath, class_name,
-                              kids->as.arr.items[i], line, col,
-                              name_lines, name_vals, name_count);
-    }
-}
-
-/* Scan the raw .zform text for `"name": "xxx"` key/value pairs and record the
- * 0-based line of each so field symbols can point at their JSON definition. */
-static int intel_zform_name_lines(const char *text, size_t len,
+/* Scan a JSON design document's raw text for `"name": "xxx"` key/value pairs
+ * and record the 0-based line of each so symbols can point at their JSON
+ * definition. */
+static int intel_doc_name_lines(const char *text, size_t len,
                                   const char *lines[64], const char *vals[64],
                                   int max) {
     int n = 0, line = 0;
@@ -390,62 +348,17 @@ static int intel_zform_name_lines(const char *text, size_t len,
     return n;
 }
 
-static void intel_parse_zform(intellisense_t *is, const char *filepath,
-                              const char *content, size_t len) {
-    char *text = (char *)malloc(len + 1);
-    if (!text) return;
-    memcpy(text, content, len);
-    text[len] = '\0';
-
-    json_value *root = json_parse(text);
-    free(text);
-    if (!root || root->type != JSON_OBJ) { json_free(root); return; }
-
-    const char *class_name = json_get_str(json_obj_get(root, "name"));
-    if (!class_name || !class_name[0]) { json_free(root); return; }
-
-    /* the form class, base type Form (member completion walks inheritance) */
-    add_symbol_ex(is, class_name, "Form", NULL, NULL, filepath, NULL,
-                  ISYM_CLASS, 0, 0, false, 0);
-
-    /* top-level "submit" names the default button handler */
-    const char *submit = json_get_str(json_obj_get(root, "submit"));
-    if (submit && submit[0])
-        add_symbol(is, submit, "void", class_name, "void handler()",
-                   filepath, ISYM_METHOD, 0, 0);
-
-    /* field name -> JSON line map for go-to-def */
-    const char *name_lines[64], *name_vals[64];
-    int name_count = intel_zform_name_lines(content, len, name_lines,
-                                            name_vals, 64);
-
-    json_value *fields = json_obj_get(root, "fields");
-    if (fields && fields->type == JSON_ARR) {
-        for (int i = 0; i < fields->as.arr.count; i++)
-            intel_zform_field(is, filepath, class_name,
-                              fields->as.arr.items[i], 0, 0,
-                              name_lines, name_vals, name_count);
-    }
-
-    for (int k = 0; k < name_count; k++) {
-        free((void *)name_lines[k]);
-        free((void *)name_vals[k]);
-    }
-    json_free(root);
-}
-
 /* ---- .html designer-document indexing (P7d storage format) ----
  *
- * A .html design doc (stdlib/System/Web/DesignerHtml) is the same form
- * model as .zform serialized as HTML: the body tag carries the
+ * A .html design doc (stdlib/System/Web/DesignerHtml) is the designer's
+ * JSON form model serialized as HTML: the body tag carries the
  * data-zan-design marker + id="FormName" (+ data-submit for the form-level
  * submit handler), each field element carries id="Name" +
  * data-kind="WidgetType", and event handlers ride data-on-<event>="Handler".
  * The encoder writes one element per line, so the index scans line-wise and
- * flattens nested containers (the .zform path flattens field names the same
- * way). Hand-edited elements wrapped across lines are not seen until the
- * designer re-saves - the same class of line assumption as the .zform
- * name-key scanner. Only docs carrying the marker are indexed; plain HTML
+ * flattens nested containers (one symbol per field, kids included).
+ * Hand-edited elements wrapped across lines are not seen until the
+ * designer re-saves. Only docs carrying the marker are indexed; plain HTML
  * pages produce no symbols. */
 
 /* Read attr="value" off one HTML line. `attr` must sit at a tag boundary
@@ -509,7 +422,7 @@ static int intel_html_handlers(const char *line, size_t len,
     return n;
 }
 
-static void intel_parse_zform_html(intellisense_t *is, const char *filepath,
+static void intel_parse_design_html(intellisense_t *is, const char *filepath,
                                    const char *content, size_t len) {
     /* pass 1: the marker line names the form and the form-level handlers */
     bool has_marker = false;
@@ -562,7 +475,7 @@ static void intel_parse_zform_html(intellisense_t *is, const char *filepath,
                 if (isalpha((unsigned char)kind[0])) {
                     wtype = kind;
                 } else if (kind[0] >= '0' && kind[0] <= '9') {
-                    wtype = intel_zform_widget(atoi(kind));
+                    wtype = intel_design_widget(atoi(kind));
                 }
                 add_symbol(is, fname, wtype, class_name, NULL,
                            filepath, ISYM_FIELD, line, 0);
@@ -610,8 +523,8 @@ static void intel_parse_zscene(intellisense_t *is, const char *filepath,
 
     /* element name -> JSON line map for go-to-def */
     const char *name_lines[64], *name_vals[64];
-    int name_count = intel_zform_name_lines(content, len, name_lines,
-                                            name_vals, 64);
+    int name_count = intel_doc_name_lines(content, len, name_lines,
+                                          name_vals, 64);
 
     json_value *els = json_obj_get(root, "elements");
     if (els && els->type == JSON_ARR) {
@@ -640,8 +553,8 @@ static void intel_parse_zscene(intellisense_t *is, const char *filepath,
     json_free(root);
 }
 
-/* Simple lexical scanner to extract symbols from Zan source. .zform files
- * (design documents) are indexed through their JSON projection instead. */
+/* Simple lexical scanner to extract symbols from Zan source. Design
+ * documents (.zscene, .html) are indexed through their projection instead. */
 void intel_parse_file(intellisense_t *is, const char *filepath,
                       const char *content, size_t len) {
     /* clear previous symbols from this file */
@@ -665,25 +578,21 @@ void intel_parse_file(intellisense_t *is, const char *filepath,
 
     if (!content || len == 0) return;
 
-    /* designer documents are not Zan source (.zform/.zscene JSON,
-     * .html P7d): index their compile-time projection (class + typed
+    /* designer documents are not Zan source (.zscene JSON, .html/.htm
+     * P7d): index their compile-time projection (class + typed
      * fields + event handlers) instead. */
     {
         size_t fl = strlen(filepath);
-        if (fl > 6 && strcmp(filepath + fl - 6, ".zform") == 0) {
-            intel_parse_zform(is, filepath, content, len);
-            return;
-        }
         if (fl > 7 && strcmp(filepath + fl - 7, ".zscene") == 0) {
             intel_parse_zscene(is, filepath, content, len);
             return;
         }
         if (fl > 5 && strcmp(filepath + fl - 5, ".html") == 0) {
-            intel_parse_zform_html(is, filepath, content, len);
+            intel_parse_design_html(is, filepath, content, len);
             return;
         }
         if (fl > 4 && strcmp(filepath + fl - 4, ".htm") == 0) {
-            intel_parse_zform_html(is, filepath, content, len);
+            intel_parse_design_html(is, filepath, content, len);
             return;
         }
     }
@@ -1982,15 +1891,13 @@ static void index_directory_recursive(intellisense_t *is, const char *dir_path) 
             size_t name_len = strlen(fd.cFileName);
             bool is_zan = name_len > 4 &&
                           strcmp(fd.cFileName + name_len - 4, ".zan") == 0;
-            bool is_zform = name_len > 6 &&
-                            strcmp(fd.cFileName + name_len - 6, ".zform") == 0;
             bool is_zscene = name_len > 7 &&
                              strcmp(fd.cFileName + name_len - 7, ".zscene") == 0;
             bool is_html = name_len > 5 &&
                            strcmp(fd.cFileName + name_len - 5, ".html") == 0;
             bool is_htm = name_len > 4 &&
                           strcmp(fd.cFileName + name_len - 4, ".htm") == 0;
-            if (is_zan || is_zform || is_zscene || is_html || is_htm) {
+            if (is_zan || is_zscene || is_html || is_htm) {
                 /* read file and parse it */
                 HANDLE hFile = CreateFileA(full_path, GENERIC_READ, FILE_SHARE_READ,
                                           NULL, OPEN_EXISTING, 0, NULL);
@@ -2042,15 +1949,13 @@ static void index_directory_recursive(intellisense_t *is, const char *dir_path) 
             size_t name_len = strlen(entry->d_name);
             bool is_zan = name_len > 4 &&
                           strcmp(entry->d_name + name_len - 4, ".zan") == 0;
-            bool is_zform = name_len > 6 &&
-                            strcmp(entry->d_name + name_len - 6, ".zform") == 0;
             bool is_zscene = name_len > 7 &&
                              strcmp(entry->d_name + name_len - 7, ".zscene") == 0;
             bool is_html = name_len > 5 &&
                            strcmp(entry->d_name + name_len - 5, ".html") == 0;
             bool is_htm = name_len > 4 &&
                           strcmp(entry->d_name + name_len - 4, ".htm") == 0;
-            if (is_zan || is_zform || is_zscene || is_html || is_htm) {
+            if (is_zan || is_zscene || is_html || is_htm) {
                 FILE *f = fopen(full_path, "rb");
                 if (f) {
                     fseek(f, 0, SEEK_END);
