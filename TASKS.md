@@ -2275,3 +2275,25 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
   留待后续刀次。验证：五键探针往返全绿；gui_props/gui_zform_control
   golden 字节级一致；gallery 全量编译过；smoke 全绿（除两个外部
   在途失败）。
+
+* **P8-2d 第二刀：57 个不可达 Extra 死臂删除（13 文件）+ 直调测试
+  改走管线**（2026-09-13）：判定矩阵 = spec 绑定状态 × SetProp 覆写
+  截写 × Extra 臂语义等价性 × 测试直调。删除的臂全部满足「spec 已绑
+  （PropOf 拦截）且无 SetProp 覆写截写且臂语义与 spec 路径等价且无
+  测试直调」：ColorPicker mode、Image.fit、Input.status、InputOtp
+  block/length/mask/readonly/separator/status、Progress.percent/
+  circles、Slider.marks、StatusBar.options、Tabs.options、
+  ToolStrip.options、TextArea maxlen/round/showCount/status、
+  Pagination jumperLabel/jumperSuffix。三个保留判定记台账：
+  ① ColorPicker.showAlpha 臂调 SetShowAlpha（关时重置 alpha=255），
+  spec 直绑 flag 丢副作用——整文件保留待三件套转换；
+  ② InputNumber.value 臂是 ParseScaled 缩放/精度解析，spec
+  Convert.ToInt32 语义完全不等价——整文件保留；③ ChoiceGroup/
+  radio_group 的 options 臂被 conformance 直调且多类文件待逐类判
+  ——保留。image_test/pagination_test 的直调 Extra 臂断言改为
+  GetProp/SetProp 管线断言（直调 Extra 臂 = 断言实现细节，管线
+  才是行为契约；pageSizes/order 走 SetProp 覆写截写、jumper 键走
+  spec 字段绑定，均已验证等价）。验证：image/pagination/colorpicker/
+  inputnumber/slider/tabs 测试全绿；gui_props/gui_zform_control/
+  gui_css golden 字节级一致；gallery 全量编译过；smoke 全绿（除
+  两个外部在途失败）。
