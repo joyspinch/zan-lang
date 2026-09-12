@@ -1,0 +1,65 @@
+using System;
+
+/// A310 回归：`comp.prop = f().field;`（右值是字段左值、但接收者产出
+/// owned 临时）不得合成活绑定——活绑定的 target 是刻意设计的**弱引用**
+/// （避免 model<->component 循环泄漏），而临时接收者在语句结束即被释放，
+/// target 从此悬空，下一帧读 Get() 就是 use-after-free。
+/// 修复：接收者是 owned 临时时降级为 const 快照绑定（IsLive()==false）。
+/// 接收者是被持有的对象（局部/字段/容器元素）时活绑定语义不变。
+
+class Model {
+    public string name;
+    public int age;
+}
+
+class Input {
+    public Binding<string> data;
+}
+
+class Counter {
+    public Binding<int> val;
+}
+
+class Program {
+    static Model MakeModel(string tag) {
+        Model m = new Model();
+        m.name = tag;
+        m.age = 33;
+        return m;
+    }
+
+    static void Churn(int n) {
+        // 与 Model 同尺寸类的堆复用，暴露悬空 target 的 use-after-free
+        for (int i = 0; i < n; i = i + 1) {
+            Model j = new Model();
+            j.name = "churn";
+        }
+    }
+
+    static void Main() {
+        // 临时接收者：必须降级为 const 快照
+        Input input = new Input();
+        input.data = MakeModel("snapshot").name;
+        Console.WriteLine(Convert.ToString(input.data.IsLive()));
+        Churn(20000);
+        Console.WriteLine(input.data.Get());
+
+        // 持久接收者：活绑定语义不变（Get 透读、Set 回写）
+        Model u = new Model();
+        u.name = "alice";
+        Input input2 = new Input();
+        input2.data = u.name;
+        Console.WriteLine(Convert.ToString(input2.data.IsLive()));
+        Console.WriteLine(input2.data.Get());
+        u.name = "carol";
+        Console.WriteLine(input2.data.Get());
+        input2.data.Set("dave");
+        Console.WriteLine(u.name);
+
+        // 字段链接收者是临时：同样降级
+        Counter c = new Counter();
+        c.val = MakeModel("unused").age;
+        Console.WriteLine(Convert.ToString(c.val.IsLive()));
+        Console.WriteLine(Convert.ToString(c.val.Get()));
+    }
+}

@@ -1035,18 +1035,24 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
 - conformance 用例 `reflect_object_payload`：类/串/一维数组/矩形数组四种载荷的
   `GetType()`+`is` 一起钉，四孪生（conformance/leakcheck/arcguard/determinism）。
 
-## Binding 活绑定悬空与 out 字段写穿丢失（2026-09-12 gui-wechat 名片会话，均未修）
+## Binding 活绑定弱引用契约与 out 字段写穿（2026-09-12 登记，2026-09-13 均已修闭账）
 
-- **A310**：`label.Text = someObj.field;`（Binding<T> 属性 ← 裸字段左值）合成活绑定
-  透过源对象逐帧读；源是调用后即释放的临时 → 绑定 `object target` 悬空 →
-  `Form_RenderFrame → Control_MeasureTree → Label_OnMeasure → Canvas_MeasureText`
-  崩，点击路径 30-50% 概率复现（llvm-symbolizer 对 out.exe 以
-  `0x140000000+RVA` 全 VMA 符号化定位）。右值被持有（`data[i]`）则安全。
-  修向：irgen 合成「源=字段左值」活绑定时强引用源对象或退化为快照绑定。
-- **A307**：`out` 实参目标是实例字段（`Fill(out v)`）编译干净、字段未写穿，
-  后续读/ARC retain 空指针崩；局部变量目标正常。疑 checker/irgen 对
-  「out 目标=字段槽」的地址计算丢对象基址。修复需配 conformance 用例。
-- 两者在模板侧的防御写法已沉淀进 zan-development skill（快照局部、先赋值再传参）。
+- **A310（已修）**：`comp.prop = f().field;`（Binding<T> 属性 ← 字段左值、但接收者
+  产出 owned 临时）曾合成活绑定——活绑定的 `object target` 是**刻意设计的弱引用**
+  （`emit_binding_value` 注释：强引用会让 model<->component 图成环泄漏），而临时
+  接收者在语句结束即被释放 → target 悬空，下一帧 `Get()` 读释放内存（轻则读出
+  空串，重则 MeasureTree 段错误；堆复用探针 + `IsLive()` 观察可稳定实锤）。
+  **修**：接收者 `expr_yields_owned_rc_value` 为真时不合成活绑定，降级为 const
+  快照（`IsLive()==false`，语义自洽：临时源本来就不存在"活"可言）；live 路径里
+  原来的临时接收者手动释放块随之变成死代码删除。持久接收者（局部/字段/容器元素）
+  的活绑定语义不变，`binding_sugar` 等金样逐字不动。**铁律升级**：模板侧"先快照
+  局部再赋 Binding 属性"的防御写法只对"绑定活得过源对象作用域"场景仍有意义；
+  编译器现在兜底 `f().field` 形态，回归用例 `tests/conformance/binding_temp_source.zan`。
+- **A307（已修，与 out_param_lvalue 同根因）**：`out` 实参目标是非标识符位置
+  （`Fill(out this.v)`/`out b.field`/`out arr[i]`）曾走 emit_expr 返回**存值**被
+  当地址写（int 字段存 7 就把 0x7 当指针）；修=emit_ref_arg 按位置解析真实地址
+  （实例字段/静态字段/数组与 List 元素/裸字段名=this.field）。回归
+  `tests/conformance/out_param_lvalue.zan`，2026-09-13 六形态补试零复现后闭账。
 
 ## A311 已修：设计类名撞 `Gui.App`（2026-09-12 下午锁定，续轮修复）
 

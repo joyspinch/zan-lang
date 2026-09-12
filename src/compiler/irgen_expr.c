@@ -2423,6 +2423,16 @@ static LLVMValueRef emit_binding_value(zan_irgen_t *g, zan_type_t *bind_t,
             if (ffs && !ffs->type) ffs = NULL;
             /* only bind live when the field's representation matches T */
             if (ffs && T && ffs->type->kind != T->kind) ffs = NULL;
+            /* The live target is a non-owning reference (cycle avoidance
+             * below), so a receiver that yields an owned temp (`f().name`)
+             * would dangle the moment this statement releases it — snapshot
+             * the field value into a const binding instead. */
+            if (ffs) {
+                zan_type_t *ot = infer_expr_type(g, rhs->member.object, locals);
+                if (ot && is_rc_managed_type(ot) &&
+                    expr_yields_owned_rc_value(g, rhs->member.object, locals))
+                    ffs = NULL;
+            }
         }
     }
     LLVMValueRef get_fn = NULL, set_fn = NULL;
@@ -2469,15 +2479,10 @@ static LLVMValueRef emit_binding_value(zan_irgen_t *g, zan_type_t *bind_t,
             LLVMGetTypeKind(LLVMTypeOf(obj_cast)) == LLVMPointerTypeKind)
             obj_cast = LLVMBuildBitCast(g->builder, obj_cast, tgt_t, "b.tgt.bc");
         /* non-owning target reference (like a weak field): the binding must
-         * not keep the model alive, or model<->component graphs would leak */
+         * not keep the model alive, or model<->component graphs would leak.
+         * Receivers yielding owned temps never get here (diverted to the
+         * const path above), so no release is owed on this path. */
         zan_store_fit(g, obj_cast, tptr);
-        {
-            /* an owned temp (e.g. `f().name`) is still released normally */
-            zan_type_t *ot = infer_expr_type(g, rhs->member.object, locals);
-            if (ot && is_rc_managed_type(ot) &&
-                expr_yields_owned_rc_value(g, rhs->member.object, locals))
-                emit_rc_release_for_type(g, ot, obj_val);
-        }
 
         LLVMValueRef gptr = LLVMBuildStructGEP2(g->builder, st, objp, (unsigned)fi_getter, "b.get");
         LLVMTypeRef gslot_t = LLVMStructGetTypeAtIndex(st, (unsigned)fi_getter);
