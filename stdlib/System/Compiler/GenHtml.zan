@@ -1,0 +1,233 @@
+using System;
+using System.Json;
+using System.Web;
+
+namespace System.Compiler;
+
+/// GenHtml.zan -- .html 声明文档 → 建树类的代码生成器
+/// （WEB_GUI_ROADMAP P5）。与运行时 App.LoadHtml 共用 System.Web 的
+/// 解析记录（HtmlParser.Parse 的 WDoc/WNode）：编译期把 .html 展开
+/// 成纯建树代码，发布不携带 HTML 文本与解析器；动态装载仍走
+/// App.LoadHtml（同一解析器，同一几何）。
+///
+/// 输入(design 请求的 files[i])：
+///   { "name": "ui.html", "text": "<html 文本>", "emitMain": 忽略 }
+/// 输出：reply.sources 里追加一段名为 name 的 .zan 源码，形态
+/// （ui.html → 类 UiHtml；类名 = 文件基名帕斯卡化 + Html 后缀）：
+///   public class UiHtml {
+///       public static string Css = "...<style> 与 style 属性收集...";
+///       public static Control Build(HtmlHandlers handlers) { ... }
+///   }
+/// 调用方：`Control root = UiHtml.Build(handlers);` 之后自行
+/// `app.UseAppCss(UiHtml.Css)`（或并进自己的样式表）再挂树。
+///
+/// 生成依据是 WDoc.nodes 声明记录（tag/父下标/属性/文档序内容）——
+/// 与运行时同一次解析的产物，天然同构。本文件只依赖 System.Web
+/// 纯层（不能 using Gui：生成器 exe 的活名闭包会滤掉 Gui 的
+/// 传递依赖，UiDriver 的 Json.Serialize 编译不进来）。
+class GenHtml {
+    /// 翻译 design 请求里所有 .html/.htm 文件；失败写 reply 的 error。
+    static void Translate(JsonValue req, JsonValue reply) {
+        JsonValue files = req.Get("files");
+        if (files == null || !files.IsArray()) { return; }
+        for (int i = 0; i < files.Count(); i = i + 1) {
+            JsonValue f = files.At(i);
+            string name = f.Str("name", "");
+            string lower = name.ToLower();
+            if (!lower.EndsWith(".html") && !lower.EndsWith(".htm")) {
+                continue;
+            }
+            string text = f.Str("text", "");
+            WDoc wd = HtmlParser.Parse(text, "");
+            StringBuilder outp = new StringBuilder();
+            if (!Emit(name, wd, outp)) {
+                GenCommon.Fail(reply, "GenHtml: cannot emit '" + name + "'");
+                return;
+            }
+            GenCommon.AddSource(reply, name, outp);
+        }
+    }
+
+    static bool Emit(string path, WDoc wd, StringBuilder outp) {
+        string cls = ClassName(path);
+        if (cls == "") { return false; }
+        // 行内 style 预扫：合成 .zgen-N 规则并进 Css 字面量（与运行时
+        // Html.Build 同一编号顺序——按记录序），EmitNode 按 genCls 发射
+        // AddClass。HTML 属性重复名取首个，一节点至多一条规则。
+        string css = wd.css;
+        List<string> genCls = new List<string>();
+        for (int i = 0; i < wd.nodes.Count; i = i + 1) {
+            WNode n = wd.nodes[i];
+            string g = "";
+            for (int k = 0; k < n.attrNames.Count; k = k + 1) {
+                if (n.attrNames[k] != "style") { continue; }
+                g = "zgen-" + Convert.ToString(genCls.Count);
+                css = css + "." + g + " { " + n.attrVals[k] + " }\n";
+                break;
+            }
+            genCls.Add(g);
+        }
+        StringBuilder b = new StringBuilder();
+        GenCommon.Line(b, 0, "// 由 GenHtml 从 " + BaseName(path)
+                             + " 生成 -- 编译期产物,勿手改。");
+        GenCommon.Line(b, 0, "using System;");
+        GenCommon.Line(b, 0, "using Gui;");
+        GenCommon.Line(b, 0, "");
+        GenCommon.Line(b, 0, "public class " + cls + " {");
+        GenCommon.Line(b, 1, "/// <style>、<link> 与 style 属性收集的 CSS："
+                           + "装载时并进 appCss（UseAppCss）。");
+        GenCommon.Line(b, 1, "public static string Css = \""
+                           + GenCommon.Esc(css) + "\";");
+        GenCommon.Line(b, 1, "");
+        GenCommon.Line(b, 1, "/// 构建树。handlers：data-on-* 注册表"
+                           + "（可 null）。\n"
+                           + "    public static Control Build("
+                           + "HtmlHandlers handlers) {");
+        for (int i = 0; i < wd.nodes.Count; i = i + 1) {
+            EmitDecl(b, wd.nodes[i], i, genCls[i]);
+        }
+        // 内容游走：逐父按 items 文档序发射 AddText / AddChild——
+        // 与运行时 Html.Parse 的装配同一顺序，混排行盒靠它同构。
+        for (int i = 0; i < wd.nodes.Count; i = i + 1) {
+            EmitContent(b, wd.nodes[i], i);
+        }
+        for (int i = 0; i < wd.nodes.Count; i = i + 1) {
+            EmitWiring(b, wd.nodes[i], i);
+        }
+        GenCommon.Line(b, 2, "return v0;");
+        GenCommon.Line(b, 1, "}");
+        GenCommon.Line(b, 0, "}");
+        outp.Append(b.ToString());
+        return true;
+    }
+
+    /// 一条记录 = 一个变量的声明 + 属性协议（构造；文本与挂树在
+    /// EmitContent 按文档序发射）。
+    static void EmitDecl(StringBuilder b, WNode n, int idx, string genCls) {
+        string v = "v" + idx;
+        string tag = n.tag;
+        string id = GenCommon.Esc(HtmlText.Attr(n.attrNames, n.attrVals,
+                                                "id"));
+        string type = HtmlText.Attr(n.attrNames, n.attrVals,
+                                    "type").ToLower();
+        if (tag == "button") {
+            GenCommon.Line(b, 2, "Button " + v + " = new Button();");
+            GenCommon.Line(b, 2, v + ".InitButton(\""
+                           + GenCommon.Esc(n.text) + "\");");
+        } else if (tag == "textarea") {
+            GenCommon.Line(b, 2, "TextArea " + v + " = new TextArea();");
+            GenCommon.Line(b, 2, v + ".InitTextArea(new SignalString(\""
+                           + GenCommon.Esc(n.text) + "\"), \"\");");
+        } else if (tag == "input" && type == "checkbox") {
+            GenCommon.Line(b, 2, "Checkbox " + v + " = new Checkbox();");
+            GenCommon.Line(b, 2, v + ".InitCheckbox(\"\", "
+                           + "new SignalBool(false));");
+        } else if (tag == "input") {
+            string val = HtmlText.Attr(n.attrNames, n.attrVals, "value");
+            string ph = HtmlText.Attr(n.attrNames, n.attrVals,
+                                      "placeholder");
+            GenCommon.Line(b, 2, "Input " + v + " = new Input();");
+            GenCommon.Line(b, 2, v + ".InitInput(new SignalString(\""
+                           + GenCommon.Esc(val) + "\"), \""
+                           + GenCommon.Esc(ph) + "\");");
+        } else if (tag == "img") {
+            string src = HtmlText.Attr(n.attrNames, n.attrVals, "src");
+            string alt = HtmlText.Attr(n.attrNames, n.attrVals, "alt");
+            GenCommon.Line(b, 2, "Image " + v + " = new Image();");
+            GenCommon.Line(b, 2, v + ".InitImage(\""
+                           + GenCommon.Esc(src) + "\", \""
+                           + GenCommon.Esc(alt) + "\", \"cover\");");
+        } else {
+            GenCommon.Line(b, 2, "Element " + v + " = new Element();");
+            GenCommon.Line(b, 2, v + ".InitElement(\"" + tag + "\", \""
+                           + id + "\");");
+        }
+        // 类与 id（非 Element 的 id 走 SetProp）
+        if (genCls != "") {
+            GenCommon.Line(b, 2, v + ".AddClass(\"" + genCls + "\");");
+        }
+        string clsAttr = HtmlText.Attr(n.attrNames, n.attrVals, "class");
+        if (clsAttr != "") {
+            List<string> cs = HtmlText.SplitClass(clsAttr);
+            for (int c = 0; c < cs.Count; c = c + 1) {
+                GenCommon.Line(b, 2, v + ".AddClass(\""
+                               + GenCommon.Esc(cs[c]) + "\");");
+            }
+        }
+        bool isWidget = tag == "button" || tag == "textarea"
+            || tag == "input" || tag == "img";
+        if (isWidget && id != "") {
+            GenCommon.Line(b, 2, v + ".SetProp(\"name\", \"" + id
+                           + "\");");
+        }
+        string bind = HtmlText.Attr(n.attrNames, n.attrVals, "data-bind");
+        if (bind != "") {
+            GenCommon.Line(b, 2, v + ".bindPath = \""
+                           + GenCommon.Esc(bind) + "\";");
+        }
+    }
+
+    /// 父节点 idx 的内容游走：文本片 AddText、子节点 AddChild，
+    /// 严格 items 文档序（只有容器记录带文本项——捕获控件的文本
+    /// 走自己的构造协议，void 元素无内容）。
+    static void EmitContent(StringBuilder b, WNode n, int idx) {
+        string v = "v" + idx;
+        for (int k = 0; k < n.items.Count; k = k + 1) {
+            WItem it = n.items[k];
+            if (it.kid < 0) {
+                GenCommon.Line(b, 2, v + ".AddText(\""
+                               + GenCommon.Esc(it.text) + "\");");
+            } else {
+                GenCommon.Line(b, 2, "Html.AddChild(" + v + ", v"
+                               + it.kid + ");");
+            }
+        }
+    }
+
+    /// data-on-* 接线（树建完统一挂，html 文档序不敏感）。
+    static void EmitWiring(StringBuilder b, WNode n, int idx) {
+        for (int i = 0; i < n.attrNames.Count; i = i + 1) {
+            string k = n.attrNames[i];
+            if (k.Length <= 8 || !HtmlText.StartsWith(k, "data-on-")) {
+                continue;
+            }
+            string suffix = k.Substring(8, k.Length - 8);
+            string evt = HtmlText.EventKind(suffix);
+            if (evt == "") { continue; }
+            GenCommon.Line(b, 2, "Html.Wire(handlers, v" + idx + ", \""
+                           + evt + "\", \""
+                           + GenCommon.Esc(n.attrVals[i]) + "\");");
+        }
+    }
+
+    /// "src/ui.html" → "UiHtml"（基名帕斯卡化 + Html；非标识符字符
+    /// 当分节符丢弃，数字开头的段补 _）。
+    static string ClassName(string path) {
+        string baseName = BaseName(path);
+        int dot = baseName.LastIndexOf(".");
+        if (dot > 0) { baseName = baseName.Substring(0, dot); }
+        string outp = "";
+        bool up = true;
+        for (int i = 0; i < baseName.Length; i = i + 1) {
+            int c = baseName[i];
+            bool alnum = (c >= 48 && c <= 57) || (c >= 65 && c <= 90)
+                || (c >= 97 && c <= 122);
+            if (!alnum) { up = true; continue; }
+            if (outp.Length == 0 && c >= 48 && c <= 57) {
+                outp = outp + "_";
+            }
+            string ch = baseName.Substring(i, 1);
+            if (up) { ch = ch.ToUpper(); up = false; }
+            outp = outp + ch;
+        }
+        if (outp.Length == 0) { return ""; }
+        return outp + "Html";
+    }
+
+    static string BaseName(string path) {
+        int slash = path.LastIndexOf("/");
+        int back = path.LastIndexOf("\\");
+        int at = slash > back ? slash : back;
+        return at >= 0 ? path.Substring(at + 1) : path;
+    }
+}

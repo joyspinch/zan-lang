@@ -64,6 +64,7 @@ void zan_gen_take_source_texts(char ***texts, int *count) {
  * fixed list (no directory scan): adding a source file means extending it. */
 static const char *const kGenSources[] = {
     "ZanGen.zan", "GenCommon.zan", "GenForm.zan", "GenScene.zan",
+    "GenHtml.zan",
     "GenJson.zan", "GenRoute.zan", "GenDb.zan", "GenDbEmit.zan"
 };
 #define GEN_SOURCE_COUNT ((int)(sizeof(kGenSources) / sizeof(kGenSources[0])))
@@ -490,7 +491,9 @@ int zan_gen_run(const char *exe, const char *meta_path, const char *out_path) {
 static bool zan_is_design_path(const char *p) {
     size_t n = strlen(p);
     return (n > 6 && strcmp(p + n - 6, ".zform") == 0) ||
-           (n > 7 && strcmp(p + n - 7, ".zscene") == 0);
+           (n > 7 && strcmp(p + n - 7, ".zscene") == 0) ||
+           (n > 5 && strcmp(p + n - 5, ".html") == 0) ||
+           (n > 4 && strcmp(p + n - 4, ".htm") == 0);
 }
 
 /* A saved user component (designer "save as component"): pure design data
