@@ -218,7 +218,12 @@ partial class ChartView {
                         // 提亮成浅色带，堆叠色块之间看起来隔了一条
                         // 白线（衔接瑕疵）。中段平铺后接缝是纯色对
                         // 纯色的 1px 过渡，与 ECharts 堆叠柱一致。
-                        int drawTop = yTop;
+                        // 绘制矩形必须用归一化的 segY0/segY1：负值段的
+                        // segH = yBot - yTop 是负数（Y 向下增大），
+                        // BarCell 的 `h <= 0` 守卫会整段吞掉。正值段
+                        // segY0 == yTop、segY1-segY0 == segH，逐像素不变。
+                        int drawTop = segY0;
+                        int drawH = segY1 - segY0;
                         int segRad = rad;
                         bool segGrad = o.gradient && si == topSi[gi];
                         if (si != topSi[gi]) { segRad = 0; }
@@ -229,7 +234,7 @@ partial class ChartView {
                             && sc.data[oi].itemStyle.normal.borderRadius.Count > 0) {
                             segR4 = sc.data[oi].itemStyle.normal.borderRadius;
                         }
-                        ChartView.BarCellR4(c, bx, drawTop, barW, segH, segR4,
+                        ChartView.BarCellR4(c, bx, drawTop, barW, drawH, segR4,
                             segRad, sc.color, segGrad);
                         // barBorderColor/barBorderWidth（ECharts 2.2.x）：
                         // 描边贴着段外框；悬停时被 emphasis 覆盖
@@ -477,6 +482,12 @@ partial class ChartView {
                                 // 负值柱条垂挂在零基线下方
                                 int bh = zeroY - by;
                                 if (bh < 0) { bh = 0 - bh; }
+                                // barMinHeight：零基线不动、值端推到至少 min
+                                // 像素（barGrid.ts:470-472 的竖向分支）。
+                                if (s.barMinHeight > 0) {
+                                    int mhN = app.Scale(s.barMinHeight);
+                                    if (bh < mhN) { bh = mhN; }
+                                }
                                 if (!s.silent && mxB >= bx && mxB < bx + barW
                                     && myB >= zeroY && myB < zeroY + bh && bh > 0) {
                                     barHit = ChartView.MakeDataHit(s, si, oi,
@@ -528,6 +539,14 @@ partial class ChartView {
                             } else {
                                 int bh = zeroY - by;
                                 if (bh < 0) { bh = 0; }
+                                // barMinHeight：值端推离零基线到至少 min 像素。
+                                // 源的判定是 height<=0（barGrid.ts:472），零值柱
+                                // 因此归"向上"——这里的 vF==0 正落在本分支，把
+                                // 顶边改到 zeroY-min 即等价（零基线不动）。
+                                if (s.barMinHeight > 0) {
+                                    int mhP = app.Scale(s.barMinHeight);
+                                    if (bh < mhP) { bh = mhP; by = zeroY - mhP; }
+                                }
                                 if (!s.silent && mxB >= bx && mxB < bx + barW
                                     && myB >= by && myB < zeroY && bh > 0) {
                                     barHit = ChartView.MakeDataHit(s, si, oi,
@@ -713,6 +732,15 @@ partial class ChartView {
                 if (th < app.Scale(2)) { th = app.Scale(2); }
                 int bxh = px < baseX ? px : baseX;
                 int bwid = px < baseX ? baseX - px : px - baseX;
+                // 横条长度沿值轴（x），barMinHeight 补的是这个长度；
+                // 源判定 width<0（barGrid.ts:457），零值归正方向。
+                if (s.barMinHeight > 0) {
+                    int mhX = app.Scale(s.barMinHeight);
+                    if (bwid < mhX) {
+                        bwid = mhX;
+                        bxh = px < baseX ? baseX - mhX : baseX;
+                    }
+                }
                 int byh = py - th / 2;
                 bool hovH = mx >= bxh && mx < bxh + bwid
                     && my >= byh && my < byh + th;
@@ -745,6 +773,15 @@ partial class ChartView {
             int bx = px - bw / 2;
             int y0 = py < zeroY ? py : zeroY;
             int bh = py < zeroY ? zeroY - py : py - zeroY;
+            // barMinHeight：同竖向分支（barGrid.ts:470-472）；py<=zeroY
+            // 即源的 height<=0，零值归向上，顶边改到 zeroY-min。
+            if (s.barMinHeight > 0) {
+                int mhV = app.Scale(s.barMinHeight);
+                if (bh < mhV) {
+                    bh = mhV;
+                    y0 = py <= zeroY ? zeroY - mhV : zeroY;
+                }
+            }
             bool hov = mx >= bx && mx < bx + bw && my >= y0 && my < y0 + bh;
             if (hov && bh > 0) {
                 ChartView.OfferActiveHit(ChartView.MakeDataHit(s, si, j,
@@ -1207,10 +1244,23 @@ partial class ChartView {
                         }
                     }
                     int x1 = Chart.ValueX(plotX, plotW, lo, hi, v);
-                    int bx = x0;
-                    int bw = x1 - x0;
-                    bool toRight = true;
-                    if (bw < 0) { bx = x1; bw = 0 - bw; toRight = false; }
+                    // barMinHeight：值轴横向时补的是宽度（barGrid.ts:456-457
+                    // 的 isValueAxisH 分支）。源的形态是 x = baseCoord（零
+                    // 基线）+ 有向 width，钳制只改 width 的大小不改锚点——
+                    // 负值柱因此从零基线向左长 mh，而不是从值端向右长。
+                    // 源判定是 width<0（不含 0），零值柱归正方向。
+                    int sw = x1 - x0;
+                    if (series[si].barMinHeight > 0) {
+                        int mhH = app.Scale(series[si].barMinHeight);
+                        if (sw < 0) {
+                            if (0 - sw < mhH) { sw = 0 - mhH; }
+                        } else {
+                            if (sw < mhH) { sw = mhH; }
+                        }
+                    }
+                    int bx = sw < 0 ? x0 + sw : x0;
+                    int bw = sw < 0 ? 0 - sw : sw;
+                    bool toRight = sw >= 0;
                     // 本系列在行带内的柱列（barGrid 解算）。
                     ChartBarCol hbc2 = hColOf[si];
                     int by = ChartView.BarY0(plotY, i, band, hbc2.offset);

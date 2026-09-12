@@ -2279,6 +2279,22 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_chart_background${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # barMinHeight 最小柱高回归（账本 A5）：ECharts layout/barGrid.ts:456-472
+  # 把 |height| < barMinHeight 的柱条按符号补足（竖向分支的判定是
+  # height<=0，零值柱因此归"向上"），值轴横向时补的是宽度。此前该选项
+  # 从不解析也不应用，几乎为零的柱条取整成 0px 整根消失。
+  # 用例离屏渲染真图后逐像素数出柱条包围盒（Canvas.GetPixel，与
+  # chart_fillaa / chart_background 同一套无窗口装置）：声明 min 的
+  # 柱条必须达到该像素数，未声明的必须仍是原样（不回归）。
+  add_test(NAME conformance_gui_chart_barminheight
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/chart_barminheight_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_chart_barminheight.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_chart_barminheight${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   add_test(NAME conformance_gui_layer
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>

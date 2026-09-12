@@ -1,0 +1,162 @@
+using System;
+using Gui;
+using Gui.Component.Chart;
+
+/// A5 回归：barMinHeight 必须把"几乎为零"的柱条补足到最小像素尺寸。
+///
+/// 缺口原状：ECharts `barMinHeight`（layout/barGrid.ts:456-472）把
+/// |height| < min 的柱条按符号补足——竖轴柱 0.05 的销量在官方图里
+/// 仍是一条可见的短柱，Zan 侧因 bh 直接取整成 0px 而整根消失。
+/// 值轴横向时补的是宽度（同源 isValueAxisH 分支）。
+///
+/// 本用例离屏渲染真图、逐像素数出柱条包围盒，断言：
+///   1. 声明 barMinHeight 时，柱条达到该像素数（竖高 / 横宽）；
+///   2. 不声明时（缺省 0）柱条仍是原来的不可见高度（不回归）；
+///   3. 负值与零值同样补足（源的竖向判定是 height<=0）。
+/// 断言是像素计数，跨栅格化后端成立。
+class Program {
+    static int fails;
+
+    static void True(string what, bool got) {
+        if (got) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    /// 失败时才落诊断：golden 必须与 stdout 逐字节一致，而像素计数
+    /// 随 DPI/字体缩放浮动，钉进 golden 会让用例在别的机器上假红。
+    static void Note(string s) {
+        if (fails > 0) { Console.WriteLine(s); }
+    }
+
+    /// 离屏渲染一份 option。
+    ///
+    /// KeyedStatic 是必须的：Of() 会走增长入场动画，首帧 g 可能为 0
+    /// （整图还没长出来），断言量到的是空图而不是柱高差异。
+    static Canvas Render(string json, int w, int h) {
+        ChartOption o = ChartOption.FromJson(json);
+        App app = new App("a5", w, h);
+        app.BeginFrame();
+        ChartView v = ChartView.KeyedStatic(o, 7);
+        v.Render(app, 0, 0, w, h);
+        return app.canvas;
+    }
+
+    /// 指定色（RGB 掩码后）的像素数 + 包围盒（宽/高）。
+    static int CountColor(Canvas c, int w, int h, int rgb,
+                          out int boxW, out int boxH) {
+        int n = 0;
+        int xLo = 0 - 1;
+        int xHi = 0 - 1;
+        int yLo = 0 - 1;
+        int yHi = 0 - 1;
+        for (int y = 0; y < h; y = y + 1) {
+            for (int x = 0; x < w; x = x + 1) {
+                if ((c.GetPixel(x, y) & 0x00FFFFFF) == rgb) {
+                    n = n + 1;
+                    if (xLo < 0 || x < xLo) { xLo = x; }
+                    if (xHi < 0 || x > xHi) { xHi = x; }
+                    if (yLo < 0 || y < yLo) { yLo = y; }
+                    if (yHi < 0 || y > yHi) { yHi = y; }
+                }
+            }
+        }
+        boxW = xLo < 0 ? 0 : xHi - xLo + 1;
+        boxH = yLo < 0 ? 0 : yHi - yLo + 1;
+        return n;
+    }
+
+    static void Main() {
+        fails = 0;
+        int W = 400;
+        int H = 300;
+        int red = Chart.Rgb(255, 0, 0) & 0x00FFFFFF;
+        int bw = 0;
+        int bh = 0;
+
+        // ---- 1. 竖向：值 1 对 yAxis max 1000 ----
+        // 无 barMinHeight 时柱高 = 222/1000 < 1px，取整成 0 整根不见；
+        // 声明 40 后必须是一条 40px 高的柱。
+        string baseJson = "{\"xAxis\":{\"type\":\"category\",\"data\":[\"a\"]},"
+            + "\"yAxis\":{\"type\":\"value\",\"max\":1000},"
+            + "\"series\":[{\"type\":\"bar\",\"itemStyle\":{\"color\":\"#ff0000\"},";
+
+        Canvas cMin = Render(baseJson + "\"barMinHeight\":40,\"data\":[1]}]}", W, H);
+        int nMin = CountColor(cMin, W, H, red, out bw, out bh);
+        int hMin = bh;
+        Canvas cNo = Render(baseJson + "\"data\":[1]}]}", W, H);
+        int nNo = CountColor(cNo, W, H, red, out bw, out bh);
+        int hNo = bh;
+
+        Note("minh40: n=" + Convert.ToString(nMin)
+            + " bboxH=" + Convert.ToString(hMin));
+        Note("unset:  n=" + Convert.ToString(nNo)
+            + " bboxH=" + Convert.ToString(hNo));
+
+        True("barMinHeight draws a bar", nMin > 0);
+        True("barMinHeight lifts height to 40px", hMin >= 40);
+        True("unset stays invisible (no regression)", nNo == 0);
+        True("barMinHeight adds ink vs unset", nMin > nNo);
+
+        // ---- 2. 负值：源的竖向判定 height<=0 归负方向，柱垂挂在
+        // 零线下并补足。零线须留在绘图区中部，否则补足的像素落在
+        // 绘图区外被裁剪（源同样裁剪，属正确行为）。
+        string negJson = "{\"xAxis\":{\"type\":\"category\",\"data\":[\"a\"]},"
+            + "\"yAxis\":{\"type\":\"value\",\"min\":-1000,\"max\":1000},"
+            + "\"series\":[{\"type\":\"bar\",\"itemStyle\":{\"color\":\"#ff0000\"},";
+        Canvas cNeg = Render(negJson + "\"barMinHeight\":40,\"data\":[-1]}]}", W, H);
+        int nNeg = CountColor(cNeg, W, H, red, out bw, out bh);
+        Note("neg40:  n=" + Convert.ToString(nNeg)
+            + " bboxH=" + Convert.ToString(bh));
+        True("negative bar also lifted", nNeg > 0 && bh >= 40);
+
+        // ---- 3. 零值：height<=0 因此归负方向 → 画成向上的 min 柱 ----
+        Canvas cZero = Render(baseJson + "\"barMinHeight\":40,\"data\":[0]}]}", W, H);
+        int nZero = CountColor(cZero, W, H, red, out bw, out bh);
+        Note("zero40: n=" + Convert.ToString(nZero)
+            + " bboxH=" + Convert.ToString(bh));
+        True("zero bar drawn upward", nZero > 0 && bh >= 40);
+
+        // ---- 4. 水平柱（值轴横向）：补的是宽度。用"一个大值 + 一个
+        // 极小值"造出亚像素柱宽（值轴量程由数据决定，HBarCore 目前
+        // 不读声明的 axis.min/max——见台账 B17 残留）。值 1 对
+        // max 100000 的映射不足 1px，声明 40 后必须变成 40px 宽。
+        string hJson = "{\"xAxis\":{\"type\":\"value\"},"
+            + "\"yAxis\":{\"type\":\"category\",\"data\":[\"a\",\"b\"]},"
+            + "\"series\":[{\"type\":\"bar\",\"itemStyle\":{\"color\":\"#ff0000\"},";
+        string hData = "\"data\":[1,100000]}]}";
+        Canvas cHMin = Render(hJson + "\"barMinHeight\":40," + hData, W, H);
+        int nHMin = CountColor(cHMin, W, H, red, out bw, out bh);
+        Canvas cHNo = Render(hJson + hData, W, H);
+        int nHNo = CountColor(cHNo, W, H, red, out bw, out bh);
+        Note("hbar40: n=" + Convert.ToString(nHMin));
+        Note("hbar0:  n=" + Convert.ToString(nHNo));
+        True("hbar min width applied", nHMin > nHNo);
+
+        // ---- 5. 堆叠柱的负值段必须画出来 ----
+        // 段矩形曾用未归一化的 yTop/segH 绘制：负值段的 segH = yBot-yTop
+        // 是负数（Y 向下增大），BarCell 的 `h <= 0` 守卫把整段吞掉——
+        // bar-negative 的 stack:"Total" 负段整根消失。正值段不受影响
+        // （segY0 == yTop、segY1-segY0 == segH），所以这里两态都断言。
+        string stHead = "{\"xAxis\":{\"type\":\"category\",\"data\":[\"a\",\"b\"]},"
+            + "\"yAxis\":{\"type\":\"value\"},\"series\":[";
+        Canvas cStPos = Render(stHead
+            + "{\"type\":\"bar\",\"stack\":\"T\",\"itemStyle\":{\"color\":\"#ff0000\"},"
+            + "\"data\":[200,170]},"
+            + "{\"type\":\"bar\",\"stack\":\"T\",\"itemStyle\":{\"color\":\"#00ff00\"},"
+            + "\"data\":[120,132]}]}", W, H);
+        int nStPos = CountColor(cStPos, W, H, red, out bw, out bh);
+        Canvas cStNeg = Render(stHead
+            + "{\"type\":\"bar\",\"stack\":\"T\",\"itemStyle\":{\"color\":\"#ff0000\"},"
+            + "\"data\":[-200,-170]},"
+            + "{\"type\":\"bar\",\"stack\":\"T\",\"itemStyle\":{\"color\":\"#00ff00\"},"
+            + "\"data\":[-120,-132]}]}", W, H);
+        int nStNeg = CountColor(cStNeg, W, H, red, out bw, out bh);
+        Note("stack-pos: n=" + Convert.ToString(nStPos));
+        Note("stack-neg: n=" + Convert.ToString(nStNeg));
+        True("stacked positive segment drawn", nStPos > 1000);
+        True("stacked negative segment drawn", nStNeg > 1000);
+
+        Console.WriteLine("a5-barminheight:" + Convert.ToString(fails == 0 ? 1 : 0));
+    }
+}

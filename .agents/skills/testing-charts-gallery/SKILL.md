@@ -652,3 +652,49 @@ ECharts line 的平滑算法不是「单调 Hermite / Cardinal / Catmull-Rom」�
    前置缺陷）。判分派前先用无头探针打印
    `DispatchKind/LeadSeries.type/isGeoBase/regions`，别凭 demo 名字
    猜渲染器（`_scratch/geo_probe.zan`）。
+
+## 无头像素用例的三条硬规矩（A5 会话教训）
+
+1. **离屏探针必须 `KeyedStatic`，不能用 `Of`**：`ChartView.Of()` 走增长
+   入场动画，`Render` 里 `g = app.AnimIntroIn(...)` 首帧可能为 0，柱条
+   一根都长不出来。本会话 A5 首轮用 `Of()`，量到"未声明 min 时柱高 0"
+   就当成缺口证据——其实两边都是 0，**断言量的是空图**。改用
+   `ChartView.KeyedStatic(o, key)`（`staticFrame = true` 跳过动画）后
+   数字才有意义。凡是"渲染后数像素"的用例，先问一句：量的是最终形态吗？
+2. **诊断只在失败时打印，且像素计数不进 golden**：golden 与 stdout
+   逐字节比对，像素数随 DPI/字体缩放浮动，钉进 golden 会让用例在别的
+   机器上假红。写法：`if (fails > 0) { Console.WriteLine(...) }`，
+   golden 只留一行 `xxx:1`。首轮把 6 行计数都 `WriteLine` 出去，
+   ctest 直接 FAIL（输出与 golden 不符）。
+3. **量"最小尺寸"要挑真的低于阈值的输入**：A5 的水平柱首版用
+   `xAxis.max:1000` + 值 1，量出柱宽 71px——已远超 40 的 min，钳制
+   是无操作，断言 `nHMin > nHNo` 永远红。改用"一个大值撑开量程 +
+   一个极小值"（`data:[1,100000]`）才造出亚像素柱宽。另一个坑：
+   **HBarCore 不读声明的 axis.min/max**（lo/hi 只由数据算），
+   想靠 `xAxis.max` 压窄量程是压不动的（见台账 B17 残留）。
+
+## 堆叠柱负值段整体不绘制（A5 会话发现并修复）
+
+`ChartViewBar.zan` 堆叠分支算段矩形用的是
+`yTop = YOfFL((segBase+vF)*g/1000)`、`yBot = YOfFL(segBase*g/1000)`、
+`segH = yBot - yTop`，然后 `BarCellR4(c, bx, drawTop, barW, segH, ...)`。
+负值段（`segBase=0`、`vF<0`）在"Y 向下增大"的映射下 `yTop > yBot`，
+于是 **segH 为负**，而 `BarCell` 开头就是 `if (h <= 0 || w <= 0) { return; }`
+——负值段整根不画。无头探针（`_scratch/stackneg4.zan`，同图只换数据）：
+
+| 形态 | 墨量（绘图区内非白像素） |
+|------|--------------------------|
+| 正值不堆叠 | 49884 |
+| 负值不堆叠 | 49236 |
+| 正值堆叠 | 34397 |
+| 负值堆叠 | **2262** |
+
+不堆叠路（`y0 = py<zeroY?py:zeroY; bh = |py-zeroY|`）已归一化所以正常；
+堆叠路的 `segY0/segY1` 只用在命中与描边，**没用来修正绘制矩形**。
+修法：绘制矩形改用同分支描边早就在用的归一化值
+（`drawTop = segY0; drawH = segY1 - segY0;`），`segNeg` 的累加逻辑
+不动。正值段 `segY0 == yTop`、`segY1-segY0 == segH`，逐像素不变。
+修复后 neg-stack 墨量 2262 → 33882（与 pos-stack 34397 同量级），
+已并入 `tests/gui/chart_barminheight_test.zan` 第 5 组断言；
+只回退这一处、保留 barMinHeight 的 A/B 显示该断言单独变红。
+影响 `bar-negative`（stack:"Total" 负段）等 demo。
