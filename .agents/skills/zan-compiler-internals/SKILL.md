@@ -894,3 +894,16 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
   后续读/ARC retain 空指针崩；局部变量目标正常。疑 checker/irgen 对
   「out 目标=字段槽」的地址计算丢对象基址。修复需配 conformance 用例。
 - 两者在模板侧的防御写法已沉淀进 zan-development skill（快照局部、先赋值再传参）。
+
+## A311 根因锁定：设计类名撞 `Gui.App`（2026-09-12 同日下午，未修）
+
+- 上半段记的「间歇性 Chart 全家 `undefined type 'App'`」**不是时序**：三连
+  100% 复现，开关只有一个——GenForm 生成的 partial 类名。`.zform` 的
+  `"name"` 非 ident（如模板占位符 `{{NAME}}`）时回退**文件基名**
+  （App.zform→`App`），用户类与 stdlib `Gui.App` 同名，nsresolve 的重名
+  去重表把 `Gui.Component.Chart` 各文件里 `App app` 形参的引用改坏
+  （100 错）；`name="Root"` 同输入全绿。Gui 根目录文件不受影响，只有
+  Chart 子目录坏，疑共享项目图里 Chart 的解析顺序被全局重名表波及。
+- 最小复现：`_min.zform name="App"` + `partial class App` + `--auto-stdlib`。
+- 修向：GenForm 回退基名时检查 stdlib 已占用类名（撞则报错或加后缀）；
+  nsresolve 已解析的命名空间内部引用不得被用户全局改名表污染。
