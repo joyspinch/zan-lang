@@ -48,6 +48,14 @@
   shorthand 里也认;写 `color: currentColor` 等于保持主题前景)。
 - **`var(--x, fallback)` 支持回退值**,未定义或空值时用回退;定义了就永远
   赢不了回退(CSS 语义)。所以"少给一个 token 整条声明消失"已经不是问题。
+- **动效系是真属性,整链生效**:`transform: translate(...)/scale(...)/rotate(...)`
+  (可多函数串联)、`transition`/`transition-duration`(属性级时长) +
+  `transition-timing-function`(内置 8 曲线)、`animation: <name> <dur> <easing>`
+  (只认内置曲线,@keyframes 不解析)。现代独立写法同样认:
+  `rotate: 90`/`scale: 1.2`/`translate: 10px 20px` 可脱离 transform 单发。
+- **视觉效果**:`backdrop-filter`/`filter` 认 `blur(Npx)`(玻璃拟态主通道)、
+  `opacity`、`aspect-ratio`(定宽推高/定高推宽)、`text-shadow`(取第一层
+  几何,≥3 层零模糊)、`border` 的 `dashed/dotted` 走虚线描边。
 - **`position`/`z-index`/`order`/`overflow` 现在真的生效**(此前解析进样式盒
   但布局/绘制不读=写而不读):`position: absolute` 脱流(不占停靠/flex 的流
   空间),包含块是父 **padding box**,`top`/`right`/`bottom`/`left`/`inset`
