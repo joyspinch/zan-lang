@@ -1202,6 +1202,156 @@ class WinChainTest {
         Report("shroud passes global",
                engineS2.ShroudedOut("GlobalBoom", 3, 3, sndShroud) ? 1 : 0,
                0);
+        // ---- 经验等级 (VeteranTrait) -------------------------------------
+        // 规则解析:VeteranRatio 等因子走千分位 (1000 = 1.0),VeteranSight
+        // 下限 1000,VeteranCap 默认 2,InitialVeteran 默认关。
+        Rules vetRules = Rules.Default();
+        vetRules.ApplyIni(IniParser.Parse(
+            "[General]\nVeteranRatio=3\nVeteranCombat=1.2\n"
+            + "VeteranSight=0.9\nVeteranArmor=1.5\nVeteranROF=0.8\n"
+            + "VeteranSpeed=1.1\nVeteranCap=1\nInitialVeteran=yes\n"));
+        Report("vet ratio parsed",
+               vetRules.VeteranRatioM() == 3000 ? 1 : 0, 1);
+        Report("vet combat parsed",
+               vetRules.VeteranCombatM() == 1200 ? 1 : 0, 1);
+        Report("vet sight floored",
+               vetRules.VeteranSightM() == 1000 ? 1 : 0, 1);
+        Report("vet armor parsed",
+               vetRules.VeteranArmorM() == 1500 ? 1 : 0, 1);
+        Report("vet rof parsed",
+               vetRules.VeteranRofM() == 800 ? 1 : 0, 1);
+        Report("vet speed parsed",
+               vetRules.VeteranSpeedM() == 1100 ? 1 : 0, 1);
+        Report("vet cap parsed", vetRules.VeteranCap() == 1 ? 1 : 0, 1);
+        Report("initial veteran parsed",
+               vetRules.InitialVeteran() ? 1 : 0, 1);
+        Report("vet defaults intact",
+               Rules.Default().VeteranCap() == 2 ? 1 : 0, 1);
+        // 能力表解析:VeteranAbilities 进 veteran 集合,EliteAbilities 并入
+        // elite 集合(参考的 union);未知名跳过。
+        Rules vetRules2 = Rules.Default();
+        vetRules2.ApplyIni(IniParser.Parse(
+            "[E1]\nVeteranAbilities=STRONGER, ROF, NotAnAbility\n"
+            + "EliteAbilities=FIREPOWER, SIGHT\n"));
+        UnitDef vetGi = vetRules2.UnitDefNamed("E1");
+        Report("vet abilities parsed",
+               vetGi != null && vetGi.VeteranAbilities().Count == 2
+               && vetGi.VeteranAbilities().Contains(VetAbility.Stronger())
+               && vetGi.VeteranAbilities().Contains(VetAbility.Rof())
+                   ? 1 : 0, 1);
+        Report("elite abilities union",
+               vetGi != null && vetGi.EliteAbilities().Count == 4
+               && vetGi.EliteAbilities().Contains(VetAbility.Firepower())
+                   ? 1 : 0, 1);
+        // 阈值与升级:cost * ratio/1000 + 1;XP 跨线晋级,溢出结转,封顶
+        // 停涨(gainXP 的整数语义)。
+        // 经验等级运行时:一个无 theater 的小地图世界(水域回退、道路
+        // 默认全通),规则用默认档,单位摆开验证阈值/倍率/封顶。
+        Rules vetWorldRules = Rules.Default();
+        vetWorldRules.ApplyIni(IniParser.Parse(
+            "[General]\nVeteranArmor=1.5\nVeteranCombat=1.2\n"
+            + "InitialVeteran=yes\n"
+            + "[E1]\nVeteranAbilities=STRONGER\n"
+            + "EliteAbilities=FIREPOWER\n"));
+        World vetWorld = World.Create(
+            MapFile.Parse("[Map]\nSize=0,0,20,20\nLocalSize=0,0,20,20\n")
+                .Terrain(),
+            StructureCatalog.CreateWith(vetWorldRules),
+            UnitCatalog.CreateWith(vetWorldRules));
+        Rules wRules = vetWorld.Rules();
+        int vetId = 0 - 1;
+        for (int i = 0; i < vetWorld.Units().ListFor(vetWorld, 0).Count;
+             i = i + 1) {
+            UnitType tt = vetWorld.Units().TypeFor(vetWorld, 0, i);
+            if (tt != null && tt.Reg() == "E1") { vetId = i; break; }
+        }
+        Report("vet unit present", vetId >= 0 ? 1 : 0, 1);
+        if (vetId >= 0) {
+            WorldObject v1 = vetWorld.SpawnUnit(0, vetId, 5, 5) >= 0
+                ? vetWorld.ObjectAt(vetWorld.ObjectCount() - 1) : null;
+            UnitType vetType = vetWorld.Units().TypeFor(vetWorld, 0, vetId);
+            int thresh = vetType != null
+                ? wRules.VeteranRatioM() * vetType.Cost() / 1000 + 1 : 1;
+            Report("threshold maths",
+                   vetWorld.PromoteThreshold(v1) == thresh ? 1 : 0, 1);
+            vetWorld.GainVetXp(v1, thresh - 1);
+            Report("xp below line",
+                   v1.VeteranLevel() == 0 && v1.VeteranXp() == thresh - 1
+                       ? 1 : 0, 1);
+            vetWorld.GainVetXp(v1, 1);
+            Report("xp crosses line",
+                   v1.VeteranLevel() == 1 && v1.VeteranXp() == 0 ? 1 : 0, 1);
+            // 从 1 级起一笔跨两级:新等级 = 1 + (0 + 2t+5)/t,封顶 2,
+            // 消耗 (2-1) 段阈值,余 xp = 2t+5 - t = t+5(gainXP 的整数语义:
+            // 溢出结转,不是从零重新计数)。
+            vetWorld.GainVetXp(v1, thresh * 2 + 5);
+            Report("xp overflow carries",
+                   v1.VeteranLevel() == 2 && v1.VeteranXp() == thresh + 5
+                       ? 1 : 0, 1);
+            vetWorld.GainVetXp(v1, thresh * 3);
+            Report("xp capped at cap",
+                   v1.VeteranLevel() == 2 ? 1 : 0, 1);
+            // 击杀经验:受害者 cost * (其等级 + 1),友军/中立不给分。
+            // 敌兵用 1 号屋摆下场 (同规则表、同 cost),击杀者用 1 级的
+            // v5 验证进账;封顶的 v1 击杀不再进账 (isMaxLevel 短路)。
+            int preyId = vetWorld.Units().IdOfReg(vetWorld, 1, "E2");
+            int preyIdx = preyId >= 0
+                ? vetWorld.SpawnUnit(1, preyId, 8, 8) : 0 - 1;
+            WorldObject prey = preyIdx >= 0
+                ? vetWorld.ObjectAt(preyIdx) : null;
+            int preyCost = prey != null && prey.UnitType() != null
+                ? prey.UnitType().Cost() : 0;
+            int before = v1.VeteranXp();
+            WorldObject v5 = vetWorld.SpawnUnit(0, vetId, 10, 8) >= 0
+                ? vetWorld.ObjectAt(vetWorld.ObjectCount() - 1) : null;
+            vetWorld.GainVetXp(v5, thresh / 2);   // 半程,击杀不触发晋级
+            int before5 = v5.VeteranXp();
+            vetWorld.AwardKillXP(v5, prey);
+            Report("kill xp banked",
+                   v5.VeteranXp() == before5 + preyCost * 1 ? 1 : 0, 1);
+            Report("kill xp capped silent",
+                   v1.VeteranXp() == before ? 1 : 0, 1);
+            WorldObject pal = vetWorld.SpawnUnit(0, vetId, 9, 8) >= 0
+                ? vetWorld.ObjectAt(vetWorld.ObjectCount() - 1) : null;
+            vetWorld.AwardKillXP(pal, v5);
+            Report("friendly kill silent", pal.VeteranXp() == 0 ? 1 : 0, 1);
+            // 倍率门:老兵档解锁 STRONGER(armor 1500),精英档沿用
+            // elite 并集里的 FIREPOWER(1200);未列出的保持 1000。
+            WorldObject v2 = vetWorld.SpawnUnit(0, vetId, 5, 6) >= 0
+                ? vetWorld.ObjectAt(vetWorld.ObjectCount() - 1) : null;
+            Report("rookie armor stock",
+                   vetWorld.VetArmorPermille(v2) == 1000 ? 1 : 0, 1);
+            v2.SetVeteranLevel(1);
+            Report("vet armor boosted",
+                   vetWorld.VetArmorPermille(v2) == 1500 ? 1 : 0, 1);
+            Report("vet firepower stock (elite only)",
+                   vetWorld.VetFirepowerPermille(v2) == 1000 ? 1 : 0, 1);
+            v2.SetVeteranLevel(2);
+            Report("elite firepower boosted",
+                   vetWorld.VetFirepowerPermille(v2) == 1200 ? 1 : 0, 1);
+            Report("elite sight stock (not listed)",
+                   vetWorld.VetSightPermille(v2) == 1000 ? 1 : 0, 1);
+            // 火力包:精英档 1200 * 箱子火力 1 = 1200;箱子火力翻倍时
+            // 乘起来 (参考 baseDamageMultiplier 的乘积)。
+            Report("firepower package elite",
+                   vetWorld.FirepowerPermilleOf(v2) == 1200 ? 1 : 0, 1);
+            v2.SetCrateFirepower(2);
+            Report("firepower package with crate",
+                   vetWorld.FirepowerPermilleOf(v2) == 2400 ? 1 : 0, 1);
+            // 受伤调整:STRONGER 除伤 (1500) 再除箱子护甲 (1)。
+            int adj = vetWorld.VictimArmorAdjust(v2, 3000);
+            Report("victim armor adjusts", adj == 2000 ? 1 : 0, 1);
+            // InitialVeteran:新建单位直接精英档。
+            WorldObject v3 = vetWorld.SpawnUnit(0, vetId, 6, 6) >= 0
+                ? vetWorld.ObjectAt(vetWorld.ObjectCount() - 1) : null;
+            vetWorld.ApplyInitialVeteran(v3);
+            Report("initial veteran elite",
+                   v3.VeteranLevel() == 2 ? 1 : 0, 1);
+            WorldObject v4 = vetWorld.SpawnUnit(0, vetId, 6, 7) >= 0
+                ? vetWorld.ObjectAt(vetWorld.ObjectCount() - 1) : null;
+            Report("spawn default rookie",
+                   v4.VeteranLevel() == 0 ? 1 : 0, 1);
+        }
         // 真实安装的表状态:本机 rip 没有音频表,引擎必须以空表静音装载
         // 而不是崩。表数打印出来,有表/无表都算通过。
         string instDir = "data";

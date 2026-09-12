@@ -65,6 +65,15 @@ class WorldObject {
     int maX;
     int maY;
 
+    // Veterancy, the reference's VeteranTrait: the rank (0 rookie, 1
+    // veteran, 2 elite), accumulated experience and the crate upgrade
+    // multipliers (1 = unboosted; a crate sets one and it lasts for life).
+    int veteranLevel;
+    int veteranXp;
+    int crateArmor;
+    int crateFirepower;
+    int crateSpeed;
+
     // Production (structures only): the unit ids being trained and the ticks
     // remaining before each is ready to walk out of the building.
     List<int> prodQueue;
@@ -143,6 +152,11 @@ class WorldObject {
         o.deployed = false;
         o.deposeTicks = 0;
         o.deposeSeq = 0;
+        o.veteranLevel = 0;
+        o.veteranXp = 0;
+        o.crateArmor = 1;
+        o.crateFirepower = 1;
+        o.crateSpeed = 1;
         return o;
     }
 
@@ -183,6 +197,11 @@ class WorldObject {
         o.deployed = false;
         o.deposeTicks = 0;
         o.deposeSeq = 0;
+        o.veteranLevel = 0;
+        o.veteranXp = 0;
+        o.crateArmor = 1;
+        o.crateFirepower = 1;
+        o.crateSpeed = 1;
         return o;
     }
 
@@ -265,6 +284,17 @@ class WorldObject {
     int Frozen() { return this.frozen; }
     int MoveAccum() { return this.moveAccum; }
     void SetMoveAccum(int v) { this.moveAccum = v; }
+
+    int VeteranLevel() { return this.veteranLevel; }
+    void SetVeteranLevel(int lvl) { this.veteranLevel = lvl; }
+    int VeteranXp() { return this.veteranXp; }
+    void SetVeteranXp(int xp) { this.veteranXp = xp; }
+    int CrateArmor() { return this.crateArmor; }
+    void SetCrateArmor(int mult) { this.crateArmor = mult; }
+    int CrateFirepower() { return this.crateFirepower; }
+    void SetCrateFirepower(int mult) { this.crateFirepower = mult; }
+    int CrateSpeed() { return this.crateSpeed; }
+    void SetCrateSpeed(int mult) { this.crateSpeed = mult; }
     void SetFrozen(int ticks) { this.frozen = ticks; }
     int BombTimer() { return this.bombTimer; }
     void SetBombTimer(int ticks) { this.bombTimer = ticks; }
@@ -639,6 +669,10 @@ class UnitType {
     string deploySound;
     string undeploySound;
     string dieSound;
+    // The per-unit veteran/elite ability lists, copied off the def (elite
+    // already holds the veteran union).
+    List<int> veteranAbilities;
+    List<int> eliteAbilities;
 
     static UnitType Create(string reg, string label, int cost, int buildTime,
                            int hp, string shpName, int armor, Weapon primary,
@@ -682,6 +716,8 @@ class UnitType {
         t.deploySound = "";
         t.undeploySound = "";
         t.dieSound = "";
+        t.veteranAbilities = new List<int>();
+        t.eliteAbilities = new List<int>();
         return t;
     }
 
@@ -702,6 +738,12 @@ class UnitType {
         this.deploySound = deploySnd;
         this.undeploySound = undeploySnd;
         this.dieSound = dieSnd;
+    }
+    List<int> VeteranAbilities() { return this.veteranAbilities; }
+    List<int> EliteAbilities() { return this.eliteAbilities; }
+    void SetVeteranAbilities(List<int> vet, List<int> elite) {
+        this.veteranAbilities = vet;
+        this.eliteAbilities = elite;
     }
     bool Amphibious() { return this.amphibious; }
     string ShpName() { return this.shpName; }
@@ -928,6 +970,7 @@ class UnitCatalog {
             t.SetVoices(d.Voices());
             t.SetSoundKeys(d.CreateSound(), d.DeploySound(),
                            d.UndeploySound(), d.DieSound());
+            t.SetVeteranAbilities(d.VeteranAbilities(), d.EliteAbilities());
             l.Add(t);
         }
         return l;
@@ -1699,11 +1742,220 @@ class World {
         else {
             UnitType ut = o.UnitType();
             sight = ut != null ? ut.Sight() : 0;
+            // The veteran SIGHT factor, capped like the rules' own cap.
+            if (sight > 0) {
+                sight = sight * this.VetSightPermille(o) / 1000;
+                if (sight < 1) { sight = 1; }
+                if (sight > 11) { sight = 11; }
+            }
         }
         s.RevealFrom(o.X(), o.Y(), this.LevelAt(o.X(), o.Y()), sight);
     }
 
-    // ---- crates / power-ups (the reference's CrateGeneratorTrait) ----------
+    // ---- veterancy (the reference's VeteranTrait) ---------------------------
+
+    /// <summary>The promotion threshold in XP: the target's cost times the
+    /// [General] VeteranRatio= (per-mille) plus one -- the reference's
+    /// constructor maths kept integral.</summary>
+    int PromoteThreshold(WorldObject o) {
+        int cost = 0;
+        if (o.Kind() == ObjKind.Unit() && o.UnitType() != null) {
+            cost = o.UnitType().Cost();
+        } else if (o.Kind() == ObjKind.Structure()) {
+            StructureType t = this.TypeOf(o);
+            cost = t != null ? t.Cost() : 0;
+        }
+        return cost * this.Rules().VeteranRatioM() / 1000 + 1;
+    }
+
+    /// <summary>Whether the ability sits on the unit's list for its rank:
+    /// the reference's hasVeteranAbility -- the veteran list gates rank 1,
+    /// the elite list (which unions the veteran one) ranks 2+.</summary>
+    bool HasVetAbility(WorldObject o, int ability) {
+        if (o.Kind() != ObjKind.Unit() || o.UnitType() == null) { return false; }
+        if (o.VeteranLevel() == VetLevel.Veteran()) {
+            return o.UnitType().VeteranAbilities().Contains(ability);
+        }
+        if (o.VeteranLevel() >= VetLevel.Elite()) {
+            return o.UnitType().EliteAbilities().Contains(ability);
+        }
+        return false;
+    }
+
+    /// <summary>The multipliers, per-mille: 1000 unless the rank gates the
+    /// matching ability, then the veteran rules' factor.</summary>
+    int VetSpeedPermille(WorldObject o) {
+        return this.HasVetAbility(o, VetAbility.Faster())
+            ? this.Rules().VeteranSpeedM() : 1000;
+    }
+    int VetArmorPermille(WorldObject o) {
+        return this.HasVetAbility(o, VetAbility.Stronger())
+            ? this.Rules().VeteranArmorM() : 1000;
+    }
+    int VetFirepowerPermille(WorldObject o) {
+        return this.HasVetAbility(o, VetAbility.Firepower())
+            ? this.Rules().VeteranCombatM() : 1000;
+    }
+    int VetRofPermille(WorldObject o) {
+        return this.HasVetAbility(o, VetAbility.Rof())
+            ? this.Rules().VeteranRofM() : 1000;
+    }
+    int VetSightPermille(WorldObject o) {
+        return this.HasVetAbility(o, VetAbility.Sight())
+            ? this.Rules().VeteranSightM() : 1000;
+    }
+
+    /// <summary>The total damage package a shooter fires with, per-mille:
+    /// the veteran FIREPOWER factor (per-mille) times the crate firepower
+    /// bonus (a raw x1/x2 multiplier) -- the reference's
+    /// baseDamageMultiplier product.</summary>
+    int FirepowerPermilleOf(WorldObject shooter) {
+        return this.VetFirepowerPermille(shooter) * shooter.CrateFirepower();
+    }
+
+    /// <summary>The victim's damage intake adjustment, the reference's
+    /// warhead impact order: the veteran STRONGER factor divides first,
+    /// then the crate armour bonus. Applied after the verse so the shipped
+    /// damage pipeline order is kept.</summary>
+    int VictimArmorAdjust(WorldObject victim, int dmg) {
+        int d = dmg * 1000 / this.VetArmorPermille(victim);
+        return d / victim.CrateArmor();
+    }
+
+    /// <summary>The XP award for a kill, the reference's
+    /// NotifyTargetDestroy path: the victim's cost times (its rank + 1).
+    /// Friendly fire and self-hits pay nothing; a rank at the cap banks
+    /// nothing. Promotion plays the shipped rank-up sound through the
+    /// sink's UnitPromote event.</summary>
+    void AwardKillXP(WorldObject killer, WorldObject victim) {
+        if (killer == null || killer.IsDead()
+         || killer.Kind() != ObjKind.Unit()
+         || killer.UnitType() == null) { return; }
+        if (victim == null || victim.Side() == Side2.Neutral()
+         || victim.Side() == killer.Side()) { return; }
+        int cap = this.Rules().VeteranCap();
+        if (killer.VeteranLevel() >= cap) { return; }
+        int cost = 0;
+        if (victim.Kind() == ObjKind.Unit() && victim.UnitType() != null) {
+            cost = victim.UnitType().Cost();
+        } else if (victim.Kind() == ObjKind.Structure()) {
+            StructureType t = this.TypeOf(victim);
+            cost = t != null ? t.Cost() : 0;
+        }
+        if (cost <= 0) { return; }
+        this.GainVetXp(killer, cost * (victim.VeteranLevel() + 1));
+    }
+
+    /// <summary>Banks XP and promotes on crossing the threshold, the
+    /// reference's gainXP: the overflow carries, each level spend is one
+    /// threshold, and the level never passes the cap.</summary>
+    void GainVetXp(WorldObject o, int amount) {
+        o.SetVeteranXp(o.VeteranXp() + amount);
+        int thresh = this.PromoteThreshold(o);
+        if (o.VeteranXp() < thresh) { return; }
+        int cap = this.Rules().VeteranCap();
+        int newLevel = o.VeteranLevel() + o.VeteranXp() / thresh;
+        if (newLevel > cap) { newLevel = cap; }
+        int gain = newLevel - o.VeteranLevel();
+        if (gain <= 0) { return; }
+        o.SetVeteranXp(o.VeteranXp() - gain * thresh);
+        o.SetVeteranLevel(newLevel);
+        if (this.sndSink != null) {
+            this.sndSink.PromoteFeedback(o.Side(), newLevel);
+        }
+    }
+
+    /// <summary>The opening-squad rank switch, the reference's
+    /// applyInitialVeteran: with the [General] InitialVeteran= flag a
+    /// starting unit opens at Elite. Only units carry the trait; the
+    /// country's VeteranUnits= fallback to Veteran has no port-side
+    /// counterpart yet, and factory production never consults this.</summary>
+    void ApplyInitialVeteran(WorldObject o) {
+        if (!this.Rules().InitialVeteran()) { return; }
+        if (o == null || o.Kind() != ObjKind.Unit()) { return; }
+        o.SetVeteranLevel(VetLevel.Elite());
+    }
+
+    // ---- veterancy crates (grantVeteran/Armor/Firepower/SpeedPowerup) ------
+
+    /// <summary>Whether the crate upgrade applies to this picker: the
+    /// reference's gate is the matching bonus still at 1 (unboosted) -- an
+    /// already-boosted army does not stack a second crate of the kind. The
+    /// veteran crate instead needs headroom below the cap.</summary>
+    bool CrateUpgradeApplies(WorldObject unit, int crateType) {
+        if (unit.Kind() != ObjKind.Unit() || unit.UnitType() == null) {
+            return false;
+        }
+        if (crateType == Rules.PowerupVeteran()) {
+            return unit.VeteranLevel() < this.Rules().VeteranCap();
+        }
+        if (crateType == Rules.PowerupArmor()) {
+            return unit.CrateArmor() == 1;
+        }
+        if (crateType == Rules.PowerupFirepower()) {
+            return unit.CrateFirepower() == 1;
+        }
+        if (crateType == Rules.PowerupSpeed()) {
+            return unit.CrateSpeed() == 1;
+        }
+        return false;
+    }
+
+    /// <summary>The rank crate, grantVeteranPowerup: every own unit within
+    /// CrateRadius promotes by the crate's Data= levels, capped.</summary>
+    void GrantCrateVeteran(WorldObject unit, int pow, int x, int y) {
+        int levels = this.rules_dataInt(this.Rules().PowerupDataAt(pow), 1);
+        if (levels < 1) { levels = 1; }
+        List<WorldObject> around = this.UnitsInCrateRadius(unit, x, y);
+        for (int i = 0; i < around.Count; i = i + 1) {
+            WorldObject o = around[i];
+            int cap = this.Rules().VeteranCap();
+            int nl = o.VeteranLevel() + levels;
+            if (nl > cap) { nl = cap; }
+            if (nl > o.VeteranLevel()) { o.SetVeteranLevel(nl); }
+        }
+    }
+
+    /// <summary>The three stat crates, the grant*Powerup triple: every own
+    /// in-radius unit whose matching bonus is still 1 picks the crate's
+    /// Data= multiplier up for life.</summary>
+    void GrantCrateStat(WorldObject unit, int pow, int x, int y,
+                        int crateType) {
+        int mult = this.rules_dataInt(this.Rules().PowerupDataAt(pow), 1);
+        if (mult < 1) { mult = 1; }
+        List<WorldObject> around = this.UnitsInCrateRadius(unit, x, y);
+        for (int i = 0; i < around.Count; i = i + 1) {
+            WorldObject o = around[i];
+            if (crateType == Rules.PowerupArmor()
+             && o.CrateArmor() == 1) { o.SetCrateArmor(mult); }
+            else if (crateType == Rules.PowerupFirepower()
+                  && o.CrateFirepower() == 1) { o.SetCrateFirepower(mult); }
+            else if (crateType == Rules.PowerupSpeed()
+                  && o.CrateSpeed() == 1) { o.SetCrateSpeed(mult); }
+        }
+    }
+
+    /// <summary>The crate radius walk, getUnitsInCrateRadius: every own
+    /// living unit within [CrateRules] CrateRadius= cells of the crate --
+    /// Euclidean, the reference's RangeHelper.tileDistance comparing tile
+    /// centres with Vector2.distanceTo, kept integral by squaring both
+    /// sides.</summary>
+    List<WorldObject> UnitsInCrateRadius(WorldObject unit, int x, int y) {
+        List<WorldObject> outList = new List<WorldObject>();
+        int radius = this.Rules().CrateRadius();
+        int r2 = radius * radius;
+        for (int i = 0; i < this.objects.Count; i = i + 1) {
+            WorldObject o = this.objects[i];
+            if (o == null || o.IsDead() || o.Side() != unit.Side()
+             || o.Kind() != ObjKind.Unit()) { continue; }
+            int dx = x - o.X();
+            int dy = y - o.Y();
+            if (dx * dx + dy * dy <= r2) {
+                outList.Add(o);
+            }
+        }
+        return outList;
+    }
 
     // The goodie crates: live records in parallel lists (cell x, cell y,
     // the rolled powerup index, ticks until the crate despawns), the init
@@ -2005,6 +2257,14 @@ class World {
             }
         } else if (type == Rules.PowerupUnit()) {
             ok = this.GrantCrateUnit(unit, x, y);
+        } else if (type == Rules.PowerupVeteran()) {
+            ok = this.CrateUpgradeApplies(unit, type);
+            if (ok) { this.GrantCrateVeteran(unit, pow, x, y); }
+        } else if (type == Rules.PowerupArmor()
+                || type == Rules.PowerupFirepower()
+                || type == Rules.PowerupSpeed()) {
+            ok = this.CrateUpgradeApplies(unit, type);
+            if (ok) { this.GrantCrateStat(unit, pow, x, y, type); }
         } else if (type == Rules.PowerupExplosion()
                 || type == Rules.PowerupNapalm()) {
             ok = this.GrantCrateBoom(unit, pow, x, y);
@@ -2073,6 +2333,7 @@ class World {
             WorldObject d = this.objects[zero];
             int armor = this.ArmorOf(d);
             int zd = dmg * wh.Verse(armor) / 100;
+            zd = this.VictimArmorAdjust(d, zd);
             d.TakeDamageAs(zd, wh.InfDeath());
             this.SndBuildingDamage(d, zd);
             this.SuppressTrooper(d);
@@ -2093,6 +2354,7 @@ class World {
             if (d2 > radius) { continue; }
             int damp = (radius - d2) * (dmg * half / 100) / radius;
             if (damp <= 0) { continue; }
+            damp = this.VictimArmorAdjust(o, damp);
             o.TakeDamageAs(damp, wh.InfDeath());
             this.SndBuildingDamage(o, damp);
             this.SuppressTrooper(o);
@@ -4789,15 +5051,19 @@ class World {
         p.side = shooter.Side();
         p.shooter = this.IndexOfObject(shooter);
         p.target = this.IndexOfObject(target);
+        p.dmgPermille = 1000;
         if (p.target < 0) {
             // The mark was lost between trigger and launch: the round flies
             // to the cell it was aimed at and bursts there.
             p.target = 0 - 1;
         }
+        p.dmgPermille = 1000;
+        if (shooter != null) {
+            p.dmgPermille = this.FirepowerPermilleOf(shooter);
+        }
         if (!pt.Homing()) {
             // Unguided rounds hold their fire-time course.
-            p.target = 0 - 1;
-        }
+            p.target = 0 - 1;        }
         this.projectiles.Add(p);
     }
 
@@ -4939,7 +5205,7 @@ class World {
         Warhead wh = w.Warhead();
         WorldObject hit = t;
         if (t != null) {
-            this.ApplyShotSide(p.side, shooter, w, t);
+            this.ApplyShotSide(p.side, shooter, w, t, p.dmgPermille);
         } else {
             // Ground strike: whoever stands at the impact cell takes the
             // full bore -- that is where the round burst -- and the
@@ -4953,10 +5219,12 @@ class World {
             hit = direct;
             if (direct != null) {
                 int armor = this.ArmorOf(direct);
-                int dmg = w.Damage() * wh.Verse(armor) / 100;
-                this.SplashAround(p.side, wh, gx, gy, direct, dmg);
+                int dmg = w.Damage() * p.dmgPermille / 1000
+                    * wh.Verse(armor) / 100;
+                this.SplashAround(p.side, wh, gx, gy, direct, dmg, shooter);
             } else {
-                int dmg = w.Damage() * wh.Verse(4) / 100;
+                int dmg = w.Damage() * p.dmgPermille / 1000
+                    * wh.Verse(4) / 100;
                 // A wall on the burst cell soaks the round first: its own
                 // armour class picks the verse (the shipped walls are
                 // concrete), and WallTrait's linked damage spreads half to
@@ -4967,7 +5235,7 @@ class World {
                     this.DamageWallAt(gx, gy,
                         w.Damage() * wh.Verse(warmor) / 100);
                 }
-                this.SplashAround(p.side, wh, gx, gy, null, dmg);
+                this.SplashAround(p.side, wh, gx, gy, null, dmg, shooter);
             }
         }
         // The impact art follows the reference exactly: a conventional
@@ -5730,6 +5998,8 @@ class World {
             int rr = b.Reload();
             if (rr <= 0) {
                 this.FireWeapon(b, bt.Weapon(), tgt);
+                // Buildings are not Trainable= in the shipped rules, so
+                // their cooldown never carries a veteran ROF factor.
                 b.SetReload(bt.Cooldown());
                 fired = fired + 1;
             } else {
@@ -5766,7 +6036,14 @@ class World {
             }
             if (o.Frozen() > 0 || o.Deployed() || o.deposeTicks > 0
              || !o.HasRoute()) { continue; }
-            int bank = o.MoveAccum() + o.UnitType().Speed();
+            // The ledger banks the boosted speed: the veteran FASTER factor
+            // times the crate speed bonus (the reference's baseSpeed
+            // product, minus the damaged-vehicle crawl still to migrate).
+            // The factors multiply into one boost ratio in thousandths of
+            // stock (1000 = unboosted) so the bank stays in stock units.
+            int boost = this.VetSpeedPermille(o) * o.CrateSpeed() / 1000;
+            if (boost < 1) { boost = 1; }
+            int bank = o.MoveAccum() + o.UnitType().Speed() * boost;
             while (bank >= Rules.CellMoveCost() && o.HasRoute()) {
                 bank = bank - Rules.CellMoveCost();
                 int nx = o.StepCellX();
@@ -5902,6 +6179,13 @@ class World {
                                                    cell[1], u.Hp(), u);
             this.AddObject(n);
             this.ShroudRevealObject(n);
+            // Factory output opens rookie. The reference's production gate
+            // is canProduceVeteran (a captured spy's veteran factory flag
+            // or the country's VeteranInfantry= list) promoting to Veteran
+            // -- never the Elite rank, and not the InitialVeteran rules
+            // flag, which belongs to the opening squad. Neither country
+            // lists nor veteran-factory spies are ported yet, so every
+            // factory here stays a plain one.
             // The factory output: the spawn chirp (CreateSound=) and, for
             // the player's own house, the Unit ready announcement -- the
             // FactoryProduceUnit event.
@@ -5985,7 +6269,10 @@ class World {
         Weapon w = this.PickWeapon(u, t);
         if (w == null) { o.SetReload(20); return false; }
         this.FireWeapon(o, w, t);
-        o.SetReload(w.Rof());
+        // The veteran ROF factor multiplies the cooldown (the reference's
+        // getRateOfFire), floored at one tick.
+        int rof = w.Rof() * this.VetRofPermille(o) / 1000;
+        o.SetReload(rof > 1 ? rof : 1);
         return true;
     }
 
@@ -6005,26 +6292,32 @@ class World {
         this.SpawnFlash(shooter.X(), shooter.Y());
     }
 
-    /// <summary>Lands one shot: the warhead's verse against the target's
-    /// armour scales the damage, then the special effects land -- a dog's
-    /// bite kills infantry outright, a chrono beam freezes, Yuri's pulse
-    /// converts, Ivan sticks a bomb.</summary>
+    /// <summary>Lands one shot: the shooter's firepower package (the
+    /// veteran FIREPOWER factor times the crate bonus) scales the base
+    /// damage, then the special effects land -- a dog's bite kills infantry
+    /// outright, a chrono beam freezes, Yuri's pulse converts, Ivan sticks
+    /// a bomb.</summary>
     void ApplyShot(WorldObject shooter, Weapon w, WorldObject t) {
-        this.ApplyShotSide(shooter.Side(), shooter, w, t);
+        this.ApplyShotSide(shooter.Side(), shooter, w, t,
+                           this.FirepowerPermilleOf(shooter));
     }
 
     /// <summary>The shot-landing core. `side` rides separately from the
     /// shooter object because a projectile can outlive its firer: the round
     /// keeps the allegiance it was fired with even after the shooter is
-    /// rubble, so splash still skips friends and mind control still flips.</summary>
-    void ApplyShotSide(int side, WorldObject shooter, Weapon w, WorldObject t) {
+    /// rubble, so splash still skips friends and mind control still flips.
+    /// `dmgPermille` is the shooter's firepower package, captured at fire
+    /// time so a round keeps its boost mid-flight like the reference's
+    /// projectile-captured veteranDamageMult.</summary>
+    void ApplyShotSide(int side, WorldObject shooter, Weapon w, WorldObject t,
+                       int dmgPermille) {
         Warhead wh = w.Warhead();
         int armor = this.ArmorOf(t);
-        int dmg = w.Damage() * wh.Verse(armor) / 100;
+        int dmg = w.Damage() * dmgPermille / 1000 * wh.Verse(armor) / 100;
         if (wh.KillsInfantry() && t.Kind() == ObjKind.Unit()) {
             dmg = t.Hp();   // dogs take infantry down regardless of health
         }
-        this.SplashAround(side, wh, t.X(), t.Y(), t, dmg);
+        this.SplashAround(side, wh, t.X(), t.Y(), t, dmg, shooter);
         if (t.IsDead()) { return; }
         if (wh.Freeze() && t.Kind() == ObjKind.Unit()) {
             t.SetFrozen(this.Rules().FreezeTicks());
@@ -6080,14 +6373,16 @@ class World {
     }
 
     void SplashAround(int side, Warhead wh, int cx, int cy,
-                      WorldObject t, int dmg) {
+                      WorldObject t, int dmg, WorldObject shooter) {
         if (t != null) {
             int pd = dmg;
             if (this.IsTrooper(t) && t.SuppTicks() > 0) {
                 pd = dmg * this.Rules().ProneDamagePct() / 100;
             }
+            pd = this.VictimArmorAdjust(t, pd);
             t.TakeDamageAs(pd, wh.InfDeath());
             this.SndBuildingDamage(t, pd);
+            if (t.IsDead()) { this.AwardKillXP(shooter, t); }
             this.SuppressTrooper(t);
         }
         if (wh.Spread() <= 0) { return; }
@@ -6113,8 +6408,10 @@ class World {
             if (this.IsTrooper(o) && o.SuppTicks() > 0) {
                 pd = damp * this.Rules().ProneDamagePct() / 100;
             }
+            pd = this.VictimArmorAdjust(o, pd);
             o.TakeDamageAs(pd, wh.InfDeath());
             this.SndBuildingDamage(o, pd);
+            if (o.IsDead()) { this.AwardKillXP(shooter, o); }
             this.SuppressTrooper(o);
         }
     }
@@ -6658,6 +6955,11 @@ class Projectile {
     int target;           // object index for guided rounds, -1 otherwise
     int ticks;
     int trailerClock;     // ticks since the last smoke puff
+    // The firepower package captured at fire time, in per-mille (1000 =
+    // stock): the veteran FIREPOWER factor times the shooter's crate
+    // firepower bonus -- the reference's veteranDamageMult and
+    // crateBonuses.firepower riding the projectile.
+    int dmgPermille;
 
     double Px() { return this.px; }
     double Py() { return this.py; }
