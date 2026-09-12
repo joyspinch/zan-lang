@@ -938,6 +938,33 @@ pt/pc/cm/mm/in/q）+ `calc()/min()/max()/clamp()`；`%` 在各属性原有通道
   检查验证（无解析错误），全量编译待该回归修复后补验；修向=nsresolve
   改名重写根修（ctx_ns 命中即应短路，不得被改名表污染）。
 
+* **P7b 字段内联 style 通道 + Inspector CSS 声明编辑**（2026-09-12）：
+  **运行时通道**——`Control.SetProp("style", ...)` →
+  `StyleSheet.ApplyInline`：声明文本（"background:#c00; padding:8px"）交
+  给整块 CSS 解析器（`Css.Parse(".zan-inline { … }")`，颜色函数/缩写键/
+  !important 全复用），块落点复用 ApplySelector 抽出的
+  `StyleSheet.ApplyBlock`（布局键 pad/gap/width/height/dock/x/y 落控件
+  字段，视觉键 DeclSource+CopyToControl 落 style* 覆盖字段——在每次样式
+  解析的 Style.Inline 之后，优先于类规则）；SetProp 后清 computedStyle
+  缓存（首绘后改样式也生效）。**三端同落点**：GenForm 发射
+  `SetProp("style", …)`、画布预览 FormBuilder.FromField→MakeControl、
+  运行期 UiDoc。**设计器模型**：FormField.styleText（"style" 建模键，
+  IsModeledKey 同步；名字不叫 Style——与 Gui.Style 类撞，方法体里裸写
+  Style.Part 会被字段抢走解析）。**Inspector**：STYLE（CSS）区逐声明行
+  编辑（一行一条、× 删、添加声明），每帧重组回 styleText（空行跳过），
+  换选区/Undo（ApplyJson 清 sel）安全重建；画布下一帧即时生效。
+  **DesignerHtml**：style 键 ↔ 元素 style 属性（非 data-* 通道），.html
+  设计稿因此就是合法运行时 HTML（App.LoadHtml 同语义吃 style）。
+  **语义例外（台账）**：设计几何拥有布局——发射器 logW/Prefer/logPad 在
+  style 之后接管、ApplyDeclaredUnits 每帧重算，故 style 的布局键
+  （width/height/x/y/dock/gap/pad）对设计字段只在几何沉默处生效；视觉键
+  （background/color/border*/box-shadow/font-size/transition）完全生效。
+  这是刻意偏离浏览器 "inline 不败"：画布拖拽手柄/对齐命令基于同一份几何。
+  **测试**：conformance/gui_field_style（SetProp 通道+rgb 函数+垃圾值
+  不落值+预览路径）、designer_html 扩展（style 往返+桥内 styleText 断
+  言）、e2e（.zform style 键→生成代码→实例断言 bg/圆角+几何接管）。
+  standard 层回归后提交。
+
 # A17-A31 历史修复记录（全部完成，一行摘要）
 
 * **A17** ✅ 测试套件"要跑半小时"的真正原因（2026-07-28）：A17-1 三批测试没设

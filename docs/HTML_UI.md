@@ -137,7 +137,8 @@ P0-P4 节）。CSS 支持面（含 grid/flex/float）见 TASKS.md A16。
   缺省）。
 - 字段 → 元素：`kind` 决定 tag（Panel/自定义→div、Label→label、Button→
   button、Input→input、TextArea→textarea、Image→img），`data-kind` 是权
-  威标记；`name` → `id`、`class` → `class`、`kids` → 子元素。
+  威标记；`name` → `id`、`class` → `class`、`style` → `style`、`kids` →
+  子元素。
 - 标量键 → `data-<kebab>`（camelCase kebab 化，读端还原）；数字/布尔自动
   嗅探。
 - 事件键 `onClick` 等 → `data-on-click`（与运行时 data-on-* 协议同形）。
@@ -149,6 +150,25 @@ P0-P4 节）。CSS 支持面（含 grid/flex/float）见 TASKS.md A16。
 设计器侧 API：`Designer.SaveHtml()` / `LoadHtmlText(text)`；IDE 的 .html
 设计稿标签页（body 有标记）自动进设计器并回存 HTML。`.zform` JSON 仍作为
 内部表示存在（撤销快照、JSON 抽屉、LSP 供数），不再手写。
+
+## 字段内联 style（P7b）
+
+字段的 `style` 键（设计稿里就是元素的 `style` 属性）是控件内联 CSS 声明，
+Inspector 的 STYLE 区逐行编辑（`键: 值`，一行一条）。运行时通道：
+`SetProp("style", ...)` → `StyleSheet.ApplyInline`——声明文本交给整块 CSS
+解析器（颜色函数/缩写键/`!important` 全复用），布局键（pad/gap/width/
+height/dock/x/y）落控件字段，视觉键经 `DeclSource`+`CopyToControl` 落
+`style*` 覆盖字段（在每次样式解析的 Inline 覆盖之后，优先于类规则）。三个
+消费端同落点：画布预览（FormBuilder.FromField → MakeControl）、生成代码
+（GenForm 发射 `SetProp("style", ...)`）、运行期文档（UiDoc）。
+
+**语义边界（台账）**：设计几何拥有布局——字段的 X/Y/宽/高（或流式跨距、
+显式 pad/gap）由发射器以 `logW/Prefer/logPad` 在 style 之后接管，measure
+期 `ApplyDeclaredUnits` 每帧重算，故 style 里的 width/height/x/y/dock/
+gap/pad 对设计字段只在几何沉默处生效（如流式字段未声明 pad 时 style 的
+padding 生效）。视觉键（background/color/border/border-radius/box-shadow/
+font-size/transition）完全生效，不受几何影响。这是对浏览器 "inline 不败"
+原则的刻意例外：设计画布的拖拽手柄、对齐命令都基于同一份几何。
 
 ## 与浏览器的差异清单（台账）
 

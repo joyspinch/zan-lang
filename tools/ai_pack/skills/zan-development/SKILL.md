@@ -135,6 +135,23 @@ the LSP feed); don't hand-write it.
   ("M" -> "77") — capitalize via `char + string` concatenation instead
   (`(char)(c - 32) + rest`).
 
+## 6d. Per-control inline CSS (Gui P7b)
+
+Any control takes inline CSS declarations via `ctl.SetProp("style",
+"background:#c00; padding:8px; border-radius:6px")` — one call applies them
+immediately (visual keys win over class rules; colors/functions reuse the
+full CSS parser). `GetProp`-driven docs and the HTML `style` attribute land
+on the same channel. Designer fields carry the same thing as the `style`
+key / element `style` attr, editable line-by-line in the Inspector's STYLE
+section.
+
+- **Design geometry owns layout**: for designer-placed fields the emitted
+  `logW`/`Prefer`/`logPad` (from X/Y/W/H, span, dock rows) is re-applied
+  every measure, so `width`/`height`/`x`/`y`/`dock`/`gap`/`pad` inside
+  `style` only stick where the design is silent. Visual keys (background/
+  color/border/border-radius/box-shadow/font-size/transition) always win
+  over class rules. Don't fight this by re-applying style after geometry.
+
 ## 7. Evidence discipline (the anti-rework rules)
 
 Two real projects (a 420-file gateway port, a 634-file WinForms port) lost days
