@@ -1,12 +1,11 @@
 ---
 name: zan-compiler-internals
-description: zanc 编译器内部（parser/checker/irgen）的实测定式与坑——Dict 内建布局契约（插入序 keys/values + 惰性哈希索引 + Remove 整体失效）、LLVM select 两臂都求值导致的死臂分配泄漏（用 branch+phi）、delegate 两形态与 wasm32 函数表索引撞 ZAN_CLOSURE_TAG 的根修定式（形状按 target_is_wasm32 条件化）、ARC 所有权判定内建优先于 extern 借用（GetString 误判=每 HTTP 请求泄一条请求头）、looks_like_var_decl 的内建关键字分派契约（rank specifier 必须容忍逗号）、stdlib 按需拉入的四坑（扩展宿主关键字接收者/方法名撞类名/泛型委托假名 T/#if 区域必须带宏扫描）、交叉工具链 .o 重出配方（zig cc + build/ 暂存副本不会自动刷新）、可空值类型在字符串位的解包形状、编译器调试的 scratch 卫生（bisect 用 worktree 即用即删、A/B 对照复用固定目录名）。做或改 src/compiler/*、交叉运行时对象、conformance golden 时使用。
+description: zanc 编译器内部（parser/checker/irgen）的定式与坑——Dict 内建布局契约、LLVM select 死臂泄漏（用 branch+phi）、delegate 两形态与 wasm32 ZAN_CLOSURE_TAG 碰撞、ARC 所有权判定内建优先于 extern 借用、stdlib 按需拉入的坑、交叉工具链 .o 重出配方、conformance 处置四分法、scratch 卫生（bisect 用 worktree 即用即删）。做或改 src/compiler/*、交叉运行时对象、conformance golden 时使用。
 ---
 
 # zanc 编译器内部定式与坑
 
-> 提炼自 standard 层存量挂账清零批（2026-09-09：int[,] 回归、Dict.Remove
-> 保序、string+可空拼接、交叉 rt 对象重出）。每条都实测踩过。
+> 每条都是踩过坑、探针验证过的契约。
 
 ## Dict 内建（irgen.c 布局注释 = 契约）
 
@@ -34,7 +33,7 @@ description: zanc 编译器内部（parser/checker/irgen）的实测定式与坑
 - 返回 NULL 字符串是合法的空串形状：emit_str_concat 有 NULL→""、
   zan_rt_str_release 有 NULL 守卫，全链路安全。
 
-## delegate 两形态与 wasm32 的 tag 碰撞（2026-09-10）
+## delegate 两形态与 wasm32 的 tag 碰撞
 
 - **形态契约（zan_abi.h）**：delegate 值一个指针两形态，bit 0 区分——偶数
   =裸 fn 指针（静态方法组/无捕获 lambda），奇数=tag 过的堆 closure 记录
@@ -52,12 +51,11 @@ description: zanc 编译器内部（parser/checker/irgen）的实测定式与坑
   dtor/retain 跳过 target 槽（是函数非对象）；无捕获 lambda 也走 rec-first
   （`is_closure || target_is_wasm32`）。C 回调 cast `(nint)M` 走裸 fn 指针
   路径（emit_raw_fn_for_cb_cast），与记录互不干扰。
-- **根修兜底（2026-09-11）：wasm 链接加 `--table-base=2`（main.c wasm-ld
+- **根修兜底：wasm 链接加 `--table-base=2`（main.c wasm-ld
   命令行）**。lld 默认表基址 1，地址取函数的表索引奇偶皆有——任何漏网
   的裸 fn delegate（如 `inp.Size = vm.x` 合成 Binding 访问器曾是裸指针，
   `emit_binding_acc_delegate` 已按 mg 形状收口）都会撞 tag：索引 N 被当
-  tagged 记录 untag 成 N-1，间接调用恰好落进相邻函数（实测 Canvas_DrawGlyph
-  落进 getenv）。表基址挪到 2 后裸索引恒为偶，native 的「偶数才合法」
+  tagged 记录 untag 成 N-1，间接调用恰好落进相邻函数。表基址挪到 2 后裸索引恒为偶，native 的「偶数才合法」
   假设在 wasm 上成立，整族漏网点一次性免疫。
 - **教训**：中间层用「指针低位 tag」复用值位时，必须审计目标平台上"这个
   位模式是否真的不可能出现"——函数表索引/句柄/压缩指针都可能撞 tag。
@@ -73,12 +71,12 @@ description: zanc 编译器内部（parser/checker/irgen）的实测定式与坑
   `fn(rec, ...)` rec-first 调；裸指针才直接调），`zan_thread_start` 侧
   `zan_delegate_retain(body)`、trampoline 收尾 `zan_delegate_release(arg)`。
   **retain 是必需的，不是保险**：调用方在 `Thread.Start(...)` 语句结束就释放
-  自己的临时量，工作线程可能还没跑（实测去掉 retain 后 `-g` 下即段错误）。
+  自己的临时量，工作线程可能还没跑。
   **通则：任何把 delegate 存下来留给"另一次调用 / 另一线程"执行的 runtime
   入口，都要对到达时的那个值补 retain、在真正的执行点补 release**——这正是
   zan_abi.h store-family 契约的要求。
 
-- **语义修复后要扫"断言旧行为"的每一处，生成器发出的注释也算（2026-09-11）**：
+- **语义修复后要扫"断言旧行为"的每一处，生成器发出的注释也算**：
   A70/A261 让 `Thread.Start` 收得下实例方法组与捕获 lambda 之后，仓里仍留着三处
   按旧事实写的说明——`Gui/Widget/Upload.zan` 的类注释（"线程入口必须是静态方法组，
   `zan_thread_start` 只接受裸函数指针"）、`DataTable/DataTable.HttpSource.zan`
@@ -91,7 +89,7 @@ description: zanc 编译器内部（parser/checker/irgen）的实测定式与坑
   引用的 `_scratch` 探针结论一并复核。坑出处：这三处是"文档更新已完成"当天漏掉
   的，"更新 stdlib 注释"被当成做完，实际只改了一半。
 
-## wasm32 局部数爆炸：V8 每函数 5 万局部硬上限（2026-09-11）
+## wasm32 局部数爆炸：V8 每函数 5 万局部硬上限
 
 - **症状**：浏览器 `WebAssembly.instantiate` 报 `Compiling function #N:"X"
   failed: local count too large`。V8 上限 50,000 局部/函数；gui_gallery 的
@@ -157,7 +155,7 @@ description: zanc 编译器内部（parser/checker/irgen）的实测定式与坑
   形态（局部 / 字段 / 临时 / 类型名）；并用**旧编译器快照**证明是既有缺陷而非本轮引入
   （本次用 `_scratch/zanc_head.exe`，2026-09-03 构建，同探针同样复现）。
 
-## 属性访问：裸名 static 读静默得 0，裸名实例写让 zanc 段错误（2026-09-11 审计实测）
+## 属性访问：裸名 static 读静默得 0，裸名实例写让 zanc 段错误
 
 - **方法体里对「本类带自定义 setter 的属性」写裸名 `Prop = v;` / `Prop++` → zanc
   rc=139 段错误**。`irgen_expr.c:3058` 把 `recv_type` 传成 `g->cur_inst`（非单体化流程
@@ -237,7 +235,7 @@ description: zanc 编译器内部（parser/checker/irgen）的实测定式与坑
   「只有 mac 挂」误导成 mac 特有问题。
 - toolchain/** 的 *.o 命中 gitignore，提交要 `git add -f`。
 
-## win-arm64 交叉 rt：setjmp 降层与 rt_crash 架构门（实测踩坑 2026-09）
+## win-arm64 交叉 rt：setjmp 降层与 rt_crash 架构门
 
 - **生成的 `_setjmp` 在 aarch64-windows 链不上**：ARM64 的 msvcrt.dll 根本
   没有 `_setjmp` 导出（mingw setjmp.h 原话 "ARM64 msvcrt.dll lacks _setjmp,
@@ -357,13 +355,13 @@ description: zanc 编译器内部（parser/checker/irgen）的实测定式与坑
   平板（与算法无关=与 native 库无关=拷贝循环在扛），输出零拷贝后
   CBC 1267-1319 / GCM 2000-4413 MiB/s（raw 的 88-96%）。
 
-## 字符串字面量里的 `\xNN` 是码点，不是裸字节（2026-09-11 实测）
+## 字符串字面量里的 `\xNN` 是码点，不是裸字节
 
 - `"\xEF"` **不是** byte 0xEF，是码点 U+00EF，进字符串时编成两个 UTF-8 字节
   `C3 AF`。于是 `"\xEF" + "\xBB" + "\xBF"` 不是 3 字节 BOM 而是 6 字节
   `C3 AF C2 BB C2 BF`：同一份 82 字节的 CSS，拼上它读出 len 88、首字节 195，
   写进文件得到的头是 `C3 AF C2 BB C2 BF`——「看起来像 BOM、其实不是」，
-  拿去验证 BOM 行为会得出错误结论（实测踩过一轮）。
+  拿去验证 BOM 行为会得出错误结论。
 - 需要字节精确的内容（BOM、协议魔数、含高位字节的 fixture）一律从 `byte[]` 拼：
   `byte[] raw = new byte[3]; raw[0] = (byte)0xEF; ...; string s = raw.ToStr(0, 3);`
   ——`File.ReadAllText` 内部就是这样把 chunk 变字符串的。自检：`.Length` 等于
@@ -433,7 +431,7 @@ description: zanc 编译器内部（parser/checker/irgen）的实测定式与坑
   `--emit-ir` 写 IR 的**同一条流**。`tests/run_determinism.cmake` 逐字节比两次
   `--emit-ir` 捕获，**冷生成器缓存**那次多一行前缀 → 必红；暖缓存（生成器已编译
   好、不 spawn）不红。**这类"只在冷缓存复现"的红不要当 flake 放过**：把
-  `%LOCALAPPDATA%\Zan\gen` 移走即可稳定复现（本机实测 `json_entity_mapping`
+  `%LOCALAPPDATA%\Zan\gen` 移走即可稳定复现（如 `json_entity_mapping`
   这个**未改动**的既有用例冷缓存同样红，是决定性归因手段）。
   - **修法（根因层）**：加 `--quiet`/`-q`，把编译成功行、驱动捆绑通知、
     `packaging APK` 三条人类进度行纳入 `if (!quiet)`；`genrun.c` 的嵌套生成器
@@ -464,10 +462,10 @@ description: zanc 编译器内部（parser/checker/irgen）的实测定式与坑
 - stdlib 文件引用跨命名空间类型必须写 using（ChartHost 曾裸写 `App`，
   靠用户程序恰好也有 `class App` 才碰巧编译——prune 把它藏成了哑弹）。
 
-## 闭包捕获语义：按变量分型（2026-09-11 实测）
+## 闭包捕获语义：按变量分型
 
 写闭包相关的代码或文档时**不要假设捕获统一按引用装箱**——Zan 按变量分型
-（实测探针 `_scratch/zqa/cap2.zan`）：
+：
 
 ```zan
 int p = 1;
@@ -483,7 +481,7 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
 ```
 
 - 坑出处：给 `zan-site/guides/gui.md` 校订「委托不能捕获局部变量」这类断言时，
-  差点按"闭包一律快照"或"一律共享"写成一句错的——实测发现是**逐变量**决定的
+  差点按"闭包一律快照"或"一律共享"写成一句错的——实际语义是**逐变量**决定的
   （只赋值的那一个才装箱）。写文档/写跨帧状态共享时先按这个分型核对。
 - 配套事实：对象捕获持有的是引用（`h.v = 9` 对闭包可见），所以"捕获后改状态
   看不见"只适用于**只读捕获的值类型局部**。
@@ -491,7 +489,7 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
   捕获 lambda 是带 tag 的堆闭包记录（rec-first）。判据、契约与 store-family
   retain 规则见 `src/common/zan_abi.h` 与 `docs/ABI.md` §3.6。
 
-## 并行会话下的 ctest 假红（2026-09-11）
+## 并行会话下的 ctest 假红
 
 同一工作树里有别的会话在改 stdlib 时，standard 档会出现**与自己无关的红**。
 先归因，别急着改自己的代码：
@@ -510,7 +508,7 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
 - **归因顺序（四步）**：单跑该用例 → 删 `build/conf_<name>.exe` 重编单跑 →
   手工 `zanc` 编译 + 直接跑 exe → 旧编译器快照（如 `_scratch/zanc_head.exe`）
   复现。四步都指向"不是我"再继续；否则停下来查自己。
-- 另一条会一次打红**整档**的：并行会话重链 `build/zanc.exe`（本轮实测 07:21:34，
+- 另一条会一次打红**整档**的：并行会话重链 `build/zanc.exe`（
   而我这轮 ctest 是 07:20:58 起的）。编译器一换，所有 `conf_*.exe`/golden 产物
   全部过期，逐条归因毫无意义；判据是 `ls -l build/zanc.exe` 的 mtime 落在你的运行
   区间内 → 整档作废重跑。
@@ -522,7 +520,7 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
   单跑 0.5s 过，属端口竞争）。并行档的超时值一律先单跑复核。
 
 - **两档 ctest 绝不能同时跑：它们共享同一批 `build/conf_*.exe`**（smoke 与 standard
-  的 label 大量重叠，`add_test` 的 `-DOUT_EXE` 是同一个路径）。本轮实测：我这轮
+  的 label 大量重叠，`add_test` 的 `-DOUT_EXE` 是同一个路径）。本轮：我这轮
   `-L standard -j 4` 起来后，另一会话的 `-L smoke -j 32` 也在跑，两条进程同时往同一个
   `conf_*.exe` 写、又互相把它当「已是最新」复用，双方都开始冒出无法归因的红。**开工前
   先查** `Get-CimInstance Win32_Process -Filter "Name='ctest.exe'"`，有别人的档就先等它
@@ -549,7 +547,7 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
 - **提交前自检**：本次会话在 `_scratch` 造的东西还在吗？在，删掉再提交。
   会话验收只看"任务完成"，没人替你收尾。
 
-## wasm32 默认栈只有 64KB——GUI 深递归必打穿，症状是"乱指针"不是"栈溢出"（2026-09-11）
+## wasm32 默认栈只有 64KB——GUI 深递归必打穿，症状是"乱指针"不是"栈溢出"
 
 > gui_gallery wasm 版随机崩在 measure/strcmp/str_retain：野字符串指针
 > （a=0x72='r'）、emmalloc 块头被清零、缓存 payload 变成别的 JSON 文本——
@@ -578,7 +576,7 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
   摆过一次乌龙。nint 在 IR 恒为 i64（irgen.c TYPE_NINT），C 侧 iptr 是
   i32，wasm-ld 的 signature mismatch 告警就是这对宽度差，逐符号进表。
 
-## wasm32 H5 文本两坑：中文全成"?"是字体面没盖住；"2G 内存"是 V8 预留不是真用（2026-09-11）
+## wasm32 H5 文本两坑：中文全成"?"是字体面没盖住；"2G 内存"是 V8 预留不是真用
 
 > gallery 网页版中文全画成 "?"——不是编码，是 ui.ttf（Segoe UI）cmap 里
 > 中/文/✓ 全是 glyph 0，ft 路径对未覆盖 cp 回退画问号。任务管理器 2G 也
@@ -596,14 +594,14 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
 - **--max-memory 收口预留**：wasm-ld 命令加 `--max-memory=536870912` 后
   模块 memory 段带 max 声明（min 11MB/max 512MB），V8 只预留 512MB，宿主
   JS **零改动**（memory 仍是模块导出，不用 --import-memory）。增长越界会
-  trap，所以上界别贴着实测给，留一个量级余量。
+  trap，所以上界别贴着单次测得值给，留一个量级余量。
 - **wasm 冒烟在 node 跑**：`WebAssembly.instantiate(bytes,
   {wasi_snapshot_preview1: Proxy})` + `ZanWASI(fsBackend, out).attach()`，
   fsBackend 要有 statSync/readFileSync/writeFileSync（缺 writeFileSync 时
   path_open 创建文件会静默失败，别误判成编译问题——tests/wasm32 的断言本
   是"编译+链接"，端到端跑通要自备内存 fs）。
 
-## wasm32 回调地址跨界：(nint)Method 必须垫 C 形 thunk，w32adapt 表逐符号跟（2026-09-11）
+## wasm32 回调地址跨界：(nint)Method 必须垫 C 形 thunk，w32adapt 表逐符号跟
 
 > wxprobe 在真浏览器首帧即陷 "null function or function signature mismatch"：
 > App.PumpGuarded 把 `(nint)App.GuardBody` 交给 C `zan_gui_guard_call`，C 侧
@@ -623,7 +621,7 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
 - **async 未捕获 die 块具名**（irgen_async.c `emit_eh_rethrow_current`）：
   原来只打裸行 "Unhandled exception"，设备控制台上没法归因。现在字符串
   载荷直打消息、类异常经 tid-name 注册表打类名、无异常在飞维持裸行，与
-  同步 die 块对齐。探针实测：`await Boom()` 无 try 时打
+  同步 die 块对齐。探针：`await Boom()` 无 try 时打
   `Unhandled exception: string-payload` / `Unhandled exception: Spark`
   并 exit 1；conformance 无金样期待裸行（exc_uncaught_name 走 catch 路径）。
 - **并行会话下的选择性提交**：工作树文件 = HEAD + 我的 hunk + 别人在途
@@ -633,7 +631,7 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
   `git update-index --cacheinfo 100644,<blob>,<path>`，`git diff --cached`
   核对只剩自己的 hunk 再 commit；别人的在途改动原样留在工作树。
 
-## 改仓库文件的静默陷阱（2026-09-11 本轮实测，三个都真的浪费过时间）
+## 改仓库文件的静默陷阱
 
 - **行尾**：本仓 `core.autocrlf=true`，多数 `.zan`/`CMakeLists.txt`/`parser.c` 在工作区
   是 CRLF、blob 是 LF。**不要**用「读到字节里有 CRLF → 把换行全换成 CRLF」的整片
@@ -643,8 +641,7 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
   验证靠 `git diff --numstat`：增删行数应等于你实际改的行数（本轮 2/2 才对）。
 - **工具传输会把双反斜杠折叠成单反斜杠**：替换片段里想要两个反斜杠，到执行时可能
   只剩一个，于是 old == new、`str.replace()` 静默 no-op——脚本照样打印 "patched 5"，
-  文件一个字节没变（A290 的转义修复就这样空转 4 次，`zanc` 一直报同一个错，还以为
-  是别的会话在还原文件）。含反斜杠/引号的替换一律用 `chr(92)` / `chr(34)` 在脚本里
+  文件一个字节没变。含反斜杠/引号的替换一律用 `chr(92)` / `chr(34)` 在脚本里
   拼，写后做两件事：**md5 前后对比**、**断言 old 计数归零**。
 - **不止双反斜杠：\r / \n 这类同样会被折成真的 CR / LF**（本轮两处：
   `Pinyin.zan` 的注释里落了 2 个裸 CR、`TASKS.md` A301 里落了 3 个裸 CR + 1 个裸 LF，
@@ -688,7 +685,7 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
 - 零成本修法：该分支本来已为 `DoubleOf` 切过一次子串，复用它填 `numRaw` 即可（热路径
   ≤18 位整数一行未动，分配次数不变）。
 
-## 静默截断的指纹：rc=0 但输出缺行（2026-09-11 实测）
+## 静默截断的指纹：rc=0 但输出缺行
 
 - Zan 调度器在**协程全部 parked** 时正常退出（rc=0）。所以「丢唤醒 / 某个 await 永不 resume」
   不崩不报错，只会**少打印后面所有行**——conformance 报 output mismatch，人工看像「输出少
@@ -800,7 +797,7 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
   会从 flaky 绿变确定性红/挂——按 http_client_keepalive 的清理定式补显式
   Close + settle 泵（20×10ms），让挂起事件真正清零。判定哪层是根因：A/B 同一
   stdlib 只换编译器（或反之），单变量归因，别拿两棵树产物直接对跑下结论。
-- **终局语义别记错（2026-09-12 复核定案）**：`run_until` 循环头先查 root-done
+- **终局语义别记错**：`run_until` 循环头先查 root-done
   标志，Main 一完成就退出，不经 io_bb 的 has_pending 分支——「main 返回但仍有
   挂起 op」时退出是设计内（与 rt_sched 纤程调度器「排干全部协程」是两个语义）。
   判别 has_pending 是否生效，必须构造「root 挂起期间被无唤醒轮误杀」的场景；
@@ -817,7 +814,7 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
 - Windows 轮询式带超时 RecvAsync（stdlib 3 参版，1→16ms select-poll）对本地
   关闭**免疫**：select 对已关句柄恒不报可读 → 循环唯一的 `IsOpen` 逃生口（只在
   IsReadable 分支内）不可达，协程带着死 fd 空转到 idle 截止；本地 shutdown
-  也不够（select 恒报可读但 recv 返回 -1 且 fd 未关 → 同样空转，实测）。两个
+  也不够（select 恒报可读但 recv 返回 -1 且 fd 未关 → 同样空转）。两个
   逃生口都够不到时，外部 CancelIoEx 无 op 可取消——「Stop+settle 排水」修不了它。
 - 共享 fd 的协程收尾定式：**谁最后读谁 Close，对端只 Shutdown（半关闭）**——
   shutdown 让对端下一轮探测以 EOF 正常退出、由它亲手 Close；Close 一侧若可能
@@ -861,7 +858,7 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
   `__zan_site_names[idx]` 在每次分配时被无条件覆写——标签永远属于**同类各站点中
   运行时最后分配的那个**。程序里同类有多个 `new` 站点时，报告会把真实泄漏引到
   完全无辜的那个站点上（A64b 实锤：测试自己的 listener 停摆，报告却指着 stdlib
-  里 fwd 的 `new TcpListener`，误导排查一天）。**已修（2026-09-12 同日）**：
+  里 fwd 的 `new TcpListener`，误导排查一天）。**已修**：
   新增 `site_loc_file`/`site_loc_line` 并行表，check-leaks 构建下去重键扩成
   (形状, di_cur_file, di_cur_line)；无 `-g` 时 di_cur_* 恒 0、键退化为纯形状=修复前
   行为；非 check-leaks 构建键恒 0、索引序列不变（对正常构建零扰动）。4096 站点上限
@@ -900,7 +897,7 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
   listener 提成 `static` 字段，Run 收尾补一次 `Stop()`：挂起 accept 以 -1 复位、
   循环 break、帧完成释放，leakcheck 转绿。Stop 幂等（`running=false; sock>=0`
   守卫），循环保守起见的二次 Stop 是无害 no-op。
-- 实测定式（static 停靠不会假红）：static 字段持有的对象**不在泄漏报告里出现**
+- 定式（static 停靠不会假红）：static 字段持有的对象**不在泄漏报告里出现**
   （static 存储不 retain，P2 探针 0 泄漏实锤）——用它当「外部可及的关闭把手」
   安全，但别把语义依赖在它上面（对象生命周期仍由帧/局部变量掌管）。
 - **leakcheck/arcguard 这些「conformance 派生 foreach」的 `_extra_args` 链必须随
@@ -914,7 +911,7 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
   **不看 ZANC_ARGS**，args 修好后旧 exe 依旧复用、红不变——已加 `.args` sidecar
   记录编译参数，args 变了强制重编；`zan_drop_artifact` 同步删 sidecar。
 
-## Worker.Stop() 只翻标志；停摆 accept 靠「关监听 fd」复位（2026-09-12 net 系六项收口）
+## Worker.Stop() 只翻标志；停摆 accept 靠「关监听 fd」复位
 
 - `Worker.Stop()` 语义是协作式（`running=false`，注释明言「不中断运行中的协程」）：
   循环 `while (running) { await AcceptAsync(sock); }` **停在 accept 里时永远看不到
@@ -927,7 +924,7 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
 - 判「accept 靠什么唤醒」别信用例注释，读循环实现：注释说「停止会复位 accept 循环」
   的用例照红——写注释的人把 TcpListener 的语义记串了。
 
-## 停摆的不只 accept：对端 close 唤不醒挂起的 recv，服务端帧同样钉住局部（2026-09-12 sqlserver_tds 收口）
+## 停摆的不只 accept：对端 close 唤不醒挂起的 recv，服务端帧同样钉住局部
 
 - **坑**：测试里的 fake server 协程停在 `RecvOv` 上时，**客户端关掉自己那端不会
   唤醒它**——overlapped recv 不因对端 close 而完成（探针实证：accept 后挂起的 recv，
@@ -947,7 +944,7 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
 - 与上一条 accept 同族：**测试里的停摆帧是 leakcheck 红的常见来源**（accept 停摆、
   recv 停摆），收尾必须让每个自建协程帧能退——「关自己那端的 fd」是通用把手。
 
-## 集合查找内建吞掉 owned 实参临时：Contains/IndexOf/Dict 三兄弟（2026-09-12 同日根修）
+## 集合查找内建吞掉 owned 实参临时：Contains/IndexOf/Dict 三兄弟
 
 - **坑**：`List.Contains/IndexOf(item)`、`Dict.Remove/ContainsKey/TryGetValue(key)`、
   `d[key]` 读的代码生成把实参 `emit_expr` 出来后从不释放。实参是局部变量/字面量时
@@ -972,7 +969,7 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
 - conformance 用例 `arc_lookup_owned_arg` 六形态全调用实参化，leakcheck 孪生
   钉零泄漏；语义结果（at=-1 等）同 golden 钉死，防「释放修没修对、答案先错」。
 
-## 抛出被调方吞掉 owned 实参临时：非泛型调用路径漏注册 EH unwind（2026-09-12 同日根修）
+## 抛出被调方吞掉 owned 实参临时：非泛型调用路径漏注册 EH unwind
 
 - **坑**：setjmp/longjmp 异常路径下，调用方必须把 owned 实参/接收者临时注册进
   每线程 unwind 栈（`__zan_eh_tmp_push` / `emit_eh_tmp_push_slot` 打标），throw 时
@@ -999,7 +996,7 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
 - conformance 用例 `arc_throw_owned_arg`（**双实参** + 抛出被调方）：单实参时
   push/pop 偶发自动平衡，多实参才会把不平衡暴露出来——写这类用例别只用一参。
 
-## object 槽的静态类型决定不了所有权：漏收 owned RHS 与头字当描述符解引用（2026-09-12 同日根修）
+## object 槽的静态类型决定不了所有权：漏收 owned RHS 与头字当描述符解引用
 
 - **坑一（漏收 +1）**：`emit_obj_local_store` 用初始化的**静态类型**判定槽是否接管
   所有权（`obj_slot_owns_value` → `is_arc_managed_type`），而
@@ -1035,7 +1032,7 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
 - conformance 用例 `reflect_object_payload`：类/串/一维数组/矩形数组四种载荷的
   `GetType()`+`is` 一起钉，四孪生（conformance/leakcheck/arcguard/determinism）。
 
-## Binding 活绑定弱引用契约与 out 字段写穿（2026-09-12 登记，2026-09-13 均已修闭账）
+## Binding 活绑定弱引用契约与 out 字段写穿
 
 - **A310（已修）**：`comp.prop = f().field;`（Binding<T> 属性 ← 字段左值、但接收者
   产出 owned 临时）曾合成活绑定——活绑定的 `object target` 是**刻意设计的弱引用**
@@ -1054,14 +1051,14 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
   （实例字段/静态字段/数组与 List 元素/裸字段名=this.field）。回归
   `tests/conformance/out_param_lvalue.zan`，2026-09-13 六形态补试零复现后闭账。
 
-## A311 已修：设计类名撞 `Gui.App`（2026-09-12 下午锁定，续轮修复）
+## A311 已修：设计类名撞 `Gui.App`
 
 - 上半段记的「间歇性 Chart 全家 `undefined type 'App'`」**不是时序，也不是
   「Chart 排序靠后」**：三连 100% 复现，开关是 `partial class` 的逐文件
   上下文与全局命名空间。`.zform` 的 `"name"` 非 ident（如模板占位符
   `{{NAME}}`）时回退**文件基名**（App.zform→`App`），用户类与 stdlib
   `Gui.App` 同名，把下面三个缺陷一起点亮；`name="Root"` 同输入全绿。
-- **三处根因（2026-09-12 续轮已全修，`nsresolve.c` + 两个 stdlib 文件）**：
+- **三处根因**：
   ① `nr_walk` 把合并后的 partial 成员按**存活声明的文件**解析：
      `zan_parser_merge_partials`（`parser.c:4809`）把后续 partial 的成员折进
      **第一个** partial，且不合并各 partial 的 `using` 表；`nr_walk` 于是把
@@ -1093,7 +1090,7 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
   它。是否让 GenForm 回退基名时对 stdlib 已占用类名报错/加后缀属产品取舍
   （静默加后缀掩盖撞名、报错拦住合法同名局部用法），本轮未采纳。
 
-## 生成器缓存键曾漏哈希闭包内文件（2026-09-12 P7a 根修，现已全 stdlib 哈希）
+## 生成器缓存键曾漏哈希闭包内文件
 
 **坑**：`zan_gen_ensure` 的缓存键原先只哈希 `System/Compiler/` 下 9 个固定
 文件；而生成器 exe 是 `zanc ZanGen.zan --auto-stdlib` 编的，其行为由整个
@@ -1110,7 +1107,7 @@ recurse 收集相对路径 → qsort 定序 → 逐文件哈希路径+内容）�
 强制重建——看到 "zan: compiling code generators" 才是真重建。
 
 
-## ORM 表访问器是编译期生成的（GenDb），新 [Table] 模型零接线（2026-09-12 实测）
+## ORM 表访问器是编译期生成的（GenDb），新 [Table] 模型零接线
 
 **坑**：server-collab 控制器里 `this.OaMessage.Where(...)` 在整个模板源码
 里找不到任何属性声明——差点按"漏了接线"去翻 DbContext/AdminController。
@@ -1125,4 +1122,4 @@ Update<T>()/Delete<T>()/SyncStructure<T>()` 根调用同样重写（db_root）�
 裸连接 `db.Select<T>()`、`SyncStructureAllAsync()` 加列全部自动生效，
 无需任何注册/清单；存量库加列后旧行 NULL 读作 0（哨兵语义，见
 tenantId 回填先例）。另：`Insert(x).ExecuteIdentityAsync()` 的返回值才
-是自增 id，且**不回写** `x.id`（实测历史文件记出 id=0 的坑）。
+是自增 id，且**不回写** `x.id`。
