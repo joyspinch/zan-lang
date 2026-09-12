@@ -433,6 +433,15 @@ description: zanc 编译器内部（parser/checker/irgen）的实测定式与坑
     路径时，子 argv 必须带 `--quiet`。
   - 定位手法：`grep -nE '(^|[^a-zA-Z_])printf\(' src/compiler/main.c`（排掉
     `snprintf`/`fprintf`）列出所有 stdout 写点，比读全文件快。
+  - **拉入闭包扩大后，并行会话的在途 stdlib 编辑会经由你的用例炸出来**：A312
+    让 `pullin_qualified_*` 拉入整个 Gui 闭包（282 文件，含 72 个 Chart 文件），
+    于是并行会话改到一半的 stdlib（调用与定义对不上）会让**你的**用例报
+    「stdlib 自身编译错误」。**别怀疑本修**，按此顺序归因：① `git status
+    stdlib/` 看谁在改；② `git archive HEAD stdlib | tar -x -C <tmp>` 抽冻结
+    HEAD stdlib；③ `zanc <case> --stdlib-path <tmp>/stdlib --auto-stdlib
+    --emit-ir` 连跑两次比 md5。HEAD stdlib 上两次 rc=0 且 md5 相同即证明与
+    本修无关。同理，`ctest` 大面积红先看有没有**别的会话在跑 ctest/构建**
+    （共用 `build\zanc.exe` 与 `conf_*.exe`），隔离重跑一遍再下结论。
 - 门控：`--emit-symbols` 恒全量（IDE 索引要完整 stdlib），`ZAN_NO_PULLIN_FILTER=1`
   回退旧行为，`ZAN_PULLIN_DEBUG=1` 打印每个文件的拉入原因（含命中名）。
 - 语义等价验证定式：同一程序 `ZAN_NO_PULLIN_FILTER=1` 开关两态编译运行
