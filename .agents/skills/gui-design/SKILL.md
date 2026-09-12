@@ -223,6 +223,17 @@ token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
   块级 strut 字号不继承)对 HTML 层同样适用,fixture 里显式
   line-height/font-size 规避。
 
+- **overflow 滚动(P6)**:`overflow-y: auto/hidden/scroll` 是真滚动容器
+  ——内容溢出时钳位平移、在 padding box 裁剪、滚动条可用。`auto`
+  溢出才出滚动条,`scroll` 常驻,`hidden` 裁剪且无交互但可程序滚动
+  (`SetScrollTop`,Chrome scrollTop 同语义);单轴声明时另一根 visible
+  按规范计算成 auto。滚动条是**覆盖式**(画在内容上,不占布局宽,
+  不会像 Chrome 经典条那样把内容挤窄 17px);水平轴只裁剪不滚动。
+  坑:① flex 容器要滚动,子项必须 `flex-shrink: 0`——否则弹性收缩
+  把内容恰好压进容器,永远不溢出(Chrome 同款);② 滚动容器里的
+  绝对定位后代也随内容滚(计入延伸);③ 滚轮认领要有指针悬停的
+  先帧历史,UiDriver 脚本先 click 落点再 scroll,否则静默无效。
+
 - **`!important` 真的压得住 inline**:带标记的声明单独存、在普通级联
   (含宿主 inline)之后统一再套一遍,不是"剥掉标记按顺序碰运气"。
 - **渐变只认两端+中间一档**(`linear-gradient([dir,] a, b[, c])`);停靠点上的

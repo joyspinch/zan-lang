@@ -852,6 +852,39 @@ pt/pc/cm/mm/in/q）+ `calc()/min()/max()/clamp()`；`%` 在各属性原有通道
   smoke 仅 HEAD 已知失败 + 其他会话在途 Chart 调试行（XEXT）一例。
   主文档 `docs/HTML_UI.md`（元素/事件/样式支持面 + 浏览器差异清单）。
 
+* **P6 overflow 滚动**（2026-09-12）：**per-axis 滚动语义**——StyleBox
+  新增 overflowX/overflowY（0 visible/1 hidden/2 auto/3 scroll），
+  `overflow` 简写双轴复位、长hand覆盖单轴；单轴声明时另一根 visible
+  按规范计算成 auto（StyleOverflowX/Y 消费端）；非 visible 声明照旧
+  落渲染裁剪位与 BFC 位（P1 判据不变）。**滚动容器**——任一轴声明
+  非 visible 即成立；Arrange 尾段（流/flex/grid/legacy 四条路径统一
+  ArrangeScrollTail，非滚动容器零开销）算内容延伸（子项 border-box
+  底 + 自身 padding-bottom，换算 padding-box 坐标、下限 client 高，
+  absolute 后代也计入）→ 钳 offset → 子树整体平移 -scrollY——渲染
+  与命中共用平移后坐标，HitTest 零改动；下一帧自然位置重排不累积。
+  滚动容器在 padding box 裁剪（CSS 滚动内容收口于 border 内侧）。
+  **交互**——`Gui.ScrollState`（base Gui，非 Widget）：滚轮渲染期
+  CaptureWheel 认领（所有权=上一帧末认领者，嵌套最内层赢、指针在
+  滚动区落回页面滚动的仲裁链复用），轨道点击/滑块拖动移植
+  ScrollView（含拖拽中内容高度重锚定）；滚动条**覆盖式**不占布局宽
+  （Chrome 经典条占 17px 布局宽不模拟，oracle 用 --hide-scrollbars
+  对齐）；scroll 条带常驻、auto 溢出才出、hidden 无交互但
+  SetScrollTop/ScrollTop/ScrollExtent 程序接口可用（Chrome scrollTop
+  同语义）。**验证**——oracle scroll 16 盒全部 0px
+  （tests/weboracle/scroll.json + scroll_driver.zan：auto/hidden/
+  scroll 三态、程序滚动、超额钳制 s3 100→30、嵌套组合 o1 -20 与
+  n1 -10 叠加；web_oracle.py 注入解析期 scrollTop 脚本 +
+  --hide-scrollbars）；css_test 新增 DisplayScroll 段（7 行 golden：
+  extent/钳制/平移/hidden 程序滚动/flex 滚动容器——flex 子项须
+  `flex-shrink: 0`，否则被弹性收缩恰好装下不溢出，引擎与 Chrome
+  同款）；conformance_gui_css Passed；smoke 同基线（HEAD 已知失败
+  + 其他会话 Chart 在途调试行）；UiDriver 实机滚轮
+  （ZAN_UI_SCRIPT：click 悬停→认领历史→scroll 注入→子树精确
+  -60px）——**坑：滚轮认领要有指针悬停的先帧历史，脚本先 click
+  落点再 scroll，否则落页面滚动分支静默无效**。台账新增：无塌陷
+  恢复（ScrollView guard 未移植）、scrollbar-gutter/scroll-behavior/
+  snap/锚点滚动不支持、水平轴 clip-only。
+
 ---
 
 # A17-A31 历史修复记录（全部完成，一行摘要）

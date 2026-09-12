@@ -138,6 +138,11 @@ P0-P4 节）。CSS 支持面（含 grid/flex/float）见 TASKS.md A16。
   span 不建树，文本并入按钮标签。
 - **事件模型是宿主委托**：没有 DOM 冒泡/捕获/.preventDefault——
   data-on-* 直连控件事件槽，一个名字一个 Action。
+- **滚动条是覆盖式**：`overflow-y: auto/scroll` 出的滚动条画在内容
+  上、不占布局宽（Chrome 经典条占 17px、出现/消失引起 reflow；
+  oracle 用 --hide-scrollbars 对齐）。水平轴只裁剪不滚动；
+  overflow:hidden 可程序滚动（SetScrollTop）但无滚轮/滚动条交互。
+  详见 roadmap P6 节。
 - **引擎级已知偏差**（P0-P4 遗留，对 HTML 层同样适用）：行内 run x
   累计 ±3px（GDI 整数步进）、行高分数取整逐行 ±1px、块级 strut
   font-size 不继承（HTML 层已给 body 显式字号的写法规避）、
