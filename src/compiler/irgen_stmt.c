@@ -1083,11 +1083,27 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             if (type && type->kind == TYPE_DELEGATE &&
                 stmt->var_decl.initializer->kind != AST_LAMBDA)
                 check_delegate_async_match(g, stmt->var_decl.initializer, type, locals);
-            LLVMValueRef init_val =
-                (type && type->kind == TYPE_DELEGATE &&
-                 stmt->var_decl.initializer->kind == AST_LAMBDA)
-                    ? emit_lambda_typed(g, stmt->var_decl.initializer, type, locals)
-                    : emit_expr(g, stmt->var_decl.initializer, locals);
+            /* `Binding<T> b = <T expr>` is the same sugar as a plain
+             * assignment (`comp.prop = user.name`): wrap the value in a
+             * binding object instead of storing a raw T where the slot's
+             * readers expect a Binding (a raw store segfaults on the first
+             * Get/Set -- probed 2026-09-12). The assignment path in
+             * irgen_expr.c has always lowered this; the declaration path
+             * here never did. */
+            LLVMValueRef init_val = NULL;
+            int init_owned = 0;
+            if (type && type_is_binding(type) &&
+                !type_is_binding(infer_expr_type(g, stmt->var_decl.initializer, locals))) {
+                init_val = emit_binding_value(g, type,
+                                              stmt->var_decl.initializer, locals);
+                if (init_val) init_owned = 1;
+            }
+            if (!init_val)
+                init_val =
+                    (type && type->kind == TYPE_DELEGATE &&
+                     stmt->var_decl.initializer->kind == AST_LAMBDA)
+                        ? emit_lambda_typed(g, stmt->var_decl.initializer, type, locals)
+                        : emit_expr(g, stmt->var_decl.initializer, locals);
             /* user-defined implicit conversion in a typed initializer:
              * `double d = c;` / `Fahrenheit t = 7.25;` (B12). A conversion
              * whose target is rc-managed yields an owned (+1) reference (the
@@ -1097,7 +1113,11 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
              * the binding-lowering path). */
             zan_ast_node_t *init_src = stmt->var_decl.initializer;
             bool conv_owned = false;
-            if (type) {
+            /* the binding object built above is owned (+1) like a `new`
+             * result: skip the conversion lookup (string→Binding is not a
+             * user conversion) and mark the store below to move it. */
+            bool bind_owned = init_owned;
+            if (type && !bind_owned) {
                 zan_type_t *ity = infer_expr_type(g, init_src, locals);
                 if (ity) {
                     conv_owned =
@@ -1109,7 +1129,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             }
             if (arc_own) {
                 emit_rc_capture_local(g, type, alloca, init_val,
-                    conv_owned ? owned_rhs_marker(g, init_src->loc) : init_src,
+                    (conv_owned || bind_owned)
+                        ? owned_rhs_marker(g, init_src->loc) : init_src,
                     locals);
             } else if (obj_own) {
                 emit_obj_local_store(g, &obj_slot, init_val,
