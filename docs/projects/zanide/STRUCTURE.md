@@ -3,18 +3,18 @@
 本文件是 ZanIDE 的结构约定，也是**其他 Zan GUI 商业项目的参考模板**。
 新增文件前先读这里；`scripts\check_structure.ps1` 会在构建/提交前做守门检查。
 
-## 1. 一个可视单元 = 一个 `.zform` + 同名 code-behind
+## 1. 一个可视单元 = 一个 `.html` 设计稿 + 同名 code-behind
 
 | 文件 | 职责 |
 |------|------|
-| `Xxx.zform` | 声明式设计（FormDoc，JSON）：控件树、布局、事件名。**唯一** UI 声明来源 |
+| `Xxx.html` | 声明式设计（body 带 data-zan-design）：控件树、布局、事件名。**唯一** UI 声明来源 |
 | `Xxx.zan`   | code-behind：`partial class Xxx`，只放数据绑定与事件逻辑 |
 
-* `.zform` 由构建时的 `System.Compiler.GenForm` 生成 `partial class`，**不要手改生成物**。
+* 设计稿由构建时的 `System.Compiler.GenForm` 生成 `partial class`，**不要手改生成物**。
 * 窗口文档（缺省，或 `"role": "window"`）生成 `__CreateWindow()` / `Show()`；
   项目入口（`zan.proj` 的 `entry`）必须是窗口文档，且必须是 zanc 的第一个输入。
 * 面板 / 页 / 卡片等可嵌入单元写 `"role": "control"`，生成
-  `partial class Xxx : Control`，可以直接作为别的 `.zform` 里的 `kind`：
+  `partial class Xxx : Control`，可以直接作为别的 `.html` 设计稿里的 `kind`：
 
   ```json
   { "kind": "ExplorerPanel", "name": "Explorer", "dock": 3, "fw": 260 }
@@ -30,10 +30,10 @@ src/ide_zan/
   zan.proj              项目清单（entry / name / kind）
   ide.css               页面样式表
   src/
-    IdeForm.zform       主窗体（入口，窗口文档）
+    IdeForm.html        主窗体（入口，窗口文档）
     IdeForm.zan
     shell/              外壳：ribbon 命令、停靠注册、快捷键、帧循环
-    panels/             停靠面板（每个一对 .zform + .zan，role: control）
+    panels/             停靠面板（每个一对 .html + .zan，role: control）
     editor/             编辑器宿主、标签条、查找栏、代码导航、诊断存储
     dialogs/            模态/子窗口（窗口文档）
     pages/              全页视图（Start / Docs / Team / Debug / Asset）
@@ -64,7 +64,7 @@ powershell -ExecutionPolicy Bypass -File scripts\check_structure.ps1
 
 检查项：
 
-* 每个 `.zform` 都有同名 `.zan` code-behind；
+* 每个 `.html` 设计稿都有同名 `.zan` code-behind；
 * `src/ide_zan/src` 下的一级目录都在白名单内（见第 2 节）；
 * 没有新的超过 800 行的文件（对照 baseline）；
 * `services/` 与 `models/` 不 `using Gui`。
@@ -73,11 +73,11 @@ powershell -ExecutionPolicy Bypass -File scripts\check_structure.ps1
 
 | 批次 | 内容 | 状态 |
 |------|------|------|
-| P0 | 构建收集全部 `.zform`；本规范 + 守门脚本；编译器 `role: control` | 已完成 |
+| P0 | 构建收集全部设计稿；本规范 + 守门脚本；编译器 `role: control` | 已完成 |
 | P1 | 把 `ZanIDE` 巨类里的状态迁到 `services/` 与面板类 | 进行中 |
-| P2 | 对话框各自独立 `.zform` + code-behind | 待办 |
-| P3 | 停靠面板改 `.zform` + 保留式控件树，去掉即时绘制 | 待办 |
-| P4 | 页面（Start / Docs / Team / Debug / Asset）改 `.zform` | 待办 |
+| P2 | 对话框各自独立设计稿 + code-behind | 待办 |
+| P3 | 停靠面板改 `.html` 设计稿 + 保留式控件树，去掉即时绘制 | 待办 |
+| P4 | 页面（Start / Docs / Team / Debug / Asset）改 `.html` 设计稿 | 待办 |
 | P5 | `ZanIDE.zan` 只留外壳编排；文档收口 | 待办 |
 
 每批必须可编译、可运行、可单独提交（smoke 必须绿）。

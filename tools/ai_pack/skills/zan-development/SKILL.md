@@ -123,14 +123,16 @@ in fixtures. Full spec: `docs/HTML_UI.md` in the SDK.
 ## 6c. Designer documents are .html (Gui P7a)
 
 The visual window designer's storage format is HTML — a doc whose
-`<body>` carries the bare `data-zan-design` marker. Since P7d every shipped
-template and all IDE-internal forms ARE .html (the .zform compile channel
-survives only so old user projects still build); the .zform JSON is an
-internal representation (undo/redo snapshots, the JSON drawer, the LSP
+`<body>` carries the bare `data-zan-design` marker. Every shipped
+template and all IDE-internal forms ARE .html (the legacy .zform compile
+channel was removed in P8-4: zanc rejects .zform input with a targeted
+error; convert with `DesignerHtml.FromJsonDoc`, the canonical
+.zform→.html converter); the JSON doc model is an internal
+representation (undo/redo snapshots, the JSON drawer, the LSP
 feed) — don't hand-write it, and write new designs as .html.
 
 - **Compile channel**: zanc sends a `body[data-zan-design]` .html to the
-  same GenForm projection .zform used (typed partial class); a plain .html
+  same GenForm projection the old .zform used (typed partial class); a plain .html
   goes to the GenHtml build-tree class instead. Keep the marker intact —
   it is the routing bit.
 - **Round-trip is key-faithful** (tested): doc-level keys become body

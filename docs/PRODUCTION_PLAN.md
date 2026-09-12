@@ -41,7 +41,7 @@
 | 3.1 | 代码签名 | 要做（SmartScreen 会拦未签名 exe） | publish 脚本签名 ZanIDE.exe/zanc.exe/工具链 exe；干净虚拟机上无 SmartScreen 拦截 |
 | 3.2 | 自动更新 | 要做 | IDE 内检查更新 + 下载替换 dist 目录，失败可回滚 |
 | 3.3 | 崩溃上报 | 要做 | IDE 崩溃捕获（minidump/栈）+ 用户同意后上传；编译器 zan_crash 同通道 |
-| 3.4 | 标准库/包商店 | 现状：`src/pkg` 已移除（2026-07-28）；IDE 已有 Marketplace 组件（Marketplace.zan / MarketplaceClient.zan / MarketplaceModels.zan + MarketplaceWindow.zform），发布/浏览流程待完善 | IDE 内可浏览/安装/发布版本化包 |
+| 3.4 | 标准库/包商店 | 现状：`src/pkg` 已移除（2026-07-28）；IDE 已有 Marketplace 组件（Marketplace.zan / MarketplaceClient.zan / MarketplaceModels.zan + MarketplaceView 设计稿），发布/浏览流程待完善 | IDE 内可浏览/安装/发布版本化包 |
 | 3.5 | 安装器 | **不做** | — |
 
 ## 阶段 4：质量保障体系（P1，与阶段 2/3 并行）

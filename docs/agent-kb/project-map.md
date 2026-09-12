@@ -88,7 +88,7 @@
 | 新控件 | `stdlib/Gui/Widget/<Name>.zan` + `stdlib/Gui/Component/` 注册 + gallery 示例 |
 | 新 HMI 元件 | `stdlib/Gui/Hmi/` + `templates/gui/gui-hmi` 演示 |
 | 主题/皮肤 | `stdlib/Gui/Theme.zan`, `Skin.zan`, `Style*.zan`, `skins/` |
-| 设计器行为 | `stdlib/Gui/Designer/*` + `stdlib/System/Compiler/GenForm.zan`（`.zform` → 代码） |
+| 设计器行为 | `stdlib/Gui/Designer/*` + `stdlib/System/Compiler/GenForm.zan`（`.html` 设计稿 → 代码） |
 | 新建项目模板 | `templates/**/template.manifest` + `ZanIDE.Workspace.zan`（见 [templates-and-wizard.md](templates-and-wizard.md)） |
 | IDE 面板/命令 | `ZanIDE.Panels.zan` + `ZanIDE.zan`（命令分发）+ `ZanIDE.State.zan`（状态） |
 | 补全/跳转/悬停 | `src/lsp/` + `LspSession.zan` |

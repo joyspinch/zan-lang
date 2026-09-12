@@ -10,9 +10,9 @@ templates/<group>/<id>/template.manifest
                  ├─ 左：分类列表   中：模板列表 + 名称/位置/平台/设备尺寸
                  └─ 右：预览（真实截图，或按 sketch 画线框）
        └─ ZanIDE.CreateProjectT(tpl, parent, name, platforms, devW, devH, log)
-            ├─ 复制模板树，App.zan/App.zform 重命名为项目名
+            ├─ 复制模板树，App.zan/App.html 重命名为项目名
             ├─ 写 zan.proj（type/target/entry/platforms）
-            └─ RetargetForms(): 按所选设备尺寸改写 .zform 的 winW/winH 并把控件夹回画布内
+            └─ RetargetForms(): 按所选设备尺寸改写 .html 设计稿的 winW/winH 并把控件夹回画布内
 ```
 
 ## manifest 字段
@@ -35,7 +35,7 @@ templates/<group>/<id>/template.manifest
 
 | 字段 | 含义 |
 | --- | --- |
-| `sizeable` | `1` = 这个模板可以在创建时选设备尺寸（向导显示尺寸行，并改写生成的 `.zform`） |
+| `sizeable` | `1` = 这个模板可以在创建时选设备尺寸（向导显示尺寸行，并改写生成的 `.html` 设计稿） |
 | `size` | 默认设计尺寸，`宽x高`，如 `1000x680` |
 | `shape` | `round` = 圆形设计区（手表表盘） |
 | `preview` | 相对模板目录的截图路径（有就优先画真实截图） |
@@ -50,7 +50,7 @@ templates/<group>/<id>/template.manifest
 
 **教训**：曾经存在 `gui-desktop(1280x720)`、`gui-phone(390x844)`、`gui-tablet(768x1024)`、
 `gui-qvga(320x240)`、`gui-screen(480x320)`、`gui-wvga(800x480)` 六个模板，内容与
-`gui-free` 完全相同，只有 `.zform` 里的宽高不同 —— 20 个 GUI 模板全挤在同一个
+`gui-free` 完全相同，只有 `.html` 设计稿里的宽高不同 —— 20 个 GUI 模板全挤在同一个
 "Window App" 分类里，用户根本看不出区别。
 
 现在的划分是**三个正交维度**，各自用不同的 UI 元素表达，不再混进模板名：
@@ -102,6 +102,6 @@ templates/<group>/<id>/template.manifest
 scripts\e2e_pipeline.ps1     # 每个模板：脚手架 → 编译 → 发布 → 冒烟
 ```
 
-- `.zform` 设计器模板会被它 **SKIP**（`.g.zan` 由 IDE 生成），所以窗体模板还要在
+- `.html` 设计器模板会被它 **SKIP**（`.g.zan` 由 IDE 生成），所以窗体模板还要在
   IDE 里真的新建一次项目、编一次、跑起来看一眼。
 - 删/改模板前先 `git grep <模板目录名>`：`scripts/e2e_pipeline.ps1`、文档、测试可能引用。

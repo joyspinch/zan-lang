@@ -239,10 +239,10 @@ smoke/standard 档）。皮肤命名空间 `numberanim`（base.css 三处：size
   gallery 的仪表演示全是 `ChartSeries.Gauge(...)` 配置。所以仪表画错要去
   `stdlib/Gui/Component/Chart/ChartViewPie.zan` 的 `DrawGauge` 查，别改 demo。
 
-## 设计器窗体（`.zform`）的数据流
+## 设计器窗体（`.html` 设计稿）的数据流
 
 ```text
-.zform (JSON, FormDoc)  --IDE/编译器 formgen--> <Name>.g.zan --+
+.html 设计稿 (JSON 文档模型)  --IDE/编译器 GenForm--> <Name>.g.zan --+
                                                                |--> 与手写 App.zan 一起编译
 手写逻辑 <Name>.zan / App.zan --------------------------------+
 ```
@@ -251,7 +251,7 @@ smoke/standard 档）。皮肤命名空间 `numberanim`（base.css 三处：size
   winCenter, layoutMode, winZoom, fields }`、`FormFieldDoc { type, label, name,
   required, wrap, span, fx, fy, fw, fh }`（`fx/fy/fw/fh` 是自由布局的绝对坐标）。
 - 生成器在 `stdlib/System/Compiler/GenForm.zan`（编译期）与 IDE 侧的生成代码路径。
-- 因此：**改窗口尺寸/控件位置就是改 `FormDoc` 再写回 `.zform`**，不要去改生成的 `.g.zan`。
+- 因此：**改窗口尺寸/控件位置就是改设计文档再写回 `.html` 设计稿**，不要去改生成的 `.g.zan`。
 
 ## 验证 GUI 改动
 
