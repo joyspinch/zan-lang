@@ -1032,3 +1032,21 @@ recurse 收集相对路径 → qsort 定序 → 逐文件哈希路径+内容）�
 加源/改 stdlib 闭包内任何文件，无需再动 genrun.c 的清单；kGenSources 清
 单已删。临时绕过手段（诊断用）：删 `%LOCALAPPDATA%/Zan/gen/ZanGen_*.exe`
 强制重建——看到 "zan: compiling code generators" 才是真重建。
+
+
+## ORM 表访问器是编译期生成的（GenDb），新 [Table] 模型零接线（2026-09-12 实测）
+
+**坑**：server-collab 控制器里 `this.OaMessage.Where(...)` 在整个模板源码
+里找不到任何属性声明——差点按"漏了接线"去翻 DbContext/AdminController。
+实际是 stdlib `System/Compiler/GenDb.zan` 在编译期重写：`obj.<Entity>`
+（<Entity> 匹配 [Table] 类名）整体替换为 `__DbBind.Q_<T>(obj.__Conn())`
+等绑定树（指令 db_acc_head / db_acc_root）；`db.Select<T>()/Insert<T>/
+Update<T>()/Delete<T>()/SyncStructure<T>()` 根调用同样重写（db_root）。
+任何带 `__Conn()` 的类（模板 AppController 的请求租约）自动获得全部实体
+访问器。
+
+**定式**：加新模型 = 新建 [Table] 类文件即可，控制器 `this.<Entity>`、
+裸连接 `db.Select<T>()`、`SyncStructureAllAsync()` 加列全部自动生效，
+无需任何注册/清单；存量库加列后旧行 NULL 读作 0（哨兵语义，见
+tenantId 回填先例）。另：`Insert(x).ExecuteIdentityAsync()` 的返回值才
+是自增 id，且**不回写** `x.id`（实测历史文件记出 id=0 的坑）。
