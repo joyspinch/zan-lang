@@ -27,6 +27,8 @@ class WxPageChat : Control {
     Control curPopup;
     /// 输入区下排的图标条：群聊/私聊图标数不同，切会话时重建。
     ToolStrip bar;
+    /// 点任意用户头像弹出的小名片（与抽屉互斥的右缘浮卡）。
+    WxProfilePanel prof;
 
     WxPageChat() {
         this.InitControl("wxPageChat", 5);
@@ -137,10 +139,16 @@ class WxPageChat : Control {
         drawer.visible = false;
         drawerBody = WxDrawerBody.Of(
             () => { WxHistoryWindow.Open(this.app, data[current]); },
-            () => { this.ClearCurrent(); });
+            () => { this.ClearCurrent(); },
+            (nm, ini, tint) => { this.ShowProfile(nm, ini, tint); });
         drawerBody.Root().dock = 5;
         drawer.Add(drawerBody.Root());
         this.Add(drawer);
+
+        // ---- 资料名片：点任意用户头像弹出（右缘浮卡，与抽屉互斥）----
+        prof = WxProfilePanel.Of();
+        prof.dock = 4;
+        this.Add(prof);
 
         // ---- 聊天记录本体 ----
         chat = new ChatView();
@@ -148,6 +156,8 @@ class WxPageChat : Control {
         chat.dock = 5;
         chat.WithStyle(ChatStyle.Bubble());
         chat.WithBubbleWidth(620);
+        // 点气泡里的头像 = 弹发言人名片（原版同款交互）。
+        chat.OnAvatarClick((idx) => { this.OpenMsgProfile(idx); });
         this.Add(chat);
 
         this.Select(0);
@@ -171,6 +181,7 @@ class WxPageChat : Control {
         avaPanel.Root().visible = p == avaPanel.Root();
         filePanel.Root().visible = p == filePanel.Root();
         drawer.visible = false;
+        prof.Hide();
         popup.visible = true;
         { if (app != null) { app.RequestRedraw(); } }
     }
@@ -184,9 +195,45 @@ class WxPageChat : Control {
     /// 抽屉显隐；打开前把内容对齐到当前会话（私聊/群聊版式翻面）。
     void ToggleDrawer() {
         this.ClosePopups();
+        prof.Hide();
         drawerBody.Show(data[current]);
         drawer.visible = !drawer.visible;
         { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    /// 点气泡头像弹名片：user = 我；带 agent 的按发言人注册表解析；
+    /// 其余（一对一的对方）用会话名。原版单点头像就是这个名片。
+    void OpenMsgProfile(int idx) {
+        if (idx < 0 || idx >= data[current].msgs.Count) { return; }
+        ChatMessage m = data[current].msgs[idx];
+        if (m.role == "user") {
+            this.ShowProfileCard(WxProfiles.Me());
+            return;
+        }
+        if (m.agent != "") {
+            string nm = WxData.NameOf(m.agent);
+            if (nm != null) {
+                this.ShowProfileCard(WxProfiles.Of(nm,
+                    WxData.IniOf(m.agent), WxData.TintOfId(m.agent)));
+                return;
+            }
+        }
+        WxSession s = data[current];
+        this.ShowProfileCard(WxProfiles.Of(s.name, s.initial, s.tint));
+    }
+
+    /// 弹名片（按数据）；抽屉与弹出面板一并收起——它们与名片同一
+    /// 一块右缘/弹出区，叠着就是自检报的重叠。
+    void ShowProfileCard(WxProfileCard c) {
+        this.ClosePopups();
+        drawer.visible = false;
+        prof.Show(c);
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    /// 弹名片（按 名字/首字/色调；抽屉与群成员格走这条）。
+    void ShowProfile(string nm, string ini, string tint) {
+        this.ShowProfileCard(WxProfiles.Of(nm, ini, tint));
     }
 
     /// 清空当前会话：共享的记录列表清掉，聊天区与列表摘要跟上
@@ -962,4 +1009,84 @@ class WxSettingsView : Control {
     }
 
     override string Kind() { return "WxSettingsView"; }
+}
+
+
+/// 朋友圈页：左栏是「发现」入口列（朋友圈/视频号/搜一搜/游戏/小程序，
+/// 只有朋友圈是真的，其余是原版同款的摆设项）；右侧上方是封面（自己的
+/// 名字与头像压在封面右下角，点头像弹自己的名片），下方是帖子流
+/// （头像 + 名字 + 正文 + 图墙 + 时间 + 「···」）。头像可点、长文可展开。
+/// 版式上「左窄导航 + 右信息流」与将来的企业工作台同构。
+class WxPageMoments : Control {
+    ListView<WxPost> feed;
+    WxProfilePanel prof;
+    App app;
+
+    WxPageMoments() {
+        this.InitControl("wxmoments", 5);
+        this.Class = "wxmain";
+
+        // ---- 左栏：发现 ----
+        Panel disc = Wx.Col("wxdisc");
+        disc.dock = 3;
+        disc.Add(Wx.Lbl("发现", "wxdistitle"));
+        disc.Add(this.Entry("compass", "朋友圈", true));
+        disc.Add(this.Entry("device-tv", "视频号", false));
+        disc.Add(this.Entry("search", "搜一搜", false));
+        disc.Add(this.Entry("device-gamepad", "游戏", false));
+        disc.Add(this.Entry("apps", "小程序", false));
+        this.Add(disc);
+
+        // ---- 封面：右下角压着自己的名字与头像（点头像 = 我的名片）----
+        Panel cover = Wx.Col("wxcover");
+        cover.dock = 1;
+        Panel corner = Wx.Col("wxcovercorner");
+        corner.dock = 4;
+        corner.Add(Wx.Lbl("季然", "wxcovername"));
+        Avatar me = Wx.Ava("季", 64, "success");
+        me.AddClass("wxpme");
+        me.OnClick(() => { this.Ask("季然", "季", "success"); });
+        corner.Add(me);
+        cover.Add(corner);
+        this.Add(cover);
+
+        // ---- 帖子流 ----
+        feed = new ListView<WxPost>(WxPostRow.Of);
+        feed.Class = "wxfeed";
+        feed.dock = 5;
+        feed.Bind(WxProfiles.Moments());
+        this.Add(feed);
+
+        // ---- 资料名片（与聊天页同一张卡）----
+        prof = WxProfilePanel.Of();
+        prof.dock = 4;
+        this.Add(prof);
+    }
+
+    /// 「发现」的一行：图标 + 名字；只有当前项亮着，其余是原版
+    /// 同款的摆设项，点了不动。
+    Flex Entry(string icon, string txt, bool on) {
+        Flex e = Wx.Row("wxdentry");
+        IconView ic = new IconView(icon, 20);
+        Label tl = Wx.Lbl(txt, "wxdentrytext");
+        e.Add(ic);
+        e.Add(tl);
+        if (on) {
+            e.SetClassIn("wxon", "wxon");
+            ic.AddClass("wxon");
+            tl.AddClass("wxon");
+        }
+        return e;
+    }
+
+    void Ask(string nm, string ini, string tint) {
+        prof.Show(WxProfiles.Of(nm, ini, tint));
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    void UseApp(App a) {
+        this.app = a;
+    }
+
+    override string Kind() { return "WxPageMoments"; }
 }

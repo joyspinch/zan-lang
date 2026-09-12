@@ -5,6 +5,10 @@ using Gui.Component.CodeEditor;
 
 namespace Gui.Component;
 
+/// 气泡头像被点击：告诉宿主命中的是 `data` 里的第几条消息
+/// （宿主据此弹出发言人的资料面板之类的名片界面）。
+delegate void ChatAvatarClick(int msgIndex);
+
 /// 一条聊天消息：记录里显示的角色（user / assistant / tool / error）、
 /// 正文，以及这一轮的思考过程（没有则 ""）。
 ///
@@ -231,6 +235,11 @@ class ChatView : Control {
     int style;
     /// 时刻格式化钩子（null = 组件内置的本机时区 HH:MM）。
     ChatClock clockOf;
+    /// 气泡头像被点中时的宿主回调（bubble 模式专用，见 AvatarHit）。
+    ChatAvatarClick avatarClick;
+    /// 命中测试要从鼠标坐标换算气泡几何，而点击事件到达时手里没有
+    /// App 参数——OnPaint 把当帧的 app 缓存下来供 AvatarHit 用。
+    App uiApp;
 
     /// 正在排的那份行表，以及增量重排用的水位线：`cacheTurns` 之前的
     /// 轮次已定型，`cachePrefix` 是它们占的行数。
@@ -292,6 +301,9 @@ class ChatView : Control {
         kindLabelOf = null;
         style = 0;
         clockOf = null;
+        // 气泡模式的点击落在子网格 StyledText 上，到不了这里；整条
+        // 点击链由 AvatarHit 用当帧几何自己判（日志模式它自会退出）。
+        this.OnClick(() => { this.AvatarHit(); });
         cache = new List<TextRun>();
         cacheTurns = 0;
         cachePrefix = 0;
@@ -455,6 +467,7 @@ class ChatView : Control {
     /// 增量重排（受时间预算约束），把排好的行、滚动、选区与折叠
     /// 状态交给常驻的 StyledText 呈现。
     override void OnPaint(App app) {
+        uiApp = app;
         bool has = data != null && data.Count > 0;
         bool bubMode = style == ChatStyle.Bubble();
         emptyLbl.SetShown(!has && !busy);
@@ -490,6 +503,40 @@ class ChatView : Control {
         if (scrollSig.Get() > max) { scrollSig.Set(max); }
         if (scrollSig.Get() < 0) { scrollSig.Set(0); }
         this.TakeCopy(app);
+    }
+
+    /// 宿主注册「气泡头像被点」回调；链式返回自己。
+    ChatView OnAvatarClick(ChatAvatarClick cb) {
+        avatarClick = cb;
+        return this;
+    }
+
+    /// 点击命中测试：只有 bubble 模式响应。点击坐标来自缓存的
+    /// uiApp（事件到达在两帧之间，没有 app 参数），气泡几何与
+    /// PaintBubbles 同一套换算：先滚动态偏移出每条气泡的 y，
+    /// 头像在气泡同行一侧（我方在右、对方在左），直径 34 缩放像素。
+    void AvatarHit() {
+        if (avatarClick == null || uiApp == null) { return; }
+        if (style != ChatStyle.Bubble() || bubKey == "") { return; }
+        App app = uiApp;
+        if (app.mouseX < bx || app.mouseX >= bx + bw) { return; }
+        if (app.mouseY < by || app.mouseY >= by + bh) { return; }
+        int pad = app.Scale(12); int padV = app.Scale(10); int avaD = app.Scale(34);
+        int viewH = bh - padV * 2; if (viewH < 0) { viewH = 0; }
+        int over = bubH - viewH; if (over < 0) { over = 0; }
+        int y0 = by + padV - (over - bscr.Get());
+        for (int i = 0; i < bub.Count; i = i + 1) {
+            ChatBubble b = bub[i];
+            if (b.waiting) { continue; }
+            int ry = y0 + b.top;
+            if (app.mouseY < ry || app.mouseY >= ry + avaD) { continue; }
+            int avaX = bx + pad;
+            if (b.mine) { avaX = bx + bw - pad - avaD; }
+            if (app.mouseX >= avaX && app.mouseX < avaX + avaD) {
+                avatarClick(b.idx);
+                return;
+            }
+        }
     }
 
     /// 指针在气泡区上时滚轮滚动：气泡是像素滚动的，一档滚 40px（约一
