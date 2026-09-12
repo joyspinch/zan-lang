@@ -14,6 +14,12 @@ class AccountDao {
     static int AnswerLimit = 5;
     static int AnswerWindowSec = 3600;
 
+    /* 登录密码错锁定（账号级，A303 建议 ④）：1 小时窗口内错满
+       LoginLimit 次，本窗口结束前登录拒绝。IP 限流是第一道闸（防单源
+       扫描），这是第二道（防分布式按账号撞库）。 */
+    static int LoginLimit = 10;
+    static int LoginWindowSec = 3600;
+
     IDbConnection db;
 
     AccountDao(IDbConnection db) {
@@ -106,6 +112,34 @@ class AccountDao {
     async void ClearAnswerFails(int accountId) {
         int _n = await this.db.Update<Account>()
             .Set(a => a.answerFails, 0)
+            .Where(a => a.id == accountId)
+            .ExecuteAffrowsAsync();
+    }
+
+    /* 登录锁定：窗口内错满 LoginLimit 次后拒绝（与密保同构的窗口语义）。
+       row 为 null（账号不存在）恒不锁定——错误计数没有落点。 */
+    bool LoginLocked(Account row, long now) {
+        if (row == null || row.loginFails < AccountDao.LoginLimit) {
+            return false;
+        }
+        return now - row.loginFailAt < AccountDao.LoginWindowSec;
+    }
+
+    async void NoteLoginFail(Account row, long now) {
+        if (row == null) { return; }
+        /* 窗口过期则从零计。 */
+        int fails = row.loginFails;
+        if (now - row.loginFailAt >= AccountDao.LoginWindowSec) { fails = 0; }
+        int _n = await this.db.Update<Account>()
+            .Set(a => a.loginFails, fails + 1)
+            .Set(a => a.loginFailAt, now)
+            .Where(a => a.id == row.id)
+            .ExecuteAffrowsAsync();
+    }
+
+    async void ClearLoginFails(int accountId) {
+        int _n = await this.db.Update<Account>()
+            .Set(a => a.loginFails, 0)
             .Where(a => a.id == accountId)
             .ExecuteAffrowsAsync();
     }

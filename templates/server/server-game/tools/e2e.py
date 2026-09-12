@@ -234,6 +234,21 @@ st, html, _ = http("/forgot/reset", data={
     "newpass2": "pass123"})
 ok("错误次数过多" in html, "lockout applies even to correct answer")
 
+# 登录密码错限频（账号级，A303 建议 ④）：mallory 连错 10 次后锁定，
+# 正确密码也被拒到窗口结束；IP 限流（5/5s）之上叠加的账号维度闸门。
+# mallory 的登录走 TCP：op login 不限 IP（有身份前的按 op 限流只对
+# HTTP），计数落在 game_account 行上。
+mlock = tcp()
+mlock.recv()
+for i in range(10):
+    mlock.send({"op": "login", "user": "mallory", "pass": "wrongpass"})
+    m = mlock.err_for("账号或密码不正确")
+    ok(m is not None, f"mallory wrong password #{i+1}")
+mlock.send({"op": "login", "user": "mallory", "pass": "mallory1"})
+m = mlock.err_for("错误次数过多")
+ok(m is not None, "login locks after 10 wrong passwords (account-level)")
+mlock.drop()
+
 # ---------- 4. TCP 账号/选区/建角 ----------
 bob = tcp()
 hello = bob.recv(timeout=30)  # 世界 worker 起服要种子目录，banner 可能晚到

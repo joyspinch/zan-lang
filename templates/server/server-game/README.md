@@ -141,9 +141,11 @@ zanc src/main.zan src/**/*.zan --auto-stdlib -o server-game.exe
 - **打金闭环**：材料（兽皮/蝎子壳/祖玛头像…）不可购买只能卖店
   （半价、下限 1 金）→ 换钱买药/买装备 → 打更高级的怪。新手图稻草人
   `dropRate=10000` 首杀必掉，入门丝滑。
-- **挂机**：`auto` 挂上模板 id 后，每 `tickMs` 世界拍给在线会话打一
-  回合并推 `ev fight`，关掉或下线即停；跨图自动暂停（找不到目标静默
-  空转），回到怪的地图续打；被踢会话不参与 tick。
+- **挂机**：`auto` 挂上模板 id 后照原版离线挂机——服务端不为每一击
+  推流，每 60 秒把过去的战斗批量补跑结算成一条 `ev idlesum`（击杀/
+  经验/金币/掉落聚合 + self/bag 快照）推给客户端；关掉或下线即结算
+  收尾；跨图自动暂停（找不到目标静默空转），回到怪的地图续打；被踢
+  会话不参与 tick。客户端的逐秒战况动画是本地演示，收益以结算为权威。
 - **死亡**：`hp<=0` 立即回新手村（地图 1），保留一半血量、关闭挂机，
   推 `ev die`；不掉装备不掉级，死亡惩罚留给二开。GM 改等级会把血量
   钳到新上限（升不溢出、降不悬空）。
@@ -184,11 +186,15 @@ zanc src/main.zan src/**/*.zan --auto-stdlib -o server-game.exe
 | `{"op":"buy","item":id,"count"}` | `{"ok":1,"self"}`（金币即时扣，1-99 件） |
 | `{"op":"sell","item":id,"count"}` | `{"ok":1,"self"}`（半价回收，下限 1 金） |
 
-服务端主动推送：`ev chat / walk / move / announce / kick`（客户端收到
-kick 自行断开）、`ev online`（tick 每 30 秒在线数）、`ev state`（GM 改值
-实时推给在线会话）；战斗另推 `ev fight`（每回合详情）、`ev levelup`、
-`ev drop`（掉落/GM 发放）、`ev die`（死亡回城）。密码与密保答案都是盐化散列，网页与 TCP 共用
-`AccountDao`，行为不会漂移。
+服务端主动推送（按现有代码逐项核对）：`ev chat`（区服/GM 喊话）、
+`ev walk / move`（同区同图播报）、`ev announce`（公告）、`ev kick`
+（顶号/心跳超时/GM 踢线，客户端收到自行断开）、`ev state`（GM 改值
+实时推给在线会话）；战斗类：`ev levelup`（手动单挑升级即时推）、
+`ev drop`（掉落/GM 发放，含 bag 快照）、`ev die`（死亡回城）、
+`ev idlesum`（挂机每 60 秒批量结算）。手动 `hunt` 的回合详情在 op
+应答的 `fight` 字段里，不单独推 `ev fight`；在线数走 `realms`/`hb`
+的响应字段，没有 `ev online` 推送。密码与密保答案都是盐化散列，网页
+与 TCP 共用 `AccountDao`，行为不会漂移。
 
 用 `nc` 就能当客户端试：
 

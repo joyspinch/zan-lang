@@ -18,9 +18,9 @@ namespace ZanWeb.Game;
      HTTP 应答  {"ok":1,...} / {"ok":0,"err"}（HTTP 200；限流 429）
      TCP 推送   {"ev":"chat","from","text"} {"ev":"walk",...} {"ev":"move",...}
                {"ev":"announce","title","body"} {"ev":"kick","reason"}
-               {"ev":"fight",...} {"ev":"levelup","level"} {"ev":"drop",...}
-               {"ev":"die"} {"ev":"idlesum",...}（挂机 60 秒批量结算）
-               {"ev":"hb-notice",...}
+               {"ev":"levelup","level"} {"ev":"drop",...} {"ev":"die"}
+               {"ev":"idlesum",...}（挂机 60 秒批量结算；手动 hunt 的
+               回合详情在 op 应答的 fight 字段里，不单独推 ev fight）
      TCP 上行   {"op":"hello",...} 加密握手（沿用）
                {"op":"attach","token":...} 把本连接挂为推送通道
                {"op":"hb"} 心跳（续 lastSeen）
@@ -501,8 +501,15 @@ class Gateway {
         try {
             AccountDao dao = new AccountDao(db);
             Account row = await dao.ByUsername(user);
+            /* 账号级锁定（分布式撞库闸门，A303 建议 ④）：先于密码校验，
+               拒绝文案不带「账号不存在」信息——不向爆破者透露账号存在性。
+               row==null 时锁定恒假，走同一条错误文案。 */
+            if (dao.LoginLocked(row, now)) {
+                return Gateway.Err("错误次数过多，请一小时后再试");
+            }
             /* 空响应同文案：不向爆破者透露账号是否存在。 */
             if (!dao.CheckPassword(row, pass)) {
+                await dao.NoteLoginFail(row, now);
                 return Gateway.Err("账号或密码不正确");
             }
             if (row.status != 1) {
@@ -512,6 +519,7 @@ class Gateway {
                 return Gateway.Err(why);
             }
             int _t = await dao.TouchLogin(row.id, now);
+            await dao.ClearLoginFails(row.id);
 
             /* 密码校验在本 worker 完成（多 worker 时登录算力按请求分摊
                到各 HTTP worker）；会话登记在世界进程：顶号与入表必须
@@ -622,6 +630,7 @@ class Gateway {
             }
             await dao.ClearAnswerFails(row.id);
             await dao.SetPassword(row.id, newpass);
+            await dao.ClearLoginFails(row.id);
             JsonValue r = Gateway.Ok();
             r.Set("msg", JsonValue.NewStr("密码已重置，请用新密码登录"));
             return r;
