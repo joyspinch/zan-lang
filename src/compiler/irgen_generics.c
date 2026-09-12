@@ -993,6 +993,46 @@ static LLVMValueRef obj_rc_flag_slot(zan_irgen_t *g, local_var_t *v) {
     return v->obj_rc_flag;
 }
 
+/* Release a heap value held in an `object` slot whose concrete flavour is not
+ * known statically. An owned RHS stored there can be a class instance or a
+ * heap string, and the two carry different second header words -- a class
+ * object records its allocation site / descriptor pointer, a managed string
+ * records the string tag with its cached byte length. Releasing a string
+ * through zan_rt_release_dyn made it read that tag word as a descriptor and
+ * call a garbage destructor, so each flavour is tested and sent to its own
+ * releaser: the string tag is checked first (a descriptor pointer's high half
+ * can never equal ZAN_STRING_TAG), and a null slot is skipped -- the header
+ * probe must not run on a null reference. */
+static void emit_release_obj_value(zan_irgen_t *g, LLVMValueRef cur) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(i8t, 0);
+    if (LLVMTypeOf(cur) != i8ptr)
+        cur = LLVMBuildBitCast(g->builder, cur, i8ptr, "obj.rbc");
+    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+    LLVMBasicBlockRef probe = LLVMAppendBasicBlockInContext(g->ctx, fn, "obj.probe");
+    LLVMBasicBlockRef sbb = LLVMAppendBasicBlockInContext(g->ctx, fn, "obj.srel");
+    LLVMBasicBlockRef obb = LLVMAppendBasicBlockInContext(g->ctx, fn, "obj.orel");
+    LLVMBasicBlockRef cbb = LLVMAppendBasicBlockInContext(g->ctx, fn, "obj.rdone");
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntEQ, cur, LLVMConstNull(i8ptr), "obj.rnull"),
+        cbb, probe);
+    LLVMPositionBuilderAtEnd(g->builder, probe);
+    LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
+    LLVMValueRef hp = LLVMBuildGEP2(g->builder, i8t, cur, &neg8, 1, "obj.hp");
+    LLVMValueRef w = LLVMBuildLoad2(g->builder, i64,
+        LLVMBuildBitCast(g->builder, hp, LLVMPointerType(i64, 0), "obj.hi"),
+        "obj.hw");
+    LLVMBuildCondBr(g->builder, zan_hdr_is_string(g, w, "obj.isstr"), sbb, obb);
+    LLVMPositionBuilderAtEnd(g->builder, sbb);
+    emit_string_release(g, cur);
+    LLVMBuildBr(g->builder, cbb);
+    LLVMPositionBuilderAtEnd(g->builder, obb);
+    emit_arc_release_typed(g, NULL, cur);
+    LLVMBuildBr(g->builder, cbb);
+    LLVMPositionBuilderAtEnd(g->builder, cbb);
+}
+
 /* Release the occupant of an object local when it owns one. */
 static void emit_release_obj_local(zan_irgen_t *g, local_var_t *v) {
     if (!v || !v->obj_rc_flag) return;
@@ -1005,7 +1045,7 @@ static void emit_release_obj_local(zan_irgen_t *g, local_var_t *v) {
     LLVMBuildCondBr(g->builder, owns, rel, cont);
     LLVMPositionBuilderAtEnd(g->builder, rel);
     LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr, v->alloca, "obj.cur");
-    emit_arc_release_typed(g, NULL, cur);
+    emit_release_obj_value(g, cur);
     LLVMBuildStore(g->builder, LLVMConstInt(i1, 0, 0), v->obj_rc_flag);
     LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), v->alloca);
     LLVMBuildBr(g->builder, cont);
@@ -1019,6 +1059,25 @@ static int obj_slot_owns_value(zan_type_t *t) {
     return t && is_arc_managed_type(t);
 }
 
+/* The same question when the initializer's static type tells nothing about
+ * ownership -- `object` or `string`: an owned (+1) RHS is by construction a
+ * heap reference handed over to this slot, and the dynamic release tolerates
+ * null and both header flavours (class site index / string tag). Refusing to
+ * own it dropped that +1 and leaked one object per execution --
+ * leakcheck_reflect_members' single `(null)`-named object was exactly the
+ * CreateInstance result (a call declared to return `object`).
+ * Delegates and arrays are excluded: they carry their own release functions
+ * (closure-record destructor, array length prefix) and the site-index dynamic
+ * releaser would free the record without running them. */
+static int obj_slot_owns_owned_rhs(zan_irgen_t *g, zan_ast_node_t *rhs,
+                                   LLVMValueRef val, local_scope_t *locals) {
+    if (!rhs || !val || !locals) return 0;
+    if (LLVMGetTypeKind(LLVMTypeOf(val)) != LLVMPointerTypeKind) return 0;
+    zan_type_t *rt = infer_expr_type(g, rhs, locals);
+    if (!rt || (rt->kind != TYPE_OBJECT && rt->kind != TYPE_STRING)) return 0;
+    return expr_yields_owned_rc_value(g, rhs, locals);
+}
+
 /* Store `v` (from `rhs`, static type `vtype`) into an object local, keeping the
  * ownership flag in step: release what the slot owned, take a reference to the
  * new occupant when it is a heap object the expression does not already hand
@@ -1028,7 +1087,8 @@ static void emit_obj_local_store(zan_irgen_t *g, local_var_t *v, LLVMValueRef va
                                  local_scope_t *locals) {
     LLVMTypeRef i1 = LLVMInt1TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    int owns = obj_slot_owns_value(vtype);
+    int owns = obj_slot_owns_value(vtype) ||
+               obj_slot_owns_owned_rhs(g, rhs, val, locals);
     if (owns || v->obj_rc_flag) obj_rc_flag_slot(g, v);
     emit_release_obj_local(g, v);
     if (owns) {

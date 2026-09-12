@@ -8996,9 +8996,21 @@ static LLVMValueRef emit_runtime_is_check(zan_irgen_t *g, LLVMValueRef x,
             "is.oob2");
     } else {
         /* descriptor mode: the header word is the record pointer (never a
-         * small integer); zero means "no descriptor" -> not a T */
-        oob = zan_icmp(g->builder, LLVMIntEQ, site, LLVMConstInt(i64, 0, 0),
-                       "is.nodsc");
+         * small integer); zero means "no descriptor" -> not a T. An array in
+         * the slot is not a descriptor either: its word holds the array magic
+         * or -- for a rectangular array -- the rank, a small integer, and
+         * dereferencing that as a pointer +8 faults. Reject both shapes here
+         * (the string tag was already diverted to str_bb above). */
+        oob = zan_or(g->builder,
+            zan_or(g->builder,
+                zan_icmp(g->builder, LLVMIntEQ, site, LLVMConstInt(i64, 0, 0),
+                         "is.nodsc"),
+                zan_icmp(g->builder, LLVMIntEQ, site,
+                         LLVMConstInt(i64, ZAN_ARRAY_MAGIC, 0), "is.arrdsc"),
+                "is.notdsc"),
+            zan_icmp(g->builder, LLVMIntULT, site, LLVMConstInt(i64, 4096, 0),
+                     "is.tinydsc"),
+            "is.oob2");
     }
     LLVMBuildCondBr(g->builder, oob, false_bb, loop);
 

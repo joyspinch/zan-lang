@@ -1465,7 +1465,28 @@ static LLVMValueRef refl_obj_type_fn(zan_irgen_t *g) {
             "refl.sok");
     } else {
         /* descriptor mode: the header word is the record pointer; load its
-         * meta field (offset 16). Zero record -> fallback. */
+         * meta field (offset 16). Zero record -> fallback. A managed string or
+         * array held in the slot is NOT a descriptor: its second header word is
+         * the string tag (with the cached byte length), the array magic, or --
+         * for a rectangular array -- the rank, and dereferencing any of those
+         * as a pointer +16 faults. `object o = "lit"; o.GetType()` crashed
+         * every default build this way. Reject the two tags and any word too
+         * small to be a pointer (a descriptor is a global, never a rank/index)
+         * before the load, and fall back to the static type's record -- which
+         * is exactly what the range-checked check-leaks build answers for the
+         * same value, so the two modes stay in step. */
+        LLVMValueRef is_tag = zan_or(g->builder,
+            zan_or(g->builder,
+                zan_hdr_is_string(g, site, "refl.isstr"),
+                LLVMBuildICmp(g->builder, LLVMIntEQ, site,
+                              LLVMConstInt(i64, ZAN_ARRAY_MAGIC, 0), "refl.isarr"),
+                "refl.istag"),
+            LLVMBuildICmp(g->builder, LLVMIntULT, site,
+                          LLVMConstInt(i64, 4096, 0), "refl.istiny"),
+            "refl.notdsc");
+        LLVMBasicBlockRef dsc = LLVMAppendBasicBlockInContext(g->ctx, fn, "dsc");
+        LLVMBuildCondBr(g->builder, is_tag, fb, dsc);
+        LLVMPositionBuilderAtEnd(g->builder, dsc);
         LLVMValueRef dp = LLVMBuildIntToPtr(g->builder, site, i8ptr, "refl.dsc");
         LLVMValueRef m_off = LLVMConstInt(i64, 16, 0);
         LLVMValueRef m_p = LLVMBuildGEP2(g->builder, i8, dp, &m_off, 1, "refl.mp");
