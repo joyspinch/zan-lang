@@ -105,6 +105,10 @@ class Fake {
     static int batches = 0;
     static int inFlight = 0;
     static int peak = 0;
+    /// Sessions this fake server accepted, so ShutdownClients can close them
+    /// and let every Serve frame retire (see the note on that helper).
+    static List<nint> clients;
+    static int serveLive = 0;
 
     [DllImport("crt")]
     static extern string calloc(int count, int size);
@@ -169,6 +173,7 @@ class Fake {
     }
 
     static async void Serve(nint client) {
+        Fake.serveLive = Fake.serveLive + 1;
         string hdr = Fake.calloc(9, 1);
         string pay = Fake.calloc(65537, 1);
         bool alive = true;
@@ -194,6 +199,7 @@ class Fake {
                 Fake.inFlight = Fake.inFlight - 1;
             }
         }
+        Fake.serveLive = Fake.serveLive - 1;
         Fake.free(hdr);
         Fake.free(pay);
         Socket.Close(client);
@@ -205,10 +211,28 @@ class Fake {
         for (int n = 0; n < count; n = n + 1) {
             nint client = await AsyncSocket.Accept(listener);
             Socket.SetNonBlocking(client);
+            if (Fake.clients == null) { Fake.clients = new List<nint>(); }
+            Fake.clients.Add(client);
             Task.Spawn(Fake.Serve(client));
         }
         Socket.Close(listener);
     }
+
+    /// Closes every session this fake server accepted. A Serve frame parked in
+    /// RecvOv when the client disconnects never observes the EOF (closing the
+    /// peer does not wake a pending overlapped recv here), so the frame stays
+    /// reachable at exit and its TdsBytes wrappers are reported as leaks. The
+    /// client-side closes at the end of Live() are not enough -- the server
+    /// must close its OWN end, exactly as the net-suite cases do for their
+    /// parked accepts.
+    static void ShutdownClients() {
+        if (Fake.clients == null) { return; }
+        for (int i = 0; i < Fake.clients.Count; i = i + 1) {
+            Socket.Close(Fake.clients[i]);
+        }
+    }
+
+    static int ClientsAlive() { return Fake.serveLive; }
 
     static nint Listen() {
         nint listener = Socket.CreateTcp();
@@ -529,6 +553,12 @@ class Program {
         Program.CheckEqInt("close drains the pool", pool.IdleCount(), 0);
         SqlServerConnection dead = await pool.AcquireAsync();
         Program.Check("acquire on a closed pool yields null", dead == null);
+        Fake.ShutdownClients();
+        int guard = 0;
+        while (Fake.ClientsAlive() > 0 && guard < 200) {
+            await Task.Delay(5);
+            guard = guard + 1;
+        }
     }
 
     static void Main() {

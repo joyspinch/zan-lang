@@ -857,6 +857,26 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
 - 判「accept 靠什么唤醒」别信用例注释，读循环实现：注释说「停止会复位 accept 循环」
   的用例照红——写注释的人把 TcpListener 的语义记串了。
 
+## 停摆的不只 accept：对端 close 唤不醒挂起的 recv，服务端帧同样钉住局部（2026-09-12 sqlserver_tds 收口）
+
+- **坑**：测试里的 fake server 协程停在 `RecvOv` 上时，**客户端关掉自己那端不会
+  唤醒它**——overlapped recv 不因对端 close 而完成（探针实证：accept 后挂起的 recv，
+  对端 `Socket.Close` 后永不返回，服务端那帧永久可达）。帧本地若持有 `TdsBytes`
+  之类的包装对象，就整批进 leakcheck 报告。sqlserver_tds 的「4 对象、站点
+  `TdsCodec.zan:146:16`（`new TdsBytes`）」正是它：泄漏物是 **fake server 自己**
+  的两个包装对象 × 2 个未退 Serve 帧，与编解码器无关——**站点名又一次张冠李戴**。
+- **定位阶梯（最小探针全干净时必须回真实用例二分）**：去掉 Live() → 0；worker 数
+  1/2/4 → 2/4/4（锁定在池段）；在 Serve 里 Release 后补 `body=null; pkt=null` →
+  **clean**（坐实是「帧持有包装对象」而非内部缓冲）；插桩 serveLive/serveDone →
+  退出时 `live=2 done=1`（两帧未退）。**判据**：泄漏数 = 未退帧数 × 帧内包装对象数，
+  先数帧再数局部。
+- **修法定式**：fake server 记下每个 accept 的 client fd，用例收尾关掉**服务端自己
+  那端**（关对端没用），再自旋等 `serveLive==0`。`List<nint>` 这类静态字段的
+  `xs.At(i)`/`xs.Count` **不能从别的静态方法直接调**（报「'xs' is not a known
+  variable」），必须包一层 `ShutdownClients()/ClientsAlive()` 辅助方法。
+- 与上一条 accept 同族：**测试里的停摆帧是 leakcheck 红的常见来源**（accept 停摆、
+  recv 停摆），收尾必须让每个自建协程帧能退——「关自己那端的 fd」是通用把手。
+
 ## 集合查找内建吞掉 owned 实参临时：Contains/IndexOf/Dict 三兄弟（2026-09-12 同日根修）
 
 - **坑**：`List.Contains/IndexOf(item)`、`Dict.Remove/ContainsKey/TryGetValue(key)`、
