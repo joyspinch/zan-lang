@@ -10934,6 +10934,60 @@ static LLVMValueRef emit_arg_typed(zan_irgen_t *g, zan_ast_node_t *arg,
 
 /* `ref x` / `out x` / `out T x` argument: pass the address of the local's
  * storage slot. An inline `out T x` declares a fresh zero-initialised local
+ * in the caller's scope first.
+ *
+ * The target may also be a *place* rather than a bare name -- `out b.field`,
+ * `out arr[i]`, `out lst[i]`. Those used to fall through to `emit_expr`, which
+ * yields the stored VALUE; the callee then wrote through that value as if it
+ * were an address and the program faulted on the first store (an `int` field
+ * holding 7 became the pointer 0x7). Resolve a real address instead. */
+static LLVMValueRef emit_ref_lvalue_ptr(zan_irgen_t *g, zan_ast_node_t *tgt,
+                                        local_scope_t *locals) {
+    if (!tgt) return NULL;
+
+    if (tgt->kind == AST_MEMBER_ACCESS && !tgt->member.null_cond) {
+        zan_ast_node_t *obj_expr = tgt->member.object;
+        /* ClassName.StaticField: the backing global IS the slot. */
+        if (obj_expr->kind == AST_IDENTIFIER &&
+            !local_find(locals, obj_expr->ident.name)) {
+            zan_symbol_t *cs = zan_binder_lookup(g->binder, obj_expr->ident.name);
+            if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT)) {
+                zan_symbol_t *fs = get_field_sym(cs, tgt->member.name);
+                LLVMValueRef gv = fs ? get_static_field_global(g, cs, fs,
+                    static_access_inst(g, obj_expr)) : NULL;
+                if (gv) return gv;
+            }
+        }
+        /* obj.Field: the field slot inside the object's storage. */
+        zan_symbol_t *cls = expr_class_sym(g, obj_expr, locals);
+        if (cls) {
+            int fi = get_field_index(cls, tgt->member.name);
+            LLVMTypeRef st = get_struct_llvm_type(g, cls);
+            if (fi >= 0 && st) {
+                LLVMValueRef obj_val = emit_expr(g, obj_expr, locals);
+                if (obj_val &&
+                    LLVMGetTypeKind(LLVMTypeOf(obj_val)) == LLVMPointerTypeKind) {
+                    if (LLVMTypeOf(obj_val) != LLVMPointerType(st, 0))
+                        obj_val = LLVMBuildBitCast(g->builder, obj_val,
+                            LLVMPointerType(st, 0), "ref.obj");
+                    return emit_field_ptr(g, cls, st, obj_val, fi, "ref.fld");
+                }
+            }
+        }
+        return NULL;
+    }
+
+    /* List/array/span element: emit_struct_elem_ptr yields the element's
+     * address in the backing buffer, which is exactly the slot a `ref`/`out`
+     * element writes through. */
+    if (tgt->kind == AST_INDEX)
+        return emit_struct_elem_ptr(g, tgt, locals);
+
+    return NULL;
+}
+
+/* `ref x` / `out x` / `out T x` argument: pass the address of the local's
+ * storage slot. An inline `out T x` declares a fresh zero-initialised local
  * in the caller's scope first. */
 static LLVMValueRef emit_ref_arg(zan_irgen_t *g, zan_ast_node_t *arg,
                                  local_scope_t *locals) {
@@ -10949,6 +11003,36 @@ static LLVMValueRef emit_ref_arg(zan_irgen_t *g, zan_ast_node_t *arg,
     if (tgt && tgt->kind == AST_IDENTIFIER) {
         local_var_t *l = local_find(locals, tgt->ident.name);
         if (l) return l->alloca;
+        /* bare name of an instance field of the enclosing class: `out field`
+         * means `out this.field`. */
+        if (g->current_type_sym) {
+            zan_symbol_t *fs = get_field_sym(g->current_type_sym,
+                                             tgt->ident.name);
+            LLVMValueRef gv = fs ? get_static_field_global(g,
+                g->current_type_sym, fs, NULL) : NULL;
+            if (gv) return gv;
+            int fi = get_field_index(g->current_type_sym, tgt->ident.name);
+            LLVMTypeRef st = get_struct_llvm_type(g, g->current_type_sym);
+            if (fi >= 0 && st && g->current_this) {
+                LLVMValueRef this_ptr = LLVMBuildLoad2(g->builder,
+                    LLVMPointerType(st, 0), g->current_this, "this");
+                return emit_field_ptr(g, g->current_type_sym, st, this_ptr,
+                                      fi, "ref.this");
+            }
+        }
     }
+    /* A place (`obj.field`, `arr[i]`): resolve its address. Falling through to
+     * emit_expr yields the stored VALUE, which the callee then writes through
+     * as if it were an address -- an int field holding 7 became the pointer
+     * 0x7 and the first store faulted. */
+    LLVMValueRef place = emit_ref_lvalue_ptr(g, tgt, locals);
+    if (place) {
+        if (LLVMGetTypeKind(LLVMTypeOf(place)) != LLVMPointerTypeKind)
+            return LLVMBuildIntToPtr(g->builder, place,
+                LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0), "ref.ip");
+        return place;
+    }
+    zan_diag_emit(g->diag, DIAG_ERROR, arg->loc,
+        "ref/out argument must be a variable, a field, or an element");
     return emit_expr(g, tgt, locals);
 }

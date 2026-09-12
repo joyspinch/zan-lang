@@ -1,0 +1,346 @@
+using System;
+
+namespace Gui.Component.Chart;
+
+/// 极坐标柱的一列（ECharts `layout/barPolar.ts` calcRadialBar 的结果
+/// 条目：同一 stackId 共享一条列）。`offset`/`width` 都是 double ——
+/// 极坐标带宽是 pxSpan/count（600px 图 7 类目 = 51.43），整数会
+/// 系统性偏窄。
+class ChartPolarBarCol {
+    double offset;
+    double width;
+
+    static ChartPolarBarCol Of(double o, double w) {
+        return new ChartPolarBarCol { offset = o, width = w };
+    }
+}
+
+/// 极坐标柱的一个逐项布局（ECharts `layoutPerAxisPerSeries` 写进
+/// `data.setItemLayout` 的 SectorLayout）。
+///
+/// 角度存**度**、且是"数学角"（0=3 点钟、逆时针为正）×10。
+/// 数值上等于源里的 ECharts coord 角：源存 `-startAngle * PI/180`
+/// 是 zrender 的画布角（0=3 点钟、顺时针为正，y 向下），而画布角
+/// = −数学角，两次取负抵消。
+/// 例：bar-polar-stack 的 series A 首柱源 layout 角 −1.571rad
+/// （= 画布 −90°，12 点钟），本字段即 +900（数学 90°），
+/// `PolarScreenX/Y` 直接可用，`FillSector` 侧换算 `90 − 数学角`。
+class ChartPolarBarLayout {
+    int r0;
+    int r;
+    int startAngleX10;
+    int endAngleX10;
+    bool clockwise;
+
+    static ChartPolarBarLayout Of(int r0, int r, int a0X10, int a1X10,
+                                  bool cw) {
+        ChartPolarBarLayout L = new ChartPolarBarLayout();
+        L.r0 = r0; L.r = r; L.startAngleX10 = a0X10; L.endAngleX10 = a1X10;
+        L.clockwise = cw;
+        return L;
+    }
+}
+
+/// 极坐标柱渲染所需的一套轴投影（单个 polar 坐标系）。
+/// `aLo/aHi`、`rLo/rHi` 是值轴的**数据域**（原值单位，非定点）；
+/// `r0Px/r1Px` 是半径轴的像素范围。
+class ChartPolarBarFrame {
+    int cx;
+    int cy;
+    int r0Px;
+    int r1Px;
+    bool aCat;
+    bool rCat;
+    double aLo;
+    double aHi;
+    double rLo;
+    double rHi;
+    List<string> aCats;
+    List<string> rCats;
+    int startAngle;      // 角度轴起始角（"顺时针为正"的屏幕角）
+    int endAngle;
+    bool endAngleSet;
+    bool clockwise;
+    bool aOnBand;
+    bool rOnBand;
+}
+
+/// 极坐标柱布局：ECharts 6.1 `layout/barPolar.ts` 的逐行移植
+/// （`calcRadialBar` + `layoutPerAxisPerSeries`）。
+///
+/// 极坐标柱有两条形态，由**基轴**决定（`Polar.getBaseAxis()`：第一个
+/// ordinal 轴，否则第一个 time 轴，否则角度轴）：
+///   * 基轴是角度类目轴 → **切向柱**（value 轴是半径）：柱沿半径
+///     分层、角度方向生长（bar-polar-stack / polar-roundCap /
+///     bar-polar-real-estate）；
+///   * 基轴是半径类目轴 → **径向柱**（value 轴是角度）：柱沿角度
+///     铺开、半径方向生长（bar-polar-stack-radial）。
+/// 两形态共用同一 Sector 的 r0/r 与 startAngle/endAngle，渲染端按
+/// `valueIsRadius` 取用。
+///
+/// 三条容易写错的语义，全部照抄源：
+///   * 极坐标的 `categoryGap` 缺省是**固定 '20%'**、`barGap` 是
+///     **'30%'**（barPolar.ts:200-201 的硬编码局部变量），与直角
+///     坐标 `barGrid.ts` 的 `max(35-4n,15)%` / `'10%'` 完全不同；
+///   * `barGap`/`barCategoryGap` 取**最后一条**声明它们的系列
+///     （`barGapOption != null && (gapOption = barGapOption)`），
+///     且极坐标**没有** `defaultBarGap` 那条"只看第一条"的历史特例；
+///   * `barMaxWidth` 溢出回收会把该列从 `autoWidthCount` 里摘掉并
+///     **重算** autoWidth（源里 `autoWidthCount--` 后二次解算），
+///     少这一步则显式 maxWidth 的柱会挤掉同轴其它自动柱。
+partial class ChartView {
+    /// 极坐标类目带带宽（px）—— `calcBandWidth(axis, {min:1})` 的
+    /// 类目分支（`axisBand.ts:calcBandWidthForCategoryAxis`）：
+    /// `w = pxSpan / (scaleLinearSpan + (onBand ? 1 : 0))`。
+    ///
+    /// 关键：ordinal scale 的 `scaleLinearSpan` 是**刻度跨度 count-1**
+    /// （不是 count）。所以 onBand（boundaryGap）时带宽 = pxSpan/count
+    /// （bar-polar-stack 的 4 类目 160px 半径轴 → 40），offBand 时 =
+    /// pxSpan/(count-1)（punchCard 的 24 类目 → 15°）。
+    /// 拿直角坐标的 `BarBandWidth`（pxSpan/count）套 offBand 会偏窄。
+    static double PolarBandWidth(double pxSpan, int count, bool onBand) {
+        int c = count;
+        if (c < 1) { c = 1; }
+        double len = (double)(c - 1) + (onBand ? 1.0 : 0.0);
+        if (len <= 0.0) { len = 1.0; }   // 源：len === 0 && (len = 1)
+        double w = pxSpan / len;
+        if (w < 1.0) { return 1.0; }     // calcBandWidth 的 {min:1}
+        return w;
+    }
+
+    /// ECharts `layout/barPolar.ts:calcRadialBar()`。
+    ///
+    /// 输入：类目基轴的带宽 `bandW`；本条轴上的柱系列 `bars`（声明
+    /// 序）；与 `bars` 同序的 `stackIds`（`getSeriesStackId`：stack
+    /// 名，未设则 `__ec_stack_<index>` 每条系列独占一列）。
+    /// 输出：与 `bars` 同序的列布局，同 stackId 的系列共享同一列对象。
+    static List<ChartPolarBarCol> CalcPolarBarCols(
+        double bandW, List<ChartSeries> bars, List<string> stackIds) {
+        List<ChartPolarBarCol> cols = new List<ChartPolarBarCol>();
+        int nb = bars.Count;
+        if (nb < 1) { return cols; }
+
+        // ---- pass 1：stack 归并 + 逐系列选项（barPolar.ts:215-250） ----
+        List<string> stackList = new List<string>();
+        List<double> stackW = new List<double>();    // 0 = 未显式声明（源的 falsy）
+        List<double> stackMax = new List<double>();
+        int autoCount = 0;
+        double remained = bandW;
+        string gapRaw = "30%";     // 源 gapOption 初值（可被系列覆写）
+        string catGapRaw = "20%";  // 源 categoryGapOption 初值
+        for (int i = 0; i < nb; i = i + 1) {
+            ChartSeries s = bars[i];
+            string sid = stackIds[i];
+            int gi = ChartView.GroupIndex(stackList, sid);
+            if (gi < 0) {
+                stackList.Add(sid);
+                stackW.Add(0.0);
+                stackMax.Add(0.0);
+                autoCount = autoCount + 1;
+                gi = stackList.Count - 1;
+            }
+            double bwV = 0.0;
+            if (ChartView.PercentOf(s.barWidthRaw, bandW, out bwV) && bwV != 0.0) {
+                if (stackW[gi] == 0.0) {
+                    // 源：`barWidth = mathMin(remainedWidth, barWidth)`
+                    // 赋值前就钳到剩余宽度（极坐标源只有这一处钳制，
+                    // 没有 barGrid 的 min/maxWidth 复核）。
+                    double wv = bwV < remained ? bwV : remained;
+                    stackW[gi] = wv;
+                    remained = remained - wv;
+                }
+            }
+            double mxV = 0.0;
+            if (ChartView.PercentOf(s.barMaxWidthRaw, bandW, out mxV) && mxV != 0.0) {
+                stackMax[gi] = mxV;
+            }
+            // 取**最后一条**声明者（源的 `!= null` 判定，无 defaultBarGap 特例）。
+            if (s.barGapRaw.Length > 0) { gapRaw = s.barGapRaw; }
+            if (s.barCategoryGapRaw.Length > 0) { catGapRaw = s.barCategoryGapRaw; }
+        }
+        double catGapNum = 0.0;
+        ChartView.PercentOf(catGapRaw, bandW, out catGapNum);
+        double gapPct = 0.0;
+        ChartView.PercentOf(gapRaw, 1.0, out gapPct);
+        double autoW = ChartView.AutoBarWidth(remained, catGapNum, autoCount, gapPct);
+
+        // ---- maxWidth 溢出回收 + 二次解算（barPolar.ts:262-278） ----
+        int nStack = stackList.Count;
+        for (int i = 0; i < nStack; i = i + 1) {
+            double maxWidth = stackMax[i];
+            if (maxWidth > 0.0 && maxWidth < autoW) {
+                maxWidth = maxWidth < remained ? maxWidth : remained;
+                if (stackW[i] > 0.0 && maxWidth > stackW[i]) {
+                    maxWidth = stackW[i];
+                }
+                remained = remained - maxWidth;
+                stackW[i] = maxWidth;
+                autoCount = autoCount - 1;
+            }
+        }
+        autoW = ChartView.AutoBarWidth(remained, catGapNum, autoCount, gapPct);
+
+        // ---- 偏移：整组在带内居中（barPolar.ts:281-300） ----
+        // widthSum 扣掉最后一列的 barGap（组间才有缝，组尾没有）。
+        double widthSum = 0.0;
+        for (int i = 0; i < nStack; i = i + 1) {
+            if (stackW[i] == 0.0) { stackW[i] = autoW; }
+            widthSum = widthSum + stackW[i] * (1.0 + gapPct);
+        }
+        widthSum = widthSum - stackW[nStack - 1] * gapPct;
+        List<ChartPolarBarCol> byStack = new List<ChartPolarBarCol>();
+        double off = 0.0 - widthSum / 2.0;
+        for (int i = 0; i < nStack; i = i + 1) {
+            byStack.Add(ChartPolarBarCol.Of(off, stackW[i]));
+            off = off + stackW[i] * (1.0 + gapPct);
+        }
+        for (int i = 0; i < nb; i = i + 1) {
+            int gi = ChartView.GroupIndex(stackList, stackIds[i]);
+            cols.Add(byStack[gi]);
+        }
+        return cols;
+    }
+
+    /// 柱系列在某条基轴上的 stack id（ECharts `getSeriesStackId`）。
+    static string PolarStackIdOf(ChartSeries s, int si) {
+        if (s.stackName.Length > 0) { return s.stackName; }
+        return "__ec_stack_" + Convert.ToString(si);
+    }
+
+    /// 基轴是哪一条：`Polar.getBaseAxis()` = 第一个 ordinal 轴，否则
+    /// 第一个 time 轴，否则角度轴。本引擎的极轴只有 Category/Value
+    /// 两态，故 = 第一条类目轴，否则角度轴。
+    /// 返回 true 表示基轴是**角度轴**（切向柱，value 轴是半径）。
+    static bool PolarBaseIsAngle(bool angleIsCategory, bool radiusIsCategory) {
+        if (angleIsCategory) { return true; }
+        if (radiusIsCategory) { return false; }
+        return true;   // 两轴皆值轴 → 兜底角度轴（源 getAngleAxis）
+    }
+
+    /// ECharts `layout/barPolar.ts:layoutPerAxisPerSeries()`。
+    ///
+    /// `valueIsRadius` = 值轴是半径轴（**径向柱**：柱沿角度铺开、
+    /// 半径方向生长）；false = 值轴是角度轴（**切向柱**：柱沿半径
+    /// 分层、角度方向生长）。
+    ///
+    /// `baseCoords[si][i]` / `valCoords[si][i]` 分别是基轴/值轴的像素
+    /// 坐标（径向柱的基轴角度用度、值轴半径用 px；切向柱反之）。
+    /// `valStart` 是值轴原点坐标（`dataToCoord(startValue)`）——
+    /// 极坐标柱都从轴原点起算，不从 0 像素起算。
+    ///
+    /// 堆叠累加器按**数据下标**索引（源的键是 baseValue；本引擎极坐标
+    /// 柱的基轴恒为类目轴，baseValue 即下标，两者等价）。
+    static List<List<ChartPolarBarLayout>> PolarBarLayout(
+        List<ChartSeries> bars, List<ChartPolarBarCol> cols,
+        List<string> stackIds,
+        bool valueIsRadius, bool stacked,
+        List<List<double>> baseCoords, List<List<double>> valCoords,
+        double valStart, List<bool> clampFlags,
+        double valCoordLo, double valCoordHi) {
+        List<List<ChartPolarBarLayout>> outAll =
+            new List<List<ChartPolarBarLayout>>();
+        int nb = bars.Count;
+        if (nb < 1) { return outAll; }
+
+        List<string> seenIds = new List<string>();
+        List<List<double>> stackPos = new List<List<double>>();
+        List<List<double>> stackNeg = new List<List<double>>();
+
+        for (int si = 0; si < nb; si = si + 1) {
+            ChartSeries s = bars[si];
+            string sid = stackIds[si];
+            ChartPolarBarCol col = cols[si];
+            int sIdx = ChartView.GroupIndex(seenIds, sid);
+            if (sIdx < 0) {
+                seenIds.Add(sid);
+                stackPos.Add(new List<double>());
+                stackNeg.Add(new List<double>());
+                sIdx = seenIds.Count - 1;
+            }
+            List<double> pos = stackPos[sIdx];
+            List<double> neg = stackNeg[sIdx];
+            bool clamp = si < clampFlags.Count && clampFlags[si];
+
+            List<ChartPolarBarLayout> seriesOut = new List<ChartPolarBarLayout>();
+            int n = 0;
+            if (si < baseCoords.Count) { n = baseCoords[si].Count; }
+            if (si < valCoords.Count && valCoords[si].Count > n) {
+                n = valCoords[si].Count;
+            }
+            for (int i = 0; i < n; i = i + 1) {
+                double vc = si < valCoords.Count && i < valCoords[si].Count
+                    ? valCoords[si][i] : valStart;
+                double bc = si < baseCoords.Count && i < baseCoords[si].Count
+                    ? baseCoords[si][i] : 0.0;
+                // clampLayout：源 `dataToCoord(value, clampLayout)` 把越界
+                // 值钳回轴量程（roundCap 的切向柱不钳，端点圆头要伸出去）。
+                if (clamp) {
+                    if (vc < valCoordLo) { vc = valCoordLo; }
+                    if (vc > valCoordHi) { vc = valCoordHi; }
+                }
+                // 正负号取自**原始数据值**（源 `const sign = value >= 0 ?
+                // 'p' : 'n'`），不是坐标方向——角度轴顺时针时正值使坐标
+                // 减小，按坐标判号会把每条正柱都塞进负累加器。
+                double rawV = si < bars.Count && i < bars[si].Count()
+                    ? bars[si].Number(i) : 0.0;
+                bool negSign = rawV < 0.0;
+                int minH = si < bars.Count ? bars[si].barMinHeight : 0;
+                int minA = si < bars.Count ? bars[si].barMinAngle : 0;
+                double baseCoord = valStart;
+                while (pos.Count <= i) { pos.Add(valStart); }
+                while (neg.Count <= i) { neg.Add(valStart); }
+                if (stacked) { baseCoord = negSign ? neg[i] : pos[i]; }
+
+                int r0;
+                int r;
+                int startX10;   // 源度值 ×10（顺时针为正的屏幕角）
+                int endX10;
+                if (valueIsRadius) {
+                    // ---- 径向扇区（barPolar.ts:139-155）----
+                    double radiusSpan = vc - valStart;
+                    if (ChartView.DAbs(radiusSpan) < (double)minH) {
+                        radiusSpan = (radiusSpan < 0.0 ? -1.0 : 1.0)
+                            * (double)minH;
+                    }
+                    r0 = ChartView.RoundPx(baseCoord);
+                    r = ChartView.RoundPx(baseCoord + radiusSpan);
+                    startX10 = ChartView.RoundPx((bc - col.offset) * 10.0);
+                    endX10 = ChartView.RoundPx(
+                        (bc - col.offset - col.width) * 10.0);
+                    if (stacked) {
+                        if (negSign) { neg[i] = baseCoord + radiusSpan; }
+                        else { pos[i] = baseCoord + radiusSpan; }
+                    }
+                } else {
+                    // ---- 切向扇区（barPolar.ts:157-185）----
+                    double angleSpan = vc - valStart;
+                    if (ChartView.DAbs(angleSpan) < (double)minA) {
+                        angleSpan = (angleSpan < 0.0 ? -1.0 : 1.0)
+                            * (double)minA;
+                    }
+                    r0 = ChartView.RoundPx(bc + col.offset);
+                    r = ChartView.RoundPx(bc + col.offset + col.width);
+                    startX10 = ChartView.RoundPx(baseCoord * 10.0);
+                    endX10 = ChartView.RoundPx((baseCoord + angleSpan) * 10.0);
+                    if (stacked) {
+                        if (negSign) { neg[i] = baseCoord + angleSpan; }
+                        else { pos[i] = baseCoord + angleSpan; }
+                    }
+                }
+                // 字段存 ECharts coord 角（= 数学角，见 ChartPolarBarLayout
+                // 的注释）；clockwise 用源里**未取负**的度值判定
+                // （`clockwise: startAngle >= endAngle`）。
+                seriesOut.Add(ChartPolarBarLayout.Of(r0, r,
+                    startX10, endX10, startX10 >= endX10));
+            }
+            outAll.Add(seriesOut);
+        }
+        return outAll;
+    }
+
+    /// double 绝对值（Chart 组件内多处要用，统一一处避免各写各的）。
+    static double DAbs(double v) {
+        if (v < 0.0) { return 0.0 - v; }
+        return v;
+    }
+}

@@ -1,0 +1,147 @@
+// A6/A7: 极坐标柱（ECharts `layout/barPolar.ts`）。
+//
+// 此前 `DrawPolarCoord`/`DrawPolarMulti` 的系列循环对
+// `ChartType.Bar` 直接 `continue`——bar-polar 族 8 个 demo 一根柱
+// 都不画。本用例断言移植后的纯几何 `PolarBarSolve`（渲染端与用例
+// 共用同一入口），逐项对齐 ECharts 6.1 SSR oracle：
+// ①径向柱（基轴=角度类目）：bar-polar-stack 4 槽半径类目轴、
+//   角度值轴域 0..16（堆叠和 4/8/12/16 → nice 0..16）；
+//   r0/r = 4/36,44/76,84/116,124/156，s0i0 角度 90→67.5；
+// ②切向柱（基轴=半径类目）：bar-polar-stack-radial 7 槽角度类目轴，
+//   半径域 0..12，s2i2 r0/r = 120/160 满环；
+// ③polar-roundCap：半径类目 5 槽 + 角度 max 2 startAngle 30，
+//   圆头柱（clampLayout=false）角度**不钳**（源 720° 满扫）；
+// ④bar-polar-label-tangential：polar.radius [30,'80%'] 的**内径**
+//   进 r0Px（对象形态此前把 At(0) 当外径，内径 30 被吃掉）；
+// ⑤polar-endAngle：显式 endAngle（90→0 与 -90→-180）必须被采纳，
+//   0 是合法值不是"未声明"哨兵；
+// ⑥角度方向：ECharts 角度轴**顺时针为正**，值增大屏幕角减小
+//   （s0i0 90→67.5 而非 90→112.5）。
+// JSON 内联（不读 examples/）：conformance 在 build 目录里跑，
+// 仓库相对路径取不到。
+using System;
+using Gui.Component.Chart;
+
+namespace Conf;
+
+class Program {
+    /// ×10 定点角度 → 度（打印用）。
+    static double D(int x10) { return (double)x10 / 10.0; }
+
+    /// 按内联 option JSON 建帧并解算，逐项打印（与 oracle 行可直接 diff）。
+    /// `aCatN`/`rCatN` 是两轴的类目槽数（0 = 值轴）。
+    static void Dump(string name, string json, int r0Px, int r1Px,
+                     int aCatN, int rCatN, bool aOnBand, bool rOnBand,
+                     int startA, int endA, bool endSet, int pi) {
+        ChartOption o = ChartOption.FromJson(json);
+
+        ChartPolarBarFrame f = new ChartPolarBarFrame();
+        f.cx = 300; f.cy = 200;
+        f.r0Px = r0Px; f.r1Px = r1Px;
+        f.aCat = aCatN > 0; f.rCat = rCatN > 0;
+        ChartView.PolarBarsValueExtentAt(o, true, pi, out f.aLo, out f.aHi);
+        ChartView.PolarBarsValueExtentAt(o, false, pi, out f.rLo, out f.rHi);
+        f.aCats = new List<string>();
+        f.rCats = new List<string>();
+        for (int i = 0; i < aCatN; i = i + 1) { f.aCats.Add(Convert.ToString(i)); }
+        for (int i = 0; i < rCatN; i = i + 1) { f.rCats.Add(Convert.ToString(i)); }
+        f.startAngle = startA; f.endAngle = endA; f.endAngleSet = endSet;
+        f.clockwise = true;
+        f.aOnBand = aOnBand; f.rOnBand = rOnBand;
+
+        List<ChartSeries> bars = new List<ChartSeries>();
+        List<int> siOf = new List<int>();
+        for (int si = 0; si < o.series.Count; si = si + 1) {
+            ChartSeries s = o.series[si];
+            if (s.hidden || s.coordSys != "polar"
+                || s.type != ChartType.Bar) { continue; }
+            if (pi >= 0 && s.polarIndex != pi) { continue; }
+            bars.Add(s);
+            siOf.Add(si);
+        }
+        bool vir = false;
+        List<List<ChartPolarBarLayout>> lays =
+            ChartView.PolarBarSolve(bars, siOf, f, out vir);
+        Console.WriteLine(name + "|" + Convert.ToString(pi)
+            + "|" + Convert.ToString(vir ? 1 : 0)
+            + "|" + Convert.ToString(f.aLo) + ".." + Convert.ToString(f.aHi)
+            + "|" + Convert.ToString(f.rLo) + ".." + Convert.ToString(f.rHi));
+        for (int si = 0; si < lays.Count; si = si + 1) {
+            for (int i = 0; i < lays[si].Count; i = i + 1) {
+                ChartPolarBarLayout L = lays[si][i];
+                Console.WriteLine("  " + Convert.ToString(si) + "," + Convert.ToString(i)
+                    + " r=" + Convert.ToString(L.r0) + "/" + Convert.ToString(L.r)
+                    + " a=" + Convert.ToString(D(L.startAngleX10)) + "->"
+                    + Convert.ToString(D(L.endAngleX10))
+                    + " cw=" + Convert.ToString(L.clockwise ? 1 : 0));
+            }
+        }
+    }
+
+    static void Main() {
+        // ①径向柱：bar-polar-stack（半径类目 4 槽，角度值轴堆叠和 0..16）
+        Program.Dump("bar-polar-stack",
+            "{\"angleAxis\":{},\"radiusAxis\":{\"type\":\"category\",\"data\":[\"Mon\",\"Tue\",\"Wed\",\"Thu\"]},\"polar\":{},\"series\":[{\"type\":\"bar\",\"data\":[1,2,3,4],\"coordinateSystem\":\"polar\",\"name\":\"A\",\"stack\":\"a\"},{\"type\":\"bar\",\"data\":[2,4,6,8],\"coordinateSystem\":\"polar\",\"name\":\"B\",\"stack\":\"a\"},{\"type\":\"bar\",\"data\":[1,2,3,4],\"coordinateSystem\":\"polar\",\"name\":\"C\",\"stack\":\"a\"}]}",
+            0, 160, 0, 4, false, true, 90, 0, false, 0);
+
+        // ②切向柱：bar-polar-stack-radial（角度类目 7 槽）
+        Program.Dump("bar-polar-stack-radial",
+            "{\"angleAxis\":{\"type\":\"category\",\"data\":[\"Mon\",\"Tue\",\"Wed\",\"Thu\",\"Fri\",\"Sat\",\"Sun\"]},\"radiusAxis\":{},\"polar\":{},\"series\":[{\"type\":\"bar\",\"data\":[1,2,3,4,3,5,1],\"coordinateSystem\":\"polar\",\"name\":\"A\",\"stack\":\"a\"},{\"type\":\"bar\",\"data\":[2,4,6,1,3,2,1],\"coordinateSystem\":\"polar\",\"name\":\"B\",\"stack\":\"a\"},{\"type\":\"bar\",\"data\":[1,2,3,4,1,2,5],\"coordinateSystem\":\"polar\",\"name\":\"C\",\"stack\":\"a\"}]}",
+            0, 160, 7, 0, true, false, 90, 0, false, 0);
+
+        // ③圆头柱：polar-roundCap（半径类目 5 槽，角度 max 2 startAngle 30）
+        Program.Dump("polar-roundCap",
+            "{\"angleAxis\":{\"max\":2,\"startAngle\":30},\"radiusAxis\":{\"type\":\"category\",\"data\":[\"v\",\"w\",\"x\",\"y\",\"z\"]},\"polar\":{},\"series\":[{\"type\":\"bar\",\"data\":[4,3,2,1,0],\"coordinateSystem\":\"polar\"},{\"type\":\"bar\",\"data\":[4,3,2,1,0],\"coordinateSystem\":\"polar\",\"roundCap\":true}]}",
+            0, 160, 0, 5, false, true, 30, 0, false, 0);
+
+        // ④内径：bar-polar-label-tangential（polar.radius [30,'80%']）
+        Program.Dump("bar-polar-label-tangential",
+            "{\"polar\":{\"radius\":[30,\"80%\"]},\"angleAxis\":{\"max\":4,\"startAngle\":75},\"radiusAxis\":{\"type\":\"category\",\"data\":[\"a\",\"b\",\"c\",\"d\"]},\"series\":{\"type\":\"bar\",\"data\":[2,1.2,2.4,3.6],\"coordinateSystem\":\"polar\"}}",
+            30, 160, 0, 4, false, true, 75, 0, false, 0);
+        Program.Dump("bar-polar-label-radial",
+            "{\"polar\":{\"radius\":[30,\"80%\"]},\"radiusAxis\":{\"max\":4},\"angleAxis\":{\"type\":\"category\",\"data\":[\"a\",\"b\",\"c\",\"d\"],\"startAngle\":75},\"series\":{\"type\":\"bar\",\"data\":[2,1.2,2.4,3.6],\"coordinateSystem\":\"polar\"}}",
+            30, 160, 4, 0, true, false, 75, 0, false, 0);
+
+        // ⑤显式 endAngle：polar-endAngle 两个 polar（0 是合法值）
+        string pe = "{\"angleAxis\":[{\"type\":\"category\",\"polarIndex\":0,\"startAngle\":90,\"endAngle\":0,\"data\":[\"S1\",\"S2\",\"S3\"]},{\"type\":\"category\",\"polarIndex\":1,\"startAngle\":-90,\"endAngle\":-180,\"data\":[\"T1\",\"T2\",\"T3\"]}],\"radiusAxis\":[{\"polarIndex\":0},{\"polarIndex\":1}],\"polar\":[{},{}],\"series\":[{\"type\":\"bar\",\"polarIndex\":0,\"data\":[1,2,3],\"coordinateSystem\":\"polar\"},{\"type\":\"bar\",\"polarIndex\":1,\"data\":[1,2,3],\"coordinateSystem\":\"polar\"}]}";
+        Program.Dump("polar-endAngle", pe, 0, 160, 3, 0, true, false, 90, 0, true, 0);
+        Program.Dump("polar-endAngle", pe, 0, 160, 3, 0, true, false, -90, -180, true, 1);
+
+        // ⑥单条 stack 不堆叠：单系列 stack 不累加，两柱都从轴原点起。
+        ChartSeries solo = ChartSeries.Bar("solo", new List<int>{3, 5});
+        solo.stackName = "a";
+        ChartOption so = ChartOption.Of("Solo", new List<string>{"a", "b"},
+            new List<ChartSeries>{solo});
+        ChartPolarBarFrame sf = new ChartPolarBarFrame();
+        sf.cx = 300; sf.cy = 200; sf.r0Px = 0; sf.r1Px = 160;
+        sf.aCat = false; sf.rCat = true;
+        sf.aLo = 0.0; sf.aHi = 10.0; sf.rLo = 0.0; sf.rHi = 10.0;
+        sf.aCats = new List<string>(); sf.rCats = new List<string>();
+        sf.rCats.Add("x"); sf.rCats.Add("y");
+        sf.startAngle = 90; sf.endAngle = 0; sf.endAngleSet = false;
+        sf.clockwise = true; sf.aOnBand = false; sf.rOnBand = true;
+        List<ChartSeries> sb = new List<ChartSeries>{solo};
+        List<int> ssi = new List<int>{0};
+        bool svir = false;
+        List<List<ChartPolarBarLayout>> slay =
+            ChartView.PolarBarSolve(sb, ssi, sf, out svir);
+        Console.WriteLine("solo|" + Convert.ToString(slay.Count));
+        for (int i = 0; i < slay[0].Count; i = i + 1) {
+            ChartPolarBarLayout L = slay[0][i];
+            Console.WriteLine("  solo," + Convert.ToString(i) + " r="
+                + Convert.ToString(L.r0) + "/" + Convert.ToString(L.r));
+        }
+
+        // ⑦带宽：类目轴 onBand = pxSpan/count，offBand = pxSpan/(count-1)；
+        // 低于 1px 时钳到 1（calcBandWidth 的 {min:1}）。
+        Console.WriteLine("bw=" + Convert.ToString(ChartView.PolarBandWidth(160.0, 4, true))
+            + ":" + Convert.ToString(ChartView.PolarBandWidth(150.0, 4, false))
+            + ":" + Convert.ToString(ChartView.PolarBandWidth(1.0, 4, false)));
+
+        // ⑧offBand 角度类目轴的跨度收缩：24 槽 → 缩掉一个槽。
+        Console.WriteLine("span=" + Convert.ToString(
+            ChartView.PolarCatSpan(-360.0, 24, false, true))
+            + ":" + Convert.ToString(
+            ChartView.PolarCatSpan(-360.0, 24, true, true)));
+    }
+}

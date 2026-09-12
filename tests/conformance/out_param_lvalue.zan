@@ -1,0 +1,98 @@
+using System;
+
+/// `ref`/`out` 实参指向"位置"（字段/元素）时的地址解析
+/// （irgen：emit_ref_arg 对非标识符目标回落 emit_expr）。
+///
+/// 回归：`out b.field` / `out arr[i]` / `out lst[i]` 的目标不是标识符，
+/// emit_ref_arg 于是走到 `return emit_expr(g, tgt, locals)`——那条路返回
+/// 的是**存着的值**，被调方把它当地址写：int 字段里存 7 就把 7 当成
+/// 指针 0x7，第一次写入即崩（此前全仓无一处这么写，缺陷一直潜伏）。
+/// 现在按位置解析真实地址：类实例字段、静态字段、数组/List 元素、
+/// 以及裸字段名（= this.field）。
+class OutParamLvalue {
+    static int fails;
+
+    static void Eq(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got "
+            + Convert.ToString(got) + " want " + Convert.ToString(want));
+    }
+
+    class Inner {
+        int v;
+    }
+
+    class Box {
+        static int sv;
+        int a;
+        Inner inr;
+    }
+
+    static void Set(out int x, int val) { x = val; }
+    static void Bump(ref int x) { x = x + 1; }
+
+    // 裸字段名：`out a` 必须解析成 `out this.a`。
+    int bare;
+    void BareThroughThis() { OutParamLvalue.Set(out bare, 64); }
+    int BareRead() { return bare; }
+
+    static void Main() {
+        fails = 0;
+
+        // ① 类实例字段：out / ref 两条路都要写到对象里。
+        Box b = new Box();
+        OutParamLvalue.Set(out b.a, 7);
+        OutParamLvalue.Eq("field out", b.a, 7);
+        OutParamLvalue.Bump(ref b.a);
+        OutParamLvalue.Eq("field ref", b.a, 8);
+
+        // ② 静态字段（调用方全局槽本身就是地址）。
+        OutParamLvalue.Set(out Box.sv, 42);
+        OutParamLvalue.Eq("static out", Box.sv, 42);
+
+        // ③ 嵌套字段：out b.inr.v 要落到内层对象里。
+        b.inr = new Inner();
+        OutParamLvalue.Set(out b.inr.v, 9);
+        OutParamLvalue.Eq("nested out", b.inr.v, 9);
+
+        // ④ 数组元素。
+        int[] arr = new int[3];
+        arr[0] = 10;
+        OutParamLvalue.Bump(ref arr[0]);
+        OutParamLvalue.Eq("array ref", arr[0], 11);
+        OutParamLvalue.Set(out arr[1], 55);
+        OutParamLvalue.Eq("array out", arr[1], 55);
+        OutParamLvalue.Eq("array untouched", arr[2], 0);
+
+        // ⑤ List 元素（i64 槽按元素宽度读写）。
+        List<int> lst = new List<int>{1, 2, 3};
+        OutParamLvalue.Set(out lst[1], 77);
+        OutParamLvalue.Eq("list out", lst[1], 77);
+        OutParamLvalue.Bump(ref lst[2]);
+        OutParamLvalue.Eq("list ref", lst[2], 4);
+        OutParamLvalue.Eq("list untouched", lst[0], 1);
+
+        // ⑥ 裸字段名走 this。
+        OutParamLvalue o = new OutParamLvalue();
+        o.BareThroughThis();
+        OutParamLvalue.Eq("bare this", o.BareRead(), 64);
+
+        // ⑦ 普通局部仍是老行为（不能被位置解析抢走）。
+        int local = 0;
+        OutParamLvalue.Set(out local, 3);
+        OutParamLvalue.Eq("local out", local, 3);
+
+        // ⑧ 写的是位置不是快照：写完立刻读回必须见到新值。
+        Box p = new Box();
+        OutParamLvalue.Set(out p.a, 1);
+        OutParamLvalue.Set(out p.a, 2);
+        OutParamLvalue.Eq("repeat", p.a, 2);
+
+        if (fails == 0) { Console.WriteLine("out_param_lvalue_test: OK"); }
+        else {
+            Console.WriteLine("out_param_lvalue_test: "
+                + Convert.ToString(fails) + " failure(s)");
+        }
+    }
+}

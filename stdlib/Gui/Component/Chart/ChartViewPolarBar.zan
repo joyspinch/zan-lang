@@ -1,0 +1,411 @@
+using System;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+/// 极坐标柱渲染：ECharts 5/6 `chart/bar/BarView.ts` 的 `polar()` +
+/// `layout/barPolar.ts`。几何解算在 ChartPolarBarLayout.zan，本文件
+/// 只做"轴量程 → 坐标 → Sector/Sausage"的投影与绘制。
+///
+/// 缺口原状：`DrawPolarCoord` / `DrawPolarMulti` 的系列循环里
+/// `if (s.type == ChartType.Bar) { continue; }`——极坐标柱整体未落地，
+/// 8 个官方 demo（bar-polar-stack / -stack-radial / -real-estate /
+/// -label-radial / -label-tangential / polar-roundCap / polar-endAngle
+/// 等）一根柱都不画。barMinAngle / roundCap 字段从 A5 起就已解析，
+/// 但没有消费者。
+partial class ChartView {
+    /// 归一化位置 frac ∈ [0,1] → ECharts coord 角 ×10。
+    /// `spanX10` 已带符号（clockwise 时为负），故顺时针轴的 frac 增大
+    /// 时角度减小——与 ECharts 一致。
+    static int PolarAngleAt(int startA, int spanX10, double frac) {
+        return startA * 10 + (int)((double)spanX10 * frac
+            + (spanX10 < 0 ? -0.5 : 0.5));
+    }
+
+    /// 本 polar 上是否有柱系列（决定值轴域走"堆叠和"还是"点坐标"）。
+    /// `pi` 指定 polar 下标（-1 = 不筛选，单 polar 场景）。
+    static bool PolarHasBars(ChartOption o) {
+        return ChartView.PolarHasBarsAt(o, 0 - 1);
+    }
+
+    static bool PolarHasBarsAt(ChartOption o, int pi) {
+        for (int si = 0; si < o.series.Count; si = si + 1) {
+            ChartSeries s = o.series[si];
+            if (s.hidden || s.coordSys != "polar"
+                || s.type != ChartType.Bar) { continue; }
+            if (pi >= 0 && s.polarIndex != pi) { continue; }
+            return true;
+        }
+        return false;
+    }
+
+    /// 本 polar 柱系列在指定轴（isAngle=true 角度轴 / false 半径轴）上的
+    /// 数据域。栈组按 stackName 归并（未声明 stack 的系列各自独立），
+    /// 逐轴取 min/max 后交给 PolarValueExtent 做 nice 对齐。
+    /// `pi` = 目标 polar（-1 = 全部；多 polar 时必须按 polarIndex 筛，
+    /// 否则 polar-endAngle 两个 polar 的数据会互相撑大对方的域）。
+    static void PolarBarsValueExtent(ChartOption o, bool isAngle,
+                                     out double lo, out double hi) {
+        ChartView.PolarBarsValueExtentAt(o, isAngle, 0 - 1, out lo, out hi);
+    }
+
+    static void PolarBarsValueExtentAt(ChartOption o, bool isAngle, int pi,
+                                       out double lo, out double hi) {
+        List<ChartSeries> bars = new List<ChartSeries>();
+        List<int> siOf = new List<int>();
+        for (int si = 0; si < o.series.Count; si = si + 1) {
+            ChartSeries s = o.series[si];
+            if (s.hidden || s.coordSys != "polar"
+                || s.type != ChartType.Bar) { continue; }
+            if (pi >= 0 && s.polarIndex != pi) { continue; }
+            bars.Add(s);
+            siOf.Add(si);
+        }
+        List<string> stackIds = new List<string>();
+        for (int i = 0; i < bars.Count; i = i + 1) {
+            stackIds.Add(ChartView.PolarStackIdOf(bars[i], siOf[i]));
+        }
+        // 轴声明 min/max 优先（radiusAxis.max / angleAxis.max）。
+        PolarAxisSpec ax = pi >= 0
+            ? ChartView.PolarAxisFor(isAngle ? o.angleAxes : o.radiusAxes, pi)
+            : ChartView.PolarAxisOf(isAngle ? o.angleAxes : o.radiusAxes);
+        bool minSet = ax != null && ax.minSet;
+        bool maxSet = ax != null && ax.maxSet;
+        double minV = ax != null ? (double)ax.min : 0.0;
+        double maxV = ax != null ? (double)ax.max : 0.0;
+        int n = 0;
+        for (int i = 0; i < bars.Count; i = i + 1) {
+            if (bars[i].Count() > n) { n = bars[i].Count(); }
+        }
+        ChartView.PolarValueExtent(bars, stackIds, n, isAngle,
+            minSet, maxSet, minV, maxV, out lo, out hi);
+    }
+
+    /// 极坐标柱渲染所需的一套轴投影（单个 polar 坐标系）。
+    /// `aLo/aHi`、`rLo/rHi` 是值轴的**数据域**（原值单位，非定点）；
+    /// `r0Px/r1Px` 是半径轴的像素范围。
+    /// 角度轴的总跨度（度，顺时针为正）——`polarCreator.ts:115-118`：
+    /// 未声明 endAngle 时 = `startAngle ± 360`（clockwise 取负）。
+    static double PolarAngleSpan(int startAngle, int endAngle,
+                                 bool endAngleSet, bool clockwise) {
+        if (endAngleSet) { return (double)(endAngle - startAngle); }
+        return clockwise ? 0.0 - 360.0 : 360.0;
+    }
+
+    /// 类目轴归一化位置（`Axis.makeExtentWithBands` + `Ordinal.normalize`）：
+    /// onBand（boundaryGap 缺省 true）落在带中央 `(i+0.5)/n`；
+    /// offBand 落在刻度上 `i/(n-1)`。
+    static double PolarCatFrac(int i, int n, bool onBand) {
+        if (n < 1) { return 0.0; }
+        if (onBand) { return ((double)i + 0.5) / (double)n; }
+        if (n < 2) { return 0.0; }
+        return (double)i / (double)(n - 1);
+    }
+
+    /// offBand 类目轴的跨度修正（`polarCreator.ts:96-99`
+    /// `extent[1] -= 360/count`）：轴跨度按**槽数**而非槽数-1 计，
+    /// 故要缩掉一个槽。punchCard 的 24 槽 90..-255 即此。
+    static double PolarCatSpan(double span, int n, bool onBand,
+                               bool clockwise) {
+        if (onBand || n < 1) { return span; }
+        double slot = 360.0 / (double)n;
+        return clockwise ? span + slot : span - slot;
+    }
+
+    /// 线性映射：数据值 v ∈ [lo,hi] → 像素/角度 [p0,p1]。
+    static double PolarLinear(double v, double lo, double hi,
+                              double p0, double p1) {
+        double span = hi - lo;
+        if (span == 0.0) { return p0; }
+        return p0 + (v - lo) / span * (p1 - p0);
+    }
+
+    /// 类目轴的逐项坐标（像素或角度，取决于传进来的 p0/p1）。
+    /// 值轴请直接用 `PolarLinear`。
+    static double PolarCatCoord(int i, int n, bool onBand,
+                                double p0, double p1) {
+        return p0 + ChartView.PolarCatFrac(i, n, onBand) * (p1 - p0);
+    }
+
+    /// 极坐标柱的堆叠和（ECharts `stackResultDimension` 的等价物）：
+    /// 值轴量程按**累加后的和**推导，不是单系列最大值——bar-polar-stack
+    /// 的 4 类目堆叠和是 4/8/12/16，量程因此 0..16 而非 0..8。
+    ///
+    /// 堆叠是**按 stack 组**分别累加的（ECharts 逐系列
+    /// `isDimensionStacked(data, valueDim)`）：未声明 stack 的系列各自
+    /// 独立，不与堆叠组相加。`stackIds` 与 `bars` 同序。
+    static List<double> PolarStackSums(List<ChartSeries> bars,
+                                       List<string> stackIds, int n) {
+        List<double> sums = new List<double>();
+        for (int i = 0; i < n; i = i + 1) { sums.Add(0.0); }
+        for (int si = 0; si < bars.Count; si = si + 1) {
+            if (stackIds[si].Length < 1) { continue; }
+            ChartSeries s = bars[si];
+            for (int i = 0; i < n && i < s.Count(); i = i + 1) {
+                sums[i] = sums[i] + s.Number(i);
+            }
+        }
+        return sums;
+    }
+
+    /// 极坐标值轴的数据域。类目轴无域；值轴按 stack 组累加和（或未堆叠
+    /// 系列的逐值）取范围后走 `IntervalScaleNiceTicks`——splitNumber 取
+    /// polar 组件缺省：角度轴 12、半径轴 5
+    /// （`component/polar/install.ts` 的 angleAxisExtraOption.splitNumber:12
+    /// / radiusAxisExtraOption.splitNumber:5）。
+    static void PolarValueExtent(List<ChartSeries> bars,
+                                 List<string> stackIds, int n, bool isAngle,
+                                 bool minSet, bool maxSet,
+                                 double minV, double maxV,
+                                 out double lo, out double hi) {
+        double dLo = 0.0;
+        double dHi = 0.0;
+        bool any = false;
+        // 堆叠组的累加和（未堆叠系列不进这张表）。
+        List<double> sums = ChartView.PolarStackSums(bars, stackIds, n);
+        for (int i = 0; i < sums.Count; i = i + 1) {
+            bool inStack = false;
+            for (int si = 0; si < bars.Count; si = si + 1) {
+                if (stackIds[si].Length > 0 && i < bars[si].Count()) {
+                    inStack = true;
+                }
+            }
+            if (!inStack) { continue; }
+            if (!any || sums[i] > dHi) { dHi = sums[i]; }
+            if (!any || sums[i] < dLo) { dLo = sums[i]; }
+            any = true;
+        }
+        // 未堆叠系列逐值参与。
+        for (int si = 0; si < bars.Count; si = si + 1) {
+            if (stackIds[si].Length > 0) { continue; }
+            ChartSeries s = bars[si];
+            for (int i = 0; i < s.Count(); i = i + 1) {
+                double v = s.Number(i);
+                if (!any || v > dHi) { dHi = v; }
+                if (!any || v < dLo) { dLo = v; }
+                any = true;
+            }
+        }
+        if (!any) { dLo = 0.0; dHi = 0.0; }
+        // 柱从轴原点起算，0 必须落在域内，否则柱基悬空。
+        if (dLo > 0.0) { dLo = 0.0; }
+        if (dHi < 0.0) { dHi = 0.0; }
+        int splitNumber = isAngle ? 12 : 5;
+        double interval = 0.0;
+        int precision = 0;
+        double nt0 = 0.0;
+        double nt1 = 0.0;
+        Chart.IntervalScaleNiceTicks(dLo, dHi, splitNumber,
+            ChartOption.AutoD(), ChartOption.AutoD(),
+            out interval, out precision, out nt0, out nt1);
+        lo = minSet ? minV : nt0;
+        hi = maxSet ? maxV : nt1;
+        if (hi <= lo) { hi = lo + (interval > 0.0 ? interval : 1.0); }
+    }
+
+    /// 极坐标柱的扇形绘制。
+    ///
+    /// `a0X10/a1X10` 是**数学角**（0=3 点钟、逆时针为正）×10——与
+    /// `Canvas.FillSector` 的"12 点、顺时针"约定差一个 `90 - m`
+    /// （见 PolarScreenX/Y 的同一换算）。
+    ///
+    /// 切向柱 + roundCap 是 ECharts 的 Sausage
+    /// （`BarView.polar`：`(!isRadial && roundCap) ? Sausage : Sector`）：
+    /// 在扇区两端各补一个半圆，圆心落在径向中线的两端角度上、
+    /// 半径 = 径向厚度的一半——即四角按 thickness/2 倒圆。
+    static void PolarFillBar(Canvas c, int cx, int cy, int r0, int r,
+                             int a0X10, int a1X10, bool valueIsRadius,
+                             bool roundCap, int color) {
+        if (r <= r0) { return; }
+        int sDeg = 90 - a0X10 / 10;
+        int eDeg = 90 - a1X10 / 10;
+        c.FillSector(cx, cy, r0, r, sDeg, eDeg, color);
+        if (valueIsRadius || !roundCap) { return; }
+        int mid = (r0 + r) / 2;
+        int cap = (r - r0) / 2;
+        if (cap < 1) { return; }
+        c.FillCircle(ChartView.PolarScreenX(cx, mid, a0X10 / 10),
+                     ChartView.PolarScreenY(cy, mid, a0X10 / 10), cap, color);
+        c.FillCircle(ChartView.PolarScreenX(cx, mid, a1X10 / 10),
+                     ChartView.PolarScreenY(cy, mid, a1X10 / 10), cap, color);
+    }
+
+    /// 极坐标柱的纯几何解算：`PolarBarFrame`（轴域/几何）→ 逐项
+    /// `ChartPolarBarLayout`。渲染端与 conformance 用例共用同一入口，
+    /// 保证断言的就是真正画出来的几何。
+    /// `valueIsRadius` 由本函数按基轴判定后回写（out）。
+    static List<List<ChartPolarBarLayout>> PolarBarSolve(
+        List<ChartSeries> bars, List<int> siOf, ChartPolarBarFrame f,
+        out bool valueIsRadius) {
+        List<List<ChartPolarBarLayout>> none =
+            new List<List<ChartPolarBarLayout>>();
+        int nb = bars.Count;
+        if (nb < 1) { valueIsRadius = false; return none; }
+
+        // 基轴 = 第一个 ordinal（类目）轴，否则角度轴
+        // （`Polar.getBaseAxis()`；本引擎极轴只有 Category/Value 两态）。
+        bool baseIsAngle = f.aCat ? true : (f.rCat ? false : true);
+        // 值轴是"另一条轴"：基轴是角度 → 值轴是半径 → 径向柱。
+        valueIsRadius = baseIsAngle;
+
+        int baseCount = baseIsAngle ? f.aCats.Count : f.rCats.Count;
+        if (baseCount < 1) {
+            for (int si = 0; si < nb; si = si + 1) {
+                if (bars[si].Count() > baseCount) { baseCount = bars[si].Count(); }
+            }
+        }
+        if (baseCount < 1) { return none; }
+
+        // ---- 列布局：类目带带宽 → calcRadialBar ----
+        double bandW;
+        if (baseIsAngle) {
+            double aSpan = ChartView.PolarCatSpan(
+                ChartView.PolarAngleSpan(f.startAngle, f.endAngle,
+                    f.endAngleSet, f.clockwise),
+                baseCount, f.aOnBand, f.clockwise);
+            bandW = ChartView.PolarBandWidth(aSpan < 0.0 ? 0.0 - aSpan : aSpan,
+                baseCount, f.aOnBand);
+        } else {
+            bandW = ChartView.PolarBandWidth((double)(f.r1Px - f.r0Px),
+                baseCount, f.rOnBand);
+        }
+
+        List<string> stackIds = new List<string>();
+        for (int si = 0; si < nb; si = si + 1) {
+            stackIds.Add(ChartView.PolarStackIdOf(bars[si], siOf[si]));
+        }
+        List<ChartPolarBarCol> cols =
+            ChartView.CalcPolarBarCols(bandW, bars, stackIds);
+
+        // 同一 stackId 出现 ≥2 次 = 堆叠组（单条 stack 不堆叠）。
+        bool stacked = false;
+        for (int i = 0; i < stackIds.Count; i = i + 1) {
+            for (int j = i + 1; j < stackIds.Count; j = j + 1) {
+                if (stackIds[i] == stackIds[j]) { stacked = true; }
+            }
+        }
+
+        // ---- 逐系列的基轴/值轴坐标 ----
+        // 径向柱：基轴=角度（度）、值轴=半径（px）；
+        // 切向柱：基轴=半径（px）、值轴=角度（度）。
+        double valStart;
+        double valCoordLo;
+        double valCoordHi;
+        List<List<double>> baseCoords = new List<List<double>>();
+        List<List<double>> valCoords = new List<List<double>>();
+        if (valueIsRadius) {
+            valStart = ChartView.PolarLinear(0.0, f.rLo, f.rHi,
+                (double)f.r0Px, (double)f.r1Px);
+            valCoordLo = (double)f.r0Px;
+            valCoordHi = (double)f.r1Px;
+            double aSpan = ChartView.PolarCatSpan(
+                ChartView.PolarAngleSpan(f.startAngle, f.endAngle,
+                    f.endAngleSet, f.clockwise),
+                baseCount, f.aOnBand, f.clockwise);
+            for (int si = 0; si < nb; si = si + 1) {
+                ChartSeries s = bars[si];
+                List<double> bc = new List<double>();
+                List<double> vc = new List<double>();
+                for (int i = 0; i < s.Count(); i = i + 1) {
+                    bc.Add(ChartView.PolarCatCoord(i, baseCount, f.aOnBand,
+                        (double)f.startAngle, (double)f.startAngle + aSpan));
+                    vc.Add(ChartView.PolarLinear(s.Number(i), f.rLo, f.rHi,
+                        (double)f.r0Px, (double)f.r1Px));
+                }
+                baseCoords.Add(bc);
+                valCoords.Add(vc);
+            }
+        } else {
+            // 切向柱：值轴是**角度**轴，它自己不是类目轴（基轴才是），
+            // 所以角度跨度**不做** offBand 类目收缩——拿 baseCount 去
+            // 收缩是错的（bar-polar-stack 的 360° 曾被缩成 330°）。
+            double aSpan = ChartView.PolarAngleSpan(
+                f.startAngle, f.endAngle, f.endAngleSet, f.clockwise);
+            valStart = (double)f.startAngle
+                + ChartView.PolarLinear(0.0, f.aLo, f.aHi, 0.0, aSpan);
+            valCoordLo = aSpan < 0.0 ? (double)f.startAngle + aSpan
+                                     : (double)f.startAngle;
+            valCoordHi = aSpan < 0.0 ? (double)f.startAngle
+                                     : (double)f.startAngle + aSpan;
+            for (int si = 0; si < nb; si = si + 1) {
+                ChartSeries s = bars[si];
+                List<double> bc = new List<double>();
+                List<double> vc = new List<double>();
+                for (int i = 0; i < s.Count(); i = i + 1) {
+                    bc.Add(ChartView.PolarCatCoord(i, baseCount, f.rOnBand,
+                        (double)f.r0Px, (double)f.r1Px));
+                    vc.Add((double)f.startAngle
+                        + ChartView.PolarLinear(s.Number(i), f.aLo, f.aHi,
+                            0.0, aSpan));
+                }
+                baseCoords.Add(bc);
+                valCoords.Add(vc);
+            }
+        }
+
+        // clampLayout（barPolar.ts:112-113）：`baseAxis.dim !== 'radius'
+        // || !roundCap`——径向柱恒钳，切向柱圆头时不钳（端点圆头要伸
+        // 出外环；polar-roundCap 的 With Round Cap 正是 720° 满扫）。
+        List<bool> clampFlags = new List<bool>();
+        for (int si = 0; si < nb; si = si + 1) {
+            clampFlags.Add(valueIsRadius || !bars[si].roundCap);
+        }
+
+        return ChartView.PolarBarLayout(bars, cols, stackIds, valueIsRadius,
+            stacked, baseCoords, valCoords, valStart, clampFlags,
+            valCoordLo, valCoordHi);
+    }
+
+    /// 画一组极坐标柱（单个 polar 坐标系）。
+    ///
+    /// `bars` 是本 polar 上的柱系列（声明序，hidden 已滤）；
+    /// `siOf` 与 `bars` 同序的全局系列下标（取色/取标签用）。
+    static void DrawPolarBarSeries(App app, Canvas c, ChartOption o,
+                                   List<ChartSeries> bars, List<int> siOf,
+                                   ChartPolarBarFrame f, int g) {
+        int nb = bars.Count;
+        if (nb < 1) { return; }
+        bool valueIsRadius = ChartView.PolarBaseIsAngle(f.aCat, f.rCat);
+        List<List<ChartPolarBarLayout>> lays =
+            ChartView.PolarBarSolve(bars, siOf, f, out valueIsRadius);
+        if (lays.Count < 1) { return; }
+
+        // ---- 绘制 ----
+        for (int si = 0; si < nb; si = si + 1) {
+            ChartSeries s = bars[si];
+            int col = Chart.SeriesPaintColor(s, app.theme, siOf[si]);
+            if (si >= lays.Count) { continue; }
+            List<ChartPolarBarLayout> ls = lays[si];
+            for (int i = 0; i < ls.Count; i = i + 1) {
+                ChartPolarBarLayout L = ls[i];
+                int icol = col;
+                if (i < s.data.Count && s.data[i].color != 0) {
+                    icol = s.data[i].color;
+                }
+                // 入场动画：径向柱长半径、切向柱张角（源 animateProperty
+                // 就是 `isRadial ? 'r' : 'endAngle'`）。
+                int r0 = L.r0;
+                int r = L.r;
+                int a0 = L.startAngleX10;
+                int a1 = L.endAngleX10;
+                if (g < 1000) {
+                    if (valueIsRadius) {
+                        r = r0 + (r - r0) * g / 1000;
+                    } else {
+                        a1 = a0 + (a1 - a0) * g / 1000;
+                    }
+                }
+                ChartView.PolarFillBar(c, f.cx, f.cy, r0, r, a0, a1,
+                    valueIsRadius, s.roundCap, icol);
+                // 描边（itemStyle.borderColor/Width）贴扇区外缘画弧。
+                if (s.itemStyle != null
+                    && s.itemStyle.normal.borderWidth > 0
+                    && s.itemStyle.normal.borderColor != 0) {
+                    c.DrawArc(f.cx, f.cy, r0, r, 90 - a0 / 10, 90 - a1 / 10,
+                        s.itemStyle.normal.borderColor,
+                        app.Scale(s.itemStyle.normal.borderWidth));
+                }
+            }
+        }
+    }
+}

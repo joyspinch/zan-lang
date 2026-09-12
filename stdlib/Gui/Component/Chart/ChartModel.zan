@@ -653,8 +653,17 @@ class PolarAxisSpec {
     int max;
     bool minSet;
     bool maxSet;
-    int startAngle;     // 仅角度轴：起始数学角（ECharts 缺省 90 = 12 点）
-    int endAngle;       // 仅角度轴：0 = 未声明（满圈）
+    int startAngle;     // 仅角度轴：起始角（ECharts 缺省 90 = 12 点）。这是
+                        //   "顺时针为正"的屏幕角：clockwise（缺省）时角度
+                        //   随值递减。见 ChartView.PolarAngleAt。
+    int endAngle;       // 仅角度轴：终止角。未声明时 = startAngle - 360
+                        //   （clockwise:true）。
+    bool endAngleSet;   // endAngle 是否显式声明。`endAngle:0` 是合法显式值
+                        //   （四分之一圈，polar-endAngle 两个 polar 都这么用），
+                        //   不能拿 0 当"未声明"哨兵——旧代码正是如此，于是
+                        //   polar-endAngle 的扇区被撑成满圈。
+    bool clockwise;     // 仅角度轴：ECharts 缺省 true（角度随值递减，屏幕上
+                        //   是顺时针）。false 时角度递增。
     bool boundaryGap;   // 类目轴（缺省 true：点落在带中央）
     List<string> cats;  // 类目数据
 
@@ -668,6 +677,8 @@ class PolarAxisSpec {
         a.minSet = false; a.maxSet = false;
         a.startAngle = 90;
         a.endAngle = 0;
+        a.endAngleSet = false;
+        a.clockwise = true;
         a.boundaryGap = true;
         a.cats = new List<string>();
         return a;
@@ -682,6 +693,8 @@ class PolarAxisSpec {
         a.minSet = src.minSet; a.maxSet = src.maxSet;
         a.startAngle = src.startAngle;
         a.endAngle = src.endAngle;
+        a.endAngleSet = src.endAngleSet;
+        a.clockwise = src.clockwise;
         a.boundaryGap = src.boundaryGap;
         for (int i = 0; i < src.cats.Count; i = i + 1) { a.cats.Add(src.cats[i]); }
         return a;
@@ -1444,7 +1457,9 @@ class RadarPolar {
     List<string> indicatorText; // 每轴指示器名；空 = 回退 option 类目（dims）
     List<int> indicatorMax;     // 每轴满刻度；0/缺 = 从该 polar 的系列推导
     ChartPosition center;       // 圆心（% 相对面板宽高 / px）；null = 单 polar 自动居中
-    ChartScalar radius;         // 半径（% 相对 min(areaW,areaH)/2 / px）；0 = 自动
+    ChartScalar radius;         // 外径（% 相对 min(areaW,areaH)/2 / px）；0 = 自动
+    ChartScalar radiusInner;    // 内径（polar.radius:[30,'80%'] 的首元）；
+                                //   Px(0) = 从圆心起（ECharts 缺省 [0,'80%']）
     int startAngle;             // 第一轴的数学角（90 = 正上，ECharts2 默认）
     int splitNumber;            // 环数；0 = 4（与单 polar 现状一致）
     string type;                // "" / "circle" / "polygon"；"" = 跟全局 radarShape
@@ -1460,7 +1475,8 @@ class RadarPolar {
     static RadarPolar Create() {
         RadarPolar p = new RadarPolar {
             indicatorText = new List<string>(), indicatorMax = new List<int>(),
-            center = null, radius = ChartScalar.Px(0), startAngle = 90,
+            center = null, radius = ChartScalar.Px(0),
+            radiusInner = ChartScalar.Px(0), startAngle = 90,
             splitNumber = 0, type = "", nameColor = 0, nameFormat = "",
             axisLineColor = 0, axisLineWidth = 0, splitLineColor = 0,
             splitLineWidth = 0, splitAreaColors = new List<int>()
@@ -1474,6 +1490,7 @@ class RadarPolar {
             indicatorText = new List<string>(), indicatorMax = new List<int>(),
             center = ChartPosition.Clone(src.center),
             radius = ChartScalar.Clone(src.radius),
+            radiusInner = ChartScalar.Clone(src.radiusInner),
             startAngle = src.startAngle, splitNumber = src.splitNumber,
             type = src.type, nameColor = src.nameColor, nameFormat = src.nameFormat,
             axisLineColor = src.axisLineColor, axisLineWidth = src.axisLineWidth,
@@ -1546,8 +1563,12 @@ class ChartSeries {
                      //   也归负方向，结果是向上 1px）；0 = 不设（官方 `|| 0` 缺省）
     int barMinAngle; // ECharts bar.barMinAngle：极坐标切向柱最小角度跨度
                      //   （layout/barPolar.ts:165-167）；0 = 不设
-    bool roundCap;   // ECharts bar.roundCap：极坐标径向柱端点圆头
-                     //   （barPolar.ts:112-113 的 clampLayout 开关）；缺省 true
+    bool roundCap;   // ECharts bar.roundCap：极坐标**切向**柱的端点圆头
+                     //   （BarView.polar 的 `(!isRadial && roundCap) ?
+                     //   Sausage : Sector`）。缺省 false（BarSeries.ts:149
+                     //   的 defaultOption）。它同时是 barPolar 的 clampLayout
+                     //   开关：切向柱圆头时**不**把值钳回轴量程
+                     //   （barPolar.ts:112-113），端点才能伸出外环。
     int barGapPct;   // ECharts bar.barGap：同系列柱间距百分比；-1 = 旧固定缝
     // 柱布局原始选项（ECharts layout/barGrid.ts:createLayoutInfoListOnAxis
     // 的系列侧输入）。字符串原样保留 `'N%'` / 数值两种形态，布局期才按
@@ -1758,7 +1779,11 @@ class ChartSeries {
         s.barHeight = 0;
         s.barMinHeight = 0;
         s.barMinAngle = 0;
-        s.roundCap = true;
+        // ECharts BarSeries.defaultOption.roundCap = false（BarSeries.ts:149）。
+        // 源里 `get('roundCap', true)` 的第二个参数只是"取不到时的兜底"，
+        // 而 defaultOption 已经给了 false，实际永远取不到兜底值。
+        // 旧代码缺省 true，于是切向柱全画成圆头香肠。
+        s.roundCap = false;
         s.barGapPct = 0 - 1;
         s.barWidthRaw = "";
         s.barGapRaw = "";
@@ -4292,7 +4317,14 @@ class ChartOption {
         if (a.Has("max")) { ax.max = a.Int("max", 0); ax.maxSet = true; }
         if (isAngle) {
             ax.startAngle = a.Int("startAngle", ax.startAngle);
-            ax.endAngle = a.Int("endAngle", 0);
+            // `endAngle` 只在**显式声明**时记入：0 是合法角度值
+            // （polar-endAngle 的 polar 0 就是 endAngle:0），不能拿
+            // 0 当"未声明"哨兵——旧代码那样做，把四分之一圈撑成满圈。
+            if (a.Has("endAngle")) {
+                ax.endAngle = a.Int("endAngle", ax.endAngle);
+                ax.endAngleSet = true;
+            }
+            ax.clockwise = a.Bool("clockwise", ax.clockwise);
         }
         JsonValue da = a.Get("data");
         if (da != null && da.IsArray()) {
@@ -5197,6 +5229,7 @@ class ChartOption {
                 }
                 JsonValue prad = ps.Get("radius");
                 if (prad != null && prad.IsArray() && prad.Count() >= 2) {
+                    p.radiusInner = ChartOption.ParseScalar(prad.At(0), ChartScalar.Px(0));
                     p.radius = ChartOption.ParseScalar(prad.At(1), ChartScalar.Px(0));
                 } else if (prad != null) {
                     p.radius = ChartOption.ParseScalar(prad, ChartScalar.Px(0));
@@ -5262,7 +5295,11 @@ class ChartOption {
             }
             JsonValue prad = pj.Get("radius");
             if (prad != null && prad.IsArray() && prad.Count() >= 2) {
-                p.radius = ChartOption.ParseScalar(prad.At(0), ChartScalar.Px(0));
+                // `radius:[30,'80%']` 的语义是 [内径, 外径]（polarCreator.ts:63-76
+                // 的 parsedRadius[0]/[1]）——旧代码取 At(0) 当外径，于是
+                // bar-polar-label-* 的外径塌成 30px、内径丢失。
+                p.radiusInner = ChartOption.ParseScalar(prad.At(0), ChartScalar.Px(0));
+                p.radius = ChartOption.ParseScalar(prad.At(1), ChartScalar.Px(0));
             } else if (prad != null) {
                 p.radius = ChartOption.ParseScalar(prad, ChartScalar.Px(0));
             }

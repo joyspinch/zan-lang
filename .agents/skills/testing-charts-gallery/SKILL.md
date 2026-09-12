@@ -699,6 +699,82 @@ ECharts line 的平滑算法不是「单调 Hermite / Cardinal / Catmull-Rom」�
 只回退这一处、保留 barMinHeight 的 A/B 显示该断言单独变红。
 影响 `bar-negative`（stack:"Total" 负段）等 demo。
 
+## 极坐标柱：方向、跨度、域三者是独立的（A6/A7 会话，整族曾反向）
+
+移植 `layout/barPolar.ts` 时最贵的三个坑，每个都让**整族** 8 个 demo 错，
+且都能在"看起来对"的局部探针里蒙混过关：
+
+1. **角度方向：`angleAxis` 缺省顺时针**。ECharts `clockwise: true`（缺省）
+   ⇒ `axis.inverse = inverse !== clockwise` ⇒ 缺省 `endAngle = startAngle − 360`。
+   值增大 ⇒ 屏幕角**减小**。Zan 的 `PolarAngleAt(startA, spanX10, frac)`
+   里 `spanX10` **带符号**正是为此，别把它取绝对值。
+2. **正负号取自原始数据，不取自坐标方向**。源是
+   `const sign = value >= 0 ? 'p' : 'n'`（`barPolar.ts:126`）。在顺时针
+   角度轴上正值使坐标**减小**，所以按 `vc < valStart` 判号会把**每条正柱
+   都塞进负累加器**——堆叠全塌。判号一律回原始数据
+   （`double rawV = bars[si].Number(i); bool negSign = rawV < 0.0;`）。
+3. **轴跨度 ≠ 值轴数据域，两个量勿混**。轴几何跨度恒 ±360°（类目轴
+   `offBand` 再缩一个槽位，`PolarCatSpan`）；而值轴的**数据域**来自数据
+   （bar-polar-stack 的角度域是堆叠和 `0..16`，**不是** 360）。
+   派生结论：切向柱（值轴 = 角度轴）里**不做** offBand 类目收缩——那根
+   轴自己不是类目轴（基轴才是），拿 `baseCount` 去收缩会把 360° 缩成
+   330°。只有径向柱（基轴 = 角度轴）才 `PolarCatSpan`。
+
+配套两条小的：
+
+- **`roundCap` 缺省是 `false`**（`BarSeries.ts:149`）。源里
+  `get('roundCap', true)` 的第二个参数只是"取不到时的兜底"，被
+  `defaultOption` 覆盖——照抄字面量会得到**相反**缺省。它同时是
+  `clampLayout` 的开关（`baseAxis.dim !== 'radius' || !roundCap`）：
+  径向柱恒钳，切向圆头柱不钳（端帽要伸出外环，`polar-roundCap` 的
+  With Round Cap 正是 720° 满扫）。
+- **`barMinHeight`/`barMinAngle` 按系列取**（`seriesModel.get(...)`），
+  不是按轴——一个轴上两个系列可以各有各的最小尺寸。`calcRadialBar` 的
+  极坐标缺省是**硬编码** `categoryGap '20%'`/`barGap '30%'`（不读主题），
+  且取**最后一个**声明 barGap/barCategoryGap 的系列。
+
+**验证手法**：极坐标柱是纯几何，走数值 oracle——ECharts 6.1 SSR 跑真实
+demo，把每根柱的 `{r0, r1, a0, a1}` 与 `PolarBarSolve` 的输出逐项比。
+`ChartView.PolarBarSolve(bars, siOf, f, out valueIsRadius)` 是渲染与用例
+**共用**的纯解算入口（渲染器 `DrawPolarBarSeries` 也调它），这样用例测的
+就是真路径，不会出现"探针自己对、渲染器另一套"。
+
+**多 polar 必须逐 polar 过滤**：`polar-endAngle` 有两个 polar，把两者塞进
+同一个 frame 会得出"不吻合"的假结论。`PolarBarsValueExtentAt(o, isAngle,
+pi, ...)` 按 `s.polarIndex != pi` 过滤系列，轴用 `PolarAxisFor(list, pi)`
+按 `polarIndex` 绑（带槽位回退）。先怀疑探针的过滤，再怀疑库。
+
+### conformance 用例不许读仓库相对路径（踩过一次假红）
+
+`tests/run_case.cmake` 从 **build 目录**跑编译产物，用例里
+`File.ReadAllText("examples/gui_charts/options/xxx.json")` 在 ctest 下直接
+`FileNotFoundException`（手动从仓库根跑却是绿的——最容易骗过自己）。
+option JSON 一律**内联**进用例源码。
+
+## 极坐标柱顺带修出的编译器缺陷：`out`/`ref` 目标是"位置"时取到了值（A6/A7 会话）
+
+写渲染器时用 `PolarBarSolve(..., out bool valueIsRadius)` 崩了，根因不在
+图库：`emit_ref_arg`（`src/compiler/irgen_expr.c`）只在目标是
+**标识符局部变量**时返回 `alloca`，其余一律 `emit_expr` —— 于是
+`out obj.field` / `out arr[i]` / `out lst[i]` 把**字段里存的值**当地址
+传出去，被调方首次写入就段错误。修法（rule 10，改编译器不改调用方）：
+
+- 新增 `emit_ref_lvalue_ptr(g, tgt, locals)` 解析"位置"：
+  `ClassName.StaticField` 取 backing global（global 本身就是槽）；
+  `obj.Field` 走 `get_field_index` + `emit_field_ptr`；
+  `AST_INDEX` 走 `emit_struct_elem_ptr`。
+- `emit_ref_arg` 的标识符分支补**裸名解析**（`out field` → `out this.field`），
+  末尾接 place 解析，解析不出来就发显式诊断
+  `ref/out argument must be a variable, a field, or an element`（旧行为是
+  静默传一个错地址，只有运行期崩才暴露）。
+- 用例 `tests/conformance/out_param_lvalue.zan`（8 项：实例字段 out/ref、
+  静态字段、嵌套 `out b.inr.v`、数组元素、List 元素、裸名、普通局部、
+  重复写）。
+
+**排查纪律**：这个缺陷当时是**潜伏**的（仓库里只有新代码用这个形状），
+所以"附近用例都绿"不能证明新代码没引缺陷。遇到"新写的形状一跑就崩"，
+先用 `_scratch/` 最小复现区分"我的代码错"还是"编译器错"，再决定改哪边。
+
 ## 组件级坐标系的分派与"过河"（C5 会话，geo 系 4 处同源缺陷）
 
 geo 系 demo 底图整体不画的根因是**四处**，只修一处不够，而且前两处
