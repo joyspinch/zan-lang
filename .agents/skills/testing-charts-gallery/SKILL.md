@@ -743,8 +743,82 @@ geo/map demo 指纹逐字节同 HEAD**。只跑自造的小地图会漏掉"底�
 注册表（china 走 `MapChinaData.Regions()` 而非 JSON 文件）"这类差别：
 探针里没注册 `china` 时 `regions=0`，底图当然不画，读数是假的。
 
-**遗留（下一步，非本条）**：`o.rampColors` 只从 `dataRange.color`
-（2.x 遗留）填，`visualMap.inRange.color` 只进 `visualMaps[]`，
-地图渲染器读 `o.rampColors`/`MapRamp` 的缺省浅蓝→深蓝——7 个 demo
-的分级着色仍走缺省色域；`o.rampLo/rampHi` 同理未从
-`visualMap.min/max` 接线。
+**本条暴露的下一层（已由 C6 修掉）**：`o.rampColors` 只从
+`dataRange.color`（2.x 遗留）填，`visualMap.inRange.color` 只进
+`visualMaps[]`，地图渲染器读 `o.rampColors`/`MapRamp` 的缺省浅蓝→深蓝。
+
+## 全局色带只有一条：visualMap 与 dataRange 必须汇到同一处（C6 会话）
+
+**现象**：29 个带 `visualMap.inRange.color` 的官方 demo（continuous 22 /
+piecewise 7）分级着色全丢，地图走缺省浅蓝→深蓝、日历走系列色。
+
+**根因**：`o.rampColors` + `o.rampLo/rampHi` 是**单条全局色带**，被
+`ChartViewMap` / `ChartViewHeatmap` / `ChartViewScatter` / `ChartViewCalendar`
+四个渲染器共读；但它此前只从 `dataRange.color`（ECharts 2.x 遗留）填，
+`visualMap.inRange.color` 只进 `visualMaps[]`。**两条路从不交汇**——
+写 visualMap 的现代 demo 一个都吃不到自己的色带。
+
+修法：`FromJsonValue` 在 `ParseVisualMap` 之后接线，取**首个**
+`type==0 && colorsExplicit && rangeColors.Count>=2` 的 visualMap 灌进
+`o.rampColors`；`o.rampColors` 已被 dataRange 填时不覆盖（dataRange 更具体）。
+语料普查先确认**没有任何 demo 声明 ≥2 条带色 visualMap**，"首个"才无歧义。
+
+### 接线必须认"显式声明"，不能认"有没有值"
+
+`ParseVisualMapOne` 在 continuous 且未声明颜色时会**填官方缺省彩虹带**
+（11 色 `#313695..a50026`），所以 `rangeColors.Count>0` 根本区分不出
+"用户声明了色带"和"我们替他填了缺省"。`scatter-nutrients` 的 visualMap
+只有 `inRange.symbolSize`，若照 `Count>0` 接，它的分组色会被按值彩虹
+覆盖（官方是 piecewise 分组色）。**加 `colorsExplicit` 字段，只在
+`inRange.color` 或 2.x `color` 真正存在时置真。**
+
+同型坑：C5 的 `geoIndex` 判定用 `s.Has("geoIndex")` 而非比较字段值——
+缺省 0 与显式 0 数值不可区分，而语义不同（`useDefault:false`）。
+**"显式声明过没有"是配置语义，字段值往往不是它的代理。**
+
+### 定点域 vs 原值域：别把 ×1000 的边界喂给按原值比较的消费者
+
+`ChartVisualMap.minV/maxV` 是 **×1000 定点**（给 `VisualColorAt` 的
+`tF` 归一用），而 `o.rampLo/rampHi` 的四个消费者都拿**原始数据值**比。
+`map-usa` 的 `max:38000000` ×1000 是 3.8e10，`(int)` 强转直接溢出成
+INT_MIN——图上变成"值域下界巨大"，全部区域一个色。
+
+修法：`ChartVisualMap` 另存 `minRaw/maxRaw`（`ChartOption.RawBound`：
+`|d|>2e9` 记 `Auto()` 按未声明退回"从数据推导"，否则四舍五入成 int），
+接线只读 `minRaw/maxRaw`。**写断言时先算清哪个域**：我一开始把
+`max:38000000` 断言成 `Auto()`（以为触发了护栏），实际 38000000 在
+int 内、rampHi 就该拿到 38000000；护栏只在 1.7e10 这种真超界时才生效。
+**测试断言错了和实现错了长得一模一样——先算一遍再写。**
+
+### 色名解析成 0 ≠ 无色，是"整片透明"（本条独立第二缺陷）
+
+`StyleSheet.NamedColor` 只有 42 个常用名（CSS Color Module Level 4
+共 148 个）。`map-HK` 色带里的 `lightskyblue` / `orangered` 落空解析成
+**0**，而 0 在渲染期经 `Chart.WithAlpha(0, 255)` 等于"未着色"——
+**区域整片透明不画**。
+
+**这条是"拒绝接受异常读数"挖出来的**：接线后 `map-HK` 墨迹从 HEAD 的
+80898 暴跌到 8805（9×）。色带接上了反而更空，说明不是接线错，是色带
+本身有解析不出颜色的项。顺着查才挖出具名色表缺陷。修完 `map-HK`
+ramp=3、墨迹 84915（回到 HEAD 量级），`lightskyblue`(8900346) 在
+n=66567 个像素上落地。
+
+**规矩：A/B 里出现方向相反的大幅变化，先当"新缺陷"查，别当"接线的
+副作用"接受。** 顺带把表补全到 148 名全覆盖（139 显式 + 9 拼写别名
+aqua/cyan、fuchsia/magenta、gray/grey、dark*/dimgray/dimgrey、
+lightgray/lightgrey、slate*/darkslate*/lightslate* 的 gray/grey 对），
+并**逐条比对 CSS 规范零错值**。
+
+### 真 demo 像素普查的排除法
+
+`_scratch/c6_demos.zan` 跑 20 个 demo 的 `ramp=<色带长度> ink=<非白像素> sum=<色值和>`
+指纹。判断接线对不对靠**两类对照**：
+- 该接的接上了：16 个 demo 的 ramp 从 0 变正（`map-usa`/`heatmap-large`/
+  `matrix-covariance` 11、`scatter-map`/`heatmap-map`/`dataset-encode0`/
+  `parallel-aqi` 3、`geo-map-scatter` 等 2）；
+- **不该接的保持 0**：`scatter-world-population`/`scatter-nutrients`
+  （symbolSize-only）与 `bar-simple`/`line-simple`/`pie-simple`/
+  `heatmap-cartesian`（无 visualMap）6 个 ramp 恒 0。
+
+只数"变了多少个"不够，**必须同时确认"不该变的没变"**，否则一次
+过度接线（比如照 `Count>0` 接）会被"变了 22 个"当成成功。

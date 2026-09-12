@@ -2805,6 +2805,14 @@ class ChartOption {
 
     /// 哨兵值，表示"此边界从数据推导"。
     static int Auto() { return 0 - 2000000000; }
+    /// visualMap 声明的边界按**原始数据单位**取整（o.rampLo/Hi 的消费者
+    /// 都按原值比较）。超出 int 可表示范围（>2e9，如 epoch-ms）时返回
+    /// Auto() 按未声明处理，避免强转溢出（同 B17 的轴 min/max 护栏）。
+    static int RawBound(double d) {
+        if (d > 2000000000.0 || d < 0.0 - 2000000000.0) { return ChartOption.Auto(); }
+        if (d < 0.0) { return (int)(d - 0.5); }
+        return (int)(d + 0.5);
+    }
     /// double 版（ChartAxis.min/max 是 double；直接 cast 2000000000 会被
     /// 强转工具链看作溢出风险，统一走这里）。
     static double AutoD() { return 0.0 - 2000000000.0; }
@@ -4819,11 +4827,15 @@ class ChartOption {
         vm.seriesIndex = v.Int("seriesIndex", 0 - 1);
         if (v.Has("min")) {
             vm.hasMin = true;
-            vm.minV = (int)(v.Double("min", 0.0) * 1000.0 + 0.5);
+            double mn = v.Double("min", 0.0);
+            vm.minV = (int)(mn * 1000.0 + 0.5);
+            vm.minRaw = ChartOption.RawBound(mn);
         }
         if (v.Has("max")) {
             vm.hasMax = true;
-            vm.maxV = (int)(v.Double("max", 0.0) * 1000.0 + 0.5);
+            double mx = v.Double("max", 0.0);
+            vm.maxV = (int)(mx * 1000.0 + 0.5);
+            vm.maxRaw = ChartOption.RawBound(mx);
         }
         JsonValue cl = null;
         JsonValue ir = v.Get("inRange");
@@ -4840,6 +4852,7 @@ class ChartOption {
             }
         }
         if (cl == null) { cl = v.Get("color"); }  // 2.x dataRange 遗留
+        if (cl != null) { vm.colorsExplicit = true; }
         if (cl != null && cl.IsArray()) {
             for (int i = 0; i < cl.Count(); i = i + 1) {
                 vm.rangeColors.Add(ChartOption.ParseColor(cl.At(i), 0));
@@ -5259,6 +5272,28 @@ class ChartOption {
         ChartOption.ParseAxis(v.Get("xAxis"), o.xAxes, true);
         ChartOption.ParseAxis(v.Get("yAxis"), o.yAxes, false);
         ChartOption.ParseVisualMap(v.Get("visualMap"), o.visualMaps);
+        // visualMap.inRange.color → 全局色带。地图/热力图/散点/日历渲染器
+        // 读的是 o.rampColors + o.rampLo/rampHi（单条全局色带），而
+        // visualMap 的色带此前只进 visualMaps[]，两边从不交汇——29 个带
+        // inRange.color 的 demo 因此全走缺省色域（地图浅蓝→深蓝、
+        // 日历底→系列色），官方色带形同不存在。
+        // 取**首个显式声明颜色的 continuous visualMap**：语料普查确认
+        // 没有任何 demo 声明 ≥2 条带色的 visualMap，"首个"不产生歧义；
+        // piecewise 走 pieces 通道，不在这里接线。dataRange（2.x 遗留）
+        // 已填时不覆盖——它更具体。
+        if (o.rampColors.Count < 1) {
+            for (int vmi = 0; vmi < o.visualMaps.Count; vmi = vmi + 1) {
+                ChartVisualMap vm = o.visualMaps[vmi];
+                if (vm.type != 0 || !vm.colorsExplicit
+                    || vm.rangeColors.Count < 2) { continue; }
+                for (int ci = 0; ci < vm.rangeColors.Count; ci = ci + 1) {
+                    o.rampColors.Add(vm.rangeColors[ci]);
+                }
+                if (vm.hasMin && vm.minRaw != ChartOption.Auto()) { o.rampLo = vm.minRaw; }
+                if (vm.hasMax && vm.maxRaw != ChartOption.Auto()) { o.rampHi = vm.maxRaw; }
+                break;
+            }
+        }
 
         // ECharts dataset：数据集与 transform 先于系列解析——系列用
         // datasetId/datasetIndex + encode 绑定列（缺省绑 index 0）。
@@ -6846,6 +6881,17 @@ class ChartVisualMap {
     int dimension;     // -1 = 默认（按 0 处理）
     int seriesIndex;   // -1 = 全部系列
     List<int> rangeColors;      // inRange.color 渐变 stop（continuous）
+    // 显式声明过 inRange.color（/2.x 的 color）。rangeColors 在
+    // "continuous 且未声明颜色"时会填官方缺省彩虹带，那不是用户的
+    // 着色意图——接线到全局 o.rampColors 时只能认显式声明，否则
+    // scatter-nutrients 的 symbolSize-only visualMap 会把分组色
+    // 覆盖成按值彩虹（官方是 piecewise 分组色）。
+    bool colorsExplicit;
+    // 声明的边界按**原始数据单位**另存一份：minV/maxV 是 ×1000 定点，
+    // 大数（map-usa max:38000000 → 3.8e10）强转会溢出成 INT_MIN；
+    // 而 o.rampLo/Hi 的消费者（ChartViewMap/Heatmap/Scatter）都按
+    // 原值比较，需要原值。超出 int 范围时记 Auto() 按未声明处理。
+    int minRaw; int maxRaw;
     List<ChartVisualPiece> pieces;
     // piecewise 类目模式（官方 nutrients）：categories 列出数据列里
     // 出现过的字符串类目，inRange.color 同序一一对应；行按该列的
@@ -6860,6 +6906,8 @@ class ChartVisualMap {
         vm.type = 0; vm.show = true; vm.hasMin = false; vm.hasMax = false;
         vm.minV = 0; vm.maxV = 0; vm.dimension = 0 - 1; vm.seriesIndex = 0 - 1;
         vm.rangeColors = new List<int>();
+        vm.colorsExplicit = false;
+        vm.minRaw = ChartOption.Auto(); vm.maxRaw = ChartOption.Auto();
         vm.pieces = new List<ChartVisualPiece>();
         vm.vmCats = new List<string>();
         vm.inOpacity = 0;
@@ -6876,6 +6924,8 @@ class ChartVisualMap {
         for (int i = 0; i < src.rangeColors.Count; i = i + 1) {
             vm.rangeColors.Add(src.rangeColors[i]);
         }
+        vm.colorsExplicit = src.colorsExplicit;
+        vm.minRaw = src.minRaw; vm.maxRaw = src.maxRaw;
         for (int i = 0; i < src.pieces.Count; i = i + 1) { vm.pieces.Add(src.pieces[i]); }
         for (int i = 0; i < src.vmCats.Count; i = i + 1) { vm.vmCats.Add(src.vmCats[i]); }
         vm.inOpacity = src.inOpacity;

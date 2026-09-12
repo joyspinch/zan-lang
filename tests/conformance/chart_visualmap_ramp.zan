@@ -1,0 +1,115 @@
+using System;
+using Gui.Component.Chart;
+
+namespace Conf;
+
+/// C6 回归：visualMap.inRange.color 必须接到全局色带（o.rampColors），
+/// 且只有**显式声明颜色**的 continuous visualMap 才能接。
+///
+/// 缺口原状：o.rampColors 只从 dataRange.color（ECharts 2.x 遗留）填，
+/// visualMap.inRange.color 只进 visualMaps[]，两条路从不交汇——地图/
+/// 热力图/散点/日历渲染器读的是 o.rampColors + o.rampLo/rampHi，
+/// 于是 29 个带 inRange.color 的官方 demo 全走缺省色域（地图浅蓝→
+/// 深蓝、日历底→系列色），官方色带形同不存在。
+///
+/// 两处必须同时成立才不出错：
+///   1. 只有 colorsExplicit 的才接——continuous 且未声明颜色时
+///      ParseVisualMapOne 会填官方缺省彩虹带，那不是用户的着色意图
+///      （scatter-nutrients 的 symbolSize-only visualMap 若接了，
+///      分组色会被按值彩虹覆盖，官方是 piecewise 分组色）；
+///   2. 边界要按**原始数据单位**记录——minV/maxV 是 ×1000 定点，
+///      map-usa 的 max:38000000 → 3.8e10 强转会溢出成 INT_MIN，
+///      而 o.rampLo/Hi 的消费者按原值比较。
+///
+/// 第二处独立缺陷：StyleSheet.NamedColor 只有 42 个常用名，
+/// map-HK 色带里的 lightskyblue / orangered 解析成 0——0 在渲染期
+/// 等于"未着色"，区域整片透明不画。
+class Program {
+    static int fails;
+
+    static void Eq(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got " + Convert.ToString(got)
+            + " want " + Convert.ToString(want));
+    }
+
+    static void True(string what, bool got) {
+        if (got) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    static ChartOption P(string json) { return ChartOption.FromJson(json); }
+
+    static void Main() {
+        fails = 0;
+
+        // ---- 1. 显式色带 + 显式边界 → 原值单位接到 rampLo/Hi ----
+        ChartOption o1 = P("{\"visualMap\":{\"min\":800,\"max\":50000,"
+            + "\"inRange\":{\"color\":[\"lightskyblue\",\"yellow\",\"orangered\"]}},"
+            + "\"series\":[{\"type\":\"pie\",\"data\":[1]}]}");
+        Eq("ramp count", o1.rampColors.Count, 3);
+        Eq("ramp lo (raw units)", o1.rampLo, 800);
+        Eq("ramp hi (raw units)", o1.rampHi, 50000);
+        // 具名色必须真解析（此前 lightskyblue/orangered 是 0）。
+        Eq("ramp[0] lightskyblue", o1.rampColors[0] & 0x00FFFFFF, 0x87CEFA);
+        Eq("ramp[1] yellow", o1.rampColors[1] & 0x00FFFFFF, 0xFFFF00);
+        Eq("ramp[2] orangered", o1.rampColors[2] & 0x00FFFFFF, 0xFF4500);
+
+        // ---- 2. 只声明 symbolSize 的 visualMap 不接色带 ----
+        // continuous 缺省彩虹带会被填进 rangeColors，但 colorsExplicit
+        // 为假，接线必须跳过（否则 scatter-world-population 的符号色
+        // 被按值彩虹覆盖）。
+        ChartOption o2 = P("{\"visualMap\":{\"min\":0,\"max\":100,"
+            + "\"inRange\":{\"symbolSize\":[6,60]}},"
+            + "\"series\":[{\"type\":\"scatter\",\"data\":[[1,2]]}]}");
+        Eq("symbolSize-only not wired", o2.rampColors.Count, 0);
+        Eq("symbolSize-only lo auto", o2.rampLo, ChartOption.Auto());
+
+        // ---- 3. piecewise 不接（走 pieces/vmCats 通道）----
+        ChartOption o3 = P("{\"visualMap\":{\"type\":\"piecewise\","
+            + "\"inRange\":{\"color\":[\"#5A94DF\",\"#c23531\"]}},"
+            + "\"series\":[{\"type\":\"scatter\",\"data\":[[1,2]]}]}");
+        Eq("piecewise not wired", o3.rampColors.Count, 0);
+
+        // ---- 4. 大边界按**原值**接线（消费者按原值比较）----
+        // map-usa 的 max:38000000 在 int 范围内，rampHi 必须拿到原值
+        // 38000000——不能给 ×1000 定点值（3.8e10 还会强转溢出）。
+        // Map/Heatmap/Scatter/Calendar 四个消费者都是拿原始数据值跟
+        // rampLo/Hi 比的。
+        ChartOption o4 = P("{\"visualMap\":{\"min\":500000,\"max\":38000000,"
+            + "\"inRange\":{\"color\":[\"#313695\",\"#d73027\"]}},"
+            + "\"series\":[{\"type\":\"map\",\"map\":\"\",\"data\":[]}]}");
+        Eq("big min wired raw", o4.rampLo, 500000);
+        Eq("big max wired raw", o4.rampHi, 38000000);
+        Eq("big colors still wired", o4.rampColors.Count, 2);
+
+        // ---- 4b. 超出 int 可表示范围（epoch-ms 级）→ 按未声明处理 ----
+        // RawBound 的护栏在这里才真正生效：1.7e10 无法用 int 表示，
+        // 记 Auto() 退回"从数据推导"，好过强转成一个假的负数边界。
+        ChartOption o4b = P("{\"visualMap\":{\"min\":0,\"max\":17000000000,"
+            + "\"inRange\":{\"color\":[\"#313695\",\"#d73027\"]}},"
+            + "\"series\":[{\"type\":\"line\",\"data\":[1]}]}");
+        Eq("out-of-range max -> Auto", o4b.rampHi, ChartOption.Auto());
+        Eq("in-range min still wired", o4b.rampLo, 0);
+
+        // ---- 5. 无 visualMap 时不误开色带（不回归）----
+        ChartOption o5 = P("{\"series\":[{\"type\":\"line\",\"data\":[1,2]}]}");
+        Eq("no visualMap ramp", o5.rampColors.Count, 0);
+
+        // ---- 6. 具名颜色表补齐：demo 用到的 6 个此前全落空 ----
+        string[] names = new string[] { "azure", "tomato", "lightskyblue",
+            "orangered", "peru", "chocolate" };
+        int[] want = new int[] { 0xF0FFFF, 0xFF6347, 0x87CEFA,
+            0xFF4500, 0xCD853F, 0xD2691E };
+        for (int i = 0; i < names.Length; i = i + 1) {
+            ChartOption oi = P("{\"visualMap\":{\"min\":0,\"max\":1,"
+                + "\"inRange\":{\"color\":[\"" + names[i] + "\",\"#000000\"]}},"
+                + "\"series\":[{\"type\":\"pie\",\"data\":[1]}]}");
+            Eq("named " + names[i], oi.rampColors[0] & 0x00FFFFFF, want[i]);
+        }
+
+        Console.WriteLine("c6-visualmap-ramp:" + Convert.ToString(fails == 0 ? 1 : 0));
+    }
+}
