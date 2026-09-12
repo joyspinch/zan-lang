@@ -2,6 +2,7 @@ using System;
 using System.Collections;
 using System.Data;
 using System.Data.Orm;
+using System.Json;
 using System.Web;
 using ZanWeb.Model.Oa;
 using ZanWeb.Model.Sys;
@@ -13,6 +14,10 @@ namespace ZanWeb.Admin.Oa;
    打开会话即批量已读（收件人维度 UPDATE，勿碰 from 侧——Bug#7 同类
    谨记：isRead 只属 to）。新私信经 Notify.Send(module="oa", kind=
    "message") 走铃铛（在线即推、离线未读数），私信历史不进通知中心。
+   已读/送达回执（本单）：对方客户端收帧即 Ack 置送达位、打开会话/会话
+   内新消息即 Read 置已读位，都经 oa_message_event 事件表由 MessageRelay
+   向发送方实时扇出 ack/read 帧；send/read/ack 同时以 JSONL 追加到
+   运行路径 data/chat/（旁路存证，见 ChatLog）。
    一期不做 SearchProvider：私信仅会话双方可见，Provider 权限语义不足。 */
 [Route("admin/oa/messages/[action]")]
 [Custom(Authorization = CustomAuthorization.Grant)]
@@ -89,6 +94,7 @@ class Messages : AdminController {
                     || (a.fromId == peer.id && a.toId == me.id)))
             .OrderBy(a => a.id).ToListAsync();
         List<StrMap> items = d.AddList("rows");
+        int maxUnread = 0;
         for (int i = 0; i < rows.Count; i = i + 1) {
             OaMessage r = rows[i];
             StrMap m = new StrMap();
@@ -96,19 +102,34 @@ class Messages : AdminController {
             m.Set("mine", r.fromId == me.id ? "1" : "");
             m.Set("who", r.fromId == me.id ? "我" : peerName);
             m.Set("at", Fmt.Stamp(r.createdAt));
-            /* 已读回执（按落库正确性非实时）：我发的且对方已读（isRead 只按 toId 维度）。 */
-            m.Set("readed", (r.fromId == me.id && r.isRead == 1) ? "1" : "");
+            m.Set("id", Convert.ToString(r.id));
+            /* 回执标记（我发的消息）：已读 > 已送达，均按 toId 维度状态。 */
+            string mark = "";
+            if (r.fromId == me.id) {
+                if (r.isRead == 1) { mark = "已读"; }
+                else if (r.isAcked == 1) { mark = "已送达"; }
+            }
+            m.Set("mark", mark);
+            if (r.toId == me.id && r.isRead == 0 && r.id > maxUnread) {
+                maxUnread = r.id;
+            }
             items.Add(m);
         }
         d.Set("empty", rows.Count == 0 ? "1" : "");
         d.Set("peerId", Convert.ToString(peer.id));
         d.Set("peerName", peerName);
-        /* 打开即批量已读：只清 toId==me 侧，from 侧未读属于对方。 */
+        /* 打开即批量已读：只清 toId==me 侧，from 侧未读属于对方。
+           顺带置送达位（读了必然已收到）；确有新已读才落事件，由
+           MessageRelay 向对端实时扇出 type=read 帧（读到 maxUnread 为止）。 */
         int _n = await this.OaMessage.Update()
             .Set(a => a.isRead, 1)
+            .Set(a => a.isAcked, 1)
             .Where(a => a.tenantId == this.TenantId()
                 && a.toId == me.id && a.fromId == peer.id && a.isRead == 0)
             .ExecuteAffrowsAsync();
+        if (_n > 0 && maxUnread > 0) {
+            await this.Receipt(this.TenantId(), maxUnread, peer.id, me.id, 2);
+        }
         this.Page(d);
     }
 
@@ -143,10 +164,101 @@ class Messages : AdminController {
             "新私信：" + Fmt.Text(me.nickname, me.username),
             Messages.Excerpt(content, 50),
             "/admin/oa/messages/chat?peer=" + Convert.ToString(me.id));
+        /* 本地历史（data/chat/）：send 事件旁路追加。 */
+        JsonValue h = JsonValue.NewObject();
+        h.Put("kind", JsonValue.NewStr("send"));
+        h.Put("id", JsonValue.NewStr(Convert.ToString(r.id)));
+        h.Put("from", JsonValue.NewStr(Convert.ToString(me.id)));
+        h.Put("to", JsonValue.NewStr(Convert.ToString(peer.id)));
+        h.Put("content", JsonValue.NewStr(content));
+        h.Put("at", JsonValue.NewStr(Convert.ToString(r.createdAt)));
+        ChatLog.AppendEvent(this.TenantId(), me.id, peer.id, h);
         this.Saved("已发送");
     }
 
+    /* 送达回执：收件人客户端收到 type=message 实时帧即打点（chat.js 自动
+       调，不依赖打开会话——在列表页/其他标签收到也算送达）。只按 toId
+       维度写 isAcked（isRead 同款纪律，勿碰发送方状态）；首次确认才落
+       事件+历史，重复调用幂等。 */
+    [HttpPost]
+    [Custom(IsMenu = false, Perm = PermBit.View)]
+    [Description("私信送达回执")]
+    async void Ack() {
+        User me = await this.Admin();
+        int id = this.InInt("id", 0);
+        if (id <= 0) { this.Ctx().Json("{\"code\":\"0003\"}"); return; }
+        OaMessage r = await this.OaMessage
+            .Where(a => a.id == id && a.tenantId == this.TenantId())
+            .FirstAsync();
+        if (r == null || r.toId != me.id) {
+            this.Ctx().Json("{\"code\":\"0404\"}");
+            return;
+        }
+        int n = await this.OaMessage.Update()
+            .Set(a => a.isAcked, 1)
+            .Where(a => a.id == r.id && a.tenantId == this.TenantId()
+                && a.toId == me.id && a.isAcked == 0)
+            .ExecuteAffrowsAsync();
+        if (n > 0) {
+            await this.Receipt(this.TenantId(), r.id, r.fromId, me.id, 1);
+        }
+        this.Ctx().Json("{\"code\":\"0000\"}");
+    }
+
+    /* 已读回执（实时）：打开中的会话收到新消息由前端调用——标记已读
+       （顺带送达位）并落已读事件，对端在线即实时点亮「已读」。与 Chat
+       打开时的批量已读同一语义，只按 toId==me 维度写。 */
+    [HttpPost]
+    [Custom(IsMenu = false, Perm = PermBit.View)]
+    [Description("私信已读回执")]
+    async void Read() {
+        User me = await this.Admin();
+        int peerId = this.InInt("peer", 0);
+        if (peerId <= 0 || peerId == me.id) {
+            this.Ctx().Json("{\"code\":\"0003\"}");
+            return;
+        }
+        List<OaMessage> unread = await this.OaMessage
+            .Where(a => a.tenantId == this.TenantId()
+                && a.toId == me.id && a.fromId == peerId && a.isRead == 0)
+            .OrderBy(a => a.id).ToListAsync();
+        if (unread.Count == 0) { this.Ctx().Json("{\"code\":\"0000\"}"); return; }
+        int maxId = 0;
+        for (int i = 0; i < unread.Count; i = i + 1) {
+            if (unread[i].id > maxId) { maxId = unread[i].id; }
+        }
+        await this.OaMessage.Update()
+            .Set(a => a.isRead, 1)
+            .Set(a => a.isAcked, 1)
+            .Where(a => a.tenantId == this.TenantId()
+                && a.toId == me.id && a.fromId == peerId && a.isRead == 0)
+            .ExecuteAffrowsAsync();
+        await this.Receipt(this.TenantId(), maxId, peerId, me.id, 2);
+        this.Ctx().Json("{\"code\":\"0000\"}");
+    }
+
     /* ---- helpers ---- */
+
+    /* 回执事件落库 + 本地历史（data/chat/）同点追加：read/ack 共用。
+       事件表即总线，MessageRelay 水位扫描后向消息发送方（ev.fromId）
+       扇出实时帧；kind 1=送达 2=已读，与 OaMessageEvent.kind 对应。 */
+    async void Receipt(int tenantId, int msgId, int senderId, int byId,
+        int kind) {
+        OaMessageEvent ev = new OaMessageEvent();
+        ev.tenantId = tenantId;
+        ev.msgId = msgId;
+        ev.fromId = senderId;
+        ev.toId = byId;
+        ev.kind = kind;
+        ev.createdAt = WebApp.NowSeconds();
+        await this.OaMessageEvent.Insert(ev).ExecuteIdentityAsync();
+        JsonValue h = JsonValue.NewObject();
+        h.Put("kind", JsonValue.NewStr(kind == 1 ? "ack" : "read"));
+        h.Put("id", JsonValue.NewStr(Convert.ToString(msgId)));
+        h.Put("by", JsonValue.NewStr(Convert.ToString(byId)));
+        h.Put("at", JsonValue.NewStr(Convert.ToString(ev.createdAt)));
+        ChatLog.AppendEvent(tenantId, senderId, byId, h);
+    }
 
     static int IndexOf(List<int> ids, int v) {
         for (int i = 0; i < ids.Count; i = i + 1) {

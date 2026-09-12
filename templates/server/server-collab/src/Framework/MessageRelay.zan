@@ -18,7 +18,9 @@ namespace ZanWeb;
    payload（CalendarRemind / Engine.Note 同款纪律）。
    Init 取 MAX(id) 作水位初值——worker 重启不重推历史（落库为准：离线消息
    由 Messages.Chat 打开会话时批量呈现并清已读，实时层只管「在线期间新增」，
-   已读回执按落库正确性非实时）。 */
+   已读回执实时化（本单）：oa_message_event 表是回执总线，SweepEvents
+   同款水位扫描向消息发送方扇出 type="ack"/"read" 帧（对端收帧即 Ack、
+   打开/会话内新消息即 Read，见 Messages 控制器）。 */
 class MessageRelay {
     /* 拍间隔（毫秒）：1s 一拍，验收口径 ≤2s 可达（1s 拍 + 索引读）。 */
     static int IntervalMs = 1000;
@@ -27,6 +29,8 @@ class MessageRelay {
 
     /* worker 内存水位：已扇出的最大 oa_message.id；-1 = 尚未 Init。 */
     static long lastId = -1;
+    /* 回执事件水位：已扇出的最大 oa_message_event.id。 */
+    static long lastEvId = -1;
 
     static async void Loop() {
         while (true) {
@@ -35,6 +39,7 @@ class MessageRelay {
             if (db == null) { continue; }
             try {
                 await MessageRelay.Sweep(db);
+                await MessageRelay.SweepEvents(db);
             } finally {
                 AppServices.Current().Db().Release(db);
             }
@@ -64,6 +69,32 @@ class MessageRelay {
             o.Put("createdAt", JsonValue.NewStr(Convert.ToString(r.createdAt)));
             o.Put("excerpt", JsonValue.NewStr(MessageRelay.Excerpt(r.content, 50)));
             await NotifyHub.PushTyped(r.toId, "message", o);
+        }
+    }
+
+    /* 回执扇出：向消息发送方（ev.fromId）推 type="ack"/"read" 帧。
+       ack 帧只带 msgId（对端点亮该条「已送达」）；read 帧带「读到为止」
+       的 msgId（对端把 ≤ 该 id 的自己发的消息全部点亮「已读」）与行为方
+       byId（发送方打开着谁的会话由对端页面自行比对）。首拍 Init 水位对齐
+       MAX(id)，重启不重推历史。 */
+    static async void SweepEvents(IDbConnection db) {
+        if (MessageRelay.lastEvId < 0) {
+            OaMessageEvent last = await db.Select<OaMessageEvent>()
+                .OrderByDescending(a => a.id).FirstAsync();
+            MessageRelay.lastEvId = last == null ? 0 : last.id;
+            return;
+        }
+        long mark = MessageRelay.lastEvId;
+        List<OaMessageEvent> evs = await db.Select<OaMessageEvent>()
+            .Where(a => a.id > mark)
+            .OrderBy(a => a.id).Take(MessageRelay.BatchSize).ToListAsync();
+        for (int i = 0; i < evs.Count; i = i + 1) {
+            OaMessageEvent e = evs[i];
+            MessageRelay.lastEvId = e.id;
+            JsonValue o = JsonValue.NewObject();
+            o.Put("msgId", JsonValue.NewStr(Convert.ToString(e.msgId)));
+            o.Put("by", JsonValue.NewStr(Convert.ToString(e.toId)));
+            await NotifyHub.PushTyped(e.fromId, e.kind == 1 ? "ack" : "read", o);
         }
     }
 

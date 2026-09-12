@@ -17,8 +17,8 @@ MVC 框架之上。**零 Redis、零外部服务依赖**：默认 SQLite（WAL�
 | 全文搜索（T8） | 顶栏聚合搜索，逐源 MaskOf 权限闸（无权限源零泄漏）、租户内检索 |
 | 文档中心（T9/T10） | 空间-树形文档、11 种块类型渲染、块编辑器（2s 防抖自动保存、乐观锁 409）、版本历史、XSS 白名单 |
 | 日历（T11） | 月/周视图、到期触发通知 + 待办各一条（多 worker 原子抢占防重发） |
-| 站内信 + 公告（T12） | 私信（会话 + 已读回执）、全员公告 + 登录弹窗一次 |
-| IM 实时（T13） | 统一事件流（ChatHub + MessageRelay 水位扫描）、跨 worker 1s 拍内送达、离线上线补拉 |
+| 站内信 + 公告（T12） | 私信（会话 + 已读/送达回执）、全员公告 + 登录弹窗一次 |
+| IM 实时（T13） | 统一事件流（ChatHub + MessageRelay 水位扫描）、跨 worker 1s 拍内送达、离线上线补拉、回执实时帧（ack/read，经 oa_message_event 事件总线） |
 | 表单引擎（T14/T15） | 8 种字段 schema 定义 + 预览、字典联动（`dict:`）、服务端校验白名单、填报自动发起流程、审批状态推导回显、CSV 导出 |
 | 备份恢复（T16） | 管理页一键备份（VACUUM INTO 快照 + uploads.zip + manifest）、保留 7 份轮转、跨 worker 锁、zip 下载 |
 
@@ -49,7 +49,7 @@ src/Modules/            业务域（模型 + 控制器同目录内聚）
   Flow/                   流程定义 / 实例 / 任务 + 引擎（Engine.zan）+ 通知兼容层
 src/Feature/            横切能力：Attachment、TodoCenter、ExcelIo、Blocks、
                         FormSchema、Backup、Search、CalendarRemind、
-                        MessageRelay、Mailer、Metrics、Ai…
+                        MessageRelay、ChatLog、Mailer、Metrics、Ai…
 src/Framework/          应用接线：Cfg、Db、DbContext、Schema（CodeFirst DDL +
                         种子）、Auth、Tenant、Notify(Hub)、DataScope、Perm(Table)、
                         ExcelIo、Search、MessageRelay、AppServices
@@ -343,6 +343,7 @@ data/app.db          SQLite 主库（WAL）
 data/backups/{ts}/   备份（app.db + uploads.zip + manifest.txt，保留 7 份）
 data/metrics.db      指标历史（独立库）
 data/uploads/        附件流式落盘（{year-month}/ 结构）
+data/chat/           私信本地历史（t{租户}/{a}-{b}.jsonl，send/read/ack 事件流水）
 logs/{yyyyMM}/dd.log 运行日志
 ```
 
