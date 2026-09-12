@@ -1,0 +1,90 @@
+// B17: 直角坐标系轴声明 min/max（ECharts valueAxis min/max）。
+// 此前 ParseAxisOne 用 v.AsDouble(AutoD()) 作用在轴对象上恒返回缺省，
+// 声明从未进 minD/maxD（line-easing 0..1、anscombe 0..20 全按 auto
+// nice 画）。断言：
+// ①数值形态 min/max 经 SetRange 同步进 minD/maxD 与 int 影子；
+// ②'dataMin'/'dataMax' 字面量记 minDataB/maxDataB，数值域保持 Auto
+//   （精确数据界接线待续，本 slice 按未声明处理）；
+// ③超 int 影子量程的声明（custom-profile 的 epoch-ms）按未声明，
+//   防溢出；
+// ④Clone 全量携带；
+// ⑤points 系列（[[x,y],...] ×1000 定点）的量程按 PointV 除回真值
+//   （AxisMaxFor 此前经 Value() 读 raw，量程放大 1000 倍——
+//   line-in-cartesian 的 y 轴曾画成 0..100,000）；
+// ⑥小数 points 系列被 SeriesFracAny 识别（让 ×1000 定点轴管线与
+//   声明 min/max 的定点承载接管；SeriesFrac 只认 data[]，points 全漏）；
+// ⑦ValueXF 定点直通映射 vs 先 PointV 取整的亚单位差异
+//   （line-easing 1/30 步长采样曾被坍缩成左右两根竖线）。
+using System;
+using Gui.Component.Chart;
+
+namespace Conf;
+
+class Program {
+    static List<ChartSeries> One(ChartSeries s) {
+        List<ChartSeries> l = new List<ChartSeries>();
+        l.Add(s);
+        return l;
+    }
+
+    /// [[x,y],...] 数值对系列：×1000 定点存 points（与 JSON 解析
+    /// 同一约定），pointG=1000。
+    static ChartSeries Pairs(string name, List<int> xs, List<int> ys) {
+        List<ChartPoint> ps = new List<ChartPoint>();
+        for (int i = 0; i < xs.Count; i = i + 1) {
+            ps.Add(ChartPoint.Of(xs[i], ys[i]));
+        }
+        ChartSeries s = ChartSeries.OfLinePoints(name, ps);
+        s.pointG = 1000;
+        return s;
+    }
+
+    static void Main() {
+        ChartOption o = ChartOption.FromJson("{\"xAxis\":[{\"type\":\"value\",\"min\":0,\"max\":1},{\"type\":\"value\",\"min\":-4,\"max\":4},{\"type\":\"value\",\"min\":\"dataMin\",\"max\":\"dataMax\"},{\"type\":\"value\"},{\"type\":\"value\",\"min\":0,\"max\":1789026530162}],\"yAxis\":[{\"type\":\"value\",\"min\":-0.4,\"max\":1.4},{\"type\":\"value\",\"min\":0,\"max\":500}],\"series\":[{\"type\":\"line\",\"data\":[[0,0],[1,1]]}]}");
+        ChartAxis x0 = o.xAxes[0];
+        Console.WriteLine("x0=" + Convert.ToString(x0.minD) + "," + Convert.ToString(x0.maxD)
+            + ";" + Convert.ToString(x0.min) + "," + Convert.ToString(x0.max));
+        ChartAxis x1 = o.xAxes[1];
+        Console.WriteLine("x1=" + Convert.ToString(x1.minD) + "," + Convert.ToString(x1.maxD)
+            + ";" + Convert.ToString(x1.min) + "," + Convert.ToString(x1.max));
+        ChartAxis x2 = o.xAxes[2];
+        Console.WriteLine("x2-data=" + Convert.ToString(x2.minDataB ? 1 : 0) + "," + Convert.ToString(x2.maxDataB ? 1 : 0)
+            + ";" + Convert.ToString(x2.minD) + "," + Convert.ToString(x2.maxD));
+        ChartAxis x3 = o.xAxes[3];
+        Console.WriteLine("x3-auto=" + Convert.ToString(x3.minD) + "," + Convert.ToString(x3.maxD));
+        ChartAxis x4 = o.xAxes[4];
+        Console.WriteLine("x4-overflow=" + Convert.ToString(x4.min) + "," + Convert.ToString(x4.maxD));
+        ChartAxis y0 = o.yAxes[0];
+        Console.WriteLine("y0-frac=" + Convert.ToString(y0.minD) + "," + Convert.ToString(y0.maxD));
+
+        ChartAxis c = ChartAxis.Clone(x2);
+        if (c != null) {
+            Console.WriteLine("clone=" + Convert.ToString(c.minDataB ? 1 : 0) + "," + Convert.ToString(c.maxDataB ? 1 : 0)
+                + ";" + Convert.ToString(c.minD) + "," + Convert.ToString(c.maxD));
+        }
+
+        // points 系列量程：×1000 定点真值（非 raw 100000）。
+        List<ChartSeries> pts = Program.One(Program.Pairs("p",
+            new List<int>{10000, 50000, 40000},
+            new List<int>{40000, 100000, 20000}));
+        Console.WriteLine("extent=" + Convert.ToString(Chart.AxisMinFor(pts, 0, 0 - 1, 0 - 1, false))
+            + "," + Convert.ToString(Chart.AxisMaxFor(pts, 0, 0 - 1, 0 - 1, false)));
+
+        // 小数 points 系列被识别；整倍数定点不误报。
+        List<ChartSeries> frac = Program.One(Program.Pairs("f",
+            new List<int>{0, 333, 1000},
+            new List<int>{0, 250, 1000}));
+        Console.WriteLine("frac=" + Convert.ToString(Chart.SeriesFracAny(frac, 0) ? 1 : 0)
+            + ";int=" + Convert.ToString(Chart.SeriesFracAny(pts, 0) ? 1 : 0));
+
+        // 定点直通 vs 先取整：1/3 处的亚单位坐标。
+        int viaXF = Chart.ValueXF(0, 900, 0, 1, 333, 1000);
+        int viaRound = Chart.ValueX(0, 900, 0, 1, Chart.PointV(333, 1000));
+        Console.WriteLine("map=" + Convert.ToString(viaXF) + "," + Convert.ToString(viaRound));
+
+        // 工厂路径不受影响：未设轴仍 Auto。
+        ChartOption d = ChartOption.Create();
+        d.xAxes.Add(ChartAxis.Value());
+        Console.WriteLine("factory=" + Convert.ToString(d.XAxis0().min) + "," + Convert.ToString(d.XAxis0().minD));
+    }
+}

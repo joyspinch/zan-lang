@@ -573,3 +573,40 @@ ECharts line 的平滑算法不是「单调 Hermite / Cardinal / Catmull-Rom」�
 7. **triggerOn:"none" 解析期门控 `showTooltip=false` 即忠实**：引擎无
    dispatchAction 通道，官方"只由 action 触发"在本引擎等价于不出
    提示框，渲染层零改动（--nomouse 截图模式本来也压掉 tooltip）。
+
+## 轴声明 min/max 与值对系列定点贯通（B17 会话教训）
+
+1. **单位契约先于像素**：值对系列（[[x,y],...]）解析后 points 存
+   值×pointG（恒 1000）、data[] 存 值×g、YOfF 吃 值×1000、散点映射走
+   ValueXF/ValueYF。量程与映射**必须同一单位**，错一处就是 1000 倍
+   （line-in-cartesian y 轴 0..100,000）或全线塌 0（area-time-axis 把
+   除式写成 `g>1?g:1000`，pointG=1 时 255÷1000≈0）。定点换算恒为
+   `raw×1000/pointG`，没有特例。
+2. **JsonValue 取键值用 `Get(key)`+`AsDouble(dflt)` 或
+   `Double(key,dflt)`**：`v.AsDouble(dflt)` 是值节点方法，作用在
+   OBJECT 上恒返回 dflt——axis min/max 声明因此静默全废（34 demo
+   249 条），探针（打印 minD/maxD/min/max）一发就现形。
+3. **extent 环与映射环都要过 PointV**：AxisMinFor/MaxFor 第一环
+   `Value()` 会把 points 系列的定点原值混进量程（第二环除回了也
+   白除，raw 赢 max）——points-only 系列第一环必须跳过
+   （`data.Count>0` 守卫）。
+4. **frac 判定也要认 points**：SeriesFrac 只查 data[]，points 小数
+   系列全漏 → ×1000 定点轴管线（含声明的 −0.4..1.4 双固定精确
+   等分）永不接管，PointV 取整把曲线压扁。判定式
+   `pointG>1 && y%pointG!=0`。
+5. **映射别先取整**：`XOfValue(PointV(x,g))` 把 1/30 步长采样坍缩成
+   左右两根竖线；ValueXF/YOfFL(raw, g) 分母按 span×g 缩放，亚单位
+   精度直通（散点早就是这个式子，折线 geoMode-1 补齐即可）。
+6. **快照构建后打补丁 = 用旧代码验证**：_scratch/stdlib_snap 是
+   构建时拷贝，改完工作区必须重 cp 三个 Chart 文件再编——本会话
+   首轮 XEXT 探针打印的还是修复前数值，白跑一轮。探针输出与预期
+   不符时，第一反应查"exe 是不是旧的"。
+7. **`pwsh -File` 不拆逗号数组**：`-Ids a,b` 整串成一个 id，匹配
+   不到就静默拍默认 demo（面包屑还显示旧图）；一次一个 id 或用
+   数组语法 `-Ids a -Ids b`。recheck2 的 OutDir 不存在时**不落盘
+   还打印 OK**——先 mkdir。
+8. **新官方对照的回归疑点先 HEAD A/B 再动手**：本会话 area-time-axis
+   平线一度疑似"既有缺口"，HEAD 变体构建（三文件 swap：
+   git show HEAD:... > 工作区，cp 进 snap，编 charts_pc_head.exe，
+   恢复）证明是本次回归，修除式后像素同 HEAD。swap 期间别让别的
+   会话碰 Chart 文件（并发树纪律：用完立刻恢复）。
