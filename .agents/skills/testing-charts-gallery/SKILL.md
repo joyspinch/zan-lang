@@ -610,3 +610,45 @@ ECharts line 的平滑算法不是「单调 Hermite / Cardinal / Catmull-Rom」�
    git show HEAD:... > 工作区，cp 进 snap，编 charts_pc_head.exe，
    恢复）证明是本次回归，修除式后像素同 HEAD。swap 期间别让别的
    会话碰 Chart 文件（并发树纪律：用完立刻恢复）。
+
+## 散点族小数定义域与数值核对（B18 会话教训）
+
+1. **轴扫描器分 X/Y，别拿 Y 扫描器算 X 域**：`FracAxisLoF/HiF` 内部
+   走 `AxisMinForF/AxisMaxForF`——那是 **Y 列**扫描器（读 points.y，
+   还夹带堆叠柱逻辑），拿它算 X 域会得到"按 Y 值算出来的 X 域"。
+   本会话首轮 `ScatterRangeX` 这么写，x 域直接垃圾（scatter-simple
+   出 0..200 定点）。正确做法：X 域取该轴自己的精确极值。
+2. **取整极值不够用，seam 要同时出"精确定点极值"**：`ScatterSpan`
+   原先经 `PointV` 除回取整（0.03→0、6.95→7），frac 域管线需要
+   `raw×1000/pointG` 的真值。给 seam 加 4 个 out（fMnX/fMxX/fMnY/
+   fMxY）而**保留**原 4 个整数 out 供整数路——两条路各吃各的单位，
+   别指望一个 out 兼顾。
+3. **frac 判定按轴分开查**：`ScatterAxisFrac(series, xAxis)`——散点
+   x 列也要判（此前只判 y）。判定条件 `pointG>1 && data.Count==0`
+   ＋逐点 `%pointG!=0`：CatIdx1000 的类目下标恰是整倍数不误报，
+   时间对 pointG=1 不进。
+4. **NiceRange 是自动端的包络，不是声明端的取整器**：单侧声明
+   （`yAxis.min=-40`）经 NiceRange 会被 nice 成 -200，官方与整数路
+   （AxisLo/AxisHi 直接采用固定值）都是 -40。规则：NiceRange 之后
+   把声明端**钉回**精确值（`PinDeclaredF`）。本会话靠 HEAD A/B 抓到
+   （polynomial-regression y 域 −40 → −200）。
+5. **A/B 探针别调新 API**：要给 HEAD 快照编同一份探针，探针只能调
+   两版都有的函数（ScatterRangeX/Y），否则 HEAD 侧直接编不过，
+   整个 A/B 白做。新 API 的单测留给 conformance。
+6. **conformance golden 是 CRLF，但别重复转换**：Zan 的
+   `Console.WriteLine` 输出**已经是 CRLF**，再 `.replace(b'\n',b'\r\n')`
+   会变 `\r\r\n`（`cat -A` 见 `^M^M$`，与已提交 golden 不符）。
+   正确姿势：先归一到 LF 再统一转 CRLF。
+7. **窗口截图不一定能看，数值核对才是主证**：本会话 Read 图片被
+   过滤（模型不支持图像），"实机看着对"这条路直接断了——但用户
+   方法本来就是"代码层对比"。可靠替代：官方 SSR oracle 取 extent
+   （`_scratch/b18_sweep_oracle.js`）＋引擎侧无头探针（
+   `_scratch/b18_engine_extent.zan`）逐行 diff；HEAD A/B 给每一行
+   归因。**没有数值证据就不要在汇报里写"实机已过"**。
+8. **`DispatchKind` 看的是首个可见系列的 type**：geo 系 demo 若
+   series[0] 是 `coordinateSystem:'geo'` 的 scatter，kind 判成
+   scatter → `DrawMap`/`DrawGeoOverlay` 不跑，底图与 geo 投影点
+   整体丢失（`geo-choropleth-scatter`/`geo-map-scatter` 即此，
+   前置缺陷）。判分派前先用无头探针打印
+   `DispatchKind/LeadSeries.type/isGeoBase/regions`，别凭 demo 名字
+   猜渲染器（`_scratch/geo_probe.zan`）。

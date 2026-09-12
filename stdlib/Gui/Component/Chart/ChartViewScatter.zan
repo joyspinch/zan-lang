@@ -6,10 +6,15 @@ namespace Gui.Component.Chart;
 
 partial class ChartView {
     /// 可见散点在闭区间窗口内的原始值域；无有效点时四端均为 0。
+    /// fMnX..fMxY 四端为 ×1000 定点（F）值域：raw×1000/pointG 精确
+    /// 换算、不过 PointV 取整——frac 域管线（NiceRange/映射 g=1 同
+    /// 单位式）必须吃 0.03..0.99 这类亚单位真值。
     /// 绘制主体与悬停命中共用此 seam，避免两套域推导漂移。
     static void ScatterSpan(List<ChartSeries> series, int i0, int i1,
-                            out int minX, out int maxX, out int minY, out int maxY) {
+                            out int minX, out int maxX, out int minY, out int maxY,
+                            out int fMnX, out int fMxX, out int fMnY, out int fMxY) {
         minX = 0; maxX = 0; minY = 0; maxY = 0;
+        fMnX = 0; fMxX = 0; fMnY = 0; fMxY = 0;
         bool seen = false;
         if (series == null) { return; }
         for (int si = 0; si < series.Count; si = si + 1) {
@@ -20,16 +25,40 @@ partial class ChartView {
             while (j <= i1 && j < s.points.Count) {
                 int pxv = Chart.PointV(s.points[j].x, s.pointG);
                 int pyv = Chart.PointV(s.points[j].y, s.pointG);
+                int fpx = (int)((long)s.points[j].x * 1000L / (long)s.pointG);
+                int fpy = (int)((long)s.points[j].y * 1000L / (long)s.pointG);
                 if (!seen) {
-                    minX = pxv; maxX = pxv; minY = pyv; maxY = pyv; seen = true;
+                    minX = pxv; maxX = pxv; minY = pyv; maxY = pyv;
+                    fMnX = fpx; fMxX = fpx; fMnY = fpy; fMxY = fpy; seen = true;
                 } else {
                     if (pxv < minX) { minX = pxv; }
                     if (pxv > maxX) { maxX = pxv; }
                     if (pyv < minY) { minY = pyv; }
                     if (pyv > maxY) { maxY = pyv; }
+                    if (fpx < fMnX) { fMnX = fpx; }
+                    if (fpx > fMxX) { fMxX = fpx; }
+                    if (fpy < fMnY) { fMnY = fpy; }
+                    if (fpy > fMxY) { fMxY = fpy; }
                 }
                 j = j + 1;
             }
+        }
+    }
+
+    /// 把轴声明的 min/max 钉回小数域的精确定点值（fixMM 语义）。
+    /// NiceRange 只负责自动端的 nice 包络；声明端一旦被它取整就
+    /// 违背官方语义（scatter-polynomial-regression 的 yAxis.min=-40
+    /// 官方与整数路都是 -40，nice 后变 -200）。整数路由
+    /// AxisLo/AxisHi 直接采用固定值，此处对齐同一约定。
+    static void PinDeclaredF(ChartAxis ax, ChartSpan sp) {
+        if (sp == null) { return; }
+        if (!ChartOption.IsAutoD(ax.minD)) {
+            sp.lo = (int)(ax.minD >= 0.0 ? ax.minD * 1000.0 + 0.5
+                : ax.minD * 1000.0 - 0.5);
+        }
+        if (!ChartOption.IsAutoD(ax.maxD)) {
+            sp.hi = (int)(ax.maxD >= 0.0 ? ax.maxD * 1000.0 + 0.5
+                : ax.maxD * 1000.0 - 0.5);
         }
     }
 
@@ -42,12 +71,44 @@ partial class ChartView {
     /// 命中错位（历史教训：0 锚定只改了一边）。
     static ChartSpan ScatterRangeX(ChartOption o, List<ChartSeries> series, int i0, int i1) {
         int mn = 0; int mx = 0; int my = 0; int mY = 0;
-        ChartView.ScatterSpan(series, i0, i1, out mn, out mx, out my, out mY);
+        int fMnX = 0; int fMxX = 0; int fMnY = 0; int fMxY = 0;
+        ChartView.ScatterSpan(series, i0, i1, out mn, out mx, out my, out mY,
+                              out fMnX, out fMxX, out fMnY, out fMxY);
         ChartAxis ax = o.XAxis0();
         ChartSpan s = new ChartSpan();
         if (ax.type == ChartAxisType.Time) {
             s.lo = mn; s.hi = mx; s.ticks = 0;
             return s;
+        }
+        // 小数 X（B18）：与 ScatterRangeY 同一条 F 域管线——
+        // scatter-linear-regression 0.03..0.99、scatter-nutrients 等
+        // 亚单位横坐标经整数路（PointV 取整 + SmartForInteger）会
+        // 坍缩成 0..5 的假刻度。定点界取 ScatterSpan 的 F 极值
+        // （不用 FracAxisLoF/HiF：那是 Y 列扫描器，且过 PointV 取整）。
+        if (Chart.ScatterAxisFrac(series, true)) {
+            int loF;
+            if (!ChartOption.IsAutoD(ax.minD)) {
+                loF = (int)(ax.minD >= 0.0 ? ax.minD * 1000.0 + 0.5
+                    : ax.minD * 1000.0 - 0.5);
+            } else {
+                loF = fMnX;
+            }
+            int hiF;
+            if (!ChartOption.IsAutoD(ax.maxD)) {
+                hiF = (int)(ax.maxD >= 0.0 ? ax.maxD * 1000.0 + 0.5
+                    : ax.maxD * 1000.0 - 0.5);
+            } else {
+                hiF = fMxX;
+            }
+            if (!ChartOption.IsAutoD(ax.minD) && !ChartOption.IsAutoD(ax.maxD)) {
+                ChartSpan fs2 = new ChartSpan();
+                fs2.lo = loF; fs2.hi = hiF;
+                fs2.ticks = ax.ticks < 1 ? 5 : ax.ticks;
+                return fs2;
+            }
+            ChartSpan fsn = Chart.NiceRange(loF, hiF, ax.scale);
+            ChartView.PinDeclaredF(ax, fsn);
+            return fsn;
         }
         int lo = Chart.ZeroAnchorLo(ax.scale, ax.min != ChartOption.Auto(), mn, mx);
         int hi = Chart.ZeroAnchorHi(ax.scale, ax.max != ChartOption.Auto(), lo, mx);
@@ -61,8 +122,37 @@ partial class ChartView {
     /// Y 定义域：同 ScatterRangeX（散点 Y 轴没有时间形态）。
     static ChartSpan ScatterRangeY(ChartOption o, List<ChartSeries> series, int i0, int i1) {
         int mn = 0; int mx = 0; int my = 0; int mY = 0;
-        ChartView.ScatterSpan(series, i0, i1, out mn, out mx, out my, out mY);
+        int fMnX = 0; int fMxX = 0; int fMnY = 0; int fMxY = 0;
+        ChartView.ScatterSpan(series, i0, i1, out mn, out mx, out my, out mY,
+                              out fMnX, out fMxX, out fMnY, out fMxY);
         ChartAxis ax = o.YAxis0();
+        // 小数 Y（B18）：同 ScatterRangeX 的 F 域管线（bubble-gradient
+        // 6.58..9.4、scatter-simple 全小数云）；整数路原样。
+        if (Chart.ScatterAxisFrac(series, false)) {
+            int loF;
+            if (!ChartOption.IsAutoD(ax.minD)) {
+                loF = (int)(ax.minD >= 0.0 ? ax.minD * 1000.0 + 0.5
+                    : ax.minD * 1000.0 - 0.5);
+            } else {
+                loF = fMnY;
+            }
+            int hiF;
+            if (!ChartOption.IsAutoD(ax.maxD)) {
+                hiF = (int)(ax.maxD >= 0.0 ? ax.maxD * 1000.0 + 0.5
+                    : ax.maxD * 1000.0 - 0.5);
+            } else {
+                hiF = fMxY;
+            }
+            if (!ChartOption.IsAutoD(ax.minD) && !ChartOption.IsAutoD(ax.maxD)) {
+                ChartSpan fs2 = new ChartSpan();
+                fs2.lo = loF; fs2.hi = hiF;
+                fs2.ticks = ax.ticks < 1 ? 5 : ax.ticks;
+                return fs2;
+            }
+            ChartSpan fs = Chart.NiceRange(loF, hiF, ax.scale);
+            ChartView.PinDeclaredF(ax, fs);
+            return fs;
+        }
         int lo = Chart.ZeroAnchorLo(ax.scale, ax.min != ChartOption.Auto(), my, mY);
         int hi = Chart.ZeroAnchorHi(ax.scale, ax.max != ChartOption.Auto(), lo, mY);
         ChartSpan auto = Chart.ScatterAutoRange(lo, hi);
@@ -121,6 +211,12 @@ partial class ChartView {
         int maxYN = ysp.hi;
         int xTicksAuto = xsp.ticks;
         int yTicksAuto = ysp.ticks;
+        // 小数轴（B18）：域为 ×1000 定点（F），点坐标同为定点——映射
+        // 走 g=1 的同单位线性式（ValueXF 的 g<=1 分支即 ValueX），
+        // 刻度标签 FracText 除回。散点轴没有逐轴 frac 标志，从系列
+        // 重扫（纯扫描，与 ScatterRangeX/Y 的分支同判）。
+        bool fracX = Chart.ScatterAxisFrac(o.series, true);
+        bool fracY = Chart.ScatterAxisFrac(o.series, false);
         // 时间轴的刻度/标签走 TimeTicks，ScatterRangeX 已把 ticks 归零。
         bool xTime = xTicksAuto == 0
             && o.XAxis0().type == ChartAxisType.Time;
@@ -130,8 +226,8 @@ partial class ChartView {
         // 过滤仍要有定义域，否则全部点被误判为界外）。
         int dLo = yLo;
         int dHi = maxYN;
-        if (o.rampLo != ChartOption.Auto()) { dLo = o.rampLo; }
-        if (o.rampHi != ChartOption.Auto()) { dHi = o.rampHi; }
+        if (o.rampLo != ChartOption.Auto()) { dLo = fracY ? o.rampLo * 1000 : o.rampLo; }
+        if (o.rampHi != ChartOption.Auto()) { dHi = fracY ? o.rampHi * 1000 : o.rampHi; }
         int dSpan = dHi - dLo;
         if (dSpan < 1) { dSpan = 1; }
         int xSpan = maxXN - xLo;
@@ -154,7 +250,8 @@ partial class ChartView {
         // ECharts yAxis.position："right" 把 y 刻度标签挂到绘图区
         // 右侧（dataRange1 原例）；Core/Hover 布局必须一致。
         bool yRight = o.yAxes.Count > 0 && o.yAxes[0].position == "right";
-        int yGut = Canvas.MeasureText(Convert.ToString(maxYN), axisFs) + app.Scale(12);
+        int yGut = Canvas.MeasureText(
+            fracY ? Chart.FracText(maxYN) : Convert.ToString(maxYN), axisFs) + app.Scale(12);
         int leftGut = yRight ? app.Scale(6) : yGut;
         int rightGut = yRight ? yGut : 0;
         int botGut = Canvas.FontHeight(axisFs) + app.Scale(8);
@@ -217,7 +314,8 @@ partial class ChartView {
         for (int k = 0; k <= yTicks; k = k + 1) {
             int gy = plotY + plotH - (k * plotH / yTicks);
             c.FillRect(plotX, gy, plotW, 1, sGrid.BgOr(0));
-            string vs = Convert.ToString(yLo + ySpan * k / yTicks);
+            string vs = fracY ? Chart.FracText(yLo + ySpan * k / yTicks)
+                : Convert.ToString(yLo + ySpan * k / yTicks);
             if (o.yAxes.Count > 0 && o.yAxes[0].labelFormatter.Length > 0) {
                 vs = o.yAxes[0].labelFormatter.Replace("{value}", vs);
             }
@@ -251,7 +349,8 @@ partial class ChartView {
                 int gx = plotX + k * plotW / xTicks;
                 // ECharts splitLine 横竖两向都有。
                 c.FillRect(gx, plotY, 1, plotH, sGrid.BgOr(0));
-                string xs = Convert.ToString(xLo + xSpan * k / xTicks);
+                string xs = fracX ? Chart.FracText(xLo + xSpan * k / xTicks)
+                    : Convert.ToString(xLo + xSpan * k / xTicks);
                 if (o.xAxes.Count > 0 && o.xAxes[0].labelFormatter.Length > 0) {
                     xs = o.xAxes[0].labelFormatter.Replace("{value}", xs);
                 }
@@ -334,30 +433,36 @@ partial class ChartView {
                     List<int> lx = new List<int>();
                     List<int> ly = new List<int>();
                     int j0 = i0;
+                    int xg = fracX ? 1 : s.pointG;
+                    int yg = fracY ? 1 : s.pointG;
                     while (j0 <= i1 && j0 < s.points.Count) {
                         lx.Add(Chart.ValueXF(plotX, plotW, xLo, maxXN,
-                            s.points[j0].x, s.pointG));
+                            s.points[j0].x, xg));
                         ly.Add(Chart.ValueYF(plotY, plotH, yLo, maxYN,
-                            s.points[j0].y, s.pointG));
+                            s.points[j0].y, yg));
                         j0 = j0 + 1;
                     }
                     c.DrawPolyline(lx, ly, Chart.FadeFocusColor(r, s.color),
                         app.Scale(2));
                 } else {
                     int j = i0;
+                    int xg = fracX ? 1 : s.pointG;
+                    int yg = fracY ? 1 : s.pointG;
                     while (j <= i1 && j < s.points.Count) {
                         int px = Chart.ValueXF(plotX, plotW, xLo, maxXN,
-                            s.points[j].x, s.pointG);
+                            s.points[j].x, xg);
                         int py = Chart.ValueYF(plotY, plotH, yLo, maxYN,
-                            s.points[j].y, s.pointG);
+                            s.points[j].y, yg);
                         int col = s.color;
                         if (s.points[j].color != 0) { col = s.points[j].color; }
                         if (ramp) {
                             // dataRange/色带按第三维 z（ECharts 多维 data
                             // 的末维，dataRange1 的 value[2]）映射；
                             // 未带 z 的点回落 y。
-                            int dv = Chart.PointV(s.points[j].z != 0
-                                ? s.points[j].z : s.points[j].y, s.pointG);
+                            int dv = fracY && s.points[j].z == 0
+                                ? s.points[j].y
+                                : Chart.PointV(s.points[j].z != 0
+                                    ? s.points[j].z : s.points[j].y, s.pointG);
                             if (dv < dLo) { dv = dLo; }
                             if (dv > dHi) { dv = dHi; }
                             col = Chart.RampAt(o.rampColors, (dv - dLo) * 1000 / dSpan);
@@ -380,8 +485,10 @@ partial class ChartView {
                             if (v > 0) { jr = v; }
                         }
                         if (!Chart.DRangeOk(app, o, o.iwid, dLo, dHi,
-                                Chart.PointV(s.points[j].z != 0
-                                    ? s.points[j].z : s.points[j].y, s.pointG))) {
+                                fracY && s.points[j].z == 0
+                                    ? s.points[j].y
+                                    : Chart.PointV(s.points[j].z != 0
+                                        ? s.points[j].z : s.points[j].y, s.pointG))) {
                             col = Chart.Rgb(204, 204, 204);
                         }
                         Chart.DrawSymbol(c, px, py, jr, shape, col, bCol, bW);
@@ -440,11 +547,13 @@ partial class ChartView {
         if (pps.Count > 0) {
             ChartSeries pb = pps[0];
             int pj = i0;
+            int pbxg = fracX ? 1 : pb.pointG;
+            int pbyg = fracY ? 1 : pb.pointG;
             while (pj <= i1 && pj < pb.points.Count) {
                 int pcx = Chart.ValueXF(plotX, plotW, xLo, maxXN,
-                    pb.points[pj].x, pb.pointG);
+                    pb.points[pj].x, pbxg);
                 int pcy = Chart.ValueYF(plotY, plotH, yLo, maxYN,
-                    pb.points[pj].y, pb.pointG);
+                    pb.points[pj].y, pbyg);
                 int pr = pb.points[pj].sizeSet
                     ? app.Scale(pb.points[pj].size) : rad;
                 if (pr < 1) { pr = 1; }
@@ -593,6 +702,9 @@ partial class ChartView {
         // min/max、时间轴）：两套各写一遍就会命中错位。
         ChartSpan xsp = ChartView.ScatterRangeX(o, o.series, i0, i1);
         ChartSpan ysp = ChartView.ScatterRangeY(o, o.series, i0, i1);
+        // 与 DrawScatterCore 同判（B18）：F 域时映射走 g=1 同单位式。
+        bool fracX = Chart.ScatterAxisFrac(o.series, true);
+        bool fracY = Chart.ScatterAxisFrac(o.series, false);
         int xLo = xsp.lo;
         int yLo = ysp.lo;
         int maxXN = xsp.hi;
@@ -609,7 +721,8 @@ partial class ChartView {
         // ECharts yAxis.position："right" 把 y 刻度标签挂到绘图区
         // 右侧（dataRange1 原例）；Core/Hover 布局必须一致。
         bool yRight = o.yAxes.Count > 0 && o.yAxes[0].position == "right";
-        int yGut = Canvas.MeasureText(Convert.ToString(maxYN), axisFs) + app.Scale(12);
+        int yGut = Canvas.MeasureText(
+            fracY ? Chart.FracText(maxYN) : Convert.ToString(maxYN), axisFs) + app.Scale(12);
         int leftGut = yRight ? app.Scale(6) : yGut;
         int rightGut = yRight ? yGut : 0;
         int botGut = Canvas.FontHeight(axisFs) + app.Scale(8);
@@ -658,11 +771,13 @@ partial class ChartView {
                 ChartSeries s2 = o.series[r2];
                 if (!s2.hidden) {
                     int j2 = i0;
+                    int xg = fracX ? 1 : s2.pointG;
+                    int yg = fracY ? 1 : s2.pointG;
                     while (j2 <= i1 && j2 < s2.points.Count) {
                         int px2 = Chart.ValueXF(plotX, plotW, xLo, maxXN,
-                            s2.points[j2].x, s2.pointG);
+                            s2.points[j2].x, xg);
                         int py2 = Chart.ValueYF(plotY, plotH, yLo, maxYN,
-                            s2.points[j2].y, s2.pointG);
+                            s2.points[j2].y, yg);
                         int ddx = mx - px2;
                         int ddy = my - py2;
                         int d2 = ddx * ddx + ddy * ddy;
@@ -696,9 +811,9 @@ partial class ChartView {
                     ChartSeries bs = o.series[bestS];
                 ChartPoint bp = bs.points[bestJ];
                 int pxHit = Chart.ValueXF(plotX, plotW, xLo, maxXN,
-                    bp.x, bs.pointG);
+                    bp.x, fracX ? 1 : bs.pointG);
                 int pyHit = Chart.ValueYF(plotY, plotH, yLo, maxYN,
-                    bp.y, bs.pointG);
+                    bp.y, fracY ? 1 : bs.pointG);
                 ChartElementType pointType = bs.type == ChartType.Line
                     ? ChartElementType.LinePoint : ChartElementType.ScatterPoint;
                 string pointName = "#" + Convert.ToString(bestJ + 1);
