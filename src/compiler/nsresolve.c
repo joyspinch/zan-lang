@@ -427,7 +427,7 @@ static void resolve_static_receiver(nr_ctx_t *c, zan_ast_node_t *id,
     nr_type_t *t = NULL;
     /* Same-namespace first, the global namespace included -- the same rule
      * resolve_ref applies to type positions. A declaration at global scope
-     * must win over an import, or `App.OnLoad(form)` in the .zform-generated
+     * must win over an import, or `App.OnLoad(form)` in the design-generated
      * global `partial class App` resolves through `using Gui;` to Gui.App and
      * the binder reports `'Gui_App' has no member 'OnLoad'`. join_ns returns
      * the bare name for an empty ctx_ns, so this covers both scopes. */

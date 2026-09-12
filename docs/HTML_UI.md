@@ -148,12 +148,16 @@ P0-P4 节）。CSS 支持面（含 grid/flex/float）见 TASKS.md A16。
   JoinOpts 同约定）。
 
 设计器侧 API：`Designer.SaveHtml()` / `LoadHtmlText(text)`；IDE 的 .html
-设计稿标签页（body 有标记）自动进设计器并回存 HTML。`.zform` JSON 仍作为
-内部表示存在（撤销快照、JSON 抽屉、LSP 供数），不再手写。
+设计稿标签页（body 有标记）自动进设计器并回存 HTML。JSON 文档模型仍是
+内部表示（撤销快照、JSON 抽屉、LSP 供数），不落盘、不手写。
 
 P7d 起全仓库窗口声明只有 .html 一种形态：templates/gui 12 份与 IDE 自用
 31 份设计稿均已迁移（模型级等价校验），模板/新建文件/编译发现全部以
-.html 为入口；.zform 编译通道保留，只为打开旧用户项目。
+.html 为入口。P8-4 起 .zform 编译通道删除：zanc 对 .zform 输入报定向
+错误（"the legacy .zform design format is no longer supported"），旧项目
+把设计文档转成 .html（`DesignerHtml.FromJsonDoc` 是规范转换器）后编译；
+GenForm 只认 .html 设计稿，`.zscene`（场景）与 `.zcomp`（用户组件）不受
+影响。
 
 ## 字段内联 style（P7b）
 

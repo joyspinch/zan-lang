@@ -779,16 +779,16 @@ if(NOT WIN32)
 endif()
 add_test(NAME unit_json_trailing COMMAND zan_json_trailing_test)
 
-# A .zform node must name a real Zan Control class. Invalid kinds fail at
+# A design doc node must name a real Zan Control class. Invalid kinds fail at
 # formgen time instead of silently becoming a Panel or Label.
-add_test(NAME diag_invalid_zform_kind
+add_test(NAME diag_invalid_design_kind
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
-    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/invalid_zform_kind.zform
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_invalid_zform_kind${_exe_ext}
-    "-DEXPECT_REGEX=invalid_zform_kind\\.zform: \.zform field 0 requires a valid Zan Control kind"
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/invalid_design_kind.html
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_invalid_design_kind${_exe_ext}
+    "-DEXPECT_REGEX=invalid_design_kind\.html: design field 0 requires a valid Zan Control kind"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
-set_tests_properties(diag_invalid_zform_kind PROPERTIES TIMEOUT 60)
+set_tests_properties(diag_invalid_design_kind PROPERTIES TIMEOUT 60)
 
 # A class that declares constructors has no implicit parameterless one, so
 # `new T()` on it has nothing to run and irgen would hand back a zero-filled
@@ -1121,17 +1121,17 @@ add_test(NAME diag_unresolved_call_member_chain
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_unresolved_call_member_chain PROPERTIES TIMEOUT 60)
 
-# A `"role": "control"` .zform is an embeddable Control, not a window: it has
+# A `"role": "control"` .html design doc is an embeddable Control, not a window: it has
 # no Main/Show, so naming one as the project entry has to fail at formgen time
 # instead of linking a program with no entry point.
-add_test(NAME diag_control_zform_entry
+add_test(NAME diag_control_design_entry
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
-    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/control_zform_entry.zform
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_control_zform_entry${_exe_ext}
-    "-DEXPECT_REGEX=control_zform_entry\\.zform: a \\.zform with .role.: .control. cannot be the project entry"
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/control_design_entry.html
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_control_design_entry${_exe_ext}
+    "-DEXPECT_REGEX=control_design_entry\.html: a design document with .role.: .control. cannot be the project entry"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
-set_tests_properties(diag_control_zform_entry PROPERTIES TIMEOUT 60)
+set_tests_properties(diag_control_design_entry PROPERTIES TIMEOUT 60)
 
 # A member name denotes storage (field/property) or code (method), never both:
 # `Class.Name` in a value context reads the slot, so a same-named method is
@@ -2059,7 +2059,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_virtuallist${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
-  # The New Project wizard rescales a template's .zform designs to the chosen
+  # The New Project wizard rescales a template's .html designs to the chosen
   # device. Retargeting must touch geometry only: an earlier round-trip through
   # a geometry-only model dropped every control's "kind", so a scaffolded
   # project came out with all-Input controls and would not compile.
@@ -2629,25 +2629,11 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_exportui${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
-  # The property protocol (Props() specs -> Control.GetProp/SetProp) is what
-  # the designer and the serializer talk to, and it is pure computation.
-  # A `"role": "control"` .zform must build an embeddable Control: the designed
-  # tree lands under the control itself and the designer's `label` reaches every
-  # control publishing a `text` property (containers keep it as a design note).
-  add_test(NAME conformance_gui_zform_control
-    COMMAND ${CMAKE_COMMAND}
-      -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/zform_control_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/zform_control.zform;--auto-stdlib${_gui_driver_tail}"
-      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_zform_control.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_zform_control${_exe_ext}
-      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
-
   # WEB_GUI_ROADMAP P7a: the designer's HTML storage format is exercised by
   # tests/conformance/designer_html.zan (codec roundtrip + designer bridge),
   # auto-registered by the conformance glob above; the compile-time channel
-  # (.html design doc -> the same GenForm projection as .zform) by the case
-  # below, which reuses the zform_control golden byte for byte.
+  # (.html design doc -> GenForm projection; the legacy .zform channel
+  # was removed in P8-4) by the case below, reusing the same golden byte for byte.
   add_test(NAME conformance_gui_zform_html
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
@@ -2664,7 +2650,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/zform_grid_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/zform_grid.zform;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/zform_grid.html;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_zform_grid.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_zform_grid${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2682,7 +2668,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
 
   # FormBuilder.Build runtime path lock: flow cells, caption wrapping,
   # self-labeled Checkbox defOn, container kids actually built (this path
-  # is what Nav outlets and runtime .zform loading ride on).
+  # is what Nav outlets and runtime form-doc loading ride on).
   add_test(NAME conformance_gui_formbuild
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
@@ -2712,7 +2698,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/compref_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/compref_app.zform;${CMAKE_SOURCE_DIR}/tests/gui/components/BadgeCard.zcomp;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/compref_app.html;${CMAKE_SOURCE_DIR}/tests/gui/components/BadgeCard.zcomp;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_compref.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_compref${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2741,7 +2727,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/batchjob_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/batchjob_app.zform;${CMAKE_SOURCE_DIR}/tests/gui/components/BatchJobProgress.zcomp;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/batchjob_app.html;${CMAKE_SOURCE_DIR}/tests/gui/components/BatchJobProgress.zcomp;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_batchjob.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_batchjob${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)

@@ -2716,7 +2716,7 @@ int main(int argc, char **argv) {
      * outside the stdlib-discovery scope) can root driver dirs at
      * <stdlib_root>/<module>/drivers/<target>/. Empty when no stdlib is used. */
     char resolved_stdlib_root[1024] = {0};
-    char **design_outs = NULL;   /* translated .zform/.zscene texts, per input */
+    char **design_outs = NULL;   /* translated .html/.zscene texts, per input */
     size_t design_count = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -2903,6 +2903,21 @@ int main(int argc, char **argv) {
         fprintf(stderr, "error: no input file\n");
         return 1;
     }
+    /* The legacy .zform design format was removed (P8 legacy cut): the
+     * designer stores .html and zanc projects .html design docs. Fail with
+     * a targeted message instead of parsing the JSON as Zan source. */
+    for (int fi = 0; fi < input_count; fi++) {
+        size_t pn = strlen(input_files[fi]);
+        if (pn > 6 && strcmp(input_files[fi] + pn - 6, ".zform") == 0) {
+            fprintf(stderr,
+                    "error: '%s': the legacy .zform design format is no "
+                    "longer supported; convert the document to an .html "
+                    "design doc and recompile\n",
+                    input_files[fi]);
+            return 1;
+        }
+    }
+
     input_file = input_files[0];
     resolve_package_project_root(input_file);
     for (int fi = 0; fi < input_count; fi++) {
@@ -3029,7 +3044,7 @@ int main(int argc, char **argv) {
          * Resolve to a fixpoint because a pulled-in module may itself `using`
          * another namespace (e.g. System.Net.WebSocket -> System.Text), so
          * re-scan every included file until nothing new is added. */
-        /* Design documents (.zform/.zscene) are translated by the Zan-scripted
+        /* Design documents (.html/.zscene) are translated by the Zan-scripted
          * generators (stdlib/System/Compiler/ZanGen.zan) before the using-scan:
          * the synthetic source carries the `using System/Gui/...` directives
          * the auto-stdlib pull-in needs, and one generator run covers every
@@ -3086,11 +3101,12 @@ int main(int argc, char **argv) {
                 size_t slen3 = 0;
                 char *src3 = read_file(input_files[fi], &slen3);
                 if (!src3) continue;
-                /* A .zform input is a JSON design document, so the raw text has
+                /* A design input is a JSON model (projected from the
+                 * .html design doc), so the raw text has
                  * no `using` directives to scan. It was translated up front
                  * (design_outs) into a synthetic `partial class` with
                  * `using System/Gui/...`, so the auto-stdlib pull-in covers the
-                 * widgets the design uses even when the .zform is compiled
+                 * widgets the design uses even when the design doc is compiled
                  * without its sibling .zan. */
                 char *owned = NULL;
                 if ((size_t)fi < design_count && design_outs[fi]) {
@@ -3120,7 +3136,6 @@ int main(int argc, char **argv) {
     size_t source_len;
     char *source = read_file(input_file, &source_len);
     if (!source) return 1;
-
     /* dump tokens mode (first file only) */
     if (do_dump_tokens) {
         dump_tokens(source, source_len, input_file);
@@ -3134,7 +3149,8 @@ int main(int argc, char **argv) {
 
     /* Parse every input file and merge their declarations into a single
      * compilation unit so that names resolve across files (multi-file
-     * compilation: zanc a.zan b.zan ... -o out). A .zform input is a visual
+     * compilation: zanc a.zan b.zan ... -o out). A design input (.html
+     * design doc) is a visual
      * design document: it is translated first (formgen) to a synthetic
      * `partial class` -- typed widget fields, __BuildForm, __WireForm and
      * Main -- which is then parsed and merged exactly like a source file. */
@@ -3169,7 +3185,7 @@ int main(int argc, char **argv) {
             }
         }
         {
-            /* A .zform/.zscene input is a visual design document: it was
+            /* A .html/.zscene design input is a visual design document: it was
              * translated up front (design_outs) to a synthetic `partial
              * class` -- typed widget fields, __BuildForm, __WireForm and
              * Main -- which is then parsed and merged exactly like a source
@@ -6835,10 +6851,9 @@ int main(int argc, char **argv) {
               if (base2 > base) base = base2;
               base = base ? base + 1 : input_file;
               snprintf(pkg, sizeof(pkg), "dev.zan.%s", base);
-              /* .zan or .zform (designer entry) suffix off */
+              /* .zan (designer entry) suffix off */
               { char *dot = strrchr(pkg, '.');
-                if (dot && (strcmp(dot, ".zan") == 0 ||
-                            strcmp(dot, ".zform") == 0)) *dot = 0; }
+                if (dot && strcmp(dot, ".zan") == 0) *dot = 0; }
               /* package segments must be [a-zA-Z0-9_]; fold the rest */
               for (char *c = pkg; *c; c++) {
                   if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z')
@@ -6855,8 +6870,7 @@ int main(int argc, char **argv) {
               base = base ? base + 1 : input_file;
               snprintf(lbl, sizeof(lbl), "%s", base);
               { char *d2 = strrchr(lbl, '.');
-                if (d2 && (strcmp(d2, ".zan") == 0 ||
-                           strcmp(d2, ".zform") == 0)) *d2 = 0; }
+                if (d2 && strcmp(d2, ".zan") == 0) *d2 = 0; }
             }
             /* bundled driver libs to carry inside lib/<abi>/ */
             char *extras[64]; int nextra = 0;

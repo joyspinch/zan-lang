@@ -2345,3 +2345,29 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
   control/zform_grid 直编失败系并发会话在途 GenForm/checker（定向
   stash A/B 实证与本次改动无关；测试文档只用 Button/Card/Label/
   Panel）。
+
+* **P8-4 .zform 遗留链删除：设计文档只留 .html 一种形态**
+  （2026-09-13）：P7d 全仓库迁移 .html 时刻意保留的 .zform 编译通道
+  （只为打开旧用户项目）按 P8 精简期决定砍除——不迁移、定向报错。
+  C 侧：genrun.c `zan_is_design_path` 删 .zform 臂（.zscene/.html/
+  .htm 不变）；main.c 输入扫描对 .zform 报定向错误（"convert the
+  document to an .html design doc and recompile"），APK 打包的
+  suffix-strip 收敛为只剥 .zan；genrun.h/nsresolve.c/genrun.c 注释
+  同步去 .zform 表述。Zan 侧：GenForm `Translate` 删 isZform 分派
+  臂（只认 .html/.htm 设计稿）、名称回落 strip 删 .zform 臂、8 处
+  "zform field" 文案改 "design field"，头部注明 `DesignerHtml.
+  FromJsonDoc` 是 .zform→.html 的规范转换器（模型级保真）。测试与
+  数据：gui 侧 grid/compref_app/batchjob_app 三份 .zform 经
+  FromJsonDoc 自己转换成 .html 入库（非手写，金样逐字 MATCH 证明
+  保真；zform_control.html P7d 已在），diag 两份 .zform 同转并改名
+  invalid_design_kind/control_design_entry，CMakeLists 删
+  conformance_gui_zform_control 注册块、改名两 diag 用例并更新
+  EXPECT_REGEX（含 .role. 键面），孤儿 datepicker_smoke.zform 一并
+  删（零引用）；docs/HTML_UI.md 格式节写明通道已删与转换指引。验证
+  （stdlib 副本 --stdlib-path 直编，绕开并发在途 Chart.zan 半成品）
+  ：zform_html/zform_grid/compref/batchjob/designer_html/css_test
+  六金样 MATCH；diag 两例错误正则过；.zform 拒绝诊断实测打印；
+  gallery 320 文件类型检查过。IDE 内部 ~135 处 .zform 字面引用
+  （Workspace/ZanIDE/CodeNav 等）是 IDE 自身功能臂（打开旧项目、
+  JSON 抽屉、撤销快照），不属编译通道，留独立提交清扫（需
+  build_ide.ps1 完整配方验证）。

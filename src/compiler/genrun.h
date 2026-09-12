@@ -41,7 +41,7 @@ int zan_gen_ensure(const char *stdlib_root, char *exe, size_t exe_size);
  * success, -1 on failure (message on stderr). */
 int zan_gen_run(const char *exe, const char *meta_path, const char *out_path);
 
-/* Translate every .zform/.zscene design input in one generator run (the
+/* Translate every .html/.zscene design input in one generator run (the
  * "design" mode request) and return a malloc'd array of `count` translated
  * source texts; entries for non-design files are NULL and ownership of every
  * entry passes to the caller (one free() each, plus free() on the array).

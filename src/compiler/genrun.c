@@ -608,14 +608,13 @@ int zan_gen_run(const char *exe, const char *meta_path, const char *out_path) {
 
 static bool zan_is_design_path(const char *p) {
     size_t n = strlen(p);
-    return (n > 6 && strcmp(p + n - 6, ".zform") == 0) ||
-           (n > 7 && strcmp(p + n - 7, ".zscene") == 0) ||
+    return (n > 7 && strcmp(p + n - 7, ".zscene") == 0) ||
            (n > 5 && strcmp(p + n - 5, ".html") == 0) ||
            (n > 4 && strcmp(p + n - 4, ".htm") == 0);
 }
 
 /* A saved user component (designer "save as component"): pure design data
- * the generators expand into every referencing .zform. Not a translatable
+ * the generators expand into every referencing design doc. Not a translatable
  * design document itself, and never parsed as Zan source. */
 bool zan_is_zcomp_path(const char *p) {
     size_t n = strlen(p);
@@ -694,9 +693,9 @@ char **zan_gen_design(const char *stdlib_root, const char *const *paths,
             return NULL;
         }
         /* A design document is JSON, and JSON must not start with a byte order
-         * mark: an editor that saves the .zform as "UTF-8 with BOM" (Notepad,
-         * PowerShell's Set-Content) would otherwise make the generator fail
-         * with "cannot translate design document". Drop it. */
+         * mark: an editor that saves the design doc as "UTF-8 with BOM"
+         * (Notepad, PowerShell's Set-Content) would otherwise make the
+         * generator fail with "cannot translate design document". Drop it. */
         const char *body = text;
         if (tlen >= 3 && (unsigned char)body[0] == 0xEF &&
             (unsigned char)body[1] == 0xBB && (unsigned char)body[2] == 0xBF)

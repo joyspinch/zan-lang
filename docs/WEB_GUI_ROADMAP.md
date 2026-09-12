@@ -20,7 +20,7 @@
 | P5 | HTML 声明层：Html.zan parser、tag→控件映射、data-on-* 事件、data-bind、style/link 接线、GenHtml 编译期生成器、App.LoadHtml()、oracle 闭环 | ✅ 2026-09-12 | 09d73369 运行时 + dc3b55f9 生成器；oracle html 13 盒（tol 3）；编译期建树与运行时解析 13 盒 diff 全等；主文档 docs/HTML_UI.md |
 | P6 | overflow 滚动：auto/scroll 真语义（clip+偏移+滚动条） | ✅ 2026-09-12 | oracle scroll 16 盒全部 0px（auto/hidden/scroll 三态、程序滚动、钳制、嵌套组合）；UiDriver 实机滚轮验证（注入滚轮→子树精确平移） |
 | P7 | 设计器 + HUD：存取格式 = .html、Inspector CSS 编辑、拖拽翻译 CSS、游戏窗口层嵌入帧循环、IDE 自用窗体重写 | ✅ 2026-09-12 | P7a ✅：DesignerHtml 编解码器全键往返、GenForm .html 设计稿投影（与 .zform 同一生成）、生成器缓存键全 stdlib 哈希（genrun.c）、Designer.SaveHtml/LoadHtmlText 桥、IDE .html 设计稿九处接线；P7b ✅：字段内联 style 通道（SetProp("style")→ApplyInline，FormField.styleText，Inspector STYLE 声明行编辑，DesignerHtml style 属性互通，GenForm/FormBuilder 同落点；布局键让位设计几何记台账）；P7d ✅（模板+IDE 43 份 .zform 全转 .html，模型级等价校验，引用全翻转，.zform 编译通道保留给旧项目）；P7c ✅：游戏 HUD 帧内接入实测（游戏=Gui 同引擎不建宿主；clean/dirty avg 3ms、max 23ms，预算 16.6ms；空闲 120 拍仅 3 帧；像素级门控证据；台账：流式子元素 % 宽未生效顺延 P8）；LSP 补 .html 设计稿索引通道（2227fab0） |
-| P8 | 组件精简：% 尺寸修复、属性面生成化、复合控件声明化重组、legacy API 删除 | 🚧 2026-09-12 | % 尺寸修复 ✅（下详）；其余进行中 |
+| P8 | 组件精简：% 尺寸修复、属性面生成化、复合控件声明化重组、legacy API 删除 | 🚧 2026-09-12 | % 尺寸修复 ✅（下详）；legacy 删除 ✅：P8-4 .zform 编译通道删除（C 侧 `zan_is_design_path` 删臂 + main.c 定向拒绝诊断，GenForm 只认 .html，4 份测试 .zform 经 `DesignerHtml.FromJsonDoc` 保真转 .html 入库；IDE 内部 .zform 功能臂清扫留独立提交）；其余进行中 |
 
 ## 每期验收纪律
 
