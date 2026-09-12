@@ -3097,6 +3097,21 @@ add_test(NAME diag_readonly_property_write
 set_tests_properties(diag_readonly_property_write PROPERTIES
   WILL_FAIL TRUE TIMEOUT 60)
 
+# The same initializer check must cover the factory-continuation shape
+# (`Maker.New() { ... }`), whose members are named without a receiver scope:
+# the unknown member and the getter-only write both used to pass silently.
+add_test(NAME diag_factory_initializer_member
+  COMMAND zanc ${CMAKE_SOURCE_DIR}/tests/diag/factory_initializer_member.zan
+    -o ${CMAKE_BINARY_DIR}/diag_factory_initializer_member${_exe_ext})
+set_tests_properties(diag_factory_initializer_member PROPERTIES
+  WILL_FAIL TRUE TIMEOUT 60)
+
+add_test(NAME diag_factory_initializer_readonly
+  COMMAND zanc ${CMAKE_SOURCE_DIR}/tests/diag/factory_initializer_readonly.zan
+    -o ${CMAKE_BINARY_DIR}/diag_factory_initializer_readonly${_exe_ext})
+set_tests_properties(diag_factory_initializer_readonly PROPERTIES
+  WILL_FAIL TRUE TIMEOUT 60)
+
 # An `init` accessor is a setter restricted to object initialization; a plain
 # `obj.Prop = v` after construction must be a compile error.
 add_test(NAME diag_init_only_write

@@ -183,6 +183,18 @@ description: zanc 编译器内部（parser/checker/irgen）的实测定式与坑
 - **本类一个构造函数都没有时 `new C(args)` 静默丢实参**（`irgen_expr.c:7281-7287` 的
   诊断以 `type_has_ctor()` 为门，无 ctor 反而不报）→ 对象只用字段初始化器，args 不
   求值。探针 `_scratch/audit2/newargs.zan`。
+- **工厂延续初始化器 `Factory() { M = v }` 的成员检查曾被整段跳过（A89，2026-09-13
+  已修）**：call_init 形态没有 type 节点（`new_expr.type == NULL`），checker 先
+  `type = check_expr(call_init)` 拿到工厂返回类型，后面又无条件
+  `resolve_type(new_expr.type)`——NULL 进去 type_error 出来，把已算好的类型冲掉，
+  共享初始化器循环的 `type && type->sym` 门恒假：no-setter / 赋值兼容 / 成员存在
+  **三检查全部静默**（`Maker.New() { tag = "字符串" }` 塞 int 字段、`{ nosuch = 5 }`
+  都编译通过，运行期 `if (!msym) continue` 整体丢写）。**为什么**：给表达式分支补
+  "后置统一 resolve" 时会吃掉前面分支已算好的类型——新增 AST 形态要么 early-return，
+  要么用形态旗标门住 resolve/ctor 检查。诊断点在 `checker.c` AST_NEW_EXPR +
+  `factory_init` 旗标；合法糖 `Children = { a, b }`（AST_COLL_INIT）对 getter-only
+  成员豁免（读成员逐个 Add，不是写），修检查时勿误伤。档
+  `tests/diag/factory_initializer_{member,readonly}.zan`。
 - **审计纪律（本轮两条代理结论被证伪，别再登记）**：① 「`Task.Delay(long.MaxValue)`
   有符号溢出→立即触发」不成立——探针 `delaymax2.zan` 打印 start 后睡死，5s 超时仍未醒；
   ② 「`irgen_emit.c` 的 `fields[32]/names[32]` 缓冲区溢出」不成立——`:1802-1803`、

@@ -2465,14 +2465,28 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             }
             return c->binder->type_error;
         }
-        type = zan_binder_resolve_type(c->binder, expr->new_expr.type);
-        /* `new byte[256]` parses the element type with is_array set, so the
-         * expression's type is the array of it, not the scalar element. */
-        if (expr->new_expr.is_array && type && type->kind != TYPE_ERROR &&
-            type->kind != TYPE_ARRAY)
-            type = zan_binder_make_array_type(c->binder, type);
-        check_generic_constraints(c, type, expr->loc);
-        check_ctor_available(c, type, expr);
+        /* The member-write tail of an initializer is validated against the
+         * built object's type; that check lives inside the loop further down.
+         * A factory continuation carries its tail in arg_inits while the type
+         * comes from the call, so the loop has to run for that shape too --
+         * before, it only ran for `new T { ... }` and a factory's writes were
+         * never checked at all: an unknown member was dropped on the floor and
+         * a getter-only property silently ignored instead of reporting "has no
+         * setter". No constructor arguments are involved there, so every entry
+         * is a write. */
+        bool factory_init = expr->new_expr.call_init != NULL;
+        if (!factory_init) {
+            type = zan_binder_resolve_type(c->binder, expr->new_expr.type);
+            /* `new byte[256]` parses the element type with is_array set, so the
+             * expression's type is the array of it, not the scalar element. */
+            if (expr->new_expr.is_array && type && type->kind != TYPE_ERROR &&
+                type->kind != TYPE_ARRAY)
+                type = zan_binder_make_array_type(c->binder, type);
+            check_generic_constraints(c, type, expr->loc);
+            /* the object comes from the call otherwise, so there is no
+             * constructor of this expression to check */
+            check_ctor_available(c, type, expr);
+        }
         /* `new List<T>(src)` with a single List-typed argument is the copy
          * constructor. Historically every argument was silently read as a
          * collection-initializer item, so `new List<T>(other)` compiled to a
@@ -2540,6 +2554,16 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                     ? arg->coll_init.name
                     : arg->binary.left->ident.name;
                 zan_symbol_t *field = checker_find_field(type->sym, mname);
+                /* A factory continuation names the member without a receiver
+                 * scope to resolve it against, so an unknown name was dropped
+                 * silently; the `new T { .. }` shape only survives because its
+                 * ctor check rejects the unknown as a stray argument. Say it. */
+                if (!field && factory_init) {
+                    zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
+                                  "'%s' has no member '%.*s'",
+                                  type_name(type), (int)mname.len, mname.str);
+                    continue;
+                }
                 if (field) {
                     /* a getter-only property has no setter to dispatch to,
                      * except a member collection initializer, which never
