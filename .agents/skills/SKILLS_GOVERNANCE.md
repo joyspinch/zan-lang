@@ -24,6 +24,16 @@
 | server-db-design | SQL 专属数据层细则 |
 | zan-compiler-internals | 编译器内部契约（改 src/compiler 才触发） |
 
+## 文档与 skill 的边界（HTML/设计器等声明层不新建 skill）
+
+HTML 声明层（`App.LoadHtmlWith`/GenHtml 编译期展开/`data-on-*` 协议/
+tag→控件映射/空白语义/设计器 .zform P7a、P7b 字段内联 style）的能力
+全集与差异台账在**仓库文档** `docs/HTML_UI.md`（208 行，随代码更新），
+布局语义在 `docs/WEB_GUI_ROADMAP.md`；skill 侧只在 gui-design 的
+`references/css-dialect.md` 留"HTML 声明窗口"一节摘要与指针。
+理由：docs 跟代码同仓库同提交，是能力面的权威；skill 只放"写界面时
+要遵守的规范"。能力清单在 docs、行为规范在 skill，两边不重复维护。
+
 ## 已执行的历史处置（2026-09）
 
 - 删除 11 个：testing-* 7 个（实机验证仪式，机器专属内容混入，可迁移规则
