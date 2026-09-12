@@ -1,5 +1,6 @@
 using System;
 using System.Json;
+using System.Text;
 using Gui;
 
 namespace Gui.Component.Chart;
@@ -2539,6 +2540,34 @@ class ChartSeries {
 /// 一个坐标轴（ECharts xAxis/yAxis 条目）。分类轴携带其
 /// 标签；数值轴携带可选固定范围（ChartOption.Auto()
 /// 从数据推导）和刻度数。
+class ChartBreak {
+    // ECharts axis.breaks 一项（axisCommonTypes.ts AxisBreakOption）：
+    // [start,end] 是数据空间声明域（time 轴 = epoch 毫秒），gap 是断带
+    // 占据的像素份额——'1.5%' 字符串 = tpPrct（占比），数值 = tpAbs
+    // （绝对数据单位）。gapReal 在量程定型后解算（breakImpl.ts
+    // updateAxisBreakGapReal）：占比断带按 Σprct / (1-Σprct) × S 分摊，
+    // S = 外层数据跨度 − Σ(断带数据跨度)。
+    double startD;   // epoch-ms / 数据值（double：类目序号也可能小数）
+    double endD;
+    bool gapPrct;    // gapParsed.type == 'tpPrct'
+    double gapVal;   // prct = 0..1；abs = 数据单位
+
+    static ChartBreak Of() {
+        ChartBreak b = new ChartBreak();
+        b.startD = 0.0; b.endD = 0.0;
+        b.gapPrct = false; b.gapVal = 0.0;
+        return b;
+    }
+
+    static ChartBreak Clone(ChartBreak src) {
+        if (src == null) { return null; }
+        ChartBreak b = new ChartBreak();
+        b.startD = src.startD; b.endD = src.endD;
+        b.gapPrct = src.gapPrct; b.gapVal = src.gapVal;
+        return b;
+    }
+}
+
 class ChartAxis {
     ChartAxisType type;
     string title;     // 轴名称（ECharts name），"" = 无
@@ -2614,6 +2643,15 @@ class ChartAxis {
     bool minorTickShow;
     int minorTickSplitNumber;   // 缺省 5（axisDefault.ts:194）
     bool minorSplitLineShow;
+    // ECharts axis.breaks / axis.breakArea（axisCommonTypes.ts:130-143）：
+    // 数值/时间轴断带（类目轴不支持，Axis.ts 声明即报错——解析照收、
+    // 渲染侧按轴类型忽略）。gapReal 在量程定型后解算。
+    List<ChartBreak> breaks;
+    bool breakShow;          // breakArea.show（缺省 true）
+    int breakAmp;            // zigzagAmplitude（缺省 4）
+    int breakBorderColor;    // itemStyle.borderColor；0 = 主题 #b7b9be
+    int breakFillColor;      // itemStyle.color；0 = 白
+    int breakOpacityX10;     // itemStyle.opacity ×10（-1 = 未声明 → 6）
     List<string> categories;
 
     /// 分类轴工厂：携带标签列表，无网格线，标签自动防重叠。
@@ -2642,6 +2680,12 @@ class ChartAxis {
         a.minorTickShow = false;
         a.minorTickSplitNumber = 5;
         a.minorSplitLineShow = false;
+        a.breaks = new List<ChartBreak>();
+        a.breakShow = true;
+        a.breakAmp = 4;
+        a.breakBorderColor = 0;
+        a.breakFillColor = 0;
+        a.breakOpacityX10 = 0 - 1;
         // 类目轴：axisLine.show 官方缺省 true、axisLine.onZero 'auto'
         // （axisDefault.ts:162 / :66）。
         a.axisLineShow = 1;
@@ -2687,6 +2731,12 @@ class ChartAxis {
         a.minorTickShow = false;
         a.minorTickSplitNumber = 5;
         a.minorSplitLineShow = false;
+        a.breaks = new List<ChartBreak>();
+        a.breakShow = true;
+        a.breakAmp = 4;
+        a.breakBorderColor = 0;
+        a.breakFillColor = 0;
+        a.breakOpacityX10 = 0 - 1;
         // 数值轴：axisLine.show 官方缺省 'auto'（axisDefault.ts:176，
         // valueAxis 覆盖），故记 -1；onZero 仍是 'auto'。
         a.axisLineShow = 0 - 1;
@@ -2757,6 +2807,17 @@ class ChartAxis {
         a.minorTickShow = src.minorTickShow;
         a.minorTickSplitNumber = src.minorTickSplitNumber;
         a.minorSplitLineShow = src.minorSplitLineShow;
+        a.breaks = new List<ChartBreak>();
+        if (src.breaks != null) {
+            for (int bi = 0; bi < src.breaks.Count; bi = bi + 1) {
+                a.breaks.Add(ChartBreak.Clone(src.breaks[bi]));
+            }
+        }
+        a.breakShow = src.breakShow;
+        a.breakAmp = src.breakAmp;
+        a.breakBorderColor = src.breakBorderColor;
+        a.breakFillColor = src.breakFillColor;
+        a.breakOpacityX10 = src.breakOpacityX10;
         a.reversed = src.reversed; a.ticks = src.ticks; a.showGrid = src.showGrid;
         a.splitArea = src.splitArea;
         a.labelRotate = src.labelRotate; a.labelInterval = src.labelInterval;
@@ -6872,6 +6933,83 @@ class ChartOption {
             JsonValue lstyle = aln.Get("lineStyle");
             if (lstyle != null && lstyle.IsObject()) {
                 a.axisLineColor = ChartOption.ParseColor(lstyle.Get("color"), a.axisLineColor);
+            }
+        }
+        // ---- axis.breaks / breakArea（scale/breakImpl.ts parseAxisBreakOption +
+        // axisDefault.ts:123-138）----
+        JsonValue bkv = v.Get("breaks");
+        if (bkv != null && bkv.IsArray()) {
+            for (int bi = 0; bi < bkv.Count(); bi = bi + 1) {
+                JsonValue bo = bkv.At(bi);
+                if (bo == null || !bo.IsObject()) { continue; }
+                JsonValue bsv = bo.Get("start");
+                JsonValue bev = bo.Get("end");
+                if (bsv == null || bev == null) { continue; }
+                // isExpanded（点击展开态）项直接跳过（parseAxisBreakOption:537）。
+                if (bo.Bool("isExpanded", false)) { continue; }
+                ChartBreak cb = ChartBreak.Of();
+                cb.startD = bsv.AsDouble(0.0);
+                cb.endD = bev.AsDouble(0.0);
+                JsonValue gv = bo.Get("gap");
+                if (gv != null) {
+                    if (gv.IsString()) {
+                        string gs = gv.AsString("");
+                        if (gs.Length > 1 && gs.EndsWith("%")) {
+                            double pd = Encoding.ParseDouble(gs.Substring(0, gs.Length - 1));
+                            if (pd >= 0.0 && pd < 100.0 - 1e-5) {
+                                cb.gapPrct = true;
+                                cb.gapVal = pd / 100.0;
+                            } else {
+                                cb.gapPrct = true; cb.gapVal = 0.0;
+                            }
+                        }
+                    } else if (gv.IsNumber()) {
+                        double ad = gv.AsDouble(0.0);
+                        if (ad < 0.0) { ad = 0.0; }
+                        cb.gapPrct = false; cb.gapVal = ad;
+                    }
+                }
+                if (cb.startD > cb.endD) {
+                    double tmp = cb.startD;
+                    cb.startD = cb.endD; cb.endD = tmp;
+                }
+                if (cb.startD == cb.endD) { cb.gapPrct = false; cb.gapVal = 0.0; }
+                a.breaks.Add(cb);
+            }
+            // ascending sort + 去重叠（parseAxisBreakOption 尾部）。
+            for (int si = 1; si < a.breaks.Count; si = si + 1) {
+                ChartBreak key = a.breaks[si];
+                int sj = si - 1;
+                while (sj >= 0 && a.breaks[sj].startD > key.startD) {
+                    a.breaks[sj + 1] = a.breaks[sj]; sj = sj - 1;
+                }
+                a.breaks[sj + 1] = key;
+            }
+            double lastEnd = 0.0; bool haveLast = false;
+            int keep = 0;
+            for (int oi = 0; oi < a.breaks.Count; oi = oi + 1) {
+                if (haveLast && lastEnd > a.breaks[oi].startD) { continue; }
+                a.breaks[keep] = a.breaks[oi]; keep = keep + 1;
+                lastEnd = a.breaks[oi].endD; haveLast = true;
+            }
+            while (a.breaks.Count > keep) { a.breaks.RemoveAt(a.breaks.Count - 1); }
+        }
+        JsonValue bav = v.Get("breakArea");
+        if (bav != null && bav.IsObject()) {
+            a.breakShow = bav.Bool("show", a.breakShow);
+            a.breakAmp = bav.Int("zigzagAmplitude", a.breakAmp);
+            JsonValue bais = bav.Get("itemStyle");
+            if (bais != null && bais.IsObject()) {
+                if (bais.Get("borderColor") != null) {
+                    a.breakBorderColor = ChartOption.ParseColor(bais.Get("borderColor"), 0);
+                }
+                if (bais.Get("color") != null) {
+                    a.breakFillColor = ChartOption.ParseColor(bais.Get("color"), 0);
+                }
+                JsonValue opv = bais.Get("opacity");
+                if (opv != null && opv.IsNumber()) {
+                    a.breakOpacityX10 = (int)(opv.AsDouble(0.6) * 10.0 + 0.5);
+                }
             }
         }
         // boundaryGap：类目轴点/柱落在格子中间（默认）还是刻度线上。

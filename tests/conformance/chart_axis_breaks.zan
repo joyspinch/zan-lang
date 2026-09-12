@@ -1,0 +1,118 @@
+// A15：axis.breaks 断轴（scale/breakImpl.ts）。
+// 用例：占比 gap 解算（updateAxisBreakGapReal 的静帧近似）、elapsed/
+// unelapsed 互逆、断带内值收敛（gap=0 折叠）、断轴刻度表（正常刻度
+// 跳断带 + 端点对 + 3/4·interval 剪除）、JSON 解析（'1.5%' 百分比/
+// 数值绝对 gap）、Clone。
+using System;
+using System.Json;
+using Gui;
+using Gui.Component.Chart;
+
+class ChartAxisBreaksTest {
+    static void Main() {
+        // ---- 1. 解析：bar-breaks-simple 的 yAxis.breaks ----
+        ChartOption o = ChartOption.FromJson(
+            "{\"yAxis\":[{\"type\":\"value\",\"breaks\":[{\"start\":5000,\"end\":100000,\"gap\":\"1.5%\"},{\"start\":105000,\"end\":3100000,\"gap\":\"1.5%\"}],\"breakArea\":{\"itemStyle\":{\"opacity\":1}}}]}"
+        );
+        ChartAxis y0 = o.YAxis0();
+        if (y0.breaks.Count != 2) { Console.WriteLine("FAIL parse count"); return; }
+        Console.WriteLine("parse|" + y0.breaks[0].startD + "," + y0.breaks[0].endD
+            + "|prct=" + (y0.breaks[0].gapPrct ? 1 : 0) + ",v=" + y0.breaks[0].gapVal);
+        // 官方 SSR：breakArea 缺省 zigzagAmplitude 4；itemStyle.opacity 1 → ×10 = 10
+        Console.WriteLine("area|amp=" + y0.breakAmp + "|op=" + y0.breakOpacityX10);
+
+        // ---- 2. gapReal 解算：官方 278.35 ×2（S=18000，P=0.03）----
+        List<double> grs = Chart.BrkGapReals(y0.breaks, 0.0, 3108000.0);
+        Console.WriteLine("gap|0=" + Math.Round(grs[0] * 100.0) / 100.0
+            + "|1=" + Math.Round(grs[1] * 100.0) / 100.0);
+        if (Math.Round(grs[0]) != 278) { Console.WriteLine("FAIL gap"); return; }
+
+        // ---- 3. elapsed/normalize 对照官方 SSR（a15brk3.js）----
+        double span = Chart.BrkElapsed(y0.breaks, grs, 3108000.0);
+        if (Math.Abs(span - 18556.701) > 0.01) { Console.WriteLine("FAIL span"); return; }
+        double n1 = Chart.BrkElapsed(y0.breaks, grs, 3106212.0) / span;
+        double n2 = Chart.BrkElapsed(y0.breaks, grs, 4330.0) / span;
+        double n3 = Chart.BrkElapsed(y0.breaks, grs, 103200.0) / span;
+        Console.WriteLine("norm|hi=" + Math.Round(n1 * 10000.0) / 10000.0
+            + "|low=" + Math.Round(n2 * 10000.0) / 10000.0
+            + "|mid=" + Math.Round(n3 * 10000.0) / 10000.0);
+        if (Math.Abs(n1 - 0.9036) > 0.0005) { Console.WriteLine("FAIL n1"); return; }
+        if (Math.Abs(n2 - 0.2333) > 0.0005) { Console.WriteLine("FAIL n2"); return; }
+        if (Math.Abs(n3 - 0.4569) > 0.0005) { Console.WriteLine("FAIL n3"); return; }
+
+        // ---- 4. 绝对 gap：官方 a15brkD.js norm(1200)=0.2793、norm(500)=0.0536 ----
+        List<ChartBreak> ba = new List<ChartBreak>();
+        ChartBreak b1 = ChartBreak.Of();
+        b1.startD = 10.0; b1.endD = 1000.0; b1.gapVal = 100.0;
+        ba.Add(b1);
+        List<double> ga = Chart.BrkGapReals(ba, 0.0, 2000.0);
+        if (ga[0] != 100.0) { Console.WriteLine("FAIL ga"); return; }
+        double m1 = Chart.BrkElapsed(ba, ga, 1200.0) / 1110.0;
+        double m2 = Chart.BrkElapsed(ba, ga, 500.0) / 1110.0;
+        Console.WriteLine("abs|1200=" + Math.Round(m1 * 10000.0) / 10000.0
+            + "|500=" + Math.Round(m2 * 10000.0) / 10000.0);
+        if (Math.Abs(m1 - 0.2793) > 0.0005) { Console.WriteLine("FAIL m1"); return; }
+        if (Math.Abs(m2 - 0.0536) > 0.0005) { Console.WriteLine("FAIL m2"); return; }
+
+        // ---- 5. gap=0 折叠（intraday-breaks-2 的闭市段）----
+        List<ChartBreak> bz = new List<ChartBreak>();
+        ChartBreak b2 = ChartBreak.Of();
+        b2.startD = 1000.0; b2.endD = 2000.0;
+        bz.Add(b2);
+        List<double> gz = Chart.BrkGapReals(bz, 0.0, 2700.0);
+        double e1 = Chart.BrkElapsed(bz, gz, 1000.0);
+        double e2 = Chart.BrkElapsed(bz, gz, 2000.0);
+        Console.WriteLine("fold|" + (e1 == e2 ? 1 : 0));
+        if (e1 != e2) { Console.WriteLine("FAIL fold"); return; }
+        // 断带外 unelapsed 往返一致
+        for (int i = 0; i <= 10; i = i + 1) {
+            double v = 2700.0 * i / 10.0;
+            if (v >= 1000.0 && v <= 2000.0) { continue; }
+            double u = Chart.BrkUnelapsed(bz, gz, Chart.BrkElapsed(bz, gz, v));
+            if (Math.Abs(u - v) > 0.0001) { Console.WriteLine("FAIL rt " + v); return; }
+        }
+        Console.WriteLine("roundtrip|ok");
+
+        // ---- 6. 断轴刻度表：官方 ticks（含端点对、跳断带、剪除）----
+        List<double> tk = Chart.BrkTicks(y0.breaks, grs, 0.0, 3108000.0, 3000.0);
+        string s = "";
+        for (int i = 0; i < tk.Count; i = i + 1) {
+            s = s + Math.Round(tk[i]);
+            if (i < tk.Count - 1) { s = s + ","; }
+        }
+        Console.WriteLine("ticks|" + s);
+        if (s != "0,5000,100000,105000,3100000,3105000,3108000") { Console.WriteLine("FAIL ticks"); return; }
+        // gap=0 刻度表（oracle a15brkO.js：0,300,600,1000,2000,2400,2700）
+        List<double> tz = Chart.BrkTicks(bz, gz, 0.0, 2700.0, 300.0);
+        string sz = "";
+        for (int i = 0; i < tz.Count; i = i + 1) {
+            sz = sz + Math.Round(tz[i]);
+            if (i < tz.Count - 1) { sz = sz + ","; }
+        }
+        Console.WriteLine("ticks0|" + sz);
+        if (sz != "0,300,600,1000,2000,2400,2700") { Console.WriteLine("FAIL ticks0"); return; }
+
+        // ---- 7. nice 量程：raw 域 [0,3107022] → [0,3108000]、iv 3000
+        // （官方：effective span 17548.5/5=3509.7 → nice ROUND 档
+        // 1/2/3/5/10 阈值 1.5/2.5/4/7 → 3000；域向外扩到整数倍）----
+        List<double> ne = Chart.BrkNiceExtent(y0.breaks, 0.0, 3107022.0, 5);
+        Console.WriteLine("nice|" + Math.Round(ne[0]) + "," + Math.Round(ne[1])
+            + "|iv=" + Math.Round(ne[2]));
+        if (Math.Round(ne[0]) != 0 || Math.Round(ne[1]) != 3108000
+            || Math.Round(ne[2]) != 3000) { Console.WriteLine("FAIL nice"); return; }
+
+        // ---- 8. 解析：绝对 gap 数值 + Clone ----
+        ChartOption o2 = ChartOption.FromJson(
+            "{\"yAxis\":[{\"type\":\"value\",\"breaks\":[{\"start\":10,\"end\":1000,\"gap\":100}]}]}"
+        );
+        ChartAxis ya = o2.YAxis0();
+        Console.WriteLine("absGap|prct=" + (ya.breaks[0].gapPrct ? 1 : 0) + ",v=" + ya.breaks[0].gapVal);
+        if (ya.breaks[0].gapPrct || ya.breaks[0].gapVal != 100.0) { Console.WriteLine("FAIL absgap"); return; }
+        ChartOption o3 = ChartOption.Clone(o);
+        if (o3 == null || o3.YAxis0().breaks.Count != 2
+            || o3.YAxis0().breaks[1].endD != 3100000.0) { Console.WriteLine("FAIL clone"); return; }
+        Console.WriteLine("clone|ok");
+
+        Console.WriteLine("chart_axis_breaks_test: OK");
+    }
+}

@@ -1035,3 +1035,46 @@ map/geo ×2（`GeoLabelStyle`：geo.labelSt 优先，回落 lead.label）。
 `paint-order`/`feDropShadow` 属性逐值对照）；
 `tests/conformance/chart_text_border.zan` 6 案（label 级、data 级 rich 段、
 显式 0 宽、geo label、Clone 双层、同段双效果）。
+
+## 断轴 axis.breaks：interval 解在 out 空间、由 elapsed span 驱动（A15 会话）
+
+**现象**：`bar-breaks-simple` 四条系列画成**几乎等高**、轴标 4,000,000/…/5,000
+（应当 0…3,108,000 且断带上下分明）。根因是两个独立缺陷叠加。
+
+- **缺陷一（量程）**：断轴轴的 extent 不能用普通 nice 阶梯。官方
+  `coord/axisNiceTicks.ts calcNiceForIntervalOrLogScale` 是：
+  `iv = nice(elapsedSpan / splitNumber, NICE_MODE_ROUND)`，**ROUND 阶梯是
+  1/2/3/5/10、阈值 1.5/2.5/4/7**（普通阶梯是 1/2/5，阈值 2.5/5）；
+  然后 extent **向外**扩到 interval 整倍数 `[floor(lo/iv)·iv, ceil(hi/iv)·iv]`。
+  bar-breaks-simple：elapsed span 18556.7 /5 = 3711 → ROUND nice → **3000**
+  → extent `[0, 3108000]`。用普通阶梯会得到 `0..4000000`，四条柱挤成等高
+  （柱高按 elapsed 归一后差 3%，落在 4e6 量程上肉眼不可分）。
+- **缺陷二（柱高）**：柱高走的是 `YOfFL`（×1000 定点的 long 入口），而断带
+  折进只加在 `YOf`/`YOfF` 上——**三个入口都要挂**，漏一个就是柱族整族
+  无视断带。
+- **gap 是静帧解**：`gapReal_i = P·S/(1−P) × (prct_i/P)`，其中 `P=Σprct`、
+  `S = outSpan − ΣbreakSpans`（`scale/breakImpl.ts updateAxisBreakGapReal`）。
+  声明的是**绝对** duration，实测 bar-breaks-simple 每个断带 278.35。
+  **不要**按"占绘图区的百分比"去猜——那会差一个 outSpan 因子。
+- **elapsed 映射**：`normalize(v) = elapsed(v)/elapsedSpan`。官方数值可直接
+  当 oracle：`norm(3106212)=0.903647`、`norm(4330)=0.2333`、`norm(103200)=0.4569`、
+  `norm(2410)=0.1299`。**gap=0 的断带把带内全部值折叠成同一 elapsed**
+  （e1==e2==e3），这是判定映射是否真按断带走的尖锐用例。
+- **刻度**：落在 **out 空间** interval 的整倍数上，跨断带靠
+  `mult = round((b.endD − nxt)/iv)` **一次跳过去**，带尾补一对端点；
+  正常刻度按 ±¾·iv 剪除。官方 tick 表
+  `0, 5000, 100000, 105000, 3100000, 3105000, 3108000` 可逐项复现。
+- **渲染**（`axisBreakHelperImpl.ts rectCoordBuildBreakAxis` → `addZigzagShapes`）：
+  贯穿**整个绘图矩形**的两条平行锯齿折线，±amplitude 交替、端点不偏移；
+  `gapReal !== 0` 时另加多边形填充（polygon = 上折线 + reverse(下折线)）。
+  缺省 `zigzagAmplitude 4 / zigzagMinSpan 4 / zigzagMaxSpan 20`、
+  `itemStyle {color:'#fff', borderColor:'#b7b9be', borderWidth:1, borderType:[3,3], opacity:0.6}`。
+  本引擎的两处刻意偏差：锯齿步长用**确定性黄金比伪随机**（官方 `Math.random`
+  每帧重掷，无法做 golden）、`[3,3]` 虚线按等长 dash 近似。
+- **验证**：`tests/conformance/chart_axis_breaks.zan` + 纯净 HEAD 构建的像素
+  A/B。**别拿"手头那个旧 exe"当 HEAD**——工作区里其它会话的在途 stdlib 编辑
+  会混进去（本会话据此假报过一次回归）；用 `git archive HEAD stdlib` 出快照
+  再构建。
+- **时间轴断带是死的，直到时间域离开 epoch-天**：断带声明值是 epoch-ms，
+  而时间域是 epoch-**天**的 int32，两域永不相交 ⇒ `f.brkX` 恒 0。
+  修时间断带的前置是 A16（真时间域），不是断轴本身。

@@ -57,6 +57,19 @@ class ChartFrame {
     int xHi;
     bool leftNegate;     // 左轴刻度/工具提示按 -值 显示（axisLabel.formatter=-v）
     bool rightNegate;    // 右轴同上
+    // ---- A15 断轴（axis.breaks）---- 左/右轴各自的解算结果。breaks 空
+    // = 无断带，全部映射走原路径（逐像素一致）。
+    List<ChartBreak> brkL;      // 左轴断带（升序、仅界内）
+    List<double> brkGapL;       // 对应 gapReal
+    double brkSpanL;            // 线性（elapsed）总跨度 = 数据跨度 − Σ断带跨度 + ΣgapReal
+    double brkIvL;              // 断轴刻度 interval（BrkNiceExtent 算一次存这里）
+    List<ChartBreak> brkR;
+    List<double> brkGapR;
+    double brkSpanR;
+    double brkIvR;
+    List<ChartBreak> brkX;      // X 数值/时间轴断带
+    List<double> brkGapX;
+    double brkSpanX;
 
     /// 第 i 类目左缘。用 i*W/n 而不是固定 step，余数摊到末格，
     /// 最后一根柱/最后一个标签贴上绘图区右缘。boundaryGap=false
@@ -128,6 +141,9 @@ class ChartFrame {
     /// 左轴（axisIndex 0）或右轴（1）上数值对应的像素 Y，
     /// 遵循各轴预设的翻转标志。
     int YOf(int v, int axisIndex) {
+        // A15：该轴挂有断带时走 elapsed 映射（breakImpl.ts normalize：
+        // normalize = linear.normalize(transformIn(v))）。
+        if (this.BrkHas(axisIndex)) { return this.YOfBrk((double)v, axisIndex); }
         int lo = this.leftMin;
         int hi = this.leftMax;
         bool rev = this.reversed;
@@ -139,6 +155,41 @@ class ChartFrame {
         return this.plotY + this.plotH - d;
     }
 
+    /// A15：断轴 Y 映射。axisIndex 轴挂有断带时，把值映进 elapsed
+    /// 线性空间再走同一比例映射（elapsed(0)=0 不必成立——elapsed 是
+    /// 位移量，值域端点 elapsed(lo)/elapsed(hi) 才是 0/1 锚）。
+    bool BrkHas(int axisIndex) {
+        if (axisIndex == 1) { return this.brkR != null && this.brkR.Count > 0; }
+        return this.brkL != null && this.brkL.Count > 0;
+    }
+
+    int YOfBrk(double v, int axisIndex) {
+        List<ChartBreak> brks = axisIndex == 1 ? this.brkR : this.brkL;
+        List<double> grs = axisIndex == 1 ? this.brkGapR : this.brkGapL;
+        double lo = axisIndex == 1 ? this.rightMin : this.leftMin;
+        double hi = axisIndex == 1 ? this.rightMax : this.leftMax;
+        bool rev = axisIndex == 1 ? this.rightReversed : this.reversed;
+        double span = this.brkSpanR;
+        if (axisIndex != 1) { span = this.brkSpanL; }
+        double eLo = Chart.BrkElapsed(brks, grs, lo);
+        double eHi = Chart.BrkElapsed(brks, grs, hi);
+        double eSpan = eHi - eLo;
+        if (eSpan < 1e-9) { eSpan = 1.0; }
+        double e = Chart.BrkElapsed(brks, grs, v) - eLo;
+        int d = (int)(e * (long)this.plotH / eSpan);
+        if (rev) { return this.plotY + d; }
+        return this.plotY + this.plotH - d;
+    }
+
+    /// X 数值/时间轴断轴映射（轴互换/值对折线的 X 数值轴挂断带时）。
+    int XOfBrk(double v) {
+        double eLo = Chart.BrkElapsed(this.brkX, this.brkGapX, (double)this.xLo);
+        double eHi = Chart.BrkElapsed(this.brkX, this.brkGapX, (double)this.xHi);
+        double eSpan = eHi - eLo;
+        if (eSpan < 1e-9) { eSpan = 1.0; }
+        double e = Chart.BrkElapsed(this.brkX, this.brkGapX, v) - eLo;
+        return this.plotX + (int)(e * (long)this.plotW / eSpan);
+    }
     /// YOf 的 16.8 定点版本（1/256 px）：堆叠面积带的填充边界走
     /// 亚像素光栅化（FillBandFx），整数 YOf 会把边界量化到整行，
     /// 缓坡上每列硬跳 1 行——正是"面积边缘锯齿"的来源。
@@ -163,6 +214,7 @@ class ChartFrame {
     /// （vF 恰为 1000 的倍数）与 YOf 逐像素一致，小数数据不再被
     /// vF/1000 截断丢掉小数位。
     int YOfF(int vF, int axisIndex) {
+        if (this.BrkHas(axisIndex)) { return this.YOfBrk((double)vF / 1000.0, axisIndex); }
         int loF = this.leftMinF;
         int hiF = this.leftMaxF;
         bool rev = this.reversed;
@@ -188,6 +240,8 @@ class ChartFrame {
     /// 8.6e7、成交额）×1000 定点后 8.6e10 必爆 int32，调用方
     /// 以 long 承载定点值走这里；映射体与 YOfF 同式。
     int YOfFL(long vF, int axisIndex) {
+        // A15：该轴挂断带时先折进 elapsed 空间（vF 是 ×1000 定点）。
+        if (this.BrkHas(axisIndex)) { return this.YOfBrk((double)vF / 1000.0, axisIndex); }
         int loF = this.leftMinF;
         int hiF = this.leftMaxF;
         bool rev = this.reversed;
@@ -271,6 +325,10 @@ class ChartFrame {
 
     /// X 数值轴上数值 v 的像素（轴互换折线 / 值对折线）。
     int XOfValue(int v) {
+        // A15：X 数值轴挂断带时走 elapsed 映射。
+        if (this.brkX != null && this.brkX.Count > 0) {
+            return this.XOfBrk((double)v);
+        }
         return Chart.ValueX(this.plotX, this.plotW, this.xLo, this.xHi, v);
     }
 
@@ -410,6 +468,11 @@ class ChartFrame {
     /// 时间 X 映射：整数时间值 → 像素 x，钳制在绘图区内。
     /// 时间跨度（秒/毫秒）× plotW 轻易超 int32，乘法走 long。
     int XOfTime(int t) {
+        // A15：时间轴断带（intraday-breaks-1/2、matrix-stock 的周内闭市段）：
+        // epoch-ms 值走 elapsed 映射，闭市段整段收敛到 gapReal 宽。
+        if (this.brkX != null && this.brkX.Count > 0) {
+            return this.XOfBrk((double)t);
+        }
         int lo = this.timeMin;
         int hi = this.timeMax;
         long span = (long)hi - (long)lo;
@@ -1830,6 +1893,360 @@ class Chart {
     }
 
     /// 定点数值 → 垂直像素（ValueXF 的纵轴对偶）。
+    /// ---- A15 axis breaks（scale/breakImpl.ts BreakScaleMapperImpl）----
+    /// elapsed 映射：把数据值映进“抽掉断带、铺平 gapReal”的线性空间。
+    /// breaks 已升序去重叠；gapReal 已解算（BrkGapReal）。链式扫描：
+    ///   v ≤ brk.vmax 且 v > brk.vmin → 断带内线性映射进 gapReal 停；
+    ///   v ≤ brk.vmin → 加 (v - lastBreakEnd) 停；否则跳过整个断带
+    ///   （加 vmin-lastBreakEnd+gapReal）。断带外尾部补 (v-lastBreakEnd)。
+    static double BrkElapsed(List<ChartBreak> breaks, List<double> gapReals,
+                             double v) {
+        double elapsed = 0.0;
+        double lastEnd = 0.0;
+        for (int i = 0; i < breaks.Count; i = i + 1) {
+            ChartBreak b = breaks[i];
+            double vmin = b.startD;
+            double vmax = b.endD;
+            if (v <= vmax) {
+                if (v > vmin) {
+                    double span = vmax - vmin;
+                    double gr = gapReals[i];
+                    elapsed = elapsed + vmin - lastEnd + (v - vmin) / span * gr;
+                } else {
+                    elapsed = elapsed + v - lastEnd;
+                }
+                return elapsed;
+            }
+            elapsed = elapsed + vmin - lastEnd + gapReals[i];
+            lastEnd = vmax;
+        }
+        return elapsed + v - lastEnd;
+    }
+
+    /// elapsed 的逆映射（breakImpl.ts transformOut）：elapsedVal 落在某
+    /// 断带的 gapReal 段内 → 按比例折回数据空间；落在段外 → 段间线性。
+    static double BrkUnelapsed(List<ChartBreak> breaks, List<double> gapReals,
+                               double e) {
+        double lastElapsedEnd = 0.0;
+        double lastBreakEnd = 0.0;
+        for (int i = 0; i < breaks.Count; i = i + 1) {
+            ChartBreak b = breaks[i];
+            double vmin = b.startD;
+            double vmax = b.endD;
+            double elapsedStart = lastElapsedEnd + vmin - lastBreakEnd;
+            double elapsedEnd = elapsedStart + gapReals[i];
+            if (e <= elapsedEnd) {
+                if (e > elapsedStart) {
+                    return vmin + (e - elapsedStart) / (elapsedEnd - elapsedStart) * (vmax - vmin);
+                }
+                return lastBreakEnd + e - lastElapsedEnd;
+            }
+            lastElapsedEnd = elapsedEnd;
+            lastBreakEnd = vmax;
+        }
+        return lastBreakEnd + e - lastElapsedEnd;
+    }
+
+    /// 断带 gapReal 解算（updateAxisBreakGapReal 的静帧近似——本引擎
+    /// 不支持 dataZoom 推断带出界，断带要么整体在 extent 内要么整体在
+    /// 外，半出界分支省略）：占比断带共享总额 G = P·S/(1-P)，P = Σ占比、
+    /// S = 外层跨度 − Σ断带数据跨度；绝对断带 gapReal = gap 原值。
+    /// 返回逐断带 gapReal（与 breaks 对齐）；breaks 为空返回空表。
+    static List<double> BrkGapReals(List<ChartBreak> breaks,
+                                    double extentLo, double extentHi) {
+        List<double> outp = new List<double>();
+        int n = breaks.Count;
+        if (n == 0) { return outp; }
+        double prctSum = 0.0;
+        double brkSpan = 0.0;
+        for (int i = 0; i < n; i = i + 1) {
+            ChartBreak b = breaks[i];
+            if (b.startD < extentLo || b.endD > extentHi) { continue; }
+            if (b.gapPrct) { prctSum = prctSum + b.gapVal; }
+            brkSpan = brkSpan + (b.endD - b.startD);
+        }
+        double s = extentHi - extentLo - brkSpan;
+        if (s < 0.0) { s = 0.0; }
+        double totalGap = prctSum > 0.0 && prctSum < 1.0
+            ? prctSum * s / (1.0 - prctSum) : 0.0;
+        for (int i = 0; i < n; i = i + 1) {
+            ChartBreak b = breaks[i];
+            if (b.startD < extentLo || b.endD > extentHi) { outp.Add(0.0); continue; }
+            if (b.gapPrct) {
+                outp.Add(prctSum > 0.0 ? totalGap * b.gapVal / prctSum : 0.0);
+            } else {
+                outp.Add(b.gapVal);
+            }
+        }
+        return outp;
+    }
+
+    /// 断带是否真的参与本帧：与轴 extent 相交才算（clampBreakByExtent
+    /// 的整体在界近似——半出界时钳到界内语义由调用方忽略，语料无此态）。
+    static bool BrkActive(ChartBreak b, double extentLo, double extentHi) {
+        return b.startD < extentHi && b.endD > extentLo;
+    }
+
+    /// A15：断轴 nice 量程（axisNiceTicks.ts calcNiceForIntervalOrLogScale
+    /// + intervalScaleCalcNiceTicks 源对抄）。raw 域上解 gap →
+    /// effective span（elapsed 跨度，getScaleLinearSpanEffective）→
+    /// interval = nice(span/splitNumber, ROUND)——number.ts nice 的
+    /// ROUND 档是 **1/2/3/5/10** 阈值 1.5/2.5/4/7（3711→3000 的出处；
+    /// 不是无断轴路径的 1/2/5 十档）→ 最终域向**外**扩到 interval 整数
+    /// 倍：[floor(lo/iv)·iv, ceil(hi/iv)·iv]。返回 [nlo, nhi, iv]。
+    static List<double> BrkNiceExtent(List<ChartBreak> brks,
+                                      double rawLo, double rawHi, int splitNumber) {
+        List<double> outp = new List<double>();
+        double lo = rawLo;
+        double hi = rawHi;
+        if (!(hi > lo)) { hi = lo + 1.0; }
+        List<double> grs = Chart.BrkGapReals(brks, lo, hi);
+        double eLo = Chart.BrkElapsed(brks, grs, lo);
+        double eHi = Chart.BrkElapsed(brks, grs, hi);
+        double eSpan = eHi - eLo;
+        if (eSpan < 1.0) { eSpan = 1.0; }
+        double iv = eSpan / (splitNumber > 0 ? (double)splitNumber : 5.0);
+        double mag = 1.0;
+        while (mag * 10.0 <= iv) { mag = mag * 10.0; }
+        double m = iv / mag;
+        if (m < 1.5) { iv = mag; }
+        else if (m < 2.5) { iv = 2.0 * mag; }
+        else if (m < 4.0) { iv = 3.0 * mag; }
+        else if (m < 7.0) { iv = 5.0 * mag; }
+        else { iv = 10.0 * mag; }
+        if (iv < 1.0) { iv = 1.0; }
+        outp.Add(Math.Floor(lo / iv) * iv);
+        outp.Add(Math.Ceiling(hi / iv) * iv);
+        outp.Add(iv);
+        return outp;
+    }
+
+    /// A15：断轴刻度表（Interval.getTicks 的 OUT 空间近似 + prune +
+    /// addBreaksToTicks）。interval 由调用方按 elapsed 跨度选定；
+    /// 正常刻度 = 域内 interval 的整数倍，下一个落进断带内部
+    /// （vmin < v < vmax）时按 calcNiceTickMultiple 跳过：
+    /// v += round((vmax - v)/interval)·interval；断带端点成对补入；
+    /// 距断带 3/4·interval 内的正常刻度剔除（pruneTicksByBreak 的
+    /// 经验 gap）。
+    static List<double> BrkTicks(List<ChartBreak> breaks, List<double> grs,
+                                 double lo, double hi, double interval) {
+        List<double> outp = new List<double>();
+        if (interval <= 0.0) { return outp; }
+        // 正常刻度：floor(lo/iv)..floor(hi/iv) 的整数倍（与 NiceRange
+        // 端点取整规则一致：下端 ceil 向上取整在 k0 里由 v<=hi 修正）。
+        long k0 = (long)Math.Floor(lo / interval);
+        long k1 = (long)Math.Floor(hi / interval);
+        double v = (double)k0 * interval;
+        if (v < lo) { v = v + interval; }
+        int guard = 0;
+        while (v <= hi + interval * 0.001 && guard < 4096) {
+            guard = guard + 1;
+            outp.Add(v);
+            double nxt = v + interval;
+            // calcNiceTickMultiple：nxt 严格落在断带内 → 跳过整段。
+            for (int i = 0; i < breaks.Count; i = i + 1) {
+                ChartBreak b = breaks[i];
+                if (nxt > b.startD && nxt < b.endD) {
+                    double mult = Math.Floor((b.endD - nxt) / interval + 0.5);
+                    if (mult > 0.0) { nxt = nxt + mult * interval; }
+                    break;
+                }
+            }
+            v = nxt;
+        }
+        // 断带端点成对补入（addBreaksToTicks）。
+        for (int i = 0; i < breaks.Count; i = i + 1) {
+            ChartBreak b = breaks[i];
+            outp.Add(b.startD);
+            outp.Add(b.endD);
+        }
+        // 剔除断带 ±3/4·interval 内的正常刻度（断带端点除外）。
+        double gapq = interval * 0.75;
+        for (int i = outp.Count - 1; i >= 0; i = i - 1) {
+            double tv = outp[i];
+            bool isBrkEnd = false;
+            for (int b = 0; b < breaks.Count; b = b + 1) {
+                if (tv == breaks[b].startD || tv == breaks[b].endD) { isBrkEnd = true; break; }
+            }
+            if (isBrkEnd) { continue; }
+            for (int b = 0; b < breaks.Count; b = b + 1) {
+                if (tv > breaks[b].startD - gapq && tv < breaks[b].endD + gapq) {
+                    outp.RemoveAt(i);
+                    break;
+                }
+            }
+        }
+        // 升序。
+        for (int a = 1; a < outp.Count; a = a + 1) {
+            double key = outp[a];
+            int b2 = a - 1;
+            while (b2 >= 0 && outp[b2] > key) { outp[b2 + 1] = outp[b2]; b2 = b2 - 1; }
+            outp[b2 + 1] = key;
+        }
+        // 去重。
+        List<double> dd = new List<double>();
+        for (int i = 0; i < outp.Count; i = i + 1) {
+            if (dd.Count == 0 || dd[dd.Count - 1] != outp[i]) { dd.Add(outp[i]); }
+        }
+        return dd;
+    }
+    /// A15：断带的像素区间（升序、钳在绘图区内）。kind：0=左值轴
+    /// 1=右值轴（区间是 y 段），2=X 数值/时间轴（区间是 x 段）。
+    static List<int> BrkPixelBands(ChartFrame f, int kind) {
+        List<ChartBreak> brks = f.brkL;
+        if (kind == 1) { brks = f.brkR; }
+        if (kind == 2) { brks = f.brkX; }
+        List<int> bands = new List<int>();
+        if (brks == null || brks.Count == 0) { return bands; }
+        int lo = f.plotY;
+        int hi = f.plotY + f.plotH;
+        if (kind == 2) { lo = f.plotX; hi = f.plotX + f.plotW; }
+        for (int i = 0; i < brks.Count; i = i + 1) {
+            int a = kind == 2 ? f.XOfBrk(brks[i].startD)
+                : f.YOfBrk(brks[i].startD, kind);
+            int b2 = kind == 2 ? f.XOfBrk(brks[i].endD)
+                : f.YOfBrk(brks[i].endD, kind);
+            if (a > b2) { int t = a; a = b2; b2 = t; }
+            if (a < lo) { a = lo; }
+            if (b2 > hi) { b2 = hi; }
+            if (b2 > a) { bands.Add(a); bands.Add(b2); }
+        }
+        return bands;
+    }
+
+    /// A15：axisLine.breakLine（缺省 true）——轴挂断带时轴线只画
+    /// 断带之外的段（AxisBuilder.ts:716 → axisBreakHelperImpl.ts
+    /// buildAxisBreakLine addSeg）。bands 为 BrkPixelBands 的升序
+    /// 区间对 [s0,e0,s1,e1,...]，长度 len 沿 vertical?y:x。
+    static void DrawAxisLineBands(Canvas c, int x, int y, int len, bool vertical,
+        int thick, int col, List<int> bands) {
+        int pos = 0;
+        for (int i = 0; i + 1 < bands.Count; i = i + 2) {
+            int s = bands[i];
+            int e = bands[i + 1];
+            if (s > len) { s = len; }
+            if (e > len) { e = len; }
+            if (s > pos) {
+                if (vertical) { c.FillRect(x, y + pos, thick, s - pos, col); }
+                else { c.FillRect(x + pos, y, s - pos, thick, col); }
+            }
+            if (e > pos) { pos = e; }
+        }
+        if (pos < len) {
+            if (vertical) { c.FillRect(x, y + pos, thick, len - pos, col); }
+            else { c.FillRect(x + pos, y, len - pos, thick, col); }
+        }
+    }
+
+    /// A15：锯齿点列（addZigzagShapes 源对抄）。沿 sweep 轴扫过整个
+    /// 绘图区，端点不偏移（与轴刻度精确相接）、内部点 band ±amp 交替
+    /// （isSwap 起步 true：两线同向偏移保持平行），步长取
+    /// minSpan..maxSpan（缺省 4..20）伪随机权重。官方用 Math.random；
+    /// 这里换黄金比/白银比递推保证逐帧确定（像素回归可复现）。
+    /// horizontal=true：带在 x（竖直锯齿线，扫 y），否则带在 y。
+    static void BrkZigzag(int seed, int amp, int plotPos, int plotLen,
+        int bandLo, int bandHi, bool horizontal,
+        List<int> xsA, List<int> ysA, List<int> xsB, List<int> ysB) {
+        double minSpan = 4.0;
+        double maxSpan = 20.0;
+        int sweepEnd = plotPos + plotLen;
+        int cur = plotPos;
+        bool isSwap = true;
+        int idx = 0;
+        while (true) {
+            bool isLast = cur >= sweepEnd;
+            if (isLast) { cur = sweepEnd; }
+            int off = 0;
+            if (idx > 0 && !isLast) { off = isSwap ? 0 - amp : amp; }
+            if (horizontal) {
+                xsA.Add(bandLo + off); ysA.Add(cur);
+                xsB.Add(bandHi + off); ysB.Add(cur);
+            } else {
+                xsA.Add(cur); ysA.Add(bandLo + off);
+                xsB.Add(cur); ysB.Add(bandHi + off);
+            }
+            double r = (idx + 1) * 0.6180339887498949 + seed * 0.7548776662466927 + 0.2113;
+            r = r - Math.Floor(r);
+            cur = cur + (int)(r * (maxSpan - minSpan) + minSpan);
+            isSwap = !isSwap;
+            idx = idx + 1;
+            if (isLast) { break; }
+        }
+    }
+
+    /// A15：breakArea 锯齿边框 dashed [3,3]（borderType 缺省）的近似：
+    /// 折线笔划不可分段，逐段按切比雪夫长度参数走 3px 通/3px 断，
+    /// 通段用 DrawLine。每条锯齿约 25 段，成本可忽略。
+    static void BrkDashPolyline(Canvas c, List<int> xs, List<int> ys, int col) {
+        for (int i = 1; i < xs.Count; i = i + 1) {
+            int dx = xs[i] - xs[i - 1];
+            int dy = ys[i] - ys[i - 1];
+            int adx = dx > 0 ? dx : 0 - dx;
+            int ady = dy > 0 ? dy : 0 - dy;
+            int ln = adx > ady ? adx : ady;
+            if (ln < 1) { continue; }
+            int nseg = (int)Math.Ceiling(ln / 3.0);
+            if (nseg < 1) { nseg = 1; }
+            for (int s = 0; s < nseg; s = s + 1) {
+                if (s % 2 == 1) { continue; }
+                double t0 = (double)s / nseg;
+                double t1 = (double)(s + 1) / nseg;
+                if (t1 > 1.0) { t1 = 1.0; }
+                c.DrawLine(xs[i - 1] + (int)(dx * t0 + 0.5),
+                    ys[i - 1] + (int)(dy * t0 + 0.5),
+                    xs[i - 1] + (int)(dx * t1 + 0.5),
+                    ys[i - 1] + (int)(dy * t1 + 0.5), col, 1);
+            }
+        }
+    }
+
+    /// A15：breakArea 锯齿带（axisBreakHelperImpl.ts rectCoordBuildBreakAxis
+    /// → addZigzagShapes 源对抄）。每条断带画两条平行锯齿折线跨满绘图区
+    /// （边框色/宽、dashed 缺省），gapReal≠0 时再加两线之间的多边形填充
+    /// （itemStyle color + opacity，缺省 #fff/0.6）。gap=0 只画单线
+    /// （官方注释：dash/半透明在零宽带上不连续）。官方 z=zigzagZ(100)
+    /// 在系列之上——调用点在系列绘制之后。
+    static void DrawBreakAreas(Canvas c, ChartFrame f, ChartAxis ax, int kind) {
+        if (ax == null || !ax.breakShow) { return; }
+        List<ChartBreak> brks = f.brkL;
+        List<double> grs = f.brkGapL;
+        if (kind == 1) { brks = f.brkR; grs = f.brkGapR; }
+        if (kind == 2) { brks = f.brkX; grs = f.brkGapX; }
+        if (brks == null || brks.Count == 0 || grs == null || grs.Count < brks.Count) { return; }
+        int amp = ax.breakAmp > 0 ? ax.breakAmp : 4;
+        int bcol = ax.breakBorderColor != 0 ? ax.breakBorderColor : Chart.Rgb(183, 185, 190);
+        int fcol = ax.breakFillColor != 0 ? ax.breakFillColor : Chart.Rgb(255, 255, 255);
+        int opa = ax.breakOpacityX10 >= 0 ? ax.breakOpacityX10 * 255 / 10 : 153;
+        for (int bi = 0; bi < brks.Count; bi = bi + 1) {
+            ChartBreak b = brks[bi];
+            List<int> xsA = new List<int>();
+            List<int> ysA = new List<int>();
+            List<int> xsB = new List<int>();
+            List<int> ysB = new List<int>();
+            if (kind == 2) {
+                int xa = f.XOfBrk(b.startD);
+                int xb = f.XOfBrk(b.endD);
+                if (xa > xb) { int t = xa; xa = xb; xb = t; }
+                Chart.BrkZigzag(bi, amp, f.plotY, f.plotH, xa, xb, true,
+                    xsA, ysA, xsB, ysB);
+            } else {
+                int ya = f.YOfBrk(b.startD, kind);
+                int yb = f.YOfBrk(b.endD, kind);
+                if (ya > yb) { int t = ya; ya = yb; yb = t; }
+                Chart.BrkZigzag(bi, amp, f.plotX, f.plotW, ya, yb, false,
+                    xsA, ysA, xsB, ysB);
+            }
+            Chart.BrkDashPolyline(c, xsA, ysA, bcol);
+            if (grs[bi] != 0.0) {
+                Chart.BrkDashPolyline(c, xsB, ysB, bcol);
+                List<ChartMapPoint> poly = new List<ChartMapPoint>();
+                for (int i = 0; i < xsA.Count; i = i + 1) { poly.Add(ChartMapPoint.Of(xsA[i], ysA[i])); }
+                for (int i = xsB.Count - 1; i >= 0; i = i - 1) { poly.Add(ChartMapPoint.Of(xsB[i], ysB[i])); }
+                ChartView.FillPolygon(c, poly, Chart.WithAlpha(fcol, opa));
+            }
+        }
+    }
+
     static int ValueYF(int plotY, int plotH, int lo, int hi, int v, int g) {
         if (g <= 1) { return Chart.ValueY(plotY, plotH, lo, hi, v); }
         long span = ((long)hi - (long)lo) * (long)g;
@@ -4399,6 +4816,22 @@ class Chart {
             if (leftLo < 1) { leftLo = 1; }
             if (leftHi < leftLo + 1) { leftHi = leftLo + 1; }
         }
+        // A15：断轴量程另走 BrkNiceExtent（elapsed 跨度定 interval、
+        // 域向外扩到整数倍）。普通 nice 的 1/2/5 十档与官方断轴的
+        // 1/2/3/5/10 档不同，bar-breaks-simple 会得到 4000000 上界
+        // 而官方是 3108000。
+        double brkIvL = 0.0;
+        if (!leftLog && !leftFrac && y0.type == ChartAxisType.Value
+            && y0.breaks != null && y0.breaks.Count > 0) {
+            double rlo = (double)Chart.AxisMinFor(series, 0, zI0, zI1, y0.scale);
+            if (y0.min != ChartOption.Auto()) { rlo = (double)y0.min; }
+            double rhi = (double)lData;
+            if (y0.max != ChartOption.Auto()) { rhi = (double)y0.max; }
+            List<double> nb = Chart.BrkNiceExtent(y0.breaks, rlo, rhi, y0.ticks);
+            leftLo = (int)nb[0];
+            leftHi = (int)nb[1];
+            brkIvL = nb[2];
+        }
         if (rightLog) {
             if (rightLo < 1) { rightLo = 1; }
             if (rightHi < rightLo + 1) { rightHi = rightLo + 1; }
@@ -4412,6 +4845,19 @@ class Chart {
             rightLo = rs.lo;
             rightHi = rs.hi;
             rt = rs.ticks;
+        }
+        // A15：右轴断轴量程（同左轴）。
+        double brkIvR = 0.0;
+        if (hasRight && !rightLog && !rightFrac && y1.type == ChartAxisType.Value
+            && y1.breaks != null && y1.breaks.Count > 0) {
+            double rrlo = (double)Chart.AxisMinFor(series, 1, zI0, zI1, y1.scale);
+            if (y1.min != ChartOption.Auto()) { rrlo = (double)y1.min; }
+            double rrhi = (double)Chart.AxisMaxFor(series, 1, zI0, zI1, y1.scale);
+            if (y1.max != ChartOption.Auto()) { rrhi = (double)y1.max; }
+            List<double> nb2 = Chart.BrkNiceExtent(y1.breaks, rrlo, rrhi, y1.ticks);
+            rightLo = (int)nb2[0];
+            rightHi = (int)nb2[1];
+            brkIvR = nb2[2];
         }
         // ---- A12 alignTicks（coord/axisAlignTicks.ts scaleCalcAlign）----
         // 只在左/右两条**数值轴**之间做：Grid.ts:738-756 逆序扫描
@@ -4732,6 +5178,96 @@ class Chart {
         }
 
         ChartFrame f = new ChartFrame();
+        // ---- A15 断轴 gapReal 解算 + 挂框 ----
+        // 量程（含 nice 与 markPad 外扩）定型后解：占比断带按
+        // G = P·S/(1-P) 分摊（S = 最终外层跨度 − Σ断带跨度）；
+        // 只挂与最终界相交的断带。X 数值/时间轴同式。
+        if (y0.breaks != null && y0.breaks.Count > 0 && !leftFrac) {
+            List<ChartBreak> act = new List<ChartBreak>();
+            for (int bi = 0; bi < y0.breaks.Count; bi = bi + 1) {
+                ChartBreak b = y0.breaks[bi];
+                if (Chart.BrkActive(b, (double)leftLo, (double)leftHi)) { act.Add(b); }
+            }
+            if (act.Count > 0) {
+                f.brkL = act;
+                f.brkIvL = brkIvL;
+                f.brkGapL = Chart.BrkGapReals(act, (double)leftLo, (double)leftHi);
+                double sp = (double)(leftHi - leftLo);
+                double bsp = 0.0;
+                for (int bi = 0; bi < act.Count; bi = bi + 1) {
+                    bsp = bsp + (act[bi].endD - act[bi].startD);
+                }
+                double gs = 0.0;
+                for (int bi = 0; bi < f.brkGapL.Count; bi = bi + 1) { gs = gs + f.brkGapL[bi]; }
+                f.brkSpanL = sp - bsp + gs;
+                if (f.brkSpanL < 1.0) { f.brkSpanL = 1.0; }
+            }
+        }
+        if (hasRight && y1.breaks != null && y1.breaks.Count > 0 && !rightFrac) {
+            List<ChartBreak> act2 = new List<ChartBreak>();
+            for (int bi = 0; bi < y1.breaks.Count; bi = bi + 1) {
+                ChartBreak b2 = y1.breaks[bi];
+                if (Chart.BrkActive(b2, (double)rightLo, (double)rightHi)) { act2.Add(b2); }
+            }
+            if (act2.Count > 0) {
+                f.brkR = act2;
+                f.brkIvR = brkIvR;
+                f.brkGapR = Chart.BrkGapReals(act2, (double)rightLo, (double)rightHi);
+                double sp2 = (double)(rightHi - rightLo);
+                double bsp2 = 0.0;
+                for (int bi = 0; bi < act2.Count; bi = bi + 1) {
+                    bsp2 = bsp2 + (act2[bi].endD - act2[bi].startD);
+                }
+                double gs2 = 0.0;
+                for (int bi = 0; bi < f.brkGapR.Count; bi = bi + 1) { gs2 = gs2 + f.brkGapR[bi]; }
+                f.brkSpanR = sp2 - bsp2 + gs2;
+                if (f.brkSpanR < 1.0) { f.brkSpanR = 1.0; }
+            }
+        }
+        if (!isTime && x0.breaks != null && x0.breaks.Count > 0 && !catY) {
+            List<ChartBreak> act3 = new List<ChartBreak>();
+            for (int bi = 0; bi < x0.breaks.Count; bi = bi + 1) {
+                ChartBreak b3 = x0.breaks[bi];
+                if (Chart.BrkActive(b3, (double)xLo, (double)xHi)) { act3.Add(b3); }
+            }
+            if (act3.Count > 0) {
+                f.brkX = act3;
+                f.brkGapX = Chart.BrkGapReals(act3, (double)xLo, (double)xHi);
+                double sp3 = (double)(xHi - xLo);
+                double bsp3 = 0.0;
+                for (int bi = 0; bi < act3.Count; bi = bi + 1) {
+                    bsp3 = bsp3 + (act3[bi].endD - act3[bi].startD);
+                }
+                double gs3 = 0.0;
+                for (int bi = 0; bi < f.brkGapX.Count; bi = bi + 1) { gs3 = gs3 + f.brkGapX[bi]; }
+                f.brkSpanX = sp3 - bsp3 + gs3;
+                if (f.brkSpanX < 1.0) { f.brkSpanX = 1.0; }
+            }
+        } else if (isTime && x0.breaks != null && x0.breaks.Count > 0) {
+            // 时间轴断带：breaks.startD/endD（epoch 毫秒）与帧的
+            // timeMin/timeMax 同空间直接比较。
+            List<ChartBreak> act4 = new List<ChartBreak>();
+            double tLo = (double)tMin;
+            double tHi = (double)tMax;
+            for (int bi = 0; bi < x0.breaks.Count; bi = bi + 1) {
+                ChartBreak b4 = x0.breaks[bi];
+                if (Chart.BrkActive(b4, tLo, tHi)) { act4.Add(b4); }
+            }
+            if (act4.Count > 0) {
+                f.brkX = act4;
+                f.brkGapX = Chart.BrkGapReals(act4, tLo, tHi);
+                double sp4 = tHi - tLo;
+                double bsp4 = 0.0;
+                for (int bi = 0; bi < act4.Count; bi = bi + 1) {
+                    bsp4 = bsp4 + (act4[bi].endD - act4[bi].startD);
+                }
+                double gs4 = 0.0;
+                for (int bi = 0; bi < f.brkGapX.Count; bi = bi + 1) { gs4 = gs4 + f.brkGapX[bi]; }
+                f.brkSpanX = sp4 - bsp4 + gs4;
+                if (f.brkSpanX < 1.0) { f.brkSpanX = 1.0; }
+            }
+        }
+
         f.plotX = plotX;
         f.plotY = plotY;
         f.plotW = plotW;
@@ -4837,6 +5373,47 @@ class Chart {
         } else {
             // 刻度取 Tick 副本（nice 端点）：映射范围留白外扩后，
             // 网格/标签仍落在整数 nice 值上，端格线悬在绘图区内侧。
+            // A15：该轴挂断带时刻度表换成 BrkTicks（区间倍数 + 跳断带 +
+            // 断带端点对 + 3/4·interval 剪除），像素走 elapsed 映射；
+            // interval 按 elapsed 跨度 / ticks 取整十倍档（nice 的近似，
+            // 官方 bar-breaks-simple 得 3000、gap0 demo 得 300 同档）。
+            if (f.BrkHas(0)) {
+                // interval 优先取量程阶段 BrkNiceExtent 存的 brkIvL；
+                // 未存（固定 min/max 等旁路）才按当前 elapsed 跨度现算，
+                // 取整档与官方 nice ROUND 一致：1/2/3/5/10（阈值
+                // 1.5/2.5/4/7），不是无断轴路径的 1/2/5。
+                double iv = f.brkIvL;
+                if (iv <= 0.0) {
+                    double eLo = Chart.BrkElapsed(f.brkL, f.brkGapL, (double)leftTickLo);
+                    double eHi = Chart.BrkElapsed(f.brkL, f.brkGapL, (double)leftTickHi);
+                    double eSpan = eHi - eLo;
+                    if (eSpan < 1.0) { eSpan = 1.0; }
+                    iv = eSpan / (ticks > 0 ? (double)ticks : 5.0);
+                    double mag = 1.0;
+                    while (mag * 10.0 <= iv) { mag = mag * 10.0; }
+                    double m = iv / mag;
+                    if (m < 1.5) { iv = mag; }
+                    else if (m < 2.5) { iv = 2.0 * mag; }
+                    else if (m < 4.0) { iv = 3.0 * mag; }
+                    else if (m < 7.0) { iv = 5.0 * mag; }
+                    else { iv = 10.0 * mag; }
+                    if (iv < 1.0) { iv = 1.0; }
+                }
+                List<double> bts = Chart.BrkTicks(f.brkL, f.brkGapL,
+                    (double)leftTickLo, (double)leftTickHi, iv);
+                for (int k = 0; k < bts.Count; k = k + 1) {
+                    double lvb = bts[k];
+                    int lvi = (int)Math.Round(lvb);
+                    int gy = f.YOfBrk(lvb, 0);
+                    if (grid) { c.FillRect(plotX, gy, plotW, 1, sGrid.BgOr(0)); }
+                    if (!y0Show) { continue; }
+                    string ls = Chart.Commas(y0.labelNegate ? 0 - lvi : lvi);
+                    if (y0.labelFormatter.Length > 0) { ls = y0.labelFormatter.Replace("{value}", ls); }
+                    int lw = Canvas.MeasureText(ls, fs);
+                    c.DrawText(plotX - app.Scale(6) - lw, Canvas.CenterTextYAt(gy, fs),
+                        ls, sAxis.FgOr(0), fs);
+                }
+            } else {
             int leftSpan = leftTickHi - leftTickLo;
             for (int k = 0; k <= ticks; k = k + 1) {
                 int lv = leftTickLo + leftSpan * k / ticks;
@@ -4848,6 +5425,7 @@ class Chart {
                 int lw = Canvas.MeasureText(ls, fs);
                 c.DrawText(plotX - app.Scale(6) - lw, Canvas.CenterTextYAt(gy, fs),
                     ls, sAxis.FgOr(0), fs);
+            }
             }
         }
         // ---- A12 minorSplitLine（CartesianAxisView.ts:170-200）----
@@ -4930,6 +5508,39 @@ class Chart {
                     c.DrawText(plotRight + app.Scale(6), Canvas.CenterTextYAt(gy, fs),
                         rs, sAxis.FgOr(0), fs);
                 }
+            } else if (f.BrkHas(1)) {
+                // A15：右值轴挂断带——与左轴同构：interval 优先取量程
+                // 阶段的 brkIvR，未存才现算；取整档与官方 nice ROUND
+                // 一致（1/2/3/5/10，阈值 1.5/2.5/4/7）。
+                double iv = f.brkIvR;
+                if (iv <= 0.0) {
+                    double eLo = Chart.BrkElapsed(f.brkR, f.brkGapR, (double)rightTickLo);
+                    double eHi = Chart.BrkElapsed(f.brkR, f.brkGapR, (double)rightTickHi);
+                    double eSpan = eHi - eLo;
+                    if (eSpan < 1.0) { eSpan = 1.0; }
+                    iv = eSpan / (rt > 0 ? (double)rt : 5.0);
+                    double mag = 1.0;
+                    while (mag * 10.0 <= iv) { mag = mag * 10.0; }
+                    double m2 = iv / mag;
+                    if (m2 < 1.5) { iv = mag; }
+                    else if (m2 < 2.5) { iv = 2.0 * mag; }
+                    else if (m2 < 4.0) { iv = 3.0 * mag; }
+                    else if (m2 < 7.0) { iv = 5.0 * mag; }
+                    else { iv = 10.0 * mag; }
+                    if (iv < 1.0) { iv = 1.0; }
+                }
+                List<double> bts = Chart.BrkTicks(f.brkR, f.brkGapR,
+                    (double)rightTickLo, (double)rightTickHi, iv);
+                for (int k = 0; k < bts.Count; k = k + 1) {
+                    double rvb = bts[k];
+                    int rvi = (int)Math.Round(rvb);
+                    int gy = f.YOfBrk(rvb, 1);
+                    if (grid) { c.FillRect(plotX, gy, plotW, 1, sGrid.BgOr(0)); }
+                    string rs = Chart.Commas(y1.labelNegate ? 0 - rvi : rvi);
+                    if (y1.labelFormatter.Length > 0) { rs = y1.labelFormatter.Replace("{value}", rs); }
+                    c.DrawText(plotRight + app.Scale(6), Canvas.CenterTextYAt(gy, fs),
+                        rs, sAxis.FgOr(0), fs);
+                }
             } else {
                 int rightSpan = rightTickHi - rightTickLo;
                 for (int k = 0; k <= rt; k = k + 1) {
@@ -4954,15 +5565,30 @@ class Chart {
         int y1LineX = plotX + plotW;
         if (y1RidesX0) { y1LineX = f.ZeroLineX(); }
         if (y0Line) {
-            c.FillRect(yLineX, plotY, app.Scale(2), plotH,
-                y0.axisLineColor != 0 ? y0.axisLineColor : sAxis.BgOr(0));
+            int ylcol = y0.axisLineColor != 0 ? y0.axisLineColor : sAxis.BgOr(0);
+            if (f.BrkHas(0)) {
+                Chart.DrawAxisLineBands(c, yLineX, plotY, plotH, true,
+                    app.Scale(2), ylcol, Chart.BrkPixelBands(f, 0));
+            } else {
+                c.FillRect(yLineX, plotY, app.Scale(2), plotH, ylcol);
+            }
         }
         if (x0Line) {
-            c.FillRect(plotX, xLineY, plotW, app.Scale(2), sAxis.BgOr(0));
+            if (f.brkX != null && f.brkX.Count > 0) {
+                Chart.DrawAxisLineBands(c, plotX, xLineY, plotW, false,
+                    app.Scale(2), sAxis.BgOr(0), Chart.BrkPixelBands(f, 2));
+            } else {
+                c.FillRect(plotX, xLineY, plotW, app.Scale(2), sAxis.BgOr(0));
+            }
         }
         if (y1Line) {
-            c.FillRect(y1LineX, plotY, 1, plotH,
-                y1.axisLineColor != 0 ? y1.axisLineColor : sAxis.BgOr(0));
+            int y1col = y1.axisLineColor != 0 ? y1.axisLineColor : sAxis.BgOr(0);
+            if (f.BrkHas(1)) {
+                Chart.DrawAxisLineBands(c, y1LineX, plotY, plotH, true, 1,
+                    y1col, Chart.BrkPixelBands(f, 1));
+            } else {
+                c.FillRect(y1LineX, plotY, 1, plotH, y1col);
+            }
         }
 
         // x 分类标签（时间轴用 TimeLabel 日期刻度；值轴画数值刻度）
