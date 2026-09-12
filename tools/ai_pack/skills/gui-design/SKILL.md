@@ -231,6 +231,19 @@ token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
   绝对定位后代也随内容滚(计入延伸);③ 滚轮认领要有指针悬停的
   先帧历史,UiDriver 脚本先 click 落点再 scroll,否则静默无效。
 
+- **百分比尺寸(宽/高,2026-09-12 修复)**:`width:50%`/`height:50%`
+  (样式表与内联 alike)对**流内块**按包含块解析,Chrome 逐盒 0px
+  (oracle `tests/weboracle/pct.json`)。语义边界(都实测过):
+  ① 包含块必须**定尺寸**——父块 `width/height` 声明(px 或 %,% 一路
+  向上解析到定尺寸祖先);② 容器 auto 高(按内容补齐)里子项 % 高
+  按 auto 回落测量偏好,不是 0(浏览器同款,别指望 % 高撑开 auto
+  父);③ **内在宽场景(shrink-to-fit、float 测量、grid auto 轨道、
+  flex 断行)% 按 auto**——css-sizing 规范,`width:50%` 的 float 不
+  会把容器内在宽算成一半;④ 声明了 % 高的空块不参与 margin 塌穿
+  (有确定高就不塌)。此前 % 宽整体失效(声明门不认千分比字段,
+  流内块宽回落 100% 母宽、高塌 0),已修复,
+  血条/HUD 宽度驱动从此可用 `SetProp("style","width:40%")`。
+
 - **`!important` 真的压得住 inline**:带标记的声明单独存、在普通级联
   (含宿主 inline)之后统一再套一遍,不是"剥掉标记按顺序碰运气"。
 - **渐变只认两端+中间一档**(`linear-gradient([dir,] a, b[, c])`);停靠点上的
