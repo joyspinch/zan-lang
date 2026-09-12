@@ -12,9 +12,59 @@
 #include "definite.h"
 #include "diag.h"
 #include "arena.h"
+#include "builtin_api.h"
 #include <string.h>
 
 static const char *type_name(zan_type_t *t);
+
+/* The static type of a built-in member call whose lowering produces a value
+ * irgen already knows the shape of: `"a,b".Split(",")` is a List<string> and
+ * `list.ToArray()` is a T[]. The table in builtin_api.c names the result (see
+ * zan_builtin_member_result); this resolves it to a type.
+ *
+ * Without it a call on a built-in receiver was typed TYPE_ERROR, which every
+ * assignability rule accepts. `string[] ks = text.Split(",");` therefore
+ * compiled, and irgen -- keying correctly off the expression's real type --
+ * emitted a List pointer into an array slot: `.Length` then read the List's
+ * own allocation header and reported 1 (or faulted), and element reads
+ * dereferenced a struct as a buffer. Typing the call turns that whole family
+ * into "cannot convert 'List' to 'string' in initializer" at the source. */
+static zan_type_t *builtin_call_result_type(zan_checker_t *c,
+                                            zan_type_t *recv,
+                                            zan_istr_t name) {
+    const char *bt = NULL;
+    if (!recv) return NULL;
+    if (recv->kind == TYPE_STRING) bt = "string";
+    else if (recv->kind == TYPE_CLASS && recv->name.len == 4 &&
+             memcmp(recv->name.str, "List", 4) == 0) bt = "List";
+    else if (recv->kind == TYPE_CLASS && recv->name.len == 4 &&
+             memcmp(recv->name.str, "Dict", 4) == 0) bt = "Dict";
+    else if (recv->kind == TYPE_CLASS && recv->name.len == 13 &&
+             memcmp(recv->name.str, "StringBuilder", 13) == 0)
+        bt = "StringBuilder";
+    if (!bt) return NULL;
+    /* Methods only: a property invoked with parentheses (`items.Count()`) is
+     * still the error irgen reports, and typing it here would mask nothing but
+     * would let the call reach lowering as if it were well-formed. */
+    if (zan_builtin_member_kind(bt, name.str, (int)name.len) != 'M') return NULL;
+    const char *res = zan_builtin_member_result(bt, name.str, (int)name.len);
+    if (!res) return NULL;
+    if (strcmp(res, "string") == 0) return c->binder->type_string;
+    if (strcmp(res, "int") == 0) return c->binder->type_int;
+    if (strcmp(res, "long") == 0) return c->binder->type_long;
+    if (strcmp(res, "double") == 0) return c->binder->type_double;
+    if (strcmp(res, "bool") == 0) return c->binder->type_bool;
+    if (strcmp(res, "List<string>") == 0)
+        return zan_binder_make_list_type(c->binder, c->binder->type_string);
+    /* ToArray() is the only built-in returning T[]: the receiver's own
+     * element type, so List<Item>.ToArray() is Item[]. */
+    if (strcmp(res, "T[]") == 0) {
+        zan_type_t *elem = recv->type_arg_count > 0 ? recv->type_args[0] : NULL;
+        if (!elem) return NULL;
+        return zan_binder_make_array_type(c->binder, elem);
+    }
+    return NULL;
+}
 
 /* Depth cap for every walk that follows base_type / interface chains. The
  * binder rejects cyclic inheritance outright (binder.c resolve_bases), but a
@@ -2200,6 +2250,13 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         c->last_call_node = expr;
         c->last_call_method = called_sym;
         check_call_arity(c, expr, recv);
+        /* A call on a built-in receiver (string/List/Dict/StringBuilder) has no
+         * symbol the generic paths below could read a return type from. */
+        if (!callee_is_method && recv) {
+            zan_type_t *br = builtin_call_result_type(c, recv,
+                                                      expr->call.callee->member.name);
+            if (br) return br;
+        }
         if (!callee_is_method && callee_type &&
             callee_type->kind == TYPE_DELEGATE) {
             zan_type_t *ret = callee_type->delegate_ret_type

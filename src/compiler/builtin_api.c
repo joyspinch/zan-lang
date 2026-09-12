@@ -207,7 +207,7 @@ const char *zan_builtin_member_result(const char *type, const char *name,
                                       int name_len) {
     static const char *results[] = {
         "string", "int", "long", "double", "bool", "void", "nint",
-        "List<string>", "List<K>", "List<V>", "ConsoleColor",
+        "List<string>", "List<K>", "List<V>", "ConsoleColor", "T[]",
     };
     const zan_builtin_type_t *bt = zan_builtin_find(type);
     if (!bt || !name || name_len <= 0) return NULL;

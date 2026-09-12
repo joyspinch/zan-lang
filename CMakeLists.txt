@@ -1021,6 +1021,22 @@ add_test(NAME diag_arg_class_to_list
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_arg_class_to_list PROPERTIES TIMEOUT 60)
 
+# A call on a built-in receiver (string/List/Dictionary/StringBuilder) has no
+# symbol, so the checker typed the call TYPE_ERROR -- which every assignability
+# rule accepts. `string[] ks = "a,b,c".Split(",")` therefore compiled, and irgen
+# stored a List pointer into an array slot: `.Length` read the List's own
+# allocation header (1) and element reads dereferenced a List struct as a
+# buffer. The built-in result table (builtin_api.c) now types those calls, so
+# the array target is rejected at the source.
+add_test(NAME diag_split_into_array
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/split_into_array.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_split_into_array${_exe_ext}
+    "-DEXPECT_REGEX=cannot convert .List. to .string. in initializer"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_split_into_array PROPERTIES TIMEOUT 60)
+
 
 # ---- Declared access control ----
 # public/private/internal/protected were parsed into metadata but the checker
