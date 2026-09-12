@@ -1,0 +1,733 @@
+using System;
+using System.IO;
+using System.Text;
+
+namespace Gui;
+
+/// WEB_GUI_ROADMAP P5：HTML 声明层运行时。同一份 .html 既是设计器
+/// 存取格式（P7）也是运行时建树语言——AI 熟悉 web，窗口直接用
+/// HTML + CSS 描述。
+///
+/// 只保证 AI 常生成的良构子集：配对标签、自闭合 `/>`、void 元素、
+/// 注释、`<!doctype>`、单双引号/裸属性值、五命名实体 + 数字实体。
+/// 容器 tag 建 `Element`（UA 样式表给 web 缺省语义），button/input/
+/// textarea/img 映射真控件。`<style>`/`<link rel=stylesheet>` 收集为
+/// CSS 串，由调用方并进样式表。`data-on-*` 事件与 `data-bind` 走
+/// HtmlHandlers 注册表协议（解析期接线，几何/样式零特殊路径）。
+///
+/// 空白处理对齐 HTML：文本 run 内连续空白塌缩成单空格；纯空白 run
+/// 只在两个行内级兄弟之间保留一个空格，块边界的丢掉（Chrome 同款，
+/// 几何 oracle 依赖此语义）。行内级判定按 UA 缺省 display 的 tag 表。
+
+/// 解析产物：body 根 + 收集的样式。root 恒为 body 元素——片段没有
+/// body 标签时包一层隐式 body（对齐 Chrome 的文档语义）。
+class HtmlDoc {
+    Control root;
+    string css;
+    int gen;        // style 属性合成类的计数器（zgen-N）
+}
+
+/// data-on-* 的处理器注册表：`handlers.Add("submit", () => ...)`，
+/// HTML 里 `data-on-click="submit"` 命中同名条目即接线。
+class HtmlHandlers {
+    Dict<string, Action> map;
+
+    void Add(string name, Action a) {
+        if (this.map == null) { this.map = new Dict<string, Action>(); }
+        this.map.Add(name, a);
+    }
+
+    /// 未注册的名字返回 null（静默不接线——HTML 是声明，事件在
+    /// 宿主语言里，名字打错表现为按钮没反应而非崩溃）。
+    Action Find(string name) {
+        if (this.map == null) { return null; }
+        Action a = null;
+        if (this.map.TryGetValue(name, out a)) { return a; }
+        return null;
+    }
+}
+
+/// 建树栈帧。mode：0 普通 Element，1 捕获文本（button/textarea，
+/// 关闭时才建控件），2 原文收集（style），3 原文跳过（script/title）。
+class HtmlFrame {
+    Control c;
+    string tag;
+    int mode;
+    string pending;     // 已塌缩、前后空白待裁决的文本
+    bool prevInline;    // pending 之前最近一个兄弟是否行内级
+    string label;       // mode 1/2 的累计文本
+    List<string> attrNames;   // mode 1 留到关闭时应用
+    List<string> attrVals;
+}
+
+/// 开标签扫描结果（Zan 无 out 参数，用返回类承载游标）。
+class HtmlOpenResult {
+    string name;
+    int next;
+    bool selfClose;
+}
+
+class Html {
+    /// 解析 `html`（整文档或片段）。`baseDir` 是 `<link>` 相对路径的
+    /// 基目录（空 = 不解析 link）。`handlers` 可为 null。
+    static HtmlDoc Parse(string html, string baseDir, HtmlHandlers handlers) {
+        HtmlDoc doc = new HtmlDoc();
+        doc.css = "";
+        doc.gen = 0;
+        doc.root = null;
+        List<HtmlFrame> st = new List<HtmlFrame>();
+        int n = html.Length;
+        int i = 0;
+        while (i < n) {
+            if (html[i] == 60) {   // '<'
+                // 注释 <!-- -->
+                if (i + 3 < n && html[i + 1] == 33 && html[i + 2] == 45
+                    && html[i + 3] == 45) {
+                    int end = Html.FindFrom(html, "-->", i + 4);
+                    i = end < 0 ? n : end + 3;
+                    continue;
+                }
+                // <!doctype ...>
+                if (i + 1 < n && html[i + 1] == 33) {
+                    int gt = Html.FindFrom(html, ">", i);
+                    i = gt < 0 ? n : gt + 1;
+                    continue;
+                }
+                // </close>
+                if (i + 1 < n && html[i + 1] == 47) {
+                    int j = i + 2;
+                    int ns = j;
+                    while (j < n && Html.IsNameChar(html[j])) { j = j + 1; }
+                    string name = html.Substring(ns, j - ns).ToLower();
+                    while (j < n && html[j] != 62) { j = j + 1; }
+                    i = j < n ? j + 1 : n;
+                    Html.CloseTag(st, doc, name, handlers);
+                    continue;
+                }
+                // 开标签
+                if (i + 1 < n && Html.IsAlpha(html[i + 1])) {
+                    List<string> an = new List<string>();
+                    List<string> av = new List<string>();
+                    HtmlOpenResult r = Html.OpenTag(html, i, an, av);
+                    i = r.next;
+                    Html.HandleOpen(st, doc, r.name, an, av, r.selfClose,
+                                    baseDir, handlers);
+                    continue;
+                }
+            }
+            // 原文模式（style/script/title）：读到对应闭标签为止
+            if (st.Count > 0) {
+                HtmlFrame top = st[st.Count - 1];
+                if (top.mode == 2 || top.mode == 3) {
+                    int close = Html.FindCloseTag(html, top.tag, i);
+                    int bodyEnd = close < 0 ? n : close;
+                    if (bodyEnd > i && top.mode == 2) {
+                        top.label = top.label + html.Substring(i, bodyEnd - i);
+                    }
+                    i = close < 0 ? n : close;
+                    if (i < n) { continue; }
+                }
+            }
+            // 文本 run
+            int lt = i;
+            while (lt < n && html[lt] != 60) { lt = lt + 1; }
+            if (lt > i) {
+                Html.FeedText(st, html.Substring(i, lt - i));
+                i = lt;
+            } else {
+                i = i + 1;   // 游离 '<'：按文本丢弃，防死循环
+            }
+        }
+        // 未显式闭合的帧全部收口
+        while (st.Count > 0) { Html.CloseTop(st, doc, handlers); }
+        if (doc.root == null) {
+            Element body = new Element();
+            body.InitElement("body", "");
+            doc.root = body;
+        }
+        return doc;
+    }
+
+    static bool IsAlpha(int c) {
+        return (c >= 97 && c <= 122) || (c >= 65 && c <= 90);
+    }
+
+    static bool IsNameChar(int c) {
+        return Html.IsAlpha(c) || (c >= 48 && c <= 57) || c == 45 || c == 95
+            || c == 58 || c == 46;
+    }
+
+    static bool IsSpaceChar(int c) {
+        return c == 32 || c == 10 || c == 13 || c == 9;
+    }
+
+    static int FindFrom(string s, string sub, int from) {
+        if (sub.Length == 0 || from >= s.Length) { return 0 - 1; }
+        int first = sub[0];
+        int limit = s.Length - sub.Length;
+        for (int i = from; i <= limit; i = i + 1) {
+            if (s[i] != first) { continue; }
+            bool ok = true;
+            for (int k = 1; k < sub.Length; k = k + 1) {
+                if (s[i + k] != sub[k]) { ok = false; break; }
+            }
+            if (ok) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    /// 大小写不敏感地找 `</tag`（原文模式收尾）。
+    static int FindCloseTag(string s, string tag, int from) {
+        int limit = s.Length - tag.Length - 2;
+        for (int i = from; i <= limit; i = i + 1) {
+            if (s[i] != 60 || s[i + 1] != 47) { continue; }
+            bool ok = true;
+            for (int k = 0; k < tag.Length; k = k + 1) {
+                int a = s[i + 2 + k] | 32;
+                int b = tag[k];
+                if (a != b) { ok = false; break; }
+            }
+            if (ok) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    /// 扫开标签：名字 + 属性表 + 自闭合标记，返回游标。
+    static HtmlOpenResult OpenTag(string html, int i,
+                                  List<string> an, List<string> av) {
+        HtmlOpenResult r = new HtmlOpenResult();
+        int n = html.Length;
+        int j = i + 1;
+        int ns = j;
+        while (j < n && Html.IsNameChar(html[j])) { j = j + 1; }
+        r.name = html.Substring(ns, j - ns).ToLower();
+        r.selfClose = false;
+        while (j < n) {
+            int ch = html[j];
+            if (ch == 62) { j = j + 1; break; }
+            if (ch == 47) {
+                if (j + 1 < n && html[j + 1] == 62) {
+                    r.selfClose = true;
+                    j = j + 2;
+                    break;
+                }
+                j = j + 1;
+                continue;
+            }
+            if (Html.IsSpaceChar(ch)) { j = j + 1; continue; }
+            int asn = j;
+            while (j < n && !Html.IsSpaceChar(html[j]) && html[j] != 61
+                   && html[j] != 62 && html[j] != 47) {
+                j = j + 1;
+            }
+            string aname = html.Substring(asn, j - asn).ToLower();
+            while (j < n && Html.IsSpaceChar(html[j])) { j = j + 1; }
+            string aval = "";
+            if (j < n && html[j] == 61) {
+                j = j + 1;
+                while (j < n && Html.IsSpaceChar(html[j])) { j = j + 1; }
+                if (j < n && (html[j] == 34 || html[j] == 39)) {
+                    int q = html[j];
+                    j = j + 1;
+                    int vs = j;
+                    while (j < n && html[j] != q) { j = j + 1; }
+                    aval = html.Substring(vs, j - vs);
+                    if (j < n) { j = j + 1; }
+                } else {
+                    int vs = j;
+                    while (j < n && !Html.IsSpaceChar(html[j])
+                           && html[j] != 62) {
+                        j = j + 1;
+                    }
+                    aval = html.Substring(vs, j - vs);
+                }
+            }
+            if (aname != "") {
+                an.Add(aname);
+                av.Add(Html.DecodeEntities(aval));
+            }
+        }
+        r.next = j;
+        return r;
+    }
+
+    // ---- 建树 -----------------------------------------------------------
+
+    static void HandleOpen(List<HtmlFrame> st, HtmlDoc doc, string name,
+                           List<string> an, List<string> av, bool selfClose,
+                           string baseDir, HtmlHandlers handlers) {
+        if (st.Count > 0) {
+            HtmlFrame top = st[st.Count - 1];
+            if (top.mode == 1) {
+                return;   // 捕获帧（button/textarea）内嵌元素：忽略
+            }
+        }
+        if (name == "html" || name == "head") { return; }   // 透明容器
+        if (name == "body") {
+            if (doc.root != null) { return; }   // 重复/迟到 body 忽略
+            Element body = new Element();
+            body.InitElement("body", Html.Attr(an, av, "id"));
+            doc.root = body;
+            Html.PushElement(st, body, "body");
+            return;
+        }
+        if (doc.root == null) {
+            // 片段：包一层隐式 body
+            Element body = new Element();
+            body.InitElement("body", "");
+            doc.root = body;
+            HtmlFrame bf = new HtmlFrame();
+            bf.c = body;
+            bf.tag = "body";
+            bf.mode = 0;
+            bf.pending = "";
+            bf.prevInline = false;
+            bf.label = "";
+            st.Add(bf);
+        }
+        HtmlFrame parent = st[st.Count - 1];
+        bool isInl = Html.IsInlineTag(name);
+
+        // 原文/捕获/void 的特殊 tag。凡进父容器的节点：先 Flush 父的
+        // pending 文本再 Add——文档序不能颠倒（行盒按 elOrder 分段）。
+        if (name == "style") {
+            Html.Flush(parent, false);
+            parent.prevInline = false;
+            Html.PushRaw(st, "style", 2);
+            return;
+        }
+        if (name == "script" || name == "title") {
+            Html.Flush(parent, false);
+            parent.prevInline = false;
+            Html.PushRaw(st, name, 3);
+            return;
+        }
+        if (name == "link") {
+            string rel = Html.Attr(an, av, "rel").ToLower();
+            string href = Html.Attr(an, av, "href");
+            if (rel == "stylesheet" && href != "" && baseDir != "") {
+                string path = baseDir + "/" + href;
+                if (File.Exists(path)) {
+                    string css = File.ReadAllText(path);
+                    doc.css = doc.css + css + "\n";
+                }
+            }
+            return;
+        }
+        if (name == "meta" || name == "base") { return; }
+
+        // 真控件映射
+        if (name == "button" || name == "textarea") {
+            Html.Flush(parent, true);
+            parent.prevInline = true;
+            Html.PushCapture(st, name, an, av);
+            return;
+        }
+        if (name == "input") {
+            string type = Html.Attr(an, av, "type").ToLower();
+            Control c = null;
+            if (type == "checkbox") {
+                Checkbox cb = new Checkbox();
+                cb.InitCheckbox("", new SignalBool(false));
+                c = cb;
+            } else {
+                Input inp = new Input();
+                inp.InitInput(new SignalString(Html.Attr(an, av, "value")),
+                              Html.Attr(an, av, "placeholder"));
+                c = inp;
+            }
+            Html.Flush(parent, true);
+            Html.Attach(c, name, an, av, doc, handlers);
+            Html.AddChild(parent.c, c);
+            parent.prevInline = true;
+            return;
+        }
+        if (name == "img") {
+            Image img = new Image();
+            img.InitImage(Html.Attr(an, av, "src"),
+                          Html.Attr(an, av, "alt"), "cover");
+            Html.Flush(parent, true);
+            Html.Attach(img, name, an, av, doc, handlers);
+            Html.AddChild(parent.c, img);
+            parent.prevInline = true;
+            return;
+        }
+        if (name == "br" || name == "hr") {
+            Element e = new Element();
+            e.InitElement(name, "");
+            Html.Flush(parent, name == "br");
+            Html.AddChild(parent.c, e);
+            parent.prevInline = name == "br";
+            return;
+        }
+
+        // 容器 Element（select 等未映射 tag 也落这里占位）
+        Element el = new Element();
+        el.InitElement(name, Html.Attr(an, av, "id"));
+        Html.Flush(parent, isInl);
+        Html.Attach(el, name, an, av, doc, handlers);
+        Html.AddChild(parent.c, el);
+        if (selfClose || Html.IsVoidTag(name)) {
+            parent.prevInline = isInl;
+            return;
+        }
+        Html.PushElement(st, el, name);
+    }
+
+    static void PushElement(List<HtmlFrame> st, Element e, string tag) {
+        HtmlFrame f = new HtmlFrame();
+        f.c = e;
+        f.tag = tag;
+        f.mode = 0;
+        f.pending = "";
+        f.prevInline = false;
+        f.label = "";
+        st.Add(f);
+    }
+
+    static void PushRaw(List<HtmlFrame> st, string tag, int mode) {
+        HtmlFrame f = new HtmlFrame();
+        f.c = null;
+        f.tag = tag;
+        f.mode = mode;
+        f.pending = "";
+        f.prevInline = false;
+        f.label = "";
+        st.Add(f);
+    }
+
+    static void PushCapture(List<HtmlFrame> st, string tag,
+                            List<string> an, List<string> av) {
+        HtmlFrame f = new HtmlFrame();
+        f.c = null;
+        f.tag = tag;
+        f.mode = 1;
+        f.pending = "";
+        f.prevInline = false;
+        f.label = "";
+        f.attrNames = an;
+        f.attrVals = av;
+        st.Add(f);
+    }
+
+    /// 挂子节点：Element 父走 AddKid（记录与 AddText 的文档序交错，
+    /// 行盒混排依赖），控件父走普通 Add。
+    static void AddChild(Control parent, Control c) {
+        if (parent is Element) {
+            ((Element)parent).AddKid(c);
+            return;
+        }
+        parent.Add(c);
+    }
+
+    static void CloseTag(List<HtmlFrame> st, HtmlDoc doc, string name,
+                         HtmlHandlers handlers) {
+        int at = 0 - 1;
+        for (int k = st.Count - 1; k >= 0; k = k - 1) {
+            if (st[k].tag == name) { at = k; break; }
+        }
+        if (at < 0) { return; }   // 游离闭标签忽略
+        // 隐式闭合中间帧（未写 </li> 之类）
+        while (st.Count - 1 > at) { Html.CloseTop(st, doc, handlers); }
+        Html.CloseTop(st, doc, handlers);
+        if (st.Count > 0) {
+            st[st.Count - 1].prevInline = Html.IsInlineTag(name);
+        }
+    }
+
+    static void CloseTop(List<HtmlFrame> st, HtmlDoc doc,
+                         HtmlHandlers handlers) {
+        HtmlFrame f = st[st.Count - 1];
+        st.RemoveAt(st.Count - 1);
+        if (f.mode == 2) {
+            doc.css = doc.css + f.label + "\n";
+            return;
+        }
+        if (f.mode == 3) { return; }
+        if (f.mode == 1) {
+            string label = Html.CollapseSpace(f.label).Trim();
+            Control c = null;
+            if (f.tag == "button") {
+                Button b = new Button();
+                b.InitButton(label);
+                c = b;
+            } else if (f.tag == "textarea") {
+                TextArea ta = new TextArea();
+                ta.InitTextArea(new SignalString(label), "");
+                c = ta;
+            } else {
+                return;
+            }
+            Html.Attach(c, f.tag, f.attrNames, f.attrVals, doc, handlers);
+            Html.AddChild(st[st.Count - 1].c, c);
+            return;
+        }
+        Html.Flush(f, Html.IsInlineTag(f.tag));
+    }
+
+    static void FeedText(List<HtmlFrame> st, string raw) {
+        if (st.Count == 0) { return; }
+        HtmlFrame top = st[st.Count - 1];
+        if (top.mode == 1) {
+            top.label = top.label + Html.DecodeEntities(raw);
+            return;
+        }
+        if (top.mode != 0) { return; }
+        string s = Html.CollapseSpace(Html.DecodeEntities(raw));
+        if (s == "") { return; }
+        // 行内级前驱才配保留 run 的前导空格（块边界空白丢弃）
+        if (top.pending == "" && !top.prevInline && s[0] == 32) {
+            s = Html.TrimLead(s);
+        }
+        top.pending = top.pending + s;
+    }
+
+    /// 结算 pending 文本。`nextInline`：紧随其后的节点是否行内级——
+    /// 尾随空格只在后面还是行内内容时保留（HTML 空白语义）。
+    static void Flush(HtmlFrame f, bool nextInline) {
+        string s = f.pending;
+        f.pending = "";
+        if (s == "") { return; }
+        bool wasPrev = f.prevInline;
+        if (!nextInline) { s = Html.TrimTrail(s); }
+        if (s == "") { return; }   // 纯空白且块边界：整体丢
+        if (s == " ") {
+            // 单空格只在两个行内级兄弟之间才有意义
+            if (wasPrev && nextInline) {
+                Html.EmitText(f, " ");
+                f.prevInline = true;
+            }
+            return;
+        }
+        Html.EmitText(f, s);
+        f.prevInline = true;
+    }
+
+    static void EmitText(HtmlFrame f, string s) {
+        if (f.c is Element) {
+            ((Element)f.c).AddText(s);
+        }
+        // 真控件下的游离文本无处安放（映射控件的文本走自己的协议）
+    }
+
+    // ---- 属性协议 --------------------------------------------------------
+
+    /// 把属性折进控件：id/class 在创建时已用，这里补 style 合成类、
+    /// data-on-* 事件接线、data-bind 绑定路径。
+    static void Attach(Control c, string tag, List<string> an,
+                       List<string> av, HtmlDoc doc, HtmlHandlers handlers) {
+        for (int i = 0; i < an.Count; i = i + 1) {
+            string k = an[i];
+            string v = av[i];
+            if (k == "id") {
+                if (!(c is Element)) { c.SetProp("name", v); }
+                continue;
+            }
+            if (k == "class") {
+                List<string> cs = Html.SplitClass(v);
+                for (int j = 0; j < cs.Count; j = j + 1) { c.AddClass(cs[j]); }
+                continue;
+            }
+            if (k == "style") {
+                string gen = "zgen-" + Convert.ToString(doc.gen);
+                doc.gen = doc.gen + 1;
+                c.AddClass(gen);
+                doc.css = doc.css + "." + gen + " { " + v + " }\n";
+                continue;
+            }
+            if (k == "data-bind") {
+                c.bindPath = v;
+                continue;
+            }
+            if (k.Length > 8 && Html.StartsWith(k, "data-on-")) {
+                string suffix = k.Substring(8, k.Length - 8);
+                string evt = Html.EventKind(suffix);
+                if (evt != "" && handlers != null) {
+                    Action a = handlers.Find(v);
+                    if (a != null) { c.BindEvent(evt, a); }
+                }
+                continue;
+            }
+            // 其余属性（href/title/alt/disabled/...）忽略（台账）
+        }
+    }
+
+    /// data-on-* 后缀 → AddByName 事件名。未映射的后缀返回空
+    /// （静默忽略：HTML 引用宿主没接的事件不该炸）。
+    static string EventKind(string suffix) {
+        if (suffix == "click") { return "Click"; }
+        if (suffix == "dblclick" || suffix == "doubleclick") {
+            return "DoubleClick";
+        }
+        if (suffix == "rightclick" || suffix == "contextmenu") {
+            return "RightClick";
+        }
+        if (suffix == "mousedown") { return "MouseDown"; }
+        if (suffix == "mouseup") { return "MouseUp"; }
+        if (suffix == "mouseenter" || suffix == "mouseover") { return "Enter"; }
+        if (suffix == "mouseleave" || suffix == "mouseout") { return "Leave"; }
+        if (suffix == "wheel") { return "Wheel"; }
+        if (suffix == "focus") { return "Focus"; }
+        if (suffix == "blur") { return "Blur"; }
+        if (suffix == "keydown") { return "KeyDown"; }
+        if (suffix == "keyup") { return "KeyUp"; }
+        if (suffix == "keypress") { return "KeyPress"; }
+        return "";
+    }
+
+    static string Attr(List<string> an, List<string> av, string name) {
+        for (int i = 0; i < an.Count; i = i + 1) {
+            if (an[i] == name) { return av[i]; }
+        }
+        return "";
+    }
+
+    static List<string> SplitClass(string v) {
+        List<string> outp = new List<string>();
+        int i = 0;
+        int n = v.Length;
+        while (i < n) {
+            while (i < n && Html.IsSpaceChar(v[i])) { i = i + 1; }
+            int s = i;
+            while (i < n && !Html.IsSpaceChar(v[i])) { i = i + 1; }
+            if (i > s) { outp.Add(v.Substring(s, i - s)); }
+        }
+        return outp;
+    }
+
+    // ---- 文本工具 --------------------------------------------------------
+
+    /// 行内级 tag 表：UA 样式表的 inline 集合 + 原子控件 + 未知 tag
+    /// 按 Chrome 缺省 inline 处理——块表用白名单（见 IsBlockTag）。
+    static bool IsInlineTag(string t) {
+        return !Html.IsBlockTag(t);
+    }
+
+    static bool IsBlockTag(string t) {
+        if (t == "div" || t == "p" || t == "section" || t == "article"
+            || t == "header" || t == "footer" || t == "nav" || t == "aside"
+            || t == "main" || t == "ul" || t == "ol" || t == "li"
+            || t == "dl" || t == "dt" || t == "dd" || t == "blockquote"
+            || t == "figure" || t == "figcaption" || t == "pre"
+            || t == "address" || t == "body" || t == "html" || t == "head"
+            || t == "hr" || t == "form" || t == "table" || t == "tr"
+            || t == "td" || t == "th" || t == "thead" || t == "tbody"
+            || t == "tfoot" || t == "h1" || t == "h2" || t == "h3"
+            || t == "h4" || t == "h5" || t == "h6" || t == "style"
+            || t == "script" || t == "title" || t == "meta" || t == "link") {
+            return true;
+        }
+        return false;
+    }
+
+    static bool IsVoidTag(string t) {
+        return t == "br" || t == "hr" || t == "img" || t == "input"
+            || t == "meta" || t == "link" || t == "base" || t == "area"
+            || t == "col" || t == "embed" || t == "source" || t == "track"
+            || t == "wbr" || t == "param";
+    }
+
+    static bool StartsWith(string s, string p) {
+        if (s.Length < p.Length) { return false; }
+        for (int i = 0; i < p.Length; i = i + 1) {
+            if (s[i] != p[i]) { return false; }
+        }
+        return true;
+    }
+
+    /// 连续空白塌缩成单空格（HTML 文本语义），不 trim 首尾。
+    static string CollapseSpace(string s) {
+        string outp = "";
+        bool inSpace = false;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i];
+            if (c == 32 || c == 10 || c == 13 || c == 9) {
+                inSpace = true;
+                continue;
+            }
+            if (inSpace) {
+                if (outp != "") { outp = outp + " "; }
+                inSpace = false;
+            }
+            outp = outp + s.Substring(i, 1);
+        }
+        if (inSpace && outp != "") { outp = outp + " "; }
+        return outp;
+    }
+
+    static string TrimLead(string s) {
+        int i = 0;
+        while (i < s.Length && s[i] == 32) { i = i + 1; }
+        return i == 0 ? s : s.Substring(i, s.Length - i);
+    }
+
+    static string TrimTrail(string s) {
+        int e = s.Length;
+        while (e > 0 && s[e - 1] == 32) { e = e - 1; }
+        return e == s.Length ? s : s.Substring(0, e);
+    }
+
+    /// 命名实体（amp/lt/gt/quot/apos/nbsp）+ 数字实体（&#39; &#x27;）。
+    static string DecodeEntities(string s) {
+        if (s.IndexOf("&") < 0) { return s; }
+        string outp = "";
+        int i = 0;
+        int n = s.Length;
+        while (i < n) {
+            if (s[i] != 38) { outp = outp + s.Substring(i, 1); i = i + 1; continue; }
+            int semi = Html.FindFrom(s, ";", i + 1);
+            if (semi < 0 || semi - i > 10) {
+                outp = outp + "&";
+                i = i + 1;
+                continue;
+            }
+            string ent = s.Substring(i + 1, semi - i - 1);
+            string dec = "";
+            if (ent == "amp") { dec = "&"; }
+            else if (ent == "lt") { dec = "<"; }
+            else if (ent == "gt") { dec = ">"; }
+            else if (ent == "quot") { dec = "\""; }
+            else if (ent == "apos") { dec = "'"; }
+            else if (ent == "nbsp") { dec = " "; }
+            else if (ent.Length > 1 && ent[0] == 35) {
+                // #NNN 或 #xHH
+                int code = 0 - 1;
+                if (ent[1] == 120 || ent[1] == 88) {
+                    code = Html.ParseHex(ent.Substring(2, ent.Length - 2));
+                } else {
+                    code = StyleSheet.ParseInt(
+                        ent.Substring(1, ent.Length - 1));
+                    if (code <= 0) { code = 0 - 1; }
+                }
+                if (code > 0 && code < 65536) { dec = Html.CharStr(code); }
+            }
+            if (dec == "") {
+                outp = outp + "&";
+                i = i + 1;
+                continue;
+            }
+            outp = outp + dec;
+            i = semi + 1;
+        }
+        return outp;
+    }
+
+    static int ParseHex(string s) {
+        int v = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] | 32;
+            int d = 0 - 1;
+            if (c >= 48 && c <= 57) { d = c - 48; }
+            else if (c >= 97 && c <= 102) { d = c - 87; }
+            if (d < 0) { return 0 - 1; }
+            v = v * 16 + d;
+            if (v > 65535) { return 0 - 1; }
+        }
+        return s.Length == 0 ? 0 - 1 : v;
+    }
+
+    /// 码点 → 单字符字符串。
+    static string CharStr(int code) {
+        return Encoding.Utf8FromCodePoint(code);
+    }
+}
