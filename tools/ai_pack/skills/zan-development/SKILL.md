@@ -88,6 +88,13 @@ down: later errors are usually fallout.
 `scripts/test.ps1 smoke | standard | full` — take the smallest tier that covers
 the change.
 
+**ctest green ≠ 当前工作区已验证**（2026-09-13 实证）：conformance 用例的
+`run_case.cmake` 有 up-to-date check——STDLIB_STAMP 不变就复用旧 exe 直接
+回放，工作区**未提交**的 stdlib 改动不碰 stamp，于是出现"ctest passed 但
+同一源文件手编失败"的假绿。多会话并行的仓库里，凡结论依赖"刚改过的东西
+过没过"，必须手编直跑（`build/zanc.exe <case>.zan --auto-stdlib -o
+_scratch/x.exe && _scratch/x.exe`）当真值，ctest 只当台账。
+
 ## 6b. Writing windows in HTML (Gui P5)
 
 Windows can be described in plain HTML + CSS instead of hand-built control

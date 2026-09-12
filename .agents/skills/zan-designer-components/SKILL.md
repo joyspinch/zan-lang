@@ -134,10 +134,14 @@ description: Zan 窗口设计器用户组件（components/*.zcomp）的全链路
   `inputnumber_test`/`image_test`/`pagination_test` 曾直接调
   GetExtra/SetExtra 断言——测试直调 Extra 臂 = 断言实现细节而非行为
   契约，正修是测试改走 GetProp/SetProp 管线，不是保留死臂。但删前
-  必须逐键核对语义等价：showAlpha 的臂调 SetShowAlpha（关闭时重置
-  alpha=255）有副作用、InputNumber.value 的臂走 ParseScaled 缩放
-  解析，spec 直绑不等价——这类文件整体挂后续做三件套转换
-  （快照 spec + SetProp 覆写截写 + GetProp 覆写应答），别一刀切。
+  必须逐键核对语义等价，不等价的臂不删、转三件套（第三刀落地）：
+  写路径有副作用的在 SetProp 覆写里截写（ColorPicker.showAlpha →
+  SetShowAlpha 的 alpha=255 重置——直绑字段丢重置，管线关再开实测
+  alpha 残留 0.5）；值通道语义特殊的截写+应答成对（InputNumber.
+  value/text → ParseScaled 缩放解析 + SetRaw 收口，读侧 DisplayText）；
+  读侧需归一/钳位的覆写应答（mode → ModeName 归一、precision →
+  Decimals 钳位）；无 spec 的 extra-only 键（ColorPicker value/
+  color/text、InputNumber loading）臂是唯一读写路径，保留。
 - **内置组件的直通属性行**（Image/Countdown/NumberAnimation/InputOtp
   已接）：键值存 f.extra["props"]（与引用节点实例值同一张直通表，
   "props" 不在 IsModeledKey），GenForm 泛化发射 SetProp、画布预览经

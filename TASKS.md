@@ -2297,3 +2297,28 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
   inputnumber/slider/tabs 测试全绿；gui_props/gui_zform_control/
   gui_css golden 字节级一致；gallery 全量编译过；smoke 全绿（除
   两个外部在途失败）。
+
+* **P8-2d 第三刀：语义不等价臂的三件套转换（ColorPicker/
+  InputNumber）**（2026-09-13）：第二刀挂账的两文件按判据矩阵逐键
+  落地。ColorPicker：showAlpha 走 SetProp 覆写截写（SetShowAlpha 的
+  alpha=255 重置是真语义，直绑字段丢重置——探针实测管线关再开
+  alpha 残留 0.5），mode 删双臂、GetProp 应答归一化名（原臂
+  ModeName 语义，spec 直读裸 Mode 不归一）；value/color/text 无
+  spec（extra-only）臂保留。InputNumber：value/text 截写走
+  ParseScaled（千分位与按 precision 缩放的展示文本，spec 裸
+  Convert 只认纯整数）+ SetRaw 收口（钳制/校验/事件），读侧
+  DisplayText；precision 读侧覆写 Decimals 钳位（spec 读裸
+  Precision）；min/max/step/hint(placeholder 别名)/group
+  (groupDigits 别名)/prefix/suffix/placement 八键经证等价（普通
+  字段直赋=实时绑定），臂全删；loading 无 spec 保留臂。
+  colorpicker_test 补管线 alpha 重置回归锁（专属实例防污染后续
+  弹层用例）；inputnumber_test 直调段转管线（loading 仍走 Extra）。
+  验证：两 widget golden 字节级不变；prop_test/gui_css golden
+  match；gallery 320 文件类型检查过（native 链接 __imp_
+  CoInitializeEx 失败系并发会话在途 zanc/CMake 状态，.zan 层无关）；
+  受影响面 smoke 子集 10/10——但 run_case.cmake 的 STAMP
+  up-to-date check 复用旧 exe，ctest 绿是回放（未提交改动不碰
+  stamp），直编才是真值（教训进 zan-development skill）。zform_
+  control/zform_grid 直编失败系并发会话在途 GenForm/checker（定向
+  stash A/B 实证与本次改动无关；测试文档只用 Button/Card/Label/
+  Panel）。
