@@ -4,7 +4,7 @@ Set-Location $root
 
 # ---- Standard Zan GUI project build for the IDE ---------------------------
 # src/ide_zan is a normal zan.proj project: the `entry` manifest key names the
-# designed form (src/IdeForm.zform), the GenForm generator projects it into a
+# designed form (src/IdeForm.html), the GenForm generator projects it into a
 # partial class with the program's Main, code-behind src/IdeForm.zan holds the
 # logic and the rest of the shell/editor lives under src/. zanc compiles
 # everything, drives the bundled linker, and links the static native GUI
@@ -110,10 +110,10 @@ if (!(Test-Path -LiteralPath $entry)) { Write-Output "PROJECT_ENTRY_NOT_FOUND $e
 Write-Output "[entry] $entry"
 
 # Every designed document in the project is compiled, not just the entry: one
-# .zform per visual unit (window / panel / dialog / page) with a same-named
+# .html per visual unit (window / panel / dialog / page) with a same-named
 # code-behind. The entry is passed separately (first), so skip it here to
 # avoid handing zanc the same path twice.
-$designs = @(Get-ChildItem src\ide_zan -Recurse -Include *.zform |
+$designs = @(Get-ChildItem src\ide_zan -Recurse -Include *.html |
     Where-Object { $_.FullName -ne $entry } |
     ForEach-Object { $_.FullName })
 if ($designs.Count -gt 0) {

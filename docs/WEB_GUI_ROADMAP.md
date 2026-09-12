@@ -19,7 +19,7 @@
 | P4 | grid：track sizing（auto/fr/minmax/px/%）、span、隐式轨道、gap、网格线放置 | ✅ 2026-09-12 | 1b1c5375 引擎 + db19356e 修复/断言/文档；oracle grid 19 盒全部 0px |
 | P5 | HTML 声明层：Html.zan parser、tag→控件映射、data-on-* 事件、data-bind、style/link 接线、GenHtml 编译期生成器、App.LoadHtml()、oracle 闭环 | ✅ 2026-09-12 | 09d73369 运行时 + dc3b55f9 生成器；oracle html 13 盒（tol 3）；编译期建树与运行时解析 13 盒 diff 全等；主文档 docs/HTML_UI.md |
 | P6 | overflow 滚动：auto/scroll 真语义（clip+偏移+滚动条） | ✅ 2026-09-12 | oracle scroll 16 盒全部 0px（auto/hidden/scroll 三态、程序滚动、钳制、嵌套组合）；UiDriver 实机滚轮验证（注入滚轮→子树精确平移） |
-| P7 | 设计器 + HUD：存取格式 = .html、Inspector CSS 编辑、拖拽翻译 CSS、游戏窗口层嵌入帧循环、IDE 自用窗体重写 | 🚧 2026-09-12 | P7a ✅：DesignerHtml 编解码器全键往返、GenForm .html 设计稿投影（与 .zform 同一生成）、生成器缓存键全 stdlib 哈希（genrun.c）、Designer.SaveHtml/LoadHtmlText 桥、IDE .html 设计稿九处接线；P7b ✅：字段内联 style 通道（SetProp("style")→ApplyInline，FormField.styleText，Inspector STYLE 声明行编辑，DesignerHtml style 属性互通，GenForm/FormBuilder 同落点；布局键让位设计几何记台账）；P7c（HUD 帧内）/P7d（IDE 31 个 .zform 迁移）进行中 |
+| P7 | 设计器 + HUD：存取格式 = .html、Inspector CSS 编辑、拖拽翻译 CSS、游戏窗口层嵌入帧循环、IDE 自用窗体重写 | 🚧 2026-09-12 | P7a ✅：DesignerHtml 编解码器全键往返、GenForm .html 设计稿投影（与 .zform 同一生成）、生成器缓存键全 stdlib 哈希（genrun.c）、Designer.SaveHtml/LoadHtmlText 桥、IDE .html 设计稿九处接线；P7b ✅：字段内联 style 通道（SetProp("style")→ApplyInline，FormField.styleText，Inspector STYLE 声明行编辑，DesignerHtml style 属性互通，GenForm/FormBuilder 同落点；布局键让位设计几何记台账）；P7d ✅（模板+IDE 43 份 .zform 全转 .html，模型级等价校验，引用全翻转，.zform 编译通道保留给旧项目）；P7c（HUD 帧内）进行中 |
 
 ## 每期验收纪律
 
@@ -234,6 +234,12 @@ golden/audit/Inert 名单同步 → 提交 `gui-web(Pn): 主题`。
   道）。data-zan-design 裸标记区分设计稿与运行期 HTML UI 文档：前者归
   GenForm（合成 partial class 窗体），后者归 GenHtml（建树类）；`.zform`
   JSON 不再手写，成为内部表示（Undo 快照/JSON 抽屉/LSP 契约仍用 JSON）。
+- **模板统一 .html（P7d）**：templates/gui 12 个 + IDE 自用 31 个
+  设计稿全部转成 .html（模型级等价校验：两种载入的 SaveJson 逐字节
+  一致）；zan.proj entry、build_ide 设计稿发现、IDE New Project/
+  New File/编译配对/入口解析全部 .html 优先（.zform 回退读旧项目）。
+  转换暴露并修复编解码器"缺省跳过"语义 bug：显式缺省有义
+  （fh:0/winZoom:0/pad:0/gap:0/label:""），豁免名单落在 AppendKey。
 - **字段内联 style 通道（P7b）**：字段的 `style` 键/元素 style 属性是
   控件内联 CSS 声明。`SetProp("style")` → `StyleSheet.ApplyInline`（声明
   文本走整块 CSS 解析器，布局键落控件字段、视觉键走 DeclSource+

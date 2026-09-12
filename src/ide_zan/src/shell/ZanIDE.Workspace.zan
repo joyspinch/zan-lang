@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Diagnostics;
 using System.Json;
+using System.Web;
 using Gui;
 using Gui.Widget;
 using Gui.Component;
@@ -339,7 +340,8 @@ partial class ZanIDE {
     /// RetargetForms with a target device profile id ("" = free-size desktop).
     static void RetargetForms(string srcDir, int devW, int devH, string devId,
                               List<string> log) {
-        List<string> files = DirectoryTree.Flat(srcDir, PathFilter.Only(".zform"));
+        List<string> files = DirectoryTree.Flat(srcDir,
+            PathFilter.Only(".html .zform"));
         for (int i = 0; i < files.Count; i = i + 1) {
             string fp = files[i];
             // 逐文件守卫：模板 src/ 里的一份坏 .zform（截断/手改的 JSON，
@@ -406,18 +408,25 @@ partial class ZanIDE {
                     File.WriteAllText(dir + "/src/" + name + ".zan", body);
                     File.Delete(dir + "/src/App.zan");
                 }
-                if (File.Exists(dir + "/src/App.zform")) {
+                if (File.Exists(dir + "/src/App.html")) {
+                    string body = File.ReadAllText(dir + "/src/App.html");
+                    File.WriteAllText(dir + "/src/" + name + ".html", body);
+                    File.Delete(dir + "/src/App.html");
+                } else if (File.Exists(dir + "/src/App.zform")) {
                     string body = File.ReadAllText(dir + "/src/App.zform");
                     File.WriteAllText(dir + "/src/" + name + ".zform", body);
                     File.Delete(dir + "/src/App.zform");
                 }
-                // 2-file model: the .zform IS the compiled design source (zanc's
-                // formgen projects its typed fields + Main at compile time), so
-                // only ensure the business file exists; the form is the entry.
-                // Window-app templates WITHOUT a .zform (e.g. WebView, which
-                // builds its UI in code) keep the manifest entry (src/main.zan).
+                // 2-file model: the .html design IS the compiled design source
+                // (zanc's formgen projects its typed fields + Main at compile
+                // time), so only ensure the business file exists; the form is
+                // the entry. Window-app templates WITHOUT a design (e.g.
+                // WebView, which builds its UI in code) keep the manifest
+                // entry (src/main.zan).
                 ZanIDE.SyncFormCodeBehinds(dir + "/src");
-                if (File.Exists(dir + "/src/" + name + ".zform")) {
+                if (File.Exists(dir + "/src/" + name + ".html")) {
+                    entry = "src/" + name + ".html";
+                } else if (File.Exists(dir + "/src/" + name + ".zform")) {
                     entry = "src/" + name + ".zform";
                 }
             }
@@ -479,7 +488,7 @@ partial class ZanIDE {
     /// layout file to keep in sync. Scenes follow the same two-file model.
     static void SyncFormCodeBehinds(string srcDir) {
         List<string> files = DirectoryTree.Flat(srcDir,
-            PathFilter.Only(".zform .zscene"));
+            PathFilter.Only(".zform .zscene .html .htm"));
         int i = 0;
         while (i < files.Count) {
             string fp = files[i];
@@ -556,6 +565,7 @@ partial class ZanIDE {
             return "";
         }
         if (kind == ZanIDE.FileKindForm() || kind == ZanIDE.FileKindFreeForm()) {
+            if (File.Exists(src + name + ".html")) { return src + name + ".html"; }
             if (File.Exists(src + name + ".zform")) { return src + name + ".zform"; }
             return "";
         }
@@ -629,7 +639,7 @@ partial class ZanIDE {
             return scenePath;
         }
         if (kind == ZanIDE.FileKindForm()) {
-            string formPath = root + "/src/" + name + ".zform";
+            string formPath = root + "/src/" + name + ".html";
             string cbPath = ZanIDE.CodeBehindPath(formPath);
             FormDoc o = new FormDoc();
             o.name = name;
@@ -640,7 +650,8 @@ partial class ZanIDE {
             o.layoutMode = 0;
             o.winZoom = 0;
             o.fields = new List<FormFieldDoc>();
-            File.WriteAllText(formPath, Json.Serialize<FormDoc>(o));
+            File.WriteAllText(formPath,
+                DesignerHtml.FromJsonDoc(Json.Serialize<FormDoc>(o)));
             if (!File.Exists(cbPath)) {
                 File.WriteAllText(cbPath, ZanIDE.GenBusinessShell(name));
             }
@@ -652,7 +663,7 @@ partial class ZanIDE {
             // design uses layoutMode 1 so every control is absolutely placed on
             // the canvas (the designer's Free mode), with a starter sample that
             // also demonstrates required-field validation and a wrapping hint.
-            string formPath = root + "/src/" + name + ".zform";
+            string formPath = root + "/src/" + name + ".html";
             string cbPath = ZanIDE.CodeBehindPath(formPath);
             File.WriteAllText(formPath, ZanIDE.FreeFormBody(name, winW, winH));
             if (!File.Exists(cbPath)) {
@@ -692,7 +703,10 @@ partial class ZanIDE {
     }
 
     static void OpenFirst(List<TabRecord> tabs, SignalInt active, string root) {
-        string formP = root + "/src/" + Path.GetFileName(root) + ".zform";
+        string formP = root + "/src/" + Path.GetFileName(root) + ".html";
+        if (!File.Exists(formP)) {
+            formP = root + "/src/" + Path.GetFileName(root) + ".zform";
+        }
         string main = root + "/src/main.zan";
         string lib = root + "/src/lib.zan";
         if (File.Exists(formP)) {
@@ -955,7 +969,9 @@ partial class ZanIDE {
         // A leftover generated Name.g.zan still routes to the design it came
         // from, which the compiler now projects directly.
         if (ZanIDE.IsGenPath(p)) {
-            string gform = p.Substring(0, p.Length - 6) + ".zform";
+            string gform = p.Substring(0, p.Length - 6) + ".html";
+            if (File.Exists(gform)) { return gform; }
+            gform = p.Substring(0, p.Length - 6) + ".zform";
             if (File.Exists(gform)) { return gform; }
             string gscene = p.Substring(0, p.Length - 6) + ".zscene";
             if (File.Exists(gscene)) { return gscene; }
@@ -963,7 +979,9 @@ partial class ZanIDE {
         // A form's business file (Name.zan) has no Main of its own; compile via
         // its paired .zform, which zanc projects into the window's entry point.
         if (ZanIDE.IsZanFilePath(p) && !ZanIDE.IsGenPath(p)) {
-            string form = p.Substring(0, p.Length - 4) + ".zform";
+            string form = p.Substring(0, p.Length - 4) + ".html";
+            if (File.Exists(form)) { return form; }
+            form = p.Substring(0, p.Length - 4) + ".zform";
             if (File.Exists(form)) { return form; }
             // Same for a scene's business file: compile via its .zscene.
             string scene = p.Substring(0, p.Length - 4) + ".zscene";
@@ -1009,9 +1027,9 @@ partial class ZanIDE {
             // resolve through --auto-stdlib at compile time and need no extra
             // files on the command line.
             string args0 = "\"" + entry + "\"";
-            // A loose .zform compiles together with its business half (Name.zan)
-            // - OnLoad / registered handlers live there.
-            if (ZanIDE.IsFormPath(entry)) {
+            // A loose design doc compiles together with its business half
+            // (Name.zan) - OnLoad / registered handlers live there.
+            if (ZanIDE.IsDesignFilePath(entry)) {
                 string cbp0 = ZanIDE.CodeBehindPath(entry);
                 if (File.Exists(cbp0)) { args0 = args0 + " \"" + cbp0 + "\""; have.Add(cbp0); }
             }
@@ -1581,7 +1599,9 @@ partial class ZanIDE {
         }
         string full = root + "/" + entry;
         if (ZanIDE.IsGenPath(full)) {
-            string form = full.Substring(0, full.Length - 6) + ".zform";
+            string form = full.Substring(0, full.Length - 6) + ".html";
+            if (File.Exists(form)) { return form; }
+            form = full.Substring(0, full.Length - 6) + ".zform";
             if (File.Exists(form)) { return form; }
             string scene = full.Substring(0, full.Length - 6) + ".zscene";
             if (File.Exists(scene)) { return scene; }

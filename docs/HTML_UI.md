@@ -151,6 +151,10 @@ P0-P4 节）。CSS 支持面（含 grid/flex/float）见 TASKS.md A16。
 设计稿标签页（body 有标记）自动进设计器并回存 HTML。`.zform` JSON 仍作为
 内部表示存在（撤销快照、JSON 抽屉、LSP 供数），不再手写。
 
+P7d 起全仓库窗口声明只有 .html 一种形态：templates/gui 12 份与 IDE 自用
+31 份设计稿均已迁移（模型级等价校验），模板/新建文件/编译发现全部以
+.html 为入口；.zform 编译通道保留，只为打开旧用户项目。
+
 ## 字段内联 style（P7b）
 
 字段的 `style` 键（设计稿里就是元素的 `style` 属性）是控件内联 CSS 声明，

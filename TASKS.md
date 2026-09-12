@@ -965,6 +965,29 @@ pt/pc/cm/mm/in/q）+ `calc()/min()/max()/clamp()`；`%` 在各属性原有通道
   言）、e2e（.zform style 键→生成代码→实例断言 bg/圆角+几何接管）。
   standard 层回归后提交。
 
+* **P7d 模板统一 .html（全仓库窗口声明单一格式）**（2026-09-12）：
+  **批量转换**——templates/gui 12 个 App.zform + src/ide_zan 31 个 .zform
+  → .html（转换器三重校验：模型级等价 LoadJson→SaveJson ==
+  LoadHtmlText→SaveJson、SaveHtml 再入稳定、IsDesignDoc 判真）。**转换
+  揪出编解码器"缺省跳过"的语义 bug**：显式缺省值是有义的（fh:0=矩形
+  边界、winZoom:0=适应视口、pad/gap:0=压过样式表缺省、label:""=显式
+  清空标签不落 kind 缺省文案）——AppendKey 零值/空串豁免名单
+  {fx,fy,fw,fh,winZoom,pad,gap}（数字）+ {label,placeholder}（字符串），
+  新键由模型级等价校验兜底。**引用翻转**——13 个 zan.proj entry、
+  build_ide.ps1 设计稿 glob、IDE 九文件（New Project 的 App 拷贝/改名、
+  RetargetForms 收 .html 并经 ToJsonDoc→RetargetDoc→FromJsonDoc 往返、
+  New File 表单/自由表单写 .html（FormDoc JSON → FromJsonDoc）、
+  OpenFirst/编译配对/入口解析 .html 优先 .zform 回退（旧用户项目仍
+  可编译）、IsDesignFilePath=path-only 双格式判定（设计器开门保持
+  TabRecord.designDoc 内容判定，任意网页不弹设计器）、CollectZan/
+  SyncFormCodeBehinds/AiAgent 文本与提示词）。**测试**：12/12 模板
+  实例化后以 .html 为入口编译通过（gui-components 顺带修掉模板自带
+  的 `"; +` 语法 bug）；conformance designer_html/gui_field_style/
+  zform 双金标/policy_zform_schema 全绿（zform.doc.json 补 style 键
+  说明 + P7d note）。改动的 9 个 IDE .zan 语法级检查干净（单文件
+  编译仅剩缺 partial 兄弟的语义错）。.zform 编译通道保留（旧用户
+  项目零破坏），仓库内不再有任何 .zform。
+
 # A17-A31 历史修复记录（全部完成，一行摘要）
 
 * **A17** ✅ 测试套件"要跑半小时"的真正原因（2026-07-28）：A17-1 三批测试没设
