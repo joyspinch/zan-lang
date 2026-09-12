@@ -1005,3 +1005,33 @@ A11 第一版只改了 y 轴（左/右）的四处量程点，漏了 **x 数值�
   钉 4 策略×5 向量 + 逐系列策略 + 解析/克隆 + 窗口组顶/组底 + 极坐标 +
   未声明 stack 门；全图库 335 demo 的堆叠点扫描（旧 vs 新）为 0 分歧
   ——**语义修正但无 demo 可见变化**，这类修复的价值在边界不在普查。
+
+## 富文本 textBorder*/textShadow* 的解析与 Canvas 近似（A14 会话）
+
+**现象**：label/rich 段的 `textBorderColor/textBorderWidth/textShadowColor/
+textShadowBlur/textShadowOffsetX/textShadowOffsetY` 六键在 Chart 目录 0 解析，
+bar-rich-text 卡头白字无描边（官方 `textBorder #333 2px` 描出轮廓才可读），
+9 个 demo 声明了这些键全部静默失效。
+
+- **源语义**（`label/labelStyle.ts:522,550-612`）：textBorder → zrender stroke，
+SVG 侧 `paint-order:stroke` = **描边画在填充之下**（先描后填，不是先填后描）；
+textShadow → `filter: feDropShadow(dx,dy,stdDeviation)`，dx/dy/blur 三独立参数。
+Canvas 没有 stroke-text/blur 原语，移植约定：**先阴影后描边后填充**；
+阴影 = 偏移色拷贝（纯 blur 无偏移 → 四向 1px 光晕近似）；
+描边 = ±r 四向拷贝（width≥2 再加四角），r=width。
+- **单点解析**：`ParseTextStyle`（label 级）与 `ParseRichStyle`（rich 段级）
+是仅有的两个解析点，六键各进 `tbColor/tbWidth/tsColor/tsBlur/tsDx/tsDy`；
+`tbWidth`/`tsBlur` 用 **-1 哨兵**（显式 0 是合法值，0 宽描边=no-op 但要留痕）。
+- **三层数据落点**：series label → `series.label`；data 项 label → 
+`data[i].dlabel`（gate 必须包含 border/shadow-only 声明，否则整块丢弃）；
+rich 段 → `label.rich`；geo 独立一份 `ChartGeo.labelSt`。
+写探针时 data 级 rich 要从 `data[0].dlabel.rich` 读——从 series label 读会拿 null，
+且 dlabel gate 不含 border 键时会静默 null（曾据此前叉出段错误）。
+- **绘制点要全**：`ChartView.DrawTextStyled` 双重载收尾，替换 6 个直出 
+DrawText：bar ×3（nInk/pInk/值标签）、line ×1、scatter labelLayout 
+延迟绘制（`s` 出作用域——并行 `List<ChartTextStyle>` 在收集时装）、
+map/geo ×2（`GeoLabelStyle`：geo.labelSt 优先，回落 lead.label）。
+- **验证闭环**：SVG oracle（`echarts.init(ssr:true)` 渲染后读 
+`paint-order`/`feDropShadow` 属性逐值对照）；
+`tests/conformance/chart_text_border.zan` 6 案（label 级、data 级 rich 段、
+显式 0 宽、geo label、Clone 双层、同段双效果）。

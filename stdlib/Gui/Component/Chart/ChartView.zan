@@ -1833,6 +1833,61 @@ partial class ChartView {
         return b;
     }
 
+    /// A14：带 textBorder/textShadow 的纯文本绘制（ECharts
+    /// labelStyle.ts:550——zrender 对 textBorderColor/Width 走 stroke
+    /// 字形、SVG 输出里是 `paint-order:stroke`，即**描边在填充之下**；
+    /// textShadow 是 filter: drop-shadow）。
+    ///
+    /// Canvas 无模糊/无字形描边原语，移植口径：
+    ///  - textBorder → 描边色按 width 圈 4 向（width>=2 加对角 4 向）
+    ///    各画一遍字形，再画填充字（描边永远垫底）。
+    ///  - textShadow → 无模糊退化为偏移影子；纯 blur（无偏移）近似
+    ///    为四向 1px 晕圈。垫在描边与填充之下。
+    /// 无样式文本直接 DrawText（零开销快路）。
+    static void DrawTextStyled(Canvas c, int x, int y, string text,
+                               int color, int fs,
+                               int tbColor, int tbWidth,
+                               int tsColor, int tsBlur, int tsDx, int tsDy) {
+        if (text.Length == 0) { return; }
+        if (tsColor != 0) {
+            int dx = tsDx;
+            int dy = tsDy;
+            if (tsBlur > 0 && dx == 0 && dy == 0) {
+                c.DrawText(x - 1, y, text, tsColor, fs);
+                c.DrawText(x + 1, y, text, tsColor, fs);
+                c.DrawText(x, y - 1, text, tsColor, fs);
+                c.DrawText(x, y + 1, text, tsColor, fs);
+            } else {
+                c.DrawText(x + dx, y + dy, text, tsColor, fs);
+            }
+        }
+        if (tbColor != 0 && tbWidth > 0) {
+            int r = tbWidth;
+            if (r >= 2) {
+                c.DrawText(x - r, y - r, text, tbColor, fs);
+                c.DrawText(x + r, y - r, text, tbColor, fs);
+                c.DrawText(x - r, y + r, text, tbColor, fs);
+                c.DrawText(x + r, y + r, text, tbColor, fs);
+            }
+            c.DrawText(x - r, y, text, tbColor, fs);
+            c.DrawText(x + r, y, text, tbColor, fs);
+            c.DrawText(x, y - r, text, tbColor, fs);
+            c.DrawText(x, y + r, text, tbColor, fs);
+        }
+        c.DrawText(x, y, text, color, fs);
+    }
+
+    /// DrawTextStyled 的 ChartTextStyle 版（label 级声明）。
+    static void DrawTextStyled(Canvas c, int x, int y, string text,
+                               int color, int fs, ChartTextStyle st) {
+        if (st == null || (st.tbColor == 0 && st.tsColor == 0)) {
+            c.DrawText(x, y, text, color, fs);
+            return;
+        }
+        ChartView.DrawTextStyled(c, x, y, text, color, fs,
+            st.tbColor, st.tbWidth, st.tsColor, st.tsBlur, st.tsDx, st.tsDy);
+    }
+
     /// 绘制富文本块：整块底板（boxBg/border/圆角）→ 全部段底色片
     /// 与线块 → 全部文字（两趟：abg 这类同行底板必须压在同行文字
     /// 之下——zrender 段底色先于本段文字，但跨段的 title|abg 需要底
@@ -1898,9 +1953,36 @@ partial class ChartView {
                 tx = ox + sg.x + sg.w - padR2 - sg.tw;
             }
             int ty = oy + sg.y + (sg.h - fh) / 2;
+            // A14：段级 textShadow 先垫（zrender 影子在最下）、
+            // textBorder 描边次之、填充字最后（paint-order:stroke）。
+            if (rs != null && rs.tsColor != 0) {
+                int sdx = rs.tsDx;
+                int sdy = rs.tsDy;
+                if (rs.tsBlur > 0 && sdx == 0 && sdy == 0) {
+                    c.DrawText(tx - 1, ty, sg.text, rs.tsColor, sg.fsPx);
+                    c.DrawText(tx + 1, ty, sg.text, rs.tsColor, sg.fsPx);
+                    c.DrawText(tx, ty - 1, sg.text, rs.tsColor, sg.fsPx);
+                    c.DrawText(tx, ty + 1, sg.text, rs.tsColor, sg.fsPx);
+                } else {
+                    c.DrawText(tx + sdx, ty + sdy, sg.text, rs.tsColor, sg.fsPx);
+                }
+            }
             bool bold = rs != null && (rs.fontWeight == "bold"
                 || rs.fontWeight == "bolder" || rs.fontWeight == "600"
                 || rs.fontWeight == "700" || rs.fontWeight == "800");
+            if (rs != null && rs.tbColor != 0 && rs.tbWidth > 0) {
+                int r = rs.tbWidth;
+                if (r >= 2) {
+                    c.DrawText(tx - r, ty - r, sg.text, rs.tbColor, sg.fsPx);
+                    c.DrawText(tx + r, ty - r, sg.text, rs.tbColor, sg.fsPx);
+                    c.DrawText(tx - r, ty + r, sg.text, rs.tbColor, sg.fsPx);
+                    c.DrawText(tx + r, ty + r, sg.text, rs.tbColor, sg.fsPx);
+                }
+                c.DrawText(tx - r, ty, sg.text, rs.tbColor, sg.fsPx);
+                c.DrawText(tx + r, ty, sg.text, rs.tbColor, sg.fsPx);
+                c.DrawText(tx, ty - r, sg.text, rs.tbColor, sg.fsPx);
+                c.DrawText(tx, ty + r, sg.text, rs.tbColor, sg.fsPx);
+            }
             if (bold) {
                 c.DrawTextBold(tx, ty, sg.text, col, sg.fsPx);
             } else {
