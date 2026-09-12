@@ -1,0 +1,218 @@
+using System;
+
+namespace Ra2.Formats;
+
+/// <summary>One decoded Westwood .AUD sound: 16-bit mono PCM ready to wrap
+/// as a WAV container. The retail sound effects (SOUND.MIX / AUDIO.MIX /
+/// CACHE.MIX entries) all ship in this container, so the game reads the
+/// player's own archives and decodes at load.</summary>
+class AudSound {
+    int rate;
+    int sampleCount;
+    byte[] pcm;
+    bool ok;
+
+    static AudSound Fail() {
+        AudSound s = new AudSound();
+        s.ok = false;
+        return s;
+    }
+
+    bool Valid() { return this.ok; }
+    int Rate() { return this.rate; }
+    int SampleCount() { return this.sampleCount; }
+    byte[] Pcm() { return this.pcm; }
+
+    /// <summary>Duration in whole milliseconds, the play-scheduling basis.</summary>
+    int DurationMs() {
+        if (!this.ok || this.rate <= 0) { return 0; }
+        return this.sampleCount * 1000 / this.rate;
+    }
+
+    /// <summary>Decodes a .AUD image. The 8-byte header is the sample rate
+    /// (u16), the data size (u32), the output sample width flag (u8: 0 = 8
+    /// bit output, 1 = 16 bit) and the compression byte (0 = raw PCM, 1 =
+    /// Westwood's own sliding-window codec, 99 = IMA ADPCM). The data is a
+    /// run of chunks, each `u16 compressed size, u16 output size` then the
+    /// payload; every IMA chunk restarts its predictor from its own first
+    /// bytes, which is what keeps a corrupt chunk from poisoning the rest.
+    /// Compression 1 (the TD-era Westwood codec) does not occur in the RA2
+    /// sets this reads and fails the decode.</summary>
+    static AudSound Decode(byte[] raw, int len) {
+        if (raw == null || len < 10) { return AudSound.Fail(); }
+        int rate = (raw[0] & 0xFF) + (raw[1] & 0xFF) * 256;
+        int dataSize = (int)(((long)(raw[2] & 0xFF))
+            | (((long)(raw[3] & 0xFF)) << 8)
+            | (((long)(raw[4] & 0xFF)) << 16)
+            | (((long)(raw[5] & 0xFF)) << 24));
+        int outBps = raw[6] & 0xFF;
+        int comp = raw[7] & 0xFF;
+        if (rate < 4000 || rate > 96000) { return AudSound.Fail(); }
+        if (dataSize < 0 || dataSize > len - 8) { dataSize = len - 8; }
+        AudSound s = new AudSound();
+        s.ok = false;
+        s.rate = rate;
+        s.pcm = new byte[0];
+        List<byte> outBuf = new List<byte>();
+        int at = 8;
+        int end = 8 + dataSize;
+        if (end > len) { end = len; }
+        while (at + 4 <= end) {
+            int chunkSize = (raw[at] & 0xFF) + (raw[at + 1] & 0xFF) * 256;
+            int outSize = (raw[at + 2] & 0xFF)
+                + (raw[at + 3] & 0xFF) * 256;
+            at = at + 4;
+            if (chunkSize <= 0 || at + chunkSize > end) { break; }
+            if (comp == 99) {
+                if (!AudSound.DecodeImaChunk(raw, at, chunkSize, outSize,
+                    outBuf)) {
+                    return AudSound.Fail();
+                }
+            } else if (comp == 0) {
+                if (!AudSound.DecodePcmChunk(raw, at, chunkSize, outBps,
+                    outBuf)) {
+                    return AudSound.Fail();
+                }
+            } else {
+                return AudSound.Fail();
+            }
+            at = at + chunkSize;
+        }
+        if (outBuf.Count <= 0) { return AudSound.Fail(); }
+        s.pcm = new byte[outBuf.Count];
+        for (int i = 0; i < outBuf.Count; i = i + 1) {
+            s.pcm[i] = outBuf[i];
+        }
+        s.sampleCount = outBuf.Count / 2;
+        s.ok = true;
+        return s;
+    }
+
+    /// <summary>A raw PCM chunk. Output width follows the header's out-bps
+    /// flag: 8-bit unsigned samples widen to 16-bit (each unsigned byte v
+    /// becomes (v - 128) &lt;&lt; 8); 16-bit samples copy through.</summary>
+    static bool DecodePcmChunk(byte[] raw, int at, int chunkSize, int outBps,
+        List<byte> outBuf) {
+        if (outBps == 0) {
+            for (int i = 0; i < chunkSize; i = i + 1) {
+                int v = ((raw[at + i] & 0xFF) - 128) << 8;
+                outBuf.Add((byte)(v & 0xFF));
+                outBuf.Add((byte)((v >> 8) & 0xFF));
+            }
+            return true;
+        }
+        int samples = chunkSize / 2;
+        for (int i = 0; i < samples; i = i + 1) {
+            outBuf.Add(raw[at + i * 2]);
+            outBuf.Add(raw[at + i * 2 + 1]);
+        }
+        return true;
+    }
+
+    /// <summary>One IMA ADPCM chunk, the compression-99 payload: a signed
+    /// 16-bit starting predictor, a 4-bit step index (one reserved byte
+    /// after it), then packed 4-bit nibbles, low nibble first. The header
+    /// predictor is itself the chunk's first output sample -- the chunk's
+    /// out-size counts it (1 + one per nibble), which is what keeps
+    /// outSize = 2 + 2*nibbles consistent. Standard IMA maths: the step
+    /// walks a fixed 89-entry table, each nibble adds a fraction of the
+    /// step to the predictor, and the index drifts by
+    /// {-1,-1,-1,-1,2,4,6,8} clamped to 0..88.</summary>
+    static bool DecodeImaChunk(byte[] raw, int at, int chunkSize, int outSize,
+        List<byte> outBuf) {
+        if (chunkSize < 4) { return false; }
+        int predictor = (raw[at] & 0xFF) + ((raw[at + 1] & 0xFF) << 8);
+        if (predictor >= 32768) { predictor = predictor - 65536; }
+        int stepIndex = raw[at + 2] & 0xFF;
+        if (stepIndex > 88) { stepIndex = 88; }
+        outBuf.Add((byte)(predictor & 0xFF));
+        outBuf.Add((byte)((predictor >> 8) & 0xFF));
+        int i = at + 4;
+        int end = at + chunkSize;
+        while (i < end) {
+            int b = raw[i] & 0xFF;
+            for (int half = 0; half < 2; half = half + 1) {
+                int nib = half == 0 ? b & 0x0F : (b >> 4) & 0x0F;
+                int step = AudSound.StepAt(stepIndex);
+                int diff = step >> 3;
+                if ((nib & 1) != 0) { diff = diff + (step >> 2); }
+                if ((nib & 2) != 0) { diff = diff + (step >> 1); }
+                if ((nib & 4) != 0) { diff = diff + step; }
+                if ((nib & 8) != 0) { diff = 0 - diff; }
+                predictor = predictor + diff;
+                if (predictor > 32767) { predictor = 32767; }
+                if (predictor < 0 - 32768) { predictor = 0 - 32768; }
+                stepIndex = stepIndex + AudSound.IndexDelta(nib);
+                if (stepIndex < 0) { stepIndex = 0; }
+                if (stepIndex > 88) { stepIndex = 88; }
+                outBuf.Add((byte)(predictor & 0xFF));
+                outBuf.Add((byte)((predictor >> 8) & 0xFF));
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /// <summary>The canonical IMA step table, 89 entries, and the per-nibble
+    /// index adjustment.</summary>
+    static int[] Steps;
+
+    static int StepAt(int index) {
+        if (AudSound.Steps == null) { AudSound.BuildSteps(); }
+        return AudSound.Steps[index];
+    }
+
+    static int IndexDelta(int nib) {
+        if (nib < 4) { return 0 - 1; }
+        return nib == 4 ? 2 : nib == 5 ? 4 : nib == 6 ? 6 : 8;
+    }
+
+    static void BuildSteps() {
+        int[] t = new int[89];
+        int v = 7;
+        for (int i = 0; i < 89; i = i + 1) {
+            t[i] = v;
+            v = v + (v >> 2) + 1;
+        }
+        AudSound.Steps = t;
+    }
+
+    /// <summary>Wraps decoded PCM as a little-endian WAV container
+    /// (RIFF/WAVE, mono 16-bit PCM) in memory, ready for
+    /// AudioClip.LoadWavFromMem. 44-byte canonical header, no chunks beyond
+    /// the data block.</summary>
+    static byte[] WavContainer(byte[] pcm, int rate) {
+        int dataLen = pcm.Length;
+        int fileLen = 36 + dataLen;
+        byte[] wav = new byte[44 + dataLen];
+        wav[0] = 82; wav[1] = 73; wav[2] = 70; wav[3] = 70;      // RIFF
+        AudSound.U32(wav, 4, fileLen);
+        wav[8] = 87; wav[9] = 65; wav[10] = 86; wav[11] = 69;    // WAVE
+        wav[12] = 102; wav[13] = 109; wav[14] = 116; wav[15] = 32; // fmt
+        AudSound.U32(wav, 16, 16);
+        AudSound.U16(wav, 20, 1);          // PCM
+        AudSound.U16(wav, 22, 1);          // mono
+        AudSound.U32(wav, 24, rate);
+        AudSound.U32(wav, 28, rate * 2);   // byte rate
+        AudSound.U16(wav, 32, 2);          // block align
+        AudSound.U16(wav, 34, 16);         // bits
+        wav[36] = 100; wav[37] = 97; wav[38] = 116; wav[39] = 97; // data
+        AudSound.U32(wav, 40, dataLen);
+        for (int i = 0; i < dataLen; i = i + 1) {
+            wav[44 + i] = pcm[i];
+        }
+        return wav;
+    }
+
+    static void U32(byte[] buf, int at, int v) {
+        buf[at] = (byte)(v & 0xFF);
+        buf[at + 1] = (byte)((v >> 8) & 0xFF);
+        buf[at + 2] = (byte)((v >> 16) & 0xFF);
+        buf[at + 3] = (byte)((v >> 24) & 0xFF);
+    }
+
+    static void U16(byte[] buf, int at, int v) {
+        buf[at] = (byte)(v & 0xFF);
+        buf[at + 1] = (byte)((v >> 8) & 0xFF);
+    }
+}

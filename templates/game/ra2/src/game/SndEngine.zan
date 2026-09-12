@@ -1,0 +1,1072 @@
+using System;
+using System.Collections.Generic;
+using Ra2.Assets;
+using Ra2.Formats;
+
+namespace Ra2.Game;
+
+/// <summary>One eva.ini dialog: the caption text, the speech file for the
+/// player's side, how important it is, and whether it queues behind the
+/// current speech instead of dropping.</summary>
+class EvaSpec {
+    string text;
+    string sound;
+    int priority;
+    bool queue;
+}
+
+/// <summary>eva.ini as a whole: the [DialogList] roster resolved against
+/// per-dialog sections. The sound column follows the player's side --
+/// Allied, Russian or Yuri -- with the shipped fallback to the two legacy
+/// columns when the side's own column is empty.</summary>
+class EvaSpecs {
+    List<string> names;
+    List<EvaSpec> specs;
+    string sidePrefix;
+
+    static EvaSpecs Create(string sidePrefix) {
+        EvaSpecs e = new EvaSpecs();
+        e.names = new List<string>();
+        e.specs = new List<EvaSpec>();
+        e.sidePrefix = sidePrefix;
+        return e;
+    }
+
+    /// <summary>The voice column a side speaks: the reference maps GDI to
+    /// "Allied", Yuri to "Yuri", everything else to "Russian".</summary>
+    static string PrefixForSide(int side) {
+        if (side == Side2.Allied()) { return "Allied"; }
+        if (side == Side2.Yuri()) { return "Yuri"; }
+        return "Russian";
+    }
+
+    static EvaSpecs Parse(IniDocument ini, int side) {
+        EvaSpecs e = EvaSpecs.Create(EvaSpecs.PrefixForSide(side));
+        IniSection list = ini.Section("DialogList");
+        if (list == null) { return e; }
+        for (int i = 0; i < list.Count(); i = i + 1) {
+            string dialogName = list.EntryAt(i).Value().Trim();
+            if (dialogName.Length == 0) { continue; }
+            IniSection sec = ini.Section(dialogName);
+            if (sec == null) { continue; }
+            EvaSpec sp = new EvaSpec();
+            sp.text = sec.Get("Text");
+            sp.sound = sec.Get(e.sidePrefix);
+            if (sp.sound.Length == 0) { sp.sound = sec.Get("Russian"); }
+            if (sp.sound.Length == 0) { sp.sound = sec.Get("Allied"); }
+            sp.priority = 1;
+            List<string> pri = SndSpecText.Tokens(sec.Get("Priority"));
+            for (int k = 0; k < pri.Count; k = k + 1) {
+                // reference 的 EvaPriority:Low/Normal/Important/Critical。
+                if (SndSpecText.SameWord(pri[k], "Low")) { sp.priority = 0; }
+                else if (SndSpecText.SameWord(pri[k], "Normal")) { sp.priority = 1; }
+                else if (SndSpecText.SameWord(pri[k], "Important")) { sp.priority = 2; }
+                else if (SndSpecText.SameWord(pri[k], "Critical")) { sp.priority = 3; }
+            }
+            string typeRaw = sec.Get("Type").Trim();
+            sp.queue = typeRaw.Length >= 3
+                && SndSpecText.SameWord(typeRaw, "queue");
+            e.names.Add(dialogName);
+            e.specs.Add(sp);
+        }
+        return e;
+    }
+
+    int Count() { return this.specs.Count; }
+
+    EvaSpec Spec(string name) {
+        if (name == null || name.Length == 0) { return null; }
+        for (int i = 0; i < this.names.Count; i = i + 1) {
+            if (SndSpecText.SameWord(this.names[i], name)) {
+                return this.specs[i];
+            }
+        }
+        return null;
+    }
+}
+
+/// <summary>The battlefield advisor's speech queue. Events land in a
+/// waiting list; every frame the queue sorts by priority, the cooldown
+/// filter drops everything still inside its five-second repeat gate, the
+/// loudest survivor speaks, and only the next survivor is kept behind it.
+/// While a voice is up, only events queued explicitly survive. One voice
+/// at a time.</summary>
+class Eva {
+    EvaSpecs specs;
+    List<EvaSpec> waiting;
+    List<string> lastPlayedNames;
+    List<long> lastPlayedAt;
+    SndEngine engine;
+    AudioVoice current;
+
+    static Eva Create(EvaSpecs specs, SndEngine engine) {
+        Eva e = new Eva();
+        e.specs = specs;
+        e.engine = engine;
+        e.waiting = new List<EvaSpec>();
+        e.lastPlayedNames = new List<string>();
+        e.lastPlayedAt = new List<long>();
+        e.current = null;
+        return e;
+    }
+
+    /// <summary>Queues a dialog by eva.ini name. `queue` keeps it alive
+    /// behind the current speech instead of dropping it.</summary>
+    void Play(string name, bool queue) {
+        EvaSpec spec = this.specs.Spec(name);
+        if (spec == null) { return; }
+        if (queue && !spec.queue) {
+            EvaSpec copy = new EvaSpec();
+            copy.text = spec.text;
+            copy.sound = spec.sound;
+            copy.priority = spec.priority;
+            copy.queue = true;
+            spec = copy;
+        }
+        this.waiting.Add(spec);
+    }
+
+    bool Speaking() {
+        return this.current != null && this.current.IsValid()
+            && this.current.IsPlaying();
+    }
+
+    long LastPlayedOf(EvaSpec spec) {
+        for (int i = 0; i < this.lastPlayedNames.Count; i = i + 1) {
+            if (SndSpecText.SameWord(this.lastPlayedNames[i],
+                spec.sound)) {
+                return this.lastPlayedAt[i];
+            }
+        }
+        return 0 - 1000000;
+    }
+
+    void MarkPlayed(EvaSpec spec, long now) {
+        for (int i = 0; i < this.lastPlayedNames.Count; i = i + 1) {
+            if (SndSpecText.SameWord(this.lastPlayedNames[i],
+                spec.sound)) {
+                this.lastPlayedAt[i] = now;
+                return;
+            }
+        }
+        this.lastPlayedNames.Add(spec.sound);
+        this.lastPlayedAt.Add(now);
+    }
+
+    /// <summary>The frame pump, the reference's exact waiting-list
+    /// discipline.</summary>
+    void Update(long now) {
+        if (this.Speaking()) {
+            for (int i = this.waiting.Count - 1; i >= 0; i = i - 1) {
+                if (!this.waiting[i].queue) {
+                    this.waiting.RemoveAt(i);
+                }
+            }
+            return;
+        }
+        this.current = null;
+        if (this.waiting.Count == 0) { return; }
+        // 优先级降序稳定排:同级的先来先说。
+        for (int i = 1; i < this.waiting.Count; i = i + 1) {
+            EvaSpec sp = this.waiting[i];
+            int j = i - 1;
+            while (j >= 0 && this.waiting[j].priority < sp.priority) {
+                this.waiting[j + 1] = this.waiting[j];
+                j = j - 1;
+            }
+            this.waiting[j + 1] = sp;
+        }
+        // 冷却过滤会整表替换:还在五秒门里的直接丢。
+        List<EvaSpec> eligible = new List<EvaSpec>();
+        for (int i = 0; i < this.waiting.Count; i = i + 1) {
+            if (now - this.LastPlayedOf(this.waiting[i]) >= 5000) {
+                eligible.Add(this.waiting[i]);
+            }
+        }
+        this.waiting = new List<EvaSpec>();
+        if (eligible.Count == 0) { return; }
+        EvaSpec chosen = eligible[0];
+        this.MarkPlayed(chosen, now);
+        AudioVoice voice = this.engine.PlaySpeech(chosen.sound);
+        if (voice != null && voice.IsValid()) {
+            this.current = voice;
+        }
+        // shift() 之后 splice(1):这一批只再留一条,其余作废。
+        if (eligible.Count > 1) {
+            this.waiting.Add(eligible[1]);
+        }
+    }
+}
+
+/// <summary>One theme.ini entry: a soundtrack's menu name, its music file,
+/// whether it joins the battle playlist, and whether it repeats itself.</summary>
+class MusicSpec {
+    string name;
+    string sound;
+    bool normal;
+    bool repeat;
+}
+
+/// <summary>theme.ini: the [Themes] roster and one section per theme.</summary>
+class MusicSpecs {
+    List<string> names;
+    List<MusicSpec> specs;
+
+    static MusicSpecs Create() {
+        MusicSpecs m = new MusicSpecs();
+        m.names = new List<string>();
+        m.specs = new List<MusicSpec>();
+        return m;
+    }
+
+    static MusicSpecs Parse(IniDocument ini) {
+        MusicSpecs m = MusicSpecs.Create();
+        IniSection themes = ini.Section("Themes");
+        if (themes == null) { return m; }
+        for (int i = 0; i < themes.Count(); i = i + 1) {
+            string themeName = themes.EntryAt(i).Value().Trim();
+            if (themeName.Length == 0) { continue; }
+            IniSection sec = ini.Section(themeName);
+            if (sec == null) { continue; }
+            MusicSpec sp = new MusicSpec();
+            sp.name = sec.Get("Name");
+            sp.sound = sec.Get("Sound");
+            string normalRaw = sec.Get("Normal").Trim();
+            sp.normal = normalRaw.Length == 0
+                || SndSpecText.SameWord(normalRaw, "yes")
+                || SndSpecText.SameWord(normalRaw, "true")
+                || normalRaw == "1";
+            string repeatRaw = sec.Get("Repeat").Trim();
+            sp.repeat = SndSpecText.SameWord(repeatRaw, "yes")
+                || SndSpecText.SameWord(repeatRaw, "true")
+                || repeatRaw == "1";
+            m.names.Add(themeName);
+            m.specs.Add(sp);
+        }
+        return m;
+    }
+
+    int Count() { return this.specs.Count; }
+
+    MusicSpec Spec(string name) {
+        if (name == null || name.Length == 0) { return null; }
+        for (int i = 0; i < this.names.Count; i = i + 1) {
+            if (SndSpecText.SameWord(this.names[i], name)) {
+                return this.specs[i];
+            }
+        }
+        return null;
+    }
+
+    MusicSpec At(int i) { return this.specs[i]; }
+}
+
+/// <summary>The battle soundtrack player: a playlist of the themes flagged
+/// Normal=yes, shuffled or straight, advancing when a track ends and
+/// holding on the current one when the options say repeat. Special screen
+/// types (INTRO, SCORE, LOADING, CREDITS, RA2Options) play their one named
+/// theme instead.</summary>
+class MusicPlayer {
+    MusicSpecs specs;
+    SndEngine engine;
+    List<MusicSpec> playlist;
+    int playlistIdx;
+    bool shuffle;
+    bool repeat;
+    string currentType;
+    string initialRepeatName;
+    AudioVoice current;
+
+    static MusicPlayer Create(MusicSpecs specs, SndEngine engine) {
+        MusicPlayer p = new MusicPlayer();
+        p.specs = specs;
+        p.engine = engine;
+        p.playlist = new List<MusicSpec>();
+        p.playlistIdx = 0 - 1;
+        p.shuffle = false;
+        p.repeat = false;
+        p.currentType = "";
+        p.initialRepeatName = "";
+        p.current = null;
+        return p;
+    }
+
+    void UnserializeOptions(string data) {
+        if (data == null || data.Length == 0) { return; }
+        int first = data.IndexOf(',');
+        if (first < 0) { return; }
+        int second = data.IndexOf(',', first + 1);
+        this.shuffle = SndSpecText.ToInt(data.Substring(0, first), 0) != 0;
+        if (second < 0) {
+            this.repeat = SndSpecText.ToInt(
+                data.Substring(first + 1), 0) != 0;
+            return;
+        }
+        this.repeat = SndSpecText.ToInt(
+            data.Substring(first + 1, second - first - 1), 0) != 0;
+        this.initialRepeatName = data.Substring(second + 1).Trim();
+    }
+
+    string SerializeOptions() {
+        string repeatName = "";
+        if (this.repeat && this.playlistIdx >= 0
+         && this.playlistIdx < this.playlist.Count) {
+            repeatName = this.playlist[this.playlistIdx].name;
+        }
+        return Convert.ToString(this.shuffle ? 1 : 0) + ","
+            + Convert.ToString(this.repeat ? 1 : 0) + "," + repeatName;
+    }
+
+    bool ShuffleMode() { return this.shuffle; }
+    bool RepeatMode() { return this.repeat; }
+
+    List<MusicSpec> GetPlaylist() {
+        return this.BuildPlaylist(this.shuffle);
+    }
+
+    /// <summary>The normal-flagged themes, optionally Fisher-Yates
+    /// shuffled through the engine's own random.</summary>
+    List<MusicSpec> BuildPlaylist(bool shuffleNow) {
+        List<MusicSpec> list = new List<MusicSpec>();
+        for (int i = 0; i < this.specs.Count(); i = i + 1) {
+            if (this.specs.At(i).normal) { list.Add(this.specs.At(i)); }
+        }
+        if (shuffleNow) {
+            for (int i = list.Count - 1; i > 0; i = i - 1) {
+                int j = this.engine.Rand(i + 1);
+                MusicSpec tmp = list[i];
+                list[i] = list[j];
+                list[j] = tmp;
+            }
+        }
+        return list;
+    }
+
+    /// <summary>Starts a music mode. Normal and NormalShuffle walk the
+    /// playlist; a named type plays its one theme. The same type twice in
+    /// a row is a no-op.</summary>
+    void Play(string type) {
+        if (this.currentType == type) { return; }
+        bool normal = SndSpecText.SameWord(type, "Normal")
+            || SndSpecText.SameWord(type, "NormalShuffle");
+        if (normal) {
+            bool shuffleNow = this.shuffle || SndSpecText.SameWord(type,
+                "NormalShuffle");
+            this.playlist = this.BuildPlaylist(shuffleNow);
+            this.playlistIdx = 0;
+            if (this.initialRepeatName.Length > 0) {
+                for (int i = 0; i < this.playlist.Count; i = i + 1) {
+                    if (SndSpecText.SameWord(this.playlist[i].name,
+                        this.initialRepeatName)) {
+                        this.playlistIdx = i;
+                        break;
+                    }
+                }
+            }
+            if (this.PlaylistCount() == 0) { return; }
+            if (this.PlaySpec(this.playlist[this.playlistIdx])) {
+                this.currentType = type;
+            }
+            return;
+        }
+        MusicSpec spec = this.specs.Spec(type);
+        if (spec != null) {
+            if (this.PlaySpec(spec)) { this.currentType = type; }
+        }
+    }
+
+    void StopPlaying() {
+        if (this.current != null) {
+            this.current.Stop();
+            this.current = null;
+        }
+        this.currentType = "";
+    }
+
+    void SetShuffleMode(bool shuffleNow) {
+        if (shuffleNow == this.shuffle) { return; }
+        this.shuffle = shuffleNow;
+        MusicSpec currentItem = null;
+        if (this.playlistIdx >= 0 && this.playlistIdx < this.playlist.Count) {
+            currentItem = this.playlist[this.playlistIdx];
+        }
+        this.playlist = this.BuildPlaylist(this.shuffle);
+        this.playlistIdx = 0 - 1;
+        if (currentItem != null) {
+            for (int i = 0; i < this.playlist.Count; i = i + 1) {
+                if (this.playlist[i] == currentItem) {
+                    this.playlistIdx = i;
+                    break;
+                }
+            }
+        }
+    }
+
+    void SetRepeatMode(bool repeatNow) {
+        this.repeat = repeatNow;
+    }
+
+    /// <summary>Jump to a playlist entry and keep cycling from there.</summary>
+    void SelectPlaylistItem(int index) {
+        if (index < 0 || index >= this.playlist.Count) { return; }
+        this.playlistIdx = index;
+        this.StopPlaying();
+        this.PlaySpec(this.playlist[this.playlistIdx]);
+    }
+
+    int PlaylistCount() {
+        return this.playlist != null ? this.playlist.Count : 0;
+    }
+
+    /// <summary>Plays one theme; a Repeat=yes theme loops its clip, the
+    /// rest hand the advance decision to the frame pump when they end.</summary>
+    bool PlaySpec(MusicSpec spec) {
+        if (spec == null || spec.sound.Length == 0) { return false; }
+        if (this.current != null) {
+            this.current.Stop();
+            this.current = null;
+        }
+        AudioClip clip = this.engine.LoadClip(spec.sound);
+        if (clip == null || !clip.IsValid()) {
+            return false;
+        }
+        this.current = spec.repeat
+            ? clip.PlayLooping(this.engine.ChannelGainOf(Ch.Music()))
+            : clip.Play(this.engine.ChannelGainOf(Ch.Music()), 0);
+        return this.current.IsValid();
+    }
+
+    /// <summary>The frame pump: a finished non-looping track advances the
+    /// playlist -- repeating forever when the option says so.</summary>
+    void Update() {
+        if (this.current == null || !this.current.IsValid()) { return; }
+        if (this.current.IsPlaying()) { return; }
+        if (this.PlaylistCount() == 0) { return; }
+        this.playlistIdx = this.repeat
+            ? this.playlistIdx
+            : (this.playlistIdx + 1) % this.PlaylistCount();
+        this.PlaySpec(this.playlist[this.playlistIdx]);
+    }
+}
+
+/// <summary>One registered playback: the spec and its live voice, the copy
+/// limit's bookkeeping.</summary>
+class SndHandle {
+    SoundSpec spec;
+    AudioVoice voice;
+}
+
+/// <summary>One positional voice on the battlefield: where it sits, whose
+/// it is, and the gain math it last resolved to.</summary>
+class WorldVoice {
+    SoundSpec spec;
+    double x;
+    double y;
+    int side;
+    AudioVoice voice;
+    double gain;
+    double volume;
+    bool loop;
+}
+
+/// <summary>The sound engine facade: the mixer, the parsed tables, the
+/// clip cache and the playback paths. Tables come from the player's own
+/// install (sound.ini / eva.ini / theme.ini, base and MD variants layered);
+/// an install without them plays silently, exactly like the shipped
+/// engine's missing-section path.</summary>
+class SndEngine {
+    SndMixer mixer;
+    SoundSpecs specs;
+    EvaSpecs evaSpecs;
+    Eva eva;
+    MusicSpecs musicSpecs;
+    MusicPlayer music;
+    IniDocument rules;
+    Vfs vfs;
+    Random rand;
+    List<string> clipKeys;
+    List<AudioClip> clips;
+    List<string> seqKeys;
+    List<AudioClip> seqClips;
+    List<SndHandle> handles;
+    List<WorldVoice> voices;
+    bool deviceOpen;
+    int localSide;
+    // 视口中心格与视口尺寸:位置音量每拍重算的基准。
+    double centerX;
+    double centerY;
+    double viewW;
+    double viewH;
+    bool haveCenter;
+
+    static SndEngine Create() {
+        SndEngine e = new SndEngine();
+        e.mixer = SndMixer.Create();
+        e.specs = SoundSpecs.Create();
+        e.evaSpecs = EvaSpecs.Create("Russian");
+        e.musicSpecs = MusicSpecs.Create();
+        e.rules = null;
+        e.vfs = null;
+        e.rand = Random.Seeded(0x5EED1234);
+        e.clipKeys = new List<string>();
+        e.clips = new List<AudioClip>();
+        e.seqKeys = new List<string>();
+        e.seqClips = new List<AudioClip>();
+        e.handles = new List<SndHandle>();
+        e.voices = new List<WorldVoice>();
+        e.deviceOpen = false;
+        e.localSide = 0;
+        e.centerX = 0.0;
+        e.centerY = 0.0;
+        e.viewW = 800.0;
+        e.viewH = 600.0;
+        e.haveCenter = false;
+        e.eva = Eva.Create(e.evaSpecs, e);
+        e.music = MusicPlayer.Create(e.musicSpecs, e);
+        return e;
+    }
+
+    // ---- 装载 ------------------------------------------------------------
+
+    /// <summary>Reads the audio tables from the player's install. The MD
+    /// variant layers over the base one (Yuri's Revenge overrides), the
+    /// shipped last-wins rule. Missing tables leave that subsystem empty;
+    /// the game stays silent rather than guessing.</summary>
+    static SndEngine Load(Vfs vfs, IniDocument rulesIni, int side) {
+        SndEngine e = SndEngine.Create();
+        e.vfs = vfs;
+        e.rules = rulesIni;
+        e.localSide = side;
+        e.deviceOpen = Audio.Open();
+        e.specs = SoundSpecs.Parse(AssetDb.LayerIni(e.ReadIni("SOUND.INI"),
+            e.ReadIni("SOUNDMD.INI")));
+        e.evaSpecs = EvaSpecs.Parse(AssetDb.LayerIni(e.ReadIni("EVA.INI"),
+            e.ReadIni("EVAMD.INI")), side);
+        e.musicSpecs = MusicSpecs.Parse(AssetDb.LayerIni(
+            e.ReadIni("THEME.INI"), e.ReadIni("THEMEMD.INI")));
+        e.eva = Eva.Create(e.evaSpecs, e);
+        e.music = MusicPlayer.Create(e.musicSpecs, e);
+        return e;
+    }
+
+    IniDocument ReadIni(string name) {
+        if (this.vfs == null || !this.vfs.Contains(name)) {
+            return IniDocument.Create();
+        }
+        List<int> len = new List<int>();
+        len.Add(0);
+        byte[] raw = this.vfs.Read(name, len);
+        if (len[0] == 0) { return IniDocument.Create(); }
+        int start = 0;
+        for (int i = 0; i < len[0]; i = i + 1) {
+            if ((raw[i] & 0xFF) == 91) { start = i; break; }
+        }
+        return IniParser.Parse(raw.ToStr(start, len[0] - start));
+    }
+
+    bool Ready() { return this.deviceOpen; }
+
+    // ---- 混音台 -----------------------------------------------------------
+
+    void SetVolume(int channel, double volume) {
+        this.mixer.SetVolume(channel, volume);
+        if (channel == Ch.Master()) {
+            Audio.SetVolume(this.mixer.IsMuted(Ch.Master())
+                ? 0.0 : this.mixer.GetVolume(Ch.Master()));
+        }
+    }
+
+    double ChannelGainOf(int channel) {
+        return this.mixer.ChannelGain(channel);
+    }
+
+    void SetMuted(int channel, bool muted) {
+        this.mixer.SetMuted(channel, muted);
+        if (channel == Ch.Master()) {
+            Audio.SetVolume(muted ? 0.0
+                : this.mixer.GetVolume(Ch.Master()));
+        }
+    }
+
+    string SerializeMixer() {
+        return this.mixer.Serialize();
+    }
+
+    void UnserializeMixer(string data) {
+        this.mixer.Unserialize(data);
+    }
+
+    // ---- 采样 ------------------------------------------------------------
+
+    int Rand(int bound) {
+        if (bound <= 0) { return 0; }
+        return this.rand.NextBelow(bound);
+    }
+
+    /// <summary>Decodes one <name>.AUD from the install and wraps it as a
+    /// WAV clip. Failed loads are not cached, so a late-arriving archive is
+    /// picked up on the next call.</summary>
+    AudioClip LoadClip(string soundName) {
+        string key = soundName.ToUpper();
+        for (int i = 0; i < this.clipKeys.Count; i = i + 1) {
+            if (this.clipKeys[i] == key) { return this.clips[i]; }
+        }
+        string fileName = AudFileOf(soundName);
+        if (this.vfs == null || !this.vfs.Contains(fileName)) {
+            return null;
+        }
+        List<int> len = new List<int>();
+        len.Add(0);
+        byte[] raw = this.vfs.Read(fileName, len);
+        if (len[0] < 10) { return null; }
+        AudSound snd = AudSound.Decode(raw, len[0]);
+        if (!snd.Valid()) { return null; }
+        byte[] wav = AudSound.WavContainer(snd.Pcm(), snd.Rate());
+        AudioClip clip = AudioClip.LoadWavFromMem(wav.ToStr(0, wav.Length),
+            wav.Length);
+        if (!clip.IsValid()) { return null; }
+        this.Remember(this.clipKeys, this.clips, key, clip);
+        return clip;
+    }
+
+    static string AudFileOf(string soundName) {
+        if (soundName.Length > 4
+         && soundName[soundName.Length - 4] == 46) {
+            return soundName.ToUpper();
+        }
+        return soundName.ToUpper() + ".AUD";
+    }
+
+    /// <summary>The attack/main/decay sequence of a spec, concatenated into
+    /// one clip so the shipped order-of-parts structure survives a player
+    /// with no sample scheduling. The parts' picks are the reference's own
+    /// random ranges. (The native output carries no rate control, so the
+    /// FShift pitch jitter has nothing to apply to and is not played.)</summary>
+    AudioClip LoadSequence(SoundSpec spec) {
+        int attackCount = spec.HasControl(SndSpecText.ControlAttack())
+            ? (spec.attack > 0 ? spec.attack : 1) : 0;
+        int decayCount = spec.HasControl(SndSpecText.ControlDecay())
+            ? (spec.decay > 0 ? spec.decay : 1) : 0;
+        int mainCount = spec.sounds.Count - attackCount - decayCount;
+        if (mainCount < 0) { return null; }
+        string key = spec.name + "#" + Convert.ToString(attackCount)
+            + "/" + Convert.ToString(mainCount) + "/"
+            + Convert.ToString(decayCount);
+        for (int i = 0; i < this.seqKeys.Count; i = i + 1) {
+            if (this.seqKeys[i] == key) { return this.seqClips[i]; }
+        }
+        List<byte[]> parts = new List<byte[]>();
+        List<int> rates = new List<int>();
+        if (attackCount > 0) {
+            if (!this.CollectPart(spec, this.Rand(attackCount), parts,
+                rates)) {
+                return null;
+            }
+        }
+        if (mainCount > 0) {
+            if (!this.CollectPart(spec, attackCount + this.Rand(mainCount),
+                parts, rates)) {
+                return null;
+            }
+        }
+        if (decayCount > 0) {
+            if (!this.CollectPart(spec,
+                spec.sounds.Count - decayCount + this.Rand(decayCount),
+                parts, rates)) {
+                return null;
+            }
+        }
+        if (parts.Count == 0) { return null; }
+        int rate = rates[0];
+        int total = 0;
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            total = total + parts[i].Length;
+        }
+        byte[] pcm = new byte[total];
+        int at = 0;
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            for (int b = 0; b < parts[i].Length; b = b + 1) {
+                pcm[at + b] = parts[i][b];
+            }
+            at = at + parts[i].Length;
+        }
+        byte[] wav = AudSound.WavContainer(pcm, rate);
+        AudioClip clip = AudioClip.LoadWavFromMem(wav.ToStr(0, wav.Length),
+            wav.Length);
+        if (!clip.IsValid()) { return null; }
+        this.Remember(this.seqKeys, this.seqClips, key, clip);
+        return clip;
+    }
+
+    bool CollectPart(SoundSpec spec, int index, List<byte[]> parts,
+        List<int> rates) {
+        if (index < 0 || index >= spec.sounds.Count) { return false; }
+        string soundName = spec.sounds[index];
+        string fileName = AudFileOf(soundName);
+        if (this.vfs == null || !this.vfs.Contains(fileName)) {
+            return false;
+        }
+        List<int> len = new List<int>();
+        len.Add(0);
+        byte[] raw = this.vfs.Read(fileName, len);
+        if (len[0] < 10) { return false; }
+        AudSound snd = AudSound.Decode(raw, len[0]);
+        if (!snd.Valid()) { return false; }
+        parts.Add(snd.Pcm());
+        rates.Add(snd.Rate());
+        return true;
+    }
+
+    void Remember(List<string> keys, List<AudioClip> clips, string key,
+        AudioClip clip) {
+        keys.Add(key);
+        clips.Add(clip);
+        // 上限 100 张,和 reference 的解码缓存一致;挤掉的采样随之释放,
+        // 还在读它的声音由运行时停掉。
+        if (keys.Count > 100) {
+            clips[0].Close();
+            keys.RemoveAt(0);
+            clips.RemoveAt(0);
+        }
+    }
+
+    // ---- 播放 ------------------------------------------------------------
+
+    /// <summary>Resolves a UI/game event key through the rules document --
+    /// the shipped engine reads e.g. "SellSound" out of rules.ini to get a
+    /// sound.ini name -- then plays it on one channel. No rules key or no
+    /// spec, no sound.</summary>
+    AudioVoice Play(string key, int channel) {
+        SoundSpec spec = this.SpecForKey(key);
+        if (spec == null) { return null; }
+        return this.PlaySpec(spec, channel, spec.volume / 100.0, 1.0,
+            false);
+    }
+
+    SoundSpec SpecForKey(string key) {
+        if (key == null || key.Length == 0) { return null; }
+        string target = "";
+        if (this.rules != null) {
+            target = this.rules.Get("AudioVisual", key);
+            if (target.Length == 0) {
+                // 键可能在任何节里:全文档扫一遍。
+                for (int s = 0; s < this.rules.Count(); s = s + 1) {
+                    target = this.rules.SectionAt(s).Get(key);
+                    if (target.Length > 0) { break; }
+                }
+            }
+        }
+        if (target.Length == 0) { return null; }
+        return this.specs.Spec(target.Trim());
+    }
+
+    void CleanHandles() {
+        for (int i = this.handles.Count - 1; i >= 0; i = i - 1) {
+            AudioVoice v = this.handles[i].voice;
+            if (v == null || !v.IsValid() || !v.IsPlaying()) {
+                this.handles.RemoveAt(i);
+            }
+        }
+    }
+
+    /// <summary>The copy limit: when `limit` voices of this spec are already
+    /// sounding, Interrupt stops the oldest, otherwise the play is refused.
+    /// Looping voices do their limiting on the world side.</summary>
+    bool LimitOk(SoundSpec spec) {
+        if (spec.limit <= 0) { return true; }
+        int active = 0;
+        int oldest = 0 - 1;
+        for (int i = 0; i < this.handles.Count; i = i + 1) {
+            if (this.handles[i].spec != spec) { continue; }
+            AudioVoice v = this.handles[i].voice;
+            if (v == null || !v.IsValid() || !v.IsPlaying()) { continue; }
+            if (oldest < 0) { oldest = i; }
+            active = active + 1;
+        }
+        if (active < spec.limit) { return true; }
+        if (!spec.HasControl(SndSpecText.ControlInterrupt())) {
+            return false;
+        }
+        if (oldest >= 0) {
+            this.handles[oldest].voice.Stop();
+            this.handles.RemoveAt(oldest);
+        }
+        return true;
+    }
+
+    /// <summary>The shared playback core: limit with interrupt, the random
+    /// pick, looping or one-shot. Sequence specs (Attack/Decay controls)
+    /// play their concatenated clip instead of a single pick.</summary>
+    AudioVoice PlaySpec(SoundSpec spec, int channel, double volume,
+        double gain, bool loopOverride) {
+        if (spec.sounds.Count == 0) { return null; }
+        int loops = spec.HasControl(SndSpecText.ControlLoop())
+            ? (spec.loop > 0 ? spec.loop : 2147483647) : 0;
+        bool loop = loopOverride || loops != 0;
+        if (!loop) {
+            this.CleanHandles();
+            if (!this.LimitOk(spec)) { return null; }
+        }
+        double gainNow = volume * gain
+            * this.mixer.ChannelGain(channel);
+        if (gainNow <= 0.0) { return null; }
+        AudioClip clip;
+        bool seq = spec.HasControl(SndSpecText.ControlAttack())
+            || spec.HasControl(SndSpecText.ControlDecay());
+        if (seq) {
+            clip = this.LoadSequence(spec);
+        } else {
+            string soundName = spec.HasControl(SndSpecText.ControlRandom())
+                ? spec.sounds[this.Rand(spec.sounds.Count)]
+                : spec.sounds[0];
+            clip = this.LoadClip(soundName);
+        }
+        if (clip == null || !clip.IsValid()) { return null; }
+        AudioVoice voice = loop ? clip.PlayLooping(gainNow)
+            : clip.Play(gainNow, 0);
+        if (voice.IsValid()) {
+            SndHandle h = new SndHandle();
+            h.spec = spec;
+            h.voice = voice;
+            this.handles.Add(h);
+        }
+        return voice;
+    }
+
+    // ---- 位置声音 ----------------------------------------------------------
+
+    /// <summary>The world-effect path: a sound at a map position for a
+    /// house. Ambient-controlled specs (or the _Amb_ name prefix) ride the
+    /// ambient channel and loop; the rest are one-shots on the effect
+    /// channel. Positional gain resolves per frame in Update.</summary>
+    AudioVoice PlayEffect(string key, double x, double y, int side,
+        double gain, double loopGain) {
+        SoundSpec spec = this.SpecForKey(key);
+        if (spec == null) { return null; }
+        bool loop = spec.HasControl(SndSpecText.ControlAmbient())
+            || (spec.name.Length > 5
+                && SndSpecText.SameWord(spec.name.Substring(0, 5),
+                    "_Amb_"));
+        if (spec.HasType(SndSpecText.TypePlayer())
+         && side != this.localSide) {
+            return null;
+        }
+        if (loop && loopGain > 0.0) { gain = loopGain; }
+        double volume = this.EffectVolume(spec, x, y, side, gain);
+        if (loop && spec.limit > 0) {
+            this.CleanHandles();
+            int active = 0;
+            for (int i = 0; i < this.voices.Count; i = i + 1) {
+                if (this.voices[i].spec == spec
+                 && this.voices[i].volume > 0.0) {
+                    active = active + 1;
+                }
+            }
+            if (active >= spec.limit) { volume = 0.0; }
+        }
+        if (!loop && volume <= 0.0 && spec.limit > 0) { return null; }
+        int channel = loop ? Ch.Ambient() : Ch.Effect();
+        AudioVoice voice = this.PlaySpec(spec, channel, volume, 1.0, loop);
+        if (voice != null && voice.IsValid()) {
+            WorldVoice wv = new WorldVoice();
+            wv.spec = spec;
+            wv.x = x;
+            wv.y = y;
+            wv.side = side;
+            wv.voice = voice;
+            wv.gain = gain;
+            wv.volume = volume;
+            wv.loop = loop;
+            this.voices.Add(wv);
+            return voice;
+        }
+        return null;
+    }
+
+    /// <summary>Distance maths, the reference's computeVolumeAndPan minus
+    /// the pan term the native output cannot carry: Global sounds from
+    /// other houses play at MinVolume; Screen sounds fade linearly over a
+    /// third of the viewport's average span; Local sounds die past
+    /// Range*sqrt2 tiles from the viewport centre and fall with the square
+    /// of what remains, with VShift picking a per-play volume jitter.</summary>
+    double EffectVolume(SoundSpec spec, double x, double y, int side,
+        double gain) {
+        double volume = spec.volume / 100.0;
+        if (spec.HasType(SndSpecText.TypeGlobal())
+         && side != this.localSide) {
+            volume = spec.minVolume / 100.0;
+        }
+        volume = volume * gain;
+        if (spec.HasType(SndSpecText.TypeScreen())) {
+            double falloff = (this.viewH + this.viewW) / 2.0 / 3.0;
+            if (falloff > 0.0) {
+                double dx = x - this.centerX;
+                double dy = y - this.centerY;
+                double dist = Math.Sqrt(dx * dx + dy * dy);
+                double t = dist / falloff;
+                if (t > 1.0) { t = 1.0; }
+                volume = volume * (1.0 - t);
+            }
+        }
+        else if (spec.HasType(SndSpecText.TypeLocal())
+         && spec.range > 0) {
+            double maxRange = spec.range * 1.41421356;
+            double dx = x - this.centerX;
+            double dy = y - this.centerY;
+            double tileDistance = Math.Sqrt(dx * dx + dy * dy);
+            if (maxRange < tileDistance) {
+                volume = 0.0;
+            } else {
+                if (spec.vShiftSet && spec.vShiftMax >= spec.vShiftMin) {
+                    volume = volume
+                        * (this.Rand(spec.vShiftMax - spec.vShiftMin + 1)
+                            + spec.vShiftMin) / 100.0;
+                }
+                double q = tileDistance / maxRange;
+                volume = volume * (1.0 - q * q);
+            }
+        }
+        return volume;
+    }
+
+    /// <summary>Which sounds ignore the fog: the shipped no-shroud list --
+    /// construction slams, selling, garrisoning, repairs and the spy-sat
+    /// pings play for the owner even under black ground unless they are
+    /// Global.</summary>
+    static bool NoShroudKey(string key) {
+        return SndSpecText.SameWord(key, "BuildingSlam")
+            || SndSpecText.SameWord(key, "SellSound")
+            || SndSpecText.SameWord(key, "BuildingGarrisonedSound")
+            || SndSpecText.SameWord(key, "BuildingRepairedSound")
+            || SndSpecText.SameWord(key, "SpySatActivationSound")
+            || SndSpecText.SameWord(key, "SpySatDeactivationSound");
+    }
+
+    /// <summary>Whether a positional voice on this key is muted by the
+    /// local player's unexplored ground at its cell. The app calls this
+    /// when spawning the effect; per-frame gain updates keep it muted.</summary>
+    bool ShroudedOut(string key, int tileX, int tileY, MapShroud shroud) {
+        if (shroud == null) { return false; }
+        if (!SndEngine.NoShroudKey(key)) { return false; }
+        SoundSpec spec = this.SpecForKey(key);
+        if (spec == null) { return false; }
+        if (spec.HasType(SndSpecText.TypeGlobal())) { return false; }
+        return shroud.At(tileX, tileY) == MapShroud.Unexplored();
+    }
+
+    // ---- 帧泵 --------------------------------------------------------------
+
+    void SetViewport(double cx, double cy, double w, double h) {
+        this.centerX = cx;
+        this.centerY = cy;
+        this.viewW = w;
+        this.viewH = h;
+        this.haveCenter = true;
+    }
+
+    /// <summary>The frame pump: EVA's speech queue, the music playlist, and
+    /// the positional voices' gain refresh. Called once per rendered
+    /// frame.</summary>
+    void Update(long now) {
+        this.eva.Update(now);
+        this.music.Update();
+        if (!this.haveCenter) { return; }
+        this.CleanHandles();
+        // reference 的 updateLegacy:同 spec 的循环实例超过 Limit 的部分
+        // 音量归零,按遍历顺序计数。
+        List<int> specCounts = new List<int>();
+        List<SoundSpec> specSeen = new List<SoundSpec>();
+        for (int i = 0; i < this.voices.Count; i = i + 1) {
+            WorldVoice wv = this.voices[i];
+            if (wv.voice == null || !wv.voice.IsValid()) { continue; }
+            double volume = this.EffectVolume(wv.spec, wv.x, wv.y,
+                wv.side, wv.gain);
+            if (wv.loop && volume > 0.0 && wv.spec.limit > 0) {
+                int seen = 0;
+                for (int k = 0; k < specSeen.Count; k = k + 1) {
+                    if (specSeen[k] == wv.spec) {
+                        seen = specCounts[k];
+                        break;
+                    }
+                }
+                if (seen >= wv.spec.limit) {
+                    volume = 0.0;
+                } else {
+                    bool found = false;
+                    for (int k = 0; k < specSeen.Count; k = k + 1) {
+                        if (specSeen[k] == wv.spec) {
+                            specCounts[k] = seen + 1;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        specSeen.Add(wv.spec);
+                        specCounts.Add(seen + 1);
+                    }
+                }
+            }
+            wv.volume = volume;
+            double g = volume * this.mixer.ChannelGain(wv.loop
+                ? Ch.Ambient() : Ch.Effect());
+            wv.voice.SetGain(g);
+        }
+        for (int i = this.voices.Count - 1; i >= 0; i = i - 1) {
+            AudioVoice v = this.voices[i].voice;
+            if (v == null || !v.IsValid() || !v.IsPlaying()) {
+                this.voices.RemoveAt(i);
+            }
+        }
+    }
+
+    // ---- 对外通道 -----------------------------------------------------------
+
+    /// <summary>The advisor's queue entry point.</summary>
+    void EvaPlay(string name, bool queue) {
+        this.eva.Play(name, queue);
+    }
+
+    bool EvaSpeaking() {
+        return this.eva.Speaking();
+    }
+
+    /// <summary>Battle music start, the GameScreen's own call.</summary>
+    void MusicNormal(bool shuffle) {
+        this.music.Play(shuffle ? "NormalShuffle" : "Normal");
+    }
+
+    void MusicNamed(string type) {
+        this.music.Play(type);
+    }
+
+    void MusicStop() {
+        this.music.StopPlaying();
+    }
+
+    MusicPlayer Music() {
+        return this.music;
+    }
+
+    int SpecCount() {
+        return this.specs.Count();
+    }
+
+    int EvaCount() {
+        return this.evaSpecs.Count();
+    }
+
+    int MusicCount() {
+        return this.musicSpecs.Count();
+    }
+
+    /// <summary>EVA 的语音不走 sound.ini:名字直指语音文件,固定走语音
+    /// 声道。</summary>
+    AudioVoice PlaySpeech(string soundName) {
+        if (soundName == null || soundName.Length == 0) { return null; }
+        double g = this.mixer.ChannelGain(Ch.Voice());
+        if (g <= 0.0) { return null; }
+        AudioClip clip = this.LoadClip(soundName);
+        if (clip == null || !clip.IsValid()) { return null; }
+        return clip.Play(g, 0);
+    }
+}

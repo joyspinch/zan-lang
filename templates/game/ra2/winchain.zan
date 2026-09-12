@@ -7,6 +7,7 @@
 //   多房:玩家+两个 AI 房,清一个 AI 局面继续,清光才判胜
 using System;
 using Game.Kit;
+using Ra2.Assets;
 using Ra2.Formats;
 using Ra2.Game;
 
@@ -68,6 +69,152 @@ class WinChainTest {
     }
 
     static int failures = 0;
+
+    // ---- 声音样件工厂:合成 AUD,喂给解码器断言 ----------------------
+
+    static byte[] Au8(int n) {
+        byte[] b = new byte[n];
+        return b;
+    }
+
+    static void Au16(byte[] buf, int at, int v) {
+        buf[at] = (byte)(v & 0xFF);
+        buf[at + 1] = (byte)((v >> 8) & 0xFF);
+    }
+
+    static int AuGet16(byte[] buf, int at) {
+        int v = (buf[at] & 0xFF) + (buf[at + 1] & 0xFF) * 256;
+        return v >= 32768 ? v - 65536 : v;
+    }
+
+    static void AuU32(byte[] buf, int at, int v) {
+        buf[at] = (byte)(v & 0xFF);
+        buf[at + 1] = (byte)((v >> 8) & 0xFF);
+        buf[at + 2] = (byte)((v >> 16) & 0xFF);
+        buf[at + 3] = (byte)((v >> 24) & 0xFF);
+    }
+
+    /// <summary>16 位 PCM 的 AUD:rate、outBps=1、comp=0,单块。</summary>
+    static byte[] PcmAud(int[] samples) {
+        int dataLen = samples.Length * 2 + 4;
+        byte[] b = Au8(8 + dataLen);
+        Au16(b, 0, 22050);
+        AuU32(b, 2, dataLen);
+        b[6] = 1;
+        b[7] = 0;
+        b[8] = (byte)((samples.Length * 2) & 0xFF);
+        b[9] = (byte)(((samples.Length * 2) >> 8) & 0xFF);
+        b[10] = (byte)((samples.Length * 2) & 0xFF);
+        b[11] = (byte)(((samples.Length * 2) >> 8) & 0xFF);
+        for (int i = 0; i < samples.Length; i = i + 1) {
+            Au16(b, 12 + i * 2, samples[i]);
+        }
+        return b;
+    }
+
+    /// <summary>8 位无符号 PCM 的 AUD:outBps=0,单块,解码时拓宽到 16 位。</summary>
+    static byte[] Pcm8Aud(byte[] samples) {
+        int dataLen = samples.Length + 4;
+        byte[] b = Au8(8 + dataLen);
+        Au16(b, 0, 22050);
+        AuU32(b, 2, dataLen);
+        b[6] = 0;
+        b[7] = 0;
+        b[8] = (byte)(samples.Length & 0xFF);
+        b[9] = (byte)((samples.Length >> 8) & 0xFF);
+        b[10] = (byte)(samples.Length & 0xFF);
+        b[11] = (byte)((samples.Length >> 8) & 0xFF);
+        for (int i = 0; i < samples.Length; i = i + 1) {
+            b[12 + i] = samples[i];
+        }
+        return b;
+    }
+
+    static int ImaStepAt(int index) {
+        int v = 7;
+        for (int i = 0; i < index; i = i + 1) {
+            v = v + (v >> 2) + 1;
+        }
+        return v;
+    }
+
+    /// <summary>IMA ADPCM 的 AUD(压缩 99):闭环重建编码——编码器与解码器
+    /// 同步推进预测器,解码输出应与重建序列逐样本一致,且对目标样本的
+    /// 误差有界。每块 5 个样本 = 4 个增量 = 整 2 字节半字节,块头是完整
+    /// 的 4 字节(预测器 + 步索引 + 保留字节),与解码器逐字节对齐。
+    /// 返回码 0 = 正常,负值 = 输入规模不支持。</summary>
+    static int ImaAud(int[] samples, byte[] outBuf, int cap) {
+        int perChunk = 5;
+        int chunkCount = (samples.Length + perChunk - 1) / perChunk;
+        int dataLen = 0;
+        for (int c = 0; c < chunkCount; c = c + 1) {
+            int n = perChunk;
+            if (c * perChunk + n > samples.Length) {
+                n = samples.Length - c * perChunk;
+            }
+            dataLen = dataLen + 8 + ((n - 1) + 1) / 2;
+        }
+        if (8 + dataLen > cap) { return 0 - 1; }
+        byte[] b = outBuf;
+        Au16(b, 0, 22050);
+        AuU32(b, 2, dataLen);
+        b[6] = 1;
+        b[7] = 99;
+        int at = 8;
+        int si = 0;
+        for (int c = 0; c < chunkCount; c = c + 1) {
+            int end = si + perChunk;
+            if (end > samples.Length) { end = samples.Length; }
+            int deltas = end - si - 1;
+            int nibBytes = (deltas + 1) / 2;
+            int chunkBytes = 4 + nibBytes;
+            b[at] = (byte)(chunkBytes & 0xFF);
+            b[at + 1] = (byte)((chunkBytes >> 8) & 0xFF);
+            int outBytes = (end - si) * 2;
+            b[at + 2] = (byte)(outBytes & 0xFF);
+            b[at + 3] = (byte)((outBytes >> 8) & 0xFF);
+            int predictor = samples[si];
+            int stepIndex = 0;
+            Au16(b, at + 4, predictor);
+            b[at + 6] = 0;
+            b[at + 7] = 0;
+            int nibAt = at + 8;
+            int nibbles = 0;
+            for (int i = si + 1; i < end; i = i + 1) {
+                int step = ImaStepAt(stepIndex);
+                int diff = samples[i] - predictor;
+                int nib = 0;
+                if (diff < 0) { nib = nib + 8; diff = 0 - diff; }
+                if (diff >= step) { nib = nib + 4; diff = diff - step; }
+                if (diff >= step >> 1) { nib = nib + 2; diff = diff - (step >> 1); }
+                if (diff >= step >> 2) { nib = nib + 1; }
+                if (nibbles % 2 == 0) {
+                    b[nibAt] = (byte)nib;
+                } else {
+                    b[nibAt] = (byte)((b[nibAt] & 0xFF) + nib * 16);
+                    nibAt = nibAt + 1;
+                }
+                nibbles = nibbles + 1;
+                // 与解码器逐位一致的重建链。
+                int step2 = ImaStepAt(stepIndex);
+                int add = step2 >> 3;
+                if ((nib & 1) != 0) { add = add + (step2 >> 2); }
+                if ((nib & 2) != 0) { add = add + (step2 >> 1); }
+                if ((nib & 4) != 0) { add = add + step2; }
+                if ((nib & 8) != 0) { add = 0 - add; }
+                predictor = predictor + add;
+                if (predictor > 32767) { predictor = 32767; }
+                if (predictor < 0 - 32768) { predictor = 0 - 32768; }
+                int d = stepIndex
+                    + (nib < 4 ? 0 - 1 : nib == 4 ? 2 : nib == 5 ? 4
+                        : nib == 6 ? 6 : 8);
+                stepIndex = d < 0 ? 0 : d > 88 ? 88 : d;
+            }
+            at = at + 4 + chunkBytes;
+            si = end;
+        }
+        return 8 + dataLen;
+    }
 
     static void Report(string tag, int got, int want) {
         string verdict = got == want ? "PASS" : "FAIL";
@@ -492,6 +639,299 @@ class WinChainTest {
                 }
                 Report("crate tiberium grows ore", ore6 > 0 ? 1 : 0, 1);
             }
+        }
+
+        // ---- 声音: AUD 解码 / sound.ini / EVA / 主题 --------------------
+        // 表文件是玩家安装的资产(本机没有也能静音跑),引擎语义全部用
+        // 合成样件断言:AUD 三种编码的解码闭环、WAV 容器、sound.ini 的
+        // Defaults/Control/Sounds 截断/Type 回退、EVA 的队列纪律、主题
+        // 播放表、位置音量的距离衰减。
+        int[] pcmS = new int[] { 1000, 0 - 2000, 30000, 0 - 30000 };
+        byte[] pcmAud = PcmAud(pcmS);
+        List<int> plen = new List<int>();
+        plen.Add(0);
+        AudSound pcmSnd = AudSound.Decode(pcmAud, pcmAud.Length);
+        Report("aud pcm decodes", pcmSnd.Valid() ? 1 : 0, 1);
+        Report("aud pcm rate",
+               pcmSnd.Valid() ? pcmSnd.Rate() : 0 - 1, 22050);
+        Report("aud pcm sample count",
+               pcmSnd.Valid() ? pcmSnd.SampleCount() : 0 - 1, 4);
+        Report("aud pcm sample value",
+               pcmSnd.Valid() ? AuGet16(pcmSnd.Pcm(), 0) : 0 - 1, 1000);
+        Report("aud pcm sample value 2",
+               pcmSnd.Valid() ? AuGet16(pcmSnd.Pcm(), 2) : 0 - 1,
+               0 - 2000);
+        byte[] pcm8 = Au8(4);
+        pcm8[0] = 200;
+        pcm8[1] = 0;
+        pcm8[2] = 128;
+        pcm8[3] = 255;
+        byte[] pcm8Aud = Pcm8Aud(pcm8);
+        AudSound pcm8Snd = AudSound.Decode(pcm8Aud, pcm8Aud.Length);
+        Report("aud 8bit widens silence-centered",
+               pcm8Snd.Valid() ? AuGet16(pcm8Snd.Pcm(), 4) : 0 - 1, 0);
+        Report("aud 8bit widens high",
+               pcm8Snd.Valid() ? AuGet16(pcm8Snd.Pcm(), 6) : 0 - 1,
+               32512);
+        int[] imaS = new int[] { 0, 100, 200, 300, 200, 100, 0,
+            0 - 100, 1200, 0 - 1200, 300, 0, 300, 0, 0 - 300, 0 };
+        byte[] imaBuf = Au8(512);
+        int imaLen = ImaAud(imaS, imaBuf, 512);
+        Report("aud ima fixture built", imaLen > 0 ? 1 : 0, 1);
+        AudSound imaSnd = AudSound.Fail();
+        if (imaLen > 0) { imaSnd = AudSound.Decode(imaBuf, imaLen); }
+        Report("aud ima decodes", imaSnd.Valid() ? 1 : 0, 1);
+        Report("aud ima sample count",
+               imaSnd.Valid() ? imaSnd.SampleCount() : 0 - 1, 16);
+        Report("aud ima first sample exact",
+               imaSnd.Valid() ? AuGet16(imaSnd.Pcm(), 0) : 0 - 1, 0);
+        // 块头样本从预测器直接播种,必须逐位精确:第 3 块(样本 10)
+        // 的目标是 300。
+        Report("aud ima chunk head exact",
+               imaSnd.Valid() ? AuGet16(imaSnd.Pcm(), 10 * 2) : 0 - 1,
+               300);
+        int imaErr = 0;
+        for (int i = 0; i < 16 && imaSnd.Valid(); i = i + 1) {
+            int gotS = AuGet16(imaSnd.Pcm(), i * 2);
+            int err = gotS - imaS[i];
+            if (err < 0) { err = 0 - err; }
+            if (err > imaErr) { imaErr = err; }
+        }
+        Report("aud ima error bounded", imaErr <= 3500 ? 1 : 0, 1);
+        Report("aud rejects garbage",
+               AudSound.Decode(Au8(16), 16).Valid() ? 1 : 0, 0);
+        byte[] tiny = Au8(4);
+        Report("aud rejects truncated",
+               AudSound.Decode(tiny, 4).Valid() ? 1 : 0, 0);
+        byte[] wav = AudSound.WavContainer(pcmSnd.Pcm(), 22050);
+        Report("wav container riff tag",
+               wav[0] == 82 && wav[1] == 73 && wav[2] == 70
+               && wav[3] == 70 ? 1 : 0, 1);
+        Report("wav container size",
+               wav.Length == 44 + 8 ? 1 : 0, 1);
+        // 本机时长断言需要 1ms 以上,4 个样本不足——补一段 2205 样本
+        // (22050Hz 下正好 100ms)的静音去走原生装载。
+        byte[] longPcm = Au8(2205 * 2);
+        byte[] wavLong = AudSound.WavContainer(longPcm, 22050);
+        AudioClip wavClip = AudioClip.LoadWavFromMem(
+            wavLong.ToStr(0, wavLong.Length), wavLong.Length);
+        Report("wav container parses natively",
+               wavClip.IsValid() ? 1 : 0, 1);
+        Report("wav clip frequency",
+               wavClip.IsValid() ? wavClip.Frequency() : 0 - 1, 22050);
+        Report("wav clip duration",
+               wavClip.IsValid() && wavClip.DurationMs() > 0 ? 1 : 0, 1);
+
+        // sound.ini 解析:Defaults 承底、$ 引用剥离、Sounds= 行内 Control=
+        // 截断、Range=-2 化无穷、Type 缺空间类时回退 Defaults。
+        string soundIni = "[Defaults]\n"
+            + "MinVolume=20\nRange=10\nVolume=50\nLimit=1\n"
+            + "Type=Screen\nPriority=Normal\n"
+            + "[SoundList]\n1=MyShot\n2=MyLoop\n3=MyProbe\n"
+            + "[MyShot]\nSounds=$alpha $beta Control=Random\nVolume=80\n"
+            + "Delay=100 200\nType=Local\nRange=-2\nLimit=3\nLoop=5\n"
+            + "MinVolume=25\nVShift=40 60\nAttack=1\nDecay=1\n"
+            + "Control=Interrupt\n"
+            + "[MyLoop]\nSounds=solo\nType=Global Normal\n"
+            + "[MyProbe]\nType=Player\n";
+        SoundSpecs specs = SoundSpecs.Parse(IniParser.Parse(soundIni));
+        Report("sound ini parses three specs", specs.Count(), 3);
+        SoundSpec shot = specs.Spec("myshot");
+        Report("sound spec lookup caseless", shot != null ? 1 : 0, 1);
+        Report("sound spec dollar strip",
+               shot != null && shot.sounds.Count == 2
+               && shot.sounds[0] == "alpha" && shot.sounds[1] == "beta"
+                   ? 1 : 0, 1);
+        Report("sound spec volume", shot != null ? shot.volume : 0 - 1,
+               80);
+        Report("sound spec delay pair",
+               shot != null && shot.delaySet && shot.delayMin == 100
+               && shot.delayMax == 200 ? 1 : 0, 1);
+        Report("sound spec range inf",
+               shot != null ? shot.range : 0, 2147483647);
+        Report("sound spec limit", shot != null ? shot.limit : 0 - 1, 3);
+        Report("sound spec loop", shot != null ? shot.loop : 0 - 1, 5);
+        Report("sound spec minvolume",
+               shot != null ? shot.minVolume : 0 - 1, 25);
+        Report("sound spec vshift pair",
+               shot != null && shot.vShiftSet && shot.vShiftMin == 40
+               && shot.vShiftMax == 60 ? 1 : 0, 1);
+        // 参考的 parseSoundNames 把 Sounds= 行内第一个 control= 起的
+        // token 截断丢弃——Control 位只来自独立的 Control= 键,行内那份
+        // 不生效。所以位里只有 Interrupt,没有 Random。
+        Report("sound spec controls",
+               shot != null
+               && (shot.controlBits & (SndSpecText.ControlRandom()
+                  | SndSpecText.ControlAttack()
+                  | SndSpecText.ControlDecay())) == 0
+               && (shot.controlBits & SndSpecText.ControlInterrupt()) != 0
+                   ? 1 : 0, 1);
+        SoundSpec loop = specs.Spec("MyLoop");
+        Report("sound spec default limit",
+               loop != null ? loop.limit : 0 - 1, 1);
+        Report("sound spec default volume",
+               loop != null ? loop.volume : 0 - 1, 50);
+        Report("sound spec global type",
+               loop != null
+               && (loop.typeBits & SndSpecText.TypeGlobal()) != 0 ? 1 : 0,
+               1);
+        SoundSpec probe = specs.Spec("MyProbe");
+        Report("sound spec type fallback adds screen",
+               probe != null
+               && (probe.typeBits & SndSpecText.TypePlayer()) != 0
+               && (probe.typeBits & SndSpecText.TypeScreen()) != 0
+                   ? 1 : 0, 1);
+
+        // 位置音量:Local 的 range*sqrt2 截断 + 平方衰减,Screen 的线性
+        // 衰减,Global 的他房 MinVolume。
+        SndEngine engineS = SndEngine.Create();
+        engineS.SetViewport(20.0, 20.0, 600.0, 300.0);
+        SoundSpec localSpec = new SoundSpec();
+        localSpec.name = "LocalSpec";
+        localSpec.typeBits = SndSpecText.TypeLocal();
+        localSpec.range = 10;
+        localSpec.volume = 100;
+        localSpec.sounds = new List<string>();
+        localSpec.sounds.Add("a");
+        int volCenter = (int)(engineS.EffectVolume(localSpec, 20.0, 20.0,
+            0, 1.0) * 1000.0);
+        Report("world local at center full", volCenter, 1000);
+        int volHalf = (int)(engineS.EffectVolume(localSpec, 27.0, 20.0,
+            0, 1.0) * 1000.0);
+        Report("world local half range falls",
+               volHalf > 700 && volHalf < 800 ? 1 : 0, 1);
+        int volFar = (int)(engineS.EffectVolume(localSpec, 40.0, 20.0,
+            0, 1.0) * 1000.0);
+        Report("world local past range silent", volFar, 0);
+        SoundSpec screenSpec = new SoundSpec();
+        screenSpec.name = "ScreenSpec";
+        screenSpec.typeBits = SndSpecText.TypeScreen();
+        screenSpec.volume = 100;
+        screenSpec.sounds = new List<string>();
+        screenSpec.sounds.Add("a");
+        int volScreen = (int)(engineS.EffectVolume(screenSpec, 20.0 + 75.0,
+            20.0, 0, 1.0) * 1000.0);
+        Report("world screen half falloff", volScreen, 500);
+        SoundSpec globalSpec = new SoundSpec();
+        globalSpec.name = "GlobalSpec";
+        globalSpec.typeBits = SndSpecText.TypeGlobal();
+        globalSpec.volume = 100;
+        globalSpec.minVolume = 20;
+        globalSpec.sounds = new List<string>();
+        globalSpec.sounds.Add("a");
+        int volGlobal = (int)(engineS.EffectVolume(globalSpec, 0.0, 0.0,
+            1, 1.0) * 1000.0);
+        Report("world global other side minvolume", volGlobal, 200);
+        Report("world no-shroud list",
+               SndEngine.NoShroudKey("SellSound")
+               && !SndEngine.NoShroudKey("MyShot") ? 1 : 0, 1);
+
+        // eva.ini:侧别列、优先级、队列;EVA 的等待纪律(优先级说话、
+        // 五秒冷却、批量只留一条)。
+        string evaIni = "[DialogList]\n1=000I000\n2=000I002\n3=000I003\n"
+            + "[000I000]\nText=Construction complete\nAllied=CONCOMP1\n"
+            + "Russian=CONCOMP1\nPriority=Important\n"
+            + "[000I002]\nText=Unit ready\nAllied=UNITRDY1\n"
+            + "Russian=UNITRDY1\nType=queue\n"
+            + "[000I003]\nText=Low power\nAllied=LOWPWR1\n"
+            + "Russian=LOWPWR1\nPriority=Critical\n";
+        SndEngine engineE = SndEngine.Create();
+        engineE.evaSpecs = EvaSpecs.Parse(IniParser.Parse(evaIni), 0);
+        engineE.eva = Eva.Create(engineE.evaSpecs, engineE);
+        Report("eva side prefix allied",
+               EvaSpecs.PrefixForSide(Side2.Allied()) == "Allied" ? 1 : 0,
+               1);
+        Report("eva table parsed", engineE.EvaCount(), 3);
+        EvaSpec comp = engineE.evaSpecs.Spec("000I000");
+        Report("eva sound column",
+               comp != null && comp.sound == "CONCOMP1" ? 1 : 0, 1);
+        Report("eva priority important",
+               comp != null && comp.priority == 2 ? 1 : 0, 1);
+        EvaSpec ready = engineE.evaSpecs.Spec("000I002");
+        Report("eva queue flag",
+               ready != null && ready.queue ? 1 : 0, 1);
+        engineE.EvaPlay("000I000", false);
+        engineE.EvaPlay("000I003", false);
+        engineE.eva.Update(0);
+        Report("eva critical speaks first",
+               engineE.eva.waiting.Count == 1
+               && engineE.eva.waiting[0] == comp ? 1 : 0, 1);
+        engineE.eva.Update(1);
+        Report("eva queue drains", engineE.eva.waiting.Count, 0);
+        engineE.EvaPlay("000I000", false);
+        engineE.eva.Update(100);
+        Report("eva cooldown holds",
+               engineE.eva.waiting.Count == 0
+               && !engineE.EvaSpeaking() ? 1 : 0, 1);
+        engineE.EvaPlay("000I000", false);
+        engineE.eva.Update(5200);
+        bool spoke5200 = false;
+        for (int i = 0; i < engineE.eva.lastPlayedNames.Count;
+          i = i + 1) {
+            if (engineE.eva.lastPlayedNames[i] == "CONCOMP1"
+             && engineE.eva.lastPlayedAt[i] == 5200) {
+                spoke5200 = true;
+            }
+        }
+        Report("eva cooldown releases", spoke5200 ? 1 : 0, 1);
+
+        // theme.ini:Normal 出播放表、Repeat 循环、shuffle 同集、选项串
+        // 序列化往返。
+        string themeIni = "[Themes]\n1=GRIND\n2=DEFEND\n3=HIDEF\n"
+            + "[GRIND]\nName=Grinder\nSound=GRINDER\nNormal=yes\n"
+            + "[DEFEND]\nName=Defend\nSound=DEFEND\nNormal=yes\n"
+            + "Repeat=yes\n"
+            + "[HIDEF]\nName=Hidden\nSound=HIDDEN\nNormal=no\n";
+        SndEngine engineM = SndEngine.Create();
+        engineM.musicSpecs = MusicSpecs.Parse(IniParser.Parse(themeIni));
+        engineM.music = MusicPlayer.Create(engineM.musicSpecs, engineM);
+        Report("music table parsed", engineM.MusicCount(), 3);
+        List<MusicSpec> playlist = engineM.music.BuildPlaylist(false);
+        Report("music playlist normal only", playlist.Count, 2);
+        List<MusicSpec> shuffled = engineM.music.BuildPlaylist(true);
+        Report("music shuffle same set",
+               shuffled.Count == 2
+               && (shuffled[0] != shuffled[1]) ? 1 : 0, 1);
+        engineM.music.UnserializeOptions("1,1,Defend");
+        // 参考语义:反序列化把 "Defend" 存进 initialRepeatName(播放时
+        // 从播放表里找它起播),但此刻没有已装载的播放表,序列化时名字
+        // 段落空——"1,1," 而不是回显输入。
+        Report("music options roundtrip",
+               engineM.music.ShuffleMode()
+               && engineM.music.RepeatMode()
+               && engineM.music.initialRepeatName == "Defend"
+               && engineM.music.SerializeOptions() == "1,1,"
+                   ? 1 : 0, 1);
+        // 混音台:滑条、静音、序列化。
+        engineM.SetVolume(Ch.Voice(), 0.5);
+        Report("mixer voice volume",
+               engineM.ChannelGainOf(Ch.Voice()) == 0.5 ? 1 : 0, 1);
+        engineM.SetMuted(Ch.Voice(), true);
+        Report("mixer voice mute",
+               engineM.ChannelGainOf(Ch.Voice()) < 0.001 ? 1 : 0, 1);
+        engineM.SetMuted(Ch.Voice(), false);
+        Report("mixer unmute keeps slider",
+               engineM.ChannelGainOf(Ch.Voice()) == 0.5 ? 1 : 0, 1);
+        string mix = engineM.SerializeMixer();
+        engineM.SetVolume(Ch.Voice(), 1.0);
+        engineM.UnserializeMixer(mix);
+        Report("mixer serialize roundtrip",
+               engineM.ChannelGainOf(Ch.Voice()) == 0.5 ? 1 : 0, 1);
+        // 真实安装的表状态:本机 rip 没有音频表,引擎必须以空表静音装载
+        // 而不是崩。表数打印出来,有表/无表都算通过。
+        string instDir = "data";
+        if (!File.Exists(instDir + "/ra2.mix")) { instDir = "../data"; }
+        if (File.Exists(instDir + "/ra2.mix")) {
+            Vfs vfsInst = AssetDb.MountInstall(instDir);
+            SndEngine engineI = SndEngine.Create();
+            engineI.Load(vfsInst, IniParser.Parse("\n"), 0);
+            Console.WriteLine("winchain install tables: sound="
+                + Convert.ToString(engineI.SpecCount())
+                + " eva=" + Convert.ToString(engineI.EvaCount())
+                + " music=" + Convert.ToString(engineI.MusicCount())
+                + " (probe-only line)");
+        } else {
+            Console.WriteLine("winchain install tables: no data/ mount");
         }
 
         Console.WriteLine(failures == 0 ? "winchain ok"
