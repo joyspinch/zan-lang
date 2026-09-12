@@ -57,9 +57,10 @@ CORPUS_A = [
 # 算进"支持度"分母只会让数字难看而没有行动价值。默认单独归一类，`--all` 时并入。
 # display/float/clear 自 WEB_GUI_ROADMAP P0 起是真实布局键（不再归入
 # 网页专属类）；white-space/vertical-align 自 WEB_GUI_ROADMAP P2 起
-# 由行盒/落位消费，同批移出。
+# 由行盒/落位消费，同批移出；content 自伪元素支持起由 Element 伪文本
+# 消费，移出（quotes/counter-* 仍无消费者）。
 FLOW_ONLY = re.compile(
-    r'^(-webkit-|-moz-|-ms-|-o-|page-break|break-|content$|quotes$|counter-'
+    r'^(-webkit-|-moz-|-ms-|-o-|page-break|break-|quotes$|counter-'
     r'|list-style|outline|orphans$|widows$)'
 )
 
@@ -169,10 +170,12 @@ def match_brace(text, open_at):
 
 
 # 伪元素名（Css.Selector.IsPseudoElement）：能当部件名匹配。
+# before/after 自 CSS 伪元素支持起也是部件（Element 伪文本合成 content）。
 PSEUDO_ELEMENTS = {'placeholder', 'selection', 'marker', 'backdrop',
-                   'file-selector-button', 'caret', 'scrollbar', 'track', 'thumb'}
-# 需要生成内容/行盒的伪元素（Css.Selector.IsGenerated）：永不匹配。
-GENERATED = {'before', 'after', 'first-line', 'first-letter'}
+                   'file-selector-button', 'caret', 'scrollbar', 'track', 'thumb',
+                   'before', 'after'}
+# 需要生成内容/行盒的伪元素（Css.Selector.IsGenerated 收窄后）：永不匹配。
+GENERATED = {'first-line', 'first-letter'}
 # 布尔属性 -> 已有状态位（Css.Selector.AttrState）。
 ATTR_STATE = {'disabled', 'checked', 'selected'}
 
@@ -181,6 +184,12 @@ STRUCT_PSEUDO = {'first-child', 'last-child', 'only-child', 'nth-child',
                  'nth-last-child', 'first-of-type', 'last-of-type',
                  'only-of-type', 'nth-of-type', 'nth-last-of-type',
                  'empty'}
+
+# :has() 内层的拒绝条件（镜像 Css.HasMatch）：伪元素部件（任何双冒号伪元素
+# 或单冒号部件名）、嵌套 :has（防组合爆炸）。
+HAS_PART_INNER = re.compile(
+    r'::|:(?:before|after|placeholder|selection|marker|backdrop'
+    r'|first-line|first-letter)\b|has\s*\(', re.IGNORECASE)
 
 
 def _skip_ws(s, i):
@@ -259,7 +268,9 @@ def _classify_attr(inner, states):
             return 'dead', 'attribute'
     if name == 'class' or name in ATTR_STATE:
         return 'live', ''
-    return 'dead', 'attr:' + name
+    # CSS 属性选择器起：任意属性经 Control.CssAttr / Element 属性表求值
+    # （id 也走 CssAttr）。能否命中取决于节点数据，不再是引擎面拒绝。
+    return 'live', ''
 
 
 def _classify(s, states):
@@ -317,8 +328,22 @@ def _classify(s, states):
                 inner = s[j + 1:close]
                 lo = name.lower()
                 if lo == 'has':
-                    never = True    # 引擎对 :has() 判 never
-                    why = why or 'has'
+                    # 引擎（Css.HasMatch）：内层 alternative 全部解析成
+                    # live 选择器、不含伪元素部件、不嵌套 :has 时会求值
+                    # （前导组合器 > + ~ 也接受，取候选范围）。
+                    subs = split_top(inner, ',')
+                    ok = bool(subs)
+                    for t in subs:
+                        t = t.strip()
+                        if t[:1] in '>+~':
+                            t = t[1:].strip()
+                        if (HAS_PART_INNER.search(t)
+                                or _classify(t, states)[0] != 'live'):
+                            ok = False
+                            break
+                    if not ok:
+                        never = True
+                        why = why or 'has'
                     i = close + 1
                     continue
                 if lo == 'not':

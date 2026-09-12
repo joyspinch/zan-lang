@@ -1977,7 +1977,7 @@ class Program {
     /// 组合器链与结构性伪类的树上下文匹配。手工搭一棵 retained 树，
     /// 用 ApplyMatchCtx（真实匹配路径，非按文本查表）逐节点看声明：
     /// 子/后代/相邻兄弟/通用兄弟组合器、:first/:last/:only/:nth(-of-type)、
-    /// :not(:first-child)、:empty；:has 仍不可判定（Lint 报 never）。
+    /// :not(:first-child)、:empty、:has(子存在)。
     static void TreeCtx() {
         StyleSheet s = Css.Parse(
             "panel > title { color: #111111; }\n"
@@ -2069,8 +2069,8 @@ class Program {
         // only-child / empty（box 没挂到树上也算：无父即无子）。
         Program.TreeFg("card-only", s, card);
         Program.TreeFg("box-empty", s, box);
-        // :has() 不可判定：panel 不得被上色，Lint 报 never。
-        Program.TreeFg("panel-no-has", s, panel);
+        // :has() 可判定：panel 有 title 子节点，命中上色。
+        Program.TreeFg("panel-has-title", s, panel);
         List<string> relLint = s.Audit();
         Console.WriteLine($"tree lint count {relLint.Count}");
         for (int i = 0; i < relLint.Count; i = i + 1) {
@@ -3331,6 +3331,9 @@ class Program {
         Console.WriteLine("--- grid layout / tracks / placement");
         Program.DisplayGrid();
 
+        Console.WriteLine("--- selector features (attrs / pseudo content / has)");
+        Program.SelectorFeatures();
+
         Console.WriteLine("--- html declaration layer");
         Program.DisplayHtml();
         Program.DisplayScroll();
@@ -3340,6 +3343,89 @@ class Program {
 
         Console.WriteLine("--- cascade ordering");
         Program.Cascade();
+    }
+
+    /// CSS 属性面三件（2026-09-13）：属性选择器查真实属性表
+    /// （Control.CssAttr/Element.SetAttr）、::before/::after 的
+    /// content 合成进流内容（Element 伪文本）、:has() 相对选择器。
+    static void SelectorFeatures() {
+        App app = new App("css-feat", 320, 280);
+        app.UseCss(
+            "* { box-sizing: border-box; }\n"
+            + "[data-kind=\"card\"] { width: 40px; height: 12px; }\n"
+            + "[data-x^=\"https\"] { width: 55px; height: 10px; }\n"
+            + "p:has(em) { width: 70px; height: 10px; }\n"
+            + ".q::before { content: \"「\"; }\n"
+            + ".q::after { content: \"」\"; }\n"
+            + ".ref::before { content: attr(data-ref) \" \"; }\n"
+            + ".none::before { content: none; }\n");
+        // 属性选择器与 :has()：ApplyMatchCtx 真实匹配路径（带节点）。
+        Element card = new Element();
+        card.InitElement("div", "f1");
+        card.SetAttr("data-kind", "card");
+        Element panelEl = new Element();
+        panelEl.InitElement("div", "f2");
+        panelEl.SetAttr("data-kind", "panel");
+        Element hrefEl = new Element();
+        hrefEl.InitElement("div", "f3");
+        hrefEl.SetAttr("data-x", "https://z.dev");
+        Element withEm = new Element();
+        withEm.InitElement("p", "f4");
+        Element em = new Element();
+        em.InitElement("em", "f4e");
+        withEm.AddKid(em);
+        Element noEm = new Element();
+        noEm.InitElement("p", "f5");
+        StyleBox b1 = new StyleBox();
+        app.sheet.ApplyMatchCtx(b1, card.StyleType(), card.Class, card.name,
+                                "", Style.SNormal(), card);
+        StyleBox b2 = new StyleBox();
+        app.sheet.ApplyMatchCtx(b2, panelEl.StyleType(), panelEl.Class,
+                                panelEl.name, "", Style.SNormal(), panelEl);
+        StyleBox b3 = new StyleBox();
+        app.sheet.ApplyMatchCtx(b3, hrefEl.StyleType(), hrefEl.Class,
+                                hrefEl.name, "", Style.SNormal(), hrefEl);
+        StyleBox b4 = new StyleBox();
+        app.sheet.ApplyMatchCtx(b4, withEm.StyleType(), withEm.Class,
+                                withEm.name, "", Style.SNormal(), withEm);
+        StyleBox b5 = new StyleBox();
+        app.sheet.ApplyMatchCtx(b5, noEm.StyleType(), noEm.Class,
+                                noEm.name, "", Style.SNormal(), noEm);
+        Console.WriteLine($"attr kind-card w {b1.width} (40=hit)");
+        Console.WriteLine($"attr kind-panel w {b2.width} (-1=miss)");
+        Console.WriteLine($"attr href^ w {b3.width} (55=hit)");
+        Console.WriteLine($"has em w {b4.width} (70=hit)");
+        Console.WriteLine($"has none w {b5.width} (-1=miss)");
+
+        // ::before/::after：Element.ResolveStyle 顺带取伪盒 content，
+        // inline 元素在 FlowText 首尾拼接。
+        Element q = new Element();
+        q.InitElement("span", "q1");
+        q.Class = "q";
+        q.SetText("mid");
+        q.ResolveStyle(app, Style.SNormal());
+        Console.WriteLine($"pseudo q flowtext [{q.FlowText()}]");
+        Element r1 = new Element();
+        r1.InitElement("span", "r1");
+        r1.Class = "ref";
+        r1.SetAttr("data-ref", "12");
+        r1.SetText("code");
+        r1.ResolveStyle(app, Style.SNormal());
+        Console.WriteLine($"pseudo ref flowtext [{r1.FlowText()}]");
+        Element nx = new Element();
+        nx.InitElement("span", "nx");
+        nx.Class = "none";
+        nx.SetText("x");
+        nx.ResolveStyle(app, Style.SNormal());
+        Console.WriteLine($"pseudo none flowtext [{nx.FlowText()}]");
+        // 块容器：伪文本首尾各占一段匿名文本（3 行）。
+        Element qblk = new Element();
+        qblk.InitElement("div", "q2");
+        qblk.Class = "q";
+        qblk.SetText("mid");
+        qblk.ResolveStyle(app, Style.SNormal());
+        qblk.MeasureTree(app);
+        Console.WriteLine($"pseudo block pref {qblk.prefW}x{qblk.prefH}");
     }
 }
 

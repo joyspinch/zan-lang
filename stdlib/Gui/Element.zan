@@ -23,11 +23,52 @@ class Element : Control {
     List<ElementRun> elRuns;
     bool elRunsFresh;   // 本帧行盒是否落位过（防陈旧 run 重画）
     List<FlowEntry> elOrder;    // 文档序（AddText/AddKid 交错记录）
+    /// 原始属性表（HTML 声明层留下的 type/data-*/href 等），
+    /// CSS 属性选择器（`[type="text"]`）的取值源。
+    Dict<string, string> elAttrs;
+    /// ::before/::after 的 content 文本（宿主样式解析时刷新，
+    /// "" = 无伪元素）。参与本元素的流内容：inline 走 FlowText 拼接，
+    /// 块容器在 FlowEntries 首尾各占一段匿名文本。
+    string elBefore;
+    string elAfter;
 
     void InitElement(string tag, string nodeName) {
         this.InitControl(nodeName, 0);
         elTag = tag;
         elRuns = new List<ElementRun>();
+    }
+
+    /// 记录一个原始属性（树构建期逐个喂入；同名覆盖；键折小写）。
+    Element SetAttr(string k, string v) {
+        string key = Css.Lower(k);
+        if (elAttrs == null) { elAttrs = new Dict<string, string>(); }
+        if (elAttrs.ContainsKey(key)) { elAttrs.Remove(key); }
+        elAttrs.Add(key, v);
+        return this;
+    }
+
+    /// CSS 属性选择器取值源：先查属性表，缺了落基类（id → name）。
+    override string CssAttr(string key) {
+        if (elAttrs != null) {
+            string v = "";
+            if (elAttrs.TryGetValue(Css.Lower(key), out v)) { return v; }
+        }
+        return base.CssAttr(key);
+    }
+
+    /// 宿主样式解析后顺带解析 ::before/::after 伪盒，取出 content
+    /// 文本。伪盒经 Style.Part 按键缓存，这里只是字典查询 + 短串
+    /// 解析；伪盒里 content 之外的声明 v1 不消费（伪元素自身的
+    /// 颜色/字号等是后续工作），文本沿用宿主样式绘制。
+    override StyleBox ResolveStyle(App app, int state) {
+        StyleBox sb = base.ResolveStyle(app, state);
+        StyleBox pb = Style.Part(app, this.StyleType(), "before", "", Class,
+                                 name, state);
+        elBefore = Css.PseudoContent(pb == null ? "" : pb.contentRaw, this);
+        StyleBox pa = Style.Part(app, this.StyleType(), "after", "", Class,
+                                 name, state);
+        elAfter = Css.PseudoContent(pa == null ? "" : pa.contentRaw, this);
+        return sb;
     }
 
     /// 标签名（StyleType() 折小写后与 CSS type 选择器匹配）。
@@ -62,16 +103,21 @@ class Element : Control {
         return this;
     }
 
-    /// 块流内容序列（Control.FlowEntries 覆写）：SetText 的整块文本
-    /// 最先，其后按 elOrder 文档序；从未用 AddText/AddKid 记录顺序时
+    /// 一段匿名文本的流条目。
+    FlowEntry TextEntry(string t) {
+        FlowEntry e = new FlowEntry();
+        e.text = t;
+        return e;
+    }
+
+    /// 块流内容序列（Control.FlowEntries 覆写）：::before 伪文本
+    /// 最先、::after 最后（CSS 生成内容语义），中间是 SetText 的
+    /// 整块文本与 elOrder 文档序；从未用 AddText/AddKid 记录顺序时
     /// 子项照旧按 FlexKids 序追加（P0/P1 代码零改动）。
     override List<FlowEntry> FlowEntries() {
         List<FlowEntry> es = new List<FlowEntry>();
-        if (elText != "") {
-            FlowEntry e = new FlowEntry();
-            e.text = elText;
-            es.Add(e);
-        }
+        if (elBefore != "") { es.Add(this.TextEntry(elBefore)); }
+        if (elText != "") { es.Add(this.TextEntry(elText)); }
         if (elOrder == null || elOrder.Count == 0) {
             List<Control> kids = this.FlexKids();
             for (int i = 0; i < kids.Count; i = i + 1) {
@@ -79,6 +125,7 @@ class Element : Control {
                 e.kid = kids[i];
                 es.Add(e);
             }
+            if (elAfter != "") { es.Add(this.TextEntry(elAfter)); }
             return es;
         }
         List<Control> tracked = new List<Control>();
@@ -103,6 +150,7 @@ class Element : Control {
             e.kid = kids2[i];
             es.Add(e);
         }
+        if (elAfter != "") { es.Add(this.TextEntry(elAfter)); }
         return es;
     }
 
@@ -118,17 +166,21 @@ class Element : Control {
     /// display:inline 的元素按文本 run 参与父级行盒（web 语义），
     /// 而不是原子盒坐基线把行高撑爆（P5 html oracle 实证：span 里的
     /// "beta" 走原子盒让 20px 行涨到 24）。混排（有控件子项）的仍
-    /// 走原子盒路径，行为与 P2 一致。
+    /// 走原子盒路径，行为与 P2 一致。::before/::after 文本按 CSS
+    /// 生成内容语义拼在首尾。
     override string FlowText() {
-        if (elText != "") { return elText; }
-        if (elOrder == null || elOrder.Count == 0) { return ""; }
+        if (elText != "") { return elBefore + elText + elAfter; }
+        if (elOrder == null || elOrder.Count == 0) {
+            if (elBefore != "" || elAfter != "") { return elBefore + elAfter; }
+            return "";
+        }
         string joined = "";
         for (int i = 0; i < elOrder.Count; i = i + 1) {
             FlowEntry o = elOrder[i];
             if (o.kid != null) { return ""; }
             joined = joined + o.text;
         }
-        return joined;
+        return elBefore + joined + elAfter;
     }
 
     /// 行盒排布期：清上一帧的 run 缓存并标记本帧 fresh。

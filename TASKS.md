@@ -628,6 +628,26 @@ HTTP 解析、编码转换、路径处理这类纯逻辑，上移到 Zan。
 
 # A16 CSS 支持面（现状实测，参考）
 
+> 2026-09-13 第四次更新（选择器三特性收尾）：①属性选择器全面放开——非
+> class 属性经 `Control.CssAttr(name)`（Element 带真实属性表，`SetAttr` 键折
+> 小写）求值，操作符 `=`/`^=`/`$=`/`|=`/`~=`/`*=` 全套（`~=` 词表近似空格包
+> 夹），id 也走 CssAttr；disabled/checked/selected 仍映射状态位；同型不同属
+> 性的兄弟节点不再共用样式缓存（Relational 记账，缓存正确性而非 Lint 装饰）。
+> ②`::before/::after` 落地——解析为部件（part=name，IsGenerated 收窄为
+> first-line/first-letter），`content` 出 Inert 名单进 StyleBox.contentRaw，
+> Element.ResolveStyle 经 Style.Part 取伪盒解析（引号串 `\` 转义与 1-6 位 hex
+> 码点、`attr(name)` 查宿主属性表、none/normal→空），inline 元素 FlowText 首
+> 尾拼接、块容器 FlowEntries 首尾各占匿名文本段。③`:has()` 求值——前导组合
+> 器定候选范围（缺省严格后代子树、`>` 直接子、`+` 紧邻后兄弟、`~` 全部后兄
+> 弟），内层解析失败/含伪元素部件/嵌套 :has 判 never；已知近似：内层组合器
+> 链最左块可落宿主子树之外（`:scope` 严格辖域是后续工作）；未做 memo 缓存
+> （CtxSig 不含子树内容会陈旧，v1 直评）。行为断言：css_test 新增
+> SelectorFeatures 段（属性七形态/伪文本 FlowText/伪盒 none/块级 pref）。
+> bootstrap 语料复测：选择器 70.9%→99.9% live（dead-state 29.1%→0.1%），声明
+> 75.3%→95.2% accepted（inert 24.0%→4.1%，content 657 条转正），effective
+> 99.4%；仓内皮肤保持 99.9%/100%。css_coverage_audit 的 never/inert 推导同
+> 步镜像新引擎（:has 可求值、GENERATED 收窄、content 出 FLOW_ONLY）。
+
 > 2026-09-11 第三次更新（第四轮：定位/层叠语义接入渲染路径）：此前
 > position/top/right/bottom/left/inset、z-index、order、overflow 只是"解析进
 > 样式盒"，布局与绘制路径根本不读——写而不读=语义失败。本轮真实消费：
@@ -664,11 +684,14 @@ HTTP 解析、编码转换、路径处理这类纯逻辑，上移到 Zan。
 
 **选择器**：复合块链（引擎 `Css.Selector`）：type/`.class`/`#id`/`::part` 可用
 后代（空格）、`>`、`+`、`~` 组合成链，复合块内可带 `:state`（hover/active/
-focus/focus-visible/disabled/selected/checked）、结构性伪类、`[class*="frag"]`
-属性选择器、`:not(...)/:is(...)/:where(...)`、`*`；逗号列表。**树上下文**：
-组合器与结构性伪类只在 retained 树（`Control.RenderTree`）内命中，无树上下文
-的即时解析路径它们不命中（Lint 汇总报告条数）；特异性按复合块累加。
-`:has()` 与 `::before/::after` 判 never（Lint 点名）。层叠固定顺序：类型 →
+focus/focus-visible/disabled/selected/checked）、结构性伪类、属性选择器（任意
+属性，操作符 `=`/`^=`/`$=`/`|=`/`~=`/`*=`，经 `CssAttr`/Element 属性表求值）、
+`:not(...)/:is(...)/:where(...)`、`:has(...)`（子/后代/兄弟存在性判定）、`*`；
+逗号列表。**树上下文**：组合器、结构性伪类、`:has()` 与非 class 属性条件只在
+retained 树（`Control.RenderTree`）内命中，无树上下文的即时解析路径它们不命
+中（Lint 汇总报告条数）；特异性按复合块累加（`:has()` 取内层最大权重）。
+`::before/::after` 是部件（Element 伪文本消费 `content`，见上第四次更新）；
+first-line/first-letter 判 never（Lint 点名）。层叠固定顺序：类型 →
 `.class` → `#id` → 带状态；同权重按出现顺序。
 
 **at-rule**：`@media` 运行期求值（逗号=或、`not X and Y`、Level 4 范围），
