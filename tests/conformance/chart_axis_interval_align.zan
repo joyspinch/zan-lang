@@ -1,0 +1,152 @@
+// A11/A12: 轴 nice 步长钳制（minInterval/maxInterval）与 alignTicks。
+//
+// 此前 `minInterval`/`maxInterval`/`alignTicks` 三个键在整个
+// stdlib/Gui/Component/Chart 里**从未被解析**（grep 只有两个死函数
+// 提到），配置静默失效。本用例断言移植后的两个纯函数，逐项对齐
+// ECharts 6.1 SSR oracle（_scratch/a11_clamp.js / a12_ticks.js）：
+//
+// ①ClampNiceRange —— axisNiceTicks.ts:130-138 的钳制：
+//   interval = nice(span/splitNumber)，被钳后按新步长重解端点，
+//   且**不得收缩**原 extent（Interval.ts:238-282 的补 tick 分支）。
+//   数据 0..3（引擎 nice 0..5/5 段 → iv=1）：
+//     min=1 → iv 不变（1==1）→ 保持 0..5；
+//     min=2 → iv 抬到 2 → 0..4（官方 0..4）；
+//     max=0.5 → iv 压到 0.5 → 0..3。
+//   注意本引擎 nice 是 ECharts 2.2.4 smartSteps（1/2/2.5/5），
+//   6.1 是 1/2/5——端点天然不同，可移植的是**钳制方向**。
+//   注：钳制后必须保证**不收缩**原 extent
+//   （Interval.ts:238-282 会给超出部分补 tick
+//   ——只管取整不补就把数据切了）。
+//
+// ②AlignRange —— axisAlignTicks.ts:250-300 的单侧实现（目标轴
+//   非固定端点分支）：interval = nice(span/alignToNiceSegCount,
+//   NICE_MODE_MIN)，段数不足时按 incl0/居中规则补格，直到覆盖原 extent。
+//   area-rainfall 右轴（雨量 0..9.415，定点 0..9415）对齐左轴 4 段
+//   → 0..12000（官方 0..4 步长 1，本引擎 0..12 步长 3，段数一致）；
+//   multiple-y-axis y1（0..182200）对齐 y0 的 4 段 → 0..200000。
+//
+// ③MinorTickValues —— scale/minorTicks.ts:22-81：相邻 nice 刻度间
+//   均分 splitNumber 段取内部点，且严格落在 extent 内（:50 的
+//   `mt > extent[0] && mt < extent[1]`）——首末段点数不足即被截。
+//   line-function y（-20..20 步长 10 共 4 段，splitNumber 5）官方
+//   minor = -18,-16,-14,-12, -8,-6,-4,-2, 2,4,6,8, 12,14,16,18
+//   （±10 是主刻度、±20 是端点，都不出现）。
+//
+// ④IncreaseInterval —— helper.ts:125：1→2、2→3、3→5、5→10。
+//
+// ⑤解析：minInterval 显式 0 是合法值（用 Double(key, AutoD) 而非
+//   Has 判定）；minorTick.splitNumber 不在 (0,100) 内回落 5
+//   （Axis.ts:207 的保护）。
+using System;
+using Gui.Component.Chart;
+
+namespace Conf;
+
+class Program {
+    static string F(double v) {
+        double r = v * 1000.0;
+        long n = r >= 0.0 ? (long)(r + 0.5) : 0L - (long)(0.0 - r + 0.5);
+        string s = Convert.ToString(n / 1000);
+        int frac = (int)(n % 1000);
+        if (frac < 0) { frac = 0 - frac; }
+        if (frac == 0) { return s; }
+        string fs = Convert.ToString(frac);
+        while (fs.Length < 3) { fs = "0" + fs; }
+        while (fs.EndsWith("0")) { fs = fs.Substring(0, fs.Length - 1); }
+        return s + "." + fs;
+    }
+
+    static void Clamp(string tag, int lo, int hi, bool scale,
+                      double mn, double mx) {
+        ChartSpan s = Chart.ClampNiceRange(lo, hi, scale, mn, mx);
+        Console.WriteLine(tag + "|" + Convert.ToString(s.lo) + ".." + Convert.ToString(s.hi)
+            + "|t=" + Convert.ToString(s.ticks));
+    }
+
+    static void Align(string tag, double lo, double hi, int segs, bool incl0) {
+        ChartSpan s = Chart.AlignRange(lo, hi, segs, incl0);
+        Console.WriteLine(tag + "|" + Convert.ToString(s.lo) + ".." + Convert.ToString(s.hi)
+            + "|t=" + Convert.ToString(s.ticks));
+    }
+
+    static void Minor(string tag, double lo, double hi, int segs, int sn) {
+        List<double> mts = new List<double>();
+        Chart.MinorTickValues(lo, hi, segs, sn, mts);
+        string outS = "";
+        for (int i = 0; i < mts.Count; i = i + 1) {
+            if (i > 0) { outS = outS + ","; }
+            outS = outS + F(mts[i]);
+        }
+        Console.WriteLine(tag + "|n=" + Convert.ToString(mts.Count) + "|" + outS);
+    }
+
+    /// 对数轴细分：逐对在原值空间插值
+    /// （minorTicks.ts:41-63）。官方 line-log 的
+    /// g0=[0.0028,0.0046,0.0064,0.0082]（_scratch/a12_log.js 实测）
+    /// 换算到千倍就是 2.8/4.6/6.4/8.2——工本引擎
+    /// 不是对数均分（对数均分会得
+    /// 到 10^0.2≈1.58 类的值）。
+    static void LogMinor(string tag, List<int> ticks, int sn) {
+        List<double> mts = new List<double>();
+        Chart.MinorTickValuesPairs(ticks, sn, mts);
+        string outS = "";
+        for (int i = 0; i < mts.Count; i = i + 1) {
+            if (i > 0) { outS = outS + ","; }
+            outS = outS + F(mts[i]);
+        }
+        Console.WriteLine(tag + "|n=" + Convert.ToString(mts.Count) + "|" + outS);
+    }
+
+    static void Main() {
+        double A = ChartOption.AutoD();
+        // ①钳制
+        Program.Clamp("clamp-none", 0, 3, false, A, A);
+        Program.Clamp("clamp-min1", 0, 3, false, 1.0, A);
+        Program.Clamp("clamp-min2", 0, 3, false, 2.0, A);
+        Program.Clamp("clamp-max05", 0, 3, false, A, 0.5);
+        Program.Clamp("clamp-min2-frac", 0, 9415, false, 2000.0, A);
+
+        // ②对齐
+        Program.Align("align-ar-right", 0.0, 9415.0, 4, true);
+        Program.Align("align-myy-y1", 2300.0, 182200.0, 4, true);
+        Program.Align("align-myy-y2", 2000.0, 23400.0, 4, true);
+        Program.Align("align-segs6", 0.0, 3301.0, 6, true);
+
+        // ③细分刻度
+        List<int> lgt = new List<int>();
+        lgt.Add(1); lgt.Add(10); lgt.Add(100); lgt.Add(1000); lgt.Add(8000);
+        Program.LogMinor("minor-log", lgt, 5);
+        Program.Minor("minor-linefn", 0.0 - 20.0, 20.0, 4, 5);
+        Program.Minor("minor-myy-y2", 0.0, 30.0, 6, 5);
+        Program.Minor("minor-frac", 0.0, 12000.0, 4, 5);
+        Program.Minor("minor-sn3", 0.0, 100.0, 4, 3);
+
+        // ④步长递增
+        Console.WriteLine("incr=" + F(Chart.IncreaseInterval(0.5))
+            + "," + F(Chart.IncreaseInterval(1.0))
+            + "," + F(Chart.IncreaseInterval(2.0))
+            + "," + F(Chart.IncreaseInterval(3.0))
+            + "," + F(Chart.IncreaseInterval(5.0))
+            + "," + F(Chart.IncreaseInterval(10.0)));
+
+        // ⑤解析：显式 0 / splitNumber 越界回落
+        string js = "{\"yAxis\":{\"minInterval\":0,\"maxInterval\":5,"
+            + "\"alignTicks\":true,\"minorTick\":{\"show\":true,\"splitNumber\":250},"
+            + "\"minorSplitLine\":{\"show\":true}},"
+            + "\"xAxis\":{\"type\":\"category\",\"data\":[\"a\"]},"
+            + "\"series\":[{\"type\":\"bar\",\"data\":[1]}]}";
+        ChartOption o = ChartOption.FromJson(js);
+        ChartAxis y = o.YAxis0();
+        Console.WriteLine("parse|mi=" + F(y.minInterval) + "|ma=" + F(y.maxInterval)
+            + "|align=" + (y.alignTicks ? "1" : "0")
+            + "|mtshow=" + (y.minorTickShow ? "1" : "0")
+            + "|mtsn=" + Convert.ToString(y.minorTickSplitNumber)
+            + "|msl=" + (y.minorSplitLineShow ? "1" : "0"));
+        string js2 = "{\"yAxis\":{\"minorTick\":{\"splitNumber\":0}},"
+            + "\"xAxis\":{\"type\":\"category\",\"data\":[\"a\"]},"
+            + "\"series\":[{\"type\":\"bar\",\"data\":[1]}]}";
+        Console.WriteLine("parse-sn0|mtsn=" + Convert.ToString(
+            ChartOption.FromJson(js2).YAxis0().minorTickSplitNumber));
+        Console.WriteLine("chart_axis_interval_align_test: OK");
+    }
+}

@@ -297,6 +297,27 @@ class ChartFrame {
         return this.plotY + this.plotH - (int)d;
     }
 
+    /// 同 YOfLog 但参数是 ×1000 定点的对数轴投影，
+    /// 供细分刻度（2.8/4.6 这类非整值）用。
+    /// 比 YOfLog 的整数口径多一档尾数分辨率。
+    int YOfLogF(long vF, int axisIndex) {
+        int lo = this.leftMin;
+        int hi = this.leftMax;
+        bool rev = this.reversed;
+        if (axisIndex == 1) { lo = this.rightMin; hi = this.rightMax; rev = this.rightReversed; }
+        if (lo < 1) { lo = 1; }
+        if (hi < lo + 1) { hi = lo + 1; }
+        if (vF < 1000L) { vF = 1000L; }
+        long llo = ChartFrame.Log10Fx((long)lo * 1000L);
+        long lhi = ChartFrame.Log10Fx((long)hi * 1000L);
+        if (lhi <= llo) { lhi = llo + 1000L; }
+        long d = (ChartFrame.Log10Fx(vF) - llo) * (long)this.plotH / (lhi - llo);
+        if (d < 0L) { d = 0L; }
+        if (d > (long)this.plotH) { d = (long)this.plotH; }
+        if (rev) { return this.plotY + (int)d; }
+        return this.plotY + this.plotH - (int)d;
+    }
+
     /// 10 的整数对数（floor log10），仅正值（v < 1 → 0）。
     static int Log10(int v) {
         if (v < 1) { return 0; }
@@ -330,6 +351,23 @@ class ChartFrame {
             frac = 778 + (long)(x - 6) * 74;
         }
         return (long)e * 1000 + frac;
+    }
+
+    /// Log10F 的 ×1000 定点入口版：参数也是定点
+    /// （v×1000），尾数段不再被整除截成整数。
+    /// 折线节点与 Log10F 同源（lg1=0、lg3≈478、
+    /// lg6≈778、lg10=1000），所以对整数点两者
+    /// 输出完全一致（Log10Fx(8000*1000)==Log10F(8000)）。
+    static long Log10Fx(long vF) {
+        if (vF < 1000L) { return 0L; }
+        long e = 0L;
+        long x = vF;
+        while (x >= 10000L) { x = x / 10L; e = e + 1L; }
+        long frac;
+        if (x < 3000L) { frac = (x - 1000L) * 477L / 2000L; }
+        else if (x < 6000L) { frac = 477L + (x - 3000L) * 301L / 3000L; }
+        else { frac = 778L + (x - 6000L) * 296L / 4000L; }
+        return e * 1000L + frac;
     }
 
     /// 线性/对数 Y 的像素 -> 值域反解。对数轴与当前
@@ -1048,6 +1086,173 @@ class Chart {
         double last = outTicks.Count > 0 ? outTicks[outTicks.Count - 1] : nt1;
         // extent 高于 nice 上界时补一个原始端点（源码 :279-288）
         if (extent1 > last) { outTicks.Add(extent1); }
+    }
+
+    /// `scale/helper.ts:125 increaseInterval(niceInterval)`：把 nice 步长
+    /// 抬到下一个 nice 值（f 是十进制系数）——1→2、2→3、3→5、5→10。
+    /// 用于 alignTicks 的 `loopIncreaseInterval` 搜索。
+    static double IncreaseInterval(double iv) {
+        if (iv <= 0.0) { return 1.0; }
+        int e = Chart.QuantityExponent(iv);
+        double exp10 = Chart.Pow10D(e);
+        double f = Chart.RoundP(iv / exp10, 0);
+        if (f == 0.0) { f = 1.0; }
+        else if (f == 2.0) { f = 3.0; }
+        else if (f == 3.0) { f = 5.0; }
+        else { f = f * 2.0; }
+        return Chart.RoundP(f * exp10, e < 0 ? 0 - e : 0);
+    }
+
+    /// A11：`axisNiceTicks.ts:130-138` 的 minInterval/maxInterval 钳制。
+    /// 先按 NiceRange 解出引擎自己的 nice 区间，算出等效步长
+    /// interval = (hi−lo)/ticks；若被钳制改变，则用钳后的步长重解端点
+    /// （`niceExtent = [ceil(e0/iv)·iv, floor(e1/iv)·iv]`，出处同文件
+    /// :140-143）。**未声明钳制的轴走原路，逐像素不变**。
+    /// 注意本引擎 nice 是 ECharts 2.2.4 smartSteps（1/2/2.5/5），
+    /// 与 6.1 的 1/2/5 端点天然不同——钳制语义（往哪边推）才是可移植的。
+    static ChartSpan ClampNiceRange(int dataLo, int dataHi, bool scale,
+                                    double minInterval, double maxInterval) {
+        ChartSpan s = Chart.NiceRange(dataLo, dataHi, scale);
+        if (ChartOption.IsAutoD(minInterval) && ChartOption.IsAutoD(maxInterval)) { return s; }
+        if (s.ticks < 1) { return s; }
+        double iv0 = (double)(s.hi - s.lo) / (double)s.ticks;
+        if (iv0 <= 0.0) { return s; }
+        double iv = iv0;
+        if (!ChartOption.IsAutoD(minInterval) && iv < minInterval) { iv = minInterval; }
+        if (!ChartOption.IsAutoD(maxInterval) && iv > maxInterval) { iv = maxInterval; }
+        if (iv == iv0) { return s; }
+        int p = Chart.GetIntervalPrecision(iv);
+        // niceExtent = [ceil(e0/iv)·iv, floor(e1/iv)·iv] 落在数据域内部；
+        // 但轴的 extent 不得被缩小（Interval.ts:238-282 的
+        // 两个补 tick 分支：域外的那一格被推
+        // 成 niceExtent ± interval）——数据超出的那一格
+        // 必须补回来（min=2 时 0..3 官方出 0..4）。
+        double nlo = Chart.RoundP(Math.Ceiling((double)dataLo / iv) * iv, p);
+        double nhi = Chart.RoundP(Math.Floor((double)dataHi / iv) * iv, p);
+        if (nlo > (double)dataLo) { nlo = Chart.RoundP(nlo - iv, p); }
+        if (nhi < (double)dataHi) { nhi = Chart.RoundP(nhi + iv, p); }
+        if (nhi <= nlo) { nhi = nlo + iv; }
+        ChartSpan r = new ChartSpan();
+        r.lo = (int)(nlo >= 0.0 ? nlo + 0.5 : nlo - 0.5);
+        r.hi = (int)(nhi >= 0.0 ? nhi + 0.5 : nhi - 0.5);
+        if (r.hi <= r.lo) { r.hi = r.lo + 1; }
+        int nt = (int)Chart.RoundP(((double)r.hi - (double)r.lo) / iv, 0);
+        r.ticks = nt < 1 ? 1 : nt;
+        return r;
+    }
+
+    /// A12：`coord/axisAlignTicks.ts scaleCalcAlign` 的单侧实现——把目标轴
+    /// 解成与对齐轴**段数相同、刻度对齐**的量程。`alignToSegs` = 对齐轴
+    /// 的段数；`dataLo/dataHi` 是目标轴的原始 extent（incl0 已并入）。
+    /// 对应源码 :250-300 的 `targetMinMaxFixed` 双 false 分支：
+    ///   interval = nice(span / alignToNiceSegCount, NICE_MODE_MIN)
+    ///   loopIncreaseInterval: minNice=ceil(e0/iv)·iv、maxNice=floor(e1/iv)·iv，
+    ///     段数不足 alignToNiceSegCount 时按 incl0/居中规则向两侧补格，
+    ///     直到 [min,max] 覆盖原 extent。
+    /// 调用方给的单位是"轴自己的单位"（整数轴=值，小数轴=×1000 定点，
+    /// 时间轴=天），因此同一函数三处复用。
+    static ChartSpan AlignRange(double dataLo, double dataHi, int alignToSegs,
+                                bool incl0) {
+        if (alignToSegs < 1) { alignToSegs = 1; }
+        // incl0 时先做与 NiceRange 同一个零锚定
+        // （Chart.zan 的 NiceRange 原文 :1552-1555，出处 valueAxis
+        // _reformValue）：全正数据下界归零、
+        // 全负数据上界归零。不做这一步
+        // 就会把 2000..23400 对成 -10000..30000
+        // （官方 0..40000）——零锚定是
+        // incl0 的前提，不是可选补丁。
+        if (incl0) {
+            if (dataLo >= 0.0 && dataHi >= 0.0) { dataLo = 0.0; }
+            if (dataLo <= 0.0 && dataHi <= 0.0) { dataHi = 0.0; }
+        }
+        double span = dataHi - dataLo;
+        if (span <= 0.0) { span = 1.0; }
+        double iv = Chart.NiceMode(span / (double)alignToSegs, false);
+        if (iv <= 0.0) { iv = 1.0; }
+        double nlo = dataLo;
+        double nhi = dataHi;
+        for (int guard = 0; guard < 64; guard = guard + 1) {
+            int p = Chart.GetIntervalPrecision(iv);
+            nlo = Chart.RoundP(Math.Ceiling(dataLo / iv) * iv, p);
+            nhi = Chart.RoundP(Math.Floor(dataHi / iv) * iv, p);
+            int cnt = (int)Chart.RoundP((nhi - nlo) / iv, 0);
+            if (cnt <= alignToSegs) {
+                int more = alignToSegs - cnt;
+                double mlo = 0.0;
+                double mhi = 0.0;
+                if (incl0 && dataLo == 0.0) { mlo = 0.0; mhi = (double)more; }
+                else if (incl0 && dataHi == 0.0) { mlo = (double)more; mhi = 0.0; }
+                else {
+                    int half = more / 2;
+                    if (more % 2 == 0) { mlo = (double)half; mhi = (double)half; }
+                    else if (nlo + nhi < dataLo + dataHi) {
+                        mlo = (double)half; mhi = (double)(half + 1);
+                    } else {
+                        mlo = (double)(half + 1); mhi = (double)half;
+                    }
+                }
+                nlo = Chart.RoundP(nlo - iv * mlo, p);
+                nhi = Chart.RoundP(nhi + iv * mhi, p);
+                if (nlo <= dataLo && nhi >= dataHi) { break; }
+            }
+            iv = Chart.IncreaseInterval(iv);
+        }
+        ChartSpan r = new ChartSpan();
+        r.lo = (int)(nlo >= 0.0 ? nlo + 0.5 : nlo - 0.5);
+        r.hi = (int)(nhi >= 0.0 ? nhi + 0.5 : nhi - 0.5);
+        if (r.hi <= r.lo) { r.hi = r.lo + 1; }
+        r.ticks = alignToSegs;
+        return r;
+    }
+
+    /// A12 minorTick 的刻度序列：scale/minorTicks.ts:22-81
+    /// getMinorTicks(scale, splitNumber, breaks, scaleInterval)。
+    /// 每两个相邻 nice 刻度之间均分 splitNumber
+    /// 段，取内部点，且严格落在
+    /// [extent0, extent1] 内（源码 :50 `minorTick > extent[0] &&
+    /// minorTick < extent[1]`）——首末段因数不足而被
+    /// 截掉的点就是这条规则。
+    /// 入参域与 splitNumber 均为轴自己的单位
+    /// （整数轴=值，小数轴=×1000 定点）。
+    /// 对数轴版：刻度不等距（每个十倍），
+    /// 不能用均分版。源码同 minorTicks.ts:41-63
+    /// 的对点循环：逐对在**原值**空间插值
+    /// （minorTick = prev + (c+1)*interval/splitNumber），再经对数映射落像素
+    /// ——所以 1..10 的细分点是 2.8/4.6/6.4/8.2
+    /// 而不是对数均分点（官方
+    /// _scratch/a12_log.js 实测）。
+    static void MinorTickValuesPairs(List<int> ticks, int splitNumber,
+                                    List<double> into) {
+        if (splitNumber < 2 || ticks.Count < 2) { return; }
+        double e0 = (double)ticks[0];
+        double e1 = (double)ticks[ticks.Count - 1];
+        for (int i = 1; i < ticks.Count; i = i + 1) {
+            double prev = (double)ticks[i - 1];
+            double interval = (double)ticks[i] - prev;
+            if (interval <= 0.0) { continue; }
+            double minorInterval = interval / (double)splitNumber;
+            int p = Chart.GetIntervalPrecision(minorInterval);
+            for (int c = 1; c < splitNumber; c = c + 1) {
+                double mt = Chart.RoundP(prev + (double)c * minorInterval, p);
+                if (mt > e0 && mt < e1) { into.Add(mt); }
+            }
+        }
+    }
+
+    static void MinorTickValues(double e0, double e1, int segs, int splitNumber,
+                                List<double> into) {
+        if (segs < 1 || splitNumber < 2) { return; }
+        double interval = (e1 - e0) / (double)segs;
+        if (interval == 0.0) { return; }
+        double minorInterval = interval / (double)splitNumber;
+        int p = Chart.GetIntervalPrecision(minorInterval);
+        for (int g = 0; g < segs; g = g + 1) {
+            double prev = e0 + interval * (double)g;
+            for (int c = 1; c < splitNumber; c = c + 1) {
+                double mt = Chart.RoundP(prev + (double)c * minorInterval, p);
+                if (mt > e0 && mt < e1) { into.Add(mt); }
+            }
+        }
     }
 
     /// ECharts 语义的数值轴 [lo, hi]（供 BuildAxes* 用）。
@@ -4130,6 +4335,11 @@ class Chart {
         bool leftFrac = Chart.SeriesFracAny(series, 0);
         int leftLo = Chart.AxisLo(y0.min, Chart.AxisMinFor(series, 0, zI0, zI1, y0.scale), y0.scale);
         int leftHi = Chart.AxisHi(y0.max, lData, leftLo);
+        // alignTicks 需要的是 **nice 之前**的原始 extent
+        // （axisAlignTicks.ts:176 的 targetExtent = 原始域，不是 niceExtent）。
+        // 本引擎两条路径的原始域都要留下副本。
+        double lRawLo = 0.0;
+        double lRawHi = 0.0;
         int leftLoF = 0;
         int leftHiF = 0;
         if (leftFrac) {
@@ -4154,8 +4364,16 @@ class Chart {
             if (!ChartOption.IsAutoD(y0.minD) && !ChartOption.IsAutoD(y0.maxD)) {
                 leftLo = leftLoF / 1000;
                 leftHi = leftHiF / 1000;
+                lRawLo = (double)leftLoF; lRawHi = (double)leftHiF;
             } else {
-                ChartSpan fs2 = Chart.NiceRange(leftLoF, leftHiF, y0.scale);
+                // minInterval/maxInterval 在数据单位上声明，定点域 ×1000。
+                // 未声明（AutoD 哨兵）不能乘，否则哨兵失效。
+                lRawLo = (double)leftLoF; lRawHi = (double)leftHiF;
+                double lmn = ChartOption.IsAutoD(y0.minInterval)
+                    ? ChartOption.AutoD() : y0.minInterval * 1000.0;
+                double lmx = ChartOption.IsAutoD(y0.maxInterval)
+                    ? ChartOption.AutoD() : y0.maxInterval * 1000.0;
+                ChartSpan fs2 = Chart.ClampNiceRange(leftLoF, leftHiF, y0.scale, lmn, lmx);
                 leftLoF = fs2.lo;
                 leftHiF = fs2.hi;
                 ticks = fs2.ticks;
@@ -4169,6 +4387,8 @@ class Chart {
         int rightHi = 1;
         int rightLoF = 0;
         int rightHiF = 0;
+        double rRawLo = 0.0;
+        double rRawHi = 0.0;
         bool rightFrac = false;
         int rt = ticks;
         if (hasRight) {
@@ -4192,12 +4412,17 @@ class Chart {
                 } else {
                     rightHiF = Chart.FracAxisHiF(y1.max, series, 1, zI0, zI1, y1.scale);
                 }
+                rRawLo = (double)rightLoF; rRawHi = (double)rightHiF;
                 if (!ChartOption.IsAutoD(y1.minD) && !ChartOption.IsAutoD(y1.maxD)) {
                     rightLo = rightLoF / 1000;
                     rightHi = rightHiF / 1000;
                     rt = y1.ticks < 1 ? 5 : y1.ticks;
                 } else {
-                    ChartSpan rs2 = Chart.NiceRange(rightLoF, rightHiF, y1.scale);
+                    double rmn = ChartOption.IsAutoD(y1.minInterval)
+                        ? ChartOption.AutoD() : y1.minInterval * 1000.0;
+                    double rmx = ChartOption.IsAutoD(y1.maxInterval)
+                        ? ChartOption.AutoD() : y1.maxInterval * 1000.0;
+                    ChartSpan rs2 = Chart.ClampNiceRange(rightLoF, rightHiF, y1.scale, rmn, rmx);
                     rightLoF = rs2.lo;
                     rightHiF = rs2.hi;
                     rt = rs2.ticks;
@@ -4214,8 +4439,10 @@ class Chart {
         if (!leftLog && !leftFrac && y0.type == ChartAxisType.Value
             && y0.min == ChartOption.Auto() && y0.max == ChartOption.Auto()
             && (leftDataMax < 0 || y0.scale)) {
-            ChartSpan ls = Chart.NiceRange(
-                Chart.AxisMinFor(series, 0, zI0, zI1, y0.scale), lData, y0.scale);
+            lRawLo = (double)Chart.AxisMinFor(series, 0, zI0, zI1, y0.scale);
+            lRawHi = (double)lData;
+            ChartSpan ls = Chart.ClampNiceRange((int)lRawLo, (int)lRawHi, y0.scale,
+                y0.minInterval, y0.maxInterval);
             leftLo = ls.lo;
             leftHi = ls.hi;
             ticks = ls.ticks;
@@ -4231,11 +4458,37 @@ class Chart {
         } else if (hasRight && !rightFrac && y1.type == ChartAxisType.Value
             && y1.min == ChartOption.Auto() && y1.max == ChartOption.Auto()
             && (rightDataMax < 0 || y1.scale)) {
-            ChartSpan rs = Chart.NiceRange(Chart.AxisMinFor(series, 1, zI0, zI1, y1.scale),
-                Chart.AxisMaxFor(series, 1, zI0, zI1, y1.scale), y1.scale);
+            rRawLo = (double)Chart.AxisMinFor(series, 1, zI0, zI1, y1.scale);
+            rRawHi = (double)Chart.AxisMaxFor(series, 1, zI0, zI1, y1.scale);
+            ChartSpan rs = Chart.ClampNiceRange((int)rRawLo, (int)rRawHi, y1.scale,
+                y1.minInterval, y1.maxInterval);
             rightLo = rs.lo;
             rightHi = rs.hi;
             rt = rs.ticks;
+        }
+        // ---- A12 alignTicks（coord/axisAlignTicks.ts scaleCalcAlign）----
+        // 只在左/右两条**数值轴**之间做：Grid.ts:738-756 逆序扫描
+        // 挑 alignTo（不要求对齐的最后一条）；两槽都要求则取 y0。
+        // 本引擎只有左/右两槽，第 3 条以上的 y 轴不参与对齐（记债）。
+        if (hasRight && !leftLog && !rightLog
+            && y0.type == ChartAxisType.Value && y1.type == ChartAxisType.Value
+            && (y0.alignTicks || y1.alignTicks)) {
+            // 只 y1 要求：把右轴对齐到左轴；
+            // 只 y0 要求：把左轴对齐到右轴。
+            bool alignRight = y1.alignTicks;
+            int segs = alignRight ? ticks : rt;
+            if (segs < 1) { segs = 1; }
+            if (alignRight) {
+                ChartSpan ar = Chart.AlignRange(rRawLo, rRawHi, segs, !y1.scale);
+                if (rightFrac) { rightLoF = ar.lo; rightHiF = ar.hi; rightLo = rightLoF / 1000; rightHi = rightHiF / 1000; }
+                else { rightLo = ar.lo; rightHi = ar.hi; }
+                rt = ar.ticks;
+            } else {
+                ChartSpan al = Chart.AlignRange(lRawLo, lRawHi, segs, !y0.scale);
+                if (leftFrac) { leftLoF = al.lo; leftHiF = al.hi; leftLo = leftLoF / 1000; leftHi = leftHiF / 1000; }
+                else { leftLo = al.lo; leftHi = al.hi; }
+                ticks = al.ticks;
+            }
         }
         // 时间 X 轴：显式 min/max 优先；否则时间域取全部可见系列
         // 时间点（points.x，epoch 天）在 dataZoom 窗口内的 min/max
@@ -4307,8 +4560,12 @@ class Chart {
                 if (xHi == ChartOption.Auto()) { xHi = Chart.XMaxFor(series, catY, x0.scale); }
                 if (xHi <= xLo) { xHi = xLo + 1; }
             } else {
-                ChartSpan xsp = Chart.NiceRange(Chart.XMinFor(series, catY, x0.scale),
-                    Chart.XMaxFor(series, catY, x0.scale), x0.scale);
+                // A11\uff1aminInterval/maxInterval 同样作用于 X 数值轴
+                // （axisNiceTicks.ts:263-264 的 isIntervalOrTime 不分轴\uff09。
+                ChartSpan xsp = Chart.ClampNiceRange(
+                    Chart.XMinFor(series, catY, x0.scale),
+                    Chart.XMaxFor(series, catY, x0.scale), x0.scale,
+                    x0.minInterval, x0.maxInterval);
                 xLo = xsp.lo;
                 xHi = xsp.hi;
                 xt = xsp.ticks;
@@ -4646,6 +4903,65 @@ class Chart {
                     ls, sAxis.FgOr(0), fs);
             }
         }
+        // ---- A12 minorSplitLine（CartesianAxisView.ts:170-200）----
+        // 细分网格线：每两个 nice 刻度之间 splitNumber 等分处画一条
+        // 横线（数值轴）。颜色走 chart::minor-grid，缺省回落主网格色。
+        // 类目轴不支持（Axis.ts:204 isOrdinalScale 直接返回空）。
+        if (grid && (y0.minorSplitLineShow || (hasRight && y1.minorSplitLineShow))) {
+            StyleBox sMinor = Style.Part(app, "chart", "minor-grid", "", "", "",
+                                        Style.SNormal());
+            int mcol = sMinor.BgOr(0) != 0 ? sMinor.BgOr(0) : sGrid.BgOr(0);
+            if (y0.minorSplitLineShow && !catY && leftLog) {
+                // 对数轴：刻度非等距，逐对插值
+                // （minorTicks.ts:41-63），投影走
+                // YOfLogF 的定点对数轴。
+                List<int> ltsM = Chart.LogTicks(leftLo, leftHi);
+                List<double> mtsL = new List<double>();
+                Chart.MinorTickValuesPairs(ltsM, y0.minorTickSplitNumber, mtsL);
+                for (int mi = 0; mi < mtsL.Count; mi = mi + 1) {
+                    long mf = (long)(mtsL[mi] * 1000.0 + 0.5);
+                    c.FillRect(plotX, f.YOfLogF(mf, 0), plotW, 1, mcol);
+                }
+            }
+            if (y0.minorSplitLineShow && !catY && !leftLog
+                && y0.type == ChartAxisType.Value && ticks > 0) {
+                List<double> mts = new List<double>();
+                if (leftFrac) {
+                    Chart.MinorTickValues((double)leftLoF, (double)leftHiF, ticks,
+                        y0.minorTickSplitNumber, mts);
+                    for (int mi = 0; mi < mts.Count; mi = mi + 1) {
+                        int gy = f.YOfF((int)(mts[mi] + 0.5), 0);
+                        c.FillRect(plotX, gy, plotW, 1, mcol);
+                    }
+                } else {
+                    Chart.MinorTickValues((double)leftTickLo, (double)leftTickHi, ticks,
+                        y0.minorTickSplitNumber, mts);
+                    for (int mi = 0; mi < mts.Count; mi = mi + 1) {
+                        int gy = f.YOf((int)(mts[mi] + 0.5), 0);
+                        c.FillRect(plotX, gy, plotW, 1, mcol);
+                    }
+                }
+            }
+            if (hasRight && y1.minorSplitLineShow && !rightLog
+                && y1.type == ChartAxisType.Value && rt > 0) {
+                List<double> mts = new List<double>();
+                if (rightFrac) {
+                    Chart.MinorTickValues((double)rightLoF, (double)rightHiF, rt,
+                        y1.minorTickSplitNumber, mts);
+                    for (int mi = 0; mi < mts.Count; mi = mi + 1) {
+                        int gy = f.YOfF((int)(mts[mi] + 0.5), 1);
+                        c.FillRect(plotX, gy, plotW, 1, mcol);
+                    }
+                } else {
+                    Chart.MinorTickValues((double)rightTickLo, (double)rightTickHi, rt,
+                        y1.minorTickSplitNumber, mts);
+                    for (int mi = 0; mi < mts.Count; mi = mi + 1) {
+                        int gy = f.YOf((int)(mts[mi] + 0.5), 1);
+                        c.FillRect(plotX, gy, plotW, 1, mcol);
+                    }
+                }
+            }
+        }
         if (hasRight) {
             if (rightLog) {
                 List<int> rts = Chart.LogTicks(rightLo, rightHi);
@@ -4712,6 +5028,25 @@ class Chart {
             bool gridX = o.showGrid && x0.showGrid;
             // X 刻度同左/右轴取 nice 端点副本（xLo/xHi 已留白外扩）。
             int xspan = xTickHi - xTickLo;
+            // ---- A12 minorSplitLine\uff08X 数值轴\uff09----
+            // CartesianAxisView.ts:170-200 同一函数按
+            // isHorizontal 分支：x 轴画竖线。
+            // 类目轴不支持\uff08Axis.ts:204 返回空\uff09。
+            if (x0.minorSplitLineShow && !catY && !isTime
+                && x0.type == ChartAxisType.Value && xt > 0) {
+                StyleBox sMinorX = Style.Part(app, "chart", "minor-grid", "", "", "",
+                                             Style.SNormal());
+                int mcolX = sMinorX.BgOr(0) != 0 ? sMinorX.BgOr(0) : sGrid.BgOr(0);
+                List<double> mtsX = new List<double>();
+                Chart.MinorTickValues((double)xTickLo, (double)xTickHi, xt,
+                    x0.minorTickSplitNumber, mtsX);
+                for (int miX = 0; miX < mtsX.Count; miX = miX + 1) {
+                    int gmx = f.XOfValue((int)(mtsX[miX] + 0.5));
+                    if (gmx > plotX && gmx < plotX + plotW) {
+                        c.FillRect(gmx, plotY, 1, plotH, mcolX);
+                    }
+                }
+            }
             for (int k = 0; k <= xt; k = k + 1) {
                 int xv = xTickLo + xspan * k / xt;
                 int gx = f.XOfValue(xv);

@@ -898,3 +898,77 @@ lightgray/lightgrey、slate*/darkslate*/lightslate* 的 gray/grey 对），
 
 只数"变了多少个"不够，**必须同时确认"不该变的没变"**，否则一次
 过度接线（比如照 `Count>0` 接）会被"变了 22 个"当成成功。
+
+## 轴刻度钳制/对齐/细分：三个键静默失效（A11/A12 会话）
+
+**现象**：`yAxis.minInterval` / `maxInterval` / `alignTicks` / `minorTick` /
+`minorSplitLine` 全部无效果。grep `stdlib/Gui/Component/Chart/` 发现
+`minInterval` 只出现在两个**死函数**里（`AxisNiceRange` / `IntervalScaleNiceTicks`），
+真实管线 `NiceRange`/`BuildAxesR` 从不读它——**配置字段存在、解析代码没有，
+就是静默失效**。查缺口先 grep 字段名是否被 `ParseAxisOne` 读，别先看渲染。
+
+### 钳制（minInterval/maxInterval）
+
+- 只对 **interval/time** 刻度生效（`axisNiceTicks.ts:263-264`
+  `isIntervalOrTime ? model.get(...) : null`），log/类目轴不适用。
+- 顺序：`interval = nice(span/splitNumber)` → `if (minInterval != null && interval < minInterval) interval = minInterval` → max 对称。
+- nice extent 落在**数据域内侧**（`ceil(e0/iv)·iv` / `floor(e1/iv)·iv`），
+  但 `Interval.ts:238-282` 会给超出部分**补 tick**。**所以钳制后必须保证
+  extent 不收缩**：`if (nlo > dataLo) nlo -= iv; if (nhi < dataHi) nhi += iv;`
+  （我第一版漏了这步，`minInterval:2` 在数据 0..3 上给出 0..2 而非 0..4，
+  直接把数据切了）。
+- `minInterval` 是 `null` 有语义（未声明）而 **0 是合法值**，所以解析必须用
+  `Double(key, AutoD())` 哨兵，不能用 `Has(key)` 判定（同 C6 的
+  "接线必须认显式声明"）。小数轴（×1000 定点）的 minInterval 按数据单位
+  ×1000 换算，**哨兵不能参与乘法**。
+
+### alignTicks
+
+- alignTo 由 `Grid.ts:738-756` **逆序扫描**挑"不要求对齐的最后一条"；全都要
+  求则第一条被 pop 当 alignTo。本引擎只有左/右两槽，第 3 条以上 y 轴不参与
+  （记债）。
+- 两个必踩的坑：
+  1. 必须用**原始 extent**（`axisAlignTicks.ts:176 targetExtent`），不是
+     nice 后的——拿 nice 域去对齐会多补一格。
+  2. `mayEnhanceZero = targetExtentInfo.incl0`，而 `incl0 = !option.scale`：
+     **全正数据在 `scale:false`（缺省）时下界就是 0**。不做这步零锚定，
+     `2000..23400` 会被对成 `-10000..30000`（官方 `0..40000`）——
+     这是"官方为什么从不给正数据负刻度"的答案。
+- `nice(x, NICE_MODE_MIN)` 的 `NICE_MODE_MIN` ⇒ `nf = 1`，**结果就是 10 的幂**，
+  不是 1/2/5 那套。
+- 段数（`nseg`）是可移植判据，端点不是（本引擎 nice 是 2.2.4 smartSteps 的
+  1/2/2.5/5，ECharts 6 是 1/2/5）。
+
+### minorTick / minorSplitLine
+
+- `splitNumber` 缺省 5，**不在 `(0,100)` 内回落 5**（`Axis.ts:207` 的保护）。
+- 逐对相邻刻度在**原始值空间**等分取内部点，且严格
+  `mt > extent[0] && mt < extent[1]`（`minorTicks.ts:50`）——**首末段越界的
+  点被丢弃**：−20..20 / 4 段 / splitNumber 5 得 **16** 点而不是 20。
+- **类目轴返回空**（`Axis.ts:204 isOrdinalScale`）——别给类目轴画细分线。
+- **log 轴也在原始值空间插值**（`Log.ts:146-154` 把 `intervalStub` 传进
+  `getMinorTicks`）：line-log 的 g0 实测 `2.8/4.6/6.4/8.2`，**不是对数均分**
+  （对数均分会得 1.58 之类）。所以 log 细分要用"逐对刻度"版而不是"等分段"版。
+- 非整值细分点（2.8/4.6）在 log 轴上落像素需要 ×1000 定点对数映射
+  （新增 `Log10Fx`/`YOfLogF`），整数版 `YOfLog` 会把它们全挤到同一像素。
+- 颜色 `tokens.color.axisMinorSplitLine = neutral05 = '#f4f7fd'`——按项目
+  规矩**进 CSS**（`stdlib/Gui/skins/base.css` 的 `chart::minor-grid`），
+  不在代码里写字面色。
+- **残留**：`minorTick.show`（短刻度 stub）未渲染，本引擎没有 cartesian
+  axisTick 渲染通道，只做了 `minorSplitLine`（记债）。
+
+### 钳制/对齐要覆盖到"轴有几种"，别只修看见的那一条
+
+A11 第一版只改了 y 轴（左/右）的四处量程点，漏了 **x 数值轴**——同一个
+`axisNiceTicks.ts:263-264` 的 `isIntervalOrTime` 判定**不分轴**，
+`xAxis.minInterval` 一样该生效。修完 y 要回头数一遍这个键在源码里
+覆盖哪些轴/路径，再逐条接（x 值轴已补，**time 轴记债**）。
+
+**time 轴为什么不能照抄**：`scale/Time.ts:745-775 calcNiceForTimeScale`
+是把钳制加在中间量 `approxInterval = span/splitNumber` 上，再去
+`scaleIntervals` 表里取档；本引擎的 `Chart.TimeTicks(t0,t1,maxTicks)`
+是按**刻度条数**自增步长（1→2→5→10 天），没有 `approxInterval` 这个
+中间量。**在现结构上硬套 = 臆想**——先把 `TimeTicks` 改成"先解
+`approxInterval` 再查档"，才谈得上接线。而且实测唯一用它的 demo
+（wind-barb，`maxInterval` 1 天）本身就是 no-op（引擎步长已 2 天），
+所以"没接"当前不产生可见错误，记债即可。
