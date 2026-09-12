@@ -2371,3 +2371,25 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
   （Workspace/ZanIDE/CodeNav 等）是 IDE 自身功能臂（打开旧项目、
   JSON 抽屉、撤销快照），不属编译通道，留独立提交清扫（需
   build_ide.ps1 完整配方验证）。
+
+* **P8-4 后续：.zform 清扫收尾 + 命名债挂账（2026-09-13）**：
+  编译通道删除后的三个清尾批次——① lsp：intel_parse_zform JSON 索引
+  通道删除（.html/.zscene 通道共享 helper 更名 intel_design_widget/
+  intel_doc_name_lines），顺带补 zan-lsp 源清单缺失的 builtin_api.c
+  （fc2dda55 起 checker 引用 zan_builtin_member_result，清单缺口被
+  链接错误暴露）；② 五个脚本 + run_templates.cmake 的设计文档发现面
+  P7d 时漏改（scan_components 按 .zform 兄弟找 code-behind 恒不命中
+  →IDE 组件注册表静默少收 2 个；check_structure 守门扫错扩展名；
+  build_oneplus 收集 .zform 会被定向拒绝；e2e/脚手架改名臂恒死），
+  全部翻转 .html，gui-wechat quoteBar Panel→Flex 类型错顺修；③
+  51 文件措辞对齐（stdlib 注释/模板头/gallery 资产/mcp_server 工具
+  描述/docs 活文档/skill ②③）。验证：templates_build 33 模板 32 OK、
+  lsp 探针全绿、stdlib 类型检查过、check_structure 与 HEAD 同结果。
+  **命名债挂账（不挡功能，等 knowledge/MCP 管线专项或版本边界一起
+  改名）**：zform.json/zform.doc.json/ZformSchema.zan/run_zform_schema
+  .cmake/conformance_gui_zform_html 测试名——内容是格式无关的控件
+  PropSpec 目录，"zform"只是历史资源名。**在途半成品挂账**：
+  server-legend Player.zan 字段改名（arenaPts→merit、stars→starsLit、
+  删 buffUntil 加四币种）模型侧已改、消费端（Play/Gateway/World 的
+  Set 链与读写点 ~13 处）未跟上——模板门 templates_build 因此红，
+  待该会话收尾；templates_build 其余 32 模板全绿。
