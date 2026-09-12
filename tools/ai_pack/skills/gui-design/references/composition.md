@@ -101,5 +101,5 @@ gallery 支持深链直达任一演示页 + 指定皮肤/语言/玻璃:
 ./gui_gallery Slider liquidglass zh     # 组件名 皮肤 语言
 ```
 
-构建与启动的完整注意事项(含 Linux 环境坑)见 `testing-gui-gallery`
-skill。改完先过自查清单,再换三个皮肤各截图看一眼。
+构建与启动注意本机环境差异(Linux 的显示/依赖坑)。改完先过自查清单,
+再换三个皮肤各截图看一眼。

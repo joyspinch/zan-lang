@@ -603,7 +603,7 @@ CSS 里非 token 的长度由 `Style.ScaleLayout` 补乘,`StyleBox.IsPrescaled`
 
 - 编译:`zanc <file>.zan --auto-stdlib -o out.exe`(GUI 程序自动带 zan_gui 驱动)。
 - 跑起来真实看一眼,截图对照自查清单(截图必须锚定被调试窗口的 PID、按窗口
-  截取并先验证再判断,规范见 `testing-gui-screenshot` skill);交互(点击/拖拽/键盘)用
+  截取并先验证再判断);交互(点击/拖拽/键盘)用
   `ZAN_UI_SCRIPT` UiDriver 驱动做可重复流程,不要手点一次就算完。
 - UiDriver 只绑进程里第一个 App:ChildWindow 里的树驱动不到。要端到端
   驱动子窗口界面,拆成 View 控件(真实整棵树)+ 薄 ChildWindow 壳
@@ -618,7 +618,7 @@ CSS 里非 token 的长度由 `Style.ScaleLayout` 补乘,`StyleBox.IsPrescaled`
   棘轮;新组件必带 conformance 测试(`docs/STDLIB_COMPONENT_STANDARDS.md`)。
 - 构建回归:`scripts\build_gallery.ps1` + `scripts\build_ide.ps1` 必须过;
   视觉检查用 gallery 深链(组件名+皮肤直达,如 `./gui_gallery Slider
-  liquidglass zh`),完整流程与 Linux 环境坑见 `testing-gui-gallery` skill;
+  liquidglass zh`),完整构建/启动流程见仓库文档;
   像素级改动参照 `tests/conformance/conformance_gui_chart_symbol` 加离屏回归。
 - 新增内置皮肤:在 `stdlib/Gui/skins/<name>/skin.css` 建包即可自动发现
   (可选 `banner.png` 预览图)。

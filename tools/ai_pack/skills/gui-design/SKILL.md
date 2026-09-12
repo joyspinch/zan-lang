@@ -603,7 +603,7 @@ CSS 里非 token 的长度由 `Style.ScaleLayout` 补乘,`StyleBox.IsPrescaled`
 
 - 编译:`zanc <file>.zan --auto-stdlib -o out.exe`(GUI 程序自动带 zan_gui 驱动)。
 - 跑起来真实看一眼,截图对照自查清单(截图必须锚定被调试窗口的 PID、按窗口
-  截取并先验证再判断,规范见 `testing-gui-screenshot` skill);交互(点击/拖拽/键盘)用
+  截取并先验证再判断);交互(点击/拖拽/键盘)用
   `ZAN_UI_SCRIPT` UiDriver 驱动做可重复流程,不要手点一次就算完。
 - UiDriver 只绑进程里第一个 App:ChildWindow 里的树驱动不到。要端到端
   驱动子窗口界面,拆成 View 控件(真实整棵树)+ 薄 ChildWindow 壳

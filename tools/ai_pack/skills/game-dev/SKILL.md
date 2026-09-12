@@ -1,6 +1,6 @@
 ---
 name: game-dev
-description: Zan 2D 游戏(templates/game/* 与 stdlib/Game)的帧循环、HUD 合成、性能与手感规范——帧节奏预算、门控渲染、"重绘后才能 present"合成契约、外设预热、Dock 摆位、手感=参数曲线、无头仿真+像素复核验证。用 Zan 写实时游戏、改游戏模板、调帧率/卡顿/失焦/手感/首次操作卡时使用；HUD 字号/DPI 度量异常也用它；文字棋类等无帧循环游戏走 gui-design。仓库内有同名项目级版本，会自动优先。
+description: Zan 2D 游戏(templates/game/* 与 stdlib/Game)的帧循环、HUD 合成、性能与手感规范——帧节奏预算、门控渲染、"重绘后才能 present"合成契约、外设预热、Dock 摆位、手感=参数曲线、无头仿真+像素复核验证。用 Zan 写实时游戏、改游戏模板、调帧率/卡顿/失焦/手感/首次操作卡时使用；HUD 字号/DPI 度量异常也用它；文字棋类等无帧循环游戏走 gui-design。
 ---
 
 # Zan 游戏开发：帧循环、HUD 与手感
@@ -117,7 +117,7 @@ description: Zan 2D 游戏(templates/game/* 与 stdlib/Game)的帧循环、HUD �
   才炸——是时序实现问题，不是显卡问题。
 - **声明性 API 的平台分支缺失=静默失效**：`Native.PresentFull()` 曾只写
   `#if WINDOWS` 臂，非 Windows 整窗帧声明丢成空操作，Android 画面冻在
-  第一帧（详见 testing-android-native"画面冻结排查定式"）。新加平台
+  第一帧。新加平台
   分支 API 时把所有 `#if` 臂抄全，缺臂不报错。
 
 ## 面板/弹层摆位：Dock 与手动 Place 的边界
@@ -176,7 +176,7 @@ description: Zan 2D 游戏(templates/game/* 与 stdlib/Game)的帧循环、HUD �
 
 **非 DPI 感知进程的测量是假象**:150% 屏上 1280x768 物理窗会报成
 853x512（÷1.5 虚拟化），别拿它反推"钳制/缩放 bug"——截图/测量脚本先
-`SetProcessDpiAwarenessContext(-4)`（见 `_scratch/GuiHostProbe/shotpid.ps1`）。
+`SetProcessDpiAwarenessContext(-4)`。
 同理，ctest 冒烟在并行会话构建时会假失败（共享 build\zanc.exe），单独
 重跑一次再定论。
 
@@ -251,8 +251,9 @@ Post 调用核对编码，别信二手注释。
   验证=装包后 `dumpsys window` 查 frame=[0,0][2400,1080] +
   截图 PIL 左右 8px 边带颜色普查（出现 (0,0,0) 黑带=根因①、
   (24,24,28) margin 带=根因②），menu+对局各截一张。
-- **注意项目目录下有同名 SKILL.md 时以项目级为准**，
-  改前先确认动的是哪份。
+- **注意 GUI 目录下有同名 SKILL.md 时以项目级为准**——
+  zan-lang 仓库内的 game-dev/app-migration/gui-design 会覆盖
+  用户目录版本，改前先确认动的是哪份。
 - **APK 启动即崩 `UnsatisfiedLinkError: cannot locate symbol
   "zan_audio_load_wav"`**：gui_runtime.c 单 TU 末尾 `#include
   "zan_audio.c"`，其 WASAPI 静态量（`zan_audio_dev_freq` 等）收在
@@ -314,7 +315,7 @@ Post 调用核对编码，别信二手注释。
   路径**——截图路径单独直调而主循环漏调，就会出"截图里有、游玩看不到"
   的分叉，且被兜底渲染长期掩盖。每加一个功能，先问：三条通道都走到它吗？
 - 资产定位是相对 exe 目录/工作目录向上 4 级（Assets.Find）：从
-  _scratch 深目录直接跑模板 exe 时 assets 全找不到、看到的"贴图"
+  从深层目录直接跑模板 exe 时 assets 全找不到、看到的"贴图"
   其实是矢量兜底——**验证贴图要 cd 到模板目录再启动**。
 - **UiDriver 像素 dump 是唯一真相，窗口截图会抓到没重绘的空帧**：同一构建，窗口截图整片空白，而同一次运行的 `dump pixels` /
   `dump tree` 都完整。看到空白先别怀疑页面构建，用 `dump pixels`（ZPX1→PNG）
