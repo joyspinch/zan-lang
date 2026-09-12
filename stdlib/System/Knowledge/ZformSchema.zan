@@ -176,7 +176,9 @@ class ZformSchema {
         List<KnowledgeProp> all = new List<KnowledgeProp>();
         List<KnowledgeProp> ordered = new List<KnowledgeProp>();
         string pending = "";
-        List<string> ls = ZformSchema.Lines(props);
+        // 先把花括号不配对的折行并回一行（多行 List 初始化器是常见
+        // 排版），后续逐行扫描才能在单行里看到完整的选项表。
+        List<string> ls = ZformSchema.JoinBraces(ZformSchema.Lines(props));
         for (int i = 0; i < ls.Count; i = i + 1) {
             string lineText = ls[i];
             bool declared = false;
@@ -202,7 +204,11 @@ class ZformSchema {
                         all.Add(q);
                     }
                     pending = q.variable;
-                } else {
+                } else if (ZformSchema.Find(lineText,
+                               "PropSpec.Sizes", 0) < 0) {
+                    /* PropSpec.Sizes()/Sizes3() 是折行声明的选项实参
+                     * （选项经 pending 链在 ReadChainText 里取），不是
+                     * 一条独立声明，静默跳过。 */
                     ZformSchema.Warn(result, path, root, stdlib, line,
                         propsLine + i, lineText,
                         "unable to parse PropSpec declaration");
@@ -333,6 +339,38 @@ class ZformSchema {
                 ? line.Substring(sb + 7, close - sb - 7) : "";
             p.step = ZformSchema.Int(a);
         }
+        // 枚举选项的两种非链式来源：PropSpec.Sizes()/Sizes3() 工厂
+        // （尺寸档统一常量表），以及内联 `new List<string>{ "a", "b" }`
+        // 初始化器——声明行折行时初始化器常单独一行流到这里。
+        // 都是与 Option() 相同的追加语义，先到先合并。
+        if (ZformSchema.Find(line, "PropSpec.Sizes()", 0) >= 0) {
+            ZformSchema.AddOptions(p, "tiny|small|medium|large");
+        }
+        if (ZformSchema.Find(line, "PropSpec.Sizes3()", 0) >= 0) {
+            ZformSchema.AddOptions(p, "small|medium|large");
+        }
+        int lb = ZformSchema.Find(line, "{", 0);
+        if (lb >= 0) {
+            int rb = ZformSchema.Find(line, "}", lb);
+            if (rb > lb) {
+                string inner = line.Substring(lb + 1, rb - lb - 1);
+                int q = ZformSchema.Find(inner, "\"", 0);
+                while (q >= 0) {
+                    int e = ZformSchema.Find(inner, "\"", q + 1);
+                    if (e < 0) { break; }
+                    ZformSchema.AddOptions(p,
+                        inner.Substring(q + 1, e - q - 1));
+                    q = ZformSchema.Find(inner, "\"", e + 1);
+                }
+            }
+        }
+    }
+
+    /// 往 `p.options` 追加一段（"|" 连接，与 Option() 同语义）。
+    static void AddOptions(KnowledgeProp p, string opts) {
+        if (opts == "") { return; }
+        if (p.options != "") { p.options = p.options + "|"; }
+        p.options = p.options + opts;
     }
 
     /// 控件条目的 JSON 视图：name/file/line/styleKind/designer/creatable/
@@ -593,6 +631,41 @@ class ZformSchema {
         int d = 0; for (int i = open; i < s.Length; i = i + 1) { string c = s.Substring(i, 1); if (c == "{") { d = d + 1; } else if (c == "}") { d = d - 1; if (d == 0) { return i; } } } return -1;
     }
     /// 按 '\n' 切行（丢弃 '\r'）。
+    /// 把折行的 List 初始化器并回一行（`new List<string>{ ... }` 常
+    /// 因选项多而折行；不并回则单行扫描看不到完整选项表）。只并含
+    /// "List<" 的起始行——控制流块（if/for 的 `{`）不并，块内逐行
+    /// 声明的属性不会因合并而丢。配对计数在 Mask 后的文本上做，
+    /// 字符串字面量里的花括号不算。
+    static List<string> JoinBraces(List<string> ls) {
+        List<string> r = new List<string>();
+        int i = 0;
+        while (i < ls.Count) {
+            string cur = ls[i];
+            int open = ZformSchema.Find(cur, "List<", 0) >= 0
+                ? ZformSchema.BraceDelta(cur) : 0;
+            i = i + 1;
+            while (open > 0 && i < ls.Count) {
+                cur = cur + " " + ls[i];
+                open = open + ZformSchema.BraceDelta(ls[i]);
+                i = i + 1;
+            }
+            r.Add(cur);
+        }
+        return r;
+    }
+
+    /// 一行文本上 '{' 与 '}' 的差值（字面量与注释抹平后计数）。
+    static int BraceDelta(string s) {
+        string m = ZformSchema.Mask(s);
+        int d = 0;
+        for (int i = 0; i < m.Length; i = i + 1) {
+            string c = m.Substring(i, 1);
+            if (c == "{") { d = d + 1; }
+            else if (c == "}") { d = d - 1; }
+        }
+        return d;
+    }
+
     static List<string> Lines(string s) { List<string> r = new List<string>(); StringBuilder b = new StringBuilder(); for (int i = 0; i < s.Length; i = i + 1) { string c = s.Substring(i, 1); if (c == "\n") { r.Add(b.ToString()); b = new StringBuilder(); } else if (c != "\r") { b.Append(c); } } r.Add(b.ToString()); return r; }
     /// 去除首尾空格/制表符。
     static string Trim(string s) { int a = 0; int b = s.Length; while (a < b && (s.Substring(a,1)==" " || s.Substring(a,1)=="\t")) { a = a + 1; } while (b > a && (s.Substring(b-1,1)==" " || s.Substring(b-1,1)=="\t")) { b = b - 1; } return s.Substring(a,b-a); }

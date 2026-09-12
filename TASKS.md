@@ -1970,7 +1970,7 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
 * **待修复：Windows 文本超采样的测量/绘制宽度不一致（Legend 实机）**：当前 `src/runtime/gui_runtime_text.c::win_run_tile` 用 size 测量逻辑宽，再以 size*3 的 GDI 字体绘制至逻辑宽*3 的 DIB。Hinting 非线性导致截断：探针 `_scratch/legend/detail-pass/font-probe.py` 中技能消耗句 size=19 测宽360、size=57测宽1099，大于 (360+2)*3=1086，真实截图末尾数字被吃掉。修复须统一布局测量与超采样绘制的 advance/extent，覆盖长中英文数字串、普通/加粗、多 DPI 和实际 tile 像素边界，不能在游戏里补空格/假 padding/缩字号掩盖。当前 runtime 文件有其他会话未完成改动，本轮保留并登记，未改写该渲染算法。
 * **待修复（编译器加固，非阻塞）：zanc `--embed <dir>=skins` 一律跳过 stdlib 皮肤基线自动内嵌**：src/compiler/main.c 的 Gui 皮肤自动内嵌块只要发现任一 `--embed` 目标名为 "skins" 就整体跳过，但项目 skins 目录往往只含自家皮肤包（如 templates/game/wuwei/skins/ 起初只有 wuwei/skin.css、无 base.css），跳过后发布产物没有 skins/base.css 基线层——Style.BaseSheet 为空，`flex { display: flex }` 不生效，所有 Flex 容器退化成 dock 排版、子控件全部叠在同一矩形（无为修仙传百艺页签全叠点不中即此因，探针 _scratch/flexprobe.zan：无 skins 内嵌则坏、内嵌含 base.css 的目录则好，已复现闭环）。本轮由模板自带 base.css（与 stdlib/Gui/skins/base.css 逐字节一致）解决，游戏 ALL PASS；建议后续把跳过条件收紧为"staged 目录含 base.css 才算完整替身"，修复草稿已写好但因 main.c 有其他会话未完成的 apk 改动（strtok_r/apk.h 签名）无法编译验证，本轮未保留该改动。
 
-* **A90 GenDb typed-ORM 的 stdlib 内部类型被可达性裁剪丢弃（已实测，待修）**（2026-09-07，server-game 模板验证时发现）：`zanc app.zan --auto-stdlib` 单文件编译任何用到 GenDb 生成代码的程序（`db.Select<T>()` / `Insert` / `Update` …），报 51 个 "undefined type OrmCol/OrmMeta/OrmSelect/Expr" —— 这些类型由 GenDb 生成代码引用，但只存在于 `stdlib/System/Data/Orm/*.zan` 与 `stdlib/System/Linq/*.zan`。**探针**：`_scratch/orm-prune-probe/probe.zan`（15 行最小复现）。**根因假设**：`--auto-stdlib` 的 from_stdlib 输入走可达性裁剪，裁剪发生在 GenDb 生成代码参与分析**之前**（或生成代码引用不记为 stdlib 符号的根），于是 ORM/Linq 的实现文件被整文件剪掉。**workaround（已按 rule 10 登记，未在模板里隐藏）**：显式把 `stdlib/System/Data/Orm/*.zan` + `stdlib/System/Linq/*.zan` 加进命令行（等价 `_build_ide_check.ps1` 的显式 stdlib 模式），51 错误清零；pristine server-mvc 同样复现，属存量问题非本次引入。**补充实证（同日，完整 server-game 模板，legend 联机任务）**：65 文件全模板报 874 个同类 undefined，且报错被归咎到入口文件假行号（合并单元归属失真）；`--no-gen` 同批源类型检查全绿，锁定「裁剪先于生成器运行、生成器合入的输出引用已删类型」的精确顺序；第二 workaround：`ZAN_NO_PRUNE=1`（nsresolve.c 自带的 bisect 逃生口）整体跳过裁剪，server-game 编译通过并 E2E 跑通（注册/登录/建角/背包穿戴/挂机 5 杀奖励全流程）；探针另见 `_scratch/ormprobe/p2.zan`。修向：irgen/binder 里让 GenDb 生成代码的引用参与 stdlib 可达性标记，或 auto-stdlib 对 `System.Data.Orm`/`System.Linq` 命名空间整体豁免裁剪。
+* **A90 GenDb typed-ORM 的 stdlib 内部类型被可达性裁剪丢弃（2026-09-13 复验：已被 demand-driven pull-in 二轮修复，闭账）**（原登记 2026-09-07，server-game 模板验证时发现）：`zanc app.zan --auto-stdlib` 单文件编译任何用到 GenDb 生成代码的程序（`db.Select<T>()` / `Insert` / `Update` …），报 51 个 "undefined type OrmCol/OrmMeta/OrmSelect/Expr" —— 这些类型由 GenDb 生成代码引用，但只存在于 `stdlib/System/Data/Orm/*.zan` 与 `stdlib/System/Linq/*.zan`。根因：`--auto-stdlib` 的可达性裁剪发生在 GenDb 生成代码参与分析之前，生成器合入的输出引用已删类型（`--no-gen` 全绿、`ZAN_NO_PRUNE=1` 逃生口可跑通，曾按 rule 10 登记 workaround）。**修复（早已落地的 main.c "Demand-driven pull-in, second round"，src/compiler/main.c ~3308-3355）**：codegen 之后、prune 之前，用 `zan_gen_take_source_texts` 取出生成器输出作 `pi_seed_source` 种子、`pi_close_all`+`pi_append_included` 把生成代码引用的 stdlib 符号拉进 live 集，再跑 nsresolve 裁剪——裁剪不再删生成代码依赖的类型。**复验证据（2026-09-13，当前树）**：① 最小 `[Table]` 实体探针 `--auto-stdlib` 编译干净；② server-mvc 全 71 源 `--auto-stdlib` 编译通过（175 文件）；③ server-legend 全 84 源（26 个 `[Table]` 实体、170+ 处 Select/Insert/Update/Delete 调用点，ORM 重度使用）`--auto-stdlib` 编译通过（186 文件）——原 51/874 个 "undefined type Orm*" 零复现，模板侧显式加 `Orm/*.zan`/`Linq/*.zan` 的 workaround 与 `ZAN_NO_PRUNE=1` 均可撤。
 
 * **A257 Worker TCP 连接软空引用（未根治，规则 10 在案；非阻塞）**（2026-09-07）：`_scratch/server-game-run` 跑 server-game 模板 e2e（80 断言，全 PASS）时，每次完整运行在 run.log 恰好出现一条 `Net\Worker.zan:2607:16: runtime error: null reference where an object is required (member access)`——2607:16 即 `Connection.GetId(): return this.id;`，接收者为空/已释放。时间窗恒定在启动横幅之后、首个游戏登录（bob）之前，即第一个 TCP 客户端（mallory：connect → hello 推送 → register → 约 2s 闲置 → 客户端 drop）的生命周期内；每次运行恰一条、不随断言数变化。软错误只杀死当前任务：mallory 无会话、无功能断言受影响、服务端继续运行、后续连接（bob/alice/carl/dave + GM 页）全部正常。隔离探针 `_scratch/worker-onclose-probe/`（Worker("tcp") + OnConnect 推送 + onClose 里 GetId()）四形态均零复现：纯 connect+drop 30 轮、hello+register+闲置+drop 20 轮、以及 game-server 侧的 (B) register+drop、(C) login+drop、(D) 游戏连接+10 HTTP POST 混合、(E) 逐句复刻 e2e mallory→bob 前置序列——错误计数都停在基线 1，无新增。怀疑方向：完整服务端里 tick 协程（Gateway.SweepIdle 快照后逐个 GetId）与连接 EOF 清理（HandleTcp finally → onClose(conn)）之间的 Connection 释放竞态（ARC 下悬垂接收者），或 onClose 回调链上 conn 的生命周期缺口；最小探针缺 HTTP worker + World tick + 会话表的并发形状故不复现。影响评估：单发、软失败、不破坏功能与计数；真正会受伤的场景是"被杀任务恰持有会话"（会话滞留 World 直到客户端主动断开）。根治路径：给 Connection 的跨协程持有/回调补 ARC 生命周期契约（onClose 参数、Sweep 快照元素），或在 Worker 内对 GetId 接收者做存活断言把软错变成可定位的硬日志。复现环境：`_scratch/server-game-run`（fresh DB → server-game.exe → python e2e_v3.py → grep -c "runtime error" run.log == 1，连续 4+ 轮）。
 
@@ -2252,3 +2252,24 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
   （gui-window/gui-components/gui-webview）App.zform→App.html 引用翻转
   + models.gui-designer 措辞改 .html——policy_gallery_coverage 此前因
   P7d 删 .zform 模板后 seed 悬空而红（HEAD 继承），本次恢复绿。
+
+* **P8-2c size 枚举收敛 + 扫描器 options 补全**（2026-09-13）：
+  审计发现 ZformSchema 扫描器根本不解析内联
+  `new List<string>{...}` 选项——zform.json 里全部枚举属性的
+  options 一直是缺失的（只有 .Option() 链式的 FormField.dock 有）。
+  两刀一起落：① PropSpec 加 `Sizes()`（tiny/small/medium/large）/
+  `Sizes3()`（small/medium/large）常量工厂，16 处 size 枚举字面量
+  （10×四档 + 6×三档）全部改指工厂，字面量单点化；每次调用新建
+  List（PropSpec 持 options 引用且 Option() 追加，共享实例会串台）。
+  ② 扫描器 ReadChainText 认 `PropSpec.Sizes()/Sizes3()` 工厂与内联
+  花括号列表（与 Option() 同追加语义）；ReadControl 先过 JoinBraces
+  把折行 List 初始化器并回一行（只并含 "List<" 的起始行——控制流
+  块不并，块内逐行声明不因合并丢；配对计数在 Mask 后文本上做，
+  字面量里的花括号不算）；`PropSpec.Sizes()` 续行从 "unable to
+  parse" 告警豁免（选项经 pending 链取，非独立声明）。
+  结果：zform.json 枚举属性 45 个里 44 个带 options（唯一缺口
+  Bargraph.orient 用局部变量表，纯文本扫描无数据流，台账保留）；
+  折行多选项声明（ButtonGroup.type/DatePicker.type）借此补全。
+  验证：gui_props/gui_zform_control golden 字节级一致；timeline_test
+  （size 枚举消费方）全绿；gallery 全量编译过；GenKnowledge 实跑
+  核验 44/45；smoke 全绿（除两个外部在途失败）。

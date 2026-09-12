@@ -104,6 +104,17 @@ description: Zan 窗口设计器用户组件（components/*.zcomp）的全链路
   `SetProp("orient","vertical")` 经 strtoll 静默得 0、无声落回第一项
   （2026-09 Tabs 方向进设计器时探针实证后修复）。.zform 里枚举值存选项名
   （如 "vertical"）可读性最好，旧数字写法仍被容忍。
+- **size 枚举一律用 `PropSpec.Sizes()` / `Sizes3()` 工厂**（2026-09-13
+  起，16 处字面量已收敛）：四档 tiny/small/medium/large 用 Sizes()，
+  三档 small/medium/large 用 Sizes3()。每次调用新建 List——PropSpec 持
+  options 引用且 Option() 会追加，静态共享实例会串台。
+- **ZformSchema 扫描器的选项解析面**（2026-09-13 实证）：认三种来源
+  ——链式 `.Option()`、内联 `new List<string>{...}`（JoinBraces 会先把
+  折行初始化器并回一行，只并含 "List<" 的行）、`PropSpec.Sizes()/
+  Sizes3()` 工厂；不认局部变量表（`Enum("orient",…, os)` 这种
+  options 进不了 zform.json，写枚举时直接给字面量/工厂）。声明走
+  `new List<PropSpec>{…}` 初始化器而不逐个 ps.Add 的属性（Collapse
+  titles/bodies）不进 schema——Props() 里逐个 ps.Add 是扫描器契约。
 - **SetProp 管线是 PropOf 先于 SetExtra，快照 spec 会挡死真写入**：
   Image 曾同时有 Props() 里 `fit.num = FitIndex()`（方法返回值=游离
   快照）和 SetExtra("fit") 真写入——PropOf 命中快照 spec 即 return，
