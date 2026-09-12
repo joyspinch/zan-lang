@@ -1,0 +1,394 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+
+/* 登录小窗口：注册 / 登录 / 修改密码 / 找回密码，四页在同一扇小窗里翻。
+ *
+ * 时序（对齐原版微信）：登录窗是一扇独立 OS 小窗，在主窗口 OnLoad 里
+ * 用 OpenStandalone + PumpStandaloneUntil 泵它自己的事件循环——此时主
+ * 窗口还没 Show，登录成功泵返回后主窗口才打开；没登录就把登录窗关掉
+ * 的话，它会在外层循环里重新打开（进程内没有干净的"放弃启动"出口，
+ * 见 App.zan 的调用注释）。
+ *
+ * 账号数据是进程内虚构的（WxAccounts），预置一个演示账号让模板能直接
+ * 登进去；注册/改密/找回都落同一张表，四页互相打通。
+ */
+
+/// 进程内的虚构账号（wxid 唯一）。
+class WxAccount {
+    string wxid;
+    string nick;
+    string pass;
+}
+
+/// 账号注册表：预置演示账号，注册/改密/找回共用。
+class WxAccounts {
+    static List<WxAccount> all;
+
+    /// 首次访问时补上演示账号（库内无静态构造器，惯用惰性初始化）。
+    static void Seed() {
+        if (all != null) { return; }
+        all = new List<WxAccount>();
+        WxAccount a = new WxAccount();
+        a.wxid = "jiran_2024";
+        a.nick = "季然";
+        a.pass = "123456";
+        all.Add(a);
+    }
+
+    /// 按 wxid 或昵称找（登录框两种都收）。找不到返回 null。
+    static WxAccount Find(string idOrNick) {
+        WxAccounts.Seed();
+        for (int i = 0; i < all.Count; i = i + 1) {
+            WxAccount a = all[i];
+            if (a.wxid == idOrNick || a.nick == idOrNick) { return a; }
+        }
+        return null;
+    }
+
+    static bool Exists(string wxid) {
+        return WxAccounts.Find(wxid) != null;
+    }
+
+    /// 注册成功返回 ""，失败返回错误文案。
+    static string Register(string nick, string wxid, string pass) {
+        WxAccounts.Seed();
+        if (nick == "" || wxid == "" || pass == "") {
+            return "昵称、微信号、密码都要填";
+        }
+        if (WxAccounts.Exists(wxid)) {
+            return "微信号 " + wxid + " 已被占用";
+        }
+        WxAccount a = new WxAccount();
+        a.wxid = wxid;
+        a.nick = nick;
+        a.pass = pass;
+        all.Add(a);
+        return "";
+    }
+
+    /// 修改密码：原密码校验过了才改。成功返回 ""。
+    static string ChangePass(string idOrNick, string oldPass, string newPass) {
+        WxAccount a = WxAccounts.Find(idOrNick);
+        if (a == null) { return "账号不存在"; }
+        if (a.pass != oldPass) { return "原密码不对"; }
+        if (newPass == "") { return "新密码不能为空"; }
+        a.pass = newPass;
+        return "";
+    }
+
+    /// 找回（重置）密码：验证码校验占位（演示固定 246810）。
+    static string ResetPass(string idOrNick, string code, string newPass) {
+        WxAccount a = WxAccounts.Find(idOrNick);
+        if (a == null) { return "账号不存在"; }
+        if (code != "246810") { return "验证码不对"; }
+        if (newPass == "") { return "新密码不能为空"; }
+        return WxAccounts.ChangePass(idOrNick, a.pass, newPass);
+    }
+}
+
+/// 登录小窗：四页翻面。Run(app) 阻塞到登录成功（返回 true）或
+/// 登录窗被关掉（返回 false，宿主负责重新拉起）。
+class WxLoginWindow : ChildWindow {
+    /// 页序：与 ShowPage 的参数一致。
+    static int PAGE_LOGIN = 0;
+    static int PAGE_REG = 1;
+    static int PAGE_CHPWD = 2;
+    static int PAGE_FORGOT = 3;
+
+    List<Control> pages;
+    bool loggedIn;
+    Input acc;
+    Input pwd;
+    Input regNick;
+    Input regId;
+    Input regPwd;
+    Input regPwd2;
+    Input chAcc;
+    Input chOld;
+    Input chNew;
+    Input chNew2;
+    Input fgAcc;
+    Input fgCode;
+    Input fgNew;
+    Label status;
+    Flex head;
+    bool codeSent;
+
+    override string Title() { return "微聊"; }
+    /// 原版微信登录窗是一扇竖版小窗。
+    override int Width() { return 300; }
+    override int Height() { return 430; }
+    override bool ShowMaximize() { return false; }
+    override int IdBase() { return 950000; }
+
+    /// 阻塞跑一遍登录窗。返回 true = 已登录成功（进主窗口）；
+    /// false = 窗口被关掉（宿主重新拉起）。
+    static bool Run() {
+        WxLoginWindow w = new WxLoginWindow();
+        w.BuildUi();
+        w.OpenStandalone();
+        w.host.UseAppCss(WxSkin.Css());
+        w.RequestRedraw();
+        // 独立泵：登录成功（loggedIn 置位）即返回；窗口被关也返回。
+        w.PumpStandaloneUntil(() => { return w.loggedIn; });
+        return w.loggedIn;
+    }
+
+    void BuildUi() {
+        Panel col = Wx.Col("wxlogin");
+        col.dock = 5;
+
+        // 顶部：头像 + 应用名（原版是上次登录的账号头像，这里用
+        // 应用徽标头像 + 名字）。
+        // 窗口根用 dock 布局（模板子窗口根的成熟定式，见
+        // WxChatWindow）：head/titlerow 吸顶，status/foot 落底，
+        // 页区吃剩余——纯流式排布在这里会把底部行挤到页前面。
+        head = Wx.Row("");
+        head.Justify("center");
+        head.AddClass("wxloginhead");
+        head.Add(Wx.Ava("微", 72, "success"));
+        head.dock = 1;
+        col.Add(head);
+        Flex titlerow = Wx.Row("");
+        titlerow.Justify("center");
+        titlerow.AddClass("wxlogintitlerow");
+        titlerow.Add(Wx.Lbl("微 聊", "wxlogintitle"));
+        titlerow.dock = 1;
+        col.Add(titlerow);
+
+        // 四页共享同一块表单区，翻面 = 切可见。页收进一个宿主容器：
+        // 流式根里直接混不可见面板会把 status/foot 的排位挤到页前面。
+        pages = new List<Control>();
+        Panel pagesHost = Wx.Col("wxpageshost");
+        pages.Add(this.BuildLogin());
+        pages.Add(this.BuildRegister());
+        pages.Add(this.BuildChangePass());
+        pages.Add(this.BuildForgot());
+        pagesHost.dock = 5;
+        for (int i = 0; i < pages.Count; i = i + 1) {
+            pages[i].visible = i == 0;
+            pages[i].dock = 5;
+            pagesHost.Add(pages[i]);
+        }
+        col.Add(pagesHost);
+
+        status = Wx.Lbl("", "wxloginstatus");
+        status.dock = 2;
+        col.Add(status);
+
+        Flex foot = Wx.Row("");
+        foot.Justify("center");
+        foot.AddClass("wxloginhint");
+        foot.Add(Wx.Lbl("演示账号 jiran_2024 / 123456", "wxloginhinttext"));
+        foot.dock = 2;
+        col.Add(foot);
+
+        this.SetRoot(col, null);
+    }
+
+    /// 登录页：账号 + 密码 + 登录 + 三个入口。
+    Control BuildLogin() {
+        Panel p = Wx.Col("wxpage");
+        acc = new Input("微信号 / 昵称");
+        acc.Class = "wxlogininput";
+        p.Add(acc);
+        pwd = new Input("密码");
+        pwd.Class = "wxlogininput";
+        pwd.password = true;
+        p.Add(pwd);
+        Button go = new Button("登 录");
+        go.Class = "primary wxloginbtn";
+        go.OnClick(() => { this.DoLogin(); });
+        p.Add(go);
+        Flex links = Wx.Row("wxloginlinks");
+        Label reg = Wx.Lbl("注册账号", "wxloginlink");
+        reg.OnClick(() => { this.ShowPage(1); });
+        links.Add(reg);
+        Flex sp = Wx.Row("");
+        sp.AddClass("grow");
+        links.Add(sp);
+        Label ch = Wx.Lbl("修改密码", "wxloginlink");
+        ch.OnClick(() => { this.ShowPage(2); });
+        links.Add(ch);
+        Flex sp2 = Wx.Row("");
+        sp2.AddClass("grow");
+        links.Add(sp2);
+        Label fg = Wx.Lbl("忘记密码", "wxloginlink");
+        fg.OnClick(() => { this.ShowPage(3); });
+        links.Add(fg);
+        p.Add(links);
+        return p;
+    }
+
+    /// 注册页：昵称 / 微信号 / 密码 / 确认。
+    Control BuildRegister() {
+        Panel p = Wx.Col("wxpage");
+        regNick = new Input("昵称");
+        regNick.Class = "wxlogininput";
+        p.Add(regNick);
+        regId = new Input("微信号（字母开头，唯一）");
+        regId.Class = "wxlogininput";
+        p.Add(regId);
+        regPwd = new Input("密码");
+        regPwd.Class = "wxlogininput";
+        regPwd.password = true;
+        p.Add(regPwd);
+        regPwd2 = new Input("确认密码");
+        regPwd2.Class = "wxlogininput";
+        regPwd2.password = true;
+        p.Add(regPwd2);
+        Button go = new Button("注 册");
+        go.Class = "primary wxloginbtn";
+        go.OnClick(() => { this.DoRegister(); });
+        p.Add(go);
+        p.Add(this.BackRow());
+        return p;
+    }
+
+    /// 修改密码页：账号 / 原密码 / 新密码 / 确认。
+    Control BuildChangePass() {
+        Panel p = Wx.Col("wxpage");
+        chAcc = new Input("微信号 / 昵称");
+        chAcc.Class = "wxlogininput";
+        p.Add(chAcc);
+        chOld = new Input("原密码");
+        chOld.Class = "wxlogininput";
+        chOld.password = true;
+        p.Add(chOld);
+        chNew = new Input("新密码");
+        chNew.Class = "wxlogininput";
+        chNew.password = true;
+        p.Add(chNew);
+        chNew2 = new Input("确认新密码");
+        chNew2.Class = "wxlogininput";
+        chNew2.password = true;
+        p.Add(chNew2);
+        Button go = new Button("确认修改");
+        go.Class = "primary wxloginbtn";
+        go.OnClick(() => { this.DoChangePass(); });
+        p.Add(go);
+        p.Add(this.BackRow());
+        return p;
+    }
+
+    /// 找回密码页：账号 + 验证码（演示固定 246810）+ 新密码。
+    Control BuildForgot() {
+        Panel p = Wx.Col("wxpage");
+        fgAcc = new Input("微信号 / 昵称");
+        fgAcc.Class = "wxlogininput";
+        p.Add(fgAcc);
+        Flex coderow = Wx.Row("wxlogincoderow");
+        fgCode = new Input("验证码");
+        fgCode.Class = "wxlogininput";
+        fgCode.dock = 5;
+        coderow.Add(fgCode);
+        Button send = new Button("获取验证码");
+        send.Class = "wxloginsend";
+        send.OnClick(() => {
+            codeSent = true;
+            this.Note("验证码已发送（演示：246810）", false);
+        });
+        coderow.Add(send);
+        p.Add(coderow);
+        fgNew = new Input("新密码");
+        fgNew.Class = "wxlogininput";
+        fgNew.password = true;
+        p.Add(fgNew);
+        Button go = new Button("重置密码");
+        go.Class = "primary wxloginbtn";
+        go.OnClick(() => { this.DoReset(); });
+        p.Add(go);
+        p.Add(this.BackRow());
+        return p;
+    }
+
+    /// 每页底部那行「返回登录」。
+    Flex BackRow() {
+        Flex r = Wx.Row("");
+        r.Justify("center");
+        r.AddClass("wxloginbackrow");
+        Label back = Wx.Lbl("返回登录", "wxloginlink");
+        back.OnClick(() => { this.ShowPage(0); });
+        r.Add(back);
+        return r;
+    }
+
+    /// 翻页：切可见 + 状态行清空。
+    void ShowPage(int n) {
+        for (int i = 0; i < pages.Count; i = i + 1) {
+            pages[i].visible = i == n;
+        }
+        /* 子页 4 个输入比登录页高，固定窗高放不下：收起大头像（原版
+           微信的子页也没有大头像），标题行保留，页区吃回这一截。 */
+        head.visible = n == PAGE_LOGIN;
+        status.Text = "";
+        this.RequestRedraw();
+    }
+
+    /// 状态行：错误红字 / 成功绿字。
+    void Note(string msg, bool ok) {
+        status.Text = msg;
+        status.SetClassIn("wxloginok", ok ? "wxloginok" : "");
+        this.RequestRedraw();
+    }
+
+    void DoLogin() {
+        WxAccount a = WxAccounts.Find(acc.GetText());
+        if (a == null || a.pass != pwd.GetText()) {
+            this.Note("账号或密码不对", false);
+            return;
+        }
+        this.Note("登录成功，正在打开微聊…", true);
+        loggedIn = true;
+    }
+
+    void DoRegister() {
+        if (regPwd.GetText() != regPwd2.GetText()) {
+            this.Note("两次密码不一样", false);
+            return;
+        }
+        string err = WxAccounts.Register(regNick.GetText(),
+            regId.GetText(), regPwd.GetText());
+        if (err != "") {
+            this.Note(err, false);
+            return;
+        }
+        this.Note("注册成功，请登录", true);
+        acc.SetText(regId.GetText());
+        this.ShowPage(0);
+    }
+
+    void DoChangePass() {
+        if (chNew.GetText() != chNew2.GetText()) {
+            this.Note("两次新密码不一样", false);
+            return;
+        }
+        string err = WxAccounts.ChangePass(chAcc.GetText(),
+            chOld.GetText(), chNew.GetText());
+        if (err != "") {
+            this.Note(err, false);
+            return;
+        }
+        this.Note("密码已改，请用新密码登录", true);
+        acc.SetText(chAcc.GetText());
+        this.ShowPage(0);
+    }
+
+    void DoReset() {
+        if (!codeSent) {
+            this.Note("先获取验证码", false);
+            return;
+        }
+        string err = WxAccounts.ResetPass(fgAcc.GetText(),
+            fgCode.GetText(), fgNew.GetText());
+        if (err != "") {
+            this.Note(err, false);
+            return;
+        }
+        this.Note("密码已重置，请登录", true);
+        acc.SetText(fgAcc.GetText());
+        this.ShowPage(0);
+    }
+}
