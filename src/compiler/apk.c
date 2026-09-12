@@ -630,6 +630,7 @@ static int ensure_java(char *out, size_t outsz) {
         "?project=jdk";
     const char *zdir_name = "jre-win";
 #else
+    const char *url = ""; /* unreachable: the error path below returns first */
     fprintf(stderr,
         "error: apksigner needs Java, and no java was found on PATH.\n"
         "       Install a JRE (e.g. your package manager's default-jre) and retry.\n");
