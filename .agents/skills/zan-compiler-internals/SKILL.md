@@ -978,18 +978,45 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
   「out 目标=字段槽」的地址计算丢对象基址。修复需配 conformance 用例。
 - 两者在模板侧的防御写法已沉淀进 zan-development skill（快照局部、先赋值再传参）。
 
-## A311 根因锁定：设计类名撞 `Gui.App`（2026-09-12 同日下午，未修）
+## A311 已修：设计类名撞 `Gui.App`（2026-09-12 下午锁定，续轮修复）
 
-- 上半段记的「间歇性 Chart 全家 `undefined type 'App'`」**不是时序**：三连
-  100% 复现，开关只有一个——GenForm 生成的 partial 类名。`.zform` 的
-  `"name"` 非 ident（如模板占位符 `{{NAME}}`）时回退**文件基名**
-  （App.zform→`App`），用户类与 stdlib `Gui.App` 同名，nsresolve 的重名
-  去重表把 `Gui.Component.Chart` 各文件里 `App app` 形参的引用改坏
-  （100 错）；`name="Root"` 同输入全绿。Gui 根目录文件不受影响，只有
-  Chart 子目录坏，疑共享项目图里 Chart 的解析顺序被全局重名表波及。
-- 最小复现：`_min.zform name="App"` + `partial class App` + `--auto-stdlib`。
-- 修向：GenForm 回退基名时检查 stdlib 已占用类名（撞则报错或加后缀）；
-  nsresolve 已解析的命名空间内部引用不得被用户全局改名表污染。
+- 上半段记的「间歇性 Chart 全家 `undefined type 'App'`」**不是时序，也不是
+  「Chart 排序靠后」**：三连 100% 复现，开关是 `partial class` 的逐文件
+  上下文与全局命名空间。`.zform` 的 `"name"` 非 ident（如模板占位符
+  `{{NAME}}`）时回退**文件基名**（App.zform→`App`），用户类与 stdlib
+  `Gui.App` 同名，把下面三个缺陷一起点亮；`name="Root"` 同输入全绿。
+- **三处根因（2026-09-12 续轮已全修，`nsresolve.c` + 两个 stdlib 文件）**：
+  ① `nr_walk` 把合并后的 partial 成员按**存活声明的文件**解析：
+     `zan_parser_merge_partials`（`parser.c:4809`）把后续 partial 的成员折进
+     **第一个** partial，且不合并各 partial 的 `using` 表；`nr_walk` 于是把
+     第一个 partial 的 `ns_usings` 传进所有成员。`ChartView` 的第一个 partial
+     是 `ChartBarLayout.zan`，它**没有 `using Gui;`**，其余 ~20 个 partial 里
+     的 `App app` 形参因此全解析不到（=那 100 个 `undefined type 'App'`）。
+     **修**：`nr_walk` 入口优先采信节点自己在 parse 期打的 `ns_usings`/
+     `ns_name`（`zan_nsresolve_stamp` 逐文件、在 merge 之前跑，每个节点都带
+     对了自己的文件上下文）——凡走「合并多个来源的声明」的遍历都要这样。
+  ② 「同命名空间优先」被 `if (ctx_ns.len)` 跳过**全局作用域**：全局命名空间
+     也是命名空间，全局 `App` 必须压过 `using Gui;` 的 `Gui.App`。旧代码在
+     `ctx_ns` 空时直接掉进 `using` 分支绑成 `Gui_App`。**修**：无条件
+     `find_full(join_ns(ctx_ns, R))`（空 `ctx_ns` 时 `join_ns` 返回裸名）。
+     **坑中坑：这类判定有两处，必须同修**——`resolve_ref` 管**类型位置**，
+     `resolve_static_receiver` 管**表达式位置的 static receiver**
+     （`App.OnLoad(form)`）；只修前者时 `.zform` 生成的全局 `partial class App`
+     仍把 `App.OnLoad` 绑到 `Gui_App`，报 `'Gui_App' has no member 'OnLoad'`。
+  ③ **潜伏 stdlib 缺陷**：`Gui/ChildWindow.zan`、`Gui/UserComponents.zan`
+     住在 Gui 模块却**没写 `namespace Gui;`**（同目录另外 43 个文件都写了），
+     此前只靠②的 `using` 兜底才把 `App` 解析成 `Gui.App`；②去掉兜底后立刻
+     暴露 `cannot convert 'App_2' to 'Gui_App'`。**教训**：模块目录下的文件
+     一律显式写 `namespace`，别指望兜底——兜底一旦收紧，这类文件成片爆。
+- 最小复现：`App.zform name="App"` + `partial class App` + `--auto-stdlib`
+  （PRE 101 错 → POST rc=0）。conformance 用例：`conformance_nsctx`
+  （`tests/conformance/nsctx/`，5 文件覆盖①跨文件 partial 上下文 + ②全局
+  声明压过 import）。
+- **仍留（用户命名问题，非解析缺陷）**：项目叫 `App` 时用户类仍撞 stdlib
+  `Gui.App`，nsresolve 改名 `App_2`，stdlib 的 `Style.Of(App,…)` 形参不接受
+  它。是否让 GenForm 回退基名时对 stdlib 已占用类名报错/加后缀属产品取舍
+  （静默加后缀掩盖撞名、报错拦住合法同名局部用法），本轮未采纳。
+
 ## 生成器缓存键曾漏哈希闭包内文件（2026-09-12 P7a 根修，现已全 stdlib 哈希）
 
 **坑**：`zan_gen_ensure` 的缓存键原先只哈希 `System/Compiler/` 下 9 个固定

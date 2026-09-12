@@ -1666,6 +1666,19 @@ add_test(NAME conformance_nsdup
     -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_nsdup${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+# ---- Per-declaration namespace context: a `partial class` split across files
+#      must resolve each member against its own file's imports, and a global
+#      declaration must beat a same-named type pulled in by `using` (see
+#      nsresolve.c, nr_walk / resolve_ref / resolve_static_receiver). ----
+add_test(NAME conformance_nsctx
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/nsctx/main.zan
+    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/conformance/nsctx/alpha.zan;${CMAKE_SOURCE_DIR}/tests/conformance/nsctx/beta.zan;${CMAKE_SOURCE_DIR}/tests/conformance/nsctx/split1.zan;${CMAKE_SOURCE_DIR}/tests/conformance/nsctx/split2.zan"
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/nsctx/expected.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_nsctx${_exe_ext}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
 # ---- Library output: static archive + shared libraries (.dll/.so/.dylib) ----
 # A library has no entry point, so these bypass the compile-run-compare GLOB:
 # the artifact is validated by format magic (and, on Windows, a consumer that

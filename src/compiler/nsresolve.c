@@ -372,9 +372,13 @@ static void resolve_ref(nr_ctx_t *c, zan_ast_node_t *tr,
         return;
     }
 
-    /* simple name: same-namespace first, then usings */
-    if (ctx_ns.len)
-        t = find_full(c, join_ns(c->arena, ctx_ns, R));
+    /* simple name: same-namespace first, then usings. The global namespace is
+     * a namespace too: a declaration at global scope must win over an import,
+     * or a file with no `namespace` line resolves its own class to a
+     * same-named stdlib type pulled in by `using` (the generated global
+     * `partial class App` bound its App.OnLoad to Gui.App). join_ns returns
+     * the bare name for an empty ctx_ns, so this covers both. */
+    t = find_full(c, join_ns(c->arena, ctx_ns, R));
     if (!t && usings) {
         for (int i = 0; i < usings->count && !t; i++) {
             zan_ast_node_t *u = usings->items[i];
@@ -421,7 +425,13 @@ static void resolve_static_receiver(nr_ctx_t *c, zan_ast_node_t *id,
     if (c->refs) zan_refs_add(c->refs, R, c->arena);
 
     nr_type_t *t = NULL;
-    if (ctx_ns.len) t = find_full(c, join_ns(c->arena, ctx_ns, R));
+    /* Same-namespace first, the global namespace included -- the same rule
+     * resolve_ref applies to type positions. A declaration at global scope
+     * must win over an import, or `App.OnLoad(form)` in the .zform-generated
+     * global `partial class App` resolves through `using Gui;` to Gui.App and
+     * the binder reports `'Gui_App' has no member 'OnLoad'`. join_ns returns
+     * the bare name for an empty ctx_ns, so this covers both scopes. */
+    t = find_full(c, join_ns(c->arena, ctx_ns, R));
     if (!t && usings) {
         for (int i = 0; i < usings->count && !t; i++) {
             zan_ast_node_t *u = usings->items[i];
@@ -635,6 +645,18 @@ static void nr_walk_list(nr_ctx_t *c, zan_ast_list_t *l,
 static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
                     zan_istr_t ns, zan_ast_list_t *usings) {
     if (!n) return;
+    /* A declaration keeps the file context it was stamped with at parse time
+     * (zan_nsresolve_stamp runs per file, before merge_partials folds the
+     * partials together). Honor that over the caller's, which for a merged
+     * partial is the surviving declaration's file: the first partial of a
+     * split class need not import what the others' members use. ChartView is
+     * spread over ~20 files and its ChartBarLayout.zan partial has no
+     * `using Gui;`, so inheriting that file's imports left every `App`
+     * parameter in the other partials unresolved. */
+    if (n->ns_usings) {
+        ns = n->ns_name;
+        usings = n->ns_usings;
+    }
     switch (n->kind) {
     case AST_TYPE_REF:
         resolve_ref(c, n, ns, usings);
