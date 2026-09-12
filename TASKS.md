@@ -816,6 +816,42 @@ pt/pc/cm/mm/in/q）+ `calc()/min()/max()/clamp()`；`%` 在各属性原有通道
   css_test 新增 DisplayGrid 断言段（20 行）；conformance_gui_css Passed；
   smoke 仅 HEAD 已知失败。
 
+* **P5 HTML 声明层**（2026-09-12，09d73369 + dc3b55f9）：**运行时**
+  ——`App.LoadHtml(html)` / `LoadHtmlWith(html, handlers, baseDir)`：
+  HTML（整文档或片段）→ 控件树，root 恒为 body（片段包隐式 body）；
+  tag 映射容器→Element（UA 样式表给 web 缺省）、button/textarea 捕获
+  文本、input→Input/Checkbox、img→Image、select 落 Element 占位；
+  属性协议 id→选择器名、class→AddClass、style→合成 `.zgen-N` 规则
+  （复用级联/!important）、data-on-\<evt\>="名"→HtmlHandlers 注册表→
+  BindEvent（click/dblclick/rightclick/mouse\*/enter/leave/wheel/
+  focus/blur/key\* 十三映射，未映射后缀与未注册名字静默不接线）、
+  data-bind→bindPath；`<style>`/`<link rel=stylesheet>` 收集并进
+  appCss。**引擎修**——Element.FlowText 纯文本回退：display:inline
+  元素即使无控件子项（AddText 记录的 elOrder）也构成行内内容按文本
+  run 参与父级行盒，不再走原子盒坐基线把行高撑爆（20px 行涨 24 实证；
+  混排元素不变，golden 零 diff 证实不伤既有）。**编译期生成器
+  GenHtml**——genrun.c 生成器源清单 + `.html/.htm` 认作 design 路径，
+  ZanGen design 分派 `GenHtml.Translate`：`.html` 展开成
+  `public class UiHtml { static string Css; static Control
+  Build(HtmlHandlers); }`（基名帕斯卡化+Html 后缀），调用方
+  `app.UseAppCss(UiHtml.Css); UiHtml.Build(handlers)`；生成器 exe 按
+  zanc+stdlib+源内容哈希缓存 %LOCALAPPDATA%\Zan\gen，stdlib 变更自动
+  重编。**拆层**——`System.Web`（stdlib/System/Web/Html.zan）零 Gui
+  依赖纯解析记录层（WDoc/WNode/WItem：tag/父下标/属性/文档序内容表，
+  空白塌缩=run 内塌单空格+行内级兄弟间保留+块边界丢弃，实体解码，
+  捕获控件语义），`Gui.Html` 只剩记录→控件构建；动机：生成器 exe 活
+  名闭包编译不了全 Gui（UiDriver 的 Json.Serialize 拉不进 System.Json），
+  拆层后两边吃同一份 WDoc，同构有机制保证。**同构关键**——PushNode
+  把子链接写进父 items（文档序内容表），Gui 侧与生成器 EmitContent
+  都按 items 单遍游走（AddText/AddChild 交错=行内内容顺序）；真控件
+  id 走 SetProp("name")、Element 走 nodeName；style 合成两边同一编号
+  顺序。**验证**——oracle html 13 盒（tol 3，唯一非零 #s1 为 GDI 步进
+  台账）；端到端 gen_app.zan+ui.html 编译产出 UiHtml 建树，13 盒与
+  运行时 LoadHtmlWith diff 全等；css_test 新增 DisplayHtml 段（11 行
+  golden：实体/混排/事件槽位/绑定路径）；conformance_gui_css Passed；
+  smoke 仅 HEAD 已知失败 + 其他会话在途 Chart 调试行（XEXT）一例。
+  主文档 `docs/HTML_UI.md`（元素/事件/样式支持面 + 浏览器差异清单）。
+
 ---
 
 # A17-A31 历史修复记录（全部完成，一行摘要）

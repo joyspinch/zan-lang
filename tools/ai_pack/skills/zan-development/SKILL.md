@@ -88,6 +88,31 @@ down: later errors are usually fallout.
 `scripts/test.ps1 smoke | standard | full` — take the smallest tier that covers
 the change.
 
+## 6b. Writing windows in HTML (Gui P5)
+
+Windows can be described in plain HTML + CSS instead of hand-built control
+trees — use it whenever the user says "用网页/HTML 写界面" or the layout is
+web-shaped. Two paths, same parser, pixel-identical geometry:
+
+- **Runtime**: `Control root = app.LoadHtmlWith(html, handlers, baseDir);`
+  (fragments are fine — a missing body gets an implicit one).
+- **Compile time**: pass the `.html` file to zanc next to your `.zan`
+  sources; it expands to `UiHtml.Build(handlers)` + `UiHtml.Css` (call
+  `app.UseAppCss(UiHtml.Css)` first). The shipped exe carries no HTML text
+  and no parser.
+
+Protocols: containers map to `Element` (UA stylesheet supplies web defaults
+— never write `display: block` by hand), `button`/`textarea`/`input`/`img`
+map to real widgets, `select` is a placeholder box. Events:
+`data-on-click="save"` wires the handler registered as
+`handlers.Add("save", ...)`; unknown names silently no-op by design.
+`style` attributes become `.zgen-N` class rules (class-level specificity,
+not browser inline specificity). Idempotent pitfalls: Button routes "Click"
+to its dedicated `Click` field — assert `((Button)b).Click.Count()`, not
+`b.On.Click`; engine ledgers (inline x stepping ±3px, line-height rounding,
+block strut font-size) apply — write explicit `line-height`/`font-size`
+in fixtures. Full spec: `docs/HTML_UI.md` in the SDK.
+
 ## 7. Evidence discipline (the anti-rework rules)
 
 Two real projects (a 420-file gateway port, a 634-file WinForms port) lost days

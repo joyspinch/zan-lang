@@ -1,6 +1,6 @@
 ---
 name: gui-design
-description: Zan GUI (stdlib/Gui) 的审美与排版规范——对齐、间距、尺寸统一、层级与克制,以及商务/街头嘻哈/赛博/国风/极简/玻璃拟态/新拟态/豪华/波普等风格配方,适用于任何使用 Zan 标准库 Gui 的项目(随工具链发布给用户)。凡是用 stdlib/Gui 写界面(窗口、页面、HMI、自定义组件)、做皮肤/换风格,或用户提到 好看/美观/精致/精美/对齐/间距/尺寸统一/风格/审美/商务/酷炫 时使用;界面写完收尾自查也用它。界面出现 控件重叠/压住/排版混乱/位置乱/尺寸乱,或提到 停靠/Flex/Grid/手摆坐标/ gui-overlap / ZAN_GUI_OVERLAP 时先用"排版原语纪律"一节。按钮被钉成巨块/忽大忽小、反复手调按钮尺寸(手写宽高),或提到 gui-lint/ZAN_GUI_LAYOUTLINT/FreeLayout 时也先用"排版原语纪律"一节。用户给截图要求 照着做/严格还原布局/复刻界面/按图排版,或提到 布局账本/交互体验/UX优化/反馈闭环/防呆/键盘操作 时,先用 references/screenshot-restore.md。界面出现 毛刺/锯齿/边缘硬跳/月牙缝/抗锯齿 等渲染瑕疵,或画图表(斜线/曲线/面积)时也用它。复杂窗口布局迭代(标题栏/导航/内容/弹窗/动效从混乱到收口)、自定义或加高标题栏、窗口拖动与命中区、弹窗居中与层序、飘带等氛围动效,写码前先读 references/layout-iteration.md。界面尺寸忽大忽小、DPI 缩放错乱(双重缩放/漏缩放)也用它。注意:zan-lang 仓库内有同名项目级版本,会自动优先于本文件。
+description: Zan GUI (stdlib/Gui) 的审美与排版规范——对齐、间距、尺寸统一、层级与克制,以及商务/街头嘻哈/赛博/国风/极简/玻璃拟态/新拟态/豪华/波普等风格配方,适用于任何使用 Zan 标准库 Gui 的项目(随工具链发布给用户)。凡是用 stdlib/Gui 写界面(窗口、页面、HMI、自定义组件)、做皮肤/换风格,或用户提到 好看/美观/精致/精美/对齐/间距/尺寸统一/风格/审美/商务/酷炫 时使用;界面写完收尾自查也用它。界面出现 控件重叠/压住/排版混乱/位置乱/尺寸乱,或提到 停靠/Flex/Grid/手摆坐标/ gui-overlap / ZAN_GUI_OVERLAP 时先用"排版原语纪律"一节。按钮被钉成巨块/忽大忽小、反复手调按钮尺寸(手写宽高),或提到 gui-lint/ZAN_GUI_LAYOUTLINT/FreeLayout 时也先用"排版原语纪律"一节。用户给截图要求 照着做/严格还原布局/复刻界面/按图排版,或提到 布局账本/交互体验/UX优化/反馈闭环/防呆/键盘操作 时,先用 references/screenshot-restore.md。界面出现 毛刺/锯齿/边缘硬跳/月牙缝/抗锯齿 等渲染瑕疵,或画图表(斜线/曲线/面积)时也用它。复杂窗口布局迭代(标题栏/导航/内容/弹窗/动效从混乱到收口)、自定义或加高标题栏、窗口拖动与命中区、弹窗居中与层序、飘带等氛围动效,写码前先读 references/layout-iteration.md。界面尺寸忽大忽小、DPI 缩放错乱(双重缩放/漏缩放)也用它。用 HTML+CSS 写窗口(HTML 声明层/data-on-*/LoadHtml/UiHtml/GenHtml)时也用它。注意:zan-lang 仓库内有同名项目级版本,会自动优先于本文件。
 ---
 
 # Zan GUI 界面审美规范
@@ -202,6 +202,23 @@ token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
   `fit-content()`/`dense` 不认(按 auto 兜底),条目级
   justify-self/align-self 未接入,跨 span>1 的条目不参与 auto 轨的
   内容定宽。
+
+- **HTML 声明窗口(P5)**:窗口可以直接用 HTML + CSS 描述——运行时
+  `LoadHtmlWith(html, handlers, baseDir)` 建树(片段也行,没写 body 会
+  包隐式 body),或把 `.html` 文件直接喂 zanc,编译期展开成
+  `UiHtml.Build(handlers)`(发布不携带 HTML 文本与解析器;生成器与
+  运行时吃同一解析器,几何逐盒全等)。属性协议:`data-on-click="名"`
+  接事件(`handlers.Add("名", () => ...)` 注册;**Button 的 Click 落
+  专属字段**,断言 `((Button)b).Click.Count()` 而非 `b.On.Click`)、
+  `data-bind` 绑定路径、`style` 属性合成 `.zgen-N` 类规则(类级特异性,
+  不是浏览器 inline style 特异性,`!important` 可覆盖)。容器 tag→
+  Element(UA 样式表给 web 缺省 display/字号/margin,AI 不用写
+  `display: block`)、button/textarea/input/img→真控件、select 落
+  Element 占位。`<style>`/`<link>`/style 三路样式并进 appCss。规范见
+  SDK 的 `docs/HTML_UI.md`。坑:① href/title/disabled 等属性静默忽略,
+  行为在宿主语言;② 引擎级台账(行内 x 步进 ±3px、行高取整逐行 ±1px、
+  块级 strut 字号不继承)对 HTML 层同样适用,fixture 里显式
+  line-height/font-size 规避。
 
 - **`!important` 真的压得住 inline**:带标记的声明单独存、在普通级联
   (含宿主 inline)之后统一再套一遍,不是"剥掉标记按顺序碰运气"。
