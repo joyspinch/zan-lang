@@ -2140,12 +2140,19 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
 
   **仍留（本轮不做）**：把模板项目命名为 `App` 时用户类仍会撞 stdlib `Gui.App`，nsresolve 改名成 `App_2`，stdlib 的 `Style.Of(App,…)`/`ChildWindow.OpenHost(App)` 形参不接受它。**裸名**部分确属用户命名撞库、与 C# 同规则（旧账本修向①「GenForm 回退基名时对 stdlib 已占用类名加后缀或报错」仍是可选的产品级防御，本轮未采纳：静默加后缀会掩盖撞名，报错又会拦住合法同名的局部用法，留给 IDE 建项目时的命名校验）；但**限定名逃逸失效是解析缺陷**，见 A312——原判断「不是解析错误」只对裸名成立。
 
-* **A312 [编译器/pull-in] 限定名 `Gui.App` 不拉入 stdlib 且静默改绑到用户同名类（2026-09-12，C# 对照实验时实测发现，未修）**：C# 对照证明遮蔽规则两边一致（`class Panel` + 裸 `Panel.Column()` → CS0117），**但 C# 用全限定名能逃出遮蔽**（`Lib.Panel.Column()` 编译且运行正确）。Zan 同形状逃不出去，且有两种坏法：
+* **A312 已修（2026-09-12，C# 对照实验时实测发现并当轮根修）[编译器/pull-in] 限定名 `Gui.App` 不拉入 stdlib 且静默改绑到用户同名类**：C# 对照证明遮蔽规则两边一致（`class Panel` + 裸 `Panel.Column()` → CS0117），**但 C# 用全限定名能逃出遮蔽**（`Lib.Panel.Column()` 编译且运行正确）。Zan 同形状逃不出去，且有两种坏法：
   ① **无同名用户类**：`Gui.App a = null;` / `Gui.Widget.Panel p = Gui.Widget.Panel.Column();` 报 `undefined type 'App'`/`'Panel'`——`Gui/App.zan`、`Gui/Widget/Panel.zan` 未拉入。`ZAN_PULLIN_DEBUG=1` 显示 `skip …Gui\App.zan (top=4, idents=8445)`；同程序 `ZAN_NO_PULLIN_FILTER=1` 即 `Compiled 395 files`。
   ② **有同名用户类**：静默改绑到用户的类——`class App { static string Marker() => "USER-CLASS"; }` + `Gui.App.Marker()` 编译通过并打印 `USER-CLASS`（同程序 `ZAN_NO_PULLIN_FILTER=1` 下才正确报 `'Gui_App' has no member 'Marker'`）。改绑路径 = `src/compiler/nsresolve.c:363-372`「限定名未在声明表中 → 归约为最后一段」回退（`1fc45c33bd` 2026-07-24，非本批引入）把 `Gui.App` 降级成 `App`，被用户类接住。
-  **根因**：`main.c:1051-1055` 注释与 `docs/SPEC.md:658` 都声明「限定（点号）提及仍会 seed，保留 `Gui.App` 式逃逸」，但该分支是死代码——`pi_seed_source` 的 `chain` 在设置它的**同一轮**被 switch 后置守卫 `main.c:1287 if (tok.kind != TK_DOT) chain = NULL;` 清空（`main.c:1284` default 再清一次），故 `main.c:1265` 的 `chain && chain->ns_root` 及其后 Task 镜像分支恒不可达（A300 已留注释；A300 当年试过整链复活，137 项连坐红）。
-  **既有用例为何没抓住**：`tests/conformance/pullin_qualified_escape.zan` 只做 `Gui.App a = null; Console.WriteLine(a == null);`——`a == null` 对任何引用类型都成立，改绑与正确解析**输出同为 `true`**，用例恒真（vacuous）。判别性探针必须让用户类带一个 stdlib 类没有的成员。
-  **探针形状**（`_scratch`，已删）：①`class App{}` + `Gui.App a = null;`（有/无用户类两态 × `ZAN_NO_PULLIN_FILTER` 开关两态）；②`class App{ static string Marker() => "USER-CLASS"; }` + `Gui.App.Marker()` 判改绑。**影响面**：任何想用全限定名逃出同名遮蔽的用户代码都失效。**修向**：复活点号链 seed（须同时消解 A300 的 137 项连坐——「链根是命名空间段」的判定要真正可用），并把 `pullin_qualified_escape` 改成判别性用例。与 A311 独立：A311 修的是「用户类同名时 stdlib 内部引用被污染」，本项是「用户侧限定名逃逸失效」。
+  **根因**：`main.c:1051-1055` 注释与 `docs/SPEC.md:658` 都声明「限定（点号）提及仍会 seed，保留 `Gui.App` 式逃逸」，但该分支是死代码——`pi_seed_source` 的 `chain` 在设置它的**同一轮**被两处清空：`default:` 分支在**点号本身**清一次（`TK_DOT` 落到 default），switch 后置守卫 `main.c:1287 if (tok.kind != TK_DOT) chain = NULL;` 又在**起始 IDENT 本身**清一次。链根活不过它自己的那个 token，`main.c:1265` 的 `chain && chain->ns_root` 及其后 Task 镜像分支恒不可达（A300 已留注释）。
+  **修**（`src/compiler/main.c`，外科式两行）：① 新增 `case TK_DOT: break;`——点号是**延续**链的 token，不得清 `chain`；② 后置守卫改为 `if (tok.kind != TK_DOT && tok.kind != TK_IDENT) chain = NULL;`——起始 IDENT 必须活到它后面的点号。**A300 担心的「整链复活 → 137 项连坐红」没有出现**：A300 那次连坐的机制是「链根是命名空间段」判定依赖已死的 chain，复活后 `ns_root` 分支开始把 `using` 目录**段名**当拉入信号；本次实测 `ns_root` 只对 `using`/`namespace` 路径的**每一段**置位（`main.c:1119`/`:1151`），而 stdlib 里没有任何文件声明 `Widget`/`Component`/`Collections`/`Generic`/`System`/`Gui` 这类段名（逐一 grep 确认 0 个），故传递拉入无处落脚。**实证**：97 项 `conformance_gui*` 全绿；`web_typed_binding`（A300 的 TaskJoin 路径）输出与 golden 逐字节一致；裸名遮蔽契约未破（`class App` 仍 `Compiled 3 files`，不带 stdlib）。
+  **既有用例为何没抓住**：`tests/conformance/pullin_qualified_escape.zan` 只做 `Gui.App a = null; Console.WriteLine(a == null);`——`a == null` 对任何引用类型都成立，改绑与正确解析**输出同为 `true`**，用例恒真（vacuous）。
+  **验证**：`pullin_qualified_escape` 改成**判别性**用例（`App.Tag()` 走用户类 + `Gui.App.ISqrt(9)` 走 stdlib 类，输出 `user-app`/`3`），PRE（HEAD 5f7cbee7 worktree 构建）编译失败 `unresolved call 'Gui.App.ISqrt': type 'App' has no method 'ISqrt'`、POST 通过；新增 **`pullin_qualified_pull`**（无同名类、只有限定提及，PRE 报 `undefined type 'App'`、POST 输出 `3`）。smoke 260/261、standard 806/809——三红逐项证为预存且与本修无关：`policy_gallery_coverage` 在 HEAD 自身即红（并行会话把 `gui-empty` 的 `App.zform` 迁成 `App.html` 但 `tools/mcp_server/gallery.json` 仍引用旧名，`git cat-file -e HEAD:...App.zform` 即证）、`conformance_gui_listview_scrollbar_drag` 是 CMakeLists 已注明的桌面争用 240s 停摆（单跑编译 rc=0）、`conformance_http_forwarder_stream` 单跑逐字节过（端口绑定型，属 A298 家族偶发）。determinism/leakcheck 孪生 8 项全过；手工 `--emit-ir` 连跑 4 次 md5 一致。**与 A311 独立**：A311 修的是「用户类同名时 stdlib 内部引用被污染」，本项是「用户侧限定名逃逸失效」。
+
+* **A313 已修（2026-09-12，A312 收尾时暴露并当轮根修）[编译器/子进程] 生成器子编译的进度行漏进父进程 stdout，`--emit-ir` 通道被污染 → determinism 孪生冷缓存必红**：A312 让 `pullin_qualified_pull` 真正拉入 Gui 闭包（282 文件），触发 `zan_gen_codegen`；**冷生成器缓存**下 `zan_gen_ensure` 要现场编译 ZanGen，而 `genrun.c` 的 `zan_spawn_wait` 刻意让子进程继承 stdout（注释「its diagnostics pass through untouched」），子编译的 `Compiled 31 files ? '…ZanGen_<hash>_<pid>.exe'`（`main.c` 编译成功行，`printf` 到 stdout）就落到父进程 stdout 上——与 `--emit-ir` 写 IR 的**同一条流**。`tests/run_determinism.cmake` 逐字节比较两次 `--emit-ir` 捕获，冷缓存那次多一行前缀、暖缓存没有 → 必红。
+  **归因（先证预存，再修）**：① 我改的 `pi_seed_source` 在 `main.c:3058`，而泄漏点在 `main.c:3026` 的 `zan_gen_design`/`zan_gen_ensure`——**调用次序在 seed 之前**，且 `genrun.c` 未改一行；② 决定性反证：`json_entity_mapping.zan`（本轮未碰、本就触发 codegen）在冷缓存下同样报 `two --emit-ir runs differ`，冷缓存命令为「把 `%LOCALAPPDATA%\Zan\gen` 移走 + 跑 `run_determinism.cmake`」。故**泄漏是预存缺陷，A312 只是让它在一个非设计输入用例上现形**。
+  **修**（根因层，不绕过）：`src/compiler/main.c` 加 `--quiet`/`-q`（`quiet` 变量），把编译成功行（`Compiled N files`/`Published`）、驱动捆绑通知（`embedded/bundled driver`/`note: driver … not bundled`）、`packaging APK` 三条**人类进度行**纳入 `if (!quiet)`；`src/compiler/genrun.c` 的嵌套生成器编译 argv 补 `--quiet`——它是编译器**给自己**建的子构建，其 stdout 从来不是给用户的，`--emit-ir` 才是 stdout 的主人。错误/警告仍走 stderr（`zan: compiling code generators (first use…)` 保留 stderr 上，冷缓存首用提示不丢）。
+  **验证**：冷缓存（移走 gen 目录）下 `pullin_qualified_pull` 与 `json_entity_mapping` 的 determinism 孪生均转为 `deterministic`；冷缓存 `--emit-ir` 的 stdout `grep -c Compiled` = 0，stderr 仍见首用提示；非 quiet 直编仍打印 `Compiled 282 files ? '…'`，`--quiet` 直编 stdout 全空。既有用例：`json_entity_mapping` 是 pre-existing 受害者，同修。
+
 
 * **A310 已修（2026-09-12，A309 后续）[P2/模板 server-game] A303 报告建议 ②④⑤ 三条落地**：
   ④ **账号级登录失败锁定**：IP 限流（5/5s/worker）防单源扫描，防不住分布式按账号撞库——game_account 加 `loginFails/loginFailAt` 列（SyncStructureAll 自动 ALTER 补列，旧行读 0=未锁定），AccountDao 补 `LoginLocked/NoteLoginFail/ClearLoginFails`（与密保 answerFails 同构的 1h 窗口语义，阈值 10 次）；Gateway.Login 密码校验前查锁、错一次计一次、成功登录与密码重置清零。锁定拒绝文案不带「账号不存在」信息，不透露账号存在性。e2e +12 断言（10 次错密逐一确认文案 + 第 11 次正确密码被拒）114→125→127→**138/138**。
@@ -2165,3 +2172,21 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
   Extra:Checkbox 实时可见），lsp_baseline_probe gallery 模式无回归（hit-rate
   2/2、def ok）。教训进 zan-lsp-intellisense skill：新存储格式落地必须同步加
   LSP 索引通道 + 双扫描点同步 + 设计稿扩展名空诊断三件套。
+
+* **P7c 完成：游戏 HUD 帧内接入实测（P7 最后一项）**（2026-09-12）：
+  定案"游戏和 Gui 无差异"（用户拍板）——不建独立 GameHud 宿主/第二表
+  面，游戏就是跑在标准保留模式循环上的 Gui 应用：帧体 = 世界直接画上
+  画布（HUD 树之前）→ MeasureTree/Arrange/RenderTree（RenderFrame 公开
+  契约的组合调用）→ PresentFrame，HTML 声明的 HUD 就是同一棵树的普通
+  控件。探针实测（1280×800、240 实体、flex 顶栏+血条+状态条 HTML HUD、
+  DPI 1.5）：渲染段 clean avg 3ms / dirty avg 3ms / max 23ms（预算
+  16.6ms@60fps，余量 5 倍）；空闲 120 拍仅渲染 3 帧；像素级证据：干净
+  帧 HP 条逐帧同色 0xFFE5484D（世界重绘不透入），脏帧内联样式更新像素
+  即变。台账：运行期 HTML 流式子元素 % 宽未生效（内联/样式表 alike 回
+  落 auto=100% 母宽），血条宽度驱动现走颜色/文本，顺延 P8。
+  探针踩坑（已进 game-dev skill）：外部帧宿主必须每圈 SetPollEventMode
+  （一次性语义，否则无事件拍阻塞 WaitEvent——RequestRedraw 在
+  ProcessEvent 之后执行救不了上一拍）；Show 不置挂起重绘、首帧前手动
+  画基线帧；GetPixel 必须在 Present 之前读（present 后画布不保留）且
+  回读同步昂贵、每样本一个像素。探针在 _scratch（已清理），数字以此
+  条目为准。

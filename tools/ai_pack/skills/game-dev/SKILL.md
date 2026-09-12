@@ -80,6 +80,26 @@ description: Zan 上做 2D 游戏(templates/game/* 与 stdlib/Game)的帧循环�
 - HUD 不显示/不置顶/画布错位，先查三条：合成循环是否根本没跑（空闲
   死锁）、是否绕过了置顶链、锚点算的是窗口还是画布坐标。
 
+## HUD 用 HTML/CSS 声明（游戏与 Gui 同引擎）
+
+- 游戏 HUD/菜单/面板不需要独立 UI 宿主或第二表面：HTML 声明的 UI 就是
+  同一棵 Gui 控件树。帧体 = 世界直接画上画布（HUD 树之前）→
+  hud.MeasureTree/Arrange/RenderTree（RenderFrame 的组合调用是公开
+  契约）→ PresentFrame。实测 1280x800、240 实体 + HTML HUD：
+  clean/dirty avg 3ms、max 23ms（60fps 预算 16.6ms，余量 5 倍）；
+  空闲时事件驱动门控天然零渲染。
+- **自写循环的宿主每圈必须重新 SetPollEventMode()**：它是一次性语义
+  （"要求下一次 ProcessEvent 轮询"），漏提的那一圈若恰好无事件且无
+  挂起重绘，就阻塞在 WaitEvent 上——RequestRedraw 在 ProcessEvent
+  之后才执行，救不了上一拍。探针实测死等数分钟就是这个坑。
+- **首帧前手动画一帧基线**：Show() 不置挂起重绘，循环第一拍
+  ProcessEvent 同样会阻塞等事件。
+- **像素断言在 Present 之前做**：present 后画布内容不保留（与合成
+  契约同源）；GetPixel 是回读同步、每样本只读一个像素，条带哈希级
+  采样会把探针拖慢一个量级。
+- 台账：运行期 HTML 流式子元素的 % 宽未生效（内联/样式表 alike 回落
+  auto=100% 母宽），血条宽度驱动现走颜色/文本更新，待引擎修复。
+
 ## GPU 档 3D（DrawMesh3D）平台事实与 NVIDIA 死锁定式
 
 - **平台可用性查 `gui_gl_context.c` 的分支**：GPU 后端只接了

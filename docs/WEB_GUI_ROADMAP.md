@@ -19,7 +19,7 @@
 | P4 | grid：track sizing（auto/fr/minmax/px/%）、span、隐式轨道、gap、网格线放置 | ✅ 2026-09-12 | 1b1c5375 引擎 + db19356e 修复/断言/文档；oracle grid 19 盒全部 0px |
 | P5 | HTML 声明层：Html.zan parser、tag→控件映射、data-on-* 事件、data-bind、style/link 接线、GenHtml 编译期生成器、App.LoadHtml()、oracle 闭环 | ✅ 2026-09-12 | 09d73369 运行时 + dc3b55f9 生成器；oracle html 13 盒（tol 3）；编译期建树与运行时解析 13 盒 diff 全等；主文档 docs/HTML_UI.md |
 | P6 | overflow 滚动：auto/scroll 真语义（clip+偏移+滚动条） | ✅ 2026-09-12 | oracle scroll 16 盒全部 0px（auto/hidden/scroll 三态、程序滚动、钳制、嵌套组合）；UiDriver 实机滚轮验证（注入滚轮→子树精确平移） |
-| P7 | 设计器 + HUD：存取格式 = .html、Inspector CSS 编辑、拖拽翻译 CSS、游戏窗口层嵌入帧循环、IDE 自用窗体重写 | 🚧 2026-09-12 | P7a ✅：DesignerHtml 编解码器全键往返、GenForm .html 设计稿投影（与 .zform 同一生成）、生成器缓存键全 stdlib 哈希（genrun.c）、Designer.SaveHtml/LoadHtmlText 桥、IDE .html 设计稿九处接线；P7b ✅：字段内联 style 通道（SetProp("style")→ApplyInline，FormField.styleText，Inspector STYLE 声明行编辑，DesignerHtml style 属性互通，GenForm/FormBuilder 同落点；布局键让位设计几何记台账）；P7d ✅（模板+IDE 43 份 .zform 全转 .html，模型级等价校验，引用全翻转，.zform 编译通道保留给旧项目）；P7c（HUD 帧内）进行中 |
+| P7 | 设计器 + HUD：存取格式 = .html、Inspector CSS 编辑、拖拽翻译 CSS、游戏窗口层嵌入帧循环、IDE 自用窗体重写 | ✅ 2026-09-12 | P7a ✅：DesignerHtml 编解码器全键往返、GenForm .html 设计稿投影（与 .zform 同一生成）、生成器缓存键全 stdlib 哈希（genrun.c）、Designer.SaveHtml/LoadHtmlText 桥、IDE .html 设计稿九处接线；P7b ✅：字段内联 style 通道（SetProp("style")→ApplyInline，FormField.styleText，Inspector STYLE 声明行编辑，DesignerHtml style 属性互通，GenForm/FormBuilder 同落点；布局键让位设计几何记台账）；P7d ✅（模板+IDE 43 份 .zform 全转 .html，模型级等价校验，引用全翻转，.zform 编译通道保留给旧项目）；P7c ✅：游戏 HUD 帧内接入实测（游戏=Gui 同引擎不建宿主；clean/dirty avg 3ms、max 23ms，预算 16.6ms；空闲 120 拍仅 3 帧；像素级门控证据；台账：流式子元素 % 宽未生效顺延 P8）；LSP 补 .html 设计稿索引通道（2227fab0） |
 
 ## 每期验收纪律
 
@@ -249,6 +249,20 @@ golden/audit/Inert 名单同步 → 提交 `gui-web(Pn): 主题`。
   **语义例外（台账）**：设计几何拥有布局——style 的 width/height/x/y/
   dock/gap/pad 对设计字段只在几何沉默处生效（发射器 logW/Prefer/logPad
   在 style 之后接管，ApplyDeclaredUnits 每帧重算）；视觉键完全生效。
+- **游戏 HUD 帧内接入（P7c）**：定案"游戏和 Gui 无差异"——不建独立
+  GameHud 宿主、不做第二表面/纹理合成；游戏就是跑在标准保留模式循环
+  上的 Gui 应用：帧体 = 世界直接画在画布上（HUD 树之前）→
+  MeasureTree/Arrange/RenderTree 组合调用（RenderFrame 公开契约）→
+  PresentFrame，HTML/CSS 声明的 HUD 就是同一棵树里的普通控件。
+  实测（探针 1280×800、240 实体世界、flex 顶栏+血条+状态条 HTML
+  HUD、DPI 1.5）：渲染段 **clean avg 3ms / dirty avg 3ms / max 23ms**
+  （预算 16.6ms@60fps，均值余量 5 倍）；空闲 120 拍仅 3 帧（事件驱动
+  门控天然生效）；像素级：干净帧 HP 条逐帧同色（世界重绘不透入
+  HUD），脏帧内联样式更新即渲染。
+  **（台账）运行期 HTML 流式子元素的 % 宽未生效**：内联
+  `width:X%` 与样式表 `width:40%` alike 都回落 auto（=100% 母宽），
+  探针血条填充宽度不动——类 HUD 的宽度驱动现走颜色/文本更新，
+  % 宽解析待修，顺延 P8（组件精简期）一并处理。
 - **滚动条覆盖式（P6）**：滚动条画在内容上、不占布局宽——Chrome
   经典滚动条占 17px 布局宽（内容收窄、出现/消失引起 reflow 抖动），
   这里不模拟；oracle 侧用 `--hide-scrollbars` 对齐（headless 无占位
