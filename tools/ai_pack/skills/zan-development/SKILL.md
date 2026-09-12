@@ -173,3 +173,6 @@ State the command you ran and what it printed. Separate "compiled", "ran" and
   for output.
 * If the compiler itself looks wrong, reduce it to a minimal snippet with
   `zan_compile` and report the snippet — do not contort the code around it.
+* 给 `Binding<T>` 属性赋值（`Label.Text = ...` 同族）时，右值**别用裸字段左值**（`someObj.field`）：会合成活绑定逐帧读源对象，源是本次调用里新建的临时就活不过返回，绑定的 target 悬空，下一帧 MeasureText 读坏串崩（gui-wechat 名片页点击路径 30-50% 概率崩实测）。**先快照进局部变量再赋**——局部 → 常量绑定；右值本就被持有（`data[i]`、`cur = c`）则安全。
+* `out` 实参的目标是**实例字段**时（`Fill(out v)`），编译干净但字段没被写穿，后续读它 = 空指针崩。定式：先给字段赋值，再把字段当普通实参传。
+* `.zform` + `--auto-stdlib` 偶发把 stdlib Chart 全家报 `undefined type 'App'`（与输入内容无关，绿红交替，重试至绿即可）。要和并行会话彻底隔离：`git archive HEAD stdlib` 解到快照目录 + 复制 `zanc.exe` 和 `build/zanrt_*.obj` 进去（stdlib 按 exe 相对定位），再把 `LOCALAPPDATA` 指到私有目录隔离生成器缓存。

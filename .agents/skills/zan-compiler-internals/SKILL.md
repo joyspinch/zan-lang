@@ -881,3 +881,16 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
   新写消费 RC 实参的内建时必须过这个帮手，别自己判断要不要释放。
 - conformance 用例 `arc_lookup_owned_arg` 六形态全调用实参化，leakcheck 孪生
   钉零泄漏；语义结果（at=-1 等）同 golden 钉死，防「释放修没修对、答案先错」。
+
+## Binding 活绑定悬空与 out 字段写穿丢失（2026-09-12 gui-wechat 名片会话，均未修）
+
+- **A310**：`label.Text = someObj.field;`（Binding<T> 属性 ← 裸字段左值）合成活绑定
+  透过源对象逐帧读；源是调用后即释放的临时 → 绑定 `object target` 悬空 →
+  `Form_RenderFrame → Control_MeasureTree → Label_OnMeasure → Canvas_MeasureText`
+  崩，点击路径 30-50% 概率复现（llvm-symbolizer 对 out.exe 以
+  `0x140000000+RVA` 全 VMA 符号化定位）。右值被持有（`data[i]`）则安全。
+  修向：irgen 合成「源=字段左值」活绑定时强引用源对象或退化为快照绑定。
+- **A307**：`out` 实参目标是实例字段（`Fill(out v)`）编译干净、字段未写穿，
+  后续读/ARC retain 空指针崩；局部变量目标正常。疑 checker/irgen 对
+  「out 目标=字段槽」的地址计算丢对象基址。修复需配 conformance 用例。
+- 两者在模板侧的防御写法已沉淀进 zan-development skill（快照局部、先赋值再传参）。
