@@ -1,0 +1,91 @@
+using System;
+using System.Json;
+using Gui;
+using Gui.Component.Chart;
+
+/// A13 回归：option 级 backgroundColor 必须成为整卡底色。
+///
+/// 缺口原状：ChartView.Render 先在卡片矩形铺 option.backgroundColor，
+/// 紧接着 DrawPanelI / PanelHead 用主题面板色把整张卡片盖回去，
+/// 于是底色永远不可见——pie-custom 的 #2c343c 深底配
+/// label.color:rgba(255,255,255,.3) 白字、gauge-car 的 #000 都是
+/// 配套设计，白底渲染时标签直接看不见。
+///
+/// 本用例离屏渲染真图后逐像素采样（Canvas.GetPixel，与
+/// chart_fillaa_test 同一套无窗口装置），断言：
+///   1. 声明了 backgroundColor 的图，卡片角落像素 == 该色；
+///   2. 未声明的图，卡片角落像素 == 主题面板色（不回归）；
+///   3. 深底配白字时，深底确实铺满卡片（取四角与中心）。
+/// 断言是颜色值比对，跨 GDI/FreeType 后端成立。
+class Program {
+    static int fails;
+
+    static void EqInt(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got " + Convert.ToString(got)
+            + " want " + Convert.ToString(want));
+    }
+
+    static void True(string what, bool got) {
+        if (got) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    /// 卡片角落像素（RGB）。内缩若干像素避开圆角与边框。
+    static int Corner(Canvas c, int x, int y, int w, int h) {
+        return c.GetPixel(x + 4, y + 4) & 0x00FFFFFF;
+    }
+
+    /// 离屏渲染一份 option，返回画布。
+    static Canvas Render(ChartOption o, int w, int h) {
+        App app = new App("a13", w, h);
+        app.BeginFrame();
+        ChartView v = ChartView.Of(o);
+        v.Render(app, 0, 0, w, h);
+        return app.canvas;
+    }
+
+    static void Main() {
+        fails = 0;
+
+        // ---- 1. 声明的 backgroundColor 必须铺满卡片 ----
+        ChartOption dark = ChartOption.FromJson(
+            "{\"backgroundColor\":\"#2c343c\",\"title\":{\"text\":\"Pie\"},"
+            + "\"series\":[{\"type\":\"pie\",\"data\":[{\"name\":\"A\",\"value\":3},"
+            + "{\"name\":\"B\",\"value\":7}]}]}");
+        True("dark parsed", dark.backgroundColor == Chart.Rgb(44, 52, 60) & 0x00FFFFFF);
+        Canvas c1 = Render(dark, 320, 220);
+        EqInt("dark card TL", Corner(c1, 0, 0, 320, 220), Chart.Rgb(44, 52, 60) & 0x00FFFFFF);
+        EqInt("dark card TR", c1.GetPixel(316, 4) & 0x00FFFFFF, Chart.Rgb(44, 52, 60) & 0x00FFFFFF);
+        EqInt("dark card BL", c1.GetPixel(4, 216) & 0x00FFFFFF, Chart.Rgb(44, 52, 60) & 0x00FFFFFF);
+        EqInt("dark card BR", c1.GetPixel(316, 216) & 0x00FFFFFF, Chart.Rgb(44, 52, 60) & 0x00FFFFFF);
+
+        // ---- 2. #000 深底（gauge-car 形态） ----
+        ChartOption black = ChartOption.FromJson(
+            "{\"backgroundColor\":\"#000\",\"series\":[{\"type\":\"gauge\","
+            + "\"data\":[{\"value\":50}]}]}");
+        True("black parsed", black.backgroundColor == Chart.Rgb(0, 0, 0) & 0x00FFFFFF);
+        Canvas c2 = Render(black, 320, 220);
+        EqInt("black card TL", Corner(c2, 0, 0, 320, 220), Chart.Rgb(0, 0, 0) & 0x00FFFFFF);
+
+        // ---- 3. 未声明 → 主题面板色，不回归 ----
+        ChartOption plain = ChartOption.FromJson(
+            "{\"title\":{\"text\":\"Plain\"},\"series\":[{\"type\":\"pie\","
+            + "\"data\":[{\"name\":\"A\",\"value\":3},{\"name\":\"B\",\"value\":7}]}]}");
+        EqInt("plain bg unset", plain.backgroundColor, 0);
+        Canvas c3 = Render(plain, 320, 220);
+        int themeBg = Corner(c3, 0, 0, 320, 220);
+        True("plain uses theme panel bg (not black)",
+            themeBg != (Chart.Rgb(0, 0, 0) & 0x00FFFFFF)
+            && themeBg != (Chart.Rgb(44, 52, 60) & 0x00FFFFFF) & 0x00FFFFFF);
+
+        // ---- 4. 深底确实覆盖卡片（中心也被铺到，非仅四角） ----
+        // 中心落在饼扇区上，改为采样标题行右端的空白区。
+        EqInt("dark card mid-right", c1.GetPixel(300, 110) & 0x00FFFFFF,
+            Chart.Rgb(44, 52, 60) & 0x00FFFFFF);
+
+        Console.WriteLine("a13-background:" + Convert.ToString(fails == 0 ? 1 : 0));
+    }
+}

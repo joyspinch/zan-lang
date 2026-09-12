@@ -2262,6 +2262,23 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_chart_stackedarea_aa${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # option 级 backgroundColor 整卡底色回归（账本 A13）：官方
+  # option.backgroundColor 是整卡底色，pie-custom 的 #2c343c 深底配
+  # label.color:rgba(255,255,255,.3) 白字、gauge-car 的 #000 都是配套
+  # 设计。此前 ChartView.Render 先铺了它，紧接着 DrawPanelI/PanelHead
+  # 用主题面板色把整卡盖回去，底色永远不可见（白底渲染时白字直接消失）。
+  # 用例离屏渲染真图后采样卡片四角/右中像素（Canvas.GetPixel，与
+  # chart_fillaa 同一套无窗口装置）：声明 #2c343c/#000 的图卡片必须
+  # 是该色，未声明的图必须仍是主题面板色（不回归）。
+  add_test(NAME conformance_gui_chart_background
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/chart_background_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_chart_background.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_chart_background${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   add_test(NAME conformance_gui_layer
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
