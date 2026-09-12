@@ -385,22 +385,54 @@ description: zanc 编译器内部（parser/checker/irgen）的实测定式与坑
   自己的，不拉 stdlib 同名文件。这是 stdlib 模板（App/Window/Button 全是
   常见词）不级联的关键。**这条与 C# 同规则**（`class Panel` + 裸
   `Panel.Column()` → C# CS0117 / Zan `'Panel' has no member 'Column'`）。
-- **限定名逃逸当前失效（A312，未修）——别信代码注释和 SPEC**：`main.c:1051`
-  与 `docs/SPEC.md:658` 都写「限定 `Gui.App` 仍拉」，实测**不拉**，且有两种
-  坏法：① 无同名用户类时 `Gui.App a = null;` 报 `undefined type 'App'`
-  （`Gui/App.zan` 被 `skip`，`ZAN_PULLIN_DEBUG=1` 可证；同程序
+- **限定名逃逸（A312，2026-09-12 已修）——注释/SPEC 说的才是对的，但曾长期是死代码**：
+  `main.c` 与 `docs/SPEC.md:658` 都写「限定 `Gui.App` 仍拉」，A312 之前**不拉**，
+  有两种坏法：① 无同名用户类时 `Gui.App a = null;` 报 `undefined type 'App'`
+  （`Gui/App.zan` 被 `skip`；`ZAN_PULLIN_DEBUG=1` 可证，同程序
   `ZAN_NO_PULLIN_FILTER=1` 才编过）；② 有同名用户类时 `Gui.App` **静默改绑
-  到用户类**——`class App{ static string Marker()=>"USER-CLASS"; }` +
-  `Gui.App.Marker()` 编译并打印 `USER-CLASS`。根因：seed 的 `chain` 在设置它
-  的同一轮被后置守卫 `main.c:1287` 清空（default 再清一次），`chain->ns_root`
-  分支（`main.c:1265`）恒不可达；限定名掉进 `nsresolve.c:363-372` 的
-  「未声明 → 归约成最后一段」回退，被用户类接住。C# 恰恰**能**用
-  `Lib.Panel.Column()` 逃出遮蔽，所以这是 Zan 独有的洞，不是"语言如此"。
-  - 判别性探针：**必须让用户类带一个 stdlib 类没有的成员**（`Marker()`），
-    再去调 `Gui.App.Marker()`。`pullin_qualified_escape` 只写
+  到用户类**（`class App{ static string Marker()=>"USER-CLASS"; }` +
+  `Gui.App.Marker()` 编译并打印 `USER-CLASS`）。C# 恰恰**能**用
+  `Lib.Panel.Column()` 逃出遮蔽，所以当时是 Zan 独有的洞。
+  - **根因（两处清空，缺一不可）**：seed 的 `chain` 在设置它的**同一轮**被
+    清两次——`default:` 分支在**点号本身**清（`TK_DOT` 落到 default），
+    switch 后置守卫又在**起始 IDENT 本身**清（`tok.kind != TK_DOT`）。
+    链根活不过它自己那个 token，`chain->ns_root` 分支恒不可达。
+  - **修**：加 `case TK_DOT: break;`（点号是**延续**链的 token），后置守卫
+    改 `if (tok.kind != TK_DOT && tok.kind != TK_IDENT) chain = NULL;`。
+    **教训**：这类"某分支是死代码"的注释要当成待办，不是设计——A300 当年
+    留下"整链复活会 137 项连坐红"的注释，其实是**另一个** bug（`ns_root`
+    判定），不是 chain 本身的问题；A312 复活后连坐没出现。
+  - **A300 连坐为何没复现**：`ns_root` 只对 `using`/`namespace` 路径的每一
+    段置位，而 stdlib 里**没有**任何文件声明 `Widget`/`Component`/
+    `Collections`/`Generic`/`System`/`Gui` 这类段名（grep 确认 0 个），
+    传递拉入无处落脚。改 `ns_root` 相关逻辑前先重跑这个检查。
+  - 判别性探针：**必须让用户类带一个 stdlib 类没有的成员**，再去调
+    `Gui.App.Marker()`。原 `pullin_qualified_escape` 只写
     `Gui.App a = null; a == null`，改绑与正确解析**输出同为 `true`**，用例
     恒真（vacuous）——这类"输出与错误行为同值"的断言是假绿，写 conformance
-    时先问一句"改绑/漏解析会不会也通过"。
+    时先问一句"改绑/漏解析会不会也通过"。已改成
+    `App.Tag()` + `Gui.App.ISqrt(9)`（输出 `user-app`/`3`），并补
+    `pullin_qualified_pull`（无同名类、只有限定提及）覆盖另一半。
+- **子进程 stdout 是 `--emit-ir` 的私有通道（A313，2026-09-12 已修）**：编译器
+  会**自己调自己**去编译代码生成器（`genrun.c:zan_gen_ensure`），而
+  `zan_spawn_wait` 刻意让子进程继承 stdout（注释说"diagnostics pass through"）。
+  于是子编译的人类进度行 `Compiled 31 files ? '…ZanGen_<hash>_<pid>.exe'`
+  （`main.c` 编译成功行 `printf` 到 stdout）就落进父进程 stdout——和
+  `--emit-ir` 写 IR 的**同一条流**。`tests/run_determinism.cmake` 逐字节比两次
+  `--emit-ir` 捕获，**冷生成器缓存**那次多一行前缀 → 必红；暖缓存（生成器已编译
+  好、不 spawn）不红。**这类"只在冷缓存复现"的红不要当 flake 放过**：把
+  `%LOCALAPPDATA%\Zan\gen` 移走即可稳定复现（本机实测 `json_entity_mapping`
+  这个**未改动**的既有用例冷缓存同样红，是决定性归因手段）。
+  - **修法（根因层）**：加 `--quiet`/`-q`，把编译成功行、驱动捆绑通知、
+    `packaging APK` 三条人类进度行纳入 `if (!quiet)`；`genrun.c` 的嵌套生成器
+    编译 argv 补 `--quiet`——编译器给自己建的子构建，stdout 本来就不该给它。
+    **错误/警告仍走 stderr**，冷缓存首用提示 `zan: compiling code generators
+    (first use…)` 保留在 stderr 上不丢。
+  - **纪律**：`--emit-ir`/`--dump-tokens`/`--dump-ast` 把 stdout 当**机器通道**；
+    任何新加的人类输出都走 stderr，或纳入 `--quiet`。加"会 spawn 子 zanc"的新
+    路径时，子 argv 必须带 `--quiet`。
+  - 定位手法：`grep -nE '(^|[^a-zA-Z_])printf\(' src/compiler/main.c`（排掉
+    `snprintf`/`fprintf`）列出所有 stdout 写点，比读全文件快。
 - 门控：`--emit-symbols` 恒全量（IDE 索引要完整 stdlib），`ZAN_NO_PULLIN_FILTER=1`
   回退旧行为，`ZAN_PULLIN_DEBUG=1` 打印每个文件的拉入原因（含命中名）。
 - 语义等价验证定式：同一程序 `ZAN_NO_PULLIN_FILTER=1` 开关两态编译运行

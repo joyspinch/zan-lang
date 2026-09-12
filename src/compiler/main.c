@@ -1221,16 +1221,10 @@ static void pi_seed_source(const char *source, size_t len) {
                              * TaskJoin rewrite (desugar_task_join): flag
                              * TaskJoin when this bare `Task` is followed by
                              * `.WhenAll`/`.WhenAny`. The chain-based mirror
-                             * further below is dead code -- `chain` is
-                             * cleared by the `default:` case on the dot
-                             * itself and again by the post-switch guard on
-                             * every non-dot token, so it is always NULL at
-                             * `prev == TK_DOT`; TaskJoin.zan was only ever
-                             * pulled when the program also spelled the
-                             * name out. Keep chain semantics untouched
-                             * (reviving them also revives the ns_root
-                             * branch, whose transitive pull breaks the
-                             * pullin_qualified_escape shadow contract). */
+                             * further below covers the same shape (A312 gave
+                             * the chain a lifetime); this lookahead is kept
+                             * as the shape-only check, independent of whether
+                             * `Task` sits under a namespace root. */
                             if (name->len == 4 &&
                                 memcmp(name->str, "Task", 4) == 0 &&
                                 next.kind == TK_DOT) {
@@ -1280,11 +1274,22 @@ static void pi_seed_source(const char *source, size_t len) {
                     }
                 }
                 break;
+            case TK_DOT:
+                /* A dot continues the chain: the segment after it has to see
+                 * the chain root to tell a namespace-qualified type
+                 * (`Gui.App`) from a member access on a variable
+                 * (`b.Label()`). Clearing here killed every chain. */
+                break;
             default:
                 chain = NULL;
                 break;
             }
-            if (tok.kind != TK_DOT) chain = NULL;
+            /* An IDENT may have just started a chain and must survive to the
+             * dot that follows it; every other token ends the chain. Clearing
+             * on the IDENT itself -- as this guard did -- cleared each chain
+             * on the very token that set it, so the `chain->ns_root` branch
+             * below was unreachable and a qualified mention never seeded. */
+            if (tok.kind != TK_DOT && tok.kind != TK_IDENT) chain = NULL;
             prev = tok.kind;
         }
     }
@@ -2460,6 +2465,8 @@ static void print_usage(void) {
     fprintf(stderr, "  --dump-tokens   Dump lexer tokens\n");
     fprintf(stderr, "  --dump-ast      Dump parse tree\n");
     fprintf(stderr, "  --emit-ir       Emit LLVM IR to stdout\n");
+    fprintf(stderr, "  --quiet, -q     Suppress progress lines on stdout (driver bundling,\n");
+    fprintf(stderr, "                   APK packaging, the \"Compiled N files\" summary)\n");
     fprintf(stderr, "  --check-leaks   Report unreleased objects at program exit (default with -g)\n");
     fprintf(stderr, "  --arc-guard     Quarantine freed objects and trap stale retain/release (default with -g)\n");
     fprintf(stderr, "  --no-check-leaks, --no-arc-guard  Turn those off in a debug build\n");
@@ -2670,6 +2677,13 @@ int main(int argc, char **argv) {
     bool fast_alloc = false;
     const char *stdlib_path = NULL;
     bool auto_stdlib = true;
+    /* --quiet: suppress the human progress lines ("Compiled N files -> ...",
+     * driver bundling notices, APK packaging) that otherwise go to stdout.
+     * stdout is a machine channel -- `--emit-ir` writes the IR there -- and
+     * the compiler also invokes itself to build the code generators
+     * (genrun.c's zan_gen_ensure), so a nested build's progress line landed
+     * on the caller's stdout and made two `--emit-ir` runs differ. */
+    bool quiet = false;
     const char *package_api = NULL;
     const char *package_install_dir = NULL;
     const char *package_name = NULL;
@@ -2714,6 +2728,8 @@ int main(int argc, char **argv) {
             emit_symbols_path = argv[++i];
         } else if (strcmp(argv[i], "--no-gen") == 0) {
             zan_gen_enabled = 0;
+        } else if (strcmp(argv[i], "--quiet") == 0 || strcmp(argv[i], "-q") == 0) {
+            quiet = true;
         } else if (strcmp(argv[i], "--gen-meta") == 0 && i + 1 < argc) {
             gen_meta_path = argv[++i];
         } else if (strcmp(argv[i], "--emit-ir") == 0) {
@@ -6768,15 +6784,17 @@ int main(int argc, char **argv) {
                     char src[1300], dst[1300];
                     if (used_driver_embedded[d] &&
                         strcmp(cands[c], embedded_driver_file[d]) == 0) {
-                        printf("  embedded driver '%s' ? %s (inside the "
-                               "executable)\n", drv, cands[c]);
+                        if (!quiet)
+                            printf("  embedded driver '%s' ? %s (inside the "
+                                   "executable)\n", drv, cands[c]);
                         copied++;
                         continue;
                     }
                     snprintf(src, sizeof(src), "%s/%s", driver_dir, cands[c]);
                     snprintf(dst, sizeof(dst), "%s/%s", outdir, cands[c]);
                     if (zan_copy_file(src, dst) == 0) {
-                        printf("  bundled driver '%s' ? %s\n", drv, cands[c]);
+                        if (!quiet)
+                            printf("  bundled driver '%s' ? %s\n", drv, cands[c]);
                         copied++;
                     }
                 }
@@ -6785,9 +6803,10 @@ int main(int argc, char **argv) {
                      * falls back to a system install (and reports
                      * IsAvailable() == false when there is none), so an
                      * unstaged bundle is a note, not a warning. */
-                    printf("  note: driver '%s' not bundled (%s is empty); the "
-                           "program will use a system-installed %s\n",
-                           drv, driver_dir, drv);
+                    if (!quiet)
+                        printf("  note: driver '%s' not bundled (%s is empty); the "
+                               "program will use a system-installed %s\n",
+                               drv, driver_dir, drv);
                 } else if (copied == 0) {
                     fprintf(stderr,
                         "warning: driver '%s' was not bundled (no runtime library "
@@ -6879,7 +6898,8 @@ int main(int argc, char **argv) {
 #endif
               snprintf(shell_dir, sizeof(shell_dir), "%s/apk-shell", exe_dir_a);
             }
-            printf("  packaging APK ? %s\n", apk_path);
+            if (!quiet)
+                printf("  packaging APK ? %s\n", apk_path);
             if (zan_apk_build(apk_path, obj_path, abi, pkg, lbl, shell_dir,
                               extras, nextra,
                               proj_android_perm_count, proj_android_perms) != 0) {
@@ -6892,10 +6912,12 @@ int main(int argc, char **argv) {
             remove(obj_path); /* the .so is inside the APK now */
         }
 
-        if (input_count == 1) {
-            printf("%s '%s' ? '%s'\n", publish_mode ? "Published" : "Compiled", input_file, obj_path);
-        } else {
-            printf("%s %d files ? '%s'\n", publish_mode ? "Published" : "Compiled", input_count, obj_path);
+        if (!quiet) {
+            if (input_count == 1) {
+                printf("%s '%s' ? '%s'\n", publish_mode ? "Published" : "Compiled", input_file, obj_path);
+            } else {
+                printf("%s %d files ? '%s'\n", publish_mode ? "Published" : "Compiled", input_count, obj_path);
+            }
         }
     }
 

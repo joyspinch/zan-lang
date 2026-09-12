@@ -557,9 +557,14 @@ int zan_gen_ensure(const char *stdlib_root, char *exe, size_t exe_size) {
         snprintf(tmp, sizeof(tmp), "%s%cZanGen_%016llx_%d%s", dir,
                  GEN_DIR_SEP_STR[0], (unsigned long long)key, pid,
                  GEN_EXE_SUFFIX);
+        /* --quiet: this is a nested build of our own generator, and the
+         * child inherits our stdout. Its "Compiled N files -> ..." progress
+         * line would otherwise land on the caller's stdout -- the machine
+         * channel `--emit-ir` writes the IR to -- making two emissions of
+         * the same source differ (A313). */
         char *argv[] = {
             zexe, src, "--stdlib-path", (char *)stdlib_root, "--auto-stdlib",
-            "--no-gen", "-DZAN_GEN_MAIN=1", "-o", tmp, NULL
+            "--no-gen", "--quiet", "-DZAN_GEN_MAIN=1", "-o", tmp, NULL
         };
         int r = zan_spawn_wait(argv);
         if (r != 0) {
