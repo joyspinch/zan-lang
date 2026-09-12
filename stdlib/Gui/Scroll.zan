@@ -1,0 +1,150 @@
+using System;
+using Gui;
+
+namespace Gui;
+
+/// CSS 滚动容器的交互状态（WEB_GUI_ROADMAP P6）：滚轮认领、
+/// 覆盖式滚动条绘制与滑块拖动。偏移本体存在 Control.scrollY——
+/// 排布期（Arrange）按内容延伸钳制并把子树平移 -scrollY，本类只
+/// 管"输入如何改 offset"与"滚动条怎么画"，方法都吃现值返回新值。
+///
+/// 与 Widget.ScrollView 的分工：ScrollView 是立即模式帮助类（自带
+/// 塌陷保护——内容高度按帧实测会抖）；保留模式树里内容高度来自
+/// 上一次排布，是确定的，塌陷恢复不适用（差异记 roadmap 台账）。
+/// 滚动条是覆盖式（overlay）：画在内容上、不占布局宽——Chrome
+/// 经典滚动条占 17px 布局宽，这里不模拟（oracle 用 --hide-scrollbars
+/// 对齐，台账）。
+class ScrollState {
+    bool dragging;
+    int dragMouseY0;
+    int dragOffset0;
+    int dragMo0;
+    /// 滚动条宽（OnMeasure 后的消费端自行 Scale；此处存基准值）。
+    int barW;
+
+    ScrollState() {
+        dragging = false;
+        dragMouseY0 = 0;
+        dragOffset0 = 0;
+        dragMo0 = 0;
+        barW = 8;
+    }
+
+    /// 指针悬停时认领滚轮：offset 减去滚轮增量。overflow:hidden 的
+    /// 容器不可用户滚动（Chrome 同款，只有程序性 scrollTop），调用
+    /// 方负责只对 auto/scroll 调用。未认领（指针不在区域内）不动。
+    int Wheel(App app, int x, int y, int w, int h, int offset) {
+        if (!Ui.Over(app, x, y, w, h)) { return offset; }
+        if (!app.CaptureWheel(x, y, w, h)) { return offset; }
+        int d = app.window.EventKeyCode();
+        return offset - d * app.scrollSpeed / 120;
+    }
+
+    /// 该不该画滚动条：scroll 常驻（Chrome 桌面对 overflow:scroll
+    /// 总是显示轨道），auto 溢出才出，hidden 永不（调用方不调）。
+    bool WantsBar(int extent, int client, int mode) {
+        if (mode == 3) { return true; }
+        return extent > client;
+    }
+
+    /// 排布期钳制：offset 落回 [0, extent-client]（mo<0 视为 0）。
+    int Clamp(int offset, int extent, int client) {
+        int mo = extent - client;
+        if (mo < 0) { mo = 0; }
+        if (offset > mo) { return mo; }
+        if (offset < 0) { return 0; }
+        return offset;
+    }
+
+    /// 渲染尾段（子项画完、裁剪弹出后调用）：画覆盖式滚动条并处理
+    /// 轨道点击/滑块拖动，返回（可能被拖动改写的）offset。条带矩形
+    /// 是滚动容器的 padding box；不溢出且 mode=auto 时只收拖动状态。
+    int Bar(App app, int x, int y, int w, int h, int offset,
+            int extent, int mode) {
+        int client = h;
+        int mo = extent - client;
+        if (mo < 0) { mo = 0; }
+        if (!this.WantsBar(extent, client, mode)) {
+            dragging = false;
+            return this.Clamp(offset, extent, client);
+        }
+
+        Canvas c = app.canvas;
+        int bw = app.Scale(barW);
+        if (bw > w) { bw = w; }
+        if (bw < 1) { bw = 1; }
+        int inset = app.Scale(2);
+        int bx = x + w - bw - inset;
+        if (bx < x) { bx = x; }
+        int by = y;
+        int bh = h;
+        if (bh <= 0) { dragging = false; return offset; }
+
+        int minThumb = app.Scale(24);
+        if (minThumb > bh) { minThumb = bh; }
+        int thumbH = bh * bh / extent;
+        if (thumbH < minThumb) { thumbH = minThumb; }
+        if (thumbH > bh) { thumbH = bh; }
+        int travel = bh - thumbH;
+        if (travel < 0) { travel = 0; }
+
+        int off = this.Clamp(offset, extent, client);
+        int thumbY = by;
+        if (mo > 0) { thumbY = by + off * travel / mo; }
+        if (thumbY < by) { thumbY = by; }
+        if (thumbY + thumbH > by + bh) { thumbY = by + bh - thumbH; }
+
+        bool overThumb = Ui.Over(app, bx, thumbY, bw, thumbH);
+        bool overBar = Ui.Over(app, bx, by, bw, bh);
+
+        if (!dragging && Ui.MousePressed(app) && overBar) {
+            // 点轨道：滑块跳到指针处再拖（整条可抓，ScrollView 同款）
+            if (!overThumb && travel > 0) {
+                int want = app.mouseY - by - thumbH / 2;
+                int o = want * mo / travel;
+                if (o < 0) { o = 0; }
+                if (o > mo) { o = mo; }
+                off = o;
+            }
+            dragging = true;
+            dragMouseY0 = app.mouseY;
+            dragOffset0 = off;
+            dragMo0 = mo;
+        }
+
+        if (dragging) {
+            int dyPix = app.mouseY - dragMouseY0;
+            int o = dragOffset0;
+            if (mo != dragMo0) {
+                // 拖拽中内容高度变了：以当前位置重新锚定，防"按住
+                // 不动自己滚"的正反馈（ScrollView 同款）。
+                dragOffset0 = off;
+                dragMouseY0 = app.mouseY;
+                dragMo0 = mo;
+                dyPix = 0;
+            }
+            if (travel > 0) { o = dragOffset0 + dyPix * mo / travel; }
+            if (o < 0) { o = 0; }
+            if (o > mo) { o = mo; }
+            off = o;
+            if (Ui.MouseReleased(app)) { dragging = false; }
+        }
+
+        if (off != offset) {
+            app.NoteScrollDamage(x, y, w, h);
+        }
+
+        StyleBox track = Style.Of(app, "scrollbar", "", Style.SNormal());
+        int thumbState = Style.SNormal();
+        if (dragging || overThumb) { thumbState = Style.SHover(); }
+        StyleBox thumb = Style.Part(app, "scrollbar", "thumb", "", "", "",
+                                    thumbState);
+
+        int half = bw / 2;
+        c.PushClip(x, y, w, h);
+        c.FillRoundRect(bx, by, bw, bh, half, track.bg);
+        c.FillRoundRect(bx, thumbY, bw, thumbH, half, thumb.bg);
+        c.PopClip();
+        return off;
+    }
+}

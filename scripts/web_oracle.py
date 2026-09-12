@@ -34,6 +34,16 @@ HARNESS = """<!doctype html><html><head><meta charset="utf-8">
 </head><body>
 {body}
 <script>
+// P6：解析期脚本先设 scrollTop（body 里没有 script 标签——Zan 解析器
+// 会跳过 script，这里由 scrollTop 键生成），测量脚本在其后拿到
+// 滚动后的视口相对矩形。
+const st0 = {scroll};
+for (const k in st0) {{
+  const el0 = document.getElementById(k);
+  if (el0) {{ el0.scrollTop = st0[k]; }}
+}}
+</script>
+<script>
 const sels = {sels};
 const out = [];
 for (const sel of sels) {{
@@ -58,14 +68,18 @@ def chrome_rects(case):
     chrome = find_chrome()
     if not chrome:
         sys.exit("chrome not found; edit CHROME_CANDIDATES")
+    sc = case.get("scrollTop", [])
+    scroll_map = {sc[i]: sc[i + 1] for i in range(0, len(sc), 2)}
     html = HARNESS.format(css=case["css"], body=case["body"],
-                          sels=json.dumps(case["selectors"]))
+                          sels=json.dumps(case["selectors"]),
+                          scroll=json.dumps(scroll_map))
     fd, path = tempfile.mkstemp(suffix=".html")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(html)
     try:
         proc = subprocess.run(
             [chrome, "--headless=new", "--disable-gpu",
+             "--hide-scrollbars",
              "--virtual-time-budget=500", "--dump-dom", path],
             capture_output=True, text=True, timeout=60)
     finally:

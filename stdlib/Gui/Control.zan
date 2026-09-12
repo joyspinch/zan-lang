@@ -125,6 +125,12 @@ class Control {
     int by;
     int bw;
     int bh;
+    /// CSS 滚动容器（P6）：当前滚动偏移与最近一次排布出的内容延伸
+    /// （padding-box 坐标，px）。偏移在 Arrange 期按延伸钳制并把
+    /// 子树平移 -scrollY；交互状态（滚轮/拖动）惰性建。
+    int scrollY;
+    int scrollExtent;
+    ScrollState scroll;
     weak Control parent;
     List<Control> children;
     /// 供设计器/序列化器使用的事件处理器绑定：把事件名
@@ -662,6 +668,41 @@ class Control {
         if (computedStyle == null) { return 0; }
         return computedStyle.display;
     }
+
+    /// CSS overflow 的 per-axis 计算值（P6）：0 visible / 1 hidden /
+    /// 2 auto / 3 scroll。单轴声明时另一根的 visible 按规范计算成
+    /// auto（CSS Overflow——混合 visible 会让 visible 轴变 auto）。
+    /// 水平轴当前只裁剪不滚动（roadmap 台账）。
+    int StyleOverflowX() {
+        if (computedStyle == null) { return 0; }
+        int x = computedStyle.overflowX;
+        if (computedStyle.overflowY != 0 && x == 0) { x = 2; }
+        return x;
+    }
+    int StyleOverflowY() {
+        if (computedStyle == null) { return 0; }
+        int y = computedStyle.overflowY;
+        if (computedStyle.overflowX != 0 && y == 0) { y = 2; }
+        return y;
+    }
+
+    /// 是否为滚动容器：任一轴声明了非 visible 的 overflow。
+    bool IsScrollContainer() {
+        return this.StyleOverflowX() != 0 || this.StyleOverflowY() != 0;
+    }
+
+    /// 程序性滚动（等价 el.scrollTop = v）：下一帧 Arrange 钳制并把
+    /// 子树平移。overflow:hidden 的容器同样可程序滚动（Chrome 同款，
+    /// 只是没有滚轮/滚动条交互）。
+    void SetScrollTop(int v) {
+        this.scrollY = v;
+        if (this.scroll == null) { this.scroll = new ScrollState(); }
+    }
+    /// 当前滚动偏移（px，钳制后）。
+    int ScrollTop() { return this.scrollY; }
+    /// 最近一次排布出的内容延伸（padding-box 坐标，px；
+    /// 等价 DOM scrollHeight 与 clientHeight 取大）。
+    int ScrollExtent() { return this.scrollExtent; }
 
     /// 在 `avail` 像素的包含块内声明的主/交叉轴尺寸，
     /// 百分比已解析、min/max 已应用；样式未声明尺寸时
@@ -2290,6 +2331,51 @@ class Control {
 
     /// 计算此节点及其子树（通过停靠）的边界。
     /// 虚方法，使容器（如 ScrollColumn）可以偏移/裁剪其子节点。
+    /// 滚动容器排布收口（P6）：流/flex/grid/legacy 四条排布路径都
+    /// 经过这里；非滚动容器零开销。clientH 是内容框高。
+    void ArrangeScrollTail(int clientH) {
+        if (children.Count == 0 || !this.IsScrollContainer()) { return; }
+        this.UpdateScroll(clientH, this.StylePadB());
+    }
+
+    /// Arrange 尾段（P6 滚动容器）：算内容延伸、钳偏移、把子树平移
+    /// -scrollY。延伸 = 可见内容底（子项 border-box 底，absolute 后代
+    /// 也计入——Chrome 里 abs 后代贡献滚动溢出）+ 自身 padding-bottom，
+    /// 换算到 padding-box 坐标；下限 = client 高（内容不足不滚）。
+    /// `clientH` 是内容框高，`padB` 是内容框底 padding（延伸含它，
+    /// CSSOM scrollHeight 同义）。
+    void UpdateScroll(int clientH, int padB) {
+        int bottom = 0;
+        for (int i = 0; i < children.Count; i = i + 1) {
+            Control c = children[i];
+            int b = c.by + c.bh;
+            if (b > bottom) { bottom = b; }
+        }
+        // padding-box 顶 = by + borderT = 内容框顶（by+InsetT）- padT
+        int top = this.by + this.StyleInsetT() - this.StylePadT();
+        this.scrollExtent = bottom > 0 ? bottom + padB - top : clientH;
+        if (this.scrollExtent < clientH) { this.scrollExtent = clientH; }
+        int mo = this.scrollExtent - clientH;
+        if (mo < 0) { mo = 0; }
+        if (this.scrollY > mo) { this.scrollY = mo; }
+        if (this.scrollY < 0) { this.scrollY = 0; }
+        if (this.scrollY != 0) {
+            for (int i = 0; i < children.Count; i = i + 1) {
+                children[i].ShiftTree(0, 0 - this.scrollY);
+            }
+        }
+    }
+
+    /// 子树整体平移（滚动偏移的渲染/命中实现）：后代都是绝对坐标，
+    /// 逐层平移；下一帧 Arrange 从自然位置重排，不会累积。
+    void ShiftTree(int dx, int dy) {
+        this.bx = this.bx + dx;
+        this.by = this.by + dy;
+        for (int i = 0; i < children.Count; i = i + 1) {
+            children[i].ShiftTree(dx, dy);
+        }
+    }
+
     virtual void Arrange(int px, int py, int pw, int ph) {
         if (pw < 0) { pw = 0; }
         if (ph < 0) { ph = 0; }
@@ -2320,18 +2406,21 @@ class Control {
             this.ArrangeFlow(cx, cy, cw, ch, innerGap);
             this.ArrangePositioned(pbx, pby, pbw, pbh);
             this.CheckKidsLayout();
+            this.ArrangeScrollTail(ch);
             return;
         }
         if (dispBox == 1) {
             this.ArrangeFlex(cx, cy, cw, ch, innerGap);
             this.ArrangePositioned(pbx, pby, pbw, pbh);
             this.CheckKidsLayout();
+            this.ArrangeScrollTail(ch);
             return;
         }
         if (dispBox == 4) {
             this.ArrangeGrid(cx, cy, cw, ch);
             this.ArrangePositioned(pbx, pby, pbw, pbh);
             this.CheckKidsLayout();
+            this.ArrangeScrollTail(ch);
             return;
         }
         for (int i = 0; i < children.Count; i = i + 1) {
@@ -2391,6 +2480,7 @@ class Control {
         }
         this.ArrangePositioned(pbx, pby, pbw, pbh);
         this.CheckKidsLayout();
+        this.ArrangeScrollTail(ch);
     }
 
     /// 排布 `position` 子项。absolute/fixed 脱离常规流（停靠/flex
@@ -3306,13 +3396,45 @@ class Control {
         lastBw = bw;
         lastBh = bh;
         everLaidOut = true;
+        // P6 滚动容器：滚轮认领要在子项之前（CaptureWheel 后声明者
+        // 胜——嵌套时最内层最后认领而赢，外层不双重滚动）；hidden 的
+        // 容器不可用户滚动（Chrome 同款），不认领。
+        bool scrollC = this.IsScrollContainer();
+        int oyMode = scrollC ? this.StyleOverflowY() : 0;
+        if (scrollC && oyMode >= 2) {
+            if (this.scroll == null) { this.scroll = new ScrollState(); }
+            int pby = by + computedStyle.BorderTopPx();
+            int pbh = bh - computedStyle.BorderTopPx()
+                - computedStyle.BorderBottomPx();
+            int off = this.scroll.Wheel(app, bx, pby, bw, pbh,
+                                        this.scrollY);
+            if (off != this.scrollY) {
+                this.scrollY = off;
+                app.NoteScrollDamage(bx, by, bw, bh);
+            }
+        }
         if (children.Count > 0) {
             // overflow：引擎缺省裁剪（子节点不画出界）；显式
-            // `overflow: visible` 放行溢出内容。hidden/scroll 与
-            // 缺省同义（scroll 不画滚动条）。
+            // `overflow: visible` 放行溢出内容。hidden/scroll/auto
+            // 与缺省同义地裁剪；滚动容器额外在 padding box 裁剪
+            // （CSS：滚动内容被 border 内侧矩形收口）。
             bool clipKids = computedStyle == null
                 || computedStyle.overflow != 0;
-            if (clipKids) { app.canvas.PushClip(bx, by, bw, bh); }
+            int clipX = bx;
+            int clipY = by;
+            int clipW = bw;
+            int clipH = bh;
+            if (scrollC && computedStyle != null) {
+                clipX = bx + computedStyle.BorderLeftPx();
+                clipY = by + computedStyle.BorderTopPx();
+                clipW = bw - computedStyle.BorderLeftPx()
+                    - computedStyle.BorderRightPx();
+                clipH = bh - computedStyle.BorderTopPx()
+                    - computedStyle.BorderBottomPx();
+            }
+            if (clipKids) {
+                app.canvas.PushClip(clipX, clipY, clipW, clipH);
+            }
             // z-index：有非零值时兄弟按值稳定排序绘制（0 保持
             // 文档序）；HitTest 用同一份顺序的逆序。
             bool anyZ = false;
@@ -3339,6 +3461,21 @@ class Control {
                 }
             }
             if (clipKids) { app.canvas.PopClip(); }
+        }
+        // 滚动条在子项与裁剪之后画（覆盖式，不被自己的裁剪收走）；
+        // 拖动改写 offset 后由下一帧 Arrange 生效。
+        if (scrollC && oyMode >= 2) {
+            if (this.scroll == null) { this.scroll = new ScrollState(); }
+            int pby2 = by + computedStyle.BorderTopPx();
+            int pbh2 = bh - computedStyle.BorderTopPx()
+                - computedStyle.BorderBottomPx();
+            int off = this.scroll.Bar(app, bx, pby2, bw, pbh2,
+                                      this.scrollY, this.scrollExtent,
+                                      oyMode);
+            if (off != this.scrollY) {
+                this.scrollY = off;
+                app.NoteScrollDamage(bx, by, bw, bh);
+            }
         }
     }
 }
