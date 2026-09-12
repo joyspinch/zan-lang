@@ -2192,3 +2192,28 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
   画基线帧；GetPixel 必须在 Present 之前读（present 后画布不保留）且
   回读同步昂贵、每样本一个像素。探针在 _scratch（已清理），数字以此
   条目为准。
+
+
+* **P8 开工（组件精简期），首项：流式子元素 % 尺寸修复**（2026-09-12）：
+  P7c 台账项落地。根因两层：① `StyleDeclaresWidth/Height` 声明门只认
+  绝对值（`computedStyle.width >= 0`）不认 Pm 千分比字段，`width:50%`
+  被判"未声明"——流内块宽回落 auto（=100% 母宽）、高塌 0；②
+  `StyleBox.MetricIn` 在包含块未定（测量路径传 avail=0）时把 % 解析成
+  0 而不是回落。修法（stdlib/Gui/Control.zan + StyleBox.zan）：
+  声明门加认 Pm；新增 `StyleDeclaresWidthAbs/HeightAbs`（只认绝对值）
+  给包含块未定的测量路径——grid 轨道尺寸（GridOuterW/H、colAvail/
+  rowAvail）、float 重测（MeasureFlow/ArrangeFlow 的
+  StyleDeclaresHeight 重测分支）、内在宽（MeasureFlow 主路径、float
+  内在宽累积）、flex 断行（% basis 按声明值/测量偏好回落，不再落 0）
+  ——css-sizing"内在尺寸计算中百分比视作 auto"语义；`MetricIn` 对
+  avail<=0 回落 fb（防御，不再解析成 0）；空块塌穿豁免认
+  `heightPm/minHPm`（CSS 8.3.1 有确定高的块不塌穿）；ArrangeFlow 的
+  `chKids` 在容器声明高时用真实 ch 作包含块（fillH 只描述 prefH 来源
+  不代表高未定）。 arrange 侧（1663/1675/1691 行区）与行盒/inline/float
+  落位（1773/1871）保持完整门（传入真实包含块 cw/ch/frameW/wAvail）。
+  验证：探针五用例全绿（样式表/内联 % 宽 150、% 高 100、px 对照不变）；
+  Chrome oracle 新用例 tests/weboracle/pct.json（pct_driver.zan）六盒
+  0px 偏差；conformance_gui_css 加 DisplayPercent 回归锁（5 行）+
+  gui_flex/gui_tree/gui_calendar/gui_carousel/gui_zform_control(.html)/
+  listview×2/scroll_reanchor/datatable×2/listitem 金标准逐一无回归；
+  flex-basis 断行修正后 gui_flex 仍逐字节一致。

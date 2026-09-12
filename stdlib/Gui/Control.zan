@@ -742,15 +742,28 @@ class Control {
     }
 
     /// 样式表声明了宽度/高度（如 `button.large` 这样的尺寸类）时为 true，
-    /// 区别于测量偏好。停靠在行中的子节点
-    /// 若声明了交叉轴尺寸则保留它（并居中），而不是
-    /// 被拉伸到行高。
+    /// 区别于测量偏好。百分比声明（width:50%）也算——调用方必须传入
+    /// 真实包含块基准（avail），% 才有定义；包含块未定的测量期调用方
+    /// （grid 轨道、float 重测、内在宽）请用 *Abs 变体，让 % 按 auto
+    /// 回落测量偏好（css-sizing：内在尺寸计算中百分比视作 auto）。
     bool StyleDeclaresWidth() {
-        return computedStyle != null && computedStyle.width >= 0;
+        return computedStyle != null
+            && (computedStyle.width >= 0 || computedStyle.widthPm >= 0);
     }
 
     /// 样式表声明了高度时为 true（与 StyleDeclaresWidth 配对使用）。
     bool StyleDeclaresHeight() {
+        return computedStyle != null
+            && (computedStyle.height >= 0 || computedStyle.heightPm >= 0);
+    }
+
+    /// 只认绝对值（px）声明的宽度：包含块未定的测量期判定用。
+    bool StyleDeclaresWidthAbs() {
+        return computedStyle != null && computedStyle.width >= 0;
+    }
+
+    /// 只认绝对值（px）声明的高度，同 StyleDeclaresWidthAbs。
+    bool StyleDeclaresHeightAbs() {
         return computedStyle != null && computedStyle.height >= 0;
     }
 
@@ -1384,7 +1397,10 @@ class Control {
         if (c.FlowEntries().Count > 0) { return false; }
         StyleBox sb = c.computedStyle;
         if (sb != null) {
-            if (sb.height > 0 || sb.minH > 0) { return false; }
+            // 百分比高在包含块定下后是确定值——声明了 % 高的空块
+            // 不塌穿（CSS 8.3.1：有高度的块不参与塌穿）。
+            if (sb.height > 0 || sb.heightPm > 0
+                || sb.minH > 0 || sb.minHPm > 0) { return false; }
             if (sb.BorderTopPx() > 0 || sb.BorderBottomPx() > 0) { return false; }
             if (c.StyleInsetT() > 0 || c.StyleInsetB() > 0) { return false; }
         }
@@ -1477,7 +1493,10 @@ class Control {
                 for (int oi = ownFloats; oi < floats.Count; oi = oi + 1) {
                     if (floats[oi].yTop > fy) { fy = floats[oi].yTop; }
                 }
-                int fw = c.StyleDeclaresWidth() ? c.StyleWidthIn(wrapW) : c.prefW;
+                // 这是容器的内在宽累积（maxW）：float 的 % 宽按 auto
+                // 回落测量偏好（css-sizing），不算进内在贡献。
+                int fw = c.StyleDeclaresWidthAbs()
+                    ? c.StyleWidthIn(wrapW) : c.prefW;
                 int fwm = (fw > 0 ? fw : 0) + c.StyleMarL() + c.StyleMarR();
                 if (fwm > maxW) { maxW = fwm; }
                 this.PlaceFloatKid(floats, c, wrapW > 0 ? wrapW : 0, fy,
@@ -1508,7 +1527,9 @@ class Control {
                 if (h < 0) { h = 0; }
             }
             int w = 0;
-            if (c.StyleDeclaresWidth()) { w = c.StyleWidthIn(0); }
+            // 内在宽（shrink-to-fit）里包含块未定，% 按 auto 回落
+            // 测量偏好（css-sizing），与 grid 轨道同规矩。
+            if (c.StyleDeclaresWidthAbs()) { w = c.StyleWidthIn(0); }
             else { w = c.prefW; }
             w = w + c.MarMain(true);   // 水平 margin 不塌陷，照常计宽
             if (w > maxW) { maxW = w; }
@@ -1528,7 +1549,7 @@ class Control {
                 this.SetHostFloats(c, floats,
                                    c.StyleMarL() + c.StyleInsetL(),
                                    sumH + withMt2 + c.StyleInsetT());
-                if (!c.StyleDeclaresHeight()) {
+                if (!c.StyleDeclaresHeightAbs()) {
                     c.prefH = 0;
                     c.fillH = false;
                     c.MeasureFlow(null);
@@ -1583,7 +1604,12 @@ class Control {
         int y = cy;
         bool sepT = this.FlowSepT();
         bool sepB = this.FlowSepB();
-        int chKids = this.fillH ? 0 : ch;
+        // 容器自己的高是声明值（CSS px/%， Arrange 收到的 ch 即包含
+        // 块）时子项百分比高照常解析；fillH 只描述 prefH 的来源
+        // （测量端按内容补齐过），高声明时它不代表"高未定"。
+        // 真 auto 容器（fillH 且无声明）高未定，子项 % 高按 0，
+        // 与测量端一致（CSS 10.3.3）。
+        int chKids = (this.fillH && !this.StyleDeclaresHeight()) ? 0 : ch;
         int pending = 0 - 1;
         int placed = 0;
         // P3：float 入侵表（内容框坐标）+ 行内段流起点（同测量端）。
@@ -1703,7 +1729,7 @@ class Control {
                 this.SetHostFloats(c, floats,
                                    x - cx + c.StyleInsetL(),
                                    (y - cy) + c.StyleInsetT());
-                if (!c.StyleDeclaresHeight()) {
+                if (!c.StyleDeclaresHeightAbs()) {
                     c.prefH = 0;
                     c.fillH = false;
                     c.MeasureFlow(null);
@@ -1753,7 +1779,7 @@ class Control {
     void PlaceFloatKid(List<FloatIntrusion> floats, Control c, int frameW,
                        int yFlow, int cx, int cy, bool place) {
         int w = c.StyleDeclaresWidth() ? c.StyleWidthIn(frameW) : c.prefW;
-        int h = c.StyleDeclaresHeight() ? c.StyleHeightIn(0) : c.prefH;
+        int h = c.StyleDeclaresHeightAbs() ? c.StyleHeightIn(0) : c.prefH;
         if (w < 0) { w = 0; }
         if (h < 0) { h = 0; }
         int ml = c.StyleMarL();
@@ -1851,7 +1877,7 @@ class Control {
                 continue;
             }
             int w = c.StyleDeclaresWidth() ? c.StyleWidthIn(wAvail) : c.prefW;
-            int h = c.StyleDeclaresHeight() ? c.StyleHeightIn(0) : c.prefH;
+            int h = c.StyleDeclaresHeightAbs() ? c.StyleHeightIn(0) : c.prefH;
             if (w < 0) { w = 0; }
             if (h < 0) { h = 0; }
             items.Add(LineBox.MakeBox(c, w, h, c.StyleMarL(), c.StyleMarR(),
@@ -1976,16 +2002,16 @@ class Control {
         return items;
     }
 
-    /// 条目外围宽（轨道尺寸用）：声明宽用声明值（% 按容器未定给 0，
-    /// 与块流测量同规矩），否则测量偏好；加水平 margin。
+    /// 条目外围宽（轨道尺寸用）：声明宽用声明值（包含块未定，%
+    /// 按 auto 回落测量偏好，与块流测量同规矩）；加水平 margin。
     int GridOuterW(Control c) {
-        int w = c.StyleDeclaresWidth() ? c.StyleWidthIn(0) : c.prefW;
+        int w = c.StyleDeclaresWidthAbs() ? c.StyleWidthIn(0) : c.prefW;
         if (w < 0) { w = 0; }
         return w + c.StyleMarL() + c.StyleMarR();
     }
 
     int GridOuterH(Control c) {
-        int h = c.StyleDeclaresHeight() ? c.StyleHeightIn(0) : c.prefH;
+        int h = c.StyleDeclaresHeightAbs() ? c.StyleHeightIn(0) : c.prefH;
         if (h < 0) { h = 0; }
         return h + c.StyleMarT() + c.StyleMarB();
     }
@@ -2014,7 +2040,7 @@ class Control {
             sz.Add(this.GridOuterW(items[i]));
         }
         int colAvail = 0 - 1;
-        if (this.StyleDeclaresWidth()) {
+        if (this.StyleDeclaresWidthAbs()) {
             colAvail = this.StyleWidthIn(0)
                 - this.StyleInsetL() - this.StyleInsetR();
             if (colAvail < 0) { colAvail = 0; }
@@ -2026,7 +2052,7 @@ class Control {
         sz = new List<int>();
         for (int i = 0; i < items.Count; i = i + 1) {
             Control c = items[i];
-            if (!c.StyleDeclaresHeight() && c.StyleDisplay() == 3) {
+            if (!c.StyleDeclaresHeightAbs() && c.StyleDisplay() == 3) {
                 int inner = CssGrid.SpanSum(colW, colGap, pl.colStart[i],
                                          pl.colSpan[i])
                     - c.StyleMarL() - c.StyleMarR();
@@ -2041,7 +2067,7 @@ class Control {
             sz.Add(this.GridOuterH(items[i]));
         }
         int rowAvail = 0 - 1;
-        if (this.StyleDeclaresHeight()) {
+        if (this.StyleDeclaresHeightAbs()) {
             rowAvail = this.StyleHeightIn(0)
                 - this.StyleInsetT() - this.StyleInsetB();
             if (rowAvail < 0) { rowAvail = 0; }
@@ -2090,7 +2116,7 @@ class Control {
         sz = new List<int>();
         for (int i = 0; i < items.Count; i = i + 1) {
             Control c = items[i];
-            if (!c.StyleDeclaresHeight() && c.StyleDisplay() == 3) {
+            if (!c.StyleDeclaresHeightAbs() && c.StyleDisplay() == 3) {
                 int inner = CssGrid.SpanSum(colW, colGap, pl.colStart[i],
                                          pl.colSpan[i])
                     - c.StyleMarL() - c.StyleMarR();
@@ -2253,12 +2279,19 @@ class Control {
             Control c = flexKids[i];
             // 主轴尺寸和排布时用同一个来源：flex-basis 优先，其次
             // 才是测量偏好，否则断行数会和实际排布不一致。这里的
-            // 包含块尚未确定，因此百分比 basis 只能落到 0。
+            // 包含块尚未确定，因此百分比 basis 按 auto 回落（断行
+            // 计算里 % basis 取测量偏好/width 声明）。
             int m = c.prefH;
             int cr = c.prefW;
             if (row) { m = c.prefW; cr = c.prefH; }
             int bs = c.StyleBasisIn(0);
-            if (bs >= 0) { m = bs; }
+            if (bs >= 0) {
+                if (!row && c.computedStyle != null
+                    && c.computedStyle.width >= 0) { bs = c.computedStyle.width; }
+                else if (row && c.computedStyle != null
+                    && c.computedStyle.height >= 0) { bs = c.computedStyle.height; }
+                m = bs;
+            }
             m = m + c.MarMain(row);
             cr = cr + c.MarCross(row);
             int need = m;
