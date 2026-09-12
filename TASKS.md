@@ -2273,3 +2273,24 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
   验证：gui_props/gui_zform_control golden 字节级一致；timeline_test
   （size 枚举消费方）全绿；gallery 全量编译过；GenKnowledge 实跑
   核验 44/45；smoke 全绿（除两个外部在途失败）。
+
+* **P8-2d GetExtra/SetExtra 收敛第一刀：字面量绑定 spec 的死写面**
+  （2026-09-13）：普查 29 文件 90 个 GetExtra/SetExtra 键臂，分三类：
+  ①「both」键（spec 与 Extra 臂并存）——spec 未绑定时 Extra 臂是唯一
+  写路径，spec **绑了字面量**（`spec.num = 0` 常量绑定）时 PropOf 拦
+  在 SetExtra 之前，写入全死、GetProp 恒读 "0"；②「extra-only」键
+  （无 spec，Extra 臂是唯一表面）——合法形态，属派生键/复合键；
+  ③派生键三件套（快照 spec + SetProp 截写）——skill 已载，不动。
+  第一刀修 ① 的五个死写面（探针逐键往返验证）：Avatar.shape
+  （`num = 0` 挡死 SetExtra，GetProp 恒 "0"、SetProp 恒 circle）
+  改 `shape.str = Shape` 删 Extra 臂；Carousel.dotPlacement 与
+  direction（后者原绑 `Vert() ? 1 : 0` 表达式快照）改 str 绑字段；
+  Collapse.arrowPlacement 同改；DatePicker.type 的 SetExtra 带
+  editor.SetText(FormatText()) 副作用不能走绑直写——删 `num = 0`
+  让 spec 回到未绑定态、SetExtra 恢复可达（spec 只管序列化/schema
+  可见性）。顺带删 ChoiceGroup 两个类里被 str 绑定挡死的 4 个
+  size Extra 死臂。普查分类与其余「both」键（DataGrid 10 键、
+  InputNumber 10 键、InputOtp 6 键等，多为派生/复合键需逐键判）
+  留待后续刀次。验证：五键探针往返全绿；gui_props/gui_zform_control
+  golden 字节级一致；gallery 全量编译过；smoke 全绿（除两个外部
+  在途失败）。

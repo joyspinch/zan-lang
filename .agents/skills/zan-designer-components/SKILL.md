@@ -115,12 +115,20 @@ description: Zan 窗口设计器用户组件（components/*.zcomp）的全链路
   options 进不了 zform.json，写枚举时直接给字面量/工厂）。声明走
   `new List<PropSpec>{…}` 初始化器而不逐个 ps.Add 的属性（Collapse
   titles/bodies）不进 schema——Props() 里逐个 ps.Add 是扫描器契约。
-- **SetProp 管线是 PropOf 先于 SetExtra，快照 spec 会挡死真写入**：
-  Image 曾同时有 Props() 里 `fit.num = FitIndex()`（方法返回值=游离
-  快照）和 SetExtra("fit") 真写入——PropOf 命中快照 spec 即 return，
-  SetExtra 永不可达，SetProp("fit",…) 静默无效。正解是 spec 直接绑
-  字段（`fit.str = Fit`，枚举选项文本即取值），别给同一键开两条写入
-  通路（2026-09 内置组件 props 直通时探针实证）。
+- **SetProp 管线是 PropOf 先于 SetExtra，快照/字面量 spec 会挡死真
+  写入**：Image 曾同时有 Props() 里 `fit.num = FitIndex()`（方法返回
+  值=游离快照）和 SetExtra("fit") 真写入——PropOf 命中快照 spec 即
+  return，SetExtra 永不可达，SetProp("fit",…) 静默无效。正解是 spec
+  直接绑字段（`fit.str = Fit`，枚举选项文本即取值），别给同一键开
+  两条写入通路（2026-09 内置组件 props 直通时探针实证）。
+  **`spec.num = 0` 这类字面量赋值同罪**（2026-09-13 普查实锤五处）：
+  字面量进 Binding 槽=常量绑定，IsBound() 为 true，PropOf 照样拦截
+  ——Avatar.shape（GetProp 恒 "0"、SetProp 永不改 Shape）、
+  Carousel.dotPlacement/direction（`Vert() ? 1 : 0` 表达式快照同效）、
+  Collapse.arrowPlacement、DatePicker.type 全部静默失效。有真实字段
+  的改 str 绑定删 Extra 臂；写路径带副作用（DatePicker.type 的
+  editor.SetText 重建）的删字面量让 spec 回到未绑定态，Extra 臂保持
+  唯一写路径——未绑定 spec 仍把键带进序列化与 zform schema。
 - **内置组件的直通属性行**（Image/Countdown/NumberAnimation/InputOtp
   已接）：键值存 f.extra["props"]（与引用节点实例值同一张直通表，
   "props" 不在 IsModeledKey），GenForm 泛化发射 SetProp、画布预览经
