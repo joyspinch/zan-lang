@@ -126,9 +126,14 @@ description: Zan 窗口设计器用户组件（components/*.zcomp）的全链路
   FieldJson 写 "horizontal"/"vertical"，GenForm 仅在 vertical 时发射
   `SetProp("orient","vertical")`；画布 KidInsetX/Y 与 RenderTabStrip 按
   `f.tabOrient` 换轴（纵排轨道宽 160 = 运行时 trackW 未缩放宽）。
-- **裸 `ps.Add(PropSpec.Text("class", "Classes"))` 是合法的**：读写
-  走 Control.GetProp/SetProp 对 "class" 的基类特判，spec 只负责属性
-  面板可见性。同理 "name"。
+- **class 不在控件 Props() 里声明（2026-09-13 起，39 处声明已删）**：
+  class 是基类契约——GetProp/SetProp 对 "class" 短路应答、序列化有
+  专用尾部字段（WriteNode/ReadNode）、.html 设计文档走 f.Class modeled
+  key；per-prop 声明在所有消费点都是死行（gallery WatchTree 跳过
+  !IsBound()，Designer Inspector 吃 FieldSpecs 不吃控件 Props()）。
+  zform.json 的 class 条目由 ZformSchema.ReadControl 单点注入（78/78
+  控件全覆盖），别再往控件里加回来。同理 "name"（基类特判，也从无
+  声明）。
 - Zan **没有 C# 式跨行相邻字符串隐式串接**，`"a"\n"b"` 直接报
   expected ')', got STRING_LIT——换行拼接必须显式 `+`。
 - 颜色属性（PropSpec.Color，kind 4）的文档串形式就是 ARGB 整数十进制

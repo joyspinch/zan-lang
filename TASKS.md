@@ -1965,7 +1965,7 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
 
 * **待修复：ScrollColumn 首次进入视口吞掉第一下滚轮（Legend 实测）**：鼠标从非滚动区域进入无交互标签的日志视口，移动未触发渲染；首个 kind=13 帧 `App.CaptureWheel` 的 `wheelOwnerOrder=0`，而当前 `wheelClaimSeq` 增为 1，因此没有消费者。第二下正常。源头在 `stdlib/Gui/App.zan` 的前帧滚轮认领与无 hover 命中移动重绘之间的关系；不能简单放行所有 owner=0 的声明者，否则嵌套滚动可能双消费。复现：`_scratch/legend/presentation-scroll.ui` 去掉第二次 scroll，日志内容必须高于视口；探针 `_scratch/legend/main-scroll-trace.zan`、记录 `_scratch/legend/scroll-trace.txt`。布局/血条/透明素材已修，未在游戏代码中增加假滚动或额外吞发事件绕过此问题。后续须修标准库并覆盖首次滚动、兄弟容器切换、嵌套滚动、连续滚动的真实输入测试。
 
-* **A89 初始化器挂在非 new 表达式上时，成员赋值跳过 no-setter 检查且静默丢弃（已实测，待修）**（2026-09-05）：`Maker.New() { Tag = s }`——初始化器挂在**方法调用结果**上（stdlib Gui 惯用法 `Panel.Column().Gap(6) { Children = list }` 全是这个形态）——里面对只有 getter 的属性赋值，编译零诊断、运行期赋值被静默丢弃；同款赋值在 `new T { ... }` 形态下则正确报 "property 'X' has no setter and cannot be assigned"（语句位、初始化器位、基类声明属性三种检查均在，探针逐一对过）。后果实例：tools/skinbuilder 首版 `Panel.Column()...{ Children = a }`（a 为 List<Control>）编译通过、面板 children 为空（MeasureTree prefH==0），一度按"空面板渲染 bug"排查半天。探针 `_scratch/prop_assign_probe.zan`（四形态对照：语句位报错✓、new 初始化器报错✓、继承属性报错✓、方法结果初始化器静默 no-op ✗ tag=<>）。修法方向：checker 让挂在 invocation 表达式上的初始化器走同一成员检查（setter 存在性 + 赋值兼容）；注意与**合法**的集合初始化器糖（`Children = { a, b }` → 逐个 Add，Control.zan 门面注释明载）区分，勿误伤。SkinBuilder 已改用显式 `With()` 收养绕开（组合原语、非绕过缺陷——缺陷在检查器漏报，正确写法本就该是 With/集合形态）。
+* **A89 已修（2026-09-13，P1/编译器 checker）**——原登记（2026-09-05）：初始化器挂在非 new 表达式上时，成员赋值跳过 no-setter 检查且静默丢弃：`Maker.New() { Tag = s }`——初始化器挂在**方法调用结果**上（stdlib Gui 惯用法 `Panel.Column().Gap(6) { Children = list }` 全是这个形态）——里面对只有 getter 的属性赋值，编译零诊断、运行期赋值被静默丢弃；同款赋值在 `new T { ... }` 形态下则正确报 "property 'X' has no setter and cannot be assigned"（语句位、初始化器位、基类声明属性三种检查均在，探针逐一对过）。后果实例：tools/skinbuilder 首版 `Panel.Column()...{ Children = a }`（a 为 List<Control>）编译通过、面板 children 为空（MeasureTree prefH==0），一度按"空面板渲染 bug"排查半天。**根因（比登记的更宽）**：checker `AST_NEW_EXPR` 的 call_init 分支先用 `type = check_expr(call_init)` 拿到工厂返回类型，紧接着无条件 `type = zan_binder_resolve_type(c->binder, expr->new_expr.type)`——工厂形态的 type 节点是 **NULL**，resolve 返回 type_error 把整个类型冲掉，共享初始化器循环的 `type && type->sym` 门从此恒假：no-setter、赋值兼容、成员存在性**三检查全部静默跳过**（`Maker.New() { tag = "not-an-int" }`（int 字段塞 string）、`{ nosuch = 5 }` 都编译通过；运行期 irgen 的 `if (!msym) continue` 把写整体丢掉——p3 实测 setter 根本不跑）。**修**：`factory_init = call_init != NULL` 时**不再 resolve type 节点**（类型就是调用结果）且跳过 ctor 可用性检查（该形态没有 new 构造可查）；循环内工厂形态的未知成员补报 `'<T>' has no member '<n>'`（原来静默，new 形态只是靠 ctor 参数错位报出一条误导信息）；**合法的集合初始化器糖不受影响**（`Children = { a, b }` 是 AST_COLL_INIT，getter-only 门面对 Add 语义照旧豁免）。**验证**：探针五形态（语句位/new 初始化器/工厂 no-setter/工厂未知成员/工厂类型错配）全部正确报错，p8（工厂+集合初始化器+settable 字段混写）运行期逐项落地 `tag=<z> items=3 names=2`；gui_gallery（222 处 `Children = {`）、ZanIDE（build_ide OK）、legend/ra2 模板全量编译零新增错误；coll_postfix_init golden 逐字。新档 `tests/diag/factory_initializer_member.zan`（unknown member）+ `factory_initializer_readonly.zan`（no setter），smoke 档 4/4 过。SkinBuilder 的 `With()` 写法照旧（组合原语，非绕过缺陷）。
 
 * **待修复：Windows 文本超采样的测量/绘制宽度不一致（Legend 实机）**：当前 `src/runtime/gui_runtime_text.c::win_run_tile` 用 size 测量逻辑宽，再以 size*3 的 GDI 字体绘制至逻辑宽*3 的 DIB。Hinting 非线性导致截断：探针 `_scratch/legend/detail-pass/font-probe.py` 中技能消耗句 size=19 测宽360、size=57测宽1099，大于 (360+2)*3=1086，真实截图末尾数字被吃掉。修复须统一布局测量与超采样绘制的 advance/extent，覆盖长中英文数字串、普通/加粗、多 DPI 和实际 tile 像素边界，不能在游戏里补空格/假 padding/缩字号掩盖。当前 runtime 文件有其他会话未完成改动，本轮保留并登记，未改写该渲染算法。
 * **待修复（编译器加固，非阻塞）：zanc `--embed <dir>=skins` 一律跳过 stdlib 皮肤基线自动内嵌**：src/compiler/main.c 的 Gui 皮肤自动内嵌块只要发现任一 `--embed` 目标名为 "skins" 就整体跳过，但项目 skins 目录往往只含自家皮肤包（如 templates/game/wuwei/skins/ 起初只有 wuwei/skin.css、无 base.css），跳过后发布产物没有 skins/base.css 基线层——Style.BaseSheet 为空，`flex { display: flex }` 不生效，所有 Flex 容器退化成 dock 排版、子控件全部叠在同一矩形（无为修仙传百艺页签全叠点不中即此因，探针 _scratch/flexprobe.zan：无 skins 内嵌则坏、内嵌含 base.css 的目录则好，已复现闭环）。本轮由模板自带 base.css（与 stdlib/Gui/skins/base.css 逐字节一致）解决，游戏 ALL PASS；建议后续把跳过条件收紧为"staged 目录含 base.css 才算完整替身"，修复草稿已写好但因 main.c 有其他会话未完成的 apk 改动（strtok_r/apk.h 签名）无法编译验证，本轮未保留该改动。
@@ -2217,3 +2217,38 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
   gui_flex/gui_tree/gui_calendar/gui_carousel/gui_zform_control(.html)/
   listview×2/scroll_reanchor/datatable×2/listitem 金标准逐一无回归；
   flex-basis 断行修正后 gui_flex 仍逐字节一致。
+
+* **P8-2a 前置：编译器补局部 `Binding<T>` 声明初始化降级**（2026-09-13，
+  3f2aab13）：局部声明 `Binding<T> b = w.prop;` 从不走 emit_binding_value
+  ——裸 T 直接存进 Binding 槽位，首次 Get/Set 解引用裸指针段错误。赋值
+  路径（irgen_expr.c）一直有 lowering，声明路径（irgen_stmt.c
+  AST_VAR_DECL 类型声明分支）从来没有（A/B 对比证明）。修法：声明初始
+  化器非 Binding 类型时先试 emit_binding_value（结果 owned +1，与 new
+  同权：跳过用户转换查找、store 走 owned_rhs_marker move）。回归锁
+  tests/conformance/binding_local_init（活绑定/常量/null 解绑 8 行）。
+  P8-2 属性面生成化需要这个语义（PropSpec 槽位直接吃控件字段的活绑定）。
+
+* **P8-2b 属性面生成化第一刀：class 收敛为基类契约**（2026-09-13）：
+  删掉 39 处控件 Props() 里的 `class` 重复声明（30 处一行式
+  `ps.Add(PropSpec.Text("class", "Classes"))` + 9 处三行式
+  `cls.str = Class`），class 的真相单点化在 Control 基类：
+  GetProp/SetProp 本来就短路应答 `class`，序列化有专用尾部字段
+  （WriteNode L83 / ReadNode L189），.html 设计文档走 f.Class modeled key
+  ——per-prop 声明在所有消费点都是死行（gallery WatchTree 跳过
+  !IsBound()，Designer Inspector 用 FieldSpecs 不吃控件 Props()，
+  FormBuilder 只查 label 键）。ZformSchema 扫描器在 ReadControl 里单点
+  注入 class（key=class/label=Classes/type=string，已有声明则不重复），
+  zform.json 从 39/78 控件带 class 变成 78/78 全覆盖，schema 更完整。
+  序列化文档双向兼容：新文档不再写 per-prop class（尾部字段仍在），
+  旧文档的 class 键经 SetProp 短路照常读回。测试同步 6 处
+  Props().Count 断言（watermark 15/countdown 3/image 3/
+  numberanimation 9/pagination 15/timeline 1）+ gui_timeline.out
+  golden 同步（props count/props 1 两行）。验证：gui_props/
+  gui_zform_control(.zform+.html 两通道) golden 字节级一致；六测试全绿；
+  gallery 全量编译过；GenKnowledge 实跑 zform.json 注入核验；
+  run_zform_schema.cmake 校验面（Props() 覆写清单 + GenForm 键文档）
+  不受影响；smoke 全绿（除 barminheight 为 Chart 在途外部失败）。
+  顺手修：tools/mcp_server/gallery.json seed 三条目
+  （gui-window/gui-components/gui-webview）App.zform→App.html 引用翻转
+  + models.gui-designer 措辞改 .html——policy_gallery_coverage 此前因
+  P7d 删 .zform 模板后 seed 悬空而红（HEAD 继承），本次恢复绿。
