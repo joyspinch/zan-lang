@@ -887,6 +887,45 @@ pt/pc/cm/mm/in/q）+ `calc()/min()/max()/clamp()`；`%` 在各属性原有通道
 
 ---
 
+* **P7a 设计器存取格式 = .html**（2026-09-12）：**编解码器**
+  stdlib/System/Web/DesignerHtml.zan（纯字符串层、零 Gui 依赖——设计器与
+  生成器两端共用）：设计 JSON 文档 ↔ HTML 全键保真往返。编码：文档级键落
+  `<body>` 的 data-<kebab> 属性（name 另发 id；body 带 data-zan-design 裸
+  标记），字段树变元素树（kind 决定 tag 但 data-kind 是权威标记；kids 递
+  归），事件键 on<Event> → data-on-<kebab>（与 P5 运行时事件协议同形），
+  复合值（props 直通/columns/winShape）走 data-x-<kebab>='<紧凑 JSON>'（字
+  符串值不作数字嗅探，props 的 "min":"0" 不漂成数字），属性值统一实体转
+  义。解码逐键还原：kebab→camel、true/false→布尔、数字字面→数字、on- 前缀
+  →Pascal 事件键。**踩坑台账**：(a) Zan 的 `char.ToString()` 得到码点数字
+  （'M'.ToString()=="77"），首字母大写必须用 char+string 拼接惯用法；(b)
+  data-zan-design 是裸属性（值空串），`Attr(...) != ""` 判存在性永远 false
+  ——IsDesignDoc 必须按名扫描；(c) head 区语义——meta/style/title 在隐式
+  body 创建之前早退（inHead 标志），否则真 body 被当"迟到"丢弃、整文档只
+  剩默认节点；head 的 data-* 属性经 pendingHeadAttr 暂存合入 body。**编译
+  期通道**：zan_is_design_path 本就收 .html/.htm；GenForm.Translate 增
+  .html 设计稿分支（IsDesignDoc → ToJsonDoc → 同一 TranslateOne 投影），
+  GenHtml.Translate 对设计稿跳过（防重复生成）；两通道同编译共存实测无干
+  扰。**生成器缓存键修复（genrun.c，结构坑）**——键原只哈希
+  System/Compiler 下 9 个固定文件，而生成器 exe 是 `ZanGen.zan
+  --auto-stdlib` 编的、行为由整个 stdlib 闭包定义：GenForm 新引用的
+  System/Web/DesignerHtml.zan（及此前的 Html.zan）改了不重建，出现"stdlib
+  已修、生成器仍旧"的幽灵行为。改为哈希 stdlib 全部 .zan（相对路径+内容，
+  排序定序，FindFirstFile/recurse 双实现）。**设计器桥**：Designer.Html.zan
+  partial——SaveHtml()=FromJsonDoc(SaveJson())、LoadHtmlText()=
+  LoadJson(ToJsonDoc(s))；内部模型/Undo 快照/JSON 抽屉仍是文档 JSON。**IDE
+  接线**：TabRecord.designDoc（打开时算一次缓存，.html+data-zan-design 才
+  进设计器——任意网页不该弹设计器）；designerMode/编辑器同步守卫/载入
+  LoadHtmlText/落盘 SaveHtml（LSP SyncDoc 仍推 JSON 保持 LSP 契约）/F7 源
+  码视图/Ctrl+S 只读守卫/SaveActive 守卫九处接线；CodeBehindPath/
+  FormBaseName 剥 .html；GatherZanFiles 收 .html .htm 进构建命令。**测试**
+  ：tests/conformance/designer_html.zan（纯层往返+IsDesignDoc 三态+桥稳
+  定+空文档降级为空表单的诚实契约——HTML 没有 JSON 的"损坏"形态，loadError
+  通道对 .html 输入基本不可达）+ tests/gui/zform_control.html（真 .zform
+  经编解码器转换入库）+ conformance_gui_zform_html（同一 zform_control 测
+  试与金标，设计稿改吃 .html——生成的 ZfPanel partial class 逐字节等价）；
+  conformance glob 自动注册 designer_html（Gui 检测→gui 驱动），手工注册
+  撞名一次。standard 层全绿后提交。
+
 # A17-A31 历史修复记录（全部完成，一行摘要）
 
 * **A17** ✅ 测试套件"要跑半小时"的真正原因（2026-07-28）：A17-1 三批测试没设
@@ -1831,7 +1870,7 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
 * **A71 后续路线（按需加载未完部分）**：① globaldce 钉死源逐个核（A75 已退役三表，重钉面需复量）；② auto-embed 泛化——`stdlib/<Ns>/data/` 自动烤进镜像的通用机制（skins 手工、icons 已接）。
 * **体积优化线剩余候选（边际收益小）**：desc 记录瘦身、tynames 列表共享；PIC 与 ARC 冗余对两条杠杆已实测证伪。A74 归因的「空窗 ~72% .text 可去死」随 A75 去钉后需复量。
 * **A44(genmeta) 备注（已部分过时）**：`build\ZanIDE.exe` 12.23MB vs dist 快照 8.2MB 的增长未追查（2026-08-24 记录；其后 A71-A75 已大幅优化发布体积，数字需重测）。
-* **determinism/leakcheck_checkbox_group、determinism_bytebuffer_bounds**：`--emit-ir` 宿主崩溃，zanc_clean（HEAD 基线构建）同样复现，属在途既有问题，待查。
+* **determinism/leakcheck_checkbox_group、determinism_bytebuffer_bounds**：`--emit-ir` 宿主崩溃（2026-08-31 登记）。**2026-09-12 复核：已不复现，本项关闭**——两用例 `--emit-ir` 三连 rc=0（`bytebuffer_bounds` 605KB / `checkbox_group` 114MB IR 均正常产出），`ctest -R "determinism_(bytebuffer_bounds|checkbox_group)"` 2/2 通过，`leakcheck_bytebuffer_bounds` 亦过。归因证据：这两个用例既无 `.zform` 输入、也不含 `Serialize`/`Route`/`Table` 等生成器触发构造，`zan_gen_codegen_triggered` 在 `zan_gen_codegen` 入口即早退，故并行会话对 `genrun.c` 的在途改动不可能影响它们；`build/zanc.exe` 的 `src/compiler`/`src/runtime` 源码与 HEAD 一致。疑为 2026-09-08 两次「内部崩溃改为干净诊断」提交（`253b5c76` 索引器下标失配、`6980f93b` 委托 combine 与内建标量构造）顺带修掉，未逐提交二分定位（崩溃已不可复现，二分无靶）。若日后复发，先查 `--emit-ir` 下的 LLVM 校验失败路径。
 
 * **A80 zanc 退出段错误（已修复：LLVMContext 双重拆除，保留 ctx 绕开）**（2026-08-31）：大型 GUI 模块（--auto-stdlib 拉入 Gui 全量，约 330 文件）编译完成后进程退出时段错误，`Compiled 330 files` 之后；gui-empty 模板对（zform+zan）符号化构建下 100% 复现，console 小程序不复现；fd19375a 记录的「链接完成后退出时段错误」即此。cdb（`_NO_DEBUG_HEAP=1`，debug heap 完全掩盖此崩溃）实锤根因：CRT 退出表里有一条 LLVM 静态注册的析构 thunk（`zanc!LLVMStopMultithreaded+0x10: lea rcx,[静态 LLVMContext]; jmp llvm::LLVMContext::~LLVMContext`，静态本体无符号、近邻符号 `_OptionsStorage+0x28`，pImpl 为垃圾/悬垂堆），main() 里 `LLVMContextDispose` 释放过整个堆图后，退出表 dtor 对同图用户再走 `~LLVMContextImpl → User::dropAllReferences` 写 `mov [r9],r8` 到 MEM_RESERVE 未提交页 → c0000005。实证链：`LLVMShutdown()` 清 ManagedStatic 注册表后仍 12/12 崩（崩溃者不是 ManagedStatic 形态）；对照实验 8/8 崩 vs 保留 ctx 20/20 零崩，`ASLR/堆布局`、模板大小只是触发概率因子。修复（irgen.c zan_irgen_destroy）：跳过 `LLVMContextDispose`、保留 context 存活到进程退出（有界泄漏、编译器进程短命），main() 成功路径尾部 `LLVMShutdown()` 收 ManagedStatic。回归：gui-empty 对 20/20、gui-components/dashboard/free/hmi/ribbon/sidebar 各 1 次、模板对全零退出；cdb 复跑无 AV。ASan 零复现疑因分配器差异不暴露未提交页写入；根治需 LLVM 侧退出表禁注册（上游 C++ 语义，超出本仓库），现状即最稳工程解。先于本项发现的 **确定性** c00000fd 家族（emit_stmt 单帧 ~6KB × stdlib 深 else-if 链 Theme.SetToken(100)/IconVector.Draw(256) 超 1MB 默认栈，zform 模板 100% 复现）已以 zanc 链接选项 /STACK:32MB 修复，与本 UAF 无关。
 
