@@ -1,0 +1,192 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Legend;
+
+/// 页 18「发红包」——原版这一格**不是整页，是浮在当页上的模态弹窗**
+/// （参考图 `发红包.png` 就是弹窗本体裁切；实测表见 REFERENCE_AUDIT §5.4h）。
+///
+/// 结构：底下的页面照常渲染（`page` 一直指着那一页，不换页），弹窗做 `root`
+/// 的 `position: absolute` 子面板（`.rp-host` 铺满 root 的 padding box），
+/// 最后 Add → 画在全窗最上层，且命中「后注册者优先」。面板里再挂一层透明
+/// 遮罩（`.rp-block`）吃命中：模态开着时底下的导航/按钮点不动。遮罩**不压暗**
+/// ——参考图只裁了弹窗本体，压暗是自创（记在审计的偏差里）。
+partial class LegendApp {
+    bool rpOpen = false;
+    Panel rpHost;
+    TextArea rpSayBox;
+    Input rpYuanBox;
+    /* 输入内容活得比控件久：每次重建整页都会换掉控件，值放在这两个 string
+       字段上——`框.data = 字段` 是编译器的**实时绑定**（Get 读字段 / Set 回写），
+       重开弹窗还是上次的内容（原版不会清掉用户输入）。别改成 SignalString：
+       `Binding<string>` 只接受 string 左值或常量字符串，收 SignalString 编译报
+       「cannot convert 'SignalString' to 'Binding'」。 */
+    string rpSayText = "恭喜发财，大吉大利!";
+    string rpYuanText = "100";
+
+    /// 导航格「发红包」触发：开模态，不换页。
+    void RpShow() {
+        rpOpen = true;
+        Rebuild();
+    }
+
+    /// 「取消(C)」：关掉弹窗，露出下面的页面（page 一直是那一页）。
+    void RpClose() {
+        if (!rpOpen) { return; }
+        rpOpen = false;
+        RpClear();
+        Rebuild();
+    }
+
+    /// 拆弹窗：从 root 上摘掉宿主。开着时每次重建都先摘再挂，不叠加。
+    void RpClear() {
+        if (rpHost != null) {
+            root.Remove(rpHost);
+            rpHost.RemoveAll();
+        }
+        rpSayBox = null;
+        rpYuanBox = null;
+    }
+
+    /// 「发红包」：离线壳不产生真实收益（与挂机/扫荡同口径），走一条系统
+    /// 聊天；元宝下限照原版提示挡一道。
+    void RpSend() {
+        string say = rpSayText;
+        int yuan = RpToInt(rpYuanText, 0);
+        if (yuan < Spec.RpMinYuan()) {
+            net.AddChat("[系统]", "元宝数量不能低于" + Rules.N(Spec.RpMinYuan())
+                + "元宝。");
+            Refresh();
+            return;
+        }
+        net.AddChat("[系统]", "全服(包含所有分区)发元宝：" + Rules.N(yuan)
+            + " 元宝，祝福语「" + say + "」已送出。");
+        rpOpen = false;
+        RpClear();
+        Rebuild();
+    }
+
+    /// 十进制解析：输入框已限数字，这里只兜底（给不出数就当 dflt，交给下限判断）。
+    int RpToInt(string s, int dflt) {
+        string t = s.Trim();
+        if (t.Length == 0) { return dflt; }
+        int v = 0;
+        for (int i = 0; i < t.Length; i = i + 1) {
+            int c = t[i] & 255;
+            if (c < 48 || c > 57) { return dflt; }
+            v = v * 10 + (c - 48);
+            if (v > 100000000) { return 100000000; }
+        }
+        return v;
+    }
+
+    /// 弹窗本体。`BuildPage` 在 rpOpen 时调它。
+    void RpBuild() {
+        RpClear();
+        Panel host = Panel.Row(); host.Class = "rp-host";
+        host.Pad(0); host.NoOverlapCheck();
+        rpHost = host;
+        root.Add(host);
+
+        /* 遮罩铺满内容区（§11.5：铺满/居中一律按运行期 Client*，不按设计值）。
+           `ClientHeight()` 含自绘标题栏 48（`ContentTop()`），内容区要减掉它
+           ——不减的话弹窗会比内容区中线低 24 设备px（实测 y 379..714）。
+
+           **必须挂一个监听器**：控件只有在有人监听时才注册命中区
+           （`Control.FireCommon`：`if (!On.Any()) { return; }`，"未使用的容器
+           不能抢走画在它下面的内容的指针"）。空壳 Panel 不注册 → 点导航瓦片
+           会穿透到下层并把弹窗关掉（实测：点 nav-12 后弹窗没了）。挂上空
+           Click 后它按绘制序最后注册，命中解析逆序优先 → 模态成立。 */
+        int cw = app.ClientWidth();
+        int chh = app.ClientHeight() - app.ContentTop();
+        Panel block = Panel.Row(); block.Class = "rp-block";
+        block.Pad(0); block.NoOverlapCheck();
+        block.DockManual();
+        block.Place(0, 0);
+        block.Prefer(cw, chh);
+        block.OnClick(() => { });           // 只吃命中，什么都不做
+        block.OnKeyDown(() => { RpHotkey(); });
+        host.Add(block);
+        /* 焦点交给遮罩：框架的键事件只发给**持有焦点**的控件（`Ui.KeyDownOn`
+           就是 `focus.IsFocused(id)`），不显式聚焦的话开窗后按 C 没人接。
+           之后用户点弹窗空白处/底页时命中解析到遮罩，焦点自然还留在它身上。 */
+        app.focus.SetFocused(block.CommonId());
+
+        Panel dlg = Panel.Row(); dlg.Class = "rp-dialog";
+        dlg.Pad(0); dlg.NoOverlapCheck();
+        dlg.DockManual();
+        dlg.Place((cw - Spec.RpW()) / 2, (chh - Spec.RpH()) / 2);
+        dlg.Prefer(Spec.RpW(), Spec.RpH());
+        host.Add(dlg);
+
+        Label title = Text("全服(包含所有分区)发元宝：", "rp-title", 0);
+        title.DockManual(); title.Place(Spec.RpTitleX(), Spec.RpTitleY());
+        title.Prefer(Spec.RpInnerW() - Spec.RpTitleX(), Spec.RpTitleH());
+        dlg.Add(title);
+
+        /* 标签盒故意比原版宽、并且**压在输入框左缘上**（墨到 88、框线 90）：
+           本机字体对「祝福语：」要 84 设备px（原版只占 66），盒窄了会被
+           `Label` 省略号截成「祝福语..」（实测 74 时就是这个结果）。
+           `NoOverlapCheck()` 必须挂在**子控件**上——lint 的豁免是
+           `CheckOverlapKids` 里读 `a.overlapExempt`（a=子），挂父容器不生效。 */
+        Label l1 = Text("祝福语：", "rp-label", 0);
+        l1.NoOverlapCheck();
+        l1.DockManual(); l1.Place(Spec.RpLabelX(), Spec.RpLabel1Y());
+        l1.Prefer(Spec.RpLabelW(), Spec.RpLabelH());
+        dlg.Add(l1);
+
+        TextArea say = new TextArea("");
+        say.Class = "rp-box";
+        say.data = rpSayText;
+        say.MaxLen = Spec.RpSayMax();       // 「祝福语不能超过17个汉字」
+        say.DockManual(); say.Place(Spec.RpBoxX(), Spec.RpSayY());
+        say.Prefer(Spec.RpBoxW(), Spec.RpSayH());
+        dlg.Add(say);
+        rpSayBox = say;
+
+        Panel h1 = CenterRow("祝福语不能超过17个汉字", "rp-center", "rp-hint",
+                             Spec.RpInnerW(), Spec.RpHintH());
+        h1.DockManual(); h1.Place(0, Spec.RpHint1Y());
+        dlg.Add(h1);
+
+        Label l2 = Text("元宝数：", "rp-label2", 0);
+        l2.NoOverlapCheck();                // 同上：盒压住输入框左缘是刻意的
+        l2.DockManual(); l2.Place(Spec.RpLabelX(), Spec.RpLabel2Y());
+        l2.Prefer(Spec.RpLabelW(), Spec.RpLabelH());
+        dlg.Add(l2);
+
+        Input yuan = new Input("");
+        yuan.Class = "rp-box";
+        yuan.data = rpYuanText;
+        yuan.Filter = Input.OnlyDigits;     // 元宝数只收数字
+        yuan.DockManual(); yuan.Place(Spec.RpBoxX(), Spec.RpYuanY());
+        yuan.Prefer(Spec.RpBoxW(), Spec.RpYuanH());
+        dlg.Add(yuan);
+        rpYuanBox = yuan;
+
+        Panel h2 = CenterRow("元宝数量不能低于100元宝", "rp-center", "rp-hint",
+                             Spec.RpInnerW(), Spec.RpHintH());
+        h2.DockManual(); h2.Place(0, Spec.RpHint2Y());
+        dlg.Add(h2);
+
+        Button send = BtnDev("发红包", "rp-btn", Spec.RpBtnW(), Spec.RpBtnH(),
+                             () => { RpSend(); });
+        send.DockManual(); send.Place(Spec.RpBtn1X(), Spec.RpBtnY());
+        dlg.Add(send);
+
+        Button cancel = BtnDev("取消(C)", "rp-btn", Spec.RpBtnW(), Spec.RpBtnH(),
+                               () => { RpClose(); });
+        cancel.DockManual(); cancel.Place(Spec.RpBtn2X(), Spec.RpBtnY());
+        dlg.Add(cancel);
+    }
+
+    /// 「取消(C)」的热键：挂在遮罩的 OnKeyDown 上（原版按钮就写着 (C)）。
+    /// **别改成在 120ms 刻度上轮询 `app.EventKind()`**：键事件在
+    /// `ProcessEvent` 里处理完，下一次 PollEvent 的 `ClearEvent` 就把它清了，
+    /// 刻度多半读不到——实测 keydown 67 之后弹窗照旧开着。
+    /// 已知偏差：焦点在输入框里时 C 是普通字符（不过去抢）。
+    void RpHotkey() {
+        if (!rpOpen) { return; }
+        if (Ui.KeyDown(app) == 67) { RpClose(); }        // 67 = 'C'
+    }
+}
