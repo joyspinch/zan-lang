@@ -118,7 +118,10 @@ class Ruleset {
                 } else if (value.Length == 0) { throw new Exception(context + ": empty " + bits[0]); }
             }
             string id = row.Text("id");
-            if (id != Convert.ToString(ParseInt(id, context))) { throw new Exception(context + ": ID must be canonical decimal"); }
+            /* 数字键表要求规范十进制；`balance` 的 id 是符号名
+               （initial_gold…），schema 首项 `id` 无范围，与客户端
+               `Tables.zan` 的同一判据对齐。 */
+            if (spec[0].StartsWith("id:") && id != Convert.ToString(ParseInt(id, context))) { throw new Exception(context + ": ID must be canonical decimal"); }
             if (table.byId.ContainsKey(id)) { throw new Exception(context + ": duplicate id " + id); }
             table.byId[id] = row;
             table.rows.Add(row);
@@ -177,6 +180,10 @@ class Rules {
     Ruleset recycle;
     Ruleset recyclePrices;
 
+    /* 表名 -> 表：启动自检与诊断读取（table 名与文件同名），
+       在 Read 末尾统一填充。 */
+    Dictionary<string, Ruleset> tables = new Dictionary<string, Ruleset>();
+
     /* 掉落池索引：pool -> 行集合（装载时建一次，掷骰不再扫全表）。 */
     Dictionary<int, List<RuleRow>> poolOf = new Dictionary<int, List<RuleRow>>();
     /* 每池权重和（含高价值保护权重，见 WeightOf）。 */
@@ -187,8 +194,29 @@ class Rules {
         return Rules.current;
     }
 
-    static void Initialize(string directory) { Rules.current = Rules.Read(directory); }
+    /* 装载即校验。`current` 必须在索引与校验之前发布：两者都通过
+       `Current()` 读表（`Val`/`RequiredKeys`/`WeightOf`）。校验失败则
+       撤销发布，`Ready()` 保持 false，调用方的 catch 才有意义。 */
+    static void Initialize(string directory) {
+        Rules r = Rules.Read(directory);
+        Rules.current = r;
+        try {
+            r.IndexPools();
+            r.Validate();
+        } catch (Exception ex) {
+            Rules.current = null;
+            throw ex;
+        }
+    }
     static bool Ready() { return Rules.current != null; }
+
+    /* 装载自检口径：表张数与某表行数，供启动日志与健康检查打印。 */
+    static int TableCount() { return Rules.Current().tables.Count; }
+    static int Count(string table) {
+        Ruleset t = null;
+        if (!Rules.Current().tables.TryGetValue(table, out t)) { return 0; }
+        return t.Count();
+    }
 
     /* ---- 数值 ---- */
 
@@ -329,8 +357,14 @@ class Rules {
         r.sets = Ruleset.Load(dir + "/sets.csv", "id:0:100,name,required:1:12,items,stat,value:1:100000");
         r.recycle = Ruleset.Load(dir + "/recycle.csv", "id:0:6,name,numerator:1:1000000,denominator:1:1000000,cap:1:1000000000");
         r.recyclePrices = Ruleset.Load(dir + "/recycle_prices.csv", "id:1:1000000,gold:0:100000000");
-        r.IndexPools();
-        r.Validate();
+        r.tables["slots"] = r.slots; r.tables["qualities"] = r.qualities; r.tables["items"] = r.items;
+        r.tables["monsters"] = r.monsters; r.tables["bosses"] = r.bosses; r.tables["maps"] = r.maps;
+        r.tables["jobs"] = r.jobs; r.tables["skills"] = r.skills; r.tables["levels"] = r.levels;
+        r.tables["drops"] = r.drops; r.tables["forge"] = r.forge; r.tables["shop"] = r.shop;
+        r.tables["balance"] = r.balance; r.tables["quests"] = r.quests; r.tables["rebirth"] = r.rebirth;
+        r.tables["growth"] = r.growth; r.tables["encounters"] = r.encounters; r.tables["attributes"] = r.attributes;
+        r.tables["inner_power"] = r.innerPower; r.tables["gems"] = r.gems; r.tables["elements"] = r.elements;
+        r.tables["sets"] = r.sets; r.tables["recycle"] = r.recycle; r.tables["recycle_prices"] = r.recyclePrices;
         return r;
     }
 
@@ -353,30 +387,50 @@ class Rules {
 
     /* balance 必需键：客户端 `Game.zan` 与本文都引用到的全部数值键。
        这份清单是「服务端允许读到的键」的白名单，缺一个就是配置不完整
-       （旧表里 `incoming_random_min` 就漏了，见文件头注释）。 */
-    static string[] RequiredKeys() {
-        return ("initial_gold,initial_gems,initial_iron,initial_potions,initial_capacity,max_capacity,"
-            + "storage_capacity,max_floor,max_rebirth,offline_seconds,boss_tries,arena_tries,escort_tries,"
-            + "tower_tries,wave_count,guardian_hp_pct,guardian_attack_pct,drop_chance,iron_chance,potion_chance,"
-            + "critical_chance,critical_damage_pct,mp_regen,potion_trigger_pct,potion_heal_pct,recovery_seconds,"
-            + "round_limit,equipment_coefficient_max,treasure_gold,treasure_gems,treasure_iron,treasure_runes,"
-            + "treasure_potions,initial_treasure_maps,daily_treasure_maps,daily_gold,daily_yuan,daily_potions,"
+       （旧表里 `incoming_random_min` 就漏了，见文件头注释）。
+       `Split` 返回 `List<string>`，不是数组。 */
+    static List<string> RequiredKeys() {
+        return ("inner_tp_per_kill,inner_tp_cap,initial_gold,initial_gems,initial_iron,initial_potions,"
+            + "initial_capacity,max_capacity,storage_capacity,max_floor,max_rebirth,offline_seconds,"
+            + "boss_tries,arena_tries,escort_tries,wave_count,guardian_hp_pct,guardian_attack_pct,"
+            + "drop_chance,iron_chance,potion_chance,critical_chance,critical_damage_pct,mp_regen,"
+            + "potion_trigger_pct,potion_heal_pct,recovery_seconds,round_limit,equipment_coefficient_max,"
+            + "treasure_pity,initial_treasure_maps,daily_treasure_maps,treasure_gold,treasure_gems,"
+            + "treasure_iron,treasure_runes,treasure_potions,daily_gold,daily_yuan,daily_potions,"
             + "bounty_kills,bounty_gold,bounty_runes,first_clear_yuan,between_wave_heal_pct,escort_gold,"
-            + "escort_seconds,escort_reward,escort_level_gold,escort_guild_gold,escort_merit,arena_power_base,"
-            + "arena_power_win,arena_power_rival,arena_win_merit,arena_lose_merit,arena_win_gold,"
-            + "arena_win_reputation,arena_lose_reputation,incoming_random_min,incoming_random_range,"
-            + "element_pool_cap,element_xp_per_second,secret_wave_count,secret_mob_hp_pct,altar_personal_cap,"
-            + "altar_world_cap,altar_world_reward_merit,tower_gold_base,tower_gold_per_floor,tower_xp_base,"
-            + "tower_xp_per_floor,tower_merit,tower_foe_atk_base,tower_foe_atk_per_floor,tower_foe_hp_base,"
-            + "tower_foe_hp_per_floor,guild_max_members,siege_attack_gold,siege_base_chance,siege_power_div,"
-            + "siege_hold_seconds,market_fee_pct,market_min_price,redpack_min_yuan,redpack_max_yuan,"
-            + "redpack_share_pct,mentor_apprentice_max_level,mentor_take_level,mentor_master_rebirth,"
-            + "mentor_take_gold,mentor_take_xp,star_activate_gold,star_points_per_rebirth,lord_donate_yuan,"
-            + "title_unlock_rep_pct,legend_sword_base,legend_robe_male_base,legend_robe_female_base,"
-            + "legend_first_form,legend_form_count,rune_word_ore,rune_word_rune,form_growth_balls,"
-            + "form_growth_rune,floor_scale_per_100,floor_scale_cap,progress_cap_hard,drop_value_pivot,"
-            + "guild_create_item,mentor_max_apprentices,mentor_max_masters,star_points_max,forge_gold_per_star,"
-            + "forge_iron_per_star,treasure_pity").Split(",");
+            + "escort_seconds,escort_reward,escort_level_gold,escort_guild_gold,escort_merit,"
+            + "arena_power_base,arena_power_win,arena_power_rival,arena_win_merit,arena_lose_merit,"
+            + "arena_win_gold,arena_win_reputation,arena_lose_reputation,element_pool_cap,"
+            + "element_xp_per_second,secret_wave_count,secret_mob_hp_pct,tianshu_hp_per_coefficient,"
+            + "tianshu_mp_per_coefficient,tianshu_attack_min_per_coefficient,"
+            + "tianshu_attack_max_per_coefficient,tianshu_magic_min_per_coefficient,"
+            + "tianshu_magic_max_per_coefficient,tianshu_tao_min_per_coefficient,"
+            + "tianshu_tao_max_per_coefficient,tianshu_defense_min_per_coefficient,"
+            + "tianshu_defense_max_per_coefficient,tianshu_magic_defense_min_per_coefficient,"
+            + "tianshu_magic_defense_max_per_coefficient,altar_personal_cap,altar_world_cap,"
+            + "altar_gold_cost,altar_gold_gain,altar_yuan_cost,altar_yuan_gain,altar_yuan_large_cost,"
+            + "altar_yuan_large_gain,altar_iron_cost,altar_iron_gain,altar_personal_reward_gold,"
+            + "altar_personal_reward_yuan,altar_personal_reward_reputation,altar_world_reward_gold,"
+            + "altar_world_reward_yuan,altar_world_reward_merit,legend_sword_base,legend_robe_male_base,"
+            + "legend_robe_female_base,legend_first_form,legend_form_count,rune_word_ore,rune_word_rune,"
+            + "form_growth_balls,form_growth_rune,tower_tries,progress_cap_hard,incoming_random_min,"
+            + "incoming_random_range,tower_merit,tower_gold_base,tower_gold_per_floor,tower_xp_base,"
+            + "tower_xp_per_floor,tower_foe_atk_base,tower_foe_atk_per_floor,tower_foe_hp_base,"
+            + "tower_foe_hp_per_floor,guild_create_gold,guild_create_item,guild_max_members,"
+            + "siege_attack_gold,siege_base_chance,siege_power_div,siege_hold_seconds,market_fee_pct,"
+            + "market_min_price,redpack_min_yuan,redpack_max_yuan,redpack_share_pct,"
+            + "mentor_apprentice_max_level,mentor_take_level,mentor_master_rebirth,mentor_take_gold,"
+            + "mentor_take_xp,mentor_max_apprentices,mentor_max_masters,star_activate_gold,"
+            + "star_points_per_rebirth,star_points_max,lord_donate_yuan,title_unlock_rep_pct,"
+            + "floor_scale_per_100,floor_scale_cap,drop_value_pivot,forge_gold_per_star,"
+            + "forge_iron_per_star,arena_def_offset,arena_power_scale,arena_rival_count,arena_win_scale,"
+            + "altar_buff_seconds,auto_batch_sec,auto_max_rounds,boss_max_rounds,boss_sweep_max,city_count,"
+            + "city_income_base,city_income_step,city_page_size,codex_page_size,death_hp_pct,"
+            + "forge_star_attack,forge_star_defense,guild_name_max,guild_name_min,mentor_take_reputation,"
+            + "sell_price_pct,shop_buy_max,siege_level_power,tower_win_atk_scale,tower_win_def_base,"
+            + "tower_win_floor_div,treasure_cost,world_boss_big_item_pct,world_boss_damage_pct,"
+            + "world_boss_defense,world_boss_exp,world_boss_gold_max,world_boss_gold_min,world_boss_hp,"
+            + "world_boss_kill_gold,world_boss_level,world_boss_respawn_seconds,world_boss_top_item_pct").Split(",");
     }
 
     void Validate() {
@@ -519,7 +573,10 @@ class Rules {
             Need(PoolTotal(encounter.Int("drop_pool")) > 0, encounter.location + ": missing pool");
             string mode = encounter.Text("progress_cap_mode");
             Need(mode == "fixed" || mode == "level_plus", encounter.location + ": unsupported progress_cap_mode");
-            CheckRanges(encounter);
+            /* 秘境/传说塔的攻防不是区间，是基准值 + 百分比缩放
+               （`attack_base`/`attack_min_pct`），没有 `*_min`/`*_max` 列，
+               所以不做 `CheckRanges`。客户端 `Tables.zan` 同样只对
+               monsters/bosses 调它。 */
         }
         foreach (RuleRow boss in bosses.All()) {
             Need(PoolTotal(boss.Int("drop_pool")) > 0, boss.location + ": missing pool");
