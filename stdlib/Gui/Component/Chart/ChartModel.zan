@@ -842,6 +842,41 @@ class ChartMarkLine {
     }
 }
 
+/// grid.{left,right,top,bottom,width,height} / outerBounds 的**原始声明**
+/// （A16）。ECharts util/layout.ts 的 mergeLayoutParam + getLayoutRect
+/// 只在声明值上解算绘图矩形——百分比按容器尺寸、数字按像素、关键字
+/// center/middle/left/top/right/bottom 有专名语义，且 `left||right`
+/// 的对齐 switch 读的是原始关键字。此前的 int px / int pct 双字段把
+/// 百分比截断成整数、把关键字整体丢弃，多宫格（scatter-matrix
+/// "17.166666666666664%"）与 top:'center' 全部落错。
+/// kind：0 = 声明了 null/"auto"（hasValue 语义=无值）；1 = 像素数；
+/// 2 = "N%" 百分比；3 = 关键字。null 引用 = 键未声明。
+class ChartBoxParam {
+    int kind;
+    double num;      // kind 1/2：像素数 / 百分数（可带小数）
+    string kw;       // kind 3：原始关键字
+
+    static ChartBoxParam Px(double v) {
+        return new ChartBoxParam { kind = 1, num = v, kw = "" };
+    }
+    static ChartBoxParam Pct(double v) {
+        return new ChartBoxParam { kind = 2, num = v, kw = "" };
+    }
+    static ChartBoxParam Key(string s) {
+        return new ChartBoxParam { kind = 3, num = 0.0, kw = s };
+    }
+    /// 声明了 null/"auto"（占位但无值——mergeLayoutParam 的 hasValue
+    /// 把它与未声明同样对待，但 hasOwn 语义不同）。
+    static ChartBoxParam Void() {
+        return new ChartBoxParam { kind = 0, num = 0.0, kw = "" };
+    }
+
+    static ChartBoxParam Clone(ChartBoxParam src) {
+        if (src == null) { return null; }
+        return new ChartBoxParam { kind = src.kind, num = src.num, kw = src.kw };
+    }
+}
+
 /// 长度/位置标量：像素（Px）或相对主体的百分比（Pct，0..100）。
 class ChartScalar {
     int amount;
@@ -2594,6 +2629,8 @@ class ChartAxis {
     int labelRotate;   // ECharts axisLabel.rotate：度（钳 -90..90），0 = 水平
     int labelInterval; // ECharts axisLabel.interval：-1 = 自动防重叠，>=0 = 每 (n+1) 个画一个
     int labelMargin;   // ECharts axisLabel.margin：标签与轴线的像素距离（bump-chart 30）
+    bool labelShow;    // ECharts axisLabel.show：false = 整组刻度标签不画
+    int labelFontSize; // ECharts axisLabel.fontSize：-1 = 未声明
     string nameLocation; // ECharts nameLocation："start"|"middle"|"end"
                          //   官方缺省 'end'（coord/axisDefault.ts:34）
     int nameGap;         // ECharts nameGap：轴名与轴线的像素间距，
@@ -2669,6 +2706,8 @@ class ChartAxis {
         a.labelRotate = 0;
         a.labelInterval = 0 - 1;
         a.labelMargin = 0;
+        a.labelShow = true;
+        a.labelFontSize = 0 - 1;
         a.nameLocation = "end";
         a.nameGap = 0 - 1;
         a.labelFormatter = "";
@@ -2720,6 +2759,8 @@ class ChartAxis {
         a.labelRotate = 0;
         a.labelInterval = 0 - 1;
         a.labelMargin = 0;
+        a.labelShow = true;
+        a.labelFontSize = 0 - 1;
         a.nameLocation = "end";
         a.nameGap = 0 - 1;
         a.labelFormatter = "";
@@ -2822,6 +2863,8 @@ class ChartAxis {
         a.splitArea = src.splitArea;
         a.labelRotate = src.labelRotate; a.labelInterval = src.labelInterval;
         a.labelMargin = src.labelMargin;
+        a.labelShow = src.labelShow;
+        a.labelFontSize = src.labelFontSize;
         a.nameLocation = src.nameLocation; a.nameGap = src.nameGap;
         a.labelFormatter = src.labelFormatter;
         a.labelSt = ChartTextStyle.Clone(src.labelSt);
@@ -2962,6 +3005,23 @@ class ChartOption {
     int gridTopPct;
     int gridBottomPct;
     bool containLabel;
+    // A16：grid 的原始声明（ChartBoxParam，kind/语义见类注释）——
+    // GridRawRect 按 ECharts mergeLayoutParam + getLayoutRect 精确
+    // 解算单格/多格矩形；上面 int 字段保留为旧读方与指纹的粗档影子。
+    ChartBoxParam gridLeftRaw;
+    ChartBoxParam gridRightRaw;
+    ChartBoxParam gridTopRaw;
+    ChartBoxParam gridBottomRaw;
+    ChartBoxParam gridWidthRaw;
+    ChartBoxParam gridHeightRaw;
+    // A16：grid.outerBounds（Grid.ts prepareOuterBounds：'auto' 模式下
+    // outerBounds 自身再走一遍 getLayoutRect 得外接矩形，标签外溢
+    // 量往里收缩——intraday-breaks-1 {top:'20%',bottom:'30%'}）。
+    ChartBoxParam obLeftRaw;
+    ChartBoxParam obRightRaw;
+    ChartBoxParam obTopRaw;
+    ChartBoxParam obBottomRaw;
+    bool obDeclared;  // outerBounds 键在（无值声明也算，走 OUTER_BOUNDS_DEFAULT）
     int zoomStart;    // dataZoom 初始窗口，百分比 0..100
     int zoomEnd;      // dataZoom 初始窗口，百分比 0..100
     string zoomStartValue; // dataZoom startValue：按类目名定位窗口起点
@@ -3053,6 +3113,17 @@ class ChartOption {
         o.gridLeftPct = src.gridLeftPct; o.gridRightPct = src.gridRightPct;
         o.gridTopPct = src.gridTopPct; o.gridBottomPct = src.gridBottomPct;
         o.containLabel = src.containLabel;
+        o.gridLeftRaw = ChartBoxParam.Clone(src.gridLeftRaw);
+        o.gridRightRaw = ChartBoxParam.Clone(src.gridRightRaw);
+        o.gridTopRaw = ChartBoxParam.Clone(src.gridTopRaw);
+        o.gridBottomRaw = ChartBoxParam.Clone(src.gridBottomRaw);
+        o.gridWidthRaw = ChartBoxParam.Clone(src.gridWidthRaw);
+        o.gridHeightRaw = ChartBoxParam.Clone(src.gridHeightRaw);
+        o.obLeftRaw = ChartBoxParam.Clone(src.obLeftRaw);
+        o.obRightRaw = ChartBoxParam.Clone(src.obRightRaw);
+        o.obTopRaw = ChartBoxParam.Clone(src.obTopRaw);
+        o.obBottomRaw = ChartBoxParam.Clone(src.obBottomRaw);
+        o.obDeclared = src.obDeclared;
         o.zoomStart = src.zoomStart; o.zoomEnd = src.zoomEnd;
         o.zoomStartValue = src.zoomStartValue; o.zoomEndValue = src.zoomEndValue;
         o.windowStart = src.windowStart; o.windowEnd = src.windowEnd;
@@ -3205,6 +3276,17 @@ class ChartOption {
         o.gridTopPct = 0 - 1;
         o.gridBottomPct = 0 - 1;
         o.containLabel = false;
+        o.gridLeftRaw = null;
+        o.gridRightRaw = null;
+        o.gridTopRaw = null;
+        o.gridBottomRaw = null;
+        o.gridWidthRaw = null;
+        o.gridHeightRaw = null;
+        o.obLeftRaw = null;
+        o.obRightRaw = null;
+        o.obTopRaw = null;
+        o.obBottomRaw = null;
+        o.obDeclared = false;
         o.zoomStart = 0;
         o.zoomEnd = 100;
         // startValue/endValue 字符串必须跟着初始化：null 时
@@ -3947,8 +4029,9 @@ class ChartOption {
 
     /// 解析 grid.left/right/top/bottom 绘图区边距覆盖。
     /// grid.{left,top,right,bottom}：数字=像素；"N%"=面板尺寸百分
-    /// 比（ECharts grid 双形态）。containLabel=true 时边距之外再
-    /// 包住轴标签（标签计入 grid 内）。
+    /// 比；center/middle/left/top/right/bottom 关键字（A16 原样保留，
+    /// parsePercent 有专名映射）。containLabel=true 时矩形再被轴
+    /// 标签的外溢量收缩（Grid.ts legacyContainLabel）。
     static void ParseGrid(JsonValue v, ChartOption o) {
         if (v != null && v.IsArray()) {
             // grid 数组（多 grid 布局）：单格 legacy 字段取第一项，
@@ -3969,10 +4052,72 @@ class ChartOption {
         ChartOption.ParseGridEdge(v.Get("top"), true, true, o);
         ChartOption.ParseGridEdge(v.Get("bottom"), false, true, o);
         o.containLabel = v.Bool("containLabel", o.containLabel);
+        // A16：原始声明 + width/height + outerBounds。
+        if (v.Has("left")) { o.gridLeftRaw = ChartOption.ParseBoxParam(v.Get("left")); }
+        if (v.Has("right")) { o.gridRightRaw = ChartOption.ParseBoxParam(v.Get("right")); }
+        if (v.Has("top")) { o.gridTopRaw = ChartOption.ParseBoxParam(v.Get("top")); }
+        if (v.Has("bottom")) { o.gridBottomRaw = ChartOption.ParseBoxParam(v.Get("bottom")); }
+        if (v.Has("width")) { o.gridWidthRaw = ChartOption.ParseBoxParam(v.Get("width")); }
+        if (v.Has("height")) { o.gridHeightRaw = ChartOption.ParseBoxParam(v.Get("height")); }
+        JsonValue obv = v.Get("outerBounds");
+        if (obv != null && obv.IsObject()) {
+            o.obDeclared = true;
+            if (obv.Has("left")) { o.obLeftRaw = ChartOption.ParseBoxParam(obv.Get("left")); }
+            if (obv.Has("right")) { o.obRightRaw = ChartOption.ParseBoxParam(obv.Get("right")); }
+            if (obv.Has("top")) { o.obTopRaw = ChartOption.ParseBoxParam(obv.Get("top")); }
+            if (obv.Has("bottom")) { o.obBottomRaw = ChartOption.ParseBoxParam(obv.Get("bottom")); }
+        } else if (v.Has("outerBounds")) {
+            // 显式 null/"auto" 占位：mergeDefaultAndTheme 的
+            // getLayoutParams 只在真值时并参——这里等同未声明。
+            o.obDeclared = false;
+        }
+    }
+
+    /// 一个布局标量的原始值：数字（像素）、"N%"（百分比，
+    /// 保小数）、center/middle/left/top/right/bottom 关键字、
+    /// null/"auto"（Void——hasValue 视为无值）。不可识别的串按
+    /// parsePositionSizeOption 的 parseFloat 处理（NaN 归 Void）。
+    static ChartBoxParam ParseBoxParam(JsonValue e) {
+        if (e == null || e.IsNull()) { return ChartBoxParam.Void(); }
+        if (e.IsNumber()) { return ChartBoxParam.Px(e.AsDouble(0.0)); }
+        if (e.IsString()) {
+            string s = e.AsString("");
+            if (s == "auto") { return ChartBoxParam.Void(); }
+            int at = s.IndexOf("%");
+            if (at > 0) {
+                return ChartBoxParam.Pct(JsonValue.DoubleOf(s.Substring(0, at)));
+            }
+            if (s == "center" || s == "middle" || s == "left" || s == "top"
+                || s == "right" || s == "bottom") {
+                return ChartBoxParam.Key(s);
+            }
+            double d = JsonValue.DoubleOf(s);
+            if (d == 0.0 && !ChartOption.StrLooksNumeric(s)) { return ChartBoxParam.Void(); }
+            return ChartBoxParam.Px(d);
+        }
+        return ChartBoxParam.Void();
+    }
+
+    /// 数字串（可带小数/正负号）。"12.5"、"-3" 真；"12%"、"" 假。
+    static bool StrLooksNumeric(string s) {
+        if (s == null || s.Length == 0) { return false; }
+        int i = 0;
+        if (s[0] == '-') { i = 1; }
+        bool digit = false;
+        bool dot = false;
+        for (; i < s.Length; i = i + 1) {
+            char ch = s[i];
+            if (ch >= '0' && ch <= '9') { digit = true; }
+            else if (ch == '.' && !dot) { dot = true; }
+            else { return false; }
+        }
+        return digit;
     }
 
     /// 解析 grid 单边：isLeft 选 gridLeft/gridRight，isVert 选水
-    /// 平/垂直字段对（px 与 pct 互斥，后写覆盖）。
+    /// 平/垂直字段对（px 与 pct 互斥，后写覆盖）。字符串形态只认
+    /// "N%"（关键字/数值串进 raw，不落旧字段——A16 前关键字在这里
+    /// 被静默丢成 px=-1）。
     static void ParseGridEdge(JsonValue e, bool isLeft, bool isVert, ChartOption o) {
         if (e == null) { return; }
         if (e.IsNumber()) {
@@ -4990,7 +5135,8 @@ class ChartOption {
         return true;
     }
 
-    /// grid 数组单项：四边 inset 解析（数字 px / "N%" pct）。
+    /// grid 数组单项：四边 inset 解析（数字 px / "N%" pct / 关键字
+    /// 走 raw），外加原始声明供 GridRawRect 精确解算（A16）。
     static ChartGridSpec ParseGridOne(JsonValue it) {
         ChartGridSpec gs = ChartGridSpec.Of();
         gs.containLabel = it.Bool("containLabel", false);
@@ -4999,6 +5145,12 @@ class ChartOption {
         for (int ki = 0; ki < keys.Length; ki = ki + 1) {
             if (!it.Has(keys[ki])) { continue; }
             JsonValue pv = it.Get(keys[ki]);
+            if (ki == 0) { gs.lRaw = ChartOption.ParseBoxParam(pv); }
+            else if (ki == 1) { gs.tRaw = ChartOption.ParseBoxParam(pv); }
+            else if (ki == 2) { gs.rRaw = ChartOption.ParseBoxParam(pv); }
+            else if (ki == 3) { gs.bRaw = ChartOption.ParseBoxParam(pv); }
+            else if (ki == 4) { gs.wRaw = ChartOption.ParseBoxParam(pv); }
+            else { gs.hRaw = ChartOption.ParseBoxParam(pv); }
             int pct = 0 - 1;
             int px = 0 - 1;
             if (pv != null && pv.IsNumber()) { px = pv.AsInt(0 - 1); }
@@ -7026,6 +7178,8 @@ class ChartOption {
             if (iv != null && iv.IsNumber()) { a.labelInterval = iv.AsInt(0 - 1); }
             // 标签与轴线像素距离（bump-chart Y=30，X=30）——此前丢弃。
             a.labelMargin = al.Int("margin", a.labelMargin);
+            a.labelShow = al.Bool("show", a.labelShow);
+            a.labelFontSize = al.Int("fontSize", a.labelFontSize);
             // 模板标签："{value} °C"——{value} 替换为刻度值。
             a.labelFormatter = al.Str("formatter", a.labelFormatter);
             // axisLabel.rich：富文本刻度标签。声明了 rich 才建 labelSt
@@ -7135,6 +7289,15 @@ class ChartGridSpec {
     int wPct; int wPx;
     int hPct; int hPx;
     bool containLabel;
+    // A16：原始声明（parsePercent 语义的 px / "N%" / 关键字）。
+    // 多宫格与 DrawFrame 家族走 GridRawRect 精确解算；lPct/lPx 等
+    // 旧字段保留给 scatter-matrix 快路径与缓存指纹。
+    ChartBoxParam lRaw;
+    ChartBoxParam tRaw;
+    ChartBoxParam rRaw;
+    ChartBoxParam bRaw;
+    ChartBoxParam wRaw;
+    ChartBoxParam hRaw;
 
     static ChartGridSpec Of() {
         ChartGridSpec gs = new ChartGridSpec();
@@ -8232,3 +8395,4 @@ class ChartDataset {
         return this.EncodeBy(title, yd, type);
     }
 }
+

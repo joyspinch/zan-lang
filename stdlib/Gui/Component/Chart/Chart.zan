@@ -975,6 +975,247 @@ class Chart {
 
     // ---- 比例辅助 ----
 
+    // ======== A16 grid 绘图矩形：mergeLayoutParam + getLayoutRect ========
+    // 出处 util/layout.ts:263-360 getLayoutRect / :679-757
+    // mergeLayoutParam / number.ts:132 parsePositionOption，
+    // Grid.ts:210 `getLayoutRect(gridModel.getBoxLayoutParams(),
+    // layoutRef.refContainer)`——矩形只由声明的六参决定，与轴标签
+    // 宽度无关（标签宽度只在 containLabel/outerBounds 的第二遍
+    // 收缩里进 margin）。port 语义逐条对抄：
+
+    /// 布局矩形（getLayoutRect 的 BoundingRect）。
+    class ChartLayoutRect {
+        double x;
+        double y;
+        double width;
+        double height;
+    }
+
+    /// mergeLayoutParam 的 HV_NAMES：宽族 [width,left,right]、
+    /// 高族 [height,top,bottom]（util/layout.ts:662）。
+    /// enoughParamNumber = 2；mergedValueCount===2 或 newValueCount==0
+    /// 取 merged；newValueCount>=2 取 newParams；否则从 target 按名
+    /// 序补一个。hasValue：!= null 且 != 'auto'（ChartBoxParam kind 0
+    /// = null/auto 占位）。
+    /// target：声明值并入缺省后的 option（可变）；newOption：用户
+    /// 原始声明（mergeDefaultAndTheme 的 inputPositionParams）。
+    static void GridMergeLayoutParam(List<ChartBoxParam> target,
+                                     List<ChartBoxParam> newOption) {
+        // HV 族按下标（宽族 / 高族；0=width 1=left 2=right /
+        // 0=height 1=top 2=bottom 的名字序 = 源 HV_NAMES）。
+        int[] hvW = new int[] { 4, 0, 1 };
+        int[] hvH = new int[] { 5, 2, 3 };
+        Chart.GridMergeOne(hvW, target, newOption);
+        Chart.GridMergeOne(hvH, target, newOption);
+    }
+
+    /// mergeLayoutParam 的单族（names = [size, min, max] 六参下标）。
+    static void GridMergeOne(int[] names, List<ChartBoxParam> target,
+                             List<ChartBoxParam> newOption) {
+        List<ChartBoxParam> merged = new List<ChartBoxParam>();
+        List<ChartBoxParam> newParams = new List<ChartBoxParam>();
+        for (int ni = 0; ni < 3; ni = ni + 1) {
+            merged.Add(target[names[ni]]);
+            newParams.Add(null);
+        }
+        int newValueCount = 0;
+        int mergedValueCount = 0;
+        for (int ni = 0; ni < 3; ni = ni + 1) {
+            if (newOption[names[ni]] != null) {
+                newParams[ni] = newOption[names[ni]];
+                merged[ni] = newOption[names[ni]];
+            }
+            if (Chart.BoxParamHasValue(newParams[ni])) { newValueCount = newValueCount + 1; }
+            if (Chart.BoxParamHasValue(merged[ni])) { mergedValueCount = mergedValueCount + 1; }
+        }
+        List<ChartBoxParam> result;
+        if (mergedValueCount == 2 || newValueCount == 0) {
+            result = merged;
+        } else if (newValueCount >= 2) {
+            result = newParams;
+        } else {
+            result = newParams;
+            for (int ni = 0; ni < 3; ni = ni + 1) {
+                if (newParams[ni] == null && target[names[ni]] != null) {
+                    result[ni] = target[names[ni]];
+                    break;
+                }
+            }
+        }
+        for (int ni = 0; ni < 3; ni = ni + 1) {
+            target[names[ni]] = result[ni];
+        }
+    }
+
+    /// hasValue（mergeLayoutParam 尾部）：!= null 且 != 'auto'。
+    static bool BoxParamHasValue(ChartBoxParam p) {
+        return p != null && p.kind != 0;
+    }
+
+    /// parsePositionOption（number.ts:132-153）：
+    /// center|middle→50%、left|top→0%、right|bottom→100%，
+    /// 百分比 = parseFloat/100*base，数值串 parseFloat，其余
+    /// +option（null→NaN → 这里用 kind 0 表"无值"）。
+    /// 返回 px；无值时 wrote=false。
+    static double GridParsePercent(ChartBoxParam p, double base1, out bool wrote) {
+        wrote = false;
+        if (p == null || p.kind == 0) { return 0.0; }
+        if (p.kind == 2) {
+            wrote = true;
+            return p.num / 100.0 * base1;
+        }
+        if (p.kind == 3) {
+            // 关键字 → 百分数再乘容器。
+            if (p.kw == "center" || p.kw == "middle") {
+                wrote = true;
+                return 0.5 * base1;
+            }
+            if (p.kw == "left" || p.kw == "top") {
+                wrote = true;
+                return 0.0;
+            }
+            if (p.kw == "right" || p.kw == "bottom") {
+                wrote = true;
+                return base1;
+            }
+            return 0.0;
+        }
+        wrote = true;
+        return p.num;
+    }
+
+    /// getLayoutRect（util/layout.ts:263-360）。
+    /// p = [left,right,top,bottom,width,height]（已并入缺省并 merge）。
+    static ChartLayoutRect GridGetLayoutRect(List<ChartBoxParam> p,
+                                             double cw, double ch) {
+        double left = Chart.GridParsePercent(p[0], cw, out bool wL);
+        double top = Chart.GridParsePercent(p[2], ch, out bool wT);
+        double right = Chart.GridParsePercent(p[1], cw, out bool wR);
+        double bottom = Chart.GridParsePercent(p[3], ch, out bool wB);
+        double width = Chart.GridParsePercent(p[4], cw, out bool wW);
+        double height = Chart.GridParsePercent(p[5], ch, out bool wH);
+        // isNaN(width) → width = cw - right - left（margin 恒 0）。
+        if (!wW) { width = cw - right - left; }
+        if (!wH) { height = ch - bottom - top; }
+        if (!wL) { left = cw - right - width; }
+        if (!wT) { top = ch - bottom - height; }
+        // switch (positionInfo.left || positionInfo.right)：声明键的
+        // 关键字对齐（Grid.ts 传入的 margin 为 0，官方 heatmap 等
+        // 全部走 0）。
+        ChartBoxParam lh = p[0] != null ? p[0] : p[1];
+        if (lh != null && lh.kind == 3) {
+            if (lh.kw == "center") { left = cw / 2.0 - width / 2.0; }
+            else if (lh.kw == "right") { left = cw - width; }
+        }
+        ChartBoxParam tv = p[2] != null ? p[2] : p[3];
+        if (tv != null && tv.kind == 3) {
+            if (tv.kw == "middle" || tv.kw == "center") { top = ch / 2.0 - height / 2.0; }
+            else if (tv.kw == "bottom") { top = ch - height; }
+        }
+        // left = left || 0; top = top || 0（NaN 也归 0）。
+        if (!(left > 0.0) && !(left < 0.0)) { left = 0.0; }
+        if (!(top > 0.0) && !(top < 0.0)) { top = 0.0; }
+        ChartLayoutRect r = new ChartLayoutRect();
+        r.x = left;
+        r.y = top;
+        r.width = width;
+        r.height = height;
+        return r;
+    }
+
+    /// 六参序表：[left,right,top,bottom,width,height] 全 null。
+    static List<ChartBoxParam> GridParamsNew() {
+        List<ChartBoxParam> ps = new List<ChartBoxParam>();
+        for (int i = 0; i < 6; i = i + 1) { ps.Add(null); }
+        return ps;
+    }
+
+    /// 单格 grid 矩形（ECharts Grid.resize 首遍）。raw 六参 =
+    /// 用户声明（null = 未声明），缺省 left 15% / top 65 / right
+    /// 10% / bottom 80（GridModel.defaultOption），然后
+    /// mergeLayoutParam(merged, declared) + getLayoutRect。
+    static ChartLayoutRect GridRawRect(ChartBoxParam l, ChartBoxParam r,
+                                       ChartBoxParam t, ChartBoxParam b,
+                                       ChartBoxParam w, ChartBoxParam h,
+                                       double cw, double ch,
+                                       bool nullDefaults) {
+        List<ChartBoxParam> ps = Chart.GridParamsNew();
+        // zrUtil.merge(option, defaultOption)：缺省只补缺失键。
+        if (nullDefaults) {
+            // outerBounds 缺省四边是 0（非 grid 缺省 15%/65%/10%/80%）：
+            // null 保留到 getLayoutRect 的 isNaN 回退 = 0 边。
+            ps[0] = l;
+            ps[1] = r;
+            ps[2] = t;
+            ps[3] = b;
+        } else {
+            ps[0] = l != null ? l : ChartBoxParam.Pct(15.0);
+            ps[1] = r != null ? r : ChartBoxParam.Pct(10.0);
+            ps[2] = t != null ? t : ChartBoxParam.Px(65.0);
+            ps[3] = b != null ? b : ChartBoxParam.Px(80.0);
+        }
+        ps[4] = w;
+        ps[5] = h;
+        List<ChartBoxParam> declared = Chart.GridParamsNew();
+        declared[0] = l;
+        declared[1] = r;
+        declared[2] = t;
+        declared[3] = b;
+        declared[4] = w;
+        declared[5] = h;
+        Chart.GridMergeLayoutParam(ps, declared);
+        return Chart.GridGetLayoutRect(ps, cw, ch);
+    }
+
+    /// expandOrShrinkRect（util/graphic.ts:608-673）的 shrink 半边
+    /// （shrinkOrExpand=true，noNegative=true，minSize=clamp）：
+    /// delta = [top, right, bottom, left]（margin 序），先钳非负，
+    /// 再负向应用：x -= left、width -= (right+left)…… 尺寸小于
+    /// minSize 时保持 minSize 并按 delta 方向贴边。
+    static void GridShrinkRect(ChartLayoutRect rect, double mTop,
+                               double mRight, double mBottom, double mLeft,
+                               double minW, double minH) {
+        if (mTop < 0.0) { mTop = 0.0; }
+        if (mRight < 0.0) { mRight = 0.0; }
+        if (mBottom < 0.0) { mBottom = 0.0; }
+        if (mLeft < 0.0) { mLeft = 0.0; }
+        // expandRectOnOneDimension x：delta 向量已取负 ——
+        // delta[ltIdx=3] = -left、delta[rbIdx=1] = -right。
+        // shrink 分支只走 rect[xy] -= delta[ltIdx] 与
+        // rect[wh] += deltaSum（rect.width >= minSize 时）。
+        double oldW = rect.width;
+        double newW = rect.width - mLeft - mRight;
+        double minWc = minW;
+        if (minWc > oldW) { minWc = oldW; }
+        if (minWc < 0.0) { minWc = 0.0; }
+        if (newW < minWc) {
+            rect.width = minWc;
+            // delta[ltIdx] = -left <= 0：分支二
+            // rect.x += oldSize + delta[rbIdx] = old - right。
+            rect.x = rect.x + oldW - mRight;
+            // 分支一（delta[ltIdx] >= 0 → rect.x -= delta[ltIdx] =
+            // rect.x + left）只在 left==0 时与二同值：mLeft==0 时
+            // 二式退化正确；mLeft>0 走二。
+            if (mLeft > 0.0 && mRight <= 0.0) { rect.x = rect.x + mLeft; }
+        } else {
+            rect.width = newW;
+            rect.x = rect.x + mLeft;
+        }
+        double oldH = rect.height;
+        double newH = rect.height - mTop - mBottom;
+        double minHc = minH;
+        if (minHc > oldH) { minHc = oldH; }
+        if (minHc < 0.0) { minHc = 0.0; }
+        if (newH < minHc) {
+            rect.height = minHc;
+            rect.y = rect.y + oldH - mBottom;
+            if (mTop > 0.0 && mBottom <= 0.0) { rect.y = rect.y + mTop; }
+        } else {
+            rect.height = newH;
+            rect.y = rect.y + mTop;
+        }
+    }
+
     /// 将原始最大值向上取整为友好的轴上界（2/5/10 * 10^n）：
     /// 37 -> 50、830 -> 1000。<=5 时返回 5。
     static int NiceMax(int v) {
@@ -4011,14 +4252,28 @@ class Chart {
         int axisFs = ChartFonts.AxisLabel(app);
         if (ticks < 1) { ticks = 5; }
 
-        int leftGut = Canvas.MeasureText(Chart.Commas(maxV), axisFs) + app.Scale(12);
         int botGut = Canvas.FontHeight(axisFs) + app.Scale(8);
 
-        int plotX = x + pad + leftGut;
+        // A16：与 BuildAxesR 同一矩形来源（GridRawRect）；o 为 null
+        // （对象 API 旧形态）时缺省 left 15% / right 10% 照旧生效，
+        // 头部下限与图例带仍是外壳语义（ECharts 图例浮在画布上）。
+        ChartLayoutRect fr;
+        if (o != null) {
+            fr = Chart.GridRawRect(o.gridLeftRaw, o.gridRightRaw,
+                o.gridTopRaw, o.gridBottomRaw, o.gridWidthRaw, o.gridHeightRaw,
+                (double)w, (double)h, false);
+        } else {
+            fr = Chart.GridRawRect(null, null, null, null, null, null,
+                (double)w, (double)h, false);
+        }
+        int plotX = x + (int)Math.Round(fr.x);
         int plotY = plotTop;
-        int plotW = (x + w - pad) - plotX;
+        int plotW = (int)Math.Round(fr.x + fr.width) - plotX;
         // 底部图例（ECharts 6 默认）从绘图区底边扣除。
-        int plotH = (y + h - pad - botGut - Chart.legendBottomReserve) - plotY;
+        int frBot = y + (int)Math.Round(fr.y + fr.height)
+            - botGut - Chart.legendBottomReserve;
+        int plotH = frBot - plotY;
+        if (plotH > y + h - pad - plotY) { plotH = y + h - pad - plotY; }
         if (plotW < app.Scale(20)) { plotW = app.Scale(20); }
         if (plotH < app.Scale(20)) { plotH = app.Scale(20); }
 
@@ -4085,18 +4340,28 @@ class Chart {
         int axisFs = ChartFonts.AxisLabel(app);
         if (hi <= lo) { hi = lo + 1; }
 
-        int gw0 = Canvas.MeasureText(Chart.Commas(hi), axisFs);
-        int gw1 = Canvas.MeasureText(Chart.Commas(lo), axisFs);
-        int leftGut = gw0;
-        if (gw1 > leftGut) { leftGut = gw1; }
-        leftGut = leftGut + app.Scale(12);
         int botGut = Canvas.FontHeight(axisFs) + app.Scale(8);
 
-        int plotX = x + pad + leftGut;
+        // A16：与 BuildAxesR/DrawFrameTO 同一矩形来源；o 为 null 保持
+        // 旧形态。leftGut 不再参与矩形（标签绘制起点由矩形左缘推）。
+        int plotX;
         int plotY = plotTop;
-        int plotW = (x + w - pad) - plotX;
+        ChartLayoutRect fr2;
+        if (o != null) {
+            fr2 = Chart.GridRawRect(o.gridLeftRaw, o.gridRightRaw,
+                o.gridTopRaw, o.gridBottomRaw, o.gridWidthRaw, o.gridHeightRaw,
+                (double)w, (double)h, false);
+        } else {
+            fr2 = Chart.GridRawRect(null, null, null, null, null, null,
+                (double)w, (double)h, false);
+        }
+        plotX = x + (int)Math.Round(fr2.x);
+        int plotW = (int)Math.Round(fr2.x + fr2.width) - plotX;
         // 底部图例（ECharts 6 默认）从绘图区底边扣除。
-        int plotH = (y + h - pad - botGut - Chart.legendBottomReserve) - plotY;
+        int frBot = y + (int)Math.Round(fr2.y + fr2.height)
+            - botGut - Chart.legendBottomReserve;
+        int plotH = frBot - plotY;
+        if (plotH > y + h - pad - plotY) { plotH = y + h - pad - plotY; }
         if (plotW < app.Scale(20)) { plotW = app.Scale(20); }
         if (plotH < app.Scale(20)) { plotH = app.Scale(20); }
 
@@ -4995,6 +5260,9 @@ class Chart {
         bool y1Line = hasRight && y1.show
             && Chart.AxisLineDraws(y1.axisLineShow, x0IsVL);
 
+        // containLabel/outerBounds 用的纯标签宽（官方 labelUnionRect：
+        // 只量文本盒，不加 padding）。
+        int yLblRaw = 0;
         int leftGut;
         if (catY && y0.categories.Count > 0) {
             // 类目 Y：左栏取最宽类目标签（含 formatter 展开）。
@@ -5005,17 +5273,22 @@ class Chart {
                 int wgi = Canvas.MeasureText(cgl, fs);
                 if (wgi > mw) { mw = wgi; }
             }
+            yLblRaw = mw;
             leftGut = mw + app.Scale(12) + app.Scale(y0.labelMargin);
         } else {
+            yLblRaw = Chart.TickLabelW(leftLo, leftHi, ticks, fs);
             leftGut = Chart.TickLabelW(leftLo, leftHi, ticks, fs) + app.Scale(12) + app.Scale(y0.labelMargin);
             if (leftFrac) {
                 // 小数轴标签（"0.5"）比整数影子值（"0"）宽，按定点
                 // 域重估最宽刻度文本。
                 int fw = Chart.TickLabelWF(leftLoF, leftHiF, ticks, fs);
                 if (fw > leftGut) { leftGut = fw + app.Scale(12) + app.Scale(y0.labelMargin); }
+                if (fw > yLblRaw) { yLblRaw = fw; }
             }
             if (y0.labelFormatter.Length > 0) {
-                leftGut = leftGut + Chart.FormatterExtraW(y0.labelFormatter, leftHi, fs);
+                int fx = Chart.FormatterExtraW(y0.labelFormatter, leftHi, fs);
+                leftGut = leftGut + fx;
+                yLblRaw = yLblRaw + fx;
             }
         }
         int rightGut = pad + app.Scale(y1.labelMargin);
@@ -5054,61 +5327,115 @@ class Chart {
                 botGut = botGut - baseNeed + need;
             }
         }
-        // y 轴名 end 态落在绘图区上方、start/middle 在区内：量出名字盒顶
-        // 相对绘图区顶边高出多少，按最高的一根让出上栏。
-        int topGut = 0;
-        if (y0.title.Length > 0 && y0.show) {
-            int yTw = Canvas.MeasureText(y0.title, fs);
-            ChartNameBox yb = Chart.AxisNameBoxPx(y0, false, 0, 0, 100, 100,
-                false, Chart.NameGapPx(app, y0), fh, Canvas.CenterTextYAt(0, fs),
-                yTw, 0 - 1);
-            int above = (0 - yb.top) + app.Scale(2);
-            if (above > topGut) { topGut = above; }
-        }
-        if (hasRight && o.yAxes.Count > 1 && y1.title.Length > 0 && y1.show) {
-            int y1Tw = Canvas.MeasureText(y1.title, fs);
-            ChartNameBox yb2 = Chart.AxisNameBoxPx(y1, false, 0, 0, 100, 100,
-                y1.position == "right", Chart.NameGapPx(app, y1), fh,
-                Canvas.CenterTextYAt(0, fs), y1Tw, 0 - 1);
-            int above2 = (0 - yb2.top) + app.Scale(2);
-            if (above2 > topGut) { topGut = above2; }
-        }
 
-        int plotX = x + pad + leftGut;
-        if (o.gridLeft >= 0) {
-            plotX = x + app.Scale(o.gridLeft) + (o.containLabel ? leftGut : 0);
-        } else if (o.gridLeftPct >= 0) {
-            plotX = x + w * o.gridLeftPct / 100 + (o.containLabel ? leftGut : 0);
+        // ---- A16 绘图矩形：ECharts Grid.resize 首遍
+        // getLayoutRect(getBoxLayoutParams())，矩形只由声明的
+        // left/right/top/bottom/width/height 决定（% 按容器、关键字
+        // center/middle/bottom/... 专名语义、width/height 优先锚
+        // 定）。官方网格从不为轴标签/轴名/图例留白——标签溢出由
+        // containLabel / outerBounds 的第二遍收缩处理，图例在
+        // 官方是独立组件浮在画布上、根本不改 grid 矩形。
+        ChartLayoutRect gr = Chart.GridRawRect(
+            o.gridLeftRaw, o.gridRightRaw, o.gridTopRaw, o.gridBottomRaw,
+            o.gridWidthRaw, o.gridHeightRaw, (double)w, (double)h, false);
+        int plotX = x + (int)Math.Round(gr.x);
+        int plotY = y + (int)Math.Round(gr.y);
+        int plotW = (int)Math.Round(gr.width);
+        int plotH = (int)Math.Round(gr.height);
+        // 右/下缘的命名副本：BuildAxesR 里的右轴标签/底行沿用旧变量。
+        int plotRight = plotX + plotW;
+        int plotBot = plotY + plotH;
+        // containLabel：legacyContainLabel.ts 语义——x 轴（水平，
+        // bottom 侧）从高度里扣「标签并集高 + margin」并把 y 下推；
+        // y 轴（left 侧）从宽度里扣「标签并集宽 + margin」并把 x
+        // 右推。标签并集用与绘制同一套度量（最宽刻度文本 / 行高）。
+        if (o.containLabel) {
+            // estimateLabelUnionRect（legacyContainLabel.ts）：逐
+            // 标签 getTextRect 取并集——y 轴 = 最宽文本盒宽，x 轴 =
+            // 文本盒高（官方 12px 文本盒高 12，不是行盒 fh；fallback
+            // 度量下 equal font-size）。旋转取旋转后外接盒。
+            // axisLabel.fontSize 声明时并集高随字号（bump-chart 16）。
+            int xLblH = x0.labelFontSize > 0 ? app.Scale(x0.labelFontSize)
+                : (x0.labelSt != null && x0.labelSt.fontSize > 0
+                    ? app.Scale(x0.labelSt.fontSize) : app.Scale(12));
+            if (x0.labelRotate != 0 && labels.Count > 0) {
+                int rotMaxW2 = 0;
+                for (int ri2 = 0; ri2 < labels.Count; ri2 = ri2 + 1) {
+                    int rwi2 = Canvas.MeasureText(labels[ri2], fs);
+                    if (rwi2 > rotMaxW2) { rotMaxW2 = rwi2; }
+                }
+                rotMaxW2 = Chart.RotatedLabelH(rotMaxW2, app.Scale(12), x0.labelRotate);
+                if (rotMaxW2 > xLblH) { xLblH = rotMaxW2; }
+            }
+            // axisLabel.margin 官方缺省 8（zan 缺省 0 是画距语义）。
+            int margin = app.Scale(x0.labelMargin > 0 ? x0.labelMargin : 8);
+            int yMargin = app.Scale(y0.labelMargin > 0 ? y0.labelMargin : 8);
+            // x 轴（bottom 侧）只缩高度；y 轴（left 侧）缩宽并把 x
+            // 右推。y 下移仅发生在 x 轴 position top（语料无）。
+            if (x0.show && x0.labelShow) { plotH = plotH - xLblH - margin; }
+            if (y0.show && yLblRaw > 0) {
+                plotW = plotW - yLblRaw - yMargin;
+                plotX = plotX + yLblRaw + yMargin;
+            }
         }
-        int plotY = plotTop + topGut;
-        if (o.gridTop >= 0) {
-            // grid.top 是 ECharts 绝对偏移，但不得小于面板头
-            //（标题/副标题/图例行）底边——头部内容永远优先显示，
-            // gridTop 只在头部之下继续往下推（bar12 的 70 压住
-            // 图例行的根因）。
-            int topAbs = y + app.Scale(o.gridTop) + (o.containLabel ? topGut : 0);
-            if (topAbs > plotY) { plotY = topAbs; }
-        } else if (o.gridTopPct >= 0) {
-            int topAbs = y + h * o.gridTopPct / 100 + (o.containLabel ? topGut : 0);
-            if (topAbs > plotY) { plotY = topAbs; }
+        // outerBounds（Grid.ts prepareOuterBounds 'auto'，缺省即跑）：外接矩形
+        // 走 getLayoutRect 且缺省四边 0 = 整个容器。layOutGridBy
+        // OuterBounds：先估轴标签/轴名盒，凡越过外接边界的溢出量
+        // 记入 margin[top,right,bottom,left]，再 expandOrShrinkRect
+        // （shrink，noNegative，钳 25%/25% 尺寸）。语料覆盖四类：
+        //   - y 标签左溢（grid left 0/2px）：mLeft = 标签左缘溢出；
+        //   - x 轴名 end 态右溢（boxplot-light-velocity2）：mRight；
+        //   - 外接声明 top/bottom 时标签上下溢出（intraday-breaks-1）。
+        if (o.obDeclared && !o.containLabel) {
+        ChartLayoutRect ob = Chart.GridRawRect(
+            o.obLeftRaw, o.obRightRaw, o.obTopRaw, o.obBottomRaw,
+            null, null, (double)w, (double)h, true);
+        double mTop = 0.0;
+        double mRight = 0.0;
+        double mBottom = 0.0;
+        double mLeft = 0.0;
+        // 标签盒：官方 labelInfoList.rect（文本盒 + margin 8 的落位）。
+        // y 轴标签行盒：右缘贴 plotX - margin，左缘 = 右缘 - 文本宽。
+        if (y0.show && yLblRaw > 0) {
+            double lblRight = plotX - app.Scale(y0.labelMargin > 0 ? y0.labelMargin : 8);
+            double lblLeft = lblRight - yLblRaw;
+            mLeft = Math.Max(mLeft, ob.x - lblLeft);
         }
-        int plotRight = x + w - rightGut;
-        if (o.gridRight >= 0) {
-            plotRight = x + w - app.Scale(o.gridRight) - (o.containLabel ? rightGut : 0);
-        } else if (o.gridRightPct >= 0) {
-            plotRight = x + w - w * o.gridRightPct / 100
-                - (o.containLabel ? rightGut : 0);
+        // 顶/底溢出（x 维标签与 x 轴名）。x 标签行盒：顶 = plot 底
+        // + margin，高 = 文本盒高（官方 12px → 12）。
+        if (x0.show) {
+            double lblH = app.Scale(12);
+            double lblTop = plotY + plotH + app.Scale(x0.labelMargin > 0 ? x0.labelMargin : 8);
+            mBottom = Math.Max(mBottom, lblTop + lblH - (ob.y + ob.height));
+            // 最顶 y 标签垂直居中于绘图区顶边：盒顶 = plotY - h/2。
+            if (y0.show) {
+                mTop = Math.Max(mTop, ob.y - (plotY - lblH / 2.0));
+            }
         }
-        // 底部图例（ECharts 6 默认）从绘图区底边扣除。
-        int plotBot = y + h - pad - botGut - Chart.legendBottomReserve;
-        if (o.gridBottom >= 0) {
-            plotBot = y + h - app.Scale(o.gridBottom) - (o.containLabel ? botGut : 0);
-        } else if (o.gridBottomPct >= 0) {
-            plotBot = y + h - h * o.gridBottomPct / 100 - (o.containLabel ? botGut : 0);
+        // x 轴名 end 态：名字盒在轴右端外（AxisNameBoxPx anchor 0）。
+        if (x0.title.Length > 0 && x0.show && x0.nameLocation != "middle") {
+            int xTw = Canvas.MeasureText(x0.title, fs);
+            ChartNameBox xb = Chart.AxisNameBoxPx(x0, true, plotX, plotY,
+                plotW, plotH, false, Chart.NameGapPx(app, x0), fh,
+                Canvas.CenterTextYAt(0, fs), xTw, 0 - 1);
+            mRight = Math.Max(mRight, xb.right - (ob.x + ob.width));
+            mBottom = Math.Max(mBottom, (double)(xb.bottom - (ob.y + ob.height)));
         }
-        int plotW = plotRight - plotX;
-        int plotH = plotBot - plotY;
+        // y 轴名 end/start 态在绘图区上/下方溢出（intraday 类）。
+        if (y0.title.Length > 0 && y0.show) {
+            ChartNameBox yb = Chart.AxisNameBoxPx(y0, false, plotX, plotY,
+                plotW, plotH, false, Chart.NameGapPx(app, y0), fh,
+                Canvas.CenterTextYAt(0, fs), 0, 0 - 1);
+            mTop = Math.Max(mTop, (double)(ob.y - yb.top));
+        }
+        Chart.GridShrinkRect(gr, mTop, mRight, mBottom, mLeft,
+            gr.width * 0.25, gr.height * 0.25);
+        plotX = x + (int)Math.Round(gr.x);
+        plotY = y + (int)Math.Round(gr.y);
+        plotW = (int)Math.Round(gr.width);
+        plotH = (int)Math.Round(gr.height);
         if (plotW < app.Scale(20)) { plotW = app.Scale(20); }
+        }
         if (plotH < app.Scale(20)) { plotH = app.Scale(20); }
 
         // 极值贴边留出约半个徽标高度：数据最值逼近 nice 端点时
