@@ -972,3 +972,36 @@ A11 第一版只改了 y 轴（左/右）的四处量程点，漏了 **x 数值�
 `approxInterval` 再查档"，才谈得上接线。而且实测唯一用它的 demo
 （wind-barb，`maxInterval` 1 天）本身就是 no-op（引擎步长已 2 天），
 所以"没接"当前不产生可见错误，记债即可。
+## 堆叠累加的唯一真相是 stackStrategy 链（A9 会话）
+
+**现象**：堆叠柱/堆叠面积/极坐标堆叠柱用"正负双累加器"（bar.js 遗产，
+等价 `'all'` 粗略版）——但 ECharts 6.1 缺省是 **`'samesign'`**，且
+`series.stackStrategy` 键在整个 Chart 目录 0 解析。混号/零值数据上与官方分岔：
+`[10,-8,0]` 官方给 `10,-8,-8`（0 跟随同号前驱），旧引擎给 `10,-8,10`。
+
+- **唯一真相链**（`processor/dataStack.ts:112-165`，移植为
+  `ChartView.StackResults`）：sum 从**本系列自己的原始值**起算；往前扫
+  j=idx-1..0，取**第一个**满足策略条件的前驱的**结果值**（不是原始值，
+  链上前驱结果已是它那条链的和）累加后**单次 break**（不是全累加）；
+  策略是**逐系列**的（`stackInfo.seriesModel.get('stackStrategy')`），
+  前驱用它自己声明的策略判定——所以辅助函数收 `List<int> strategies`。
+  策略条件：`all`→恒真；`positive`→val>0；`negative`→val<0；
+  `samesign`→`(sum>=0&&val>0)||(sum<=0&&val<0)`。
+- **"未声明 stack"不是"空名成组"**：`dataStack.ts:44 if (stack)`——空 stack
+  的系列**不进任何堆叠组**（既不被累加也不当前驱），空名分组只对
+  **列布局**（并排柱）成立。第一版漏了这道门，非堆叠多系列图上组顶被
+  连加（`5,7,9` 三条系列给 21）。判据集中在
+  `ChartView.IsStackedSeries`（`stackName.Length>0 || stack!=0`）。
+- **消费点要全**：段基线（`StackBaseAt` = 链末值 − 自身，纵向柱/横条/
+  堆叠面积三处）、轴量程（`StackTopAll`/`MaxBarStackGroupsW`/
+  `MinBarStackGroupsW`/`StackExtentF`，未堆叠系列取自身值）、组底
+  （堆叠面积的组基线 = 下方各组的**组顶**链末值之和——取组内最后一条
+  系列的结果，逐系列都取会把同组前驱重复相加）、极坐标
+  （`PolarStackTops` 取代 `PolarStackSums`：域取自
+  `stackResultDimension` 而非"组内直加"，后者只在全同号时等价，
+  混号数据会把域撑大）。
+- **验证闭环**：ECharts SSR oracle 跑 235 行全策略随机混号数据
+  （含 0 值/跨零）逐行 diff；`tests/conformance/chart_stack_strategy.zan`
+  钉 4 策略×5 向量 + 逐系列策略 + 解析/克隆 + 窗口组顶/组底 + 极坐标 +
+  未声明 stack 门；全图库 335 demo 的堆叠点扫描（旧 vs 新）为 0 分歧
+  ——**语义修正但无 demo 可见变化**，这类修复的价值在边界不在普查。

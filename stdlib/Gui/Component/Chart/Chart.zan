@@ -1386,10 +1386,14 @@ class Chart {
         if (hiI < loI) { hiI = loI; }
         int hi = 0;
         int lo = 0;
+        // A9：组内顶端值走 processor/dataStack.ts 的
+        // stackStrategy 链（逐系列取各自声明的策略）。
+        // 旧的“正负双累加器”在“负值后跟 0”时与官方
+        // 分岔（[10,-8,0] 官方给 -8/-8，旧给 10/10）。
+        List<double> tops = new List<double>();
         for (int i = loI; i <= hiI; i = i + 1) {
-            List<int> accs = new List<int>();
-            List<int> negAccs = new List<int>();
-            for (int a = 0; a < ng; a = a + 1) { accs.Add(0); negAccs.Add(0); }
+            tops.Clear();
+            ChartView.StackTopAll(series, i, tops);
             for (int s2 = 0; s2 < series.Count; s2 = s2 + 1) {
                 ChartSeries cs3 = series[s2];
                 if (cs3.hidden || cs3.axisIndex != axisIndex
@@ -1399,12 +1403,10 @@ class Chart {
                 if (i >= cs3.Count()) { continue; }
                 double dv = cs3.Number(i);
                 int vF = (int)(dv * 1000.0 + (dv >= 0 ? 0.5 : 0 - 0.5));
-                if (vF < 0) { negAccs[gi] = negAccs[gi] + vF; }
-                else { accs[gi] = accs[gi] + vF; }
-            }
-            for (int a2 = 0; a2 < ng; a2 = a2 + 1) {
-                if (accs[a2] > hi) { hi = accs[a2]; }
-                if (negAccs[a2] < lo) { lo = negAccs[a2]; }
+                double topD = s2 < tops.Count ? tops[s2] : 0.0;
+                int topF = (int)(topD * 1000.0 + (topD >= 0 ? 0.5 : 0 - 0.5));
+                if (topF > hi) { hi = topF; }
+                if (topF - vF < lo) { lo = topF - vF; }
             }
         }
         // 堆叠面积折线（confidence-band L/U 带、stream-graph）：与
@@ -2201,104 +2203,49 @@ class Chart {
     /// 系列（stack=0）只按绝对值计入（ECharts 轴量程覆盖组顶与
     /// 绝对值的最大者，绝对值不进累加和——多级控制混合图）。
     static int MaxStackGroupsW(List<ChartSeries> series, int n, int i0) {
-        int mx = 0;
-        for (int i = 0; i < n; i = i + 1) {
-            int oi = i0 + i;
-            List<string> grp = new List<string>();
-            List<int> sums = new List<int>();
-            List<int> absMx = new List<int>();
-            for (int s = 0; s < series.Count; s = s + 1) {
-                ChartSeries cs = series[s];
-                if (cs.hidden || oi >= cs.Count()) { continue; }
-                bool stacked = cs.stackName.Length > 0 || cs.stack != 0;
-                int gi = 0 - 1;
-                for (int g2 = 0; g2 < grp.Count; g2 = g2 + 1) {
-                    if (grp[g2] == cs.stackName) { gi = g2; break; }
-                }
-                if (gi < 0) {
-                    grp.Add(cs.stackName);
-                    sums.Add(0);
-                    absMx.Add(0);
-                    gi = grp.Count - 1;
-                }
-                int v = cs.Value(oi);
-                if (v > absMx[gi]) { absMx[gi] = v; }
-                if (stacked) { sums[gi] = sums[gi] + v; }
-            }
-            for (int g3 = 0; g3 < sums.Count; g3 = g3 + 1) {
-                int top = sums[g3] > absMx[g3] ? sums[g3] : absMx[g3];
-                if (top > mx) { mx = top; }
-            }
-        }
-        return mx;
+        return Chart.MaxBarStackGroupsW(series, n, i0);
     }
 
-    /// 堆叠柱（ECharts 2.2.x 负向堆积）的正侧组顶：各组正值
-    /// 依序累计，未堆叠系列按绝对值计入；负值不进正向累加
-    /// （bar.js 正负独立累加器，bar5：收入向右、支出向左）。
+    /// 堆叠柱（含逐系列 stackStrategy）在窗口内的**正侧组顶**最大值。
+    /// 逐点用 ChartView.StackTopAll 取各系列堆叠结果，取正的最大值；
+    /// 未堆叠系列按自身值参与（与旧 absMx 口径一致）。
     static int MaxBarStackGroupsW(List<ChartSeries> series, int n, int i0) {
         int mx = 0;
+        List<double> tops = new List<double>();
         for (int i = 0; i < n; i = i + 1) {
             int oi = i0 + i;
-            List<string> grp = new List<string>();
-            List<int> sums = new List<int>();
-            List<int> absMx = new List<int>();
+            tops.Clear();
+            ChartView.StackTopAll(series, oi, tops);
             for (int s = 0; s < series.Count; s = s + 1) {
                 ChartSeries cs = series[s];
                 if (cs.hidden || oi >= cs.Count()) { continue; }
                 bool stackedOne = cs.stackName.Length > 0 || cs.stack != 0;
-                int gi = 0 - 1;
-                for (int g2 = 0; g2 < grp.Count; g2 = g2 + 1) {
-                    if (grp[g2] == cs.stackName) { gi = g2; break; }
-                }
-                if (gi < 0) {
-                    grp.Add(cs.stackName);
-                    sums.Add(0);
-                    absMx.Add(0);
-                    gi = grp.Count - 1;
-                }
-                int v = cs.Value(oi);
-                if (v > absMx[gi]) { absMx[gi] = v; }
-                if (stackedOne && v > 0) { sums[gi] = sums[gi] + v; }
-            }
-            for (int g3 = 0; g3 < sums.Count; g3 = g3 + 1) {
-                int top = sums[g3] > absMx[g3] ? sums[g3] : absMx[g3];
-                if (top > mx) { mx = top; }
+                double top = s < tops.Count ? tops[s] : 0.0;
+                double cand = stackedOne ? top : cs.Number(oi);
+                int cF = (int)(cand >= 0.0 ? cand + 0.5 : cand - 0.5);
+                if (cF > mx) { mx = cF; }
             }
         }
         return mx;
     }
 
-    /// MaxBarStackGroupsW 的负侧对偶：各组负值依序累计出组底
-    /// （未堆叠系列只取自身的负值），返回值 ≤ 0。
+    /// MaxBarStackGroupsW 的负侧对偶：各组堆叠结果的负侧最小值，
+    /// 返回值 ≤ 0（原始值单位，与调用方 NiceMin 一致）。
     static int MinBarStackGroupsW(List<ChartSeries> series, int n, int i0) {
         int mn = 0;
+        List<double> tops = new List<double>();
         for (int i = 0; i < n; i = i + 1) {
             int oi = i0 + i;
-            List<string> grp = new List<string>();
-            List<int> sums = new List<int>();
-            List<int> absMn = new List<int>();
+            tops.Clear();
+            ChartView.StackTopAll(series, oi, tops);
             for (int s = 0; s < series.Count; s = s + 1) {
                 ChartSeries cs = series[s];
                 if (cs.hidden || oi >= cs.Count()) { continue; }
                 bool stackedOne = cs.stackName.Length > 0 || cs.stack != 0;
-                int gi = 0 - 1;
-                for (int g2 = 0; g2 < grp.Count; g2 = g2 + 1) {
-                    if (grp[g2] == cs.stackName) { gi = g2; break; }
-                }
-                if (gi < 0) {
-                    grp.Add(cs.stackName);
-                    sums.Add(0);
-                    absMn.Add(0);
-                    gi = grp.Count - 1;
-                }
-                int v = cs.Value(oi);
-                if (v < absMn[gi]) { absMn[gi] = v; }
-                if (stackedOne && v < 0) { sums[gi] = sums[gi] + v; }
-            }
-            for (int g3 = 0; g3 < sums.Count; g3 = g3 + 1) {
-                int bot = sums[g3] < absMn[g3] ? sums[g3] : absMn[g3];
-                if (bot < mn) { mn = bot; }
+                double top = s < tops.Count ? tops[s] : 0.0;
+                double cand = stackedOne ? top : cs.Number(oi);
+                int cF = (int)(cand >= 0.0 ? cand + 0.5 : cand - 0.5);
+                if (cF < mn) { mn = cF; }
             }
         }
         return mn;
@@ -4560,8 +4507,8 @@ class Chart {
                 if (xHi == ChartOption.Auto()) { xHi = Chart.XMaxFor(series, catY, x0.scale); }
                 if (xHi <= xLo) { xHi = xLo + 1; }
             } else {
-                // A11\uff1aminInterval/maxInterval 同样作用于 X 数值轴
-                // （axisNiceTicks.ts:263-264 的 isIntervalOrTime 不分轴\uff09。
+                // A11：minInterval/maxInterval 同样作用于 X 数值轴
+                // （axisNiceTicks.ts:263-264 的 isIntervalOrTime 不分轴）。
                 ChartSpan xsp = Chart.ClampNiceRange(
                     Chart.XMinFor(series, catY, x0.scale),
                     Chart.XMaxFor(series, catY, x0.scale), x0.scale,
@@ -5028,10 +4975,10 @@ class Chart {
             bool gridX = o.showGrid && x0.showGrid;
             // X 刻度同左/右轴取 nice 端点副本（xLo/xHi 已留白外扩）。
             int xspan = xTickHi - xTickLo;
-            // ---- A12 minorSplitLine\uff08X 数值轴\uff09----
+            // ---- A12 minorSplitLine（X 数值轴）----
             // CartesianAxisView.ts:170-200 同一函数按
             // isHorizontal 分支：x 轴画竖线。
-            // 类目轴不支持\uff08Axis.ts:204 返回空\uff09。
+            // 类目轴不支持（Axis.ts:204 返回空）。
             if (x0.minorSplitLineShow && !catY && !isTime
                 && x0.type == ChartAxisType.Value && xt > 0) {
                 StyleBox sMinorX = Style.Part(app, "chart", "minor-grid", "", "", "",

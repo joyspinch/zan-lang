@@ -1251,6 +1251,95 @@ partial class ChartView {
     }
 
     /// 堆叠组名称的索引，无则 -1（柱状图按 stackName 分组）。
+    /// ECharts stackStrategy 的组内累加（processor/dataStack.ts:112-165）。
+    /// 对一组共享 stack 的系列，逐系列算它在**本点**的堆叠顶端值，写进
+    /// into（与 rawVals 同序同长）。语义逐条对抄：
+    ///   sum 从**本系列自己的值**起算（源码 `let sum = targetData.get(
+    ///   stackedDimension, dataIndex)`）；
+    ///   再从本系列往前扫前驱 j = idx-1 .. 0，取第一个满足策略条件的
+    ///   前驱**结果**（不是原始值——链上前驱的结果已是它那条链的和）
+    ///   累加后 break（源码单次 break，不是全累加）；
+    ///   条件：all 恒真；positive 要求 val > 0；negative 要求 val < 0；
+    ///   samesign（缺省）要求“当前和与前驱值同号”（sum>=0&&val>0 或
+    ///   sum<=0&&val<0）。
+    /// **策略按系列各自取**：源码用 `targetStackInfo.seriesModel.get(
+    /// stackStrategy)`，即算第 idx 条时用第 idx 条自己的声明——同一
+    /// 堆叠组里各系列可以声明不同策略，故 strategies 是逐下标数组。
+    /// 找不到合格前驱时结果就是自己的值（源码 stackedOver = NaN）。
+    /// 于是“段的基线”= 结果 − 自己的值（无前驱时恰为 0），调用方不必
+    /// 再分辨正负累加器。
+    static void StackResults(List<double> rawVals, List<int> strategies,
+                             List<double> into) {
+        int n = rawVals.Count;
+        for (int idx = 0; idx < n; idx = idx + 1) {
+            int strategy = idx < strategies.Count ? strategies[idx] : 0;
+            double sum = rawVals[idx];
+            for (int j = idx - 1; j >= 0; j = j - 1) {
+                double val = into[j];
+                bool ok = false;
+                if (strategy == 1) { ok = true; }
+                else if (strategy == 2) { ok = val > 0.0; }
+                else if (strategy == 3) { ok = val < 0.0; }
+                else { ok = (sum >= 0.0 && val > 0.0) || (sum <= 0.0 && val < 0.0); }
+                if (ok) { sum = sum + val; break; }
+            }
+            into.Add(sum);
+        }
+    }
+
+    /// 整幅系列在**某一点**的堆叠顶端值（按 series 序，未堆叠系列即自身
+    /// 值）。分组口径与各渲染器一致：同 `stackName` 成一组（空 stackName
+    /// 也自成一组，与既有累加器行为一致）。逐系列沿组内前驱跑一次
+    /// StackResults，取末项。系列数很小（典型 2..10），每点 O(n²) 可接受。
+    /// 调用方拿 `top[si] − 自身值` 即该段基线。
+    static void StackTopAll(List<ChartSeries> series, int oi,
+                            List<double> into) {
+        int ns = series.Count;
+        for (int si = 0; si < ns; si = si + 1) {
+            into.Add(ChartView.StackTopAt(series, si, oi));
+        }
+    }
+
+    /// 同组内到 si 为止的堆叠链结果（= 该系列的堆叠顶端值）。
+    /// 未堆叠系列（无合格前驱）即自身值。
+    static double StackTopAt(List<ChartSeries> series, int si, int oi) {
+        ChartSeries sc = series[si];
+        if (!ChartView.IsStackedSeries(sc)) { return sc.Number(oi); }
+        List<double> raw = new List<double>();
+        List<int> sts = new List<int>();
+        for (int j = 0; j <= si; j = j + 1) {
+            ChartSeries sj = series[j];
+            if (sj.hidden || !ChartView.IsStackedSeries(sj)) { continue; }
+            if (sj.stackName != sc.stackName) { continue; }
+            raw.Add(sj.Number(oi));
+            sts.Add(sj.stackStrategy);
+        }
+        List<double> res = new List<double>();
+        ChartView.StackResults(raw, sts, res);
+        if (res.Count < 1) { return sc.Number(oi); }
+        return res[res.Count - 1];
+    }
+
+    /// 第 si 条系列在第 oi 点上的**堆叠基线**（= 该段应从哪条水平/垂直
+    /// 线起画）。语义 = ECharts processor/dataStack.ts 的 resultVal 减
+    /// 自身原始值：无合格前驱时恰为 0（段从零轴起画）。
+    /// 分组口径与各渲染器一致：同 `stackName` 成一组（空 stackName 也
+    /// 自成一组）。组内只算到 si 为止（含），策略逐系列取自各自声明。
+    /// 返回原始值单位（调用方按需 ×1000 转定点）。
+    static double StackBaseAt(List<ChartSeries> series, int si, int oi) {
+        ChartSeries sc = series[si];
+        if (!ChartView.IsStackedSeries(sc)) { return 0.0; }
+        return ChartView.StackTopAt(series, si, oi) - sc.Number(oi);
+    }
+
+    /// 本系列是否声明了堆叠组。ECharts dataStack.ts:44 的
+    /// `if (stack)` ——空 stack 的系列**不进任何堆叠组**（既不参与
+    /// 累加，也不作为前驱被后续系列读取），而不是“空名自成一组”。
+    /// 空名成组只对**列布局**（并排柱分组）成立。
+    static bool IsStackedSeries(ChartSeries s) {
+        return s.stackName.Length > 0 || s.stack != 0;
+    }
+
     static int GroupIndex(List<string> groups, string name) {
         for (int i = 0; i < groups.Count; i = i + 1) {
             if (groups[i] == name) { return i; }

@@ -134,18 +134,38 @@ partial class ChartView {
     /// 堆叠是**按 stack 组**分别累加的（ECharts 逐系列
     /// `isDimensionStacked(data, valueDim)`）：未声明 stack 的系列各自
     /// 独立，不与堆叠组相加。`stackIds` 与 `bars` 同序。
-    static List<double> PolarStackSums(List<ChartSeries> bars,
-                                       List<string> stackIds, int n) {
-        List<double> sums = new List<double>();
-        for (int i = 0; i < n; i = i + 1) { sums.Add(0.0); }
+    /// 每点的堆叠链结果顶值。ECharts 轴域取自
+    /// `stackResultDimension`（processor/dataStack.ts 按 stackStrategy
+    /// 算出的结果），而非“组内原始值直加”——后者只在
+    /// 全同号时等价，混号数据会把域撑大。
+    /// 返回：tops[si][i]（未堆叠系列即自身值）。
+    static List<List<double>> PolarStackTops(List<ChartSeries> bars,
+                                             List<string> stackIds, int n) {
+        List<List<double>> tops = new List<List<double>>();
         for (int si = 0; si < bars.Count; si = si + 1) {
-            if (stackIds[si].Length < 1) { continue; }
-            ChartSeries s = bars[si];
-            for (int i = 0; i < n && i < s.Count(); i = i + 1) {
-                sums[i] = sums[i] + s.Number(i);
+            List<double> row = new List<double>();
+            for (int i = 0; i < n; i = i + 1) {
+                ChartSeries self = bars[si];
+                if (!ChartView.IsStackedSeries(self)) {
+                    row.Add(self.Number(i));
+                    continue;
+                }
+                List<double> raw = new List<double>();
+                List<int> sts = new List<int>();
+                for (int sj = 0; sj <= si; sj = sj + 1) {
+                    ChartSeries s2 = bars[sj];
+                    if (!ChartView.IsStackedSeries(s2)) { continue; }
+                    if (stackIds[sj] != stackIds[si]) { continue; }
+                    raw.Add(s2.Number(i));
+                    sts.Add(s2.stackStrategy);
+                }
+                List<double> res = new List<double>();
+                ChartView.StackResults(raw, sts, res);
+                row.Add(res.Count > 0 ? res[res.Count - 1] : self.Number(i));
             }
+            tops.Add(row);
         }
-        return sums;
+        return tops;
     }
 
     /// 极坐标值轴的数据域。类目轴无域；值轴按 stack 组累加和（或未堆叠
@@ -161,28 +181,15 @@ partial class ChartView {
         double dLo = 0.0;
         double dHi = 0.0;
         bool any = false;
-        // 堆叠组的累加和（未堆叠系列不进这张表）。
-        List<double> sums = ChartView.PolarStackSums(bars, stackIds, n);
-        for (int i = 0; i < sums.Count; i = i + 1) {
-            bool inStack = false;
-            for (int si = 0; si < bars.Count; si = si + 1) {
-                if (stackIds[si].Length > 0 && i < bars[si].Count()) {
-                    inStack = true;
-                }
-            }
-            if (!inStack) { continue; }
-            if (!any || sums[i] > dHi) { dHi = sums[i]; }
-            if (!any || sums[i] < dLo) { dLo = sums[i]; }
-            any = true;
-        }
-        // 未堆叠系列逐值参与。
+        // 逐系列：堆叠系列取链结果（ECharts axisHelper.ts:270
+        // getDataDimensionsOnAxis 把原始 dim 映到 stackResultDimension），
+        // 未堆叠系列取原始值（PolarStackTops 已处理）。
+        List<List<double>> tops = ChartView.PolarStackTops(bars, stackIds, n);
         for (int si = 0; si < bars.Count; si = si + 1) {
-            if (stackIds[si].Length > 0) { continue; }
-            ChartSeries s = bars[si];
-            for (int i = 0; i < s.Count(); i = i + 1) {
-                double v = s.Number(i);
-                if (!any || v > dHi) { dHi = v; }
-                if (!any || v < dLo) { dLo = v; }
+            List<double> row = tops[si];
+            for (int i = 0; i < row.Count && i < bars[si].Count(); i = i + 1) {
+                if (!any || row[i] > dHi) { dHi = row[i]; }
+                if (!any || row[i] < dLo) { dLo = row[i]; }
                 any = true;
             }
         }

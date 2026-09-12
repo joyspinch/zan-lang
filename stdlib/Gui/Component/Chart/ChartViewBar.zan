@@ -143,15 +143,9 @@ partial class ChartView {
             }
             int ng = grp.Count;
             if (ng < 1) { ng = 1; }
-            // 累加器 long：亿级值 ×1000 定点后 8.6e10 超 int32，
-            // 堆叠累计随之升宽（candlestick-touch 成交量堆不上的根因）。
-            List<long> accs = new List<long>();
-            for (int ai = 0; ai < ng; ai = ai + 1) { accs.Add(0); }
-            // 负向堆积（ECharts 2.2.x bar.js）：正负各持独立累加器，
-            // 负值段从零轴向反方向生长，不与正向累计相加（bar5：
-            // 收入向右、支出向左互不重叠）。
-            List<long> negAccs = new List<long>();
-            for (int ai = 0; ai < ng; ai = ai + 1) { negAccs.Add(0); }
+            // 段的基线与累加全部由 ChartView.StackBaseAt 按 ECharts
+            // processor/dataStack.ts 的 stackStrategy 链给出（不再持有
+            // 正负双累加器——那条快捷路在“负值后跟 0”时与官方不一致）。
             // 每组最后（最顶）一个序列：只有它带圆角顶，
             // 使堆叠色带以平整直角相接，与 ECharts 一致。
             List<int> topSi = new List<int>();
@@ -166,7 +160,6 @@ partial class ChartView {
             }
             for (int i = 0; i < n; i = i + 1) {
                 int oi = i0 + i;
-                for (int a2 = 0; a2 < ng; a2 = a2 + 1) { accs[a2] = 0; negAccs[a2] = 0; }
                 for (int si = 0; si < ns; si = si + 1) {
                     ChartSeries sc = series[si];
                     if (!sc.hidden && ChartView.IsBarFamily(sc.type)) {
@@ -195,8 +188,10 @@ partial class ChartView {
                         }
                         // 负向堆积：负值段挂在本组负累加器上，从零轴向
                         // 下方生长；正值段照旧从正累加器顶向上。
-                        bool segNeg = vF < 0;
-                        long segBase = segNeg ? negAccs[gi] : accs[gi];
+                        // A9：基线取 stackStrategy 链的结果
+                        // 减自己值（无前驱时恰为 0）。
+                        long segBase = (long)(ChartView.StackBaseAt(series, si, oi)
+                            * 1000.0 + (vF >= 0 ? 0.5 : 0 - 0.5)) - vF;
                         // vF 是 ×1000 定点，堆叠和×g(0..1000) 必超 int32，
                         // 全程 long 走 YOfFL。
                         int yTop = f.YOfFL((segBase + vF) * (long)g / 1000L, 0);
@@ -249,8 +244,6 @@ partial class ChartView {
                             ChartView.StrokeRect(c, bx, segY0, barW,
                                 segY1 - segY0, sBcol, app.Scale(sBwid));
                         }
-                        if (segNeg) { negAccs[gi] = negAccs[gi] + vF; }
-                        else { accs[gi] = accs[gi] + vF; }
                         // 数值标签（ECharts 堆叠 label position）：
                         // "top" 在段上方、"bottom" 在段下方、
                         // "insideTop" 段内顶部，缺省段内垂直居中；
@@ -1088,12 +1081,9 @@ partial class ChartView {
             }
             int ng = grp.Count;
             if (ng < 1) { ng = 1; }
-            List<int> accs = new List<int>();
-            for (int ai = 0; ai < ng; ai = ai + 1) { accs.Add(0); }
-            // 负向堆积（ECharts 2.2.x bar.js）：正负独立累加器，
-            // 负值段从零轴向反方向生长（bar5：收入向右、支出向左）。
-            List<int> negAccs = new List<int>();
-            for (int ai = 0; ai < ng; ai = ai + 1) { negAccs.Add(0); }
+            // 段的基线与累加由 ChartView.StackBaseAt 按 ECharts
+            // processor/dataStack.ts 的 stackStrategy 链给出（正负双
+            // 累加器的快捷路在“负值后跟 0”时与官方不一致）。
             List<int> topSi = new List<int>();
             for (int ti = 0; ti < ng; ti = ti + 1) { topSi.Add(0 - 1); }
             for (int ts = 0; ts < ns; ts = ts + 1) {
@@ -1106,7 +1096,6 @@ partial class ChartView {
             }
             for (int i = 0; i < n; i = i + 1) {
                 int rowY = plotY + i * rowH;
-                for (int a2 = 0; a2 < ng; a2 = a2 + 1) { accs[a2] = 0; negAccs[a2] = 0; }
                 for (int si = 0; si < ns; si = si + 1) {
                     ChartSeries sc = series[si];
                     if (!sc.hidden) {
@@ -1123,8 +1112,13 @@ partial class ChartView {
                                 v = (int)((long)sc.Value(sdi) * g / 1000L);
                             }
                         }
-                        bool segNeg = v < 0;
-                        int segBase = segNeg ? negAccs[gi] : accs[gi];
+                        // A9：基线取 stackStrategy 链（含逐系列策略）的结果
+                        // 减自身值，与纵向柱同一语义；正负双累加器的
+                        // 快捷路在“负值后跟 0”时与官方不一致。
+                        double baseRaw = ChartView.StackBaseAt(series, si, sdi);
+                        long baseF = (long)(baseRaw * 1000.0
+                            + (baseRaw >= 0.0 ? 0.5 : 0 - 0.5));
+                        int segBase = (int)(baseF * (long)g / 1000L);
                         int x0 = Chart.ValueX(plotX, plotW, lo, hi, segBase);
                         int x1 = Chart.ValueX(plotX, plotW, lo, hi, segBase + v);
                         int drawX = x0;
@@ -1199,8 +1193,6 @@ partial class ChartView {
                                 }
                             }
                         }
-                        if (segNeg) { negAccs[gi] = negAccs[gi] + v; }
-                        else { accs[gi] = accs[gi] + v; }
                     }
                 }
             }
