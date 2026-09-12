@@ -1,0 +1,623 @@
+using System;
+using System.IO;
+using Gui;
+using Gui.Widget;
+using Legend;
+
+/// 登录流五页 —— 原版「登录窗 → 选区 → 建角 → 主窗」的窗口序。参考图
+/// `01_login`/`02_register`/`03_changepw`/`04_realm`/`05_createchar` 各一张
+/// 548×582（逐项实测与偏差登记见 REFERENCE_AUDIT.md §5.6）。
+///
+/// 三条定式（不照抄会踩的坑）：
+///  1. **回调只改状态**，界面由 120ms 刻度上的 `LgPump()` 按 `lgPage` /
+///     `LgKey()` 的变化重建。在按钮自己的回调里同步重建容器会拆掉当前这次
+///     点击的派发链（表单页 state-only 回调 + 轮询重建定式）。
+///  2. 落位全用**设备像素**：Spec 的 Lg* 直接给「内容区设备像素」（= 参考图
+///     坐标 − 内容原点 (4,49)），`Place()/Prefer()` 都不经 CSS/DPI 换算。文字
+///     只给「墨」坐标，盒由 `LgTextTop/LgTextX` 反推（口径见 Spec 顶部）。
+///     内容原点 = 根面板 (0,0)：窗口客户区高 385 逻辑（= 578 设备）里含
+///     自绘标题栏 48（`ContentTop()`），故 530 = 578 − 48 正好是内容区。
+///  3. 窗口**小窗长大**：登录流期间客户区 360×385（逻辑），进世界那一步才
+///     `SetClientSize` 长成主窗、摘掉登录根面板（见 `LgEnterWorld`）。
+///
+/// 已知偏差（参考图没有、本版加的，逐条记在审计里）：
+///   · 提示行：五页参考图都是干净态，本版把 net 回话/连接状态放各页空区居中；
+///   · 页 1 两个输入框没有标签，本版给 hinte（账号/密码）当占位；
+///   · 职/性别徽记：原版是石头徽记（assets 里没有，全库 NCC 最高 0.62），
+///     本版用立绘 ui/00043..00048（= 原版 face 111..116 的等比放大）；
+///   · 喇叭：Tabler 图标包没有 volume-off，静音态用 volume + 变暗表示；
+///   · 选中态：参考图是未选状态（五块一样），故初始不高亮，点过才描蓝框。
+partial class LegendApp {
+    /* ---- 状态 ---- */
+    bool lgOn = false;                 // 登录流是否接管窗口
+    bool lgOffline = false;            // 离线演示（不拨号，页序本地推）
+    Panel lgRoot;
+    string lgPage = "login";
+    string lgRenderPage = "";
+    string lgRenderKey = "";
+    string lgMsg = "";
+    string lgRememberFile = "data/login.txt";
+
+    /* 输入草稿：控件每次重建都换，值留在字段上——`框.data = 字段` 是编译器的
+       实时绑定（Get 读字段 / Set 回写），换页回来还是上次的内容。别改成
+       SignalString：`Binding<string>` 只收 string 左值（同 PageRedPack 注释）。 */
+    string lgUser = ""; string lgPass = ""; string lgPass2 = ""; string lgEmail = "";
+    string lgOld = ""; string lgNew = ""; string lgNew2 = "";
+    string lgName = "";
+
+    /* 勾选态用 SignalBool：Checkbox 的 model 就是信号，重建后把上次的勾选
+       带过来（换成 bool 字段得自己回填 SetChecked，多一条同步路径）。 */
+    SignalBool lgRemember; SignalBool lgAgree; SignalBool lgMailNew;
+
+    int lgJob = 0; int lgGender = 0;    // 选中的职业 / 性别（= 栅格行列）
+    bool lgTilePicked = false;          // 参考图是未选态，点过才高亮
+    int lgRealm = 0; string lgRealmName = "";
+    bool lgMuted = false;
+    string lgSeenForm = "";            // formMsg 去重（服务端字段不会自己清）
+
+    // =====================================================================
+    //  起停
+    // =====================================================================
+    /// 起登录流：备信号、建登录根面板、画第一页。`offline` 为真时不拨号，
+    /// 页序（登录→分区→建角→主窗）全在本地推，供无服务器实机验证。
+    void LgBegin(bool offline) {
+        lgOn = true; lgOffline = offline;
+        /* 登录窗是「游戏启动器」不是通用工具窗：标题栏去掉**置顶**与**皮肤
+           选择**（原版登录器没有这两样，皮肤抽屉还会盖住 540×530 的小窗）。
+           最小化/最大化/关闭保留——关窗是唯一的退出通道。 */
+        app.SetChromeButtons(false, false, true, true);
+        lgPage = "login"; lgMsg = ""; lgSeenForm = "";
+        lgJob = 0; lgGender = 0; lgTilePicked = false;
+        lgRealm = 0; lgRealmName = "";
+        lgRemember = new SignalBool(LgRemembered().Length > 0);
+        lgAgree = new SignalBool(false);
+        lgMailNew = new SignalBool(false);
+        lgUser = LgRemembered();
+        lgPass = ""; lgPass2 = ""; lgEmail = "";
+        lgOld = ""; lgNew = ""; lgNew2 = ""; lgName = "";
+        lgRoot = Panel.Root("lg-root");
+        lgRoot.Pad(0); lgRoot.Class = "lg-root"; lgRoot.DockFill();
+        form.Add(lgRoot);
+        lgRenderPage = ""; lgRenderKey = "";
+        LgBuild();
+    }
+
+    /// 进世界：窗口长大、摘登录根、建主窗壳。登录流到此为止（`lgOn=false`
+    /// 之后 120ms/1000ms 刻度才走主窗那条路）。
+    void LgEnterWorld() {
+        lgOn = false;
+        if (lgRoot != null) { form.Remove(lgRoot); lgRoot = null; }
+        if (lgOffline) {
+            form.SetTitle("迷你传奇 · 离线");
+        } else if (lgRealmName.Length > 0) {
+            form.SetTitle("迷你传奇 · " + lgRealmName);
+        } else {
+            form.SetTitle("迷你传奇");
+        }
+        app.SetClientSize(Spec.WindowW(), Spec.WindowH());
+        /* 主窗壳 + 首页 + 数值刷新，与 Run() 启动那条路一致。尺寸变了要让
+           120ms 刻度重新量一遍（lastClient* 清成 -1）。 */
+        BuildShell();
+        BuildPage();
+        Refresh();
+        lastClientW = -1; lastClientH = -1;
+        lastNetKey = net.DataVersion();
+    }
+
+    // =====================================================================
+    //  小工厂（全部落位到 lgRoot）
+    // =====================================================================
+    /// 墨坐标 → 标签盒：`inkX` 墨左、`inkCentre` 墨心（都是内容区设备像素），
+    /// 盒尺寸由调用方给（宽度决定会不会被省略号截断，见 .rp-label 的教训）。
+    Label LgInk(string s, string cls, int inkX, int inkCentre, int boxW, int boxH) {
+        Label l = Text(s, cls, 0);
+        l.DockManual();
+        l.Place(Spec.LgTextX(inkX), Spec.LgTextTop(inkCentre, boxH));
+        l.Prefer(boxW, boxH);
+        l.NoOverlapCheck();
+        lgRoot.Add(l);
+        return l;
+    }
+
+    /// 五页共用的标题（墨左 41 / 墨心 28，五张参考图逐张一致）。
+    void LgTitle(string s) {
+        LgInk(s, "lg-title", Spec.LgTitleXInk(), Spec.LgTitleInk(),
+              Spec.LgTitleW(), Spec.LgTitleH());
+    }
+
+    /// 输入框（不含 `.data` 绑定——绑定要求字段名出现在赋值现场，故由页面里
+    /// 自己写 `框.data = 字段`）。
+    Input LgBoxDev(int x, int y, int w, int h, string hint, bool pw) {
+        Input inp = new Input(hint);
+        inp.Class = "lg-box";
+        inp.password = pw;
+        inp.DockManual(); inp.Place(x, y); inp.Prefer(w, h);
+        inp.NoOverlapCheck();
+        return inp;
+    }
+
+    /// 行标签：页 2 左对齐（墨 44）、页 3 右对齐（墨右 106）——同字号，只有
+    /// 容器的 justify 不同。右对齐必须靠容器 flex（Label 永远左对齐）。
+    void LgRowLabel(string s, bool rightAlign, int inkCentre) {
+        Label l = Text(s, "lg-label", 0);
+        if (!rightAlign) {
+            l.DockManual();
+            l.Place(Spec.LgRowLabelX(), Spec.LgTextTop(inkCentre, Spec.LgLabelH()));
+            l.Prefer(Spec.LgRowLabelW(), Spec.LgLabelH());
+            l.NoOverlapCheck();
+            lgRoot.Add(l);
+            return;
+        }
+        Panel row = Panel.Row(); row.Class = "lg-rowhost-end";
+        row.Pad(0); row.NoOverlapCheck();
+        row.DockManual();
+        row.Place(Spec.LgRowLabelR() - Spec.LgRowLabelW(),
+                  Spec.LgTextTop(inkCentre, Spec.LgLabelH()));
+        row.Prefer(Spec.LgRowLabelW(), Spec.LgLabelH());
+        row.With(l);
+        lgRoot.Add(row);
+    }
+
+    /// 提示行（参考图没有这块，本版加）：只在有话说时占位，居中一行。
+    void LgMsgRow(int inkCentre) {
+        string t = LgMsgText();
+        if (t.Length == 0) { return; }
+        Panel row = CenterRow(t, "lg-center", "lg-msg", Spec.LgW(), Spec.LgMsgH());
+        row.DockManual(); row.Place(0, Spec.LgTextTop(inkCentre, Spec.LgMsgH()));
+        row.NoOverlapCheck();
+        lgRoot.Add(row);
+    }
+
+    /// 两钮行（页 1「修改密码/登录」、页 2/3「申请新账号|修改密码 / 返回」）。
+    void LgBtnPair(int y, string left, Action lf, string right, Action rf) {
+        Button a = BtnDev(left, "lg-btn", Spec.LgBtnW(), Spec.LgBtnH(), lf);
+        a.DockManual(); a.Place(Spec.LgBoxX(), y);
+        lgRoot.Add(a);
+        Button b = BtnDev(right, "lg-btn", Spec.LgBtn2W(), Spec.LgBtnH(), rf);
+        b.DockManual(); b.Place(Spec.LgBtn2X(), y);
+        lgRoot.Add(b);
+    }
+
+    /// 满宽钮（页 1「创建免费账号」、页 5「创建角色并进入游戏」）。
+    void LgBigBtn(string s, Action fn) {
+        Button b = BtnDev(s, "lg-btn", Spec.LgBigBtnW(), Spec.LgBigBtnH(), fn);
+        b.DockManual(); b.Place(Spec.LgBoxX(), Spec.LgBigBtnY());
+        lgRoot.Add(b);
+    }
+
+    /// 页 1 下块（底 #1d2633 + 顶 2 设备高光）。它是纯背景：文字/按钮仍挂在
+    /// lgRoot 上按绝对坐标落位，后加者画在上面——挂进块里就得再算一次边框
+    /// 内缩（内缩 2），白添一处对不齐的机会。
+    void LgLower() {
+        Panel low = Panel.Row(); low.Class = "lg-lower";
+        low.Pad(0); low.NoOverlapCheck();
+        low.DockManual(); low.Place(0, Spec.LgLowerY());
+        low.Prefer(Spec.LgW(), Spec.LgLowerH());
+        lgRoot.Add(low);
+    }
+
+    // =====================================================================
+    //  页 1「请登录」
+    // =====================================================================
+    void LgBuildLogin() {
+        LgTitle("请登录");
+
+        Input u = LgBoxDev(Spec.LgBoxX(), Spec.LgRowY(0), Spec.LgBoxW(), Spec.LgBoxH(),
+                           "账号", false);
+        u.MaxLen = 32;
+        u.data = lgUser;
+        u.Submit += () => { LgDoLogin(); };
+        lgRoot.Add(u);
+
+        Input p = LgBoxDev(Spec.LgBoxX(), Spec.LgRowY(1), Spec.LgBoxW(), Spec.LgBoxH(),
+                           "密码", true);
+        p.MaxLen = 64;
+        p.data = lgPass;
+        p.Submit += () => { LgDoLogin(); };
+        lgRoot.Add(p);
+
+        /* 喇叭钮：灰框方钮，图标居中。图标边长 20 逻辑 = 30 设备，`Place(8,8)`
+           = (46−30)/2；Tabler `volume-2` 在 30 设备方框里墨约 20×22，正好
+           落在参考图的 459..482 / 209..230 上。 */
+        Panel spk = Panel.Row(); spk.Class = "lg-spk";
+        spk.Pad(0); spk.NoOverlapCheck();
+        spk.DockManual();
+        spk.Place(Spec.LgSpkX(), Spec.LgSpkY());
+        spk.Prefer(Spec.LgSpkS(), Spec.LgSpkS());
+        spk.OnClick(() => { lgMuted = !lgMuted; });
+        int icDev = Spec.Px(Spec.LgSpkIcon());
+        IconView ic = new IconView(lgMuted ? "volume" : "volume-2", Spec.LgSpkIcon());
+        ic.DockManual();
+        ic.Place((Spec.LgSpkS() - icDev) / 2, (Spec.LgSpkS() - icDev) / 2);
+        ic.Prefer(icDev, icDev); ic.NoOverlapCheck();
+        spk.Add(ic);
+        lgRoot.Add(spk);
+
+        Checkbox cb = Checkbox.Bind("记住我的账户", lgRemember);
+        cb.Class = "lg-chk";
+        cb.DockManual();
+        cb.Place(Spec.LgChkX(), Spec.LgChkY(Spec.LgChkInkLogin()));
+        cb.Prefer(Spec.LgChkLabelW(), Spec.LgChkS());
+        cb.NoOverlapCheck();
+        lgRoot.Add(cb);
+
+        LgBtnPair(Spec.LgBtnPairYLogin(), "修改密码", () => { LgGo("changepw"); },
+                  "登录", () => { LgDoLogin(); });
+
+        LgLower();
+        LgMsgRow(Spec.LgMsgInkLogin());
+        Panel foot = CenterRow("初次使用没有账号?", "lg-center", "lg-foot",
+                               Spec.LgW(), Spec.LgFootH());
+        foot.DockManual();
+        foot.Place(0, Spec.LgTextTop(Spec.LgFootInk(), Spec.LgFootH()));
+        foot.NoOverlapCheck();
+        lgRoot.Add(foot);
+        LgBigBtn("创建免费账号", () => { LgGo("register"); });
+    }
+
+    // =====================================================================
+    //  页 2「创建新账号」
+    // =====================================================================
+    void LgBuildRegister() {
+        LgTitle("创建新账号");
+        string[] lbl = new string[] { "账号：", "密码：", "确认：", "邮箱：" };
+        for (int i = 0; i < 4; i = i + 1) {
+            LgRowLabel(lbl[i], false, Spec.LgRowInk(i));
+        }
+
+        Input a = LgBoxDev(Spec.LgSplitX(), Spec.LgRowY(0), Spec.LgSplitW(),
+                           Spec.LgBoxH(), "", false);
+        a.MaxLen = 32; a.data = lgUser;
+        lgRoot.Add(a);
+        Input b = LgBoxDev(Spec.LgSplitX(), Spec.LgRowY(1), Spec.LgSplitW(),
+                           Spec.LgBoxH(), "", true);
+        b.MaxLen = 64; b.data = lgPass;
+        lgRoot.Add(b);
+        Input c = LgBoxDev(Spec.LgSplitX(), Spec.LgRowY(2), Spec.LgSplitW(),
+                           Spec.LgBoxH(), "", true);
+        c.MaxLen = 64; c.data = lgPass2;
+        lgRoot.Add(c);
+        Input d = LgBoxDev(Spec.LgSplitX(), Spec.LgRowY(3), Spec.LgSplitW(),
+                           Spec.LgBoxH(), "", false);
+        d.MaxLen = 64; d.data = lgEmail;
+        lgRoot.Add(d);
+
+        Checkbox cb = Checkbox.Bind("同意许可协议", lgAgree);
+        cb.Class = "lg-chk";
+        cb.DockManual();
+        cb.Place(Spec.LgChkX(), Spec.LgChkY(Spec.LgChkInkAcct()));
+        cb.Prefer(Spec.LgChkLabelW(), Spec.LgChkS());
+        cb.NoOverlapCheck();
+        lgRoot.Add(cb);
+
+        LgMsgRow(Spec.LgMsgInkAcct());
+        LgBtnPair(Spec.LgBtnPairYAcct(), "申请新账号", () => { LgDoRegister(); },
+                  "返回", () => { LgGo("login"); });
+    }
+
+    // =====================================================================
+    //  页 3「修改密码」
+    // =====================================================================
+    void LgBuildChangePw() {
+        LgTitle("修改密码");
+        string[] lbl = new string[] { "账号：", "原密码：", "新密码：", "确认：" };
+        for (int i = 0; i < 4; i = i + 1) {
+            LgRowLabel(lbl[i], true, Spec.LgRowInk(i));
+        }
+
+        Input a = LgBoxDev(Spec.LgSplitX(), Spec.LgRowY(0), Spec.LgSplitW(),
+                           Spec.LgBoxH(), "", false);
+        a.MaxLen = 32; a.data = lgUser;
+        lgRoot.Add(a);
+        Input o = LgBoxDev(Spec.LgSplitX(), Spec.LgRowY(1), Spec.LgSplitW(),
+                           Spec.LgBoxH(), "", true);
+        o.MaxLen = 64; o.data = lgOld;
+        lgRoot.Add(o);
+        Input n = LgBoxDev(Spec.LgSplitX(), Spec.LgRowY(2), Spec.LgSplitW(),
+                           Spec.LgBoxH(), "", true);
+        n.MaxLen = 64; n.data = lgNew;
+        lgRoot.Add(n);
+        Input c = LgBoxDev(Spec.LgSplitX(), Spec.LgRowY(3), Spec.LgSplitW(),
+                           Spec.LgBoxH(), "", true);
+        c.MaxLen = 64; c.data = lgNew2;
+        lgRoot.Add(c);
+
+        Checkbox cb = Checkbox.Bind("发送新密码到注册邮箱", lgMailNew);
+        cb.Class = "lg-chk";
+        cb.DockManual();
+        cb.Place(Spec.LgChkX(), Spec.LgChkY(Spec.LgChkInkAcct()));
+        cb.Prefer(Spec.LgChkLabelW(), Spec.LgChkS());
+        cb.NoOverlapCheck();
+        lgRoot.Add(cb);
+
+        LgMsgRow(Spec.LgMsgInkAcct());
+        LgBtnPair(Spec.LgBtnPairYAcct(), "修改密码", () => { LgDoChangePw(); },
+                  "返回", () => { LgGo("login"); });
+    }
+
+    // =====================================================================
+    //  页 4「分区」
+    // =====================================================================
+    void LgBuildRealm() {
+        Panel tab = Panel.Row(); tab.Class = "lg-tab";
+        tab.Pad(0); tab.NoOverlapCheck();
+        tab.DockManual(); tab.Place(Spec.LgTabX(), Spec.LgTabY());
+        tab.Prefer(Spec.LgTabW(), Spec.LgTabH());
+        lgRoot.Add(tab);
+        /* 标签字挂在 lgRoot 上、盒与 tab 完全重合（不是 tab 的子控件）：子控件
+           会落在 tab 的边框内缘（+1 设备），字心就跟着偏一像素。 */
+        Panel tabText = CenterRow("分区", "lg-center", "lg-tabtext",
+                                  Spec.LgTabW(), Spec.LgTabH());
+        tabText.DockManual();
+        tabText.Place(Spec.LgTabX(), Spec.LgTabY());
+        tabText.NoOverlapCheck();
+        lgRoot.Add(tabText);
+
+        Panel list = Panel.Row(); list.Class = "lg-panel";
+        list.Pad(0); list.NoOverlapCheck();
+        list.DockManual(); list.Place(Spec.LgPanelX(), Spec.LgPanelY());
+        list.Prefer(Spec.LgPanelW(), Spec.LgPanelH());
+        lgRoot.Add(list);
+
+        for (int i = 0; i < LgRealmCount(); i = i + 1) { LgBuildRealmRow(i); }
+        LgMsgRow(Spec.LgMsgInkRealm());
+    }
+
+    /// 一行区服（行钮：灰框蓝字居中）。名字/id 取**局部变量**再进闭包——
+    /// 别让闭包捕获循环变量 i。
+    void LgBuildRealmRow(int i) {
+        string nm = LgRealmName(i);
+        int rid = LgRealmId(i);
+        Button b = BtnDev(nm, "lg-rowbtn", Spec.LgRealmRowW(), Spec.LgRealmRowH(),
+                          () => { LgPickRealm(rid, nm); });
+        b.DockManual();
+        b.Place(Spec.LgRealmRowX(), Spec.LgRealmRowY(i));
+        lgRoot.Add(b);
+    }
+
+    // =====================================================================
+    //  页 5「创建角色」
+    // =====================================================================
+    void LgBuildCreateChar() {
+        LgTitle("创建角色");
+        LgInk("请输入一个名字：", "lg-hint", Spec.LgNameXInk(), Spec.LgNameInk(),
+              Spec.LgNameHintW(), Spec.LgNameHintH());
+
+        Input nm = LgBoxDev(Spec.LgBoxX(), Spec.LgNameBoxY(), Spec.LgBoxW(),
+                            Spec.LgBoxH(), "角色名", false);
+        nm.MaxLen = 12;
+        nm.data = lgName;
+        nm.Submit += () => { LgDoCreate(); };
+        lgRoot.Add(nm);
+
+        /* 六格立绘：上行男、下行女，列序 战/法/道——用户定式「一排男一排女
+           战法道」。每格自带 (职, 性) 一对，选中态记在 `lgJob/lgGender` 上。 */
+        for (int r = 0; r < Spec.LgTileRows(); r = r + 1) {
+            for (int c = 0; c < Spec.LgTileCols(); c = c + 1) { LgTile(c, r); }
+        }
+        LgMsgRow(Spec.LgMsgInkChar());
+        LgBigBtn("创建角色并进入游戏", () => { LgDoCreate(); });
+    }
+
+    /// 一格立绘（行 `r` = 性别、列 `c` = 职业）：立绘 66×55 + 下方居中名牌。
+    /// 选中的描蓝框（`.lg-tile-on`）。立绘号由 (职, 性) 一起定 —— `Spec.LgFaceNum`。
+    void LgTile(int c, int r) {
+        int x = Spec.LgTileX(c);
+        int y = Spec.LgTileY(r);
+        bool on = lgTilePicked && lgJob == c && lgGender == r;
+        Panel t = Panel.Row(); t.Class = on ? "lg-tile lg-tile-on" : "lg-tile";
+        t.Pad(0); t.NoOverlapCheck();
+        t.DockManual(); t.Place(x, y);
+        t.Prefer(Spec.LgTileW(), Spec.LgTileH());
+        t.OnClick(() => { LgPickTile(c, r); });
+        Image im = new Image("assets/ui/000" + Rules.N(Spec.LgFaceNum(c, r)) + ".jpg",
+                             Spec.LgJobName(c), "cover");
+        im.Prefer(Spec.LgTileW(), Spec.LgTileH());
+        t.Add(im);
+        lgRoot.Add(t);
+
+        Panel row = CenterRow(Spec.LgJobName(c), "lg-center", "lg-hint",
+                              Spec.LgTileW(), Spec.LgTileLabelH());
+        row.DockManual();
+        row.Place(x, Spec.LgTextTop(Spec.LgTileInk(r), Spec.LgTileLabelH()));
+        row.NoOverlapCheck();
+        lgRoot.Add(row);
+    }
+
+    // =====================================================================
+    //  动作（一律只改状态，界面交给 LgPump 重建）
+    // =====================================================================
+    /// 换页只落一个状态；清空交给 `LgResetPage`——页序有两条来源（用户点钮
+    /// 走 `LgGo`，服务端状态推进走 `LgPump`/`LgPickRealm` 直接改 `lgPage`），
+    /// 在 LgGo 里清会漏掉后者。
+    void LgGo(string p) { lgPage = p; lgMsg = ""; lgSeenForm = ""; }
+
+    /// 进一页 = 一张全新的表单：参考图五页里，除页 1 的「记住我的账户」预填
+    /// 之外**每个输入框都是空的**（实测页 2/3/5 框内墨像素 0）。清空放在
+    /// `LgBuild` 里「页真的变了」那一次、且必须在 `RemoveAll()` **之后**——
+    /// 输入框析构时会把值回写给 `data` 绑定的字段，先清后删等于白清。
+    void LgResetPage(string p) {
+        lgMsg = ""; lgSeenForm = "";
+        if (!lgOffline) { net.SetFormMsg(""); }
+        if (p == "login") {
+            lgUser = LgRemembered(); lgPass = "";
+        } else if (p == "register") {
+            lgUser = ""; lgPass = ""; lgPass2 = ""; lgEmail = "";
+            lgAgree.Set(false);
+        } else if (p == "changepw") {
+            lgUser = ""; lgOld = ""; lgNew = ""; lgNew2 = "";
+            lgMailNew.Set(false);
+        } else if (p == "createchar") {
+            lgName = ""; lgJob = 0; lgGender = 0; lgTilePicked = false;
+        }
+    }
+
+    /// 选一格立绘 = 同时定下职业与性别。
+    void LgPickTile(int c, int r) { lgJob = c; lgGender = r; lgTilePicked = true; }
+
+    void LgPickRealm(int id, string nm) {
+        lgRealm = id; lgRealmName = nm;
+        if (lgOffline) { lgPage = "createchar"; lgMsg = ""; return; }
+        lgMsg = "正在进入 " + nm + "…";
+        net.EnterRealm(id, nm);
+    }
+
+    void LgDoLogin() {
+        string u = lgUser.Trim();
+        if (u.Length == 0) { lgMsg = "请输入账号。"; return; }
+        if (lgPass.Length == 0) { lgMsg = "请输入密码。"; return; }
+        LgSaveRemembered(lgRemember.Get() ? u : "");
+        if (lgOffline) { lgPage = "realm"; lgMsg = ""; return; }
+        lgMsg = "正在登录…";
+        net.Login(u, lgPass);
+    }
+
+    void LgDoRegister() {
+        string u = lgUser.Trim();
+        if (u.Length < 3) { lgMsg = "账号需 3-32 个字符。"; return; }
+        if (lgPass.Length < 6) { lgMsg = "密码需 6-64 位。"; return; }
+        if (lgPass != lgPass2) { lgMsg = "两次输入的密码不一致。"; return; }
+        if (!lgAgree.Get()) { lgMsg = "请先勾选同意许可协议。"; return; }
+        if (lgOffline) {
+            lgMsg = "离线演示：账号已在本地校验通过，返回登录即可。";
+            return;
+        }
+        lgMsg = "正在提交注册…";
+        net.Register(u, lgPass, lgEmail.Trim());
+    }
+
+    void LgDoChangePw() {
+        string u = lgUser.Trim();
+        if (u.Length == 0) { lgMsg = "请输入账号。"; return; }
+        if (lgOld.Length == 0) { lgMsg = "请输入原密码。"; return; }
+        if (lgNew.Length < 6) { lgMsg = "新密码需 6-64 位。"; return; }
+        if (lgNew != lgNew2) { lgMsg = "两次输入的新密码不一致。"; return; }
+        if (lgOffline) {
+            lgMsg = "离线演示：新密码已在本地校验通过。";
+            return;
+        }
+        lgMsg = "正在提交改密…";
+        net.ChangePass(u, lgOld, lgNew, lgMailNew.Get());
+    }
+
+    void LgDoCreate() {
+        string nm = lgName.Trim();
+        if (nm.Length < 2) { lgMsg = "角色名需 2 个字符以上。"; return; }
+        if (lgOffline) {
+            lgRealmName = lgRealmName.Length > 0 ? lgRealmName : "永久区";
+            LgEnterWorld();
+            return;
+        }
+        lgMsg = "正在创建角色…";
+        net.CreateChar(nm, lgJob, lgGender);
+    }
+
+    // =====================================================================
+    //  刻度泵（120ms）与页序
+    // =====================================================================
+    /// 服务端状态 → 页序，再按 `lgPage`/`LgKey()` 变化重建。参考图五页都没有
+    /// 提示行，重建只由「页/选中/静音/回话/状态字」驱动，打字不会把输入框重建掉。
+    void LgPump() {
+        if (!lgOn) { return; }
+        if (!lgOffline) {
+            if (net.InWorld()) { LgEnterWorld(); return; }
+            if (net.Stage() >= 3) {
+                if (net.NeedCreate()) {
+                    if (lgPage != "createchar") { lgPage = "createchar"; lgMsg = ""; }
+                } else if (lgPage != "realm") {
+                    lgPage = "realm"; lgMsg = "";
+                    if (lgRealmName.Length == 0) { lgRealmName = net.RealmName(); }
+                }
+            }
+            /* formMsg 是服务端的表单回话（注册成功/失败），读过就不再重复显示。 */
+            string fm = net.FormMsg();
+            if (fm.Length > 0 && fm != lgSeenForm) { lgSeenForm = fm; lgMsg = fm; }
+        }
+        if (lgPage != lgRenderPage || LgKey() != lgRenderKey) { LgBuild(); }
+    }
+
+    /// 重建键：只有这些变了才重画整页。
+    string LgKey() {
+        string k = lgPage + "|" + LgMsgText() + "|" + Rules.N(lgJob) + "|"
+            + Rules.N(lgGender) + (lgTilePicked ? "P" : "-")
+            + (lgMuted ? "M" : "-");
+        if (lgPage == "realm") { k = k + "|" + Rules.N(LgRealmCount()); }
+        return k;
+    }
+
+    /// 提示行文字：本版自己攒的 `lgMsg` 优先；空则（未登录时）报连接状态——
+    /// 参考图是干净态，这条行本身就在偏差清单里。
+    string LgMsgText() {
+        if (lgMsg.Length > 0) { return lgMsg; }
+        /* 连接状态只报在登录页：参考图五页都是干净态，把「服务器可达」挂到
+           注册/改密的空区里就是上一页漏过来的脏字。 */
+        if (lgPage != "login") { return ""; }
+        if (lgOffline || net.Stage() >= 3) { return ""; }
+        return net.StatusText();
+    }
+
+    void LgBuild() {
+        if (lgRoot == null) { return; }
+        lgRoot.RemoveAll();
+        if (lgPage != lgRenderPage) { LgResetPage(lgPage); }
+        if (lgPage == "register") { LgBuildRegister(); }
+        else if (lgPage == "changepw") { LgBuildChangePw(); }
+        else if (lgPage == "realm") { LgBuildRealm(); }
+        else if (lgPage == "createchar") { LgBuildCreateChar(); }
+        else { LgBuildLogin(); }
+        lgRenderPage = lgPage;
+        lgRenderKey = LgKey();
+    }
+
+    // =====================================================================
+    //  区服列表（离线用 Spec 抄的 7 行；联机用服务端下发）
+    // =====================================================================
+    int LgRealmCount() {
+        if (!lgOffline && net.RealmCount() > 0) { return net.RealmCount(); }
+        return Spec.LgRealmCount();
+    }
+
+    string LgRealmName(int i) {
+        if (!lgOffline && net.RealmCount() > i) {
+            JsonValue r = net.RealmAt(i);
+            if (r != null) { return r.Str("name", "分区" + Rules.N(i + 1)); }
+        }
+        return Spec.LgRealmName(i);
+    }
+
+    int LgRealmId(int i) {
+        if (!lgOffline && net.RealmCount() > i) {
+            JsonValue r = net.RealmAt(i);
+            if (r != null) { return r.Int("id", i + 1); }
+        }
+        return i + 1;
+    }
+
+    // =====================================================================
+    //  记住的账号（data/login.txt 三行：账号 / 服务器地址 / 上次区服 id）
+    //  ——地址与区服 id 本版不读，但写回时原样保留，老客户端存下的文件不丢字段。
+    // =====================================================================
+    string LgRmLine(int idx) {
+        if (!File.Exists(lgRememberFile)) { return ""; }
+        try {
+            string rest = File.ReadAllText(lgRememberFile);
+            for (int i = 0; i < idx; i = i + 1) {
+                int nl = rest.IndexOf("\n");
+                if (nl < 0) { return ""; }
+                rest = rest.Substring(nl + 1, rest.Length - nl - 1);
+            }
+            int end = rest.IndexOf("\n");
+            string line = end >= 0 ? rest.Substring(0, end) : rest;
+            return line.Trim();
+        } catch (Exception e) { return ""; }
+    }
+
+    string LgRemembered() { return LgRmLine(0); }
+
+    void LgSaveRemembered(string u) {
+        try {
+            File.WriteAllText(lgRememberFile,
+                u + "\n" + LgRmLine(1) + "\n" + LgRmLine(2) + "\n");
+        } catch (Exception e) { }
+    }
+}

@@ -42,11 +42,7 @@ partial class LegendApp {
     Label newsFeed; Label statusText;
     Progress expBar; Label expText;
 
-    /* ---- 登录窗 ---- */
-    Panel netForm; string formPage = "login";
-    string lastFormKey = ""; string renderedFormPage = "";
-    string formUser = ""; string formPass = "";
-    Label formMsg;
+    /* ---- 发布内置服务器地址（连接密码=推送通道门禁，不是账号密码）---- */
     string srvAddr = "127.0.0.1:8099"; string srvPass = "";
 
     // =====================================================================
@@ -69,7 +65,19 @@ partial class LegendApp {
         g = saves.Read(now); lastTick = now; lastSave = now;
         net = new GameNet();
 
-        form = Form.CreateDark("迷你传奇", Spec.WindowW(), Spec.WindowH());
+        /* 开窗尺寸必须在 Form 构造时定：窗口创建会把
+           「min(800x600 逻辑, 本次创建尺寸)」记成 OS 的最小拖拽尺寸
+           （Win32Shell.CreateWindowSized 的 minTrackW/H），此后
+           SetClientSize 缩不到它以下。按主窗尺寸开、登录期再缩，会被
+           钳在 1200x852 —— 540x530 的登录页铺进 1200x852 画布，整页
+           缩到 45%、字全变小（实测就是这么翻的车）。故登录流一开窗
+           就是登录窗尺寸，进世界只**长大**（放大不受下限约束）。 */
+        lgRememberFile = dataDir + "/login.txt";
+        bool lgOff = KnownFolders.GetEnv("LEGEND_OFFLINE").Length > 0;
+        bool lgFlow = !lgOff || KnownFolders.GetEnv("LEGEND_LOGIN").Length > 0;
+        int bootW = lgFlow ? Spec.LgBootW() : Spec.WindowW();
+        int bootH = lgFlow ? Spec.LgBootH() : Spec.WindowH();
+        form = Form.CreateDark("迷你传奇", bootW, bootH);
         app = form.GetApp(); net.Attach(app);
         /* DPI：窗口客户区要正好等于「设计尺寸 × 设备缩放」，否则界面会
            在 150% 屏上按 1:1 铺进 1.5 倍的画布（所有控件缩成 2/3，实测
@@ -82,14 +90,24 @@ partial class LegendApp {
            100（App.dpiScale 是 Show() 里才读的设备值），所以这里直接问
            Canvas.GetDpiScale()，它在窗口创建前后都返回同一个设备值。 */
         Spec.SetDpi(Canvas.GetDpiScale());
-        app.SetClientSize(Spec.WindowW(), Spec.WindowH());
+
+        /* LEGEND_OFFLINE=1 单独给出 = 直进主窗（31 页回归脚本一直这么跑）；
+           LEGEND_LOGIN=1 与 LEGEND_OFFLINE 同时给 = 不拨号演一遍登录流
+           （登录→分区→建角→主窗），无服务器也能验那五页。 */
+        if (lgFlow) {
+            /* 登录窗按参考图的**设备**像素精确开窗（SetClientSize 的框架
+               补偿会多出 22×55 死边，且逻辑像素入参在 150% 下截断）。 */
+            app.SetClientSizeDev(Spec.LgClientW(), Spec.LgClientH());
+        } else {
+            app.SetClientSize(Spec.WindowW(), Spec.WindowH());
+        }
         app.UseSkin("legend"); app.SetBackdropFx(false);
 
         /* 离线/连接分流要放在建壳之前：种子聊天是纯本地数据，建壳前
            播好，启动第一帧（同步的那次 Refresh）聊天区就有内容——
            不必等第一个秒刻度（实测刻度在忙机器上会被拖到数秒外，
            挂到刻度上会让聊天区时有时无）。 */
-        if (KnownFolders.GetEnv("LEGEND_OFFLINE").Length > 0) {
+        if (lgOff) {
             /* 离线壳：LEGEND_OFFLINE=1 时不拨号（UI 自动化回归与
                无服务器试玩走这条路），窗口标题标明离线。 */
             form.SetTitle("迷你传奇 · 离线");
@@ -98,12 +116,26 @@ partial class LegendApp {
             ConnectPublished(dataDir);
         }
 
-        BuildShell();
-        BuildPage();
-        Refresh();
+        if (lgFlow) {
+            LgBegin(lgOff);
+        } else {
+            BuildShell();
+            BuildPage();
+            Refresh();
+        }
 
         form.Every(120, () => {
             try { net.PollHttp(); } catch (Exception) { }
+            /* 登录流接管期间：主窗那些活（页 31 场景、尺寸重建）都还没有壳，
+               碰 content/root 会空引用——只推页序。 */
+            if (lgOn) {
+                try { LgPump(); } catch (Exception e) {
+                    if (UiDriver.Active()) {
+                        try { UiDriver.SetProbe("lg-err", e.ToString()); } catch (Exception e2) { }
+                    }
+                }
+                return;
+            }
             /* 页 31 的活场景：怪随机刷、角色走过去砍、战报往上滚。只动控件
                位置/文本，不重建整页（重建会丢输入框数字和勾选态）。 */
             try {
@@ -140,6 +172,7 @@ partial class LegendApp {
         });
         form.Every(1000, () => {
             try {
+                if (lgOn) { return; }        // 登录流期间没有世界可推、没有壳可刷
                 if (KnownFolders.GetEnv("LEGEND_DBG").Length > 0) {
                     /* dump tree 有中间帧伪象（22 页曾"树里全 0、像素全好"）。
                        HitTest 走和命中同一条可见性+矩形路径：页面内采样点

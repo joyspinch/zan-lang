@@ -290,6 +290,7 @@ class Gateway {
         if (op == "login") { return await Gateway.Login(m, now, http, cid); }
         if (op == "forgot") { return await Gateway.Forgot(m); }
         if (op == "reset") { return await Gateway.Reset(m, now); }
+        if (op == "changepw") { return await Gateway.ChangePw(m, now); }
         if (op == "realms") { return await Gateway.Realms(); }
         if (op == "hb") {
             JsonValue r = Gateway.Ok();
@@ -633,6 +634,47 @@ class Gateway {
             await dao.ClearLoginFails(row.id);
             JsonValue r = Gateway.Ok();
             r.Set("msg", JsonValue.NewStr("密码已重置，请用新密码登录"));
+            return r;
+        } finally {
+            Gateway.Give(db);
+        }
+    }
+
+    /* 修改密码（登录窗「修改密码」页：账号 + 原密码 + 新密码 ×2）。与 reset
+       的区别是验**原密码**而不是密保答案——原版那一页就是这么走的。闸门与
+       文案与 login 同一套：锁先于校验、不透露账号是否存在。 */
+    static async JsonValue ChangePw(JsonValue m, long now) {
+        string user = m.Str("user", "").Trim();
+        string oldpass = m.Str("oldpass", "");
+        string newpass = m.Str("newpass", "");
+        bool mail = m.Int("mail", 0) == 1;
+        if (Fmt.CharCount(newpass) < 6 || Fmt.CharCount(newpass) > 64) {
+            return Gateway.Err("新密码需 6-64 字");
+        }
+        IDbConnection db = await Gateway.Db();
+        if (db == null) { return Gateway.Err("数据库不可用，请稍后再试"); }
+        try {
+            AccountDao dao = new AccountDao(db);
+            Account row = await dao.ByUsername(user);
+            if (dao.LoginLocked(row, now)) {
+                return Gateway.Err("错误次数过多，请一小时后再试");
+            }
+            if (!dao.CheckPassword(row, oldpass)) {
+                await dao.NoteLoginFail(row, now);
+                return Gateway.Err("账号或原密码不正确");
+            }
+            await dao.SetPassword(row.id, newpass);
+            await dao.ClearLoginFails(row.id);
+            /* 锁定计数一并归零：玩家已经证明了自己是账号主人（连续两次
+               正确凭据），留着的密保失败计数只会误伤下一次找回。 */
+            await dao.ClearAnswerFails(row.id);
+            JsonValue r = Gateway.Ok();
+            r.Set("msg", JsonValue.NewStr("密码已修改，请用新密码登录"));
+            r.Set("mailed", JsonValue.NewNum("0"));
+            if (mail) {
+                /* 没有邮件投递就照实说没发（勾了框不等于发了信）。 */
+                r.Set("mailmsg", JsonValue.NewStr("本服务未配置邮件投递，新密码未发送到邮箱"));
+            }
             return r;
         } finally {
             Gateway.Give(db);
