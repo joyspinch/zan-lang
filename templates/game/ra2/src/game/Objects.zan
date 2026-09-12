@@ -631,6 +631,8 @@ class UnitType {
     int storage;
     // The shroud reveal radius (rules Sight=, default 1).
     int sight;
+    // Order/selection voices (the rules' VoiceSelect= and friends).
+    TechnoVoices voices;
 
     static UnitType Create(string reg, string label, int cost, int buildTime,
                            int hp, string shpName, int armor, Weapon primary,
@@ -669,6 +671,7 @@ class UnitType {
         t.hasDeployedSeq = false;
         t.deployedStart = 0;
         t.deployedFrames = 1;
+        t.voices = TechnoVoices.Create();
         return t;
     }
 
@@ -677,6 +680,8 @@ class UnitType {
     int Cost() { return this.cost; }
     int BuildTime() { return this.buildTime; }
     int Hp() { return this.hp; }
+    TechnoVoices Voices() { return this.voices; }
+    void SetVoices(TechnoVoices v) { this.voices = v; }
     bool Amphibious() { return this.amphibious; }
     string ShpName() { return this.shpName; }
     string TurretVxl() { return this.turretVxl; }
@@ -899,6 +904,7 @@ class UnitCatalog {
             t.SetDeployer(d.Deployer());
             t.SetSpeed(d.Speed() > 0 ? d.Speed() : d.Steps() * 4);
             t.SetSight(d.Sight());
+            t.SetVoices(d.Voices());
             l.Add(t);
         }
         return l;
@@ -1034,6 +1040,7 @@ class StructureType {
     bool waterBound;     // floats: its footprint must be water (the shipyard)
     int sight;           // the shroud reveal radius (rules Sight=, default 1)
     bool conYard;        // rules ConstructionYard=: the free-MCV crate gate
+    TechnoVoices voices; // order/selection voices off the def
 
     static StructureType Create(BuildingDef d) {
         StructureType t = new StructureType();
@@ -1060,6 +1067,7 @@ class StructureType {
         t.sight = d.Sight();
         t.conYard = d.IsConYard();
         t.techLevel = d.TechLevel();
+        t.voices = d.Voices();
         return t;
     }
 
@@ -1070,6 +1078,7 @@ class StructureType {
     void SetCameo(string c) { this.cameo = c; }
     int TechLevel() { return this.techLevel; }
     void SetTechLevel(int l) { this.techLevel = l; }
+    TechnoVoices Voices() { return this.voices; }
     int FootprintW() { return this.footprintW; }
     int FootprintH() { return this.footprintH; }
     int Hp() { return this.hp; }
@@ -1226,6 +1235,10 @@ class StructureCatalog {
 /// search over the passable grid, which keeps the path tight around buildings
 /// without the bookkeeping of a weighted A*.
 class World {
+    // Battle audio sink, set by the app once the game's own SndEngine is
+    // built. Null in the winchain's rule-only worlds, which then stay
+    // silent.
+    SndEngine sndSink;
     int width;
     int height;
     IsoMap iso;
@@ -4504,6 +4517,51 @@ class World {
         return this.objects[this.selectedIndex];
     }
 
+    /// <summary>Battle audio: the sink the app installed for this game, or
+    /// null in the silent rule-only worlds.</summary>
+    void SetSoundSink(SndEngine snd) { this.sndSink = snd; }
+    SndEngine SoundSink() { return this.sndSink; }
+
+    /// <summary>The selected object's voice lines, null when it has none
+    /// (nothing selected, a foreign house, or an unarmed prop).</summary>
+    TechnoVoices SelectedVoices() {
+        WorldObject o = this.Selected();
+        if (o == null) { return null; }
+        if (o.Kind() == ObjKind.Unit()) {
+            UnitType u = o.UnitType();
+            if (u == null) { return null; }
+            return u.Voices();
+        }
+        if (o.Kind() == ObjKind.Structure()) {
+            StructureType st = this.TypeOf(o);
+            if (st == null) { return null; }
+            return st.Voices();
+        }
+        return null;
+    }
+
+    /// <summary>The player's order acknowledgment from the selected unit --
+    /// the reference's SoundHandler.handleOrderPushed: VoiceAttack on an
+    /// attack order, VoiceMove on a move, one per 250ms feedback window.</summary>
+    void PlayOrderFeedback(bool attack) {
+        if (this.sndSink == null) { return; }
+        TechnoVoices v = this.SelectedVoices();
+        if (v == null) { return; }
+        this.sndSink.PlayOrderVoice(v,
+            attack ? SndEngine.FeedbackAttack() : SndEngine.FeedbackMove(),
+            Window.GetTickMs());
+    }
+
+    /// <summary>The player's selection acknowledgment -- the reference's
+    /// handleSelectionChangeEvent: VoiceSelect per newly selected own unit,
+    /// sharing the order feedback's 250ms window.</summary>
+    void PlaySelectFeedback() {
+        if (this.sndSink == null) { return; }
+        TechnoVoices v = this.SelectedVoices();
+        if (v == null) { return; }
+        this.sndSink.PlaySelectVoice(v, Window.GetTickMs());
+    }
+
     /// <summary>The side of the currently selected object, or -1 when nothing
     /// is selected. Lets the controller refuse to command enemy units.</summary>
     int SelectedSide() {
@@ -5784,6 +5842,7 @@ class World {
     /// projectile reaches its mark, so a distant target sees the shell
     /// coming, exactly like the reference's flight-time model.</summary>
     void FireWeapon(WorldObject shooter, Weapon w, WorldObject t) {
+        if (this.sndSink != null) { this.sndSink.PlayReport(w, shooter); }
         if (w.IsBeamWeapon()) {
             this.ApplyShot(shooter, w, t);
             this.SpawnBeam(shooter, t, w);

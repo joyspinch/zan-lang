@@ -917,6 +917,155 @@ class WinChainTest {
         engineM.UnserializeMixer(mix);
         Report("mixer serialize roundtrip",
                engineM.ChannelGainOf(Ch.Voice()) == 0.5 ? 1 : 0, 1);
+
+        // ---- 武器声/口令声:SoundHandler 的设备无关逻辑 -----------------
+        // 规则转录:Report= 逗号表、弹头 ElectricAssault=、TechnoVoices
+        // 八个 Voice* 键,全部从 ApplyIni 的分层环进来。
+        Rules rulesV = Rules.Default();
+        rulesV.ApplyIni(IniParser.Parse(
+            "[M60]\nReport=GunA, GunB\n"
+            + "[SA]\nElectricAssault=yes\n"
+            + "[E1]\nVoiceSelect=GSelect\nVoiceMove=GMove\n"
+            + "VoiceAttack=GAttack\nVoiceEnter=GEnter\n"
+            + "VoiceCapture=GCapture\nVoiceSpecialAttack=GSpecial\n"
+            + "VoiceFeedback=GFeedback\nVoiceCrashing=GCrash\n"));
+        Weapon gunV = rulesV.WeaponNamed("M60");
+        Warhead saV = rulesV.WarheadNamed("SA");
+        TechnoVoices gv = null;
+        UnitDef e1V = rulesV.UnitDefNamed("E1");
+        if (e1V != null) { gv = e1V.Voices(); }
+        Report("weapon report parsed",
+               gunV != null ? gunV.ReportCount() : 0 - 1, 2);
+        Report("weapon report entry",
+               gunV != null && SndSpecText.SameWord(gunV.ReportAt(1), "GunB")
+                   ? 1 : 0, 1);
+        Report("warhead electric assault",
+               saV != null && saV.ElectricAssault() ? 1 : 0, 1);
+        Report("unit voices transcribed",
+               gv != null
+               && SndSpecText.SameWord(gv.Select(), "GSelect")
+               && SndSpecText.SameWord(gv.Move(), "GMove")
+               && SndSpecText.SameWord(gv.Crashing(), "GCrash") ? 1 : 0, 1);
+        // 口令回退链,参考 handleOrderPushed 的 switch;缺键的链按
+        // 参考落到备选,全空落 ""。
+        Report("order voice attack",
+               SndSpecText.SameWord(
+                   SndEngine.OrderVoiceName(gv, OrderFeedback.Attack()),
+                   "GAttack") ? 1 : 0, 1);
+        Report("order voice move",
+               SndSpecText.SameWord(
+                   SndEngine.OrderVoiceName(gv, OrderFeedback.Move()),
+                   "GMove") ? 1 : 0, 1);
+        Report("order voice enter",
+               SndSpecText.SameWord(
+                   SndEngine.OrderVoiceName(gv, OrderFeedback.Enter()),
+                   "GEnter") ? 1 : 0, 1);
+        Report("order voice capture",
+               SndSpecText.SameWord(
+                   SndEngine.OrderVoiceName(gv, OrderFeedback.Capture()),
+                   "GCapture") ? 1 : 0, 1);
+        Report("order voice special",
+               SndSpecText.SameWord(
+                   SndEngine.OrderVoiceName(gv,
+                       OrderFeedback.SpecialAttack()),
+                   "GSpecial") ? 1 : 0, 1);
+        TechnoVoices partial = TechnoVoices.Create();
+        partial.ReadIni(IniParser.Parse(
+            "[T]\nVoiceMove=BMove\nVoiceAttack=BAttack\n").Section("T"));
+        Report("order voice enter falls to move",
+               SndSpecText.SameWord(
+                   SndEngine.OrderVoiceName(partial, OrderFeedback.Enter()),
+                   "BMove") ? 1 : 0, 1);
+        Report("order voice capture falls empty",
+               SndEngine.OrderVoiceName(partial,
+                   OrderFeedback.Capture()).Length == 0 ? 1 : 0, 1);
+        Report("order voice special falls attack",
+               SndSpecText.SameWord(
+                   SndEngine.OrderVoiceName(partial,
+                       OrderFeedback.SpecialAttack()),
+                   "BAttack") ? 1 : 0, 1);
+        TechnoVoices quiet = TechnoVoices.Create();
+        Report("order voice none empty",
+               SndEngine.OrderVoiceName(quiet,
+                   OrderFeedback.Move()).Length == 0 ? 1 : 0, 1);
+        // 电击弹头的火线音量打 25 折,其余全量;随机挑名永远落在表内。
+        SndEngine engineV = SndEngine.Create();
+        Weapon plainW = Weapon.Create("P", 10, 20, 4,
+            Warhead.Create("PW", "100"));
+        Weapon eaW = Weapon.Create("E", 10, 20, 4,
+            Warhead.Create("EW", "100"));
+        eaW.Warhead().SetElectricAssault(true);
+        Report("report gain full",
+               (int)(engineV.ReportGain(plainW) * 1000.0), 1000);
+        Report("report gain quarter",
+               (int)(engineV.ReportGain(eaW) * 1000.0), 250);
+        Weapon repW = Weapon.Create("R", 10, 20, 4, null);
+        List<string> repNames = new List<string>();
+        repNames.Add("RA");
+        repNames.Add("RB");
+        repNames.Add("RC");
+        repW.SetReport(repNames);
+        bool pickOk = repW.ReportCount() > 0;
+        for (int i = 0; i < 30 && pickOk; i = i + 1) {
+            string p = engineV.ReportPick(repW);
+            if (!SndSpecText.SameWord(p, "RA")
+             && !SndSpecText.SameWord(p, "RB")
+             && !SndSpecText.SameWord(p, "RC")) {
+                pickOk = false;
+            }
+        }
+        Report("report pick in set", pickOk ? 1 : 0, 1);
+        // 循环报告判定:Control=Loop/Ambient 命中,判定按名字缓存。没有
+        // [Defaults] 的表按参考语义整表弃用,所以样表必须带 Defaults。
+        string loopIni = "[Defaults]\nVolume=100\n"
+            + "[SoundList]\n1=LoopShot\n2=PlainShot\n"
+            + "[LoopShot]\nSounds=ls\nControl=Loop\n"
+            + "[PlainShot]\nSounds=ps\n";
+        SndEngine engineL = SndEngine.Create();
+        engineL.specs = SoundSpecs.Parse(IniParser.Parse(loopIni));
+        Report("loop report detects loop",
+               engineL.IsLoopReport("LoopShot") ? 1 : 0, 1);
+        Report("loop report plain",
+               engineL.IsLoopReport("PlainShot") ? 1 : 0, 0);
+        Report("loop report cache hits",
+               engineL.IsLoopReport("LoopShot") ? 1 : 0, 1);
+        // 250ms 口令窗:两类反馈共享;说话才花窗(select 事件先花窗再
+        // 查名,口令是有名才花窗)。
+        SndEngine engineF = SndEngine.Create();
+        TechnoVoices fv = TechnoVoices.Create();
+        fv.ReadIni(IniParser.Parse(
+            "[T]\nVoiceMove=FMove\nVoiceAttack=FAttack\n").Section("T"));
+        engineF.PlayOrderVoice(fv, OrderFeedback.Move(), 1000);
+        Report("feedback window set",
+               engineF.lastFeedbackMs == 1000 ? 1 : 0, 1);
+        engineF.PlayOrderVoice(fv, OrderFeedback.Attack(), 1100);
+        Report("feedback window holds",
+               engineF.lastFeedbackMs == 1000 ? 1 : 0, 1);
+        engineF.PlayOrderVoice(fv, OrderFeedback.Attack(), 1300);
+        Report("feedback window passes",
+               engineF.lastFeedbackMs == 1300 ? 1 : 0, 1);
+        SndEngine engineG = SndEngine.Create();
+        engineG.PlayOrderVoice(quiet, OrderFeedback.Move(), 500);
+        Report("silent kind keeps window",
+               engineG.lastFeedbackMs == 0 ? 1 : 0, 1);
+        engineG.PlaySelectVoice(quiet, 2000);
+        Report("select spends window",
+               engineG.lastFeedbackMs == 2000 ? 1 : 0, 1);
+        // 键名分流:SoundKey 枚举名走 rules 的 [AudioVisual],其余名字
+        // 直接查 sound.ini——报告名与口令名永不误入 rules 映射。
+        SndEngine engineK = SndEngine.Create();
+        engineK.specs = SoundSpecs.Parse(IniParser.Parse(
+            "[Defaults]\nVolume=100\n"
+            + "[SoundList]\n1=MyVoice\n2=Sell1\n"
+            + "[MyVoice]\nSounds=v1\n[Sell1]\nSounds=s1\n"));
+        engineK.rules = IniParser.Parse(
+            "[AudioVisual]\nSellSound=Sell1\n");
+        Report("sound key name routes rules",
+               engineK.SpecForKey("SellSound") != null ? 1 : 0, 1);
+        Report("plain name direct",
+               engineK.SpecForKey("MyVoice") != null ? 1 : 0, 1);
+        Report("unmapped key silent",
+               engineK.SpecForKey("RadarOn") == null ? 1 : 0, 1);
         // 真实安装的表状态:本机 rip 没有音频表,引擎必须以空表静音装载
         // 而不是崩。表数打印出来,有表/无表都算通过。
         string instDir = "data";

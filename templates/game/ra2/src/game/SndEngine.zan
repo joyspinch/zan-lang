@@ -456,8 +456,20 @@ class SndHandle {
     AudioVoice voice;
 }
 
+/// <summary>The reference's OrderFeedbackType, the numeric kinds the order
+/// handler switches on.</summary>
+class OrderFeedback {
+    static int Attack() { return 0; }
+    static int Move() { return 1; }
+    static int Enter() { return 2; }
+    static int Capture() { return 3; }
+    static int SpecialAttack() { return 4; }
+}
+
 /// <summary>One positional voice on the battlefield: where it sits, whose
-/// it is, and the gain math it last resolved to.</summary>
+/// it is, and the gain math it last resolved to. A voice that follows a
+/// shooter (the looping weapon reports) re-reads his position each frame
+/// and dies with him.</summary>
 class WorldVoice {
     SoundSpec spec;
     double x;
@@ -467,6 +479,7 @@ class WorldVoice {
     double gain;
     double volume;
     bool loop;
+    WorldObject follow;
 }
 
 /// <summary>The sound engine facade: the mixer, the parsed tables, the
@@ -498,6 +511,16 @@ class SndEngine {
     double viewW;
     double viewH;
     bool haveCenter;
+    // Order/selection feedback: shared 250ms window (the reference's
+    // lastFeedbackTime), the shooting loops' per-shooter registry, and the
+    // is-this-report-a-loop spec cache.
+    long lastFeedbackMs;
+    bool haveFeedback;
+    List<WorldObject> loopShooters;
+    List<SndHandle> loopHandles;
+    List<string> loopNames;
+    List<string> loopCacheKeys;
+    List<bool> loopCacheVals;
 
     static SndEngine Create() {
         SndEngine e = new SndEngine();
@@ -521,6 +544,13 @@ class SndEngine {
         e.viewW = 800.0;
         e.viewH = 600.0;
         e.haveCenter = false;
+        e.lastFeedbackMs = 0;
+        e.haveFeedback = false;
+        e.loopShooters = new List<WorldObject>();
+        e.loopHandles = new List<SndHandle>();
+        e.loopNames = new List<string>();
+        e.loopCacheKeys = new List<string>();
+        e.loopCacheVals = new List<bool>();
         e.eva = Eva.Create(e.evaSpecs, e);
         e.music = MusicPlayer.Create(e.musicSpecs, e);
         return e;
@@ -732,32 +762,31 @@ class SndEngine {
 
     // ---- 播放 ------------------------------------------------------------
 
-    /// <summary>Resolves a UI/game event key through the rules document --
-    /// the shipped engine reads e.g. "SellSound" out of rules.ini to get a
-    /// sound.ini name -- then plays it on one channel. No rules key or no
-    /// spec, no sound.</summary>
+    /// <summary>Resolves a key to a spec, the reference's getSoundKey: a
+    /// SoundKey enum name maps through the rules' [AudioVisual] section to
+    /// a sound.ini name; anything else IS a sound.ini name already, so a
+    /// weapon Report= or a unit voice never consults the rules document.
+    /// No mapping or no spec, no sound.</summary>
+    SoundSpec SpecForKey(string key) {
+        if (key == null || key.Length == 0) { return null; }
+        if (!SndKeys.IsSoundKeyName(key)) {
+            return this.specs.Spec(key);
+        }
+        string target = "";
+        if (this.rules != null) {
+            target = this.rules.Get("AudioVisual", key);
+        }
+        if (target.Length == 0) { return null; }
+        return this.specs.Spec(target.Trim());
+    }
+
+    /// <summary>One UI/game event playback through the resolved spec: the
+    /// spec's own volume, the channel's mixer gain.</summary>
     AudioVoice Play(string key, int channel) {
         SoundSpec spec = this.SpecForKey(key);
         if (spec == null) { return null; }
         return this.PlaySpec(spec, channel, spec.volume / 100.0, 1.0,
             false);
-    }
-
-    SoundSpec SpecForKey(string key) {
-        if (key == null || key.Length == 0) { return null; }
-        string target = "";
-        if (this.rules != null) {
-            target = this.rules.Get("AudioVisual", key);
-            if (target.Length == 0) {
-                // 键可能在任何节里:全文档扫一遍。
-                for (int s = 0; s < this.rules.Count(); s = s + 1) {
-                    target = this.rules.SectionAt(s).Get(key);
-                    if (target.Length > 0) { break; }
-                }
-            }
-        }
-        if (target.Length == 0) { return null; }
-        return this.specs.Spec(target.Trim());
     }
 
     void CleanHandles() {
@@ -841,6 +870,14 @@ class SndEngine {
     /// channel. Positional gain resolves per frame in Update.</summary>
     AudioVoice PlayEffect(string key, double x, double y, int side,
         double gain, double loopGain) {
+        return this.PlayEffectCore(key, x, y, side, gain, loopGain, null);
+    }
+
+    /// <summary>The effect core. A non-null follow parks the shooter on the
+    /// voice: Update re-reads his position every frame and stops the sound
+    /// when he dies -- the looping weapon reports ride this.</summary>
+    AudioVoice PlayEffectCore(string key, double x, double y, int side,
+        double gain, double loopGain, WorldObject follow) {
         SoundSpec spec = this.SpecForKey(key);
         if (spec == null) { return null; }
         bool loop = spec.HasControl(SndSpecText.ControlAmbient())
@@ -877,6 +914,7 @@ class SndEngine {
             wv.gain = gain;
             wv.volume = volume;
             wv.loop = loop;
+            wv.follow = follow;
             this.voices.Add(wv);
             return voice;
         }
@@ -954,6 +992,159 @@ class SndEngine {
         return shroud.At(tileX, tileY) == MapShroud.Unexplored();
     }
 
+    // ---- 武器声与口令声 ----------------------------------------------------
+    // reference 的 SoundHandler:handleWeaponFireSound / handleOrderPushed /
+    // handleSelectionChangeEvent 的语义,1:1 到纯函数可测的程度。
+
+    /// <summary>The loop-report cap: sound.ini caps the gattling stages at
+    /// Limit=2 each, and past ~6 loops WorldSound hard-mutes anyway -- the
+    /// reference refuses to schedule what cannot be heard.</summary>
+    static int MaxWeaponLoops() { return 6; }
+
+    static int FeedbackAttack() { return 0; }
+    static int FeedbackMove() { return 1; }
+
+    /// <summary>The weapon fire volume: a quarter through an
+    /// electric-assault warhead, full otherwise.</summary>
+    double ReportGain(Weapon w) {
+        if (w.Warhead() != null && w.Warhead().ElectricAssault()) {
+            return 0.25;
+        }
+        return 1.0;
+    }
+
+    /// <summary>One random name from the weapon's Report= list, the
+    /// fire event's pick.</summary>
+    string ReportPick(Weapon w) {
+        return w.ReportAt((int)this.Rand(w.ReportCount()));
+    }
+
+    /// <summary>Whether this sound.ini name loops, resolved once per name:
+    /// the Loop or Ambient control bits mark the gattling-style reports
+    /// that must not stack per shot.</summary>
+    bool IsLoopReport(string soundName) {
+        for (int i = 0; i < this.loopCacheKeys.Count; i = i + 1) {
+            if (SndSpecText.SameWord(this.loopCacheKeys[i], soundName)) {
+                return this.loopCacheVals[i];
+            }
+        }
+        bool loop = false;
+        SoundSpec spec = this.specs.Spec(soundName);
+        if (spec != null && (spec.HasControl(SndSpecText.ControlLoop())
+         || spec.HasControl(SndSpecText.ControlAmbient()))) {
+            loop = true;
+        }
+        this.loopCacheKeys.Add(soundName);
+        this.loopCacheVals.Add(loop);
+        return loop;
+    }
+
+    /// <summary>The order-acknowledgment switch, the reference's
+    /// handleOrderPushed including the fallback chains: Enter falls back to
+    /// Move, Capture to SpecialAttack, SpecialAttack to Attack.</summary>
+    static string OrderVoiceName(TechnoVoices v, int feedback) {
+        if (feedback == OrderFeedback.Attack()) { return v.Attack(); }
+        if (feedback == OrderFeedback.Move()) { return v.Move(); }
+        if (feedback == OrderFeedback.Enter()) {
+            return v.Enter().Length > 0 ? v.Enter() : v.Move();
+        }
+        if (feedback == OrderFeedback.Capture()) {
+            return v.Capture().Length > 0 ? v.Capture() : v.SpecialAttack();
+        }
+        if (feedback == OrderFeedback.SpecialAttack()) {
+            return v.SpecialAttack().Length > 0
+                ? v.SpecialAttack() : v.Attack();
+        }
+        return "";
+    }
+
+    /// <summary>One order acknowledgment. The 250ms window is shared with
+    /// selection feedback, and -- exactly like the reference -- a kind the
+    /// unit has no line for leaves the window unspent.</summary>
+    void PlayOrderVoice(TechnoVoices v, int feedback, long now) {
+        if (v == null) { return; }
+        if (this.haveFeedback && now - this.lastFeedbackMs < 250) {
+            return;
+        }
+        string name = SndEngine.OrderVoiceName(v, feedback);
+        if (name == null || name.Length == 0) { return; }
+        this.lastFeedbackMs = now;
+        this.haveFeedback = true;
+        this.Play(name, Ch.Effect());
+    }
+
+    /// <summary>Selection acknowledgment: the window is spent on the event
+    /// (before the name check), one VoiceSelect per newly selected unit.</summary>
+    void PlaySelectVoice(TechnoVoices v, long now) {
+        if (v == null) { return; }
+        if (this.haveFeedback && now - this.lastFeedbackMs < 250) {
+            return;
+        }
+        this.lastFeedbackMs = now;
+        this.haveFeedback = true;
+        if (v.Select() == null || v.Select().Length == 0) { return; }
+        this.Play(v.Select(), Ch.Effect());
+    }
+
+    /// <summary>The weapon fire path: a random pick from the weapon's
+    /// Report= list at the fire event. Non-loop reports play once at the
+    /// shooter; a looping report keeps exactly one loop per shooter (a new
+    /// stage retires the old, plays its decay tail) and never more than six
+    /// shooters loop at once.</summary>
+    void PlayReport(Weapon w, WorldObject shooter) {
+        if (w == null || shooter == null || w.ReportCount() == 0) {
+            return;
+        }
+        string name = this.ReportPick(w);
+        if (name == null || name.Length == 0) { return; }
+        if (!this.IsLoopReport(name)) {
+            this.PlayEffectCore(name, shooter.X(), shooter.Y(),
+                shooter.Side(), this.ReportGain(w), 0.0, null);
+            return;
+        }
+        SndHandle existing = null;
+        int existingAt = 0 - 1;
+        for (int i = 0; i < this.loopShooters.Count; i = i + 1) {
+            if (this.loopShooters[i] == shooter) {
+                existing = this.loopHandles[i];
+                existingAt = i;
+                break;
+            }
+        }
+        if (existing != null) {
+            bool stillGoing = existing.voice != null && existing.voice.IsValid()
+                && existing.voice.IsPlaying();
+            bool sameStage = false;
+            if (stillGoing) {
+                for (int r = 0; r < w.ReportCount(); r = r + 1) {
+                    if (SndSpecText.SameWord(w.ReportAt(r),
+                        this.loopNames[existingAt])) {
+                        sameStage = true;
+                        break;
+                    }
+                }
+            }
+            if (stillGoing && sameStage) { return; }
+            if (existing.voice != null) { existing.voice.Stop(); }
+            this.loopShooters.RemoveAt(existingAt);
+            this.loopHandles.RemoveAt(existingAt);
+            this.loopNames.RemoveAt(existingAt);
+        }
+        if (this.loopShooters.Count >= SndEngine.MaxWeaponLoops()) {
+            return;
+        }
+        AudioVoice v = this.PlayEffectCore(name, shooter.X(), shooter.Y(),
+            shooter.Side(), this.ReportGain(w), 0.0, shooter);
+        if (v != null && v.IsValid()) {
+            SndHandle h = new SndHandle();
+            h.spec = this.SpecForKey(name);
+            h.voice = v;
+            this.loopShooters.Add(shooter);
+            this.loopHandles.Add(h);
+            this.loopNames.Add(name);
+        }
+    }
+
     // ---- 帧泵 --------------------------------------------------------------
 
     void SetViewport(double cx, double cy, double w, double h) {
@@ -979,6 +1170,13 @@ class SndEngine {
         for (int i = 0; i < this.voices.Count; i = i + 1) {
             WorldVoice wv = this.voices[i];
             if (wv.voice == null || !wv.voice.IsValid()) { continue; }
+            if (wv.follow != null) {
+                if (wv.follow.IsDead()) { wv.voice.Stop(); }
+                else {
+                    wv.x = wv.follow.X();
+                    wv.y = wv.follow.Y();
+                }
+            }
             double volume = this.EffectVolume(wv.spec, wv.x, wv.y,
                 wv.side, wv.gain);
             if (wv.loop && volume > 0.0 && wv.spec.limit > 0) {
@@ -1015,6 +1213,18 @@ class SndEngine {
             AudioVoice v = this.voices[i].voice;
             if (v == null || !v.IsValid() || !v.IsPlaying()) {
                 this.voices.RemoveAt(i);
+            }
+        }
+        // The shooters' loop registry forgets finished loops (the
+        // reference's updateWeaponLoops poll); a stopped voice is already
+        // silent, forgetting the entry is what lets a new stage open one.
+        for (int i = this.loopShooters.Count - 1; i >= 0; i = i - 1) {
+            SndHandle h = this.loopHandles[i];
+            if (h.voice == null || !h.voice.IsValid()
+             || !h.voice.IsPlaying()) {
+                this.loopShooters.RemoveAt(i);
+                this.loopHandles.RemoveAt(i);
+                this.loopNames.RemoveAt(i);
             }
         }
     }
