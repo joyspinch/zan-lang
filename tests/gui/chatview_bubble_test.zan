@@ -1,0 +1,152 @@
+using System;
+using Gui;
+using Gui.Component;
+
+/// ChatView 气泡模式的两条回归（都来自桌面端 IM 客户端的实机反馈）：
+///
+/// 1. 滚轮方向。`bscr` 是「离底部多少像素」（0 = 贴住最新一条），与
+///    记录模式的 scrollSig 同一语义。滚轮向上（delta 为正）要看更旧的
+///    内容 = 离底部更远 = bscr 变大；曾经这里写成减号，向上滚得到负值
+///    被钳回 0，界面纹丝不动（实机表现为「聊天的滚动条滚动方向反了 /
+///    滚不上去」）。本用例把方向锁死：一格向上恰好 +scrollSpeed，一格
+///    向下回到原位。
+///
+/// 2. 回执行小字的高度。IM 的送达/已读回执复用「名字行」那截空间画在
+///    自己气泡上方，而名字行高度只在 showNames（群聊）时才非零——一对一
+///    会话里 showNames=false，回执标签于是没有高度可占，怎么翻 kind 都
+///    看不见（实机表现为「消息下缺少已读标记」，服务端字段其实全对）。
+///    本用例断言：一对一（showNames=false）下给一条"我的"消息换回执
+///    节拍，内容总高恰好多出一行小字；且换掉**非末条**的回执也要重排
+///    （缓存签名若只带末条，已送达→已读这种逐条翻新就冻在缓存里）。
+class ChatViewBubbleTest {
+    static int fails;
+    static App app;
+    static ChatView chat;
+    static Rect area;
+
+    static void EqInt(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got "
+            + Convert.ToString(got) + " want " + Convert.ToString(want));
+    }
+
+    static void True(string what, bool got) {
+        if (got) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    /// 回执节拍 → 标签（一对一也返回文案：IM 客户端就靠它画已送达/已读）。
+    static string KindLabel(string kind) {
+        if (kind == "wx-acked") { return "已送达"; }
+        if (kind == "wx-readed") { return "已读"; }
+        return "";
+    }
+
+    static ChatSpeaker Speaker(string agent) {
+        return ChatSpeaker.Of("对方", 0, "");
+    }
+
+    static void Body() {
+        chat.RenderInside(app, area);
+    }
+
+    /// 注入一个事件并让它独占两拍（认领登记发生在渲染期，下一拍才生效
+    /// ——与真实循环中"每次渲染前先泵一次"同节奏）。
+    static void Ev(int kind, int x, int y, int code) {
+        app.window.InjectEvent(kind, x, y, 0, code, 0);
+        app.PumpGuarded();
+        app.FrameGuarded(ChatViewBubbleTest.Body);
+        app.PumpGuarded();
+        app.FrameGuarded(ChatViewBubbleTest.Body);
+    }
+
+    static void Main() {
+        fails = 0;
+        app = new App("chatview-bubble", 400, 300);
+        app.Show();
+        app.RequestAnimationFrame(16);
+
+        List<ChatMessage> msgs = new List<ChatMessage>();
+        for (int i = 0; i < 40; i = i + 1) {
+            ChatMessage m = ChatMessage.Create(
+                i % 2 == 0 ? "user" : "assistant", "第 " + Convert.ToString(i) + " 行");
+            m.at = 0;
+            msgs.Add(m);
+        }
+        chat = new ChatView();
+        chat.WithStyle(ChatStyle.Bubble());
+        // 一对一会话：不画发言人名字行（回执行小字正是要在这种情形下出现）。
+        chat.WithSpeakerNames(false);
+        chat.WithSpeakers(ChatViewBubbleTest.Speaker, ChatViewBubbleTest.KindLabel);
+        chat.Bind(msgs);
+        area = new Rect(0, 0, 390, 280);
+
+        app.PumpGuarded();
+        app.FrameGuarded(ChatViewBubbleTest.Body);
+        app.PumpGuarded();
+        app.FrameGuarded(ChatViewBubbleTest.Body);
+
+        int padV = app.Scale(10);
+        int viewH = area.height - padV * 2;
+        int over = chat.bubH - viewH;
+        True("bubble content overflows the viewport", over > 0);
+
+        // ---- 1. 滚轮方向 ---------------------------------------------
+        int x = 200;
+        int y = 150;
+        ChatViewBubbleTest.Ev(1, x, y, 0);   // 指针进区并登记认领
+        EqInt("starts pinned to newest", chat.BubbleScroll().Get(), 0);
+
+        int speed = app.scrollSpeed;
+        ChatViewBubbleTest.Ev(13, x, y, 120);    // 向上滚一格
+        EqInt("wheel up goes back in history",
+              chat.BubbleScroll().Get(), speed);
+        ChatViewBubbleTest.Ev(13, x, y, 120);    // 再一格
+        EqInt("second notch adds one more step",
+              chat.BubbleScroll().Get(), speed * 2);
+
+        ChatViewBubbleTest.Ev(13, x, y, 0 - 120);   // 向下滚一格
+        EqInt("wheel down comes back toward newest",
+              chat.BubbleScroll().Get(), speed);
+
+        // 反向到底不得越过最新一条（钳在 0，而不是负值）。
+        ChatViewBubbleTest.Ev(13, x, y, 0 - 120);
+        ChatViewBubbleTest.Ev(13, x, y, 0 - 120);
+        EqInt("clamped at newest", chat.BubbleScroll().Get(), 0);
+
+        // ---- 2. 回执行小字占位（一对一 / showNames=false）-----------
+        // 全清回执再量一次基准高，避免上面几拍可能触发的重排干扰。
+        for (int i = 0; i < msgs.Count; i = i + 1) { msgs[i].kind = ""; }
+        app.PumpGuarded();
+        app.FrameGuarded(ChatViewBubbleTest.Body);
+        int baseH = chat.bubH;
+
+        // 回执只画在"我发的"气泡上（role == "user"），因此取偶数下标。
+        msgs[msgs.Count - 2].kind = "wx-acked";
+        app.PumpGuarded();
+        app.FrameGuarded(ChatViewBubbleTest.Body);
+        int ackedH = chat.bubH;
+        True("receipt label adds a row on the last bubble",
+             ackedH > baseH);
+
+        // 非末条翻新（已送达 → 已读）：缓存签名只带末条的话这里高度
+        // 不变——回执就永远停在第一次画出来的样子。
+        msgs[msgs.Count - 2].kind = "";
+        msgs[msgs.Count - 6].kind = "wx-acked";
+        app.PumpGuarded();
+        app.FrameGuarded(ChatViewBubbleTest.Body);
+        int midH = chat.bubH;
+        True("receipt label on a middle bubble re-lays out",
+             midH > baseH);
+
+        msgs[msgs.Count - 6].kind = "wx-readed";
+        app.PumpGuarded();
+        app.FrameGuarded(ChatViewBubbleTest.Body);
+        EqInt("readed keeps the same height as acked", chat.bubH, midH);
+
+        Console.WriteLine(fails == 0 ? "CHATVIEWBUBBLE PASS"
+            : "CHATVIEWBUBBLE FAIL " + Convert.ToString(fails));
+    }
+}

@@ -9,6 +9,16 @@ namespace Gui.Component;
 /// （宿主据此弹出发言人的资料面板之类的名片界面）。
 delegate void ChatAvatarClick(int msgIndex);
 
+/// 一条消息被「引用」：宿主拿到消息下标与要引用的正文（用户选中了
+/// 一段就是那一段，未选中就是整条）。IM 客户端据此把引用块塞进
+/// 输入框，发送时把被引消息 id 一并带给服务端，对端才看得到引用关系。
+delegate void ChatQuote(int msgIndex, string text);
+
+/// 气泡上按下右键：宿主弹自己的菜单（复制 / 引用 / 转发…）。
+/// 组件不带任何菜单文案——文案与业务动作都是宿主的事，
+/// 这里只把「右键了哪一条、当前选中了什么」告诉宿主。
+delegate void ChatBubbleMenu(int msgIndex, string selText);
+
 /// 一条聊天消息：记录里显示的角色（user / assistant / tool / error）、
 /// 正文，以及这一轮的思考过程（没有则 ""）。
 ///
@@ -36,6 +46,17 @@ class ChatMessage {
     /// 解码）。非空时这一轮在气泡模式里画成一张图片气泡；正文仍然保留，
     /// 供记录模式（ChatStyle.Log）与复制使用。
     string img;
+    /// 宿主的消息 id（IM/服务端场景按 id 对账增量流；"" = 本地消息）。
+    string msgId;
+    /// 回执位（IM 用）：0 发出 / 1 送达 / 2 已读 / -1 别人的消息。
+    /// 渲染走 kind（宿主把 mark 翻成 "wx-acked" 一类的节拍串）。
+    int mark;
+    /// 引用回复：被引消息的发送者显示名与原文摘要（"" = 这条不是回复）。
+    /// 引用块画在自己气泡内、正文之上，与 IM 客户端的观感一致。
+    string quoteWho;
+    string quoteText;
+    /// 被引消息的宿主 id（发送时原样回给服务端，对端才能还原引用关系）。
+    string quoteId;
 
     /// 一条普通消息：无思考、无信封，时间戳取当前 UTC 时刻。
     static ChatMessage Create(string role, string text) {
@@ -51,6 +72,11 @@ class ChatMessage {
         m.call = "";
         m.at = DateTime.UtcNow().ToUnixSeconds();
         m.img = "";
+        m.msgId = "";
+        m.mark = -1;
+        m.quoteWho = "";
+        m.quoteText = "";
+        m.quoteId = "";
         return m;
     }
 
@@ -137,8 +163,20 @@ class ChatBubble {
     /// 名字行高度（群聊里别人的消息才有）与名字。
     int nameH;
     string name;
+    /// 引用块高度（这条消息是「引用某条消息」的回复时非 0）与内容：
+    /// 被引人的显示名 + 原文摘要。IM 客户端把引用画在正文上方那一条，
+    /// 与名字行占的是同一段纵向空间的两个位置（引用在下、名字在上）。
+    int quoteH;
+    string quoteWho;
+    string quoteText;
+    /// 已经省略号截好的引用行（`引用者: 摘要`），绘制时直接画它，
+    /// 免得每帧在一段长摘要上做一次二分。
+    string quoteShown;
     /// 气泡正文的换行结果与最长行宽（图片气泡为空 / 0）。
     List<string> lines;
+    /// 展示行 → 正文的字节偏移账（与 `lines` 同长）：鼠标落点换算成
+    /// 正文偏移、选区高亮反算每行的像素区间都要它。图片气泡为空。
+    WrappedText linesAt;
     int textW;
     /// 图片气泡的画面尺寸（0 = 文本气泡）。
     int imgW;
@@ -165,7 +203,12 @@ class ChatBubble {
         divText = "";
         nameH = 0;
         name = "";
+        quoteH = 0;
+        quoteWho = "";
+        quoteText = "";
+        quoteShown = "";
         lines = new List<string>();
+        linesAt = null;
         textW = 0;
         imgW = 0;
         imgH = 0;
@@ -176,6 +219,19 @@ class ChatBubble {
         bw = 0;
         bh = 0;
         waiting = false;
+    }
+}
+
+/// 气泡模式里的一处落点：命中第几条消息、落在正文的第几个字节。
+/// 选择按「消息下标 + 正文偏移」记（不是展示行/列）——展示行随窗口
+/// 宽度重排，正文偏移不会，改窗口宽度后选区仍框住同一段文字。
+class ChatHit {
+    int msg;
+    int off;
+
+    ChatHit() {
+        this.msg = 0 - 1;
+        this.off = 0;
     }
 }
 
@@ -237,6 +293,8 @@ class ChatView : Control {
     ChatClock clockOf;
     /// 气泡头像被点中时的宿主回调（bubble 模式专用，见 AvatarHit）。
     ChatAvatarClick avatarClick;
+    /// 气泡上右键的宿主回调（bubble 模式；null = 不响应右键）。
+    ChatBubbleMenu bubbleMenu;
     /// 命中测试要从鼠标坐标换算气泡几何，而点击事件到达时手里没有
     /// App 参数——OnPaint 把当帧的 app 缓存下来供 AvatarHit 用。
     App uiApp;
@@ -289,6 +347,23 @@ class ChatView : Control {
     /// 别人的气泡上方显示发言人名字（群聊）。自己发的永远不显示。
     bool showNames;
 
+    // ---- 气泡模式的文本选择（跨消息）--------------------------------
+    //
+    // 记录模式的选择走 StyledText 的等高行网格（LogState + 行/列）；
+    // 气泡模式的行不是等高的，同一套行列索引在这里没有意义，所以选择
+    // 按「消息下标 + 正文内字节偏移」记：(selMsg0, selOff0) 是拖拽起点，
+    // (selMsg1, selOff1) 是当前端点，两者谁前谁后由取值比较决定。
+    // 偏移是正文（msg.text）里的字节位置，不是展示行里的位置——展示行
+    // 随窗口宽度重排，正文偏移不会；窗口一改宽，选区仍框住同一段文字。
+    int selMsg0;
+    int selOff0;
+    int selMsg1;
+    int selOff1;
+    bool selDrag;
+    /// 宿主回调：用户对某条消息选择「引用」。文本是选中部分（没有选区
+    /// 就是整条），宿主据此在输入区拉起引用条。
+    ChatQuote quoteCb;
+
     /// 空视图：英文默认文案，常驻的记录网格与空态提示都已建好
     /// （是否显示由每帧绘制决定）。
     ChatView() {
@@ -303,7 +378,14 @@ class ChatView : Control {
         clockOf = null;
         // 气泡模式的点击落在子网格 StyledText 上，到不了这里；整条
         // 点击链由 AvatarHit 用当帧几何自己判（日志模式它自会退出）。
+        // 双击同样由几何判定：气泡的行不是等高的，StyledText 的
+        // 行/列命中在气泡模式下没有意义。
         this.OnClick(() => { this.AvatarHit(); });
+        this.OnDoubleClick(() => {
+            if (uiApp != null && style == ChatStyle.Bubble()) {
+                this.BubbleDoubleClick(uiApp);
+            }
+        });
         cache = new List<TextRun>();
         cacheTurns = 0;
         cachePrefix = 0;
@@ -323,6 +405,11 @@ class ChatView : Control {
         bubSig = "";
         showNames = false;
         sel = new LogState();
+        selMsg0 = 0 - 1; selOff0 = 0;
+        selMsg1 = 0 - 1; selOff1 = 0;
+        selDrag = false;
+        quoteCb = null;
+        bubbleMenu = null;
         busy = false;
         grid = new StyledText();
         grid.DockFill();
@@ -458,8 +545,24 @@ class ChatView : Control {
         bubKey = "";
     }
 
-    /// 当前选中的文本（未选中则 ""）。
-    string SelectedText() { return ChatView.SelectionText(show, sel); }
+    /// 当前选中的文本（未选中则 ""）。气泡模式下回答气泡选区，
+    /// 记录模式下回答行网格选区——宿主两个模式都可能用。
+    string SelectedText() {
+        if (style == ChatStyle.Bubble()) { return this.BubbleSelectionText(); }
+        return ChatView.SelectionText(show, sel);
+    }
+
+    /// 气泡模式下是否有选区（宿主菜单据此决定「复制」是灰的还是亮的）。
+    bool HasSelection() {
+        if (style == ChatStyle.Bubble()) { return this.HasBubbleSelection(); }
+        return sel.HasSelection();
+    }
+
+    /// 清空当前选择（气泡/记录两模式通用）。
+    void ClearSelection() {
+        if (style == ChatStyle.Bubble()) { this.ClearBubbleSelection(); return; }
+        sel.ClearSelection();
+    }
 
     // ---- retained 钩子 ----------------------------------------------
 
@@ -481,7 +584,9 @@ class ChatView : Control {
         if (bubMode) {
             this.TakeBubbleWheel(app);
             this.BuildBubble(app);
+            this.BubbleMouse(app);
             this.PaintBubbles(app);
+            this.TakeBubbleCopy(app);
             return;
         }
         this.TakeWheel(app);
@@ -539,6 +644,234 @@ class ChatView : Control {
         }
     }
 
+    /* ---- 气泡模式的正文落点与选择 ---- */
+
+    /// 把视口坐标换成「第几条消息、正文第几个字节」。
+    /// `clamp` 为真时越界的 y 收进最近的一条（拖选时指针拖出视口上下的
+    /// 常用语义），为假时返回 msg = -1（右键/按键只认真实落点）。
+    ChatHit HitBubble(App app, int mx, int my, bool clamp) {
+        ChatHit h = new ChatHit();
+        if (bubKey == "" || bub == null || bub.Count == 0) { return h; }
+        int pad = app.Scale(12);
+        int padV = app.Scale(10);
+        int avaD = app.Scale(34);
+        int gapA = app.Scale(8);
+        int tailW = app.Scale(6);
+        int padX = app.Scale(12);
+        int padY = app.Scale(9);
+        int fontPx = ChatView.BubbleFont(app);
+        int lineH = Canvas.FontHeight(fontPx) + app.Scale(3);
+        int viewH = bh - padV * 2;
+        if (viewH < 0) { viewH = 0; }
+        int over = bubH - viewH;
+        if (over < 0) { over = 0; }
+        int y0 = by + padV - (over - bscr.Get());
+        int fallMsg = 0 - 1;
+        int fallOff = 0;
+        for (int i = 0; i < bub.Count; i = i + 1) {
+            ChatBubble b = bub[i];
+            if (b.waiting) { continue; }
+            int ry = y0 + b.top;
+            int rowH = avaD;
+            if (b.bh > rowH) { rowH = b.bh; }
+            // 纵向含气泡上方的名字/回执行与时刻分隔：落在它们上面也算
+            // 落在这条消息上（拖选经过时间分隔不该断掉）。
+            int top = ry - b.nameH - b.divH;
+            int bottom = ry + rowH;
+            if (my < top || my >= bottom) {
+                if (!clamp) { continue; }
+                // 拖选钳位：指针在第一条之上 → 这条的开头；越过某条
+                // 下沿先记成「这条的结尾」，全部走完仍未命中就取它
+                // （指针拖到最末条之下 = 选到结尾）。
+                if (my < top) { h.msg = b.idx; h.off = 0; return h; }
+                fallMsg = b.idx;
+                fallOff = 0;
+                if (b.linesAt != null && b.linesAt.lines.Count > 0) {
+                    int ll = b.linesAt.lines.Count - 1;
+                    fallOff = b.linesAt.starts[ll] + b.linesAt.lines[ll].Length;
+                }
+                continue;
+            }
+            h.msg = b.idx;
+            int bx0 = 0;
+            if (b.mine) {
+                int avaX = bx + bw - pad - avaD;
+                bx0 = avaX - gapA - tailW - b.bw;
+            } else {
+                int avaX = bx + pad;
+                bx0 = avaX + avaD + gapA + tailW;
+            }
+            // 横向也要落在气泡上：头像、气泡与头像之间的空隙、气泡外侧
+            // 的空白都不算「点了这条消息的正文」——否则点头像会顺带
+            // 建立起一个空选区。
+            if (mx < bx0 || mx >= bx0 + b.bw) { h.msg = 0 - 1; return h; }
+            if (b.imgW > 0) { h.off = 0; return h; }
+            int tx = bx0 + padX;
+            int ty = ry + padY + b.quoteH;
+            if (my < ty) { h.off = 0; return h; }
+            int li = (my - ty) / lineH;
+            if (b.linesAt == null || b.linesAt.lines.Count == 0) { h.off = 0; return h; }
+            if (li < 0) { li = 0; }
+            int lastLine = b.linesAt.lines.Count - 1;
+            if (li >= b.linesAt.lines.Count) {
+                h.off = b.linesAt.starts[lastLine] + b.linesAt.lines[lastLine].Length;
+                return h;
+            }
+            string ln = b.linesAt.lines[li];
+            int col = LogView.ColAt(ln, tx, fontPx, mx);
+            col = Text.ClampCharStart(ln, col);
+            h.off = b.linesAt.starts[li] + col;
+            return h;
+        }
+        if (clamp && fallMsg >= 0) { h.msg = fallMsg; h.off = fallOff; }
+        return h;
+    }
+
+    /// 选择区间归一化后的两端（谁在文档里靠前谁当起点）。
+    void SelRange(out int m0, out int o0, out int m1, out int o1) {
+        m0 = selMsg0; o0 = selOff0; m1 = selMsg1; o1 = selOff1;
+        if (m0 < 0) { return; }
+        if (m1 < 0) { m1 = m0; o1 = o0; return; }
+        bool swap = m1 < m0 || (m1 == m0 && o1 < o0);
+        if (swap) {
+            int tm = m0; m0 = m1; m1 = tm;
+            int to = o0; o0 = o1; o1 = to;
+        }
+    }
+
+    /// 气泡模式下选中的文本（跨消息拼接，未选中为 ""）。
+    string BubbleSelectionText() {
+        if (selMsg0 < 0 || data == null) { return ""; }
+        int m0 = 0; int o0 = 0; int m1 = 0; int o1 = 0;
+        this.SelRange(out m0, out o0, out m1, out o1);
+        if (m0 == m1 && o0 == o1) { return ""; }
+        string outp = "";
+        int last = m1;
+        if (last >= data.Count) { last = data.Count - 1; }
+        for (int m = m0; m <= last; m = m + 1) {
+            if (m < 0) { continue; }
+            string t = data[m].text;
+            int s = 0;
+            int e = t.Length;
+            if (m == m0) { s = o0; }
+            if (m == m1) { e = o1; }
+            s = Text.ClampCharStart(t, s);
+            e = Text.ClampCharStart(t, e);
+            if (s < 0) { s = 0; }
+            if (e > t.Length) { e = t.Length; }
+            if (s > e) { s = e; }
+            if (outp.Length > 0) { outp = outp + "\n"; }
+            outp = outp + t.Substring(s, e - s);
+        }
+        return outp;
+    }
+
+    /// 有选区（跨一个字符即算）。
+    bool HasBubbleSelection() {
+        if (selMsg0 < 0 || selMsg1 < 0) { return false; }
+        return !(selMsg0 == selMsg1 && selOff0 == selOff1);
+    }
+
+    /// 清掉气泡选区。
+    void ClearBubbleSelection() {
+        selMsg0 = 0 - 1; selOff0 = 0;
+        selMsg1 = 0 - 1; selOff1 = 0;
+        selDrag = false;
+    }
+
+    /// 起始偏移落在某个字符中间时钳到边界（拖选端点不得切开多字节字符）。
+    ChatHit SnapHit(ChatHit h) {
+        if (h.msg < 0 || data == null || h.msg >= data.Count) { return h; }
+        h.off = Text.ClampCharStart(data[h.msg].text, h.off);
+        return h;
+    }
+
+    /// 气泡模式的鼠标处理：按下起选、移动续选、松开收尾、双击选整条、
+    /// 右键把落点交给宿主菜单。滚动拖动与头像点击优先，命中不了正文
+    /// 的落点不建立选区。
+    void BubbleMouse(App app) {
+        if (bubKey == "") { return; }
+        int kind = app.EventKind();
+        bool inside = app.mouseX >= bx && app.mouseX < bx + bw
+            && app.mouseY >= by && app.mouseY < by + bh;
+        if (kind == 1) {
+            if (selDrag) {
+                ChatHit h = this.SnapHit(this.HitBubble(app, app.mouseX, app.mouseY, true));
+                if (h.msg >= 0) {
+                    selMsg1 = h.msg;
+                    selOff1 = h.off;
+                    app.RequestRedraw();
+                }
+            }
+            return;
+        }
+        if (kind == 2 && app.window.EventButton() == 0) {
+            if (app.PointerCaptured()) { return; }
+            ChatHit h = this.SnapHit(this.HitBubble(app, app.mouseX, app.mouseY, false));
+            if (h.msg < 0) {
+                // 点在空白/头像上：清掉旧选区（头像点击由 Click 那条链管）。
+                if (this.HasBubbleSelection()) {
+                    this.ClearBubbleSelection();
+                    app.RequestRedraw();
+                }
+                return;
+            }
+            selMsg0 = h.msg; selOff0 = h.off;
+            selMsg1 = h.msg; selOff1 = h.off;
+            selDrag = true;
+            app.RequestRedraw();
+            return;
+        }
+        if (kind == 3) {
+            if (app.window.EventButton() == 0 && selDrag) {
+                selDrag = false;
+                app.RequestRedraw();
+                return;
+            }
+            // 右键：把落点与当前选中交给宿主菜单。组件不带菜单文案。
+            if (app.window.EventButton() == 1 && bubbleMenu != null && inside) {
+                ChatHit h = this.SnapHit(this.HitBubble(app, app.mouseX, app.mouseY, false));
+                if (h.msg >= 0) {
+                    string selTxt = this.BubbleSelectionText();
+                    if (selTxt == "") { selTxt = data[h.msg].text; }
+                    bubbleMenu(h.msg, selTxt);
+                    app.RequestRedraw();
+                }
+            }
+            return;
+        }
+    }
+
+    /// 双击选整条（IM 惯例：双击一条消息选中它，右键即可引用/复制）。
+    void BubbleDoubleClick(App app) {
+        if (bubKey == "" || data == null) { return; }
+        ChatHit h = this.HitBubble(app, app.mouseX, app.mouseY, false);
+        if (h.msg < 0 || h.msg >= data.Count) { return; }
+        selMsg0 = h.msg; selOff0 = 0;
+        selMsg1 = h.msg; selOff1 = data[h.msg].text.Length;
+        app.RequestRedraw();
+    }
+
+    /// 宿主注册「气泡被右键」回调（复制/引用/转发一类菜单由宿主出）。
+    ChatView OnBubbleMenu(ChatBubbleMenu cb) {
+        bubbleMenu = cb;
+        return this;
+    }
+
+    /// 宿主注册「引用了一条消息」回调（选中部分或整条）。
+    ChatView OnQuote(ChatQuote cb) {
+        quoteCb = cb;
+        return this;
+    }
+
+    /// 消息的显示名（引用块里标「引用谁」用；与气泡上方的发言人同一口径）。
+    string NameOf(int idx) {
+        if (data == null || idx < 0 || idx >= data.Count) { return ""; }
+        ChatMessage m = data[idx];
+        if (m.role == "user") { return str.you; }
+        return this.SpeakerName(m);
+    }
+
     /// 指针在气泡区上时滚轮滚动：气泡是像素滚动的，一档滚 40px（约一
     /// 行多一点），而不是记录模式的一整行。
     void TakeBubbleWheel(App app) {
@@ -553,7 +886,11 @@ class ChatView : Control {
         int viewH = bh - padV * 2;
         int over = bubH - viewH;
         if (over < 0) { over = 0; }
-        bscr.Set(bscr.Get() - step * app.Scale(40));
+        // bscr 是「离底部多少像素」（与记录模式的 scrollSig 同一语义：
+        // 0 = 贴住最新一条）。滚轮向上 = step 为正 = 要看更旧的内容 =
+        // 离底部更远，所以是加不是减——此前这里写成减号，滚轮方向整个
+        // 反了（向上滚反而跳到最新）。
+        bscr.Set(bscr.Get() + step * app.Scale(40));
         if (bscr.Get() > over) { bscr.Set(over); }
         if (bscr.Get() < 0) { bscr.Set(0); }
         app.RequestRedraw();
@@ -582,6 +919,34 @@ class ChatView : Control {
         if (app.mouseY < by || app.mouseY > by + bh) { return; }
         Clipboard.SetText(this.SelectedText());
         app.RequestRedraw();
+    }
+
+    /// 气泡模式下 Ctrl+C 复制选区、Ctrl+A 全选当前会话。
+    /// 按键是窗口级事件，不要求指针正悬在控件上（记录模式那条
+    /// 旧口径要求鼠标在框内，是当年点选语义的遗留；键盘复制不该
+    /// 因为鼠标恰好移开了就失效）。命中区间用本控件的矩形限定：
+    /// 一个窗口里叠着多个 ChatView 时不让它们一起响应。
+    void TakeBubbleCopy(App app) {
+        if (app.EventKind() != 4) { return; }
+        if (!Modifiers.HasCtrl(app.window.EventMods())) { return; }
+        int code = app.window.EventKeyCode();
+        if (code == 67) {                        // Ctrl+C
+            if (!this.HasBubbleSelection()) { return; }
+            if (app.mouseX < bx || app.mouseX > bx + bw) { return; }
+            if (app.mouseY < by || app.mouseY > by + bh) { return; }
+            Clipboard.SetText(this.BubbleSelectionText());
+            app.RequestRedraw();
+            return;
+        }
+        if (code == 65) {                        // Ctrl+A：全选
+            if (data == null || data.Count == 0) { return; }
+            if (app.mouseX < bx || app.mouseX > bx + bw) { return; }
+            if (app.mouseY < by || app.mouseY > by + bh) { return; }
+            selMsg0 = 0; selOff0 = 0;
+            selMsg1 = data.Count - 1;
+            selOff1 = data[data.Count - 1].text.Length;
+            app.RequestRedraw();
+        }
     }
 
     /// 换行缓存：只有记录、宽度、字号或折叠状态变了才重建，而且只有
@@ -1088,14 +1453,28 @@ class ChatView : Control {
             return;
         }
         int fontPx = ChatView.BubbleFont(app);
+        /* 缓存签名要把"决定高度的那几样"全带上：条数、末条的正文/角色/
+           回执种类，以及**每一条**的回执种类——回执行小字挤占的是
+           名字行的高度，而回执是按 id 对账逐条翻的，末条之外某条的
+           已送达→已读不会改末条签名。不带的话第一次渲染之后回执就
+           冻在缓存里不再重画（实测：已读永远不亮）。 */
+        /* 引用摘要的长度也要进签名：引用是随增量流补上来的（先落正文，
+           下一拍才补被引原文的摘要），只带 kind 的话引用条永远画不出来。 */
+        string markSig = "";
+        for (int mi = 0; mi < count; mi = mi + 1) {
+            markSig = markSig + data[mi].kind + "/"
+                + Convert.ToString(data[mi].quoteText.Length)
+                + Convert.ToString(data[mi].quoteWho.Length) + ",";
+        }
         string tailSig = "-";
         if (count > 0) {
             ChatMessage tm = data[count - 1];
             tailSig = Convert.ToString(tm.text.Length + tm.img.Length)
-                + "/" + tm.role;
+                + "/" + tm.role + "/" + tm.kind;
         }
         string layoutSig = this.BubbleLayoutSig(app);
         string keyNow = layoutSig + ":" + Convert.ToString(count) + ":" + tailSig
+            + ":" + Convert.ToString(markSig.Length) + ":" + markSig
             + ":" + (busy ? "1" : "0");
         if (keyNow == bubKey) { return; }
         // 行宽变了就整份重排：留着的选区会框住错的文本，换上来的那一帧
@@ -1112,9 +1491,10 @@ class ChatView : Control {
         int padY = app.Scale(9);
         int lineH = Canvas.FontHeight(fontPx) + app.Scale(3);
         int nameH = 0;
+        int tinyH = Canvas.FontHeight(Style.FontFallback(app, "tiny"))
+            + app.Scale(3);
         if (showNames) {
-            nameH = Canvas.FontHeight(Style.FontFallback(app, "tiny"))
-                + app.Scale(3);
+            nameH = tinyH;
         }
         int maxBub = bw - pad * 2 - avaD - gapA - tailW;
         int cap = bw * bubWMille / 1000;
@@ -1152,6 +1532,32 @@ class ChatView : Control {
                 b.nameH = nameH;
                 b.name = this.SpeakerName(msg);
             }
+            // 我发的消息带协议节拍时（IM 的送达/已读回执），名字行的
+            // 位置复用为气泡上方的回执小字（右对齐）——群聊里「别人的
+            // 消息上方有名字」占的是同一截空间，布局不用另开一路。
+            if (mine && msg.kind != "" && kindLabelOf != null) {
+                string lbl = kindLabelOf(msg.kind);
+                if (lbl != "") {
+                    b.nameH = tinyH;
+                    b.name = lbl;
+                }
+            }
+            // 引用条：这一条是「回复某条消息」时，把被引人的名字与原文
+            // 摘要画在自己气泡内、正文之上（IM 客户端的通用观感）。
+            // 高度并进气泡高度，正文整体下移——命中测试与绘制都读
+            // b.quoteH，所以引用条永远和正文对得上。
+            if (msg.quoteText != "" || msg.quoteWho != "") {
+                int qf = Style.FontFallback(app, "tiny");
+                string qt = msg.quoteText.Replace("\r\n", " ").Replace("\n", " ");
+                string head = "";
+                if (msg.quoteWho != "") { head = msg.quoteWho + "："; }
+                int qw = textW - app.Scale(8);
+                if (qw < app.Scale(20)) { qw = app.Scale(20); }
+                b.quoteShown = Ellipsis.Fit(head + qt, qw, qf);
+                b.quoteWho = msg.quoteWho;
+                b.quoteText = qt;
+                b.quoteH = Canvas.FontHeight(qf) + app.Scale(10);
+            }
             // 时刻分隔：轮次开头、或与上一句隔得够久。
             if (msg.at > 0 && msg.at - prevAt[0] >= ChatView.BubbleTimeGap()) {
                 b.divH = lineH + app.Scale(8);
@@ -1182,7 +1588,11 @@ class ChatView : Control {
                 }
             }
             if (b.imgW <= 0) {
-                List<string> ls = TextWrap.Lines(msg.text, textW, fontPx);
+                // 带偏移账的换行：展示行 → 正文字节偏移。落点换算与
+                // 选区高亮都要它（纯 `TextWrap.Lines` 丢掉了行首偏移）。
+                WrappedText wt = TextWrap.LinesAt(msg.text, textW, fontPx);
+                b.linesAt = wt;
+                List<string> ls = wt.lines;
                 int widest = 0;
                 for (int li = 0; li < ls.Count; li = li + 1) {
                     int lw = Canvas.MeasureText(ls[li], fontPx);
@@ -1191,8 +1601,15 @@ class ChatView : Control {
                 b.lines = ls;
                 b.textW = widest;
                 b.bw = widest + padX * 2;
+                // 引用条比自己那几行正文宽时，气泡要撑到引用条的宽度。
+                int qMin = 0;
+                if (b.quoteShown != "") {
+                    qMin = Canvas.MeasureText(b.quoteShown,
+                        Style.FontFallback(app, "tiny")) + padX * 2 + app.Scale(10);
+                }
+                if (qMin > b.bw) { b.bw = qMin; }
                 if (b.bw > maxBub) { b.bw = maxBub; }
-                b.bh = ls.Count * lineH + padY * 2;
+                b.bh = ls.Count * lineH + padY * 2 + b.quoteH;
             }
             b.top = yy + b.divH + b.nameH;
             int rowH = avaD;
@@ -1260,6 +1677,19 @@ class ChatView : Control {
                                       "", "", Style.SNormal());
         StyleBox nameBox = Style.Part(app, "chatview", "name", "",
                                       "", "", Style.SNormal());
+        StyleBox quoteMine = Style.Part(app, "chatview", "quote", "",
+                                        "mine", "", Style.SNormal());
+        StyleBox quoteOther = Style.Part(app, "chatview", "quote", "",
+                                         "other", "", Style.SNormal());
+        // 选区底色分两套：我方气泡是主色底，通用选区色（主色半透明）压在
+        // 同色底上等于没画——那一侧换成反色半透明。
+        StyleBox selMine = Style.Part(app, "chatview", "sel", "",
+                                      "mine", "", Style.SNormal());
+        StyleBox selOther = Style.Part(app, "chatview", "sel", "",
+                                       "other", "", Style.SNormal());
+        int sm0 = 0; int so0 = 0; int sm1 = 0; int so1 = 0;
+        this.SelRange(out sm0, out so0, out sm1, out so1);
+        bool hasSel = sm0 >= 0 && !(sm0 == sm1 && so0 == so1);
         int pad = app.Scale(12);
         int padV = app.Scale(10);
         int avaD = app.Scale(34);
@@ -1347,7 +1777,55 @@ class ChatView : Control {
                     0, 0, 0, 0);
             } else {
                 int ty = ry + padY;
+                // 引用条：气泡内正文之上的一截，左侧一条竖线标出引用块。
+                if (b.quoteH > 0 && b.quoteShown != "") {
+                    int qf = Style.FontFallback(app, "tiny");
+                    int qfg = quoteOther.FgOr(0);
+                    if (b.mine) { qfg = quoteMine.FgOr(0); }
+                    int barCol = quoteOther.BorderOr(0);
+                    if (b.mine) { barCol = quoteMine.BorderOr(0); }
+                    int barW = app.Scale(2);
+                    int qh = Canvas.FontHeight(qf);
+                    c.FillRect(bx0 + padX, ty + app.Scale(2), barW,
+                        qh + app.Scale(4), barCol);
+                    c.DrawText(bx0 + padX + barW + app.Scale(6), ty,
+                        b.quoteShown, qfg, qf);
+                    ty = ty + b.quoteH;
+                }
+                // 选区底：先铺整条，再按字节偏移反算每行的像素区间。
+                // 选区画在气泡底色之上、文字之下。
+                int selCol = selOther.BgOr(0);
+                if (b.mine) { selCol = selMine.BgOr(0); }
+                bool rowSel = hasSel && b.idx >= sm0 && b.idx <= sm1;
                 for (int li = 0; li < b.lines.Count; li = li + 1) {
+                    if (rowSel && selCol != 0 && b.linesAt != null
+                        && li < b.linesAt.lines.Count) {
+                        string ln = b.lines[li];
+                        int hs = b.linesAt.starts[li];
+                        int he = hs + ln.Length;
+                        if (b.idx == sm0 && so0 > hs) { hs = so0; }
+                        if (b.idx == sm1 && so1 < he) { he = so1; }
+                        if (hs < b.linesAt.starts[li]) { hs = b.linesAt.starts[li]; }
+                        if (he > b.linesAt.starts[li] + ln.Length) {
+                            he = b.linesAt.starts[li] + ln.Length;
+                        }
+                        if (he > hs) {
+                            int cs = hs - b.linesAt.starts[li];
+                            int ce = he - b.linesAt.starts[li];
+                            cs = Text.ClampCharStart(ln, cs);
+                            ce = Text.ClampCharStart(ln, ce);
+                            int hx0 = bx0 + padX
+                                + Canvas.MeasureText(Text.Left(ln, cs), fontPx);
+                            int hx1 = bx0 + padX
+                                + Canvas.MeasureText(Text.Left(ln, ce), fontPx);
+                            // 行尾接续下一行时空选区要看得见：至少给 2px。
+                            if (b.idx < sm1 && ce >= ln.Length) {
+                                hx1 = hx1 + app.Scale(4);
+                            }
+                            if (hx1 < hx0 + 2) { hx1 = hx0 + 2; }
+                            c.FillRect(hx0, ty, hx1 - hx0, lineH, selCol);
+                        }
+                    }
                     c.DrawText(bx0 + padX, ty, b.lines[li], fg, fontPx);
                     ty = ty + lineH;
                 }

@@ -2018,6 +2018,23 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_listview_scrollbar_drag${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # ChatView 气泡模式回归（桌面 IM 客户端实机反馈“消息乱码、滚动条方向
+  # 反了、已读标记看不见”）：(1) bscr 的语义是“离底部多少像素”，滚轮
+  # 向上=看更旧=离底部更远=加；写成减号时向上滚被钳在 0，界面纹丝
+  # 不动而向下滚直接到底。(2) 已送达/已读小字复用名字行那截高度，
+  # 而名字行高度只在群聊 showNames 时非零——一对一里标签没有高度可
+  # 占，服务端 acked/readed 全对却一个像素都看不见；名字行高度必须
+  # 独立于 showNames 计算。(3) 重排缓存签名要带每条 message 的 kind，
+  # 否则非末条的回执从已送达变已读时签名不变，冻在缓存里永不重画。
+  add_test(NAME conformance_gui_chatview_bubble
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/chatview_bubble_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_chatview_bubble.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_chatview_bubble${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # ListView 禁用行（不可选选项）回归：WithSelectable 的门与模板行
   # 控件自带 Disabled 都必须关死行的全部选择途径——点选、Ctrl+点选、
   # Shift+范围（内部禁用行跳过）、右键、程序化 SelectIndex、悬停。

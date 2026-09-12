@@ -214,6 +214,23 @@ class Text {
     }
 }
 
+/// 换行结果：`lines[i]` 是第 i 个展示行，`starts[i]` 是它在原文里的
+/// 起始字节偏移。
+///
+/// 偏移不是可有可无的：鼠标落点要先换算成「第几行第几列」再折回原文的
+/// 字节位置，选中高亮又要反着算回每行的像素区间。只留行文本的话，这条
+/// 展示行 ↔ 原文的映射每个调用方都得自己再扫一遍，硬换行被吃掉的那一
+/// 个字节还会各算各的（选中文本多一个/少一个换行）。
+class WrappedText {
+    List<string> lines;
+    List<int> starts;
+
+    WrappedText() {
+        this.lines = new List<string>();
+        this.starts = new List<int>();
+    }
+}
+
 /// 位于 `Text` 类之外的文本辅助函数，这样声明了同名
 /// `Text` 成员（Label）的控件仍能调用它们，而不被成员遮蔽
 /// 类名。对字符串的纯函数，外加基于像素的换行。
@@ -234,6 +251,54 @@ class TextWrap {
         }
         if (a == 0 && z == len) { return s; }
         return s.Substring(a, z - a);
+    }
+
+    /// 换行并记录每行在原文里的起始字节偏移（`Lines` 的带账版本）。
+    ///
+    /// 换行规则与 `Lines` 逐字一致（调用方按行绘制时两者结果必须同一
+    /// 份）；差别只在这里把每行的起点也留下来。硬换行（字节 10）不计
+    /// 入行文本，因此下一行的起点要跳过它——偏移口径与 `Lines` 拼回
+    /// 原文时丢掉的正是那一个换行符，两处一致才对得上。
+    static WrappedText LinesAt(string s, int maxW, int fs) {
+        // `out` 是语言关键字（out 参数），局部变量不能叫它。
+        WrappedText acc = new WrappedText();
+        if (maxW <= 0) { maxW = 1; }
+        int len = s.Length;
+        int i = 0;
+        while (i < len) {
+            if (s[i] == 10) {
+                acc.starts.Add(i);
+                acc.lines.Add("");
+                i = i + 1;
+                continue;
+            }
+            int w = 0;
+            int k = i;
+            int lastSpace = -1;
+            int end = i;
+            while (k < len && s[k] != 10) {
+                int kk = Text.NextCharEnd(s, k);
+                int cw = Canvas.MeasureText(s.Substring(k, kk - k), fs);
+                if (w + cw > maxW && end > i) { break; }
+                w = w + cw;
+                end = kk;
+                if (s[k] == 32) { lastSpace = kk; }
+                k = kk;
+            }
+            int take = end;
+            if (k < len && s[k] != 10 && lastSpace > i) { take = lastSpace; }
+            if (take <= i) { take = Text.NextCharEnd(s, i); }
+            acc.starts.Add(i);
+            acc.lines.Add(s.Substring(i, take - i));
+            i = take;
+            if (i < len && s[i] == 10) { i = i + 1; }
+        }
+        if (acc.lines.Count == 0) {
+            acc.starts.Add(0);
+            acc.lines.Add("");
+            return acc;
+        }
+        return acc;
     }
 
     /// 将 `s` 拆成行，每行在 `fs` 磅下都能放进 `maxW` 像素，
