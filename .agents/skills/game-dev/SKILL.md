@@ -359,3 +359,25 @@ Post 调用核对编码，别信二手注释。
   日志尾却是 `TEST_FAIL`。判定看日志里的 `tests passed` / `TEST_FAIL` 文本，
   不看管道退出码；失败项先按名字归因（网络类 / 其他会话未提交的 stdlib
   改动 / 属性计数漂移），再决定是不是自己的。
+
+
+## GUI 登录门（登录成功才进主窗）定式（2026-09-12 gui-wechat 实测）
+
+- **时序**：GenForm 顺序是 Show→__CreateWindow(→OnLoad)→Run，在 OnLoad 里
+  阻塞即"主窗 Show 之前"的门。子窗类（ChildWindow 子类，覆写 Title/Width/
+  Height/ShowMaximize/IdBase）用 `OpenStandalone()` + `PumpStandaloneUntil(
+  stop)` 泵自己的事件循环；登录成功置位 stop 条件返回 true，主窗才继续。
+  进程内没有干净的"放弃启动"出口：登录窗被直接关掉 = Pump 返回 false，
+  宿主 `while (!WxLoginWindow.Run()) { }` 重新拉起（门必须闩住）。
+- **子页超高**：登录窗固定高里，注册/改密/找回 4 输入页比登录页（2 输入
+  +链接行）高，大头像页头占 ~90px 会把页尾按钮挤出固定窗高被裁。翻页时
+  收起大头像（原版微信子页也没有头像）即可，标题行保留。
+- **窗口根用 dock 布局**（head/titlerow dock=1 吸顶，status/foot dock=2 
+  落底，页区 dock=5 吃剩余）——纯流式排布在窗口根里会把底部行挤到页前面
+  （WxChatWindow 同款成熟定式）。
+- **UiDriver 限制**：`ZAN_UI_SCRIPT` 只绑第一个 App（`if (active) return;
+  `），主 App 在 OnLoad 前构造 → 登录独立窗驱动不了。实机验证用
+  SetCursorPos+mouse_event 真实点击（坐标 = WinRect + 自绘标题栏 50 物理px）；
+  注意 Agent 会话注入的点击可能到不了用户交互桌面的窗口（WM_CLOSE 能到而
+  鼠标不到=会话隔离），此时用"探针页码"（构造后直接 ShowPage(n) 的静态槽）
+  做无头布局截图，交互行为留给用户实机点。
