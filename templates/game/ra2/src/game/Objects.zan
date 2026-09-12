@@ -633,6 +633,12 @@ class UnitType {
     int sight;
     // Order/selection voices (the rules' VoiceSelect= and friends).
     TechnoVoices voices;
+    // The TechnoRules sound keys, plain sound.ini names ("" = unset): the
+    // spawn chirp, the deploy stance toggle's two directions, the death cry.
+    string createSound;
+    string deploySound;
+    string undeploySound;
+    string dieSound;
 
     static UnitType Create(string reg, string label, int cost, int buildTime,
                            int hp, string shpName, int armor, Weapon primary,
@@ -672,6 +678,10 @@ class UnitType {
         t.deployedStart = 0;
         t.deployedFrames = 1;
         t.voices = TechnoVoices.Create();
+        t.createSound = "";
+        t.deploySound = "";
+        t.undeploySound = "";
+        t.dieSound = "";
         return t;
     }
 
@@ -682,6 +692,17 @@ class UnitType {
     int Hp() { return this.hp; }
     TechnoVoices Voices() { return this.voices; }
     void SetVoices(TechnoVoices v) { this.voices = v; }
+    string CreateSound() { return this.createSound; }
+    string DeploySound() { return this.deploySound; }
+    string UndeploySound() { return this.undeploySound; }
+    string DieSound() { return this.dieSound; }
+    void SetSoundKeys(string createSnd, string deploySnd, string undeploySnd,
+                      string dieSnd) {
+        this.createSound = createSnd;
+        this.deploySound = deploySnd;
+        this.undeploySound = undeploySnd;
+        this.dieSound = dieSnd;
+    }
     bool Amphibious() { return this.amphibious; }
     string ShpName() { return this.shpName; }
     string TurretVxl() { return this.turretVxl; }
@@ -905,6 +926,8 @@ class UnitCatalog {
             t.SetSpeed(d.Speed() > 0 ? d.Speed() : d.Steps() * 4);
             t.SetSight(d.Sight());
             t.SetVoices(d.Voices());
+            t.SetSoundKeys(d.CreateSound(), d.DeploySound(),
+                           d.UndeploySound(), d.DieSound());
             l.Add(t);
         }
         return l;
@@ -1041,6 +1064,9 @@ class StructureType {
     int sight;           // the shroud reveal radius (rules Sight=, default 1)
     bool conYard;        // rules ConstructionYard=: the free-MCV crate gate
     TechnoVoices voices; // order/selection voices off the def
+    string slamSound;    // TechnoRules SlamSound=: the placement thud
+    string dieSound;     // TechnoRules DieSound=: the death cry (falls back
+                         // to the BuildingDieSound key when unset)
 
     static StructureType Create(BuildingDef d) {
         StructureType t = new StructureType();
@@ -1068,6 +1094,8 @@ class StructureType {
         t.conYard = d.IsConYard();
         t.techLevel = d.TechLevel();
         t.voices = d.Voices();
+        t.slamSound = d.SlamSound();
+        t.dieSound = d.DieSound();
         return t;
     }
 
@@ -1079,6 +1107,8 @@ class StructureType {
     int TechLevel() { return this.techLevel; }
     void SetTechLevel(int l) { this.techLevel = l; }
     TechnoVoices Voices() { return this.voices; }
+    string SlamSound() { return this.slamSound; }
+    string DieSound() { return this.dieSound; }
     int FootprintW() { return this.footprintW; }
     int FootprintH() { return this.footprintH; }
     int Hp() { return this.hp; }
@@ -1981,15 +2011,20 @@ class World {
         } else if (type == Rules.PowerupTiberium()) {
             ok = this.GrantCrateOre(x, y);
         }
+        // The pickup speaks for the RESOLVED outcome: a grant that failed
+        // degrades to money above, so the money crate is the one heard. A
+        // hostile pickup stays silent (the reference's isHostilePickup).
+        int resolvedType = ok ? type : Rules.PowerupMoney();
         if (!ok) {
             for (int i = 0; i < rules.PowerupCount(); i = i + 1) {
                 if (rules.PowerupTypeAt(i) == Rules.PowerupMoney()
                  && rules.PowerupSharesAt(i) > 0) {
                     this.GrantMoneyCrate(side, rules.PowerupDataAt(i));
-                    return;
+                    break;
                 }
             }
         }
+        this.SndCrateFeedback(side, x, y, resolvedType);
     }
 
     /// <summary>The money payout, the reference's grantMoneyPowerup: the
@@ -2037,7 +2072,9 @@ class World {
         if (zero >= 0) {
             WorldObject d = this.objects[zero];
             int armor = this.ArmorOf(d);
-            d.TakeDamageAs(dmg * wh.Verse(armor) / 100, wh.InfDeath());
+            int zd = dmg * wh.Verse(armor) / 100;
+            d.TakeDamageAs(zd, wh.InfDeath());
+            this.SndBuildingDamage(d, zd);
             this.SuppressTrooper(d);
         }
         if (wh.Spread() <= 0) { return true; }
@@ -2057,6 +2094,7 @@ class World {
             int damp = (radius - d2) * (dmg * half / 100) / radius;
             if (damp <= 0) { continue; }
             o.TakeDamageAs(damp, wh.InfDeath());
+            this.SndBuildingDamage(o, damp);
             this.SuppressTrooper(o);
         }
         return true;
@@ -3278,6 +3316,11 @@ class World {
         WorldObject o = WorldObject.CreateStructure(side, buildId, x, y, t.Hp());
         int idx = this.AddObject(o);
         this.ShroudRevealObject(o);
+        // The placement thud, handleBuildingPlaceSound: the rules
+        // SlamSound= or the BuildingSlam key, played through the fog.
+        string slam = t.SlamSound();
+        if (slam == null || slam.Length == 0) { slam = "BuildingSlam"; }
+        this.SndEffect(slam, o);
         return idx;
     }
 
@@ -3331,16 +3374,21 @@ class World {
                 }
             }
             this.ShroudRevealObject(o);
+            // The MCV's unfold, the UnitDeployUndeploy event's deploy leg:
+            // the rules DeploySound=, skipped when unset.
+            this.SndEffect(ut.DeploySound(), o);
             return idx;
         }
         if (ut.Deployer()) {
             if (!o.Deployed()) {
                 o.StopAttack();
                 o.StartDeployPose();
+                this.SndEffect(ut.DeploySound(), o);
             } else {
                 o.SetDeployed(false);
                 o.StopAttack();
                 o.StartUndeployPose();
+                this.SndEffect(ut.UndeploySound(), o);
             }
             return idx;
         }
@@ -3396,6 +3444,9 @@ class World {
         if (o.UnderConstruction(t.BuildTime())) { return -1; }
         int refund = t.Cost() * this.Rules().RefundPercent() / 100;
         this.AddMoneyEvent(side, refund);
+        // The sell chime, the no-shroud SellSound key: the owner hears it
+        // even under black ground.
+        this.SndEffect("SellSound", o);
         this.Demolish(o);
         return refund;
     }
@@ -3473,6 +3524,11 @@ class World {
         WorldObject o = WorldObject.CreateUnit(side, unitId, x, y, u.Hp(), u);
         int idx = this.AddObject(o);
         this.ShroudRevealObject(o);
+        // The spawn chirp (CreateSound=) -- the ObjectSpawn event. The
+        // battle's opening population goes through here before the app
+        // installs the sink, so only later spawns (crates, the free-MCV
+        // event) are heard, matching the reference's subscribe-after-load.
+        this.SndSpawnSound(o);
         return idx;
     }
 
@@ -4560,6 +4616,78 @@ class World {
         TechnoVoices v = this.SelectedVoices();
         if (v == null) { return; }
         this.sndSink.PlaySelectVoice(v, Window.GetTickMs());
+    }
+
+    // ---- SoundHandler 事件位 ----------------------------------------------
+    // reference 的 handleObjectSpawn/BuildingPlace/ObjectDestroy/
+    // InflictDamage/UnitDeployUndeploy 事件的世界侧落点。
+
+    /// <summary>One positional world effect, the reference's
+    /// worldSound.playEffect: the local player's unexplored ground mutes it
+    /// unless the key is on the shipped no-shroud list (or Global, which
+    /// ShroudedOut exempts). Null names silently skip.</summary>
+    void SndEffect(string key, WorldObject at) {
+        if (this.sndSink == null || key == null || key.Length == 0) { return; }
+        MapShroud s = this.ShroudOf(this.sndSink.LocalSide());
+        if (s != null && this.sndSink.ShroudedOut(key, at.X(), at.Y(), s)) {
+            return;
+        }
+        this.sndSink.PlayEffect(key, at.X(), at.Y(), at.Side(), 1.0, 0.0);
+    }
+
+    /// <summary>A techno spawning: the rules CreateSound= at its cell
+    /// (handleObjectSpawnSound). Structures place with the slam instead.</summary>
+    void SndSpawnSound(WorldObject o) {
+        if (this.sndSink == null || o.UnitType() == null) { return; }
+        this.SndEffect(o.UnitType().CreateSound(), o);
+    }
+
+    /// <summary>A techno dying: the rules DieSound=, buildings falling back
+    /// to the BuildingDieSound key, plus EVA_UnitLost for an own unit --
+    /// the reference's handleObjectDestroySound. The looping weapon reports
+    /// ride the follow mechanism, which retires them when the shooter's
+    /// health hits zero.</summary>
+    void SndDeathFeedback(WorldObject o) {
+        if (this.sndSink == null) { return; }
+        string die = null;
+        if (o.Kind() == ObjKind.Unit() && o.UnitType() != null) {
+            die = o.UnitType().DieSound();
+        } else if (o.Kind() == ObjKind.Structure()) {
+            StructureType t = this.TypeOf(o);
+            if (t != null) {
+                die = t.DieSound();
+                if (die == null || die.Length == 0) { die = "BuildingDieSound"; }
+            }
+        }
+        this.SndEffect(die, o);
+        if (o.Kind() == ObjKind.Unit()) {
+            this.sndSink.UnitLostFeedback(o.Side());
+        }
+    }
+
+    /// <summary>A building crossing a damage condition, the reference's
+    /// handleDamageSound: BuildingDamageSound when this hit dropped the
+    /// health to or under the [AudioVisual] yellow/red percents from above.
+    /// `dmgTaken` is the raw hit, before the health floor clamps it.</summary>
+    void SndBuildingDamage(WorldObject o, int dmgTaken) {
+        if (this.sndSink == null || dmgTaken <= 0) { return; }
+        if (o.Kind() != ObjKind.Structure() || o.IsDead()) { return; }
+        StructureType t = this.TypeOf(o);
+        if (t == null) { return; }
+        Rules r = this.Rules();
+        if (SndEngine.DamageCross(o.Hp(), o.MaxHp(), dmgTaken,
+                                  r.ConditionYellowPct(),
+                                  r.ConditionRedPct())) {
+            this.SndEffect("BuildingDamageSound", o);
+        }
+    }
+
+    /// <summary>A crate resolving: sound for the resolved type at the crate
+    /// cell (a failed grant degrades to money, so the money crate speaks),
+    /// silent for a hostile pickup -- the reference's handleCratePickupSound.</summary>
+    void SndCrateFeedback(int side, int x, int y, int crateType) {
+        if (this.sndSink == null) { return; }
+        this.sndSink.CratePickupFeedback(side, x, y, crateType, this.Rules());
     }
 
     /// <summary>The side of the currently selected object, or -1 when nothing
@@ -5693,7 +5821,17 @@ class World {
         for (int i = 0; i < this.objects.Count; i = i + 1) {
             WorldObject o = this.objects[i];
             if (o.Kind() != ObjKind.Structure()) { continue; }
+            // The structure-construction Ready flip, the reference's
+            // handleProductionQueueUpdate on the Structures queue: the
+            // player's own house hears EVA_ConstructionComplete once.
+            StructureType bt = this.TypeOf(o);
+            int prevBuilt = o.BuiltTicks();
             o.AdvanceBuilt();
+            if (this.sndSink != null && bt != null
+             && prevBuilt < bt.BuildTime()
+             && o.BuiltTicks() >= bt.BuildTime()) {
+                this.sndSink.StructureReadyFeedback(o.Side());
+            }
             // The wrench: a repairing structure heals one RepairStep every
             // RepairRateTicks. The cost rides the same schedule: a full
             // patch is RepairPercent of the building's price, so every hp
@@ -5717,6 +5855,9 @@ class World {
                     o.repairCarry = billNumer % (o.MaxHp() * 100);
                     if (stepCost > 0) { this.AddMoneyEvent(o.Side(), 0 - stepCost); }
                     o.SetHp(o.Hp() + heal);
+                    // One wrench-patch chirp per step, the reference's
+                    // per-step BuildingRepairedSound.
+                    this.SndEffect("BuildingRepairedSound", o);
                     o.SetRepairAtTick(this.worldTick + this.Rules().RepairRateTicks());
                 }
             }
@@ -5724,7 +5865,6 @@ class World {
             // A finished refinery delivers one free harvester, as the
             // shipped buildings always have -- the ore loop starts the
             // moment the refinery opens, without a manual click.
-            StructureType bt = this.TypeOf(o);
             if (bt != null && bt.IsRefinery()
              && o.BuiltTicks() == bt.BuildTime()) {
                 int hid = this.units.HarvesterIdFor(this, o.Side());
@@ -5737,6 +5877,12 @@ class World {
                             hcell[0], hcell[1], hu.Hp(), hu);
                         this.AddObject(h);
                         this.ShroudRevealObject(h);
+                        // The free harvester completes a production too:
+                        // spawn chirp and, for the player, Unit ready.
+                        this.SndSpawnSound(h);
+                        if (this.sndSink != null) {
+                            this.sndSink.UnitReadyFeedback(h.Side());
+                        }
                     }
                 }
             }
@@ -5756,6 +5902,13 @@ class World {
                                                    cell[1], u.Hp(), u);
             this.AddObject(n);
             this.ShroudRevealObject(n);
+            // The factory output: the spawn chirp (CreateSound=) and, for
+            // the player's own house, the Unit ready announcement -- the
+            // FactoryProduceUnit event.
+            this.SndSpawnSound(n);
+            if (this.sndSink != null) {
+                this.sndSink.UnitReadyFeedback(n.Side());
+            }
             o.PopProd();
             produced = produced + 1;
         }
@@ -5934,6 +6087,7 @@ class World {
                 pd = dmg * this.Rules().ProneDamagePct() / 100;
             }
             t.TakeDamageAs(pd, wh.InfDeath());
+            this.SndBuildingDamage(t, pd);
             this.SuppressTrooper(t);
         }
         if (wh.Spread() <= 0) { return; }
@@ -5960,6 +6114,7 @@ class World {
                 pd = damp * this.Rules().ProneDamagePct() / 100;
             }
             o.TakeDamageAs(pd, wh.InfDeath());
+            this.SndBuildingDamage(o, pd);
             this.SuppressTrooper(o);
         }
     }
@@ -6086,6 +6241,7 @@ class World {
         while (i < this.objects.Count) {
             WorldObject o = this.objects[i];
             if (!o.IsDead()) { i = i + 1; continue; }
+            this.SndDeathFeedback(o);
             // A trooper does not pop: the reference plays his death art
             // (sequence or anim) and leaves the corpse.
             if (o.Kind() == ObjKind.Unit() && o.UnitType() != null

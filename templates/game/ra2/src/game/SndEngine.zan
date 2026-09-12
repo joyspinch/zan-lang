@@ -131,6 +131,8 @@ class Eva {
             && this.current.IsPlaying();
     }
 
+    int WaitingCount() { return this.waiting.Count; }
+
     long LastPlayedOf(EvaSpec spec) {
         for (int i = 0; i < this.lastPlayedNames.Count; i = i + 1) {
             if (SndSpecText.SameWord(this.lastPlayedNames[i],
@@ -596,6 +598,23 @@ class SndEngine {
 
     bool Ready() { return this.deviceOpen; }
 
+    int LocalSide() { return this.localSide; }
+
+    /// <summary>Queues an EVA line by its eva.ini [DialogList] name; a
+    /// name the table lacks silently skips, the reference's eva.play.</summary>
+    void Eva(string name) {
+        if (name == null || name.Length == 0) { return; }
+        if (this.eva == null) { return; }
+        this.eva.Play(name, false);
+    }
+
+    /// <summary>How many EVA lines sit queued — the winchain's window on
+    /// whether an announcement fired (a table without the name never
+    /// queues, so asserts need the table to carry the line).</summary>
+    int EvaQueueCount() {
+        return this.eva != null ? this.eva.WaitingCount() : 0;
+    }
+
     // ---- 混音台 -----------------------------------------------------------
 
     void SetVolume(int channel, double volume) {
@@ -981,15 +1000,128 @@ class SndEngine {
     }
 
     /// <summary>Whether a positional voice on this key is muted by the
-    /// local player's unexplored ground at its cell. The app calls this
-    /// when spawning the effect; per-frame gain updates keep it muted.</summary>
+    /// local player's unexplored ground at its cell. The world calls this
+    /// when spawning the effect; per-frame gain updates keep it muted. The
+    /// shipped no-shroud list (slams, selling, garrisoning, repairs, the
+    /// spy-sat pings) plays through the black ground, and so does anything
+    /// Global; everything else dies under the fog, the reference's
+    /// WorldSound.playEffect gate.</summary>
     bool ShroudedOut(string key, int tileX, int tileY, MapShroud shroud) {
         if (shroud == null) { return false; }
-        if (!SndEngine.NoShroudKey(key)) { return false; }
+        if (SndEngine.NoShroudKey(key)) { return false; }
         SoundSpec spec = this.SpecForKey(key);
         if (spec == null) { return false; }
         if (spec.HasType(SndSpecText.TypeGlobal())) { return false; }
         return shroud.At(tileX, tileY) == MapShroud.Unexplored();
+    }
+
+    // ---- SoundHandler 事件位 ------------------------------------------------
+    // reference 的 gui/screen/game/SoundHandler.ts 事件分支,1:1 到纯函数
+    // 可测的程度:箱子音/EVA 映射、生产 EVA、损伤阈值与新增科技判定。
+
+    /// <summary>The crate pickup's sound.ini name, the SoundHandler's
+    /// crateSoundByType map; null = no sound for this type. The heal crate
+    /// takes its name from [CrateRules] HealCrateSound= instead.</summary>
+    static string CrateSoundOfType(int crateType) {
+        if (crateType == Rules.PowerupVeteran()) { return "CratePromoteSound"; }
+        if (crateType == Rules.PowerupMoney()) { return "CrateMoneySound"; }
+        if (crateType == Rules.PowerupReveal()) { return "CrateRevealSound"; }
+        if (crateType == Rules.PowerupFirepower()) { return "CrateFireSound"; }
+        if (crateType == Rules.PowerupArmor()) { return "CrateArmourSound"; }
+        if (crateType == Rules.PowerupSpeed()) { return "CrateSpeedSound"; }
+        if (crateType == Rules.PowerupUnit()) { return "CrateUnitSound"; }
+        return null;
+    }
+
+    /// <summary>The crate pickup's EVA line, the crateEvaByType map;
+    /// null = silent.</summary>
+    static string CrateEvaOfType(int crateType) {
+        if (crateType == Rules.PowerupArmor()) {
+            return "EVA_UnitArmorUpgraded";
+        }
+        if (crateType == Rules.PowerupFirepower()) {
+            return "EVA_UnitFirePowerUpgraded";
+        }
+        if (crateType == Rules.PowerupSpeed()) {
+            return "EVA_UnitSpeedUpgraded";
+        }
+        return null;
+    }
+
+    /// <summary>The crate event: the sound at the crate cell plus the EVA
+    /// line, silent when a hostile (non-local) house picked it up -- the
+    /// reference's isHostilePickup gate.</summary>
+    void CratePickupFeedback(int side, int x, int y, int crateType,
+        Rules rules) {
+        if (side != this.localSide) { return; }
+        string sound = SndEngine.CrateSoundOfType(crateType);
+        if ((sound == null || sound.Length == 0)
+         && crateType == Rules.PowerupHealBase() && rules != null) {
+            sound = rules.HealCrateSound();
+        }
+        if (sound != null && sound.Length > 0) {
+            this.PlayEffect(sound, x, y, side, 1.0, 0.0);
+        }
+        string eva = SndEngine.CrateEvaOfType(crateType);
+        if (eva != null) { this.Eva(eva); }
+    }
+
+    /// <summary>A produced structure flipping to Ready: the player's own
+    /// house hears EVA_ConstructionComplete (the reference's
+    /// handleProductionQueueUpdate on the Structures/Armory queues).</summary>
+    void StructureReadyFeedback(int side) {
+        if (side == this.localSide) { this.Eva("EVA_ConstructionComplete"); }
+    }
+
+    /// <summary>A factory walking a unit out: the player's own house hears
+    /// EVA_UnitReady, the FactoryProduceUnit event.</summary>
+    void UnitReadyFeedback(int side) {
+        if (side == this.localSide) { this.Eva("EVA_UnitReady"); }
+    }
+
+    /// <summary>The power grid dipping negative: EVA_LowPower, the
+    /// PowerLow event for the local player.</summary>
+    void LowPowerFeedback() { this.Eva("EVA_LowPower"); }
+
+    /// <summary>An own unit dying: EVA_UnitLost (ObjectDestroy; the
+    /// reference's spawned= clause has no counterpart here -- nothing
+    /// spawns children).</summary>
+    void UnitLostFeedback(int side) {
+        if (side == this.localSide) { this.Eva("EVA_UnitLost"); }
+    }
+
+    /// <summary>A house eliminated: EVA_YouHaveLost when it is the local
+    /// player's, EVA_PlayerDefeated when another house goes down (the
+    /// PlayerDefeated handler; its resigned= clause never fires -- nobody
+    /// resigns a skirmish).</summary>
+    void DefeatFeedback(int side) {
+        if (side == this.localSide) { this.Eva("EVA_YouHaveLost"); }
+        else { this.Eva("EVA_PlayerDefeated"); }
+    }
+
+    /// <summary>Whether the available-buildables set grew: any name the
+    /// previous set lacked is a new entry, the reference's
+    /// handleAvailableObjectsUpdate (the caller skips the first update by
+    /// passing a null previous).</summary>
+    static bool HasNewName(List<string> prev, List<string> cur) {
+        if (prev == null || cur == null) { return false; }
+        for (int i = 0; i < cur.Count; i = i + 1) {
+            if (!prev.Contains(cur[i])) { return true; }
+        }
+        return false;
+    }
+
+    /// <summary>The building-damage thump's crossing test, the reference's
+    /// handleDamageSound: the post-hit health sits at or under a threshold
+    /// the pre-hit health was above. The damage is a percent of max health,
+    /// compared exactly in integers; the thresholds are the [AudioVisual]
+    /// ConditionYellow=/ConditionRed= percents.</summary>
+    static bool DamageCross(int health, int maxHp, int dmg, int yellowPct,
+        int redPct) {
+        if (maxHp <= 0) { return false; }
+        return (health <= yellowPct
+                && (yellowPct - health) * maxHp < dmg * 100)
+            || (health <= redPct && (redPct - health) * maxHp < dmg * 100);
     }
 
     // ---- 武器声与口令声 ----------------------------------------------------

@@ -30,6 +30,12 @@ class GameController {
     // number to recall). Stored as object references so a unit that dies is
     // simply skipped on recall.
     List<List<WorldObject>> squads;
+    // Battle audio: the app's engine, null in silent rule-only worlds. The
+    // controller's EVA announcements (low power, new construction options,
+    // the defeat lines) answer through it.
+    SndEngine sndSink;
+    bool lowPowerWas;    // the last tick's power state, the LowPower edge
+    List<string> availPrev; // last tick's buildable names, null until seen
 
     static GameController Create(World world, int side) {
         return GameController.CreateWith(world, side,
@@ -91,6 +97,7 @@ class GameController {
     World World() { return this.world; }
     int Side() { return this.side; }
     int Money() { return this.money; }
+    void SetSoundSink(SndEngine snd) { this.sndSink = snd; }
     // First AI house's wallet: kept for the sidebar's single-enemy line.
     int AiMoney() {
         return this.aiHouses.Count > 0
@@ -180,7 +187,45 @@ class GameController {
         this.UpdateAi();
         List<int> r = this.world.Tick();
         this.CheckResult();
+        this.TickEvaAnnouncements();
         return r[0];
+    }
+
+    /// <summary>The controller-side EVA announcements, the reference's
+    /// PowerLow and available-objects events, checked once a tick against
+    /// the last tick's state.</summary>
+    void TickEvaAnnouncements() {
+        if (this.sndSink == null) { return; }
+        bool low = this.LowPower();
+        if (low && !this.lowPowerWas) { this.sndSink.LowPowerFeedback(); }
+        this.lowPowerWas = low;
+        this.UpdateAvailEva();
+    }
+
+    /// <summary>The buildable set's names, buildings then units, the input
+    /// the reference's handleAvailableObjectsUpdate compares. The first
+    /// observation only records; a later set that grew announces
+    /// EVA_NewConstructionOptions once.</summary>
+    void UpdateAvailEva() {
+        List<string> names = new List<string>();
+        int bn = this.world.Catalog().CountFor(this.world, this.side);
+        for (int i = 0; i < bn; i = i + 1) {
+            StructureType t = this.world.Catalog().TypeFor(this.world,
+                                                           this.side, i);
+            if (t == null || t.TechLevel() < 0) { continue; }
+            if (!this.BuildUnlocked(i)) { continue; }
+            names.Add(t.Reg());
+        }
+        List<UnitType> ul = this.world.Units().ListFor(this.world, this.side);
+        for (int i = 0; i < ul.Count; i = i + 1) {
+            UnitType u = this.world.Units().TypeFor(this.world, this.side, i);
+            if (u == null || !this.UnitUnlocked(i)) { continue; }
+            names.Add(u.Reg());
+        }
+        if (SndEngine.HasNewName(this.availPrev, names)) {
+            this.sndSink.Eva("EVA_NewConstructionOptions");
+        }
+        this.availPrev = names;
     }
 
     // ---- economy -----------------------------------------------------------
@@ -916,11 +961,19 @@ class GameController {
         }
         if (allDown) {
             this.result = 1;
+            // The last AI house going down is the PlayerDefeated event;
+            // the observer hears the defeat line for it.
+            if (this.sndSink != null) {
+                this.sndSink.DefeatFeedback(this.aiHouses.Count > 0
+                    ? this.aiHouses[0] : this.side);
+            }
             return;
         }
         if (this.world.SideEliminated(this.side)
          && (this.shortGame || !this.WorldHasUnits(this.side))) {
             this.result = 2;
+            // The player's own defeat: EVA_YouHaveLost.
+            if (this.sndSink != null) { this.sndSink.DefeatFeedback(this.side); }
             return;
         }
     }
