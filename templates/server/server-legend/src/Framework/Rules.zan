@@ -1,0 +1,544 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using ZanWeb.Model.Game;
+
+namespace ZanWeb;
+
+/* 规则表装载：启动时把 data/rules 下 29 张 CSV 全部读入、整体校验，
+   校验通过才发布成一个 `Ruleset`。此后 Fight/Play 里只允许出现
+   `Rules.Val("键")` 与 `Rules.Table(...)`，不再有玩法常量——数值改了
+   是改 CSV，不是改代码，这是与旧服务端最大的结构差异。
+
+   schema 字符串与客户端 `templates/game/legend/src/Tables.zan` 的
+   `GameTables.Read` 逐字一致：两张表用同一份契约校验，任何一边改了列
+   或列范围，另一边立刻在加载期炸而不是在运行时算错。`tools/sync_rules.py`
+   负责把编辑源（客户端 data/）单向复制到 data/rules/，测试断言两份副本
+   一致，因此「客户端一份规则 + 服务端一份规则」的双写在这里被压成一份。
+
+   与客户端版本的两点不同（服务端更严）：
+   - 校验遗漏的必需键在这里补齐（旧表里 `incoming_random_min` 被客户端
+     代码引用却没人校验，一打竞技场就抛 unknown id）。
+   - 每个数值键有**唯一来源**声明：值是 `value` 列还是库里的原版事实表
+     （GameTitle/GameJue/GameCity…），见 `Rules.Val` 与 `Rules.Orig*`。 */
+
+/* 一行规则：列名 -> 原文。整数按需解析（懒），失败带行号上下文。 */
+class RuleRow {
+    string location;
+    Dictionary<string, string> fields = new Dictionary<string, string>();
+
+    void Put(string key, string value) { fields[key] = value; }
+    bool Has(string key) { return fields.ContainsKey(key); }
+
+    string Text(string key) {
+        if (!fields.ContainsKey(key)) { throw new Exception(location + ": missing column " + key); }
+        return fields[key];
+    }
+
+    int Int(string key) { return Ruleset.ParseInt(Text(key), location + ": " + key); }
+    long Long(string key) { return (long)Int(key); }
+
+    bool Flag(string key) {
+        string v = Text(key);
+        if (v == "1" || v == "true" || v == "yes") { return true; }
+        if (v == "0" || v == "false" || v == "no" || v.Length == 0) { return false; }
+        throw new Exception(location + ": not a flag: " + key + "=" + v);
+    }
+}
+
+/* 一张规则表：按行序 + 按 id 索引。id 列恒为第一列的规范十进制。 */
+class Ruleset {
+    string name;
+    List<RuleRow> rows = new List<RuleRow>();
+    Dictionary<string, RuleRow> byId = new Dictionary<string, RuleRow>();
+
+    List<RuleRow> All() { return rows; }
+    int Count() { return rows.Count; }
+
+    RuleRow At(int id) { return ById(Convert.ToString(id)); }
+
+    RuleRow ById(string id) {
+        if (!byId.ContainsKey(id)) { throw new Exception(name + ": unknown id " + id); }
+        return byId[id];
+    }
+
+    /* 列名存在性检查（用于可选列，如 encounters.progress_cap_mode）。 */
+    bool HasColumn(string key) { return rows.Count > 0 && rows[0].Has(key); }
+
+    static int ParseInt(string value, string context) {
+        if (value.Length == 0) { throw new Exception(context + ": empty integer"); }
+        int start = value.Substring(0, 1) == "-" ? 1 : 0;
+        if (start == value.Length) { throw new Exception(context + ": invalid integer"); }
+        long n = 0;
+        for (int i = start; i < value.Length; i = i + 1) {
+            int digit = value[i] & 255;
+            if (digit < 48 || digit > 57) { throw new Exception(context + ": invalid integer " + value); }
+            n = n * 10 + digit - 48;
+            if (n > 2147483647) { throw new Exception(context + ": integer overflow"); }
+        }
+        return start == 1 ? 0 - (int)n : (int)n;
+    }
+
+    /* schema 项：`列` = 必需非空文本；`列:min:max` = 必需且在闭区间内。 */
+    static Ruleset Load(string path, string schema) {
+        if (!File.Exists(path)) { throw new Exception("Configuration missing: " + path); }
+        string text = File.ReadAllText(path);
+        if (text.Length > 0 && text.Substring(0, 1) == "\uFEFF") { text = text.Substring(1, text.Length - 1); }
+        Ruleset.CheckQuotes(path, text);
+        List<List<string>> parsed = Csv.Parse(text);
+        if (parsed.Count < 2) { throw new Exception(path + ": empty table"); }
+        Ruleset table = new Ruleset();
+        table.name = path;
+        List<string> header = parsed[0];
+        List<string> spec = schema.Split(",");
+        if (header.Count != spec.Count) { throw new Exception(path + ": schema column count mismatch"); }
+        for (int c = 0; c < header.Count; c = c + 1) {
+            string column = header[c];
+            int seen = 0;
+            for (int o = 0; o < header.Count; o = o + 1) { if (header[o] == column) { seen = seen + 1; } }
+            if (column.Length == 0 || seen != 1) { throw new Exception(path + ": duplicate or empty header " + column); }
+            if (spec[c].Split(":")[0] != column) { throw new Exception(path + ": schema expects " + spec[c] + " at column " + Convert.ToString(c + 1) + ", found " + column); }
+        }
+        for (int r = 1; r < parsed.Count; r = r + 1) {
+            List<string> values = parsed[r];
+            string context = path + ": row " + Convert.ToString(r + 1);
+            if (values.Count != header.Count) { throw new Exception(context + ": column count mismatch"); }
+            RuleRow row = new RuleRow();
+            row.location = context;
+            for (int c = 0; c < header.Count; c = c + 1) { row.Put(header[c], values[c]); }
+            for (int c = 0; c < spec.Count; c = c + 1) {
+                List<string> bits = spec[c].Split(":");
+                string value = row.Text(bits[0]);
+                if (bits.Count == 3) {
+                    int n = ParseInt(value, context + ": " + bits[0]);
+                    if (n < ParseInt(bits[1], context) || n > ParseInt(bits[2], context)) {
+                        throw new Exception(context + ": out of range " + bits[0]);
+                    }
+                } else if (value.Length == 0) { throw new Exception(context + ": empty " + bits[0]); }
+            }
+            string id = row.Text("id");
+            if (id != Convert.ToString(ParseInt(id, context))) { throw new Exception(context + ": ID must be canonical decimal"); }
+            if (table.byId.ContainsKey(id)) { throw new Exception(context + ": duplicate id " + id); }
+            table.byId[id] = row;
+            table.rows.Add(row);
+        }
+        return table;
+    }
+
+    /* stdlib Csv 刻意宽松，这里先拒掉畸形引号，避免把坏行读成合法行。 */
+    static void CheckQuotes(string path, string text) {
+        bool quoted = false;
+        bool closed = false;
+        bool atStart = true;
+        for (int i = 0; i < text.Length; i = i + 1) {
+            string ch = text.Substring(i, 1);
+            if (quoted) {
+                if (ch == "\"") {
+                    if (i + 1 < text.Length && text.Substring(i + 1, 1) == "\"") { i = i + 1; } else { quoted = false; closed = true; }
+                }
+            } else if (ch == "," || ch == "\n" || ch == "\r") { atStart = true; closed = false; }
+            else if (ch == "\"" && atStart && !closed) { quoted = true; atStart = false; }
+            else {
+                if (closed || ch == "\"") { throw new Exception(path + ": malformed CSV quotes"); }
+                atStart = false;
+            }
+        }
+        if (quoted) { throw new Exception(path + ": unclosed CSV quote"); }
+    }
+}
+
+/* 规则表全集 + 派生查询。启动装载一次，之后只读。 */
+class Rules {
+    static Rules current;
+
+    Ruleset slots;
+    Ruleset qualities;
+    Ruleset items;
+    Ruleset monsters;
+    Ruleset bosses;
+    Ruleset maps;
+    Ruleset jobs;
+    Ruleset skills;
+    Ruleset levels;
+    Ruleset drops;
+    Ruleset forge;
+    Ruleset shop;
+    Ruleset balance;
+    Ruleset quests;
+    Ruleset rebirth;
+    Ruleset growth;
+    Ruleset encounters;
+    Ruleset attributes;
+    Ruleset innerPower;
+    Ruleset gems;
+    Ruleset elements;
+    Ruleset sets;
+    Ruleset recycle;
+    Ruleset recyclePrices;
+
+    /* 掉落池索引：pool -> 行集合（装载时建一次，掷骰不再扫全表）。 */
+    Dictionary<int, List<RuleRow>> poolOf = new Dictionary<int, List<RuleRow>>();
+    /* 每池权重和（含高价值保护权重，见 WeightOf）。 */
+    Dictionary<int, long> poolTotal = new Dictionary<int, long>();
+
+    static Rules Current() {
+        if (Rules.current == null) { throw new Exception("rules not loaded"); }
+        return Rules.current;
+    }
+
+    static void Initialize(string directory) { Rules.current = Rules.Read(directory); }
+    static bool Ready() { return Rules.current != null; }
+
+    /* ---- 数值 ---- */
+
+    /* balance 表：唯一允许写玩法数字的地方。 */
+    static int Val(string id) { return Rules.Current().balance.ById(id).Int("value"); }
+    static long Long(string id) { return (long)Rules.Val(id); }
+
+    /* ---- 表访问 ---- */
+
+    static Ruleset Items() { return Rules.Current().items; }
+    static Ruleset Monsters() { return Rules.Current().monsters; }
+    static Ruleset Bosses() { return Rules.Current().bosses; }
+    static Ruleset Maps() { return Rules.Current().maps; }
+    static Ruleset Jobs() { return Rules.Current().jobs; }
+    static Ruleset Skills() { return Rules.Current().skills; }
+    static Ruleset Quests() { return Rules.Current().quests; }
+    static Ruleset Rebirths() { return Rules.Current().rebirth; }
+    static Ruleset Growth() { return Rules.Current().growth; }
+    static Ruleset Encounters() { return Rules.Current().encounters; }
+    static Ruleset Attributes() { return Rules.Current().attributes; }
+    static Ruleset Inner() { return Rules.Current().innerPower; }
+    static Ruleset Gems() { return Rules.Current().gems; }
+    static Ruleset Elements() { return Rules.Current().elements; }
+    static Ruleset Sets() { return Rules.Current().sets; }
+    static Ruleset Recycle() { return Rules.Current().recycle; }
+    static Ruleset Qualities() { return Rules.Current().qualities; }
+    static Ruleset Slots() { return Rules.Current().slots; }
+    static Ruleset ForgeOps() { return Rules.Current().forge; }
+    static Ruleset Shop() { return Rules.Current().shop; }
+
+    /* 升级经验：1500 行逐级表。超出表长按末级二次外推（原版曲线为
+       xp = 8L²+35，外推用同一条二次式，避免高转生后等级停摆）。 */
+    static long NeedXp(int level) {
+        Ruleset t = Rules.Current().levels;
+        if (level < 1) { level = 1; }
+        if (level <= t.Count()) { return (long)t.At(level).Int("xp"); }
+        long l = (long)level;
+        return 8 * l * l + 35;
+    }
+
+    /* 幻境某层的实际配置：地图表只覆盖到 171 层，之上按层缩放，
+       否则 172 层以后的地图/怪/金币/经验全部退化成末图。 */
+    static RuleRow MapAt(int floor) {
+        Ruleset t = Rules.Current().maps;
+        RuleRow row = t.At(1);
+        foreach (RuleRow candidate in t.All()) { if (candidate.Int("start_floor") <= floor) { row = candidate; } }
+        return row;
+    }
+
+    /* 超出末图后的每 100 层增量倍率（万分比）：基础 10000 = 1.0。 */
+    static int FloorScalePermille(int floor) {
+        Ruleset t = Rules.Current().maps;
+        int cap = 0;
+        foreach (RuleRow row in t.All()) { cap = row.Int("start_floor"); }
+        if (floor <= cap) { return 10000; }
+        long steps = (long)(floor - cap) / 100;
+        long scale = 10000 + steps * Rules.Long("floor_scale_per_100");
+        if (scale > Rules.Long("floor_scale_cap")) { scale = Rules.Long("floor_scale_cap"); }
+        return (int)scale;
+    }
+
+    /* 秘境可挑战上限：原版是「人物等级+100」的动态值，模板旧值是常量
+       100。encounters.progress_cap_mode 决定用哪一种。 */
+    static int ProgressCap(RuleRow encounter, int level) {
+        if (encounter.Text("progress_cap_mode") == "level_plus") {
+            long cap = (long)level + encounter.Long("max_progress");
+            long hard = Rules.Long("progress_cap_hard");
+            return (int)(cap > hard ? hard : cap);
+        }
+        return encounter.Int("max_progress");
+    }
+
+    /* 掉落池权重：表里的 weight 是「稀有度基准」，实际权重 = weight × 稀缺度，
+       稀缺度由该物品的回收/售价反推（价值越高越稀）。这样不必为 234 行
+       逐条手调，也能表达「转生证明约 1/10、属性符文约 1/500」的量级。 */
+    static long WeightOf(RuleRow drop) {
+        long w = (long)drop.Int("weight");
+        RuleRow item = Rules.Current().items.At(drop.Int("item_id"));
+        long price = (long)item.Int("sell_price");
+        if (price <= 0) { return w; }
+        long rare = Rules.Long("drop_value_pivot") * 1000 / (price + 1);
+        if (rare < 1) { rare = 1; }
+        long scaled = w * rare / 1000;
+        return scaled < 1 ? 1 : scaled;
+    }
+
+    static List<RuleRow> Pool(int pool) {
+        Rules r = Rules.Current();
+        if (!r.poolOf.ContainsKey(pool)) { return new List<RuleRow>(); }
+        return r.poolOf[pool];
+    }
+
+    static long PoolTotal(int pool) {
+        Rules r = Rules.Current();
+        if (!r.poolTotal.ContainsKey(pool)) { return 0; }
+        return r.poolTotal[pool];
+    }
+
+    /* 按池掷一件物品；池空返回 0。 */
+    static int RollPool(int pool, int rollPermille) {
+        List<RuleRow> rows = Rules.Pool(pool);
+        long total = Rules.PoolTotal(pool);
+        if (rows.Count == 0 || total <= 0) { return 0; }
+        long pick = (long)rollPermille * total / 1000;
+        long acc = 0;
+        foreach (RuleRow row in rows) {
+            acc = acc + Rules.WeightOf(row);
+            if (pick < acc) { return row.Int("item_id"); }
+        }
+        return rows[rows.Count - 1].Int("item_id");
+    }
+
+    /* ---- 装载 ---- */
+
+    static Rules Read(string dir) {
+        Rules r = new Rules();
+        r.slots = Ruleset.Load(dir + "/slots.csv", "id:0:11,name,group:0:11");
+        r.qualities = Ruleset.Load(dir + "/qualities.csv", "id:0:4,name,weight:1:100000,coefficient_min:1:10,coefficient_max:1:10,stat_pct:0:10000");
+        r.items = Ruleset.Load(dir + "/items.csv", "id:1:1000000,name,slot:-1:11,min_level:1:1500,picture,category,hp:0:100000000,mp:0:100000000,attack_min:0:100000000,attack_max:0:100000000,magic_min:0:100000000,magic_max:0:100000000,tao_min:0:100000000,tao_max:0:100000000,defense_min:0:100000000,defense_max:0:100000000,magic_defense_min:0:100000000,magic_defense_max:0:100000000,required_job:-1:2,required_rebirth:0:10,weight:0:1000000,sell_price:0:100000000,stack_limit:1:100000000,description");
+        r.monsters = Ruleset.Load(dir + "/monsters.csv", "id:1:1000000,name,min_level:1:1500,rebirth:0:10,hp:1:100000000,picture,mp:0:100000000,attack_min:0:100000000,attack_max:0:100000000,magic_min:0:100000000,magic_max:0:100000000,tao_min:0:100000000,tao_max:0:100000000,defense_min:0:100000000,defense_max:0:100000000,magic_defense_min:0:100000000,magic_defense_max:0:100000000,attack_school");
+        r.bosses = Ruleset.Load(dir + "/bosses.csv", "id:1:1000000,name,min_level:1:1500,rebirth:0:10,hp:1:100000000,picture,gold:0:1000000,xp:0:1000000,xp_floor:0:10000,iron:0:1000000,yuan:0:1000000,runes:0:1000000,quality:0:4,drop_pool:1:1000000,mp:0:100000000,attack_min:0:100000000,attack_max:0:100000000,magic_min:0:100000000,magic_max:0:100000000,tao_min:0:100000000,tao_max:0:100000000,defense_min:0:100000000,defense_max:0:100000000,magic_defense_min:0:100000000,magic_defense_max:0:100000000,attack_school");
+        r.maps = Ruleset.Load(dir + "/maps.csv", "id:1:1000000,name,start_floor:1:10000,min_level:1:1500,rebirth:0:10,monster_id:1:1000000,gold:0:1000000,xp:0:1000000,drop_pool:1:1000000");
+        r.jobs = Ruleset.Load(dir + "/jobs.csv", "id:0:2,name,hp_base:1:100000,hp_level:0:1000,mp_base:1:100000,mp_level:0:1000,damage_taken_pct:1:100,pet_attack_pct:0:100,skill_id:1:1000000,weapon_id:1:1000000,armor_id:1:1000000,helmet_id:1:1000000,attack_school,attack_min_base:0:100000,attack_min_level:0:100000,attack_max_base:0:100000,attack_max_level:0:100000,magic_min_base:0:100000,magic_min_level:0:100000,magic_max_base:0:100000,magic_max_level:0:100000,tao_min_base:0:100000,tao_min_level:0:100000,tao_max_base:0:100000,tao_max_level:0:100000,defense_min_base:0:100000,defense_min_level:0:100000,defense_max_base:0:100000,defense_max_level:0:100000,magic_defense_min_base:0:100000,magic_defense_min_level:0:100000,magic_defense_max_base:0:100000,magic_defense_max_level:0:100000");
+        r.skills = Ruleset.Load(dir + "/skills.csv", "id:1:1000000,name,job:0:2,slot:0:7,kind,target,cooldown:0:3600,mana:0:100000,damage_pct:0:1000,damage_per_level:0:100,heal_pct:0:100,heal_per_level:0:10,passive_damage_pct:0:100,passive_defense_pct:0:100,max_level:1:100,train_gold:0:1000000,train_iron:0:1000000,school");
+        r.levels = Ruleset.Load(dir + "/levels.csv", "id:1:1500,xp:1:100000000");
+        r.drops = Ruleset.Load(dir + "/drops.csv", "id:1:1000000,pool:1:1000000,item_id:1:1000000,weight:1:100000");
+        r.forge = Ruleset.Load(dir + "/forge.csv", "id:0:100,name,operation,gold:0:1000000,iron:0:1000000,yuan:0:1000000,runes:0:1000000,scale,limit:1:20,success_pct:1:100,failure");
+        r.shop = Ruleset.Load(dir + "/shop.csv", "id:0:1000000,name,reward,quantity:1:1000000,gold:0:1000000,iron:0:1000000,yuan:0:1000000,capacity_gold:0:10000");
+        r.balance = Ruleset.Load(dir + "/balance.csv", "id,value:0:1000000000");
+        r.quests = Ruleset.Load(dir + "/quests.csv", "id:0:1000,name,metric,target:1:1000000,gold:0:1000000,yuan:0:1000000,iron:0:1000000");
+        r.rebirth = Ruleset.Load(dir + "/rebirth.csv", "id:1:10,min_level:1:1500,min_floor:1:10000,gold:0:1000000000");
+        r.growth = Ruleset.Load(dir + "/growth.csv", "id:1:3,name,max_level:1:100,gold:0:1000000,gold_per_level:0:100000,iron:0:1000000,merit:0:1000000,merit_per_level:0:100000,reward_merit:0:1000000,reward_iron:0:1000000");
+        r.encounters = Ruleset.Load(dir + "/encounters.csv", "id:2:4,name,progress,min_level:1:1500,min_rebirth:0:10,max_progress:1:100000,progress_cap_mode,hp_base:1:10000000,hp_linear:0:100000,hp_square:0:10000,attack_base:0:100000,attack_linear:0:10000,defense_base:0:100000,defense_linear:0:10000,gold:0:1000000,gold_linear:0:100000,xp:0:1000000,xp_floor:0:10000,iron:0:1000000,yuan:0:1000000,runes:0:1000000,quality:0:4,drop_pool:1:1000000,attack_school,attack_min_pct:0:100,defense_min_pct:0:100,magic_defense_base:0:1000000,magic_defense_linear:0:1000000,magic_defense_min_pct:0:100");
+        r.attributes = Ruleset.Load(dir + "/attributes.csv", "id,name,score_weight:0:10000,upgrade_pct:0:100,skill_flat:0:1000,training_flat:0:1000,collection_flat:0:1000,rebirth_flat:0:100000,rebirth_pct:0:100,title_pct:0:100");
+        r.innerPower = Ruleset.Load(dir + "/inner_power.csv", "id:0:7,name,stat,value_per_level:1:1000,max_level:1:100,tp:1:100000,tp_per_level:0:1000,iron:0:100000");
+        r.gems = Ruleset.Load(dir + "/gems.csv", "id:0:5,name,stat,value_per_level:1:10000,max_level:1:100,gold:0:1000000,iron:0:100000,yuan:0:100000,synthesis_gold:1:1000000,synthesis_iron:1:100000,synthesis_yuan:1:100000,synthesis_max_level:1:100");
+        r.elements = Ruleset.Load(dir + "/elements.csv", "id:0:4,name,picture,stat,value_per_level:1:10000,max_level:1:100,xp_base:1:100000,xp_step:0:10000,upgrade_iron:0:100000,upgrade_iron_step:0:100000,upgrade_yuan:0:100000,upgrade_yuan_step:0:100000");
+        r.sets = Ruleset.Load(dir + "/sets.csv", "id:0:100,name,required:1:12,items,stat,value:1:100000");
+        r.recycle = Ruleset.Load(dir + "/recycle.csv", "id:0:6,name,numerator:1:1000000,denominator:1:1000000,cap:1:1000000000");
+        r.recyclePrices = Ruleset.Load(dir + "/recycle_prices.csv", "id:1:1000000,gold:0:100000000");
+        r.IndexPools();
+        r.Validate();
+        return r;
+    }
+
+    void IndexPools() {
+        foreach (RuleRow drop in drops.All()) {
+            int pool = drop.Int("pool");
+            if (!poolOf.ContainsKey(pool)) { poolOf[pool] = new List<RuleRow>(); }
+            poolOf[pool].Add(drop);
+        }
+        foreach (int pool in poolOf.Keys) {
+            long total = 0;
+            foreach (RuleRow drop in poolOf[pool]) { total = total + WeightOf(drop); }
+            poolTotal[pool] = total;
+        }
+    }
+
+    void Need(bool condition, string message) {
+        if (!condition) { throw new Exception("Configuration: " + message); }
+    }
+
+    /* balance 必需键：客户端 `Game.zan` 与本文都引用到的全部数值键。
+       这份清单是「服务端允许读到的键」的白名单，缺一个就是配置不完整
+       （旧表里 `incoming_random_min` 就漏了，见文件头注释）。 */
+    static string[] RequiredKeys() {
+        return ("initial_gold,initial_gems,initial_iron,initial_potions,initial_capacity,max_capacity,"
+            + "storage_capacity,max_floor,max_rebirth,offline_seconds,boss_tries,arena_tries,escort_tries,"
+            + "tower_tries,wave_count,guardian_hp_pct,guardian_attack_pct,drop_chance,iron_chance,potion_chance,"
+            + "critical_chance,critical_damage_pct,mp_regen,potion_trigger_pct,potion_heal_pct,recovery_seconds,"
+            + "round_limit,equipment_coefficient_max,treasure_gold,treasure_gems,treasure_iron,treasure_runes,"
+            + "treasure_potions,initial_treasure_maps,daily_treasure_maps,daily_gold,daily_yuan,daily_potions,"
+            + "bounty_kills,bounty_gold,bounty_runes,first_clear_yuan,between_wave_heal_pct,escort_gold,"
+            + "escort_seconds,escort_reward,escort_level_gold,escort_guild_gold,escort_merit,arena_power_base,"
+            + "arena_power_win,arena_power_rival,arena_win_merit,arena_lose_merit,arena_win_gold,"
+            + "arena_win_reputation,arena_lose_reputation,incoming_random_min,incoming_random_range,"
+            + "element_pool_cap,element_xp_per_second,secret_wave_count,secret_mob_hp_pct,altar_personal_cap,"
+            + "altar_world_cap,altar_world_reward_merit,tower_gold_base,tower_gold_per_floor,tower_xp_base,"
+            + "tower_xp_per_floor,tower_merit,tower_foe_atk_base,tower_foe_atk_per_floor,tower_foe_hp_base,"
+            + "tower_foe_hp_per_floor,guild_max_members,siege_attack_gold,siege_base_chance,siege_power_div,"
+            + "siege_hold_seconds,market_fee_pct,market_min_price,redpack_min_yuan,redpack_max_yuan,"
+            + "redpack_share_pct,mentor_apprentice_max_level,mentor_take_level,mentor_master_rebirth,"
+            + "mentor_take_gold,mentor_take_xp,star_activate_gold,star_points_per_rebirth,lord_donate_yuan,"
+            + "title_unlock_rep_pct,legend_sword_base,legend_robe_male_base,legend_robe_female_base,"
+            + "legend_first_form,legend_form_count,rune_word_ore,rune_word_rune,form_growth_balls,"
+            + "form_growth_rune,floor_scale_per_100,floor_scale_cap,progress_cap_hard,drop_value_pivot,"
+            + "guild_create_item,mentor_max_apprentices,mentor_max_masters,star_points_max,forge_gold_per_star,"
+            + "forge_iron_per_star,treasure_pity").Split(",");
+    }
+
+    void Validate() {
+        Need(elements.Count() == 5 && recycle.Count() == 7, "five elements and seven recycle currencies required");
+        foreach (RuleRow element in elements.All()) { attributes.ById(element.Text("stat")); }
+        foreach (RuleRow suit in sets.All()) {
+            attributes.ById(suit.Text("stat"));
+            List<string> ids = suit.Text("items").Split("|");
+            Need(ids.Count >= suit.Int("required"), suit.location + ": set has fewer items than required");
+            foreach (string token in ids) {
+                int itemId = Ruleset.ParseInt(token, suit.location + ": items");
+                Need(items.At(itemId).Int("slot") >= 0, suit.location + ": set item must be equipment");
+            }
+        }
+        /* 回收价目只能标在真实存在的物品上。原表曾要求「必须是可穿戴装备」，
+           但原版对无槽位的贵重品（幸运雪莲等）也给了回收价，那条约束会把
+           它们排除在外，因此这里只校验存在性。 */
+        foreach (RuleRow price in recyclePrices.All()) {
+            Need(items.ById(Convert.ToString(price.Int("id"))).Text("name").Length > 0,
+                price.location + ": recycle price on a non-existent item");
+        }
+        Need(Val("element_pool_cap") > 0 && Val("element_xp_per_second") > 0, "element pool/rate must be positive");
+        Need(Val("secret_wave_count") > 0 && Val("secret_mob_hp_pct") > 0 && Val("secret_mob_hp_pct") <= 100, "secret wave configuration invalid");
+        Need(innerPower.Count() == 8, "inner power requires eight slots");
+        Need(gems.Count() == 6, "gem system requires six slots");
+        foreach (RuleRow gem in gems.All()) {
+            attributes.ById(gem.Text("stat"));
+            Need(gem.Int("synthesis_max_level") < gem.Int("max_level"), gem.location + ": synthesis must stop before ordinary upgrade cap");
+        }
+        foreach (RuleRow inner in innerPower.All()) { attributes.ById(inner.Text("stat")); }
+        Need(Val("inner_tp_cap") > 0, "inner TP cap must be positive");
+        List<string> attributeIds = "hp,mp,attack_min,attack_max,magic_min,magic_max,tao_min,tao_max,defense_min,defense_max,magic_defense_min,magic_defense_max".Split(",");
+        Need(attributes.Count() == attributeIds.Count, "attribute schema mismatch");
+        foreach (string id in attributeIds) { attributes.ById(id); }
+        foreach (RuleRow job in jobs.All()) { CheckSchool(job.Text("attack_school"), job.location); }
+        foreach (RuleRow ability in skills.All()) {
+            CheckSkillSchool(ability.Text("school"), ability.Text("kind"), ability.location);
+            Need(ability.Int("job") >= 0 && ability.Int("job") < 3, ability.location + ": unknown skill job");
+            Need(ability.Int("slot") >= 0 && ability.Int("slot") < 8, ability.location + ": skill slot must be 0..7");
+            Need(ability.Text("kind") == "active" || ability.Text("kind") == "passive", ability.location + ": unsupported skill kind");
+            Need(ability.Text("target") == "enemy" || ability.Text("target") == "self", ability.location + ": unsupported skill target");
+            Need(ability.Text("kind") == "passive" || ability.Int("cooldown") > 0, ability.location + ": active skill cooldown must be positive");
+        }
+        for (int job = 0; job < 3; job = job + 1) {
+            for (int slot = 0; slot < 8; slot = slot + 1) {
+                int matches = 0;
+                foreach (RuleRow ability in skills.All()) { if (ability.Int("job") == job && ability.Int("slot") == slot) { matches = matches + 1; } }
+                Need(matches == 1, "skill loadout must define exactly one skill per job and slot");
+            }
+        }
+        foreach (RuleRow m in monsters.All()) { CheckSchool(m.Text("attack_school"), m.location); CheckRanges(m); }
+        foreach (RuleRow b in bosses.All()) { CheckSchool(b.Text("attack_school"), b.location); CheckRanges(b); }
+        Need(slots.Count() == 12 && qualities.Count() == 5 && jobs.Count() == 3, "rules require 12 slots, 5 qualities, 3 jobs");
+        foreach (RuleRow q in qualities.All()) {
+            Need(q.Int("coefficient_min") <= q.Int("coefficient_max"), q.location + ": coefficient range");
+            /* 品阶倒挂防护：高品阶的最低系数不得低于低品阶，否则「传说 1 系数」
+               比「精良 3 系数」还弱。 */
+            if (q.Int("id") > 0) {
+                Need(q.Int("coefficient_min") >= qualities.At(q.Int("id") - 1).Int("coefficient_min"), q.location + ": quality coefficient floor must not regress");
+            }
+        }
+        for (int level = 1; level <= levels.Count(); level = level + 1) { levels.At(level); }
+        foreach (RuleRow item in items.All()) { if (item.Int("slot") >= 0) { slots.At(item.Int("slot")); } }
+        for (int job = 0; job < 3; job = job + 1) {
+            RuleRow j = jobs.At(job);
+            skills.At(j.Int("skill_id"));
+            Need(items.At(j.Int("weapon_id")).Int("slot") == 0, j.location + ": starter weapon slot");
+            Need(items.At(j.Int("armor_id")).Int("slot") == 1, j.location + ": starter armor slot");
+            Need(items.At(j.Int("helmet_id")).Int("slot") == 2, j.location + ": starter helmet slot");
+        }
+        foreach (RuleRow q in quests.All()) {
+            string m = q.Text("metric");
+            Need(m == "kills" || m == "level" || m == "best" || m == "recycled" || m == "skill" || m == "bossWins" || m == "rebirth", q.location + ": unsupported quest metric");
+        }
+        for (int i = 1; i <= rebirth.Count(); i = i + 1) { rebirth.At(i); }
+        for (int i = 1; i <= growth.Count(); i = i + 1) { growth.At(i); }
+        foreach (RuleRow slot in slots.All()) { Need(slots.At(slot.Int("group")).Int("group") == slot.Int("group"), slot.location + ": group must reference a canonical slot"); }
+        int last = 0;
+        foreach (RuleRow m in maps.All()) {
+            Need(m.Int("start_floor") > last, m.location + ": map floors must increase");
+            last = m.Int("start_floor");
+            monsters.At(m.Int("monster_id"));
+            Need(PoolTotal(m.Int("drop_pool")) > 0, m.location + ": missing drop pool");
+        }
+        Need(maps.At(1).Int("start_floor") == 1, "first map must start at floor 1");
+        /* 掉落池允许非装备（转生证明/龙珠/渡劫证明/祝福油…），但引用的
+           item_id 必须存在，且不能是货币占位（id<=10 的是金币/元宝/经验…）。 */
+        foreach (RuleRow drop in drops.All()) {
+            int itemId = drop.Int("item_id");
+            RuleRow item = items.At(itemId);
+            Need(itemId > 10, drop.location + ": drop pool must not contain currency placeholders");
+            Need(item.Text("name").Length > 0, drop.location + ": drop references an unnamed item");
+        }
+        foreach (RuleRow forge in forge.All()) {
+            string op = forge.Text("operation");
+            string scale = forge.Text("scale");
+            Need(op == "upgrade" || op == "reroll" || op == "improve" || op == "tier", forge.location + ": unsupported forge operation");
+            Need(scale == "upgrade" || scale == "coefficient" || scale == "fixed", forge.location + ": unsupported cost scale");
+            Need(op != "tier" || forge.Int("limit") < qualities.Count(), forge.location + ": tier limit");
+            Need((op != "reroll" && op != "improve") || forge.Int("limit") <= 10, forge.location + ": coefficient limit");
+            Need(forge.Int("success_pct") >= 1 && forge.Int("success_pct") <= 100, forge.location + ": success percentage");
+            Need(forge.Text("failure") == "keep" || forge.Text("failure") == "downgrade", forge.location + ": unsupported failure result");
+            Need(op != "reroll" || forge.Text("failure") == "downgrade", forge.location + ": reroll must declare downgrade failure");
+        }
+        foreach (RuleRow shop in shop.All()) {
+            string reward = shop.Text("reward");
+            bool runeReward = reward.StartsWith("rune") && reward != "runes";
+            if (runeReward) {
+                int rune = Ruleset.ParseInt(reward.Substring(4, reward.Length - 4), shop.location + ": rune reward");
+                Need(rune >= 1 && rune <= 14, shop.location + ": rune reward must be 1#..14#");
+            }
+            bool ballReward = reward.StartsWith("ball");
+            if (ballReward) {
+                int star = Ruleset.ParseInt(reward.Substring(4, reward.Length - 4), shop.location + ": dragon ball reward");
+                Need(star >= 1 && star <= 9, shop.location + ": dragon ball reward must be 1..9 star");
+            }
+            Need(reward == "potions" || reward == "iron" || reward == "capacity" || reward == "runes" || reward == "gold" || reward == "ore" || ballReward || runeReward,
+                shop.location + ": unsupported reward");
+        }
+        foreach (string baseKey in "legend_sword_base,legend_robe_male_base,legend_robe_female_base".Split(",")) {
+            Need(items.At(Val(baseKey)).Int("slot") >= 0, "legend base must be equipment: " + baseKey);
+        }
+        int legendFirst = Val("legend_first_form");
+        int legendForms = Val("legend_form_count");
+        Need(legendForms >= 2 && legendForms <= 9, "legend form count bounds");
+        for (int i = 0; i < legendForms * 3; i = i + 1) {
+            Need(items.At(legendFirst + i).Int("slot") == (i < legendForms ? 0 : 1), "legend form chain slots");
+        }
+        foreach (string key in Rules.RequiredKeys()) { Val(key); }
+        Need(Val("guild_create_gold") > 0 && Val("guild_create_gold") <= 1000000000, "guild creation cost out of range");
+        Need(Val("boss_tries") > 0 && Val("arena_tries") > 0 && Val("escort_tries") > 0 && Val("tower_tries") > 0, "daily try budgets must be positive");
+        Need(Val("max_floor") >= last && Val("max_floor") <= 10000 && Val("max_rebirth") <= 10, "progression bounds");
+        Need(rebirth.Count() >= Val("max_rebirth"), "missing rebirth levels");
+        Need(Val("initial_capacity") > 0 && Val("initial_capacity") <= Val("max_capacity") && Val("max_capacity") <= 120 && Val("storage_capacity") <= 120, "inventory bounds");
+        Need(Val("offline_seconds") <= 86400 && Val("equipment_coefficient_max") > 0 && Val("equipment_coefficient_max") <= 10, "simulation bounds");
+        foreach (RuleRow encounter in encounters.All()) {
+            CheckSchool(encounter.Text("attack_school"), encounter.location);
+            string progress = encounter.Text("progress");
+            Need(progress == "tower" || progress == "rebirth" || progress == "secrets", encounter.location + ": unsupported progression");
+            Need(PoolTotal(encounter.Int("drop_pool")) > 0, encounter.location + ": missing pool");
+            string mode = encounter.Text("progress_cap_mode");
+            Need(mode == "fixed" || mode == "level_plus", encounter.location + ": unsupported progress_cap_mode");
+            CheckRanges(encounter);
+        }
+        foreach (RuleRow boss in bosses.All()) {
+            Need(PoolTotal(boss.Int("drop_pool")) > 0, boss.location + ": missing pool");
+        }
+    }
+
+    void CheckSchool(string school, string context) {
+        Need(school == "attack" || school == "magic" || school == "tao", context + ": unknown attack school");
+    }
+
+    void CheckSkillSchool(string school, string kind, string context) {
+        if (kind == "passive") {
+            Need(school == "attack" || school == "magic" || school == "tao" || school == "defense" || school == "magic_defense", context + ": unknown skill school");
+        } else { CheckSchool(school, context); }
+    }
+
+    void CheckRanges(RuleRow row) {
+        foreach (string group in "attack,magic,tao,defense,magic_defense".Split(",")) {
+            Need(row.Int(group + "_min") <= row.Int(group + "_max"), row.location + ": inverted " + group + " range");
+        }
+    }
+}

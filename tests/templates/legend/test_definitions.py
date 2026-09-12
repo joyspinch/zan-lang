@@ -17,7 +17,9 @@ sys.dont_write_bytecode = True
 
 ROOT = Path(__file__).resolve().parents[3]
 DATA = ROOT/'templates/game/legend/data'
-DB = ROOT/'templates/server/server-game/data/M2.DB'
+# The original data.dll snapshot lives with the server template that seeds from it
+# (server-legend). Keep this the only place the client tests reach across templates.
+DB = ROOT/'templates/server/server-legend/data/M2.DB'
 EXE = ROOT/'build/legend-attributes-test.exe'
 spec = importlib.util.spec_from_file_location('enrich', ROOT/'templates/game/legend/tools/enrich_attributes.py')
 module = importlib.util.module_from_spec(spec)

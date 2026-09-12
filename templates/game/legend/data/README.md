@@ -2,16 +2,17 @@
 
 ## 数据链与生效范围
 
-原版数据已入库服务端 `templates/server/server-game/data/M2.DB`（权威载体）：
+原版数据已入库服务端 `templates/server/server-legend/data/M2.DB`（权威载体）；
+服务端侧还有一份本目录规则表的发布副本 `data/rules/`，由
+`templates/server/server-legend/tools/sync_rules.py` 单向同步：
 
 - 原表：`GameItem/GameMap/GameMonster/GameBoss/GameSkill/GameSc/GameTitle/
   GameCity/GameAchieve/GameFw/GameJue/GameShuxing/GameTask`——从迷你传奇
   `data/data.dll` 只读导出，逐字保留 ID、原字段与空值；`GameSource` 记录
   来源 SHA256，`GameMeta` 记录各表行数。
-- 数据链：`data.dll --import_reference.py--> reference/*.csv
-  --sync_csv_to_db.py--> M2.DB`。reference CSV 入库后不再入库客户端模板，
-  需要重同步时先用 `import_reference.py` 重导出，再跑
-  `templates/server/server-game/tools/sync_csv_to_db.py`。
+- 数据链：`data.dll --import_reference.py--> reference/*.csv --> M2.DB`。
+  `reference/` 是一次性中间产物，导出后不入库；需要重同步时重跑
+  `import_reference.py` 再入库。入库后 M2.DB 即只读种子，运行期不写回。
 - 本目录的运行时 CSV：暂由 `src/Tables.zan` 启动读取校验；正逐步改为
   客户端走协议取服务端数据，完成后本目录仅保留资产映射并删除其余 CSV。
   **改原版数据改 M2.DB（或重跑同步），改模板数值才改这里的 CSV。**
@@ -22,7 +23,7 @@
 | monsters（36）、bosses（28） | 战斗属性、伤害类型、奖励；原始六条无生命怪物占位记录仅保留在 reference |
 | maps（35）、drops（234） | 地图及掉落装备池；运行时掉落权重属于模板规则，不冒充原版爆率 |
 | slots（12）、qualities（5） | 穿戴组、品质权重/倍率/系数区间 |
-| jobs（3）、skills（3）、levels（1500） | 角色基础/每级属性、三个模板技能、经验曲线 |
+| jobs（3）、skills（24）、levels（1500） | 角色基础/每级属性、3 职业 × 8 技能槽、经验曲线 |
 | attributes（12） | 各属性评分权重、强化比例、修炼/收集/转生/称谓增益 |
 | gems（6） | 六槽宝石的属性、等级上限与金币/黑铁/元宝成本 |
 | forge（4）、shop（18） | 锻造操作、材料费用、成功率/失败结果与商店商品 |
@@ -75,7 +76,12 @@ python templates/game/legend/tools/enrich_attributes.py
 
 `need`、`f1`、`fj`、`ztx` 等原字段保持原样，没有根据缩写猜测并实现吸血、暴击、套装等效果。它们的解释和触发逻辑必须对照原程序验证后再接入。当前完整的是上述十二个基础战斗属性，不是“所有原版特殊词条和所有玩法”。
 
-回归测试位于仓库 `tests/templates/legend/`：86 条 Zan 断言覆盖穿戴、伤害分流、强化、存档和三职业一小时离线模拟；Python 测试逐字段核对全量原始定义，并验证导入幂等和八类错误配置拒绝。
+回归测试位于仓库 `tests/templates/legend/`：189 条 Zan 断言覆盖穿戴、伤害分流、
+强化、地图行进、五行、祭坛、存档和三职业一小时离线模拟；Python 测试逐字段核对
+全量原始定义，并验证导入幂等和八类错误配置拒绝。
+
+服务端参数与「客户端一份规则 + 服务端一份规则」的同步纪律见
+`templates/server/server-legend/data/RULES.md`（冲突裁决台账 + 数值依据）。
 
 
 ## 五行突破字段
