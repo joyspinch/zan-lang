@@ -316,6 +316,29 @@ parser 回溯，专项做。
   拷进 toolchain/。OHOS NDK clang 15.0.4 在 DevEco Studio 安装目录的
   native/ 下。
 
+## IOCP 唤醒包丢失家族与 raw socket 探针陷阱（A298 收尾，2026-09-14）
+
+- **丢包路径的契约**：Windows 上 `PostQueuedCompletionStatus` 失败（DNS/-2
+  唤醒包）会置 `g_blocking_wake_lost`，完成结果滞留 `g_blocking_done` 且
+  `g_blocking_inflight` 仍计数（递减只发生在 drain/timeout）。任何驻车前
+  （尤其 INFINITE 超时）必须 check-and-drain 这个 flag——`co_wait_io` 与
+  `zan_io_poll` 都有了（pre-park drain 守卫）；新增阻塞等待时照抄，别只
+  依赖 GQCS 失败分支的超时扫描（INFINITE 下永不可达）。POSIX 侧 wake 走
+  eventfd/管道且在 select 集合里，无丢包问题——此类改动天然 Windows-only。
+- **「关闭不唤醒」指认前先 A/B 四形状**：closesocket 的 IRP 取消本就补发
+  完成包（aborted op 呈现为 0 字节读=对端关闭语义）。判据矩阵=本端
+  raw Close / 对端 FIN × 单反应器 / `--async-workers` 多 worker；四格全
+  绿就别再指认「raw 关闭不唤醒」（A298⑵ 的旧说法即此假象）。现在
+  `zan_io_close_notify`（Windows）为显式 `CancelIoEx(fd, NULL)`，唤醒
+  不再依赖 closesocket 的隐式取消时序；stdlib 侧 `Socket.ShutdownBoth`
+  同型（SysShutdown+CancelIoEx）。
+- **raw `Socket.Create*` 曾不做 WSAStartup**（2026-09-14 已修：四个
+  Create* 自调 `Socket.Initialize()`）：TcpListener/TcpClient/UdpClient
+  构造器各自初始化，raw 路径原本无人兜底，Windows 上 `CreateTcp()`
+  静默返 -1。**socket 探针必须断言 fd>0 且 Bind==0**——否则挂在不存在的
+  fd 上，`AcceptAsync(-1)` 立即返回会伪装成「苏醒」，探针假阳性（首轮
+  listener 探针就因此"通过"过一次）。
+
 ## conformance 处置四分法
 
 挂的测试先归因再动手：「stale golden」（重生成，逐行核对 C# 拼写）、

@@ -2601,6 +2601,15 @@ int32_t zan_io_poll(int64_t timeout_ms) {
     ULONG removed = 0;
     int64_t wait = rto_wait_ms(dns_wait_ms(timeout_ms));
     DWORD to = (wait < 0) ? INFINITE : (DWORD)wait;
+    /* A completion packet whose Post failed left a finished blocking job in
+     * g_blocking_done with nothing to announce it (g_blocking_inflight still
+     * counts it, so the early return above does not fire). Drain before
+     * parking: with INFINITE the timeout scans in the GQCS-failure branch
+     * would never run. Same guard as co_wait_io. */
+    if (g_blocking_wake_lost && InterlockedExchange(&g_blocking_wake_lost, 0)) {
+        int wd = dns_drain();
+        if (wd) return wd;
+    }
 #if defined(ZAN_CO_DRIVER)
     if (!io_poll_any(entries, 64, &removed, to)) {
 #else
@@ -2646,11 +2655,17 @@ int32_t zan_io_poll(int64_t timeout_ms) {
     return woke;
 }
 
-/* See rt_io.h. Windows has no fd-numbered waiter slot: pending overlapped
- * reads are completed (reported as 0 bytes) by the shutdown path's
- * CancelIoEx + wakeup packet, so there is no stale-slot identity to clear. */
+/* See rt_io.h. Windows has no fd-numbered waiter slot to clear; instead,
+ * cancel every overlapped op still pending on the socket so a parked
+ * RecvAsync/AcceptAsync wakes deterministically as a 0-byte peer-closed.
+ * closesocket's own IRP cancellation posts the same packets, but only when
+ * the handle actually closes; cancelling here keeps the wake ordered before
+ * the handle can be closed and reused. Already-complete or already-closed
+ * fds fail with ERROR_NOT_FOUND / ERROR_INVALID_HANDLE and are ignored --
+ * same pattern as the rto deadline path and Socket.ShutdownBoth. */
 void zan_io_close_notify(intptr_t fd) {
-    (void)fd;
+    if (fd > 0)
+        CancelIoEx((HANDLE)fd, NULL);
 }
 
 #else

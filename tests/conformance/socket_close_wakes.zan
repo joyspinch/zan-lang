@@ -1,0 +1,72 @@
+using System;
+using System.Net;
+using System.Net.Sockets;
+
+/// Socket.Close on a raw fd must wake coroutines parked on that fd:
+///   - AcceptAsync parked on a listener wakes with <= 0 (A298-2)
+///   - RecvAsync parked on a connection wakes with "" (peer-closed shape)
+/// Pins the close-wakes contract that zan_io_close_notify (Windows
+/// CancelIoEx) implements; loopback only, no external network.
+class Prog
+{
+    const int PORT_A = 39741;
+    const int PORT_B = 39743;
+    static nint listenerA;
+    static int acceptState;
+    static nint listenerB;
+    static nint srvSock;
+    static int srvReady;
+    static int recvDone;
+    static string recvResult = "?";
+
+    static async void AcceptLoop()
+    {
+        nint c = await Socket.AcceptAsync(listenerA);
+        if (c > 0) { acceptState = 1; Socket.Close(c); }
+        else { acceptState = 2; }
+    }
+
+    static async void ServerRun()
+    {
+        nint c = await Socket.AcceptAsync(listenerB);
+        if (c <= 0) { recvResult = "accept-fail"; recvDone = 2; return; }
+        srvSock = c;
+        srvReady = 1;
+        string piece = await Socket.RecvAsync(c, 8192);
+        recvResult = "len=" + Convert.ToString(piece.Length);
+        recvDone = 1;
+    }
+
+    static async int Main()
+    {
+        // Shape A: close the listener under a parked AcceptAsync.
+        listenerA = Socket.CreateTcp();
+        if (Socket.Bind(listenerA, "127.0.0.1", PORT_A) != 0) { Console.WriteLine("bindA-fail"); return 3; }
+        Socket.Listen(listenerA, 4);
+        Task.Spawn(AcceptLoop());
+        await Task.Delay(200);   // let AcceptAsync park on the listener
+        Socket.Close(listenerA);
+        for (int i = 0; i < 160 && acceptState == 0; i = i + 1) { await Task.Delay(25); }
+        if (acceptState == 0) { Console.WriteLine("HUNG-accept"); return 42; }
+        Console.WriteLine("accept-state=" + Convert.ToString(acceptState));
+
+        // Shape B: close the accepted socket's own end under a parked RecvAsync.
+        listenerB = Socket.CreateTcp();
+        if (Socket.Bind(listenerB, "127.0.0.1", PORT_B) != 0) { Console.WriteLine("bindB-fail"); return 3; }
+        Socket.Listen(listenerB, 4);
+        Task.Spawn(ServerRun());
+        nint cli = Socket.CreateTcp();
+        int rc = await Socket.ConnectAsync(cli, "127.0.0.1", PORT_B);
+        if (rc != 0) { Console.WriteLine("connect-fail"); return 3; }
+        for (int i = 0; i < 40 && srvReady == 0; i = i + 1) { await Task.Delay(25); }
+        if (srvReady == 0) { Console.WriteLine("accept-timeout"); return 3; }
+        await Task.Delay(200);   // let RecvAsync park on the accepted socket
+        Socket.Close(cli);   // same-side raw close (A298-2 shape 1)
+        for (int i = 0; i < 160 && recvDone == 0; i = i + 1) { await Task.Delay(25); }
+        if (recvDone == 0) { Console.WriteLine("HUNG-recv"); if (srvSock > 0) { Socket.Close(srvSock); } return 42; }
+        Console.WriteLine("recv " + recvResult);
+        if (srvSock > 0) { Socket.Close(srvSock); }
+        Console.WriteLine("ok");
+        return 0;
+    }
+}
