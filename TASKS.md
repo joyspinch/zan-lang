@@ -2566,3 +2566,30 @@ P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
   exe 相对 auto-stdlib 的 A/B 大坑 + CellOf 闭账改记；
   zan-development（②③）——`x is T ?` 旧教训翻转（已修，22d75d0e）
   改记新语义 + int? 解包模式不支持 + as 失败产空串。
+
+### 折线族第三波（2026-09-13，平滑坍缩 + splitLine 维度默认 + 时间值对堆叠）
+* **已完成**：BuildPathFxEx 贝塞尔基单位错乱（‰ 幂配 1e6 常数项 → b0 恒
+  ≈1 → 每段采样坍缩段起点，smooth 全错、末段丢失）换百万分定点真贝塞尔
+  基 + Bernstein 配对；splitLine 官方维度缺省（xAxis false / yAxis true，
+  SSR 实测）+ ParseAxisOne 补收 splitLine 声明（splitLineDeclared/
+  splitColor/splitWidth）；axisLabel.margin 接线（缺省 8，bump-chart 30
+  曾被写死 Scale(6) 盖掉标签数字）；DispatchKind 堆叠判定提到点系列之前
+  + DrawStackedArea noCatX 路径（时间值对 stack 曾按未堆叠折线画）；
+  DrawStackedArea 量程 NiceRange→NiceSpan6（330→400 曾致堆叠带低 19px）；
+  轴级静态 axisPointer（show 缺省 'auto' 声明 value 即画，含 label 盒）。
+  新增 conformance `chart_axis_splitline_pointer`；36 demo 比对 27 PASS 且
+  四个用户点名 demo 逐图目检与官方一致；charts_test.exe 已重建。
+* **挂账（真缺陷）**：grid-multiple grid2 值域（#b6d634 IoU 0.25，
+  引擎带体 391..455 vs 官方 330..527）；axisLabel.inside 未实现（标签画
+  到绘图区外被画布裁剪，line-tooltip-touch Y 轴）；axisPointer.handle
+  未画（官方底部小把手）。
+* **挂账（oracle 伪差，不改引擎）**：confidence-band（官方线色带 opacity
+  混色，精确 hex 匹配天然 MISS）；dynamic-data2 / line-easing（官方 SSR
+  定格动画起始帧，引擎画终态=实机终态）；line-tooltip-touch #7581BD
+  IoU 0.01（oracle 只收 stroke path，label 盒是 fill rect）。
+* **挂账（测试基建，另立提交）**：standard 层 10 例因"用例读仓库相对
+  路径文件 + ctest 默认 cwd=build/"失败（dataminmax/cat_backfill/
+  force_params/series_zorder/tree_depth/http_forwarder_stream/win_tray/
+  gui_chart_calendar/barminheight/policy_gallery_coverage）；手工从根目录
+  5 个 conformance 全 MATCH 证非引擎回归。修法 = add_test 统一补
+  `WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}`。

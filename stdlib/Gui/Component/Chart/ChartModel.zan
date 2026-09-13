@@ -2750,6 +2750,19 @@ class ChartAxis {
     bool reversed;    // 翻转轴（ECharts inverse）
     int ticks;        // 数值轴刻度数（默认 5）
     bool showGrid;    // 为此轴绘制网格线
+    bool splitLineDeclared; // splitLine 显式声明过——按维度的官方默认
+                      // （xAxis false / yAxis true）只对未声明轴生效
+    int splitColor;   // splitLine.lineStyle.color；0 = 主题网格色
+    int splitWidth;   // splitLine.lineStyle.width；0 = 1
+    int axisPointerShow; // 轴级静态 axisPointer：-1 未声明（官方缺省
+                      // 不画）/ 1 显式 true / 0 显式 false
+    double apValue;   // axisPointer.value 锚点（时间轴 = epoch 天，
+                      // 数值轴 = 原值）
+    bool apValueSet;  // value 是否声明
+    int apColor;      // axisPointer.lineStyle.color；0 = 轴色
+    int apWidth;      // axisPointer.lineStyle.width；0 = 1
+    bool apLabelShow; // axisPointer.label.show
+    int apLabelBg;    // axisPointer.label.backgroundColor；0 = 主题
     bool splitArea;   // ECharts splitArea.show：数值轴相邻刻度交替底纹
                       //   （2.2 数值轴默认开，5.x 默认关——引擎随 5.x）
     int labelRotate;   // ECharts axisLabel.rotate：度（钳 -90..90），0 = 水平
@@ -2833,8 +2846,13 @@ class ChartAxis {
         a.scale = false;
         a.reversed = false;
         a.ticks = 5;
-        // ECharts 2 类目轴 splitLine 默认开（竖向 #eee 网格线）。
+        // ECharts 6.1 轴 splitLine 缺省不再在这里定：工厂两族共用，
+        // 维度差异（xAxis false / yAxis true）由 ParseAxisOne 在未
+        // 声明时落；工厂保持"开"，兼容不走 JSON 的内部构图。
         a.showGrid = true;
+        a.splitLineDeclared = false; a.splitColor = 0; a.splitWidth = 0;
+        a.axisPointerShow = 0 - 1; a.apValue = 0.0; a.apValueSet = false;
+        a.apColor = 0; a.apWidth = 0; a.apLabelShow = false; a.apLabelBg = 0;
         a.splitArea = false;
         a.labelRotate = 0;
         a.labelInterval = 0 - 1;
@@ -2888,6 +2906,9 @@ class ChartAxis {
         a.reversed = false;
         a.ticks = 0;
         a.showGrid = true;
+        a.splitLineDeclared = false; a.splitColor = 0; a.splitWidth = 0;
+        a.axisPointerShow = 0 - 1; a.apValue = 0.0; a.apValueSet = false;
+        a.apColor = 0; a.apWidth = 0; a.apLabelShow = false; a.apLabelBg = 0;
         a.splitArea = false;
         a.labelRotate = 0;
         a.labelInterval = 0 - 1;
@@ -2993,6 +3014,12 @@ class ChartAxis {
         a.breakFillColor = src.breakFillColor;
         a.breakOpacityX10 = src.breakOpacityX10;
         a.reversed = src.reversed; a.ticks = src.ticks; a.showGrid = src.showGrid;
+        a.splitLineDeclared = src.splitLineDeclared; a.splitColor = src.splitColor;
+        a.splitWidth = src.splitWidth;
+        a.axisPointerShow = src.axisPointerShow; a.apValue = src.apValue;
+        a.apValueSet = src.apValueSet; a.apColor = src.apColor;
+        a.apWidth = src.apWidth; a.apLabelShow = src.apLabelShow;
+        a.apLabelBg = src.apLabelBg;
         a.splitArea = src.splitArea;
         a.labelRotate = src.labelRotate; a.labelInterval = src.labelInterval;
         a.labelMargin = src.labelMargin;
@@ -7809,6 +7836,56 @@ class ChartOption {
         JsonValue msv = v.Get("minorSplitLine");
         if (msv != null && msv.IsObject()) {
             a.minorSplitLineShow = msv.Bool("show", a.minorSplitLineShow);
+        }
+        // splitLine（axisDefault.ts：xAxis 缺省 show:false、yAxis 缺省
+        // show:true——维度差异，与轴类型无关；SSR 实测 6.1 双轴
+        // get('splitLine') 证实）。显式声明优先并覆盖主题网格色；
+        // 未声明按维度落默认，替掉 ECharts 2 "类目轴竖线默认开"的
+        // 旧语义（line-simple 这类未声明 splitLine 的折线图官方只
+        // 有横线）。
+        JsonValue slv2 = v.Get("splitLine");
+        if (slv2 != null && slv2.IsObject()) {
+            if (slv2.Has("show")) {
+                a.showGrid = slv2.Bool("show", a.showGrid);
+                a.splitLineDeclared = true;
+            }
+            JsonValue slLs = slv2.Get("lineStyle");
+            if (slLs != null && slLs.IsObject()) {
+                a.splitColor = ChartOption.ParseColor(slLs.Get("color"), 0);
+                a.splitWidth = slLs.Int("width", a.splitWidth);
+            }
+        }
+        if (!a.splitLineDeclared) { a.showGrid = !isX; }
+        // 轴级静态 axisPointer（line-tooltip-touch）：show 显式才画
+        // （轴级缺省 false，跟 tooltip 联动的 axisPointer 是另一套
+        // 组件）。value = 指示线锚点——时间轴吃 'YYYY-M-D' 转 epoch
+        // 天，数值轴吃数；lineStyle.color/width、label.show/
+        // backgroundColor 随声明收。
+        JsonValue apv2 = v.Get("axisPointer");
+        if (apv2 != null && apv2.IsObject()) {
+            if (apv2.Has("show")) {
+                a.axisPointerShow = apv2.Bool("show", false) ? 1 : 0;
+            }
+            JsonValue apval2 = apv2.Get("value");
+            if (apval2 != null) {
+                if (apval2.IsString()) {
+                    int ddy = ChartOption.ParseDateDay(apval2.AsString(""), 0 - 1);
+                    if (ddy >= 0) { a.apValue = (double)ddy; a.apValueSet = true; }
+                } else if (apval2.IsNumber()) {
+                    a.apValue = apval2.AsDouble(0.0);
+                    a.apValueSet = true;
+                }
+            }
+            JsonValue apls2 = apv2.Get("lineStyle");
+            if (apls2 != null && apls2.IsObject()) {
+                a.apColor = ChartOption.ParseColor(apls2.Get("color"), 0);
+                a.apWidth = apls2.Int("width", a.apWidth);
+            }
+            JsonValue aplb2 = apv2.Get("label");
+            if (aplb2 != null && aplb2.IsObject()) {
+                a.apLabelShow = aplb2.Bool("show", a.apLabelShow);
+                a.apLabelBg = ChartOption.ParseColor(aplb2.Get("backgroundColor"), 0);
+            }
         }
         // axis.scale：ECharts 无默认值（`axisCommonTypes.ts:235 scale?: boolean`），
         // 只在 scaleRawExtentInfo 里按真值判断，缺省等价 false。

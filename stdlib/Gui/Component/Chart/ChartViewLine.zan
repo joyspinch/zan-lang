@@ -180,16 +180,21 @@ partial class ChartView {
             if (steps < 2) { steps = 2; }
             int sIdx = 1;
             while (sIdx <= steps) {
-                int tt = sIdx * 1000 / steps;
-                int tt2 = tt * tt / 1000;
-                int tt3 = tt2 * tt / 1000;
-                // 3 次贝塞尔基（P0=prev, C0=cpx0/cpy0, C1=cpx1/cpy1, P1=x/y）
-                long b0 = 1000000 - 3 * tt2 + 2 * tt3;
-                long b1 = 3 * tt2 - 2 * tt3;
-                long b2 = tt3 - 2 * tt2 + tt;
-                long b3 = tt2 - tt3;
-                long qx = (b0 * prevX + b2 * cpx0 + b3 * cpx1 + b1 * x) / 1000000;
-                long qy = (b0 * prevY + b2 * cpy0 + b3 * cpy1 + b1 * y) / 1000000;
+                // 三次贝塞尔基（P0=prev, C0=cpx0/cpy0, C1=cpx1/cpy1,
+                // P1=x/y），t 取百万分定点。旧实现把 Hermite 基的 ‰ 幂
+                // 直接当贝塞尔基：t²/t³ 项按 ‰ 定标（最大 1000）而常数
+                // 项是 1e6，b0 恒 ≈ 0.9995——每段 48 个采样全部坍缩在
+                // 段起点，平滑曲线退化成首尾直联的折线（smooth 名存实
+                // 亡），末段在描边器里只剩零长段 + 一次端点直跳。
+                long tm = (long)sIdx * 1000000 / steps;
+                long t2m = tm * tm / 1000000;
+                long t3m = t2m * tm / 1000000;
+                long b0 = 1000000 - 3 * tm + 3 * t2m - t3m;
+                long b1 = 3 * tm - 6 * t2m + 3 * t3m;
+                long b2 = 3 * t2m - 3 * t3m;
+                long b3 = t3m;
+                long qx = (b0 * prevX + b1 * cpx0 + b2 * cpx1 + b3 * x) / 1000000;
+                long qy = (b0 * prevY + b1 * cpy0 + b2 * cpy1 + b3 * y) / 1000000;
                 ox.Add((int)qx); oy.Add((int)qy);
                 sIdx = sIdx + 1;
             }
@@ -1362,8 +1367,24 @@ partial class ChartView {
 
         // dataZoom：与折线/柱状一致，锁定窗口 [i0,i1]，
         // 渲染按窗口索引读原系列。
+        // 无类目 X（时间值对/数值对 points——line-tooltip-touch 的
+        // stack + time）时没有类目标签，窗口/点数改取最长系列。
+        bool noCatX = o.YAxis0().type == ChartAxisType.Category
+            || o.XAxis0().type == ChartAxisType.Value
+            || (o.XAxis0().type == ChartAxisType.Time
+                && o.XCategories().Count == 0);
+        int axisN = 0;
+        if (noCatX) {
+            for (int ani = 0; ani < series.Count; ani = ani + 1) {
+                ChartSeries ans = series[ani];
+                if (ans.hidden) { continue; }
+                if (ans.points.Count > axisN) { axisN = ans.points.Count; }
+                if (ans.data.Count > axisN) { axisN = ans.data.Count; }
+            }
+        }
         int zoomH = 0;
         int fullN = labels.Count;
+        if (axisN > fullN) { fullN = axisN; }
         int i0 = 0;
         int i1 = fullN - 1;
         if (o.zoom && o.iwid != 0 && fullN > 1) {
@@ -1373,6 +1394,7 @@ partial class ChartView {
         }
         List<string> winLabels = Chart.WindowLabels(labels, i0, i1);
         int n = winLabels.Count;
+        if (n < 1 && axisN > 0) { n = axisN; }
         // ECharts nice 量程：堆叠感知的组顶/绝对值最大取整到步长
         // 倍数（如 0..1320 → 0..1400 每 200）。小数堆叠（confidence-
         // band L/U 带）走 ×1000 定点——Value() 四舍五入会把
@@ -1399,9 +1421,14 @@ partial class ChartView {
                 }
                 if (sumF > maxStackF) { maxStackF = sumF; }
             }
-            sv = Chart.NiceRange(0, maxStackF);
+            // 官方 6.1 nice（intervalScaleNiceTicks：1/2/3/5/10 阶梯，
+            // SSR 校准 0..330 → 0..350 step 50）。旧 NiceRange 是 2.2.x
+            // smartSteps 阶梯（330 → 400），堆叠带整体比官方低 19px。
+            sv = Chart.NiceSpan6(0, maxStackF, ChartOption.AutoD(),
+                ChartOption.AutoD());
         } else {
-            sv = Chart.NiceRange(0, Chart.MaxStackGroupsW(series, n, i0));
+            sv = Chart.NiceSpan6(0, Chart.MaxStackGroupsW(series, n, i0),
+                ChartOption.AutoD(), ChartOption.AutoD());
         }
         int maxV = sv.hi;
         // dataZoom 滑条预留带先于面板头声明：底部图例锚点据此上移。
@@ -1558,8 +1585,31 @@ partial class ChartView {
                     }
                 }
                 List<int> xs = new List<int>();
-                for (int xi = 0; xi < n; xi = xi + 1) {
-                    xs.Add(f.CatX(xi, n));
+                if (noCatX) {
+                    // 时间值对：x 取首条可见带 points 的系列（epoch 天
+                    // 走 XOfTime；数值对走 ValueXF 定点直通）——与
+                    // DrawLines geoMode 1 同一映射。堆叠组共享 x。
+                    ChartSeries xsSrc = null;
+                    for (int xsi = 0; xsi < series.Count; xsi = xsi + 1) {
+                        if (!series[xsi].hidden && series[xsi].points.Count > 0) {
+                            xsSrc = series[xsi];
+                            break;
+                        }
+                    }
+                    for (int xi = 0; xi < n; xi = xi + 1) {
+                        if (xsSrc != null && xi < xsSrc.points.Count) {
+                            xs.Add(f.isTime
+                                ? f.XOfTime(Chart.PointV(xsSrc.points[xi].x, xsSrc.pointG))
+                                : Chart.ValueXF(f.plotX, f.plotW, f.xLo, f.xHi,
+                                    xsSrc.points[xi].x, xsSrc.pointG));
+                        } else {
+                            xs.Add(f.plotX);
+                        }
+                    }
+                } else {
+                    for (int xi = 0; xi < n; xi = xi + 1) {
+                        xs.Add(f.CatX(xi, n));
+                    }
                 }
                 bool smooth = o.smooth;
                 if (s.smooth == 1) { smooth = true; } else if (s.smooth == 0) { smooth = false; }

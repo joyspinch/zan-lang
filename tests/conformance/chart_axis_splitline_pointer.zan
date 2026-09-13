@@ -1,0 +1,88 @@
+// 折线族第二波回归锚点（官方 6.1 SSR 对抄）：
+// ①splitLine 官方缺省按维度（axisDefault.ts：xAxis show:false、
+//   yAxis show:true，SSR get('splitLine') 实测）——引擎旧默认
+//   "类目轴竖线开"是 ECharts 2 遗留，line-simple 类未声明 splitLine
+//   的折线图曾画出官方没有的竖向网格；
+// ②显式 splitLine.show/lineStyle.color/width 收进 showGrid/splitColor/
+//   splitWidth（bump-chart 的 xAxis.splitLine.show:true 必须保留竖线）；
+// ③Clone 全量携带新字段；
+// ④轴级静态 axisPointer：show 官方缺省 'auto'（SSR 实测）——未声明
+//   show 但声明 value 时显示（line-tooltip-touch 只写 value/lineStyle/
+//   label，竖线照画）；显式 false 隐藏；lineStyle.color/width 与
+//   label.backgroundColor 收进；
+// ⑤NiceSpan6 用于堆叠面积量程：0..330 → 0..350 step 50（官方 6.1
+//   intervalScaleNiceTicks 1/2/3/5/10 阶梯；旧 NiceRange 2.2.x 阶梯
+//   给 400，堆叠带整体比官方低 19px）；
+// ⑥平滑路径采样（poly.ts drawSegment + 三次贝塞尔基）：段边界 t=1
+//   精确落在端点——旧基函数 ‰/1e6 单位错乱（b0 恒≈1）每段采样坍缩
+//   在段起点，smooth 名存实亡、末段只剩端点直跳；
+// ⑦时间值对 + stack 分发：[[ts,v],...] 落在 points 里，堆叠判定必须
+//   先于"点系列 → lines"（line-tooltip-touch 两条 stack 同名系列曾
+//   各自按原始值画，官方是累计面积带）。
+using System;
+using Gui.Component.Chart;
+
+namespace Conf;
+
+class Program {
+    static void Main() {
+        // ① 维度缺省：x 关、y 开，且都记"未声明"。
+        ChartOption d1 = ChartOption.FromJson("{\"xAxis\":{\"type\":\"category\",\"data\":[\"A\",\"B\"]},\"yAxis\":{},\"series\":[{\"type\":\"line\",\"data\":[1,2]}]}");
+        ChartAxis x0 = d1.xAxes[0];
+        ChartAxis y0 = d1.yAxes[0];
+        Console.WriteLine("dim-x=" + Convert.ToString(x0.showGrid ? 1 : 0)
+            + "," + Convert.ToString(x0.splitLineDeclared ? 1 : 0));
+        Console.WriteLine("dim-y=" + Convert.ToString(y0.showGrid ? 1 : 0)
+            + "," + Convert.ToString(y0.splitLineDeclared ? 1 : 0));
+
+        // ② 显式声明：X 开 + 线色宽；Y 关。
+        ChartOption d2 = ChartOption.FromJson("{\"xAxis\":{\"type\":\"category\",\"data\":[\"A\",\"B\"],\"splitLine\":{\"show\":true,\"lineStyle\":{\"color\":\"#7581BD\",\"width\":2}}},\"yAxis\":{\"type\":\"value\",\"splitLine\":{\"show\":false}},\"series\":[{\"type\":\"line\",\"data\":[1,2]}]}");
+        ChartAxis x1 = d2.xAxes[0];
+        ChartAxis y1 = d2.yAxes[0];
+        Console.WriteLine("expl-x=" + Convert.ToString(x1.showGrid ? 1 : 0)
+            + "," + Convert.ToString(x1.splitLineDeclared ? 1 : 0)
+            + ";" + Convert.ToString(x1.splitColor) + "," + Convert.ToString(x1.splitWidth));
+        Console.WriteLine("expl-y=" + Convert.ToString(y1.showGrid ? 1 : 0)
+            + "," + Convert.ToString(y1.splitLineDeclared ? 1 : 0));
+
+        // ③ Clone 携带。
+        ChartAxis cx = ChartAxis.Clone(x1);
+        if (cx != null) {
+            Console.WriteLine("clone=" + Convert.ToString(cx.showGrid ? 1 : 0)
+                + "," + Convert.ToString(cx.splitLineDeclared ? 1 : 0)
+                + ";" + Convert.ToString(cx.splitColor) + "," + Convert.ToString(cx.splitWidth));
+        }
+
+        // ④ axisPointer：auto + value（line-tooltip-touch 形态）、显式 false。
+        ChartOption d3 = ChartOption.FromJson("{\"xAxis\":{\"type\":\"time\",\"axisPointer\":{\"value\":\"2016-10-7\",\"lineStyle\":{\"color\":\"#7581BD\",\"width\":2},\"label\":{\"show\":true,\"backgroundColor\":\"#7581BD\"}}},\"yAxis\":{},\"series\":[{\"type\":\"line\",\"data\":[[\"2016-10-4\",1]]}]}");
+        ChartAxis x2 = d3.xAxes[0];
+        Console.WriteLine("ap-auto=" + Convert.ToString(x2.axisPointerShow)
+            + ";" + Convert.ToString(x2.apValueSet ? 1 : 0) + "," + Convert.ToString(x2.apValue)
+            + ";" + Convert.ToString(x2.apColor) + "," + Convert.ToString(x2.apWidth)
+            + ";" + Convert.ToString(x2.apLabelShow ? 1 : 0) + "," + Convert.ToString(x2.apLabelBg));
+        ChartOption d4 = ChartOption.FromJson("{\"xAxis\":{\"type\":\"value\",\"axisPointer\":{\"show\":false,\"value\":3}},\"yAxis\":{},\"series\":[{\"type\":\"line\",\"data\":[1]}]}");
+        Console.WriteLine("ap-off=" + Convert.ToString(d4.xAxes[0].axisPointerShow));
+
+        // ⑤ 堆叠面积量程：官方 nice 0..330 → 0..350。
+        ChartSpan sv = Chart.NiceSpan6(0, 330, ChartOption.AutoD(), ChartOption.AutoD());
+        Console.WriteLine("span=" + Convert.ToString(sv.lo) + "," + Convert.ToString(sv.hi)
+            + ";" + Convert.ToString(sv.ticks));
+
+        // ⑥ 平滑采样：段边界精确落端点。
+        List<int> px = new List<int>();
+        List<int> py = new List<int>();
+        px.Add(100); py.Add(300);
+        px.Add(200); py.Add(100);
+        px.Add(400); py.Add(200);
+        List<int> ox = new List<int>();
+        List<int> oy = new List<int>();
+        ChartView.BuildPathFx(px, py, true, ox, oy);
+        Console.WriteLine("path-n=" + Convert.ToString(ox.Count)
+            + ";mid=" + Convert.ToString(ox[48]) + "," + Convert.ToString(oy[48])
+            + ";last=" + Convert.ToString(ox[ox.Count - 1]) + "," + Convert.ToString(oy[oy.Count - 1]));
+
+        // ⑦ 时间值对 + stack → stackedArea（而非 lines）。
+        ChartOption d5 = ChartOption.FromJson("{\"xAxis\":{\"type\":\"time\"},\"yAxis\":{},\"series\":[{\"type\":\"line\",\"stack\":\"a\",\"data\":[[\"2016-10-4\",292],[\"2016-10-5\",287]]},{\"type\":\"line\",\"stack\":\"a\",\"data\":[[\"2016-10-4\",38],[\"2016-10-5\",28]]}]}");
+        Console.WriteLine("kind=" + ChartView.DispatchKind(d5));
+    }
+}
