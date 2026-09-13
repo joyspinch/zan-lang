@@ -462,6 +462,15 @@ parser 回溯，专项做。
     --emit-ir` 连跑两次比 md5。HEAD stdlib 上两次 rc=0 且 md5 相同即证明与
     本修无关。同理，`ctest` 大面积红先看有没有**别的会话在跑 ctest/构建**
     （共用 `build\zanc.exe` 与 `conf_*.exe`），隔离重跑一遍再下结论。
+- **A/B 两个 zanc 二进制时 stdlib 根跟着 exe 走（2026-09-13 实测大坑）**：
+  `--auto-stdlib` 按**编译器 exe 所在目录**找 stdlib（main.c:2951）——
+  worktree/副本里构建的 zanc 会静默用它自己那份冻结 stdlib；此时脚本若又
+  显式喂主树 stdlib 文件，同一文件两个根各注册一次，全局类型集体报
+  `ambiguous type 'X'; qualify it with its namespace`（一次 IDE 全量 A/B
+  假象出 100 歧义 583 错，差点误判成编译器回归）。**正解**：把被测 zanc
+  复制进主 `build/` 再跑（auto-stdlib 即指向主树 stdlib）；反方向复制
+  （主 zanc 放进副本树）要连 `build/zanrt_*.obj`、`zan_*.obj` 一起带过去，
+  否则链接期才炸"no such file: zanrt_timer.obj"。
 - 门控：`--emit-symbols` 恒全量（IDE 索引要完整 stdlib），`ZAN_NO_PULLIN_FILTER=1`
   回退旧行为，`ZAN_PULLIN_DEBUG=1` 打印每个文件的拉入原因（含命中名）。
 - 语义等价验证定式：同一程序 `ZAN_NO_PULLIN_FILTER=1` 开关两态编译运行
@@ -471,13 +480,12 @@ parser 回溯，专项做。
   GuiHost→App/Style/Fx 的活代码闭包 + Zan 运行时，与 unused 无关。
 - stdlib 文件引用跨命名空间类型必须写 using（ChartHost 曾裸写 `App`，
   靠用户程序恰好也有 `class App` 才碰巧编译——prune 把它藏成了哑弹）。
-- **极小 seed 的闭包过滤有已知误伤（2026-09-13，挂账未修）**：只引用
-  `Element` 等一两个名字的最小程序，闭包裁到 Transfer/DataGrid 的
-  delegate 声明面不齐，报 `cannot convert 'CellOf' to 'CellOf'`（同名
-  类型两份解析；Transfer.zan:204/207、DataGrid.zan:89/306/341）；
-  同一程序把 seed 加大（多真实引用几个 Gui 类型）即全绿。**症状是
-  同名类型互斥转换时先怀疑闭包裁剪，不是代码错**——TASKS.md P8-3 有
-  最小探针与 HEAD 复现记录。
+- **（已闭，2026-09-13）极小 seed 曾报 `cannot convert 'CellOf' to
+  'CellOf'`**（同名类型两份解析，Transfer/DataGrid delegate 声明面）。
+  当时的诊断 heuristic 仍有效：**同名类型互斥转换先怀疑闭包裁剪，不是
+  代码错**。现在的 HEAD 复现不出（6 形态 × 2 拉入模式全绿；台账行号
+  所指代码已不存在），疑 A312 限定名逃逸根修顺带治愈——再遇到先隔离
+  重跑，别急着当活缺陷修。
 
 ## 闭包捕获语义：按变量分型
 

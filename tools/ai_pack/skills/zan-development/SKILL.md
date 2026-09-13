@@ -50,10 +50,15 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
 * Platform-specific code: `#if WINDOWS` / `#else`; native symbols via
   `[DllImport("crt", EntryPoint = "...")]`.
 * Strings concatenate with `+`; `Convert.ToString(n)` for numbers.
-* Ternary `cond ? a : b` exists, but **`x is T ? a : b` fails to parse**:
-  the type operand of `is` eats `?` as a nullable-type marker. Write
-  `(x is T) ? a : b` or if/else. (Cost a real debugging round in
-  ChildWindow.)
+* Ternary `cond ? a : b` and type tests compose: `x is T ? a : b` parses
+  as the conditional (C# rule — `?` starts the true-arm when a top-level
+  `:` closes the construct). The nullable marker still wins when no `:`
+  follows: `x is int? i` tests against `int?`. **Unwrap patterns are not
+  supported**: `maybe is int n` (int? -> int) does not compile — test
+  `maybe is int?` instead. `as` on failure yields an empty string for
+  value-shaped targets, not null: check `!= ""`. (2026-09-13: the parse
+  ambiguity was fixed in zanc; the old advice to write `(x is T) ? a : b`
+  is obsolete.)
 * Never list attribute names with `*/` inside a `/* ... */` comment —
   `data-on-*/data-if` closes the comment mid-sentence and the rest becomes
   code (209 cascading errors). Separate with `、` or spaces.

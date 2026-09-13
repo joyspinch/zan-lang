@@ -20,7 +20,7 @@
 | P5 | HTML 声明层：Html.zan parser、tag→控件映射、data-on-* 事件、data-bind、style/link 接线、GenHtml 编译期生成器、App.LoadHtml()、oracle 闭环 | ✅ 2026-09-12 | 09d73369 运行时 + dc3b55f9 生成器；oracle html 13 盒（tol 3）；编译期建树与运行时解析 13 盒 diff 全等；主文档 docs/HTML_UI.md |
 | P6 | overflow 滚动：auto/scroll 真语义（clip+偏移+滚动条） | ✅ 2026-09-12 | oracle scroll 16 盒全部 0px（auto/hidden/scroll 三态、程序滚动、钳制、嵌套组合）；UiDriver 实机滚轮验证（注入滚轮→子树精确平移） |
 | P7 | 设计器 + HUD：存取格式 = .html、Inspector CSS 编辑、拖拽翻译 CSS、游戏窗口层嵌入帧循环、IDE 自用窗体重写 | ✅ 2026-09-12 | P7a ✅：DesignerHtml 编解码器全键往返、GenForm .html 设计稿投影（与 .zform 同一生成）、生成器缓存键全 stdlib 哈希（genrun.c）、Designer.SaveHtml/LoadHtmlText 桥、IDE .html 设计稿九处接线；P7b ✅：字段内联 style 通道（SetProp("style")→ApplyInline，FormField.styleText，Inspector STYLE 声明行编辑，DesignerHtml style 属性互通，GenForm/FormBuilder 同落点；布局键让位设计几何记台账）；P7d ✅（模板+IDE 43 份 .zform 全转 .html，模型级等价校验，引用全翻转，.zform 编译通道保留给旧项目）；P7c ✅：游戏 HUD 帧内接入实测（游戏=Gui 同引擎不建宿主；clean/dirty avg 3ms、max 23ms，预算 16.6ms；空闲 120 拍仅 3 帧；像素级门控证据；台账：流式子元素 % 宽未生效顺延 P8）；LSP 补 .html 设计稿索引通道（2227fab0） |
-| P8 | 组件精简：% 尺寸修复、属性面生成化、复合控件声明化重组、legacy API 删除 | 🚧 2026-09-13 | % 尺寸修复 ✅（下详）；legacy 删除 ✅：P8-4 .zform 编译通道删除（C 侧 `zan_is_design_path` 删臂 + main.c 定向拒绝诊断，GenForm 只认 .html，4 份测试 .zform 经 `DesignerHtml.FromJsonDoc` 保真转 .html 入库；IDE 内部 .zform 功能臂清扫留独立提交）；动态原语 ✅ 2026-09-13：`data-if` → `Control.bindIf`（Truthy 真值插拔）+ `<template data-for>` 行克隆展开（原型 UA display:none，ChildWindow 每帧核对数组长度整组重建，行内 bind/bindIf 以本项 JsonValue 为第一作用域、回落根模型，Element 缺省绑定属性 text），运行时 Parse / GenHtml / GenForm+FormBuilder / DesignerHtml 四路同语义（四 conformance：gui_html_dynamic、zform_dynamic、html_runtime、designer_html 扩展；主文档 docs/HTML_UI.md「动态原语」节；边界：嵌套模板不支持、Element 父内模板宜为末子项、ApplyInline 内联声明克隆不带走）；事件带参 ✅ 2026-09-13：`data-arg` 属性 → `Control.handlerArg`，HtmlHandlers/HandlerRegistry 双注册表带参槽，Html.WireArg 落名+实参闭包快照（Wire 契约补齐：名字无注册表也落控件，ChildWindow 宿主可二次解析），ChildWindow.HandleArg/WireNode 带参优先回落无参，GenHtml 发射 handlerArg+WireArg，模板克隆行共享原型实参；GenForm/设计器 v1 不建模（设计稿事件模型纯名字）；gui_html_dynamic/gui_html_runtime 扩展金标不变）；其余进行中 |
+| P8 | 组件精简：% 尺寸修复、属性面生成化、复合控件声明化重组、legacy API 删除 | ✅ 2026-09-13 | % 尺寸修复 ✅（下详）；legacy 删除 ✅：P8-4 .zform 编译通道删除（C 侧 `zan_is_design_path` 删臂 + main.c 定向拒绝诊断，GenForm 只认 .html，4 份测试 .zform 经 `DesignerHtml.FromJsonDoc` 保真转 .html 入库；IDE 内部 .zform 功能臂清扫留独立提交）；动态原语 ✅ 2026-09-13：`data-if` → `Control.bindIf`（Truthy 真值插拔）+ `<template data-for>` 行克隆展开（原型 UA display:none，ChildWindow 每帧核对数组长度整组重建，行内 bind/bindIf 以本项 JsonValue 为第一作用域、回落根模型，Element 缺省绑定属性 text），运行时 Parse / GenHtml / GenForm+FormBuilder / DesignerHtml 四路同语义（四 conformance：gui_html_dynamic、zform_dynamic、html_runtime、designer_html 扩展；主文档 docs/HTML_UI.md「动态原语」节；边界：嵌套模板不支持、Element 父内模板宜为末子项、ApplyInline 内联声明克隆不带走）；事件带参 ✅ 2026-09-13：`data-arg` 属性 → `Control.handlerArg`，HtmlHandlers/HandlerRegistry 双注册表带参槽，Html.WireArg 落名+实参闭包快照（Wire 契约补齐：名字无注册表也落控件，ChildWindow 宿主可二次解析），ChildWindow.HandleArg/WireNode 带参优先回落无参，GenHtml 发射 handlerArg+WireArg，模板克隆行共享原型实参；GenForm/设计器 v1 不建模（设计稿事件模型纯名字）；gui_html_dynamic/gui_html_runtime 扩展金标不变）；属性面生成化 ✅：P8-2a 局部 Binding<T> 声明初始化降级 + P8-2b class 收敛基类契约 + P8-2c size 枚举收敛 + P8-2d GetExtra/SetExtra 四刀收口（死写面修复 5 键、不可达死臂删除 57 臂 13 文件、ColorPicker/InputNumber 不等价臂三件套转换、ChoiceGroup/RadioGroup options 死臂删除与 slider marks 测试管线化；DataGrid 等余下键全部判决合法 extra-only，29 文件 90 键臂普查闭环）；IDE 内部 .zform 功能臂清扫 ✅ 687faf39（约135处→14处，余为 legacy 导入面；bind 全绿验证）；复合控件声明化重组 ✅（决策：不做——设计器编辑属性面而非复合内部结构，判据见台账）；顺带：`x is T ?` 三元歧义修复（22d75d0e 缺陷①闭账）、void 调用结果当值由静默坏 IR 改定向诊断（280e08d6）、lambda_87 类 closure 签名 verifier 失败挂账（在途树触发、新旧编译器同错，待专项） |
 
 ## 每期验收纪律
 
@@ -287,3 +287,19 @@ golden/audit/Inert 名单同步 → 提交 `gui-web(Pn): 主题`。
 - **（P6 台账）scrollbar-gutter/scroll-behavior/scroll-snap/锚点
   滚动 不支持**：无预留槽、无平滑滚动、无 snap 点、无 URL 片段
   滚动定位。
+- **（P8 台账）动态原语边界**：`<template data-for>` 不嵌套（模板体内
+  再有 template 不展开）；模板宜为父 Element 的末子项（行渲染排在全部
+  已跟踪内容之后）；HTML 通道克隆行带走 zgen-N 合成类规则，FormBuilder
+  通道 ApplyInline 的实例字段克隆不带走。`data-arg` 是静态字面量快照
+  不是绑定路径（模板克隆行共享原型实参，行身份走 data-bind 回写通道）；
+  GenForm/设计器 v1 不建模带参事件——设计稿事件模型是纯名字，带参文档
+  由 HTML 层承载。
+- **（P8 决策）复合控件声明化重组不做**：设计器对复合控件（ChatView/
+  DataGrid/ColorPicker…）编辑的是属性面——PropSpec 与已判净的 Extra 键
+  （P8-2d 四刀：死写面修复、不可达死臂删除 57 臂、不等价臂三件套转换、
+  ChoiceGroup/RadioGroup options 死臂删除、slider marks 测试转管线；
+  余下键全部判决为合法 extra-only，如 DataGrid 全部键读写自身 st.*
+  状态）——不重组其内部结构。复合控件是行为体（流式/编辑/拾色状态机），
+  内部结构不是设计器的编辑对象；整体 HTML 化需要 DesignerHtml 对每个
+  复合内部全键建模（P7 级工程），收益不抵风险。声明层的组合单位
+  Element + 标准控件已够表达窗口/页面/面板。

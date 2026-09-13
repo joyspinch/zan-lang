@@ -2472,3 +2472,70 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
   gui_html_runtime（handlerArg 字段 + 两宿主路径断言），金标均不变；
   爆炸半径 gui_css/timeline/props/nav/zform_html/zform_dynamic/
   zform_grid/designer_html 八例字节级一致。
+
+### P8 收尾清帐（2026-09-13， afternoon 批次）
+
+P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
+
+* **IDE 内部 .zform 功能臂清扫（687faf39）**：54 文件，约 135 处字面
+  引用收敛到 14 处（全为 legacy .zform 导入面：IsFormPath/FormBaseName/
+  LegacyFormToJson 等，注明 legacy-import only；Workspace 33→0、
+  ZanIDE 17→1、CodeNav 15→14、其余 ~50 文件注释/文案翻转，
+  AiProfiles PathFilter 补 .zcomp）。验证：全量 zanc 编译到 bind
+  0 错 0 警——codegen 阶段 LLVM verifier lambda_87 失败与清扫无关
+  （stash 基线 A/B 同错 + 新旧编译器 A/B 同错双证）。**A/B 方法论
+  挂 skill**：worktree 构建的 zanc 按 exe 目录解析 auto-stdlib
+  （main.c:2951），与显式主树 stdlib 输入双根双注册，产生 100 个
+  假 ambiguous type 的 583 错假象（zan-compiler-internals）。
+* **缺陷② CellOf 闭账**：6 探针形态 × 2 拉入模式在当前 HEAD 全绿
+  无法复现；台账行号（Transfer.zan:204/207、DataGrid.zan:89/306/341）
+  所指代码已不存在，疑 A312 限定名逃逸根修顺带治愈。skill 同提交
+  改记闭账状态，保留诊断 heuristic（同名类型互斥转换先疑闭包裁剪）。
+* **挂账缺陷③（新）：closure 签名 LLVM verifier 失败**——IDE 全量
+  输入（在途树）报 `lambda_87: Incorrect number of arguments...
+  call void %dlg.fn(ptr %clo.rec, ptr %load4)` 四处。证据链：
+  新旧编译器（542204d2/22d75d0e+）同错 → 非本轮 parser 系列引入；
+  stash 基线同错 → 非 IDE 清扫引入；IDE 设计文档零 data-arg → 非
+  ③ 闭包引入；HEAD stdlib 因 7953b6b3 半提交（ChartResolved 调
+  ChartView.ZOrder，HEAD 无此成员）bind 不通过，无法取 HEAD 基线。
+  疑似 delegate 两形态（裸函数指针/闭包 rec+fn）调用点形态判定错，
+  zan-compiler-internals 已载该域。待在途 Chart 会话落地后以稳定树
+  专项定位。
+* **缺陷④（新，已修 280e08d6）：void 调用结果当值漏诊**——
+  checker_check_assignable 把 type_void 与 type_error 同路放行 +
+  调用实参无签名时（重载/内建）无检查，void 当实参/初始化器静默
+  生成非法 IR。修法三处（assignable 报 cannot convert 'void'；
+  无签名实参报 cannot use a 'void' value；有签名者按参数类型判，
+  delegate 参数放行 spawn 惯用法，Spawn/Run 白名单对齐 irgen
+  is_call_to）。tests/diag/void_value.zan 锁两形态。闸门教训：
+  第一版通用诊断误伤 Task.Spawn(Work(n)) 核心惯用法（stdlib 10+
+  处），probe Gate.zan:54 当场暴露后收窄——**加检查先查 stdlib
+  既有惯用法**。
+* **P8-2d 收口（3a2c501b）**：ChoiceGroup/RadioGroup 的 options
+  Extra 臂按三件套判据判死删除（spec 已绑 + 覆写拦截）；slider
+  marks 直调测试转管线——上一刀删臂漏转、ctest 绿系 STAMP 回放，
+  本轮 stdlib 变更触发真编译暴露（回放教训已在 skill，此次再次
+  实证）；DataGrid 普查判决 = 全部 Extra 键读写自身 st.* 状态
+  （523 行注释明言规格不绑定）合法 extra-only。29 文件 90 键臂
+  普查至此闭环，属性面生成化 P8-2 全部完成。
+* **policy_zform_schema 复绿**：a60aabb6 导出器让 GenForm 读
+  Element 的 "text"（ObjStr(o,"text")→SetText），zform.doc.json
+  漏登记——补记 text 键（3a2c501b）。
+* **复合控件声明化重组：决策不做**（roadmap 台账有全文）：设计器
+  编辑属性面而非复合内部结构；复合控件是行为体，整体 HTML 化需
+  DesignerHtml 全键建模（P7 级工程）收益不抵风险。
+* **standard 层补跑（缺陷① IOU 销账）**：832 例，除在途会话用例
+  外全绿。本轮修正后转绿 2 例（gui_slider、policy_zform_schema）；
+  在途外部失败 11 例（chart×6=Chart 会话 N3 treemap 系列、
+  gui_html_widget_shadow=他会在途未跟踪用例、http_client_keepalive
+  超时/http_forwarder_stream/mysql_async_nonblocking=Net 在途编辑、
+  win_tray_screen_smoke/listview_scrollbar_drag=环境）；
+  **conformance_gui_compref 1 例运行期 FAIL（inner label by
+  caption）暂无法归因**：复跑时在途树已 bind 中断（Card1.Kind()
+  unresolved，Chart 会话新半提交），我的改动面（ChoiceGroup 死臂/
+  checker 诊断）与 Label caption 查找无因果路径——待树稳定后复查
+  挂账。
+* **skill 增删（rule 13）**：zan-compiler-internals（①）——
+  exe 相对 auto-stdlib 的 A/B 大坑 + CellOf 闭账改记；
+  zan-development（②③）——`x is T ?` 旧教训翻转（已修，22d75d0e）
+  改记新语义 + int? 解包模式不支持 + as 失败产空串。
