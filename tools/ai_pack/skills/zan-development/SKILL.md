@@ -120,6 +120,10 @@ Protocols: containers map to `Element` (UA stylesheet supplies web defaults
 map to real widgets, `select` is a placeholder box. Events:
 `data-on-click="save"` wires the handler registered as
 `handlers.Add("save", ...)`; unknown names silently no-op by design.
+Handler args: `data-arg="apple"` on the same node passes the literal
+`"apple"` to an `handlers.AddArg("save", (string a) => ...)` entry
+(creation-time value snapshot — row identity goes through `data-bind`,
+not the arg; template rows share the prototype's arg).
 `style` attributes become `.zgen-N` class rules (class-level specificity,
 not browser inline specificity). Idempotent pitfalls: Button routes "Click"
 to its dedicated `Click` field — assert `((Button)b).Click.Count()`, not

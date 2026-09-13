@@ -2435,3 +2435,40 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
   DataGrid.zan:89/306/341，泛型类内 delegate 同名解析分裂）——
   最小探针触发、同程序大闭包全绿，疑闭包裁剪掉了同名类型的一致
   解析所需文件，待专项定位。
+
+### P8-3b 事件带参 data-arg（2026-09-13，提交见 git log）
+
+用户点名的三件套之③（"收益最小，复杂逻辑本来就该在代码"——落的是
+最小声明面，不是表达式求值）。HTML 里
+`<button data-on-click="pick" data-arg="apple">` 把字面量 `apple`
+作为实参传给带参处理器；列表行共用一个处理器区分来源的最小方案。
+
+- **Control.handlerArg** 字段（声明通道，v1 不进序列化——设计器事件
+  模型是纯名字，带参文档由 HTML 层承载）。运行时 `Html.Build` 预扫
+  `data-arg` 落字段（属性顺序不保证，先于全部 data-on-* 消费）；
+  `Html.Clone` 两分支随 bind 三字段一起带走。
+- **双注册表带参槽**：`HtmlHandlers.AddArg/FindArg`（Dict 二表）与
+  `HandlerRegistry.SetArg/GetArg`（HandlerEntry.argAction）。Set 不清
+  argAction 槽、SetArg 不清 action 槽，同名双注册并存。
+- **`Html.WireArg(handlers, c, evt, name, arg)`**：名字照落控件
+  （SetHandler），带参槽命中则把实参闭包进无参 Action 再 BindEvent
+  ——实参是只读捕获局部 = 创建时值快照（"这个控件永远带着它的参数"）；
+  未命中静默不接。**顺带把 `Html.Wire` 的契约补齐**：名字无论有没有
+  注册表都落控件（此前 Build(null) 建的树 c.events 为空，ChildWindow
+  宿主根本无从二次解析——GenForm 生成码早就是 BindEvent+SetHandler
+  双发，运行时通道补齐同一契约）。
+- **ChildWindow**：`HandleArg(name, Action<string>)` +
+  WireNode 带参优先解析（handlerArg 非空且带参槽命中 → 有参闭包；
+  否则回落无参 Has/Get——只注册了无参版也能接）。
+- **GenHtml**：EmitDecl 落 `vN.handlerArg`；EmitWiring 对带参节点发射
+  `Html.WireArg(...)`，生成码与运行时建树同语义。GenForm/FormBuilder/
+  DesignerHtml v1 不建模（见上）。
+- **语义边界**：data-arg 是静态字面量快照不是绑定路径——模板克隆行
+  共享原型上的同一实参，行身份走 data-bind 回写通道；嵌套/表达式
+  不支持（复杂逻辑在宿主语言）。
+- 验证：_scratch 探针四通道全绿（运行时注册表、ChildWindow 二次解析、
+  模板克隆行、GenHtml 生成码双宿主路径）；conformance 扩展
+  gui_html_dynamic（静态按钮 + 模板行按钮带参断言）与
+  gui_html_runtime（handlerArg 字段 + 两宿主路径断言），金标均不变；
+  爆炸半径 gui_css/timeline/props/nav/zform_html/zform_dynamic/
+  zform_grid/designer_html 八例字节级一致。

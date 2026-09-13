@@ -32,13 +32,24 @@ class HtmlDoc {
 }
 
 /// data-on-* 的处理器注册表：`handlers.Add("submit", () => ...)`，
-/// HTML 里 `data-on-click="submit"` 命中同名条目即接线。
+/// HTML 里 `data-on-click="submit"` 命中同名条目即接线。带参变体
+/// `AddArg("row", a => ...)` 配 `data-arg` 使用（见 Html.WireArg）。
 class HtmlHandlers {
     Dict<string, Action> map;
+    Dict<string, Action<string>> argMap;
 
     void Add(string name, Action a) {
         if (this.map == null) { this.map = new Dict<string, Action>(); }
         this.map.Add(name, a);
+    }
+
+    /// 注册带参处理器：同名文档节点写了 `data-arg="x"`，触发时
+    /// 收到 "x"。
+    void AddArg(string name, Action<string> a) {
+        if (this.argMap == null) {
+            this.argMap = new Dict<string, Action<string>>();
+        }
+        this.argMap.Add(name, a);
     }
 
     /// 未注册的名字返回 null（静默不接线——HTML 是声明，事件在
@@ -47,6 +58,14 @@ class HtmlHandlers {
         if (this.map == null) { return null; }
         Action a = null;
         if (this.map.TryGetValue(name, out a)) { return a; }
+        return null;
+    }
+
+    /// 带参槽查找，未注册返回 null。
+    Action<string> FindArg(string name) {
+        if (this.argMap == null) { return null; }
+        Action<string> a = null;
+        if (this.argMap.TryGetValue(name, out a)) { return a; }
         return null;
     }
 }
@@ -130,6 +149,11 @@ class Html {
         }
         // 真控件的 id 不进 nodeName（那是 Element 的），走选择器名
         if (id != "" && !(c is Element)) { c.SetProp("name", id); }
+        // data-arg 预扫：属性顺序不保证（data-arg 可写在 data-on-*
+        // 之后），先取出来供本节点全部事件共用；同时落 handlerArg
+        // 字段，ChildWindow.WireNode 的二次接线同源。
+        string darg = HtmlText.Attr(n.attrNames, n.attrVals, "data-arg");
+        if (darg != "") { c.handlerArg = darg; }
         // 属性协议（与 GenHtml 生成的建树代码同一套语义）
         for (int i = 0; i < n.attrNames.Count; i = i + 1) {
             string k = n.attrNames[i];
@@ -164,7 +188,14 @@ class Html {
             if (k.Length > 8 && HtmlText.StartsWith(k, "data-on-")) {
                 string suffix = k.Substring(8, k.Length - 8);
                 string evt = HtmlText.EventKind(suffix);
-                if (evt != "") { Html.Wire(handlers, c, evt, v); }
+                if (evt != "") {
+                    // Wire/WireArg 负责落名（SetHandler）+ 接线，见上。
+                    if (darg != "") {
+                        Html.WireArg(handlers, c, evt, v, darg);
+                    } else {
+                        Html.Wire(handlers, c, evt, v);
+                    }
+                }
                 continue;
             }
             // 其余属性（href/title/disabled/...）忽略（台账）
@@ -216,6 +247,7 @@ class Html {
             el.bindPath = src.bindPath;
             el.bindProp = src.bindProp;
             el.bindIf = src.bindIf;
+            el.handlerArg = src.handlerArg;
             for (int ei = 0; ei < src.events.Count; ei = ei + 1) {
                 el.SetHandler(src.events[ei].key, src.events[ei].val);
             }
@@ -263,6 +295,7 @@ class Html {
         n.bindPath = c.bindPath;
         n.bindProp = c.bindProp;
         n.bindIf = c.bindIf;
+        n.handlerArg = c.handlerArg;
         List<PropSpec> ps = c.Props();
         for (int i = 0; i < ps.Count; i = i + 1) {
             n.SetProp(ps[i].key, c.GetProp(ps[i].key));
@@ -279,11 +312,30 @@ class Html {
 
     /// data-on-* 接线的公开钩子：生成的/手写的建树代码统一走这里，
     /// 由它消化"名字 → 注册表 Action → BindEvent"与 Button 等控件
-    /// 把事件路由到专属槽位的差异（BindEvent 多态分派）。
+    /// 把事件路由到专属槽位的差异（BindEvent 多态分派）。名字无论
+    /// 有没有注册表都落控件（SetHandler）——与 GenForm 生成的建树
+    /// 代码同一契约，ChildWindow.Wire 等宿主才能二次解析。
     static void Wire(HtmlHandlers handlers, Control c, string evt,
                      string name) {
-        if (handlers == null || evt == "") { return; }
+        if (evt == "") { return; }
+        c.SetHandler(evt, name);
+        if (handlers == null) { return; }
         Action a = handlers.Find(name);
         if (a != null) { c.BindEvent(evt, a); }
+    }
+
+    /// 带参接线（`data-arg`）：按名查带参槽，把实参闭包进无参
+    /// Action 再 BindEvent（实参是只读捕获的局部——创建时值快照，
+    /// 语义即"这个控件永远带着它的参数"）。名字照落控件；带参槽
+    /// 未命中时静默不接（与 Wire 同一契约）。
+    static void WireArg(HtmlHandlers handlers, Control c, string evt,
+                        string name, string arg) {
+        if (evt == "") { return; }
+        c.SetHandler(evt, name);
+        if (handlers == null) { return; }
+        Action<string> a = handlers.FindArg(name);
+        if (a == null) { return; }
+        string captured = arg;
+        c.BindEvent(evt, () => { a(captured); });
     }
 }

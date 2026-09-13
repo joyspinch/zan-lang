@@ -70,6 +70,7 @@ HTML 实体（`&amp;` `&lt;` `&#65;` 等）在文本与属性值里都解码。
 | class | 逐个 AddClass |
 | style | 行内样式合成专属类 `.zgen-N { ... }`（复用整套级联与 !important 机制，见差异清单） |
 | data-on-\<evt\>="名" | 事件接线（见下） |
+| data-arg="字面量" | 本控件全部 data-on-* 处理器的实参（见下） |
 | data-bind="路径" | 绑定路径 bindPath |
 | data-if="路径" | 真值插拔声明 bindIf（见「动态原语」） |
 | data-for="路径" | `<template>` 行展开源数组（见「动态原语」；Element 上同时进属性表） |
@@ -95,6 +96,29 @@ focus/blur、keydown/keyup/keypress。未映射的后缀与未注册的名字都
 接线走 `Control.BindEvent`（多态）——Button 把 "Click" 路由到专属
 `Click` 字段（与 `btn.Click += h` 同队列）。断言事件数时按控件实际
 槽位查（`((Button)b).Click.Count()`，不是 `b.On.Click`）。
+
+**带参事件 `data-arg`**：列表行/卡片上的同类按钮想共用一个处理器又
+要区分来源时，`data-on-click="pick" data-arg="apple"` 把字面量
+`apple` 作为实参传给带参条目。注册表挂带参槽：
+
+```zan
+h.AddArg("pick", (string arg) => { ... });   // 同名也可再 Add 无参版
+```
+
+语义要点：
+
+- 实参是 **`data-arg` 属性值的创建时快照**（Wire 时闭包捕获），不是
+  绑定路径——行身份走 `data-bind` 回写通道，`data-arg` 只表达
+  "这个控件带着什么参数"这一静态事实；
+- 名字命中带参槽 → 有参调用；只注册了无参 `Add` → 回落无参调用；
+  都没注册 → 静默不接（同上）；
+- 名字无论如何都落控件（`SetHandler`），ChildWindow 宿主可用
+  `HandleArg("pick", ...)` + `Wire()` 二次解析——运行时 `Html.Parse`
+  与编译期 `GenHtml`（发射 `handlerArg` 字段 + `Html.WireArg`）同一
+  语义；`<template data-for>` 克隆行保留声明，展开后逐行接线共享
+  原型上的同一实参；
+- `GenForm`/设计器通道不建模 data-arg：设计稿的事件模型是纯名字
+  （生成码按名分发），带参文档由 HTML 层承载。
 
 ## 动态原语：data-if 与 `<template data-for>`（P8）
 
@@ -257,7 +281,8 @@ font-size/transition）完全生效，不受几何影响。这是对浏览器 "i
 - **捕获控件的内嵌元素忽略**：`<button><span>x</span></button>` 的
   span 不建树，文本并入按钮标签。
 - **事件模型是宿主委托**：没有 DOM 冒泡/捕获/.preventDefault——
-  data-on-* 直连控件事件槽，一个名字一个 Action。
+  data-on-* 直连控件事件槽，一个名字一个 Action。data-arg 是宿主侧
+  的静态实参快照，不是 DOM data-* 属性（浏览器打开无事件语义）。
 - **滚动条是覆盖式**：`overflow-y: auto/scroll` 出的滚动条画在内容
   上、不占布局宽（Chrome 经典条占 17px、出现/消失引起 reflow；
   oracle 用 --hide-scrollbars 对齐）。水平轴只裁剪不滚动；
