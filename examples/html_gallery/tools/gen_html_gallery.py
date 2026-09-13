@@ -270,7 +270,7 @@ def geom(fx, fy, fw, fh):
 # 白补丁、内容文字（跟随 --text-primary 变白）在白底上集体隐形。
 CARD_STYLE = ("background:var(--surface-bg); color:var(--text-primary); "
               + "border:1px solid var(--border-secondary); border-radius:10px")
-TITLE_STYLE = "color:var(--text-secondary); font-size:15px"
+TITLE_STYLE = "color:var(--text-secondary); font-size:17px"
 
 def emit_demo(kind, dw, dh, a, ind):
     out = []

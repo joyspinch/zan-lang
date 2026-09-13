@@ -42,7 +42,10 @@ token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
 **字号**:`var(--font-size-tiny/small/medium/large/huge)` = 12/13/14/16/20。
 正文 medium(14),辅助/标签 small(13)或 tiny(12),区块标题 large(16),
 页面标题 huge(20)。更大的展示数字用 Tailwind 原子类 `text-xl..text-3xl`,
-但一个画面至多出现一个超档大字。
+但一个画面至多出现一个超档大字。**卡片墙的组头(每卡标题)别挤在
+small-medium 之间**:画廊卡片标题先后用 13/15 都被打回"太小",17 才过
+——密排卡片墙里 caption 与正文只差 1px 等于没分组,组头要么 large(16)
+要么自定义再大一档,和正文拉开两级才算分组。
 
 **控件高度**:`var(--height-tiny/small/medium/large)` = 22/28/34/40。
 按钮/输入框/选择框用 `.tiny/.small/.medium/.large` 皮肤档位类
