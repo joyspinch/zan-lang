@@ -4,13 +4,42 @@
 通道已删（GenForm 只认 .html）——别再写、别再提，见到旧稿用设计器
 往返转一次即可。
 
-## 两条建树通道（同语义，选一条）
+## 三条建树通道（同解析器，按窗口形态选）
 
-- **编译期**：设计稿作为编译输入，GenHtml 合成 Main 与控件字段。
-  **设计稿必须是命令行第一个文件**——zanc 从第一份设计文档合成入口，
-  放后面 = 字段全缺（模板门配方：html 首参 + 全部 src/*.zan）。
-- **运行时**：`App.LoadHtml(...)` 同一解析器动态建树。切页出口里
-  装每页内容时用这条。
+- **编译期设计稿（GenForm）**：body 带 `data-zan-design` 的设计文档
+  作为编译输入，GenForm 合成 Main、控件字段、`__BuildForm`（含
+  `root.Dock(Dock.Fill())`）。**设计稿必须是命令行第一个文件**——
+  zanc 从第一份设计文档合成入口，放后面 = 字段全缺（模板门配方：
+  html 首参 + 全部 src/*.zan）。
+- **编译期运行期文档（GenHtml）**：body **不带** `data-zan-design`
+  的普通 .html 作为编译输入，GenHtml 展开成
+  `class <文件基名帕斯卡化>Html { public static string Css;
+  public static Control Build(HtmlHandlers); }`——类名来自**文件基名**
+  （App.html → `AppHtml`），不是 body id 也不是 `{{NAME}}`；成员只有
+  静态字段 `Css`（无括号）与静态方法 `Build`。**不发射 Main、不发射
+  字段、不管 dock**：`data-win-*` 是 GenForm 专属，dock/图标/Tip 等
+  行为配置在 code-behind 里 `Find(id)` 后补。适合"文档=结构快照、
+  行为=代码"的窗口。
+- **运行时**：`App.LoadHtml(...)` 同一解析器动态建树（html 文本可来自
+  文件/网络/字符串）。切页出口里装每页内容时用这条。
+
+**GenHtml 通道的树根坑（实机踩过）**：`Build` 返回的 body 元素 dock=0
+（Manual）——窗口只对 dock=Fill 的根做客户区填充，**code-behind 必须
+补一句 `root.DockFill()`**，否则整棵树缩在窗口左上角按内容尺寸排版
+（GenForm 时代这句由 `__BuildForm` 发射，runtime 文档没人替你发射）。
+同理：左栏宽度这类"GenForm 靠 logW/logH 声明"的定尺寸，在 GenHtml
+通道走 CSS `width/height` 声明（dock 排布的 `DockSize` 取
+`StyleWidthIn/StyleHeightIn`）。
+
+**迁移设计稿 → 运行期文档的三个语义坑（都真踩过）**：
+1. **单位数字是 CSS，不是逻辑 px**：`line-height: 72` 是 72 **倍**
+   行高（CSS 规范：无单位 = font-size 的倍数），30px 字号配它 =
+   3240px 行盒，整棵布局被顶飞。要 72 逻辑像素必须写 `72px`。
+   width/height/font-size 同理——搬 CSS 时逐条补单位。
+2. **样式单一来源**：骨架样式搬进文档 `<style>` 后，把 skin/appCss
+   里的同规则删掉，别留两份（改一处忘另一处）。
+3. **`{{NAME}}` 只在 .zan 里替换**；GenHtml 类名跟文件名走，
+   code-behind 里引用的是 `<基名>Html.Build/Css`。
 
 ## 声明面五件套与硬边界
 

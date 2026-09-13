@@ -629,6 +629,22 @@ CSS 里非 token 的长度由 `Style.ScaleLayout` 补乘,`StyleBox.IsPrescaled`
   驱动子窗口界面,拆成 View 控件(真实整棵树)+ 薄 ChildWindow 壳
   (`SetRoot(new View(), null)`):探针把 View 挂进主窗口驱动全部交互,
   生产路径仍走子窗口壳,两边同源(微信模板通讯录管理窗,。
+- **多窗口端到端验证用真实 Win32 点击驱动,别硬掰 UiDriver**:登录窗
+  (独立泵)→主窗这种多窗口流,UiDriver 绑在第一个 App 上驱动不到主窗;
+  改用 Win32 层驱动(SetCursorPos+mouse_event 客户区坐标+标题栏高度
+  修正、PrintWindow 按 hwnd 截图、Stop-Process 收尾),打字走
+  **剪贴板粘贴**(Set-Clipboard+^v)——机器只有中文 IME 时 SendKeys
+  会把 "admin1234" 组成 "admin安德敏234"。粘贴中文文本的进程管道
+  (bash→powershell)按 GBK 显示乱码是**终端显示问题**:
+  `乱码.encode('gbk').decode('utf-8')` 还原后与服务端存储 byte 级比对,
+  别当成输入 bug 修。
+- **HTML 运行期文档通道(GenHtml)的树根必须代码补 DockFill**:
+  `Build()` 返回的 body 元素 dock=Manual,窗口只填 dock=Fill 的根——
+  漏一句整棵树缩在左上角;类名=文件基名帕斯卡化+Html(App.html→
+  AppHtml),成员只有静态 Css 字段(无括号)+Build 方法,不发射 Main。
+  搬 CSS 进 `<style>` 时逐条补单位:`line-height: 72` 是 72 倍行高
+  (无单位=倍数),30px 字号配它=3240px 行盒整树顶飞,要 72px 必须
+  写 `72px`(详见 references/html-window.md)。
 
 - 跑 GUI 程序别用 `Start-Process -WindowStyle Hidden` 启动:STARTUPINFO 的
   SW_HIDE 会传给子进程,Zan 窗口创建即隐藏、事件循环立刻返回,症状像
