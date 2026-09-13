@@ -289,6 +289,39 @@ Difficulty is for **CLI/compute** first; GUI is a separate, larger effort on eac
   try, and finally all match native output (`conformance_try_catch_wasm32`
   compiles+links the case in the suite).
 
+### WeChat mini-game (`wasm32` GUI probe inside WeChat devtools) — verified in devtools, delivery is CDN-shaped
+- A wasm32 GUI program (window, widgets, touch, present loop) runs inside the
+  WeChat devtools simulator through a **wx-worker message bridge**: the main
+  thread collects `wx.onTouchStart/Move/End` + `onWindowResize`, the worker
+  owns the WebAssembly instance and services the `zan_env` imports off that
+  queue, and RGBA frames come back for `putImageData`. Verified end to end in
+  devtools 2.02: boot (`WX-START`), frame render/present, and touch -> Button
+  Click all land in the shell log.
+- **Host contracts** (any wasm-on-worker embed): seed resize + layout-attach
+  events *before* `_start` or the first poll sees a 0x0 window and the run
+  loop quits silently; a synchronous run loop occupies the worker until exit,
+  so runtime-posted input is only serviced between tasks — interactive test
+  events ride the pre-start queue. `Atomics.wait` on a non-shared buffer
+  throws (no cross-origin isolation in the sim), so pacing falls back to a
+  bounded busy-spin; the simulator serves worker bundles **entry file only**
+  (inline dependencies) and its file-read pipe caps single reads at the
+  Blink `atob` limit (~12.5 MB), so large engines ship as <=4 MB pieces.
+- **Package size**: a GUI engine wasm is ~14 MB (`stdlib/Gui` + FreeType +
+  font data), while a mini-game **main package caps at 4 MB** and a single
+  `.wasm` cannot be split across subpackages. The shipping shape is therefore
+  CDN/asset download into `USER_DATA_PATH` at first run (pieces reassembled
+  client-side), with subpackages carrying only the thin JS shell. Shrinking
+  the pull closure itself (`Gui/App.zan` no longer dragging the whole chart
+  component into every program) is tracked as stdlib work.
+- Devtools automation notes: the game-vs-miniprogram decision comes from a
+  per-project cached `attr.gameApp` (offline tourist projects get `false`;
+  pre-seed the store to run the game pipeline); the 2.x GUI entry exe is the
+  Electron `微信开发者工具.exe` — launching the legacy NW wrapper with the
+  old `package.nw` argument pops a browser-dialog error; CDP `Input` domain
+  drops `mousePressed` on the simulator webview (drive `wx` touch handlers
+  through `Runtime.evaluate` in the game context instead) and `Page.reload`
+  of the game webview kills it unrecoverably (restart the IDE process).
+
 ### Embedded / bare-metal (Cortex-M, RISC-V MCU) — largest effort
 - Needs a **freestanding** runtime: no libc, no OS, custom linker script, and a
   heap for ARC/`malloc`. No reactor, threads, or GUI.

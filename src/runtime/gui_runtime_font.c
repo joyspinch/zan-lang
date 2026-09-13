@@ -1047,6 +1047,17 @@ EXPORT void zan_gui_draw_text(
     bitmap_draw_text(surface_id, x, y, text, color, font_size);
 }
 
+/* Bold variant. The Win32 driver (gui_runtime_text.c) renders real bold via
+ * a weight axis; the FreeType/bitmap fallbacks here have no weight axis yet,
+ * so they draw regular rather than not at all -- same convention as the
+ * rotated fallback below. Render.zan declares the entry point
+ * unconditionally (chart titles bold by default), so every non-Win32 GUI
+ * program needs the symbol to exist. */
+EXPORT void zan_gui_draw_text_bold(
+    i32 surface_id, i32 x, i32 y, const char *text, i32 color, i32 font_size) {
+    zan_gui_draw_text(surface_id, x, y, text, color, font_size);
+}
+
 /* Rotated text: anchor and angle convention match the Win32 driver --
  * (x, y) is the unrotated line box's top-left and the run rotates rigidly
  * about it, positive = clockwise. FreeType bakes the rotation into the

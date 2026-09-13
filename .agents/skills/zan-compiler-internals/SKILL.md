@@ -691,6 +691,36 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
   `git update-index --cacheinfo 100644,<blob>,<path>`，`git diff --cached`
   核对只剩自己的 hunk 再 commit；别人的在途改动原样留在工作树。
 
+## wasm32 小游戏宿主事件桥：同步 runloop 占住 worker 任务，运行期消息不可达
+
+> wxmini 探针在微信 devtools 里 `_start` 活着但零 stdout、点击永不到达：
+> 不是 wasm 坏了，是宿主消息模型——事件桥的所有运行期假设在 worker 里
+> 都不成立，逐条踩过才有这条契约。
+
+- **pre-start 种子契约**：宿主必须在 `_start` 之前把 resize(kind 7)+
+  layout-attach(kind 14) 排进事件队列——wasm 第一次 poll 看不到画布尺寸
+  就按 0×0 窗口直接退出（零输出、无报错，像"链接失败"其实是种子丢失）。
+  种子还必须在 worker 创建**之后**发（早于 worker 存在的 sendEv 静默吞掉）。
+- **worker 消息只在任务间被服务**：同步 runloop（`_start` 内 busy-park）
+  占住 worker 直到退出，运行期 postMessage 的触摸/事件全部滞留到 exit 才
+  冲洗。交互验证不能"运行中发事件"，要把 press/release 与种子一起排在
+  wasm 投递之前（app 头几帧即处理点击）；运行期通道只对"任务会退让"的
+  宿主（真 rAF 驱动的游戏循环）成立。
+- **pacing**：无 SharedArrayBuffer 的宿主（devtools 模拟器整页没有跨域隔离）
+  里 `Atomics.wait` 对非共享 Int32Array **抛异常**（node worker_threads 同样），
+  别拿异常当阻塞；退路是有界自旋（≤16ms）保 ~60fps。桥别建在 SAB 上。
+- **宿主文件管道上限**：走 base64→atob 的 readFileSync 单次上限 2^24 字符
+  (~12.5MB 二进制)，超限 InvalidCharacterError；大产物预切 ≤4MB 分片循环
+  读再拼接。async readFile 在这类宿主可能**静默不回调**（成功失败都不来），
+  只用 sync 读。
+- **worker 只投递入口文件**：依赖 JS 全部内联进入口；且 API 是全局 worker
+  对象（`worker.onMessage/postMessage`），DOM Worker 的 `self.postMessage`
+  不路由——stdout sink 用错会让全部程序输出**静默消失**，误诊成"卡死"。
+- **渲染入口声明即契约**：Render.zan 无条件引用 `zan_gui_draw_text_bold`
+  （图表标题默认加粗），非 Win32 的 gui_runtime_font.c 必须出这个符号
+  （回退=画常规体），否则 wasm/非 Win32 链接期 undefined symbol；同族
+  "对象 mtime 新于源码但缺符号"的坑用 nm 验对象内容，别信 mtime。
+
 ## 改仓库文件的静默陷阱
 
 - **行尾**：本仓 `core.autocrlf=true`，多数 `.zan`/`CMakeLists.txt`/`parser.c` 在工作区
