@@ -8,6 +8,10 @@ namespace System.Data.ZanDb;
 /// （键不存在时 current 为 ""）。</summary>
 delegate string StoreUpdater(string current);
 
+/// <summary>扫描回调：按 键序升序 收到每个存活键的最新值；
+/// 返回 false 早停。</summary>
+delegate bool StoreVisit(string key, string val);
+
 /// 段句柄：段文件与其全局段号的配对。
 class SegRef {
     SegmentFile seg;
@@ -447,6 +451,91 @@ class ZanStore {
         this.log.AppendFrame(b);
         b.Free();
         this.seq = this.seq + 1;
+    }
+
+    /// <summary>按键序（<see cref="String.CompareOrdinal"/> 升序）
+    /// 归并扫描 fromKey（含）起的全部存活键值：memtable 与各段
+    /// 多路归并，同键取最新版本（memtable &gt; 更大段号），墓碑
+    /// 隐藏。visit 返回 false 早停。看到的是已提交视图（不含未
+    /// 提交事务的覆盖层）；memtable 部分每次扫描现排序，段部分
+    /// 顺序流读、不占用块缓存。返回 visit 接受的键数。</summary>
+    int Scan(string fromKey, StoreVisit visit) {
+        // 各段游标，段号降序排列 = 新段在前。
+        List<SegCursor> cursors = new List<SegCursor>();
+        for (int i = this.segs.Count - 1; i >= 0; i = i - 1) {
+            cursors.Add(SegCursor.Open(this.segs[i].seg, fromKey));
+        }
+        // memtable 的键序视图（每键至多一条，即最新版本）。
+        List<string> mk = new List<string>();
+        List<string> src = this.memtable.Keys;
+        for (int i = 0; i < src.Count; i = i + 1) { mk.Add(src[i]); }
+        ZanStore.SortStrings(mk);
+        int mi = 0;
+        while (mi < mk.Count && String.CompareOrdinal(mk[mi], fromKey) < 0) {
+            mi = mi + 1;
+        }
+
+        int accepted = 0;
+        bool go = true;
+        while (go) {
+            // 1) 各来源当前位置上的最小键。
+            string minKey = "";
+            bool has = false;
+            if (mi < mk.Count) { minKey = mk[mi]; has = true; }
+            for (int i = 0; i < cursors.Count; i = i + 1) {
+                SegCursor c = cursors[i];
+                if (!c.Valid()) { continue; }
+                if (!has || String.CompareOrdinal(c.Key(), minKey) < 0) {
+                    minKey = c.Key();
+                    has = true;
+                }
+            }
+            if (!has) { break; }
+            bool atMem = mi < mk.Count && mk[mi] == minKey;
+            // 2) 最新来源定值：memtable 优先；否则段号最大的段
+            //    （cursors 已按新→旧排，取第一个停在 minKey 的）。
+            bool live = false;
+            string val = "";
+            if (atMem) {
+                string v = "";
+                this.memtable.TryGetValue(minKey, out v);
+                val = v;
+                live = true;
+            } else {
+                for (int i = 0; i < cursors.Count; i = i + 1) {
+                    SegCursor c = cursors[i];
+                    if (c.Valid() && c.Key() == minKey) {
+                        live = c.Op() == 1;
+                        val = c.Val();
+                        break;
+                    }
+                }
+            }
+            // 3) 推进所有停在 minKey 的来源（旧段同名键一并作废）。
+            if (atMem) { mi = mi + 1; }
+            for (int i = 0; i < cursors.Count; i = i + 1) {
+                SegCursor c = cursors[i];
+                if (c.Valid() && c.Key() == minKey) { c.Next(); }
+            }
+            // 尚未固化的墓碑同样压住旧段版本（点读路径由索引摘除
+            // 保证，扫描路径在这里保证）。
+            if (live && this.tombstones.ContainsKey(minKey)) { live = false; }
+            // 4) 存活键才交给 visit；false 早停。
+            if (live) {
+                if (!visit(minKey, val)) { go = false; }
+                else { accepted = accepted + 1; }
+            }
+        }
+        for (int i = 0; i < cursors.Count; i = i + 1) { cursors[i].Free(); }
+        return accepted;
+    }
+
+    /// <summary>共享锁下的 <see cref="Scan"/>；可与并发写入共存。</summary>
+    async int ScanAsync(string fromKey, StoreVisit visit) {
+        await this.rw.EnterRead();
+        int n = Scan(fromKey, visit);
+        this.rw.ExitRead();
+        return n;
     }
 
     /// <summary>将缓冲与 OS 缓存全部强制落盘。</summary>

@@ -1,0 +1,145 @@
+using System;
+using System.Data.ZanDb;
+using System.IO;
+
+/// <summary>
+/// ZanStore 有序归并扫描用例：memtable 与多段归并按键序输出、
+/// 同键最新版本胜出、墓碑隐藏（含未固化与已落段两种）、fromKey
+/// 定位、visit 早停、未提交事务不可见。输出确定性，与
+/// zandb_scan.out 比对。
+/// </summary>
+class ZanDbScanTest {
+    static int checks = 0;
+
+    static void Ok(bool cond, string what) {
+        checks = checks + 1;
+        if (cond) {
+            Console.WriteLine("ok " + Convert.ToString(checks) + " - " + what);
+        } else {
+            Console.WriteLine("FAIL " + Convert.ToString(checks) + " - " + what);
+        }
+    }
+
+    static string Key(int i) {
+        return "k" + Convert.ToString(i).PadLeft(3, "0");
+    }
+
+    static void Clean(string basePath) {
+        File.Delete(basePath);
+        File.Delete(basePath + ".m0");
+        File.Delete(basePath + ".m1");
+        for (int i = 0; i < 8; i = i + 1) {
+            File.Delete(basePath + ".s" + Convert.ToString(i));
+        }
+    }
+
+    /// 收集扫描结果为 "key=val" 行（保持访问顺序）。
+    static List<string> Collect(ZanStore db, string fromKey, int limit) {
+        List<string> rows = new List<string>();
+        if (limit < 0) {
+            db.Scan(fromKey, delegate(string k, string v) {
+                rows.Add(k + "=" + v);
+                return true;
+            });
+        } else {
+            db.Scan(fromKey, delegate(string k, string v) {
+                if (rows.Count >= limit) { return false; }
+                rows.Add(k + "=" + v);
+                return true;
+            });
+        }
+        return rows;
+    }
+
+    static bool Ascending(List<string> rows) {
+        for (int i = 1; i < rows.Count; i = i + 1) {
+            string prev = rows[i - 1].Substring(0, rows[i - 1].IndexOf("="));
+            string cur = rows[i].Substring(0, rows[i].IndexOf("="));
+            if (String.CompareOrdinal(prev, cur) >= 0) { return false; }
+        }
+        return true;
+    }
+
+    static void Main() {
+        string path = "zandb_scan_tmp.zdb";
+        Clean(path);
+
+        // 空库扫描。
+        ZanStore db = ZanStore.Open(path, ZanStore.DUR_SYNC);
+        Ok(db.IsOpen(), "open");
+        Ok(Collect(db, "", -1).Count == 0, "empty store scans nothing");
+        db.Close();
+
+        // 30 键 + 阈值 200 → 固化出多个段；随后覆盖 k010、删 k004/k017
+        // （墓碑留在 memtable 侧，专测「未固化墓碑压旧段」分支）。
+        db = ZanStore.Open(path, ZanStore.DUR_SYNC);
+        db.SetFlushThreshold(200);
+        for (int i = 0; i < 30; i = i + 1) {
+            db.Put(Key(i), "v" + Convert.ToString(i));
+        }
+        db.Put(Key(10), "W10");
+        db.Delete(Key(4));
+        db.Delete(Key(17));
+        List<string> all = Collect(db, "", -1);
+        Ok(all.Count == 28, "scan count 28, got " + Convert.ToString(all.Count));
+        Ok(Ascending(all), "keys strictly ascending");
+        Ok(db.Get(Key(4)) == "" && db.Get(Key(17)) == "", "deleted absent");
+        bool saw = false;
+        for (int i = 0; i < all.Count; i = i + 1) {
+            if (all[i] == "k010=W10") { saw = true; }
+        }
+        Ok(saw, "overwrite wins");
+        Ok(all[0] == "k000=v0" && all[all.Count - 1] == "k029=v29", "endpoints");
+
+        // fromKey 定位：k012..k029 共 18 个，k017 已删 → 17 个。
+        List<string> tail = Collect(db, "k012", -1);
+        Ok(tail.Count == 17 && tail[0] == "k012=v12", "fromKey range 17");
+        Ok(Ascending(tail), "tail ascending");
+
+        // 早停：limit 5 → 恰好前 5 个最小存活键。
+        List<string> head5 = Collect(db, "", 5);
+        Ok(head5.Count == 5 && head5[0] == "k000=v0" && head5[4] == "k005=v5",
+            "early stop at 5");
+        db.Close();
+
+        // 未提交事务对扫描不可见。
+        db = ZanStore.Open(path);
+        db.Begin();
+        db.Put("zzz", "hidden");
+        Ok(db.Get("zzz") == "hidden", "tx overlay visible to Get");
+        bool zzzSeen = false;
+        db.Scan("", delegate(string k, string v) {
+            if (k == "zzz") { zzzSeen = true; }
+            return true;
+        });
+        Ok(!zzzSeen, "uncommitted tx invisible to scan");
+        db.Commit();
+        Ok(Collect(db, "y", -1).Count == 1, "committed tx visible after commit");
+        db.Close();
+
+        // 重开：墓碑已固化进段，删除依旧不复活。
+        db = ZanStore.Open(path);
+        db.FlushToSegment();
+        db.Close();
+        db = ZanStore.Open(path);
+        List<string> again = Collect(db, "", -1);
+        Ok(again.Count == 29, "reopen scan count 29");
+        bool ghosts = false;
+        for (int i = 0; i < again.Count; i = i + 1) {
+            if (again[i].StartsWith("k004=") || again[i].StartsWith("k017=")) {
+                ghosts = true;
+            }
+        }
+        Ok(!ghosts, "deleted stay deleted across reopen");
+        bool zzzThere = false;
+        for (int i = 0; i < again.Count; i = i + 1) {
+            if (again[i] == "zzz=hidden") { zzzThere = true; }
+        }
+        Ok(zzzThere, "zzz persisted");
+        Ok(Ascending(again), "reopen scan ascending");
+        db.Close();
+
+        Console.WriteLine("done " + Convert.ToString(checks) + " checks");
+        Clean(path);
+    }
+}

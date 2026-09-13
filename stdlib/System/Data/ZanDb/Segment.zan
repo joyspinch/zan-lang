@@ -451,3 +451,101 @@ class SegmentFile {
         this.file.Close();
     }
 }
+
+/// <summary>
+/// 段内拉式游标：定位 fromKey（含）起顺序推进，块读完自动换块。
+/// 供 <see cref="ZanStore"/> 的多路归并扫描使用；扫描走顺序流读、
+/// 不经过块缓存（点读才占缓存，顺序扫不污染它）。用完必须
+/// <see cref="Free"/>。
+/// </summary>
+class SegCursor {
+    SegmentFile seg;
+    ByteBuffer buf;
+    int blockIdx;
+    bool valid;
+    string curKey;
+    string curVal;
+    int curOp;
+
+    SegCursor(SegmentFile seg) {
+        this.seg = seg;
+        this.buf = null;
+        this.blockIdx = 0;
+        this.valid = false;
+        this.curKey = "";
+        this.curVal = "";
+        this.curOp = 0;
+    }
+
+    /// 当前记录的键（Valid() 为假时无意义）。
+    string Key() { return this.curKey; }
+
+    /// 当前记录的值（墓碑时为空串）。
+    string Val() { return this.curVal; }
+
+    /// 当前记录类型：1=put、2=墓碑。
+    int Op() { return this.curOp; }
+
+    /// 是否还有未消费的记录。
+    bool Valid() { return this.valid; }
+
+    /// <summary>打开游标并定位到第一个 key ≥ fromKey 的记录；
+    /// 段为空或全部记录都小于 fromKey 时 Valid() 为假。</summary>
+    static SegCursor Open(SegmentFile seg, string fromKey) {
+        SegCursor c = new SegCursor(seg);
+        c.blockIdx = seg.BlockFor(fromKey);
+        c.LoadCur();
+        while (c.valid && String.CompareOrdinal(c.curKey, fromKey) < 0) {
+            c.Next();
+        }
+        return c;
+    }
+
+    /// 加载 blockIdx 块并读入其首条记录；越界/腐坏/空块置 invalid。
+    bool LoadCur() {
+        if (this.buf != null) { this.buf.Free(); this.buf = null; }
+        this.valid = false;
+        this.curKey = "";
+        this.curVal = "";
+        this.curOp = 0;
+        if (this.blockIdx >= this.seg.sparseOff.Count) { return false; }
+        ByteBuffer b = this.seg.LoadBlock(this.blockIdx);
+        if (b == null) { return false; }
+        string rk;
+        string rv;
+        int rop;
+        if (!SegmentFile.NextRecord(b, out rk, out rv, out rop)) {
+            // 空块（良构段不应出现）：按段耗尽处理。
+            b.Free();
+            return false;
+        }
+        this.buf = b;
+        this.curKey = rk;
+        this.curVal = rv;
+        this.curOp = rop;
+        this.valid = true;
+        return true;
+    }
+
+    /// 推进到下一条记录；段耗尽后 Valid() 变假。
+    void Next() {
+        if (!this.valid) { return; }
+        string rk;
+        string rv;
+        int rop;
+        if (SegmentFile.NextRecord(this.buf, out rk, out rv, out rop)) {
+            this.curKey = rk;
+            this.curVal = rv;
+            this.curOp = rop;
+            return;
+        }
+        this.blockIdx = this.blockIdx + 1;
+        this.LoadCur();
+    }
+
+    /// 释放当前块缓冲；之后 Valid() 恒为假。
+    void Free() {
+        if (this.buf != null) { this.buf.Free(); this.buf = null; }
+        this.valid = false;
+    }
+}
