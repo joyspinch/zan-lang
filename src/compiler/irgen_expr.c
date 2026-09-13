@@ -7077,6 +7077,18 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             for (int k = 0; k < n; k++) {
                 LLVMValueRef v = emit_arg_typed(g, expr->new_expr.args.items[k],
                                                 elem_type, locals);
+                /* ARC: the buffer owns its elements. A refcounted element
+                 * (string, nested array, object) must be retained on store —
+                 * the producing expression's owner (a local, a call temp)
+                 * still releases its own reference, so without this the
+                 * literal holds dangling pointers as soon as that owner
+                 * exits (each loop iteration reuses the freed bytes).
+                 * Mirrors the element-assignment path's store protocol. */
+                if (elem_type && is_rc_managed_type(elem_type) &&
+                    !expr_yields_owned_rc_value(g, expr->new_expr.args.items[k],
+                                                locals)) {
+                    emit_rc_retain_for_type(g, elem_type, v);
+                }
                 LLVMValueRef idx = LLVMConstInt(i64t, (unsigned long long)k, 0);
                 LLVMValueRef slot = LLVMBuildGEP2(g->builder, elem_llvm, arr,
                                                   &idx, 1, "aep");
@@ -7145,6 +7157,13 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 for (int k = 0; k < ninit; k++) {
                     LLVMValueRef v = emit_arg_typed(g,
                         expr->new_expr.args.items[ndims + k], elem_type, locals);
+                    /* same ARC protocol as the unsized literal above: the
+                     * buffer owns refcounted elements, so retain on store */
+                    if (elem_type && is_rc_managed_type(elem_type) &&
+                        !expr_yields_owned_rc_value(g,
+                            expr->new_expr.args.items[ndims + k], locals)) {
+                        emit_rc_retain_for_type(g, elem_type, v);
+                    }
                     LLVMValueRef idx = LLVMConstInt(i64t, (unsigned long long)k, 0);
                     LLVMValueRef slot = LLVMBuildGEP2(g->builder, elem_llvm,
                         typed, &idx, 1, "aep");
