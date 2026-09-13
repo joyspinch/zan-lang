@@ -4792,6 +4792,34 @@ class Chart {
     /// 从数据 + 固定覆盖解析数值轴的 [lo, hi] 范围（fixedLo/fixedHi
     /// 取 ChartOption.Auto() 时从数据推导）。有负值时下界自动扩展
     /// 到 0 以下。
+    /// 横条值轴 'dataMin'/'dataMax' 的原始极值（不零锚、不 nice）：
+    /// 可见系列的最小/最大值，官方 dataMM = 系列数据并集。
+    static int BarDataMinRaw(List<ChartSeries> series) {
+        int mn = 0;
+        bool any = false;
+        for (int i = 0; i < series.Count; i = i + 1) {
+            if (series[i].hidden) { continue; }
+            for (int j = 0; j < series[i].Count(); j = j + 1) {
+                int v = series[i].Value(j);
+                if (!any || v < mn) { mn = v; any = true; }
+            }
+        }
+        return mn;
+    }
+
+    static int BarDataMaxRaw(List<ChartSeries> series) {
+        int mx = 0;
+        bool any = false;
+        for (int i = 0; i < series.Count; i = i + 1) {
+            if (series[i].hidden) { continue; }
+            for (int j = 0; j < series[i].Count(); j = j + 1) {
+                int v = series[i].Value(j);
+                if (!any || v > mx) { mx = v; any = true; }
+            }
+        }
+        return mx;
+    }
+
     static int AxisLo(int fixedLo, int dataMin) {
         return Chart.AxisLo(fixedLo, dataMin, false);
     }
@@ -4962,8 +4990,15 @@ class Chart {
         int lData = leftDataMax;
         if (lData < 0) { lData = Chart.AxisMaxFor(series, 0, zI0, zI1, y0.scale); }
         bool leftFrac = Chart.SeriesFracAny(series, 0);
-        int leftLo = Chart.AxisLo(y0.min, Chart.AxisMinFor(series, 0, zI0, zI1, y0.scale), y0.scale);
-        int leftHi = Chart.AxisHi(y0.max, lData, leftLo);
+        // min:'dataMin'（fixMM 语义，scaleRawExtentInfo.ts:241-244）：该端
+        // 钉在原始数据极值上——不 nice、不并入 0（固定端 respect fixMM，
+        // 单侧并入 0 不生效）。取极值用 scale=true 的原始口径。
+        int declLo = y0.min;
+        if (y0.minDataB) { declLo = Chart.AxisMinFor(series, 0, zI0, zI1, true); }
+        int declHi = y0.max;
+        if (y0.maxDataB) { declHi = Chart.AxisMaxFor(series, 0, zI0, zI1, true); }
+        int leftLo = Chart.AxisLo(declLo, Chart.AxisMinFor(series, 0, zI0, zI1, y0.scale), y0.scale);
+        int leftHi = Chart.AxisHi(declHi, lData, leftLo);
         // alignTicks 需要的是 **nice 之前**的原始 extent
         // （axisAlignTicks.ts:176 的 targetExtent = 原始域，不是 niceExtent）。
         // 本引擎两条路径的原始域都要留下副本。
@@ -4981,12 +5016,16 @@ class Chart {
             if (!ChartOption.IsAutoD(y0.minD)) {
                 leftLoF = (int)(y0.minD >= 0.0 ? y0.minD * 1000.0 + 0.5
                     : y0.minD * 1000.0 - 0.5);
+            } else if (y0.minDataB) {
+                leftLoF = Chart.AxisMinForF(series, 0, zI0, zI1, true);
             } else {
                 leftLoF = Chart.FracAxisLoF(y0.min, series, 0, zI0, zI1, y0.scale);
             }
             if (!ChartOption.IsAutoD(y0.maxD)) {
                 leftHiF = (int)(y0.maxD >= 0.0 ? y0.maxD * 1000.0 + 0.5
                     : y0.maxD * 1000.0 - 0.5);
+            } else if (y0.maxDataB) {
+                leftHiF = Chart.AxisMaxForF(series, 0, zI0, zI1, true);
             } else {
                 leftHiF = Chart.FracAxisHiF(y0.max, series, 0, zI0, zI1, y0.scale);
             }
@@ -5023,8 +5062,12 @@ class Chart {
         if (hasRight) {
             int rData = rightDataMax;
             if (rData < 0) { rData = Chart.AxisMaxFor(series, 1, zI0, zI1, y1.scale); }
-            rightLo = Chart.AxisLo(y1.min, Chart.AxisMinFor(series, 1, zI0, zI1, y1.scale), y1.scale);
-            rightHi = Chart.AxisHi(y1.max, rData, rightLo);
+            int rDeclLo = y1.min;
+            if (y1.minDataB) { rDeclLo = Chart.AxisMinFor(series, 1, zI0, zI1, true); }
+            int rDeclHi = y1.max;
+            if (y1.maxDataB) { rDeclHi = Chart.AxisMaxFor(series, 1, zI0, zI1, true); }
+            rightLo = Chart.AxisLo(rDeclLo, Chart.AxisMinFor(series, 1, zI0, zI1, y1.scale), y1.scale);
+            rightHi = Chart.AxisHi(rDeclHi, rData, rightLo);
             rightFrac = Chart.SeriesFracAny(series, 1);
             if (rightFrac) {
                 // 右小数轴（line6 降雨量 -0.955..-0.005 → 定点域
@@ -5067,6 +5110,7 @@ class Chart {
         // 0..1320 → 0..1400），刻度数随步长；固定 min/max 尊重不取整。
         if (!leftLog && !leftFrac && y0.type == ChartAxisType.Value
             && y0.min == ChartOption.Auto() && y0.max == ChartOption.Auto()
+            && !y0.minDataB && !y0.maxDataB
             && (leftDataMax < 0 || y0.scale)) {
             lRawLo = (double)Chart.AxisMinFor(series, 0, zI0, zI1, y0.scale);
             lRawHi = (double)lData;
@@ -5089,9 +5133,11 @@ class Chart {
         if (!leftLog && !leftFrac && y0.type == ChartAxisType.Value
             && y0.breaks != null && y0.breaks.Count > 0) {
             double rlo = (double)Chart.AxisMinFor(series, 0, zI0, zI1, y0.scale);
-            if (y0.min != ChartOption.Auto()) { rlo = (double)y0.min; }
+            if (y0.minDataB) { rlo = (double)Chart.AxisMinFor(series, 0, zI0, zI1, true); }
+            else if (y0.min != ChartOption.Auto()) { rlo = (double)y0.min; }
             double rhi = (double)lData;
-            if (y0.max != ChartOption.Auto()) { rhi = (double)y0.max; }
+            if (y0.maxDataB) { rhi = (double)Chart.AxisMaxFor(series, 0, zI0, zI1, true); }
+            else if (y0.max != ChartOption.Auto()) { rhi = (double)y0.max; }
             List<double> nb = Chart.BrkNiceExtent(y0.breaks, rlo, rhi, y0.ticks);
             leftLo = (int)nb[0];
             leftHi = (int)nb[1];
@@ -5102,6 +5148,7 @@ class Chart {
             if (rightHi < rightLo + 1) { rightHi = rightLo + 1; }
         } else if (hasRight && !rightFrac && y1.type == ChartAxisType.Value
             && y1.min == ChartOption.Auto() && y1.max == ChartOption.Auto()
+            && !y1.minDataB && !y1.maxDataB
             && (rightDataMax < 0 || y1.scale)) {
             rRawLo = (double)Chart.AxisMinFor(series, 1, zI0, zI1, y1.scale);
             rRawHi = (double)Chart.AxisMaxFor(series, 1, zI0, zI1, y1.scale);
@@ -5461,7 +5508,8 @@ class Chart {
         int leftTickLo = leftLo;
         int leftTickHi = leftHi;
         if (anyYMark0 && !leftLog && y0.min == ChartOption.Auto()
-            && y0.max == ChartOption.Auto()) {
+            && y0.max == ChartOption.Auto()
+            && !y0.minDataB && !y0.maxDataB) {
             int lpad = ((leftHi - leftLo) * pxPad + plotH - 1) / plotH;
             int lDataMin = Chart.AxisMinFor(series, 0, zI0, zI1, y0.scale);
             if (lpad > 0) {
