@@ -1,0 +1,250 @@
+using System;
+using System.Data;
+using System.Data.Sqlite;
+using System.Data.ZanDb;
+using System.Json;
+using System.IO;
+
+/// ZanDb vs SQLite 同负载对拍：20000 文档（name/age/cat/bio，bio 为 80 字符
+/// 文本），相同批量节奏（500/提交）、相同索引（cat）。数字依赖机器，
+/// Release 构建参考值见 stdlib/System/Data/ZanDb/README.md；运行结束自动清理。
+class ZanDbVsSqlite {
+    static int N = 20000;
+    static int BATCH = 500;
+
+    static JsonValue MkDoc(int i) {
+        JsonValue d = JsonValue.NewObject();
+        d.Set("name", JsonValue.NewStr("user-" + Convert.ToString(i)));
+        d.Set("age", JsonValue.NewNum(Convert.ToString(i % 80)));
+        d.Set("cat", JsonValue.NewStr("c" + Convert.ToString(i % 16)));
+        d.Set("bio", JsonValue.NewStr("0123456789012345678901234567890123456789"
+            + "0123456789012345678901234567890123456789"));
+        return d;
+    }
+
+    static string Ms(double ms) {
+        return Convert.ToString(Math.Round(ms, 1));
+    }
+
+    static string Ops(int ops, double ms) {
+        if (ms <= 0) { ms = 0.01; }
+        return Convert.ToString((long)(ops * 1000.0 / ms)) + " ops/s";
+    }
+
+    static void CleanZan(string basePath) {
+        File.Delete(basePath);
+        File.Delete(basePath + ".m0");
+        File.Delete(basePath + ".m1");
+        for (int i = 0; i < 64; i = i + 1) {
+            File.Delete(basePath + ".s" + Convert.ToString(i));
+        }
+    }
+
+    static void Main() {
+        // ================= SQLite =================
+        string spath = "vs_sqlite.tmp.db";
+        File.Delete(spath);
+        SqliteConnection sdb = SqliteConnection.Open(spath);
+        if (!sdb.IsConnected()) {
+            Console.WriteLine("sqlite open failed: " + sdb.GetError());
+            return;
+        }
+        sdb.Execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, "
+            + "name TEXT, age INTEGER, cat TEXT, bio TEXT)");
+
+        Stopwatch sw = Stopwatch.StartNew();
+        int firstRow = 0;
+        for (int b = 0; b < N / BATCH; b = b + 1) {
+            sdb.BeginTransaction();
+            for (int i = 0; i < BATCH; i = i + 1) {
+                int k = b * BATCH + i;
+                sdb.Execute("INSERT INTO docs (id, name, age, cat, bio) VALUES (?, ?, ?, ?, ?)",
+                    new DbParams().AddInt(k).Add("user-" + Convert.ToString(k))
+                        .AddInt(k % 80).Add("c" + Convert.ToString(k % 16))
+                        .Add("0123456789012345678901234567890123456789"
+                            + "0123456789012345678901234567890123456789"));
+                if (k == 0) { firstRow = sdb.LastInsertId(); }
+            }
+            sdb.Commit();
+        }
+        double insMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("[sqlite] insert batched   " + Ms(insMs) + " ms = " + Ops(N, insMs));
+
+        long sink = 0;
+        sw = Stopwatch.StartNew();
+        for (int r = 0; r < 3; r = r + 1) {
+            for (int i = 0; i < N; i = i + 1) {
+                DbResult row = sdb.Query("SELECT name, age, cat, bio FROM docs WHERE id = ?",
+                    new DbParams().AddInt(firstRow + i));
+                if (row.RowCount() > 0) {
+                    sink = sink + row.GetByName(0, "name").Length
+                        + row.GetByName(0, "age").Length;
+                }
+            }
+        }
+        double getMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("[sqlite] point read       " + Ms(getMs) + " ms = "
+            + Ops(3 * N, getMs) + " (sink=" + Convert.ToString(sink) + ")");
+
+        sw = Stopwatch.StartNew();
+        long scanned = 0;
+        for (int r = 0; r < 3; r = r + 1) {
+            DbResult all = sdb.Query("SELECT id, name, age, cat, bio FROM docs");
+            scanned = scanned + all.RowCount();
+        }
+        double scanMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("[sqlite] full scan        " + Ms(scanMs) + " ms = "
+            + Ops(scanned, scanMs) + " rows");
+
+        sw = Stopwatch.StartNew();
+        sdb.Execute("CREATE INDEX idx_cat ON docs(cat)");
+        double idxMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("[sqlite] index build      " + Ms(idxMs) + " ms");
+
+        long hits = 0;
+        sw = Stopwatch.StartNew();
+        for (int r = 0; r < 20; r = r + 1) {
+            DbResult got = sdb.Query(
+                "SELECT id, name, age, cat, bio FROM docs WHERE cat = ?",
+                new DbParams().Add("c3"));
+            hits = hits + got.RowCount();
+        }
+        double idxqMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("[sqlite] index lookup     " + Ms(idxqMs) + " ms = "
+            + Ops(hits, idxqMs) + " (rows=" + Convert.ToString(hits) + ")");
+
+        int M = 2000;
+        sw = Stopwatch.StartNew();
+        for (int i = 0; i < M; i = i + 1) {
+            int k = 1000000 + i;
+            sdb.Execute("INSERT INTO docs (id, name, age, cat, bio) VALUES (?, ?, ?, ?, ?)",
+                new DbParams().AddInt(k).Add("user-" + Convert.ToString(k))
+                    .AddInt(k % 80).Add("c" + Convert.ToString(k % 80))
+                    .Add("0123456789012345678901234567890123456789"
+                        + "0123456789012345678901234567890123456789"));
+        }
+        double autoMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("[sqlite] insert autocommit " + Ms(autoMs) + " ms = "
+            + Ops(M, autoMs) + " (synchronous=FULL 每次提交 fsync)");
+
+        sdb.Close();
+        Console.WriteLine("[sqlite] disk             "
+            + Convert.ToString(File.GetSize(spath)) + " B");
+
+        // ================= ZanDb（默认 DUR_GROUP） =================
+        string zpath = "vs_zandb.tmp.zdb";
+        CleanZan(zpath);
+        ZanDatabase zdb = ZanDatabase.Open(zpath, ZanStore.DUR_GROUP);
+        if (!zdb.IsOpen()) {
+            Console.WriteLine("zandb open failed: " + zdb.GetError());
+            return;
+        }
+        zdb.Kv().SetFlushThreshold(262144);  // 稳态：边写边固化，而非全量堆在日志里
+        Collection docs = zdb.GetCollection("docs");
+
+        sw = Stopwatch.StartNew();
+        int firstId = 0;
+        for (int b = 0; b < N / BATCH; b = b + 1) {
+            zdb.Begin();
+            for (int i = 0; i < BATCH; i = i + 1) {
+                int id = docs.Insert(MkDoc(b * BATCH + i));
+                if (b == 0 && i == 0) { firstId = id; }
+            }
+            zdb.Commit();
+        }
+        insMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("[zandb ] insert batched   " + Ms(insMs) + " ms = " + Ops(N, insMs));
+
+        sink = 0;
+        sw = Stopwatch.StartNew();
+        for (int r = 0; r < 3; r = r + 1) {
+            for (int i = 0; i < N; i = i + 1) {
+                JsonValue d = docs.FindById(firstId + i);
+                if (d != null) {
+                    JsonValue nm = d.Get("name");
+                    JsonValue ag = d.Get("age");
+                    if (nm != null) { sink = sink + nm.AsString("").Length; }
+                    if (ag != null) { sink = sink + ag.AsString("").Length; }
+                }
+            }
+        }
+        getMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("[zandb ] point read       " + Ms(getMs) + " ms = "
+            + Ops(3 * N, getMs) + " (sink=" + Convert.ToString(sink) + ")");
+
+        sw = Stopwatch.StartNew();
+        scanned = 0;
+        for (int r = 0; r < 3; r = r + 1) {
+            List<JsonValue> all = docs.FindAll();
+            scanned = scanned + all.Count;
+        }
+        scanMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("[zandb ] full scan        " + Ms(scanMs) + " ms = "
+            + Ops(scanned, scanMs) + " docs");
+
+        sw = Stopwatch.StartNew();
+        docs.EnsureIndex("cat");
+        idxMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("[zandb ] index build      " + Ms(idxMs) + " ms");
+
+        hits = 0;
+        sw = Stopwatch.StartNew();
+        for (int r = 0; r < 20; r = r + 1) {
+            List<JsonValue> got = docs.FindByIndex("cat", "c3");
+            hits = hits + got.Count;
+        }
+        idxqMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("[zandb ] index lookup     " + Ms(idxqMs) + " ms = "
+            + Ops(hits, idxqMs) + " (rows=" + Convert.ToString(hits) + ")");
+
+        zdb.MergeSegments();
+        long zbytes = 0;
+        string[] parts = new string[67];
+        parts[0] = zpath;                // 日志就是基名文件本身
+        parts[1] = zpath + ".m0";
+        parts[2] = zpath + ".m1";
+        for (int i = 0; i < 64; i = i + 1) {
+            parts[3 + i] = zpath + ".s" + Convert.ToString(i);
+        }
+        for (int i = 0; i < parts.Length; i = i + 1) {
+            if (File.Exists(parts[i])) { zbytes = zbytes + File.GetSize(parts[i]); }
+        }
+        zdb.Close();
+        Console.WriteLine("[zandb ] disk (flushed+merged) "
+            + Convert.ToString(zbytes) + " B (含二级索引)");
+
+        // ============ 自动提交对比（独立空库 + 相同 cat 索引，档位互比） ============
+        string zgrp = "vs_zandb_group.tmp.zdb";
+        CleanZan(zgrp);
+        ZanDatabase zgdb = ZanDatabase.Open(zgrp, ZanStore.DUR_GROUP);
+        Collection gdocs = zgdb.GetCollection("docs");
+        gdocs.EnsureIndex("cat");
+        sw = Stopwatch.StartNew();
+        for (int i = 0; i < M; i = i + 1) {
+            gdocs.Insert(MkDoc(1000000 + i));
+        }
+        autoMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("[zandb ] autocommit DUR_GROUP " + Ms(autoMs) + " ms = "
+            + Ops(M, autoMs) + " (默认档，分组 fsync)");
+        zgdb.Close();
+
+        string zsync = "vs_zandb_sync.tmp.zdb";
+        CleanZan(zsync);
+        ZanDatabase zsdb = ZanDatabase.Open(zsync, ZanStore.DUR_SYNC);
+        Collection sdocs = zsdb.GetCollection("docs");
+        sdocs.EnsureIndex("cat");        // 与 GROUP 侧同负载（每插入含索引维护）
+        sw = Stopwatch.StartNew();
+        for (int i = 0; i < M; i = i + 1) {
+            sdocs.Insert(MkDoc(1000000 + i));
+        }
+        autoMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("[zandb ] autocommit DUR_SYNC  " + Ms(autoMs) + " ms = "
+            + Ops(M, autoMs) + " (与 SQLite 默认档同语义)");
+        zsdb.Close();
+
+        CleanZan(zpath);
+        CleanZan(zgrp);
+        CleanZan(zsync);
+        File.Delete(spath);
+    }
+}

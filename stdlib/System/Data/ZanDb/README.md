@@ -98,28 +98,39 @@ ZanStore 是**单进程单写者**：`Open` 对日志文件加非阻塞独占锁
 
 ## 基准
 
-Release 构建实测（Windows 10，NVMe SSD，2026-09；20000 文档，
-每文档约 130B JSON，含 name/age/cat/bio 四字段 + cat 索引）：
+**与内嵌 SQLite 同负载对拍**（Release 构建，Windows 10，NVMe SSD，
+2026-09；22000 文档：name/age/cat/bio 四字段、bio 为 80 字符文本，
+两侧均建 cat 二级索引，相同批量节奏 500 条/提交）：
 
-| 操作                                | 吞吐              |
-|-------------------------------------|-------------------|
-| 文档插入（批量提交）                | ~35000 文档/s     |
-| 文档插入（每条一个提交，DUR_GROUP） | ~8000 提交/s      |
-| 主键点读 `FindById`                 | ~110000 次/s      |
-| 全表扫描 `FindAll`                  | ~170000 文档/s    |
-| 索引构建（20000 文档）              | ~240 ms           |
-| 索引点查 `FindByIndex`              | ~100000 行/s      |
-| 重开恢复（22000 文档）              | ~85 ms            |
-| 原始 KV 批量 Put                    | ~260000 键/s      |
-| 原始 KV 点读 Get                    | ~230000 次/s      |
+| 操作 | SQLite | ZanDb | 说明 |
+|------|--------|-------|------|
+| 批量插入 | ~65000 行/s | ~31000 文档/s | SQLite 纯 C 引擎占优 |
+| 主键点读 | ~14000 次/s | **~128000 次/s** | ZanDb 进程内块缓存，约 9 倍 |
+| 全表扫描 | ~850000 行/s | ~165000 文档/s | ZanDb 每行解码 JsonValue 树 |
+| 索引点查 | ~370000 行/s | ~100000 行/s | 同上 |
+| 自动提交（同语义：每提交 fsync） | ~150 提交/s | ~600 提交/s | ZanDb DUR_SYNC；日志追加 vs journal 双写 |
+| 自动提交（分组提交） | —（无此档） | **~8300 提交/s** | ZanDb DUR_GROUP（默认档） |
+| 磁盘占用（含二级索引） | 2.67 MB（121 B/行） | 3.05 MB（139 B/文档） | **新引擎 ≈ SQLite 的 1.14 倍** |
 
-存储占用：原始 KV 层合并后约 **41 B/键**（~50B 值）；文档层合并后
-约 **147 B/文档**（含二级索引与 JSON 编码）。作为对照，旧引擎
-CoW B+Tree + WAL 对同等负载体积大数倍（页开销 + 写放大碎片 +
-WAL 未回收）。
+诚实口径：
 
-复现：`build/zanc examples/db/zandb_bench.zan --auto-stdlib -o bench.exe && ./bench.exe`
-（基准源码见 `examples/db/zandb_bench.zan`，数字依赖机器）。
+* SQLite 数字经 stdlib `SqliteConnection`/`DbResult` 通道（每次查询
+  prepare/bind + 行物化，单次点查固定开销 ~65µs），不代表 SQLite C API
+  的裸上限；ZanDb 侧走进程内块缓存。两个通道都是 Zan 程序实际可用的形态。
+* 扫描/批量写入慢于 SQLite 是**文档模型的代价**：每条记录要 JSON
+  编解码成 `JsonValue` 树；换来的是 schema-free、原生 Zan 值、免 ORM。
+* 自动提交吞吐对 fsync 延迟与机器负载敏感（±20%）；高吞吐写入请走
+  `Begin`/`Commit` 批量（设计主路径，每批一次落盘）。
+
+单引擎（不含 SQLite 对照）补充：重开恢复 22000 文档 ~85ms；原始 KV 层
+批量 Put ~260000 键/s、点读 ~230000 次/s、合并后 **41 B/键**（~50B 值）；
+文档层合并后 **157 B/文档**（含二级索引与 JSON 编码）。作为对照，旧引擎
+CoW B+Tree + WAL 对同等负载体积大数倍（页开销 + 写放大碎片 + WAL 未回收）。
+
+复现：`examples/db/zandb_vs_sqlite.zan`（对拍）与
+`examples/db/zandb_bench.zan`（单引擎），
+`build/zanc <文件> --auto-stdlib -o bench.exe && ./bench.exe`
+（数字依赖机器）。
 
 ## 测试
 
