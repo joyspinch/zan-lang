@@ -1935,7 +1935,7 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
 | # | 内容 | 验收 |
 |---|---|---|
 | 4.1 | **A57 遗留** ARC 引用环：`Control.OnChildChanged` 虚钩子取代"子控件事件上挂捕获 this 的闭包"，并全库扫同模式 | `leakcheck_checkbox_group` 转绿；扫描结果登记 |
-| 4.2 | 闭包瘦身第二批：`Automation`(61) / `Management`(68) / `Windows`(71) 去 Threading+Diagnostics 税 | 三者文件数各降一档；standard 全绿 |
+| 4.2 | 闭包瘦身第二批：`Automation`(61) / `Management`(68) / `Windows`(71) 去 Threading+Diagnostics 税 | ✅ **2026-09-14 完成**：实测 10 / 10 / 4（验收=各降一档，达成）。Window.zan 5 处 + Cpu.zan 2 处（Win/Linux 双支）Thread.Sleep 换 kernel32 `Sleep`/crt `usleep` 文件内 extern，去掉 `using System.Threading`——Threading.zan 一进闭包其 zan_thread_* extern 声明即钉死 rt_sync（ZAN_TRACE_SYNC 实证 Automation 2 旗标→0）。Windows 留 TrayIcon 的 Thread.Start（消息泵真线程，税正当）；Diagnostics 半边只余 Stopwatch ~2 文件且零对象拖带，保留。受影响 6 conformance ×4 孪生 24/24 绿 + standard |
 
 ---
 
@@ -1957,7 +1957,7 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
 * **A76 crasher（应用层/悬垂）**：① 已修（2026-09-14）：`TlsStream.Close` 先翻 open 再做 shutdown/free，`SSL_free` 后 rbio/wbio 置空绝悬垂（SSL_set_bio 已把 BIO 所有权移给 SSL，Zan 侧字段是借用指针）；真正危机是并发——Close 全同步无 await，唯一竞争窗是别的协程驻车在 FlushOutAsync/PumpInAsync 的套接字 await 上，恢复后继续碰已随 SSL_free 释放的 BIO。两泵在每个 await 恢复点后重查 open，失败返回让各调用方自然收尾；TLS 切片 12/12 绿。② sqlserver_tds `Program_Live$resume`（pool.Close 场景）协程 resume 路径 null 实例字段，非确定性复现，仍挂。
 * **Windows IOCP blocking-worker 唤醒包偶发丢失（09-09 全链路稳定性测试定位，先于本次会话，待根因）**：`conformance_http_forwarder_keepalive` / `http_forwarder_stream` 在 Windows 上概率性（约 1/6~1/2 次）中途静默截断（exit=0、金样 18 行只出 8/11/14 行不等），或转发器 `ConnectAsync` 的 blocking-worker 结果永不送达（实测 1/6：`NativeConnectSockAddr` 经 `zan_rt_blocking_co` 提交后协程永不恢复，`DBG connected-up` 永不打印，整程序 10s 后靠上游 idle 超时才走完）；带 ZAN_IO_TRACE 的坏例 trace 都停在 `poll removed=1` 后不再有任何 reactor 活动——怀疑 DNS/完成唤醒包（`PostQueuedCompletionStatus(key=-2, lpOverlapped=NULL)` → `zan_io_poll` 的 `dns_drain` 路径）与 GQCS 超时路径竞态丢包。对照实验：纯串行 connect 150/150、单 RecvOv 挂起 + connect 150/150、双 AcceptEx + RecvOv + connect 200/200 都不复现，坏例只在 HttpForwarder 完整形状（2 监听 AcceptEx + 下游 RecvOv + 上游 blocking connect + 定时器轮询混跑）出现。归因证据：rt_io.c 最后一次改动是 09-05 的 0e55108a（本会话两提交 454c72f0/fc97defd 未触碰 rt_io/rt_co/DNS 唤醒），复现所用 build/zanc.exe 是 09:35 编译——早于本会话首个提交 12:54，故非本次改动引入。修复方向：给 `dns_wake_notify` 的包加序号/与 `g_blocking_done` 快照配对，或 blocking-worker 完成路径改走与 IO op 同形的 real-overlapped 包，消除 NULL-overlapped 特判路径。受影响测试需先容忍重跑（ctest RESOURCE_LOCK 已防同源并发，但单例本身翻车）。
 * **A67 字节×码点语义冲突（语言级，待定夺）**：string 按字节（索引/NUL 守卫/Length；FbReader/TDS codec 按字节索引），char 按码点（拼接/打印 UTF-8 编码），`s + s[i]` 对非 ASCII 必然膨胀；两侧皆有意设计，修复任何一侧破坏面都大。语言级出路（Rune/ByteAt API、解码式索引等）留待专项。
-* **A56 未做（下一批）**：`System.Automation`(61) / `System.Management`(68) / `System.Windows`(71) 仍各带 Threading + Diagnostics 税（= A58 4.2）；`Automation/Window.zan` 与 `Management/Cpu.zan` 疑似只为 Thread.Sleep 付全价，待核。
+* **A56 未做（下一批）** ✅ **2026-09-14 完成（见 A58 4.2）**：疑点核实成立——Automation/Management 两名空间确实只为 Thread.Sleep 付全价，去税后 Automation 闭包 11→10 文件且 rt_sync 旗标归零、Management 10、Windows 4（TrayIcon 真线程保留）。"待核"结论：税源是 extern 声明发射即触发 uses_sync_runtime 旗标，与是否实际调用无关。
 * **A71 后续路线（按需加载未完部分）**：① globaldce 钉死源逐个核（A75 已退役三表，重钉面需复量）；② auto-embed 泛化——`stdlib/<Ns>/data/` 自动烤进镜像的通用机制（skins 手工、icons 已接）。
 * **体积优化线剩余候选（边际收益小）**：desc 记录瘦身、tynames 列表共享；PIC 与 ARC 冗余对两条杠杆已实测证伪。A74 归因的「空窗 ~72% .text 可去死」随 A75 去钉后需复量。
 * **A44(genmeta) 备注（已部分过时）**：`build\ZanIDE.exe` 12.23MB vs dist 快照 8.2MB 的增长未追查（2026-08-24 记录；其后 A71-A75 已大幅优化发布体积，数字需重测）。
