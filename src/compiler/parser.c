@@ -115,6 +115,46 @@ static void parse_attr_usages(zan_parser_t *p, zan_ast_list_t *out,
                               zan_istr_t *out_lib, zan_istr_t *out_entry);
 static bool parse_top_level_decl(zan_parser_t *p, zan_ast_node_t *unit);
 
+/* Parses `delegate ReturnType Name<TParams>(params);` with the cursor on the
+ * `delegate` keyword. Shared by unit-level declarations and nested ones
+ * inside a type body: a nested AST_DELEGATE_DECL member is hoisted to unit
+ * level by zan_parser_flatten_nested_types and then binds exactly like a
+ * unit-level delegate. */
+static zan_ast_node_t *parse_delegate_decl(zan_parser_t *p, uint32_t mods) {
+    parser_advance(p); /* consume 'delegate' */
+    zan_loc_t dloc = p->current.loc;
+    zan_ast_node_t *ret_type = parse_type_ref(p);
+    parser_expect(p, TK_IDENT);
+    zan_istr_t dname = p->previous.str_val;
+    /* optional generic type params: delegate R Name<T, R>(params); */
+    zan_ast_list_t dtype_params;
+    zan_ast_list_init(&dtype_params);
+    if (parser_match(p, TK_LESS)) {
+        while (!parser_check(p, TK_GREATER) && !parser_check(p, TK_EOF)) {
+            if (parser_check(p, TK_IDENT)) {
+                parser_advance(p);
+                zan_ast_node_t *tp = zan_ast_new(p->arena, AST_IDENTIFIER, p->previous.loc);
+                tp->ident.name = p->previous.str_val;
+                zan_ast_list_push(&dtype_params, tp, p->arena);
+            }
+            if (!parser_match(p, TK_COMMA)) break;
+        }
+        parser_expect(p, TK_GREATER);
+    }
+    zan_ast_list_t dparams = parse_param_list(p);
+    parser_expect(p, TK_SEMICOLON);
+    zan_ast_node_t *ddecl = zan_ast_new(p->arena, AST_DELEGATE_DECL, dloc);
+    ddecl->method_decl.name = dname;
+    ddecl->method_decl.return_type = ret_type;
+    ddecl->method_decl.params = dparams;
+    ddecl->method_decl.type_params = dtype_params;
+    ddecl->method_decl.body = NULL;
+    ddecl->method_decl.modifiers = mods;
+    ddecl->method_decl.extern_lib = (zan_istr_t){NULL, 0};
+    ddecl->method_decl.entry_point = (zan_istr_t){NULL, 0};
+    return ddecl;
+}
+
 /* Parses one full top-level declaration -- attributes, modifiers, class/
  * struct/interface/enum/delegate, or a `record` lowering -- into
  * unit->comp_unit.decls. Shared verbatim by the compilation-unit decls loop
@@ -183,37 +223,7 @@ static bool parse_top_level_decl(zan_parser_t *p, zan_ast_node_t *unit) {
     }
     if (parser_check(p, TK_DELEGATE)) {
         /* delegate ReturnType Name(params); */
-        parser_advance(p); /* consume 'delegate' */
-        zan_loc_t dloc = p->current.loc;
-        zan_ast_node_t *ret_type = parse_type_ref(p);
-        parser_expect(p, TK_IDENT);
-        zan_istr_t dname = p->previous.str_val;
-        /* optional generic type params: delegate R Name<T, R>(params); */
-        zan_ast_list_t dtype_params;
-        zan_ast_list_init(&dtype_params);
-        if (parser_match(p, TK_LESS)) {
-            while (!parser_check(p, TK_GREATER) && !parser_check(p, TK_EOF)) {
-                if (parser_check(p, TK_IDENT)) {
-                    parser_advance(p);
-                    zan_ast_node_t *tp = zan_ast_new(p->arena, AST_IDENTIFIER, p->previous.loc);
-                    tp->ident.name = p->previous.str_val;
-                    zan_ast_list_push(&dtype_params, tp, p->arena);
-                }
-                if (!parser_match(p, TK_COMMA)) break;
-            }
-            parser_expect(p, TK_GREATER);
-        }
-        zan_ast_list_t dparams = parse_param_list(p);
-        parser_expect(p, TK_SEMICOLON);
-        zan_ast_node_t *ddecl = zan_ast_new(p->arena, AST_DELEGATE_DECL, dloc);
-        ddecl->method_decl.name = dname;
-        ddecl->method_decl.return_type = ret_type;
-        ddecl->method_decl.params = dparams;
-        ddecl->method_decl.type_params = dtype_params;
-        ddecl->method_decl.body = NULL;
-        ddecl->method_decl.modifiers = mods;
-        ddecl->method_decl.extern_lib = (zan_istr_t){NULL, 0};
-        ddecl->method_decl.entry_point = (zan_istr_t){NULL, 0};
+        zan_ast_node_t *ddecl = parse_delegate_decl(p, mods);
         zan_ast_list_push(&unit->comp_unit.decls, ddecl, p->arena);
         return true;
     }
@@ -3866,6 +3876,13 @@ static zan_ast_node_t *parse_member_decl_inner(zan_parser_t *p,
         return parse_type_decl(p, mods);
     }
 
+    /* nested delegate declaration: `[mods] delegate R Name(params);` -- the
+     * same AST as a unit-level delegate; zan_parser_flatten_nested_types
+     * hoists it out of the type body so it binds identically. */
+    if (parser_check(p, TK_DELEGATE)) {
+        return parse_delegate_decl(p, mods);
+    }
+
     zan_loc_t loc = p->current.loc;
 
     /* destructor: ~ClassName() { } */
@@ -4949,8 +4966,16 @@ static int hoist_nested_types(zan_ast_node_t *unit, zan_ast_node_t *type_node,
     int mi = 0;
     while (mi < m) {
         zan_ast_node_t *mem = members->items[mi];
-        if (mem->kind == AST_CLASS_DECL || mem->kind == AST_STRUCT_DECL ||
-            mem->kind == AST_INTERFACE_DECL || mem->kind == AST_ENUM_DECL) {
+        if (mem->kind == AST_DELEGATE_DECL) {
+            /* delegates have no members to recurse into: just lift */
+            zan_ast_list_push(decls, mem, arena);
+            hoisted++;
+            /* remove from the member list (order-preserving) */
+            for (int k = mi; k < m - 1; k++) members->items[k] = members->items[k + 1];
+            members->count--;
+            m--;
+        } else if (mem->kind == AST_CLASS_DECL || mem->kind == AST_STRUCT_DECL ||
+                   mem->kind == AST_INTERFACE_DECL || mem->kind == AST_ENUM_DECL) {
             hoisted += hoist_nested_types(unit, mem, decls, arena);
             zan_ast_list_push(decls, mem, arena);
             hoisted++;
