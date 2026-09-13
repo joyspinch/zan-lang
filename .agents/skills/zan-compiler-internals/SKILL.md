@@ -1325,3 +1325,19 @@ f64、i64/指针原样；irgen_call.c 的"global LLVM function by name"路径有
 自己的 coerce 循环，两处都要加。⑥ 验证：正例（等参/超参/运行期 string
 尾部/double 尾部/返回值）+ 负例（少参 qualified 报源码错误、bare 落
 verifier 属既有缺口）+ 全量 existing-extern 回归。
+
+## stdlib 文件去掉 using System.Threading 的省税原理（A56 第二批实录）
+
+**机制**：irgen_emit 的 extern 声明发射按"类成员被拉进闭包"就发生，与是
+否真的调用无关；Threading.zan 里 zan_thread_*/zan_shared_* 等声明一被
+发射，uses_sync_runtime 前缀旗标即置位，rt_sync.o（线程+共享表运行时）
+整个被拖进链接。所以哪怕只用了一个 `Thread.Sleep`，`using
+System.Threading` 的代价都是整个 rt_sync。
+
+**定式**：stdlib 轮询等待里的裸睡眠，用文件内
+`[DllImport("kernel32", EntryPoint = "Sleep")]`（POSIX 用 crt `usleep`，
+微秒单位）——Win32Shell.SleepW、Guard.WinSleep、Automation.Window.SleepW
+是三个同款先例；调用点都在 `#if WINDOWS`/`#elif LINUX` 内，未编译分支的
+声明不发射、不产生未定义符号。**验证口诀**：`ZAN_TRACE_SYNC=1 zanc ...`
+看 [sync-flag] 行，改动前后对比应为归零；注意 TrayIcon 这类"真线程"
+（Thread.Start 消息泵）的税是正当的，不要误杀。

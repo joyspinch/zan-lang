@@ -206,7 +206,7 @@ g = 24700000.0; steps = [round(g * 1.5**i, -4) for i in range(10)]   # sum ≈ 2
 | 押镖产出 | 金币 + 声望 + 行会资金 | `escort_merit=30` 声望入个人；`escort_guild_gold` 同额写入 `game_guild.fund`（§3.5 声望入口的兑现）；押金 `escort_gold` 不退 |
 | 红包玩法币种 | **元宝 gems** | 红包池是全服共享世界态（world_state），发出与抢到都是元宝；§3.5 表里的「红包 redPackets 币」是回收币种 #4，两回事——前者是玩法，后者是币，产出仍挂幻境（下一轮） |
 | 竞技场对手公式 | 幂基 + 胜场 + 档位 | `opponent = arena_power_base + (胜场+1)×arena_power_win + (档位-1)×arena_power_rival`，我的战力×随机区间 vs 对手×arena_win_scale；胜负都发战功+声望（赢多发金币），段位榜按 merit 取前 `arena_rival_count` |
-| 市场双花 | 条件更新 | 买断走 `UPDATE sellerId=? WHERE id=? AND sellerId=?` 判 affected（§五 兑现），卖方按 `market_fee_pct` 抽成，离线也入账 |
+| 市场双花 | 条件更新 + 负值占位 | 买断走 `UPDATE sellerId=-卖家 WHERE id=? AND sellerId=原值` 判 affected（§五 兑现）；select/列表只认 `sellerId>0` 的在售单。最初实现把 sellerId 改成**正的买家 id**，顺序双买（非并发）的第二个买家会把它当「新卖家」再卖一遍——e2e 实测抓到，见 tools/e2e_legend.py CAS 段。卖方按 `market_fee_pct` 抽成，离线也入账 |
 | 将星位图 | int → long | maps.csv 覆盖 171 层，`bit = mapId-1` 在 int 位图装不下（§3.4 连带） |
 
 > 三个新键同时进两侧 RequiredKeys（服务端 `Rules.zan` / 客户端
