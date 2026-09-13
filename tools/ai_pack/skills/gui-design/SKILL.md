@@ -122,14 +122,21 @@ token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
   等价物的组件一律写原生标签,`data-kind` 只留给没有原生等价物的组件
   (Avatar/Badge/Tag/Card/Chart…)——这正是 data-kind 协议的本意。全集:
   `<button>文字`、`<label>文字`、`<textarea>初始值`、`<img src/alt>`、
-  `<input>` 按 type 六型(checkbox→Checkbox+checked、radio→Radio、
-  range→Slider、color→ColorPicker、number→InputNumber、date→DatePicker,
-  其余→Input+placeholder)、`<select><option>`(option 文本→options,
-  selected→value 下标,无 selected 默认第 0 项=浏览器语义)、
+  `<input>` 按 type 七型(checkbox→Checkbox+checked、radio→Radio、
+  range→Slider、color→ColorPicker、number→InputNumber、date→DatePicker、
+  file→Upload,其余→Input+placeholder)、`<select><option>`(option 文本→
+  options,selected→value 下标,无 selected 默认第 0 项=浏览器语义)、
   `<hr>`→Divider(void 无正文,文案走 `data-text`)、`<progress
   value max>`→Progress(折算 percent)、`<p>正文`→Typography。原生属性
   与 `data-x-*` 通道等价可混用(图片内容就该放 src)。复合属性
   (props/columns)才用 `data-x-<键>='<JSON>'`。
+- **裸 `<div>` 的 kind 兜底就是 Panel**:布局壳(页面/卡片/格子)不写
+  `data-kind="Panel"`,剥掉后模型逐字节不变——只有"演示本尊"才值得
+  标 kind。协议侧扩了原生映射后旧稿不会自动跟上:用
+  `grep '<div[^>]*data-kind='` 普查各 .html 设计稿,把有原生等价物的
+  控件换成原生标签;批量转换用探针校验——新旧稿各过
+  `DesignerHtml.ToJsonDoc` 比模型,除有意的形状变化(如滑条 min/max
+  从 props 袋提为原生属性)外应逐字节 SAME。
 - **导入侧两个静默坑**(都真踩过):①读端属性循环里,专用分支必须排在
   通用分支之前——checkbox/radio 的 value 是文案(→label)、progress 的
   value/max 要截流(→percent),排进通用 value/min/max 分支之后就成了

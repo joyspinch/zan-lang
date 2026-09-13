@@ -132,7 +132,8 @@ add("输入", "ColorPicker", "ColorPicker 颜色", 0, 40,
     {"native": "input_t", "itype": "color",
      "tattrs": ' value="#378add"'})
 add("输入", "Upload", "Upload 上传", 0, 110,
-    {"props": P(triggerText="点击上传", tip="单个文件不超过 10 MB")})
+    {"native": "input_t", "itype": "file",
+     "tattrs": " data-x-props='{&quot;triggerText&quot;:&quot;点击上传&quot;,&quot;tip&quot;:&quot;单个文件不超过 10 MB&quot;}'"})
 add("输入", "SelectBox", "SelectBox 下拉选择", 0, 40,
     {"native": "select",
      "options": ["Web 前端", "桌面客户端", "服务端"]})
@@ -286,7 +287,7 @@ def emit_demo(kind, dw, dh, a, ind):
             ind, did, a["src"], a.get("fit", "contain"),
             geom(fx, fy, dw, dh)))
     elif kind in CODE_FED:
-        out.append('%s<div id="%s" data-kind="Panel"%s></div>' % (
+        out.append('%s<div id="%s"%s></div>' % (
             ind, did, geom(fx, fy, dw, dh)))
     else:
         head = '%s<div id="%s" data-kind="%s"' % (ind, did, kind)
@@ -328,7 +329,7 @@ lines.append('  <div id="Cats" data-kind="Tabs"%s></div>'
              % attr("data-fh", HEAD_H))
 
 for pi, (ptitle, items) in enumerate(PAGES):
-    lines.append('  <div id="Page%d" data-kind="Panel"%s>' % (
+    lines.append('  <div id="Page%d"%s>' % (
         pi, geom(CONTENT_X, CONTENT_Y, CONTENT_W, CONTENT_H)))
     y = 8
     for rs in range(0, len(items), COLS):
@@ -339,7 +340,7 @@ for pi, (ptitle, items) in enumerate(PAGES):
             card_h = dh + CARD_EXTRA
             row_h = max(row_h, card_h)
             x = ci * (CARD_W + GAP)
-            lines.append('    <div id="Card%d_%d" data-kind="Panel"%s%s%s>' % (
+            lines.append('    <div id="Card%d_%d"%s%s%s>' % (
                 pi, rs + ci, geom(x, y, CARD_W, card_h),
                 attr("class", "demo-card"), attr("style", CARD_STYLE)))
             lines.append('      <label%s%s>%s</label>' % (
