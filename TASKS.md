@@ -2140,7 +2140,7 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
 * **A300 已修（2026-09-11 续轮，P1/编译器拉入）**：`conformance_web_typed_binding` 在 HEAD 编不过（8 处 unresolved call 'TaskJoin.WhenAll'）。根因不在注册而在 `pi_seed_source`（`src/compiler/main.c:1066`）的按需拉入种子：镜像「`Task.WhenAll` → flag TaskJoin」的分支（`:1237-1248`）判定依赖 `chain`（点号链头），而 chain 在点号本身（switch default）与每个非点号 token （switch 后置 `if (tok.kind != TK_DOT) chain = NULL;`）处被**双重清空**——恒为 NULL，该镜像与 ns_root 命名空间分支都是死代码。任何用例从未因镜像受益；`async_when_all` 能过纯因用例显式拼写了一次 `TaskJoin.CancelAll`；stdlib 自己的 `Task.WhenAll` （HttpForwarder.zan:961）由 pi_scan_file（无 chain、逐 ident 无条件 flag，`main.c:1011-1037`）扫到。**修（外科式）**：不动 chain 语义（整链复活会连带复活 ns_root 分支，其传递性拉入会破坏 `pullin_qualified_escape` 的遮蔽契约——实测 137 项连坐红），改为在裸名 `Task` 的 TK_IDENT 处用 `zan_lexer_peek2`（新增，`lexer.c` 的 peek 改造为 `lexer_peek_n(n)`，peek/peek2 皆全状态快照）前瞻两 token，`Task.WhenAll/WhenAny` 形状就地 flag TaskJoin；chain 死代码以注释言明留待后续清理。**验证**：三个此前必红的 WhenAll 探针转绿；`web_typed_binding` 输出与 golden 逐字节一致；`pullin_qualified_escape` 单独编译+运行 golden 一致；smoke 档 Gui 在途与一次 ld.exe 竞态（重跑即绿）外全过。注：本修复后的整档 standard 轮无法给出干净数字——并行会话正在改 `stdlib/Gui/Component/Chart/**` （工作树一度删除了 `PolarAxisSpec`/`ChartCalendarSpec` 类而引用它们的文件未同步改），约 136 项在 `--auto-stdlib` 下编译连坐红，与本修复无关（编译失败点全在 Chart 子树）。
 * **A302 已修（2026-09-12，根因三段实锤）[P2/stdlib Net] leakcheck_http_forwarder_tunnel 退出时 29 对象仍可达**：A300 修复解除了该用例的编译阻塞后暴露。泄漏图谱（2/2 稳定）：`HttpForwarder.zan` 的 listener/FwdChannel×4/List<FwdChannel>/List<long>×3/FwdReader×4/FwdPool + 用例 TcpClient——全部被「每条隧道一个永久停摆的上游方向泵」钉住（Serve 帧等 Tunnel，Tunnel 的 WhenAll 等泵）。**根因链**：①隧道两条 channel 继承请求级 `recvIdleMs`（用例 `SetTimeout(10000)`），泵的接收走 3 参 `Socket.RecvAsync(带截止)`——Windows 实现是 1→16ms select-轮询循环，**不是挂起的重叠操作**（IOTRACE 里泵的 recv 从不出现在 cnt 里）；②对端方向泵先退出（客户端 FIN→EOF→原 `src.Close(); dst.Close()`），`dst.Close` 把共享 fd 抽掉：select 对已关闭句柄不再报可读 → 轮询循环唯一的 `IsOpen` 逃生口（只写在 IsReadable 分支内）不可达，泵带着死 fd 按定时器空转到 10s idle 截止=进程退出前永不返回；③没有 IO op 挂着，任何 CancelIoEx/关闭都无从唤醒它——Stop+settle 排水无效，缺的不是泵转是唤醒。本地 `Shutdown` 也不够（select 对半关闭套接字恒报可读，但 recv 路径返回 -1 且 fd 未关 → 同样空转，实测）。**修（全在 HttpForwarder.zan）**：`Tunnel()` 入口把两条 channel `SetIdleMs(0)`（隧道沉默本就是常态，继承请求级空闲截止 10s 掐断无流量 SSH/TLS 本属设计疣；无截止接收走 RecvOv 真重叠 op，teardown 的 CancelIoEx 能以 0 字节唤醒它）+ `FwdChannel.Close` 先 `ShutdownBoth`（CancelIoEx，与 TcpListener.Stop/TcpClient.Close 同型）+ `PumpUntilClose` 退出只 Close 自己读的链、对端方向只 `Shutdown()` 半关闭（兄弟泵以 EOF 正常退出、由它亲手 Close，绝不抽兄弟脚下的 fd；发送中被取消的写表现为短写 break）。**验证**（worktree zanc，仅含本修）：tunnel leakcheck **0 对象** + golden 逐字；keepalive golden 逐字（仍 1 对象=A64b 既有，HEAD 同数）；stream 功能 diff 与 HEAD 逐字一致（A298 登记的既有失败，归并行 Socket.zan 重写）；http_client cookies/redirect/timeout/keepalive 四件套 golden 逐字。**留给 Socket.zan/rt_io 车道**：带截止 RecvAsync 的轮询循环对「本地已关 fd」永不退出（IsReadable 恒假 → IsOpen 不可达）与「半关闭 fd 空转」两形态——并行会话的 RecvToOv 重写会整段替换该循环，落地后复核；本修不依赖它。
 
-* **A315 [stdlib] StringExtensions.To* 扩展内部调全局 `Convert`，撞用户 Convert 遮蔽类（2026-09-14 standard 档归因时发现，未修）[P2/stdlib 设计隐患]**：d822c1c1 给 stdlib/System/StringExtensions.zan 加的 ToInt32/ToInt64/ToDouble 扩展方法内部以 `Convert.ToInt64(s)` 实现——stdlib 源码与用户代码同编译单元时，该全局名解析到**用户自带**的 `class Convert`（tests/conformance/builtin_shadowing.zan 即此形状：自带 Math/Convert/Environment 遮蔽类，合法且受 f32caa9ef 保护），用户 Convert 无 ToInt64 → stdlib 文件报 "Convert has no member ToInt64" 连坐编译失败。修法方向：StringExtensions.To* 改走编译器内建形态（irgen_call.c:1638 已特判 Convert.ToInt/ToInt32/ToInt64，stdlib 侧别再调全局名——直接内联解析或换非遮蔽内名）。当前 `conformance_builtin_shadowing` 在含 d822c1c1 的任何树上都红。
+* **A315 [stdlib] StringExtensions.To* 扩展内部调全局 `Convert`，撞用户 Convert 遮蔽类（2026-09-14 发现并当轮修复）[P2/stdlib 设计隐患]**：d822c1c1 给 stdlib/System/StringExtensions.zan 加的 ToInt32/ToInt64/ToDouble 扩展方法内部以 `Convert.ToInt64(s)` 实现——stdlib 源码与用户代码同编译单元时，该全局名解析到**用户自带**的 `class Convert`（tests/conformance/builtin_shadowing.zan 即此形状：自带 Math/Convert/Environment 遮蔽类，合法且受 f32caa9ef 保护），用户 Convert 无 ToInt64 → stdlib 文件报 "Convert has no member ToInt64" 连坐编译失败。**修**：StringExtensions 增加私有 `[DllImport("crt")] strtoll/strtod`，三个 To* 直呼 libc（与 Convert.ToInt32/64 内建降层同一 strtoll 实现，语义逐位一致），DllImport 名字不可被用户类遮蔽；用户遮蔽类照常对自己的直接调用生效，两侧互不干扰。**验证**：遮蔽程序内 To* 扩展（42/7/3.5/null→0）与用户 Convert 直接调用（12000）并存的探针全对；`conformance_builtin_shadowing` 转绿；standard 档 839/846（剩 7 红均归并行 charts/win-smoke 车道）。
 * **A304 其余 7 个服务端模板五维抽测 + server-mvc 6 处 type-check 修复（2026-09-11 完成）**。
 
 * **A305 [stdlib/Gui] 导航后内容区间歇性整片不画——树在、像素空（2026-09-11 legend 复刻会话实测，未修，非页面代码缺陷）**：legend 模板（templates/game/legend）经 UiDriver 点击底部导航切页后，内容区**经常**只剩页面底色 `#1d2633`，再导航一次又可能画出来——同 build 同脚本一会画一会不画。已证与页面代码无关：连拍 `_scratch/legend-scene/multi.txt`（m1 画 / m2-m5 全空）里 m3/m4 是**已提交的成就页 26**（69d2bc58，常规 mk-frame 结构）同样空；图鉴 23 页的 LEGEND_DBG 探针（模板 main.zan 1000ms 刻度，`content.HitTest` 走可见性+矩形同一路径）显示 6 个采样点全部命中具名节点、navscan 扫出全部导航 tile、控件树实摆矩形正确；`Navigate` 已包 try/catch 挂 `nav-err` probe（随本次 legend 提交入库），空画时**从未触发**——不是布局塌陷也不是构建异常，是重绘/失效路径丢了请求。波及所有浮窗页（17/22/23/26/29 都中过），legend 验收只能靠「一次运行只做一次导航、不画就重启重试」的仪式绕行（REFERENCE_AUDIT §八）。**疑点与排查方向**：Gui 失效传播（rebuild+Refresh 后 dirty 标记被吞/重绘合并窗口错过）、Win32 后端 present 条件；本轮 stdlib/Gui 后端正被并行会话大面积修改（Native/Win32Shell/Css 在途 + 33b510e4 等 5 个 Gui 提交），无法在半成品 stdlib 上二分定根因——等 Gui 车道安静后用 `LEGEND_DBG=1` 起模板 + UiDriver 连拍复现（探针已固化在模板 main.zan），从 33b510e4 起对 Gui 提交逐个 A/B。另：初判「`mk-frame` 缺 `mk-fixed` 首子才中招」被 m3/m4 证伪，勿按该方向修。
@@ -2754,6 +2754,43 @@ P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
   回归：chart 层 211/213（仍只剩台账在案的 calendar/barminheight 两
   个批次前失败），全量 sweep 345 张 FLAG 182 与改前持平，conformance
   chart_radar_values 增至十一断言（multi/multimax）4 变体全绿。
+* **大数据卡死闭账 + 异步装载落地（2026-09-13 第四批）**：
+  用户点名的「大量数据加载卡死」两层根因都修讫。①**力导向布局
+  O(n²) 热循环 8.3s/帧**：graph-webkit-dep（nn=513, links=942）、
+  graph-npm（nn=492）首帧卡 7-8s。逐段插桩钉准在 ForceLayout.OfK
+  弹簧模拟，再往循环内部插标记证明换掉 List<ForceNode> 对象访问
+  **毫无变化**——真凶是 `ChartView.ISqrt`：整型牛顿迭代**初值取
+  r=v 本身**，d²≈1e5 量级要 ~17 次带 long 除法的对折才到 √v，每次
+  ~1000 周期，30 轮 × nn² 对全中招。修法：斥力/引力内循环改
+  `Math.Sqrt`（硬件 sqrt）+ 平方域剪枝（d²≥k² 直接 continue，与原
+  `d<k` 语义逐位等价，k 恒 ≥8 故钳制分支不受影响）+ 坐标/邻接抄进
+  原生 int[]（CSR 邻接表把 attraction 从逐节点全边扫 O(n·en) 降到
+  O(度)）。实测 sim 8111→78ms，graph-webkit-dep 6916→122ms、
+  graph-npm 8196→194ms，全量 sweep 24.5s→12s。ISqrt 本体未动
+  （其余车道依赖），台账留观察：其初值可改 `r = 1<<(bit_length(v)/2)`
+  一类的近猜，属后续优化。②**demo 首开在 UI 线程 FromJson 卡交互**
+  （geo-svg-scatter-simple 解析 3.1s）：gallery 落地异步装载——
+  OptionOf 未命中即插 pending 槽 + `Thread.Start` 后台 worker
+  （只做 EmbedRead + FromJson 纯计算，不触 UI 状态），成品经
+  `app.Post(捕获闭包)` 整只移交 UI 线程（App.Post 自带
+  window.Wake() 唤醒阻塞中的 WaitEvent、DrainPosts 执行后自动置
+  needsRedraw——与 DataTable.HttpSource/ImageHttp 同一定式）；
+  pending 期间画「加载中…」占位。`--nomouse` 回归与 `--sweep`
+  审查路径保持同步装载（单帧截图必须终态；sweep 有独立的
+  FromJson 通道不受影响）。实机端到端：启动 1s 内见加载占位且
+  UI 活着，解析完成后冰岛地形图完整渲染，全程不冻结。
+  ③**顺带清除存量噪音与脚手架坑**：GaugeScalar 补 `scalar == null`
+  守卫——pie/gauge/polar 各车道大量「整标量直传」调用点把 null 传
+  入（Zan 宽容语义每帧打两行 runtime error，radar-multiple/custom
+  只是冰山一角，sweep 全量数百条）；守卫按 0 处理与既有渲染逐位
+  一致，sweep runtime error 归零。Chart.zan 里 71af2a7f 批次漏拆
+  的 `DBG grid` 每帧打印删除。sweep 机器补 `_scratch/sweep` 目录
+  自建（目录缺失时逐张 WritePixels 静默失败、末尾 manifest 整体
+  IOException——干净检出/目录被清后 sweep 直接崩）+ 逐 demo 进度
+  行 + WritePixels 独立 try/catch（render-error 不再连坐落盘失败）。
+  回归：chart 层 ctest 仅台账在案两失败（calendar/barminheight），
+  全量 sweep 345 张 FLAG 182 持平，manifest 仅 lines-ny/custom-wind
+  两个已知 nojson。
 * **ZanDb 扫描层零拷贝化 + 段不可变 CRC 验一次（2026-09-13）**：
   针对「过滤/投影与 SQLite 差距好几倍」的机器层改造：①SegCursor
   惰性物化——NextRecordRaw 裸解析只记键值在块内的偏移/长度，
