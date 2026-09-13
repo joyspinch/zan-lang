@@ -1297,13 +1297,34 @@ static LLVMValueRef emit_boundary_coerce(zan_irgen_t *g, LLVMValueRef v,
 static void coerce_args_to_params(zan_irgen_t *g, LLVMTypeRef fn_type,
                                   LLVMValueRef *call_args, int argc) {
     unsigned npt = LLVMCountParamTypes(fn_type);
-    if (npt == 0 || argc <= 0) return;
-    LLVMTypeRef *pts = (LLVMTypeRef *)calloc((size_t)npt, sizeof(LLVMTypeRef));
-    LLVMGetParamTypes(fn_type, pts);
+    bool va = LLVMIsFunctionVarArg(fn_type) != 0;
+    if ((npt == 0 && !va) || argc <= 0) return;
+    LLVMTypeRef *pts = (LLVMTypeRef *)calloc((size_t)(npt > 0 ? npt : 1),
+                                             sizeof(LLVMTypeRef));
+    if (npt > 0) LLVMGetParamTypes(fn_type, pts);
     int n = (argc < (int)npt) ? argc : (int)npt;
     for (int i = 0; i < n; i++)
         call_args[i] = emit_boundary_coerce(g, call_args[i], pts[i]);
     free(pts);
+    /* C default argument promotions on a Variadic = true extern's tail
+     * (A2-3): small integers widen to int, float widens to double; i64 and
+     * pointers pass unchanged. Narrow signed Zan types read back signed like
+     * a C char/short -- pass an `int` when the width matters. */
+    for (int i = (int)npt; va && i < argc; i++) {
+        LLVMValueRef v = call_args[i];
+        if (!v) continue;
+        LLVMTypeRef t = LLVMTypeOf(v);
+        if (LLVMGetTypeKind(t) == LLVMIntegerTypeKind &&
+            LLVMGetIntTypeWidth(t) < 32)
+            call_args[i] = (LLVMGetIntTypeWidth(t) == 1)
+                ? LLVMBuildZExt(g->builder, v,
+                    LLVMInt32TypeInContext(g->ctx), "va.prom")
+                : LLVMBuildSExt(g->builder, v,
+                    LLVMInt32TypeInContext(g->ctx), "va.prom");
+        else if (LLVMGetTypeKind(t) == LLVMFloatTypeKind)
+            call_args[i] = LLVMBuildFPExt(g->builder, v,
+                LLVMDoubleTypeInContext(g->ctx), "va.prom");
+    }
 }
 
 /* If `t` is a generic type parameter of `recv`'s instantiated class, resolve it

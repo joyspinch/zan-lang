@@ -3477,6 +3477,8 @@ static int method_accepts_arity(zan_symbol_t *m, int argc) {
     if (!m || !m->decl || m->decl->kind != AST_METHOD_DECL) return 0;
     int pc = m->decl->method_decl.params.count;
     if (pc == argc) return 1;
+    /* a [DllImport(..., Variadic = true)] extern absorbs any tail */
+    if (m->decl->method_decl.is_variadic && argc > pc) return 1;
     if (method_is_params_variadic(m) && argc >= pc - 1) return 1;
     if (argc < pc) {
         for (int i = argc; i < pc; i++) {

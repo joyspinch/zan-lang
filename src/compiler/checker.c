@@ -1367,6 +1367,9 @@ static void checker_reject_null_receiver(zan_checker_t *c, zan_ast_node_t *expr)
  * parameter of the declaration but not an argument of the call. */
 static bool method_arity(zan_symbol_t *m, int *min, int *max) {
     if (!m->decl || m->decl->kind != AST_METHOD_DECL) return false;
+    /* a [DllImport(..., Variadic = true)] extern accepts any argument count
+     * above its declared parameters: undecidable here, like a params tail */
+    if (m->decl->method_decl.is_variadic) return false;
     zan_ast_list_t *ps = &m->decl->method_decl.params;
     int lo = 0;
     for (int i = 0; i < ps->count; i++) {
@@ -1389,6 +1392,8 @@ static bool method_accepts_argc(zan_symbol_t *m, int argc) {
     if (method_arity(m, &lo, &hi)) return argc >= lo && argc <= hi;
     if (!m->decl || m->decl->kind != AST_METHOD_DECL) return false;
     zan_ast_list_t *ps = &m->decl->method_decl.params;
+    /* a Variadic DllImport takes every declared parameter and any tail */
+    if (m->decl->method_decl.is_variadic) return argc >= ps->count;
     if (ps->count == 0) return false;
     zan_ast_node_t *last = ps->items[ps->count - 1];
     if (!last || last->kind != AST_PARAM || !last->param.is_params) return false;
@@ -1466,7 +1471,21 @@ static void check_call_arity(zan_checker_t *c, zan_ast_node_t *call,
             if (!m || m->kind != SYM_METHOD || m->name.len != name.len ||
                 memcmp(m->name.str, name.str, (size_t)name.len) != 0)
                 continue;
-            if (!method_arity(m, &lo, &hi)) return;
+            if (!method_arity(m, &lo, &hi)) {
+                /* a Variadic = true DllImport absorbs any tail but its fixed
+                 * parameter prefix is still mandatory */
+                if (candidates == 0 && m->decl->method_decl.is_variadic &&
+                    argc < m->decl->method_decl.params.count) {
+                    int floor = m->decl->method_decl.params.count;
+                    zan_diag_emit(c->diag, DIAG_ERROR, call->loc,
+                                  "'%.*s.%.*s' takes at least %d argument%s, "
+                                  "but %d given",
+                                  (int)recv->sym->name.len, recv->sym->name.str,
+                                  (int)name.len, name.str, floor,
+                                  floor == 1 ? "" : "s", argc);
+                }
+                return;
+            }
             if (argc >= lo && argc <= hi) return;
             if (!candidates) { want_min = lo; want_max = hi; }
             candidates++;

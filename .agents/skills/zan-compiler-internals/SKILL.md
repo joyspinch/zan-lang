@@ -1287,3 +1287,41 @@ Update<T>()/Delete<T>()/SyncStructure<T>()` 根调用同样重写（db_root）�
 无需任何注册/清单；存量库加列后旧行 NULL 读作 0（哨兵语义，见
 tenantId 回填先例）。另：`Insert(x).ExecuteIdentityAsync()` 的返回值才
 是自增 id，且**不回写** `x.id`。
+
+
+## File 读族 alt-base 回退 exe 目录 vs Directory 清理 CWD 相对：测试缓存目录必须用绝对路径
+
+**坑**：GUI 用例报 hits==0 而行数据照常到达（conformance_gui_httpsource
+连红两天）。根因是两套锚点不同树：`File.Exists` 相对路径 miss 时经
+`rt_file.c zan_file_attributes` 的 alt-base 链回退（base0=ZAN_PKG_DIR、
+base1=**exe 目录**）——测试 exe 在 build/，于是读到 build/hts_cache 里的
+陈旧缓存；而 `Directory.DeleteRecursive` 走 ExistsOnDisk/相对删除，锚的
+是进程 CWD（ctest 下=仓库根）。启动时把 CWD 侧缓存删得再干净，exe 侧
+残留照样被 File 读族端上来；写路径（WriteAllText 等）又是 CWD 相对——
+读、写、清理三边各锚一棵树，用例永远无法自清理。
+
+**定式**：程序运行期自己创建的缓存/临时目录，路径一律用
+`ProcessHost.AppDir() + "/name"` 绝对路径（绝对路径 `path[1]==':'` 或
+前导 `/` 直接跳过 alt-base，三边天然同树）；只有"随程序分发的只读资源"
+才该用相对路径享受 alt-base 的发布查找。排查口诀：见"删了还在/读不到刚
+写的"先问一句 File 和 Directory 是否锚在同一目录——
+`ProcessHost.UseAppDir(marker)` 是现成的整树切换开关。
+
+## 加 [DllImport] 命名属性旗标的完整穿线（A2-3 Variadic 实录）
+
+`Variadic = true` 从语法到代码生成的穿线清单，加任何 DllImport 命名属性
+照抄：① `parser.c parse_attr_usages` 解码命名实参（argname 比对 +
+AST_BOOL_LITERAL 判值）→ 新 out 参；**顶部还有一份 4 参前向声明，
+改签名别漏**。② `ast.h method_decl` 加 `bool is_variadic`。③ arity 三处
+口径必须同步：checker `method_arity`（返回 false=不判，check_call_arity
+靠它跳过；变参仍要给"至少 N 参"下限诊断就在它的调用点补）、checker
+`method_accepts_argc`、irgen `method_accepts_arity`（resolve_overload 的
+唯一实现在 irgen.c——整个 irgen*.c 是一个 TU）。④ 声明点
+`irgen_emit.c is_extern_decl` 分支：`LLVMFunctionType(..., isVarArg)`，
+且**跳过 abi_extern_thunk**（varargs 无法转发，struct 变参本来也没有更
+好的 ABI）。⑤ 尾参 C 默认提升放 `irgen_arc.c coerce_args_to_params`：
+i1→zext i32（bool 是 0/1，sext 会变 -1）、i8/i16→sext i32、f32→fpext
+f64、i64/指针原样；irgen_call.c 的"global LLVM function by name"路径有
+自己的 coerce 循环，两处都要加。⑥ 验证：正例（等参/超参/运行期 string
+尾部/double 尾部/返回值）+ 负例（少参 qualified 报源码错误、bare 落
+verifier 属既有缺口）+ 全量 existing-extern 回归。

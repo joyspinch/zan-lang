@@ -112,7 +112,8 @@ static zan_ast_node_t *parse_parameter(zan_parser_t *p);
 static uint32_t parse_modifiers(zan_parser_t *p);
 static zan_ast_list_t parse_param_list(zan_parser_t *p);
 static void parse_attr_usages(zan_parser_t *p, zan_ast_list_t *out,
-                              zan_istr_t *out_lib, zan_istr_t *out_entry);
+                              zan_istr_t *out_lib, zan_istr_t *out_entry,
+                              bool *out_variadic);
 static bool parse_top_level_decl(zan_parser_t *p, zan_ast_node_t *unit);
 
 /* Parses `delegate ReturnType Name<TParams>(params);` with the cursor on the
@@ -168,7 +169,7 @@ static bool parse_top_level_decl(zan_parser_t *p, zan_ast_node_t *unit) {
     bool has_explicit_layout = false;
     zan_ast_list_t type_attrs;
     zan_ast_list_init(&type_attrs);
-    parse_attr_usages(p, &type_attrs, NULL, NULL);
+    parse_attr_usages(p, &type_attrs, NULL, NULL, NULL);
     for (int _ai = 0; _ai < type_attrs.count; _ai++) {
         zan_istr_t _n = type_attrs.items[_ai]->attribute.name->ident.name;
         if (_n.str && _n.len == 12 && memcmp(_n.str, "StructLayout", 12) == 0) {
@@ -3730,12 +3731,14 @@ static void desugar_yield_method(zan_parser_t *p, zan_ast_node_t *m) {
 }
 
 static void parse_attr_usages(zan_parser_t *p, zan_ast_list_t *out,
-                              zan_istr_t *out_lib, zan_istr_t *out_entry) {
+                              zan_istr_t *out_lib, zan_istr_t *out_entry,
+                              bool *out_variadic) {
     /* Parse zero or more `[A, B(...)]` attribute groups; append each as an
      * AST_ATTRIBUTE (name = last dotted segment; args = positional expressions
      * and AST_ASSIGNMENT nodes for `Name = value`). Retained on the following
      * declaration for the compile-time attribute evaluator / routegen.
-     * `[DllImport(...)]` is also decoded into *out_lib / *out_entry. */
+     * `[DllImport(...)]` is also decoded into *out_lib / *out_entry, and its
+     * `Variadic = true` named argument into *out_variadic (A2-3). */
     while (parser_check(p, TK_LBRACKET)) {
         parser_advance(p); /* [ */
         for (;;) {
@@ -3777,6 +3780,12 @@ static void parse_attr_usages(zan_parser_t *p, zan_ast_list_t *out,
                             val->kind == AST_STRING_LITERAL) {
                             *out_entry = val->str_val;
                         }
+                        if (is_dll && out_variadic && argname.str &&
+                            argname.len == 8 &&
+                            memcmp(argname.str, "Variadic", 8) == 0 &&
+                            val->kind == AST_BOOL_LITERAL && val->bool_val) {
+                            *out_variadic = true;
+                        }
                     } else {
                         zan_ast_node_t *val = parse_expression(p);
                         zan_ast_list_push(&attr->attribute.args, val, p->arena);
@@ -3798,7 +3807,8 @@ static void parse_attr_usages(zan_parser_t *p, zan_ast_list_t *out,
 
 static zan_ast_node_t *parse_member_decl_inner(zan_parser_t *p,
                                                zan_istr_t dll_import_lib,
-                                               zan_istr_t dll_entry_point);
+                                               zan_istr_t dll_entry_point,
+                                               bool dll_variadic);
 
 /* Synthesize the accessor method of a property with a custom body. `name` is
  * the mangled method name (`get_Prop` / `set_Prop`), `ret_type` the property's
@@ -3836,15 +3846,18 @@ static zan_ast_node_t *parse_member_decl(zan_parser_t *p) {
     zan_ast_list_init(&attrs);
     zan_istr_t dll_import_lib = {NULL, 0};
     zan_istr_t dll_entry_point = {NULL, 0};
-    parse_attr_usages(p, &attrs, &dll_import_lib, &dll_entry_point);
-    zan_ast_node_t *n = parse_member_decl_inner(p, dll_import_lib, dll_entry_point);
+    bool dll_variadic = false;
+    parse_attr_usages(p, &attrs, &dll_import_lib, &dll_entry_point, &dll_variadic);
+    zan_ast_node_t *n = parse_member_decl_inner(p, dll_import_lib, dll_entry_point,
+                                                dll_variadic);
     if (n) n->attributes = attrs;
     return n;
 }
 
 static zan_ast_node_t *parse_member_decl_inner(zan_parser_t *p,
                                                zan_istr_t dll_import_lib,
-                                               zan_istr_t dll_entry_point) {
+                                               zan_istr_t dll_entry_point,
+                                               bool dll_variadic) {
     uint32_t mods = parse_modifiers(p);
     if (dll_import_lib.str) mods |= MOD_EXTERN;
     /* `event` is contextual: only a modifier when introducing an event field
@@ -4270,6 +4283,7 @@ ordinary_member:
         n->method_decl.modifiers = mods;
         n->method_decl.extern_lib = dll_import_lib;
         n->method_decl.entry_point = dll_entry_point;
+        n->method_decl.is_variadic = dll_variadic;
         n->method_decl.where_clauses = wheres;
         desugar_yield_method(p, n);
         return n;

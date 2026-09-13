@@ -28,7 +28,8 @@ This document is layered into **current implementation** and **target design**:
 > implementation; §3.3–§3.5 are the longer-term design.
 
 Remaining ABI capability work is tracked in `TASKS.md` (A0-2 FFI bit-width, A0-3
-struct alignment corner cases, A2 variadic `DllImport` + `signext`/`zeroext`).
+struct alignment corner cases; A2's variadic `DllImport` and
+`signext`/`zeroext` are done).
 
 ---
 
@@ -373,6 +374,29 @@ static extern void ProcessString(string text);
 // 4. Unpin
 // The const char* is ONLY valid during the call
 ```
+
+### 6.4 Variadic Externs (`Variadic = true`)
+
+```csharp
+[DllImport("crt", Variadic = true)]
+static extern int printf(string fmt);
+
+printf("%d %s!\n", 42, "hi");   // declared params = fixed prefix,
+                                // the rest lands in the C `...` tail
+```
+
+- The declared parameters are the mandatory fixed prefix of the C varargs
+  callee; a call may pass more arguments, which are forwarded to the tail.
+  Passing fewer is a compile error (qualified calls report at the source;
+  unqualified calls surface as an LLVM verifier failure, matching the general
+  bare-call arity gap).
+- Tail arguments receive the C default argument promotions: `bool` widens to
+  0/1 i32, `float` widens to `double`, narrow integers widen to i32
+  (sign-extended — pass an `int` when an unsigned `byte`/`ushort` value's high
+  bit matters). Zan `int` (i64) and pointers pass unchanged.
+- A variadic extern is never wrapped in the struct-ABI thunk of §6.2; the
+  declaration stays plain, so avoid struct arguments on variadic callees.
+- String tail arguments follow §6.3 (pointer valid only during the call).
 
 ---
 

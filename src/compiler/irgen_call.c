@@ -5164,6 +5164,26 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             call_args[k], pt, "arg.ptrc");
                     }
                 }
+                /* Variadic = true tail (A2-3): C default argument promotions
+                 * on args beyond the declared parameters -- small integers
+                 * widen to int, float to double. */
+                if (LLVMIsFunctionVarArg(fn_type)) {
+                    for (int k = (int)nparams; k < argc; k++) {
+                        LLVMTypeRef at = LLVMTypeOf(call_args[k]);
+                        if (LLVMGetTypeKind(at) == LLVMIntegerTypeKind &&
+                            LLVMGetIntTypeWidth(at) < 32)
+                            call_args[k] =
+                                (LLVMGetIntTypeWidth(at) == 1)
+                                ? LLVMBuildZExt(g->builder, call_args[k],
+                                    LLVMInt32TypeInContext(g->ctx), "va.prom")
+                                : LLVMBuildSExt(g->builder, call_args[k],
+                                    LLVMInt32TypeInContext(g->ctx), "va.prom");
+                        else if (LLVMGetTypeKind(at) == LLVMFloatTypeKind)
+                            call_args[k] = LLVMBuildFPExt(g->builder,
+                                call_args[k],
+                                LLVMDoubleTypeInContext(g->ctx), "va.prom");
+                    }
+                }
                 /* A null string handed to an extern (whose callee has no Zan
                  * null checks at all) is the crash family the soft guards
                  * exist for: report it, then pass an empty literal so the

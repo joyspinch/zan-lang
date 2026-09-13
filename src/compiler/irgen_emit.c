@@ -1186,7 +1186,11 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                     ? zan_binder_resolve_type(g->binder, member->method_decl.return_type)
                     : g->binder->type_void;
                 LLVMTypeRef llvm_rt = map_type(g, rt);
-                LLVMTypeRef ft = LLVMFunctionType(llvm_rt, pt, (unsigned)pc, 0);
+                /* Variadic = true (A2-3): the C callee is varargs, so the
+                 * declaration carries the trailing ... and calls may pass
+                 * more arguments than the declared parameters. */
+                LLVMTypeRef ft = LLVMFunctionType(llvm_rt, pt, (unsigned)pc,
+                    member->method_decl.is_variadic ? 1 : 0);
                 /* use entry_point if specified, otherwise method name */
                 char ext_name[256];
                 if (member->method_decl.entry_point.str) {
@@ -1255,8 +1259,14 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                  * (e.g. built-in malloc/free/strlen, or duplicate DllImport across files). */
                 /* A struct crossing the boundary is not passed the way LLVM
                  * passes a first-class aggregate: abi_extern_thunk declares the
-                 * symbol with the platform C signature and wraps it. */
-                LLVMValueRef efn = abi_extern_thunk(g, ext_name, ft);
+                 * symbol with the platform C signature and wraps it. A varargs
+                 * callee cannot be forwarded through such a thunk, so a
+                 * Variadic = true extern always declares plain (C gives a
+                 * struct argument to a variadic callee no better ABI than
+                 * this anyway). */
+                LLVMValueRef efn = NULL;
+                if (!member->method_decl.is_variadic)
+                    efn = abi_extern_thunk(g, ext_name, ft);
                 if (!efn) efn = LLVMGetNamedFunction(g->mod, ext_name);
                 if (!efn) {
                     efn = LLVMAddFunction(g->mod, ext_name, ft);
