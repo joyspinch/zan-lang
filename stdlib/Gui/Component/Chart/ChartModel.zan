@@ -384,6 +384,10 @@ class ChartStage {
 class ChartNode {
     string name;
     int val;
+    string id;       // ECharts data 节点 id（treemap colorMappingBy:'id' 的
+                     // 映射键 = DFS 序号，官方 mapIdToIndex）
+    int color;       // 逐节点 itemStyle.color（0 = 继承级样式）
+    List<int> vals;  // value 数组形态（obama 的多维 value），null = 标量
     string symbol;   // ECharts force symbol 逐节点形状（"" = 圆）
     int size;        // 逐节点尺寸（直径像素；0 = 自动）
     bool collapsed;  // ECharts data 节点 collapsed:true = 折叠子树
@@ -394,6 +398,8 @@ class ChartNode {
         ChartNode n = new ChartNode();
         n.name = name;
         n.val = val;
+        n.id = "";
+        n.color = 0;
         n.symbol = "";
         n.size = 0;
         n.children = new List<ChartNode>();
@@ -405,6 +411,8 @@ class ChartNode {
         ChartNode n = new ChartNode();
         n.name = name;
         n.val = 0;
+        n.id = "";
+        n.color = 0;
         n.symbol = "";
         n.size = 0;
         n.children = children;
@@ -427,11 +435,23 @@ class ChartNode {
         return n;
     }
 
+    /// value 维度取值（visualDimension 缺省 0 = val；数组形态取
+    /// 对应维，越界退 val）。
+    int ValueOf(int dim) {
+        if (dim > 0 && vals != null && dim < vals.Count) { return vals[dim]; }
+        return val;
+    }
+
     /// 深复制整棵子树；src 为 null 时返回 null。
     static ChartNode Clone(ChartNode src) {
         if (src == null) { return null; }
         ChartNode n = new ChartNode();
         n.name = src.name; n.val = src.val; n.symbol = src.symbol; n.size = src.size;
+        n.id = src.id; n.color = src.color;
+        if (src.vals != null) {
+            n.vals = new List<int>();
+            for (int i = 0; i < src.vals.Count; i = i + 1) { n.vals.Add(src.vals[i]); }
+        }
         n.collapsed = src.collapsed;
         n.children = new List<ChartNode>();
         int childCount = src.children == null ? 0 : src.children.Count;
@@ -1798,6 +1818,28 @@ class ChartSeries {
     List<ErrorItem> errors;    // 误差条种类
     List<ChartPoint> points;    // 散点图种类
     List<ChartNode> tree;      // Treemap / Sunburst（层级根列表）
+    List<ChartLevel> levels;   // N3 levels 分级样式（treemap/sunburst 逐级）
+    int visibleMin;            // 官方 10：子格面积阈值；仅 sort 'asc'/'desc'
+                               //   时生效（treemapLayout filterByThreshold），
+                               //   语料 sort:true = 不排序 = 不裁剪
+    int leafDepth;             // -1 未声明；声明后 depth>=leafDepth 视作叶
+    int tmBorderWidth;         // -1 未声明（官方 itemStyle.borderWidth 0）
+    int tmBorderColor;         // 0 未声明（官方 neutral00 #fff）
+    int tmGapWidth;            // -1 未声明（官方 0）
+    int tmBorderColorSat;      // -1 未声明；声明后 borderColor 失效
+    int tmHasColorSat;         // series 级 colorSaturation [lo,hi]
+    int tmSatLo;
+    int tmSatHi;
+    int tmUpperShow;           // -1 未声明（官方 upperLabel.show false）
+    int tmUpperHeight;         // -1 未声明（官方 20）
+    int sunLabelMode;          // sunburst 系级 label.rotate：0 未声明 | 1 radial
+                               //   | 2 tangential | 3 角度（官方缺省 radial）
+    int sunLabelRotate;        // sunLabelMode==3 的角度
+    int sunLabelColor;         // sunburst 系级 label.color；0 未声明
+    int sunItemColor;          // sunburst 系级 itemStyle.color 纯色覆盖；0 未声明
+    int visualDimension;       // 官方 0；obama 多维 value 取维
+    int visualMin;             // -1 未声明（value 域下限拓宽）
+    int visualMax;             // -1 未声明
     List<ChartLink> links;     // Sankey / Chord / Force 种类
     List<ChartMapRegion> regions;  // Map 种类
     List<ChartEvent> events;       // Event River 种类
@@ -1979,6 +2021,25 @@ class ChartSeries {
         s.errors = new List<ErrorItem>();
         s.points = new List<ChartPoint>();
         s.tree = new List<ChartNode>();
+        s.levels = new List<ChartLevel>();
+        s.visibleMin = 10;
+        s.leafDepth = 0 - 1;
+        s.tmBorderWidth = 0 - 1;
+        s.tmBorderColor = 0;
+        s.tmGapWidth = 0 - 1;
+        s.tmBorderColorSat = 0 - 1;
+        s.tmHasColorSat = 0;
+        s.tmSatLo = 0;
+        s.tmSatHi = 0;
+        s.tmUpperShow = 0 - 1;
+        s.tmUpperHeight = 0 - 1;
+        s.sunLabelMode = 0;
+        s.sunLabelRotate = 0;
+        s.sunLabelColor = 0;
+        s.sunItemColor = 0;
+        s.visualDimension = 0;
+        s.visualMin = 0 - 1;
+        s.visualMax = 0 - 1;
         s.links = new List<ChartLink>();
         s.regions = new List<ChartMapRegion>();
         s.events = new List<ChartEvent>();
@@ -2470,6 +2531,26 @@ class ChartSeries {
         s.calIndex = src.calIndex;
         s.calCenter = src.calCenter;
         s.typeName = src.typeName;
+        // N3 分级样式域（treemap/sunburst）：纯标量，与数据共享无关，
+        // 必须在 shareData 早退前抄全，否则 Materialize 丢级样式。
+        s.visibleMin = src.visibleMin;
+        s.leafDepth = src.leafDepth;
+        s.tmBorderWidth = src.tmBorderWidth;
+        s.tmBorderColor = src.tmBorderColor;
+        s.tmGapWidth = src.tmGapWidth;
+        s.tmBorderColorSat = src.tmBorderColorSat;
+        s.tmHasColorSat = src.tmHasColorSat;
+        s.tmSatLo = src.tmSatLo;
+        s.tmSatHi = src.tmSatHi;
+        s.tmUpperShow = src.tmUpperShow;
+        s.tmUpperHeight = src.tmUpperHeight;
+        s.sunLabelMode = src.sunLabelMode;
+        s.sunLabelRotate = src.sunLabelRotate;
+        s.sunLabelColor = src.sunLabelColor;
+        s.sunItemColor = src.sunItemColor;
+        s.visualDimension = src.visualDimension;
+        s.visualMin = src.visualMin;
+        s.visualMax = src.visualMax;
         if (shareData) {
             // 阶段 B：渲染帧对数据集合只读，直接共享引用（scatter-large
             // /scatter-weibo 的逐项克隆税由此归零）。写方（图例态
@@ -2482,6 +2563,7 @@ class ChartSeries {
             s.errors = src.errors;
             s.points = src.points;
             s.tree = src.tree;
+            s.levels = src.levels;
             s.links = src.links;
             s.regions = src.regions;
             s.events = src.events;
@@ -2555,6 +2637,26 @@ class ChartSeries {
         for (int i = 0; i < src.points.Count; i = i + 1) { s.points.Add(ChartPoint.Clone(src.points[i])); }
         s.tree = new List<ChartNode>();
         for (int i = 0; i < src.tree.Count; i = i + 1) { s.tree.Add(ChartNode.Clone(src.tree[i])); }
+        s.levels = new List<ChartLevel>();
+        for (int i = 0; i < src.levels.Count; i = i + 1) { s.levels.Add(ChartLevel.Clone(src.levels[i])); }
+        s.visibleMin = src.visibleMin;
+        s.leafDepth = src.leafDepth;
+        s.tmBorderWidth = src.tmBorderWidth;
+        s.tmBorderColor = src.tmBorderColor;
+        s.tmGapWidth = src.tmGapWidth;
+        s.tmBorderColorSat = src.tmBorderColorSat;
+        s.tmHasColorSat = src.tmHasColorSat;
+        s.tmSatLo = src.tmSatLo;
+        s.tmSatHi = src.tmSatHi;
+        s.tmUpperShow = src.tmUpperShow;
+        s.tmUpperHeight = src.tmUpperHeight;
+        s.sunLabelMode = src.sunLabelMode;
+        s.sunLabelRotate = src.sunLabelRotate;
+        s.sunLabelColor = src.sunLabelColor;
+        s.sunItemColor = src.sunItemColor;
+        s.visualDimension = src.visualDimension;
+        s.visualMin = src.visualMin;
+        s.visualMax = src.visualMax;
         s.links = new List<ChartLink>();
         for (int i = 0; i < src.links.Count; i = i + 1) { s.links.Add(ChartLink.Clone(src.links[i])); }
         s.regions = new List<ChartMapRegion>();
@@ -3016,6 +3118,82 @@ class ChartZoom {
 /// Of(series) / FromJson() 构建，直接调整字段，然后交给
 /// ChartView.Of(option).Render(app, x, y, w, h)。三级控制对应
 /// ECharts：option.*（全局）< series.*（逐系列）< data[i].*（逐项）。
+/// N3：treemap/sunburst 的 levels[] 一项（TreemapSeriesLevelOption /
+/// SunburstLevelOption）。int 字段 -1 = 未声明（回退官方缺省或上级）。
+class ChartLevel {
+    List<int> color;      // 级调色板 / 渐变档（空 = 继承全局调色板）
+    int hasColorSat;      // colorSaturation [lo,hi] 已声明（千分值饱和度域）
+    int satLo;
+    int satHi;
+    int colorMappingBy;   // 0 index | 1 value | 2 id（官方缺省 index）
+    int borderWidth;      // 官方缺省 0
+    int borderColor;      // 0 = 未声明（官方缺省 neutral00 #fff）
+    int gapWidth;         // 官方缺省 0
+    int borderColorSat;   // borderColorSaturation 千分值；-1 未声明
+    int upperShow;        // 0/1；-1 未声明（官方缺省 false）
+    int upperHeight;      // 官方缺省 20
+    int r0;               // sunburst 环带内半径 px；-1 未声明
+    int r;                // sunburst 环带外半径 px；-1 未声明
+    int labelMode;        // 0 未声明 | 1 radial | 2 tangential | 3 角度
+    int labelRotate;      // labelMode==3 的角度
+    int r0Pct;            // sunburst 环带内半径百分比（千分值）；-1 未声明
+    int rPct;             // sunburst 环带外半径百分比（千分值）；-1 未声明
+    int colorOne;         // 级 itemStyle.color 单色（0 未声明）
+    int labelColor;       // 级 label.color（0 未声明）
+
+    static ChartLevel Of() {
+        ChartLevel lv = new ChartLevel();
+        lv.color = null;
+        lv.hasColorSat = 0;
+        lv.satLo = 0;
+        lv.satHi = 0;
+        lv.colorMappingBy = 0;
+        lv.borderWidth = 0 - 1;
+        lv.borderColor = 0;
+        lv.gapWidth = 0 - 1;
+        lv.borderColorSat = 0 - 1;
+        lv.upperShow = 0 - 1;
+        lv.upperHeight = 0 - 1;
+        lv.r0 = 0 - 1;
+        lv.r = 0 - 1;
+        lv.labelMode = 0;
+        lv.labelRotate = 0;
+        lv.r0Pct = 0 - 1;
+        lv.rPct = 0 - 1;
+        lv.colorOne = 0;
+        lv.labelColor = 0;
+        return lv;
+    }
+
+    static ChartLevel Clone(ChartLevel src) {
+        if (src == null) { return null; }
+        ChartLevel lv = ChartLevel.Of();
+        if (src.color != null) {
+            lv.color = new List<int>();
+            for (int i = 0; i < src.color.Count; i = i + 1) { lv.color.Add(src.color[i]); }
+        }
+        lv.hasColorSat = src.hasColorSat;
+        lv.satLo = src.satLo;
+        lv.satHi = src.satHi;
+        lv.colorMappingBy = src.colorMappingBy;
+        lv.borderWidth = src.borderWidth;
+        lv.borderColor = src.borderColor;
+        lv.gapWidth = src.gapWidth;
+        lv.borderColorSat = src.borderColorSat;
+        lv.upperShow = src.upperShow;
+        lv.upperHeight = src.upperHeight;
+        lv.r0 = src.r0;
+        lv.r = src.r;
+        lv.labelMode = src.labelMode;
+        lv.labelRotate = src.labelRotate;
+        lv.r0Pct = src.r0Pct;
+        lv.rPct = src.rPct;
+        lv.colorOne = src.colorOne;
+        lv.labelColor = src.labelColor;
+        return lv;
+    }
+}
+
 class ChartOption {
     string title;
     string titleSub;   // ECharts title.subtext（标题下的小字副标题）
@@ -4622,9 +4800,28 @@ class ChartOption {
             JsonValue ch = it.Get("children");
             List<ChartNode> kids = new List<ChartNode>();
             if (ch != null && ch.IsArray()) { ChartOption.ParseTree(ch, kids); }
+            JsonValue vi = it.Get("value");
+            int v0 = 0;
+            List<int> vals = null;
+            if (vi != null && vi.IsArray() && vi.Count() > 0) {
+                // obama 形多维 value：visualDimension 取对应维。
+                vals = new List<int>();
+                for (int k = 0; k < vi.Count(); k = k + 1) {
+                    vals.Add(vi.At(k).AsInt(0));
+                }
+                v0 = vals[0];
+            } else {
+                v0 = it.Int("value", 0);
+            }
             ChartNode n = kids.Count > 0
-                ? ChartNode.GroupVal(name, it.Int("value", 0), kids)
-                : ChartNode.Leaf(name, it.Int("value", 0));
+                ? ChartNode.GroupVal(name, v0, kids)
+                : ChartNode.Leaf(name, v0);
+            n.vals = vals;
+            n.id = it.Str("id", "");
+            JsonValue nis = it.Get("itemStyle");
+            if (nis != null && nis.IsObject()) {
+                n.color = ChartOption.ParseColor(nis.Get("color"), 0);
+            }
             // 官方 TreeSeries.ts:189-191：item.collapsed != null 时
             // isExpand = !collapsed（逐项折叠优先于全局深度）。
             n.collapsed = it.Bool("collapsed", false);
@@ -4679,6 +4876,133 @@ class ChartOption {
             if (idx >= 0 && idx < gnames.Count) { return gnames[idx]; }
         }
         return "";
+    }
+
+    /// N3：levels[] 逐级样式解析（TreemapSeriesLevelOption /
+    /// SunburstLevelOption：color/colorSaturation/colorMappingBy/
+    /// itemStyle{borderWidth,gapWidth,borderColor,borderColorSaturation}/
+    /// upperLabel/label.rotate/r0/r）。
+    /// "15%" / "12.5%" → 千分值 150 / 125（非 % 结尾或非数字返回
+    /// -1）。sunburst levels r0/r 的百分比半径用（官方 parsePercent
+    /// 对 size/2，绘制期折算）。
+    static int PercentPerMille(string s) {
+        if (s == null || !s.EndsWith("%")) { return 0 - 1; }
+        string num = s.Substring(0, s.Length - 1);
+        int i = 0;
+        bool neg = false;
+        if (i < num.Length && (num[i] == '+' || num[i] == '-')) {
+            neg = num[i] == '-';
+            i = i + 1;
+        }
+        long whole = 0;
+        long frac = 0;
+        int fracDigits = 0;
+        bool dot = false;
+        bool any = false;
+        for (; i < num.Length; i = i + 1) {
+            char ch = num[i];
+            if (ch == '.') {
+                if (dot) { return 0 - 1; }
+                dot = true;
+                continue;
+            }
+            if (ch < '0' || ch > '9') { return 0 - 1; }
+            any = true;
+            if (!dot) {
+                whole = whole * 10 + (ch - '0');
+                if (whole > 1000000) { return 0 - 1; }
+            } else {
+                if (fracDigits < 3) {
+                    frac = frac * 10 + (ch - '0');
+                    fracDigits = fracDigits + 1;
+                }
+            }
+        }
+        if (!any) { return 0 - 1; }
+        while (fracDigits < 3) { frac = frac * 10; fracDigits = fracDigits + 1; }
+        long perMille = whole * 10 + frac / 100;
+        if (neg) { perMille = 0 - perMille; }
+        return (int)perMille;
+    }
+
+    static void ParseLevels(JsonValue v, List<ChartLevel> into) {
+        if (v == null || !v.IsArray()) { return; }
+        for (int i = 0; i < v.Count(); i = i + 1) {
+            JsonValue it = v.At(i);
+            if (!it.IsObject()) { continue; }
+            ChartLevel lv = ChartLevel.Of();
+            JsonValue col = it.Get("color");
+            if (col != null && col.IsArray() && col.Count() > 0) {
+                lv.color = new List<int>();
+                for (int k = 0; k < col.Count(); k = k + 1) {
+                    lv.color.Add(ChartOption.ParseColor(col.At(k), 0));
+                }
+            }
+            JsonValue csat = it.Get("colorSaturation");
+            if (csat != null && csat.IsArray() && csat.Count() >= 2) {
+                lv.hasColorSat = 1;
+                lv.satLo = (int)(csat.At(0).AsDouble(0) * 1000);
+                lv.satHi = (int)(csat.At(1).AsDouble(0) * 1000);
+            }
+            string cmb = it.Str("colorMappingBy", "");
+            if (cmb == "value") { lv.colorMappingBy = 1; }
+            else if (cmb == "id") { lv.colorMappingBy = 2; }
+            JsonValue isv = it.Get("itemStyle");
+            if (isv != null && isv.IsObject()) {
+                if (isv.Has("borderWidth")) { lv.borderWidth = isv.Int("borderWidth", 0); }
+                if (isv.Has("gapWidth")) { lv.gapWidth = isv.Int("gapWidth", 0); }
+                lv.borderColor = ChartOption.ParseColor(isv.Get("borderColor"), 0);
+                // 级单色（sunburst-label-rotate 的级环纯色）。
+                lv.colorOne = ChartOption.ParseColor(isv.Get("color"), 0);
+                JsonValue bcs = isv.Get("borderColorSaturation");
+                if (bcs != null && bcs.IsNumber()) {
+                    lv.borderColorSat = (int)(bcs.AsDouble(0) * 1000);
+                }
+            }
+            JsonValue ul = it.Get("upperLabel");
+            if (ul != null && ul.IsObject()) {
+                lv.upperShow = ul.Bool("show", false) ? 1 : 0;
+                if (ul.Has("height")) { lv.upperHeight = ul.Int("height", 20); }
+            }
+            JsonValue lbl = it.Get("label");
+            if (lbl != null && lbl.IsObject()) {
+                JsonValue rot = lbl.Get("rotate");
+                if (rot != null && rot.IsString()) {
+                    string rs = rot.AsString("");
+                    if (rs == "radial") { lv.labelMode = 1; }
+                    else if (rs == "tangential") { lv.labelMode = 2; }
+                } else if (rot != null) {
+                    lv.labelMode = 3;
+                    lv.labelRotate = rot.AsInt(0);
+                }
+                lv.labelColor = ChartOption.ParseColor(lbl.Get("color"), 0);
+            }
+            // r0/r：数字 = px，字符串 = 百分比（官方 parsePercent 对
+            // size/2，绘制时按 rMax 折算）。字段落两套，避免歧义。
+            JsonValue r0v = it.Get("r0");
+            if (r0v != null) {
+                if (r0v.IsNumber()) {
+                    lv.r0 = r0v.AsInt(0 - 1);
+                } else if (r0v.IsString()) {
+                    string rs0 = r0v.AsString("");
+                    if (rs0.EndsWith("%")) {
+                        lv.r0Pct = ChartOption.PercentPerMille(rs0);
+                    }
+                }
+            }
+            JsonValue rvv = it.Get("r");
+            if (rvv != null) {
+                if (rvv.IsNumber()) {
+                    lv.r = rvv.AsInt(0 - 1);
+                } else if (rvv.IsString()) {
+                    string rs1 = rvv.AsString("");
+                    if (rs1.EndsWith("%")) {
+                        lv.rPct = ChartOption.PercentPerMille(rs1);
+                    }
+                }
+            }
+            into.Add(lv);
+        }
     }
 
     /// 解析蜡烛数据：[open,high,low,close] 数组或同名键对象。
@@ -6498,6 +6822,51 @@ class ChartOption {
                 ChartOption.ParseRegions(s.Get("regions"), cs.regions);
                 // 层级数据（tree/treemap/sunburst 的 children 递归）。
                 ChartOption.ParseTree(s.Get("data"), cs.tree);
+                // ---- N3：levels 分级样式 + treemap 布局/视觉键 ----
+                ChartOption.ParseLevels(s.Get("levels"), cs.levels);
+                if (s.Has("visibleMin")) { cs.visibleMin = s.Int("visibleMin", 10); }
+                if (s.Has("leafDepth")) { cs.leafDepth = s.Int("leafDepth", 0 - 1); }
+                if (s.Has("visualDimension")) { cs.visualDimension = s.Int("visualDimension", 0); }
+                if (s.Has("visualMin")) { cs.visualMin = s.Int("visualMin", 0 - 1); }
+                if (s.Has("visualMax")) { cs.visualMax = s.Int("visualMax", 0 - 1); }
+                JsonValue tmIS = s.Get("itemStyle");
+                if (tmIS != null && tmIS.IsObject()) {
+                    if (tmIS.Has("borderWidth")) { cs.tmBorderWidth = tmIS.Int("borderWidth", 0); }
+                    if (tmIS.Has("gapWidth")) { cs.tmGapWidth = tmIS.Int("gapWidth", 0); }
+                    cs.tmBorderColor = ChartOption.ParseColor(tmIS.Get("borderColor"), 0);
+                    JsonValue tbcs = tmIS.Get("borderColorSaturation");
+                    if (tbcs != null && tbcs.IsNumber()) {
+                        cs.tmBorderColorSat = (int)(tbcs.AsDouble(0) * 1000);
+                    }
+                    JsonValue tcsat = tmIS.Get("colorSaturation");
+                    if (tcsat != null && tcsat.IsArray() && tcsat.Count() >= 2) {
+                        cs.tmHasColorSat = 1;
+                        cs.tmSatLo = (int)(tcsat.At(0).AsDouble(0) * 1000);
+                        cs.tmSatHi = (int)(tcsat.At(1).AsDouble(0) * 1000);
+                    }
+                    // sunburst 系级扇区纯色覆盖（sunburst-monochrome #ddd）。
+                    cs.sunItemColor = ChartOption.ParseColor(tmIS.Get("color"), 0);
+                }
+                JsonValue tmUL = s.Get("upperLabel");
+                if (tmUL != null && tmUL.IsObject()) {
+                    cs.tmUpperShow = tmUL.Bool("show", false) ? 1 : 0;
+                    if (tmUL.Has("height")) { cs.tmUpperHeight = tmUL.Int("height", 20); }
+                }
+                // sunburst 系级 label.rotate（radial/tangential/角度）与
+                // label.color（sunburst-book "#2E2733"）。
+                JsonValue sbLbl = s.Get("label");
+                if (sbLbl != null && sbLbl.IsObject()) {
+                    JsonValue sbRot = sbLbl.Get("rotate");
+                    if (sbRot != null && sbRot.IsString()) {
+                        string sbRs = sbRot.AsString("");
+                        if (sbRs == "radial") { cs.sunLabelMode = 1; }
+                        else if (sbRs == "tangential") { cs.sunLabelMode = 2; }
+                    } else if (sbRot != null) {
+                        cs.sunLabelMode = 3;
+                        cs.sunLabelRotate = sbRot.AsInt(0);
+                    }
+                    cs.sunLabelColor = ChartOption.ParseColor(sbLbl.Get("color"), 0);
+                }
                 ChartOption.ParseMarks(s.Get("markPoint"), cs.marks);
                 // series 级 markPoint.label（对象形态）：模板 + 富文本/
                 // 盒样式 + 位置/距离；symbolSize 声明后 mark 点画小点

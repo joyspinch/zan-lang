@@ -107,6 +107,58 @@ class SankeyNodeLayout {
     }
 }
 
+/// treemap squarify 布局矩形：绘制与命中共用同一份几何。
+class TmRect {
+    ChartNode node;
+    int depth;
+    int x;
+    int y;
+    int w;
+    int h;
+
+    static TmRect Of(ChartNode node, int depth, int x, int y, int w, int h) {
+        TmRect r = new TmRect();
+        r.node = node;
+        r.depth = depth;
+        r.x = x;
+        r.y = y;
+        r.w = w;
+        r.h = h;
+        return r;
+    }
+}
+
+/// TmPosition 里随行落位而收缩的剩余内容矩形（Zan 无 ref 参数，
+/// 用对象引用让调用方看到推进）。
+class TmBox {
+    double x;
+    double y;
+    double w;
+    double h;
+}
+
+/// 某深度合并后的 treemap 样式（levels[depth] → 系级 tm* → 官方缺省），
+/// px 值已过 app.Scale。
+class TmStyle {
+    int borderWidth;
+    int gapWidth;
+    int borderColor;
+    int borderColorSat;   // -1 未声明；声明后 borderColor 失效
+    int hasColorSat;      // colorSaturation [lo,hi]（千分值域）
+    int satLo;
+    int satHi;
+    int upperShow;
+    int upperHeight;      // max(borderWidth, show ? height : 0)
+    List<int> color;      // 级 color 数组（null → 继承父级 designated）
+    int colorMappingBy;   // 0 index | 1 value | 2 id
+}
+
+/// sunburst 深度 d 的环带 [rStart, rEnd]。
+class SunBand {
+    int rStart;
+    int rEnd;
+}
+
 partial class ChartView {
     /// 节点安全名（null → ""）。
     static string TreeNodeName(ChartNode n) {
@@ -156,19 +208,22 @@ partial class ChartView {
         return left + right;
     }
 
-    /// 矩形树图（treemap）绘制入口：面积按 TreemapValue 分配，
-    /// 交替方向递归切片；支持 hover tooltip 与 Node 点击事件。
-    /// `g` 为出现动画进度（千分值 0..1000）。
+    /// 矩形树图（treemap）绘制入口。官方契约（源对抄
+    /// echarts-master/src/chart/treemap/）：getInitialData 恒把 data
+    /// 包进虚拟根 {name, children: data}，故 lead.tree 条目是深度 1、
+    /// levels[min(depth, len-1)] 与官方 node.depth 对齐；布局是 d3
+    /// squarify（treemapLayout.ts 源对抄）；父格底 = borderColor，
+    /// 叶格填充 = designated 色（color 数组 index/id/value 映射 +
+    /// colorSaturation 线性域）。sort:true → orderBy null → 不排序、
+    /// visibleMin 不生效（官方 filterByThreshold 前置条件），语料
+    /// 数据已按序给出。`g` 为出现动画进度（千分值 0..1000）。
     static void DrawTreemap(App app, int x, int y, int w, int h,
                             ChartOption o, int g) {
         Canvas c = app.canvas;
-        Theme t = app.theme;
         ChartSeries lead = ChartView.LeadSeries(o);
         if (lead == null || lead.tree == null || lead.tree.Count < 1) { return; }
-        ChartNode root = lead.tree[0];
-        if (root == null) { return; }
         int plotTop = ChartView.PanelHead(app, x, y, w, h, o.title);
-        int pad = t.paddingMedium;
+        int pad = app.theme.paddingMedium;
         int areaX = x + pad;
         int areaY = plotTop;
         int areaW = w - pad * 2;
@@ -182,47 +237,44 @@ partial class ChartView {
         areaH = gh;
         if (areaW < app.Scale(4) || areaH < app.Scale(4)) { return; }
 
-        int rootValue = ChartView.TreemapValue(root);
-        int rootKids = root.children == null ? 0 : root.children.Count;
-        if (rootKids == 0) {
-            if (rootValue > 0) {
-                c.FillRoundRect(areaX, areaY, areaW, areaH,
-                    ChartView.TreemapCornerRadius(0, app.Scale(1)), Chart.Palette(t, 0));
-                ChartView.TreemapCell(app, areaX, areaY, areaW, areaH,
-                    ChartView.TreeNodeName(root), Convert.ToString(rootValue));
-            }
-        } else {
-            ChartView.TreemapSlice(app, areaX, areaY, areaW, areaH, root.children, 0);
-        }
+        // 虚拟根（深度 0）底色 = 深度 0 borderColor（官方 renderBackground）。
+        TmStyle st0 = ChartView.TmStyleOf(app, lead, 0);
+        c.FillRect(areaX, areaY, areaW, areaH, st0.borderColor);
 
+        List<TmRect> rects = new List<TmRect>();
+        Dict<string, int> idmap = new Dict<string, int>();
+        ChartView.TmBuildIdMap(lead.tree, idmap, 0);
+        ChartView.TmLayoutPaint(app, lead, null, lead.tree, 0,
+            areaX, areaY, areaW, areaH, 0, 0 - 1, rects, idmap);
+
+        // 命中：同一份几何，倒序取最内格（子格盖在父格上，间隙归父格）。
         int mx = app.mouseX;
         int my = app.mouseY;
         ChartView.ttName = "";
         ChartView.ttVal = 0;
         ChartView.ttNode = null;
-        int rootRadius = ChartView.TreemapCornerRadius(0, app.Scale(1));
-        if (ChartView.TreemapContains(mx, my, areaX, areaY,
-                areaW, areaH, rootRadius)) {
-            if (rootKids == 0) {
-                if (rootValue > 0) {
-                    ChartView.ttNode = root;
-                    ChartView.ttName = ChartView.TreeNodeName(root);
-                    ChartView.ttVal = rootValue;
+        if (ChartView.TreemapContains(mx, my, areaX, areaY, areaW, areaH, 0)) {
+            for (int i = rects.Count - 1; i >= 0; i = i - 1) {
+                TmRect rc = rects[i];
+                if (rc.node == null) { continue; }
+                if (!ChartView.TreemapContains(mx, my, rc.x, rc.y, rc.w, rc.h, 0)) {
+                    continue;
                 }
-                ChartView.ttX = areaX;
-                ChartView.ttY = areaY;
-                ChartView.ttW = areaW;
-                ChartView.ttH = areaH;
-                ChartView.ttRadius = rootRadius;
-            } else {
-                ChartView.TreemapHit(app, areaX, areaY, areaW, areaH,
-                    root.children, 0, mx, my);
+                ChartView.ttNode = rc.node;
+                ChartView.ttName = ChartView.TreeNodeName(rc.node);
+                ChartView.ttVal = ChartView.TreemapValue(rc.node);
+                ChartView.ttX = rc.x;
+                ChartView.ttY = rc.y;
+                ChartView.ttW = rc.w;
+                ChartView.ttH = rc.h;
+                ChartView.ttRadius = 0;
+                break;
             }
             if (ChartView.ttNode != null
                 && ChartView.activeEventView != null) {
                 ChartHit th = ChartHit.Of(ChartElementType.Node,
                     ChartView.SeriesIndexOf(o, lead), lead.name,
-                    ChartView.TreeNodeIndex(root, ChartView.ttNode),
+                    ChartView.TmNodeIndex(lead.tree, ChartView.ttNode),
                     ChartView.ttName, ChartView.ttVal, mx, my);
                 th.axisIndex = lead.axisIndex;
                 ChartView.OfferActiveHit(th);
@@ -241,69 +293,494 @@ partial class ChartView {
         }
     }
 
-    /// 一层分割；单元格足够大时递归进子节点，
-    /// 否则以名称 + 值标记该单元格。偶数层竖切、奇数层横切。
-    static void TreemapSlice(App app, int x, int y, int w, int h,
-                             List<ChartNode> nodes, int depth) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        int total = ChartView.TreemapTotal(nodes);
-        if (total < 1) { return; }
-        bool vert = (depth % 2) == 0;
-        int acc = 0;
-        for (int j = 0; j < nodes.Count; j = j + 1) {
-            ChartNode nd = nodes[j];
-            if (nd == null) { continue; }
-            int v = ChartView.TreemapValue(nd);
-            int cell = vert
-                ? ChartView.TreemapSliceSize(h, acc, v, total)
-                : ChartView.TreemapSliceSize(w, acc, v, total);
-            int start = vert
-                ? ChartView.TreemapSliceStart(h, acc, total)
-                : ChartView.TreemapSliceStart(w, acc, total);
-            int cx = x;
-            int cy = y;
-            int cw = w;
-            int ch = h;
-            if (vert) { ch = cell; cy = y + start; }
-            else { cw = cell; cx = x + start; }
-            acc = ChartView.TreemapAdd(acc, v);
+    /// 官方 mapIdToIndex：全树 preorder 下标（id → 首个命中），
+    /// colorMappingBy 'id' 的取值通道；无 id 的节点只占号不建键。
+    static int TmBuildIdMap(List<ChartNode> nodes, Dict<string, int> into, int next) {
+        if (nodes == null) { return next; }
+        for (int i = 0; i < nodes.Count; i = i + 1) {
+            ChartNode n = nodes[i];
+            if (n == null) { continue; }
+            if (n.id != null && n.id.Length > 0 && !into.ContainsKey(n.id)) {
+                into.Add(n.id, next);
+            }
+            next = next + 1;
+            next = ChartView.TmBuildIdMap(n.children, into, next);
+        }
+        return next;
+    }
 
-            if (v < 1) { continue; }
-            int col = Chart.Palette(t, j);
-            int panelBg = Style.Full(app, "chart", "", "", Style.SNormal()).BgOr(0);
-            if (depth > 0) { col = App.LerpColor(col, panelBg, depth * 130); }
-            int rr = ChartView.TreemapCornerRadius(depth, app.Scale(1));
-            if (cw > app.Scale(2) && ch > app.Scale(2)) {
-                c.FillRoundRect(cx, cy, cw, ch, rr, col);
-                c.DrawRoundRect(cx, cy, cw, ch, rr, panelBg, app.Scale(1));
+    /// 虚拟根语义的全树 preorder 下标（命中事件 dataIndex）。
+    static int TmNodeIndex(List<ChartNode> nodes, ChartNode target) {
+        if (nodes == null || target == null) { return 0 - 1; }
+        int offset = 0;
+        for (int i = 0; i < nodes.Count; i = i + 1) {
+            if (nodes[i] == target) { return offset; }
+            int sub = ChartView.TreeNodeIndex(nodes[i], target);
+            if (sub >= 0) { return offset + sub; }
+            offset = offset + ChartView.TreeNodeCount(nodes[i]);
+        }
+        return 0 - 1;
+    }
+
+    /// levels[min(depth, levels.Count-1)]；无 levels 返回 null。
+    static ChartLevel TmLevel(ChartSeries s, int depth) {
+        if (s == null || s.levels == null || s.levels.Count < 1) { return null; }
+        if (depth < 0) { depth = 0; }
+        if (depth >= s.levels.Count) { depth = s.levels.Count - 1; }
+        return s.levels[depth];
+    }
+
+    /// 全系任一 level 声明过 color 数组（setDefault 注入判定用）。
+    static bool TmAnyLevelColor(ChartSeries s) {
+        if (s.levels == null) { return false; }
+        for (int i = 0; i < s.levels.Count; i = i + 1) {
+            if (s.levels[i] != null && s.levels[i].color != null
+                && s.levels[i].color.Count > 0) { return true; }
+        }
+        return false;
+    }
+
+    /// 深度样式合并（官方 node item → levels[depth] → series → 缺省，
+    /// px 过 Scale）。color 决议：级色声明优先；否则在 setDefault
+    /// 「级0 无级色时注入全局调色板」语义下，深度 0（或 levels 全空
+    /// 的钳位路径）用主题调色板；更深无声明 → null（继承父级）。
+    static TmStyle TmStyleOf(App app, ChartSeries s, int depth) {
+        ChartLevel lv = ChartView.TmLevel(s, depth);
+        TmStyle st = new TmStyle();
+        int sc = app.Scale(1);
+        if (lv != null && lv.borderWidth >= 0) { st.borderWidth = lv.borderWidth * sc; }
+        else if (s.tmBorderWidth >= 0) { st.borderWidth = s.tmBorderWidth * sc; }
+        else { st.borderWidth = 0; }
+        if (lv != null && lv.gapWidth >= 0) { st.gapWidth = lv.gapWidth * sc; }
+        else if (s.tmGapWidth >= 0) { st.gapWidth = s.tmGapWidth * sc; }
+        else { st.gapWidth = 0; }
+        if (lv != null && lv.borderColor != 0) { st.borderColor = lv.borderColor; }
+        else if (s.tmBorderColor != 0) { st.borderColor = s.tmBorderColor; }
+        else { st.borderColor = 4294967295; }
+        if (lv != null && lv.borderColorSat >= 0) { st.borderColorSat = lv.borderColorSat; }
+        else { st.borderColorSat = s.tmBorderColorSat; }
+        if (lv != null && lv.hasColorSat == 1) {
+            st.hasColorSat = 1;
+            st.satLo = lv.satLo;
+            st.satHi = lv.satHi;
+        } else {
+            st.hasColorSat = s.tmHasColorSat;
+            st.satLo = s.tmSatLo;
+            st.satHi = s.tmSatHi;
+        }
+        if (lv != null && lv.upperShow >= 0) { st.upperShow = lv.upperShow; }
+        else if (s.tmUpperShow >= 0) { st.upperShow = s.tmUpperShow; }
+        else { st.upperShow = 0; }
+        int uhRaw = 20;
+        if (lv != null && lv.upperHeight >= 0) { uhRaw = lv.upperHeight; }
+        else if (s.tmUpperHeight >= 0) { uhRaw = s.tmUpperHeight; }
+        int uh = st.upperShow == 1 ? app.Scale(uhRaw) : 0;
+        st.upperHeight = st.borderWidth > uh ? st.borderWidth : uh;
+        if (lv != null && lv.color != null && lv.color.Count > 0) {
+            st.color = lv.color;
+        } else if (s.levels.Count < 1
+            || (depth == 0 && !ChartView.TmAnyLevelColor(s))) {
+            st.color = new List<int>();
+            for (int pi = 0; pi < 9; pi = pi + 1) {
+                st.color.Add(Chart.Palette(app.theme, pi));
             }
-            int kids = nd.children == null ? 0 : nd.children.Count;
-            if (kids > 0 && cw > app.Scale(34) && ch > app.Scale(26)) {
-                int inset = app.Scale(3);
-                ChartView.TreemapSlice(app, cx + inset, cy + inset,
-                    cw - inset * 2, ch - inset * 2, nd.children, depth + 1);
+        }
+        st.colorMappingBy = lv != null ? lv.colorMappingBy : 0;
+        return st;
+    }
+
+    /// 官方 squareRatio：0.5 × (1 + √5)。
+    static double TmSquareRatio() {
+        return 1.618033988749895;
+    }
+
+    /// double 域 min（squarify 固定长边判定用；DAbs 在
+    /// ChartPolarBarLayout 已有）。
+    static double DMin(double a, double b) {
+        return a < b ? a : b;
+    }
+
+    /// 布局/视觉取值：dim 0 = 子树累计（同官方 getValue()），
+    /// dim > 0 = 多维 value 对应维原始值（treemap-visual 维 3）。
+    static double TmNodeValue(ChartNode n, int dim) {
+        if (n == null) { return 0; }
+        if (dim > 0 && n.vals != null && dim < n.vals.Count) { return n.vals[dim]; }
+        return ChartView.TreemapValue(n);
+    }
+
+    /// 官方 worst()：行的最坏纵横比（d3 squarified）。areaMin 走
+    /// IEEE 无穷语义（全 0 行 → b 项为 0，与官方一致）。
+    static double TmWorst(double rowArea, double areaMax, double areaMin,
+                          double side, double ratio) {
+        if (rowArea <= 0) { return 1.7976931348623157e308; }
+        double squareArea = rowArea * rowArea;
+        double f = side * side * ratio;
+        double a = f * areaMax / squareArea;
+        double b = squareArea / (f * areaMin);
+        return a > b ? a : b;
+    }
+
+    static double TmRowArea(List<int> row, List<double> areas) {
+        double sum = 0;
+        for (int i = 0; i < row.Count; i = i + 1) { sum = sum + areas[row[i]]; }
+        return sum;
+    }
+
+    static double TmRowMax(List<int> row, List<double> areas) {
+        double mx = 0;
+        for (int i = 0; i < row.Count; i = i + 1) {
+            double a = areas[row[i]];
+            if (a > mx) { mx = a; }
+        }
+        return mx;
+    }
+
+    static double TmRowMin(List<int> row, List<double> areas) {
+        double mn = 1.7976931348623157e308;
+        for (int i = 0; i < row.Count; i = i + 1) {
+            double a = areas[row[i]];
+            if (a > 0 && a < mn) { mn = a; }
+        }
+        return mn;
+    }
+
+    /// 官方 position()：一行沿剩余矩形短边（固定长 side）铺开，
+    /// 行厚从剩余矩形上切走；子矩形产出 TmRect（floor 到整数像素），
+    /// 深度 = depth（子级）。halfGap 缝隙由 min(halfGap, wh/2) 内缩。
+    static void TmPosition(TmBox rect, List<int> row, List<double> areas,
+                           double side, double halfGap, bool flush,
+                           int depth, List<TmRect> rects) {
+        double rowArea = 0;
+        for (int i = 0; i < row.Count; i = i + 1) { rowArea = rowArea + areas[row[i]]; }
+        bool horiz = side == rect.w;
+        double last = horiz ? rect.x : rect.y;
+        double other = side > 0 ? rowArea / side : 0;
+        double otherLimit = horiz ? rect.h : rect.w;
+        if (flush || other > otherLimit) { other = otherLimit; }
+        for (int i = 0; i < row.Count; i = i + 1) {
+            double step = other > 0 ? areas[row[i]] / other : 0;
+            double remain = (horiz ? rect.x + rect.w : rect.y + rect.h) - last;
+            double modWH = (i == row.Count - 1 || remain < step) ? remain : step;
+            double wh0 = modWH - halfGap * 2;
+            if (wh0 < 0) { wh0 = 0; }
+            double wh1 = other - halfGap * 2;
+            if (wh1 < 0) { wh1 = 0; }
+            int nx;
+            int ny;
+            int nw;
+            int nh;
+            if (horiz) {
+                nx = (int)(last + ChartView.DMin(halfGap, wh0 / 2));
+                ny = (int)(rect.y + ChartView.DMin(halfGap, wh1 / 2));
+                nw = (int)wh0;
+                nh = (int)wh1;
             } else {
-                ChartView.TreemapCell(app, cx, cy, cw, ch,
-                    ChartView.TreeNodeName(nd), Convert.ToString(v));
+                nx = (int)(rect.x + ChartView.DMin(halfGap, wh0 / 2));
+                ny = (int)(last + ChartView.DMin(halfGap, wh1 / 2));
+                nw = (int)wh1;
+                nh = (int)wh0;
             }
+            rects.Add(TmRect.Of(null, depth, nx, ny, nw, nh));
+            last = last + modWH;
+        }
+        if (horiz) {
+            rect.y = rect.y + other;
+            rect.h = rect.h - other;
+        } else {
+            rect.x = rect.x + other;
+            rect.w = rect.w - other;
         }
     }
 
-    /// 矩形树图单元格内的名称（+ 值）标签，仅放得下时绘制，
-    /// 并用单元格矩形裁剪，避免长名称画出格子。
-    static void TreemapCell(App app, int x, int y, int w, int h, string name, string val) {
+    /// 官方 dataExtent 拓宽（visualMin/visualMax）后的线性千分比
+    ///（VisualMapping linear 的归一域）。
+    static int TmValueT(ChartSeries s, double lo, double hi, double v) {
+        if (s.visualMin != 0 - 1 && s.visualMin < lo) { lo = s.visualMin; }
+        if (s.visualMax != 0 - 1 && s.visualMax > hi) { hi = s.visualMax; }
+        if (hi <= lo) { return 0; }
+        double tt = (v - lo) / (hi - lo);
+        if (tt < 0) { tt = 0; }
+        if (tt > 1) { tt = 1; }
+        return (int)(tt * 1000.0 + 0.5);
+    }
+
+    static int TmLerp(int lo, int hi, int tPerMille) {
+        return lo + (hi - lo) * tPerMille / 1000;
+    }
+
+    /// zrender modifyHSL 的饱和度通道：ARGB 的 S 置为 sat（千分值
+    /// 0..1000），H/L 不变；灰阶（max==min）原样返回。
+    static int RgbSat(int color, int satPerMille) {
+        int r = (color >> 16) & 255;
+        int g = (color >> 8) & 255;
+        int b = color & 255;
+        double rf = r / 255.0;
+        double gf = g / 255.0;
+        double bf = b / 255.0;
+        double mx = rf;
+        if (gf > mx) { mx = gf; }
+        if (bf > mx) { mx = bf; }
+        double mn = rf;
+        if (gf < mn) { mn = gf; }
+        if (bf < mn) { mn = bf; }
+        if (mx - mn < 0.000001) { return color; }
+        double l = (mx + mn) / 2.0;
+        double h;
+        if (mx == rf) {
+            h = (gf - bf) / (mx - mn);
+        } else if (mx == gf) {
+            h = 2.0 + (bf - rf) / (mx - mn);
+        } else {
+            h = 4.0 + (rf - gf) / (mx - mn);
+        }
+        h = h / 6.0;
+        if (h < 0) { h = h + 1.0; }
+        double s = satPerMille / 1000.0;
+        if (s < 0) { s = 0; }
+        if (s > 1) { s = 1; }
+        double c2 = (1.0 - ChartView.DAbs(2.0 * l - 1.0)) * s;
+        double hp = h * 6.0;
+        double frac = hp - 2.0 * (int)(hp / 2.0);
+        double x = c2 * (1.0 - ChartView.DAbs(frac - 1.0));
+        double rr = 0;
+        double gg = 0;
+        double bb = 0;
+        int sector = (int)hp;
+        if (sector > 5) { sector = 5; }
+        if (sector == 0) { rr = c2; gg = x; }
+        else if (sector == 1) { rr = x; gg = c2; }
+        else if (sector == 2) { gg = c2; bb = x; }
+        else if (sector == 3) { gg = x; bb = c2; }
+        else if (sector == 4) { rr = x; bb = c2; }
+        else { rr = c2; bb = x; }
+        double m = l - c2 / 2.0;
+        int ri = (int)((rr + m) * 255.0 + 0.5);
+        int gi = (int)((gg + m) * 255.0 + 0.5);
+        int bi = (int)((bb + m) * 255.0 + 0.5);
+        if (ri < 0) { ri = 0; }
+        if (ri > 255) { ri = 255; }
+        if (gi < 0) { gi = 0; }
+        if (gi > 255) { gi = 255; }
+        if (bi < 0) { bi = 0; }
+        if (bi > 255) { bi = 255; }
+        return (0 - 16777216) + (ri << 16) + (gi << 8) + bi;
+    }
+
+    /// 多档渐变取色：stops 均匀分段，t 千分值 0..1000，段内
+    /// App.LerpColor 插值（VisualMapping linear × color 数组）。
+    static int PaletteLerp(List<int> stops, int tPerMille) {
+        if (stops == null || stops.Count < 1) { return 0; }
+        if (stops.Count == 1) { return stops[0]; }
+        int t = tPerMille;
+        if (t < 0) { t = 0; }
+        if (t > 1000) { t = 1000; }
+        long seg = (long)t * (stops.Count - 1);
+        int idx = (int)(seg / 1000);
+        int frac = (int)(seg % 1000);
+        if (idx >= stops.Count - 1) { return stops[stops.Count - 1]; }
+        return App.LerpColor(stops[idx], stops[idx + 1], frac);
+    }
+
+    /// 父格上带标签（官方 upperLabel 几何 {x+borderWidth, y,
+    /// w-2·borderWidth, upperHeight}，白字，放不下裁剪）。
+    static void TmUpperLabel(App app, int x, int y, int w, int hgt, string name) {
+        if (name == null || name.Length < 1) { return; }
         Canvas c = app.canvas;
         int fs = ChartFonts.SeriesLabel(app);
         int fh = Canvas.FontHeight(fs);
+        if (hgt < fh || w < app.Scale(8)) { return; }
+        c.PushClip(x, y, w, hgt);
+        ChartView.DrawTextClamped(c, x + app.Scale(3), y + (hgt - fh) / 2,
+            name, 4294967295, fs, x, y, w, hgt);
+        c.PopClip();
+    }
+
+    /// 布局 + 绘制一体递归（官方 squarify 行循环 + treemapVisual 的
+    /// designated 视觉传播）：每层先画父格底/上带，再 squarify 铺子格、
+    /// 按级映射子色并递归；叶子填充 + 描边 + 标签。rects 收集全部格子
+    /// （父先子后，倒序即命中序）。self = 当前节点（虚拟根传 null），
+    /// nodes = 其子列表（虚拟根传 lead.tree）。
+    static void TmLayoutPaint(App app, ChartSeries s, ChartNode self,
+                              List<ChartNode> nodes, int depth,
+                              int rx, int ry, int rw, int rh,
+                              int desigColor, int desigSat,
+                              List<TmRect> rects, Dict<string, int> idmap) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        TmStyle st = ChartView.TmStyleOf(app, s, depth);
+        int color = self != null && self.color != 0 ? self.color : desigColor;
+        int kids = nodes == null ? 0 : nodes.Count;
+        bool overLeaf = s.leafDepth >= 0 && s.leafDepth <= depth;
+        if (self != null && (kids < 1 || overLeaf)) {
+            // ---- 叶格（或 leafDepth 截断的叶根）：designated 色 ----
+            if (color == 0) { color = Chart.Palette(t, 0); }
+            int fill = color;
+            if (desigSat >= 0) { fill = ChartView.RgbSat(fill, desigSat); }
+            int stroke = st.borderColor;
+            if (st.borderColorSat >= 0) {
+                stroke = ChartView.RgbSat(fill, st.borderColorSat);
+            }
+            if (rw > 0 && rh > 0) {
+                c.FillRect(rx, ry, rw, rh, fill);
+                if (st.borderWidth > 0 && rw > st.borderWidth * 2
+                    && rh > st.borderWidth * 2) {
+                    c.DrawRect(rx, ry, rw, rh, stroke, st.borderWidth);
+                }
+                ChartView.TreemapCell(app, rx, ry, rw, rh,
+                    ChartView.TreeNodeName(self));
+            }
+            rects.Add(TmRect.Of(self, depth, rx, ry, rw, rh));
+            return;
+        }
+        if (self != null && kids > 0) {
+            // ---- 父格：底 = borderColor；borderColorSat 声明时底色 =
+            // 自身色调饱和（官方 stroke 失效语义，bg 同源）----
+            int bg = st.borderColor;
+            if (st.borderColorSat >= 0) {
+                int pcol = color != 0 ? color : Chart.Palette(t, 0);
+                bg = ChartView.RgbSat(pcol, st.borderColorSat);
+            }
+            c.FillRect(rx, ry, rw, rh, bg);
+            if (st.upperShow == 1 && rh > st.upperHeight) {
+                ChartView.TmUpperLabel(app, rx, ry, rw, st.upperHeight,
+                    ChartView.TreeNodeName(self));
+            }
+            rects.Add(TmRect.Of(self, depth, rx, ry, rw, rh));
+        }
+        if (kids < 1) { return; }
+
+        // ---- 内容区 insets（官方：layoutOffset = borderWidth -
+        // halfGapWidth，layoutOffsetUpper = upperHeight - halfGapWidth）----
+        double halfGap = st.gapWidth / 2.0;
+        double lox = st.borderWidth - halfGap;
+        double loy = st.upperHeight - halfGap;
+        double cw = rw - lox * 2;
+        if (cw < 0) { cw = 0; }
+        double chh = rh - lox - loy;
+        if (chh < 0) { chh = 0; }
+        double totalArea = cw * chh;
+        if (totalArea < 1) { return; }
+
+        // ---- 子面积 = 子值 / 和 × 内容区面积（官方 initChildren：
+        // 面积恒取维 0 子树和，visualDimension 只喂颜色映射的
+        // dataExtent；double 域，obama 量级不溢出）----
+        int dim = s.visualDimension;
+        double sum = 0;
+        List<double> areas = new List<double>();
+        for (int i = 0; i < kids; i = i + 1) {
+            double v = ChartView.TreemapValue(nodes[i]);
+            if (v < 0) { v = 0; }
+            areas.Add(v);
+            sum = sum + v;
+        }
+        if (sum <= 0) { return; }
+        for (int i = 0; i < kids; i = i + 1) {
+            areas[i] = areas[i] / sum * totalArea;
+        }
+
+        // ---- 官方 squarify 行循环：worst 变差则整行落位 ----
+        TmBox box = new TmBox();
+        box.x = rx + lox;
+        box.y = ry + loy;
+        box.w = cw;
+        box.h = chh;
+        double side = ChartView.DMin(box.w, box.h);
+        double best = 1.7976931348623157e308;
+        double ratio = ChartView.TmSquareRatio();
+        List<int> row = new List<int>();
+        int base0 = rects.Count;
+        int i2 = 0;
+        while (i2 < kids) {
+            row.Add(i2);
+            double score = ChartView.TmWorst(ChartView.TmRowArea(row, areas),
+                ChartView.TmRowMax(row, areas), ChartView.TmRowMin(row, areas),
+                side, ratio);
+            if (score <= best) {
+                i2 = i2 + 1;
+                best = score;
+            } else {
+                row.RemoveAt(row.Count - 1);
+                ChartView.TmPosition(box, row, areas, side, halfGap, false,
+                    depth + 1, rects);
+                side = ChartView.DMin(box.w, box.h);
+                row.Clear();
+                best = 1.7976931348623157e308;
+            }
+        }
+        if (row.Count > 0) {
+            ChartView.TmPosition(box, row, areas, side, halfGap, true,
+                depth + 1, rects);
+        }
+
+        // ---- 官方 statistic dataExtent（子级取值域，供映射归一）----
+        double extLo = 0;
+        double extHi = 0;
+        bool hasExt = false;
+        for (int i = 0; i < kids; i = i + 1) {
+            double v = ChartView.TmNodeValue(nodes[i], dim);
+            if (!hasExt) {
+                extLo = v;
+                extHi = v;
+                hasExt = true;
+                continue;
+            }
+            if (v < extLo) { extLo = v; }
+            if (v > extHi) { extHi = v; }
+        }
+
+        // ---- 官方 buildVisualMapping：color 数组 > (单色 ×
+        // colorSaturation 域)；映射不到则子级继承 designated ----
+        List<int> colorRange = st.color;
+        bool useSatRange = (colorRange == null || colorRange.Count < 1)
+            && st.hasColorSat == 1 && color != 0;
+        if (colorRange != null && colorRange.Count < 1) { colorRange = null; }
+
+        for (int i = 0; i < kids; i = i + 1) {
+            ChartNode child = nodes[i];
+            TmRect rc = rects[base0 + i];
+            rc.node = child;
+            int childColor = color;
+            int childSat = desigSat;
+            if (colorRange != null) {
+                if (st.colorMappingBy == 1) {
+                    // 'value'：线性域 × 多档渐变（treemap-visual）。
+                    childColor = ChartView.PaletteLerp(colorRange,
+                        ChartView.TmValueT(s, extLo, extHi,
+                            ChartView.TmNodeValue(child, dim)));
+                } else if (st.colorMappingBy == 2) {
+                    // 'id'：全树 preorder 号循环（obama）。
+                    int di = i;
+                    if (child.id != null && child.id.Length > 0) {
+                        int found = 0;
+                        if (idmap.TryGetValue(child.id, out found)) { di = found; }
+                    }
+                    childColor = colorRange[di % colorRange.Count];
+                } else {
+                    // 'index'：兄弟序号循环（官方缺省）。
+                    childColor = colorRange[i % colorRange.Count];
+                }
+            } else if (useSatRange) {
+                childSat = ChartView.TmLerp(st.satLo, st.satHi,
+                    ChartView.TmValueT(s, extLo, extHi,
+                        ChartView.TmNodeValue(child, dim)));
+            }
+            ChartView.TmLayoutPaint(app, s, child, child.children, depth + 1,
+                rc.x, rc.y, rc.w, rc.h, childColor, childSat, rects, idmap);
+        }
+    }
+
+    /// 矩形树图叶格名称标签（官方 label 缺省 {b} 白字
+    /// insideTopLeft），仅放得下时绘制，并用单元格矩形裁剪，
+    /// 避免长名称画出格子。
+    static void TreemapCell(App app, int x, int y, int w, int h, string name) {
+        Canvas c = app.canvas;
+        int fs = ChartFonts.SeriesLabel(app);
+        int fh = Canvas.FontHeight(fs);
+        if (name == null || name.Length < 1) { return; }
         if (w < app.Scale(20) || h < fh + app.Scale(4)) { return; }
         c.PushClip(x, y, w, h);
         ChartView.DrawTextClamped(c, x + app.Scale(3), y + app.Scale(2),
             name, 4294967295, fs, x, y, w, h);
-        if (h > fh * 2 + app.Scale(4) && val.Length > 0) {
-            ChartView.DrawTextClamped(c, x + app.Scale(3), y + app.Scale(2) + fh, val,
-                Chart.WithAlpha(4294967295, 200), fs, x, y, w, h);
-        }
         c.PopClip();
     }
 
@@ -336,13 +813,6 @@ partial class ChartView {
         int ringH = rMax / rings;
         if (ringH < 1) { ringH = 1; }
         return ringH;
-    }
-
-    /// 单元格圆角半径：外层格 4、内层格 2（乘 scale）。
-    static int TreemapCornerRadius(int depth, int scale) {
-        int rr = scale * 2;
-        if (depth == 0) { rr = scale * 4; }
-        return rr;
     }
 
     /// 子树节点总数（含根）。
@@ -409,80 +879,6 @@ partial class ChartView {
         return true;
     }
 
-    /// 按累计值计算像素边界；绘制和命中必须使用同一组边界，
-    /// 避免逐项 floor 后在最后一列/最后一行留下不可命中的空带。
-    static int TreemapSliceStart(int dimension, int prefix, int total) {
-        if (dimension < 1 || prefix < 0 || total < 1) { return 0; }
-        if (prefix > total) { prefix = total; }
-        return (int)((long)dimension * (long)prefix / (long)total);
-    }
-
-    /// 切片末端像素 = Start(prefix+value)，与 Start 同界。
-    static int TreemapSliceEnd(int dimension, int prefix, int value, int total) {
-        if (dimension < 1 || prefix < 0 || value < 0 || total < 1) { return 0; }
-        if (prefix > total) { prefix = total; }
-        long end = (long)prefix + (long)value;
-        if (end > (long)total) { end = (long)total; }
-        return (int)((long)dimension * end / (long)total);
-    }
-
-    /// 切片厚度 = End - Start（恒非负）。
-    static int TreemapSliceSize(int dimension, int prefix, int value, int total) {
-        int start = ChartView.TreemapSliceStart(dimension, prefix, total);
-        int end = ChartView.TreemapSliceEnd(dimension, prefix, value, total);
-        if (end < start) { return 0; }
-        return end - start;
-    }
-
-    /// 矩形树图命中测试：按 TreemapSlice 相同的切片布局遍历，
-    /// 仅当指针位于子单元格内（且深度足够
-    /// 被分割）时才递归。填充静态命中字段 ttName/ttVal。
-    static void TreemapHit(App app, int x, int y, int w, int h,
-                           List<ChartNode> nodes, int depth, int px, int py) {
-        int total = ChartView.TreemapTotal(nodes);
-        if (total < 1) { return; }
-        bool vert = (depth % 2) == 0;
-        int acc = 0;
-        for (int j = 0; j < nodes.Count; j = j + 1) {
-            ChartNode nd = nodes[j];
-            if (nd == null) { continue; }
-            int v = ChartView.TreemapValue(nd);
-            int cell = vert
-                ? ChartView.TreemapSliceSize(h, acc, v, total)
-                : ChartView.TreemapSliceSize(w, acc, v, total);
-            int start = vert
-                ? ChartView.TreemapSliceStart(h, acc, total)
-                : ChartView.TreemapSliceStart(w, acc, total);
-            int cx = x;
-            int cy = y;
-            int cw = w;
-            int ch = h;
-            if (vert) { ch = cell; cy = y + start; }
-            else { cw = cell; cx = x + start; }
-            acc = ChartView.TreemapAdd(acc, v);
-            int rr = ChartView.TreemapCornerRadius(depth, app.Scale(1));
-            if (ChartView.TreemapContains(px, py, cx, cy, cw, ch, rr)) {
-                // 先登记父格作为 fallback；若子格命中，递归会覆盖
-                // 这些字段。父格边框/gutter 因而不会变成无主空带。
-                ChartView.ttNode = nd;
-                ChartView.ttName = ChartView.TreeNodeName(nd);
-                ChartView.ttVal = v;
-                ChartView.ttX = cx;
-                ChartView.ttY = cy;
-                ChartView.ttW = cw;
-                ChartView.ttH = ch;
-                ChartView.ttRadius = rr;
-                int kids = nd.children == null ? 0 : nd.children.Count;
-                if (kids > 0 && cw > app.Scale(34) && ch > app.Scale(26)) {
-                    int inset = app.Scale(3);
-                    ChartView.TreemapHit(app, cx + inset, cy + inset,
-                        cw - inset * 2, ch - inset * 2, nd.children, depth + 1, px, py);
-                }
-                return;
-            }
-        }
-    }
-
     /// 旭日图可见扫掠末端：rawEnd 裁到 sweepMax（rawEnd < 0 = 完整圆）。
     static int SunburstVisibleEnd(int rawEnd, int sweepMax) {
         if (sweepMax < 0) { sweepMax = 0; }
@@ -492,24 +888,29 @@ partial class ChartView {
         return rawEnd;
     }
 
-    /// 旭日图环形命中测试：按 SunburstRing 相同的角扫掠遍历，
-    /// 指针位于子扇形内时递归。填充静态命中字段 ttName/ttVal
-    /// （角度命中不做半径早退，否则内环会挡住所有外环指针）。
-    static void SunburstHit(App app, int cx, int cy, int ringH, ChartNode node,
-                            int depth, int a0, int a1, int sweepMax,
-                            int px, int py) {
-        int total = node.Total();
+    /// 旭日图环形命中测试：按 SunRingList 相同的角扫掠 + 环带
+    /// 半径遍历，指针角度命中的组节点递归（不做半径早退，否则内
+    /// 环会挡住所有外环指针）；叶节点校验指针距离落在环带
+    /// [rStart, rEnd]。nodes 为深度 depth 的兄弟组（虚拟根语义，
+    /// lead.tree 条目 = 深度 1）。
+    static void SunburstHit(App app, ChartSeries s, int cx, int cy,
+                            int rMax, int rPer, List<ChartNode> nodes, int depth,
+                            int a0, int a1, int sweepMax, int px, int py) {
+        if (nodes == null || nodes.Count < 1) { return; }
+        int total = 0;
+        for (int i = 0; i < nodes.Count; i = i + 1) {
+            total = total + nodes[i].Total();
+        }
         if (total < 1) { return; }
-        int kids = node.children.Count;
-        if (kids == 0) { return; }
         int ddx = px - cx;
         int ddy = py - cy;
         int ang = ChartView.AngleOf(ddx, ddy);
         int a = a0;
         int visibleEnd = ChartView.SunburstVisibleEnd(a1, sweepMax);
         if (visibleEnd <= a0) { return; }
-        for (int i = 0; i < kids; i = i + 1) {
-            ChartNode k = node.children[i];
+        SunBand band = ChartView.SunBandOf(app, s, depth, rMax, rPer);
+        for (int i = 0; i < nodes.Count; i = i + 1) {
+            ChartNode k = nodes[i];
             int v = k.Total();
             int span = (a1 - a0) * v / total;
             int aEnd = a + span;
@@ -519,12 +920,12 @@ partial class ChartView {
                 if (k.children.Count > 0) {
                     // 组节点命中角度区间就递归：子叶所在的环带由
                     // 叶子命中处自行校验，这里不做半径早退——否则
-                    // root 的 [0,ringH) 带检查会挡住所有外环指针。
-                    ChartView.SunburstHit(app, cx, cy, ringH, k, depth + 1,
-                        a, aEnd, sweepMax, px, py);
+                    // 内环的角度检查会挡住所有外环指针。
+                    ChartView.SunburstHit(app, s, cx, cy, rMax, rPer, k.children,
+                        depth + 1, a, aEnd, sweepMax, px, py);
                 } else {
                     int dist = ChartView.ISqrt(ddx * ddx + ddy * ddy);
-                    if (dist >= depth * ringH && dist <= (depth + 1) * ringH) {
+                    if (dist >= band.rStart && dist <= band.rEnd) {
                         ChartView.ttName = k.name;
                         ChartView.ttVal = v;
                         ChartView.ttA0 = a;
@@ -541,18 +942,94 @@ partial class ChartView {
         }
     }
 
-    /// 旭日图绘制入口：同心环自内向外，环厚均分；中心标签为根名。
-    /// 支持 hover 高亮 + tooltip + Node 点击事件。`g` 为出现动画
-    /// 进度（千分值 0..1000，映射扫掠角）。
+    /// 深度 d 的环带：levels[min(d, len-1)] 的 r0/r 优先（数字 px 过
+    /// Scale、百分比对 rMax 折算，官方 parsePercent 对 size/2），
+    /// 缺省 = rPer 均分。
+    static SunBand SunBandOf(App app, ChartSeries s, int depth, int rMax, int rPer) {
+        SunBand b = new SunBand();
+        b.rStart = depth * rPer;
+        b.rEnd = (depth + 1) * rPer;
+        ChartLevel lv = ChartView.TmLevel(s, depth);
+        if (lv != null) {
+            if (lv.r0Pct >= 0) { b.rStart = lv.r0Pct * rMax / 1000; }
+            else if (lv.r0 >= 0) { b.rStart = app.Scale(lv.r0); }
+            if (lv.rPct >= 0) { b.rEnd = lv.rPct * rMax / 1000; }
+            else if (lv.r >= 0) { b.rEnd = app.Scale(lv.r); }
+        }
+        if (b.rEnd < b.rStart) { b.rEnd = b.rStart; }
+        return b;
+    }
+
+    /// 角度归一到 [-90, 90]（DrawTextRot 的钳制域），保证文字不倒置。
+    static int SunUpright(int angle) {
+        int a = angle % 360;
+        if (a > 180) { a = a - 360; }
+        if (a > 90) { a = a - 180; }
+        if (a < -90) { a = a + 180; }
+        return a;
+    }
+
+    /// 扇区标签：级/系 rotate 声明（1 radial 2 tangential 3 角度，
+    /// 官方缺省 radial），色 = 级色 > 系色 > 图表标签前景；角跨
+    /// ≥ 4° 且环带厚 ≥ 字高才画，锚定中点半径（绕锚点旋转，
+    /// 锚为未旋行盒左上角）。
+    static void SunLabel(App app, ChartSeries s, ChartNode node, int cx, int cy,
+                         SunBand band, int a0, int a1, int depth) {
+        if (node.name == null || node.name.Length < 1) { return; }
+        int span = a1 - a0;
+        if (span < 4 || band.rEnd - band.rStart < 1) { return; }
+        ChartLevel lv = ChartView.TmLevel(s, depth);
+        int mode = lv != null && lv.labelMode != 0 ? lv.labelMode
+            : (s.sunLabelMode != 0 ? s.sunLabelMode : 1);
+        int color = lv != null && lv.labelColor != 0 ? lv.labelColor
+            : (s.sunLabelColor != 0 ? s.sunLabelColor
+                : Style.Part(app, "chart", "label", "", "", "",
+                    Style.SNormal()).FgOr(0));
+        int fs = ChartFonts.SeriesLabel(app);
+        int fh = Canvas.FontHeight(fs);
+        if (band.rEnd - band.rStart < fh) { return; }
+        int tw = Canvas.MeasureText(node.name, fs);
+        int mid = (a0 + a1) / 2;
+        int rm = (band.rStart + band.rEnd) / 2;
+        double rad = mid * 3.14159265358979 / 180.0;
+        int px = cx + (int)(Math.Cos(rad) * rm);
+        int py = cy + (int)(Math.Sin(rad) * rm);
+        Canvas c = app.canvas;
+        if (mode == 3) {
+            int rot = lv != null && lv.labelMode == 3 ? lv.labelRotate
+                : s.sunLabelRotate;
+            c.DrawTextRot(px - tw / 2, py - fh / 2, node.name, color, fs,
+                ChartView.SunUpright(rot));
+            return;
+        }
+        if (mode == 2) {
+            // 切向：沿圆周方向（半径垂线），翻转保持可读。
+            c.DrawTextRot(px - tw / 2, py - fh / 2, node.name, color, fs,
+                ChartView.SunUpright(mid + 90));
+            return;
+        }
+        if (mode == 1) {
+            // 径向：沿半径方向。
+            c.DrawTextRot(px - tw / 2, py - fh / 2, node.name, color, fs,
+                ChartView.SunUpright(mid));
+            return;
+        }
+        c.DrawTextRot(px - tw / 2, py - fh / 2, node.name, color, fs, 0);
+    }
+
+    /// 旭日图绘制入口：lead.tree 条目为深度 1（官方 data 恒在虚拟
+    /// 根之下），环带半径按 levels r0/r（缺省均分）；扇区色 = 节点色
+    /// > 级单色 > 系级纯色 > 深度 1 主题调色板 > 向父色白化；描边 =
+    /// 系级 itemStyle borderWidth/borderColor；标签 rotate radial/
+    /// tangential/角度（官方缺省 radial）。支持 hover 高亮 + tooltip
+    /// + Node 点击事件。`g` 为出现动画进度（千分值 → 扫掠角）。
     static void DrawSunburst(App app, int x, int y, int w, int h,
                              ChartOption o, int g) {
         Canvas c = app.canvas;
-        Theme t = app.theme;
-        List<ChartSeries> series = o.series;
-        if (series.Count < 1 || series[0].tree.Count < 1) { return; }
-        ChartNode root = series[0].tree[0];
+        ChartSeries lead = ChartView.LeadSeries(o);
+        if (lead == null || lead.tree == null || lead.tree.Count < 1) { return; }
         int top = ChartView.PanelHead(app, x, y, w, h, o.title);
-        int pad = t.paddingMedium;
+        int pad = app.theme.paddingMedium;
         int areaY = top;
         int areaH = (y + h - pad) - top;
         if (areaH < app.Scale(16)) { areaH = app.Scale(16); }
@@ -563,17 +1040,15 @@ partial class ChartView {
         if (rMax < app.Scale(10)) { rMax = app.Scale(10); }
         int sweepMax = 360 * g / 1000;
 
-        int rings = ChartView.SunburstRingCount(root);
-        int ringH = ChartView.SunburstRingHeight(rMax, rings);
-        ChartView.SunburstRing(app, cx, cy, ringH, root, 0, 0, 360, sweepMax, 0);
-
-        // 中心标签 = 根节点名称
-        if (root.name.Length > 0) {
-            int fs = ChartFonts.SeriesLabel(app);
-            c.DrawTextCentered(cx - ringH / 2, Canvas.CenterTextYAt(cy, fs),
-                ringH, Canvas.FontHeight(fs), root.name,
-                Style.Part(app, "chart", "label", "", "", "", Style.SNormal()).FgOr(0), fs);
+        // 环数 = 各根子树的最大父子边数（深度 1 起算）。
+        int rings = 1;
+        for (int i = 0; i < lead.tree.Count; i = i + 1) {
+            int d = ChartView.SunburstRingCount(lead.tree[i]);
+            if (d > rings) { rings = d; }
         }
+        int rPer = ChartView.SunburstRingHeight(rMax, rings);
+        ChartView.SunRingList(app, lead, cx, cy, rMax, rPer, lead.tree, 1,
+            0, 360, sweepMax, 0);
 
         // 命中几何与 tooltip 展示解耦：关闭 tooltip 不能关闭
         // Sunburst 叶子的 Hover/MouseOut/Click 事件。
@@ -586,23 +1061,24 @@ partial class ChartView {
             ChartView.ttName = "";
             ChartView.ttVal = 0;
             ChartView.ttSunNode = null;
-            ChartView.SunburstHit(app, cx, cy, ringH, root, 0, 0, 360,
-                sweepMax, mx, my);
+            ChartView.SunburstHit(app, lead, cx, cy, rMax, rPer, lead.tree, 1,
+                0, 360, sweepMax, mx, my);
             if (ChartView.ttSunNode != null
                 && ChartView.activeEventView != null) {
                 ChartHit th = ChartHit.Of(ChartElementType.Node,
-                    0, series[0].name,
-                    ChartView.TreeNodeIndex(root, ChartView.ttSunNode),
+                    ChartView.SeriesIndexOf(o, lead), lead.name,
+                    ChartView.TmNodeIndex(lead.tree, ChartView.ttSunNode),
                     ChartView.ttName, ChartView.ttVal, mx, my);
-                th.axisIndex = series[0].axisIndex;
+                th.axisIndex = lead.axisIndex;
                 ChartView.OfferActiveHit(th);
             }
             if (o.showTooltip && ChartView.ttName.Length > 0) {
-                // 悬停扇区外缘的高亮圆环。
-                int hiInner = (ChartView.ttDepth + 1) * ringH - app.Scale(2);
-                int hiOuter = (ChartView.ttDepth + 1) * ringH;
-                if (hiInner < 0) { hiInner = 0; }
-                c.FillSector(cx, cy, hiInner, hiOuter,
+                // 悬停扇区环带外缘的高亮圆环。
+                SunBand hb = ChartView.SunBandOf(app, lead, ChartView.ttDepth,
+                    rMax, rPer);
+                int hiInner = hb.rEnd - app.Scale(2);
+                if (hiInner < hb.rStart) { hiInner = hb.rStart; }
+                c.FillSector(cx, cy, hiInner, hb.rEnd,
                     ChartView.ttA0, ChartView.ttA1, 4294967295);
                 List<TooltipRow> rows = new List<TooltipRow>{
                     TooltipRow.Of(0, o.title),
@@ -613,32 +1089,46 @@ partial class ChartView {
         }
     }
 
-    /// 递归绘制一层旭日环：子扇区按子树 Total() 分配父扇区角度，
-    /// 颜色向父色向白色插值区分层级。
-    static void SunburstRing(App app, int cx, int cy, int ringH, ChartNode node,
-                             int depth, int a0, int a1, int sweepMax, int parentCol) {
+    /// 递归绘制一层旭日环：nodes 为深度 depth 的兄弟组，扇区角按
+    /// 子树 Total() 分配；色阶见入口注释，环带经 SunBandOf 决议，
+    /// 递归用未裁剪 rawEnd（同官方 startAngle 累计）。
+    static void SunRingList(App app, ChartSeries s, int cx, int cy,
+                            int rMax, int rPer, List<ChartNode> nodes, int depth,
+                            int a0, int a1, int sweepMax, int parentCol) {
         Canvas c = app.canvas;
         Theme t = app.theme;
-        int total = node.Total();
+        if (nodes == null || nodes.Count < 1) { return; }
+        int total = 0;
+        for (int i = 0; i < nodes.Count; i = i + 1) {
+            total = total + nodes[i].Total();
+        }
         if (total < 1) { return; }
-        int kids = node.children.Count;
-        if (kids == 0) { return; }
-        int rInner = depth * ringH;
-        int rOuter = (depth + 1) * ringH;
+        SunBand band = ChartView.SunBandOf(app, s, depth, rMax, rPer);
+        ChartLevel lv = ChartView.TmLevel(s, depth);
         int a = a0;
-        for (int i = 0; i < kids; i = i + 1) {
-            ChartNode k = node.children[i];
+        for (int i = 0; i < nodes.Count; i = i + 1) {
+            ChartNode k = nodes[i];
             int v = k.Total();
             int span = (a1 - a0) * v / total;
             int rawEnd = a + span;
             int visibleEnd = ChartView.SunburstVisibleEnd(rawEnd, sweepMax);
-            int col = Chart.Palette(t, i);
-            if (depth > 0) { col = App.LerpColor(parentCol, 4294967295, 100 + depth * 70); }
-            if (visibleEnd > a && rOuter > rInner) {
-                c.FillSector(cx, cy, rInner, rOuter, a, visibleEnd, col);
+            int col = k.color != 0 ? k.color
+                : (lv != null && lv.colorOne != 0 ? lv.colorOne
+                    : (s.sunItemColor != 0 ? s.sunItemColor
+                        : (depth == 1 ? Chart.Palette(t, i)
+                            : App.LerpColor(parentCol, 4294967295,
+                                100 + (depth - 1) * 70))));
+            if (visibleEnd > a && band.rEnd > band.rStart) {
+                c.FillSector(cx, cy, band.rStart, band.rEnd, a, visibleEnd, col);
+                if (s.tmBorderWidth > 0) {
+                    c.DrawArc(cx, cy, band.rStart, band.rEnd, a, visibleEnd,
+                        s.tmBorderColor != 0 ? s.tmBorderColor : 4294967295,
+                        s.tmBorderWidth);
+                }
+                ChartView.SunLabel(app, s, k, cx, cy, band, a, visibleEnd, depth);
                 if (k.children.Count > 0) {
-                    ChartView.SunburstRing(app, cx, cy, ringH, k, depth + 1,
-                        a, rawEnd, sweepMax, col);
+                    ChartView.SunRingList(app, s, cx, cy, rMax, rPer, k.children,
+                        depth + 1, a, rawEnd, sweepMax, col);
                 }
             }
             a = rawEnd;
