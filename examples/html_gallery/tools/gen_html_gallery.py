@@ -6,8 +6,8 @@
     组件一律用原生标签 + 原生属性/文本内容（src、placeholder、元素文本），
     其余组件用 div + data-kind 扩展（设计稿协议的 custom-element 通道）。
   - 演示尺寸按组件自身特性配置，按 1560×920 逻辑窗口 4 列瀑布流布局：
-    每列独立记账、卡片落"最矮位置"；DataGrid/Transfer 等大组件跨两列，
-    断言不超出内容区（页面不滚动、不裁切）。
+    同页高卡降序先行，每列独立记账、卡片落"最矮位置"，页底收平；
+    DataGrid/Transfer 等大组件跨两列，断言不超出内容区（不裁切）。
   - 每张卡片 = 无标题 Panel + 自放标题 label + 演示节点（标题位置
     完全可预测，绕开 Panel 标题的 padT 预留）；卡片边框走内联 style。
   - 9 个无法纯声明喂活的组件（泛型/需模型/无零参构造）在 HTML 里落
@@ -26,10 +26,12 @@ CATALOG = [l.strip() for l in io.open(
 EXCLUDED = {"WebViewBox", "CefBrowserBox", "ChoiceGroup"}
 # 由 code-behind 构造真控件的占位壳（HTML 里是 Panel）
 CODE_FED = {"Wizard", "Popover", "FormField", "ListView", "AlarmBanner",
-            "AlarmList", "EquipPanel", "DeviceCard", "ButtonGroup"}
+            "AlarmList", "EquipPanel", "DeviceCard", "ButtonGroup",
+            "Dropdown", "RichText", "ChatView", "PropertyGrid", "Grid",
+            "FileTree", "ScrollColumn"}
 
 WIN_W, WIN_H = 1560, 920
-HEAD_H = 44
+HEAD_H = 34                             # 页签条自然高（theme.heightMedium）
 MARGIN = 16
 GAP = 16
 COLS = 4
@@ -216,6 +218,14 @@ add("HMI 专用", "ToolStrip", "ToolStrip 工具条", 0, 40,
     {"options": ["新建", "打开", "保存"]})
 add("HMI 专用", "StatusBar", "StatusBar 状态栏", 0, 32,
     {"options": ["就绪", "UTF-8", "第 1 页"]})
+# ---- 更多组件 7（目录外真控件，全部 code-behind 喂活） ----
+add("更多组件", "ChatView", "ChatView 聊天视图", 0, 240, {}, span=2)
+add("更多组件", "FileTree", "FileTree 文件树（喂 TreeView）", 0, 240, {})
+add("更多组件", "PropertyGrid", "PropertyGrid 属性表", 0, 220, {})
+add("更多组件", "ScrollColumn", "ScrollColumn 滚动列", 0, 200, {})
+add("更多组件", "RichText", "RichText 富文本", 0, 120, {})
+add("更多组件", "Grid", "Grid 栅格", 0, 140, {})
+add("更多组件", "Dropdown", "Dropdown 下拉面板", 0, 40, {})
 
 PAGES = []
 for item in D:
@@ -227,10 +237,10 @@ for item in D:
 placed = [it[0] for (_t, items) in PAGES for it in items]
 assert len(placed) == len(set(placed)), "kind 重复放置"
 EXTRA = {"CheckboxGroup", "ListView"}   # 目录本身漏登的两个真组件
-assert set(placed) == set(CATALOG) - EXCLUDED | EXTRA, (
-    "覆盖面不齐: 缺 %s 多 %s" % (
-        sorted((set(CATALOG) - EXCLUDED | EXTRA) - set(placed)),
-        sorted(set(placed) - (set(CATALOG) - EXCLUDED | EXTRA))))
+# 组件目录（除排除项）必须全覆盖；「更多组件」页是目录外的真控件扩充，
+# 只增不缺——用包含断言而非相等断言。
+MISS = (set(CATALOG) - EXCLUDED | EXTRA) - set(placed)
+assert not MISS, "覆盖面缺: %s" % sorted(MISS)
 
 CARD_W = (CONTENT_W - (COLS - 1) * GAP) // COLS   # 370
 DEMO_W = CARD_W - CARD_PAD * 2                     # 338
@@ -256,7 +266,7 @@ def geom(fx, fy, fw, fh):
             + attr("data-fw", fw) + attr("data-fh", fh))
 
 CARD_STYLE = "background:#ffffff; border:1px solid #e5e7eb; border-radius:10px"
-TITLE_STYLE = "color:#6b7280; font-size:13px"
+TITLE_STYLE = "color:#4b5563; font-size:15px"
 
 def emit_demo(kind, dw, dh, a, ind):
     out = []
@@ -343,10 +353,16 @@ lines.append('  <zan-tabs id="Cats"%s></zan-tabs>'
 for pi, (ptitle, items) in enumerate(PAGES):
     lines.append('  <div id="Page%d"%s>' % (
         pi, geom(CONTENT_X, CONTENT_Y, CONTENT_W, CONTENT_H)))
-    # 瀑布流：每列独立记账，卡片落"最矮位置"（并列取最左）；span=2 的
-    # 大卡横跨两个卡槽（card_w = 2*CARD_W+GAP），被跨各列同步记高。
+    # 瀑布流：同页按卡高降序（稳定排序）先行，每列独立记账、卡片落
+    # "最矮位置"（并列取最左）——高卡坐底、小卡填坑，页底收平不留
+    # 大片空洞，列间隙恒为 GAP。span=2 的大卡横跨两个卡槽
+    # （card_w = 2*CARD_W+GAP），被跨各列同步记高。
     col_h = [8] * COLS
-    for si, (kind, cap, dw0, dh, a, span) in enumerate(items):
+    # 同高时跨列大卡先行：单卡抢先落矮列会把 span2 的落位窗全顶高。
+    for si, oi in enumerate(sorted(range(len(items)),
+                                   key=lambda k: (-items[k][3],
+                                                  -items[k][5]))):
+        kind, cap, dw0, dh, a, span = items[oi]
         card_w = span * CARD_W + (span - 1) * GAP
         dw = dw0 or (card_w - CARD_PAD * 2)
         card_h = dh + CARD_EXTRA
