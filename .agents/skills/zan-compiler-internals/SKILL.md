@@ -720,6 +720,17 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
 - **worker 只投递入口文件**：依赖 JS 全部内联进入口；且 API 是全局 worker
   对象（`worker.onMessage/postMessage`），DOM Worker 的 `self.postMessage`
   不路由——stdout sink 用错会让全部程序输出**静默消失**，误诊成"卡死"。
+- **真机 worker 全局缺失**：devtools 的 worker 有 `performance`/
+  `TextDecoder`/`TextEncoder`，真机（JSC/V8 定制壳）没有——`performance.now
+  ? ... : ...` 这种守卫引用未定义标识符**照样 ReferenceError**，必须
+  `typeof performance !== "undefined"`；TextCodec 缺失则第一条 stdout
+  （fd_write）就崩，症状是"黑屏且零日志"。真机交互输入走 SharedArrayBuffer
+  环 + `Atomics.wait` 共享门铃（消息队列只在任务间被服务，同步 runloop 下
+  永远不可达）；无 SAB 宿主（devtools）回退消息桥，仅支持 pre-start 种子。
+- **坐标系分两类**：Game 模板（GuiHost + CDraw.StageViewport）把设计分辨
+  率等比缩放到窗口实际尺寸（短轴贴设计、长轴延展），壳应喂**高分辨率**
+  （物理或 2x，清晰且比例正确）；裸 Gui 程序无缩放层，喂高分辨率会把逻辑
+  尺寸控件缩成 1/dpr，必须喂逻辑分辨率。
 - **游戏模板实测 + 字体注入**：ddz 卡牌模板 wasm 8.8MB 在 wx worker 壳里
   跑到稳态 ~49fps（390×844 逻辑；首 120 帧个位数是 instantiate+字体挂载，
   不是稳态）。中文字形必须 pre-start 往 worker 内存 FS 挂 `/fonts/ui.ttf`
