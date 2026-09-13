@@ -891,6 +891,51 @@ partial class ChartView {
         return s;
     }
 
+    /// 官方 TreeSeries.ts:185-191 的展开态：item.collapsed 优先
+    /// （isExpand = !collapsed），否则 depth <= expandTreeDepth。
+    static bool TreeExpanded(ChartNode n, int depth, int effDepth) {
+        if (n.collapsed) { return false; }
+        return depth <= effDepth;
+    }
+
+    /// 展开态子树的可见叶子数（折叠子树算 1 个叶子位）。
+    static int TreeVisLeafCount(ChartNode n, int effDepth, int depth) {
+        int childCount = ChartView.TreeChildCount(n);
+        if (childCount == 0) { return 1; }
+        if (!ChartView.TreeExpanded(n, depth, effDepth)) { return 1; }
+        int s = 0;
+        for (int i = 0; i < childCount; i = i + 1) {
+            s = s + ChartView.TreeVisLeafCount(n.children[i], effDepth, depth + 1);
+        }
+        return s;
+    }
+
+    /// 展开态子树的最大可见深度（层数）。
+    static int TreeVisDepth(ChartNode n, int effDepth, int depth) {
+        int childCount = ChartView.TreeChildCount(n);
+        int md = 0;
+        if (childCount > 0 && ChartView.TreeExpanded(n, depth, effDepth)) {
+            for (int i = 0; i < childCount; i = i + 1) {
+                int d = ChartView.TreeVisDepth(n.children[i], effDepth, depth + 1);
+                if (d > md) { md = d; }
+            }
+            return md + 1;
+        }
+        return 1;
+    }
+
+    /// 有效展开深度：expandAndCollapse=false → -1 哨兵（全展开，
+    /// 用一个大数）；initialTreeDepth>=0 → 声明值；否则官方缺省 2
+    /// （TreeSeries.ts:293）。
+    static int TreeExpandDepth(ChartOption o, int fullDepth) {
+        ChartSeries lead = ChartView.LeadSeries(o);
+        if (lead == null) { return 2; }
+        if (!lead.treeExpandCollapse) { return fullDepth + 1; }
+        if (lead.initialTreeDepth < 0) { return fullDepth + 1; }
+        return lead.initialTreeDepth;
+    }
+
+
     /// 为每个节点分配 span 坐标：节点跨越叶子 [lo, hi)，
     /// 其中心位于该叶子范围中点。span 在垂直树中
     /// 从左到右，在水平树中从上到下。
@@ -903,6 +948,21 @@ partial class ChartView {
             for (int i = 0; i < childCount; i = i + 1) {
                 ChartView.TreeAssign(n.children[i], acc, depth + 1, layout);
                 acc = acc + ChartView.TreeLeafCount(n.children[i]);
+            }
+        }
+    }
+    /// 展开态版：折叠节点不产出子节点布局行（官方 collapse 后
+    /// 子树不参与布局），其叶子位由 collapsed 子树以 1 位占。
+    static void TreeAssignEx(ChartNode n, int lo, int depth, int effDepth,
+                             List<TreeLayoutNode> layout) {
+        int vis = ChartView.TreeVisLeafCount(n, effDepth, depth);
+        layout.Add(TreeLayoutNode.Of(n, depth, lo, vis));
+        int childCount = ChartView.TreeChildCount(n);
+        if (childCount > 0 && ChartView.TreeExpanded(n, depth, effDepth)) {
+            int acc = lo;
+            for (int i = 0; i < childCount; i = i + 1) {
+                ChartView.TreeAssignEx(n.children[i], acc, depth + 1, effDepth, layout);
+                acc = acc + ChartView.TreeVisLeafCount(n.children[i], effDepth, depth + 1);
             }
         }
     }
@@ -1300,8 +1360,11 @@ partial class ChartView {
         bool horiz = false;
         if (lead.treeOrient == "horizontal") { horiz = true; }
 
-        int leaves = ChartView.TreeLeafCount(root);
-        int depth = ChartView.TreeDepth(root);
+        // N6：官方缺省展开到第 2 层（initialTreeDepth 缺省 2），
+        // collapsed 逐项反义；可见叶数/深度决定 span 网格与缩放。
+        int effDepth = ChartView.TreeExpandDepth(o, ChartView.TreeDepth(root));
+        int leaves = ChartView.TreeVisLeafCount(root, effDepth, 0);
+        int depth = ChartView.TreeVisDepth(root, effDepth, 0);
         if (leaves < 1) { leaves = 1; }
         if (depth < 1) { depth = 1; }
 
@@ -1436,7 +1499,7 @@ partial class ChartView {
         c.PushClip(ax, ay, aw, ah);
         ChartView.DrawTreeCanvasGrid(app, c, ax, ay, aw, ah, panX, panY, zoom);
         List<TreeLayoutNode> layout = new List<TreeLayoutNode>();
-        ChartView.TreeAssign(root, 0, 0, layout);
+        ChartView.TreeAssignEx(root, 0, 0, effDepth, layout);
 
         int col = 0;
         if (lead != null) { col = lead.color; }

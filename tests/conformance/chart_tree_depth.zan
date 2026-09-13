@@ -1,0 +1,100 @@
+using System;
+using Gui;
+using Gui.Component.Chart;
+
+namespace Conf;
+
+/// tree.initialTreeDepth / expandAndCollapse / data 节点 collapsed
+/// （官方 TreeSeries.ts:185-191、:293）：
+///   isExpand = item.collapsed != null ? !collapsed : depth <= expandTreeDepth
+///   expandTreeDepth = expandAndCollapse && initialTreeDepth >= 0
+///                     ? initialTreeDepth : 整树深
+///   initialTreeDepth 官方缺省 2；可见叶子 = 展开态布局的叶子数，
+///   折叠子树占 1 个叶子位（官方 collapse 后子树不参与布局）。
+class Program {
+    static int CountCollapsed(ChartNode n) {
+        int c = n.collapsed ? 1 : 0;
+        for (int i = 0; i < ChartView.TreeChildCount(n); i = i + 1) {
+            c = c + Conf.Program.CountCollapsed(n.children[i]);
+        }
+        return c;
+    }
+
+    static ChartNode Named(ChartNode n, string name) {
+        if (n.name == name) { return n; }
+        for (int i = 0; i < ChartView.TreeChildCount(n); i = i + 1) {
+            ChartNode hit = Conf.Program.Named(n.children[i], name);
+            if (hit != null) { return hit; }
+        }
+        return null;
+    }
+
+    static void Main() {
+        // tree-basic：缺省 2、逐项 collapsed、5 层数据。
+        ChartOption o = ChartOption.FromJson(File.ReadAllText(
+            "examples/gui_charts/options/tree-basic.json"));
+        ChartSeries s = o.series[0];
+        ChartNode root = s.tree[0];
+        Console.WriteLine("parse:" + Convert.ToString(s.initialTreeDepth)
+            + ":" + Convert.ToString(s.treeExpandCollapse));
+        int full = ChartView.TreeDepth(root);
+        int eff = ChartView.TreeExpandDepth(o, full);
+        Console.WriteLine("eff:" + Convert.ToString(full)
+            + ":" + Convert.ToString(eff)
+            + ":" + Convert.ToString(ChartView.TreeLeafCount(root))
+            + ":" + Convert.ToString(ChartView.TreeVisLeafCount(root, eff, 0))
+            + ":" + Convert.ToString(ChartView.TreeVisDepth(root, eff, 0)));
+        Console.WriteLine("collapsedItems:" + Convert.ToString(Conf.Program.CountCollapsed(root)));
+
+        // 展开深度语义：eff=2 → 深度 0..3 的节点可见（isExpand 门控
+        // 的是"子树是否铺开"，被门控节点本身仍渲染为端点）。
+        List<TreeLayoutNode> layout = new List<TreeLayoutNode>();
+        ChartView.TreeAssignEx(root, 0, 0, eff, layout);
+        int maxLvl = 0;
+        for (int i = 0; i < layout.Count; i = i + 1) {
+            if (layout[i].depth > maxLvl) { maxLvl = layout[i].depth; }
+        }
+        Console.WriteLine("visibleLevels:" + Convert.ToString(maxLvl));
+
+        // expandAndCollapse:false → 全展开（可见叶数 = 物理叶数）。
+        ChartOption o2 = ChartOption.FromJson(File.ReadAllText(
+            "examples/gui_charts/options/tree-basic.json"));
+        o2.series[0].treeExpandCollapse = false;
+        int eff2 = ChartView.TreeExpandDepth(o2, ChartView.TreeDepth(o2.series[0].tree[0]));
+        // collapsed 逐项优先于全局全展开（官方 isExpand 三元序）：
+        // tree-basic 有 5 个 collapsed:true，全展开深度下它们仍折叠。
+        Console.WriteLine("fullExpand:" + Convert.ToString(eff2 > full)
+            + ":" + Convert.ToString(ChartView.TreeVisLeafCount(o2.series[0].tree[0], eff2, 0)
+                != ChartView.TreeLeafCount(o2.series[0].tree[0])));
+
+        // initialTreeDepth:-1 → 全展开哨兵。
+        ChartOption o3 = ChartOption.FromJson(File.ReadAllText(
+            "examples/gui_charts/options/tree-basic.json"));
+        o3.series[0].initialTreeDepth = 0 - 1;
+        int eff3 = ChartView.TreeExpandDepth(o3, ChartView.TreeDepth(o3.series[0].tree[0]));
+        Console.WriteLine("minusOne:" + Convert.ToString(eff3 > full));
+
+        // collapsed 逐项反义：折叠节点的子树不在布局行里。
+        ChartNode flare = Conf.Program.Named(root, "Flare");
+        ChartNode anyCollapsed = null;
+        if (flare != null) {
+            for (int i = 0; i < ChartView.TreeChildCount(flare) && anyCollapsed == null; i = i + 1) {
+                ChartNode k = flare.children[i];
+                if (k.collapsed) { anyCollapsed = k; }
+            }
+        }
+// collapsed 逐项反义：折叠节点的子树不在布局行里——
+        // 布局行数 < 物理节点总数（220 物理节点 vs 91 可见叶子）。
+        int physNodes = Conf.Program.PhysCount(root);
+        Console.WriteLine("pruned:" + Convert.ToString(layout.Count < physNodes)
+            + ":" + Convert.ToString(physNodes));
+    }
+
+    static int PhysCount(ChartNode n) {
+        int c = 1;
+        for (int i = 0; i < ChartView.TreeChildCount(n); i = i + 1) {
+            c = c + Conf.Program.PhysCount(n.children[i]);
+        }
+        return c;
+    }
+}
