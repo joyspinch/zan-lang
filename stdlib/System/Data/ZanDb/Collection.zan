@@ -6,6 +6,11 @@ using System.Threading;
 
 namespace System.Data.ZanDb;
 
+/// <summary><see cref="Collection.ScanField"/> 的访问器：id 为文档 id，
+/// v 为该文档 field 字段的值（每篇文档只有这一个字段被解码）。
+/// 返回 false 结束扫描。</summary>
+delegate bool FieldVisit(int id, JsonValue v);
+
 /// <summary>
 /// <see cref="ZanDatabase"/> 中一组有名字的文档。文档是
 /// JsonValue 对象树，每篇文档分配一个自增整数 _id。
@@ -374,33 +379,6 @@ class Collection {
         return s;
     }
 
-    /// 从记录中读取 <see cref="WriteVal"/> 写出的一个值并还原为 JsonValue。
-    JsonValue ReadVal(ByteBuffer b) {
-        int tag = b.ReadU8();
-        if (tag == 0) { return JsonValue.NewNull(); }
-        if (tag == 1) { return JsonValue.NewBool(false); }
-        if (tag == 2) { return JsonValue.NewBool(true); }
-        if (tag == 3) { return JsonValue.NewNum(Convert.ToString(b.ReadVarInt())); }
-        if (tag == 8) { return JsonValue.NewNum(Convert.ToString(0 - b.ReadVarInt())); }
-        if (tag == 9) { return JsonValue.NewNum("0"); }
-        if (tag == 4) { return JsonValue.NewNum(b.ReadString()); }
-        if (tag == 5) { return JsonValue.NewStr(b.ReadString()); }
-        if (tag == 10) { return JsonValue.NewStr(""); }
-        if (tag == 6) {
-            JsonValue a = JsonValue.NewArray();
-            int c = (int)b.ReadVarInt();
-            for (int i = 0; i < c; i = i + 1) { a.Append(ReadVal(b)); }
-            return a;
-        }
-        JsonValue o = JsonValue.NewObject();
-        int c = (int)b.ReadVarInt();
-        for (int i = 0; i < c; i = i + 1) {
-            int kid = (int)b.ReadVarInt();
-            o.Set(KeyName(kid), ReadVal(b));
-        }
-        return o;
-    }
-
     /// <summary>键尾随数字中编码的 id。行键和
     /// 索引条目都以定宽 id 结尾，因此无需搜索分隔符——
     /// id 的某个数字可能恰好像分隔符。</summary>
@@ -415,57 +393,121 @@ class Collection {
         return Convert.ToString(Collection.IdOfKey(key));
     }
 
-    /// <summary>将二进制记录正文（见 EncodeDoc）解码回
-    /// JsonValue 对象。"_id" 不存储在正文中；调用方从
-    /// 行键取出并附加。</summary>
-    /// <summary>包装存储的记录以供读取，仅在记录
-    /// 确实包含转义字节时才反转义。EncodeDoc
-    /// 写出的记录很少包含（标签 9 和 10 让常见单元格不含 0x00），
-    /// 因此通常只需一个缓冲区，无需逐字节复制。</summary>
-    ByteBuffer OpenRecord(string body) {
-        ByteBuffer e = ByteBuffer.FromStr(body);
-        if (Collection.MemChr(e.Raw(), 255, e.Length()) == 0) {
-            e.SeekRead(0);
-            return e;
+    // ===== 字符串直读解码器：不经 ByteBuffer、常态零拷贝零分配（除值本身）。=====
+    // 记录格式见 EncodeDoc：'B' + VarInt(字段数) + (VarInt(字典id) + 值)*。
+    // 存储串不含 0x00；含 0xFF（转义标记或载荷）的先经 UnescapeRecord 还原。
+
+    [DllImport("crt", EntryPoint = "memchr")]
+    static extern nint StrMemChr(string p, int c, long n);
+
+    /// 与 ByteBuffer.WriteVarInt 同格式的变长整数读取（显式位置传递）。
+    static long RecVarInt(string s, int p, out int np) {
+        long v = 0;
+        int shift = 0;
+        while (true) {
+            int by = s[p] & 255;
+            p = p + 1;
+            v = v + ((long)(by & 127) << shift);
+            if ((by & 128) == 0) { break; }
+            shift = shift + 7;
         }
-        ByteBuffer b = ByteBuffer.Alloc(e.Length() + 4);
-        e.SeekRead(0);
-        while (e.Remaining() > 0) {
-            int by = e.ReadU8();
+        np = p;
+        return v;
+    }
+
+    /// 记录含 0xFF 时（转义标记或载荷）还原为可直读的串。罕见路径。
+    static string UnescapeRecord(string body) {
+        ByteBuffer b = ByteBuffer.Alloc(body.Length + 4);
+        for (int i = 0; i < body.Length; i = i + 1) {
+            int by = body[i] & 255;
             if (by == 255) {
-                int nx = e.ReadU8();
+                i = i + 1;
+                int nx = body[i] & 255;
                 if (nx == 1) { b.WriteU8(0); } else { b.WriteU8(255); }
             } else {
                 b.WriteU8(by);
             }
         }
-        e.Free();
-        b.SeekRead(0);
-        return b;
+        string s = b.ToStr();
+        b.Free();
+        return s;
+    }
+
+    /// 从记录中读取 <see cref="WriteVal"/> 写出的一个值并还原为
+    /// JsonValue；p 为值起始字节，np 为值结束后的位置。
+    JsonValue ReadValS(string s, int p, out int np) {
+        int tag = s[p] & 255;
+        p = p + 1;
+        if (tag == 0) { np = p; return JsonValue.NewNull(); }
+        if (tag == 1) { np = p; return JsonValue.NewBool(false); }
+        if (tag == 2) { np = p; return JsonValue.NewBool(true); }
+        if (tag == 3) {
+            long v = Collection.RecVarInt(s, p, out np);
+            return JsonValue.NewNum(Convert.ToString(v));
+        }
+        if (tag == 8) {
+            long v = Collection.RecVarInt(s, p, out np);
+            return JsonValue.NewNum(Convert.ToString(0 - v));
+        }
+        if (tag == 9) { np = p; return JsonValue.NewNum("0"); }
+        if (tag == 4 || tag == 5) {
+            long n = Collection.RecVarInt(s, p, out p);
+            string t = s.Substring(p, (int)n);
+            np = p + (int)n;
+            if (tag == 4) { return JsonValue.NewNum(t); }
+            return JsonValue.NewStr(t);
+        }
+        if (tag == 10) { np = p; return JsonValue.NewStr(""); }
+        if (tag == 6) {
+            long c = Collection.RecVarInt(s, p, out p);
+            JsonValue a = JsonValue.NewArray();
+            for (int i = 0; i < (int)c; i = i + 1) {
+                JsonValue v = ReadValS(s, p, out p);
+                a.Append(v);
+            }
+            np = p;
+            return a;
+        }
+        // tag == 7：对象
+        long oc = Collection.RecVarInt(s, p, out p);
+        JsonValue obj = JsonValue.NewObject();
+        for (int i = 0; i < (int)oc; i = i + 1) {
+            long kid = Collection.RecVarInt(s, p, out p);
+            JsonValue v = ReadValS(s, p, out p);
+            obj.Set(KeyName((int)kid), v);
+        }
+        np = p;
+        return obj;
     }
 
     /// <summary>跳过一个编码值，而不从中构建任何内容。
-    /// 字符串和文本形式的数字按长度跳过，而非
-    /// 复制。</summary>
-    void SkipVal(ByteBuffer b) {
-        int tag = b.ReadU8();
-        if (tag == 3 || tag == 8) { b.ReadVarInt(); return; }
+    /// 字符串和文本形式的数字按长度跳过，而非复制。</summary>
+    static void SkipValS(string s, int p, out int np) {
+        int tag = s[p] & 255;
+        p = p + 1;
+        if (tag == 3 || tag == 8) { Collection.RecVarInt(s, p, out np); return; }
         if (tag == 4 || tag == 5) {
-            int len = (int)b.ReadVarInt();
-            b.SeekRead(b.ReadPos() + len);
+            long n = Collection.RecVarInt(s, p, out p);
+            np = p + (int)n;
             return;
         }
         if (tag == 6) {
-            int c = (int)b.ReadVarInt();
-            for (int i = 0; i < c; i = i + 1) { SkipVal(b); }
+            long c = Collection.RecVarInt(s, p, out p);
+            for (int i = 0; i < (int)c; i = i + 1) { Collection.SkipValS(s, p, out p); }
+            np = p;
             return;
         }
         if (tag == 7) {
-            int c = (int)b.ReadVarInt();
-            for (int i = 0; i < c; i = i + 1) { b.ReadVarInt(); SkipVal(b); }
+            long c = Collection.RecVarInt(s, p, out p);
+            for (int i = 0; i < (int)c; i = i + 1) {
+                p = (int)Collection.RecVarInt(s, p, out p);
+                Collection.SkipValS(s, p, out p);
+            }
+            np = p;
             return;
         }
         // 标签 0、1、2、9、10 不带载荷。
+        np = p;
     }
 
     /// <summary>直接从存储的记录中取出一个字段：其他字段
@@ -474,38 +516,33 @@ class Collection {
     /// 没有该字段时返回 null。</summary>
     JsonValue FieldOf(string body, int kid) {
         if (kid == 0) { return null; }
-        ByteBuffer b = OpenRecord(body);
-        b.ReadU8();                     // 'B'
-        int n = (int)b.ReadVarInt();
-        JsonValue found = null;
+        if (StrMemChr(body, 255, body.Length) != 0) { body = Collection.UnescapeRecord(body); }
+        int p = 1;                     // 'B'
+        long n = Collection.RecVarInt(body, p, out p);
         int i = 0;
-        while (i < n) {
-            int k = (int)b.ReadVarInt();
-            if (k == kid) {
-                found = ReadVal(b);
-                i = n;
-            } else {
-                SkipVal(b);
-                i = i + 1;
+        while (i < (int)n) {
+            long k = Collection.RecVarInt(body, p, out p);
+            if ((int)k == kid) {
+                return ReadValS(body, p, out p);
             }
+            Collection.SkipValS(body, p, out p);
+            i = i + 1;
         }
-        b.Free();
-        return found;
+        return null;
     }
 
     /// 把存储的二进制记录（见 <see cref="EncodeDoc"/>）解码回 JsonValue 对象；
     /// "_id" 由调用方从行键附加。
     JsonValue DecodeDoc(string body) {
-        ByteBuffer b = OpenRecord(body);
-        int fmt = b.ReadU8();   // 'B' = 66
+        if (StrMemChr(body, 255, body.Length) != 0) { body = Collection.UnescapeRecord(body); }
+        int p = 1;                     // 'B' = 66
+        long n = Collection.RecVarInt(body, p, out p);
         JsonValue o = JsonValue.NewObject();
-        int n = (int)b.ReadVarInt();
-        for (int i = 0; i < n; i = i + 1) {
-            int kid = (int)b.ReadVarInt();
-            JsonValue v = ReadVal(b);
-            o.Set(KeyName(kid), v);
+        for (int i = 0; i < (int)n; i = i + 1) {
+            long kid = Collection.RecVarInt(body, p, out p);
+            JsonValue v = ReadValS(body, p, out p);
+            o.Set(KeyName((int)kid), v);
         }
-        b.Free();
         return o;
     }
 
@@ -834,6 +871,56 @@ class Collection {
             return limit <= 0 || docs.Count < limit;
         });
         return docs;
+    }
+
+    /// <summary>投影式扫描：按 id 序遍历集合，每篇含 field 的文档
+    /// 以 (id, 值) 调用一次 visit；visit 返回 false 提前结束。
+    /// 每条记录只解码这一个字段——不构建文档树、不物化文档，
+    /// 单字段聚合/过滤的每文档成本与文档的字段数无关。
+    /// 返回 visit 被调用的次数。</summary>
+    int ScanField(string field, FieldVisit visit) {
+        SyncMeta();
+        int kid = KeyIdOf(field);
+        if (kid == 0) { return 0; }
+        string hi = "c:" + this.name + ";";
+        int n = 0;
+        this.kv.Scan("c:" + this.name + ":", delegate(string k, string v) {
+            if (String.CompareOrdinal(k, hi) > 0) { return false; }
+            JsonValue f = FieldOf(v, kid);
+            if (f != null) {
+                n = n + 1;
+                if (!visit(Collection.IdOfKey(k), f)) { return false; }
+            }
+            return true;
+        });
+        return n;
+    }
+
+    /// <summary>字段值等于 val 的所有文档 id，按 id 序。
+    /// 索引就绪时只扫索引条目（覆盖索引，一个文档都不读）；
+    /// 否则流式扫描、每条记录只解码这一个字段，匹配才收 id
+    /// ——全程不物化任何文档。</summary>
+    List<int> FindIdsByField(string field, string val) {
+        SyncMeta();
+        List<int> ids = new List<int>();
+        if (HasIndex(field) && !this.kv.Contains(IdxPosKey(field))) {
+            List<KvEntry> entries = new List<KvEntry>();
+            this.kv.ScanPrefix(IdxPrefix(field, val), 0, entries);
+            for (int i = 0; i < entries.Count; i = i + 1) {
+                ids.Add(Collection.IdOfKey(entries[i].key));
+            }
+            return ids;
+        }
+        int kid = KeyIdOf(field);
+        if (kid == 0) { return ids; }
+        string hi = "c:" + this.name + ";";
+        this.kv.Scan("c:" + this.name + ":", delegate(string k, string v) {
+            if (String.CompareOrdinal(k, hi) > 0) { return false; }
+            JsonValue f = FieldOf(v, kid);
+            if (f != null && f.AsString("") == val) { ids.Add(Collection.IdOfKey(k)); }
+            return true;
+        });
+        return ids;
     }
 
     /// <summary>对集合启动流畅的 LINQ 风格查询。</summary>

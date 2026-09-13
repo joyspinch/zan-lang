@@ -1,0 +1,125 @@
+using System;
+using System.Data.ZanDb;
+using System.Json;
+
+// ZanDB projection API: ScanField decodes exactly one field per record
+// (no document tree materialized); FindIdsByField answers from the
+// secondary index alone when it is ready, falling back to a
+// single-field scan. Also covers early stop and the unescape path.
+class Program {
+    static int pass = 0;
+    static int fail = 0;
+    static List<int> seen;
+
+    static void Check(string name, bool ok) {
+        if (ok) { pass = pass + 1; }
+        else { fail = fail + 1; Console.WriteLine("FAIL " + name); }
+    }
+
+    static JsonValue Doc(string name, string city, int age) {
+        JsonValue u = JsonValue.NewObject();
+        u.Put("name", JsonValue.NewStr(name));
+        u.Put("city", JsonValue.NewStr(city));
+        u.Put("age", JsonValue.NewNum(Convert.ToString(age)));
+        return u;
+    }
+
+    static async int Run() {
+        string basePath = "zandb_proj.tmp.db";
+        File.Delete(basePath);
+        File.Delete(basePath + ".m0");
+        File.Delete(basePath + ".m1");
+        for (int i = 0; i < 8; i = i + 1) {
+            string seg = basePath + ".s" + Convert.ToString(i);
+            if (File.Exists(seg)) { File.Delete(seg); }
+        }
+
+        ZanDatabase db = ZanDatabase.Open(basePath, 64);
+        Check("open", db.IsOpen());
+        Collection users = db.GetCollection("users");
+
+        // 1. Seed: alice/bob in 北京, carol in 上海, dave has no city.
+        int a = users.Insert(Doc("alice", "北京", 30));
+        int b = users.Insert(Doc("bob", "北京", 25));
+        int c = users.Insert(Doc("carol", "上海", 30));
+        int d = users.Insert(Doc("dave", "", 40));
+        // dave 改为真正没有 city 字段的文档（不是空串）。
+        JsonValue noCity = JsonValue.NewObject();
+        noCity.Put("name", JsonValue.NewStr("dave"));
+        noCity.Put("age", JsonValue.NewNum("40"));
+        users.Update(d, noCity);
+
+        // 2. ScanField visits only docs having the field, in id order,
+        //    and the returned count is the number of visits.
+        seen = new List<int>();
+        List<string> vals = new List<string>();
+        int n = users.ScanField("city", (int id, JsonValue v) => {
+            seen.Add(id);
+            vals.Add(v.AsString(""));
+            return true;
+        });
+        Check("scanfield-count", n == 3);
+        Check("scanfield-ids", seen.Count == 3 && seen[0] == a && seen[1] == b && seen[2] == c);
+        Check("scanfield-vals", vals[0] == "北京" && vals[1] == "北京" && vals[2] == "上海");
+
+        // 3. Early stop: returning false ends the scan.
+        seen = new List<int>();
+        int m = users.ScanField("city", (int id, JsonValue v) => {
+            seen.Add(id);
+            return false;
+        });
+        Check("scanfield-stop", m == 1 && seen.Count == 1 && seen[0] == a);
+
+        // 4. Missing field across the whole collection.
+        Check("scanfield-missing", users.ScanField("nosuch", (int id, JsonValue v) => {
+            return true;
+        }) == 0);
+
+        // 5. FindIdsByField before indexing: single-field scan path.
+        List<int> bj = users.FindIdsByField("city", "北京");
+        Check("ids-scan-path", bj.Count == 2 && bj[0] == a && bj[1] == b);
+        Check("ids-scan-none", users.FindIdsByField("city", "广州").Count == 0);
+
+        // 6. Build the index, then the same query goes through the
+        //    covering-index path (no document reads at all).
+        users.EnsureIndex("city");
+        List<int> bj2 = users.FindIdsByField("city", "北京");
+        Check("ids-index-path", bj2.Count == 2 && bj2[0] == a && bj2[1] == b);
+        Check("ids-index-none", users.FindIdsByField("city", "广州").Count == 0);
+        Check("ids-index-sh", users.FindIdsByField("city", "上海")[0] == c);
+        // dave 没有 city 字段：无论哪条路径都不应出现。
+        Check("ids-skip-fieldless", users.FindIdsByField("city", "").Count == 0);
+
+        // 7. Delete keeps both paths consistent.
+        users.DeleteById(b);
+        Check("ids-after-del", users.FindIdsByField("city", "北京").Count == 1
+            && users.FindIdsByField("city", "北京")[0] == a);
+        Check("scanfield-after-del", users.ScanField("city", (int id, JsonValue v) => {
+            return true;
+        }) == 2);
+
+        db.Close();
+
+        // 8. Reopen: projection paths work on a cold cache too.
+        ZanDatabase db2 = ZanDatabase.Open(basePath, 64);
+        Collection users2 = db2.GetCollection("users");
+        List<int> bj3 = users2.FindIdsByField("city", "北京");
+        Check("reopen-ids", bj3.Count == 1 && bj3[0] == a);
+        db2.Close();
+
+        File.Delete(basePath);
+        File.Delete(basePath + ".m0");
+        File.Delete(basePath + ".m1");
+        for (int i = 0; i < 8; i = i + 1) {
+            string seg = basePath + ".s" + Convert.ToString(i);
+            if (File.Exists(seg)) { File.Delete(seg); }
+        }
+        Console.WriteLine("pass: " + Convert.ToString(pass));
+        Console.WriteLine("fail: " + Convert.ToString(fail));
+        return 0;
+    }
+
+    static async void Main() {
+        int r = await Run();
+    }
+}
