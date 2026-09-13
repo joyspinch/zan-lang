@@ -272,31 +272,34 @@ class ZanStore {
     }
 
     /// <summary>插入或替换一个键。除非处于 Begin()/Commit() 内，
-    /// 否则按当前持久化档立即落盘；日志攒满阈值自动固化新段。</summary>
+    /// 否则按当前持久化档立即落盘；日志攒满阈值自动固化新段。
+    /// 事务内只记覆盖层、不落帧——最外层 Commit 时每个键只落
+    /// 最终值一帧（批量写同一键 N 次只写 1 帧，日志写放大大幅
+    /// 下降；帧在提交前从未离开内存，回滚与崩溃语义不变）。</summary>
     void Put(string key, string val) {
-        this.AppendRec(1, key, val);
         if (this.txDepth > 0) {
             if (this.txDel.ContainsKey(key)) { this.txDel.Remove(key); }
             if (this.txPut.ContainsKey(key)) { this.txPut.Remove(key); }
             this.txPut.Add(key, val);
             return;
         }
+        this.AppendRec(1, key, val);
         if (this.memtable.ContainsKey(key)) { this.memtable.Remove(key); }
         if (this.tombstones.ContainsKey(key)) { this.tombstones.Remove(key); }
         this.memtable.Add(key, val);
         this.FinishCommit();
     }
 
-    /// 删除键；键存在时返回 true。
+    /// 删除键；键存在时返回 true。事务内延迟到提交落帧。
     bool Delete(string key) {
         if (!this.Contains(key)) { return false; }
-        this.AppendRec(2, key, "");
         if (this.txDepth > 0) {
             if (this.txPut.ContainsKey(key)) { this.txPut.Remove(key); }
             if (this.txDel.ContainsKey(key)) { this.txDel.Remove(key); }
             this.txDel.Add(key, "");
             return true;
         }
+        this.AppendRec(2, key, "");
         this.memtable.Remove(key);
         this.index.Remove(key);
         if (!this.tombstones.ContainsKey(key)) { this.tombstones.Add(key, 0); }
@@ -304,9 +307,9 @@ class ZanStore {
         return true;
     }
 
-    /// <summary>开始一个批次：写入进入覆盖层并追加日志帧，
-    /// 最外层 Commit 时合并进 memtable 并按持久化档落盘。
-    /// 可嵌套。</summary>
+    /// <summary>开始一个批次：写入进入内存覆盖层（不落帧），
+    /// 最外层 Commit 时按覆盖层落帧、合并进 memtable 并按持久化档
+    /// 落盘。可嵌套。</summary>
     void Begin() {
         if (this.txDepth == 0) { this.txMark = this.log.Mark(); }
         this.txDepth = this.txDepth + 1;
@@ -316,9 +319,26 @@ class ZanStore {
     bool Commit() {
         if (this.txDepth > 0) { this.txDepth = this.txDepth - 1; }
         if (this.txDepth > 0) { return true; }
+        this.AppendTxFrames();
         this.MergeTxOverlay();
         this.FinishCommit();
         return true;
+    }
+
+    /// 最外层提交时按覆盖层落帧：每个键一帧、只落最终值。
+    /// 帧只在内存缓冲中追加（磁盘写仍由 FinishCommit 统一做），
+    /// 键集在 txPut/txDel 间互斥，帧序与恢复无关。
+    void AppendTxFrames() {
+        List<string> dk = this.txDel.Keys;
+        for (int i = 0; i < dk.Count; i = i + 1) {
+            this.AppendRec(2, dk[i], "");
+        }
+        List<string> pk = this.txPut.Keys;
+        for (int i = 0; i < pk.Count; i = i + 1) {
+            string v = "";
+            this.txPut.TryGetValue(pk[i], out v);
+            this.AppendRec(1, pk[i], v);
+        }
     }
 
     /// <summary>丢弃自最外层 Begin() 以来的全部写入：缓冲中的帧

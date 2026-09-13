@@ -27,6 +27,10 @@ class Collection {
     List<string> keyDict;
     bool keyDictDirty;
     long metaVersion;
+    /// 已缓存的下一个待分配 id；0 = 尚未从 seq 键加载。
+    /// 单写者模型下安全：序列键仍随每次分配落盘（事务覆盖层
+    /// 会在提交时去重成一帧），崩溃后经重开恢复，缓存作废重读。
+    int nextIdCache;
 
     /// <summary>批量索引构建中每个事务索引的文档数。</summary>
     static int INDEX_BATCH = 500;
@@ -45,6 +49,7 @@ class Collection {
         this.keyDict = new List<string>();
         this.keyDictDirty = false;
         this.metaVersion = 0 - 1;
+        this.nextIdCache = 0;
     }
 
     /// 绑定到底层 ZanStore 的一个命名空间，并加载索引列表与字段名字典。
@@ -519,12 +524,19 @@ class Collection {
     }
 
     /// 读取并推进自增 id 序列，返回新分配的 id（须在 kv 事务内）。
+    /// seq 值缓存在内存（0 = 未加载）：单写者下没有并发分配者，
+    /// 序列键本身仍随本次分配 Put 落盘，崩溃后重开时缓存作废重读。
+    /// 省掉每次分配一次 Get——实测它随段数增长，占插入路径大头。
     int NextId() {
-        string cur = this.kv.Get(SeqKey());
-        int id = 1;
-        if (cur.Length > 0) { id = Convert.ToInt(cur) + 1; }
-        this.kv.Put(SeqKey(), Convert.ToString(id));
-        return id;
+        if (this.nextIdCache < 1) {
+            string cur = this.kv.Get(SeqKey());
+            this.nextIdCache = 1;
+            if (cur.Length > 0) { this.nextIdCache = Convert.ToInt(cur) + 1; }
+        } else {
+            this.nextIdCache = this.nextIdCache + 1;
+        }
+        this.kv.Put(SeqKey(), Convert.ToString(this.nextIdCache));
+        return this.nextIdCache;
     }
 
     // ===== CRUD =====
