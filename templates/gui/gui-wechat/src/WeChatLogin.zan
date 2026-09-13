@@ -5,6 +5,11 @@ using Gui.Component;
 
 /* 登录小窗口：注册 / 登录 / 修改密码 / 找回密码，四页在同一扇小窗里翻。
  *
+ * HTML+CSS 改造：窗口内容整个是一份 WeChatLogin.html 运行期文档
+ * （GenHtml 编译期生成 WeChatLoginHtml 建树类）——四页的排布、文案与
+ * 外观（<style> 里的 wxlogin* 规则，已从 WeChatSkin 迁进文档）都在
+ * HTML 里；这份 code-behind 只留行为：翻页、状态行、登录请求。
+ *
  * 时序（对齐原版微信）：登录窗是一扇独立 OS 小窗，在主窗口 OnLoad 里
  * 用 OpenStandalone + PumpStandaloneUntil 泵它自己的事件循环——此时主
  * 窗口还没 Show，登录成功泵返回后主窗口才打开；没登录就把登录窗关掉
@@ -31,9 +36,7 @@ class WxLoginWindow : ChildWindow {
     bool loggedIn;
     Input acc;
     Input pwd;
-    Label status;
-    Flex head;
-    /// 登录请求在途（防重复点击）。
+    Control status;
     bool busy;
 
     override string Title() { return "微聊"; }
@@ -49,7 +52,7 @@ class WxLoginWindow : ChildWindow {
         WxLoginWindow w = new WxLoginWindow();
         w.BuildUi();
         w.OpenStandalone();
-        w.host.UseAppCss(WxSkin.Css());
+        w.host.UseAppCss(WeChatLoginHtml.Css);
         w.RequestRedraw();
         // 独立泵：登录成功（loggedIn 置位）即返回；窗口被关也返回。
         // 每拍顺带并入网络应答（回调在本窗口 UI 线程跑）。
@@ -61,128 +64,31 @@ class WxLoginWindow : ChildWindow {
     }
 
     void BuildUi() {
-        Panel col = Wx.Col("wxlogin");
-        col.dock = 5;
+        HtmlHandlers hs = new HtmlHandlers();
+        hs.Add("login", () => { this.DoLogin(); });
+        hs.Add("show-reg", () => { this.ShowPage(PAGE_REG); });
+        hs.Add("show-chpwd", () => { this.ShowPage(PAGE_CHPWD); });
+        hs.Add("show-forgot", () => { this.ShowPage(PAGE_FORGOT); });
+        hs.Add("back", () => { this.ShowPage(PAGE_LOGIN); });
+        Control root = WeChatLoginHtml.Build(hs);
 
-        // 顶部：头像 + 应用名（原版是上次登录的账号头像，这里用
-        // 应用徽标头像 + 名字）。
-        // 窗口根用 dock 布局（模板子窗口根的成熟定式，见
-        // WxChatWindow）：head/titlerow 吸顶，status/foot 落底，
-        // 页区吃剩余——纯流式排布在这里会把底部行挤到页前面。
-        head = Wx.Row("");
-        head.Justify("center");
-        head.AddClass("wxloginhead");
-        head.Add(Wx.Ava("微", 72, "success"));
-        head.dock = 1;
-        col.Add(head);
-        Flex titlerow = Wx.Row("");
-        titlerow.Justify("center");
-        titlerow.AddClass("wxlogintitlerow");
-        titlerow.Add(Wx.Lbl("微 聊", "wxlogintitle"));
-        titlerow.dock = 1;
-        col.Add(titlerow);
+        // 文档里的真控件按 id 找回（id → name）：账号/密码输入框与
+        // 状态行。密码掩码是行为配置，runtime 通道没有 data-x-props，
+        // 在 code-behind 补 SetProp（探针验证过的路）。
+        acc = (Input)root.Find("LoginAcc");
+        pwd = (Input)root.Find("LoginPwd");
+        pwd.SetProp("password", "true");
+        pwd.BindEvent("Submit", () => { this.DoLogin(); });
+        status = root.Find("LoginStatus");
 
-        // 四页共享同一块表单区，翻面 = 切可见。页收进一个宿主容器：
-        // 流式根里直接混不可见面板会把 status/foot 的排位挤到页前面。
         pages = new List<Control>();
-        Panel pagesHost = Wx.Col("wxpageshost");
-        pages.Add(this.BuildLogin());
-        pages.Add(this.BuildRegister());
-        pages.Add(this.BuildChangePass());
-        pages.Add(this.BuildForgot());
-        pagesHost.dock = 5;
-        for (int i = 0; i < pages.Count; i = i + 1) {
-            pages[i].visible = i == 0;
-            pages[i].dock = 5;
-            pagesHost.Add(pages[i]);
-        }
-        col.Add(pagesHost);
+        pages.Add(root.Find("PageLogin"));
+        pages.Add(root.Find("PageReg"));
+        pages.Add(root.Find("PageChpwd"));
+        pages.Add(root.Find("PageForgot"));
+        this.ShowPage(PAGE_LOGIN);
 
-        status = Wx.Lbl("", "wxloginstatus");
-        status.dock = 2;
-        col.Add(status);
-
-        this.SetRoot(col, null);
-    }
-
-    /// 登录页：账号 + 密码 + 登录 + 三个入口。
-    Control BuildLogin() {
-        Panel p = Wx.Col("wxpage");
-        acc = new Input("微信号 / 昵称");
-        acc.Class = "wxlogininput";
-        p.Add(acc);
-        pwd = new Input("密码");
-        pwd.Class = "wxlogininput";
-        pwd.password = true;
-        p.Add(pwd);
-        Button go = new Button("登 录");
-        go.Class = "primary wxloginbtn";
-        go.OnClick(() => { this.DoLogin(); });
-        p.Add(go);
-        Flex links = Wx.Row("wxloginlinks");
-        Label reg = Wx.Lbl("注册账号", "wxloginlink");
-        reg.OnClick(() => { this.ShowPage(1); });
-        links.Add(reg);
-        Flex sp = Wx.Row("");
-        sp.AddClass("grow");
-        links.Add(sp);
-        Label ch = Wx.Lbl("修改密码", "wxloginlink");
-        ch.OnClick(() => { this.ShowPage(2); });
-        links.Add(ch);
-        Flex sp2 = Wx.Row("");
-        sp2.AddClass("grow");
-        links.Add(sp2);
-        Label fg = Wx.Lbl("忘记密码", "wxloginlink");
-        fg.OnClick(() => { this.ShowPage(3); });
-        links.Add(fg);
-        p.Add(links);
-        return p;
-    }
-
-    /// 注册页：账号体系唯一，注册口在 Web 端（带邮箱验证码）。
-    Control BuildRegister() {
-        return this.WebGuidePage("注册账号",
-            "企业内部账号统一在管理平台注册：\n"
-            + "需要账号 + 企业邮箱 + 邮箱验证码，\n"
-            + "注册通过后即可用同一账号登录本客户端。");
-    }
-
-    /// 修改密码页：同走 Web 端（单账户体系）。
-    Control BuildChangePass() {
-        return this.WebGuidePage("修改密码",
-            "修改密码在管理平台的个人中心：\n"
-            + "登录 Web 端 → 个人中心 → 修改密码，\n"
-            + "改完用新密码重新登录本客户端。");
-    }
-
-    /// 找回密码页：同走 Web 端（邮箱验证码流程）。
-    Control BuildForgot() {
-        return this.WebGuidePage("找回密码",
-            "忘记密码在登录页的「找回密码」：\n"
-            + "用企业邮箱接收验证码后重置，\n"
-            + "重置后用新密码登录本客户端。");
-    }
-
-    /// Web 端指引页：标题 + 多行说明 + 服务地址 + 返回登录。
-    Control WebGuidePage(string title, string text) {
-        Panel p = Wx.Col("wxpage");
-        Label h = Wx.Lbl(title, "wxloginguide-title");
-        p.Add(h);
-        Label body = Wx.Lbl(text, "wxloginguide");
-        p.Add(body);
-        p.Add(this.BackRow());
-        return p;
-    }
-
-    /// 每页底部那行「返回登录」。
-    Flex BackRow() {
-        Flex r = Wx.Row("");
-        r.Justify("center");
-        r.AddClass("wxloginbackrow");
-        Label back = Wx.Lbl("返回登录", "wxloginlink");
-        back.OnClick(() => { this.ShowPage(0); });
-        r.Add(back);
-        return r;
+        this.SetRoot(root, null);
     }
 
     /// 翻页：切可见 + 状态行清空。
@@ -190,16 +96,12 @@ class WxLoginWindow : ChildWindow {
         for (int i = 0; i < pages.Count; i = i + 1) {
             pages[i].visible = i == n;
         }
-        /* 子页 4 个输入比登录页高，固定窗高放不下：收起大头像（原版
-           微信的子页也没有大头像），标题行保留，页区吃回这一截。 */
-        head.visible = n == PAGE_LOGIN;
-        status.Text = "";
-        this.RequestRedraw();
+        this.Note("", false);
     }
 
     /// 状态行：错误红字 / 成功绿字。
     void Note(string msg, bool ok) {
-        status.Text = msg;
+        status.SetProp("text", msg);
         status.SetClassIn("wxloginok", ok ? "wxloginok" : "");
         this.RequestRedraw();
     }

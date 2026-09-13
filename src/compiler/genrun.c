@@ -806,8 +806,12 @@ char **zan_gen_design(const char *stdlib_root, const char *const *paths,
         free(reply);
     }
 
-    remove(meta_path);
-    remove(out_path);
+    /* ZAN_KEEP_GEN_REQ=1 keeps the request/reply pair for debugging a
+     * generator mismatch (default: removed). */
+    if (getenv("ZAN_KEEP_GEN_REQ") == NULL) {
+        remove(meta_path);
+        remove(out_path);
+    }
     if (ok != 0) {
         for (size_t i = 0; i < count; i++) free(outs[i]);
         free(outs);
