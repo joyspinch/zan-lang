@@ -2596,10 +2596,15 @@ P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
   run_leakcheck.cmake/run_arcguard.cmake 三脚本统一默认
   `WORKDIR=仓库根`（由 CMAKE_SCRIPT_MODE_FILE 推导，显式 -DWORKDIR 仍优先），
   全部转绿；②win_tray/policy_gallery_coverage 在近期提交中已自愈。
-* **挂账（http 车道，真实行为差异）**：conformance_http_forwarder_stream
-  期望 `echo-body: hello-upstream`、实际 `echo-body: keep-alive`（其余 9 项
-  全过，端口绑定正常非 cwd）——转发器流式 keep-alive 复用后 echo 请求读到
-  上一个响应体，待修 src/runtime http 流缓冲。
+* **已闭账（2026-09-14，夹具违反 HTTP 义务非转发器缺陷）**：conformance_http_forwarder_stream
+  的 `echo-body: keep-alive`——raw-socket 上游夹具读到头终止符就回显，
+  从不读它自己声明的 Content-Length 请求体；转发器合法地把改写头与
+  体分两次写（SendAllAsync），头/体是否落进上游同一次 RecvAsync 全凭
+  TCP 分段运气（实测 6 连跑 1 绿 5 挂、行数恒齐仅第 9 行变）。**修**
+  （tests/conformance/http_forwarder_stream.zan）：夹具按
+  Content-Length 读全请求体再回显——比旧形状更强地验证体中继。
+  12/12 稳定；同家族 http_forwarder_keepalive 12/12（历史 1/6~1/2
+  丢唤醒包 flaky 已被 A298 系列修复治愈，见该条 1956 行）。
 * **挂账（charts 车道，渲染缺口非基建）**：conformance_gui_chart_calendar
   （FAIL render spread custom-calendar-icon）与 conformance_gui_chart_
   barminheight（FAIL stacked positive/negative segment drawn）均为内容

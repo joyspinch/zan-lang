@@ -44,6 +44,17 @@ class Prog {
         string headOnly = head.Substring(0, hb + 4);
         string body = head.Substring(hb + 4, head.Length - hb - 4);
 
+        // HTTP 义务：声明了 Content-Length 就必须把请求体读全再响应。
+        // 转发器合法地把改写头与体分两次写，若这里只认「头终止符与体
+        // 恰好落进同一次 RecvAsync」，回显的体就看 TCP 分段脸色
+        // （历史上 echo-body 因此 flaky）。
+        int cl = Prog.ContentLengthOf(headOnly);
+        while (body.Length < cl) {
+            string piece = await Socket.RecvAsync(c, 8192);
+            if (piece.Length == 0) { break; }
+            body = body + piece;
+        }
+
         if (Prog.Find(headOnly, "/stream") >= 0) {
             int _h = await Socket.SendStringAsync(c,
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
@@ -153,6 +164,23 @@ class Prog {
             if (k == m) { return i; }
         }
         return -1;
+    }
+
+    /// 解析请求头声明的 Content-Length（无声明/解析失败为 0）。
+    static int ContentLengthOf(string head) {
+        int p = Prog.Find(head, "Content-Length:");
+        if (p < 0) { return 0; }
+        int i = p + 15;
+        int n = 0;
+        while (i < head.Length) {
+            int b = head[i] & 255;
+            if (b == 13 || b == 10) { break; }
+            if (b == 32) { i = i + 1; continue; }
+            if (b < 48 || b > 57) { break; }
+            n = n * 10 + (b - 48);
+            i = i + 1;
+        }
+        return n;
     }
 
     static async int Run() {
