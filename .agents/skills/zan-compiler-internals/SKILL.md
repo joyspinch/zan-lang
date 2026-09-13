@@ -19,6 +19,16 @@ description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式�
   方全部条目（键 1 词、值 value_words 词）+ **索引整体失效
   （indexed_count=0）**——洞上方条目全部重编号后任何增量索引修复都不可能，
   find 的 stale 判据天然触发全量重建。Remove 变 O(n) 与 shift 同阶，可接受。
+  前科（A258）：ada73452 的增量 backward-shift 修复在**共享前缀键序**（同簇
+  探测链）下把索引写坏，后续 Remove 的探测循环无空槽出口直接死循环（CPU
+  100%）——形状钉在 `tests/conformance/dict_remove_shared_prefix.zan`。
+- **Keys/Values 是编译期合成的视图，不是声明的字段**（A314，2026-09-13 已修）：
+  `dict.Keys[i]` 曾整表达式折叠成常量 0——`emit_expr_index` 的成员分支只认
+  `member_access_field_type`（声明字段），合成视图解析失败后落进「静默折叠
+  常量 0」兜底，且 `d.Keys.Count` 走另一特判一直正常、极具迷惑性。凡新增
+  「名字像成员」的内建视图，检查 `emit_expr_index`/`member_access_field_type`
+  是否需要回落 `infer_expr_type`（其 member 处理才是全量）。折叠常量 0 的
+  IR 指纹：槽初始化 null 后紧跟 `store i64 0`。
 - find 的 append 快路径（只索引新追加的键）有 `kept = icnt > 0` 守卫，
   icnt=0 不会误入快路径——整体失效与增量追加逻辑兼容。
 - tail 槽清零不能省（ARC 不得见脏引用）；memset 按 libc 真身

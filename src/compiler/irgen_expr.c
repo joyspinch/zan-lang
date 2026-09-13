@@ -5342,8 +5342,13 @@ static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
         } else if (expr->index.object->kind == AST_MEMBER_ACCESS) {
             /* obj.field[i] — array stored in a struct/class field. Load the
              * field value (the array data pointer) and recover its element
-             * type from the field declaration. */
+             * type from the field declaration. member_access_field_type only
+             * sees declared fields; synthesized members (Dict.Keys/Values
+             * views, property accessors) need the full inference — without
+             * the fallback the whole access folded to the constant 0. */
             arr_type = member_access_field_type(g, locals, expr->index.object);
+            if (!arr_type)
+                arr_type = infer_expr_type(g, expr->index.object, locals);
             if (arr_type) {
                 arr_ptr = emit_expr(g, expr->index.object, locals);
                 if (type_named(arr_type, "List", 4)) {
