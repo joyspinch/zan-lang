@@ -28,7 +28,7 @@ EXCLUDED = {"WebViewBox", "CefBrowserBox", "ChoiceGroup"}
 CODE_FED = {"Wizard", "Popover", "FormField", "ListView", "AlarmBanner",
             "AlarmList", "EquipPanel", "DeviceCard", "ButtonGroup",
             "Dropdown", "RichText", "ChatView", "PropertyGrid", "Grid",
-            "FileTree", "ScrollColumn"}
+            "FileTree", "ScrollColumn", "Flex", "FormGroup"}
 
 WIN_W, WIN_H = 1560, 920
 HEAD_H = 34                             # 页签条自然高（theme.heightMedium）
@@ -218,7 +218,7 @@ add("HMI 专用", "ToolStrip", "ToolStrip 工具条", 0, 40,
     {"options": ["新建", "打开", "保存"]})
 add("HMI 专用", "StatusBar", "StatusBar 状态栏", 0, 32,
     {"options": ["就绪", "UTF-8", "第 1 页"]})
-# ---- 更多组件 7（目录外真控件，全部 code-behind 喂活） ----
+# ---- 更多组件 9（目录外真控件，全部 code-behind 喂活） ----
 add("更多组件", "ChatView", "ChatView 聊天视图", 0, 240, {}, span=2)
 add("更多组件", "FileTree", "FileTree 文件树（喂 TreeView）", 0, 240, {})
 add("更多组件", "PropertyGrid", "PropertyGrid 属性表", 0, 220, {})
@@ -226,6 +226,8 @@ add("更多组件", "ScrollColumn", "ScrollColumn 滚动列", 0, 200, {})
 add("更多组件", "RichText", "RichText 富文本", 0, 120, {})
 add("更多组件", "Grid", "Grid 栅格", 0, 140, {})
 add("更多组件", "Dropdown", "Dropdown 下拉面板", 0, 40, {})
+add("更多组件", "Flex", "Flex 弹性布局", 0, 130, {})
+add("更多组件", "FormGroup", "FormGroup 表单校验", 0, 250, {})
 
 PAGES = []
 for item in D:

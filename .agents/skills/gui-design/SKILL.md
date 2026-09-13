@@ -159,6 +159,13 @@ small-medium 之间**:画廊卡片标题先后用 13/15 都被打回"太小",17 
   卡片,内嵌场景用它的 `RenderList` 等子件;`FormField` 是设计器文档
   节点、自身无运行时绘制,运行时形态是 `FormBuilder.Build(设计 JSON)`
   实例化的真控件树。
+- **"喂不活"的判别法**(裁定一个类能不能进画廊/目录时先看这三条):
+  ①类头注释写"每帧由调用方…"、API 只有 `Begin/End/Bind` 没有
+  `Dock/Add`(ScrollView、StyledText、ChatArea)——每帧驱动的宿主件,
+  不是 retained 控件;②构造私有 + 无 `Kind()`(Layer/Prompt/
+  Ellipsis 这类静态助手);③App 级全窗(Dialog/Wizard 全窗形态)。
+  反例教训:ScrollView 名字像容器,真身是 `ScrollColumn` 背后的
+  每帧滚动助手,差点当容器补卡——读类头注释+方法面,别望文生义。
 - `data-if` 只认路径真值,不支持比较表达式;多按钮控制中间区走
   `Nav.Embed`(路由出口:惰性实例化、切走保留、可配临态),别用
   N 个布尔 data-if 硬拼。

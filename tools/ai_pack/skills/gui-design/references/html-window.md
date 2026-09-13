@@ -54,6 +54,21 @@
   见到同名目录就整体跳过 stdlib 基线内嵌，只放自家 skin.css 会让
   基线层整层丢失、flex 全退化成叠矩形（无为修仙传百艺页签全叠的根因，
   模板补带 base.css 后消除）。
+- 运行时换肤是实例方法：`form.GetApp().UseSkin("neon")`——按静态
+  `App.UseSkin(...)` 调会报 cannot call instance method（踩过）。
+
+## 模板实例化（gui-* 模板带 `{{NAME}}` 占位符）
+
+- `{{NAME}}` 在**两处**都要替换：`src/App.html`（根元素
+  `id="{{NAME}}"` 与 `data-win-title`）和 `src/App.zan`
+  （`partial class {{NAME}}`），且两个入口文件要改名为
+  `<NAME>.html`/`<NAME>.zan`（zan.proj `entry = src/{{NAME}}.html`
+  按名对上）。只换 .zan 不换 .html，GenForm 合成的
+  `<NAME>.OnLoad` 找不到方法、模板内组件字段全裸（只复制
+  App.zan/App.html 各一份编译 gui-wechat 这类多文件模板也会
+  undefined type——整个 src 都要带）。
+- 参考实例化脚本（仓库 `scripts/e2e_pipeline.ps1` 的做法）：整树
+  拷贝 + 替换 + 用 zan.proj 编译，别手搓单文件。
 
 ## 验证定式
 
