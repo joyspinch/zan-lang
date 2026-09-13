@@ -339,6 +339,29 @@ static void zan_refs_add(zp_refs_t *r, zan_istr_t name, zan_arena_t *arena) {
     r->items[r->count++] = name;
 }
 
+/* Type-parameter count of a declared type: class/struct/interface/enum keep
+ * their own list, a delegate declaration reuses method_decl. */
+static int decl_type_param_count(const zan_ast_node_t *d) {
+    if (!d) return 0;
+    if (d->kind == AST_DELEGATE_DECL) return d->method_decl.type_params.count;
+    return d->type_decl.type_params.count;
+}
+
+/* A type reference carrying type arguments can only bind to a declaration
+ * that declares the same number of type parameters (the C# generic-arity
+ * rule). `Gui.Action` is a non-generic delegate; when a same-namespace or
+ * using-imported `Action` makes nsresolve rewrite `Action` references to the
+ * mangled name, an `Action<string>` reference rewritten along with them would
+ * silently lose its argument and change the type's signature -- the rewritten
+ * reference then binds to the zero-parameter delegate and every delegate
+ * invoke on it emits a call with the wrong arity (the lambda_87 IDE-build
+ * verifier failure). Such a reference must stay untouched so the binder
+ * resolves the generic builtin (System.Action<T>) instead. */
+static bool arity_matches(const zan_ast_node_t *tr, const nr_type_t *t) {
+    if (tr->type_ref.type_args.count == 0) return true;
+    return decl_type_param_count(t->decl) == tr->type_ref.type_args.count;
+}
+
 static void resolve_ref(nr_ctx_t *c, zan_ast_node_t *tr,
                         zan_istr_t ctx_ns, zan_ast_list_t *usings) {
     zan_istr_t R = tr->type_ref.name;
@@ -355,6 +378,12 @@ static void resolve_ref(nr_ctx_t *c, zan_ast_node_t *tr,
                 zan_istr_t up = flatten_qname(u->using_decl.name, c->arena);
                 t = find_full(c, join_ns(c->arena, up, R));
             }
+        }
+        if (t && !arity_matches(tr, t)) {
+            /* qualified reference with the wrong arity for the declared
+             * type: reduce to the simple name and let the binder resolve
+             * it (the generic builtin, if any) */
+            t = NULL;
         }
         if (t) {
             tr->type_ref.name = t->final;
@@ -379,12 +408,21 @@ static void resolve_ref(nr_ctx_t *c, zan_ast_node_t *tr,
      * `partial class App` bound its App.OnLoad to Gui.App). join_ns returns
      * the bare name for an empty ctx_ns, so this covers both. */
     t = find_full(c, join_ns(c->arena, ctx_ns, R));
+    if (t && !arity_matches(tr, t)) {
+        /* The same-namespace declaration cannot take the reference's type
+         * arguments: leave the reference untouched (it resolves to the
+         * generic builtin) instead of rewriting it onto the mangled
+         * non-generic name. */
+        if (c->refs) zan_refs_add(c->refs, R, c->arena);
+        return;
+    }
     if (!t && usings) {
         for (int i = 0; i < usings->count && !t; i++) {
             zan_ast_node_t *u = usings->items[i];
             if (!u || u->kind != AST_USING_DECL || u->using_decl.is_static) continue;
             zan_istr_t up = flatten_qname(u->using_decl.name, c->arena);
             t = find_full(c, join_ns(c->arena, up, R));
+            if (t && !arity_matches(tr, t)) t = NULL;
         }
     }
     if (t) {

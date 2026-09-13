@@ -1399,6 +1399,11 @@ foreach(_src ${_conf_srcs})
   elseif(_name STREQUAL "server_mvc_timezone")
     set(_extra_args
       "${CMAKE_SOURCE_DIR}/templates/server/server-mvc/src/Framework/Fmt.zan")
+  elseif(_name STREQUAL "ns_conflict_generic_arity")
+    # The case needs a same-simple-name delegate in a second namespace so
+    # nsresolve sees the cross-namespace collision it locks in.
+    set(_extra_args
+      "${CMAKE_SOURCE_DIR}/tests/conformance/helpers/ns_conflict_other_action.zan")
   elseif(_name STREQUAL "file_embed_bytes")
     # The case reads its fixtures back through the embedded-resource API;
     # they are registered under "assets/..." via --embed.
@@ -1580,6 +1585,11 @@ foreach(_src ${_conf_srcs})
   elseif(_name STREQUAL "server_mvc_timezone")
     set(_extra_args
       "${CMAKE_SOURCE_DIR}/templates/server/server-mvc/src/Framework/Fmt.zan")
+  elseif(_name STREQUAL "ns_conflict_generic_arity")
+    # The case needs a same-simple-name delegate in a second namespace so
+    # nsresolve sees the cross-namespace collision it locks in.
+    set(_extra_args
+      "${CMAKE_SOURCE_DIR}/tests/conformance/helpers/ns_conflict_other_action.zan")
   elseif(_name STREQUAL "file_embed_bytes")
     # Same branch as the conformance/arcguard loops: the fixtures only exist
     # through the embedded-resource API, registered via --embed.
@@ -1636,6 +1646,11 @@ foreach(_src ${_conf_srcs})
   elseif(_name STREQUAL "server_mvc_timezone")
     set(_extra_args
       "${CMAKE_SOURCE_DIR}/templates/server/server-mvc/src/Framework/Fmt.zan")
+  elseif(_name STREQUAL "ns_conflict_generic_arity")
+    # The case needs a same-simple-name delegate in a second namespace so
+    # nsresolve sees the cross-namespace collision it locks in.
+    set(_extra_args
+      "${CMAKE_SOURCE_DIR}/tests/conformance/helpers/ns_conflict_other_action.zan")
   elseif(_name STREQUAL "file_embed_bytes")
     # The case reads its fixtures back through the embedded-resource API;
     # they are registered under "assets/..." via --embed. (Same branch as the

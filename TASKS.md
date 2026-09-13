@@ -2491,16 +2491,29 @@ P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
   无法复现；台账行号（Transfer.zan:204/207、DataGrid.zan:89/306/341）
   所指代码已不存在，疑 A312 限定名逃逸根修顺带治愈。skill 同提交
   改记闭账状态，保留诊断 heuristic（同名类型互斥转换先疑闭包裁剪）。
-* **挂账缺陷③（新）：closure 签名 LLVM verifier 失败**——IDE 全量
-  输入（在途树）报 `lambda_87: Incorrect number of arguments...
-  call void %dlg.fn(ptr %clo.rec, ptr %load4)` 四处。证据链：
-  新旧编译器（542204d2/22d75d0e+）同错 → 非本轮 parser 系列引入；
-  stash 基线同错 → 非 IDE 清扫引入；IDE 设计文档零 data-arg → 非
-  ③ 闭包引入；HEAD stdlib 因 7953b6b3 半提交（ChartResolved 调
-  ChartView.ZOrder，HEAD 无此成员）bind 不通过，无法取 HEAD 基线。
-  疑似 delegate 两形态（裸函数指针/闭包 rec+fn）调用点形态判定错，
-  zan-compiler-internals 已载该域。待在途 Chart 会话落地后以稳定树
-  专项定位。
+* **挂账缺陷③（新，已修，本轮闭环）：nsresolve 冲突改名丢泛型实参
+  → lambda 委托调用参数个数错 → IDE 构建 verifier 失败**——IDE 全量
+  输入报 `lambda_87: Incorrect number of arguments... call void
+  %dlg.fn(ptr %clo.rec, ptr %load4)`。根因链：stdlib/Gui/Event.zan
+  （namespace Gui）与 stdlib/Gui/Reactive/Events.zan（namespace
+  Gui.Reactive）各有一个零参 `delegate void Action()`；IDE 构建 glob
+  全 Gui 树 → 两声明跨命名空间冲突 → nsresolve 把双方改名为
+  Gui_Action/... 并改写引用，但改写不看泛型实参——Gui 命名空间文件
+  里的 `Action<string>` 被改写到非泛型名上，实参在 binder 静默丢弃，
+  类型变 pc=0 委托；ChildWindow.WireNode / Html.WireArg 的
+  `Action<string> aa = ...; () => { aa(arg); }` 于是按 pc=0 发射
+  argc=1 的调用，verifier 拒绝。**为何只炸 IDE 构建**：conformance/
+  单文件走 auto-stdlib 按需拉取，Gui.Reactive 不入编译 → 无冲突 →
+  不改名 → 一切正常；glob 全量（IDE）必中招，与设计文档数量无关
+  （此前设计二分的全部信号皆假，度量被"类型错误=假通过"污染）。
+  修法：nsresolve.resolve_ref 按泛型配对规则过滤候选（引用带实参而
+  候选声明类型参数个数不符 → 不改写，回落内建 Action<T>；bare 形式
+  照旧改写）。诊断手法立功：ZANC_DUMP_BAD_IR 拿到挂掉函数 IR +
+  临时 arity 审计（expect vs actual）+ 全模块 dump 找到 lambda 的
+  创建者函数反查捕获 → `delegate=Gui_Action pc=0 argc=1` 一锤定音。
+  conformance 新用例 ns_conflict_generic_arity 锁形状（四连体
+  Passed；standard 层 834 例除在途外部失败外全绿；build_ide.ps1
+  全量绿灯 IDE_BUILD_OK）。
 * **缺陷④（新，已修 280e08d6）：void 调用结果当值漏诊**——
   checker_check_assignable 把 type_void 与 type_error 同路放行 +
   调用实参无签名时（重载/内建）无检查，void 当实参/初始化器静默

@@ -1,6 +1,6 @@
 ---
 name: zan-compiler-internals
-description: zanc 编译器内部（parser/checker/irgen）的定式与坑——Dict 内建布局契约、LLVM select 死臂泄漏（用 branch+phi）、delegate 两形态与 wasm32 ZAN_CLOSURE_TAG 碰撞、ARC 所有权判定内建优先于 extern 借用、stdlib 按需拉入的坑、交叉工具链 .o 重出配方、conformance 处置四分法、scratch 卫生（bisect 用 worktree 即用即删）。做或改 src/compiler/*、交叉运行时对象、conformance golden 时使用。
+description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式与坑——Dict 内建布局契约、LLVM select 死臂泄漏（用 branch+phi）、delegate 两形态与 wasm32 ZAN_CLOSURE_TAG 碰撞、nsresolve 冲突改名丢泛型实参（全量输入 vs 按需拉取行为不同）、ARC 所有权判定内建优先于 extern 借用、stdlib 按需拉入的坑、交叉工具链 .o 重出配方、conformance 处置四分法、scratch 卫生（bisect 用 worktree 即用即删）。做或改 src/compiler/*、交叉运行时对象、conformance golden 时使用。
 ---
 
 # zanc 编译器内部定式与坑
@@ -88,6 +88,41 @@ description: zanc 编译器内部（parser/checker/irgen）的定式与坑——
   方法组`、`只接受`）`git grep` 全仓（含 `stdlib/**` 与生成器 Append 串），注释里
   引用的 `_scratch` 探针结论一并复核。坑出处：这三处是"文档更新已完成"当天漏掉
   的，"更新 stdlib 注释"被当成做完，实际只改了一半。
+
+## nsresolve 冲突改名丢泛型实参：只在"全量输入"构建炸（lambda_87，2026-09-13）
+
+- **症状**：IDE 构建（glob 全 Gui 树）报 `LLVM verification failed in
+  lambda_87: Incorrect number of arguments passed to called function!`，
+  `call void %dlg.fn(ptr %clo.rec, ptr %load4)`；同一份 Gui 源码在
+  conformance/单文件编译全绿。挂掉的是 ChildWindow.WireNode /
+  Html.WireArg 的 `Action<string> aa = ...; () => { aa(arg); }`。
+- **根因链**：`Gui/Event.zan`（namespace Gui）与
+  `Gui/Reactive/Events.zan`（namespace Gui.Reactive）各有一个零参
+  `delegate void Action()`。nsresolve 对跨命名空间同名声明双方 mangle
+  （Gui_Action…）并改写所有解析到的引用，但 `type_ref.name` 只是基名、
+  泛型实参在独立列表里——**改写基名天然丢实参**。Gui 命名空间文件里的
+  `Action<string>` 于是被绑到零参 Gui_Action（binder 侧 scope 命中声明、
+  静默丢 args），lambda 捕获记下 pc=0，invoke 按 argc=1 发射 → verifier。
+- **为什么只有全量构建炸（本轮最大陷阱）**：conformance/单文件走
+  auto-stdlib **按需拉取**，Gui.Reactive 不入编译 → 无冲突 → 不改名 →
+  一切正常；glob 全量必中招。**拉入面一变，nsresolve 的冲突集就变，
+  同一文件在不同输入集下类型解析结果不同**——"单文件探针无法复现"不
+  等于"编译器无缺陷"。修法：resolve_ref 按泛型配对规则过滤（引用带
+  实参而候选声明的 type_params 个数不符 → 不改写、回落内建 Action<T>；
+  bare 形式照旧改写）。conformance 锁：ns_conflict_generic_arity
+  （主文件 namespace Widgets + helpers/ 子目录附加第二个命名空间，
+  ZANC_ARGS 附带——GLOB 不递归，helpers 不会被当成独立用例）。
+- **诊断三板斧（verifier "Incorrect number of arguments" 通用）**：
+  ① `ZANC_DUMP_BAD_IR=1` 拿挂掉函数的 IR（irgen_emit.c 现成钩子）；
+  ② 临时给 emit 点加 arity 审计（`LLVMCountParamTypes(调用函数类型)`
+  vs `LLVMGetNumArgOperands`）判定哪一臂、差多少；③ 临时全模块 dump
+  （LLVMPrintModuleToString）后按 `%clo = call ptr @zan_rt_alloc`
+  的 define 反查 lambda 创建者函数与捕获槽来源——比读源码猜形状快
+  一个数量级。最终 `delegate=Gui_Action pc=0 argc=1` 一行定案。
+- **bisect 度量陷阱**：用"目标错误消息消失"当 pass，会把"类型错误
+  提前终止编译"的运行误判成 pass（codegen 没跑当然没有 verifier 错）
+  ——本轮设计文档二分的全部结论因此作废。二分前先确认每个子集都能
+  走到被观测的阶段（closed set），或把 pass 判据定为"编译成功"。
 
 ## wasm32 局部数爆炸：V8 每函数 5 万局部硬上限
 
