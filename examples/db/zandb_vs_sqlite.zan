@@ -134,6 +134,28 @@ class ZanDbVsSqlite {
         Console.WriteLine("[sqlite] id lookup (cover) " + Ms(idqMs) + " ms = "
             + Ops(hits, idqMs) + " (rows=" + Convert.ToString(hits) + ")");
 
+        // 无索引字段的等值过滤：两侧都只能全表扫。口径 = 扫过的文档数。
+        hits = 0;
+        sw = Stopwatch.StartNew();
+        for (int r = 0; r < 10; r = r + 1) {
+            DbResult ids2 = sdb.Query("SELECT id FROM docs WHERE name = ?",
+                new DbParams().Add("user-12345"));
+            hits = hits + ids2.RowCount();
+        }
+        double nfMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("[sqlite] filter (no index) " + Ms(nfMs) + " ms = "
+            + Ops(10 * N, nfMs) + " docs/s (rows=" + Convert.ToString(hits) + ")");
+
+        sw = Stopwatch.StartNew();
+        long cnt = 0;
+        for (int r = 0; r < 10; r = r + 1) {
+            DbResult cr = sdb.Query("SELECT COUNT(*) AS n FROM docs");
+            cnt = cnt + cr.GetByName(0, "n").Length;
+        }
+        double cMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("[sqlite] count             " + Ms(cMs) + " ms = "
+            + Ops(cnt, cMs) + " rows/s");
+
         int M = 2000;
         sw = Stopwatch.StartNew();
         for (int i = 0; i < M; i = i + 1) {
@@ -176,6 +198,19 @@ class ZanDbVsSqlite {
         insMs = sw.ElapsedMilliseconds();
         Console.WriteLine("[zandb ] insert batched   " + Ms(insMs) + " ms = " + Ops(N, insMs));
 
+        sw = Stopwatch.StartNew();
+        docs.EnsureIndex("cat");
+        idxMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("[zandb ] index build      " + Ms(idxMs) + " ms");
+
+        // 维护：把多段归并为单段（写路径固化出的段 + 索引段）。
+        // 之后的全部查询场景都在归并后的稳态上测量——与 SQLite
+        // 的无段概念对齐；未归并的扫描要走多路归并，另行标注。
+        sw = Stopwatch.StartNew();
+        zdb.MergeSegments();
+        double mgMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("[zandb ] merge segments   " + Ms(mgMs) + " ms");
+
         sink = 0;
         sw = Stopwatch.StartNew();
         for (int r = 0; r < 3; r = r + 1) {
@@ -215,11 +250,6 @@ class ZanDbVsSqlite {
         Console.WriteLine("[zandb ] projection scan  " + Ms(zprojMs) + " ms = "
             + Ops(scanned, zprojMs) + " docs");
 
-        sw = Stopwatch.StartNew();
-        docs.EnsureIndex("cat");
-        idxMs = sw.ElapsedMilliseconds();
-        Console.WriteLine("[zandb ] index build      " + Ms(idxMs) + " ms");
-
         hits = 0;
         sw = Stopwatch.StartNew();
         for (int r = 0; r < 20; r = r + 1) {
@@ -240,7 +270,29 @@ class ZanDbVsSqlite {
         Console.WriteLine("[zandb ] id lookup (cover) " + Ms(zidqMs) + " ms = "
             + Ops(hits, zidqMs) + " (rows=" + Convert.ToString(hits) + ")");
 
-        zdb.MergeSegments();
+        // 无索引字段的等值过滤：FieldEquals 零分配逐字节比较。
+        // 口径 = 扫过的文档数。
+        hits = 0;
+        sw = Stopwatch.StartNew();
+        for (int r = 0; r < 10; r = r + 1) {
+            List<int> nid = docs.FindIdsByField("name", "user-12345");
+            hits = hits + nid.Count;
+        }
+        double znfMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("[zandb ] filter (no index) " + Ms(znfMs) + " ms = "
+            + Ops(10 * N, znfMs) + " docs/s (rows=" + Convert.ToString(hits) + ")");
+
+        // Count：存储层直数（无回调、墓碑空集免哈希）。
+        sw = Stopwatch.StartNew();
+        long cnt = 0;
+        for (int r = 0; r < 10; r = r + 1) {
+            cnt = cnt + docs.Count();
+        }
+        double zcMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("[zandb ] count             " + Ms(zcMs) + " ms = "
+            + Ops((int)cnt, zcMs) + " docs/s");
+
+        // 磁盘占用：写路径已结束、查询不写入，归并后的状态即终态。
         long zbytes = 0;
         string[] parts = new string[67];
         parts[0] = zpath;                // 日志就是基名文件本身

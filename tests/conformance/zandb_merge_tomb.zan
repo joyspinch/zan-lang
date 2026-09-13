@@ -1,0 +1,110 @@
+using System;
+using System.Data.ZanDb;
+using System.Json;
+
+// ZanDB merge tombstones: MergeSegments rebuilds the key index from
+// segment contents only. A delete whose put already lives in a flushed
+// segment must survive the merge -- both the checkpointed shape
+// (tombstone already in a segment) and the tx shape (tombstone still in
+// the memtable-side set; merge must not re-add the key to the rebuilt
+// index, which Get/Contains consult without checking tombstones).
+class Program {
+    static int pass = 0;
+    static int fail = 0;
+
+    static void Check(string name, bool ok) {
+        if (ok) { pass = pass + 1; }
+        else { fail = fail + 1; Console.WriteLine("FAIL " + name); }
+    }
+
+    static void Clean(string p) {
+        File.Delete(p);
+        File.Delete(p + ".m0");
+        File.Delete(p + ".m1");
+        for (int i = 0; i < 64; i = i + 1) {
+            string seg = p + ".s" + Convert.ToString(i);
+            if (File.Exists(seg)) { File.Delete(seg); }
+        }
+    }
+
+    static async int Run() {
+        // 1. KV level, tx shape: put flushed, delete only in the
+        //    memtable-side tombstone set when the merge runs.
+        string kvPath = "zandb_mt_kv.tmp.zdb";
+        Clean(kvPath);
+        ZanStore s = ZanStore.Open(kvPath, ZanStore.DUR_GROUP);
+        s.SetFlushThreshold(16384);
+        for (int i = 0; i < 4000; i = i + 1) {
+            s.Put("d" + Convert.ToString(i), "v" + Convert.ToString(i));
+        }
+        s.Put("k", "v1");
+        s.Checkpoint();                          // k 已入段
+        for (int i = 4000; i < 8000; i = i + 1) {
+            s.Put("d" + Convert.ToString(i), "v" + Convert.ToString(i));
+        }
+        s.Begin();
+        s.Delete("k");                           // 事务内删除：墓碑留在内存集
+        s.Commit();
+        Check("kv-pre", !s.Contains("k") && s.Get("k") == "");
+        s.MergeSegments();
+        Check("kv-merged", !s.Contains("k") && s.Get("k") == "");
+        s.Checkpoint();
+        s.MergeSegments();
+        Check("kv-remerge", !s.Contains("k") && s.Get("k") == "");
+        // 重新写入后归并：新值必须留下
+        s.Put("k", "v2");
+        s.MergeSegments();
+        Check("kv-reput", s.Contains("k") && s.Get("k") == "v2");
+        s.Close();
+
+        ZanStore s2 = ZanStore.Open(kvPath, ZanStore.DUR_GROUP);
+        Check("kv-reopen", s2.Get("k") == "v2");
+        s2.Close();
+        Clean(kvPath);
+
+        // 2. Document level: deleted docs stay gone across merge --
+        //    point reads, Count, FindAll, and (the original symptom)
+        //    secondary-index lookups must not fall back or resurrect.
+        string basePath = "zandb_mt_docs.tmp.zdb";
+        Clean(basePath);
+        ZanDatabase db = ZanDatabase.Open(basePath, ZanStore.DUR_GROUP);
+        db.Kv().SetFlushThreshold(16384);
+        Collection docs = db.GetCollection("docs");
+        for (int i = 1; i <= 6000; i = i + 1) {
+            JsonValue d = JsonValue.NewObject();
+            d.Set("name", JsonValue.NewStr("u" + Convert.ToString(i)));
+            d.Set("cat", JsonValue.NewStr("c" + Convert.ToString(i % 4)));
+            docs.Insert(d);
+        }
+        docs.EnsureIndex("cat");
+        docs.DeleteById(6000);
+        docs.DeleteById(5999);
+        Check("doc-pre", docs.FindById(6000) == null && docs.FindById(5999) == null);
+        Check("doc-pre-count", docs.Count() == 5998);
+        db.MergeSegments();
+        Check("doc-merged", docs.FindById(6000) == null && docs.FindById(5999) == null);
+        Check("doc-merged-count", docs.Count() == 5998);
+        Check("doc-merged-findall", docs.FindAll().Count == 5998);
+        Check("doc-merged-idx", docs.FindByIndex("cat", "c0").Count == 1499
+            && docs.FindByIndex("cat", "c1").Count == 1500);
+        Check("doc-merged-ids", docs.FindIdsByField("cat", "c0").Count == 1499);
+        Check("doc-merged-countby", docs.CountByField("cat", "c2") == 1500);
+        db.Close();
+
+        ZanDatabase db2 = ZanDatabase.Open(basePath, ZanStore.DUR_GROUP);
+        Collection docs2 = db2.GetCollection("docs");
+        Check("doc-reopen", docs2.FindById(6000) == null
+            && docs2.Count() == 5998
+            && docs2.FindByIndex("cat", "c0").Count == 1499);
+        db2.Close();
+        Clean(basePath);
+
+        Console.WriteLine("pass: " + Convert.ToString(pass));
+        Console.WriteLine("fail: " + Convert.ToString(fail));
+        return 0;
+    }
+
+    static async void Main() {
+        int r = await Run();
+    }
+}

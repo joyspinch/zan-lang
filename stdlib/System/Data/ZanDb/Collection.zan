@@ -531,6 +531,40 @@ class Collection {
         return null;
     }
 
+    /// <summary>字段等值判定（<see cref="FindIdsByField"/> 与
+    /// <see cref="CountByField"/> 的过滤内核）：字符串值
+    /// （记录 tag 5）按长度 + 逐字节比较，零分配；
+    /// 其他类型才解码出值按 <see cref="JsonValue.AsString"/>
+    /// 比较（与投影读语义一致）。与 FieldOf 相同的记录行走，
+    /// 但命中字段后不构建 JsonValue。</summary>
+    bool FieldEquals(string body, int kid, string val) {
+        if (kid == 0) { return false; }
+        if (StrMemChr(body, 255, body.Length) != 0) { body = Collection.UnescapeRecord(body); }
+        int p = 1;                     // 'B'
+        long n = Collection.RecVarInt(body, p, out p);
+        int i = 0;
+        while (i < (int)n) {
+            long k = Collection.RecVarInt(body, p, out p);
+            if ((int)k == kid) {
+                int tag = body[p] & 255;
+                if (tag == 5) {
+                    p = p + 1;
+                    long len = Collection.RecVarInt(body, p, out p);
+                    if (len != val.Length) { return false; }
+                    for (int j = 0; j < (int)len; j = j + 1) {
+                        if (body[p + j] != val[j]) { return false; }
+                    }
+                    return true;
+                }
+                JsonValue f = ReadValS(body, p, out p);
+                return f.AsString("") == val;
+            }
+            Collection.SkipValS(body, p, out p);
+            i = i + 1;
+        }
+        return false;
+    }
+
     /// 把存储的二进制记录（见 <see cref="EncodeDoc"/>）解码回 JsonValue 对象；
     /// "_id" 由调用方从行键附加。
     JsonValue DecodeDoc(string body) {
@@ -791,8 +825,9 @@ class Collection {
     }
 
     /// <summary>通过扫描找出字段等于 val 的文档：每条
-    /// 记录只被询问这一个字段，只有匹配项会被完整解码。
-    /// 用于字段没有可用索引的情况。</summary>
+    /// 记录只被询问这一个字段（字符串值走零分配比较），
+    /// 只有匹配项会被完整解码，全程流式、不经 KvEntry
+    /// 中间层。用于字段没有可用索引的情况。</summary>
     List<JsonValue> FindByFieldScan(string field, string val) {
         SyncMeta();
         List<JsonValue> docs = new List<JsonValue>();
@@ -800,21 +835,20 @@ class Collection {
         if (kid == 0) {
             return docs;
         }
-        List<KvEntry> entries = new List<KvEntry>();
-        this.kv.ScanRange(DocKey(0), "c:" + this.name + ";", 0, entries);
-        for (int i = 0; i < entries.Count; i = i + 1) {
-            JsonValue f = FieldOf(entries[i].val, kid);
-            if (f != null && f.AsString("") == val) {
-                JsonValue doc = DecodeDoc(entries[i].val);
-                doc.Set("_id", JsonValue.NewNum(Collection.IdFromKey(entries[i].key)));
+        string hi = "c:" + this.name + ";";
+        this.kv.ScanBetween("c:" + this.name + ":", hi, delegate(string k, string v) {
+            if (FieldEquals(v, kid, val)) {
+                JsonValue doc = DecodeDoc(v);
+                doc.Set("_id", JsonValue.NewNum(Collection.IdFromKey(k)));
                 docs.Add(doc);
             }
-        }
+            return true;
+        });
         return docs;
     }
 
     /// <summary>字段值等于 val 的文档数，无需具体化
-    /// 任何文档。</summary>
+    /// 任何文档：字符串值零分配比较，全程流式计数。</summary>
     int CountByField(string field, string val) {
         SyncMeta();
         int n = 0;
@@ -827,24 +861,18 @@ class Collection {
         if (kid == 0) {
             return 0;
         }
-        List<KvEntry> entries2 = new List<KvEntry>();
-        this.kv.ScanRange(DocKey(0), "c:" + this.name + ";", 0, entries2);
-        for (int i = 0; i < entries2.Count; i = i + 1) {
-            JsonValue f = FieldOf(entries2[i].val, kid);
-            if (f != null && f.AsString("") == val) { n = n + 1; }
-        }
+        string hi = "c:" + this.name + ";";
+        this.kv.ScanBetween("c:" + this.name + ":", hi, delegate(string k, string v) {
+            if (FieldEquals(v, kid, val)) { n = n + 1; }
+            return true;
+        });
         return n;
     }
 
-    /// <summary>文档总数（对命名空间做范围扫描）。只数键、
-    /// 不物化条目，大集合上不再按文档数分配。</summary>
+    /// <summary>文档总数（命名空间的键范围直数）。上界判定
+    /// 与存活判定都在存储层循环内，无回调、大集合不按文档数分配。</summary>
     int Count() {
-        string lo = "c:" + this.name + ":";
-        string hi = "c:" + this.name + ";";
-        return this.kv.Scan(lo, delegate(string k, string v) {
-            if (String.CompareOrdinal(k, hi) > 0) { return false; }
-            return true;
-        });
+        return this.kv.CountRange("c:" + this.name + ":", "c:" + this.name + ";");
     }
 
     /// <summary>按 id 顺序返回所有文档。</summary>
@@ -860,11 +888,10 @@ class Collection {
         string hi = "";
         if (toId > 0) { hi = DocKey(toId); }
         else { hi = "c:" + this.name + ";"; }   // ';' 的排序紧随 ':' 之后
-        // 流式解码：扫描回调里直接建文档树，不经 KvEntry 中间层。
-        // [lo, hi] 闭区间内全是本集合的行键，无需再核对前缀。
+        // 流式解码：扫描回调里直接建文档树，不经 KvEntry 中间层；
+        // 上界由存储层判定。
         List<JsonValue> docs = new List<JsonValue>();
-        this.kv.Scan(lo, delegate(string k, string v) {
-            if (String.CompareOrdinal(k, hi) > 0) { return false; }
+        this.kv.ScanBetween(lo, hi, delegate(string k, string v) {
             JsonValue doc = DecodeDoc(v);
             doc.Set("_id", JsonValue.NewNum(Convert.ToString(Collection.IdOfKey(k))));
             docs.Add(doc);
@@ -884,8 +911,7 @@ class Collection {
         if (kid == 0) { return 0; }
         string hi = "c:" + this.name + ";";
         int n = 0;
-        this.kv.Scan("c:" + this.name + ":", delegate(string k, string v) {
-            if (String.CompareOrdinal(k, hi) > 0) { return false; }
+        this.kv.ScanBetween("c:" + this.name + ":", hi, delegate(string k, string v) {
             JsonValue f = FieldOf(v, kid);
             if (f != null) {
                 n = n + 1;
@@ -914,10 +940,8 @@ class Collection {
         int kid = KeyIdOf(field);
         if (kid == 0) { return ids; }
         string hi = "c:" + this.name + ";";
-        this.kv.Scan("c:" + this.name + ":", delegate(string k, string v) {
-            if (String.CompareOrdinal(k, hi) > 0) { return false; }
-            JsonValue f = FieldOf(v, kid);
-            if (f != null && f.AsString("") == val) { ids.Add(Collection.IdOfKey(k)); }
+        this.kv.ScanBetween("c:" + this.name + ":", hi, delegate(string k, string v) {
+            if (FieldEquals(v, kid, val)) { ids.Add(Collection.IdOfKey(k)); }
             return true;
         });
         return ids;

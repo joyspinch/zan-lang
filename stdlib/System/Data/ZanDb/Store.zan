@@ -487,7 +487,7 @@ class ZanStore {
         SegmentWriter wtr = SegmentWriter.Create(segPath);
         if (wtr.Failed()) { this.lastError = wtr.GetError(); return; }
         // 各段游标，段号降序 = 新→旧；每键第一个停住的游标即最新
-        // 版本：put 落并入段，墓碑让整键消失（旧版本一并作废）。
+        // 版本：put 落入归并段，墓碑让整键消失（旧版本一并作废）。
         List<SegCursor> cursors = new List<SegCursor>();
         for (int i = this.segs.Count - 1; i >= 0; i = i - 1) {
             cursors.Add(SegCursor.Open(this.segs[i].seg, ""));
@@ -505,6 +505,16 @@ class ZanStore {
                 }
             }
             if (!has) { break; }
+            // 尚未固化的墓碑同样压住段内旧版本：该键整体跳过、
+            // 不写入归并段——重建的键索引才不会让它复活
+            // （Get/Contains 走 memtable+索引，不查墓碑集）。
+            if (this.tombstones.ContainsKey(minKey)) {
+                for (int i = 0; i < cursors.Count; i = i + 1) {
+                    SegCursor c = cursors[i];
+                    if (c.Valid() && c.Key() == minKey) { c.Next(); }
+                }
+                continue;
+            }
             // 第一个（=最新段的）停在 minKey 的游标无条件定生死：
             // put 落入归并段；墓碑让整键消失——绝不能落到更旧段
             // 的同名 put（否则删除会复活）。
@@ -586,32 +596,46 @@ class ZanStore {
     /// 提交事务的覆盖层）；memtable 部分每次扫描现排序，段部分
     /// 顺序流读、不占用块缓存。返回 visit 接受的键数。</summary>
     int Scan(string fromKey, StoreVisit visit) {
+        return ScanBetween(fromKey, "", visit);
+    }
+
+    /// <summary><see cref="Scan"/> 的有界形式：只访问
+    /// [startKey, endKey] 闭区间内的键，上界在归并循环内判定，
+    /// 调用方无需在回调里逐键比对。返回 visit 接受的键数。</summary>
+    int ScanBetween(string startKey, string endKey, StoreVisit visit) {
         // 各段游标，段号降序排列 = 新段在前。
         List<SegCursor> cursors = new List<SegCursor>();
         for (int i = this.segs.Count - 1; i >= 0; i = i - 1) {
-            cursors.Add(SegCursor.Open(this.segs[i].seg, fromKey));
+            cursors.Add(SegCursor.Open(this.segs[i].seg, startKey));
         }
-        // memtable 中键 ≥ fromKey 的部分（每键至多一条，即最新版本），
+        // memtable 中键 ≥ startKey 的部分（每键至多一条，即最新版本），
         // 先过滤再排序：固化+归并后的常态是 memtable 为空，排序整段跳过。
         List<string> mk = new List<string>();
         List<string> src = this.memtable.Keys;
         for (int i = 0; i < src.Count; i = i + 1) {
-            if (String.CompareOrdinal(src[i], fromKey) >= 0) { mk.Add(src[i]); }
+            if (String.CompareOrdinal(src[i], startKey) >= 0) { mk.Add(src[i]); }
         }
         ZanStore.SortStrings(mk);
         int mi = 0;
 
         int accepted = 0;
+        bool bounded = endKey.Length > 0;
+        // 墓碑集为空（无未固化删除）时逐键哈希整个跳过：
+        // 扫描态集合的常态。
+        bool hasTombs = this.tombstones.Count > 0;
 
         // 单一来源快速路径：恰好一个段、memtable 无参与归并的键。
         // 固化+归并后的常态——无需最小键仲裁与同键裁决，顺序直读。
-        // 墓碑仍须逐键检查（删除不进 memtable，无键序可借）。
         if (cursors.Count == 1 && mk.Count == 0) {
             SegCursor c = cursors[0];
             while (c.Valid()) {
-                if (c.Op() == 1 && !this.tombstones.ContainsKey(c.Key())) {
-                    if (!visit(c.Key(), c.Val())) { break; }
-                    accepted = accepted + 1;
+                if (c.Op() == 1) {
+                    string k = c.Key();
+                    if (bounded && String.CompareOrdinal(k, endKey) > 0) { break; }
+                    if (!hasTombs || !this.tombstones.ContainsKey(k)) {
+                        if (!visit(k, c.Val())) { break; }
+                        accepted = accepted + 1;
+                    }
                 }
                 c.Next();
             }
@@ -644,6 +668,7 @@ class ZanStore {
                 }
             }
             if (!has) { break; }
+            if (bounded && String.CompareOrdinal(minKey, endKey) > 0) { break; }
             // 2) 最新来源定值：memtable 优先；否则胜出游标。
             bool live = false;
             string val = "";
@@ -667,7 +692,7 @@ class ZanStore {
             }
             // 尚未固化的墓碑同样压住旧段版本（点读路径由索引摘除
             // 保证，扫描路径在这里保证）。
-            if (live && this.tombstones.ContainsKey(minKey)) { live = false; }
+            if (live && hasTombs && this.tombstones.ContainsKey(minKey)) { live = false; }
             // 4) 存活键才交给 visit；false 早停。
             if (live) {
                 if (!visit(minKey, val)) { go = false; }
@@ -676,6 +701,32 @@ class ZanStore {
         }
         for (int i = 0; i < cursors.Count; i = i + 1) { cursors[i].Free(); }
         return accepted;
+    }
+
+    /// <summary>统计 [startKey, endKey] 闭区间内的存活键数，
+    /// 不做任何回调：单段且 memtable 无参与时顺序直数，
+    /// 墓碑集为空时连逐键哈希都省掉。返回键数。</summary>
+    int CountRange(string startKey, string endKey) {
+        List<string> src = this.memtable.Keys;
+        if (this.segs.Count == 1 && src.Count == 0) {
+            SegCursor c = SegCursor.Open(this.segs[0].seg, startKey);
+            bool hasTombs = this.tombstones.Count > 0;
+            bool bounded = endKey.Length > 0;
+            int n = 0;
+            while (c.Valid()) {
+                string k = c.Key();
+                if (bounded && String.CompareOrdinal(k, endKey) > 0) { break; }
+                if (c.Op() == 1 && (!hasTombs || !this.tombstones.ContainsKey(k))) {
+                    n = n + 1;
+                }
+                c.Next();
+            }
+            c.Free();
+            return n;
+        }
+        return ScanBetween(startKey, endKey, delegate(string k, string v) {
+            return true;
+        });
     }
 
     /// <summary>共享锁下的 <see cref="Scan"/>；可与并发写入共存。</summary>
