@@ -234,6 +234,19 @@ class Fight {
 
     static async void Bootstrap(DbContext ctx) {
         if (Fight.items.Count > 0) { return; }
+        /* 世界态（城池/红包池/世界 BOSS）先于目录装载：wboss 静态量
+           从 game_world 回放，没有键=开服首刷（wbHp=0 → 懒重置满血）。
+           世界态故障绝不能拖垮目录装载——单独兜住打日志。 */
+        try {
+            await WorldState.Load(ctx);
+            Fight.wbHp = WorldState.GetNum("wboss.hp", 0);
+            Fight.wbRespawnAt = WorldState.GetNum("wboss.respawn_at", 0);
+            Fight.wbTopName = WorldState.Get("wboss.top_name", "");
+            Fight.wbTopDmg = WorldState.GetNum("wboss.top_dmg", 0);
+        } catch (Exception ex) {
+            Console.WriteLine("[worldstate] 回放失败（按开服首刷处理）："
+                + ex.Message);
+        }
         /* async void 会吞掉装载异常（实测：冷库 WAL 忙时 SELECT 抛
            DbException，目录静默为空、端口照收），因此这里兜底重试并
            把失败打到日志——目录没装载，战斗 op 全部空转。 */
@@ -1284,6 +1297,7 @@ class Fight {
         if (dmg < 1) { dmg = 1; }
         if (dmg > Fight.wbHp) { dmg = (int)Fight.wbHp; }
         Fight.wbHp = Fight.wbHp - dmg;
+        WorldState.SetNum("wboss.hp", Fight.wbHp);
         s.wbDmg = s.wbDmg + dmg;
         long gold = (long)Fight.rng.Between(Rules.Val("world_boss_gold_min"),
             Rules.Val("world_boss_gold_max"));
@@ -1297,10 +1311,13 @@ class Fight {
         if (s.wbDmg > Fight.wbTopDmg) {
             Fight.wbTopDmg = s.wbDmg;
             Fight.wbTopName = s.row.nickname;
+            WorldState.SetNum("wboss.top_dmg", Fight.wbTopDmg);
+            WorldState.Set("wboss.top_name", Fight.wbTopName);
         }
         f.Set("mydmg", JsonValue.NewNum(Convert.ToString(s.wbDmg)));
         if (Fight.wbHp <= 0) {
             Fight.wbRespawnAt = now + Rules.Val("world_boss_respawn_seconds");
+            WorldState.SetNum("wboss.respawn_at", Fight.wbRespawnAt);
             s.row.gold = s.row.gold + Rules.Val("world_boss_kill_gold");
             f.Set("killed", JsonValue.NewNum("1"));
             f.Set("quest", JsonValue.NewStr("世界BOSS击杀"));

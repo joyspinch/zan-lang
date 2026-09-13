@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stability chaos probe for the server-game template.
+"""Stability chaos probe for the server-legend template.
 
 Run against a live instance. Duration defaults to 600s (override: argv[1]
 seconds). Mixes hostile traffic with normal clients and watches resources:
@@ -8,7 +8,7 @@ seconds). Mixes hostile traffic with normal clients and watches resources:
   reconnect loop on port 7100
 - 3 churn threads: connect-login-attach then RST close (SO_LINGER 0), ~1/s
 - 2 normal bots: login/enter/state loop at ~1 op/s, error + latency tracked
-- monitor: VmRSS + fd count of every server-game pid every 5s
+- monitor: VmRSS + fd count of every legend-server pid every 5s
   (appended to /tmp/chaos_mon.jsonl)
 
 Ends with: bot error count, latency median, realms liveness, fresh-account
@@ -131,7 +131,7 @@ def monitor():
                 continue
             try:
                 with open(f"/proc/{pid}/comm") as f:
-                    if f.read().strip() != "server-game":
+                    if f.read().strip() != "legend-server":
                         continue
                 rss = 0
                 with open(f"/proc/{pid}/status") as f:

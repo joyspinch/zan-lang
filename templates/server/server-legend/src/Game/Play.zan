@@ -330,18 +330,24 @@ class Play {
         }
     }
 
-    /* siege 城池争夺：沙巴克城主（owner 名 + 申报战时间，进程内记忆）
-       + 城池争夺页的 city_count 座钱庄（每座 owner/guild/at，进程内
-       记忆，重启清空——世界态持久化在下一轮接 world_state 表）。
+    /* siege 城池争夺：沙巴克城主（owner 名 + 申报战时间）
+       + 城池争夺页的 city_count 座钱庄（每座 owner/guild/at）。
+       全部走 WorldState（进程内热缓存 + 写穿 game_world，重启恢复）。
        攻占 = 消耗 siege_attack_gold 掷骰（胜率 siege_base_chance
        + (攻 + 等级×siege_level_power) / siege_power_div），成功即易主
        并全服公告。 */
-    static string siegeOwner = "";
-    static string siegeGuild = "";
-    static long siegeAt = 0;
-    static string[] cityOwners = new string[] { "", "", "", "", "", "", "", "" };
-    static string[] cityGuilds = new string[] { "", "", "", "", "", "", "", "" };
-    static long[] cityAt = new long[] { 0, 0, 0, 0, 0, 0, 0, 0 };
+    static string SiegeOwner() { return WorldState.Get("siege.master.owner", ""); }
+    static string SiegeGuild() { return WorldState.Get("siege.master.guild", ""); }
+    static long SiegeAt() { return WorldState.GetNum("siege.master.at", 0); }
+    static string CityOwner(int city) {
+        return WorldState.Get("city." + Convert.ToString(city) + ".owner", "");
+    }
+    static string CityGuild(int city) {
+        return WorldState.Get("city." + Convert.ToString(city) + ".guild", "");
+    }
+    static long CityAt(int city) {
+        return WorldState.GetNum("city." + Convert.ToString(city) + ".at", 0);
+    }
 
     /* city_count 可配，进程内数组固定 8 座，配置超出按 8 封顶。 */
     static int CityCount() {
@@ -382,9 +388,9 @@ class Play {
             bool win = Play.rng.Between(0, 99) < chance;
             JsonValue r = Gateway.Ok();
             if (win) {
-                Play.cityOwners[city - 1] = s.row.nickname;
-                Play.cityGuilds[city - 1] = guildName;
-                Play.cityAt[city - 1] = now;
+                WorldState.Set("city." + Convert.ToString(city) + ".owner", s.row.nickname);
+                WorldState.Set("city." + Convert.ToString(city) + ".guild", guildName);
+                WorldState.SetNum("city." + Convert.ToString(city) + ".at", now);
                 Gateway.AnnounceAll("城池易主",
                     s.row.nickname + " 率行会攻占了" + Play.CityName(city) + "！");
             }
@@ -403,9 +409,10 @@ class Play {
 
     static JsonValue SiegeState(long now) {
         JsonValue o = JsonValue.NewObject();
-        o.Set("owner", JsonValue.NewStr(Play.siegeOwner));
-        o.Set("guild", JsonValue.NewStr(Play.siegeGuild));
-        long hold = Play.siegeAt > 0 ? now - Play.siegeAt : 0;
+        o.Set("owner", JsonValue.NewStr(Play.SiegeOwner()));
+        o.Set("guild", JsonValue.NewStr(Play.SiegeGuild()));
+        long at = Play.SiegeAt();
+        long hold = at > 0 ? now - at : 0;
         o.Set("holdSeconds", JsonValue.NewNum(Convert.ToString(hold)));
         /* 城池争夺页：date 下发占领日 yyyy-MM-dd，income 为每小时产出
            金币（city_income_base 起步、每座 +city_income_step）。 */
@@ -417,12 +424,12 @@ class Play {
             JsonValue c = JsonValue.NewObject();
             c.Set("id", JsonValue.NewNum(Convert.ToString(i + 1)));
             c.Set("name", JsonValue.NewStr(Play.CityName(i + 1)));
-            c.Set("owner", JsonValue.NewStr(Play.cityOwners[i]));
-            c.Set("guild", JsonValue.NewStr(Play.cityGuilds[i]));
+            c.Set("owner", JsonValue.NewStr(Play.CityOwner(i + 1)));
+            c.Set("guild", JsonValue.NewStr(Play.CityGuild(i + 1)));
             c.Set("income", JsonValue.NewNum(Convert.ToString(
                 incomeBase + (long)i * incomeStep)));
-            c.Set("date", JsonValue.NewStr(Play.cityAt[i] > 0
-                ? Play.Today(Play.cityAt[i]) : ""));
+            c.Set("date", JsonValue.NewStr(Play.CityAt(i + 1) > 0
+                ? Play.Today(Play.CityAt(i + 1)) : ""));
             cities.Append(c);
         }
         o.Set("cities", cities);
@@ -840,10 +847,22 @@ class Play {
 
     /* redpack 发红包：{"send":N} 发一个全服元宝红包（N 在
        redpack_min_yuan/max_yuan 之间）；{"grab":1} 抢一次（每红包每人
-       一次，抢到 pool×redpack_share_pct）。进程内运营，重启清空。 */
-    static long rpPool = 0;
-    static string rpFrom = "";
-    static List<string> rpTaken = new List<string>();
+       一次，抢到 pool×redpack_share_pct）。池子/发送人/已抢名单走
+       WorldState（写穿 game_world，重启恢复）。 */
+    static long RpPool() { return WorldState.GetNum("redpack.pool", 0); }
+    static bool RpTakenHas(string name) {
+        string csv = WorldState.Get("redpack.taken", "");
+        if (csv.Length == 0) { return false; }
+        List<string> parts = csv.Split(",");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            if (parts[i] == name) { return true; }
+        }
+        return false;
+    }
+    static void RpTakenAdd(string name) {
+        string csv = WorldState.Get("redpack.taken", "");
+        WorldState.Set("redpack.taken", csv.Length == 0 ? name : csv + "," + name);
+    }
 
     static JsonValue Redpack(Session s, JsonValue m, long now) {
         if (m.Int("send", 0) > 0) {
@@ -855,9 +874,9 @@ class Play {
             }
             if (s.row.gems < amount) { return Gateway.Err("元宝不够"); }
             s.row.gems = s.row.gems - amount;
-            Play.rpPool = Play.rpPool + amount;
-            Play.rpFrom = s.row.nickname;
-            Play.rpTaken.Clear();
+            WorldState.SetNum("redpack.pool", Play.RpPool() + amount);
+            WorldState.Set("redpack.from", s.row.nickname);
+            WorldState.Set("redpack.taken", "");
             s.dirty = true;
             Gateway.AnnounceAll("红包雨",
                 s.row.nickname + " 发出 " + Convert.ToString(amount)
@@ -865,25 +884,23 @@ class Play {
         }
         JsonValue r = Gateway.Ok();
         JsonValue o = JsonValue.NewObject();
-        o.Set("pool", JsonValue.NewNum(Convert.ToString(Play.rpPool)));
-        o.Set("from", JsonValue.NewStr(Play.rpFrom));
+        o.Set("pool", JsonValue.NewNum(Convert.ToString(Play.RpPool())));
+        o.Set("from", JsonValue.NewStr(WorldState.Get("redpack.from", "")));
         if (m.Int("grab", 0) == 1) {
-            if (Play.rpPool <= 0) { return Gateway.Err("红包已抢完"); }
-            for (int i = 0; i < Play.rpTaken.Count; i = i + 1) {
-                if (Play.rpTaken[i] == s.row.nickname) {
-                    return Gateway.Err("你已经抢过这个红包了");
-                }
+            if (Play.RpPool() <= 0) { return Gateway.Err("红包已抢完"); }
+            if (Play.RpTakenHas(s.row.nickname)) {
+                return Gateway.Err("你已经抢过这个红包了");
             }
-            long grab = Play.rpPool * Rules.Val("redpack_share_pct") / 100;
+            long grab = Play.RpPool() * Rules.Val("redpack_share_pct") / 100;
             if (grab < 1) { grab = 1; }
-            if (grab > Play.rpPool) { grab = Play.rpPool; }
-            Play.rpPool = Play.rpPool - grab;
-            Play.rpTaken.Add(s.row.nickname);
+            if (grab > Play.RpPool()) { grab = Play.RpPool(); }
+            WorldState.SetNum("redpack.pool", Play.RpPool() - grab);
+            Play.RpTakenAdd(s.row.nickname);
             s.row.gems = s.row.gems + grab;
             s.dirty = true;
             o.Set("grab", JsonValue.NewNum(Convert.ToString(grab)));
         }
-        o.Set("taken", JsonValue.NewNum(Play.rpTaken.IndexOf(s.row.nickname) >= 0
+        o.Set("taken", JsonValue.NewNum(Play.RpTakenHas(s.row.nickname)
             ? "1" : "0"));
         r.Set("redpack", o);
         Gateway.SelfInto(r, s);
@@ -923,16 +940,20 @@ class Play {
             }
             if (m.Int("buy", 0) > 0) {
                 int buyId = m.Int("buy", 0);
+                /* 只读在售单（sellerId>0；买断会把 sellerId 改成负的
+                   「已售」标记）。顺序双买的第二个买家在这里就拿到 null。 */
                 ZanWeb.Model.Game.Market row = await db
                     .Select<ZanWeb.Model.Game.Market>()
-                    .Where(a => a.id == buyId).FirstAsync();
+                    .Where(a => a.id == buyId && a.sellerId > 0).FirstAsync();
                 if (row == null) { return Gateway.Err("这件商品已售出或下架"); }
                 if (row.sellerId == s.row.id) { return Gateway.Err("不能买自己的挂单"); }
                 if (s.row.gold < row.price) { return Gateway.Err("金币不够"); }
-                /* 抢占：只有还能把 sellerId 从原值改走的那个请求买断成功；
-                   并发的第二个请求 affected=0 → 明确报「刚被别人买走」。 */
+                /* 抢占：sellerId 从原卖家改成负值，只有还能改走的那个
+                   请求买断成功；并发的第二个请求 affected=0 → 明确报
+                   「刚被别人买走」。改成正的买家 id 挡不住顺序双买
+                   （第二次 select 会把它当「新卖家」再卖一遍）。 */
                 int claimed = await db.Update<ZanWeb.Model.Game.Market>()
-                    .Set(a => a.sellerId, s.row.id)
+                    .Set(a => a.sellerId, -row.sellerId)
                     .Where(a => a.id == row.id && a.sellerId == row.sellerId)
                     .ExecuteAffrowsAsync();
                 if (claimed <= 0) { return Gateway.Err("这件商品刚被别人买走"); }
@@ -973,6 +994,7 @@ class Play {
             }
             List<ZanWeb.Model.Game.Market> rows = await db
                 .Select<ZanWeb.Model.Game.Market>()
+                .Where(a => a.sellerId > 0)
                 .OrderBy(a => a.id).ToListAsync();
             JsonValue arr = JsonValue.NewArray();
             for (int i = 0; i < rows.Count; i = i + 1) {

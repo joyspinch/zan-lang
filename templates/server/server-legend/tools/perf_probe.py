@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Performance matrix for the server-game template.
+"""Performance matrix for the server-legend template.
 
 Run against a live instance (no other load). Creates perf00..perf07 accounts
 with characters entered.

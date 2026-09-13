@@ -1,0 +1,87 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Json;
+using ZanWeb.Model.Game;
+
+namespace ZanWeb.Game;
+
+/* 跨重启世界态的内存热缓存 + 写穿（RULES.md §五）。城池/沙巴克、
+   红包池、世界 BOSS 在进程内的「记忆」从这里读写：Get 走字典，
+   Set 改字典并记脏，世界 tick 调 FlushAll 把脏键 insert or replace
+   进 game_world。脏检查在取连接之前——无脏键时零开销。
+   键名是代码常量（非用户输入），值经参数绑定写入，不拼 SQL。 */
+static class WorldState {
+    /* 单区服模板：世界态恒在 1 区（多区共享一个世界玩法面）。 */
+    const int REALM_ID = 1;
+
+    static Dict<string, string> kv = new Dict<string, string>();
+    static Dict<string, bool> dirty = new Dict<string, bool>();
+
+    /* 启动装载：Fight.Bootstrap 开头 await 一次。表由 CodeFirst
+       创建，可能为空（首次启动）。列名即模型字段名（camelCase）。 */
+    static async bool Load(DbContext ctx) {
+        IDbConnection db = await ctx.Acquire();
+        if (db == null) { return false; }
+        try {
+            DbResult rows = await db.QueryAsync(
+                "select k,v from game_world where realmId="
+                + Convert.ToString(WorldState.REALM_ID));
+            for (int i = 0; i < rows.RowCount(); i = i + 1) {
+                WorldState.kv[rows.GetString(i, 0)] = rows.GetString(i, 1);
+            }
+        } finally {
+            ctx.Release(db);
+        }
+        return true;
+    }
+
+    static string Get(string key, string dft) {
+        string v = null;
+        if (WorldState.kv.TryGetValue(key, out v) && v != null) { return v; }
+        return dft;
+    }
+
+    static long GetNum(string key, long dft) {
+        string v = WorldState.Get(key, "");
+        if (v.Length == 0) { return dft; }
+        return Convert.ToInt64(v);
+    }
+
+    static void Set(string key, string v) {
+        WorldState.kv[key] = v == null ? "" : v;
+        WorldState.dirty[key] = true;
+    }
+
+    static void SetNum(string key, long v) {
+        WorldState.Set(key, Convert.ToString(v));
+    }
+
+    /* 世界 tick 调用：把脏键写穿。逐键 insert or replace——键数量
+       常态 <20，批量收益为零。失败不清脏标记，下一 tick 重试。 */
+    static async void FlushAll(DbContext ctx) {
+        if (WorldState.dirty.Count == 0) { return; }
+        IDbConnection db = await ctx.Acquire();
+        if (db == null) { return; }
+        try {
+            List<string> keys = new List<string>();
+            foreach (string k in WorldState.dirty.Keys) { keys.Add(k); }
+            long now = WebApp.NowSeconds();
+            for (int i = 0; i < keys.Count; i = i + 1) {
+                string k = keys[i];
+                string v = null;
+                if (!WorldState.kv.TryGetValue(k, out v)) { continue; }
+                DbParams prms = new DbParams().AddInt(WorldState.REALM_ID)
+                    .Add(k).Add(v).AddLong(now);
+                await db.ExecuteAsync("insert or replace into game_world"
+                    + "(realmId,k,v,updatedAt) values(?,?,?,?)", prms);
+                WorldState.dirty.Remove(k);
+            }
+        } catch (Exception ex) {
+            Console.WriteLine("[worldstate] flush failed (will retry): "
+                + ex.Message);
+        } finally {
+            ctx.Release(db);
+        }
+    }
+}

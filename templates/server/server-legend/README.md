@@ -93,10 +93,10 @@ tools/e2e.py            端到端自检：注册/找回 + 完整协议 + GM + �
 
 ```bash
 # 用 zanc 编译（模板是多文件工程：把 src 下所有 .zan 一起给编译器）
-zanc src/main.zan src/**/*.zan --auto-stdlib -o server-game.exe
+zanc src/main.zan src/**/*.zan --auto-stdlib -o legend-server.exe
 # 或者用 IDE 新建项目（模板名"游戏服务端"）后直接运行
 
-./server-game.exe
+./legend-server.exe
 # [game] tcp://0.0.0.0:7100
 # http-worker http://0.0.0.0:8099
 ```

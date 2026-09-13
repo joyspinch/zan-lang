@@ -67,7 +67,7 @@ def main():
     here = os.path.dirname(os.path.abspath(__file__))
     repo = os.path.abspath(os.path.join(here, "..", "..", "..", ".."))
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--db", default=os.path.join(repo, "templates/server/server-game/data/M2.DB"))
+    ap.add_argument("--db", default=os.path.join(repo, "templates/server/server-legend/data/M2.DB"))
     ap.add_argument("--data-dir", default=os.path.join(repo, "templates/game/legend/data"))
     ap.add_argument("--reference-dir", default=None)
     args = ap.parse_args()

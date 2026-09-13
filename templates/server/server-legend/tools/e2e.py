@@ -1,4 +1,4 @@
-"""End-to-end self-test for the realm-based server-game template.
+"""End-to-end self-test for the realm-based server-legend template.
 
 Covers the full player flow AND the combat loop: web register/forgot (3-step
 with security question, wrong-answer lockout), TCP realms/register/login/

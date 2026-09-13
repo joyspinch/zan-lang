@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Security probe for the server-game template.
+"""Security probe for the server-legend template.
 
 Run against a live instance AFTER tools/e2e.py (creates its own sec_* accounts,
 expects no other load so the anon 5/5s rate limiter is not tripped spuriously --
