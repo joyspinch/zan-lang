@@ -3304,9 +3304,13 @@ class ChartOption {
                              //   tooltip 显示走 FracText 除回
     string radarShape;  // ECharts radar.shape："circle"（默认=现状）| "polygon"
     bool radarSplitArea; // ECharts radar.splitArea.show：环带交替色
+    int radarNameColor;  // radar.axisName.color（ECharts5 改名前的 name.
+                         //   textStyle.color）：指示器名颜色，0 = 主题轴色
     List<RadarPolar> polars; // ECharts2 polar[]：多雷达坐标系；空 = 单 polar
                              //   （用上面的 radarMax/radarShape/dims 全局字段）
     // ---- legend 选项（ECharts legend）----
+    int legendTextColor;        // legend.textStyle.color：图例文字色
+                                //   （radar-aqi 深底的 #fff）；0 = 主题轴色
     string legendOrient;        // "horizontal"（默认）| "vertical"
     string legendX;             // ECharts legend.x："left"|"center"(默认)|"right"
     string legendSelectedMode;  // ""=multiple | "single" | "false"
@@ -3506,6 +3510,8 @@ class ChartOption {
         o.radarNames = new List<string>();
         for (int i = 0; i < src.radarNames.Count; i = i + 1) { o.radarNames.Add(src.radarNames[i]); }
         o.radarScaled = src.radarScaled;
+        o.radarNameColor = src.radarNameColor;
+        o.legendTextColor = src.legendTextColor;
         o.polars = new List<RadarPolar>();
         for (int i = 0; i < src.polars.Count; i = i + 1) {
             o.polars.Add(RadarPolar.Clone(src.polars[i]));
@@ -3613,8 +3619,10 @@ class ChartOption {
         o.radarScaled = false;
         o.radarShape = "circle";
         o.radarSplitArea = false;
+        o.radarNameColor = 0;
         o.polars = new List<RadarPolar>();
         o.legendOrient = "horizontal";
+        o.legendTextColor = 0;
         o.legendX = "";
         o.legendLeft = ""; o.legendRight = "";
         o.legendTop = ""; o.legendBottom = "";
@@ -6153,6 +6161,12 @@ class ChartOption {
             o.legendSelectedMode = ChartKinds.LegendModeSanitize(
                 lg.Str("selectedMode", o.legendSelectedMode));
             o.legendFormatter = lg.Str("formatter", o.legendFormatter);
+            // legend.textStyle.color：深底 demo（radar-aqi）的白字。
+            JsonValue lgts = lg.Get("textStyle");
+            if (lgts != null && lgts.IsObject()) {
+                o.legendTextColor = ChartOption.ParseColor(
+                    lgts.Get("color"), o.legendTextColor);
+            }
         }
 
         // dataRange（2.x）：min/max/calculable/splitNumber/data[]。
@@ -6264,6 +6278,69 @@ class ChartOption {
             JsonValue sa = rj.Get("splitArea");
             if (sa != null && sa.IsObject()) { o.radarSplitArea = sa.Bool("show", false); }
             else { o.radarSplitArea = rj.Bool("splitArea", o.radarSplitArea); }
+            // 指示器名颜色：ECharts5/6 radar.axisName.color（旧写法
+            // name.textStyle.color 同收）——radar-aqi 的金色标签。
+            JsonValue an = rj.Get("axisName");
+            if (an == null || !an.IsObject()) { an = rj.Get("name"); }
+            if (an != null && an.IsObject()) {
+                JsonValue ants = an.Get("textStyle");
+                if (ants != null && ants.IsObject()) {
+                    o.radarNameColor = ChartOption.ParseColor(
+                        ants.Get("color"), o.radarNameColor);
+                }
+                o.radarNameColor = ChartOption.ParseColor(
+                    an.Get("color"), o.radarNameColor);
+            }
+        } else if (rj != null && rj.IsArray()) {
+            // ECharts5 radar 数组形态（多雷达，radar-multiple）：每个
+            // 条目 = 一个独立雷达坐标系，series.radarIndex 绑定。字段
+            // 与 ECharts2 polar[] 同构，解析进 o.polars 共用消费端；
+            // 首条目回填 radarMax/radarNames/radarShape 供单 polar
+            // 回退与 0 系列分发。radar.shape 官方缺省 polygon（与
+            // ECharts2 polar[] 缺省圆环不同），条目未声明按 polygon。
+            for (int ri = 0; ri < rj.Count(); ri = ri + 1) {
+                JsonValue rs = rj.At(ri);
+                if (rs == null || !rs.IsObject()) { continue; }
+                RadarPolar p = RadarPolar.Create();
+                p.splitNumber = rs.Int("splitNumber", p.splitNumber);
+                string rshp = rs.Str("shape", "polygon");
+                if (rshp == "circle" || rshp == "polygon") { p.type = rshp; }
+                JsonValue pc = rs.Get("center");
+                if (pc != null && pc.IsArray() && pc.Count() >= 2) {
+                    p.center = ChartOption.ParsePoint(pc,
+                        ChartPosition.Of(ChartScalar.Pct(50), ChartScalar.Pct(50)));
+                }
+                JsonValue prad = rs.Get("radius");
+                if (prad != null) {
+                    p.radius = ChartOption.ParseScalar(prad, ChartScalar.Px(0));
+                }
+                JsonValue ind = rs.Get("indicator");
+                if (ind != null && ind.IsArray()) {
+                    for (int ii = 0; ii < ind.Count(); ii = ii + 1) {
+                        JsonValue ax = ind.At(ii);
+                        // ECharts5 用 name，ECharts2 风格用 text。
+                        string inm = ax.Str("text", "");
+                        if (inm.Length == 0) { inm = ax.Str("name", ""); }
+                        p.indicatorText.Add(inm);
+                        p.indicatorMax.Add(ax.Int("max", 0));
+                        if (ri == 0) {
+                            o.radarMax.Add(ax.Int("max", 0));
+                            o.radarNames.Add(inm);
+                        }
+                    }
+                }
+                JsonValue anm = rs.Get("axisName");
+                if (anm == null || !anm.IsObject()) { anm = rs.Get("name"); }
+                if (anm != null && anm.IsObject()) {
+                    JsonValue ants2 = anm.Get("textStyle");
+                    if (ants2 != null && ants2.IsObject()) {
+                        p.nameColor = ChartOption.ParseColor(
+                            ants2.Get("color"), p.nameColor);
+                    }
+                    p.nameColor = ChartOption.ParseColor(anm.Get("color"), p.nameColor);
+                }
+                o.polars.Add(p);
+            }
         }
 
         // ECharts2 polar[]：多雷达坐标系。radius 数组的 [min,max]
@@ -6694,6 +6771,8 @@ class ChartOption {
                 cs.roseType = s.Str("roseType", cs.roseType);
                 cs.clockWise = s.Bool("clockWise", cs.clockWise);
                 cs.polarIndex = s.Int("polarIndex", cs.polarIndex);
+                // ECharts5 radar 系列绑定雷达组件数组用 radarIndex。
+                cs.polarIndex = s.Int("radarIndex", cs.polarIndex);
                 string lsym = s.Str("linkSymbol", "");
                 if (lsym == "arrow") { cs.forceLinkSymbol = "arrow"; }
                 // pie.center / pie.radius（ECharts：['25%', 200] 与
@@ -7673,21 +7752,27 @@ class ChartOption {
                         }
                     }
                     if (rmatAny) {
-                        o.radarScaled = true;
-                        for (int rmatM = 0; rmatM < o.radarMax.Count; rmatM = rmatM + 1) {
-                            if (o.radarMax[rmatM] > 0) {
-                                o.radarMax[rmatM] = o.radarMax[rmatM] * 1000;
+                        // 满刻度放大只做一次：本块逐系列进（radar-multiple
+                        // 是 3 个雷达系列），重复进会把 radarMax/
+                        // indicatorMax 连乘 1000（100 → 1e8）。首个带向量
+                        // 项的系列触发，其后系列只物化自己的数据项。
+                        if (!o.radarScaled) {
+                            for (int rmatM = 0; rmatM < o.radarMax.Count; rmatM = rmatM + 1) {
+                                if (o.radarMax[rmatM] > 0) {
+                                    o.radarMax[rmatM] = o.radarMax[rmatM] * 1000;
+                                }
                             }
-                        }
-                        for (int rmatPg = 0; rmatPg < o.polars.Count; rmatPg = rmatPg + 1) {
-                            for (int rmatPm = 0; rmatPm < o.polars[rmatPg].indicatorMax.Count;
-                                 rmatPm = rmatPm + 1) {
-                                if (o.polars[rmatPg].indicatorMax[rmatPm] > 0) {
-                                    o.polars[rmatPg].indicatorMax[rmatPm] =
-                                        o.polars[rmatPg].indicatorMax[rmatPm] * 1000;
+                            for (int rmatPg = 0; rmatPg < o.polars.Count; rmatPg = rmatPg + 1) {
+                                for (int rmatPm = 0; rmatPm < o.polars[rmatPg].indicatorMax.Count;
+                                     rmatPm = rmatPm + 1) {
+                                    if (o.polars[rmatPg].indicatorMax[rmatPm] > 0) {
+                                        o.polars[rmatPg].indicatorMax[rmatPm] =
+                                            o.polars[rmatPg].indicatorMax[rmatPm] * 1000;
+                                    }
                                 }
                             }
                         }
+                        o.radarScaled = true;
                         for (int rmatI = 0; rmatI < da.Count(); rmatI = rmatI + 1) {
                             JsonValue rmatIt2 = da.At(rmatI);
                             JsonValue rmatVv2 = rmatIt2.IsObject()

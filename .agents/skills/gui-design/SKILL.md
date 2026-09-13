@@ -327,6 +327,22 @@ token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
   分发链"0 系列→空状态"之前先认组件 radar/polar——两渲染器的骨架
   路径 0 系列本就安全,白白被空状态短路(真实案例:doc-example/radar
   的纯雷达组件落 "(no data)",官方画五轴网格+指示器名)。
+- **渲染形态不对,先 dump 物化 json 的对应键再定责**:官方例 TS 的
+  组件数组会在 json 里完整保留(radar-multiple 三联雷达的 center/
+  radius/indicator.text 一直在案),缺的可能是引擎解析入口(radar
+  数组形态没解析,只认对象形态)——不 dump 就动手,会白查一轮数据侧。
+  口诀:json 有=引擎缺,json 无=物化缺;ECharts5 radar[]与 ECharts2
+  polar[] 字段同构,消费端齐全时补的只是解析(真实案例:三雷达全画
+  一个圈,以为是双 polar 圆心语义没实现)。
+- **逐系列物化块里的 option 级字段只准改一次**:物化循环逐系列进,
+  里面的全局放大/归一会连乘(真实案例:多雷达 3 个系列把 radarMax
+  ×1000 连乘三次成 1e8,单系列 demo 永远不暴露)——用已置位的旗
+  (radarScaled)守卫"只做一次",旗天然标记"首轮已做"。
+- **option 里的颜色声明走全链才生效**:legend.textStyle.color、
+  radar.axisName.color 这类字段要过五处:ChartOption 字段+Create/
+  Clone+DrawOption 拷贝+渲染器传参/消费端。漏最后一级(渲染器读
+  主题色没读声明)时解析全绿、渲染死灰(真实案例:radar-aqi 深底
+  图例白字画成主题灰字,金轴名根本没接)。
 
 ## 缩放纪律(DPI:为什么界面忽大忽小)
 

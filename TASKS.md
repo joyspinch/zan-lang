@@ -2729,3 +2729,27 @@ P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
   金样。**遗留观察**：radar-multiple 双 polar 是否该分画两个圆心
   （ECharts2 polar[] 缺省 center 语义）待对官方截图；radar-aqi 线宽
   1/opacity 0.5 DrawPolar 固定 2px 不透未接。
+* **radar-multiple / radar-aqi 遗留观察闭账（2026-09-13 第三批）**：
+  对官方 TS 源核验后两处都坐实为引擎缺口，本批修讫。①radar-multiple：
+  物化 json 里 radar 三联数组（center/radius/indicator.text）**一直
+  完整在案**，缺的是解析——FromJson 只认 radar 对象形态，数组形态
+  （ECharts5 多雷达）整个落地。修法：radar 数组每条目解析进
+  o.polars（center/radius/splitNumber/indicator name+text/axisName
+  色，与 ECharts2 polar[] 共用 DrawPolarMulti 消费端），条目 shape
+  缺省 polygon（radar 语义，polar[] 保持圆环缺省），series.radarIndex
+  作为 polarIndex 别名收编；首条目回填 radarMax/radarNames 供单
+  polar 回退与 0 系列分发。顺带揪出**物化器连乘 bug**：满刻度 ×1000
+  放大块在逐系列循环里，多雷达系列（3 个）把 radarMax 连乘 1000³
+  （100→1e8）——之前单系列 demo 不暴露；改为用 radarScaled 旗守卫
+  只放大一次。实测三雷达分画菱形/五边形/十二月环，center 25/50/75%
+  与官方一致，放大 12 轴环确认为十二边形（与官方 polygon 缺省同）。
+  ②radar-aqi：DrawPolar 单 polar 路径补 lineStyle.width/opacity 与
+  areaStyle.opacity 消费（多 polar 路径补 opacity；width 本就有），
+  radar.axisName.color（旧 name.textStyle.color）→ o.radarNameColor
+  金色指示器名；legend.textStyle.color → o.legendTextColor 全链
+  （ChartOption 字段+Clone+DrawOption+DrawPanelI 传参，19 个调用点
+  统一插参）——深底 demo 图例白字，此前主题灰字看不清。实测金轴名/
+  白图例/细线(1px)/雾面(opacity 0.1/0.05)全数生效，与官方截图同构。
+  回归：chart 层 211/213（仍只剩台账在案的 calendar/barminheight 两
+  个批次前失败），全量 sweep 345 张 FLAG 182 与改前持平，conformance
+  chart_radar_values 增至十一断言（multi/multimax）4 变体全绿。
