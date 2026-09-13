@@ -164,6 +164,20 @@ token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
   `chart_stackedarea_aa_test.zan`:同一图形整数实现 56/152 处硬相接,
   亚像素实现 0/4);肉眼收尾用 PrintWindow 截图放大 6× 看角与斜边。
 
+## Chart 引擎改造与渲染探针(硬规则)
+
+- **ChartSeries/ChartOption 新增字段五处同改**:字段声明、Create/Of 缺省、
+  深 Clone、`Clone(src, shareData: true)` 浅路径**早退之前**的标量抄写块、
+  浅路径的集合引用共享(levels/tree 等)。渲染管线 MaterializeSeries 每帧
+  都走 share 路径,漏抄一处 = 字段静默丢失:模型层解析断言全绿,渲染却
+  全吃缺省(真实案例:treemap/sunburst 的 levels 全链解析正确、渲染整图
+  缺省配色,根因是 levels 在浅路径早退处被丢,配置断言测不出这种丢法)。
+- **渲染探针两条铁律**:要看首帧静态效果用 `ChartView.KeyedStatic`
+  (staticFrame 把动画进度钉在终点;普通 `Keyed` 首帧动画进度≈0,
+  不在引擎免动画名单里的图型整板近黑);GetPixel 采样必须在 `Render`
+  之后、`PresentFrame` 之前——Present 后读到的已是清屏面,每张 demo
+  扫出同一单色(真实案例:探针首版把两种错各踩了一遍才定位)。
+
 ## 缩放纪律(DPI:为什么界面忽大忽小)
 
 框架的缩放是自动且不重复的,混乱全是绕开它造成的。机制:主题 token
