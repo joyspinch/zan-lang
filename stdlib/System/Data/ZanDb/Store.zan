@@ -128,6 +128,10 @@ class ZanStore {
         s.man = Manifest.Load(path);
         if (s.man.Exists()) {
             s.logStartSeq = s.man.LogStartSeq();
+            // 新帧从水位起编号：日志为空（全部已固化）时 seq 若
+            // 从 0 重来，重开的写入帧全部低于水位，下次恢复会被
+            // 当陈旧头整体跳过——插入丢失、删除复活。
+            s.seq = s.logStartSeq;
             s.nextSegId = s.man.NextSegId();
             List<long> ids = s.man.SegIds();
             for (int i = 0; i < ids.Count; i = i + 1) {
@@ -440,6 +444,101 @@ class ZanStore {
         this.commitsSinceSync = 0;
     }
 
+    /// <summary>把全部已固化段（≥2 个）归并为一个新段：同键只留
+    /// 最新版本，墓碑直接掉落（归并集=全部段，不存在会复活的更老
+    /// 版本），索引按归并结果重建。须在写侧串行环境调用且不在事务
+    /// 中（协程请走 <see cref="MergeAsync"/>）；期间阻塞写入——
+    /// 在线换段优化留待后续。崩溃窗口两段皆一致：段已写清单未换
+    /// = 孤儿段，下次同号归并覆盖之；清单已换 = 旧段成孤儿（不再
+    /// 被引用，仅占盘）。内存峰值 ≈ 存活键数（重建索引用）。</summary>
+    void MergeSegments() {
+        if (this.segs.Count < 2 || this.txDepth > 0) { return; }
+        long newId = this.nextSegId;
+        string segPath = ZanStore.SegPath(this.basePath, newId);
+        // 同号孤儿防御：上次「段已写、清单未换」的崩溃残留。
+        File.Delete(segPath);
+        SegmentWriter wtr = SegmentWriter.Create(segPath);
+        if (wtr.Failed()) { this.lastError = wtr.GetError(); return; }
+        // 各段游标，段号降序 = 新→旧；每键第一个停住的游标即最新
+        // 版本：put 落并入段，墓碑让整键消失（旧版本一并作废）。
+        List<SegCursor> cursors = new List<SegCursor>();
+        for (int i = this.segs.Count - 1; i >= 0; i = i - 1) {
+            cursors.Add(SegCursor.Open(this.segs[i].seg, ""));
+        }
+        Dictionary<string, long> mergedIndex = new Dictionary<string, long>();
+        while (true) {
+            string minKey = "";
+            bool has = false;
+            for (int i = 0; i < cursors.Count; i = i + 1) {
+                SegCursor c = cursors[i];
+                if (!c.Valid()) { continue; }
+                if (!has || String.CompareOrdinal(c.Key(), minKey) < 0) {
+                    minKey = c.Key();
+                    has = true;
+                }
+            }
+            if (!has) { break; }
+            // 第一个（=最新段的）停在 minKey 的游标无条件定生死：
+            // put 落入归并段；墓碑让整键消失——绝不能落到更旧段
+            // 的同名 put（否则删除会复活）。
+            bool decided = false;
+            for (int i = 0; i < cursors.Count; i = i + 1) {
+                SegCursor c = cursors[i];
+                if (c.Valid() && c.Key() == minKey) {
+                    if (!decided) {
+                        decided = true;
+                        if (c.Op() == 1) {
+                            wtr.Add(minKey, c.Val(), 1);
+                            if (!mergedIndex.ContainsKey(minKey)) {
+                                mergedIndex.Add(minKey, newId);
+                            }
+                        }
+                    }
+                    c.Next();
+                }
+            }
+        }
+        for (int i = 0; i < cursors.Count; i = i + 1) { cursors[i].Free(); }
+        if (!wtr.Finish()) {
+            this.lastError = wtr.GetError();
+            File.Delete(segPath);
+            return;
+        }
+        SegmentFile seg = SegmentFile.Open(segPath);
+        if (seg.GetError() != "") {
+            this.lastError = seg.GetError();
+            File.Delete(segPath);
+            return;
+        }
+        // 清单先换：此后任何时刻崩溃，磁盘上都只剩一致状态。
+        // 水位保持原值——归并不覆盖任何日志帧（memtable 数据
+        // 仍在日志里），推到当前 seq 会让重开时跳过那些帧、
+        // 丢掉未固化数据。
+        List<long> ids = new List<long>();
+        ids.Add(newId);
+        if (!this.man.Save(this.man.LogStartSeq(), newId + 1, ids)) {
+            this.lastError = this.man.GetError();
+            seg.Close();
+            File.Delete(segPath);
+            return;
+        }
+        this.index = mergedIndex;
+        for (int i = 0; i < this.segs.Count; i = i + 1) {
+            this.segs[i].seg.Close();
+            File.Delete(ZanStore.SegPath(this.basePath, this.segs[i].id));
+        }
+        this.segs.Clear();
+        this.segs.Add(new SegRef(seg, newId));
+        this.nextSegId = newId + 1;
+    }
+
+    /// <summary>独占锁下的 <see cref="MergeSegments"/>。</summary>
+    async void MergeAsync() {
+        await this.rw.EnterWrite();
+        MergeSegments();
+        this.rw.ExitWrite();
+    }
+
     /// 追加一条记录帧并推进 seq。
     void AppendRec(int op, string key, string val) {
         ByteBuffer b = ByteBuffer.Alloc(24 + key.Length + val.Length);
@@ -536,6 +635,33 @@ class ZanStore {
         int n = Scan(fromKey, visit);
         this.rw.ExitRead();
         return n;
+    }
+
+    /// <summary>物化式范围扫描：startKey（含）到 endKey（含，与
+    /// 旧引擎 <c>BTree.Scan</c> 语义一致）按键序收集到 output；
+    /// limit &gt; 0 时至多 limit 条。返回收集的条数。</summary>
+    int ScanRange(string startKey, string endKey, int limit, List<KvEntry> output) {
+        int before = output.Count;
+        Scan(startKey, delegate(string k, string v) {
+            if (endKey.Length > 0 && String.CompareOrdinal(k, endKey) > 0) {
+                return false;
+            }
+            output.Add(new KvEntry(k, v));
+            return limit <= 0 || output.Count - before < limit;
+        });
+        return output.Count - before;
+    }
+
+    /// <summary>前缀扫描：所有以 prefix 开头的键值按键序收集；
+    /// limit &gt; 0 时至多 limit 条。返回收集的条数。</summary>
+    int ScanPrefix(string prefix, int limit, List<KvEntry> output) {
+        int before = output.Count;
+        Scan(prefix, delegate(string k, string v) {
+            if (!k.StartsWith(prefix)) { return false; }
+            output.Add(new KvEntry(k, v));
+            return limit <= 0 || output.Count - before < limit;
+        });
+        return output.Count - before;
     }
 
     /// <summary>将缓冲与 OS 缓存全部强制落盘。</summary>

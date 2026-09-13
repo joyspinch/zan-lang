@@ -12,8 +12,8 @@ delegate JsonValue DocUpdater(JsonValue current);
 /// <summary>
 /// 嵌入式文档数据库，存储原生 Zan 值树（JsonValue：
 /// 整数、浮点数、布尔、字符串、嵌套对象、数组）——无 ORM 映射、
-/// 无 SQL 字符串。单文件 + WAL、崩溃安全的原子提交、LRU 页
-/// 缓存，且内存有硬上限。
+/// 无 SQL 字符串。底层为 <see cref="ZanStore"/>：追加 CRC 帧日志 +
+/// 不可变有序段 + 双槽清单，崩溃安全；memtable 与块缓存皆有界。
 ///
 ///   ZanDatabase db = ZanDatabase.Open("app.zdb");
 ///   Collection users = db.GetCollection("users");
@@ -25,7 +25,7 @@ delegate JsonValue DocUpdater(JsonValue current);
 ///   db.Close();
 /// </summary>
 class ZanDatabase {
-    KvStore kv;
+    ZanStore kv;
     AsyncRwLock rw;
     List<string> colNames;
     List<Collection> cols;
@@ -37,17 +37,20 @@ class ZanDatabase {
         this.lastError = "";
     }
 
-    /// <summary>以默认参数打开（不存在则创建）：256 页缓存、
-    /// 每次提交都 fsync。</summary>
+    /// <summary>以默认参数打开（不存在则创建）：分组提交档、
+    /// 64MB 固化阈值、32MB 块缓存。</summary>
     static ZanDatabase Open(string path) {
-        return ZanDatabase.Open(path, 256);
+        return ZanDatabase.Open(path, ZanStore.DUR_GROUP);
     }
 
-    /// 以显式页缓存容量打开（不存在则创建）；打开失败时
-    /// <see cref="IsOpen"/> 为 false，原因见 <see cref="GetError"/>。
-    static ZanDatabase Open(string path, int cachePages) {
+    /// <summary>以显式持久化档打开（不存在则创建）：
+    /// <see cref="ZanStore.DUR_SYNC"/> 每次提交 fsync、
+    /// <see cref="ZanStore.DUR_GROUP"/> 分组提交、
+    /// <see cref="ZanStore.DUR_NONE"/> 缓冲落盘。打开失败时
+    /// <see cref="IsOpen"/> 为 false，原因见 <see cref="GetError"/>。</summary>
+    static ZanDatabase Open(string path, int durability) {
         ZanDatabase d = new ZanDatabase();
-        d.kv = KvStore.Open(path, cachePages);
+        d.kv = ZanStore.Open(path, durability);
         if (!d.kv.IsOpen()) { d.lastError = d.kv.GetError(); }
         d.rw = new AsyncRwLock();
         return d;
@@ -74,7 +77,7 @@ class ZanDatabase {
     }
 
     /// <summary>直接访问底层的键/值存储。</summary>
-    KvStore Kv() { return this.kv; }
+    ZanStore Kv() { return this.kv; }
 
     /// <summary>将后续写入批量合并为一次原子提交。</summary>
     void Begin() { this.kv.Begin(); }
@@ -84,6 +87,11 @@ class ZanDatabase {
 
     /// 将迄今写入的内容强制落盘到稳定存储。
     void Checkpoint() { this.kv.Checkpoint(); }
+
+    /// <summary>把全部已固化段归并为一个段：掉落被新版压住的
+    /// 旧版本与已无意义的墓碑，回收存储空间。见
+    /// <see cref="ZanStore.MergeSegments"/>。</summary>
+    void MergeSegments() { this.kv.MergeSegments(); }
 
     /// 关闭底层存储与读写锁。
     void Close() {

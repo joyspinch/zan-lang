@@ -1,0 +1,148 @@
+using System;
+using System.Data.ZanDb;
+using System.Json;
+using System.IO;
+
+/// <summary>
+/// 文档层（ZanDatabase/Collection/DocQuery）压在新内核上的
+/// 一致性用例：插入/点查/更新/删除、二级索引（批量构建、索引
+/// 查找、计数）、FindRange、DocQuery 过滤排序分页、重开恢复、
+/// 多段归并后一切照旧。输出确定性，与 zandb_docs.out 比对。
+/// </summary>
+class ZanDbDocsTest {
+    static int checks = 0;
+
+    static void Ok(bool cond, string what) {
+        checks = checks + 1;
+        if (cond) {
+            Console.WriteLine("ok " + Convert.ToString(checks) + " - " + what);
+        } else {
+            Console.WriteLine("FAIL " + Convert.ToString(checks) + " - " + what);
+        }
+    }
+
+    static void Clean(string basePath) {
+        File.Delete(basePath);
+        File.Delete(basePath + ".m0");
+        File.Delete(basePath + ".m1");
+        for (int i = 0; i < 12; i = i + 1) {
+            File.Delete(basePath + ".s" + Convert.ToString(i));
+        }
+    }
+
+    static JsonValue User(int i) {
+        JsonValue u = JsonValue.NewObject();
+        u.Put("name", JsonValue.NewStr("user" + Convert.ToString(i).PadLeft(3, "0")));
+        u.Put("age", JsonValue.NewInt(20 + (i % 40)));
+        u.Put("city", JsonValue.NewStr(i % 2 == 0 ? "sh" : "bj"));
+        return u;
+    }
+
+    static string Field(JsonValue doc, string key) {
+        if (doc == null) { return "<null>"; }
+        JsonValue v = doc.Get(key);
+        if (v == null) { return "<missing>"; }
+        return v.AsString("");
+    }
+
+    static void Main() {
+        string path = "zandb_docs_tmp.zdb";
+        Clean(path);
+
+        ZanDatabase db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        Ok(db.IsOpen(), "open");
+        db.Kv().SetFlushThreshold(200);
+        Collection users = db.GetCollection("users");
+
+        // 1) 插入 30 篇 + 点查回读。
+        List<int> ids = new List<int>();
+        for (int i = 0; i < 30; i = i + 1) {
+            ids.Add(users.Insert(User(i)));
+        }
+        Ok(users.Count() == 30, "count 30");
+        JsonValue u7 = users.FindById(ids[7]);
+        Ok(Field(u7, "name") == "user007" && Field(u7, "city") == "bj", "roundtrip id 7");
+
+        // 2) 更新与删除。
+        JsonValue u10 = users.FindById(ids[10]);
+        u10.Set("city", JsonValue.NewStr("gz"));
+        Ok(users.Update(ids[10], u10), "update id 10");
+        Ok(Field(users.FindById(ids[10]), "city") == "gz", "update visible");
+        Ok(users.DeleteById(ids[5]), "delete id 5");
+        Ok(users.FindById(ids[5]) == null, "deleted gone");
+        Ok(users.Count() == 29, "count 29");
+
+        // 3) 二级索引：先建（批量步进），再查。
+        users.EnsureIndex("city");
+        while (!users.BuildIndexStep("city", 8)) { }
+        Ok(users.IndexReady("city"), "city index ready");
+        Ok(users.FindByIndex("city", "sh").Count == 14, "index find sh 14");
+        Ok(users.FindByIndex("city", "gz").Count == 1, "index find gz 1");
+        Ok(users.CountByField("city", "bj") == 14, "count bj 14");
+
+        // 4) FindRange：id 6..10 共 5 篇（含两端）。
+        Ok(users.FindRange(ids[6], ids[10], 0).Count == 5, "range 5 docs");
+        Ok(users.FindAll().Count == 29, "findall 29");
+
+        // 5) DocQuery：过滤 + 排序 + 分页。
+        List<JsonValue> young = users.Query()
+            .WhereEq("city", "sh")
+            .OrderByInt(delegate(JsonValue d) {
+                return Convert.ToInt(d.Get("age").AsString("0"));
+            })
+            .Skip(1)
+            .Take(3)
+            .ToList();
+        Ok(young.Count == 3, "query take 3");
+        bool sorted = true;
+        for (int i = 1; i < young.Count; i = i + 1) {
+            if (Convert.ToInt(Field(young[i - 1], "age")) > Convert.ToInt(Field(young[i], "age"))) {
+                sorted = false;
+            }
+        }
+        Ok(sorted, "query order by age asc");
+        int minAge = 9999;
+        List<JsonValue> shDocs = users.FindByIndex("city", "sh");
+        for (int i = 0; i < shDocs.Count; i = i + 1) {
+            int a = Convert.ToInt(Field(shDocs[i], "age"));
+            if (a < minAge) { minAge = a; }
+        }
+        JsonValue first = users.Query().WhereEq("city", "sh")
+            .OrderByInt(delegate(JsonValue d) {
+                return Convert.ToInt(d.Get("age").AsString("0"));
+            })
+            .First();
+        Ok(Convert.ToInt(Field(first, "age")) == minAge, "query first is min");
+
+        // 6) 重开：数据、索引元数据、序列全部恢复。
+        db.Close();
+        db = ZanDatabase.Open(path, ZanStore.DUR_SYNC);
+        users = db.GetCollection("users");
+        Ok(users.Count() == 29, "reopen count 29");
+        Ok(users.IndexReady("city"), "index survives reopen");
+        Ok(users.FindByIndex("city", "gz").Count == 1, "index find gz after reopen");
+        int next = users.Insert(User(30));
+        Ok(users.FindById(next) != null, "insert after reopen");
+
+        // 7) 多段归并：一切查询照旧，段数归一。
+        Ok(db.Kv().SegCount() > 1, "multiple segments before merge");
+        int before = users.Count();
+        db.MergeSegments();
+        Ok(db.Kv().SegCount() == 1, "one segment after merge");
+        Ok(users.Count() == before, "count stable across merge");
+        Ok(users.FindByIndex("city", "sh").Count == 15, "index find sh 15 after merge");
+        Ok(users.DeleteById(ids[20]), "delete after merge");
+        Ok(users.FindById(ids[20]) == null, "deleted after merge stays gone");
+        db.Close();
+
+        // 8) 归并后重开：删除不复活（墓碑掉落=键彻底消失）。
+        db = ZanDatabase.Open(path);
+        users = db.GetCollection("users");
+        Ok(users.Count() == before - 1, "final count stable");
+        Ok(users.FindById(ids[20]) == null, "no resurrect after merge+reopen");
+        db.Close();
+
+        Console.WriteLine("done " + Convert.ToString(checks) + " checks");
+        Clean(path);
+    }
+}
