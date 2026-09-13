@@ -53,6 +53,18 @@ class ChildWindow {
     /// 永不命中（键是引用），随窗口生命周期一并释放。
     List<Control> boundKeys;
     List<string> boundSnaps;
+    /// `<template data-for>` 展开登记（平行列表，按模板控件引用线性
+    /// 查找——与 boundKeys 同一 house pattern）：tmplKeys = 模板原型
+    /// 控件，tmplCounts = 上帧源数组长度（变化才重建行），rowRoots =
+    /// 已展开的行根（原型子项的克隆，插在模板紧后），rowTmpl = 行
+    /// 归属的模板。scopeKeys/scopeVals = 行内绑定作用域（行内声明了
+    /// bind/bindIf 的控件 → 本项 JsonValue；项内命中优先，回落根模型）。
+    List<Control> tmplKeys;
+    List<int> tmplCounts;
+    List<Control> rowRoots;
+    List<Control> rowTmpl;
+    List<Control> scopeKeys;
+    List<JsonValue> scopeVals;
 
     /// 构造：全部字段置空/默认（idBase 基线 900000）。
     ChildWindow() {
@@ -66,6 +78,12 @@ class ChildWindow {
         renderCb = null;
         boundKeys = null;
         boundSnaps = null;
+        tmplKeys = null;
+        tmplCounts = null;
+        rowRoots = null;
+        rowTmpl = null;
+        scopeKeys = null;
+        scopeVals = null;
     }
 
     /// OS window caption.
@@ -122,6 +140,7 @@ class ChildWindow {
     void Wire() {
         if (root == null) { return; }
         WireNode(root);
+        RegisterTemplates(root);
         SyncFromModel();
     }
 
@@ -151,21 +170,32 @@ class ChildWindow {
     /// 会忽略写入，因此对所有控件类型都安全。
     void SyncFromModel() {
         if (model == null || root == null) { return; }
+        this.EnsureExpanded();
         SyncFromNode(root);
     }
 
     /// 递归把模型值推入声明了 bind 路径的控件（值变化才写），
-    /// 并记录绑定快照。
+    /// 按 bindIf 声明插拔显示，并记录绑定快照。`template` 原型子树
+    /// 不参与同步/回写（它是克隆底版，不是活界面）。
     void SyncFromNode(Control c) {
+        if (c.Kind() == "template") { return; }
+        if (c.bindIf != "") {
+            c.SetShown(ChildWindow.Truthy(this.ValueFor(c, c.bindIf)));
+        }
         if (c.bindPath != "") {
-            JsonValue v = model.PathGet(c.bindPath);
+            JsonValue v = this.ValueFor(c, c.bindPath);
             if (v != null) {
                 string s = v.AsString("");
                 // 只在值真的变了才写：文本框收到一次写入就把光标收到末尾
                 // （SetText 的语义），而这段每帧都跑——无条件写下去的话，
                 // 方向键刚把光标挪开，下一帧就被同一个值弹回行尾。
+                // Element 的缺省绑定属性是 text（SetText 通道），不是
+                // value——后者对元素是"非空值当样式类"的基类兜底。
                 string prop = c.bindProp;
-                if (prop == "") { prop = "value"; }
+                if (prop == "") {
+                    prop = "value";
+                    if (c is Element) { prop = "text"; }
+                }
                 if (c.GetProp(prop) != s) { c.SetProp(prop, s); }
             }
             RecordSnapshot(c, BoundValue(c));
@@ -177,6 +207,7 @@ class ChildWindow {
 
     /// 把每个绑定控件的当前值读回状态实体（UI -> state）。
     void SyncChangedNode(Control c) {
+        if (c.Kind() == "template") { return; }
         if (c.bindPath != "") {
             string s = BoundValue(c);
             if (s != SnapshotOf(c)) { WriteBoundValue(c, s); }
@@ -184,6 +215,18 @@ class ChildWindow {
         for (int i = 0; i < c.children.Count; i = i + 1) {
             SyncChangedNode(c.children[i]);
         }
+    }
+
+    /// 绑定路径取值：控件在模板行作用域里（scopeKeys 有登记）先查
+    /// 本项 JsonValue，未命中回落根模型——行内相对路径（"name"）与
+    /// 绝对路径（"vm.title"）因此可以在同一行混用。
+    JsonValue ValueFor(Control c, string path) {
+        JsonValue item = this.ScopeOf(c);
+        if (item != null) {
+            JsonValue v = item.PathGet(path);
+            if (v != null) { return v; }
+        }
+        return model.PathGet(path);
     }
 
     /// 记录（或更新）控件绑定属性的模型侧确认值——上次由模型
@@ -220,16 +263,193 @@ class ChildWindow {
     }
 
     /// 把字符串值写回模型节点：按现有节点的类型转换为
-    /// bool / 数值 / 字符串，保持模型原有的形状。
+    /// bool / 数值 / 字符串，保持模型原有的形状。行作用域控件写到
+    /// 本项 JsonValue（数组元素的引用，就地生效）。
     void WriteBoundValue(Control c, string s) {
-        JsonValue cur = model.PathGet(c.bindPath);
-        if (cur != null && cur.IsBool()) {
+        JsonValue scope = this.ScopeOf(c);
+        if (scope != null) {
+            JsonValue cur = scope.PathGet(c.bindPath);
+            if (cur != null && cur.IsBool()) {
+                scope.PathSetValue(c.bindPath, JsonValue.NewBool(s == "true"));
+            } else if (cur != null && cur.IsNumber()) {
+                scope.PathSetValue(c.bindPath, JsonValue.NewNum(s));
+            } else {
+                scope.PathSet(c.bindPath, s);
+            }
+            return;
+        }
+        JsonValue cur0 = model.PathGet(c.bindPath);
+        if (cur0 != null && cur0.IsBool()) {
             model.PathSetValue(c.bindPath, JsonValue.NewBool(s == "true"));
-        } else if (cur != null && cur.IsNumber()) {
+        } else if (cur0 != null && cur0.IsNumber()) {
             model.PathSetValue(c.bindPath, JsonValue.NewNum(s));
         } else {
             model.PathSet(c.bindPath, s);
         }
+    }
+
+    // ---- <template data-for> 行展开 ---------------------------------------
+    // 原型被 UA 样式表 display:none；挂模型的窗口每帧（SyncFromModel
+    // 开头）核对源数组长度，变了才整组重建：逐原型子项 Html.Clone 成
+    // 行，普通 InsertAt 插在模板紧后（不走 Element.AddKid——克隆行
+    // 不进原型父的文档序表，撤除也不留幽灵占位）。行内 bind/bindIf
+    // 以本项 JsonValue 为第一作用域。
+
+    /// Wire 期登记静态树上的模板原型（v1 不支持嵌套模板：原型子树
+    /// 不再下扫）。未挂模型时登记了也惰性——展开只发生在
+    /// SyncFromModel。
+    void RegisterTemplates(Control c) {
+        if (c.Kind() == "template") {
+            if (tmplKeys == null) {
+                tmplKeys = new List<Control>();
+                tmplCounts = new List<int>();
+            }
+            bool known = false;
+            for (int i = 0; i < tmplKeys.Count; i = i + 1) {
+                if (tmplKeys[i] == c) { known = true; break; }
+            }
+            if (!known) {
+                tmplKeys.Add(c);
+                tmplCounts.Add(0 - 1);  // 强制首帧展开
+            }
+            return;
+        }
+        for (int j = 0; j < c.children.Count; j = j + 1) {
+            RegisterTemplates(c.children[j]);
+        }
+    }
+
+    /// 每帧核对各模板的源数组长度；与上帧一致就什么都不做（行是活
+    /// 控件，绑定照常同步），变了才整组重建。
+    void EnsureExpanded() {
+        if (tmplKeys == null) { return; }
+        for (int i = 0; i < tmplKeys.Count; i = i + 1) {
+            Control t = tmplKeys[i];
+            string path = t.CssAttr("data-for");
+            if (path == "" || t.children.Count == 0) { continue; }
+            JsonValue arr = model.PathGet(path);
+            int n = (arr != null && arr.IsArray()) ? arr.Count() : 0;
+            if (tmplCounts[i] == n) { continue; }
+            this.RemoveRows(t);
+            tmplCounts[i] = n;
+            if (n == 0) { continue; }
+            Control p = t.parent;
+            if (p == null) { continue; }
+            int cur = p.IndexOf(t) + 1;
+            for (int k = 0; k < n; k = k + 1) {
+                JsonValue item = arr.At(k);
+                for (int j = 0; j < t.children.Count; j = j + 1) {
+                    Control row = Html.Clone(t.children[j]);
+                    if (row == null) { continue; }
+                    p.InsertAt(cur, row);
+                    cur = cur + 1;
+                    WireNode(row);
+                    this.ScopeRow(row, item);
+                    if (rowRoots == null) {
+                        rowRoots = new List<Control>();
+                        rowTmpl = new List<Control>();
+                    }
+                    rowRoots.Add(row);
+                    rowTmpl.Add(t);
+                }
+            }
+        }
+    }
+
+    /// 撤除模板 `t` 的全部行（数组重建前调）：从各自的父节点摘下
+    /// 并清掉行内控件的作用域登记。
+    void RemoveRows(Control t) {
+        if (rowRoots == null) { return; }
+        for (int i = rowRoots.Count - 1; i >= 0; i = i - 1) {
+            if (rowTmpl[i] != t) { continue; }
+            Control row = rowRoots[i];
+            this.DetachRow(row);
+            this.ScopeDropRow(row);
+            rowRoots.RemoveAt(i);
+            rowTmpl.RemoveAt(i);
+        }
+    }
+
+    /// 行根脱父：Element 父走 DropKid（文档序表一并清，不留幽灵
+    /// 占位），控件父走普通 Remove。
+    void DetachRow(Control row) {
+        Control p = row.parent;
+        if (p == null) { return; }
+        if (p is Element) {
+            ((Element)p).DropKid(row);
+        } else {
+            p.Remove(row);
+        }
+    }
+
+    /// 登记行子树里所有声明了 bind/bindIf 的控件的作用域（本项
+    /// JsonValue）。只登记声明了绑定的控件——表按引用线性查，登记
+    /// 面越小每帧越便宜。
+    void ScopeRow(Control c, JsonValue item) {
+        if (c.bindPath != "" || c.bindIf != "") { this.ScopePut(c, item); }
+        for (int j = 0; j < c.children.Count; j = j + 1) {
+            this.ScopeRow(c.children[j], item);
+        }
+    }
+
+    void ScopePut(Control c, JsonValue item) {
+        if (scopeKeys == null) {
+            scopeKeys = new List<Control>();
+            scopeVals = new List<JsonValue>();
+        }
+        for (int i = 0; i < scopeKeys.Count; i = i + 1) {
+            if (scopeKeys[i] == c) { scopeVals[i] = item; return; }
+        }
+        scopeKeys.Add(c);
+        scopeVals.Add(item);
+    }
+
+    /// 控件的行作用域；不在任何行里返回 null。
+    JsonValue ScopeOf(Control c) {
+        if (scopeKeys == null) { return null; }
+        for (int i = 0; i < scopeKeys.Count; i = i + 1) {
+            if (scopeKeys[i] == c) { return scopeVals[i]; }
+        }
+        return null;
+    }
+
+    /// 撤行时清作用域登记：行子树里声明了绑定的控件逐个摘除（就地
+    /// 压缩，尾部截断）。残留条目永不命中（键是引用），但数组频繁
+    /// 重建的窗口靠这一步封住增长。
+    void ScopeDropRow(Control c) {
+        if (c.bindPath != "" || c.bindIf != "") { this.ScopeDropOne(c); }
+        for (int j = 0; j < c.children.Count; j = j + 1) {
+            this.ScopeDropRow(c.children[j]);
+        }
+    }
+
+    void ScopeDropOne(Control c) {
+        if (scopeKeys == null) { return; }
+        int keep = 0;
+        for (int i = 0; i < scopeKeys.Count; i = i + 1) {
+            if (scopeKeys[i] == c) { continue; }
+            scopeKeys[keep] = scopeKeys[i];
+            scopeVals[keep] = scopeVals[i];
+            keep = keep + 1;
+        }
+        if (keep == scopeKeys.Count) { return; }
+        while (scopeKeys.Count > keep) {
+            scopeKeys.RemoveAt(scopeKeys.Count - 1);
+        }
+        while (scopeVals.Count > keep) {
+            scopeVals.RemoveAt(scopeVals.Count - 1);
+        }
+    }
+
+    /// data-if 路径取值的真值裁决：null 假；布尔原样；数字非 0；
+    /// 字符串非空且不为 "false"。比 AsBool 的严格 "true" 宽——HTML
+    /// 侧路径值多是字符串状态名（"on"/"done"）。
+    static bool Truthy(JsonValue v) {
+        if (v == null) { return false; }
+        if (v.IsBool()) { return v.AsBool(false); }
+        if (v.IsNumber()) { return v.AsInt(0) != 0; }
+        string s = v.AsString("");
+        return s != "" && s != "false";
     }
 
     /// Extra reasons to repaint: actions raised by handlers between

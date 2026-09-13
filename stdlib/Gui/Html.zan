@@ -20,7 +20,8 @@ namespace Gui;
 /// 属性协议：id → 选择器名（nodeName），class → AddClass，
 /// style → 合成 .zgen-N 规则（复用整套级联与 !important 机制），
 /// data-on-<evt>="名" 经 HtmlHandlers 注册表接 BindEvent，
-/// data-bind → bindPath。其余属性（href/title/disabled/...）忽略。
+/// data-bind → bindPath，data-if → bindIf。其余属性（Element 进
+/// 原始属性表；真控件忽略）。
 
 /// 解析产物：body 根 + 收集的样式。root 恒为 body 元素——片段没有
 /// body 标签时包一层隐式 body（对齐 Chrome 的文档语义）。
@@ -156,6 +157,10 @@ class Html {
                 c.bindPath = v;
                 continue;
             }
+            if (k == "data-if") {
+                c.bindIf = v;
+                continue;
+            }
             if (k.Length > 8 && HtmlText.StartsWith(k, "data-on-")) {
                 string suffix = k.Substring(8, k.Length - 8);
                 string evt = HtmlText.EventKind(suffix);
@@ -175,6 +180,101 @@ class Html {
             return;
         }
         parent.Add(c);
+    }
+
+    /// 深拷贝一棵控件树（`<template data-for>` 行展开用）。Element
+    /// 走同构克隆——Props() 没有覆写、Serialize 无法往返，标签/文本/
+    /// 原始属性表必须特判搬运；Class 原样带上（行内 style 的 zgen-N
+    /// 规则已在应用样式表里，克隆件挂同名类即生效）。其余控件按注册
+    /// kind 重建（未注册返回 null，调用侧跳过不占位），Props 声明槽
+    /// 与事件名照搬；几何与绑定声明逐项复制，子树递归。
+    static Control Clone(Control c) {
+        if (c is Element) {
+            Element src = (Element)c;
+            Element el = new Element();
+            el.InitElement(src.Kind(), src.name);
+            el.CopyAttrsFrom(src);
+            el.SetText(src.Text());
+            el.Class = src.Class;
+            el.dock = src.dock;
+            el.padL = src.padL;
+            el.padT = src.padT;
+            el.padR = src.padR;
+            el.padB = src.padB;
+            el.gap = src.gap;
+            el.mx = src.mx;
+            el.my = src.my;
+            el.prefW = src.prefW;
+            el.prefH = src.prefH;
+            el.logW = src.logW;
+            el.logH = src.logH;
+            el.logX = src.logX;
+            el.logY = src.logY;
+            el.logGap = src.logGap;
+            el.logPad = src.logPad;
+            el.logPlaceSet = src.logPlaceSet;
+            el.bindPath = src.bindPath;
+            el.bindProp = src.bindProp;
+            el.bindIf = src.bindIf;
+            for (int ei = 0; ei < src.events.Count; ei = ei + 1) {
+                el.SetHandler(src.events[ei].key, src.events[ei].val);
+            }
+            // 文档序重放（AddText/AddKid 交错是行盒混排的依据）
+            if (src.elOrder != null) {
+                for (int i = 0; i < src.elOrder.Count; i = i + 1) {
+                    FlowEntry o = src.elOrder[i];
+                    if (o.kid != null) {
+                        Control kid = Html.Clone(o.kid);
+                        if (kid != null) { el.AddKid(kid); }
+                    } else {
+                        el.AddText(o.text);
+                    }
+                }
+            } else {
+                List<Control> kids = src.children;
+                for (int i = 0; i < kids.Count; i = i + 1) {
+                    Control kid = Html.Clone(kids[i]);
+                    if (kid != null) { el.AddKid(kid); }
+                }
+            }
+            return el;
+        }
+        Control n = ControlFactory.Create(c.Kind());
+        if (n == null) { return null; }
+        n.name = c.name;
+        n.Class = c.Class;
+        n.dock = c.dock;
+        n.padL = c.padL;
+        n.padT = c.padT;
+        n.padR = c.padR;
+        n.padB = c.padB;
+        n.gap = c.gap;
+        n.mx = c.mx;
+        n.my = c.my;
+        n.prefW = c.prefW;
+        n.prefH = c.prefH;
+        n.logW = c.logW;
+        n.logH = c.logH;
+        n.logX = c.logX;
+        n.logY = c.logY;
+        n.logGap = c.logGap;
+        n.logPad = c.logPad;
+        n.logPlaceSet = c.logPlaceSet;
+        n.bindPath = c.bindPath;
+        n.bindProp = c.bindProp;
+        n.bindIf = c.bindIf;
+        List<PropSpec> ps = c.Props();
+        for (int i = 0; i < ps.Count; i = i + 1) {
+            n.SetProp(ps[i].key, c.GetProp(ps[i].key));
+        }
+        for (int ei = 0; ei < c.events.Count; ei = ei + 1) {
+            n.SetHandler(c.events[ei].key, c.events[ei].val);
+        }
+        for (int i = 0; i < c.children.Count; i = i + 1) {
+            Control kid = Html.Clone(c.children[i]);
+            if (kid != null) { n.Add(kid); }
+        }
+        return n;
     }
 
     /// data-on-* 接线的公开钩子：生成的/手写的建树代码统一走这里，

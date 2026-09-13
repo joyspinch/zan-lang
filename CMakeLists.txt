@@ -2644,6 +2644,32 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_zform_html${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # Dynamic document primitives (P8): a design doc with <template
+  # data-for> / data-if projects Rows.SetAttr("data-for") and
+  # Title.bindIf through GenForm; the host attaches a JsonValue model
+  # and the headless sync channel expands rows, toggles visibility and
+  # writes edits back through item scopes.
+  add_test(NAME conformance_gui_zform_dynamic
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/zform_dynamic_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/zform_dynamic.html;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_zform_dynamic.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_zform_dynamic${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
+  # Same primitives through the runtime-HTML compiled channel (GenHtml):
+  # data-if lands on bindIf and data-for lands in the Element attribute
+  # table, so the compiled tree behaves identically to App.LoadHtml.
+  add_test(NAME conformance_gui_html_runtime
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/html_runtime_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/html_runtime.html;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_html_runtime.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_html_runtime${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # Declarative typed grid: a DataGrid field with "of" + "columns" projects
   # typed accessor lambdas onto the generic column API, binds the caller's
   # List<T> directly (no DataRow), and "props"/"rowFactory" reach the state.

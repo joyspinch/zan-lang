@@ -2393,3 +2393,45 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
   删 buffUntil 加四币种）模型侧已改、消费端（Play/Gateway/World 的
   Set 链与读写点 ~13 处）未跟上——模板门 templates_build 因此红，
   待该会话收尾；templates_build 其余 32 模板全绿。
+
+* **P8-3 文档动态原语：`data-if` / `<template data-for>`（四方同语义）**
+  （2026-09-13）：HTML 声明层补上"按状态显隐 + 逐项渲染列表"两条
+  原语，语义由挂 JsonValue 模型的宿主消费（与 bindPath 同一契约，
+  无模型宿主一律惰性）。**data-if → `Control.bindIf`**（新声明字段，
+  Serialize 尾部可选字段往返）：ChildWindow.SyncFromNode 每帧
+  `Truthy(PathGet)` → SetShown——null 假/布尔原样/数字非 0/字符串
+  非空非 "false"（比 AsBool 宽，路径值多是字符串状态名）。
+  **`<template data-for>`**：parser IsBlockTag + "template"（容器空白
+  语义）、UA 样式表 `template{display:none}`（原型隐藏，Chrome 语义）；
+  Wire 登记 → SyncFromModel 开头核对源数组长度，变了整组重建——逐
+  **原型子项** `Html.Clone`（新静态方法：Element 同构特判搬运标签/
+  文本/属性表/文档序，其余按 ControlFactory 重建 + Props 声明槽 +
+  几何/绑定字段，未注册 kind 跳过）成行、普通 InsertAt 插模板紧后
+  （不走 Element.AddKid，撤行走新 `Element.DropKid` 清文档序表——
+  防 elOrder 陈旧条目幽灵占位）；行内 bind/bindIf 以本项 JsonValue
+  为第一作用域（ChildWindow 侧表 scopeKeys/scopeVals，项内命中优先
+  回落根模型；回写落数组元素引用就地生效）；模板原型子树不参与
+  同步/回写。**Element 缺省绑定属性 = text**（GetExtra/SetExtra 投影
+  SetText/Text）——行内 `<span data-bind="name">` 直接显示字段；
+  真控件缺省仍 value。**四方发射/消费同语义**：运行时 Html.Parse
+  属性协议；GenHtml（data-if→bindIf + Element 分支 data-* parity
+  SetAttr，编译/运行建树同构）；GenForm EmitField（"if"→bindIf、
+  Element "for"→SetAttr(data-for)）；FormBuilder.MakeControl 同两处；
+  DesignerHtml FieldJson/FieldHtml 升级 template↔Element+"tag" 键
+  （"tag"/"for"/"if" 不进 IsModeledKey，设计器 extra 透传保真）。
+  语义边界（docs/HTML_UI.md「动态原语」节）：嵌套模板 v1 不支持；
+  Element 父内模板宜为末子项（行渲染在全部已跟踪内容之后）；HTML
+  通道行内 style 经 zgen-N 类规则对克隆生效，FormBuilder 通道
+  ApplyInline 实例字段克隆不带走。验证：conformance 四用例
+  （gui_html_dynamic 运行时通道、gui_zform_dynamic 设计稿两源、
+  gui_html_runtime 编译期两源、designer_html 往返扩展输出行不变
+  金标免改）全绿。**顺带发现两个既有编译器缺陷（挂账，与本轮改动
+  无关、HEAD 干净树可复现）**：① `x is T ? a : b` 解析失败——
+  parse_binary 对 `is` 的类型操作数走 parse_type_ref，类型语法把
+  `?` 无条件吃成可空类型标记（parser.c:1933/412），需 C# 式歧义
+  消解（`?` 后跟表达式则归三元）；现状括号 `(x is T) ? a : b`
+  合法；② 极小 using 集（pull-in 闭包过滤后）编译报
+  "cannot convert 'CellOf' to 'CellOf'"（Transfer.zan:204/207、
+  DataGrid.zan:89/306/341，泛型类内 delegate 同名解析分裂）——
+  最小探针触发、同程序大闭包全绿，疑闭包裁剪掉了同名类型的一致
+  解析所需文件，待专项定位。

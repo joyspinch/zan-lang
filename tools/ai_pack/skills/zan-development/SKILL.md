@@ -50,6 +50,13 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
 * Platform-specific code: `#if WINDOWS` / `#else`; native symbols via
   `[DllImport("crt", EntryPoint = "...")]`.
 * Strings concatenate with `+`; `Convert.ToString(n)` for numbers.
+* Ternary `cond ? a : b` exists, but **`x is T ? a : b` fails to parse**:
+  the type operand of `is` eats `?` as a nullable-type marker. Write
+  `(x is T) ? a : b` or if/else. (Cost a real debugging round in
+  ChildWindow.)
+* Never list attribute names with `*/` inside a `/* ... */` comment —
+  `data-on-*/data-if` closes the comment mid-sentence and the rest becomes
+  code (209 cascading errors). Separate with `、` or spaces.
 
 ## 4. Edit
 
@@ -118,7 +125,16 @@ not browser inline specificity). Idempotent pitfalls: Button routes "Click"
 to its dedicated `Click` field — assert `((Button)b).Click.Count()`, not
 `b.On.Click`; engine ledgers (inline x stepping ±3px, line-height rounding,
 block strut font-size) apply — write explicit `line-height`/`font-size`
-in fixtures. Full spec: `docs/HTML_UI.md` in the SDK.
+in fixtures. Lists and conditional visibility are declarative too
+(P8): `<template data-for="items">` clones its element children per array
+item (rows inserted right after the template; row binds scope to the item
+first, so `<span data-bind="name">` shows `item.name` — Element's default
+bind property is `text`), and `data-if="flag"` toggles `SetShown` by the
+path's truthiness (null/false/0/"" are false). Both are **consumed only by
+a model-hosting ChildWindow** (`SetRoot(tree, model)` + `Wire()`); without
+a model they are inert (prototype stays hidden, conditions stay visible).
+Nested templates are not supported v1.
+Full spec: `docs/HTML_UI.md` in the SDK.
 
 ## 6c. Designer documents are .html (Gui P7a)
 

@@ -71,6 +71,8 @@ HTML 实体（`&amp;` `&lt;` `&#65;` 等）在文本与属性值里都解码。
 | style | 行内样式合成专属类 `.zgen-N { ... }`（复用整套级联与 !important 机制，见差异清单） |
 | data-on-\<evt\>="名" | 事件接线（见下） |
 | data-bind="路径" | 绑定路径 bindPath |
+| data-if="路径" | 真值插拔声明 bindIf（见「动态原语」） |
+| data-for="路径" | `<template>` 行展开源数组（见「动态原语」；Element 上同时进属性表） |
 | href/title/disabled/… | 忽略（行为在宿主语言，不装死） |
 
 ## 事件协议
@@ -93,6 +95,71 @@ focus/blur、keydown/keyup/keypress。未映射的后缀与未注册的名字都
 接线走 `Control.BindEvent`（多态）——Button 把 "Click" 路由到专属
 `Click` 字段（与 `btn.Click += h` 同队列）。断言事件数时按控件实际
 槽位查（`((Button)b).Click.Count()`，不是 `b.On.Click`）。
+
+## 动态原语：data-if 与 `<template data-for>`（P8）
+
+HTML 是声明，没有循环和条件表达式；这两条原语把"逐项渲染列表、
+按状态显隐"也声明化，**语义由挂了模型的宿主消费**（与 bindPath
+同一契约）——无模型的宿主（纯静态 UI、设计器画布）一律惰性。
+
+```html
+<ul class="cart">
+  <li data-bind="count" data-if="hasItems"></li>
+</ul>
+<template data-for="items">
+  <li><span data-bind="name"></span>
+      <input data-bind="qty" data-if="editable" /></li>
+</template>
+```
+
+**data-if → `Control.bindIf`**：挂模型的 ChildWindow 每帧取
+路径真值调 `SetShown`。真值裁决（`ChildWindow.Truthy`）：
+null（缺路径）→ 假；布尔原样；数字非 0；字符串非空且 ≠ "false"
+（比 `AsBool` 的严格 "true" 宽——路径值多是字符串状态名）。
+
+**`<template data-for>` 行展开**：模板原型被 UA 样式表
+`template { display: none; }` 隐藏（Chrome 语义）；ChildWindow 在
+`SyncFromModel` 开头核对源数组长度，与上帧一致就什么都不做（行是
+活控件，绑定照常同步），变了才整组重建——逐**原型子项**
+`Html.Clone` 成行，插在模板紧后。行内 bind/bindIf 以本项 JsonValue
+为第一作用域（项内命中优先、回落根模型，相对路径 "name" 与绝对路径
+"vm.title" 可在同一行混用），回写同样先落本项（数组元素的引用，
+就地生效）。
+
+**Element 的缺省绑定属性是 text**：行里 `<span data-bind="name">`
+由 ChildWindow 按 `SetText` 通道推送/读回（真控件缺省是 value）。
+
+**三条通道同语义**（同一份文档在运行时装载与编译期生成行为一致，
+conformance 三用例互为镜像）：
+
+| 通道 | data-if | data-for |
+|------|---------|----------|
+| 运行时 `App.LoadHtml` | 属性协议 → bindIf | Element 属性表 |
+| 编译期 `GenHtml`（非设计稿 .html） | → bindIf | Element 分支 parity `SetAttr("data-for")` |
+| 设计稿 `GenForm` / 设计器 | JSON `"if"` 键 → bindIf | JSON `"for"` 键 → `SetAttr("data-for")` |
+
+设计器存取格式里模板字段的形态（"tag"/"for"/"if" 都不在
+IsModeledKey 名单，Inspector 经 extra 原样透传保真）：
+
+```json
+{ "kind": "Element", "tag": "template", "for": "items", "name": "Rows",
+  "kids": [ { "kind": "Element", "tag": "li", ... } ] }
+```
+
+**语义边界（台账）**：
+- 无模型宿主：data-if 惒性恒显示，模板不展开（原型隐藏）；
+  挂模型后缺路径 = 假（隐藏）。
+- 嵌套模板 v1 不支持（原型子树里的模板不登记、随行原样克隆但
+  不展开）；原型子树不参与同步/回写。
+- 模板在 Element 父里应为**最后一个子项**：行经普通 InsertAt
+  插入（不进 Element 文档序表），流布局下行渲染在该父全部已
+  跟踪内容之后；Panel 等普通容器父无此限制。
+- 行克隆沿用原型的 `Class`：HTML 通道的行内 style 经 zgen-N 类
+  规则对克隆同样生效；设计器/FormBuilder 通道里经
+  `SetProp("style")` 落实例字段（ApplyInline）的内联声明克隆
+  不带走。
+- 撤行走 Element 父的 `DropKid`（文档序表一并清），不留幽灵
+  占位；行作用域登记随撤行清空（数组频繁重建不涨表）。
 
 ## 空白与文本语义（Chrome 同款）
 
@@ -196,6 +263,9 @@ font-size/transition）完全生效，不受几何影响。这是对浏览器 "i
   oracle 用 --hide-scrollbars 对齐）。水平轴只裁剪不滚动；
   overflow:hidden 可程序滚动（SetScrollTop）但无滚轮/滚动条交互。
   详见 roadmap P6 节。
+- **动态原语是宿主语义不是浏览器语义**：data-if/data-for 只在挂
+  JsonValue 模型的宿主里生效（见「动态原语」），浏览器打开同一份
+  文件时 template 内容本就不渲染，data-if 只是未知属性。
 - **引擎级已知偏差**（P0-P4 遗留，对 HTML 层同样适用）：行内 run x
   累计 ±3px（GDI 整数步进）、行高分数取整逐行 ±1px、块级 strut
   font-size 不继承（HTML 层已给 body 显式字号的写法规避）、

@@ -1,0 +1,102 @@
+// WEB_GUI_ROADMAP P8：文档动态原语（<template data-for> / data-if）
+// 的运行时通道无头用例。Html.Parse 建树 → ChildWindow 挂模型：
+// 模板行按源数组克隆展开、行内 bind/bindIf 以本项 JsonValue 为
+// 第一作用域、data-if 真值插拔、数组长度变化整组重建、行内与根级
+// 双向回写。不泵事件，直调 SyncFromModel/SyncChangedNode。
+using System;
+using System.Json;
+using Gui;
+using Gui.Widget;
+
+class DynConfWin : ChildWindow {
+}
+
+class GuiHtmlDynamic {
+    static int fails;
+
+    static void Eq(string what, string got, string want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got '" + got
+            + "' want '" + want + "'");
+    }
+
+    static void Main() {
+        fails = 0;
+        string html = "<div>"
+            + "<template data-for=\"items\">"
+            + "<li class=\"row\"><span data-bind=\"name\"></span>"
+            + "<input data-bind=\"qty\" data-if=\"on\" /></li>"
+            + "</template>"
+            + "<input data-bind=\"title\" data-if=\"flag\" />"
+            + "</div>";
+        HtmlDoc doc = Html.Parse(html, "", null);
+        Control rootT = doc.root;
+        Control div = rootT.children[0];
+
+        // 未挂模型：动态原语惰性——原型隐藏（UA 样式表 display:none
+        // 的类语义在 Kind 上，见 Gui_html_css 的 type 选择器用例），
+        // 不展开、不插拔。
+        DynConfWin w = new DynConfWin();
+        w.SetRoot(rootT, null);
+        w.Wire();
+        GuiHtmlDynamic.Eq("inert kids", Convert.ToString(div.ChildCount()), "2");
+
+        JsonValue model = JsonValue.Parse(
+            "{\"flag\":true,\"title\":\"hello\","
+            + "\"items\":[{\"name\":\"a\",\"qty\":\"1\",\"on\":true},"
+            + "{\"name\":\"b\",\"qty\":\"2\",\"on\":false}]}");
+        w.SetRoot(rootT, model);
+        w.Wire();
+
+        // 首展：模板后两行 li（每项克隆一个原型子项），行内作用域
+        // 推送与插拔同时生效。
+        GuiHtmlDynamic.Eq("expanded kids",
+                          Convert.ToString(div.ChildCount()), "4");
+        Control row0 = div.children[1];
+        Control row1 = div.children[2];
+        Control title = div.children[3];
+        GuiHtmlDynamic.Eq("row0 kind", row0.Kind(), "li");
+        GuiHtmlDynamic.Eq("row0 name", row0.children[0].GetProp("text"), "a");
+        GuiHtmlDynamic.Eq("row1 name", row1.children[0].GetProp("text"), "b");
+        GuiHtmlDynamic.Eq("inp0 shown",
+                          Convert.ToString(row0.children[1].visible), "1");
+        GuiHtmlDynamic.Eq("inp1 hidden",
+                          Convert.ToString(row1.children[1].visible), "0");
+
+        // 根级 data-if 插拔。
+        GuiHtmlDynamic.Eq("title shown",
+                          Convert.ToString(title.visible), "1");
+        model.PathSet("flag", "false");
+        w.SyncFromModel();
+        GuiHtmlDynamic.Eq("title hidden",
+                          Convert.ToString(title.visible), "0");
+
+        // 数组长度变化 → 整组重建。
+        JsonValue items2 = JsonValue.Parse(
+            "[{\"name\":\"a\",\"qty\":\"1\",\"on\":true}]");
+        model.PathSetValue("items", items2);
+        w.SyncFromModel();
+        GuiHtmlDynamic.Eq("shrunk kids",
+                          Convert.ToString(div.ChildCount()), "3");
+
+        // 行内回写（改克隆 span 的文本 → items[0].name）与根级回写。
+        div.children[1].children[0].SetProp("text", "z");
+        title.SetProp("value", "changed");
+        w.SyncChangedNode(rootT);
+        JsonValue back = model.Get("items");
+        JsonValue back0 = back == null ? null : back.At(0);
+        JsonValue backn = back0 == null ? null : back0.Get("name");
+        JsonValue mt = model.Get("title");
+        GuiHtmlDynamic.Eq("row writeback",
+                          backn == null ? "?" : backn.AsString(""), "z");
+        GuiHtmlDynamic.Eq("root writeback",
+                          mt == null ? "?" : mt.AsString(""), "changed");
+
+        if (fails == 0) {
+            Console.WriteLine("GUI_HTML_DYNAMIC_OK");
+        } else {
+            Console.WriteLine("GUI_HTML_DYNAMIC_FAILS " + fails);
+        }
+    }
+}

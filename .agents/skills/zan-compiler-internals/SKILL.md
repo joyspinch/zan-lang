@@ -210,6 +210,16 @@ description: zanc 编译器内部（parser/checker/irgen）的定式与坑——
 - 单行多声明符 `int a = 0, b = 2;` 走 pending_stmts 队列 + 三个语句收集点
   splice；comma 循环只吃 `IDENT [= expr]`。
 
+## `is T ?` 三元歧义：类型语法吃掉 `?`（2026-09-13，挂账未修）
+
+`x is T ? a : b` 解析失败：parse_binary 对 `is` 的类型操作数走
+`parse_type_ref`（parser.c:1933），而类型语法把 `?` 无条件当可空类型
+标记（parser.c:412），`Element ? "a"` 被读成可空类型 `Element?` 接
+字符串，报 `expected ';' got STRING_LIT`。**现状合法写法**：括号
+`(x is T) ? a : b`（括号内不进 parse_type_ref，`?` 留给三元）或
+if/else。修法是 C# 式歧义消解（`?` 后跟表达式起点则归三元），要动
+parser 回溯，专项做。
+
 ## 字符串位的可空值类型
 
 - C# 语义：`"a=" + int?` 合法，null 拼空串。checker
@@ -461,6 +471,13 @@ description: zanc 编译器内部（parser/checker/irgen）的定式与坑——
   GuiHost→App/Style/Fx 的活代码闭包 + Zan 运行时，与 unused 无关。
 - stdlib 文件引用跨命名空间类型必须写 using（ChartHost 曾裸写 `App`，
   靠用户程序恰好也有 `class App` 才碰巧编译——prune 把它藏成了哑弹）。
+- **极小 seed 的闭包过滤有已知误伤（2026-09-13，挂账未修）**：只引用
+  `Element` 等一两个名字的最小程序，闭包裁到 Transfer/DataGrid 的
+  delegate 声明面不齐，报 `cannot convert 'CellOf' to 'CellOf'`（同名
+  类型两份解析；Transfer.zan:204/207、DataGrid.zan:89/306/341）；
+  同一程序把 seed 加大（多真实引用几个 Gui 类型）即全绿。**症状是
+  同名类型互斥转换时先怀疑闭包裁剪，不是代码错**——TASKS.md P8-3 有
+  最小探针与 HEAD 复现记录。
 
 ## 闭包捕获语义：按变量分型
 
