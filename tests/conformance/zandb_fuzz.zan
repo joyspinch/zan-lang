@@ -1,0 +1,193 @@
+using System;
+using System.Data.ZanDb;
+using System.IO;
+
+/// <summary>
+/// 确定性模拟测试（DST，frankensqlite/Turso 方法论）：固定种子
+/// LCG 驱动随机操作流——put/delete/get 对拍、全量扫描对拍、事务
+/// 提交/回滚、阈值固化、全段归并、随机持久化档重开（= 干净关闭
+/// 后从任意提交边界恢复）。全程与内存参照模型逐操作对账，
+/// 输出确定性，与 zandb_fuzz.out 比对。
+/// </summary>
+class ZanDbFuzzTest {
+    static long seed = 20260913;
+    static int mismatches = 0;
+
+    static long Next() {
+        seed = seed * 6364136223846793005 + 1442695040888963407;
+        return (seed >> 33) & 2147483647;
+    }
+
+    static string Key(int i) {
+        return "k" + Convert.ToString(i).PadLeft(3, "0");
+    }
+
+    static void Clean(string basePath) {
+        File.Delete(basePath);
+        File.Delete(basePath + ".m0");
+        File.Delete(basePath + ".m1");
+        for (int i = 0; i < 24; i = i + 1) {
+            File.Delete(basePath + ".s" + Convert.ToString(i));
+        }
+    }
+
+    /// db.Get 与模型对账；不符记一次（打印确定性的差异行）。
+    static void VerifyGet(ZanStore db, Dictionary<string, string> model, string key, int op) {
+        string want = "";
+        model.TryGetValue(key, out want);
+        string got = db.Get(key);
+        if (got != want) {
+            mismatches = mismatches + 1;
+            Console.WriteLine("MISMATCH op=" + Convert.ToString(op) + " get " + key
+                + " want=" + want + " got=" + got);
+        }
+    }
+
+    /// 全量扫描对账：db.Scan 行序 == 模型键序行。
+    static void VerifyScan(ZanStore db, Dictionary<string, string> model, int op) {
+        List<string> got = new List<string>();
+        db.Scan("", delegate(string k, string v) {
+            got.Add(k + "=" + v);
+            return true;
+        });
+        // model.Keys 是字典内部列表：必须拷贝后再排序，原地排序
+        // 会搅乱键值配对。
+        List<string> keys = new List<string>();
+        List<string> mks = model.Keys;
+        for (int i = 0; i < mks.Count; i = i + 1) { keys.Add(mks[i]); }
+        ZanStore.SortStrings(keys);
+        if (got.Count != keys.Count) {
+            mismatches = mismatches + 1;
+            Console.WriteLine("MISMATCH op=" + Convert.ToString(op) + " scan count "
+                + Convert.ToString(got.Count) + " vs model " + Convert.ToString(keys.Count));
+            return;
+        }
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            string v = "";
+            model.TryGetValue(keys[i], out v);
+            if (got[i] != keys[i] + "=" + v) {
+                mismatches = mismatches + 1;
+                Console.WriteLine("MISMATCH op=" + Convert.ToString(op)
+                    + " scan row " + got[i] + " want " + keys[i] + "=" + v);
+                return;
+            }
+        }
+    }
+
+    static void Main() {
+        string path = "zandb_fuzz_tmp.zdb";
+        Clean(path);
+
+        Dictionary<string, string> model = new Dictionary<string, string>();
+        ZanStore db = ZanStore.Open(path, ZanStore.DUR_SYNC);
+        db.SetFlushThreshold(200);
+
+        int op = 0;
+        while (op < 300) {
+            op = op + 1;
+            int r = (int)(Next() % 100);
+            int ki = (int)(Next() % 200);
+            string key = Key(ki);
+            if (r < 40) {
+                string val = "v" + Convert.ToString(Next() % 100000);
+                db.Put(key, val);
+                if (model.ContainsKey(key)) { model.Remove(key); }
+                model.Add(key, val);
+            } else if (r < 55) {
+                bool want = model.ContainsKey(key);
+                bool got = db.Delete(key);
+                if (got != want) {
+                    mismatches = mismatches + 1;
+                    Console.WriteLine("MISMATCH op=" + Convert.ToString(op)
+                        + " delete " + key + " want=" + Convert.ToString(want)
+                        + " got=" + Convert.ToString(got));
+                }
+                if (want) { model.Remove(key); }
+            } else if (r < 65) {
+                VerifyGet(db, model, key, op);
+            } else if (r < 75) {
+                VerifyScan(db, model, op);
+            } else if (r < 82) {
+                db.FlushToSegment();
+            } else if (r < 85) {
+                db.MergeSegments();
+            } else if (r < 92) {
+                db.Close();
+                int d = (int)(Next() % 3);
+                db = ZanStore.Open(path, d == 0 ? ZanStore.DUR_SYNC
+                    : (d == 1 ? ZanStore.DUR_GROUP : ZanStore.DUR_NONE));
+                db.SetFlushThreshold(Next() % 2 == 0 ? 200 : 4096);
+            } else if (r < 97) {
+                // 事务批量提交：1-3 个写。
+                db.Begin();
+                int n = 1 + (int)(Next() % 3);
+                List<string[]> batch = new List<string[]>();
+                for (int j = 0; j < n; j = j + 1) {
+                    int kj = (int)(Next() % 200);
+                    string k2 = Key(kj);
+                    if (Next() % 4 == 0) {
+                        db.Delete(k2);
+                        batch.Add(new string[] { k2, null });
+                    } else {
+                        string v2 = "t" + Convert.ToString(Next() % 100000);
+                        db.Put(k2, v2);
+                        batch.Add(new string[] { k2, v2 });
+                    }
+                }
+                db.Commit();
+                for (int j = 0; j < batch.Count; j = j + 1) {
+                    if (batch[j][1] == null) {
+                        if (model.ContainsKey(batch[j][0])) { model.Remove(batch[j][0]); }
+                    } else {
+                        if (model.ContainsKey(batch[j][0])) { model.Remove(batch[j][0]); }
+                        model.Add(batch[j][0], batch[j][1]);
+                    }
+                }
+            } else {
+                // 事务回滚：模型不动。
+                db.Begin();
+                for (int j = 0; j < 3; j = j + 1) {
+                    string k2 = Key((int)(Next() % 200));
+                    db.Put(k2, "lost" + Convert.ToString(Next() % 1000));
+                }
+                db.Rollback();
+            }
+            if (op % 40 == 0) {
+                if (db.Count() != model.Count) {
+                    mismatches = mismatches + 1;
+                    Console.WriteLine("MISMATCH op=" + Convert.ToString(op) + " count "
+                        + Convert.ToString(db.Count()) + " vs model "
+                        + Convert.ToString(model.Count));
+                }
+                Console.WriteLine("ckpt " + Convert.ToString(op)
+                    + " count=" + Convert.ToString(model.Count)
+                    + " segs=" + Convert.ToString(db.SegCount())
+                    + " log=" + Convert.ToString(db.LogBytes()));
+            }
+        }
+
+        VerifyScan(db, model, op);
+        db.Checkpoint();
+        db.Close();
+
+        // 终验：干净关闭后重开，全量再对账。
+        db = ZanStore.Open(path, ZanStore.DUR_GROUP);
+        VerifyScan(db, model, 999);
+        if (db.Count() != model.Count) {
+            mismatches = mismatches + 1;
+            Console.WriteLine("MISMATCH final count " + Convert.ToString(db.Count())
+                + " vs model " + Convert.ToString(model.Count));
+        }
+        db.MergeSegments();
+        VerifyScan(db, model, 1000);
+        db.Close();
+
+        db = ZanStore.Open(path, ZanStore.DUR_SYNC);
+        VerifyScan(db, model, 1001);
+        db.Close();
+
+        Console.WriteLine("fuzz done model=" + Convert.ToString(model.Count)
+            + " mismatches=" + Convert.ToString(mismatches));
+        Clean(path);
+    }
+}
