@@ -235,6 +235,19 @@ token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
   "点系列→lines"的判定若排在堆叠判定之前,stack+time 图永远走不到
   堆叠面积渲染器,两条同名 stack 系列各自按原始值画(真实案例:
   line-tooltip-touch 粉带不堆叠,DispatchKind 里换两行顺序即修)。
+- **Keyed 每帧新建实例,图表跨帧悬停状态必须放 wid 悬停槽**:宿主
+  每帧 `ChartView.Keyed(o, key).Render(...)`,实例随帧丢弃;
+  previousHit/pointerWasOver 这类状态放实例字段时,fadeFocus 渐隐读
+  "上一帧命中"永远是空。实测的坑:无头探针复用同一实例渲染三帧全绿,
+  活窗口光标钉在数据点上却死活不渐隐——两种用法行为分裂,探针测不出
+  实例生命周期的坑。跨帧状态进 `ChartView.HoverSlot*`(按 wid 键)。
+- **GUI 重绘是按需的:hitTester hover 变化才调度,图表内部悬停要自己
+  补帧**:App 的 mousemove 只在 hitTester hover id 变化时置
+  needsRedraw,而系列命中(currentHit)不在 hitTester 里——光标停在
+  数据点上后没有任何下一帧,晚一帧的渐隐/item 卡永远不渲染。实测:
+  同一时刻导航行 CSS :hover 会亮(hitTester 链活),图表拾取却"死";
+  修法是 DispatchPointerEvents 在 hitChanged/entered/left 时补
+  `needsRedraw = true`。
 
 ## 缩放纪律(DPI:为什么界面忽大忽小)
 

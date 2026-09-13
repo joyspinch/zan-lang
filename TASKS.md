@@ -2593,3 +2593,9 @@ P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
   gui_chart_calendar/barminheight/policy_gallery_coverage）；手工从根目录
   5 个 conformance 全 MATCH 证非引擎回归。修法 = add_test 统一补
   `WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}`。
+* **挂账（本轮悬停修复的 standard 层，待安静窗口补跑）**：ChartView
+  悬停槽改造（Keyed 每帧新建实例 → 跨帧悬停状态进 wid 槽）+ 命中
+  变化补调度一帧 + 类目线点 item 悬停卡，实机 bump-chart 渐隐/值卡
+  全通、chart_cached_events 金样 MATCH、theme/stackedarea-aa 用例过；
+  standard 层因并行会话 ZanDb 重构 + Tabs TEMP-DBG 占用构建无法运行，
+  下个无并发构建的窗口补 `scripts/test.ps1 standard`。

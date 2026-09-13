@@ -41,13 +41,61 @@ partial class ChartView {
     bool disposed;
     ChartEventHub eventHub;
     int eventHitId;
-    bool pointerWasOver;
     ChartHit currentHit;
-    ChartHit previousHit;
     int lastZoomLo;
     int lastZoomHi;
     int lastEventStateWid;
     static ChartView activeEventView;
+
+    // —— 跨帧悬停槽（按 wid）——
+    // Keyed 每帧新建实例，悬停的跨帧状态（上一帧命中、指针是否
+    // 在图上）放在实例字段必然断档：fadeFocus 渐隐读不到上一帧
+    // 命中、enter/leave 每帧重触发。状态搬进 wid 键槽，实例可丢弃。
+    static List<int> hoverSlotWids;
+    static List<ChartHit> hoverSlotHits;
+    static List<int> hoverSlotOvers;
+
+    static int HoverSlotIdx(int wid) {
+        if (ChartView.hoverSlotWids == null) { return 0 - 1; }
+        for (int i = 0; i < ChartView.hoverSlotWids.Count; i = i + 1) {
+            if (ChartView.hoverSlotWids[i] == wid) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    /// wid 槽记录的上一帧悬停命中（无则 null）。
+    static ChartHit HoverSlotHit(int wid) {
+        int i = ChartView.HoverSlotIdx(wid);
+        return i < 0 ? null : ChartView.hoverSlotHits[i];
+    }
+
+    static bool HoverSlotOver(int wid) {
+        int i = ChartView.HoverSlotIdx(wid);
+        return i >= 0 && ChartView.hoverSlotOvers[i] != 0;
+    }
+
+    static void HoverSlotSet(int wid, ChartHit hit, bool over) {
+        if (ChartView.hoverSlotWids == null) {
+            ChartView.hoverSlotWids = new List<int>();
+            ChartView.hoverSlotHits = new List<ChartHit>();
+            ChartView.hoverSlotOvers = new List<int>();
+        }
+        int i = ChartView.HoverSlotIdx(wid);
+        if (i < 0) {
+            // 图表数量有限；换页孤儿槽到量即整表重建。
+            if (ChartView.hoverSlotWids.Count > 64) {
+                ChartView.hoverSlotWids = new List<int>();
+                ChartView.hoverSlotHits = new List<ChartHit>();
+                ChartView.hoverSlotOvers = new List<int>();
+            }
+            ChartView.hoverSlotWids.Add(wid);
+            ChartView.hoverSlotHits.Add(hit);
+            ChartView.hoverSlotOvers.Add(over ? 1 : 0);
+            return;
+        }
+        ChartView.hoverSlotHits[i] = hit;
+        ChartView.hoverSlotOvers[i] = over ? 1 : 0;
+    }
 
     /// 初始化保留式生命周期字段（事件、动画/版本跟踪、事件 hub）。
     void InitLifecycle() {
@@ -64,9 +112,7 @@ partial class ChartView {
         disposed = false;
         eventHub = new ChartEventHub();
         eventHitId = 0 - 1;
-        pointerWasOver = false;
         currentHit = null;
-        previousHit = null;
         lastZoomLo = 0 - 1;
         lastZoomHi = 0 - 1;
         lastEventStateWid = 0 - 1;
@@ -346,6 +392,24 @@ partial class ChartView {
             best.pixelY = my;
             if (forceTopmost) { ChartView.OfferActiveHit(best); }
             else { ChartView.OfferTopmostCategoryHit(best); }
+            // ECharts trigger:'item' 的数据点悬停卡：列卡由
+            // CartesianTooltip 负责，声明 item 时它整体不画，官方
+            // 凹凸图"悬停某条线出该点值卡"的观感由这里补齐。
+            // --nomouse 把 showTooltip 关掉，截图/回归不进卡。
+            if (Chart.legendOpt != null && Chart.legendOpt.showTooltip
+                && Chart.legendOpt.tooltipTrigger == "item") {
+                ChartSeries bs = series[best.seriesIndex];
+                string vt = Convert.ToString(best.value);
+                if (bs.SeriesFrac(best.dataIndex)) {
+                    double dn = bs.Number(best.dataIndex);
+                    vt = Chart.FracText((int)(dn * 1000
+                        + (dn >= 0 ? 0.5 : 0 - 0.5)));
+                }
+                List<TooltipRow> rows = new List<TooltipRow>();
+                rows.Add(TooltipRow.Of(0, best.dataName));
+                rows.Add(TooltipRow.Of(bs.color, bs.name + "  " + vt));
+                ChartView.TooltipCard(app, mx, my, f.plotX + f.plotW, rows);
+            }
         }
     }
 
@@ -377,12 +441,23 @@ partial class ChartView {
             hit.pixelX = app.mouseX;
             hit.pixelY = app.mouseY;
         }
-        bool entered = over && !this.pointerWasOver;
-        bool left = !over && this.pointerWasOver;
-        bool hitChanged = !ChartHit.Same(this.previousHit, hit);
-        if ((hitChanged || left) && this.previousHit != null) {
+        bool wasOver = ChartView.HoverSlotOver(this.wid);
+        ChartHit prevHit = ChartView.HoverSlotHit(this.wid);
+        bool entered = over && !wasOver;
+        bool left = !over && wasOver;
+        bool hitChanged = !ChartHit.Same(prevHit, hit);
+        if (hitChanged || entered || left) {
+            // 悬停可见反馈晚命中一帧：emphasis.focus 渐隐在下一帧
+            // 渲染入口才读悬停槽（fadeFocus 帧内静态），item 悬停卡
+            // 也随命中重画。hitTester 的 hover 不含系列命中，鼠标
+            // 停住后不再有 mousemove 调度重绘——光标停在数据点上会
+            // 永远等不到下一帧。命中变化时这里补一帧。
+            app.NoteRedrawWhy("chart-hover");
+            app.needsRedraw = true;
+        }
+        if ((hitChanged || left) && prevHit != null) {
             ChartInteractionEvent me = ChartView.EventFromHit(
-                ChartEventType.MouseOut, this.wid, this.previousHit);
+                ChartEventType.MouseOut, this.wid, prevHit);
             this.RaiseInteraction(me);
         }
         if ((hitChanged || entered) && hit != null) {
@@ -393,12 +468,11 @@ partial class ChartView {
             ChartInteractionEvent he2 = ChartView.EventAt(
                 ChartEventType.Hover, this.wid, app.mouseX, app.mouseY);
             this.RaiseInteraction(he2);
-        } else if (left && hit == null && this.previousHit == null) {
+        } else if (left && hit == null && prevHit == null) {
             ChartInteractionEvent me2 = ChartView.EventAt(
                 ChartEventType.MouseOut, this.wid, app.mouseX, app.mouseY);
             this.RaiseInteraction(me2);
         }
-        this.pointerWasOver = over;
         if (statusNow == "ready" && this.eventHitId >= 0
             && Ui.Clicked(app, this.eventHitId)) {
             if (hit != null) {
@@ -420,7 +494,8 @@ partial class ChartView {
                                     app.mouseX, app.mouseY);
             this.RaiseInteraction(de);
         }
-        this.previousHit = ChartHit.Copy(hit);
+        ChartView.HoverSlotSet(this.wid,
+            hit == null ? null : ChartHit.Copy(hit), over);
         ChartView.activeEventView = null;
     }
 
@@ -1522,16 +1597,17 @@ partial class ChartView {
 
         // 把每种图表裁剪到自己的矩形，防止绘图线、柱条、
         // 轴标签和图例溢出到相邻控件。
-        // emphasis.focus='series' 渐隐的帧内状态源：下面的渲染会
-        // 重置并重测命中，先把上一帧悬停系列记进 Chart 帧内静态；
-        // 该系列声明 focus:'series' 时渲染器把其余系列乘残透明
-        // （官方 bump 图"鼠标经过其余线渐变"的观感）。
+        // emphasis.focus='series' 渐隐的帧内状态源：读 wid 悬停槽里
+        // 上一帧的命中（下面的渲染会重置并重测 currentHit），该系列
+        // 声明 focus:'series' 时渲染器把其余系列乘残透明（官方
+        // bump 图"鼠标经过其余线渐变"的观感）。
         Chart.fadeFocusIdx = -1;
-        if (this.currentHit != null && this.currentHit.seriesIndex >= 0
-            && this.currentHit.seriesIndex < drawOption.series.Count
-            && drawOption.series[this.currentHit.seriesIndex].emphasisFocus
+        ChartHit hoverPrev = ChartView.HoverSlotHit(this.wid);
+        if (hoverPrev != null && hoverPrev.seriesIndex >= 0
+            && hoverPrev.seriesIndex < drawOption.series.Count
+            && drawOption.series[hoverPrev.seriesIndex].emphasisFocus
                 == "series") {
-            Chart.fadeFocusIdx = this.currentHit.seriesIndex;
+            Chart.fadeFocusIdx = hoverPrev.seriesIndex;
         }
         ChartView.activeEventView = this;
         this.currentHit = null;
