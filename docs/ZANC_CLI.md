@@ -161,8 +161,9 @@ build/zanc probe.zan --auto-stdlib --time              # 各阶段耗时
 | `ZAN_PULLIN_DEBUG` | 打印 stdlib 拉入决策 |
 | `ZAN_NO_PULLIN_FILTER` / `ZAN_NO_PRUNE` | 拉入调试：关过滤 / 关裁剪 |
 | `ZANC_DUMP_BAD_IR` | LLVM verifier 拒绝时 dump 挂掉函数的 IR（定位 verifier 错误第一工具） |
-| `ZANC_TRACE` | 编译器内部跟踪 |
-| `ZAN_WARN_NARROW` | 收窄转换告警 |
+| `ZANC_TRACE` | 编译器内部跟踪（diag.c 统一出口） |
+| `ZAN_TRACE_SYNC` | 打印哪些外部符号把同步/协程运行时拉进来（排查"为什么带上了 co 调度器"） |
+| `ZAN_WARN_NARROW` | 收窄转换告警（默认静默） |
 | `ZAN_CO_WORKERS` | --mt 的 worker 数 |
 | `JAVA_HOME` | --emit-apk 签名用 JDK |
 | `ZAN_GENMETA_DUMP` / `ZAN_GEN_REPLY` | genrun 代码生成器调试 |
@@ -171,9 +172,8 @@ build/zanc probe.zan --auto-stdlib --time              # 各阶段耗时
 | 变量 | 作用 |
 |---|---|
 | `ZAN_RT_HARD` | 设了它守卫失败即硬退出（默认构建下等效 `--strict-runtime` 的行为） |
-| `ZAN_TRACE_SYNC` | 协程/同步调度跟踪 |
 | `ZAN_GUI_ICONS` | 覆盖图标包目录（发现序：env → exe 旁 icons/ → 内嵌 → stdlib） |
-| `ZAN_CEF_*` | CEF 浏览器驱动运行时定位（见 examples/gui_cef_browser） |
+| `ZAN_CEF_*` | CEF 浏览器驱动运行时定位（examples/gui_cef_browser/README.md 全表：RUNTIME/CACHE/MIRROR/LOG/SWITCHES/HELPER* 等一族） |
 
 ## 5. 测试命令（本仓库纪律的命令面）
 
