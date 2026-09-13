@@ -762,10 +762,14 @@ partial class ChartView {
             Style.SNormal()).FgOr(0);
         int mx = app.mouseX;
         int my = app.mouseY;
+        int userSiBase = 0;
         for (int si = 0; si < o.series.Count; si = si + 1) {
             ChartSeries s = o.series[si];
             if (s.hidden || s.coordSys != "geo") { continue; }
             if (s.isGeoBase) { continue; }
+            // visualMap.seriesIndex 按用户声明序计（不含合成的 isGeoBase
+            // 底图载体系列）；userSi 是官方语义的系列序号，循环尾递增。
+            int userSi = userSiBase;
             int col = s.color;
             if (col == 0) { col = Chart.Palette(t, si); }
             if (s.itemStyle.normal.lineStyle.color != 0) {
@@ -837,8 +841,33 @@ partial class ChartView {
                     }
                 }
             }
-            // 散点（含 effectScatter 折算）：按 z 值定半径（visualMap
-            // 语义近似），有名且有 label.show 的画名标签。
+            // 散点（含 effectScatter 折算）：按值定符号大小——
+            // visualMap inRange.symbolSize 声明时按官方语义把 z 线性
+            // 映射到 [sizeLo,sizeHi] 直径；未声明时退回旧启发式
+            // （小值 demo 观感不变）。有名且有 label.show 的画名标签。
+            // 旧启发式对大值域（人口 1.3e9）会算出天文数字半径把
+            // 整张画布刷成一个系列色——所以凡 z 驱动半径一律过
+            // Scale(60) 硬帽。
+            ChartVisualMap sizeVm = null;
+            for (int vi = 0; vi < o.visualMaps.Count; vi = vi + 1) {
+                ChartVisualMap vv = o.visualMaps[vi];
+                if (vv.hasSize && vv.type == 0
+                    && (vv.seriesIndex < 0 || vv.seriesIndex == userSi)) {
+                    sizeVm = vv; break;
+                }
+            }
+            int zLo = 0; int zHi = 0; bool zOk = false;
+            if (sizeVm != null && sizeVm.hasMin && sizeVm.hasMax
+                && sizeVm.minRaw != ChartOption.Auto()
+                && sizeVm.maxRaw != ChartOption.Auto()) {
+                zLo = sizeVm.minRaw; zHi = sizeVm.maxRaw; zOk = true;
+            } else if (sizeVm != null) {
+                for (int zi = 0; zi < s.points.Count; zi = zi + 1) {
+                    int zv = s.points[zi].z;
+                    if (!zOk) { zLo = zv; zHi = zv; zOk = true; }
+                    else { if (zv < zLo) { zLo = zv; } if (zv > zHi) { zHi = zv; } }
+                }
+            }
             for (int pi4 = 0; pi4 < s.points.Count; pi4 = pi4 + 1) {
                 ChartPoint p = s.points[pi4];
                 int px2 = ChartView.GeoProjectX(layout, p.x);
@@ -850,8 +879,20 @@ partial class ChartView {
                 int pcol = p.color != 0 ? p.color : col;
                 int r = app.Scale(4);
                 if (p.sizeSet && p.size > 0) { r = app.Scale(p.size) / 2; }
-                if (p.z != 0) { r = app.Scale(3) + p.z * app.Scale(14) / 100; }
+                if (p.z != 0) {
+                    if (sizeVm != null && zOk && zHi > zLo) {
+                        long tS = (long)(p.z - zLo) * 1000 / (long)(zHi - zLo);
+                        if (tS < 0) { tS = 0; }
+                        if (tS > 1000) { tS = 1000; }
+                        int dia = sizeVm.sizeLo
+                            + (int)((long)(sizeVm.sizeHi - sizeVm.sizeLo) * tS / 1000);
+                        r = app.Scale(dia) / 2;
+                    } else {
+                        r = app.Scale(3) + (int)((long)p.z * app.Scale(14) / 100);
+                    }
+                }
                 if (r < app.Scale(2)) { r = app.Scale(2); }
+                if (r > app.Scale(60)) { r = app.Scale(60); }
                 c.FillCircle(px2, py2, r, Chart.WithAlpha(pcol, alpha));
                 if (s.symbolSize > 0 && p.sizeSet) { r = app.Scale(p.size) / 2; }
                 if (!s.silent && mx >= px2 - r && mx < px2 + r
@@ -869,6 +910,7 @@ partial class ChartView {
                         plotX, plotY, plotW, plotH);
                 }
             }
+            userSiBase = userSiBase + 1;
         }
     }
 

@@ -2628,3 +2628,75 @@ P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
   本次已修：凹凸图 live 重掷（nomouse 钉死保回归）、线体悬停
   （SegDist2 线段命中，官方 linePrecision 对齐，值对路径 PointsHover
   仍只点半径待同修）。
+* **全量 347 demo 审查 sweep 落地（2026-09-13 续）**：gui_charts 新增
+  `--sweep` 启动参数——逐 demo FromJson+KeyedStatic 渲染一帧
+  `Canvas.WritePixels` 落 `_scratch/sweep/<id>.zpx`（ZPX1）+ manifest.txt
+  （id/ready/phase/ms），异常按例捕获不中断；_scratch/sweep_analyze.py
+  解码出 png + 统计（非背景占比/调色板命中/内容 bbox/边缘接触/轴线暗
+  游程）+ FLAG 启发。首轮 345/347 渲染 ok（nojson=lines-ny/custom-wind 两个
+  ready:false），185 FLAG 经人工看图分诊，"有的"已落到 id：
+  - **已修（本批）**：geo 投影散点半径启发式 `r=Scale(3)+z*Scale(14)/100`
+    对大值域爆炸——scatter-world-population（人口 1.35e9→半径 1.9e8px）、
+    geo-choropleth-scatter（z 1e5→14003px）各把整画布刷成一个系列色。
+    改为解析 visualMap `inRange.symbolSize`（ChartVisualMap.sizeLo/Hi/
+    hasSize，含 Clone；官方 [6,60]/[5,30] 语义按 minRaw/maxRaw 或系列
+    数据域线性映射直径）+ 未声明时旧启发式 + 凡 z 驱动半径一律
+    Scale(60) 硬帽；visualMap.seriesIndex 按用户系列序计（不含合成
+    isGeoBase）。另修 LeadSeries 对 0 系列 option 的 declOrder[0] 越界
+    （sweep 尾声暴露的运行时错误）。
+  - **挂账（雷达车道，比预想深）**：radar 主力 demo 即坏——series
+    data[{value:[...]}] 多边形整条没画、radar.indicator 的 name 未解析
+    （ChartModel.zan 只读 max）、DrawPolar 轴标签错拿图例文案
+    （XCategories 无雷达指示器路径）；doc-example/radar（纯组件无系列）
+    落 "(no data)"。需要独立会话：指示器名进模型 + 多边形绘制 +
+    0 系列画骨架。
+  - **挂账（cartesian 热力图车道缺失）**：heatmap-large/piecewise
+    （[x,y,v] 对组 20301 点）现走表格热力车道（1 系列=1 行）→
+    cellW<1 纯白；heatmap-cartesian 168 点画成 1 行退化条（恰没被判
+    BLANK）。需按 yAxis 类目=行、xAxis 类目=列、visualMap 连续 ramp
+    上色的官方语义建车道。
+  - **挂账（bar-race-country 纯白）**：dataset + realtimeSort + encode
+    车道未实现，series.data 空 → 无柱。
+  - **挂账（matrix 坐标系内容）**：matrix-* 11 例：骨架（行/列带）画出
+    但系列内容全无（matrix-pie 有图例无饼、matrix-simple 全空）。matrix
+    coordSys 车道待建。
+  - **挂账（组件级骨架）**：doc-example/polar-anticlockwise /
+    polar-start-angle（series:[] 纯 polar 组件）官方画极坐标网格+角度
+    刻度，现落 "(no data)"。修法方向：DispatchKind 0 系列时若
+    polar/angleAxes 存在 → "polarCoord"、radarMax 存在 → "radar"，
+    DrawPolarCoord/DrawPolar 0 系列本就画骨架。
+  - **挂账（geo-svg doc 三连维持 ready:false）**：geo-svg-label-basic /
+    named-basic（simple_svg 命名元素 + geo.regions[].label.formatter，
+    ChartSvgMap 无标签支持）、geo-svg-layout-basic（六种
+    宽高/viewBox/boundingCoords 布局变体）——素材与语义来自 ECharts
+    手册 SVG 底图教程，需 SVG 命名元素标签车道，非一行注册可解。
+  - **启发式噪声（不改引擎）**：EDGE-CLIP LTRB 于 treemap/sunburst
+    （官方本就满幅）、polar 类 NO-X/YAXIS、graph-force 稀疏 0.08~0.11
+    nonbg 均为误报；图表类 NO-YAXIS 多因 ECharts6 浅色轴线过不了暗游
+    程阈值。
+* **html_gallery 全量重设计 + 事件/声明三根修复（2026-09-13）**：
+  画廊重做（77 卡 × 7 分类页、1560×920 四列大卡、原生 HTML 语义
+  `<button>/<input>/<img src>/<label>` 与 data-* 通道等价），实点验证
+  Tabs/Pagination/Collapse/SelectBox/Wizard 列表交互全通。本轮 stdlib
+  修的三处根因：
+  - **Tabs 页签点不动**：Tabs 的 Select 按几何自己消费点击、不经过
+    On 通用事件包，而 FireCommon 只给 On.Any() 的控件注册命中区——
+    宿主只用 `TabChanged.Add` 类型化接线（On 为空）时，按页签=
+    按空白（hitId<0 → pressOnBlocker），释放被 ClickAvailable 判成
+    "点外部"吞掉。修：Render/RenderVertical 把条带注册成命中区。
+  - **Control.SetProp("name") 截断组件同名属性**：IconView 的图标名
+    等走任何声明通道都喂不进。修：PropOf 命中则写属性，syncName 的
+    才顺带改标识名。
+  - **ListItem PropSpec 死快照**：`text.str = this.Label()` 绑的是
+    返回值快照而非 Binding 字段本身，SetProp 写进死快照界面永不
+    出现。修：绑 `Text`/`Desc` 字段（编译器合成实时访问器对）。
+  - 演示侧配套：Wizard 全窗 Render/Show 不可 Dock，卡内嵌
+    RenderList 子件 + 实时描述；FormField 是设计器文档节点无运行时
+    绘制，运行时形态 = FormBuilder.Build(设计 JSON)，演示卡按此喂
+    迷你表单；BandGrid 热力图不设 Heat 即与底色融为一体；Trend
+    量程是原始计数（位号 scale=10 时 0..100 装不下 1520）。
+  - **挂账**：① 词法器字符串字面量 4095 上限（src/compiler/lexer.c
+    栈缓冲 char buf[4096]）——大 data-uri 属性靠 GenForm EmitSetProp
+    分块发射绕开，根治需堆化；② 符号索引把 .html 当 Zan 源扫描，
+    报 `<unknown>:N:M: unexpected character` 非致命噪音（构建
+    exit=0），应在索引侧跳过设计文档。

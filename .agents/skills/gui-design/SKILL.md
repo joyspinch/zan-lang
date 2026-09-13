@@ -118,6 +118,17 @@ token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
 
 - **设计稿必须是编译输入的第一个文件**——zanc 从第一份设计文档合成
   Main 与控件字段,放后面 = 字段全缺。
+- **写真 HTML 语义,不是全 div + data-* 的"类 HTML"**:`<button>文字</button>`、
+  `<input placeholder>`、`<img src/alt>`、`<label>文字</label>` 直接映射
+  组件属性,与 data-x-* 通道等价可混用(图片内容就该放 src)。复合属性
+  (props/options/columns)才用 `data-x-<键>='<JSON>'`。
+- **code-behind 职责分界**:结构全部进设计稿;只有声明通道喂不活的组件
+  (泛型 `ListView<T>`、需运行时模型、立即模式助手、设计器文档节点)在
+  HTML 里落 Panel 占位壳,由 code-behind 构造真控件 `Add` 进壳。两个
+  易错形态:Wizard 的 `Render`/`Show` 是 App 级全窗绘制,不可 Dock 进
+  卡片,内嵌场景用它的 `RenderList` 等子件;`FormField` 是设计器文档
+  节点、自身无运行时绘制,运行时形态是 `FormBuilder.Build(设计 JSON)`
+  实例化的真控件树。
 - `data-if` 只认路径真值,不支持比较表达式;多按钮控制中间区走
   `Nav.Embed`(路由出口:惰性实例化、切走保留、可配临态),别用
   N 个布尔 data-if 硬拼。
@@ -152,6 +163,16 @@ token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
   裸写的 `Gui.Widget.Ribbon`(功能区控件)整体劫持到新类上,调用点报
   "no member",离肇因提交很远——Zan 的名字解析按 using 就近绑定,同名类不警告。
   新增类落名前 `grep -rn "class <Name>" stdlib/Gui/`;撞名要么改名、要么调用点限定名。
+- **纯几何消费点击的控件必须自己注册命中区**(Tabs 页签条教训):不走
+  On 通用事件包、按几何自己判点击的区域,要 `app.hitTester.RegisterRect`
+  自己的条带——FireCommon 只给 `On.Any()` 的控件注册命中区,宿主只用
+  `TabChanged.Add` 类型化接线(On 为空)时,按页签=按空白
+  (hitId<0 → pressOnBlocker),释放被 ClickAvailable 判成"点外部"吞掉,
+  页签永远切不动。
+- **PropSpec 的 str/num/flag 必须绑字段本身,不能绑 getter 返回值**
+  (ListItem 教训):`text.str = this.Label()` 绑到的是一份值快照,设计
+  通道的 SetProp 写进死快照,界面永不出现;绑 `Text` 字段才拿到编译器
+  合成的实时访问器对。
 
 ## 毛刺防治(斜线/曲线/圆角的抗锯齿)
 
@@ -255,6 +276,21 @@ token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
   最近点 300+px 仍应命中)。实现 = 指针到相邻两点连线(数据点弦)的
   SegDist2 也进最近候选,命中归属较近端点;启动参数路径(SelectDemo
   带 demo 参数)会早于容器惰性初始化,重掷/替换缓存前先判空建表。
+- **数据值直接进像素公式的通道必须过显式域映射或硬帽,大值域会画出
+  天文数字图元刷满画布**:geo 投影散点旧启发式 `r=Scale(3)+z*Scale(14)/100`
+  拿数据值当尺寸——scatter-world-population 人口 1.35e9 算出半径
+  1.9e8px,整张画布被一个圆刷成系列调色板色(geo-choropleth-scatter
+  同炸)。官方语义是 visualMap inRange.symbolSize [lo,hi] 按声明的
+  min/max(未声明则数据域)线性映射直径;凡 z 驱动半径一律再过
+  Scale(60) 硬帽兜底(真实案例:全量 sweep 的 BLANK 分诊里,两张
+  "满屏纯色"图都是它)。
+- **全量 demo 审查靠 sweep 机器落 id,不靠人眼扫**:gallery 加 `--sweep`
+  启动参数,逐 demo FromJson+KeyedStatic 渲一帧 Canvas.WritePixels 落
+  ZPX1 + manifest(时延/异常按例捕获不中断),python 解码 png + 启发
+  FLAG(非背景占比/调色板命中/内容 bbox/边缘接触/轴线暗游程)。用户
+  "有的缺轴/有的空白/有的刷色"式模糊指控,一晚上落成 demo id 清单。
+  三类启发误报要先看图再信 FLAG:treemap/sunburst 满幅 EDGE-CLIP
+  正当、polar 类本无 X/Y 轴、ECharts6 浅色轴线过不了暗游程阈值。
 
 ## 缩放纪律(DPI:为什么界面忽大忽小)
 

@@ -118,6 +118,17 @@ token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
 
 - **设计稿必须是编译输入的第一个文件**——zanc 从第一份设计文档合成
   Main 与控件字段,放后面 = 字段全缺。
+- **写真 HTML 语义,不是全 div + data-* 的"类 HTML"**:`<button>文字</button>`、
+  `<input placeholder>`、`<img src/alt>`、`<label>文字</label>` 直接映射
+  组件属性,与 data-x-* 通道等价可混用(图片内容就该放 src)。复合属性
+  (props/options/columns)才用 `data-x-<键>='<JSON>'`。
+- **code-behind 职责分界**:结构全部进设计稿;只有声明通道喂不活的组件
+  (泛型 `ListView<T>`、需运行时模型、立即模式助手、设计器文档节点)在
+  HTML 里落 Panel 占位壳,由 code-behind 构造真控件 `Add` 进壳。两个
+  易错形态:Wizard 的 `Render`/`Show` 是 App 级全窗绘制,不可 Dock 进
+  卡片,内嵌场景用它的 `RenderList` 等子件;`FormField` 是设计器文档
+  节点、自身无运行时绘制,运行时形态是 `FormBuilder.Build(设计 JSON)`
+  实例化的真控件树。
 - `data-if` 只认路径真值,不支持比较表达式;多按钮控制中间区走
   `Nav.Embed`(路由出口:惰性实例化、切走保留、可配临态),别用
   N 个布尔 data-if 硬拼。
@@ -152,6 +163,16 @@ token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
   裸写的 `Gui.Widget.Ribbon`(功能区控件)整体劫持到新类上,调用点报
   "no member",离肇因提交很远——Zan 的名字解析按 using 就近绑定,同名类不警告。
   新增类落名前 `grep -rn "class <Name>" stdlib/Gui/`;撞名要么改名、要么调用点限定名。
+- **纯几何消费点击的控件必须自己注册命中区**(Tabs 页签条教训):不走
+  On 通用事件包、按几何自己判点击的区域,要 `app.hitTester.RegisterRect`
+  自己的条带——FireCommon 只给 `On.Any()` 的控件注册命中区,宿主只用
+  `TabChanged.Add` 类型化接线(On 为空)时,按页签=按空白
+  (hitId<0 → pressOnBlocker),释放被 ClickAvailable 判成"点外部"吞掉,
+  页签永远切不动。
+- **PropSpec 的 str/num/flag 必须绑字段本身,不能绑 getter 返回值**
+  (ListItem 教训):`text.str = this.Label()` 绑到的是一份值快照,设计
+  通道的 SetProp 写进死快照,界面永不出现;绑 `Text` 字段才拿到编译器
+  合成的实时访问器对。
 
 ## 毛刺防治(斜线/曲线/圆角的抗锯齿)
 
@@ -254,6 +275,20 @@ token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
   圆点"——光标离最近点 300+px 仍应命中)。实现 = 指针到相邻两点
   连线(数据点弦)的距离平方也进最近候选,命中归属较近端点;另外
   启动参数路径会早于容器惰性初始化,替换缓存前先判空建表。
+- **数据值直接进像素公式的通道必须过显式域映射或硬帽,大值域会画出
+  天文数字图元刷满画布**:地图投影散点的旧启发式拿数据值直接乘系数
+  当半径——人口量级(1e9)的数据算出上亿像素的圆,整张画布被刷成一
+  个系列色。正确语义是 visualMap inRange.symbolSize [lo,hi] 按声明的
+  min/max(未声明则数据域)线性映射符号直径;凡数据值驱动半径一律再
+  过硬帽兜底(真实案例:全量截图审查的"空白"分诊里,两张满屏纯色
+  图都是它,纯色恰是散点系列的调色板色)。
+- **全量示例审查靠批量截图机器落 id,不靠人眼扫**:给示例程序加批量
+  启动参数,逐示例解析+静态渲染一帧 WritePixels 落盘 + manifest
+  (时延/异常按例捕获不中断),再用脚本解码成 png + 启发 FLAG(非
+  背景占比/调色板命中/内容包围盒/边缘接触/轴线暗游程)。用户
+  "有的缺轴/有的空白/有的刷色"式模糊指控,一晚上落成示例 id 清单。
+  三类启发误报要先看图再信 FLAG:矩形树图/旭日图满幅裁边正当、
+  极坐标类本无直角轴、浅色轴线过不了暗游程阈值。
 
 ## 缩放纪律(DPI:为什么界面忽大忽小)
 
