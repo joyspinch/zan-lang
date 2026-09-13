@@ -2604,13 +2604,19 @@ P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
   barminheight（FAIL stacked positive/negative segment drawn）均为内容
   断言失败——calendar 已显式 -DWORKDIR=源树根仍挂，证与 cwd 无关，归
   charts 会话在途工作收口。
-* **观察（并发构建污染，非回归）**：2026-09-13 standard 档期间
-  zanc.exe/zan_gui.dll 被并行会话在途 gui 改动反复重链（21:11/21:14/
-  21:20 三次），跑出的 gui/http 失败是移动靶：http_client_keepalive 在
-  安静窗口单跑即过；gui_listview_scrollbar_drag（Timeout）、
-  gui_httpsource 在 dll 持续重链下无法归因，留给 gui 会话收口后复核。
-  教训：test.ps1 的预构建会把工作树里他人在途改动编进产物，并发期
-  standard 结果不可作归因依据。
+* **已闭账（并发构建污染，2026-09-13 深夜安静窗口复跑定谳）**：上轮
+  standard 期间 zanc.exe/zan_gui.dll 被并行会话在途改动反复重链
+  （21:11/21:14/21:20 三次），跑出的部分 gui/http 失败是移动靶——复跑
+  842 例仅 5 失败：http_client_keepalive、gui_listview_scrollbar_drag
+  均自愈转绿（坐实上轮假红）；本会话测试基建修复车道（chart 5 例及其
+  leakcheck/arcguard twins、测试三脚本默认 WORKDIR）全绿。余下失败
+  分属各自车道：http_forwarder_stream（上行挂账，转发器真实缺陷）、
+  gui_chart_calendar/barminheight（上行挂账，charts 渲染缺口）、
+  gui_zform_html（container class 断言，gui 会话在途 zform/Wizard 半成品
+  所致，且 zan_gui.dll 复跑中途 23:45 又被重链）、gui_httpsource
+  （HTTP 命中数 0，疑环境或在途运行时，待 gui 会话落地后复核）。
+  教训不变：并发期 standard 结果不可作归因依据，test.ps1 预构建会把
+  工作树里他人在途改动编进产物。
 * **挂账（本轮悬停修复的 standard 层，待安静窗口补跑）**：ChartView
   悬停槽改造（Keyed 每帧新建实例 → 跨帧悬停状态进 wid 槽）+ 命中
   变化补调度一帧 + 类目线点 item 悬停卡，实机 bump-chart 渐隐/值卡
