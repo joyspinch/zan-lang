@@ -5,8 +5,9 @@
   - 真 HTML 语义优先：button/label/input/textarea/img 五种有原生标签的
     组件一律用原生标签 + 原生属性/文本内容（src、placeholder、元素文本），
     其余组件用 div + data-kind 扩展（设计稿协议的 custom-element 通道）。
-  - 演示尺寸按组件自身特性配置，按 1560×920 逻辑窗口 4 列大卡布局，
-    每页行高打包并断言不超出内容区（页面不滚动、不裁切）。
+  - 演示尺寸按组件自身特性配置，按 1560×920 逻辑窗口 4 列瀑布流布局：
+    每列独立记账、卡片落"最矮位置"；DataGrid/Transfer 等大组件跨两列，
+    断言不超出内容区（页面不滚动、不裁切）。
   - 每张卡片 = 无标题 Panel + 自放标题 label + 演示节点（标题位置
     完全可预测，绕开 Panel 标题的 padT 预留）；卡片边框走内联 style。
   - 9 个无法纯声明喂活的组件（泛型/需模型/无零参构造）在 HTML 里落
@@ -65,11 +66,12 @@ def png_uri():
 def P(**kw):
     return {k: str(v) for k, v in kw.items()}
 
-# 每项：(页, kind, 卡标题, demo_dw, demo_h, 属性字典)。dw=0 → 卡宽自适应。
+# 每项：(页, kind, 卡标题, demo_dw, demo_h, 属性字典, 跨列数)。dw=0 → 卡宽
+# 自适应（普通卡 338 / 跨两列卡 724）；span=2 的大卡横跨两个卡槽。
 # 原生标签：Button/Label/Input/TextArea/Image 由 emit_demo 特判。
 D = []
-def add(page, kind, cap, dw, dh, a=None):
-    D.append((page, kind, cap, dw, dh, a or {}))
+def add(page, kind, cap, dw, dh, a=None, span=1):
+    D.append((page, kind, cap, dw, dh, a or {}, span))
 
 # ---- 基础控件 13 ----
 add("基础控件", "Button", "Button 按钮", 0, 48,
@@ -149,17 +151,17 @@ add("数据展示", "Marquee", "Marquee 横幅滚动", 0, 36,
                 speed="60", autoFill="true")})
 add("数据展示", "QrCode", "QrCode 二维码", 176, 176,
     {"props": P(text="https://zan-lang.dev", size="160")})
-add("数据展示", "Calendar", "Calendar 日历", 300, 280, {})
+add("数据展示", "Calendar", "Calendar 日历", 0, 280, {}, span=2)
 add("数据展示", "Timeline", "Timeline 时间线", 0, 200, {})
 add("数据展示", "ListItem", "ListItem 列表项", 0, 64,
     {"props": P(text="列表项标题", desc="辅助说明文字")})
 add("数据展示", "Skeleton", "Skeleton 骨架屏", 0, 64,
     {"props": P(width="280", height="48")})
 add("数据展示", "Spin", "Spin 加载中", 120, 96, {"props": P(tip="加载中")})
-add("数据展示", "CodeBlock", "CodeBlock 代码面板", 0, 160, {})
+add("数据展示", "CodeBlock", "CodeBlock 代码面板", 0, 160, {}, span=2)
 add("数据展示", "Progress", "Progress 进度条", 0, 28,
     {"native": "progress", "value": "72"})
-# ---- 导航 11 ----
+# ---- 导航 11（TreeView 提前落矮列，瀑布流才压得进 844 高） ----
 add("导航", "Tabs", "Tabs 页签", 0, 140, {})
 add("导航", "PageHeader", "PageHeader 页头", 0, 72,
     {"props": P(text="项目设置", subtitle="管理成员与权限", icon="settings")})
@@ -167,13 +169,14 @@ add("导航", "Breadcrumb", "Breadcrumb 面包屑", 0, 32, {})
 add("导航", "Pagination", "Pagination 分页", 0, 36,
     {"props": P(total="115", pageSize="10")})
 add("导航", "Steps", "Steps 步骤条", 0, 72, {})
-add("导航", "Wizard", "Wizard 向导（模板列表 + 实时描述）", 0, 210, {})
 add("导航", "FloatButton", "FloatButton 浮动按钮", 96, 56,
     {"props": P(icon="plus")})
-add("导航", "SplitPanel", "SplitPanel 分栏", 0, 140, {})
-add("导航", "Carousel", "Carousel 轮播", 0, 140, {})
-add("导航", "Collapse", "Collapse 折叠面板", 0, 140, {})
 add("导航", "TreeView", "TreeView 树", 0, 180, {})
+add("导航", "Wizard", "Wizard 向导（模板列表 + 实时描述）", 0, 210, {},
+    span=2)
+add("导航", "SplitPanel", "SplitPanel 分栏", 0, 140, {}, span=2)
+add("导航", "Carousel", "Carousel 轮播", 0, 140, {}, span=2)
+add("导航", "Collapse", "Collapse 折叠面板", 0, 140, {}, span=2)
 # ---- 反馈 6 ----
 add("反馈", "Empty", "Empty 空状态", 0, 120,
     {"props": P(text="暂无数据", icon="inbox")})
@@ -183,7 +186,7 @@ add("反馈", "AlarmBanner", "AlarmBanner 报警条", 0, 44, {})
 add("反馈", "Popover", "Popover 气泡", 0, 56, {})
 add("反馈", "AlarmList", "AlarmList 报警列表", 0, 130, {})
 add("反馈", "FormField", "FormField / FormBuilder 迷你表单", 0, 240, {})
-# ---- 列表与表格 7 ----
+# ---- 列表与表格 7（除竖列列表外全是宽组件，一律跨两列） ----
 add("列表与表格", "ListView", "ListView 列表", 0, 140, {})
 add("列表与表格", "VirtualList", "VirtualList 虚拟列表", 0, 160, {})
 add("列表与表格", "DataGrid", "DataGrid 数据表格", 0, 170,
@@ -191,11 +194,11 @@ add("列表与表格", "DataGrid", "DataGrid 数据表格", 0, 170,
      "columns": [{"field": "name", "title": "组件", "width": 140},
                  {"field": "kind", "title": "分类", "width": 100},
                  {"field": "size", "title": "数量", "width": 70,
-                  "type": "num"}]})
-add("列表与表格", "Transfer", "Transfer 穿梭框", 0, 160, {})
-add("列表与表格", "ConsoleView", "ConsoleView 控制台", 0, 140, {})
-add("列表与表格", "BandGrid", "BandGrid 波段表", 0, 170, {})
-add("列表与表格", "GraphView", "GraphView 关系图", 0, 170, {})
+                  "type": "num"}]}, span=2)
+add("列表与表格", "Transfer", "Transfer 穿梭框", 0, 160, {}, span=2)
+add("列表与表格", "ConsoleView", "ConsoleView 控制台", 0, 140, {}, span=2)
+add("列表与表格", "BandGrid", "BandGrid 波段表", 0, 170, {}, span=2)
+add("列表与表格", "GraphView", "GraphView 关系图", 0, 170, {}, span=2)
 # ---- HMI 专用 11 ----
 add("HMI 专用", "Led", "Led 指示灯", 120, 48,
     {"props": P(label="RUN", state="1")})
@@ -204,9 +207,9 @@ add("HMI 专用", "Digital", "Digital 数显", 0, 72,
 add("HMI 专用", "Bargraph", "Bargraph 棒图", 80, 160, {})
 add("HMI 专用", "Gauge", "Gauge 仪表", 160, 170,
     {"props": P(label="PV", value="62", min="0", max="100", unit="%")})
-add("HMI 专用", "Trend", "Trend 趋势", 0, 150, {})
+add("HMI 专用", "Trend", "Trend 趋势", 0, 150, {}, span=2)
 add("HMI 专用", "NumPad", "NumPad 数字键盘", 200, 230, {})
-add("HMI 专用", "EquipPanel", "EquipPanel 设备墙", 0, 210, {})
+add("HMI 专用", "EquipPanel", "EquipPanel 设备墙", 0, 210, {}, span=2)
 add("HMI 专用", "DeviceCard", "DeviceCard 设备卡", 240, 90, {})
 add("HMI 专用", "ButtonGroup", "ButtonGroup 按钮组", 0, 44, {})
 add("HMI 专用", "ToolStrip", "ToolStrip 工具条", 0, 40,
@@ -340,27 +343,32 @@ lines.append('  <zan-tabs id="Cats"%s></zan-tabs>'
 for pi, (ptitle, items) in enumerate(PAGES):
     lines.append('  <div id="Page%d"%s>' % (
         pi, geom(CONTENT_X, CONTENT_Y, CONTENT_W, CONTENT_H)))
-    y = 8
-    for rs in range(0, len(items), COLS):
-        row = items[rs:rs + COLS]
-        row_h = 0
-        for ci, (kind, cap, dw0, dh, a) in enumerate(row):
-            dw = dw0 or DEMO_W
-            card_h = dh + CARD_EXTRA
-            row_h = max(row_h, card_h)
-            x = ci * (CARD_W + GAP)
-            lines.append('    <div id="Card%d_%d"%s%s%s>' % (
-                pi, rs + ci, geom(x, y, CARD_W, card_h),
-                attr("class", "demo-card"), attr("style", CARD_STYLE)))
-            lines.append('      <label%s%s>%s</label>' % (
-                geom(CARD_PAD, 10, CARD_W - CARD_PAD * 2, TITLE_H),
-                attr("style", TITLE_STYLE), esc(cap)))
-            for l in emit_demo(kind, dw, dh, a, "      "):
-                lines.append(l)
-            lines.append('    </div>')
-        y = y + row_h + GAP
-    assert y - GAP <= CONTENT_H, (
-        "Page%d 高度溢出: %d > %d" % (pi, y - GAP, CONTENT_H))
+    # 瀑布流：每列独立记账，卡片落"最矮位置"（并列取最左）；span=2 的
+    # 大卡横跨两个卡槽（card_w = 2*CARD_W+GAP），被跨各列同步记高。
+    col_h = [8] * COLS
+    for si, (kind, cap, dw0, dh, a, span) in enumerate(items):
+        card_w = span * CARD_W + (span - 1) * GAP
+        dw = dw0 or (card_w - CARD_PAD * 2)
+        card_h = dh + CARD_EXTRA
+        best_c, best_y = 0, -1
+        for c in range(COLS - span + 1):
+            y = max(col_h[c:c + span])
+            if best_y < 0 or y < best_y:
+                best_c, best_y = c, y
+        for c in range(best_c, best_c + span):
+            col_h[c] = best_y + card_h + GAP
+        lines.append('    <div id="Card%d_%d"%s%s%s>' % (
+            pi, si,
+            geom(best_c * (CARD_W + GAP), best_y, card_w, card_h),
+            attr("class", "demo-card"), attr("style", CARD_STYLE)))
+        lines.append('      <label%s%s>%s</label>' % (
+            geom(CARD_PAD, 10, card_w - CARD_PAD * 2, TITLE_H),
+            attr("style", TITLE_STYLE), esc(cap)))
+        for l in emit_demo(kind, dw, dh, a, "      "):
+            lines.append(l)
+        lines.append('    </div>')
+    assert max(col_h) - GAP <= CONTENT_H, (
+        "Page%d 高度溢出: %d > %d" % (pi, max(col_h) - GAP, CONTENT_H))
     lines.append('  </div>')
 lines.append('</body>')
 lines.append('</html>')

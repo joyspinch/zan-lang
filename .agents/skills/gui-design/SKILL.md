@@ -159,6 +159,18 @@ token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
 - `data-if` 只认路径真值,不支持比较表达式;多按钮控制中间区走
   `Nav.Embed`(路由出口:惰性实例化、切走保留、可配临态),别用
   N 个布尔 data-if 硬拼。
+- **zanc 编 .html 设计稿会先喷 `<unknown>` 噪音诊断,不是编译失败**:
+  编译前置的命名空间预扫描对原始 HTML 文本跑一遍 Zan lexer,HTML 的中文
+  与超长 data-uri 会报成 "unexpected character" 和 "string literal
+  exceeds 4095 characters",文件名显示 `<unknown>`。这些是良性噪音;
+  判定成败看最后的 Compiled/linking 行与产物 SELFTEST——曾把 54 个噪音
+  错误误判为编译失败,白查半小时才定位到预扫描。
+- **组件画廊/演示墙用瀑布流,大组件跨两列**(组件全量画廊定式):固定
+  N 列行打包的行高=行内最高卡,DataGrid/Transfer 这类宽组件挤在单列
+  370 逻辑宽里施展不开;改每列独立记账、卡片落"最矮位置"(并列取最
+  左),大卡 span=2 横跨两卡槽(双倍宽),生成器断言
+  max(列高)-GAP ≤ 内容区高。坑:贪心落位会把落单的高卡甩到最后一行
+  顶破下界——把高单卡排在跨列块之前先填矮列(导航页 TreeView 提前)。
 - 布局按浏览器**等价子集**写(flow/inline/flex/grid/float/overflow);
   "写上去不生效"先查支持度审计与差异清单,再查优先级。
 - 项目自带 `skins/` 目录要连 base.css 一起带——同名目录整体跳过
