@@ -110,7 +110,7 @@ build/zanc probe.zan --auto-stdlib --time              # 各阶段耗时
 | `--target <name>` | 交叉编译（§3 全表） |
 | `--list-targets` | 列出全部目标 |
 | `--subsystem <console\|windows>` | PE 子系统；GUI 程序用 windows（仅 Windows） |
-| `--async-workers, --mt` | 多 worker 协程调度器（worker 数 = ZAN_CO_WORKERS） |
+| `--async-workers, --mt` | 链入多 worker 协程调度器（worker 数运行期从 ZAN_CO_WORKERS 读，默认=逻辑核数） |
 | `--fast-alloc` | 前端 malloc 换每线程小对象分配器（服务端负载，native） |
 | `--no-runtime-checks` | 关运行时守卫（如除零） |
 | `--strict-runtime` | 守卫失败直接 exit(70)（否则受 ZAN_RT_HARD 控制） |
@@ -164,14 +164,14 @@ build/zanc probe.zan --auto-stdlib --time              # 各阶段耗时
 | `ZANC_TRACE` | 编译器内部跟踪（diag.c 统一出口） |
 | `ZAN_TRACE_SYNC` | 打印哪些外部符号把同步/协程运行时拉进来（排查"为什么带上了 co 调度器"） |
 | `ZAN_WARN_NARROW` | 收窄转换告警（默认静默） |
-| `ZAN_CO_WORKERS` | --mt 的 worker 数 |
 | `JAVA_HOME` | --emit-apk 签名用 JDK |
 | `ZAN_GENMETA_DUMP` / `ZAN_GEN_REPLY` | genrun 代码生成器调试 |
 
-### 运行期（编译产物）
+### 运行期（编译产物读；exe 已定型，env 是唯一现成通道）
 | 变量 | 作用 |
 |---|---|
 | `ZAN_RT_HARD` | 设了它守卫失败即硬退出（默认构建下等效 `--strict-runtime` 的行为） |
+| `ZAN_CO_WORKERS` | 多 worker 协程调度器的 worker 数（默认=逻辑核数；需程序以 --mt 构建） |
 | `ZAN_GUI_ICONS` | 覆盖图标包目录（发现序：env → exe 旁 icons/ → 内嵌 → stdlib） |
 | `ZAN_CEF_*` | CEF 浏览器驱动运行时定位（examples/gui_cef_browser/README.md 全表：RUNTIME/CACHE/MIRROR/LOG/SWITCHES/HELPER* 等一族） |
 
