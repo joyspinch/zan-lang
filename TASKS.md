@@ -2599,3 +2599,15 @@ P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
   全通、chart_cached_events 金样 MATCH、theme/stackedarea-aa 用例过；
   standard 层因并行会话 ZanDb 重构 + Tabs TEMP-DBG 占用构建无法运行，
   下个无并发构建的窗口补 `scripts/test.ps1 standard`。
+* **挂账（用户实机审查 2026-09-13 批次）**：①geo lines 车道未实现——
+  lines-airline（type:"lines"+coordinateSystem:"geo"，[[lng,lat],...]
+  航线对 + world 地图）地图画了航线没画；②小数显示成整数——SeriesFrac
+  通道未全覆盖，demo 待定位；③地图区域拼接边界可见，待 map-usa/world
+  放大复现；④geo-svg 悬停扰动渲染，待复现；⑤大数据卡死（bar-large
+  5e5 点级），性能预算+降采样；⑥缺 x/y 轴/缺自定义组件/尺寸错/少内
+  容/轴外/遮挡各若干 demo 待定位——需全量 347 demo 审查 sweep（截图
+  +SSR oracle 对拍）逐一定位，"有的"必须落到 id；⑦lines-ny 32 分片
+  二进制流式（ready:false，用户点名）：Float32Array 流加载车道。
+  本次已修：凹凸图 live 重掷（nomouse 钉死保回归）、线体悬停
+  （SegDist2 线段命中，官方 linePrecision 对齐，值对路径 PointsHover
+  仍只点半径待同修）。

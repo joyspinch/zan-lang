@@ -248,6 +248,13 @@ token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
   同一时刻导航行 CSS :hover 会亮(hitTester 链活),图表拾取却"死";
   修法是 DispatchPointerEvents 在 hitChanged/entered/left 时补
   `needsRedraw = true`。
+- **悬停命中要对齐官方 linePrecision:类目折线拾取含线段距离,不只
+  数据点半径**:官方 trigger:'item' 沿整条折线可悬停;只拿"最近数据
+  点 < 抓取半径"判定时,线段中段悬停毫无反应(真实案例:bump 图圆点
+  悬停修完当天,用户指出"鼠标经过线就有效果,不只是圆点"——光标离
+  最近点 300+px 仍应命中)。实现 = 指针到相邻两点连线(数据点弦)的
+  SegDist2 也进最近候选,命中归属较近端点;启动参数路径(SelectDemo
+  带 demo 参数)会早于容器惰性初始化,重掷/替换缓存前先判空建表。
 
 ## 缩放纪律(DPI:为什么界面忽大忽小)
 
