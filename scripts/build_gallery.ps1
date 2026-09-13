@@ -52,9 +52,13 @@ try {
     $zanArgs += @("--libpath", "build", "--link-lib", "zan_gui_gallery_gnu")
     # Native Win32 backend needs only the system libs it imports directly (the
     # runtime's #pragma libs: dwmapi/user32/gdi32/imm32) plus the reactor deps.
+    # ole32: zan_audio 的 WASAPI 设备枚举走 COM（CoInitializeEx/CoCreateInstance
+    # /CoTaskMemFree），静态驱动归档直接引用这些符号，缺 -lole32 链接失败
+    # （同 build_ide.ps1，2026-09-13 gallery 实测）。
     $zanArgs += @("--link-lib", "ws2_32", "--link-lib", "mswsock")
     $zanArgs += @("--link-lib", "psapi", "--link-lib", "advapi32")
-    $zanArgs += @("--link-lib", "dwmapi", "--link-lib", "gdi32", "--link-lib", "imm32")
+    $zanArgs += @("--link-lib", "dwmapi", "--link-lib", "gdi32", "--link-lib", "imm32",
+        "--link-lib", "ole32")
     $zanArgs += @("--link-lib", "user32", "--link-lib", "rpcrt4", "--link-lib", "winpthread")
     $zanArgs += @("--icon", (Join-Path (Get-Location) "assets\zan.ico"))
     $out = & build\zanc.exe @zanArgs 2>&1

@@ -192,15 +192,60 @@ class FormBuilder {
     static Control MakeControl(JsonValue o, bool free) {
         string kind = FormBuilder.Kind(o);
         if (kind == "") { return null; }
+        // kind="Element" 是导出器（Gui.Designer.DesignExport）写的通用
+        // 元素容器：真实标签在 "tag" 键，纯文本在 "text" 键。它不是
+        // Widget 类，走独立构造，不进 ControlFactory 注册表。
+        if (kind == "Element") {
+            Element el = new Element();
+            string tag = o.Str("tag", "");
+            if (tag == "") { tag = "div"; }
+            el.InitElement(tag, o.Str("name", ""));
+            string txt = o.Str("text", "");
+            if (txt != "") { el.SetText(txt); }
+            string ecls = o.Str("class", "");
+            if (ecls != "") { el.Class = ecls; }
+            string esty = o.Str("style", "");
+            if (esty != "") { el.SetProp("style", esty); }
+            return el;
+        }
         Control ctl = ControlFactory.Create(kind);
         if (ctl == null) { return null; }
         ctl.name = o.Str("name", "");
-        // 自带 label 的控件（Checkbox / Radio）自己画标题，把值交给它；
-        // 其余控件的标题由 BuildCell 在上方补一行。
-        string cap = FormBuilder.Caption(o);
-        if (cap != "" && FormBuilder.OwnsLabel(ctl)) {
-            ctl.SetProp("label", cap);
+        // 设计文档的 "label" 是控件标题：发布 text 属性的控件
+        // （Label/Button/Checkbox...）经 SetDesignText 接收，容器
+        // 忽略。BuildCell 的 caption 包裹只服务表单文档的输入字段；
+        // 导出的自由画布文档靠这里把标题落回控件。
+        string cap = o.Str("label", "");
+        if (cap != "") { ctl.SetDesignText(cap); }
+        // 绑定路径（ChildWindow/设计器数据通道的取值源）。
+        string bp = o.Str("bind", "");
+        if (bp != "") {
+            ctl.bindPath = bp;
+            string bpp = o.Str("bindProp", "");
+            if (bpp != "") { ctl.bindProp = bpp; }
         }
+        // 事件绑定：处理器名存 events 槽（GetHandler/SetHandler 协议）。
+        for (int ei = 0; ei < o.Count(); ei = ei + 1) {
+            string ek = o.KeyAt(ei);
+            if (ek.Length < 3 || ek.Substring(0, 2) != "on") { continue; }
+            JsonValue ev = o.ValAt(ei);
+            if (ev == null || !ev.IsString()) { continue; }
+            string hname = ev.AsString("");
+            if (hname == "") { continue; }
+            ctl.SetHandler(ek.Substring(2), hname);
+        }
+        // props 直通表：键名即控件 SetProp 认的名字。
+        JsonValue dprops = o.Get("props");
+        if (dprops != null && dprops.IsObject()) {
+            for (int pi = 0; pi < dprops.Count(); pi = pi + 1) {
+                JsonValue pv = dprops.ValAt(pi);
+                if (pv == null) { continue; }
+                ctl.SetProp(dprops.KeyAt(pi), pv.AsString(""));
+            }
+        }
+        // SetDesignText/SetProp 可能触发 syncName 改写 name，最终以
+        // 设计的字段名为准。
+        ctl.name = o.Str("name", "");
         // 样式类（皮肤规则 / `grid-cols-3 gap-y-2` 这类原子类）。
         string cls = o.Str("class", "");
         if (cls != "") { ctl.Class = cls; }

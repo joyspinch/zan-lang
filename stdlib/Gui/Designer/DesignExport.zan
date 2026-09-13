@@ -1,0 +1,164 @@
+using System;
+using System.Json;
+using System.Web;
+using Gui;
+using Gui.Hmi;
+
+namespace Gui.Designer;
+
+/// 控件树 → 设计文档导出器（WEB_GUI_ROADMAP P8）：把运行期/代码建的
+/// 保留控件树反向序列化成设计器 JSON 文档模型（再经
+/// `DesignerHtml.FromJsonDoc` 得到 .html 设计稿），让存量手搭界面
+/// 一次性搬进声明层——之后设计器可打开编辑、CSS 皮肤按 class 生效。
+///
+/// 映射规则（与 GenForm.EmitField 的消费端一一对应，读写对称）：
+///   - kind ← `Control.Kind()`；Element 例外——裸标签名（div/span）
+///     不是合法控件 kind，固定导出 kind="Element"，真实标签进 "tag"
+///     键、纯文本内容进 "text" 键（装载端 InitElement/SetText 还原）；
+///   - name/class/style ← 同名属性（style 反向自 ApplyInline 落下的
+///     style* 字段重组，只发与缺省不同的键）；
+///   - dock/fx/fy/fw/fh ← dock 与 logX/logY/logW/logH（logPlaceSet
+///     为假时不发几何，装载端按内容测量）；
+///   - label ← `GetProp("text")`（容器没有 text，发空串即跳过）；
+///   - options ← Props() 里 kind==3（枚举）spec 的选项表；
+///   - on<Event> ← events 槽（SetHandler 存的处理器名）；
+///   - bind/bindProp ← bindPath/bindProp；
+///   - children ← kids 递归（Element 的文档序混合内容里，文本 run
+///     并入元素文本，子控件仍是 kids）。
+///
+/// 导出是**有损有界**的：只保结构/几何/样式/事件名，回调 Action、
+/// signal 订阅、运行期动态状态不在文档模型里（本来也存不进声明层）。
+/// 文档级键（winW/winTitle/layoutMode…）由调用方补：`ExportDoc` 的
+/// 覆载接收一个现成的文档头。
+class DesignExport {
+    /// 控件树 → 设计文档 JSON（紧凑 PrettyToJson）。`name` 是文档名
+    /// （生成 partial class 名），`winW`/`winH` 是窗口文档尺寸——
+    /// 传 role="control" 的文档头可用零值，本方法不填窗口键。
+    static string Export(Control root, string name, int winW, int winH) {
+        JsonValue head = JsonValue.NewObject();
+        head.Put("name", JsonValue.NewStr(name));
+        // 手搭树是停靠/绝对几何的集合，文档因此走自由画布
+        // （layoutMode=1）：GenForm/FormBuilder 的 free 路径才消费
+        // dock/fx/fy/fw/fh，流式模式会忽略这些键把整棵树重排。
+        head.Put("layoutMode", JsonValue.NewNum("1"));
+        if (winW > 0) { head.Put("winW", JsonValue.NewNum(Convert.ToString(winW))); }
+        if (winH > 0) { head.Put("winH", JsonValue.NewNum(Convert.ToString(winH))); }
+        JsonValue fields = JsonValue.NewArray();
+        List<Control> top = root.children;
+        for (int i = 0; i < top.Count; i = i + 1) {
+            fields.Append(DesignExport.NodeJson(top[i]));
+        }
+        head.Put("fields", fields);
+        return head.PrettyToJson() + "\n";
+    }
+
+    /// 控件树 → .html 设计稿文本（Export + FromJsonDoc 的组合捷径）。
+    static string ExportHtml(Control root, string name, int winW, int winH) {
+        return DesignerHtml.FromJsonDoc(DesignExport.Export(root, name, winW, winH));
+    }
+
+    /// 单个控件 → 字段对象。容器递归 kids；Element 的纯文本内容进
+    /// "text" 键（装载端 InitElement 后 SetText 还原 elText）。
+    static JsonValue NodeJson(Control c) {
+        JsonValue o = JsonValue.NewObject();
+        if (c is Element) {
+            // 裸标签名（div/span）不是合法控件 kind：ValidateFields 会拒，
+            // GenForm/ControlFactory 也无从实例化。统一导 kind="Element"，
+            // 标签进 "tag" 键。
+            o.Put("kind", JsonValue.NewStr("Element"));
+            o.Put("tag", JsonValue.NewStr(((Element)c).Kind()));
+        } else {
+            o.Put("kind", JsonValue.NewStr(c.Kind()));
+        }
+        if (c.name != "") { o.Put("name", JsonValue.NewStr(c.name)); }
+        string label = c.GetProp("text");
+        if (label != "") { o.Put("label", JsonValue.NewStr(label)); }
+        if (c.Class != "") { o.Put("class", JsonValue.NewStr(c.Class)); }
+        string style = DesignExport.StyleJson(c);
+        if (style != "") { o.Put("style", JsonValue.NewStr(style)); }
+        if (c.dock != 0) {
+            o.Put("dock", JsonValue.NewNum(Convert.ToString(c.dock)));
+        }
+        if (c.logPlaceSet) {
+            o.Put("fx", JsonValue.NewNum(Convert.ToString(c.logX)));
+            o.Put("fy", JsonValue.NewNum(Convert.ToString(c.logY)));
+            if (c.logW > 0) { o.Put("fw", JsonValue.NewNum(Convert.ToString(c.logW))); }
+            if (c.logH > 0) { o.Put("fh", JsonValue.NewNum(Convert.ToString(c.logH))); }
+        }
+        if (c.bindPath != "") { o.Put("bind", JsonValue.NewStr(c.bindPath)); }
+        if (c.bindProp != "") { o.Put("bindProp", JsonValue.NewStr(c.bindProp)); }
+        // 事件名 → 处理器名（设计器模型存名不存 Action）。
+        for (int e = 0; e < c.events.Count; e = e + 1) {
+            o.Put("on" + c.events[e].key, JsonValue.NewStr(c.events[e].val));
+        }
+        // 枚举属性当前值以选项名回填 props（装载端 PropSpec 收选项名）。
+        JsonValue props = DesignExport.EnumProps(c);
+        if (props != null && props.Count() > 0) { o.Put("props", props); }
+        // 纯文本元素内容（elText / 匿名文本 run）。绑定文本（绑定的
+        // 数据源）与临时快照（如 Input 当前值）不导——后者属运行态。
+        if (c is Element) {
+            string ft = ((Element)c).FlowText();
+            if (ft != "") { o.Put("text", JsonValue.NewStr(ft)); }
+        }
+        // 子控件（Element 的 AddKid 与普通 Add 统一落 children）。
+        if (c.children.Count > 0) {
+            JsonValue kids = JsonValue.NewArray();
+            for (int k = 0; k < c.children.Count; k = k + 1) {
+                kids.Append(DesignExport.NodeJson(c.children[k]));
+            }
+            o.Put("kids", kids);
+        }
+        return o;
+    }
+
+    /// 反向重组内联 style 文本：只发 ApplyInline 会落控件的视觉键且
+    /// 值非缺省。样式层是单向解析（原文不存），这里按 style* 字段
+    /// 的现值重建，顺序固定——装载端 ApplyInline 语义与原声明等价。
+    static string StyleJson(Control c) {
+        string s = "";
+        if (c.styleBg != 0) {
+            s = s + "background:" + Style.Hex8(c.styleBg) + ";";
+        }
+        if (c.styleBgTo != 0) {
+            s = s + "background-image:linear-gradient(" +
+                Style.Hex8(c.styleBg) + "," + Style.Hex8(c.styleBgTo) + ");";
+        }
+        if (c.styleRadius != 0) {
+            s = s + "border-radius:" + Convert.ToString(c.styleRadius) + "px;";
+        }
+        if (c.styleBorderColor != 0) {
+            s = s + "border-color:" + Style.Hex8(c.styleBorderColor) + ";";
+        }
+        if (c.styleBorderWidth != 0) {
+            s = s + "border-width:" + Convert.ToString(c.styleBorderWidth) + "px;";
+        }
+        if (c.styleColor != 0) {
+            s = s + "color:" + Style.Hex8(c.styleColor) + ";";
+        }
+        if (c.styleFontPx != 0) {
+            s = s + "font-size:" + Convert.ToString(c.styleFontPx) + "px;";
+        }
+        return s;
+    }
+
+    /// 控件发布且已绑定的枚举属性（kind==3）：当前下标 → 选项名。
+    /// 未绑定或空选项表的 spec 跳过（那些是派生键，导不出快照）。
+    static JsonValue EnumProps(Control c) {
+        JsonValue props = null;
+        List<PropSpec> ps = c.Props();
+        for (int i = 0; i < ps.Count; i = i + 1) {
+            PropSpec p = ps[i];
+            if (p.kind != 3 || p.options.Count == 0 || !p.IsBound()) { continue; }
+            string v = p.Read();
+            if (v == "") { continue; }
+            bool known = false;
+            for (int j = 0; j < p.options.Count; j = j + 1) {
+                if (p.options[j] == v) { known = true; break; }
+            }
+            if (!known) { continue; }
+            if (props == null) { props = JsonValue.NewObject(); }
+            props.Put(p.key, JsonValue.NewStr(v));
+        }
+        return props;
+    }
+}
