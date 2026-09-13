@@ -2754,3 +2754,27 @@ P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
   回归：chart 层 211/213（仍只剩台账在案的 calendar/barminheight 两
   个批次前失败），全量 sweep 345 张 FLAG 182 与改前持平，conformance
   chart_radar_values 增至十一断言（multi/multimax）4 变体全绿。
+* **ZanDb 扫描层零拷贝化 + 段不可变 CRC 验一次（2026-09-13）**：
+  针对「过滤/投影与 SQLite 差距好几倍」的机器层改造：①SegCursor
+  惰性物化——NextRecordRaw 裸解析只记键值在块内的偏移/长度，
+  Key()/Val() 首次访问才 GetString（命中行才分配），上界与跳读改
+  CmpKeyRaw（块内指针 memcmp，与 CompareOrdinal 同序）；②Store
+  新增 `ScanRows`/`ScanRow`（零拷贝扫描行，值按偏移/长度/指针
+  交付，多源归并退化模式回退字符串包装）；③等值过滤**针线否证**
+  ——needle（≥2 字符、含非数值渲染字符、无 0x00/0xFF、非
+  true/false）原字节经 memchr+memcmp 不在记录值区出现即整行否决，
+  免物化免走读；④LoadBlockReuse 块缓冲跨块复用（消每块
+  Alloc/Free），段不可变故 CRC 每块只在首次加载校验一次（读时不算
+  派生数）。微基准：块内裸解析 ~230-315ns/行、字符串物化 ~37ns、
+  memcmp/memchr ~5ns； ByteBuffer 有状态方法逐字节走读比字符串
+  索引慢 2-4 倍（ReadU8 每次 new Span）——走读必须落在字符串上，
+  「全裸化」反而更慢，已按实测回退为包装。同轮对拍中位：投影
+  2.0→2.3 倍、索引点查 2.6→2.2 倍、全扫 3.0 倍、过滤 ~8.9 倍、
+  Count ~23 倍反超；机器高负载（并发会话）噪声 ±30%，扫描地板
+  （游标机器 + 每块 IO + 惰性物化）与 SQLite 纯 C 列解引用的差距
+  属语言层地板，README 已记。金标 zandb_* 12/12、ctest
+  `-R "zandb|arr_lit"` 52/52（含泄漏孪生）。**挂账（编译器）**：
+  实例 `extern` DllImport 方法（漏 static）通过类型检查，irgen
+  生成含 this 的调用约定在 LLVM verify 报 "Invalid bitcast"——
+  应在检查器报「extern 方法必须 static」诊断；探针复现于
+  SegCursor.CmpKeyRaw 首版。

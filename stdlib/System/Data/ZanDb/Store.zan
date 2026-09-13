@@ -4,13 +4,62 @@ using System.Threading;
 
 namespace System.Data.ZanDb;
 
-/// <summary>在写临界区内根据当前值计算新值
-/// （键不存在时 current 为 ""）。</summary>
 delegate string StoreUpdater(string current);
 
 /// <summary>扫描回调：按 键序升序 收到每个存活键的最新值；
 /// 返回 false 早停。</summary>
 delegate bool StoreVisit(string key, string val);
+
+/// <summary>裸扫描回调：收到零拷贝扫描行（值按块内偏移/长度/指针
+/// 暴露，Key()/Val() 才物化字符串）；返回 false 早停。</summary>
+delegate bool ScanRowVisit(ScanRow row);
+
+/// <summary>
+/// 扫描行视图：<see cref="ZanStore.ScanRows"/> 回调参数。值默认
+/// 零拷贝——按块内偏移/长度/指针暴露，调用 Key()/Val() 才物化
+/// 字符串（同一行内缓存，推进到下一行自动失效）。多源归并退化
+/// 路径（memtable 有未固化数据）时 <see cref="Block"/> 为 null，
+/// 键值直接以字符串给出。行数据仅在回调返回前有效。
+/// </summary>
+class ScanRow {
+    SegCursor cur;
+    string memKey;
+    string memVal;
+
+    /// 绑定到段游标当前记录（零拷贝模式）。
+    void Bind(SegCursor c) {
+        this.cur = c;
+        this.memKey = "";
+        this.memVal = "";
+    }
+
+    /// 绑定到一对字符串（多源归并退化模式）。
+    void BindMem(string k, string v) {
+        this.cur = null;
+        this.memKey = k;
+        this.memVal = v;
+    }
+
+    /// 当前行的键（惰性物化，行内缓存；退化模式直接给字符串）。
+    string Key() { return this.cur != null ? this.cur.Key() : this.memKey; }
+
+    /// 当前行的值字符串（惰性物化，行内缓存）。
+    string Val() { return this.cur != null ? this.cur.Val() : this.memVal; }
+
+    /// 值所在块缓冲；退化模式下为 null，调用方须走字符串路径。
+    ByteBuffer Block() { return this.cur != null ? this.cur.Block() : null; }
+
+    /// 值在块内的起始偏移（退化模式无意义）。
+    int ValOff() { return this.cur != null ? this.cur.ValOff() : 0; }
+
+    /// 值的字节长度。
+    int ValLen() { return this.cur != null ? this.cur.ValLen() : 0; }
+
+    /// 值字节的裸指针（等于 Block().Raw() + ValOff()）。
+    nint ValPtr() {
+        return this.cur != null ? this.cur.Block().Raw() + this.cur.ValOff() : 0;
+    }
+}
 
 /// 段句柄：段文件与其全局段号的配对。
 class SegRef {
@@ -701,6 +750,40 @@ class ZanStore {
         }
         for (int i = 0; i < cursors.Count; i = i + 1) { cursors[i].Free(); }
         return accepted;
+    }
+
+    /// <summary><see cref="ScanBetween"/> 的零拷贝形式：交付
+    /// <see cref="ScanRow"/> 而非字符串——单段且 memtable 无未固化
+    /// 数据时值不物化、上界与墓碑判定全走块内指针；memtable 有
+    /// 参与则退化为字符串路径包装。语义与 ScanBetween 完全一致，
+    /// 行数据仅在回调返回前有效。返回 visit 接受的键数。</summary>
+    int ScanRows(string startKey, string endKey, ScanRowVisit visit) {
+        if (this.segs.Count == 1 && this.memtable.Keys.Count == 0) {
+            SegCursor c = SegCursor.Open(this.segs[0].seg, startKey);
+            ScanRow row = new ScanRow();
+            row.Bind(c);
+            bool hasTombs = this.tombstones.Count > 0;
+            bool bounded = endKey.Length > 0;
+            int accepted = 0;
+            while (c.Valid()) {
+                if (c.Op() == 1) {
+                    if (bounded && c.CmpKeyRaw(endKey) > 0) { break; }
+                    if (!hasTombs || !this.tombstones.ContainsKey(c.Key())) {
+                        if (!visit(row)) { break; }
+                        accepted = accepted + 1;
+                    }
+                }
+                c.Next();
+            }
+            c.Free();
+            return accepted;
+        }
+        // 多源归并（未固化数据参与）：退化为字符串路径包装交付。
+        ScanRow mrow = new ScanRow();
+        return ScanBetween(startKey, endKey, delegate(string k, string v) {
+            mrow.BindMem(k, v);
+            return visit(mrow);
+        });
     }
 
     /// <summary>统计 [startKey, endKey] 闭区间内的存活键数，

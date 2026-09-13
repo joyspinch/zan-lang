@@ -190,6 +190,7 @@ class SegmentFile {
     List<long> sparseOff;
     List<string> sparseKey;
     List<long> sparseCrc;
+    List<int> blockVerified;
     long indexStart;
     long recordCount;
     string lastError;
@@ -202,6 +203,7 @@ class SegmentFile {
         this.sparseOff = new List<long>();
         this.sparseKey = new List<string>();
         this.sparseCrc = new List<long>();
+        this.blockVerified = new List<int>();
     }
 
     /// <summary>打开并校验一个已完成的段：读尾部定位索引区，
@@ -284,6 +286,7 @@ class SegmentFile {
             sf.sparseOff.Add(off);
             sf.sparseKey.Add(key);
             sf.sparseCrc.Add(crc);
+            sf.blockVerified.Add(0);
         }
         idx.Free();
         return sf;
@@ -319,6 +322,15 @@ class SegmentFile {
     /// <summary>加载块 i 并校验 CRC；失败（越界/腐坏/短读）返回 null
     /// 并在 <see cref="GetError"/> 留痕。缓冲区归调用方 Free。</summary>
     ByteBuffer LoadBlock(int i) {
+        ByteBuffer b = this.LoadBlockReuse(i, null);
+        return b;
+    }
+
+    /// <summary><see cref="LoadBlock"/> 的复用形式：给定非 null 的
+    /// reuse 缓冲时原地扩容读入（容量足够则零分配），消除每块的
+    /// Alloc/Free。段不可变——CRC 每块只在首次加载时校验一次，
+    /// 之后同一打开会话内的重复读取免 CRC（读时不算派生数）。</summary>
+    ByteBuffer LoadBlockReuse(int i, ByteBuffer reuse) {
         if (i < 0 || i >= this.sparseOff.Count) {
             // 空段（0 条记录）或越界：返回「未命中」而不是索引崩。
             this.lastError = "segment block out of range";
@@ -331,12 +343,21 @@ class SegmentFile {
             this.lastError = "segment block empty";
             return null;
         }
-        ByteBuffer b = ByteBuffer.Alloc(len);
+        ByteBuffer b = reuse;
+        if (b == null) { b = ByteBuffer.Alloc(len); }
         int got = this.file.ReadAt(this.sparseOff[i], b, len);
-        if (got != len || b.Crc32(len) != this.sparseCrc[i]) {
-            this.lastError = "segment block corrupt";
-            b.Free();
+        if (got != len) {
+            this.lastError = "segment block short read";
+            if (reuse == null) { b.Free(); }
             return null;
+        }
+        if (this.blockVerified[i] == 0) {
+            if (b.Crc32(len) != this.sparseCrc[i]) {
+                this.lastError = "segment block corrupt";
+                if (reuse == null) { b.Free(); }
+                return null;
+            }
+            this.blockVerified[i] = 1;
         }
         b.SeekRead(0);
         return b;
@@ -364,6 +385,35 @@ class SegmentFile {
         int vp = b.ReadPos();
         b.SeekRead(vp + (int)vlen);
         val = b.Str(vp, (int)vlen);
+        return true;
+    }
+
+    /// <summary>裸解析块内下一条记录：不物化任何字符串，只输出
+    /// 键/值在块内的绝对偏移与长度（读游标推进到记录尾）。
+    /// 块耗尽或腐坏返回 false。</summary>
+    static bool NextRecordRaw(ByteBuffer b, out int keyOff, out int keyLen,
+                              out int valOff, out int valLen, out int op) {
+        keyOff = 0;
+        keyLen = 0;
+        valOff = 0;
+        valLen = 0;
+        op = 0;
+        if (!b.CanRead(1)) { return false; }
+        op = b.ReadU8();
+        if (op != 1 && op != 2) { return false; }
+        if (!b.CanRead(1)) { return false; }
+        long klen = b.ReadVarInt();
+        if (klen < 0 || !b.CanRead((int)klen)) { return false; }
+        keyOff = b.ReadPos();
+        keyLen = (int)klen;
+        b.SeekRead(keyOff + keyLen);
+        if (op == 2) { return true; }
+        if (!b.CanRead(1)) { return false; }
+        long vlen = b.ReadVarInt();
+        if (vlen < 0 || !b.CanRead((int)vlen)) { return false; }
+        valOff = b.ReadPos();
+        valLen = (int)vlen;
+        b.SeekRead(valOff + valLen);
         return true;
     }
 
@@ -457,17 +507,27 @@ class SegmentFile {
 /// <summary>
 /// 段内拉式游标：定位 fromKey（含）起顺序推进，块读完自动换块。
 /// 供 <see cref="ZanStore"/> 的多路归并扫描使用；扫描走顺序流读、
-/// 不经过块缓存（点读才占缓存，顺序扫不污染它）。用完必须
-/// <see cref="Free"/>。
+/// 不经过块缓存（点读才占缓存，顺序扫不污染它）。键/值字符串
+/// **惰性物化**——裸扫描路径只走偏移/长度与块内指针，命中行才
+/// 调用 Key()/Val() 分配。用完必须 <see cref="Free"/>。
 /// </summary>
 class SegCursor {
+    [DllImport("crt", EntryPoint = "memcmp")]
+    static extern int MemCmp(nint a, string b, long n);
+
     SegmentFile seg;
     ByteBuffer buf;
     int blockIdx;
     bool valid;
     string curKey;
+    bool keyMat;
     string curVal;
+    bool valMat;
     int curOp;
+    int curKeyOff;
+    int curKeyLen;
+    int curValOff;
+    int curValLen;
 
     SegCursor(SegmentFile seg) {
         this.seg = seg;
@@ -475,15 +535,34 @@ class SegCursor {
         this.blockIdx = 0;
         this.valid = false;
         this.curKey = "";
+        this.keyMat = false;
         this.curVal = "";
+        this.valMat = false;
         this.curOp = 0;
+        this.curKeyOff = 0;
+        this.curKeyLen = 0;
+        this.curValOff = 0;
+        this.curValLen = 0;
     }
 
-    /// 当前记录的键（Valid() 为假时无意义）。
-    string Key() { return this.curKey; }
+    /// 当前记录的键（Valid() 为假时无意义）。首次调用物化并缓存。
+    string Key() {
+        if (!this.keyMat) {
+            this.curKey = this.buf.Str(this.curKeyOff, this.curKeyLen);
+            this.keyMat = true;
+        }
+        return this.curKey;
+    }
 
-    /// 当前记录的值（墓碑时为空串）。
-    string Val() { return this.curVal; }
+    /// 当前记录的值（墓碑时为空串）。首次调用物化并缓存。
+    string Val() {
+        if (!this.valMat) {
+            this.curVal = this.curValLen > 0
+                ? this.buf.Str(this.curValOff, this.curValLen) : "";
+            this.valMat = true;
+        }
+        return this.curVal;
+    }
 
     /// 当前记录类型：1=put、2=墓碑。
     int Op() { return this.curOp; }
@@ -491,54 +570,102 @@ class SegCursor {
     /// 是否还有未消费的记录。
     bool Valid() { return this.valid; }
 
+    /// 当前键在块内的起始偏移（Valid() 为假时无意义）。
+    int KeyOff() { return this.curKeyOff; }
+
+    /// 当前键的字节长度。
+    int KeyLen() { return this.curKeyLen; }
+
+    /// 当前值在块内的起始偏移（墓碑时无意义）。
+    int ValOff() { return this.curValOff; }
+
+    /// 当前值的字节长度（墓碑为 0）。
+    int ValLen() { return this.curValLen; }
+
+    /// 当前块缓冲（键/值偏移基于它；回调期间可随机读）。
+    ByteBuffer Block() { return this.buf; }
+
+    /// <summary>当前键与 other 的序数比较：块内指针 memcmp 前缀、
+    /// 长度定序——与 String.CompareOrdinal 同序（本层键为字节串，
+    /// 每字符一字节），零分配。</summary>
+    int CmpKeyRaw(string other) {
+        int n = this.curKeyLen < other.Length ? this.curKeyLen : other.Length;
+        if (n > 0) {
+            nint kp = this.buf.Raw() + this.curKeyOff;
+            int r = MemCmp(kp, other, n);
+            if (r != 0) { return r; }
+        }
+        return this.curKeyLen - other.Length;
+    }
+
     /// <summary>打开游标并定位到第一个 key ≥ fromKey 的记录；
     /// 段为空或全部记录都小于 fromKey 时 Valid() 为假。</summary>
     static SegCursor Open(SegmentFile seg, string fromKey) {
         SegCursor c = new SegCursor(seg);
         c.blockIdx = seg.BlockFor(fromKey);
         c.LoadCur();
-        while (c.valid && String.CompareOrdinal(c.curKey, fromKey) < 0) {
+        while (c.valid && c.CmpKeyRaw(fromKey) < 0) {
             c.Next();
         }
         return c;
     }
 
-    /// 加载 blockIdx 块并读入其首条记录；越界/腐坏/空块置 invalid。
+    /// 加载 blockIdx 块并裸解析其首条记录；越界/腐坏/空块置 invalid。
+    /// 块缓冲跨块复用（段不可变，重读只走 IO 不再分配）。
     bool LoadCur() {
-        if (this.buf != null) { this.buf.Free(); this.buf = null; }
         this.valid = false;
         this.curKey = "";
+        this.keyMat = false;
         this.curVal = "";
+        this.valMat = false;
         this.curOp = 0;
         if (this.blockIdx >= this.seg.sparseOff.Count) { return false; }
-        ByteBuffer b = this.seg.LoadBlock(this.blockIdx);
+        ByteBuffer b;
+        if (this.buf != null) {
+            // 复用现有缓冲：LoadBlockReuse 失败时不动调用方缓冲，
+            // 所有权仍在游标手里，Free() 时统一释放。
+            b = this.seg.LoadBlockReuse(this.blockIdx, this.buf);
+        } else {
+            b = this.seg.LoadBlock(this.blockIdx);
+        }
         if (b == null) { return false; }
-        string rk;
-        string rv;
+        this.buf = b;
+        int ko;
+        int kl;
+        int vo;
+        int vl;
         int rop;
-        if (!SegmentFile.NextRecord(b, out rk, out rv, out rop)) {
+        if (!SegmentFile.NextRecordRaw(b, out ko, out kl, out vo, out vl, out rop)) {
             // 空块（良构段不应出现）：按段耗尽处理。
-            b.Free();
+            this.buf.Free();
+            this.buf = null;
             return false;
         }
-        this.buf = b;
-        this.curKey = rk;
-        this.curVal = rv;
+        this.curKeyOff = ko;
+        this.curKeyLen = kl;
+        this.curValOff = vo;
+        this.curValLen = vl;
         this.curOp = rop;
         this.valid = true;
         return true;
     }
 
-    /// 推进到下一条记录；段耗尽后 Valid() 变假。
+    /// 推进到下一条记录（惰性缓存一并失效）；段耗尽后 Valid() 变假。
     void Next() {
         if (!this.valid) { return; }
-        string rk;
-        string rv;
+        int ko;
+        int kl;
+        int vo;
+        int vl;
         int rop;
-        if (SegmentFile.NextRecord(this.buf, out rk, out rv, out rop)) {
-            this.curKey = rk;
-            this.curVal = rv;
+        if (SegmentFile.NextRecordRaw(this.buf, out ko, out kl, out vo, out vl, out rop)) {
+            this.curKeyOff = ko;
+            this.curKeyLen = kl;
+            this.curValOff = vo;
+            this.curValLen = vl;
             this.curOp = rop;
+            this.keyMat = false;
+            this.valMat = false;
             return;
         }
         this.blockIdx = this.blockIdx + 1;

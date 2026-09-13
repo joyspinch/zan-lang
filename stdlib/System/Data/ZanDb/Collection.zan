@@ -400,6 +400,9 @@ class Collection {
     [DllImport("crt", EntryPoint = "memchr")]
     static extern nint StrMemChr(string p, int c, long n);
 
+    [DllImport("crt", EntryPoint = "memcmp")]
+    static extern int MemCmpRaw(nint a, string b, long n);
+
     /// 与 ByteBuffer.WriteVarInt 同格式的变长整数读取（显式位置传递）。
     static long RecVarInt(string s, int p, out int np) {
         long v = 0;
@@ -563,6 +566,63 @@ class Collection {
             i = i + 1;
         }
         return false;
+    }
+
+    /// <summary>等值过滤的快速否证前提：needle 至少 2 字符、
+    /// 含「非数值渲染字符」的字符（排除数值 AsString 归一化渲染
+    /// 的等值可能——整数/浮点渲染只含 0-9 与 + - . e E）、
+    /// 不含 0x00/0xFF（排除转义编码的字节位移）、不是 "true"/
+    /// "false"（排除布尔 AsString 等值）。满足时 needle 的原
+    /// 字节若不在记录值区出现，字段就绝不等于该值——整行免
+    /// 物化免走读直接否决。</summary>
+    bool EqFastReject(string val) {
+        if (val.Length < 2) { return false; }
+        if (val == "true" || val == "false") { return false; }
+        if (StrMemChr(val, 0, val.Length) != 0
+                || StrMemChr(val, 255, val.Length) != 0) { return false; }
+        for (int i = 0; i < val.Length; i = i + 1) {
+            int c = val[i] & 255;
+            if (c < 48 || c > 57) {
+                if (c != 43 && c != 45 && c != 46 && c != 69 && c != 101) { return true; }
+            }
+        }
+        return false;
+    }
+
+    /// <summary>needle 原字节是否不在行值区出现：memchr 找首字符
+    /// 出现点、memcmp 全针验证，命中点逐个推进。找不到即整行
+    /// 否决（<see cref="EqFastReject"/> 前提下声音）。约 5ns 级
+    /// 原语成本，替代数百纳秒的记录走读。</summary>
+    bool NeedleAbsent(ScanRow row, string val) {
+        nint p = row.ValPtr();
+        long n = row.ValLen();
+        if (n < val.Length) { return true; }
+        int c = val[0] & 255;
+        long len = val.Length;
+        nint hit = MemChr(p, c, n);
+        while (hit != 0) {
+            long off = (long)(hit - p);
+            if (off + len <= n && MemCmpRaw(hit, val, len) == 0) { return false; }
+            hit = MemChr(hit + 1, c, n - off - 1);
+        }
+        return true;
+    }
+
+    /// <summary><see cref="FieldEquals"/> 的行视图版：满足
+    /// <see cref="EqFastReject"/> 的 needle 先做针线否证（零物化），
+    /// 未否决才物化值走权威走读；不满足直接走权威走读。</summary>
+    bool FieldEqualsRow(ScanRow row, int kid, string val, bool fastReject) {
+        if (kid == 0) { return false; }
+        if (fastReject && row.Block() != null && NeedleAbsent(row, val)) { return false; }
+        return FieldEquals(row.Val(), kid, val);
+    }
+
+    /// <summary><see cref="FieldOf"/> 的行视图版：值按需物化，
+    /// 走读落在静态字符串路径（物化实测比 ByteBuffer 有状态
+    /// 方法逐字节走读便宜）。</summary>
+    JsonValue FieldOfRow(ScanRow row, int kid) {
+        if (kid == 0) { return null; }
+        return FieldOf(row.Val(), kid);
     }
 
     /// 把存储的二进制记录（见 <see cref="EncodeDoc"/>）解码回 JsonValue 对象；
@@ -826,8 +886,8 @@ class Collection {
 
     /// <summary>通过扫描找出字段等于 val 的文档：每条
     /// 记录只被询问这一个字段（字符串值走零分配比较），
-    /// 只有匹配项会被完整解码，全程流式、不经 KvEntry
-    /// 中间层。用于字段没有可用索引的情况。</summary>
+    /// 只有匹配项会被完整解码，全程流式。用于字段没有
+    /// 可用索引的情况。</summary>
     List<JsonValue> FindByFieldScan(string field, string val) {
         SyncMeta();
         List<JsonValue> docs = new List<JsonValue>();
@@ -835,11 +895,12 @@ class Collection {
         if (kid == 0) {
             return docs;
         }
+        bool fastReject = EqFastReject(val);
         string hi = "c:" + this.name + ";";
-        this.kv.ScanBetween("c:" + this.name + ":", hi, delegate(string k, string v) {
-            if (FieldEquals(v, kid, val)) {
-                JsonValue doc = DecodeDoc(v);
-                doc.Set("_id", JsonValue.NewNum(Collection.IdFromKey(k)));
+        this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
+            if (FieldEqualsRow(row, kid, val, fastReject)) {
+                JsonValue doc = DecodeDoc(row.Val());
+                doc.Set("_id", JsonValue.NewNum(Collection.IdFromKey(row.Key())));
                 docs.Add(doc);
             }
             return true;
@@ -861,9 +922,10 @@ class Collection {
         if (kid == 0) {
             return 0;
         }
+        bool fastReject = EqFastReject(val);
         string hi = "c:" + this.name + ";";
-        this.kv.ScanBetween("c:" + this.name + ":", hi, delegate(string k, string v) {
-            if (FieldEquals(v, kid, val)) { n = n + 1; }
+        this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
+            if (FieldEqualsRow(row, kid, val, fastReject)) { n = n + 1; }
             return true;
         });
         return n;
@@ -902,20 +964,20 @@ class Collection {
 
     /// <summary>投影式扫描：按 id 序遍历集合，每篇含 field 的文档
     /// 以 (id, 值) 调用一次 visit；visit 返回 false 提前结束。
-    /// 每条记录只解码这一个字段——不构建文档树、不物化文档，
-    /// 单字段聚合/过滤的每文档成本与文档的字段数无关。
-    /// 返回 visit 被调用的次数。</summary>
+    /// 每条记录只解码这一个字段——值留在块内按偏移解析，不构建
+    /// 文档树、不物化文档，单字段聚合/过滤的每文档成本与文档的
+    /// 字段数无关。返回 visit 被调用的次数。</summary>
     int ScanField(string field, FieldVisit visit) {
         SyncMeta();
         int kid = KeyIdOf(field);
         if (kid == 0) { return 0; }
         string hi = "c:" + this.name + ";";
         int n = 0;
-        this.kv.ScanBetween("c:" + this.name + ":", hi, delegate(string k, string v) {
-            JsonValue f = FieldOf(v, kid);
+        this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
+            JsonValue f = FieldOfRow(row, kid);
             if (f != null) {
                 n = n + 1;
-                if (!visit(Collection.IdOfKey(k), f)) { return false; }
+                if (!visit(Collection.IdOfKey(row.Key()), f)) { return false; }
             }
             return true;
         });
@@ -924,8 +986,8 @@ class Collection {
 
     /// <summary>字段值等于 val 的所有文档 id，按 id 序。
     /// 索引就绪时只扫索引条目（覆盖索引，一个文档都不读）；
-    /// 否则流式扫描、每条记录只解码这一个字段，匹配才收 id
-    /// ——全程不物化任何文档。</summary>
+    /// 否则流式扫描、每条记录只解码这一个字段（零拷贝），
+    /// 匹配才物化键收 id——全程不构建文档树。</summary>
     List<int> FindIdsByField(string field, string val) {
         SyncMeta();
         List<int> ids = new List<int>();
@@ -939,9 +1001,12 @@ class Collection {
         }
         int kid = KeyIdOf(field);
         if (kid == 0) { return ids; }
+        bool fastReject = EqFastReject(val);
         string hi = "c:" + this.name + ";";
-        this.kv.ScanBetween("c:" + this.name + ":", hi, delegate(string k, string v) {
-            if (FieldEquals(v, kid, val)) { ids.Add(Collection.IdOfKey(k)); }
+        this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
+            if (FieldEqualsRow(row, kid, val, fastReject)) {
+                ids.Add(Collection.IdOfKey(row.Key()));
+            }
             return true;
         });
         return ids;
