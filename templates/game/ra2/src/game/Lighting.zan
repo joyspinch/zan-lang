@@ -1,0 +1,512 @@
+using System;
+using System.Collections.Generic;
+using Ra2.Formats;
+
+namespace Ra2.Game;
+
+/// <summary>The map's lighting parameters, the reference's MapLighting:
+/// the per-height level step, the ambient floor and the RGB tint. A map's
+/// [Lighting] section supplies every one of them (with the Ion-prefixed
+/// copies forming the ion-storm override), and the engine's Lighting
+/// combines them with the per-cell lamp pools to shade every sprite.</summary>
+class MapLighting {
+    // Level per height step, the shipped default 0.032: a cell one level
+    // up gets this much added to its brightness.
+    double level;
+    // The ambient intensity and the "ground" term the retail formula
+    // subtracts from it (ambient - ground is the base brightness).
+    double ambient;
+    double ground;
+    // The map-wide tint, applied to art whose lighting class takes the map
+    // tint (or always, when forceTint is set -- the ion override).
+    double red;
+    double green;
+    double blue;
+    bool forceTint;
+
+    static MapLighting Create() {
+        MapLighting m = new MapLighting();
+        m.level = 0.0;
+        m.ambient = 1.0;
+        m.ground = 0.0;
+        m.red = 1.0;
+        m.green = 1.0;
+        m.blue = 1.0;
+        m.forceTint = false;
+        return m;
+    }
+
+    /// <summary>Reads the lighting keys out of a section with the given
+    /// prefix, the reference's MapLighting.read: Level defaults 0.032,
+    /// Ambient 1, the tints 1, Ground 0. A missing section still yields
+    /// those defaults -- the reference reads the section it creates on
+    /// demand, so a map with no [Lighting] block plays in daylight.</summary>
+    static MapLighting Read(IniSection s, string prefix) {
+        MapLighting m = MapLighting.Create();
+        m.level = MapLighting.Num(s, prefix + "Level", 0.032);
+        m.ambient = MapLighting.Num(s, prefix + "Ambient", 1.0);
+        m.red = MapLighting.Num(s, prefix + "Red", 1.0);
+        m.green = MapLighting.Num(s, prefix + "Green", 1.0);
+        m.blue = MapLighting.Num(s, prefix + "Blue", 1.0);
+        m.ground = MapLighting.Num(s, prefix + "Ground", 0.0);
+        return m;
+    }
+
+    /// <summary>A double-valued key, or the fallback when the section is
+    /// missing or never names it. ".003" has no leading zero, which a bare
+    /// parse rejects, so one is prepended the way the rest of the port does
+    /// it.</summary>
+    static double Num(IniSection s, string key, double fallback) {
+        if (s == null) { return fallback; }
+        string v = s.GetOr(key, "").Trim();
+        if (v.Length == 0) { return fallback; }
+        if (v[0] == 46) { v = "0" + v; }
+        return Convert.ToDouble(v);
+    }
+
+    MapLighting Copy() {
+        MapLighting m = new MapLighting();
+        m.level = this.level;
+        m.ambient = this.ambient;
+        m.ground = this.ground;
+        m.red = this.red;
+        m.green = this.green;
+        m.blue = this.blue;
+        m.forceTint = this.forceTint;
+        return m;
+    }
+
+    void CopyFrom(MapLighting s) {
+        this.level = s.level;
+        this.ambient = s.ambient;
+        this.ground = s.ground;
+        this.red = s.red;
+        this.green = s.green;
+        this.blue = s.blue;
+        this.forceTint = s.forceTint;
+    }
+
+    double Level() { return this.level; }
+    double Ambient() { return this.ambient; }
+    double Ground() { return this.ground; }
+    double Red() { return this.red; }
+    double Green() { return this.green; }
+    double Blue() { return this.blue; }
+    bool ForceTint() { return this.forceTint; }
+    void SetForceTint(bool on) { this.forceTint = on; }
+    void SetAmbient(double v) { this.ambient = v; }
+}
+
+/// <summary>How much lighting a piece of art takes, the reference's
+/// LightingType. The numbers are ordered: a compute() call applies every
+/// term whose class is at or below the art's own.
+///
+///   None    -- unlit (animations: a fireball must not darken at night)
+///   Global  -- tint-free, no ambient floor (projectiles, voxel anims)
+///   Level   -- height step only
+///   Ambient -- ambient + height (units and buildings)
+///   Full    -- everything, including lamp pools (terrain, overlays, smudges)
+///   Default -- the art never said; the object type picks (see ArtLighting)</summary>
+class LightingType {
+    static int None() { return 0; }
+    static int Global() { return 1; }
+    static int Level() { return 2; }
+    static int Ambient() { return 3; }
+    static int Full() { return 4; }
+    static int Default() { return 5; }
+
+    /// <summary>The Lighting= key's name -> value, the reference's
+    /// ObjectArt parse (case-insensitive like the rest of the ini keys).</summary>
+    static int Parse(string word) {
+        if (word == null) { return LightingType.Default(); }
+        if (SndSpecText.SameWord(word, "NONE")) { return LightingType.None(); }
+        if (SndSpecText.SameWord(word, "GLOBAL")) {
+            return LightingType.Global();
+        }
+        if (SndSpecText.SameWord(word, "LEVEL")) { return LightingType.Level(); }
+        if (SndSpecText.SameWord(word, "AMBIENT")) {
+            return LightingType.Ambient();
+        }
+        if (SndSpecText.SameWord(word, "FULL")) { return LightingType.Full(); }
+        return LightingType.Default();
+    }
+
+    /// <summary>The lighting an object type gets when its art names none,
+    /// the reference's ObjectArt.getDefaultLighting: animations unlit,
+    /// units and buildings ambient, projectiles and voxel anims global,
+    /// everything that lies on the ground full.</summary>
+    static int ForKind(int objKind) {
+        if (objKind == ObjKind.Structure() || objKind == ObjKind.Unit()) {
+            return LightingType.Ambient();
+        }
+        return LightingType.Full();
+    }
+}
+
+/// <summary>A light a lamp building casts onto one cell, the reference's
+/// per-tile light entry: the falloff-scaled tint and intensity summed into
+/// that cell's lighting. Negative intensities are the NEGLAMP family, which
+/// darkens its surroundings.</summary>
+class TileLight {
+    double red;
+    double green;
+    double blue;
+    double intensity;
+
+    static TileLight Create(double r, double g, double b, double i) {
+        TileLight t = new TileLight();
+        t.red = r;
+        t.green = g;
+        t.blue = b;
+        t.intensity = i;
+        return t;
+    }
+
+    double Red() { return this.red; }
+    double Green() { return this.green; }
+    double Blue() { return this.blue; }
+    double Intensity() { return this.intensity; }
+}
+
+/// <summary>The engine's lighting, the reference's Lighting: it holds the
+/// map's ambient (possibly overridden by an effect or the ion storm), the
+/// per-cell lamp pools, and answers compute() -- the retail tint/intensity
+/// a sprite at a given cell and height is drawn with.
+///
+/// Retail formula (CNCMaps Palette.ApplyLighting, which the reference
+/// transcribes):
+///   tint       = mapTint + sum(tile light tints)
+///   intensity  = max(0, ambient - ground) + level*height + sum(tile light
+///                intensities)
+///   result     = max(0, tint) * max(0, intensity)
+/// with each term gated by the art's LightingType. The clamps at zero
+/// matter: negative lamps push the sums below zero and the original engine
+/// floors them there rather than wrapping.</summary>
+class Lighting {
+    // The map's own lighting, the base every override copies.
+    MapLighting baseAmbient;
+    // The live ambient: the base, or an effect's copy while one runs.
+    MapLighting ambientOverride;
+    // Per-cell lamp pools, keyed by "x,y" with the list of lights on that
+    // cell -- the reference's Map<string, Set<light>>. The lights are kept
+    // individually rather than summed so a lamp dying takes only its own
+    // light off a cell another lamp also lights.
+    List<string> lightKeys;
+    List<List<TileLight>> lightVals;
+    // The ambient a running effect is walking toward, and its countdown --
+    // the reference's MapLightingTrait.setTargetAmbientIntensity.
+    double targetAmbient;
+    bool hasTarget;
+    int ambientUpdateTicks;
+    int ambientChangeRateM;
+    int ambientChangeStepM;
+
+    static Lighting Create(MapLighting initial) {
+        Lighting l = new Lighting();
+        l.baseAmbient = initial != null ? initial.Copy()
+                                        : MapLighting.Create();
+        l.ambientOverride = null;
+        l.lightKeys = new List<string>();
+        l.lightVals = new List<List<TileLight>>();
+        l.targetAmbient = 0.0;
+        l.hasTarget = false;
+        l.ambientUpdateTicks = 0 - 1;
+        l.ambientChangeRateM = 0;
+        l.ambientChangeStepM = 1;
+        return l;
+    }
+
+    MapLighting BaseAmbient() { return this.baseAmbient; }
+
+    /// <summary>The lighting actually in force: an effect's override while
+    /// one runs, the map's own otherwise.</summary>
+    MapLighting MapLightingNow() {
+        if (this.ambientOverride != null) { return this.ambientOverride; }
+        return this.baseAmbient;
+    }
+
+    void SetBase(MapLighting m) { this.baseAmbient = m.Copy(); }
+
+    /// <summary>Puts an effect's lighting in force (null clears it), the
+    /// reference's applyAmbientOverride.</summary>
+    void ApplyAmbientOverride(MapLighting m) {
+        this.ambientOverride = m;
+    }
+
+    bool HasOverride() { return this.ambientOverride != null; }
+
+    /// <summary>Starts a walk toward a new ambient, the reference's
+    /// setTargetAmbientIntensity + the config rates: `rateM` is the minutes
+    /// per step in per-mille (the shipped AmbientChangeRate=.2) and `stepM`
+    /// the amount per step, also per-mille. Both live on the rules'
+    /// [AudioVisual] block.</summary>
+    void SetTargetAmbient(double target, int rateM, int stepM) {
+        this.targetAmbient = target;
+        this.hasTarget = true;
+        this.ambientChangeRateM = rateM;
+        this.ambientChangeStepM = stepM < 1 ? 1 : stepM;
+        this.ambientUpdateTicks = 0 - 1;
+    }
+
+    bool HasTarget() { return this.hasTarget; }
+    double TargetAmbient() { return this.targetAmbient; }
+
+    /// <summary>The ambient walk, the reference's MapLightingTrait.onTick:
+    /// every rate minutes it nudges the ambient one step toward the target
+    /// and stops when it arrives. The reference computes the interval as
+    /// 60 * BASE_TICKS_PER_SECOND * rate; BASE_TICKS_PER_SECOND is 15, so a
+    /// minute is 900 ticks and a per-mille rate becomes 0.9*rateM ticks
+    /// (the shipped .2 -> 180).</summary>
+    void TickAmbient() {
+        if (!this.hasTarget) { return; }
+        if (this.ambientUpdateTicks < 0) {
+            this.ambientUpdateTicks =
+                (int)Math.Floor(0.9 * (double)this.ambientChangeRateM);
+        }
+        if (this.ambientUpdateTicks <= 0) {
+            this.ambientUpdateTicks = 0 - 1;
+            double cur = this.MapLightingNow().Ambient();
+            double diff = this.targetAmbient - cur;
+            if (diff != 0.0) {
+                double step = diff > 0 ? 1.0 : -1.0;
+                double mag = diff > 0 ? diff : 0.0 - diff;
+                double size = (double)this.ambientChangeStepM / 1000.0;
+                if (mag < size) { size = mag; }
+                this.MapLightingNow().SetAmbient(cur + step * size);
+            } else {
+                this.hasTarget = false;
+            }
+        } else {
+            this.ambientUpdateTicks = this.ambientUpdateTicks - 1;
+        }
+    }
+
+    // ---- lamp pools -------------------------------------------------------
+
+    void AddTileLight(int x, int y, TileLight light) {
+        string key = Convert.ToString(x) + "," + Convert.ToString(y);
+        for (int i = 0; i < this.lightKeys.Count; i = i + 1) {
+            if (this.lightKeys[i] == key) {
+                this.lightVals[i].Add(light);
+                return;
+            }
+        }
+        List<TileLight> grp = new List<TileLight>();
+        grp.Add(light);
+        this.lightKeys.Add(key);
+        this.lightVals.Add(grp);
+    }
+
+    /// <summary>Takes one lamp's light off a cell, the reference's
+    /// removeTileLight. The cell keeps the lights of every other lamp on it,
+    /// and drops out of the map when the last one goes.</summary>
+    void RemoveTileLight(int x, int y, TileLight light) {
+        string key = Convert.ToString(x) + "," + Convert.ToString(y);
+        for (int i = 0; i < this.lightKeys.Count; i = i + 1) {
+            if (this.lightKeys[i] != key) { continue; }
+            List<TileLight> grp = this.lightVals[i];
+            for (int j = 0; j < grp.Count; j = j + 1) {
+                if (grp[j] == light) { grp.RemoveAt(j); break; }
+            }
+            if (grp.Count == 0) {
+                this.lightKeys.RemoveAt(i);
+                this.lightVals.RemoveAt(i);
+            }
+            return;
+        }
+    }
+
+    void ClearTileLights() {
+        this.lightKeys = new List<string>();
+        this.lightVals = new List<List<TileLight>>();
+    }
+
+    int TileLightCount() { return this.lightKeys.Count; }
+
+    /// <summary>The summed light on a cell: every lamp's tint and intensity
+    /// added up, or null when no lamp reaches it.</summary>
+    TileLight TileLightAt(int x, int y) {
+        string key = Convert.ToString(x) + "," + Convert.ToString(y);
+        for (int i = 0; i < this.lightKeys.Count; i = i + 1) {
+            if (this.lightKeys[i] != key) { continue; }
+            List<TileLight> grp = this.lightVals[i];
+            double r = 0.0;
+            double g = 0.0;
+            double b = 0.0;
+            double v = 0.0;
+            for (int j = 0; j < grp.Count; j = j + 1) {
+                r = r + grp[j].Red();
+                g = g + grp[j].Green();
+                b = b + grp[j].Blue();
+                v = v + grp[j].Intensity();
+            }
+            return TileLight.Create(r, g, b, v);
+        }
+        return null;
+    }
+
+    // ---- the retail formula ----------------------------------------------
+
+    /// <summary>The tint a cell is drawn with: the map tint (only for art
+    /// whose class takes it, or when the map forces it) plus every lamp's
+    /// tint, floored at zero. Returned as a 3-list: r, g, b.</summary>
+    List<double> ComputeTint(int type, int x, int y) {
+        double r = 1.0;
+        double g = 1.0;
+        double b = 1.0;
+        MapLighting ml = this.MapLightingNow();
+        if (type >= LightingType.Full() || ml.ForceTint()) {
+            r = ml.Red();
+            g = ml.Green();
+            b = ml.Blue();
+        }
+        if (type >= LightingType.Full()) {
+            TileLight l = this.TileLightAt(x, y);
+            if (l != null) {
+                r = r + l.Red();
+                g = g + l.Green();
+                b = b + l.Blue();
+            }
+        }
+        if (r < 0.0) { r = 0.0; }
+        if (g < 0.0) { g = 0.0; }
+        if (b < 0.0) { b = 0.0; }
+        List<double> out3 = new List<double>();
+        out3.Add(r);
+        out3.Add(g);
+        out3.Add(b);
+        return out3;
+    }
+
+    /// <summary>The brightness a cell at a given height is drawn with:
+    /// (ambient - ground) + level*height + lamp pools, floored at zero.
+    /// The lamp term only reaches art whose class takes ambient light --
+    /// projectiles and voxel anims ignore lamp pools, as in retail.</summary>
+    double ComputeIntensity(int type, int x, int y, int height) {
+        MapLighting ml = this.MapLightingNow();
+        double v = ml.Ambient() - ml.Ground();
+        if (type >= LightingType.Level()) {
+            v = v + ml.Level() * (double)height;
+        }
+        if (type >= LightingType.Ambient()) {
+            TileLight l = this.TileLightAt(x, y);
+            if (l != null) { v = v + l.Intensity(); }
+        }
+        if (v < 0.0) { v = 0.0; }
+        return v;
+    }
+
+    /// <summary>The full per-cell colour multiply: tint * intensity, as a
+    /// 3-list. This is what a sprite's pixels are scaled by.</summary>
+    List<double> Compute(int type, int x, int y, int height) {
+        if (type == LightingType.None()) {
+            List<double> one = new List<double>();
+            one.Add(1.0);
+            one.Add(1.0);
+            one.Add(1.0);
+            return one;
+        }
+        List<double> tint = this.ComputeTint(type, x, y);
+        double i = this.ComputeIntensity(type, x, y, height);
+        List<double> out3 = new List<double>();
+        out3.Add(tint[0] * i);
+        out3.Add(tint[1] * i);
+        out3.Add(tint[2] * i);
+        return out3;
+    }
+
+    /// <summary>The ambient floor alone, the reference's getAmbientIntensity
+    /// (ambient - ground): what a "no lighting" reference point compares
+    /// against.</summary>
+    double AmbientIntensity() {
+        MapLighting ml = this.MapLightingNow();
+        return ml.Ambient() - ml.Ground();
+    }
+}
+
+/// <summary>A timed lighting effect, the reference's LightingFx: it walks
+/// a copy of the map's lighting over time and hands the result to the
+/// engine. Only the nuke flash is ported so far (NukeLightingFx), which is
+/// what the reference ships too.</summary>
+class LightingFx {
+    MapLighting mapLighting;
+    bool isRunning;
+    double startTime;
+    int priority;
+
+    static LightingFx Create(int prio) {
+        LightingFx f = new LightingFx();
+        f.mapLighting = MapLighting.Create();
+        f.isRunning = false;
+        f.startTime = 0.0;
+        f.priority = prio;
+        return f;
+    }
+
+    int Priority() { return this.priority; }
+    MapLighting Lighting() { return this.mapLighting; }
+    bool IsRunning() { return this.isRunning; }
+    void Start(double time, MapLighting from) {
+        this.isRunning = true;
+        this.startTime = time;
+        this.mapLighting.CopyFrom(from);
+    }
+    void SetRunning(bool on) { this.isRunning = on; }
+    double StartTime() { return this.startTime; }
+
+    /// <summary>One frame of the effect; true when it has finished.</summary>
+    bool Advance(double time, int gameSpeed) { return true; }
+}
+
+/// <summary>The nuke's lighting flash, the reference's NukeLightingFx: the
+/// ambient leaps 1.5 over the first 0.3s, holds for 3s, then falls back
+/// over 0.5s. Its priority is High so it outranks any other effect running
+/// at the same time.</summary>
+class NukeLightingFx : LightingFx {
+    double initialAmbient;
+    bool haveInitial;
+
+    static NukeLightingFx CreateNuke() {
+        NukeLightingFx f = new NukeLightingFx();
+        f.mapLighting = MapLighting.Create();
+        f.isRunning = false;
+        f.startTime = 0.0;
+        f.priority = 1;      // LightingFxPriority.High
+        f.initialAmbient = 0.0;
+        f.haveInitial = false;
+        return f;
+    }
+
+    /// <summary>Advances the flash. Returns true when done, and writes the
+    /// updated flag into res[0] (1 updated / 0 unchanged).</summary>
+    bool UpdateNuke(double time, int gameSpeed, List<int> res) {
+        res[0] = 0;
+        if (!this.haveInitial) {
+            this.initialAmbient = this.mapLighting.Ambient();
+            this.haveInitial = true;
+        }
+        // The reference scales elapsed wall time by the game speed, so a
+        // sped-up game flashes faster.
+        double elapsed = (time - this.startTime) / 1000.0 * (double)gameSpeed;
+        double newAmbient = 0.0;
+        bool have = false;
+        bool done = false;
+        if (elapsed >= 3.3) {
+            double remaining = elapsed - 3.3;
+            double progress = remaining / 0.5;
+            if (progress > 1.0) { progress = 1.0; }
+            newAmbient = this.initialAmbient + 1.5 * (1.0 - progress);
+            if (progress == 1.0) { done = true; }
+            have = true;
+        } else if (elapsed < 0.3) {
+            double progress = elapsed / 0.3;
+            newAmbient = this.initialAmbient + 1.5 * progress;
+            have = true;
+        }
+        if (have && this.mapLighting.Ambient() != newAmbient) {
+            res[0] = 1;
+            this.mapLighting.SetAmbient(newAmbient);
+        }
+        return done;
+    }
+}

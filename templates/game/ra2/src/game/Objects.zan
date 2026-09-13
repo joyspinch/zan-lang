@@ -1218,6 +1218,17 @@ class StructureType {
     bool crushable;      // rules Crushable= (default no: buildings are run
                          // over only when their section says so)
     string crushSound;   // rules CrushSound=: the squish key when run over
+    // Lamp pool facts, the reference's TechnoRules light reads: how far the
+    // building's light reaches in leptons (LightVisibility, 256 per cell),
+    // how strong it is (LightIntensity -- negative for the NEGLAMP posts,
+    // which darken) and its tint per channel.
+    int lightVisibility;
+    double lightIntensity;
+    double lightRedTint;
+    double lightGreenTint;
+    double lightBlueTint;
+    bool isLightpost;    // InvisibleInGame=: the post renders nothing and
+                         // only its light exists (the IN*LAMP family)
 
     static StructureType Create(BuildingDef d) {
         StructureType t = new StructureType();
@@ -1249,6 +1260,12 @@ class StructureType {
         t.dieSound = d.DieSound();
         t.crushable = d.Crushable();
         t.crushSound = d.CrushSound();
+        t.lightVisibility = d.LightVisibility();
+        t.lightIntensity = d.LightIntensity();
+        t.lightRedTint = d.LightRedTint();
+        t.lightGreenTint = d.LightGreenTint();
+        t.lightBlueTint = d.LightBlueTint();
+        t.isLightpost = d.InvisibleInGame();
         return t;
     }
 
@@ -1264,6 +1281,12 @@ class StructureType {
     string DieSound() { return this.dieSound; }
     bool Crushable() { return this.crushable; }
     string CrushSound() { return this.crushSound; }
+    int LightVisibility() { return this.lightVisibility; }
+    double LightIntensity() { return this.lightIntensity; }
+    double LightRedTint() { return this.lightRedTint; }
+    double LightGreenTint() { return this.lightGreenTint; }
+    double LightBlueTint() { return this.lightBlueTint; }
+    bool IsLightpost() { return this.isLightpost; }
     int FootprintW() { return this.footprintW; }
     int FootprintH() { return this.footprintH; }
     int Hp() { return this.hp; }
@@ -1452,6 +1475,23 @@ class World {
     // the theater loads, in which case IsWater falls back to temperate's
     // own 314..327. See Theater.WaterRanges.
     List<int> waterRanges;
+
+    // The map lighting engine (see Lighting.zan): the [Lighting] block's
+    // ambient/level/tint, the per-cell lamp pools, and the compute() the
+    // renderer shades sprites with. Never null.
+    Lighting lighting;
+
+    // The lamp buildings that currently cast a pool, with the lights each
+    // one placed -- the reference's lampLights map. Kept so a lamp dying
+    // takes exactly its own light off the cells it lit, leaving any
+    // neighbouring lamp's pool on the shared cells intact. Parallel lists:
+    // lampSources[i] placed lampLights[i].
+    List<WorldObject> lampSources;
+    List<List<TileLight>> lampLights;
+    // The cells each lamp's lights went onto, parallel to lampLights, so a
+    // removal knows where to take them off.
+    List<List<int>> lampSpots;
+    List<List<int>> lampSpotsY;
 
     // The theater whose TMP templates classify each cell's land type and
     // ramp flag. Null is tolerated: CellLand then falls back to the
@@ -1662,6 +1702,15 @@ class World {
         w.smudgeName = new List<string>();
         w.smudgeX = new List<int>();
         w.smudgeY = new List<int>();
+        // The lighting: the map's own [Lighting] block is installed by
+        // SetMapLighting once the map is known; until then the engine runs
+        // the reference's defaults (ambient 1, no tint), so a world built
+        // straight from Rules still shades like daylight.
+        w.lighting = Lighting.Create(null);
+        w.lampSources = new List<WorldObject>();
+        w.lampLights = new List<List<TileLight>>();
+        w.lampSpots = new List<List<int>>();
+        w.lampSpotsY = new List<List<int>>();
         return w;
     }
 
@@ -4011,6 +4060,7 @@ class World {
     void Demolish(WorldObject o) {
         int i = this.IndexOfObject(o);
         if (i < 0) { return; }
+        this.ClearLampLights(o);
         StructureType t = this.TypeOf(o);
         for (int dy = 0; dy < t.FootprintH(); dy = dy + 1) {
             for (int dx = 0; dx < t.FootprintW(); dx = dx + 1) {
@@ -4339,6 +4389,167 @@ class World {
     /// to apply; until then CellLand falls back to the set-name ranges.</summary>
     void SetTheater(Theater t) { this.theater = t; }
 
+    // ---- lighting ---------------------------------------------------------
+
+    /// <summary>The lighting engine, for the renderer's shade lookups and
+    /// for the effects/triggers that override the ambient.</summary>
+    Lighting Lights() { return this.lighting; }
+
+    /// <summary>The per-channel shading factors for an object at its cell,
+    /// as a 3-list (r, g, b). `type` is the art's LightingType class: units
+    /// and structures take Ambient, ground decals take Full. The height
+    /// term rides the object's cell level so a unit on a cliff catches the
+    /// level step the reference gives it. Units and aircraft take their
+    /// [AudioVisual] Extra*Light nudge on top -- the shipped .2 that makes
+    /// a hull read a touch brighter than the ground under it; structures
+    /// take none, the reference's Building.updateBaseLight.</summary>
+    List<double> ShadeFor(WorldObject o, int type) {
+        int h = 0;
+        if (o != null && this.iso != null) {
+            IsoTile t = this.iso.At(o.X(), o.Y());
+            if (t != null) { h = t.Level(); }
+        }
+        List<double> sh = this.ShadeAt(o == null ? 0 : o.X(),
+                                       o == null ? 0 : o.Y(), h, type);
+        if (o == null || o.Kind() != ObjKind.Unit()) { return sh; }
+        UnitType u = this.UnitTypeOf(o);
+        if (u == null) { return sh; }
+        int extraM = u.Infantry() ? this.Rules().ExtraInfantryLightM()
+                                  : this.Rules().ExtraUnitLightM();
+        if (extraM == 0) { return sh; }
+        // The reference adds it as a delta to the cell's multiplier, so a
+        // dim cell brightens by the same amount a bright one does.
+        double add = (double)extraM / 1000.0;
+        List<double> out3 = new List<double>();
+        out3.Add(sh[0] + add);
+        out3.Add(sh[1] + add);
+        out3.Add(sh[2] + add);
+        return out3;
+    }
+
+    /// <summary>The per-channel shading factors for a cell, as a 3-list.</summary>
+    List<double> ShadeAt(int x, int y, int height, int type) {
+        if (this.lighting == null) {
+            List<double> one = new List<double>();
+            one.Add(1.0);
+            one.Add(1.0);
+            one.Add(1.0);
+            return one;
+        }
+        return this.lighting.Compute(type, x, y, height);
+    }
+
+    /// <summary>Installs the map's [Lighting] block as the engine's base,
+    /// the reference's Lighting(mapLightingTrait). Called once the map is
+    /// known; a world that never gets one keeps the reference defaults.</summary>
+    void SetMapLighting(MapLighting m) {
+        if (m == null) { return; }
+        this.lighting.SetBase(m);
+    }
+
+    /// <summary>Whether a structure type casts a lamp pool: its rules carry
+    /// a LightVisibility and a non-zero LightIntensity. The shipped GALITE
+    /// (a visible street lamp) and the IN*LAMP/NEGLAMP family
+    /// (InvisibleInGame posts) are the ones that qualify; NEGLAMP's
+    /// intensity is negative, so it darkens.</summary>
+    bool IsLampType(StructureType t) {
+        if (t == null) { return false; }
+        if (t.LightVisibility() <= 0) { return false; }
+        double i = t.LightIntensity();
+        return i >= 0.001 || i <= 0.0 - 0.001;
+    }
+
+    /// <summary>Seeds a lamp building's pool onto every cell within
+    /// LightVisibility leptons, the reference's WorldView.addLampLights:
+    /// the radius is visibility/256 cells, and each cell in it gets
+    /// (visibility - 256*distance)/visibility of the lamp's tint and
+    /// intensity -- a linear falloff to nothing at the rim. The lights
+    /// placed are remembered per lamp so a later death can take exactly
+    /// those off again.</summary>
+    void SeedLampLights(WorldObject o) {
+        if (o == null || o.Kind() != ObjKind.Structure()) { return; }
+        StructureType t = this.TypeOf(o);
+        if (!this.IsLampType(t)) { return; }
+        for (int k = 0; k < this.lampSources.Count; k = k + 1) {
+            if (this.lampSources[k] == o) { return; }   // already seeded
+        }
+        List<TileLight> placed = new List<TileLight>();
+        List<int> px = new List<int>();
+        List<int> py = new List<int>();
+        double radius = t.LightVisibility() / 256.0;
+        int maxDelta = (int)Math.Ceiling(radius);
+        int cx = o.X();
+        int cy = o.Y();
+        for (int dx = 0 - maxDelta; dx <= maxDelta; dx = dx + 1) {
+            for (int dy = 0 - maxDelta; dy <= maxDelta; dy = dy + 1) {
+                int tx = cx + dx;
+                int ty = cy + dy;
+                if (!this.InBounds(tx, ty)) { continue; }
+                double dist = Math.Sqrt((double)(dx * dx + dy * dy));
+                if (dist >= radius) { continue; }
+                double effect = ((double)t.LightVisibility() - 256.0 * dist)
+                                / (double)t.LightVisibility();
+                TileLight light = TileLight.Create(
+                    effect * t.LightRedTint(),
+                    effect * t.LightGreenTint(),
+                    effect * t.LightBlueTint(),
+                    effect * t.LightIntensity());
+                this.lighting.AddTileLight(tx, ty, light);
+                placed.Add(light);
+                px.Add(tx);
+                py.Add(ty);
+            }
+        }
+        this.lampSources.Add(o);
+        this.lampLights.Add(placed);
+        this.lampSpots.Add(px);
+        this.lampSpotsY.Add(py);
+    }
+
+    /// <summary>Takes a dead lamp's pool off its cells, the reference's
+    /// onLampRemoved: without this a destroyed street lamp keeps lighting
+    /// the street forever. Only this lamp's own entries come off, so a cell
+    /// two lamps share stays lit by the survivor.</summary>
+    void ClearLampLights(WorldObject o) {
+        if (o == null) { return; }
+        int at = 0 - 1;
+        for (int k = 0; k < this.lampSources.Count; k = k + 1) {
+            if (this.lampSources[k] == o) { at = k; break; }
+        }
+        if (at < 0) { return; }
+        List<TileLight> placed = this.lampLights[at];
+        List<int> px = this.lampSpots[at];
+        List<int> py = this.lampSpotsY[at];
+        for (int k = 0; k < placed.Count; k = k + 1) {
+            this.lighting.RemoveTileLight(px[k], py[k], placed[k]);
+        }
+        this.lampSources.RemoveAt(at);
+        this.lampLights.RemoveAt(at);
+        this.lampSpots.RemoveAt(at);
+        this.lampSpotsY.RemoveAt(at);
+    }
+
+    /// <summary>Re-seeds every lamp on the field: called when a save/load or
+    /// a scenario rebuild repopulates the world, so the pools match the
+    /// buildings that exist. A no-op when nothing is a lamp.</summary>
+    void ReseedLamps() {
+        this.lighting.ClearTileLights();
+        this.lampSources = new List<WorldObject>();
+        this.lampLights = new List<List<TileLight>>();
+        this.lampSpots = new List<List<int>>();
+        this.lampSpotsY = new List<List<int>>();
+        for (int i = 0; i < this.objects.Count; i = i + 1) {
+            WorldObject o = this.objects[i];
+            if (o != null && !o.IsDead()) { this.SeedLampLights(o); }
+        }
+    }
+
+    /// <summary>Seeds lamps as a structure spawns, the reference's
+    /// onLampSpawned hook.</summary>
+    void OnStructureSpawned(WorldObject o) {
+        this.SeedLampLights(o);
+    }
+
     /// <summary>Per-cell water test for callers that only have a coordinate
     /// (the dev ground-rule probe).</summary>
     bool CellIsWater(int x, int y) {
@@ -4398,6 +4609,9 @@ class World {
     int AddObject(WorldObject o) {
         this.occupancy[this.CellSlot(o.X(), o.Y())] = this.objects.Count + 1;
         this.objects.Add(o);
+        // A lamp building lights its neighbourhood the moment it appears,
+        // the reference's onObjectSpawned hook in WorldView.
+        this.OnStructureSpawned(o);
         // A structure's footprint is its whole footprint; a unit is one cell.
         if (o.Kind() == ObjKind.Structure()) {
             StructureType t = this.TypeOf(o);
@@ -6526,6 +6740,10 @@ class World {
         // The crates age and repopulate behind the shroud flush, the
         // reference's CrateGeneratorTrait riding the same tick.
         this.TickCrates();
+        // The map's ambient walks toward whatever a scenario asked for
+        // (an ion storm darkening the map, a nuke flash), the reference's
+        // MapLightingTrait.onTick.
+        this.lighting.TickAmbient();
         List<int> result = new List<int>();
         result.Add(moved);
         result.Add(fired);
@@ -6853,6 +7071,10 @@ class World {
         while (i < this.objects.Count) {
             WorldObject o = this.objects[i];
             if (!o.IsDead()) { i = i + 1; continue; }
+            // A dead lamp takes its pool off the street with it, the
+            // reference's onObjectRemoved hook; without this the cells it
+            // lit stay bright forever.
+            this.ClearLampLights(o);
             this.SndDeathFeedback(o);
             // A trooper does not pop: the reference plays his death art
             // (sequence or anim) and leaves the corpse. A crushed one

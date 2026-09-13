@@ -1551,6 +1551,281 @@ class WinChainTest {
             Report("crusher cell kept",
                    crushWorld.OccupantAt(5, 5) >= 0 ? 1 : 0, 1);
         }
+
+        // ---- 场景:地图光照 [Lighting] + 灯柱 tile light + 亮度渐变 ----
+        // 参考 engine/Lighting.ts 的零售公式(CNCMaps Palette.ApplyLighting):
+        //   tint      = 地图 tint(仅 Full 类或 forceTint)+ 该格灯池 tint 之和
+        //   intensity = max(0, ambient - ground) + level*height + 该格灯池强度之和
+        //   result    = max(0, tint) * max(0, intensity)
+        // 每一项按 art 的 LightingType 门控(None 全亮、Global 无 ambient、
+        // Level 加高度、Ambient 加灯池、Full 加地图 tint)。
+        // 1) 无 [Lighting] 段的地图 = 参考默认(白天):level .032/ambient 1/tint 1。
+        MapFile litless = MapFile.Parse(
+            "[Map]\nSize=0,0,20,20\nLocalSize=0,0,20,20\n");
+        MapLighting litDef = litless.Lighting();
+        Report("no [Lighting] defaults level",
+               litDef.Level() == 0.032 ? 1 : 0, 1);
+        Report("no [Lighting] defaults ambient",
+               litDef.Ambient() == 1.0 ? 1 : 0, 1);
+        Report("no [Lighting] defaults tint",
+               litDef.Red() == 1.0 && litDef.Green() == 1.0
+                   && litDef.Blue() == 1.0 ? 1 : 0, 1);
+        Report("no [Lighting] defaults ground",
+               litDef.Ground() == 0.0 ? 1 : 0, 1);
+        Report("base tint not forced",
+               litDef.ForceTint() ? 0 : 1, 1);
+        // 2) 地图自带 [Lighting]:夜战(暗 ambient、偏蓝 tint)+ Ion 前缀覆盖。
+        MapFile litMap = MapFile.Parse(
+            "[Map]\nSize=0,0,20,20\nLocalSize=0,0,20,20\n"
+            + "[Lighting]\nLevel=.05\nAmbient=.6\nRed=.7\nGreen=.8\n"
+            + "Blue=1.1\nGround=.1\n"
+            + "IonAmbient=.35\nIonRed=.6\nIonGreen=.7\nIonBlue=1.2\n");
+        MapLighting litNight = litMap.Lighting();
+        Report("map [Lighting] level",
+               litNight.Level() == 0.05 ? 1 : 0, 1);
+        Report("map [Lighting] ambient",
+               litNight.Ambient() == 0.6 ? 1 : 0, 1);
+        Report("map [Lighting] ground",
+               litNight.Ground() == 0.1 ? 1 : 0, 1);
+        Report("map [Lighting] tint blue",
+               litNight.Blue() == 1.1 ? 1 : 0, 1);
+        MapLighting litIon = litMap.IonLighting();
+        // Ion 段只覆盖自己给的键,其余继承默认(Level 没给 -> .032)。
+        Report("ion ambient override",
+               litIon.Ambient() == 0.35 ? 1 : 0, 1);
+        Report("ion tint override",
+               litIon.Blue() == 1.2 ? 1 : 0, 1);
+        Report("ion level falls back",
+               litIon.Level() == 0.032 ? 1 : 0, 1);
+        // Ion 段总是 forceTint:离子风暴里连建筑也吃那张冷色 tint。
+        Report("ion forces tint",
+               litIon.ForceTint() ? 1 : 0, 1);
+
+        // 3) 零售公式本体:直接对 Lighting 求值。
+        Lighting light = Lighting.Create(litNight);
+        Report("daylight level step",
+               light.Compute(3, 0, 0, 0)[0] == 0.5 ? 1 : 0, 1);
+        // Ambient 类不吃地图 tint(forceTint=false),所以三个通道都等于强度。
+        Report("ambient class ignores map tint",
+               light.Compute(3, 0, 0, 0)[2] == 0.5 ? 1 : 0, 1);
+        // Full 类吃地图 tint:.7 * .5 / .8 * .5 / 1.1 * .5。
+        Report("full class takes map tint red",
+               light.Compute(4, 0, 0, 0)[0] == 0.35 ? 1 : 0, 1);
+        Report("full class takes map tint blue",
+               light.Compute(4, 0, 0, 0)[2] == 0.55 ? 1 : 0, 1);
+        // Level 类:ambient-ground 打底 + level*height,没有地图 tint。
+        // (0.6-0.1) + 0.05*4 = 0.7。
+        Report("level class height step",
+               light.Compute(2, 0, 0, 4)[0] == 0.7 ? 1 : 0, 1);
+        // None 类全亮:动画不吃光照(火球在夜里不该变暗)。
+        Report("none class unlit",
+               light.Compute(0, 0, 0, 0)[0] == 1.0 ? 1 : 0, 1);
+        // 零下限:负灯把和压到 0 以下时,原版引擎是夹到 0 而不是回绕。
+        Lighting negLight = Lighting.Create(litNight);
+        negLight.AddTileLight(2, 2, TileLight.Create(-9.0, -9.0, -9.0,
+                                                     -9.0));
+        Report("negative light clamps to zero",
+               negLight.Compute(4, 2, 2, 0)[0] == 0.0 ? 1 : 0, 1);
+
+        // 4) 灯池:一盏灯照亮半径内的格子,亮度线性衰减到边缘归零。
+        // 世界铺一张平地:解析出来的地图没有 IsoMapPack5 地形包,格子
+        // 判不出陆地,结构放不下去。地图光照用 SetMapLighting 装进去,
+        // 跟主程序 LoadGame 的接线一致。
+        Rules litRules = Rules.Default();
+        World litWorld = World.Create(FlatMap(40, 40),
+            StructureCatalog.CreateWith(litRules),
+            UnitCatalog.CreateWith(litRules));
+        litWorld.SetMapLighting(litMap.Lighting());
+        // 内置规则给 GALITE(路灯)抄了 LightVisibility=5000/Intensity=.2。
+        BuildingDef lampDef = litRules.BuildingDefNamed("GALITE");
+        Report("galite is a lamp def",
+               lampDef != null && lampDef.LightVisibility() == 5000 ? 1 : 0, 1);
+        Report("galite intensity",
+               lampDef != null && lampDef.LightIntensity() == 0.2 ? 1 : 0, 1);
+        Report("galite tint red",
+               lampDef != null && lampDef.LightRedTint() == 0.05 ? 1 : 0, 1);
+        // 不可见灯:IN* 前缀(INYELWLAMP 等)与 TEM*/SNO* 剧场氛围灯。
+        BuildingDef inLamp = litRules.BuildingDefNamed("INYELWLAMP");
+        Report("invisible lamp flag",
+               inLamp != null && inLamp.InvisibleInGame() ? 1 : 0, 1);
+        Report("visible lamp not hidden",
+               lampDef != null && !lampDef.InvisibleInGame() ? 1 : 0, 1);
+        // 负灯 NEGRED:强度为负,把周围压暗。
+        BuildingDef negDef = litRules.BuildingDefNamed("NEGRED");
+        Report("negred negative intensity",
+               negDef != null && negDef.LightIntensity() < 0.0 ? 1 : 0, 1);
+        int galiteId = litWorld.Catalog().CivIdOf("GALITE");
+        Report("galite in civ catalog",
+               galiteId >= 0 ? 1 : 0, 1);
+        if (galiteId >= 0) {
+            // 半径 5000/256 = 19.5 格,以 (20,20) 为心:中心强度 .2,
+            // 正北一格 .2*(5000-256)/5000 ≈ .19。
+            int li = litWorld.PlaceCivStructure(galiteId, 20, 20, 0);
+            Report("lamp placed", li >= 0 ? 1 : 0, 1);
+            Report("lamp cell lit",
+                   litWorld.Lights().TileLightAt(20, 20) != null ? 1 : 0, 1);
+            TileLight lc = litWorld.Lights().TileLightAt(20, 20);
+            Report("lamp center intensity",
+                   lc != null && lc.Intensity() > 0.19
+                       && lc.Intensity() < 0.201 ? 1 : 0, 1);
+            TileLight ln = litWorld.Lights().TileLightAt(20, 19);
+            Report("lamp one cell falloff",
+                   ln != null && ln.Intensity() > 0.18
+                       && ln.Intensity() < lc.Intensity() ? 1 : 0, 1);
+            Report("lamp rim unlit",
+                   litWorld.Lights().TileLightAt(20, 0) == null ? 1 : 0, 1);
+            // 灯死了,池子跟着走 —— 参考的 onLampRemoved。
+            litWorld.ClearLampLights(litWorld.ObjectAt(li));
+            Report("dead lamp pool gone",
+                   litWorld.Lights().TileLightAt(20, 20) == null ? 1 : 0, 1);
+            // 两个灯共享的格子:一盏拆掉后另一盏还在。
+            int l1 = litWorld.PlaceCivStructure(galiteId, 5, 5, 0);
+            int l2 = litWorld.PlaceCivStructure(galiteId, 6, 5, 0);
+            Report("two lamps placed",
+                   l1 >= 0 && l2 >= 0 ? 1 : 0, 1);
+            if (l1 >= 0 && l2 >= 0) {
+                TileLight both = litWorld.Lights().TileLightAt(5, 5);
+                litWorld.ClearLampLights(litWorld.ObjectAt(l2));
+                TileLight one = litWorld.Lights().TileLightAt(5, 5);
+                Report("shared cell keeps survivor",
+                       both != null && one != null
+                           && one.Intensity() < both.Intensity()
+                           && one.Intensity() > 0.0 ? 1 : 0, 1);
+                litWorld.ClearLampLights(litWorld.ObjectAt(l1));
+                Report("last lamp clears cell",
+                       litWorld.Lights().TileLightAt(5, 5) == null ? 1 : 0, 1);
+            }
+            // 灯池进公式:一盏灯下的地面比远处亮(Full 类吃地图 tint +
+            // 灯池)。两盏测试灯都拆了,这里另放一盏。
+            int l3 = litWorld.PlaceCivStructure(galiteId, 30, 30, 0);
+            if (l3 >= 0) {
+                List<double> near = litWorld.ShadeAt(30, 30, 4, 4);
+                List<double> far = litWorld.ShadeAt(2, 2, 4, 4);
+                Report("lamp brightens its cell",
+                       near[0] > far[0] ? 1 : 0, 1);
+            }
+        }
+        // 5) 渲染侧的着色因子:同一格,地面(Full)与单位(Ambient)拿到
+        // 不同的值 —— Full 吃地图 tint,Ambient 不吃(除非 forceTint)。
+        List<double> groundShade = litWorld.ShadeAt(20, 20, 0, 4);
+        List<double> unitShade = litWorld.ShadeAt(20, 20, 0, 3);
+        Report("ground shade takes tint",
+               groundShade[0] != unitShade[0] ? 1 : 0, 1);
+        // 单位额外亮度(ExtraUnitLight=.2):同格同高度,单位比地面亮 .2
+        // —— 用 ShadeFor 走一遍对象路径。
+        int litMtnk = litWorld.Units().IdOfReg(litWorld, 0, "MTNK");
+        if (litMtnk >= 0) {
+            int ui = litWorld.SpawnUnit(0, litMtnk, 15, 15);
+            if (ui >= 0) {
+                WorldObject uo = litWorld.ObjectAt(litWorld.ObjectCount() - 1);
+                List<double> withUnit = litWorld.ShadeFor(uo, 3);
+                List<double> without = litWorld.ShadeAt(15, 15, 4, 3);
+                Report("unit takes extra light",
+                       withUnit[0] > without[0] ? 1 : 0, 1);
+                Report("extra light is .2",
+                       withUnit[0] - without[0] > 0.199
+                           && withUnit[0] - without[0] < 0.201 ? 1 : 0, 1);
+            }
+        }
+
+        // 6) 亮度渐变(MapLightingTrait.onTick):每 rate 分钟走一步,
+        // 走到目标就停。出厂 AmbientChangeRate=.2 / Step=.2。
+        Report("rules ambient change rate",
+               litRules.AmbientChangeRateM() == 200 ? 1 : 0, 1);
+        Report("rules ambient change step",
+               litRules.AmbientChangeStepM() == 200 ? 1 : 0, 1);
+        Lighting walk = Lighting.Create(litNight);
+        // 目标 .4,当前 .6,步长 .2 -> 一步到底。
+        walk.SetTargetAmbient(0.4, 200, 200);
+        Report("ambient walk has target", walk.HasTarget() ? 1 : 0, 1);
+        // 间隔 = floor(0.9 * 200) = 180 tick(参考的
+        // 60*BASE_TICKS_PER_SECOND*rate,基 tick 15),第一次 tick 只设
+        // 倒计时。
+        walk.TickAmbient();
+        Report("ambient walk waits its interval",
+               walk.MapLightingNow().Ambient() == 0.6 ? 1 : 0, 1);
+        // 180 个 tick 走完倒计时,第 181 个 tick 落一步,再一个间隔后
+        // 看到 diff 已是 0 才清目标 —— 参考的 ambientUpdateTicks 每轮
+        // 重置,所以到站也要再等一个间隔才认。
+        for (int w = 0; w < 181; w = w + 1) { walk.TickAmbient(); }
+        Report("ambient walk steps to target",
+               walk.MapLightingNow().Ambient() == 0.4 ? 1 : 0, 1);
+        for (int w = 0; w < 181; w = w + 1) { walk.TickAmbient(); }
+        // 到达后 target 清空,后续 tick 不再改。
+        Report("ambient walk stops at target",
+               walk.HasTarget() ? 0 : 1, 1);
+        walk.TickAmbient();
+        Report("ambient walk idle after arrival",
+               walk.MapLightingNow().Ambient() == 0.4 ? 1 : 0, 1);
+        // 步长比差距大时只走差距那么多(不越过目标)。
+        Lighting walk2 = Lighting.Create(litNight);
+        walk2.SetTargetAmbient(0.55, 200, 900);
+        walk2.TickAmbient();
+        for (int w = 0; w < 181; w = w + 1) { walk2.TickAmbient(); }
+        Report("ambient walk clamps overshoot",
+               walk2.MapLightingNow().Ambient() == 0.55 ? 1 : 0, 1);
+
+        // 7) 核弹闪光的包络(NukeLightingFx):0.3s 冲 +1.5,持续到 3.3s,
+        // 之后 0.5s 落回。优先级 High=1。
+        NukeLightingFx nuke = NukeLightingFx.CreateNuke();
+        Report("nuke fx high priority", nuke.Priority(), 1);
+        MapLighting nukeBase = MapLighting.Create();
+        nuke.Start(0.0, nukeBase);
+        Report("nuke fx running", nuke.IsRunning() ? 1 : 0, 1);
+        List<int> nres = new List<int>();
+        nres.Add(0);
+        // t=150ms -> progress .5 -> ambient 1.75。
+        bool nDone = nuke.UpdateNuke(150.0, 1, nres);
+        Report("nuke flash ramps up",
+               nuke.Lighting().Ambient() == 1.75 ? 1 : 0, 1);
+        Report("nuke flash reports update", nres[0], 1);
+        Report("nuke flash not done early", nDone ? 0 : 1, 1);
+        // t=1000ms:0.3~3.3 的平台期参考什么都不写,ambient 冻结在最后一次
+        // 上升到的值 —— 也就是 0.3s 那一刻的峰值 1+1.5=2.5(浮点等于
+        // 1.5*1.0 的加法,这里用同一算式比对)。断言它既没继续涨也没回落。
+        nuke.UpdateNuke(1000.0, 1, nres);
+        Report("nuke flash plateau freezes",
+               nuke.Lighting().Ambient() > 1.74
+                   && nuke.Lighting().Ambient() < 1.76 ? 1 : 0, 1);
+        Report("nuke flash plateau no update", nres[0], 0);
+        // t=3550ms -> 回落 progress .5 -> ambient 1.75。
+        nuke.UpdateNuke(3550.0, 1, nres);
+        Report("nuke flash falls back",
+               nuke.Lighting().Ambient() == 1.75 ? 1 : 0, 1);
+        // t=3800ms -> progress 1 -> 回到底值,效果结束。
+        nDone = nuke.UpdateNuke(3800.0, 1, nres);
+        Report("nuke flash restores ambient",
+               nuke.Lighting().Ambient() == 1.0 ? 1 : 0, 1);
+        Report("nuke flash done at end", nDone ? 1 : 0, 1);
+        // 游戏速度缩放:同一时刻,速度 2 的 elapsed 翻倍。t=1650ms 在
+        // speed=2 下 elapsed 正好 3.3s,刚进回落段(progress 0),所以
+        // ambient 仍是峰值 1+1.5=2.5;而 speed=1 的同一时刻还在 0.3~3.3
+        // 的平台上不动。两者一比就见速度在起作用。
+        NukeLightingFx nuke2 = NukeLightingFx.CreateNuke();
+        nuke2.Start(0.0, MapLighting.Create());
+        nuke2.UpdateNuke(1650.0, 2, nres);
+        Report("nuke flash scaled by game speed",
+               nuke2.Lighting().Ambient() == 2.5 ? 1 : 0, 1);
+        NukeLightingFx nuke3 = NukeLightingFx.CreateNuke();
+        nuke3.Start(0.0, MapLighting.Create());
+        nuke3.UpdateNuke(150.0, 1, nres);
+        Report("nuke flash unscaled stays low",
+               nuke3.Lighting().Ambient() == 1.75 ? 1 : 0, 1);
+
+        // 8) 覆盖层(override):效果运行期间用的是效果自己的 MapLighting,
+        // 清除后回到地图的底值 —— 参考的 applyAmbientOverride。
+        Lighting ov = Lighting.Create(litNight);
+        Report("no override initially", ov.HasOverride() ? 0 : 1, 1);
+        MapLighting ovLight = MapLighting.Create();
+        ovLight.SetAmbient(2.0);
+        ov.ApplyAmbientOverride(ovLight);
+        Report("override in force", ov.HasOverride() ? 1 : 0, 1);
+        Report("override changes ambient",
+               ov.MapLightingNow().Ambient() == 2.0 ? 1 : 0, 1);
+        ov.ApplyAmbientOverride(null);
+        Report("override cleared",
+               ov.MapLightingNow().Ambient() == 0.6 ? 1 : 0, 1);
+
         // 真实安装的表状态:本机 rip 没有音频表,引擎必须以空表静音装载
         // 而不是崩。表数打印出来,有表/无表都算通过。
         string instDir = "data";
