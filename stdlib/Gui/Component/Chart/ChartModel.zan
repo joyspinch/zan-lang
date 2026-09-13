@@ -88,6 +88,9 @@ class ChartKinds {
     /// ECharts2 别名（五角星），归一到 star。
     static string SymbolSanitize(string s) {
         if (s == "star5") { return "star"; }
+        // rect 是 ECharts5 标准名（radar-custom 的逐项 symbol），
+        // rectangle 是旧名——归一到渲染器认的那个。
+        if (s == "rect") { return "rectangle"; }
         if (s == "emptyCircle" || s == "rectangle" || s == "diamond"
             || s == "triangle" || s == "circle" || s == "star"
             || s == "star6" || s == "arrow" || s == "droplet"
@@ -3294,6 +3297,11 @@ class ChartOption {
                       //   跳过面板底/头，直接在同一面板上叠加绘制
                       //   （ECharts2 同 option 混排 pie/gauge/funnel + 笛卡尔）
     List<int> radarMax; // 雷达每轴满刻度（空 = 从数据推导）
+    List<string> radarNames; // 雷达每轴指示器名（radar.indicator[].name；
+                             //   空 = 回退旧类目路径）
+    bool radarScaled;        // 雷达数据已 ×1000 定点：值数组物化时置位，
+                             //   radarMax/polars[].indicatorMax 同步放大，
+                             //   tooltip 显示走 FracText 除回
     string radarShape;  // ECharts radar.shape："circle"（默认=现状）| "polygon"
     bool radarSplitArea; // ECharts radar.splitArea.show：环带交替色
     List<RadarPolar> polars; // ECharts2 polar[]：多雷达坐标系；空 = 单 polar
@@ -3495,6 +3503,9 @@ class ChartOption {
         o.connectGroup = src.connectGroup; o.rampLo = src.rampLo; o.rampHi = src.rampHi;
         o.radarMax = new List<int>();
         for (int i = 0; i < src.radarMax.Count; i = i + 1) { o.radarMax.Add(src.radarMax[i]); }
+        o.radarNames = new List<string>();
+        for (int i = 0; i < src.radarNames.Count; i = i + 1) { o.radarNames.Add(src.radarNames[i]); }
+        o.radarScaled = src.radarScaled;
         o.polars = new List<RadarPolar>();
         for (int i = 0; i < src.polars.Count; i = i + 1) {
             o.polars.Add(RadarPolar.Clone(src.polars[i]));
@@ -3598,6 +3609,8 @@ class ChartOption {
         o.pieRings = false;
         o.overlay = false;
         o.radarMax = new List<int>();
+        o.radarNames = new List<string>();
+        o.radarScaled = false;
         o.radarShape = "circle";
         o.radarSplitArea = false;
         o.polars = new List<RadarPolar>();
@@ -6239,6 +6252,11 @@ class ChartOption {
                 for (int ri = 0; ri < ind.Count(); ri = ri + 1) {
                     JsonValue ax = ind.At(ri);
                     o.radarMax.Add(ax.Int("max", 0));
+                    // ECharts5 用 name，ECharts2 风格用 text（doc-example/
+                    // radar 的 指标一..五）。
+                    string inm = ax.Str("name", "");
+                    if (inm.Length == 0) { inm = ax.Str("text", ""); }
+                    o.radarNames.Add(inm);
                 }
             }
             string shp = rj.Str("shape", o.radarShape);
@@ -7628,7 +7646,116 @@ class ChartOption {
                         if (cs.data[q].calDay < 0) { cs.data[q].calDay = cs.calCenter; }
                     }
                 }
-                o.series.Add(cs);
+                // radar 数据项值数组物化（官方语义）：radar 系列的每个
+                // data 项是一条独立多边形——对象项 {value:[每轴值],
+                // name:"多边形名"} 或裸数组 [v0,v1,...]。旧标量车道
+                // Double("value") 对数组取 0，整图塌成圆心一个点（radar
+                // 主力 demo 即坏）。物化成每项一个系列：图例取数据项名
+                // （未命名的继承系列名——radar-aqi 31 天同名，图例的
+                // "同名系列随主项一起开关"语义天然成立）；样式拷自源
+                // 系列（城色是显式 itemStyle.color，随 Clone 带走），
+                // 逐项 symbol/symbolSize/lineStyle/itemStyle 覆写落到
+                // 物化系列（radar-custom 的 rect 符号）。值 ×1000 定点
+                // （radarScaled），radarMax/indicatorMax 同步放大，
+                // tooltip 显示走 FracText 除回——0.46 这类小数不丢。
+                if (cs.type == ChartType.Radar && da != null && da.IsArray()
+                    && da.Count() > 0) {
+                    bool rmatAny = false;
+                    for (int rmatV = 0; rmatV < da.Count(); rmatV = rmatV + 1) {
+                        JsonValue rmatIt = da.At(rmatV);
+                        if (rmatIt == null) { continue; }
+                        if (rmatIt.IsArray()) { rmatAny = true; break; }
+                        if (rmatIt.IsObject()) {
+                            JsonValue rmatVv = rmatIt.Get("value");
+                            if (rmatVv != null && rmatVv.IsArray()) {
+                                rmatAny = true; break;
+                            }
+                        }
+                    }
+                    if (rmatAny) {
+                        o.radarScaled = true;
+                        for (int rmatM = 0; rmatM < o.radarMax.Count; rmatM = rmatM + 1) {
+                            if (o.radarMax[rmatM] > 0) {
+                                o.radarMax[rmatM] = o.radarMax[rmatM] * 1000;
+                            }
+                        }
+                        for (int rmatPg = 0; rmatPg < o.polars.Count; rmatPg = rmatPg + 1) {
+                            for (int rmatPm = 0; rmatPm < o.polars[rmatPg].indicatorMax.Count;
+                                 rmatPm = rmatPm + 1) {
+                                if (o.polars[rmatPg].indicatorMax[rmatPm] > 0) {
+                                    o.polars[rmatPg].indicatorMax[rmatPm] =
+                                        o.polars[rmatPg].indicatorMax[rmatPm] * 1000;
+                                }
+                            }
+                        }
+                        for (int rmatI = 0; rmatI < da.Count(); rmatI = rmatI + 1) {
+                            JsonValue rmatIt2 = da.At(rmatI);
+                            JsonValue rmatVv2 = rmatIt2.IsObject()
+                                ? rmatIt2.Get("value") : rmatIt2;
+                            if (rmatVv2 == null || !rmatVv2.IsArray()
+                                || rmatVv2.Count() < 1) { continue; }
+                            ChartSeries rmatS = ChartSeries.Of(
+                                rmatIt2.IsObject() ? rmatIt2.Str("name", "") : "",
+                                ChartType.Radar, new List<int>());
+                            if (rmatS.name.Length == 0) { rmatS.name = cs.name; }
+                            rmatS.color = cs.color;
+                            rmatS.areaStyle = cs.areaStyle;
+                            rmatS.symbol = cs.symbol;
+                            rmatS.symbolSize = cs.symbolSize;
+                            rmatS.showSymbol = cs.showSymbol;
+                            rmatS.polarIndex = cs.polarIndex;
+                            rmatS.z = cs.z;
+                            if (cs.itemStyle != null) {
+                                rmatS.itemStyle = ChartItemStyle.Clone(cs.itemStyle);
+                            }
+                            if (rmatIt2.IsObject()) {
+                                if (rmatIt2.Has("symbol")) {
+                                    rmatS.symbol = ChartKinds.SymbolSanitize(
+                                        rmatIt2.Str("symbol", ""));
+                                }
+                                if (rmatIt2.Has("symbolSize")) {
+                                    rmatS.symbolSize = rmatIt2.Int("symbolSize", 0);
+                                }
+                                JsonValue rmatLs = rmatIt2.Get("lineStyle");
+                                if (rmatLs != null && rmatLs.IsObject()) {
+                                    JsonValue rmatLc = rmatLs.Get("color");
+                                    if (rmatLc != null) {
+                                        rmatS.itemStyle.normal.lineStyle.color =
+                                            ChartOption.ParseColor(rmatLc, 0);
+                                    }
+                                    JsonValue rmatLw = rmatLs.Get("width");
+                                    if (rmatLw != null && rmatLw.IsNumber()) {
+                                        rmatS.itemStyle.normal.lineStyle.width =
+                                            (int)rmatLw.AsDouble(0.0);
+                                    }
+                                    string rmatLt = rmatLs.Str("type", "");
+                                    if (rmatLt.Length > 0) {
+                                        rmatS.itemStyle.normal.lineStyle.type = rmatLt;
+                                    }
+                                }
+                                JsonValue rmatIs = rmatIt2.Get("itemStyle");
+                                if (rmatIs != null && rmatIs.IsObject()) {
+                                    ChartOption.ParseItemStyle(rmatIs, rmatS.itemStyle);
+                                }
+                            }
+                            for (int rmatAj = 0; rmatAj < rmatVv2.Count();
+                                 rmatAj = rmatAj + 1) {
+                                double rmatDv = rmatVv2.At(rmatAj).AsDouble(0.0);
+                                int rmatKv = (int)(rmatDv >= 0.0
+                                    ? rmatDv * 1000.0 + 0.5
+                                    : rmatDv * 1000.0 - 0.5);
+                                ChartData rmatCd = ChartData.Of(0);
+                                rmatCd.val = rmatKv;
+                                rmatCd.number = (double)rmatKv;
+                                rmatCd.numberSet = true;
+                                rmatS.data.Add(rmatCd);
+                            }
+                            o.series.Add(rmatS);
+                        }
+                    } else { o.series.Add(cs); }
+                } else {
+                    o.series.Add(cs);
+                }
             }
         }
 

@@ -2707,3 +2707,25 @@ P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
     分块发射绕开，根治需堆化；② 符号索引把 .html 当 Zan 源扫描，
     报 `<unknown>:N:M: unexpected character` 非致命噪音（构建
     exit=0），应在索引侧跳过设计文档。
+* **雷达车道已修（2026-09-13 第二批）**：根因三个——①radar 系列的
+  data 项是值数组（对象 {value:[...],name} 或裸数组），旧标量车道
+  Double("value") 对数组取 0，全部多边形塌成圆心一个点（radar 主力
+  demo 即坏，radar2/radar-multiple/radar-aqi/radar-custom 同炸）；
+  ②radar.indicator[].name 从未解析，轴标签错拿图例文案；③纯组件
+  option（series:[] 只有 radar/polar）落 "(no data)"。修法：解析期
+  **值数组物化**——每个数据项物化成独立系列（图例取数据项名；未命名
+  继承系列名，radar-aqi 31 天同名正好吃到图例"同名系列随主项一起开
+  关"语义；样式拷源系列，逐项 symbol/symbolSize/lineStyle/itemStyle
+  覆写落物化系列），值 ×1000 定点（o.radarScaled），radarMax/
+  polars[].indicatorMax 同步放大（渲染公式 val×g×r/(maxV×1000) 在
+  milli/milli 下约掉 g），tooltip 显示走 FracText 除回（0.46 不再
+  丢）；radarNames 支持 ECharts5 name + ECharts2 text（doc-example/
+  radar 的 指标一..五）；DispatchKind 0 系列时 radarMax/radarNames→
+  "radar"、polars/angleAxes→"polarCoord"（两渲染器骨架路径 0 系列
+  本就安全）；顺修 SymbolSanitize 不认 ECharts5 标准名 "rect"（只认
+  旧名 rectangle）。实机：radar 双多边形+指示器名与官方一致、radar2
+  28 层多边形、radar-custom 4 项逐项符号、radar-aqi 星爆、doc radar
+  纯组件骨架（不再 no data）。conformance：chart_radar_values 九断言
+  金样。**遗留观察**：radar-multiple 双 polar 是否该分画两个圆心
+  （ECharts2 polar[] 缺省 center 语义）待对官方截图；radar-aqi 线宽
+  1/opacity 0.5 DrawPolar 固定 2px 不透未接。
