@@ -211,6 +211,11 @@ cmake --build build            # zanc, zan-lsp, zan-dap, tools
 Compile a single program: `build/zanc <file.zan> --auto-stdlib -o out.exe`
 Release build of a program: `build/zanc <file.zan> --auto-stdlib --publish -o out.exe`
 
+**Full CLI reference** — every zanc flag, cross target, env var, test recipe,
+and the known pitfalls: [`docs/ZANC_CLI.md`](docs/ZANC_CLI.md). When a build/
+publish/test command is unclear or "worked yesterday", check there first;
+update it in the same commit when changing argument parsing.
+
 ### CEF browser driver (optional)
 
 `Gui.Component.CefBrowser` ships as an opt-in native driver (`zan_cef` / on
