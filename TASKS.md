@@ -2530,11 +2530,15 @@ P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
   gui_html_widget_shadow=他会在途未跟踪用例、http_client_keepalive
   超时/http_forwarder_stream/mysql_async_nonblocking=Net 在途编辑、
   win_tray_screen_smoke/listview_scrollbar_drag=环境）；
-  **conformance_gui_compref 1 例运行期 FAIL（inner label by
-  caption）暂无法归因**：复跑时在途树已 bind 中断（Card1.Kind()
-  unresolved，Chart 会话新半提交），我的改动面（ChoiceGroup 死臂/
-  checker 诊断）与 Label caption 查找无因果路径——待树稳定后复查
-  挂账。
+  **conformance_gui_compref 1 例运行期 FAIL 已归因闭环**：不是回归
+  是契约翻转——a60aabb6 设计字段名优先（GenForm/FormBuilder 在
+  SetDesignText 后重申组件显式 name），Label 的 name 稳定为
+  Card1_InnerTitle，不再被 caption 覆盖；compref_test 仍按旧契约按
+  caption 查找故断言失败。（此前"编译失败"的判断建立在畸形 repro
+  上：缺 compref_app.html + BadgeCard.zcomp 两输入，正确输入集下是
+  运行期断言 FAIL。）测试已翻新为新契约（按
+  Shell_FieldName 查找、caption 作内容断言），COMPREF_OK，ctest
+  Passed；金样不变。
 * **skill 增删（rule 13）**：zan-compiler-internals（①）——
   exe 相对 auto-stdlib 的 A/B 大坑 + CellOf 闭账改记；
   zan-development（②③）——`x is T ?` 旧教训翻转（已修，22d75d0e）
