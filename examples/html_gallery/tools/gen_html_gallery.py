@@ -236,6 +236,15 @@ def esc(s):
     s = str(s)
     return s.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;")
 
+def kebab(kind):
+    """Pascal kind → zan-<kebab> 自定义元素名（与 DesignerHtml.KebabKey 同规则）。"""
+    out = ''
+    for i, ch in enumerate(kind):
+        if ch.isupper() and i > 0:
+            out += '-'
+        out += ch.lower()
+    return 'zan-' + out
+
 def attr(name, val):
     return ' %s="%s"' % (name, esc(val))
 
@@ -290,7 +299,7 @@ def emit_demo(kind, dw, dh, a, ind):
         out.append('%s<div id="%s"%s></div>' % (
             ind, did, geom(fx, fy, dw, dh)))
     else:
-        head = '%s<div id="%s" data-kind="%s"' % (ind, did, kind)
+        head = '%s<%s id="%s"' % (ind, kebab(kind), did)
         head += geom(fx, fy, dw, dh)
         if "of" in a:
             head += attr("data-of", a["of"])
@@ -313,7 +322,7 @@ def emit_demo(kind, dw, dh, a, ind):
             out.append('%s  <label%s%s>%s</label>' % (
                 ind, geom(12, 34, dw - 24, 28),
                 attr("style", "color:#6b7280"), esc(a["kid_label"])))
-        out.append('%s</div>' % ind)
+        out.append('%s</%s>' % (ind, kebab(kind)))
     return out
 
 lines = []
@@ -325,7 +334,7 @@ lines.append('<body data-zan-design id="HtmlGallery"%s%s%s%s%s>' % (
     attr("data-win-title", "HTML 组件全量画廊"), attr("data-win-center", "true"),
     attr("data-layout-mode", "1")))
 # 分类条：Tabs（带选中高亮）；页签由 code-behind 喂。
-lines.append('  <div id="Cats" data-kind="Tabs"%s></div>'
+lines.append('  <zan-tabs id="Cats"%s></zan-tabs>'
              % attr("data-fh", HEAD_H))
 
 for pi, (ptitle, items) in enumerate(PAGES):

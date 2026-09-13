@@ -119,17 +119,22 @@ token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
 - **设计稿必须是编译输入的第一个文件**——zanc 从第一份设计文档合成
   Main 与控件字段,放后面 = 字段全缺。
 - **写真 HTML 语义,不是全 div + data-* 的"类 HTML"**:凡 HTML 有原生
-  等价物的组件一律写原生标签,`data-kind` 只留给没有原生等价物的组件
-  (Avatar/Badge/Tag/Card/Chart…)——这正是 data-kind 协议的本意。全集:
-  `<button>文字`、`<label>文字`、`<textarea>初始值`、`<img src/alt>`、
-  `<input>` 按 type 七型(checkbox→Checkbox+checked、radio→Radio、
-  range→Slider、color→ColorPicker、number→InputNumber、date→DatePicker、
-  file→Upload,其余→Input+placeholder)、`<select><option>`(option 文本→
-  options,selected→value 下标,无 selected 默认第 0 项=浏览器语义)、
+  等价物的组件一律写原生标签。全集:`<button>文字`、`<label>文字`、
+  `<textarea>初始值`、`<img src/alt>`、`<input>` 按 type 七型
+  (checkbox→Checkbox+checked、radio→Radio、range→Slider、
+  color→ColorPicker、number→InputNumber、date→DatePicker、file→Upload,
+  其余→Input+placeholder)、`<select><option>`(option 文本→options,
+  selected→value 下标,无 selected 默认第 0 项=浏览器语义)、
   `<hr>`→Divider(void 无正文,文案走 `data-text`)、`<progress
-  value max>`→Progress(折算 percent)、`<p>正文`→Typography。原生属性
-  与 `data-x-*` 通道等价可混用(图片内容就该放 src)。复合属性
-  (props/columns)才用 `data-x-<键>='<JSON>'`。
+  value max>`→Progress(折算 percent)、`<p>正文`→Typography。
+  **没有原生等价物的组件写成 `zan-<kebab>` 自定义元素**(`zan-avatar`、
+  `zan-data-grid`、`zan-tabs`——HTML5 合法标签名,tokenizer 收连字符,
+  读端 TagKind 逐段大写反解回 Pascal kind);`data-kind` 只在"不标就
+  看不出"时发(裸 div 承载非 Panel kind、span 上的 Element 覆写),
+  裸 `<div>` 的 kind 兜底就是 Panel——布局壳(页面/卡片/格子)不标
+  任何 kind。原生属性与 `data-x-*` 通道等价可混用(图片内容就该放
+  src);复合属性(props/columns)才用 `data-x-<键>='<JSON>'`。
+  旧稿的 div+data-kind 写法导入通道永久保留,不必追改。
 - **裸 `<div>` 的 kind 兜底就是 Panel**:布局壳(页面/卡片/格子)不写
   `data-kind="Panel"`,剥掉后模型逐字节不变——只有"演示本尊"才值得
   标 kind。协议侧扩了原生映射后旧稿不会自动跟上:用
