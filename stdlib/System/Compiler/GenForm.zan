@@ -845,19 +845,38 @@ class GenForm {
         return out0;
     }
 
+    /// 发射一条字符串 SetProp：值超长（base64 资源等）时拆成
+    /// 多段字面量相加，绕开单字面量 4095 字符的词法上限。
+    static void EmitSetProp(StringBuilder b, string vn, string key,
+                            string v) {
+        b.Append("        " + vn + ".SetProp(\"");
+        b.Append(GenCommon.Esc(key));
+        b.Append("\", ");
+        int at = 0;
+        int n = 0;
+        while (at < v.Length) {
+            int take = v.Length - at;
+            if (take > 3000) { take = 3000; }
+            if (n > 0) { b.Append(" + "); }
+            b.Append("\"");
+            b.Append(GenCommon.Esc(v.Substring(at, take)));
+            b.Append("\"");
+            at = at + take;
+            n = n + 1;
+        }
+        if (n == 0) { b.Append("\"\""); }
+        b.Append(");\n");
+    }
+
     /// 应用 schema 级属性(options/placeholder/required/defOn)。
     static void FieldSetup(StringBuilder b, JsonValue o, string vn) {
         string opts = GenForm.JoinOpts(o);
         if (opts != null && opts.Length > 0) {
-            b.Append("        " + vn + ".SetProp(\"options\", \"");
-            b.Append(GenCommon.Esc(opts));
-            b.Append("\");\n");
+            GenForm.EmitSetProp(b, vn, "options", opts);
         }
         string placeholder = GenForm.ObjStr(o, "placeholder");
         if (placeholder.Length > 0) {
-            b.Append("        " + vn + ".SetProp(\"placeholder\", \"");
-            b.Append(GenCommon.Esc(placeholder));
-            b.Append("\");\n");
+            GenForm.EmitSetProp(b, vn, "placeholder", placeholder);
         }
         if (GenForm.ObjBool(o, "required")) {
             b.Append("        " + vn + ".SetProp(\"required\", \"true\");\n");
@@ -1130,9 +1149,7 @@ class GenForm {
          * 语义,优先于类规则):SetProp("style") 走 ApplyInline 通道。 */
         string dsty = GenForm.ObjStr(o, "style");
         if (dsty.Length > 0) {
-            body.Append("        " + vn + ".SetProp(\"style\", \"");
-            body.Append(GenCommon.Esc(dsty));
-            body.Append("\");\n");
+            GenForm.EmitSetProp(body, vn, "style", dsty);
         }
         /* 设计里的 props 是控件自有属性的直通表(滑块的 min/max、
          * 单选项的 option ...):键名就是控件 SetProp 认的名字。 */
@@ -1141,12 +1158,33 @@ class GenForm {
             for (int pi = 0; pi < dprops.Count(); pi = pi + 1) {
                 JsonValue pv = dprops.ValAt(pi);
                 if (pv == null) { continue; }
-                body.Append("        " + vn + ".SetProp(\"");
-                body.Append(GenCommon.Esc(dprops.KeyAt(pi)));
-                body.Append("\", \"");
-                body.Append(GenCommon.Esc(pv.AsString("")));
-                body.Append("\");\n");
+                GenForm.EmitSetProp(body, vn, dprops.KeyAt(pi),
+                                    pv.AsString(""));
             }
+        }
+        /* 建模直通:props 之外的字段级标量键(text/src/min/...)同样
+         * 落成 SetProp——html 的原生语义键(<button>文本 → "text"、
+         * <img src> → "src")与手写键由此等价,不再静默丢弃。上面
+         * 各分支已消费的建模键与事件键(onXxx)不进回退。 */
+        for (int si = 0; si < o.Count(); si = si + 1) {
+            string sk = o.KeyAt(si);
+            JsonValue sv = o.ValAt(si);
+            if (sv == null || !sv.IsString()) { continue; }
+            if (sk == "kind" || sk == "name" || sk == "tag"
+                || sk == "class" || sk == "style" || sk == "props"
+                || sk == "kids" || sk == "dock" || sk == "fx"
+                || sk == "fy" || sk == "fw" || sk == "fh"
+                || sk == "bind" || sk == "bindProp" || sk == "if"
+                || sk == "for" || sk == "columns" || sk == "of"
+                || sk == "options" || sk == "orient" || sk == "required"
+                || sk == "defOn" || sk == "placeholder") {
+                continue;
+            }
+            if (sk.Length > 3 && HtmlText.StartsWith(sk, "on")
+                && sk[2] >= 65 && sk[2] <= 90) {
+                continue;   // onClick 等事件键由接线通道消费
+            }
+            GenForm.EmitSetProp(body, vn, sk, sv.AsString(""));
         }
         /* Tabs 标签条方向:设计器建模键 orient 存选项名,横排是
          * 默认不发射,纵排落成 SetProp(PropSpec 收枚举选项名)。 */

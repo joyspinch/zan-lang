@@ -28,8 +28,10 @@ namespace System.Web;
 ///     字符串值不作数字/布尔嗅探，props 的 "min":"0" 不会漂成数字。
 ///   - options（字符串数组）→ data-options="a|b|c"（与 JoinOpts 同
 ///     分隔，| 内嵌限制相同）。
-///   - 属性值统一实体转义（& < > "）；元素不发裸文本（文本内容全在
-///     属性里），规避 HTML 空白塌缩。
+///   - 属性值统一实体转义（& < > "）；原生语义发原生形态——img 的
+///     src/alt、input/textarea 的 placeholder/value 发真属性，
+///     button/label/textarea 的 text 发元素文本（读端与 data-* 通道
+///     等价），其余键全在属性里，规避 HTML 空白塌缩。
 class DesignerHtml {
     /// 是否设计器文档：body 带 data-zan-design 标记。标记是裸属性
     /// （值为空串），不能用 Attr(...) != "" 判——那样存在与缺失
@@ -142,6 +144,24 @@ class DesignerHtml {
             if (key == "kids") {
                 continue;   // 收尾统一发子元素
             }
+            // 原生语义键发原生属性/文本：img 的 src/alt、input/textarea
+            // 的 placeholder/value 发真 HTML 属性；button/label/textarea
+            // 的 text 发元素文本（收尾）——文档读起来就是真 HTML。
+            if (kind == "Image" && (key == "src" || key == "alt")) {
+                string nv = v.IsString() ? v.AsString("") : "";
+                if (nv != "") { b.Append(" " + key + "=\"" + EscapeAttr(nv) + "\""); }
+                continue;
+            }
+            if ((kind == "Input" || kind == "TextArea")
+                && (key == "placeholder" || key == "value")) {
+                string pv = v.IsString() ? v.AsString("") : "";
+                if (pv != "") { b.Append(" " + key + "=\"" + EscapeAttr(pv) + "\""); }
+                continue;
+            }
+            if ((kind == "Button" || kind == "Label" || kind == "TextArea")
+                && key == "text") {
+                continue;   // 收尾发元素文本
+            }
             AppendKey(b, v, key, 1);
         }
         JsonValue kids = o.Get("kids");
@@ -156,6 +176,14 @@ class DesignerHtml {
         if (tag == "input" || tag == "img") {
             b.Append(" />\n");
             return;
+        }
+        JsonValue tv = o.Get("text");
+        if (tv != null && tv.IsString()) {
+            string ts = tv.AsString("");
+            if (ts != "") {
+                b.Append(">" + EscapeAttr(ts) + "</" + tag + ">\n");
+                return;
+            }
         }
         b.Append("></" + tag + ">\n");
     }
@@ -185,9 +213,34 @@ class DesignerHtml {
                 if (v != "") { o.Put("style", JsonValue.NewStr(v)); }
                 continue;
             }
+            // 原生 HTML 属性 → 建模键：<img src/alt>、input/textarea
+            // 的 placeholder/value。与 data-* 通道写进同一个键空间
+            // （src="x" ≡ data-src="x"），读端不分来源。
+            if (a == "src" || a == "alt" || a == "placeholder"
+                || a == "value") {
+                if (v != "") { o.Put(a, JsonValue.NewStr(v)); }
+                continue;
+            }
             if (a.Length > 5 && HtmlText.StartsWith(a, "data-")) {
                 PutAttr(o, a.Substring(5), v);
             }
+        }
+        // 原生文本内容 → "text" 键：<button>点我</button>、<label>…</label>
+        // 的可见文字、<textarea> 的初始值——与 data-text 等价。button/
+        // textarea 是解析器的捕获控件（文本汇总在节点 text 上），其余
+        // 标签从文本片拼。
+        string nk = o.Str("kind", "");
+        if (nk == "Button" || nk == "Label" || nk == "TextArea") {
+            string txt = n.text;
+            if (txt == "") {
+                for (int i = 0; i < n.items.Count; i = i + 1) {
+                    WItem it = n.items[i];
+                    if (it.kid >= 0 || it.text == "") { continue; }
+                    txt = txt + it.text;
+                }
+            }
+            txt = txt.Trim();
+            if (txt != "") { o.Put("text", JsonValue.NewStr(txt)); }
         }
         JsonValue kids = JsonValue.NewArray();
         for (int i = 0; i < n.items.Count; i = i + 1) {
