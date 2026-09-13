@@ -17,6 +17,14 @@ if(NOT ZANC OR NOT SRC OR NOT OUT_EXE)
   message(FATAL_ERROR "run_leakcheck.cmake: ZANC, SRC and OUT_EXE are required")
 endif()
 
+# The compiled program runs from the repo root by default (see run_case.cmake):
+# the generic add_test registrations pass no WORKDIR, and ctest's build-dir
+# default breaks any case that opens repo-relative fixture paths.
+if(NOT WORKDIR AND CMAKE_SCRIPT_MODE_FILE)
+  get_filename_component(_script_dir "${CMAKE_SCRIPT_MODE_FILE}" DIRECTORY)
+  get_filename_component(WORKDIR "${_script_dir}/.." ABSOLUTE)
+endif()
+
 
 # ---- up-to-date check ------------------------------------------------------
 # Re-running the suite must not recompile programs whose inputs did not change:
@@ -85,6 +93,7 @@ while(TRUE)
   math(EXPR _run_attempt "${_run_attempt} + 1")
   execute_process(
     COMMAND ${OUT_EXE}
+    WORKING_DIRECTORY ${WORKDIR}
     RESULT_VARIABLE run_rc
     OUTPUT_VARIABLE run_out
     ERROR_VARIABLE  run_err)

@@ -2587,12 +2587,29 @@ P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
   混色，精确 hex 匹配天然 MISS）；dynamic-data2 / line-easing（官方 SSR
   定格动画起始帧，引擎画终态=实机终态）；line-tooltip-touch #7581BD
   IoU 0.01（oracle 只收 stroke path，label 盒是 fill rect）。
-* **挂账（测试基建，另立提交）**：standard 层 10 例因"用例读仓库相对
-  路径文件 + ctest 默认 cwd=build/"失败（dataminmax/cat_backfill/
-  force_params/series_zorder/tree_depth/http_forwarder_stream/win_tray/
-  gui_chart_calendar/barminheight/policy_gallery_coverage）；手工从根目录
-  5 个 conformance 全 MATCH 证非引擎回归。修法 = add_test 统一补
-  `WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}`。
+* **已闭账（测试基建，2026-09-13）**：standard 层 10 例失败初判"用例读仓库
+  相对路径 + ctest 默认 cwd=build/"。实测拆三类：①cwd 问题只占 chart 5 例
+  （dataminmax/cat_backfill/force_params/series_zorder/tree_depth）及其
+  leakcheck/arcguard twins——修法未走 add_test 逐个补，而是 run_case.cmake/
+  run_leakcheck.cmake/run_arcguard.cmake 三脚本统一默认
+  `WORKDIR=仓库根`（由 CMAKE_SCRIPT_MODE_FILE 推导，显式 -DWORKDIR 仍优先），
+  全部转绿；②win_tray/policy_gallery_coverage 在近期提交中已自愈。
+* **挂账（http 车道，真实行为差异）**：conformance_http_forwarder_stream
+  期望 `echo-body: hello-upstream`、实际 `echo-body: keep-alive`（其余 9 项
+  全过，端口绑定正常非 cwd）——转发器流式 keep-alive 复用后 echo 请求读到
+  上一个响应体，待修 src/runtime http 流缓冲。
+* **挂账（charts 车道，渲染缺口非基建）**：conformance_gui_chart_calendar
+  （FAIL render spread custom-calendar-icon）与 conformance_gui_chart_
+  barminheight（FAIL stacked positive/negative segment drawn）均为内容
+  断言失败——calendar 已显式 -DWORKDIR=源树根仍挂，证与 cwd 无关，归
+  charts 会话在途工作收口。
+* **观察（并发构建污染，非回归）**：2026-09-13 standard 档期间
+  zanc.exe/zan_gui.dll 被并行会话在途 gui 改动反复重链（21:11/21:14/
+  21:20 三次），跑出的 gui/http 失败是移动靶：http_client_keepalive 在
+  安静窗口单跑即过；gui_listview_scrollbar_drag（Timeout）、
+  gui_httpsource 在 dll 持续重链下无法归因，留给 gui 会话收口后复核。
+  教训：test.ps1 的预构建会把工作树里他人在途改动编进产物，并发期
+  standard 结果不可作归因依据。
 * **挂账（本轮悬停修复的 standard 层，待安静窗口补跑）**：ChartView
   悬停槽改造（Keyed 每帧新建实例 → 跨帧悬停状态进 wid 槽）+ 命中
   变化补调度一帧 + 类目线点 item 悬停卡，实机 bump-chart 渐隐/值卡

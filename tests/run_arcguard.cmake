@@ -24,6 +24,14 @@ if(NOT ZANC OR NOT SRC OR NOT OUT_EXE)
   message(FATAL_ERROR "run_arcguard.cmake: ZANC, SRC and OUT_EXE are required")
 endif()
 
+# The compiled program runs from the repo root by default (see run_case.cmake):
+# the generic add_test registrations pass no WORKDIR, and ctest's build-dir
+# default breaks any case that opens repo-relative fixture paths.
+if(NOT WORKDIR AND CMAKE_SCRIPT_MODE_FILE)
+  get_filename_component(_script_dir "${CMAKE_SCRIPT_MODE_FILE}" DIRECTORY)
+  get_filename_component(WORKDIR "${_script_dir}/.." ABSOLUTE)
+endif()
+
 # ---- up-to-date check ------------------------------------------------------
 # The artifact is a pure function of (source, compiler, stdlib); reuse it when
 # it is newer than all three. STDLIB_STAMP is touched whenever a stdlib source
@@ -72,20 +80,12 @@ endif()
 set(_run_attempt 0)
 while(TRUE)
   math(EXPR _run_attempt "${_run_attempt} + 1")
-  if(WORKDIR)
-    execute_process(
-      COMMAND ${OUT_EXE}
-      WORKING_DIRECTORY ${WORKDIR}
-      RESULT_VARIABLE run_rc
-      OUTPUT_VARIABLE run_out
-      ERROR_VARIABLE  run_err)
-  else()
-    execute_process(
-      COMMAND ${OUT_EXE}
-      RESULT_VARIABLE run_rc
-      OUTPUT_VARIABLE run_out
-      ERROR_VARIABLE  run_err)
-  endif()
+  execute_process(
+    COMMAND ${OUT_EXE}
+    WORKING_DIRECTORY ${WORKDIR}
+    RESULT_VARIABLE run_rc
+    OUTPUT_VARIABLE run_out
+    ERROR_VARIABLE  run_err)
   if((run_rc MATCHES "[cC]0000043" OR run_rc MATCHES "[cC]0000022")
      AND _run_attempt LESS 6)
     execute_process(COMMAND ${CMAKE_COMMAND} -E sleep 0.4)

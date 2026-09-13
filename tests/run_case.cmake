@@ -19,6 +19,16 @@ if(NOT ZANC OR NOT SRC OR NOT EXPECTED OR NOT OUT_EXE)
   message(FATAL_ERROR "run_case.cmake: ZANC, SRC, EXPECTED and OUT_EXE are required")
 endif()
 
+# The compiled program runs from the repo root by default (this script lives in
+# tests/), so a case can read repo-relative fixtures no matter where ctest was
+# launched from — the generic add_test registrations pass no WORKDIR of their
+# own, and ctest's build-dir default breaks any case that opens "tests/..."
+# or "stdlib/..." relative paths.
+if(NOT WORKDIR AND CMAKE_SCRIPT_MODE_FILE)
+  get_filename_component(_script_dir "${CMAKE_SCRIPT_MODE_FILE}" DIRECTORY)
+  get_filename_component(WORKDIR "${_script_dir}/.." ABSOLUTE)
+endif()
+
 
 # ---- up-to-date check ------------------------------------------------------
 # Re-running the suite must not recompile programs whose inputs did not change:
@@ -79,20 +89,12 @@ endif()
 set(_run_attempt 0)
 while(TRUE)
   math(EXPR _run_attempt "${_run_attempt} + 1")
-  if(WORKDIR)
-    execute_process(
-      COMMAND ${OUT_EXE} ${RUN_ARGS}
-      WORKING_DIRECTORY ${WORKDIR}
-      RESULT_VARIABLE run_rc
-      OUTPUT_VARIABLE actual
-      ENCODING UTF-8)
-  else()
-    execute_process(
-      COMMAND ${OUT_EXE} ${RUN_ARGS}
-      RESULT_VARIABLE run_rc
-      OUTPUT_VARIABLE actual
-      ENCODING UTF-8)
-  endif()
+  execute_process(
+    COMMAND ${OUT_EXE} ${RUN_ARGS}
+    WORKING_DIRECTORY ${WORKDIR}
+    RESULT_VARIABLE run_rc
+    OUTPUT_VARIABLE actual
+    ENCODING UTF-8)
   if((run_rc MATCHES "[cC]0000043" OR run_rc MATCHES "[cC]0000022")
      AND _run_attempt LESS 6)
     execute_process(COMMAND ${CMAKE_COMMAND} -E sleep 0.4)
