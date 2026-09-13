@@ -31,6 +31,8 @@ class ChartSvgMap {
         ChartSvgMap.Push(tf, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
         List<ChartSvgShape> shapes = new List<ChartSvgShape>();
         List<string> skip = new List<string>();
+        List<string> gnames = new List<string>();
+        gnames.Add("");
         string svg = e.svg;
         int n = svg.Length;
         int i = 0;
@@ -39,7 +41,7 @@ class ChartSvgMap {
             if (lt < 0) { break; }
             int gt = svg.IndexOf(">", lt);
             if (gt < 0) { break; }
-            ChartSvgMap.Tag(svg, lt, gt, tf, skip, shapes);
+            ChartSvgMap.Tag(svg, lt, gt, tf, skip, shapes, gnames);
             i = gt + 1;
         }
         // 形状 → 区域；同名的多形状并成一个区域的多条环
@@ -47,11 +49,18 @@ class ChartSvgMap {
         for (int s = 0; s < shapes.Count; s = s + 1) {
             ChartSvgShape sh = shapes[s];
             if (sh.rings.Count < 1) { continue; }
+            if (sh.name.Length == 0) {
+                // 未命名形状（海面/背景/装饰）不构成可交互区域：
+                // 官方区域名来自 name/data-name/id（id 兜底已在
+                // RegionName 做）。这些大形状的环是曲线端点近似
+                // （本扫描器精度约定），一旦可命中，悬停强调会把
+                // 巨形弦多边形盖在光栅底图上；只描边的线稿在收集
+                // 侧已被 NoFill 挡掉。
+                continue;
+            }
             int dst = 0 - 1;
-            if (sh.name.Length > 0) {
-                for (int r = 0; r < e.regions.Count; r = r + 1) {
-                    if (e.regions[r].name == sh.name) { dst = r; break; }
-                }
+            for (int r = 0; r < e.regions.Count; r = r + 1) {
+                if (e.regions[r].name == sh.name) { dst = r; break; }
             }
             if (dst >= 0) {
                 for (int k = 0; k < sh.rings.Count; k = k + 1) {
@@ -93,9 +102,12 @@ class ChartSvgMap {
     }
 
     /// 处理一个标签：闭标签弹仿射栈/跳过栈；开标签解析 transform、
-    /// 形状出几何。lt/gt 是 '<'/'>' 下标。
+    /// 形状出几何。lt/gt 是 '&lt;'/'&gt;' 下标。gnames 是 g 的 name
+    /// 栈（官方 flight-seats 把座位名写在 &lt;g name="..."&gt; 上，
+    /// 形状继承最近一个非空祖先组名）。
     static void Tag(string svg, int lt, int gt, List<double> tf,
-                    List<string> skip, List<ChartSvgShape> shapes) {
+                    List<string> skip, List<ChartSvgShape> shapes,
+                    List<string> gnames) {
         if (lt + 1 >= gt) { return; }
         bool close = svg[lt + 1] == '/';
         int name0 = close ? lt + 2 : lt + 1;
@@ -112,6 +124,9 @@ class ChartSvgMap {
         if (close) {
             if (name == "g" && tf.Count > 6) {
                 for (int k = 0; k < 6; k = k + 1) { tf.RemoveAt(tf.Count - 1); }
+            }
+            if (name == "g" && gnames.Count > 1) {
+                gnames.RemoveAt(gnames.Count - 1);
             }
             if (skip.Count > 0 && skip[skip.Count - 1] == name) {
                 skip.RemoveAt(skip.Count - 1);
@@ -130,6 +145,7 @@ class ChartSvgMap {
                 ga = m[0]; gb = m[1]; gc = m[2]; gd = m[3]; ge = m[4]; gf = m[5];
             }
             ChartSvgMap.Push(tf, ga, gb, gc, gd, ge, gf);
+            gnames.Add(ChartSvgMap.Attr(svg, name1, gt, "name"));
         }
         if (skip.Count > 0) {
             if (!selfClose && ChartSvgMap.IsSkipEl(name)) { skip.Add(name); }
@@ -146,19 +162,50 @@ class ChartSvgMap {
                 List<double> m2 = ChartSvgMap.ParseTransform(str, a, b, c, d, ee, f);
                 a = m2[0]; b = m2[1]; c = m2[2]; d = m2[3]; ee = m2[4]; f = m2[5];
             }
-            string nm = ChartSvgMap.RegionName(svg, name1, gt);
+            // 区域名优先级：形状自身 name= > data-name= > 最近
+            // 非空祖先 g 的 name= > 形状 id=。
+            string nm = ChartSvgMap.Attr(svg, name1, gt, "name");
+            if (nm.Length == 0) { nm = ChartSvgMap.Attr(svg, name1, gt, "data-name"); }
+            if (nm.Length == 0) {
+                for (int gi = gnames.Count - 1; gi > 0; gi = gi - 1) {
+                    if (gnames[gi].Length > 0) { nm = gnames[gi]; break; }
+                }
+            }
+            if (nm.Length == 0) { nm = ChartSvgMap.Attr(svg, name1, gt, "id"); }
             List<ChartMapRing> rings = ChartSvgMap.ShapeRings(
                 name, svg, name1, gt, a, b, c, d, ee, f);
-            if (rings.Count > 0) { shapes.Add(ChartSvgShape.Of(nm, rings)); }
+            if (rings.Count > 0 && !ChartSvgMap.NoFill(svg, name1, gt)) {
+                shapes.Add(ChartSvgShape.Of(nm, rings));
+            }
         }
     }
 
-    /// 区域名优先级 name= > data-name= > id=。
-    static string RegionName(string svg, int from, int to) {
-        string nm = ChartSvgMap.Attr(svg, from, to, "name");
-        if (nm.Length == 0) { nm = ChartSvgMap.Attr(svg, from, to, "data-name"); }
-        if (nm.Length == 0) { nm = ChartSvgMap.Attr(svg, from, to, "id"); }
-        return nm;
+    /// 形状是否不铺面（fill="none"/transparent、fill-opacity 0、
+    /// style fill:none）：只描边的形状是装饰性线稿（冰岛图的
+    /// trip1/trip2 红色路线）。官方命中语义对这类元素只认描边带；
+    /// 本扫描器曲线只取端点，线稿折线化必是横跨半图的弦多边形，
+    /// 进区域表会让悬停强调在光栅底图上盖出巨形半透明多边形
+    /// （geo-svg-scatter-simple 悬停海面出半屏三角的根因）。
+    /// fill 只认元素自身属性/内联 style——显式 fill="none" 必然
+    /// 压倒任何祖先继承，无需上溯仿照完整 CSS 级联。
+    static bool NoFill(string svg, int from, int to) {
+        string fill = ChartSvgMap.Attr(svg, from, to, "fill");
+        if (fill == "none" || fill == "transparent") { return true; }
+        string fo = ChartSvgMap.Attr(svg, from, to, "fill-opacity");
+        if (fo.Length > 0 && ChartSvgMap.UnitNum(fo) <= 0.0) { return true; }
+        string st = ChartSvgMap.Attr(svg, from, to, "style");
+        int p = st.IndexOf("fill:");
+        if (p >= 0) {
+            int q = p + 5;
+            while (q < st.Length && (st[q] == 32 || st[q] == 9)) { q = q + 1; }
+            int e = q;
+            while (e < st.Length && st[e] != 59 && st[e] != 32) { e = e + 1; }
+            if (e > q) {
+                string v = st.Substring(q, e - q);
+                if (v == "none" || v == "transparent") { return true; }
+            }
+        }
+        return false;
     }
 
     /// 一个形状元素的环组（折线化）。line 无法成面，跳过。
@@ -231,12 +278,12 @@ class ChartSvgMap {
         ChartSvgCursor cs = ChartSvgCursor.Of(dd, 0, dd.Length);
         double cx = 0.0; double cy = 0.0;
         double sx = 0.0; double sy = 0.0;
-        int cmd = 0;  // 上一命令字母（大写）；0 = 尚未开始
+        int cmd = 0;  // 上一命令字母（保留大小写：大小写即绝对/相对语义）；0 = 尚未开始
         while (true) {
             int ch = cs.Peek();
             if (ch == 0) { break; }
             if ((ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122)) {
-                cmd = ch >= 97 ? ch - 32 : ch;
+                cmd = ch;
                 cs.i = cs.i + 1;
             }
             if (cmd == 0) { break; }

@@ -275,12 +275,15 @@ partial class ChartView {
         // 的 isGeoBase 系列（ChartModel 的 geo 合成块），没有它时退回
         // 首个"真的带几何"的 map 系列（用户直接写 series[].type=map）。
         ChartSeries lead = ChartView.MapBaseSeries(o);
-        if (lead == null || lead.regions.Count < 1) { return; }
         // SVG 地图：底图纹理 + 按名覆盖填充（见 DrawSvgMode 语义）。
-        ChartMapEntry mapEntry = lead.mapName.Length > 0
+        ChartMapEntry mapEntry = lead != null && lead.mapName.Length > 0
             ? ChartMaps.Find(lead.mapName) : null;
         bool svgMode = mapEntry != null && mapEntry.svg.Length > 0;
         if (svgMode) { ChartMaps.EnsureScanned(mapEntry); }
+        // SVG 底图零命名区域（纯装饰素材）也要画光栅底图——官方
+        // 语义是 SVG 原样渲染、区域只叠加交互；矢量地图才依赖
+        // regions，空表直接退。
+        if (lead == null || (!svgMode && lead.regions.Count < 1)) { return; }
 
         int plotX = x;
         int plotY = top;
@@ -733,7 +736,8 @@ partial class ChartView {
         // lines 折线/迁徙 + 散点，坐标经 GeoProject 按底图同一仿射
         // 换算（roam 缩放平移联动）。series.geoIndex 选中所属 geo，
         // 缺省 0（单 geo 场景）。silent 系列不响应命中。
-        ChartView.DrawGeoOverlay(app, o, layout, plotX, plotY, plotW, plotH, g);
+        ChartView.DrawGeoOverlay(app, o, layout, plotX, plotY, plotW, plotH,
+            svgMode, g);
     }
 
     /// 地图布局 → geo 经纬度（0.01° 定点）的投影换算：lng/lat
@@ -746,11 +750,28 @@ partial class ChartView {
         return l.offY + (long)(latQ - l.minY) * (long)l.scale / 1000;
     }
 
+    /// SVG 底图版投影：布局源框是 SVG 用户单位（y 向下、原始
+    /// 精度），而 geo 系列坐标经 GeoQ 变成 0.01 定点且 y 已按
+    /// 纬度向上约定取反——X 把定点除回 100 同框映射；Y 先翻回
+    /// y 向下再映射。不换算的话点被投影到 ±3 万像素外再被绘图
+    /// 区裁掉，geo-svg-scatter-simple 的散点整组不可见（静态
+    /// 好看、悬停没目标）。GeoJSON 底图两侧同为 0.01 定点纬度
+    /// 向上，走原投影。
+    static int ProjX(MapLayout l, int lngQ, bool svgUnits) {
+        if (!svgUnits) { return ChartView.GeoProjectX(l, lngQ); }
+        return l.offX + (long)(lngQ - 100L * l.minX) * (long)l.scale / 100000;
+    }
+    static int ProjY(MapLayout l, int latQ, bool svgUnits) {
+        if (!svgUnits) { return ChartView.GeoProjectY(l, latQ); }
+        return l.offY + (long)((0 - latQ) - 100L * l.minY) * (long)l.scale / 100000;
+    }
+
     /// geo 坐标系叠加渲染（DrawMap 末段调用）：逐系列画 lines
     /// 折线（curveness 弯曲 / dotted 虚线）与散点（带名标签）。
     /// 命中经 OfferActiveHit 出 tooltip（silent 系列跳过）。
     static void DrawGeoOverlay(App app, ChartOption o, MapLayout layout,
-                               int plotX, int plotY, int plotW, int plotH, int g) {
+                               int plotX, int plotY, int plotW, int plotH,
+                               bool svgUnits, int g) {
         if (layout.scale <= 0) { return; }
         Canvas c = app.canvas;
         Theme t = app.theme;
@@ -786,10 +807,10 @@ partial class ChartView {
                     if (cv > 0) {
                         // 弯曲连线：控制点 = 弦中点垂直偏移
                         // curveness×弦长（与 force 边同语义）。
-                        int x0 = ChartView.GeoProjectX(layout, line[0].x);
-                        int y0 = ChartView.GeoProjectY(layout, line[0].y);
-                        int x1 = ChartView.GeoProjectX(layout, line[line.Count - 1].x);
-                        int y1 = ChartView.GeoProjectY(layout, line[line.Count - 1].y);
+                        int x0 = ChartView.ProjX(layout, line[0].x, svgUnits);
+                        int y0 = ChartView.ProjY(layout, line[0].y, svgUnits);
+                        int x1 = ChartView.ProjX(layout, line[line.Count - 1].x, svgUnits);
+                        int y1 = ChartView.ProjY(layout, line[line.Count - 1].y, svgUnits);
                         int dxg = x1 - x0;
                         int dyg = y1 - y0;
                         int cxq = (x0 + x1) / 2 + (0 - dyg) * cv / 1000;
@@ -800,16 +821,16 @@ partial class ChartView {
                         List<int> fx = new List<int>();
                         List<int> fy = new List<int>();
                         for (int pi = 0; pi < line.Count; pi = pi + 1) {
-                            fx.Add(ChartView.GeoProjectX(layout, line[pi].x) * 256);
-                            fy.Add(ChartView.GeoProjectY(layout, line[pi].y) * 256);
+                            fx.Add(ChartView.ProjX(layout, line[pi].x, svgUnits) * 256);
+                            fy.Add(ChartView.ProjY(layout, line[pi].y, svgUnits) * 256);
                         }
                         string lt = s.itemStyle.normal.lineStyle.type;
                         if (lt == "dotted" || lt == "dashed") {
                             List<int> pxl = new List<int>();
                             List<int> pyl = new List<int>();
                             for (int pi2 = 0; pi2 < line.Count; pi2 = pi2 + 1) {
-                                pxl.Add(ChartView.GeoProjectX(layout, line[pi2].x));
-                                pyl.Add(ChartView.GeoProjectY(layout, line[pi2].y));
+                                pxl.Add(ChartView.ProjX(layout, line[pi2].x, svgUnits));
+                                pyl.Add(ChartView.ProjY(layout, line[pi2].y, svgUnits));
                             }
                             int dl = app.Scale(2);
                             int gl = app.Scale(2);
@@ -824,10 +845,10 @@ partial class ChartView {
                 // 线命中：指针到各线段距离 < 6px。
                 if (!s.silent && line.Count >= 2) {
                     for (int pi3 = 0; pi3 + 1 < line.Count; pi3 = pi3 + 1) {
-                        int ax = ChartView.GeoProjectX(layout, line[pi3].x);
-                        int ay = ChartView.GeoProjectY(layout, line[pi3].y);
-                        int bx = ChartView.GeoProjectX(layout, line[pi3 + 1].x);
-                        int by = ChartView.GeoProjectY(layout, line[pi3 + 1].y);
+                        int ax = ChartView.ProjX(layout, line[pi3].x, svgUnits);
+                        int ay = ChartView.ProjY(layout, line[pi3].y, svgUnits);
+                        int bx = ChartView.ProjX(layout, line[pi3 + 1].x, svgUnits);
+                        int by = ChartView.ProjY(layout, line[pi3 + 1].y, svgUnits);
                         int hitP = ChartView.DistToSeg(mx, my, ax, ay, bx, by);
                         if (hitP < app.Scale(6)) {
                             string nm = line[0].name.Length > 0 ? line[0].name
@@ -870,8 +891,8 @@ partial class ChartView {
             }
             for (int pi4 = 0; pi4 < s.points.Count; pi4 = pi4 + 1) {
                 ChartPoint p = s.points[pi4];
-                int px2 = ChartView.GeoProjectX(layout, p.x);
-                int py2 = ChartView.GeoProjectY(layout, p.y);
+                int px2 = ChartView.ProjX(layout, p.x, svgUnits);
+                int py2 = ChartView.ProjY(layout, p.y, svgUnits);
                 if (px2 < plotX - app.Scale(20) || px2 >= plotX + plotW + app.Scale(20)
                     || py2 < plotY - app.Scale(20) || py2 >= plotY + plotH + app.Scale(20)) {
                     continue;
@@ -902,6 +923,18 @@ partial class ChartView {
                     ph.numberValueSet = true;
                     ph.numberValue = p.z;
                     ChartView.OfferActiveHit(ph);
+                    // 悬停卡：geo 散点此前只发事件不画卡——地图车道
+                    // 只给区域画卡（hit>=0 分支），官方 geo + 散点
+                    // demo（geo-svg-scatter-simple）悬停点出值卡。
+                    if (o.showTooltip) {
+                        List<TooltipRow> rows = new List<TooltipRow>();
+                        if (p.name.Length > 0) { rows.Add(TooltipRow.Of(0, p.name)); }
+                        rows.Add(TooltipRow.Of(pcol,
+                            s.name.Length > 0
+                                ? s.name + "  " + Convert.ToString(p.z)
+                                : Convert.ToString(p.z)));
+                        ChartView.TooltipCard(app, mx, my, plotX + plotW, rows);
+                    }
                 }
                 if (s.labelShow && p.name.Length > 0
                     && (s.labelPos == "right" || s.labelPos.Length == 0)) {

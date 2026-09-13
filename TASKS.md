@@ -136,7 +136,7 @@ A32（遗留收尾路线）、A33-A47（专项记录）、文末"已撤回的结
   显式布局整体降成「对齐载体 + 字节块」，字段按偏移字节 GEP 定址；缺偏移/未对齐/
   带虚方法都会报错。用例 `explicit_layout.zan`，708/708。
   **未做**：`Pack = n`、顺序布局类型的 `[FieldOffset]` 校验、stdlib 硬编码偏移改声明式（B5）。
-* **A2-3** [ ] 变参：加 `[DllImport(..., Variadic = true)]`。（`params` 已支持，属 C# 级变参，与 FFI 变参是两回事。）
+* **A2-3** [x] **变参已修（2026-09-14）**：`[DllImport(..., Variadic = true)]` 落地——声明参数即 C 变参被调方的固定前缀，调用可传更多实参落入 `...`。穿线：parser 解码命名属性 → `method_decl.is_variadic` → arity 三口径（checker `method_arity`/`method_accepts_argc` + irgen `method_accepts_arity`）放行超参调用并保留"至少 N 参"下限诊断（qualified 报源码级，bare 调用仍落 LLVM verifier=既有缺口）→ 声明点 `LLVMFunctionType` 带 isVarArg 且跳过 struct-ABI thunk → 尾参 C 默认提升（bool→0/1 i32、窄整→sext i32、f32→fpext f64，i64/指针原样）在 `coerce_args_to_params` 与 irgen_call 全局函数路径两处。conformance `dllimport_variadic`（printf：等参/超参/运行期 string/double/返回值）4 孪生绿；byte_buffer 等 extern 用例回归绿。契约文档 docs/ABI.md §6.4。（`params` 已支持，属 C# 级变参，与 FFI 变参是两回事。）
 * **A2-4** 🟡 半边完成（2026-08-08 复核）：`signext`/`zeroext` 已按声明类型自动贴 LLVM 属性
   （`irgen.c:419`、`irgen_abi.c:348/350`，commit `e6b01d53`）；**仍缺**：用户可见的
   `stdcall` / `CallConv` 调用约定属性（compiler 内 `stdcall` / `CallConv` 出现 0 次）。
@@ -2822,3 +2822,41 @@ P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
   生成含 this 的调用约定在 LLVM verify 报 "Invalid bitcast"——
   应在检查器报「extern 方法必须 static」诊断；探针复现于
   SegCursor.CmpKeyRaw 首版。
+* **geo-svg 悬停扰动闭账（2026-09-13 第五批，用户实机审查批次④）**：
+  用户报「鼠标经过对 SVG 的干扰依然存在」——geo-svg-scatter-simple
+  悬停海面时整图蒙上巨大半透明浅蓝三角形 + 弹 "trip2 0" 卡。三层
+  根因叠加，修讫于 ChartSvgMap/ChartViewMap/ChartModel：
+  ①**未命名形状不构成可交互区域**（官方 SVG 底图语义：交互区域只
+  来自 name/data-name/祖先 g name/id 命名形状）：冰岛 SVG 3061 个
+  形状仅 2 个命名（trip1/trip2），其余全是海面/装饰，旧扫描全部
+  收进 regions 逐个参与命中。
+  ②**fill="none" 线稿不可区域命中**：trip1/trip2 是 stroke-only
+  航线（NoFill 新判定：fill none/transparent、fill-opacity≤0、
+  style fill:），官方只做描边带命中；旧扫描把它们当实心多边形，
+  悬停海面误触航线 ring → emphasis 填充即「巨大三角」。
+  ③**SVG path 命令字母大小写即绝对/相对语义（根因）**：PathRings
+  解析时 `cmd = ch >= 97 ? ch - 32 : ch` 把大小写归一，小写相对
+  命令被当绝对执行，path15592 一条路径的后续点全部漂移成横跨
+  全图的弦多边形（SCANDBG 实证：改前 bbox (-59,-16)-(1729,1264)
+  4 点，改后 (1720,1248)-(1779,1264)）。修 `cmd = ch` 保留原样，
+  下游 `rel = cmd >= 97` 照常推导。
+  **顺带修复（同根排查揪出）**：(a) geo 散点/lines 数据被通用数值对
+  车道（×1000 定点）与 geo 专用车道（GeoQ ×100、y 取反）双路齐收，
+  一半点屏外一半屏内——ChartModel 数值对分支加 `coordSys != "geo"`
+  守卫；(b) SVG 底图坐标系（用户单位 ×1）与矢量地图（度 ×100）投影
+  混用导致 SVG 底图上散点全丢——ChartViewMap 新增 ProjX/ProjY
+  （svgUnits 分支按 viewBox 线性映射），effectScatter 六点落位与
+  官方一致；(c) geo 散点悬停只发事件不画卡——补 TooltipCard；
+  (d) ChartSvgMap 补 `<g name>` 组名继承（flight-seats 座位名全在
+  g 上，扫描后 regions 从 0 变 179）；(e) svgMode 零命名区域
+  （纯装饰素材）也要画光栅底图——`(!svgMode && regions.Count<1)`
+  才早退。回归：全量 sweep FLAG 182 与 HEAD 基线逐字节 IDENTICAL
+  （A/B 隔离出 +1 geo-seatmap-flight BLANK 即 (d)(e) 所修），
+  实机海面悬停干净、flight-seats 座位图完整渲染。
+  **挂账（app 层 DPI 鼠标空间错位，未修）**：150% DPI 下
+  `app.mouseX = (物理光标 − 窗口原点) × 1.5` 而画布 1:1 客户区
+  ——HITDBG3 同帧实证 px2=788 mx=1211（恰 ×1.5）。所有图表车道
+  的悬停命中在 ≥150% DPI 全体右下偏移（用户截图中区域卡总在光标
+  右下即此）。根子在 app/Win32Shell 层的 DPI 缩放约定，不在
+  Chart 作用域内；合成光标注入路径（UiDriver ev 1）直接给画布
+  坐标不受影响，自动化回归不受阻。
