@@ -1,0 +1,117 @@
+using System;
+using System.Data.ZanDb;
+using System.IO;
+
+/// <summary>
+/// SegmentWriter/SegmentFile 的一致性用例：写入 100 条有序记录
+/// （含墓碑）、重开点查（命中/墓碑/越界）、跨块扫描早停、
+/// 字节翻转后的腐坏检测。输出确定性，与 zandb_segment.out 比对。
+/// </summary>
+class ZanDbSegmentTest {
+    static int checks = 0;
+
+    static void Ok(bool cond, string what) {
+        checks = checks + 1;
+        if (cond) {
+            Console.WriteLine("ok " + Convert.ToString(checks) + " - " + what);
+        } else {
+            Console.WriteLine("FAIL " + Convert.ToString(checks) + " - " + what);
+        }
+    }
+
+    /// 收集扫描结果的钩子：遇到大于 stopKey 的键返回 false 早停。
+    static string stopKey = "";
+    static List<string> seenKeys = new List<string>();
+    static List<string> seenVals = new List<string>();
+    static List<int> seenOps = new List<int>();
+
+    static bool Collect(string key, string val, int op) {
+        if (stopKey.Length > 0 && String.CompareOrdinal(key, stopKey) > 0) {
+            return false;
+        }
+        seenKeys.Add(key);
+        seenVals.Add(val);
+        seenOps.Add(op);
+        return true;
+    }
+
+    static void Main() {
+        string path = "zandb_segment_tmp.zseg";
+        File.Delete(path);
+
+        // 1) 写入 k000..k099：i%10==7 的键写墓碑，其余写 "v"+i。
+        SegmentWriter w = SegmentWriter.Create(path);
+        Ok(!w.Failed(), "writer created");
+        for (int i = 0; i < 100; i = i + 1) {
+            string k = "k" + Convert.ToString(i).PadLeft(3, "0");
+            if (i % 10 == 7) {
+                w.Add(k, "", 2);
+            } else {
+                w.Add(k, "v" + Convert.ToString(i), 1);
+            }
+        }
+        Ok(w.Finish(), "finish ok");
+
+        // 2) 重开：元数据与点查。
+        SegmentFile seg = SegmentFile.Open(path);
+        Ok(seg.GetError() == "", "open clean");
+        Ok(seg.Count() == 100, "record count 100");
+
+        string v1 = "";
+        Ok(seg.Lookup("k000", out v1) == 1 && v1 == "v0", "lookup first");
+        string v2 = "";
+        Ok(seg.Lookup("k099", out v2) == 1 && v2 == "v99", "lookup last");
+        string v3 = "";
+        Ok(seg.Lookup("k007", out v3) == 2, "tombstone reported");
+        string v4 = "";
+        Ok(seg.Lookup("a000", out v4) == 0, "before range absent");
+        string v5 = "";
+        Ok(seg.Lookup("z000", out v5) == 0, "after range absent");
+        string v6 = "";
+        Ok(seg.Lookup("k050", out v6) == 1 && v6 == "v50", "lookup middle");
+
+        // 3) 范围扫描：k050 起到 k060 早停，跨块推进。
+        stopKey = "k060";
+        seenKeys = new List<string>();
+        seenVals = new List<string>();
+        seenOps = new List<int>();
+        int n = seg.Scan("k050", Collect);
+        Ok(n == 11, "scan yielded 11");
+        Ok(seenKeys[0] == "k050" && seenKeys[10] == "k060", "scan bounds");
+        Ok(seenVals[3] == "v53", "scan value");
+        Ok(seenOps[7] == 2, "scan tombstone op");
+
+        // 4) 全量扫描计数。
+        stopKey = "";
+        seenKeys = new List<string>();
+        int all = seg.Scan("a000", Collect);
+        Ok(all == 100, "full scan 100");
+
+        // 5) 腐坏检测：翻转记录区一个字节，重开后命中该块报腐坏。
+        seg.Close();
+        PageFile pf = PageFile.Open(path);
+        ByteBuffer one = ByteBuffer.Alloc(1);
+        pf.ReadAt(40, one, 1);
+        one.SeekRead(0);
+        int flipped = (one.ReadU8() ^ 255) & 255;
+        ByteBuffer wr = ByteBuffer.Alloc(1);
+        wr.WriteU8(flipped);
+        wr.SeekRead(0);
+        pf.WriteAt(40, wr.Raw(), 1);
+        pf.Close();
+        one.Free();
+        wr.Free();
+
+        SegmentFile bad = SegmentFile.Open(path);
+        Ok(bad.GetError() == "", "header/footer intact");
+        string bv = "";
+        int lr = bad.Lookup("k000", out bv);
+        Ok(lr == 0 && bad.GetError() != "", "corrupt block detected");
+        string bv2 = "";
+        Ok(bad.Lookup("a000", out bv2) == 0, "absent still absent on corrupt seg");
+        bad.Close();
+
+        Console.WriteLine("done " + Convert.ToString(checks) + " checks");
+        File.Delete(path);
+    }
+}
