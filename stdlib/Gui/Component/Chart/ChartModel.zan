@@ -7467,16 +7467,16 @@ class ChartOption {
                                 }
                             }
                         } else {
-                            // line/bar/scatter 共用：先按列样本推断缺省
-                            // 类目轴是否实为数值轴（ECharts 智能推断——
-                            // 全数值列 + 轴无显式类目 = value）。
+                            // line/bar/scatter 共用。官方的数值轴智能推断
+                            // 只发生在**解析期无 type** 时（axisModelCreator
+                            // .ts:143 `option.type || (data?'category':'value')`）；
+                            // 这里能见到 Category 且类目为空的唯一形态 =
+                            // 用户**显式声明**了 type:'category'（data 回填的
+                            // 类目轴 Count>0，无 type 空对象在解析期已是
+                            // Value）——显式 type 不得翻（data-transform-filter
+                            // 的 Year 列全数值，曾被翻成 value 轴后零锚域
+                            // 把 1950..2015 全钳到绘图区右缘）。
                             int xai2 = cs.axisIndex < o.xAxes.Count ? cs.axisIndex : 0;
-                            if (o.xAxes.Count > 0
-                                && o.xAxes[xai2].type == ChartAxisType.Category
-                                && o.xAxes[xai2].categories.Count == 0
-                                && ChartJsonDataset.ColNumeric(ds2, xcol)) {
-                                o.xAxes[xai2].type = ChartAxisType.Value;
-                            }
                             bool xIsCat = o.xAxes.Count > 0
                                 && o.xAxes[xai2].type == ChartAxisType.Category;
                             int yai2 = cs.axisIndex < o.yAxes.Count ? cs.axisIndex : 0;
@@ -8314,26 +8314,40 @@ class ChartJsonDataset {
             return;
         }
         if (type == "filter" && cfg != null && cfg.IsObject()) {
+            // 行号表沿用「rows[0] = 表头行」约定（sort 分支同款）——
+            // 此前从 r=1 起筛且不回填表头，结果集首条数据行被当表头
+            // 吃掉、末条被 RowCount 的 -1 截掉（data-transform-filter
+            // 的 1950 与最末年凭空消失）。noHdr 一并继承，否则无表头
+            // 上游的变换结果按 1 行表头错位读取。
             List<int> outRows = new List<int>();
-            for (int r = 1; r < from.rows.Count; r = r + 1) {
+            into.noHdr = from.noHdr;
+            int fhdr = from.HdrRows();
+            for (int h2 = 0; h2 < fhdr; h2 = h2 + 1) { outRows.Add(from.rows[h2]); }
+            for (int r = fhdr; r < from.rows.Count; r = r + 1) {
                 if (ChartJsonDataset.FilterRow(from, from.rows[r], cfg)) { outRows.Add(from.rows[r]); }
             }
             into.rows = outRows;
             return;
         }
         if (type == "sort" && cfg != null && (cfg.IsObject() || cfg.IsArray())) {
+            // 表头行留在槽 0 不参与比较（旧实现连表头一起插排，字符串
+            // 表头 vs 数值单元的序会把表头挤进数据段）；比较方向 = 
+            // key < outRows[j] 时右移（旧实现参数反序 = 比较器取反，
+            // 升序输入碰巧原样、乱序输入排出错序）。
             List<int> outRows = new List<int>();
-            if (from.rows.Count > 0) { outRows.Add(from.rows[0]); }
-            for (int sr = 1; sr < from.rows.Count; sr = sr + 1) { outRows.Add(from.rows[sr]); }
+            into.noHdr = from.noHdr;
+            int shdr = from.HdrRows();
+            for (int h3 = 0; h3 < shdr; h3 = h3 + 1) { outRows.Add(from.rows[h3]); }
+            for (int sr = shdr; sr < from.rows.Count; sr = sr + 1) { outRows.Add(from.rows[sr]); }
             List<JsonValue> cfgs = new List<JsonValue>();
             if (cfg.IsArray()) {
                 for (int ci = 0; ci < cfg.Count(); ci = ci + 1) { cfgs.Add(cfg.At(ci)); }
             } else { cfgs.Add(cfg); }
             // 稳定插入排序（行数典型几百，足够）。
-            for (int i2 = 1; i2 < outRows.Count; i2 = i2 + 1) {
+            for (int i2 = shdr; i2 < outRows.Count; i2 = i2 + 1) {
                 int key = outRows[i2];
                 int j = i2 - 1;
-                while (j >= 0 && ChartJsonDataset.RowLess(from, outRows[j], key, cfgs)) {
+                while (j >= shdr && ChartJsonDataset.RowLess(from, key, outRows[j], cfgs)) {
                     outRows[j + 1] = outRows[j];
                     j = j - 1;
                 }
