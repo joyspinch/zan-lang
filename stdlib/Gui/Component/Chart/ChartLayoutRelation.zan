@@ -400,40 +400,74 @@ class ForceLayout {
         if (rest < 1) { rest = 1; }
         int maxDisp = rad * 4;
         if (maxDisp < 8) { maxDisp = 8; }
+        // 模拟热循环跑在原生 int[] 上（坐标 xs/ys + CSR 邻接）。
+        // 开方绝不能走 ChartView.ISqrt：那是初值 r=v 的牛顿迭代，
+        // 大坐标要 ~17 次带 long 除法的收敛才到 √v，30 轮 × nn²
+        // 的内循环曾被它拖到单帧 8s（graph-webkit-dep nn=513）。
+        // Math.Sqrt 是硬件 sqrt；斥力侧另有 d²≥k² 剪枝（d≥k 本来
+        // 就不施力）。结果与原牛顿版一致（⌊√v⌋），布局逐位不变。
+        int[] xs = new int[nn];
+        int[] ys = new int[nn];
+        for (int i = 0; i < nn; i = i + 1) {
+            xs[i] = l.nodes[i].x;
+            ys[i] = l.nodes[i].y;
+        }
+        int en = l.edges.Count;
+        // CSR 邻接表：attraction 从逐节点全边扫描 O(n·en) 降 O(度)。
+        int[] adjStart = new int[nn + 1];
+        int[] ea = new int[en];
+        int[] eb = new int[en];
+        for (int ei = 0; ei < en; ei = ei + 1) {
+            ea[ei] = l.edges[ei].a;
+            eb[ei] = l.edges[ei].b;
+            adjStart[ea[ei] + 1] = adjStart[ea[ei] + 1] + 1;
+            adjStart[eb[ei] + 1] = adjStart[eb[ei] + 1] + 1;
+        }
+        for (int i = 0; i < nn; i = i + 1) {
+            adjStart[i + 1] = adjStart[i + 1] + adjStart[i];
+        }
+        int[] adjFill = new int[nn];
+        for (int i = 0; i < nn; i = i + 1) { adjFill[i] = adjStart[i]; }
+        int[] adjList = new int[2 * en];
+        for (int ei = 0; ei < en; ei = ei + 1) {
+            int pa = adjFill[ea[ei]];
+            adjList[pa] = eb[ei];
+            adjFill[ea[ei]] = pa + 1;
+            int pb = adjFill[eb[ei]];
+            adjList[pb] = ea[ei];
+            adjFill[eb[ei]] = pb + 1;
+        }
+        long k2 = (long)k * (long)k;
         for (int it = 0; it < iters; it = it + 1) {
             for (int i = 0; i < nn; i = i + 1) {
-                int xi = l.nodes[i].x;
-                int yi = l.nodes[i].y;
+                int xi = xs[i];
+                int yi = ys[i];
                 int dx = 0;
                 int dy = 0;
                 // 斥力：近距离成对推开（方向归一化，量级 ∝ (k-d)）。
                 for (int j = 0; j < nn; j = j + 1) {
                     if (j == i) { continue; }
-                    int dijx = l.nodes[j].x - xi;
-                    int dijy = l.nodes[j].y - yi;
+                    int dijx = xs[j] - xi;
+                    int dijy = ys[j] - yi;
                     if (dijx == 0 && dijy == 0) { dijx = 1; dijy = 0; }
                     int d2 = dijx * dijx + dijy * dijy;
-                    int d = ChartView.ISqrt(d2);
+                    // d ≥ k 原本就不施力，平方域直接剪掉，免开方。
+                    if ((long)d2 >= k2) { continue; }
+                    int d = (int)Math.Sqrt((double)d2);
                     if (d < 8) { d = 8; }
-                    if (d < k) {
-                        int fr = (k - d) * 4 * scaling * repulsion / 100000;
-                        dx = dx - dijx * fr / d;
-                        dy = dy - dijy * fr / d;
-                    }
+                    int fr = (k - d) * 4 * scaling * repulsion / 100000;
+                    dx = dx - dijx * fr / d;
+                    dy = dy - dijy * fr / d;
                 }
                 // 边吸引：拉向对方（拉伸时吸引，压缩时推开；
                 // 方向归一化，量级 ∝ (d-rest)）。
-                for (int ei = 0; ei < l.edges.Count; ei = ei + 1) {
-                    ForceEdge e = l.edges[ei];
-                    int j = 0 - 1;
-                    if (e.a == i) { j = e.b; }
-                    if (e.b == i) { j = e.a; }
-                    if (j < 0) { continue; }
-                    int dijx = l.nodes[j].x - xi;
-                    int dijy = l.nodes[j].y - yi;
+                for (int ai = adjStart[i]; ai < adjStart[i + 1]; ai = ai + 1) {
+                    int j = adjList[ai];
+                    int dijx = xs[j] - xi;
+                    int dijy = ys[j] - yi;
                     if (dijx == 0 && dijy == 0) { dijx = 1; dijy = 0; }
                     int d2 = dijx * dijx + dijy * dijy;
-                    int d = ChartView.ISqrt(d2);
+                    int d = (int)Math.Sqrt((double)d2);
                     if (d < 8) { d = 8; }
                     int fa = (d - rest) * 2 * scaling / 1000;
                     dx = dx + dijx * fa / d;
@@ -452,9 +486,13 @@ class ForceLayout {
                 if (nx > w) { nx = w; }
                 if (ny < 0) { ny = 0; }
                 if (ny > h) { ny = h; }
-                l.nodes[i].x = nx;
-                l.nodes[i].y = ny;
+                xs[i] = nx;
+                ys[i] = ny;
             }
+        }
+        for (int i = 0; i < nn; i = i + 1) {
+            l.nodes[i].x = xs[i];
+            l.nodes[i].y = ys[i];
         }
         return l;
     }

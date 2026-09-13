@@ -639,17 +639,28 @@ partial class ChartView {
     /// 窗口均值，千分固定点（不会像整数均值那样把 85/7 抹成 12）：
     /// sum×1000/cnt（×pointG 定点序列再除 g，原始值均值 = sum/(cnt·g)，
     /// 文本需要 avg_raw×1000 = sum×1000/(cnt·g)），中间量走 long。
+    /// 小数数据项（bar1 的 2.6/162.2）从 Number 取 ×1000 参与累计——
+    /// 先走 Value() 舍入会把均值砍成整数（41.06 → "41"）。
     static int SeriesAvg1000(ChartSeries s, int i0, int i1) {
-        int sum = 0;
+        long sum = 0;  // milli 域累计（大值序列逐项 ×1000，int 会溢）
         int cnt = 0;
+        int g = s.pointG > 1 ? s.pointG : 1;
         for (int j = i0; j <= i1 && j < s.Count(); j = j + 1) {
             if (j < s.data.Count && s.data[j].gap) { continue; }
-            sum = sum + s.Value(j);
+            if (j < s.data.Count && s.data[j].numberSet
+                && s.data[j].number != (double)s.data[j].val) {
+                double dn = s.data[j].number;
+                sum = sum + (int)(dn >= 0 ? dn * 1000.0 + 0.5
+                                          : dn * 1000.0 - 0.5);
+            } else {
+                // data 整数道贡献 ×1000；points 道的 Value 已是
+                // ×pointG 定点，按 (1000/g) 折算成 milli 域。
+                sum = sum + (long)s.Value(j) * (1000 / g);
+            }
             cnt = cnt + 1;
         }
         if (cnt < 1) { return 0; }
-        int g = s.pointG > 1 ? s.pointG : 1;
-        return (int)(((long)sum * 1000L) / ((long)cnt * (long)g));
+        return (int)(sum / (long)cnt);
     }
 
     /// 均值显示串（ECharts markLine 默认标签是具体数值，不是
@@ -1166,18 +1177,19 @@ partial class ChartView {
             // 同 DrawSeriesMarkLines：默认具体数值，显式 label 支持
             // {value} 占位，无占位则 "name: value"。
             if (m.labelShow) {
+                // 均值文本一律走千分定点（Avg1000Text 出 "41.06"），
+                // min/max/显式线走整数域 PointText；显式 name 的
+                // 缺省标签是 "Avg: 41.06"（官方 bar1）。
+                string valTxt = isAvg
+                    ? ChartView.Avg1000Text(ChartView.SeriesAvg1000(s, i0, i1))
+                    : Chart.PointText(val, s.pointG);
                 string lbl = m.label;
                 if (lbl.Length == 0) {
-                    if (isAvg) {
-                        lbl = ChartView.Avg1000Text(
-                            ChartView.SeriesAvg1000(s, i0, i1));
-                    } else {
-                        lbl = Chart.PointText(val, s.pointG);
-                    }
+                    lbl = valTxt;
                 } else if (lbl.IndexOf("{value}") >= 0) {
-                    lbl = lbl.Replace("{value}", Chart.PointText(val, s.pointG));
+                    lbl = lbl.Replace("{value}", valTxt);
                 } else {
-                    lbl = lbl + ": " + Chart.PointText(val, s.pointG);
+                    lbl = lbl + ": " + valTxt;
                 }
                 int fs = ChartFonts.SeriesLabel(app);
                 int lw = Canvas.MeasureText(lbl, fs);
@@ -1232,6 +1244,10 @@ partial class ChartView {
                     }
                 } else if (lbl.IndexOf("{value}") >= 0) {
                     lbl = lbl.Replace("{value}", Convert.ToString(val));
+                } else if (m.kind == "average") {
+                    // 横向柱转置版与竖排同语义："Avg: 41.06"。
+                    lbl = lbl + ": " + ChartView.Avg1000Text(
+                        ChartView.SeriesAvg1000(s, i0, i1));
                 } else {
                     lbl = lbl + ": " + Convert.ToString(val);
                 }
@@ -1275,12 +1291,12 @@ partial class ChartView {
             // 不是 "max/min" 字样。
             if (maxI >= 0) {
                 ChartView.MarkAt(app, f, s, maxI, maxI - i0, nWin,
-                    Convert.ToString(s.Value(maxI)), below, 0, "", 0,
+                    Chart.SeriesNumText(s, maxI), below, 0, "", 0,
                     ChartView.BarMarkX(f, barX, maxI - i0, band));
             }
             if (minI >= 0 && minI != maxI) {
                 ChartView.MarkAt(app, f, s, minI, minI - i0, nWin,
-                    Convert.ToString(s.Value(minI)), below, 0, "", 0,
+                    Chart.SeriesNumText(s, minI), below, 0, "", 0,
                     ChartView.BarMarkX(f, barX, minI - i0, band));
             }
         }
@@ -1304,7 +1320,7 @@ partial class ChartView {
                 string raw2 = fmt2
                     .Replace("{a}", s.name)
                     .Replace("{b}", m.name)
-                    .Replace("{c}", Convert.ToString(s.Value(idx)));
+                    .Replace("{c}", Chart.SeriesNumText(s, idx));
                 RichBlock blk = ChartView.RichLayout(app,
                     Chart.RichTokenize(raw2, s.markLabelSt), s.markLabelSt,
                     ChartFonts.SeriesLabel(app));
@@ -1332,9 +1348,9 @@ partial class ChartView {
             // name（年最高/最大值）是 tooltip 元数据，不进徽标。
             string lbl = m.label;
             if (lbl.IndexOf("{value}") >= 0) {
-                lbl = lbl.Replace("{value}", Convert.ToString(s.Value(idx)));
+                lbl = lbl.Replace("{value}", Chart.SeriesNumText(s, idx));
             } else {
-                lbl = Convert.ToString(s.Value(idx));
+                lbl = Chart.SeriesNumText(s, idx);
             }
             ChartView.MarkAt(app, f, s, idx, idx - i0, nWin, lbl,
                 o.showValues || s.labelShow, m.color, m.symbol,
@@ -1377,7 +1393,7 @@ partial class ChartView {
                 string fmt2 = s.markLabelFmt.Length > 0 ? s.markLabelFmt : "{c}";
                 string raw2 = fmt2.Replace("{a}", s.name)
                     .Replace("{b}", m.name)
-                    .Replace("{c}", Convert.ToString(s.Value(idx)));
+                    .Replace("{c}", Chart.SeriesNumText(s, idx));
                 RichBlock blk = ChartView.RichLayout(app,
                     Chart.RichTokenize(raw2, s.markLabelSt), s.markLabelSt,
                     ChartFonts.SeriesLabel(app));
@@ -1399,7 +1415,7 @@ partial class ChartView {
                 }
             } else {
                 // 端点圆徽标 + 数值（ECharts pin 徽标的横向近似）。
-                string lbl = Convert.ToString(s.Value(idx));
+                string lbl = Chart.SeriesNumText(s, idx);
                 int fs = ChartFonts.SeriesLabel(app);
                 int lw = Canvas.MeasureText(lbl, fs);
                 int rr = lw / 2 + app.Scale(5);

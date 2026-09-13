@@ -4,6 +4,7 @@
 /// 逐字转换，Zan 侧只有加载与渲染调用；渲染失败=引擎缺口，进账本修复。
 using System;
 using System.Json;
+using System.Threading;
 using Gui;
 using Gui.Widget;
 using Gui.Component.Chart;
@@ -221,9 +222,16 @@ partial class Charts {
         for (int si = 0; si < Environment.ArgCount(); si = si + 1) {
             if (Environment.ArgAt(si) == "--sweep") {
                 Charts.RegisterMaps();
+                // 落盘目录不预存时逐张 WritePixels 静默失败、末尾
+                // manifest 整体 IOException——这里显式补建（干净检出
+                // / 目录被清理后 sweep 依然自洽）。
+                if (!System.IO.Directory.ExistsUtf8("_scratch/sweep")) {
+                    System.IO.Directory.CreateDirectoryUtf8("_scratch/sweep");
+                }
                 string manifest = "";
                 for (int di = 0; di < Charts.demos.Count; di = di + 1) {
                     ChartsDemo d = Charts.demos[di];
+                    Console.WriteLine("SWEEP " + d.id);
                     int t0 = Window.GetTickMs();
                     string phase = "ok";
                     ChartOption o = null;
@@ -235,6 +243,11 @@ partial class Charts {
                     } catch (Exception ex) {
                         phase = "json-error";
                     }
+                    // 卡顿定位：parse（FromJson）与 render（布局+绘制+
+                    // 落盘）分列计时——大数据 demo 卡死时先看时间花在
+                    // 哪一段（manifest 第 5/6 列）。
+                    int parseMs = Window.GetTickMs() - t0;
+                    int renderMs = 0;
                     if (o != null) {
                         try {
                             app.BeginFrame();
@@ -245,13 +258,20 @@ partial class Charts {
                         } catch (Exception ex2) {
                             phase = "render-error";
                         }
-                        app.canvas.WritePixels("_scratch/sweep/"
-                            + Charts.SweepFileOf(d.id) + ".zpx",
-                            0, 0, app.designW, app.designH);
+                        try {
+                            app.canvas.WritePixels("_scratch/sweep/"
+                                + Charts.SweepFileOf(d.id) + ".zpx",
+                                0, 0, app.designW, app.designH);
+                        } catch (Exception ex3) {
+                            phase = "write-error";
+                        }
+                        renderMs = Window.GetTickMs() - t0 - parseMs;
                     }
                     manifest = manifest + d.id + "\t"
                         + Convert.ToString(d.ready) + "\t" + phase + "\t"
-                        + Convert.ToString(Window.GetTickMs() - t0) + "\n";
+                        + Convert.ToString(Window.GetTickMs() - t0) + "\t"
+                        + Convert.ToString(parseMs) + "\t"
+                        + Convert.ToString(renderMs) + "\n";
                 }
                 System.IO.File.WriteAllText("_scratch/sweep/manifest.txt",
                     manifest);
@@ -626,10 +646,20 @@ partial class Charts {
         // 任何示例数据装配代码——渲染不对就是引擎缺口，进账本。
         ChartOption cached = Charts.OptionOf(id);
         if (cached == null) {
-            Charts.DrawEmpty(app, id, x, y, w, h);
+            if (Charts.IsPending(id)) { Charts.DrawLoading(app, x, y, w, h); }
+            else { Charts.DrawEmpty(app, id, x, y, w, h); }
             return;
         }
         Charts.Show(app, cached, x, y, w, h);
+    }
+
+    /// 后台装载中的占位：worker 经 App.Post 收货后下一帧即为成图。
+    static void DrawLoading(App app, int x, int y, int w, int h) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        c.DrawText(x + w / 2 - app.Scale(40), y + h / 2 - app.Scale(10),
+            Charts.T("Loading…", "加载中…"), t.textTertiary,
+            t.fontSizeMedium);
     }
 
     // ---- option 缓存 + 地图注册 ------------------------------------
@@ -638,20 +668,68 @@ partial class Charts {
     // option 本体跨帧复用安全。
     static List<string> optIds;
     static List<ChartOption> optCache;
+    static List<bool> optPending;
 
     static ChartOption OptionOf(string id) {
         if (Charts.optIds == null) {
             Charts.optIds = new List<string>();
             Charts.optCache = new List<ChartOption>();
+            Charts.optPending = new List<bool>();
         }
         for (int i = 0; i < Charts.optIds.Count; i = i + 1) {
             if (Charts.optIds[i] == id) { return Charts.optCache[i]; }
         }
-        string src = Skin.EmbedRead("options/" + id + ".json");
-        ChartOption o = src == "" ? null : ChartOption.FromJson(src);
+        // 未内置例（registry ready=false，无 JSON）保持同步空态；
+        // 可渲染例走后台装载——UI 线程 FromJson 会卡住交互（geo-svg
+        // 系列实测 2.6s）。--nomouse 回归模式除外：单帧截图必须
+        // 看到终态，保持同步。
+        bool ready = false;
+        for (int i = 0; i < Charts.demos.Count; i = i + 1) {
+            if (Charts.demos[i].id == id) {
+                ready = Charts.demos[i].ready == 1;
+                break;
+            }
+        }
         Charts.optIds.Add(id);
-        Charts.optCache.Add(o);
-        return o;
+        Charts.optCache.Add(null);
+        if (!ready || Charts.nomouse) {
+            string src0 = Skin.EmbedRead("options/" + id + ".json");
+            Charts.optCache[Charts.optCache.Count - 1]
+                = src0 == "" ? null : ChartOption.FromJson(src0);
+            Charts.optPending.Add(false);
+        } else {
+            Charts.optPending.Add(true);
+            Charts.KickLoad(id, Charts.optCache.Count - 1);
+        }
+        return Charts.optCache[Charts.optCache.Count - 1];
+    }
+
+    /// 后台装载（DataTable.HttpSource / ImageHttp 同款定式）：worker
+    /// 只做内嵌资源读取 + FromJson 纯计算，不触 UI 状态；成品经
+    /// App.Post 捕获闭包整只移交 UI 线程——Post 自带 window.Wake()
+    /// 唤醒阻塞中的事件循环，DrainPosts 执行后自动置 needsRedraw。
+    static void KickLoad(string id, int slot) {
+        Thread.Start(() => {
+            string src = Skin.EmbedRead("options/" + id + ".json");
+            ChartOption o = src == "" ? null : ChartOption.FromJson(src);
+            Charts.app.Post(() => {
+                if (slot < Charts.optCache.Count
+                    && Charts.optIds[slot] == id) {
+                    Charts.optCache[slot] = o;
+                    Charts.optPending[slot] = false;
+                }
+            });
+        });
+    }
+
+    static bool IsPending(string id) {
+        if (Charts.optIds == null) { return false; }
+        for (int i = 0; i < Charts.optIds.Count; i = i + 1) {
+            if (Charts.optIds[i] == id) {
+                return i < Charts.optPending.Count && Charts.optPending[i];
+            }
+        }
+        return false;
     }
 
     /// 进程级一次性：把内嵌地图资产注册进 ChartMaps（echarts
