@@ -207,6 +207,34 @@ token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
   狂野过冲,HEAD 探针里 y 轴声明域/平滑包络全是对的——min/max 接线
   是当天的提交;正确动作 = 先在 HEAD 复现,复现不了就重建 gallery
   (`scripts\build_charts.ps1`)再要截图)。
+- **自写曲线采样先验两件事:基和=1、t=0/1 精确落端点**。平滑折线的
+  控制点是绝对贝塞尔控制点,必须配 Bernstein 基 `(1-t)³/3(1-t)²t/
+  3(1-t)t²/t³`;把 Hermite 基的千分幂直接配 1e6 常数项(单位错乱)
+  得 b0≈0.9995 恒成立——每段几十个采样全部坍缩在段起点,平滑曲线
+  退化成首尾直联折线、末段"整根消失"(真实案例:line-smooth 七点
+  图 Sun 悬空,根因查了三天,定位后改动只有 4 行基函数+2 行配对)。
+  配对也别抄旧代码:`qx = b0·P0 + b1·C0 + b2·C1 + b3·P1`,旧 Hermite
+  配对残留会让 t=1 落在控制点上而不是端点。
+- **bbox-IoU 比较器对结构性缺陷全盲**:缺末段、多余竖网格线、整带
+  错位 19px,IoU 照样 ≥0.5 PASS——"比较器全绿"不等于"图对"。数值
+  oracle(SSR 出 SVG 提取包围盒/解剖)+ 逐图目检缺一不可,用户报
+  "基本没对得上"时先目检再信指标(真实案例:折线族 36 图 27 PASS
+  的同一天,用户点名的前两张图都是结构性错的)。
+- **官方缺省值一律 SSR 实测,不凭文档或旧版记忆**:splitLine 缺省按
+  **维度**(xAxis show:false、yAxis show:true,与轴类型无关),ECharts2
+  "类目轴竖线默认开"的旧注释会误导出多余竖线;axisPointer.show 缺省
+  是字符串 **'auto'**(声明了 value 就显示),按 bool false 处理会整根
+  漏画静态指示线。SSR 一行 `getComponent(axis).get(key)` 拿到的就是
+  合并后真值。
+- **主题/CSS 调色板只填未声明的槽**:系列自带 color/itemStyle.color、
+  根级 option.color(整表替换主题调色板)都必须跳过 chart::series-N
+  的 CSS 覆写——常驻基线主题包一上,不带守卫的覆写通道会把
+  multiple-x-axis 这类自带调色板的图逐槽盖回默认色,而且渲染不报
+  错、只有颜色对不上(真实案例:echarts6.css 设为 App 缺省包当天)。
+- **值对系列([[ts,v],...])落在 points 而不是 data,分发判定要照顾**:
+  "点系列→lines"的判定若排在堆叠判定之前,stack+time 图永远走不到
+  堆叠面积渲染器,两条同名 stack 系列各自按原始值画(真实案例:
+  line-tooltip-touch 粉带不堆叠,DispatchKind 里换两行顺序即修)。
 
 ## 缩放纪律(DPI:为什么界面忽大忽小)
 
