@@ -17,6 +17,8 @@ using Legend;
 /// （攻击品红 / 魔法蓝 / 道术绿 / 防御黄 / 魔防紫），**值为 `0 - 0` 时统一
 /// 转灰**——原版就是这样把「这一阶还没这项加成」区分出来的。
 partial class LegendApp {
+    /// 当前称谓页号（0 起始）：翻页后重建时 pager 从它恢复，不再回跳第 1 页。
+    int titlePageNo = 0;
     /// 表头十列。
     static List<string> TitleHeads() {
         List<string> h = new List<string>();
@@ -122,6 +124,11 @@ partial class LegendApp {
     }
 
     void BuildTitlePage() {
+        /* 联机：进页拉一次称谓表（服务端 251 行 / 21 页，页号走 page 参数）；
+           应答到达 Bump 重建后走下方 playTitle 渲染分支。 */
+        net.MaybeRefreshTitle();
+        bool online = net.Self() != null && net.PlayTitle() != null;
+
         Panel page0 = Panel.Column(); page0.Class = "tbl-page";
         page0.Pad(0); page0.Gap(0); page0.Grow(); content.With(page0);
 
@@ -136,8 +143,29 @@ partial class LegendApp {
         Panel wall = Panel.Column(); wall.Pad(0); wall.Gap(Spec.TblRowGap());
         box.With(wall);
 
-        List<TitleRow> rows = TitleData();
-        for (int r = 0; r < Spec.TblRows(); r = r + 1) {
+        /* 联机渲染服务端行（一行一实体照旧映射到 TitleRow）；离线保持
+           演示数据。最后一页可能不足 12 行，按实际行数铺。 */
+        List<TitleRow> rows;
+        if (online) {
+            rows = new List<TitleRow>();
+            JsonValue a = net.PlayTitle();
+            for (int i = 0; i < a.Count(); i = i + 1) {
+                JsonValue x = a.At(i);
+                rows.Add(TitleRowOf(
+                    x.Str("name", ""),
+                    x.Long("fame", 0), x.Long("gold", 0),
+                    x.Int("rebirth", 0), x.Int("level", 0),
+                    PairOf(x.Int("atkMin", 0), x.Int("atkMax", 0)),
+                    PairOf(x.Int("magMin", 0), x.Int("magMax", 0)),
+                    PairOf(x.Int("taoMin", 0), x.Int("taoMax", 0)),
+                    PairOf(x.Int("defMin", 0), x.Int("defMax", 0)),
+                    PairOf(x.Int("mdefMin", 0), x.Int("mdefMax", 0))));
+            }
+        } else {
+            rows = TitleData();
+        }
+        int nRows = rows.Count;
+        for (int r = 0; r < nRows; r = r + 1) {
             TitleRow ti = rows[r];
             List<string> cells = new List<string>();
             cells.Add(ti.name); cells.Add(ti.FameText()); cells.Add(ti.GoldText());
@@ -160,18 +188,36 @@ partial class LegendApp {
         Panel footGap = Panel.Row(); footGap.Pad(0);
         footGap.Prefer(0, Spec.TblFootGap()); page0.With(footGap);
 
-        SignalInt pgSig = new SignalInt(1);
-        Pagination pg = new Pagination(21, pgSig);
+        /* 页数：联机取服务端 pages（251 行 / title_page_size=12 → 21 页），
+           翻页发 {"op":"title","page":N}；离线保持演示的 21。 */
+        int pages = online ? net.TitlePages() : 21;
+        SignalInt pgSig = new SignalInt(this.titlePageNo + 1);
+        Pagination pg = new Pagination(pages, pgSig);
         pg.Class = "simple";
         pg.PrevText("上一页"); pg.NextText("下一页");
         pg.Named("title-pager");
-        page0.With(TblFoot(TblFootNote("当前称谓：", "无", "tbl-note-v"), pg));
+        /* 只发请求：应答到达 Bump 重建，pager 从 titlePageNo 恢复页号。 */
+        pg.Change += () => {
+            if (net.Self() != null) {
+                this.titlePageNo = pgSig.Get() - 1;
+                if (this.titlePageNo < 0) { this.titlePageNo = 0; }
+                if (this.titlePageNo > pages - 1) { this.titlePageNo = pages - 1; }
+                net.TitlePage(this.titlePageNo);
+            }
+        };
+        /* 当前称谓：联机读 self.title（领取/佩戴后随 self 下发）。 */
+        string cur = "无";
+        if (online) {
+            string t2 = net.Self().Str("title", "");
+            if (t2.Length > 0) { cur = t2; }
+        }
+        page0.With(TblFoot(TblFootNote("当前称谓：", cur, "tbl-note-v"), pg));
     }
 
-    /// 「领取」钮：尚未接玩法，按本模板惯例给明确反馈（不假装已实现）。
+    /// 「领取」钮：联机走 unlock（声望×pct + 金币，服务端权威判定），
+    /// 离线按模板惯例给明确反馈（不假装已实现）。
     void TitleClaim(TitleRow tr) {
-        string msg = "领取称谓：" + tr.name;
-        if (net.Self() != null) { net.AddChat("[系统]", msg); return; }
-        g.Log(msg);
+        if (net.Self() != null) { net.TitleUnlock(tr.name); return; }
+        g.Log("领取称谓：" + tr.name);
     }
 }

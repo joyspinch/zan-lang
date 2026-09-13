@@ -226,6 +226,7 @@ class GameNet {
     JsonValue playRedpack;
     JsonValue playMarket;
     JsonValue playTitle;
+    int playTitlePages;
     JsonValue codexPage;
     int codexPageNo;
     string codexKind = "items";
@@ -289,10 +290,15 @@ class GameNet {
         return this.chat.Count > 0 ? this.chat[this.chat.Count - 1] : "";
     }
 
+    /// 服务端 job 0/1/2 -> 职业名（排行榜等页共用）。
+    public string JobNameOf(int job) {
+        return job >= 0 && job < 3 ? JobNames[job] : "旅人";
+    }
+
     string SelfLine() {
         if (this.self == null) { return ""; }
         int job = this.self.Int("job", 0);
-        string jobName = job >= 0 && job < 3 ? JobNames[job] : "旅人";
+        string jobName = this.JobNameOf(job);
         return this.self.Str("name", "旅人") + " · " + jobName + " · "
             + Convert.ToString(this.self.Int("level", 1)) + "级 · 血 "
             + Convert.ToString(this.self.Int("hp", 0)) + "/"
@@ -1380,6 +1386,8 @@ class GameNet {
     JsonValue PlayRedpack() { return this.playRedpack; }
     JsonValue PlayMarket() { return this.playMarket; }
     JsonValue PlayTitle() { return this.playTitle; }
+    int TitlePages() { return this.playTitlePages > 0 ? this.playTitlePages : 1; }
+    JsonValue Rank() { return this.rank; }
     JsonValue CodexPage() { return this.codexPage; }
     int CodexPageNo() { return this.codexPageNo; }
     int CodexTotal() { return this.codexTotal; }
@@ -1679,12 +1687,32 @@ class GameNet {
     }
 
     void RefreshTitle() {
-        this.Op("{\"op\":\"title\"}", (JsonValue r) => {
-            if (this.TakeSelf(r)) {
-                JsonValue rows = r.Get("rows");
-                if (rows != null && rows.IsArray()) { this.playTitle = rows; this.Bump(); }
-            }
-        });
+        this.Op("{\"op\":\"title\"}", (JsonValue r) => { this.TakeTitleReply(r); });
+    }
+
+    /* 称谓数据入缓存：行 + 服务端页数（251 行 / 21 页，pager 按它渲染）。 */
+    void TakeTitleReply(JsonValue r) {
+        if (!this.TakeSelf(r)) { return; }
+        JsonValue rows = r.Get("rows");
+        if (rows != null && rows.IsArray()) {
+            this.playTitle = rows;
+            this.playTitlePages = r.Int("pages", 1);
+            if (this.playTitlePages < 1) { this.playTitlePages = 1; }
+            this.Bump();
+        }
+    }
+
+    /* 页面进页拉取：只在没数据时发一次，防 Bump 重建循环重拉。 */
+    void MaybeRefreshTitle() {
+        if (this.playTitle != null) { return; }
+        this.RefreshTitle();
+    }
+
+    /* 翻页：{"op":"title","page":N}。playTitle 保留旧页直到应答整包
+       替换（置空会让重建期的 Maybe 守卫再拉一次第 0 页）。 */
+    void TitlePage(int n) {
+        this.Op("{\"op\":\"title\",\"page\":" + Convert.ToString(n) + "}",
+                (JsonValue r) => { this.TakeTitleReply(r); });
     }
 
     void TitleUnlock(string name) {
