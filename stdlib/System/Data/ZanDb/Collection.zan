@@ -345,6 +345,15 @@ class Collection {
             i = i + 1;
         }
         PersistKeyDict();
+        // 常态快速路径：记录不含 0x00/0xFF 时无需转义，直接成串——
+        // 省去逐字节扫描重写与第二个缓冲区（文本型文档几乎总命中）。
+        long blen = b.Length();
+        if (Collection.MemChr(b.Raw(), 0, blen) == 0
+                && Collection.MemChr(b.Raw(), 255, blen) == 0) {
+            string s0 = b.ToStr();
+            b.Free();
+            return s0;
+        }
         // 转义为不含 NUL 的字节流。运行时字符串类型（以及
         // ToStr 和 B+Tree 自带的 ReadString 都在使用的
         // NativeMemory.GetString）遇到第一个 0x00 即停止，因此原始记录——
@@ -607,7 +616,12 @@ class Collection {
         string cur = this.kv.Get(SeqKey());
         int seq = 0;
         if (cur.Length > 0) { seq = Convert.ToInt(cur); }
-        if (id > seq) { this.kv.Put(SeqKey(), Convert.ToString(id)); }
+        if (id > seq) {
+            this.kv.Put(SeqKey(), Convert.ToString(id));
+            // 序列缓存与此处绕过 NextId 的推进保持一致
+            //（缓存语义 = 已落盘的序列值；已分配 id 不回退）。
+            if (this.nextIdCache < id) { this.nextIdCache = id; }
+        }
         if (this.indexedFields.Count > 0 && this.kv.Contains(DocKey(id))) {
             RemoveIndexEntries(id, FindById(id));
         }
@@ -785,10 +799,15 @@ class Collection {
         return n;
     }
 
-    /// <summary>文档总数（对命名空间做范围扫描）。</summary>
+    /// <summary>文档总数（对命名空间做范围扫描）。只数键、
+    /// 不物化条目，大集合上不再按文档数分配。</summary>
     int Count() {
-        List<KvEntry> entries = new List<KvEntry>();
-        return this.kv.ScanPrefix("c:" + this.name + ":", 0, entries);
+        string lo = "c:" + this.name + ":";
+        string hi = "c:" + this.name + ";";
+        return this.kv.Scan(lo, delegate(string k, string v) {
+            if (String.CompareOrdinal(k, hi) > 0) { return false; }
+            return true;
+        });
     }
 
     /// <summary>按 id 顺序返回所有文档。</summary>
@@ -804,16 +823,16 @@ class Collection {
         string hi = "";
         if (toId > 0) { hi = DocKey(toId); }
         else { hi = "c:" + this.name + ";"; }   // ';' 的排序紧随 ':' 之后
-        List<KvEntry> entries = new List<KvEntry>();
-        this.kv.ScanRange(lo, hi, limit, entries);
+        // 流式解码：扫描回调里直接建文档树，不经 KvEntry 中间层。
+        // [lo, hi] 闭区间内全是本集合的行键，无需再核对前缀。
         List<JsonValue> docs = new List<JsonValue>();
-        for (int i = 0; i < entries.Count; i = i + 1) {
-            if (entries[i].key.Length > 2 && entries[i].key.Substring(0, 2) == "c:") {
-                JsonValue doc = DecodeDoc(entries[i].val);
-                doc.Set("_id", JsonValue.NewNum(Collection.IdFromKey(entries[i].key)));
-                docs.Add(doc);
-            }
-        }
+        this.kv.Scan(lo, delegate(string k, string v) {
+            if (String.CompareOrdinal(k, hi) > 0) { return false; }
+            JsonValue doc = DecodeDoc(v);
+            doc.Set("_id", JsonValue.NewNum(Convert.ToString(Collection.IdOfKey(k))));
+            docs.Add(doc);
+            return limit <= 0 || docs.Count < limit;
+        });
         return docs;
     }
 

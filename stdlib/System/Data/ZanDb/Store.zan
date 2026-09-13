@@ -591,55 +591,77 @@ class ZanStore {
         for (int i = this.segs.Count - 1; i >= 0; i = i - 1) {
             cursors.Add(SegCursor.Open(this.segs[i].seg, fromKey));
         }
-        // memtable 的键序视图（每键至多一条，即最新版本）。
+        // memtable 中键 ≥ fromKey 的部分（每键至多一条，即最新版本），
+        // 先过滤再排序：固化+归并后的常态是 memtable 为空，排序整段跳过。
         List<string> mk = new List<string>();
         List<string> src = this.memtable.Keys;
-        for (int i = 0; i < src.Count; i = i + 1) { mk.Add(src[i]); }
+        for (int i = 0; i < src.Count; i = i + 1) {
+            if (String.CompareOrdinal(src[i], fromKey) >= 0) { mk.Add(src[i]); }
+        }
         ZanStore.SortStrings(mk);
         int mi = 0;
-        while (mi < mk.Count && String.CompareOrdinal(mk[mi], fromKey) < 0) {
-            mi = mi + 1;
-        }
 
         int accepted = 0;
+
+        // 单一来源快速路径：恰好一个段、memtable 无参与归并的键。
+        // 固化+归并后的常态——无需最小键仲裁与同键裁决，顺序直读。
+        // 墓碑仍须逐键检查（删除不进 memtable，无键序可借）。
+        if (cursors.Count == 1 && mk.Count == 0) {
+            SegCursor c = cursors[0];
+            while (c.Valid()) {
+                if (c.Op() == 1 && !this.tombstones.ContainsKey(c.Key())) {
+                    if (!visit(c.Key(), c.Val())) { break; }
+                    accepted = accepted + 1;
+                }
+                c.Next();
+            }
+            c.Free();
+            return accepted;
+        }
+
         bool go = true;
         while (go) {
-            // 1) 各来源当前位置上的最小键。
+            // 1) 各来源当前位置上的最小键；win = 胜出游标下标
+            //    （-1 = memtable 持有当前键或无来源）。cursors 新→旧，
+            //    严格小于才替换，天然让最新段在并列时胜出。
             string minKey = "";
             bool has = false;
-            if (mi < mk.Count) { minKey = mk[mi]; has = true; }
+            bool memHas = false;
+            int win = -1;
+            if (mi < mk.Count) { minKey = mk[mi]; has = true; memHas = true; }
             for (int i = 0; i < cursors.Count; i = i + 1) {
                 SegCursor c = cursors[i];
                 if (!c.Valid()) { continue; }
-                if (!has || String.CompareOrdinal(c.Key(), minKey) < 0) {
-                    minKey = c.Key();
-                    has = true;
+                if (!has) {
+                    minKey = c.Key(); has = true; win = i;
+                } else {
+                    int cmp = String.CompareOrdinal(c.Key(), minKey);
+                    if (cmp < 0) {
+                        minKey = c.Key(); win = i; memHas = false;
+                    } else if (cmp == 0 && win == -1) {
+                        win = i;    // 与 memtable 同键：值仍取 memtable，游标须推进
+                    }
                 }
             }
             if (!has) { break; }
-            bool atMem = mi < mk.Count && mk[mi] == minKey;
-            // 2) 最新来源定值：memtable 优先；否则段号最大的段
-            //    （cursors 已按新→旧排，取第一个停在 minKey 的）。
+            // 2) 最新来源定值：memtable 优先；否则胜出游标。
             bool live = false;
             string val = "";
-            if (atMem) {
+            if (memHas) {
                 string v = "";
                 this.memtable.TryGetValue(minKey, out v);
                 val = v;
                 live = true;
             } else {
-                for (int i = 0; i < cursors.Count; i = i + 1) {
-                    SegCursor c = cursors[i];
-                    if (c.Valid() && c.Key() == minKey) {
-                        live = c.Op() == 1;
-                        val = c.Val();
-                        break;
-                    }
-                }
+                SegCursor c = cursors[win];
+                live = c.Op() == 1;
+                val = c.Val();
             }
-            // 3) 推进所有停在 minKey 的来源（旧段同名键一并作废）。
-            if (atMem) { mi = mi + 1; }
-            for (int i = 0; i < cursors.Count; i = i + 1) {
+            // 3) 推进停在 minKey 的来源：memtable 与胜出游标必推；
+            //    多段时更旧的段可能同名键，逐个核对一并作废。
+            if (memHas) { mi = mi + 1; }
+            if (win >= 0) { cursors[win].Next(); }
+            for (int i = win + 1; i < cursors.Count; i = i + 1) {
                 SegCursor c = cursors[i];
                 if (c.Valid() && c.Key() == minKey) { c.Next(); }
             }
