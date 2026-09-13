@@ -17,60 +17,66 @@ namespace ZanWeb.Api;
 [Description("桌面客户端 IM")]
 class Im : ApiController {
     /* 会话列表：按对端分组的最新一条 + 未读数 + 我发消息的已读/送达摘要
-       （客户端列表页要的"已读/已送达"角标直接给结果，不再算一遍）。 */
+       （客户端列表页要的"已读/已送达"角标直接给结果，不再算一遍）。
+       单遍聚合：id 倒序扫一遍，对端第一次出现即该会话的最新一条，
+       计数随行累进到槽里，出槽时一次落 JSON——没有第二遍回填。 */
     [HttpGet]
     [Description("会话列表")]
     [Custom(Perm = PermBit.View)]
     async void Chats() {
         User me = await this.Me();
+        // 轮询端点（客户端每 4.5s 拉一次）：限最新 2000 条让扫描成本
+        // 有界。未读与回执都落在"新近"消息上，窗口外的老账不影响列表页。
         List<OaMessage> rows = await this.OaMessage
             .Where(a => a.tenantId == this.TenantId()
                 && (a.fromId == me.id || a.toId == me.id))
-            .OrderByDescending(a => a.id).ToListAsync();
+            .OrderByDescending(a => a.id).Take(2000).ToListAsync();
         List<User> users = await this.User
             .Where(a => a.tenantId == this.TenantId() && a.status == 1)
             .ToListAsync();
-        List<int> peers = new List<int>();
-        List<int> unread = new List<int>();
-        List<int> sentUnread = new List<int>();
-        List<int> toAck = new List<int>();
-        JsonValue items = JsonValue.NewArray();
+        List<ChatSlot> slots = new List<ChatSlot>();
+        Dict<int, ChatSlot> byPeer = new Dict<int, ChatSlot>();
         for (int i = 0; i < rows.Count; i = i + 1) {
             OaMessage r = rows[i];
             int peer = r.fromId == me.id ? r.toId : r.fromId;
-            int at = Im.IndexOf(peers, peer);
-            if (at < 0) {
-                peers.Add(peer);
-                unread.Add(0);
-                sentUnread.Add(0);
-                toAck.Add(0);
-                JsonValue o = JsonValue.NewObject();
-                o.Put("peerId", JsonValue.NewStr(Convert.ToString(peer)));
-                o.Put("peerName", JsonValue.NewStr(Im.NameOf(users, peer)));
-                o.Put("lastText", JsonValue.NewStr(Im.Excerpt(r.content, 60)));
-                o.Put("lastAt", JsonValue.NewStr(Convert.ToString(r.createdAt)));
-                o.Put("mine", JsonValue.NewStr(r.fromId == me.id ? "1" : "0"));
-                o.Put("readed", JsonValue.NewStr(
-                    (r.fromId == me.id && r.isRead == 1) ? "1" : "0"));
-                o.Put("acked", JsonValue.NewStr(
-                    (r.fromId == me.id && (r.isRead == 1 || r.isAcked == 1)) ? "1" : "0"));
-                items.Append(o);
-                at = peers.Count - 1;
+            ChatSlot s;
+            if (!byPeer.TryGetValue(peer, out s)) {
+                s = new ChatSlot();
+                s.peer = peer;
+                s.lastText = Im.Excerpt(r.content, 60);
+                s.lastAt = Convert.ToString(r.createdAt);
+                s.mine = r.fromId == me.id;
+                s.readed = s.mine && r.isRead == 1;
+                s.acked = s.mine && (r.isRead == 1 || r.isAcked == 1);
+                byPeer.Add(peer, s);
+                slots.Add(s);
             }
-            if (r.toId == me.id && r.isRead == 0) { unread[at] = unread[at] + 1; }
-            if (r.fromId == me.id && r.isRead == 0) { sentUnread[at] = sentUnread[at] + 1; }
-            /* 收件人侧：对方发来还没打送达位的一条 id（按 id 倒序扫，
-               给到最新那条）。客户端拿到就立刻回执——"已送达"不必等
-               用户点开这条会话才亮；回执后下一拍再取剩下的。 */
-            if (r.toId == me.id && r.isAcked == 0 && toAck[at] == 0) {
-                toAck[at] = r.id;
+            if (r.toId == me.id) {
+                if (r.isRead == 0) { s.unread = s.unread + 1; }
+                /* 收件人侧：对方发来还没打送达位的最新一条（id 倒序扫，
+                   记第一条命中）。客户端拿到就立刻回执——"已送达"不必
+                   等用户点开这条会话才亮；回执后下一拍再取剩下的。 */
+                if (r.isAcked == 0 && s.ackId == 0) { s.ackId = r.id; }
+            }
+            if (r.fromId == me.id && r.isRead == 0) {
+                s.sentUnread = s.sentUnread + 1;
             }
         }
-        for (int i = 0; i < items.Count(); i = i + 1) {
-            JsonValue o = items.At(i);
-            o.Put("unread", JsonValue.NewStr(Convert.ToString(unread[i])));
-            o.Put("sentUnread", JsonValue.NewStr(Convert.ToString(sentUnread[i])));
-            o.Put("ackId", JsonValue.NewStr(Convert.ToString(toAck[i])));
+        JsonValue items = JsonValue.NewArray();
+        for (int i = 0; i < slots.Count; i = i + 1) {
+            ChatSlot s = slots[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Put("peerId", JsonValue.NewStr(Convert.ToString(s.peer)));
+            o.Put("peerName", JsonValue.NewStr(Im.NameOf(users, s.peer)));
+            o.Put("lastText", JsonValue.NewStr(s.lastText));
+            o.Put("lastAt", JsonValue.NewStr(s.lastAt));
+            o.Put("mine", JsonValue.NewStr(s.mine ? "1" : "0"));
+            o.Put("readed", JsonValue.NewStr(s.readed ? "1" : "0"));
+            o.Put("acked", JsonValue.NewStr(s.acked ? "1" : "0"));
+            o.Put("unread", JsonValue.NewStr(Convert.ToString(s.unread)));
+            o.Put("sentUnread", JsonValue.NewStr(Convert.ToString(s.sentUnread)));
+            o.Put("ackId", JsonValue.NewStr(Convert.ToString(s.ackId)));
+            items.Append(o);
         }
         JsonValue body = JsonValue.NewObject();
         body.Put("chats", items);
@@ -319,11 +325,18 @@ class Im : ApiController {
         await db.Insert<OaMessageEvent>(ev).ExecuteIdentityAsync();
     }
 
-    static int IndexOf(List<int> ids, int v) {
-        for (int i = 0; i < ids.Count; i = i + 1) {
-            if (ids[i] == v) { return i; }
-        }
-        return -1;
+    /// Chats() 的按对端聚合槽：一行消息把最新一条与计数一次算清，
+    /// 不再要四个平行数组按下标对位。
+    class ChatSlot {
+        int peer;
+        string lastText;
+        string lastAt;
+        bool mine;
+        bool readed;
+        bool acked;
+        int unread;
+        int sentUnread;
+        int ackId;
     }
 
     static string NameOf(List<User> users, int id) {
