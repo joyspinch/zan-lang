@@ -26,7 +26,8 @@ RT_IO = ["src/runtime/rt_io.c", "src/runtime/rt_sched.c"]
 RT_SYNC = ["src/runtime/rt_sync.c"]
 RT_FILE = ["src/runtime/rt_file.c"]
 RT_TIMER = ["src/runtime/rt_timer.c"]
-RT_WASM = ["src/runtime/rt_wasm.c", "src/runtime/rt_file.c"]
+RT_WASM = ["src/runtime/rt_wasm.c"]   # zanrt_wasm.o compiles rt_wasm.c only; rt_file.c
+                                     # links alongside as its own object (build_cross_rt.cmd)
 ANDROID_NDK = []  # NDK-derived: no repo source drives it; never "stale" by src
 GUI = ["src/runtime/gui_runtime.c", "src/runtime/gui_runtime_text.c",
        "src/runtime/gui_runtime_font.c", "src/runtime/gui_runtime_x11.c",
