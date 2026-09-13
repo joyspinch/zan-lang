@@ -225,6 +225,14 @@ token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
   `richtext { color: var(--text-primary) }` 兜住默认段;演示文案挑
   #R/#B/#H/#L 这类亮底可见色。
 
+- **设计稿壳色写主题 token,不写字面 hex**(组件画廊暗皮肤翻车):卡片壳
+  写死 `background:#ffffff`,暗色皮肤整面墙留白补丁,内容文字(跟随
+  --text-primary 翻白)在白底上集体隐形——壳和组件用了两个颜色来源。
+  壳的正规画法与 base.css 对 card/panel 同源:
+  `background:var(--surface-bg); color:var(--text-primary);
+  border:1 var(--border-secondary)`,辅助文字 --text-secondary/tertiary;
+  演示数据本身的字面色(ColorPicker 初始值)才保留 hex。
+
 ## 毛刺防治(斜线/曲线/圆角的抗锯齿)
 
 **毛刺 = 数据边被量化到整像素。** 斜线/曲线在光栅化器眼里只有"每像素覆盖
@@ -578,3 +586,8 @@ CSS 里非 token 的长度由 `Style.ScaleLayout` 补乘,`StyleBox.IsPrescaled`
   驱动子窗口界面,拆成 View 控件(真实整棵树)+ 薄 ChildWindow 壳
   (`SetRoot(new View(), null)`):探针把 View 挂进主窗口驱动全部交互,
   生产路径仍走子窗口壳,两边同源(微信模板通讯录管理窗,。
+
+- 跑 GUI 程序别用 `Start-Process -WindowStyle Hidden` 启动:STARTUPINFO 的
+  SW_HIDE 会传给子进程,Zan 窗口创建即隐藏、事件循环立刻返回,症状像
+  "窗口创建失败/进程秒退";这次被它带偏,顺着去查机器环境半小时。直接
+  `Start-Process exe` 本体,要静默就最小化到任务栏。

@@ -265,8 +265,12 @@ def geom(fx, fy, fw, fh):
     return (attr("data-fx", fx) + attr("data-fy", fy)
             + attr("data-fw", fw) + attr("data-fh", fh))
 
-CARD_STYLE = "background:#ffffff; border:1px solid #e5e7eb; border-radius:10px"
-TITLE_STYLE = "color:#4b5563; font-size:15px"
+# 壳色走主题 token（与 base.css 对 card/panel 的正规画法同源），
+# 暗色皮肤下整面墙跟着翻色；写死 #ffffff 会在暗皮肤里留一块块
+# 白补丁、内容文字（跟随 --text-primary 变白）在白底上集体隐形。
+CARD_STYLE = ("background:var(--surface-bg); color:var(--text-primary); "
+              + "border:1px solid var(--border-secondary); border-radius:10px")
+TITLE_STYLE = "color:var(--text-secondary); font-size:15px"
 
 def emit_demo(kind, dw, dh, a, ind):
     out = []
@@ -334,7 +338,8 @@ def emit_demo(kind, dw, dh, a, ind):
         if "kid_label" in a:
             out.append('%s  <label%s%s>%s</label>' % (
                 ind, geom(12, 34, dw - 24, 28),
-                attr("style", "color:#6b7280"), esc(a["kid_label"])))
+                attr("style", "color:var(--text-tertiary)"),
+                esc(a["kid_label"])))
         out.append('%s</%s>' % (ind, kebab(kind)))
     return out
 
