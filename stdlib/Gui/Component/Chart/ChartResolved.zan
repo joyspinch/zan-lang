@@ -208,8 +208,15 @@ class ResolvedChart {
             outp.windowStart = 0;
             outp.windowEnd = n - 1;
         }
-        for (int i = 0; i < source.series.Count; i = i + 1) {
-            ChartSeries s = source.series[i];
+        // N7：z/zlevel 声明重排系列表（稳定，同键保声明序）。重排后，
+        // 图例键（LegendKey(stateWid, i)）、palette、CSS chart::series-N 的下标 i 就
+        // 绑定在绘制序上；下游渲染器按重排后的表直接画，声明的 z 自然生效
+        // （watermark 水印柱压住饼、pictorialBar 负 z 垫底、custom trend z=100
+        // 压住柱群）。源 option 不回写——每帧重排，声明序恒为准。
+        List<int> zorder = new List<int>();
+        ChartView.ZOrder(source, zorder);
+        for (int i = 0; i < zorder.Count; i = i + 1) {
+            ChartSeries s = source.series[zorder[i]];
             bool hidden = s.hidden;
             if (app != null && stateWid != 0) {
                 hidden = app.StateGet(Chart.LegendKey(stateWid, i), hidden ? 1 : 0) == 1;
@@ -237,7 +244,8 @@ class ResolvedChart {
         return null;
     }
 
-    /// 把全部解析快照物化为 ChartSeries 副本（顺序同源 option）。
+    /// 把全部解析快照物化为 ChartSeries 副本（顺序 = Resolve 的
+    /// ZOrder 绘制序；N7 声明 z 的重排在 Resolve 完成，本表已按它排序）。
     /// pie/funnel 之外的类型数据集合只读共享（阶段 B）。
     List<ChartSeries> MaterializeSeries() {
         List<ChartSeries> outp = new List<ChartSeries>();
@@ -273,8 +281,17 @@ class ResolvedChart {
         for (int mai = 0; mai < s.markAreas.Count; mai = mai + 1) { o.markAreas.Add(s.markAreas[mai]); }
         o.yAxes = new List<ChartAxis>();
         for (int yi = 0; yi < s.yAxes.Count; yi = yi + 1) { o.yAxes.Add(ChartAxis.Clone(s.yAxes[yi])); }
-        o.series = this.MaterializeSeries(); o.defaultType = s.defaultType;
-        o.showLegend = s.showLegend; o.showTooltip = s.showTooltip;
+        o.series = this.MaterializeSeries();
+        // N7：drawOption.series 已是 ZOrder 绘制序；把声明序快照交给
+        // 它（同引用），LeadSeries/DispatchKind 据此仍读声明序首条。
+        List<int> zord = new List<int>();
+        ChartView.ZOrder(s, zord);
+        List<ChartSeries> decl = new List<ChartSeries>();
+        for (int zi = 0; zi < zord.Count; zi = zi + 1) {
+            decl.Add(o.series[zord[zi]]);
+        }
+        o.declOrder = decl;
+        o.defaultType = s.defaultType;        o.showLegend = s.showLegend; o.showTooltip = s.showTooltip;
         o.tooltipTrigger = s.tooltipTrigger;
         o.toolboxShow = s.toolboxShow;
         o.toolboxDataView = s.toolboxDataView; o.toolboxMagicLine = s.toolboxMagicLine;
@@ -319,6 +336,8 @@ class ResolvedChart {
         o.gridTopPct = s.gridTopPct; o.gridBottomPct = s.gridBottomPct;
         o.containLabel = s.containLabel;
         o.zoomStart = s.zoomStart; o.zoomEnd = s.zoomEnd;
+        // N2：zooms 组件只读共享——条几何/阴影/手柄样式渲染期读它。
+        o.zooms = s.zooms; o.zoomX = s.zoomX; o.zoomY = s.zoomY;
         o.windowStart = this.windowStart; o.windowEnd = this.windowEnd;
         o.backgroundColor = s.backgroundColor; o.iwid = this.stateWid;
         o.connectGroup = s.connectGroup;
