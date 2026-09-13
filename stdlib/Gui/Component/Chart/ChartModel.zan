@@ -2770,6 +2770,13 @@ class ChartAxis {
     bool labelNegate;  // ECharts axisLabel.formatter 为 function(v){return -v}
                        // 的等价开关：刻度/工具提示按 -值 显示（雨量图负值轴）
     bool boundaryGap;  // ECharts boundaryGap（类目轴默认 true：点落在格中）
+    // boundaryGap 数组形态（数值轴 extent 外扩）：[下外扩, 上外扩]，
+    // 以原始 span 的千分比记（'100%' = 1000）。0 = 未声明/0%。
+    // 官方 fixExtentWithBoundaryGap：rawMin -= span·bg0，rawMax +=
+    // span·bg1，在 nice 之前施加（area-time-axis [0,'100%'] →
+    // 官方 extent -600..1200）。
+    int bgLoF;
+    int bgHiF;
     int axisLineColor; // ECharts axisLine.lineStyle.color；0 = 主题色
     int axisLineShow;  // ECharts axisLine.show 三态：-1 = 未声明（走 'auto'）、
                        //   0 = 显式 false、1 = 显式 true。'auto' 的判定：
@@ -3348,6 +3355,10 @@ class ChartOption {
     int windowStart;  // 渲染器实际使用的窗口（类别索引，含端点）
     int windowEnd;    // 由 ResolvedChart 从 app 状态解析；-1 = 未窗口化
     int backgroundColor; // 0 = 跟随主题，不主动填充背景
+    // ECharts 根级 color：整图定性调色板（替换官方缺省 9 档）。
+    // 系列未声明色时按绘制序取 colorPal[i % n]（ChartResolved.Of）。
+    // null = 未声明，走 ChartSkin/主题 token/官方缺省。
+    List<int> colorPal;
     int iwid;         // 交互键（由 ChartView.Render 每帧设置）；0 = 无
     int connectGroup; // connect() 组号（0 = 不参与联动；同组非 0 值共享交互态）
 
@@ -4878,6 +4889,19 @@ class ChartOption {
         return "";
     }
 
+    /// boundaryGap 数组单项 → span 千分比。数字 = 小数分数
+    /// （官方 parsePercent 对数值原样取用：0.1 = 10%）；字符串
+    /// 'N%' 走 PercentPerMille。非法/缺省 0。
+    static int AxisGapPerMille(JsonValue x) {
+        if (x == null) { return 0; }
+        if (x.IsNumber()) {
+            double d = x.AsDouble(0.0);
+            return (int)(d * 1000.0 + (d >= 0 ? 0.5 : 0 - 0.5));
+        }
+        int pm = ChartOption.PercentPerMille(x.AsString(""));
+        return pm > 0 ? pm : 0;
+    }
+
     /// N3：levels[] 逐级样式解析（TreemapSeriesLevelOption /
     /// SunburstLevelOption：color/colorSaturation/colorMappingBy/
     /// itemStyle{borderWidth,gapWidth,borderColor,borderColorSaturation}/
@@ -5347,6 +5371,19 @@ class ChartOption {
         }
         if (v.IsObject()) { data = v.Get("data"); }
         if (data == null || !data.IsArray()) { return; }
+        // markLine 级 lineStyle{color,type}：全部 data 项的缺省线
+        // （ECharts 语义；line-aqi 的阈值线 #333 声明在这里）。
+        // data 项级 lineStyle 优先（缺省回填，不覆盖已解析值）。
+        int lvlColor = 0;
+        string lvlType = "";
+        if (v.IsObject()) {
+            JsonValue lls = v.Get("lineStyle");
+            if (lls != null && lls.IsObject()) {
+                lvlType = lls.Str("type", "");
+                JsonValue llc = lls.Get("color");
+                if (llc != null) { lvlColor = ChartOption.ParseColor(llc, 0); }
+            }
+        }
         for (int i = 0; i < data.Count(); i = i + 1) {
             JsonValue it = data.At(i);
             if (it.IsArray() && it.Count() >= 2) {
@@ -5375,6 +5412,8 @@ class ChartOption {
                     }
                 }
                 m.labelShow = lvlLabelShow; m.startArrow = symStart; m.endArrow = symEnd;
+                if (m.color == 0) { m.color = lvlColor; }
+                if (m.lineType.Length == 0) { m.lineType = lvlType; }
                 into.Add(m);
                 continue;
             }
@@ -5419,6 +5458,8 @@ class ChartOption {
                 if (csrc != null) { m.color = ChartOption.ParseColor(csrc, m.color); }
             }
             if (it.Has("valueIndex")) { m.valueIndex = it.Int("valueIndex", 0 - 1); }
+            if (m.color == 0) { m.color = lvlColor; }
+            if (m.lineType.Length == 0) { m.lineType = lvlType; }
             into.Add(m);
         }
     }
@@ -6024,6 +6065,16 @@ class ChartOption {
             o.title = v.Str("title", "");
         }
         if (v.Has("backgroundColor")) { o.backgroundColor = ChartOption.ParseColor(v.Get("backgroundColor"), o.backgroundColor); }
+        // ECharts 根级 color：string 数组，整图替换定性调色板。
+        JsonValue palv = v.Get("color");
+        if (palv != null && palv.IsArray()) {
+            List<int> pal = new List<int>();
+            for (int pi = 0; pi < palv.Count(); pi = pi + 1) {
+                int pc = ChartOption.ParseColor(palv.At(pi), 0);
+                if (pc != 0) { pal.Add(pc); }
+            }
+            if (pal.Count > 0) { o.colorPal = pal; }
+        }
         o.roamWheelMode = ChartKinds.RoamWheelModeSanitize(
             v.Str("roamWheelMode", o.roamWheelMode));
         ChartOption.ParseGrid(v.Get("grid"), o);
@@ -7717,6 +7768,14 @@ class ChartOption {
             if (loD > 2000000000.0 || loD < 0.0 - 2000000000.0) { loD = ChartOption.AutoD(); }
             if (hiD > 2000000000.0 || hiD < 0.0 - 2000000000.0) { hiD = ChartOption.AutoD(); }
             a.SetRange(loD, hiD);
+        }
+        // boundaryGap 数组形态（数值轴 extent 外扩，span 千分比）。
+        // 数字 = 小数分数（0.1 = 10%），字符串 = 'N%'。类目轴的
+        // bool 形态在上面/别处已收，两形态互不干扰。
+        JsonValue bgv = v.Get("boundaryGap");
+        if (bgv != null && bgv.IsArray() && bgv.Count() > 0) {
+            a.bgLoF = ChartOption.AxisGapPerMille(bgv.At(0));
+            if (bgv.Count() > 1) { a.bgHiF = ChartOption.AxisGapPerMille(bgv.At(1)); }
         }
         // yAxis.interval：数值轴刻度步长（bump-chart 的 1）。显式
         // min/max 存在时换算成刻度区间数，轴标签按整数步长落。

@@ -144,6 +144,7 @@ class ChartFrame {
         // A15：该轴挂有断带时走 elapsed 映射（breakImpl.ts normalize：
         // normalize = linear.normalize(transformIn(v))）。
         if (this.BrkHas(axisIndex)) { return this.YOfBrk((double)v, axisIndex); }
+        if (axisIndex == 1 ? this.rightLog : this.leftLog) { return this.YOfLog(v, axisIndex); }
         int lo = this.leftMin;
         int hi = this.leftMax;
         bool rev = this.reversed;
@@ -215,6 +216,7 @@ class ChartFrame {
     /// vF/1000 截断丢掉小数位。
     int YOfF(int vF, int axisIndex) {
         if (this.BrkHas(axisIndex)) { return this.YOfBrk((double)vF / 1000.0, axisIndex); }
+        if (axisIndex == 1 ? this.rightLog : this.leftLog) { return this.YOfLogF(vF, axisIndex); }
         int loF = this.leftMinF;
         int hiF = this.leftMaxF;
         bool rev = this.reversed;
@@ -242,6 +244,7 @@ class ChartFrame {
     int YOfFL(long vF, int axisIndex) {
         // A15：该轴挂断带时先折进 elapsed 空间（vF 是 ×1000 定点）。
         if (this.BrkHas(axisIndex)) { return this.YOfBrk((double)vF / 1000.0, axisIndex); }
+        if (axisIndex == 1 ? this.rightLog : this.leftLog) { return this.YOfLogF(vF, axisIndex); }
         int loF = this.leftMinF;
         int hiF = this.leftMaxF;
         bool rev = this.reversed;
@@ -338,6 +341,13 @@ class ChartFrame {
     /// 是连续对数。lg 值用 ×1000 定点（Log10F），域差转像素走 long。
     /// 低于/高于范围钳制在绘图区内。
     int YOfLog(int v, int axisIndex) {
+        // 小数对数域（leftMinF/leftMaxF 生效）走定点口径：整数
+        // floor-log10 承载不了 sub-1 十进位（0.001 线在整数域会被
+        // 钳成 1）。
+        if (this.leftMinF != 0 || this.leftMaxF != 0
+            || this.rightMinF != 0 || this.rightMaxF != 0) {
+            return this.YOfLogF((long)v * 1000L, axisIndex);
+        }
         if (v < 1) { v = 1; }
         int lo = this.leftMin;
         int hi = this.leftMax;
@@ -358,16 +368,34 @@ class ChartFrame {
     /// 同 YOfLog 但参数是 ×1000 定点的对数轴投影，
     /// 供细分刻度（2.8/4.6 这类非整值）用。
     /// 比 YOfLog 的整数口径多一档尾数分辨率。
+    /// 域读取：帧带 leftMinF/leftMaxF（小数对数域，line-log 的
+    /// 0.001..10000）时用定点域；否则退回整数域 ×1000。
     int YOfLogF(long vF, int axisIndex) {
-        int lo = this.leftMin;
-        int hi = this.leftMax;
+        long lo;
+        long hi;
         bool rev = this.reversed;
-        if (axisIndex == 1) { lo = this.rightMin; hi = this.rightMax; rev = this.rightReversed; }
-        if (lo < 1) { lo = 1; }
-        if (hi < lo + 1) { hi = lo + 1; }
-        if (vF < 1000L) { vF = 1000L; }
-        long llo = ChartFrame.Log10Fx((long)lo * 1000L);
-        long lhi = ChartFrame.Log10Fx((long)hi * 1000L);
+        if (axisIndex == 1) {
+            rev = this.rightReversed;
+            if (this.rightMinF != 0 || this.rightMaxF != 0) {
+                lo = this.rightMinF; hi = this.rightMaxF;
+            } else {
+                lo = (long)this.rightMin * 1000L;
+                hi = (long)this.rightMax * 1000L;
+            }
+        } else {
+            if (this.leftMinF != 0 || this.leftMaxF != 0) {
+                lo = this.leftMinF; hi = this.leftMaxF;
+            } else {
+                lo = (long)this.leftMin * 1000L;
+                hi = (long)this.leftMax * 1000L;
+            }
+        }
+        if (lo < 1L) { lo = 1L; }
+        if (hi < lo + 1000L) { hi = lo + 1000L; }
+        if (vF < lo) { vF = lo; }
+        if (vF > hi) { vF = hi; }
+        long llo = ChartFrame.Log10Fx(lo);
+        long lhi = ChartFrame.Log10Fx(hi);
         if (lhi <= llo) { lhi = llo + 1000L; }
         long d = (ChartFrame.Log10Fx(vF) - llo) * (long)this.plotH / (lhi - llo);
         if (d < 0L) { d = 0L; }
@@ -417,9 +445,13 @@ class ChartFrame {
     /// lg6≈778、lg10=1000），所以对整数点两者
     /// 输出完全一致（Log10Fx(8000*1000)==Log10F(8000)）。
     static long Log10Fx(long vF) {
-        if (vF < 1000L) { return 0L; }
+        if (vF <= 0L) { return 0L - 4000L; }
+        // sub-1 定点值（0.5 → 500‰）：先升到 ≥1 档记负指数，
+        // line-log 的 Log1/2 系列 0.5..0.002 才能落到正确的
+        // 负十进位（旧实现 <1000 一律归 0，整条线被压平在底档）。
         long e = 0L;
         long x = vF;
+        while (x < 1000L) { x = x * 10L; e = e - 1L; }
         while (x >= 10000L) { x = x / 10L; e = e + 1L; }
         long frac;
         if (x < 3000L) { frac = (x - 1000L) * 477L / 2000L; }
@@ -1447,6 +1479,57 @@ class Chart {
         if (r.hi <= r.lo) { r.hi = r.lo + 1; }
         int nt = (int)Chart.RoundP(((double)r.hi - (double)r.lo) / iv, 0);
         r.ticks = nt < 1 ? 1 : nt;
+        return r;
+    }
+
+    /// ECharts 6.1 IntervalScale 自动量程（源对抄 scale/helper.js
+    /// intervalScaleNiceTicks + util/number.js nice(NICE_MODE_ROUND) +
+    /// Interval.js getTicks 的两个域外补格分支）。SSR 校准 8 组数据
+    /// 逐例复现：interval = nice(span/5, round)——round 档是
+    /// 1/2/3/5/10（f 阈值 1.5/2.5/4/7；2.2.4 smartSteps 的 1/2/2.5/5
+    /// 在 0..1320 出 200 步 → 0..1400，官方 300 步 → 0..1500）；
+    /// 刻度界向内取整（ceil lo / floor hi），原始域溢出端向外补一格。
+    /// minInterval/maxInterval 非 Auto 时按 helper.js 钳制步长。
+    /// 0 锚不在此做（AxisLo/AxisHi 已按 scale 语义并入）。
+    static ChartSpan NiceSpan6(int dataLo, int dataHi, double minInterval,
+                               double maxInterval) {
+        long span = (long)dataHi - (long)dataLo;
+        if (span <= 0) { span = 1; }
+        long rough = span / 5;
+        if (rough < 1) { rough = 1; }
+        // 档位判据用 ×10 定点整数——f 的实数阈值 1.5/2.5/4/7，
+        // 截断到整数会把 1.564 误判进 1 档。
+        long exp10 = 1;
+        while (rough / exp10 >= 10) { exp10 = exp10 * 10; }
+        long f10 = rough * 10 / exp10;
+        long nf;
+        if (f10 < 15) { nf = 1; }
+        else if (f10 < 25) { nf = 2; }
+        else if (f10 < 40) { nf = 3; }
+        else if (f10 < 70) { nf = 5; }
+        else { nf = 10; }
+        long iv = nf * exp10;
+        if (!ChartOption.IsAutoD(minInterval) && (double)iv < minInterval) {
+            iv = (long)minInterval;
+        }
+        if (!ChartOption.IsAutoD(maxInterval) && (double)iv > maxInterval) {
+            iv = (long)maxInterval;
+        }
+        if (iv < 1) { iv = 1; }
+        // 向内取整（helper.js niceTickExtent）；负值要数学 ceil/floor，
+        // Zan 的 / 向零截断，走 FloorDivQ/CeilDivQ。
+        long loT = (long)Chart.CeilDivQ(dataLo, (int)iv) * iv;
+        long hiT = (long)Chart.FloorDivQ(dataHi, (int)iv) * iv;
+        // 原始域溢出端向外补一格（Interval.js getTicks 的
+        // extent[0] < niceExtent[0] / extent[1] > lastNiceTick 分支；
+        // 向内取整保证各至多一格）。
+        if (loT > dataLo) { loT = loT - iv; }
+        if (hiT < dataHi) { hiT = hiT + iv; }
+        ChartSpan r = new ChartSpan();
+        r.lo = (int)loT;
+        r.hi = (int)hiT;
+        r.ticks = (int)((hiT - loT) / iv);
+        if (r.ticks < 1) { r.ticks = 1; }
         return r;
     }
 
@@ -2990,6 +3073,48 @@ class Chart {
         }
         if (ts[ts.Count - 1] != hi) { ts.Add(hi); }
         return ts;
+    }
+
+    /// 官方 LogScale.getExtent 的十进位对齐：下界 = 10^floor(log10 v)、
+    /// 上界 = 10^ceil(log10 v)（line-log 数据 0.002..2000 → 0.001..10000）。
+    /// F 后缀作用于 ×1000 定点域（sub-1 十进位只有定点能承载）。
+    /// log 轴小数十进位标签：‰ 域 → "0.001"/"0.01"/"0.1"/"1"/"10,000"。
+    /// FracText 只有两位小数（1‰ → "0"），log 轴底档需要三位。
+    static string LogFracText(long vF) {
+        if (vF >= 1000L) { return Chart.Commas((int)(vF / 1000L)); }
+        string fs = Convert.ToString((int)vF);
+        string pad = "";
+        while (pad.Length + fs.Length < 3) { pad = pad + "0"; }
+        return "0." + pad + fs;
+    }
+
+    static int LogFloorI(int v) {
+        if (v < 1) { return 1; }
+        int b = 1;
+        while ((long)b * 10L <= (long)v) { b = b * 10; }
+        return b;
+    }
+    static int LogCeilI(int v) {
+        if (v < 1) { return 1; }
+        int b = 1;
+        while (b < v) {
+            if (b > 100000000) { return 1000000000; }
+            b = b * 10;
+        }
+        return b;
+    }
+    static long LogFloorF(long vF) {
+        if (vF <= 0) { return 1; }
+        long b = 1000;
+        while (b * 10L <= vF) { b = b * 10L; }
+        while (b > vF) { b = b / 10L; }
+        return b < 1 ? 1 : b;
+    }
+    static long LogCeilF(long vF) {
+        if (vF <= 0) { return 1000; }
+        long b = 1000;
+        while (b < vF) { b = b * 10L; }
+        return b;
     }
 
     /// 从 epoch 天生成确定性短日期 "YYYY-MM-DD"（真实公历，经
@@ -5233,8 +5358,19 @@ class Chart {
         if (y0.minDataB) { declLo = Chart.AxisMinFor(series, 0, zI0, zI1, true); }
         int declHi = y0.max;
         if (y0.maxDataB) { declHi = Chart.AxisMaxFor(series, 0, zI0, zI1, true); }
-        int leftLo = Chart.AxisLo(declLo, Chart.AxisMinFor(series, 0, zI0, zI1, y0.scale), y0.scale);
+        int rawLo = Chart.AxisMinFor(series, 0, zI0, zI1, y0.scale);
+        int leftLo = Chart.AxisLo(declLo, rawLo, y0.scale);
         int leftHi = Chart.AxisHi(declHi, lData, leftLo);
+        // 数值轴 boundaryGap（整数路径）：原始域按声明千分比外扩
+        // （官方 fixExtentWithBoundaryGap），仅 min/max 均未固定时。
+        if (!leftFrac && (y0.bgLoF != 0 || y0.bgHiF != 0)
+            && ChartOption.IsAutoD(y0.minD) && ChartOption.IsAutoD(y0.maxD)) {
+            long spanBg = (long)(leftHi - leftLo);
+            if (spanBg > 0) {
+                leftLo = (int)((long)leftLo - spanBg * y0.bgLoF / 1000);
+                leftHi = (int)((long)leftHi + spanBg * y0.bgHiF / 1000);
+            }
+        }
         // alignTicks 需要的是 **nice 之前**的原始 extent
         // （axisAlignTicks.ts:176 的 targetExtent = 原始域，不是 niceExtent）。
         // 本引擎两条路径的原始域都要留下副本。
@@ -5272,17 +5408,43 @@ class Chart {
             } else {
                 // minInterval/maxInterval 在数据单位上声明，定点域 ×1000。
                 // 未声明（AutoD 哨兵）不能乘，否则哨兵失效。
-                lRawLo = (double)leftLoF; lRawHi = (double)leftHiF;
-                double lmn = ChartOption.IsAutoD(y0.minInterval)
-                    ? ChartOption.AutoD() : y0.minInterval * 1000.0;
-                double lmx = ChartOption.IsAutoD(y0.maxInterval)
-                    ? ChartOption.AutoD() : y0.maxInterval * 1000.0;
-                ChartSpan fs2 = Chart.ClampNiceRange(leftLoF, leftHiF, y0.scale, lmn, lmx);
-                leftLoF = fs2.lo;
-                leftHiF = fs2.hi;
-                ticks = fs2.ticks;
+                // boundaryGap（定点路径）：nice 之前按 span 千分比外扩
+                // （官方 fixExtentWithBoundaryGap，area-time-axis
+                // [0,'100%']：-499..283 → -499..1065 → nice -600..1200）。
+                if (y0.bgLoF != 0 || y0.bgHiF != 0) {
+                    long spanBg = (long)(leftHiF - leftLoF);
+                    if (spanBg > 0) {
+                        leftLoF = (int)((long)leftLoF - spanBg * y0.bgLoF / 1000);
+                        leftHiF = (int)((long)leftHiF + spanBg * y0.bgHiF / 1000);
+                    }
+                }
+                if (y0.type == ChartAxisType.Log) {
+                    // 对数轴（小数域）：官方 LogScale.getExtent 对齐十
+                    // 进位，10^floor/ceil（line-log 0.002..2000 →
+                    // 0.001..10000，‰ 域 1..10000000）。不走线性 nice。
+                    leftLoF = (int)Chart.LogFloorF(leftLoF);
+                    leftHiF = (int)Chart.LogCeilF(leftHiF);
+                    if (leftHiF <= leftLoF) { leftHiF = leftLoF * 10; }
+                    lRawLo = (double)leftLoF; lRawHi = (double)leftHiF;
+                    ticks = 1;
+                    long dg = (long)leftLoF;
+                    int dc = 0;
+                    while (dg < leftHiF) { dg = dg * 10L; dc = dc + 1; }
+                    ticks = dc > 0 ? dc : 1;
+                } else {
+                    lRawLo = (double)leftLoF; lRawHi = (double)leftHiF;
+                    double lmn = ChartOption.IsAutoD(y0.minInterval)
+                        ? ChartOption.AutoD() : y0.minInterval * 1000.0;
+                    double lmx = ChartOption.IsAutoD(y0.maxInterval)
+                        ? ChartOption.AutoD() : y0.maxInterval * 1000.0;
+                    ChartSpan fs2 = Chart.ClampNiceRange(leftLoF, leftHiF, y0.scale, lmn, lmx);
+                    leftLoF = fs2.lo;
+                    leftHiF = fs2.hi;
+                    ticks = fs2.ticks;
+                }
                 leftLo = leftLoF / 1000;
                 leftHi = leftHiF / 1000;
+                if (leftLo < 1) { leftLo = 1; }
             }
         }
         bool hasRight = Chart.AnyOnAxis(series, 1);
@@ -5348,9 +5510,23 @@ class Chart {
             && y0.min == ChartOption.Auto() && y0.max == ChartOption.Auto()
             && !y0.minDataB && !y0.maxDataB
             && (leftDataMax < 0 || y0.scale)) {
-            lRawLo = (double)Chart.AxisMinFor(series, 0, zI0, zI1, y0.scale);
-            lRawHi = (double)lData;
-            ChartSpan ls = Chart.ClampNiceRange((int)lRawLo, (int)lRawHi, y0.scale,
+            // nice 输入取**原始域**：AxisLo/AxisHi 的 NiceMin/NiceMax
+            // 预整是 ECharts 2 老管道，会先把 -499..283 抹成
+            // -500..500、丢掉官方步长判定（SSR 实测 nice(1564/5)
+            // 落 3 档 = 300，nice(1000/5) 落 2 档 = 200）。官方流程
+            // 是原始域 → fixExtentWithBoundaryGap → niceExtent。
+            int nLo = rawLo;
+            int nHi = lData;
+            if (y0.bgLoF != 0 || y0.bgHiF != 0) {
+                long spanBg = (long)nHi - (long)nLo;
+                if (spanBg > 0) {
+                    nLo = (int)((long)nLo - spanBg * y0.bgLoF / 1000);
+                    nHi = (int)((long)nHi + spanBg * y0.bgHiF / 1000);
+                }
+            }
+            lRawLo = (double)nLo;
+            lRawHi = (double)nHi;
+            ChartSpan ls = Chart.NiceSpan6((int)lRawLo, (int)lRawHi,
                 y0.minInterval, y0.maxInterval);
             leftLo = ls.lo;
             leftHi = ls.hi;
@@ -5358,8 +5534,11 @@ class Chart {
             rt = ticks;
         }
         if (leftLog) {
-            if (leftLo < 1) { leftLo = 1; }
-            if (leftHi < leftLo + 1) { leftHi = leftLo + 1; }
+            // 官方 LogScale.getExtent：域对齐十进位（数据 1..2000 →
+            // 1..10000），不是线性 nice 也不是 1 的钳制。
+            leftLo = Chart.LogFloorI(leftLo);
+            leftHi = Chart.LogCeilI(leftHi);
+            if (leftHi <= leftLo) { leftHi = leftLo * 10; }
         }
         // A15：断轴量程另走 BrkNiceExtent（elapsed 跨度定 interval、
         // 域向外扩到整数倍）。普通 nice 的 1/2/5 十档与官方断轴的
@@ -5953,6 +6132,22 @@ class Chart {
                 c.DrawText(plotX - app.Scale(6) - lw, Canvas.CenterTextYAt(gy, fs),
                     ls, sAxis.FgOr(0), fs);
             }
+        } else if (leftLog && leftFrac && (leftLoF != 0 || leftHiF != 0)) {
+            // 对数轴（小数域）：十进位枚举（‰ 域 ×10 递进），
+            // FracText 出 0.001/0.01/1/10000 这类标签。
+            long lvF = leftLoF;
+            while (lvF <= leftHiF) {
+                int gy = f.YOfLogF(lvF, 0);
+                if (grid) { c.FillRect(plotX, gy, plotW, 1, sGrid.BgOr(0)); }
+                if (y0Show) {
+                    string ls = Chart.LogFracText(lvF);
+                    if (y0.labelFormatter.Length > 0) { ls = y0.labelFormatter.Replace("{value}", ls); }
+                    int lw = Canvas.MeasureText(ls, fs);
+                    c.DrawText(plotX - app.Scale(6) - lw, Canvas.CenterTextYAt(gy, fs),
+                        ls, sAxis.FgOr(0), fs);
+                }
+                lvF = lvF * 10L;
+            }
         } else if (leftLog) {
             List<int> lts = Chart.LogTicks(leftLo, leftHi);
             for (int li = 0; li < lts.Count; li = li + 1) {
@@ -6051,12 +6246,26 @@ class Chart {
                 // 对数轴：刻度非等距，逐对插值
                 // （minorTicks.ts:41-63），投影走
                 // YOfLogF 的定点对数轴。
-                List<int> ltsM = Chart.LogTicks(leftLo, leftHi);
-                List<double> mtsL = new List<double>();
-                Chart.MinorTickValuesPairs(ltsM, y0.minorTickSplitNumber, mtsL);
-                for (int mi = 0; mi < mtsL.Count; mi = mi + 1) {
-                    long mf = (long)(mtsL[mi] * 1000.0 + 0.5);
-                    c.FillRect(plotX, f.YOfLogF(mf, 0), plotW, 1, mcol);
+                if (leftFrac && (leftLoF != 0 || leftHiF != 0)) {
+                    // 小数域：每十进位内按 splitNumber 线性插值。
+                    long dF = leftLoF;
+                    while (dF < leftHiF) {
+                        long dF10 = dF * 10L;
+                        for (int mk = 1; mk < y0.minorTickSplitNumber; mk = mk + 1) {
+                            long mf = dF + (dF10 - dF) * mk / y0.minorTickSplitNumber;
+                            if (mf >= leftHiF) { break; }
+                            c.FillRect(plotX, f.YOfLogF(mf, 0), plotW, 1, mcol);
+                        }
+                        dF = dF10;
+                    }
+                } else {
+                    List<int> ltsM = Chart.LogTicks(leftLo, leftHi);
+                    List<double> mtsL = new List<double>();
+                    Chart.MinorTickValuesPairs(ltsM, y0.minorTickSplitNumber, mtsL);
+                    for (int mi = 0; mi < mtsL.Count; mi = mi + 1) {
+                        long mf = (long)(mtsL[mi] * 1000.0 + 0.5);
+                        c.FillRect(plotX, f.YOfLogF(mf, 0), plotW, 1, mcol);
+                    }
                 }
             }
             if (y0.minorSplitLineShow && !catY && !leftLog
