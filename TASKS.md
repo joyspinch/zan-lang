@@ -2386,10 +2386,18 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
   51 文件措辞对齐（stdlib 注释/模板头/gallery 资产/mcp_server 工具
   描述/docs 活文档/skill ②③）。验证：templates_build 33 模板 32 OK、
   lsp 探针全绿、stdlib 类型检查过、check_structure 与 HEAD 同结果。
-  **命名债挂账（不挡功能，等 knowledge/MCP 管线专项或版本边界一起
-  改名）**：zform.json/zform.doc.json/ZformSchema.zan/run_zform_schema
-  .cmake/conformance_gui_zform_html 测试名——内容是格式无关的控件
-  PropSpec 目录，"zform"只是历史资源名。**在途半成品挂账**：
+  **命名债（.zform 移除拍板后的收口状态，2026-09-13）**：文档/技能面
+  已清——docs 口径统一为"格式无关的控件 PropSpec 目录（文件名沿用
+  历史 zform.json）"，zform-review 五份旧评审归档 docs/archive/，
+  game-dev/gui-design 技能已教 .html 设计稿新方案。剩**物理改名**
+  待 knowledge/MCP 管线专项一次执行，映射表：
+  zform.json→controls.json、zform.doc.json→controls.doc.json、
+  ZformSchema.zan/ZformResult→ControlCatalog.zan/CatalogResult、
+  zan_form_schema（MCP 工具名，对外破坏面：外部客户端+zan-mcp/ai
+  文档需同改）→zan_control_schema、MCP 响应键 zformControls→
+  controlCatalog（对外）、run_zform_schema.cmake→run_control_schema
+  .cmake、conformance_gui_zform_html→conformance_gui_controls_html
+  （ctest 名，内部安全）。**在途半成品挂账**：
   server-legend Player.zan 字段改名（arenaPts→merit、stars→starsLit、
   删 buffUntil 加四币种）模型侧已改、消费端（Play/Gateway/World 的
   Set 链与读写点 ~13 处）未跟上——模板门 templates_build 因此红，

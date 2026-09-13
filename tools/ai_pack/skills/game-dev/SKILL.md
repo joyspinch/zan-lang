@@ -96,8 +96,32 @@ description: Zan 2D 游戏(templates/game/* 与 stdlib/Game)的帧循环、HUD �
 - **像素断言在 Present 之前做**：present 后画布内容不保留（与合成
   契约同源）；GetPixel 是回读同步、每样本只读一个像素，条带哈希级
   采样会把探针拖慢一个量级。
-- 台账：运行期 HTML 流式子元素的 % 宽未生效（内联/样式表 alike 回落
-  auto=100% 母宽），血条宽度驱动现走颜色/文本更新，待引擎修复。
+- 台账（已闭）：运行期 HTML 流式子元素的 % 宽未生效（内联/样式表
+  alike 回落 auto=100% 母宽）——P8 已修（StyleDeclaresWidth 认 Pm、
+  包含块未定的测量路径回落 fb），血条宽度可直接 `width:X%` 驱动。
+
+## 游戏界面设计方案：菜单/面板走 .html 设计稿 + Nav 出口
+
+放置/面板驱动类（legend、wuwei 这类"页签导航 + 全屏面板堆"，界面
+代码占大头）按声明层方案组织，不要手写建树；RTS/动作类不适用（见
+热路径边界）。
+
+- **每个页面一张 .html 设计稿**：布局/列表/样式进设计稿，数据绑定走
+  `data-bind`/`data-for`（服务端 JSON 或本地模型都接 JsonValue），
+  交互在 code-behind。五件声明原语与硬边界见 gui-design skill 的
+  "HTML 窗口开发定式"（设计稿必须是编译输入第一个文件等）。
+- **页与页切换 = `Gui/Nav.zan` 的 `Nav.Embed`**（Tabs-as-outlet）：
+  路由表对应按钮排（legend 的按钮本来就从 navigation.csv 读——
+  `data-for` 一条渲染），中间区 = 出口；惰性实例化、默认切走保留
+  （keepAlive）、可按路由配临态。别用 N 个布尔 data-if 硬拼页切换
+  （data-if 只认路径真值，没有比较表达式）。
+- **热路径边界**：每帧变的 HUD（血条/伤害数字/选中框/小地图）继续
+  代码直绘 + 门控渲染（上一节）——那是性能边界不是能力缺口；
+  RTS/动作类整体属这类，HTML 化收益低。放置类主城的计数条量少，
+  直绘或 HTML 都行。
+- 已知坑出处：项目 `skins/` 目录连 base.css 一起带（wuwei 百艺页签
+  全叠的根因）；运行时建树用 `App.LoadHtml`，编译期通道用 GenHtml，
+  两者同语义。
 
 ## GPU 档 3D（DrawMesh3D）平台事实与 NVIDIA 死锁定式
 

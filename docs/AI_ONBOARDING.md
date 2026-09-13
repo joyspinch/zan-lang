@@ -22,7 +22,7 @@ the templates:
                              AGENTS.md, skills\, mcp.json,
                              cursor.mcp.json, vscode.mcp.json
 <ZAN_SDK>\knowledge\         symbols.json (API index), gallery.json (examples),
-                             zform.json (.zform schema and control catalog)
+                             zform.json (control PropSpec catalog; legacy file name)
 <ZAN_SDK>\toolchain\         zanc, zan-lsp, zan-dap, linker, gdb
 ```
 
