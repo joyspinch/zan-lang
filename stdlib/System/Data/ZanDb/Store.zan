@@ -8,32 +8,32 @@ namespace System.Data.ZanDb;
 /// （键不存在时 current 为 ""）。</summary>
 delegate string StoreUpdater(string current);
 
+/// 段句柄：段文件与其全局段号的配对。
+class SegRef {
+    SegmentFile seg;
+    long id;
+
+    SegRef(SegmentFile seg, long id) {
+        this.seg = seg;
+        this.id = id;
+    }
+}
+
 /// <summary>
-/// 日志式键值存储：全内存哈希索引 + 单一追加日志。
-/// 点读 O(1) 零 IO；写路径只做顺序追加，一组提交一次定位写、
-/// 至多一次 fsync。打开时重放日志恢复，撕裂尾部自动截断——
-/// 任何时刻断电，数据库都停留在最后一个完整帧。
+/// 日志式键值存储：memtable + 不可变有序段 + 追加日志 + 双槽清单。
 ///
-/// 每条记录一帧，载荷（小端）：
-///   u64 seq
-///   u8  op        1 = put，2 = delete
-///   varint 键长 + 键字节
-///   varint 值长 + 值字节（仅 put）
-/// 键与值按 NUL-free 契约传递（记录编码层负责转义，参见
-/// Collection 的 EncodeDoc），因此字符串可以安全往返。
+/// 写路径：追加 CRC 帧日志（组提交）+ 更新 memtable；日志攒到
+/// 阈值（默认 64MB，可调）把 memtable 排序固化为新段、保存
+/// manifest、截断日志。读路径：memtable → 内存索引（键 → 段号）
+/// → 目标段的块（有界块缓存，O(1) 点读）。恢复：逐段顺序扫描
+/// 重建索引（Bitcask 式，纯顺序读）+ 重放日志中 seq ≥ 水位的
+/// 尾部——「manifest 已存、日志未截断」的崩溃窗口由水位跳过。
 ///
-/// 持久化三档（默认 GROUP）：
-///   DUR_SYNC  每次提交 flush + fsync——停电不丢已确认的提交
-///   DUR_GROUP 每次提交 flush 进 OS 缓存，每 syncEvery 次提交
-///             或攒满 512KB 才 fsync——停电丢最近几次提交
-///   DUR_NONE  攒满 1MB 才 flush，仅 Checkpoint/Close 落盘
-/// 三档都不会损坏数据库：fsync 之前的帧在崩溃时整体消失。
+/// 内存有界：memtable ≤ 阈值，块缓存有硬上限；常驻索引每键
+/// 只有哈希项 + 4 字节段号。
 ///
-/// 并发模型：单进程、单写多读。同步 API 不加锁（一个句柄
-/// 归一个所有者）；协程请走 Async 系列——它们经共享
-/// AsyncRwLock 串行化写、共享化读。跨进程访问不受支持：
-/// 跨进程文件锁是上一代引擎并发瓶颈的根源，多进程共享
-/// 请走服务进程。
+/// 记录帧、持久化三档、NUL-free 契约、单进程单写多读模型
+/// 与异步 API 的说明见各类注释（LogFile / Segment / Manifest）。
 /// </summary>
 class ZanStore {
     /// 每次提交都 fsync。
@@ -47,29 +47,62 @@ class ZanStore {
     static int GROUP_FLUSH_BYTES = 524288;
     /// NONE 档攒满这么多字节强制 flush 进 OS 缓存。
     static int NONE_FLUSH_BYTES = 1048576;
+    /// 默认 memtable/日志 flush 阈值（字节）。
+    static long DEFAULT_FLUSH_THRESHOLD = 67108864;
+    /// 默认块缓存上限（字节）。
+    static long DEFAULT_CACHE_CAP = 33554432;
 
     LogFile log;
-    Dictionary<string, string> map;
-    /// 事务内的未提交覆盖层：put 的键值；值为空串仅表示删除。
-    Dictionary<string, string> txPut;
-    Dictionary<string, string> txDel;
+    Dictionary<string, string> memtable;
+    Dictionary<string, long> index;
+    List<SegRef> segs;
+    Manifest man;
+    string basePath;
+    BlockCache cache;
     AsyncRwLock rw;
     int durability;
     int syncEvery;
     int commitsSinceSync;
     long seq;
+    long logStartSeq;
+    long nextSegId;
+    long flushThreshold;
+    long recoverSeg;
     int txDepth;
     int txMark;
+    Dictionary<string, string> txPut;
+    Dictionary<string, string> txDel;
+    /// <summary>未固化墓碑：删掉的键在旧段里仍有旧版本，固化时
+    /// 必须把 op=2 记录写进新段压住它们，否则恢复扫描会让已删
+    /// 键复活（旧段版本重指索引）。</summary>
+    Dictionary<string, long> tombstones;
     string lastError;
 
     ZanStore() {
+        this.memtable = new Dictionary<string, string>();
+        this.index = new Dictionary<string, long>();
+        this.segs = new List<SegRef>();
+        this.txPut = new Dictionary<string, string>();
+        this.txDel = new Dictionary<string, string>();
+        this.tombstones = new Dictionary<string, long>();
+        this.cache = new BlockCache(ZanStore.DEFAULT_CACHE_CAP);
+        this.rw = new AsyncRwLock();
         this.durability = ZanStore.DUR_GROUP;
         this.syncEvery = 32;
         this.commitsSinceSync = 0;
         this.seq = 0;
+        this.logStartSeq = 0;
+        this.nextSegId = 0;
+        this.flushThreshold = ZanStore.DEFAULT_FLUSH_THRESHOLD;
+        this.recoverSeg = 0;
         this.txDepth = 0;
         this.txMark = 0;
+        this.basePath = "";
         this.lastError = "";
+    }
+
+    static string SegPath(string basePath, long id) {
+        return basePath + ".s" + Convert.ToString(id);
     }
 
     /// <summary>打开（必要时创建）分组提交档的存储。</summary>
@@ -77,22 +110,68 @@ class ZanStore {
         return ZanStore.Open(path, ZanStore.DUR_GROUP);
     }
 
-    /// <summary>以显式持久化档打开：重放既有日志恢复内存索引，
-    /// 撕裂尾部就地截断。</summary>
+    /// <summary>以显式持久化档打开：加载 manifest 与段、重建
+    /// 内存索引、按水位重放日志尾部。</summary>
     static ZanStore Open(string path, int durability) {
         ZanStore s = new ZanStore();
         s.durability = durability;
-        s.map = new Dictionary<string, string>();
-        s.txPut = new Dictionary<string, string>();
-        s.txDel = new Dictionary<string, string>();
-        s.rw = new AsyncRwLock();
+        s.basePath = path;
         s.log = LogFile.Open(path);
         if (!s.log.IsOpen()) {
             s.lastError = s.log.GetError();
             return s;
         }
+        s.man = Manifest.Load(path);
+        if (s.man.Exists()) {
+            s.logStartSeq = s.man.LogStartSeq();
+            s.nextSegId = s.man.NextSegId();
+            List<long> ids = s.man.SegIds();
+            for (int i = 0; i < ids.Count; i = i + 1) {
+                SegmentFile sf = SegmentFile.Open(ZanStore.SegPath(path, ids[i]));
+                if (sf.GetError() != "") {
+                    s.lastError = "segment " + Convert.ToString(ids[i]) + ": " + sf.GetError();
+                    return s;
+                }
+                s.recoverSeg = ids[i];
+                s.segs.Add(new SegRef(sf, ids[i]));
+                sf.Scan("", s.RecoverRecord);
+            }
+        }
         s.log.Replay(s.ApplyFrame);
         return s;
+    }
+
+    /// 恢复扫描回调：段内记录重指索引（段按号升序扫描，
+    /// 后段覆盖前段；墓碑摘除索引，为合并输出预留）。
+    bool RecoverRecord(string key, string val, int op) {
+        if (op == 2) {
+            if (this.index.ContainsKey(key)) { this.index.Remove(key); }
+            return true;
+        }
+        if (this.index.ContainsKey(key)) { this.index.Remove(key); }
+        this.index.Add(key, this.recoverSeg);
+        return true;
+    }
+
+    /// 重放期间应用一帧；水位之下的陈旧头跳过。重放的删除同时
+    /// 进墓碑集——该删除尚未落段，下次固化必须带进新段。
+    void ApplyFrame(ByteBuffer b) {
+        b.SeekRead(0);
+        long fseq = b.ReadU64();
+        if (fseq < this.logStartSeq) { return; }
+        int op = b.ReadU8();
+        string key = b.ReadString();
+        if (op == 1) {
+            string val = b.ReadString();
+            if (this.memtable.ContainsKey(key)) { this.memtable.Remove(key); }
+            if (this.tombstones.ContainsKey(key)) { this.tombstones.Remove(key); }
+            this.memtable.Add(key, val);
+        } else if (op == 2) {
+            this.memtable.Remove(key);
+            if (this.index.ContainsKey(key)) { this.index.Remove(key); }
+            if (!this.tombstones.ContainsKey(key)) { this.tombstones.Add(key, 0); }
+        }
+        this.seq = fseq + 1;
     }
 
     /// 是否处于打开状态（打开无错误且底层日志可用）。
@@ -101,29 +180,23 @@ class ZanStore {
     /// 最近一次打开失败的错误文本；Open 失败时由它给出原因。
     string GetError() { return this.lastError; }
 
-    /// 重放期间按日志序应用一帧；缓冲区归 LogFile，不得 Free。
-    void ApplyFrame(ByteBuffer b) {
-        b.SeekRead(0);
-        b.ReadU64();
-        int op = b.ReadU8();
-        string key = b.ReadString();
-        if (op == 1) {
-            string val = b.ReadString();
-            if (this.map.ContainsKey(key)) { this.map.Remove(key); }
-            this.map.Add(key, val);
-        } else if (op == 2) {
-            this.map.Remove(key);
-        }
-        this.seq = this.seq + 1;
-    }
-
     /// <summary>该句柄已应用的记录数：单调递增，可当快照版本用。</summary>
     long Version() { return this.seq; }
 
-    /// 键值对总数（内存索引维护，O(1)）。
-    int Count() { return this.map.Count; }
+    /// 键值对总数：索引（已落段）+ memtable 中尚未落段的新键。
+    int Count() {
+        int n = this.index.Count;
+        List<string> mk = this.memtable.Keys;
+        for (int i = 0; i < mk.Count; i = i + 1) {
+            if (!this.index.ContainsKey(mk[i])) { n = n + 1; }
+        }
+        return n;
+    }
 
-    /// 日志逻辑大小（字节）：含已落盘与缓冲中的帧。
+    /// 已固化段的数量。
+    int SegCount() { return this.segs.Count; }
+
+    /// 日志逻辑大小（字节）：0 表示全部数据已在段里。
     long LogBytes() { return this.log.Size(); }
 
     /// 切换持久化档（立即生效）。
@@ -133,6 +206,19 @@ class ZanStore {
     /// 一次 fsync（攒满 <see cref="GROUP_FLUSH_BYTES"/> 字节会提前）。</summary>
     void SetSyncEvery(int n) {
         if (n >= 1) { this.syncEvery = n; }
+    }
+
+    /// <summary>memtable/日志 flush 阈值（字节）：日志攒到该值
+    /// 即固化新段。默认 64MB；调小是合法配置（=1 即每次提交
+    /// 都固化），只拒绝非正数。</summary>
+    void SetFlushThreshold(long bytes) {
+        if (bytes >= 1) { this.flushThreshold = bytes; }
+    }
+
+    /// <summary>块缓存字节上限。默认 32MB；调小是合法配置
+    /// （缓存退化到直读），只拒绝非正数。</summary>
+    void SetCacheCap(long bytes) {
+        if (bytes >= 1) { this.cache.SetCap(bytes); }
     }
 
     // ===== 同步核心（单所有者，无锁） =====
@@ -146,8 +232,17 @@ class ZanStore {
             string tv = "";
             if (this.txPut.TryGetValue(key, out tv)) { return tv; }
         }
-        string v = "";
-        if (this.map.TryGetValue(key, out v)) { return v; }
+        string mv = "";
+        if (this.memtable.TryGetValue(key, out mv)) { return mv; }
+        long segId = 0;
+        if (this.index.TryGetValue(key, out segId)) {
+            SegRef r = this.FindSeg(segId);
+            if (r != null) {
+                string sv = "";
+                int hit = r.seg.Lookup(key, out sv, this.cache, segId);
+                if (hit == 1) { return sv; }
+            }
+        }
         return "";
     }
 
@@ -157,11 +252,12 @@ class ZanStore {
             if (this.txDel.ContainsKey(key)) { return false; }
             if (this.txPut.ContainsKey(key)) { return true; }
         }
-        return this.map.ContainsKey(key);
+        if (this.memtable.ContainsKey(key)) { return true; }
+        return this.index.ContainsKey(key);
     }
 
     /// <summary>插入或替换一个键。除非处于 Begin()/Commit() 内，
-    /// 否则按当前持久化档立即落盘。</summary>
+    /// 否则按当前持久化档立即落盘；日志攒满阈值自动固化新段。</summary>
     void Put(string key, string val) {
         this.AppendRec(1, key, val);
         if (this.txDepth > 0) {
@@ -170,17 +266,15 @@ class ZanStore {
             this.txPut.Add(key, val);
             return;
         }
-        if (this.map.ContainsKey(key)) { this.map.Remove(key); }
-        this.map.Add(key, val);
+        if (this.memtable.ContainsKey(key)) { this.memtable.Remove(key); }
+        if (this.tombstones.ContainsKey(key)) { this.tombstones.Remove(key); }
+        this.memtable.Add(key, val);
         this.FinishCommit();
     }
 
     /// 删除键；键存在时返回 true。
     bool Delete(string key) {
-        if (this.txDepth == 0 && !this.map.ContainsKey(key)) { return false; }
-        if (this.txDepth > 0) {
-            if (!this.Contains(key)) { return false; }
-        }
+        if (!this.Contains(key)) { return false; }
         this.AppendRec(2, key, "");
         if (this.txDepth > 0) {
             if (this.txPut.ContainsKey(key)) { this.txPut.Remove(key); }
@@ -188,13 +282,15 @@ class ZanStore {
             this.txDel.Add(key, "");
             return true;
         }
-        this.map.Remove(key);
+        this.memtable.Remove(key);
+        this.index.Remove(key);
+        if (!this.tombstones.ContainsKey(key)) { this.tombstones.Add(key, 0); }
         this.FinishCommit();
         return true;
     }
 
     /// <summary>开始一个批次：写入进入覆盖层并追加日志帧，
-    /// 最外层 Commit 时合并进内存索引并按持久化档落盘。
+    /// 最外层 Commit 时合并进 memtable 并按持久化档落盘。
     /// 可嵌套。</summary>
     void Begin() {
         if (this.txDepth == 0) { this.txMark = this.log.Mark(); }
@@ -220,11 +316,13 @@ class ZanStore {
         this.txDel.Clear();
     }
 
-    /// 最外层提交时把覆盖层合并进内存索引。
+    /// 最外层提交时把覆盖层合并进 memtable/索引/墓碑。
     void MergeTxOverlay() {
         List<string> dk = this.txDel.Keys;
         for (int i = 0; i < dk.Count; i = i + 1) {
-            this.map.Remove(dk[i]);
+            this.memtable.Remove(dk[i]);
+            this.index.Remove(dk[i]);
+            if (!this.tombstones.ContainsKey(dk[i])) { this.tombstones.Add(dk[i], 0); }
         }
         this.txDel.Clear();
         List<string> pk = this.txPut.Keys;
@@ -232,19 +330,19 @@ class ZanStore {
             string k = pk[i];
             string v = "";
             this.txPut.TryGetValue(k, out v);
-            if (this.map.ContainsKey(k)) { this.map.Remove(k); }
-            this.map.Add(k, v);
+            if (this.memtable.ContainsKey(k)) { this.memtable.Remove(k); }
+            if (this.tombstones.ContainsKey(k)) { this.tombstones.Remove(k); }
+            this.memtable.Add(k, v);
         }
         this.txPut.Clear();
     }
 
-    /// 按当前持久化档处理缓冲：flush / 窗口化 fsync。
+    /// 按当前持久化档处理缓冲：flush / 窗口化 fsync；日志攒满
+    /// 阈值时固化新段。
     void FinishCommit() {
         if (this.durability == ZanStore.DUR_SYNC) {
             if (!this.log.Sync()) { this.lastError = this.log.GetError(); }
-            return;
-        }
-        if (this.durability == ZanStore.DUR_GROUP) {
+        } else if (this.durability == ZanStore.DUR_GROUP) {
             if (!this.log.Flush()) {
                 this.lastError = this.log.GetError();
                 return;
@@ -255,11 +353,87 @@ class ZanStore {
                 if (!this.log.Sync()) { this.lastError = this.log.GetError(); }
                 this.commitsSinceSync = 0;
             }
+        } else {
+            if (this.log.PendingBytes() >= ZanStore.NONE_FLUSH_BYTES) {
+                this.log.Flush();
+            }
+        }
+        if (this.log.Size() >= this.flushThreshold) {
+            this.FlushToSegment();
+        }
+    }
+
+    /// <summary>把 memtable 固化为新段：put 与未固化墓碑按键序
+    /// 合并写段 → fsync → 保存 manifest（水位 = 当前 seq）→ 截断
+    /// 日志。墓碑必须随段持久化：被删键在旧段里仍有旧版本，没有
+    /// 新段墓碑压住，恢复扫描就会把它复活。任一步失败都保持日志
+    /// 兜底（旧 manifest + 完整日志 = 完好状态）；成功后日志归零。
+    /// 须在写侧串行环境调用（同步核心即满足；协程请走
+    /// <see cref="FlushAsync"/>）。</summary>
+    void FlushToSegment() {
+        if (this.memtable.Count == 0 && this.tombstones.Count == 0) {
+            // 空覆盖也能安全轮转：memtable 与墓碑皆空说明未落段
+            // 日志的净效果为零（put 过的键都被删除或已落段）。
+            if (this.log.Size() == 0) { return; }
+            if (!this.man.Save(this.seq, this.nextSegId, this.SegIdList())) {
+                this.lastError = this.man.GetError();
+                return;
+            }
+            this.log.Reset();
             return;
         }
-        if (this.log.PendingBytes() >= ZanStore.NONE_FLUSH_BYTES) {
-            this.log.Flush();
+        long segId = this.nextSegId;
+        string segPath = ZanStore.SegPath(this.basePath, segId);
+        // 同号孤儿防御：上次崩溃可能留下未入清单的同名残段。
+        File.Delete(segPath);
+        // 写入集 = memtable put + 墓碑 del；两集合互斥（Put 摘
+        // 墓碑、Delete 摘 memtable），合并后同键至多一条记录。
+        List<string> keys = new List<string>();
+        List<string> src = this.memtable.Keys;
+        for (int i = 0; i < src.Count; i = i + 1) { keys.Add(src[i]); }
+        List<string> tks = this.tombstones.Keys;
+        for (int i = 0; i < tks.Count; i = i + 1) { keys.Add(tks[i]); }
+        ZanStore.SortStrings(keys);
+        SegmentWriter wtr = SegmentWriter.Create(segPath);
+        if (wtr.Failed()) { this.lastError = wtr.GetError(); return; }
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            if (this.tombstones.ContainsKey(keys[i])) {
+                wtr.Add(keys[i], "", 2);
+            } else {
+                string v = "";
+                this.memtable.TryGetValue(keys[i], out v);
+                wtr.Add(keys[i], v, 1);
+            }
         }
+        if (!wtr.Finish()) {
+            this.lastError = wtr.GetError();
+            File.Delete(segPath);
+            return;
+        }
+        SegmentFile seg = SegmentFile.Open(segPath);
+        if (seg.GetError() != "") {
+            this.lastError = seg.GetError();
+            File.Delete(segPath);
+            return;
+        }
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            if (this.tombstones.ContainsKey(keys[i])) {
+                this.index.Remove(keys[i]);
+            } else {
+                if (this.index.ContainsKey(keys[i])) { this.index.Remove(keys[i]); }
+                this.index.Add(keys[i], segId);
+            }
+        }
+        this.memtable.Clear();
+        this.tombstones.Clear();
+        this.segs.Add(new SegRef(seg, segId));
+        this.nextSegId = segId + 1;
+        if (!this.man.Save(this.seq, this.nextSegId, this.SegIdList())) {
+            this.lastError = this.man.GetError();
+            return;
+        }
+        this.log.Reset();
+        this.commitsSinceSync = 0;
     }
 
     /// 追加一条记录帧并推进 seq。
@@ -280,10 +454,83 @@ class ZanStore {
         if (!this.log.Sync()) { this.lastError = this.log.GetError(); }
     }
 
-    /// 落盘并关闭日志与进程内读写锁。
+    /// 当前全部段号列表。
+    List<long> SegIdList() {
+        List<long> ids = new List<long>();
+        for (int i = 0; i < this.segs.Count; i = i + 1) {
+            ids.Add(this.segs[i].id);
+        }
+        return ids;
+    }
+
+    /// 按段号找段句柄。
+    SegRef FindSeg(long id) {
+        for (int i = 0; i < this.segs.Count; i = i + 1) {
+            if (this.segs[i].id == id) { return this.segs[i]; }
+        }
+        return null;
+    }
+
+    /// 落盘并关闭日志、段、缓存与进程内读写锁。
     void Close() {
         this.log.Close();
+        for (int i = 0; i < this.segs.Count; i = i + 1) {
+            this.segs[i].seg.Close();
+        }
+        this.cache.Close();
         this.rw.Close();
+    }
+
+    // ===== 排序（键序固化段用）：中位数三选快速排序 =====
+
+    static void SortStrings(List<string> a) {
+        ZanStore.SortRange(a, 0, a.Count - 1);
+    }
+
+    static void SortRange(List<string> a, int lo, int hi) {
+        while (lo < hi) {
+            if (hi - lo < 12) {
+                for (int i = lo + 1; i <= hi; i = i + 1) {
+                    string k = a[i];
+                    int j = i - 1;
+                    while (j >= lo && String.CompareOrdinal(a[j], k) > 0) {
+                        a[j + 1] = a[j];
+                        j = j - 1;
+                    }
+                    a[j + 1] = k;
+                }
+                return;
+            }
+            int mid = (lo + hi) / 2;
+            if (String.CompareOrdinal(a[lo], a[mid]) > 0) { ZanStore.Swap(a, lo, mid); }
+            if (String.CompareOrdinal(a[lo], a[hi]) > 0) { ZanStore.Swap(a, lo, hi); }
+            if (String.CompareOrdinal(a[mid], a[hi]) > 0) { ZanStore.Swap(a, mid, hi); }
+            string pivot = a[mid];
+            int l = lo;
+            int r = hi;
+            while (l <= r) {
+                while (String.CompareOrdinal(a[l], pivot) < 0) { l = l + 1; }
+                while (String.CompareOrdinal(a[r], pivot) > 0) { r = r - 1; }
+                if (l <= r) {
+                    ZanStore.Swap(a, l, r);
+                    l = l + 1;
+                    r = r - 1;
+                }
+            }
+            if (r - lo < hi - l) {
+                ZanStore.SortRange(a, lo, r);
+                lo = l;
+            } else {
+                ZanStore.SortRange(a, l, hi);
+                hi = r;
+            }
+        }
+    }
+
+    static void Swap(List<string> a, int i, int j) {
+        string t = a[i];
+        a[i] = a[j];
+        a[j] = t;
     }
 
     // ===== 协程安全的异步 API =====
@@ -309,6 +556,13 @@ class ZanStore {
         bool existed = Delete(key);
         this.rw.ExitWrite();
         return existed;
+    }
+
+    /// <summary>独占锁下把 memtable 固化为新段。</summary>
+    async void FlushAsync() {
+        await this.rw.EnterWrite();
+        FlushToSegment();
+        this.rw.ExitWrite();
     }
 
     /// <summary>原子读改写：fn 在写临界区内看到最新已提交值

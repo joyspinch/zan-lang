@@ -210,6 +210,12 @@ class SegmentFile {
     static SegmentFile Open(string segPath) {
         SegmentFile sf = new SegmentFile();
         sf.path = segPath;
+        // 段只读打开；PageFile.Open 有「不存在即创建」的副作用，
+        // 会把拼错/缺失的段名变成空文件，这里先挡掉。
+        if (!File.Exists(segPath)) {
+            sf.lastError = "segment missing: " + segPath;
+            return sf;
+        }
         sf.file = PageFile.Open(segPath);
         if (!sf.file.IsOpen()) {
             sf.lastError = sf.file.GetError();
@@ -310,9 +316,14 @@ class SegmentFile {
         return ans;
     }
 
-    /// <summary>加载块 i 并校验 CRC；失败（腐坏/短读）返回 null
+    /// <summary>加载块 i 并校验 CRC；失败（越界/腐坏/短读）返回 null
     /// 并在 <see cref="GetError"/> 留痕。缓冲区归调用方 Free。</summary>
     ByteBuffer LoadBlock(int i) {
+        if (i < 0 || i >= this.sparseOff.Count) {
+            // 空段（0 条记录）或越界：返回「未命中」而不是索引崩。
+            this.lastError = "segment block out of range";
+            return null;
+        }
         long end = this.indexStart;
         if (i + 1 < this.sparseOff.Count) { end = this.sparseOff[i + 1]; }
         int len = (int)(end - this.sparseOff[i]);
@@ -356,6 +367,26 @@ class SegmentFile {
         return true;
     }
 
+    /// <summary>块内顺序查找 key：1=命中（val 为值）、2=墓碑、
+    /// 0=不存在（含越过 key 的位置）。读完即止，不做全块解析。</summary>
+    static int ScanBlock(ByteBuffer b, string key, out string val) {
+        val = "";
+        while (true) {
+            string rk;
+            string rv;
+            int rop;
+            if (!SegmentFile.NextRecord(b, out rk, out rv, out rop)) { break; }
+            int cmp = String.CompareOrdinal(rk, key);
+            if (cmp == 0) {
+                if (rop == 2) { return 2; }
+                val = rv;
+                return 1;
+            }
+            if (cmp > 0) { return 0; }
+        }
+        return 0;
+    }
+
     /// <summary>点查：0=不存在，1=命中（val 为值），
     /// 2=墓碑（键在本段被删，查找到此为止）。块腐坏按不存在
     /// 处理并留错误痕迹。</summary>
@@ -364,22 +395,28 @@ class SegmentFile {
         int bi = this.BlockFor(key);
         ByteBuffer b = this.LoadBlock(bi);
         if (b == null) { return 0; }
-        int result = 0;
-        while (true) {
-            string rk;
-            string rv;
-            int rop;
-            if (!SegmentFile.NextRecord(b, out rk, out rv, out rop)) { break; }
-            int cmp = String.CompareOrdinal(rk, key);
-            if (cmp == 0) {
-                if (rop == 2) { result = 2; }
-                else { result = 1; val = rv; }
-                break;
-            }
-            if (cmp > 0) { break; }
-        }
+        int r = SegmentFile.ScanBlock(b, key, out val);
         b.Free();
-        return result;
+        return r;
+    }
+
+    /// <summary>点查（带块缓存）：先借缓存 pin，未命中则加载
+    /// 块并入库。val 是字符串拷贝，pin 释放后仍然有效。
+    /// segNo 是本段的全局段号，用于跨段区分缓存键。</summary>
+    int Lookup(string key, out string val, BlockCache cache, long segNo) {
+        if (cache == null) { return this.Lookup(key, out val); }
+        val = "";
+        int bi = this.BlockFor(key);
+        long ck = segNo * 4294967296 + bi;
+        CachePin pin = cache.Acquire(ck);
+        if (pin == null) {
+            ByteBuffer nb = this.LoadBlock(bi);
+            if (nb == null) { return 0; }
+            pin = cache.Insert(ck, nb);
+        }
+        int r = SegmentFile.ScanBlock(pin.buf, key, out val);
+        cache.Release(pin);
+        return r;
     }
 
     /// <summary>从 fromKey（含）起顺序扫描全部记录，逐条交给

@@ -1,0 +1,161 @@
+using System;
+using System.IO;
+
+namespace System.Data.ZanDb;
+
+/// <summary>
+/// 双槽清单文件：段列表 + 日志水位 + 段号游标。两个槽各存一代，
+/// CRC 有效且代数（generation）高者胜；保存写到非当前槽并 fsync
+/// ——任何时刻崩溃，两槽中总有一份完整的清单，不依赖原子改名。
+///
+/// 布局（小端）：
+///   "ZMAN" + u32 version + u64 gen + u64 logStartSeq
+///   + u64 nextSegId + u32 segCount + segCount × u64 segId
+///   + u32 crc32(以上全部字节)
+///
+/// logStartSeq 语义：日志中 seq &lt; logStartSeq 的帧已被段覆盖，
+/// 恢复时跳过——它覆盖"manifest 已保存、日志尚未截断"的崩溃窗口。
+/// </summary>
+class Manifest {
+    static string MAGIC = "ZMAN";
+    static int VERSION = 1;
+    /// 头部定长：magic4 + ver4 + gen8 + seq8 + nextId8 + count4。
+    static int FIXED = 36;
+
+    string basePath;
+    int curSlot;
+    long gen;
+    long logStartSeq;
+    long nextSegId;
+    List<long> segIds;
+    bool exists;
+    string lastError;
+
+    Manifest() {
+        this.basePath = "";
+        this.curSlot = -1;
+        this.gen = 0;
+        this.logStartSeq = 0;
+        this.nextSegId = 0;
+        this.segIds = new List<long>();
+        this.exists = false;
+        this.lastError = "";
+    }
+
+    static string SlotPath(string basePath, int slot) {
+        return basePath + ".m" + Convert.ToString(slot);
+    }
+
+    /// <summary>读取双槽清单：两个槽都试，取 CRC 有效且代数最高的。
+    /// 都无效（全新库）时返回 <see cref="Exists"/> 为 false 的空清单。
+    /// 只读，不创建任何文件。</summary>
+    static Manifest Load(string basePath) {
+        Manifest m = new Manifest();
+        m.basePath = basePath;
+        for (int slot = 0; slot < 2; slot = slot + 1) {
+            string p = SlotPath(basePath, slot);
+            if (!File.Exists(p)) { continue; }
+            long gen = 0;
+            long seq = 0;
+            long nextId = 0;
+            List<long> ids = new List<long>();
+            if (!m.ParseSlot(p, out gen, out seq, out nextId, ids)) { continue; }
+            if (m.exists && gen <= m.gen) { continue; }
+            m.curSlot = slot;
+            m.gen = gen;
+            m.logStartSeq = seq;
+            m.nextSegId = nextId;
+            m.segIds = ids;
+            m.exists = true;
+        }
+        return m;
+    }
+
+    /// 解析单个槽文件；任何不一致都按无效处理返回 false。
+    bool ParseSlot(string path, out long gen, out long seq, out long nextId, List<long> ids) {
+        gen = 0;
+        seq = 0;
+        nextId = 0;
+        PageFile f = PageFile.Open(path);
+        if (!f.IsOpen()) { return false; }
+        long size = f.Size();
+        if (size < Manifest.FIXED + 4) { f.Close(); return false; }
+        ByteBuffer b = ByteBuffer.Alloc((int)size);
+        int got = f.ReadAt(0, b, (int)size);
+        f.Close();
+        if (got != (int)size) { b.Free(); return false; }
+        b.SeekRead(0);
+        if (b.Str(0, 4) != Manifest.MAGIC) { b.Free(); return false; }
+        b.SeekRead(4);
+        long ver = b.ReadU32();
+        if (ver != Manifest.VERSION) { b.Free(); return false; }
+        gen = b.ReadU64();
+        seq = b.ReadU64();
+        nextId = b.ReadU64();
+        long count = b.ReadU32();
+        if (Manifest.FIXED + 8 * count + 4 != size) { b.Free(); return false; }
+        ids.Clear();
+        for (long i = 0; i < count; i = i + 1) {
+            ids.Add(b.ReadU64());
+        }
+        long crc = b.ReadU32();
+        if (b.Crc32((int)size - 4) != crc) { b.Free(); return false; }
+        b.Free();
+        return true;
+    }
+
+    /// 是否存在有效清单（全新库为 false）。
+    bool Exists() { return this.exists; }
+
+    /// 日志水位：seq &lt; 该值的日志帧已被段覆盖。
+    long LogStartSeq() { return this.logStartSeq; }
+
+ /// 下一个新段应使用的段号。
+    long NextSegId() { return this.nextSegId; }
+
+    /// 当前有效段号列表（内部列表，调用方只读）。
+    List<long> SegIds() { return this.segIds; }
+
+    /// 最近一次错误描述。
+    string GetError() { return this.lastError; }
+
+    /// <summary>原子发布新代：payload 写到非当前槽、截断对齐、
+    /// fsync。失败时旧代清单仍然有效。</summary>
+    bool Save(long newLogStartSeq, long newNextSegId, List<long> ids) {
+        int slot = this.curSlot == 0 ? 1 : 0;
+        long newGen = this.gen + 1;
+        int n = ids.Count;
+        int total = Manifest.FIXED + 8 * n + 4;
+        ByteBuffer b = ByteBuffer.Alloc(total);
+        b.WriteRaw(Manifest.MAGIC, 4);
+        b.WriteU32(Manifest.VERSION);
+        b.WriteU64(newGen);
+        b.WriteU64(newLogStartSeq);
+        b.WriteU64(newNextSegId);
+        b.WriteU32(n);
+        for (int i = 0; i < n; i = i + 1) { b.WriteU64(ids[i]); }
+        b.WriteU32(b.Crc32(total - 4));
+        PageFile f = PageFile.Open(SlotPath(this.basePath, slot));
+        if (!f.IsOpen()) {
+            this.lastError = f.GetError();
+            b.Free();
+            return false;
+        }
+        int w = f.WriteAt(0, b.Raw(), total);
+        bool ok = w == total && f.Truncate(total) && f.Sync();
+        f.Close();
+        b.Free();
+        if (!ok) {
+            this.lastError = "manifest save failed";
+            return false;
+        }
+        this.curSlot = slot;
+        this.gen = newGen;
+        this.logStartSeq = newLogStartSeq;
+        this.nextSegId = newNextSegId;
+        List<long> copy = new List<long>();
+        for (int i = 0; i < n; i = i + 1) { copy.Add(ids[i]); }
+        this.segIds = copy;
+        return true;
+    }
+}

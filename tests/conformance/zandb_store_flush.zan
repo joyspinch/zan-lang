@@ -1,0 +1,147 @@
+using System;
+using System.Data.ZanDb;
+using System.IO;
+
+/// <summary>
+/// ZanStore 段固化（flush）链路的一致性用例：阈值触发固化为
+/// 有序段、memtable 清空、重开经 manifest+段恢复、新段覆盖旧段、
+/// 删除穿透段、陈旧日志头按水位跳过、撕裂尾与段共存。
+/// 输出确定性，与 zandb_store_flush.out 比对。
+/// </summary>
+class ZanDbStoreFlushTest {
+    static int checks = 0;
+
+    static void Ok(bool cond, string what) {
+        checks = checks + 1;
+        if (cond) {
+            Console.WriteLine("ok " + Convert.ToString(checks) + " - " + what);
+        } else {
+            Console.WriteLine("FAIL " + Convert.ToString(checks) + " - " + what);
+        }
+    }
+
+    static string Key(int i) {
+        return "k" + Convert.ToString(i).PadLeft(3, "0");
+    }
+
+    static void Clean(string basePath) {
+        File.Delete(basePath);
+        File.Delete(basePath + ".m0");
+        File.Delete(basePath + ".m1");
+        for (int i = 0; i < 8; i = i + 1) {
+            File.Delete(basePath + ".s" + Convert.ToString(i));
+        }
+    }
+
+    static void Main() {
+        string path = "zandb_flush_tmp.zdb";
+        Clean(path);
+
+        // 1) 阈值 200 字节：40 键必然触发多次固化。
+        ZanStore db = ZanStore.Open(path, ZanStore.DUR_SYNC);
+        Ok(db.IsOpen(), "open");
+        db.SetFlushThreshold(200);
+        for (int i = 0; i < 40; i = i + 1) {
+            db.Put(Key(i), "v" + Convert.ToString(i));
+        }
+        Ok(db.SegCount() >= 5, "flushed to multiple segments");
+        Ok(db.LogBytes() == 0, "log empty after flush");
+        Ok(db.Count() == 40, "count 40");
+        Ok(db.Get("k000") == "v0", "read through segment");
+        Ok(db.Get("k039") == "v39", "read last");
+        db.Close();
+
+        // 2) 重开：manifest + 段恢复索引，日志为空。
+        db = ZanStore.Open(path);
+        Ok(db.Count() == 40, "recover count 40");
+        Ok(db.SegCount() >= 5, "recover segments");
+        Ok(db.LogBytes() == 0, "recover log empty");
+        Ok(db.Get("k007") == "v7", "recover read");
+        db.Close();
+
+        // 3) 覆盖一半 + 删一个：新段版本压过旧段，读最新。
+        db = ZanStore.Open(path);
+        db.SetFlushThreshold(200);
+        for (int i = 0; i < 20; i = i + 1) {
+            db.Put(Key(i), "w" + Convert.ToString(i));
+        }
+        db.Delete("k005");
+        Ok(db.Get("k000") == "w0", "overwrite visible");
+        Ok(db.Get("k005") == "", "deleted invisible");
+        Ok(db.Get("k030") == "v30", "untouched key intact");
+        Ok(db.Count() == 39, "count after overwrite+delete");
+        db.Close();
+
+        db = ZanStore.Open(path);
+        Ok(db.Get("k000") == "w0", "overwrite survives reopen");
+        Ok(db.Get("k005") == "", "delete survives reopen");
+        Ok(db.Get("k019") == "w19", "overwrite tail survives");
+        Ok(db.Count() == 39, "recover count 39");
+
+        // 4) 旧段保留旧版本：k000 的首次写入还在 s0 里。
+        SegmentFile s0 = SegmentFile.Open(path + ".s0");
+        string oldv = "";
+        Ok(s0.Lookup("k000", out oldv) == 1 && oldv == "v0", "old version in old segment");
+        s0.Close();
+
+        // 5) 陈旧日志头跳过：水位下的帧重新追加也不生效。
+        db.Checkpoint();
+        db.Close();
+        PageFile pf = PageFile.Open(path);
+        ByteBuffer frame = ByteBuffer.Alloc(64);
+        frame.WriteU64(0);                  // seq=0，远低于水位
+        frame.WriteU8(1);
+        frame.WriteString("ghost");
+        frame.WriteString("boo");
+        frame.SeekRead(0);
+        long plen = frame.Length();
+        ByteBuffer h = ByteBuffer.Alloc(8);
+        h.WriteU32(plen);
+        h.WriteU32(frame.Crc32((int)plen));
+        h.SeekRead(0);
+        pf.Append(h.Raw(), 8);
+        pf.Append(frame.Raw(), (int)plen);
+        h.Free();
+        frame.Free();
+        // 再补一段撕裂垃圾：重放应停在坏帧。
+        ByteBuffer junk = ByteBuffer.Alloc(24);
+        for (int i = 0; i < 24; i = i + 1) { junk.WriteU8(i * 7 + 3); }
+        junk.SeekRead(0);
+        pf.Append(junk.Raw(), 24);
+        junk.Free();
+        pf.Close();
+
+        db = ZanStore.Open(path);
+        Ok(db.Get("ghost") == "", "stale header skipped");
+        Ok(db.Get("k000") == "w0", "state intact after stale+garbage log");
+        Ok(db.Count() == 39, "count stable");
+
+        // 6) 事务 + 固化混跑：批量提交后再固化一次，全量校验。
+        db.Begin();
+        for (int i = 40; i < 60; i = i + 1) {
+            db.Put(Key(i), "t" + Convert.ToString(i));
+        }
+        db.Commit();
+        db.FlushToSegment();
+        Ok(db.LogBytes() == 0, "log empty after manual flush");
+        db.Close();
+
+        db = ZanStore.Open(path);
+        bool allOk = true;
+        for (int i = 0; i < 60; i = i + 1) {
+            // k005 已删：期待空串——旧段里的 v5 不得复活。
+            string want = "";
+            if (i != 5) {
+                want = i < 20 ? "w" + Convert.ToString(i)
+                    : (i < 40 ? "v" + Convert.ToString(i) : "t" + Convert.ToString(i));
+            }
+            if (db.Get(Key(i)) != want) { allOk = false; }
+        }
+        Ok(allOk, "all 59 values verified after flush+reopen");
+        Ok(db.Count() == 59, "final count 59");
+        db.Close();
+
+        Console.WriteLine("done " + Convert.ToString(checks) + " checks");
+        Clean(path);
+    }
+}

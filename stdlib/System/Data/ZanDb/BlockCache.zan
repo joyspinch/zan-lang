@@ -1,0 +1,117 @@
+using System;
+using System.IO;
+using System.Threading;
+
+namespace System.Data.ZanDb;
+
+/// <summary>缓存条目：块缓冲 + 借用计数。pins &gt; 0 的条目
+/// 不被驱逐；借用方解析完必须 <see cref="BlockCache.Release"/>。</summary>
+class CachePin {
+    ByteBuffer buf;
+    int pins;
+    int size;
+
+    CachePin(ByteBuffer buf, int size) {
+        this.buf = buf;
+        this.pins = 0;
+        this.size = size;
+    }
+}
+
+/// <summary>
+/// 段块缓存：FIFO 驱逐、字节上限、借用计数保护。
+/// 异步读共享锁下多协程并发命中，互斥锁只护元数据；
+/// 借用期间缓冲内容稳定（值解析出字符串拷贝后才 Release）。
+/// 驱逐只在 Insert 时做一轮扫描：无无 pin 受害者时允许暂时
+/// 超限——借用是短暂的，写入方下次插入会继续回收。
+/// </summary>
+class BlockCache {
+    Dictionary<long, CachePin> map;
+    List<long> order;
+    long bytes;
+    long cap;
+    nint mtx;
+
+    BlockCache(long capBytes) {
+        this.map = new Dictionary<long, CachePin>();
+        this.order = new List<long>();
+        this.bytes = 0;
+        this.cap = capBytes;
+        this.mtx = Mutex.Create();
+    }
+
+    /// 调整字节上限（立即生效，下次驱逐执行）。
+    void SetCap(long capBytes) { this.cap = capBytes; }
+
+    /// <summary>取块：命中时 pin +1 返回；未命中返回 null。
+    /// 用完必须 Release。</summary>
+    CachePin Acquire(long key) {
+        Mutex.Lock(this.mtx);
+        CachePin pin = null;
+        if (this.map.TryGetValue(key, out pin)) {
+            pin.pins = pin.pins + 1;
+        }
+        Mutex.Unlock(this.mtx);
+        return pin;
+    }
+
+    /// <summary>放入新块并返回已 pin 的条目（接管 buf 所有权，
+    /// 含将来驱逐时的 Free）。同键已存在时释放新缓冲、返回旧条目。</summary>
+    CachePin Insert(long key, ByteBuffer buf) {
+        Mutex.Lock(this.mtx);
+        CachePin old = null;
+        if (this.map.TryGetValue(key, out old)) {
+            old.pins = old.pins + 1;
+            Mutex.Unlock(this.mtx);
+            buf.Free();
+            return old;
+        }
+        CachePin pin = new CachePin(buf, buf.Length());
+        this.map.Add(key, pin);
+        this.order.Add(key);
+        this.bytes = this.bytes + pin.size;
+        // 驱逐：从队头起扫一轮，无 pin 的回收，被借用的挪到队尾。
+        int budget = this.order.Count;
+        while (this.bytes > this.cap && budget > 0) {
+            budget = budget - 1;
+            long vk = this.order[0];
+            this.order.RemoveAt(0);
+            CachePin vp = null;
+            this.map.TryGetValue(vk, out vp);
+            if (vp == null) { continue; }
+            if (vp.pins == 0) {
+                this.map.Remove(vk);
+                this.bytes = this.bytes - vp.size;
+                vp.buf.Free();
+            } else {
+                this.order.Add(vk);
+            }
+        }
+        Mutex.Unlock(this.mtx);
+        return pin;
+    }
+
+    /// 归还借用的条目。
+    void Release(CachePin pin) {
+        Mutex.Lock(this.mtx);
+        pin.pins = pin.pins - 1;
+        Mutex.Unlock(this.mtx);
+    }
+
+    /// <summary>释放全部缓冲并销毁互斥锁（Close 后不可再用）。</summary>
+    void Close() {
+        Mutex.Lock(this.mtx);
+        List<long> ks = this.map.Keys;
+        for (int i = 0; i < ks.Count; i = i + 1) {
+            CachePin pin = null;
+            this.map.TryGetValue(ks[i], out pin);
+            if (pin != null) { pin.buf.Free(); }
+        }
+        this.map.Clear();
+        this.order.Clear();
+        this.bytes = 0;
+        Mutex.Unlock(this.mtx);
+        Mutex.Destroy(this.mtx);
+        this.mtx = 0;
+    }
+}
