@@ -805,6 +805,9 @@ class TlsStream {
             int n = Norm(BIO_read(this.wbio, this.scratch, chunk));
             if (n <= 0) { return -1; }
             int sent = Norm(await Socket.SendAsync(this.sock, this.scratch, n));
+            // 驻车期间另一协程可能 Close()：SSL_free 连带释放了
+            // rbio/wbio，回到这里先按 open 退出，绝不再碰 BIO。
+            if (!this.open) { return -1; }
             if (sent != n) { return -1; }
             pending = BIO_ctrl_pending(this.wbio);
         }
@@ -818,6 +821,9 @@ class TlsStream {
     async int PumpInAsync() {
         while (true) {
             await Socket.ReadReady(this.sock);
+            // 驻车期间另一协程可能 Close()：scratch 已置空、rbio 已随
+            // SSL_free 释放，先按 open 退出。
+            if (!this.open) { return -1; }
             int n = Norm(Socket.Recv(this.sock, this.scratch, SCRATCH));
             if (n == 0) { return 0; }
             if (n > 0) {
@@ -967,14 +973,23 @@ class TlsStream {
 
     /// <summary>发送 TLS close_notify 并释放 SSL 引擎与 BIO 所有权；
     /// 底层套接字仍归调用方所有（且必须由其关闭）。Close 后继续
-    /// 调用安全：所有方法按未打开处理。</summary>
+    /// 调用安全：所有方法按未打开处理。
+    ///
+    /// 并发安全（A76-①）：Close 同步执行、无 await，唯一的竞争窗口
+    /// 是另一个协程正驻车在 FlushOutAsync/PumpInAsync 的套接字 await
+    /// 上。因此 open 先于 SSL_free 翻转——恢复出的协程重查 open
+    /// 即按未打开退出，不再触碰已释放的 ssl/rbio/wbio（SSL_set_bio
+    /// 已把 BIO 所有权移给 SSL，SSL_free 连带释放；Zan 侧字段只是
+    /// 借用指针，free 后置空以绝悬垂）。</summary>
     void Close() {
         // 异常路径可能跳过 EndHandshakeWatch：这里兜底释放槽位，
         // 防止扫描器拿着已关闭套接字的槽位 shutdown 一个复用 fd。
         HttpDeadline.Disarm(this.watch);
         this.watch = null;
+        bool wasOpen = this.open;
+        this.open = false;
         if (this.ssl != null) {
-            if (this.open) {
+            if (wasOpen) {
                 int _s = SSL_shutdown(this.ssl);
                 // 尽力把 close_notify 全部发出；每次从 BIO 读出后
                 // 循环发送直到这块字节写完或出错，避免截断 TLS 记录。
@@ -990,7 +1005,8 @@ class TlsStream {
             SSL_free(this.ssl);
             this.ssl = null;
         }
+        this.rbio = null;
+        this.wbio = null;
         this.scratch = null;
-        this.open = false;
     }
 }
