@@ -1296,8 +1296,18 @@ static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
                                      zan_type_t *value, zan_ast_node_t *expr,
                                      zan_loc_t loc, const char *what) {
     if (!target || !value || target == c->binder->type_error ||
-        value == c->binder->type_error || value == c->binder->type_void)
+        value == c->binder->type_error)
         return;
+    /* A void call used as a value used to slip through silently and reach
+     * irgen as a `void` SSA operand (invalid IR, verifier failure). C#
+     * rejects it at the same sites. */
+    if (value == c->binder->type_void && target != c->binder->type_void) {
+        zan_diag_emit(c->diag, DIAG_ERROR, loc,
+                      "cannot convert 'void' to '%s' in %s: no implicit "
+                      "conversion",
+                      type_name(target), what);
+        return;
+    }
     bool target_integral = type_is_integral(target) || target->kind == TYPE_CHAR ||
                            target->kind == TYPE_ENUM;
     bool value_integral = type_is_integral(value) || value->kind == TYPE_CHAR ||
@@ -1632,12 +1642,35 @@ static zan_symbol_t *call_arg_signature(zan_checker_t *c, zan_ast_node_t *call,
     return only;
 }
 
+/* True for `Task.Spawn(..)` / `Task.Run(..)` — the builtins whose single
+ * argument may be a void async call (irgen_call.c lowers exactly these).
+ * Mirrors irgen's is_call_to special case so checker and irgen agree on
+ * which void-arg shapes are legal. */
+static bool arg_is_spawn_callee(zan_ast_node_t *call) {
+    if (!call || call->call.callee == NULL ||
+        call->call.callee->kind != AST_MEMBER_ACCESS ||
+        call->call.args.count != 1) return false;
+    zan_istr_t n = call->call.callee->member.name;
+    if (n.len == 5 && memcmp(n.str, "Spawn", 5) == 0) return true;
+    if (n.len == 3 && memcmp(n.str, "Run", 3) == 0) return true;
+    return false;
+}
+
 static void check_call_arg_type(zan_checker_t *c, zan_symbol_t *sig, int index,
                                 zan_ast_node_t *arg, zan_type_t *arg_type) {
     zan_ast_list_t *ps = &sig->decl->method_decl.params;
     if (index >= ps->count) return;
     zan_type_t *pt = zan_binder_resolve_type(c->binder,
                                              ps->items[index]->param.type);
+    if (arg_type == c->binder->type_void) {
+        if (!pt || pt->kind != TYPE_DELEGATE) {
+            zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
+                          "cannot use a 'void' value in argument %d of "
+                          "'%.*s': a void call has no result",
+                          index + 1, (int)sig->name.len, sig->name.str);
+        }
+        return;
+    }
     if (!checker_arg_type_mismatch(c, pt, arg_type)) return;
     zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
                   "cannot convert '%s' to '%s' in argument %d of '%.*s': "
@@ -2218,6 +2251,21 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             zan_ast_node_t *arg = expr->call.args.items[i];
             if (arg && arg->kind == AST_NAMED_ARG) arg = arg->named_arg.expr;
             zan_type_t *arg_type = zan_checker_check_expr(c, arg);
+            /* An async call passed as an argument is the spawn idiom
+             * (Task.Spawn(Work(n))): the Task.Spawn/Task.Run builtins lower
+             * a void call arg to a coroutine, so they are the one legal
+             * void-arg consumer without a resolvable signature (the builtin
+             * has no Zan decl, hence no arg_sig). Any other
+             * unresolved-signature position (overloads, Console.WriteLine)
+             * has no consumer for a void call: C# rejects it, and irgen
+             * used to miscompile it into invalid IR. */
+            if (!arg_sig && arg && arg_type == c->binder->type_void &&
+                arg->kind != AST_REF_ARG && !arg_is_spawn_callee(expr)) {
+                zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
+                              "cannot use a 'void' value in argument %d: a "
+                              "void call has no result",
+                              i + 1);
+            }
             if (arg_sig && arg)
                 check_call_arg_type(c, arg_sig, i, arg, arg_type);
         }

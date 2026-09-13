@@ -803,6 +803,19 @@ add_test(NAME diag_ctor_missing_parameterless
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_ctor_missing_parameterless PROPERTIES TIMEOUT 60)
 
+# A void call has no result, so using one as an argument or an initializer
+# is a type error. The checker used to let both slip through and irgen then
+# emitted invalid IR (verifier: "Incorrect number of arguments" / "storing
+# unsized types") instead of a diagnostic.
+add_test(NAME diag_void_value
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/void_value.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_void_value${_exe_ext}
+    "-DEXPECT_REGEX=cannot use a .void. value in argument 1[a-z: ]*|cannot convert .void. to .int. in initializer"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_void_value PROPERTIES TIMEOUT 60)
+
 # A complete object initializer builds the object itself, so it may stand in
 # for the parameterless constructor the class does not have; a partial one
 # leaves the members it skips zero-filled and must still be rejected.
