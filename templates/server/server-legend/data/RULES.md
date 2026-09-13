@@ -212,6 +212,26 @@ g = 24700000.0; steps = [round(g * 1.5**i, -4) for i in range(10)]   # sum ≈ 2
 > 三个新键同时进两侧 RequiredKeys（服务端 `Rules.zan` / 客户端
 > `Tables.zan`，位置逐字一致）并由 `tools/sync_rules.py` 同步两份 CSV 副本。
 
+### 3.12 战斗层收尾（Fight.zan）的裁决
+
+`world_boss_*` 十个键此前「表有码无」——balance.csv 里全有，Fight 里全是
+写死值，且 `wbHp=150000` 与 `wbMaxHp=50000` 自相矛盾（血量是上限的三倍）、
+重生时刻有三处说法（注释 3 分钟 / 代码 1800 秒 / 公告 5 分钟）。本轮全部
+接线并统一：
+
+| 事项 | 裁决 | 依据 |
+|---|---|---|
+| 世界 BOSS 血量 | 统一 `world_boss_hp=150000` | 表值为准；修 max/hp 不一致 |
+| 重生时间 | `world_boss_respawn_seconds=300`，公告文案由键生成 | 三处矛盾取公告口径（5 分钟） |
+| 击杀大奖 | `world_boss_big_item_pct`（万分比 2500=25%）屠龙/霸者之刃二选一 | 原硬编码 2500/10000 |
+| 全场伤害最高者 | 再按 `world_boss_top_item_pct` 掷一次 | 表里原本就有此键，给语义 |
+| 寻宝奖池 | **新表 `draw.csv`**（27 行 item_id+weight）；费用用既有 `treasure_cost` | 旧硬编码池 27 名中 7 个在物品目录不存在（金创药×2/食人树叶/毒蜘蛛牙齿/蛆卵/水晶/破馆珍剑——快照 732 物品无这些），抽中即「奖池物品缺失」；以目录在售物品同权重顶替（肉/干肉/鸡肉/蜡烛/匕首/紫宝矿石/修罗），屠龙 20/9590≈0.2% 不变；启动校验 ≥20 行且物品存在 |
+| 铁匠铺满星 | 新键 `forge_max_star=9` | 原写死 9 |
+| 锻造费用 | `(星+1)×forge_gold_per_star` 金币 + `(星+1)×forge_iron_per_star` 黑铁矿石 | `forge_iron_per_star` 此前是必需键却无实现（死键）——矿石成为稳定出水口 |
+| 挂机批量 | `auto_batch_sec` / `auto_max_rounds` 接线 | 删 `const AUTO_BATCH_SEC/AUTO_MAX_ROUNDS` |
+| 回收七币种 | 接 `recycle.csv`（经验/战功/声望/红包/元宝/积分按 1/denominator 结算，单项封 cap）+ `recycle_prices.csv` 逐物品金币（缺价回退半价） | §3.5 四币种闭环的回收入口兑现；客户端读 `gain`+`self` 不受影响 |
+| 目录装载兜底 | `Fight.Bootstrap` 重试 3 次并把失败打到日志 | async void 会吞装载异常（实测冷库 WAL 忙时 SELECT 抛 DbException，目录静默为空、战斗 op 全部空转、端口照收） |
+
 ---
 
 ## 四、校验：错配置要在启动时炸，不是运行时算错

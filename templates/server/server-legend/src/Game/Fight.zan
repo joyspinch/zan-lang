@@ -234,7 +234,20 @@ class Fight {
 
     static async void Bootstrap(DbContext ctx) {
         if (Fight.items.Count > 0) { return; }
-        await Fight.LoadCatalog(ctx, true);
+        /* async void 会吞掉装载异常（实测：冷库 WAL 忙时 SELECT 抛
+           DbException，目录静默为空、端口照收），因此这里兜底重试并
+           把失败打到日志——目录没装载，战斗 op 全部空转。 */
+        for (int attempt = 1; attempt <= 3; attempt = attempt + 1) {
+            try {
+                await Fight.LoadCatalog(ctx, true);
+                return;
+            } catch (Exception ex) {
+                Console.WriteLine("[fight] 目录装载失败（第 "
+                    + Convert.ToString(attempt) + " 次）：" + ex.Message);
+                await Task.Delay(3000);
+            }
+        }
+        Console.WriteLine("[fight] 目录装载放弃——战斗系统不可用，请重启服务");
     }
 
     /* 装载/重载目录（物品、怪物模板、掉落表）。bootstrap=true 首次
@@ -391,19 +404,16 @@ class Fight {
     }
 
     /* ---- 自动挂机：批量结算（照原版离线挂机） ----
-       服务端不为每一击推流：每 AUTO_BATCH_SEC 把过去这段战斗用虚拟
+       服务端不为每一击推流：每 auto_batch_sec 把过去这段战斗用虚拟
        时钟一次性补跑（每秒一轮，数值核与手动 Hunt 完全同一条 Round），
        产出聚合成一条 ev idlesum 推给客户端；客户端的逐秒战况动画是
        本地演示，收益以这里的结算为权威。长间隔（卡顿/挂起恢复）用
-       AUTO_MAX_ROUNDS 封顶，防止一次补跑爆量。 */
-
-    const int AUTO_BATCH_SEC = 60;
-    const int AUTO_MAX_ROUNDS = 600;
+       auto_max_rounds 封顶，防止一次补跑爆量。 */
 
     static void AutoSettle(Session s, long now) {
         if (s.autoSettledAt == 0) { s.autoSettledAt = now; return; }
         long elapsed = now - s.autoSettledAt;
-        if (elapsed < AUTO_BATCH_SEC) { return; }
+        if (elapsed < Rules.Val("auto_batch_sec")) { return; }
         Fight.Settle(s, now, true);
     }
 
@@ -413,7 +423,8 @@ class Fight {
         long elapsed = now - s.autoSettledAt;
         s.autoSettledAt = now;
         if (s.row == null || s.autoMobId <= 0 || elapsed <= 0) { return; }
-        int rounds = (int)(elapsed > AUTO_MAX_ROUNDS ? AUTO_MAX_ROUNDS : elapsed);
+        int rounds = (int)(elapsed > Rules.Val("auto_max_rounds")
+            ? Rules.Val("auto_max_rounds") : elapsed);
         int kills = 0;
         long exp = 0;
         long gold = 0;
@@ -1194,41 +1205,57 @@ class Fight {
         return arr;
     }
 
-    /* 铁匠铺强化：武器/防具各 0-9 星，费用 = (星+1)*800 金币；每星
-       武器 +2 攻、防具 +2 防（Fight.Atk/Def）。失败不存在——花金币
-       稳定变强，是后期金币的出水口。 */
+    /* 铁匠铺强化：武器/防具各 0-forge_max_star 星，费用 = (星+1)*
+       forge_gold_per_star 金币 + (星+1)*forge_iron_per_star 黑铁矿石；
+       每星武器 +forge_star_attack 攻、防具 +forge_star_defense 防
+       （Fight.Atk/Def）。失败不存在——稳定变强，是后期金币/矿石出水口。 */
     static string Forge(Session s, string slot) {
         bool weapon = slot == "weapon";
         if (!weapon && slot != "armor") { return "未知部位"; }
         int star = weapon ? s.row.weaponStar : s.row.armorStar;
-        if (star >= 9) { return "已经满星（9）"; }
-        long cost = (star + 1) * 1200;
+        int maxStar = Rules.Val("forge_max_star");
+        if (star >= maxStar) { return "已经满星（" + Convert.ToString(maxStar) + "）"; }
+        long cost = (long)(star + 1) * Rules.Val("forge_gold_per_star");
+        int iron = (star + 1) * Rules.Val("forge_iron_per_star");
         if (s.row.gold < cost) {
             return "金币不够（下一星需 " + Convert.ToString(cost) + "）";
+        }
+        ZanWeb.Model.Game.Item ore = Fight.ByName("黑铁矿石");
+        if (ore == null) { return "黑铁矿石不存在"; }
+        if (!Fight.BagTake(s, ore.id, iron)) {
+            return "黑铁矿石不够（下一星需 " + Convert.ToString(iron) + "）";
         }
         s.row.gold = s.row.gold - cost;
         if (weapon) { s.row.weaponStar = star + 1; }
         else { s.row.armorStar = star + 1; }
         s.dirty = true;
+        s.bagDirty = true;
         return "";
     }
 
     /* 世界 BOSS：全进程一只（重启重置），全场玩家打同一管血；击杀者
-       得大奖，累计伤害最高者随公告表扬。3 分钟重生（懒重置：查询与
-       攻击时发现到期即满血复活）。 */
-    static long wbHp = 150000;
-    static long wbMaxHp = 50000;
+       得大奖，累计伤害最高者随公告表扬。world_boss_respawn_seconds 秒
+       重生（懒重置：查询与攻击时发现到期即满血复活）。hp=0 且从未
+       定过重生时刻 = 开服首刷。 */
+    static long wbHp = 0;
+    static long wbMaxHp = 0;
     static long wbRespawnAt = 0;
     static string wbTopName = "";
     static long wbTopDmg = 0;
 
-    static JsonValue WBossState(long now) {
+    /* 懒初始化/懒重生共用：到期即满血。maxhp 只读一次键。 */
+    static void WBossTick(long now) {
+        if (Fight.wbMaxHp <= 0) { Fight.wbMaxHp = Rules.Val("world_boss_hp"); }
         if (Fight.wbHp <= 0 && now >= Fight.wbRespawnAt) {
             Fight.wbHp = Fight.wbMaxHp;
         }
+    }
+
+    static JsonValue WBossState(long now) {
+        Fight.WBossTick(now);
         JsonValue o = JsonValue.NewObject();
         o.Set("name", JsonValue.NewStr("玛雅之神·幻影"));
-        o.Set("level", JsonValue.NewNum("40"));
+        o.Set("level", JsonValue.NewNum(Convert.ToString(Rules.Val("world_boss_level"))));
         o.Set("top", JsonValue.NewStr(Fight.wbTopName));
         o.Set("topDmg", JsonValue.NewNum(Convert.ToString(Fight.wbTopDmg)));
         if (Fight.wbHp <= 0) {
@@ -1246,21 +1273,21 @@ class Fight {
 
     /* 打世界 BOSS 一轮：f 收战况（含血量进度），错误串非空即失败。 */
     static string WBossHit(Session s, long now, JsonValue f) {
-        if (Fight.wbHp <= 0 && now >= Fight.wbRespawnAt) {
-            Fight.wbHp = Fight.wbMaxHp;
-        }
+        Fight.WBossTick(now);
         if (Fight.wbHp <= 0) {
             long left = Fight.wbRespawnAt - now;
             if (left < 0) { left = 0; }
             return "世界BOSS尚未重生（还需 " + Convert.ToString(left) + " 秒）";
         }
-        int dmg = Fight.Damage(Fight.Atk(s.row) * 3, 100);
+        int dmg = Fight.Damage(Fight.Atk(s.row) * Rules.Val("world_boss_damage_pct") / 100,
+            Rules.Val("world_boss_defense"));
         if (dmg < 1) { dmg = 1; }
         if (dmg > Fight.wbHp) { dmg = (int)Fight.wbHp; }
         Fight.wbHp = Fight.wbHp - dmg;
         s.wbDmg = s.wbDmg + dmg;
-        long gold = Fight.rng.Between(10, 45);
-        s.row.exp = s.row.exp + 200;
+        long gold = (long)Fight.rng.Between(Rules.Val("world_boss_gold_min"),
+            Rules.Val("world_boss_gold_max"));
+        s.row.exp = s.row.exp + Rules.Val("world_boss_exp");
         s.row.gold = s.row.gold + gold;
         f.Set("mob", JsonValue.NewStr("暗之虹魔教主·幻影"));
         f.Set("dmg", JsonValue.NewNum(Convert.ToString(dmg)));
@@ -1273,70 +1300,133 @@ class Fight {
         }
         f.Set("mydmg", JsonValue.NewNum(Convert.ToString(s.wbDmg)));
         if (Fight.wbHp <= 0) {
-            Fight.wbRespawnAt = now + 1800;
-            s.row.gold = s.row.gold + 5000;
-            ZanWeb.Model.Game.Item big = Fight.rng.NextBelow(10000) < 2500
-                ? Fight.ByName("屠龙") : Fight.ByName("霸者之刃");
-            if (big != null) { Fight.Gift(s, big.id, 1); f.Set("drop",
-                JsonValue.NewStr(big.name)); }
+            Fight.wbRespawnAt = now + Rules.Val("world_boss_respawn_seconds");
+            s.row.gold = s.row.gold + Rules.Val("world_boss_kill_gold");
             f.Set("killed", JsonValue.NewNum("1"));
             f.Set("quest", JsonValue.NewStr("世界BOSS击杀"));
+            /* 击杀者按 world_boss_big_item_pct（万分比）掷大奖；
+               若击杀者就是全场伤害最高者，再按 top_item_pct 掷一次。 */
+            Fight.WBossBigDrop(s, Rules.Val("world_boss_big_item_pct"), f);
+            if (Fight.wbTopName == s.row.nickname && s.wbDmg == Fight.wbTopDmg) {
+                Fight.WBossBigDrop(s, Rules.Val("world_boss_top_item_pct"), f);
+            }
             Gateway.AnnounceAll("世界BOSS被击杀",
                 s.row.nickname + " 的一击致命！全场伤害最高："
                 + Fight.wbTopName + "（"
-                + Convert.ToString(Fight.wbTopDmg) + " 伤害）。5 分钟后重生。");
+                + Convert.ToString(Fight.wbTopDmg) + " 伤害）。"
+                + Convert.ToString(Rules.Val("world_boss_respawn_seconds") / 60)
+                + " 分钟后重生。");
         }
         Fight.StampProgress(s, f);
         s.dirty = true;
         return "";
     }
 
-    /* 寻宝：200 金币抽一件，权重表覆盖全物品档，屠龙 20/9590≈0.2%。
-       结果物品名随回复（r.item）带回。 */
+    /* 大奖掷骰：pct 万分比命中即屠龙/霸者之刃二选一（表在 bosses
+       目录里，二选一是原版「终极大奖」的双倍紧张感）。 */
+    static void WBossBigDrop(Session s, int pct, JsonValue f) {
+        if (Fight.rng.NextBelow(10000) >= pct) { return; }
+        ZanWeb.Model.Game.Item big = Fight.rng.NextBelow(2) == 0
+            ? Fight.ByName("屠龙") : Fight.ByName("霸者之刃");
+        if (big != null) { Fight.Gift(s, big.id, 1); f.Set("drop",
+            JsonValue.NewStr(big.name)); }
+    }
+
+    /* 寻宝：treasure_cost 金币抽一件，奖池在 draw.csv（item_id+weight，
+       启动校验物品存在与行数；旧硬编码池里 7 个物品名在目录中不存在，
+       抽中即「奖池物品缺失」——已按目录重配）。结果物品名随回复带回。 */
     static string Draw(Session s, JsonValue r) {
-        long cost = 200;
-        if (s.row.gold < cost) { return "金币不够（每次寻宝需 200）"; }
-        string[] names = new string[] { "金创药(小量)", "金创药(中量)",
-            "食人树叶", "毒蜘蛛牙齿", "蛆卵", "铜矿", "水晶", "铁矿",
-            "黑铁矿石", "银矿", "金矿", "八荒", "半月", "偃月", "凝霜",
-            "无极棍", "炼狱", "血饮", "井中月", "龙牙", "裁决之杖",
-            "龙纹剑", "逍遥扇", "破馆珍剑", "怒斩", "霸者之刃", "屠龙" };
-        int[] weights = new int[] { 2000, 1200, 900, 900, 700, 700, 500,
-            500, 400, 300, 180, 400, 350, 300, 260, 200, 190, 150, 130,
-            90, 70, 60, 50, 40, 25, 12, 20 };
+        long cost = Rules.Val("treasure_cost");
+        if (s.row.gold < cost) {
+            return "金币不够（每次寻宝需 " + Convert.ToString(cost) + "）";
+        }
+        List<int> ids = new List<int>();
+        List<int> weights = new List<int>();
+        foreach (ZanWeb.RuleRow prize in Rules.DrawPool().All()) {
+            if (Fight.ById(prize.Int("item_id")) == null) { continue; }
+            ids.Add(prize.Int("item_id"));
+            weights.Add(prize.Int("weight"));
+        }
         int total = 0;
-        for (int i = 0; i < weights.Length; i = i + 1) { total += weights[i]; }
+        for (int i = 0; i < weights.Count; i = i + 1) { total += weights[i]; }
+        if (total <= 0) { return "奖池为空"; }
         int roll = Fight.rng.NextBelow(total);
         int pick = 0;
-        for (int i = 0; i < weights.Length; i = i + 1) {
+        for (int i = 0; i < weights.Count; i = i + 1) {
             if (roll < weights[i]) { pick = i; break; }
             roll -= weights[i];
         }
-        ZanWeb.Model.Game.Item it = Fight.ByName(names[pick]);
+        ZanWeb.Model.Game.Item it = Fight.ById(ids[pick]);
         if (it == null) { return "奖池物品缺失"; }
         s.row.gold = s.row.gold - cost;
         Fight.BagAdd(s, it.id, 1);
         s.dirty = true;
+        s.bagDirty = true;
         r.Set("item", JsonValue.NewStr(it.name));
         return "";
     }
 
-    /* 回收：把背包里全部材料（kind=3）按卖店价一半一次性结成金币。 */
+    /* 回收：背包里全部材料（kind=3）一次性结账。金币按
+       recycle_prices.csv 逐物品给价（缺价回退半价），另按 recycle.csv
+       的 1/denominator 比率结出经验/战功/声望/红包/元宝/积分（§3.5
+       四币种闭环的回收入口），单项不超过该币 cap。 */
     static string Recycle(Session s, JsonValue r) {
         long gain = 0;
+        long exp = 0;
+        long merit = 0;
+        long reputation = 0;
+        long redPackets = 0;
+        long gems = 0;
+        long points = 0;
         for (int i = s.bagIds.Count - 1; i >= 0; i = i - 1) {
             ZanWeb.Model.Game.Item it = Fight.ById(s.bagIds[i]);
             if (it == null || it.kind != 3) { continue; }
-            gain += it.price / 2 * s.bagCounts[i];
+            long price = it.price / 2;
+            ZanWeb.RuleRow priced = null;
+            if (Rules.RecyclePrices().TryById(Convert.ToString(it.id), out priced)
+                && priced.Int("gold") > 0) {
+                price = priced.Int("gold");
+            }
+            long unit = price * s.bagCounts[i];
+            gain += Fight.Capped(unit, Rules.Recycle().At(0));
+            exp += Fight.Capped(unit, Rules.Recycle().At(1));
+            merit += Fight.Capped(unit, Rules.Recycle().At(2));
+            reputation += Fight.Capped(unit, Rules.Recycle().At(3));
+            redPackets += Fight.Capped(unit, Rules.Recycle().At(4));
+            gems += Fight.Capped(unit, Rules.Recycle().At(5));
+            points += Fight.Capped(unit, Rules.Recycle().At(6));
             s.bagIds.RemoveAt(i);
             s.bagCounts.RemoveAt(i);
         }
-        if (gain <= 0) { return "背包里没有可回收的材料"; }
+        if (gain <= 0 && exp <= 0 && merit <= 0 && reputation <= 0
+            && redPackets <= 0 && gems <= 0 && points <= 0) {
+            return "背包里没有可回收的材料";
+        }
         s.row.gold = s.row.gold + gain;
+        s.row.exp = s.row.exp + exp;
+        s.row.merit = s.row.merit + merit;
+        s.row.reputation = s.row.reputation + reputation;
+        s.row.redPackets = s.row.redPackets + redPackets;
+        s.row.gems = s.row.gems + gems;
+        s.row.recyclePoints = s.row.recyclePoints + points;
         s.bagDirty = true;
         s.dirty = true;
         r.Set("gain", JsonValue.NewNum(Convert.ToString(gain)));
+        r.Set("exp", JsonValue.NewNum(Convert.ToString(exp)));
+        r.Set("merit", JsonValue.NewNum(Convert.ToString(merit)));
+        r.Set("reputation", JsonValue.NewNum(Convert.ToString(reputation)));
+        r.Set("redPackets", JsonValue.NewNum(Convert.ToString(redPackets)));
+        r.Set("gems", JsonValue.NewNum(Convert.ToString(gems)));
+        r.Set("recyclePoints", JsonValue.NewNum(Convert.ToString(points)));
         return "";
+    }
+
+    /* recycle.csv 一行的换算：unit * numerator / denominator，封到 cap。 */
+    static long Capped(long unit, ZanWeb.RuleRow currency) {
+        long v = unit * currency.Int("numerator") / currency.Int("denominator");
+        long cap = currency.Int("cap");
+        if (v > cap) { v = cap; }
+        return v;
     }
 
     /* 图鉴：全物品档 + 全怪物档（只读， GM 后台加怪/加物即自动带出）。 */
