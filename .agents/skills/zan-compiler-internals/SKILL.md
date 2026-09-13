@@ -720,6 +720,10 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
 - **worker 只投递入口文件**：依赖 JS 全部内联进入口；且 API 是全局 worker
   对象（`worker.onMessage/postMessage`），DOM Worker 的 `self.postMessage`
   不路由——stdout sink 用错会让全部程序输出**静默消失**，误诊成"卡死"。
+- **游戏模板实测 + 字体注入**：ddz 卡牌模板 wasm 8.8MB 在 wx worker 壳里
+  跑到稳态 ~49fps（390×844 逻辑；首 120 帧个位数是 instantiate+字体挂载，
+  不是稳态）。中文字形必须 pre-start 往 worker 内存 FS 挂 `/fonts/ui.ttf`
+  + `/fonts/cjk.ttf`（与引擎同法 ≤4MB 分片），缺字体不报错、只画"?"。
 - **渲染入口声明即契约**：Render.zan 无条件引用 `zan_gui_draw_text_bold`
   （图表标题默认加粗），非 Win32 的 gui_runtime_font.c 必须出这个符号
   （回退=画常规体），否则 wasm/非 Win32 链接期 undefined symbol；同族

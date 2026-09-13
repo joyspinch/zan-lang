@@ -310,6 +310,13 @@ Difficulty is for **CLI/compute** first; GUI is a separate, larger effort on eac
   bounded busy-spin; the simulator serves worker bundles **entry file only**
   (inline dependencies) and its file-read pipe caps single reads at the
   Blink `atob` limit (~12.5 MB), so large engines ship as <=4 MB pieces.
+- **Card/board games run**: the ddz (Fight-the-Landlord) game template
+  compiles to an 8.8 MB wasm and boots to its painted menu — embedded art
+  assets, TTF Chinese text, buttons all render — at a steady ~49 fps in
+  devtools (390x844 logical; the first ~120 frames drop to single digits
+  while instantiate + font mount happen). Fonts must be mounted into the
+  worker's in-memory FS pre-start (`/fonts/ui.ttf` + the 6 MB `/fonts/cjk.ttf`
+  subset, shipped as pieces like the engine) or every CJK glyph renders "?".
 - **Package size**: a GUI engine wasm is ~14 MB (`stdlib/Gui` + FreeType +
   font data), while a mini-game **main package caps at 4 MB** and a single
   `.wasm` cannot be split across subpackages. The shipping shape is therefore
