@@ -1,0 +1,203 @@
+using System;
+using System.Data.ZanDb;
+using System.Json;
+using System.IO;
+
+/// ZanDb 引擎基准：批量插入 / 自动提交插入 / 主键点读 / 全表扫描 /
+/// 索引构建 / 索引点查 / 重开恢复 / 原始 KV 读写，以及归并前后的
+/// 磁盘占用。数字依赖机器（Release 构建参考值见
+/// stdlib/System/Data/ZanDb/README.md）；运行结束自动清理临时库文件。
+class ZanDbBench {
+    static int N = 20000;
+    static int BATCH = 500;
+
+    static void Clean(string basePath) {
+        File.Delete(basePath);
+        File.Delete(basePath + ".log");
+        File.Delete(basePath + ".m0");
+        File.Delete(basePath + ".m1");
+        for (int i = 0; i < 64; i = i + 1) {
+            File.Delete(basePath + ".s" + Convert.ToString(i));
+        }
+    }
+
+    static JsonValue MkDoc(int i) {
+        JsonValue d = JsonValue.NewObject();
+        d.Set("name", JsonValue.NewStr("user-" + Convert.ToString(i)));
+        d.Set("age", JsonValue.NewNum(Convert.ToString(i % 80)));
+        d.Set("cat", JsonValue.NewStr("c" + Convert.ToString(i % 16)));
+        d.Set("bio", JsonValue.NewStr("0123456789012345678901234567890123456789"
+            + "0123456789012345678901234567890123456789"));
+        return d;
+    }
+
+    static long TotalBytes(string basePath) {
+        long total = 0;
+        string[] parts = new string[67];
+        parts[0] = basePath + ".log";
+        parts[1] = basePath + ".m0";
+        parts[2] = basePath + ".m1";
+        for (int i = 0; i < 64; i = i + 1) {
+            parts[3 + i] = basePath + ".s" + Convert.ToString(i);
+        }
+        for (int i = 0; i < parts.Length; i = i + 1) {
+            if (File.Exists(parts[i])) {
+                total = total + File.GetSize(parts[i]);
+            }
+        }
+        return total;
+    }
+
+    static string Ms(double ms) {
+        return Convert.ToString(Math.Round(ms, 1));
+    }
+
+    static string Ops(int ops, double ms) {
+        if (ms <= 0) { ms = 0.01; }
+        return Convert.ToString((long)(ops * 1000.0 / ms)) + " ops/s";
+    }
+
+    static void Main() {
+        string path = "zandb_bench_tmp.zdb";
+        Clean(path);
+
+        ZanDatabase db = ZanDatabase.Open(path, ZanStore.DUR_GROUP);
+        if (!db.IsOpen()) {
+            Console.WriteLine("open failed: " + db.GetError());
+            return;
+        }
+        db.Kv().SetFlushThreshold(262144);
+        Collection users = db.GetCollection("users");
+
+        // 1) 批量插入（每 500 条一次提交）
+        int firstId = 0;
+        Stopwatch sw = Stopwatch.StartNew();
+        for (int b = 0; b < N / BATCH; b = b + 1) {
+            db.Begin();
+            for (int i = 0; i < BATCH; i = i + 1) {
+                int id = users.Insert(MkDoc(b * BATCH + i));
+                if (b == 0 && i == 0) { firstId = id; }
+            }
+            if (!db.Commit()) { Console.WriteLine("commit failed"); }
+        }
+        double insMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("insert batched   " + Convert.ToString(N) + " docs in "
+            + Ms(insMs) + " ms = " + Ops(N, insMs));
+
+        // 2) 点读（主键）：3 轮 x N
+        JsonValue probe = users.FindById(firstId);
+        if (probe == null) { Console.WriteLine("POINT READ BROKEN"); return; }
+        JsonValue nameVal = probe.Get("name");
+        string probeName = nameVal == null ? "" : nameVal.AsString("");
+        if (probeName != "user-0") {
+            Console.WriteLine("POINT READ BROKEN");
+            return;
+        }
+        long sink = 0;
+        sw = Stopwatch.StartNew();
+        for (int r = 0; r < 3; r = r + 1) {
+            for (int i = 0; i < N; i = i + 1) {
+                JsonValue d = users.FindById(firstId + i);
+                if (d != null) {
+                    JsonValue age = d.Get("age");
+                    if (age != null) { sink = sink + age.AsString("0").Length; }
+                }
+            }
+        }
+        double getMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("point read       " + Convert.ToString(3 * N)
+            + " lookups in " + Ms(getMs) + " ms = " + Ops(3 * N, getMs)
+            + "  (sink=" + Convert.ToString(sink) + ")");
+
+        // 3) 全表扫描：3 轮
+        sw = Stopwatch.StartNew();
+        long scanned = 0;
+        for (int r = 0; r < 3; r = r + 1) {
+            List<JsonValue> all = users.FindAll();
+            scanned = all.Count;
+        }
+        double scanMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("full scan        " + Convert.ToString(3 * scanned)
+            + " docs in " + Ms(scanMs) + " ms = " + Ops(3 * scanned, scanMs));
+
+        // 4) 索引构建 + 索引点查
+        sw = Stopwatch.StartNew();
+        users.EnsureIndex("cat");
+        double idxMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("index build      cat (" + Convert.ToString(N)
+            + " docs) in " + Ms(idxMs) + " ms");
+        sw = Stopwatch.StartNew();
+        long hits = 0;
+        for (int r = 0; r < 20; r = r + 1) {
+            List<JsonValue> got = users.FindByIndex("cat", "c3");
+            hits = got.Count;
+        }
+        double idxqMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("index lookup     " + Convert.ToString(20 * hits) + " rows in "
+            + Ms(idxqMs) + " ms = " + Ops(20 * hits, idxqMs) + " (expect N/16 per query)");
+
+        // 5) 自动提交插入（每条一个提交，DUR_GROUP）
+        int M = 2000;
+        sw = Stopwatch.StartNew();
+        for (int i = 0; i < M; i = i + 1) {
+            users.Insert(MkDoc(1000000 + i));
+        }
+        double autoMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("insert autocommit " + Convert.ToString(M) + " docs in "
+            + Ms(autoMs) + " ms = " + Ops(M, autoMs));
+
+        // 6) 重开恢复
+        db.Close();
+        sw = Stopwatch.StartNew();
+        db = ZanDatabase.Open(path, ZanStore.DUR_GROUP);
+        double openMs = sw.ElapsedMilliseconds();
+        Collection users2 = db.GetCollection("users");
+        Console.WriteLine("reopen           " + Ms(openMs) + " ms, count="
+            + Convert.ToString(users2.Count()));
+        if (users2.Count() != N + M) { Console.WriteLine("REOPEN COUNT WRONG"); }
+
+        // 7) 合并前后磁盘占用
+        long before = TotalBytes(path);
+        db.MergeSegments();
+        db.Close();
+        long after = TotalBytes(path);
+        Console.WriteLine("disk             before merge " + Convert.ToString(before)
+            + " B, after merge " + Convert.ToString(after) + " B ("
+            + Convert.ToString(after / (N + M)) + " B/doc)");
+
+        // 8) 原始 KV：批量 Put + 点读（独立路径，避免混入文档键）
+        string rpath = "zandb_bench_raw.zdb";
+        Clean(rpath);
+        ZanStore kv = ZanStore.Open(rpath, ZanStore.DUR_GROUP);
+        kv.SetFlushThreshold(262144);
+        sw = Stopwatch.StartNew();
+        for (int b = 0; b < N / BATCH; b = b + 1) {
+            kv.Begin();
+            for (int i = 0; i < BATCH; i = i + 1) {
+                kv.Put("raw" + Convert.ToString(b * BATCH + i).PadLeft(6, "0"),
+                    "value-" + Convert.ToString(b * BATCH + i) + "-0123456789abcdef");
+            }
+            kv.Commit();
+        }
+        double kvPutMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("kv put batched   " + Convert.ToString(N) + " keys in "
+            + Ms(kvPutMs) + " ms = " + Ops(N, kvPutMs));
+        sw = Stopwatch.StartNew();
+        long vsink = 0;
+        for (int r = 0; r < 3; r = r + 1) {
+            for (int i = 0; i < N; i = i + 1) {
+                string v = kv.Get("raw" + Convert.ToString(i).PadLeft(6, "0"));
+                if (v != null) { vsink = vsink + v.Length; }
+            }
+        }
+        double kvGetMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("kv get           " + Convert.ToString(3 * N) + " lookups in "
+            + Ms(kvGetMs) + " ms = " + Ops(3 * N, kvGetMs)
+            + "  (sink=" + Convert.ToString(vsink) + ")");
+        kv.MergeSegments();
+        kv.Close();
+        Console.WriteLine("kv disk after merge " + Convert.ToString(TotalBytes(rpath)) + " B");
+        Clean(path);
+        Clean(rpath);
+    }
+}

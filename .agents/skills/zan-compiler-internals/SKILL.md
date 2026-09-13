@@ -370,6 +370,23 @@ parser 回溯，专项做。
   那条路径"**——按"谁 retain 了它"反查消费点（这里是 emit_closure_record 的
   retain_target），别只盯着 new。
 
+## 数组字面量初始化循环必须走 ARC retain 协议（2026-09-13 已修）
+
+- `new T[]{a, b}` 与定长 `new T[n] {...}` 的元素初始化循环原先只
+  `LLVMBuildStore` 不 retain——元素是引用类型（string/类/委托）时数组槽里
+  存的是**悬垂指针**：表达式值出栈即被释放。症状不是崩在初始化处，而是
+  **"串值"**：后写的元素把先写的槽内容覆盖成自己这次迭代的值、跨迭代内容
+  漂移、读完像"数组元素全都变成最后一个"；且 `--check-leaks` 反而干净
+  （没人 retain 也就没人 release）。**"内容莫名漂移 + leakcheck 干净"
+  = 优先怀疑某条路径漏 retain**，用最小探针（两元素字面量 + 两次读）
+  即可复现。
+- 修法（irgen_expr.c，`array_init` 字面量与 `ninit` 定长两处循环同改）：
+  逐元素 `is_rc_managed_type(elem_type) && !expr_yields_owned_rc_value(...)
+  → emit_rc_retain_for_type`——与元素赋值路径（`arr[i] = x`）同一协议。
+  **新增任何"把表达式值写进容器槽位"的 irgen 路径（数组/列表/字典/字段）
+  都必须复制这套判据**，判据散装手写会漏。conformance：
+  tests/conformance/arr_lit_rc（存 two 元素字面量后再逐个比对）。
+
 ## 字节串 ABI 契约（stdlib crypto EVP 换装踩坑，2026-09-10）
 
 - **byte[] 按 string 形参传入时 `.Length` = strlen**：共享的是 payload
