@@ -1,0 +1,121 @@
+using System;
+using System.Data.ZanDb;
+using System.IO;
+
+/// <summary>
+/// ZanStore 日志式存储引擎的一致性用例：基本读写、重开重放、
+/// 事务回滚、批量提交、撕裂尾部恢复。输出为确定性行序列，
+/// 与 zandb_store.out 金样逐行比对。
+/// </summary>
+class ZanDbStoreTest {
+    static int checks = 0;
+
+    static void Ok(bool cond, string what) {
+        checks = checks + 1;
+        if (cond) {
+            Console.WriteLine("ok " + Convert.ToString(checks) + " - " + what);
+        } else {
+            Console.WriteLine("FAIL " + Convert.ToString(checks) + " - " + what);
+        }
+    }
+
+    static void Main() {
+        string path = "zandb_store_tmp.zdb";
+        File.Delete(path);
+
+        // 1) 基本读写：自动提交（SYNC 档每次落盘）。
+        ZanStore db = ZanStore.Open(path, ZanStore.DUR_SYNC);
+        Ok(db.IsOpen(), "open");
+        db.Put("alpha", "1");
+        db.Put("beta", "2");
+        db.Put("gamma", "3");
+        db.Put("beta", "2b");
+        Ok(db.Get("beta") == "2b", "overwrite visible");
+        Ok(db.Contains("gamma"), "contains existing");
+        Ok(!db.Contains("delta"), "contains missing");
+        Ok(db.Delete("gamma"), "delete existing");
+        Ok(!db.Delete("gamma"), "delete missing");
+        Ok(db.Get("gamma") == "", "deleted key reads empty");
+        Ok(db.Count() == 2, "count after delete");
+        long logBytes1 = db.LogBytes();
+        Ok(logBytes1 > 0, "log has bytes");
+        db.Close();
+
+        // 2) 重开：日志重放恢复内存索引。
+        db = ZanStore.Open(path);
+        Ok(db.Get("alpha") == "1", "alpha survives reopen");
+        Ok(db.Get("beta") == "2b", "beta overwrite survives");
+        Ok(db.Get("gamma") == "", "gamma gone after replay");
+        Ok(db.Count() == 2, "count after replay");
+        Ok(db.Version() == 5, "version = applied records");
+
+        // 3) 事务：提交生效，回滚无痕（含对既有键的覆盖）。
+        db.Begin();
+        db.Put("tx1", "a");
+        db.Put("alpha", "tx-overwrite");
+        db.Rollback();
+        Ok(db.Get("tx1") == "", "rollback discards new key");
+        Ok(db.Get("alpha") == "1", "rollback restores old value");
+
+        db.Begin();
+        db.Put("tx2", "b");
+        db.Commit();
+        db.Begin();
+        db.Put("tx3", "c");
+        db.Commit();
+        Ok(db.Get("tx2") == "b" && db.Get("tx3") == "c", "committed tx visible");
+        Ok(db.Count() == 4, "count after commits");
+        db.Close();
+
+        // 4) 批量写入：一个事务 100 键，重开后完整。
+        db = ZanStore.Open(path);
+        long bytesBefore = db.LogBytes();
+        db.Begin();
+        for (int i = 0; i < 100; i = i + 1) {
+            db.Put("k" + Convert.ToString(i), "v" + Convert.ToString(i));
+        }
+        db.Commit();
+        Ok(db.LogBytes() > bytesBefore, "batch appended to log");
+        Ok(db.Count() == 104, "count after batch");
+        db.Close();
+
+        db = ZanStore.Open(path);
+        Ok(db.Get("k0") == "v0", "batch first key survives");
+        Ok(db.Get("k99") == "v99", "batch last key survives");
+
+        // 5) 撕裂尾部：模拟崩溃——日志被追加垃圾后重开。
+        //    重放必须停在坏帧、截断尾部，且坏帧之前的数据完好。
+        PageFile junk = PageFile.Open(path);
+        ByteBuffer garbage = ByteBuffer.Alloc(48);
+        for (int i = 0; i < 48; i = i + 1) {
+            garbage.WriteU8((i * 37 + 11) & 255);
+        }
+        garbage.SeekRead(0);
+        junk.Append(garbage.Raw(), 48);
+        junk.Close();
+        garbage.Free();
+        db.Close();
+
+        db = ZanStore.Open(path);
+        Ok(db.Count() == 104, "torn tail ignored");
+        Ok(db.Get("k50") == "v50", "data before torn tail intact");
+
+        // 6) 恢复后的写入直接覆盖垃圾区域，且重开可见。
+        db.Put("post", "crash");
+        db.Close();
+        db = ZanStore.Open(path);
+        Ok(db.Get("post") == "crash", "write after recovery visible");
+        Ok(db.Count() == 105, "count after recovery write");
+
+        // 7) Checkpoint 后重开，一切仍在。
+        db.Checkpoint();
+        db.Close();
+        db = ZanStore.Open(path);
+        Ok(db.Get("post") == "crash", "post survives checkpoint reopen");
+        Ok(db.Count() == 105, "count final");
+        db.Close();
+
+        Console.WriteLine("done " + Convert.ToString(checks) + " checks");
+        File.Delete(path);
+    }
+}

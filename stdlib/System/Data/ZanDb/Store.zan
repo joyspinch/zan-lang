@@ -1,0 +1,326 @@
+using System;
+using System.IO;
+using System.Threading;
+
+namespace System.Data.ZanDb;
+
+/// <summary>在写临界区内根据当前值计算新值
+/// （键不存在时 current 为 ""）。</summary>
+delegate string StoreUpdater(string current);
+
+/// <summary>
+/// 日志式键值存储：全内存哈希索引 + 单一追加日志。
+/// 点读 O(1) 零 IO；写路径只做顺序追加，一组提交一次定位写、
+/// 至多一次 fsync。打开时重放日志恢复，撕裂尾部自动截断——
+/// 任何时刻断电，数据库都停留在最后一个完整帧。
+///
+/// 每条记录一帧，载荷（小端）：
+///   u64 seq
+///   u8  op        1 = put，2 = delete
+///   varint 键长 + 键字节
+///   varint 值长 + 值字节（仅 put）
+/// 键与值按 NUL-free 契约传递（记录编码层负责转义，参见
+/// Collection 的 EncodeDoc），因此字符串可以安全往返。
+///
+/// 持久化三档（默认 GROUP）：
+///   DUR_SYNC  每次提交 flush + fsync——停电不丢已确认的提交
+///   DUR_GROUP 每次提交 flush 进 OS 缓存，每 syncEvery 次提交
+///             或攒满 512KB 才 fsync——停电丢最近几次提交
+///   DUR_NONE  攒满 1MB 才 flush，仅 Checkpoint/Close 落盘
+/// 三档都不会损坏数据库：fsync 之前的帧在崩溃时整体消失。
+///
+/// 并发模型：单进程、单写多读。同步 API 不加锁（一个句柄
+/// 归一个所有者）；协程请走 Async 系列——它们经共享
+/// AsyncRwLock 串行化写、共享化读。跨进程访问不受支持：
+/// 跨进程文件锁是上一代引擎并发瓶颈的根源，多进程共享
+/// 请走服务进程。
+/// </summary>
+class ZanStore {
+    /// 每次提交都 fsync。
+    static int DUR_SYNC = 0;
+    /// 分组提交：按次数/字节数窗口 fsync。
+    static int DUR_GROUP = 1;
+    /// 只在 Checkpoint/Close 与缓冲攒满时落盘。
+    static int DUR_NONE = 2;
+
+    /// GROUP 档攒满这么多字节提前 fsync。
+    static int GROUP_FLUSH_BYTES = 524288;
+    /// NONE 档攒满这么多字节强制 flush 进 OS 缓存。
+    static int NONE_FLUSH_BYTES = 1048576;
+
+    LogFile log;
+    Dictionary<string, string> map;
+    /// 事务内的未提交覆盖层：put 的键值；值为空串仅表示删除。
+    Dictionary<string, string> txPut;
+    Dictionary<string, string> txDel;
+    AsyncRwLock rw;
+    int durability;
+    int syncEvery;
+    int commitsSinceSync;
+    long seq;
+    int txDepth;
+    int txMark;
+    string lastError;
+
+    ZanStore() {
+        this.durability = ZanStore.DUR_GROUP;
+        this.syncEvery = 32;
+        this.commitsSinceSync = 0;
+        this.seq = 0;
+        this.txDepth = 0;
+        this.txMark = 0;
+        this.lastError = "";
+    }
+
+    /// <summary>打开（必要时创建）分组提交档的存储。</summary>
+    static ZanStore Open(string path) {
+        return ZanStore.Open(path, ZanStore.DUR_GROUP);
+    }
+
+    /// <summary>以显式持久化档打开：重放既有日志恢复内存索引，
+    /// 撕裂尾部就地截断。</summary>
+    static ZanStore Open(string path, int durability) {
+        ZanStore s = new ZanStore();
+        s.durability = durability;
+        s.map = new Dictionary<string, string>();
+        s.txPut = new Dictionary<string, string>();
+        s.txDel = new Dictionary<string, string>();
+        s.rw = new AsyncRwLock();
+        s.log = LogFile.Open(path);
+        if (!s.log.IsOpen()) {
+            s.lastError = s.log.GetError();
+            return s;
+        }
+        s.log.Replay(s.ApplyFrame);
+        return s;
+    }
+
+    /// 是否处于打开状态（打开无错误且底层日志可用）。
+    bool IsOpen() { return this.lastError.Length == 0 && this.log.IsOpen(); }
+
+    /// 最近一次打开失败的错误文本；Open 失败时由它给出原因。
+    string GetError() { return this.lastError; }
+
+    /// 重放期间按日志序应用一帧；缓冲区归 LogFile，不得 Free。
+    void ApplyFrame(ByteBuffer b) {
+        b.SeekRead(0);
+        b.ReadU64();
+        int op = b.ReadU8();
+        string key = b.ReadString();
+        if (op == 1) {
+            string val = b.ReadString();
+            if (this.map.ContainsKey(key)) { this.map.Remove(key); }
+            this.map.Add(key, val);
+        } else if (op == 2) {
+            this.map.Remove(key);
+        }
+        this.seq = this.seq + 1;
+    }
+
+    /// <summary>该句柄已应用的记录数：单调递增，可当快照版本用。</summary>
+    long Version() { return this.seq; }
+
+    /// 键值对总数（内存索引维护，O(1)）。
+    int Count() { return this.map.Count; }
+
+    /// 日志逻辑大小（字节）：含已落盘与缓冲中的帧。
+    long LogBytes() { return this.log.Size(); }
+
+    /// 切换持久化档（立即生效）。
+    void SetDurability(int d) { this.durability = d; }
+
+    /// <summary>GROUP 档的 fsync 窗口：N = 每 N 次提交至多
+    /// 一次 fsync（攒满 <see cref="GROUP_FLUSH_BYTES"/> 字节会提前）。</summary>
+    void SetSyncEvery(int n) {
+        if (n >= 1) { this.syncEvery = n; }
+    }
+
+    // ===== 同步核心（单所有者，无锁） =====
+
+    /// <summary>返回值；不存在时返回 ""（与「值为空串」不可区分，
+    /// 需要区分时用 <see cref="Contains"/>）。事务内可见未提交的
+    /// 本事务写入。</summary>
+    string Get(string key) {
+        if (this.txDepth > 0) {
+            if (this.txDel.ContainsKey(key)) { return ""; }
+            string tv = "";
+            if (this.txPut.TryGetValue(key, out tv)) { return tv; }
+        }
+        string v = "";
+        if (this.map.TryGetValue(key, out v)) { return v; }
+        return "";
+    }
+
+    /// 键是否存在。
+    bool Contains(string key) {
+        if (this.txDepth > 0) {
+            if (this.txDel.ContainsKey(key)) { return false; }
+            if (this.txPut.ContainsKey(key)) { return true; }
+        }
+        return this.map.ContainsKey(key);
+    }
+
+    /// <summary>插入或替换一个键。除非处于 Begin()/Commit() 内，
+    /// 否则按当前持久化档立即落盘。</summary>
+    void Put(string key, string val) {
+        this.AppendRec(1, key, val);
+        if (this.txDepth > 0) {
+            if (this.txDel.ContainsKey(key)) { this.txDel.Remove(key); }
+            if (this.txPut.ContainsKey(key)) { this.txPut.Remove(key); }
+            this.txPut.Add(key, val);
+            return;
+        }
+        if (this.map.ContainsKey(key)) { this.map.Remove(key); }
+        this.map.Add(key, val);
+        this.FinishCommit();
+    }
+
+    /// 删除键；键存在时返回 true。
+    bool Delete(string key) {
+        if (this.txDepth == 0 && !this.map.ContainsKey(key)) { return false; }
+        if (this.txDepth > 0) {
+            if (!this.Contains(key)) { return false; }
+        }
+        this.AppendRec(2, key, "");
+        if (this.txDepth > 0) {
+            if (this.txPut.ContainsKey(key)) { this.txPut.Remove(key); }
+            if (this.txDel.ContainsKey(key)) { this.txDel.Remove(key); }
+            this.txDel.Add(key, "");
+            return true;
+        }
+        this.map.Remove(key);
+        this.FinishCommit();
+        return true;
+    }
+
+    /// <summary>开始一个批次：写入进入覆盖层并追加日志帧，
+    /// 最外层 Commit 时合并进内存索引并按持久化档落盘。
+    /// 可嵌套。</summary>
+    void Begin() {
+        if (this.txDepth == 0) { this.txMark = this.log.Mark(); }
+        this.txDepth = this.txDepth + 1;
+    }
+
+    /// <summary>原子地持久化自最外层 Begin() 以来的全部写入。</summary>
+    bool Commit() {
+        if (this.txDepth > 0) { this.txDepth = this.txDepth - 1; }
+        if (this.txDepth > 0) { return true; }
+        this.MergeTxOverlay();
+        this.FinishCommit();
+        return true;
+    }
+
+    /// <summary>丢弃自最外层 Begin() 以来的全部写入：缓冲中的帧
+    /// 回退到事务起点，覆盖层清空。</summary>
+    void Rollback() {
+        if (this.txDepth == 0) { return; }
+        this.txDepth = 0;
+        this.log.RollbackTo(this.txMark);
+        this.txPut.Clear();
+        this.txDel.Clear();
+    }
+
+    /// 最外层提交时把覆盖层合并进内存索引。
+    void MergeTxOverlay() {
+        List<string> dk = this.txDel.Keys;
+        for (int i = 0; i < dk.Count; i = i + 1) {
+            this.map.Remove(dk[i]);
+        }
+        this.txDel.Clear();
+        List<string> pk = this.txPut.Keys;
+        for (int i = 0; i < pk.Count; i = i + 1) {
+            string k = pk[i];
+            string v = "";
+            this.txPut.TryGetValue(k, out v);
+            if (this.map.ContainsKey(k)) { this.map.Remove(k); }
+            this.map.Add(k, v);
+        }
+        this.txPut.Clear();
+    }
+
+    /// 按当前持久化档处理缓冲：flush / 窗口化 fsync。
+    void FinishCommit() {
+        if (this.durability == ZanStore.DUR_SYNC) {
+            if (!this.log.Sync()) { this.lastError = this.log.GetError(); }
+            return;
+        }
+        if (this.durability == ZanStore.DUR_GROUP) {
+            if (!this.log.Flush()) {
+                this.lastError = this.log.GetError();
+                return;
+            }
+            this.commitsSinceSync = this.commitsSinceSync + 1;
+            if (this.commitsSinceSync >= this.syncEvery
+                    || this.log.PendingBytes() >= ZanStore.GROUP_FLUSH_BYTES) {
+                if (!this.log.Sync()) { this.lastError = this.log.GetError(); }
+                this.commitsSinceSync = 0;
+            }
+            return;
+        }
+        if (this.log.PendingBytes() >= ZanStore.NONE_FLUSH_BYTES) {
+            this.log.Flush();
+        }
+    }
+
+    /// 追加一条记录帧并推进 seq。
+    void AppendRec(int op, string key, string val) {
+        ByteBuffer b = ByteBuffer.Alloc(24 + key.Length + val.Length);
+        b.WriteU64(this.seq);
+        b.WriteU8(op);
+        b.WriteString(key);
+        if (op == 1) { b.WriteString(val); }
+        b.SeekRead(0);
+        this.log.AppendFrame(b);
+        b.Free();
+        this.seq = this.seq + 1;
+    }
+
+    /// <summary>将缓冲与 OS 缓存全部强制落盘。</summary>
+    void Checkpoint() {
+        if (!this.log.Sync()) { this.lastError = this.log.GetError(); }
+    }
+
+    /// 落盘并关闭日志与进程内读写锁。
+    void Close() {
+        this.log.Close();
+        this.rw.Close();
+    }
+
+    // ===== 协程安全的异步 API =====
+
+    /// <summary>共享锁读取；可安全地与并发写入共存。</summary>
+    async string GetAsync(string key) {
+        await this.rw.EnterRead();
+        string v = Get(key);
+        this.rw.ExitRead();
+        return v;
+    }
+
+    /// <summary>独占锁写入并按当前持久化档落盘。</summary>
+    async void PutAsync(string key, string val) {
+        await this.rw.EnterWrite();
+        Put(key, val);
+        this.rw.ExitWrite();
+    }
+
+    /// 独占锁删除一个键；返回键此前是否存在。
+    async bool DeleteAsync(string key) {
+        await this.rw.EnterWrite();
+        bool existed = Delete(key);
+        this.rw.ExitWrite();
+        return existed;
+    }
+
+    /// <summary>原子读改写：fn 在写临界区内看到最新已提交值
+    /// （不存在时为 ""），因此同一键上的并发 UpdateAtomic
+    /// 不会丢失更新。返回最终存储的结果。</summary>
+    async string UpdateAtomic(string key, StoreUpdater fn) {
+        await this.rw.EnterWrite();
+        Begin();
+        string next = fn(Get(key));
+        Put(key, next);
+        Commit();
+        this.rw.ExitWrite();
+        return next;
+    }
+}

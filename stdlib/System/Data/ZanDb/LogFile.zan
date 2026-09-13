@@ -1,0 +1,155 @@
+using System;
+using System.IO;
+
+namespace System.Data.ZanDb;
+
+/// <summary>重放回调：payload 为一帧载荷，读位置在 0、长度为载荷字节数。
+/// 缓冲区归 LogFile 所有并在下一帧复用，访客不得 Free；
+/// 需要保留内容时必须自行复制。</summary>
+delegate void LogFrameVisitor(ByteBuffer payload);
+
+/// <summary>
+/// 追加日志：定长头（载荷长度 + CRC32）+ 载荷的顺序帧序列。
+/// 写路径先把帧攒进内存缓冲，Flush 时一次性写到逻辑末尾，
+/// Sync 落到稳定存储——一组帧因此只需一次定位写、一次 fsync。
+/// Replay 按序校验帧，遇到第一个不完整或 CRC 不符的帧即停止；
+/// 崩溃留下的撕裂尾部被就地截断，因此重放之后日志永远以
+/// 完整帧结尾，后续追加直接覆盖垃圾区域。
+///
+/// 帧布局（小端）：
+///   u32 payloadLen
+///   u32 crc32     载荷的 CRC32
+///   payload       payloadLen 字节
+/// </summary>
+class LogFile {
+    /// 帧头长度（字节）：u32 len + u32 crc。
+    static int HEADER_LEN = 8;
+    /// 单帧载荷的防护性上限：超过即视为损坏帧。
+    static long MAX_FRAME = 67108864;
+
+    PageFile file;
+    string path;
+    ByteBuffer pending;
+    long logicalEnd;
+    string lastError;
+
+    LogFile() {
+        this.path = "";
+        this.logicalEnd = 0;
+        this.lastError = "";
+        this.pending = ByteBuffer.Alloc(256);
+    }
+
+    /// <summary>打开（必要时创建）日志文件。重放由调用方
+    /// 经 <see cref="Replay"/> 驱动。</summary>
+    static LogFile Open(string filePath) {
+        LogFile lf = new LogFile();
+        lf.path = filePath;
+        lf.file = PageFile.Open(filePath);
+        if (!lf.file.IsOpen()) {
+            lf.lastError = lf.file.GetError();
+            return lf;
+        }
+        return lf;
+    }
+
+    /// 文件是否成功打开。
+    bool IsOpen() { return this.file.IsOpen(); }
+
+    /// 最近一次操作的错误描述（无错为空串）。
+    string GetError() { return this.lastError; }
+
+    /// 日志文件的磁盘路径。
+    string FilePath() { return this.path; }
+
+    /// 逻辑大小：已落盘的完整帧 + 缓冲中的帧。
+    long Size() { return this.logicalEnd + this.pending.Length(); }
+
+    /// 缓冲中尚未写入文件的字节数。
+    int PendingBytes() { return this.pending.Length(); }
+
+    /// <summary>追加一帧。帧先进入内存缓冲，
+    /// <see cref="Flush"/> 之前不落盘。</summary>
+    void AppendFrame(ByteBuffer payload) {
+        int plen = payload.Length();
+        this.pending.EnsureRoom(LogFile.HEADER_LEN + plen);
+        this.pending.WriteU32(plen);
+        this.pending.WriteU32(payload.Crc32(plen));
+        payload.SeekRead(0);
+        this.pending.WriteBytes(payload.Raw(), plen);
+    }
+
+    /// <summary>把缓冲中的全部帧一次性写到逻辑末尾。
+    /// 失败时缓冲保持原样，可重试。</summary>
+    bool Flush() {
+        if (this.pending.Length() == 0) { return true; }
+        long at = this.logicalEnd;
+        int n = this.file.WriteAt(at, this.pending.Raw(), this.pending.Length());
+        if (n != this.pending.Length()) {
+            this.lastError = "log write failed";
+            return false;
+        }
+        this.logicalEnd = at + n;
+        this.pending.Clear();
+        return true;
+    }
+
+    /// <summary>Flush 并强制落盘到稳定存储。</summary>
+    bool Sync() {
+        if (!this.Flush()) { return false; }
+        return this.file.Sync();
+    }
+
+    /// 标记缓冲当前位置（事务起点），供 <see cref="RollbackTo"/> 使用。
+    int Mark() { return this.pending.Length(); }
+
+    /// <summary>丢弃 Mark 之后缓冲中的帧（事务回滚）。
+    /// 只对尚未 Flush 的内容有效。</summary>
+    void RollbackTo(int mark) {
+        if (mark >= 0 && mark < this.pending.Length()) {
+            this.pending.SetLength(mark);
+        }
+    }
+
+    /// <summary>顺序重放全部完整帧，每个载荷交给 visit；
+    /// 遇到第一个不完整或 CRC 不符的帧停止，并截断其后的
+    /// 撕裂尾部。返回重放结束处的偏移（新的逻辑末尾）。</summary>
+    long Replay(LogFrameVisitor visit) {
+        long size = this.file.Size();
+        if (size <= 0) { return 0; }
+        long off = 0;
+        ByteBuffer h = ByteBuffer.Alloc(LogFile.HEADER_LEN);
+        ByteBuffer body = ByteBuffer.Alloc(256);
+        while (off + LogFile.HEADER_LEN <= size) {
+            int got = this.file.ReadAt(off, h, LogFile.HEADER_LEN);
+            if (got < LogFile.HEADER_LEN) { break; }
+            h.SeekRead(0);
+            long plen = h.ReadU32();
+            long crc = h.ReadU32();
+            if (plen > LogFile.MAX_FRAME) { break; }
+            if (off + LogFile.HEADER_LEN + plen > size) { break; }
+            if (plen > 0) {
+                body.EnsureCapacity((int)plen);
+                got = this.file.ReadAt(off + LogFile.HEADER_LEN, body, (int)plen);
+                if (got != (int)plen) { break; }
+                if (body.Crc32(got) != crc) { break; }
+            }
+            body.SeekRead(0);
+            visit(body);
+            off = off + LogFile.HEADER_LEN + plen;
+        }
+        h.Free();
+        body.Free();
+        if (off < size) {
+            this.file.Truncate(off);
+        }
+        this.logicalEnd = off;
+        return off;
+    }
+
+    /// <summary>Flush 后关闭底层文件。</summary>
+    void Close() {
+        this.Flush();
+        this.file.Close();
+    }
+}
