@@ -54,6 +54,13 @@ char **zan_gen_design(const char *stdlib_root, const char *const *paths,
  * by the generators, never parsed as Zan source. */
 bool zan_is_zcomp_path(const char *p);
 
+/* True when `p` is a design document (".html"/".htm"/".zscene"): generator
+ * input translated to Zan source by zan_gen_design, never meaningful to
+ * lex as raw Zan (heuristic token scans must skip it -- raw HTML lexes as
+ * garbage tokens whose Chinese bytes hit the lexer's unknown-character
+ * path). */
+bool zan_is_design_path(const char *p);
+
 /* Run the Zan-scripted code generators (the "codegen" mode: jsongen/dbgen/
  * routegen) over the compilation unit. Exports the metadata, spawns the
  * cached generator when a call site could trigger codegen, then applies the

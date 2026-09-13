@@ -2698,6 +2698,20 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_html_runtime${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # Runtime-HTML channel with Chinese text and non-Zan bytes (@@) in the
+  # document: the raw HTML must reach only the generator; heuristic token
+  # scans must skip design inputs entirely, so zanc stays silent and the
+  # generated tree keeps every CJK literal byte-exact (labels, placeholder,
+  # data-arg).
+  add_test(NAME conformance_gui_html_runtime_cjk
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/html_runtime_cjk_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/html_runtime_cjk.html;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_html_runtime_cjk.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_html_runtime_cjk${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # Declarative typed grid: a DataGrid field with "of" + "columns" projects
   # typed accessor lambdas onto the generic column API, binds the caller's
   # List<T> directly (no DataRow), and "props"/"rowFactory" reach the state.

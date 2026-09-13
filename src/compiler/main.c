@@ -439,6 +439,11 @@ static int auto_include_namespace(const char *stdlib_root, const char *subdir,
 static void scan_namespace_tokens(const char *source, size_t len) {
     zan_arena_t *arena = zan_arena_new();
     zan_diag_t *diag = zan_diag_new(arena);
+    /* Heuristic scan over text that is *believed* to be Zan source: a
+     * lexer error here is a false alarm on foreign text, not a user
+     * diagnostic -- capture it instead of printing (the diag has no file
+     * registered, so a print would render as "<unknown>"). */
+    zan_diag_set_capture(diag, true);
     zan_lexer_t lex;
     zan_lexer_init(&lex, source, len, 0, arena, diag);
     for (;;) {
@@ -461,6 +466,7 @@ static void scan_namespace_tokens(const char *source, size_t len) {
         name[used] = 0;
         if (tok.kind == TK_SEMICOLON && used > 0) project_namespace_add(name);
     }
+    zan_diag_free_buffers(diag);
     zan_arena_free(arena);
 }
 
@@ -624,6 +630,9 @@ static void scan_using_tokens(const char *source, size_t len,
                               const char ***files, int *count, int *cap) {
     zan_arena_t *arena = zan_arena_new();
     zan_diag_t *diag = zan_diag_new(arena);
+    /* Heuristic scan: lexer errors on foreign text are false alarms, not
+     * user diagnostics (see scan_namespace_tokens). */
+    zan_diag_set_capture(diag, true);
     zan_lexer_t lex;
     zan_lexer_init(&lex, source, len, 0, arena, diag);
     for (;;) {
@@ -647,6 +656,7 @@ static void scan_using_tokens(const char *source, size_t len,
         if (tok.kind == TK_SEMICOLON && used > 0 && !subdir_globbed(subdir))
             auto_include_namespace(stdlib_root, subdir, files, count, cap);
     }
+    zan_diag_free_buffers(diag);
     zan_arena_free(arena);
 }
 
@@ -897,6 +907,9 @@ static void pi_scan_file(pi_file_t *f) {
     }
     zan_arena_t *arena = zan_arena_new();
     zan_diag_t *diag = zan_diag_new(arena);
+    /* Heuristic scan: lexer errors on foreign text are false alarms, not
+     * user diagnostics (see scan_namespace_tokens). */
+    zan_diag_set_capture(diag, true);
     zan_lexer_t lex;
     zan_lexer_init(&lex, src, len, 0, arena, diag);
     zan_apply_lex_defines(&lex, pi_target, pi_pp_defines, pi_pp_define_count);
@@ -1041,6 +1054,7 @@ static void pi_scan_file(pi_file_t *f) {
         }
         prev = tok.kind;
     }
+    zan_diag_free_buffers(diag);
     zan_arena_free(arena);
     free(src);
 }
@@ -2921,6 +2935,13 @@ int main(int argc, char **argv) {
     input_file = input_files[0];
     resolve_package_project_root(input_file);
     for (int fi = 0; fi < input_count; fi++) {
+        /* Design docs / saved components are generator data, not Zan
+         * source: their raw text is only meaningful to the generator, and
+         * lexing it here would surface lexer errors (every Chinese char
+         * in an .html used to spam "unexpected character" from a diag
+         * that has no file registered, rendering as "<unknown>"). */
+        if (zan_is_design_path(input_files[fi]) ||
+            zan_is_zcomp_path(input_files[fi])) continue;
         size_t nlen = 0;
         char *nsrc = read_file(input_files[fi], &nlen);
         if (!nsrc) continue;

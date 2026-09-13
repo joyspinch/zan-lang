@@ -606,7 +606,11 @@ int zan_gen_run(const char *exe, const char *meta_path, const char *out_path) {
 
 /* ---- design-document translation (the "design" mode) ---- */
 
-static bool zan_is_design_path(const char *p) {
+/* A design document: generator input, translated to Zan source by
+ * zan_gen_design before anything lexes it. Exported so the pre-parse
+ * heuristic token scans in main.c can skip it -- lexing raw HTML as Zan
+ * cannot produce anything but garbage tokens. */
+bool zan_is_design_path(const char *p) {
     size_t n = strlen(p);
     return (n > 7 && strcmp(p + n - 7, ".zscene") == 0) ||
            (n > 5 && strcmp(p + n - 5, ".html") == 0) ||
