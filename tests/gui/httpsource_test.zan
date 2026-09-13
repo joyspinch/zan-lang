@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Json;
 using System.Net.Sockets;
 using System.Net.Http;
@@ -77,16 +78,27 @@ class HttpSourceTest {
 
     static void Main() {
         fails = 0;
-        Directory.CreateDirectory("hts_cache");
-        Directory.CreateDirectory("hts_cache2");
+        // 缓存目录必须用绝对路径：File 读族在相对路径 miss 时会回退到
+        // exe 目录（rt_file.c 的 alt-base），于是 CWD 相对的清理防不住
+        // exe 侧的残留缓存（首轮 fetch 变缓存命中，hits==0 而行数据照常
+        // 到达）。绝对路径让清理/读/写三边锚定同一棵树，alt-base 永远
+        // 不会介入。
+        string cacheRoot = ProcessHost.AppDir();
+        if (cacheRoot == "") { cacheRoot = Directory.GetCurrentDirectory(); }
+        string cacheDir1 = cacheRoot + "/hts_cache";
+        string cacheDir2 = cacheRoot + "/hts_cache2";
+        Directory.DeleteRecursive(cacheDir1);
+        Directory.DeleteRecursive(cacheDir2);
+        Directory.CreateDirectory(cacheDir1);
+        Directory.CreateDirectory(cacheDir2);
         Thread.Start(HttpTestSrv.Entry);
         Thread.Sleep(300);
 
         try {
             // ---- network fetch: one block, one HTTP hit, cells + total ----
             HttpTableSource a = HttpTableSource.Create("127.0.0.1", 18365,
-                                                       "/data", "hts_cache");
-            Purge("hts_cache", a);
+                                                       "/data", cacheDir1);
+            Purge(cacheDir1, a);
             a.RequestBlock(0);
             Ok("network block arrived", PollUntil(a, 10, 300));
             Eq("row count from total", Convert.ToString(a.RowCount()), "10");
@@ -103,7 +115,7 @@ class HttpSourceTest {
             // ---- disk cache: a fresh instance with the same cache dir serves
             //      the same block without touching the network again ----
             HttpTableSource b = HttpTableSource.Create("127.0.0.1", 18365,
-                                                       "/data", "hts_cache");
+                                                       "/data", cacheDir1);
             b.RequestBlock(0);
             Ok("cache block arrived", PollUntil(b, 10, 100));
             Eq("cell from cache", b.CellText(3, 0), "r3c0");
@@ -117,7 +129,7 @@ class HttpSourceTest {
         try {
             // ---- offline: nothing listens on 18366, failure surfaces ----
             HttpTableSource c = HttpTableSource.Create("127.0.0.1", 18366,
-                                                       "/data", "hts_cache2");
+                                                       "/data", cacheDir2);
             c.RequestBlock(0);
             for (int i = 0; i < 200; i = i + 1) {
                 c.Poll();
