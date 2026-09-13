@@ -1,0 +1,232 @@
+using System;
+using System.Collections;
+using System.Json;
+using System.Net.External;
+using System.Net.Http.Client;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+
+/* 桌面客户端 ↔ server-collab 服务端的 HTTP 通道。接线定式抄
+   templates/game/legend 的 GameNet（DataTable.HttpSource / ImageHttp 同款）：
+   UI 线程 Op() 入静态 Mutex 队列 → 「队列空即退」的静态 worker 线程
+   await SendBytesAsync → 完成进静态 done 队列 → UI 线程 Poll() 在
+   form.Every 里并入回调。await 只活在 worker 一个线程上（stdlib 协程
+   ready 队列 M:1，跨线程并发排程会静默丢子任务，legend 实测教训）；
+   worker 循环体只经静态字段与形参往返，不触碰任何实例状态。
+   认证：/api/auth/login 拿 token，此后每请求带 Authorization: Bearer
+   （WebApp 认 token 的两条路之一，无需 CookieJar）。每请求新建连接
+   （keep-alive 复用在大应答后串帧，legend/stdlib 先例同款注）。 */
+class WxNet {
+    /// 连接目标（登录页可改，默认指向本机 server-collab）。
+    static string host = "127.0.0.1";
+    static int port = 8090;
+    /// 登录成功后的会话令牌；"" = 未登录。
+    static string token = "";
+    /// 当前登录账号名（状态栏显示用）。
+    static string account = "";
+
+    static nint lockId = 0;
+    static List<WxNetReq> queue;
+    static List<WxNetReq> done;
+    static bool workerUp;
+
+    /* ---- 配置与会话 ---- */
+
+    static string Host() { return WxNet.host; }
+    static int Port() { return WxNet.port; }
+    static string Token() { return WxNet.token; }
+    static string Account() { return WxNet.account; }
+    static bool LoggedIn() { return WxNet.token.Length > 0; }
+
+    /// 登录页设置连接目标；登录成功后由 Login 回调写入 token。
+    static void Configure(string h, int p) {
+        WxNet.host = h;
+        WxNet.port = p;
+    }
+
+    static void SetSession(string tok, string acc) {
+        WxNet.token = tok;
+        WxNet.account = acc;
+    }
+
+    static void DropSession() {
+        WxNet.token = "";
+        WxNet.account = "";
+    }
+
+    /* ---- 提交侧（UI 线程） ---- */
+
+    /* 调用定式（legend HttpSubmit 同款）：先建槽（回调闭包捕获它读
+       应答），再连 op 一起提交——闭包不能引用它自己的初始化表达式
+       里才诞生的变量，所以"建槽"必须独立一步。
+         WxNetReq req = WxNet.NewReq();
+         WxNet.Login(req, user, pass, () => { ... OkOf(req) ... }); */
+
+    /// 建一条请求槽（回调闭包先捕获引用，OkOf/ErrOf/DataOf 以它为参）。
+    static WxNetReq NewReq() {
+        WxNetReq r = new WxNetReq();
+        return r;
+    }
+
+    /// GET /api/im/<op>（无 body）。
+    static void Get(WxNetReq r, string op, Action cb) {
+        WxNet.Submit(r, "GET", "/api/im/" + op, null, cb);
+    }
+
+    /// POST /api/im/<op>，表单编码 body。
+    static void Post(WxNetReq r, string op, string body, Action cb) {
+        WxNet.Submit(r, "POST", "/api/im/" + op, body, cb);
+    }
+
+    /// 登录：POST /api/auth/login。cb 在 UI 线程拿结果。
+    static void Login(WxNetReq r, string user, string pass, Action cb) {
+        WxNet.Submit(r, "POST", "/api/auth/login",
+            "user=" + Encoding.UrlEncode(user)
+            + "&pass=" + Encoding.UrlEncode(pass), cb);
+    }
+
+    static void Submit(WxNetReq r, string method, string path, string body,
+            Action cb) {
+        if (WxNet.lockId == 0) {
+            WxNet.lockId = Mutex.Create();
+            WxNet.queue = new List<WxNetReq>();
+            WxNet.done = new List<WxNetReq>();
+        }
+        r.method = method;
+        r.path = path;
+        r.body = body;
+        r.callback = cb;
+        bool need = false;
+        Mutex.Lock(WxNet.lockId);
+        WxNet.queue.Add(r);
+        need = !WxNet.workerUp;
+        WxNet.workerUp = true;
+        Mutex.Unlock(WxNet.lockId);
+        if (need && !Thread.Start(WxNet.WorkerEntry)) {
+            Mutex.Lock(WxNet.lockId);
+            WxNet.workerUp = false;
+            WxNet.done.Add(r);
+            Mutex.Unlock(WxNet.lockId);
+        }
+    }
+
+    /* ---- worker（网络线程） ---- */
+
+    static void WorkerEntry() {
+        Socket.Initialize();
+        while (true) {
+            WxNetReq r = null;
+            Mutex.Lock(WxNet.lockId);
+            if (WxNet.queue.Count > 0) {
+                r = WxNet.queue[0];
+                WxNet.queue.RemoveAt(0);
+            } else {
+                WxNet.workerUp = false;
+                Mutex.Unlock(WxNet.lockId);
+                return;
+            }
+            Mutex.Unlock(WxNet.lockId);
+            await WxNet.FetchOne(r);
+        }
+    }
+
+    static async int FetchOne(WxNetReq r) {
+        string err = "";
+        string body = null;
+        int status = 0;
+        try {
+            HttpClient nh = new HttpClient(WxNet.host, WxNet.port);
+            nh.SetHeader("Content-Type", "application/x-www-form-urlencoded");
+            if (WxNet.token.Length > 0) {
+                nh.SetHeader("Authorization", "Bearer " + WxNet.token);
+            }
+            nh.SetCallPolicy(ExternalCallPolicy.Default()
+                .AllowLocalHttp()
+                .TotalTimeout(6000).ResponseLimit(1024 * 1024));
+            HttpResponse resp = await nh.SendBytesAsync(r.method, r.path,
+                r.body == null ? "" : r.body);
+            status = resp.statusCode;
+            body = resp.body;
+        } catch (Exception ex) {
+            err = ex.Message;
+        }
+        r.status = status;
+        r.respBody = body;
+        r.err = err;
+        Mutex.Lock(WxNet.lockId);
+        WxNet.done.Add(r);
+        Mutex.Unlock(WxNet.lockId);
+        return 0;
+    }
+
+    /* ---- 并入侧（UI 线程，form.Every 里调） ---- */
+
+    /// 把完成的应答交回各自回调（回调里收 JSON）。返回 true 表示
+    /// 本拍有应答并入（调用方可顺带 RequestRedraw）。
+    static bool Poll() {
+        if (WxNet.lockId == 0 || WxNet.done.Count == 0) { return false; }
+        List<WxNetReq> batch = null;
+        Mutex.Lock(WxNet.lockId);
+        if (WxNet.done.Count > 0) {
+            batch = WxNet.done;
+            WxNet.done = new List<WxNetReq>();
+        }
+        Mutex.Unlock(WxNet.lockId);
+        if (batch == null) { return false; }
+        for (int i = 0; i < batch.Count; i = i + 1) {
+            WxNetReq r = batch[i];
+            if (r.callback != null) {
+                r.callback();
+            }
+        }
+        return batch.Count > 0;
+    }
+
+    /* ---- 应答解包助手（回调里用；结果留在 req 字段上，
+       回调闭包直接捕获 req 引用读） ---- */
+
+    /// 本次请求是否成功（HTTP 200 且 body 的 code==0000）。
+    static bool OkOf(WxNetReq r) {
+        if (r.err != null && r.err.Length > 0) { return false; }
+        if (r.status != 200) { return false; }
+        JsonValue v = JsonValue.ParseLenient(r.respBody == null ? "" : r.respBody);
+        return v != null && v.Str("code", "") == "0000";
+    }
+
+    /// 请求错误文案（网络 err > HTTP 状态 > body msg）。
+    static string ErrOf(WxNetReq r) {
+        if (r.err != null && r.err.Length > 0) { return r.err; }
+        if (r.status != 200) {
+            if (r.status == 401) { WxNet.DropSession(); }
+            JsonValue v = JsonValue.ParseLenient(r.respBody == null ? "" : r.respBody);
+            if (v != null) {
+                string m = v.Str("msg", "");
+                if (m.Length > 0) { return m; }
+            }
+            return "HTTP " + Convert.ToString(r.status);
+        }
+        return "";
+    }
+
+    /// 成功应答的 data 节点（失败返回 null）。
+    static JsonValue DataOf(WxNetReq r) {
+        if (!WxNet.OkOf(r)) { return null; }
+        JsonValue v = JsonValue.ParseLenient(r.respBody);
+        return v.Get("data");
+    }
+}
+
+/// 一条待发/已回的请求。op 是服务端路由尾段（/api/auth/<op>、
+/// /api/im/<op>），body 是已编码的表单体或 null（GET）。
+/// （Zan 不支持从类外用 WxNet.Req 限定嵌套类型名，故提为顶层类。）
+class WxNetReq {
+    string op;
+    string method;
+    string path;
+    string body;
+    string respBody;
+    int status;
+    string err;
+    Action callback;
+}

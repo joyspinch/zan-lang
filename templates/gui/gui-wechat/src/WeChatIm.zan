@@ -1,0 +1,419 @@
+using System;
+using System.Collections;
+using System.Json;
+using System.Threading;
+
+/* gui-wechat ↔ server-collab 的业务桥：把 /api/im 的 JSON 翻成
+   WxSession/ChatMessage 模型。请求都走 WxNet 的队列（UI 线程提交、
+   回调在 UI 线程并入），这里只做三件事：
+     1. RefreshChats —— 会话列表全量重建（App.OnLoad 首拉 + 轮询）；
+     2. Open         —— 打开会话：/stream 拉全量消息（服务端顺带批量已读）；
+     3. Send         —— 发送：本地先插气泡，应答带回 id/at 定稿；失败
+        把该气泡改成红色 error 角色（原版微信的红色感叹号语义）。
+   回执：ChatMessage.mark 存 0 发出 / 1 送达 / 2 已读，渲染走 kind
+   （"wx-acked"/"wx-readed" → WxData.KindLabel 的头行小字）。
+   轮询：宿主开一个 form.Every 调 Beat()——打开的会话每拍拉流，
+   chats 与未读总数每 3 拍重拉。没有推送通道，轮询就是客户端的"实时"。 */
+static class WxIm {
+    /// 会话模型（页与桥共享同一份 List 引用，重建 = 清掉重填）。
+    static List<WxSession> sessions;
+    static WxPageChat page;
+    /// 轮询节拍计数：chats 每 3 拍拉一次，打开的会话每拍拉流。
+    static int tick;
+    /// 当前打开的会话对端 id（"" = 没开）。
+    static string openPeer = "";
+
+    /// 接桥：页把模型与自身交给桥（App.OnLoad 里调一次）。
+    static void Use(List<WxSession> model, WxPageChat host) {
+        WxIm.sessions = model;
+        WxIm.page = host;
+        // 登录后主窗口只认服务端数据：示例会话清空，列表/聊天区重绑。
+        host.BeginServerMode();
+    }
+
+    /* ---- 会话列表 ---- */
+
+    /// 拉会话列表并整表重建。done 在 UI 线程回调（可空）。
+    static void RefreshChats(Action done) {
+        if (!WxNet.LoggedIn()) { return; }
+        WxNetReq req = WxNet.NewReq();
+        WxNet.Get(req, "chats", () => {
+            if (done != null) { done(); }
+            if (!WxNet.OkOf(req)) { return; }
+            JsonValue d = WxNet.DataOf(req);
+            if (d == null) { return; }
+            JsonValue items = d.Get("chats");
+            if (items == null) { return; }
+            ApplyChats(items);
+        });
+    }
+
+    /// 把服务端的 chats 数组重填进共享模型（保留对象身份，行模板
+    /// 与绑定的 ListView 直接看到新值）。
+    static void ApplyChats(JsonValue items) {
+        if (WxIm.sessions == null) { return; }
+        int n = items.Count();
+        // 服务端会话数少于本地（比如别的端清了记录）：截掉尾部多余行。
+        while (WxIm.sessions.Count > n) { WxIm.sessions.RemoveAt(WxIm.sessions.Count - 1); }
+        for (int i = 0; i < n; i = i + 1) {
+            JsonValue o = items.At(i);
+            WxSession s = null;
+            if (i < WxIm.sessions.Count) { s = WxIm.sessions[i]; }
+            if (s == null) {
+                s = WxSession.Blank();
+                WxIm.sessions.Add(s);
+            }
+            string newPeer = o.Str("peerId", "");
+            // 槽被换给另一个对端时清空旧记录：会话槽是复用的（列表
+            // 行对象身份要保），但别人家的消息不能留在新对端的记录里
+            // ——示例数据首屏那一屏正是这么漏进来的。
+            if (s.peer != "" && s.peer != newPeer) {
+                s.msgs.Clear();
+                s.lastMark = 0;
+            }
+            s.peer = newPeer;
+            s.name = o.Str("peerName", "?");
+            s.initial = WxIm.IniOf(s.name);
+            s.tint = WxData.TintOf(i);
+            s.group = false;
+            s.people = 0;
+            s.snippet = o.Str("lastText", "");
+            s.time = WxIm.ClockOf(o.Str("lastAt", "0"));
+            s.unread = Convert.ToInt32(o.Str("unread", "0"));
+            s.sentUnread = Convert.ToInt32(o.Str("sentUnread", "0"));
+            s.lastMark = o.Str("readed", "0") == "1" ? 2
+                : (o.Str("acked", "0") == "1" ? 1 : 0);
+            // 对方发来还没回执的：立刻打送达位（服务端按 toId 幂等）。
+            // 有了这一条，"已送达"在对方没点开这条会话时就亮了。
+            string ackId = o.Str("ackId", "0");
+            if (ackId != "0" && ackId != "") { WxIm.QueueAck(newPeer); }
+        }
+        // 列表重建后当前选中行已经是新的槽对象。只有"还没选过"时才主动
+        // 选一次（登录后首屏：不点行也能看到当前会话的记录）——每次轮询
+        // 都 Select 会把 chat.Reset() 一并跑掉，用户的滚动位置每 4.5 秒被
+        // 拽回最新一条（实测：往上翻立刻弹回底部）。刷新已在看的会话由
+        // RefreshOpen 负责，标题区由 OnDataChanged 负责。
+        if (WxIm.page != null && WxIm.sessions.Count > 0
+            && WxIm.page.CurrentIndex() < 0) {
+            WxIm.page.Select(0);
+        }
+        WxIm.RefreshViews();
+    }
+
+    /* ---- 打开会话：拉消息流 ---- */
+
+    /// 打开（或刷新）某会话：记下对端，拉全量流。打开即已读由服务端
+    /// 在 Stream 里批量落账。
+    static void Open(WxSession s) {
+        if (s == null || s.peer.Length == 0) { return; }
+        openPeer = s.peer;
+        PullStream(s.peer, null);
+    }
+
+    /// 当前打开的会话拉一遍流（轮询与新消息并入用）。
+    static void RefreshOpen() {
+        if (openPeer.Length == 0) { return; }
+        PullStream(openPeer, null);
+    }
+
+    static void PullStream(string peer, Action done) {
+        if (!WxNet.LoggedIn()) { return; }
+        WxNetReq req = WxNet.NewReq();
+        WxNet.Post(req, "stream", "peer=" + Encoding.UrlEncode(peer), () => {
+            if (done != null) { done(); }
+            if (!WxNet.OkOf(req)) { return; }
+            JsonValue d = WxNet.DataOf(req);
+            if (d == null) { return; }
+            ApplyStream(d.Str("peer", ""), d.Get("msgs"));
+        });
+    }
+
+    /// 把流并进会话模型：按服务端消息 id 对账——已有的更新回执位，
+    /// 没有的按序追加。发送中的气泡（id ""）保持在尾部，等 Send 的
+    /// 应答来定稿；这里只追加 id 非空的消息。
+    static void ApplyStream(string peer, JsonValue msgs) {
+        if (WxIm.sessions == null || msgs == null) { return; }
+        WxSession s = WxIm.ByPeer(peer);
+        if (s == null) { return; }
+        for (int i = 0; i < msgs.Count(); i = i + 1) {
+            JsonValue o = msgs.At(i);
+            string id = o.Str("id", "");
+            bool mine = o.Str("mine", "0") == "1";
+            bool readed = o.Str("readed", "0") == "1";
+            bool acked = o.Str("acked", "0") == "1";
+            int mark = readed ? 2 : (acked ? 1 : 0);
+            ChatMessage m = WxIm.ById(s, id);
+            if (m != null) {
+                if (mine) {
+                    m.mark = mark;
+                    m.kind = mark == 2 ? "wx-readed"
+                        : (mark == 1 ? "wx-acked" : "");
+                }
+                continue;
+            }
+            ChatMessage nm = ChatMessage.Create(
+                mine ? "user" : "assistant", o.Str("content", ""));
+            nm.agent = mine ? "" : "peer:" + peer;
+            nm.at = Convert.ToInt64(o.Str("at", "0"));
+            nm.msgId = id;
+            nm.mark = mine ? mark : -1;
+            if (mine) {
+                nm.kind = mark == 2 ? "wx-readed"
+                    : (mark == 1 ? "wx-acked" : "");
+            }
+            // 引用回复：服务端把被引消息的发送者与摘要回在 quoteWho/
+            // quoteText（发送时传 replyTo）。服务端校验不过时降级成
+            // 普通消息，这两个字段缺席——照样画，只是没有引用条。
+            nm.quoteId = o.Str("replyTo", "");
+            nm.quoteWho = o.Str("quoteWho", "");
+            nm.quoteText = o.Str("quoteText", "");
+            s.msgs.Add(nm);
+            WxData.Who("peer:" + peer, s.name, s.initial);
+        }
+        // 摘要/时间/回执角标跟最新一条走；列表上的回执位取最后一条
+        // 我发的消息。
+        int lastMineMark = -1;
+        if (s.msgs.Count > 0) {
+            ChatMessage last = s.msgs[s.msgs.Count - 1];
+            s.snippet = last.text;
+            s.time = WxIm.ClockOf(Convert.ToString(last.at));
+            for (int i = s.msgs.Count - 1; i >= 0; i = i - 1) {
+                if (s.msgs[i].role == "user" && s.msgs[i].msgId.Length > 0) {
+                    lastMineMark = s.msgs[i].mark;
+                    break;
+                }
+            }
+        }
+        if (lastMineMark >= 0) { s.lastMark = lastMineMark; }
+        if (peer == openPeer) { s.unread = 0; }
+        WxIm.RefreshViews();
+    }
+
+    /* ---- 发送 ---- */
+
+    /// 发送：先插"发送中"气泡（灰勾），应答定稿（绿勾/已读），失败
+    /// 翻红。正文长度服务端裁到 2048，客户端不再卡。三参版按引用
+    /// 回复发送：quoteId 是被引消息的服务端 id（随下一拍流对账）。
+    static void Send(WxSession s, string text) {
+        WxIm.Send(s, text, "");
+    }
+
+    /// 页发送钮的入口：有引用草稿就带上（发送后草稿被清、引用条收起）。
+    static void SendWithDraft(WxSession s, string text) {
+        WxIm.Send(s, text, WxIm.quoteIdPending);
+    }
+
+    static void Send(WxSession s, string text, string quoteId) {
+        if (s == null || text.Length == 0) { return; }
+        if (s.peer.Length == 0) {
+            // 没接上服务端的旧示例数据行：维持纯本地行为。
+            return;
+        }
+        ChatMessage m = ChatMessage.Create("user", text);
+        m.at = DateTime.UtcNow().ToUnixSeconds();
+        m.msgId = "";
+        m.mark = 0;
+        m.quoteId = quoteId != null ? quoteId : "";
+        // 本地气泡的引用条即刻画出来（引用草稿里有被引人与摘要）；
+        // 下一拍流刷新会用服务端的 quoteWho/quoteText 对账覆盖。
+        if (m.quoteId.Length > 0) {
+            m.quoteWho = WxIm.quoteWhoPending;
+            m.quoteText = WxIm.quoteTextPending;
+        }
+        WxIm.ClearQuoteDraft();
+        s.msgs.Add(m);
+        s.snippet = text;
+        s.time = "刚刚";
+        WxIm.RefreshViews();
+        WxNetReq req = WxNet.NewReq();
+        string form = "peer=" + Encoding.UrlEncode(s.peer)
+            + "&content=" + Encoding.UrlEncode(text);
+        if (m.quoteId.Length > 0) {
+            form = form + "&replyTo=" + Encoding.UrlEncode(m.quoteId);
+        }
+        WxNet.Post(req, "send", form, () => {
+            if (WxNet.OkOf(req)) {
+                JsonValue d = WxNet.DataOf(req);
+                m.msgId = d == null ? "" : d.Str("id", "");
+                if (d != null) {
+                    long at = Convert.ToInt64(d.Str("at", "0"));
+                    if (at > 0) { m.at = at; }
+                }
+                // 送达/已读回执等轮询翻；先按"已发出"画。
+                m.mark = 0;
+                s.lastMark = 0;
+            } else {
+                m.role = "error";
+            }
+            WxIm.RefreshViews();
+        });
+    }
+
+    /* ---- 引用草稿（输入区上方的引用条） ---- */
+
+    /// 待发送的引用：会话里点「引用」后暂存，随下一条消息发走。
+    /// 与输入框文字无关——清空输入框不清引用，点引用条上的 × 才清。
+    static string quoteWhoPending = "";
+    static string quoteTextPending = "";
+    static string quoteIdPending = "";
+
+    /// 页把引用草稿压进来（msgIndex + 选中文本；文本空 = 整条引用）。
+    static void SetQuoteDraft(int msgIndex, string text) {
+        if (WxIm.sessions == null || WxIm.page == null) { return; }
+        // msgIndex 是 ChatView data（= 当前会话 msgs）里的下标，
+        // 当前会话就是页上正打开的那个。
+        WxSession s = WxIm.page.CurrentSession();
+        if (s == null || msgIndex < 0 || msgIndex >= s.msgs.Count) { return; }
+        ChatMessage m = s.msgs[msgIndex];
+        string who = m.role == "user" ? "我" : s.name;
+        string body = text != null && text.Length > 0 ? text : m.text;
+        if (body.Length > 120) { body = body.Substring(0, 120) + "…"; }
+        WxIm.quoteWhoPending = who;
+        WxIm.quoteTextPending = body;
+        WxIm.quoteIdPending = m.msgId;
+        // 引用的是"发送中"还没拿到 id 的气泡：等价于普通发送。
+        if (WxIm.quoteIdPending.Length == 0) {
+            WxIm.ClearQuoteDraft();
+            return;
+        }
+        WxIm.page.ShowQuoteBar(who, body);
+    }
+
+    static void ClearQuoteDraft() {
+        WxIm.quoteWhoPending = "";
+        WxIm.quoteTextPending = "";
+        WxIm.quoteIdPending = "";
+    }
+
+    /// 页上的 × 按钮调：清草稿并收起引用条。
+    static void DismissQuoteDraft() {
+        WxIm.ClearQuoteDraft();
+        if (WxIm.page != null) { WxIm.page.HideQuoteBar(); }
+    }
+
+    /* ---- 未读总数（Rail 徽标用） ---- */
+
+    static int unreadTotal;
+
+    /// 未读总数（Rail 徽标；App 轮询后读它刷新）。
+    static int TotalUnread() { return WxIm.unreadTotal; }
+
+    /// 未读徽标刷新回调（宿主接：Rail 上的红点随 total 变）。
+    static Action badgeSink;
+
+    static void OnBadge(Action cb) { WxIm.badgeSink = cb; }
+
+    static void RefreshBadge() {
+        if (WxIm.badgeSink != null) { WxIm.badgeSink(); }
+    }
+
+    /// 打一条送达回执（服务端按 toId 幂等；同一 id 重复打无害）。
+    static void PostAck(string id) {
+        if (!WxNet.LoggedIn() || id.Length == 0 || id == "0") { return; }
+        WxNetReq req = WxNet.NewReq();
+        WxNet.Post(req, "ack", "id=" + Encoding.UrlEncode(id), null);
+    }
+
+    static void PollUnread() {
+        if (!WxNet.LoggedIn()) { return; }
+        WxNetReq req = WxNet.NewReq();
+        WxNet.Get(req, "unread", () => {
+            if (!WxNet.OkOf(req)) { return; }
+            JsonValue d = WxNet.DataOf(req);
+            if (d == null) { return; }
+            int n = Convert.ToInt32(d.Str("count", "0"));
+            if (n != WxIm.unreadTotal) {
+                WxIm.unreadTotal = n;
+                WxIm.RefreshBadge();
+            }
+        });
+    }
+
+    /// 一次拉流的应答体（WxNet.DataOf 的薄包装，回调里读得顺一些）。
+    static JsonValue WxDataOf(WxNetReq r) { return WxNet.DataOf(r); }
+
+    /* ---- 待回执的对端队列 ---- */
+
+    /// 列表重拉看到的"对方发来、我还没回执"的对端（每端一条就够，
+    /// 服务端会把这端发来的整批一次打点）。收进队列，轮询的下半拍
+    /// 发批量回执——在 ApplyChats 里直接发会让同一拍堆两条请求。
+    static List<string> ackQueue;
+
+    static void QueueAck(string peer) {
+        if (peer.Length == 0 || peer == "0") { return; }
+        if (WxIm.ackQueue == null) { WxIm.ackQueue = new List<string>(); }
+        for (int i = 0; i < WxIm.ackQueue.Count; i = i + 1) {
+            if (WxIm.ackQueue[i] == peer) { return; }
+        }
+        WxIm.ackQueue.Add(peer);
+    }
+
+    /// 把队列里的对端各打一次批量送达回执（服务端幂等）。
+    static void DrainAckQueue() {
+        if (WxIm.ackQueue == null || WxIm.ackQueue.Count == 0) { return; }
+        List<string> q = WxIm.ackQueue;
+        WxIm.ackQueue = new List<string>();
+        for (int i = 0; i < q.Count; i = i + 1) {
+            WxNetReq req = WxNet.NewReq();
+            WxNet.Post(req, "ack", "peer=" + Encoding.UrlEncode(q[i]), null);
+        }
+    }
+
+    /* ---- 定时节拍（宿主 form.Every(1500, ...) 调） ---- */
+
+    static void Tick() {
+        if (!WxNet.LoggedIn()) { return; }
+        WxIm.tick = WxIm.tick + 1;
+        WxIm.RefreshOpen();
+        WxIm.DrainAckQueue();
+        if (WxIm.tick % 3 == 0) {
+            WxIm.RefreshChats(null);
+            WxIm.PollUnread();
+        }
+    }
+
+    /// 宿主接节拍（主窗口 form.Every 里调）。
+    static void Beat() { WxIm.Tick(); }
+
+    /* ---- 工具 ---- */
+
+    static WxSession ByPeer(string peer) {
+        if (WxIm.sessions == null) { return null; }
+        for (int i = 0; i < WxIm.sessions.Count; i = i + 1) {
+            if (WxIm.sessions[i].peer == peer) { return WxIm.sessions[i]; }
+        }
+        return null;
+    }
+
+    static ChatMessage ById(WxSession s, string id) {
+        if (id.Length == 0) { return null; }
+        for (int i = 0; i < s.msgs.Count; i = i + 1) {
+            if (s.msgs[i].msgId == id) { return s.msgs[i]; }
+        }
+        return null;
+    }
+
+    /// 名字取首字（头像格）：ASCII 首字节大写；中文取首字（数据显式
+    /// 给不到时按字节兜底）。
+    static string IniOf(string name) {
+        if (name.Length == 0) { return "?"; }
+        return name.Substring(0, 1);
+    }
+
+    /// Unix 秒 → 列表时间：今天显示 HH:MM，更早显示 MM-dd。
+    static string ClockOf(string atStr) {
+        long at = Convert.ToInt64(atStr);
+        if (at <= 0) { return ""; }
+        long now = DateTime.UtcNow().ToUnixSeconds();
+        DateTime t = DateTime.FromUnixSeconds(at).ToLocalTime();
+        if (now - at < 86400) {
+            return t.ToTimeString().Substring(0, 5);
+        }
+        return t.ToDateString().Substring(5, 5);
+    }
+
+    /// 让页面把新数据画出来（列表行 + 气泡 + 标题区）。
+    static void RefreshViews() {
+        if (WxIm.page != null) { WxIm.page.OnDataChanged(); }
+    }
+}
