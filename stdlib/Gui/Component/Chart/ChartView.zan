@@ -1042,7 +1042,15 @@ partial class ChartView {
 
     /// 第一个可见序列（整图系列族从中选取布局
     /// 标志位 —— innerPct、roseType、sort、hbar、custom）。
+    /// N7：ZSort 重排绘制序后，主导系列仍按**声明序**取（declOrder
+    /// 快照）——官方每系列自带 view，面板主导型不随 z 漂移。
     static ChartSeries LeadSeries(ChartOption o) {
+        if (o.declOrder != null && o.declOrder.Count == o.series.Count) {
+            for (int d = 0; d < o.declOrder.Count; d = d + 1) {
+                if (!o.declOrder[d].hidden) { return o.declOrder[d]; }
+            }
+            return o.declOrder[0];
+        }
         if (o.series.Count < 1) { return null; }
         for (int i = 0; i < o.series.Count; i = i + 1) {
             if (!o.series[i].hidden) { return o.series[i]; }
@@ -1071,7 +1079,15 @@ partial class ChartView {
 
     /// 第一个可见系列的下标；全部隐藏时返回 0，无系列返回 -1。
     static int LeadSeriesIndex(ChartOption o) {
-        if (o == null || o.series.Count < 1) { return 0 - 1; }
+        if (o == null) { return 0 - 1; }
+        // N7：与 LeadSeries 同源——declOrder 快照优先（声明序语义）。
+        if (o.declOrder != null && o.declOrder.Count == o.series.Count) {
+            for (int d = 0; d < o.declOrder.Count; d = d + 1) {
+                if (!o.declOrder[d].hidden) { return d; }
+            }
+            return 0;
+        }
+        if (o.series.Count < 1) { return 0 - 1; }
         for (int i = 0; i < o.series.Count; i = i + 1) {
             if (!o.series[i].hidden) { return i; }
         }
@@ -1092,11 +1108,82 @@ partial class ChartView {
     /// 笛卡尔系列族则逐序列混用）。全部隐藏时仍用首条系列类型，
     /// 保留坐标轴/图例，而不是整图变成空状态。
     static ChartType LeadType(ChartOption o) {
+        // N7：声明序语义（declOrder 快照优先，见 LeadSeries）。
+        if (o.declOrder != null && o.declOrder.Count == o.series.Count) {
+            for (int d = 0; d < o.declOrder.Count; d = d + 1) {
+                if (!o.declOrder[d].hidden) { return o.declOrder[d].type; }
+            }
+            return o.declOrder[0].type;
+        }
         for (int i = 0; i < o.series.Count; i = i + 1) {
             if (!o.series[i].hidden) { return o.series[i].type; }
         }
         if (o.series.Count > 0) { return o.series[0].type; }
         return ChartType.Line;
+    }
+
+    /// N7 系列绘制键 = zlevel*1000 + z（zrender 显示列表序的静态投影；
+    /// z2 只作用于同系列内图元/hover 层，静态渲染无此层）。未声明的 z
+    /// 在解析期已按系列型官方缺省赋好（bar/pie/scatter 等 2、line 3——
+    /// 各 Series.ts）。
+    static int ZKeyOf(ChartSeries s) {
+        return s.zlevel * 1000 + s.z;
+    }
+
+    /// 稳定 argsort：返回按 ZKeyOf 升序的声明下标表（同键保持声明
+    /// 序——zrender 显示列表稳定语义）。与 hidden 无关：图例开关不得
+    /// 改变绘制序/键位，否则交互态在帧间漂移。Resolve（图例键绑定、
+    /// palette、CSS series-N）与 ZSort（物理排序）共用本函数，两处的
+    /// 序恒等——交互键才能跨帧对上。
+    static void ZOrder(ChartOption o, List<int> order) {
+        order.Clear();
+        int n = o.series.Count;
+        List<int> keys = new List<int>();
+        for (int i = 0; i < n; i = i + 1) {
+            order.Add(i);
+            keys.Add(ChartView.ZKeyOf(o.series[i]));
+        }
+        for (int a = 1; a < n; a = a + 1) {
+            int ov = order[a];
+            int kv = keys[a];
+            int b = a - 1;
+            while (b >= 0 && keys[b] > kv) {
+                order[b + 1] = order[b];
+                keys[b + 1] = keys[b];
+                b = b - 1;
+            }
+            order[b + 1] = ov;
+            keys[b + 1] = kv;
+        }
+    }
+
+    /// 把 o.series 就地重排为 ZOrder 绘制序。重排前先快照声明序
+    /// （declOrder）：LeadSeries/LeadType/DispatchKind 等「主导系列」
+    /// 语义读声明序首条可见系列——官方每系列自带 view，面板主导型
+    /// 不随 z 重排漂移（custom trend z=100 重排后仍是 lead，kind 不变，
+    /// 只是它画的线落在柱群之上）。快照与 o.series 同引用，图例等
+    /// 就地写仍穿透。drawOption 每帧由 Resolve 重新物化，声明序恒为准。
+    static void ZSort(ChartOption o) {
+        if (o.series.Count < 2) { return; }
+        List<int> order = new List<int>();
+        ChartView.ZOrder(o, order);
+        bool idem = true;
+        for (int i = 0; i < order.Count; i = i + 1) {
+            if (order[i] != i) { idem = false; break; }
+        }
+        if (idem) { return; }
+        if (o.declOrder == null || o.declOrder.Count != o.series.Count) {
+            List<ChartSeries> decl = new List<ChartSeries>();
+            for (int i = 0; i < o.series.Count; i = i + 1) {
+                decl.Add(o.series[i]);
+            }
+            o.declOrder = decl;
+        }
+        List<ChartSeries> sorted = new List<ChartSeries>();
+        for (int i = 0; i < order.Count; i = i + 1) {
+            sorted.Add(o.series[order[i]]);
+        }
+        o.series = sorted;
     }
 
     /// 渲染器分发键：每个 ChartType 和 custom kind 都映射到
@@ -1571,6 +1658,11 @@ partial class ChartView {
     /// 落到正确的渲染器）。
     static void RenderOnce(App app, int x, int y, int w, int h,
                            ChartOption option, int g) {
+        // N7 z/zlevel 绘制序兜底重排（Resolve 主路径已在解析期把
+        // 系列表排成 ZOrder 序，这里的调用覆盖直接以源 option 渲染的
+        // 路径——Keyed 缓存 miss、图例回放、探针直渲）。同键保持声明
+        // 序，本帧排序不回写源 option，声明序恒为准。
+        if (!option.overlay) { ChartView.ZSort(option); }
         string kind = ChartView.DispatchKind(option);
         ChartSeries leadS = ChartView.LeadSeries(option);
         // 底部图例占位每图清零（不经 DrawPanelI 的视图不背上一图的值）。
