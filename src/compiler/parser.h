@@ -27,6 +27,10 @@ struct zan_parser {
                                * (30k parens printed 6 MB of one error) */
     int stmt_depth; /* current statement/block recursion depth (stack-overflow guard) */
     int type_depth; /* current type-reference recursion depth (stack-overflow guard) */
+    int type_no_nullable; /* one-shot: the next parse_type_ref call's TOP-LEVEL
+                          * suffix loop must not consume a `?` (the `is`/`as` type
+                          * operand decided the `?` opens a conditional expression;
+                          * recursion into generic/tuple element types clears it) */
     int checked_depth; /* >0 while inside checked(...)/checked{...}: binary + - *
                         * nodes get binary.checked = 1 (see ast.h) */
     int unchecked_depth; /* >0 while inside unchecked(...)/unchecked{...}:

@@ -279,6 +279,13 @@ static int array_suffix_rank(zan_parser_t *p) {
 static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
     zan_loc_t loc = p->current.loc;
 
+    /* One-shot suppression belongs to the OUTERMOST call only: recursion
+     * (tuple elements, generic args) parses inner types with their full
+     * nullable grammar — `x is List<int?> ? a : b` keeps the inner `?`.
+     * Clearing here means every nested call sees 0. */
+    int nn_top = p->type_no_nullable;
+    p->type_no_nullable = 0;
+
     /* `List<List<...>>` / `A.B<A.B<...>>>` / `(int,(int,(...)))` recurse this
      * function once per nesting level with no other guard on the path, so
      * ~8k levels of hostile source would exhaust the C stack before any
@@ -409,6 +416,13 @@ static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
     int nranks = 0;
     bool seen_array = false;
     for (;;) {
+        if (nn_top && parser_check(p, TK_QUESTION)) {
+            /* The `is`/`as` operand already decided this `?` opens a
+             * conditional expression — leave it unconsumed for
+             * parse_conditional. Array suffixes after it are not part of
+             * the nullable reading either. */
+            break;
+        }
         if (parser_match(p, TK_QUESTION)) {
             if (seen_array) {
                 /* `int[]?` -- the array reference is nullable; nothing to do. */
@@ -1876,6 +1890,73 @@ static bool is_binary_op(zan_token_kind_t kind) {
     return get_precedence(kind) > 0;
 }
 
+/* Tokens that can begin an expression operand. Conservative on purpose:
+ * the `is`/`as` `?` disambiguation below treats "cannot start an
+ * expression" as "the `?` is a nullable-type marker", which is exactly
+ * the pre-fix behavior — so an unlisted token can never regress code
+ * that parses today. */
+static bool token_starts_expr(zan_token_kind_t k) {
+    switch (k) {
+    case TK_IDENT: case TK_INT_LIT: case TK_FLOAT_LIT: case TK_STRING_LIT:
+    case TK_CHAR_LIT: case TK_INTERP_START: case TK_LPAREN: case TK_MINUS:
+    case TK_PLUS: case TK_BANG: case TK_TILDE: case TK_THIS: case TK_BASE:
+    case TK_NEW: case TK_NULL: case TK_TRUE: case TK_FALSE:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* `x is T ? a : b` vs a nullable type operand / nullable pattern
+ * (`x is int? i`): C# resolves the ambiguity in favor of the conditional
+ * operator. Token-only lookahead from the type operand, no allocation:
+ * find the first top-level `?`; it opens a conditional exactly when the
+ * next token can begin an expression AND a top-level `:` appears before
+ * the construct ends (`;`, `,`, braces, `=>`, EOF, stray closer). Nullable
+ * types and nullable patterns have no `:` after the `?`, so the scan only
+ * ever changes how code that fails to parse today gets read. */
+static bool is_question_is_conditional(zan_parser_t *p) {
+    zan_lexer_t saved_lex = *p->lex;
+    zan_token_t saved_cur = p->current;
+    zan_token_t saved_prev = p->previous;
+    int depth = 0; /* ( ) [ ] and approximate generic < > nesting */
+    bool in_arm = false; /* past the candidate `?`, looking for the `:` */
+    bool result = false;
+    while (p->current.kind != TK_EOF) {
+        zan_token_kind_t k = p->current.kind;
+        if (k == TK_SEMICOLON || k == TK_COMMA || k == TK_LBRACE
+            || k == TK_RBRACE || k == TK_ARROW) {
+            break; /* construct ends; no conditional here */
+        }
+        if (k == TK_LPAREN || k == TK_LBRACKET
+            || (!in_arm && k == TK_LESS)) {
+            depth++;
+        } else if (k == TK_RPAREN || k == TK_RBRACKET || k == TK_GREATER) {
+            if (depth == 0) { break; }
+            depth--;
+        } else if (k == TK_GREATER_GREATER) {
+            if (depth == 0) { break; }
+            depth -= depth >= 2 ? 2 : depth;
+        } else if (k == TK_GREATER_GREATER_GREATER) {
+            if (depth == 0) { break; }
+            depth -= depth >= 3 ? 3 : depth;
+        } else if (!in_arm && k == TK_QUESTION && depth == 0) {
+            if (!token_starts_expr(zan_lexer_peek(p->lex).kind)) {
+                break; /* nullable type: next token can't start an arm */
+            }
+            in_arm = true;
+        } else if (in_arm && k == TK_COLON && depth == 0) {
+            result = true;
+            break;
+        }
+        parser_advance(p);
+    }
+    *p->lex = saved_lex;
+    p->current = saved_cur;
+    p->previous = saved_prev;
+    return result;
+}
+
 /* A same-precedence chain (`a+b+c+...`) is built iteratively, so unlike the
  * unary paths it never trips the expr_depth guard above and the left spine
  * grows one AST level per token. Every later pass walks that spine
@@ -1916,7 +1997,12 @@ static zan_ast_node_t *parse_binary(zan_parser_t *p, int min_prec) {
             n->type_test.var_name = (zan_istr_t){NULL, 0};
             n->type_test.is_not = false;
             if (op == TK_AS) {
+                /* `x as T ? a : b`: same C# ambiguity as `is` — conditional
+                 * wins, the `?` stays for parse_conditional. */
+                p->type_no_nullable =
+                    is_question_is_conditional(p) ? 1 : 0;
                 n->type_test.type = parse_type_ref(p);
+                p->type_no_nullable = 0;
                 left = n;
                 continue;
             }
@@ -1929,9 +2015,14 @@ static zan_ast_node_t *parse_binary(zan_parser_t *p, int min_prec) {
                 /* `is null` / `is not null` — no type operand */
                 parser_advance(p);
             } else {
+                p->type_no_nullable =
+                    is_question_is_conditional(p) ? 1 : 0;
                 n->type_test.type = parse_type_ref(p);
+                p->type_no_nullable = 0;
                 /* pattern variable: `is T x` — a bare name after the type
-                 * (not `is` or `as`, which would be a chained test). */
+                 * (not `is` or `as`, which would be a chained test). With
+                 * the `?` claimed by a conditional the next token is `?`,
+                 * so the check naturally does not fire. */
                 if (parser_check(p, TK_IDENT)) {
                     zan_token_t after = zan_lexer_peek(p->lex);
                     if (after.kind != TK_IS && after.kind != TK_AS) {
