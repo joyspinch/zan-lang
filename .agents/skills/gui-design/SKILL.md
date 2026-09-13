@@ -177,6 +177,12 @@ token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
   不在引擎免动画名单里的图型整板近黑);GetPixel 采样必须在 `Render`
   之后、`PresentFrame` 之前——Present 后读到的已是清屏面,每张 demo
   扫出同一单色(真实案例:探针首版把两种错各踩了一遍才定位)。
+- **用户实机截图 ≠ HEAD 行为,先核对构建新旧再立项**:引擎修复不断
+  落地,用户跑的 gallery 二进制可能落后几天;把 stale binary 的症状
+  当活缺陷修会白走一趟(真实案例:用户截图刻度 `#0/#2/#4` + smooth
+  狂野过冲,HEAD 探针里 y 轴声明域/平滑包络全是对的——min/max 接线
+  是当天的提交;正确动作 = 先在 HEAD 复现,复现不了就重建 gallery
+  (`scripts\build_charts.ps1`)再要截图)。
 
 ## 缩放纪律(DPI:为什么界面忽大忽小)
 
