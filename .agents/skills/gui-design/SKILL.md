@@ -118,10 +118,25 @@ token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
 
 - **设计稿必须是编译输入的第一个文件**——zanc 从第一份设计文档合成
   Main 与控件字段,放后面 = 字段全缺。
-- **写真 HTML 语义,不是全 div + data-* 的"类 HTML"**:`<button>文字</button>`、
-  `<input placeholder>`、`<img src/alt>`、`<label>文字</label>` 直接映射
-  组件属性,与 data-x-* 通道等价可混用(图片内容就该放 src)。复合属性
-  (props/options/columns)才用 `data-x-<键>='<JSON>'`。
+- **写真 HTML 语义,不是全 div + data-* 的"类 HTML"**:凡 HTML 有原生
+  等价物的组件一律写原生标签,`data-kind` 只留给没有原生等价物的组件
+  (Avatar/Badge/Tag/Card/Chart…)——这正是 data-kind 协议的本意。全集:
+  `<button>文字`、`<label>文字`、`<textarea>初始值`、`<img src/alt>`、
+  `<input>` 按 type 六型(checkbox→Checkbox+checked、radio→Radio、
+  range→Slider、color→ColorPicker、number→InputNumber、date→DatePicker,
+  其余→Input+placeholder)、`<select><option>`(option 文本→options,
+  selected→value 下标,无 selected 默认第 0 项=浏览器语义)、
+  `<hr>`→Divider(void 无正文,文案走 `data-text`)、`<progress
+  value max>`→Progress(折算 percent)、`<p>正文`→Typography。原生属性
+  与 `data-x-*` 通道等价可混用(图片内容就该放 src)。复合属性
+  (props/columns)才用 `data-x-<键>='<JSON>'`。
+- **导入侧两个静默坑**(都真踩过):①读端属性循环里,专用分支必须排在
+  通用分支之前——checkbox/radio 的 value 是文案(→label)、progress 的
+  value/max 要截流(→percent),排进通用 value/min/max 分支之后就成了
+  死代码,值静默丢失;②原生标签折进模型的键形态必须与消费端对齐——
+  select 折出的 options 是 `"a|b|c"` 字符串,GenForm 老代码只认数组形态,
+  options 静默不发射、SelectBox 空白。折新键前先查 GenForm/FieldSetup
+  与控件 SetProp 期望的形态。
 - **code-behind 职责分界**:结构全部进设计稿;只有声明通道喂不活的组件
   (泛型 `ListView<T>`、需运行时模型、立即模式助手、设计器文档节点)在
   HTML 里落 Panel 占位壳,由 code-behind 构造真控件 `Add` 进壳。两个

@@ -77,9 +77,9 @@ add("基础控件", "Button", "Button 按钮", 0, 48,
 add("基础控件", "Label", "Label 标签", 0, 32,
     {"native": "label", "text": "普通标签文本"})
 add("基础控件", "Typography", "Typography 排版", 0, 88,
-    {"props": P(text="标题与正文排版层级")})
+    {"native": "p", "text": "标题与正文排版层级"})
 add("基础控件", "Divider", "Divider 分割线", 0, 24,
-    {"props": P(text="分割线")})
+    {"native": "hr", "text": "分割线"})
 add("基础控件", "IconView", "IconView 图标", 96, 96,
     {"props": P(name="home", box="48")})
 add("基础控件", "Image", "Image 图片", 0, 180,
@@ -103,13 +103,16 @@ add("输入", "Input", "Input 输入框", 0, 40,
 add("输入", "TextArea", "TextArea 多行文本", 0, 110,
     {"native": "textarea", "placeholder": "请输入简介", "showCount": "true"})
 add("输入", "InputNumber", "InputNumber 数字", 0, 40,
-    {"props": P(value="42", min="0", max="100", step="1")})
+    {"native": "input_t", "itype": "number",
+     "tattrs": ' min="0" max="100" step="1" value="42"'})
 add("输入", "InputOtp", "InputOtp 验证码", 0, 48,
     {"props": P(length="6")})
 add("输入", "Checkbox", "Checkbox 多选", 200, 32,
-    {"props": P(label="记住我"), "defOn": True})
+    {"native": "input_t", "itype": "checkbox",
+     "tattrs": ' value="记住我" checked="true"'})
 add("输入", "Switch", "Switch 开关", 140, 32, {"defOn": True})
-add("输入", "Radio", "Radio 单选", 200, 32, {"props": P(label="已选中")})
+add("输入", "Radio", "Radio 单选", 200, 32,
+    {"native": "input_t", "itype": "radio", "tattrs": ' value="已选中"'})
 add("输入", "RadioButton", "RadioButton 按钮单选", 200, 36,
     {"props": P(label="选项 A")})
 add("输入", "RadioGroup", "RadioGroup 组单选", 0, 36,
@@ -119,15 +122,20 @@ add("输入", "RadioButtonGroup", "RadioButtonGroup 按钮组", 0, 40,
 add("输入", "CheckboxGroup", "CheckboxGroup 多选组", 0, 36,
     {"options": ["苹果", "香蕉", "橙子"]})
 add("输入", "Slider", "Slider 滑块", 0, 40,
-    {"props": P(value="40", min="0", max="100")})
+    {"native": "input_t", "itype": "range",
+     "tattrs": ' min="0" max="100" value="40"'})
 add("输入", "Rate", "Rate 评分", 200, 36, {"props": P(value="3")})
 add("输入", "DatePicker", "DatePicker 日期", 0, 40,
-    {"props": P(text="2026-09-13")})
-add("输入", "ColorPicker", "ColorPicker 颜色", 0, 40, {})
+    {"native": "input_t", "itype": "date",
+     "tattrs": ' value="2026-09-13"'})
+add("输入", "ColorPicker", "ColorPicker 颜色", 0, 40,
+    {"native": "input_t", "itype": "color",
+     "tattrs": ' value="#378add"'})
 add("输入", "Upload", "Upload 上传", 0, 110,
     {"props": P(triggerText="点击上传", tip="单个文件不超过 10 MB")})
 add("输入", "SelectBox", "SelectBox 下拉选择", 0, 40,
-    {"options": ["Web 前端", "桌面客户端", "服务端"]})
+    {"native": "select",
+     "options": ["Web 前端", "桌面客户端", "服务端"]})
 # ---- 数据展示 12（行内高低搭配，压缩纵向空间） ----
 add("数据展示", "Statistic", "Statistic 统计", 0, 88,
     {"props": P(text="活跃用户", value="12,480")})
@@ -149,7 +157,7 @@ add("数据展示", "Skeleton", "Skeleton 骨架屏", 0, 64,
 add("数据展示", "Spin", "Spin 加载中", 120, 96, {"props": P(tip="加载中")})
 add("数据展示", "CodeBlock", "CodeBlock 代码面板", 0, 160, {})
 add("数据展示", "Progress", "Progress 进度条", 0, 28,
-    {"props": P(percent="72", showIndicator="true")})
+    {"native": "progress", "value": "72"})
 # ---- 导航 11 ----
 add("导航", "Tabs", "Tabs 页签", 0, 140, {})
 add("导航", "PageHeader", "PageHeader 页头", 0, 72,
@@ -256,6 +264,23 @@ def emit_demo(kind, dw, dh, a, ind):
             extra = attr("data-show-count", a["showCount"])
         out.append('%s<textarea id="%s" placeholder="%s"%s%s></textarea>' % (
             ind, did, esc(a["placeholder"]), extra, geom(fx, fy, dw, dh)))
+    elif a.get("native") == "hr":
+        out.append('%s<hr id="%s" data-text="%s"%s />' % (
+            ind, did, esc(a["text"]), geom(fx, fy, dw, dh)))
+    elif a.get("native") == "p":
+        out.append('%s<p id="%s"%s>%s</p>' % (
+            ind, did, geom(fx, fy, dw, dh), esc(a["text"])))
+    elif a.get("native") == "progress":
+        out.append(("%s<progress id=\"%s\" value=\"%s\" max=\"100\""
+                    " data-x-props='{\"showIndicator\":\"true\"}'%s />") % (
+            ind, did, a["value"], geom(fx, fy, dw, dh)))
+    elif a.get("native") == "select":
+        opts = "".join("<option>%s</option>" % esc(o) for o in a["options"])
+        out.append('%s<select id="%s"%s>%s</select>' % (
+            ind, did, geom(fx, fy, dw, dh), opts))
+    elif a.get("native") == "input_t":
+        out.append('%s<input id="%s" type="%s"%s%s />' % (
+            ind, did, a["itype"], a["tattrs"], geom(fx, fy, dw, dh)))
     elif a.get("native") == "img":
         out.append('%s<img id="%s" src="%s" data-fit="%s"%s />' % (
             ind, did, a["src"], a.get("fit", "contain"),
