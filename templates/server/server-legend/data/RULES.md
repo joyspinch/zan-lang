@@ -191,6 +191,27 @@ g = 24700000.0; steps = [round(g * 1.5**i, -4) for i in range(10)]   # sum ≈ 2
 「balance 值 ≤ 1000000」的安全上限，因此该键**移出小数值白名单**，改由一条
 货币量级断言兜底（`> 0 && <= 1000000000`）。`guild_create_item=330`（沃玛号角）。
 
+### 3.11 玩法层重写（Play.zan）的数值落点与裁决
+
+`Play.zan` 按本文件重写：次数/费用/曲线/概率一律读规则表，文件内不允许出现
+玩法常量。本轮落地时新增/修订的键与裁决：
+
+| 键 / 事项 | 值 | 依据 |
+|---|---|---|
+| `arena_rival_count` | 3 → **16** | 客户端竞技场页是 4×4 对手卡网格，3 个对手铺不满版面 |
+| `altar_buff_mult_pct` | **新增 11000** | 祭坛增益以万分比给（10000=原值），+10% 经验/金币；Fight 两处结算共用，不再各自写死 |
+| `title_page_size` | **新增 12** | 客户端 `PageTitle` 每页硬编码 12 行，服务端分页必须一致 |
+| `tower_rival_cards` | **新增 15** | 传说塔页对手卡张数 |
+| 称谓解锁货币 | 声望 + 金币 | 裁决 #8 的实现：`rep×title_unlock_rep_pct% + money`；事实源 = `M2.DB` 的 GameTitle（251 行，只读快照懒加载一次），解锁列表按 id 存 `titlesUnlocked`，客户端 12 行字段 `fame/gold/rebirth/level/atk…mdef` 逐列同构 |
+| 押镖产出 | 金币 + 声望 + 行会资金 | `escort_merit=30` 声望入个人；`escort_guild_gold` 同额写入 `game_guild.fund`（§3.5 声望入口的兑现）；押金 `escort_gold` 不退 |
+| 红包玩法币种 | **元宝 gems** | 红包池是全服共享世界态（world_state），发出与抢到都是元宝；§3.5 表里的「红包 redPackets 币」是回收币种 #4，两回事——前者是玩法，后者是币，产出仍挂幻境（下一轮） |
+| 竞技场对手公式 | 幂基 + 胜场 + 档位 | `opponent = arena_power_base + (胜场+1)×arena_power_win + (档位-1)×arena_power_rival`，我的战力×随机区间 vs 对手×arena_win_scale；胜负都发战功+声望（赢多发金币），段位榜按 merit 取前 `arena_rival_count` |
+| 市场双花 | 条件更新 | 买断走 `UPDATE sellerId=? WHERE id=? AND sellerId=?` 判 affected（§五 兑现），卖方按 `market_fee_pct` 抽成，离线也入账 |
+| 将星位图 | int → long | maps.csv 覆盖 171 层，`bit = mapId-1` 在 int 位图装不下（§3.4 连带） |
+
+> 三个新键同时进两侧 RequiredKeys（服务端 `Rules.zan` / 客户端
+> `Tables.zan`，位置逐字一致）并由 `tools/sync_rules.py` 同步两份 CSV 副本。
+
 ---
 
 ## 四、校验：错配置要在启动时炸，不是运行时算错

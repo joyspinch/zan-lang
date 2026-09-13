@@ -51,7 +51,7 @@ class Fight {
        不匹配，不采用）。血量/法力/攻防 = ClassCurves 三职业曲线 +
        装备追加（原版 RecalcAbilitys 同构）。 */
     static long ExpNext(int level) {
-        return 44 * level * level;
+        return Rules.NeedXp(level);
     }
 
     /* 进度戳：等级/经验的绝对值随战况事件下发。客户端面板因此跟着每
@@ -120,7 +120,7 @@ class Fight {
         List<ZanWeb.Model.Game.Item> worn = Fight.Worn(row);
         for (int i = 0; i < worn.Count; i = i + 1) { bonus = bonus + worn[i].atk; }
         return ClassCurves.AtkHi(row.job, row.level) + bonus
-            + row.weaponStar * 2 + row.wuxing;
+            + row.weaponStar * Rules.Val("forge_star_attack") + row.wuxing;
     }
 
     static int Def(ZanWeb.Model.Game.Player row) {
@@ -128,7 +128,7 @@ class Fight {
         List<ZanWeb.Model.Game.Item> worn = Fight.Worn(row);
         for (int i = 0; i < worn.Count; i = i + 1) { bonus = bonus + worn[i].def; }
         return ClassCurves.AcHi(row.job, row.level) + bonus
-            + row.armorStar * 2;
+            + row.armorStar * Rules.Val("forge_star_defense");
     }
 
     static int MaxHp(ZanWeb.Model.Game.Player row) {
@@ -147,7 +147,7 @@ class Fight {
             bonus = bonus + worn[i].atkMin;
         }
         return ClassCurves.AtkLo(row.job, row.level) + bonus
-            + row.weaponStar * 2 + row.wuxing;
+            + row.weaponStar * Rules.Val("forge_star_attack") + row.wuxing;
     }
 
     static int DefLo(ZanWeb.Model.Game.Player row) {
@@ -156,7 +156,7 @@ class Fight {
         for (int i = 0; i < worn.Count; i = i + 1) {
             bonus = bonus + worn[i].defMin;
         }
-        return bonus + row.armorStar * 2;
+        return bonus + row.armorStar * Rules.Val("forge_star_defense");
     }
 
     static int MacHi(ZanWeb.Model.Game.Player row) {
@@ -528,7 +528,7 @@ class Fight {
        game_realm 三列）。 */
     static void OnKill(Session s, ZanWeb.Model.Game.Mob t, JsonValue f, bool quiet) {
         /* 祭坛增益（捐献获得，30 分钟）有效期内经验 ×1.1。 */
-        int expMul = Play.AltarBuffed(s) ? 11000 : 10000;
+        int expMul = Play.AltarBuffed(s) ? Rules.Val("altar_buff_mult_pct") : 10000;
         s.row.exp = s.row.exp + (long)t.exp * s.expRate / 10000 * expMul / 10000;
         s.row.kills = s.row.kills + 1;
         /* 五行修炼经验池：每击 +1（封顶），修炼页注入转行经验。 */
@@ -536,18 +536,29 @@ class Fight {
         f.Set("kills", JsonValue.NewNum(Convert.ToString(s.row.kills)));
         long gold = Fight.rng.Between((int)t.goldMin, (int)t.goldMax + 1);
         /* 祭坛增益（捐献获得，30 分钟）有效期内经验金币 ×1.1。 */
-        long altarMul = Play.AltarBuffed(s) ? 11000 : 10000;
+        long altarMul = Play.AltarBuffed(s) ? Rules.Val("altar_buff_mult_pct") : 10000;
         gold = gold * s.goldRate / 10000 * altarMul / 10000;
         s.row.gold = s.row.gold + gold;
         f.Set("gold", JsonValue.NewNum(Convert.ToString(gold)));
-        if (s.row.kills == 5) {
-            s.row.gold = s.row.gold + 400;
-            /* 奖励并进这一击的 gold 增量：客户端 self 金币随 fight 推送
-               累加，奖励不改事件就会一直显示旧值。 */
-            f.Set("gold", JsonValue.NewNum(Convert.ToString(gold + 400)));
-            Gateway.PushAnnounce(s.conn, "任务完成：首次击杀",
-                "累计击杀达到 5，奖励 400 金币已发放。");
-            f.Set("quest", JsonValue.NewStr("首次击杀完成"));
+        /* 主线「首次击杀」：目标与四项奖励读 quests 行（金币进本次
+           gold 增量——客户端 self 金币随 fight 推送累加，不改事件就会
+           一直显示旧值；元宝/黑铁入账并随 bag 事件下发）。 */
+        ZanWeb.RuleRow quest = Rules.Quests().At(0);
+        if (quest.Text("metric") == "kills" && s.row.kills == quest.Int("target")) {
+            long questGold = quest.Int("gold");
+            s.row.gold = s.row.gold + questGold;
+            f.Set("gold", JsonValue.NewNum(Convert.ToString(gold + questGold)));
+            int questYuan = quest.Int("yuan");
+            if (questYuan > 0) { s.row.gems = s.row.gems + questYuan; }
+            int questIron = quest.Int("iron");
+            ZanWeb.Model.Game.Item ironItem = Fight.ByName("黑铁矿石");
+            if (questIron > 0 && ironItem != null) {
+                Fight.BagAdd(s, ironItem.id, questIron);
+            }
+            Gateway.PushAnnounce(s.conn, "任务完成：" + quest.Text("name"),
+                "累计击杀达到 " + Convert.ToString(quest.Int("target"))
+                + "，奖励 " + Convert.ToString(questGold) + " 金币已发放。");
+            f.Set("quest", JsonValue.NewStr(quest.Text("name") + "完成"));
         }
         /* BOSS 链解锁在地图内页「挑战BOSS」胜利路径（Fight.BossFight），
            挂机杀野怪不解锁——照原版，BOSS 要专门下挑战打。 */
@@ -617,7 +628,7 @@ class Fight {
     /* 死亡：回城满状态（血量一半）继续玩，自动挂机关闭；不掉经验，
        模板取向是休闲挂机，惩罚留给二开自己加。 */
     static void Die(Session s) {
-        s.row.hp = Fight.MaxHp(s.row) / 2;
+        s.row.hp = Fight.MaxHp(s.row) * Rules.Val("death_hp_pct") / 100;
         if (s.row.hp < 1) { s.row.hp = 1; }
         s.row.mapId = 1;
         s.row.x = 5;
@@ -792,15 +803,15 @@ class Fight {
 
     /* ---- 地图内页 BOSS 挑战（照原版「挑战BOSS(剩N)次」） ---- */
 
-    /* 挑战次数跨天回满：bossTryDate 不是今天就把次数拉回 20（次数池
-       全局一个，原版 UI 也只显示一个「剩N次」）。 */
+    /* 挑战次数跨天回满：bossTryDate 不是今天就把次数拉回 boss_tries
+       （次数池全局一个，原版 UI 也只显示一个「剩N次」）。 */
     static void BossDaily(Session s, long now) {
         DateTime dt = DateTime.FromUnixSeconds(now);
         string today = Convert.ToString(dt.year) + "-"
             + (dt.month < 10 ? "0" : "") + Convert.ToString(dt.month) + "-"
             + (dt.day < 10 ? "0" : "") + Convert.ToString(dt.day);
         if (s.row.bossTryDate == today) { return; }
-        s.row.bossTries = 20;
+        s.row.bossTries = Rules.Val("boss_tries");
         s.row.bossTryDate = today;
         s.dirty = true;
     }
@@ -870,7 +881,7 @@ class Fight {
         int hpStart = s.row.hp;
         JsonValue log = JsonValue.NewArray();
         bool win = false;
-        for (int round = 0; round < 200; round = round + 1) {
+        for (int round = 0; round < Rules.Val("boss_max_rounds"); round = round + 1) {
             int dmg = Fight.Damage(Fight.Atk(s.row), t.def);
             bhp = bhp - dmg;
             log.Append(JsonValue.NewStr("[BOSS] " + s.row.nickname + " 攻击 "
@@ -933,8 +944,9 @@ class Fight {
             return Gateway.Err("先击败这个 BOSS 才能扫荡");
         }
         Fight.BossDaily(s, now);
+        int sweepMax = Rules.Val("boss_sweep_max");
         if (count < 1) { count = 1; }
-        if (count > 20) { count = 20; }
+        if (count > sweepMax) { count = sweepMax; }
         if (count > s.row.bossTries) { count = s.row.bossTries; }
         if (count <= 0) {
             return Gateway.Err("今天的挑战次数已用完，明天再来");

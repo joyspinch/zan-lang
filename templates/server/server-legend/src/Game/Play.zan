@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Data.Orm;
+using System.Data.Sqlite;
 using System.Json;
 using ZanWeb.Model.Game;
 
@@ -10,50 +11,14 @@ namespace ZanWeb.Game;
 /* 玩法页（导航 1/4/5/7/8/10/11/14/16/18/22/23/25）的服务端实现：
    PK竞技场、押镖、行会、城池争夺、传说塔、五行修炼、师徒、祭坛、
    将星图谱、发红包、交易市场、图鉴明细、称谓。
-   规则对照客户端离线版 Game.zan 的同名玩法（复刻不创造不阉割）；
-   数值出处 balance.csv / growth.csv / recycle.csv / elements.csv。
-   每日次数照 bossTryDate 定式跨天回满；所有可变状态改会话内存副本
-   并置 dirty，落库随 World.Flush。图鉴明细（codex）挪到这里并按
-   物品/怪物分页，页面一次一页。 */
+   本文件不允许出现玩法数值常量：次数/费用/曲线/概率一律 Rules.Val
+   与规则表行取值（balance.csv / elements.csv / 原版事实表 GameTitle），
+   改数值是改 CSV，不是改代码——这是与旧服务端最大的结构差异。
+   四种玩法货币（战功/声望/红包币/图谱积分）在这里入账，闭环见
+   data/RULES.md §3.5。每日次数照 bossTryDate 定式跨天回满；所有可变
+   状态改会话内存副本并置 dirty，落库随 World.Flush。图鉴明细（codex）
+   按物品/怪物分页，页面一次一页。 */
 class Play {
-    const int ARENA_TRIES = 5;
-    const int ESCORT_TRIES = 3;
-    const int ESCORT_SECONDS = 60;
-    const int ESCORT_GOLD = 100;
-    const int ESCORT_REWARD = 400;
-    const int ESCORT_LEVEL_GOLD = 20;
-    const int ARENA_WIN_MERIT = 100;
-    const int ARENA_LOSE_MERIT = 20;
-    const int ARENA_WIN_GOLD = 200;
-    const int ARENA_POWER_BASE = 200;
-    const int ARENA_POWER_WIN = 180;
-    const int ARENA_POWER_RIVAL = 300;
-    const int ALTAR_PERSONAL_CAP = 1000;
-    const int ALTAR_GOLD_COST = 100;
-    const int ALTAR_GOLD_GAIN = 100;
-    const int ALTAR_YUAN_COST = 100;
-    const int ALTAR_YUAN_GAIN = 5;
-    const int ALTAR_YUAN_LARGE_COST = 1000;
-    const int ALTAR_YUAN_LARGE_GAIN = 50;
-    const int ALTAR_IRON_COST = 500;
-    const int ALTAR_IRON_GAIN = 4;
-    const int ALTAR_PERSONAL_REWARD_GOLD = 1000;
-    const int ALTAR_PERSONAL_REWARD_YUAN = 100;
-    const int ALTAR_PERSONAL_REWARD_REPUTATION = 100;
-    const int ALTAR_BUFF_SECONDS = 1800;
-    /* 五行：name/属性加成每级（攻+2 或血+20），上限 100 级；池上限、
-       每秒入池、突破费用（金币 = 800+级*400，元宝 = 级/2）。 */
-    const int WX_MAX = 100;
-    const int WX_POOL_CAP = 600;
-    const int WX_POOL_PER_SEC = 1;
-    const int WX_XP_BASE = 60;
-    const int WX_XP_STEP = 30;
-    const int WX_IRON_COST = 2;
-    /* 传说塔：层数无限，敌人强度随层增长；每层通关奖励金币与经验。 */
-    const int TOWER_MERIT = 20;
-    /* 原版传说塔每日 10 次（照原版 UI 的 挑战次数 10/10）。 */
-    const int TOWER_MAX_TRIES = 10;
-
     static Random rng = new Random();
 
     static string Err(string why) { return why; }
@@ -66,16 +31,16 @@ class Play {
             + (dt.day < 10 ? "0" : "") + Convert.ToString(dt.day);
     }
 
-    /* towerTries 每日回满也并入 DailyReset。 */
+    /* arena/escort/tower 每日次数跨天回满，上限读 balance.csv。 */
     static void DailyReset(Session s, long now) {
         string today = Play.Today(now);
         if (s.row.arenaTryDate != today) {
-            s.row.arenaTries = ARENA_TRIES;
+            s.row.arenaTries = Rules.Val("arena_tries");
             s.row.arenaTryDate = today;
             s.dirty = true;
         }
         if (s.row.escortTryDate != today) {
-            s.row.escortTries = ESCORT_TRIES;
+            s.row.escortTries = Rules.Val("escort_tries");
             s.row.escortTryDate = today;
             s.dirty = true;
         }
@@ -85,7 +50,7 @@ class Play {
             s.dirty = true;
         }
         if (s.row.towerTryDate != today) {
-            s.row.towerTries = TOWER_MAX_TRIES;
+            s.row.towerTries = Rules.Val("tower_tries");
             s.row.towerTryDate = today;
             s.dirty = true;
         }
@@ -93,70 +58,126 @@ class Play {
 
     /* ---- 协议 ---- */
 
-    /* arena: {}=面板；{"fight":1..3}=打一场。 */
-    static JsonValue Arena(Session s, JsonValue m, long now) {
+    /* arena: {}=面板；{"fight":1..N}=打一场（N=arena_rival_count，与
+       客户端 16 张挑战卡一致）。对手战力照客户端 Game.zan 的公式：
+       base + (胜场+1)*win + rival0*rival（服务端 rival 1 基，转 0 基）；
+       胜负 = 我方战力×随机系数 ≥ 对手战力×arena_win_scale。 */
+    static async JsonValue Arena(Session s, JsonValue m, long now) {
         Play.DailyReset(s, now);
         if (m.Int("fight", 0) > 0) {
             int rival = m.Int("fight", 1);
-            if (rival < 1 || rival > 3) { return Gateway.Err("对手编号不合法"); }
-            if (s.row.arenaTries <= 0) { return Gateway.Err("竞技场每日5次，明日再来"); }
+            int rivalCount = Rules.Val("arena_rival_count");
+            if (rival < 1 || rival > rivalCount) { return Gateway.Err("对手编号不合法"); }
+            if (s.row.arenaTries <= 0) {
+                return Gateway.Err("竞技场每日" + Convert.ToString(Rules.Val("arena_tries"))
+                    + "次，明日再来");
+            }
             s.row.arenaTries = s.row.arenaTries - 1;
-            s.row.merit = s.row.merit + ARENA_LOSE_MERIT;
-            int power = Fight.Atk(s.row) * 100 / (Fight.Def(s.row) + 10);
-            int opponent = ARENA_POWER_BASE + (s.row.arenaWins + 1) * ARENA_POWER_WIN
-                + (rival - 1) * ARENA_POWER_RIVAL;
-            int myRoll = power * (Play.rng.Between(80, 130));
-            bool win = myRoll >= opponent * 100;
+            long winMerit = Rules.Long("arena_win_merit");
+            long loseMerit = Rules.Long("arena_lose_merit");
+            long winReputation = Rules.Long("arena_win_reputation");
+            long loseReputation = Rules.Long("arena_lose_reputation");
+            long winGold = Rules.Long("arena_win_gold");
+            int power = Fight.Atk(s.row) * Rules.Val("arena_power_scale")
+                / (Fight.Def(s.row) + Rules.Val("arena_def_offset"));
+            long opponent = (long)Rules.Val("arena_power_base")
+                + (long)(s.row.arenaWins + 1) * Rules.Val("arena_power_win")
+                + (long)(rival - 1) * Rules.Val("arena_power_rival");
+            long myRoll = (long)power * (Rules.Val("incoming_random_min")
+                + Play.rng.Between(0, Rules.Val("incoming_random_range")));
+            bool win = myRoll >= opponent * Rules.Val("arena_win_scale");
+            s.row.merit = s.row.merit + loseMerit;
+            s.row.reputation = s.row.reputation + loseReputation;
             JsonValue r = Gateway.Ok();
+            long gotMerit = loseMerit;
+            long gotReputation = loseReputation;
+            long gotGold = 0;
             if (win) {
                 s.row.arenaWins = s.row.arenaWins + 1;
-                s.row.merit = s.row.merit + ARENA_WIN_MERIT - ARENA_LOSE_MERIT;
-                s.row.gold = s.row.gold + ARENA_WIN_GOLD;
+                s.row.merit = s.row.merit + winMerit - loseMerit;
+                s.row.reputation = s.row.reputation + winReputation - loseReputation;
+                s.row.gold = s.row.gold + winGold;
+                gotMerit = winMerit;
+                gotReputation = winReputation;
+                gotGold = winGold;
             }
             r.Set("win", JsonValue.NewNum(win ? "1" : "0"));
             r.Set("rival", JsonValue.NewNum(Convert.ToString(rival)));
-            r.Set("gold", JsonValue.NewNum(Convert.ToString(win ? ARENA_WIN_GOLD : 0)));
-            r.Set("merit", JsonValue.NewNum(Convert.ToString(win
-                ? ARENA_WIN_MERIT : ARENA_LOSE_MERIT)));
+            r.Set("gold", JsonValue.NewNum(Convert.ToString(gotGold)));
+            r.Set("merit", JsonValue.NewNum(Convert.ToString(gotMerit)));
+            r.Set("reputation", JsonValue.NewNum(Convert.ToString(gotReputation)));
             r.Set("log", JsonValue.NewStr(win
                 ? "击败对手 " + Convert.ToString(rival) + "！战功 +"
-                    + Convert.ToString(ARENA_WIN_MERIT) + "、金币 +"
-                    + Convert.ToString(ARENA_WIN_GOLD)
+                    + Convert.ToString(gotMerit) + "、声望 +"
+                    + Convert.ToString(gotReputation) + "、金币 +"
+                    + Convert.ToString(gotGold)
                 : "挑战对手 " + Convert.ToString(rival) + " 失败，战功 +"
-                    + Convert.ToString(ARENA_LOSE_MERIT)));
+                    + Convert.ToString(gotMerit) + "、声望 +"
+                    + Convert.ToString(gotReputation)));
+            r.Set("arena", await Play.ArenaState(s, now));
             Gateway.SelfInto(r, s);
             s.dirty = true;
             return r;
         }
-        return Play.ArenaState(s);
+        JsonValue p = Gateway.Ok();
+        p.Set("arena", await Play.ArenaState(s, now));
+        return p;
     }
 
-    static JsonValue ArenaState(Session s) {
-        JsonValue r = Gateway.Ok();
+    /* 面板：计数器 + 本区战功榜（arena_rival_count 行，客户端挑战卡
+       逐张取 rows[i].name/rank/me，无榜时退回演示数据）。 */
+    static async JsonValue ArenaState(Session s, long now) {
         JsonValue a = JsonValue.NewObject();
         a.Set("tries", JsonValue.NewNum(Convert.ToString(s.row.arenaTries)));
         a.Set("wins", JsonValue.NewNum(Convert.ToString(s.row.arenaWins)));
         a.Set("pts", JsonValue.NewNum(Convert.ToString(s.row.merit)));
         a.Set("power", JsonValue.NewNum(Convert.ToString(Fight.Atk(s.row))));
-        r.Set("arena", a);
-        return r;
+        a.Set("time", JsonValue.NewNum(Convert.ToString(now)));
+        int take = Rules.Val("arena_rival_count");
+        JsonValue arr = JsonValue.NewArray();
+        IDbConnection db = await Gateway.Db();
+        if (db != null) {
+            try {
+                List<ZanWeb.Model.Game.Player> rows = await db
+                    .Select<ZanWeb.Model.Game.Player>()
+                    .Where(x => x.realmId == s.realmId)
+                    .OrderByDescending(x => x.merit)
+                    .Take(take).ToListAsync();
+                for (int i = 0; i < rows.Count; i = i + 1) {
+                    JsonValue o = JsonValue.NewObject();
+                    o.Set("name", JsonValue.NewStr(rows[i].nickname));
+                    o.Set("rank", JsonValue.NewNum(Convert.ToString(i + 1)));
+                    o.Set("me", JsonValue.NewNum(rows[i].id == s.row.id ? "1" : "0"));
+                    arr.Append(o);
+                }
+            } finally {
+                Gateway.Give(db);
+            }
+        }
+        a.Set("rows", arr);
+        return a;
     }
 
-    /* escort: {}=面板；{"go":1}=出发；{"collect":1}=到达收镖。 */
-    static JsonValue Escort(Session s, JsonValue m, long now) {
+    /* escort: {}=面板；{"go":1}=出发（押金 escort_gold 不退）；{"collect":1}
+       =到达收镖。奖励 = escort_reward + 等级×escort_level_gold + 有会加
+       escort_guild_gold；收镖入账金币 + 声望 escort_merit，行会资金同步
+       +escort_guild_gold（RULES.md 裁决 #9：金币+行会物资+声望）。 */
+    static async JsonValue Escort(Session s, JsonValue m, long now) {
         Play.DailyReset(s, now);
         if (m.Int("go", 0) == 1) {
             if (s.row.escortStage == 1) { return Gateway.Err("镖车已在路上"); }
             if (s.row.escortTries <= 0) { return Gateway.Err("今日押镖次数已用完，明天再来"); }
-            if (s.row.gold < ESCORT_GOLD) {
-                return Gateway.Err("金币不够（押金 " + Convert.ToString(ESCORT_GOLD) + "）");
+            long deposit = Rules.Long("escort_gold");
+            if (s.row.gold < deposit) {
+                return Gateway.Err("金币不够（押金 " + Convert.ToString(deposit) + "）");
             }
-            s.row.gold = s.row.gold - ESCORT_GOLD;
+            s.row.gold = s.row.gold - deposit;
             s.row.escortTries = s.row.escortTries - 1;
             s.row.escortStage = 1;
-            s.row.escortUntil = now + ESCORT_SECONDS;
-            s.row.escortReward = (long)ESCORT_REWARD
-                + (long)s.row.level * ESCORT_LEVEL_GOLD + ESCORT_GOLD;
+            s.row.escortUntil = now + Rules.Val("escort_seconds");
+            s.row.escortReward = Rules.Long("escort_reward")
+                + (long)s.row.level * Rules.Val("escort_level_gold")
+                + (s.row.guildId > 0 ? Rules.Long("escort_guild_gold") : 0);
             s.dirty = true;
         }
         if (m.Int("collect", 0) == 1) {
@@ -170,8 +191,21 @@ class Play {
             s.row.escortUntil = 0;
             s.row.escortReward = 0;
             s.row.gold = s.row.gold + gain;
-            s.row.exp = s.row.exp + 50;
+            s.row.reputation = s.row.reputation + Rules.Long("escort_merit");
             s.dirty = true;
+            if (s.row.guildId > 0) {
+                IDbConnection db = await Gateway.Db();
+                if (db != null) {
+                    try {
+                        int _g = await db.Update<ZanWeb.Model.Game.Guild>()
+                            .SetIncr(a => a.fund, Rules.Long("escort_guild_gold"))
+                            .Where(a => a.id == s.row.guildId)
+                            .ExecuteAffrowsAsync();
+                    } finally {
+                        Gateway.Give(db);
+                    }
+                }
+            }
             JsonValue rc = Gateway.Ok();
             rc.Set("gain", JsonValue.NewNum(Convert.ToString(gain)));
             rc.Set("escort", Play.EscortState(s, now));
@@ -196,23 +230,38 @@ class Play {
         return a;
     }
 
-    /* guild: {}=列表+我的会；{"create":"名"}=建会（1000金币）；
-       {"join":id}=入会；{"quit":1}=退会。会长退会先转让/拒绝。 */
+    /* guild: {}=列表+我的会；{"create":"名"}=建会（guild_create_gold
+       + 道具 guild_create_item，名字 guild_name_min/max 字）；
+       {"join":id}=入会；{"quit":1}=退会。会长退会先转让/拒绝。
+       行形状照客户端 GuildRow：master/memberCap/goods/limitLevel，
+       旧键 leader/fund 同步下发双保险。 */
     static async JsonValue Guild(Session s, JsonValue m, long now) {
         IDbConnection db = await Gateway.Db();
         if (db == null) { return Gateway.Err("数据库不可用，请稍后再试"); }
         try {
             if (m.Str("create", "").Length > 0) {
                 string name = m.Str("create", "").Trim();
-                if (Fmt.CharCount(name) < 2 || Fmt.CharCount(name) > 12) {
-                    return Gateway.Err("行会名需 2-12 字");
+                int nameMin = Rules.Val("guild_name_min");
+                int nameMax = Rules.Val("guild_name_max");
+                if (Fmt.CharCount(name) < nameMin || Fmt.CharCount(name) > nameMax) {
+                    return Gateway.Err("行会名需 " + Convert.ToString(nameMin) + "-"
+                        + Convert.ToString(nameMax) + " 字");
                 }
                 if (s.row.guildId > 0) { return Gateway.Err("你已有行会，先退出再建"); }
-                if (s.row.gold < 1000) { return Gateway.Err("建会需要 1000 金币"); }
+                long cost = Rules.Long("guild_create_gold");
+                if (s.row.gold < cost) {
+                    return Gateway.Err("建会需要 " + Convert.ToString(cost) + " 金币");
+                }
+                int token = Rules.Val("guild_create_item");
+                if (!Fight.BagTake(s, token, 1)) {
+                    ZanWeb.Model.Game.Item tokenItem = Fight.ById(token);
+                    return Gateway.Err("建会需要 1 个 "
+                        + (tokenItem != null ? tokenItem.name : "信物"));
+                }
                 int dup = await db.Select<ZanWeb.Model.Game.Guild>()
                     .Where(a => a.name == name).CountAsync();
                 if (dup > 0) { return Gateway.Err("行会名已被使用"); }
-                s.row.gold = s.row.gold - 1000;
+                s.row.gold = s.row.gold - cost;
                 ZanWeb.Model.Game.Guild g = new ZanWeb.Model.Game.Guild();
                 g.name = name;
                 g.leader = s.row.nickname;
@@ -249,6 +298,7 @@ class Play {
                 s.row.guildId = 0;
                 s.dirty = true;
             }
+            int cap = Rules.Val("guild_max_members");
             List<ZanWeb.Model.Game.Guild> rows = await db
                 .Select<ZanWeb.Model.Game.Guild>()
                 .OrderBy(a => a.id).ToListAsync();
@@ -260,9 +310,13 @@ class Play {
                 JsonValue o = JsonValue.NewObject();
                 o.Set("id", JsonValue.NewNum(Convert.ToString(g.id)));
                 o.Set("name", JsonValue.NewStr(g.name));
+                o.Set("master", JsonValue.NewStr(g.leader));
                 o.Set("leader", JsonValue.NewStr(g.leader));
-                o.Set("fund", JsonValue.NewNum(Convert.ToString(g.fund)));
                 o.Set("members", JsonValue.NewNum(Convert.ToString(members)));
+                o.Set("memberCap", JsonValue.NewNum(Convert.ToString(cap)));
+                o.Set("goods", JsonValue.NewNum(Convert.ToString(g.fund)));
+                o.Set("fund", JsonValue.NewNum(Convert.ToString(g.fund)));
+                o.Set("limitLevel", JsonValue.NewNum("0"));
                 o.Set("mine", JsonValue.NewNum(g.id == s.row.guildId ? "1" : "0"));
                 arr.Append(o);
             }
@@ -277,9 +331,11 @@ class Play {
     }
 
     /* siege 城池争夺：沙巴克城主（owner 名 + 申报战时间，进程内记忆）
-       + 城池争夺页的 8 座钱庄（每座 owner/guild/at，进程内记忆，重启
-       清空，同 redpack 定式）。攻占 = 消耗 2000 金币掷骰（胜率
-       40%+战力/10），成功即易主并全服公告。 */
+       + 城池争夺页的 city_count 座钱庄（每座 owner/guild/at，进程内
+       记忆，重启清空——世界态持久化在下一轮接 world_state 表）。
+       攻占 = 消耗 siege_attack_gold 掷骰（胜率 siege_base_chance
+       + (攻 + 等级×siege_level_power) / siege_power_div），成功即易主
+       并全服公告。 */
     static string siegeOwner = "";
     static string siegeGuild = "";
     static long siegeAt = 0;
@@ -287,14 +343,25 @@ class Play {
     static string[] cityGuilds = new string[] { "", "", "", "", "", "", "", "" };
     static long[] cityAt = new long[] { 0, 0, 0, 0, 0, 0, 0, 0 };
 
+    /* city_count 可配，进程内数组固定 8 座，配置超出按 8 封顶。 */
+    static int CityCount() {
+        int n = Rules.Val("city_count");
+        if (n > 8) { n = 8; }
+        if (n < 1) { n = 1; }
+        return n;
+    }
+
     static string CityName(int city) { return "钱庄" + Convert.ToString(city); }
 
     static async JsonValue Siege(Session s, JsonValue m, long now) {
         if (m.Int("attack", 0) == 1) {
             int city = m.Int("city", 0);
-            if (city < 1 || city > 8) { return Gateway.Err("城池编号不合法"); }
+            if (city < 1 || city > Play.CityCount()) { return Gateway.Err("城池编号不合法"); }
             if (s.row.guildId <= 0) { return Gateway.Err("先加入行会才能攻占城池"); }
-            if (s.row.gold < 2000) { return Gateway.Err("攻占城池需要 2000 金币"); }
+            long cost = Rules.Long("siege_attack_gold");
+            if (s.row.gold < cost) {
+                return Gateway.Err("攻占城池需要 " + Convert.ToString(cost) + " 金币");
+            }
             string guildName = "";
             IDbConnection db = await Gateway.Db();
             if (db != null) {
@@ -307,10 +374,12 @@ class Play {
                     Gateway.Give(db);
                 }
             }
-            int power = Fight.Atk(s.row) + s.row.level * 2;
-            s.row.gold = s.row.gold - 2000;
+            int power = Fight.Atk(s.row)
+                + s.row.level * Rules.Val("siege_level_power");
+            s.row.gold = s.row.gold - cost;
             s.dirty = true;
-            bool win = Play.rng.Between(0, 100) < 40 + power / 10;
+            int chance = Rules.Val("siege_base_chance") + power / Rules.Val("siege_power_div");
+            bool win = Play.rng.Between(0, 99) < chance;
             JsonValue r = Gateway.Ok();
             if (win) {
                 Play.cityOwners[city - 1] = s.row.nickname;
@@ -338,16 +407,20 @@ class Play {
         o.Set("guild", JsonValue.NewStr(Play.siegeGuild));
         long hold = Play.siegeAt > 0 ? now - Play.siegeAt : 0;
         o.Set("holdSeconds", JsonValue.NewNum(Convert.ToString(hold)));
-        /* 城池争夺页的 8 座钱庄：date 直接下发 yyyy-MM-dd（占领日），
-           income 为每小时产出金币（占领展示数值）。 */
+        /* 城池争夺页：date 下发占领日 yyyy-MM-dd，income 为每小时产出
+           金币（city_income_base 起步、每座 +city_income_step）。 */
         JsonValue cities = JsonValue.NewArray();
-        for (int i = 0; i < 8; i = i + 1) {
+        int n = Play.CityCount();
+        long incomeBase = Rules.Long("city_income_base");
+        long incomeStep = Rules.Long("city_income_step");
+        for (int i = 0; i < n; i = i + 1) {
             JsonValue c = JsonValue.NewObject();
             c.Set("id", JsonValue.NewNum(Convert.ToString(i + 1)));
-            c.Set("name", JsonValue.NewStr("钱庄" + Convert.ToString(i + 1)));
+            c.Set("name", JsonValue.NewStr(Play.CityName(i + 1)));
             c.Set("owner", JsonValue.NewStr(Play.cityOwners[i]));
             c.Set("guild", JsonValue.NewStr(Play.cityGuilds[i]));
-            c.Set("income", JsonValue.NewNum(Convert.ToString(500 + i * 250)));
+            c.Set("income", JsonValue.NewNum(Convert.ToString(
+                incomeBase + (long)i * incomeStep)));
             c.Set("date", JsonValue.NewStr(Play.cityAt[i] > 0
                 ? Play.Today(Play.cityAt[i]) : ""));
             cities.Append(c);
@@ -356,10 +429,11 @@ class Play {
         return o;
     }
 
-    /* tower 传说塔：{"climb":1} 爬一层。敌人强度随层涨，胜利楼层+1、
-       经验金币入账；失败塔层保留（明日再战），每日 10 次尝试（原版
-       挑战次数 10/10）。 */
-    static JsonValue Tower(Session s, JsonValue m, long now) {
+    /* tower 传说塔：{"climb":1} 爬一层。敌人强度随层涨（tower_foe_*），
+       胜负 = 我攻×tower_win_atk_scale > 敌攻×(tower_win_def_base
+       + 层/tower_win_floor_div)；胜利楼层+1、金币/经验/战功入账；
+       失败塔层保留（明日再战），每日 tower_tries 次。 */
+    static async JsonValue Tower(Session s, JsonValue m, long now) {
         Play.DailyReset(s, now);
         if (m.Int("climb", 0) == 1) {
             if (s.row.towerTries <= 0) {
@@ -367,19 +441,24 @@ class Play {
             }
             s.row.towerTries = s.row.towerTries - 1;
             int floor = s.row.towerFloor + 1;
-            int foeAtk = 30 + floor * 12;
-            int foeHp = 200 + floor * 150;
+            int foeAtk = Rules.Val("tower_foe_atk_base")
+                + floor * Rules.Val("tower_foe_atk_per_floor");
+            int foeHp = Rules.Val("tower_foe_hp_base")
+                + floor * Rules.Val("tower_foe_hp_per_floor");
             int myAtk = Fight.Atk(s.row);
-            int myDef = Fight.Def(s.row);
-            bool win = myAtk * 10 > foeAtk * (4 + floor / 5)
-                && myAtk * (foeHp / (myAtk > 0 ? myAtk : 1)) > 0;
+            bool win = (long)myAtk * Rules.Val("tower_win_atk_scale")
+                > (long)foeAtk * (Rules.Val("tower_win_def_base")
+                    + floor / Rules.Val("tower_win_floor_div"));
             JsonValue r = Gateway.Ok();
             if (win) {
                 s.row.towerFloor = floor;
-                long gold = 100 + (long)floor * 60;
-                long exp = 60 + (long)floor * 45;
+                long gold = Rules.Long("tower_gold_base")
+                    + (long)floor * Rules.Val("tower_gold_per_floor");
+                long exp = Rules.Long("tower_xp_base")
+                    + (long)floor * Rules.Val("tower_xp_per_floor");
                 s.row.gold = s.row.gold + gold;
                 s.row.exp = s.row.exp + exp;
+                s.row.merit = s.row.merit + Rules.Long("tower_merit");
                 int ups = 0;
                 while (s.row.exp >= Fight.ExpNext(s.row.level)) {
                     s.row.exp = s.row.exp - Fight.ExpNext(s.row.level);
@@ -392,30 +471,33 @@ class Play {
                     ? s.row.level : 0)));
                 r.Set("gold", JsonValue.NewNum(Convert.ToString(gold)));
                 r.Set("exp", JsonValue.NewNum(Convert.ToString(exp)));
+                r.Set("merit", JsonValue.NewNum(Convert.ToString(
+                    Rules.Val("tower_merit"))));
                 r.Set("floor", JsonValue.NewNum(Convert.ToString(floor)));
             }
             r.Set("win", JsonValue.NewNum(win ? "1" : "0"));
             r.Set("log", JsonValue.NewStr(win
-                ? "第 " + Convert.ToString(floor) + " 层攻克！"
+                ? "第 " + Convert.ToString(floor) + " 层攻克！守卫血量 "
+                    + Convert.ToString(foeHp) + "。"
                 : "第 " + Convert.ToString(floor) + " 层守卫太强， Retreat。"));
-            r.Set("tower", Play.TowerState(s));
+            r.Set("tower", await Play.TowerState(s));
             Gateway.SelfInto(r, s);
             s.dirty = true;
             return r;
         }
         JsonValue r2 = Gateway.Ok();
-        r2.Set("tower", Play.TowerState(s));
+        r2.Set("tower", await Play.TowerState(s));
         return r2;
     }
 
-    static JsonValue TowerState(Session s) {
+    static async JsonValue TowerState(Session s) {
         JsonValue o = JsonValue.NewObject();
         o.Set("floor", JsonValue.NewNum(Convert.ToString(s.row.towerFloor)));
         o.Set("tries", JsonValue.NewNum(Convert.ToString(s.row.towerTries)));
-        o.Set("maxTries", JsonValue.NewNum(Convert.ToString(TOWER_MAX_TRIES)));
+        o.Set("maxTries", JsonValue.NewNum(Convert.ToString(Rules.Val("tower_tries"))));
         /* 传说塔页的挑战者卡（原版每层 15 张）：本区前 15 名的层榜，
            rank 0 = 自己的位置卡（floor=自己进度，me=1）。 */
-        o.Set("rivals", Play.TowerRivals(s));
+        o.Set("rivals", await Play.TowerRivals(s));
         return o;
     }
 
@@ -429,8 +511,8 @@ class Play {
                 .Select<ZanWeb.Model.Game.Player>()
                 .Where(a => a.realmId == s.realmId && a.id != s.row.id)
                 .OrderByDescending(a => a.towerFloor)
-                .ToListAsync();
-            for (int i = 0; i < rows.Count && i < 15; i = i + 1) {
+                .Take(Rules.Val("tower_rival_cards")).ToListAsync();
+            for (int i = 0; i < rows.Count; i = i + 1) {
                 JsonValue p = JsonValue.NewObject();
                 p.Set("name", JsonValue.NewStr(rows[i].nickname));
                 p.Set("floor", JsonValue.NewNum(Convert.ToString(rows[i].towerFloor)));
@@ -444,7 +526,8 @@ class Play {
     }
 
     /* wuxing 五行修炼：{"do":"pool"} 打怪经验入池（挂机自动）；
-       {"do":"inject","id":0..4} 注入；{"do":"up","id":0..4} 突破。 */
+       {"do":"inject","id":0..4} 注入；{"do":"up","id":0..4} 突破。
+       每行的上限/经验曲线/突破费用（黑铁+元宝）读 elements.csv 行。 */
     static JsonValue Wuxing(Session s, JsonValue m) {
         int[] ranks = Play.WxParse(s.row.wuxingRanks);
         long[] xp = Play.WxParseL(s.row.wuxingXp);
@@ -453,8 +536,9 @@ class Play {
         if (act == "inject") {
             int id = m.Int("id", -1);
             if (id < 0 || id > 4) { return Gateway.Err("五行编号不合法"); }
-            if (ranks[id] >= WX_MAX) { return Gateway.Err("该五行已满级"); }
-            long need = (long)WX_XP_BASE + WX_XP_STEP * ranks[id];
+            ZanWeb.RuleRow el = Rules.Elements().At(id);
+            if (ranks[id] >= el.Int("max_level")) { return Gateway.Err("该五行已满级"); }
+            long need = (long)el.Int("xp_base") + (long)el.Int("xp_step") * ranks[id];
             long amount = need - xp[id];
             if (amount > s.row.wuxingPool) { amount = s.row.wuxingPool; }
             if (amount <= 0) { return Gateway.Err("经验池为空，先去挂机积累"); }
@@ -464,18 +548,25 @@ class Play {
         } else if (act == "up") {
             int id = m.Int("id", -1);
             if (id < 0 || id > 4) { return Gateway.Err("五行编号不合法"); }
-            if (ranks[id] >= WX_MAX) { return Gateway.Err("该五行已满级"); }
-            long need = (long)WX_XP_BASE + WX_XP_STEP * ranks[id];
+            ZanWeb.RuleRow el = Rules.Elements().At(id);
+            if (ranks[id] >= el.Int("max_level")) { return Gateway.Err("该五行已满级"); }
+            long need = (long)el.Int("xp_base") + (long)el.Int("xp_step") * ranks[id];
             if (xp[id] < need) { return Gateway.Err("经验不足，先注入"); }
-            long cost = 800 + (long)ranks[id] * 400;
-            long yuanCost = ranks[id] / 2;
-            if (s.row.gold < cost) {
-                return Gateway.Err("突破需要 " + Convert.ToString(cost) + " 金币");
-            }
+            long ironCost = (long)el.Int("upgrade_iron")
+                + (long)el.Int("upgrade_iron_step") * ranks[id];
+            long yuanCost = (long)el.Int("upgrade_yuan")
+                + (long)el.Int("upgrade_yuan_step") * ranks[id];
             if (s.row.gems < yuanCost) {
                 return Gateway.Err("突破需要 " + Convert.ToString(yuanCost) + " 元宝");
             }
-            s.row.gold = s.row.gold - cost;
+            if (ironCost > 0) {
+                ZanWeb.Model.Game.Item iron = Fight.ByName("黑铁矿石");
+                if (iron == null) { return Gateway.Err("黑铁矿石不存在"); }
+                if (!Fight.BagTake(s, iron.id, (int)ironCost)) {
+                    return Gateway.Err("背包里没有 "
+                        + Convert.ToString(ironCost) + " 个黑铁矿石");
+                }
+            }
             s.row.gems = s.row.gems - yuanCost;
             xp[id] = xp[id] - need;
             ranks[id] = ranks[id] + 1;
@@ -489,13 +580,18 @@ class Play {
         return r;
     }
 
-    /* 打怪入池：Fight.OnKill 每击 +1（Play.WxGain）。 */
+    /* 打怪入池：Fight.OnKill 按 element_xp_per_second 调用（Play.WxGain）。 */
     static void WxGain(Session s) {
-        if (s.row.wuxingPool < WX_POOL_CAP) { s.row.wuxingPool = s.row.wuxingPool + 1; }
-        s.dirty = true;
+        long cap = Rules.Long("element_pool_cap");
+        long step = Rules.Long("element_xp_per_second");
+        if (s.row.wuxingPool + step > cap) { step = cap - s.row.wuxingPool; }
+        if (step > 0) {
+            s.row.wuxingPool = s.row.wuxingPool + step;
+            s.dirty = true;
+        }
     }
 
-    /* 祭坛增益是否生效（Fight.OnKill 结算经验/金币 ×1.1）。 */
+    /* 祭坛增益是否生效（Fight.OnKill 经验/金币按 altar_buff_mult_pct 放大）。 */
     static bool AltarBuffed(Session s) {
         return s.row.altarBuffUntil > WebApp.NowSeconds();
     }
@@ -539,25 +635,30 @@ class Play {
     static JsonValue WuxingState(Session s, int[] ranks, long[] xp) {
         JsonValue o = JsonValue.NewObject();
         o.Set("pool", JsonValue.NewNum(Convert.ToString(s.row.wuxingPool)));
-        o.Set("poolCap", JsonValue.NewNum(Convert.ToString(WX_POOL_CAP)));
+        o.Set("poolCap", JsonValue.NewNum(Convert.ToString(
+            Rules.Val("element_pool_cap"))));
         JsonValue arr = JsonValue.NewArray();
-        string[] names = new string[] { "金", "木", "水", "火", "土" };
         for (int i = 0; i < 5; i = i + 1) {
+            ZanWeb.RuleRow el = Rules.Elements().At(i);
             JsonValue e = JsonValue.NewObject();
             e.Set("id", JsonValue.NewNum(Convert.ToString(i)));
-            e.Set("name", JsonValue.NewStr(names[i]));
+            e.Set("name", JsonValue.NewStr(el.Text("name")));
             e.Set("rank", JsonValue.NewNum(Convert.ToString(ranks[i])));
             e.Set("xp", JsonValue.NewNum(Convert.ToString(xp[i])));
             e.Set("need", JsonValue.NewNum(Convert.ToString(
-                WX_XP_BASE + WX_XP_STEP * ranks[i])));
+                el.Int("xp_base") + el.Int("xp_step") * ranks[i])));
+            e.Set("cap", JsonValue.NewNum(Convert.ToString(el.Int("max_level"))));
             arr.Append(e);
         }
         o.Set("rows", arr);
         return o;
     }
 
-    /* mentor 师徒：{"master":"名"}=拜师；{"take":1}=出师（等级≥30 且
-       有师父）。徒弟列表见师傅视角：本进程内按 masterName 反查。 */
+    /* mentor 师徒：{"master":"名"}=拜师（徒弟 ≤ mentor_apprentice_max_level、
+       师傅等级更高且转数 ≥ mentor_master_rebirth、门下弟子未满）；
+       {"take":1}=出师（等级 ≥ mentor_take_level）：徒弟得
+       mentor_take_gold/mentor_take_xp，师傅得 mentor_take_reputation 声望
+       （在线走内存，离线直接落库）。 */
     static async JsonValue Mentor(Session s, JsonValue m, long now) {
         /* masterName 老库可能为 NULL（SelfJson 同款判空）：Length 直探
            会打崩整个 op，先归一成空串再走业务。 */
@@ -568,6 +669,10 @@ class Play {
                 return Gateway.Err("你已有师父：" + s.row.masterName);
             }
             if (name == s.row.nickname) { return Gateway.Err("不能拜自己为师"); }
+            if (s.row.level > Rules.Val("mentor_apprentice_max_level")) {
+                return Gateway.Err("拜师需不超过 "
+                    + Convert.ToString(Rules.Val("mentor_apprentice_max_level")) + " 级");
+            }
             IDbConnection db = await Gateway.Db();
             if (db == null) { return Gateway.Err("数据库不可用，请稍后再试"); }
             try {
@@ -579,6 +684,12 @@ class Play {
                 if (master.level <= s.row.level) {
                     return Gateway.Err("对方等级不比你高，不能拜师");
                 }
+                int apprentices = await db.Select<ZanWeb.Model.Game.Player>()
+                    .Where(a => a.masterName == master.nickname
+                        && a.realmId == s.realmId).CountAsync();
+                if (apprentices >= Rules.Val("mentor_max_apprentices")) {
+                    return Gateway.Err("对方门下弟子已满");
+                }
                 s.row.masterName = name;
                 s.dirty = true;
             } finally {
@@ -587,70 +698,108 @@ class Play {
         }
         if (m.Int("take", 0) == 1) {
             if (s.row.masterName.Length == 0) { return Gateway.Err("你还没有师父"); }
-            if (s.row.level < 30) { return Gateway.Err("出师需 30 级"); }
-            s.row.masterName = "";
-            s.row.gold = s.row.gold + 2000;
-            s.row.exp = s.row.exp + 3000;
-            s.dirty = true;
+            int takeLevel = Rules.Val("mentor_take_level");
+            if (s.row.level < takeLevel) {
+                return Gateway.Err("出师需 " + Convert.ToString(takeLevel) + " 级");
+            }
+            IDbConnection db = await Gateway.Db();
+            if (db == null) { return Gateway.Err("数据库不可用，请稍后再试"); }
+            try {
+                string masterName = s.row.masterName;
+                s.row.masterName = "";
+                s.row.gold = s.row.gold + Rules.Long("mentor_take_gold");
+                s.row.exp = s.row.exp + Rules.Long("mentor_take_xp");
+                s.dirty = true;
+                ZanWeb.Model.Game.Player master = await db
+                    .Select<ZanWeb.Model.Game.Player>()
+                    .Where(a => a.nickname == masterName && a.realmId == s.realmId)
+                    .FirstAsync();
+                if (master != null) {
+                    Session online = World.ByChar(master.id);
+                    if (online != null) {
+                        online.row.reputation = online.row.reputation
+                            + Rules.Long("mentor_take_reputation");
+                        online.dirty = true;
+                    } else {
+                        int _u = await db.Update<ZanWeb.Model.Game.Player>()
+                            .SetIncr(a => a.reputation,
+                                Rules.Long("mentor_take_reputation"))
+                            .Where(a => a.id == master.id)
+                            .ExecuteAffrowsAsync();
+                    }
+                }
+            } finally {
+                Gateway.Give(db);
+            }
         }
         JsonValue r = Gateway.Ok();
         JsonValue o = JsonValue.NewObject();
         o.Set("master", JsonValue.NewStr(s.row.masterName));
         o.Set("canTake", JsonValue.NewNum(
-            s.row.masterName.Length > 0 && s.row.level >= 30 ? "1" : "0"));
+            s.row.masterName.Length > 0
+                && s.row.level >= Rules.Val("mentor_take_level") ? "1" : "0"));
         r.Set("mentor", o);
         Gateway.SelfInto(r, s);
         return r;
     }
 
-    /* altar 祭坛：{"do":"gold"|"yuan"|"large"|"iron"} 捐献；
-       {"do":"claim"} 领个人奖励。捐献+Buff 到期前打怪 ×1.1。 */
+    /* altar 祭坛：{"do":"gold"|"yuan"|"large"|"iron"} 捐献（费用/点数/
+       次数全读 balance.csv）；{"do":"claim"} 领个人奖励（金币+元宝+声望）。
+       捐献+Buff 到期前打怪按 altar_buff_mult_pct 放大（Fight.OnKill）。 */
     static JsonValue Altar(Session s, JsonValue m, long now) {
         Play.DailyReset(s, now);
         string act = m.Str("do", "");
         if (act.Length > 0 && act != "claim") {
             long points = 0;
             if (act == "gold") {
-                if (s.row.gold < ALTAR_GOLD_COST) { return Gateway.Err("金币不够"); }
-                s.row.gold = s.row.gold - ALTAR_GOLD_COST;
-                points = ALTAR_GOLD_GAIN;
+                long cost = Rules.Long("altar_gold_cost");
+                if (s.row.gold < cost) { return Gateway.Err("金币不够"); }
+                s.row.gold = s.row.gold - cost;
+                points = Rules.Val("altar_gold_gain");
             } else if (act == "yuan") {
-                if (s.row.gems < ALTAR_YUAN_COST) { return Gateway.Err("元宝不够"); }
-                s.row.gems = s.row.gems - ALTAR_YUAN_COST;
-                points = ALTAR_YUAN_GAIN;
+                long cost = Rules.Long("altar_yuan_cost");
+                if (s.row.gems < cost) { return Gateway.Err("元宝不够"); }
+                s.row.gems = s.row.gems - cost;
+                points = Rules.Val("altar_yuan_gain");
             } else if (act == "large") {
-                if (s.row.gems < ALTAR_YUAN_LARGE_COST) { return Gateway.Err("元宝不够"); }
-                s.row.gems = s.row.gems - ALTAR_YUAN_LARGE_COST;
-                points = ALTAR_YUAN_LARGE_GAIN;
+                long cost = Rules.Long("altar_yuan_large_cost");
+                if (s.row.gems < cost) { return Gateway.Err("元宝不够"); }
+                s.row.gems = s.row.gems - cost;
+                points = Rules.Val("altar_yuan_large_gain");
             } else if (act == "iron") {
+                long cost = Rules.Long("altar_iron_cost");
                 ZanWeb.Model.Game.Item iron = Fight.ByName("黑铁矿石");
                 if (iron == null) { return Gateway.Err("黑铁矿石不存在"); }
-                if (!Fight.BagTake(s, iron.id, ALTAR_IRON_COST)) {
-                    return Gateway.Err("背包里没有 " + Convert.ToString(ALTAR_IRON_COST) + " 个黑铁矿石");
+                if (!Fight.BagTake(s, iron.id, (int)cost)) {
+                    return Gateway.Err("背包里没有 " + Convert.ToString(cost)
+                        + " 个黑铁矿石");
                 }
-                points = ALTAR_IRON_GAIN;
+                points = Rules.Val("altar_iron_gain");
             } else {
                 return Gateway.Err("未知捐献类型");
             }
             s.row.altarPersonal = s.row.altarPersonal + points;
             s.row.altarDonations = s.row.altarDonations + 1;
-            s.row.altarBuffUntil = now + ALTAR_BUFF_SECONDS;
+            s.row.altarBuffUntil = now + Rules.Val("altar_buff_seconds");
             s.dirty = true;
         }
         if (act == "claim") {
-            if (s.row.altarPersonal < ALTAR_PERSONAL_CAP) {
-                return Gateway.Err("个人进度未到领取线（"
-                    + Convert.ToString(ALTAR_PERSONAL_CAP) + "）");
+            long cap = Rules.Long("altar_personal_cap");
+            if (s.row.altarPersonal < cap) {
+                return Gateway.Err("个人进度未到领取线（" + Convert.ToString(cap) + "）");
             }
-            s.row.altarPersonal = s.row.altarPersonal - ALTAR_PERSONAL_CAP;
-            s.row.gold = s.row.gold + ALTAR_PERSONAL_REWARD_GOLD;
-            s.row.gems = s.row.gems + ALTAR_PERSONAL_REWARD_YUAN;
+            s.row.altarPersonal = s.row.altarPersonal - cap;
+            s.row.gold = s.row.gold + Rules.Long("altar_personal_reward_gold");
+            s.row.gems = s.row.gems + Rules.Long("altar_personal_reward_yuan");
+            s.row.reputation = s.row.reputation
+                + Rules.Long("altar_personal_reward_reputation");
             s.dirty = true;
         }
         JsonValue r = Gateway.Ok();
         JsonValue o = JsonValue.NewObject();
         o.Set("personal", JsonValue.NewNum(Convert.ToString(s.row.altarPersonal)));
-        o.Set("cap", JsonValue.NewNum(Convert.ToString(ALTAR_PERSONAL_CAP)));
+        o.Set("cap", JsonValue.NewNum(Convert.ToString(
+            Rules.Val("altar_personal_cap"))));
         o.Set("donations", JsonValue.NewNum(Convert.ToString(s.row.altarDonations)));
         long buffLeft = s.row.altarBuffUntil - now;
         o.Set("buff", JsonValue.NewNum(Convert.ToString(buffLeft > 0 ? buffLeft : 0)));
@@ -659,14 +808,15 @@ class Play {
         return r;
     }
 
-    /* stars 将星图谱：全 BOSS 清单（bosses 同源），带点亮状态（该图
-       BOSS 已被本角色击败过，BossFight 胜利时点亮）。 */
+    /* stars 将星图谱：全部 BOSS 清单（boss 名与图行同源），带点亮状态
+       （该图 BOSS 已被本角色击败过，BossFight 胜利时点亮）。BOSS 图
+       35 张，long 位图按 bit=mapId-1 装。 */
     static JsonValue Stars(Session s, long now) {
         JsonValue arr = JsonValue.NewArray();
         for (int i = 0; i < Fight.mobs.Count; i = i + 1) {
             ZanWeb.Model.Game.Mob t = Fight.mobs[i];
             if (t == null || t.count != 1 || t.status != 1) { continue; }
-            int bit = 1 << (t.mapId - 1);
+            long bit = (long)1 << (t.mapId - 1);
             JsonValue o = JsonValue.NewObject();
             o.Set("name", JsonValue.NewStr(t.name));
             o.Set("level", JsonValue.NewNum(Convert.ToString(t.level)));
@@ -681,15 +831,16 @@ class Play {
 
     /* BossFight 胜利后点亮图谱位（Fight 调用）。 */
     static void LightStar(Session s, int mapId) {
-        int bit = 1 << (mapId - 1);
+        long bit = (long)1 << (mapId - 1);
         if ((s.row.starsLit & bit) == 0) {
             s.row.starsLit = s.row.starsLit | bit;
             s.dirty = true;
         }
     }
 
-    /* redpack 发红包：{"gold":N} 发一个全服红包（金币入奖池）；
-       {"grab":1} 抢一次（每红包每人一次）。进程内运营，重启清空。 */
+    /* redpack 发红包：{"send":N} 发一个全服元宝红包（N 在
+       redpack_min_yuan/max_yuan 之间）；{"grab":1} 抢一次（每红包每人
+       一次，抢到 pool×redpack_share_pct）。进程内运营，重启清空。 */
     static long rpPool = 0;
     static string rpFrom = "";
     static List<string> rpTaken = new List<string>();
@@ -697,18 +848,20 @@ class Play {
     static JsonValue Redpack(Session s, JsonValue m, long now) {
         if (m.Int("send", 0) > 0) {
             long amount = m.Int("send", 0);
-            if (amount < 100 || amount > 100000) {
-                return Gateway.Err("红包金额需 100-100000 金币");
+            if (amount < Rules.Val("redpack_min_yuan")
+                    || amount > Rules.Val("redpack_max_yuan")) {
+                return Gateway.Err("红包金额需 " + Convert.ToString(Rules.Val("redpack_min_yuan"))
+                    + "-" + Convert.ToString(Rules.Val("redpack_max_yuan")) + " 元宝");
             }
-            if (s.row.gold < amount) { return Gateway.Err("金币不够"); }
-            s.row.gold = s.row.gold - amount;
+            if (s.row.gems < amount) { return Gateway.Err("元宝不够"); }
+            s.row.gems = s.row.gems - amount;
             Play.rpPool = Play.rpPool + amount;
             Play.rpFrom = s.row.nickname;
             Play.rpTaken.Clear();
             s.dirty = true;
             Gateway.AnnounceAll("红包雨",
                 s.row.nickname + " 发出 " + Convert.ToString(amount)
-                + " 金币红包，全服可抢！");
+                + " 元宝红包，全服可抢！");
         }
         JsonValue r = Gateway.Ok();
         JsonValue o = JsonValue.NewObject();
@@ -721,12 +874,12 @@ class Play {
                     return Gateway.Err("你已经抢过这个红包了");
                 }
             }
-            long grab = Play.rpPool / 2;
-            if (grab < 1) { grab = Play.rpPool; }
+            long grab = Play.rpPool * Rules.Val("redpack_share_pct") / 100;
+            if (grab < 1) { grab = 1; }
             if (grab > Play.rpPool) { grab = Play.rpPool; }
             Play.rpPool = Play.rpPool - grab;
             Play.rpTaken.Add(s.row.nickname);
-            s.row.gold = s.row.gold + grab;
+            s.row.gems = s.row.gems + grab;
             s.dirty = true;
             o.Set("grab", JsonValue.NewNum(Convert.ToString(grab)));
         }
@@ -737,8 +890,10 @@ class Play {
         return r;
     }
 
-    /* market 交易市场：{}=列表；{"sellItem":id,"count":N,"price":P}=上架；
-       {"buy":rowId}=购买；{"cancel":rowId}=下架。 */
+    /* market 交易市场：{}=列表；{"sellItem":id,"count":N,"price":P}=上架
+       （价格 ≥ market_min_price）；{"buy":rowId}=购买；{"cancel":rowId}
+       =下架。购买走条件更新抢占（sellerId 原值改写为买家，RULES.md §五：
+       修旧服「同一挂单被两人同时买走」的双花），手续费 market_fee_pct。 */
     static async JsonValue Market(Session s, JsonValue m) {
         IDbConnection db = await Gateway.Db();
         if (db == null) { return Gateway.Err("数据库不可用，请稍后再试"); }
@@ -748,11 +903,13 @@ class Play {
                 int count = m.Int("count", 1);
                 long price = m.Int("price", 0);
                 if (count < 1) { count = 1; }
-                if (price < 1) { return Gateway.Err("价格需大于 0"); }
+                if (price < Rules.Val("market_min_price")) {
+                    return Gateway.Err("价格需不低于 "
+                        + Convert.ToString(Rules.Val("market_min_price")));
+                }
                 if (!Fight.BagTake(s, itemId, count)) {
                     return Gateway.Err("背包里数量不够");
                 }
-                ZanWeb.Model.Game.Item it = Fight.ById(itemId);
                 ZanWeb.Model.Game.Market row = new ZanWeb.Model.Game.Market();
                 row.sellerId = s.row.id;
                 row.sellerName = s.row.nickname;
@@ -765,32 +922,41 @@ class Play {
                 s.dirty = true;
             }
             if (m.Int("buy", 0) > 0) {
+                int buyId = m.Int("buy", 0);
                 ZanWeb.Model.Game.Market row = await db
                     .Select<ZanWeb.Model.Game.Market>()
-                    .Where(a => a.id == m.Int("buy", 0)).FirstAsync();
+                    .Where(a => a.id == buyId).FirstAsync();
                 if (row == null) { return Gateway.Err("这件商品已售出或下架"); }
                 if (row.sellerId == s.row.id) { return Gateway.Err("不能买自己的挂单"); }
                 if (s.row.gold < row.price) { return Gateway.Err("金币不够"); }
+                /* 抢占：只有还能把 sellerId 从原值改走的那个请求买断成功；
+                   并发的第二个请求 affected=0 → 明确报「刚被别人买走」。 */
+                int claimed = await db.Update<ZanWeb.Model.Game.Market>()
+                    .Set(a => a.sellerId, s.row.id)
+                    .Where(a => a.id == row.id && a.sellerId == row.sellerId)
+                    .ExecuteAffrowsAsync();
+                if (claimed <= 0) { return Gateway.Err("这件商品刚被别人买走"); }
                 s.row.gold = s.row.gold - row.price;
                 Fight.BagAdd(s, row.itemId, row.count);
                 s.dirty = true;
-                /* 卖家离线也成立：金币直接记他角色行。 */
+                /* 卖家得价扣手续费；离线也成立：直接记他角色行。 */
+                long payout = row.price * (100 - Rules.Val("market_fee_pct")) / 100;
                 ZanWeb.Model.Game.Player seller = await db
                     .Select<ZanWeb.Model.Game.Player>()
                     .Where(a => a.id == row.sellerId).FirstAsync();
                 if (seller != null) {
                     Session online = World.ByChar(seller.id);
                     if (online != null) {
-                        online.row.gold = online.row.gold + row.price;
+                        online.row.gold = online.row.gold + payout;
                         online.dirty = true;
                     } else {
-                        seller.gold = seller.gold + row.price;
                         int _u = await db.Update<ZanWeb.Model.Game.Player>()
-                            .Set(a => a.gold, seller.gold)
-                            .Where(a => a.id == seller.id).ExecuteAffrowsAsync();
+                            .SetIncr(a => a.gold, payout)
+                            .Where(a => a.id == seller.id)
+                            .ExecuteAffrowsAsync();
                     }
                 }
-                await db.Delete<ZanWeb.Model.Game.Market>()
+                int _d = await db.Delete<ZanWeb.Model.Game.Market>()
                     .Where(a => a.id == row.id).ExecuteAffrowsAsync();
             }
             if (m.Int("cancel", 0) > 0) {
@@ -830,12 +996,12 @@ class Play {
         }
     }
 
-    /* codex 图鉴明细：kind=items/mobs，page 从 0。 */
+    /* codex 图鉴明细：kind=items/mobs，page 从 0，每页 codex_page_size。 */
     static JsonValue CodexPage(JsonValue m) {
         string kind = m.Str("kind", "items");
         int page = m.Int("page", 0);
         if (page < 0) { page = 0; }
-        int per = 20;
+        int per = Rules.Val("codex_page_size");
         JsonValue arr = JsonValue.NewArray();
         if (kind == "mobs") {
             int total = Fight.mobs.Count;
@@ -882,27 +1048,120 @@ class Play {
         return r2;
     }
 
-    /* title 称谓：{}=面板（当前称谓+已解锁+可解锁清单）；
-       {"unlock":"名"}=花声望解锁；{"wear":"名"}=佩戴。 */
-    static JsonValue Title(Session s, JsonValue m) {
-        string[] names = new string[] { "初出茅庐", "小有名气", "名震一方", "威震天下", "传奇战神" };
-        int[] need = new int[] { 0, 100, 500, 2000, 10000 };
+    /* ---- 称谓：原版事实表 GameTitle（data/M2.DB，251 行，只读）---- */
+
+    static List<TitleDef> titleDefs;
+    static bool titleTried;
+
+    /* GameTitle 只读快照：种子库是纯数据文件，独立单连接懒加载一次。
+       NULL 读作 0（快照列全 TEXT，空串按 0）。 */
+    static async bool LoadTitles() {
+        if (Play.titleTried) { return Play.titleDefs != null && Play.titleDefs.Count > 0; }
+        Play.titleTried = true;
+        DbPool pool = SqliteConnector.Pool("data/M2.DB", 1);
+        IDbConnection db = await pool.AcquireAsync();
+        if (db == null) { return false; }
+        try {
+            DbResult rows = await db.QueryAsync(
+                "select * from gametitle order by cast(id as integer)");
+            List<TitleDef> v = new List<TitleDef>();
+            for (int i = 0; i < rows.RowCount(); i = i + 1) {
+                TitleDef t = new TitleDef();
+                t.id = Play.ShotInt(rows, i, "id");
+                t.name = rows.GetByName(i, "name");
+                t.lvl = Play.ShotInt(rows, i, "lvl");
+                t.money = Play.ShotLong(rows, i, "money");
+                t.rep = Play.ShotLong(rows, i, "rep");
+                t.met = Play.ShotInt(rows, i, "met");
+                t.a1 = Play.ShotLong(rows, i, "a1");
+                t.a2 = Play.ShotLong(rows, i, "a2");
+                t.b1 = Play.ShotLong(rows, i, "b1");
+                t.b2 = Play.ShotLong(rows, i, "b2");
+                t.c1 = Play.ShotLong(rows, i, "c1");
+                t.c2 = Play.ShotLong(rows, i, "c2");
+                t.d1 = Play.ShotLong(rows, i, "d1");
+                t.d2 = Play.ShotLong(rows, i, "d2");
+                t.e1 = Play.ShotLong(rows, i, "e1");
+                t.e2 = Play.ShotLong(rows, i, "e2");
+                v.Add(t);
+            }
+            Play.titleDefs = v;
+        } finally {
+            pool.Release(db);
+        }
+        return Play.titleDefs != null && Play.titleDefs.Count > 0;
+    }
+
+    static int ShotInt(DbResult rows, int row, string col) {
+        string v = rows.GetByName(row, col);
+        if (v.Length == 0) { return 0; }
+        return Convert.ToInt(v);
+    }
+
+    static long ShotLong(DbResult rows, int row, string col) {
+        string v = rows.GetByName(row, col);
+        if (v.Length == 0) { return 0; }
+        return Convert.ToInt64(v);
+    }
+
+    static TitleDef TitleByName(string name) {
+        if (Play.titleDefs == null) { return null; }
+        for (int i = 0; i < Play.titleDefs.Count; i = i + 1) {
+            if (Play.titleDefs[i].name == name) { return Play.titleDefs[i]; }
+        }
+        return null;
+    }
+
+    static List<int> TitleIds(string csv) {
+        List<int> v = new List<int>();
+        if (csv == null || csv.Length == 0) { return v; }
+        List<string> parts = csv.Split(',');
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            string t = parts[i].Trim();
+            if (t.Length > 0) { v.Add(Convert.ToInt(t)); }
+        }
+        return v;
+    }
+
+    static bool TitleOwned(string csv, int id) {
+        List<int> v = Play.TitleIds(csv);
+        return v.Contains(id);
+    }
+
+    static string TitleIdsJoin(List<int> v) {
+        string t = "";
+        for (int i = 0; i < v.Count; i = i + 1) {
+            t = t + (i > 0 ? "," : "") + Convert.ToString(v[i]);
+        }
+        return t;
+    }
+
+    /* title 称谓：{}=面板（12 行/页，原版称谓表分页）；{"page":N}=翻页；
+       {"unlock":"名"}=解锁（声望 rep×title_unlock_rep_pct% + 金币 money，
+       RULES.md 裁决 #8）；{"wear":"名"}=佩戴（"无"=摘下）。
+       rows 字段与客户端 TitleRow 同构：fame/gold/rebirth/level/atk…mdef。 */
+    static async JsonValue Title(Session s, JsonValue m) {
+        if (!await Play.LoadTitles()) {
+            return Gateway.Err("称谓数据未就绪");
+        }
         if (m.Str("unlock", "").Length > 0) {
             string want = m.Str("unlock", "").Trim();
-            int at = -1;
-            for (int i = 0; i < names.Length; i = i + 1) {
-                if (names[i] == want) { at = i; break; }
-            }
-            if (at < 0) { return Gateway.Err("没有这个称谓"); }
-            List<string> owned = Play.TitleList(s.row.titlesUnlocked);
-            if (!owned.Contains(want)) {
-                int pts = need[at] * 10;
-                if (s.row.merit < pts) {
-                    return Gateway.Err("战功不够（需 " + Convert.ToString(pts) + "）");
+            TitleDef def = Play.TitleByName(want);
+            if (def == null) { return Gateway.Err("没有这个称谓"); }
+            if (!Play.TitleOwned(s.row.titlesUnlocked, def.id)) {
+                long repCost = def.rep * Rules.Val("title_unlock_rep_pct") / 100;
+                long goldCost = def.money;
+                if (s.row.reputation < repCost) {
+                    return Gateway.Err("声望不够（需 " + Convert.ToString(repCost) + "）");
                 }
-                s.row.merit = s.row.merit - pts;
-                owned.Add(want);
-                s.row.titlesUnlocked = Play.TitleJoin(owned);
+                if (s.row.gold < goldCost) {
+                    return Gateway.Err("金币不够（需 " + Convert.ToString(goldCost) + "）");
+                }
+                s.row.reputation = s.row.reputation - repCost;
+                s.row.gold = s.row.gold - goldCost;
+                List<int> owned = Play.TitleIds(s.row.titlesUnlocked);
+                owned.Add(def.id);
+                s.row.titlesUnlocked = Play.TitleIdsJoin(owned);
                 s.dirty = true;
             }
         }
@@ -910,45 +1169,68 @@ class Play {
             string want = m.Str("wear", "").Trim();
             if (want == "无") { want = ""; }
             if (want.Length > 0) {
-                List<string> owned = Play.TitleList(s.row.titlesUnlocked);
-                if (!owned.Contains(want)) { return Gateway.Err("先解锁这个称谓"); }
+                TitleDef def = Play.TitleByName(want);
+                if (def == null || !Play.TitleOwned(s.row.titlesUnlocked, def.id)) {
+                    return Gateway.Err("先解锁这个称谓");
+                }
             }
             s.row.title = want;
             s.dirty = true;
         }
-        List<string> mine = Play.TitleList(s.row.titlesUnlocked);
+        int per = Rules.Val("title_page_size");
+        int page = m.Int("page", 0);
+        if (page < 0) { page = 0; }
+        int total = Play.titleDefs.Count;
+        int pages = (total + per - 1) / per;
+        if (page >= pages && pages > 0) { page = pages - 1; }
         JsonValue arr = JsonValue.NewArray();
-        for (int i = 0; i < names.Length; i = i + 1) {
+        int from = page * per;
+        for (int i = from; i < total && i < from + per; i = i + 1) {
+            TitleDef t = Play.titleDefs[i];
             JsonValue o = JsonValue.NewObject();
-            o.Set("name", JsonValue.NewStr(names[i]));
-            o.Set("cost", JsonValue.NewNum(Convert.ToString(need[i] * 10)));
-            o.Set("owned", JsonValue.NewNum(mine.Contains(names[i]) ? "1" : "0"));
-            o.Set("worn", JsonValue.NewNum(s.row.title == names[i] ? "1" : "0"));
+            o.Set("id", JsonValue.NewNum(Convert.ToString(t.id)));
+            o.Set("name", JsonValue.NewStr(t.name));
+            o.Set("fame", JsonValue.NewNum(Convert.ToString(t.rep)));
+            o.Set("gold", JsonValue.NewNum(Convert.ToString(t.money)));
+            o.Set("rebirth", JsonValue.NewNum(Convert.ToString(t.met)));
+            o.Set("level", JsonValue.NewNum(Convert.ToString(t.lvl)));
+            o.Set("atkMin", JsonValue.NewNum(Convert.ToString(t.a1)));
+            o.Set("atkMax", JsonValue.NewNum(Convert.ToString(t.a2)));
+            o.Set("magMin", JsonValue.NewNum(Convert.ToString(t.b1)));
+            o.Set("magMax", JsonValue.NewNum(Convert.ToString(t.b2)));
+            o.Set("taoMin", JsonValue.NewNum(Convert.ToString(t.c1)));
+            o.Set("taoMax", JsonValue.NewNum(Convert.ToString(t.c2)));
+            o.Set("defMin", JsonValue.NewNum(Convert.ToString(t.d1)));
+            o.Set("defMax", JsonValue.NewNum(Convert.ToString(t.d2)));
+            o.Set("mdefMin", JsonValue.NewNum(Convert.ToString(t.e1)));
+            o.Set("mdefMax", JsonValue.NewNum(Convert.ToString(t.e2)));
+            o.Set("owned", JsonValue.NewNum(
+                Play.TitleOwned(s.row.titlesUnlocked, t.id) ? "1" : "0"));
+            o.Set("worn", JsonValue.NewNum(
+                s.row.title != null && s.row.title == t.name ? "1" : "0"));
             arr.Append(o);
         }
         JsonValue r = Gateway.Ok();
         r.Set("rows", arr);
+        r.Set("page", JsonValue.NewNum(Convert.ToString(page)));
+        r.Set("pages", JsonValue.NewNum(Convert.ToString(pages)));
+        r.Set("total", JsonValue.NewNum(Convert.ToString(total)));
         r.Set("pts", JsonValue.NewNum(Convert.ToString(s.row.merit)));
+        r.Set("fame", JsonValue.NewNum(Convert.ToString(s.row.reputation)));
         Gateway.SelfInto(r, s);
         return r;
     }
+}
 
-    static List<string> TitleList(string csv) {
-        List<string> v = new List<string>();
-        if (csv == null || csv.Length == 0) { return v; }
-        List<string> parts = csv.Split(',');
-        for (int i = 0; i < parts.Count; i = i + 1) {
-            string t = parts[i].Trim();
-            if (t.Length > 0) { v.Add(t); }
-        }
-        return v;
-    }
-
-    static string TitleJoin(List<string> v) {
-        string t = "";
-        for (int i = 0; i < v.Count; i = i + 1) {
-            t = t + (i > 0 ? "," : "") + v[i];
-        }
-        return t;
-    }
+/* 一行称谓：列即快照小写原始字段。展示对（攻/魔/道/防/魔防）是
+   (a1|0, a2) … (e1|0, e2)，与客户端 PageTitle 硬编码 12 行逐行同构。 */
+class TitleDef {
+    int id;
+    string name;
+    int lvl;
+    long money;
+    long rep;
+    int met;
+    long a1; long a2; long b1; long b2; long c1; long c2;
+    long d1; long d2; long e1; long e2;
 }

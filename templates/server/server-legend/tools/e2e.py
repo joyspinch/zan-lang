@@ -12,7 +12,7 @@ back on it), death respawn in town, GM item gift (online push + offline
 grant), GM level change clamping hp, full-hp potion refusal, and DB
 persistence of hp/exp/equipped weapon/bag, plus the HTTP-session push
 channel flow: attach, relogin kick, zero-delay re-attach after kick
-(register-before-kick regression), GM broadcast delivery -- 125
+(register-before-kick regression), GM broadcast delivery -- 138
 assertions. Stdlib urllib/socket only.
 
 Run from the SERVER directory against a FRESH data/app.db:
@@ -554,8 +554,17 @@ st, j, _ = gm("/admin/game/players/save", {
     "accountStatus": "1", "banReason": ""}, cookie)
 ok(j.get("code") == "0000", "GM raises hunter to level 8")
 h.send({"op": "state"})
-r = h.reply_for(lambda m: m.get("ev") == "state" or "self" in m)
-ok(r is not None and r["self"]["level"] == 8 and r["self"]["maxhp"] == 300,
+# GM 存盘在线角色会推两条 state（Adjust 钱币差量一条 + ApplyEdit 等级一条，
+# 前者还带着旧等级快照），排空队列取到 level==8 的那条再验曲线。
+r = None
+while True:
+    m = h.reply_for(lambda m: m.get("ev") == "state" or "self" in m, timeout=2)
+    if m is None:
+        break
+    if m.get("self", {}).get("level") == 8:
+        r = m
+        break
+ok(r is not None and r["self"]["maxhp"] == 300,
    "level 8 warrior maxhp follows 140+20L curve")
 killed = False
 for _ in range(30):
