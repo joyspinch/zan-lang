@@ -299,7 +299,11 @@ Difficulty is for **CLI/compute** first; GUI is a separate, larger effort on eac
   Click all land in the shell log.
 - **Host contracts** (any wasm-on-worker embed): seed resize + layout-attach
   events *before* `_start` or the first poll sees a 0x0 window and the run
-  loop quits silently; a synchronous run loop occupies the worker until exit,
+  loop quits silently — and seed the **logical** size (`windowWidth x
+  windowHeight`, same coordinate system as the H5 harness): physical pixels
+  shrink every logically-sized widget to 1/DPR on a phone screen, with
+  touch coordinates and present size following the same logical space;
+ a synchronous run loop occupies the worker until exit,
   so runtime-posted input is only serviced between tasks — interactive test
   events ride the pre-start queue. `Atomics.wait` on a non-shared buffer
   throws (no cross-origin isolation in the sim), so pacing falls back to a

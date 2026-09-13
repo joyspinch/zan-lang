@@ -701,6 +701,10 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
   layout-attach(kind 14) 排进事件队列——wasm 第一次 poll 看不到画布尺寸
   就按 0×0 窗口直接退出（零输出、无报错，像"链接失败"其实是种子丢失）。
   种子还必须在 worker 创建**之后**发（早于 worker 存在的 sendEv 静默吞掉）。
+  种子尺寸给**逻辑分辨率**（windowWidth×windowHeight，与 H5 harness 同一
+  坐标系），给物理分辨率会让全部按逻辑尺寸写的控件缩成 1/DPR（手机 3x 屏
+  上按钮只有 7% 宽）；触控坐标、present 尺寸同步用逻辑系，画布由模拟器
+  上采样。
 - **worker 消息只在任务间被服务**：同步 runloop（`_start` 内 busy-park）
   占住 worker 直到退出，运行期 postMessage 的触摸/事件全部滞留到 exit 才
   冲洗。交互验证不能"运行中发事件"，要把 press/release 与种子一起排在
