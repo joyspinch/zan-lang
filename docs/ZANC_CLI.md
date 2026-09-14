@@ -94,7 +94,7 @@ build/zanc probe.zan --auto-stdlib --time              # 各阶段耗时
 | `-O0..-O3/-Os/-Oz` | 优化档；默认 O0，--publish 默认 Os；-Oz 极限体积（边缘/嵌入式） |
 | `-g, --debug` | DWARF 调试信息（强制 O0；自动开 --check-leaks/--arc-guard） |
 | `--icon <f.ico>` / `--no-icon` | 嵌入/跳过 Windows 图标 |
-| `--embed <p[=n]>` | 把文件/目录烤进可执行资源（可重复） |
+| `--embed <p[=n]>` | 把文件/目录烤进可执行资源（可重复）；GUI 程序自带 `skins/` 暂存时，仅当目录内含 base.css（完整替身）才跳过 stdlib 皮肤基线自动内嵌，pack-only 暂存照常内嵌基线且暂存包赢重名 |
 | `--emit-apk` | （未列入 help）Android APK 全链路打包；配 `--apk-package`/`--apk-label` |
 
 ### 标准库与包

@@ -275,9 +275,14 @@ golden/audit/Inert 名单同步 → 提交 `gui-web(Pn): 主题`。
   这里不模拟；oracle 侧用 `--hide-scrollbars` 对齐（headless 无占位
   滚动条）。水平轴只裁剪不滚动（overflow-x 的 auto/scroll 当 hidden
   用，台账）。
-- **滚轮仲裁沿用 CaptureWheel（P6）**：渲染期认领、所有权 = 上一帧
-  末认领者——嵌套滚动时最内层最后认领而赢，指针不在滚动区时落回
-  页面滚动。overflow:hidden 的容器不可用户滚动（无滚轮/无滚动条）
+- **滚轮仲裁沿用 CaptureWheel（P6，2026-09-14 升两段式）**：第一段
+  渲染期认领、所有权 = 上一帧末认领者——嵌套滚动时最内层最后认领
+  而赢，指针不在滚动区时落回页面滚动；第二段消费回放——本帧有
+  认领却无人消费（指针刚跨入滚动区上一帧无人认领、owner=0，或
+  兄弟/嵌套切换致 owner 序过期）时，PresentFrame 把同一格滚轮经
+  InjectEvent 回灌队列，下一帧由已武装的正确声明者消费（首格一帧
+  延迟，不再静默丢失；armed 位保证每链至多回放一次不循环）。回归：
+  conformance_gui_wheel_route 四场景。overflow:hidden 的容器不可用户滚动（无滚轮/无滚动条）
   但可程序滚动（SetScrollTop，Chrome scrollTop 同语义）。
   overflow:scroll 的条带常驻（Chrome 桌面同款），auto 溢出才出。
 - **（P6 台账）无塌陷恢复**：Widget.ScrollView 的 offset 恢复机制
