@@ -1031,48 +1031,79 @@ static char lexer_escape_char(zan_lexer_t *lex) {
     (void)n;
 }
 
+/* Growable accumulator for string-literal bodies. The fixed 4 KiB stack
+ * buffers these paths used to sit on turned any larger literal into a hard
+ * compile error (GenForm EmitSetProp had to chunk its large data URIs around
+ * it); big literals are rare, so growth starts at one 4 KiB block and doubles
+ * from there. OOM degrades to a truncated literal plus a diagnostic -- the
+ * token stays terminated and lexing continues. */
+typedef struct {
+    char *buf;
+    size_t len;
+    size_t cap;
+    bool oom;
+} zan_lex_strbuf_t;
+
+static void zan_lex_strbuf_init(zan_lex_strbuf_t *sb) {
+    sb->cap = 4096;
+    sb->len = 0;
+    sb->buf = (char *)malloc(sb->cap);
+    sb->oom = sb->buf == NULL;
+}
+
+static void zan_lex_strbuf_push(zan_lex_strbuf_t *sb, char ch) {
+    if (sb->oom) return;
+    if (sb->len + 1 > sb->cap) {
+        size_t ncap = sb->cap * 2;
+        char *nbuf = (char *)realloc(sb->buf, ncap);
+        if (!nbuf) { sb->oom = true; return; }
+        sb->buf = nbuf;
+        sb->cap = ncap;
+    }
+    sb->buf[sb->len++] = ch;
+}
+
+/* Copy the accumulated body into the arena (empty literal -> ""). */
+static char *zan_lex_strbuf_take(zan_lexer_t *lex, zan_lex_strbuf_t *sb,
+                                 size_t *out_len) {
+    if (sb->oom) {
+        zan_diag_emit(lex->diag, DIAG_ERROR, lexer_loc(lex),
+                      "out of memory while lexing string literal");
+        *out_len = 0;
+        return zan_arena_strdup(lex->arena, "", 0);
+    }
+    *out_len = sb->len;
+    char *out = zan_arena_strdup(lex->arena, sb->buf, sb->len);
+    free(sb->buf);
+    sb->buf = NULL;
+    return out;
+}
+
 static zan_token_t lexer_string(zan_lexer_t *lex) {
     zan_loc_t loc = lexer_loc(lex);
     lexer_advance(lex); /* opening " */
 
-    /* collect into temporary buffer */
-    char buf[4096];
-    size_t bi = 0;
-    bool truncated = false;
+    zan_lex_strbuf_t sb;
+    zan_lex_strbuf_init(&sb);
 
     while (!lexer_at_end(lex) && lexer_peek_ch(lex) != '"') {
         if (lexer_peek_ch(lex) == '\\') {
             lexer_advance(lex); /* \ */
-            /* Always run the escape through the decoder, even when the
-             * buffer is full: it consumes the escaped characters, so skipping
-             * them on truncation would let a `\"` be re-read as the closing
-             * quote and desynchronize the lexer for the rest of the file. */
+            /* Always run the escape through the decoder, even on OOM: it
+             * consumes the escaped characters, so skipping them would let a
+             * `\"` be re-read as the closing quote and desynchronize the
+             * lexer for the rest of the file. */
             zan_esc_out_t esc;
             int en = lexer_escape_seq(lex, loc, &esc);
             for (int i = 0; i < en; i++) {
-                if (bi < sizeof(buf) - 1) {
-                    buf[bi++] = esc.bytes[i];
-                } else {
-                    truncated = true;
-                }
+                zan_lex_strbuf_push(&sb, esc.bytes[i]);
             }
         } else if (lexer_peek_ch(lex) == '\n') {
             zan_diag_emit(lex->diag, DIAG_ERROR, loc, "unterminated string literal");
             break;
         } else {
-            if (bi < sizeof(buf) - 1) {
-                buf[bi++] = lexer_advance(lex);
-            } else {
-                lexer_advance(lex);
-                truncated = true;
-            }
+            zan_lex_strbuf_push(&sb, lexer_advance(lex));
         }
-    }
-
-    if (truncated) {
-        zan_diag_emit(lex->diag, DIAG_ERROR, loc,
-                      "string literal exceeds %d characters and was truncated",
-                      (int)sizeof(buf) - 1);
     }
 
     if (!lexer_at_end(lex)) {
@@ -1081,8 +1112,10 @@ static zan_token_t lexer_string(zan_lexer_t *lex) {
         zan_diag_emit(lex->diag, DIAG_ERROR, loc, "unterminated string literal");
     }
 
+    size_t bi = 0;
+    char *text = zan_lex_strbuf_take(lex, &sb, &bi);
     zan_token_t tok = lexer_make(lex, TK_STRING_LIT, loc);
-    tok.str_val.str = zan_arena_strdup(lex->arena, buf, bi);
+    tok.str_val.str = text;
     tok.str_val.len = (uint32_t)bi;
     return tok;
 }
@@ -1125,42 +1158,26 @@ static zan_interp_level_t *lexer_interp_top(zan_lexer_t *lex) {
 
 static zan_token_t lexer_interp_string_segment(zan_lexer_t *lex, zan_token_kind_t start_kind) {
     zan_loc_t loc = lexer_loc(lex);
-    char buf[4096];
-    size_t bi = 0;
-    bool truncated = false;
+    zan_lex_strbuf_t sb;
+    zan_lex_strbuf_init(&sb);
 
     while (!lexer_at_end(lex) && lexer_peek_ch(lex) != '"' && lexer_peek_ch(lex) != '{') {
         if (lexer_peek_ch(lex) == '\\') {
             lexer_advance(lex); /* \ */
             /* Same desync guard as lexer_string: the escaped characters must
-             * be consumed even when the buffer is full, or a truncated `\"`
-             * ends the segment early and everything after is mistokenized. */
+             * be consumed even on OOM, or a truncated `\"` ends the segment
+             * early and everything after is mistokenized. */
             zan_esc_out_t esc;
             int en = lexer_escape_seq(lex, loc, &esc);
             for (int i = 0; i < en; i++) {
-                if (bi < sizeof(buf) - 1) {
-                    buf[bi++] = esc.bytes[i];
-                } else {
-                    truncated = true;
-                }
+                zan_lex_strbuf_push(&sb, esc.bytes[i]);
             }
         } else if (lexer_peek_ch(lex) == '\n') {
             zan_diag_emit(lex->diag, DIAG_ERROR, loc, "unterminated interpolated string");
             break;
         } else {
-            if (bi < sizeof(buf) - 1) {
-                buf[bi++] = lexer_advance(lex);
-            } else {
-                lexer_advance(lex);
-                truncated = true;
-            }
+            zan_lex_strbuf_push(&sb, lexer_advance(lex));
         }
-    }
-
-    if (truncated) {
-        zan_diag_emit(lex->diag, DIAG_ERROR, loc,
-                      "interpolated string segment exceeds %d characters and was truncated",
-                      (int)sizeof(buf) - 1);
     }
 
     zan_token_kind_t kind;
@@ -1188,8 +1205,10 @@ static zan_token_t lexer_interp_string_segment(zan_lexer_t *lex, zan_token_kind_
         kind = (start_kind == TK_INTERP_START) ? TK_STRING_LIT : TK_INTERP_END;
     }
 
+    size_t bi = 0;
+    char *text = zan_lex_strbuf_take(lex, &sb, &bi);
     zan_token_t tok = lexer_make(lex, kind, loc);
-    tok.str_val.str = zan_arena_strdup(lex->arena, buf, bi);
+    tok.str_val.str = text;
     tok.str_val.len = (uint32_t)bi;
     return tok;
 }
@@ -1223,9 +1242,8 @@ static zan_token_t lexer_verbatim_string(zan_lexer_t *lex) {
     lexer_advance(lex); /* @ */
     lexer_advance(lex); /* " */
 
-    char buf[4096];
-    size_t bi = 0;
-    bool truncated = false;
+    zan_lex_strbuf_t sb;
+    zan_lex_strbuf_init(&sb);
 
     while (!lexer_at_end(lex)) {
         if (lexer_peek_ch(lex) == '"') {
@@ -1233,30 +1251,20 @@ static zan_token_t lexer_verbatim_string(zan_lexer_t *lex) {
                 /* escaped quote "" → " */
                 lexer_advance(lex);
                 lexer_advance(lex);
-                if (bi < sizeof(buf) - 1) buf[bi++] = '"';
-                else truncated = true;
+                zan_lex_strbuf_push(&sb, '"');
             } else {
                 lexer_advance(lex); /* closing " */
                 break;
             }
         } else {
-            if (bi < sizeof(buf) - 1) {
-                buf[bi++] = lexer_advance(lex);
-            } else {
-                lexer_advance(lex);
-                truncated = true;
-            }
+            zan_lex_strbuf_push(&sb, lexer_advance(lex));
         }
     }
 
-    if (truncated) {
-        zan_diag_emit(lex->diag, DIAG_ERROR, loc,
-                      "verbatim string literal exceeds %d characters and was truncated",
-                      (int)sizeof(buf) - 1);
-    }
-
+    size_t bi = 0;
+    char *text = zan_lex_strbuf_take(lex, &sb, &bi);
     zan_token_t tok = lexer_make(lex, TK_STRING_LIT, loc);
-    tok.str_val.str = zan_arena_strdup(lex->arena, buf, bi);
+    tok.str_val.str = text;
     tok.str_val.len = (uint32_t)bi;
     return tok;
 }
