@@ -1907,6 +1907,8 @@ class ChartSeries {
                           //   绘制序键（zlevel*1000+z）
     int calIndex;         // series.calendarIndex（coordSys == "calendar" 的目标日历）
     int calCenter;        // calendar 坐标系下 pie.center 的日期（1970 起天序）；-1 = 未给
+    string matCX;         // matrix 坐标系下 pie.center 的 x 格名（"" = 未锚定）
+    string matCY;         // matrix 坐标系下 pie.center 的 y 格名
     string typeName;      // 原始 ECharts type 字符串（"effectScatter"/"graph"/
                           //   "candlestick"..."）。ChartType 是粗粒度归并
                           //   （effectScatter->Scatter、graph->Force），
@@ -2089,6 +2091,8 @@ class ChartSeries {
         s.coordSys = "";
         s.calIndex = 0;
         s.calCenter = 0 - 1;
+        s.matCX = "";
+        s.matCY = "";
         s.typeName = "";
         s.geoLines = new List<List<ChartPoint>>();
         s.gauge = GaugeOption.Create();
@@ -2555,6 +2559,8 @@ class ChartSeries {
         s.coordSys = src.coordSys;
         s.calIndex = src.calIndex;
         s.calCenter = src.calCenter;
+        s.matCX = src.matCX;
+        s.matCY = src.matCY;
         s.typeName = src.typeName;
         // N3 分级样式域（treemap/sunburst）：纯标量，与数据共享无关，
         // 必须在 shareData 早退前抄全，否则 Materialize 丢级样式。
@@ -4861,8 +4867,18 @@ class ChartOption {
         for (int i = 0; i < v.Count(); i = i + 1) {
             JsonValue lk = v.At(i);
             if (!lk.IsObject()) { continue; }
-            string from = lk.Str("source", lk.Str("from", ""));
-            string to = lk.Str("target", lk.Str("to", ""));
+            // 官方端点语义：数字 = 节点序号、串 = 名字/id。数字端点
+            // 此前被 Str() 丢成空串、整条边被弃（matrix-graph 全靠
+            // 序号连线），统一转成十进制串，渲染端按「纯数字 → 序
+            // 号，否则名字」解析。
+            JsonValue jf = lk.Get("source");
+            if (jf == null) { jf = lk.Get("from"); }
+            JsonValue jt = lk.Get("target");
+            if (jt == null) { jt = lk.Get("to"); }
+            string from = jf == null ? "" : (jf.IsNumber()
+                ? Convert.ToString(jf.AsInt(0)) : jf.AsString(""));
+            string to = jt == null ? "" : (jt.IsNumber()
+                ? Convert.ToString(jt.AsInt(0)) : jt.AsString(""));
             if (from.Length == 0 || to.Length == 0) { continue; }
             int val = lk.Int("value", lk.Int("val", 1));
             if (val < 0) { val = 0; }
@@ -6723,6 +6739,18 @@ class ChartOption {
                         }
                     }
                 }
+                // matrix 坐标系的 pie：center 是格名串 ["Grade 1",
+                // "Class 1"]（matrix-pie 一格一饼），渲染端解成格矩形
+                // 圆心（官方 dataToPoint = rect center）。
+                if (csys == "matrix" && cs.type == ChartType.Pie) {
+                    JsonValue mctr = s.Get("center");
+                    if (mctr != null && mctr.IsArray() && mctr.Count() >= 2) {
+                        cs.matCX = mctr.At(0).AsString("");
+                        cs.matCY = mctr.At(1).AsString("");
+                    } else if (mctr != null && mctr.IsString()) {
+                        cs.matCX = mctr.AsString("");
+                    }
+                }
                 if (cs.custom == "pictorialBar") {
                     JsonValue psm = s.Get("symbol");
                     if (psm != null && psm.IsString()) {
@@ -7253,6 +7281,12 @@ class ChartOption {
                                     md.heatY = myi;
                                     if (it.Count() >= 3
                                         && it.At(2).IsString()) { md.gap = true; }
+                                    // graph-on-matrix 的第 4 元是节点显示
+                                    // 名（matrix-graph 的课程名）。
+                                    if (it.Count() >= 4
+                                        && it.At(3).IsString()) {
+                                        md.labelText = it.At(3).AsString("");
+                                    }
                                     cs.data.Add(md);
                                 }
                                 continue;
@@ -7570,6 +7604,12 @@ class ChartOption {
                     }
                     JsonValue nds = s.Get("nodes");
                     if (nds == null || !nds.IsArray()) { nds = s.Get("data"); }
+                    if (cs.coordSys == "matrix") {
+                        // graph-on-matrix：节点即 data 项本身，已由矩阵
+                        // 三元组车道收进 data（heatX/heatY + labelText），
+                        // 这里再按 graph 节点收一遍会追加重复项。
+                        nds = null;
+                    }
                     if (nds != null && nds.IsArray()) {
                         for (int ni2 = 0; ni2 < nds.Count(); ni2 = ni2 + 1) {
                             JsonValue nit = nds.At(ni2);
@@ -7660,7 +7700,13 @@ class ChartOption {
                         // links 的别名（geo-graph 用 edges）。
                         glinks = s.Get("edges");
                     }
-                    if (glinks != null && glinks.IsArray()) {
+                    // matrix 坐标系不重建：matrix-graph 的节点是矩阵三
+                    // 元组（第 4 元显示名在 labelText，没有 name），上面
+                    // 的节点名表会全退化成 val 串、数字端点被改写成同一
+                    // 个名字；保留通用 ParseLinks 的原始端点（渲染端按
+                    // 「纯数字 = 序号，否则显示名」解析）。
+                    if (glinks != null && glinks.IsArray()
+                        && cs.coordSys != "matrix") {
                         cs.links = new List<ChartLink>();
                         ChartOption.ParseGraphLinks(glinks, cs.links,
                             gnames);
@@ -8545,6 +8591,14 @@ class ChartMatrixSpec {
     ChartBoxParam lRaw; ChartBoxParam tRaw;
     ChartBoxParam rRaw; ChartBoxParam bRaw;
 
+    bool xShow;         // x.show（false = 头带 0 宽，标签/线不画）
+    bool yShow;
+    ChartBoxParam xLevelSize; // x.levelSize：x 树层带沿 y 的厚度声明
+    ChartBoxParam yLevelSize; // y.levelSize：y 树层带沿 x 的宽度声明
+    List<ChartBoxParam> xSizes; // 逐格 size 声明（官方只有叶消费；null = 未声明）
+    List<ChartBoxParam> ySizes;
+    int xItemColor;     // x.itemStyle.color 头带填充（0 = none，官方缺省）
+    int yItemColor;
     List<string> xText; // 显示文本（label 覆盖 value；缺省自动名）
     List<int> xLevel;   // 树深（0 = 顶）
     List<int> xFirst;   // firstLeafLocator
@@ -8564,9 +8618,25 @@ class ChartMatrixSpec {
     List<int> qIdx;
     List<bool> qIsX;
 
+    // body.data：体区合并格文本（官方 {value, coord}，coord 数字 =
+    // 叶序号、串 = 格名、[a,b] = 跨度；渲染端画在合并域中心）。
+    List<string> bodyText;
+    List<int> bodyX0; List<int> bodyX1;
+    List<int> bodyY0; List<int> bodyY1;
+    bool bodyBorder;    // body.itemStyle.borderColor != "none"（官方缺省有边）
+
     static ChartMatrixSpec Of() {
         ChartMatrixSpec m = new ChartMatrixSpec();
         m.lRaw = null; m.tRaw = null; m.rRaw = null; m.bRaw = null;
+        m.xShow = true; m.yShow = true;
+        m.xLevelSize = null; m.yLevelSize = null;
+        m.xSizes = new List<ChartBoxParam>();
+        m.ySizes = new List<ChartBoxParam>();
+        m.xItemColor = 0; m.yItemColor = 0;
+        m.bodyText = new List<string>();
+        m.bodyX0 = new List<int>(); m.bodyX1 = new List<int>();
+        m.bodyY0 = new List<int>(); m.bodyY1 = new List<int>();
+        m.bodyBorder = true;
         m.xText = new List<string>();
         m.xLevel = new List<int>();
         m.xFirst = new List<int>();
@@ -8586,7 +8656,7 @@ class ChartMatrixSpec {
     }
 
     /// matrix 组件对象：盒布局四边（数值 px / "N%" 字符串）+ x/y
-    /// 维度树 data。
+    /// 维度树 data + 尺寸声明（levelSize/size）+ body.data 合并格。
     static ChartMatrixSpec ParseOne(JsonValue v) {
         ChartMatrixSpec m = ChartMatrixSpec.Of();
         m.lRaw = ChartOption.ParseBoxParam(v.Get("left"));
@@ -8595,11 +8665,57 @@ class ChartMatrixSpec {
         m.bRaw = ChartOption.ParseBoxParam(v.Get("bottom"));
         JsonValue xj = v.Get("x");
         if (xj != null && xj.IsObject()) {
+            m.xShow = xj.Bool("show", true);
+            m.xLevelSize = ChartOption.ParseBoxParam(xj.Get("levelSize"));
+            JsonValue xis = xj.Get("itemStyle");
+            if (xis != null && xis.IsObject()) {
+                m.xItemColor = ChartOption.ParseColor(xis.Get("color"), 0);
+            }
             m.xLeaves = ChartMatrixSpec.ParseCells(xj.Get("data"), m, true, 0, 0);
         }
         JsonValue yj = v.Get("y");
         if (yj != null && yj.IsObject()) {
+            m.yShow = yj.Bool("show", true);
+            m.yLevelSize = ChartOption.ParseBoxParam(yj.Get("levelSize"));
+            JsonValue yis = yj.Get("itemStyle");
+            if (yis != null && yis.IsObject()) {
+                m.yItemColor = ChartOption.ParseColor(yis.Get("color"), 0);
+            }
             m.yLeaves = ChartMatrixSpec.ParseCells(yj.Get("data"), m, false, 0, 0);
+        }
+        // body.data：体区合并格文本。coord 各维是 数字（叶序号）|
+        // 格名 | [起, 止]，统一归一成叶子域 [first, first+span-1]。
+        JsonValue bj = v.Get("body");
+        if (bj != null && bj.IsObject()) {
+            JsonValue bis = bj.Get("itemStyle");
+            if (bis != null && bis.IsObject()) {
+                JsonValue bbc = bis.Get("borderColor");
+                if (bbc != null && bbc.IsString()
+                    && bbc.AsString("") == "none") {
+                    m.bodyBorder = false;
+                }
+            }
+            JsonValue bdata = bj.Get("data");
+            if (bdata != null && bdata.IsArray()) {
+                for (int bi = 0; bi < bdata.Count(); bi = bi + 1) {
+                    JsonValue bit = bdata.At(bi);
+                    if (bit == null || !bit.IsObject()) { continue; }
+                    JsonValue bcrd = bit.Get("coord");
+                    if (bcrd == null || !bcrd.IsArray()
+                        || bcrd.Count() < 2) { continue; }
+                    int bx0;
+                    int bx1;
+                    ChartMatrixSpec.MatCoordSpan(m, true, bcrd.At(0),
+                        out bx0, out bx1);
+                    int by0;
+                    int by1;
+                    ChartMatrixSpec.MatCoordSpan(m, false, bcrd.At(1),
+                        out by0, out by1);
+                    m.bodyText.Add(bit.Str("value", ""));
+                    m.bodyX0.Add(bx0); m.bodyX1.Add(bx1);
+                    m.bodyY0.Add(by0); m.bodyY1.Add(by1);
+                }
+            }
         }
         // 层级带数 = 最大树深（官方 _levels.length：每深一层一带）。
         for (int i = 0; i < m.xLevel.Count; i = i + 1) {
@@ -8609,6 +8725,38 @@ class ChartMatrixSpec {
             if (m.yLevel[j] + 1 > m.yLevels) { m.yLevels = m.yLevel[j] + 1; }
         }
         return m;
+    }
+
+    /// 单个 coord 元素归一成叶子域 [c0, c1]：数字 = 叶序号；串 =
+    /// 格名（可落在组，展开为叶子域）；[a, b] = 两端各解一次。
+    static void MatCoordSpan(ChartMatrixSpec m, bool isX, JsonValue e,
+                             out int c0, out int c1) {
+        c0 = 0;
+        c1 = 0;
+        if (e == null) { return; }
+        if (e.IsNumber()) {
+            c0 = e.AsInt(0);
+            c1 = c0;
+            return;
+        }
+        if (e.IsString()) {
+            int ci = m.FindCell(isX, e.AsString(""));
+            if (ci < 0) { c0 = 0 - 1; c1 = 0 - 1; return; }
+            c0 = isX ? m.xFirst[ci] : m.yFirst[ci];
+            c1 = c0 + (isX ? m.xSpan[ci] : m.ySpan[ci]) - 1;
+            return;
+        }
+        if (e.IsArray() && e.Count() >= 2) {
+            int a0;
+            int a1;
+            ChartMatrixSpec.MatCoordSpan(m, isX, e.At(0), out a0, out a1);
+            int b0;
+            int b1;
+            ChartMatrixSpec.MatCoordSpan(m, isX, e.At(1), out b0, out b1);
+            c0 = a0;
+            c1 = b1;
+            return;
+        }
     }
 
     /// 维度树前序展平；返回本数组覆盖的叶子数。data 项：字符串 |
@@ -8635,6 +8783,10 @@ class ChartMatrixSpec {
             int idx;
             int kind = children != null && children.IsArray()
                 && children.Count() > 0 ? 1 : 0;
+            // 官方只有叶消费 size（Matrix.js layOutUnitsOnDimension 的
+            // tmpCellModel.get('size')），组上的声明直接不收。
+            ChartBoxParam sizeRaw = kind == 0
+                ? ChartOption.ParseBoxParam(it.Get("size")) : null;
             if (isX) {
                 idx = m.xText.Count;
                 m.xText.Add(lab.Length > 0 ? lab : val);
@@ -8642,6 +8794,7 @@ class ChartMatrixSpec {
                 m.xFirst.Add(first + total);
                 m.xSpan.Add(1);
                 m.xKind.Add(kind);
+                m.xSizes.Add(sizeRaw);
             } else {
                 idx = m.yText.Count;
                 m.yText.Add(lab.Length > 0 ? lab : val);
@@ -8649,6 +8802,7 @@ class ChartMatrixSpec {
                 m.yFirst.Add(first + total);
                 m.ySpan.Add(1);
                 m.yKind.Add(kind);
+                m.ySizes.Add(sizeRaw);
             }
             if (val.Length > 0) {
                 m.qName.Add(val);

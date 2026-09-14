@@ -3167,3 +3167,41 @@ P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
   covariance/correlation 稳态 4-7ms（快照命中实锤）；总旗标 164→181
   漂移为并行会话 ChartViewCalendar.zan 在飞改动所致（mtime 实证，类
   全在其噪声类），非本车道。
+* **台账⑥-3a 闭账：matrix 增量——尺寸声明布局 + body.data + pie/graph
+  落格（2026-09-15，批次⑥续）**：matrix-pie / matrix-graph 两个 BLANK
+  清除（BLANK 总数 10→8，剩余全归 ⑥-3b/既有挂账）。官方语义对抄：
+  ①**尺寸声明布局**（layOutUnitsOnDimension 的 parseSizeOption 语义）——
+  每维 `levelSize`（头带）、逐叶 `size`、`show:false`（带占 0 尺寸）声明
+  先占（px/"N%"，百分比对向全长），余量**等分**给未声明单位（含隐藏带），
+  末单元右缘贴盒缘（MatUnitSizes+MatStartsOf：双精度累计逐界取整+单调
+  钳制）；②**逐格描边**——叶格竖线/横线只落在自己的带行到体缘（跨带
+  levels-level），组格只描本带行矩形：matrix-pie 的组带行（Primary
+  School/High School）内不再有组内竖线（首版全带贯通是错的，matrix-
+  simple 单层树退化后不变）；③**body.data 合并格**：`{value, coord}`
+  项按 MatCoordSpan 归一成叶子域（数=叶序、名=FindCell 跨度、[a,b]=端
+  点各解），画合并域文本+可选边框（body.itemStyle.borderColor=='none'
+  关边）；④**pie-on-matrix**：`center` 格名串解析进 series.matCX/matCY，
+  渲染 = 格矩形圆心 FillSector 扇组（radius 标量走 GaugeScalar：百分
+  比按格短边、px 按 DPI，calendar-pie 同款），扇色 itemStyle>item>
+  系列色；⑤**graph-on-matrix**：节点 = [x名,y名,1,显示名] 四元组（第 4
+  元进 labelText）落格心，FillCircle + links 连线 + edgeSymbol 数组
+  ['none','arrow'] 端箭头（Force 块已有解析）+ label.show 粗体两行名
+  （offset[0,-15] verticalAlign bottom：块底边在圆心上方 15px），
+  端点「纯数字=序号，否则按显示名/name」；⑥matrix 图例：落格 pie 系
+  列的数据项名去重收集（pie 面板道同法）+ LegendFloatTop 底部锚定
+  （图例点击显隐未接管，挂账）。**教训（解析期"错而不空"变体）**：
+  matrix-graph 首版连线全无——links 被两条道各解析一次，通用 ParseLinks
+  （数字端点此前被 Str() 丢空、已修）先收对，Force 专用道再用「节点名
+  表」整表**重建** cs.links，而 matrix 车道的节点没有 name、名表全退化
+  成 val 串 "1"，数字端点全被改写成同一个名字（探针实锤 7 条 link 端
+  点全 '1'→'1'）。给通用解析道加新形态时，必须查专用道是否会用自己
+  那份重建覆盖——修法 = matrix 坐标系跳过重建（ChartModel graph 块
+  glinks 门），渲染端按序号/显示名解析。快照指纹同步扩容（show/
+  levelSize/sizes/itemColor/body 合并格/matCX/matCY/radius/symbolSize/
+  label 粗体），bench matrix-pie 4-7ms / matrix-graph 4-5ms 稳态。
+  验证：parsecheck 335/335；matrix-pie（组带跨列/9 叶列/扇组/底部图
+  例）与 matrix-graph（树分组头带/节点落格/箭头连线/粗体标签）逐像素
+  对拍官方；matrix 族除 mini-bar-geo（⑥-3b）外 0 旗标；总旗标 162
+  （并行会话噪声回落）。⑥-3b 挂账不变：grid/geo 锚格托管（mini-bar-
+  geo/grid-layout/sparkline/matrix-stock 的 title.coord+grid.coord+
+  axes.gridIndex+time breaks 复合体）。

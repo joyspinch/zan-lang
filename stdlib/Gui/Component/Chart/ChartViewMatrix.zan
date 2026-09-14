@@ -5,20 +5,24 @@ using Gui;
 namespace Gui.Component.Chart;
 
 /// 矩阵坐标系（ECharts6 coord/matrix）的几何与取色域——核心层与
-/// 悬停层共用的一次推导结果：盒矩形、单位分割（头带 + 叶列/叶行
-/// 等分）、色带、值域、piecewise 桶数。
+/// 悬停层共用的一次推导结果：盒矩形、单位分割（头带 + 叶列/叶行）、
+/// 色带、值域、piecewise 桶数。
 ///
 /// 官方布局（Matrix.js layOutUnitsOnDimension）：沿 x 向先铺 y 树的
 /// 层级头带（左缘竖条），再铺 x 树的叶列；沿 y 向先铺 x 树的层级
-/// 头带（顶缘横条），再铺 y 树的叶行。未声明 levelSize/size 的单位
-/// 等分剩余空间（头带与体格同厚），末单元贴齐盒缘。角区（两棵树
-/// 头带的交叠）无任何格线。
+/// 头带（顶缘横条），再铺 y 树的叶行。声明 levelSize/size 的单位先
+/// 占尺寸（隐藏维的头带占 0），剩余空间**等分**给未声明单位（头带
+/// 与体格同厚），末单元贴齐盒缘。角区（两棵树头带的交叠）无格线。
 class MatGeom {
     int rx; int ry; int rw; int rh;   // 矩阵盒（含头带与角区）
     int xBands; int yBands;           // x 树层级数（顶横带）/ y 树层级数（左竖带）
     int xLeaves; int yLeaves;         // 叶列 / 叶行数
     int unitsX; int unitsY;           // x 向 = yBands + xLeaves；y 向 = xBands + yLeaves
+    List<int> xStarts;                // x 向单位边界（unitsX+1 项，绝对 px）
+    List<int> yStarts;                // y 向单位边界（unitsY+1 项，绝对 px）
     int bodyL; int bodyT;             // 体区左/上缘（头带结束处）
+    int panelX; int panelY;           // 图表面板矩形（图例浮层锚定用）
+    int panelW; int panelH;
     List<int> ramp;                   // 取色带；<2 色时调用方回退系列色
     double dLo; double dHi;           // 值域：visualMap 声明优先，缺省数据包络
     int split;                        // piecewise 等分桶数；0 = 连续
@@ -29,7 +33,11 @@ class MatGeom {
         geo.xBands = 0; geo.yBands = 0;
         geo.xLeaves = 0; geo.yLeaves = 0;
         geo.unitsX = 0; geo.unitsY = 0;
+        geo.xStarts = new List<int>();
+        geo.yStarts = new List<int>();
         geo.bodyL = 0; geo.bodyT = 0;
+        geo.panelX = 0; geo.panelY = 0;
+        geo.panelW = 0; geo.panelH = 0;
         geo.ramp = null;
         geo.dLo = 0.0; geo.dHi = 1.0;
         geo.split = 0;
@@ -39,9 +47,10 @@ class MatGeom {
 
 partial class ChartView {
 
-    // ---- 矩阵坐标系车道：维度树头带 + 叶子体格骨架，heatmap 系列
-    // 按 [x名, y名, 值] 落格上色（matrix-correlation-heatmap 族）。
-    // 与直角热力图车道共用色带原语 MatColorAt 与帧内快照缓存定式。----
+    // ---- 矩阵坐标系车道：维度树头带 + 叶子体格骨架；heatmap 按
+    // [x名, y名, 值] 落格上色，pie 按 center 格名落格心，graph 节点
+    // 落格心连线。与直角热力图车道共用色带原语 MatColorAt 与帧内
+    // 快照缓存定式。----
 
     /// 盒布局单边：数值 px / "N%"（ParseBoxParam 两种 kind），缺省
     /// 盒尺寸的 10%（官方 MatrixModel.defaultOption 四边 '10%'）。
@@ -52,14 +61,87 @@ partial class ChartView {
         return full * dfltPct / 100;
     }
 
-    /// 单位 k 的左/上缘（k ∈ [0, units]）：累计整数除法，余数落在
-    /// 末端——末单元自动贴齐盒缘（官方等分 + 末位对齐的整数化，
-    /// 与 HeatmapCellStart 同一约定）。
-    static int MatUnitStart(int origin, int total, int units, int k) {
-        if (units < 1) { return origin; }
+    /// 单向的单位尺寸序列：头带（levelSize 声明；隐藏维 = 0）在前、
+    /// 叶（逐格 size 声明）在后，声明过的先占尺寸，剩余均分给未声
+    /// 明单位（官方 restSize/restCellsCount）。total = 该向盒尺寸
+    /// （百分比声明的基准，官方 parseSizeOption 同源）。
+    static List<double> MatUnitSizes(int bandCount, bool bandShow,
+                                     ChartBoxParam levelSize,
+                                     int leafCount, List<ChartBoxParam> sizes,
+                                     int total) {
+        List<double> ws = new List<double>();
+        double rest = (double)total;
+        int restCount = 0;
+        for (int k = 0; k < bandCount; k = k + 1) {
+            double wh = 0.0 - 1.0;
+            if (!bandShow) {
+                wh = 0.0;
+            } else if (levelSize != null && levelSize.kind == 1) {
+                wh = levelSize.num;
+            } else if (levelSize != null && levelSize.kind == 2) {
+                wh = (double)total * levelSize.num / 100.0;
+            }
+            if (wh >= 0.0) {
+                if (wh > rest) { wh = rest; }
+                ws.Add(wh);
+                rest = rest - wh;
+            } else {
+                ws.Add(0.0 - 1.0);
+                restCount = restCount + 1;
+            }
+        }
+        for (int j = 0; j < leafCount; j = j + 1) {
+            ChartBoxParam sz = j < sizes.Count ? sizes[j] : null;
+            double wh = 0.0 - 1.0;
+            if (sz != null && sz.kind == 1) { wh = sz.num; }
+            else if (sz != null && sz.kind == 2) {
+                wh = (double)total * sz.num / 100.0;
+            }
+            if (wh >= 0.0) {
+                if (wh > rest) { wh = rest; }
+                ws.Add(wh);
+                rest = rest - wh;
+            } else {
+                ws.Add(0.0 - 1.0);
+                restCount = restCount + 1;
+            }
+        }
+        double share = restCount > 0 ? rest / (double)restCount : 0.0;
+        for (int k2 = 0; k2 < ws.Count; k2 = k2 + 1) {
+            if (ws[k2] < 0.0) { ws[k2] = share; }
+        }
+        return ws;
+    }
+
+    /// 单位尺寸 → 绝对边界（n+1 项）：双精度累计、逐界取整；末界
+    /// 即盒缘（末单元天然贴齐），边界保证单调不减（极小单元取整
+    /// 后不回退）。
+    static List<int> MatStartsOf(int origin, int total, List<double> ws) {
+        List<int> starts = new List<int>();
+        double cur = (double)origin;
+        int n = ws.Count;
+        for (int k = 0; k < n; k = k + 1) {
+            starts.Add((int)(cur + 0.5));
+            cur = cur + ws[k];
+        }
+        starts.Add(origin + total);
+        for (int k2 = 1; k2 < starts.Count; k2 = k2 + 1) {
+            if (starts[k2] < starts[k2 - 1]) { starts[k2] = starts[k2 - 1]; }
+        }
+        return starts;
+    }
+
+    /// x/y 向第 k 单元的边界（k ∈ [0, units]）。
+    static int MatXAt(MatGeom geo, int k) {
         if (k < 0) { k = 0; }
-        if (k > units) { k = units; }
-        return origin + (int)((long)total * (long)k / (long)units);
+        if (k > geo.unitsX) { k = geo.unitsX; }
+        return geo.xStarts[k];
+    }
+
+    static int MatYAt(MatGeom geo, int k) {
+        if (k < 0) { k = 0; }
+        if (k > geo.unitsY) { k = geo.unitsY; }
+        return geo.yStarts[k];
     }
 
     /// x 维格（叶或组）的屏幕矩形：列域 = 头带之后的叶子域；行域 =
@@ -68,14 +150,12 @@ partial class ChartView {
     static void MatXCellRect(MatGeom geo, ChartMatrixSpec m, int ci,
                              out int cx, out int cy, out int cw, out int ch) {
         int col0 = geo.yBands + m.xFirst[ci];
-        cx = ChartView.MatUnitStart(geo.rx, geo.rw, geo.unitsX, col0);
-        cw = ChartView.MatUnitStart(geo.rx, geo.rw, geo.unitsX,
-            col0 + m.xSpan[ci]) - cx;
-        cy = ChartView.MatUnitStart(geo.ry, geo.rh, geo.unitsY, m.xLevel[ci]);
+        cx = ChartView.MatXAt(geo, col0);
+        cw = ChartView.MatXAt(geo, col0 + m.xSpan[ci]) - cx;
+        cy = ChartView.MatYAt(geo, m.xLevel[ci]);
         int cy2 = m.xKind[ci] == 0
             ? geo.bodyT
-            : ChartView.MatUnitStart(geo.ry, geo.rh, geo.unitsY,
-                m.xLevel[ci] + 1);
+            : ChartView.MatYAt(geo, m.xLevel[ci] + 1);
         ch = cy2 - cy;
     }
 
@@ -84,35 +164,38 @@ partial class ChartView {
     static void MatYCellRect(MatGeom geo, ChartMatrixSpec m, int ri,
                              out int cx, out int cy, out int cw, out int ch) {
         int row0 = geo.xBands + m.yFirst[ri];
-        cy = ChartView.MatUnitStart(geo.ry, geo.rh, geo.unitsY, row0);
-        ch = ChartView.MatUnitStart(geo.ry, geo.rh, geo.unitsY,
-            row0 + m.ySpan[ri]) - cy;
-        cx = ChartView.MatUnitStart(geo.rx, geo.rw, geo.unitsX, m.yLevel[ri]);
+        cy = ChartView.MatYAt(geo, row0);
+        ch = ChartView.MatYAt(geo, row0 + m.ySpan[ri]) - cy;
+        cx = ChartView.MatXAt(geo, m.yLevel[ri]);
         int cx2 = m.yKind[ri] == 0
             ? geo.bodyL
-            : ChartView.MatUnitStart(geo.rx, geo.rw, geo.unitsX,
-                m.yLevel[ri] + 1);
+            : ChartView.MatXAt(geo, m.yLevel[ri] + 1);
         cw = cx2 - cx;
     }
 
     /// 体格 (i,j) 的屏幕矩形：x 第 i 叶列 × y 第 j 叶行。
     static void MatBodyRect(MatGeom geo, int i, int j, out int bx, out int by,
                             out int bw, out int bh) {
-        bx = ChartView.MatUnitStart(geo.rx, geo.rw, geo.unitsX, geo.yBands + i);
-        bw = ChartView.MatUnitStart(geo.rx, geo.rw, geo.unitsX, geo.yBands + i + 1) - bx;
-        by = ChartView.MatUnitStart(geo.ry, geo.rh, geo.unitsY, geo.xBands + j);
-        bh = ChartView.MatUnitStart(geo.ry, geo.rh, geo.unitsY, geo.xBands + j + 1) - by;
+        bx = ChartView.MatXAt(geo, geo.yBands + i);
+        bw = ChartView.MatXAt(geo, geo.yBands + i + 1) - bx;
+        by = ChartView.MatYAt(geo, geo.xBands + j);
+        bh = ChartView.MatYAt(geo, geo.xBands + j + 1) - by;
     }
 
-    /// 布局：盒矩形（px/"N%"，缺省四边 10%）+ 单位分割 + 取色域。
-    /// 值包络由调用方扫好传入（核心层与指纹合同一趟，悬停层走
-    /// HeatFactsScan 兜底）。数据不成盒（rw/rh 过小）返回 null。
+    /// 布局：盒矩形（px/"N%"，缺省四边 10%）+ 单位分割（含声明尺
+    /// 寸）+ 取色域。值包络由调用方扫好传入（核心层与指纹合同一趟，
+    /// 悬停层走 HeatFactsScan 兜底）。数据不成盒（rw/rh 过小）返回
+    /// null。
     static MatGeom MatLayout(App app, int x, int y, int w, int h, int top,
                              ChartOption o, double eLo, double eHi) {
         ChartMatrixSpec m = o.matrix;
         if (m == null) { return null; }
         MatGeom geo = MatGeom.Of();
         int ph = (y + h) - top;
+        geo.panelX = x;
+        geo.panelY = y;
+        geo.panelW = w;
+        geo.panelH = h;
         int l = ChartView.MatSide(m.lRaw, w, 10);
         int r = ChartView.MatSide(m.rRaw, w, 10);
         int tt = ChartView.MatSide(m.tRaw, ph, 10);
@@ -128,8 +211,16 @@ partial class ChartView {
         geo.yLeaves = m.yLeaves;
         geo.unitsX = geo.yBands + geo.xLeaves;
         geo.unitsY = geo.xBands + geo.yLeaves;
-        geo.bodyL = ChartView.MatUnitStart(geo.rx, geo.rw, geo.unitsX, geo.yBands);
-        geo.bodyT = ChartView.MatUnitStart(geo.ry, geo.rh, geo.unitsY, geo.xBands);
+        // x 向：y 树层带（levelSize；y.show false = 0）+ x 叶列（size）。
+        geo.xStarts = ChartView.MatStartsOf(geo.rx, geo.rw,
+            ChartView.MatUnitSizes(geo.yBands, m.yShow, m.yLevelSize,
+                geo.xLeaves, m.xSizes, geo.rw));
+        // y 向：x 树层带 + y 叶行。
+        geo.yStarts = ChartView.MatStartsOf(geo.ry, geo.rh,
+            ChartView.MatUnitSizes(geo.xBands, m.xShow, m.xLevelSize,
+                geo.yLeaves, m.ySizes, geo.rh));
+        geo.bodyL = ChartView.MatXAt(geo, geo.yBands);
+        geo.bodyT = ChartView.MatYAt(geo, geo.xBands);
         // 取色带与值域：与直角热力图车道同源（全局 rampColors 优先，
         // 否则第一条 visualMap 的 rangeColors——continuous 缺省带在
         // 解析期已填、piecewise 的 inRange.color 也在这里；声明过
@@ -166,10 +257,17 @@ partial class ChartView {
         return f;
     }
 
-    /// 矩阵坐标系主体入口：先画骨架 + 系列填色（可整块快照缓存），
+    /// 盒单边声明的指纹折叠（kind 区分 px/%，num ×100 保两位小数）。
+    static int MatBoxFold(ChartBoxParam p) {
+        if (p == null) { return 0; }
+        return p.kind * 17 + (int)(p.num * 100.0);
+    }
+
+    /// 矩阵坐标系主体入口：先画骨架 + 系列内容（可整块快照缓存），
     /// 再由调用方画悬停覆盖层。指纹覆盖全部取像素输入：几何/缩放、
-    /// 规格树形与文本、盒声明、逐格数据、系列 hidden/label 位、
-    /// 色带与值域、主题色。g<1000（入场渐显探针）不缓存。
+    /// 规格树形与文本、盒与尺寸声明、body 合并格、逐格数据、系列
+    /// hidden/label/锚定位、色带与值域、主题色。g<1000（入场渐显
+    /// 探针）不缓存。
     static void DrawMatrix(App app, int x, int y, int w, int h,
                            ChartOption o, int g) {
         ChartMatrixSpec m = o.matrix;
@@ -185,20 +283,34 @@ partial class ChartView {
         f = (f * 31 + w) % 2000000000;
         f = (f * 31 + h) % 2000000000;
         f = (f * 31 + app.Scale(100)) % 2000000000;
-        // 规格树形 + 文本（盒声明、两棵树的层级/叶子域/跨度/文本）。
+        // 规格：盒 + 尺寸/隐藏声明 + 两棵树 + body 合并格。
         f = (f * 31 + ChartView.MatBoxFold(m.lRaw)
             + ChartView.MatBoxFold(m.tRaw) * 3
             + ChartView.MatBoxFold(m.rRaw) * 7
             + ChartView.MatBoxFold(m.bRaw) * 11) % 2000000000;
+        f = (f * 31 + (m.xShow ? 1 : 0) + (m.yShow ? 2 : 0)
+            + ChartView.MatBoxFold(m.xLevelSize) * 13
+            + ChartView.MatBoxFold(m.yLevelSize) * 17) % 2000000000;
+        f = (f * 31 + m.xItemColor + m.yItemColor * 3
+            + (m.bodyBorder ? 5 : 0)) % 2000000000;
         for (int i = 0; i < m.xText.Count; i = i + 1) {
             f = (f * 31 + m.xLevel[i] * 5 + m.xFirst[i] * 13
                 + m.xSpan[i] * 29) % 2000000000;
+            f = (f * 31 + ChartView.MatBoxFold(
+                i < m.xSizes.Count ? m.xSizes[i] : null)) % 2000000000;
             f = ChartView.MatTextFold(f, m.xText[i]);
         }
         for (int j = 0; j < m.yText.Count; j = j + 1) {
             f = (f * 31 + m.yLevel[j] * 5 + m.yFirst[j] * 13
                 + m.ySpan[j] * 29) % 2000000000;
+            f = (f * 31 + ChartView.MatBoxFold(
+                j < m.ySizes.Count ? m.ySizes[j] : null)) % 2000000000;
             f = ChartView.MatTextFold(f, m.yText[j]);
+        }
+        for (int bi = 0; bi < m.bodyText.Count; bi = bi + 1) {
+            f = (f * 31 + m.bodyX0[bi] * 7 + m.bodyX1[bi] * 11
+                + m.bodyY0[bi] * 13 + m.bodyY1[bi] * 17) % 2000000000;
+            f = ChartView.MatTextFold(f, m.bodyText[bi]);
         }
         double eLo = 0.0;
         double eHi = 0.0;
@@ -207,12 +319,21 @@ partial class ChartView {
             ChartSeries s = o.series[si];
             f = (f * 31 + (s.hidden ? 1 : 0)
                 + (s.labelShowT == 1 ? 2 : 0)) % 2000000000;
+            f = (f * 31 + s.symbolSize + (s.color != 0 ? s.color : 0)
+                + s.itemStyle.normal.lineStyle.color
+                + s.itemStyle.normal.lineStyle.width * 3) % 2000000000;
+            f = (f * 31 + (s.radius == null ? 0
+                : s.radius.amount * (s.radius.percent ? 13 : 17))
+                + s.startAngle) % 2000000000;
+            f = ChartView.MatTextFold(f, s.matCX);
+            f = ChartView.MatTextFold(f, s.matCY);
             if (s.hidden) { continue; }
             for (int di = 0; di < s.data.Count; di = di + 1) {
                 ChartData d = s.data[di];
                 if (d.heatX < 0 || d.heatY < 0 || d.gap) { continue; }
                 f = (f * 31 + d.heatX * 7 + d.heatY * 13
                     + (int)(d.number * 1000.0) * 29) % 2000000000;
+                f = ChartView.MatTextFold(f, d.labelText);
                 if (!seen) { eLo = d.number; eHi = d.number; seen = true; }
                 else {
                     if (d.number < eLo) { eLo = d.number; }
@@ -259,17 +380,12 @@ partial class ChartView {
         c.PopClip();
     }
 
-    /// 盒单边声明的指纹折叠（kind 区分 px/%，num ×100 保两位小数）。
-    static int MatBoxFold(ChartBoxParam p) {
-        if (p == null) { return 0; }
-        return p.kind * 17 + (int)(p.num * 100.0);
-    }
-
-    /// 矩阵骨架 + 系列填色（快照 miss 帧执行一次）。绘制序：系列
-    /// 填色 → 体区格网与头带格线（官方 cell borderWidth 1 borderTint
-    /// 压在填色上）→ 头带标签 → 背景描边（backgroundStyle
-    /// borderColor axisLine）。角区无边框（官方 corner borderColor
-    /// 'none'）。
+    /// 矩阵骨架 + 系列内容（快照 miss 帧执行一次）。绘制序：头带
+    /// 填充（x/y.itemStyle.color）→ 系列填色 → 体区格网与头带格线
+    /// （官方 cell borderWidth 1 borderTint 压在填色上）→ body 合并
+    /// 格文本 → 头带标签 → pie/graph 落格 → 背景描边（
+    /// backgroundStyle borderColor axisLine）。角区无边框（官方
+    /// corner borderColor 'none'）。
     static void DrawMatrixBody(App app, ChartOption o, ChartMatrixSpec m,
                                MatGeom geo, int g) {
         Canvas c = app.canvas;
@@ -280,6 +396,28 @@ partial class ChartView {
             Style.SNormal()).BorderOr(0);
         int labelFg = Style.Part(app, "chart", "label", "", "", "",
             Style.SNormal()).FgOr(0);
+
+        // 头带填充（x/y.itemStyle.color 声明才画；官方缺省 'none'）。
+        if (m.xItemColor != 0) {
+            for (int i = 0; i < m.xText.Count; i = i + 1) {
+                int cx;
+                int cy;
+                int cw;
+                int ch;
+                ChartView.MatXCellRect(geo, m, i, out cx, out cy, out cw, out ch);
+                if (cw > 0 && ch > 0) { c.FillRect(cx, cy, cw, ch, m.xItemColor); }
+            }
+        }
+        if (m.yItemColor != 0) {
+            for (int j = 0; j < m.yText.Count; j = j + 1) {
+                int cx;
+                int cy;
+                int cw;
+                int ch;
+                ChartView.MatYCellRect(geo, m, j, out cx, out cy, out cw, out ch);
+                if (cw > 0 && ch > 0) { c.FillRect(cx, cy, cw, ch, m.yItemColor); }
+            }
+        }
 
         // 系列填色：heatmap 系列按格域上色（组名格 = 合并域整填）。
         // 无色带时回退系列色。逐格数值标签（series.label.show）在
@@ -328,44 +466,85 @@ partial class ChartView {
 
         // 体区格网：叶列/叶行界线（官方 body cell borderWidth 1）。
         for (int k = geo.yBands + 1; k < geo.unitsX; k = k + 1) {
-            int lx = ChartView.MatUnitStart(geo.rx, geo.rw, geo.unitsX, k);
+            int lx = ChartView.MatXAt(geo, k);
             c.FillRect(lx, geo.bodyT, 1, (geo.ry + geo.rh) - geo.bodyT, gridC);
         }
         for (int l = geo.xBands + 1; l < geo.unitsY; l = l + 1) {
-            int ly = ChartView.MatUnitStart(geo.ry, geo.rh, geo.unitsY, l);
+            int ly = ChartView.MatYAt(geo, l);
             c.FillRect(geo.bodyL, ly, (geo.rx + geo.rw) - geo.bodyL, 1, gridC);
         }
         // 体区左/上边界线（头带与体格的分界）。
         c.FillRect(geo.bodyL, geo.bodyT, 1, (geo.ry + geo.rh) - geo.bodyT, gridC);
         c.FillRect(geo.bodyL, geo.bodyT, (geo.rx + geo.rw) - geo.bodyL, 1, gridC);
 
-        // x 头带：叶列竖线顶延到盒缘（x 树叶格的列界），层级横线
-        // 右延到盒缘（x 树层带界）。官方 x 树叶格 rect 只占头带区，
-        // 逐格描边与线段等价。
+        // x 头带：叶列竖线只落在叶子自己的带行（末带）到体缘——
+        // 官方逐格描边：叶格跨带到体缘，组格只占本带行（组带行内
+        // 没有组内竖线，组界由组格描边补）。单层树退化为原样。
+        int xLeafTop = ChartView.MatYAt(geo, geo.xBands - 1);
         for (int k = geo.yBands + 1; k < geo.unitsX; k = k + 1) {
-            int lx = ChartView.MatUnitStart(geo.rx, geo.rw, geo.unitsX, k);
-            c.FillRect(lx, geo.ry, 1, geo.bodyT - geo.ry, gridC);
+            int lx = ChartView.MatXAt(geo, k);
+            c.FillRect(lx, xLeafTop, 1, geo.bodyT - xLeafTop, gridC);
         }
-        for (int l = 1; l < geo.xBands; l = l + 1) {
-            int ly = ChartView.MatUnitStart(geo.ry, geo.rh, geo.unitsY, l);
-            c.FillRect(geo.bodyL, ly, (geo.rx + geo.rw) - geo.bodyL, 1, gridC);
+        for (int i = 0; i < m.xText.Count; i = i + 1) {
+            if (m.xLevel[i] >= geo.xBands - 1) { continue; }
+            int gx;
+            int gy;
+            int gw;
+            int gh;
+            ChartView.MatXCellRect(geo, m, i, out gx, out gy, out gw, out gh);
+            c.DrawRect(gx, gy, gw, gh, gridC, 1);
         }
-        // y 头带：叶行横线左延到盒缘（y 树叶格的行界），层级竖线
-        // 下延到盒缘（y 树层带界）。
+        if (m.xShow) {
+            for (int l = 1; l < geo.xBands; l = l + 1) {
+                int ly = ChartView.MatYAt(geo, l);
+                c.FillRect(geo.bodyL, ly, (geo.rx + geo.rw) - geo.bodyL, 1, gridC);
+            }
+        }
+        // y 头带：与 x 对称（叶行横线只在末带到体缘，组格描边补界）。
+        int yLeafLeft = ChartView.MatXAt(geo, geo.yBands - 1);
         for (int l = geo.xBands + 1; l < geo.unitsY; l = l + 1) {
-            int ly = ChartView.MatUnitStart(geo.ry, geo.rh, geo.unitsY, l);
-            c.FillRect(geo.rx, ly, geo.bodyL - geo.rx, 1, gridC);
+            int ly = ChartView.MatYAt(geo, l);
+            c.FillRect(yLeafLeft, ly, geo.bodyL - yLeafLeft, 1, gridC);
         }
-        for (int k = 1; k < geo.yBands; k = k + 1) {
-            int lx = ChartView.MatUnitStart(geo.rx, geo.rw, geo.unitsX, k);
-            c.FillRect(lx, geo.bodyT, 1, (geo.ry + geo.rh) - geo.bodyT, gridC);
+        for (int j = 0; j < m.yText.Count; j = j + 1) {
+            if (m.yLevel[j] >= geo.yBands - 1) { continue; }
+            int gx;
+            int gy;
+            int gw;
+            int gh;
+            ChartView.MatYCellRect(geo, m, j, out gx, out gy, out gw, out gh);
+            c.DrawRect(gx, gy, gw, gh, gridC, 1);
+        }
+        if (m.yShow) {
+            for (int k = 1; k < geo.yBands; k = k + 1) {
+                int lx = ChartView.MatXAt(geo, k);
+                c.FillRect(lx, geo.bodyT, 1, (geo.ry + geo.rh) - geo.bodyT, gridC);
+            }
+        }
+
+        // body.data 合并格文本（mini-bar-geo 的州名列表；coord 已在
+        // 解析期归一成叶子域）。有边声明（缺省有）时描合并域边。
+        for (int bi = 0; bi < m.bodyText.Count; bi = bi + 1) {
+            if (m.bodyText[bi].Length < 1) { continue; }
+            if (m.bodyX0[bi] < 0 || m.bodyY0[bi] < 0
+                || m.bodyX1[bi] >= m.xLeaves || m.bodyY1[bi] >= m.yLeaves) {
+                continue;
+            }
+            int bx = ChartView.MatXAt(geo, geo.yBands + m.bodyX0[bi]);
+            int bx2 = ChartView.MatXAt(geo, geo.yBands + m.bodyX1[bi] + 1);
+            int by = ChartView.MatYAt(geo, geo.xBands + m.bodyY0[bi]);
+            int by2 = ChartView.MatYAt(geo, geo.xBands + m.bodyY1[bi] + 1);
+            if (m.bodyBorder) {
+                c.DrawRect(bx, by, bx2 - bx, by2 - by, gridC, 1);
+            }
+            c.DrawTextCentered(bx, by, bx2 - bx, by2 - by,
+                m.bodyText[bi], axisC, axisFont);
         }
 
         // 头带标签：x 树格画在各自头带格（列域 × 带高），y 树格
         // 对称。带高放不下字号时跳过（密集网格靠结构辨识）。
-        int bandH = ChartView.MatUnitStart(geo.ry, geo.rh, geo.unitsY, 1)
-            - geo.ry;
-        bool xLabOk = bandH >= axisFont;
+        int bandH = ChartView.MatYAt(geo, 1) - geo.ry;
+        bool xLabOk = m.xShow && bandH >= axisFont;
         for (int i = 0; i < m.xText.Count && xLabOk; i = i + 1) {
             int cx;
             int cy;
@@ -376,9 +555,8 @@ partial class ChartView {
                 c.DrawTextCentered(cx, cy, cw, ch, m.xText[i], axisC, axisFont);
             }
         }
-        int bandW = ChartView.MatUnitStart(geo.rx, geo.rw, geo.unitsX, 1)
-            - geo.rx;
-        bool yLabOk = bandW >= axisFont + app.Scale(2);
+        int bandW = ChartView.MatXAt(geo, 1) - geo.rx;
+        bool yLabOk = m.yShow && bandW >= axisFont + app.Scale(2);
         for (int j = 0; j < m.yText.Count && yLabOk; j = j + 1) {
             int cx;
             int cy;
@@ -390,8 +568,281 @@ partial class ChartView {
             }
         }
 
+        // 系列内容落格：pie（center 格名 → 格心）、graph（节点 = 格
+        // 心 + 连线箭头）。压在骨架之上（官方系列 z 高于矩阵 z:-50）。
+        ChartView.DrawMatrixPies(app, o, m, geo);
+        for (int si = 0; si < o.series.Count; si = si + 1) {
+            ChartSeries s = o.series[si];
+            if (s.hidden || s.type != ChartType.Force
+                || s.coordSys != "matrix") { continue; }
+            ChartView.DrawMatrixGraph(app, o, m, geo, s, si);
+        }
+
         // 背景描边（backgroundStyle：borderColor axisLine width 1）。
         c.DrawRect(geo.rx, geo.ry, geo.rw, geo.rh, axisC, 1);
+
+        // 图例浮层（matrix-pie 的 Male/Female 行）：候选 = 落格 pie
+        // 系列的数据项名，跨系列同名去重（pie 面板道同法）。图例项
+        // 的点击显隐不在此道（矩阵悬停层未接管图例热区，记账）。
+        if (o.showLegend) {
+            ChartView.MatLegendDraw(app, o, geo);
+        }
+    }
+
+    /// matrix 车道的 pie 图例：数据项名去重收集 + 底部/顶部浮层锚
+    /// 定（LegendFloatTop，pie 面板道同一解析），逐项 DrawLegendChip。
+    static void MatLegendDraw(App app, ChartOption o, MatGeom geo) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        bool hasPie = false;
+        for (int si = 0; si < o.series.Count; si = si + 1) {
+            if (o.series[si].type == ChartType.Pie && !o.series[si].hidden
+                && (o.series[si].matCX.Length > 0
+                    || o.series[si].matCY.Length > 0)) {
+                hasPie = true;
+                break;
+            }
+        }
+        if (!hasPie) { return; }
+        List<string> candNm = new List<string>();
+        List<int> candSi = new List<int>();
+        List<int> candDi = new List<int>();
+        for (int si = 0; si < o.series.Count; si = si + 1) {
+            ChartSeries ps = o.series[si];
+            if (ps.type != ChartType.Pie) { continue; }
+            for (int di = 0; di < ps.data.Count; di = di + 1) {
+                string nmm = PieLayout.SliceName(ps, di);
+                if (nmm.Length < 1) { continue; }
+                bool dup = false;
+                for (int ci = 0; ci < candNm.Count; ci = ci + 1) {
+                    if (candNm[ci] == nmm) { dup = true; break; }
+                }
+                if (dup) { continue; }
+                if (o.legendData != null && o.legendData.Count > 0) {
+                    bool white = false;
+                    for (int wl = 0; wl < o.legendData.Count; wl = wl + 1) {
+                        if (o.legendData[wl] == nmm) { white = true; break; }
+                    }
+                    if (!white) { continue; }
+                }
+                candSi.Add(si);
+                candDi.Add(di);
+                candNm.Add(nmm);
+            }
+        }
+        if (candNm.Count < 1) { return; }
+        int pad = t.paddingMedium;
+        int rowH = Canvas.FontHeight(ChartFonts.Legend(app)) + app.Scale(6);
+        int gap = app.Scale(8);
+        int lgH = o.legendOrient == "vertical" ? candNm.Count * rowH : rowH;
+        int yCur = Chart.LegendFloatTop(app, geo.panelY, geo.panelH, lgH, pad);
+        int x0 = geo.panelX + pad;
+        int maxX = geo.panelX + geo.panelW - pad;
+        int xCur = x0;
+        if (o.legendOrient != "vertical" && candNm.Count > 0) {
+            int rowW = 0 - gap;
+            for (int ci = 0; ci < candNm.Count; ci = ci + 1) {
+                rowW = rowW + Chart.LegendChipW(app, candNm[ci]) + gap;
+            }
+            xCur = Chart.LegendFloatLeft(app, geo.panelX, geo.panelW, rowW,
+                pad, x0, maxX);
+        }
+        for (int ci = 0; ci < candNm.Count; ci = ci + 1) {
+            ChartSeries ps = o.series[candSi[ci]];
+            int di = candDi[ci];
+            int col = PieLayout.SliceColor(t, ps, di,
+                PieLayout.SlicePalIndex(o, ps, di, candSi[ci] * 16 + di));
+            string lbl = candNm[ci];
+            int cw = Chart.LegendChipW(app, lbl);
+            if (o.legendOrient == "vertical") { xCur = x0; }
+            if (xCur + cw > maxX) { xCur = x0; yCur = yCur + rowH; }
+            Chart.DrawLegendChip(app, xCur, yCur, cw, rowH, col, lbl,
+                ps.data[di].hidden, 0);
+            if (o.legendOrient == "vertical") { yCur = yCur + rowH; }
+            else { xCur = xCur + cw + gap; }
+        }
+    }
+
+    /// pie-on-matrix：series.center 是格名串（matrix-pie 一格一饼），
+    /// 解成格矩形圆心画扇形（官方 dataToPoint = rect center；半径
+    /// px 声明直接用，百分比按格短边折算）。label.show false 语料，
+    /// 扇区标签暂不画。
+    static void DrawMatrixPies(App app, ChartOption o, ChartMatrixSpec m,
+                               MatGeom geo) {
+        Canvas c = app.canvas;
+        for (int si = 0; si < o.series.Count; si = si + 1) {
+            ChartSeries s = o.series[si];
+            if (s.hidden || s.type != ChartType.Pie) { continue; }
+            if (s.matCX.Length < 1 && s.matCY.Length < 1) { continue; }
+            int xi = s.matCX.Length > 0
+                ? m.FindCell(true, s.matCX) : 0 - 1;
+            int yi = s.matCY.Length > 0
+                ? m.FindCell(false, s.matCY) : 0 - 1;
+            if (xi < 0 || yi < 0) { continue; }
+            int cx;
+            int cy;
+            int cw;
+            int ch;
+            ChartView.MatXCellRect(geo, m, xi, out cx, out cy, out cw, out ch);
+            int px;
+            int py;
+            int pw;
+            int ph2;
+            ChartView.MatYCellRect(geo, m, yi, out px, out py, out pw, out ph2);
+            if (cw < 2 || ch < 2 || pw < 2 || ph2 < 2) { continue; }
+            int ccx = cx + cw / 2;
+            int ccy = py + ph2 / 2;
+            // 半径：series.radius 标量走 GaugeScalar（百分比按格短边、
+            // px 按 DPI 缩放；calendar-pie 同款），缺省短边的一半。
+            int cell = cw < ph2 ? cw : ph2;
+            int r = ChartView.GaugeScalar(app, s.radius, cell);
+            if (r <= 0) { r = cell / 2 - app.Scale(1); }
+            if (r < 1) { continue; }
+            int baseColor = ChartView.SeriesColorAt(app, o, si);
+            double total = 0.0;
+            for (int di = 0; di < s.data.Count; di = di + 1) {
+                double v = s.data[di].number;
+                if (v > 0.0) { total = total + v; }
+            }
+            if (total <= 0.000001) { continue; }
+            double acc = (double)(s.startAngle != 0 ? s.startAngle : 90);
+            for (int di = 0; di < s.data.Count; di = di + 1) {
+                ChartData d = s.data[di];
+                if (d.number <= 0.0) { continue; }
+                double sweep = d.number * 360.0 / total;
+                int a0 = (int)(acc + 0.5);
+                int a1 = (int)(acc + sweep + 0.5);
+                if (a1 <= a0) { a1 = a0 + 1; }
+                // 配色：逐项 itemStyle.color > 逐项 color > 系列色
+                // （calendar-pie 同款次序）。
+                int col = baseColor;
+                if (d.itemStyle != null && d.itemStyle.normal.color != 0) {
+                    col = d.itemStyle.normal.color;
+                } else if (d.color != 0) {
+                    col = d.color;
+                }
+                c.FillSector(ccx, ccy, 0, r, a0, a1, col);
+                acc = acc + sweep;
+            }
+        }
+    }
+
+    /// graph-on-matrix 的端点解析：纯数字串 = 节点序号（官方数字 =
+    /// index），否则按节点显示名（第 4 元 labelText）/name 匹配。
+    static int MatNodeIndex(ChartSeries s, string key) {
+        if (key == null || key.Length < 1) { return 0 - 1; }
+        bool digits = true;
+        for (int i = 0; i < key.Length; i = i + 1) {
+            if (key[i] < '0' || key[i] > '9') { digits = false; break; }
+        }
+        if (digits) { return Convert.ToInt(key); }
+        for (int i = 0; i < s.data.Count; i = i + 1) {
+            if (s.data[i].labelText == key || s.data[i].name == key) {
+                return i;
+            }
+        }
+        return 0 - 1;
+    }
+
+    /// graph-on-matrix：节点 = data 项的格矩形圆心（matrix-graph 的
+    /// [x名, y名, 1, 课程名] 写法），links 按端点序连直线，目标端
+    /// 画箭头（edgeSymbol 'arrow'），label.show 时节点上方画显示名
+    /// （官方 offset [0,-15] verticalAlign bottom）。
+    static void DrawMatrixGraph(App app, ChartOption o, ChartMatrixSpec m,
+                                MatGeom geo, ChartSeries s, int si) {
+        Canvas c = app.canvas;
+        int n = s.data.Count;
+        if (n < 1) { return; }
+        List<int> nx = new List<int>();
+        List<int> ny = new List<int>();
+        for (int di = 0; di < n; di = di + 1) {
+            ChartData d = s.data[di];
+            int cx = 0 - 1;
+            int cy = 0 - 1;
+            if (d.heatX >= 0 && d.heatY >= 0
+                && d.heatX < m.xText.Count && d.heatY < m.yText.Count) {
+                int rx0;
+                int ry0;
+                int rw0;
+                int rh0;
+                ChartView.MatXCellRect(geo, m, d.heatX, out rx0, out ry0,
+                    out rw0, out rh0);
+                int px0;
+                int py0;
+                int pw0;
+                int ph0;
+                ChartView.MatYCellRect(geo, m, d.heatY, out px0, out py0,
+                    out pw0, out ph0);
+                if (rw0 > 0 && ph0 > 0) {
+                    cx = rx0 + rw0 / 2;
+                    cy = py0 + ph0 / 2;
+                }
+            }
+            nx.Add(cx);
+            ny.Add(cy);
+        }
+        int nodeR = s.symbolSize > 0 ? s.symbolSize / 2 : app.Scale(6);
+        int nodeCol = s.color != 0 ? s.color
+            : ChartView.SeriesColorAt(app, o, si);
+        int lineCol = s.itemStyle.normal.lineStyle.color != 0
+            ? s.itemStyle.normal.lineStyle.color : nodeCol;
+        int lineW = s.itemStyle.normal.lineStyle.width > 0
+            ? s.itemStyle.normal.lineStyle.width : 2;
+        // 边先画（压在节点下），目标端箭头。
+        for (int li = 0; li < s.links.Count; li = li + 1) {
+            ChartLink lk = s.links[li];
+            int a = ChartView.MatNodeIndex(s, lk.from);
+            int b = ChartView.MatNodeIndex(s, lk.to);
+            if (a < 0 || b < 0 || a >= n || b >= n) { continue; }
+            if (nx[a] < 0 || nx[b] < 0 || a == b) { continue; }
+            c.DrawLine(nx[a], ny[a], nx[b], ny[b], lineCol, lineW);
+            if (s.forceLinkSymbol == "arrow") {
+                ChartView.DrawForceArrow(c, nx[a], ny[a], nx[b], ny[b],
+                    nodeR + 1, lineCol);
+            }
+        }
+        // 节点 + 显示名标签。
+        for (int di = 0; di < n; di = di + 1) {
+            if (nx[di] < 0) { continue; }
+            c.FillCircle(nx[di], ny[di], nodeR, nodeCol);
+            if (s.labelShowT == 1 && s.data[di].labelText.Length > 0) {
+                int lf = s.label.color != 0 ? s.label.color : 0;
+                if (lf == 0) {
+                    lf = Style.Part(app, "chart", "label", "", "", "",
+                        Style.SNormal()).FgOr(0);
+                }
+                int lfFont = s.label.fontSize > 0
+                    ? s.label.fontSize : ChartFonts.SeriesLabel(app);
+                bool lfBold = s.label.fontWeight == "bold";
+                // offset [0,-15] + verticalAlign bottom：文本底边在
+                // 圆心上方 15px。多行名（含 \n）逐行居中画。
+                string txt = s.data[di].labelText;
+                int lineH = lfFont + app.Scale(3);
+                int lines = 1;
+                for (int ci = 0; ci < txt.Length; ci = ci + 1) {
+                    if (txt[ci] == '\n') { lines = lines + 1; }
+                }
+                int blockH = lines * lineH;
+                int ty = ny[di] - app.Scale(15) - blockH;
+                int curY = ty;
+                string line = "";
+                for (int ci = 0; ci <= txt.Length; ci = ci + 1) {
+                    if (ci == txt.Length || txt[ci] == '\n') {
+                        int lw2 = c.MeasureText(line, lfFont);
+                        if (lfBold) {
+                            c.DrawTextBold(nx[di] - lw2 / 2, curY, line,
+                                lf, lfFont);
+                        } else {
+                            c.DrawText(nx[di] - lw2 / 2, curY, line, lf, lfFont);
+                        }
+                        curY = curY + lineH;
+                        line = "";
+                    } else {
+                        line = line + txt.Substring(ci, 1);
+                    }
+                }
+            }
+        }
     }
 
     // ---- 布局备忘（悬停层复用核心层推导好的几何；地图/直角热力
