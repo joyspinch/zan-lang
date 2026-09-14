@@ -62,6 +62,32 @@ foreach ($p in @($ideExe, $zancExe, $stdlib)) {
     if (-not (Test-Path $p)) { Write-Output "PUBLISH_FAILED: missing $p"; exit 1 }
 }
 
+# ---- self-nesting guard -----------------------------------------------------
+# Everything below recursively copies a source tree into $dist (stdlib\,
+# examples\, templates\, and build\ pieces -> toolchain\). If $dist ever sits
+# inside one of those sources -- or a source inside $dist -- Copy-Item drops
+# the destination into itself and recurses until the disk fills: build\toolchain
+# once grew 32 layers / 1.29 GB exactly this way (A47-2; stage_dev_toolchain.ps1
+# carries the same guard for the dev tree, plus the junction handling). Fail
+# fast here so a future path change cannot silently reintroduce it.
+$distFull = [IO.Path]::GetFullPath($dist)
+foreach ($src in @($b, $stdlib,
+                   (Join-Path $root 'examples'),
+                   (Join-Path $root 'templates'))) {
+    $srcFull = [IO.Path]::GetFullPath($src)
+    $nested = $srcFull -eq $distFull -or $distFull -eq $srcFull -or
+              $distFull.StartsWith($srcFull + [IO.Path]::DirectorySeparatorChar,
+                                   [StringComparison]::OrdinalIgnoreCase) -or
+              $srcFull.StartsWith($distFull + [IO.Path]::DirectorySeparatorChar,
+                                   [StringComparison]::OrdinalIgnoreCase)
+    if ($nested) {
+        Write-Output (("PUBLISH_FAILED: dist '{0}' overlaps recursive-copy " +
+                       "source '{1}' (self-nesting guard, A47-2)") -f
+                      $distFull, $srcFull)
+        exit 1
+    }
+}
+
 # ---- clean + recreate dist (release output only) ----
 Write-Output "[2/6] Preparing clean dist directory: $dist"
 if (Test-Path $dist) {

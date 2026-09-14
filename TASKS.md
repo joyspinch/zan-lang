@@ -1489,15 +1489,21 @@ exactly"；经 `emit_arg_typed` 覆盖全部方法调用实参发射点。2026-0
   ③ smoke 层绿（main.c 属编译器改动，rule 8）。
   限制（原 caveat 不变）：本机只验 win-x64，其余 4 目标（linux-x64/arm64、
   macos-x64/arm64）走同一代码路径未实测；android 侧见 A47-3。
-* [~] **A47-2 `build/toolchain` 自嵌套**：曾实测嵌套到 32 层
-  （`build/toolchain/toolchain/toolchain/...`，每层都带一份 stdlib 和
-  openssl），`build/toolchain` 单独占 1.29 GB / 3205 文件。`build/` 是
-  git-ignored 的一次性产物，但说明某个发布/拷贝步骤把目标目录拷进了自己
-  （`scripts/publish_ide.ps1` 的注释已经点出要避免 `toolchain\toolchain`）。
-  **2026-08-08 复核：自嵌套已消失**——当前 `build/toolchain` 无嵌套（189MB / 1026
-  文件，实测深度 0），大概率随 build 目录重建而清掉；「定位到具体步骤并加自嵌套
-  防护」未验证，重跑发布流程时仍需检查。
-  **2026-08-27 复核**：仍无自嵌套（192 MB / 1048 文件，深度 0）；防护仍未加。
+* [x] **A47-2 `build/toolchain` 自嵌套**（2026-09-15 闭账）。历史根因已定位并
+  有据可查：`scripts/stage_dev_toolchain.ps1` 头注明确记载「Copying build\*
+  wholesale instead would drop the destination into itself and recurse
+  (build	oolchain	oolchain\... -- 2.2 GB of it once)」——即把 build 树整份
+  镜像进 build	oolchain 时目的地落在源内部导致递归自拷；该脚本已带双层防护
+  （每条目显式命名 + `Test-UnderDest` 跳过 + ReparsePoint 侦察拆链接）。
+  本轮补上最后缺口：`scripts/publish_ide.ps1` 在 required inputs 之后新增
+  自嵌套守卫——$dist 与四个递归拷贝源（build\、stdlib\、examples\、
+  templates\）两两做全路径前缀包含检查（双向），命中即 `PUBLISH_FAILED`
+  退出，Future 参数化改动无法再静默引入嵌套。验证：① 负路径——探针把
+  $dist 改为 build	oolchain，脚本在清理 dist 前即拒绝（exit 1）；
+  ② 正路径——`publish_ide.ps1 -SkipBuild -NoBump` 全流程 PUBLISH_OK
+  （11739 文件），合法布局无误伤；③ 第三次复核零嵌套——`build	oolchain`
+  （218MB）与 `dist\win-x64	oolchain`（188MB）深度扫描均无嵌套
+  toolchain/stdlib。
 * [x] **A47-3 `templates/server/server-mvc/.build/` 残留** —— ✅ 本机已无
   （2026-08-27 实测该目录不存在）。它是跑过一次模板构建留下的产物、被
   `.gitignore` 的 `.build/` 挡着，会随构建重新出现；若要彻底了结，应在模板构建
