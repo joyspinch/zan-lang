@@ -48,15 +48,16 @@
   `UseAppCss` 调用**（`AppHtml.Css + "\n" + FavsHtml.Css + ...`）。
   漏拼哪份，那份的骨架样式（flex、栏宽、渐变）整体静默失效，页面
   塌回纵向块流——不报错，只有截图能看出来。
-- **样式 scoping 编译期自动完成**（2026-09 起，gui-wechat 四页"裸
+- **样式 scoping 编译/装载期自动完成**（2026-09 起，gui-wechat 四页"裸
   body 互中"踩坑后的工具链修复）：GenHtml 给文档每个元素混入作用域
   类 `zs-<基名>`，并把文档 `<style>` 的每个复合块补上该类——同名类
   跨文档互不串，裸 `body` 只作用自己的根，手写唯一 body id 不再是
   必须项（留作 Find/可读性）。`@media`/`@supports` 内层递归，
   `@keyframes`/`@font-face` 原样。**边界**：运行期挂载件（ListView
   行模板等 code-behind 建的控件）不携作用域类，其样式放皮肤层（全
-  局通道）——与 Vue 组件样式不泄漏子组件同一取舍；运行期
-  `App.LoadHtml` 通道暂不 scoping（装载的是无文件名的文本）。
+  局通道）——与 Vue 组件样式不泄漏子组件同一取舍。运行期
+  `App.LoadHtml` 同语义：装载即组件，每次装载造 `zs-load-<序>` 作用域
+  （变换器共用 System.Web.HtmlScope，与编译通道同一保证）。
 - **flex 链条上每个"吃满"的环节都要自己声明**：页面根控件挂进 flex
   宿主后，没有声明高度就是零高（dock 时代的 MeasureDocked 不认
   flex 宿主里的 dock=5 子页）——`.page { flex-grow: 1; align-self:

@@ -173,6 +173,10 @@ class App {
     // 与皮肤分开保存，并在每次皮肤变更时重新叠放到最上层，
     // 这样切换皮肤会重新为应用换装，而不会丢失其布局。
     string appCss;
+    // 运行期 HTML 装载的作用域序号：每次 LoadHtml 递增，造出
+    // zs-load-<n> 文档作用域类（与 GenHtml 编译通道同一 scoping
+    // 语义，变换器共用 System.Web.HtmlScope）。
+    int htmlLoadSeq;
     // 图表主题包（Gui.Component.Chart/themes/<name>.css）编译出的
     // 独立样式表：解析时垫在内置基线之上、皮肤 sheet 之下，不与
     // 皮肤/appCss 合并成一张表。null = 未安装，图表跟随皮肤。
@@ -1117,12 +1121,28 @@ class App {
     /// 完整形态：带处理器注册表与 `<link>` 的基目录。
     Control LoadHtmlWith(string html, HtmlHandlers handlers, string baseDir) {
         HtmlDoc doc = Html.Parse(html, baseDir, handlers);
+        // 与 GenHtml 编译通道同一 scoping 语义：装载即组件——本次
+        // 文档的元素混入 zs-load-<序>，<style> 规则收窄到只命中本树，
+        // 多次装载的同名类互不串（System.Web.HtmlScope 共用实现）。
+        string zs = "zs-load-" + Convert.ToString(htmlLoadSeq);
+        htmlLoadSeq = htmlLoadSeq + 1;
         if (doc.css != "") {
-            string merged = appCss == "" ? doc.css
-                : appCss + "\n" + doc.css;
+            string scoped = HtmlScope.Styles(doc.css, zs);
+            string merged = appCss == "" ? scoped
+                : appCss + "\n" + scoped;
             this.UseAppCss(merged);
         }
+        this.MarkScope(doc.root, zs);
         return doc.root;
+    }
+
+    /// 给装载树每个元素补作用域类（编译通道由生成码逐节点 AddClass，
+    /// 运行期树建好了，走一遍后处理）。
+    void MarkScope(Control n, string zs) {
+        n.AddClass(zs);
+        for (int i = 0; i < n.ChildCount(); i = i + 1) {
+            this.MarkScope(n.children[i], zs);
+        }
     }
 
     void UseAppCss(string css) {
