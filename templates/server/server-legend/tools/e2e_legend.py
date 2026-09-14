@@ -416,6 +416,33 @@ def run_matrix():
         if r and r.get("item"): draws += 1
     ok(draws == 3, "draw x3 succeed (pool items exist)")
     hero.clear()
+    def ore_count():
+        hero.send({"op": "bag"})
+        rr = hero.reply_for(lambda m: "items" in m)
+        return sum(i["count"] for i in rr.get("items", []) if i["id"] == 223)
+    n0 = ore_count()
+    ok(n0 > 5, "bag holds enough ore for per-item recycle")
+    # 回收系统页按行回收：item=材料 id、count=上限数量；缺价回退半价
+    # （223 无 recycle_prices 行 → sell_price/2 = 1000）。
+    def recycle_reply():
+        return hero.reply_for(lambda m: m.get("gain") is not None
+                              or (m.get("ok") == 0 and "err" in m))
+    hero.send({"op": "recycle", "item": 223, "count": 5})
+    r = recycle_reply()
+    ok(r is not None and r.get("ok") == 1 and r.get("gain") == 5000,
+       "recycle item=223 count=5 -> gain 5000 (half-price fallback)")
+    n1 = ore_count()
+    ok(n1 == n0 - 5, "per-item recycle takes exactly count from the stack")
+    hero.send({"op": "recycle", "item": 223})
+    r = recycle_reply()
+    ok(r is not None and r.get("ok") == 1 and r.get("gain") == n1 * 1000,
+       "recycle item=223 no count -> whole stack settled")
+    ok(ore_count() == 0, "ore gone after whole-stack recycle")
+    hero.clear()
+    hero.send({"op": "recycle", "item": 223})
+    r = recycle_reply()
+    ok(r is not None and r.get("ok") == 0, "recycle missing item -> err")
+    hero.clear()
     hero.send({"op": "recycle"})
     r = hero.reply_for(lambda m: "ok" in m)
     ok(r is not None and (r.get("ok") == 0 or all(
