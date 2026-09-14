@@ -1302,7 +1302,7 @@ leakcheck 子集全部通过；生成 IR 不含 `setjmp`/`longjmp`/`__zan_eh_tmp
 | A43-A14 | `static extern string` 返回的裸 C 指针做下标：合法下标一律报 `string index out of bounds`（`Skin.EmbedList` 逐字符扫描时必崩） | — | ✅ 已修（2026-08-08，`extern_cstring_index.zan`） |
 | A43-A15 | 成员调用解析到不存在的重载时**静默编译并返回空串/默认值**：QueryBuilder 删除旧 `BuildSelect(string,bool)` 后，类内 `BuildSelect(columns, true)` 照常编译，运行时返回 `""`（用户代码里同形调用会正确报错，类内静默——解析路径不一致） | 批B 现场（718bc8af 前后），`tests/conformance/http_params.zan` 开发过程复现同族 | ✅ 已修（2026-08-09，`diag_implicit_ghost_call`）。根因：**隐式 this**（无前缀）调用走裸名分支，未命中后直落兜底静默置零；显式 `this.` 走成员访问分支才有硬错误。修复：irgen_call.c 裸名分支在全局函数未命中后，对封闭类型链做成员名扫描，全缺则报 `'T' has no member 'n'`。**实战即中两雷**：stdlib `Validate.zan` 无恙但 `Worker.zan:1619` 调用从不存在的 `ControlPortHasMaster()`——重启守卫静默恒 false，活主端口被 reuse-bind 抢占；已改接现成 `ProbeControlPort()` |
 | A43-A16 | **重复成员定义静默接受且先者胜**：HttpContext 已有 `Param(string)`（route 专用），新增同名合并版照常编译、全部调用解析到前者——注入面级别的语义偷换零诊断 | 同上开发过程 | ✅ 已修（2026-08-09，`diag_duplicate_member`）。binder.c `check_member_name_clash` 原只查方法↔字段互撞；扩展为：同名字段/属性重复（CS0102）、同签名方法重复（CS0111，按参数类型结构等价比较，合法重载不受影响）、同签名构造器重复、重名枚举成员；方法参数改为先绑定后查重。**实战即中一雷**：stdlib `Validator.Ok()` L31/L85 逐字节重复声明，先者胜掩盖至今；已删 |
-| A43-A17 | codegen 报 `no overload of 'T.M' matches argument type(s)`，实参是**自身即一次方法调用的表达式**（`this.AddClass(this.ActiveSizeCls())`）；同一实参先落 `string` 局部变量再传即正常。typecheck 通过、仅 irgen 拒绝；`Gui.Control` 派生语境下必现（stdlib Switch.zan 两处），但最小探针（继承 + Binding<string> 字段 + 静态映射方法同形写法）不复现，疑与重载集/成员链解析路径有关 | `_scratch/probe_nested.zan`、`_scratch/probe_nested2.zan`（均**不**复现）；复现现场见 Switch.zan 改造（2026-08-29） | ⏳ 未修。暂以局部变量写法绕过（不构成能力缺失，仅诊断误导），排查方向同 A43-A15 的 irgen 实参类型传播 |
+| A43-A17 | codegen 报 `no overload of 'T.M' matches argument type(s)`，实参是**自身即一次方法调用的表达式**（`this.AddClass(this.ActiveSizeCls())`）；同一实参先落 `string` 局部变量再传即正常。typecheck 通过、仅 irgen 拒绝；`Gui.Control` 派生语境下必现（stdlib Switch.zan 两处），但最小探针（继承 + Binding<string> 字段 + 静态映射方法同形写法）不复现，疑与重载集/成员链解析路径有关 | `_scratch/probe_nested.zan`、`_scratch/probe_nested2.zan`（均**不**复现）；复现现场见 Switch.zan 改造（2026-08-29） | ✅ 已无痕治愈（2026-09-15 复测）：后续 irgen 改动顺带治愈——派生类（`class A17 : Switch { void T() { this.AddClass(this.ActiveSizeCls()); } }`）与 Switch.zan 类内原形（HEAD stdlib 快照恢复嵌套调用）两形态编译运行全过，Switch 全量 conformance 绿；stdlib Switch.zan 两处局部变量绕行已恢复为自然形（同提交），原最小探针不复现的原因不再追究 |
 
 > 各条修复细节（根因、落点、探针输出、回归记录）已压缩；原始详细记录在 git 历史与
 > `_scratch/TASKS.md.bak-2026-08-31`。
@@ -1510,7 +1510,7 @@ exactly"；经 `emit_arg_typed` 覆盖全部方法调用实参发射点。2026-0
   〔已实测〕`zanc tests\conformance\python_embed_smoke.zan --auto-stdlib
   --publish` 发布 77 个文件、运行输出 `python-ok: 1`，退出码 0。
 
-# A48 · 交叉编译共享库缺运行时（2026-08-08 记录，未修）
+# A48 · 交叉编译共享库缺运行时 —— ✅ 已完成（A48-1，2026-08-27；本节其余描述已过时）
 
 `emit_lib_linux_so` / `emit_lib_macos_dylib` 两个 standard 用例失败，`zanc` 明确
 拒绝：`cross-compiled shared libraries that use the Zan runtime are not supported
@@ -2451,16 +2451,16 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
   ApplyInline 实例字段克隆不带走。验证：conformance 四用例
   （gui_html_dynamic 运行时通道、gui_zform_dynamic 设计稿两源、
   gui_html_runtime 编译期两源、designer_html 往返扩展输出行不变
-  金标免改）全绿。**顺带发现两个既有编译器缺陷（挂账，与本轮改动
+  金标免改）全绿。**顺带发现两个既有编译器缺陷（挂账→①②均已另行闭账，与本轮改动
   无关、HEAD 干净树可复现）**：① `x is T ? a : b` 解析失败——
   parse_binary 对 `is` 的类型操作数走 parse_type_ref，类型语法把
   `?` 无条件吃成可空类型标记（parser.c:1933/412），需 C# 式歧义
   消解（`?` 后跟表达式则归三元）；现状括号 `(x is T) ? a : b`
-  合法；② 极小 using 集（pull-in 闭包过滤后）编译报
+  合法；**①修讫：2026-09-13 22d75d0e 已落 C# 式消解**。② 极小 using 集（pull-in 闭包过滤后）编译报
   "cannot convert 'CellOf' to 'CellOf'"（Transfer.zan:204/207、
   DataGrid.zan:89/306/341，泛型类内 delegate 同名解析分裂）——
   最小探针触发、同程序大闭包全绿，疑闭包裁剪掉了同名类型的一致
-  解析所需文件，待专项定位。
+  解析所需文件，待专项定位。**②闭账：HEAD 复测无法复现（见「缺陷② CellOf 闭账」条），疑 A312 限定名逃逸根修顺带治愈**。
 
 ### P8-3b 事件带参 data-arg（2026-09-13，提交见 git log）
 
