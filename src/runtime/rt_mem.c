@@ -46,6 +46,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../common/zan_abi.h"
+#include "rt_timer.h"          /* zan_rt_fatal: slab-consistency funnel */
 
 #if defined(__linux__) || defined(__APPLE__) || defined(__unix__)
 #include <sys/mman.h>
@@ -442,15 +443,17 @@ static int zan_mem_hdr_check(const void *p, uint32_t *cls) {
      * those cross-thread operations. */
     uint32_t magic = __atomic_load_n(&h->magic, __ATOMIC_ACQUIRE);
     if (magic == ZAN_MEM_FREED) {
-        fprintf(stderr, "zan runtime: double free of block %p\n", (void *)p);
-        abort();
+        char msg[64];
+        snprintf(msg, sizeof msg, "double free of block %p", p);
+        zan_rt_fatal("mem", msg);
     }
     if (magic != ZAN_MEM_MAGIC) return -1;   /* not a block start: ignore */
     uint32_t c = __atomic_load_n(&h->cls, __ATOMIC_ACQUIRE);
     if (c >= (uint32_t)ZAN_MEM_NCLASS) {   /* header garbage: refuse to trust it */
-        fprintf(stderr, "zan runtime: corrupt block header at %p (class %u)\n",
-                (void *)p, (unsigned)c);
-        abort();
+        char msg[80];
+        snprintf(msg, sizeof msg, "corrupt block header at %p (class %u)",
+                 p, (unsigned)c);
+        zan_rt_fatal("mem", msg);
     }
     *cls = c;
     return 0;
@@ -470,8 +473,9 @@ void __wrap_free(void *p) {
     if (!__atomic_compare_exchange_n(&h->magic, &expect, ZAN_MEM_FREED, 0,
                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
         if (expect == ZAN_MEM_FREED) {
-            fprintf(stderr, "zan runtime: double free of block %p\n", (void *)p);
-            abort();
+            char msg[64];
+            snprintf(msg, sizeof msg, "double free of block %p", p);
+            zan_rt_fatal("mem", msg);
         }
         return;   /* header no longer ours: not a block start */
     }

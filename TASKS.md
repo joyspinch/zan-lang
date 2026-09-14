@@ -1653,7 +1653,7 @@ POSIX gthr，`pthread_*` 全部未定义 → `emit_lib_windows_dll` 链接失败
 
 * **A56 · using 闭包瘦身第一批** ✅（2026-08-27）：MessageBox→System.Windows、DirectoryWatcher→IO.Watch、RandomNumberGenerator/Guid 解耦、双 Stopwatch 合并——`using System` 从 80 文件 564KB 瘦到 16/393KB，standard 558/558；暴露并修掉 mmap 前缀表、缺 using 声明、测试写 build/_scratch 三类隐藏耦合。**未做**：Automation/Management/Windows 去 Threading+Diagnostics 税（见遗留专项）。
 * **A57 · FormBuilder 逻辑像素重构两处回归** ✅（2026-08-27）：补标题只认真写了 label；SetRowHeight 写入 100% 基准镜像。**遗留**：leakcheck_checkbox_group 引用环（见遗留专项）。
-* **A58 · 全量收口执行计划** 🟡（2026-08-27 定序）：批 1（封死静默产错码，含 1.5 有诊断即停 codegen）与批 2（验证基建：arcguard 435 项档、sanitizer 扩容、前端 fuzz 扩容抓出 41KB lexer 栈帧真 bug）完成；批 3-6 未动。正文见下。
+* **A58 · 全量收口执行计划** 🟡（2026-08-27 定序）：批 1（封死静默产错码，含 1.5 有诊断即停 codegen）与批 2（验证基建：arcguard 435 项档、sanitizer 扩容、前端 fuzz 扩容抓出 41KB lexer 栈帧真 bug）完成；批 3 的 3.1/3.2 与批 4 的 4.1/4.2 已完成（2026-09-14），批 3 剩 3.3/3.4 两处待拍板取舍（见下）。正文见下。
 * **A59 · Gui.Image 图片组件** ✅（2026-08-28）：本地/http/base64/SVG 传地址即渲染。
 * **A60 · 局部帧裁剪吃掉条带外点击 + Switch 禁用可点 + 条件真值化 i0** ✅（2026-08-28）。**遗留未解**：注入点击批次偶发整批丢失（1/40，press 到而 release 未泵出，锁屏/高负载时段），待可复现样本查 `Window.InjectEvent`→原生队列→泵路径。
 * **A60 · PivotTable 整体重写** ✅（2026-08-28）：滚动/选中/百分比/热力/钉住合计；边框二修（底色与窗口同色致断裂观感）+ 悬停越界修同批。
@@ -1890,7 +1890,7 @@ memcpy 一并消失（这同时是条性能修复：`parse_postfix` 的前瞻是
 | # | 内容 | 验收 |
 |---|---|---|
 | 3.1 | **A52-7** EH 线程表 1024 硬顶动态化 ✅；A4-2 剩余（`zan_thread_detach()` 接线）已并 **B5** 前置——今日回调源全为 Zan 托管线程，stdlib 零受益者（grep 证） | `thread_eh_slots` 扩到 >1024 并发仍跑完 ✅；峰值内存不回退 ✅（102.3MB→3.9MB） |
-| 3.2 | **A52-8** 库内十余处 `abort()` 改为可注册回调 + 错误码出口（OOM、契约违反、slab 一致性） | 新增"宿主接管 OOM 后自行退出"用例；无回调时行为与今天一致 |
+| 3.2 | **A52-8** 库内十余处 `abort()` 改为可注册回调 + 错误码出口（OOM、契约违反、slab 一致性）✅ **2026-09-14 完成**：`zan_rt_set_fatal_handler`/`zan_rt_fatal(category,message)` 落 rt_timer.c（崩溃机器所在地，每程序必链）；18 处活死点收编——rt_mem×3（double-free/CAS 竞态 double-free/slab 头损坏）、rt_sched×7（6 OOM + task 提前释放契约违反）、rt_io×1（注入节点 OOM）、rt_sync×6（TLS init/set OOM，原 `zan_host_oom` 藏在头文件里漏数）、rt_timer×1（co-live 表扩容）。fatal 单点打印 `zan runtime: fatal (cat): msg` → 回调（宿主自行 exit；接管后返回=违约仍 abort）；无回调 abort 兜底与今天一致（rt_mem 站点原 fprintf 文本并入 message，信息不丢）；rt_wasm longjmp 桩与 host_oom.h（编译器侧）不在范围。链面修复：zanrt_sync_test / zan_rt_mem_dblfree_test / zan_rt_mem_remote_test 补链 rt_timer.c。 | 新增"宿主接管后自行退出"用例 ✅（dblfree 测试扩 takeover child：handler 收到 cat/msg 原文后 exit(71)；返回型 handler 回退 abort 断言；WSL 实跑全绿）；无回调行为与今天一致 ✅（原 abort 双例原样绿）+ Windows runtime_sync/io_addr 绿 + 默认/--fast-alloc 双链接路径探针绿 + standard 845/850（5 红全归因：4 Gui/Chart 并行车道既有 + keepalive 负载 flake 独跑绿） |
 | 3.3 | **A52-5** `--publish` 保留低成本安全网（~~需先定性能预算~~ **已实测，见下**） | publish 版本能报 over-release；约定阈值内不退化 |
 | 3.4 | **A52-6** null 解引用通用守卫 + opaque string 越界检查（~~需先定性能预算~~ **不是预算问题，见下**） | 新增诊断用例；裸循环/字段访问的基准不退化超阈值 |
 
@@ -1946,7 +1946,7 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
 
 | # | 内容 | 验收 |
 |---|---|---|
-| 4.1 | **A57 遗留** ARC 引用环：`Control.OnChildChanged` 虚钩子取代"子控件事件上挂捕获 this 的闭包"，并全库扫同模式 | `leakcheck_checkbox_group` 转绿；扫描结果登记 |
+| 4.1 | **A57 遗留** ARC 引用环：`Control.OnChildEvent` 虚钩子取代"子控件事件上挂捕获 this 的闭包"✅（钩子与三组改造 2026-09-14 完成，见遗留专项「引用环」条）；**全库同模式扫描 ✅**（2026-09-14）：`Add(()` 闭包挂事件全树（stdlib + ide_zan + templates）**0 处活代码**（唯一命中 DataTableModel.zan:2256 文档注释）；IDE 组件的 `.Click.Add(...)` 全为静态方法组（无捕获不成环）——A57 环模式已退役 | `leakcheck_checkbox_group` 转绿 ✅；扫描结果登记 ✅ |
 | 4.2 | 闭包瘦身第二批：`Automation`(61) / `Management`(68) / `Windows`(71) 去 Threading+Diagnostics 税 | ✅ **2026-09-14 完成**：实测 10 / 10 / 4（验收=各降一档，达成）。Window.zan 5 处 + Cpu.zan 2 处（Win/Linux 双支）Thread.Sleep 换 kernel32 `Sleep`/crt `usleep` 文件内 extern，去掉 `using System.Threading`——Threading.zan 一进闭包其 zan_thread_* extern 声明即钉死 rt_sync（ZAN_TRACE_SYNC 实证 Automation 2 旗标→0）。Windows 留 TrayIcon 的 Thread.Start（消息泵真线程，税正当）；Diagnostics 半边只余 Stopwatch ~2 文件且零对象拖带，保留。受影响 6 conformance ×4 孪生 24/24 绿 + standard |
 
 ---

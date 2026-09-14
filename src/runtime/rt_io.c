@@ -3880,7 +3880,7 @@ static void inj_push(zan_co_task t) {
     if (n) g_inj_free = n->next;
     else {
         n = (zan_co_node *)malloc(sizeof(*n));
-        if (!n) abort();
+        if (!n) zan_rt_fatal("oom", "io: injection node alloc failed");
     }
     n->next = NULL; n->frame = t.frame; n->step = t.step;
     if (g_inj_tail) g_inj_tail->next = n; else g_inj_head = n;

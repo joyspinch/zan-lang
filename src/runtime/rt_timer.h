@@ -52,6 +52,25 @@ int zan_rt_soft_is_hard(void);
  * failure even where the operator never set ZAN_RT_HARD=1. The env var still
  * wins when explicitly set to 0 (escape hatch without a rebuild). */
 void zan_rt_set_strict(void);
+/* Host takeover for unrecoverable runtime failures: the allocator's
+ * slab-consistency checks (double free, corrupt header), the scheduler's OOM
+ * fail-fasts and its "task released before completion" contract check, and
+ * the io reactor's node-allocation failure all funnel through zan_rt_fatal.
+ * With no handler the behavior is the historical one: one diagnostic line on
+ * stderr and abort(). An embedder (game server, service supervisor) registers
+ * a handler to log, flush state and terminate itself -- exit() INSIDE the
+ * handler, with the host's own status code. The handler runs on the faulting
+ * thread and must not return: the condition that brought us here (a NULL
+ * about to be dereferenced, a corrupt slab header) is unrecoverable, and a
+ * returning handler falls back to abort(). Register it once at startup,
+ * before any worker exists; the setter is a plain store because it is only
+ * raced by handlers that were never registered. */
+typedef void (*zan_fatal_fn)(const char *category, const char *message);
+void zan_rt_set_fatal_handler(zan_fatal_fn fn);
+/* The funnel itself. `category` is one of "mem" (slab consistency), "sched"
+ * (scheduler contract violation), "oom" (allocation failure in the runtime's
+ * own bookkeeping); `message` is a static description, safe to retain. */
+void zan_rt_fatal(const char *category, const char *message);
 /* A small zeroed, readable/writable page the soft guards substitute for a
  * null base before the lowered GEP+load runs: the fault-free load then reads
  * 0 and stores land in scratch memory instead of page 0. Only the soft path

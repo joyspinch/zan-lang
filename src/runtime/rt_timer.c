@@ -455,6 +455,29 @@ void zan_rt_guard_fail3(const char *file, unsigned line, unsigned col,
     }
     zan_rt_soft_note3(file, line, col, msg);
 }
+
+/* ---- Fatal takeover (zan_rt_fatal) ---- */
+
+static zan_fatal_fn g_fatal_handler;
+
+void zan_rt_set_fatal_handler(zan_fatal_fn fn) { g_fatal_handler = fn; }
+
+void zan_rt_fatal(const char *category, const char *message) {
+    /* One diagnostic line for every fatal path, including the OOM fail-fasts
+     * that historically died without a word. Sites that printed their own
+     * message now pass it here instead, so nothing is printed twice and a
+     * supervisor tailing stderr sees the same stream shape for all of them. */
+    fprintf(stderr, "zan runtime: fatal (%s): %s\n",
+            category ? category : "runtime", message ? message : "");
+    fflush(stderr);
+    zan_fatal_fn fn = g_fatal_handler;
+    if (fn) fn(category, message);
+    /* The handler was supposed to exit() the process itself; returning means
+     * the host wants to keep running through a corrupt heap or a NULL the
+     * caller will immediately dereference -- refuse, exactly as before the
+     * hook existed. */
+    abort();
+}
 typedef enum zan_timer_kind {
     ZAN_TIMER_DELAY = 0,
     ZAN_TIMER_PUBLIC = 1
@@ -945,7 +968,7 @@ static void live_rehash(size_t ncap) {
     void **old = g_colive_slots;
     size_t ocap = g_colive_cap;
     void **ns = (void **)calloc(ncap, sizeof(*ns));
-    if (!ns) zan_host_oom();
+    if (!ns) zan_rt_fatal("oom", "timer: coroutine-live table grow failed");
     g_colive_slots = ns;
     g_colive_cap = ncap;
     g_colive_dead = 0;

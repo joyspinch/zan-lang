@@ -26,7 +26,7 @@
 #include <string.h>
 #include <time.h>
 
-#include "../common/host_oom.h"
+#include "rt_timer.h"           /* zan_rt_fatal: OOM funnel */
 #include "../common/zan_abi.h"
 
 #ifdef _WIN32
@@ -183,14 +183,14 @@ static char *zan_get_shared_string(void) {
     char *buffer;
     if (!InitOnceExecuteOnce(
             &zan_shared_string_once, zan_shared_string_init, NULL, NULL)) {
-        zan_host_oom();
+        zan_rt_fatal("oom", "sync: shared-string TLS init failed");
     }
     buffer = (char *)FlsGetValue(zan_shared_string_slot);
     if (!buffer) {
         buffer = (char *)calloc(ZAN_TABLE_MAX_STRING + 1, 1);
         if (!FlsSetValue(zan_shared_string_slot, buffer)) {
             free(buffer);
-            zan_host_oom();
+            zan_rt_fatal("oom", "sync: shared-string TLS set failed");
         }
     }
     return buffer;
@@ -202,7 +202,7 @@ static void zan_shared_string_dtor(void *buffer) { free(buffer); }
 
 static void zan_shared_string_key_create(void) {
     if (pthread_key_create(&zan_shared_string_key, zan_shared_string_dtor) != 0)
-        zan_host_oom();
+        zan_rt_fatal("oom", "sync: shared-string TLS init failed");
 }
 
 static char *zan_get_shared_string(void) {
@@ -213,7 +213,7 @@ static char *zan_get_shared_string(void) {
         buffer = (char *)calloc(ZAN_TABLE_MAX_STRING + 1, 1);
         if (pthread_setspecific(zan_shared_string_key, buffer) != 0) {
             free(buffer);
-            zan_host_oom();
+            zan_rt_fatal("oom", "sync: shared-string TLS set failed");
         }
     }
     return buffer;
@@ -2878,7 +2878,7 @@ static void zan_plat_text_dtor(void *buffer) { free(buffer); }
 
 static void zan_plat_text_key_create(void) {
     if (pthread_key_create(&zan_plat_text_key, zan_plat_text_dtor) != 0)
-        zan_host_oom();
+        zan_rt_fatal("oom", "sync: text TLS init failed");
 }
 
 static char *zan_get_plat_text(void) {
@@ -2889,7 +2889,7 @@ static char *zan_get_plat_text(void) {
         buffer = (char *)calloc(ZAN_PLAT_TEXT_MAX, 1);
         if (pthread_setspecific(zan_plat_text_key, buffer) != 0) {
             free(buffer);
-            zan_host_oom();
+            zan_rt_fatal("oom", "sync: text TLS set failed");
         }
     }
     return buffer;

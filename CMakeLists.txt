@@ -678,6 +678,7 @@ add_executable(zanrt_sync_test
     tests/runtime/rt_sync_test.c
     src/runtime/rt_sync.c
     src/runtime/rt_file.c
+    src/runtime/rt_timer.c # zan_rt_fatal: rt_sync's OOM funnel
 )
 target_include_directories(zanrt_sync_test PRIVATE ${CMAKE_SOURCE_DIR})
 set_target_properties(zanrt_sync_test PROPERTIES
@@ -1230,12 +1231,15 @@ if(NOT WIN32 AND NOT APPLE)
   add_executable(zan_rt_mem_dblfree_test
     tests/runtime/rt_mem_dblfree_test.c
     src/runtime/rt_mem.c
+    src/runtime/rt_timer.c # zan_rt_fatal: the slab guards funnel through it
   )
   target_include_directories(zan_rt_mem_dblfree_test PRIVATE ${CMAKE_SOURCE_DIR})
   set_target_properties(zan_rt_mem_dblfree_test PROPERTIES
     C_STANDARD 11
     C_STANDARD_REQUIRED YES
   )
+  find_package(Threads REQUIRED)
+  target_link_libraries(zan_rt_mem_dblfree_test PRIVATE Threads::Threads)
   target_link_options(zan_rt_mem_dblfree_test PRIVATE
     -Wl,--wrap=malloc -Wl,--wrap=free -Wl,--wrap=calloc -Wl,--wrap=realloc
   )
@@ -1248,6 +1252,7 @@ if(NOT WIN32 AND NOT APPLE)
   add_executable(zan_rt_mem_remote_test
     tests/runtime/rt_mem_remote_test.c
     src/runtime/rt_mem.c
+    src/runtime/rt_timer.c # zan_rt_fatal: the slab guards funnel through it
   )
   target_include_directories(zan_rt_mem_remote_test PRIVATE ${CMAKE_SOURCE_DIR})
   set_target_properties(zan_rt_mem_remote_test PROPERTIES

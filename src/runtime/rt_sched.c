@@ -16,6 +16,7 @@
 
 #include "rt_sched.h"
 #include "rt_io.h"
+#include "rt_timer.h"       /* zan_rt_fatal: OOM / contract funnel */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -144,9 +145,9 @@ static void plat_sched_enter(void) { g_sched_fiber = &g_sched_ctx; }
 static void plat_sched_leave(void) {}
 static void *plat_fiber_new(zan_co_t *co) {
     posix_fiber_t *pf = (posix_fiber_t *)calloc(1, sizeof(*pf));
-    if (!pf) abort();                 /* OOM: fail fast, like the rest of rt_* */
+    if (!pf) zan_rt_fatal("oom", "scheduler: fiber control block alloc failed");
     pf->stack = plat_stack_alloc();
-    if (!pf->stack) abort();          /* OOM: fail fast, like the rest of rt_* */
+    if (!pf->stack) zan_rt_fatal("oom", "scheduler: fiber stack alloc failed");
     getcontext(&pf->ctx);
     pf->ctx.uc_stack.ss_sp = pf->stack;
     pf->ctx.uc_stack.ss_size = ZAN_CO_STACK;
@@ -213,7 +214,7 @@ static zan_co_t *ready_pop(void) {
 
 static zan_task_t *task_new(zan_co_t *owner) {
     zan_task_t *t = (zan_task_t *)calloc(1, sizeof(*t));
-    if (!t) abort();                  /* OOM: fail fast, like the rest of rt_* */
+    if (!t) zan_rt_fatal("oom", "scheduler: task alloc failed");
     t->co = owner;
     t->all_next = g_all_tasks;
     g_all_tasks = t;
@@ -261,8 +262,7 @@ void zan_task_release(zan_task_t *task) {
          * memory), its coroutine may not have run out, or another coroutine
          * is parked in await reading its result. There is no safe early
          * release -- refuse loudly instead of corrupting the heap. */
-        fprintf(stderr, "zan runtime: task released before completion\n");
-        abort();
+        zan_rt_fatal("sched", "task released before completion");
     }
     *pp = task->all_next;
     free(task);
@@ -282,7 +282,7 @@ static void timer_add(zan_task_t *t, int64_t delay_ms) {
     if (g_timer_n == g_timer_cap) {
         size_t nc = g_timer_cap ? g_timer_cap * 2 : 64;
         zan_timer_t *nt = (zan_timer_t *)realloc(g_timers, nc * sizeof(*nt));
-        if (!nt) abort();             /* OOM: fail fast, like the rest of rt_* */
+        if (!nt) zan_rt_fatal("oom", "scheduler: timer table grow failed");
         g_timers = nt;
         g_timer_cap = nc;
     }
@@ -354,12 +354,12 @@ static void co_trampoline_posix(unsigned hi, unsigned lo) {
 
 zan_task_t *zan_spawn(zan_co_body_t body, void *arg) {
     zan_co_t *co = (zan_co_t *)calloc(1, sizeof(*co));
-    if (!co) abort();                 /* OOM: fail fast, like the rest of rt_* */
+    if (!co) zan_rt_fatal("oom", "scheduler: coroutine alloc failed");
     co->body = body;
     co->task = task_new(co);
     co->task->arg = arg;
     co->fiber = plat_fiber_new(co);
-    if (!co->fiber) abort();          /* OOM / fiber limits: fail fast */
+    if (!co->fiber) zan_rt_fatal("oom", "scheduler: fiber alloc failed");
     g_live++;
     ready_push(co);
     return co->task;
