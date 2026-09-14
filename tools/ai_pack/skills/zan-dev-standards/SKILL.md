@@ -70,6 +70,14 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   回复错位；断言谓词用目标回复的独有形状（如"含 rows 数组"），宽谓词
   （"有 ok 字段即中"）会被心跳/广播回复误命中；每个操作前清空上一操作
   的待收队列。
+- **外壳非客户区行为用真实消息 + 显式泵断言**：双击标题栏、SC_MAXIMIZE
+  这类 WndProc 路径，PostMessage 到真实 hwnd 再显式 PumpGuarded，消息在
+  泵内同步派发，无 sleep、无时序依赖。两条坑：NC 双击的 wParam 必须是
+  WM_NCHITTEST 的 HTCAPTION(2)——传 0（HTERROR）DefWindowProc 静默忽略，
+  "双击被挡住"的断言是空洞的假绿；RunLoop 的帧体只在 needsRedraw 时跑，
+  静止窗口上永不点火——场景别挂在帧体上，用 worker 线程发消息
+  （PostMessageW/IsZoomed 线程安全）+ app.Post 回 UI 线程收尾
+  （Post 契约即线程安全）。
 
 ## 四、经验沉淀纪律（skill 的准入标准）
 
