@@ -753,22 +753,18 @@ static LLVMValueRef get_dict_find_fn(zan_irgen_t *g) {
 
 /* i64 __zan_dict_remove(i8* draw, i8* key, i64 is_str): remove the entry with
  * `key` from the hash index and shrink the count; returns the removed entry's
- * index (callers release the key/value and move the last entry into that hole
- * themselves, with the ARC types they know), or -1 when the key is absent.
+ * index (callers release the key/value and shift every entry above the hole
+ * down one slot themselves, with the ARC types they know), or -1 when the key
+ * is absent.
  *
- * The index stays VALID after this -- no full rebuild on the next lookup, which
- * is what made a Remove loop quadratic (every Remove left indexed_count stale,
- * so the next find rebuilt all cap slots; 100k removes from a 200k dict cost
- * six minutes). Two slot updates plus one linear-probe deletion (backward shift
- * of the cluster after the emptied slot) keep probe invariants intact:
- *   1. probe hash(key) for the slot holding fi+1 (the entry being removed);
- *   2. when fi != last, probe hash(ks[last]) for the slot holding last+1 and
- *      rewrite it to fi+1 -- the moved entry keeps its position;
- *   3. clear the removed slot, then re-seat every following entry of the
- *      cluster whose home does not lie cyclically within (hole, cursor]
- *      (standard deletion for linear probing; a cleared slot without it cuts
- *      probe chains).
- * cnt and indexed_count decrement together, so lookups see a fresh index. */
+ * The helper does find + cnt-- + indexed_count = 0: the hash index is dropped
+ * wholesale and find rebuilds it from scratch on the next lookup (the
+ * icnt != cnt stale check fires; the rebuild is the same O(n) class as the
+ * caller's ordered data shift). An earlier design swap-removed the LAST entry
+ * into the hole and repaired the index incrementally — incremental repair
+ * could not survive the ordered shift (every entry above fi is renumbered)
+ * and the swap itself reordered Keys/Values away from insertion order, so it
+ * was replaced wholesale by b8bb4c35. */
 static LLVMValueRef get_dict_remove_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_dict_remove");
     if (fn) return fn;

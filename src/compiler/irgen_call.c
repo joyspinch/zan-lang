@@ -4153,14 +4153,16 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             }
         }
 
-        /* Dict.Remove(key) — O(1): the helper probes the hash index, re-points
-         * the moved entry's slot and backward-shifts the cluster after the
-         * emptied slot, keeping the index VALID (no full rebuild on the next
-         * lookup — that rebuild-per-remove was what made Remove loops
-         * quadratic: 100k removes from a 200k dict cost six minutes). The
-         * helper returns the removed entry's index; this caller releases the
-         * key/value (ARC types it knows) and moves the last entry into the
-         * hole. Receiver resolved by static type (locals and fields alike). */
+        /* Dict.Remove(key) — the helper finds the entry, decrements the count
+         * and invalidates the hash index (indexed_count = 0); find rebuilds it
+         * from scratch on the next lookup, the same O(n) class as this
+         * caller's data shift. That shift moves every entry above the hole
+         * down one slot so the parallel buffers keep insertion order (C#
+         * observable enumeration semantics; the layout contract documented at
+         * dict_struct_type). The helper returns the removed entry's index;
+         * this caller releases the key/value (ARC types it knows) and does
+         * the shift. Receiver resolved by static type (locals and fields
+         * alike). */
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
             zan_ast_node_t *callee_d = expr->call.callee;
             zan_istr_t mname = callee_d->member.name;
