@@ -3250,3 +3250,43 @@ P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
   （并行会话噪声回落）。⑥-3b 挂账不变：grid/geo 锚格托管（mini-bar-
   geo/grid-layout/sparkline/matrix-stock 的 title.coord+grid.coord+
   axes.gridIndex+time breaks 复合体）。
+
+* **台账⑥-3b 闭账：grid/geo/title 锚格托管 + media 缺省合并 + 迷你
+  面板壳带治理（2026-09-15，批次⑥续）**：matrix-mini-bar-geo 从
+  BLANK→全格渲染（40 柱 + 10 瑞士地图），matrix-grid-layout /
+  matrix-sparkline / matrix-stock 骨架成形。官方语义对抄：①**grid
+  锚格**：`grid.coordinateSystem:"matrix" + coord` → 格矩形按自身
+  top/bottom 六参内缩（GridRawRect 对格宽高解算），axes 按 gridId/
+  下标对齐进子面板单轴表，系列按 xAxisIndex 分组重入分发链；
+  ②**geo 锚格**：`geo.coordinateSystem:"matrix" + coord` → 每 geo
+  一个单载体系列子 option 复用 DrawMap 落格；③**title 锚格**：
+  title 数组项 coord → 格矩形定位（grid-layout 五节标题、stock 的
+  Order Book/Depth/MACD/Volume）；④**media 缺省形态**：无 query 的
+  条目 = 查询不中时的缺省形态，title/grid/matrix 数据按 id 合并覆
+  写（grid-layout 的响应式分节）；⑤**锚格尺寸门**：多格拆分的
+  40px 退化门对锚格放行 8px（官方迷你格合法形态 ~40px）；⑥**body
+  网格线随 itemStyle.borderColor:'none' 整体消失**（承载子图的格
+  不许格线压板）。**三处壳带吃光迷你格的教训（每次都"渲染了但看不
+  见"）**：主题 paddingMedium(18) 在 42px 格上下各吃一行 → HBarCore
+  plotH 算成 6px 早退、DrawMap 绘图区剩 6px 地图成细条——迷你面板
+  pad 收缩为 Scale(2..3)；x 轴标签带 botGut 不看 axisLabel.show 照
+  占 22px——跟随 labelShow；锚格内图例把格吃穿——按格不画（官方
+  legend:{} 画整幅底部，面板级图例挂账⑦）。**DrawMap 动画门陷阱**：
+  矢量区域填色整个包在 `else if (g >= 1000)` 里，g<1000 只填底——
+  复用渲染器时传 999（防快照互踩）结果区域全无，锚格无动画语义必须
+  传 1000（10 个 geo 快照指纹随格矩形互异，同槽不会误命中）。
+  **resolved 克隆漏拷新字段的变体**：ChartGeo.Clone 不拷 matAnchor/
+  mx0..my1，源 option 探针全绿、渲染端锚格全灭——给 spec 结构加字
+  段必须同步过查 Clone/DrawOption 每条过河路（上条 ⑥-3a 的解析双
+  车道教训的克隆版）。**验证纪律教训**：sweep 后必须先跑 analyzer
+  刷新 PNG 再判断——本轮"修好了但看着还空"的过期 PNG 多绕了四轮
+  构建。value-x/category-y 的 `[值, 类目名]` 对（[[1212, ""]]）进
+  cs.data 并直接登记轴类目（空串也是类目，Set 去重；通用回填块只
+  认非空名）。验证：parsecheck exit 0；sweep 总旗标 165（并行会话
+  新增 3 个 doc-example/geo-svg-* BLANK，非本车道）；matrix 族仅剩
+  grid-layout EDGE-CLIP LRB（10 行矩阵撑满 1160×760 画布的内容贴
+  缘，响应式 demo 的比例性 artifact，结构全对）；bench
+  matrix-mini-bar-geo 稳态 4-5ms。挂账：矩阵锚格形态的面板级图例
+  （legend:{} 应画整幅底部）、sparkline 的 x 轴末标签挤行 / y 轴
+  "400/400" 重影（interval 9007199254740991 缺省）、mini bar 段内
+  标签挤压。

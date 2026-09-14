@@ -204,6 +204,23 @@ partial class ChartView {
         geo.ry = top + tt;
         geo.rw = w - l - r;
         geo.rh = ph - tt - bb;
+        // width/height 声明覆盖对面边推导；left "center" / top
+        // "middle" 随声明生效（官方 parseSizeOption：width 百分比对
+        // 容器宽，center = 居中安放）。
+        if (m.wRaw != null && m.wRaw.kind == 1) {
+            geo.rw = (int)(m.wRaw.num + 0.5);
+            if (m.leftCenter) { geo.rx = x + (w - geo.rw) / 2; }
+        } else if (m.wRaw != null && m.wRaw.kind == 2) {
+            geo.rw = (int)((double)w * m.wRaw.num / 100.0 + 0.5);
+            if (m.leftCenter) { geo.rx = x + (w - geo.rw) / 2; }
+        }
+        if (m.hRaw != null && m.hRaw.kind == 1) {
+            geo.rh = (int)(m.hRaw.num + 0.5);
+            if (m.topMiddle) { geo.ry = top + (ph - geo.rh) / 2; }
+        } else if (m.hRaw != null && m.hRaw.kind == 2) {
+            geo.rh = (int)((double)ph * m.hRaw.num / 100.0 + 0.5);
+            if (m.topMiddle) { geo.ry = top + (ph - geo.rh) / 2; }
+        }
         if (geo.rw < 8 || geo.rh < 8) { return null; }
         geo.xBands = m.xLevels;
         geo.yBands = m.yLevels;
@@ -257,6 +274,34 @@ partial class ChartView {
         return f;
     }
 
+    /// 多行文本块居中绘制：按 \n 分行，行距 = 字号 + 3px 设计值；
+    /// 块整体在 (x,y,w,h) 内水平垂直居中（矩阵头带/体区/角区文本
+    /// 共用——官方 sparkline 的 "8:00\n~\n10:00" 三行标签）。
+    static void MatDrawLinesCentered(Canvas c, int x, int y, int w, int h,
+                                     string text, int col, int font, App app) {
+        if (text == null || text.Length < 1 || w < 1 || h < 1) { return; }
+        int lineH = font + app.Scale(3);
+        int lines = 1;
+        for (int ci = 0; ci < text.Length; ci = ci + 1) {
+            if (text[ci] == '\n') { lines = lines + 1; }
+        }
+        int blockH = lines * lineH;
+        int curY = y + (h - blockH) / 2;
+        string line = "";
+        for (int ci = 0; ci <= text.Length; ci = ci + 1) {
+            if (ci == text.Length || text[ci] == '\n') {
+                if (line.Length > 0) {
+                    int lw = c.MeasureText(line, font);
+                    c.DrawText(x + (w - lw) / 2, curY, line, col, font);
+                }
+                curY = curY + lineH;
+                line = "";
+            } else {
+                line = line + text.Substring(ci, 1);
+            }
+        }
+    }
+
     /// 盒单边声明的指纹折叠（kind 区分 px/%，num ×100 保两位小数）。
     static int MatBoxFold(ChartBoxParam p) {
         if (p == null) { return 0; }
@@ -291,6 +336,15 @@ partial class ChartView {
         f = (f * 31 + (m.xShow ? 1 : 0) + (m.yShow ? 2 : 0)
             + ChartView.MatBoxFold(m.xLevelSize) * 13
             + ChartView.MatBoxFold(m.yLevelSize) * 17) % 2000000000;
+        f = (f * 31 + ChartView.MatBoxFold(m.wRaw)
+            + ChartView.MatBoxFold(m.hRaw) * 3
+            + (m.leftCenter ? 5 : 0) + (m.topMiddle ? 7 : 0)) % 2000000000;
+        f = (f * 31 + m.xLabelFontSize + m.yLabelFontSize * 3
+            + m.xLabelColor + m.yLabelColor * 7
+            + (m.xLabelBold ? 11 : 0) + (m.yLabelBold ? 13 : 0)) % 2000000000;
+        for (int ct = 0; ct < m.cornerText.Count; ct = ct + 1) {
+            f = ChartView.MatTextFold(f, m.cornerText[ct]);
+        }
         f = (f * 31 + m.xItemColor + m.yItemColor * 3
             + (m.bodyBorder ? 5 : 0)) % 2000000000;
         for (int i = 0; i < m.xText.Count; i = i + 1) {
@@ -310,6 +364,8 @@ partial class ChartView {
         for (int bi = 0; bi < m.bodyText.Count; bi = bi + 1) {
             f = (f * 31 + m.bodyX0[bi] * 7 + m.bodyX1[bi] * 11
                 + m.bodyY0[bi] * 13 + m.bodyY1[bi] * 17) % 2000000000;
+            f = (f * 31 + m.bodyLabelColor[bi]
+                + m.bodyLabelFontSize[bi] * 3) % 2000000000;
             f = ChartView.MatTextFold(f, m.bodyText[bi]);
         }
         double eLo = 0.0;
@@ -465,17 +521,21 @@ partial class ChartView {
         }
 
         // 体区格网：叶列/叶行界线（官方 body cell borderWidth 1）。
-        for (int k = geo.yBands + 1; k < geo.unitsX; k = k + 1) {
-            int lx = ChartView.MatXAt(geo, k);
-            c.FillRect(lx, geo.bodyT, 1, (geo.ry + geo.rh) - geo.bodyT, gridC);
+        // body.itemStyle.borderColor 'none' → 整张体区格网一起去掉
+        // （matrix-grid-layout 承载子图，格线压在子图上）。
+        if (m.bodyBorder) {
+            for (int k = geo.yBands + 1; k < geo.unitsX; k = k + 1) {
+                int lx = ChartView.MatXAt(geo, k);
+                c.FillRect(lx, geo.bodyT, 1, (geo.ry + geo.rh) - geo.bodyT, gridC);
+            }
+            for (int l = geo.xBands + 1; l < geo.unitsY; l = l + 1) {
+                int ly = ChartView.MatYAt(geo, l);
+                c.FillRect(geo.bodyL, ly, (geo.rx + geo.rw) - geo.bodyL, 1, gridC);
+            }
+            // 体区左/上边界线（头带与体格的分界）。
+            c.FillRect(geo.bodyL, geo.bodyT, 1, (geo.ry + geo.rh) - geo.bodyT, gridC);
+            c.FillRect(geo.bodyL, geo.bodyT, (geo.rx + geo.rw) - geo.bodyL, 1, gridC);
         }
-        for (int l = geo.xBands + 1; l < geo.unitsY; l = l + 1) {
-            int ly = ChartView.MatYAt(geo, l);
-            c.FillRect(geo.bodyL, ly, (geo.rx + geo.rw) - geo.bodyL, 1, gridC);
-        }
-        // 体区左/上边界线（头带与体格的分界）。
-        c.FillRect(geo.bodyL, geo.bodyT, 1, (geo.ry + geo.rh) - geo.bodyT, gridC);
-        c.FillRect(geo.bodyL, geo.bodyT, (geo.rx + geo.rw) - geo.bodyL, 1, gridC);
 
         // x 头带：叶列竖线只落在叶子自己的带行（末带）到体缘——
         // 官方逐格描边：叶格跨带到体缘，组格只占本带行（组带行内
@@ -537,34 +597,51 @@ partial class ChartView {
             if (m.bodyBorder) {
                 c.DrawRect(bx, by, bx2 - bx, by2 - by, gridC, 1);
             }
-            c.DrawTextCentered(bx, by, bx2 - bx, by2 - by,
-                m.bodyText[bi], axisC, axisFont);
+            int bcol = m.bodyLabelColor[bi] != 0 ? m.bodyLabelColor[bi] : axisC;
+            int bfont = m.bodyLabelFontSize[bi] > 0
+                ? m.bodyLabelFontSize[bi] : axisFont;
+            ChartView.MatDrawLinesCentered(c, bx, by, bx2 - bx, by2 - by,
+                m.bodyText[bi], bcol, bfont, app);
+        }
+
+        // 角区文本（sparkline 的 "Time"；coord [-1,-1] = 整角区）。
+        for (int ct = 0; ct < m.cornerText.Count; ct = ct + 1) {
+            ChartView.MatDrawLinesCentered(c, geo.rx, geo.ry,
+                geo.bodyL - geo.rx, geo.bodyT - geo.ry,
+                m.cornerText[ct], axisC, axisFont, app);
         }
 
         // 头带标签：x 树格画在各自头带格（列域 × 带高），y 树格
         // 对称。带高放不下字号时跳过（密集网格靠结构辨识）。
+        int xLabFs = m.xLabelFontSize > 0 ? m.xLabelFontSize : axisFont;
+        int xLabCol = m.xLabelColor != 0 ? m.xLabelColor : axisC;
+        int yLabFs = m.yLabelFontSize > 0 ? m.yLabelFontSize : axisFont;
+        int yLabCol = m.yLabelColor != 0 ? m.yLabelColor : axisC;
         int bandH = ChartView.MatYAt(geo, 1) - geo.ry;
-        bool xLabOk = m.xShow && bandH >= axisFont;
+        bool xLabOk = m.xShow && bandH >= xLabFs;
         for (int i = 0; i < m.xText.Count && xLabOk; i = i + 1) {
             int cx;
             int cy;
             int cw;
             int ch;
             ChartView.MatXCellRect(geo, m, i, out cx, out cy, out cw, out ch);
-            if (cw >= app.Scale(14)) {
-                c.DrawTextCentered(cx, cy, cw, ch, m.xText[i], axisC, axisFont);
+            if (m.xText[i].Length > 0 && cw >= app.Scale(14)) {
+                ChartView.MatDrawLinesCentered(c, cx, cy, cw, ch, m.xText[i],
+                    xLabCol, xLabFs, app);
             }
         }
         int bandW = ChartView.MatXAt(geo, 1) - geo.rx;
-        bool yLabOk = m.yShow && bandW >= axisFont + app.Scale(2);
+        bool yLabOk = m.yShow && bandW >= yLabFs + app.Scale(2);
         for (int j = 0; j < m.yText.Count && yLabOk; j = j + 1) {
             int cx;
             int cy;
             int cw;
             int ch;
             ChartView.MatYCellRect(geo, m, j, out cx, out cy, out cw, out ch);
-            if (ch >= app.Scale(10) && cw >= app.Scale(14)) {
-                c.DrawTextCentered(cx, cy, cw, ch, m.yText[j], axisC, axisFont);
+            if (m.yText[j].Length > 0 && ch >= app.Scale(10)
+                && cw >= app.Scale(14)) {
+                ChartView.MatDrawLinesCentered(c, cx, cy, cw, ch, m.yText[j],
+                    yLabCol, yLabFs, app);
             }
         }
 

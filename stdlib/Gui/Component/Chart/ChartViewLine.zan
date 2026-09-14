@@ -511,29 +511,61 @@ partial class ChartView {
         int nG = o.grids.Count;
         if (nG < 1) { return; }
         int headerH = app.Scale(o.titles.Count > 0 ? 52 : 30);
+        // matrix 锚定形态（⑥-3b）：矩阵骨架整幅先画（自带快照缓存），
+        // 格几何现算一份供 grid/geo/title 锚定取矩形。
+        MatGeom mgeo = null;
+        if (o.matrix != null) {
+            ChartView.DrawMatrix(app, x, y, w, h, o, g);
+            int mtop = Chart.HeadBandBottom(app, y, o.title);
+            mgeo = ChartView.MatLayout(app, x, y, w, h, mtop, o, 0.0, 1.0);
+        }
         for (int gi = 0; gi < nG; gi = gi + 1) {
             ChartGridSpec gs = o.grids[gi];
             // A16：与单格 BuildAxesR 同一解算（GridRawRect）——矩形只
             // 由六参决定；面板头/图例带是外壳语义，仅当声明值伸进头
-            // 部时钳回（头部内容永远优先显示）。
-            ChartLayoutRect gr = Chart.GridRawRect(gs.lRaw, gs.rRaw,
-                gs.tRaw, gs.bRaw, gs.wRaw, gs.hRaw, (double)w, (double)h, false);
+            // 部时钳回（头部内容永远优先显示）。matrix 锚定格以格矩
+            // 形为基准再按自身六参内缩，不参与外壳钳制。
+            bool anchored = gs.matAnchor && mgeo != null;
+            ChartLayoutRect gr;
+            if (anchored) {
+                int cx0 = ChartView.MatXAt(mgeo, mgeo.yBands + gs.mx0);
+                int cx1 = ChartView.MatXAt(mgeo, mgeo.yBands + gs.mx1 + 1);
+                int cy0 = ChartView.MatYAt(mgeo, mgeo.xBands + gs.my0);
+                int cy1 = ChartView.MatYAt(mgeo, mgeo.xBands + gs.my1 + 1);
+                gr = Chart.GridRawRect(gs.lRaw, gs.rRaw, gs.tRaw, gs.bRaw,
+                    gs.wRaw, gs.hRaw, (double)(cx1 - cx0),
+                    (double)(cy1 - cy0), false);
+                gr.x = gr.x + (cx0 - x);
+                gr.y = gr.y + (cy0 - y);
+            } else {
+                gr = Chart.GridRawRect(gs.lRaw, gs.rRaw,
+                    gs.tRaw, gs.bRaw, gs.wRaw, gs.hRaw, (double)w, (double)h, false);
+            }
             int gx0 = x + (int)Math.Round(gr.x);
             int gx1 = gx0 + (int)Math.Round(gr.width);
             int gy0 = y + (int)Math.Round(gr.y);
             int gy1 = gy0 + (int)Math.Round(gr.height);
-            if (gy0 < y + headerH) { gy0 = y + headerH; }
-            if (gy1 > y + h - Chart.legendBottomReserve) {
-                gy1 = y + h - Chart.legendBottomReserve;
+            if (!anchored) {
+                if (gy0 < y + headerH) { gy0 = y + headerH; }
+                if (gy1 > y + h - Chart.legendBottomReserve) {
+                    gy1 = y + h - Chart.legendBottomReserve;
+                }
             }
-            if (gy1 - gy0 < app.Scale(40) || gx1 - gx0 < app.Scale(40)) { continue; }
+            // 尺寸门只防退化矩形（全画面板误声明等）；matrix 锚格的
+            // 迷你面板是合法形态（官方 mini-bar 每格仅 ~40px 高），
+            // 门槛对齐 geo 落格的 8px。
+            if (gy1 - gy0 < app.Scale(anchored ? 8 : 40)
+                || gx1 - gx0 < app.Scale(anchored ? 8 : 40)) { continue; }
 
             // 系列按 xAxisIndex 分组（越界钳入最后一格，不声明轴的
             // demo 靠它落位）；visualMap.seriesIndex 重映射到组内新
-            // 下标（visualMap 是全局面板语义）。
+            // 下标（visualMap 是全局面板语义）。matrix 锚定形态下
+            // geo 载体系列（isGeoBase）不进格分组——它们按 geo.coord
+            // 单独落格。
             List<ChartSeries> grp = new List<ChartSeries>();
             List<int> origIdx = new List<int>();
             for (int si3 = 0; si3 < o.series.Count; si3 = si3 + 1) {
+                if (o.matrix != null && o.series[si3].isGeoBase) { continue; }
                 int giEff = o.series[si3].xIndex;
                 if (giEff > nG - 1) { giEff = nG - 1; }
                 if (giEff != gi) { continue; }
@@ -586,7 +618,11 @@ partial class ChartView {
             sub.zoom = o.zoom;
             Chart.zoomBarHidden = gi != nG - 1;
             // 图例全图一份，随第一格（官方多 grid 图例置顶）。
-            sub.showLegend = o.showLegend && gi == 0;
+            // 图例全图一份，随第一格（官方多 grid 图例置顶）。matrix
+            // 锚定形态的格是迷你面板（~40px），格内图例会把绘图区
+            // 吃穿——官方 legend:{} 画在整幅底部，面板级图例挂账
+            // （TASKS.md ⑥-3b），这里先按格内不画走。
+            sub.showLegend = o.showLegend && gi == 0 && !anchored;
             sub.xAxes = new List<ChartAxis>();
             if (gi < o.xAxes.Count) { sub.xAxes.Add(o.xAxes[gi]); }
             sub.yAxes = new List<ChartAxis>();
@@ -601,6 +637,10 @@ partial class ChartView {
             List<ChartSeries> subSeries = new List<ChartSeries>();
             for (int si4 = 0; si4 < o.series.Count; si4 = si4 + 1) {
                 ChartSeries cs4 = o.series[si4];
+                // 与上面的 grp 分组同一条规则：matrix 锚定形态下 geo
+                // 载体系列不进格（否则载体 series[0] 把子面板 kind
+                // 劫持成 map，迷你 bar 全灭）。
+                if (o.matrix != null && cs4.isGeoBase) { continue; }
                 int gx4 = cs4.xIndex;
                 if (gx4 > nG - 1) { gx4 = nG - 1; }
                 if (gx4 != gi) { continue; }
@@ -611,6 +651,13 @@ partial class ChartView {
             sub.title = ""; sub.titleSub = "";
             sub.titles = new List<ChartTitleSpec>();
             sub.visualMaps = new List<ChartVisualMap>();
+            if (o.matrix != null) {
+                // matrix 锚定形态：子面板绝不能带 matrix（否则子分发
+                // 又进 matrix 车道重画整幅骨架），dataZoom 滑条也不随
+                // 格画（官方位在矩阵盒底缘之外，挂账）。
+                sub.zoom = false;
+                Chart.zoomBarHidden = true;
+            }
             for (int vi3 = 0; vi3 < o.visualMaps.Count; vi3 = vi3 + 1) {
                 ChartVisualMap vm3 = ChartVisualMap.Clone(o.visualMaps[vi3]);
                 if (vm3 != null) {
@@ -629,35 +676,90 @@ partial class ChartView {
             Chart.gridPanelSub = false;
             Chart.zoomBarHidden = false;
         }
+        // matrix 锚定的 geo 组件：逐个构造单 geo 子 option 落到格矩形
+        // （复用 DrawMap 的单矩形渲染；roam/tooltip 不启用，g=999 走
+        // 非快照帧——快照槽按 CacheKey 全局编址，同帧多图互踩）。
+        if (o.matrix != null && mgeo != null) {
+            for (int gi8 = 0; gi8 < o.geos.Count; gi8 = gi8 + 1) {
+                ChartGeo ge = o.geos[gi8];
+                if (!ge.matAnchor) { continue; }
+                int gcx0 = ChartView.MatXAt(mgeo, mgeo.yBands + ge.mx0);
+                int gcx1 = ChartView.MatXAt(mgeo, mgeo.yBands + ge.mx1 + 1);
+                int gcy0 = ChartView.MatYAt(mgeo, mgeo.xBands + ge.my0);
+                int gcy1 = ChartView.MatYAt(mgeo, mgeo.xBands + ge.my1 + 1);
+                if (gcx1 - gcx0 < app.Scale(8) || gcy1 - gcy0 < app.Scale(8)) {
+                    continue;
+                }
+                ChartSeries carrier = null;
+                for (int si8 = 0; si8 < o.series.Count; si8 = si8 + 1) {
+                    ChartSeries s8 = o.series[si8];
+                    if (s8.isGeoBase && s8.geoIndex == gi8) {
+                        carrier = s8;
+                        break;
+                    }
+                }
+                if (carrier == null) { continue; }
+                ChartOption gsub = ChartOption.Create();
+                gsub.overlay = true;
+                gsub.iwid = o.iwid;
+                gsub.backgroundColor = o.backgroundColor;
+                gsub.showTooltip = false;
+                gsub.showLegend = false;
+                gsub.animate = false;
+                gsub.animMs = 0;
+                gsub.series = new List<ChartSeries>();
+                gsub.series.Add(carrier);
+                Chart.gridPanelSub = true;
+                // g 必须传 1000（终帧）：DrawMap 的矢量区域填色只在
+                // g>=1000 走，g<1000 视为入场动画中段，只填底不填
+                // 区域（矩阵锚格没有入场动画，永远终帧）。10 个 geo
+                // 的快照指纹随格矩形各不相同，不会误命中彼此的槽。
+                ChartView.DrawMap(app, gcx0, gcy0, gcx1 - gcx0,
+                    gcy1 - gcy0, gsub, 1000);
+                Chart.gridPanelSub = false;
+            }
+        }
         // 标题数组：面板坐标绘制（top/left 百分比），子调用已抑制。
+        // matrix 锚定标题以格矩形为基准（stock 的 coord 锚定、
+        // grid-layout 的响应式分节标题）。
         for (int ti3 = 0; ti3 < o.titles.Count; ti3 = ti3 + 1) {
             ChartTitleSpec ts = o.titles[ti3];
             if (ts.text.Length < 1) { continue; }
+            int bx = x;
+            int by = y;
+            int bw = w;
+            int bh = h;
+            if (ts.matAnchor && mgeo != null) {
+                bx = ChartView.MatXAt(mgeo, mgeo.yBands + ts.mx0);
+                bw = ChartView.MatXAt(mgeo, mgeo.yBands + ts.mx1 + 1) - bx;
+                by = ChartView.MatYAt(mgeo, mgeo.xBands + ts.my0);
+                bh = ChartView.MatYAt(mgeo, mgeo.xBands + ts.my1 + 1) - by;
+            }
             int fs = Style.FontFallback(app, "large");
             int subFs = ChartFonts.SeriesLabel(app);
             int tH = Canvas.FontHeight(fs)
                 + (ts.sub.Length > 0 ? Canvas.FontHeight(subFs) + app.Scale(2) : 0);
-            int ty = y + app.theme.paddingMedium;
-            if (ts.topPct >= 0) { ty = y + h * ts.topPct / 100; }
-            else if (ts.topPx >= 0) { ty = y + app.Scale(ts.topPx); }
-            int tx = x + app.theme.paddingMedium;
+            int ty = by + app.theme.paddingMedium;
+            if (ts.topPct >= 0) { ty = by + bh * ts.topPct / 100; }
+            else if (ts.topPx >= 0) { ty = by + app.Scale(ts.topPx); }
+            int tx = bx + app.theme.paddingMedium;
             int tW = Canvas.MeasureText(ts.text, fs);
-            int maxW = w - app.theme.paddingMedium * 2;
+            int maxW = bw - app.theme.paddingMedium * 2;
             if (ts.align == "center") {
-                tx = x + (w - tW) / 2;
+                tx = bx + (bw - tW) / 2;
             } else if (ts.leftPct >= 0) {
-                tx = x + w * ts.leftPct / 100;
+                tx = bx + bw * ts.leftPct / 100;
             } else if (ts.leftPx >= 0) {
-                tx = x + app.Scale(ts.leftPx);
+                tx = bx + app.Scale(ts.leftPx);
             } else if (ts.align == "right") {
-                tx = x + w - app.theme.paddingMedium - tW;
+                tx = bx + bw - app.theme.paddingMedium - tW;
             }
             // 官方 title left:'center' 是最常用形态：left 未声明但
             // 前一项居中的多标题示例均按 center 处理。
             if (ts.align.Length == 0 && ts.leftPct < 0 && ts.leftPx < 0) {
-                tx = x + (w - tW) / 2;
+                tx = bx + (bw - tW) / 2;
             }
-            if (tx < x) { tx = x; }
+            if (tx < bx) { tx = bx; }
             int subCol = Style.Part(app, "chart", "axis-title", "", "", "",
                 Style.SNormal()).FgOr(0);
             c.DrawText(tx, ty, ts.text, sPanelFg(app), fs);
@@ -665,7 +767,7 @@ partial class ChartView {
                 int sW = Canvas.MeasureText(ts.sub, subFs);
                 int sx = tx;
                 if (ts.align.Length == 0 && ts.leftPct < 0 && ts.leftPx < 0) {
-                    sx = x + (w - sW) / 2;
+                    sx = bx + (bw - sW) / 2;
                 }
                 c.DrawText(sx, ty + Canvas.FontHeight(fs) + app.Scale(2),
                     ts.sub, subCol, subFs);
