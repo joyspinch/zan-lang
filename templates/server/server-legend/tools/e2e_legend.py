@@ -379,6 +379,9 @@ def run_matrix():
     hero.send({"op": "altar"})
     r = hero.reply_for(lambda m: "altar" in m)
     ok(r is not None, "altar -> altar")
+    a = ((r or {}).get("altar") or {})
+    ok("global" in a and int(a.get("globalCap", 0)) == 8000,
+       "altar shape global+globalCap=8000 (client 祭坛进度行)")
     hero.clear()
     hero.send({"op": "guild"})
     r = hero.reply_for(lambda m: "rows" in m)
@@ -470,10 +473,16 @@ def run_cas_and_worldstate(cookie):
     hero.send({"op": "market"})
     r = hero.reply_for(lambda m: "rows" in m)
     rowid = None
+    mine_row = None
     for x in r.get("rows", []):
         if str(x.get("mine")) == "1":
             rowid = x.get("id")
+            mine_row = x
     ok(rowid is not None, "listing visible")
+    # 客户端在行页：物品图标按 itemId 反查 items、时长列按 age 换算 天/时/分
+    ok(mine_row is not None and mine_row.get("itemId") is not None
+       and mine_row.get("age") is not None,
+       "market row carries itemId+age (client live columns)")
 
     # CAS：两个买家同时买同一挂单，恰好一个成功
     # （谓词必须认 rows——hb 回复 {ok:1,t,online} 会被 "ok" in m 误中）
@@ -484,6 +493,19 @@ def run_cas_and_worldstate(cookie):
     r2 = buyer2.reply_for(lambda m: "rows" in m)
     wins = (1 if r1 and r1.get("ok") == 1 else 0) + (1 if r2 and r2.get("ok") == 1 else 0)
     ok(wins == 1, "market CAS: exactly one buyer wins (got %d)" % wins)
+
+    # 祭坛捐献：gold 档扣金币，个人/全服进度同步涨（global 写穿 world_state）
+    hero.clear()
+    hero.send({"op": "altar"})
+    r = hero.reply_for(lambda m: "altar" in m)
+    g0 = int(((r or {}).get("altar") or {}).get("global", 0))
+    hero.clear()
+    hero.send({"op": "altar", "do": "gold"})
+    r = hero.reply_for(lambda m: m.get("ok") == 1 and "altar" in m)
+    ok(r is not None, "altar donate gold ok")
+    g1 = int(((r or {}).get("altar") or {}).get("global", 0))
+    ok(g1 == g0 + 100, "altar global grows +altar_gold_gain (%d -> %d)" % (g0, g1))
+    altar_global = g1
 
     # 世界态写入：红包池 + 世界 BOSS 伤害 + 攻占城池
     hero.clear()
@@ -519,10 +541,29 @@ def run_cas_and_worldstate(cookie):
     if cities:
         city_owner = cities[0].get("owner")
     ok(city_owner == "市霸" + TS, "siege city1 owned (owner=%s)" % city_owner)
+    ok(bool(cities) and str(cities[0].get("cost")) == "2000",
+       "siege cities carry cost=siege_attack_gold (client 条件：金币×N)")
+
+    # 攻沙：sha 分支——同 power/chance 公式，胜了写 siege.master.*（沙巴克页头带）
+    for attempt in range(6):
+        hero.clear()
+        hero.send({"op": "siege", "sha": 1})
+        r = hero.reply_for(lambda m: "siege" in m or (m.get("ok") == 0 and "err" in m))
+        if r and r.get("win") is not None and int(r["win"]) == 1:
+            break
+        if r and r.get("ok") == 0 and "金币" in (r.get("err") or ""):
+            gm_save(cookie, uid1, "市霸" + TS)  # 补钱再试
+    hero.clear()
+    hero.send({"op": "siege"})
+    r = hero.reply_for(lambda m: "siege" in m)
+    sha_owner = ((r or {}).get("siege") or {}).get("owner")
+    ok(sha_owner == "市霸" + TS, "siege sha -> basha owner (got %s)" % sha_owner)
 
     # 留下重启后的期望值
     with open(os.path.join(ROOT, "data", "e2e_legend_state.json"), "w") as f:
-        json.dump({"hero": "市霸" + TS, "pool": Play_pool_after(hero), "wb_hp": wb_hp}, f)
+        json.dump({"hero": "市霸" + TS, "pool": Play_pool_after(hero),
+                   "wb_hp": wb_hp, "altar_global": altar_global,
+                   "sha": sha_owner}, f)
 
 def Play_pool_after(hero):
     hero.clear()
@@ -557,6 +598,17 @@ def run_persistence():
     # 重启后血量沿用落库值；若正好跨过重生时刻则满血——两者都算"不丢"
     ok(hp == want["wb_hp"] or hp == maxhp,
        "restart: wboss hp kept (got %d, want %d or fresh %d)" % (hp, want["wb_hp"], maxhp))
+    c.clear()
+    c.send({"op": "altar"})
+    r = c.reply_for(lambda m: "altar" in m)
+    aglobal = int(((r or {}).get("altar") or {}).get("global", -1))
+    ok(aglobal == want["altar_global"],
+       "restart: altar global kept (%d vs %d)" % (aglobal, want["altar_global"]))
+    c.clear()
+    c.send({"op": "siege"})
+    r = c.reply_for(lambda m: "siege" in m)
+    bowner = ((r or {}).get("siege") or {}).get("owner")
+    ok(bowner == want["sha"], "restart: basha owner kept (got %s)" % bowner)
     os.remove(st_path)
 
 if __name__ == "__main__":

@@ -79,6 +79,7 @@ partial class LegendApp {
     }
 
     void BuildBashaPage() {
+        if (net.Self() != null) { net.MaybeRefreshSiege(); }
         Panel frame = Panel.Row(); frame.Class = "bh-frame";
         frame.Pad(0); frame.Gap(Spec.BhColGap());
         frame.Prefer(0, Spec.BhFrameH());
@@ -86,6 +87,37 @@ partial class LegendApp {
         content.With(frame);
         frame.With(BashaMain());
         frame.With(BashaSide());
+    }
+
+    /// 沙巴克状态（siege 应答的 master 部分）；离线 null。
+    JsonValue BashaState() {
+        JsonValue s = net.Self() != null ? net.PlaySiege() : null;
+        return s;
+    }
+
+    /// 坚守时长：holdSeconds → 「N天 HH:MM:SS」；未占领 → 「暂无」。
+    string BashaHoldText() {
+        JsonValue s = BashaState();
+        if (s == null) { return "2026-08-02 18:27:44"; }
+        long hold = s.Int("holdSeconds", 0);
+        if (hold <= 0) { return "暂无"; }
+        return Rules.N(hold / 86400) + "天 " + Rules.N(hold % 86400 / 3600).PadLeft(2, "0")
+            + ":" + Rules.N(hold % 3600 / 60).PadLeft(2, "0") + ":"
+            + Rules.N(hold % 60).PadLeft(2, "0");
+    }
+
+    string BashaOwner() {
+        JsonValue s = BashaState();
+        if (s == null) { return "龙卫——圣战"; }
+        string o = s.Str("owner", "");
+        return o.Length > 0 ? o : "暂无";
+    }
+
+    string BashaGuild() {
+        JsonValue s = BashaState();
+        if (s == null) { return "永恒总会"; }
+        string g = s.Str("guild", "");
+        return g.Length > 0 ? g : "暂无";
     }
 
     // ------------------------------------------------------------------
@@ -118,13 +150,16 @@ partial class LegendApp {
 
         Panel r2 = Panel.Row(); r2.Pad(0); r2.Gap(Spec.BhInfoGap());
         r2.Prefer(0, Spec.BhInfoH()); info.With(r2);
-        r2.With(BashaKV("占领公会：", "永恒总会", "bh-k-green"));
-        r2.With(BashaKV("占领时间：", "2026-08-02 18:27:44", "bh-k-yellow"));
+        r2.With(BashaKV("占领公会：", BashaGuild(), "bh-k-green"));
+        r2.With(BashaKV("占领时间：", BashaHoldText(), "bh-k-yellow"));
 
         Panel btns = Panel.Column(); btns.Pad(0); btns.Gap(Spec.BhBtnGap());
         btns.Prefer(Spec.BhBtnW(), 0); head.With(btns);
         btns.With(BtnDev("申请攻沙", "tbl-btn bh-btn", Spec.BhBtnW(), Spec.BhBtnH(),
-            () => { BashaSay("申请攻沙需要行会会长在攻城时间内提交申请。"); }));
+            () => {
+                if (net.Self() != null) { net.SiegeSha(); return; }
+                BashaSay("申请攻沙需要行会会长在攻城时间内提交申请。");
+            }));
         btns.With(BtnDev("行会排名", "tbl-btn bh-btn", Spec.BhBtnW(), Spec.BhBtnH(),
             () => { BashaSay("行会排名见「行会」页与「排行榜」页。"); }));
         return head;
@@ -182,7 +217,7 @@ partial class LegendApp {
         Image pic = new Image("assets/ui/00046.jpg", "城主", "cover");
         pic.DockFill(); face.Add(pic);
         scene.With(face);
-        scene.With(CenterRow("龙卫——圣战", "bh-name-row", "bh-name", 0, Spec.BhNameH()));
+        scene.With(CenterRow(BashaOwner(), "bh-name-row", "bh-name", 0, Spec.BhNameH()));
         scene.With(CenterRow("膜拜沙巴克城主", "bh-worship-row", "bh-worship",
             Spec.BhWorshipW(), Spec.BhWorshipH()));
         Panel help = Panel.Row(); help.Class = "bh-help";
@@ -201,8 +236,11 @@ partial class LegendApp {
         Panel col = Panel.Column(); col.Class = "bh-side mk-fill";
         col.Pad(0); col.Gap(0);
 
+        /* 在线：右列改行会榜（服务端 guild 应答）；离线：原版申请列表。
+           「申请日期」列在线时语义换成会长名，表头同步换字。 */
+        bool online = net.Self() != null && net.PlayGuild() != null;
         List<string> heads = new List<string>();
-        heads.Add("编号"); heads.Add("行会名称"); heads.Add("申请日期");
+        heads.Add("编号"); heads.Add("行会名称"); heads.Add(online ? "会长" : "申请日期");
         List<int> ws = new List<int>();
         ws.Add(Spec.BhIdW()); ws.Add(Spec.BhGuildW()); ws.Add(Spec.BhDateW());
         col.With(TblHeadAt(heads, ws, Spec.SideHeadH(), Spec.BhCellGap(),
@@ -210,19 +248,23 @@ partial class LegendApp {
 
         col.With(TblPad(Spec.SideHeadToRow()));
         List<BashaApply> rows = BashaData();
+        JsonValue gu = online ? net.PlayGuild() : null;
+        int nGu = gu != null ? gu.Count() : 0;
         for (int r = 0; r < Spec.SideRows(); r = r + 1) {
             Panel row = Panel.Row(); row.Class = "tbl-row";
             row.Pad(0); row.Gap(Spec.BhCellGap());
             row.Prefer(0, Spec.SideRowH());
             row.Padding(0, Spec.BhRowPadR(), 0, Spec.BhRowPadL());
-            string id = r < rows.Count ? Rules.N(r + 1) : "";
-            string guild = r < rows.Count ? rows[r].guild : "";
-            string date = r < rows.Count ? rows[r].date : "";
+            string id = r < rows.Count || (gu != null && r < nGu) ? Rules.N(r + 1) : "";
+            string guild = gu != null && r < nGu ? gu.At(r).Str("name", "")
+                : (r < rows.Count ? rows[r].guild : "");
+            string third = gu != null && r < nGu ? gu.At(r).Str("master", "")
+                : (r < rows.Count ? rows[r].date : "");
             row.With(TblCellClsAt(id, "tbl-c1", Spec.BhIdW(), "tbl-cell",
                                 Spec.SideRowH()));
             row.With(TblCellClsAt(guild, "tbl-c2", Spec.BhGuildW(), "tbl-cell",
                                 Spec.SideRowH()));
-            row.With(TblCellClsAt(date, "tbl-c1", Spec.BhDateW(), "tbl-cell",
+            row.With(TblCellClsAt(third, "tbl-c1", Spec.BhDateW(), "tbl-cell",
                                 Spec.SideRowH()));
             col.With(row);
             if (r + 1 < Spec.SideRows()) { col.With(TblPad(Spec.SideRowGap())); }

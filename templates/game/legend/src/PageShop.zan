@@ -87,14 +87,20 @@ partial class LegendApp {
     }
 
     void ShopBuy(int i) {
-        if (i < 0 || i >= GameTables.current.shop.rows.Count) { return; }
         int n = ShopCount(i);
+        /* 在线：服务端 items 目录（金价计费、直接入背包）。
+           离线：本地 shop.csv 语义（reward 发放）。 */
+        JsonValue live = net.Self() != null ? net.ShopAt(i) : null;
+        if (live != null) { net.ShopBuyItem(live.Int("id", 0), n); return; }
+        if (i < 0 || i >= GameTables.current.shop.rows.Count) { return; }
         for (int k = 0; k < n; k = k + 1) { g.Shop(i); }
         Rebuild();
     }
 
     void BuildShop() {
-        int total = GameTables.current.shop.rows.Count;
+        if (net.Self() != null) { net.MaybeRefreshShop(); }
+        bool live = net.Self() != null && net.ShopCount() > 0;
+        int total = live ? net.ShopCount() : GameTables.current.shop.rows.Count;
         int per = Spec.ShopPerPage();
         int cols = Spec.ShopCols();
         int pages = (total + per - 1) / per;
@@ -189,8 +195,61 @@ partial class LegendApp {
         foot.With(pg);
     }
 
+    /// 服务端目录卡：道具号取图、金价胶囊、购买走 buy op。
+    Panel ShopLiveCard(JsonValue row, int slotIdx) {
+        int itemId = row.Int("id", 0);
+        int price = row.Int("price", 0);
+
+        Panel card = Panel.Row(); card.Class = "shop-card";
+        card.Pad(0); card.Gap(Spec.ShopIconGap());
+        card.Prefer(Spec.ShopCardW(), Spec.ShopCardH());
+        card.Named("shop-card-" + Rules.N(slotIdx));
+        card.With(SpacerW(Spec.ShopCardPadL()));
+
+        Panel box = Panel.Row(); box.Class = "shop-icon";
+        box.Pad(Spec.Px(1)); box.Prefer(Spec.ShopIconW(), Spec.ShopIconH());
+        Image ic = new Image(ItemArtById(itemId), row.Str("name", ""), "contain");
+        ic.DockFill(); box.Add(ic);
+        card.With(box);
+
+        Panel col = Panel.Column(); col.Pad(0); col.Gap(Spec.ShopRowGap()); col.Grow(); card.With(col);
+
+        Panel nameRow = Panel.Row(); nameRow.Class = "shop-name-row";
+        nameRow.Pad(0); nameRow.Gap(0); nameRow.Prefer(0, Spec.ShopNameH());
+        col.With(nameRow);
+        Label nm = Text(row.Str("name", ""), "shop-name", 0);
+        nameRow.With(nm);
+        Panel priceP = Panel.Row(); priceP.Class = "shop-price";
+        priceP.Pad(Spec.Px(2)); priceP.Gap(Spec.Px(2));
+        priceP.Prefer(Spec.ShopPillW(), Spec.ShopPillH()); nameRow.With(priceP);
+        Image coin = new Image(ShopCoinPath(false), "货币", "contain");
+        coin.Prefer(Spec.ShopCoinW(), Spec.ShopCoinW()); priceP.With(coin);
+        Label pv = Text(Rules.N(price), "shop-price-v", 0);
+        pv.Grow(); priceP.With(pv);
+        nameRow.With(SpacerW(Spec.ShopPillPadR()));
+
+        Panel qty = Panel.Row(); qty.Class = "shop-qty";
+        qty.Pad(0); qty.Gap(Spec.Px(3)); qty.Prefer(0, Spec.ShopQtyH()); col.With(qty);
+        Label qk = Text("数量", "shop-qty-k", 0);
+        qk.Prefer(Spec.ShopQtyKeyW(), 0); qty.With(qk);
+        qty.With(BtnDev("+", "shop-num", Spec.ShopNumW(), Spec.ShopQtyH(),
+            () => { ShopStep(slotIdx, 1); Rebuild(); }));
+        Label qv = Text(Rules.N(ShopCount(slotIdx)), "shop-val", 0);
+        qv.Prefer(Spec.ShopValW(), 0); qty.With(qv);
+        qty.With(BtnDev("-", "shop-num", Spec.ShopNumW(), Spec.ShopQtyH(),
+            () => { ShopStep(slotIdx, -1); Rebuild(); }));
+        Panel qfill = Panel.Row(); qfill.Class = "shop-qty-fill"; qty.With(qfill);
+        qty.With(BtnDev("购买", "shop-buy", Spec.ShopBuyW(), Spec.ShopQtyH(),
+            () => { ShopBuy(slotIdx); }));
+        card.With(SpacerW(Spec.ShopCardPadR()));
+        return card;
+    }
+
     /// 一张商品卡：图标石框 + 右上名称/价格 + 右下数量/购买。
+    /// 在线 = 服务端 items 目录（金价胶囊）；离线 = shop.csv reward 语义。
     Panel ShopCard(int i) {
+        JsonValue live = net.Self() != null ? net.ShopAt(i) : null;
+        if (live != null) { return ShopLiveCard(live, i); }
         DataRow offer = GameTables.current.shop.rows[i];
         int yuan = offer.Int("yuan");
         int gold = offer.Int("gold");

@@ -22,6 +22,7 @@ partial class LegendApp {
         int cost;               // 条件/产出的金币数
         string owner;           // 城主名
         string date;            // 攻占时间
+        int cityId;             // 服务端城池号（在线 >0：攻占 op 用）
     }
 
     /// 第 1 页 8 城（照 `城池争夺.png` 逐行抄录；原版共 5 页，2..5 页无对照图）。
@@ -62,7 +63,34 @@ partial class LegendApp {
         return "assets/city/" + Rules.N(i).PadLeft(5, "0") + ".gif";
     }
 
+    /// 在线城池行：siege 应答 cities[] → CityInfo（owner/date/income/cost 全服务端）。
+    static CityInfo CityLiveRowOf(JsonValue c) {
+        CityInfo r = new CityInfo();
+        r.cityId = c.Int("id", 0);
+        r.name = "钱庄(" + Rules.N(r.cityId) + ")";
+        r.cost = c.Int("cost", 0);
+        r.owner = c.Str("owner", "");
+        if (r.owner.Length == 0) { r.owner = "暂无"; }
+        r.date = c.Str("date", "");
+        if (r.date.Length == 0) { r.date = "暂无"; }
+        return r;
+    }
+
+    /// 当前卡阵数据：在线 = siege 应答 cities[]，离线 = 原版对照抄录。
+    List<CityInfo> CityRows() {
+        JsonValue s = net.Self() != null ? net.PlaySiege() : null;
+        if (s == null) { return CityData(); }
+        JsonValue cities = s.Get("cities");
+        if (cities == null || !cities.IsArray()) { return CityData(); }
+        List<CityInfo> v = new List<CityInfo>();
+        for (int i = 0; i < cities.Count(); i = i + 1) {
+            v.Add(CityLiveRowOf(cities.At(i)));
+        }
+        return v;
+    }
+
     void BuildCityPage() {
+        if (net.Self() != null) { net.MaybeRefreshSiege(); }
         int pageW = app.ClientWidth() - Spec.LeftPad() - Spec.LeftW()
             - Spec.ChatW() - Spec.ChatPadR();
         /* 原版卡阵不是居中摆的：左留白 15 / 右 27（内容宽比卡阵宽出的
@@ -83,7 +111,7 @@ partial class LegendApp {
         grid.Pad(0); grid.Gap(Spec.CityRowGap());
         grid.Prefer(Spec.CityWallW(), Spec.CityWallH());
         gridRow.With(grid);
-        List<CityInfo> rows = CityData();
+        List<CityInfo> rows = CityRows();
         for (int r = 0; r < Spec.CityRows(); r = r + 1) {
             Panel row = Panel.Row(); row.Class = "city-row";
             row.Pad(0); row.Gap(Spec.CityColGap());
@@ -154,7 +182,17 @@ partial class LegendApp {
            （同经验条数值/地图瓦片名的压图套路），情景图 DockFill 铺满。 */
         scene.With(Text("城池：" + r.name, "city-l1", 0));
         scene.With(Text("条件：金币×" + Rules.N(r.cost), "city-l2", 0));
-        scene.With(Text("产出：金币×" + Rules.N(r.cost) + "/小时", "city-l3", 0));
+        /* 在线产出 = 服务端 income（每城递增）；离线沿用原版条件数。 */
+        JsonValue s = net.Self() != null ? net.PlaySiege() : null;
+        int income = r.cost;
+        if (s != null) {
+            JsonValue cities = s.Get("cities");
+            if (cities != null && cities.IsArray() && r.cityId >= 1
+                && r.cityId <= cities.Count()) {
+                income = cities.At(r.cityId - 1).Int("income", 0);
+            }
+        }
+        scene.With(Text("产出：金币×" + Rules.N(income) + "/小时", "city-l3", 0));
         info.With(scene);
 
         Panel zz = Panel.Row(); zz.Pad(0); zz.Gap(Spec.Px(4));
@@ -182,8 +220,12 @@ partial class LegendApp {
     }
 
     void CityAttack(int i) {
-        List<CityInfo> rows = CityData();
+        List<CityInfo> rows = CityRows();
         if (i < 0 || i >= rows.Count) { return; }
-        CitySay("攻占「" + rows[i].name + "」（玩法未接，攻占费 金币×" + Rules.N(rows[i].cost) + "）");
+        if (net.Self() != null && rows[i].cityId > 0) {
+            net.SiegeAttack(rows[i].cityId);
+            return;
+        }
+        CitySay("攻占「" + rows[i].name + "」（离线演示，攻占费 金币×" + Rules.N(rows[i].cost) + "）");
     }
 }

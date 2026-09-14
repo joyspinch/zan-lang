@@ -360,6 +360,48 @@ class Play {
     static string CityName(int city) { return "钱庄" + Convert.ToString(city); }
 
     static async JsonValue Siege(Session s, JsonValue m, long now) {
+        /* 沙巴克争夺（{"sha":1}）：同攻城判定，赢主 writeWorld 的
+           siege.master.*——沙巴克页头带的占领公会/占领时间/城主就来自它。 */
+        if (m.Int("sha", 0) == 1) {
+            if (s.row.guildId <= 0) { return Gateway.Err("先加入行会才能争夺沙巴克"); }
+            long cost = Rules.Long("siege_attack_gold");
+            if (s.row.gold < cost) {
+                return Gateway.Err("争夺沙巴克需要 " + Convert.ToString(cost) + " 金币");
+            }
+            string guildName = "";
+            IDbConnection db = await Gateway.Db();
+            if (db != null) {
+                try {
+                    ZanWeb.Model.Game.Guild g = await db
+                        .Select<ZanWeb.Model.Game.Guild>()
+                        .Where(a => a.id == s.row.guildId).FirstAsync();
+                    if (g != null) { guildName = g.name; }
+                } finally {
+                    Gateway.Give(db);
+                }
+            }
+            int power = Fight.Atk(s.row)
+                + s.row.level * Rules.Val("siege_level_power");
+            s.row.gold = s.row.gold - cost;
+            s.dirty = true;
+            int chance = Rules.Val("siege_base_chance") + power / Rules.Val("siege_power_div");
+            bool win = Play.rng.Between(0, 99) < chance;
+            JsonValue rs = Gateway.Ok();
+            if (win) {
+                WorldState.Set("siege.master.owner", s.row.nickname);
+                WorldState.Set("siege.master.guild", guildName);
+                WorldState.SetNum("siege.master.at", now);
+                Gateway.AnnounceAll("沙巴克易主",
+                    s.row.nickname + " 率" + guildName + "攻占了沙巴克！");
+            }
+            rs.Set("win", JsonValue.NewNum(win ? "1" : "0"));
+            rs.Set("log", JsonValue.NewStr(win
+                ? "攻占沙巴克成功，全服公告已发！"
+                : "攻占沙巴克失败，守军太强。金币已消耗。"));
+            rs.Set("siege", Play.SiegeState(now));
+            Gateway.SelfInto(rs, s);
+            return rs;
+        }
         if (m.Int("attack", 0) == 1) {
             int city = m.Int("city", 0);
             if (city < 1 || city > Play.CityCount()) { return Gateway.Err("城池编号不合法"); }
@@ -428,6 +470,9 @@ class Play {
             c.Set("guild", JsonValue.NewStr(Play.CityGuild(i + 1)));
             c.Set("income", JsonValue.NewNum(Convert.ToString(
                 incomeBase + (long)i * incomeStep)));
+            /* 攻占费用也随行下发（原版「条件：金币×N」逐城显示）。 */
+            c.Set("cost", JsonValue.NewNum(Convert.ToString(
+                Rules.Long("siege_attack_gold"))));
             c.Set("date", JsonValue.NewStr(Play.CityAt(i + 1) > 0
                 ? Play.Today(Play.CityAt(i + 1)) : ""));
             cities.Append(c);
@@ -788,6 +833,9 @@ class Play {
             s.row.altarPersonal = s.row.altarPersonal + points;
             s.row.altarDonations = s.row.altarDonations + 1;
             s.row.altarBuffUntil = now + Rules.Val("altar_buff_seconds");
+            /* 全服祭坛进度走 world_state（重启不丢），原版「祭坛进度」行。 */
+            WorldState.SetNum("altar.global",
+                WorldState.GetNum("altar.global", 0) + points);
             s.dirty = true;
         }
         if (act == "claim") {
@@ -807,6 +855,11 @@ class Play {
         o.Set("personal", JsonValue.NewNum(Convert.ToString(s.row.altarPersonal)));
         o.Set("cap", JsonValue.NewNum(Convert.ToString(
             Rules.Val("altar_personal_cap"))));
+        /* 全服祭坛进度（捐献累加，写穿 world_state）。 */
+        o.Set("global", JsonValue.NewNum(Convert.ToString(
+            WorldState.GetNum("altar.global", 0))));
+        o.Set("globalCap", JsonValue.NewNum(Convert.ToString(
+            Rules.Val("altar_world_cap"))));
         o.Set("donations", JsonValue.NewNum(Convert.ToString(s.row.altarDonations)));
         long buffLeft = s.row.altarBuffUntil - now;
         o.Set("buff", JsonValue.NewNum(Convert.ToString(buffLeft > 0 ? buffLeft : 0)));
@@ -1002,6 +1055,10 @@ class Play {
                 ZanWeb.Model.Game.Item it = Fight.ById(row.itemId);
                 JsonValue o = JsonValue.NewObject();
                 o.Set("id", JsonValue.NewNum(Convert.ToString(row.id)));
+                /* 记录格取图与挂龄显示都要原始数据：itemId + 已挂秒数。 */
+                o.Set("itemId", JsonValue.NewNum(Convert.ToString(row.itemId)));
+                o.Set("age", JsonValue.NewNum(Convert.ToString(
+                    WebApp.NowSeconds() - row.createdAt)));
                 o.Set("seller", JsonValue.NewStr(row.sellerName));
                 o.Set("name", JsonValue.NewStr(it != null ? it.name : "???"));
                 o.Set("count", JsonValue.NewNum(Convert.ToString(row.count)));

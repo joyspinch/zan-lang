@@ -39,6 +39,10 @@ partial class LegendApp {
         int hh;
         int mm;
         int ss;
+        int rowId;          // 挂单号（在线 >0：买/下架用）
+        bool mine;          // 我的挂单（在线：操作列变「下架」）
+        string iCat;        // items.csv category 文本（装备/消耗/道具/其他）
+        int iSlot;          // 穿戴槽位（-1 = 非穿戴）
         string SubText() { return (kind == 0 ? "数量：" : "系数：") + Rules.N(amount); }
         string BadgeText() {
             if (kind == 1) { return "+" + Rules.N(amount); }
@@ -50,6 +54,31 @@ partial class LegendApp {
             return Rules.N(days) + "天 " + Rules.N(hh).PadLeft(2, "0") + ":"
                 + Rules.N(mm).PadLeft(2, "0") + ":" + Rules.N(ss).PadLeft(2, "0");
         }
+    }
+
+    /// 当前页（服务端挂单 8 行/页）与「只看我的」过滤。
+    int marketPageNo = 0;
+    bool marketMineOnly = false;
+    /// 左栏过滤条件：分类（0=全部）、寄售人、道具名称（`.data` 绑定字段）。
+    int mkCat = 0;
+    string mkSeller = "";
+    string mkName = "";
+
+    /// 分类谓词：武器=slot0 / 防具=衣服头盔 / 首饰=项链手镯戒指 /
+    /// 消耗=kind0 / 材料=kind3 / 杂物=腰带靴子勋章宝石 / 符文=名字带「符文」。
+    bool MarketCatHit(MarketRow r) {
+        if (this.mkCat == 0) { return true; }
+        string cat = MarketCats()[this.mkCat];
+        if (cat == "符文") { return r.name.IndexOf("符文") >= 0; }
+        if (cat == "武器") { return r.iCat == "装备" && r.iSlot == 0; }
+        if (cat == "防具") { return r.iCat == "装备" && (r.iSlot == 1 || r.iSlot == 2); }
+        if (cat == "首饰") { return r.iCat == "装备"
+            && (r.iSlot == 3 || r.iSlot == 4 || r.iSlot == 6); }
+        if (cat == "消耗类") { return r.iCat == "消耗"; }
+        if (cat == "材料类") { return r.iCat == "道具"; }
+        if (cat == "杂物类") { return r.iCat == "其他" || r.iCat == "装备"
+            && (r.iSlot == 8 || r.iSlot == 9 || r.iSlot == 10 || r.iSlot == 11); }
+        return true;
     }
 
     /// 8 行寄售数据（照 `交易市场.png` 逐行抄录）。魔法天书 / 魔防天书在道具表
@@ -80,6 +109,49 @@ partial class LegendApp {
         return r;
     }
 
+    /// 在线行：market 应答一行 → MarketRow（itemId 查图、age 拆挂龄）。
+    /// items.csv 与服务端同一套目录；异常 id 落空白占位图。
+    static MarketRow MarketLiveRowOf(JsonValue m) {
+        int itemId = m.Int("itemId", 0);
+        int picture = 0;
+        string iCat = "";
+        int iSlot = 0 - 1;
+        if (GameTables.current.items.index.ContainsKey(Convert.ToString(itemId))) {
+            DataRow def = GameTables.current.items.At(itemId);
+            picture = def.Int("picture");
+            iCat = def.Text("category");
+            iSlot = def.Int("slot");
+        }
+        long age = m.Int("age", 0);
+        if (age < 0) { age = 0; }
+        MarketRow r = MarketRowOf(picture, m.Str("name", "?"), 0, m.Int("count", 1),
+            m.Int("price", 0), m.Str("seller", ""), "", false,
+            (int)(age / 86400), (int)(age % 86400 / 3600),
+            (int)(age % 3600 / 60), (int)(age % 60));
+        r.rowId = m.Int("id", 0);
+        r.mine = m.Int("mine", 0) == 1;
+        r.iCat = iCat;
+        r.iSlot = iSlot;
+        return r;
+    }
+
+    /// 当前页要渲染的行：在线 = 服务端挂单（分类/寄售人/名称/只看我的过滤），
+    /// 离线 = 原版对照。
+    List<MarketRow> MarketPageRows() {
+        if (net.Self() == null || net.PlayMarket() == null) { return MarketData(); }
+        JsonValue all = net.PlayMarket();
+        List<MarketRow> v = new List<MarketRow>();
+        for (int i = 0; i < all.Count(); i = i + 1) {
+            MarketRow r = MarketLiveRowOf(all.At(i));
+            if (this.marketMineOnly && !r.mine) { continue; }
+            if (!MarketCatHit(r)) { continue; }
+            if (this.mkSeller.Length > 0 && r.seller.IndexOf(this.mkSeller) < 0) { continue; }
+            if (this.mkName.Length > 0 && r.name.IndexOf(this.mkName) < 0) { continue; }
+            v.Add(r);
+        }
+        return v;
+    }
+
     /// 左栏 8 枚分类（原版顺序）。
     static List<string> MarketCats() {
         List<string> c = new List<string>();
@@ -96,6 +168,7 @@ partial class LegendApp {
     }
 
     void BuildMarketPage() {
+        if (net.Self() != null) { net.MaybeRefreshMarket(); }
         Panel frame = Panel.Column(); frame.Class = "mk-frame";
         frame.Pad(0); frame.Gap(0);
         frame.Prefer(0, Spec.MkFrameH());
@@ -179,10 +252,14 @@ partial class LegendApp {
 
         p.With(MarketLabel("寄售人:"));
         Input seller = new Input(""); seller.Class = "mk-input";
-        seller.Prefer(0, Spec.MkInputH()); p.With(seller);
+        seller.Prefer(0, Spec.MkInputH());
+        seller.data = this.mkSeller;
+        p.With(seller);
         p.With(MarketLabel("道具名称:"));
         Input item = new Input(""); item.Class = "mk-input";
-        item.Prefer(0, Spec.MkInputH()); p.With(item);
+        item.Prefer(0, Spec.MkInputH());
+        item.data = this.mkName;
+        p.With(item);
 
         p.With(TblPad(Spec.MkInputToCheck()));
         Panel ck = Panel.Row(); ck.Class = "mk-check-row";
@@ -235,10 +312,18 @@ partial class LegendApp {
         List<int> ws = Spec.MkCols();
         box.With(TblPad(Spec.MkHeadToRow()));
 
-        List<MarketRow> rows = MarketData();
-        for (int r = 0; r < rows.Count; r = r + 1) {
-            box.With(MarketRowBox(rows[r], ws));
-            if (r + 1 < rows.Count) { box.With(TblPad(Spec.MkRowGap())); }
+        List<MarketRow> all = MarketPageRows();
+        bool online = net.Self() != null && net.PlayMarket() != null;
+        int per = 8;
+        int pages = (all.Count + per - 1) / per;
+        if (pages < 1) { pages = 1; }
+        if (this.marketPageNo > pages - 1) { this.marketPageNo = pages - 1; }
+        if (this.marketPageNo < 0) { this.marketPageNo = 0; }
+        int off = online ? this.marketPageNo * per : 0;
+        int to = off + per < all.Count ? off + per : all.Count;
+        for (int r = off; r < to; r = r + 1) {
+            box.With(MarketRowBox(all[r], ws));
+            if (r + 1 < to) { box.With(TblPad(Spec.MkRowGap())); }
         }
         return box;
     }
@@ -299,59 +384,100 @@ partial class LegendApp {
         c4.With(Text(it.TimeText(), "mk-time", 0));
         row.With(c4);
 
-        // 操作：购买钮居中
+        // 操作：购买钮居中；我的挂单换成「下架」（market op cancel 分支）。
         Panel c5 = Panel.Row(); c5.Class = "mk-cell mk-fill"; c5.Pad(0);
         c5.Prefer(0, Spec.MkRowH());
         MarketRow pick = it;
-        c5.With(BtnDev("购 买", "tbl-btn mk-buy", Spec.MkBuyW(), Spec.MkBuyH(),
-                       () => { MarketBuy(pick); }));
+        if (pick.mine) {
+            c5.With(BtnDev("下 架", "tbl-btn mk-buy", Spec.MkBuyW(), Spec.MkBuyH(),
+                           () => { net.MarketCancel(pick.rowId); }));
+        } else {
+            c5.With(BtnDev("购 买", "tbl-btn mk-buy", Spec.MkBuyW(), Spec.MkBuyH(),
+                           () => { MarketBuy(pick); }));
+        }
         row.With(c5);
         return row;
     }
 
     /// 页脚带：无自底色，左三钮 + 右分页（标准库 Pagination simple 档 + 跳转输入）。
+    /// 「我的寄售」= 只看我的挂单（再点还原）；售出款服务端即时入账卖家
+    /// （在线也直接记角色行），故没有「一键领取」可领、「重新上架」无此语义。
     Panel MarketFoot() {
         Panel f = Panel.Row(); f.Class = "mk-foot mk-fixed";
         f.Pad(0); f.Gap(Spec.MkFootGap());
         f.Prefer(0, Spec.MkFootH());
         f.Padding(Spec.MkFootPadT(), Spec.MkFootPadR(), 0, Spec.MkFootPadL());
-        f.With(BtnDev("我的寄售", "tbl-btn mk-foot-btn", Spec.MkFootBtnW(), Spec.MkFootBtnH(),
-                      () => { MarketFootAct("我的寄售"); }));
+        f.With(BtnDev(this.marketMineOnly ? "全部挂单" : "我的寄售",
+                      "tbl-btn mk-foot-btn", Spec.MkFootBtnW(), Spec.MkFootBtnH(),
+                      () => { MarketToggleMine(); }));
         f.With(BtnDev("一键领取", "tbl-btn mk-foot-btn", Spec.MkFootBtnW(), Spec.MkFootBtnH(),
                       () => { MarketFootAct("一键领取"); }));
         f.With(BtnDev("重新上架", "tbl-btn mk-foot-btn", Spec.MkFootBtnW(), Spec.MkFootBtnH(),
                       () => { MarketFootAct("重新上架"); }));
         Panel sp = Panel.Row(); sp.Class = "mk-fill"; sp.Pad(0); f.With(sp);
-        SignalInt pgSig = new SignalInt(1);
-        Pagination pg = new Pagination(Spec.MkPages(), pgSig);
+        bool online = net.Self() != null && net.PlayMarket() != null;
+        int pages = online ? (MarketPageRows().Count + 7) / 8 : Spec.MkPages();
+        if (pages < 1) { pages = 1; }
+        SignalInt pgSig = new SignalInt(online ? this.marketPageNo + 1 : 1);
+        Pagination pg = new Pagination(pages, pgSig);
         pg.Class = "simple";
         pg.PrevText("上一页"); pg.NextText("下一页");
         pg.Jumper(true); pg.JumperLabel("跳转到");
         pg.Named("market-pager");
+        pg.Change += () => {
+            if (net.Self() != null && net.PlayMarket() != null) {
+                this.marketPageNo = pgSig.Get() - 1;
+                if (this.marketPageNo < 0) { this.marketPageNo = 0; }
+                BuildPage(); Refresh();
+            }
+        };
         f.With(pg);
         return f;
+    }
+
+    void MarketToggleMine() {
+        if (net.Self() == null) { MarketFootAct("我的寄售"); return; }
+        this.marketMineOnly = !this.marketMineOnly;
+        this.marketPageNo = 0;
+        BuildPage(); Refresh();
     }
 
     // ------------------------------------------------------------------
     //  动作（玩法未接：按本模板惯例给明确反馈，不假装已实现）
     // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    //  动作：分类/搜索是客户端过滤（数据来自 market op），购买/下架走 op。
+    // ------------------------------------------------------------------
     void MarketPickCat(int i) {
-        string msg = "交易市场：" + MarketCats()[i] + "（数据未接）";
-        if (net.Self() != null) { net.AddChat("[系统]", msg); return; }
-        g.Log(msg);
+        this.mkCat = i;
+        this.marketPageNo = 0;
+        if (net.Self() == null) {
+            string msg = "交易市场：" + MarketCats()[i] + "（离线演示行）";
+            g.Log(msg);
+            return;
+        }
+        BuildPage(); Refresh();
     }
     void MarketSearch() {
-        string msg = "交易市场：搜索（数据未接）";
-        if (net.Self() != null) { net.AddChat("[系统]", msg); return; }
-        g.Log(msg);
+        this.marketPageNo = 0;
+        if (net.Self() == null) { g.Log("交易市场：搜索（离线演示行）"); return; }
+        BuildPage(); Refresh();
     }
     void MarketBuy(MarketRow it) {
-        string msg = "购买「" + it.name + "」需要 " + it.PriceText() + " 金币（交易未接）";
+        if (net.Self() != null && it.rowId > 0) { net.MarketBuy(it.rowId); return; }
+        string msg = "购买「" + it.name + "」需要 " + it.PriceText() + " 金币（离线演示行）";
         if (net.Self() != null) { net.AddChat("[系统]", msg); return; }
         g.Log(msg);
     }
     void MarketFootAct(string what) {
-        string msg = "交易市场：" + what + "（未接）";
+        string msg;
+        if (what == "一键领取") {
+            msg = "交易市场：售出款在成交时即时入账卖家（含离线），无需领取。";
+        } else if (what == "重新上架") {
+            msg = "交易市场：重新上架未开放（下架后可从背包再次寄售）。";
+        } else {
+            msg = "交易市场：" + what + "（离线演示行）";
+        }
         if (net.Self() != null) { net.AddChat("[系统]", msg); return; }
         g.Log(msg);
     }
