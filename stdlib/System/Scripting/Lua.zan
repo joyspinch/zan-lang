@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 
 namespace System.Scripting;
 
@@ -147,6 +148,25 @@ class Lua {
         Lua.state = 0;
         Lua.initialized = false;
         Lua.FreeModule();
+    }
+
+    /// <summary>
+    /// 收紧脚本环境（沙箱，A291①）：移除可逃逸宿主的全局入口——
+    /// <c>os.execute/remove/rename/exit</c>（进程与文件系统）、<c>io</c>
+    /// 整库、<c>dofile/loadfile</c>（文件加载）、<c>require/package</c>
+    /// （模块加载同样落盘）。宿主在 <see cref="Initialize"/> 之后对不可信
+    /// 脚本调用一次即可；幂等。保留 <c>os.time/clock/date/getenv</c>、
+    /// <c>math/string/table</c> 等纯计算库。
+    /// </summary>
+    static void Sandbox() {
+        Lua.EnsureReady();
+        // 用受信设置脚本实现，零新 extern；置 nil 等价于不存在
+        // （Lua 取不存在的全局同样得 nil）。
+        Lua.Exec("os.execute = nil; os.remove = nil; os.rename = nil;" +
+                 " os.exit = nil\n" +
+                 "io = nil\n" +
+                 "dofile = nil; loadfile = nil\n" +
+                 "require = nil; package = nil\n");
     }
 
     /// <summary>底层 lua_State*（未初始化时为 0）。</summary>
@@ -588,7 +608,19 @@ class Lua {
                 "liblua.so.5.4", "liblua.so.5.3", "liblua.so",
                 "liblua5.4.dylib", "liblua5.3.dylib", "liblua.dylib"
             };
-            for (int i = 0; i < cands.Length; i = i + 1) {
+            // 先试 exe 目录限定路径（A291①：--publish 把 lua.bundle 铺在
+            // exe 旁，限定路径让随附副本确定性地赢下裸名搜索——裸名在
+            // Windows 上找不到时会继续查 CWD/PATH，可写目录放同名 DLL
+            // 即劫持；POSIX 限定路径含 / 按 literal 文件处理，缺了自然
+            // 落回下面的裸名表）。
+            string appdir = ProcessHost.AppDir();
+            if (appdir != "") {
+                for (int i = 0; i < cands.Length; i = i + 1) {
+                    Lua.mod = Interop.Load(appdir + "/" + cands[i]);
+                    if (Lua.mod != 0) { break; }
+                }
+            }
+            for (int i = 0; Lua.mod == 0 && i < cands.Length; i = i + 1) {
                 Lua.mod = Interop.Load(cands[i]);
                 if (Lua.mod != 0) { break; }
             }

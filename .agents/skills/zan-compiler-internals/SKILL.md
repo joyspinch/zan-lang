@@ -1341,3 +1341,18 @@ System.Threading` 的代价都是整个 rt_sync。
 声明不发射、不产生未定义符号。**验证口诀**：`ZAN_TRACE_SYNC=1 zanc ...`
 看 [sync-flag] 行，改动前后对比应为归零；注意 TrayIcon 这类"真线程"
 （Thread.Start 消息泵）的税是正当的，不要误杀。
+
+## zig 交叉的 linux 产物是 musl 静态链：dlopen 不可用，可选动态依赖全灭
+
+**坑**：`--target linux-x64`（zig 交叉）产物里 `Interop.Load`/任何 dlopen
+直接报 "Dynamic loading not supported"——musl 静态二进制不支持 dlopen
+（musl 的已知限制）。Lua/Python/SDL 这类运行期 dlopen 的可选原生依赖在
+交叉 Linux 产物上永远 IsAvailable()==false，且裸名/限定路径/CDPATH 都
+救不了。排查时先在目标机跑一个 `Interop.Load("libc.so")` 探针分清
+「库没找到」还是「dlopen 本身不可用」。
+
+**定式**：交叉 Linux 产物的可选原生依赖要么随包静态链进主程序
+（[DllImport] 声明 + 链接期解析），要么文档声明仅桌面动态链可用；
+验证沙箱/加载器类改动用 Windows 实机（lua54.dll 铺 exe 旁即可真跑，
+注意 lua_embed_smoke 的 env-skip 语义：无 Lua 时打印同一 golden，
+ctest 绿≠断言跑过，必须另写显式探针）。
