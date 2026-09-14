@@ -805,11 +805,26 @@ partial class DataTable {
     /// 未分组时显示提示。
     /// 列头被拖动期间 `headerDrag` 为 true，条带
     /// 可标示自己为放置目标。
+    /// 模态浮层（行右键菜单/表头右键菜单/列选择器/条件格式清除/
+    /// 编辑器弹窗）打开期间，表格交互面归浮层所有：内容阶段的事件
+    /// 种类就地清零。表头 chrome（全选框/排序/列菜单/筛选钮/手柄）、
+    /// 分组与筛选芯片条、表格体一样都是几何命中——读的是原始事件，
+    /// 弹层的全窗阻挡拦不住几何命中；菜单比表格高时会被钳到表格
+    /// 顶部，菜单项正好盖住表头，点菜单项就点穿到全选框上，选中行
+    /// 被改成点击位置的行（2026-09 用户实测）。浮层自身的内容在
+    /// 覆盖层阶段绘制，仍读原始事件，不受此抑制影响。
+    static int ModalEvt(App app, DataTableState st) {
+        if (st.ctxOpen || st.hdrCtxOpen || st.colChooserOpen
+            || st.cfClearOpen || st.edPopHot) { return 0; }
+        return app.EventKind();
+    }
+
     static void RenderGroupPanel(App app, int x, int y, int viewW, int h,
                                  List<DataColumn> cols, DataTableState st,
                                  bool headerDrag) {
         Canvas c = app.canvas;
         Theme t = app.theme;
+        int evt = DataTable.ModalEvt(app, st);
         int fs = Style.FontFallback(app, "small");
         bool over = app.mouseX >= x && app.mouseX < x + viewW
                     && app.mouseY >= y && app.mouseY < y + h;
@@ -880,13 +895,13 @@ partial class DataTable {
             int chipId = app.focus.AllocId();
             app.hitTester.RegisterRectL(chipId, cxp, chipY,
                                         rx - cxp, chipH, 0, cols[col].title);
-            if (app.EventKind() == 3 && app.window.EventButton() == 0
+            if (evt == 3 && app.window.EventButton() == 0
                 && app.hitTester.HitTest(app.mouseX, app.mouseY) == rmId) {
                 DataTable.UngroupOne(st, col);
                 st.GroupChanged.Raise();
                 app.RequestRedraw();
             }
-            if (app.EventKind() == 2 && app.window.EventButton() == 0
+            if (evt == 2 && app.window.EventButton() == 0
                 && app.hitTester.HitTest(app.mouseX, app.mouseY) == chipId) {
                 st.dragChip = col;
                 app.RequestRedraw();
@@ -1166,6 +1181,9 @@ partial class DataTable {
                        List<DataColumn> cols, DataSource src, DataTableState st) {
         Canvas c = app.canvas;
         Theme t = app.theme;
+        // 模态浮层打开期间整表（表头 chrome + 分组面板 + 表格体）
+        // 的事件种类清零，见 ModalEvt。
+        int evt = DataTable.ModalEvt(app, st);
 
         // 透视视图：整表切换为交叉投影。此后的管线
         // （EnsureInit/Recompute/表头/单元格/汇总/菜单）看到的
@@ -1284,7 +1302,7 @@ partial class DataTable {
             Checkbox.PaintBox(app, bx, by, box, allLvl);
             app.hitTester.RegisterRectL(allId, hx, y, selW, headerH, 0,
                                         "select-all");
-            if (app.EventKind() == 3 && app.window.EventButton() == 0 && app.hitTester.HitTest(app.mouseX, app.mouseY) == allId) {
+            if (evt == 3 && app.window.EventButton() == 0 && app.hitTester.HitTest(app.mouseX, app.mouseY) == allId) {
                 bool target = !allChecked;
                 DataTable.SelectAllRows(st, src, target);
                 st.SelectionChanged.Raise();
@@ -1344,7 +1362,7 @@ partial class DataTable {
                             c.DrawGlyphIn(chIcon, chX, by0, chev, bandRowH,
                                                 app.Scale(11), sIcon.FgOr(0));
                             app.hitTester.RegisterRect(chId, chX, by0, chev, bandRowH, 0);
-                            if (app.EventKind() == 3 && app.window.EventButton() == 0
+                            if (evt == 3 && app.window.EventButton() == 0
                                 && app.hitTester.HitTest(app.mouseX, app.mouseY) == chId) {
                                 DataTable.ToggleBand(st, cols, sp.path);
                                 st.BandToggled.Raise();
@@ -1455,7 +1473,7 @@ partial class DataTable {
                 if (gripHot || st.dragCol == i) { gCol = sIconSel.FgOr(0); }
                 DataTable.DrawGrip(app, hx, titleTop, gripW, titleRowH, gCol);
                 app.hitTester.RegisterRect(gripId, hx, titleTop, gripW, titleRowH, 0);
-                if (gripHot && app.EventKind() == 2 && app.window.EventButton() == 0) {
+                if (gripHot && evt == 2 && app.window.EventButton() == 0) {
                     st.dragCol = i;
                     st.dragColStartX = app.mouseX;
                     st.dragColMoved = false;
@@ -1496,7 +1514,7 @@ partial class DataTable {
                     if (app.focus.IsHovered(menuId)) { mColor = sIconHover.FgOr(0); }
                     c.DrawGlyphIn("filter", mIx, titleTop, menuIconW, titleRowH, app.Scale(10), mColor);
                     app.hitTester.RegisterRect(menuId, mIx, titleTop, menuIconW, titleRowH, 0);
-                    if (!st.dragColMoved && app.EventKind() == 3 && app.window.EventButton() == 0
+                    if (!st.dragColMoved && evt == 3 && app.window.EventButton() == 0
                         && !app.LongPressFired()
                         && app.hitTester.HitTest(app.mouseX, app.mouseY) == menuId) {
                         // LongPressFired：长按图标开过列菜单的那次
@@ -1570,7 +1588,7 @@ partial class DataTable {
             if (colDragging && st.dragCol == i) {
                 c.FillRect(visX, titleTop, visW, titleRowH, sHeaderHover.BgOr(0));
             }
-            if (col.sortable && !st.dragColMoved && app.EventKind() == 3 && app.window.EventButton() == 0 && app.ClickTarget() == titleId) {
+            if (col.sortable && !st.dragColMoved && evt == 3 && app.window.EventButton() == 0 && app.ClickTarget() == titleId) {
                 // 长按菜单已命中时松开不算排序点击：触摸上长按
                 // 表头由 menuId 的按住驱动，这里只挡住随后的释放。
                 if (!app.LongPressFired()) {
@@ -1587,7 +1605,7 @@ partial class DataTable {
             // 右键点击表头单元格 => 列上下文菜单（排序 / 自动适配 /
             // 隐藏）。基于几何判断，不受本单元格注册的
             // 标题 / 菜单图标 / 调整大小 id 重叠影响。
-            if (app.EventKind() == 2 && app.window.EventButton() == 1
+            if (evt == 2 && app.window.EventButton() == 1
                 && st.openMenu < 0
                 && app.mouseX >= hx && app.mouseX < hx + cw
                 && app.mouseY >= titleTop && app.mouseY < titleTop + titleRowH) {
@@ -1626,7 +1644,7 @@ partial class DataTable {
             int rzCursor = 4;
             if (!col.resizable) { rzCursor = 6; }
             app.hitTester.RegisterRect(rzId, rzX, titleTop, rzHitW, titleRowH, rzCursor);
-            if (col.resizable && app.EventKind() == 2 && app.window.EventButton() == 0 && app.PressTarget() == rzId) {
+            if (col.resizable && evt == 2 && app.window.EventButton() == 0 && app.PressTarget() == rzId) {
                 st.resizeCol = i;
                 st.resizeStartX = app.mouseX;
                 st.resizeStartW = st.colWidths[i];
@@ -1642,7 +1660,7 @@ partial class DataTable {
                 }
             }
 
-            if (st.resizeCol == i && app.EventKind() == 3 && app.window.EventButton() == 0) {
+            if (st.resizeCol == i && evt == 3 && app.window.EventButton() == 0) {
                 st.hitCol = i;
                 st.resizeCol = -1;
                 st.ColumnResizeEnd.Raise();
@@ -1817,7 +1835,7 @@ partial class DataTable {
                     }
                     c.PopClip();
                     app.hitTester.RegisterRect(frid2, frX, fry, frW, filterRowH, 1);
-                    if (app.EventKind() == 3 && app.window.EventButton() == 0
+                    if (evt == 3 && app.window.EventButton() == 0
                         && app.hitTester.HitTest(app.mouseX, app.mouseY) == frid2) {
                         if (st.filterRowFocusCol != fri) {
                             st.filterRowFocusCol = fri;
@@ -1889,7 +1907,7 @@ partial class DataTable {
                 if (gst == 1) { Checkbox.PaintBox(app, gcbX, gcbY, gcbSz, 1000); }
                 else if (gst == 2) { Checkbox.PaintBoxIndeterminate(app, gcbX, gcbY, gcbSz); }
                 else { Checkbox.PaintBox(app, gcbX, gcbY, gcbSz, 0); }
-                if (app.EventKind() == 3 && app.window.EventButton() == 0
+                if (evt == 3 && app.window.EventButton() == 0
                     && app.hitTester.HitTest(app.mouseX, app.mouseY) == gcbId) {
                     DataTable.SelectGroupRows(st, grp, src, gst != 1);
                     st.SelectionChanged.Raise();
@@ -2011,7 +2029,7 @@ partial class DataTable {
                     int rgCol = sIcon.FgOr(0);
                     if (rgHot || st.dragRow == oiRow) { rgCol = sIconSel.FgOr(0); }
                     DataTable.DrawGrip(app, rowGripX, ry, rowGripW, rowH, rgCol);
-                    if (rgHot && app.EventKind() == 2 && app.window.EventButton() == 0) {
+                    if (rgHot && evt == 2 && app.window.EventButton() == 0) {
                         st.dragRow = oiRow;
                         st.dragStartY = app.mouseY;
                         st.dragMoved = false;
@@ -2035,7 +2053,7 @@ partial class DataTable {
                     int exCol = sIcon.FgOr(0);
                     if (app.focus.IsHovered(exId)) { exCol = sIconSel.FgOr(0); }
                     c.DrawGlyph(exCh, exX, exY, exSz, exCol);
-                    if (app.EventKind() == 3 && app.window.EventButton() == 0
+                    if (evt == 3 && app.window.EventButton() == 0
                         && app.hitTester.HitTest(app.mouseX, app.mouseY) == exId) {
                         DataTable.ToggleDetail(st, src, rowIdx);
                         app.RequestRedraw();
@@ -2053,7 +2071,7 @@ partial class DataTable {
                 int selId = app.focus.AllocId();
                 app.hitTester.RegisterRectL(selId, cx2, ry, selW, rowH, 0,
                                             "select-row");
-                if (app.EventKind() == 3 && app.window.EventButton() == 0 && app.hitTester.HitTest(app.mouseX, app.mouseY) == selId) {
+                if (evt == 3 && app.window.EventButton() == 0 && app.hitTester.HitTest(app.mouseX, app.mouseY) == selId) {
                     DataTable.SetSelected(st, src, rowIdx, !rSel);
                     st.hitRow = rowIdx;
                     st.SelectionChanged.Raise();
@@ -2223,7 +2241,7 @@ partial class DataTable {
                                 int exId = app.focus.AllocId();
                                 int exW = app.Scale(16) * (depth + 1);
                                 app.hitTester.RegisterRect(exId, ccl, ry, exW, rowH, 0);
-                                if (app.EventKind() == 3 && app.window.EventButton() == 0
+                                if (evt == 3 && app.window.EventButton() == 0
                                     && app.hitTester.HitTest(app.mouseX, app.mouseY) == exId) {
                                     DataTable.TreeToggle(st, src, rowIdx);
                                     app.RequestRedraw();
@@ -2244,7 +2262,7 @@ partial class DataTable {
                     if (cols[cc].isBool && cols[cc].editable) {
                         int tgId = app.focus.AllocId();
                         app.hitTester.RegisterRect(tgId, ccl, ry, cw, rowH, 0);
-                        if (app.EventKind() == 3 && app.window.EventButton() == 0
+                        if (evt == 3 && app.window.EventButton() == 0
                             && app.hitTester.HitTest(app.mouseX, app.mouseY) == tgId) {
                             DataTable.ToggleBoolCell(st, cols, src, rowIdx, cc);
                             app.RequestRedraw();
@@ -2382,7 +2400,7 @@ partial class DataTable {
                        ay + (rowH - Style.FontFallback(app, "small")) / 2,
                        DataTable.T("Click to add row", "点击添加新行"), aFg, Style.FontFallback(app, "small"));
             c.FillRect(x + 1, ay + rowH - 1, viewW - 2, 1, gridColor);
-            if (app.EventKind() == 3 && app.window.EventButton() == 0
+            if (evt == 3 && app.window.EventButton() == 0
                 && app.hitTester.HitTest(app.mouseX, app.mouseY) == addId) {
                 int newRow = DataTable.AppendRow(st, cols, src);
                 if (newRow >= 0) {
@@ -2521,7 +2539,7 @@ partial class DataTable {
             } else { st.tipOi = -1; }
         } else { st.tipOi = -1; }
 
-        int ek = app.EventKind();
+        int ek = evt;
         int eb = app.window.EventButton();
         int emods = app.window.EventMods();
 
@@ -2657,18 +2675,9 @@ partial class DataTable {
             }
             if (frKeyHandled) { ek = 0; app.RequestRedraw(); }
         }
-        // 右键菜单打开时是模态的：吞掉表格体事件，
-        // 避免点击菜单项时还在其下方触发范围/选择。
-        // （RenderContextMenu 读取原始事件来驱动菜单项命中/关闭。）
-        if (st.ctxOpen) { ek = 0; }
-        if (st.hdrCtxOpen) { ek = 0; }
-        if (st.colChooserOpen) { ek = 0; }
-        // 清除条件格式规则弹窗是模态：打开时吞掉表格体事件，
-        // 弹窗自身的绘制与点击在浮层阶段自理。
-        if (st.cfClearOpen) { ek = 0; }
-        // 打开的编辑器弹窗同理：其列表/日历已处理按压，
-        // 下方的单元格不应将其视为新的选择。
-        if (st.edPopHot) { ek = 0; }
+        // 模态浮层（右键菜单/列选择器/条件格式清除/编辑器弹窗）
+        // 打开时吞掉表格事件——提升到 RenderSource 入口统一处理
+        // （ModalEvt），表头 chrome 与表格体一并受抑制。
 
         // ---------------- 内联编辑器按键处理 ----------------
         // 编辑器打开时独占键盘：可打印输入、光标
@@ -3200,7 +3209,7 @@ partial class DataTable {
                                    "×", sChip2.FgOr(0), sbFs);
                 app.hitTester.RegisterRectL(chipId, chipX, sbY + app.Scale(4), cw, chipH2, 0,
                                             label);
-                if (app.EventKind() == 3 && app.window.EventButton() == 0
+                if (evt == 3 && app.window.EventButton() == 0
                     && app.hitTester.HitTest(app.mouseX, app.mouseY) == chipId) {
                     // 清除该条筛选：组合树条目清树，其余按列清 ColFilter
                     // 与筛选行文本。

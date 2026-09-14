@@ -15,10 +15,22 @@ using Gui.Component.DataTable;
 /// Escape/点菜单项（复制）也不动选择。稳定键源（KeyBy）路径
 /// 与无选择时的预选语义一并覆盖。
 ///
+/// 「点菜单项」场景（2026-09 用户复报后补）：菜单比表格高时被
+/// RenderContextMenu 钳到表格顶部，菜单项正好盖住表头——表头
+/// chrome（全选框等）是几何命中，此前不受模态抑制，点菜单项
+/// 会点穿到全选框上把选择改掉（ModalEvt 修复）。点第 0 项的
+/// 落点按同一套钳位公式算出，正好压在表头全选框上；断言菜单
+/// 关闭（项激活成功）且选择原样。
+///
 /// 几何纪律（踩过的坑）：表高 300、行高 heightMedium——行 4 的
 /// 体坐标必须落在 bodyTop + bodyH 之内且是可见行，右键在表体
 /// 之外/不可见行上会被几何判定静默忽略，断言就会因"菜单没开"
 /// 假失败（早期版本表高 240，行 4 在表外，全部右键场景 0）。
+///
+/// harness 纪律（踩过的坑）：Body 里不要再调 app.BeginFrame()——
+/// SafeFrame 已经调过；双重置会把 inputBlockPrevious 链打断，
+/// BlockHitsBelow 每帧误判「模态首帧」而认领点击，菜单项永远
+/// 收不到释放（表现为菜单开着、result 恒 -1），掩盖真实行为。
 class KeyRowSource : DataSource {
     List<DataRow> rows;
     KeyRowSource(List<DataRow> values) { this.rows = values; }
@@ -36,7 +48,6 @@ class Program {
     static DataTableState st;
 
     static void Body() {
-        app.BeginFrame();
         WidgetId.ResetFrame();
         // Main 先出一帧事件才建状态，未建前不渲染表体。
         if (st != null && cols != null && src != null) {
@@ -109,6 +120,31 @@ class Program {
     /// Escape 关菜单（第一帧置 openFlag=false，第二帧镜像 ctxOpen）。
     static void EscapeMenu() {
         app.window.InjectEvent(4, 200, 200, 0, 27, 0);
+        PumpFrame();
+        PumpFrame();
+    }
+
+    /// 点击行菜单第 0 项（复制）。落点按 RenderContextMenu 的
+    /// 表格矩形钳位 + 面板 (padV, rowH/2) 复刻：菜单比表格高时
+    /// 钳到表格顶部，第 0 项正好压在表头全选框上——历史上点穿
+    /// 改选择的位置。返回是否命中了项（菜单应因此关闭）。
+    static void ClickMenuItem0() {
+        int mw = app.Scale(240);
+        int mh = OverlayPopup.RichHeight(app,
+                                         DataTable.BuildRowMenuItems(st, cols, src));
+        int mx = st.ctxX;
+        if (mx + mw > 20 + 420) { mx = 20 + 420 - mw - app.Scale(2); }
+        int my = st.ctxY;
+        if (my + mh > 20 + 300) { my = 20 + 300 - mh - app.Scale(2); }
+        if (mx < 20) { mx = 20; }
+        if (my < 20) { my = 20; }
+        int ix = mx + 40;
+        int iy = my + app.Scale(6) + app.Scale(26) / 2;
+        MoveTo(ix, iy);
+        Press(ix, iy, 0, 0);
+        Release(ix, iy, 0, 0);
+        // 项激活写 result 在释放帧，下一帧 RenderContextMenu 分发并
+        // 镜像 ctxOpen；再补一帧让镜像稳定。
         PumpFrame();
         PumpFrame();
     }
@@ -223,5 +259,45 @@ class Program {
         RightClickBody(1);
         Console.WriteLine("noSelectionRightClickPreselects="
             + (SelCount() == 1 && st.ctxOpen ? 1 : 0));
+
+        // ---- 8. 无预选右键后点菜单第 0 项：选择保持在该行 ----
+        // 菜单钳到表格顶部，第 0 项盖住表头——点穿会选中"点击
+        // 位置的行"（表头全选框）而不是右键的行。
+        Console.WriteLine("menuItemClickKeepsRowSelection="
+            + (st.ctxOpen && ClickMenuItem0Kept(st.ctxRow) ? 1 : 0));
+
+        // ---- 9. 勾选 {0,2} 右键行 4 后点菜单第 0 项：勾选不动 ----
+        Reset("legacy");
+        ClickRowCheck(0);
+        ClickRowCheck(2);
+        RightClickBody(4);
+        bool item9 = st.ctxOpen && SelCount() == 2;
+        ClickMenuItem0();
+        bool closed9 = !st.ctxOpen && st.ctxMenuResult.Get() < 0;
+        Console.WriteLine("menuItemClickKeepsCheckboxSelection="
+            + (item9 && closed9 && SelCount() == 2 && st.selected[0]
+               && st.selected[2] ? 1 : 0));
+    }
+
+    /// 场景 8 主体：点第 0 项后选择仍是唯一的右键行、菜单已关。
+    /// 用局部快照记录右键时的行，点击后比对。
+    static bool ClickMenuItem0Kept(int ctxRowAtOpen) {
+        int sole = 0 - 100;
+        for (int i = 0; i < st.selected.Count; i = i + 1) {
+            if (st.selected[i]) {
+                if (sole != 0 - 100) { return false; }
+                sole = i;
+            }
+        }
+        ClickMenuItem0();
+        if (st.ctxOpen) { return false; }
+        int after = 0 - 100;
+        for (int i = 0; i < st.selected.Count; i = i + 1) {
+            if (st.selected[i]) {
+                if (after != 0 - 100) { return false; }
+                after = i;
+            }
+        }
+        return after == ctxRowAtOpen && after == sole;
     }
 }
