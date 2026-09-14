@@ -2783,6 +2783,19 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_html_runtime_cjk${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # GenHtml 编译期样式 scoping（Vue <style scoped> 同语义）：两份文档
+  # 同名类合装一张 appCss 后各自身份——同名 .card 宽度互不覆盖，
+  # A 的 body:flex 不泄漏进 B 的块流 body；scope 类落在元素与
+  # 改写后的 Css 两头。
+  add_test(NAME conformance_gui_html_scope
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/html_scope_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/html_scope.html;${CMAKE_SOURCE_DIR}/tests/gui/html_scope_b.html;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_html_scope.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_html_scope${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # Declarative typed grid: a DataGrid field with "of" + "columns" projects
   # typed accessor lambdas onto the generic column API, binds the caller's
   # List<T> directly (no DataRow), and "props"/"rowFactory" reach the state.

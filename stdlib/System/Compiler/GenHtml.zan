@@ -21,6 +21,13 @@ namespace System.Compiler;
 /// 调用方：`Control root = UiHtml.Build(handlers);` 之后自行
 /// `app.UseAppCss(UiHtml.Css)`（或并进自己的样式表）再挂树。
 ///
+/// 样式 scoping（Vue <style scoped> 同语义）：多份文档的 Css 合装
+/// 进同一张 app 表时，裸标签/类选择器会跨文档互中。生成期给每个
+/// 元素混入文档作用域类 zs-<基名>，并把文档 CSS 每个复合块补上
+/// 该类——规则只命中本文档的元素（ScopeStyles）。运行期挂载件
+/// （列表行模板等 Build 之外长出来的控件）不携作用域类，其样式
+/// 放皮肤层（全局通道）——与 Vue 的组件样式不泄漏子组件同一取舍。
+///
 /// 生成依据是 WDoc.nodes 声明记录（tag/父下标/属性/文档序内容）——
 /// 与运行时同一次解析的产物，天然同构。本文件只依赖 System.Web
 /// 纯层（不能 using Gui：生成器 exe 的活名闭包会滤掉 Gui 的
@@ -70,6 +77,9 @@ class GenHtml {
             }
             genCls.Add(g);
         }
+        // 文档作用域类：元素与 CSS 同源混入（见类注释与 ScopeStyles）。
+        string zs = ScopeClassOf(path);
+        css = ScopeStyles(css, zs);
         StringBuilder b = new StringBuilder();
         GenCommon.Line(b, 0, "// 由 GenHtml 从 " + BaseName(path)
                              + " 生成 -- 编译期产物,勿手改。");
@@ -77,7 +87,8 @@ class GenHtml {
         GenCommon.Line(b, 0, "using Gui;");
         GenCommon.Line(b, 0, "");
         GenCommon.Line(b, 0, "public class " + cls + " {");
-        GenCommon.Line(b, 1, "/// <style>、<link> 与 style 属性收集的 CSS："
+        GenCommon.Line(b, 1, "/// <style>、<link> 与 style 属性收集的 CSS，已按文档"
+                           + "作用域类 " + zs + " 收窄（只命中本文档元素）："
                            + "装载时并进 appCss（UseAppCss）。");
         // 值超长（整套应用样式随文档走）时拆成多段字面量相加，绕开
         // 单字面量 4095 字符的词法上限——与 GenForm.EmitSetProp 同一
@@ -103,7 +114,7 @@ class GenHtml {
                            + "    public static Control Build("
                            + "HtmlHandlers handlers) {");
         for (int i = 0; i < wd.nodes.Count; i = i + 1) {
-            EmitDecl(b, wd.nodes[i], i, genCls[i]);
+            EmitDecl(b, wd.nodes[i], i, genCls[i], zs);
         }
         // 内容游走：逐父按 items 文档序发射 AddText / AddChild——
         // 与运行时 Html.Parse 的装配同一顺序，混排行盒靠它同构。
@@ -122,7 +133,8 @@ class GenHtml {
 
     /// 一条记录 = 一个变量的声明 + 属性协议（构造；文本与挂树在
     /// EmitContent 按文档序发射）。
-    static void EmitDecl(StringBuilder b, WNode n, int idx, string genCls) {
+    static void EmitDecl(StringBuilder b, WNode n, int idx, string genCls,
+                         string zs) {
         string v = "v" + idx;
         string tag = n.tag;
         string id = GenCommon.Esc(HtmlText.Attr(n.attrNames, n.attrVals,
@@ -183,6 +195,9 @@ class GenHtml {
                                + GenCommon.Esc(cs[c]) + "\");");
             }
         }
+        // 文档作用域类：与 ScopeStyles 改写的选择器配对——生成 CSS
+        // 只命中带此类的元素（即本文档 Build 出的树）。
+        GenCommon.Line(b, 2, v + ".AddClass(\"" + zs + "\");");
         bool isWidget = tag == "button" || tag == "textarea"
             || tag == "input" || tag == "img";
         if (isWidget && id != "") {
@@ -266,6 +281,340 @@ class GenHtml {
                                + GenCommon.Esc(n.attrVals[i]) + "\");");
             }
         }
+    }
+
+    // —— 编译期样式 scoping（Vue <style scoped> 同语义）——
+
+    /// 文档路径 → 作用域类：基名去扩展名后小写、非字母数字折 '-'。
+    /// 与生成类名同源（同目录同名文档本来就会撞生成类名），
+    /// 作用域类继承该唯一性。
+    static string ScopeClassOf(string path) {
+        string baseName = BaseName(path);
+        int dot = baseName.LastIndexOf(".");
+        if (dot > 0) { baseName = baseName.Substring(0, dot); }
+        string outp = "zs-";
+        bool dash = true;
+        for (int i = 0; i < baseName.Length; i = i + 1) {
+            int c = baseName[i];
+            bool al = (c >= 48 && c <= 57) || (c >= 65 && c <= 90)
+                || (c >= 97 && c <= 122);
+            if (al) {
+                outp = outp + baseName.Substring(i, 1).ToLower();
+                dash = false;
+            } else if (!dash) {
+                outp = outp + "-";
+                dash = true;
+            }
+        }
+        return outp;
+    }
+
+    /// 样式表 scoping 主入口：逐顶层段（注释 / at 规则 / 普通规则）
+    /// 走一遍，规则 prelude 改写、块体原样。
+    static string ScopeStyles(string css, string zs) {
+        int n = css.Length;
+        StringBuilder outp = new StringBuilder();
+        int i = 0;
+        while (i < n) {
+            if (i + 1 < n && css.Substring(i, 2) == "/*") {
+                int e = FindFrom(css, "*/", i + 2);
+                int stop = e < 0 ? n : e + 2;
+                outp.Append(css.Substring(i, stop - i));
+                i = stop;
+                continue;
+            }
+            if (css.Substring(i, 1) == "@") {
+                i = ScopeAt(css, i, zs, outp);
+                continue;
+            }
+            int b = i;
+            bool real = false;
+            bool atStart = false;
+            while (b < n) {
+                b = SkipNoise(css, b);
+                if (b >= n) { break; }
+                string cb = css.Substring(b, 1);
+                if (cb == "{" || cb == ";" || cb == "}") { break; }
+                if (cb == "@" && !real) { atStart = true; break; }
+                if (cb != " " && cb != "\t" && cb != "\r"
+                    && cb != "\n") { real = true; }
+                b = b + 1;
+            }
+            if (b >= n) { outp.Append(css.Substring(i)); break; }
+            if (atStart) {
+                // 段首 @（前面只有空白/注释）：吐前缀，交回 at 分支
+                outp.Append(css.Substring(i, b - i));
+                i = b;
+                continue;
+            }
+            if (css.Substring(b, 1) != "{") {
+                // 杂尘（裸 ';' / '}'）：原样吐出，不碰后面
+                outp.Append(css.Substring(i, b + 1 - i));
+                i = b + 1;
+                continue;
+            }
+            outp.Append(ScopePrelude(css.Substring(i, b - i), zs));
+            int close = MatchBrace(css, b);
+            if (close < 0) { outp.Append(css.Substring(b)); break; }
+            outp.Append(css.Substring(b, close + 1 - b));
+            i = close + 1;
+        }
+        return outp.ToString();
+    }
+
+    /// at 规则：返回处理后的下一个下标。@media/@supports 递归内层；
+    /// 其余（@keyframes 的百分比段、@font-face、未知块）整块原样。
+    static int ScopeAt(string css, int i, string zs, StringBuilder outp) {
+        int n = css.Length;
+        int k = i + 1;
+        while (k < n && NameChar(css.Substring(k, 1))) { k = k + 1; }
+        string atName = css.Substring(i + 1, k - i - 1).ToLower();
+        int j = k;
+        int depth = 0;
+        while (j < n) {
+            j = SkipNoise(css, j);
+            if (j >= n) { break; }
+            string cj = css.Substring(j, 1);
+            if (cj == "(") { depth = depth + 1; }
+            else if (cj == ")") {
+                if (depth > 0) { depth = depth - 1; }
+            } else if (depth == 0 && (cj == "{" || cj == ";")) {
+                break;
+            }
+            j = j + 1;
+        }
+        if (j >= n) { outp.Append(css.Substring(i)); return n; }
+        if (css.Substring(j, 1) == ";") {
+            outp.Append(css.Substring(i, j + 1 - i));
+            return j + 1;
+        }
+        int close = MatchBrace(css, j);
+        if (close < 0) { outp.Append(css.Substring(i)); return n; }
+        if (atName == "media" || atName == "supports") {
+            outp.Append(css.Substring(i, j + 1 - i));
+            outp.Append(ScopeStyles(css.Substring(j + 1, close - j - 1), zs));
+            outp.Append("}");
+        } else {
+            outp.Append(css.Substring(i, close + 1 - i));
+        }
+        return close + 1;
+    }
+
+    /// 规则 prelude（选择器列表）：顶层逗号切分，逐片 scoping 后拼回。
+    static string ScopePrelude(string sel, string zs) {
+        List<string> parts = new List<string>();
+        int n = sel.Length;
+        int start = 0;
+        int i = 0;
+        while (i < n) {
+            i = SkipNoise(sel, i);
+            if (i >= n) { break; }
+            string c = sel.Substring(i, 1);
+            if (c == "(" || c == "[") {
+                int close = MatchChunk(sel, i);
+                i = close < 0 ? n : close;
+                continue;
+            }
+            if (c == ",") {
+                parts.Add(sel.Substring(start, i - start));
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        parts.Add(sel.Substring(start));
+        string outp = "";
+        for (int p = 0; p < parts.Count; p = p + 1) {
+            if (p > 0) { outp = outp + ","; }
+            outp = outp + ScopeOne(parts[p].Trim(), zs);
+        }
+        return outp;
+    }
+
+    /// 一片选择器（可能带组合器链）：逐复合块补 zs。注释剥离、空白
+    /// 归一；显式组合器（>/+/~）覆盖待定后代空格。
+    static string ScopeOne(string piece, string zs) {
+        List<string> outp = new List<string>();
+        string cur = "";
+        string pend = "";
+        int n = piece.Length;
+        int i = 0;
+        while (i < n) {
+            int j = SkipNoise(piece, i);
+            if (j > i) { i = j; continue; }
+            string c = piece.Substring(i, 1);
+            if (c == " " || c == "\t" || c == "\r" || c == "\n") {
+                if (cur != "" && pend == "") { pend = " "; }
+                i = i + 1;
+                continue;
+            }
+            if (c == ">" || c == "+" || c == "~") {
+                pend = c;
+                i = i + 1;
+                continue;
+            }
+            if (c == "{" || c == "}" || c == ";") {
+                break;   // 防御：块边界终止 piece（正常到不了这里）
+            }
+            if (cur != "" && pend != "") {
+                outp.Add(ScopeCompound(cur, zs));
+                outp.Add(pend);
+                cur = "";
+                pend = "";
+            }
+            if (c == "(" || c == "[" || c == "\"" || c == "'") {
+                int close = MatchChunk(piece, i);
+                int stop = close < 0 ? n : close + 1;
+                cur = cur + piece.Substring(i, stop - i);
+                i = stop;
+                continue;
+            }
+            cur = cur + c;
+            i = i + 1;
+        }
+        if (cur != "" || outp.Count == 0) {
+            outp.Add(ScopeCompound(cur, zs));
+        }
+        string s = "";
+        for (int k = 0; k < outp.Count; k = k + 1) { s = s + outp[k]; }
+        return s;
+    }
+
+    /// 单复合块补 zs：插到主体名/类列之后、首个伪类/属性之前——
+    /// 类列顺序无关语义，且保证类在 `::before`/`[attr]` 前的语法序。
+    /// 已含该类则原样（幂等）；无主体（裸 `:hover`）补 `*` 主体，
+    /// 否则规则会泄成全局。
+    static string ScopeCompound(string chunk, string zs) {
+        if (chunk == "") { return ""; }
+        if (HasClsToken(chunk, zs)) { return chunk; }
+        int at = 0 - 1;
+        int n = chunk.Length;
+        int i = 0;
+        while (i < n) {
+            int j = SkipNoise(chunk, i);
+            if (j > i) { i = j; continue; }
+            string c = chunk.Substring(i, 1);
+            if (c == ":" || c == "[") { at = i; break; }
+            if (c == "(") {
+                int close = MatchChunk(chunk, i);
+                if (close < 0) { i = n; break; }
+                i = close + 1;
+                continue;
+            }
+            i = i + 1;
+        }
+        if (at < 0) { at = n; }
+        string ins = at == 0 ? "*." + zs : "." + zs;
+        return chunk.Substring(0, at) + ins + chunk.Substring(at);
+    }
+
+    /// 越过 i 处的注释/字符串（可连续），返回首个"实"字符下标。
+    static int SkipNoise(string s, int i) {
+        int n = s.Length;
+        while (i < n) {
+            if (i + 1 < n && s.Substring(i, 2) == "/*") {
+                int e = FindFrom(s, "*/", i + 2);
+                i = e < 0 ? n : e + 2;
+                continue;
+            }
+            string c = s.Substring(i, 1);
+            if (c == "\"" || c == "'") {
+                int q = MatchChunk(s, i);
+                i = q < 0 ? n : q + 1;
+                continue;
+            }
+            break;
+        }
+        return i;
+    }
+
+    /// 括号/引号块的配对下标（引号支持 \\ 转义，括号计嵌套，
+    /// 注释/内层字符串不参与配对）；找不到返回 -1。
+    static int MatchChunk(string s, int open) {
+        string o = s.Substring(open, 1);
+        if (o == "\"" || o == "'") {
+            int n2 = s.Length;
+            int i2 = open + 1;
+            while (i2 < n2) {
+                if (s.Substring(i2, 1) == "\\") { i2 = i2 + 2; continue; }
+                if (s.Substring(i2, 1) == o) { return i2; }
+                i2 = i2 + 1;
+            }
+            return 0 - 1;
+        }
+        string cl = o == "(" ? ")" : "]";
+        int depth = 0;
+        int n = s.Length;
+        int i = open + 1;
+        while (i < n) {
+            i = SkipNoise(s, i);
+            if (i >= n) { return 0 - 1; }
+            string c = s.Substring(i, 1);
+            if (c == "\"" || c == "'") {
+                int q = MatchChunk(s, i);
+                i = q < 0 ? n : q;
+                continue;
+            }
+            if (c == o) { depth = depth + 1; }
+            else if (c == cl) {
+                if (depth == 0) { return i; }
+                depth = depth - 1;
+            }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    /// '{' 的配对 '}'（注释/字符串感知）。
+    static int MatchBrace(string s, int open) {
+        int depth = 0;
+        int n = s.Length;
+        int i = open;
+        while (i < n) {
+            i = SkipNoise(s, i);
+            if (i >= n) { return 0 - 1; }
+            string c = s.Substring(i, 1);
+            if (c == "{") { depth = depth + 1; }
+            else if (c == "}") {
+                depth = depth - 1;
+                if (depth == 0) { return i; }
+            }
+            i = i + 1;
+        }
+        return 0 - 1;
+    }
+
+    /// 复合块里是否已有 zs 这个类词（".zs-x" 后跟非名字字符）。
+    static bool HasClsToken(string chunk, string zs) {
+        string needle = "." + zs;
+        int n = chunk.Length;
+        int m = needle.Length;
+        for (int k = 0; k + m <= n; k = k + 1) {
+            if (!HtmlText.StartsWith(chunk.Substring(k), needle)) { continue; }
+            if (k + m >= n) { return true; }
+            string c = chunk.Substring(k + m, 1);
+            if (!NameChar(c)) { return true; }
+        }
+        return false;
+    }
+
+    static int FindFrom(string s, string needle, int start) {
+        int n = s.Length;
+        int m = needle.Length;
+        for (int i = start; i + m <= n; i = i + 1) {
+            if (HtmlText.StartsWith(s.Substring(i), needle)) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    static bool NameChar(string c) {
+        return Alnum(c) || c == "-" || c == "_";
+    }
+
+    static bool Alnum(string c) {
+        if (c.Length != 1) { return false; }
+        int v = c[0];
+        return (v >= 48 && v <= 57) || (v >= 65 && v <= 90)
+            || (v >= 97 && v <= 122);
     }
 
     /// "src/ui.html" → "UiHtml"（基名帕斯卡化 + Html；非标识符字符
