@@ -78,6 +78,8 @@ partial class LegendApp {
     }
 
     void BuildGuildPage() {
+        /* 在线进页才拉（Maybe 守卫：有缓存不再发，防 Bump 重建循环）。 */
+        if (net.Self() != null) { net.MaybeRefreshGuild(); }
         Panel page0 = Panel.Column(); page0.Class = "tbl-page";
         page0.Pad(0); page0.Gap(0); page0.Grow(); content.With(page0);
 
@@ -91,20 +93,40 @@ partial class LegendApp {
         Panel wall = Panel.Column(); wall.Pad(0); wall.Gap(Spec.TblRowGap());
         box.With(wall);
 
-        List<GuildRow> rows = GuildData();
+        /* 在线 = 服务端行会表（建会/入会即时可见）；离线 = 原版对照抄录。
+           不足一页的行画空格子（骨架仍是 12 行）。 */
+        JsonValue rows = net.Self() != null ? net.PlayGuild() : null;
+        int nRows = rows != null && rows.IsArray() ? rows.Count() : 0;
+        List<GuildRow> demo = GuildData();
         for (int r = 0; r < Spec.TblRows(); r = r + 1) {
-            GuildRow gu = rows[r];
+            JsonValue g = rows != null && r < nRows ? rows.At(r) : null;
+            GuildRow gu = g == null && rows == null && r < demo.Count ? demo[r] : null;
+            bool mine = g != null && g.Int("mine", 0) == 1;
             List<Panel> cells = new List<Panel>();
-            cells.Add(TblCell(Rules.N(r + 1), "guild-c0", ws[0]));
-            cells.Add(TblCell(gu.name, "guild-c1", ws[1]));
+            cells.Add(TblCell(g != null ? Rules.N(r + 1)
+                              : (gu != null ? Rules.N(r + 1) : ""), "guild-c0", ws[0]));
+            cells.Add(TblCell(g != null ? g.Str("name", "")
+                              : (gu != null ? gu.name : ""), "guild-c1", ws[1]));
             cells.Add(TblCellBox(GuildLvBadge(), ws[2]));
-            cells.Add(TblCell(gu.MemText(), "guild-c2", ws[3]));
-            cells.Add(TblCell(gu.master, "guild-c1", ws[4]));
-            cells.Add(TblCell(gu.GoodsText(), "guild-c1", ws[5]));
-            cells.Add(TblCell(gu.LimitText(), "guild-c3", ws[6]));
-            cells.Add(TblActionCell("申请", "guild-btn", Spec.GuildApplyW(),
-                                    Spec.GuildApplyH(), ws[7], TblRowHAt(r),
-                                    () => { GuildApply(gu); }));
+            cells.Add(TblCell(g != null ? Rules.N(g.Int("members", 0)) + "/" + Rules.N(g.Int("memberCap", 0))
+                              : (gu != null ? gu.MemText() : ""), "guild-c2", ws[3]));
+            cells.Add(TblCell(g != null ? g.Str("master", "")
+                              : (gu != null ? gu.master : ""), "guild-c1", ws[4]));
+            cells.Add(TblCell(g != null ? Rules.N(g.Int("goods", 0))
+                              : (gu != null ? gu.GoodsText() : ""), "guild-c1", ws[5]));
+            cells.Add(TblCell(g != null ? g.Str("limitLevel", "0") + "级"
+                              : (gu != null ? gu.LimitText() : ""), "guild-c3", ws[6]));
+            if (g != null) {
+                int gid = g.Int("id", 0);
+                cells.Add(TblActionCell(mine ? "退出" : "申请", "guild-btn",
+                                        Spec.GuildApplyW(), Spec.GuildApplyH(), ws[7],
+                                        TblRowHAt(r),
+                                        () => { GuildRowAct(gid, mine); }));
+            } else {
+                cells.Add(TblActionCell("申请", "guild-btn", Spec.GuildApplyW(),
+                                        Spec.GuildApplyH(), ws[7], TblRowHAt(r),
+                                        () => { GuildApply(gu); }));
+            }
             wall.With(TblRowBoxes(cells, r, "tbl-row"));
         }
         box.With(TblPad(Spec.TblBottomPad()));
@@ -120,6 +142,19 @@ partial class LegendApp {
         page0.With(TblFootOpt(GuildFootLeft(), pg, Spec.GuildFootPadL(), false));
     }
 
+    /// 在线行会行动作：mine 行是退出，其余是申请入会（结果由服务端裁决，
+    /// 错误进聊天、成功后 RefreshGuild 重拉全表）。空行给提示。
+    void GuildRowAct(int gid, bool mine) {
+        if (gid <= 0) { GuildSay("这一行没有行会。"); return; }
+        if (mine) { net.GuildQuit(); return; }
+        net.GuildJoin(gid);
+    }
+
+    void GuildSay(string msg) {
+        if (net.Self() != null) { net.AddChat("[系统]", msg); return; }
+        g.Log(msg);
+    }
+
     /// 等级列的红椭圆徽章：定尺寸子盒 + 居中白字（居中同样靠 flex
     /// `justify-content`——`Label` 不认 `text-align`，与表格格子同理）。
     Panel GuildLvBadge() {
@@ -131,8 +166,8 @@ partial class LegendApp {
         return b;
     }
 
-    /// 页脚左组：「创建行会」钮 + 16 设备缝 + 提示文字（页脚左内缩 25 设备
-    /// 由 `TblFootOpt` 的 padL 给，比称谓/爵位的 18 宽）。
+    /// 页脚左组：「创建行会」钮 + 提示文字；在线点钮进入命名态
+    /// （输入框 + 确认/取消），建会校验全在服务端。
     Panel GuildFootLeft() {
         Panel left = Panel.Row(); left.Pad(0); left.Gap(0);
         left.Prefer(0, Spec.TblFootH());
@@ -140,23 +175,61 @@ partial class LegendApp {
                          Spec.TblFootH(), () => { GuildCreate(); }));
         Panel gap = Panel.Row(); gap.Pad(0);
         gap.Prefer(Spec.GuildCreateGap(), Spec.TblFootH()); left.With(gap);
+        if (this.guildNaming && net.Self() != null) {
+            Input inp = new Input("行会名（2-8字）");
+            inp.Class = "guild-name-in";
+            inp.Prefer(Spec.Px(220), Spec.Px(30));
+            /* `框.data = 字段` 是编译器的实时绑定（Get 读字段 / Set 回写），
+               控件重建后值还在——SignalString 不收（LoginWin 同注）。 */
+            inp.data = this.guildName;
+            left.With(inp);
+            left.With(SpacerW(Spec.Px(8)));
+            left.With(BtnDev("确认", "tbl-btn", Spec.Px(64), Spec.TblFootH(),
+                             () => { GuildCreateGo(); }));
+            left.With(SpacerW(Spec.Px(6)));
+            left.With(BtnDev("取消", "tbl-btn", Spec.Px(64), Spec.TblFootH(),
+                             () => { this.guildNaming = false; BuildPage(); Refresh(); }));
+            return left;
+        }
         Label hint = Text("创建行会需要沃玛号角和500W金币", "guild-hint", 0);
         hint.Prefer(0, Spec.TblFootH());
         left.With(hint);
         return left;
     }
 
-    /// 「申请」钮：尚未接玩法，按本模板惯例给明确反馈（不假装已实现）。
+    void GuildCreateGo() {
+        string name = this.guildName.Trim();
+        if (name.Length == 0) { GuildSay("先给行会起个名字。"); return; }
+        this.guildNaming = false;
+        net.GuildCreate(name);
+    }
+
+    /// 「申请」钮（离线/空行）：在线空行给提示，离线按惯例给明确反馈。
     void GuildApply(GuildRow gu) {
+        if (net.Self() != null) {
+            GuildSay("这一行没有行会。");
+            return;
+        }
         string msg = "已申请加入：「" + gu.name + "」";
         if (net.Self() != null) { net.AddChat("[系统]", msg); return; }
         g.Log(msg);
     }
 
-    /// 「创建行会」钮：同上——原版要沃玛号角 + 500W 金币，玩法未接。
+    /// 「创建行会」钮：在线进入命名态（服务端校验字数/费用/信物），
+    /// 离线保持原版提示。
     void GuildCreate() {
+        if (net.Self() != null) {
+            this.guildName = "";
+            this.guildNaming = true;
+            BuildPage(); Refresh();
+            return;
+        }
         string msg = "创建行会需要沃玛号角和500W金币";
         if (net.Self() != null) { net.AddChat("[系统]", msg); return; }
         g.Log(msg);
     }
+
+    /// 在线建会：页脚的输入态（点「创建行会」出现，建完回落）。
+    bool guildNaming = false;
+    string guildName = "";
 }

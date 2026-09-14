@@ -39,6 +39,8 @@ partial class LegendApp {
     Panel VGap(int h) { Panel s = Panel.Column(); s.Prefer(0, h); return s; }
 
     void BuildTowerPage() {
+        /* 在线进页才拉（Maybe 守卫：有缓存不再发，防 Bump 重建循环）。 */
+        if (net.Self() != null) { net.MaybeRefreshTower(); }
         Panel body = Panel.Column(); body.Class = "tower-page";
         body.Pad(0); body.Gap(0); body.Grow(); content.With(body);
 
@@ -66,16 +68,20 @@ partial class LegendApp {
                 "tower-lab-row tower-lab-" + Rules.N(i + 1), "tower-lab",
                 Spec.TowerLabW(), Spec.TowerLabH()));
         }
-        Label lv1 = Text("当前层数：1", "tower-lv tower-lv-1", 0);
+        /* 层数：在线读服务端 tower 缓存（floor=已攻克的最高层，当前要打
+           的是 floor+1 层）；离线保持原版对照抄录。 */
+        JsonValue tw = net.Self() != null ? net.PlayTower() : null;
+        int floor = tw != null ? tw.Int("floor", 0) : 0;
+        Label lv1 = Text("当前层数：" + Rules.N(floor + 1), "tower-lv tower-lv-1", 0);
         lv1.Prefer(Spec.Px(77), Spec.TowerLvH()); scene.With(lv1);
-        Label lv2 = Text("我的层数：0", "tower-lv tower-lv-2", 0);
+        Label lv2 = Text("我的层数：" + Rules.N(floor), "tower-lv tower-lv-2", 0);
         lv2.Prefer(Spec.Px(77), Spec.TowerLvH()); scene.With(lv2);
         /* 撑条不是 Grow()：停靠流里 dock=5 的子项是**第二趟**排的，放在
            流中不占位（实测 Grow 撑条后面的底行会贴到塔图下沿，比原版高
            38 设备）。用固定高撑条把底行压到主带底（原版这行与名单末行
            同高）。 */
         left.With(VGap(Spec.TowerBottomGap()));
-        left.With(TowerBottomRow());
+        left.With(TowerBottomRow(tw));
 
         main.With(SpacerW(Spec.TowerArtToGrid()));
 
@@ -85,6 +91,10 @@ partial class LegendApp {
         grid.Padding(Spec.TowerGridTopPad(), 0, 0, 0);
         grid.Gap(Spec.TowerRowGap());
         grid.Prefer(Spec.TowerGridW(), 0); main.With(grid);
+        /* 挑战名单：在线 = 服务端本区层榜前 15（rivals，不含自己）；
+           离线 = 原版对照抄录。 */
+        JsonValue rivals = tw != null ? tw.Get("rivals") : null;
+        int nRivals = rivals != null && rivals.IsArray() ? rivals.Count() : 0;
         string[] who = TowerNames();
         for (int r = 0; r < Spec.TowerRows(); r = r + 1) {
             Panel row = Panel.Row(); row.Class = "tower-row";
@@ -92,6 +102,11 @@ partial class LegendApp {
             row.Prefer(0, Spec.TowerEntryH()); grid.With(row);
             for (int c = 0; c < Spec.TowerCols(); c = c + 1) {
                 int i = r * Spec.TowerCols() + c;
+                if (rivals != null) {
+                    if (i >= nRivals) { break; }
+                    row.With(TowerLiveEntry(i, rivals.At(i)));
+                    continue;
+                }
                 if (i >= who.Count) { break; }
                 row.With(TowerEntry(i, who[i]));
             }
@@ -100,20 +115,55 @@ partial class LegendApp {
         Panel fill = Panel.Column(); fill.Grow(); body.With(fill);
     }
 
-    /// 左下：挑战次数 + 数值框 + 说明钮。
-    Panel TowerBottomRow() {
+    /// 左下：挑战次数 + 数值框 + 说明钮（在线次数框读服务端
+    /// tries/maxTries——今日剩余/上限）。
+    Panel TowerBottomRow(JsonValue tw) {
         Panel row = Panel.Row(); row.Class = "tower-count";
         row.Pad(0); row.Gap(0); row.Prefer(0, Spec.TowerBottomH());
         Label k = Text("挑战次数：", "tower-count-k", 0);
         k.Prefer(Spec.TowerCountLabelW(), Spec.TowerBottomH()); row.With(k);
         row.With(SpacerW(Spec.TowerCountGap()));
+        string tries = "0/10";
+        if (tw != null) {
+            tries = Rules.N(tw.Int("tries", 0)) + "/" + Rules.N(tw.Int("maxTries", 10));
+        }
         /* 次数框：白字在黑框里居中（原版实测字心 = 框心）。 */
-        row.With(CenterRow("0/10", "tower-count-v", "tower-count-t",
+        row.With(CenterRow(tries, "tower-count-v", "tower-count-t",
             Spec.TowerCountBoxW(), Spec.TowerBottomH()));
         row.With(SpacerW(Spec.Px(7)));
         row.With(BtnDev("传说塔说明", "tower-say", Spec.TowerSayW(), Spec.TowerBottomH(),
             () => { TowerSay(); }));
         return row;
+    }
+
+    /// 在线一张挑战者卡：服务端层榜行 {name,floor,level}。「服务器：永久」
+    /// 行换成「已攻克：N 层」，[挑战] 打自己下一层（服务端推进语义）。
+    Panel TowerLiveEntry(int i, JsonValue p) {
+        string name = p.Str("name", "？？");
+        Panel e = Panel.Column(); e.Class = "tower-entry";
+        e.Pad(0); e.Gap(0); e.Prefer(Spec.TowerAvaW(), Spec.TowerEntryH());
+        e.Named("tower-entry-" + Rules.N(i));
+        Image face = new Image(TowerFacePath(i), name, "cover");
+        face.Class = "tower-ava";
+        face.Prefer(Spec.TowerAvaW(), Spec.TowerAvaH());
+        e.With(face);
+        e.With(VGap(Spec.TowerNameGap()));
+        e.With(CenterRow(name, "tower-name-row", "tower-name",
+            Spec.TowerAvaW(), Spec.TowerNameH()));
+        e.With(VGap(Spec.TowerSrvGap()));
+        Panel srvHold = VGap(Spec.TowerSrvH()); srvHold.NoOverlapCheck();
+        e.With(srvHold);
+        Panel srv = Panel.Row(); srv.Class = "tower-srv";
+        srv.Pad(0); srv.Gap(0); srv.Prefer(Spec.TowerSrvW(), Spec.TowerSrvH());
+        Label srvK = Text("已攻克：", "tower-srv-k", 0);
+        srvK.Prefer(Spec.TowerSrvKW(), Spec.TowerSrvH()); srv.With(srvK);
+        Label srvV = Text(Rules.N(p.Int("floor", 0)) + "层", "tower-srv-v", 0);
+        srvV.Prefer(Spec.TowerSrvVW(), Spec.TowerSrvH()); srv.With(srvV);
+        e.With(srv);
+        e.With(VGap(Spec.TowerBtnGap()));
+        e.With(BtnDev("挑战", "tower-fight", Spec.TowerBtnW(), Spec.TowerBtnH(),
+            () => { net.TowerClimb(); }));
+        return e;
     }
 
     /// 一个挑战者：立绘 + 名字 + 服务器行 + [挑战]。

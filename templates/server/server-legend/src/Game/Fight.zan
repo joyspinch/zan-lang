@@ -1380,14 +1380,18 @@ class Fight {
         s.dirty = true;
         s.bagDirty = true;
         r.Set("item", JsonValue.NewStr(it.name));
+        /* 寻宝记录格要按道具号取图，只回名字客户端对不上素材。 */
+        r.Set("itemId", JsonValue.NewNum(Convert.ToString(it.id)));
         return "";
     }
 
     /* 回收：背包里全部材料（kind=3）一次性结账。金币按
        recycle_prices.csv 逐物品给价（缺价回退半价），另按 recycle.csv
        的 1/denominator 比率结出经验/战功/声望/红包/元宝/积分（§3.5
-       四币种闭环的回收入口），单项不超过该币 cap。 */
-    static string Recycle(Session s, JsonValue r) {
+       四币种闭环的回收入口），单项不超过该币 cap。
+       onlyItem>0 时只结账该材料（回收系统页按行回收）；
+       onlyCount>0 再限数量，0 = 该材料全出。 */
+    static string Recycle(Session s, JsonValue r, int onlyItem, int onlyCount) {
         long gain = 0;
         long exp = 0;
         long merit = 0;
@@ -1398,13 +1402,16 @@ class Fight {
         for (int i = s.bagIds.Count - 1; i >= 0; i = i - 1) {
             ZanWeb.Model.Game.Item it = Fight.ById(s.bagIds[i]);
             if (it == null || it.kind != 3) { continue; }
+            if (onlyItem > 0 && it.id != onlyItem) { continue; }
+            long take = s.bagCounts[i];
+            if (onlyCount > 0 && onlyCount < take) { take = onlyCount; }
             long price = it.price / 2;
             ZanWeb.RuleRow priced = null;
             if (Rules.RecyclePrices().TryById(Convert.ToString(it.id), out priced)
                 && priced.Int("gold") > 0) {
                 price = priced.Int("gold");
             }
-            long unit = price * s.bagCounts[i];
+            long unit = price * take;
             gain += Fight.Capped(unit, Rules.Recycle().At(0));
             exp += Fight.Capped(unit, Rules.Recycle().At(1));
             merit += Fight.Capped(unit, Rules.Recycle().At(2));
@@ -1412,8 +1419,12 @@ class Fight {
             redPackets += Fight.Capped(unit, Rules.Recycle().At(4));
             gems += Fight.Capped(unit, Rules.Recycle().At(5));
             points += Fight.Capped(unit, Rules.Recycle().At(6));
-            s.bagIds.RemoveAt(i);
-            s.bagCounts.RemoveAt(i);
+            if (take >= s.bagCounts[i]) {
+                s.bagIds.RemoveAt(i);
+                s.bagCounts.RemoveAt(i);
+            } else {
+                s.bagCounts[i] = s.bagCounts[i] - (int)take;
+            }
         }
         if (gain <= 0 && exp <= 0 && merit <= 0 && reputation <= 0
             && redPackets <= 0 && gems <= 0 && points <= 0) {

@@ -199,8 +199,30 @@ partial class LegendApp {
         price.Pad(0); price.Prefer(0, Spec.SmgPriceH());
         price.Padding(0, 0, 0, Spec.SmgMatPadL());
         price.With(Text("价格", "smg-yellow", 0));
+        string cost = SmgCostLine();
+        if (cost.Length > 0) { price.With(Text(" " + cost, "smg-mode-v", 0)); }
         p.With(price);
         return p;
+    }
+
+    /// 价格行：在线按当前模式对应的部位算下一星费用（费用表 balance.csv
+    /// 的 forge_gold_per_star / forge_iron_per_star，与服务端同源）；离线
+    /// 不显示（校验在服务端，这里不猜数）。
+    string SmgCostLine() {
+        JsonValue st = net.Self();
+        if (st == null) { return ""; }
+        bool armor = this.smgMode == "装备升级";
+        int star = armor ? st.Int("armorStar", 0) : st.Int("weaponStar", 0);
+        int maxStar = GameTables.current.Rule("forge_max_star");
+        if (star >= maxStar) {
+            return "已满星（" + Rules.N(maxStar) + "）· 武器+" + Rules.N(st.Int("weaponStar", 0))
+                + " 护甲+" + Rules.N(st.Int("armorStar", 0));
+        }
+        long gold = (long)(star + 1) * GameTables.current.Rule("forge_gold_per_star");
+        int iron = (star + 1) * GameTables.current.Rule("forge_iron_per_star");
+        return "下一星 " + Rules.N(gold) + " 金币 + " + Rules.N(iron) + " 黑铁矿石"
+            + "（武器+" + Rules.N(st.Int("weaponStar", 0))
+            + " 护甲+" + Rules.N(st.Int("armorStar", 0)) + "）";
     }
 
     /// ② 左列操作钮：5 个自上而下 + 贴底「清空材料」。
@@ -224,6 +246,8 @@ partial class LegendApp {
     }
 
     /// ③ 材料格阵：底图 `00082.jpg`（12×7 暗格阵）stretch + 逐格叠道具。
+    /// 在线格阵 = 服务端背包实况（道具图 + 数量角标）；离线保持参考图
+    /// 的版式对照抄录。
     Panel SmgGrid() {
         Panel grid = Panel.Row(); grid.Class = "smg-grid";
         grid.Pad(0); grid.Prefer(Spec.SmgGridW(), Spec.SmgGridH());
@@ -231,6 +255,21 @@ partial class LegendApp {
         bg.DockFill(); grid.Add(bg);
 
         List<string> toks = SmgGridTokens();
+        List<string> arts = null;
+        if (net.Self() != null) {
+            toks = new List<string>();
+            arts = new List<string>();
+            for (int i = 0; i < Spec.SmgCols() * Spec.SmgRows(); i = i + 1) {
+                toks.Add(""); arts.Add("");
+            }
+            for (int i = 0; i < net.BagCount(); i = i + 1) {
+                if (i >= toks.Count) { break; }
+                JsonValue b = net.BagAt(i);
+                if (b == null || b.Int("count", 0) <= 0) { continue; }
+                toks[i] = Rules.N(b.Int("count", 0));
+                arts[i] = ItemArtById(b.Int("id", 0));
+            }
+        }
         for (int i = 0; i < Spec.SmgCols() * Spec.SmgRows(); i = i + 1) {
             int c = i % Spec.SmgCols();
             int r = i / Spec.SmgCols();
@@ -239,7 +278,8 @@ partial class LegendApp {
             int y0 = (r * Spec.SmgGridH()) / Spec.SmgRows();
             int y1 = ((r + 1) * Spec.SmgGridH()) / Spec.SmgRows();
             string tok = i < toks.Count ? toks[i] : "";
-            Panel cell = SmgCell(tok, x1 - x0, y1 - y0);
+            string art = arts != null && i < arts.Count ? arts[i] : "";
+            Panel cell = SmgCell(tok, art, x1 - x0, y1 - y0);
             cell.DockManual(); cell.Place(x0, y0);
             grid.Add(cell);
         }
@@ -247,12 +287,13 @@ partial class LegendApp {
     }
 
     /// 一格：空格什么都不叠（格框由底图给）；有道具才叠图标 + 角标。
-    Panel SmgCell(string tok, int w, int h) {
+    /// art 为空时退回占位材料图（离线展示行）；「+N」角标是强化档（黄）。
+    Panel SmgCell(string tok, string art, int w, int h) {
         if (tok.Length == 0) { return SlotArt(w, h, "", "", ""); }
         bool up = tok.StartsWith("+");
-        string badge = up ? tok : tok;
         string cls = up ? "slot-badge slot-badge-up" : "slot-badge";
-        return SlotArt(w, h, SmgMatArt(), badge, cls);
+        string pic = art.Length > 0 ? art : SmgMatArt();
+        return SlotArt(w, h, pic, tok, cls);
     }
 
     /// ④ 左下：开始锻造(D) + 当前模式 + 3×4 功能钮。
@@ -367,6 +408,14 @@ partial class LegendApp {
     }
 
     void SmgForge() {
+        if (net.Self() != null) {
+            /* 服务端 forge 只有武器/护甲升星两条路（扣金币+黑铁矿石），
+               按模式路由过去；其余模式没有服务端规则，明确说未接。 */
+            if (this.smgMode == "黑铁升级") { net.Forge("weapon"); return; }
+            if (this.smgMode == "装备升级") { net.Forge("armor"); return; }
+            SmgSay("「" + smgMode + "」未接服务端，强化请用「黑铁升级」（武器）或「装备升级」（护甲）。");
+            return;
+        }
         SmgSay("开始锻造（" + smgMode + "）：材料与费用校验待接服务端。");
     }
 

@@ -231,6 +231,9 @@ class GameNet {
     int codexPageNo;
     string codexKind = "items";
     int codexTotal;
+    /* 寻宝记录格：最近抽得的道具号（新在前，最多 36 格）。draw 回复带
+       itemId，记录格按它取图标——只回名字对不上素材。 */
+    List<int> drawItemIds = new List<int>();
 
     static string[] JobNames = new string[] { "战士", "法师", "道士" };
 
@@ -1223,6 +1226,12 @@ class GameNet {
     /* ---- 背包与穿戴 ---- */
 
     /* 背包：物品列表 + 最新 self（金币/穿装随行更新）。*/
+    /* 背包缓存为空才拉（BuildPage 里调用，防 Bump 重建死循环）。 */
+    void MaybeRefreshBag() {
+        if (this.bag != null) { return; }
+        this.RefreshBag();
+    }
+
     void RefreshBag() {
         this.Op("{\"op\":\"bag\"}", (JsonValue r) => {
             JsonValue rows = r.Get("items");
@@ -1471,6 +1480,12 @@ class GameNet {
         });
     }
 
+    /* 页面进页拉取的守卫版（行会行会随建/入/退实时刷新，缓存只兜首帧）。 */
+    void MaybeRefreshGuild() {
+        if (this.playGuild != null) { return; }
+        this.RefreshGuild();
+    }
+
     void GuildCreate(string name) {
         this.Op("{\"op\":\"guild\",\"create\":\"" + GameNet.JStr(name) + "\"}", (JsonValue r) => {
             if (this.TakeSelf(r)) { this.AddFeed("行会「" + name + "」创立！"); this.RefreshGuild(); }
@@ -1535,6 +1550,12 @@ class GameNet {
         });
     }
 
+    /* 页面进页拉取的守卫版（有缓存不再发，防 Bump 重建循环重拉）。 */
+    void MaybeRefreshWuxing() {
+        if (this.playWuxing != null) { return; }
+        this.RefreshWuxing();
+    }
+
     void WuxingAct(string act, int id) {
         this.Op("{\"op\":\"wuxing\",\"do\":\"" + act + "\",\"id\":" + Convert.ToString(id) + "}", (JsonValue r) => {
             if (this.TakeSelf(r)) {
@@ -1553,6 +1574,12 @@ class GameNet {
                 if (a != null && a.IsObject()) { this.playMentor = a; this.Bump(); }
             }
         });
+    }
+
+    /* 页面进页拉取的守卫版（拜师/出师动作里带实时刷新）。 */
+    void MaybeRefreshMentor() {
+        if (this.playMentor != null) { return; }
+        this.RefreshMentor();
     }
 
     void MentorBow(string name) {
@@ -1746,10 +1773,16 @@ class GameNet {
             JsonValue st = r.Get("self");
             if (st != null && st.IsObject()) { this.self = st; }
             this.AddFeed("寻宝抽得【" + r.Str("item", "??") + "】！");
+            this.drawItemIds.Insert(0, r.Int("itemId", 0));
+            if (this.drawItemIds.Count > 36) { this.drawItemIds.RemoveAt(36); }
             this.RefreshBag();
             this.Bump();
         });
     }
+
+    /* 寻宝记录格：最近抽得的道具号（新在前）。 */
+    int DrawLogCount() { return this.drawItemIds.Count; }
+    int DrawLogAt(int i) { return this.drawItemIds[i]; }
 
     void RecycleAll() {
         this.Op("{\"op\":\"recycle\"}", (JsonValue r) => {
@@ -1757,6 +1790,19 @@ class GameNet {
             JsonValue st = r.Get("self");
             if (st != null && st.IsObject()) { this.self = st; }
             this.AddFeed("材料回收完成，入账 " + Convert.ToString(r.Int("gain", 0)) + " 金币。");
+            this.RefreshBag();
+            this.Bump();
+        });
+    }
+
+    /* 回收系统页按行回收：只结账指定材料，count>0 时限数量。 */
+    void RecycleOne(int itemId, int count) {
+        this.Op("{\"op\":\"recycle\",\"item\":" + Convert.ToString(itemId)
+            + ",\"count\":" + Convert.ToString(count) + "}", (JsonValue r) => {
+            if (r.Int("ok", 0) != 1) { this.AddChat("[系统]", "回收失败：" + r.Str("err", "未知错误")); return; }
+            JsonValue st = r.Get("self");
+            if (st != null && st.IsObject()) { this.self = st; }
+            this.AddFeed("回收完成，入账 " + Convert.ToString(r.Int("gain", 0)) + " 金币。");
             this.RefreshBag();
             this.Bump();
         });

@@ -22,10 +22,15 @@ partial class LegendApp {
 
     // ---------------------------------------------------------------- 数据
 
-    /// 一个「键」格：只有键名（值留空等服务端）。`cls` 决定键的颜色。
+    /// 绑定输入草稿：`框.data = 字段` 实时绑定，控件重建值仍在。
+    string msName = "";
+
+    /// 一个「键」格：键名 + 值（值空串 = 只画键；在线有服务端字段的键
+    /// 由页面填）。`cls` 决定键的颜色。
     class MsKey {
         string text;
         string cls;
+        string value;
     }
 
     static MsKey MsKeyOf(string text, string cls) {
@@ -107,6 +112,8 @@ partial class LegendApp {
     // ---------------------------------------------------------------- 版面
 
     void BuildMasterPage() {
+        /* 在线进页才拉（Maybe 守卫：有缓存不再发，防 Bump 重建循环）。 */
+        if (net.Self() != null) { net.MaybeRefreshMentor(); }
         Panel stage = Panel.Row(); stage.Class = "ms-page";
         stage.Pad(0); stage.Gap(0);
         content.With(stage);
@@ -147,19 +154,33 @@ partial class LegendApp {
         Input inp = new Input("");
         inp.Class = "ms-in";
         inp.Prefer(Spec.MsInputW(), Spec.MsRowH());
+        /* `框.data = 字段` 实时绑定：控件重建值仍在（LoginWin 同法）。 */
+        inp.data = this.msName;
         inp.DockManual();
         inp.Place(Spec.MsInputX(), Spec.MsRowY());
         top.Add(inp);
         MsLabelOn(top, "请输入对方完整的名字", "ms-ph", Spec.MsHintX(), Spec.MsRowY(),
                   Spec.MsRowH());
         Button go = BtnDev("绑定师徒关系", "ms-go", Spec.MsGoW(), Spec.MsRowH(),
-                           () => { MasterBindSay(); });
+                           () => { MasterBindGo(); });
         go.DockManual();
         go.Place(Spec.MsGoX(), Spec.MsRowY());
         top.Add(go);
 
-        // ② 两列各 6 个键格（值留空）
-        MsKeyColumn(top, MsKeys(true), Spec.MsPadL());
+        // ② 两列各 6 个键格：在线「师父名称/成功出师」读服务端 mentor 缓存
+        //    （master 名 + canTake），其余键服务端没有对应字段，保持空值
+        //    不臆造；离线全空（占位）。
+        JsonValue mt = net.Self() != null ? net.PlayMentor() : null;
+        List<MsKey> lk = MsKeys(true);
+        if (mt != null) {
+            string master = mt.Str("master", "");
+            bool canTake = mt.Int("canTake", 0) == 1;
+            for (int i = 0; i < lk.Count; i = i + 1) {
+                if (lk[i].text.StartsWith("师父名称")) { lk[i].value = master.Length > 0 ? master : "无"; }
+                if (lk[i].text.StartsWith("成功出师")) { lk[i].value = canTake ? "可出师" : "未达成"; }
+            }
+        }
+        MsKeyColumn(top, lk, Spec.MsPadL());
         MsKeyColumn(top, MsKeys(false), Spec.MsCell2X());
 
         // ③ 今日师徒活跃度：标签 + 轨道（0/100 居中）+ 领奖钮
@@ -196,6 +217,7 @@ partial class LegendApp {
     }
 
     /// 一列键格：格面 25、缝 10（节距 35，实测格面 #1d2633 246..268、缝 #243040 270..279）。
+    /// 值画在格内右侧（在线有服务端字段的键才有值）。
     void MsKeyColumn(Panel p, List<MsKey> keys, int x) {
         for (int i = 0; i < keys.Count; i = i + 1) {
             Panel cell = Panel.Row(); cell.Class = "ms-cell";
@@ -203,6 +225,11 @@ partial class LegendApp {
             cell.Prefer(Spec.MsCellW(), Spec.MsCellH());
             cell.Padding(0, 0, 0, Spec.MsCellPadL());
             cell.With(Text(keys[i].text, keys[i].cls, 0));
+            if (keys[i].value != null && keys[i].value.Length > 0) {
+                Label v = Text(keys[i].value, "ms-kv", 0);
+                v.Grow();
+                cell.With(v);
+            }
             cell.DockManual();
             cell.Place(x, Spec.MsCellTop()
                           + i * (Spec.MsCellH() + Spec.MsCellGap()));
@@ -230,7 +257,7 @@ partial class LegendApp {
         num.Place(Spec.MsTrackX(), Spec.MsActY());
         p.Add(num);
         Button daily = BtnDev("领取今日经验", "ms-go", Spec.MsGoW(), Spec.MsRowH(),
-                            () => { MasterDailySay(); });
+                            () => { MasterDailyGo(); });
         daily.DockManual();
         daily.Place(Spec.MsGoX(), Spec.MsActY());
         p.Add(daily);
@@ -249,6 +276,19 @@ partial class LegendApp {
         Panel p = Panel.Row(); p.Class = "ms-roster";
         p.Pad(0); p.Gap(0);
         p.Grow();
+        /* 在线不放假榜单：服务端 mentor 只有师徒关系（master/canTake），
+           「结伴榜」没有数据通道，空榜明示。离线保持原版对照抄录。 */
+        if (net.Self() != null) {
+            Panel empty = Panel.Row(); empty.Class = "ms-mrow";
+            empty.Pad(0); empty.Prefer(Spec.MsListW(), Spec.MsListRowH());
+            Label t = Text("结伴榜未开放（服务端暂无榜单数据通道）", "ms-name", 0);
+            t.Prefer(Spec.MsListW(), 18);
+            t.DockManual();
+            t.Place(Spec.MsNameX(), Spec.MsListTop() + Spec.Px(8));
+            p.Add(empty);
+            p.Add(t);
+            return p;
+        }
         List<MsMate> ms = MsMates();
         /* 条的满格基准 = 名单里的最大徒弟数（实测 53 人正好占满 300 设备，
            其余按线性比例）。 */
@@ -310,13 +350,20 @@ partial class LegendApp {
 
     // ---------------------------------------------------------------- 动作
 
-    /// 绑定/领奖的判定都在服务端，这里只把「点了什么」记一条日志
-    /// （与祭坛/铁匠铺同一套口径）。
-    void MasterBindSay() {
+    /// 拜师：在线读输入框走服务端 mentor op（等级/门徒上限都在那边裁决）。
+    void MasterBindGo() {
+        if (net.Self() != null) {
+            string name = this.msName.Trim();
+            if (name.Length == 0) { MsSay("先输入对方的完整名字。"); return; }
+            net.MentorBow(name);
+            return;
+        }
         MsSay("绑定师徒关系：等对方确认（结果待服务端下发）。");
     }
 
-    void MasterDailySay() {
+    /// 领取：在线 = 服务端出师（canTake 与等级由服务端裁决，错误进聊天）。
+    void MasterDailyGo() {
+        if (net.Self() != null) { net.MentorTake(); return; }
         MsSay("领取今日经验：今日活跃度 0/100（结果待服务端下发）。");
     }
 

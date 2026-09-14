@@ -60,6 +60,8 @@ partial class LegendApp {
     // ---------------------------------------------------------------- 版面
 
     void BuildElementPage() {
+        /* 在线进页才拉（Maybe 守卫：有缓存不再发，防 Bump 重建循环）。 */
+        if (net.Self() != null) { net.MaybeRefreshWuxing(); }
         Panel stage = Panel.Row(); stage.Class = "el-page";
         stage.Pad(0); stage.Gap(0);
         stage.Prefer(0, Spec.ElStageH());
@@ -73,10 +75,22 @@ partial class LegendApp {
         bg.Place(Spec.ElArtX(), Spec.ElArtY());
         stage.Add(bg);
 
+        /* 行数据：在线 = 服务端 wuxing 缓存（rank/xp/need/cap 随行下发，
+           进度条画 xp/need）；离线 = 结构占位（进度 0）。行序固定
+           金木水火土 = 服务端 id 0..4。 */
+        JsonValue wx = net.Self() != null ? net.PlayWuxing() : null;
+        JsonValue wxRows = wx != null ? wx.Get("rows") : null;
         List<ElRow> rows = ElRows();
         for (int i = 0; i < Spec.ElRows(); i = i + 1) {
             int idx = i;
             ElRow r = i < rows.Count ? rows[i] : null;
+            if (wxRows != null && wxRows.IsArray() && i < wxRows.Count()) {
+                JsonValue s = wxRows.At(i);
+                r.progress = s.Int("xp", 0);
+                r.progressMax = s.Int("need", 0) > 0 ? s.Int("need", 0) : 100;
+            } else if (wxRows != null) {
+                r = null;
+            }
             int dy = Spec.ElArtY() + i * Spec.ElPitch();
             ElIcon(stage, r, dy);
             ElProgress(stage, r, dy);
@@ -86,7 +100,7 @@ partial class LegendApp {
                      dy + Spec.ElBtnY(), () => { ElementAct(idx, "注入"); });
         }
 
-        ElementInfo(stage);
+        ElementInfo(stage, wx);
         ElementActions(stage);
     }
 
@@ -138,11 +152,18 @@ partial class LegendApp {
         stage.Add(b);
     }
 
-    /// ② 左下「修炼经验: 0」「修炼时间: 无」两行。
-    void ElementInfo(Panel stage) {
-        ElementInfoLine(stage, "修炼经验: " + elExp, "el-info-g",
+    /// ② 左下「修炼经验: N」「修炼时间/池上限」两行。在线经验 = 服务端
+    /// 修炼经验池（打怪自动入池），第二行给池上限；离线保持占位。
+    void ElementInfo(Panel stage, JsonValue wx) {
+        string exp = this.elExp;
+        string cap = this.elTime;
+        if (wx != null) {
+            exp = Rules.N(wx.Int("pool", 0));
+            cap = "池上限 " + Rules.N(wx.Int("poolCap", 0));
+        }
+        ElementInfoLine(stage, "修炼经验: " + exp, "el-info-g",
                         Spec.ElArtY() + Spec.ElInfoY());
-        ElementInfoLine(stage, "修炼时间: " + elTime, "el-info-y",
+        ElementInfoLine(stage, "修炼时间: " + cap, "el-info-y",
                         Spec.ElArtY() + Spec.ElInfoY() + Spec.ElInfoRowH());
     }
 
@@ -172,9 +193,20 @@ partial class LegendApp {
 
     // ---------------------------------------------------------------- 动作
 
-    /// 五行按钮动作。数值/消耗/成功率都由服务端裁决，这里只把「点了哪一行的
-    /// 哪个动作」记成一条日志——UI 准备工作阶段不做本地假结算。
+    /// 五行按钮动作：升级/注入走服务端 wuxing op（消耗与上限都在那边
+    /// 裁决），回复 Bump 后整页重建出新进度。开始修炼是提示（入池靠
+    /// 打怪自动累积）。
     void ElementAct(int row, string what) {
+        if (net.Self() != null) {
+            if (what == "升级") { net.WuxingAct("up", row); return; }
+            if (what == "注入") { net.WuxingAct("inject", row); return; }
+            if (what == "开始修炼") {
+                ElSay("打怪即可自动积累修炼经验（每秒入池），回本页注入到五行。");
+                return;
+            }
+            ElSay("五行修炼说明见原版：注入把经验池灌进单五行，升级消耗经验与材料突破等级。");
+            return;
+        }
         if (row < 0) { ElSay("五行修炼：" + what + "（操作待接服务端）。"); return; }
         List<ElRow> rows = ElRows();
         string name = row < rows.Count ? rows[row].name : "?";

@@ -26,6 +26,17 @@ partial class LegendApp {
     /// 分类分栏选中项（默认第 1 格「古代美女」，原版对照图就是这一档）。
     int starTab = 0;
 
+    /// 卡阵页号（在线一行一张 boss 星位，10 张/页）。
+    int starPageNo = 0;
+
+    /// 在线星位行：服务端 stars op（每图 1 只 BOSS = 一个图谱位，
+    /// BossFight 胜利点亮）。行形状 {name,level,map,lit}。
+    JsonValue StarRows() { return net.PlayStars(); }
+
+    static int StarRowCount(JsonValue rows) {
+        return rows != null && rows.IsArray() ? rows.Count() : 0;
+    }
+
     /// 第 1 页 10 张（照 `将星图谱.png` 逐行抄录：角标 / 名字 / 价格 / 天赋）。
     static List<StarInfo> StarData() {
         string[] badges = new string[] {
@@ -66,6 +77,8 @@ partial class LegendApp {
     }
 
     void BuildStarPage() {
+        /* 在线进页才拉星位（Maybe 守卫：有缓存不再发）。 */
+        if (net.Self() != null) { net.RefreshStars(); }
         Panel body = Panel.Column(); body.Class = "star-page";
         body.Pad(0); body.Gap(0); body.Grow(); content.With(body);
 
@@ -90,15 +103,28 @@ partial class LegendApp {
         wall.Pad(0); wall.Gap(Spec.StarRowGap());
         wall.Prefer(Spec.StarCardW() * 5 + Spec.StarColGap() * 4, 0);
         main.With(wall);
-        List<StarInfo> rows = StarData();
+        /* 卡阵数据：在线 = 服务端星位（按页切 10 张），离线 = 原版
+           「古代美女」对照抄录。 */
+        JsonValue rows = net.Self() != null ? StarRows() : null;
+        int nRows = StarRowCount(rows);
+        int pages = (nRows + 9) / 10;
+        if (pages < 1) { pages = 1; }
+        if (this.starPageNo > pages - 1) { this.starPageNo = pages - 1; }
         for (int r = 0; r < 2; r = r + 1) {
             Panel row = Panel.Row(); row.Class = "star-row";
             row.Pad(0); row.Gap(Spec.StarColGap());
             row.Prefer(0, Spec.StarCardH()); wall.With(row);
             for (int c = 0; c < 5; c = c + 1) {
                 int i = r * 5 + c;
-                if (i >= rows.Count) { break; }
-                row.With(StarCard(i, rows[i]));
+                if (rows != null) {
+                    int k = this.starPageNo * 10 + i;
+                    if (k >= nRows) { break; }
+                    row.With(StarLiveCard(k, rows.At(k)));
+                    continue;
+                }
+                List<StarInfo> data = StarData();
+                if (i >= data.Count) { break; }
+                row.With(StarCard(i, data[i]));
             }
         }
 
@@ -112,17 +138,72 @@ partial class LegendApp {
         foot.Prefer(0, Spec.StarFootH());
         foot.Padding(0, Spec.StarFootPadR(), 0, Spec.StarFootPadL());
         foot.DockBottom(); body.Add(foot);
-        foot.With(Text("图谱积分：", "star-score-k", 0));
-        foot.With(Text("0", "star-score-v", 0));
+        /* 在线页脚 = 点亮进度 + 服务端页数翻页；离线保持原版「图谱积分：0」。 */
+        int litCount = 0;
+        if (rows != null) {
+            for (int i = 0; i < nRows; i = i + 1) {
+                if (rows.At(i).Int("lit", 0) == 1) { litCount = litCount + 1; }
+            }
+        }
+        foot.With(Text(rows != null ? "已点亮：" : "图谱积分：", "star-score-k", 0));
+        foot.With(Text(rows != null
+            ? Rules.N(litCount) + " / " + Rules.N(nRows) : "0", "star-score-v", 0));
         Panel gfill = Panel.Row(); gfill.Grow(); foot.With(gfill);
         foot.With(BtnDev("说明", "star-say", Spec.StarSayW(), Spec.Px(20),
             () => { StarSay(); }));
-        SignalInt pgSig = new SignalInt(1);
-        Pagination pg = new Pagination(Spec.StarPages(), pgSig);
+        SignalInt pgSig = new SignalInt(this.starPageNo + 1);
+        Pagination pg = new Pagination(pages, pgSig);
         pg.Class = "simple";
         pg.PrevText("上一页"); pg.NextText("下一页");
         pg.Named("star-pager");
+        pg.Change += () => {
+            this.starPageNo = pgSig.Get() - 1;
+            if (this.starPageNo < 0) { this.starPageNo = 0; }
+            BuildPage(); Refresh();
+        };
         foot.With(pg);
+    }
+
+    /// 在线一张星位卡：立绘用该图地图缩略图，点亮态压「已点亮」章，
+    /// 未点亮给「前往讨伐」（跳地图内页打 BOSS，胜即点亮）。
+    Panel StarLiveCard(int i, JsonValue r) {
+        int mapId = r.Int("map", 0);
+        bool lit = r.Int("lit", 0) == 1;
+        string name = r.Str("name", "？？");
+        string badge = Rules.N(r.Int("level", 0)) + "级";
+
+        Panel card = Panel.Column(); card.Class = "star-card";
+        card.Pad(0); card.Gap(Spec.StarArtGap());
+        card.Prefer(Spec.StarCardW(), Spec.StarCardH());
+        card.Named("star-live-" + Rules.N(i));
+
+        Panel art = Panel.Column(); art.Class = "star-art";
+        art.Pad(0); art.Prefer(Spec.StarCardW(), Spec.StarArtH());
+        Image frame = new Image("assets/ui/00257.png", name, "fill");
+        frame.DockFill(); art.Add(frame);
+        Panel inner = Panel.Column(); inner.Class = "star-inner-layer";
+        inner.Pad(0);
+        Image pic = new Image(MapThumbPath(mapId, false), name, "cover");
+        pic.DockFill(); inner.Add(pic);
+        art.With(inner);
+        art.With(CenterRow(badge, "star-ov star-ov-badge", "star-badge",
+            0, Spec.Px(13)));
+        art.With(CenterRow(lit ? "已点亮" : "未点亮",
+            "star-ov star-ov-talent", "star-talent", 0, Spec.Px(13)));
+        art.With(CenterRow(name, "star-ov star-ov-name", "star-name",
+            0, Spec.Px(14)));
+        card.With(art);
+
+        Panel price = Panel.Row(); price.Class = "star-price";
+        price.Pad(0); price.Gap(0); price.Prefer(Spec.StarCardW(), Spec.StarPriceH());
+        price.With(CenterRow(lit ? "图谱已点亮" : "讨伐该图BOSS点亮",
+            "star-price-v", "star-price-t", 0, Spec.StarPriceH()));
+        if (!lit && mapId > 0) {
+            price.With(BtnDev("前往讨伐", "star-act", Spec.StarPriceBtnW(), Spec.StarPriceH(),
+                () => { netInnerMap = mapId; net.OpenMapPage(mapId); Navigate(31); }));
+        }
+        card.With(price);
+        return card;
     }
 
     /// 一格分类：选中态亮一档；其余分类原版没数据，点了只改选中态 + 记一句。
@@ -197,6 +278,10 @@ partial class LegendApp {
     //  动作（玩法未接：按本模板惯例给明确反馈，不假装已实现）
     // ------------------------------------------------------------------
     void StarSay() {
+        if (net.Self() != null) {
+            StarSay2("每张地图的BOSS是一个图谱位，讨伐胜利即点亮；点亮的图谱是征战足迹。");
+            return;
+        }
         StarSay2("图谱积分由收集图谱获得，激活图谱可以提升气血天赋，每人每档只能激活一次。");
     }
 

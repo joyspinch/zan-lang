@@ -27,30 +27,70 @@ using Legend;
 /// `#1d5486`、输入字/钮字 `#02a0e1`（钮复用 `.tbl-btn .mk-buy`）。
 partial class LegendApp {
     /// 一行回收价目（null = 原版的空行，只画行底）。
+    /// 在线行：id/count 来自服务端背包（kind=3 材料），单价取本地
+    /// recycle_prices.csv（与服务端同一份，sync_rules 单向同步）。
     class RcRow {
         string name;            // 「屠龙」
         string price;           // 「1000000」原文，无分隔符
         int picture;            // items.csv picture 号
+        int id;                 // 材料 id（在线 >0；离线展示行 0 = 不可结账）
+        int count;              // 背包数量（在线 >0）
         string PriceText() { return "单价：" + price + "金币"; }
-    }
-
-    /// 前 4 行（照 `回收系统.png` 逐行抄录；后 4 行空）。
-    static List<RcRow> rcData = null;
-    static List<RcRow> RcData() {
-        if (rcData != null) { return rcData; }
-        List<RcRow> v = new List<RcRow>();
-        v.Add(RcRowOf("屠龙", "1000000", 58));
-        v.Add(RcRowOf("嗜魂法杖", "1000000", 59));
-        v.Add(RcRowOf("赤血魔剑", "1000000", 67));
-        v.Add(RcRowOf("幸运雪莲", "500000", 2620));
-        rcData = v;
-        return v;
     }
 
     static RcRow RcRowOf(string name, string price, int picture) {
         RcRow r = new RcRow();
         r.name = name; r.price = price; r.picture = picture;
         return r;
+    }
+
+    /// 离线展示行（照 `回收系统.png` 逐行抄录；id=0 不可结账）。
+    static List<RcRow> RcDemoRows() {
+        List<RcRow> v = new List<RcRow>();
+        v.Add(RcRowOf("屠龙", "1000000", 58));
+        v.Add(RcRowOf("嗜魂法杖", "1000000", 59));
+        v.Add(RcRowOf("赤血魔剑", "1000000", 67));
+        v.Add(RcRowOf("幸运雪莲", "500000", 2620));
+        return v;
+    }
+    static Dictionary<int, int> rcPriceMap = null;
+    static RcRow RcPriceRowOf(int itemId, string name, int picture, int count) {
+        RcRow r = new RcRow();
+        r.id = itemId; r.count = count;
+        r.name = name; r.picture = picture;
+        if (rcPriceMap == null) {
+            Dictionary<int, int> m = new Dictionary<int, int>();
+            DataTable t = GameTables.current.recyclePrices;
+            for (int i = 0; i < t.rows.Count; i = i + 1) {
+                m.Add(t.rows[i].Int("id"), t.rows[i].Int("gold"));
+            }
+            rcPriceMap = m;
+        }
+        int gold = 0;
+        if (rcPriceMap.ContainsKey(itemId)) { gold = rcPriceMap[itemId]; }
+        if (gold <= 0) {
+            gold = GameTables.current.items.At(itemId).Int("sell_price") / 2;
+        }
+        r.price = Rules.N(gold);
+        return r;
+    }
+
+    /// 当前页（在线行多于 8 行时翻页；离线只有 4 行展示行）。
+    int rcPageNo = 0;
+
+    /// 在线数据行：服务端背包里的材料（kind=3）。
+    List<RcRow> RcLiveRows() {
+        List<RcRow> v = new List<RcRow>();
+        for (int i = 0; i < net.BagCount(); i = i + 1) {
+            JsonValue b = net.BagAt(i);
+            if (b == null || b.Int("kind", 0) != 3) { continue; }
+            int cnt = b.Int("count", 0);
+            if (cnt <= 0) { continue; }
+            int itemId = b.Int("id", 0);
+            DataRow def = GameTables.current.items.At(itemId);
+            v.Add(RcPriceRowOf(itemId, b.Str("name", ""), def.Int("picture"), cnt));
+        }
+        return v;
     }
 
     /// 左栏 12 枚分类（原版顺序：7 个币种 + 5 枚「-」占位）。
@@ -63,6 +103,7 @@ partial class LegendApp {
     }
 
     void BuildRecyclePage() {
+        if (net.Self() != null) { net.MaybeRefreshBag(); }
         Panel frame = Panel.Column(); frame.Class = "mk-frame";
         frame.Pad(0); frame.Gap(0);
         frame.Prefer(0, Spec.MkFrameH());
@@ -150,12 +191,23 @@ partial class LegendApp {
         box.Pad(0); box.Gap(0); box.Prefer(0, 0);
         box.Padding(0, Spec.MkRowPadX(), Spec.MkBoxPadB(), Spec.MkRowPadX());
         box.With(TblPad(Spec.MkHeadToRow()));
-        List<RcRow> rows = RcData();
+        List<RcRow> rows = net.Self() != null ? RcLiveRows() : RcDemoRows();
+        /* 在线行多于一页时按当前页切片（回收系统页 8 行/页）。 */
+        int pages = RcPageCount(rows.Count);
+        if (this.rcPageNo > pages - 1) { this.rcPageNo = pages - 1; }
+        if (this.rcPageNo < 0) { this.rcPageNo = 0; }
+        int off = this.rcPageNo * Spec.RcRows();
         for (int r = 0; r < Spec.RcRows(); r = r + 1) {
-            box.With(RcRowBox(r < rows.Count ? rows[r] : null));
+            int i = off + r;
+            box.With(RcRowBox(i < rows.Count ? rows[i] : null));
             if (r + 1 < Spec.RcRows()) { box.With(TblPad(Spec.MkRowGap())); }
         }
         return box;
+    }
+
+    static int RcPageCount(int n) {
+        int pages = (n + Spec.RcRows() - 1) / Spec.RcRows();
+        return pages > 0 ? pages : 1;
     }
 
     /// 一行：图标格 + 名称/单价 + 数量输入框 + 最大/回收（null = 空行）。
@@ -183,44 +235,61 @@ partial class LegendApp {
         Panel sp = Panel.Row(); sp.Class = "mk-fill"; sp.Pad(0); row.With(sp);
 
         RcRow pick = it;
+        bool live = pick != null && pick.id > 0;
         Panel c2 = Panel.Row(); c2.Class = "mk-cell"; c2.Pad(0);
         c2.Prefer(Spec.RcCtrlW(), Spec.MkRowH());
         c2.Gap(Spec.RcCtrlGap());
         c2.Padding(0, Spec.RcCtrlPadR(), 0, 0);
-        Input qty = new Input("0"); qty.Class = "rc-input";
+        Input qty = new Input(live ? Rules.N(pick.count) : "0"); qty.Class = "rc-input";
         qty.Prefer(Spec.RcInputW(), Spec.RcCtrlH()); c2.With(qty);
         c2.With(BtnDev("最 大", "tbl-btn mk-buy", Spec.RcBtnW(), Spec.RcCtrlH(),
-                       () => { RcMax(pick); }));
+                       () => { RcMax(pick, qty); }));
         c2.With(BtnDev("回 收", "tbl-btn mk-buy", Spec.RcRecycleW(), Spec.RcCtrlH(),
-                       () => { RcRecycle(pick); }));
+                       () => { RcRecycle(pick, qty); }));
         row.With(c2);
         return row;
     }
 
-    /// 页脚：无自底色，只有右侧分页（原版 1/1）。
+    /// 页脚：无自底色，只有右侧分页（在线行多才翻页）。
     Panel RcFoot() {
         Panel f = Panel.Row(); f.Class = "mk-foot mk-fixed";
         f.Pad(0); f.Gap(0);
         f.Prefer(0, Spec.MkFootH());
         f.Padding(Spec.MkFootPadT(), Spec.RcFootPadR(), 0, Spec.MkFootPadL());
         Panel sp = Panel.Row(); sp.Class = "mk-fill"; sp.Pad(0); f.With(sp);
-        SignalInt pgSig = new SignalInt(1);
-        Pagination pg = new Pagination(Spec.RcPages(), pgSig);
+        int pages = net.Self() != null
+            ? RcPageCount(RcLiveRows().Count) : 1;
+        SignalInt pgSig = new SignalInt(this.rcPageNo + 1);
+        Pagination pg = new Pagination(pages, pgSig);
         pg.Class = "simple";
         pg.PrevText("上一页"); pg.NextText("下一页");
         pg.Named("recycle-pager");
+        pg.Change += () => {
+            this.rcPageNo = pgSig.Get() - 1;
+            if (this.rcPageNo < 0) { this.rcPageNo = 0; }
+            BuildPage(); Refresh();
+        };
         f.With(pg);
         return f;
     }
 
     // ------------------------------------------------------------------
-    //  动作（玩法未接：按本模板惯例给明确反馈，不假装已实现）
+    //  动作
     // ------------------------------------------------------------------
     void RcSay(string msg) {
         if (net.Self() != null) { net.AddChat("[系统]", msg); return; }
         g.Log(msg);
     }
-    void RcPickCat(int i) { RcSay("回收：" + RcCats()[i] + "（数据未接）"); }
-    void RcMax(RcRow r) { RcSay("回收：" + r.name + " 数量填满（玩法未接）"); }
-    void RcRecycle(RcRow r) { RcSay("回收：「" + r.name + "」×1（玩法未接，请在背包页回收）"); }
+    void RcPickCat(int i) { RcSay("回收按 " + RcCats()[i] + " 单独结账未开放：回收把七种收益一次结清。"); }
+    void RcMax(RcRow r, Input qty) {
+        if (r == null || r.id <= 0) { RcSay("这一行是展示行。"); return; }
+        qty.SetText(Rules.N(r.count));
+    }
+    void RcRecycle(RcRow r, Input qty) {
+        if (net.Self() == null) { RcSay("回收：「" + r.name + "」×1（离线请在背包页回收）。"); return; }
+        if (r == null || r.id <= 0) { RcSay("这一行是展示行。"); return; }
+        int n = DataTable.Integer(qty.GetText(), "回收数量");
+        if (n <= 0) { RcSay("数量要大于 0。"); return; }
+        net.RecycleOne(r.id, n);
+    }
 }
