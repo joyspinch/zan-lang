@@ -276,5 +276,6 @@ State the command you ran and what it printed. Separate "compiled", "ran" and
 * 给 `Binding<T>` 属性赋值（`Label.Text = ...` 同族）时，右值**别用裸字段左值**（`someObj.field`）：会合成活绑定逐帧读源对象，源是本次调用里新建的临时就活不过返回，绑定的 target 悬空，下一帧 MeasureText 读坏串崩（gui-wechat 名片页点击路径 30-50% 概率崩实测）。**先快照进局部变量再赋**——局部 → 常量绑定；右值本就被持有（`data[i]`、`cur = c`）则安全。
 * `out` 实参的目标是**实例字段**时（`Fill(out v)`），编译干净但字段没被写穿，后续读它 = 空指针崩。定式：先给字段赋值，再把字段当普通实参传。
 * `TryGetValue(key, out v)` **未命中时不写 out 参数**——调用后 `v` 还是调用前的旧值（未初始化则是 null），拿它当"没找到"的信号必错。定式：调用前先赋哨兵值（`string v = "";`），命中与否用返回布尔判断，别用 out 值判空。
+* 闭包（delegate/lambda）捕获方法的 **`out` 参数不回传**——捕获的是副本，delegate 里的累加/赋值调用方看不见，编译不报错（ZanDb `MinField` 首版在 `ScanRows` 回调里直接写 out 累计值，调用方永远拿到初值 0）。定式：delegate 里只操作局部变量，扫描结束后一次写回 out 参数。
 * `Dictionary.Keys` 返回的是**内部 List 本体**，不是副本——对它原地排序/增删会把键与值的配对打乱（排序后 `keys[i]` 对应的值还是旧槽位的）。需要排序先拷贝到新 List 再排。
 * `.zform` 的设计名（或文件基名）**别叫 `App`**：与 stdlib `Gui.App` 同名时 nsresolve 会把 Chart 全家的 `App` 形参引用改坏（100 个 `undefined type 'App'`，100% 复现，TASKS A311）。模板 raw 编译要把 `{{NAME}}` 占位符换成真实项目名（IDE 建项目时自动替换+重命名）。要和并行会话彻底隔离：`git archive HEAD stdlib` 解到快照目录 + 复制 `zanc.exe` 和 `build/zanrt_*.obj` 进去（stdlib 按 exe 相对定位），再把 `LOCALAPPDATA` 指到私有目录隔离生成器缓存。
