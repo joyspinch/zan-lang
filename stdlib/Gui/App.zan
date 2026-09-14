@@ -250,6 +250,18 @@ class App {
     int wheelClaimSeq;
     int wheelCapOrder;
     int wheelOwnerOrder;
+    // 滚轮两段式认领的第二段（消费回放）：所有权=上一帧认领，
+    // 指针刚跨入滚动区时上一帧无人认领（ownerOrder=0），第一格
+    // 滚轮在渲染期被所有声明者拒绝。wheelClaimSeen 记"本帧有滚轮
+    // 且有声明者认领"，wheelConsumed 记"有人真消费了"；PresentFrame
+    // 见到"有认领、无消费"就把同一格滚轮回灌事件队列，下一帧
+    // 认领已武装，由正确声明者（嵌套时最内层）消费——第一格从
+    // 静默丢失变为一帧延迟。wheelReplayArmed 保证每条事件链至多
+    // 回放一次：回放格再无人消费（渲染树抖动致序号错位）就维持
+    // 旧行为丢弃，绝不循环回放。每帧在 BeginFrame 中重置前两者。
+    bool wheelClaimSeen;
+    bool wheelConsumed;
+    bool wheelReplayArmed;
     // 本帧内自行消费 Tab 键的聚焦控件 id（例如
     // CodeEditor，它使用 Tab/Shift+Tab 进行缩进）。设置后，Tab
     // 不会把键盘焦点移动到下一个控件。每帧在
@@ -729,6 +741,9 @@ class App {
         this.wheelClaimSeq = 0;
         this.wheelCapOrder = 0;
         this.wheelOwnerOrder = 0;
+        this.wheelClaimSeen = false;
+        this.wheelConsumed = false;
+        this.wheelReplayArmed = false;
         this.tabHoldId = -1;
         this.blocksInputBelow = false;
         this.inputBlockPrevious = false;
@@ -4128,8 +4143,14 @@ class App {
         wheelCapW = w;
         wheelCapH = h;
         wheelCapOrder = wheelClaimSeq;
-        return this.EventKind() == 13
-            && wheelOwnerOrder == wheelClaimSeq;
+        bool ev = this.EventKind() == 13;
+        if (ev) { wheelClaimSeen = true; }
+        bool owns = ev && wheelOwnerOrder == wheelClaimSeq;
+        if (owns) {
+            wheelConsumed = true;
+            wheelReplayArmed = false;
+        }
+        return owns;
     }
 
     void SetContentHeight(int h) {
@@ -5202,6 +5223,23 @@ class App {
         // 最近一次整帧的命中区（见 HitTester.KeepFullSnapshot）。
         if (!partialFrame) { hitTester.KeepFullSnapshot(); }
         window.Present(canvas);
+        // 滚轮两段式认领的第二段：渲染期有声明者（指针在其内）却
+        // 无人消费——典型是指针刚跨入滚动区、上一帧无人认领
+        // （ownerOrder=0），第一格被全体声明者拒绝——就把同一格
+        // 滚轮回灌事件队列，下一帧认领已武装，由正确声明者（嵌套
+        // 时最内层最后认领）消费。armed 保证每条事件链至多回放
+        // 一次：回放格再无人消费（渲染树抖动致认领序错位）就维持
+        // 旧行为丢弃，绝不循环回放；非滚轮事件到达即解除武装。
+        if (this.EventKind() == 13) {
+            if (wheelClaimSeen && !wheelConsumed && !wheelReplayArmed) {
+                wheelReplayArmed = true;
+                window.InjectEvent(13, window.EventX(), window.EventY(),
+                                   0, window.EventKeyCode(),
+                                   window.EventMods());
+            }
+        } else {
+            wheelReplayArmed = false;
+        }
         UiDriver.NotifyPresented(this);
         if (App.PerfOn()) {
             int endMs = Window.GetTickMs();
@@ -5751,6 +5789,8 @@ class App {
         wheelCapOrder = 0;
         wheelCapW = 0;
         wheelCapH = 0;
+        wheelClaimSeen = false;
+        wheelConsumed = false;
         tabHoldId = -1;
         inputBlockPrevious = blocksInputBelow;
         blocksInputBelow = false;

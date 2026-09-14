@@ -96,9 +96,12 @@ class WheelRouteTest {
         WheelRouteTest.MoveTo(100, 100);
         EqInt("no replay on plain frame", outer.offset, o0 + 3 * Speed());
 
-        // ---- 2. 跨界不吞帧 ------------------------------------------
+        // ---- 2. 跨界不吞格 ------------------------------------------
         // 2a. 指针瞬移进视口（无任何 move 帧）后的第一格滚轮：泵期
-        //     cap 判据过期（上一帧无声明者）也必须承诺整帧。
+        //     cap 判据过期（上一帧无声明者）也必须承诺整帧；渲染帧
+        //     认领被拒（owner 未武装）后 PresentFrame 把这一格回灌
+        //     事件队列（两段式认领第二段），回放帧由已武装的声明者
+        //     消费——第一格只多一帧延迟，不再静默丢失。
         app.window.InjectEvent(1, 30, 30, 0, 0, 0);
         WheelRouteTest.PumpAndFrame();    // 出区 move 帧：cap 清空
         WheelRouteTest.MoveTo(30, 30);    // 再一无事件帧，状态稳定
@@ -107,13 +110,14 @@ class WheelRouteTest {
         app.window.InjectEvent(13, 100, 100, 0, -120, 0);
         app.PumpGuarded();
         True("stale-cap wheel promises a frame", app.needsRedraw);
-        // 渲染帧登记认领（owner 未武装，本格不消费——这是设计：认领
-        // 从下一格起生效），但帧必须正常出。
-        WheelRouteTest.FrameOnly();                  // 登记认领（本格不消费）
-        app.window.InjectEvent(13, 100, 100, 0, -120, 0);
-        WheelRouteTest.PumpAndFrame();    // 第二格：线性推进
-        EqInt("teleport-in re-applies from second notch",
+        WheelRouteTest.FrameOnly();       // 认领被拒；PresentFrame 回放本格
+        WheelRouteTest.PumpAndFrame();    // 泵出回放格 → 已武装声明者消费
+        EqInt("teleport-in first notch replayed",
               outer.offset, o0 + 4 * Speed());
+        app.window.InjectEvent(13, 100, 100, 0, -120, 0);
+        WheelRouteTest.PumpAndFrame();    // 真实下一格照常线性，不双消费
+        EqInt("real notch after replay stays linear",
+              outer.offset, o0 + 5 * Speed());
 
         // 2b. move+wheel 同帧注入：泵一次只取一条，move 帧登记认领、
         //     wheel 帧消费——跨界不得吞格。
@@ -145,6 +149,23 @@ class WheelRouteTest {
         WheelRouteTest.PumpAndFrame();
         EqInt("outer still frozen", outer.offset, outerHold);
         EqInt("inner returned", inner.offset, innerHold);
+
+        // ---- 4. 兄弟/跨容器切换：过期 owner 序号同样回放，不吞格 ----
+        // 内层持有 owner 后指针瞬移回仅外层的区域（无 move 帧）：
+        // 外层本格序号(1)≠过期 owner(2)被拒 → PresentFrame 回放 →
+        // 外层在回放帧消费。旧代码这一格被静默吞掉。
+        int outerHold2 = outer.offset;
+        int innerHold2 = inner.offset;
+        app.mouseX = 60;
+        app.mouseY = 60;                  // 内层(100,80 起)之外、外层(20,40 起)之内
+        app.window.InjectEvent(13, 60, 60, 0, -120, 0);
+        WheelRouteTest.PumpAndFrame();    // 外层被拒（owner=内层旧序）→ 回放
+        EqInt("sibling switch first notch held",
+              outer.offset, outerHold2);
+        WheelRouteTest.PumpAndFrame();    // 回放帧：外层消费
+        EqInt("sibling switch replay consumed by outer",
+              outer.offset, outerHold2 + Speed());
+        EqInt("inner untouched across switch", inner.offset, innerHold2);
 
         Console.WriteLine(fails == 0 ? "WHEELROUTE PASS" : "WHEELROUTE FAIL "
             + Convert.ToString(fails));
