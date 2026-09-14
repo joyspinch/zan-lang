@@ -2943,3 +2943,29 @@ P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
   （含泄漏/ARC 孪生）。教训再钉一次：测试断言先核对手算值（本轮
   三处算术错全在测试侧，实现零缺陷）；Zan 无 `List.RemoveRange`
   /方法内局部函数，按序重建列表/静态助手替代。
+* **ZanDb 聚合补全 + 自动归并（2026-09-14，"继续"批次）**：
+  短板收账的两项后续。①类型化聚合补全：`MinField`/`MaxField`
+  （out long + bool，无数值文档 false）、`AvgField`（一遍同时累计
+  和与计数）、`FindTopIds(field, n)`（有界最小堆 TopN——堆只驻留
+  n 项内存 O(n)，值降序、等值 id 小者先，排行榜免全排序）。
+  ②`SetAutoMerge(atSegs, mergeK)`：固化新段收尾时段数达
+  atSegs 就地归并最老 mergeK 段；非法参数（mergeK<2、
+  atSegs<mergeK+1）静默拒绝，默认关闭；段数稳态
+  [atSegs-mergeK+1, atSegs] 振荡不无界增长；固化只在 Commit 尾部
+  触发（txDepth==0），MergeSomeSegments 守卫只是双保险。
+  两个新坑入账：**闭包捕获 out 参数不回传**（捕获的是副本，
+  MinField 首版把 out 变量直接在 delegate 里累加、调用方永远拿到
+  0——out 参数先落局部变量、扫完再写回）；**堆比较器方向**
+  （worst-at-top 最小堆的上滤是"父优于子才换"、下滤找"最差者
+  居上"，首版按 max-heap 写、替换分支永不触发，前 n 个文档原样
+  留堆——只在小 n+多文档场景暴露，全量收集路径反而测不出）。
+  测试：zandb_typed 16→33 断言（含平局定序/堆替换路径/超 n 全
+  收集/重开跟随）、zandb_mergeincr 32→46 断言（非法参数拒绝、
+  开启段数稳态、关闭恢复无界、重开一致），金标 zandb_* 15/15、
+  ctest `-R "zandb|arr_lit"` 64/64。
+  顺带修一个真 bug：`ZanStore.Open` 拿独占锁失败时没关刚打开的
+  日志句柄就 return——被拒绝的 Open 把句柄泄漏到进程结束，Windows
+  上该库文件从此删不掉（zandb_lock 测试清理后根目录残留
+  `zandb_lock_tmp.zdb` 暴露）。失败路径补 `s.log.Close()`；另把
+  zandb_docs/zandb_fuzz 的段清理循环上限提到 40（分别只清 12/24，
+  段号超限即残留根目录）。金标重扫 15/15、ctest 64/64 复验。

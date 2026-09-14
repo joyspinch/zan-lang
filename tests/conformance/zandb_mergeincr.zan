@@ -8,7 +8,9 @@ using System.Json;
 // index re-pointing, deletes pressed by merge, data correctness across
 // partial merges (Count/FindById/index queries/SumField), the
 // "newer unmerged segment wins" case (old copy must not resurrect,
-// even after reopen), and manifest age-order recovery.
+// even after reopen), manifest age-order recovery, and SetAutoMerge
+// (flush-triggered incremental merge: invalid params rejected, steady
+// segment count while on, unbounded growth after disable, reopen).
 class Program {
     static int pass = 0;
     static int fail = 0;
@@ -133,6 +135,68 @@ class Program {
         Check("reopen-idx", docs2.FindIdsByField("cat", "cx").Count == 40);
         Check("reopen-sum", docs2.SumField("v") == 76245);
         db2.Close();
+
+        // 自动增量归并：SetAutoMerge(atSegs, mergeK)。非法参数静默
+        // 拒绝（mergeK<2 或 atSegs<mergeK+1 都不生效），先验证关闭
+        // 态下段数照常增长，再开启验证段数被压住、数据无损。
+        string basePath2 = "zandb_mergeincr2.tmp.db";
+        File.Delete(basePath2);
+        File.Delete(basePath2 + ".m0");
+        File.Delete(basePath2 + ".m1");
+        for (int i = 0; i < 16; i = i + 1) {
+            string seg2 = basePath2 + ".s" + Convert.ToString(i);
+            if (File.Exists(seg2)) { File.Delete(seg2); }
+        }
+        ZanDatabase db3 = ZanDatabase.Open(basePath2, 64);
+        db3.Kv().SetFlushThreshold(1024);
+        db3.SetAutoMerge(4, 1);     // mergeK < 2 → 拒绝
+        db3.SetAutoMerge(2, 2);     // atSegs < mergeK+1 → 拒绝
+        Collection docs3 = db3.GetCollection("docs");
+        docs3.EnsureIndex("cat");
+        for (int b = 0; b < 4; b = b + 1) {
+            db3.Begin();
+            for (int i = 0; i < 40; i = i + 1) { docs3.Insert(Doc(b * 40 + i)); }
+            db3.Commit();
+        }
+        Check("auto-off-grows", db3.SegCount() == 4);
+        Check("auto-off-count", docs3.Count() == 160);
+
+        db3.SetAutoMerge(4, 2);     // 生效：固化后段数 ≥4 就归并最老 2 段
+        for (int b = 4; b < 8; b = b + 1) {
+            db3.Begin();
+            for (int i = 0; i < 40; i = i + 1) { docs3.Insert(Doc(b * 40 + i)); }
+            db3.Commit();
+            Check("auto-steady-" + Convert.ToString(b), db3.SegCount() == 4);
+        }
+        Check("auto-count", docs3.Count() == 320);
+        Check("auto-sum", docs3.SumField("v") == 51040);   // 0..319 之和
+        Check("auto-idx", docs3.FindIdsByField("cat", "c0").Count == 80);
+        Check("auto-spot", VOf(docs3, 320) == 319);
+        db3.Close();
+
+        // 重开：自动归并产物在恢复路径下同样正确；关闭开关后再写，
+        // 段数恢复无界增长。
+        ZanDatabase db4 = ZanDatabase.Open(basePath2, 64);
+        db4.Kv().SetFlushThreshold(1024);
+        Collection docs4 = db4.GetCollection("docs");
+        Check("auto-reopen-count", docs4.Count() == 320);
+        Check("auto-reopen-segs", db4.SegCount() == 4);
+        Check("auto-reopen-sum", docs4.SumField("v") == 51040);
+        db4.SetAutoMerge(0, 0);     // 关闭
+        db4.Kv().SetFlushThreshold(1);   // 单篇提交也固化新段
+        db4.Begin();
+        docs4.Insert(Doc(999));
+        db4.Commit();
+        Check("auto-disabled-grows", db4.SegCount() == 5);
+        db4.Close();
+
+        File.Delete(basePath2);
+        File.Delete(basePath2 + ".m0");
+        File.Delete(basePath2 + ".m1");
+        for (int i = 0; i < 16; i = i + 1) {
+            string seg2 = basePath2 + ".s" + Convert.ToString(i);
+            if (File.Exists(seg2)) { File.Delete(seg2); }
+        }
 
         File.Delete(basePath);
         File.Delete(basePath + ".m0");

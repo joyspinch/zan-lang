@@ -5,7 +5,9 @@ using System.Json;
 // ZanDB typed tree-free accessors and aggregation: ScanNumField /
 // ScanStrField project one field without building a JsonValue;
 // SumField sums numeric-tagged fields only (no implicit coercion);
-// CountGroups does GROUP BY COUNT in one streaming pass.
+// CountGroups does GROUP BY COUNT in one streaming pass; MinField /
+// MaxField / AvgField / FindTopIds complete the typed aggregate set
+// (TopN = bounded min-heap, ties broken by smaller id).
 class Program {
     static int pass = 0;
     static int fail = 0;
@@ -103,16 +105,59 @@ class Program {
         docs.Update(b, Doc("b", 100));
         Check("sum-after-update", docs.SumField("age") == 175);
 
+        // 6.5 Min/Max/Avg/TopN。当前数值 age：{1:10, 2:100, 3:30,
+        // 4:40, 6:-5}。再补等值文档制造 TopN 平局：id8=100、id9=100、
+        // id10=40（cat "t"，不影响 a/b 组计数）。
+        long mn;
+        long mx;
+        bool hasMin = docs.MinField("age", out mn);
+        bool hasMax = docs.MaxField("age", out mx);
+        Check("min", hasMin && mn == 0 - 5);
+        Check("max", hasMax && mx == 100);
+        Check("avg", docs.AvgField("age") == 35.0);
+        long mnx;
+        long mxx;
+        Check("min-missing-field", docs.MinField("nosuch", out mnx) == false);
+        Check("max-missing-field", docs.MaxField("nosuch", out mxx) == false);
+        Check("avg-missing-field", docs.AvgField("nosuch") == 0.0);
+
+        int t1 = docs.Insert(Doc("t", 100));
+        int t2 = docs.Insert(Doc("t", 100));
+        int t3 = docs.Insert(Doc("t", 40));
+        Check("tie-ids", t1 == 8 && t2 == 9 && t3 == 10);
+
+        // TopN(3)：三个 100 平局，id 小者在前 → [2, 8, 9]。
+        List<int> top3 = docs.FindTopIds("age", 3);
+        Check("top3-count", top3.Count == 3);
+        Check("top3-ties", top3[0] == b && top3[1] == t1 && top3[2] == t2);
+        // TopN(5)：100,100,100,40,40 → [2, 8, 9, 4, 10]。
+        List<int> top5 = docs.FindTopIds("age", 5);
+        Check("top5", top5.Count == 5 && top5[0] == b && top5[1] == t1
+            && top5[2] == t2 && top5[3] == d && top5[4] == t3);
+        // TopN(0) 空；TopN 超过数值文档数 → 全部 8 个降序。
+        Check("top0", docs.FindTopIds("age", 0).Count == 0);
+        List<int> topAll = docs.FindTopIds("age", 100);
+        Check("topall-count", topAll.Count == 8);
+        Check("topall-order", topAll[0] == b && topAll[1] == t1 && topAll[2] == t2
+            && topAll[3] == d && topAll[4] == t3 && topAll[5] == c
+            && topAll[6] == a && topAll[7] == f);
+        Check("top-missing-field", docs.FindTopIds("nosuch", 3).Count == 0);
+        // 平局文档加入后聚合跟随：sum 415 / avg 51.875。
+        Check("sum-with-ties", docs.SumField("age") == 415);
+        Check("avg-with-ties", docs.AvgField("age") == 51.875);
+
         db.Close();
 
         // 7. 重开：冷缓存同结果。
         ZanDatabase db2 = ZanDatabase.Open(basePath, 64);
         Collection docs2 = db2.GetCollection("docs");
-        Check("reopen-sum", docs2.SumField("age") == 175);
+        Check("reopen-sum", docs2.SumField("age") == 415);
         Dictionary<string, int> g2 = docs2.CountGroups("cat");
         int ca2;
         g2.TryGetValue("a", out ca2);
-        Check("reopen-groups", g2.Count == 2 && ca2 == 4);
+        Check("reopen-groups", g2.Count == 3 && ca2 == 4);
+        List<int> top3b = docs2.FindTopIds("age", 3);
+        Check("reopen-top3", top3b.Count == 3 && top3b[0] == b && top3b[1] == t1);
         db2.Close();
 
         File.Delete(basePath);

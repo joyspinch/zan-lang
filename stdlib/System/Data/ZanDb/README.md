@@ -38,6 +38,9 @@ List<int> range = users.FindIdsByFieldRange("cat", "a", "m"); // 范围 [a,m] �
 // 类型化投影与聚合：免 JsonValue 树，扫描直出 long/string
 long total = users.SumField("age");           // 数值列求和（流式直算）
 Dictionary<string, int> byCat = users.CountGroups("cat");  // GROUP BY COUNT
+bool hasMin = users.MinField("age", out mn);  // MIN/MAX（无数值文档返回 false）
+double avg = users.AvgField("age");           // AVG（一遍同时累计和与计数）
+List<int> top = users.FindTopIds("score", 10); // TopN：有界最小堆，等值 id 小者在前
 int hits2 = users.ScanStrField("cat", (int id, string v) => { // 免树投影
     return true;
 });
@@ -48,6 +51,7 @@ db.Commit();
 
 db.MergeSegments();                           // 可选：回收空间、压掉旧版本
 db.MergeSomeSegments(4);                      // 或增量归并最老 4 段（写阻塞有界）
+db.SetAutoMerge(6, 4);                        // 或自动挡：固化后段数达 6 就归并最老 4 段
 db.Close();
 ```
 
@@ -110,6 +114,13 @@ db.Close();
 维护，重开恢复（按清单序后扫覆盖）与多路扫描（新→旧游标裁决）
 都不会让旧版本复活。两形态的崩溃窗口一致：段已写清单未换 = 孤儿
 段（下次同号覆盖）；清单已换 = 旧段成孤儿（仅占盘）。
+
+不想自己排班的用自动挡：`SetAutoMerge(atSegs, mergeK)` 开启后每次
+固化新段（flush）收尾时检查段数，达到 `atSegs` 就地归并最老
+`mergeK` 段——停顿上界仍是"写 mergeK 段"的耗时，段数稳态在
+`[atSegs-mergeK+1, atSegs]` 振荡、不再无界增长。`atSegs ≥
+mergeK+1` 才生效（阈值太低会每次固化都归并、得不偿失），默认关闭
+（0）：归并代价是否引入写路径应由使用方决定。
 
 ### 单写者模型（与旧引擎的关键差异）
 
@@ -212,8 +223,8 @@ CoW B+Tree + WAL 对同等负载体积大数倍（页开销 + 写放大碎片 + 
 | `zandb_docs`         | 文档层 CRUD、索引、重开、归并后墓碑不复活                   |
 | `zandb_proj`         | 投影 API：`ScanField` 回调/计数/提前停、`FindIdsByField` 扫描路径与覆盖索引路径一致、删除后两路径同步 | 
 | `zandb_idxrange`     | `FindIdsByFieldRange`：索引端点 `\t` 上界（"c1" 不放进 "c10"）、无界端点、序数语义（"9"&gt;"20"）、扫描回退与覆盖索引路径一致、删除/重开同步 |
-| `zandb_typed`        | 类型化聚合：`SumField` 只认数值标签（负数/文本数值计入、字符串跳过）、`ScanNumField`/`ScanStrField` 免 JsonValue 投影与提前停、`CountGroups` 分组计数、Update/重开跟随 |
-| `zandb_mergeincr`    | 增量归并：最老 k 段归并段数递减收敛、索引原地改指、未归并新段的更新赢（含重开后）、墓碑压键不复活、`MergeSomeSegments` 无事可做返回 0 |
+| `zandb_typed`        | 类型化聚合：`SumField` 只认数值标签（负数/文本数值计入、字符串跳过）、`ScanNumField`/`ScanStrField` 免 JsonValue 投影与提前停、`CountGroups` 分组计数、`MinField`/`MaxField`/`AvgField`/`FindTopIds`（平局 id 小者先、堆替换路径）、Update/重开跟随 |
+| `zandb_mergeincr`    | 增量归并：最老 k 段归并段数递减收敛、索引原地改指、未归并新段的更新赢（含重开后）、墓碑压键不复活、`MergeSomeSegments` 无事可做返回 0；`SetAutoMerge` 非法参数拒绝、开启后段数稳态有界、关闭恢复无界增长、重开一致 |
 | `zandb_merge_tomb`   | 归并墓碑回归：跨段「put+删除」经归并/重归并/重开不复活，点读/Count/索引查询/覆盖查询全路径一致 |
 | `zandb_fuzz`         | 300 步随机操作对拍内存参照模型（固定种子 LCG），跨持久化档重开 |
 | `zandb_lock`         | 单写锁：第二打开者被拒、关闭后可重开                        |

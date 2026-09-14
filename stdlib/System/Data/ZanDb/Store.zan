@@ -129,6 +129,11 @@ class ZanStore {
     /// 必须把 op=2 记录写进新段压住它们，否则恢复扫描会让已删
     /// 键复活（旧段版本重指索引）。</summary>
     Dictionary<string, long> tombstones;
+    /// <summary>自动增量归并阈值：固化后段数 ≥ autoMergeAt 时就地
+    /// 归并 autoMergeK 个最老段。0 = 关闭（默认）——归并代价显式
+    /// 交还调用方，自动策略只应被明确开启。</summary>
+    int autoMergeAt;
+    int autoMergeK;
     string lastError;
 
     ZanStore() {
@@ -150,6 +155,8 @@ class ZanStore {
         this.recoverSeg = 0;
         this.txDepth = 0;
         this.txMark = 0;
+        this.autoMergeAt = 0;
+        this.autoMergeK = 0;
         this.basePath = "";
         this.lastError = "";
     }
@@ -178,6 +185,10 @@ class ZanStore {
         // 而不是静默并发写腐坏文件。锁随日志句柄在 Close 释放，
         // 持有者崩溃时由操作系统兜底。
         if (!s.log.TryLockExclusive()) {
+            // 锁被占：拒绝打开前必须关掉刚拿到的日志句柄——留着它，
+            // 进程生命周期内该文件在 Windows 上删不掉（测试清理、
+            // 原地重建库都会踩）。
+            s.log.Close();
             s.lastError = "store is locked by another writer";
             return s;
         }
@@ -283,6 +294,21 @@ class ZanStore {
     /// （缓存退化到直读），只拒绝非正数。</summary>
     void SetCacheCap(long bytes) {
         if (bytes >= 1) { this.cache.SetCap(bytes); }
+    }
+
+    /// <summary>开启自动增量归并：每次固化新段后若段数达到
+    /// <paramref name="atSegs"/>，就地归并最老的
+    /// <paramref name="mergeK"/> 个段（同
+    /// <see cref="MergeSomeSegments"/>，有界停顿=写 k 段的耗时）。
+    /// atSegs ≥ max(3, mergeK+1) 才生效——阈值太低会每次固化都
+    /// 归并、得不偿失；atSegs = 0 关闭（默认）。段数稳态在
+    /// [atSegs-mergeK+1, atSegs] 间振荡，不再无界增长。</summary>
+    void SetAutoMerge(int atSegs, int mergeK) {
+        if (atSegs <= 0) { this.autoMergeAt = 0; this.autoMergeK = 0; return; }
+        if (mergeK < 2) { return; }
+        if (atSegs < mergeK + 1) { return; }
+        this.autoMergeAt = atSegs;
+        this.autoMergeK = mergeK;
     }
 
     // ===== 同步核心（单所有者，无锁） =====
@@ -518,6 +544,13 @@ class ZanStore {
         }
         this.log.Reset();
         this.commitsSinceSync = 0;
+        // 自动增量归并：固化后段数达阈值就归并最老 k 段。固化只在
+        // Commit 尾部触发（txDepth==0），MergeSomeSegments 的守卫
+        // 只是双保险。返回值忽略：归并失败不回滚固化，下次固化
+        // 段数仍达标会再试。
+        if (this.autoMergeAt > 0 && this.segs.Count >= this.autoMergeAt) {
+            this.MergeSomeSegments(this.autoMergeK);
+        }
     }
 
     /// <summary>把全部已固化段（≥2 个）归并为一个新段：同键只留

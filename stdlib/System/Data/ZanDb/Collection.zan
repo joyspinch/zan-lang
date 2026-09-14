@@ -1208,6 +1208,149 @@ class Collection {
         return ids;
     }
 
+    /// <summary>数值字段的最小值：流式直算，无 JsonValue；无数值
+    /// 文档时返回 false。out 参数被闭包捕获时不回传（捕获的是
+    /// 副本），先累计到局部变量、扫完再写回。</summary>
+    bool MinField(string field, out long v) {
+        v = 0;
+        int kid = KeyIdOf(field);
+        if (kid == 0) { return false; }
+        bool has = false;
+        long acc = 0;
+        string hi = "c:" + this.name + ";";
+        this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
+            long x;
+            if (FieldNum(row.Val(), kid, out x)) {
+                if (!has || x < acc) { acc = x; has = true; }
+            }
+            return true;
+        });
+        if (has) { v = acc; }
+        return has;
+    }
+
+    /// <summary>数值字段的最大值：流式直算，无 JsonValue；无数值
+    /// 文档时返回 false。</summary>
+    bool MaxField(string field, out long v) {
+        v = 0;
+        int kid = KeyIdOf(field);
+        if (kid == 0) { return false; }
+        bool has = false;
+        long acc = 0;
+        string hi = "c:" + this.name + ";";
+        this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
+            long x;
+            if (FieldNum(row.Val(), kid, out x)) {
+                if (!has || x > acc) { acc = x; has = true; }
+            }
+            return true;
+        });
+        if (has) { v = acc; }
+        return has;
+    }
+
+    /// <summary>数值字段的平均值：一遍流式同时累计和与计数；
+    /// 无数值文档时返回 0。</summary>
+    double AvgField(string field) {
+        int kid = KeyIdOf(field);
+        if (kid == 0) { return 0.0; }
+        long sum = 0;
+        long cnt = 0;
+        string hi = "c:" + this.name + ";";
+        this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
+            long x;
+            if (FieldNum(row.Val(), kid, out x)) {
+                sum = sum + x;
+                cnt = cnt + 1;
+            }
+            return true;
+        });
+        if (cnt == 0) { return 0.0; }
+        return (double)sum / (double)cnt;
+    }
+
+    /// <summary>数值字段 TopN：按字段值降序的前 n 个文档 id
+    /// （等值时 id 小者在前）。容量有界的最小堆流式筛选——堆里
+    /// 只驻留 n 项，内存 O(n) 与文档数无关；非数值/缺字段文档
+    /// 不参与。n ≤ 0 返回空表。排行榜类负载免全排序。</summary>
+    List<int> FindTopIds(string field, int n) {
+        List<int> tops = new List<int>();
+        if (n <= 0) { return tops; }
+        int kid = KeyIdOf(field);
+        if (kid == 0) { return tops; }
+        List<long> heapVal = new List<long>();
+        List<int> heapId = new List<int>();
+        string hi = "c:" + this.name + ";";
+        this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
+            long v;
+            if (FieldNum(row.Val(), kid, out v)) {
+                int id = Collection.IdOfKey(row.Key());
+                if (heapVal.Count < n) {
+                    HeapPush(heapVal, heapId, v, id);
+                } else if (ZanCollectionBetter(v, id, heapVal[0], heapId[0])) {
+                    // 比堆顶（当前第 n 名）更好：换根后下沉。
+                    heapVal[0] = v;
+                    heapId[0] = id;
+                    HeapSiftDown(heapVal, heapId);
+                }
+            }
+            return true;
+        });
+        // 堆内 n 项做选择式输出（n 小，O(n²) 可忽略）：反复取最优。
+        int total = heapVal.Count;
+        for (int out2 = 0; out2 < total; out2 = out2 + 1) {
+            int best = 0;
+            for (int i = 1; i < heapVal.Count; i = i + 1) {
+                if (ZanCollectionBetter(heapVal[i], heapId[i], heapVal[best], heapId[best])) {
+                    best = i;
+                }
+            }
+            tops.Add(heapId[best]);
+            heapVal.RemoveAt(best);
+            heapId.RemoveAt(best);
+        }
+        return tops;
+    }
+
+    /// 候选 (va,ia) 是否优于 (vb,ib)：值大者优；等值 id 小者优。
+    static bool ZanCollectionBetter(long va, int ia, long vb, int ib) {
+        if (va != vb) { return va > vb; }
+        return ia < ib;
+    }
+
+    // 堆不变量：父节点"不优于"子节点（worst-at-top）——根永远是
+    // 当前保留集里第 n 名，替换判定只跟根比较。
+    static void HeapPush(List<long> hv, List<int> hi, long v, int id) {
+        hv.Add(v);
+        hi.Add(id);
+        int c = hv.Count - 1;
+        while (c > 0) {
+            int p = (c - 1) / 2;
+            // 父优于子 → 违例，差的上浮。
+            if (ZanCollectionBetter(hv[p], hi[p], hv[c], hi[c])) {
+                long tv = hv[c]; hv[c] = hv[p]; hv[p] = tv;
+                int ti = hi[c]; hi[c] = hi[p]; hi[p] = ti;
+                c = p;
+            } else { break; }
+        }
+    }
+
+    static void HeapSiftDown(List<long> hv, List<int> hi) {
+        int p = 0;
+        while (true) {
+            int l = p * 2 + 1;
+            int r = l + 1;
+            int worst = p;
+            // 找 p 与两子里"最差"的那个；最差者应居上。
+            if (l < hv.Count && !ZanCollectionBetter(hv[l], hi[l], hv[worst], hi[worst])) { worst = l; }
+            if (r < hv.Count && !ZanCollectionBetter(hv[r], hi[r], hv[worst], hi[worst])) { worst = r; }
+            if (worst == p) { break; }
+            long tv = hv[p]; hv[p] = hv[worst]; hv[worst] = tv;
+            int ti = hi[p]; hi[p] = hi[worst]; hi[worst] = ti;
+            p = worst;
+        }
+    }
+
     /// <summary>对集合启动流畅的 LINQ 风格查询。</summary>
     DocQuery Query() {
         return DocQuery.Of(this);
