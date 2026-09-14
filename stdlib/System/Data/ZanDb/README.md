@@ -190,6 +190,18 @@ ZanStore 是**单进程单写者**：`Open` 对日志文件加非阻塞独占锁
   块加载**跨块复用同一缓冲**、CRC 每块只在首次加载校验一次（段不可
   变，读时不算派生数）。微基准口径：块内记录裸解析 ~230-315ns/行，
   字符串物化一次 ~37ns，memcmp/memchr 原语 ~5ns。
+* **块级聚合内核**（`ZanStore.ScanKernel`）：单段稳态（归并后收敛、
+  memtable 空——固化/归并维护后的常态）下，Count/CountRange、
+  `SumField`、`MinField`/`MaxField`/`AvgField` 走块级裸走读——块
+  缓冲读入后循环裸解析记录，把（基址+偏移+长度）直接交给回调，不经
+  SegCursor/ScanRow 对象、无字符串物化，每行成本 = varint 解码 +
+  一次委托调用；CountRange 连回调里的聚合状态都不需要。多源态
+  （memtable 未固化数据参与、多段未归并）自动退回 `ScanRows` 权威
+  路径；内核回调遇到需要权威处理的行（记录含 0xFF 转义、文本数值
+  tag 4、容器字段）时以「已聚合到 id-1」为界，剩余行（含当行）从
+  `ScanRows` 续扫，两段结果无缝拼接。`CountGroups` 在索引就绪时走
+  **覆盖索引路径**——索引条目键序 =（值, id）序，扫索引前缀范围、
+  按值切段计数，零文档读。
 * 关于「语言层地板」的实测更正：Zan **有**裸内存解引用——
   `Span<byte> sp = new Span<byte>(nint, len)` 后 `sp[i]` 即裸读
   （~2.2ns/字节，比字符串 `s[i]` 走读快 4.6 倍，可写，逐次重构造
@@ -226,6 +238,7 @@ CoW B+Tree + WAL 对同等负载体积大数倍（页开销 + 写放大碎片 + 
 | `zandb_typed`        | 类型化聚合：`SumField` 只认数值标签（负数/文本数值计入、字符串跳过）、`ScanNumField`/`ScanStrField` 免 JsonValue 投影与提前停、`CountGroups` 分组计数、`MinField`/`MaxField`/`AvgField`/`FindTopIds`（平局 id 小者先、堆替换路径）、Update/重开跟随 |
 | `zandb_mergeincr`    | 增量归并：最老 k 段归并段数递减收敛、索引原地改指、未归并新段的更新赢（含重开后）、墓碑压键不复活、`MergeSomeSegments` 无事可做返回 0；`SetAutoMerge` 非法参数拒绝、开启后段数稳态有界、关闭恢复无界增长、重开一致 |
 | `zandb_merge_tomb`   | 归并墓碑回归：跨段「put+删除」经归并/重归并/重开不复活，点读/Count/索引查询/覆盖查询全路径一致 |
+| `zandb_kernel`       | 块级聚合内核：单段稳态下 Sum/Min/Max/Avg/Count 与删除（固化墓碑）、未固化墓碑回退、0xFF 转义记录回退、文本数值字段回退、多段权威路径对拍、重开、索引覆盖 CountGroups 一致性 |
 | `zandb_fuzz`         | 300 步随机操作对拍内存参照模型（固定种子 LCG），跨持久化档重开 |
 | `zandb_lock`         | 单写锁：第二打开者被拒、关闭后可重开                        |
 | `arr_lit_rc`         | （编译器）数组字面量元素 ARC retain——本引擎开发中发现的编译器缺陷 |

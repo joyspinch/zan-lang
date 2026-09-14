@@ -130,6 +130,15 @@ class Collection {
         return v;
     }
 
+    /// <see cref="UnpadId"/> 的裸指针形式（定宽 ID_DIGITS 字节）。
+    static int UnpadIdPtr(nint p) {
+        int v = 0;
+        for (int i = 0; i < Collection.ID_DIGITS; i = i + 1) {
+            v = (v << 6) | (Collection.PeekB(p + i) - 63);
+        }
+        return v;
+    }
+
     /// 文档正文键 c:{name}:{id(定宽)}。
     string DocKey(int id) {
         return "c:" + this.name + ":" + Collection.PadId(id);
@@ -394,6 +403,15 @@ class Collection {
         int off = key.Length - Collection.ID_DIGITS;
         if (off < 0) { return 0; }
         return Collection.UnpadId(key.Substring(off, Collection.ID_DIGITS));
+    }
+
+    /// <see cref="IdOfKey"/> 的裸指针形式：键尾 6 字节定宽
+    /// id（'?'..'~'）直接还原，零分配。baseKey 指向键首字节，
+    /// keyLen 为键长。</summary>
+    static int IdOfPtr(nint baseKey, int keyLen) {
+        int off = keyLen - Collection.ID_DIGITS;
+        if (off < 0) { return 0; }
+        return Collection.UnpadIdPtr(baseKey + off);
     }
 
     /// <see cref="IdOfKey"/> 的字符串形式。
@@ -732,16 +750,47 @@ class Collection {
         return n;
     }
 
-    /// <summary>数值字段的全文求和：存储层流式直算，无回调、
-    /// 无 JsonValue——数值型标签直接还原累加，文本数值解析累加，
-    /// 非数值型文档跳过。字段不存在或全非数值时返回 0。</summary>
+    /// <summary>数值字段的全文求和：单段稳态走块级聚合内核
+    /// （免游标/ScanRow 对象，记录裸走读直累加）；记录含转义
+    /// （0xFF）或目标字段是文本数值(4)时逐行回退
+    /// <see cref="FieldNum"/> 权威走读，语义与之一致——数值型
+    /// 标签直接还原累加，非数值型文档跳过。字段不存在或全非
+    /// 数值时返回 0。</summary>
     long SumField(string field) {
         SyncMeta();
         int kid = KeyIdOf(field);
         long sum = 0;
         if (kid == 0) { return 0; }
+        string lo = "c:" + this.name + ":";
         string hi = "c:" + this.name + ";";
-        this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
+        // 块级内核路径：每行一次裸走读回调，无对象分配。
+        // 遇到需要权威走读的行（转义/文本数值）置 walk 标记，
+        // 回调无法"继续扫剩下的行"，故记录已计入内核的行数，
+        // 剩余行（含当行）回退 ScanRows——用计数哨兵跳过已聚合行。
+        NumAcc acc = new NumAcc();
+        bool[] walk = new bool[1];
+        long[] skipUntilId = new long[1];
+        skipUntilId[0] = -1;
+        int kernelN = this.kv.TryScanKernel(lo, hi,
+            delegate(nint basePtr, int keyOff, int keyLen, int valOff, int valLen) {
+                int id = Collection.IdOfPtr(basePtr + keyOff, keyLen);
+                if (id <= skipUntilId[0]) { return true; }
+                if (!Collection.RecAccNum(basePtr, valOff, valLen, kid, acc)) {
+                    walk[0] = true;
+                    skipUntilId[0] = id - 1;
+                    return false;
+                }
+                return true;
+            });
+        if (kernelN >= 0 && !walk[0]) {
+            return acc.Sum();
+        }
+        if (kernelN >= 0) {
+            sum = acc.Sum();
+        }
+        // 权威路径：字符串走读（全量回退或内核让出的剩余行）。
+        string fromKey = kernelN >= 0 ? DocKey((int)skipUntilId[0] + 1) : lo;
+        this.kv.ScanRows(fromKey, hi, delegate(ScanRow row) {
             long v;
             if (FieldNum(row.Val(), kid, out v)) { sum = sum + v; }
             return true;
@@ -751,14 +800,40 @@ class Collection {
 
     /// <summary>字段值的分组计数（GROUP BY field 的 COUNT）：
     /// 一遍流式扫描直接在键控结构里聚合，每组只分配一次键字符串。
-    /// null/容器/缺字段的文档不计入。</summary>
+    /// null/容器/缺字段的文档不计入。索引就绪时零文档读：该索引
+    /// 字段的条目键序 = （值, id）序，值相同的条目天然连片——扫
+    /// 索引前缀范围、按值切段计数即可。</summary>
     Dictionary<string, int> CountGroups(string field) {
         SyncMeta();
         Dictionary<string, int> groups = new Dictionary<string, int>();
         int kid = KeyIdOf(field);
         if (kid == 0) { return groups; }
-        string hi = "c:" + this.name + ";";
-        this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
+        if (IndexReady(field)) {
+            // 索引条目键 = "i:{coll}:{kid}:{value}\t{id}"；范围扫该
+            // 字段的全部条目，键中 \t 前的部分即组值。ScanPrefix
+            // 返回的是 KvEntry 键值对（值为空串），逐键切段。
+            string head = "i:" + this.name + ":" + Collection.PadId(kid) + ":";
+            string endKey = "i:" + this.name + ":" + Collection.PadId(kid) + ";";
+            List<KvEntry> entries = new List<KvEntry>();
+            this.kv.ScanRange(head, endKey, 0, entries);
+            for (int i = 0; i < entries.Count; i = i + 1) {
+                string k = entries[i].key;
+                // value 段 = head 之后到 \t 之前；索引值不含 \t。
+                int baseLen = head.Length;
+                int tab = k.IndexOf("\t", baseLen);   // 键内首个 \t = 值段终点
+                string val = tab > baseLen ? k.Substring(baseLen, tab - baseLen) : "";
+                int c;
+                if (groups.TryGetValue(val, out c)) {
+                    groups.Remove(val);
+                    groups.Add(val, c + 1);
+                } else {
+                    groups.Add(val, 1);
+                }
+            }
+            return groups;
+        }
+        string docHi = "c:" + this.name + ";";
+        this.kv.ScanRows("c:" + this.name + ":", docHi, delegate(ScanRow row) {
             string s = FieldText(row.Val(), kid);
             if (s != null) {
                 int c;
@@ -1086,6 +1161,124 @@ class Collection {
         return this.kv.CountRange("c:" + this.name + ":", "c:" + this.name + ";");
     }
 
+    /// <summary>裸记录走读（静态、免 this）：从记录起始位置解析
+    /// 'B' + VarInt(字段数) + (VarInt(kid) + 值)*，对每个 kid==want
+    /// 的数值字段（tag 3/8/9/4）累加进 agg。tag 语义与
+    /// <see cref="FieldNum"/> 一致；basePtr 指向键起点（值在
+    /// basePtr+valOff）。返回 false = 记录含转义（0xFF）或格式
+    /// 异常，调用方须回退权威走读。</summary>
+    static bool RecAccNum(nint basePtr, int valOff, int valLen, int want, NumAcc acc) {
+        nint v = basePtr + valOff;
+        // 记录首字节必须是 'B'(66)。
+        int b0 = Collection.PeekB(v);
+        if (b0 != 66) { return false; }
+        // 含 0xFF 的记录是转义态（0x00→FF 01、0xFF→FF 02，见
+        // EncodeDoc）：裸字节不再是 varint/tag 的原始编码，逐字段
+        // 走读会读出加大的假值。一次 memchr 检出即回退权威走读
+        // （FieldNum 的 UnescapeRecord 先行反转义）。文本记录几乎
+        // 总不含 0xFF，常态无此开销。
+        if (Collection.MemChr(v, 255, valLen) != 0) { return false; }
+        int p = valOff + 1;
+        long n = Collection.ReadVarIntRaw(basePtr, ref p, valOff + valLen);
+        if (n < 0 || n > 4096) { return false; }
+        int end = valOff + valLen;
+        for (int i = 0; i < (int)n; i = i + 1) {
+            long kid = Collection.ReadVarIntRaw(basePtr, ref p, end);
+            if (kid < 0) { return false; }
+            // tag 只消费一次：want 命中分支自己读；跳过分支由
+            // SkipValRaw 读（p 仍指向 tag——与 FieldNum 调
+            // SkipValS 的契约一致）。预读再跳会导致 SkipValRaw
+            // 把长度/载荷字节当 tag， kid/tag 全线错位。
+            if ((int)kid == want) {
+                if (p >= end) { return false; }
+                int tag = Collection.PeekB(basePtr + p);
+                p = p + 1;
+                if (tag == 3) {
+                    long x = Collection.ReadVarIntRaw(basePtr, ref p, end);
+                    if (x < 0) { return false; }
+                    acc.Add(x);
+                    return true;
+                }
+                if (tag == 8) {
+                    long x = Collection.ReadVarIntRaw(basePtr, ref p, end);
+                    if (x < 0) { return false; }
+                    acc.Add(0 - x);
+                    return true;
+                }
+                if (tag == 9) { acc.Add(0); return true; }
+                return false;   // 文本数值/非数值：交给权威走读兜底
+            }
+            // 跳过该值：按标签长度规则推进（含容器递归长度，用
+            // 栈式计数实现，免递归调用）。
+            if (!Collection.SkipValRaw(basePtr, ref p, end)) { return false; }
+        }
+        return true;
+    }
+
+    /// 块级聚合的数值累加器：sum/count/min/max 由调用方按需取用。
+    class NumAcc {
+        long sum;
+        long count;
+        long min;
+        long max;
+        internal void Add(long v) {
+            this.sum = this.sum + v;
+            this.count = this.count + 1;
+            if (this.count == 1 || v < this.min) { this.min = v; }
+            if (this.count == 1 || v > this.max) { this.max = v; }
+        }
+        internal long Sum() { return this.sum; }
+        internal long Count() { return this.count; }
+        internal long Min() { return this.min; }
+        internal long Max() { return this.max; }
+    }
+
+    /// 读取裸指针处一个字节；offset 为相对位移。
+    static int PeekB(nint p) {
+        Span<byte> sp = new Span<byte>(p, 1);
+        return sp[0] & 255;
+    }
+
+    /// <summary>裸指针 LEB128 varint 读取：自 base+p 起解析，
+    /// 结束位置写回 p（引用传参），limit 为缓冲绝对终点。越界
+    /// 返回 -1。与 ByteBuffer.ReadVarIntAt 同格式。</summary>
+    static long ReadVarIntRaw(nint basePtr, ref int p, int limit) {
+        long result = 0;
+        int shift = 0;
+        while (true) {
+            if (p >= limit) { return -1; }
+            int b = Collection.PeekB(basePtr + p);
+            p = p + 1;
+            result = result + ((long)(b & 127) << shift);
+            if ((b & 128) == 0) { break; }
+            shift = shift + 7;
+            if (shift > 63) { return -1; }
+        }
+        return result;
+    }
+
+    /// <summary>裸指针跳过一个编码值（标签已读、p 指向标签后）：
+    /// 与 <see cref="SkipValS"/> 同规则，数组/对象载荷含嵌套时
+    /// 返回 false 回退权威走读（数值聚合场景容器字段罕见）。
+    /// 推进失败返回 false。</summary>
+    static bool SkipValRaw(nint basePtr, ref int p, int end) {
+        if (p >= end) { return false; }
+        int tag = Collection.PeekB(basePtr + p);
+        p = p + 1;
+        if (tag == 3 || tag == 8) {
+            return Collection.ReadVarIntRaw(basePtr, ref p, end) >= 0;
+        }
+        if (tag == 4 || tag == 5) {
+            long n = Collection.ReadVarIntRaw(basePtr, ref p, end);
+            if (n < 0 || p + (int)n > end) { return false; }
+            p = p + (int)n;
+            return true;
+        }
+        // 标签 0/1/2/9/10 无载荷；6 数组/7 对象含嵌套结构，
+        // 裸走读不展开——回退权威路径。
+        return tag == 0 || tag == 1 || tag == 2 || tag == 9 || tag == 10;
+    }
+
     /// <summary>按 id 顺序返回所有文档。</summary>
     List<JsonValue> FindAll() {
         return FindRange(0, 0, 0);
@@ -1208,9 +1401,48 @@ class Collection {
         return ids;
     }
 
-    /// <summary>数值字段的最小值：流式直算，无 JsonValue；无数值
-    /// 文档时返回 false。out 参数被闭包捕获时不回传（捕获的是
-    /// 副本），先累计到局部变量、扫完再写回。</summary>
+    /// <summary>数值聚合的公共骨架：单段稳态先走块级内核
+    /// （RecAccNum 裸走读，语义同 FieldNum 的数值标签判定），
+    /// 内核路径遇到需权威处理的行（转义 0xFF/文本数值/格式
+    /// 异常/容器）时以「已聚合到 id-1」为界，剩余行回退
+    /// <see cref="ScanRows"/> 字符串路径，sum 与 min/max 在两段
+    /// 之间保持一致。返回 false = 内核不可用（多源/未固化数据），
+    /// 调用方直接全量走权威路径。</summary>
+    bool NumAggregate(string field, NumAcc acc, out int fromId) {
+        fromId = 0;
+        int kid = KeyIdOf(field);
+        if (kid == 0) { return true; }
+        string lo = "c:" + this.name + ":";
+        string hi = "c:" + this.name + ";";
+        int[] fallbackId = new int[1];
+        fallbackId[0] = -1;
+        bool[] walk = new bool[1];
+        int kernelN = this.kv.TryScanKernel(lo, hi,
+            delegate(nint basePtr, int keyOff, int keyLen, int valOff, int valLen) {
+                int id = Collection.IdOfPtr(basePtr + keyOff, keyLen);
+                if (id <= fallbackId[0]) { return true; }
+                if (!Collection.RecAccNum(basePtr, valOff, valLen, kid, acc)) {
+                    walk[0] = true;
+                    fallbackId[0] = id;   // 该行起（含）回退权威走读
+                    return false;
+                }
+                return true;
+            });
+        if (kernelN < 0) { return false; }
+        fromId = walk[0] ? fallbackId[0] : 0;
+        if (!walk[0]) { return true; }
+        // 内核让出部分行：剩余行走权威路径（有界：本集合段内）。
+        this.kv.ScanRows(DocKey(fromId), hi, delegate(ScanRow row) {
+            long x;
+            if (FieldNum(row.Val(), kid, out x)) { acc.Add(x); }
+            return true;
+        });
+        return true;
+    }
+
+    /// <summary>数值字段的最小值：块级内核直算（带权威回退），
+    /// 无 JsonValue；无数值文档时返回 false。out 参数被闭包捕获
+    /// 时不回传（捕获的是副本），先累计到局部变量、扫完再写回。</summary>
     bool MinField(string field, out long v) {
         v = 0;
         int kid = KeyIdOf(field);
@@ -1218,6 +1450,14 @@ class Collection {
         bool has = false;
         long acc = 0;
         string hi = "c:" + this.name + ";";
+        NumAcc a = new NumAcc();
+        int fromId;
+        bool ok = NumAggregate(field, a, out fromId);
+        if (ok && a.Count() > 0) {
+            v = a.Min();
+            return true;
+        }
+        // 内核不可用（多源/未固化数据）：全量权威路径。
         this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
             long x;
             if (FieldNum(row.Val(), kid, out x)) {
@@ -1229,8 +1469,8 @@ class Collection {
         return has;
     }
 
-    /// <summary>数值字段的最大值：流式直算，无 JsonValue；无数值
-    /// 文档时返回 false。</summary>
+    /// <summary>数值字段的最大值：块级内核直算（带权威回退），
+    /// 无 JsonValue；无数值文档时返回 false。</summary>
     bool MaxField(string field, out long v) {
         v = 0;
         int kid = KeyIdOf(field);
@@ -1238,6 +1478,13 @@ class Collection {
         bool has = false;
         long acc = 0;
         string hi = "c:" + this.name + ";";
+        NumAcc a = new NumAcc();
+        int fromId;
+        bool ok = NumAggregate(field, a, out fromId);
+        if (ok && a.Count() > 0) {
+            v = a.Max();
+            return true;
+        }
         this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
             long x;
             if (FieldNum(row.Val(), kid, out x)) {
@@ -1249,11 +1496,17 @@ class Collection {
         return has;
     }
 
-    /// <summary>数值字段的平均值：一遍流式同时累计和与计数；
-    /// 无数值文档时返回 0。</summary>
+    /// <summary>数值字段的平均值：一遍流式同时累计和与计数
+    /// （块级内核，带权威回退）；无数值文档时返回 0。</summary>
     double AvgField(string field) {
         int kid = KeyIdOf(field);
         if (kid == 0) { return 0.0; }
+        NumAcc a = new NumAcc();
+        int fromId;
+        bool ok = NumAggregate(field, a, out fromId);
+        if (ok) {
+            return a.Count() == 0 ? 0.0 : (double)a.Sum() / (double)a.Count();
+        }
         long sum = 0;
         long cnt = 0;
         string hi = "c:" + this.name + ";";

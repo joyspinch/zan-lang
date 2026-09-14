@@ -61,6 +61,13 @@ class ScanRow {
     }
 }
 
+/// <summary>
+/// 聚合内核回调：块级扫描按记录粒度交付（op=1 的存活 put），
+/// 键/值以（缓冲裸指针 + 偏移 + 长度）零拷贝给出——同一缓冲跨
+/// 块复用、回调期间有效。返回 false 早停整个扫描。
+/// </summary>
+delegate bool KernelVisit(nint basePtr, int keyOff, int keyLen, int valOff, int valLen);
+
 /// 段句柄：段文件与其全局段号的配对。
 class SegRef {
     SegmentFile seg;
@@ -953,29 +960,94 @@ class ZanStore {
     }
 
     /// <summary>统计 [startKey, endKey] 闭区间内的存活键数，
-    /// 不做任何回调：单段且 memtable 无参与时顺序直数，
-    /// 墓碑集为空时连逐键哈希都省掉。返回键数。</summary>
+    /// 不做任何回调：单段且 memtable 无参与时走块级内核直数
+    /// （免游标/回调对象），否则退化为归并扫描。返回键数。</summary>
     int CountRange(string startKey, string endKey) {
         List<string> src = this.memtable.Keys;
         if (this.segs.Count == 1 && src.Count == 0) {
-            SegCursor c = SegCursor.Open(this.segs[0].seg, startKey);
-            bool hasTombs = this.tombstones.Count > 0;
-            bool bounded = endKey.Length > 0;
-            int n = 0;
-            while (c.Valid()) {
-                string k = c.Key();
-                if (bounded && String.CompareOrdinal(k, endKey) > 0) { break; }
-                if (c.Op() == 1 && (!hasTombs || !this.tombstones.ContainsKey(k))) {
-                    n = n + 1;
-                }
-                c.Next();
-            }
-            c.Free();
-            return n;
+            return ScanKernel(this.segs[0].seg, startKey, endKey,
+                delegate(nint basePtr, int keyOff, int keyLen, int valOff, int valLen) {
+                    return true;
+                });
         }
         return ScanBetween(startKey, endKey, delegate(string k, string v) {
             return true;
         });
+    }
+
+    /// <summary><see cref="ScanKernel"/> 的区间形式：仅当处于
+    /// 单段稳态（memtable 空）时走块级内核；多源归并或 memtable
+    /// 有未固化数据时返回 -1（调用方须退回 <see cref="ScanRows"/>
+    /// 字符串路径）。endKey 为空串 = 无上界。</summary>
+    int TryScanKernel(string startKey, string endKey, KernelVisit visit) {
+        List<string> src = this.memtable.Keys;
+        if (this.segs.Count != 1 || src.Count != 0) { return -1; }
+        return ScanKernel(this.segs[0].seg, startKey, endKey, visit);
+    }
+
+    /// <summary>
+    /// 块级聚合内核（单段快速路径）：块缓冲读入后循环裸解析
+    /// 记录，把（基址+偏移+长度）直接交给 visit——不经 SegCursor
+    /// /ScanRow 对象、不经每行 delegate 之外的任何抽象；op=2 的
+    /// 段内墓碑由这里跳过（op=2 记录无值）。墓碑集非空时逐键
+    /// memcmp 比对（未固化删除极少，比对成本可忽略）；visit 返
+    /// 回 false 早停。返回 visit 接受的行数。
+    ///
+    /// 常态扫描（固化+归并后单段、memtable 空）的聚合与计数走
+    /// 这里——每行成本 = varint 解码 + 一次回调，无对象分配。
+    /// </summary>
+    int ScanKernel(SegmentFile seg, string startKey, string endKey, KernelVisit visit) {
+        int blockIdx = seg.BlockFor(startKey);
+        int accepted = 0;
+        bool bounded = endKey.Length > 0;
+        bool hasTombs = this.tombstones.Count > 0;
+        ByteBuffer buf = null;
+        while (blockIdx < seg.BlockCount()) {
+            ByteBuffer nb = seg.LoadBlockReuse(blockIdx, buf);
+            if (nb == null) { break; }
+            buf = nb;
+            int pos = 0;
+            int len = buf.Length();
+            bool stop = false;
+            while (pos < len) {
+                int op = buf.PeekU8(pos);
+                if (op != 1 && op != 2) { break; }
+                int p = pos + 1;
+                long klen = buf.ReadVarIntAt(p, out p);
+                if (klen < 0 || p + (int)klen > len) { break; }
+                int keyOff = p;
+                p = p + (int)klen;
+                if (op == 2) {
+                    // 段内墓碑：无值。单段快速路径下它就是该键的
+                    // 最新版本，直接跳过（键已被固化时索引摘除）。
+                    pos = p;
+                    continue;
+                }
+                long vlen = buf.ReadVarIntAt(p, out p);
+                if (vlen < 0 || p + (int)vlen > len) { break; }
+                int valOff = p;
+                p = p + (int)vlen;
+                // 起始定位之后段内按键序——首条越过上界即整段止步。
+                if (bounded && buf.CmpRangeRaw(keyOff, (int)klen, endKey) > 0) {
+                    stop = true;
+                    break;
+                }
+                if (hasTombs && this.tombstones.ContainsKey(buf.Str(keyOff, (int)klen))) {
+                    pos = p;
+                    continue;
+                }
+                accepted = accepted + 1;
+                if (!visit(buf.Raw(), keyOff, (int)klen, valOff, (int)vlen)) {
+                    stop = true;
+                    break;
+                }
+                pos = p;
+            }
+            if (stop) { break; }
+            blockIdx = blockIdx + 1;
+        }
+        if (buf != null) { buf.Free(); }
+        return accepted;
     }
 
     /// <summary>共享锁下的 <see cref="Scan"/>；可与并发写入共存。</summary>

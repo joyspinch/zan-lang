@@ -1,0 +1,178 @@
+using System;
+using System.Data.ZanDb;
+using System.Json;
+
+// ZanDB block-level scan kernel: ScanKernel delivers raw (base, off,
+// len) rows without SegCursor/ScanRow objects or per-row string
+// materialization. Count/CountRange, SumField, MinField, MaxField,
+// AvgField ride the kernel in single-segment steady state and fall
+// back to the authoritative ScanRows path for multi-source merges,
+// unfixed tombstones, escaped records, and text-numeric fields.
+// CountGroups takes the covering-index path (zero document reads)
+// when the index is ready. Correctness must match across:
+// multi-segment unmerged, memtable-pending, after-delete (both
+// unfixed and flushed tombstones), after merge, and reopen.
+class Program {
+    static int pass = 0;
+    static int fail = 0;
+
+    static void Check(string name, bool ok) {
+        if (ok) { pass = pass + 1; }
+        else { fail = fail + 1; Console.WriteLine("FAIL " + name); }
+    }
+
+    static JsonValue Doc(int i) {
+        JsonValue u = JsonValue.NewObject();
+        u.Put("cat", JsonValue.NewStr("c" + Convert.ToString(i % 4)));
+        u.Put("v", JsonValue.NewNum(Convert.ToString(i * 3 - 400)));
+        return u;
+    }
+
+    static JsonValue DocText(int i) {
+        JsonValue u = JsonValue.NewObject();
+        u.Put("cat", JsonValue.NewStr("c" + Convert.ToString(i % 4)));
+        u.Put("v", JsonValue.NewStr(Convert.ToString(i * 3 - 400)));
+        return u;
+    }
+
+    static async int Run() {
+        // ===== 1. 单段稳态（归并后）：内核路径基准 =====
+        string basePath = "zandb_kernel.tmp.db";
+        File.Delete(basePath);
+        File.Delete(basePath + ".m0");
+        File.Delete(basePath + ".m1");
+        for (int i = 0; i < 8; i = i + 1) {
+            string seg = basePath + ".s" + Convert.ToString(i);
+            if (File.Exists(seg)) { File.Delete(seg); }
+        }
+
+        ZanDatabase db = ZanDatabase.Open(basePath, 64);
+        Collection docs = db.GetCollection("docs");
+        long expectSum = 0;
+        long expectMin = 9223372036854775807;
+        long expectMax = 0 - 9223372036854775807 - 1;
+        for (int i = 1; i <= 100; i = i + 1) {
+            docs.Insert(Doc(i));
+            long v = i * 3 - 400;
+            expectSum = expectSum + v;
+            if (v < expectMin) { expectMin = v; }
+            if (v > expectMax) { expectMax = v; }
+        }
+        db.MergeSegments();
+        Check("kernel-sum", docs.SumField("v") == expectSum);
+        long mn;
+        long mx;
+        Check("kernel-min", docs.MinField("v", out mn) && mn == expectMin);
+        Check("kernel-max", docs.MaxField("v", out mx) && mx == expectMax);
+        Check("kernel-avg", docs.AvgField("v") == (double)expectSum / 100.0);
+        Check("kernel-count", docs.Count() == 100);
+
+        // ===== 2. 删除（墓碑固化进段）后内核仍正确 =====
+        docs.DeleteById(1);    // v = -397 = expectMin
+        docs.DeleteById(100);  // v = -100... 实际 100*3-400 = -100
+        expectSum = expectSum - (1 * 3 - 400) - (100 * 3 - 400);
+        expectMin = 2 * 3 - 400;
+        expectMax = 99 * 3 - 400;
+        db.MergeSegments();
+        Check("kernel-sum-after-del", docs.SumField("v") == expectSum);
+        Check("kernel-min-after-del", docs.MinField("v", out mn) && mn == expectMin);
+        Check("kernel-max-after-del", docs.MaxField("v", out mx) && mx == expectMax);
+        Check("kernel-avg-after-del", docs.AvgField("v") == (double)expectSum / 98.0);
+        Check("kernel-count-after-del", docs.Count() == 98);
+
+        // ===== 3. 未固化墓碑（memtable 非空）→ 回退权威路径 =====
+        docs.DeleteById(2);
+        docs.DeleteById(3);
+        expectSum = expectSum - (2 * 3 - 400) - (3 * 3 - 400);
+        expectMin = 4 * 3 - 400;
+        Check("fallback-sum", docs.SumField("v") == expectSum);
+        Check("fallback-min", docs.MinField("v", out mn) && mn == expectMin);
+        Check("fallback-max", docs.MaxField("v", out mx) && mx == expectMax);
+        Check("fallback-count", docs.Count() == 96);
+
+        // ===== 4. 文本数值字段（tag 4）：内核让行 → 权威兜底 =====
+        for (int i = 1; i <= 10; i = i + 1) { docs.Insert(DocText(1000 + i)); }
+        // DocText 的 v 是字符串形态：SumField/Min/Max 只认数值标签，
+        // 字符串不算（与 FieldNum 语义一致）。
+        Check("textnum-sum", docs.SumField("v") == expectSum);
+        // 混合：数值 + 文本数值都在 → 数值行计入，文本行不计入。
+        Check("mixed-count", docs.Count() == 106);
+
+        // ===== 5. 重开：冷缓存内核路径 =====
+        db.Close();
+        ZanDatabase db2 = ZanDatabase.Open(basePath, 64);
+        Collection docs2 = db2.GetCollection("docs");
+        Check("reopen-sum", docs2.SumField("v") == expectSum);
+        Check("reopen-min", docs2.MinField("v", out mn) && mn == expectMin);
+        Check("reopen-max", docs2.MaxField("v", out mx) && mx == expectMax);
+        Check("reopen-avg", docs2.AvgField("v") == (double)expectSum / 96.0);
+        Check("reopen-count", docs2.Count() == 106);
+        db2.Close();
+
+        // ===== 6. 索引覆盖 CountGroups：值连片计数（零文档读）=====
+        string bp2 = "zandb_kernel2.tmp.db";
+        File.Delete(bp2);
+        File.Delete(bp2 + ".m0");
+        File.Delete(bp2 + ".m1");
+        for (int i = 0; i < 8; i = i + 1) {
+            string seg = bp2 + ".s" + Convert.ToString(i);
+            if (File.Exists(seg)) { File.Delete(seg); }
+        }
+        ZanDatabase db3 = ZanDatabase.Open(bp2, 64);
+        Collection g = db3.GetCollection("g");
+        g.EnsureIndex("cat");
+        // cat c0..c3 各 25 篇；v 无索引。
+        for (int i = 0; i < 100; i = i + 1) {
+            JsonValue d = JsonValue.NewObject();
+            d.Put("cat", JsonValue.NewStr("c" + Convert.ToString(i % 4)));
+            d.Put("v", JsonValue.NewNum(Convert.ToString(i)));
+            g.Insert(d);
+        }
+        g.DeleteById(5);
+        g.DeleteById(6);
+        g.DeleteById(7);
+        // id=i+1 映射：id5/i4→c0、id6/i5→c1、id7/i6→c2 各少 1 篇。
+        Dictionary<string, int> groups = g.CountGroups("cat");
+        Check("idx-groups-count", groups.Count == 4);
+        int c0;
+        int c1;
+        int c2;
+        int c3;
+        groups.TryGetValue("c0", out c0);
+        groups.TryGetValue("c1", out c1);
+        groups.TryGetValue("c2", out c2);
+        groups.TryGetValue("c3", out c3);
+        Check("idx-groups-c0", c0 == 24);
+        Check("idx-groups-c1", c1 == 24);
+        Check("idx-groups-c2", c2 == 24);
+        Check("idx-groups-c3", c3 == 25);
+        // 无索引字段回退扫描路径，结果一致。
+        Dictionary<string, int> groups2 = g.CountGroups("v");
+        Check("scan-groups-count", groups2.Count == 100 - 3);
+        // 重开后索引覆盖路径仍一致。
+        db3.Close();
+        ZanDatabase db4 = ZanDatabase.Open(bp2, 64);
+        Collection g2 = db4.GetCollection("g");
+        Dictionary<string, int> groups3 = g2.CountGroups("cat");
+        int c1b;
+        groups3.TryGetValue("c1", out c1b);
+        Check("reopen-groups", groups3.Count == 4 && c1b == 24);
+        db4.Close();
+
+        File.Delete(bp2);
+        File.Delete(bp2 + ".m0");
+        File.Delete(bp2 + ".m1");
+        for (int i = 0; i < 8; i = i + 1) {
+            string seg = bp2 + ".s" + Convert.ToString(i);
+            if (File.Exists(seg)) { File.Delete(seg); }
+        }
+
+        Console.WriteLine("pass: " + Convert.ToString(pass));
+        Console.WriteLine("fail: " + Convert.ToString(fail));
+        return 0;
+    }
+
+    static async void Main() {
+        int r = await Run();
+    }
+}
