@@ -3086,3 +3086,39 @@ P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
   锯齿的外侧 AA，HEAD 基线同法 218 持平即非回归）；实机滚轮放大
   0/2.5x/2.8x 三档楔形透底 0；sweep FLAG 169 = 基线 0 新增；
   A/B：HEAD 数据 218 vs 修后 216 同水平，证余量非本次回归。
+* **台账⑥-1 闭账：直角坐标系热力图车道 + 大数据热力图无响应修复（2026-09-15，批次⑥续）**：
+  heatmap-large/piecewise（20301 格）与 heatmap-cartesian（24×7 打卡卡）
+  按官方语义建车道，closure 挂账"cartesian 热力图车道缺失"销账。解析侧：
+  series.data 的 [x类目下标, y类目下标, 值] 裸三元组进 ChartData.heatX/
+  heatY + number（值保留小数，large 族是 0.5..1.0 连续域），"-" 打 gap；
+  geo/bmap/gaode/amap/matrix 坐标系的三元组（[经度,纬度,值] 或类目名
+  写法）不是类目下标——bmap/gaode/amap/matrix 从此落 coordSys 绕行
+  （此前 bmap/matrix 落空串，直角车道会误吞），calendar 走时间对通道。
+  渲染侧 ChartViewHeatmap 双车道分发：heatX>=0 判直角，列=x类目（左→
+  右）、行=y类目（声明序自上而下，与官方类目 y 轴同向），格无缝
+  FillRect（官方 itemStyle 缺省 borderWidth 0），y 轴标签带在左、x 轴
+  标签带在下（1/2/5×10^k 稀疏步长防重叠，末档右对齐面板内缘），
+  label.show 且格子放得下时画逐格数值。上色走 visualMap：连续=值域
+  线性进色带（o.rampColors 缺色回落第一条 visualMap 的 rangeColors，
+  continuous 缺省 11 色带解析期已填）；piecewise（splitNumber 缺省 5）
+  =值折进等分桶取桶中点色——官方分片即色带量化，large-piecewise 8 桶
+  posterize 与官方一致；ChartVisualMap.splitNumber 补解析（Of/Clone 同
+  步）。**性能（用户实机"大数据一次性同步加载无响应"的根因与修法）**：
+  实时路径每帧 RenderOnce→DrawHeatmap，直角车道首版每帧重画 20301 格
+  + 40k 列表分配 + 300 次 MeasureText + 双份全量数据扫描 → 秒级无响应。
+  修法照地图车道帧内快照定式：标题带以下整块按指纹快照（SnapshotRect/
+  RestoreRect，槽 250+iwid%20），指纹覆盖几何/缩放/逐格数据与缺格/
+  系列 hidden·label 位/色带与值域声明/主题色，g<1000 不缓存保渐显；
+  命中帧只付一趟 O(n) 整数 fold；悬停层指针出面板早退 + 几何备忘
+  （option 引用+矩形+缩放为键），miss 才现算。--bench 实测 large 稳态
+  帧 7-15ms（修复前仅逐格光栅就 36ms/帧，稳态 < 光栅单项即命中实锤）。
+  **教训**：①即时模式渲染器里"每帧全量重画"是大网格的隐形杀手——
+  离屏单帧 sweep 测不出无响应，必须 --bench 量稳态帧；②悬停覆盖层
+  与核心层共用的几何推导必须缓存或早退，否则缓存了像素缓存不了卡顿；
+  ③语义分流要防误吞——heatmap 的 [x,y,v] 在 geo/bmap/matrix 坐标系是
+  另一语义，coordSys 落字是最低成本护栏。验证：parsecheck 335/335；
+  三 demo 观感对拍官方；calendar-heatmap/heatmap-map stash A/B 0 像素差
+  证邻车道零回归；热力 demo 0 新增旗标（heatmap-large BLANK 清除；
+  piecewise EDGE-CLIP 属 bbox 触边已知宽松类，sunburst/treemap 全家
+  同款；matrix BLANK 系 matrix 车道挂账未动）。绝对旗标数受并行会话
+  在途改动影响在 166~186 间漂移（差异全在其轴/触边噪声类，与热力无关）。
