@@ -1092,6 +1092,10 @@ static void zan_lex_strbuf_init(zan_lex_strbuf_t *sb) {
 static void zan_lex_strbuf_push(zan_lex_strbuf_t *sb, char ch) {
     if (sb->oom) return;
     if (sb->len + 1 > sb->cap) {
+        /* A wrapping cap*2 would hand realloc a too-small block and the
+         * push below would then write past it; treat the size overflow as
+         * OOM, which the take path already reports and recovers from. */
+        if (sb->cap > SIZE_MAX / 2) { sb->oom = true; return; }
         size_t ncap = sb->cap * 2;
         char *nbuf = (char *)realloc(sb->buf, ncap);
         if (!nbuf) { sb->oom = true; return; }

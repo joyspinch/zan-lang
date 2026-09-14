@@ -20,6 +20,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include "../common/host_oom.h"
 
 /* Persistent crash logging. This object is linked into every program zanc
@@ -618,12 +619,22 @@ void zan_timer_runtime_reset(void) {
     timer_unlock();
 }
 
+/* Shared deadline arithmetic: saturate instead of wrapping. `now + INT64_MAX`
+ * is UB and wraps negative, which every due check would read as already
+ * expired -- a huge delay would wake immediately instead of never. A deadline
+ * this far out is unreachable on any monotonic clock anyway. */
+long long zan_timer_saturating_due(long long now_ms, long long delay_ms) {
+    if (delay_ms < 0) return now_ms;
+    if (delay_ms > LLONG_MAX - now_ms) return LLONG_MAX;
+    return now_ms + delay_ms;
+}
+
 void zan_timer_delay(long long ms, void *frame, zan_timer_step_t step) {
     if (!step) return;
     zan_timer_entry *entry = (zan_timer_entry *)calloc(1, sizeof(*entry));
     if (!entry) return;   /* OOM: the await never fires; frame release still
                              cancels nothing since no entry exists (soft). */
-    entry->due_ms = zan_timer_now_ms() + (ms > 0 ? ms : 0);
+    entry->due_ms = zan_timer_saturating_due(zan_timer_now_ms(), ms);
     entry->kind = ZAN_TIMER_DELAY;
     entry->frame = frame;
     entry->step = step;
@@ -672,6 +683,43 @@ int zan_timer_cancel_delay(void *frame) {
         g_dispatching->removed = 1;
         found++;
     }
+    /* Physically purge cancelled DELAY entries instead of waiting for the
+     * lazy root pop. A removed entry normally self-cleans: once its due time
+     * passes it surfaces at the root and dispatch_due/next_timeout free it.
+     * A saturated LLONG_MAX deadline (an unreachable Task.Delay retired by
+     * TaskJoin.CancelAll) can never come due, so its entry would linger in
+     * the heap forever -- cancel is the only reclaim point. Free them here
+     * and heapify the survivors back into shape (Floyd, O(n); compaction
+     * shifts entries into different parent/child slots, so the residual
+     * array is NOT still a heap). g_dispatching is safe from the frees: it
+     * was popped from the heap before its dispatch window opened. */
+    size_t w = 0;
+    for (size_t i = 0; i < g_heap_len; i++) {
+        if (g_heap[i]->removed && g_heap[i]->kind == ZAN_TIMER_DELAY) {
+            free(g_heap[i]);
+        } else {
+            g_heap[w++] = g_heap[i];
+        }
+    }
+    g_heap_len = w;
+    /* Restore the heap invariant: after compaction the array is a permutation
+     * of live entries, so a full heapify (Floyd) is O(n). */
+    if (g_heap_len > 1) {
+        for (size_t i = g_heap_len / 2; i-- > 0;) {
+            size_t index = i;
+            for (;;) {
+                size_t left = index * 2 + 1;
+                if (left >= g_heap_len) break;
+                size_t right = left + 1;
+                size_t smallest = right < g_heap_len &&
+                                  timer_less(g_heap[right], g_heap[left])
+                    ? right : left;
+                if (!timer_less(g_heap[smallest], g_heap[index])) break;
+                heap_swap(index, smallest);
+                index = smallest;
+            }
+        }
+    }
     timer_unlock();
     return found;
 }
@@ -688,7 +736,7 @@ static long long timer_add(long long ms, zan_timer_callback_t callback, int repe
     entry->id = g_next_id++;
     if (entry->id <= 0) entry->id = g_next_id = 1;
     entry->interval = repeat ? ms : 0;
-    entry->due_ms = zan_timer_now_ms() + ms;
+    entry->due_ms = zan_timer_saturating_due(zan_timer_now_ms(), ms);
     entry->sequence = ++g_sequence;
     entry->kind = ZAN_TIMER_PUBLIC;
     if (heap_push(entry) != 0) {

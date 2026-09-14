@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -91,7 +92,15 @@ static void *plat_fiber_new(zan_co_t *co) {
 }
 static void plat_fiber_delete(void *f) { DeleteFiber(f); }
 static void plat_switch(void *to)      { SwitchToFiber(to); }
-static void plat_sleep(int64_t ms)     { Sleep((DWORD)(ms < 0 ? 0 : ms)); }
+/* Windows Sleep takes a DWORD; a scheduler wait beyond that (a saturated
+ * INT64_MAX deadline minus now) must clamp, not truncate modulo 2^32 --
+ * 0xFFFFFFFE ms would silently become ~49.7 days' worth of wrong residue. */
+#define ZAN_SLEEP_MS_MAX ((int64_t)0x7FFFFFFF)
+static void plat_sleep(int64_t ms) {
+    if (ms < 0) ms = 0;
+    if (ms > ZAN_SLEEP_MS_MAX) ms = ZAN_SLEEP_MS_MAX;
+    Sleep((DWORD)ms);
+}
 static int64_t plat_now_ms(void)       { return (int64_t)GetTickCount64(); }
 
 #else
@@ -288,7 +297,18 @@ static void timer_add(zan_task_t *t, int64_t delay_ms) {
     }
     /* Insert at the end, then sift up toward the root. */
     size_t i = g_timer_n++;
-    g_timers[i].due_ms = plat_now_ms() + (delay_ms < 0 ? 0 : delay_ms);
+    /* Saturate instead of wrapping: `plat_now_ms() + INT64_MAX` is UB and
+     * wraps negative, which the due check would read as already-expired.
+     * A deadline this far out is unreachable on any clock anyway. */
+    int64_t due;
+    if (delay_ms < 0) {
+        due = plat_now_ms();
+    } else if (delay_ms > INT64_MAX - plat_now_ms()) {
+        due = INT64_MAX;
+    } else {
+        due = plat_now_ms() + delay_ms;
+    }
+    g_timers[i].due_ms = due;
     g_timers[i].task = t;
     while (i > 0) {
         size_t p = (i - 1) / 2;

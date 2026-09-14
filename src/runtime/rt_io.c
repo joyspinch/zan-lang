@@ -2600,6 +2600,8 @@ int32_t zan_io_poll(int64_t timeout_ms) {
     OVERLAPPED_ENTRY entries[64];
     ULONG removed = 0;
     int64_t wait = rto_wait_ms(dns_wait_ms(timeout_ms));
+    /* Clamp a saturated deadline-derived wait before the DWORD conversion. */
+    if (wait > 0x7FFFFFFF) wait = 0x7FFFFFFF;
     DWORD to = (wait < 0) ? INFINITE : (DWORD)wait;
     /* A completion packet whose Post failed left a finished blocking job in
      * g_blocking_done with nothing to announce it (g_blocking_inflight still
@@ -2771,6 +2773,9 @@ int32_t zan_io_poll(int64_t timeout_ms) {
     }
 
     int64_t wait = rto_wait_ms(dns_wait_ms(timeout_ms));
+    /* Clamp a saturated deadline-derived wait; select's tv_sec is a long and
+     * huge values would be implementation-defined after conversion. */
+    if (wait > 0x7FFFFFFF) wait = 0x7FFFFFFF;
     struct timeval tv;
     tv.tv_sec  = (long)(wait / 1000);
     tv.tv_usec = (long)((wait % 1000) * 1000);
@@ -3493,6 +3498,11 @@ int32_t zan_io_pump_timeout(int64_t timeout_ms) {
         return zan_io_poll(timeout_ms);
     if (timeout_ms <= 0)
         return 0;
+    /* A huge timeout (a saturated LLONG_MAX timer deadline minus now, from an
+     * unreachable Task.Delay) must clamp here: Windows Sleep takes a DWORD, and
+     * truncating modulo 2^32 wraps the wait to a small residue. POSIX nanosleep
+     * is safe on Linux but a clamped wait is still bounded and correct. */
+    if (timeout_ms > 0x7FFFFFFF) timeout_ms = 0x7FFFFFFF;
 #ifdef _WIN32
     Sleep((DWORD)timeout_ms);
 #else
@@ -4301,6 +4311,9 @@ static long long co_pump_timers(void) {
 static void co_wait_io(zan_co_worker_t *w, long long timeout_ms) {
     OVERLAPPED_ENTRY entries[64];
     ULONG removed = 0;
+    /* Clamp before the DWORD conversion: a saturated LLONG_MAX timer deadline
+     * truncated modulo 2^32 would wake early (or as a bogus small wait). */
+    if (timeout_ms > 0x7FFFFFFF) timeout_ms = 0x7FFFFFFF;
     DWORD to = (timeout_ms < 0) ? INFINITE : (DWORD)timeout_ms;
     /* A completion packet whose Post failed left a finished job in
      * g_blocking_done with nothing to announce it. Drain before parking: if
