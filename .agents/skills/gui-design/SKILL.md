@@ -453,6 +453,21 @@ small-medium 之间**:画廊卡片标题先后用 13/15 都被打回"太小",17 
   Clone+DrawOption 拷贝+渲染器传参/消费端。漏最后一级(渲染器读
   主题色没读声明)时解析全绿、渲染死灰(真实案例:radar-aqi 深底
   图例白字画成主题灰字,金轴名根本没接)。
+- **相邻填充区域的接缝要按官方"区域描边"语义封,不能用同色双描
+  workaround**:官方每个 region path 是 fill+stroke 同帧落盘
+  (MapSeries/GeoModel defaultOption itemStyle borderWidth 0.5 +
+  borderColor neutral30 #b7b9be,SSR oracle 实证),相邻区域共享
+  边各描一次天然密封;只画填充时共享边单像素 AA 合成后透背景成
+  "虫洞",画一遍自己填充色压不住。描边车道独立于
+  ChartItemStateStyle(显式 0=关边框是合法值,通用结构缺省 0 分
+  不清"没声明",ChartSeries 用 -1 哨兵字段 mapBorderW/mapBorderC;
+  borderWidth 0.5 这类小数用 JsonValue.Double 取回再取整,Has/
+  Int 哨兵会混淆);渲染时描边必须压在所有填充之后画——zrender
+  同 path 先 fill 后 stroke,提前画会被后画的相邻填充盖掉(真实
+  案例:map-usa 相邻州界放大透背景缝,首版描边画在填充循环前
+  全部消失)。闭多边形轮廓助手补宽度参数 PolyOutlineW(DrawPolyline
+  对 <1 宽钳到 1px,官方 0.5px 缺省落 1px 网格)。geoIndex 挂载
+  系列的边框取宿主 geo 的 itemStyle(getHostGeoModel 语义)。
 
 ## 缩放纪律(DPI:为什么界面忽大忽小)
 

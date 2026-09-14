@@ -247,6 +247,22 @@ partial class ChartView {
         c.DrawPolyline(px, py, color, 1);
     }
 
+    /// 闭合多边形轮廓，可指定笔宽（地图区域描边：官方 0.5px 缺省
+    /// 落 1px 网格，声明 1/2 的走对应宽度）。
+    static void PolyOutlineW(Canvas c, List<ChartMapPoint> poly, int color,
+                             int thickness) {
+        int n = poly.Count;
+        if (n < 2) { return; }
+        List<int> px = new List<int>();
+        List<int> py = new List<int>();
+        for (int i = 0; i <= n; i = i + 1) {
+            ChartMapPoint p = poly[i % n];
+            px.Add(p.x);
+            py.Add(p.y);
+        }
+        c.DrawPolyline(px, py, color, thickness);
+    }
+
     /// 地图渲染入口：头部面板 + 可选 visualMap 色条；roam 时处理
     /// 滚轮缩放与拖拽平移（抛 MapRoam）；区域按系列色/MapRamp
     /// 填色（dataRange 过滤灰显），g>=1000 时按指纹快照/恢复像素
@@ -492,6 +508,17 @@ partial class ChartView {
                     }
                 }
             } else if (g >= 1000) {
+            // 官方语义（MapDraw.getFixedItemStyle → el.setStyle）：
+            // 每个 region path fill + stroke 同帧落盘，stroke 取
+            // itemStyle.borderColor/borderWidth，缺省 0.5px
+            // neutral30 #b7b9be（MapSeries/GeoModel defaultOption，
+            // SSR 实证 map-usa 全部区域 path stroke #b7b9be w0.5）。
+            // stroke 压在 fill 之上（zrender 同 path 先 fill 后
+            // stroke）；相邻区域共享边各描一次即天然密封，接缝
+            // 不再透背景。mapBorderW：-1 未声明 → 官方 0.5px 进
+            // 1px 网格；显式 0 = 关边框。
+            int rBw = lead.mapBorderW;
+            if (rBw < 0) { rBw = 1; }
             for (int i = 0; i < n; i = i + 1) {
                 MapPolygon p = layout.polys[i];
                 if (p.hole) { continue; }
@@ -507,19 +534,22 @@ partial class ChartView {
                 if (!p.hole) { continue; }
                 ChartView.FillPolygon(c, p.points, bg);
             }
+            if (rBw > 0) {
+                int rBc = lead.mapBorderC != 0
+                    ? lead.mapBorderC
+                    : Chart.Rgb(183, 185, 190);
+                for (int i = 0; i < n; i = i + 1) {
+                    MapPolygon p = layout.polys[i];
+                    if (p.hole) { continue; }
+                    ChartView.PolyOutlineW(c, p.points, rBc, rBw);
+                }
+            }
             for (int i = 0; i < n; i = i + 1) {
                 MapPolygon p = layout.polys[i];
                 int col = lead.regions[p.region].color;
                 if (col == 0) { col = ChartView.MapRamp(o, lead.regions[p.region].value, vMin, vMax); }
                 if (!Chart.DRangeOk(app, o, o.iwid, vMin, vMax, lead.regions[p.region].value)) {
                     col = Chart.Rgb(204, 204, 204);
-                }
-                // 同色描边走两遍：相邻省界共享边各画一次，单次
-                // 抗锯齿合成后仍有缝隙（背景透出成「虫洞」），
-                // 两次覆盖后接缝基本密封且轮廓不增粗。
-                if (!p.hole) {
-                    ChartView.PolyOutline(c, p.points, col);
-                    ChartView.PolyOutline(c, p.points, col);
                 }
                 if (!p.hole) {
                     string nm = lead.regions[p.region].name;

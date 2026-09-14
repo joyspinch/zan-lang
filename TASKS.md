@@ -3040,3 +3040,28 @@ P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
   串等值过滤 1.1M→25M。教训：微基准先确认走了哪条路径（SegCount
   与 memtable 状态打印出来再计时）；聚合正确性断言要带「组数+组
   计数总和」双校验。金标 zandb_* 16/16、ctest zandb 64/64。
+* **地图区域拼接接缝闭账（2026-09-14，用户实机审查批次③）**：
+  map-usa/world 放大后相邻区域边界透出背景色发丝缝。SSR oracle
+  （`_scratch/echoracle/mapborder.js`）实证官方语义：MapSeries/
+  GeoModel defaultOption `itemStyle.borderWidth 0.5 +
+  borderColor neutral30 #b7b9be`，每个 region path fill+stroke
+  同帧落盘（MapDraw.getFixedItemStyle → el.setStyle）——相邻区域
+  共享边各描一次天然密封。引擎根因：从未消费官方缺省描边，靠
+  「同色描边走两遍」的 workaround（画区域自己的填充色）压缝，AA
+  合成后共享边单像素仍透背景。修法三条车道 + stroke-on-top：
+  ①`ChartSeries.mapBorderW/mapBorderC` 专用哨兵字段（-1 未声明 /
+  显式 0 = 关边框是合法值，`ChartItemStateStyle.borderWidth` 缺省
+  0 与显式 0 无法区分，故不入 itemStyle）；②解析三路：用户
+  series.map.itemStyle 直接收、`geoIndex` 挂载系列取宿主 geo 的
+  itemStyle（官方 getHostGeoModel 语义）、geo 合成的 isGeoBase
+  系列收 `geo.itemStyle.borderColor/borderWidth`（Double 取回
+  保 0.5 这类小数与显式 0）；③渲染 fill 全画完 + 洞底补填后
+  再整幅描边一遍（zrender 同 path 先 fill 后 stroke，描边提前
+  会被后画的填充盖掉——首版踩过），未声明落官方 0.5px 取整 1px
+  网格 #b7b9be；`PolyOutlineW` 带宽轮廓新助手；旧双描 workaround
+  退役。指纹 `FingerprintCore` 折叠 mapBorderC/W 保快照缓存正确
+  失效。验证：map-usa 边框像素 0→数千、Nebraska/Kansas 等相邻州
+  直接 fill→fill 过渡无白缝、接缝启发式 3448→219（余为标签文字
+  AA 边缘）；全量 sweep 345 张 FLAG 169 与基线持平、17 个 map/geo
+  demo 单侧 0 新增；map-HK/geo-choropleth-scatter/scatter-map/
+  heatmap-map/map-iceland-pie/map-bar-morph 观感与官方一致。

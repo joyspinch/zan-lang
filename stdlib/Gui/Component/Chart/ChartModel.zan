@@ -603,6 +603,8 @@ class ChartGeo {
     string selectedMode; // ""/"single" | "multiple" | "false"
     int areaColor;       // itemStyle.areaColor；0 = 不覆盖
     int borderColor;     // itemStyle.borderColor；0 = 不覆盖
+    int borderWidth;     // itemStyle.borderWidth（官方缺省 0.5）；
+                         // -1 = 未声明（渲染器落官方缺省）
     List<ChartMapRegion> regions; // regions[] 覆盖（stub 或带 ring）
 
     static ChartGeo Of() {
@@ -614,6 +616,7 @@ class ChartGeo {
         g.selectedMode = "";
         g.areaColor = 0;
         g.borderColor = 0;
+        g.borderWidth = 0 - 1;
         g.regions = new List<ChartMapRegion>();
         return g;
     }
@@ -628,6 +631,7 @@ class ChartGeo {
         g.selectedMode = src.selectedMode;
         g.areaColor = src.areaColor;
         g.borderColor = src.borderColor;
+        g.borderWidth = src.borderWidth;
         for (int i = 0; i < src.regions.Count; i = i + 1) {
             g.regions.Add(ChartMapRegion.Clone(src.regions[i]));
         }
@@ -1744,6 +1748,13 @@ class ChartSeries {
                      //   渲染前由 ChartMaps.BindSeries 注入区域几何
     int geoIndex;    // ECharts series.geoIndex：绑定的 geo 组件下标
     bool isGeoBase;  // geo 组件合成的底图载体系列（非用户声明）
+    // map/geo 底图区域描边（官方 MapSeries/GeoModel defaultOption
+    // itemStyle borderWidth 0.5 + borderColor neutral30）：-1 = 用户
+    // 未声明（渲染端落官方缺省 1px 网格），显式 0 = 关边框（合法）。
+    // ChartItemStateStyle.borderWidth 缺省 0 与"显式 0"无法区分，
+    // 故 map 车道用独立哨兵字段。
+    int mapBorderW;  // -1 未声明 / >=0 半径像素（四舍五入）
+    int mapBorderC;  // 0 = 官方缺省 #b7b9be；否则用户声明色
     // ---- pictorialBar（custom == "pictorialBar"）----
     string picSymbol; // 原始 symbol 串：内置形状名 / path:// / image://
     string picRepeat; // symbolRepeat："true" | "fixed" | ""
@@ -1963,6 +1974,8 @@ class ChartSeries {
         s.mapName = "";
         s.geoIndex = 0;
         s.isGeoBase = false;
+        s.mapBorderW = 0 - 1;
+        s.mapBorderC = 0;
         s.picSymbol = "";
         s.picRepeat = "";
         s.picClip = false;
@@ -2496,6 +2509,7 @@ class ChartSeries {
         s.selectedMode = src.selectedMode; s.forceScaling = src.forceScaling;
         s.mapName = src.mapName; s.geoIndex = src.geoIndex;
         s.isGeoBase = src.isGeoBase;
+        s.mapBorderW = src.mapBorderW; s.mapBorderC = src.mapBorderC;
         s.picSymbol = src.picSymbol; s.picRepeat = src.picRepeat;
         s.picClip = src.picClip; s.picPos = src.picPos;
         s.picBound = src.picBound; s.picW = src.picW; s.picH = src.picH;
@@ -5359,6 +5373,11 @@ class ChartOption {
                 geo.areaColor = ChartOption.ParseColor(its.Get("color"), 0);
             }
             geo.borderColor = ChartOption.ParseColor(its.Get("borderColor"), 0);
+            // 官方可写 0.5（MapSeries/GeoModel defaultOption
+            // borderWidth: 0.5）；显式 0 是合法值（关边框），必须
+            // Double 取回再取整，不能用 Has/Int 哨兵混淆。
+            double gw = its.Double("borderWidth", -1.0);
+            if (gw != -1.0) { geo.borderWidth = (int)(gw + 0.5); }
         }
         JsonValue lb = g.Get("label");
         if (lb != null && lb.IsObject()) {
@@ -6619,6 +6638,33 @@ class ChartOption {
                 if (cs.type == ChartType.Map && s.Has("geoIndex")
                     && cs.geoIndex >= 0 && o.geos.Count > cs.geoIndex) {
                     cs.mapName = o.geos[cs.geoIndex].map;
+                }
+                // map 系列的区域描边：官方 MapSeries defaultOption
+                // itemStyle borderWidth 0.5 / borderColor neutral30。
+                // 用户显式声明走声明值（borderWidth 0 = 关边框）；
+                // 未声明保持 -1，渲染端落官方缺省。geoIndex 挂 geo
+                // 的系列同官方 getHostGeoModel 语义——geo 组件的
+                // itemStyle 优先（下方再覆写）。
+                if (cs.type == ChartType.Map) {
+                    JsonValue mits = s.Get("itemStyle");
+                    if (mits != null && mits.IsObject()) {
+                        if (mits.Has("borderColor")) {
+                            cs.mapBorderC = ChartOption.ParseColor(
+                                mits.Get("borderColor"), 0);
+                        }
+                        double mbw = mits.Double("borderWidth", -1.0);
+                        if (mbw != -1.0) { cs.mapBorderW = (int)(mbw + 0.5); }
+                    }
+                    if (s.Has("geoIndex") && cs.geoIndex >= 0
+                        && o.geos.Count > cs.geoIndex) {
+                        ChartGeo hostGeo = o.geos[cs.geoIndex];
+                        if (hostGeo.borderColor != 0) {
+                            cs.mapBorderC = hostGeo.borderColor;
+                        }
+                        if (hostGeo.borderWidth >= 0) {
+                            cs.mapBorderW = hostGeo.borderWidth;
+                        }
+                    }
                 }
                 // coordinateSystem:"geo"（散点/lines/graph 叠加地图）。
                 string csys = s.Str("coordinateSystem", "");
@@ -7912,6 +7958,11 @@ class ChartOption {
                 gs.z = 0;
                 gs.selectedMode = g.selectedMode;
                 gs.labelShow = g.labelShow;
+                // geo 底图描边过河：官方 GeoModel defaultOption 同
+                // MapSeries（borderWidth 0.5 / borderColor neutral30）。
+                // -1（未声明）与显式 0（关边框）都原样传，渲染端分得。
+                if (g.borderColor != 0) { gs.mapBorderC = g.borderColor; }
+                if (g.borderWidth >= 0) { gs.mapBorderW = g.borderWidth; }
                 for (int ri = 0; ri < g.regions.Count; ri = ri + 1) {
                     gs.regions.Add(ChartMapRegion.Clone(g.regions[ri]));
                 }
