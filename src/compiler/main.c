@@ -4209,13 +4209,26 @@ int main(int argc, char **argv) {
          * touching zanc; and a project that embeds its own skins/ folder
          * through --embed (the IDE publish stages exactly that, earlier in
          * the spec list so its copies win duplicate names) makes this
-         * auto-embed skip -- one copy of each pack is enough. */
+         * auto-embed skip -- one copy of each pack is enough. A staged
+         * folder only counts as a complete replacement when it carries the
+         * baseline itself: a pack-only skins/ (own skin.css, no base.css --
+         * wuwei shipped exactly that) would otherwise skip the auto-embed,
+         * leave skins/base.css missing from the image, Style.BaseSheet
+         * empty and every Flex container degenerate to dock stacking. */
         if (resolved_stdlib_root[0] &&
             zan_irgen_defines_prefix(&irgen, "Skin_")) {
             bool skins_staged = false;
             for (int es = 0; es < embed_spec_count && !skins_staged; es++) {
                 const char *seq = strrchr(embed_specs[es], '=');
-                if (seq && strcmp(seq + 1, "skins") == 0) skins_staged = true;
+                if (!seq || strcmp(seq + 1, "skins") != 0) { continue; }
+                char base_css[1240];
+                int dirlen = (int)(seq - embed_specs[es]);
+                if (dirlen <= 0 || dirlen > (int)sizeof(base_css) - 16) {
+                    continue;
+                }
+                memcpy(base_css, embed_specs[es], (size_t)dirlen);
+                memcpy(base_css + dirlen, "/base.css", 10);
+                if (zan_file_exists(base_css)) { skins_staged = true; }
             }
             if (!skins_staged) {
                 char skins_dir[1200];
