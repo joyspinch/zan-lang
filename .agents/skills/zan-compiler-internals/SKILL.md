@@ -1356,3 +1356,23 @@ System.Threading` 的代价都是整个 rt_sync。
 验证沙箱/加载器类改动用 Windows 实机（lua54.dll 铺 exe 旁即可真跑，
 注意 lua_embed_smoke 的 env-skip 语义：无 Lua 时打印同一 golden，
 ctest 绿≠断言跑过，必须另写显式探针）。
+## 运行时 abort 死点普查要按符号抓头文件帮凶 + zan_rt_fatal 接管钩子（A52-8 实录）
+
+**坑**：普查"库内哪些地方会硬死"时只 `grep abort()` 会漏一半——`zan_host_oom()`
+（fprintf + abort）定义在 `src/common/host_oom.h` 里，rt_sync.c 六处 OOM 死点、
+rt_timer.c 一处全部借它藏身；另有三处历史 abort 已改优雅路径但注释里留着
+"abort()" 字样，纯文本 grep 三向误报/漏报。正确姿势：先抓 `abort()`，再抓
+"包着 abort 的辅助函数"的调用点（`grep zan_host_oom`），最后逐处读上下文
+分辨活死点 vs 注留史。
+
+**定式**：运行时不可恢复死点（OOM/slab 一致性/契约违反）现在统一走
+`zan_rt_fatal(category, message)`（rt_timer.c，每程序必链）：默认打印
+`zan runtime: fatal (cat): msg` 后 abort（与历史行为等价）；嵌入方可
+`zan_rt_set_fatal_handler` 注册回调接管——回调里自行 exit(宿主码)，
+**回调返回=违约**，运行时仍 abort（现场不可恢复，绝不许继续跑）。
+新死点直接调 zan_rt_fatal，不要再造裸 abort，也不要再引 host_oom.h
+（那是编译器侧工具链用的）。改动 rt_sync/rt_mem 这类被测试目标**子集链接**
+的文件时，记得给只链部分的 ctest 目标补链 rt_timer.c（CMake 已修三处）。
+
+**顺手坑**：CMakeLists 的参数列表里 `/* ... */` 不是注释，会被拆成参数
+传给命令——CMake 注释只有 `#` 行注释。
