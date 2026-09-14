@@ -2484,6 +2484,7 @@ static void print_usage(void) {
     fprintf(stderr, "  --check-leaks   Report unreleased objects at program exit (default with -g)\n");
     fprintf(stderr, "  --arc-guard     Quarantine freed objects and trap stale retain/release (default with -g)\n");
     fprintf(stderr, "  --no-check-leaks, --no-arc-guard  Turn those off in a debug build\n");
+    fprintf(stderr, "                   (--no-arc-guard also turns off the --publish over-release net)\n");
     fprintf(stderr, "  --no-runtime-checks  Disable runtime guards (e.g. division by zero)\n");
     fprintf(stderr, "  --strict-runtime  Guard failures exit(70) without ZAN_RT_HARD=1\n");
     fprintf(stderr, "  --publish        Build optimized release binary (strip debug, optimize)\n");
@@ -3527,10 +3528,19 @@ int main(int argc, char **argv) {
                                            : (debug_info && !publish_mode);
     bool arc_guard = arc_guard_opt >= 0 ? arc_guard_opt != 0
                                         : (debug_info && !publish_mode);
+    /* Publish keeps one low-cost safety net (A52-5): the over-release check
+     * (one compare+branch on an already-loaded value, measured +4.3% on a
+     * saturated retain/release benchmark, inside PERFORMANCE.md's <5% ARC
+     * budget) reports through the fail-soft note and continues, so a leak in
+     * the field announces itself instead of silently corrupting. The full
+     * --arc-guard trap supersedes it; an explicit --no-arc-guard is the
+     * perf-paranoid escape hatch that turns the net off too. */
+    bool arc_net = publish_mode && arc_guard_opt != 1 && arc_guard_opt != 0;
     if (zan_irgen_init(&irgen, arena, diag, &binder, input_file,
                        irgen_triple,
                        target.os == ZAN_OS_WINDOWS, mt_scheduler,
-                       check_leaks, runtime_checks, arc_guard) != ZAN_OK) {
+                       check_leaks, runtime_checks, arc_guard,
+                       arc_net) != ZAN_OK) {
         fprintf(stderr, "error: failed to initialize code generator\n");
         zan_arena_free(arena);
         free(source);

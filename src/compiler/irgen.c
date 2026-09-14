@@ -1651,19 +1651,64 @@ static void emit_arc_underflow_check(zan_irgen_t *g, LLVMValueRef fn,
                                     LLVMValueRef rc_old, LLVMValueRef obj,
                                     LLVMValueRef site, unsigned code,
                                     const char *what) {
-    /* Diagnostic builds only: an over-release is a real bug, but today it only
-     * leaks (the count never reaches zero, so nothing is freed), and programs
-     * that carry one still run. Aborting them by default would turn a leak into
-     * a crash, so the trap is opt-in with --arc-guard. */
-    if (!g->arc_guard || !g->runtime_checks) return;
+    /* --arc-guard (diagnostic builds): report the full fault (object, site,
+     * backtrace) and exit(70). An over-release is a real bug, but today it
+     * only leaks (the count never reaches zero, so nothing is freed), and
+     * programs that carry one still run -- aborting them by default would
+     * turn a leak into a crash, so the trap is opt-in. */
+    if (g->arc_guard) {
+        if (!g->runtime_checks) return;
+        LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+        LLVMValueRef dead = zan_icmp(g->builder, LLVMIntSLE, rc_old,
+            LLVMConstInt(i64t, 0, 0), "arcdead");
+        LLVMBasicBlockRef bad_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "arc.bad");
+        LLVMBasicBlockRef ok_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "arc.ok");
+        LLVMBuildCondBr(g->builder, dead, bad_bb, ok_bb);
+        LLVMPositionBuilderAtEnd(g->builder, bad_bb);
+        emit_arc_fault_report(g, obj, rc_old, site, code, what);
+        LLVMPositionBuilderAtEnd(g->builder, ok_bb);
+        return;
+    }
+    /* --publish net: the same comparison, but the report is a fail-soft note
+     * (once per kind: stderr + the runtime log) and execution CONTINUES --
+     * the decrement already happened either way, so the only thing the net
+     * changes is that the leak now announces itself. Same shape as the
+     * runtime-check guards: split prefix/msg notes where the linked runtime
+     * has them, merged one-arg text on the cross-target fallback. */
+    if (!g->arc_net) return;
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
     LLVMValueRef dead = zan_icmp(g->builder, LLVMIntSLE, rc_old,
         LLVMConstInt(i64t, 0, 0), "arcdead");
-    LLVMBasicBlockRef bad_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "arc.bad");
-    LLVMBasicBlockRef ok_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "arc.ok");
+    LLVMBasicBlockRef bad_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "arcnet.bad");
+    LLVMBasicBlockRef ok_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "arcnet.ok");
     LLVMBuildCondBr(g->builder, dead, bad_bb, ok_bb);
     LLVMPositionBuilderAtEnd(g->builder, bad_bb);
-    emit_arc_fault_report(g, obj, rc_old, site, code, what);
+    if (g->rt_guard_split) {
+        LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+        LLVMTypeRef note_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                                               (LLVMTypeRef[]){ i8p, i8p }, 2, 0);
+        LLVMValueRef note_fn = LLVMGetNamedFunction(g->mod, "zan_rt_soft_note2");
+        if (!note_fn) note_fn = LLVMAddFunction(g->mod, "zan_rt_soft_note2",
+                                                note_ty);
+        LLVMValueRef prefix = zan_irgen_intern_string(g, what);
+        LLVMValueRef msg = zan_irgen_intern_string(g,
+            " [ARC over-release net: object leaked, execution continues]\n");
+        LLVMValueRef nargs[] = { prefix, msg };
+        zan_call2(g->builder, note_ty, note_fn, nargs, 2, "");
+    } else {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "%s [ARC over-release net: object leaked, "
+                 "execution continues]\n", what);
+        LLVMValueRef text = zan_irgen_intern_string(g, buf);
+        LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+        LLVMTypeRef note_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                                               (LLVMTypeRef[]){ i8p }, 1, 0);
+        LLVMValueRef note_fn = LLVMGetNamedFunction(g->mod, "zan_rt_soft_note");
+        if (!note_fn) note_fn = LLVMAddFunction(g->mod, "zan_rt_soft_note",
+                                                note_ty);
+        zan_call2(g->builder, note_ty, note_fn, &text, 1, "");
+    }
+    LLVMBuildBr(g->builder, ok_bb);
     LLVMPositionBuilderAtEnd(g->builder, ok_bb);
 }
 
@@ -1756,7 +1801,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                             const char *target_triple,
                             bool target_is_windows, bool mt_scheduler,
                             bool check_leaks, bool runtime_checks,
-                            bool arc_guard) {
+                            bool arc_guard, bool arc_net) {
     memset(g, 0, sizeof(*g));
     class_index_reset();
     s_current_irgen = g;
@@ -1769,6 +1814,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
      * fixed-size site tables. */
     g->runtime_checks = runtime_checks;
     g->arc_guard = arc_guard;
+    g->arc_net = arc_net;
     g->check_leaks = check_leaks;
     /* Set target before runtime codegen so Sleep/poll selection is correct. */
     if (target_triple && target_triple[0])

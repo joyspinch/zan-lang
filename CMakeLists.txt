@@ -3681,6 +3681,21 @@ foreach(_obf_case linux-x64:init_array linux-arm64:init_array
   set_tests_properties(publish_obf_ctor_${_obf_target} PROPERTIES TIMEOUT 180)
 endforeach()
 
+# ---- --publish over-release net (A52-5) ----
+# --publish keeps the rc<=0 check of the ARC guard as a fail-soft net: the
+# report prints once and execution continues (an over-release only leaks).
+# This case pins the net's silence contract on a correct program -- including
+# borrowed-extern traffic, where a release would read a non-refcount slot:
+# exit 0, golden output intact, and no net report anywhere. Firing behavior
+# (report + continue) is pinned by the hand-run injection probe in TASKS.md.
+add_test(NAME conformance_arc_net_publish COMMAND ${CMAKE_COMMAND}
+  -DZANC=$<TARGET_FILE:zanc>
+  -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/arc_net_publish.zan
+  -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/arc_net_publish.out
+  -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_arc_net_publish${_exe_ext}
+  -P ${CMAKE_SOURCE_DIR}/tests/run_arcnet.cmake)
+set_tests_properties(conformance_arc_net_publish PROPERTIES TIMEOUT 120)
+
 # ---- Published-size budgets (docs/embedded_runtime_assessment.md) ----
 # A minimal --publish build must stay small: a reintroduced fixed static
 # table or a cross link that lost --gc-sections trips these. Ceilings are

@@ -455,6 +455,13 @@ struct zan_irgen {
     bool         arc_guard;       /* quarantine freed objects/strings and trap
                                    * any later retain/release of them
                                    * (use-after-free detection; leaks memory) */
+    bool         arc_net;         /* --publish over-release net: the same
+                                   * rc<=0 comparison the guard uses, but the
+                                   * report goes through the fail-soft note
+                                   * (once per kind, stderr + runtime log) and
+                                   * execution continues -- an over-release
+                                   * only leaks, so the net never turns a
+                                   * leak into a crash */
     bool         fast_codegen;    /* machine codegen at -O0 (fast turnaround) */
     bool         emit_lib;        /* library output: keep `public` members as
                                      exported (external-linkage) symbols */
@@ -786,7 +793,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                             const char *target_triple,
                             bool target_is_windows, bool mt_scheduler,
                             bool check_leaks, bool runtime_checks,
-                            bool arc_guard);
+                            bool arc_guard, bool arc_net);
 void zan_irgen_destroy(zan_irgen_t *g);
 
 /* Intern a compiler-emitted guard text (see irgen.c): identical strings share
