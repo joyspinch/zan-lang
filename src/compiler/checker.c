@@ -640,6 +640,25 @@ static bool checker_weak_target_is_arc_ref(zan_type_t *t) {
     return t->kind == TYPE_CLASS && t->sym != NULL;
 }
 
+/* An `extern` method (bodyless, or carrying [DllImport]) is compiled as a
+* plain external function whose parameter list is the declared one, verbatim.
+* A *non-static* extern would instead be reached through the instance call
+* convention (receiver prepended) or via a virtual/itable dispatch, and the
+* LLVM-level mismatch surfaces as a verify failure / "Invalid bitcast" long
+* after any useful diagnostic point (zandb SegCursor.CmpKeyRaw probe). The
+* checker is the right gate: reject it at the declaration. */
+static void check_extern_static(zan_checker_t *c, zan_ast_node_t *member) {
+    if (!c || !member || member->kind != AST_METHOD_DECL) return;
+    bool is_extern = member->method_decl.extern_lib.str != NULL ||
+                     (member->method_decl.modifiers & MOD_EXTERN) != 0;
+    if (!is_extern) return;
+    if (member->method_decl.modifiers & MOD_STATIC) return;
+    zan_diag_emit(c->diag, DIAG_ERROR, member->loc,
+                  "extern method '%.*s' must be static; a native function has "
+                  "no receiver, so drop 'extern' or mark it 'static'",
+                  (int)member->method_decl.name.len,
+                  member->method_decl.name.str);
+}
 static void check_weak_member(zan_checker_t *c, zan_ast_node_t *owner,
                               zan_ast_node_t *member) {
     if (!c || !owner || !member ||
@@ -3602,6 +3621,7 @@ void zan_checker_check(zan_checker_t *c, zan_ast_node_t *unit) {
         for (int j = 0; j < decl->type_decl.members.count; j++) {
             zan_ast_node_t *member = decl->type_decl.members.items[j];
             check_weak_member(c, decl, member);
+            check_extern_static(c, member);
             if (member->kind == AST_METHOD_DECL ||
                 member->kind == AST_CONSTRUCTOR_DECL ||
                 member->kind == AST_DESTRUCTOR_DECL) {

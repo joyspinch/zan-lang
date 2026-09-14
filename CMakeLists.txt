@@ -1397,6 +1397,12 @@ endfunction()
 
 foreach(_src ${_conf_srcs})
   get_filename_component(_name ${_src} NAME_WE)
+  # arc_net_publish 有专属档（run_arcnet.cmake，--publish + 网静默
+  # 契约，见 3691 行的手工登记），四个 GLOB 孪生档全部跳过它，
+  # 否则 add_test 撞名配置失败。
+  if(_name STREQUAL "arc_net_publish")
+    continue()
+  endif()
   zan_uses_gui_driver(${_src} _needs_gui_driver)
   if(_name MATCHES "^async_mt")
     # ZAN_CO_DRIVER tests: exercise the multi-worker coroutine driver.
@@ -1503,6 +1509,10 @@ endif()
 # (reproducible-build / correctness net).
 foreach(_src ${_conf_srcs})
   get_filename_component(_name ${_src} NAME_WE)
+  # arc_net_publish 只挂手工档（3696 行），GLOB 孪生档跳过。
+  if(_name STREQUAL "arc_net_publish")
+    continue()
+  endif()
   if(_name MATCHES "^async_mt")
     set(_extra_args "--async-workers")
   else()
@@ -1583,6 +1593,10 @@ set(_known_leaky
 )
 foreach(_src ${_conf_srcs})
   get_filename_component(_name ${_src} NAME_WE)
+  # arc_net_publish 只挂手工档（3702 行），GLOB 孪生档跳过。
+  if(_name STREQUAL "arc_net_publish")
+    continue()
+  endif()
   zan_uses_gui_driver(${_src} _needs_gui_driver)
   set(_expect_leak_site "")
   if(_name MATCHES "^async_mt")
@@ -1645,6 +1659,10 @@ endforeach()
 # address and the releasing site.
 foreach(_src ${_conf_srcs})
   get_filename_component(_name ${_src} NAME_WE)
+  # arc_net_publish 只挂手工档（3711 行），GLOB 孪生档跳过。
+  if(_name STREQUAL "arc_net_publish")
+    continue()
+  endif()
   zan_uses_gui_driver(${_src} _needs_gui_driver)
   if(_name MATCHES "^async_mt")
     set(_extra_args "--async-workers")
@@ -3221,6 +3239,15 @@ set_tests_properties(diag_factory_initializer_readonly PROPERTIES
 
 # An `init` accessor is a setter restricted to object initialization; a plain
 # `obj.Prop = v` after construction must be a compile error.
+# An instance `extern` method (missing `static`) must be a compile error at
+# the declaration, not an LLVM verification failure ("Invalid bitcast" /
+# wrong argument count) with no usable diagnostic.
+add_test(NAME diag_extern_instance_method
+  COMMAND zanc ${CMAKE_SOURCE_DIR}/tests/diag/extern_instance_method.zan
+    -o ${CMAKE_BINARY_DIR}/diag_extern_instance_method${_exe_ext})
+set_tests_properties(diag_extern_instance_method PROPERTIES
+  WILL_FAIL TRUE TIMEOUT 60)
+
 add_test(NAME diag_init_only_write
   COMMAND zanc ${CMAKE_SOURCE_DIR}/tests/diag/init_only_write.zan
     -o ${CMAKE_BINARY_DIR}/diag_init_only_write${_exe_ext})

@@ -2836,11 +2836,12 @@ P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
   Count ~23 倍反超；机器高负载（并发会话）噪声 ±30%，扫描地板
   （游标机器 + 每块 IO + 惰性物化）与 SQLite 纯 C 列解引用的差距
   属语言层地板，README 已记。金标 zandb_* 12/12、ctest
-  `-R "zandb|arr_lit"` 52/52（含泄漏孪生）。**挂账（编译器）**：
-  实例 `extern` DllImport 方法（漏 static）通过类型检查，irgen
-  生成含 this 的调用约定在 LLVM verify 报 "Invalid bitcast"——
-  应在检查器报「extern 方法必须 static」诊断；探针复现于
-  SegCursor.CmpKeyRaw 首版。
+  `-R "zandb|arr_lit"` 52/52（含泄漏孪生）。**挂账（编译器）已修（2026-09-14）**：
+  实例 `extern` DllImport 方法（漏 static）此前通过类型检查，irgen
+  生成含 this 的调用约定在 LLVM verify 报 "Invalid bitcast"/参数数不符；
+  现检查器声明点直接报错 `extern method 'X' must be static`（check_extern_static，
+  extern_lib/MOD_EXTERN 判定 + MOD_STATIC 豁免，全树扫描零存量实例 extern），
+  diag_extern_instance_method 新档（WILL_FAIL）绿；最小探针 `_scratch/externstatic/`。
 * **geo-svg 悬停扰动闭账（2026-09-13 第五批，用户实机审查批次④）**：
   用户报「鼠标经过对 SVG 的干扰依然存在」——geo-svg-scatter-simple
   悬停海面时整图蒙上巨大半透明浅蓝三角形 + 弹 "trip2 0" 卡。三层
@@ -2969,3 +2970,38 @@ P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
   `zandb_lock_tmp.zdb` 暴露）。失败路径补 `s.log.Close()`；另把
   zandb_docs/zandb_fuzz 的段清理循环上限提到 40（分别只清 12/24，
   段号超限即残留根目录）。金标重扫 15/15、ctest 64/64 复验。
+* **ZanDb 块级聚合内核 + 覆盖索引 GROUP BY（2026-09-14，"继续"批次②）**：
+  上批基准结论「剩余地板是扫描游标与每行委托调用」的落地。①
+  `ZanStore.ScanKernel(seg, startKey, endKey, visit)`：单段稳态下块
+  缓冲读入后循环裸解析记录（ByteBuffer 新增 `PeekU8`/`ReadVarIntAt`
+  /`CmpRangeRaw` 裸原语），把（基址+偏移+长度）直接交给回调——不经
+  SegCursor/ScanRow 对象、零字符串物化；op=2 段内墓碑跳过、未固化
+  墓碑逐键哈希（罕见路径）、首条越过上界整段止步、回调 false 早停。
+  `TryScanKernel` 非单段稳态（多段/memtable 未固化数据）返回 -1 由
+  调用方退权威路径。②`Count`/`CountRange` 直数、`SumField`、
+  `MinField`/`MaxField`/`AvgField` 接内核：`RecAccNum` 裸走读对
+  kid==want 的数值标签（3/8/9）直接累加进 `NumAcc`；回调无法「继续
+  扫剩下的行」，权威回退以「已聚合到 id-1」为界、剩余行（含当行）
+  从 `ScanRows(DocKey(id))` 续扫，两段结果无缝拼接（共享骨架
+  `NumAggregate`）。③`CountGroups` 索引就绪时走**覆盖索引路径**：
+  条目键序 =（值, id）序，扫索引前缀范围、按 `\t` 切段计数，零文档
+  读。测试新增 zandb_kernel 28 断言（单段基准/固化墓碑/未固化回退/
+  转义回退/文本数值回退/重开/索引分组对拍扫描分组）。
+  **内核走读两个真 bug**（mergeincr 金标 sum 三断言暴露，全修）：
+  (a) `RecAccNum` 预读 tag 后调 `SkipValRaw`，而后者按「p 指向
+  tag」契约重新读 tag——同一 tag 被消费两次，字符串字段后的
+  kid/tag 全线错位，且最终仍 return true（聚合静默为 0）。修法 =
+  tag 只消费一次：want 命中分支自己读，跳过分支由 SkipValRaw 读
+  （与 FieldNum→SkipValS 契约一致）。(b) 含 0xFF 的记录是转义态
+  （0x00→FF 01、0xFF→FF 02）：v=255 的 varint 编码 FF 01 转义成
+  FF 02 01 后，裸走读把 FF 02 当 varint 读出 383（多 128）——
+  RecAccNum 开头 memchr 检出 0xFF 即回退权威走读（FieldNum 有
+  UnescapeRecord 先行）。教训：裸走读与字符串权威走读并存时，
+  「哪些字节形态表示原始载荷」必须逐条对齐（转义态、文本数值、
+  容器——三处都须显式让位）；tag 的消费权唯一化是解析器组合的
+  通用纪律。金标 zandb_* 16/16、ctest `-R "zandb"` 64/64。
+  顺带修 CMake 配置期雷：conformance_arc_net_publish 由
+  run_arcnet.cmake 手工登记（fcf56e0b 起），但四个 conformance GLOB
+  孪生档也按 `*.zan` 把它 add_test——任何重配（加新测试文件必然
+  触发）都撞名 `add_test given test NAME which already exists` 配置
+  失败。四个 GLOB 循环各补 `arc_net_publish` 跳过守卫。
