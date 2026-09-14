@@ -264,13 +264,15 @@ A32（遗留收尾路线）、A33-A47（专项记录）、文末"已撤回的结
     不再 `%lld` 打指针。
   - 后置 ✅ `System.IO.Compression`（Deflate/GZip/Zip/Tar，纯 Zan，与 Python 双向互操作）；
     顺带给 `File.zan` 新增 `WriteAllBytes(string, byte[])`。
-* **B1-2** [ ] `stdlib/Game`（**2026-08-08 复核**：47 个 .zan 文件 / 554KB / 1.47 万行代码，
-  `///` 文档注释仅 **146 行**——文档覆盖率约 1%，是全库最低）：
-  `Zgm`、`Arpg`、`Rts`、`Scene`、`Cards`、`Board`、`Arcade2D`。
-  **先补公开接口文档再谈提炼**，没有接口文档就重构 1.5 万行是盲改。
-  提炼候选：`Zgm/UiRuntime.zan` 与 `Arpg/UiRuntime.zan` 同名同量级，
-  先查两者是不是在做同一件事（若是，合并到 `Game/Foundation`）。
-  其余候选：公共游戏运行时、实体/组件模型、资源与项目模型、解析器、渲染层。
+* **B1-2** [ ] `stdlib/Game`（**2026-09-15 复核，账面刷新**：49 个 .zan 文件 /
+  1.82 万行，`///` 文档注释 **933 行**（约 5%，8 月的 146 行起游戏车道已翻六倍）；
+  模块现为 `Arcade2D/Arpg/Board/Cards/Core/Foundation/Idle/Kit/Scene`——
+  **`Zgm`、`Rts` 已不存在**（随 SDL3 清退与重组消失），台账原「Zgm/UiRuntime 与
+  Arpg/UiRuntime 同名同量级，先查是否同一件事」的提炼调查对象已灭失，问题作废；
+  `Foundation/`（Gui 宿主无关积木：Timing/Input/Scene + README）即当初设想的
+  合并落点，已成形）。文档缺口集中在 `Scene`（3666 行 / 78 ///≈2%）与
+  `Arpg`（10518 行 / 567 ///≈5%），由游戏车道随改随补；提炼（重构级）仍需
+  与该车道协调窗口，未动。
 * **B1-3** [ ] `stdlib/Gui`（103 文件 / 1.9MB / 3.8 万行）是 UI 框架，不搬走，
   但内部模块边界需重划（见 B3-2 / B3-3）。
 
