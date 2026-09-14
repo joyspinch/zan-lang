@@ -47,6 +47,7 @@ for (int i = 0; i < 1000; i = i + 1) { users.Insert(MakeDoc(i)); }
 db.Commit();
 
 db.MergeSegments();                           // 可选：回收空间、压掉旧版本
+db.MergeSomeSegments(4);                      // 或增量归并最老 4 段（写阻塞有界）
 db.Close();
 ```
 
@@ -98,6 +99,17 @@ db.Close();
 
 任何档位下**干净关闭都不丢数据**（`Close` 会 flush 未落盘帧）；
 崩溃恢复由 CRC 帧 + 水位 + 双槽清单保证到最近一次落盘点。
+
+### 归并维护（全量与增量）
+
+`MergeSegments()` 全量归并所有段为单段；`MergeSomeSegments(k)`
+增量归并最老 k 段（≥2），写阻塞时长被归并集规模封顶——大库常驻
+场景可在后台周期调用（如每写入若干段后 `MergeSomeSegments(4)`），
+反复调用最终收敛为单段。增量归并只重指「键索引仍指向归并集」的
+键，指向未归并新段的键原样保留且不写入新段，段清单按数据年龄序
+维护，重开恢复（按清单序后扫覆盖）与多路扫描（新→旧游标裁决）
+都不会让旧版本复活。两形态的崩溃窗口一致：段已写清单未换 = 孤儿
+段（下次同号覆盖）；清单已换 = 旧段成孤儿（仅占盘）。
 
 ### 单写者模型（与旧引擎的关键差异）
 
@@ -201,6 +213,7 @@ CoW B+Tree + WAL 对同等负载体积大数倍（页开销 + 写放大碎片 + 
 | `zandb_proj`         | 投影 API：`ScanField` 回调/计数/提前停、`FindIdsByField` 扫描路径与覆盖索引路径一致、删除后两路径同步 | 
 | `zandb_idxrange`     | `FindIdsByFieldRange`：索引端点 `\t` 上界（"c1" 不放进 "c10"）、无界端点、序数语义（"9"&gt;"20"）、扫描回退与覆盖索引路径一致、删除/重开同步 |
 | `zandb_typed`        | 类型化聚合：`SumField` 只认数值标签（负数/文本数值计入、字符串跳过）、`ScanNumField`/`ScanStrField` 免 JsonValue 投影与提前停、`CountGroups` 分组计数、Update/重开跟随 |
+| `zandb_mergeincr`    | 增量归并：最老 k 段归并段数递减收敛、索引原地改指、未归并新段的更新赢（含重开后）、墓碑压键不复活、`MergeSomeSegments` 无事可做返回 0 |
 | `zandb_merge_tomb`   | 归并墓碑回归：跨段「put+删除」经归并/重归并/重开不复活，点读/Count/索引查询/覆盖查询全路径一致 |
 | `zandb_fuzz`         | 300 步随机操作对拍内存参照模型（固定种子 LCG），跨持久化档重开 |
 | `zandb_lock`         | 单写锁：第二打开者被拒、关闭后可重开                        |

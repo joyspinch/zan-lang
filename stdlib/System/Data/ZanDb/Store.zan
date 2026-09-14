@@ -625,6 +625,139 @@ class ZanStore {
         this.rw.ExitWrite();
     }
 
+    /// 线性查小列表（归并集段号，k 很小）。
+    static bool IdInList(List<long> ids, long id) {
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            if (ids[i] == id) { return true; }
+        }
+        return false;
+    }
+
+    /// <summary><see cref="MergeSegments"/> 的增量形式：把最老的
+    /// maxMerge（≥2）个段归并为一个新段，其余较新段原样保留——
+    /// 写阻塞时长被归并集规模封顶，反复调用最终收敛为单段。索引
+    /// 原地改指：只有键索引仍指向归并集的键才重指/摘除；指向未
+    /// 归并新段的键保持原指（更新版本继续赢），且这样的键**不写
+    /// 入新段**——重开恢复按清单序「后扫覆盖前扫」时才不会让旧
+    /// 版本压住未归并段的新版本。归并集内同键由游标新→旧序去重，
+    /// 未固化墓碑压键与崩溃窗口语义同全量归并。返回实际归并的
+    /// 段数（0 = 无事可做：段不足 2 或在事务中）。</summary>
+    int MergeSomeSegments(int maxMerge) {
+        if (maxMerge < 2 || this.segs.Count < 2 || this.txDepth > 0) { return 0; }
+        int k = maxMerge < this.segs.Count ? maxMerge : this.segs.Count;
+        if (k < 2) { return 0; }
+        long newId = this.nextSegId;
+        string segPath = ZanStore.SegPath(this.basePath, newId);
+        // 同号孤儿防御：上次「段已写、清单未换」的崩溃残留。
+        File.Delete(segPath);
+        SegmentWriter wtr = SegmentWriter.Create(segPath);
+        if (wtr.Failed()) { this.lastError = wtr.GetError(); return 0; }
+        // 归并集 = 最老 k 段；游标集内新→旧排列，同键第一个停住的
+        // 即集内最新版本。
+        List<long> chosenIds = new List<long>();
+        for (int i = 0; i < k; i = i + 1) { chosenIds.Add(this.segs[i].id); }
+        List<SegCursor> cursors = new List<SegCursor>();
+        for (int i = k - 1; i >= 0; i = i - 1) {
+            cursors.Add(SegCursor.Open(this.segs[i].seg, ""));
+        }
+        while (true) {
+            string minKey = "";
+            bool has = false;
+            for (int i = 0; i < cursors.Count; i = i + 1) {
+                SegCursor c = cursors[i];
+                if (!c.Valid()) { continue; }
+                if (!has || String.CompareOrdinal(c.Key(), minKey) < 0) {
+                    minKey = c.Key();
+                    has = true;
+                }
+            }
+            if (!has) { break; }
+            // 未固化墓碑压键：整键跳过不写入，索引项一并摘除
+            // （指向归并集才摘——指向未归并段说明有更新版本）。
+            if (this.tombstones.ContainsKey(minKey)) {
+                for (int i = 0; i < cursors.Count; i = i + 1) {
+                    SegCursor c = cursors[i];
+                    if (c.Valid() && c.Key() == minKey) { c.Next(); }
+                }
+                long curSeg;
+                if (this.index.TryGetValue(minKey, out curSeg) && ZanStore.IdInList(chosenIds, curSeg)) {
+                    this.index.Remove(minKey);
+                }
+                continue;
+            }
+            // 集内最新版本定生死：仅当键索引指向归并集时才需要
+            // 落入新段并重指；指向未归并段 = 那里有更新版本，此键
+            // 直接跳过（新段不含它，重开覆盖序才安全）。
+            bool decided = false;
+            bool write = false;
+            string val = "";
+            for (int i = 0; i < cursors.Count; i = i + 1) {
+                SegCursor c = cursors[i];
+                if (c.Valid() && c.Key() == minKey) {
+                    if (!decided) {
+                        decided = true;
+                        long curSeg;
+                        bool mine = this.index.TryGetValue(minKey, out curSeg) && ZanStore.IdInList(chosenIds, curSeg);
+                        if (c.Op() == 1 && mine) {
+                            write = true;
+                            val = c.Val();
+                        }
+                    }
+                    c.Next();
+                }
+            }
+            if (write) {
+                wtr.Add(minKey, val, 1);
+                this.index.Remove(minKey);
+                this.index.Add(minKey, newId);
+            } else if (decided) {
+                // 集内最新是墓碑或键已归属未归并段：前者索引早已摘除；
+                // 后者不动。两情形都无需写新段。
+                long curSeg;
+                if (this.index.TryGetValue(minKey, out curSeg) && ZanStore.IdInList(chosenIds, curSeg)) {
+                    this.index.Remove(minKey);
+                }
+            }
+        }
+        for (int i = 0; i < cursors.Count; i = i + 1) { cursors[i].Free(); }
+        if (!wtr.Finish()) {
+            this.lastError = wtr.GetError();
+            File.Delete(segPath);
+            return 0;
+        }
+        SegmentFile seg = SegmentFile.Open(segPath);
+        if (seg.GetError() != "") {
+            this.lastError = seg.GetError();
+            File.Delete(segPath);
+            return 0;
+        }
+        // 清单先换：段序 = 数据年龄序（新段载最老数据，排最前），
+        // 未归并段保持原相对序在后——恢复「后扫覆盖前扫」与多路
+        // 游标「新→旧」都以这个序为准。崩溃窗口两段皆一致，同
+        // 全量归并。
+        List<long> ids = new List<long>();
+        ids.Add(newId);
+        for (int i = k; i < this.segs.Count; i = i + 1) { ids.Add(this.segs[i].id); }
+        if (!this.man.Save(this.man.LogStartSeq(), newId + 1, ids)) {
+            this.lastError = this.man.GetError();
+            seg.Close();
+            File.Delete(segPath);
+            return 0;
+        }
+        for (int i = 0; i < k; i = i + 1) {
+            this.segs[i].seg.Close();
+            File.Delete(ZanStore.SegPath(this.basePath, this.segs[i].id));
+        }
+        // 段列表按数据年龄序重建：新段（载最老数据）在最前，
+        // 未归并段保持原相对序。
+        List<SegRef> remaining = new List<SegRef>();
+        remaining.Add(new SegRef(seg, newId));
+        for (int i = k; i < this.segs.Count; i = i + 1) { remaining.Add(this.segs[i]); }
+        this.segs = remaining;
+        this.nextSegId = newId + 1;
+        return k;
+    }
+
     /// 追加一条记录帧并推进 seq。
     void AppendRec(int op, string key, string val) {
         ByteBuffer b = ByteBuffer.Alloc(24 + key.Length + val.Length);

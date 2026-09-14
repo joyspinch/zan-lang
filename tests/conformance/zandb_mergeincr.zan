@@ -1,0 +1,152 @@
+using System;
+using System.Data.ZanDb;
+using System.Json;
+
+// ZanDB incremental merge: MergeSomeSegments merges only the oldest K
+// segments (bounded write stall), keeps newer segments untouched, and
+// converges to a single segment over repeated calls. Covers: in-place
+// index re-pointing, deletes pressed by merge, data correctness across
+// partial merges (Count/FindById/index queries/SumField), the
+// "newer unmerged segment wins" case (old copy must not resurrect,
+// even after reopen), and manifest age-order recovery.
+class Program {
+    static int pass = 0;
+    static int fail = 0;
+
+    static void Check(string name, bool ok) {
+        if (ok) { pass = pass + 1; }
+        else { fail = fail + 1; Console.WriteLine("FAIL " + name); }
+    }
+
+    // 取文档 v 字段；文档或字段缺失返回 -999999（测试哨兵）。
+    static long VOf(Collection docs, int id) {
+        JsonValue d = docs.FindById(id);
+        if (d == null) { return -999999; }
+        JsonValue v = d.Get("v");
+        if (v == null) { return -999999; }
+        return v.AsLong(0);
+    }
+
+    static JsonValue Doc(int i) {
+        JsonValue u = JsonValue.NewObject();
+        u.Put("cat", JsonValue.NewStr("c" + Convert.ToString(i % 4)));
+        u.Put("v", JsonValue.NewNum(Convert.ToString(i)));
+        return u;
+    }
+
+    static JsonValue DocWith(int i, string cat, long v) {
+        JsonValue u = JsonValue.NewObject();
+        u.Put("cat", JsonValue.NewStr(cat));
+        u.Put("v", JsonValue.NewNum(Convert.ToString(v)));
+        return u;
+    }
+
+    static async int Run() {
+        string basePath = "zandb_mergeincr.tmp.db";
+        File.Delete(basePath);
+        File.Delete(basePath + ".m0");
+        File.Delete(basePath + ".m1");
+        for (int i = 0; i < 16; i = i + 1) {
+            string seg = basePath + ".s" + Convert.ToString(i);
+            if (File.Exists(seg)) { File.Delete(seg); }
+        }
+
+        ZanDatabase db = ZanDatabase.Open(basePath, 64);
+        Check("open", db.IsOpen());
+        db.Kv().SetFlushThreshold(1024);   // 极小阈值：每批固化一段
+        Collection docs = db.GetCollection("docs");
+        docs.EnsureIndex("cat");
+
+        // 6 批 × 40 篇（v = id-1，即 0..239）→ ≥4 个段。
+        for (int b = 0; b < 6; b = b + 1) {
+            db.Begin();
+            for (int i = 0; i < 40; i = i + 1) { docs.Insert(Doc(b * 40 + i)); }
+            db.Commit();
+        }
+        int segs0 = db.SegCount();
+        Check("many-segments", segs0 >= 4);
+        Check("count-all", docs.Count() == 240);
+        Check("sum-all", docs.SumField("v") == 28680);   // 0..239 之和
+
+        // 增量归并 2 段：段数 -1，数据不变。
+        int m1 = db.MergeSomeSegments(2);
+        Check("merge-2", m1 == 2);
+        Check("segs-dec", db.SegCount() == segs0 - 1);
+        Check("count-after-partial", docs.Count() == 240);
+        Check("sum-after-partial", docs.SumField("v") == 28680);
+        Check("findbyid-after-partial", VOf(docs, 60) == 59);
+        Check("idx-after-partial", docs.FindIdsByField("cat", "c0").Count == 60);
+
+        // 反复增量归并直至收敛为单段。
+        int guard = 0;
+        while (db.SegCount() > 1 && guard < 20) {
+            db.MergeSomeSegments(2);
+            guard = guard + 1;
+        }
+        Check("converged", db.SegCount() == 1);
+        Check("count-converged", docs.Count() == 240);
+        Check("sum-converged", docs.SumField("v") == 28680);
+        Check("idx-converged", docs.FindIdsByField("cat", "c3").Count == 60);
+        Check("nothing-to-do", db.MergeSomeSegments(2) == 0);
+
+        // 覆盖「未归并段有更新版本」：先插新批（段2），再把老 id 改值
+        //（段3），然后只归并最老 2 段——更新必须继续赢，重开后同样。
+        db.Begin();
+        for (int i = 0; i < 40; i = i + 1) { docs.Insert(Doc(240 + i)); }
+        db.Commit();
+        db.Begin();
+        for (int i = 0; i < 40; i = i + 1) { docs.Update(i + 1, DocWith(i, "cx", 1000)); }
+        db.Commit();
+        Check("grew-to-3", db.SegCount() == 3);
+        int m2 = db.MergeSomeSegments(2);
+        Check("merge-oldest-2", m2 == 2);
+        Check("updated-win", VOf(docs, 1) == 1000);
+        Check("updated-win-last", VOf(docs, 40) == 1000);
+        Check("untouched-new", VOf(docs, 241) == 240);
+        // sum = 0..239 之和 + 240..279 之和 - (0..39) + 40×1000
+        Check("sum-updated", docs.SumField("v") == 28680 + 10380 - 780 + 40000);
+        Check("count-updated", docs.Count() == 280);
+        Check("idx-updated", docs.FindIdsByField("cat", "cx").Count == 40);
+
+        // 墓碑：删 10 篇后增量归并到单段，删除不复活。
+        db.Begin();
+        for (int i = 0; i < 10; i = i + 1) { docs.DeleteById(200 + i); }
+        db.Commit();
+        guard = 0;
+        while (db.SegCount() > 1 && guard < 20) {
+            db.MergeSomeSegments(3);
+            guard = guard + 1;
+        }
+        Check("count-deleted", docs.Count() == 270);
+        Check("deleted-gone", docs.FindById(200) == null);
+        Check("sum-deleted", docs.SumField("v") == 78280 - 2035);
+
+        db.Close();
+
+        // 重开：清单年龄序 + 恢复覆盖序下数据仍正确。
+        ZanDatabase db2 = ZanDatabase.Open(basePath, 64);
+        Collection docs2 = db2.GetCollection("docs");
+        Check("reopen-count", docs2.Count() == 270);
+        Check("reopen-updated", VOf(docs2, 1) == 1000);
+        Check("reopen-new", VOf(docs2, 241) == 240);
+        Check("reopen-deleted", docs2.FindById(205) == null);
+        Check("reopen-idx", docs2.FindIdsByField("cat", "cx").Count == 40);
+        Check("reopen-sum", docs2.SumField("v") == 76245);
+        db2.Close();
+
+        File.Delete(basePath);
+        File.Delete(basePath + ".m0");
+        File.Delete(basePath + ".m1");
+        for (int i = 0; i < 16; i = i + 1) {
+            string seg = basePath + ".s" + Convert.ToString(i);
+            if (File.Exists(seg)) { File.Delete(seg); }
+        }
+        Console.WriteLine("pass: " + Convert.ToString(pass));
+        Console.WriteLine("fail: " + Convert.ToString(fail));
+        return 0;
+    }
+
+    static async void Main() {
+        int r = await Run();
+    }
+}
