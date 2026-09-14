@@ -2299,6 +2299,20 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_childwindow_shape${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # 关闭最大化按钮的窗口：双击标题栏与 SC_MAXIMIZE 必须断路（App
+  # 把按钮状态登记给外壳 SetMaximizable）。NC 消息与系统命令是
+  # Win32 概念，用例投递真实消息后同步泵掉，仅 Windows 注册。
+  if(WIN32)
+    add_test(NAME conformance_gui_maxbtn_dblclick
+      COMMAND ${CMAKE_COMMAND}
+        -DZANC=$<TARGET_FILE:zanc>
+        -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/maxbtn_dblclick_test.zan
+        "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+        -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_maxbtn_dblclick.out
+        -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_maxbtn_dblclick${_exe_ext}
+        -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  endif()
+
   # 图表主题包（Gui.Component.Chart/themes，图表自己的皮肤层）：
   # UseChartTheme 叠加 chart::series-N/axis/grid 规则，"default" 卸载
   # 后恢复跟随 Gui 皮肤；未知包名被拒且当前主题不变。

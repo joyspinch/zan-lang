@@ -1,0 +1,106 @@
+using System;
+using Gui;
+
+/// 关闭了最大化按钮的窗口：双击标题栏与 SC_MAXIMIZE 不得放大窗口。
+///
+/// 标题按钮画在客户区，外壳的 WndProc 看不到哪个按钮存在，而双击
+/// 标题栏与 Win+Up（WM_SYSCOMMAND SC_MAXIMIZE）会被 DefWindowProc
+/// 兜底成最大化——SetChromeButtons 隐藏最大化按钮后必须显式登记到
+/// 外壳（SetMaximizable），放大通路才真正断掉。本用例开真实窗口，
+/// PostMessage 投递非客户区消息，PumpGuarded 同步泵掉后用 IsZoomed
+/// 断言窗口状态；消息派发在泵内同步完成，无时序依赖。仅限 Windows
+/// 外壳（NC 消息与 SC 命令是 Win32 概念），用例在 CMakeLists 里按
+/// 平台注册。
+class MaxBtnDblClickTest {
+    [DllImport("user32", EntryPoint = "PostMessageW")]
+    static extern int PostMessageW(nint hwnd, int msg, nint wp, nint lp);
+
+    [DllImport("user32", EntryPoint = "IsZoomed")]
+    static extern int IsZoomed(nint hwnd);
+
+    [DllImport("user32", EntryPoint = "GetWindowRect")]
+    static extern int GetWindowRect(nint hwnd, nint rect);
+
+    const int WM_SYSCOMMAND = 0x0112;
+    const int WM_NCLBUTTONDBLCLK = 0x00A3;
+    const int SC_MAXIMIZE = 0xF030;
+    const int SC_RESTORE = 0xF120;
+    // NC 消息的 wParam 是 WM_NCHITTEST 的返回码；DefWindowProc 只对
+    // HTCAPTION(2) 响应双击（0 = HTERROR，直接忽略）。
+    const int HTCAPTION = 2;
+
+    static App app;
+    static int fails;
+
+    static void True(string what, bool got) {
+        if (got) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    static nint Hwnd() { return app.WindowHandle(); }
+
+    static void Pump(int n) {
+        for (int i = 0; i < n; i = i + 1) { app.PumpGuarded(); }
+    }
+
+    static void Post(int msg, nint wp) {
+        PostMessageW(Hwnd(), msg, wp, 0);
+    }
+
+    /// WM_NCLBUTTONDBLCLK 的 lp 是屏幕坐标（y<<16|x）。投在标题条
+    /// 中点：左右边框与右侧按钮保留带都碰不上。
+    static void CaptionDblClick() {
+        nint rc = NativeMemory.Alloc(16);
+        GetWindowRect(Hwnd(), rc);
+        int left = new Span<int>(rc, 1)[0];
+        int top = new Span<int>(rc + 4, 1)[0];
+        int right = new Span<int>(rc + 8, 1)[0];
+        NativeMemory.Free(rc);
+        int x = left + (right - left) / 2;
+        int y = top + 20;
+        int lp = ((y & 0xFFFF) << 16) | (x & 0xFFFF);
+        PostMessageW(Hwnd(), WM_NCLBUTTONDBLCLK, (nint)HTCAPTION, (nint)lp);
+    }
+
+    static void Main() {
+        app = new App("maxbtn", 480, 320);
+        app.Show();
+        Pump(4);
+
+        // ---- 控制组：最大化按钮在，真实形态的双击标题栏放大窗口 ----
+        CaptionDblClick();
+        Pump(8);
+        True("control caption dblclick maximizes", IsZoomed(Hwnd()) != 0);
+        Post(WM_SYSCOMMAND, (nint)SC_RESTORE);
+        Pump(8);
+        True("control SC_RESTORE restores", IsZoomed(Hwnd()) == 0);
+
+        // ---- 隐藏最大化按钮：两条放大通路都断，还原仍可用 ----
+        app.SetChromeButtons(true, true, true, false);
+        Post(WM_SYSCOMMAND, (nint)SC_MAXIMIZE);
+        Pump(8);
+        True("hidden button blocks SC_MAXIMIZE", IsZoomed(Hwnd()) == 0);
+        CaptionDblClick();
+        Pump(8);
+        True("hidden button blocks caption dblclick", IsZoomed(Hwnd()) == 0);
+
+        // 编程式切换（标题按钮点击走的同一条路）不受影响；已最大的
+        // 无按钮窗口双击标题栏应能还原（DefWindowProc 走 SC_RESTORE）。
+        app.window.ToggleMaximize();
+        True("programmatic toggle still maximizes", IsZoomed(Hwnd()) != 0);
+        CaptionDblClick();
+        Pump(8);
+        True("dblclick restores maximized buttonless window",
+            IsZoomed(Hwnd()) == 0);
+
+        // ---- 重新启用：登记要能摘除，通路恢复 ----
+        app.SetChromeButtons(true, true, true, true);
+        Post(WM_SYSCOMMAND, (nint)SC_MAXIMIZE);
+        Pump(8);
+        True("re-enabled SC_MAXIMIZE maximizes", IsZoomed(Hwnd()) != 0);
+
+        Console.WriteLine("maxbtn-dblclick:"
+            + Convert.ToString(fails == 0 ? 1 : 0));
+    }
+}

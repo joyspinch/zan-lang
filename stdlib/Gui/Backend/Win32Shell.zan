@@ -319,6 +319,11 @@ class Win32Shell {
     // 边框的，尺寸手柄全靠 WM_NCHITTEST 给出，所以“不能拉”
     // 就是不再把边缘报成手柄，并挡住双击标题栏 / 最大化。
     static List<nint> fixedHwnd;
+    // 关闭了最大化按钮的窗口。标题按钮画在客户区，外壳看不到
+    // 哪个按钮存在，而双击标题栏与 SC_MAXIMIZE（Win+Up、系统
+    // 菜单）会被 DefWindowProc 兜底成最大化——没有最大化按钮的
+    // 窗口也照放大不误。App 显式登记到这里：不在表内才允许放大。
+    static List<nint> noMaxHwnd;
     static int imeX;
     static int imeY;
 
@@ -773,12 +778,20 @@ class Win32Shell {
             return Win32Shell.HitTest(hwnd, Win32Shell.LoWord(lp),
                 Win32Shell.HiWord(lp));
         } else if (msg == 0x00A3) {                // WM_NCLBUTTONDBLCLK
-            // 双击标题栏默认最大化；固定尺寸的窗口吃掉它。
+            // 双击标题栏默认最大化；固定尺寸的窗口吃掉它，
+            // 关闭了最大化按钮的窗口同样吃掉。已经最大的窗口
+            // 放行，让 DefWindowProc 走 SC_RESTORE 双击还原。
             if (!Win32Shell.ResizableOf(hwnd)) { return 0; }
+            if (!Win32Shell.MaximizableOf(hwnd)
+                && !Win32Shell.IsMaximized(hwnd)) { return 0; }
         } else if (msg == 0x0112) {                // WM_SYSCOMMAND
             int cmd = ((int)wp) & 0xFFF0;
-            if (!Win32Shell.ResizableOf(hwnd) && (cmd == 0xF030 || cmd == 0xF000)) {
-                return 0;                          // SC_MAXIMIZE / SC_SIZE
+            if (!Win32Shell.ResizableOf(hwnd) && cmd == 0xF000) {
+                return 0;                          // SC_SIZE
+            }
+            if (cmd == 0xF030 && (!Win32Shell.ResizableOf(hwnd)
+                || !Win32Shell.MaximizableOf(hwnd))) {
+                return 0;                          // SC_MAXIMIZE
             }
         } else if (msg == 15) {                    // WM_PAINT
             nint ps = NativeMemory.Alloc(72);
@@ -1698,6 +1711,31 @@ class Win32Shell {
         }
         if (!on) { keep.Add(hwnd); }
         Win32Shell.fixedHwnd = keep;
+    }
+
+    /// 窗口是否允许最大化（默认允许）。关闭了最大化按钮的窗口
+    /// 必须登记 false，否则双击标题栏 / SC_MAXIMIZE 照样放大窗口。
+    static bool MaximizableOf(nint hwnd) {
+        if (Win32Shell.noMaxHwnd == null) { return true; }
+        for (int i = 0; i < Win32Shell.noMaxHwnd.Count; i = i + 1) {
+            if (Win32Shell.noMaxHwnd[i] == hwnd) { return false; }
+        }
+        return true;
+    }
+
+    /// 登记窗口是否允许最大化；false 时双击标题栏与
+    /// SC_MAXIMIZE（Win+Up、系统菜单）不再放大窗口，双击
+    /// 已最大的窗口仍可还原。重复设置同值无副作用。
+    static void SetMaximizable(nint hwnd, bool on) {
+        if (Win32Shell.noMaxHwnd == null) {
+            Win32Shell.noMaxHwnd = new List<nint>();
+        }
+        List<nint> keep = new List<nint>();
+        for (int i = 0; i < Win32Shell.noMaxHwnd.Count; i = i + 1) {
+            if (Win32Shell.noMaxHwnd[i] != hwnd) { keep.Add(Win32Shell.noMaxHwnd[i]); }
+        }
+        if (!on) { keep.Add(hwnd); }
+        Win32Shell.noMaxHwnd = keep;
     }
 
     // 工具窗口（WS_EX_TOOLWINDOW）hwnd 登记表：SetToolWindow 翻转
