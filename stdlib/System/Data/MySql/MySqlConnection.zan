@@ -1,6 +1,7 @@
 using System;
 using System.Data;
 using System.Net.Sockets;
+using System.Net.Tls;
 using System.Security.Cryptography;
 
 namespace System.Data.MySql;
@@ -55,6 +56,7 @@ class MySqlConnection : IDbConnection {
     int lastAffected;   // 上一条语句影响的行数
     bool hadError;      // 上一条语句是否返回了 ERR 数据包
     List<PreparedStmt> stmtCache;  // 预编译语句缓存（SQL -> 服务端 id）
+    TlsStream tls;      // 非空 = 通道已加密（OpenSecureParamsAsync 建立）
 
 
     /// 空连接；外部经 <see cref="OpenParamsAsync"/> 构造。
@@ -67,6 +69,7 @@ class MySqlConnection : IDbConnection {
         this.lastAffected = 0;
         this.hadError = false;
         this.stmtCache = new List<PreparedStmt>();
+        this.tls = null;
     }
 
     // ============================================================
@@ -76,8 +79,22 @@ class MySqlConnection : IDbConnection {
     /// <summary>恰好读取 <paramref name="need"/> 个字节到
     /// <paramref name="dst"/> 的 <paramref name="off"/> 处，在 IO
     /// reactor 上分段读取间挂起。返回实际读到的字节数（对端关闭时 &lt; need，
-    /// 不足）。</summary>
+    /// 不足）。TLS 建立后从解密流读取（每次最多一个 TLS 记录，
+    /// 逐字节汇入目标缓冲，与明文路径的 tmp 汇入同一形状）。</summary>
     async int recvExact(byte[] dst, int off, int need) {
+        if (this.tls != null) {
+            int have = 0;
+            while (have < need) {
+                string chunk = await this.tls.RecvAsync(need - have);
+                int cl = chunk.Length;
+                if (cl <= 0) { return have; }
+                for (int j = 0; j < cl; j = j + 1) {
+                    dst[off + have + j] = (byte)(chunk[j] & 255);
+                }
+                have = have + cl;
+            }
+            return have;
+        }
         int got = 0;
         byte[] tmp = new byte[need + 1];
         while (got < need) {
@@ -108,11 +125,15 @@ class MySqlConnection : IDbConnection {
     }
 
     /// <summary>以给定序列号写入一个协议数据包（4 字节头 + 负载）
-    /// ，二进制安全（按长度发送）。</summary>
+    /// ，二进制安全（按长度发送）。TLS 建立后写入加密流
+    /// （头与负载合为一段明文交由 TLS 分记录）。</summary>
     internal async int writePacket(string payload, int len, int seq) {
         byte[] buf = new byte[len + 5];
         buf[0]=(byte)(len&255); buf[1]=(byte)((len>>8)&255); buf[2]=(byte)((len>>16)&255); buf[3]=(byte)(seq&255);
         for (int i = 0; i < len; i = i + 1) { buf[i+4] = (byte)(payload[i] & 255); }
+        if (this.tls != null) {
+            return await this.tls.SendAsync(buf.ToStr(0, len + 4), len + 4);
+        }
         int r = await Socket.SendAsync(this.sock, buf, len + 4);
         return r;
     }
@@ -268,7 +289,32 @@ class MySqlConnection : IDbConnection {
             string database, string user, string password) {
         Socket.Initialize();
         MySqlConnection conn = new MySqlConnection();
-        bool ok = await conn.doConnect(host, port, database, user, password);
+        bool ok = await conn.doConnect(host, port, database, user, password, false);
+        conn.connected = ok;
+        return conn;
+    }
+
+    // TLS 校验开关：默认开启——证书链与主机名都验。自签/测试服务器
+    // 可经 SetTlsVerify(false) 放宽（只加密不校验），与 HttpClient 的
+    // verifyTls 开关同一语义。
+    static bool verifyTls = true;
+
+    /// <summary>切换后续 OpenSecureParamsAsync 的证书与主机名校验。
+    /// 仅测试/开发自签场景关闭；生产保持默认开启。</summary>
+    static void SetTlsVerify(bool verify) {
+        MySqlConnection.verifyTls = verify;
+    }
+
+    /// <summary>与 <see cref="OpenParamsAsync"/> 相同，但把通道升级为
+    /// TLS（MySQL 协议的 CLIENT_SSL：SSLRequest 后整个会话加密）。
+    /// 服务器不报 CLIENT_SSL 能力时显式失败（绝不静默降级明文）；
+    /// 握手按 <paramref name="host"/> 做证书主机名校验，信任系统根。
+    /// A287①：口令与查询不再走明文信道。</summary>
+    static async MySqlConnection OpenSecureParamsAsync(string host, int port,
+            string database, string user, string password) {
+        Socket.Initialize();
+        MySqlConnection conn = new MySqlConnection();
+        bool ok = await conn.doConnect(host, port, database, user, password, true);
         conn.connected = ok;
         return conn;
     }
@@ -276,7 +322,7 @@ class MySqlConnection : IDbConnection {
     /// 完整握手与认证（协程版）：解析握手包、发送握手响应，
     /// 处理 OK / ERR / AuthMoreData（快速成功与 RSA 全量认证）/
     /// AuthSwitch。返回认证是否成功；失败原因写入 lastError。
-    internal async bool doConnect(string host, int port, string db, string user, string pw) {
+    internal async bool doConnect(string host, int port, string db, string user, string pw, bool secure) {
         this.sock = Socket.CreateTcp();
         if (this.sock < 0) { this.lastError = "socket create failed"; return false; }
         Socket.SetNonBlocking(this.sock);
@@ -325,7 +371,39 @@ class MySqlConnection : IDbConnection {
             }
             if (pluginEnd > p) { plugin = MySqlWire.bytesToStr(hs, p, pluginEnd - p); }
         }
-        // --- 构建并发送握手响应（序号 1） ---
+        // --- TLS 升级（secure=true 时）：SSLRequest(序号 1) 后整条
+        // 通道换 TLS，握手响应(序号 2)起全部走加密流。服务器不报
+        // CLIENT_SSL 即显式失败——绝不静默降级明文（A287①）。
+        int loginSeq = 1;
+        if (secure) {
+            if ((serverCaps & 2048) == 0) {
+                this.lastError = "server does not support TLS (no CLIENT_SSL)";
+                return false;
+            }
+            int sslCaps = 1 | 2 | 4 | 512 | 8192 | 32768 | 524288 | 2048;
+            if (db.Length > 0) { sslCaps = sslCaps | 8; }
+            byte[] sslreq = new byte[33];
+            sslreq[0]=(byte)(sslCaps&255); sslreq[1]=(byte)((sslCaps>>8)&255);
+            sslreq[2]=(byte)((sslCaps>>16)&255); sslreq[3]=(byte)((sslCaps>>24)&255);
+            sslreq[4]=(byte)255; sslreq[5]=(byte)255; sslreq[6]=(byte)255; sslreq[7]=(byte)0;
+            sslreq[8]=(byte)45;                          // utf8mb4_general_ci
+            int z = 9;
+            while (z < 32) { sslreq[z] = 0; z = z + 1; }
+            await this.writePacket(sslreq.ToStr(0, 32), 32, 1);
+            TlsContext tlsCtx = TlsContext.CreateClient();
+            if (tlsCtx == null) {
+                this.lastError = "TLS init failed: " + TlsStream.LastError();
+                return false;
+            }
+            if (!MySqlConnection.verifyTls) { tlsCtx.DisableVerify(); }
+            this.tls = await TlsStream.ConnectAsync(tlsCtx, this.sock, host, 15000);
+            if (this.tls == null) {
+                this.lastError = "TLS handshake failed: " + TlsStream.LastError();
+                return false;
+            }
+            loginSeq = 2;                                // greeting 0 + SSLRequest 1
+        }
+        // --- 构建并发送握手响应（明文=序号 1 / TLS=序号 2） ---
         // Capabilities: LONG_PASSWORD | LONG_FLAG | PROTOCOL_41 | TRANSACTIONS
         //             | SECURE_CONNECTION | PLUGIN_AUTH
         // CLIENT_FOUND_ROWS（2）：UPDATE/DELETE 报告匹配的行数（与
@@ -361,7 +439,7 @@ class MySqlConnection : IDbConnection {
         }
         i = 0; while (i < plugin.Length) { resp[q+i] = (byte)(plugin[i] & 255); i = i + 1; } q = q + plugin.Length;
         resp[q] = (byte)(0); q=q+1;
-        await this.writePacket(resp, respLen, 1);
+        await this.writePacket(resp, respLen, loginSeq);
         // --- 认证结果 ---
         while (true) {
             byte[] r = await this.readPacket();
@@ -378,6 +456,18 @@ class MySqlConnection : IDbConnection {
                 int more = r[1] & 255;
                 if (more == 3) { continue; }                             // fast_auth_success -> 后续跟随 OK
                 if (more == 4) {
+                    // perform_full_authentication。TLS 已建立时信道本身
+                    // 机密，按协议直接发 NUL 结尾的明文密码（0x04 请求的
+                    // 安全信道分支），无需 RSA 公钥往返；明文信道才走
+                    // RSA-OAEP(SHA-1) 加密路径。
+                    if (this.tls != null) {
+                        byte[] pwresp = new byte[pw.Length + 2];
+                        i = 0;
+                        while (i < pw.Length) { pwresp[i] = (byte)(pw[i] & 255); i = i + 1; }
+                        pwresp[pw.Length] = (byte)(0);
+                        await this.writePacket(pwresp.ToStr(0, pw.Length + 1), pw.Length + 1, this.lastSeq + 1);
+                        continue;                                    // 随后跟随 OK / ERR
+                    }
                     // perform_full_authentication：请求服务器的 RSA 公钥，
                     // 然后以 OAEP-SHA1 加密发送（密码 XOR nonce）。
                     byte[] req = new byte[2]; req[0] = 2;               // request_public_key
@@ -998,8 +1088,13 @@ class MySqlConnection : IDbConnection {
         return this.connected;
     }
 
-    /// <summary>关闭连接。</summary>
+    /// <summary>关闭连接。TLS 通道先发 close_notify 再关套接字
+    /// （TlsStream.Close 不拥有底层 fd）。</summary>
     void Close() {
+        if (this.tls != null) {
+            this.tls.Close();
+            this.tls = null;
+        }
         if (this.connected || this.sock >= 0) {
             Socket.Close(this.sock);
             this.connected = false;

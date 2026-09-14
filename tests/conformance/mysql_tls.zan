@@ -1,0 +1,488 @@
+using System;
+using System.Collections.Generic;
+using System.Data.MySql;
+using System.IO;
+using System.Net.Sockets;
+using System.Net.Tls;
+
+// A287①: the MySQL connector's CLIENT_SSL path. A live TLS-capable server is
+// not available in CI, so this program is both ends again: a fake MySQL
+// 4.1-protocol server that upgrades the socket to TLS after the SSLRequest
+// packet, and a client driving MySqlConnection.OpenSecureParamsAsync through
+// the full handshake, a query, and the two failure modes:
+//   * a server WITHOUT the CLIENT_SSL capability must be refused explicitly --
+//     the connector must never fall back to a plaintext login (the exact
+//     regression A287① closed);
+//   * a self-signed server must fail certificate verification while
+//     verification is on (the default), and pass once it is disabled.
+// The server pins the wire order on the secure path: greeting (seq 0) ->
+// SSLRequest (seq 1, 32 bytes, CLIENT_SSL bit set) -> TLS handshake ->
+// Handshake Response (seq 2, INSIDE the TLS stream) -> OK, then COM_QUERY.
+
+// ---------------------------------------------------------------- server ----
+
+class Wire {
+    byte[] buf;
+    int len;
+
+    Wire() {
+        this.buf = new byte[512];
+        this.len = 0;
+    }
+
+    void Grow(int extra) {
+        if (this.len + extra + 1 <= this.buf.Length) { return; }
+        int size = this.buf.Length * 2;
+        while (size < this.len + extra + 1) { size = size * 2; }
+        byte[] bigger = new byte[size];
+        for (int i = 0; i < this.len; i = i + 1) { bigger[i] = this.buf[i]; }
+        this.buf = bigger;
+    }
+
+    Wire U8(int v) {
+        this.Grow(1);
+        this.buf[this.len] = (byte)(v & 255);
+        this.len = this.len + 1;
+        return this;
+    }
+
+    Wire U16(int v) { return this.U8(v).U8(v >> 8); }
+
+    Wire U32(int v) { return this.U8(v).U8(v >> 8).U8(v >> 16).U8(v >> 24); }
+
+    Wire Zeros(int n) {
+        int i = 0;
+        while (i < n) { this.U8(0); i = i + 1; }
+        return this;
+    }
+
+    Wire Raw(string s) {
+        int i = 0;
+        while (i < s.Length) { this.U8(s[i] & 255); i = i + 1; }
+        return this;
+    }
+
+    /// <summary>NUL-terminated string.</summary>
+    Wire Cstr(string s) { return this.Raw(s).U8(0); }
+
+    /// <summary>Length-encoded string (short form).</summary>
+    Wire Lstr(string s) { return this.U8(s.Length).Raw(s); }
+
+    string Text() { return this.buf.ToStr(0, this.len); }
+}
+
+/// <summary>Buffered reader over a TlsStream: RecvAsync returns arbitrary
+/// record-sized chunks, while the MySQL wire needs exact frame reads. Bytes
+/// may contain NULs, so everything travels as byte buffers, never as
+/// NUL-terminated strings.</summary>
+class TlsBuf {
+    TlsStream ts;
+    byte[] buf;
+    int len;   // valid bytes in buf
+    int pos;   // consumed prefix
+
+    TlsBuf(TlsStream ts) {
+        this.ts = ts;
+        this.buf = new byte[32769];
+        this.len = 0;
+        this.pos = 0;
+    }
+
+    /// <summary>Makes at least `need` bytes available past `pos`. False on
+    /// peer close before that many arrive.</summary>
+    async bool Fill(int need) {
+        while (this.len - this.pos < need) {
+            string chunk = await this.ts.RecvAsync(16384);
+            int cl = chunk.Length;
+            if (cl <= 0) { return false; }
+            if (this.pos > 0 && this.len + cl + 1 > this.buf.Length) {
+                int rem = this.len - this.pos;
+                for (int i = 0; i < rem; i = i + 1) { this.buf[i] = this.buf[this.pos + i]; }
+                this.len = rem;
+                this.pos = 0;
+            }
+            int k = 0;
+            while (k < cl) {
+                this.buf[this.len] = (byte)(chunk[k] & 255);
+                this.len = this.len + 1;
+                k = k + 1;
+            }
+        }
+        return true;
+    }
+
+    /// <summary>One MySQL packet: 3-byte length, sequence id, payload.
+    /// Returns null on close; payload length lands in seqOut[1], the
+    /// sequence id in seqOut[0].</summary>
+    async byte[] ReadPacket(List<int> seqOut) {
+        bool gotHdr = await this.Fill(4);
+        if (!gotHdr) { return null; }
+        int plen = (this.buf[this.pos] & 255)
+            | ((this.buf[this.pos + 1] & 255) << 8)
+            | ((this.buf[this.pos + 2] & 255) << 16);
+        seqOut[0] = this.buf[this.pos + 3] & 255;
+        seqOut[1] = plen;
+        this.pos = this.pos + 4;
+        byte[] pay = new byte[plen + 1];
+        if (plen > 0) {
+            bool gotPay = await this.Fill(plen);
+            if (!gotPay) { return null; }
+            for (int i = 0; i < plen; i = i + 1) { pay[i] = this.buf[this.pos + i]; }
+            this.pos = this.pos + plen;
+        }
+        return pay;
+    }
+}
+
+class FakeMySqlTls {
+    int port;
+    bool offerTls;          // greeting advertises CLIENT_SSL
+    TlsContext serverTls;   // null with offerTls=false
+    TcpListener listener;
+
+    // ---- observations the client-side assertions read back ----
+    bool sawSslRequest;      // a well-formed SSLRequest arrived
+    int sslRequestSeq = -1;  // its sequence id (must be 1)
+    bool sslRequestHasBit;   // CLIENT_SSL set in its capability flags
+    int loginSeq = -1;       // sequence of the (encrypted) Handshake Response
+    bool sawDowngrade;       // a plaintext Handshake Response on a no-TLS port
+    int queries;             // COM_QUERY served over TLS
+
+    FakeMySqlTls(int port, bool offerTls, TlsContext serverTls) {
+        this.port = port;
+        this.offerTls = offerTls;
+        this.serverTls = serverTls;
+        this.listener = null;
+        this.sawSslRequest = false;
+        this.sslRequestSeq = -1;
+        this.sslRequestHasBit = false;
+        this.loginSeq = -1;
+        this.sawDowngrade = false;
+        this.queries = 0;
+    }
+
+    void Stop() {
+        if (this.listener != null) { this.listener.Stop(); }
+    }
+
+    async void Serve() {
+        this.listener = new TcpListener("127.0.0.1", this.port);
+        this.listener.Start();
+        while (true) {
+            nint client = await this.listener.AcceptAsync();
+            if (client < 0) { return; }
+            Task.Spawn(this.Session(client));
+        }
+    }
+
+    async void Session(nint sock) {
+        // Handshake v10: enough of it for the driver's parser. offerTls adds
+        // CLIENT_SSL (2048) to the low capability word.
+        Wire hs = new Wire();
+        hs.U8(10).Cstr("8.0.0-zan-fake").U32(1);
+        hs.Raw("ABCDEFGH").U8(0);                       // salt part 1 + filler
+        int capLow = 512 | 32768;                       // PROTOCOL_41 | SECURE_CONNECTION
+        if (this.offerTls) { capLow = capLow | 2048; }
+        hs.U16(capLow);
+        hs.U8(45);                                      // charset
+        hs.U16(2);                                      // status flags
+        hs.U16(8);                                      // high word: PLUGIN_AUTH
+        hs.U8(21);                                      // auth-plugin-data length
+        hs.Zeros(10);
+        hs.Raw("IJKLMNOPQRST").U8(0);                   // salt part 2
+        hs.Cstr("mysql_native_password");
+        int _hs = await this.SendPlain(sock, hs, 0);
+
+        if (!this.offerTls) {
+            // The connector must refuse here WITHOUT sending its handshake
+            // response in the clear. Whatever arrives (normally just the
+            // close) is recorded for the assertion.
+            List<int> seq = new List<int>(); seq.Add(0); seq.Add(0);
+            byte[] leaked = await this.RecvPlain(sock, seq);
+            if (leaked != null) { this.sawDowngrade = true; }
+            Socket.Close(sock);
+            return;
+        }
+
+        // SSLRequest: 4-byte header + exactly 32 payload bytes, sequence 1.
+        List<int> sseq = new List<int>(); sseq.Add(0); sseq.Add(0);
+        byte[] sslreq = await this.RecvPlain(sock, sseq);
+        if (sslreq != null && sseq[1] == 32) {
+            this.sawSslRequest = true;
+            this.sslRequestSeq = sseq[0];
+            int caps = (sslreq[0] & 255) | ((sslreq[1] & 255) << 8);
+            this.sslRequestHasBit = (caps & 2048) != 0;
+        }
+        TlsStream ts = await TlsStream.AcceptAsync(this.serverTls, sock);
+        if (ts == null) {
+            // Expected when the client aborts on certificate verification.
+            Socket.Close(sock);
+            return;
+        }
+
+        // From here on the session lives inside TLS. The Handshake Response
+        // must arrive with sequence 2 (greeting 0 + SSLRequest 1).
+        TlsBuf r = new TlsBuf(ts);
+        List<int> lseq = new List<int>(); lseq.Add(0); lseq.Add(0);
+        byte[] login = await r.ReadPacket(lseq);
+        if (login == null) { ts.Close(); Socket.Close(sock); return; }
+        this.loginSeq = lseq[0];
+        Wire ok = new Wire();
+        ok.U8(0).U8(0).U8(0).U16(2).U16(0);
+        int _ok = await this.SendTls(ts, ok, lseq[0] + 1);
+
+        while (true) {
+            List<int> seq = new List<int>(); seq.Add(0); seq.Add(0);
+            byte[] cmd = await r.ReadPacket(seq);
+            if (cmd == null) { break; }
+            int op = cmd[0] & 255;
+            if (op == 1) { break; }                     // COM_QUIT
+            if (op == 3) {                              // COM_QUERY
+                await this.AnswerText(ts);
+            }
+        }
+        ts.Close();
+        Socket.Close(sock);
+    }
+
+    async void AnswerText(TlsStream ts) {
+        this.queries = this.queries + 1;
+        int _c = await this.SendTls(ts, FakeMySqlTls.Count(1), 1);
+        int _d = await this.SendTls(ts, FakeMySqlTls.Column("n", 3), 2);
+        int _e = await this.SendTls(ts, FakeMySqlTls.Eof(), 3);
+        Wire row = new Wire();
+        row.Lstr("7");
+        int _r = await this.SendTls(ts, row, 4);
+        int _f = await this.SendTls(ts, FakeMySqlTls.Eof(), 5);
+    }
+
+    static Wire Count(int n) {
+        Wire w = new Wire();
+        w.U8(n);
+        return w;
+    }
+
+    static Wire Eof() {
+        Wire w = new Wire();
+        w.U8(254).U16(0).U16(2);
+        return w;
+    }
+
+    /// <summary>Column definition packet (protocol 41). 3 = MYSQL_TYPE_LONG.</summary>
+    static Wire Column(string name, int type) {
+        Wire w = new Wire();
+        w.Lstr("def").Lstr("app").Lstr("note").Lstr("note");
+        w.Lstr(name).Lstr(name);
+        w.U8(12);                    // length of the fixed-length fields
+        w.U16(45);                   // charset
+        w.U32(64);                   // column length
+        w.U8(type);
+        w.U16(0);                    // flags (signed)
+        w.U8(0);                     // decimals
+        w.U16(0);                    // filler
+        return w;
+    }
+
+    async int SendPlain(nint sock, Wire w, int seq) {
+        byte[] hdr = new byte[5];
+        hdr[0] = (byte)(w.len & 255);
+        hdr[1] = (byte)((w.len >> 8) & 255);
+        hdr[2] = (byte)((w.len >> 16) & 255);
+        hdr[3] = (byte)(seq & 255);
+        int a = await Socket.SendAsync(sock, hdr, 4);
+        int b = await Socket.SendAsync(sock, w.buf, w.len);
+        return a + b;
+    }
+
+    async byte[] RecvPlain(nint sock, List<int> seqOut) {
+        byte[] hdr = new byte[5];
+        int got = await this.RecvExact(sock, hdr, 4);
+        if (got < 4) { return null; }
+        int len = (hdr[0] & 255) | ((hdr[1] & 255) << 8) | ((hdr[2] & 255) << 16);
+        seqOut[0] = hdr[3] & 255;
+        seqOut[1] = len;
+        byte[] pay = new byte[len + 1];
+        if (len > 0) {
+            int g2 = await this.RecvExact(sock, pay, len);
+            if (g2 < len) { return null; }
+        }
+        return pay;
+    }
+
+    async int RecvExact(nint sock, byte[] dst, int need) {
+        int have = 0;
+        byte[] tmp = new byte[need + 1];
+        while (have < need) {
+            int n = await Socket.RecvIntoAsync(sock, tmp, need - have);
+            if (n <= 0) { return have; }
+            int i = 0;
+            while (i < n) { dst[have + i] = tmp[i]; i = i + 1; }
+            have = have + n;
+        }
+        return have;
+    }
+
+    async int SendTls(TlsStream ts, Wire w, int seq) {
+        byte[] pkt = new byte[w.len + 5];
+        pkt[0] = (byte)(w.len & 255);
+        pkt[1] = (byte)((w.len >> 8) & 255);
+        pkt[2] = (byte)((w.len >> 16) & 255);
+        pkt[3] = (byte)(seq & 255);
+        for (int i = 0; i < w.len; i = i + 1) { pkt[i + 4] = w.buf[i]; }
+        return await ts.SendAsync(pkt.ToStr(0, w.len + 4), w.len + 4);
+    }
+}
+
+// ---------------------------------------------------------------- client ----
+
+class Program {
+    static int failures = 0;
+
+    static string CA_CERT = "-----BEGIN CERTIFICATE-----\n"
+        + "MIIDDTCCAfWgAwIBAgIUb/bsPNHjOsVxStVQV+eCJLvKtSEwDQYJKoZIhvcNAQEL\n"
+        + "BQAwFjEUMBIGA1UEAwwLWmFuIFRlc3QgQ0EwHhcNMjYwODA2MTcxMTI0WhcNMzYw\n"
+        + "ODAzMTcxMTI0WjAWMRQwEgYDVQQDDAtaYW4gVGVzdCBDQTCCASIwDQYJKoZIhvcN\n"
+        + "AQEBBQADggEPADCCAQoCggEBAK0xBdnDn6QVIaiCyPqPM3TDnomvnz3XrwUG54Kj\n"
+        + "13vQfAbuxcg/0zkrr/yxOxJRcnkh4TPzm6i98ITem6kqw7ApO7XPXBOhe/Z5OdOp\n"
+        + "ouBnQMcxgo9CqOKSqfJ9YoYdOrTxve/SiO0AHjEKaDLph8GsPynGEHftr9uRZm9H\n"
+        + "qn08QjJDxtDiyn9xil+7ZMj1eNQuvKMDRTIgO4f37+JbIFRYoaZ8Zu2aRyf05Can\n"
+        + "SyC6/g912iOgr3NS1JQuAQAe5+lAZrLgi3EAW3S4mjFJCfJpBngzC+wIuzJTFxCA\n"
+        + "wsA+PmQtPE1g8c+L24cZxfPzT0BedYH1jbu+HSz2VbUTbVUCAwEAAaNTMFEwHQYD\n"
+        + "VR0OBBYEFJ4qKfHGlmX+d/aJQBMFLs6jiEWUMB8GA1UdIwQYMBaAFJ4qKfHGlmX+\n"
+        + "d/aJQBMFLs6jiEWUMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggEB\n"
+        + "AAwPQAF56rKoGJ1d5bdAP/IqpNoRwKcUL/tbNMDxaLCV29/RvXTK5pneOB2YnyHd\n"
+        + "RSUu+OBqc/KOl8f2WMmGWU+XpIHunBO9sikazAEy4TZQTob47nlI7s4x9Q3OETRm\n"
+        + "S1FGeF2lLwcjD5qXrWNLKxP5ZLz7dmlk2qii6pEym1huaQy4352UY5WheS9ofTl0\n"
+        + "JA4PFXhJqJLMFSrbz5IY00N3QPou99EWh9AFcaxksCOajtp7drG/VZEegDhhAGWa\n"
+        + "iJHZaakLuy1uXinh9EpHxOuJ43+TmW+JN7ktlPXML0PFl+DubwDtmnux6fOdRM89\n"
+        + "XyzocGB8jnk9l+9BX6qY1rU=\n"
+        + "-----END CERTIFICATE-----\n";
+
+    static string SERVER_CERT = "-----BEGIN CERTIFICATE-----\n"
+        + "MIIDGDCCAgCgAwIBAgIUaqrty6rrTvVQ2rRAeBvfwNJolBUwDQYJKoZIhvcNAQEL\n"
+        + "BQAwFjEUMBIGA1UEAwwLWmFuIFRlc3QgQ0EwHhcNMjYwODA2MTcxMTMyWhcNMzYw\n"
+        + "ODAzMTcxMTMyWjAYMRYwFAYDVQQDDA13cm9uZy5leGFtcGxlMIIBIjANBgkqhkiG\n"
+        + "9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqvgmHOa4fI0bR4y48uabV+hkIfiIMMQgMVGE\n"
+        + "6QdVXCQjGTbjavVhr655UkoPmA/g+8Lj+KKGCq3MpGSuIxRvWgp/Syl2O77l7Amd\n"
+        + "SdlidgLvlUg5h4hlnqIWLNxpiGF6TMIoyJ4ohWMqKuuIAPoeWF933yuSWsorG4fz\n"
+        + "FqUJi5zpfrVz9QGbz4cpOJXguuk6r8BzonL8mMqSglcyoiPearaYQWOSpohriCug\n"
+        + "p8PpGKskOKD8OBaKdvTc+e05Stsbgj+MCDkKSgLPi3IXDUPHS66MLVyOX4gNk7w+\n"
+        + "evhPCJJQtkr1wPHd9zFB9I98eZMwQzmEdqvDFeoYe6FUrFGqyQIDAQABo1wwWjAY\n"
+        + "BgNVHREEETAPgg13cm9uZy5leGFtcGxlMB0GA1UdDgQWBBSGH7lrfqpCUMF/8UYv\n"
+        + "LVX/XVGLFDAfBgNVHSMEGDAWgBSeKinxxpZl/nf2iUATBS7Oo4hFlDANBgkqhkiG\n"
+        + "9w0BAQsFAAOCAQEAN5byRoBRRJguzdZFJOOrwQxy47rNrnoKdL9QXV4s5XcRF5ZC\n"
+        + "K3pueEdmQMW4CgOJ38F03e3Fd8SF/d73pNimoeOUmjrDNC83GFPYsweiL4PNCqDU\n"
+        + "PKoixouw0gdl2eHUWg7qd+aTNVg2F2rFDcHzQu0/tQNSkHVmKC5ZIT4OjWt9IOjl\n"
+        + "bMT3/Bog5jXwKPMLdfMj8Z3J4432DE797PxY7UN9I+fXgTtj4AUQeR1BAi2jh7L8\n"
+        + "fIY9E5BPmY3+jNX0TEXiDYj6uKokXbx4N82ksSBAovOXPgiUYqRbmPlpyd7l5YE1\n"
+        + "XcaVSekej9G4zp6CQVO8o32S7vcVG3/giNJPRg==\n"
+        + "-----END CERTIFICATE-----\n";
+
+    static string SERVER_KEY = "-----BEGIN PRIVATE KEY-----\n"
+        + "MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCq+CYc5rh8jRtH\n"
+        + "jLjy5ptX6GQh+IgwxCAxUYTpB1VcJCMZNuNq9WGvrnlSSg+YD+D7wuP4ooYKrcyk\n"
+        + "ZK4jFG9aCn9LKXY7vuXsCZ1J2WJ2Au+VSDmHiGWeohYs3GmIYXpMwijIniiFYyoq\n"
+        + "64gA+h5YX3ffK5Jayisbh/MWpQmLnOl+tXP1AZvPhyk4leC66TqvwHOicvyYypKC\n"
+        + "VzKiI95qtphBY5KmiGuIK6Cnw+kYqyQ4oPw4Fop29Nz57TlK2xuCP4wIOQpKAs+L\n"
+        + "chcNQ8dLrowtXI5fiA2TvD56+E8IklC2SvXA8d33MUH0j3x5kzBDOYR2q8MV6hh7\n"
+        + "oVSsUarJAgMBAAECggEAKZ3dYygbTMApXYWI6KGPOzsHkshVWG+JOZATFwkws0zd\n"
+        + "mU/l1D2WUYYaJJiACr8EwCvcw8NF9xf+yh5yz/mzsDqBaVmWnOz3OTlO5vDKOZk1\n"
+        + "2gP6cv4V5GMmnDVr3+WAeGpDtK/hA7UTiN6L3NcFZ3QXsQSBa+Wt0BYL611xgSDj\n"
+        + "IkI7sBvBX6/wQNHyvJ+Y4fykOjjfrbL3PQ0PQ/Ap9fXNXyL6pT8qj35Xy0x3FqK1\n"
+        + "ign28D4VN8mbpd9rUtT6/UNDVZksDOBHsUoweIZo85nIX7r0vtvD7uSl3RElTGId\n"
+        + "QMdavaRMQdQ7hGlB/CB6k85pZs+jrUT7DV5dI0evzQKBgQDeEC9Y9dUVBmkPKIR5\n"
+        + "zRIkhn6D8d/gbsOwy22VuvkbvrzX8NtLWfh4teUu7uLeYCo2LuryPlcUKOjUWgt2\n"
+        + "9O2CfvyqJ40AQ1IdvYa/fWQoq/ZTURG8iRfhtuk+e1dshEvmidE0VkWoao1cfEHX\n"
+        + "V8Yjefm3xAPoXMS4nf6mPZq4vQKBgQDFGQJq2/FbJlDZP0nHluDGa5roWKMotDuT\n"
+        + "BZeV6hW0MOdoYkZueaNv6YiNBDq8j27/gnKUgmYry38K1+kGg1JA+hP+i2Rfhp5k\n"
+        + "MrTzAXBU02eNYsvTNWshvPgGdUu5NtoQiOQLjDP95R4fsAPy9rbde1v/4q5MMBEQ\n"
+        + "uwCmmVr4/QKBgDgOneU3KbNFCwBomgilXA8cZJOqW3msfHoE4IULzhbS75kTlEhR\n"
+        + "Tggq4tAWPe8lF4LWFTlRw2mzahMxJ/O/oLVwmRfbJB0M4Y3gakOsw7wArQ4bSP7v\n"
+        + "HLg+FGNRf6BFRWPNJqKvpKX/P/A47eYOolYSVJevQ81EneR8/eu5YXWBAoGAdsKg\n"
+        + "C0Vlw7dtpcmVqjbGT6jM2U13WnJnJyqKcSFwXHfPJ713lN+kVC2SQu4WekGu7zRp\n"
+        + "2AROjfr7HMyGM49zQ4WsAId7Pnf9/n/zOi1WwzXywmWSTTx1xgl4JWQN8ZcUhDwH\n"
+        + "tNGRDl487XkAmCiCfSf0glXTEkMwNTWIqdnjz/0CgYBlyCdFzOlAC3i5cp3EWYe6\n"
+        + "VFFUCu2Tfikd4ZKu2uouZ+k4DHVwndYpzngS7OUbR1ex2wKI3Ejp3Hs49GNLp5cT\n"
+        + "Q6OqvBbq2uSBiQt5RRxXVmZObNJkKv+WcUy/fIb979ctVZy41wbsQ/HiErj4Np23\n"
+        + "xBYhnJesc1G+4gj4EjhgLQ==\n"
+        + "-----END PRIVATE KEY-----\n";
+
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        // 写出 PEM 文件到 _scratch/（git-ignored）：写当前目录会在仓库根
+        // 残留 .pem（用例中途失败时不清理）。
+        Directory.CreateDirectory("_scratch");
+        File.WriteAllText("_scratch/mysql_tls_server_cert.pem", SERVER_CERT);
+        File.WriteAllText("_scratch/mysql_tls_server_key.pem", SERVER_KEY);
+        TlsContext serverTls = TlsContext.CreateServer(
+            "_scratch/mysql_tls_server_cert.pem", "_scratch/mysql_tls_server_key.pem");
+        Check(serverTls != null, "server ctx created");
+        if (serverTls == null) {
+            Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+            return 0;
+        }
+
+        FakeMySqlTls secure = new FakeMySqlTls(43307, true, serverTls);
+        FakeMySqlTls plain = new FakeMySqlTls(43308, false, null);
+        Task.Spawn(secure.Serve());
+        Task.Spawn(plain.Serve());
+        await Task.Delay(80);
+
+        // 场景 1：正路径——SSLRequest 后整条信道换 TLS，查询原样可用。
+        MySqlConnection.SetTlsVerify(false);
+        MySqlConnection db = await MySqlConnection.OpenSecureParamsAsync(
+            "127.0.0.1", 43307, "app", "u", "p");
+        Check(db.IsConnected(), "secure connect");
+        Check(secure.sawSslRequest, "SSLRequest arrived");
+        Check(secure.sslRequestSeq == 1, "SSLRequest used sequence 1");
+        Check(secure.sslRequestHasBit, "SSLRequest set CLIENT_SSL");
+        Check(secure.loginSeq == 2, "handshake response entered TLS at seq 2");
+        DbResult r = await db.QueryAsync("select 7 as n");
+        Check(r.RowCount() == 1, "one row over TLS");
+        Check(r.GetString(0, 0) == "7", "row value survived the tunnel");
+        Check(secure.queries == 1, "server served one query");
+        db.Close();
+
+        // 场景 2：默认校验开启 + 自签证书 → 握手必须失败（不静默放行）。
+        MySqlConnection.SetTlsVerify(true);
+        MySqlConnection strict = await MySqlConnection.OpenSecureParamsAsync(
+            "127.0.0.1", 43307, "app", "u", "p");
+        Check(!strict.IsConnected(), "self-signed rejected while verifying");
+        Check(strict.GetError().IndexOf("TLS") >= 0, "verify failure mentions TLS");
+        strict.Close();
+
+        // 场景 3：服务器不报 CLIENT_SSL → 显式失败，绝不明文登录。
+        MySqlConnection.SetTlsVerify(false);
+        MySqlConnection plainDb = await MySqlConnection.OpenSecureParamsAsync(
+            "127.0.0.1", 43308, "app", "u", "p");
+        Check(!plainDb.IsConnected(), "no-TLS server refused");
+        Check(plainDb.GetError().IndexOf("TLS") >= 0, "refusal mentions TLS");
+        Check(!plain.sawDowngrade, "no plaintext handshake response sent");
+        plainDb.Close();
+
+        secure.Stop();
+        plain.Stop();
+        serverTls.Free();
+        Socket.Cleanup();
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+        // 停服后留几个泵转：accept 协程以 -1 复位并退出，退出时的
+        // 泄漏探测才不会把服务端对象链记为仍可达。
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}
+
