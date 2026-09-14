@@ -2722,9 +2722,12 @@ P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
     绘制，运行时形态 = FormBuilder.Build(设计 JSON)，演示卡按此喂
     迷你表单；BandGrid 热力图不设 Heat 即与底色融为一体；Trend
     量程是原始计数（位号 scale=10 时 0..100 装不下 1520）。
-  - **挂账**：① 词法器字符串字面量 4095 上限（src/compiler/lexer.c
-    栈缓冲 char buf[4096]）——大 data-uri 属性靠 GenForm EmitSetProp
-    分块发射绕开，根治需堆化；② 符号索引把 .html 当 Zan 源扫描，
+  - **挂账（① 已修 2026-09-14，df10f8b5）**：① 词法器字符串字面量
+    4095 上限已摘除——lexer_string/插值段/verbatim 三路径的栈缓冲
+    char buf[4096] 改 zan_lex_strbuf_t 堆生长（4KiB 起倍增；OOM 退化为
+    诊断+截断，转义解码始终执行防反同步），GenForm EmitSetProp 分块
+    发射可保留（兼容不依赖）；conformance big_string_literals（1 万/
+    10 万字节 + 转义/插值混排）4 孪生绿；② 符号索引把 .html 当 Zan 源扫描，
     报 `<unknown>:N:M: unexpected character` 非致命噪音（构建
     exit=0），应在索引侧跳过设计文档。
 * **雷达车道已修（2026-09-13 第二批）**：根因三个——①radar 系列的
