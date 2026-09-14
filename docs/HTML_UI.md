@@ -90,8 +90,11 @@ h.Add("submit", () => { ... });
 click→Click、dblclick/doubleclick→DoubleClick、
 rightclick/contextmenu→RightClick、mousedown/mouseup、
 mouseenter/mouseover→Enter、mouseleave/mouseout→Leave、wheel→Wheel、
-focus/blur、keydown/keyup/keypress。未映射的后缀与未注册的名字都
-**静默不接线**——HTML 是声明，名字打错表现为没反应而非崩溃。
+focus/blur、keydown/keyup/keypress。未映射的后缀与未注册的名字不接线
+也不崩溃，但**装载期各打一行 `HTML_WIRE_WARN` 警告**（未知后缀点名
+控件；名字未注册点名事件与控件）——"点了没反应"从静默变成可发现的
+事实。注意处理器在装载之后才注册的宿主（ChildWindow 二次接线）不受
+影响：名字已落控件，那路命中照样接。
 
 接线走 `Control.BindEvent`（多态）——Button 把 "Click" 路由到专属
 `Click` 字段（与 `btn.Click += h` 同队列）。断言事件数时按控件实际
@@ -271,8 +274,11 @@ font-size/transition）完全生效，不受几何影响。这是对浏览器 "i
 
 ## 与浏览器的差异清单（台账）
 
-- **select 没有下拉语义**：映射 Element 占位（容器盒），选项当文本。
-  真下拉待后续期（复用 SelectBox）。
+- **select 有真下拉语义**：`<select><option>` 运行时映射 `SelectBox`
+  （option 文本折 `a|b|c` options、`selected` 属性定选中下标、无
+  selected 显示首项），与设计稿通道（`SelectBox→select` 往返）同形；
+  change 经 `data-on-change` 接 Change 槽。多选/级联/表格式下拉仍是
+  纯代码形态。
 - **行内样式是类级特异性**：style 属性合成 `.zgen-N` 规则参与级联，
   不是浏览器的 inline style 特异性（高于任何选择器）。与 id/类选择器
   的先后按"appCss 段内出现顺序"结算；`!important` 可覆盖。

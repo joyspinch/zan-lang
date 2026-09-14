@@ -80,7 +80,7 @@ class Html {
         doc.gen = 0;
         List<Control> built = new List<Control>();
         for (int i = 0; i < wd.nodes.Count; i = i + 1) {
-            built.Add(Html.Build(wd.nodes[i], doc, handlers));
+            built.Add(Html.Build(wd, wd.nodes[i], doc, handlers));
         }
         // 装配：逐父按 items 文档序走一遍——AddText 与 AddChild 的
         // 交错顺序就是 HTML 的行内内容顺序（混排行盒依赖）。
@@ -104,7 +104,7 @@ class Html {
 
     /// 一条记录 → 一个控件（构造 + 属性协议）。容器自己的文本不在这
     /// 里加——装配阶段按 items 文档序与子控件交错加入。
-    static Control Build(WNode n, HtmlDoc doc, HtmlHandlers handlers) {
+    static Control Build(WDoc wd, WNode n, HtmlDoc doc, HtmlHandlers handlers) {
         string tag = n.tag;
         string id = HtmlText.Attr(n.attrNames, n.attrVals, "id");
         string type = HtmlText.Attr(n.attrNames, n.attrVals,
@@ -135,6 +135,44 @@ class Html {
                           HtmlText.Attr(n.attrNames, n.attrVals, "alt"),
                           "cover");
             c = img;
+        } else if (tag == "select") {
+            // 浏览器语义：<option> 文本即候选，selected 属性标选中项，
+            // 无任何 selected 时显示首项——与设计稿通道（DesignerHtml
+            // 折 "a|b|c" options + value 下标）同一折叠规则，运行时
+            // 与生成器在 <select> 上产出同形控件。
+            SelectBox sb = new SelectBox();
+            string opts = "";
+            int selIdx = 0 - 1;
+            int oi = 0;
+            for (int i = 0; i < n.items.Count; i = i + 1) {
+                WItem it = n.items[i];
+                if (it.kid < 0) { continue; }
+                WNode cn = wd.nodes[it.kid];
+                if (cn.tag != "option") { continue; }
+                string ot = cn.text;
+                if (ot == "") {
+                    for (int k = 0; k < cn.items.Count; k = k + 1) {
+                        WItem cit = cn.items[k];
+                        if (cit.kid >= 0 || cit.text == "") { continue; }
+                        ot = ot + cit.text;
+                    }
+                }
+                ot = ot.Trim();
+                for (int q = 0; q < cn.attrNames.Count; q = q + 1) {
+                    if (cn.attrNames[q] == "selected") { selIdx = oi; }
+                }
+                if (ot != "") {
+                    if (oi > 0) { opts = opts + "|"; }
+                    opts = opts + ot;
+                }
+                oi = oi + 1;
+            }
+            if (opts != "") { sb.SetProp("options", opts); }
+            if (selIdx < 0 && opts != "") { selIdx = 0; }
+            // value 是 PropSpec 常量槽（写它不动 selected），选中走
+            // Select（-1 清除、程序化赋值不触发 Change）。
+            if (selIdx >= 0) { sb.Select(selIdx); }
+            c = sb;
         } else {
             Element el = new Element();
             el.InitElement(tag, id);
@@ -195,6 +233,13 @@ class Html {
                     } else {
                         Html.Wire(handlers, c, evt, v);
                     }
+                } else {
+                    // 未知后缀 = 拼错的事件名（如 data-on-clic），此前
+                    // 静默不接线、表现为“点了没反应”。控制台一行警告
+                    // 把它变成可发现的事实（对照 EventKind 支持表）。
+                    Console.WriteLine("HTML_WIRE_WARN unknown event '"
+                        + suffix + "' on <" + n.tag + (id != ""
+                            ? " id=" + id : "") + ">");
                 }
                 continue;
             }
@@ -322,6 +367,14 @@ class Html {
         if (handlers == null) { return; }
         Action a = handlers.Find(name);
         if (a != null) { c.BindEvent(evt, a); }
+        else {
+            // 名字没注册 = 处理器漏写/拼错（宿主侧）——同一“点了没
+            // 反应”家族，同样一行警告点名。注册表晚于装载补充的
+            // 二次接线（ChildWindow.WireNode）不受影响：名字已落
+            // 控件，那路命中照样接。
+            Console.WriteLine("HTML_WIRE_WARN handler '" + name
+                + "' not registered (" + evt + " on " + c.name + ")");
+        }
     }
 
     /// 带参接线（`data-arg`）：按名查带参槽，把实参闭包进无参
