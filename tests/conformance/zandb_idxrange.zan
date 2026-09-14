@@ -1,0 +1,129 @@
+using System;
+using System.Data.ZanDb;
+using System.Json;
+
+// ZanDB secondary-index range queries: FindIdsByFieldRange answers from
+// the ordered index (covering, zero document reads) with an upper bound
+// pinned after the \t separator — "c1" must not pull in "c10".
+// Falls back to a single-field streaming scan when no index exists.
+// Range comparison is ORDINAL on the AsString form ("9" > "20").
+class Program {
+    static int pass = 0;
+    static int fail = 0;
+
+    static void Check(string name, bool ok) {
+        if (ok) { pass = pass + 1; }
+        else { fail = fail + 1; Console.WriteLine("FAIL " + name); }
+    }
+
+    static string Join(List<int> ids) {
+        string s = "";
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            if (i > 0) { s = s + ","; }
+            s = s + Convert.ToString(ids[i]);
+        }
+        return s;
+    }
+
+    static JsonValue Doc(string cat, string name) {
+        JsonValue u = JsonValue.NewObject();
+        u.Put("cat", JsonValue.NewStr(cat));
+        u.Put("name", JsonValue.NewStr(name));
+        return u;
+    }
+
+    static async int Run() {
+        string basePath = "zandb_idxrange.tmp.db";
+        File.Delete(basePath);
+        File.Delete(basePath + ".m0");
+        File.Delete(basePath + ".m1");
+        for (int i = 0; i < 8; i = i + 1) {
+            string seg = basePath + ".s" + Convert.ToString(i);
+            if (File.Exists(seg)) { File.Delete(seg); }
+        }
+
+        ZanDatabase db = ZanDatabase.Open(basePath, 64);
+        Check("open", db.IsOpen());
+        Collection docs = db.GetCollection("docs");
+
+        // 种子：cat ∈ {c1, c3, c10, c2, c9}（id 1..5）+ age 数值文档。
+        int i1 = docs.Insert(Doc("c1", "n1"));
+        int i3 = docs.Insert(Doc("c3", "n3"));
+        int i10 = docs.Insert(Doc("c10", "n10"));
+        int i2 = docs.Insert(Doc("c2", "n2"));
+        int i9 = docs.Insert(Doc("c9", "n9"));
+        JsonValue ageDoc = JsonValue.NewObject();
+        ageDoc.Put("cat", JsonValue.NewStr("c1"));
+        ageDoc.Put("age", JsonValue.NewNum("9"));
+        int iAge9 = docs.Insert(ageDoc);
+        JsonValue ageDoc2 = JsonValue.NewObject();
+        ageDoc2.Put("cat", JsonValue.NewStr("c3"));
+        ageDoc2.Put("age", JsonValue.NewNum("20"));
+        int iAge20 = docs.Insert(ageDoc2);
+
+        // 1. 无索引：流式扫描回退路径。
+        //    序数语义：["c1","c2"] 按字典序含 c1,c10,c2（"c10"<"c2"）。
+        List<int> r1 = docs.FindIdsByFieldRange("cat", "c1", "c2");
+        Check("noscan-ordinal", r1.Count == 4 && r1[0] == i1 && r1[1] == i10 && r1[2] == i2 && r1[3] == iAge9);
+        //    "c1" 到 "c1"：只 c1 本值——上界不能放进 "c10"。
+        List<int> r2 = docs.FindIdsByFieldRange("cat", "c1", "c1");
+        Check("noscan-exact-no-extend", r2.Count == 2 && r2.Contains(i1) && r2.Contains(iAge9));
+        Check("noscan-empty", docs.FindIdsByFieldRange("cat", "x1", "x9").Count == 0);
+        //    数值字段的序数语义："9" > "20"（"9">"2"），不在 [10,20] 内。
+        List<int> r3 = docs.FindIdsByFieldRange("age", "10", "20");
+        Check("noscan-num-ordinal", r3.Count == 1 && r3[0] == iAge20);
+        //    无下界：hi="c2" → c1,c10,c2；无上界：lo="c3" → c3,c9。
+        List<int> r4 = docs.FindIdsByFieldRange("cat", "", "c2");
+        Check("noscan-openlo", r4.Count == 4 && r4[0] == i1 && r4[1] == i10 && r4[2] == i2 && r4[3] == iAge9);
+        List<int> r5 = docs.FindIdsByFieldRange("cat", "c3", "");
+        Check("noscan-openhi", r5.Count == 3 && r5[0] == i3 && r5[1] == i9 && r5[2] == iAge20);
+
+        // 2. 建索引后：覆盖索引路径，同语义、不同顺序（值,id）序。
+        docs.EnsureIndex("cat");
+        List<int> r6 = docs.FindIdsByFieldRange("cat", "c1", "c1");
+        Check("idx-exact-no-extend", r6.Count == 2 && r6.Contains(i1) && r6.Contains(iAge9));
+        //    序数 [c1,c2]：值序 c1 < c10 < c2；值内按 id。逐值核对：
+        List<int> r7 = docs.FindIdsByFieldRange("cat", "c1", "c2");
+        Check("idx-ordinal-count", r7.Count == 4);  // c1×2(含 age9)、c10、c2
+        Check("idx-has-c10", r7.Contains(i10));
+        Check("idx-has-c2", r7.Contains(i2));
+        //    两端都钉死的等值范围 = 等值查询。
+        List<int> r8 = docs.FindIdsByFieldRange("cat", "c3", "c3");
+        Check("idx-eq", r8.Count == 2 && r8.Contains(i3) && r8.Contains(iAge20));
+        //    无下界/无上界走索引端点。
+        List<int> r9 = docs.FindIdsByFieldRange("cat", "", "c1");
+        Check("idx-openlo", r9.Count == 2 && r9.Contains(i1) && r9.Contains(iAge9));
+        List<int> r10 = docs.FindIdsByFieldRange("cat", "c9", "");
+        Check("idx-openhi", r10.Count == 1 && r10[0] == i9);
+        Check("idx-empty-range", docs.FindIdsByFieldRange("cat", "x1", "x9").Count == 0);
+
+        // 3. 删除后两条路径一致。
+        docs.DeleteById(i10);
+        Check("idx-after-del", docs.FindIdsByFieldRange("cat", "c1", "c2").Count == 3);
+        Check("noscan-gone", docs.FindIdsByFieldRange("nosuchfield", "a", "z").Count == 0);
+
+        db.Close();
+
+        // 4. 重开：冷缓存下索引路径照常。
+        ZanDatabase db2 = ZanDatabase.Open(basePath, 64);
+        Collection docs2 = db2.GetCollection("docs");
+        List<int> r11 = docs2.FindIdsByFieldRange("cat", "c1", "c1");
+        Check("reopen-range", r11.Count == 2 && r11.Contains(i1) && r11.Contains(iAge9));
+        db2.Close();
+
+        File.Delete(basePath);
+        File.Delete(basePath + ".m0");
+        File.Delete(basePath + ".m1");
+        for (int i = 0; i < 8; i = i + 1) {
+            string seg = basePath + ".s" + Convert.ToString(i);
+            if (File.Exists(seg)) { File.Delete(seg); }
+        }
+        Console.WriteLine("pass: " + Convert.ToString(pass));
+        Console.WriteLine("fail: " + Convert.ToString(fail));
+        return 0;
+    }
+
+    static async void Main() {
+        int r = await Run();
+    }
+}

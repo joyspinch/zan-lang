@@ -1012,6 +1012,53 @@ class Collection {
         return ids;
     }
 
+    /// <summary>字段值落在 [lo, hi]（双端含）的所有文档 id。
+    /// 索引就绪时走索引键序范围扫（覆盖索引，一个文档都不读，
+    /// 成本与等值覆盖查询同量级），结果按（值, id）序；无索引则
+    /// 流式扫描按 id 序。比较语义：字段值 AsString 形态的**序数**
+    /// 比较——数字按十进制文本比（"9" &gt; "20"），范围端点与索引
+    /// 值不应含 &lt; \t 的控制字符。lo 为空串 = 无下界，hi 为空串 =
+    /// 无上界。</summary>
+    List<int> FindIdsByFieldRange(string field, string lo, string hi) {
+        SyncMeta();
+        List<int> ids = new List<int>();
+        int kid = KeyIdOf(field);
+        if (kid == 0) { return ids; }
+        if (HasIndex(field) && !this.kv.Contains(IdxPosKey(field))) {
+            string head = "i:" + this.name + ":" + Collection.PadId(kid) + ":";
+            string startKey = head + lo + "\t";
+            string endKey;
+            if (hi.Length > 0) {
+                // 上界钉在 \t 后的 6 个 '~'（id 段每字符 ≤ '~'）：
+                // 收尽 hi 本值的全部条目，且不放进 hi 的任何扩展值
+                //（"c1" 不放进 "c10"——'\t'(9) < '0'(48)）。
+                endKey = head + hi + "\t~~~~~~";
+            } else {
+                // 无上界：该索引字段的段尾（';' 排在 ':' 之后）。
+                endKey = "i:" + this.name + ":" + Collection.PadId(kid) + ";";
+            }
+            List<KvEntry> entries = new List<KvEntry>();
+            this.kv.ScanRange(startKey, endKey, 0, entries);
+            for (int i = 0; i < entries.Count; i = i + 1) {
+                ids.Add(Collection.IdOfKey(entries[i].key));
+            }
+            return ids;
+        }
+        string docHi = "c:" + this.name + ";";
+        this.kv.ScanRows("c:" + this.name + ":", docHi, delegate(ScanRow row) {
+            JsonValue f = FieldOfRow(row, kid);
+            if (f != null) {
+                string s = f.AsString("");
+                if ((lo.Length == 0 || String.CompareOrdinal(s, lo) >= 0)
+                        && (hi.Length == 0 || String.CompareOrdinal(s, hi) <= 0)) {
+                    ids.Add(Collection.IdOfKey(row.Key()));
+                }
+            }
+            return true;
+        });
+        return ids;
+    }
+
     /// <summary>对集合启动流畅的 LINQ 风格查询。</summary>
     DocQuery Query() {
         return DocQuery.Of(this);

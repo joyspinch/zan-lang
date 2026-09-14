@@ -33,6 +33,7 @@ int n = users.ScanField("cat", (int id, JsonValue v) => {   // 逐文档回调
     return true;                              // 返回 false 提前结束
 });
 List<int> ids = users.FindIdsByField("cat", "admin");       // 只取 id（索引就绪时不读文档）
+List<int> range = users.FindIdsByFieldRange("cat", "a", "m"); // 范围 [a,m] 双端含（序数语义）
 
 db.Begin();                                   // 批量写入合并为一次原子提交
 for (int i = 0; i < 1000; i = i + 1) { users.Insert(MakeDoc(i)); }
@@ -186,6 +187,7 @@ CoW B+Tree + WAL 对同等负载体积大数倍（页开销 + 写放大碎片 + 
 | `zandb_scan`         | 归并扫描跨段/内存源、范围含端点、前缀扫描                   |
 | `zandb_docs`         | 文档层 CRUD、索引、重开、归并后墓碑不复活                   |
 | `zandb_proj`         | 投影 API：`ScanField` 回调/计数/提前停、`FindIdsByField` 扫描路径与覆盖索引路径一致、删除后两路径同步 | 
+| `zandb_idxrange`     | `FindIdsByFieldRange`：索引端点 `\t` 上界（"c1" 不放进 "c10"）、无界端点、序数语义（"9"&gt;"20"）、扫描回退与覆盖索引路径一致、删除/重开同步 |
 | `zandb_merge_tomb`   | 归并墓碑回归：跨段「put+删除」经归并/重归并/重开不复活，点读/Count/索引查询/覆盖查询全路径一致 |
 | `zandb_fuzz`         | 300 步随机操作对拍内存参照模型（固定种子 LCG），跨持久化档重开 |
 | `zandb_lock`         | 单写锁：第二打开者被拒、关闭后可重开                        |
