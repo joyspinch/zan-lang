@@ -272,6 +272,18 @@ description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式�
 - 单行多声明符 `int a = 0, b = 2;` 走 pending_stmts 队列 + 三个语句收集点
   splice；comma 循环只吃 `IDENT [= expr]`。
 
+## 类型位置的裸名是 AST_TYPE_REF，不是 AST_IDENTIFIER（2026-09-15）
+
+- 泛型实参、基底列表、extends 边里的裸名形参（`Box<T>` 的 `T`）经
+  `parse_type_ref` 解析，得到 `AST_TYPE_REF` 且 `type_args.count == 0`；
+  **永远不会**是 `AST_IDENTIFIER`。按节点 kind 分支识别"这是不是类型形参"
+  时两个 kind 都要接（TYPE_REF 零实参 = 可能是形参也可能是具体裸名，
+  先查形参表再落回具体名比较）。只查 IDENTIFIER 的分支是死代码，
+  `interface BoxSource<T> : Box<T>` 的提升检查首版就栽在这。
+- 为什么：类型语法统一走 parse_type_ref（parser.c:407 递归吃实参），
+  AST 里不存在"类型位置的标识符"节点；这一点 checker/irgen 里所有
+  对类型实参做结构匹配的代码都适用。
+
 ## `is T ?` 三元歧义：类型语法吃掉 `?`（2026-09-13，挂账未修）
 
 `x is T ? a : b` 解析失败：parse_binary 对 `is` 的类型操作数走
