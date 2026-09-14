@@ -914,6 +914,40 @@ add_test(NAME diag_ulong_literal_narrowing
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_ulong_literal_narrowing PROPERTIES TIMEOUT 60)
 
+# A float literal with an exponent but no exponent digits (`1e`, `1e+`) used
+# to lex as the mantissa's value (strtod prefix parse): `double a = 1e;`
+# compiled and ran as 1.0.
+add_test(NAME diag_number_exponent_missing_digits
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/number_exponent_missing_digits.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_number_exponent_missing_digits${_exe_ext}
+    "-DEXPECT_REGEX=exponent requires at least one digit after .e."
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_number_exponent_missing_digits PROPERTIES TIMEOUT 60)
+
+# A hex/binary/octal prefix with no digits (`0x`, `0b`, `0x_`) used to lex as
+# INT_LIT 0: `int a = 0x;` compiled and ran as 0.
+add_test(NAME diag_number_prefix_missing_digits
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/number_prefix_missing_digits.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_number_prefix_missing_digits${_exe_ext}
+    "-DEXPECT_REGEX=hexadecimal literal requires at least one digit after .0x."
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_number_prefix_missing_digits PROPERTIES TIMEOUT 60)
+
+# `0o8` used to lex as octal `0` plus decimal `8`, so the parser reported a
+# meaningless "expected ';', got 'INT_LIT'" instead of an octal diagnostic.
+add_test(NAME diag_number_octal_invalid_digit
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/number_octal_invalid_digit.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_number_octal_invalid_digit${_exe_ext}
+    "-DEXPECT_REGEX=octal literal requires digits 0-7 after .0o."
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_number_octal_invalid_digit PROPERTIES TIMEOUT 60)
+
 # Regression (A280): the nesting guard missed the right-recursive assignment
 # and conditional forms and repeated the message per level. 300 parens must be
 # reported once, with the source echo windowed.

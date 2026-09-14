@@ -698,13 +698,22 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
         if (next == 'x' || next == 'X') {
             lexer_advance(lex); /* 0 */
             lexer_advance(lex); /* x */
+            bool digit_seen = false;
             while (!lexer_at_end(lex)) {
                 char ch = lexer_peek_ch(lex);
                 if (isxdigit((unsigned char)ch) || ch == '_') {
+                    if (ch != '_') digit_seen = true;
                     lexer_advance(lex);
                 } else {
                     break;
                 }
+            }
+            /* A prefix with no digits must not silently become 0: `0x;`
+             * used to lex as INT_LIT(0) and `0o8` split into `0` `8`. */
+            if (!digit_seen) {
+                zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                              "hexadecimal literal requires at least one digit after '0x'");
+                return lexer_make(lex, TK_INVALID, loc);
             }
             zan_token_t tok = lexer_make(lex, TK_INT_LIT, loc);
             tok.lit_suffix = lexer_int_suffix(lex);
@@ -731,13 +740,20 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
         if (next == 'b' || next == 'B') {
             lexer_advance(lex); /* 0 */
             lexer_advance(lex); /* b */
+            bool digit_seen = false;
             while (!lexer_at_end(lex)) {
                 char ch = lexer_peek_ch(lex);
                 if (ch == '0' || ch == '1' || ch == '_') {
+                    if (ch != '_') digit_seen = true;
                     lexer_advance(lex);
                 } else {
                     break;
                 }
+            }
+            if (!digit_seen) {
+                zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                              "binary literal requires at least one digit after '0b'");
+                return lexer_make(lex, TK_INVALID, loc);
             }
             zan_token_t tok = lexer_make(lex, TK_INT_LIT, loc);
             tok.lit_suffix = lexer_int_suffix(lex);
@@ -763,13 +779,26 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
         if (next == 'o' || next == 'O') {
             lexer_advance(lex); /* 0 */
             lexer_advance(lex); /* o */
+            bool digit_seen = false;
             while (!lexer_at_end(lex)) {
                 char ch = lexer_peek_ch(lex);
                 if ((ch >= '0' && ch <= '7') || ch == '_') {
+                    if (ch != '_') digit_seen = true;
                     lexer_advance(lex);
                 } else {
                     break;
                 }
+            }
+            /* `0o8` must be one diagnostic, not octal `0` followed by `8`. */
+            if (!digit_seen) {
+                char bad = lexer_peek_ch(lex);
+                if (bad >= '8' && bad <= '9')
+                    zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                                  "octal literal requires digits 0-7 after '0o'");
+                else
+                    zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                                  "octal literal requires at least one digit after '0o'");
+                return lexer_make(lex, TK_INVALID, loc);
             }
             zan_token_t tok = lexer_make(lex, TK_INT_LIT, loc);
             tok.lit_suffix = lexer_int_suffix(lex);
@@ -825,8 +854,17 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
         if (lexer_peek_ch(lex) == '+' || lexer_peek_ch(lex) == '-') {
             lexer_advance(lex);
         }
+        bool exp_digit_seen = false;
         while (!lexer_at_end(lex) && isdigit((unsigned char)lexer_peek_ch(lex))) {
             lexer_advance(lex);
+            exp_digit_seen = true;
+        }
+        /* `1e` / `1e+` must not silently become 1.0 via strtod's prefix
+         * parse -- the mantissa is not the number the user wrote. */
+        if (!exp_digit_seen) {
+            zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                          "exponent requires at least one digit after 'e'");
+            return lexer_make(lex, TK_INVALID, loc);
         }
     }
 
