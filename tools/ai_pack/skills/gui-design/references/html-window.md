@@ -41,6 +41,28 @@
 3. **`{{NAME}}` 只在 .zan 里替换**；GenHtml 类名跟文件名走，
    code-behind 里引用的是 `<基名>Html.Build/Css`。
 
+**多文档 appCss 的三条定式（gui-wechat 实机踩过，run10~17）**：
+- **`UseAppCss` 是整表替换**（`appCss = css`），且它就是 app 唯一的
+  应用样式入口——每份文档的 `<style>` 只进了自己生成类的 `Css`
+  字段，**装载几份文档就要把它们几段 Css 全量拼进同一次
+  `UseAppCss` 调用**（`AppHtml.Css + "\n" + FavsHtml.Css + ...`）。
+  漏拼哪份，那份的骨架样式（flex、栏宽、渐变）整体静默失效，页面
+  塌回纵向块流——不报错，只有截图能看出来。
+- **根选择器用 id 不用裸 `body`**：所有文档的 CSS 合装同一张表，
+  `body { display:flex }` 会同时命中每个文档的 body 根。每份文档
+  给 body 一个唯一 id（`<body id="FavBody">`），选择器写 `#FavBody`。
+- **flex 链条上每个"吃满"的环节都要自己声明**：页面根控件挂进 flex
+  宿主后，没有声明高度就是零高（dock 时代的 MeasureDocked 不认
+  flex 宿主里的 dock=5 子页）——`.page { flex-grow: 1; align-self:
+  stretch; }`。反过来，**固定尺寸件要 `flex-shrink: 0`**：同列里
+  ListView 报全内容高（几千 px）时，溢出收缩按比例分摊，240px 的
+  封面带会被压扁成 95px（朋友圈封面实测）。装饰角/页脚文案这类
+  "静态 AddText 元素"没有内在宽度申报，不吃 `flex-grow: 1` 就被
+  量成几十 px 折行。
+- **`<style>` 注释里别写 `*/` 序列**（如 `.wxfilt*/.wxfavrow*` 这种
+  通配写法）：StripComments 按第一个 `*/` 截断注释，注释后半段
+  变成裸 CSS 文本、随后的规则被吞进选择器——整段样式静默失效。
+
 ## 声明面五件套与硬边界
 
 | 原语 | 作用 | 硬边界（超了就静默不生效，别猜） |
