@@ -1467,27 +1467,28 @@ exactly"；经 `emit_arg_typed` 覆盖全部方法调用实参发射点。2026-0
 `System/Scripting/drivers/win-x64` 的 `libcrypto-3.dll` 是 CPython 嵌入包
 自带的**另一个** build，名字和内容都不同，不能与上表合并）。
 
-* [~] **A47-1 拆出共享原生依赖目录**。**第一步安全网已落（2026-09-15）**：conformance `publish_tls_bundle`（--publish 默认 driver 发现，行为断言=发布的 exe 能启动且 TlsContext 可用，bundle 复制坏了就是起不来，四孪生绿）——台账建议的『先补用例』已完成，改动清单格式/链接路径时它就是回归网。挡路的其余部分是安全校验
-  `zan_is_safe_bundle_name`（`src/compiler/main.c`）：bundle 清单只允许同目录
-  裸文件名，禁止路径分隔符，所以今天没法引用别的模块的文件。方案：清单支持
-  一种受限的共享引用（如 `@shared/openssl-3/<file>`，解析相对 stdlib 根、
-  仍然拒绝 `..`、`:`、绝对路径），文件只留一份在
-  `stdlib/_shared/openssl-3/<target>/`，发布时按 basename 复制到 exe 旁边。
-  ~~链接期不受影响：导入库（`libcrypto.dll.a` / `libssl.dll.a`）只有 Tls 用，
-  留在原处。~~
-  **2026-08-27 复核：上面这句不成立，本项比记录的更复杂，因此本轮未动手。**
-  三条新约束：
-  1. **链接期确实受影响**：driver 目录会被加进链接搜索路径（`zan_lib_dirs`），
-     Linux/macOS 侧 `-lcrypto` / `-lssl` 就是从 `drivers/<target>/` 解析的，
-     把 `.so`/`.dylib` 移走会让链接失败——共享目录必须同时进链接搜索路径。
-  2. **没有任何测试覆盖 driver bundle 的发布**：现有 publish 测试只有
-     `publish_obf_ctor_*`（字符串反混淆）与 `conformance_python_embed_smoke`
-     （Scripting 的 bundle），Postgres / Tls 的 bundle 复制无人验证。
-  3. **5 个目标里本机只能验 win-x64**，其余 4 个（linux-x64/arm64、macos-x64/arm64）
-     改坏了不会当场暴露。
-  做法建议：先补一个"发布一个用 Tls 的程序、断言 exe 旁边出现
-  `libssl`+`libcrypto` 且能启动"的用例，再改清单格式与链接路径，最后移文件。
-  另：实测重复面已达 **约 28.8MB**（macOS 侧现在也重复，见上表旁注）。
+* [x] **A47-1 拆出共享原生依赖目录**（2026-09-15 闭账）。openssl-3 全套原生
+  依赖从 `stdlib/System/Net/Tls/drivers/` 搬到 `stdlib/_shared/openssl-3/drivers/`：
+  `_shared/openssl-3` 本身是一个带 `drivers/driver.manifest`（ssl、crypto）的模块，
+  `zan_discover_drivers` 走 stdlib 目录树自动发现，拥有方侧零编译器改动；静态库
+  （libssl.a/libcrypto.a/*.libs/libcrypt32.a/zan_tls_mingw_support）随迁，链接期
+  `zan_find_static_library` 也是按目录树搜 `drivers/<target>/static`，同样零改动。
+  跨模块引用：bundle 清单支持 `@shared/<group>/<rel>`（`src/compiler/main.c`）——
+  入口经 `zan_is_safe_shared_rel` 校验（禁 `..`、`:`、反斜杠、绝对路径、空段、
+  尾斜杠），复制按 basename 落 exe 旁；解析顺序=字面 `_shared/<rel>`，回退
+  `_shared/<group>/drivers/<target>/`（openssl-3 的实际布局），两处都不中打
+  warning（此前静默丢弃是第一个探针暴露的坑）。5 个 `pq.bundle` 改指
+  `@shared/openssl-3/...`，Postgres 模块下 10 份重复 openssl 二进制删除，
+  约 28.8MB 重复面消除（7 目标目录 + static 全套只留一份）。
+  验证：① Postgres publish 探针（`PgConnection.Open("host=127.0.0.1 port=1
+  connect_timeout=2")` 真加载 libpq+libssl+libcrypto+libiconv 并优雅报连接拒绝，
+  4 个 DLL 全部落 exe 旁）——注意 `new PgConnection()` 不够：未调用的 DllImport
+  会被死代码消除，必须调到真正触达原生导入的方法，driver 才会进 extern_libs；
+  ② Tls 12 双胞胎（conformance/determinism/leakcheck/arcguard ×
+  publish_tls_bundle/static_publish_tls_stub/tls_hostname）12/12 绿；
+  ③ smoke 层绿（main.c 属编译器改动，rule 8）。
+  限制（原 caveat 不变）：本机只验 win-x64，其余 4 目标（linux-x64/arm64、
+  macos-x64/arm64）走同一代码路径未实测；android 侧见 A47-3。
 * [~] **A47-2 `build/toolchain` 自嵌套**：曾实测嵌套到 32 层
   （`build/toolchain/toolchain/toolchain/...`，每层都带一份 stdlib 和
   openssl），`build/toolchain` 单独占 1.29 GB / 3205 文件。`build/` 是

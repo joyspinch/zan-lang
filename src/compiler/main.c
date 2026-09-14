@@ -2213,6 +2213,30 @@ static int zan_copy_file(const char *src, const char *dst) {
     return rc;
 }
 
+/* A bundle entry written `@shared/<group>/<file>` resolves inside the
+ * stdlib's `_shared/` tree, where modules share one copy of a native
+ * dependency (A47-1). Validate the relative part: no drive letters,
+ * absolute paths, backslashes, ".." / "." segments or empty segments, so a
+ * manifest can only reach files that actually live under `_shared/`. */
+static bool zan_is_safe_shared_rel(const char *rel) {
+    if (!rel || !rel[0] || rel[0] == '/') return false;
+    for (const char *s = rel; *s; s++) {
+        if (*s == '\\' || *s == ':') return false;
+    }
+    const char *s = rel;
+    while (*s) {
+        const char *e = strchr(s, '/');
+        size_t len = e ? (size_t)(e - s) : strlen(s);
+        if (len == 0) return false;
+        if (len == 1 && s[0] == '.') return false;
+        if (len == 2 && s[0] == '.' && s[1] == '.') return false;
+        if (!e) break;
+        s = e + 1;
+        if (!*s) return false; /* trailing slash */
+    }
+    return true;
+}
+
 /* A driver-bundle manifest lists runtime libraries to copy next to the
  * published executable. Each entry must be a bare filename inside the driver
  * directory: reject absolute paths, drive letters, path separators and ".."
@@ -6773,6 +6797,7 @@ int main(int argc, char **argv) {
               if (s) *s = '\0'; else snprintf(outdir, sizeof(outdir), "."); }
 
             bool win_target = (target.os == ZAN_OS_WINDOWS);
+            const char *dsub = zan_driver_subdir(&target);
             for (int d = 0; d < used_driver_count; d++) {
                 const char *driver_dir = driver_dirs[d];
                 if (!driver_dir[0]) continue;
@@ -6820,7 +6845,17 @@ int main(int argc, char **argv) {
                                 continue;
                         }
                         if (l > 0) {
-                            if (zan_is_safe_bundle_name(line)) {
+                            if (strncmp(line, "@shared/", 8) == 0) {
+                                if (zan_is_safe_shared_rel(line + 8)) {
+                                    snprintf(cands[ncand++], sizeof(cands[0]),
+                                             "%s", line);
+                                } else {
+                                    fprintf(stderr, "warning: ignoring unsafe "
+                                        "shared entry '%s' in %s (must be "
+                                        "@shared/<group>/<file> with no '..' "
+                                        "or absolute path)\n", line, manifest);
+                                }
+                            } else if (zan_is_safe_bundle_name(line)) {
                                 snprintf(cands[ncand++], sizeof(cands[0]), "%s", line);
                             } else {
                                 fprintf(stderr, "warning: ignoring unsafe entry "
@@ -6850,9 +6885,47 @@ int main(int argc, char **argv) {
                         copied++;
                         continue;
                     }
-                    snprintf(src, sizeof(src), "%s/%s", driver_dir, cands[c]);
-                    snprintf(dst, sizeof(dst), "%s/%s", outdir, cands[c]);
-                    if (zan_copy_file(src, dst) == 0) {
+                    bool got = false;
+                    if (strncmp(cands[c], "@shared/", 8) == 0) {
+                        /* A shared dependency: one copy under
+                         * <stdlib>/_shared/<group>/, still copied to the exe
+                         * under its own basename. Layouts, in order: the
+                         * literal path, then the per-target driver dir
+                         * _shared/<group>/drivers/<target>/<file> (how the
+                         * openssl-3 group actually stores its binaries). */
+                        const char *rel = cands[c] + 8;
+                        const char *base = strrchr(rel, '/');
+                        base = base ? base + 1 : rel;
+                        snprintf(dst, sizeof(dst), "%s/%s", outdir, base);
+                        if (resolved_stdlib_root[0]) {
+                            snprintf(src, sizeof(src), "%s/_shared/%s",
+                                     resolved_stdlib_root, rel);
+                            if (!zan_file_exists(src) && base != rel) {
+                                char group[128];
+                                size_t gl = (size_t)(base - rel - 1);
+                                if (gl < sizeof(group)) {
+                                    memcpy(group, rel, gl);
+                                    group[gl] = '\0';
+                                    snprintf(src, sizeof(src),
+                                             "%s/_shared/%s/drivers/%s/%s",
+                                             resolved_stdlib_root, group,
+                                             dsub, base);
+                                }
+                            }
+                            got = zan_copy_file(src, dst) == 0;
+                        }
+                        if (!got)
+                            fprintf(stderr, "warning: shared bundle entry "
+                                "'%s' in %s not found under %s/_shared\n",
+                                cands[c], manifest,
+                                resolved_stdlib_root[0] ? resolved_stdlib_root
+                                                        : "<stdlib>");
+                    } else {
+                        snprintf(src, sizeof(src), "%s/%s", driver_dir, cands[c]);
+                        snprintf(dst, sizeof(dst), "%s/%s", outdir, cands[c]);
+                        got = zan_copy_file(src, dst) == 0;
+                    }
+                    if (got) {
                         if (!quiet)
                             printf("  bundled driver '%s' ? %s\n", drv, cands[c]);
                         copied++;
