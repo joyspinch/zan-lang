@@ -1374,6 +1374,101 @@ static void gl_polyline(zan_surface_t *s, const int32_t *pts, int n, u32 c,
     zgl_flush(); /* finish sampling before scratch is overwritten/released */
 }
 
+/* Per-path CPU fallback shared by the batch entry's failure paths. */
+static void cpu_polybatch_loop(zan_surface_t *s, const int32_t *pts,
+                               const int32_t *counts, int n_paths, u32 c,
+                               int thickness, int fx) {
+    int off = 0;
+    for (int p = 0; p < n_paths; p++) {
+        int n = counts[p];
+        if (n >= 2) cpu_polyline(s, pts + off, n, c, thickness, fx);
+        off += n * 2;
+    }
+}
+
+/* N disconnected same-color paths in ONE coverage cycle: clear the union
+ * scratch once for the whole batch's bbox, sample every path's capsules,
+ * composite once. Thousands of single-path calls would each pay a clear +
+ * composite (dense lane charts marshal 30k+ paths per frame). */
+static void gl_polybatch(zan_surface_t *s, const int32_t *pts,
+                         const int32_t *counts, int n_paths, u32 c,
+                         int thickness, int fx) {
+    if (!pts || !counts || n_paths < 1 || (c >> 24) == 0) return;
+    if (!zgl_begin(s, ZGL_MODE_BLEND)) {
+        gl_sync_to_cpu(s);
+        cpu_polybatch_loop(s, pts, counts, n_paths, c, thickness, fx);
+        return;
+    }
+    float scale = fx == 0 ? 1.0f : 1.0f / 256.0f;
+    float half = (thickness > 1) ? (float)thickness / 2.0f : 0.5f;
+    float lo_x = (float)s->width, lo_y = (float)s->height, hi_x = 0, hi_y = 0;
+    int segments = 0;
+    int off = 0;
+    for (int p = 0; p < n_paths; p++) {
+        int n = counts[p];
+        for (int i = 0; n >= 2 && i + 1 < n; i++) {
+            float ax = (float)pts[off + i * 2] * scale;
+            float ay = (float)pts[off + i * 2 + 1] * scale;
+            float bx = (float)pts[off + i * 2 + 2] * scale;
+            float by = (float)pts[off + i * 2 + 3] * scale;
+            float dx = bx - ax, dy = by - ay;
+            if (dx * dx + dy * dy < 0.0001f) continue;
+            segments++;
+            float pad = half + 1.0f;
+            lo_x = fminf(lo_x, fminf(ax, bx) - pad);
+            lo_y = fminf(lo_y, fminf(ay, by) - pad);
+            hi_x = fmaxf(hi_x, fmaxf(ax, bx) + pad);
+            hi_y = fmaxf(hi_y, fmaxf(ay, by) + pad);
+        }
+        off += n * 2;
+    }
+    lo_x = fmaxf(lo_x, fmaxf(0.0f, (float)s->clip_x0));
+    lo_y = fmaxf(lo_y, fmaxf(0.0f, (float)s->clip_y0));
+    hi_x = fminf(hi_x, fminf((float)s->width, (float)s->clip_x1));
+    hi_y = fminf(hi_y, fminf((float)s->height, (float)s->clip_y1));
+    if (!segments || lo_x >= hi_x || lo_y >= hi_y) return;
+    int clear_x = (int)floorf(lo_x), clear_y = (int)floorf(lo_y);
+    int clear_x1 = (int)ceilf(hi_x), clear_y1 = (int)ceilf(hi_y);
+    zgl_flush(); /* painter order before clearing/reusing scratch */
+    zgl_target *t = zgl_target_of(s);
+    if (!zgl_union_target(t)) {
+        /* Resource failure only, not a rasterization workaround. */
+        fprintf(stderr, "[zan_gui] GL polybatch coverage framebuffer unavailable; CPU fallback\n");
+        gl_sync_to_cpu(s);
+        cpu_polybatch_loop(s, pts, counts, n_paths, c, thickness, fx);
+        return;
+    }
+    gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->cov_fbo);
+    gl.Enable(ZGL_SCISSOR_TEST);
+    gl.Scissor(clear_x, t->h - clear_y1, clear_x1 - clear_x, clear_y1 - clear_y);
+    gl.ClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    gl.Clear(ZGL_COLOR_BUFFER_BIT);
+    gl.Disable(ZGL_SCISSOR_TEST); /* normal clipping travels in vertices */
+    g_zgl.mode = ZGL_MODE_UNION;
+    off = 0;
+    for (int p = 0; p < n_paths; p++) {
+        int n = counts[p];
+        for (int i = 0; n >= 2 && i + 1 < n; i++) {
+            float ax = (float)pts[off + i * 2] * scale;
+            float ay = (float)pts[off + i * 2 + 1] * scale;
+            float bx = (float)pts[off + i * 2 + 2] * scale;
+            float by = (float)pts[off + i * 2 + 3] * scale;
+            float dx = bx - ax, dy = by - ay;
+            if (dx * dx + dy * dy < 0.0001f) continue; /* CPU degenerate policy */
+            gl_capsule(s, ax, ay, bx, by, half, 0xFFFFFFFFu);
+        }
+        off += n * 2;
+    }
+    zgl_flush(); /* includes all segments across allocation-pressure flushes */
+    g_zgl.mode = ZGL_MODE_BLEND;
+    zgl_quad q;
+    memset(&q, 0, sizeof(q));
+    q.kind = ZGL_K_UNION;
+    zgl_color(q.col0, c, 0);
+    zgl_push(s, &q, lo_x, lo_y, hi_x, hi_y);
+    zgl_flush(); /* finish sampling before scratch is overwritten/released */
+}
+
 /* ------------------------------------------------------------------- text */
 
 /* Where a coverage tile lives in the GPU atlas. Tile ids are never reused
@@ -1559,6 +1654,7 @@ static const zan_gui_backend zan_gl_backend = {
     .fill_sector  = gl_fill_sector,
     .draw_line    = gl_draw_line,
     .polyline     = gl_polyline,
+    .polybatch    = gl_polybatch,
     .blur         = NULL,
     .snapshot     = NULL,
     .restore      = NULL,

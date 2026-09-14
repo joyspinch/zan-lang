@@ -421,6 +421,10 @@ partial class ChartView {
         bool cached = g >= 1000 && app.StateGet(Chart.CacheKey(slot), 0) == fp
             && c.RestoreRect(plotX, plotY, plotW, plotH, slot);
         int bg = Style.Full(app, "chart", "", "", Style.SNormal()).BgOr(0);
+        // option.backgroundColor 是整只图容器的底（View 层已整块填过）
+        // ——地图绘图区不能再用主题白把它盖回去，否则深底地图
+        // （官方 flights 的 #003 海面）只剩标题条是深色。
+        if (o.backgroundColor != 0) { bg = o.backgroundColor; }
         c.PushClip(plotX, plotY, plotW, plotH);
         if (!cached) {
             c.FillRect(plotX, plotY, plotW, plotH, bg);
@@ -796,71 +800,105 @@ partial class ChartView {
             if (s.itemStyle.normal.lineStyle.color != 0) {
                 col = s.itemStyle.normal.lineStyle.color;
             }
-            // lines 折线（迁徙/航线/polyline 路径）。
-            for (int li = 0; li < s.geoLines.Count; li = li + 1) {
-                List<ChartPoint> line = s.geoLines[li];
+            // lines 折线（迁徙/航线/polyline 路径）。同系列一色 →
+            // 全部顶点进一个 DrawPolyBatch 桶（每帧每系列一次 GL
+            // 合成）；逐条 StrokeQuad/DrawPolylineFx 是每条一次
+            // 覆盖缓冲清+合成，lines-airline 3.2 万条航线直接秒级
+            // 卡死（平行坐标 nutrients 的同一定式）。ProjX/ProjY
+            // 本就落整像素，批量的整点顶点与 Fx 定点几何完全一致。
+            int lw = s.itemStyle.normal.lineStyle.width;
+            if (lw <= 0) { lw = 1; }
+            if (s.itemStyle.normal.lineStyle.transparent) { lw = 0; }
+            // lineStyle.opacity 消费（0..255，0=未声明）：与淡入
+            // g 相乘。lines-airline opacity 0.05 的 3.2 万线密度
+            // 叠加发光，全 alpha 会把世界图糊成一片实色。
+            int lineA = alpha;
+            int lsA = s.itemStyle.normal.lineStyle.alpha;
+            if (lsA > 0) {
+                lineA = lineA * lsA / 255;
+                if (lineA < 1) { lineA = 1; }
+            }
+            int lineCol = Chart.WithAlpha(col, lineA);
+            // ECharts lines large 模式（声明 large 且条数超
+            // largeThreshold，缺省 400）：官方跳过事件层，这里同样
+            // 不做逐线命中——3.2 万条 × 每段 DistToSeg 每帧纯浪费。
+            int lThr = s.largeThreshold;
+            if (lThr < 1) { lThr = 400; }
+            bool linesBig = s.large && s.geoLines.Count > lThr;
+            if (lw > 0 && s.geoLines.Count > 0) {
                 int cv = s.forceCurveness;
-                int lw = s.itemStyle.normal.lineStyle.width;
-                if (lw <= 0) { lw = 1; }
-                if (s.itemStyle.normal.lineStyle.transparent) { lw = 0; }
-                if (lw > 0) {
-                    if (cv > 0) {
-                        // 弯曲连线：控制点 = 弦中点垂直偏移
-                        // curveness×弦长（与 force 边同语义）。
+                string lt = s.itemStyle.normal.lineStyle.type;
+                bool dashed = lt == "dotted" || lt == "dashed";
+                // 曲线采样段数：large 模式 8 段足够（宽 1px、
+                // opacity 0.05 下与 24 段不可分），省 3 倍顶点吞吐。
+                int segN = linesBig ? 8 : 24;
+                List<int> bxs = new List<int>();
+                List<int> bcs = new List<int>();
+                for (int li = 0; li < s.geoLines.Count; li = li + 1) {
+                    List<ChartPoint> line = s.geoLines[li];
+                    if (line.Count < 2) { continue; }
+                    if (dashed) {
+                        List<int> pxl = new List<int>();
+                        List<int> pyl = new List<int>();
+                        for (int pi2 = 0; pi2 < line.Count; pi2 = pi2 + 1) {
+                            pxl.Add(ChartView.ProjX(layout, line[pi2].x, svgUnits));
+                            pyl.Add(ChartView.ProjY(layout, line[pi2].y, svgUnits));
+                        }
+                        int dl = app.Scale(2);
+                        int gl = app.Scale(2);
+                        if (lt == "dashed") { dl = app.Scale(5); gl = app.Scale(3); }
+                        ChartView.DrawDashed(c, pxl, pyl, lineCol, lw, dl, gl);
+                    } else if (cv > 0 && line.Count == 2) {
+                        // 两点航线：控制点 = 弦中点垂直偏移
+                        // curveness×弦长（与 force 边同语义），二次
+                        // 贝塞尔 segN 段采样。
                         int x0 = ChartView.ProjX(layout, line[0].x, svgUnits);
                         int y0 = ChartView.ProjY(layout, line[0].y, svgUnits);
-                        int x1 = ChartView.ProjX(layout, line[line.Count - 1].x, svgUnits);
-                        int y1 = ChartView.ProjY(layout, line[line.Count - 1].y, svgUnits);
+                        int x1 = ChartView.ProjX(layout, line[1].x, svgUnits);
+                        int y1 = ChartView.ProjY(layout, line[1].y, svgUnits);
                         int dxg = x1 - x0;
                         int dyg = y1 - y0;
                         int cxq = (x0 + x1) / 2 + (0 - dyg) * cv / 1000;
                         int cyq = (y0 + y1) / 2 + dxg * cv / 1000;
-                        ChartView.StrokeQuad(c, x0, y0, cxq, cyq, x1, y1,
-                            Chart.WithAlpha(col, alpha), lw);
+                        bxs.Add(x0); bxs.Add(y0);
+                        for (int qi = 1; qi <= segN; qi = qi + 1) {
+                            int tq = qi * 100 / segN;
+                            int it = 100 - tq;
+                            int bxq = (it * it * x0 + 2 * it * tq * cxq
+                                + tq * tq * x1) / 10000;
+                            int byq = (it * it * y0 + 2 * it * tq * cyq
+                                + tq * tq * y1) / 10000;
+                            bxs.Add(bxq); bxs.Add(byq);
+                        }
+                        bcs.Add(segN + 1);
                     } else {
-                        List<int> fx = new List<int>();
-                        List<int> fy = new List<int>();
                         for (int pi = 0; pi < line.Count; pi = pi + 1) {
-                            fx.Add(ChartView.ProjX(layout, line[pi].x, svgUnits) * 256);
-                            fy.Add(ChartView.ProjY(layout, line[pi].y, svgUnits) * 256);
+                            bxs.Add(ChartView.ProjX(layout, line[pi].x, svgUnits));
+                            bxs.Add(ChartView.ProjY(layout, line[pi].y, svgUnits));
                         }
-                        string lt = s.itemStyle.normal.lineStyle.type;
-                        if (lt == "dotted" || lt == "dashed") {
-                            List<int> pxl = new List<int>();
-                            List<int> pyl = new List<int>();
-                            for (int pi2 = 0; pi2 < line.Count; pi2 = pi2 + 1) {
-                                pxl.Add(ChartView.ProjX(layout, line[pi2].x, svgUnits));
-                                pyl.Add(ChartView.ProjY(layout, line[pi2].y, svgUnits));
+                        bcs.Add(line.Count);
+                    }
+                    // 线命中：指针到各线段距离 < 6px（large 模式跳过）。
+                    if (!s.silent && !linesBig) {
+                        for (int pi3 = 0; pi3 + 1 < line.Count; pi3 = pi3 + 1) {
+                            int ax = ChartView.ProjX(layout, line[pi3].x, svgUnits);
+                            int ay = ChartView.ProjY(layout, line[pi3].y, svgUnits);
+                            int bx = ChartView.ProjX(layout, line[pi3 + 1].x, svgUnits);
+                            int by = ChartView.ProjY(layout, line[pi3 + 1].y, svgUnits);
+                            int hitP = ChartView.DistToSeg(mx, my, ax, ay, bx, by);
+                            if (hitP < app.Scale(6)) {
+                                string nm = line[0].name.Length > 0 ? line[0].name
+                                    : (line[line.Count - 1].name.Length > 0
+                                        ? line[line.Count - 1].name : s.name);
+                                ChartHit lh = ChartHit.Of(ChartElementType.LinePoint,
+                                    si, s.name, li, nm, 0, mx, my);
+                                ChartView.OfferActiveHit(lh);
+                                break;
                             }
-                            int dl = app.Scale(2);
-                            int gl = app.Scale(2);
-                            if (lt == "dashed") { dl = app.Scale(5); gl = app.Scale(3); }
-                            ChartView.DrawDashed(c, pxl, pyl,
-                                Chart.WithAlpha(col, alpha), lw, dl, gl);
-                        } else {
-                            c.DrawPolylineFx(fx, fy, Chart.WithAlpha(col, alpha), lw);
                         }
                     }
                 }
-                // 线命中：指针到各线段距离 < 6px。
-                if (!s.silent && line.Count >= 2) {
-                    for (int pi3 = 0; pi3 + 1 < line.Count; pi3 = pi3 + 1) {
-                        int ax = ChartView.ProjX(layout, line[pi3].x, svgUnits);
-                        int ay = ChartView.ProjY(layout, line[pi3].y, svgUnits);
-                        int bx = ChartView.ProjX(layout, line[pi3 + 1].x, svgUnits);
-                        int by = ChartView.ProjY(layout, line[pi3 + 1].y, svgUnits);
-                        int hitP = ChartView.DistToSeg(mx, my, ax, ay, bx, by);
-                        if (hitP < app.Scale(6)) {
-                            string nm = line[0].name.Length > 0 ? line[0].name
-                                : (line[line.Count - 1].name.Length > 0
-                                    ? line[line.Count - 1].name : s.name);
-                            ChartHit lh = ChartHit.Of(ChartElementType.LinePoint,
-                                si, s.name, li, nm, 0, mx, my);
-                            ChartView.OfferActiveHit(lh);
-                            break;
-                        }
-                    }
-                }
+                c.DrawPolyBatch(bxs, bcs, lineCol, lw);
             }
             // 散点（含 effectScatter 折算）：按值定符号大小——
             // visualMap inRange.symbolSize 声明时按官方语义把 z 线性

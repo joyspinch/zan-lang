@@ -2866,3 +2866,43 @@ P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
   右下即此）。根子在 app/Win32Shell 层的 DPI 缩放约定，不在
   Chart 作用域内；合成光标注入路径（UiDriver ev 1）直接给画布
   坐标不受影响，自动化回归不受阻。
+* **geo lines 车道闭账（2026-09-14，用户实机审查批次①）**：
+  lines-airline（"World Flights"，3.2 万航线对）地图画了航线没画。
+  六处根因/缺口一批修讫（ChartModel/ChartViewMap/gui_runtime/
+  gui_gl_backend）：
+  ①**裸数组数据形态**：geo lines 的 data 除
+  {coords:[[lng,lat],...]} 对象形态（geo-lines）外，还有条目本身
+  即 [[lng,lat],[lng,lat]] 的裸数组形态（lines-airline 无包装），
+  旧解析只认对象形态，geoLines 收 0 条。
+  ②**LinesSeries 缺省 coordinateSystem='geo'**（官方
+  LinesSeries.ts defaultOption）：geo-lines 迁徙的 lines 系列
+  全都不写 coordinateSystem，旧解析只认显式声明→系列不挂 geo
+  静默不画；现仅当 option 存在 geo 组件时补缺省（无地图的纯
+  lines 兜底车道不变）。
+  ③**lines 的 lineStyle.curveness 从未解析**（只有 force 边解析，
+  与 force 共用 forceCurveness ×1000 字段）：官方 0.3 弯曲航线
+  画成直线。顺带消费 lineStyle.opacity（0..255 解析早已落表，
+  渲染端从未取用）——官方 opacity 0.05 的 3.2 万线密度叠加
+  发光，全 alpha 会把世界图糊成一片实色。
+  ④**原生 polybatch 悬空**：Render.DrawPolyBatch 的 extern 从未
+  有原生实现（gui_backend.h 的 polybatch 槽位也无人填），首次
+  接线即链接期 undefined symbol。补齐：gui_runtime.c 导出（优先
+  后端批量，退逐条 polyline）+ GL 后端 gl_polybatch（整个批次
+  共享一次覆盖缓冲清+UNION 采样+一次合成，gl_polyline 的多路径
+  推广；scissor 收敛到全批 bbox）。3.2 万线 sweep 单帧 ~0.7s，
+  交互可接受；逐条 Fx 是每条一次清+合成，秒级卡死。
+  ⑤**绘图区底色盖掉 option.backgroundColor**：DrawMap 用主题白
+  填绘图区，深底地图（flights 的 #003 海面）只剩标题条是深色；
+  现 option.backgroundColor 声明时优先。+ geo.itemStyle.color
+  按 areaColor 别名解析（ECharts2 遗留键，官方 Flights 写的就是
+  color:"#005"，旧解析丢掉后大陆落到默认浅蓝 ramp）。
+  ⑥**lines large 模式跳过事件层**（声明 large 且条数超
+  largeThreshold，官方 zrender 语义）：3.2 万条 × 每段 DistToSeg
+  每帧纯浪费，命中豁免与官方一致。
+  回归：全量 sweep FLAG 169（HEAD 基线 182，A/B 差集单侧——
+  消失的 13 个全是宣告 backgroundColor 的地图类 demo
+  （scatter-map/lines-airline/geo-lines/scatter-world-population
+  等），深色海面使 EDGE-CLIP/NO-XAXIS 启发式不再误报；
+  scatter-map 抽查官方深色观感、内容完整；**0 新增**）。
+  实机：lines-airline 深海面/深大陆/黄绿航线密度发光与官方同构，
+  geo-lines 迁徙航线（curveness+effectScatter+深底）完整。

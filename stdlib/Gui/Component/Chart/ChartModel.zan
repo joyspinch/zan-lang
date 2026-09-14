@@ -5353,6 +5353,11 @@ class ChartOption {
         JsonValue its = g.Get("itemStyle");
         if (its != null && its.IsObject()) {
             geo.areaColor = ChartOption.ParseColor(its.Get("areaColor"), 0);
+            // ECharts2 遗留键 itemStyle.color 同义（官方 lines-airline
+            // "World Flights" 的 geo.itemStyle 写的就是 color:"#005"）。
+            if (geo.areaColor == 0) {
+                geo.areaColor = ChartOption.ParseColor(its.Get("color"), 0);
+            }
             geo.borderColor = ChartOption.ParseColor(its.Get("borderColor"), 0);
         }
         JsonValue lb = g.Get("label");
@@ -6618,6 +6623,15 @@ class ChartOption {
                 // coordinateSystem:"geo"（散点/lines/graph 叠加地图）。
                 string csys = s.Str("coordinateSystem", "");
                 if (csys == "geo") { cs.coordSys = "geo"; }
+                // LinesSeries defaultOption.coordinateSystem 缺省即
+                // 'geo'（官方 LinesSeries.ts）——geo-lines 迁徙图的
+                // lines 系列全都不写 coordinateSystem。仅在 option
+                // 存在 geo 组件时补缺省；无地图的纯 lines 兜底车道
+                // （points 拆对）保持原样。
+                if (cs.custom == "lines" && csys.Length == 0
+                    && o.geos.Count > 0) {
+                    cs.coordSys = "geo";
+                }
                 // coordinateSystem:"polar"（ECharts5/6 极坐标：角度轴/
                 // 半径轴圆框，line/scatter 点投影）。
                 if (csys == "polar") { cs.coordSys = "polar"; }
@@ -7318,16 +7332,22 @@ class ChartOption {
                 }
                 // lines 系列 coordinateSystem:"geo"：data 是
                 // [{coords:[[lng,lat],[lng,lat],...]}]（coords 可两点
-                // 也可 polyline 多点）——坐标按 0.01° 定点（×100，
-                // 半值远离零）收进 geoLines，y = -lat×100（北朝上，
-                // 与注册表地图几何同一数据系）；渲染端由地图底图
-                // 的布局仿射直接投影（DrawGeoOverlay）。
+                // 也可 polyline 多点，geo-lines 迁徙）或条目本身就是
+                // [[lng,lat],[lng,lat],...] 裸数组（lines-airline
+                // 3.2 万条航线对不带包装）——坐标按 0.01° 定点
+                // （×100，半值远离零）收进 geoLines，y = -lat×100
+                // （北朝上，与注册表地图几何同一数据系）；渲染端由
+                // 地图底图的布局仿射直接投影（DrawGeoOverlay）。
                 if (cs.custom == "lines" && cs.coordSys == "geo"
                     && da != null && da.IsArray()) {
                     for (int li2 = 0; li2 < da.Count(); li2 = li2 + 1) {
                         JsonValue it2 = da.At(li2);
-                        if (it2 == null || !it2.IsObject()) { continue; }
-                        JsonValue cds = it2.Get("coords");
+                        JsonValue cds = null;
+                        if (it2 != null && it2.IsObject()) {
+                            cds = it2.Get("coords");
+                        } else if (it2 != null && it2.IsArray()) {
+                            cds = it2;
+                        }
                         if (cds == null || !cds.IsArray() || cds.Count() < 2) { continue; }
                         List<ChartPoint> line = new List<ChartPoint>();
                         for (int cp = 0; cp < cds.Count(); cp = cp + 1) {
@@ -7338,6 +7358,19 @@ class ChartOption {
                                 ChartOption.GeoQ(0.0 - cv.At(1).AsDouble(0.0))));
                         }
                         if (line.Count >= 2) { cs.geoLines.Add(line); }
+                    }
+                }
+                // lines 的 lineStyle.curveness（lines-airline 0.3 航线
+                // 弯曲）：与 force 边共用 forceCurveness（×1000 定点，
+                // Clone 已拷贝），DrawGeoOverlay 曲线分支按它取控制点。
+                if (cs.custom == "lines") {
+                    JsonValue lsty = s.Get("lineStyle");
+                    if (lsty != null && lsty.IsObject()) {
+                        JsonValue lcur = lsty.Get("curveness");
+                        if (lcur != null && lcur.IsNumber()) {
+                            cs.forceCurveness =
+                                (int)(lcur.AsDouble(0.0) * 1000.0 + 0.5);
+                        }
                     }
                 }
                 // scatter（含 effectScatter）coordinateSystem:"geo"：

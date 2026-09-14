@@ -3396,6 +3396,43 @@ EXPORT void zan_gui_draw_polyline_fx(i32 surface_id, const i32 *pts, i32 n,
     ZAN_IMPL(s, polyline)->polyline(s, pts, (int)n, (u32)color, t, 8);
 }
 
+/* N disconnected same-color paths in one call: pts is the flat interleaved
+ * vertex array across all paths, counts[i] the vertex count of path i. One
+ * FFI crossing + one marshalling buffer for the whole batch -- dense lane
+ * charts (parallel coordinates, tens of thousands of flight routes) pay
+ * per-call marshalling otherwise. Backends without a batch entry fall back
+ * to per-path polyline. */
+static void cpu_polyline(zan_surface_t *s, const int32_t *pts, int n, u32 c,
+                         int t, int shift);
+
+EXPORT void zan_gui_draw_polybatch(i32 surface_id, const i32 *pts,
+                                   const i32 *counts, i32 n_paths,
+                                   i32 color, i32 thickness) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s || !pts || !counts || n_paths < 1) return;
+    int t = (int)thickness;
+    if (t < 1) t = 1;
+    if (s->be && s->be->polybatch) {
+        s->be->polybatch(s, pts, counts, (int)n_paths, (u32)color, t, 0);
+        return;
+    }
+    i32 off = 0;
+    if (s->be && s->be->polyline) {
+        for (i32 p = 0; p < n_paths; p++) {
+            i32 n = counts[p];
+            if (n >= 2) s->be->polyline(s, pts + off, (int)n, (u32)color, t, 0);
+            off += n * 2;
+        }
+        return;
+    }
+    for (i32 p = 0; p < n_paths; p++) {
+        i32 n = counts[p];
+        if (n >= 2) cpu_polyline(s, pts + off, (int)n, (u32)color, t, 0);
+        off += n * 2;
+    }
+}
+
 EXPORT void *zan_gui_get_pixels(i32 surface_id) {
     if (surface_id < 0 || surface_id >= g_surface_count || !g_surfaces[surface_id]) return NULL;
     zan_surface_t *s = g_surfaces[surface_id];

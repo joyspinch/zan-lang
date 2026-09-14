@@ -385,6 +385,26 @@ small-medium 之间**:画廊卡片标题先后用 13/15 都被打回"太小",17 
   geo;同理 SVG 底图(用户单位 ×1)与矢量地图(度 ×100)两套坐标
   尺度的投影必须分开,封装成带单位旗的单一投影函数,禁止在调用处
   散落换算。
+- **接参考引擎的系列先读它的 defaultOption,缺省 coordinateSystem
+  和遗留键别名都是引擎缺口**:LinesSeries 的 coordinateSystem 缺省
+  即 'geo'——迁徙/航线 demo 的 lines 系列大都不写它,只认显式声明
+  的解析器让整条车道静默不画(真实案例:geo-lines 迁徙航线消失);
+  补缺省要带条件(option 里真有 geo 组件),纯 lines 兜底车道不能
+  陪葬。同理 ECharts2 遗留键:geo/map 的 itemStyle.color 与
+  areaColor 同义,官方 Flights demo 写的就是 color:"#005",只认
+  新键会把深色大陆渲染成默认浅蓝 ramp。对拍前先拿官方 option
+  原文(含遗留键)过一遍解析。
+- **同色折线大批量必须走批量入口,且批量入口要链接期验真**:逐条
+  polyline 是每条一次覆盖缓冲清+合成+一次 FFI 跨界,3.2 万条航线
+  秒级卡死;批量=扁平交错顶点数组+每路径顶点数,每帧每色一次,
+  GL 后端整个批次共享一次清+采样+合成(真实案例:lines-airline
+  World Flights 接上解析后秒卡,批量后 sweep 单帧 ~0.7s)。坑:
+  批量 API 可能只有头文件槽位和托管侧 extern,原生实现从未接线
+  ——extern 悬空到链接期才爆 undefined symbol,首次使用先 grep
+  原生导出是否存在。官方 large 模式(lines 声明 large 且条数超
+  largeThreshold)跳过事件层,逐线命中要做同等豁免,否则每帧白付
+  数万次线段距离。option.backgroundColor 是整只图容器的底,地图
+  车道不能再用主题白把绘图区盖回去。
 
 - **官方图型的数据项可以是"值向量"，标量车道会静默取 0**:radar 每个
   data 项是一条独立多边形(对象 {value:[每轴值],name} 或裸数组)——
