@@ -1121,6 +1121,10 @@ class Ra2App {
         Ra2App.Blit(r, shell, "R-UP.SHP", 0, x0 + 38 + shell.W("R-DN.SHP"),
                     rc[3] + 7);
 
+        // The superweapon pair closes the strip's right end, the way the
+        // original parks its special-weapon cameo by the page buttons.
+        Ra2App.DrawSuperButtons(r, game, art, shell, rc);
+
         Ra2App.DrawPowerPips(r, game, shell, rc);
 
         // The card itself. tile is the clock's 60x48 frame; the shipped
@@ -1349,6 +1353,97 @@ class Ra2App {
             if (mx >= Ra2App.RepairBtnX() && mx < Ra2App.RepairBtnX() + 62) { return 1; }
         }
         return -1;
+    }
+
+    /// <summary>The superweapon button's rect on the SIDE3 strip, right
+    /// end: rect[0..3] = x, y, w, h. The cameo keeps its 60x48 aspect and
+    /// shrinks to the strip's height.</summary>
+    static void SuperRect(SidebarShell shell, List<int> rc, int kind,
+                          List<int> rect) {
+        int sh = shell.H("SIDE3.SHP");
+        int bh = sh - 4 < 48 ? sh - 4 : 48;
+        int bw = 60 * bh / 48;
+        rect[0] = rc[0] + shell.W("SIDE3.SHP") - 6 - bw
+                  - (1 - kind) * (bw + 4);
+        rect[1] = rc[3] + (sh - bh) / 2;
+        rect[2] = bw;
+        rect[3] = bh;
+    }
+
+    /// <summary>Which superweapon button sits under the cursor, -1 for
+    /// none: 0 the nuke, 1 the lightning storm. Mirrors DrawSuperButtons.
+    /// </summary>
+    static int HitSuper(GameController game, SidebarShell shell, int mx,
+                        int my) {
+        if (shell == null || !shell.Ok()) { return -1; }
+        List<int> rc = new List<int>();
+        Ra2App.ShellRects(shell, rc);
+        List<int> rect = new List<int>();
+        rect.Add(0);
+        rect.Add(0);
+        rect.Add(0);
+        rect.Add(0);
+        for (int k = 0; k < 2; k = k + 1) {
+            Ra2App.SuperRect(shell, rc, k, rect);
+            if (R2Panel.PointIn(mx, my, rect[0], rect[1], rect[2], rect[3])) {
+                return k;
+            }
+        }
+        return -1;
+    }
+
+    // The two cameo portraits, decoded once (LoadCameoShp re-parses the
+    // SHP every call, so the draw path caches its Texture).
+    static Texture nukeIconTex;
+    static Texture stormIconTex;
+
+    /// <summary>The sidebar's superweapon pair: the NUKEICON/BOLTICON
+    /// cameos on the SIDE3 strip. Dark under a half cover until the silo's
+    /// charge runs full, gold-outlined while armed, and otherwise a thin
+    /// amber bar along the bottom reads the recharge progress. An install
+    /// without the icon art simply shows nothing -- the click then lands on
+    /// whatever is under the empty rect.</summary>
+    static void DrawSuperButtons(R2Canvas r, GameController game,
+                                 ObjectArt art, SidebarShell shell,
+                                 List<int> rc) {
+        if (shell == null || !shell.Ok() || art == null) { return; }
+        if (Ra2App.nukeIconTex == null) {
+            Ra2App.nukeIconTex = art.LoadCameoShp("NUKEICON.SHP");
+        }
+        if (Ra2App.stormIconTex == null) {
+            Ra2App.stormIconTex = art.LoadCameoShp("BOLTICON.SHP");
+        }
+        if (Ra2App.nukeIconTex == null && Ra2App.stormIconTex == null) {
+            return;
+        }
+        List<int> rect = new List<int>();
+        rect.Add(0);
+        rect.Add(0);
+        rect.Add(0);
+        rect.Add(0);
+        for (int k = 0; k < 2; k = k + 1) {
+            Texture cameo = k == 0 ? Ra2App.nukeIconTex : Ra2App.stormIconTex;
+            if (cameo == null) { continue; }
+            Ra2App.SuperRect(shell, rc, k, rect);
+            R2Tex tex = Ra2Ui.RegisterMutable("ra2:supericon", cameo);
+            r.DrawTexture(tex, rect[0], rect[1], rect[2], rect[3]);
+            bool armed = game.SuperArmed() && game.SuperArmedKind() == k;
+            if (armed) {
+                r.SetColor(244, 220, 90, 255);
+                r.DrawRect(rect[0] - 1, rect[1] - 1, rect[2] + 2, rect[3] + 2);
+            } else if (!game.SuperReady(k)) {
+                r.SetColor(0, 0, 0, 128);
+                r.FillRect(rect[0], rect[1], rect[2], rect[3]);
+                int cap = game.World().Rules().SwRecharge();
+                if (cap > 0) {
+                    int fill = game.SuperCharge(k) * rect[2] / cap;
+                    if (fill > 0) {
+                        r.SetColor(214, 178, 80, 255);
+                        r.FillRect(rect[0], rect[1] + rect[3] - 2, fill, 2);
+                    }
+                }
+            }
+        }
     }
 
     /// <summary>The flat cameo-tile button: a raised bevel the way the
@@ -1664,6 +1759,10 @@ class Ra2App {
                                    int my) {
         if (game.SellModeArmed()) { Ra2App.ModeHint(r, "变卖", mx, my); }
         else if (game.RepairModeArmed()) { Ra2App.ModeHint(r, "修理", mx, my); }
+        else if (game.SuperArmed()) {
+            Ra2App.ModeHint(r, game.SuperArmedKind() == 0 ? "核弹" : "闪电风暴",
+                            mx, my);
+        }
     }
 
     // The minimap's fog-of-war overlay: black patches over every
@@ -3092,6 +3191,12 @@ class Ra2Loop : IGuiHostLoop {
                     }
                     if (sr == 0) { this.game.ToggleSell(); }
                     else if (sr == 1) { this.game.ToggleRepair(); }
+                    else if (Ra2App.HitSuper(this.game, this.sideShell,
+                                             this.mouseX, this.mouseY) >= 0) {
+                        this.game.ToggleSuper(Ra2App.HitSuper(
+                            this.game, this.sideShell, this.mouseX,
+                            this.mouseY));
+                    }
                     else if (this.sideShell != null && this.sideShell.Ok()
                          && Ra2App.HitTab(this.sideShell, crc, this.mouseX,
                                           this.mouseY) >= 0) {
@@ -3261,6 +3366,12 @@ class Ra2Loop : IGuiHostLoop {
                     }
                     if (sr == 0) { this.game.ToggleSell(); }
                     else if (sr == 1) { this.game.ToggleRepair(); }
+                    else if (Ra2App.HitSuper(this.game, this.sideShell,
+                                             this.mouseX, this.mouseY) >= 0) {
+                        this.game.ToggleSuper(Ra2App.HitSuper(
+                            this.game, this.sideShell, this.mouseX,
+                            this.mouseY));
+                    }
                     else if (this.sideShell != null && this.sideShell.Ok()
                          && Ra2App.HitTab(this.sideShell, crc, this.mouseX,
                                           this.mouseY) >= 0) {
