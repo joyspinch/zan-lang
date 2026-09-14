@@ -891,6 +891,33 @@ pt/pc/cm/mm/in/q）+ `calc()/min()/max()/clamp()`；`%` 在各属性原有通道
   smoke 仅 HEAD 已知失败 + 其他会话在途 Chart 调试行（XEXT）一例。
   主文档 `docs/HTML_UI.md`（元素/事件/样式支持面 + 浏览器差异清单）。
 
+* **P5 链接导航语义**（2026-09-15）：`<a href>` 从"行内 Element、
+  href 落台账忽略"升级为桌面映射的缺省导航（用户拍板：缺省内嵌
+  WebView，新弹窗弹系统浏览器）。**路由**——`App.OpenLink(url,
+  newWindow)`：target="_blank" 直接系统浏览器（Windows
+  ShellExecuteW 直调 shell32 不经 cmd.exe，URL 元字符安全；POSIX
+  RunDetached 单引号包裹+'\'' 转义）；缺省进内嵌 WebView——宿主
+  `UseWebview(box)` 注册的就地图优先，否则懒建 App 级 `LinkWindow`
+  （ChildWindow 子类，根=WebViewBox 拿满客户区、TitleChanged 同步
+  OS 标题、全程复用；WebView 不可用首帧 IsSupported 翻 false 自动
+  转交系统浏览器并关窗）。**接线**——`Html.AutoLink(c, app)` 单一
+  入口幂等（`On.Click.Count()>0` 即让位：data-on-click/宿主
+  OnClick 接管不叠加）；三个挂载点：LoadHtmlWith 装载扫描、
+  ChildWindow.WireNode 二次接线（data-for 行克隆同享）、挂主窗口
+  的生成/手搭树宿主 `Html.AutoLinkTree(root, app)`。href 只认
+  http/https（# 锚/相对路径/javascript:/mailto: 不路由——无 base、
+  无滚动目标、脚本执行与 shell 关联程序风险）。**GenHtml parity**
+  ——`<a>` 的 href/target 放行进生成 SetAttr 属性表（AutoLink 读
+  表路由），生成树建树期无 App、由挂载窗口 WireNode 补绑。
+  **UA 示能**——`a { color: var(--primary) }`；顺带修了两个引擎
+  缺口：①ApplyAppCss 的 UA 层过去用裸 FromCss 解析、var() 展开为
+  空（改为 ParseWithSources 喂主题 token）；②LoadHtmlWith 对无
+  `<style>` 文档跳过 UseAppCss，整条 UA 链（display 分层/body
+  边距/链接主色）缺席（改为无条件走 UseAppCss——appCss 内容不变
+  也重建）。**验证**——conformance_gui_html_link（新探针 17 断言：
+  两通道接线/锚与 js 不路由/宿主接管不叠加/幂等/UA 主色且不串
+  span）+ gui_html* + gui_css 全绿；standard 层同基线。
+
 * **P6 overflow 滚动**（2026-09-12）：**per-axis 滚动语义**——StyleBox
   新增 overflowX/overflowY（0 visible/1 hidden/2 auto/3 scroll），
   `overflow` 简写双轴复位、长hand覆盖单轴；单轴声明时另一根 visible
@@ -2036,6 +2063,8 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
 * **待修复（编译器加固，非阻塞）：zanc `--embed <dir>=skins` 一律跳过 stdlib 皮肤基线自动内嵌**：src/compiler/main.c 的 Gui 皮肤自动内嵌块只要发现任一 `--embed` 目标名为 "skins" 就整体跳过，但项目 skins 目录往往只含自家皮肤包（如 templates/game/wuwei/skins/ 起初只有 wuwei/skin.css、无 base.css），跳过后发布产物没有 skins/base.css 基线层——Style.BaseSheet 为空，`flex { display: flex }` 不生效，所有 Flex 容器退化成 dock 排版、子控件全部叠在同一矩形（无为修仙传百艺页签全叠点不中即此因，探针 _scratch/flexprobe.zan：无 skins 内嵌则坏、内嵌含 base.css 的目录则好，已复现闭环）。本轮由模板自带 base.css（与 stdlib/Gui/skins/base.css 逐字节一致）解决，游戏 ALL PASS；建议后续把跳过条件收紧为"staged 目录含 base.css 才算完整替身"，修复草稿已写好但因 main.c 有其他会话未完成的 apk 改动（strtok_r/apk.h 签名）无法编译验证，本轮未保留该改动。**修讫（2026-09-14，按原建议①落地）**：main.c 皮肤自动内嵌块的跳过条件收紧——`--embed <dir>=skins` 只有当 `<dir>/base.css` 存在（完整替身）才跳过 stdlib 基线自动内嵌；pack-only 暂存（wuwei 型）照常内嵌，且暂存包因 spec 序在前仍赢重名。三例探针实测（`_scratch` 已清，配方：pack-only/含 base.css/无 --embed 三目录 + `Skin.EmbedHas("skins/base.css")`+`EmbedList("skins/")` 打印）：A pack-only → embed_base=yes、list 含 stdlib 全部皮肤包+base.css；B 完整替身 → 跳过生效、list 仅暂存 base.css+mypack（无 stdlib 包重复）；C 无 --embed → 基线照常内嵌。standard 层过账后提交。
 
 * **A90 GenDb typed-ORM 的 stdlib 内部类型被可达性裁剪丢弃（2026-09-13 闭账：已被 main.c demand-driven pull-in 二轮修复）**：codegen 后先以生成器输出为种子把生成代码引用的 stdlib 符号拉进 live 集再裁剪；复验：最小 [Table] 探针、server-mvc 全 71 源（175 文件）、server-legend 全 84 源（26 实体 170+ ORM 调用点）--auto-stdlib 全部零复现。
+
+* **A91 CSS `cursor` 在 retained 模式无消费点（挂账；P5 链接导航 A44 轮登记）**：`cursor: pointer` 声明在 StyleSheet 解析层有落点（`b.cursor = CursorCode(v)`，immediate 模式 `ApplyBox` 消费、css_test golden 有账），但 retained 侧 StyleBox.cursor 无任何渲染/交互路径读它——`<a>` 等声明了 cursor 的元素在保留树上不换光标。探针实测（`_scratch/fgdbg5` 形状）：UA 给 a 发 `cursor: pointer` 后 `ResolveStyle(app,0).cursor == 0`，同规则 color 正常落。根因形状：App 的 kind==1 鼠标移动光标只按 `hitTester.GetWidgetType` 的控件类型映射（input→I-beam 等），HitRegion 无 per-control cursor 槽，id→Control 反查链路也不存在。根治路径：HitRegion 增 cursor 字段（FireCommon RegisterRect 时从控件 resolved style 抄）+ App kind==1 命中后优先取 region cursor 调 `Native.SetCursor`（管线已在：Win32Shell.SetCursorShape / zan_gui_set_cursor 全平台通）。在此之前 UA 样式表**不发** cursor 声明（宁缺毋滥，不发写而不读的账面承诺），`<a>` 的示能由 `color: var(--primary)` 承担。
 
 * **A257 Worker TCP 连接软空引用（未根治，规则 10 在案；非阻塞）**（2026-09-07）：`_scratch/server-game-run` 跑 server-game 模板 e2e（80 断言，全 PASS）时，每次完整运行在 run.log 恰好出现一条 `Net\Worker.zan:2607:16: runtime error: null reference where an object is required (member access)`——2607:16 即 `Connection.GetId(): return this.id;`，接收者为空/已释放。时间窗恒定在启动横幅之后、首个游戏登录（bob）之前，即第一个 TCP 客户端（mallory：connect → hello 推送 → register → 约 2s 闲置 → 客户端 drop）的生命周期内；每次运行恰一条、不随断言数变化。软错误只杀死当前任务：mallory 无会话、无功能断言受影响、服务端继续运行、后续连接（bob/alice/carl/dave + GM 页）全部正常。隔离探针 `_scratch/worker-onclose-probe/`（Worker("tcp") + OnConnect 推送 + onClose 里 GetId()）四形态均零复现：纯 connect+drop 30 轮、hello+register+闲置+drop 20 轮、以及 game-server 侧的 (B) register+drop、(C) login+drop、(D) 游戏连接+10 HTTP POST 混合、(E) 逐句复刻 e2e mallory→bob 前置序列——错误计数都停在基线 1，无新增。怀疑方向：完整服务端里 tick 协程（Gateway.SweepIdle 快照后逐个 GetId）与连接 EOF 清理（HandleTcp finally → onClose(conn)）之间的 Connection 释放竞态（ARC 下悬垂接收者），或 onClose 回调链上 conn 的生命周期缺口；最小探针缺 HTTP worker + World tick + 会话表的并发形状故不复现。影响评估：单发、软失败、不破坏功能与计数；真正会受伤的场景是"被杀任务恰持有会话"（会话滞留 World 直到客户端主动断开）。根治路径：给 Connection 的跨协程持有/回调补 ARC 生命周期契约（onClose 参数、Sweep 快照元素），或在 Worker 内对 GetId 接收者做存活断言把软错变成可定位的硬日志。复现环境：`_scratch/server-game-run`（fresh DB → server-game.exe → python e2e_v3.py → grep -c "runtime error" run.log == 1，连续 4+ 轮）。　**2026-09-14 复验：不再复现，按"已治愈-根因未单独定位"闭账**——关键时间线：载有 7 条错误的 run_e2e.log（09-08 03:59）产自**更早构建**；复现目录现存 server-game.exe（09-08 18:10）已含当日 A260 审计修复批（七笔提交），A298/A64b（09-12/14）又相继加固了同族 close/wake 路径。本轮 6 轮零错误：①完整 e2e 跑到 83 号检查（覆盖文档载明的全部错误窗口：落地页/forgot/mallory 生命周期/lockout/bob hello+register+login）0 条；②聚焦 mallory 生命周期驱动 2 轮 0 条；③加并发 HTTP forgot/register 压力变体 1 轮 0 条；④服务器启动自检 0 条（旧日志同位置另有 ServerMetrics 越界 ×4，本轮亦无）。旁证：现行模板世代 server-legend 的 e2e_legend 80 检查全绿（5ecb5d6d），无 runtime error 报告。e2e 全程未跑通的部分（83 号后战斗/GM/kick 检查）因 e2e_v3 冻结于 09-07 与 exe 种子数据漂移（稻草人→鸡），非本缺陷窗口；驱动保留在 `_scratch/server-game-run/repro_a257.py`（聚焦 mallory 形状）与 `e2e_a257.py`（CONT 模式全量），若复发可直接复用。
 

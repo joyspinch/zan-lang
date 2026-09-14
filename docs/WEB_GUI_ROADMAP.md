@@ -17,7 +17,7 @@
 | P2 | 行盒与 inline 流：横排/换行/text-align/vertical-align/line-height 三态消费、FontAscent 真 baseline、inline 文本混排（run+控件盒）、white-space | ✅ 2026-09-12 | oracle inline 4 盒（tol 3）：y/行高/盒高 0 偏差，x ≤3px 步进台账 |
 | P3 | float：left/right 贴边、行盒绕排、clear、BFC 收编 | ✅ 2026-09-12 | b432d5c0 引擎 + 9ddcffa5 规则 2 + 本条（断言/文档）；oracle float 17 盒：11 精确、6 处 ≤2px（行高取整台账） |
 | P4 | grid：track sizing（auto/fr/minmax/px/%）、span、隐式轨道、gap、网格线放置 | ✅ 2026-09-12 | 1b1c5375 引擎 + db19356e 修复/断言/文档；oracle grid 19 盒全部 0px |
-| P5 | HTML 声明层：Html.zan parser、tag→控件映射、data-on-* 事件、data-bind、style/link 接线、GenHtml 编译期生成器、App.LoadHtml()、oracle 闭环 | ✅ 2026-09-12 | 09d73369 运行时 + dc3b55f9 生成器；oracle html 13 盒（tol 3）；编译期建树与运行时解析 13 盒 diff 全等；主文档 docs/HTML_UI.md |
+| P5 | HTML 声明层：Html.zan parser、tag→控件映射、data-on-* 事件、data-bind、style/link 接线、GenHtml 编译期生成器、App.LoadHtml()、oracle 闭环；链接导航（`<a>` 内嵌 WebView/系统浏览器）2026-09-15 补齐 | ✅ 2026-09-12 | 09d73369 运行时 + dc3b55f9 生成器；oracle html 13 盒（tol 3）；编译期建树与运行时解析 13 盒 diff 全等；主文档 docs/HTML_UI.md |
 | P6 | overflow 滚动：auto/scroll 真语义（clip+偏移+滚动条） | ✅ 2026-09-12；横滚 2026-09-15 补齐 | oracle scroll 26 盒全部 0px（auto/hidden/scroll 三态、程序滚动、钳制、嵌套组合、overflow-x 横滚）；UiDriver 实机滚轮验证（注入滚轮→子树精确平移） |
 | P7 | 设计器 + HUD：存取格式 = .html、Inspector CSS 编辑、拖拽翻译 CSS、游戏窗口层嵌入帧循环、IDE 自用窗体重写 | ✅ 2026-09-12 | P7a ✅：DesignerHtml 编解码器全键往返、GenForm .html 设计稿投影（与 .zform 同一生成）、生成器缓存键全 stdlib 哈希（genrun.c）、Designer.SaveHtml/LoadHtmlText 桥、IDE .html 设计稿九处接线；P7b ✅：字段内联 style 通道（SetProp("style")→ApplyInline，FormField.styleText，Inspector STYLE 声明行编辑，DesignerHtml style 属性互通，GenForm/FormBuilder 同落点；布局键让位设计几何记台账）；P7d ✅（模板+IDE 43 份 .zform 全转 .html，模型级等价校验，引用全翻转，.zform 编译通道保留给旧项目）；P7c ✅：游戏 HUD 帧内接入实测（游戏=Gui 同引擎不建宿主；clean/dirty avg 3ms、max 23ms，预算 16.6ms；空闲 120 拍仅 3 帧；像素级门控证据；台账：流式子元素 % 宽未生效顺延 P8）；LSP 补 .html 设计稿索引通道（2227fab0） |
 | P8 | 组件精简：% 尺寸修复、属性面生成化、复合控件声明化重组、legacy API 删除 | ✅ 2026-09-13 | % 尺寸修复 ✅（下详）；legacy 删除 ✅：P8-4 .zform 编译通道删除（C 侧 `zan_is_design_path` 删臂 + main.c 定向拒绝诊断，GenForm 只认 .html，4 份测试 .zform 经 `DesignerHtml.FromJsonDoc` 保真转 .html 入库；IDE 内部 .zform 功能臂清扫留独立提交）；动态原语 ✅ 2026-09-13：`data-if` → `Control.bindIf`（Truthy 真值插拔）+ `<template data-for>` 行克隆展开（原型 UA display:none，ChildWindow 每帧核对数组长度整组重建，行内 bind/bindIf 以本项 JsonValue 为第一作用域、回落根模型，Element 缺省绑定属性 text），运行时 Parse / GenHtml / GenForm+FormBuilder / DesignerHtml 四路同语义（四 conformance：gui_html_dynamic、zform_dynamic、html_runtime、designer_html 扩展；主文档 docs/HTML_UI.md「动态原语」节；边界：嵌套模板不支持、Element 父内模板宜为末子项、ApplyInline 内联声明克隆不带走）；事件带参 ✅ 2026-09-13：`data-arg` 属性 → `Control.handlerArg`，HtmlHandlers/HandlerRegistry 双注册表带参槽，Html.WireArg 落名+实参闭包快照（Wire 契约补齐：名字无注册表也落控件，ChildWindow 宿主可二次解析），ChildWindow.HandleArg/WireNode 带参优先回落无参，GenHtml 发射 handlerArg+WireArg，模板克隆行共享原型实参；GenForm/设计器 v1 不建模（设计稿事件模型纯名字）；gui_html_dynamic/gui_html_runtime 扩展金标不变）；属性面生成化 ✅：P8-2a 局部 Binding<T> 声明初始化降级 + P8-2b class 收敛基类契约 + P8-2c size 枚举收敛 + P8-2d GetExtra/SetExtra 四刀收口（死写面修复 5 键、不可达死臂删除 57 臂 13 文件、ColorPicker/InputNumber 不等价臂三件套转换、ChoiceGroup/RadioGroup options 死臂删除与 slider marks 测试管线化；DataGrid 等余下键全部判决合法 extra-only，29 文件 90 键臂普查闭环）；IDE 内部 .zform 功能臂清扫 ✅ 687faf39（约135处→14处，余为 legacy 导入面；bind 全绿验证）；复合控件声明化重组 ✅（决策：不做——设计器编辑属性面而非复合内部结构，判据见台账）；顺带：`x is T ?` 三元歧义修复（22d75d0e 缺陷①闭账）、void 调用结果当值由静默坏 IR 改定向诊断（280e08d6）、lambda_87 类 closure 签名 verifier 失败挂账（在途树触发、新旧编译器同错，待专项） |
@@ -212,10 +212,18 @@ golden/audit/Inert 名单同步 → 提交 `gui-web(Pn): 主题`。
   注册表 → `Control.BindEvent`（多态，Button 把 Click 路由到专属
   Click 字段）。未映射后缀/未注册名字静默不接线——HTML 是声明，
   断链表现为没反应而非崩溃。
-- **（P5 台账）select 无下拉语义**：映射 Element 占位（容器盒），
-  真下拉待后续期（复用 SelectBox）；`<a>` 无导航语义（行内 Element）。
-- **（P5 台账）忽略的属性**：href/title/disabled/ARIA 等静默忽略，
-  行为在宿主语言。
+- **（P5 台账）select 下拉语义（2026-09-12 后续轮翻转）**：运行时映射
+  SelectBox（option 文本折 options、selected 定下标），见 docs/HTML_UI.md
+  差异清单首条。
+- **（P5 链接导航，2026-09-15 补齐）`<a href>` 缺省导航语义**：缺省路由
+  内嵌 WebView（宿主 UseWebview 就地图优先，否则 App 级 LinkWindow
+  复用窗），target="_blank" 弹系统浏览器；Html.AutoLink 单一入口，
+  LoadHtmlWith 扫描 / ChildWindow.WireNode 二次接线 / 宿主
+  AutoLinkTree 三挂载点；GenHtml 对 `<a>` 放行 href/target 落属性表。
+  边界（http/https 才路由、data-on-click 接管不叠加、cursor 示能
+  无 retained 消费点挂 A91）详见 docs/HTML_UI.md。
+- **（P5 台账）忽略的属性**：title/disabled/ARIA 等静默忽略，
+  行为在宿主语言；href/target 已升级为导航语义（见上条）。
 - **（P5 台账）捕获控件（button/textarea）内嵌元素忽略**：文本并入
   控件自己的捕获协议（button 标签 / textarea 初值）。
 - **（P5 台账）引擎级偏差对 HTML 层同样适用**：行内 run x 累计 ±3px

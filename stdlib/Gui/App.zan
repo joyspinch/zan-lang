@@ -1,6 +1,7 @@
 using System;
 using Gui.Component.Chart;
 using Gui.Backend;
+using Gui.Component.WebView;
 
 namespace Gui;
 
@@ -177,6 +178,12 @@ class App {
     // zs-load-<n> 文档作用域类（与 GenHtml 编译通道同一 scoping
     // 语义，变换器共用 System.Web.HtmlScope）。
     int htmlLoadSeq;
+    // <a href> 缺省路由的宿主注册内嵌网页视图（UseWebview）：非空
+    // 时链接就地 Navigate 它，不开链接窗口。
+    WebViewBox linkBox;
+    // 没有注册就地图时的链接窗口（LinkWindow）：首次点链接懒建，
+    // 之后复用；关掉后再点重建。
+    LinkWindow linkWin;
     // 图表主题包（Gui.Component.Chart/themes/<name>.css）编译出的
     // 独立样式表：解析时垫在内置基线之上、皮肤 sheet 之下，不与
     // 皮肤/appCss 合并成一张表。null = 未安装，图表跟随皮肤。
@@ -1126,14 +1133,46 @@ class App {
         // 多次装载的同名类互不串（System.Web.HtmlScope 共用实现）。
         string zs = "zs-load-" + Convert.ToString(htmlLoadSeq);
         htmlLoadSeq = htmlLoadSeq + 1;
-        if (doc.css != "") {
-            string scoped = HtmlScope.Styles(doc.css, zs);
-            string merged = appCss == "" ? scoped
-                : appCss + "\n" + scoped;
-            this.UseAppCss(merged);
-        }
+        // 无样式文档也要走一遍 UseAppCss：appCss 链（含垫底的 UA
+        // 样式表）只有在 ApplyAppCss 跑过才挂上——过去无 <style> 的
+        // 文档整条 UA 语义（display 分层、body 边距、a 链接主色）
+        // 都缺席。
+        string scoped = doc.css == "" ? "" : HtmlScope.Styles(doc.css, zs);
+        string merged = appCss == "" ? scoped : appCss + "\n" + scoped;
+        this.UseAppCss(merged);
         this.MarkScope(doc.root, zs);
+        Html.AutoLinkTree(doc.root, this);
         return doc.root;
+    }
+
+    /// <summary><a href> 的缺省路由（P5 链接语义）。newWindow
+    /// （target="_blank" 新弹窗）直接弹系统浏览器；否则进内嵌
+    /// WebView：宿主经 UseWebview 注册的就地图优先（就地 Navigate，
+    /// 不另开窗），没有就懒建一个 App 级链接窗口（LinkWindow，全程
+    /// 复用）。WebView 运行时不可用时由 LinkWindow 首帧回落系统
+    /// 浏览器。</summary>
+    void OpenLink(string url, bool newWindow) {
+        if (!newWindow) {
+            if (this.linkBox != null
+                    && this.linkBox.View().IsSupported()) {
+                this.linkBox.Navigate(url);
+                return;
+            }
+            if (this.linkWin == null || !this.linkWin.IsOpen()) {
+                this.linkWin = new LinkWindow();
+            }
+            this.linkWin.Navigate(url, this);
+            return;
+        }
+        Html.OpenInSystemBrowser(url);
+    }
+
+    /// 注册宿主自有的内嵌网页视图（如应用自带的浏览器标签）：
+    /// 之后 <a href> 的缺省路由就地 Navigate 它而不开链接窗口。
+    /// 传 null 注销。WebView 运行时不可用（IsSupported false）的
+    /// 注册会被 OpenLink 忽略并走链接窗口/系统浏览器。
+    void UseWebview(WebViewBox box) {
+        this.linkBox = box;
     }
 
     /// 给装载树每个元素补作用域类（编译通道由生成码逐节点 AddClass，
@@ -1188,9 +1227,16 @@ class App {
     /// 重建成本可忽略，且不做指纹早退——换肤与热重载后必须重建。
     void ApplyAppCss() {
         StyleSheet fresh = new StyleSheet();
+        // 主题 token 先收集：UA 样式表同样要认得 var(--primary) 一类
+        // 主题变量（<a> 的链接主色）——过去 UA 层用裸 FromCss 解析，
+        // var() 展开为空、整条声明消失。皮肤 :root 的继承变量随后
+        // 叠加，appCss 的展开名单不受影响。
+        List<string> vn = new List<string>();
+        List<string> vv = new List<string>();
+        Css.CollectVars(Style.RootFromTheme(theme), vn, vv);
         // UA 样式表垫底（WEB_GUI_ROADMAP P0）：web 元素缺省语义，
         // 皮肤与应用样式按层叠覆盖。UseCss 隔离皮肤时 UA 仍然在。
-        fresh.MergeSheet(StyleSheet.FromCss(Style.UaCss()));
+        fresh.MergeSheet(Css.ParseWithSources(Style.UaCss(), vn, vv, 0));
         if (skinName != "") {
             Skin s = Skin.Load(skinName);
             if (s.IsLoaded()) { fresh.MergeSheet(s.sheet); }
@@ -1202,9 +1248,6 @@ class App {
         // 展开成空值（var() 过去只在同一份源文本内查找）。这些外来
         // 变量只用于展开，不写进 sheet.vars——那份表代表皮肤自己声明
         // 了什么（Skin.ThemeOf 按它推导主题）。
-        List<string> vn = new List<string>();
-        List<string> vv = new List<string>();
-        Css.CollectVars(Style.RootFromTheme(theme), vn, vv);
         int themeVarCount = vn.Count;
         if (fresh.vars != null) {
             for (int i = 0; i < fresh.vars.Count(); i = i + 1) {

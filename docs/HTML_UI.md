@@ -282,8 +282,24 @@ font-size/transition）完全生效，不受几何影响。这是对浏览器 "i
 - **行内样式是类级特异性**：style 属性合成 `.zgen-N` 规则参与级联，
   不是浏览器的 inline style 特异性（高于任何选择器）。与 id/类选择器
   的先后按"appCss 段内出现顺序"结算；`!important` 可覆盖。
-- **忽略的属性**：href/title/disabled/alt 之外的 ARIA 等一律静默忽略；
-  链接没有导航语义（`<a>` 是行内 Element）。
+- **忽略的属性**：ARIA 等 a11y 属性一律静默忽略。href/target 是例外
+  ——`<a>` 有缺省导航语义（见下条）。
+- **链接导航是桌面映射**：`<a href="http(s)://...">` 建树时由
+  `Html.AutoLink` 接上缺省 Click 导航——缺省路由到内嵌 WebView
+  （宿主 `App.UseWebview(box)` 注册的就地图优先，没有则懒建一个
+  App 级链接窗口 `LinkWindow`，全程复用、页面标题同步到窗口标题）；
+  `target="_blank"`（新弹窗）弹系统浏览器（Windows
+  ShellExecuteW / POSIX xdg-open+open，URL 引号转义防注入）。WebView
+  运行时不可用（缺 WebView2/WKWebView）时首帧回落系统浏览器。
+  三个接线入口：`App.LoadHtmlWith` 装载扫描、`ChildWindow.WireNode`
+  二次接线（模板行克隆也生效）、挂主窗口的生成/手搭树由宿主
+  `Html.AutoLinkTree(root, app)` 扫一遍。边界：已有 data-on-click
+  即宿主接管不叠加（幂等）；href 只认 http/https——相对路径（无
+  base 可解析）、`#` 锚（保留树无滚动目标）、`javascript:`/`mailto:`
+  等其它 scheme（脚本执行/shell 关联程序）一律不路由；`data-for`
+  行克隆走 WireNode 补接，语义与浏览器差异见上。UA 样式表给
+  `a { color: var(--primary) }` 示能（无 underline 绘制原语，
+  retained 模式也没有 cursor 消费点——见 TASKS.md A47）。
 - **捕获控件的内嵌元素忽略**：`<button><span>x</span></button>` 的
   span 不建树，文本并入按钮标签。
 - **事件模型是宿主委托**：没有 DOM 冒泡/捕获/.preventDefault——

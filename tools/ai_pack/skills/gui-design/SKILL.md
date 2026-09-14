@@ -145,6 +145,17 @@ small-medium 之间**:画廊卡片标题先后用 13/15 都被打回"太小",17 
   控件换成原生标签;批量转换用探针校验——新旧稿各过
   `DesignerHtml.ToJsonDoc` 比模型,除有意的形状变化(如滑条 min/max
   从 props 袋提为原生属性)外应逐字节 SAME。
+- **`<a href>` 自带导航语义,别再手接 data-on-click 当链接用**(2026-09-15
+  起,此前 `<a>` 只是行内 Element、href 静默忽略):http/https 链接建树时
+  自动接缺省导航——缺省进内嵌 WebView(宿主 `app.UseWebview(box)` 注册过
+  就地图,没注册懒开 App 级链接窗口复用),`target="_blank"` 弹系统浏览器;
+  WebView 运行时不可用自动回落系统浏览器。边界:href 只认 http/https
+  (相对路径无 base、`#` 锚无滚动目标、`javascript:`/`mailto:` 涉脚本与
+  shell 关联程序,一律不路由);元素写了 `data-on-click` 即宿主接管、不再
+  叠加导航;运行时通道(LoadHtmlWith)与生成通道都生效,挂主窗口的生成树
+  需宿主补一遍 `Html.AutoLinkTree(root, app)`。视觉:UA 给
+  `a { color: var(--primary) }`(引擎没有下划线绘制原语,retained 模式
+  也还没有 cursor 消费点——色差即示能)。
 - **导入侧两个静默坑**(都真踩过):①读端属性循环里,专用分支必须排在
   通用分支之前——checkbox/radio 的 value 是文案(→label)、progress 的
   value/max 要截流(→percent),排进通用 value/min/max 分支之后就成了

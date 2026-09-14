@@ -1,10 +1,13 @@
 using System;
+using System.Diagnostics;
 using System.Web;
 // 控件映射用的是裸 Button/TextArea/Checkbox/Input/Image——这些类型在
 // Gui.Widget 命名空间里，必须显式 import；不写的话只靠 binder 的全局
 // 唯一简单名兜底才能编过，一旦用户项目定义了同名全局类（如 class
 // TextArea）这里就会炸。同 A314。
 using Gui.Widget;
+// 链接的系统浏览器回落通道（ShellOpenUrl）在 Gui.Backend。
+using Gui.Backend;
 
 namespace Gui;
 
@@ -391,4 +394,60 @@ class Html {
         string captured = arg;
         c.BindEvent(evt, () => { a(captured); });
     }
+
+    // ---- <a> 链接导航（P5 链接语义） --------------------------------
+    //
+    // 桌面映射：<a href="http..."> 缺省路由到内嵌 WebView（宿主经
+    // UseWebview 注册的就地图优先，没有就 App 级链接窗口），
+    // target="_blank"（新弹窗）直接弹系统浏览器。三个入口共用
+    // AutoLink：LoadHtmlWith 装载扫描、ChildWindow.WireNode 二次
+    // 接线（模板行克隆等）、宿主对手搭/生成树的 AutoLinkTree。
+
+    /// 给一个元素接上缺省导航。已有 Click 监听（data-on-click 或
+    /// 宿主程序化 OnClick）即宿主接管，不再叠加；app 为 null 不接
+    /// （编译期生成的树没有 App 上下文，由挂载它的窗口 WireNode
+    /// 或宿主 AutoLinkTree 补）。幂等：已接 Click 的元素跳过。
+    static void AutoLink(Control c, App app) {
+        if (app == null) { return; }
+        if (!(c is Element)) { return; }
+        if (c.On.Click.Count() > 0) { return; }
+        string href = c.CssAttr("href");
+        if (!Html.Navigable(href)) { return; }
+        bool blank = c.CssAttr("target") == "_blank";
+        c.BindEvent("Click", () => { app.OpenLink(href, blank); });
+    }
+
+    /// 对一棵树做链接扫描（LoadHtmlWith / 宿主自挂的手搭或生成树）。
+    static void AutoLinkTree(Control root, App app) {
+        if (root == null) { return; }
+        Html.AutoLink(root, app);
+        for (int i = 0; i < root.children.Count; i = i + 1) {
+            Html.AutoLinkTree(root.children[i], app);
+        }
+    }
+
+    /// href 可路由：仅 http/https（大小写不敏感）。相对路径没有
+    /// base 可解析；# 锚在保留树上无滚动目标；javascript:/mailto:
+    /// 等其它 scheme 涉及脚本执行或 shell 关联程序——本版一律
+    /// 不路由（宁缺毋滥，AI 生成的 UI 不至于误触系统处理器）。
+    static bool Navigable(string href) {
+        if (href == "") { return false; }
+        string low = href.ToLower();
+        return HtmlText.StartsWith(low, "http://")
+            || HtmlText.StartsWith(low, "https://");
+    }
+
+    /// 系统关联程序打开 url（target="_blank" 与 WebView 不可用时的
+    /// 回落通道）。Windows 走 ShellExecuteW——不经 cmd.exe，URL 里
+    /// 的 & ? # 等元字符不会被 shell 吃掉；POSIX 经 RunDetached 的
+    /// sh，URL 单引号包裹 + '\'' 转义防注入。
+    static void OpenInSystemBrowser(string url) {
+        #if WINDOWS
+        Win32Shell.ShellOpenUrl(url);
+        #else
+        string q = url.Replace("'", "'\\''");
+        Process.RunDetached("(xdg-open '" + q + "' || open '" + q + "')");
+        #endif
+    }
 }
+

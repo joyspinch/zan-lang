@@ -1,0 +1,72 @@
+using Gui.Component.WebView;
+
+namespace Gui;
+
+/// `<a href>` 缺省路由的链接窗口（App.OpenLink 懒建，每个 App 全程
+/// 复用一个）：整棵保留树就是一枚 WebViewBox，根控件直接拿满窗口
+/// 客户区；页面标题经 TitleChanged 同步到 OS 窗口标题。运行时
+/// WebView 不可用（缺 WebView2/WKWebView 运行时，首次 Render 创建
+/// 失败）时首帧后自动把这次导航转交系统浏览器并关窗——链接不能
+/// 表现为"点了没反应"。
+class LinkWindow : ChildWindow {
+    WebViewBox wv;
+    /// 最近一次导航目标（WebView 不可用时的系统浏览器回落对象；
+    /// 回落完成后清空防重复打开）。
+    string lastUrl;
+    int idBase;
+
+    LinkWindow() {
+        wv = null;
+        lastUrl = "";
+        idBase = 935000;
+    }
+
+    override string Title() { return "Web"; }
+
+    override int Width() { return 980; }
+
+    override int Height() { return 660; }
+
+    /// 每个窗口一枚固定的 WidgetId 基线（主窗口不回卷进程级计数，
+    /// 子窗口不钉基线则控件 hover/press 每帧错位）。
+    override int IdBase() { return idBase; }
+
+    /// 导航：首次调用建窗口（跟随 parent 的皮肤/标题栏约定），
+    /// 之后只 Navigate（已开的窗口再次点链接 = 原地换页）。
+    void Navigate(string url, App parent) {
+        lastUrl = url;
+        if (wv == null) {
+            wv = new WebViewBox();
+            wv.BindEvent("TitleChanged", () => {
+                string t = wv.CurrentTitle();
+                if (t != "" && host != null) { host.SetWindowTitle(t); }
+            });
+            this.SetRoot(wv, null);
+            this.OpenHost(parent);
+        }
+        wv.Navigate(url);
+    }
+
+    /// 首帧之后原生视图必然已创建：IsSupported 翻 false 即创建失败
+    /// （平台没有 WebView 运行时），这次导航转交系统浏览器并关窗。
+    override void AfterFrame() {
+        if (wv == null || wv.View().IsSupported()) { return; }
+        if (lastUrl != "") {
+            string u = lastUrl;
+            lastUrl = "";
+            Html.OpenInSystemBrowser(u);
+        }
+        wv.Destroy();
+        wv = null;
+        this.Close();
+    }
+
+    /// 用户点标题栏 X：先销毁原生视图（每个 WebViewBox 一个浏览器
+    /// 实例，不随 Teardown 的窗口/画布销毁自动释放）。
+    override void OnCloseRequested() {
+        if (wv != null) {
+            wv.Destroy();
+            wv = null;
+        }
+    }
+}

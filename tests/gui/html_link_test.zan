@@ -1,0 +1,104 @@
+// <a> 链接导航语义（P5）端到端：运行时 LoadHtmlWith 装载扫描与
+// GenHtml 编译通道（html_link.html 随编译生成 HtmlLinkHtml）两条建
+// 树路都给 <a href> 接上缺省导航——http/https 进内嵌 WebView 路由
+// （App.OpenLink），target="_blank" 弹系统浏览器；# 锚/javascript:
+// 等不可路由 href 不接；宿主 data-on-click 接管时不叠加（幂等）。
+// 另断言 UA 示能（accent 色 + pointer 光标只给 a，不给 span）。
+// 无头只验证接线与样式，不真触发点击（触发会开窗/开系统浏览器）。
+using System;
+using Gui;
+
+class HtmlLinkProbe {
+    static int fails;
+
+    static void Eq(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": "
+            + Convert.ToString(got) + " != " + Convert.ToString(want));
+    }
+
+    static void EqS(string what, string got, string want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": '" + got
+            + "' != '" + want + "'");
+    }
+
+    static Element El(Control c) {
+        return c is Element ? (Element)c : null;
+    }
+
+    static void Main() {
+        Form f = Form.Create("link", 400, 300);
+        App app = f.GetApp();
+
+        // ---- 运行时通道：LoadHtmlWith 装载扫描（App sweep） ----
+        HtmlHandlers hs = new HtmlHandlers();
+        hs.Add("mine", () => { });
+        Control rt = app.LoadHtmlWith(
+            "<a href=\"https://example.com/x\" id=\"B1\">x</a>"
+            + "<a href=\"https://example.com/y\" target=\"_blank\""
+            + " id=\"B2\">y</a>"
+            + "<a href=\"#top\" id=\"B3\">anchor</a>"
+            + "<a href=\"javascript:alert(1)\" id=\"B4\">js</a>"
+            + "<a href=\"https://example.com/z\""
+            + " data-on-click=\"mine\" id=\"B5\">z</a>"
+            + "<span id=\"B6\">s</span>", hs, "");
+        Element b1 = El(rt.Find("B1"));
+        Element b2 = El(rt.Find("B2"));
+        Element b3 = El(rt.Find("B3"));
+        Element b4 = El(rt.Find("B4"));
+        Element b5 = El(rt.Find("B5"));
+        Element b6 = El(rt.Find("B6"));
+        EqS("B1 href kept",
+            b1 == null ? "" : b1.CssAttr("href"),
+            "https://example.com/x");
+        Eq("B1 wired once",
+            b1 == null ? 0 - 1 : b1.On.Click.Count(), 1);
+        Eq("B2 blank wired once",
+            b2 == null ? 0 - 1 : b2.On.Click.Count(), 1);
+        Eq("B3 anchor unrouted",
+            b3 == null ? 0 - 1 : b3.On.Click.Count(), 0);
+        Eq("B4 javascript unrouted",
+            b4 == null ? 0 - 1 : b4.On.Click.Count(), 0);
+        Eq("B5 host handler owns (no auto-link stacking)",
+            b5 == null ? 0 - 1 : b5.On.Click.Count(), 1);
+        EqS("B5 keeps handler name",
+            b5 == null || b5.events.Count < 1 ? "" : b5.events[0].val,
+            "mine");
+        Eq("B6 span unwired",
+            b6 == null ? 0 - 1 : b6.On.Click.Count(), 0);
+        StyleBox sb = b1 == null ? null : b1.ResolveStyle(app, 0);
+        Eq("ua link gets accent color",
+            sb == null || sb.fg == 0 ? 0 : 1, 1);
+        StyleBox sp = b6 == null ? null : b6.ResolveStyle(app, 0);
+        Eq("ua span not link-colored",
+            sp == null || sb == null || sp.fg == sb.fg ? 0 : 1, 1);
+
+        // ---- 编译通道：GenHtml 生成类 ----
+        // 生成树建的时候没有 App，缺省导航由挂载方补：挂子窗口走
+        // WireNode，挂主窗口宿主扫一遍 AutoLinkTree。
+        Control gt = HtmlLinkHtml.Build(null);
+        Element a1 = El(gt.Find("A1"));
+        Element a2 = El(gt.Find("A2"));
+        Element a3 = El(gt.Find("A3"));
+        EqS("gen A1 href into attr table",
+            a1 == null ? "" : a1.CssAttr("href"),
+            "https://example.com/p");
+        EqS("gen A2 target into attr table",
+            a2 == null ? "" : a2.CssAttr("target"), "_blank");
+        Eq("gen A1 unwired before sweep",
+            a1 == null ? 0 - 1 : a1.On.Click.Count(), 0);
+        Html.AutoLinkTree(gt, app);
+        Eq("gen A1 wired", a1 == null ? 0 - 1 : a1.On.Click.Count(), 1);
+        Eq("gen A2 wired", a2 == null ? 0 - 1 : a2.On.Click.Count(), 1);
+        Eq("gen A3 anchor unrouted",
+            a3 == null ? 0 - 1 : a3.On.Click.Count(), 0);
+        Html.AutoLinkTree(gt, app);
+        Eq("gen sweep idempotent",
+            a1 == null ? 0 - 1 : a1.On.Click.Count(), 1);
+
+        if (fails == 0) { Console.WriteLine("GUI_HTML_LINK_OK"); }
+    }
+}

@@ -2802,6 +2802,19 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_html_scope${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # <a> 链接导航语义（P5）：运行时 LoadHtmlWith 与 GenHtml 编译通道
+  # 两条建树路都给 <a href> 接上缺省导航（http/https 进内嵌 WebView，
+  # target="_blank" 弹系统浏览器），# 锚/javascript: 不路由，宿主
+  # data-on-click 接管不叠加，UA 给 a accent 色 + pointer 光标。
+  add_test(NAME conformance_gui_html_link
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/html_link_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/html_link.html;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_html_link.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_html_link${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # Declarative typed grid: a DataGrid field with "of" + "columns" projects
   # typed accessor lambdas onto the generic column API, binds the caller's
   # List<T> directly (no DataRow), and "props"/"rowFactory" reach the state.
