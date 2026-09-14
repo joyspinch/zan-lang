@@ -2588,6 +2588,26 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                                                 locals);
         zan_type_t *fe_enum_ty = foreach_proto_enum_type(g, col_type0);
         zan_type_t *fe_cur_ty = foreach_proto_current_type(g, col_type0);
+        if (!fe_enum_ty && col_type0 && col_type0->kind == TYPE_CLASS &&
+            col_type0->sym) {
+            /* GetEnumerator returning an interface is a protocol-shaped
+             * collection the loop cannot dispatch yet; without this guard it
+             * would silently fall through to the legacy List layout and read
+             * unrelated memory. Say so instead. */
+            zan_istr_t gi = { (char *)"GetEnumerator", 13 };
+            zan_symbol_t *gm = resolve_overload(col_type0->sym, gi, 0);
+            if (gm && gm->decl && gm->decl->kind == AST_METHOD_DECL &&
+                gm->decl->method_decl.return_type) {
+                zan_type_t *rt = resolve_type_ctx(g,
+                    gm->decl->method_decl.return_type);
+                if (rt && rt->kind == TYPE_INTERFACE)
+                    zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
+                        "foreach: GetEnumerator() returning interface '%.*s' "
+                        "is not supported yet; return the concrete enumerator "
+                        "type so the loop can call MoveNext/Current directly",
+                        (int)rt->name.len, rt->name.str);
+            }
+        }
         zan_symbol_t *fe_get_m = NULL;
         zan_symbol_t *fe_next_m = NULL, *fe_cur_m = NULL, *fe_cur_getter = NULL;
         if (fe_enum_ty) {

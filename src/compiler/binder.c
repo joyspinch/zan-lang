@@ -1191,8 +1191,27 @@ static bool binder_type_equal(zan_type_t *a, zan_type_t *b, int depth) {
     return true;
 }
 
+/* True when `t` is `sup`, or reaches it through its interface list or base
+ * chain. Used for covariant interface-method returns: the implementation may
+ * return a subtype of what the interface declares (a concrete enumerator for
+ * `IEnumerator<T> GetEnumerator()`). */
+static bool binder_type_derives(zan_type_t *t, zan_type_t *sup, int depth) {
+    if (!t || !sup || depth > 64) return false;
+    if (t == sup) return true;
+    if (t->sym && sup->sym && t->sym == sup->sym)
+        return binder_type_equal(t, sup, 0);
+    for (int i = 0; i < t->interface_count; i++)
+        if (binder_type_derives(t->interfaces[i], sup, depth + 1))
+            return true;
+    if (t->base_type && t->base_type != t)
+        return binder_type_derives(t->base_type, sup, depth + 1);
+    return false;
+}
+
 static bool method_signature_equal(zan_binder_t *b, zan_ast_node_t *a,
-                                   zan_ast_node_t *other) {
+                                   zan_ast_node_t *other,
+                                   zan_ast_list_t *bind_tps,
+                                   zan_type_t **bind_args) {
     if (!a || !other || a->kind != AST_METHOD_DECL ||
         other->kind != AST_METHOD_DECL ||
         a->method_decl.name.len != other->method_decl.name.len ||
@@ -1208,13 +1227,23 @@ static bool method_signature_equal(zan_binder_t *b, zan_ast_node_t *a,
         ? zan_binder_resolve_type(b, a->method_decl.return_type) : b->type_void;
     zan_type_t *br = other->method_decl.return_type
         ? zan_binder_resolve_type(b, other->method_decl.return_type) : b->type_void;
+    /* A use-site instantiation (`class Range : IEnumerable<int>`) binds the
+     * interface's parameters to concrete arguments; the declared signatures
+     * are re-resolved with those bindings so `IEnumerator<T> GetEnumerator()`
+     * compares as IEnumerator<int>. */
+    if (bind_tps && bind_tps->count > 0 && bind_args) {
+        zan_type_t *sr = zan_binder_subst_named(b, br, bind_tps, bind_args);
+        if (sr) br = sr;
+    }
     /* An interface method may be phrased in the interface's own type
      * parameters (`interface I<T> { T Get(); }`). Against an implementing
      * type's concrete signature the parameter is a wildcard -- `int Get()`
      * implements `T Get()` for the binding `T := int`. */
     bool a_tp = ar && ar->kind == TYPE_TYPE_PARAM;
     bool b_tp = br && br->kind == TYPE_TYPE_PARAM;
-    if (!(a_tp || b_tp) && !binder_type_equal(ar, br, 0)) return false;
+    if (!(a_tp || b_tp) && !binder_type_equal(ar, br, 0) &&
+        !binder_type_derives(ar, br, 0))
+        return false;
     for (int i = 0; i < a->method_decl.params.count; i++) {
         zan_ast_node_t *ap = a->method_decl.params.items[i];
         zan_ast_node_t *bp = other->method_decl.params.items[i];
@@ -1225,6 +1254,10 @@ static bool method_signature_equal(zan_binder_t *b, zan_ast_node_t *a,
             return false;
         zan_type_t *at = zan_binder_resolve_type(b, ap->param.type);
         zan_type_t *bt = zan_binder_resolve_type(b, bp->param.type);
+        if (bind_tps && bind_tps->count > 0 && bind_args) {
+            zan_type_t *st = zan_binder_subst_named(b, bt, bind_tps, bind_args);
+            if (st) bt = st;
+        }
         bool at_tp = at && at->kind == TYPE_TYPE_PARAM;
         bool bt_tp = bt && bt->kind == TYPE_TYPE_PARAM;
         if (!(at_tp || bt_tp) && !binder_type_equal(at, bt, 0)) return false;
@@ -1236,7 +1269,7 @@ static bool type_declares_method(zan_binder_t *b, zan_ast_node_t *type_node,
                                  zan_ast_node_t *wanted) {
     for (int i = 0; i < type_node->type_decl.members.count; i++) {
         zan_ast_node_t *m = type_node->type_decl.members.items[i];
-        if (method_signature_equal(b, m, wanted)) return true;
+        if (method_signature_equal(b, m, wanted, NULL, NULL)) return true;
     }
     return false;
 }
@@ -1281,13 +1314,16 @@ static void bind_default_interface_methods(zan_binder_t *b, zan_ast_list_t *decl
 }
 
 static bool class_has_interface_method(zan_binder_t *b, zan_symbol_t *cls,
-                                       zan_ast_node_t *wanted) {
+                                       zan_ast_node_t *wanted,
+                                       zan_ast_list_t *bind_tps,
+                                       zan_type_t **bind_args) {
     for (zan_symbol_t *s = cls; s; s = (s->type && s->type->base_type)
              ? s->type->base_type->sym : NULL) {
         for (int i = 0; i < s->member_count; i++) {
             zan_symbol_t *m = s->members[i];
             if (m && m->kind == SYM_METHOD && m->decl &&
-                method_signature_equal(b, m->decl, wanted))
+                method_signature_equal(b, m->decl, wanted, bind_tps,
+                                       bind_args))
                 return true;
         }
     }
@@ -1295,7 +1331,19 @@ static bool class_has_interface_method(zan_binder_t *b, zan_symbol_t *cls,
 }
 
 static void validate_interface_contract(zan_binder_t *b, zan_symbol_t *cls,
-                                        zan_ast_node_t *iface, int depth) {
+                                        zan_ast_node_t *iface,
+                                        zan_type_t *inst, int depth) {
+    /* The use-site binding for this interface edge (`IEnumerable<int>`),
+     * passed as the materialized instantiation from the class's interface
+     * list; NULL for recursive walks whose edges are phrased in the outer
+     * interface's own parameters. */
+    zan_ast_list_t *bind_tps = NULL;
+    zan_type_t **bind_args = NULL;
+    if (inst && inst->type_arg_count > 0 &&
+        inst->type_arg_count == iface->type_decl.type_params.count) {
+        bind_tps = &iface->type_decl.type_params;
+        bind_args = inst->type_args;
+    }
     if (!iface || depth > 64) return;
     /* An interface method may be phrased in the interface's own type
      * parameters (`interface I<T> { T Get(); }`). The signature comparison
@@ -1314,7 +1362,7 @@ static void validate_interface_contract(zan_binder_t *b, zan_symbol_t *cls,
             (im->method_decl.modifiers & MOD_STATIC) != 0 ||
             im->method_decl.body)
             continue;
-        if (!class_has_interface_method(b, cls, im)) {
+        if (!class_has_interface_method(b, cls, im, bind_tps, bind_args)) {
             zan_diag_emit(b->diag, DIAG_ERROR, im->loc,
                           "type '%.*s' does not implement interface method '%.*s'",
                           (int)cls->name.len, cls->name.str,
@@ -1327,7 +1375,7 @@ static void validate_interface_contract(zan_binder_t *b, zan_symbol_t *cls,
         if (bref->kind != AST_TYPE_REF) continue;   /* invalid base: rejected at resolve time */
         zan_symbol_t *base = scope_find(b->current_scope, bref->type_ref.name);
         if (base && base->kind == SYM_INTERFACE && base->decl)
-            validate_interface_contract(b, cls, base->decl, depth + 1);
+            validate_interface_contract(b, cls, base->decl, NULL, depth + 1);
     }
     b->current_scope = saved;
 }
@@ -1341,7 +1389,7 @@ static void validate_interface_contracts(zan_binder_t *b, zan_ast_list_t *decls)
         for (int j = 0; j < cls->type->interface_count; j++) {
             zan_type_t *iface = cls->type->interfaces[j];
             if (iface && iface->sym && iface->sym->decl)
-                validate_interface_contract(b, cls, iface->sym->decl, 0);
+                validate_interface_contract(b, cls, iface->sym->decl, iface, 0);
         }
     }
 }
