@@ -998,6 +998,39 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
  * (the base one stays in the prefix, so base methods still read and write
  * the field they were compiled against) and a name resolves to the last
  * declaration for the static type in hand -- see get_field_index. */
+/* Whether every generic argument of a declared base type reference names a
+ * type this scope can resolve without a diagnostic: a builtin primitive or a
+ * symbol visible here. Guards the interface-instantiation path in
+ * resolve_bases, which runs at global scope where a declaring type's own
+ * type parameters (`interface I<T> : J<T>`) are not bound -- resolve_type
+ * would report "undefined type 'T'" for a perfectly valid declaration. */
+static bool base_args_resolvable(zan_binder_t *b, zan_ast_node_t *type_ref) {
+    if (!type_ref || type_ref->kind != AST_TYPE_REF) return false;
+    zan_ast_list_t *args = &type_ref->type_ref.type_args;
+    for (int i = 0; i < args->count; i++) {
+        zan_ast_node_t *arg = args->items[i];
+        if (!arg || arg->kind != AST_TYPE_REF) return false;
+        zan_istr_t n = arg->type_ref.name;
+        if (istr_eq(n, "void", 4) || istr_eq(n, "bool", 4) ||
+            istr_eq(n, "byte", 4) || istr_eq(n, "short", 5) ||
+            istr_eq(n, "int", 3) || istr_eq(n, "long", 4) ||
+            istr_eq(n, "sbyte", 5) || istr_eq(n, "ushort", 6) ||
+            istr_eq(n, "uint", 4) || istr_eq(n, "ulong", 5) ||
+            istr_eq(n, "float", 5) || istr_eq(n, "double", 6) ||
+            istr_eq(n, "decimal", 7) || istr_eq(n, "char", 4) ||
+            istr_eq(n, "string", 6) || istr_eq(n, "object", 6) ||
+            istr_eq(n, "nint", 4))
+            continue;
+        if (!scope_find(b->current_scope, n)) return false;
+        /* Nested generic arguments resolve recursively through the same
+         * guard; a name that resolves but carries unresolvable arguments of
+         * its own falls back to the template via resolve_type's result
+         * check in the caller. */
+        if (!base_args_resolvable(b, arg)) return false;
+    }
+    return true;
+}
+
 static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
     zan_symbol_t *type_sym = scope_find(b->current_scope, type_node->type_decl.name);
     if (!type_sym || !type_sym->type || type_sym->decl != type_node) return;
@@ -1082,6 +1115,26 @@ static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
             } else if (base_sym->kind == SYM_INTERFACE) {
                 if (base_sym->decl) resolve_bases(b, base_sym->decl);
                 if (base_sym->type->bases_resolved != 2) continue;
+                /* `class Range : Seq<int>` must record the *instantiation*,
+                 * not the interface's canonical template: the template's
+                 * arguments are the bare type parameters, so every
+                 * derivation check against a use-site `Seq<int>` compared
+                 * Seq<T> with Seq<int> and failed ("cannot convert 'Range'
+                 * to 'Seq' in initializer"), while argument positions
+                 * resolved the target through resolve_type and worked.
+                 * Only instantiate when every declared argument is a name
+                 * this scope can already resolve: inside `interface I<T> :
+                 * J<T>` the type parameter is not in scope during pass 3,
+                 * and resolve_type would emit a bogus "undefined type 'T'"
+                 * before we could fall back to the template. */
+                if (base_args_resolvable(b, base_ref)) {
+                    zan_type_t *inst = zan_binder_resolve_type(b, base_ref);
+                    if (inst && inst->kind == TYPE_INTERFACE &&
+                        inst != b->type_error) {
+                        ifaces[nif++] = inst;
+                        continue;
+                    }
+                }
                 ifaces[nif++] = base_sym->type;
             }
         }

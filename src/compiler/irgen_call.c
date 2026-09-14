@@ -4713,6 +4713,18 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         iface_m->decl->method_decl.return_type)
                         rty = zan_binder_resolve_type(g->binder,
                                   iface_m->decl->method_decl.return_type);
+                    /* A use-site `Seq<int>` carries the interface's
+                     * instantiation, but the method's declared signature
+                     * names the bare type parameters -- `T At(int i)`
+                     * resolves `T` to an opaque pointer and the dispatch
+                     * phi/argument types disagree with every concrete
+                     * implementation (LLVM "operands are not of the same
+                     * type"). Substitute the declared arguments for the
+                     * interface's type parameters in both directions. */
+                    zan_ast_list_t *ifc_tps = &iface->decl->type_decl.type_params;
+                    bool ifc_generic = obj_ty->type_arg_count > 0 &&
+                        obj_ty->type_arg_count == ifc_tps->count &&
+                        iface->decl->kind == AST_INTERFACE_DECL;
                     /* An async method's ramp hands back a coroutine frame, not
                      * the declared return value, so dispatching one has to keep
                      * the handle as a pointer for `await` to drive -- coercing
@@ -4722,6 +4734,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         iface_m->decl->kind == AST_METHOD_DECL &&
                         (iface_m->decl->method_decl.modifiers & MOD_ASYNC) != 0;
                     bool has_res = m_async || (rty && rty->kind != TYPE_VOID);
+                    if (ifc_generic && rty)
+                        rty = zan_binder_subst_named(g->binder, rty,
+                                                     ifc_tps, obj_ty->type_args);
                     LLVMTypeRef res_ty = m_async ? i8ptr
                                                  : (has_res ? map_type(g, rty) : NULL);
 
@@ -4732,10 +4747,15 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMValueRef *avals = (LLVMValueRef *)calloc((size_t)(uargc > 0 ? uargc : 1),
                                                                 sizeof(LLVMValueRef));
                     for (int k = 0; k < uargc; k++) {
+                        zan_type_t *pat = method_param_type_at(g, iface_m, k, expr,
+                                                               callee->member.object,
+                                                               locals);
+                        if (ifc_generic && pat)
+                            pat = zan_binder_subst_named(g->binder, pat,
+                                                         ifc_tps,
+                                                         obj_ty->type_args);
                         avals[k] = emit_arg_typed(g, expr->call.args.items[k],
-                                                  method_param_type_at(g, iface_m, k, expr,
-                                                      callee->member.object, locals),
-                                                  locals);
+                                                  pat, locals);
                         n_eh_args += emit_call_arg_eh_push(g, expr->call.args.items[k],
                                                           avals[k], locals);
                     }

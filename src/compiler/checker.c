@@ -913,6 +913,60 @@ static bool checker_type_equal(zan_type_t *a, zan_type_t *b) {
     return true;
 }
 
+/* Whether one declared base edge proves a derivation. `edge_ref` is the
+ * declaring type's `Base<...>` extends/implements clause (AST), `tps`/`args`
+ * are that type's parameters and the use-site instantiation's actual
+ * arguments, `sup` the target instantiation. A parameter position matches
+ * when the mapped argument equals the target's; a concrete position compares
+ * names (nested generic arguments are conservative rejects). Generic
+ * invariance is preserved: Box<int> never derives Box<string>. */
+static bool iface_edge_derives_params_ast(zan_ast_node_t *edge_ref,
+                                          zan_ast_list_t *tps,
+                                          zan_type_t **args,
+                                          zan_type_t *sup) {
+    if (!edge_ref || edge_ref->kind != AST_TYPE_REF || !sup || !sup->sym)
+        return false;
+    zan_istr_t en = edge_ref->type_ref.name;
+    if (en.len != sup->sym->name.len ||
+        memcmp(en.str, sup->sym->name.str, (size_t)en.len) != 0)
+        return false;
+    zan_ast_list_t *eargs = &edge_ref->type_ref.type_args;
+    int want = sup->type_arg_count;
+    if (eargs->count != want) return false;
+    for (int j = 0; j < want; j++) {
+        zan_ast_node_t *ea = eargs->items[j];
+        if (!ea) return false;
+        if (ea->kind == AST_TYPE_REF && ea->type_ref.type_args.count > 0)
+            return false; /* concrete generic argument: conservative reject */
+        /* A bare name in type position parses as an AST_TYPE_REF (parser.c
+         * parse_type_ref), so both identifiers and naked type refs arrive
+         * here; either may name the declaring type's parameter or a
+         * concrete type. */
+        zan_istr_t ename;
+        if (ea->kind == AST_IDENTIFIER) ename = ea->ident.name;
+        else if (ea->kind == AST_TYPE_REF) ename = ea->type_ref.name;
+        else return false;
+        int k = 0;
+        for (; k < tps->count; k++) {
+            zan_istr_t tn = tps->items[k]->ident.name;
+            if (tn.len == ename.len &&
+                memcmp(tn.str, ename.str, (size_t)tn.len) == 0)
+                break;
+        }
+        if (k < tps->count) {
+            if (args == NULL || args[k] == NULL ||
+                !checker_type_equal(args[k], sup->type_args[j]))
+                return false;
+        } else {
+            zan_type_t *sa = sup->type_args[j];
+            if (!sa || ename.len != sa->name.len ||
+                memcmp(ename.str, sa->name.str, (size_t)sa->name.len) != 0)
+                return false;
+        }
+    }
+    return true;
+}
+
 /* True when `sub` is, implements, or derives from `sup` -- the same relation
  * type_satisfies_constraint computes for `where T : C` clauses. Depth-guarded
  * so a (defensively) cyclic class hierarchy can never loop forever. */
@@ -937,6 +991,26 @@ static bool checker_type_derives_from_depth(zan_type_t *sub, zan_type_t *sup,
         base = sub->sym->type->base_type;
     if (base && base != sub)
         return checker_type_derives_from_depth(base, sup, depth + 1);
+    /* A generic instantiation (Seq<int>) carries no interface list of its
+     * own: resolve_type's clone copies neither interfaces nor parameterized
+     * extends edges, and the canonical template's edges are phrased in the
+     * declaring type's parameters (`interface BoxSource<T> : Box<T>`).
+     * Match the declared extends/implements clauses pairwise with the
+     * use-site arguments; single-hop, which covers every shape a
+     * declaration can state directly. */
+    if (sub->type_arg_count > 0 && sub->sym && sub->sym->type &&
+        sub->sym->type != sub && sub->sym->decl &&
+        (sub->sym->decl->kind == AST_CLASS_DECL ||
+         sub->sym->decl->kind == AST_STRUCT_DECL ||
+         sub->sym->decl->kind == AST_INTERFACE_DECL)) {
+        zan_ast_list_t *tps = &sub->sym->decl->type_decl.type_params;
+        zan_ast_list_t *bases = &sub->sym->decl->type_decl.bases;
+
+        for (int i = 0; i < bases->count; i++)
+            if (iface_edge_derives_params_ast(bases->items[i], tps,
+                                              sub->type_args, sup))
+                return true;
+    }
     return false;
 }
 
