@@ -760,11 +760,8 @@ static LLVMValueRef get_dict_find_fn(zan_irgen_t *g) {
  * The helper does find + cnt-- + indexed_count = 0: the hash index is dropped
  * wholesale and find rebuilds it from scratch on the next lookup (the
  * icnt != cnt stale check fires; the rebuild is the same O(n) class as the
- * caller's ordered data shift). An earlier design swap-removed the LAST entry
- * into the hole and repaired the index incrementally — incremental repair
- * could not survive the ordered shift (every entry above fi is renumbered)
- * and the swap itself reordered Keys/Values away from insertion order, so it
- * was replaced wholesale by b8bb4c35. */
+ * caller's ordered data shift) — with every entry above the hole renumbered,
+ * an in-place index repair is impossible. */
 static LLVMValueRef get_dict_remove_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_dict_remove");
     if (fn) return fn;
@@ -812,10 +809,7 @@ static LLVMValueRef get_dict_remove_fn(zan_irgen_t *g) {
      * layout contract documented at dict_struct_type). With every entry above
      * fi renumbered, an in-place index repair is impossible — find rebuilds
      * the index from scratch on the next lookup (its icnt != cnt stale check
-     * fires; the rebuild is the same O(n) class as the data shift itself).
-     * The previous design swap-removed the LAST entry into the hole and
-     * repaired the index incrementally — that is why Remove used to reorder
-     * Keys/Values away from insertion order. */
+     * fires; the rebuild is the same O(n) class as the data shift itself). */
     LLVMValueRef cnt = LLVMBuildLoad2(b, i64, cntp, "cnt");
     LLVMBuildStore(b, zan_sub(b, cnt, LLVMConstInt(i64, 1, 0), "cnt.d"), cntp);
     LLVMBuildStore(b, LLVMConstInt(i64, 0, 0), icntp);
