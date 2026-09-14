@@ -1858,10 +1858,6 @@ class WinChainTest {
             int kIdx = wa.SpawnUnit(1, kirovId, 8, 20);
             WorldObject kirov = wa.ObjectAt(kIdx);
             Report("air spawned unit flies", kirov.IsFlying() ? 1 : 0, 1);
-            // 火箭兵在不占格的天空:同格落一辆坦克再开走,索引互不干扰。
-            int tankIdx = wa.SpawnUnit(1, uc.IdOfReg(wa, 1, "MTNK"), 8, 20);
-            Report("air ground unit shares flyer cell",
-                   wa.OccupantAt(8, 20) == tankIdx ? 1 : 0, 1);
             // 大兵(无对空)够不着基洛夫:警戒扫描不咬钩,开火不打。
             int e1idA = uc.IdOfReg(wa, 0, "E1");
             int giIdx = wa.SpawnUnit(0, e1idA, 10, 20);
@@ -1874,21 +1870,151 @@ class WinChainTest {
                    kirov.Hp() == kirov.MaxHp() ? 1 : 0, 1);
             // 火箭兵(对空)咬得动:互殴几个 tick,基洛夫掉血。
             int rkIdx = wa.SpawnUnit(0, rocketId, 12, 20);
-            wa.AddSelectionByObject(wa.ObjectAt(rkIdx));
+            // 战斗途中有人阵亡列表就会收缩,下标会漂:抓引用,不抓下标。
+            WorldObject rocketeer = wa.ObjectAt(rkIdx);
+            wa.AddSelectionByObject(rocketeer);
             // 交错扫描轮到火箭兵咬定目标,再等对空导弹飞完 4 格航程。
             for (int ta = 0; ta < 16; ta = ta + 1) { wa.Tick(); }
             Report("air rocketeer engages the flyer",
                    kirov.Hp() < kirov.MaxHp() ? 1 : 0, 1);
             Report("air rocketeer takes no ground splash",
-                   wa.ObjectAt(rkIdx).IsDead() ? 0 : 1, 1);
+                   rocketeer.IsDead() ? 0 : 1, 1);
+            // 火箭兵在不占格的天空:同格落一辆坦克,索引互不干扰。
+            // (放在交火之后:射程内的敌方地面目标在地面优先扫描里
+            // 压过飞行目标,先泊车就会抢走火箭兵的锁定。)
+            int tankIdx = wa.SpawnUnit(1, uc.IdOfReg(wa, 1, "HTNK"), 8, 20);
+            Report("air soviet tank spawns under flyer", tankIdx >= 0 ? 1 : 0, 1);
+            Report("air ground unit shares flyer cell",
+                   tankIdx >= 0 && wa.OccupantAt(8, 20) == tankIdx ? 1 : 0, 1);
             // 基洛夫的航线无视停在地面的坦克:直线走过去,不排队不绕路。
             WorldObject bomber = kirov;
             bomber.SetRoute(null, null);
             List<int> bx = new List<int>();
             List<int> by = new List<int>();
             Report("air flyer paths over parked tank",
-                   wa.FindPathF(8, 20, 20, 20, bx, by, true, true)
+                   tankIdx >= 0
+                   && wa.FindPathF(8, 20, 20, 20, bx, by, true, true)
                    && bx.Count <= 14 ? 1 : 0, 1);
+        }
+
+        // ---- 超级武器:充能、核弹打击、闪电风暴、闪光恢复 ----
+        // 核弹发射井建成充能,充满释放:75 tick 引信后落点清场,溅射不分
+        // 敌我、豁免飞行;爆炸闪光压住环境光再放回;风暴窗口内连续落雷。
+        {
+            World sw = World.Create(FlatMap(40, 40), sc, uc);
+            sw.PlaceBase(0, 3, 3);
+            GameController swGame = GameController.CreateWith(sw, 0, 10000,
+                                                              Difficulty.Normal());
+            Rules swRules = sw.Rules();
+            StructureCatalog swCat = sw.Catalog();
+            int siloId = -1;
+            int domeId = -1;
+            // NASILA is the Soviet silo: the nuke scenario runs on side 1.
+            int sovCount = swCat.CountFor(sw, 1);
+            for (int b = 0; b < sovCount; b = b + 1) {
+                StructureType t = swCat.TypeFor(sw, 1, b);
+                if (t != null && t.Reg() == "NASILA") { siloId = b; }
+            }
+            int swCount = swCat.CountFor(sw, 0);
+            for (int b = 0; b < swCount; b = b + 1) {
+                StructureType t = swCat.TypeFor(sw, 0, b);
+                if (t != null && t.Reg() == "GAWATH") { domeId = b; }
+            }
+            Report("super silo on allied roster", siloId >= 0 ? 1 : 0, 1);
+            Report("super dome on allied roster", domeId >= 0 ? 1 : 0, 1);
+            StructureType siloT = swCat.TypeFor(sw, 0, siloId);
+            int siloBuildTime = siloT != null ? siloT.BuildTime() : 0;
+            Report("silo placed", sw.PlaceStructure(1, siloId, 12, 12) >= 0 ? 1 : 0, 1);
+            // The silo's own drain would stall its house into low power:
+            // grid a Soviet reactor in beside it first.
+            int napowrId = -1;
+            for (int b = 0; b < sovCount; b = b + 1) {
+                StructureType t = swCat.TypeFor(sw, 1, b);
+                if (t != null && t.Reg() == "NAPOWR") { napowrId = b; }
+            }
+            Report("reactor placed",
+                   sw.PlaceStructure(1, napowrId, 9, 12) >= 0 ? 1 : 0, 1);
+            for (int i = 0; i < siloBuildTime + 2; i = i + 1) { swGame.Tick(); }
+            WorldObject silo = null;
+            for (int i = 0; i < sw.ObjectCount(); i = i + 1) {
+                WorldObject o = sw.ObjectAt(i);
+                if (o.Side() == 1 && o.Kind() == ObjKind.Structure()
+                 && !o.IsDead() && sw.TypeOf(o) != null
+                 && sw.TypeOf(o).SuperWeapon() == 0) { silo = o; }
+            }
+            Report("silo stands after build", silo == null ? 0 : 1, 1);
+            int charge0 = silo.SwCharge();
+            swGame.Tick();
+            swGame.Tick();
+            Report("silo charges while powered",
+                   silo.SwCharge() - charge0, 2);
+            Report("nuke not ready at low charge",
+                   sw.ReadySuper(1, 0) ? 1 : 0, 0);
+            silo.SetSwCharge(swRules.SwRecharge());
+            Report("nuke ready when charged",
+                   sw.ReadySuper(1, 0) ? 1 : 0, 1);
+            // 靶场:爆心敌兵、贴格火箭兵(飞行)、4 格外己方坦克(不分敌我)。
+            WorldObject victim = sw.ObjectAt(sw.SpawnUnit(1,
+                uc.IdOfReg(sw, 1, "E2"), 20, 20));
+            WorldObject flyer = sw.ObjectAt(sw.SpawnUnit(0,
+                uc.IdOfReg(sw, 0, "ROCKET"), 20, 21));
+            WorldObject friendly = sw.ObjectAt(sw.SpawnUnit(1,
+                uc.IdOfReg(sw, 1, "HTNK"), 24, 20));
+            Report("nuke fired", sw.FireSuper(1, 0, 20, 20) ? 1 : 0, 1);
+            Report("nuke charge spent", sw.ReadySuper(1, 0) ? 1 : 0, 0);
+            Report("nuke not falling yet", victim.IsDead() ? 1 : 0, 0);
+            for (int i = 0; i < 76; i = i + 1) { swGame.Tick(); }
+            Report("nuke flattens ground zero", victim.IsDead() ? 1 : 0, 1);
+            Report("nuke spares the flyer",
+                   !flyer.IsDead() && flyer.Hp() == flyer.MaxHp() ? 1 : 0, 1);
+            Report("nuke answers no flag",
+                   friendly.Hp() < friendly.MaxHp() ? 1 : 0, 1);
+            Report("nuke flash holds the override",
+                   sw.Lights().HasOverride() ? 1 : 0, 1);
+            for (int i = 0; i < 70; i = i + 1) { swGame.Tick(); }
+            Report("nuke flash returns the ambient",
+                   sw.Lights().HasOverride() ? 0 : 1, 1);
+            // 风暴:天气控制机充满释放,窗口内一道接一道落雷打疼敌兵。
+            StructureType domeT = swCat.TypeFor(sw, 0, domeId);
+            int domeBuildTime = domeT != null ? domeT.BuildTime() : 0;
+            Report("dome placed", sw.PlaceStructure(0, domeId, 16, 16) >= 0 ? 1 : 0, 1);
+            for (int i = 0; i < domeBuildTime + 2; i = i + 1) { swGame.Tick(); }
+            WorldObject dome = null;
+            for (int i = 0; i < sw.ObjectCount(); i = i + 1) {
+                WorldObject o = sw.ObjectAt(i);
+                if (o.Side() == 0 && o.Kind() == ObjKind.Structure()
+                 && !o.IsDead() && sw.TypeOf(o) != null
+                 && sw.TypeOf(o).SuperWeapon() == 1) { dome = o; }
+            }
+            Report("dome stands after build", dome == null ? 0 : 1, 1);
+            dome.SetSwCharge(swRules.SwRecharge());
+            Report("storm ready when charged",
+                   sw.ReadySuper(0, 1) ? 1 : 0, 1);
+            List<WorldObject> cluster = new List<WorldObject>();
+            for (int dx = 0 - 4; dx <= 4; dx = dx + 1) {
+                for (int dy = 0 - 4; dy <= 4; dy = dy + 1) {
+                    WorldObject g = sw.ObjectAt(sw.SpawnUnit(1,
+                        uc.IdOfReg(sw, 1, "E2"), 25 + dx, 25 + dy));
+                    cluster.Add(g);
+                }
+            }
+            Report("storm fired", sw.FireSuper(0, 1, 25, 25) ? 1 : 0, 1);
+            Report("storm charge spent", sw.ReadySuper(0, 1) ? 1 : 0, 0);
+            // 前 50 tick 至少落雷三道(引信 15),光束仍在屏上。
+            for (int i = 0; i < 50; i = i + 1) { swGame.Tick(); }
+            Report("storm drops bolts", sw.BeamCount() > 0 ? 1 : 0, 1);
+            // 落点是随机的:跑完整窗口再数伤亡,9x9 靶区 13 道雷必中。
+            for (int i = 0; i < 150; i = i + 1) { swGame.Tick(); }
+            bool hurt = false;
+            for (int i = 0; i < cluster.Count; i = i + 1) {
+                if (cluster[i].IsDead()
+                 || cluster[i].Hp() < cluster[i].MaxHp()) { hurt = true; }
+            }
+            Report("storm bolts bite the cluster", hurt ? 1 : 0, 1);
+            Report("storm window closes",
+                   sw.BeamCount() > 0 && sw.Rules().LightningDuration() > 0
+                   ? 1 : 0, 0);
+            Report("storm spent for good", sw.ReadySuper(0, 1) ? 1 : 0, 0);
         }
 
         Console.WriteLine(failures == 0 ? "winchain ok"
