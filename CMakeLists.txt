@@ -1460,6 +1460,12 @@ foreach(_src ${_conf_srcs})
     # stubbed and dropped from the link line instead of failing the link.
     set(_extra_args
       "--publish;--link-mode;static;--driver-dir;${CMAKE_SOURCE_DIR}/tests/conformance/empty_driver_dir")
+  elseif(_name STREQUAL "publish_tls_bundle")
+    # A47-1 step 1: a --publish build of a Tls program with the default
+    # driver discovery must copy the real OpenSSL DLLs next to the exe; the
+    # behavioral proof is that the published exe starts and hands back a
+    # usable TlsContext (a broken bundle copy fails to start instead).
+    set(_extra_args "--publish")
   elseif(_needs_gui_driver)
     set(_extra_args "${_gui_driver_args}")
   else()
