@@ -31,6 +31,8 @@ partial class LegendApp {
         string name;            // 「10级奖励」
         string req;             // 「等级达到10级」
         List<AchReward> rewards; // 恒 4 枚（空格 picture = 0）
+        int no;                 // 服务端成就定义 1 基行号（离线行 = 0）
+        int state;              // 0 条件未达 / 1 可领取 / 2 已领取
         string NameText() { return "成就：" + name; }
         string ReqText() { return "要求：" + req; }
     }
@@ -69,6 +71,35 @@ partial class LegendApp {
         return r;
     }
 
+    /// 当前成就行：在线 = 服务端 ach.rows（奖励格不足 4 枚补空格），
+    /// 离线 = 原版第 1 页对照。
+    List<AchRow> AchRows() {
+        if (net.Self() == null || net.PlayAch() == null) { return AchData(); }
+        JsonValue all = net.PlayAch();
+        List<AchRow> v = new List<AchRow>();
+        for (int i = 0; i < all.Count(); i = i + 1) {
+            JsonValue m = all.At(i);
+            AchRow r = new AchRow();
+            r.name = m.Str("name", "");
+            r.req = m.Str("req", "");
+            r.no = i + 1;
+            r.state = m.Int("claimed", 0) == 1 ? 2 : (m.Int("ok", 0) == 1 ? 1 : 0);
+            r.rewards = new List<AchReward>();
+            JsonValue rws = m.Get("rewards");
+            int n = rws != null && rws.IsArray() ? rws.Count() : 0;
+            for (int k = 0; k < 4; k = k + 1) {
+                if (k < n) {
+                    JsonValue w = rws.At(k);
+                    r.rewards.Add(AchRewardOf(w.Int("pic", 0), w.Str("badge", "")));
+                } else {
+                    r.rewards.Add(AchRewardOf(0, ""));
+                }
+            }
+            v.Add(r);
+        }
+        return v;
+    }
+
     /// 左栏 12 枚分类（原版顺序，末枚原版就是「-」）。
     static List<string> AchCats() {
         List<string> c = new List<string>();
@@ -79,6 +110,7 @@ partial class LegendApp {
     }
 
     void BuildAchPage() {
+        if (net.Self() != null) { net.MaybeRefreshAch(); }
         Panel frame = Panel.Column(); frame.Class = "mk-frame";
         frame.Pad(0); frame.Gap(0);
         frame.Prefer(0, Spec.MkFrameH());
@@ -167,7 +199,7 @@ partial class LegendApp {
         box.Pad(0); box.Gap(0); box.Prefer(0, 0);
         box.Padding(0, Spec.MkRowPadX(), Spec.AcBoxPadB(), Spec.MkRowPadX());
         box.With(TblPad(Spec.MkHeadToRow()));
-        List<AchRow> rows = AchData();
+        List<AchRow> rows = AchRows();
         for (int r = 0; r < rows.Count; r = r + 1) {
             box.With(AchRowBox(rows[r]));
             if (r + 1 < rows.Count) { box.With(TblPad(Spec.MkRowGap())); }
@@ -228,12 +260,20 @@ partial class LegendApp {
     }
 
     // ------------------------------------------------------------------
-    //  动作（玩法未接：按本模板惯例给明确反馈，不假装已实现）
+    //  动作：在线领取走服务端校验（未达标/重复领取由服务端拒绝并入聊天）；
+    //  其余分类服务端未开，照惯例给明确反馈。
     // ------------------------------------------------------------------
     void AchSay(string msg) {
         if (net.Self() != null) { net.AddChat("[系统]", msg); return; }
         g.Log(msg);
     }
-    void AchPickCat(int i) { AchSay("成就：" + AchCats()[i] + "（数据未接）"); }
-    void AchTake(AchRow r) { AchSay("成就：领取「" + r.name + "」（玩法未接）"); }
+    void AchPickCat(int i) {
+        if (i == 0 && net.Self() != null) { net.RefreshAch(); return; }
+        AchSay("成就：" + AchCats()[i] + (i == 0 ? "（离线模式）" : "（数据未接）"));
+    }
+    void AchTake(AchRow r) {
+        if (net.Self() == null || r.no <= 0) { AchSay("成就：领取「" + r.name + "」（玩法未接）"); return; }
+        if (r.state == 2) { AchSay("成就：「" + r.name + "」奖励已领取"); return; }
+        net.AchTake(r.no);
+    }
 }

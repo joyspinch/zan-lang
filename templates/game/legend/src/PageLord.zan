@@ -91,7 +91,64 @@ partial class LegendApp {
         return r;
     }
 
+    /// 当前榜行：在线 = 服务端爵位榜（rows + 我的 me），离线 = 原版对照。
+    /// 别人行的属性列按爵位档位查同一套 balance 键（服务端 me 只带自己的）。
+    List<LordRow> LordRows() {
+        if (net.Self() == null || net.PlayLord() == null) { return LordData(); }
+        JsonValue all = net.PlayLord();
+        JsonValue rows = all.Get("rows");
+        List<LordRow> v = new List<LordRow>();
+        if (rows == null || !rows.IsArray()) { return v; }
+        JsonValue me = all.Get("me");
+        int myBonus = me != null ? me.Int("bonus", 0) : 0;
+        int mySpeed = me != null ? me.Int("speed", 0) : 0;
+        int myExp = me != null ? me.Int("exp", 0) : 0;
+        for (int i = 0; i < rows.Count(); i = i + 1) {
+            JsonValue m = rows.At(i);
+            LordRow r = new LordRow();
+            r.tier = m.Int("tier", 3);
+            r.player = m.Str("name", "");
+            r.contribution = m.Int("contrib", 0);
+            r.self = m.Int("self", 0) == 1;
+            r.bonusPct = r.self ? myBonus : LordTierVal(r.tier, "lord_bonus");
+            r.speedPct = r.self ? mySpeed : LordTierVal(r.tier, "lord_speed");
+            r.expPct = r.self ? myExp : LordTierVal(r.tier, "lord_exp");
+            v.Add(r);
+        }
+        return v;
+    }
+
+    /// 档位键取值：tier 0 亲王 → lord_*4，tier 3 伯爵 → lord_*1。
+    static int LordTierVal(int tier, string key) {
+        int n = 4 - tier;
+        if (n < 1) { n = 1; }
+        if (n > 4) { n = 4; }
+        return GameTables.Value(key + Convert.ToString(n));
+    }
+
+    /// 我的爵位名（无贡献 = 无）。
+    string LordMyTierName() {
+        if (net.Self() == null || net.PlayLord() == null) { return "无"; }
+        JsonValue me = net.PlayLord().Get("me");
+        int contrib = me != null ? me.Int("contrib", 0) : 0;
+        if (contrib <= 0) { return "无"; }
+        int tier = me != null ? me.Int("tier", 4) : 4;
+        if (tier == 0) { return "亲王"; }
+        if (tier == 1) { return "国公"; }
+        if (tier == 2) { return "侯爵"; }
+        if (tier == 3) { return "伯爵"; }
+        return "平民";
+    }
+
+    /// 我的累计贡献（在线读 me，离线无）。
+    string LordMyContrib() {
+        if (net.Self() == null || net.PlayLord() == null) { return "无"; }
+        JsonValue me = net.PlayLord().Get("me");
+        return me != null ? Rules.Wan(me.Int("contrib", 0)) : "无";
+    }
+
     void BuildLordPage() {
+        if (net.Self() != null) { net.MaybeRefreshLord(); }
         Panel page0 = Panel.Column(); page0.Class = "tbl-page";
         page0.Pad(0); page0.Gap(0); page0.Grow(); content.With(page0);
 
@@ -105,8 +162,9 @@ partial class LegendApp {
         Panel wall = Panel.Column(); wall.Pad(0); wall.Gap(Spec.TblRowGap());
         box.With(wall);
 
-        List<LordRow> rows = LordData();
+        List<LordRow> rows = LordRows();
         for (int r = 0; r < Spec.TblRows(); r = r + 1) {
+            if (r >= rows.Count) { break; }
             LordRow lo = rows[r];
             List<string> cells = new List<string>();
             cells.Add(lo.NameText()); cells.Add(lo.player);
@@ -160,19 +218,20 @@ partial class LegendApp {
 
         Panel g2 = Panel.Row(); g2.Pad(0); g2.Gap(0);
         g2.Prefer(Spec.LordFootCol2W(), Spec.TblFootH());
-        g2.With(TblFootNote("累计捐献：", "无", "lord-note-o"));
+        g2.With(TblFootNote("累计捐献：", LordMyContrib(), "lord-note-o"));
         left.With(g2);
 
-        left.With(TblFootNote("我的爵位：", "无", "lord-note-p"));
+        left.With(TblFootNote("我的爵位：", LordMyTierName(), "lord-note-p"));
         return left;
     }
 
-    /// 「捐献」钮：尚未接玩法，按本模板惯例给明确反馈（不假装已实现）。
+    /// 「捐献」钮：在线走服务端 lord donate（校验元宝与下限），离线给明确反馈。
     void LordDonate(Input yuan) {
         string amount = yuan.GetText();
         if (amount.Length == 0) { amount = "0"; }
-        string msg = "捐献元宝：" + amount;
-        if (net.Self() != null) { net.AddChat("[系统]", msg); return; }
-        g.Log(msg);
+        if (net.Self() == null) { g.Log("捐献元宝：" + amount); return; }
+        int n = Convert.ToInt(amount);
+        if (n <= 0) { net.AddChat("[系统]", "请输入要捐献的元宝数量"); return; }
+        net.LordDonate(n);
     }
 }

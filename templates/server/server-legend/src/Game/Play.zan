@@ -1299,6 +1299,483 @@ class Play {
         Gateway.SelfInto(r, s);
         return r;
     }
+
+    /* ---- 成就 / 爵位 / 邮箱 / 至尊殿堂（客户端 26/24/29/19 页）----
+       成就表是服务器事实（等级/转生里程碑，奖励按原版行配）；爵位按
+       累计贡献（元宝 1:1）分四档；邮箱独立表 game_mail，建角发开区礼
+       包信；至尊殿堂按八格收服全服最好装备（world_state 写穿），登记
+       者获得打怪经验加成。数值全部走 balance.csv 键。 */
+
+    /* 成就一行定义：奖励的物品按**名字**对目录（启动种子来自 M2.DB，
+       同名同物），发奖时 BagAdd；金币/元宝/经验直入角色行。kind
+       0=等级里程碑，1=转生里程碑（本版还没有转生状态，资格恒未满足，
+       行照发——客户端页面照原版 8 行显示）。 */
+    class AchDef {
+        string name;
+        string req;
+        int kind;
+        int need;
+        long gold;
+        long gems;
+        long exp;
+        string i1; long c1;
+        string i2; long c2;
+        string i3; long c3;
+    }
+
+    static List<AchDef> achDefs = null;
+    static List<AchDef> AchDefs() {
+        if (achDefs != null) { return achDefs; }
+        List<AchDef> v = new List<AchDef>();
+        v.Add(Play.AchRow("10级奖励", "等级达到10级", 0, 10, 100000, 0, 0,
+            "", 0, "", 0, "", 0));
+        v.Add(Play.AchRow("20级奖励", "等级达到20级", 0, 20, 200000, 0, 0,
+            "黑铁矿石", 5, "", 0, "", 0));
+        v.Add(Play.AchRow("30级奖励", "等级达到30级", 0, 30, 0, 0, 0,
+            "黑铁矿石", 100, "BOSS卷轴", 100, "", 0));
+        v.Add(Play.AchRow("40级奖励", "等级达到40级", 0, 40, 0, 1000, 0,
+            "书籍包", 1000, "黑铁矿石", 100, "", 0));
+        v.Add(Play.AchRow("50级奖励", "等级达到50级", 0, 50, 0, 0, 0,
+            "天书", 200, "BOSS卷轴", 100, "书籍包", 1000));
+        v.Add(Play.AchRow("60级奖励", "等级达到60级", 0, 60, 2000000, 0, 2000000,
+            "书籍包", 5000, "黑铁矿石", 200, "", 0));
+        v.Add(Play.AchRow("1转奖励", "转生达到1转", 1, 1, 1000000, 0, 0,
+            "幸运雪莲", 1, "书籍包", 10000, "天书", 2000));
+        v.Add(Play.AchRow("2转奖励", "转生达到2转", 1, 2, 5000000, 0, 0,
+            "幸运雪莲", 2, "书籍包", 30000, "天书", 10000));
+        achDefs = v;
+        return v;
+    }
+
+    static AchDef AchRow(string name, string req, int kind, int need,
+                         long gold, long gems, long exp,
+                         string i1, long c1, string i2, long c2,
+                         string i3, long c3) {
+        AchDef d = new AchDef();
+        d.name = name; d.req = req; d.kind = kind; d.need = need;
+        d.gold = gold; d.gems = gems; d.exp = exp;
+        d.i1 = i1; d.c1 = c1; d.i2 = i2; d.c2 = c2;
+        d.i3 = i3; d.c3 = c3;
+        return d;
+    }
+
+    static bool AchOwned(string csv, int no) {
+        List<int> v = Play.CsvIds(csv);
+        return v.Contains(no);
+    }
+
+    /* "1,2,3" → 整数列表（空串=空表）。 */
+    static List<int> CsvIds(string csv) {
+        List<int> v = new List<int>();
+        if (csv == null) { return v; }
+        List<string> parts = csv.Split(",");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            string t = parts[i].Trim();
+            if (t.Length > 0) { v.Add(Convert.ToInt(t)); }
+        }
+        return v;
+    }
+
+    static string AchIdsJoin(List<int> v) {
+        string t = "";
+        for (int i = 0; i < v.Count; i = i + 1) {
+            t = t + (i > 0 ? "," : "") + Convert.ToString(v[i]);
+        }
+        return t;
+    }
+
+    static bool AchEligible(Session s, AchDef d) {
+        if (d.kind == 1) { return false; }   // 转生未开放，里程碑行照发展示
+        return s.row.level >= d.need;
+    }
+
+    /* 奖励角标文案：≥1万 折「N万」，其余原数（原版「10万/200万」同款）。 */
+    static string AchBadge(long n) {
+        if (n >= 10000) { return Convert.ToString(n / 10000) + "万"; }
+        return Convert.ToString(n);
+    }
+
+    /* 一枚奖励格：picture（货币用固定图号：金币 116 / 元宝袋 1121 /
+       经验 1187，物品用目录 picture）+ 角标原文。 */
+    static void AchRewardCell(JsonValue arr, int picture, long count) {
+        JsonValue o = JsonValue.NewObject();
+        o.Set("pic", JsonValue.NewNum(Convert.ToString(picture)));
+        o.Set("badge", JsonValue.NewStr(Play.AchBadge(count)));
+        arr.Append(o);
+    }
+
+    /* ach：{}=面板（8 行全量）；{"take":行号}=领取（资格+未领过）。
+       行字段与客户端 AchRow 同构：name/req/ok/claimed/rewards[{pic,badge}]。 */
+    static JsonValue Ach(Session s, JsonValue m, long now) {
+        List<AchDef> defs = Play.AchDefs();
+        int take = m.Int("take", 0);
+        if (take > 0) {
+            if (take > defs.Count) { return Gateway.Err("没有这个成就"); }
+            AchDef def = defs[take - 1];
+            if (Play.AchOwned(s.row.achClaimed, take)) {
+                return Gateway.Err("这个成就已领取过");
+            }
+            if (!Play.AchEligible(s, def)) {
+                return Gateway.Err("条件未达成：" + def.req);
+            }
+            s.row.gold = s.row.gold + def.gold;
+            s.row.gems = s.row.gems + def.gems;
+            s.row.exp = s.row.exp + def.exp;
+            string[] names = new string[] { def.i1, def.i2, def.i3 };
+            long[] counts = new long[] { def.c1, def.c2, def.c3 };
+            for (int i = 0; i < 3; i = i + 1) {
+                if (names[i] == null || names[i].Length == 0) { continue; }
+                ZanWeb.Model.Game.Item it = Fight.ByName(names[i]);
+                if (it == null) {
+                    return Gateway.Err("奖励物品「" + names[i] + "」不在目录，请联系 GM");
+                }
+                Fight.BagAdd(s, it.id, (int)counts[i]);
+            }
+            int _ups = Fight.LevelUpApply(s);
+            List<int> owned = Play.CsvIds(s.row.achClaimed);
+            owned.Add(take);
+            s.row.achClaimed = Play.AchIdsJoin(owned);
+            s.dirty = true;
+        }
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < defs.Count; i = i + 1) {
+            AchDef d = defs[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Set("name", JsonValue.NewStr(d.name));
+            o.Set("req", JsonValue.NewStr(d.req));
+            o.Set("ok", JsonValue.NewNum(Play.AchEligible(s, d) ? "1" : "0"));
+            o.Set("claimed", JsonValue.NewNum(
+                Play.AchOwned(s.row.achClaimed, i + 1) ? "1" : "0"));
+            JsonValue rw = JsonValue.NewArray();
+            if (d.gold > 0) { Play.AchRewardCell(rw, 116, d.gold); }
+            if (d.gems > 0) { Play.AchRewardCell(rw, 1121, d.gems); }
+            if (d.exp > 0) { Play.AchRewardCell(rw, 1187, d.exp); }
+            string[] names = new string[] { d.i1, d.i2, d.i3 };
+            long[] counts = new long[] { d.c1, d.c2, d.c3 };
+            for (int k = 0; k < 3; k = k + 1) {
+                if (names[k] == null || names[k].Length == 0) { continue; }
+                ZanWeb.Model.Game.Item it = Fight.ByName(names[k]);
+                if (it == null) { continue; }
+                int pic = 0;
+                if (it.picture != null && it.picture.Length > 0) {
+                    pic = Convert.ToInt(it.picture);
+                }
+                Play.AchRewardCell(rw, pic, counts[k]);
+            }
+            o.Set("rewards", rw);
+            arr.Append(o);
+        }
+        JsonValue r = Gateway.Ok();
+        r.Set("rows", arr);
+        Gateway.SelfInto(r, s);
+        return r;
+    }
+
+    /* 爵位档：累计贡献 ≥lord_tier4/3/2/1 → 亲王/国公/侯爵/伯爵（0..3），
+       不足最低档 = 4（无爵位）。加成三组按档查 lord_bonus/speed/exp N 键。 */
+    static int LordTier(long contrib) {
+        if (contrib >= Rules.Val("lord_tier4")) { return 0; }
+        if (contrib >= Rules.Val("lord_tier3")) { return 1; }
+        if (contrib >= Rules.Val("lord_tier2")) { return 2; }
+        if (contrib >= Rules.Val("lord_tier1")) { return 3; }
+        return 4;
+    }
+
+    static int LordBonus(int tier, string key) {
+        if (tier < 0 || tier > 3) { return 0; }
+        /* tier 0 亲王拿最高档 bonus4，tier 3 伯爵拿 bonus1——与客户端
+           PageLord.LordTierVal 同一套映射。 */
+        return Rules.Val(key + Convert.ToString(4 - tier));
+    }
+
+    /* lord：{}=面板（贡献榜 top12 + 我的爵位）；{"donate":N}=捐元宝进
+       贡献（1:1）。七项属性加成 = 档位 bonus，速度/经验加成同档取键。 */
+    static async JsonValue Lord(Session s, JsonValue m, long now) {
+        if (m.Int("donate", 0) > 0) {
+            long yuan = m.Int("donate", 0);
+            long min = Rules.Val("lord_donate_min");
+            if (yuan < min) {
+                return Gateway.Err("每次至少捐献 " + Convert.ToString(min) + " 元宝");
+            }
+            if (s.row.gems < yuan) { return Gateway.Err("元宝不够"); }
+            s.row.gems = s.row.gems - yuan;
+            s.row.lordContrib = s.row.lordContrib + yuan;
+            s.dirty = true;
+        }
+        List<Play.LordTop> tops = new List<Play.LordTop>();
+        IDbConnection db = await Gateway.Db();
+        if (db != null) {
+            try {
+                List<ZanWeb.Model.Game.Player> rows = await db
+                    .Select<ZanWeb.Model.Game.Player>()
+                    .Where(a => a.realmId == s.row.realmId && a.lordContrib > 0)
+                    .ToListAsync();
+                /* 捐献只写内存（dirty 待 flush），DB 还是旧值——同一请求
+                   内读自己的写：把会话行的贡献度叠加进候选集。 */
+                bool selfIn = false;
+                for (int i = 0; i < rows.Count; i = i + 1) {
+                    if (rows[i].id == s.row.id) {
+                        rows[i].lordContrib = s.row.lordContrib;
+                        selfIn = true;
+                    }
+                }
+                if (!selfIn && s.row.lordContrib > 0) { rows.Add(s.row); }
+                /* 12 名次选择：每轮线性取最大（榜面固定 12，人数小到
+                   不值得排序）。 */
+                for (int rank = 0; rank < 12 && rows.Count > 0; rank = rank + 1) {
+                    int best = 0;
+                    for (int i = 1; i < rows.Count; i = i + 1) {
+                        if (rows[i].lordContrib > rows[best].lordContrib) { best = i; }
+                    }
+                    Play.LordTop t = new Play.LordTop();
+                    t.name = rows[best].nickname;
+                    t.contrib = rows[best].lordContrib;
+                    t.tier = Play.LordTier(t.contrib);
+                    tops.Add(t);
+                    rows.RemoveAt(best);
+                }
+            } finally {
+                Gateway.Give(db);
+            }
+        }
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < tops.Count; i = i + 1) {
+            JsonValue o = JsonValue.NewObject();
+            o.Set("name", JsonValue.NewStr(tops[i].name));
+            o.Set("contrib", JsonValue.NewNum(Convert.ToString(tops[i].contrib)));
+            o.Set("tier", JsonValue.NewNum(Convert.ToString(tops[i].tier)));
+            o.Set("self", JsonValue.NewNum(tops[i].name == s.row.nickname ? "1" : "0"));
+            arr.Append(o);
+        }
+        int myTier = Play.LordTier(s.row.lordContrib);
+        JsonValue r = Gateway.Ok();
+        r.Set("rows", arr);
+        JsonValue me = JsonValue.NewObject();
+        me.Set("contrib", JsonValue.NewNum(Convert.ToString(s.row.lordContrib)));
+        me.Set("tier", JsonValue.NewNum(Convert.ToString(myTier)));
+        me.Set("bonus", JsonValue.NewNum(Convert.ToString(Play.LordBonus(myTier, "lord_bonus"))));
+        me.Set("speed", JsonValue.NewNum(Convert.ToString(Play.LordBonus(myTier, "lord_speed"))));
+        me.Set("exp", JsonValue.NewNum(Convert.ToString(Play.LordBonus(myTier, "lord_exp"))));
+        r.Set("me", me);
+        Gateway.SelfInto(r, s);
+        return r;
+    }
+
+    class LordTop {
+        string name;
+        long contrib;
+        int tier;
+    }
+
+    /* mail：{}=列表（≤50 封，新信在前）；{"take":id}=提取附件（物品
+       入背包、标记已领）；{"del":id}=删信；{"takeall":1}=一键提取全部
+       附件；{"clear":1}=清空已领信。items 列是 "itemId:count" 逗号串。 */
+    static async JsonValue Mail(Session s, JsonValue m, long now) {
+        IDbConnection db = await Gateway.Db();
+        if (db == null) { return Gateway.Err("数据库不可用，请稍后再试"); }
+        try {
+            if (m.Int("take", 0) > 0 || m.Int("takeall", 0) == 1) {
+                bool all = m.Int("takeall", 0) == 1;
+                int want = m.Int("take", 0);
+                List<ZanWeb.Model.Game.Mail> mails = await db
+                    .Select<ZanWeb.Model.Game.Mail>()
+                    .Where(a => a.playerId == s.row.id && a.claimed == 0)
+                    .ToListAsync();
+                int granted = 0;
+                for (int i = 0; i < mails.Count; i = i + 1) {
+                    ZanWeb.Model.Game.Mail row = mails[i];
+                    if (!all && row.id != want) { continue; }
+                    string itemsCsv = row.items != null ? row.items : "";
+                    List<string> parts = itemsCsv.Split(",");
+                    for (int k = 0; k < parts.Count; k = k + 1) {
+                        string p = parts[k].Trim();
+                        if (p.Length == 0) { continue; }
+                        List<string> kv = p.Split(":");
+                        if (kv.Count != 2) { continue; }
+                        int itemId = Convert.ToInt(kv[0].Trim());
+                        int count = Convert.ToInt(kv[1].Trim());
+                        Fight.BagAdd(s, itemId, count);
+                        granted = granted + 1;
+                    }
+                    await db.Update<ZanWeb.Model.Game.Mail>()
+                        .Set(a => a.claimed, 1)
+                        .Where(a => a.id == row.id)
+                        .ExecuteAffrowsAsync();
+                    s.dirty = true;
+                    if (!all) { break; }
+                }
+                if (!all && granted == 0) {
+                    /* 单封提取但没有任何物品：也标记已领，避免重复点。 */
+                    ZanWeb.Model.Game.Mail one = await db
+                        .Select<ZanWeb.Model.Game.Mail>()
+                        .Where(a => a.id == want && a.playerId == s.row.id)
+                        .FirstAsync();
+                    if (one == null) { return Gateway.Err("没有这封信"); }
+                    if (one.claimed == 1) { return Gateway.Err("这封信的附件已提取过"); }
+                }
+            }
+            if (m.Int("del", 0) > 0) {
+                int delId = m.Int("del", 0);
+                ZanWeb.Model.Game.Mail row = await db
+                    .Select<ZanWeb.Model.Game.Mail>()
+                    .Where(a => a.id == delId && a.playerId == s.row.id)
+                    .FirstAsync();
+                if (row == null) { return Gateway.Err("没有这封信"); }
+                await db.Delete<ZanWeb.Model.Game.Mail>()
+                    .Where(a => a.id == row.id).ExecuteAffrowsAsync();
+            }
+            if (m.Int("clear", 0) == 1) {
+                List<ZanWeb.Model.Game.Mail> claimed = await db
+                    .Select<ZanWeb.Model.Game.Mail>()
+                    .Where(a => a.playerId == s.row.id && a.claimed == 1)
+                    .ToListAsync();
+                for (int i = 0; i < claimed.Count; i = i + 1) {
+                    await db.Delete<ZanWeb.Model.Game.Mail>()
+                        .Where(a => a.id == claimed[i].id).ExecuteAffrowsAsync();
+                }
+            }
+            List<ZanWeb.Model.Game.Mail> rows = await db
+                .Select<ZanWeb.Model.Game.Mail>()
+                .Where(a => a.playerId == s.row.id)
+                .OrderBy(a => a.id).ToListAsync();
+            JsonValue arr = JsonValue.NewArray();
+            int listed = 0;
+            for (int i = rows.Count - 1; i >= 0 && listed < 50; i = i - 1) {
+                listed = listed + 1;
+                ZanWeb.Model.Game.Mail row = rows[i];
+                JsonValue o = JsonValue.NewObject();
+                o.Set("id", JsonValue.NewNum(Convert.ToString(row.id)));
+                o.Set("title", JsonValue.NewStr(row.title));
+                o.Set("sender", JsonValue.NewStr(row.sender));
+                o.Set("claimed", JsonValue.NewNum(Convert.ToString(row.claimed)));
+                DateTime dt = DateTime.FromUnixSeconds(row.createdAt);
+                o.Set("date", JsonValue.NewStr(Play.Today(row.createdAt)
+                    + " " + (dt.hour < 10 ? "0" : "") + Convert.ToString(dt.hour)
+                    + ":" + (dt.minute < 10 ? "0" : "") + Convert.ToString(dt.minute)));
+                o.Set("body", JsonValue.NewStr(row.body != null ? row.body : ""));
+                JsonValue its = JsonValue.NewArray();
+                string itemsCsv = row.items != null ? row.items : "";
+                List<string> parts = itemsCsv.Split(",");
+                for (int k = 0; k < parts.Count; k = k + 1) {
+                    string p = parts[k].Trim();
+                    if (p.Length == 0) { continue; }
+                    List<string> kv = p.Split(":");
+                    if (kv.Count != 2) { continue; }
+                    ZanWeb.Model.Game.Item it = Fight.ById(Convert.ToInt(kv[0].Trim()));
+                    if (it == null) { continue; }
+                    int pic = 0;
+                    if (it.picture != null && it.picture.Length > 0) {
+                        pic = Convert.ToInt(it.picture);
+                    }
+                    JsonValue w = JsonValue.NewObject();
+                    w.Set("pic", JsonValue.NewNum(Convert.ToString(pic)));
+                    w.Set("count", JsonValue.NewNum(kv[1].Trim()));
+                    its.Append(w);
+                }
+                o.Set("items", its);
+                arr.Append(o);
+            }
+            JsonValue r = Gateway.Ok();
+            r.Set("rows", arr);
+            Gateway.SelfInto(r, s);
+            return r;
+        } finally {
+            Gateway.Give(db);
+        }
+    }
+
+    /* 至尊殿堂八格键：武器之攻/法/道（同一把武器按不同主属性记分）、
+       铠甲/头盔（防御）、项链/手镯/戒指（三主属性之和）。 */
+    static string[] SupKeys() {
+        return new string[] {
+            "atk", "mag", "tao", "armor", "helmet", "necklace", "bracelet", "ring"
+        };
+    }
+
+    static string SupTitle(int i) {
+        string[] t = new string[] {
+            "武器之攻", "武器之法", "武器之道", "铠甲之首",
+            "头盔之首", "项链之首", "手镯之首", "戒指之首"
+        };
+        return t[i];
+    }
+
+    /* 登记格 → 玩家装备位：0..2 武器、3 铠甲、4 头盔、5 项链、6 手镯、7 戒指。 */
+    static int SupSlotItem(Session s, int i) {
+        if (i <= 2) { return s.row.weaponId; }
+        if (i == 3) { return s.row.armorId; }
+        if (i == 4) { return s.row.helmetId; }
+        if (i == 5) { return s.row.necklaceId; }
+        if (i == 6) { return s.row.braceletId; }
+        return s.row.ringId;
+    }
+
+    static long SupScore(int i, ZanWeb.Model.Game.Item it) {
+        if (i == 0) { return it.atk; }
+        if (i == 1) { return it.magic; }
+        if (i == 2) { return it.tao; }
+        if (i <= 4) { return it.def; }
+        return (long)it.atk + it.magic + it.tao;
+    }
+
+    /* 我的登记加成：每格榜首 +sup_exp_pct_per%，封顶 sup_exp_pct_cap。 */
+    static int SupBonusPct(Session s) {
+        int held = 0;
+        string[] keys = Play.SupKeys();
+        for (int i = 0; i < keys.Length; i = i + 1) {
+            if (WorldState.Get("sup." + keys[i] + ".owner", "") == s.row.nickname) {
+                held = held + 1;
+            }
+        }
+        int pct = held * Rules.Val("sup_exp_pct_per");
+        int cap = Rules.Val("sup_exp_pct_cap");
+        return pct > cap ? cap : pct;
+    }
+
+    /* sup：{}=殿堂面板（八格榜首 + 我的经验加成）；{"reg":格号}=以对应
+       装备位登记（分数须超过现任榜首才易主）。 */
+    static JsonValue Sup(Session s, JsonValue m, long now) {
+        string[] keys = Play.SupKeys();
+        int reg = m.Int("reg", -1);
+        if (reg >= 0) {
+            if (reg >= keys.Length) { return Gateway.Err("没有这个殿堂格"); }
+            int itemId = Play.SupSlotItem(s, reg);
+            if (itemId <= 0) {
+                return Gateway.Err("这个部位还没有穿戴装备");
+            }
+            ZanWeb.Model.Game.Item it = Fight.ById(itemId);
+            if (it == null) { return Gateway.Err("装备数据异常"); }
+            long score = Play.SupScore(reg, it);
+            string key = "sup." + keys[reg];
+            long cur = WorldState.GetNum(key + ".value", -1);
+            if (score <= cur) {
+                return Gateway.Err("未能超过现任榜首（"
+                    + Convert.ToString(cur) + "），登记失败不扣任何费用");
+            }
+            WorldState.Set(key + ".owner", s.row.nickname);
+            WorldState.SetNum(key + ".value", score);
+            WorldState.SetNum(key + ".item", itemId);
+        }
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < keys.Length; i = i + 1) {
+            string key = "sup." + keys[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Set("title", JsonValue.NewStr(Play.SupTitle(i)));
+            o.Set("owner", JsonValue.NewStr(WorldState.Get(key + ".owner", "")));
+            long itemId = WorldState.GetNum(key + ".item", 0);
+            o.Set("itemId", JsonValue.NewNum(Convert.ToString(itemId)));
+            o.Set("value", JsonValue.NewNum(Convert.ToString(
+                WorldState.GetNum(key + ".value", 0))));
+            ZanWeb.Model.Game.Item it = itemId > 0 ? Fight.ById((int)itemId) : null;
+            o.Set("itemName", JsonValue.NewStr(it != null ? it.name : ""));
+            arr.Append(o);
+        }
+        JsonValue r = Gateway.Ok();
+        r.Set("rows", arr);
+        r.Set("bonus", JsonValue.NewNum(Convert.ToString(Play.SupBonusPct(s))));
+        Gateway.SelfInto(r, s);
+        return r;
+    }
 }
 
 /* 一行称谓：列即快照小写原始字段。展示对（攻/魔/道/防/魔防）是

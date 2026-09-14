@@ -54,6 +54,20 @@ class Fight {
         return Rules.NeedXp(level);
     }
 
+    /* 经验入账后的连升结算（升到 exp 不再够为止，回填血法）。
+       OnKill 与成就领奖共用；返回升了多少级。 */
+    static int LevelUpApply(Session s) {
+        int ups = 0;
+        while (s.row.exp >= Fight.ExpNext(s.row.level)) {
+            s.row.exp = s.row.exp - Fight.ExpNext(s.row.level);
+            s.row.level = s.row.level + 1;
+            s.row.hp = Fight.MaxHp(s.row);
+            s.row.mp = Fight.MaxMp(s.row);
+            ups = ups + 1;
+        }
+        return ups;
+    }
+
     /* 进度戳：等级/经验的绝对值随战况事件下发。客户端面板因此跟着每
        一击走，不必等升级快照才刷新经验条。 */
     static void StampProgress(Session s, JsonValue f) {
@@ -553,7 +567,12 @@ class Fight {
     static void OnKill(Session s, ZanWeb.Model.Game.Mob t, JsonValue f, bool quiet) {
         /* 祭坛增益（捐献获得，30 分钟）有效期内经验 ×1.1。 */
         int expMul = Play.AltarBuffed(s) ? Rules.Val("altar_buff_mult_pct") : 10000;
-        s.row.exp = s.row.exp + (long)t.exp * s.expRate / 10000 * expMul / 10000;
+        /* 至尊殿堂登记加成：每登记一件 +sup_exp_pct_per%，封顶
+           sup_exp_pct_cap（原版「仅幻境和秘境有效」——本服打怪经验全在
+           幻境图，全局生效即同义）。 */
+        int supMul = 10000 + Play.SupBonusPct(s) * 100;
+        s.row.exp = s.row.exp
+            + (long)t.exp * s.expRate / 10000 * expMul / 10000 * supMul / 10000;
         s.row.kills = s.row.kills + 1;
         /* 五行修炼经验池：每击 +1（封顶），修炼页注入转行经验。 */
         Play.WxGain(s);
@@ -586,14 +605,7 @@ class Fight {
         }
         /* BOSS 链解锁在地图内页「挑战BOSS」胜利路径（Fight.BossFight），
            挂机杀野怪不解锁——照原版，BOSS 要专门下挑战打。 */
-        int ups = 0;
-        while (s.row.exp >= Fight.ExpNext(s.row.level)) {
-            s.row.exp = s.row.exp - Fight.ExpNext(s.row.level);
-            s.row.level = s.row.level + 1;
-            s.row.hp = Fight.MaxHp(s.row);
-            s.row.mp = Fight.MaxMp(s.row);
-            ups = ups + 1;
-        }
+        int ups = Fight.LevelUpApply(s);
         if (ups > 0) {
             f.Set("levelup", JsonValue.NewNum(Convert.ToString(s.row.level)));
             /* 批量结算（quiet）不发升级事件：整份 self 随 idlesum 下发；

@@ -494,6 +494,110 @@ def run_cas_and_worldstate(cookie):
     wins = (1 if r1 and r1.get("ok") == 1 else 0) + (1 if r2 and r2.get("ok") == 1 else 0)
     ok(wins == 1, "market CAS: exactly one buyer wins (got %d)" % wins)
 
+    # ---- 成就 / 爵位 / 邮箱 / 至尊殿堂（Batch F）----
+    hero.clear()
+    hero.send({"op": "ach"})
+    r = hero.reply_for(lambda m: "rows" in m)
+    arows = (r or {}).get("rows", [])
+    ok(len(arows) == 8 and arows[0].get("name") == "10级奖励"
+       and len(arows[0].get("rewards", [])) >= 1,
+       "ach rows=8 (level milestones + rebirth display rows)")
+    hero.clear()
+    hero.send({"op": "ach", "take": 1})
+    r = hero.reply_for(lambda m: (m.get("ok") == 1 and "rows" in m)
+                       or (m.get("ok") == 0 and "err" in m))
+    ok(r is not None and r.get("ok") == 1, "ach take 10级 (hero level 40)")
+    hero.clear()
+    hero.send({"op": "ach", "take": 1})
+    r = hero.reply_for(lambda m: m.get("ok") == 0 and "err" in m)
+    ok(r is not None, "ach re-claim rejected")
+    hero.clear()
+    hero.send({"op": "ach", "take": 5})
+    r = hero.reply_for(lambda m: m.get("ok") == 0 and "err" in m)
+    ok(r is not None, "ach level-50 claim gated by level")
+    hero.clear()
+    hero.send({"op": "ach", "take": 7})
+    r = hero.reply_for(lambda m: m.get("ok") == 0 and "err" in m)
+    ok(r is not None, "ach rebirth milestone gated (转生未开放)")
+
+    hero.clear()
+    hero.send({"op": "lord"})
+    r = hero.reply_for(lambda m: "me" in m)
+    ok(r is not None and int((r.get("me") or {}).get("contrib", -1)) == 0,
+       "lord panel me.contrib=0")
+    hero.clear()
+    hero.send({"op": "lord", "donate": 500})
+    r = hero.reply_for(lambda m: (m.get("ok") == 1 and "me" in m)
+                       or (m.get("ok") == 0 and "err" in m))
+    ok(r is not None and r.get("ok") == 1
+       and int((r.get("me") or {}).get("contrib", 0)) == 500
+       and str((r.get("me") or {}).get("tier")) == "4",
+       "lord donate 500 -> contrib=500 tier=无 (below tier1)")
+    lord_rows = (r or {}).get("rows", [])
+    ok(any(str(x.get("self")) == "1" for x in lord_rows),
+       "lord leaderboard lists donor row")
+
+    hero.clear()
+    hero.send({"op": "mail"})
+    r = hero.reply_for(lambda m: "rows" in m)
+    mrows = (r or {}).get("rows", [])
+    ok(len(mrows) >= 1, "mail list has mail (seeded on create)")
+    if mrows:
+        mail_id = mrows[0]["id"]
+        hero.clear()
+        hero.send({"op": "bag"})
+        rb = hero.reply_for(lambda m: "items" in m)
+        iron0 = next((i["count"] for i in (rb or {}).get("items", [])
+                      if i["name"] == "黑铁矿石"), 0)
+        hero.clear()
+        hero.send({"op": "mail", "take": mail_id})
+        r = hero.reply_for(lambda m: m.get("ok") == 1 or m.get("ok") == 0)
+        hero.clear()
+        hero.send({"op": "bag"})
+        rb = hero.reply_for(lambda m: "items" in m)
+        iron1 = next((i["count"] for i in (rb or {}).get("items", [])
+                      if i["name"] == "黑铁矿石"), 0)
+        ok(iron1 == iron0 + 10, "mail take grants 黑铁x10 (%d -> %d)" % (iron0, iron1))
+        hero.clear()
+        hero.send({"op": "mail", "take": mail_id})
+        r = hero.reply_for(lambda m: m.get("ok") == 0 and "err" in m)
+        ok(r is not None, "mail re-take rejected")
+        hero.clear()
+        hero.send({"op": "mail", "del": mail_id})
+        r = hero.reply_for(lambda m: "rows" in m)
+        ok(r is not None, "mail del ok")
+
+    # 至尊殿堂：穿上木剑登记武器之攻，第二把同剑登记被拒（score 不超榜首）
+    hero.clear()
+    hero.send({"op": "bag"})
+    rb = hero.reply_for(lambda m: "items" in m)
+    sword = next((i for i in (rb or {}).get("items", []) if i["name"] == "木剑"), None)
+    if sword:
+        hero.clear()
+        hero.send({"op": "equip", "item": sword["id"]})
+        r = hero.reply_for(lambda m: m.get("ok") == 1
+                           and (m.get("self") or {}).get("weapon"))
+        ok(r is not None, "equip sword for sup reg")
+        hero.clear()
+        hero.send({"op": "sup"})
+        r = hero.reply_for(lambda m: "rows" in m)
+        ok(r is not None and len(r.get("rows", [])) == 8,
+           "sup panel 8 cats")
+        hero.clear()
+        hero.send({"op": "sup", "reg": 0})
+        r = hero.reply_for(lambda m: (m.get("ok") == 1 and "rows" in m)
+                           or (m.get("ok") == 0 and "err" in m))
+        srows = ((r or {}).get("rows") or [])
+        ok(r is not None and r.get("ok") == 1 and len(srows) == 8
+           and srows[0].get("owner") == "市霸" + TS
+           and srows[0].get("itemName") == "木剑",
+           "sup reg -> weapon-atk champion (owner=hero)")
+        ok(int((r.get("bonus") or 0)) == 5, "sup exp bonus 5% for one holding")
+        hero.clear()
+        hero.send({"op": "sup", "reg": 0})
+        r = hero.reply_for(lambda m: m.get("ok") == 0 and "err" in m)
+        ok(r is not None, "sup re-reg with same sword rejected (score<=champion)")
+
     # 祭坛捐献：gold 档扣金币，个人/全服进度同步涨（global 写穿 world_state）
     hero.clear()
     hero.send({"op": "altar"})
