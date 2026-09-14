@@ -99,6 +99,23 @@ description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式�
   引用的 `_scratch` 探针结论一并复核。坑出处：这三处是"文档更新已完成"当天漏掉
   的，"更新 stdlib 注释"被当成做完，实际只改了一半。
 
+## stdlib 生成器（GenForm/GenHtml）：分块发射空集与直通排除清单（2026-09-14）
+
+- **分块字面量发射必须单测空集**：为绕单字面量 4095 词法上限把
+  `Css = "<全串>"` 改写成 while 分块相加（GenHtml），css 为空的文档
+  （无 `<style>` 的运行时片段）一段都不产，拼出裸 `Css = ;`，整个生成
+  类解析失败、conformance_gui_html_runtime 在编译步就红。空输入是分块
+  改造的必测边界——循环后补兜底初值（`if (cssLit == "") { cssLit =
+  "\"\""; }`）。坑出处：f69f4a99 分块改造当天回归，被同文件另一缺陷
+  的编译错误 mask 了一层才暴露。
+- **直通回退的排除清单要与"上方已消费分支"同步维护**：GenForm 建模键
+  直通循环按排除清单跳过已消费键，`label`（已被 SetDesignText 分支消费
+  的设计注记）漏在清单外，便对没有该属性的控件（容器）重复发射
+  SetProp，掉进 SetProp 兜底 `AddClass` 退化成样式类——容器
+  `GetProp("class")` 混进标题文案。加消费分支时同步加排除键；这类
+  静默降级只有 GetProp 断言型 conformance 抓得住，输出型金样抓不住
+  （gui_zform_control 的 `container class` 断言就是为此写的）。
+
 ## nsresolve 冲突改名丢泛型实参：只在"全量输入"构建炸（lambda_87，2026-09-13）
 
 - **症状**：IDE 构建（glob 全 Gui 树）报 `LLVM verification failed in
