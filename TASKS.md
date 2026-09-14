@@ -3012,3 +3012,28 @@ P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
   孪生档也按 `*.zan` 把它 add_test——任何重配（加新测试文件必然
   触发）都撞名 `add_test given test NAME which already exists` 配置
   失败。四个 GLOB 循环各补 `arc_net_publish` 跳过守卫。
+* **ZanDb 内核跨度整读 + 覆盖索引/无索引过滤接裸走读（2026-09-14，"继续"批次③）**：
+  「消除每块/每条目的系统调用与物化」三件套。①`ScanKernel` 块跨度
+  整读：段内块物理连续、记录解析不依赖块边界，`LoadBlockSpan` 一次
+  ReadAt 读 256KB（`KERNEL_SPAN_BYTES`）并逐块 CRC（NativeMemory
+  .Crc32 直算缓冲子区间，不复制）——把 16 记录/430B 小块的逐块
+  syscall 摊成每跨度一次。②`ScanKeyKernel`/`TryScanKeyKernel` 键只
+  读内核：覆盖索引路径（条目键自带值段+id）零 KvEntry 字符串物化，
+  `CountGroups` 同组连片 memcmp 判同、组值只在开新组物化一次。
+  ③无索引过滤接行内核：`FieldEqualsPtr` 裸走读（tag 5 memcmp、
+  tag 3/8/9 整数比较、tag 1/2 布尔字面；0xFF/文本数值/容器回退权
+  威），`EqFastReject` 针线否证先行——字符串等值 25M docs/s。
+  **一个真 bug**：内核循环缺下界判定——稀疏索引只保证「块首 ≤
+  startKey」，定位尾块里 < startKey 的前缀键会漏进回调；i: 范围
+  扫被定位块尾部的 c: 文档键污染，CountGroups 冒出空组（基准
+  groups=17 sum=200160 暴露，应 16/200000）。修复 = 循环内
+  `CmpRangeRaw(key, startKey) < 0` 即跳过（含 op=2 变长跳）。
+  **基准口径修正**：`zandb_vs_sqlite` 归并前 memtable 有残留（索引
+  批构建的最后几批没到阈值），全部查询退化到归并扫描慢路径——
+  之前发布的 count/sum/group 数字全是慢路径口径。`ZanDatabase
+  .Flush()` 暴露 `FlushToSegment`，归并前先固化；真稳态（20000
+  文档）：count 1.4M→19M docs/s（反超 SQLite 300 倍）、sum 1.3M→
+  8.9M（差距 10x→1.25x）、group by 1.2M→12.4M（46x→2.7x）、字符
+  串等值过滤 1.1M→25M。教训：微基准先确认走了哪条路径（SegCount
+  与 memtable 状态打印出来再计时）；聚合正确性断言要带「组数+组
+  计数总和」双校验。金标 zandb_* 16/16、ctest zandb 64/64。
