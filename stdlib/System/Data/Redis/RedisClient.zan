@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.Net.Sockets;
+using System.Net.Tls;
 using System.Data.Redis;
 
 namespace System.Data.Redis;
@@ -42,6 +44,18 @@ class RedisClient {
     int intail;
     byte[] tmp;      // 每次 recv 系统调用使用的固定暂存缓冲区
     int tmpcap;
+    TlsStream tls;   // 非空 = 通道已加密（ConnectSecureAsync 建立）
+
+    // TLS 校验开关：默认开启——证书链与主机名都验。自签/测试服务器
+    // 可经 SetTlsVerify(false) 放宽（只加密不校验），与 HttpClient 的
+    // verifyTls 开关同一语义。
+    static bool verifyTls = true;
+
+    /// <summary>切换后续 ConnectSecureAsync 的证书与主机名校验。
+    /// 仅测试/开发自签场景关闭；生产保持默认开启。</summary>
+    static void SetTlsVerify(bool verify) {
+        RedisClient.verifyTls = verify;
+    }
 
     [DllImport("crt")]
     static extern long strlen(string str);
@@ -59,6 +73,7 @@ class RedisClient {
         this.intail = 0;
         this.tmp = null;
         this.tmpcap = 16384;
+        this.tls = null;
     }
 
     /// <summary>连接 Redis 服务器，在 IO reactor 上挂起直到
@@ -69,6 +84,19 @@ class RedisClient {
 
     /// 带连接超时（毫秒，0 = 不限时）的连接；失败返回 null。
     static async RedisClient ConnectAsync(string host, int port, int timeoutMs) {
+        return await RedisClient.doConnect(host, port, timeoutMs, false);
+    }
+
+    /// <summary>与 <see cref="ConnectAsync"/> 相同，但 TCP 建连后立即把
+    /// 通道升级为 TLS（Redis 的 TLS 监听从首字节就是加密流，无需
+    /// 协商握手）。认证（AUTH）与数据全部走加密信道。
+    /// 握手按 <paramref name="host"/> 做证书主机名校验，信任系统根。
+    /// A287③：口令不再明文过网。</summary>
+    static async RedisClient ConnectSecureAsync(string host, int port, int timeoutMs) {
+        return await RedisClient.doConnect(host, port, timeoutMs, true);
+    }
+
+    static async RedisClient doConnect(string host, int port, int timeoutMs, bool secure) {
         Socket.Initialize();
         RedisClient c = new RedisClient();
         c.host = host;
@@ -81,6 +109,22 @@ class RedisClient {
             c.sock = -1;
             return null;
         }
+        if (secure) {
+            TlsContext tlsCtx = TlsContext.CreateClient();
+            if (tlsCtx == null) {
+                Socket.Close(c.sock);
+                c.sock = -1;
+                return null;
+            }
+            if (!RedisClient.verifyTls) { tlsCtx.DisableVerify(); }
+            int hsTimeout = timeoutMs > 0 ? timeoutMs : 15000;
+            c.tls = await TlsStream.ConnectAsync(tlsCtx, c.sock, host, hsTimeout);
+            if (c.tls == null) {
+                Socket.Close(c.sock);
+                c.sock = -1;
+                return null;
+            }
+        }
         c.connected = true;
         c.incap = 16384;
         c.inbuf = new byte[c.incap + 1];
@@ -92,6 +136,11 @@ class RedisClient {
 
     /// <summary>关闭连接并释放缓冲区。</summary>
     void Close() {
+        // TLS 先发 close_notify 再关套接字（TlsStream.Close 不拥有底层 fd）。
+        if (this.tls != null) {
+            this.tls.Close();
+            this.tls = null;
+        }
         // 套接字在就关闭，不依赖 connected 标志（死连接泄漏 fd）。
         if (this.connected || this.sock >= 0) {
             Socket.Close(this.sock);
@@ -141,6 +190,20 @@ class RedisClient {
     /// <summary>从套接字接收一块数据存入缓冲区。返回
     /// 字节数（对端关闭时为 0）。在 reactor 上挂起直到可读。</summary>
     async int fillMore() {
+        if (this.tls != null) {
+            string chunk = await this.tls.RecvAsync(this.tmpcap);
+            int cl = chunk.Length;
+            if (cl <= 0) {
+                this.Close();
+                return 0;
+            }
+            this.ensureRoom(cl);
+            for (int k = 0; k < cl; k = k + 1) {
+                this.inbuf[this.intail + k] = (byte)(chunk[k] & 255);
+            }
+            this.intail = this.intail + cl;
+            return cl;
+        }
         int n = await Socket.RecvIntoAsync(this.sock, this.tmp, this.tmpcap);
         if (n <= 0) {
             this.Close();
@@ -284,7 +347,12 @@ class RedisClient {
         }
         string payload = sb.ToString();
         int expected = (int)strlen(payload);
-        int sent = await Socket.SendAsync(this.sock, payload, expected);
+        int sent;
+        if (this.tls != null) {
+            sent = await this.tls.SendAsync(payload, expected);
+        } else {
+            sent = await Socket.SendAsync(this.sock, payload, expected);
+        }
         if (sent != expected) { this.Close(); }
         return sent;
     }
