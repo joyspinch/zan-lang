@@ -2873,13 +2873,20 @@ P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
   才早退。回归：全量 sweep FLAG 182 与 HEAD 基线逐字节 IDENTICAL
   （A/B 隔离出 +1 geo-seatmap-flight BLANK 即 (d)(e) 所修），
   实机海面悬停干净、flight-seats 座位图完整渲染。
-  **挂账（app 层 DPI 鼠标空间错位，未修）**：150% DPI 下
-  `app.mouseX = (物理光标 − 窗口原点) × 1.5` 而画布 1:1 客户区
-  ——HITDBG3 同帧实证 px2=788 mx=1211（恰 ×1.5）。所有图表车道
-  的悬停命中在 ≥150% DPI 全体右下偏移（用户截图中区域卡总在光标
-  右下即此）。根子在 app/Win32Shell 层的 DPI 缩放约定，不在
-  Chart 作用域内；合成光标注入路径（UiDriver ev 1）直接给画布
-  坐标不受影响，自动化回归不受阻。
+  **已闭账（2026-09-14，「DPI 鼠标空间错位」定谳为误诊，引擎无缺陷）**：
+  上批记的「150% DPI 下 app.mouseX = 物理光标 ×1.5，悬停命中全体
+  右下偏移」不成立。进程内探针（GetCursorPos+ScreenToClient 与
+  app.mouseX 同帧对照）40+ 样本 mx/my 与物理客户像素逐像素相等
+  （WM_MOUSEMOVE lParam → postQ → evX → mouseX 全链无缩放，窗口
+  客户区 1222×806 = 画布 1:1）；实机 area-simple 光标物理钉在
+  (900,600)，轴指针十字与 tooltip 卡、轴标签全部钉在光标处。
+  当时的「×1.5 实证」是**测试工具伪造的**：光标落点用 DPI 不感知
+  进程的 PowerShell SetCursorPos 摆放，OS 对 unaware 进程的鼠标
+  API 坐标做 ×1.5 虚拟化，光标实际落在 1.5× 目标处，引擎如实
+  上报（HITDBG px2=788 vs mx=1211 即 788×1.5+窗口原点杂项）。
+  教训沉淀 gui-design：外部光标自动化必须先 SetProcessDPIAware，
+  鼠标空间疑云用进程内 GetCursorPos+ScreenToClient 对照定谳，
+  不用注入式 SetCursorPos 当证据。
 * **geo lines 车道闭账（2026-09-14，用户实机审查批次①）**：
   lines-airline（"World Flights"，3.2 万航线对）地图画了航线没画。
   六处根因/缺口一批修讫（ChartModel/ChartViewMap/gui_runtime/
