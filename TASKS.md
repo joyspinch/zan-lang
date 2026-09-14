@@ -170,7 +170,14 @@ A32（遗留收尾路线）、A33-A47（专项记录）、文末"已撤回的结
   外部线程（X11 / SDL / Cocoa 回调）可以调 `zan_thread_detach()` 自己交还槽位。
   用例：`tests/conformance/thread_eh_slots.zan`（3000 个线程各抛一次，必须跑完）。
   **仍未做**：非 EH 的每线程状态（目前只有 `rt_sync.c` 的 `zan_shared_string`）没有
-  统一的 attach/detach 钩子；GUI 回调线程也还没有真正调用 `zan_thread_detach()`。
+  统一的 attach/detach 钩子。
+  **2026-09-14 余量重定性**：`zan_thread_detach()` 目前在 stdlib **零受益者**
+  （`grep -rln zan_thread_detach stdlib/ src/runtime/` 只命中 rt_sync.c/.h 定义处）——
+  今天的全部"外部回调"其实都跑在 Zan 托管线程上：CEF 回调到达主线程（CefRuntime
+  无 Thread.Start），Input/Hook 的钩子线程与 TrayIcon 泵线程都是 `Thread.Start`
+  起的 Zan 线程（trampoline 已自动释放，102.3MB→3.9MB 即其对账），A52-7/A78-2
+  动态哈希表也消除了 1024 硬顶 exit 失败。真正的异质线程只随 B5（X11 事件线程 /
+  SDL 音频回调 / Cocoa main）出现，接线作为 B5 的开工前置执行，本条不再单独立账。
 
 ## A5 SIMD 〔依赖 A1，可选〕
 
@@ -609,6 +616,12 @@ HTTP 解析、编码转换、路径处理这类纯逻辑，上移到 Zan。
 * **A15-5** [ ] `switch` 已是能力缺口外的可读性债：2026-08-08 复核 stdlib 已有 **7 处**真
   switch 语句（`Gui/Style.zan` ×3、`Gui/Widget/Spin.zan` ×3、`Gui/Widget/Typography.zan` ×1），
   "全库 0 处"的说法已过时；但 `Gui` 仍有大量 `if (x == "...")` 链，随颜色迁移一起清。
+  **2026-09-14 定量与定性**：switch-on-string 本身已被探针证通（返回分支正确），
+  债在链体改写量而非能力。链数 Top：Theme.zan **92**、ChartView.zan 33、
+  StyleSheet.zan 25、Css.zan 17、Pagination.zan 14。抽样 Pagination/StyleSheet
+  显示不少链**混卫语句**（`seg == "total" && showTotal`），并非纯单变量可机械转换；
+  Theme.zan 的 92 条全部落在颜色迁移热路径上。结论：本条与颜色迁移**同一批做**，
+  单独清链收益低；ChartView 等 Chart* 文件在并行会话在途，勿动。
 * **A15-7** ✅ 已修 `1dd023d`：foreach 只能迭代 `List<T>`（数组/字符串按 List 布局读，
   第一个元素就崩——这正是 stdlib 大量写 `while (i < x.Length)` 的原因）。
 * **A15-8** ✅ 已修 `a44a807`：数组不带长度（字段/参数上 `.Length` 和 foreach 不可用）。
@@ -1876,7 +1889,7 @@ memcpy 一并消失（这同时是条性能修复：`parse_postfix` 的前瞻是
 
 | # | 内容 | 验收 |
 |---|---|---|
-| 3.1 | **A52-7** EH 线程表 1024 硬顶动态化；GUI/SDL/外部回调线程接上 `zan_thread_detach()`（A4-2 剩余） | `thread_eh_slots` 扩到 >1024 并发仍跑完；峰值内存不回退 |
+| 3.1 | **A52-7** EH 线程表 1024 硬顶动态化 ✅；A4-2 剩余（`zan_thread_detach()` 接线）已并 **B5** 前置——今日回调源全为 Zan 托管线程，stdlib 零受益者（grep 证） | `thread_eh_slots` 扩到 >1024 并发仍跑完 ✅；峰值内存不回退 ✅（102.3MB→3.9MB） |
 | 3.2 | **A52-8** 库内十余处 `abort()` 改为可注册回调 + 错误码出口（OOM、契约违反、slab 一致性） | 新增"宿主接管 OOM 后自行退出"用例；无回调时行为与今天一致 |
 | 3.3 | **A52-5** `--publish` 保留低成本安全网（~~需先定性能预算~~ **已实测，见下**） | publish 版本能报 over-release；约定阈值内不退化 |
 | 3.4 | **A52-6** null 解引用通用守卫 + opaque string 越界检查（~~需先定性能预算~~ **不是预算问题，见下**） | 新增诊断用例；裸循环/字段访问的基准不退化超阈值 |
