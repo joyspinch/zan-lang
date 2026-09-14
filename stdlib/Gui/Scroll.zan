@@ -4,9 +4,10 @@ using Gui;
 namespace Gui;
 
 /// CSS 滚动容器的交互状态（WEB_GUI_ROADMAP P6）：滚轮认领、
-/// 覆盖式滚动条绘制与滑块拖动。偏移本体存在 Control.scrollY——
-/// 排布期（Arrange）按内容延伸钳制并把子树平移 -scrollY，本类只
-/// 管"输入如何改 offset"与"滚动条怎么画"，方法都吃现值返回新值。
+/// 覆盖式滚动条绘制与滑块拖动。偏移本体存在 Control.scrollY /
+/// Control.scrollX——排布期（Arrange）按内容延伸钳制并把子树
+/// 平移 -scrollY / -scrollX，本类只管"输入如何改 offset"与
+/// "滚动条怎么画"，方法都吃现值返回新值。
 ///
 /// 与 Widget.ScrollView 的分工：ScrollView 是立即模式帮助类（自带
 /// 塌陷保护——内容高度按帧实测会抖）；保留模式树里内容高度来自
@@ -19,6 +20,10 @@ class ScrollState {
     int dragMouseY0;
     int dragOffset0;
     int dragMo0;
+    bool draggingX;
+    int dragMouseX0;
+    int dragOffsetX0;
+    int dragMoX0;
     /// 滚动条宽（OnMeasure 后的消费端自行 Scale；此处存基准值）。
     int barW;
 
@@ -27,17 +32,38 @@ class ScrollState {
         dragMouseY0 = 0;
         dragOffset0 = 0;
         dragMo0 = 0;
+        draggingX = false;
+        dragMouseX0 = 0;
+        dragOffsetX0 = 0;
+        dragMoX0 = 0;
         barW = 8;
     }
 
-    /// 指针悬停时认领滚轮：offset 减去滚轮增量。overflow:hidden 的
-    /// 容器不可用户滚动（Chrome 同款，只有程序性 scrollTop），调用
-    /// 方负责只对 auto/scroll 调用。未认领（指针不在区域内）不动。
-    int Wheel(App app, int x, int y, int w, int h, int offset) {
-        if (!Ui.Over(app, x, y, w, h)) { return offset; }
-        if (!app.CaptureWheel(x, y, w, h)) { return offset; }
-        int d = app.window.EventKeyCode();
-        return offset - d * app.scrollSpeed / 120;
+    /// 双轴滚轮认领（渲染期每帧调用）：指针悬停时认领（CaptureWheel
+    /// 两段式，与单轴版同序）；滚轮帧上 shift+滚轮且容器横向可滚
+    /// （oxMode 为 auto/scroll、内容横向溢出）时平移 host.scrollX——
+    /// Chrome Windows 同款（触控板横扫由外壳映射成 shift+滚轮），
+    /// 横向滚不动时回落纵向；其余平移 host.scrollY。双轴都不可
+    /// 用户滚动时不认领（滚轮穿透给页面滚动）。返回是否移动了
+    /// 偏移（调用方据此报损伤）。取代单轴 Wheel（双轴分支并到
+    /// 一处，认领只做一次）。
+    bool WheelXY(App app, int x, int y, int w, int h, Control host,
+                 int oxMode, int oyMode) {
+        bool xCan = oxMode >= 2 && host.scrollExtentX > w;
+        bool yCan = oyMode >= 2;
+        if (!xCan && !yCan) { return false; }
+        if (!Ui.Over(app, x, y, w, h)) { return false; }
+        if (!app.CaptureWheel(x, y, w, h)) { return false; }
+        if (Modifiers.HasShift(app.window.EventMods()) && xCan) {
+            int nx = host.scrollX - app.window.EventKeyCode()
+                * app.scrollSpeed / 120;
+            if (nx != host.scrollX) { host.scrollX = nx; return true; }
+            return false;
+        }
+        int ny = host.scrollY - app.window.EventKeyCode()
+            * app.scrollSpeed / 120;
+        if (ny != host.scrollY) { host.scrollY = ny; return true; }
+        return false;
     }
 
     /// 该不该画滚动条：scroll 常驻（Chrome 桌面对 overflow:scroll
@@ -144,6 +170,98 @@ class ScrollState {
         c.PushClip(x, y, w, h);
         c.FillRoundRect(bx, by, bw, bh, half, track.bg);
         c.FillRoundRect(bx, thumbY, bw, thumbH, half, thumb.bg);
+        c.PopClip();
+        return off;
+    }
+
+    /// 水平轴版 Bar（P6 横滚）：轨道贴 padding box 底边，滑块按
+    /// scrollExtentX/scrollX 映射；拖拽跟随 mouseX，其余语义与
+    /// 纵向 Bar 全同。先纵后横绘制——右下角被横向轨道盖住
+    /// （Chrome 经典滚动条此处是独立方角，台账）。
+    int BarX(App app, int x, int y, int w, int h, int offset,
+             int extent, int mode) {
+        int client = w;
+        int mo = extent - client;
+        if (mo < 0) { mo = 0; }
+        if (!this.WantsBar(extent, client, mode)) {
+            draggingX = false;
+            return this.Clamp(offset, extent, client);
+        }
+
+        Canvas c = app.canvas;
+        int bw = app.Scale(barW);
+        if (bw > h) { bw = h; }
+        if (bw < 1) { bw = 1; }
+        int inset = app.Scale(2);
+        int by = y + h - bw - inset;
+        if (by < y) { by = y; }
+        int bx = x;
+        int bh = w;
+        if (bh <= 0) { draggingX = false; return offset; }
+
+        int minThumb = app.Scale(24);
+        if (minThumb > bh) { minThumb = bh; }
+        int thumbW = bh * bh / extent;
+        if (thumbW < minThumb) { thumbW = minThumb; }
+        if (thumbW > bh) { thumbW = bh; }
+        int travel = bh - thumbW;
+        if (travel < 0) { travel = 0; }
+
+        int off = this.Clamp(offset, extent, client);
+        int thumbX = bx;
+        if (mo > 0) { thumbX = bx + off * travel / mo; }
+        if (thumbX < bx) { thumbX = bx; }
+        if (thumbX + thumbW > bx + bh) { thumbX = bx + bh - thumbW; }
+
+        bool overThumb = Ui.Over(app, thumbX, by, thumbW, bw);
+        bool overBar = Ui.Over(app, bx, by, bh, bw);
+
+        if (!draggingX && Ui.MousePressed(app) && overBar) {
+            // 点轨道：滑块跳到指针处再拖（纵向 Bar 同款）
+            if (!overThumb && travel > 0) {
+                int want = app.mouseX - bx - thumbW / 2;
+                int o = want * mo / travel;
+                if (o < 0) { o = 0; }
+                if (o > mo) { o = mo; }
+                off = o;
+            }
+            draggingX = true;
+            dragMouseX0 = app.mouseX;
+            dragOffsetX0 = off;
+            dragMoX0 = mo;
+        }
+
+        if (draggingX) {
+            int dxPix = app.mouseX - dragMouseX0;
+            int o = dragOffsetX0;
+            if (mo != dragMoX0) {
+                // 拖拽中内容宽度变了：重新锚定（纵向 Bar 同款）。
+                dragOffsetX0 = off;
+                dragMouseX0 = app.mouseX;
+                dragMoX0 = mo;
+                dxPix = 0;
+            }
+            if (travel > 0) { o = dragOffsetX0 + dxPix * mo / travel; }
+            if (o < 0) { o = 0; }
+            if (o > mo) { o = mo; }
+            off = o;
+            if (Ui.MouseReleased(app)) { draggingX = false; }
+        }
+
+        if (off != offset) {
+            app.NoteScrollDamage(x, y, w, h);
+        }
+
+        StyleBox track = Style.Of(app, "scrollbar", "", Style.SNormal());
+        int thumbState = Style.SNormal();
+        if (draggingX || overThumb) { thumbState = Style.SHover(); }
+        StyleBox thumb = Style.Part(app, "scrollbar", "thumb", "", "", "",
+                                    thumbState);
+
+        int half = bw / 2;
+        c.PushClip(x, y, w, h);
+        c.FillRoundRect(bx, by, bh, bw, half, track.bg);
+        c.FillRoundRect(thumbX, by, thumbW, bw, half, thumb.bg);
         c.PopClip();
         return off;
     }

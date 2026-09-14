@@ -127,9 +127,12 @@ class Control {
     int bh;
     /// CSS 滚动容器（P6）：当前滚动偏移与最近一次排布出的内容延伸
     /// （padding-box 坐标，px）。偏移在 Arrange 期按延伸钳制并把
-    /// 子树平移 -scrollY；交互状态（滚轮/拖动）惰性建。
+    /// 子树平移 -scrollY / -scrollX；交互状态（滚轮/拖动）惰性建。
     int scrollY;
     int scrollExtent;
+    /// 水平轴（P6 横滚）：overflow-x auto/scroll 与纵向同语义。
+    int scrollX;
+    int scrollExtentX;
     ScrollState scroll;
     weak Control parent;
     List<Control> children;
@@ -711,7 +714,6 @@ class Control {
     /// CSS overflow 的 per-axis 计算值（P6）：0 visible / 1 hidden /
     /// 2 auto / 3 scroll。单轴声明时另一根的 visible 按规范计算成
     /// auto（CSS Overflow——混合 visible 会让 visible 轴变 auto）。
-    /// 水平轴当前只裁剪不滚动（roadmap 台账）。
     int StyleOverflowX() {
         if (computedStyle == null) { return 0; }
         int x = computedStyle.overflowX;
@@ -742,6 +744,18 @@ class Control {
     /// 最近一次排布出的内容延伸（padding-box 坐标，px；
     /// 等价 DOM scrollHeight 与 clientHeight 取大）。
     int ScrollExtent() { return this.scrollExtent; }
+
+    /// 程序性横向滚动（等价 el.scrollLeft = v，P6 横滚）：钳制与
+    /// 子树平移同 SetScrollTop，下一帧 Arrange 收口。
+    void SetScrollLeft(int v) {
+        this.scrollX = v;
+        if (this.scroll == null) { this.scroll = new ScrollState(); }
+    }
+    /// 当前水平滚动偏移（px，钳制后）。
+    int ScrollLeft() { return this.scrollX; }
+    /// 最近一次排布出的水平内容延伸（padding-box 坐标，px；
+    /// 等价 DOM scrollWidth 与 clientWidth 取大）。
+    int ScrollExtentX() { return this.scrollExtentX; }
 
     /// 在 `avail` 像素的包含块内声明的主/交叉轴尺寸，
     /// 百分比已解析、min/max 已应用；样式未声明尺寸时
@@ -2411,17 +2425,20 @@ class Control {
     }
 
     /// Arrange 尾段（P6 滚动容器）：算内容延伸、钳偏移、把子树平移
-    /// -scrollY。延伸 = 可见内容底（子项 border-box 底，absolute 后代
-    /// 也计入——Chrome 里 abs 后代贡献滚动溢出）+ 自身 padding-bottom，
-    /// 换算到 padding-box 坐标；下限 = client 高（内容不足不滚）。
-    /// `clientH` 是内容框高，`padB` 是内容框底 padding（延伸含它，
-    /// CSSOM scrollHeight 同义）。
+    /// -scrollY/-scrollX。延伸 = 可见内容底/右缘（子项 border-box，
+    /// absolute 后代也计入——Chrome 里 abs 后代贡献滚动溢出）+ 自身
+    /// 对应侧 padding，换算到 padding-box 坐标；下限 = client 尺寸
+    /// （内容不足不滚）。`clientH` 是内容框高，`padB` 是内容框底
+    /// padding（延伸含它，CSSOM scrollHeight/scrollWidth 同义）。
     void UpdateScroll(int clientH, int padB) {
         int bottom = 0;
+        int right = 0;
         for (int i = 0; i < children.Count; i = i + 1) {
             Control c = children[i];
             int b = c.by + c.bh;
             if (b > bottom) { bottom = b; }
+            int r = c.bx + c.bw;
+            if (r > right) { right = r; }
         }
         // padding-box 顶 = by + borderT = 内容框顶（by+InsetT）- padT
         int top = this.by + this.StyleInsetT() - this.StylePadT();
@@ -2431,9 +2448,22 @@ class Control {
         if (mo < 0) { mo = 0; }
         if (this.scrollY > mo) { this.scrollY = mo; }
         if (this.scrollY < 0) { this.scrollY = 0; }
-        if (this.scrollY != 0) {
+        // 水平轴（P6 横滚）：同式换算右缘。客户端宽 = 内容框宽；
+        // 右缘下限 = 内容框右（内容不足不横滚）。
+        int clientW = this.bw - this.StyleInsetL() - this.StyleInsetR();
+        int left = this.bx + this.StyleInsetL() - this.StylePadL();
+        this.scrollExtentX = right > 0 ? right + this.StylePadR() - left
+                                       : clientW;
+        if (this.scrollExtentX < clientW) { this.scrollExtentX = clientW; }
+        int moX = this.scrollExtentX - clientW;
+        if (moX < 0) { moX = 0; }
+        if (this.scrollX > moX) { this.scrollX = moX; }
+        if (this.scrollX < 0) { this.scrollX = 0; }
+        int dy = 0 - this.scrollY;
+        int dx = 0 - this.scrollX;
+        if (dy != 0 || dx != 0) {
             for (int i = 0; i < children.Count; i = i + 1) {
-                children[i].ShiftTree(0, 0 - this.scrollY);
+                children[i].ShiftTree(dx, dy);
             }
         }
     }
@@ -3490,18 +3520,19 @@ class Control {
         everLaidOut = true;
         // P6 滚动容器：滚轮认领要在子项之前（CaptureWheel 后声明者
         // 胜——嵌套时最内层最后认领而赢，外层不双重滚动）；hidden 的
-        // 容器不可用户滚动（Chrome 同款），不认领。
+        // 容器不可用户滚动（Chrome 同款），不认领。双轴一次认领：
+        // shift+滚轮横向、否则纵向（WheelXY 内判定）。
         bool scrollC = this.IsScrollContainer();
         int oyMode = scrollC ? this.StyleOverflowY() : 0;
-        if (scrollC && oyMode >= 2) {
+        int oxMode = scrollC ? this.StyleOverflowX() : 0;
+        if (scrollC) {
             if (this.scroll == null) { this.scroll = new ScrollState(); }
             int pby = by + computedStyle.BorderTopPx();
             int pbh = bh - computedStyle.BorderTopPx()
                 - computedStyle.BorderBottomPx();
-            int off = this.scroll.Wheel(app, bx, pby, bw, pbh,
-                                        this.scrollY);
-            if (off != this.scrollY) {
-                this.scrollY = off;
+            bool moved = this.scroll.WheelXY(app, bx, pby, bw, pbh, this,
+                                             oxMode, oyMode);
+            if (moved) {
                 app.NoteScrollDamage(bx, by, bw, bh);
             }
         }
@@ -3555,8 +3586,9 @@ class Control {
             if (clipKids) { app.canvas.PopClip(); }
         }
         // 滚动条在子项与裁剪之后画（覆盖式，不被自己的裁剪收走）；
-        // 拖动改写 offset 后由下一帧 Arrange 生效。
-        if (scrollC && oyMode >= 2) {
+        // 拖动改写 offset 后由下一帧 Arrange 生效。先纵后横：
+        // 右下角由横向轨道收口（台账）。
+        if (scrollC) {
             if (this.scroll == null) { this.scroll = new ScrollState(); }
             int pby2 = by + computedStyle.BorderTopPx();
             int pbh2 = bh - computedStyle.BorderTopPx()
@@ -3567,6 +3599,18 @@ class Control {
             if (off != this.scrollY) {
                 this.scrollY = off;
                 app.NoteScrollDamage(bx, by, bw, bh);
+            }
+            if (oxMode >= 2) {
+                int pbx2 = bx + computedStyle.BorderLeftPx();
+                int pbw2 = bw - computedStyle.BorderLeftPx()
+                    - computedStyle.BorderRightPx();
+                int offX = this.scroll.BarX(app, pbx2, pby2, pbw2, pbh2,
+                                            this.scrollX,
+                                            this.scrollExtentX, oxMode);
+                if (offX != this.scrollX) {
+                    this.scrollX = offX;
+                    app.NoteScrollDamage(bx, by, bw, bh);
+                }
             }
         }
     }
