@@ -1,0 +1,592 @@
+using System;
+using System.Collections.Generic;
+using System.Data.SqlServer;
+using System.IO;
+using System.Net.Sockets;
+using System.Net.Tls;
+
+// A287②: the TDS (SQL Server) driver's TLS path. MS-TDS has a quirky
+// encryption setup: the TLS handshake records are encapsulated in
+// PRELOGIN (0x12) packets during the handshake phase, and after the
+// handshake the raw TLS records hit the socket directly with the whole
+// TDS packet layer -- LOGIN7, its cleartext-obfuscated password field
+// included -- running INSIDE the tunnel. A live TLS SQL Server is not
+// available in CI, so this program is both ends: a fake server that
+// negotiates ENCRYPT_ON in prelogin and completes the 0x12-encapsulated
+// handshake with TlsStream.AcceptStepped, plus a client driving
+// OpenSecureAsync through login and a batch. Pinned failure modes:
+//   * a server that declines encryption (NOT_SUP) must be refused by a
+//     secure open -- never a silent plaintext downgrade;
+//   * a server demanding encryption (REQ) must be refused by a plaintext
+//     open (the pre-existing behavior);
+//   * a self-signed server must fail certificate verification while
+//     verification is on (the default).
+// The server also proves the password never crossed the wire in the
+// clear: everything read before the TLS upgrade is buffered and scanned
+// for the login's UCS-2 user bytes.
+
+// ---------------------------------------------------------------- server ----
+
+/// <summary>Token-stream builders a SQL Server would send (mirrors the
+/// shapes the TdsMessage decoder accepts).</summary>
+class Tok {
+    static void Wrap(TdsBuf outp, int token, TdsBytes body) {
+        outp.U8(token);
+        outp.U16LE(body.Len());
+        outp.Block(body);
+        body.Release();
+    }
+
+    static void BVarchar(TdsBuf b, string s) {
+        b.U8(s.Length);
+        b.Ucs2(s);
+    }
+
+    static TdsBytes LoginAck() {
+        TdsBuf w = new TdsBuf();
+        TdsBuf b = new TdsBuf();
+        b.U8(1);                        // interface: SQL
+        b.U32LE(1946157060);            // TDS 7.4
+        Tok.BVarchar(b, "Microsoft SQL Server");
+        b.U8(16);
+        b.U8(0);
+        b.U16BE(1000);
+        Tok.Wrap(w, 173, b.ToBytes());
+        return w.ToBytes();
+    }
+
+    static TdsBytes EnvChangeDb() {
+        TdsBuf w = new TdsBuf();
+        TdsBuf b = new TdsBuf();
+        b.U8(1);                        // database change
+        Tok.BVarchar(b, "appdb");
+        Tok.BVarchar(b, "");
+        Tok.Wrap(w, 227, b.ToBytes());
+        return w.ToBytes();
+    }
+
+    /// DONE with the "count is valid" status bit set.
+    static TdsBytes Done(int count) {
+        TdsBuf b = new TdsBuf();
+        b.U8(253);
+        b.U16LE(16);
+        b.U16LE(0);
+        b.U64LE(count);
+        return b.ToBytes();
+    }
+}
+
+/// <summary>Buffered reader over a TlsStream for the post-handshake TDS
+/// frames: RecvAsync returns record-sized chunks, TDS needs exact
+/// header+payload framing.</summary>
+class TlsBuf2 {
+    TlsStream ts;
+    byte[] buf;
+    int len;
+    int pos;
+
+    TlsBuf2(TlsStream ts) {
+        this.ts = ts;
+        this.buf = new byte[32769];
+        this.len = 0;
+        this.pos = 0;
+    }
+
+    async bool Fill(int need) {
+        while (this.len - this.pos < need) {
+            string chunk = await this.ts.RecvAsync(16384);
+            int cl = chunk.Length;
+            if (cl <= 0) { return false; }
+            if (this.pos > 0 && this.len + cl + 1 > this.buf.Length) {
+                int rem = this.len - this.pos;
+                for (int i = 0; i < rem; i = i + 1) { this.buf[i] = this.buf[this.pos + i]; }
+                this.len = rem;
+                this.pos = 0;
+            }
+            int k = 0;
+            while (k < cl) {
+                this.buf[this.len] = (byte)(chunk[k] & 255);
+                this.len = this.len + 1;
+                k = k + 1;
+            }
+        }
+        return true;
+    }
+
+    /// <summary>Exactly `need` bytes as a string; null on close.</summary>
+    async string ReadExact(int need) {
+        if (need <= 0) { return ""; }
+        bool ok = await this.Fill(need);
+        if (!ok) { return null; }
+        string s = this.buf.ToStr(this.pos, need);
+        this.pos = this.pos + need;
+        return s;
+    }
+}
+
+class FakeTds {
+    // session modes
+    static int MODE_ACCEPT = 1;     // prelogin enc=1, TLS upgrade, login, batch
+    static int MODE_REQ = 2;        // prelogin enc=3 (force encryption)
+    static int MODE_DECLINE = 3;    // prelogin enc=2 (encryption declined)
+
+    int port;
+    int mode;
+    TlsContext serverTls;
+    TcpListener listener;
+
+    // ---- observations the client-side assertions read back ----
+    int clientEncrypt = -1;   // ENCRYPTION byte the client proposed
+    bool loginSeen = false;   // LOGIN7 arrived (over the tunnel)
+    string userBytes = "";    // raw UCS-2LE bytes of the login user
+    int batches = 0;
+    byte[] clearLog;          // everything read BEFORE the TLS upgrade
+    int clearLen;
+    bool loginLeaked = false; // set by ScanForLeak when the user bytes show up
+
+    FakeTds(int port, int mode, TlsContext serverTls) {
+        this.port = port;
+        this.mode = mode;
+        this.serverTls = serverTls;
+        this.listener = null;
+        this.clientEncrypt = -1;
+        this.loginSeen = false;
+        this.userBytes = "";
+        this.batches = 0;
+        this.clearLog = new byte[65537];
+        this.clearLen = 0;
+        this.loginLeaked = false;
+    }
+
+    void Stop() {
+        if (this.listener != null) { this.listener.Stop(); }
+    }
+
+    async void Serve() {
+        this.listener = new TcpListener("127.0.0.1", this.port);
+        this.listener.Start();
+        while (true) {
+            nint client = await this.listener.AcceptAsync();
+            if (client < 0) { return; }
+            // Sessions run one at a time on purpose: this fake keeps a
+            // single per-session observation set.
+            await this.Session(client);
+        }
+    }
+
+    async int RecvExactRaw(nint sock, byte[] dst, int off, int need) {
+        int got = 0;
+        byte[] tmp = new byte[need + 1];
+        while (got < need) {
+            int n = await Socket.RecvIntoAsync(sock, tmp, need - got);
+            if (n <= 0) { return got; }
+            for (int j = 0; j < n; j = j + 1) { dst[off + got + j] = tmp[j]; }
+            got = got + n;
+        }
+        return got;
+    }
+
+    /// <summary>One raw (pre-TLS) TDS packet; payload appended to clearLog.
+    /// Returns the payload as a string, or null on close.</summary>
+    async string RecvPacketRaw(nint sock, List<int> typeOut) {
+        byte[] hdr = new byte[9];
+        int got = await this.RecvExactRaw(sock, hdr, 0, 8);
+        if (got < 8) { return null; }
+        typeOut[0] = hdr[0] & 255;
+        int payLen = (((hdr[2] & 255) << 8) | (hdr[3] & 255)) - 8;
+        if (payLen <= 0) { return ""; }
+        byte[] pay = new byte[payLen + 1];
+        int g2 = await this.RecvExactRaw(sock, pay, 0, payLen);
+        if (g2 < payLen) { return null; }
+        // Everything before the TLS upgrade is plaintext on the wire: keep
+        // it for the leak scan.
+        if (this.clearLen + payLen < this.clearLog.Length) {
+            for (int i = 0; i < payLen; i = i + 1) {
+                this.clearLog[this.clearLen + i] = pay[i];
+            }
+            this.clearLen = this.clearLen + payLen;
+        }
+        return pay.ToStr(0, payLen);
+    }
+
+    async void SendPacketRaw(nint sock, int type, string payload) {
+        int payLen = payload.Length;
+        byte[] frame = new byte[payLen + 9];
+        frame[0] = (byte)type;
+        frame[1] = 1;                       // EOM
+        int len = payLen + 8;
+        frame[2] = (byte)(len >> 8);
+        frame[3] = (byte)(len & 255);
+        int s = await Socket.SendAsync(sock, frame, payLen + 8);
+        if (payLen > 0 && s >= 0) {
+            int _b = await Socket.SendAsync(sock, payload, payLen);
+        }
+    }
+
+    async void SendPacketTls(TlsStream ts, int type, string payload) {
+        int payLen = payload.Length;
+        byte[] frame = new byte[payLen + 9];
+        frame[0] = (byte)type;
+        frame[1] = 1;
+        int len = payLen + 8;
+        frame[2] = (byte)(len >> 8);
+        frame[3] = (byte)(len & 255);
+        for (int i = 0; i < payLen; i = i + 1) {
+            frame[8 + i] = (byte)(payload[i] & 255);
+        }
+        int _s = await ts.SendAsync(frame.ToStr(0, payLen + 8), payLen + 8);
+    }
+
+    async void Session(nint sock) {
+        // PRELOGIN in: the ENCRYPTION byte sits at payload offset 22.
+        List<int> typeOut = new List<int>(); typeOut.Add(0);
+        string pre = await this.RecvPacketRaw(sock, typeOut);
+        if (pre == null || pre.Length < 23) { Socket.Close(sock); return; }
+        this.clientEncrypt = pre[22] & 255;
+
+        int replyEnc = 2;
+        if (this.mode == FakeTds.MODE_ACCEPT) { replyEnc = 1; }
+        if (this.mode == FakeTds.MODE_REQ) { replyEnc = 3; }
+        int _pre = await this.SendPreloginReply(sock, replyEnc);
+
+        if (this.mode == FakeTds.MODE_REQ) {
+            // Plaintext client refuses here; expect nothing but the close.
+            Socket.Close(sock);
+            return;
+        }
+        if (this.mode == FakeTds.MODE_DECLINE) {
+            // Secure client must refuse NOW; anything else is a downgrade.
+            List<int> t2 = new List<int>(); t2.Add(0);
+            string leak = await this.RecvPacketRaw(sock, t2);
+            if (leak != null) { this.loginLeaked = true; }
+            Socket.Close(sock);
+            return;
+        }
+
+        // MODE_ACCEPT: the TLS handshake arrives encapsulated in 0x12
+        // packets. Pump the state machine, shipping ciphertext both ways.
+        TlsStream ts = TlsStream.AcceptStepped(this.serverTls, sock);
+        if (ts == null) { Socket.Close(sock); return; }
+        bool done = false;
+        while (!done) {
+            int st = ts.HandshakePump();
+            string out1 = ts.HandshakeDrain();
+            int off = 0;
+            while (off < out1.Length) {
+                int chunk = out1.Length - off;
+                if (chunk > 16300) { chunk = 16300; }
+                int _s = await this.SendEncRaw(sock, out1.Substring(off, chunk));
+                off = off + chunk;
+            }
+            if (st == 1) {
+                // TLS 已压 1.2（客户端侧 DisableTls13）：完成的这一次
+                // 泵出的是本方 CCS+Finished，属于握手阶段，上面已按
+                // 0x12 封装发出，无需裸流尾包。
+                done = true;
+            } else if (st < 0) {
+                Socket.Close(sock);
+                return;
+            } else {
+                List<int> t3 = new List<int>(); t3.Add(0);
+                string enc = await this.RecvPacketRaw(sock, t3);
+                if (enc == null) { ts.Close(); Socket.Close(sock); return; }
+                ts.HandshakeFeed(enc);
+            }
+        }
+
+        // From here the tunnel carries the TDS packet layer verbatim.
+        TlsBuf2 r = new TlsBuf2(ts);
+        while (true) {
+            string hdr = await r.ReadExact(8);
+            if (hdr == null) { break; }
+            int type = hdr[0] & 255;
+            int payLen = (((hdr[2] & 255) << 8) | (hdr[3] & 255)) - 8;
+            string pay = "";
+            if (payLen > 0) {
+                pay = await r.ReadExact(payLen);
+                if (pay == null) { break; }
+            }
+            if (type == 16) {
+                // LOGIN7: user at header offset 40/42 (UCS-2LE).
+                this.loginSeen = true;
+                int userOff = (pay[40] & 255) | ((pay[41] & 255) << 8);
+                int userLen = (pay[42] & 255) | ((pay[43] & 255) << 8);
+                if (userLen > 0 && userOff + userLen * 2 <= pay.Length) {
+                    this.userBytes = pay.Substring(userOff, userLen * 2);
+                }
+                this.ScanForLeak();
+                int _l = await this.SendLoginAck(ts);
+            } else if (type == 1 || type == 3) {
+                this.batches = this.batches + 1;
+                int _b = await this.SendDone(ts, 3);
+            } else if (type == 18) {
+                int _p = await this.SendLoginAck(ts);
+            } else {
+                break;
+            }
+        }
+        ts.Close();
+        Socket.Close(sock);
+    }
+
+    async int SendPreloginReply(nint sock, int enc) {
+        TdsBytes body = TdsMessage.Prelogin(enc);
+        int payLen = body.Len();
+        byte[] frame = new byte[payLen + 9];
+        frame[0] = 18;
+        frame[1] = 1;
+        int len = payLen + 8;
+        frame[2] = (byte)(len >> 8);
+        frame[3] = (byte)(len & 255);
+        for (int i = 0; i < payLen; i = i + 1) { frame[8 + i] = (byte)body.At(i); }
+        body.Release();
+        return await Socket.SendAsync(sock, frame, payLen + 8);
+    }
+
+    /// One 0x12-framed ciphertext chunk back to the client.
+    async int SendEncRaw(nint sock, string data) {
+        int payLen = data.Length;
+        byte[] frame = new byte[payLen + 9];
+        frame[0] = 18;
+        frame[1] = 1;
+        int len = payLen + 8;
+        frame[2] = (byte)(len >> 8);
+        frame[3] = (byte)(len & 255);
+        for (int i = 0; i < payLen; i = i + 1) {
+            frame[8 + i] = (byte)(data[i] & 255);
+        }
+        return await Socket.SendAsync(sock, frame, payLen + 8);
+    }
+
+    async int SendLoginAck(TlsStream ts) {
+        TdsBytes ack = Tok.LoginAck();
+        TdsBytes env = Tok.EnvChangeDb();
+        TdsBytes done = Tok.Done(0);
+        int total = ack.Len() + env.Len() + done.Len();
+        byte[] body = new byte[total + 1];
+        for (int i = 0; i < ack.Len(); i = i + 1) { body[i] = (byte)ack.At(i); }
+        for (int i = 0; i < env.Len(); i = i + 1) { body[ack.Len() + i] = (byte)env.At(i); }
+        for (int i = 0; i < done.Len(); i = i + 1) { body[ack.Len() + env.Len() + i] = (byte)done.At(i); }
+        string payload = body.ToStr(0, total);
+        ack.Release();
+        env.Release();
+        done.Release();
+        int payLen = total;
+        byte[] frame = new byte[payLen + 9];
+        frame[0] = 4;                       // REPLY
+        frame[1] = 1;
+        int len = payLen + 8;
+        frame[2] = (byte)(len >> 8);
+        frame[3] = (byte)(len & 255);
+        for (int i = 0; i < payLen; i = i + 1) { frame[8 + i] = (byte)(payload[i] & 255); }
+        return await ts.SendAsync(frame.ToStr(0, payLen + 8), payLen + 8);
+    }
+
+    async int SendDone(TlsStream ts, int count) {
+        TdsBytes done = Tok.Done(count);
+        int payLen = done.Len();
+        byte[] frame = new byte[payLen + 9];
+        frame[0] = 4;
+        frame[1] = 1;
+        int len = payLen + 8;
+        frame[2] = (byte)(len >> 8);
+        frame[3] = (byte)(len & 255);
+        for (int i = 0; i < payLen; i = i + 1) { frame[8 + i] = (byte)done.At(i); }
+        done.Release();
+        return await ts.SendAsync(frame.ToStr(0, payLen + 8), payLen + 8);
+    }
+
+    /// The wire is clean only if the login's user bytes never show up in
+    /// anything read before the TLS upgrade.
+    void ScanForLeak() {
+        if (this.userBytes.Length == 0) { return; }
+        int first = this.userBytes[0] & 255;
+        int i = 0;
+        while (i + this.userBytes.Length <= this.clearLen) {
+            if ((this.clearLog[i] & 255) == first) {
+                bool hit = true;
+                for (int j = 0; j < this.userBytes.Length; j = j + 1) {
+                    if ((this.clearLog[i + j] & 255) != (this.userBytes[j] & 255)) {
+                        hit = false;
+                        break;
+                    }
+                }
+                if (hit) { this.loginLeaked = true; return; }
+            }
+            i = i + 1;
+        }
+    }
+}
+
+// ---------------------------------------------------------------- client ----
+
+class Program {
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            Program.failures = Program.failures + 1;
+        }
+    }
+
+    /// "sa" in UCS-2LE — what LOGIN7 carries for the login user.
+    static string UserSaBytes() {
+        byte[] b = new byte[5];
+        b[0] = 115; b[1] = 0;
+        b[2] = 97; b[3] = 0;
+        return b.ToStr(0, 4);
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        // 写出 PEM 文件到 _scratch/（git-ignored）：写当前目录会在仓库根
+        // 残留 .pem（用例中途失败时不清理）。
+        Directory.CreateDirectory("_scratch");
+        File.WriteAllText("_scratch/tds_tls_server_cert.pem", SERVER_CERT);
+        File.WriteAllText("_scratch/tds_tls_server_key.pem", SERVER_KEY);
+        TlsContext serverTls = TlsContext.CreateServer(
+            "_scratch/tds_tls_server_cert.pem", "_scratch/tds_tls_server_key.pem");
+        Check(serverTls != null, "server ctx created");
+        if (serverTls == null) {
+            Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+            return 0;
+        }
+
+        FakeTds acceptor = new FakeTds(9531, FakeTds.MODE_ACCEPT, serverTls);
+        FakeTds demanding = new FakeTds(9532, FakeTds.MODE_REQ, null);
+        FakeTds declining = new FakeTds(9533, FakeTds.MODE_DECLINE, null);
+        Task.Spawn(acceptor.Serve());
+        Task.Spawn(demanding.Serve());
+        Task.Spawn(declining.Serve());
+        await Task.Delay(80);
+
+        // 场景 1：正路径——ENCRYPT_ON 协商、0x12 封装握手、隧道里的
+        // LOGIN7 与批处理。
+        SqlServerConnection.SetTlsVerify(false);
+        SqlServerConnection db = await SqlServerConnection.OpenSecureAsync(
+            "127.0.0.1", 9531, "appdb", "sa", "secret");
+        Check(db.IsConnected(), "secure connect");
+        Check(db.ServerVersion() == "16.0.1000", "login ack survived the tunnel");
+        Check(db.Database() == "appdb", "envchange database survived the tunnel");
+        int affected = await db.ExecuteAsync("UPDATE t SET v = 1");
+        Check(affected == 3, "batch round trip over TLS");
+        Check(acceptor.clientEncrypt == 1, "client proposed ENCRYPT_ON");
+        Check(acceptor.loginSeen, "LOGIN7 arrived");
+        Check(acceptor.userBytes == Program.UserSaBytes(), "user bytes intact over TLS");
+        Check(acceptor.batches == 1, "batch served over TLS");
+        Check(!acceptor.loginLeaked, "no login bytes in the clear phase");
+        db.Close();
+
+        // 场景 2：默认校验开启 + 自签证书 → TLS 握手失败。
+        SqlServerConnection.SetTlsVerify(true);
+        SqlServerConnection strict = await SqlServerConnection.OpenSecureAsync(
+            "127.0.0.1", 9531, "appdb", "sa", "secret");
+        Check(!strict.IsConnected(), "self-signed rejected while verifying");
+        Check(strict.GetError().IndexOf("TLS") >= 0, "verify failure mentions TLS");
+        strict.Close();
+
+        // 场景 3：服务器拒绝加密（NOT_SUP）→ 安全打开显式失败。
+        SqlServerConnection.SetTlsVerify(false);
+        SqlServerConnection declined = await SqlServerConnection.OpenSecureAsync(
+            "127.0.0.1", 9533, "appdb", "sa", "secret");
+        Check(!declined.IsConnected(), "declining server refused");
+        Check(declined.GetError().IndexOf("refused") >= 0, "refusal mentions it");
+        Check(!declining.loginLeaked, "no plaintext login after decline");
+        declined.Close();
+
+        // 场景 4：明文打开对上 ENCRYPT_REQ 服务器 → 维持既有拒绝语义。
+        SqlServerConnection plain = await SqlServerConnection.OpenAsync(
+            "127.0.0.1", 9532, "appdb", "sa", "secret");
+        Check(!plain.IsConnected(), "plaintext open refuses an ENCRYPT_REQ server");
+        Check(plain.GetError().IndexOf("TLS") >= 0, "plaintext refusal mentions TLS");
+        plain.Close();
+
+        acceptor.Stop();
+        demanding.Stop();
+        declining.Stop();
+        serverTls.Free();
+        Socket.Cleanup();
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+        // 停服后留几个泵转：accept 协程以 -1 复位并退出，退出时的
+        // 泄漏探测才不会把服务端对象链记为仍可达。
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+
+    static string CA_CERT = "-----BEGIN CERTIFICATE-----\n"
+        + "MIIDDTCCAfWgAwIBAgIUb/bsPNHjOsVxStVQV+eCJLvKtSEwDQYJKoZIhvcNAQEL\n"
+        + "BQAwFjEUMBIGA1UEAwwLWmFuIFRlc3QgQ0EwHhcNMjYwODA2MTcxMTI0WhcNMzYw\n"
+        + "ODAzMTcxMTI0WjAWMRQwEgYDVQQDDAtaYW4gVGVzdCBDQTCCASIwDQYJKoZIhvcN\n"
+        + "AQEBBQADggEPADCCAQoCggEBAK0xBdnDn6QVIaiCyPqPM3TDnomvnz3XrwUG54Kj\n"
+        + "13vQfAbuxcg/0zkrr/yxOxJRcnkh4TPzm6i98ITem6kqw7ApO7XPXBOhe/Z5OdOp\n"
+        + "ouBnQMcxgo9CqOKSqfJ9YoYdOrTxve/SiO0AHjEKaDLph8GsPynGEHftr9uRZm9H\n"
+        + "qn08QjJDxtDiyn9xil+7ZMj1eNQuvKMDRTIgO4f37+JbIFRYoaZ8Zu2aRyf05Can\n"
+        + "SyC6/g912iOgr3NS1JQuAQAe5+lAZrLgi3EAW3S4mjFJCfJpBngzC+wIuzJTFxCA\n"
+        + "wsA+PmQtPE1g8c+L24cZxfPzT0BedYH1jbu+HSz2VbUTbVUCAwEAAaNTMFEwHQYD\n"
+        + "VR0OBBYEFJ4qKfHGlmX+d/aJQBMFLs6jiEWUMB8GA1UdIwQYMBaAFJ4qKfHGlmX+\n"
+        + "d/aJQBMFLs6jiEWUMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggEB\n"
+        + "AAwPQAF56rKoGJ1d5bdAP/IqpNoRwKcUL/tbNMDxaLCV29/RvXTK5pneOB2YnyHd\n"
+        + "RSUu+OBqc/KOl8f2WMmGWU+XpIHunBO9sikazAEy4TZQTob47nlI7s4x9Q3OETRm\n"
+        + "S1FGeF2lLwcjD5qXrWNLKxP5ZLz7dmlk2qii6pEym1huaQy4352UY5WheS9ofTl0\n"
+        + "JA4PFXhJqJLMFSrbz5IY00N3QPou99EWh9AFcaxksCOajtp7drG/VZEegDhhAGWa\n"
+        + "iJHZaakLuy1uXinh9EpHxOuJ43+TmW+JN7ktlPXML0PFl+DubwDtmnux6fOdRM89\n"
+        + "XyzocGB8jnk9l+9BX6qY1rU=\n"
+        + "-----END CERTIFICATE-----\n";
+
+    static string SERVER_CERT = "-----BEGIN CERTIFICATE-----\n"
+        + "MIIDGDCCAgCgAwIBAgIUaqrty6rrTvVQ2rRAeBvfwNJolBUwDQYJKoZIhvcNAQEL\n"
+        + "BQAwFjEUMBIGA1UEAwwLWmFuIFRlc3QgQ0EwHhcNMjYwODA2MTcxMTMyWhcNMzYw\n"
+        + "ODAzMTcxMTMyWjAYMRYwFAYDVQQDDA13cm9uZy5leGFtcGxlMIIBIjANBgkqhkiG\n"
+        + "9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqvgmHOa4fI0bR4y48uabV+hkIfiIMMQgMVGE\n"
+        + "6QdVXCQjGTbjavVhr655UkoPmA/g+8Lj+KKGCq3MpGSuIxRvWgp/Syl2O77l7Amd\n"
+        + "SdlidgLvlUg5h4hlnqIWLNxpiGF6TMIoyJ4ohWMqKuuIAPoeWF933yuSWsorG4fz\n"
+        + "FqUJi5zpfrVz9QGbz4cpOJXguuk6r8BzonL8mMqSglcyoiPearaYQWOSpohriCug\n"
+        + "p8PpGKskOKD8OBaKdvTc+e05Stsbgj+MCDkKSgLPi3IXDUPHS66MLVyOX4gNk7w+\n"
+        + "evhPCJJQtkr1wPHd9zFB9I98eZMwQzmEdqvDFeoYe6FUrFGqyQIDAQABo1wwWjAY\n"
+        + "BgNVHREEETAPgg13cm9uZy5leGFtcGxlMB0GA1UdDgQWBBSGH7lrfqpCUMF/8UYv\n"
+        + "LVX/XVGLFDAfBgNVHSMEGDAWgBSeKinxxpZl/nf2iUATBS7Oo4hFlDANBgkqhkiG\n"
+        + "9w0BAQsFAAOCAQEAN5byRoBRRJguzdZFJOOrwQxy47rNrnoKdL9QXV4s5XcRF5ZC\n"
+        + "K3pueEdmQMW4CgOJ38F03e3Fd8SF/d73pNimoeOUmjrDNC83GFPYsweiL4PNCqDU\n"
+        + "PKoixouw0gdl2eHUWg7qd+aTNVg2F2rFDcHzQu0/tQNSkHVmKC5ZIT4OjWt9IOjl\n"
+        + "bMT3/Bog5jXwKPMLdfMj8Z3J4432DE797PxY7UN9I+fXgTtj4AUQeR1BAi2jh7L8\n"
+        + "fIY9E5BPmY3+jNX0TEXiDYj6uKokXbx4N82ksSBAovOXPgiUYqRbmPlpyd7l5YE1\n"
+        + "XcaVSekej9G4zp6CQVO8o32S7vcVG3/giNJPRg==\n"
+        + "-----END CERTIFICATE-----\n";
+
+    static string SERVER_KEY = "-----BEGIN PRIVATE KEY-----\n"
+        + "MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCq+CYc5rh8jRtH\n"
+        + "jLjy5ptX6GQh+IgwxCAxUYTpB1VcJCMZNuNq9WGvrnlSSg+YD+D7wuP4ooYKrcyk\n"
+        + "ZK4jFG9aCn9LKXY7vuXsCZ1J2WJ2Au+VSDmHiGWeohYs3GmIYXpMwijIniiFYyoq\n"
+        + "64gA+h5YX3ffK5Jayisbh/MWpQmLnOl+tXP1AZvPhyk4leC66TqvwHOicvyYypKC\n"
+        + "VzKiI95qtphBY5KmiGuIK6Cnw+kYqyQ4oPw4Fop29Nz57TlK2xuCP4wIOQpKAs+L\n"
+        + "chcNQ8dLrowtXI5fiA2TvD56+E8IklC2SvXA8d33MUH0j3x5kzBDOYR2q8MV6hh7\n"
+        + "oVSsUarJAgMBAAECggEAKZ3dYygbTMApXYWI6KGPOzsHkshVWG+JOZATFwkws0zd\n"
+        + "mU/l1D2WUYYaJJiACr8EwCvcw8NF9xf+yh5yz/mzsDqBaVmWnOz3OTlO5vDKOZk1\n"
+        + "2gP6cv4V5GMmnDVr3+WAeGpDtK/hA7UTiN6L3NcFZ3QXsQSBa+Wt0BYL611xgSDj\n"
+        + "IkI7sBvBX6/wQNHyvJ+Y4fykOjjfrbL3PQ0PQ/Ap9fXNXyL6pT8qj35Xy0x3FqK1\n"
+        + "ign28D4VN8mbpd9rUtT6/UNDVZksDOBHsUoweIZo85nIX7r0vtvD7uSl3RElTGId\n"
+        + "QMdavaRMQdQ7hGlB/CB6k85pZs+jrUT7DV5dI0evzQKBgQDeEC9Y9dUVBmkPKIR5\n"
+        + "zRIkhn6D8d/gbsOwy22VuvkbvrzX8NtLWfh4teUu7uLeYCo2LuryPlcUKOjUWgt2\n"
+        + "9O2CfvyqJ40AQ1IdvYa/fWQoq/ZTURG8iRfhtuk+e1dshEvmidE0VkWoao1cfEHX\n"
+        + "V8Yjefm3xAPoXMS4nf6mPZq4vQKBgQDFGQJq2/FbJlDZP0nHluDGa5roWKMotDuT\n"
+        + "BZeV6hW0MOdoYkZueaNv6YiNBDq8j27/gnKUgmYry38K1+kGg1JA+hP+i2Rfhp5k\n"
+        + "MrTzAXBU02eNYsvTNWshvPgGdUu5NtoQiOQLjDP95R4fsAPy9rbde1v/4q5MMBEQ\n"
+        + "uwCmmVr4/QKBgDgOneU3KbNFCwBomgilXA8cZJOqW3msfHoE4IULzhbS75kTlEhR\n"
+        + "Tggq4tAWPe8lF4LWFTlRw2mzahMxJ/O/oLVwmRfbJB0M4Y3gakOsw7wArQ4bSP7v\n"
+        + "HLg+FGNRf6BFRWPNJqKvpKX/P/A47eYOolYSVJevQ81EneR8/eu5YXWBAoGAdsKg\n"
+        + "C0Vlw7dtpcmVqjbGT6jM2U13WnJnJyqKcSFwXHfPJ713lN+kVC2SQu4WekGu7zRp\n"
+        + "2AROjfr7HMyGM49zQ4WsAId7Pnf9/n/zOi1WwzXywmWSTTx1xgl4JWQN8ZcUhDwH\n"
+        + "tNGRDl487XkAmCiCfSf0glXTEkMwNTWIqdnjz/0CgYBlyCdFzOlAC3i5cp3EWYe6\n"
+        + "VFFUCu2Tfikd4ZKu2uouZ+k4DHVwndYpzngS7OUbR1ex2wKI3Ejp3Hs49GNLp5cT\n"
+        + "Q6OqvBbq2uSBiQt5RRxXVmZObNJkKv+WcUy/fIb979ctVZy41wbsQ/HiErj4Np23\n"
+        + "xBYhnJesc1G+4gj4EjhgLQ==\n"
+        + "-----END PRIVATE KEY-----\n";
+
+}
