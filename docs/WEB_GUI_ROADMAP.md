@@ -18,7 +18,7 @@
 | P3 | float：left/right 贴边、行盒绕排、clear、BFC 收编 | ✅ 2026-09-12 | b432d5c0 引擎 + 9ddcffa5 规则 2 + 本条（断言/文档）；oracle float 17 盒：11 精确、6 处 ≤2px（行高取整台账） |
 | P4 | grid：track sizing（auto/fr/minmax/px/%）、span、隐式轨道、gap、网格线放置 | ✅ 2026-09-12 | 1b1c5375 引擎 + db19356e 修复/断言/文档；oracle grid 19 盒全部 0px |
 | P5 | HTML 声明层：Html.zan parser、tag→控件映射、data-on-* 事件、data-bind、style/link 接线、GenHtml 编译期生成器、App.LoadHtml()、oracle 闭环 | ✅ 2026-09-12 | 09d73369 运行时 + dc3b55f9 生成器；oracle html 13 盒（tol 3）；编译期建树与运行时解析 13 盒 diff 全等；主文档 docs/HTML_UI.md |
-| P6 | overflow 滚动：auto/scroll 真语义（clip+偏移+滚动条） | ✅ 2026-09-12 | oracle scroll 16 盒全部 0px（auto/hidden/scroll 三态、程序滚动、钳制、嵌套组合）；UiDriver 实机滚轮验证（注入滚轮→子树精确平移） |
+| P6 | overflow 滚动：auto/scroll 真语义（clip+偏移+滚动条） | ✅ 2026-09-12；横滚 2026-09-15 补齐 | oracle scroll 26 盒全部 0px（auto/hidden/scroll 三态、程序滚动、钳制、嵌套组合、overflow-x 横滚）；UiDriver 实机滚轮验证（注入滚轮→子树精确平移） |
 | P7 | 设计器 + HUD：存取格式 = .html、Inspector CSS 编辑、拖拽翻译 CSS、游戏窗口层嵌入帧循环、IDE 自用窗体重写 | ✅ 2026-09-12 | P7a ✅：DesignerHtml 编解码器全键往返、GenForm .html 设计稿投影（与 .zform 同一生成）、生成器缓存键全 stdlib 哈希（genrun.c）、Designer.SaveHtml/LoadHtmlText 桥、IDE .html 设计稿九处接线；P7b ✅：字段内联 style 通道（SetProp("style")→ApplyInline，FormField.styleText，Inspector STYLE 声明行编辑，DesignerHtml style 属性互通，GenForm/FormBuilder 同落点；布局键让位设计几何记台账）；P7d ✅（模板+IDE 43 份 .zform 全转 .html，模型级等价校验，引用全翻转，.zform 编译通道保留给旧项目）；P7c ✅：游戏 HUD 帧内接入实测（游戏=Gui 同引擎不建宿主；clean/dirty avg 3ms、max 23ms，预算 16.6ms；空闲 120 拍仅 3 帧；像素级门控证据；台账：流式子元素 % 宽未生效顺延 P8）；LSP 补 .html 设计稿索引通道（2227fab0） |
 | P8 | 组件精简：% 尺寸修复、属性面生成化、复合控件声明化重组、legacy API 删除 | ✅ 2026-09-13 | % 尺寸修复 ✅（下详）；legacy 删除 ✅：P8-4 .zform 编译通道删除（C 侧 `zan_is_design_path` 删臂 + main.c 定向拒绝诊断，GenForm 只认 .html，4 份测试 .zform 经 `DesignerHtml.FromJsonDoc` 保真转 .html 入库；IDE 内部 .zform 功能臂清扫留独立提交）；动态原语 ✅ 2026-09-13：`data-if` → `Control.bindIf`（Truthy 真值插拔）+ `<template data-for>` 行克隆展开（原型 UA display:none，ChildWindow 每帧核对数组长度整组重建，行内 bind/bindIf 以本项 JsonValue 为第一作用域、回落根模型，Element 缺省绑定属性 text），运行时 Parse / GenHtml / GenForm+FormBuilder / DesignerHtml 四路同语义（四 conformance：gui_html_dynamic、zform_dynamic、html_runtime、designer_html 扩展；主文档 docs/HTML_UI.md「动态原语」节；边界：嵌套模板不支持、Element 父内模板宜为末子项、ApplyInline 内联声明克隆不带走）；事件带参 ✅ 2026-09-13：`data-arg` 属性 → `Control.handlerArg`，HtmlHandlers/HandlerRegistry 双注册表带参槽，Html.WireArg 落名+实参闭包快照（Wire 契约补齐：名字无注册表也落控件，ChildWindow 宿主可二次解析），ChildWindow.HandleArg/WireNode 带参优先回落无参，GenHtml 发射 handlerArg+WireArg，模板克隆行共享原型实参；GenForm/设计器 v1 不建模（设计稿事件模型纯名字）；gui_html_dynamic/gui_html_runtime 扩展金标不变）；属性面生成化 ✅：P8-2a 局部 Binding<T> 声明初始化降级 + P8-2b class 收敛基类契约 + P8-2c size 枚举收敛 + P8-2d GetExtra/SetExtra 四刀收口（死写面修复 5 键、不可达死臂删除 57 臂 13 文件、ColorPicker/InputNumber 不等价臂三件套转换、ChoiceGroup/RadioGroup options 死臂删除与 slider marks 测试管线化；DataGrid 等余下键全部判决合法 extra-only，29 文件 90 键臂普查闭环）；IDE 内部 .zform 功能臂清扫 ✅ 687faf39（约135处→14处，余为 legacy 导入面；bind 全绿验证）；复合控件声明化重组 ✅（决策：不做——设计器编辑属性面而非复合内部结构，判据见台账）；顺带：`x is T ?` 三元歧义修复（22d75d0e 缺陷①闭账）、void 调用结果当值由静默坏 IR 改定向诊断（280e08d6）、lambda_87 类 closure 签名 verifier 失败挂账（在途树触发、新旧编译器同错，待专项） |
 
@@ -273,8 +273,17 @@ golden/audit/Inert 名单同步 → 提交 `gui-web(Pn): 主题`。
 - **滚动条覆盖式（P6）**：滚动条画在内容上、不占布局宽——Chrome
   经典滚动条占 17px 布局宽（内容收窄、出现/消失引起 reflow 抖动），
   这里不模拟；oracle 侧用 `--hide-scrollbars` 对齐（headless 无占位
-  滚动条）。水平轴只裁剪不滚动（overflow-x 的 auto/scroll 当 hidden
-  用，台账）。
+  滚动条）。
+- **overflow-x 真滚动（2026-09-15 补齐，原台账"水平轴只裁剪不滚动"）**：
+  水平轴与纵向同语义——UpdateScroll 双轴换算右缘/钳制/ShiftTree
+  双向平移；程序性 SetScrollLeft/ScrollLeft/ScrollExtentX（DOM
+  scrollLeft/scrollWidth）；横向滚动条 BarX 贴容器 padding box 底边
+  （拖拽/轨道点击同纵向；先纵后横绘制，右下角由横向轨道收口——
+  Chrome 此处是独立方角，台账）；shift+滚轮横滚（横向滚不动回落
+  纵向），Win32 WM_MOUSEHWHEEL(0x20E) 也映射为 kind13+Shift 位
+  （触控板横扫与真横滚轮同路）。oracle scroll.json 扩到 26 盒全
+  0px 偏差（横滚 flex 行 auto/hidden/scroll 三态）。右下角方角、
+  scrollbar-gutter/scroll-snap 等仍不支持（下方台账）。
 - **滚轮仲裁沿用 CaptureWheel（P6，2026-09-14 升两段式）**：第一段
   渲染期认领、所有权 = 上一帧末认领者——嵌套滚动时最内层最后认领
   而赢，指针不在滚动区时落回页面滚动；第二段消费回放——本帧有

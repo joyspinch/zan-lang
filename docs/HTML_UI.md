@@ -289,10 +289,12 @@ font-size/transition）完全生效，不受几何影响。这是对浏览器 "i
 - **事件模型是宿主委托**：没有 DOM 冒泡/捕获/.preventDefault——
   data-on-* 直连控件事件槽，一个名字一个 Action。data-arg 是宿主侧
   的静态实参快照，不是 DOM data-* 属性（浏览器打开无事件语义）。
-- **滚动条是覆盖式**：`overflow-y: auto/scroll` 出的滚动条画在内容
-  上、不占布局宽（Chrome 经典条占 17px、出现/消失引起 reflow；
-  oracle 用 --hide-scrollbars 对齐）。水平轴只裁剪不滚动；
-  overflow:hidden 可程序滚动（SetScrollTop）但无滚轮/滚动条交互。
+- **滚动条是覆盖式**：`overflow-y / overflow-x` 的 auto/scroll 出的
+  滚动条画在内容上、不占布局宽（Chrome 经典条占 17px、出现/消失
+  引起 reflow；oracle 用 --hide-scrollbars 对齐）。水平轴与纵向同
+  语义：程序性 SetScrollLeft/ScrollLeft/ScrollExtentX（scrollWidth）、
+  shift+滚轮横滚、横向滚动条（贴容器底边）；overflow:hidden 可程序
+  滚动（SetScrollTop/SetScrollLeft）但无滚轮/滚动条交互。
   详见 roadmap P6 节。
 - **动态原语是宿主语义不是浏览器语义**：data-if/data-for 只在挂
   JsonValue 模型的宿主里生效（见「动态原语」），浏览器打开同一份
