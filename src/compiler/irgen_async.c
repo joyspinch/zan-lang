@@ -1164,6 +1164,55 @@ static int async_count_transfers(zan_ast_node_t *st) {
 
 /* Walk statements to collect named scalar locals (which must live in the frame)
  * and count await points anywhere in the body. */
+/* A43-B22①: the foreach iteration protocol (GetEnumerator/MoveNext/Current).
+ * These predicates are shared by the async frame scan and the AST_FOREACH_STMT
+ * emitter so both passes agree on which loops carry a $fe.e enumerator slot.
+ * `Current` may be a 0-arg method or a property with a custom getter; the
+ * enumerator must be a concrete class (an interface enumerator would need
+ * per-call tag dispatch, which the loop cannot re-derive cheaply yet). */
+static zan_type_t *foreach_proto_enum_type(zan_irgen_t *g, zan_type_t *ct) {
+    if (!ct || ct->kind != TYPE_CLASS || !ct->sym) return NULL;
+    zan_istr_t gi = { (char *)"GetEnumerator", 13 };
+    zan_symbol_t *gm = resolve_overload(ct->sym, gi, 0);
+    zan_type_t *et = NULL;
+    if (gm && gm->decl && gm->decl->kind == AST_METHOD_DECL &&
+        gm->decl->method_decl.return_type)
+        et = resolve_type_ctx(g, gm->decl->method_decl.return_type);
+    if (!et || et->kind != TYPE_CLASS || !et->sym) return NULL;
+    zan_istr_t ni = { (char *)"MoveNext", 8 };
+    zan_istr_t ci = { (char *)"Current", 7 };
+    if (!resolve_overload(et->sym, ni, 0)) return NULL;
+    if (resolve_overload(et->sym, ci, 0)) return et;
+    for (int i = 0; i < et->sym->member_count; i++) {
+        zan_symbol_t *m = et->sym->members[i];
+        if (m && m->kind == SYM_PROPERTY && member_name_is(m, ci) &&
+            property_getter_sym(g, m))
+            return et;
+    }
+    return NULL;
+}
+
+static zan_type_t *foreach_proto_current_type(zan_irgen_t *g, zan_type_t *ct) {
+    zan_type_t *et = foreach_proto_enum_type(g, ct);
+    if (!et) return NULL;
+    zan_istr_t ci = { (char *)"Current", 7 };
+    zan_symbol_t *cm = resolve_overload(et->sym, ci, 0);
+    if (cm && cm->decl && cm->decl->kind == AST_METHOD_DECL &&
+        cm->decl->method_decl.return_type)
+        return resolve_type_ctx(g, cm->decl->method_decl.return_type);
+    for (int i = 0; i < et->sym->member_count; i++) {
+        zan_symbol_t *m = et->sym->members[i];
+        if (m && m->kind == SYM_PROPERTY && member_name_is(m, ci)) {
+            zan_symbol_t *getter = property_getter_sym(g, m);
+            if (getter && getter->decl && getter->decl->kind == AST_METHOD_DECL &&
+                getter->decl->method_decl.return_type)
+                return resolve_type_ctx(g,
+                    getter->decl->method_decl.return_type);
+        }
+    }
+    return NULL;
+}
+
 static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
     if (!st) return;
     switch (st->kind) {
@@ -1226,6 +1275,9 @@ static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
             ? resolve_type_ctx(s->g, st->foreach_stmt.var_type)
             : NULL;
         if (!et || et->kind == TYPE_ERROR)
+            et = foreach_proto_current_type(s->g,
+                infer_expr_type(s->g, st->foreach_stmt.collection, s->scope));
+        if (!et || et->kind == TYPE_ERROR)
             et = container_elem_type(
                 infer_expr_type(s->g, st->foreach_stmt.collection, s->scope));
         if (et && et->kind != TYPE_ERROR) {
@@ -1239,6 +1291,14 @@ static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
             LLVMInt64TypeInContext(s->g->ctx));
         async_scan_add_storage_local(s, async_synth_name(s->g, "fe.c", fe_id),
             LLVMPointerType(LLVMInt8TypeInContext(s->g->ctx), 0));
+        if (foreach_proto_enum_type(s->g,
+                infer_expr_type(s->g, st->foreach_stmt.collection, s->scope)))
+            /* protocol enumerator: lives for the whole loop, survives a
+             * suspension like the collection itself (loaded as an i8* and
+             * bitcast back by the emitter) */
+            async_scan_add_storage_local(s,
+                async_synth_name(s->g, "fe.e", fe_id),
+                LLVMPointerType(LLVMInt8TypeInContext(s->g->ctx), 0));
         async_scan_stmt(s, st->foreach_stmt.body);
         break;
     }

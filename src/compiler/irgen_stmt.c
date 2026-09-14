@@ -437,6 +437,29 @@ static int emit_boxed_var_decl(zan_irgen_t *g, zan_ast_node_t *stmt,
     return 1;
 }
 
+/* A43-B22①: emit a 0-arg method call on a receiver value already in hand --
+ * the foreach iteration protocol calls GetEnumerator/MoveNext/Current on
+ * objects the loop itself materialized, so there is no AST call node to run
+ * through the normal member-access path. Static methods drop the receiver. */
+static LLVMValueRef emit_foreach_call0(zan_irgen_t *g, zan_type_t *recv_ty,
+                                       zan_symbol_t *m, LLVMValueRef recv) {
+    if (!m) return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
+    bool is_static = (m->modifiers & MOD_STATIC) != 0;
+    for (int fi = irgen_find_function(g, m); fi >= 0; fi = -1) {
+        if (g->functions[fi].sym != m) continue;
+        LLVMTypeRef mft = g->functions[fi].fn_type;
+        LLVMValueRef mfn = route_generic_method(g, recv_ty, m,
+            g->functions[fi].fn, mft, &mft);
+        LLVMValueRef args[1];
+        unsigned na = 0;
+        if (!is_static) args[na++] = recv;
+        LLVMValueRef r = emit_dispatch_call(g, is_static ? NULL : recv_ty->sym,
+                                            m, mfn, mft, args, (int)na, "fe.m");
+        return coerce_generic_result(g, r, m, recv_ty);
+    }
+    return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
+}
+
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals) {
     if (!stmt) return;
 
@@ -2555,13 +2578,43 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         /* evaluate collection */
         LLVMValueRef collection = emit_expr(g, stmt->foreach_stmt.collection, locals);
 
+        /* A43-B22①: user iteration protocol. A collection whose type declares
+         * GetEnumerator() iterating an enumerator with MoveNext()/Current is
+         * driven through that protocol instead of being mis-read as a List
+         * (the legacy fallback below). The predicate lives in irgen_async.c
+         * next to the frame scan so both passes agree on which loops carry a
+         * $fe.e enumerator slot. */
+        zan_type_t *col_type0 = infer_expr_type(g, stmt->foreach_stmt.collection,
+                                                locals);
+        zan_type_t *fe_enum_ty = foreach_proto_enum_type(g, col_type0);
+        zan_type_t *fe_cur_ty = foreach_proto_current_type(g, col_type0);
+        zan_symbol_t *fe_get_m = NULL;
+        zan_symbol_t *fe_next_m = NULL, *fe_cur_m = NULL, *fe_cur_getter = NULL;
+        if (fe_enum_ty) {
+            zan_istr_t gi = { (char *)"GetEnumerator", 13 };
+            zan_istr_t ni = { (char *)"MoveNext", 8 };
+            zan_istr_t ci = { (char *)"Current", 7 };
+            fe_get_m = resolve_overload(col_type0->sym, gi, 0);
+            fe_next_m = resolve_overload(fe_enum_ty->sym, ni, 0);
+            fe_cur_m = resolve_overload(fe_enum_ty->sym, ci, 0);
+            if (!fe_cur_m) {
+                for (int i = 0; i < fe_enum_ty->sym->member_count &&
+                                 !fe_cur_getter; i++) {
+                    zan_symbol_t *m = fe_enum_ty->sym->members[i];
+                    if (m && m->kind == SYM_PROPERTY && member_name_is(m, ci))
+                        fe_cur_getter = property_getter_sym(g, m);
+                }
+            }
+        }
+
         /* element type: declared loop-var type, else inferred from collection */
         zan_type_t *elem_type = NULL;
         if (stmt->foreach_stmt.var_type)
             elem_type = resolve_type_ctx(g, stmt->foreach_stmt.var_type);
+        if ((!elem_type || elem_type->kind == TYPE_ERROR) && fe_cur_ty)
+            elem_type = fe_cur_ty;
         if (!elem_type || elem_type->kind == TYPE_ERROR)
-            elem_type = container_elem_type(
-                infer_expr_type(g, stmt->foreach_stmt.collection, locals));
+            elem_type = container_elem_type(col_type0);
         if (!elem_type) elem_type = g->binder->type_int;
         LLVMTypeRef elem_llvm = map_type(g, elem_type);
 
@@ -2571,7 +2624,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
          * read every one of them as a List, so iterating an array or a string
          * loaded a count and a data pointer out of unrelated memory and the
          * program died on the first element. */
-        zan_type_t *col_type = infer_expr_type(g, stmt->foreach_stmt.collection, locals);
+        zan_type_t *col_type = col_type0;
         bool fe_array = col_type && col_type->kind == TYPE_ARRAY;
         bool fe_string = col_type && col_type->kind == TYPE_STRING;
         LLVMValueRef fe_len = NULL;
@@ -2591,8 +2644,23 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
          * iteration, which is also what keeps the loop correct across a
          * reallocation of the list. */
         LLVMValueRef col_slot = NULL, idx_alloc = NULL, iter_alloc = NULL;
+        LLVMValueRef enum_slot = NULL, enum_alloc = NULL;
         if (g->current_async_frame) {
             int fe_id = g->current_async_foreach_next++;
+            /* the protocol enumerator lives for the whole loop, so in an
+             * async body it must survive suspension in the frame: a resume
+             * re-enters the cond block where MoveNext is called on it */
+            if (fe_enum_ty) {
+                char nm[32];
+                snprintf(nm, sizeof(nm), "$fe.e%d", fe_id);
+                zan_istr_t en = { nm, (uint32_t)strlen(nm) };
+                local_var_t *ev2 = local_find(locals, en);
+                if (ev2) enum_slot = ev2->alloca;
+                if (!enum_slot)
+                    zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
+                                  "foreach protocol enumerator missing an "
+                                  "async frame slot");
+            }
             char nm[32];
             snprintf(nm, sizeof(nm), "$fe.c%d", fe_id);
             zan_istr_t cn = { nm, (uint32_t)strlen(nm) };
@@ -2615,6 +2683,18 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 LLVMBuildBitCast(g->builder, collection,
                     LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0), "fe.colp"),
                 col_slot);
+
+        /* protocol: materialize the enumerator once, before the loop. The
+         * loop owns it (one release at the end block); the slot holds it in
+         * an async body so a resumed MoveNext/Current call sees the live
+         * enumerator, not a stale stack value. */
+        LLVMTypeRef fe_enum_ll = fe_enum_ty ? map_type(g, fe_enum_ty) : NULL;
+        if (fe_enum_ty) {
+            if (!enum_slot) enum_alloc = emit_entry_alloca(g, fe_enum_ll, "fe.enum");
+            LLVMValueRef ev0 = emit_foreach_call0(g, col_type0, fe_get_m,
+                                                  collection);
+            zan_store_fit(g, ev0, enum_slot ? enum_slot : enum_alloc);
+        }
 
         /* index variable */
         if (!idx_alloc) idx_alloc = emit_entry_alloca(g, i64, "fi");
@@ -2648,6 +2728,75 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
         LLVMBuildBr(g->builder, cond_bb);
         LLVMPositionBuilderAtEnd(g->builder, cond_bb);
+
+        /* protocol path: the condition is enumerator.MoveNext() and the body
+         * reads enumerator.Current. The enumerator is reloaded from its slot
+         * in both blocks -- an async resume re-enters either one directly,
+         * and a plain (sync) loop re-enters cond from step. */
+        if (fe_enum_ty) {
+            LLVMValueRef fev = enum_slot
+                ? LLVMBuildBitCast(g->builder,
+                      LLVMBuildLoad2(g->builder,
+                          LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0),
+                          enum_slot, "fe.ens"),
+                      fe_enum_ll, "fe.env")
+                : LLVMBuildLoad2(g->builder, fe_enum_ll, enum_alloc, "fe.env");
+            LLVMValueRef mr = emit_foreach_call0(g, fe_enum_ty, fe_next_m, fev);
+            LLVMTypeRef mrt = LLVMTypeOf(mr);
+            LLVMValueRef more =
+                (LLVMGetTypeKind(mrt) == LLVMIntegerTypeKind &&
+                 LLVMGetIntTypeWidth(mrt) == 1)
+                    ? mr
+                    : zan_icmp(g->builder, LLVMIntNE, mr,
+                               LLVMConstNull(mrt), "fe.more");
+            LLVMBuildCondBr(g->builder, more, body_bb, end_bb);
+
+            LLVMPositionBuilderAtEnd(g->builder, body_bb);
+            fev = enum_slot
+                ? LLVMBuildBitCast(g->builder,
+                      LLVMBuildLoad2(g->builder,
+                          LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0),
+                          enum_slot, "fe.bes"),
+                      fe_enum_ll, "fe.bev")
+                : LLVMBuildLoad2(g->builder, fe_enum_ll, enum_alloc, "fe.bev");
+            LLVMValueRef cur;
+            if (fe_cur_m)
+                cur = emit_foreach_call0(g, fe_enum_ty, fe_cur_m, fev);
+            else
+                cur = emit_property_getter_call(g, fe_cur_getter, fe_enum_ty,
+                                                fev, NULL, locals);
+            zan_store_fit(g, cur, iter_alloc);
+
+            emit_stmt(g, stmt->foreach_stmt.body, locals);
+            emit_release_owned_locals_from(g, locals, fe_start);
+            if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+                LLVMBuildBr(g->builder, step_bb);
+
+            LLVMPositionBuilderAtEnd(g->builder, step_bb);
+            LLVMBuildBr(g->builder, cond_bb);
+
+            g->break_target = fe_saved_break;
+            g->continue_target = fe_saved_cont;
+            g->loop_locals_base = fe_saved_loop_base;
+            g->loop_catch_base = fe_saved_loop_cbase;
+            g->finally_loop_base = fe_saved_loop_fbase;
+            g->eh_armed_loop_base = fe_saved_loop_ehbase;
+            LLVMPositionBuilderAtEnd(g->builder, end_bb);
+            /* the loop owns the enumerator: one release on exit, then the
+             * collection temp, exactly like the index-based paths */
+            LLVMValueRef fe_end = enum_slot
+                ? LLVMBuildBitCast(g->builder,
+                      LLVMBuildLoad2(g->builder,
+                          LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0),
+                          enum_slot, "fe.ees"),
+                      fe_enum_ll, "fe.eev")
+                : LLVMBuildLoad2(g->builder, fe_enum_ll, enum_alloc, "fe.eev");
+            emit_arc_release_typed(g, fe_enum_ty, fe_end);
+            emit_release_owned_call_temp(g, stmt->foreach_stmt.collection,
+                                         collection, locals);
+            break;
+        }
+
         /* count: field 0 of the List struct, re-read each iteration */
         LLVMValueRef col_cond = col_slot
             ? LLVMBuildBitCast(g->builder,
