@@ -3123,3 +3123,38 @@ P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
   piecewise EDGE-CLIP 属 bbox 触边已知宽松类，sunburst/treemap 全家
   同款；matrix BLANK 系 matrix 车道挂账未动）。绝对旗标数受并行会话
   在途改动影响在 166~186 间漂移（差异全在其轴/触边噪声类，与热力无关）。
+* **台账⑥-2 闭账：ECharts6 matrix 坐标系车道——维度树头带 + 叶子体格
+  + heatmap 落格（2026-09-15，批次⑥续）**：matrix-correlation-heatmap
+  /matrix-simple 两个 BLANK 清除（matrix-graph/pie 骨架出图第三次清扫），
+  covariance/mbti 同族直通。官方语义（`_scratch/echoracle` Matrix.js/
+  MatrixDim.js/MatrixModel.js 源对抄）：x/y 各是维度树，叶子=布局单位，
+  格携带 level/firstLeafLocator/span；盒布局四边缺省 '10%'（px/"N%"），
+  沿 x 先铺 y 树层级头带（左竖带）再铺 x 叶列、沿 y 对称，未声明
+  levelSize/size 的单位**等分剩余空间（头带与体格同厚）**，末单元贴齐
+  盒缘；叶格 rect 跨带 levels-level 恰到体区边界，组格只占本层带；
+  角区（两树头带交叠）无边框，cell 边 1px borderTint，背景描边
+  axisLine，头带标签 #54555a。series [x名,y名,值] 三元组按名字查格
+  （任意层级，组名=合并格，首见为准），格下标复用 heatX/heatY 承载、
+  值进 number，渲染端按格叶子域解矩形；visualMap 取色与直角车道共用
+  同一原语（MatColorAt：连续线性/piecewise 桶中点量化）。落地：
+  ChartMatrixSpec（树前序展平平行数组+盒 ChartBoxParam+查找表，解析后
+  不可变，Clone/DrawOption 只读共享）、ChartViewMatrix.zan（MatGeom
+  布局+骨架线段+填色+头带标签+悬停，快照缓存槽 270+iwid%20，指纹含
+  树形/文本/盒声明，bench 稳态帧 4-7ms）、DispatchKind 组件级判定
+  （calendar 之后、polar 之前）、DrawOption 过河补 `o.matrix = s.matrix`。
+  **教训（本车道首版翻车的真根因）**：①**组件级 dispatch 通道必须随
+  DrawOption 过河**——渲染分派读的是 DrawOption 产物而非 source，逐字
+  段过河漏掉组件 = 组件级判定永不命中，系列级残留（heatX 已解析）会
+  被别的车道捡走画出"错而不空"的图（matrix 首版被直角热力图车道抢走
+  填色、头带全丢；calendar 现在的条纹态正是同一机制的历史苦主，
+  ChartViewCalendar 归并行会话在飞，未动）；②命中最快的定位法是量
+  PNG 剖面反推几何——填色起点/带宽对不上盒布局预期，一眼锁定"谁画的
+  就是另一条车道"。后续增量挂账：body/corner 键内嵌 series（matrix-
+  graph/pie/mini-bar-geo/sparkline/grid-layout 的格内 line/bar/custom）、
+  title/grid 的 coord 锚定到格（matrix-stock 86KB 复合大默认）、
+  `matrix.x.length`/null 项自动名、scatter 叠加（mbti 的 decal 底纹）。
+  验证：parsecheck 335/335；correlation/simple/covariance/mbti 观感
+  对拍官方（头带/角区/合并格/色带全对）；matrix 族 0 新增旗标；bench
+  covariance/correlation 稳态 4-7ms（快照命中实锤）；总旗标 164→181
+  漂移为并行会话 ChartViewCalendar.zan 在飞改动所致（mtime 实证，类
+  全在其噪声类），非本车道。

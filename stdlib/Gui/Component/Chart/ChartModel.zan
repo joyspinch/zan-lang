@@ -3273,6 +3273,7 @@ class ChartOption {
     List<ChartSeries> declOrder;
     List<ChartGeo> geos;   // ECharts geo 组件（底图地图，可多个）
     List<ChartCalendarSpec> calendars; // ECharts calendar[]（日历坐标系）
+    ChartMatrixSpec matrix; // ECharts6 matrix 组件（矩阵坐标系：x/y 维度树）
     List<ChartParAxis> parAxes; // ECharts parallelAxis[]（平行坐标维）
     List<PolarAxisSpec> angleAxes;  // ECharts angleAxis（对象或数组，polarIndex 绑定）
     List<PolarAxisSpec> radiusAxes; // ECharts radiusAxis
@@ -3566,6 +3567,7 @@ class ChartOption {
         for (int cai = 0; cai < src.calendars.Count; cai = cai + 1) {
             o.calendars.Add(src.calendars[cai]);
         }
+        o.matrix = src.matrix; // 解析后不可变（树展平只读），克隆共享
         o.parAxes = new List<ChartParAxis>();
         for (int pai = 0; pai < src.parAxes.Count; pai = pai + 1) {
             o.parAxes.Add(ChartParAxis.Clone(src.parAxes[pai]));
@@ -6587,6 +6589,12 @@ class ChartOption {
         // 由合成块挂载。
         ChartOption.ParseGeo(v.Get("geo"), o);
         ChartOption.ParseCalendar(v.Get("calendar"), o);
+        // ECharts6 matrix 组件（matrix-correlation-heatmap 族）：盒布局
+        // + x/y 维度树，解析后不可变。
+        JsonValue mxv = v.Get("matrix");
+        if (mxv != null && mxv.IsObject()) {
+            o.matrix = ChartMatrixSpec.ParseOne(mxv);
+        }
         ChartOption.ParseParAxes(v.Get("parallelAxis"), o);
         // ECharts 极坐标轴（angleAxis/radiusAxis）：对象或数组形态，
         // polarIndex 绑定到 polar[]（coordinateSystem:"polar" 系列）。
@@ -7226,6 +7234,29 @@ class ChartOption {
                                 cs.data.Add(hd);
                                 continue;
                             }
+                            // ECharts6 matrix 坐标系三元组 [x名, y名, 值]：
+                            // 首两位是维度树格名（可落在任意层级，组名 =
+                            // 合并格），按规格查找表解成格下标进 heatX/
+                            // heatY（渲染端按格的叶子域解矩形），值进
+                            // number。矩阵组件缺席时无从解名，不拦。
+                            if (cs.coordSys == "matrix" && o.matrix != null
+                                && it.Count() >= 2) {
+                                int mxi = o.matrix.FindCell(true,
+                                    it.At(0).AsString(""));
+                                int myi = o.matrix.FindCell(false,
+                                    it.At(1).AsString(""));
+                                if (mxi >= 0 && myi >= 0) {
+                                    ChartData md = ChartData.Numeric(
+                                        it.Count() >= 3
+                                            ? it.At(2).AsDouble(0.0) : 0.0);
+                                    md.heatX = mxi;
+                                    md.heatY = myi;
+                                    if (it.Count() >= 3
+                                        && it.At(2).IsString()) { md.gap = true; }
+                                    cs.data.Add(md);
+                                }
+                                continue;
+                            }
                             // 极坐标值对 [[radius, angle(, value)],...]：
                             // ECharts 数据序 [r, θ]；x=radius y=angle
                             // z=value 千倍定点进 points（类目轴的坐标是
@@ -7305,6 +7336,33 @@ class ChartOption {
                                         : rpy * 1000.0 - 0.5)));
                             }
                         } else if (it.IsObject()) {
+                            // matrix 坐标系对象项 {value:[x名,y名,值],
+                            // itemStyle}（mbti 语料）：与裸数组三元组同
+                            // 语义，value 数组解名后短路（itemStyle 的
+                            // decal 纹理是官方花括底纹，暂不消费）。
+                            if (cs.coordSys == "matrix" && o.matrix != null) {
+                                JsonValue mvv = it.Get("value");
+                                if (mvv != null && mvv.IsArray()
+                                    && mvv.Count() >= 2) {
+                                    int mox = o.matrix.FindCell(true,
+                                        mvv.At(0).AsString(""));
+                                    int moy = o.matrix.FindCell(false,
+                                        mvv.At(1).AsString(""));
+                                    if (mox >= 0 && moy >= 0) {
+                                        ChartData mod = ChartData.Numeric(
+                                            mvv.Count() >= 3
+                                                ? mvv.At(2).AsDouble(0.0) : 0.0);
+                                        mod.heatX = mox;
+                                        mod.heatY = moy;
+                                        if (mvv.Count() >= 3
+                                            && mvv.At(2).IsString()) {
+                                            mod.gap = true;
+                                        }
+                                        cs.data.Add(mod);
+                                    }
+                                    continue;
+                                }
+                            }
                             // 时间轴的对象项 {name, value:[日期串, 值]}
                             // （dynamic-data2）：value 是数组而非标量，
                             // 按时间值对进 points，否则 Double("value")
@@ -8474,6 +8532,146 @@ class ChartCalendarSpec {
         c.showSplitLine = true; c.splitColor = 0; c.splitWidth = 1;
         c.itemColor = 0; c.itemBorderWidth = 1; c.itemBorderColor = 0;
         return c;
+    }
+}
+
+/// ECharts6 matrix 坐标系组件（官方 coord/matrix/MatrixModel +
+/// MatrixDim）：x/y 各是一棵维度树，叶子是布局单位。树前序展平进
+/// 平行数组：first = 子树第一片叶子的序号，span = 覆盖叶子数，
+/// level = 树深。体格 (i,j) = x 第 i 叶列 × y 第 j 叶行；组格 =
+/// 叶子域合并的头部格（官方 getCell 支持任意层级按名寻址）。
+class ChartMatrixSpec {
+    // 盒布局（官方 defaultOption: 四边 '10%'）：px 与百分比互斥。
+    ChartBoxParam lRaw; ChartBoxParam tRaw;
+    ChartBoxParam rRaw; ChartBoxParam bRaw;
+
+    List<string> xText; // 显示文本（label 覆盖 value；缺省自动名）
+    List<int> xLevel;   // 树深（0 = 顶）
+    List<int> xFirst;   // firstLeafLocator
+    List<int> xSpan;    // 叶子跨度
+    List<int> xKind;    // 0 = 叶（无 children）| 1 = 组
+    List<string> yText;
+    List<int> yLevel;
+    List<int> yFirst;
+    List<int> ySpan;
+    List<int> yKind;
+    int xLeaves;        // 叶子数 = 布局单位数
+    int yLeaves;
+    int xLevels;        // 层级带数 = 最大树深
+    int yLevels;
+    // 值→格查找表（任意层级，首见为准——官方重复名只有首个可查）。
+    List<string> qName;
+    List<int> qIdx;
+    List<bool> qIsX;
+
+    static ChartMatrixSpec Of() {
+        ChartMatrixSpec m = new ChartMatrixSpec();
+        m.lRaw = null; m.tRaw = null; m.rRaw = null; m.bRaw = null;
+        m.xText = new List<string>();
+        m.xLevel = new List<int>();
+        m.xFirst = new List<int>();
+        m.xSpan = new List<int>();
+        m.xKind = new List<int>();
+        m.yText = new List<string>();
+        m.yLevel = new List<int>();
+        m.yFirst = new List<int>();
+        m.ySpan = new List<int>();
+        m.yKind = new List<int>();
+        m.xLeaves = 0; m.yLeaves = 0;
+        m.xLevels = 0; m.yLevels = 0;
+        m.qName = new List<string>();
+        m.qIdx = new List<int>();
+        m.qIsX = new List<bool>();
+        return m;
+    }
+
+    /// matrix 组件对象：盒布局四边（数值 px / "N%" 字符串）+ x/y
+    /// 维度树 data。
+    static ChartMatrixSpec ParseOne(JsonValue v) {
+        ChartMatrixSpec m = ChartMatrixSpec.Of();
+        m.lRaw = ChartOption.ParseBoxParam(v.Get("left"));
+        m.tRaw = ChartOption.ParseBoxParam(v.Get("top"));
+        m.rRaw = ChartOption.ParseBoxParam(v.Get("right"));
+        m.bRaw = ChartOption.ParseBoxParam(v.Get("bottom"));
+        JsonValue xj = v.Get("x");
+        if (xj != null && xj.IsObject()) {
+            m.xLeaves = ChartMatrixSpec.ParseCells(xj.Get("data"), m, true, 0, 0);
+        }
+        JsonValue yj = v.Get("y");
+        if (yj != null && yj.IsObject()) {
+            m.yLeaves = ChartMatrixSpec.ParseCells(yj.Get("data"), m, false, 0, 0);
+        }
+        // 层级带数 = 最大树深（官方 _levels.length：每深一层一带）。
+        for (int i = 0; i < m.xLevel.Count; i = i + 1) {
+            if (m.xLevel[i] + 1 > m.xLevels) { m.xLevels = m.xLevel[i] + 1; }
+        }
+        for (int j = 0; j < m.yLevel.Count; j = j + 1) {
+            if (m.yLevel[j] + 1 > m.yLevels) { m.yLevels = m.yLevel[j] + 1; }
+        }
+        return m;
+    }
+
+    /// 维度树前序展平；返回本数组覆盖的叶子数。data 项：字符串 |
+    /// {value, children, label}；无 children 即叶子（官方子树空时
+    /// span 取 1）。value 注册进查找表；label 仅覆盖显示文本。
+    static int ParseCells(JsonValue arr, ChartMatrixSpec m, bool isX,
+                          int first, int level) {
+        if (arr == null || !arr.IsArray()) { return 0; }
+        int total = 0;
+        for (int i = 0; i < arr.Count(); i = i + 1) {
+            JsonValue it = arr.At(i);
+            string val = "";
+            string lab = "";
+            JsonValue children = null;
+            if (it != null && it.IsString()) {
+                val = it.AsString("");
+            } else if (it != null && it.IsObject()) {
+                JsonValue vv = it.Get("value");
+                if (vv != null && vv.IsString()) { val = vv.AsString(""); }
+                JsonValue lj = it.Get("label");
+                if (lj != null && lj.IsString()) { lab = lj.AsString(""); }
+                children = it.Get("children");
+            }
+            int idx;
+            int kind = children != null && children.IsArray()
+                && children.Count() > 0 ? 1 : 0;
+            if (isX) {
+                idx = m.xText.Count;
+                m.xText.Add(lab.Length > 0 ? lab : val);
+                m.xLevel.Add(level);
+                m.xFirst.Add(first + total);
+                m.xSpan.Add(1);
+                m.xKind.Add(kind);
+            } else {
+                idx = m.yText.Count;
+                m.yText.Add(lab.Length > 0 ? lab : val);
+                m.yLevel.Add(level);
+                m.yFirst.Add(first + total);
+                m.ySpan.Add(1);
+                m.yKind.Add(kind);
+            }
+            if (val.Length > 0) {
+                m.qName.Add(val);
+                m.qIdx.Add(idx);
+                m.qIsX.Add(isX);
+            }
+            int sub = ChartMatrixSpec.ParseCells(children, m, isX,
+                first + total, level + 1);
+            if (sub < 1) { sub = 1; }
+            if (isX) { m.xSpan[idx] = sub; }
+            else { m.ySpan[idx] = sub; }
+            total = total + sub;
+        }
+        return total;
+    }
+
+    /// 按名解格下标（叶或组）；查无返回 -1。
+    int FindCell(bool isX, string name) {
+        if (name == null || name.Length < 1) { return 0 - 1; }
+        for (int i = 0; i < qName.Count; i = i + 1) {
+            if (qIsX[i] == isX && qName[i] == name) { return qIdx[i]; }
+        }
+        return 0 - 1;
     }
 }
 

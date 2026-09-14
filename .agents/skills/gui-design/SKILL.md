@@ -453,6 +453,18 @@ small-medium 之间**:画廊卡片标题先后用 13/15 都被打回"太小",17 
   Clone+DrawOption 拷贝+渲染器传参/消费端。漏最后一级(渲染器读
   主题色没读声明)时解析全绿、渲染死灰(真实案例:radar-aqi 深底
   图例白字画成主题灰字,金轴名根本没接)。
+- **组件级 dispatch 通道(整块坐标系/骨架类图表)必须随 DrawOption
+  过河,新组件入库先核对 DrawOption 拷贝清单**:渲染分派读的是
+  ResolvedChart.DrawOption 产物而非 source,它逐字段手工过河——
+  漏拷组件 = DispatchKind 的组件级判定(o.calendars.Count>0 /
+  o.matrix!=null 这类)在 drawOption 上永不命中,系列级残留(数据
+  已解析进 heatX/points)会被别的车道捡走画出"错而不空"的图,比
+  空板更难发现(真实案例:matrix 首版被直角热力图车道抢走填色、
+  维度树头带全丢;calendar 漏拷 calendars 后整族条纹化)。定位法:
+  对 PNG 量剖面反推几何——填色起点/带宽与盒布局预期对不上,一眼
+  锁定"画图的是另一条车道"。修法 = DrawOption 里补
+  `o.组件 = s.组件`(解析后不可变的规格只读共享,zooms 同款;
+  可变组件走 Clone,geos 同款)。
 - **相邻填充区域的接缝要按官方"区域描边"语义封,不能用同色双描
   workaround**:官方每个 region path 是 fill+stroke 同帧落盘
   (MapSeries/GeoModel defaultOption itemStyle borderWidth 0.5 +
