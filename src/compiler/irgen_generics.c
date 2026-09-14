@@ -13,6 +13,7 @@
 
 /* defined in later parts of this translation unit */
 static bool sym_declares_extern(zan_symbol_t *sym);
+static LLVMValueRef emit_soft_scratch_cached(zan_irgen_t *g);
 static zan_symbol_t *extern_check_callee_sym(zan_irgen_t *g,
                                              zan_ast_node_t *call);
 static zan_type_t *method_ret_type_at(zan_irgen_t *g, zan_symbol_t *msym,
@@ -1400,6 +1401,25 @@ static void emit_fopen_check(zan_irgen_t *g, LLVMValueRef fp, const char *msg) {
     emit_io_abort_if(g, isnull, msg);
 }
 
+/* Feed `cond` through llvm.expect.i1 with an expected value of false: guards
+ * fire at most once per program run, so this costs nothing at runtime and
+ * tells the backend the fault arm is cold (straight-line hot-path layout
+ * instead of a basic-block split on every guarded access). */
+static LLVMValueRef emit_expect_false(zan_irgen_t *g, LLVMValueRef cond) {
+    if (!cond) return cond;
+    if (LLVMGetTypeKind(LLVMTypeOf(cond)) != LLVMIntegerTypeKind) return cond;
+    if (LLVMGetIntTypeWidth(LLVMTypeOf(cond)) != 1) return cond;
+    if (!g->expect_false_fn) {
+        LLVMTypeRef i1 = LLVMInt1TypeInContext(g->ctx);
+        LLVMTypeRef ty = LLVMFunctionType(i1, (LLVMTypeRef[]){ i1, i1 }, 2, 0);
+        g->expect_false_fn = LLVMAddFunction(g->mod, "llvm.expect.i1", ty);
+    }
+    LLVMValueRef args[] = { cond, LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 0, 0) };
+    return LLVMBuildCall2(g->builder,
+                          LLVMGlobalGetValueType(g->expect_false_fn),
+                          g->expect_false_fn, args, 2, "guard.expect");
+}
+
 /* Emit a runtime guard: when `is_error` is true at runtime, report
  * "<file>:<line>:<col>: runtime error: <msg>". Soft mode (default) prints
  * once and CONTINUES -- the fresh block after the report is the continuation
@@ -1410,6 +1430,7 @@ static void emit_fopen_check(zan_irgen_t *g, LLVMValueRef fp, const char *msg) {
 static void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
                                zan_loc_t loc, const char *msg) {
     if (!g->runtime_checks || !g->current_fn) return;
+    is_error = emit_expect_false(g, is_error);
 
     /* Cross targets link the committed per-target runtime objects, which may
      * predate zan_rt_soft_note2 -- fall back to the self-contained merged
@@ -1579,12 +1600,7 @@ static LLVMValueRef emit_string_base_guard(zan_irgen_t *g, LLVMValueRef payload,
     LLVMPositionBuilderAtEnd(g->builder, slow_bb);
     emit_runtime_check(g, isnull, loc,
         "null reference where a string/byte buffer is required (element access)");
-    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    LLVMTypeRef fn_ty = LLVMFunctionType(i8p, NULL, 0, 0);
-    LLVMValueRef sfn = LLVMGetNamedFunction(g->mod, "zan_rt_soft_scratch");
-    if (!sfn) sfn = LLVMAddFunction(g->mod, "zan_rt_soft_scratch", fn_ty);
-    LLVMValueRef scratch = zan_call2(g->builder, fn_ty, sfn, NULL, 0,
-                                     "soft.scratch");
+    LLVMValueRef scratch = emit_soft_scratch_cached(g);
     scratch = LLVMBuildBitCast(g->builder, scratch, LLVMTypeOf(payload),
                                "soft.scratch.bc");
     LLVMBasicBlockRef slow_end = LLVMGetInsertBlock(g->builder);
@@ -1613,6 +1629,35 @@ static LLVMValueRef emit_string_base_guard(zan_irgen_t *g, LLVMValueRef payload,
  * stays in-bounds (a null buffer reads the first byte of the empty answer the
  * length probe reports). Hard mode exits inside the report, so the sanitized
  * value is never used there. */
+/* zan_rt_soft_scratch() once per emitted function, cached in an entry alloca:
+ * the substitute page is stable for the process lifetime, but a call at every
+ * guard's soft-path select sat on the hot path -- a guarded field read spent
+ * +35% and an inlined trivial accessor ~2x on a 30M pure-access micro (A58
+ * 3.4). The cached load is loop-invariant, so LICM sinks it out of guarded
+ * loops; the per-site select keeps its two arms cheap. */
+static LLVMValueRef emit_soft_scratch_cached(zan_irgen_t *g) {
+    LLVMBasicBlockRef cur = LLVMGetInsertBlock(g->builder);
+    LLVMValueRef fn = LLVMGetBasicBlockParent(cur);
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    if (!g->soft_scratch_slot || g->soft_scratch_fn != fn) {
+        g->soft_scratch_slot = emit_entry_alloca(g, i8p, "soft.scratch.slot");
+        LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
+        LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock(fn);
+        LLVMValueRef term = LLVMGetBasicBlockTerminator(entry);
+        if (term) LLVMPositionBuilderBefore(g->builder, term);
+        else LLVMPositionBuilderAtEnd(g->builder, entry);
+        LLVMTypeRef fn_ty = LLVMFunctionType(i8p, NULL, 0, 0);
+        LLVMValueRef sf = LLVMGetNamedFunction(g->mod, "zan_rt_soft_scratch");
+        if (!sf) sf = LLVMAddFunction(g->mod, "zan_rt_soft_scratch", fn_ty);
+        LLVMValueRef scratch = zan_call2(g->builder, fn_ty, sf, NULL, 0,
+                                         "soft.scratch.init");
+        LLVMBuildStore(g->builder, scratch, g->soft_scratch_slot);
+        LLVMPositionBuilderAtEnd(g->builder, saved);
+        g->soft_scratch_fn = fn;
+    }
+    return LLVMBuildLoad2(g->builder, i8p, g->soft_scratch_slot, "soft.scratch");
+}
+
 static LLVMValueRef emit_soft_base_select(zan_irgen_t *g, LLVMValueRef base,
                                           LLVMValueRef isnull, zan_loc_t loc);
 static LLVMValueRef emit_string_elem_guard(zan_irgen_t *g, LLVMValueRef payload,
@@ -1647,12 +1692,7 @@ static LLVMValueRef emit_soft_base_select(zan_irgen_t *g, LLVMValueRef base,
                                           LLVMValueRef isnull, zan_loc_t loc) {
     if (!g->runtime_checks || !g->current_fn) return base;
     if (LLVMGetTypeKind(LLVMTypeOf(base)) != LLVMPointerTypeKind) return base;
-    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    LLVMTypeRef fn_ty = LLVMFunctionType(i8p, NULL, 0, 0);
-    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_rt_soft_scratch");
-    if (!fn) fn = LLVMAddFunction(g->mod, "zan_rt_soft_scratch", fn_ty);
-    LLVMValueRef scratch = zan_call2(g->builder, fn_ty, fn, NULL, 0,
-                                     "soft.scratch");
+    LLVMValueRef scratch = emit_soft_scratch_cached(g);
     scratch = LLVMBuildBitCast(g->builder, scratch, LLVMTypeOf(base),
                                "soft.scratch.bc");
     return LLVMBuildSelect(g->builder, isnull, scratch, base, "soft.base");

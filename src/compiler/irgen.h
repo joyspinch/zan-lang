@@ -446,6 +446,14 @@ struct zan_irgen {
     LLVMValueRef fn_report_leaks; /* void __zan_report_leaks(void) */
     const char  *src_file;        /* source path, for runtime diagnostics */
     bool         runtime_checks;  /* insert div-by-zero (etc.) guards; default true */
+    LLVMValueRef expect_false_fn; /* cached llvm.expect.i1 declaration; the
+                                   * runtime guards feed their predicate
+                                   * through it with an expected value of
+                                   * false so the backend keeps the fault
+                                   * arm out of the hot path's layout */
+    LLVMValueRef soft_scratch_slot; /* per-function entry alloca holding the
+                                   * zan_rt_soft_scratch() page pointer */
+    LLVMValueRef soft_scratch_fn;   /* the function soft_scratch_slot lives in */
     bool         strict_runtime;  /* --strict-runtime: main() marks the program
                                    * fail-fast at startup (equivalent to the
                                    * operator setting ZAN_RT_HARD=1), so soft
