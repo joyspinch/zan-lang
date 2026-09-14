@@ -1,0 +1,133 @@
+using System;
+using System.Data.ZanDb;
+using System.Json;
+
+// ZanDB typed tree-free accessors and aggregation: ScanNumField /
+// ScanStrField project one field without building a JsonValue;
+// SumField sums numeric-tagged fields only (no implicit coercion);
+// CountGroups does GROUP BY COUNT in one streaming pass.
+class Program {
+    static int pass = 0;
+    static int fail = 0;
+
+    static void Check(string name, bool ok) {
+        if (ok) { pass = pass + 1; }
+        else { fail = fail + 1; Console.WriteLine("FAIL " + name); }
+    }
+
+    static JsonValue Doc(string cat, int age) {
+        JsonValue u = JsonValue.NewObject();
+        u.Put("cat", JsonValue.NewStr(cat));
+        if (age >= 0) { u.Put("age", JsonValue.NewNum(Convert.ToString(age))); }
+        return u;
+    }
+
+    static async int Run() {
+        string basePath = "zandb_typed.tmp.db";
+        File.Delete(basePath);
+        File.Delete(basePath + ".m0");
+        File.Delete(basePath + ".m1");
+        for (int i = 0; i < 8; i = i + 1) {
+            string seg = basePath + ".s" + Convert.ToString(i);
+            if (File.Exists(seg)) { File.Delete(seg); }
+        }
+
+        ZanDatabase db = ZanDatabase.Open(basePath, 64);
+        Check("open", db.IsOpen());
+        Collection docs = db.GetCollection("docs");
+
+        // 种子：age = 10,20,30,40（id 1..4，cat 交替 a/b）；id5 无 age；
+        // id6 age 为负（-5，varint tag 8）；id7 age 为字符串字段。
+        int a = docs.Insert(Doc("a", 10));
+        int b = docs.Insert(Doc("b", 20));
+        int c = docs.Insert(Doc("a", 30));
+        int d = docs.Insert(Doc("b", 40));
+        JsonValue noAge = JsonValue.NewObject();
+        noAge.Put("cat", JsonValue.NewStr("a"));
+        int e = docs.Insert(noAge);
+        JsonValue neg = JsonValue.NewObject();
+        neg.Put("cat", JsonValue.NewStr("a"));
+        neg.Put("age", JsonValue.NewNum("-5"));
+        int f = docs.Insert(neg);
+        JsonValue strAge = JsonValue.NewObject();
+        strAge.Put("cat", JsonValue.NewStr("b"));
+        strAge.Put("age", JsonValue.NewStr("not-a-num"));
+        int g = docs.Insert(strAge);
+
+        // 1. SumField：10+20+30+40-5 = 95；无 age 与字符串 age 不计入。
+        Check("sum", docs.SumField("age") == 95);
+        Check("sum-missing-field", docs.SumField("nosuch") == 0);
+
+        // 2. ScanNumField：访问数 = 数值 age 文档数（5）；值逐个对。
+        List<long> nums = new List<long>();
+        int nn = docs.ScanNumField("age", (int id, long v) => {
+            nums.Add(v);
+            return true;
+        });
+        Check("scanum-count", nn == 5);
+        Check("scanum-vals", nums[0] == 10 && nums[1] == 20 && nums[2] == 30
+            && nums[3] == 40 && nums[4] == 0 - 5);
+
+        // 3. ScanNumField 提前停。
+        List<long> early = new List<long>();
+        int ne = docs.ScanNumField("age", (int id, long v) => {
+            early.Add(v);
+            return false;
+        });
+        Check("scanum-stop", ne == 1 && early.Count == 1 && early[0] == 10);
+
+        // 4. ScanStrField：cat 文本形态，无 age 的文档也有 cat。
+        List<string> cats = new List<string>();
+        int ns = docs.ScanStrField("cat", (int id, string v) => {
+            cats.Add(v);
+            return true;
+        });
+        Check("scanstr-count", ns == 7);
+        Check("scanstr-vals", cats[0] == "a" && cats[1] == "b" && cats[6] == "b");
+        Check("scanstr-missing-field", docs.ScanStrField("nosuch", (int id, string v) => {
+            return true;
+        }) == 0);
+
+        // 5. CountGroups：a=4（id1,id3,id5无age,id6负），b=3（含字符串age）。
+        Dictionary<string, int> groups = docs.CountGroups("cat");
+        Check("groups-count", groups.Count == 2);
+        int ca;
+        int cb;
+        groups.TryGetValue("a", out ca);
+        groups.TryGetValue("b", out cb);
+        Check("groups-a", ca == 4);
+        Check("groups-b", cb == 3);
+        Check("groups-missing-field", docs.CountGroups("nosuch").Count == 0);
+
+        // 6. Update 后聚合跟随：b 的 20 改成 100 → sum 175。
+        docs.Update(b, Doc("b", 100));
+        Check("sum-after-update", docs.SumField("age") == 175);
+
+        db.Close();
+
+        // 7. 重开：冷缓存同结果。
+        ZanDatabase db2 = ZanDatabase.Open(basePath, 64);
+        Collection docs2 = db2.GetCollection("docs");
+        Check("reopen-sum", docs2.SumField("age") == 175);
+        Dictionary<string, int> g2 = docs2.CountGroups("cat");
+        int ca2;
+        g2.TryGetValue("a", out ca2);
+        Check("reopen-groups", g2.Count == 2 && ca2 == 4);
+        db2.Close();
+
+        File.Delete(basePath);
+        File.Delete(basePath + ".m0");
+        File.Delete(basePath + ".m1");
+        for (int i = 0; i < 8; i = i + 1) {
+            string seg = basePath + ".s" + Convert.ToString(i);
+            if (File.Exists(seg)) { File.Delete(seg); }
+        }
+        Console.WriteLine("pass: " + Convert.ToString(pass));
+        Console.WriteLine("fail: " + Convert.ToString(fail));
+        return 0;
+    }
+
+    static async void Main() {
+        int r = await Run();
+    }
+}

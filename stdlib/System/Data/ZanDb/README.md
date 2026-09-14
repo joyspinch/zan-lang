@@ -35,6 +35,13 @@ int n = users.ScanField("cat", (int id, JsonValue v) => {   // 逐文档回调
 List<int> ids = users.FindIdsByField("cat", "admin");       // 只取 id（索引就绪时不读文档）
 List<int> range = users.FindIdsByFieldRange("cat", "a", "m"); // 范围 [a,m] 双端含（序数语义）
 
+// 类型化投影与聚合：免 JsonValue 树，扫描直出 long/string
+long total = users.SumField("age");           // 数值列求和（流式直算）
+Dictionary<string, int> byCat = users.CountGroups("cat");  // GROUP BY COUNT
+int hits2 = users.ScanStrField("cat", (int id, string v) => { // 免树投影
+    return true;
+});
+
 db.Begin();                                   // 批量写入合并为一次原子提交
 for (int i = 0; i < 1000; i = i + 1) { users.Insert(MakeDoc(i)); }
 db.Commit();
@@ -117,11 +124,13 @@ ZanStore 是**单进程单写者**：`Open` 对日志文件加非阻塞独占锁
 | 批量插入 | ~69000 行/s | **~85000 文档/s** | 同机同负载约为 SQLite 的 1.2 倍 |
 | 主键点读 | ~17000 次/s | **~160000 次/s** | ZanDb 进程内块缓存，约 9 倍 |
 | 全表扫描 | ~965000 行/s | ~320000 文档/s | 每行构建整棵 JsonValue 树 |
-| 投影扫描（单字段） | ~1680000 行/s | ~840000 文档/s | `ScanField` 每行只解码一个字段，**比自身全表扫描快 2.6 倍** |
+| 投影扫描（单字段） | ~1400000 行/s | ~730000 文档/s | `ScanField` 每行只解码一个字段；**类型化 `ScanStrField` ~840000（差距 1.7 倍）** |
 | 索引点查（物化文档） | ~420000 行/s | ~160000 行/s | 每次命中解码整棵文档树 |
 | 索引 id 查询（覆盖） | ~1670000 次/s | ~1190000 次/s | `FindIdsByField` 索引就绪时不读任何文档 |
-| 无索引等值过滤 | ~10100000 文档/s | ~1100000 文档/s | `FieldEquals` 零分配逐字节比较；SQLite 侧为纯 C 列扫描 |
-| Count | ~62000 行/s | **~1240000 文档/s** | 存储层直数，无回调，约 20 倍 |
+| 无索引等值过滤 | ~9700000 文档/s | ~1100000 文档/s | `FieldEquals` 零分配逐字节比较；SQLite 侧为纯 C 列扫描 |
+| Count | ~62000 行/s | **~1100000 文档/s** | 存储层直数，无回调，约 18 倍 |
+| SUM（数值列） | ~10300000 行/s | ~1030000 文档/s | `SumField` 免树流式直算；SQLite 为列上 C 循环，ZanDb 已贴游标地板 |
+| GROUP BY COUNT | ~33000000 行/s | ~790000 文档/s | `CountGroups` 读文档聚合；SQLite 走索引计数不碰行——模型差异 |
 | 自动提交（同语义：每提交 fsync） | ~150 提交/s | ~620 提交/s | ZanDb DUR_SYNC；日志追加 vs journal 双写 |
 | 自动提交（分组提交） | —（无此档） | **~11000 提交/s** | ZanDb DUR_GROUP（默认档，fsync 分组窗口敏感） |
 | 磁盘占用（含二级索引） | 2.67 MB（121 B/行） | 3.05 MB（139 B/文档） | **新引擎 ≈ SQLite 的 1.14 倍** |
@@ -134,9 +143,12 @@ ZanStore 是**单进程单写者**：`Open` 对日志文件加非阻塞独占锁
 * 与行式存储的差异是**模型选择**：每条记录要 JSON 编解码成
   `JsonValue` 树；换来的是 schema-free、原生 Zan 值、免 ORM。
 * 需要整行树的操作（全表扫描/索引点查）差距在 2.2-3 倍；**只需部分
-  字段时用投影 API**（`ScanField`/`FindIdsByField`），每文档只解码
-  目标字段、不建树，单字段扫描差距缩到 ~2.3 倍，覆盖 id 查询 ~1.4 倍。
-  剩余地板是扫描游标与每行委托调用，不再是文档树。
+  字段时用投影 API**（`ScanField`，或免 JsonValue 的类型化
+  `ScanNumField`/`ScanStrField`），每文档只解码目标字段、不建树，
+  类型化单字段投影差距缩到 ~1.7 倍，覆盖 id 查询 ~1.4 倍；聚合
+  （`SumField`/`CountGroups`）免树直算但已贴游标地板（与 Count 同
+  量级），对 SQLite 的列式 SUM 差距即扫描机器本身的差距。剩余地板
+  是扫描游标与每行委托调用，不再是文档树。
 * 自动提交吞吐对 fsync 延迟与机器负载敏感（±20%）；高吞吐写入请走
   `Begin`/`Commit` 批量（设计主路径，每批一次落盘）。
 * 批量写入/扫描的结构优化已内建：自增 id 的 seq 键缓存在内存
@@ -188,6 +200,7 @@ CoW B+Tree + WAL 对同等负载体积大数倍（页开销 + 写放大碎片 + 
 | `zandb_docs`         | 文档层 CRUD、索引、重开、归并后墓碑不复活                   |
 | `zandb_proj`         | 投影 API：`ScanField` 回调/计数/提前停、`FindIdsByField` 扫描路径与覆盖索引路径一致、删除后两路径同步 | 
 | `zandb_idxrange`     | `FindIdsByFieldRange`：索引端点 `\t` 上界（"c1" 不放进 "c10"）、无界端点、序数语义（"9"&gt;"20"）、扫描回退与覆盖索引路径一致、删除/重开同步 |
+| `zandb_typed`        | 类型化聚合：`SumField` 只认数值标签（负数/文本数值计入、字符串跳过）、`ScanNumField`/`ScanStrField` 免 JsonValue 投影与提前停、`CountGroups` 分组计数、Update/重开跟随 |
 | `zandb_merge_tomb`   | 归并墓碑回归：跨段「put+删除」经归并/重归并/重开不复活，点读/Count/索引查询/覆盖查询全路径一致 |
 | `zandb_fuzz`         | 300 步随机操作对拍内存参照模型（固定种子 LCG），跨持久化档重开 |
 | `zandb_lock`         | 单写锁：第二打开者被拒、关闭后可重开                        |

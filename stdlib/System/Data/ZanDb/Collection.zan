@@ -11,6 +11,14 @@ namespace System.Data.ZanDb;
 /// 返回 false 结束扫描。</summary>
 delegate bool FieldVisit(int id, JsonValue v);
 
+/// <summary><see cref="Collection.ScanNumField"/> 的访问器：
+/// id 为文档 id，v 为字段的数值形态（免 JsonValue 树）。</summary>
+delegate bool NumVisit(int id, long v);
+
+/// <summary><see cref="Collection.ScanStrField"/> 的访问器：
+/// id 为文档 id，v 为字段的文本形态（免 JsonValue 树）。</summary>
+delegate bool StrVisit(int id, string v);
+
 /// <summary>
 /// <see cref="ZanDatabase"/> 中一组有名字的文档。文档是
 /// JsonValue 对象树，每篇文档分配一个自增整数 _id。
@@ -623,6 +631,147 @@ class Collection {
     JsonValue FieldOfRow(ScanRow row, int kid) {
         if (kid == 0) { return null; }
         return FieldOf(row.Val(), kid);
+    }
+
+    /// <summary>字段的数值形态（类型化免树）：varint(3/8/9) 直接
+    /// 还原、文本数值(4)解析；字符串/布尔/容器/缺字段返回 false
+    /// ——聚合只认数值型字段，不做隐式强制。</summary>
+    bool FieldNum(string body, int kid, out long v) {
+        v = 0;
+        if (kid == 0) { return false; }
+        if (StrMemChr(body, 255, body.Length) != 0) { body = Collection.UnescapeRecord(body); }
+        int p = 1;                     // 'B'
+        long n = Collection.RecVarInt(body, p, out p);
+        for (int i = 0; i < (int)n; i = i + 1) {
+            long k = Collection.RecVarInt(body, p, out p);
+            int tag = body[p] & 255;
+            if ((int)k == kid) {
+                if (tag == 3) { v = Collection.RecVarInt(body, p + 1, out p); return true; }
+                if (tag == 8) { v = 0 - Collection.RecVarInt(body, p + 1, out p); return true; }
+                if (tag == 9) { return true; }
+                if (tag == 4) {
+                    long len = Collection.RecVarInt(body, p + 1, out p);
+                    v = body.Substring(p, (int)len).ToInt64();
+                    return true;
+                }
+                return false;
+            }
+            Collection.SkipValS(body, p, out p);
+        }
+        return false;
+    }
+
+    /// <summary>字段的文本形态（免 JsonValue）：字符串(5/10)直接
+    /// 取载荷、数值(3/8/9/4)转十进制文本、布尔(1/2)转
+    /// "true"/"false"——与 <see cref="JsonValue.AsString"/> 的
+    /// 归一化形态一致；null/容器/缺字段返回 null（调用方跳过）。</summary>
+    string FieldText(string body, int kid) {
+        if (kid == 0) { return null; }
+        if (StrMemChr(body, 255, body.Length) != 0) { body = Collection.UnescapeRecord(body); }
+        int p = 1;                     // 'B'
+        long n = Collection.RecVarInt(body, p, out p);
+        for (int i = 0; i < (int)n; i = i + 1) {
+            long k = Collection.RecVarInt(body, p, out p);
+            int tag = body[p] & 255;
+            if ((int)k == kid) {
+                if (tag == 5 || tag == 4) {
+                    long len = Collection.RecVarInt(body, p + 1, out p);
+                    return body.Substring(p, (int)len);
+                }
+                if (tag == 10) { return ""; }
+                if (tag == 3) { return Convert.ToString(Collection.RecVarInt(body, p + 1, out p)); }
+                if (tag == 8) { return Convert.ToString(0 - Collection.RecVarInt(body, p + 1, out p)); }
+                if (tag == 9) { return "0"; }
+                if (tag == 1) { return "false"; }
+                if (tag == 2) { return "true"; }
+                return null;
+            }
+            Collection.SkipValS(body, p, out p);
+        }
+        return null;
+    }
+
+    /// <summary>数值字段投影扫描：每条含 field 的文档以 (id, 数值)
+    /// 调用一次 visit，不构建任何 JsonValue（varint 直接还原，
+    /// 文本数值才解析）；visit 返回 false 提前结束。返回 visit
+    /// 被调用的次数。</summary>
+    int ScanNumField(string field, NumVisit visit) {
+        SyncMeta();
+        int kid = KeyIdOf(field);
+        if (kid == 0) { return 0; }
+        string hi = "c:" + this.name + ";";
+        int n = 0;
+        this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
+            long v;
+            if (FieldNum(row.Val(), kid, out v)) {
+                n = n + 1;
+                if (!visit(Collection.IdOfKey(row.Key()), v)) { return false; }
+            }
+            return true;
+        });
+        return n;
+    }
+
+    /// <summary>文本字段投影扫描：每条含 field 的文档以 (id, 文本)
+    /// 调用一次 visit，只物化该字段的字符串（不建 JsonValue 包装）；
+    /// visit 返回 false 提前结束。返回 visit 被调用的次数。</summary>
+    int ScanStrField(string field, StrVisit visit) {
+        SyncMeta();
+        int kid = KeyIdOf(field);
+        if (kid == 0) { return 0; }
+        string hi = "c:" + this.name + ";";
+        int n = 0;
+        this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
+            string s = FieldText(row.Val(), kid);
+            if (s != null) {
+                n = n + 1;
+                if (!visit(Collection.IdOfKey(row.Key()), s)) { return false; }
+            }
+            return true;
+        });
+        return n;
+    }
+
+    /// <summary>数值字段的全文求和：存储层流式直算，无回调、
+    /// 无 JsonValue——数值型标签直接还原累加，文本数值解析累加，
+    /// 非数值型文档跳过。字段不存在或全非数值时返回 0。</summary>
+    long SumField(string field) {
+        SyncMeta();
+        int kid = KeyIdOf(field);
+        long sum = 0;
+        if (kid == 0) { return 0; }
+        string hi = "c:" + this.name + ";";
+        this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
+            long v;
+            if (FieldNum(row.Val(), kid, out v)) { sum = sum + v; }
+            return true;
+        });
+        return sum;
+    }
+
+    /// <summary>字段值的分组计数（GROUP BY field 的 COUNT）：
+    /// 一遍流式扫描直接在键控结构里聚合，每组只分配一次键字符串。
+    /// null/容器/缺字段的文档不计入。</summary>
+    Dictionary<string, int> CountGroups(string field) {
+        SyncMeta();
+        Dictionary<string, int> groups = new Dictionary<string, int>();
+        int kid = KeyIdOf(field);
+        if (kid == 0) { return groups; }
+        string hi = "c:" + this.name + ";";
+        this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
+            string s = FieldText(row.Val(), kid);
+            if (s != null) {
+                int c;
+                if (groups.TryGetValue(s, out c)) {
+                    groups.Remove(s);
+                    groups.Add(s, c + 1);
+                } else {
+                    groups.Add(s, 1);
+                }
+            }
+            return true;
+        });
+        return groups;
     }
 
     /// 把存储的二进制记录（见 <see cref="EncodeDoc"/>）解码回 JsonValue 对象；

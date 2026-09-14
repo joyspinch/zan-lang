@@ -156,6 +156,32 @@ class ZanDbVsSqlite {
         Console.WriteLine("[sqlite] count             " + Ms(cMs) + " ms = "
             + Ops(cnt, cMs) + " rows/s");
 
+        // 聚合：SUM 与 GROUP BY COUNT（引擎直算 vs ZanDb 免树流式聚合）。
+        sw = Stopwatch.StartNew();
+        long sumSink = 0;
+        for (int r = 0; r < 10; r = r + 1) {
+            DbResult sr = sdb.Query("SELECT SUM(age) AS s FROM docs");
+            sumSink = sumSink + Convert.ToInt64(sr.GetByName(0, "s"));
+        }
+        double sMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("[sqlite] sum(age)          " + Ms(sMs) + " ms = "
+            + Ops(10 * N, sMs) + " rows/s (sink=" + Convert.ToString(sumSink) + ")");
+
+        sw = Stopwatch.StartNew();
+        long grpRows = 0;
+        long grpSink = 0;
+        for (int r = 0; r < 10; r = r + 1) {
+            DbResult gr = sdb.Query("SELECT cat, COUNT(*) AS n FROM docs GROUP BY cat");
+            grpRows = grpRows + gr.RowCount();
+            for (int i = 0; i < gr.RowCount(); i = i + 1) {
+                grpSink = grpSink + Convert.ToInt64(gr.GetByName(i, "n"));
+            }
+        }
+        double gMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("[sqlite] group by cat      " + Ms(gMs) + " ms = "
+            + Ops(10 * N, gMs) + " rows/s (groups=" + Convert.ToString(grpRows / 10)
+            + " sum=" + Convert.ToString(grpSink) + ")");
+
         int M = 2000;
         sw = Stopwatch.StartNew();
         for (int i = 0; i < M; i = i + 1) {
@@ -250,6 +276,18 @@ class ZanDbVsSqlite {
         Console.WriteLine("[zandb ] projection scan  " + Ms(zprojMs) + " ms = "
             + Ops(scanned, zprojMs) + " docs");
 
+        // 类型化投影：只物化字段字符串本身，连 JsonValue 包装都不建。
+        scanned = 0;
+        sw = Stopwatch.StartNew();
+        for (int r = 0; r < 3; r = r + 1) {
+            scanned = scanned + docs.ScanStrField("cat", (int id, string v) => {
+                return v.Length > 0;
+            });
+        }
+        double zstrMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("[zandb ] scan str field   " + Ms(zstrMs) + " ms = "
+            + Ops(scanned, zstrMs) + " docs");
+
         hits = 0;
         sw = Stopwatch.StartNew();
         for (int r = 0; r < 20; r = r + 1) {
@@ -291,6 +329,34 @@ class ZanDbVsSqlite {
         double zcMs = sw.ElapsedMilliseconds();
         Console.WriteLine("[zandb ] count             " + Ms(zcMs) + " ms = "
             + Ops((int)cnt, zcMs) + " docs/s");
+
+        // 聚合：免树流式直算（无回调、无 JsonValue；组键每组一次分配）。
+        sw = Stopwatch.StartNew();
+        long zsum = 0;
+        for (int r = 0; r < 10; r = r + 1) {
+            zsum = zsum + docs.SumField("age");
+        }
+        double zsMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("[zandb ] sum(age)          " + Ms(zsMs) + " ms = "
+            + Ops(10 * N, zsMs) + " docs/s (sink=" + Convert.ToString(zsum) + ")");
+
+        sw = Stopwatch.StartNew();
+        long zgrpSum = 0;
+        int zgroups = 0;
+        for (int r = 0; r < 10; r = r + 1) {
+            Dictionary<string, int> groups = docs.CountGroups("cat");
+            zgroups = groups.Count;
+            List<string> gkeys = groups.Keys;
+            for (int i = 0; i < gkeys.Count; i = i + 1) {
+                int c;
+                groups.TryGetValue(gkeys[i], out c);
+                zgrpSum = zgrpSum + c;
+            }
+        }
+        double zgMs = sw.ElapsedMilliseconds();
+        Console.WriteLine("[zandb ] group by cat      " + Ms(zgMs) + " ms = "
+            + Ops(10 * N, zgMs) + " docs/s (groups=" + Convert.ToString(zgroups)
+            + " sum=" + Convert.ToString(zgrpSum) + ")");
 
         // 磁盘占用：写路径已结束、查询不写入，归并后的状态即终态。
         long zbytes = 0;
