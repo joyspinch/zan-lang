@@ -94,14 +94,27 @@ foreach(_proj IN LISTS _projs)
     continue()
   endif()
 
-  # The .html design entry must come first: zanc emits Main from the first
-  # design document on the command line.
+  # The entry is ALWAYS the first input: zanc emits Main from the first
+  # input on the command line (for a design entry it is the entry design's
+  # Main; for a .zan entry the entry's own Main must win -- a side design
+  # in front would project a second Main, "duplicate method 'Main'").
   set(_srcs "")
-  if(_entry MATCHES "\\.html$")
-    list(APPEND _srcs ${_out}/${_entry})
-  endif()
+  list(APPEND _srcs ${_out}/${_entry})
   file(GLOB_RECURSE _zan ${_out}/src/*.zan)
+  file(GLOB_RECURSE _designs ${_out}/src/*.html ${_out}/src/*.htm
+    ${_out}/src/*.zscene)
   list(SORT _zan)
+  list(SORT _designs)
+  # Side design documents (.html/.zscene next to the entry, e.g. gui-wechat's
+  # WeChatFavs/WeChatMoments run-time windows) ride the same command line --
+  # ZanIDE.GatherZanFiles puts them into every whole-project build the same
+  # way, and a design doc not on the command line projects no class at all,
+  # so any `XxxHtml.Build` reference in the .zan half fails to resolve.
+  foreach(_d IN LISTS _designs)
+    if(NOT _d STREQUAL "${_out}/${_entry}")
+      list(APPEND _srcs ${_d})
+    endif()
+  endforeach()
   list(APPEND _srcs ${_zan})
   list(REMOVE_DUPLICATES _srcs)
 

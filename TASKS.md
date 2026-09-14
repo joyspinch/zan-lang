@@ -2414,11 +2414,11 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
   文档需同改）→zan_control_schema、MCP 响应键 zformControls→
   controlCatalog（对外）、run_zform_schema.cmake→run_control_schema
   .cmake、conformance_gui_zform_html→conformance_gui_controls_html
-  （ctest 名，内部安全）。**在途半成品挂账**：
-  server-legend Player.zan 字段改名（arenaPts→merit、stars→starsLit、
-  删 buffUntil 加四币种）模型侧已改、消费端（Play/Gateway/World 的
-  Set 链与读写点 ~13 处）未跟上——模板门 templates_build 因此红，
-  待该会话收尾；templates_build 其余 32 模板全绿。
+  （ctest 名，内部安全）。**在途半成品挂账——2026-09-14 消账**：
+  server-legend 半边工作树已无未收尾缺口（消费端已跟上）；gui-wechat
+  半边（新 .html 设计稿未提交 + App.zan 硬编 AppHtml）由 A316 修复，见下。
+
+* **A316 templates_build 门两缺陷：侧设计文档不进编译输入 + gui-wechat 入口类名硬编（2026-09-14 发现并当轮修复）[P1/测试门+模板]**：门红 `unresolved call 'WeChatFavsHtml.Build'`（gui-wechat WeChatPages.zan:965/1229）及 `WinMain`/`duplicate Main` 变体，根因两条。① **tests/run_templates.cmake 输入清单漏侧设计文档**——只传 `entry(.html)` + `src/*.zan`，同目录其余 `.html/.htm/.zscene`（WeChatFavs/WeChatMoments/WeChatLogin 运行期文档）不进命令行；而 GenHtml/ZanGen 只为**命令行上的**设计文档投影建树类（`XxxHtml`，类名=文档基名帕斯卡化），不在命令行=无类=全部 `XxxHtml.Build` 未解析。IDE 的 ZanIDE.GatherZanFiles 一直把设计文档收进整项目编译（SmartInputs 同理），门从此弱于 IDE 实际构建路径——修复：门补 `file(GLOB_RECURSE _designs *.html *.htm *.zscene)`，entry 恒居首（**zanc 以第一个输入决定 Main 归属**：设计 entry 则其 Main 胜出；`.zan` entry（wuwei type=console）时侧设计若排前会被 emitMain 投出第二个 Main 报 duplicate——w 的 Work2 探针实锤），侧文档 entry 后、.zan 前追加。② **templates/gui/gui-wechat/src/App.zan 硬编 `AppHtml`**——d6ca273b 把主窗迁到 App.html 运行期文档时类名写死；脚手架按项目名改名 App.html→`<Name>.html`（门=TplProbe、IDE=用户命名）后 GenHtml 类名变 `<Name>Html`，任何非 App 项目名即编译失败，模板从 New Project 流程不可用。修：AppHtml→`{{NAME}}Html`（脚手架 contents 替换约定，dashboard 模板 `partial class {{NAME}}` 同款）。**归因纪律**：未提交的 WeChatFavs/WeChatMoments.html 与 WeChatPages 等改动属并行会话车道，本修不触碰其内容，只修门与入口类名约定；A/B 探针（含/不含侧文档×entry 顺序）四态均落 _scratch。**验证**：全 35 模板 rc=0 全绿（含 gui-wechat/wuwei/goldminer，后两者为顺序回归探针暴露并修复）。
 
 * **P8-3 文档动态原语：`data-if` / `<template data-for>`（四方同语义）**
   （2026-09-13）：HTML 声明层补上"按状态显隐 + 逐项渲染列表"两条
