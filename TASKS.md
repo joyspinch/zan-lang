@@ -2727,9 +2727,9 @@ P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
     char buf[4096] 改 zan_lex_strbuf_t 堆生长（4KiB 起倍增；OOM 退化为
     诊断+截断，转义解码始终执行防反同步），GenForm EmitSetProp 分块
     发射可保留（兼容不依赖）；conformance big_string_literals（1 万/
-    10 万字节 + 转义/插值混排）4 孪生绿；② 符号索引把 .html 当 Zan 源扫描，
-    报 `<unknown>:N:M: unexpected character` 非致命噪音（构建
-    exit=0），应在索引侧跳过设计文档。
+    10 万字节 + 转义/插值混排）4 孪生绿；② .html 词法化噪音已由 d295e5aa
+    （2026-09-14）根治——namespace 扫描跳过设计稿/.zcomp + 三个启发式扫描
+    diag 转 capture，与本项为同一树内先后提交，此处不再单列。
 * **雷达车道已修（2026-09-13 第二批）**：根因三个——①radar 系列的
   data 项是值数组（对象 {value:[...],name} 或裸数组），旧标量车道
   Double("value") 对数组取 0，全部多边形塌成圆心一个点（radar 主力
