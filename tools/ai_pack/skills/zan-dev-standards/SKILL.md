@@ -54,6 +54,12 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
 - **无头仿真 + 像素复核**：逻辑用无头仿真跑，断言写成探针
   （读内部状态或像素），禁止"截图看一眼"式的判断；相邻两次截图字节级相同
   要怀疑"根本没重绘"，先排查再下结论。
+- **注入事件的 GUI 测试，BeginFrame 归 App 循环管，帧体只画内容**：
+  `PumpGuarded + FrameGuarded(Body)` 的 Body 里不要再调 `app.BeginFrame()`——
+  SafeFrame 已经调过，双重置会把 `inputBlockPrevious` 链打断，
+  `BlockHitsBelow` 每帧误判"模态首帧"而自动认领点击（clickClaimed），
+  浮层收不到任何释放、result 恒 -1，测试静默测了个空还不报错。逐帧手工
+  推进时同理：一次 `BeginFrame() + 内容 + PresentFrame()` 才是一帧。
 - **像素转场扫描必须带末段归属**：沿列/行打印"颜色转场"做像素断言时，
   最后一次转场之后的区间保持的是前一个色值——把"后面没有转场"误读成
   "后面没画东西"，会把已生效的绘制当成缺陷，白走一圈排查。转场列表
