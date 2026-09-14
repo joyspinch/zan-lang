@@ -1297,6 +1297,22 @@ class ObjectRenderer {
 
     /// <summary>One object onto the frame canvas. The anchor math, sprite
     /// choice and overlays match DrawOne; only the blit target differs.</summary>
+    /// <summary>The flight altitude in screen pixels: how far above its
+    /// ground cell a flying unit's body is drawn. The ground keeps the
+    /// soft shadow, so the eye reads the gap as height.</summary>
+    static int FlyAlt() { return 26; }
+
+    /// <summary>A flying unit's ground shadow: a dark translucent ellipse
+    /// blotted under the body's ground cell, three stacked rects wide in
+    /// the middle and thin at the tips (the canvas has no ellipse fill,
+    /// and a per-pixel ring costs more than a shadow is worth).</summary>
+    static void DrawFlyShadow(R2Canvas r, int cx, int cy) {
+        r.SetColor(0, 0, 0, 70);
+        r.FillRect(cx - 20, cy - 4, 40, 8);
+        r.FillRect(cx - 15, cy - 6, 30, 12);
+        r.FillRect(cx - 8, cy - 7, 16, 14);
+    }
+
     static bool DrawOneToCanvas(World world, ObjectArt art, WorldObject o,
                                 R2Canvas r, int camX, int camY, int originX,
                                 int originY, int playerSide) {
@@ -1306,6 +1322,14 @@ class ObjectRenderer {
         int ch = R2CanvasStageH(r);
         if (wx > cw + 128 || wx < 0 - 128 || wy > ch + 128 || wy < 0 - 128) {
             return false;
+        }
+        // The flyer's body lifts off its cell; every later anchor -- body,
+        // turret, selection ring, health bar -- rides the raised position,
+        // while the shadow stays on the ground it hovers over.
+        if (o.IsFlying()) {
+            ObjectRenderer.DrawFlyShadow(r, wx + IsoProjection.TileW() / 2,
+                                         wy + IsoProjection.TileH() / 2);
+            wy = wy - ObjectRenderer.FlyAlt();
         }
 
         Texture tex = null;
@@ -1805,6 +1829,32 @@ class ObjectRenderer {
 
     static int Depth(WorldObject o) { return o.X() + o.Y(); }
 
+    /// <summary>The texture path's ground shadow: scales every pixel of a
+    /// small ellipse down to ~45%, in place. Out-of-bounds columns clip.</summary>
+    static void GroundShadowDarken(Texture canvas, int x0, int y0,
+                                   int w, int h) {
+        int cw = canvas.Width();
+        int ch = canvas.Height();
+        int cx = x0 + w / 2;
+        int cy = y0 + h / 2;
+        for (int y = y0; y < y0 + h; y = y + 1) {
+            if (y < 0 || y >= ch) { continue; }
+            for (int x = x0; x < x0 + w; x = x + 1) {
+                if (x < 0 || x >= cw) { continue; }
+                int dx = (x - cx) * 2;
+                int dy = (y - cy) * 2;
+                if (dx * dx + dy * dy > (w / 2) * (w / 2)) { continue; }
+                int px = canvas.PixelAt(x, y);
+                int a = (px >> 24) & 0xFF;
+                if (a == 0) { continue; }
+                int r = ((px >> 16) & 0xFF) * 45 / 100;
+                int g = ((px >> 8) & 0xFF) * 45 / 100;
+                int b = (px & 0xFF) * 45 / 100;
+                canvas.SetPixel(y * cw + x, r, g, b, a);
+            }
+        }
+    }
+
     static bool DrawOne(World world, ObjectArt art, WorldObject o, Texture canvas,
                         int camX, int camY, int originX, int originY,
                         int playerSide) {
@@ -1813,6 +1863,15 @@ class ObjectRenderer {
         if (wx > canvas.Width() + 128 || wx < -128
          || wy > canvas.Height() + 128 || wy < -128) {
             return false;
+        }
+        // The texture path lifts the flyer the same way the screen path
+        // does, and darkens the ground ellipse in place (SetPixel has no
+        // blend, so the shadow reads the pixel and scales it down).
+        if (o.IsFlying()) {
+            ObjectRenderer.GroundShadowDarken(canvas,
+                wx + IsoProjection.TileW() / 2 - 20,
+                wy + IsoProjection.TileH() / 2 - 7, 40, 14);
+            wy = wy - ObjectRenderer.FlyAlt();
         }
 
         Texture tex = null;

@@ -247,7 +247,15 @@ class WorldObject {
     void SetSelected(bool sel) { this.selected = sel; }
     UnitType UnitType() { return this.unitType; }
     bool Amphibious() {
-        return this.unitType != null && this.unitType.Amphibious();
+        return this.unitType != null
+            && (this.unitType.Amphibious() || this.unitType.Flying());
+    }
+
+    /// <summary>True for a unit whose archetype flies: it plans routes over
+    /// water, cliffs and walls, steps without touching the occupancy index,
+    /// and only AntiAir guns may acquire it as a target.</summary>
+    bool IsFlying() {
+        return this.unitType != null && this.unitType.Flying();
     }
     int TargetIndex() { return this.target; }
     void SetTarget(int idx) { this.target = idx; }
@@ -750,6 +758,10 @@ class UnitType {
     int weight;
     bool infantry;
     int speedType;     // SpeedType: only Track/Hover hulls roll over things
+    // The flying flag off the def (the Jumpjet/Disguised locomotor class):
+    // crosses water, cliffs, walls and buildings, never occupies a tile and
+    // is engageable only by AntiAir guns.
+    bool flying;
 
     static UnitType Create(string reg, string label, int cost, int buildTime,
                            int hp, string shpName, int armor, Weapon primary,
@@ -801,6 +813,7 @@ class UnitType {
         t.weight = 1;
         t.infantry = false;
         t.speedType = SpeedType.Wheel();
+        t.flying = false;
         return t;
     }
 
@@ -835,6 +848,8 @@ class UnitType {
     int Weight() { return this.weight; }
     bool Infantry() { return this.infantry; }
     int SpeedTypeValue() { return this.speedType; }
+    bool Flying() { return this.flying; }
+    void SetFlying(bool on) { this.flying = on; }
     void SetCrushKeys(bool crusher, bool crushable, string crushSound,
                       int weight, bool infantry) {
         this.crusher = crusher;
@@ -1073,6 +1088,7 @@ class UnitCatalog {
             t.SetCrushKeys(d.Crusher(), d.Crushable(), d.CrushSound(),
                            d.Weight(), d.Infantry());
             t.SetSpeedType(d.SpeedTypeValue());
+            t.SetFlying(d.Flying());
             l.Add(t);
         }
         return l;
@@ -4122,8 +4138,10 @@ class World {
         UnitType u = this.units.TypeFor(this, side, unitId);
         if (u == null) { return -1; }
         if (!this.InBounds(x, y)) { return -1; }
-        if (this.occupancy[this.CellSlot(x, y)] != 0
-         || this.IsWallCell(x, y)) { return -1; }
+        // A flyer materialises in the air: no tile to block, none occupied.
+        if (!u.Flying()
+         && (this.occupancy[this.CellSlot(x, y)] != 0
+             || this.IsWallCell(x, y))) { return -1; }
         WorldObject o = WorldObject.CreateUnit(side, unitId, x, y, u.Hp(), u);
         int idx = this.AddObject(o);
         this.ShroudRevealObject(o);
@@ -4607,7 +4625,14 @@ class World {
     }
 
     int AddObject(WorldObject o) {
-        this.occupancy[this.CellSlot(o.X(), o.Y())] = this.objects.Count + 1;
+        // A flying unit lives above the grid: the occupancy index stays
+        // untouched, so ground columns walk under it and two flyers never
+        // collide. Click selection finds them through ObjectsAt's flyer
+        // sweep instead.
+        if (!o.IsFlying()) {
+            this.occupancy[this.CellSlot(o.X(), o.Y())]
+                = this.objects.Count + 1;
+        }
         this.objects.Add(o);
         // A lamp building lights its neighbourhood the moment it appears,
         // the reference's onObjectSpawned hook in WorldView.
@@ -4696,7 +4721,8 @@ class World {
                     // Only this radius's annulus: the inner square was
                     // already scanned on a tighter ring.
                     if (x > x0 && x < x1 && y > y0 && y < y1) { continue; }
-                    if (!this.Passable(x, y)) { continue; }
+                    if (!o.IsFlying() && !this.Passable(x, y)) { continue; }
+                    if (o.IsFlying() && !this.InBounds(x, y)) { continue; }
                     int dx = x - cx;
                     int dy = y - cy;
                     if (dx < 0) { dx = 0 - dx; }
@@ -4724,7 +4750,15 @@ class World {
     }
 
     bool PassableFor(int x, int y, bool amphibious) {
+        return this.PassableForF(x, y, amphibious, false);
+    }
+
+    /// <summary>The flying-aware form: an airborne unit's destination only
+    /// needs to be on the map -- water, cliffs, walls and parked units are
+    /// all beneath it.</summary>
+    bool PassableForF(int x, int y, bool amphibious, bool flying) {
         if (!this.InBounds(x, y)) { return false; }
+        if (flying) { return true; }
         IsoTile t = this.iso.At(x, y);
         if (t == null) { return false; }
         if (!this.IsGround(t) && !this.IsBridge(t)) {
@@ -4740,6 +4774,14 @@ class World {
     /// crowded camp fails the search, so an attack order moves nobody.
     /// Structures keep blocking: a route through a wall is a lie.</summary>
     bool PassableForRoute(int x, int y, bool amphibious) {
+        return this.PassableForRouteF(x, y, amphibious, false);
+    }
+
+    /// <summary>The flying-aware route check: the sky is empty everywhere
+    /// on the map, so the sweep plans straight over water, cliffs, walls
+    /// and whole buildings.</summary>
+    bool PassableForRouteF(int x, int y, bool amphibious, bool flying) {
+        if (flying) { return this.InBounds(x, y); }
         if (!this.InBounds(x, y)) { return false; }
         IsoTile t = this.iso.At(x, y);
         if (t == null) { return false; }
@@ -4768,6 +4810,13 @@ class World {
                     if (o.X() + dx == x && o.Y() + dy == y) { outIds.Add(i); }
                 }
             }
+        }
+        // Flyers never sit in the occupancy index: a click under one sweeps
+        // the (short) airborne list directly.
+        for (int i = 0; i < this.objects.Count; i = i + 1) {
+            WorldObject o = this.objects[i];
+            if (o.IsDead() || !o.IsFlying()) { continue; }
+            if (o.X() == x && o.Y() == y) { outIds.Add(i); }
         }
     }
 
@@ -4844,6 +4893,13 @@ class World {
         if (attackerIdx < 0 || attackerIdx >= this.objects.Count) { return false; }
         WorldObject o = this.objects[attackerIdx];
         if (o.Kind() != ObjKind.Unit()) { return false; }
+        // An order at a flyer only sticks when the trooper carries an AA
+        // gun -- rifles aimed at a zeppelin would be a promise to fire
+        // straight up and hit nothing.
+        if (t != null && t.IsFlying()) {
+            Weapon w = this.PickWeapon(o.UnitType(), t);
+            if (w == null) { return false; }
+        }
         int idx = this.objects.IndexOf(t);
         if (idx < 0 || idx == o.TargetIndex()) { return false; }
         o.SetTarget(idx);
@@ -4920,16 +4976,35 @@ class World {
     /// move-attack scan so a unit only stops for hostiles close enough to
     /// matter. Skips neutrals like NearestEnemy.</summary>
     int NearestEnemyIn(int x, int y, int side, int radius) {
+        return this.NearestEnemyInAir(x, y, side, radius, true);
+    }
+
+    /// <summary>The AA-aware form: a shooter whose guns cannot reach the
+    /// sky never acquires a flying target. Ground targets still outrank
+    /// airborne ones when both are in radius, so an AA gun keeps shooting
+    /// infantry instead of chasing a distant zeppelin.</summary>
+    int NearestEnemyInAir(int x, int y, int side, int radius, bool canHitAir) {
         int best = -1;
         int bestD = -1;
+        int bestFly = -1;
+        int bestFlyD = -1;
         for (int i = 0; i < this.objects.Count; i = i + 1) {
             WorldObject o = this.objects[i];
             if (o.Side() == side || o.Side() == Side2.Neutral()
              || o.IsDead()) { continue; }
             int d = this.Distance(x, y, o.X(), o.Y());
-            if (d <= radius && (bestD < 0 || d < bestD)) { bestD = d; best = i; }
+            if (d > radius) { continue; }
+            if (o.IsFlying()) {
+                if (canHitAir && (bestFlyD < 0 || d < bestFlyD)) {
+                    bestFlyD = d;
+                    bestFly = i;
+                }
+                continue;
+            }
+            if (bestD < 0 || d < bestD) { bestD = d; best = i; }
         }
-        return best;
+        if (best >= 0) { return best; }
+        return bestFly;
     }
 
     /// <summary>True when `side` has no living structure left. That is the
@@ -5695,7 +5770,13 @@ class World {
         p.px = p.px + p.dirX * p.speed;
         p.py = p.py + p.dirY * p.speed;
         p.flown = p.flown + p.speed;
-        if (this.WallStops(p)) { return true; }
+        // Walls only stop rounds that fly the ground line: a missile
+        // chasing a flyer is above the wall line the whole way.
+        WorldObject mark = p.target >= 0 && p.target < this.objects.Count
+                         ? this.objects[p.target] : null;
+        if ((mark == null || !mark.IsFlying()) && this.WallStops(p)) {
+            return true;
+        }
         return false;
     }
 
@@ -6265,11 +6346,12 @@ class World {
                 else if (side == 2) { ty = y - ring; }
                 else { tx = x - ring; }
             }
-            if (!this.PassableFor(tx, ty, sel.Amphibious())) { continue; }
+            if (!this.PassableForF(tx, ty, sel.Amphibious(),
+                                   sel.IsFlying())) { continue; }
             List<int> px = new List<int>();
             List<int> py = new List<int>();
-            if (!this.FindPath(sel.X(), sel.Y(), tx, ty, px, py,
-                               sel.Amphibious())) { continue; }
+            if (!this.FindPathF(sel.X(), sel.Y(), tx, ty, px, py,
+                                sel.Amphibious(), sel.IsFlying())) { continue; }
             sel.SetRoute(px, py);
             sel.ClearMoveAttack();
             any = true;
@@ -6301,11 +6383,12 @@ class World {
                 else if (side == 2) { ty = y - ring; }
                 else { tx = x - ring; }
             }
-            if (!this.PassableFor(tx, ty, sel.Amphibious())) { continue; }
+            if (!this.PassableForF(tx, ty, sel.Amphibious(),
+                                   sel.IsFlying())) { continue; }
             List<int> px = new List<int>();
             List<int> py = new List<int>();
-            if (!this.FindPath(sel.X(), sel.Y(), tx, ty, px, py,
-                               sel.Amphibious())) { continue; }
+            if (!this.FindPathF(sel.X(), sel.Y(), tx, ty, px, py,
+                                sel.Amphibious(), sel.IsFlying())) { continue; }
             sel.SetRoute(px, py);
             sel.SetMoveAttack(tx, ty);
             any = true;
@@ -6357,8 +6440,9 @@ class World {
             // quadratic.
             if (o.MoveAttacking() && this.Target(o) == null && o.HasRoute()
              && (this.worldTick + i) % 8 == 0) {
-                int e = this.NearestEnemyIn(o.X(), o.Y(), o.Side(),
-                                            o.UnitType().Range() + 3);
+                int e = this.NearestEnemyInAir(o.X(), o.Y(), o.Side(),
+                                               o.UnitType().Range() + 3,
+                                               this.CanHitAir(o.UnitType()));
                 if (e >= 0) {
                     this.AttackObject(i, this.objects[e]);
                 }
@@ -6388,8 +6472,9 @@ class World {
             if (t == null && !o.MoveAttacking() && !o.HasRoute()
              && o.UnitType().Primary() != null
              && (this.worldTick + i) % 8 == 0) {
-                int e = this.NearestEnemyIn(o.X(), o.Y(), o.Side(),
-                                            o.UnitType().Range() + 4);
+                int e = this.NearestEnemyInAir(o.X(), o.Y(), o.Side(),
+                                               o.UnitType().Range() + 4,
+                                               this.CanHitAir(o.UnitType()));
                 if (e >= 0) {
                     this.AttackObject(i, this.objects[e]);
                     t = this.objects[e];
@@ -6456,8 +6541,9 @@ class World {
                         // out -- the army keeps flowing, and the next
                         // staggered turn refines the route.
                         this.pathPopCap = 6000;
-                        bool routed = this.FindPathTo(o.X(), o.Y(), t, px, py,
-                                                      o.Amphibious());
+                        bool routed = this.FindPathToF(o.X(), o.Y(), t,
+                                                       px, py, o.Amphibious(),
+                                                       o.IsFlying());
                         this.pathPopCap = 0;
                         if (routed) {
                             o.SetRoute(px, py);
@@ -6506,7 +6592,9 @@ class World {
             WorldObject tgt = this.Target(b);
             if (tgt != null && tgt.Side() == b.Side()) { b.StopAttack(); tgt = null; }
             if (tgt == null) {
-                int e = this.NearestEnemyIn(b.X(), b.Y(), b.Side(), bt.Range());
+                int e = this.NearestEnemyInAir(b.X(), b.Y(), b.Side(),
+                                               bt.Range(),
+                                               bt.Weapon().AntiAir());
                 if (e >= 0) { b.SetTarget(e); tgt = this.objects[e]; }
             }
             if (tgt == null) { b.SetReload(0); continue; }
@@ -6572,13 +6660,20 @@ class World {
                 // hull is a crusher, which rolls straight over a crushable
                 // blocker (a wall it may flatten, an enemy it may run down)
                 // instead of queueing behind it.
-                bool crushStep = this.CanCrushInto(o, nx, ny);
-                if (this.occupancy[this.CellSlot(nx, ny)] != 0
+                // A flyer steps over everything: the ground's crowds,
+                // walls and buildings are all beneath its flight line.
+                bool flying = o.IsFlying();
+                bool crushStep = !flying && this.CanCrushInto(o, nx, ny);
+                if (!flying
+                 && this.occupancy[this.CellSlot(nx, ny)] != 0
                  && !crushStep) { break; }
-                if (this.IsWallCell(nx, ny) && !crushStep) { break; }
+                if (!flying
+                 && this.IsWallCell(nx, ny) && !crushStep) { break; }
                 int oldX = o.X();
                 int oldY = o.Y();
-                this.occupancy[this.CellSlot(oldX, oldY)] = 0;
+                if (!flying) {
+                    this.occupancy[this.CellSlot(oldX, oldY)] = 0;
+                }
                 o.Advance();
                 // Each cell step re-casts the sight circle: the reference's
                 // tile-occupation change fires revealFrom per move.
@@ -6591,7 +6686,9 @@ class World {
                 if (o.UnitType().TurretVxl() != null && o.TargetIndex() < 0) {
                     o.SetTurretFacing(stepFacing);
                 }
-                this.occupancy[this.CellSlot(o.X(), o.Y())] = i + 1;
+                if (!flying) {
+                    this.occupancy[this.CellSlot(o.X(), o.Y())] = i + 1;
+                }
                 // The hull is in the new cell: the crush pass runs before
                 // the crate hook, the reference's onTileChange order.
                 this.CrushOnCell(o, o.X(), o.Y());
@@ -6767,9 +6864,27 @@ class World {
     /// warhead hurts the target's armour more than the primary's (a tesla
     /// trooper's assault bolt against buildings, Tanya's sapper charge),
     /// otherwise the primary.</summary>
+    /// <summary>Whether the archetype carries any gun that can reach the
+    /// sky -- the acquisition gate for scans, before any target exists to
+    /// pick a weapon against.</summary>
+    bool CanHitAir(UnitType u) {
+        if (u == null) { return false; }
+        return (u.Primary() != null && u.Primary().AntiAir())
+            || (u.Secondary() != null && u.Secondary().AntiAir());
+    }
+
     Weapon PickWeapon(UnitType u, WorldObject t) {
         Weapon p = u.Primary();
         Weapon s = u.Secondary();
+        // A flying mark can only be engaged by the AA gun, so the gate runs
+        // before the single-gun early returns: a rifleman (no secondary)
+        // aiming at a zeppelin would otherwise pick his rifle and dump
+        // shots into the sky.
+        if (t.IsFlying()) {
+            if (p != null && p.AntiAir()) { return p; }
+            if (s != null && s.AntiAir()) { return s; }
+            return null;
+        }
         if (p == null) { return s; }
         if (s == null) { return p; }
         int armor = this.ArmorOf(t);
@@ -6897,7 +7012,8 @@ class World {
     void SuppressTrooper(WorldObject o) {
         if (o.IsDead() || o.Kind() != ObjKind.Unit()
          || o.UnitType() == null || o.UnitType().ShpName().Length == 0
-         || !o.UnitType().HasProne() || o.Deployed() || o.Frozen() > 0) {
+         || !o.UnitType().HasProne() || o.Deployed() || o.Frozen() > 0
+         || o.IsFlying()) {
             return;
         }
         if (!o.HasRoute() || o.SuppTicks() > 0) {
@@ -6924,6 +7040,9 @@ class World {
             WorldObject o = this.objects[i];
             if (o == t || o.IsDead() || o.Side() == side
              || o.Side() == Side2.Neutral()) { continue; }
+            // A ground burst's shrapnel stays under the flight line: only
+            // the direct hit (the `t` above) can be an aircraft.
+            if (o.IsFlying()) { continue; }
             int vx = o.X() - cx;
             int vy = o.Y() - cy;
             if (vx < 0) { vx = 0 - vx; }
@@ -7162,11 +7281,18 @@ class World {
     /// visited marks are a flat byte array sized to the map.</summary>
     bool FindPath(int sx, int sy, int tx, int ty, List<int> px, List<int> py,
                   bool amphibious) {
+        return this.FindPathF(sx, sy, tx, ty, px, py, amphibious, false);
+    }
+
+    /// <summary>The flying-aware form: a flyer's sweep ignores terrain and
+    /// structures alike, so it plots a straight cardinal walk to the goal.</summary>
+    bool FindPathF(int sx, int sy, int tx, int ty, List<int> px, List<int> py,
+                   bool amphibious, bool flying) {
         List<int> gx = new List<int>();
         List<int> gy = new List<int>();
         gx.Add(tx);
         gy.Add(ty);
-        return this.FindPathMulti(sx, sy, gx, gy, px, py, amphibious);
+        return this.FindPathMultiF(sx, sy, gx, gy, px, py, amphibious, flying);
     }
 
     /// <summary>True when a ground unit can walk from (sx,sy) to (tx,ty).
@@ -7184,9 +7310,15 @@ class World {
     /// structures, which a single-goal search would never reach.</summary>
     bool FindPathTo(int sx, int sy, WorldObject target, List<int> px, List<int> py,
                     bool amphibious) {
+        return this.FindPathToF(sx, sy, target, px, py, amphibious, false);
+    }
+
+    /// <summary>The flying-aware form of the target path.</summary>
+    bool FindPathToF(int sx, int sy, WorldObject target, List<int> px,
+                     List<int> py, bool amphibious, bool flying) {
         List<int> gx = new List<int>();
         List<int> gy = new List<int>();
-        if (target.Kind() == ObjKind.Structure()) {
+        if (target.Kind() == ObjKind.Structure() && !flying) {
             StructureType t = this.TypeOf(target);
             for (int dy = 0; dy < t.FootprintH(); dy = dy + 1) {
                 for (int dx = 0; dx < t.FootprintW(); dx = dx + 1) {
@@ -7198,7 +7330,7 @@ class World {
             gx.Add(target.X());
             gy.Add(target.Y());
         }
-        return this.FindPathMulti(sx, sy, gx, gy, px, py, amphibious);
+        return this.FindPathMultiF(sx, sy, gx, gy, px, py, amphibious, flying);
     }
 
     /// <summary>Breadth-first search from (sx,sy) to the nearest of several
@@ -7209,6 +7341,15 @@ class World {
     /// represent.</summary>
     bool FindPathMulti(int sx, int sy, List<int> gx, List<int> gy,
                        List<int> px, List<int> py, bool amphibious) {
+        return this.FindPathMultiF(sx, sy, gx, gy, px, py, amphibious, false);
+    }
+
+    /// <summary>The flying-aware core: with `flying` set the expansion uses
+    /// PassableForRouteF, so terrain, walls and structures never bend the
+    /// route.</summary>
+    bool FindPathMultiF(int sx, int sy, List<int> gx, List<int> gy,
+                        List<int> px, List<int> py, bool amphibious,
+                        bool flying) {
         int cells = this.width * this.height;
         // Reused breadth-first scratch. Allocating a fresh visited map and
         // three queues per call -- and priming prev with one Add per cell --
@@ -7258,6 +7399,16 @@ class World {
         // Open field charges do not need a flood: the monotone walk below
         // settles most of them in a straight stroke, so the queue only runs
         // when terrain or a crowd actually forces a detour.
+        // A flyer's route is the straight monotone walk every time -- the
+        // sky holds no detours -- so the flood below never runs for one.
+        if (flying && gx.Count == 1) {
+            if (this.MonotoneRouteF(sx, sy, gx[0], gy[0], true, px, py,
+                                    amphibious, true)) {
+                return true;
+            }
+            return this.MonotoneRouteF(sx, sy, gx[0], gy[0], false, px, py,
+                                       amphibious, true);
+        }
         if (gx.Count == 1
          && this.MonotoneRoute(sx, sy, gx[0], gy[0], true, px, py,
                                amphibious)) {
@@ -7451,6 +7602,15 @@ class World {
     /// a route blocked anywhere falls through to the search unchanged.</summary>
     bool MonotoneRoute(int sx, int sy, int tx, int ty, bool xFirst,
                        List<int> px, List<int> py, bool amphibious) {
+        return this.MonotoneRouteF(sx, sy, tx, ty, xFirst, px, py,
+                                   amphibious, false);
+    }
+
+    /// <summary>The flying-aware form: the sky has no step gates, so the
+    /// straight monotone walk always succeeds.</summary>
+    bool MonotoneRouteF(int sx, int sy, int tx, int ty, bool xFirst,
+                        List<int> px, List<int> py, bool amphibious,
+                        bool flying) {
         int cx = sx;
         int cy = sy;
         px.Clear();
@@ -7464,7 +7624,9 @@ class World {
             } else {
                 ny = ny + (ty > cy ? 1 : 0 - 1);
             }
-            if (!this.CanStep(cx, cy, nx, ny, amphibious)) { return false; }
+            if (!flying && !this.CanStep(cx, cy, nx, ny, amphibious)) {
+                return false;
+            }
             px.Add(nx);
             py.Add(ny);
             cx = nx;

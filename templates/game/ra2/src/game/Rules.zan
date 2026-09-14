@@ -141,6 +141,12 @@ class Weapon {
     // Report=: the sound.ini names the shot calls, comma-listed; the fire
     // event picks one at random (the reference's WeaponRules.report).
     List<string> report;
+    // Anti-air: this gun can engage a flying target. The reference keys it
+    // off the warhead's Air=yes; here it rides the weapon, because this
+    // engine shares one warhead across ground and AA guns (the flak family,
+    // the gatling pair) and the granularity that matters to targeting is
+    // the gun a unit picks per shot.
+    bool antiAir;
 
     static Weapon Create(string name, int damage, int rof, int range,
                          Warhead warhead) {
@@ -153,6 +159,7 @@ class Weapon {
         w.speed = 100;
         w.laserDuration = 15;
         w.report = new List<string>();
+        w.antiAir = false;
         return w;
     }
 
@@ -175,6 +182,8 @@ class Weapon {
     int ReportCount() { return this.report == null ? 0 : this.report.Count; }
     string ReportAt(int i) { return this.report[i]; }
     void SetReport(List<string> names) { this.report = names; }
+    bool AntiAir() { return this.antiAir; }
+    void SetAntiAir(bool on) { this.antiAir = on; }
     void SetBeamFlags(bool laser, bool bolt, bool rad) {
         this.isLaser = laser;
         this.isElectricBolt = bolt;
@@ -370,6 +379,11 @@ class UnitDef {
     // for any other vehicle. Only Track/Hover hulls roll over crushable
     // things, so the default matters to the crush gate.
     int speedType;
+    // The shipped rules' Jumpjet/Disguised locomotor flag boiled down to
+    // "flies": the unit crosses water, cliffs and walls, does not occupy a
+    // tile, and can only be engaged by AntiAir guns. The Rocketeer and the
+    // Kirov carry it; everything ground-bound keeps it false.
+    bool flying;
 
     static UnitDef Create(string reg, string label, int cost, int hp,
                           int speed, int armor, Weapon primary,
@@ -411,6 +425,7 @@ class UnitDef {
         d.weight = 1;
         d.infantry = false;
         d.speedType = SpeedType.Wheel();
+        d.flying = false;
         return d;
     }
 
@@ -483,6 +498,8 @@ class UnitDef {
     void SetInfantry(bool on) { this.infantry = on; }
     int SpeedTypeValue() { return this.speedType; }
     void SetSpeedType(int st) { this.speedType = st; }
+    bool Flying() { return this.flying; }
+    void SetFlying(bool on) { this.flying = on; }
 
     /// <summary>States the crush facts directly, for the built-in ruleset
     /// (which carries the shipped values with no install to read them
@@ -1880,6 +1897,13 @@ class Rules {
     }
 
     Weapon WeaponNamed(string name) {
+        // The shared catalog stores the shipped spellings ("105mm",
+        // "FlakGuyGun"), so the exact form resolves first; the uppercase
+        // pass stays for callers that shout (and for the ini fallback,
+        // which keys sections by the uppercased name).
+        for (int i = 0; i < this.weapons.Count; i = i + 1) {
+            if (this.weapons[i].Name() == name) { return this.weapons[i]; }
+        }
         string key = name.ToUpper();
         for (int i = 0; i < this.weapons.Count; i = i + 1) {
             if (this.weapons[i].Name() == key) { return this.weapons[i]; }
@@ -2336,6 +2360,18 @@ class Rules {
             "100,100,100,75,50,50,200,200,200,100,100"));
         r.warheads.Add(Warhead.Create("FlakTWH",
             "150,125,100,60,10,10,30,20,10,100,100"));
+        // The air war's warheads. MedusaWH is the Rocketeer's rocket: an
+        // HE-flavoured round the shipped install carries no section for, so
+        // the verses transcribe its retail shape (strong versus the light
+        // skins aircraft and infantry wear, weak against concrete). BombWH
+        // is the Kirov's free-fall bomb -- a fat HE charge with a one-cell
+        // burst radius.
+        r.warheads.Add(Warhead.Create("MedusaWH",
+            "150,110,90,60,25,25,40,20,10,100,100"));
+        Warhead blimp = Warhead.Create("BombWH",
+            "100,90,80,70,35,35,75,40,20,80,100");
+        blimp.SetSpread(1);
+        r.warheads.Add(blimp);
         // Yuri's Revenge warheads, the shipped [Verses] tables. GattWH is
         // the gattling family's anti-armour-weak rounds; Virus nearly
         // ignores everything but infantry; LocomotorBeam is the
@@ -2467,6 +2503,44 @@ class Rules {
         r.weapons.Add(Weapon.Create("MindControlTower", 3, 100, 7,
             r.WarheadNamed("Controller")));
 
+        // -- the air war's guns ------------------------------------------------
+        // The Rocketeer's Medusa and the Kirov's bomb: the trimmed install
+        // carries neither section, so the numbers transcribe the retail
+        // shape (Medusa a light fast rocket, the bomb a heavy slow drop).
+        // The AA guns already in the table -- the flak family, the
+        // gatling pair, the IFV's and Apocalypse's missiles -- are marked
+        // AntiAir below: these are the only guns that can engage a flyer.
+        Weapon medusa = Weapon.Create("Medusa", 40, 50, 8,
+            r.WarheadNamed("MedusaWH"));
+        medusa.SetAntiAir(true);
+        r.weapons.Add(medusa);
+        r.weapons.Add(Weapon.Create("BlimpBomb", 250, 60, 6,
+            r.WarheadNamed("BombWH")));
+        // The AA round itself: a guided missile (ROT steers it onto the
+        // live mark). It has to steer -- a flyer never sits in the tile
+        // occupancy, so an unguided round's ground burst could never find
+        // its mark. The same guidance serves the ground shots of these
+        // guns, which is close to the retail feel (the Tusk and IFV
+        // missiles homed; the flak family's burst reads as proximity).
+        ProjectileType aaMissile = ProjectileType.Create("AAMISSILE");
+        aaMissile.SetRot(8);
+        r.projectiles.Add(aaMissile);
+        List<string> aaGuns = new List<string>();
+        aaGuns.Add("FlakGuyGun");     // 防空步兵
+        aaGuns.Add("FlakWeapon");     // 高射炮
+        aaGuns.Add("FlakTrackGun");   // 防空履带车
+        aaGuns.Add("AAGattling");     // 盖特系列
+        aaGuns.Add("MammothTusk");    // 天启对空导弹
+        aaGuns.Add("MissileLauncher"); // 甲弹斗车
+        aaGuns.Add("Medusa");         // 火箭飞行兵
+        for (int i = 0; i < aaGuns.Count; i = i + 1) {
+            Weapon aa = r.WeaponNamed(aaGuns[i]);
+            if (aa != null) {
+                aa.SetAntiAir(true);
+                aa.SetProj(aaMissile);
+            }
+        }
+
         // -- the roster -------------------------------------------------------
         // Order matters: each side's menu ids come from filtering this list,
         // so both sides open on their rifleman (E1/E2) before the shared dog
@@ -2523,6 +2597,20 @@ class Rules {
         tanya.SetMindImmune(true);
         tanya.AddPrereq("TECH");
         r.units.Add(tanya);
+        // The Rocketeer, the Allied jetpack trooper: flies over anything,
+        // only AntiAir guns can touch him, and the Airforce Command
+        // Headquarters is both his producer and his prereq (the shipped
+        // GAAIRC entry). Cost/hp/sight transcribe the retail [ROCKET];
+        // this trimmed install ships no ROCKET.SHP, so the sprite
+        // borrows the Guardian GI's (GGI.SHP) -- one line swaps the real
+        // art back when a fuller install is dropped into data/.
+        UnitDef rocket = UnitDef.Create("ROCKET", "火箭飞行兵", 600, 120, 8,
+            ArmorClass.Light(), r.WeaponNamed("Medusa"), "GAAIRC", 1,
+            "GGI.SHP");
+        rocket.SetFlying(true);
+        rocket.SetSight(6);
+        rocket.AddPrereq("GAAIRC");
+        r.units.Add(rocket);
         // The Grizzly, the allied main battle tank: a 105mm AP gun behind
         // heavy armour, turned out by the war factory. Art is the voxel
         // model the install names under its Image key, GTNK.
@@ -2644,6 +2732,19 @@ class Rules {
         apoc.SetSecondary(r.WeaponNamed("MammothTusk"));
         apoc.AddPrereq("TECH");
         r.units.Add(apoc);
+        // The Kirov: the Soviet flying leviathan, a slow uncatchable bomb
+        // platform that only AntiAir guns can argue with. Producer is the
+        // war factory behind the Battle Lab (the shipped prerequisite).
+        // The install carries no KIROV.VXL, so the hull borrows the ORCA
+        // voxel -- one line swaps the real model back on a fuller install.
+        UnitDef kirov = UnitDef.Create("KIROV", "基洛夫飞艇", 2000, 1000, 6,
+            ArmorClass.Heavy(), r.WeaponNamed("BlimpBomb"), "NAWEAP", 2,
+            "ORCA.VXL");
+        kirov.SetFlying(true);
+        kirov.SetSight(6);
+        kirov.SetMindImmune(true);
+        kirov.AddPrereq("TECH");
+        r.units.Add(kirov);
         // The War Miner, the Soviet harvester: the shipped [HARV] stats,
         // including the nose gun that makes mining under fire survivable.
         // The harvester role drives the mine-and-unload loop in World.
