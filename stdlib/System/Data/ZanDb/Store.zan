@@ -68,6 +68,11 @@ class ScanRow {
 /// </summary>
 delegate bool KernelVisit(nint basePtr, int keyOff, int keyLen, int valOff, int valLen);
 
+/// <summary>覆盖索引内核回调：索引条目键以（缓冲裸指针 + 偏移 +
+/// 长度）零拷贝交付，id 段固定在键尾 6 字节；缓冲跨跨度复用、
+/// 回调期间有效。返回 false 早停。</summary>
+delegate bool KernelKeyVisit(nint basePtr, int keyOff, int keyLen);
+
 /// 段句柄：段文件与其全局段号的配对。
 class SegRef {
     SegmentFile seg;
@@ -111,6 +116,9 @@ class ZanStore {
     static long DEFAULT_FLUSH_THRESHOLD = 67108864;
     /// 默认块缓存上限（字节）。
     static long DEFAULT_CACHE_CAP = 33554432;
+    /// 块级内核的读跨度（字节）：一次 ReadAt 摊掉这么多的逐块
+    /// 系统调用——扫描/聚合路径的 IO 下限由它决定。
+    static int KERNEL_SPAN_BYTES = 262144;
 
     LogFile log;
     Dictionary<string, string> memtable;
@@ -986,29 +994,41 @@ class ZanStore {
     }
 
     /// <summary>
-    /// 块级聚合内核（单段快速路径）：块缓冲读入后循环裸解析
-    /// 记录，把（基址+偏移+长度）直接交给 visit——不经 SegCursor
-    /// /ScanRow 对象、不经每行 delegate 之外的任何抽象；op=2 的
-    /// 段内墓碑由这里跳过（op=2 记录无值）。墓碑集非空时逐键
-    /// memcmp 比对（未固化删除极少，比对成本可忽略）；visit 返
-    /// 回 false 早停。返回 visit 接受的行数。
+    /// 块级聚合内核（单段快速路径）：把块跨度一次读入（每
+    /// <see cref="KERNEL_SPAN_BYTES"/> 一次系统调用，块在段文件里物理
+    /// 连续、记录解析不依赖块边界）后循环裸解析记录，把（基址+偏移+
+    /// 长度）直接交给 visit——不经 SegCursor/ScanRow 对象、不经每行
+    /// delegate 之外的任何抽象；op=2 的段内墓碑由这里跳过（op=2 记
+    /// 录无值）。墓碑集非空时逐键 memcmp 比对（未固化删除极少，比
+    /// 对成本可忽略）；visit 返回 false 早停。返回 visit 接受的行数。
     ///
     /// 常态扫描（固化+归并后单段、memtable 空）的聚合与计数走
-    /// 这里——每行成本 = varint 解码 + 一次回调，无对象分配。
+    /// 这里——每行成本 = varint 解码 + 一次回调，无对象分配；每
+    /// 跨度成本 = 一次 ReadAt + 逐块 CRC（同会话首遍）。
     /// </summary>
     int ScanKernel(SegmentFile seg, string startKey, string endKey, KernelVisit visit) {
         int blockIdx = seg.BlockFor(startKey);
+        int blockTotal = seg.BlockCount();
         int accepted = 0;
         bool bounded = endKey.Length > 0;
         bool hasTombs = this.tombstones.Count > 0;
         ByteBuffer buf = null;
-        while (blockIdx < seg.BlockCount()) {
-            ByteBuffer nb = seg.LoadBlockReuse(blockIdx, buf);
+        bool stop = false;
+        while (blockIdx < blockTotal && !stop) {
+            // 跨度终点：够 KERNEL_SPAN_BYTES 或到段尾。单块超长时
+            // 至少覆盖该块。
+            int endBlock = blockIdx + 1;
+            long spanLen = seg.BlockLen(blockIdx);
+            while (endBlock < blockTotal
+                    && spanLen + seg.BlockLen(endBlock) <= ZanStore.KERNEL_SPAN_BYTES) {
+                spanLen = spanLen + seg.BlockLen(endBlock);
+                endBlock = endBlock + 1;
+            }
+            ByteBuffer nb = seg.LoadBlockSpan(blockIdx, endBlock, buf);
             if (nb == null) { break; }
             buf = nb;
             int pos = 0;
             int len = buf.Length();
-            bool stop = false;
             while (pos < len) {
                 int op = buf.PeekU8(pos);
                 if (op != 1 && op != 2) { break; }
@@ -1017,6 +1037,15 @@ class ZanStore {
                 if (klen < 0 || p + (int)klen > len) { break; }
                 int keyOff = p;
                 p = p + (int)klen;
+                // 下界：定位块里可能有 < startKey 的前缀键（稀疏索
+                // 引只保证块首 <= startKey），跳过。
+                if (buf.CmpRangeRaw(keyOff, (int)klen, startKey) < 0) {
+                    if (op == 2) { pos = p; continue; }
+                    long skip = buf.ReadVarIntAt(p, out p);
+                    if (skip < 0 || p + (int)skip > len) { break; }
+                    pos = p + (int)skip;
+                    continue;
+                }
                 if (op == 2) {
                     // 段内墓碑：无值。单段快速路径下它就是该键的
                     // 最新版本，直接跳过（键已被固化时索引摘除）。
@@ -1043,8 +1072,7 @@ class ZanStore {
                 }
                 pos = p;
             }
-            if (stop) { break; }
-            blockIdx = blockIdx + 1;
+            blockIdx = endBlock;
         }
         if (buf != null) { buf.Free(); }
         return accepted;
@@ -1083,6 +1111,89 @@ class ZanStore {
             return limit <= 0 || output.Count - before < limit;
         });
         return output.Count - before;
+    }
+
+    /// <summary><see cref="ScanKernel"/> 的键只读形式：不解析值、
+    /// 只把（基址+键偏移+键长）交给 visit，供覆盖索引路径
+    /// （索引条目键自带 id/值段，零文档读也零字符串物化）使用。
+    /// 单段稳态前提与 <see cref="TryScanKernel"/> 相同，否则返回 -1。
+    /// 返回 visit 接受的键数。</summary>
+    int TryScanKeyKernel(string startKey, string endKey, KernelKeyVisit visit) {
+        List<string> src = this.memtable.Keys;
+        if (this.segs.Count != 1 || src.Count != 0) { return -1; }
+        return ScanKeyKernel(this.segs[0].seg, startKey, endKey, visit);
+    }
+
+    /// <summary><see cref="ScanKernel"/> 的键只读内档：与行版同
+    /// 跨度整读与上界/墓碑逻辑，只是不读值、交付键区间。</summary>
+    int ScanKeyKernel(SegmentFile seg, string startKey, string endKey, KernelKeyVisit visit) {
+        int blockIdx = seg.BlockFor(startKey);
+        int blockTotal = seg.BlockCount();
+        int accepted = 0;
+        bool bounded = endKey.Length > 0;
+        bool hasTombs = this.tombstones.Count > 0;
+        ByteBuffer buf = null;
+        bool stop = false;
+        while (blockIdx < blockTotal && !stop) {
+            int endBlock = blockIdx + 1;
+            long spanLen = seg.BlockLen(blockIdx);
+            while (endBlock < blockTotal
+                    && spanLen + seg.BlockLen(endBlock) <= ZanStore.KERNEL_SPAN_BYTES) {
+                spanLen = spanLen + seg.BlockLen(endBlock);
+                endBlock = endBlock + 1;
+            }
+            ByteBuffer nb = seg.LoadBlockSpan(blockIdx, endBlock, buf);
+            if (nb == null) { break; }
+            buf = nb;
+            int pos = 0;
+            int len = buf.Length();
+            while (pos < len) {
+                int op = buf.PeekU8(pos);
+                if (op != 1 && op != 2) { break; }
+                int p = pos + 1;
+                long klen = buf.ReadVarIntAt(p, out p);
+                if (klen < 0 || p + (int)klen > len) { break; }
+                int keyOff = p;
+                p = p + (int)klen;
+                // 下界：定位块里可能有 < startKey 的前缀键（稀疏索
+                // 引只保证块首 <= startKey），跳过。
+                if (buf.CmpRangeRaw(keyOff, (int)klen, startKey) < 0) {
+                    if (op == 2) { pos = p; continue; }
+                    long skip = buf.ReadVarIntAt(p, out p);
+                    if (skip < 0 || p + (int)skip > len) { break; }
+                    pos = p + (int)skip;
+                    continue;
+                }
+                if (op == 2) {
+                    if (bounded && buf.CmpRangeRaw(keyOff, (int)klen, endKey) > 0) {
+                        stop = true;
+                        break;
+                    }
+                    pos = p;
+                    continue;
+                }
+                long vlen = buf.ReadVarIntAt(p, out p);
+                if (vlen < 0 || p + (int)vlen > len) { break; }
+                p = p + (int)vlen;
+                if (bounded && buf.CmpRangeRaw(keyOff, (int)klen, endKey) > 0) {
+                    stop = true;
+                    break;
+                }
+                if (hasTombs && this.tombstones.ContainsKey(buf.Str(keyOff, (int)klen))) {
+                    pos = p;
+                    continue;
+                }
+                accepted = accepted + 1;
+                if (!visit(buf.Raw(), keyOff, (int)klen)) {
+                    stop = true;
+                    break;
+                }
+                pos = p;
+            }
+            blockIdx = endBlock;
+        }
+        if (buf != null) { buf.Free(); }
+        return accepted;
     }
 
     /// <summary>将缓冲与 OS 缓存全部强制落盘。</summary>

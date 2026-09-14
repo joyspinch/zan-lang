@@ -322,6 +322,61 @@ class SegmentFile {
     /// 稀疏索引覆盖的块数（0 = 空段）。
     int BlockCount() { return this.sparseOff.Count; }
 
+    /// <summary>块跨度整读：把块 [fromBlock, toBlock) 的文件区间
+    /// 一次 ReadAt 读入（块在段文件里物理连续），供块级内核跨块
+    /// 连续解析——把每块一次的系统调用摊成每跨度一次。 CRC 逐块
+    /// 校验（块边界在缓冲内偏移已知；用 NativeMemory.Crc32 直接
+    /// 对缓冲内子区间算，不复制）。未固化校验的块标记为已验。
+    /// 失败返回 null 并在 GetError 留痕；缓冲归调用方 Free。</summary>
+    ByteBuffer LoadBlockSpan(int fromBlock, int toBlock, ByteBuffer reuse) {
+        if (fromBlock < 0 || toBlock > this.sparseOff.Count || fromBlock >= toBlock) {
+            this.lastError = "segment block span out of range";
+            return null;
+        }
+        long start = this.sparseOff[fromBlock];
+        long end = this.indexStart;
+        if (toBlock < this.sparseOff.Count) { end = this.sparseOff[toBlock]; }
+        int len = (int)(end - start);
+        if (len <= 0) {
+            this.lastError = "segment block span empty";
+            return null;
+        }
+        ByteBuffer b = reuse;
+        if (b == null) { b = ByteBuffer.Alloc(len); }
+        int got = this.file.ReadAt(start, b, len);
+        if (got != len) {
+            this.lastError = "segment block span short read";
+            if (reuse == null) { b.Free(); }
+            return null;
+        }
+        for (int i = fromBlock; i < toBlock; i = i + 1) {
+            if (this.blockVerified[i] == 0) {
+                long bend = this.indexStart;
+                if (i + 1 < this.sparseOff.Count) { bend = this.sparseOff[i + 1]; }
+                int blen = (int)(bend - this.sparseOff[i]);
+                int boff = (int)(this.sparseOff[i] - start);
+                if (NativeMemory.Crc32(b.Raw() + boff, blen) != this.sparseCrc[i]) {
+                    this.lastError = "segment block corrupt";
+                    if (reuse == null) { b.Free(); }
+                    return null;
+                }
+                this.blockVerified[i] = 1;
+            }
+        }
+        b.SeekRead(0);
+        return b;
+    }
+
+    /// 块 i 的文件偏移（块跨度整读用）。
+    long BlockFileOff(int i) { return this.sparseOff[i]; }
+
+    /// 块 i 的字节长度（块跨度整读用）。
+    int BlockLen(int i) {
+        long end = this.indexStart;
+        if (i + 1 < this.sparseOff.Count) { end = this.sparseOff[i + 1]; }
+        return (int)(end - this.sparseOff[i]);
+    }
+
     /// <summary>加载块 i 并校验 CRC；失败（越界/腐坏/短读）返回 null
     /// 并在 <see cref="GetError"/> 留痕。缓冲区归调用方 Free。</summary>
     ByteBuffer LoadBlock(int i) {

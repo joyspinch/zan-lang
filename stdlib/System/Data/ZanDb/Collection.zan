@@ -810,16 +810,56 @@ class Collection {
         if (kid == 0) { return groups; }
         if (IndexReady(field)) {
             // 索引条目键 = "i:{coll}:{kid}:{value}\t{id}"；范围扫该
-            // 字段的全部条目，键中 \t 前的部分即组值。ScanPrefix
-            // 返回的是 KvEntry 键值对（值为空串），逐键切段。
+            // 字段的全部条目，键中 \t 前的部分即组值。单段稳态走
+            // 键只读内核：条目（基址+偏移+长）零拷贝交付，值段
+            // 直接 memcmp 判同组——同组连片，与上一条同组则免物化
+            // 计数，组值只在开新组时物化一次。
             string head = "i:" + this.name + ":" + Collection.PadId(kid) + ":";
             string endKey = "i:" + this.name + ":" + Collection.PadId(kid) + ";";
+            int baseLen = head.Length;
+            List<string>[] lastVal = new List<string>[1];   // 上一条目组值（单元素数组绕闭包捕获）
+            int[] lastCount = new int[1];
+            int kernelN = this.kv.TryScanKeyKernel(head, endKey,
+                delegate(nint basePtr, int keyOff, int keyLen) {
+                    int vStart = keyOff + baseLen;
+                    int vLen = 0;
+                    for (int i = vStart; i < keyOff + keyLen; i = i + 1) {
+                        if (Collection.PeekB(basePtr + i) == 9) { vLen = i - vStart; break; }
+                    }
+                    if (vLen == 0 && keyOff + keyLen == vStart) { vLen = 0; }
+                    bool same = false;
+                    if (lastVal[0] != null) {
+                        string lv = lastVal[0][0];
+                        if (lv.Length == vLen
+                                && NativeMemory.Compare(basePtr + vStart, lv, vLen) == 0) {
+                            same = true;
+                        }
+                    }
+                    if (same) {
+                        lastCount[0] = lastCount[0] + 1;
+                        return true;
+                    }
+                    // 开新组：物化组键（每组一次）。同组连片，上一
+                    // 组到此封账。
+                    if (lastVal[0] != null) {
+                        groups.Add(lastVal[0][0], lastCount[0]);
+                    }
+                    string nv = NativeMemory.GetString(basePtr, vStart, vLen);
+                    lastVal[0] = new List<string>();
+                    lastVal[0].Add(nv);
+                    lastCount[0] = 1;
+                    return true;
+                });
+            if (kernelN >= 0) {
+                if (lastVal[0] != null) { groups.Add(lastVal[0][0], lastCount[0]); }
+                return groups;
+            }
+            // 多源/未固化态：退 KvEntry 字符串路径。
             List<KvEntry> entries = new List<KvEntry>();
             this.kv.ScanRange(head, endKey, 0, entries);
             for (int i = 0; i < entries.Count; i = i + 1) {
                 string k = entries[i].key;
                 // value 段 = head 之后到 \t 之前；索引值不含 \t。
-                int baseLen = head.Length;
                 int tab = k.IndexOf("\t", baseLen);   // 键内首个 \t = 值段终点
                 string val = tab > baseLen ? k.Substring(baseLen, tab - baseLen) : "";
                 int c;
@@ -1233,6 +1273,59 @@ class Collection {
         internal long Max() { return this.max; }
     }
 
+    /// <summary><see cref="FieldEquals"/> 的裸指针版（内核回调用，
+    /// 免整串物化）：记录含 0xFF（转义态）或格式异常返回 -1（调用
+    /// 方回退权威路径）；tag 5 字符串值按长度 + memcmp 零分配比较，
+    /// 数值/布尔等非字符串类型返回 -2（走权威 AsString 语义），
+    /// 字段缺失返回 0。1 = 字段值等于 val。</summary>
+    static int FieldEqualsPtr(nint basePtr, int valOff, int valLen, int kid, string val) {
+        nint v = basePtr + valOff;
+        int b0 = Collection.PeekB(v);
+        if (b0 != 66) { return -1; }
+        if (Collection.MemChr(v, 255, valLen) != 0) { return -1; }
+        int p = valOff + 1;
+        int end = valOff + valLen;
+        long n = Collection.ReadVarIntRaw(basePtr, ref p, end);
+        if (n < 0 || n > 4096) { return -1; }
+        for (int i = 0; i < (int)n; i = i + 1) {
+            long k = Collection.ReadVarIntRaw(basePtr, ref p, end);
+            if (k < 0) { return -1; }
+            if (p >= end) { return -1; }
+            int tag = Collection.PeekB(basePtr + p);
+            p = p + 1;
+            if ((int)k == kid) {
+                if (tag == 5) {
+                    long len = Collection.ReadVarIntRaw(basePtr, ref p, end);
+                    if (len < 0 || p + (int)len > end) { return -1; }
+                    if (len != val.Length) { return 0; }
+                    if (NativeMemory.Compare(basePtr + p, val, (int)len) != 0) { return 0; }
+                    return 1;
+                }
+                // 整数（3/8/9）：val 是 AsString 归一化形态（十进制
+                // 文本），解析后直接比 varint——数值字段等值不走
+                // 权威回退（等值过滤最常见形态之一）。
+                if (tag == 3 || tag == 8 || tag == 9) {
+                    if (!Collection.IsIntStr(val)) { return -2; }
+                    long want = Collection.ParseI64(val);
+                    if (tag == 9) { return want == 0 ? 1 : 0; }
+                    long x = Collection.ReadVarIntRaw(basePtr, ref p, end);
+                    if (x < 0) { return -1; }
+                    if (tag == 8) { x = 0 - x; }
+                    return x == want ? 1 : 0;
+                }
+                // 布尔："true"/"false" 字面等值。
+                if (tag == 1 || tag == 2) {
+                    if (val == "true" && tag == 2) { return 1; }
+                    if (val == "false" && tag == 1) { return 1; }
+                    return 0;
+                }
+                return -2;   // 文本数值/空串/容器：As 归一化语义交权威
+            }
+            if (!Collection.SkipValRaw(basePtr, ref p, end)) { return -1; }
+        }
+        return 0;
+    }
+
     /// 读取裸指针处一个字节；offset 为相对位移。
     static int PeekB(nint p) {
         Span<byte> sp = new Span<byte>(p, 1);
@@ -1343,9 +1436,62 @@ class Collection {
         }
         int kid = KeyIdOf(field);
         if (kid == 0) { return ids; }
-        bool fastReject = EqFastReject(val);
+        string lo = "c:" + this.name + ":";
         string hi = "c:" + this.name + ";";
-        this.kv.ScanRows("c:" + this.name + ":", hi, delegate(ScanRow row) {
+        bool fastReject = EqFastReject(val);
+        // 内核路径：单段稳态下裸走读等值判定，字符串值零分配
+        // memcmp；针线否证先挡掉大多数不匹配行。命中行才物化键。
+        int[] fallbackId = new int[1];
+        fallbackId[0] = -1;
+        bool[] walk = new bool[1];
+        int[] needleState = new int[1];
+        needleState[0] = fastReject ? 1 : 0;   // 1 = 需要先试针线否证
+        int kernelN = this.kv.TryScanKernel(lo, hi,
+            delegate(nint basePtr, int keyOff, int keyLen, int valOff, int valLen) {
+                int id = Collection.IdOfPtr(basePtr + keyOff, keyLen);
+                if (id <= fallbackId[0]) { return true; }
+                if (needleState[0] == 1) {
+                    // EqFastReject 前提下：needle 原字节不在值区即否决。
+                    nint vp = basePtr + valOff;
+                    if (valLen < val.Length) { return true; }
+                    nint hit = MemChr(vp, val[0] & 255, valLen);
+                    bool present = false;
+                    while (hit != 0) {
+                        long off = (long)(hit - vp);
+                        if (off + val.Length <= valLen
+                                && NativeMemory.Compare(hit, val, val.Length) == 0) {
+                            present = true;
+                            break;
+                        }
+                        hit = MemChr(hit + 1, val[0] & 255, (int)(valLen - off - 1));
+                    }
+                    if (!present) { return true; }
+                }
+                int r = Collection.FieldEqualsPtr(basePtr, valOff, valLen, kid, val);
+                if (r >= 0) {
+                    if (r == 1) { ids.Add(id); }
+                    return true;
+                }
+                // -1 转义/格式异常 或 -2 非字符串类型：该行起回退
+                // 权威走读（含当行）。
+                walk[0] = true;
+                fallbackId[0] = id;
+                return false;
+            });
+        if (kernelN >= 0 && !walk[0]) { return ids; }
+        if (kernelN >= 0 && fallbackId[0] >= 0) {
+            // 内核已收集 fallbackId 之前（不含）的命中；剩余行走
+            // 权威路径。
+            string fromKey = DocKey(fallbackId[0]);
+            this.kv.ScanRows(fromKey, hi, delegate(ScanRow row) {
+                if (FieldEqualsRow(row, kid, val, fastReject)) {
+                    ids.Add(Collection.IdOfKey(row.Key()));
+                }
+                return true;
+            });
+            return ids;
+        }
+        this.kv.ScanRows(lo, hi, delegate(ScanRow row) {
             if (FieldEqualsRow(row, kid, val, fastReject)) {
                 ids.Add(Collection.IdOfKey(row.Key()));
             }
