@@ -2186,6 +2186,32 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     LLVMBasicBlockRef re_bb = LLVMAppendBasicBlockInContext(g->ctx, fn,
                         re[ri].nm);
                     LLVMPositionBuilderAtEnd(g->builder, re_bb);
+                    /* A300: this edge is a longjmp landing -- control re-enters
+                     * the function from OUTSIDE the CFG, so every SSA value
+                     * dominating here is unknown to the optimizer and -O2
+                     * SROA materializes the catch phi's incoming values on
+                     * this edge as null/undef (observed: `this` = null in the
+                     * catch body, then releases of garbage). The stack allocas
+                     * PHYSICALLY hold the live values: a plain-frame throw in
+                     * this invocation longjmps with them intact, and a child
+                     * coroutine's exception re-enters through the resumed
+                     * step's await point, which reloads every slot. Copy them
+                     * through volatile accesses so SROA must read memory on
+                     * this edge instead of folding to undef. This covers ALL
+                     * slot types: an int slot (e.g. a loop counter live across
+                     * the await) gets the same undef phi incoming, which made
+                     * the enclosing loop condition UB (observed: the loop ran
+                     * unbounded). The copy is refcount-neutral for ARC slots. */
+                    {
+                        for (int si = 0; si < g->current_async_slot_count; si++) {
+                            LLVMTypeRef sty = g->current_async_slots[si].llvm;
+                            LLVMValueRef sa = g->current_async_slots[si].slot_alloca;
+                            LLVMValueRef v = LLVMBuildLoad2(g->builder, sty, sa,
+                                "eh.rarm.v");
+                            LLVMSetVolatile(v, true);
+                            LLVMBuildStore(g->builder, v, sa);
+                        }
+                    }
                     LLVMValueRef rtop = LLVMBuildLoad2(g->builder, i32t, top_g, "eh.rtop");
                     zan_store_fit(g, zan_sub(g->builder, rtop,
                         LLVMConstInt(i32t, 1, 0), "eh.rtop0"), old_top_slot);

@@ -923,6 +923,37 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
 - 插桩小坑：往 C 源里加 `\n` 的 fprintf 时，工具传输会把 `\\n` 折成真换行直接
   咬断字符串字面量（本轮踩中，编译错误 expected expression 才发现）；写完先看 repr。
 
+## longjmp 落地沿的 SSA 不可信：-O2 会把 catch/展开路径的槽读折叠成 undef（A300②③，2026-09-15 已修）
+
+- **机制**：setjmp/longjmp EH 的落地块（async `$resume` 的 `co.exc`/`eh.land`、
+  try 的 `try.rearm`/`try.rearm.init`）不是 CFG 边——控制从**函数外**重新进入。
+  LLVM 的前端假设不变式「支配 landing 的值都有定义」在这里不成立，-O2 的 SROA
+  有权把 catch phi 在该边上的 incoming 折成 `ptr undef`/null。实测三种症状：
+  ① co.exc 清理释放未初始化的帧槽 → 释放垃圾 → 堆损坏、后续 malloc 段错误；
+  ② rearm 落地后 catch 里 `this`=null（HttpClient.zan:1091 软错）+ 释放垃圾；
+  ③ 非指针槽（循环计数）同样 undef → 所在循环失控打转。
+- **修（两处）**：`irgen_emit.c` resume 入口对所有指针形槽 alloca（this/参数/
+  alocal，无论 arc 归属）补 null-init——入口静态支配 landing（longjmp 不构成
+  CFG 边，优化器无法据此判定 landing 不可达），槽从此在 landing 处有定义；
+  `irgen_stmt.c` try.rearm/rearm.init 块对**全部** async 槽做 volatile load+store
+  自拷贝——栈 alloca 物理上持有活值（同调用 throw 带 post-await 值落进来、
+  子协程异常经 await 点 reload 过），volatile 迫使 SROA 从内存读而不是折叠。
+  **别用 `emit_async_reload_slots`（从堆帧 reload）**：A293 契约是同调用 throw
+  落地时栈槽比帧新（after-await），reload 会把帧里的旧值盖回来
+  （async_throw_across_frames 当场变红）。
+- **判定手法（可复用）**：publish 崩溃 + `--arc-guard` 复建**无 guard 报告**=
+  释放的是纯垃圾指针（未定义槽值），不是已释放 Zan 对象（over-release 会触发
+  guard）；`--emit-ir`（dump 的是**优化后** IR）grep catch phi 的 undef
+  incoming 直接实锤。注意 `--emit-ir` 跳过链接：经 build_ide 间接调 zanc 时
+  后续步骤对缺 exe 报错，要单跑截 stdout。
+- **符号化死路提示**：publish exe 是 strip 过的，llvm-nm/llvm-symbolizer 全空；
+  cdb 可用但无符号只给 module+offset。破法：`.pdata`（RUNTIME_FUNCTION 数组，
+  python struct 裸解析）把 fault RVA 定到函数边界，再把函数头 24 字节去
+  -O2+符号的诊断 exe 的 .text 里字节匹配换名字（prologue 相同会误配，须全 24
+  字节 + 帧尺寸一致性双重确认）。注意 crash 日志 backtrace 的 #00/#01 帧常是
+  `zan__crash_write_record`/`zan__crash_veh`（handler 自己），只有 #05+ 才是
+  真实调用者。同族残留（plain 帧展开槽 garbage，IDE publish 启动期）挂账 A318。
+
 ## leakcheck「仍可达」与停服排水（A302，未修）
 
 - Zan 的 leakcheck 对**仍可达**对象也报红（不区分丢失/仍被持有）。服务端对象

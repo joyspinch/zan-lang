@@ -764,6 +764,11 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         LLVMValueRef res_this = NULL;
         if (!is_static) {
             res_this = LLVMBuildAlloca(g->builder, param_types[0], "this");
+            /* defined from entry, same reason as the param allocas (A300):
+             * co.exc's cleanup releases `this` from this alloca and the load
+             * must not be undef before the first state block reloads it */
+            if (LLVMGetTypeKind(param_types[0]) == LLVMPointerTypeKind)
+                LLVMBuildStore(g->builder, LLVMConstNull(param_types[0]), res_this);
             slots[si].slot_alloca = res_this;
             slots[si].llvm = param_types[0];
             slots[si].frame_index = ASYNC_FRAME_FIRST_PARAM;
@@ -773,6 +778,15 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
             zan_ast_node_t *param = member->method_decl.params.items[k];
             LLVMTypeRef pty = param_types[k + param_offset];
             LLVMValueRef pa = LLVMBuildAlloca(g->builder, pty, "p");
+            /* pointer-shaped param slots are defined from entry too (A300):
+             * the ramp stores the incoming args into the frame before the
+             * first suspension, so these allocas are always written on the
+             * dispatch path -- but co.exc can also fire from the EH re-arm
+             * before any state block reloads, and its cleanup releases owned
+             * params from these allocas; without a store -O2 may fold the
+             * load to undef there (same corruption chain as the alocals). */
+            if (LLVMGetTypeKind(pty) == LLVMPointerTypeKind)
+                LLVMBuildStore(g->builder, LLVMConstNull(pty), pa);
             zan_type_t *pt = resolve_type_ctx(g, param->param.type);
             local_add(locals, param->param.name, pa, pt);
             if (pt && pt->kind == TYPE_STRING)
@@ -791,20 +805,30 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         for (int k = 0; k < alocal_count; k++) {
             LLVMValueRef la = LLVMBuildAlloca(g->builder, w->alocals[k].llvm, "fl");
             local_add(locals, w->alocals[k].name, la, w->alocals[k].ztype);
-            /* A frame-resident rc local is owned for the whole coroutine
-             * (it is never dropped at inner block scope like a synchronous
-             * local). Mark it owned and null-init its slot *here*, at
-             * registration, rather than when its var-decl is emitted: a
-             * `return` lexically preceding the declaration (e.g. an early
-             * exit at the top of a loop whose body declares the local after
-             * an await) must still release the value a prior iteration
-             * stored, or it leaks. The null-init makes the release a no-op
-             * on paths where the local was never assigned. */
+            /* Every pointer-shaped frame slot is null-initialized HERE, in the
+             * entry block, regardless of arc ownership (A300): entry statically
+             * dominates the co.exc landing pad (longjmp is not a CFG edge, so
+             * the optimizer cannot assume the landing pad is unreachable from
+             * the entry), which means the slot is never undefined there. The
+             * co.exc cleanup releases every owned local from these allocas;
+             * with no init, -O2 folded the loaded release operand to `ptr
+             * undef` whose registers happened to hold system addresses --
+             * free()ing them corrupted the heap and any later malloc crashed
+             * (the publish IDE's startup crash). Owned slots additionally need
+             * the init so a `return` lexically preceding the declaration (an
+             * early exit at the top of a loop whose body declares the local
+             * after an await) still releases the value a prior iteration
+             * stored, instead of leaking it. Storage-only slots (foreach
+             * variable/index/counter, catch binding) never release from these
+             * allocas, but emit_release_owned_locals walks locals->vars and
+             * unowned ptr slots are cheap to define. */
+            if (LLVMGetTypeKind(w->alocals[k].llvm) == LLVMPointerTypeKind) {
+                LLVMBuildStore(g->builder,
+                    LLVMConstNull(w->alocals[k].llvm), la);
+            }
             if (!w->alocals[k].no_arc &&
                 is_rc_managed_type(w->alocals[k].ztype) &&
                 LLVMGetTypeKind(w->alocals[k].llvm) == LLVMPointerTypeKind) {
-                LLVMBuildStore(g->builder,
-                    LLVMConstNull(w->alocals[k].llvm), la);
                 locals->vars[locals->count - 1].arc_owned = 1;
             }
             slots[si].slot_alloca = la;

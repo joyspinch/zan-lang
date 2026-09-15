@@ -22,6 +22,7 @@
 #include <string.h>
 #include <limits.h>
 #include "../common/host_oom.h"
+#include "../common/zan_abi.h"
 
 /* Persistent crash logging. This object is linked into every program zanc
  * builds (its coroutine driver calls zan_timer_*, see src/compiler/main.c), so
@@ -187,10 +188,57 @@ int zan_rt_soft_is_hard(void) { return zan_soft_is_hard(); }
  * explicitly sets it to 0, keeping an escape hatch without a rebuild. */
 void zan_rt_set_strict(void) { g_soft_strict = 1; }
 
-/* Scratch substitute for a null base on the soft path (see rt_timer.h). */
-static unsigned char g_soft_scratch[256];
+/* Scratch substitute for a null base on the soft path (see rt_timer.h).
+ *
+ * The compiler swaps this page in for a null receiver on the soft path and
+ * then keeps executing the surrounding code (emit_soft_base_select,
+ * irgen_generics.c): field loads read zeros, but the substituted base also
+ * flows into ordinary ARC operations and method arguments. With a bare zeroed
+ * buffer the refcount slot sat at scratch-16 -- whatever .bss global the
+ * linker placed before it. A retain incremented that global; a release
+ * decremented it, and when the count reached zero zan_rt_release called
+ * free() on an address inside the image. Those writes were the heap/image
+ * corruption behind the publish IDE's startup crash (DropAlive called with
+ * this==0x1, HeapFree faulting on a mangled free list), invisible at -O0
+ * where the same sequence stayed on guarded runtime calls.
+ *
+ * So the page is a well-formed, immortal object instead: a full 32-byte ARC
+ * header in front of a zeroed payload. The header words are exactly the
+ * layout every retain/release probes (zan_abi.h):
+ *   P-32  huge rc            (array/class refcount slot -- never hits 0)
+ *   P-24  ZAN_ARRAY_RC_MAGIC (tolerant retain/release guard)
+ *   P-16  huge rc            (object/string refcount slot)
+ *   P-8   ZAN_ARRAY_MAGIC    (discriminator: string paths forward to the
+ *                             array pair, whose rc slot is also non-sentinel)
+ * Retains and releases now land inside our own header, never free (both rc
+ * slots start at 2^62, and free fires only at exactly 0), and field loads
+ * still see a zeroed object. The payload is 4096 bytes so guarded field
+ * reads on larger structs stay inside the page too. */
+#define ZAN_SOFT_SCRATCH_RC  (UINT64_C(1) << 62)
+#define ZAN_SOFT_SCRATCH_PAYLOAD 4096
+static union {
+    unsigned char bytes[40 + ZAN_SOFT_SCRATCH_PAYLOAD];
+    /* 16-align the payload: object headers assume 16-byte-aligned rc slots */
+    long double align_it;
+} g_soft_scratch_store;
+static unsigned char *g_soft_scratch;
 
-unsigned char *zan_rt_soft_scratch(void) { return g_soft_scratch; }
+static void store_u64_le(unsigned char *p, uint64_t v) {
+    for (int i = 0; i < 8; i++) { p[i] = (unsigned char)(v >> (8 * i)); }
+}
+
+unsigned char *zan_rt_soft_scratch(void) {
+    if (!g_soft_scratch) {
+        unsigned char *hdr = g_soft_scratch_store.bytes;
+        memset(hdr, 0, sizeof(g_soft_scratch_store.bytes));
+        store_u64_le(hdr + 0,  ZAN_SOFT_SCRATCH_RC);    /* P-32: array rc   */
+        store_u64_le(hdr + 8,  ZAN_ARRAY_RC_MAGIC);     /* P-24: arr guard  */
+        store_u64_le(hdr + 16, ZAN_SOFT_SCRATCH_RC);    /* P-16: object rc  */
+        store_u64_le(hdr + 24, ZAN_ARRAY_MAGIC);        /* P-8:  discriminator */
+        g_soft_scratch = hdr + 32;
+    }
+    return g_soft_scratch;
+}
 
 /* One message per site per process: the same null field hit in a loop would
  * otherwise append an entry per iteration. Pointer identity of the compiler-
