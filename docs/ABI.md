@@ -375,6 +375,33 @@ static extern void ProcessString(string text);
 // The const char* is ONLY valid during the call
 ```
 
+**Opaque strings — bounds-check contract (A52-6/A58 3.4, decided 2026-09-15).**
+A `string` returned from an extern is adopted by reference (§6.1), so a bare
+`char*` from the native side enters Zan as an "opaque string": it carries no
+managed string header, and the `str-8` tag/length word that powers O(1)
+bounds checks (§3.4) does not exist for it. Probing that word to find out
+would itself be the out-of-bounds read it is meant to prevent (the pointer
+may point at the very start of a page). The language therefore **guarantees
+no bounds checking on opaque strings** and makes the following the contract:
+
+- Managed strings (any string produced by Zan code, incl. one copied out of
+  a `byte[]`/buffer before use) always carry the header and get O(1) bounds
+  checks on indexing and `.Length`.
+- Opaque strings (extern-returned `string` adopted from a bare `char*`)
+  have **no bounds checks**: indexing past the NUL terminator is undefined
+  behavior, same as in C. A caller that needs bounds safety must copy first
+  (`byte[]`/`ToStr` round-trip), turning it into a managed string.
+- Externs that return freshly allocated C buffers are expected to hand back
+  a NUL-terminated pointer; externs returning borrowed pointers must be
+  modeled with `nint` + explicit copy instead of `string`.
+
+Decision rationale: wrapping every extern return into a managed copy (the
+rejected option ①) would put a full-buffer copy on every wire-protocol read
+step — the async DB/TLS connectors issue hundreds of thousands of extern
+reads per request — for protection that `--arc-guard`/fuzzing already
+provide at test time. Option ③ (probe and accept the unmapped-page risk)
+is unsound by construction.
+
 ### 6.4 Variadic Externs (`Variadic = true`)
 
 ```csharp

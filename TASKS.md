@@ -1616,7 +1616,13 @@ POSIX gthr，`pthread_*` 全部未定义 → `emit_lib_windows_dll` 链接失败
   `--use-gl=disabled` 并报 `Failed to create shared context for virtualization`
   —— 触发者是 DirectComposition 交换链（装了 IDD 虚拟显示适配器的机器）。
   `CefOptions.disableDirectComposition`（`ZAN_CEF_NO_DCOMP=1`）后同一场景 GPU
-  崩溃 0 次、硬件 GL 仍走真实显卡；默认是否按机器自动关 DComp 待定。
+  崩溃 0 次、硬件 GL 仍走真实显卡。2026-09-15 拍板=默认按机器自动关：
+  `System.Management.Device.HasIndirectDisplayAdapter()`（SetupAPI Display 类
+  GUID + IDD 驱动标记串）探测到向日葵/GameViewer/Parsec/usbmmidd 类虚拟显示
+  适配器时 `CefOptions.NoDcomp()` 自动追加 `--disable-direct-composition`；
+  本机（OrayIddDriver + GameViewer 两块 IDD 实装）实测探测为真、
+  `cef_browser_model` 12/12 绿。优先级：显式配置字段 > ZAN_CEF_NO_DCOMP
+  （"0"=压掉探测，非 0 非""=强制关）> IDD 探测。
   「Timeout of new browser info response」固定 2 条，与 GPU 崩溃、宿主消息泵
   （同一次运行 `[pump]` 0 条）都无关，按 CEF 侧噪声对待。
   顺带修掉一个真 bug：helper 子进程之前拿不到 `CefOptions.switches` /
