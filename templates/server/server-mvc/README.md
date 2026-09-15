@@ -510,6 +510,28 @@ round-trip is re-validated by the same sanitizer before insert. AI output is a
 draft, never trusted, never auto-saved. Requires `[站点设置 → AI]` enabled;
 the endpoint must be one of the allow-listed providers (or local Ollama).
 
+## Inline cell editing (generic, `data-quick`)
+
+Any admin list can opt its table into in-place editing without page-specific
+scripts: put `data-quick="<POST url>"` on the `<table>` and mark each editable
+control with `data-quick-field="<field>"` and `data-id`. Controls are plain
+checkboxes / text / number inputs / selects (select initial value via
+`data-value`). `admin.js` (`applyFragmentWidgets`, so panels, fragments and
+dialogs all pick it up) delegates `change` to one POST `{id, field, value}` per
+edit; a failed save reverts the control and toasts, so the UI never shows a
+state the server refused. The `.cell-edit` styles keep the table looking like a
+table until a cell is hovered/focused.
+
+What is editable is a **per-resource server allowlist** — each controller
+implements a `Quick` action whose branches whitelist exactly the fields it
+accepts and update exactly those typed columns (the column name never comes
+from the request). Reference implementations: `Coder.ColumnQuick`
+(designer columns), `Categories.Quick`, `Dicts.ItemQuick`. Keep out of the
+allowlist: id, passwords/tokens, created/updated timestamps, computed columns
+(counts), and identity codes that other data references (category `slug`, dict
+item `value`) — those stay dialog-edited so the operator sees the warning.
+Read-only accounts render plain text instead of controls (`{{#if canUpdate}}`).
+
 ## Table component (wwwroot/js/zan-table.js)
 
 

@@ -1182,6 +1182,64 @@
   }
 
 
+  // ---- inline cell editing -------------------------------------------------
+  // Any list can opt in: put data-quick="<POST url>" on the <table> and mark
+  // each editable control with data-quick-field + data-id. Controls are plain
+  // checkboxes / text / number inputs / selects (select initial value via
+  // data-value, applied above). A change POSTs {id, field, value}; a failed
+  // save reverts the control and toasts, so the UI never shows a state the
+  // server refused. What is editable is a per-resource server allowlist — the
+  // view only marks cells, which is what keeps id, passwords, timestamps,
+  // computed columns and identity codes (slug/value) uneditable.
+  function wireInlineEdit(root) {
+    var tables = root.querySelectorAll('table[data-quick]');
+    for (var qi = 0; qi < tables.length; qi++) { wireQuickTable(tables[qi]); }
+  }
+  function wireQuickTable(table) {
+    if (table._quickWired) { return; }
+    table._quickWired = true;
+    var url = table.getAttribute('data-quick');
+    // 文本/数字框失焦才发 change；回车直接失焦触发保存。
+    table.addEventListener('keydown', function (ev) {
+      var el = ev.target;
+      if (el.getAttribute && el.getAttribute('data-quick-field')
+          && ev.key === 'Enter') { el.blur(); }
+    });
+    table.addEventListener('focusin', function (ev) {
+      var el = ev.target;
+      if (el.getAttribute && el.getAttribute('data-quick-field')
+          && el.type !== 'checkbox') {
+        el.setAttribute('data-prev', el.value);
+      }
+    });
+    table.addEventListener('change', function (ev) {
+      var el = ev.target;
+      if (!el.getAttribute || !el.getAttribute('data-quick-field')
+          || !el.getAttribute('data-id')) { return; }
+      var value = el.type === 'checkbox' ? (el.checked ? '1' : '0') : el.value;
+      fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          id: el.getAttribute('data-id'),
+          field: el.getAttribute('data-quick-field'),
+          value: value
+        }).toString()
+      }).then(function (r) { return r.json(); }).then(function (j) {
+        if (j.code === '0000') { el.setAttribute('data-prev', value); return; }
+        revertQuick(el);
+        Layer.msg(j.msg || '保存失败', 'bad');
+      }).catch(function () {
+        revertQuick(el);
+        Layer.msg('网络错误，修改未保存', 'bad');
+      });
+    });
+  }
+  function revertQuick(el) {
+    if (el.type === 'checkbox') { el.checked = !el.checked; return; }
+    el.value = el.getAttribute('data-prev') || el.value;
+  }
+
   // A template cannot write `selected` on the right <option>, so a select that
   // carries its current value in data-value applies it after the fragment is
   // in the DOM. Same for the code preview's tabs, which are markup only.
@@ -1189,6 +1247,7 @@
     // 表格增强（排序/筛选/选择/密度）先跑：纯 DOM 重排，不动节点身份，
     // 后面的脚本重放与委托事件都不受影响。
     if (window.ZanTable) { ZanTable.wire(root); }
+    wireInlineEdit(root);
     var sels = root.querySelectorAll('select[data-value]');
     for (var i = 0; i < sels.length; i++) {
       var v = sels[i].getAttribute('data-value');
