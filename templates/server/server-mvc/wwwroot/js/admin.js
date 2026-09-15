@@ -331,12 +331,18 @@
     list.id = 'ai-model-options';
     input.setAttribute('list', list.id);
     input.parentNode.insertBefore(list, input.nextSibling);
+    /* 获取模型按钮不占 .form 的网格位：包一个 span 使按钮浮在模型输入框
+       右端，温度字段的 标签/输入 对才不会错位（86px 列是成对的）。 */
+    var wrap = document.createElement('span');
+    wrap.style.cssText = 'position:relative;display:block;';
+    input.parentNode.insertBefore(wrap, input);
+    wrap.appendChild(input);
     var btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'btn sm';
     btn.textContent = '获取模型';
-    btn.style.marginLeft = '8px';
-    input.parentNode.insertBefore(btn, list.nextSibling);
+    btn.style.cssText = 'position:absolute;right:6px;top:50%;transform:translateY(-50%);';
+    wrap.appendChild(btn);
     btn.addEventListener('click', function () {
       var url = root.querySelector('[name="ai.baseUrl"]');
       var key = root.querySelector('[name="ai.apiKey"]');
