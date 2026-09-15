@@ -26,8 +26,13 @@ partial class LegendApp {
     /// 一组图鉴：组名 + 属性行 + 9 枚槽（0 = 空槽照画框）。
     class TjGroup {
         string name;            // 「祈祷」
-        string attrs;           // 「【属性】防御：0-0」
+        string attrs;           // 「【属性】防御：0-0」（离线静态对照）
+        string kind;            // 服务端加成通道：def=防御，atk=攻击
         int[] items;            // 装备 id（items.csv），0 = 空槽
+        int[] defs;             // 该组定义格（静态），0 = 非定义格不接受放入
+        int gno;                // 服务端组号（0 基）
+        int coeff;              // 服务端系数（已放格数 ×10，离线 0）
+        int done;               // 服务端 complete（集齐激活，离线 0）
         string TitleText() { return "《图鉴：" + name + "》"; }
     }
 
@@ -35,32 +40,64 @@ partial class LegendApp {
     /// 套装对照：祈祷之刃/手镯/项链/戒指/头盔 = 124..127/128；
     /// 沃玛组用同期武器 9 件近似；祖玛组用同期防具首饰 9 件近似；
     /// 圣战 166..169、法神 170..173、天尊 174..177。
+    /// kind 是服务端加成通道：法神/天尊原版标签是魔法/道术，但战斗数值
+    /// 没有魔道通道，服务端把它们的套装加成落攻击——在线属性行如实标攻击。
     static List<TjGroup> tjData = null;
     static List<TjGroup> TjData() {
         if (tjData != null) { return tjData; }
         List<TjGroup> v = new List<TjGroup>();
-        v.Add(TjGroupOf("祈祷", "【属性】防御：0-0",
+        v.Add(TjGroupOf("祈祷", "def", "【属性】防御：0-0",
                         124, 125, 126, 127, 128, 0, 0, 0, 0));
-        v.Add(TjGroupOf("沃玛", "【属性】攻击：0-0 魔法：0-0 道术：0-0",
+        v.Add(TjGroupOf("沃玛", "atk", "【属性】攻击：0-0 魔法：0-0 道术：0-0",
                         45, 33, 32, 117, 119, 136, 135, 121, 122));
-        v.Add(TjGroupOf("祖玛", "【属性】攻击：0-0 魔法：0-0 道术：0-0",
+        v.Add(TjGroupOf("祖玛", "atk", "【属性】攻击：0-0 魔法：0-0 道术：0-0",
                         123, 142, 146, 145, 129, 54, 91, 172, 177));
-        v.Add(TjGroupOf("圣战", "【属性】攻击：0-0",
+        v.Add(TjGroupOf("圣战", "atk", "【属性】攻击：0-0",
                         166, 167, 168, 169, 0, 0, 0, 0, 0));
-        v.Add(TjGroupOf("法神", "【属性】魔法：0-0",
+        v.Add(TjGroupOf("法神", "atk", "【属性】魔法：0-0",
                         170, 171, 172, 173, 0, 0, 0, 0, 0));
-        v.Add(TjGroupOf("天尊", "【属性】道术：0-0",
+        v.Add(TjGroupOf("天尊", "atk", "【属性】道术：0-0",
                         174, 175, 176, 177, 0, 0, 0, 0, 0));
         tjData = v;
         return v;
     }
 
-    static TjGroup TjGroupOf(string name, string attrs, int i0, int i1, int i2, int i3,
+    static TjGroup TjGroupOf(string name, string kind, string attrs, int i0, int i1, int i2, int i3,
                              int i4, int i5, int i6, int i7, int i8) {
         TjGroup g = new TjGroup();
-        g.name = name; g.attrs = attrs;
+        g.name = name; g.kind = kind; g.attrs = attrs;
         g.items = new int[] { i0, i1, i2, i3, i4, i5, i6, i7, i8 };
+        g.defs = new int[] { i0, i1, i2, i3, i4, i5, i6, i7, i8 };
         return g;
+    }
+
+    /// 当前组列表：在线 = 服务端 tj.groups（已放格覆盖，未放格空框），
+    /// 离线 = 原版对照（整组抄录展示）。克隆行覆盖，不动静态缓存。
+    List<TjGroup> TjRows() {
+        List<TjGroup> rows = TjData();
+        if (net.Self() == null || net.PlayTj() == null) { return rows; }
+        JsonValue groups = net.PlayTj();
+        List<TjGroup> v = new List<TjGroup>();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            TjGroup src = rows[i];
+            TjGroup g = TjGroupOf(src.name, src.kind, src.attrs, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+            g.gno = i;
+            for (int k = 0; k < 9; k = k + 1) { g.items[k] = 0; }
+            if (i < groups.Count()) {
+                JsonValue m = groups.At(i);
+                JsonValue slots = m.Get("slots");
+                if (slots != null && slots.IsArray()) {
+                    for (int k = 0; k < slots.Count() && k < 9; k = k + 1) {
+                        int it = slots.At(k).Int("item", 0);
+                        if (it > 0) { g.items[k] = it; }
+                    }
+                }
+                g.coeff = m.Int("coeff", 0);
+                g.done = m.Int("complete", 0);
+            }
+            v.Add(g);
+        }
+        return v;
     }
 
     /// 右栏 7 条说明（照 `图鉴.png` 逐行抄录，`\n` 按原版断点手排；
@@ -76,6 +113,7 @@ partial class LegendApp {
     }
 
     void BuildTujianPage() {
+        if (net.Self() != null) { net.MaybeRefreshTj(); }
         Panel frame = Panel.Column(); frame.Class = "mk-frame";
         frame.Pad(0); frame.Gap(0);
         frame.Prefer(0, Spec.MkFrameH());
@@ -96,7 +134,7 @@ partial class LegendApp {
         Panel col = Panel.Column(); col.Class = "mk-fill";
         col.Pad(0); col.Gap(0);
         col.With(TblPad(Spec.TjGridTopPad()));
-        List<TjGroup> groups = TjData();
+        List<TjGroup> groups = TjRows();
         for (int i = 0; i < groups.Count; i = i + 1) {
             col.With(TjTitleRow(groups[i]));
             col.With(TblPad(Spec.TjTitleToSlots()));
@@ -104,6 +142,16 @@ partial class LegendApp {
             if (i + 1 < groups.Count) { col.With(TblPad(Spec.TjGroupPadB())); }
         }
         return col;
+    }
+
+    /// 属性行：离线 = 原版静态对照；在线 = 按服务端通道算真加成
+    /// （规则键 tj_baseN：集齐组 +base/10，与 Fight.Def/Atk 的口径一致）。
+    string TjAttrsOf(TjGroup g) {
+        if (net.Self() == null) { return g.attrs; }
+        int b = g.done == 1 ? GameTables.Value("tj_base" + Convert.ToString(g.gno + 1)) / 10 : 0;
+        string num = Convert.ToString(b) + "-" + Convert.ToString(b);
+        if (g.kind == "def") { return "【属性】防御：" + num; }
+        return "【属性】攻击：" + num;
     }
 
     /// 组标题行：《图鉴：X》（401）+ 系数：0（579）+ 【属性】…（702 起）。
@@ -119,12 +167,12 @@ partial class LegendApp {
 
         Panel c2 = Panel.Row(); c2.Class = "mk-cell-l"; c2.Pad(0);
         c2.Prefer(Spec.TjTitle2W(), Spec.TjTitleH());
-        c2.With(Text("系数：0", "tj-line", 0));
+        c2.With(Text("系数：" + Rules.N(g.coeff), "tj-line", 0));
         row.With(c2);
 
         Panel c3 = Panel.Row(); c3.Class = "mk-cell-l mk-fill"; c3.Pad(0);
         c3.Prefer(0, Spec.TjTitleH());
-        c3.With(Text(g.attrs, "tj-line", 0));
+        c3.With(Text(TjAttrsOf(g), "tj-line", 0));
         row.With(c3);
         return row;
     }
@@ -138,6 +186,7 @@ partial class LegendApp {
         row.Prefer(0, Spec.TjSlotH());
         for (int i = 0; i < g.items.Length; i = i + 1) {
             string art = g.items[i] > 0 ? ItemArtById(g.items[i]) : "";
+            int pick = i;
             Panel cell = Panel.Row(); cell.Pad(0);
             cell.Prefer(Spec.TjSlotW(), Spec.TjSlotH());
             Image bg = new Image("assets/ui/00211.png", "格底", "stretch");
@@ -146,11 +195,25 @@ partial class LegendApp {
                 Image ic = new Image(art, "装备", "none");
                 ic.DockFill(); cell.Add(ic);
             }
+            /* 在线空的定义格可点放入：服务端校验背包与格位，放入无法取出。 */
+            if (g.defs[i] > 0 && g.items[i] == 0) {
+                cell.OnClick(() => { TjPut(g, pick); });
+            }
             cell.DockManual();
             cell.Place(Spec.TjSlotX(i), 0);
             row.Add(cell);
         }
         return row;
+    }
+
+    void TjPut(TjGroup grp, int slot) {
+        if (net.Self() == null) { TjSay("图鉴收集：放入「" + grp.name + "」（离线模式）"); return; }
+        net.TjPut(grp.gno, slot);
+    }
+
+    void TjSay(string msg) {
+        if (net.Self() != null) { net.AddChat("[系统]", msg); return; }
+        g.Log(msg);
     }
 
     // ------------------------------------------------------------------

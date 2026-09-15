@@ -598,6 +598,64 @@ def run_cas_and_worldstate(cookie):
         r = hero.reply_for(lambda m: m.get("ok") == 0 and "err" in m)
         ok(r is not None, "sup re-reg with same sword rejected (score<=champion)")
 
+    # 图鉴套装收集：六组面板 → 空格/未持有拒绝 → GM 送祈祷五件 → 放入成套
+    # （祈祷=def 组）→ def 恰好 +tj_base1/10、背包少 5 件、重复放入拒绝
+    hero.clear()
+    hero.send({"op": "tj"})
+    r = hero.reply_for(lambda m: "groups" in m)
+    groups = (r or {}).get("groups", [])
+    ok(len(groups) == 6 and groups[0]["name"] == "祈祷"
+       and groups[0]["filled"] == 0 and groups[0]["complete"] == 0,
+       "tj panel 6 groups, 祈祷 empty")
+    hero.clear()
+    hero.send({"op": "tj", "put": 0, "slot": 7})
+    r = hero.reply_for(lambda m: m.get("ok") == 0 and "err" in m)
+    ok(r is not None, "tj put into undefined slot rejected")
+    hero.clear()
+    hero.send({"op": "tj", "put": 0, "slot": 0})
+    r = hero.reply_for(lambda m: m.get("ok") == 0 and "err" in m)
+    ok(r is not None, "tj put without item in bag rejected")
+    st0 = None
+    hero.clear()
+    hero.send({"op": "state"})
+    r = hero.reply_for(lambda m: "self" in m)
+    st0 = ((r or {}).get("self") or {}).get("def")
+    ck = gm_login()
+    for gift in (124, 125, 126, 127, 128):
+        gm_save(ck, uid1, "市霸" + TS, gift=(gift, 1))
+        hero.clear()
+        hero.send({"op": "tj", "put": 0, "slot": gift - 124})
+        r = hero.reply_for(lambda m: m.get("ok") == 1 and "groups" in m)
+        ok(r is not None, "tj put 祈祷 slot%d (item %d)" % (gift - 124, gift))
+    grp0 = ((r or {}).get("groups") or [])[0]
+    ok(grp0["filled"] == 5 and grp0["complete"] == 1 and grp0["coeff"] == 50,
+       "tj 祈祷 complete (filled=5 coeff=50)")
+    hero.clear()
+    hero.send({"op": "state"})
+    r = hero.reply_for(lambda m: "self" in m)
+    st1 = ((r or {}).get("self") or {}).get("def")
+    ok(st1 is not None and st0 is not None and st1 - st0 ==
+       10, "tj set bonus def +10 (got %s -> %s)" % (st0, st1))
+    hero.clear()
+    hero.send({"op": "tj", "put": 0, "slot": 0})
+    r = hero.reply_for(lambda m: m.get("ok") == 0 and "err" in m)
+    ok(r is not None, "tj put same slot again rejected")
+
+    # 师徒结伴榜：小号拜 hero 为师 → mentor.mates 首行 = hero（cnt=1）
+    app_c, _app_uid = newchar("拜师侠")
+    app_c.send({"op": "enter", "realm": 1})
+    app_c.reply_for(lambda m: "self" in m or m.get("ok") == 0)
+    app_c.send({"op": "mentor", "master": "市霸" + TS})
+    r = app_c.reply_for(lambda m: (m.get("ok") == 1 and "mentor" in m)
+                        or (m.get("ok") == 0 and "err" in m))
+    ok(r is not None and r.get("ok") == 1, "mentor bow to hero")
+    app_c.clear()
+    app_c.send({"op": "mentor"})
+    r = app_c.reply_for(lambda m: "mentor" in m)
+    mates = ((r or {}).get("mentor") or {}).get("mates", [])
+    ok(len(mates) >= 1 and mates[0]["name"] == "市霸" + TS and mates[0]["cnt"] == 1,
+       "mentor mates lists hero (cnt=1)")
+
     # 祭坛捐献：gold 档扣金币，个人/全服进度同步涨（global 写穿 world_state）
     hero.clear()
     hero.send({"op": "altar"})

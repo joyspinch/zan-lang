@@ -790,6 +790,54 @@ class Play {
         o.Set("canTake", JsonValue.NewNum(
             s.row.masterName.Length > 0
                 && s.row.level >= Rules.Val("mentor_take_level") ? "1" : "0"));
+        /* 结伴榜：本区门徒数前 10 的师父（师徒页右栏名单的数据通道）。
+           masterName 聚合线性扫（在线人数小），名次选择同爵位榜。
+           挂在 mentor 对象里下发——客户端缓存的就是这个对象。 */
+        JsonValue mates = JsonValue.NewArray();
+        IDbConnection dbM = await Gateway.Db();
+        if (dbM != null) {
+            try {
+                List<ZanWeb.Model.Game.Player> apps = await dbM
+                    .Select<ZanWeb.Model.Game.Player>()
+                    .Where(a => a.realmId == s.realmId && a.masterName != "")
+                    .ToListAsync();
+                List<string> mNames = new List<string>();
+                List<int> mCnts = new List<int>();
+                for (int i = 0; i < apps.Count; i = i + 1) {
+                    string mn = apps[i].masterName != null ? apps[i].masterName : "";
+                    if (mn.Length == 0) { continue; }
+                    int at = -1;
+                    for (int k = 0; k < mNames.Count; k = k + 1) {
+                        if (mNames[k] == mn) { at = k; break; }
+                    }
+                    if (at < 0) { mNames.Add(mn); mCnts.Add(1); }
+                    else { mCnts[at] = mCnts[at] + 1; }
+                }
+                List<int> mLvls = new List<int>();
+                for (int k = 0; k < mNames.Count; k = k + 1) {
+                    ZanWeb.Model.Game.Player mm = await dbM
+                        .Select<ZanWeb.Model.Game.Player>()
+                        .Where(a => a.nickname == mNames[k] && a.realmId == s.realmId)
+                        .FirstAsync();
+                    mLvls.Add(mm != null ? mm.level : 0);
+                }
+                for (int rank = 0; rank < 10 && mNames.Count > 0; rank = rank + 1) {
+                    int best = 0;
+                    for (int k = 1; k < mCnts.Count; k = k + 1) {
+                        if (mCnts[k] > mCnts[best]) { best = k; }
+                    }
+                    JsonValue mo = JsonValue.NewObject();
+                    mo.Set("name", JsonValue.NewStr(mNames[best]));
+                    mo.Set("level", JsonValue.NewNum(Convert.ToString(mLvls[best])));
+                    mo.Set("cnt", JsonValue.NewNum(Convert.ToString(mCnts[best])));
+                    mates.Append(mo);
+                    mNames.RemoveAt(best); mCnts.RemoveAt(best); mLvls.RemoveAt(best);
+                }
+            } finally {
+                Gateway.Give(dbM);
+            }
+        }
+        o.Set("mates", mates);
         r.Set("mentor", o);
         Gateway.SelfInto(r, s);
         return r;
@@ -1773,6 +1821,146 @@ class Play {
         JsonValue r = Gateway.Ok();
         r.Set("rows", arr);
         r.Set("bonus", JsonValue.NewNum(Convert.ToString(Play.SupBonusPct(s))));
+        Gateway.SelfInto(r, s);
+        return r;
+    }
+
+    /* tj 图鉴套装收集：{}=六组面板（组名/已放格数/系数/九格道具）；
+       {"put":组,"slot":格}=从背包找该格对应装备放入（消耗，放入无法
+       取出）。成套（全部定义格放满）激活属性：atk 组加攻击、def 组加
+       防御，数值 tj_baseN/10（Fight.Atk/Def 现算）。六组定义与客户端
+       PageTujian 同源（原版图鉴抄录），组属性文案客户端自持。 */
+    class TjSetDef {
+        string name;
+        string kind;    // "atk" / "def"
+        int[] items;    // 按格位的道具 id，0 = 该组不用的空格
+    }
+
+    static List<Play.TjSetDef> tjDefs = null;
+    static List<Play.TjSetDef> TjDefs() {
+        if (tjDefs != null) { return tjDefs; }
+        List<Play.TjSetDef> v = new List<Play.TjSetDef>();
+        v.Add(Play.TjSetOf("祈祷", "def", 124, 125, 126, 127, 128, 0, 0, 0, 0));
+        v.Add(Play.TjSetOf("沃玛", "atk", 45, 33, 32, 117, 119, 136, 135, 121, 122));
+        v.Add(Play.TjSetOf("祖玛", "atk", 123, 142, 146, 145, 129, 54, 91, 172, 177));
+        v.Add(Play.TjSetOf("圣战", "atk", 166, 167, 168, 169, 0, 0, 0, 0, 0));
+        v.Add(Play.TjSetOf("法神", "atk", 170, 171, 172, 173, 0, 0, 0, 0, 0));
+        v.Add(Play.TjSetOf("天尊", "atk", 174, 175, 176, 177, 0, 0, 0, 0, 0));
+        tjDefs = v;
+        return v;
+    }
+
+    static Play.TjSetDef TjSetOf(string name, string kind,
+                                 int i0, int i1, int i2, int i3, int i4,
+                                 int i5, int i6, int i7, int i8) {
+        Play.TjSetDef d = new Play.TjSetDef();
+        d.name = name; d.kind = kind;
+        d.items = new int[] { i0, i1, i2, i3, i4, i5, i6, i7, i8 };
+        return d;
+    }
+
+    /* codexItems CSV（"组:格:itemId,…"）里某格是否已放。 */
+    static bool TjHas(string csv, int g, int slot) {
+        if (csv == null || csv.Length == 0) { return false; }
+        List<string> parts = csv.Split(",");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            List<string> kv = parts[i].Trim().Split(":");
+            if (kv.Count != 3) { continue; }
+            if (Convert.ToInt(kv[0]) == g && Convert.ToInt(kv[1]) == slot) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /* 成套判定：该组全部非 0 定义格都已放入。 */
+    static bool TjComplete(string csv, Play.TjSetDef def, int g) {
+        for (int k = 0; k < def.items.Length; k = k + 1) {
+            if (def.items[k] <= 0) { continue; }
+            if (!Play.TjHas(csv, g, k)) { return false; }
+        }
+        return true;
+    }
+
+    /* 成套加成（攻/防分开取）：Fight.Atk/AtkLo/Def/DefLo 现算挂入。 */
+    static int TjBonusAtk(ZanWeb.Model.Game.Player row) {
+        string csv = row.codexItems != null ? row.codexItems : "";
+        List<Play.TjSetDef> defs = Play.TjDefs();
+        int bonus = 0;
+        for (int i = 0; i < defs.Count; i = i + 1) {
+            if (defs[i].kind != "atk") { continue; }
+            if (Play.TjComplete(csv, defs[i], i)) {
+                bonus = bonus + Rules.Val("tj_base" + Convert.ToString(i + 1)) / 10;
+            }
+        }
+        return bonus;
+    }
+
+    static int TjBonusDef(ZanWeb.Model.Game.Player row) {
+        string csv = row.codexItems != null ? row.codexItems : "";
+        List<Play.TjSetDef> defs = Play.TjDefs();
+        int bonus = 0;
+        for (int i = 0; i < defs.Count; i = i + 1) {
+            if (defs[i].kind != "def") { continue; }
+            if (Play.TjComplete(csv, defs[i], i)) {
+                bonus = bonus + Rules.Val("tj_base" + Convert.ToString(i + 1)) / 10;
+            }
+        }
+        return bonus;
+    }
+
+    static JsonValue Tj(Session s, JsonValue m, long now) {
+        List<Play.TjSetDef> defs = Play.TjDefs();
+        int put = m.Int("put", -1);
+        if (put >= 0) {
+            int slot = m.Int("slot", -1);
+            if (put >= defs.Count) { return Gateway.Err("没有这组图鉴"); }
+            Play.TjSetDef def = defs[put];
+            if (slot < 0 || slot >= def.items.Length || def.items[slot] <= 0) {
+                return Gateway.Err("这格不接受装备");
+            }
+            if (Play.TjHas(s.row.codexItems, put, slot)) {
+                return Gateway.Err("这格已有装备（放入无法取出）");
+            }
+            ZanWeb.Model.Game.Item want = Fight.ById(def.items[slot]);
+            if (!Fight.BagTake(s, def.items[slot], 1)) {
+                return Gateway.Err("背包里没有「"
+                    + (want != null ? want.name : "该装备") + "」");
+            }
+            string csv = s.row.codexItems != null ? s.row.codexItems : "";
+            if (csv.Length > 0) { csv = csv + ","; }
+            s.row.codexItems = csv + Convert.ToString(put) + ":"
+                + Convert.ToString(slot) + ":" + Convert.ToString(def.items[slot]);
+            s.dirty = true;
+        }
+        string cur = s.row.codexItems != null ? s.row.codexItems : "";
+        JsonValue groups = JsonValue.NewArray();
+        for (int i = 0; i < defs.Count; i = i + 1) {
+            Play.TjSetDef def = defs[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Set("name", JsonValue.NewStr(def.name));
+            o.Set("kind", JsonValue.NewStr(def.kind));
+            JsonValue slots = JsonValue.NewArray();
+            int filled = 0;
+            for (int k = 0; k < def.items.Length; k = k + 1) {
+                JsonValue so = JsonValue.NewObject();
+                int itemId = 0;
+                if (def.items[k] > 0 && Play.TjHas(cur, i, k)) {
+                    itemId = def.items[k];
+                    filled = filled + 1;
+                }
+                so.Set("item", JsonValue.NewNum(Convert.ToString(itemId)));
+                slots.Append(so);
+            }
+            o.Set("slots", slots);
+            o.Set("filled", JsonValue.NewNum(Convert.ToString(filled)));
+            o.Set("coeff", JsonValue.NewNum(Convert.ToString(filled * 10)));
+            o.Set("complete", JsonValue.NewNum(
+                Play.TjComplete(cur, def, i) ? "1" : "0"));
+            groups.Append(o);
+        }
+        JsonValue r = Gateway.Ok();
+        r.Set("groups", groups);
         Gateway.SelfInto(r, s);
         return r;
     }
