@@ -1393,8 +1393,29 @@ sel = sel.OrderByDescending(x => x.id);   // error: 'string' has no member 'Orde
 
 **2026-08-08 复核：前提已变化**——`__DbQ_<E>` 现在是 `GenDbEmit.zan:96` 发射的**真实
 运行时类**（fluent 方法 W/Where/WhereDict/OB/OBD/GB/P/Pi/Pd/InI/InS/InD 全部返回
-`__DbQ_E`，含 `ToListAsync` 与 `Expr<T>`），不再是"纯代码生成期概念"；「跨语句 var
-组装能否编译」需按新生成器重新验证后更新本条目。
+`__DbQ_E`，含 `ToListAsync` 与 `Expr<T>`），不再是"纯代码生成期概念"。
+**2026-09-15 按新生成器实测定案（`_scratch/c1check/` 探针，sqlite 实跑）**：
+- **跨语句组装对"真实方法"已可用**：`var sel = host.PItem.Where(x => x.status == 1);`
+  之后的 `sel = sel.OBD("id")` / `sel.OB("id")` / `sel.WhereDict(dv)` 三形态全部编译、
+  运行正确（rows=2 / rows2=1 与种子数据一致）——链对象是可命名、可赋值、可跨语句
+  追加的一等值，原台账"列表页排序只能每键一分支"的痛点对字符串列名形态已解除。
+  链头宿主类需有 `IDbExecutor` 型成员 + `__Conn()`（db_acc_head 路径）。
+  **位置实参坑已修（同日）**：`[Table("t_pitem")]` 的位置实参此前被
+  `GenDb.AttrArg`（只认 assign 包装）静默丢弃，回落类名当表名、运行期报
+  `no such table: APos`；`GenDb.TableOf` 补 `AttrPositional`（裸字面量）分支后
+  `[Table("t_attrpos")]` 端到端跑通，orm_ 67/67 + diag_orm/zform 全绿。
+- **剩余缺口（lambda 续链半，仍开放）**：跨语句后续链写 lambda 形态
+  （`sel.OrderByDescending(x => x.id)` / `sel.Where(x => x.id > 0)`，
+  无论 var 还是显式 `__DbQ_PItem` 接收者、lambda 挂在本句还是 await 句）全部失败——
+  生成类没有 `OrderByDescending(Expr<T>)`/`Where(Expr<T>)` 的**静态** lambda 方法
+  （Where 只有 `Expr<T>` 形参版，lambda 降级只发生在编译期重写、要求接收者回溯到
+  重写过的链根 Rewrote 登记，跨语句 `call#N` 回溯第一环就断），checker 落到
+  `Expr<T>` 的委托形参上把 `x` 推成 int 报 `type 'int' has no member 'id'`；
+  var 形态的报错 `'__DbQ_PItem' has no member 'OrderNameDescending'` 同源。
+  可行的续法：把 lambda 条件留在链头首句，或续链用 OBD/OB/WhereDict 字符串形态。
+  修复方向（若立项）：给 `__DbQ_E` 生成 `Where(Expr<E>)` 之外的 lambda 识别版，
+  或让 dbgen 对"接收者变量静态类型是 `__DbQ_*`"的调用点也做编译期重写——
+  需要生成器拿到静态类型信息，属 genmeta 深水区，暂记缺口不在本轮修。
 
 > 已实测可用、别再当缺失：带参构造器与重载、`: this(...)` / `: base(...)`、方法重载、
 > `public/private/protected/internal`、`partial`、`#region/#endregion`、`const`、
