@@ -13,6 +13,7 @@
   function el(id) { return document.getElementById(id); }
 
   function toast(msg, kind) {
+    if (!toasts) { return; } /* SPA host without the shell: nowhere to show */
     var t = document.createElement('div');
     t.className = 'toast ' + (kind || 'ok');
     t.textContent = msg;
@@ -70,6 +71,7 @@
   }
 
   function paint() {
+    if (!tabs) { return; } /* SPA host without the shell's tab strip */
     tabs.innerHTML = '';
     state.tabs.forEach(function (t) {
       var b = document.createElement('span');
@@ -100,6 +102,7 @@
   // The strip scrolls under two arrows rather than a scrollbar, so a long
   // session does not squash the tabs or leave the active one off-screen.
   function paintTabNav() {
+    if (!tabs) { return; }
     var bar = tabs.parentNode;
     if (!bar) { return; }
     var arrows = bar.querySelectorAll('[data-tabnav]');
@@ -108,6 +111,7 @@
   }
 
   function showActiveTab() {
+    if (!tabs) { return; }
     var a = tabs.querySelector('.ad-tab.active');
     if (!a) { return; }
     var left = a.offsetLeft;
@@ -234,6 +238,7 @@
     if (loadController) { loadController.abort(); }
     loadController = window.AbortController ? new AbortController() : null;
     stopStream();
+    if (!panel) { return Promise.resolve(''); } /* SPA host: it drives panels */
     panel.setAttribute('aria-busy', 'true');
     var opts = { headers: { 'X-Fragment': '1' }, credentials: 'same-origin' };
     if (loadController) { opts.signal = loadController.signal; }
@@ -285,7 +290,7 @@
   // Re-open the sub-pane this screen was on before its panel was rebuilt.
   function restorePane(path) {
     var name = paneMemo[base(path)];
-    if (!name) { return; }
+    if (!name || !panel) { return; }
     var btn = panel.querySelector('[data-setting-tabs] [data-pane="' + name + '"]');
     if (btn) { btn.click(); }
   }
@@ -295,6 +300,7 @@
   // key is only posted to our own endpoint, which uses it server-side and never
   // returns it. Providers with no /models endpoint keep the plain text field.
   function wireModelPick(root) {
+    if (!root) { return; } /* SPA host: no server-rendered first panel */
     var input = root.querySelector('[name="ai.model"]');
     if (!input || input.getAttribute('data-model-wired')) { return; }
     input.setAttribute('data-model-wired', '1');
@@ -713,8 +719,15 @@
     topTotal = 0;
   }
 
+  // The panel root resolves per call, not once at startup: an SPA host may
+  // mount its own shell around this script and inject panels later, so a
+  // startup-cached reference would go stale (or null) after the first swap.
+  function panelEl() { return document.getElementById('ad-panel'); }
+
   function startStream() {
-    var host = panel.querySelector('[data-stream]');
+    var p = panelEl();
+    if (!p) { return; }
+    var host = p.querySelector('[data-stream]');
     if (!host) { return; }
     var gen = ++streamGen;
     var url = host.getAttribute('data-stream');
@@ -809,7 +822,9 @@
   var topSort = { key: 'calls', dir: -1 };
 
   function wireTopSort() {
-    panel.querySelectorAll('[data-toptable] th[data-sort]').forEach(function (th) {
+    var root = panelEl();
+    if (!root) { return; }
+    root.querySelectorAll('[data-toptable] th[data-sort]').forEach(function (th) {
       if (!th.getAttribute('data-label')) {
         th.setAttribute('data-label', th.textContent);
       }
@@ -827,7 +842,9 @@
   }
 
   function paintTopHead() {
-    panel.querySelectorAll('[data-toptable] th[data-sort]').forEach(function (th) {
+    var root = panelEl();
+    if (!root) { return; }
+    root.querySelectorAll('[data-toptable] th[data-sort]').forEach(function (th) {
       var label = th.getAttribute('data-label') || th.textContent;
       var on = th.getAttribute('data-sort') === topSort.key;
       th.textContent = label + (on ? (topSort.dir < 0 ? ' \u2193' : ' \u2191') : '');
@@ -835,7 +852,8 @@
   }
 
   function paintTop() {
-    var tb = panel.querySelector('[data-daytop]');
+    var root = panelEl();
+    var tb = root ? root.querySelector('[data-daytop]') : null;
     if (!tb) { return; }
     var rows = [];
     var keys = {};
@@ -889,7 +907,9 @@
   }
 
   function put(name, value) {
-    panel.querySelectorAll('[data-metric="' + name + '"]').forEach(function (n) {
+    var root = panelEl();
+    if (!root) { return; }
+    root.querySelectorAll('[data-metric="' + name + '"]').forEach(function (n) {
       n.textContent = value;
     });
   }
@@ -933,7 +953,8 @@
   // `live` is 0 once a worker has stopped publishing, and its last totals stay
   // on screen (marked stale) instead of silently leaving the table.
   function paintProcs(rows) {
-    var tb = panel.querySelector('[data-procs]');
+    var root = panelEl();
+    var tb = root ? root.querySelector('[data-procs]') : null;
     if (!tb) { return; }
     rows = rows || [];
     tb.innerHTML = rows.length
@@ -1033,7 +1054,8 @@
   /* A line chart is a polyline over a scaled array; a charting library would be
    * a lot of bytes for that. */
   function draw(id, series, pts, unit) {
-    var c = panel.querySelector('#' + id);
+    var root = panelEl();
+    var c = root ? root.querySelector('#' + id) : null;
     if (!c) { return; }
     var dpr = window.devicePixelRatio || 1;
     var w = c.clientWidth, h = c.clientHeight;
@@ -1124,7 +1146,7 @@
       });
     }
 
-    var label = panel.querySelector('[data-max="' + id + '"]');
+    var label = root.querySelector('[data-max="' + id + '"]');
     if (label) { label.textContent = '峰值 ' + max; }
   }
 
@@ -1334,28 +1356,39 @@
   });
 
   document.addEventListener('DOMContentLoaded', function () {
-    panel = el('ad-panel');
+    panel = el('ad-panel'); // null in an SPA host; per-call panelEl() covers later panels
     tabs = el('ad-tabs');
     toasts = el('ad-toasts');
-    restore();
-    var here = normalize(location.pathname + location.search + location.hash);
-    rememberPane(location.pathname + location.search + location.hash);
-    var title = document.body.getAttribute('data-tab-title') || here;
-    if (find(here) < 0) { state.tabs.push({ path: here, title: title }); }
-    state.active = here;
-    history.replaceState({ path: here }, '', here);
-    paint();
-    window.addEventListener('resize', paintTabNav);
-    // A wheel over the strip pages it sideways, like a browser's tab bar.
-    tabs.addEventListener('wheel', function (ev) {
-      if (tabs.scrollWidth <= tabs.clientWidth) { return; }
-      ev.preventDefault();
-      tabs.scrollLeft = tabs.scrollLeft + (ev.deltaY || ev.deltaX);
-    }, { passive: false });
-    // The first screen is already in the panel, server-rendered.
+    // An SPA host may run this script without the server shell: no tabs
+    // strip, no toasts node, no server-rendered first panel. Skip tab
+    // painting in that case; startStream resolves its root per call, so
+    // panels an SPA injects later still get stream wiring.
+    if (tabs) { restore(); }
+    // Server-shell URL tracking only: an SPA host owns its own URL (often a
+    // hash route), so strip rewriting must not touch history there.
+    if (tabs) {
+      var here = normalize(location.pathname + location.search + location.hash);
+      rememberPane(location.pathname + location.search + location.hash);
+      var title = document.body.getAttribute('data-tab-title') || here;
+      if (find(here) < 0) { state.tabs.push({ path: here, title: title }); }
+      state.active = here;
+      history.replaceState({ path: here }, '', here);
+      paint();
+      window.addEventListener('resize', paintTabNav);
+      // A wheel over the strip pages it sideways, like a browser's tab bar.
+      tabs.addEventListener('wheel', function (ev) {
+        if (tabs.scrollWidth <= tabs.clientWidth) { return; }
+        ev.preventDefault();
+        tabs.scrollLeft = tabs.scrollLeft + (ev.deltaY || ev.deltaX);
+      }, { passive: false });
+    }
+    // The first screen is already in the panel, server-rendered (an SPA
+    // injects its own panels later; startStream finds them per call).
     startStream();
     wireModelPick(panel);
-    window.addEventListener('popstate', restoreHistory);
+    // History repair belongs to the shell's URL space; an SPA host routes by
+    // hash and its popstate must not re-enter open()/load() here.
+    if (tabs) { window.addEventListener('popstate', restoreHistory); }
   });
 
 

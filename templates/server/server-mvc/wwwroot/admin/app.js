@@ -1,12 +1,13 @@
 (function(){
 'use strict';
-/* admin SPA 外壳：Naive UI 出深色侧栏 + 分组菜单 + 头部，内容区是 iframe
-   承载服务端渲染的管理屏（views/Admin/*）。选择 iframe 而非逐屏重写：
-   服务端页面已带完整的表格/表单/标签页交互（admin.css + admin.js），
-   外壳只做导航；每个菜单项都真实可达，页内一切功能开箱即用。
-   hash 路由：#/ = 仪表盘（壳内自绘 + zan-charts），#r=<path> = iframe 打开
-   服务端屏；未登录时整壳换成登录卡片。菜单来自 /api/admin/menu（服务端
-   权限过滤后的唯一事实），分组标题用 MenuBuilder 注册的中文标签。 */
+/* admin SPA 外壳：Naive UI 出深色侧栏 + 分组菜单 + 头部，内容区以
+   X-Fragment 面板注入承载服务端渲染屏（views/Admin/*）。面板走服务端
+   既有的 fragment 协议（admin.js 同款）：Page() 见 X-Fragment 头只输出
+   面板 div，无侧栏无布局——外壳只有一层；查询/弹窗/写操作的事件全部
+   委托在 document 上（index.html 直接引入 admin.js），注入节点天然生效。
+   hash 路由：#/ = 仪表盘（壳内自绘 + zan-charts），#r=<path> = 面板屏；
+   未登录时整壳换成登录卡片。菜单来自 /api/admin/menu（服务端权限过滤后
+   的唯一事实），分组标题用 MenuBuilder 注册的中文标签。 */
 
 const { createApp, ref, computed, onMounted } = Vue;
 const { createDiscreteApi } = naive;
@@ -16,7 +17,7 @@ const { createDiscreteApi } = naive;
    createDiscreteApi 内部挂载 provider 会因 body 为 null 抛错，导致整个脚本失效。 */
 let message;
 
-/* 菜单分组标签：与服务端 MenuBuilder.Section 注册保持同序（壳内兜底，
+/* 菜单分组标签：与 main.zan 的 MenuBuilder.Section 注册保持一致（壳内兜底，
    服务端注册后 group 字段即中文，此处映射仅给未注册段兜底）。 */
 const GROUP_LABELS = {
   "": "概览", content: "内容管理", monitor: "运行监控",
@@ -168,14 +169,16 @@ const DashboardView = {
   </div>`
 };
 
-/* ---- 根组件：深色侧栏 + 分组菜单 + iframe 内容区 ---- */
+/* ---- 根组件：深色侧栏 + 分组菜单 + 面板内容区（单层壳） ---- */
 const App = {
   setup() {
     const route = ref(location.hash || "#/");
     const me = ref(null);
     const menu = ref([]);
-    const iframeSrc = ref("");
+    const panelHtml = ref("");
+    const panelHost = ref(null);
     const contentTitle = ref("仪表盘");
+    const { nextTick } = Vue;
 
     window.addEventListener("hashchange", () => {
       route.value = location.hash || "#/";
@@ -204,30 +207,73 @@ const App = {
       try { await api("/admin/logout"); } catch (e) { /* 302 非 JSON，忽略 */ }
       me.value = null;
       menu.value = [];
-      iframeSrc.value = "";
+      panelHtml.value = "";
       location.hash = "#/";
     }
 
-    /* hash → { page, path }：#/ 是壳内仪表盘，#r=<path> 是 iframe 屏 */
+    /* hash → { page, path }：#/ 是壳内仪表盘，#r=<path> 是面板屏 */
     const current = computed(() => {
       const h = route.value;
       if (h.indexOf("#r=") === 0) { return { page: "frame", path: h.slice(3) }; }
       return { page: "dashboard", path: "" };
     });
 
-    /* 把当前 hash 同步到 iframe/标题/高亮。菜单项一个不落：菜单里的每条
-       path 都直接作为 iframe 的 src——服务端屏自己带全套交互。 */
-    function sync() {
+    /* 面板 HTML 注入缓存：同 path 面板在内存里留一份，切回时秒开不闪。
+       手写 key 前缀避免与对象原型链撞名。 */
+    const panelCache = {};
+
+    /* 拉取无壳面板：X-Fragment 头让服务端 Page() 只输出面板 div（无侧栏
+       无布局），X-Tab-Title 回读屏幕标题。 */
+    async function fetchPanel(path) {
+      const res = await fetch(path, {
+        headers: { "X-Fragment": "1" },
+        credentials: "same-origin"
+      });
+      if (!res.ok) { throw new Error(res.status + " " + res.statusText); }
+      const t = res.headers.get("X-Tab-Title");
+      if (t) {
+        try { return { html: await res.text(), title: decodeURIComponent(t) }; }
+        catch (e) { return { html: await res.text(), title: "" }; }
+      }
+      return { html: await res.text(), title: "" };
+    }
+
+    /* 把当前 hash 同步到内容区/标题/高亮。菜单项一个不落：每条 path 都
+       以 X-Fragment 面板形式载入——服务端屏自带全套表格/表单/弹窗交互，
+       而外壳只有一层（Naive UI 侧栏），不会再出现双壳。 */
+    async function sync() {
       const c = current.value;
       if (c.page !== "frame") {
-        iframeSrc.value = "";
         contentTitle.value = "仪表盘";
         return;
       }
       const hit = menu.value.find(m => m.path === c.path);
       contentTitle.value = hit ? hit.title : c.path;
-      // 同址不去重赋值：服务端屏无外部状态，重赋即刷新面板
-      iframeSrc.value = c.path;
+      try {
+        if (!panelCache[c.path]) { panelCache[c.path] = await fetchPanel(c.path); }
+        const hitCache = panelCache[c.path];
+        panelHtml.value = hitCache.html;
+        if (hitCache.title) { contentTitle.value = hitCache.title; }
+        await nextTick();
+        runPanelScripts();
+      } catch (e) {
+        message.error(e.message);
+      }
+    }
+
+    /* 面板内脚本手工复活：innerHTML 注入的 <script> 不执行。面板的查询/
+       弹窗/写操作事件全部委托在 document 上（admin.js），注入节点天然被
+       覆盖；这里重放面板内联 <script>、跑面板级增强，并接上实时流——
+       监控屏的 data-stream 由 admin.js startStream() 按当下 DOM 接线。 */
+    function runPanelScripts() {
+      const host = panelHost.value;
+      if (!host) { return; }
+      host.querySelectorAll("script").forEach(old => {
+        const s = document.createElement("script");
+        s.textContent = old.textContent;
+        old.replaceWith(s);
+      });
+      if (window.applyFragmentWidgets) { window.applyFragmentWidgets(host); }
     }
 
     /* 菜单分组：服务端 group 字段（URL 首段）→ 中文标签；段内保持服务端
@@ -263,7 +309,8 @@ const App = {
 
     onMounted(boot);
     return { me, page: computed(() => me.value ? current.value.page : "login"),
-             iframeSrc, contentTitle, menuOptions, activeKey, onMenuSelect, logout };
+             panelHtml, panelHost, contentTitle, menuOptions, activeKey,
+             onMenuSelect, logout };
   },
   template: `
   <n-config-provider>
@@ -288,11 +335,12 @@ const App = {
             <n-breadcrumb-item>{{ contentTitle }}</n-breadcrumb-item>
           </n-breadcrumb>
         </n-layout-header>
-        <n-layout-content content-style="height:calc(100% - 52px);position:relative">
+        <n-layout-content content-style="height:calc(100% - 52px);position:relative;overflow:auto">
           <dashboard-view v-if="page === 'dashboard'"
-                          style="padding:16px 20px;display:block;height:100%;overflow:auto"></dashboard-view>
-          <iframe v-else :src="iframeSrc" frameborder="0"
-                  style="display:block;width:100%;height:100%"></iframe>
+                          style="padding:16px 20px;display:block"></dashboard-view>
+          <div v-show="page === 'frame'" ref="panelHost" id="ad-panel"
+               style="padding:14px 18px"
+               v-html="panelHtml"></div>
         </n-layout-content>
       </n-layout>
     </n-layout>
@@ -304,6 +352,17 @@ function mountAdmin() {
   // body 就绪后再建离散 API（内部要往 body 挂 provider 容器）
   const discrete = createDiscreteApi(["message"]);
   message = discrete.message;
+  /* admin.js 是为服务端壳写的：缺 #ad-toasts 时 toast() 直接 return（本轮
+     已加守卫），SPA 只补 toasts 一个容器。**不能补 ad-tabs**——admin.js 把
+     "tabs 在"当作服务端壳在的标志（URL 改写、popstate→restoreHistory 都挂
+     在它下面），SPA 补一个隐藏 tabs 会让 admin.js 的 restoreHistory 在每次
+     hash 变化时把 URL 整个 replaceState 回 pathname，SPA 的 hash 路由被清空。 */
+  if (!document.getElementById("ad-toasts")) {
+    const d = document.createElement("div");
+    d.id = "ad-toasts";
+    d.style.display = "none";
+    document.body.appendChild(d);
+  }
   const app = createApp(App);
   app.use(naive);
   app.component("login-view", LoginView);
