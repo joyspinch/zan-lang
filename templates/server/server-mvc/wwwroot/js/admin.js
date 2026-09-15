@@ -59,7 +59,30 @@
     state.tabs = state.tabs.map(function (t) {
       return { path: normalize(t.path), title: t.title || t.path };
     });
+    // Only screens the shell itself serves may survive a reload. A URL once
+    // opened from outside the admin space (e.g. /static/...) would otherwise
+    // sit in localStorage and resurrect as a dead tab on every reload.
+    state.tabs = state.tabs.filter(function (t) {
+      return base(t.path).indexOf('/admin') === 0;
+    });
+    // One tab per screen, matching open(): variants that differ only in
+    // query (?page=1 vs ?page=2) collapse onto the variant seen last.
+    var byBase = {};
+    var merged = [];
+    for (var i = 0; i < state.tabs.length; i++) {
+      var b = base(state.tabs[i].path);
+      if (!byBase[b]) { merged.push(byBase[b] = state.tabs[i]); }
+      else { byBase[b].path = state.tabs[i].path; }
+    }
+    state.tabs = merged;
     state.active = state.active ? normalize(state.active) : '';
+    if (state.active && find(state.active) < 0) {
+      var ab = base(state.active);
+      for (var j = 0; j < state.tabs.length; j++) {
+        if (base(state.tabs[j].path) === ab) { state.active = state.tabs[j].path; break; }
+      }
+    }
+    if (find(state.active) < 0) { state.active = ''; }
   }
 
   function find(path) {
