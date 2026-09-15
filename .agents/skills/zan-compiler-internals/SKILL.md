@@ -1,6 +1,6 @@
 ---
 name: zan-compiler-internals
-description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式与坑——Dict 内建布局契约、LLVM select 死臂泄漏（用 branch+phi）、delegate 两形态与 wasm32 ZAN_CLOSURE_TAG 碰撞、nsresolve 冲突改名丢泛型实参（全量输入 vs 按需拉取行为不同）、ARC 所有权判定内建优先于 extern 借用、stdlib 按需拉入的坑、LLVMIsConstant/llvm.global_ctors/PE 数据分节 $ 命名等发布体积分节陷阱、GNU ld PE 把 .pdata 当 GC 根、交叉工具链 .o 重出配方、conformance 处置四分法、scratch 卫生（bisect 用 worktree 即用即删）。做或改 src/compiler/*、交叉运行时对象、conformance golden、追发布体积时使用。
+description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式与坑——Dict 内建布局契约、LLVM select 死臂泄漏（用 branch+phi）、delegate 两形态与 wasm32 ZAN_CLOSURE_TAG 碰撞、nsresolve 冲突改名丢泛型实参（全量输入 vs 按需拉取行为不同）、ARC 所有权判定内建优先于 extern 借用、stdlib 按需拉入的坑（using 整目录、潜伏缺 using、重臂 Bootstrap 注册制）、LLVMIsConstant/llvm.global_ctors/PE 数据分节 $ 命名等发布体积分节陷阱、GNU ld PE 把 .pdata 当 GC 根、交叉工具链 .o 重出配方、conformance 处置四分法、scratch 卫生（bisect 用 worktree 即用即删）。做或改 src/compiler/*、交叉运行时对象、conformance golden、追发布体积、动 stdlib 重组件目录或 ControlFactory/App 拉入面时使用。
 ---
 
 # zanc 编译器内部定式与坑
@@ -76,6 +76,33 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   接后 obj_tmp 会删）→ `llvm-ar x` → 用 build/ld.exe（PE）或 ld.lld
   （ELF）手动重链，加 `--print-gc-sections`；缺驱动符号时补
   `-z undefs --noinhibit-exec`（ELF）即可只量回收不产出可执行。
+
+## auto-stdlib 拉入的真实语义与重臂注册制（2026-09-16 落地）
+
+- **拉入由 `using` 指令驱动、按整目录**：`using X.Y.Z;` ⇔ 把
+  `stdlib/X/Y/Z` 全部 .zan 编译进图，再不动点重扫新进文件的 using。
+  **全限定名引用与字符串字面量都不触发拉入**（但全限定名若指向未拉入
+  目录的类型 = unresolved，所以生成代码要类型就得发 using）。改"谁被
+  编译进"只看 using 边，别在标识符上找补。
+- **潜伏缺 using 会被解耦暴露**：CodeEditor/FilePicker/SceneDesigner/
+  Designer 用 `Lang.Tr`（System.Globalization）却从不声明 using——过去
+  ControlFactory 的 `using Gui.Component.DataTable;` 把 DataTable.Lang.zan
+  带进每一次编译，顺带把 Globalization 拉进来，坏依赖被掩盖。拔掉顺带
+  链后当场 unresolved。**规则：谁用谁声明**；拔任何 using 前先 grep 该
+  目录独有声明的外部用户。
+- **重臂注册制（重家族一律照此办理）**：ControlFactory 主 switch 的
+  `new ChartHost()`/`new DataGrid<T>()` 分支 = 语义钉子，把 0.5-0.8MB+
+  的组件目录钉进每个 GUI 程序；App 自持 `WebViewBox linkBox` 字段 +
+  ctor 装 ChartTheme.Css 同理。范式：类型从核心文件里搬走/改为
+  `*Bootstrap.Install()` 经 HeavyControls 注册（先注册后可用），行为
+  钩子用 delegate 槽反转（App.SetLinkNavigator ← WebViewBootstrap），
+  资源装载懒触发（ChartTheme.EnsureDefault 挂在 ChartHost 布局/绘制）。
+  设计器生成代码（GenForm）的无条件重家族 using 改为按设计树实际 kind
+  发射。实测：空窗 GUI 272→213 文件；NewProject singleFile 发布
+  13.4MB→4.38MB（OpenSSL/Chart/DataTable/WebView 全部退出编译图）。
+- **入口契约陷阱**：设计文档入口生成 `Name.OnLoad(form)` 调用，业务侧
+  必须提供同名静态方法；只传 .html 不带同名 code-behind .zan 时报
+  "type X has no method OnLoad"——是输入列表不全，不是生成器坏了。
 
 ## delegate 两形态与 wasm32 的 tag 碰撞
 

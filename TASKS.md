@@ -3328,7 +3328,7 @@ P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
   "400/400" 重影（interval 9007199254740991 缺省）、mini bar 段内
   标签挤压。
 
-## 发布体积治理：数据逐符号分节已落地，PE/stdlib 两堵墙挂账（2026-09-15）
+## 发布体积治理：数据逐符号分节 + 重臂注册制已落地，PE 链接器挂账（2026-09-15/16）
 
 **已修（本次提交）**：irgen_emit.c write_obj 在 publish 档给全局按符号分节
 （COFF 用 `.rdata$<名>`/`.data$<名>`，ELF/Mach-O 用点号），与逐函数
@@ -3348,9 +3348,22 @@ NewProject 发布 7,801,856 → 7,801,344（shared 链接；singleFile 的 13.4M
 **挂账一（链接器）**：PE 要真裁剪需二选一——①链接改 lld-link + /OPT:REF
 （关联 COMDAT 语义正确，工具链要新增 lld-link.exe 伴生件）；②发布档发
 no-unwind（Zan 无异常，崩溃日志只剩寄存器不展栈，需产品决策）。
-**挂账二（stdlib 架构）**：语义可达链 `Html_Clone → ControlFactory_Create
-→ new ChartHost()/DataTable` 把未用组件整体拖活（App_ctor 自身引用 45 个
-类描述符 + ImageHttp 拖活 TLS/OpenSSL）；解法是 ControlFactory 重臂照
-CEF/WebView 的 Bootstrap 注册模式移出主 switch（其注释里已有处方），
-App 的图表主题"构造即装载"改懒装载。落地后 ELF 侧可回收大头，PE 侧仍受
-挂账一压制。
+**挂账二（stdlib 架构）——已闭（2026-09-16，重臂注册制落地）**：
+ControlFactory 主 switch 摘除 DataGrid/Transfer/ChartHost 三臂，改由
+ChartBootstrap/DataTableBootstrap.Install() 经 HeavyControls 注册（先注册
+后可用；设计器生成代码直接 new 不受影响，运行期按 kind 重建需注册）；
+App 摘除 `using Gui.Component.Chart/WebView`——WebViewBox/LinkWindow
+字段与方法改 WebViewBootstrap 注册的 App.SetLinkNavigator 导航器（未安装
+= 链接直开系统浏览器），LinkWindow 移入 Component/WebView；图表基线主题
+构造即装载改 ChartTheme.EnsureDefault 懒装载（首个 ChartHost 布局/绘制
+补装）；GenForm 生成头部的四个重家族 using 改为按设计树实际 kind 发射。
+顺带修掉四处被顺带拉入掩盖的潜伏缺 using（Lang/Globalization：CodeEditor/
+FilePicker/SceneDesigner/Designer——谁用谁声明）。实测：空窗 GUI 编译
+272→213 文件；NewProject singleFile 发布 274→214 文件、13.4MB→4.38MB
+（OpenSSL/Chart/DataTable/WebView 整体退出编译图）；回归
+chart_theme/transfer 测试与 chart_axis 金样、html_gallery/gui_gallery、
+IDE 全量构建全绿。ImageHttp 仍被 Widget/Image、Upload 引用（驱动拷贝
+清单仍见 ssl DLL），彻底切断挂账三。
+**挂账三（stdlib 架构，遗留）**：ImageHttp→网络栈仍随 Gui 根目录进每个
+程序（Image/Upload 控件的按 URL 加载路径），彻底解耦需把 ImageHttp 挪出
+Gui 根或改注册制；PE 侧 .text 回收仍受挂账一压制。

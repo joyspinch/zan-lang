@@ -4,18 +4,57 @@ using Gui.Component.WebView;
 namespace Gui.Component.WebView;
 
 /// <summary>
-/// WebView 家族的 HeavyControls 注册入口。IDE、浏览器示例等真正
-/// 用到 WebViewBox 的宿主在启动时调用一次 <see cref="Install"/>；
-/// 不调用的程序里整个 WebView 家族被 globaldce 删光，发布不再
-/// 携带 WebView2Loader.dll（bundle 的 "if WebView2_" 前缀条件）。
+/// WebView 家族的 HeavyControls/链接路由注册入口。IDE、浏览器示例
+/// 等真正用到 WebViewBox 的宿主在启动时调用一次 <see cref="Install"/>；
+/// 不调用的程序里整个 WebView 家族被裁掉，发布不再携带
+/// WebView2Loader.dll（bundle 的 "if WebView2_" 前缀条件）。
+///
+/// Install 同时向 App 注册 <a href> 内嵌导航器（宿主就地图优先，
+/// 没有就懒建 App 级链接窗口）：LinkWindow/WebViewBox 只住在本目录，
+/// App 编译图不背 WebView（auto-stdlib 按 using 整目录拉入），
+/// 未安装的程序链接直开系统浏览器。原 App.UseWebview 的业务入口
+/// 由 <see cref="UseAsLinkTarget"/> 承接。
 /// </summary>
 class WebViewBootstrap {
     static bool installed;
+
+    /// 宿主注册的内嵌就地图（UseAsLinkTarget）：非空且属于发起
+    /// 导航的 App 时链接就地 Navigate 它，不开链接窗口。
+    static WebViewBox hostBox;
+    static App hostBoxOwner;
+    /// App 级链接窗口（原 App.linkWin）：首次点链接懒建，之后
+    /// 复用；关掉后再点重建。
+    static LinkWindow linkWin;
 
     static void Install() {
         if (installed) { return; }
         installed = true;
         HeavyControls.Register("WebViewBox", MakeWebViewBox);
+        App.SetLinkNavigator(NavigateLink);
+    }
+
+    /// 业务侧注册宿主自有的内嵌网页视图（如应用自带的浏览器标签，
+    /// 原 App.UseWebview）：之后 <a href> 的缺省路由就地 Navigate 它
+    /// 而不开链接窗口。传 null 注销。WebView 运行时不可用
+    /// （IsSupported false）的注册会被导航忽略并走链接窗口/系统浏览器。
+    static void UseAsLinkTarget(App app, WebViewBox box) {
+        hostBox = box;
+        hostBoxOwner = box == null ? null : app;
+    }
+
+    /// App.linkNavigator 的实现（见 Gui.LinkNavigateFn）：总是返回
+    /// true——WebView 不可用的回落在 LinkWindow 首帧内部完成。
+    static bool NavigateLink(App app, string url) {
+        if (hostBox != null && hostBoxOwner == app
+                && hostBox.View().IsSupported()) {
+            hostBox.Navigate(url);
+            return true;
+        }
+        if (linkWin == null || !linkWin.IsOpen()) {
+            linkWin = new LinkWindow();
+        }
+        linkWin.Navigate(url, app);
+        return true;
     }
 
     static Control MakeWebViewBox(string kind) {

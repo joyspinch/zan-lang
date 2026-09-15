@@ -1,7 +1,5 @@
 using System;
-using Gui.Component.Chart;
 using Gui.Backend;
-using Gui.Component.WebView;
 
 namespace Gui;
 
@@ -40,6 +38,11 @@ class WhyTally {
 
 /// 一帧的绘制体（参见 App.RunLoop / App.SafeFrame）。
 delegate void FrameBody();
+
+/// <a href> 内嵌导航器（App.linkNavigator）：由 WebView 家族经
+/// App.SetLinkNavigator 注册；app=发起导航的宿主。返回 true =
+/// 已处理（含 WebView 不可用时转交系统浏览器的内部回落）。
+delegate bool LinkNavigateFn(App app, string url);
 
 class App {
     Window window;
@@ -184,12 +187,12 @@ class App {
     // zs-load-<n> 文档作用域类（与 GenHtml 编译通道同一 scoping
     // 语义，变换器共用 System.Web.HtmlScope）。
     int htmlLoadSeq;
-    // <a href> 缺省路由的宿主注册内嵌网页视图（UseWebview）：非空
-    // 时链接就地 Navigate 它，不开链接窗口。
-    WebViewBox linkBox;
-    // 没有注册就地图时的链接窗口（LinkWindow）：首次点链接懒建，
-    // 之后复用；关掉后再点重建。
-    LinkWindow linkWin;
+    // <a href> 缺省路由的内嵌导航器：WebView 就地图与 App 级链接
+    // 窗口都住在 Gui.Component.WebView 侧，由 WebViewBootstrap.Install()
+    // 经 SetLinkNavigator 注册进来。App 编译图因此不背 WebView 家族
+    // （auto-stdlib 按 using 整目录拉入）；未注册 = 链接一律直开
+    // 系统浏览器。
+    static LinkNavigateFn linkNavigator;
     // 图表主题包（Gui.Component.Chart/themes/<name>.css）编译出的
     // 独立样式表：解析时垫在内置基线之上、皮肤 sheet 之下，不与
     // 皮肤/appCss 合并成一张表。null = 未安装，图表跟随皮肤。
@@ -844,14 +847,15 @@ class App {
         this.skinArtOpacity = 100;
         this.sheet = new StyleSheet();
         this.appCss = "";
-        // 图表基线主题（ECharts 6.1 官方缺省）构造即装载：图表主题
-        // 色全在 Component/Chart/themes/echarts6.css 包里（zanc 对用
-        // 到 Chart 符号的程序自动内嵌），base.css 不背图表 hex。极端
-        // 裁剪下找不到包时 chartSheet 保持 null，样式回落 base.css
-        // 的皮肤 token。
-        string e6Css = ChartTheme.Css("echarts6");
-        this.chartSheet = e6Css == "" ? null : StyleSheet.FromCss(e6Css);
-        this.chartThemeName = e6Css == "" ? "" : "echarts6";
+        // 图表基线主题不再构造即装载：App 编译图不背 Chart 家族，
+        // 基线（ECharts 6.1 官方缺省，主题色全在
+        // Component/Chart/themes/echarts6.css 包里）由首个 ChartHost
+        // 布局/绘制时经 ChartTheme.EnsureDefault 补装，或宿主显式
+        // ChartTheme.Use。这里保持 null = 图表跟随 base.css 的皮肤
+        // token（用图表的程序行为与旧版一致，不用图表的程序不背
+        // Chart 家族与主题包）。
+        this.chartSheet = null;
+        this.chartThemeName = "";
         this.skinName = "";
         this.useCssSheet = null;
         this.anims = new List<AnimSlot>();
@@ -1152,34 +1156,23 @@ class App {
     }
 
     /// <summary><a href> 的缺省路由（P5 链接语义）。newWindow
-    /// （target="_blank" 新弹窗）直接弹系统浏览器；否则进内嵌
-    /// WebView：宿主经 UseWebview 注册的就地图优先（就地 Navigate，
-    /// 不另开窗），没有就懒建一个 App 级链接窗口（LinkWindow，全程
-    /// 复用）。WebView 运行时不可用时由 LinkWindow 首帧回落系统
-    /// 浏览器。</summary>
+    /// （target="_blank" 新弹窗）直接弹系统浏览器；否则优先走内嵌
+    /// 导航器——安装了 WebView 家族的程序由 WebViewBootstrap.Install()
+    /// 注册（宿主就地图 Navigate，没有就懒建 App 级链接窗口全程复用；
+    /// WebView 运行时不可用时首帧回落系统浏览器）。未安装 WebView
+    /// 家族的程序一律系统浏览器，编译图因此不背 WebView。</summary>
     void OpenLink(string url, bool newWindow) {
-        if (!newWindow) {
-            if (this.linkBox != null
-                    && this.linkBox.View().IsSupported()) {
-                this.linkBox.Navigate(url);
-                return;
-            }
-            if (this.linkWin == null || !this.linkWin.IsOpen()) {
-                this.linkWin = new LinkWindow();
-            }
-            this.linkWin.Navigate(url, this);
+        if (!newWindow && linkNavigator != null) {
+            linkNavigator(this, url);
             return;
         }
         Html.OpenInSystemBrowser(url);
     }
 
-    /// 注册宿主自有的内嵌网页视图（如应用自带的浏览器标签）：
-    /// 之后 <a href> 的缺省路由就地 Navigate 它而不开链接窗口。
-    /// 传 null 注销。WebView 运行时不可用（IsSupported false）的
-    /// 注册会被 OpenLink 忽略并走链接窗口/系统浏览器。
-    void UseWebview(WebViewBox box) {
-        this.linkBox = box;
-    }
+    /// WebView 家族（宿主就地图/链接窗口）向 App 注册 <a href> 内嵌
+    /// 导航的入口，由 Gui.Component.WebView.WebViewBootstrap.Install()
+    /// 调用；业务代码不要直接调。
+    static void SetLinkNavigator(LinkNavigateFn fn) { linkNavigator = fn; }
 
     /// 给装载树每个元素补作用域类（编译通道由生成码逐节点 AddClass，
     /// 运行期树建好了，走一遍后处理）。
@@ -1199,26 +1192,16 @@ class App {
         needsRedraw = true;
     }
 
-    /// 安装图表主题包 `Gui.Component.Chart/themes/<name>.css`（图表
-    /// 自己的皮肤，纯 CSS 配置，由组件的 ChartTheme 负责发现与读取）。
-    /// 主题包编译成一块独立的样式表，解析时垫在内置基线之上、
-    /// Gui 皮肤之下：皮肤写过的 chart 规则优先，主题包只补基线
-    /// 没定义的部分，与皮肤/appCss 互不合并。名称为 "default" =
-    /// ECharts 6.1 官方基线包 echarts6.css（App 构造即装载，随时
-    /// 回到它）；"" = 完全卸载（图表跟随 Gui 皮肤 token 回落）。
-    /// 找不到主题包时保持现状并返回 false。
-    bool UseChartTheme(string name) {
-        string css = ChartTheme.Css(name);
-        if (name != "" && css == "") { return false; }
-        // 记解析后的实际包名："default" 的载体是 echarts6.css。
-        this.chartThemeName = css == "" ? ""
-            : (name == "default" ? "echarts6" : name);
-        this.chartSheet = css == "" ? null : StyleSheet.FromCss(css);
+    /// 安装/卸载图表主题包编译出的独立样式表（App 自身不认识
+    /// Chart 家族；主题包的发现与读取在 ChartTheme，经这里落到
+    /// app 上）。s = null 表示卸载，图表跟随 Gui 皮肤 token 回落。
+    void SetChartSheet(StyleSheet s, string pkgName) {
+        this.chartSheet = s;
+        this.chartThemeName = pkgName;
         bgThemeGen = bgThemeGen + 1;
         backdropDirty = true;
         this.NoteRedrawWhy("UseChartTheme");
         needsRedraw = true;
-        return true;
     }
 
     /// 当前图表主题包名（未安装时为 ""）。
