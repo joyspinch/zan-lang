@@ -1,3 +1,17 @@
+> **已归档（历史审计快照，2026-08 口径，不再维护）。** 本账本是补齐**前**的 2.2.4 口径
+> 审计快照，其「未实现/部分实现」多数已随六批补齐落地（symbol 形状族、
+> markLine average/min/max、axisLabel rotate/interval + nameLocation、HBarCore、
+> emphasis 闭环 + pie/map 选中、radar shape/splitArea、dataRange 组件
+> （calculable + splitList）、legend formatter/orient/selectedMode、force
+> scaling/gravity/min-maxRadius、chord sort/sortSub/gap/ribbonType、funnel
+> funnelAlign/gap/转化率、wordCloud sizeRange/textRotation）。
+>
+> - 2.2.7 口径的**全示例可表达性账本**见 `docs/CHART_VS_ECHARTS_227.md`（该基准已迁走）；
+> - 2.2.7 口径的**兼容性合同**见 `docs/CHART_COMPATIBILITY_227.md`；
+> - 当前**迁移账本**见 `docs/CHART_COMPATIBILITY_5.md`（基准 ECharts 6.1.0+），**代码级对照**见
+>   `docs/CHART_CODE_GAP_LEDGER.md`；
+> - 下方正文保留为历史审计依据。
+
 # Zan Chart 与 ECharts 2.2.4 能力对照 · 变体矩阵
 
 > 基准：ECharts 2.2.4（用户指定 doc/example 文档为权威参考）。
@@ -5,16 +19,7 @@
 > 缺失项 grep 反证。标注口径：**已实现**=有代码路径且可从 option/API 表达；
 > **部分实现**=有入口但语义缩水；**未实现**=全目录 grep 无任何消费点。
 >
-> **📌 时效声明（2026-08）**：本账本是补齐**前**的审计快照，其中「未实现/部分实现」
-> 多数已随六批补齐落地（symbol 形状族、markLine average/min/max、axisLabel
-> rotate/interval + nameLocation、HBarCore、emphasis 闭环 + pie/map 选中、
-> radar shape/splitArea、dataRange 组件（calculable + splitList）、legend
-> formatter/orient/selectedMode、force scaling/gravity/min-maxRadius、
-> chord sort/sortSub/gap/ribbonType、funnel funnelAlign/gap/转化率、
-> wordCloud sizeRange/textRotation）。逐示例可表达性的**当前**口径见
-> [CHART_VS_ECHARTS_227.md](CHART_VS_ECHARTS_227.md)；下文保留作历史审计依据，
-> 未再逐项回改。仍开放的：timeline 子系统、hoverLink 反向联动、整图族定位共存层
-> （connect 多图联动）——见 TASKS.md。
+> 仍开放项：timeline 子系统、hoverLink 反向联动、整图族定位共存层（connect 多图联动）——见 TASKS.md。
 
 ## ⚠ 口径修订：以 2.2.4 为准的重新定性
 

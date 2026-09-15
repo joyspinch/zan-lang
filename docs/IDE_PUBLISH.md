@@ -3,7 +3,7 @@
 The IDE is released as a **self-contained folder** at the canonical location:
 
 ```
-d:\project\zan-lang\dist\win-x64
+<repo>\dist\win-x64
 ```
 
 Other platforms get their own `dist\<platform>` (e.g. `dist\linux-x64`) when

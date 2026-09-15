@@ -8,14 +8,14 @@
 ## Windows x64（唯一受支持的配置）
 
 - 编译器：**clang / clang++**（Visual Studio 2022 自带的 LLVM，19.x）
-- LLVM 开发包：`C:\Users\QQ\.mozbuild\clang\lib\cmake\llvm`（MSVC ABI 构建，
+- LLVM 开发包：`C:\Users\<用户名>\.mozbuild\clang\lib\cmake\llvm`（MSVC ABI 构建，
   内含 `LLVMConfig.cmake`；VS 自带的那份没有它）
 - 生成器：Ninja
 
 ```powershell
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
     -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ `
-    "-DLLVM_DIR=C:\Users\QQ\.mozbuild\clang\lib\cmake\llvm"
+    "-DLLVM_DIR=C:\Users\<用户名>\.mozbuild\clang\lib\cmake\llvm"
 cmake --build build
 ```
 

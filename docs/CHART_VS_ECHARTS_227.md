@@ -4,7 +4,7 @@
 > 与外部数据示例）。抓取清单与逐页类型见任务期 `_scratch/echarts227/`
 > （page_types.json + ledger.txt），本文件是其可表达性结论的落库版。
 > 审计方式：逐示例页提取 option 键，映射到 `stdlib/Gui/Component/Chart/`
-> 当前 API；`docs/CHART_VS_ECHARTS_224.md` 是 2.2.4 口径的**缺口账本**，本文件是
+> 当前 API；`docs/archive/CHART_VS_ECHARTS_224.md` 是 2.2.4 口径的**缺口账本**，本文件是
 > 2.2.7 全示例的**可表达性账本**（六批补齐后，多数原缺口已闭合）。
 
 ## 图例

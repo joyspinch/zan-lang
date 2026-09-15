@@ -135,7 +135,7 @@ v6 特性是逐 demo 打补丁加上去的。配置一样但**语义层是 2.2.7
 `graph/force`、`calendar`、`title`、`polar` **均已有渲染器并已接线**
 （`ChartViewHier.zan` / `ChartViewPictorial.zan` / `ChartLayoutRelation.zan` /
 `ChartViewCalendar.zan` / `ChartViewPolar.zan`；`ChartView.zan:1419-1489` 分派）。
-`docs/CHART_PORT_AUDIT_2026-09-10.md` 里「treemap/sunburst/pictorialBar/
+`docs/archive/CHART_PORT_AUDIT_2026-09-10.md` 里「treemap/sunburst/pictorialBar/
 parallel/graph 整类失效 100%」是**过期结论**——它测的是 2026-09-10 02:54 的
 构建，早于 28207b3f / f4eae183 / 4aa39232 等提交。
 
@@ -143,7 +143,7 @@ parallel/graph 整类失效 100%」是**过期结论**——它测的是 2026-09
 
 ## 四、旧口径的问题（为什么改走代码口径）
 
-1. **截图审计的产物会腐烂。** `CHART_PORT_AUDIT_2026-09-10.md` 引用的
+1. **截图审计的产物会腐烂。** `docs/archive/CHART_PORT_AUDIT_2026-09-10.md` 引用的
    `_scratch/shots/`（335 张 Zan 侧截图）**现在只剩 5 个文件**；
    `render_audit.json` 停在 2026-09-10 16:11，早于其后 5 个修复提交。
    账本引用的 `_scratch/echarts-master/`（596 个源文件）同样是 git-ignored，

@@ -147,7 +147,7 @@ TCP RTT 0.1ms、推送 fanout 3ms）。
 # 0) 构建部署（WSL）
 build/zanc.exe @server_srcs --stdlib-path <repo>/stdlib --auto-stdlib \
   --target linux-x64 -o _scratch/wsl/server-game   # 83 个模板源文件
-# 部署 ~/zan-srv/app/server-game，pkill 旧进程 → 清 data/app.db* → 起服等 8099
+# 部署到部署根下的 app/server-game，pkill 旧进程 → 清 data/app.db* → 起服等 8099
 
 # 1) 功能门（fresh db 必须）
 python3 tools/e2e.py                     # 125 断言

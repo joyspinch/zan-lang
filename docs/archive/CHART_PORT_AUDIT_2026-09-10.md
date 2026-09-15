@@ -1,8 +1,13 @@
+> **已归档（一次性审计快照，2026-09-10，不再维护）。**
+> 本报告是对 `ready: true` 的 335 个示例做的首次官方渲染全量对照，其结论已并入
+> `docs/CHART_COMPATIBILITY_5.md`（迁移账本）与 `docs/CHART_CODE_GAP_LEDGER.md`
+> （代码级对照），两者冲突时以后者为准；下方正文保留为历史审计依据。
+
 # Zan 图表引擎移植完整度审计报告
 
 **审计日期**：2026-09-10
 **审计范围**：`examples/gui_charts` 注册表中 `ready: true` 的 **335** 个示例
-**官方基准**：ECharts **v6.1.0**（`echarts-master`，与 `Downloads/echarts-master` 同源，MD5 一致）
+**官方基准**：ECharts **v6.1.0**（`echarts-master`，与本地下载目录下的同名源码树同源，MD5 一致）
 **实现**：`stdlib/Gui/Component/Chart/`
 
 ---

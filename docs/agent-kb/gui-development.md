@@ -54,7 +54,7 @@ while (app.isRunning) {
 `app.canvas.Width()/Height()` 取）。改主题相关代码前 grep 一下 `Theme.zan` 里的字段名。
 
 皮肤与样式：`Skin.zan`（皮肤索引/切换）、`Style*.zan` / `StyleSheet.zan` / `Css.zan`
-（CSS 式样式层，IDE 自己的布局在 `src/ide_zan/ide.css`）、`skins/`（资源）。
+（CSS 式样式层，IDE 自己的布局在 `src/ide_zan/assets/ide.css`）、`skins/`（资源）。
 
 ## 绘制原语（`stdlib/Gui/Render.zan`）
 

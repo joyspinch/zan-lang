@@ -60,7 +60,8 @@ zan-lang/
 │   │   ├── rt_wasm.c                   # WebAssembly backend support
 │   │   ├── zan_embed_api.c             # Embedding API
 │   │   └── gui_runtime.c, gui_runtime_font.c, gui_runtime_text.c,
-│   │       gui_runtime_tray.c, gui_runtime_x11.c, gui_runtime_sdl.c,
+│   │       gui_runtime_glyph.c, gui_runtime_tray.c, gui_runtime_x11.c,
+│   │       gui_runtime_android.c, gui_runtime_ohos.c, gui_runtime_wasm.c,
 │   │       gui_runtime_mac.m, gui_runtime_shims.c   # GUI backends
 │   │
 │   ├── lsp/                            # Language Server (LSP over stdio)
@@ -72,9 +73,10 @@ zan-lang/
 │   │   └── debugger.c/h                # Debugger engine
 │   │
 │   ├── ide_zan/                        # IDE — self-hosted, written in Zan
-│   │   ├── ZanIDE.zan                  # IDE application (compiled by zanc)
+│   │   ├── src/IdeForm.html            # IDE application entry (compiled by zanc)
+│   │   ├── src/shell/ZanIDE.zan        # IDE shell
 │   │   ├── zan.proj                    # Project manifest (name/type/target/entry)
-│   │   └── components/                 # Reusable Zan UI components
+│   │   └── src/components/             # Reusable Zan UI components
 │   │
 │   ├── doc/                            # Documentation generator
 │   │   └── zandoc.zan                  # zandoc tool (built to build/zandoc.exe)
@@ -203,7 +205,7 @@ build/                                  # Out-of-source build dir (single level)
 ├── zan-lsp / zan-dap                   # Language server, debug adapter
 ├── zanfmt.exe                          # Formatter (built from src/fmt/zanfmt.zan)
 ├── zandoc.exe                          # Doc generator (built from src/doc/zandoc.zan)
-├── ZanIDE.exe                          # IDE executable (from src/ide_zan/ZanIDE.zan)
+├── ZanIDE.exe                          # IDE executable (from src/ide_zan/, entry src/IdeForm.html)
 ├── zanrt_io.o / zanrt_io_mt.o          # Socket-async reactor objects (epoll/kqueue/IOCP)
 ├── zanrt_timer.o                       # Timer runtime object
 ├── zanrt_sync.o / zanrt_mem.o          # Sync / memory runtime objects

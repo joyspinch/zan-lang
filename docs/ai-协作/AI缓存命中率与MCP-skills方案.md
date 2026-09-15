@@ -1,6 +1,6 @@
 # IDE AI 助手缓存命中率低的原因与改进方案（zan-lang）
 
-面向 `d:\project\zan-lang` 的现状写的。结论先给：缓存低不是模型问题，
+面向本仓库（zan-lang）的现状写的。结论先给：缓存低不是模型问题，
 是**上下文前缀被反复打断 + 每轮塞进大量易变内容**。改法分三层：会话纪律、IDE 配置、线上 MCP+skills 架构。
 
 ---
@@ -54,7 +54,7 @@
 
 1. `AGENTS.md`（已有，6.4KB，OK）——只写不变的规范：构建命令、测试命令、目录约定、禁止事项。
    **不要**往里写「当前进度」「TODO」，那属于易变内容，一改就废掉全局缓存。
-2. `docs/ai-协作/工程地图.md`——模块 → 目录 → 关键文件 → 对外接口签名（谁调谁）。
+2. `docs/agent-kb/project-map.md`（已有）——模块 → 目录 → 关键文件 → 对外接口签名（谁调谁）。
    compiler 这类工程尤其值：`src/lexer|parser|sema|codegen|runtime|stdlib` 各自入口与不变量。
 3. `.agents/skills/*/SKILL.md`（已有 3 个测试类 skill）——把「怎么跑 GUI 测试 / 怎么起 admin server」
    这类反复重现的过程固化，避免每次让模型现场摸索。
@@ -232,7 +232,7 @@ IDE / Devin ───▶│  工具集冻结为 6 个：                        
 
 - [ ] 加 `.cursorignore`（内容见 3.1），把 build/dist/日志/exe/中文快照目录全屏蔽
 - [ ] `sk.txt`、`secrets.local.ps1`、`*.pem` 移出工作区或纳入 ignore + `.gitignore`
-- [ ] `AGENTS.md` 清掉进度类内容，只留不变规范；新增 `docs/ai-协作/工程地图.md`
+- [ ] `AGENTS.md` 清掉进度类内容，只留不变规范；工程地图复用 `docs/agent-kb/project-map.md`
 - [ ] 约定输出裁剪：所有构建/测试命令一律 `| tail -n 60`
 - [ ] 一任务一线程；禁用中途 `/compact` 与换模型
 - [ ] 记录每轮 `cache_read / input` 比例，做基线

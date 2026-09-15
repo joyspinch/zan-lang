@@ -136,7 +136,7 @@ singleAxis、dataset transform 等子系统仍缺。每批闭环：移植 → �
 > 可再生：`python scripts/chart_gap_audit.py`）。
 
 首次以**官方渲染结果**为基准做全量对照：用本仓库 `_scratch/echarts-master`
-（v6.1.0，与 `~/Downloads/echarts-master` 同源）的 dist 渲染 335 个
+（v6.1.0，与本地下载目录下的 `echarts-master` 同源）的 dist 渲染 335 个
 `ready: true` 示例，得到官方基准图 `_scratch/official_shots/`，再与 Zan 侧
 的窗口截图逐例比对。审计脚本 `_scratch/render_audit.py`。
 
