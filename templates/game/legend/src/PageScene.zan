@@ -22,8 +22,8 @@ delegate void SceneFn();
 ///   排行榜面板 x 1102..1491  y 163..880（10 行，行距 70.7 设备）
 ///
 /// 数据来源：进度/怪物取离线 `Game`，联机时玩家气血走 `net.Self()`。
-/// 排行榜服务端还没有这个 op（缺口记在 TASKS.md），先照原版截图的
-/// 演示榜渲染——与竞技场页的兜底同一套思路。
+/// 排行榜走服务端 `scenerank`（dim 1=幻境 2=秘境 3=世界BOSS），真行
+/// 优先、演示行补位；离线照原版截图的演示榜渲染。
 ///
 /// 一处**已知差异**（数据而非界面）：原版层 1 画的怪物是白野猪的美术
 /// （assets/boss/00801.png），我们的 maps.csv 第 1 层配的是稻草人（00101 系
@@ -99,6 +99,25 @@ partial class LegendApp {
     int SceneRankFloor(int i) { return SceneDemoFloors()[i % Spec.SceneRankRows()]; }
     int SceneRankLevel(int i) { return SceneDemoLevels()[i % Spec.SceneRankRows()]; }
 
+    /* 当前场景页的榜维度（1=幻境 2=秘境 3=世界BOSS），三个入口各设一次；
+       在线时 SceneRankPane 读服务端 scenerank.rows，离线回落演示榜。 */
+    int sceneDim = 1;
+
+    /// 榜行取数：在线行不足 10 行时，余下行回落演示数据（原版版面不满
+    /// 行也照画，空榜整版演示会失真——以真行优先、演示补位）。 */
+    string SceneRowName(int i, JsonValue live, int n) {
+        if (live != null && i < n) { return live.At(i).Str("name", "?"); }
+        return SceneRankName(i);
+    }
+    int SceneRowFloor(int i, JsonValue live, int n) {
+        if (live != null && i < n) { return live.At(i).Int("floor", 0); }
+        return SceneRankFloor(i);
+    }
+    int SceneRowLevel(int i, JsonValue live, int n) {
+        if (live != null && i < n) { return live.At(i).Int("level", 0); }
+        return SceneRankLevel(i);
+    }
+
     /// 玩家气血：联机以服务端 self 为准，离线用本地进度。
     string ScenePlayerHp() {
         JsonValue st = net.Self();
@@ -121,6 +140,7 @@ partial class LegendApp {
 
     /// 页 2 入口：幻境。
     void BuildScene() {
+        this.sceneDim = 1;
         SceneCfg cfg = new SceneCfg();
         cfg.title = "幻境" + Rules.N(g.floor);
         cfg.bestLabel = "最高幻境记录：";
@@ -140,6 +160,7 @@ partial class LegendApp {
 
     /// 页 12 入口：秘境——与幻境同族，差异：标题、怪物、最高记录、提示文案。
     void BuildSecret() {
+        this.sceneDim = 2;
         SceneCfg cfg = new SceneCfg();
         cfg.title = "秘境" + Rules.N(g.secretFloor);
         cfg.bestLabel = "最高秘境记录：";
@@ -161,6 +182,7 @@ partial class LegendApp {
     /// 排行榜 10 行（玩家名 + "次/伤害"），与幻境共家族，但右下列出的玩家
     /// 攻击/伤害。差异在 cfg + 挑战动作。
     void BuildWorldBoss() {
+        this.sceneDim = 3;
         SceneCfg cfg = new SceneCfg();
         cfg.title = "等级 " + Rules.N(g.level);
         cfg.bestLabel = "剩余BOSS挑战次数：";
@@ -442,7 +464,14 @@ partial class LegendApp {
     }
 
     /// 排行榜面板：10 行「头像 + 名字（巅峰N级）第N层 + 层数血条」。
+    /// 在线读服务端 scenerank（真行优先、演示补位）；血条按榜首进度满宽。
     Panel SceneRankPane() {
+        if (net.Self() != null) { net.MaybeRefreshSceneRank(this.sceneDim); }
+        JsonValue live = net.Self() != null ? net.SceneRankRows(this.sceneDim) : null;
+        int n = live != null && live.IsArray() ? live.Count() : 0;
+        int topFloor = 0;
+        if (n > 0) { topFloor = SceneRowFloor(0, live, n); }
+        if (topFloor <= 0) { live = null; n = 0; topFloor = SceneRankFloor(0); }
         Panel pane = Panel.Column(); pane.Class = "scene-rank";
         pane.Pad(0); pane.Gap(Spec.SceneRankRowGap());
         pane.Padding(Spec.SceneRankPadT(), 0, 0, 0);
@@ -462,13 +491,13 @@ partial class LegendApp {
             Panel top = Panel.Column(); top.Prefer(0, Spec.SceneRankTextT()); col.With(top);
             Panel line = Panel.Row(); line.Pad(0); line.Gap(0);
             line.Prefer(0, Spec.SceneRankTextH()); col.With(line);
-            line.With(Text(SceneRankName(i), SceneDemoNameCls(i), 0));
-            line.With(Text("（巅峰" + Rules.N(SceneRankLevel(i)) + "级）", "scene-rank-lv", 0));
-            line.With(Text("第" + Rules.N(SceneRankFloor(i)) + "层", "scene-rank-floor", 0));
+            line.With(Text(SceneRowName(i, live, n), SceneDemoNameCls(i), 0));
+            line.With(Text("（巅峰" + Rules.N(SceneRowLevel(i, live, n)) + "级）", "scene-rank-lv", 0));
+            line.With(Text("第" + Rules.N(SceneRowFloor(i, live, n)) + "层", "scene-rank-floor", 0));
             Panel barGap = Panel.Column(); barGap.Prefer(0, Spec.SceneRankBarGap()); col.With(barGap);
             Panel barRow = Panel.Row(); barRow.Pad(0); barRow.Prefer(0, Spec.SceneRankBarH());
             col.With(barRow);
-            int barW = Spec.SceneRankBarMax() * SceneRankFloor(i) / Spec.SceneRankBarScale();
+            int barW = Spec.SceneRankBarMax() * SceneRowFloor(i, live, n) / topFloor;
             if (barW > Spec.SceneRankBarMax()) { barW = Spec.SceneRankBarMax(); }
             if (barW < Spec.Px(4)) { barW = Spec.Px(4); }
             Panel bar = Panel.Row(); bar.Class = SceneBarCls(i);

@@ -1964,6 +1964,92 @@ class Play {
         Gateway.SelfInto(r, s);
         return r;
     }
+
+    /* 场景页家族进度榜（幻境/秘境/世界BOSS 右栏 10 行的数据通道）：
+       {"op":"scenerank","dim":1|2|3} → rows[{name,level,floor}]×10 + me。
+       dim1 幻境 = 地图解锁进度 mapUnlocked（地图链推进 = 推层）；
+       dim2 秘境 = 五行总层数（修炼深度，打怪实时涨）；
+       dim3 世界BOSS = 本周期伤害（Fight 内存榜，重生清零）。
+       前两维扫本区玩家表（在线人数小，名次选择同爵位/结伴榜）。 */
+    static async JsonValue SceneRank(Session s, JsonValue m) {
+        int dim = m.Int("dim", 1);
+        JsonValue rows = JsonValue.NewArray();
+        if (dim == 3) {
+            for (int rank = 0; rank < 10 && Fight.wbBoardNames.Count > 0;
+                    rank = rank + 1) {
+                int best = 0;
+                for (int k = 1; k < Fight.wbBoardVals.Count; k = k + 1) {
+                    if (Fight.wbBoardVals[k] > Fight.wbBoardVals[best]) { best = k; }
+                }
+                JsonValue o = JsonValue.NewObject();
+                o.Set("name", JsonValue.NewStr(Fight.wbBoardNames[best]));
+                o.Set("level", JsonValue.NewNum("0"));
+                o.Set("floor", JsonValue.NewNum(
+                    Convert.ToString(Fight.wbBoardVals[best])));
+                rows.Append(o);
+                Fight.wbBoardNames.RemoveAt(best);
+                Fight.wbBoardVals.RemoveAt(best);
+            }
+            JsonValue r3 = Gateway.Ok();
+            r3.Set("rows", rows);
+            r3.Set("me", JsonValue.NewNum(Convert.ToString(s.wbDmg)));
+            Gateway.SelfInto(r3, s);
+            return r3;
+        }
+        IDbConnection db = await Gateway.Db();
+        if (db == null) { return Gateway.Err("数据库不可用，请稍后再试"); }
+        try {
+            List<ZanWeb.Model.Game.Player> all = await db
+                .Select<ZanWeb.Model.Game.Player>()
+                .Where(a => a.realmId == s.realmId)
+                .ToListAsync();
+            List<string> names = new List<string>();
+            List<int> lvls = new List<int>();
+            List<int> floors = new List<int>();
+            for (int i = 0; i < all.Count; i = i + 1) {
+                int f = 0;
+                if (dim == 2) {
+                    int[] wx = Play.WxParse(all[i].wuxingRanks);
+                    for (int k = 0; k < wx.Length; k = k + 1) { f = f + wx[k]; }
+                } else {
+                    f = all[i].mapUnlocked;
+                }
+                if (f <= 0) { continue; }
+                names.Add(all[i].nickname);
+                lvls.Add(all[i].level);
+                floors.Add(f);
+            }
+            for (int rank = 0; rank < 10 && names.Count > 0; rank = rank + 1) {
+                int best = 0;
+                for (int k = 1; k < floors.Count; k = k + 1) {
+                    if (floors[k] > floors[best]) { best = k; }
+                }
+                JsonValue o = JsonValue.NewObject();
+                o.Set("name", JsonValue.NewStr(names[best]));
+                o.Set("level", JsonValue.NewNum(Convert.ToString(lvls[best])));
+                o.Set("floor", JsonValue.NewNum(Convert.ToString(floors[best])));
+                rows.Append(o);
+                names.RemoveAt(best);
+                lvls.RemoveAt(best);
+                floors.RemoveAt(best);
+            }
+        } finally {
+            Gateway.Give(db);
+        }
+        int me = dim == 2 ? Play.WxSum(s.row.wuxingRanks) : s.row.mapUnlocked;
+        JsonValue r = Gateway.Ok();
+        r.Set("rows", rows);
+        r.Set("me", JsonValue.NewNum(Convert.ToString(me)));
+        Gateway.SelfInto(r, s);
+        return r;
+    }
+
+    static int WxSum(string csv) {
+        int[] wx = Play.WxParse(csv);
+        int sum = 0;
+        for (int i = 0; i < wx.Length; i = i + 1) { sum = sum + wx[i]; }
+        return sum;
+    }
 }
 
 /* 一行称谓：列即快照小写原始字段。展示对（攻/魔/道/防/魔防）是

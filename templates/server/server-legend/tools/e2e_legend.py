@@ -681,6 +681,25 @@ def run_cas_and_worldstate(cookie):
     wb_hp = int(((r or {}).get("wboss") or {}).get("hp", 0))
     ok(wb_hp > 0, "wboss hit recorded (hp=%d)" % wb_hp)
 
+    # 场景进度榜三维度：幻境=mapUnlocked、秘境=五行总层数、世界BOSS=本周期伤害
+    hero.send({"op": "scenerank", "dim": 1})
+    r = hero.reply_for(lambda m: "rows" in m)
+    rows = (r or {}).get("rows", [])
+    hero_in = any(x.get("name") == "市霸" + TS and int(x.get("floor", 0)) >= 1
+                  for x in rows)
+    ok(hero_in, "scenerank dim1 幻境 lists hero (rows=%d)" % len(rows))
+    hero.send({"op": "scenerank", "dim": 2})
+    r = hero.reply_for(lambda m: "rows" in m)
+    ok(r is not None and isinstance((r or {}).get("rows"), list),
+       "scenerank dim2 秘境 returns rows array")
+    hero.send({"op": "scenerank", "dim": 3})
+    r = hero.reply_for(lambda m: "rows" in m)
+    rows = (r or {}).get("rows", [])
+    ok(len(rows) >= 1 and rows[0]["name"] == "市霸" + TS
+       and int(rows[0]["floor"]) > 0,
+       "scenerank dim3 世界BOSS damage board tops hero (floor=%s)"
+       % (rows[0]["floor"] if rows else "-"))
+
     # 攻占城池 1：建会需要 500 万金币 + 沃玛号角(330)，胜率随 power 抬满后必胜
     ok(gm_save(cookie, uid1, "市霸" + TS, gift=(330, 1)), "GM gift 沃玛号角")
     hero.clear()
