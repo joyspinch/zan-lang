@@ -505,12 +505,6 @@ class GameNet {
         return true;
     }
 
-    /* 最小 JSON 字符串转义：连接密码可能含引号/反斜杠。*/
-    static string JStr(string s) {
-        string t = s.Replace("\\", "\\\\");
-        return t.Replace("\"", "\\\"");
-    }
-
     /* 经静态中转拿到当前会话实例（线程入口是静态方法组）。*/
     static GameNet worker;
     static void ThreadEntry() { GameNet.worker.NetMain(); }
@@ -544,7 +538,9 @@ class GameNet {
             }
             /* 推送通道心跳：服务端按连接清僵尸（Gateway.SweepIdle）。 */
             if (this.wsock >= 0 && this.wenc && now - lastHb >= 30) {
-                if (!this.WSendText(this.secTx.Seal("{\"op\":\"hb\"}") + "\n")) {
+                JsonValue hb = JsonValue.NewObject();
+                hb.PutStr("op", "hb");
+                if (!this.WSendText(this.secTx.Seal(hb.ToJson()) + "\n")) {
                     this.PostLinkDown("推送通道发送失败");
                 } else {
                     lastHb = now;
@@ -617,8 +613,12 @@ class GameNet {
                 this.PostLinkDown("握手派生失败");
                 return "stop";
             }
-            if (!this.WSendText("{\"op\":\"hello\",\"enc\":\"aes-gcm\",\"cnonce\":\""
-                    + cnonce + "\",\"pass\":\"" + GameNet.JStr(this.cPass) + "\"}\n")) {
+            JsonValue hello = JsonValue.NewObject();
+            hello.PutStr("op", "hello");
+            hello.PutStr("enc", "aes-gcm");
+            hello.PutStr("cnonce", cnonce);
+            hello.PutStr("pass", this.cPass);
+            if (!this.WSendText(hello.ToJson() + "\n")) {
                 this.PostLinkDown("发送失败");
                 return "stop";
             }
@@ -629,8 +629,10 @@ class GameNet {
             /* 加密通告：切换发送加密，随即认领推送通道（应答带
                push:1，走解密路径回 UI）。 */
             this.wenc = true;
-            if (this.WSendText(this.secTx.Seal("{\"op\":\"attach\",\"token\":\""
-                    + this.token + "\"}") + "\n")) {
+            JsonValue attach = JsonValue.NewObject();
+            attach.PutStr("op", "attach");
+            attach.PutStr("token", this.token);
+            if (this.WSendText(this.secTx.Seal(attach.ToJson()) + "\n")) {
                 return "swallow";
             }
             this.PostLinkDown("推送通道发送失败");
@@ -781,14 +783,14 @@ class GameNet {
         }
     }
 
-    /* 从 op 的 JSON 体里取 op 名（路由即 /api/game/<op>）。
-       "op":" 恒在串首，用户输入污染不到它。 */
+    /* 从 op 的 JSON 体里取 op 名（路由即 /api/game/<op>）。请求体
+       全部由 JsonValue 树构建产出，这里改走解析取值，不再按引号
+       位置做文本外科手术。 */
     static string OpName(string json) {
-        int k = json.IndexOf("\"op\":\"");
-        if (k < 0) { return "state"; }
-        int e = json.IndexOf("\"", k + 6);
-        if (e < 0) { return "state"; }
-        return json.Substring(k + 6, e - k - 6);
+        JsonValue m = null;
+        try { m = JsonValue.ParseLenient(json); } catch (Exception) { m = null; }
+        string op = m != null ? m.Str("op", "") : "";
+        return op.Length > 0 ? op : "state";
     }
 
     /* 25 秒保活轮询用的 state 请求：应答与 ev state 同一合入规则。 */
@@ -1039,14 +1041,18 @@ class GameNet {
 
     string Host() { return this.cHost; }
 
-    /* HTTP 会话没有连接可认：每个 op 体都要带 token。调用点保持 TCP
-       时代的形状（{"op":...}），token 在这唯一出口统一注入。token 是
-       服务端签发的 32 位十六进制，不含引号，拼接安全。 */
+    /* HTTP 会话没有连接可认：每个 op 体都要带 token。请求体是
+       JsonValue 树序列化出的对象文本，token 在这唯一出口统一注入：
+       解析回树、Set 后重序列化，不按文本位置做外科手术。token 是
+       服务端签发的 32 位十六进制，值本身安全，但注入仍走树以防
+       未来 token 形态变化。 */
     string Seal(string json) {
-        if (this.token.Length > 0 && json.IndexOf("{\"") == 0) {
-            return "{\"token\":\"" + this.token + "\"," + json.Substring(1);
-        }
-        return json;
+        if (this.token.Length == 0) { return json; }
+        JsonValue m = null;
+        try { m = JsonValue.ParseLenient(json); } catch (Exception) { m = null; }
+        if (m == null || !m.IsObject()) { return json; }
+        m.Set("token", JsonValue.NewStr(this.token));
+        return m.ToJson();
     }
 
     /* ---- UI 动作 ---- */
@@ -1059,8 +1065,12 @@ class GameNet {
     void SetFormMsg(string s) { this.formMsg = s; }
     void Register(string user, string pass, string email) {
         if (user.Length < 3 || pass.Length < 6) { this.AddChat("[系统]", "账号需 ≥3 字符，密码需 ≥6 位。"); return; }
-        this.Op("{\"op\":\"register\",\"user\":\"" + user + "\",\"pass\":\"" + pass
-            + "\",\"email\":\"" + email + "\"}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "register");
+        body.PutStr("user", user);
+        body.PutStr("pass", pass);
+        body.PutStr("email", email);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (r.Int("ok", 0) == 1) {
                 this.formMsg = "注册成功，请登录。";
                 this.AddChat("[系统]", this.formMsg);
@@ -1076,7 +1086,11 @@ class GameNet {
        就自动拨推送通道），拿区服列表（应答自带）后停在「分区」选择
        页——照原版不自动进区，玩家选分区→区服才进。 */
     void Login(string user, string pass) {
-        this.Op("{\"op\":\"login\",\"user\":\"" + user + "\",\"pass\":\"" + pass + "\"}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "login");
+        body.PutStr("user", user);
+        body.PutStr("pass", pass);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (r.Int("ok", 0) != 1) {
                 /* 失败必须落到 formMsg：登录窗没有聊天区，只 AddChat 等于
                    把失败吞掉（服务端 err 只有这里能到界面）。 */
@@ -1109,7 +1123,10 @@ class GameNet {
     string ResetMsg() { return this.resetMsg; }
     void Forgot(string user) {
         this.forgotQuestion = ""; this.forgotMsg = "";
-        this.Op("{\"op\":\"forgot\",\"user\":\"" + user + "\"}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "forgot");
+        body.PutStr("user", user);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (r.Int("ok", 0) == 1) { this.forgotQuestion = r.Str("question", ""); }
             else { this.forgotMsg = r.Str("err", "未知错误"); }
             this.Bump();
@@ -1117,8 +1134,12 @@ class GameNet {
     }
     void Reset(string user, string answer, string newpass) {
         this.resetMsg = "";
-        this.Op("{\"op\":\"reset\",\"user\":\"" + user + "\",\"answer\":\"" + answer
-            + "\",\"newpass\":\"" + newpass + "\"}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "reset");
+        body.PutStr("user", user);
+        body.PutStr("answer", answer);
+        body.PutStr("newpass", newpass);
+        this.Op(body.ToJson(), (JsonValue r) => {
             this.resetOk = r.Int("ok", 0) == 1;
             this.resetMsg = this.resetOk ? r.Str("msg", "密码已重置，请用新密码登录")
                 : r.Str("err", "未知错误");
@@ -1132,10 +1153,13 @@ class GameNet {
        回一句没发信，绝不在没发的情况下说已发。 */
     void ChangePass(string user, string oldpass, string newpass, bool mail) {
         this.formMsg = "";
-        this.Op("{\"op\":\"changepw\",\"user\":\"" + GameNet.JStr(user)
-            + "\",\"oldpass\":\"" + GameNet.JStr(oldpass)
-            + "\",\"newpass\":\"" + GameNet.JStr(newpass)
-            + "\",\"mail\":" + (mail ? "1" : "0") + "}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "changepw");
+        body.PutStr("user", user);
+        body.PutStr("oldpass", oldpass);
+        body.PutStr("newpass", newpass);
+        body.PutBool("mail", mail);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (r.Int("ok", 0) == 1) {
                 this.formMsg = r.Str("msg", "密码已修改，请用新密码登录");
                 string mm = r.Str("mailmsg", "");
@@ -1156,7 +1180,10 @@ class GameNet {
     bool CharsReady() { return this.charsReady; }
     void RefreshChars(int realmId) {
         this.chars = null; this.charsReady = false;
-        this.Op("{\"op\":\"characters\",\"realm\":" + Convert.ToString(realmId) + "}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "characters");
+        body.PutInt("realm", realmId);
+        this.Op(body.ToJson(), (JsonValue r) => {
             JsonValue rows = r.Get("rows");
             if (rows != null && rows.IsArray()) { this.chars = rows; }
             this.charsReady = true;
@@ -1164,7 +1191,10 @@ class GameNet {
         });
     }
     void DelChar(int realmId) {
-        this.Op("{\"op\":\"delchar\",\"realm\":" + Convert.ToString(realmId) + "}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "delchar");
+        body.PutInt("realm", realmId);
+        this.Op(body.ToJson(), (JsonValue r) => {
             this.AddChat("[系统]", r.Int("ok", 0) == 1 ? "角色已删除。"
                 : "删除失败：" + r.Str("err", "未知错误"));
             this.RefreshChars(realmId);
@@ -1176,7 +1206,10 @@ class GameNet {
     void EnterRealm(int id, string name) {
         this.realmId = id;
         this.realmName = name;
-        this.Op("{\"op\":\"enter\",\"realm\":" + Convert.ToString(id) + "}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "enter");
+        body.PutInt("realm", id);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (r.Int("ok", 0) != 1) {
                 /* 该区还没有角色：置标记，登录窗切到建角页（照原版选区
                    后没角色就先建角）。*/
@@ -1200,9 +1233,13 @@ class GameNet {
        世界（self 直接带回来）。 */
     void CreateChar(string name, int job, int gender) {
         if (name.Length < 2) { this.AddChat("[系统]", "角色名需 2 个字符以上。"); return; }
-        this.Op("{\"op\":\"create\",\"realm\":" + Convert.ToString(this.realmId)
-            + ",\"name\":\"" + name + "\",\"job\":" + Convert.ToString(job)
-            + ",\"gender\":" + Convert.ToString(gender) + "}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "create");
+        body.PutInt("realm", this.realmId);
+        body.PutStr("name", name);
+        body.PutInt("job", job);
+        body.PutInt("gender", gender);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (r.Int("ok", 0) != 1) {
                 this.formMsg = "创建角色失败：" + r.Str("err", "未知错误");
                 this.AddChat("[系统]", this.formMsg);
@@ -1259,7 +1296,10 @@ class GameNet {
     }
 
     void EquipItem(int itemId) {
-        this.Op("{\"op\":\"equip\",\"item\":" + Convert.ToString(itemId) + "}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "equip");
+        body.PutInt("item", itemId);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (r.Int("ok", 0) != 1) { this.AddChat("[系统]", "穿戴失败：" + r.Str("err", "未知错误")); return; }
             JsonValue st = r.Get("self");
             if (st != null && st.IsObject()) { this.self = st; }
@@ -1271,7 +1311,10 @@ class GameNet {
     /* 卸下：slot 为服务端穿戴位代码（0武器 1衣服 2头盔 3项链 4手镯
        6戒指 8腰带 9靴子 10勋章 11宝石）。 */
     void TakeOff(int slot) {
-        this.Op("{\"op\":\"takeoff\",\"slot\":" + Convert.ToString(slot) + "}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "takeoff");
+        body.PutInt("slot", slot);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (r.Int("ok", 0) != 1) { this.AddChat("[系统]", "卸下失败：" + r.Str("err", "未知错误")); return; }
             JsonValue st = r.Get("self");
             if (st != null && st.IsObject()) { this.self = st; }
@@ -1301,7 +1344,10 @@ class GameNet {
     }
 
     void UseItem(int itemId) {
-        this.Op("{\"op\":\"use\",\"item\":" + Convert.ToString(itemId) + "}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "use");
+        body.PutInt("item", itemId);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (r.Int("ok", 0) != 1) { this.AddChat("[系统]", "使用失败：" + r.Str("err", "未知错误")); return; }
             JsonValue st = r.Get("self");
             if (st != null && st.IsObject()) { this.self = st; }
@@ -1310,7 +1356,11 @@ class GameNet {
     }
 
     void SellItem(int itemId) {
-        this.Op("{\"op\":\"sell\",\"item\":" + Convert.ToString(itemId) + ",\"count\":1}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "sell");
+        body.PutInt("item", itemId);
+        body.PutInt("count", 1);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (r.Int("ok", 0) != 1) { this.AddChat("[系统]", "卖出失败：" + r.Str("err", "未知错误")); return; }
             JsonValue st = r.Get("self");
             if (st != null && st.IsObject()) { this.self = st; }
@@ -1340,8 +1390,11 @@ class GameNet {
 
     /* 商店购买：服务端按 items 表金价计费、直接入背包。 */
     void ShopBuyItem(int itemId, int count) {
-        this.Op("{\"op\":\"buy\",\"item\":" + Convert.ToString(itemId)
-            + ",\"count\":" + Convert.ToString(count) + "}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "buy");
+        body.PutInt("item", itemId);
+        body.PutInt("count", count);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (r.Int("ok", 0) != 1) { this.AddChat("[系统]", "购买失败：" + r.Str("err", "未知错误")); return; }
             JsonValue st = r.Get("self");
             if (st != null && st.IsObject()) { this.self = st; }
@@ -1473,7 +1526,10 @@ class GameNet {
     }
 
     void ArenaFight(int rival) {
-        this.Op("{\"op\":\"arena\",\"fight\":" + Convert.ToString(rival) + "}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "arena");
+        body.PutInt("fight", rival);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (this.TakeSelf(r)) {
                 JsonValue a = r.Get("arena");
                 if (a != null && a.IsObject()) { this.playArena = a; }
@@ -1532,13 +1588,19 @@ class GameNet {
     }
 
     void GuildCreate(string name) {
-        this.Op("{\"op\":\"guild\",\"create\":\"" + GameNet.JStr(name) + "\"}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "guild");
+        body.PutStr("create", name);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (this.TakeSelf(r)) { this.AddFeed("行会「" + name + "」创立！"); this.RefreshGuild(); }
         });
     }
 
     void GuildJoin(int id) {
-        this.Op("{\"op\":\"guild\",\"join\":" + Convert.ToString(id) + "}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "guild");
+        body.PutInt("join", id);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (this.TakeSelf(r)) { this.AddFeed("入会成功！"); this.RefreshGuild(); }
         });
     }
@@ -1563,7 +1625,11 @@ class GameNet {
     }
 
     void SiegeAttack(int city) {
-        this.Op("{\"op\":\"siege\",\"attack\":1,\"city\":" + Convert.ToString(city) + "}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "siege");
+        body.PutInt("attack", 1);
+        body.PutInt("city", city);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (this.TakeSelf(r)) {
                 JsonValue a = r.Get("siege");
                 if (a != null && a.IsObject()) { this.playSiege = a; }
@@ -1608,7 +1674,11 @@ class GameNet {
     }
 
     void WuxingAct(string act, int id) {
-        this.Op("{\"op\":\"wuxing\",\"do\":\"" + act + "\",\"id\":" + Convert.ToString(id) + "}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "wuxing");
+        body.PutStr("do", act);
+        body.PutInt("id", id);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (this.TakeSelf(r)) {
                 JsonValue a = r.Get("wuxing");
                 if (a != null && a.IsObject()) { this.playWuxing = a; }
@@ -1634,7 +1704,10 @@ class GameNet {
     }
 
     void MentorBow(string name) {
-        this.Op("{\"op\":\"mentor\",\"master\":\"" + GameNet.JStr(name) + "\"}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "mentor");
+        body.PutStr("master", name);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (this.TakeSelf(r)) { this.AddFeed("拜师成功！师父是 " + name); this.RefreshMentor(); }
         });
     }
@@ -1661,7 +1734,10 @@ class GameNet {
     }
 
     void AltarDonate(string kind) {
-        this.Op("{\"op\":\"altar\",\"do\":\"" + kind + "\"}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "altar");
+        body.PutStr("do", kind);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (this.TakeSelf(r)) {
                 JsonValue a = r.Get("altar");
                 if (a != null && a.IsObject()) { this.playAltar = a; }
@@ -1706,7 +1782,10 @@ class GameNet {
     }
 
     void RedpackSend(int gold) {
-        this.Op("{\"op\":\"redpack\",\"send\":" + Convert.ToString(gold) + "}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "redpack");
+        body.PutInt("send", gold);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (this.TakeSelf(r)) { this.RefreshRedpack(); }
         });
     }
@@ -1736,9 +1815,12 @@ class GameNet {
     }
 
     void MarketSell(int itemId, int count, int price) {
-        this.Op("{\"op\":\"market\",\"sellItem\":" + Convert.ToString(itemId)
-            + ",\"count\":" + Convert.ToString(count)
-            + ",\"price\":" + Convert.ToString(price) + "}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "market");
+        body.PutInt("sellItem", itemId);
+        body.PutInt("count", count);
+        body.PutInt("price", price);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (this.TakeSelf(r)) {
                 this.AddFeed("挂单成功，等待买家。");
                 this.RefreshBag();
@@ -1748,7 +1830,10 @@ class GameNet {
     }
 
     void MarketBuy(int rowId) {
-        this.Op("{\"op\":\"market\",\"buy\":" + Convert.ToString(rowId) + "}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "market");
+        body.PutInt("buy", rowId);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (this.TakeSelf(r)) {
                 this.AddFeed("购买成功，物品已入背包。");
                 this.RefreshBag();
@@ -1758,7 +1843,10 @@ class GameNet {
     }
 
     void MarketCancel(int rowId) {
-        this.Op("{\"op\":\"market\",\"cancel\":" + Convert.ToString(rowId) + "}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "market");
+        body.PutInt("cancel", rowId);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (this.TakeSelf(r)) {
                 this.AddFeed("已下架，物品退回背包。");
                 this.RefreshBag();
@@ -1769,8 +1857,11 @@ class GameNet {
 
     /* 图鉴明细：kind=items/mobs 分页（每页 20 条，服务端切页）。 */
     void RefreshCodexPage(string kind, int page) {
-        this.Op("{\"op\":\"codexpage\",\"kind\":\"" + kind + "\",\"page\":"
-            + Convert.ToString(page) + "}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "codexpage");
+        body.PutStr("kind", kind);
+        body.PutInt("page", page);
+        this.Op(body.ToJson(), (JsonValue r) => {
             JsonValue rows = r.Get("rows");
             if (rows != null && rows.IsArray()) {
                 this.codexKind = kind;
@@ -1807,18 +1898,26 @@ class GameNet {
     /* 翻页：{"op":"title","page":N}。playTitle 保留旧页直到应答整包
        替换（置空会让重建期的 Maybe 守卫再拉一次第 0 页）。 */
     void TitlePage(int n) {
-        this.Op("{\"op\":\"title\",\"page\":" + Convert.ToString(n) + "}",
-                (JsonValue r) => { this.TakeTitleReply(r); });
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "title");
+        body.PutInt("page", n);
+        this.Op(body.ToJson(), (JsonValue r) => { this.TakeTitleReply(r); });
     }
 
     void TitleUnlock(string name) {
-        this.Op("{\"op\":\"title\",\"unlock\":\"" + GameNet.JStr(name) + "\"}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "title");
+        body.PutStr("unlock", name);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (this.TakeSelf(r)) { this.AddFeed("称谓「" + name + "」已解锁！"); this.RefreshTitle(); }
         });
     }
 
     void TitleWear(string name) {
-        this.Op("{\"op\":\"title\",\"wear\":\"" + GameNet.JStr(name) + "\"}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "title");
+        body.PutStr("wear", name);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (this.TakeSelf(r)) {
                 this.AddFeed(name == "无" ? "已摘下称谓。" : "已佩戴称谓「" + name + "」。");
                 this.RefreshTitle();
@@ -1845,7 +1944,10 @@ class GameNet {
 
     /* take = 服务端成就定义的 1 基行号（客户端第 1 页一行对一行）。 */
     void AchTake(int no) {
-        this.Op("{\"op\":\"ach\",\"take\":" + Convert.ToString(no) + "}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "ach");
+        body.PutInt("take", no);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (this.TakeSelf(r)) {
                 this.AddFeed("成就奖励已领取！");
                 this.RefreshBag();
@@ -1866,7 +1968,10 @@ class GameNet {
     }
 
     void LordDonate(int yuan) {
-        this.Op("{\"op\":\"lord\",\"donate\":" + Convert.ToString(yuan) + "}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "lord");
+        body.PutInt("donate", yuan);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (this.TakeSelf(r)) {
                 this.AddFeed("捐献成功，贡献度已累计。");
                 this.RefreshLord();
@@ -1890,7 +1995,10 @@ class GameNet {
     }
 
     void MailTake(int id) {
-        this.Op("{\"op\":\"mail\",\"take\":" + Convert.ToString(id) + "}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "mail");
+        body.PutInt("take", id);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (this.TakeSelf(r)) {
                 this.AddFeed("附件已提取到背包。");
                 this.RefreshBag();
@@ -1910,7 +2018,10 @@ class GameNet {
     }
 
     void MailDel(int id) {
-        this.Op("{\"op\":\"mail\",\"del\":" + Convert.ToString(id) + "}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "mail");
+        body.PutInt("del", id);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (this.TakeSelf(r)) { this.AddFeed("邮件已删除。"); this.RefreshMail(); }
         });
     }
@@ -1934,7 +2045,10 @@ class GameNet {
 
     /* reg = 殿堂格号（0 基，与页面卡片同序）：以对应装备位的当前穿戴登记。 */
     void SupReg(int slot) {
-        this.Op("{\"op\":\"sup\",\"reg\":" + Convert.ToString(slot) + "}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "sup");
+        body.PutInt("reg", slot);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (this.TakeSelf(r)) {
                 this.AddFeed("登记成功，经验加成已更新！");
                 this.RefreshSup();
@@ -1959,8 +2073,11 @@ class GameNet {
     /* put = 组号 slot = 格号：服务端从背包找该格对应装备放入（消耗，
        放入无法取出），失败错误进聊天。 */
     void TjPut(int group, int slot) {
-        this.Op("{\"op\":\"tj\",\"put\":" + Convert.ToString(group)
-            + ",\"slot\":" + Convert.ToString(slot) + "}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "tj");
+        body.PutInt("put", group);
+        body.PutInt("slot", slot);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (this.TakeSelf(r)) {
                 this.AddFeed("装备已放入图鉴（放入无法取出）。");
                 this.RefreshBag();
@@ -1970,7 +2087,10 @@ class GameNet {
     }
 
     void Forge(string slot) {
-        this.Op("{\"op\":\"forge\",\"slot\":\"" + slot + "\"}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "forge");
+        body.PutStr("slot", slot);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (r.Int("ok", 0) != 1) { this.AddChat("[系统]", "强化失败：" + r.Str("err", "未知错误")); return; }
             JsonValue st = r.Get("self");
             if (st != null && st.IsObject()) { this.self = st; }
@@ -2009,8 +2129,11 @@ class GameNet {
 
     /* 回收系统页按行回收：只结账指定材料，count>0 时限数量。 */
     void RecycleOne(int itemId, int count) {
-        this.Op("{\"op\":\"recycle\",\"item\":" + Convert.ToString(itemId)
-            + ",\"count\":" + Convert.ToString(count) + "}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "recycle");
+        body.PutInt("item", itemId);
+        body.PutInt("count", count);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (r.Int("ok", 0) != 1) { this.AddChat("[系统]", "回收失败：" + r.Str("err", "未知错误")); return; }
             JsonValue st = r.Get("self");
             if (st != null && st.IsObject()) { this.self = st; }
@@ -2021,10 +2144,10 @@ class GameNet {
     }
 
     void AutoHunt(int mobId, bool on) {
-        string json = on
-            ? "{\"op\":\"auto\",\"mob\":" + Convert.ToString(mobId) + ",\"on\":1}"
-            : "{\"op\":\"auto\",\"on\":0}";
-        this.Op(json, (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "auto");
+        if (on) { body.PutInt("mob", mobId); body.PutInt("on", 1); } else { body.PutInt("on", 0); }
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (r.Int("ok", 0) == 1) {
                 this.autoMob = on ? mobId : 0;
                 this.demoHp = 0; this.demoWait = 0; this.demoTick = 0;
@@ -2097,8 +2220,10 @@ class GameNet {
     /* 打开地图内页：拉一次 BOSS 面板（挑战/扫荡回复自带新面板）。 */
     void OpenMapPage(int mapId) {
         this.bossMap = mapId;
-        this.Op("{\"op\":\"bossinfo\",\"map\":" + Convert.ToString(mapId) + "}",
-            (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "bossinfo");
+        body.PutInt("map", mapId);
+        this.Op(body.ToJson(), (JsonValue r) => {
                 JsonValue p = r.Get("page");
                 if (r.Int("ok", 0) != 1) {
                     this.AddFeed("BOSS面板拉取失败：" + r.Str("err", "未知错误"));
@@ -2111,23 +2236,28 @@ class GameNet {
     /* 挑战一场：服务端整场打完，回复带逐轮战报。勾了自动挑战且打输
        且还有次数就接着递归磨（BOSS 留血，玩家每场满血，磨得动）。 */
     void BossFight(int mapId) {
-        this.Op("{\"op\":\"bossfight\",\"map\":" + Convert.ToString(mapId) + "}",
-            (JsonValue r) => {
-                if (r.Int("ok", 0) != 1) {
-                    this.AddFeed("挑战失败：" + r.Str("err", "未知错误"));
-                    return;
-                }
-                this.TakeBossReply(r);
-                if (this.bossAuto && r.Int("win", 0) != 1
-                        && this.self != null && this.self.Int("tries", 0) > 0) {
-                    this.BossFight(mapId);
-                }
-            });
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "bossfight");
+        body.PutInt("map", mapId);
+        this.Op(body.ToJson(), (JsonValue r) => {
+            if (r.Int("ok", 0) != 1) {
+                this.AddFeed("挑战失败：" + r.Str("err", "未知错误"));
+                return;
+            }
+            this.TakeBossReply(r);
+            if (this.bossAuto && r.Int("win", 0) != 1
+                    && this.self != null && this.self.Int("tries", 0) > 0) {
+                this.BossFight(mapId);
+            }
+        });
     }
 
     void BossSweep(int mapId, int count) {
-        this.Op("{\"op\":\"bossweep\",\"map\":" + Convert.ToString(mapId)
-            + ",\"count\":" + Convert.ToString(count) + "}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "bossweep");
+        body.PutInt("map", mapId);
+        body.PutInt("count", count);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (r.Int("ok", 0) != 1) {
                 this.AddFeed("扫荡失败：" + r.Str("err", "未知错误"));
                 return;
@@ -2139,7 +2269,10 @@ class GameNet {
     }
 
     void Hunt(int mobId) {
-        this.Op("{\"op\":\"hunt\",\"mob\":" + Convert.ToString(mobId) + "}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "hunt");
+        body.PutInt("mob", mobId);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (r.Int("ok", 0) != 1) { this.AddChat("[系统]", "开战失败：" + r.Str("err", "未知错误")); return; }
             JsonValue f = r.Get("fight");
             if (f != null && f.IsObject()) { this.lastFight = f; }
@@ -2157,7 +2290,10 @@ class GameNet {
     }
 
     void MoveTo(int mapId) {
-        this.Op("{\"op\":\"move\",\"map\":" + Convert.ToString(mapId) + "}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "move");
+        body.PutInt("map", mapId);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (r.Int("ok", 0) != 1) { this.AddFeed("移动失败：" + r.Str("err", "未知错误")); return; }
             JsonValue st = r.Get("self");
             if (st != null && st.IsObject()) { this.self = st; }
@@ -2168,7 +2304,11 @@ class GameNet {
     }
 
     void BuyItem(int itemId) {
-        this.Op("{\"op\":\"buy\",\"item\":" + Convert.ToString(itemId) + ",\"count\":1}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "buy");
+        body.PutInt("item", itemId);
+        body.PutInt("count", 1);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (r.Int("ok", 0) != 1) { this.AddChat("[系统]", "购买失败：" + r.Str("err", "未知错误")); return; }
             JsonValue st = r.Get("self");
             if (st != null && st.IsObject()) { this.self = st; }
@@ -2180,7 +2320,10 @@ class GameNet {
 
     void Say(string text) {
         if (text.Length == 0) { return; }
-        this.Op("{\"op\":\"say\",\"text\":\"" + text + "\"}", (JsonValue r) => {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "say");
+        body.PutStr("text", text);
+        this.Op(body.ToJson(), (JsonValue r) => {
             if (r.Int("ok", 0) != 1) { this.AddChat("[系统]", "发送失败：" + r.Str("err", "未知错误")); }
         });
     }

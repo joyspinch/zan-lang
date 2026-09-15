@@ -170,12 +170,14 @@ class Ai {
             Ai.Messages(Ai.AgentOf(agentCode), historyJson, question));
     }
 
-    /* 构造 messages 数组：系统提示词 + 历史（最多 20 轮）+ 当前问题。 */
+    /* 构造 messages 数组：系统提示词 + 历史（最多 20 轮）+ 当前问题。
+       树构建 + ToJson 产出，转义交给 Encoding.JsonEscape（Q 不再需要）。 */
     static string Messages(AiAgent agent, string historyJson, string question) {
-        StringBuilder msgs = new StringBuilder();
-        msgs.Append("[{\"role\":\"system\",\"content\":");
-        msgs.Append(Ai.Q(agent.prompt));
-        msgs.Append("}");
+        JsonValue msgs = JsonValue.NewArray();
+        JsonValue sys = JsonValue.NewObject();
+        sys.PutStr("role", "system");
+        sys.PutStr("content", agent.prompt);
+        msgs.Append(sys);
         JsonValue hist = JsonValue.Parse(historyJson);
         if (hist != null && hist.IsArray()) {
             int keep = hist.Count();
@@ -188,17 +190,17 @@ class Ai {
                 if (role != "user" && role != "assistant") { role = "user"; }
                 string content = m.Str("content", "");
                 if (content.Length == 0) { continue; }
-                msgs.Append(",{\"role\":");
-                msgs.Append(Ai.Q(role));
-                msgs.Append(",\"content\":");
-                msgs.Append(Ai.Q(content));
-                msgs.Append("}");
+                JsonValue one = JsonValue.NewObject();
+                one.PutStr("role", role);
+                one.PutStr("content", content);
+                msgs.Append(one);
             }
         }
-        msgs.Append(",{\"role\":\"user\",\"content\":");
-        msgs.Append(Ai.Q(question));
-        msgs.Append("}]");
-        return msgs.ToString();
+        JsonValue cur = JsonValue.NewObject();
+        cur.PutStr("role", "user");
+        cur.PutStr("content", question);
+        msgs.Append(cur);
+        return msgs.ToJson();
     }
 
     /* AI 外部调用预算：所有请求都必须有有限的大小、时间和重试预算。
@@ -232,14 +234,11 @@ class Ai {
     /* 非流式调用：发送 messages，返回文本或失败原因。 */
     static async AiReply Complete(AiEndpoint ep, string key, string model,
                                   string temp, string messages) {
-        StringBuilder body = new StringBuilder();
-        body.Append("{\"model\":");
-        body.Append(Ai.Q(model));
-        body.Append(",\"temperature\":");
-        body.Append(Ai.Number(temp));
-        body.Append(",\"stream\":false,\"messages\":");
-        body.Append(messages);
-        body.Append("}");
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("model", model);
+        body.PutJson("temperature", Ai.Number(temp));
+        body.PutBool("stream", false);
+        body.PutJson("messages", messages);
 
         HttpClient http = new HttpClient(ep.Host(), ep.Port());
         if (ep.Tls()) { http = HttpClient.CreateHttps(ep.Host(), ep.Port()); }
@@ -251,7 +250,7 @@ class Ai {
         string raw = "";
         try {
             HttpResponse resp = await http.SendAsync("POST",
-                ep.Path() + "/chat/completions", body.ToString());
+                ep.Path() + "/chat/completions", body.ToJson());
             raw = resp.body;
             if (resp.statusCode >= 500) {
                 return AiReply.Bad("AI 服务返回 "
@@ -289,15 +288,11 @@ class Ai {
         AiEndpoint ep = AiEndpoint.Parse(baseUrl);
         if (ep == null) { return AiReply.Bad("服务地址不合法"); }
 
-        StringBuilder body = new StringBuilder();
-        body.Append("{\"model\":");
-        body.Append(Ai.Q(model));
-        body.Append(",\"temperature\":");
-        body.Append(Ai.Number(temp));
-        body.Append(",\"stream\":true,\"messages\":");
-        body.Append(Ai.Messages(Ai.AgentOf(agentCode), historyJson, question));
-        body.Append("}");
-
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("model", model);
+        body.PutJson("temperature", Ai.Number(temp));
+        body.PutBool("stream", true);
+        body.PutJson("messages", Ai.Messages(Ai.AgentOf(agentCode), historyJson, question));
         HttpClient http = new HttpClient(ep.Host(), ep.Port());
         if (ep.Tls()) { http = HttpClient.CreateHttps(ep.Host(), ep.Port()); }
         /* 空闲超时：每个分片重设，慢响应也能存活，静默超时会被挂断。 */
@@ -317,7 +312,7 @@ class Ai {
             return false;
         });
         long producer = Task.Spawn(http.PostSseToSinkAsync(
-            ep.Path() + "/chat/completions", body.ToString(), sink));
+            ep.Path() + "/chat/completions", body.ToJson(), sink));
 
         StringBuilder full = new StringBuilder();
         string pending = "";
@@ -444,11 +439,6 @@ class Ai {
             AuthUser.Give(db);
         }
         return AiReply.Good("建表成功");
-    }
-
-    /* JSON 字符串字面量，含引号。 */
-    static string Q(string v) {
-        return "\"" + Encoding.JsonEscape(v) + "\"";
     }
 
     /* 安全的温度值：仅数字和小数点。 */
