@@ -1,0 +1,512 @@
+"""Contract e2e for the server-mvc template.
+
+Drives a live instance over HTTP with per-endpoint assertions, plus direct
+sqlite reads for persistence contracts. Covers the chains the template
+actually ships:
+
+  infra     health shallow/deep, front page, static assets
+  auth      admin login (bad/good), session cookie, anonymous redirect guard
+  content   category save / inline quick (rename, clamp, unknown field and
+            identity slug rejected, anonymous rejected), dict item quick
+            toggle, SQL-ish payload stored safely
+  coder     designer three-step (save design -> add column -> migrate DDL,
+            verified via PRAGMA), inline quick on a designed column, AI
+            guard when AI unconfigured, preview, delete design
+  monitor   index / sql / history / alerts shape / generic data manager / docs
+  mail      SMTP catcher (local sink, stdlib socket): unconfigured guard,
+            settings save flips mail.ssl off, forgot-code delivery (base64
+            body decode -> 6-digit code), 60s resend cooldown, wrong code,
+            real reset (old password rejected, session invalidated, new
+            password logs in)
+
+The script manages the server lifecycle itself:
+  1. refresh a sandbox in _scratch/mvc_e2e/ (config on port 8299, cache in
+     memory, worker 1, fresh data/, views+wwwroot copied from the template)
+  2. build the exe with zanc when the sandbox has none or --build
+  3. boot `app.exe start`, wait for /health
+  4. run the matrix, stop the server via its control port -- the netstat
+     fallback only ever kills PIDs listening on the sandbox port, never by
+     image name (the dev instance shares it)
+
+Run from anywhere; paths resolve from this file's location:
+  python tools/e2e_mvc.py [--exe PATH] [--build] [--port 8299] [--keep]
+Stdlib urllib/socket/subprocess/sqlite3 only.
+"""
+import argparse
+import base64
+import json
+import os
+import re
+import shutil
+import socket
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TMPL = os.path.dirname(HERE)                    # templates/server/server-mvc
+# repo root is three levels up: templates/server/server-mvc -> .. -> .. -> ..
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(TMPL)))
+SANDBOX = os.path.join(REPO, "_scratch", "mvc_e2e")
+EXE = os.path.join(SANDBOX, "app.exe")
+DB = os.path.join(SANDBOX, "data", "app.db")
+MAIL_PORT = 8725
+
+BASE = "http://127.0.0.1:8299"
+fails = []
+checks = 0
+
+
+def ok(cond, label):
+    global checks
+    checks += 1
+    print(("PASS " if cond else "FAIL ") + label)
+    if not cond:
+        fails.append(label)
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **kw):
+        return None
+
+
+opener = urllib.request.build_opener(NoRedirect)
+
+
+def http(path, data=None, cookie=None, timeout=15):
+    """Returns (status, body, set_cookie_lines). Never raises on HTTP errors."""
+    req = urllib.request.Request(BASE + path)
+    if cookie:
+        req.add_header("Cookie", cookie)
+    body = urllib.parse.urlencode(data).encode() if data is not None else None
+    if body is not None:
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        resp = opener.open(req, body, timeout=timeout)
+        return (resp.status, resp.read().decode("utf-8", "replace"),
+                resp.headers.get_all("Set-Cookie") or [])
+    except urllib.error.HTTPError as e:
+        return (e.code, e.read().decode("utf-8", "replace"),
+                e.headers.get_all("Set-Cookie") or [])
+
+
+def code_of(body):
+    """JSON envelope code, or "" when the reply is not the API envelope."""
+    try:
+        return json.loads(body).get("code", "")
+    except Exception:
+        return ""
+
+
+def session_cookie(setc):
+    for line in setc:
+        if line.startswith("zsession="):
+            return line.split(";")[0]
+    return ""
+
+
+def sql(query, args=()):
+    con = sqlite3.connect(DB, timeout=10)
+    try:
+        rows = con.execute(query, args).fetchall()
+        con.commit()
+        return rows
+    finally:
+        con.close()
+
+
+def table_exists(name):
+    return bool(sql(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)))
+
+
+# ---- SMTP catcher ----------------------------------------------------------
+
+class Catcher:
+    """Minimal no-auth SMTP sink answering exactly the session Mailer speaks
+    (220 -> EHLO -> MAIL/RCPT 250 -> DATA 354 -> dot-line -> 250 -> QUIT)
+    and keeping every DATA payload for inspection."""
+
+    def __init__(self, port):
+        self.port = port
+        self.mails = []
+        self.lock = threading.Lock()
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", port))
+        self.sock.listen(4)
+        threading.Thread(target=self.loop, daemon=True).start()
+
+    def loop(self):
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self.talk, args=(conn,),
+                             daemon=True).start()
+
+    def talk(self, conn):
+        f = conn.makefile("rb")
+        conn.sendall(b"220 e2e-catcher ready\r\n")
+        in_data = False
+        buf = b""
+        while True:
+            line = f.readline()
+            if not line:
+                break
+            if in_data:
+                if line in (b".\r\n", b".\n"):
+                    with self.lock:
+                        self.mails.append(buf)
+                    buf = b""
+                    in_data = False
+                    conn.sendall(b"250 accepted\r\n")
+                else:
+                    buf += line
+                continue
+            cmd = line.strip().upper()
+            if cmd.startswith(b"DATA"):
+                in_data = True
+                conn.sendall(b"354 go\r\n")
+            elif cmd.startswith(b"QUIT"):
+                conn.sendall(b"221 bye\r\n")
+                break
+            else:
+                conn.sendall(b"250 ok\r\n")
+        conn.close()
+
+    def body(self):
+        """Decoded text of the latest mail (base64 CTE per Mailer)."""
+        with self.lock:
+            if not self.mails:
+                return ""
+            raw = self.mails[-1].decode("utf-8", "replace")
+        m = re.search(r"Content-Transfer-Encoding: base64\r\n\r\n(.+)",
+                      raw, re.S)
+        if not m:
+            return raw
+        return base64.b64decode(
+            re.sub(r"\s+", "", m.group(1))).decode("utf-8", "replace")
+
+
+# ---- lifecycle -------------------------------------------------------------
+
+def build_exe():
+    zanc = os.path.join(REPO, "build", "zanc.exe")
+    if not os.path.exists(zanc):
+        print("zanc not found at", zanc)
+        sys.exit(2)
+    srcs = [os.path.join(TMPL, "src", "main.zan")]
+    for root, _dirs, files in os.walk(os.path.join(TMPL, "src")):
+        for fn in sorted(files):
+            if fn.endswith(".zan") and fn != "main.zan":
+                srcs.append(os.path.join(root, fn))
+    cmd = [zanc] + srcs + ["--auto-stdlib", "--publish", "-o", EXE]
+    print("[build] zanc ... (%d sources)" % len(srcs))
+    r = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True)
+    if r.returncode != 0 or not os.path.exists(EXE):
+        print(r.stdout[-3000:], r.stderr[-3000:])
+        sys.exit(2)
+
+
+def setup_sandbox(port):
+    shutil.rmtree(os.path.join(SANDBOX, "data"), ignore_errors=True)
+    os.makedirs(os.path.join(SANDBOX, "data"), exist_ok=True)
+    shutil.copytree(os.path.join(TMPL, "views"),
+                    os.path.join(SANDBOX, "views"), dirs_exist_ok=True)
+    shutil.copytree(os.path.join(TMPL, "wwwroot"),
+                    os.path.join(SANDBOX, "wwwroot"), dirs_exist_ok=True)
+    cfg = json.load(open(os.path.join(TMPL, "config", "app.json"),
+                         encoding="utf-8"))
+    cfg["server"]["name"] = "mvc-e2e"
+    cfg["server"]["port"] = port
+    cfg["worker"]["count"] = 1
+    if "daemon" in cfg["worker"]:
+        cfg["worker"]["daemon"] = False
+    # 无 Redis 的沙箱：本地内存缓存，worker=1 下语义正确。
+    cfg["cache"]["driver"] = "memory"
+    cfg["metrics"]["flushSeconds"] = 2
+    os.makedirs(os.path.join(SANDBOX, "config"), exist_ok=True)
+    with open(os.path.join(SANDBOX, "config", "app.json"), "w",
+              encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+def stop_server(port):
+    subprocess.run([EXE, "stop"], cwd=SANDBOX, capture_output=True, timeout=30)
+    for _ in range(20):
+        try:
+            http("/health", timeout=2)
+            time.sleep(0.5)
+        except Exception:
+            return
+    # 控制端口失灵的兜底：只杀监听沙箱端口的 PID，绝不按镜像名杀
+    #（开发实例共用 app.exe 镜像名）。
+    out = subprocess.run(["netstat", "-ano"], capture_output=True,
+                         text=True).stdout
+    pids = {ln.split()[-1] for ln in out.splitlines()
+            if ":" + str(port) + " " in ln and "LISTENING" in ln}
+    for pid in pids:
+        subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--exe", default="",
+                    help="reuse this built app.exe instead of compiling")
+    ap.add_argument("--build", action="store_true")
+    ap.add_argument("--port", type=int, default=8299)
+    ap.add_argument("--keep", action="store_true",
+                    help="keep the sandbox for inspection")
+    a = ap.parse_args()
+
+    global BASE
+    BASE = "http://127.0.0.1:%d" % a.port
+
+    setup_sandbox(a.port)
+    if a.exe:
+        shutil.copyfile(a.exe, EXE)
+        # 运行时 DLL（sqlite/ssl 等）与 exe 同目录，由 --publish 落盘。
+        for fn in os.listdir(os.path.dirname(os.path.abspath(a.exe))):
+            if fn.lower().endswith(".dll"):
+                shutil.copyfile(os.path.join(
+                    os.path.dirname(os.path.abspath(a.exe)), fn),
+                    os.path.join(SANDBOX, fn))
+    elif a.build or not os.path.exists(EXE):
+        build_exe()
+
+    subprocess.Popen([EXE, "start"], cwd=SANDBOX,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    up = False
+    for _ in range(60):
+        try:
+            code, _b, _c = http("/health", timeout=2)
+            if code == 200:
+                up = True
+                break
+        except Exception:
+            pass
+        time.sleep(0.5)
+    if not up:
+        print("server did not come up on", BASE)
+        for log in ("zan_crash.log", "server.log", "run.log"):
+            p = os.path.join(SANDBOX, log)
+            if os.path.exists(p):
+                print("--- %s ---" % log)
+                print(open(p, encoding="utf-8", errors="replace").read()[-2000:])
+        stop_server(a.port)
+        sys.exit(2)
+    print("[boot] health ok on", BASE)
+
+    catcher = Catcher(MAIL_PORT)
+    try:
+        run_matrix(catcher)
+    finally:
+        stop_server(a.port)
+        print("\n%d checks, %d failed" % (checks, len(fails)))
+        for f in fails:
+            print("  FAIL:", f)
+        if not a.keep:
+            shutil.rmtree(SANDBOX, ignore_errors=True)
+    sys.exit(1 if fails else 0)
+
+
+def run_matrix(catcher):
+    # ---- infra ----
+    code, body, _ = http("/health")
+    ok(code == 200 and '"ok"' in body, "health shallow 200 ok")
+    code, body, _ = http("/health?deep=1")
+    ok(code == 200, "health deep 200")
+    code, _b, _c = http("/static/css/admin.css?v=4")
+    ok(code == 200, "static admin.css 200")
+    code, body, _ = http("/")
+    ok(code == 200 and len(body) > 200, "front page renders")
+
+    # ---- auth ----
+    code, _b, setc = http("/admin")
+    ok(code in (301, 302) and not session_cookie(setc),
+       "admin guards anonymous -> redirect")
+    code, _b, setc = http("/admin/login", {"user": "admin", "pass": "wrong"})
+    ok(code not in (301, 302) and not session_cookie(setc),
+       "bad login rejected")
+    code, _b, setc = http("/admin/login",
+                          {"user": "admin", "pass": "admin1234"})
+    cookie = session_cookie(setc)
+    ok(code in (301, 302) and cookie, "admin login sets session")
+    code, body, _ = http("/admin", cookie=cookie)
+    ok(code == 200 and len(body) > 200, "dashboard renders with session")
+
+    # ---- content: categories ----
+    http("/admin/content/categories/save", cookie=cookie, data={
+        "name": "e2e 分类", "slug": "e2e-cat", "description": "e2e 建的",
+        "sortOrder": "9", "status": "1"})
+    ok(table_exists("blog_category") and
+       sql("SELECT id FROM blog_category WHERE slug='e2e-cat'"),
+       "category row persisted")
+    cid = sql("SELECT id FROM blog_category WHERE slug='e2e-cat'")[0][0]
+    code, body, _ = http("/admin/content/categories", cookie=cookie)
+    ok(code == 200 and "e2e-cat" in body, "category listed")
+    r = http("/admin/content/categories/quick", cookie=cookie,
+             data={"id": cid, "field": "name", "value": "e2e 分类改"})
+    ok(code_of(r[1]) == "0000", "category quick rename ok")
+    ok(sql("SELECT name FROM blog_category WHERE id=?", (cid,))[0][0]
+       == "e2e 分类改", "rename persisted")
+    http("/admin/content/categories/quick", cookie=cookie,
+         data={"id": cid, "field": "sortOrder", "value": "-5"})
+    ok(sql("SELECT sortOrder FROM blog_category WHERE id=?", (cid,))[0][0] == 0,
+       "negative sort clamped to 0")
+    r = http("/admin/content/categories/quick", cookie=cookie,
+             data={"id": cid, "field": "slug", "value": "hijack"})
+    ok(code_of(r[1]) != "0000", "slug not inline-editable")
+    ok(sql("SELECT slug FROM blog_category WHERE id=?", (cid,))[0][0]
+       == "e2e-cat", "slug untouched")
+    r = http("/admin/content/categories/quick",
+             data={"id": cid, "field": "name", "value": "anon"})
+    ok(code_of(r[1]) != "0000", "quick rejects anonymous")
+    http("/admin/content/categories/save", cookie=cookie, data={
+        "name": "'; DROP TABLE blog_category;--", "slug": "sqli-e2e",
+        "sortOrder": "1", "status": "1"})
+    ok(table_exists("blog_category") and
+       sql("SELECT COUNT(*) FROM blog_category")[0][0] >= 2,
+       "sql-ish name stored safely, table intact")
+
+    # ---- dicts: item quick ----
+    code, _b, _c = http("/admin/system/dicts", cookie=cookie)
+    ok(code == 200, "dicts page renders")
+    items = sql("SELECT id, status FROM sys_dict_item ORDER BY id LIMIT 1")
+    if items:
+        iid, st = items[0]
+        r = http("/admin/system/dicts/itemquick", cookie=cookie,
+                 data={"id": iid, "field": "status",
+                       "value": "0" if st == 1 else "1"})
+        ok(code_of(r[1]) == "0000", "dict item quick ok")
+        ok(sql("SELECT status FROM sys_dict_item WHERE id=?", (iid,))[0][0]
+           != st, "dict status flipped")
+        r = http("/admin/system/dicts/itemquick", cookie=cookie,
+                 data={"id": iid, "field": "value", "value": "hijack"})
+        ok(code_of(r[1]) != "0000", "dict value not inline-editable")
+    else:
+        ok(False, "seeded dict items exist")
+
+    # ---- coder: designer three-step ----
+    r = http("/admin/dev/coder/tablesave", cookie=cookie, data={
+        "tableName": "e2e_demo", "title": "e2e 演示"})
+    ok(code_of(r[1]) == "0000" or r[0] in (200, 301, 302), "design saved")
+    tid = sql("SELECT id FROM sys_gen_table WHERE tableName='e2e_demo'")[0][0]
+    code, body, _ = http("/admin/dev/coder/design?id=%d" % tid, cookie=cookie)
+    ok(code == 200 and "e2e_demo" in body, "design page renders")
+    r = http("/admin/dev/coder/columnsave", cookie=cookie, data={
+        "tableId": tid, "name": "qty", "label": "数量", "kind": "int",
+        "widget": "number", "sortOrder": "10"})
+    ok(code_of(r[1]) == "0000" or r[0] in (200, 301, 302), "column saved")
+    col = sql("SELECT id FROM sys_gen_column WHERE tableId=? AND name='qty'",
+              (tid,))
+    ok(bool(col), "column row persisted")
+    colId = col[0][0]
+    body = http("/admin/dev/coder/design?id=%d" % tid, cookie=cookie)[1]
+    ok('data-quick-field="label"' in body, "design table inline-editable")
+    r = http("/admin/dev/coder/columnquick", cookie=cookie,
+             data={"id": colId, "field": "kind", "value": "long"})
+    ok(code_of(r[1]) == "0000", "column quick kind ok")
+    ok(sql("SELECT kind FROM sys_gen_column WHERE id=?", (colId,))[0][0]
+       == "long", "column kind persisted")
+    r = http("/admin/dev/coder/columnquick", cookie=cookie,
+             data={"id": colId, "field": "name", "value": "hijack"})
+    ok(code_of(r[1]) != "0000", "column name not inline-editable")
+    r = http("/admin/dev/coder/aidesign", cookie=cookie,
+             data={"tableId": tid, "desc": "test"})
+    ok(code_of(r[1]) != "0000", "aidesign guarded when AI off")
+    r = http("/admin/dev/coder/migrate", cookie=cookie, data={"id": tid})
+    ok(r[0] in (200, 301, 302), "migrate accepted")
+    ok(table_exists("e2e_demo"), "migrate created table")
+    cols = [row[1] for row in sql("PRAGMA table_info(e2e_demo)")]
+    ok("qty" in cols, "migrated column present")
+    # 数据管理页只认「已设计的表」：设计同步后即可管其数据。
+    code, body, _ = http("/admin/monitor/data?t=e2e_demo", cookie=cookie)
+    ok(code == 200 and "e2e_demo" in body, "generic data manager 200")
+    code, body, _ = http("/admin/dev/coder/preview?id=%d" % tid, cookie=cookie)
+    ok(code == 200 and "e2e_demo" in body, "preview generates code")
+    r = http("/admin/dev/coder/tabledelete", cookie=cookie, data={"id": tid})
+    ok(r[0] in (200, 301, 302), "design deleted")
+    ok(not sql("SELECT 1 FROM sys_gen_table WHERE id=?", (tid,)),
+       "design row gone")
+
+    # ---- monitor ----
+    for path, label in [("/admin/monitor", "monitor index"),
+                        ("/admin/monitor/sql", "monitor sql"),
+                        ("/admin/monitor/history", "monitor history"),
+                        ("/admin/system/docs", "api docs")]:
+        code, _b, _c = http(path, cookie=cookie)
+        ok(code == 200, label + " 200")
+    r = http("/admin/monitor/alerts", cookie=cookie)
+    d = {}
+    try:
+        d = json.loads(r[1])
+    except Exception:
+        pass
+    ok("alerts" in d and "ts" in d, "alerts endpoint shape")
+
+    # reset 会使旧会话失效，admin 会话断言放在邮件段之前。
+    code, _b, _c = http("/admin", cookie=cookie)
+    ok(code == 200, "admin alive before mail section")
+
+    # ---- mail: password reset end to end ----
+    r = http("/forgot/code", data={"email": "someone@example.com"})
+    ok(code_of(r[1]) != "0000", "forgot-code guarded when mail off")
+    # 验证码发给种子管理员：顺带验证「改密使旧会话与旧密码失效」。
+    sql("UPDATE sys_user SET email=? WHERE id=(SELECT MIN(id) FROM sys_user)",
+        ("e2e-reset@example.com",))
+    r = http("/admin/system/settings/save", cookie=cookie, data={
+        "mail.host": "127.0.0.1", "mail.port": str(MAIL_PORT),
+        "mail.ssl": "0", "mail.from": "e2e@zanweb.test",
+        "mail.fromName": "e2e"})
+    ok(r[0] in (200, 301, 302), "mail settings saved")
+    r = http("/forgot/code", data={"email": "e2e-reset@example.com"})
+    ok(code_of(r[1]) == "0000", "forgot-code sent")
+    time.sleep(0.5)
+    mailbody = catcher.body()
+    m = re.search(r"\b(\d{6})\b", mailbody)
+    ok(bool(m), "reset mail delivered with 6-digit code")
+    r = http("/forgot/code", data={"email": "e2e-reset@example.com"})
+    ok(code_of(r[1]) != "0000", "resend within cooldown rejected")
+    if m:
+        code6 = m.group(1)
+        wrong = "%06d" % ((int(code6) + 1) % 1000000)
+        r = http("/forgot", data={"email": "e2e-reset@example.com",
+                                  "code": wrong, "pass": "newpass-e2e-123"})
+        ok("验证码不正确" in r[1], "wrong code rejected")
+        r = http("/forgot", data={"email": "e2e-reset@example.com",
+                                  "code": code6, "pass": "newpass-e2e-123"})
+        ok("密码已重设" in r[1], "reset with mailed code succeeds")
+        # 改密 bump tokenVersion；版本校验有 30s TTL 缓存（Auth.VerTtlSec，
+        # 注释明说"最迟再有效 30 秒"），旧 token 最迟 30s 后被拒。
+        ok(sql("SELECT tokenVersion FROM sys_user WHERE username='admin'"
+               )[0][0] >= 1, "tokenVersion bumped in db")
+        code, _b, setc = http("/admin/login",
+                              {"user": "admin", "pass": "admin1234"})
+        ok(not session_cookie(setc), "old password rejected")
+        code, _b, setc = http("/admin/login",
+                              {"user": "admin", "pass": "newpass-e2e-123"})
+        ok(code in (301, 302) and session_cookie(setc),
+           "login with new password works")
+        print("[wait] 31s for the token-version cache to expire")
+        time.sleep(31)
+        code, _b, _c = http("/admin", cookie=cookie)
+        ok(code in (301, 302), "old session invalidated after reset")
+    else:
+        ok(False, "mail body captured")
+        ok(False, "wrong code rejected")
+        ok(False, "reset with mailed code succeeds")
+        ok(False, "old password rejected")
+        ok(False, "login with new password works")
+        ok(False, "old session invalidated after reset")
+
+
+if __name__ == "__main__":
+    main()

@@ -317,6 +317,28 @@ The working directory matters more than where the binary sits: the server reads
 RELATIVE path, so run it from the project root (or from a deploy directory that
 has those next to the executable) — never `cd build && ./app.exe`.
 
+### Contract e2e (`tools/e2e_mvc.py`)
+
+A self-contained Python-stdlib suite that manages the whole lifecycle itself:
+it builds a sandbox under `_scratch/mvc_e2e/` (fresh DB, port 8299, memory
+cache, worker 1, views/wwwroot copied from the template), boots the server,
+runs ~54 HTTP/sqlite contract checks (auth, content, inline `data-quick`
+editing, table designer incl. real DDL migration, monitor, and the full
+password-reset mail chain against a local SMTP catcher on port 8725), stops
+the server via its control port and deletes the sandbox. It never kills by
+image name and touches nothing outside `_scratch/`.
+
+```
+python tools/e2e_mvc.py                 # build with zanc if no sandbox exe yet
+python tools/e2e_mvc.py --build         # force rebuild
+python tools/e2e_mvc.py --exe path/to/app.exe   # reuse an existing build
+                                        # (its sibling *.dll are staged too)
+python tools/e2e_mvc.py --keep          # keep the sandbox for inspection
+```
+
+Exit code is 0 only when every check passes. Re-run it after any controller,
+view or admin.js change — it is the template's regression gate.
+
 ### Deploying
 
 Only `.zan` code is compiled into the executable. Views, config and assets are
