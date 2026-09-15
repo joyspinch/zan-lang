@@ -194,6 +194,17 @@ small-medium 之间**:画廊卡片标题先后用 13/15 都被打回"太小",17 
   (无 diff)。两个硬边界:主窗口 `LoadHtmlWith` 装的树没有模型,
   data-bind/data-if/data-for 全惰性;改模型与 `SetProp` 同一控件
   是两个写入源打架,回写会把模型改动顶回去。
+- **重尾控件(CEF/WebView)是"注册才可用",不注册 = 发布不携带**:
+  ControlFactory 主 switch 不含 `WebViewBox`/`CefBrowserBox`——单一
+  switch 的每个 `new Xxx()` 分支都会把该家族静态拉进编译图(globaldce
+  删不掉 internal 存活),几行代码的演示程序也会让 zanc 判定"图里有
+  CefBackend 符号",发布自动带上 zan_cef/zan_cef109/WebView2Loader
+  (bundle 的 `DLL if 符号前缀` 条件按符号存在性判定)。要用它们,宿主
+  在 Main/启动最前调一次 `CefControlBootstrap.Install()` 或
+  `WebViewBootstrap.Install()`(IDE 已接,gui_cef_browser 示例是范本);
+  不调用的程序整个家族被 DCE 删光,发布目录不再出现浏览器 DLL。给
+  其他重尾控件扩同类时,走 `HeavyControls.Register(kind, fn)` 同一
+  注册表,别往主 switch 加分支。
 - **zanc 编 .html 设计稿会先喷 `<unknown>` 噪音诊断,不是编译失败**:
   编译前置的命名空间预扫描对原始 HTML 文本跑一遍 Zan lexer,HTML 的中文
   与超长 data-uri 会报成 "unexpected character" 和 "string literal
