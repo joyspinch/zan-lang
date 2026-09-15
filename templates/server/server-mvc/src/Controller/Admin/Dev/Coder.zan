@@ -2,6 +2,8 @@ using System;
 using System.Data;
 using System.Data.Orm;
 using System.IO;
+using System.Json;
+using System.Text;
 using System.Web;
 using ZanWeb;
 using ZanWeb.Model.Sys;
@@ -151,6 +153,11 @@ class Coder : AdminController {
         d.Set("entityName", t.entityName);
         d.Set("tableTitle", t.title);
         if (t.migrated == 1) { d.Set("migrated", "1"); }
+        /* AI 生成入口：服务已配置且此屏可增改时出现；权限在各动作上再拦一道。 */
+        if (await Ai.Ready() && (await this.Can((int)PermBit.Create)
+                || await this.Can((int)PermBit.Update))) {
+            d.Set("canAi", "1");
+        }
 
         List<GenColumn> cols = await this.GenColumn
             .Where(a => a.tableId == id).OrderBy(a => a.sortOrder).ToListAsync();
@@ -327,6 +334,322 @@ class Coder : AdminController {
         await this.Note("删除字段", c.name, n > 0,
             "数据库中的列保留");
         this.Saved("字段已从设计中移除，数据库中的列保留");
+    }
+
+    /* AI 字段设计：一句话业务 → 整表字段草稿。AI 只出草案，且过三道关才落设计：
+       服务器按设计器契约重验每一列（不信任模型输出，与数据屏同一纪律），
+       人在审核表里逐列勾选，应用时对浏览器回传的清单再验一遍。 */
+    [HttpGet]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("AI 字段设计表单")]
+    async void AiForm() {
+        int tableId = this.InInt("tableId", 0);
+        GenTable t = await this.GenTable.Read(tableId);
+        if (t == null) { this.Fail(404, "0404", "设计不存在"); }
+        if (!await Ai.Ready()) {
+            this.Fail(400, "0005", "尚未配置 AI 服务，先到「站点设置 → AI」启用");
+        }
+        ViewData d = new ViewData();
+        d.Set("tableId", Convert.ToString(tableId));
+        d.Set("tableTitle", t.title);
+        d.Set("tableName", t.tableName);
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("AI 生成字段设计")]
+    async void AiDesign() {
+        int tableId = this.InInt("tableId", 0);
+        string desc = this.Need("desc", "业务描述");
+        GenTable t = await this.GenTable.Read(tableId);
+        if (t == null) { this.Fail(404, "0404", "设计不存在"); }
+        if (!await Ai.Ready()) { this.Fail(400, "0005", "尚未配置 AI 服务"); }
+        if (desc.Length > 2000) { desc = desc.Substring(0, 2000); }
+
+        List<GenColumn> cols = await this.GenColumn
+            .Where(a => a.tableId == tableId).OrderBy(a => a.sortOrder)
+            .ToListAsync();
+        /* 字典类型与已设计表作为取值范围给模型：下拉建议落在真实存在的
+           字典/表上，而不是编一个不存在的类型码。 */
+        List<DictType> dicts = await this.DictType
+            .Where(a => a.status == 1).ToListAsync();
+        List<GenTable> tables = await this.GenTable.OrderBy(a => a.id)
+            .ToListAsync();
+
+        AiReply r = await Ai.CompleteRaw(Coder.DesignPrompt(),
+            Coder.DesignAsk(t, desc, cols, dicts, tables));
+        if (!r.ok) { this.Fail(400, "0005", r.text); }
+        JsonValue root = Coder.DesignJson(r.text);
+        if (root == null || !root.IsObject()) {
+            this.Fail(400, "0005", "AI 返回的内容无法解析为字段设计，请重试或换个描述");
+        }
+        JsonValue colsArr = root.Get("columns");
+        if (colsArr == null || !colsArr.IsArray()) {
+            this.Fail(400, "0005", "AI 返回的内容无法解析为字段设计，请重试或换个描述");
+        }
+        ColumnDraft draft = Coder.Sanitize(colsArr, cols, tables);
+        if (draft.cols.Count == 0) {
+            this.Fail(400, "0005", "AI 给出的字段全部无效（重名或类型不合法），请换个描述再试");
+        }
+
+        JsonValue outArr = JsonValue.NewArray();
+        for (int i = 0; i < draft.cols.Count; i = i + 1) {
+            outArr.Append(Coder.ColumnJson(draft.cols[i]));
+        }
+        JsonValue outObj = JsonValue.NewObject();
+        outObj.Put("columns", outArr);
+        outObj.Put("dropped", MetricsCluster.Num(draft.dropped));
+        this.Ok(outObj.ToJson());
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("应用 AI 字段设计")]
+    async void AiApply() {
+        int tableId = this.InInt("tableId", 0);
+        string listJson = this.Need("columns", "字段清单");
+        GenTable t = await this.GenTable.Read(tableId);
+        if (t == null) { this.Fail(404, "0404", "设计不存在"); }
+        List<GenColumn> cols = await this.GenColumn
+            .Where(a => a.tableId == tableId).OrderBy(a => a.sortOrder)
+            .ToListAsync();
+        List<GenTable> tables = await this.GenTable.OrderBy(a => a.id)
+            .ToListAsync();
+        JsonValue arr = JsonValue.ParseLenient(listJson);
+        if (arr == null || !arr.IsArray()) {
+            this.Fail(400, "0004", "字段清单无法解析");
+        }
+        /* 浏览器回传的数据同样不被信任：与生成走同一个清洗器。 */
+        ColumnDraft draft = Coder.Sanitize(arr, cols, tables);
+        if (draft.cols.Count == 0) {
+            this.Fail(400, "0004", "没有可应用的有效字段");
+        }
+
+        int sort = 10;
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            if (cols[i].sortOrder >= sort) { sort = cols[i].sortOrder + 10; }
+        }
+        int added = 0;
+        for (int i = 0; i < draft.cols.Count; i = i + 1) {
+            GenColumn c = draft.cols[i];
+            c.tableId = tableId;
+            c.sortOrder = sort;
+            sort = sort + 10;
+            int _id = await this.GenColumn.Insert(c).ExecuteIdentityAsync();
+            added = added + 1;
+        }
+        await this.Note("AI 生成字段", t.tableName, added > 0,
+            Convert.ToString(added) + " 个字段"
+            + (draft.dropped > 0 ? "，丢弃 " + Convert.ToString(draft.dropped) : ""));
+        this.Saved("已应用 " + Convert.ToString(added)
+            + " 个字段，记得「同步数据库」建列");
+    }
+
+    /* 字段设计任务的系统提示词：严格 JSON 契约 + 控件配型规则。 */
+    static string DesignPrompt() {
+        return "你是 ZanWeb 表设计器的字段设计助手。根据业务描述为一张表设计字段，"
+            + "只输出一个 JSON 对象，不要解释、不要 Markdown 代码块，格式："
+            + "{\"columns\":[{\"name\":\"field_name\",\"label\":\"中文名\","
+            + "\"kind\":\"string\",\"size\":255,\"widget\":\"text\","
+            + "\"required\":1,\"nullable\":0,\"inList\":1,\"inFilter\":0,"
+            + "\"inCreate\":1,\"inEdit\":1,\"defValue\":\"\",\"sortOrder\":10,"
+            + "\"dictType\":\"\",\"relTable\":\"\",\"relValue\":\"\",\"relLabel\":\"\"}]}。"
+            + "规则：name 用小写下划线，不与已有字段重复；kind 只能是 string/text/"
+            + "int/long/decimal/bool/datetime；widget 只能是 text/textarea/number/"
+            + "select/switch/date/richtext/upload；bool 配 switch，text 配 textarea，"
+            + "int/long/decimal 配 number，datetime 配 date；枚举字段配 select 并填"
+            + " dictType（只能用给出的字典类型码），引用其他表配 select 并填 relTable"
+            + "（只能用给出的表名）与 relValue=id、relLabel=name；label 用简短中文；"
+            + "sortOrder 按 10 递增，重要字段在前；不加主键 id 与 created_at/"
+            + "updated_at（系统自动处理）；字段数量适中（8~15 个）。";
+    }
+
+    /* 用户消息：表 + 已有字段（防重复）+ 字典/表取值范围 + 业务描述。 */
+    static string DesignAsk(GenTable t, string desc, List<GenColumn> cols,
+                            List<DictType> dicts, List<GenTable> tables) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("表：");
+        sb.Append(t.tableName);
+        sb.Append("（");
+        sb.Append(t.title);
+        sb.Append("）\n");
+        if (cols.Count > 0) {
+            sb.Append("已有字段（不要重复，可在其基础上扩展）：");
+            for (int i = 0; i < cols.Count; i = i + 1) {
+                if (i > 0) { sb.Append(", "); }
+                sb.Append(cols[i].name);
+                sb.Append("(");
+                sb.Append(cols[i].kind);
+                sb.Append(")");
+            }
+            sb.Append("\n");
+        }
+        if (dicts.Count > 0) {
+            sb.Append("可用字典类型：");
+            for (int i = 0; i < dicts.Count; i = i + 1) {
+                if (i > 0) { sb.Append(", "); }
+                sb.Append(dicts[i].code);
+                sb.Append("(");
+                sb.Append(dicts[i].name);
+                sb.Append(")");
+            }
+            sb.Append("\n");
+        }
+        if (tables.Count > 0) {
+            sb.Append("可关联表：");
+            for (int i = 0; i < tables.Count; i = i + 1) {
+                if (i > 0) { sb.Append(", "); }
+                sb.Append(tables[i].tableName);
+                sb.Append("(");
+                sb.Append(tables[i].title);
+                sb.Append(")");
+            }
+            sb.Append("\n");
+        }
+        sb.Append("业务描述：");
+        sb.Append(desc);
+        return sb.ToString();
+    }
+
+    /* 模型答语 → JSON 对象：剥掉可能的代码围栏与前后闲话，取首个 { 到末个 }。 */
+    static JsonValue DesignJson(string raw) {
+        int a = raw.IndexOf("{");
+        int b = raw.LastIndexOf("}");
+        if (a < 0 || b <= a) { return null; }
+        return JsonValue.ParseLenient(raw.Substring(a, b - a + 1));
+    }
+
+    /* 清洗结果：有效列 + 被丢弃数。 */
+    class ColumnDraft {
+        List<GenColumn> cols;
+        int dropped;
+    }
+
+    /* 把清单（模型或浏览器回传）重验成设计行：名字合法性、kind/widget 白名单、
+       关联表必须真实存在、标志位归一、与已有字段及批内互不重名。无效项丢弃。 */
+    static ColumnDraft Sanitize(JsonValue arr, List<GenColumn> existing,
+                                List<GenTable> tables) {
+        ColumnDraft outp = new ColumnDraft();
+        outp.cols = new List<GenColumn>();
+        outp.dropped = 0;
+        List<string> taken = new List<string>();
+        for (int i = 0; i < existing.Count; i = i + 1) {
+            taken.Add(existing[i].name);
+        }
+        for (int i = 0; i < arr.Count(); i = i + 1) {
+            JsonValue o = arr.At(i);
+            if (o == null || !o.IsObject()) { outp.dropped = outp.dropped + 1; continue; }
+            string name = o.Str("name", "").Trim();
+            if (!Gen.Safe(name) || name == "id" || taken.Contains(name)) {
+                outp.dropped = outp.dropped + 1;
+                continue;
+            }
+            string kind = o.Str("kind", "").Trim();
+            if (!Coder.InList(kind, "string,text,int,long,decimal,bool,datetime")) {
+                kind = "string";
+            }
+            string widget = o.Str("widget", "").Trim();
+            if (!Coder.InList(widget,
+                    "text,textarea,number,select,switch,date,richtext,upload")) {
+                widget = Coder.WidgetOf(kind);
+            }
+            GenColumn c = new GenColumn();
+            c.name = name;
+            c.label = Coder.Clip(o.Str("label", "").Trim(), 64);
+            if (c.label.Length == 0) { c.label = name; }
+            c.kind = kind;
+            long size = o.Long("size", 255);
+            if (size < 1 || size > 4000) { size = 255; }
+            c.size = (int)size;
+            c.defValue = Coder.Clip(o.Str("defValue", ""), 255);
+            c.widget = widget;
+            c.dictType = "";
+            string dict = o.Str("dictType", "").Trim();
+            if (dict.Length > 0 && Gen.Safe(dict)) { c.dictType = dict; }
+            c.relTable = "";
+            c.relValue = "";
+            c.relLabel = "";
+            string rel = o.Str("relTable", "").Trim();
+            bool known = false;
+            if (Gen.Safe(rel)) {
+                for (int k = 0; k < tables.Count; k = k + 1) {
+                    if (tables[k].tableName == rel) { known = true; break; }
+                }
+            }
+            if (known) {
+                c.relTable = rel;
+                c.relValue = Coder.Clip(o.Str("relValue", "").Trim(), 64);
+                if (!Gen.Safe(c.relValue)) { c.relValue = "id"; }
+                c.relLabel = Coder.Clip(o.Str("relLabel", "").Trim(), 64);
+                if (!Gen.Safe(c.relLabel)) { c.relLabel = "name"; }
+            }
+            long so = o.Long("sortOrder", 0 - 1);
+            if (so < 0) { so = Filter.ToInt(o.Str("sortOrder", ""), 10); }
+            c.sortOrder = (int)(so > 0 ? so : 10);
+            c.nullable = Coder.FlagOf(o, "nullable", 0);
+            c.inList = Coder.FlagOf(o, "inList", 1);
+            c.inFilter = Coder.FlagOf(o, "inFilter", 0);
+            c.inCreate = Coder.FlagOf(o, "inCreate", 1);
+            c.inEdit = Coder.FlagOf(o, "inEdit", 1);
+            c.required = Coder.FlagOf(o, "required", 0);
+            taken.Add(name);
+            outp.cols.Add(c);
+        }
+        return outp;
+    }
+
+    static JsonValue ColumnJson(GenColumn c) {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("name", JsonValue.NewStr(c.name));
+        o.Put("label", JsonValue.NewStr(c.label));
+        o.Put("kind", JsonValue.NewStr(c.kind));
+        o.Put("widget", JsonValue.NewStr(c.widget));
+        o.Put("size", MetricsCluster.Num(c.size));
+        o.Put("defValue", JsonValue.NewStr(c.defValue));
+        o.Put("dictType", JsonValue.NewStr(c.dictType));
+        o.Put("relTable", JsonValue.NewStr(c.relTable));
+        o.Put("relValue", JsonValue.NewStr(c.relValue));
+        o.Put("relLabel", JsonValue.NewStr(c.relLabel));
+        o.Put("required", MetricsCluster.Num(c.required));
+        o.Put("nullable", MetricsCluster.Num(c.nullable));
+        o.Put("inList", MetricsCluster.Num(c.inList));
+        o.Put("inFilter", MetricsCluster.Num(c.inFilter));
+        o.Put("inCreate", MetricsCluster.Num(c.inCreate));
+        o.Put("inEdit", MetricsCluster.Num(c.inEdit));
+        o.Put("sortOrder", MetricsCluster.Num(c.sortOrder));
+        return o;
+    }
+
+    /* s 在词表（逗号分隔）中吗。 */
+    static bool InList(string s, string csv) {
+        if (s.Length == 0) { return false; }
+        return ("," + csv + ",").Contains("," + s + ",");
+    }
+
+    /* 类型缺省控件：与手填表单的直觉一致。 */
+    static string WidgetOf(string kind) {
+        if (kind == "bool") { return "switch"; }
+        if (kind == "text") { return "textarea"; }
+        if (kind == "int" || kind == "long" || kind == "decimal") { return "number"; }
+        if (kind == "datetime") { return "date"; }
+        return "text";
+    }
+
+    static string Clip(string s, int max) {
+        if (s.Length <= max) { return s; }
+        return s.Substring(0, max);
+    }
+
+    /* JSON 标志位：数字 0/1、文本 "1"/"true"/"false" 都认，认不出用默认。 */
+    static int FlagOf(JsonValue o, string key, int def) {
+        long n = o.Long(key, def);
+        if (n == 1) { return 1; }
+        if (n == 0) { return 0; }
+        string s = o.Str(key, "").ToLower();
+        if (s == "1" || s == "true") { return 1; }
+        if (s == "0" || s == "false") { return 0; }
+        return def;
     }
 
     /* 将设计应用到数据库：创建表，或补其缺失列。 */

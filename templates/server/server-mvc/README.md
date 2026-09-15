@@ -481,7 +481,29 @@ demonstrates the API-driven shape of the same features.
 layout.html + {{content}}  page wrapper
 ```
 
+## Table designer (`/admin/dev/coder`)
+
+Three one-click steps with different costs: **save design** (touches only
+`sys_gen_*`), **同步数据库** (DDL — creates the table or adds missing columns),
+**生成代码** (writes `.zan` sources, needs a rebuild). The designer only adds;
+nothing is dropped or rewritten. Every designed table is immediately usable in
+the generic data manager (`/admin/monitor/data?t=...`) before any code
+generation.
+
+**AI 生成字段** — on the field-design screen, describe the business in one
+sentence and the configured AI provider drafts the whole column list (names,
+Chinese labels, kinds, widgets, dict/relation suggestions, list/filter/edit
+flags). The flow is: prompt built server-side with the field contract plus the
+operator's real dict-type codes and designed tables → model answers strict
+JSON → **every column is re-validated server-side** (name legality, kind/widget
+whitelists, relation tables must actually exist, duplicate/id rejection) →
+human reviews a checklist and applies only the wanted rows → the browser
+round-trip is re-validated by the same sanitizer before insert. AI output is a
+draft, never trusted, never auto-saved. Requires `[站点设置 → AI]` enabled;
+the endpoint must be one of the allow-listed providers (or local Ollama).
+
 ## Table component (wwwroot/js/zan-table.js)
+
 
 `zan-table.js` progressively enhances the admin tables: the server template
 keeps emitting a plain `<table class="table">` with static rows, and the
