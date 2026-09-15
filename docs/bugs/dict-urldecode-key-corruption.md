@@ -23,7 +23,7 @@ path when the key is a temporary derived from a `Split` element.
 
 ## Minimal repro
 
-`docs/bugs/repro_dict_urldecode_key.zan`:
+复现程序（原 `docs/bugs/repro_dict_urldecode_key.zan`，源码内联）：
 
 ```zan
 using System;

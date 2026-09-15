@@ -12,7 +12,7 @@ enough iterations this overflows the stack and the program crashes with
 
 ## Minimal repro
 
-`repro_list_index_write.zan`:
+复现程序（原 `repro_list_index_write.zan`，源码内联）：
 
 ```zan
 using System;
@@ -34,8 +34,8 @@ class Repro {
 ```
 
 ```
-zanc      repro_list_index_write.zan -o repro && ./repro   # -> Segmentation fault: 11
-zanc -O2  repro_list_index_write.zan -o repro && ./repro   # -> ok 200000
+zanc      repro.zan -o repro && ./repro   # -> Segmentation fault: 11
+zanc -O2  repro.zan -o repro && ./repro   # -> ok 200000
 ```
 
 ## Crash detail

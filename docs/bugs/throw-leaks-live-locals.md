@@ -11,7 +11,7 @@ still reachable at exit and `--check-leaks` reports it.
 
 ## Minimal repro
 
-`docs/bugs/repro_throw_leaks_locals.zan`:
+复现程序（原 `docs/bugs/repro_throw_leaks_locals.zan`，源码内联）：
 
 ```zan
 using System;

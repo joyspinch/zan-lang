@@ -546,10 +546,12 @@ HTTP 解析、编码转换、路径处理这类纯逻辑，上移到 Zan。
   2026-07-29 修了 `ABI.md` / `DESIGN.md` / `SPEC.md` / `ARCHITECTURE.md`；2026-08-08
   全量审计中 `CODING_STANDARDS.md`（模块依赖图 / `zan test` CLI / 分支策略 / 体积数字
   四处硬错）与 `SECURITY.md`（警示横幅 + 越界行为 / `UnsafeGet` / checked 语义）已修，
-  `ERROR_CATALOG.md` / `IDE.md` 已归档（见 C12），无剩余项。
+  `ERROR_CATALOG.md` / `IDE.md` 已归档（见 C12；2026-09-15 清理时删除），无剩余项。
 * **C3 ✅ 已完成（2026-07-29）：`STDLIB_ANALYSIS.md` `git mv` 进 `docs/archive/`。**
 * **C4 ✅ 已删（2026-07-27）** `STDLIB_DB_AARDIO_REF.md` 残桩。
 * **C5 ✅ 已完成** 7 份 bug 文档（含 repro）均纳入 git 跟踪。
+  **2026-09-15 清理**：4 个 `repro_*.zan` 删除——复现代码本就完整内联在各 bug 文档正文，
+  独立文件只作复现入口；删除同时把 4 篇文档的入口行改为「源码内联」表述。
 * **C6 ✅ 已完成（2026-07-29）：7 份 bug 文档统一 `**Status:**` 字段。**
 * **C7 ✅ 已归位（2026-07-27）** 两份 ra2-hd 文档移到 `docs/projects/ra2-hd/`，
   `docs/superpowers/` 删除。
@@ -570,6 +572,9 @@ HTTP 解析、编码转换、路径处理这类纯逻辑，上移到 Zan。
   - **归档 4 份虚构/过时文档**：`ERROR_CATALOG.md`（错误码体系与实现不符）、
     `DESIGN.md`、`STDLIB_ZAN_DESIGN.md`（设计稿，非现状）、`IDE.md`（旧 C IDE 已删，
     IDE 是 `src/ide_zan/`）→ `docs/archive/`（现共 6 份）。
+    **2026-09-15 清理**：这 4 份复核确认无任何引用（文档/脚本/skill 皆无），已删除；
+    `docs/archive/` 现存 `ROADMAP.md`、`STDLIB_ANALYSIS.md`、`zform-review/` 与两份
+    chart 历史快照（`CHART_VS_ECHARTS_224.md`、`CHART_PORT_AUDIT_2026-09-10.md`）。
   - **重写 2 份权威文档**：`SPEC.md`（关键字补 `delegate/decimal/fixed/goto/lock/
     operator/sbyte/uint/ulong/ushort`；`int`=32 位、`long`=64 位独立、`char`=8 字节字
     （`sizeof` 实测）；删元组 / tagged union / COW / `[CImport]` / `project.zan` /
