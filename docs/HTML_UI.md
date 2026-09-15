@@ -120,8 +120,11 @@ h.AddArg("pick", (string arg) => { ... });   // 同名也可再 Add 无参版
   与编译期 `GenHtml`（发射 `handlerArg` 字段 + `Html.WireArg`）同一
   语义；`<template data-for>` 克隆行保留声明，展开后逐行接线共享
   原型上的同一实参；
-- `GenForm`/设计器通道不建模 data-arg：设计稿的事件模型是纯名字
-  （生成码按名分发），带参文档由 HTML 层承载。
+- 设计器通道同样建模（2026-09-15 起）：DesignerHtml 编解码把模型
+  `"arg"` 键折成 `data-arg` 属性（与运行时协议同键同名）、
+  FieldFromJson 落 `handlerArg`、GenForm 编译期发射
+  `handlerArg` 字段——.html 设计稿里写
+  `data-on-click="pick" data-arg="apple"` 全链路语义一致。
 
 ## 动态原语：data-if 与 `<template data-for>`（P8）
 

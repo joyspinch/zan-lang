@@ -962,7 +962,12 @@ pt/pc/cm/mm/in/q）+ `calc()/min()/max()/clamp()`；`%` 在各属性原有通道
   复合值（props 直通/columns/winShape）走 data-x-<kebab>='<紧凑 JSON>'（字
   符串值不作数字嗅探，props 的 "min":"0" 不漂成数字），属性值统一实体转
   义。解码逐键还原：kebab→camel、true/false→布尔、数字字面→数字、on- 前缀
-  →Pascal 事件键。**踩坑台账**：(a) Zan 的 `char.ToString()` 得到码点数字
+  →Pascal 事件键。**带参事件建模（2026-09-15 补齐）**：模型 "arg" 键 ↔
+  `data-arg` 属性（编码在属性头、FieldJson 单点折键防通用 data-* 通道重
+  复 Put；"arg" 入 IsModeledKey），FieldFromJson 落 handlerArg，GenForm
+  编译期发射 `handlerArg` 字段（ChildWindow.WireNode 二次接线据此发
+  WireArg）——设计稿/运行时/生成三通道 data-arg 全链路同语义；设计器
+  Inspector 事件面照旧显示纯名字，arg 经模型往返保真。**踩坑台账**：(a) Zan 的 `char.ToString()` 得到码点数字
   （'M'.ToString()=="77"），首字母大写必须用 char+string 拼接惯用法；(b)
   data-zan-design 是裸属性（值空串），`Attr(...) != ""` 判存在性永远 false
   ——IsDesignDoc 必须按名扫描；(c) head 区语义——meta/style/title 在隐式
@@ -1689,9 +1694,7 @@ POSIX gthr，`pthread_*` 全部未定义 → `emit_lib_windows_dll` 链接失败
   ① 守卫谓词过 `llvm.expect.i1`(expected=false) 让后端把故障臂排冷；
   ② `zan_rt_soft_scratch()` 从每个守卫点各调一次改为每函数入口
   `emit_soft_scratch_cached` 缓存进 entry alloca（软路径 select 的调用曾坐在
-  热循环里，微基准 73/99→68/97ms）。遗留（另记）：**opaque string 越界检查**
-  仍是 ABI/表示层取舍（extern 返回的裸 char\* 无法探测是否托管字符串——探测动作
-  本身就是它要防的越界），选项见 A58 3.4，待拍板。
+  热循环里，微基准 73/99→68/97ms）。遗留（另记）：**opaque string 越界检查**已随 A58 3.4 拍板闭账（2026-09-15，选项②维持现状，契约见 docs/ABI.md §6.3）。
 - [ ] **A52-8 库内单方面终止进程**：OOM（`host_oom.h`）、契约违反
   （`rt_sched.c:242`）、slab 一致性（`rt_mem.c:446,453`）共十余处 `abort()`，
   作为被嵌入的库没有错误码出口。
@@ -1944,7 +1947,7 @@ memcpy 一并消失（这同时是条性能修复：`parse_postfix` 的前瞻是
 | 3.1 | **A52-7** EH 线程表 1024 硬顶动态化 ✅；A4-2 剩余（`zan_thread_detach()` 接线）已并 **B5** 前置——今日回调源全为 Zan 托管线程，stdlib 零受益者（grep 证） | `thread_eh_slots` 扩到 >1024 并发仍跑完 ✅；峰值内存不回退 ✅（102.3MB→3.9MB） |
 | 3.2 | **A52-8** 库内十余处 `abort()` 改为可注册回调 + 错误码出口（OOM、契约违反、slab 一致性）✅ **2026-09-14 完成**：`zan_rt_set_fatal_handler`/`zan_rt_fatal(category,message)` 落 rt_timer.c（崩溃机器所在地，每程序必链）；18 处活死点收编——rt_mem×3（double-free/CAS 竞态 double-free/slab 头损坏）、rt_sched×7（6 OOM + task 提前释放契约违反）、rt_io×1（注入节点 OOM）、rt_sync×6（TLS init/set OOM，原 `zan_host_oom` 藏在头文件里漏数）、rt_timer×1（co-live 表扩容）。fatal 单点打印 `zan runtime: fatal (cat): msg` → 回调（宿主自行 exit；接管后返回=违约仍 abort）；无回调 abort 兜底与今天一致（rt_mem 站点原 fprintf 文本并入 message，信息不丢）；rt_wasm longjmp 桩与 host_oom.h（编译器侧）不在范围。链面修复：zanrt_sync_test / zan_rt_mem_dblfree_test / zan_rt_mem_remote_test 补链 rt_timer.c。 | 新增"宿主接管后自行退出"用例 ✅（dblfree 测试扩 takeover child：handler 收到 cat/msg 原文后 exit(71)；返回型 handler 回退 abort 断言；WSL 实跑全绿）；无回调行为与今天一致 ✅（原 abort 双例原样绿）+ Windows runtime_sync/io_addr 绿 + 默认/--fast-alloc 双链接路径探针绿 + standard 845/850（5 红全归因：4 Gui/Chart 并行车道既有 + keepalive 负载 flake 独跑绿） |
 | 3.3 | **A52-5** `--publish` 保留低成本安全网 ✅ **2026-09-14 完成（3.3 的行为取舍随实现一并落定）**：`--publish` 默认开"over-release 网"——`emit_arc_underflow_check` 双模式化，同一 rc<=0 比较，报告走 fail-soft note（每类一次，stderr + 运行时日志）后**继续执行**，绝不 abort/exit(70)（over-release 只泄漏，网不把泄漏变崩溃）。行为取舍拍板：默认=报告并继续；`--arc-guard` 完整陷阱仍专属诊断档；`--no-arc-guard` 同时关网（性能偏执逃生门）。跨目标回退 merged 单参文本（rt_guard_split 同门控）。新旗标管道 arc_net 穿 main.c→irgen_init（签名 +1 参）。 | publish 版本能报 over-release ✅（火线注入探针：--publish 二进制打印 "release of an already-freed string [ARC over-release net…]" 后 exit=0 继续跑完）；约定阈值内不退化 ✅（3M 轮饱和 retain/release 交错采样 min：string 形 545↔545ms ±0、Node 形 1050↔1072ms -2%；体积 +512B/exe） |
-| 3.4 | **A52-6** null 解引用通用守卫 ✅ **2026-09-15 完成**（守卫已出厂默认+实测+两笔发射优化，见 A52-6 条）；opaque string 越界检查仍待拍板（ABI/表示层取舍，见下） | null 半：新探针双控（默认=软报告零页继续 rc=0；--no-runtime-checks=段错误）；纯访问微基准 +26%/+115%（病理极端）已入账 ✅ |
+| 3.4 | **A52-6** null 解引用通用守卫 ✅ **2026-09-15 完成**（守卫已出厂默认+实测+两笔发射优化，见 A52-6 条）；opaque string 越界检查 ✅ **2026-09-15 拍板=维持现状（选项②）**：契约文档化进 docs/ABI.md §6.3——托管字符串永远带头、O(1) 边界检查；extern 返回的 opaque string 不保证边界检查（索引越界=UB，同 C），需要边界安全先拷贝成托管串；extern 返回新分配缓冲的应交 NUL 结尾指针、返回借用指针的应改用 nint+显式拷贝建模。拒①（每次 extern 返回拷贝=线上每个 wire 读全量拷贝，连接器不可接受）与③（探测动作自身是未映射页风险，构造性不健全） | null 半：新探针双控（默认=软报告零页继续 rc=0；--no-runtime-checks=段错误）；纯访问微基准 +26%/+115%（病理极端）已入账 ✅；opaque 半：契约落 ABI.md ✅ |
 
 ### 3.3 实测（2026-08-27）：整体守卫不可出厂，但可拆出一个 4.3% 的子集
 
