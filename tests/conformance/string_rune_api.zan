@@ -1,0 +1,110 @@
+// A67 字节×码点：string 按字节索引（s[i]/Length 是字节），char/码点是
+// 文本层概念。本用例钉住解码侧 API 的契约：Encoding.DecodeCodePoint/
+// RuneAt/CodePointCount/RuneFromIndex 与扩展方法 ByteAt/RuneAt/RuneCount/
+// CharAt——字节语义不受影响，存量代码零破坏。
+using System;
+using System.Text;
+namespace Conf;
+
+class Program {
+    static int bad;
+
+    static void Eq(int got, int want, string label) {
+        if (got != want) {
+            Console.WriteLine("FAIL " + label + ": got " + got.ToString()
+                + " want " + want.ToString());
+            bad = bad + 1;
+        }
+    }
+
+    static void EqStr(string got, string want, string label) {
+        if (got != want) {
+            Console.WriteLine("FAIL " + label + ": got '" + got
+                + "' want '" + want + "'");
+            bad = bad + 1;
+        }
+    }
+
+    static void DecodeAt(string s, int i, int wantCp, int wantLen, string label) {
+        int[] slot = new int[1];
+        int used = Encoding.DecodeCodePoint(s, i, slot);
+        Eq(used, wantLen, label + " width");
+        Eq(slot[0], wantCp, label + " cp");
+    }
+
+    static void Main() {
+        // --- s[i] 字节语义不变：ASCII 原样，非 ASCII 是编码字节 ---
+        string s = "aé中😀";              // 1+2+3+4 = 10 字节, 4 码点
+        Eq(s.Length, 10, "byte length");
+        Eq(s.ByteAt(0), 97, "ByteAt ascii");
+        Eq(s.ByteAt(1), 195, "ByteAt 2-byte lead (C3)");
+        Eq(s.ByteAt(2), 169, "ByteAt 2-byte cont (A9)");
+        Eq(s.ByteAt(3), 228, "ByteAt 3-byte lead (E4)");
+        Eq(s.ByteAt(6), 240, "ByteAt 4-byte lead (F0)");
+        Eq(s.ByteAt(7), 159, "ByteAt 4-byte cont (9F)");
+        Eq(s.ByteAt(9), 128, "ByteAt 4-byte last cont (80)");
+        Eq(s.ByteAt(10), 0 - 1, "ByteAt past end");
+        Eq(s.ByteAt(0 - 1), 0 - 1, "ByteAt before start");
+        // 混写 s + s[i] 的膨胀场景：字节 195 当码点会编成 2 字节，
+        // RuneAt 取整码点则还原 é。
+        string inflated = "" + (char)(s[1] & 255);
+        Eq(inflated.Length, 2, "byte-as-codepoint inflates to 2 bytes");
+        EqStr(s.RuneAt(1), "é", "RuneAt decodes 2-byte rune");
+
+        // --- DecodeCodePoint：1/2/3/4 字节标准向量 ---
+        DecodeAt(s, 0, 97, 1, "ascii");
+        DecodeAt(s, 1, 233, 2, "U+00E9 é");              // C3 A9
+        DecodeAt(s, 3, 20013, 3, "U+4E2D 中");            // E4 B8 AD
+        DecodeAt(s, 6, 128512, 4, "U+1F600 emoji");       // F0 9F 98 80
+        // 4 字节下界：U+10000 (F0 90 80 80)
+        string q = Encoding.Utf8FromCodePoint(65536);
+        DecodeAt(q, 0, 65536, 4, "U+10000 boundary");
+        // 越界：宽 0，槽位不动
+        int[] hold = new int[1];
+        hold[0] = 7;
+        Eq(Encoding.DecodeCodePoint(s, 10, hold), 0, "decode past end width 0");
+        Eq(hold[0], 7, "slot untouched on miss");
+
+        // --- 非法序列按惯例替换 U+FFFD，前进 1 字节 ---
+        // 截断的 3 字节头在串尾（"中" 砍掉两个续字节）
+        string trunc = "a" + Encoding.Utf8FromCodePoint(20013).Substring(0, 1);
+        DecodeAt(trunc, 1, 65533, 1, "truncated lead -> FFFD");
+        // 落单续字节（0x80 是字符串的字面字节，非合法首字节）
+        string lone = Encoding.CharFromCode(128);
+        DecodeAt(lone, 0, 65533, 1, "lone continuation -> FFFD");
+        // 过短编码（C0 80 编码 'A'）拒绝
+        string ovl = Encoding.CharFromCode(0xC0) + Encoding.CharFromCode(0x80);
+        DecodeAt(ovl, 0, 65533, 1, "overlong -> FFFD");
+        // RuneAt 的字符串形态同样收敛
+        EqStr(s.RuneAt(10), "", "RuneAt past end empty");
+        EqStr(s.RuneAt(0 - 1), "", "RuneAt negative empty");
+        EqStr(lone.RuneAt(0), "\uFFFD", "RuneAt lone cont -> FFFD char");
+
+        // --- 计数与按码点取 ---
+        Eq(s.RuneCount(), 4, "rune count mixed widths");
+        Eq("".RuneCount(), 0, "empty rune count");
+        Eq("abc".RuneCount(), 3, "ascii rune count equals byte length");
+        EqStr(s.CharAt(0), "a", "CharAt 0");
+        EqStr(s.CharAt(1), "é", "CharAt 1");
+        EqStr(s.CharAt(2), "中", "CharAt 2");
+        EqStr(s.CharAt(3), s.RuneAt(6), "CharAt 3 emoji");
+        EqStr(s.CharAt(4), "", "CharAt past end");
+        EqStr(s.CharAt(0 - 1), "", "CharAt negative");
+        // 码点宽度和计数可互推：逐码点 RuneAt 前进量之和 = Length
+        int i = 0;
+        int seen = 0;
+        while (i < s.Length) {
+            i = i + s.RuneAt(i).Length;
+            seen = seen + 1;
+        }
+        Eq(seen, s.RuneCount(), "walk width sum == rune count");
+        Eq(i, s.Length, "walk total == byte length");
+        // 回程：码点串反解回 int 与 Utf8FromCodePoint 重编码一致
+        int[] cp2 = new int[1];
+        Encoding.DecodeCodePoint(s, 6, cp2);
+        EqStr(Encoding.Utf8FromCodePoint(cp2[0]), s.RuneAt(6),
+            "decode/encode roundtrip emoji");
+
+        if (bad == 0) { Console.WriteLine("string rune api ok"); }
+    }
+}

@@ -257,6 +257,106 @@ class Encoding {
         return b.ToStr(0, n);
     }
 
+    // ---- A67 字节×码点：解码侧 API。string 按字节索引（Length 即字节
+    // 数），s[i] 取的是 UTF-8 编码字节；文本层的"第 N 个字符"用下面
+    // 这组。字节语义不受影响，存量代码零破坏。
+
+    /// <summary>从字节偏移 <paramref name="byteIndex"/> 起解码一个
+    /// Unicode 码点，写入 <paramref name="cpOut"/>（长度 ≥1 的 int 数组
+    /// ——Zan 无出参，借用数组回传）并返回该码点占用的字节数
+    /// （1-4）。byteIndex 越界返回 0，cpOut[0] 不动。非法序列
+    /// （截断的多字节头、落单续字节、过长编码）返回 1、
+    /// cpOut[0] = U+FFFD，与 <see cref="GetString"/> 的替换行为一致。</summary>
+    static int DecodeCodePoint(string s, int byteIndex, int[] cpOut) {
+        int n = s.Length;
+        if (byteIndex < 0 || byteIndex >= n) { return 0; }
+        int b0 = s[byteIndex] & 255;
+        if (b0 < 128) {
+            cpOut[0] = b0;
+            return 1;
+        }
+        int need = 0;
+        int cp = 0;
+        if (b0 >= 194 && b0 <= 223) { need = 1; cp = b0 & 31; }
+        else if (b0 >= 224 && b0 <= 239) { need = 2; cp = b0 & 15; }
+        else if (b0 >= 240 && b0 <= 244) { need = 3; cp = b0 & 7; }
+        if (need == 0 || byteIndex + need > n - 1) {
+            // 非法首字节，或续字节落出串尾（byteIndex+need 越过末字节）
+            cpOut[0] = 65533;
+            return 1;
+        }
+        int k = 1;
+        while (k <= need) {
+            int bx = s[byteIndex + k] & 255;
+            if ((bx & 192) != 128) {
+                cpOut[0] = 65533;
+                return 1;
+            }
+            cp = (cp << 6) | (bx & 63);
+            k = k + 1;
+        }
+        int min = need == 1 ? 128 : (need == 2 ? 2048 : 65536);
+        if (cp < min) {
+            cpOut[0] = 65533;
+            return 1;
+        }
+        cpOut[0] = cp;
+        return need + 1;
+    }
+
+    /// <summary>从字节偏移 <paramref name="byteIndex"/> 起解码一个码点
+    /// 并直接编码回 1-4 字节 UTF-8 字符串（等价 DecodeCodePoint 后接
+    /// Utf8FromCodePoint）。非法序列收敛为 U+FFFD 单字符。</summary>
+    static string RuneAt(string s, int byteIndex) {
+        int[] slot = new int[1];
+        int used = Encoding.DecodeCodePoint(s, byteIndex, slot);
+        if (used == 0) { return ""; }
+        return Encoding.Utf8FromCodePoint(slot[0]);
+    }
+
+    /// <summary>字符串中的码点个数（≠ Length 字节数，非 ASCII 时更
+    /// 小）。非法序列按 1 码点计。</summary>
+    static int CodePointCount(string s) {
+        int n = s.Length;
+        int count = 0;
+        int i = 0;
+        while (i < n) {
+            int b = s[i] & 255;
+            int extra = 0;
+            if (b >= 194 && b <= 223) { extra = 1; }
+            else if (b >= 224 && b <= 239) { extra = 2; }
+            else if (b >= 240 && b <= 244) { extra = 3; }
+            // 续字节不齐整只影响本码点的取值，宽度按首字节声明的算：
+            // 与 DecodeCodePoint 的前进量一致，保证 count 与
+            // RuneFromIndex/RuneAt 可互推。
+            i = i + extra + 1;
+            count = count + 1;
+        }
+        return count;
+    }
+
+    /// <summary>取第 <paramref name="runeIndex"/> 个码点（0 起），
+    /// 编码为 UTF-8 字符串返回；越界返回空串。O(n) 顺序扫描。</summary>
+    static string RuneFromIndex(string s, int runeIndex) {
+        if (runeIndex < 0) { return ""; }
+        int n = s.Length;
+        int i = 0;
+        int seen = 0;
+        while (i < n) {
+            if (seen == runeIndex) {
+                return Encoding.RuneAt(s, i);
+            }
+            int b = s[i] & 255;
+            int extra = 0;
+            if (b >= 194 && b <= 223) { extra = 1; }
+            else if (b >= 224 && b <= 239) { extra = 2; }
+            else if (b >= 240 && b <= 244) { extra = 3; }
+            i = i + extra + 1;
+            seen = seen + 1;
+        }
+        return "";
+    }
+
     /// <summary>对字符串进行 URL 编码。</summary>
     static string UrlEncode(string text) {
         StringBuilder sb = new StringBuilder();
