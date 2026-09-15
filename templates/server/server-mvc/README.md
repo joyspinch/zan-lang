@@ -384,10 +384,16 @@ directory. `StaticFiles.MaxAge(0)` while developing.
 ```
 wwwroot/css/app.css          the whole design system (no framework, no build)
 wwwroot/js/app.js            htmx glue: CSRF header, error/flash toasts
-wwwroot/admin/               Vue 3 SPA admin shell (no build step — see below)
+wwwroot/admin/               Vue 3 + Naive UI SPA admin shell (no build step — see below)
 wwwroot/vendor/htmx.min.js   htmx 1.9.12    -- unpkg.com/htmx.org@1.9.12/dist/htmx.min.js
 wwwroot/vendor/alpine.min.js Alpine 3.14.1  -- unpkg.com/alpinejs@3.14.1/dist/cdn.min.js
 wwwroot/vendor/vue.global.prod.js  Vue 3.4.38  -- unpkg.com/vue@3.4.38/dist/vue.global.prod.js
+wwwroot/vendor/naive-ui.js   Naive UI 2.45.3 -- unpkg.com/naive-ui@2.45.3/dist/index.prod.js
+wwwroot/vendor/zan-charts.js zan-charts 0.1.6 (npm) -- self-built browser IIFE bundle
+wwwroot/vendor/zan-grid.js/.css    zan-grid 1.2.1 (npm) -- vendored but UNUSED: Grid.setup()
+                             stack-overflows under Vue 3.4 (TASKS.md A317); keep for
+                             switch-back once the library is fixed
+wwwroot/vendor/zan-layer.js/.css   zan-layer 1.0.8 (npm) -- layer popup API + Vue plugin
 ```
 
 The vendor files are committed on purpose: no CDN at runtime, versions
@@ -396,17 +402,24 @@ update the version in this list. There is no Node toolchain and nothing to
 compile -- `app.css` is hand-written CSS (variables, grid, a 900px breakpoint
 that turns the admin sidebar into a drawer, and tables that become cards under
 720px), so a page needs no build step to look right on phone or desktop.
+Naive UI's styles are injected at runtime by its cssr engine, so no naive css
+file is needed.
 
 ## SPA admin shell (wwwroot/admin/)
 
 `/static/admin/index.html` serves a second, alternative admin console: a Vue 3
-single-page app that talks to the server purely through the JSON API. It is a
-shell, not a replacement -- the server-rendered pages under `views/` remain the
-reference implementation of every screen; the SPA demonstrates the API-driven
-shape of the same features.
+single-page app on Naive UI components that talks to the server purely through
+the JSON API. It is a shell, not a replacement -- the server-rendered pages
+under `views/` remain the reference implementation of every screen; the SPA
+demonstrates the API-driven shape of the same features.
 
-- **Entry** `/static/admin/index.html` loads `vendor/vue.global.prod.js` and
-  `admin/app.js` (hash routing, three views: login / dashboard / posts).
+- **Entry** `/static/admin/index.html` loads `vendor/vue.global.prod.js`,
+  `vendor/naive-ui.js`, the zan-* vendor bundles and `admin/app.js` (hash
+  routing, three views: login / dashboard / posts).
+- **Cache busting**: every script/stylesheet reference carries `?ver=N`. When
+  you edit any file under `wwwroot/`, bump the `ver` in `index.html` and
+  restart `./app.exe` (views/static may be cached in memory), or the browser
+  will happily serve the stale copy at `StaticFiles.MaxAge(3600)`.
 - **Endpoints** (all `Accept: application/json`, cookie session):
   - `POST /api/auth/login`, `GET /api/auth/me` -- existing auth
   - `GET /api/admin/menu` -- the sidebar as JSON, filtered by the same

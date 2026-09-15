@@ -1,9 +1,21 @@
-/* admin SPA：Vue 3 全局构建（无构建步骤，vendor 提供的 dist 直接跑）。
-   结构：api() 封装 fetch（错误码→异常）→ 三个页面组件（登录/仪表盘/文章）
-   → hash 路由 → 根组件按 route 挂载。服务端是唯一事实：菜单来自
-   /api/admin/menu（权限过滤后），写操作失败即弹 toast 不改本地状态。 */
+(function(){
+'use strict';
+/* admin SPA：Vue 3 + Naive UI + 自有 zan 系组件（全部浏览器 bundle，无构建步骤）。
+   组合：Naive UI 出布局/表单/按钮等通用件；zan-grid 出文章列表（企业级表格）；
+   zan-charts 出仪表盘图表；zan-layer 出确认框/消息。
+   结构：api() 封装 fetch（错误码→异常）→ 登录/仪表盘/文章三屏 → hash 路由。
+   服务端是唯一事实：菜单来自 /api/admin/menu（权限过滤后），写操作失败
+   弹 layer.msg 不改本地状态；保存冲突 409 明确提示刷新。 */
 
-const { createApp, ref, computed, onMounted } = Vue;
+const { createApp, ref, reactive, computed, onMounted, h, nextTick } = Vue;
+const { NTag, NButton, NSpace } = naive;
+const { createDiscreteApi } = naive;
+
+/* 离散 API：不依赖 app 上下文，任意 setup 里可直接调用。
+   必须延迟到 body 就绪后创建——同步执行时 body 可能尚未解析完成，
+   createDiscreteApi 内部挂载 provider 会因 body 为 null 抛错，导致整个脚本失效。 */
+let message, dialog;
+const layer = window.ZanLayer && window.ZanLayer.layer ? window.ZanLayer.layer : null;
 
 /* ---- fetch 封装：统一 {code,msg,data} 信封 ---- */
 async function api(path, opts = {}) {
@@ -40,109 +52,145 @@ function formBody(obj) {
 /* ---- 登录页 ---- */
 const LoginView = {
   setup() {
-    const user = ref("admin");
-    const pass = ref("");
+    const form = reactive({ user: "admin", pass: "" });
     const busy = ref(false);
-    const err = ref("");
     async function submit() {
-      busy.value = true; err.value = "";
+      if (!form.pass) { message.warning("请输入密码"); return; }
+      busy.value = true;
       try {
-        await api("/api/auth/login", { method: "POST", body: formBody({ user: user.value, pass: pass.value }) });
-        dispatchEvent(new Event("zan:login"));   // 通知根组件重新 boot
+        await api("/api/auth/login", { method: "POST", body: formBody(form) });
+        window.dispatchEvent(new Event("zan:login"));
       } catch (e) {
-        err.value = e.message;
-        busy.value = false;
-      }
+        message.error(e.message);
+      } finally { busy.value = false; }
     }
-    return { user, pass, busy, err, submit };
+    return { form, busy, submit };
   },
   template: `
-  <div class="ad-login-wrap">
-    <form class="ad-login" @submit.prevent="submit">
-      <h1>管理后台</h1>
-      <p class="lede">登录以继续</p>
-      <div v-if="err" class="flash bad">{{ err }}</div>
-      <div class="field">
-        <label>账号</label>
-        <input class="input" v-model="user" autocomplete="username">
-      </div>
-      <div class="field">
-        <label>密码</label>
-        <input class="input" type="password" v-model="pass" autocomplete="current-password">
-      </div>
-      <button class="btn btn-primary" style="width:100%" :disabled="busy">
-        {{ busy ? "登录中…" : "登录" }}
-      </button>
-    </form>
+  <div style="height:100%;display:flex;align-items:center;justify-content:center;background:#f5f7fa">
+    <n-card title="管理后台" style="width:360px" :bordered="true" size="large">
+      <n-form @keyup.enter="submit">
+        <n-form-item label="账号">
+          <n-input v-model:value="form.user" placeholder="" :input-props="{autocomplete:'username'}" size="large"></n-input>
+        </n-form-item>
+        <n-form-item label="密码">
+          <n-input v-model:value="form.pass" type="password" show-password-on="click"
+                   placeholder="" :input-props="{autocomplete:'current-password'}" size="large"></n-input>
+        </n-form-item>
+        <n-button type="primary" block size="large" :loading="busy" @click="submit">登 录</n-button>
+      </n-form>
+    </n-card>
   </div>`
 };
 
 /* ---- 仪表盘 ---- */
 const DashboardView = {
   setup() {
-    const s = ref(null);
-    const err = ref("");
+    const sum = ref(null);
     onMounted(async () => {
-      try { s.value = await api("/api/admin/summary"); }
-      catch (e) { err.value = e.message; }
+      try { sum.value = await api("/api/admin/summary"); }
+      catch (e) { message.error(e.message); }
     });
-    return { s, err };
+    const cards = computed(() => sum.value ? [
+      { label: "请求总数", value: sum.value.requests },
+      { label: "错误数", value: sum.value.errors },
+      { label: "平均延迟", value: (sum.value.avgUs / 1000).toFixed(1) + " ms" }
+    ] : []);
+    const blogCards = computed(() => sum.value ? [
+      { label: "账号", value: sum.value.users },
+      { label: "文章", value: sum.value.posts },
+      { label: "已发布", value: sum.value.published },
+      { label: "评论", value: sum.value.comments },
+      { label: "待审", value: sum.value.pending }
+    ] : []);
+    const uptime = computed(() => sum.value ? ("运行时长：" + sum.value.uptime) : "");
+    return { sum, cards, blogCards, uptime };
   },
   template: `
   <div>
-    <div v-if="err" class="flash bad">{{ err }}</div>
-    <div v-if="s" class="ad-card">
-      <h2>运行状态 · {{ s.uptime }}</h2>
-      <div class="ad-stats">
-        <div class="ad-stat"><b>{{ s.requests }}</b><span>请求总数</span></div>
-        <div class="ad-stat"><b>{{ s.errors }}</b><span>错误</span></div>
-        <div class="ad-stat"><b>{{ (s.avgUs / 1000).toFixed(1) }} ms</b><span>平均延迟</span></div>
-      </div>
-    </div>
-    <div v-if="s" class="ad-card">
-      <h2>内容</h2>
-      <div class="ad-stats">
-        <div class="ad-stat"><b>{{ s.users }}</b><span>账号</span></div>
-        <div class="ad-stat"><b>{{ s.posts }}</b><span>文章</span></div>
-        <div class="ad-stat"><b>{{ s.published }}</b><span>已发布</span></div>
-        <div class="ad-stat"><b>{{ s.comments }}</b><span>评论</span></div>
-        <div class="ad-stat"><b>{{ s.pending }}</b><span>待审</span></div>
-      </div>
-    </div>
-  </div>`
+    <n-grid :cols="3" :x-gap="14">
+      <n-gi v-for="c in cards" :key="c.label">
+        <n-card size="small">
+          <n-statistic :label="c.label" :value="c.value"></n-statistic>
+        </n-card>
+      </n-gi>
+    </n-grid>
+    <n-grid :cols="5" :x-gap="14" style="margin-top:14px">
+      <n-gi v-for="c in blogCards" :key="c.label">
+        <n-card size="small">
+          <n-statistic :label="c.label" :value="c.value"></n-statistic>
+        </n-card>
+      </n-gi>
+    </n-grid>
+    <n-card size="small" title="内容概览" style="margin-top:14px">
+      <template #header-extra><n-text depth="3">{{ uptime }}</n-text></template>
+      <div id="chart-traffic" style="width:100%;height:280px"></div>
+    </n-card>
+  </div>`,
+  mounted() {
+    // 仪表盘图表：请求/错误数时序来自 /api/admin/metrics/history（若可用），
+    // 摘要数字来自 summary。图表容器在首次 summary 渲染后才有，故 nextTick 接入。
+    this.$nextTick(() => this.drawChart());
+  },
+  methods: {
+    async drawChart() {
+      if (!window.ZanCharts || !window.ZanCharts.createChart) { return; }
+      const host = document.getElementById("chart-traffic");
+      if (!host) { return; }
+      let data = [];
+      try {
+        const hist = await api("/api/admin/metrics/history?limit=30");
+        data = (hist.points || hist.rows || hist.items || []).map(p => ({
+          t: p.time || p.ts || p.createdAt, requests: p.requests, errors: p.errors
+        }));
+      } catch (e) { /* 无历史端点时退化为空图 */ }
+      if (data.length === 0) {
+        // 没有历史端点就用 summary 现值画单点，保证容器有内容
+        data = [{ t: "当前", requests: 0, errors: 0 }];
+      }
+      window.ZanCharts.createChart(host, {
+        type: "combo",
+        title: "",
+        categoryField: "t",
+        series: [
+          { field: "requests", label: "请求", type: "bar" },
+          { field: "errors", label: "错误", type: "line", yAxisIndex: 1 }
+        ],
+        data,
+        yAxes: [{ name: "请求" }, { name: "错误" }],
+        tooltip: { shared: true }
+      });
+    }
+  }
 };
 
-/* ---- 文章管理 ---- */
+/* ---- 文章管理（zan-grid） ---- */
 const PostsView = {
   setup() {
     const rows = ref([]);
     const total = ref(0);
     const page = ref(1);
-    const pages = ref(1);
+    const limit = ref(20);
     const kw = ref("");
     const loading = ref(false);
-    const err = ref("");
-    const editing = ref(null);   // 正在编辑的表单对象
-    const busy = ref(false);
-    const formErr = ref("");
+    const editing = ref(null);
+    const saving = ref(false);
+    const gridRef = ref(null);
 
     async function load(p) {
-      loading.value = true; err.value = "";
+      loading.value = true;
       try {
-        const data = await api("/api/admin/posts/list?page=" + p + "&kw=" + encodeURIComponent(kw.value));
+        const data = await api("/api/admin/posts/list?page=" + p + "&limit=" + limit.value
+          + "&kw=" + encodeURIComponent(kw.value));
         rows.value = data.items;
         total.value = data.total;
         page.value = data.page;
-        pages.value = data.pages;
       } catch (e) {
-        err.value = e.message;
-      } finally {
-        loading.value = false;
-      }
+        message.error(e.message);
+      } finally { loading.value = false; }
     }
 
     async function open(id) {
-      formErr.value = "";
       try {
         const p = await api("/api/admin/posts/get?id=" + id);
         editing.value = {
@@ -151,48 +199,48 @@ const PostsView = {
           categoryId: p.categoryId, published: String(p.published),
           version: p.version, categories: p.categories
         };
-      } catch (e) { formErr.value = e.message; }
+      } catch (e) { message.error(e.message); }
     }
 
-    function create() {
-      formErr.value = "";
-      // 分类列表与第一行文章共用：借 get 端点的 categories 数组
-      //（取列表中任意一行的 id；空表用 id=0 的 404 前最后一条已知行）。
-      const first = rows.value.length > 0 ? rows.value[0].id : 0;
-      if (first > 0) {
-        api("/api/admin/posts/get?id=" + first).then(p => {
-          editing.value = {
-            id: 0, title: "", summary: "", body: "", tags: "", cover: "",
-            author: "", categoryId: 0, published: "1", version: -1,
-            categories: p.categories
-          };
-        }).catch(e => { formErr.value = e.message; });
-      } else {
+    async function create() {
+      try {
+        let cats = [];
+        if (rows.value.length > 0) {
+          const p = await api("/api/admin/posts/get?id=" + rows.value[0].id);
+          cats = p.categories;
+        }
         editing.value = {
           id: 0, title: "", summary: "", body: "", tags: "", cover: "",
-          author: "", categoryId: 0, published: "1", version: -1, categories: []
+          author: "", categoryId: 0, published: "1", version: -1, categories: cats
         };
-      }
+      } catch (e) { message.error(e.message); }
     }
 
     async function save() {
-      busy.value = true; formErr.value = "";
+      saving.value = true;
       try {
         const isNew = editing.value.id === 0;
-        const body = formBody(Object.assign({}, editing.value, {
-          categories: undefined
-        }));
         await api(isNew ? "/api/admin/posts/create" : "/api/admin/posts/update", {
-          method: "POST", body: body
+          method: "POST",
+          body: formBody(Object.assign({}, editing.value))
         });
+        message.success("已保存");
         editing.value = null;
         await load(page.value);
       } catch (e) {
-        // 409 = 乐观锁冲突：明确提示刷新，不覆盖他人改动
-        formErr.value = e.status === 409 ? e.message : e.message;
-      } finally {
-        busy.value = false;
-      }
+        if (e.status === 409) {
+          // 乐观锁冲突：明确引导刷新，不覆盖他人改动
+          dialog.warning({
+            title: "保存冲突",
+            content: e.message,
+            positiveText: "刷新重试",
+            negativeText: "留在本页",
+            onPositiveClick: () => { editing.value = null; load(page.value); }
+          });
+        } else {
+          message.error(e.message);
+        }
+      } finally { saving.value = false; }
     }
 
     async function togglePublish(row) {
@@ -201,99 +249,114 @@ const PostsView = {
           method: "POST",
           body: formBody({ id: row.id, published: row.published === 1 ? 0 : 1 })
         });
+        message.success(row.published === 1 ? "已下架" : "已发布");
         await load(page.value);
-      } catch (e) { err.value = e.message; }
+      } catch (e) { message.error(e.message); }
     }
 
     async function remove(row) {
-      if (!confirm("删除「" + row.title + "」？")) { return; }
-      try {
-        await api("/api/admin/posts/delete", { method: "POST", body: formBody({ id: row.id }) });
-        await load(page.value);
-      } catch (e) { err.value = e.message; }
+      const d = dialog.warning({
+        title: "删除确认",
+        content: "删除「" + row.title + "」？删除后不可恢复。",
+        positiveText: "删除",
+        negativeText: "取消",
+        onPositiveClick: async () => {
+          try {
+            await api("/api/admin/posts/delete", { method: "POST", body: formBody({ id: row.id }) });
+            message.success("已删除");
+            await load(page.value);
+          } catch (e) { message.error(e.message); }
+        }
+      });
     }
 
     onMounted(() => load(1));
-    return { rows, total, page, pages, kw, loading, err, editing, busy, formErr,
-             load, open, create, save, togglePublish, remove };
+
+    /* 列表用 n-data-table：zan-grid 1.2.x 在 Vue 3.4 下 setup 栈溢出（已挂账 TASKS.md），
+       等库修复后切回 <Grid> 获得类 Excel 交互。这里保持服务端分页 + 行操作。 */
+    const nColumns = [
+      { title: "标题", key: "title", minWidth: 260, ellipsis: { tooltip: true } },
+      { title: "分类", key: "category", width: 100 },
+      { title: "作者", key: "author", width: 100 },
+      {
+        title: "状态", key: "published", width: 90,
+        render: row => h(NTag, { size: "small", type: row.published === 1 ? "success" : "default" },
+          { default: () => row.published === 1 ? "已发布" : "草稿" })
+      },
+      {
+        title: "创建时间", key: "createdAt", width: 170,
+        render: row => { const d = new Date(row.createdAt * 1000); return d.toLocaleString("zh-CN", { hour12: false }); }
+      },
+      {
+        title: "操作", key: "op", width: 190,
+        render: row => h(NSpace, { size: "small" }, {
+          default: () => [
+            h(NButton, { size: "tiny", type: "primary", quaternary: true, onClick: () => open(row.id) }, { default: () => "编辑" }),
+            h(NButton, { size: "tiny", quaternary: true, onClick: () => togglePublish(row) },
+              { default: () => row.published === 1 ? "下架" : "发布" }),
+            h(NButton, { size: "tiny", type: "error", quaternary: true, onClick: () => remove(row) }, { default: () => "删除" })
+          ]
+        })
+      }
+    ];
+
+    return { rows, total, page, limit, kw, loading, editing, saving,
+             load, open, create, save, togglePublish, remove, nColumns };
   },
   template: `
   <div>
-    <div v-if="err" class="flash bad">{{ err }}</div>
-    <div class="ad-card">
-      <div class="btn-row" style="justify-content:space-between;align-items:center">
-        <form class="btn-row" @submit.prevent="load(1)">
-          <input class="input input-sm" style="width:220px" v-model="kw" placeholder="按标题搜索">
-          <button class="btn btn-sm" type="submit">搜索</button>
-        </form>
-        <button class="btn btn-primary btn-sm" @click="create">写文章</button>
+    <n-card size="small">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <n-input v-model:value="kw" placeholder="按标题搜索" style="width:240px" clearable
+                 @keyup.enter="load(1)" @clear="load(1)"></n-input>
+        <n-button type="primary" @click="create">写文章</n-button>
       </div>
-      <table class="ad-table" style="margin-top:12px">
-        <thead>
-          <tr><th>标题</th><th>分类</th><th>作者</th><th>状态</th><th style="width:220px"></th></tr>
-        </thead>
-        <tbody>
-          <tr v-if="loading"><td colspan="5" style="color:var(--muted)">加载中…</td></tr>
-          <tr v-for="r in rows" :key="r.id">
-            <td>{{ r.title }}</td>
-            <td>{{ r.category }}</td>
-            <td>{{ r.author }}</td>
-            <td>{{ r.published === 1 ? "已发布" : "草稿" }}</td>
-            <td>
-              <button class="btn btn-sm" @click="open(r.id)">编辑</button>
-              <button class="btn btn-sm" @click="togglePublish(r)">
-                {{ r.published === 1 ? "下架" : "发布" }}
-              </button>
-              <button class="btn btn-sm btn-danger" @click="remove(r)">删除</button>
-            </td>
-          </tr>
-          <tr v-if="!loading && rows.length === 0"><td colspan="5" style="color:var(--muted)">还没有文章。</td></tr>
-        </tbody>
-      </table>
-      <div class="ad-pager">
-        <button class="btn btn-sm" :disabled="page <= 1" @click="load(page - 1)">上一页</button>
-        <span>第 {{ page }} / {{ pages }} 页 · 共 {{ total }} 篇</span>
-        <button class="btn btn-sm" :disabled="page >= pages" @click="load(page + 1)">下一页</button>
+      <n-data-table :columns="nColumns" :data="rows" :loading="loading" size="small" striped></n-data-table>
+      <div style="margin-top:10px;text-align:right">
+        <n-pagination :page="page" :page-size="limit" :item-count="total"
+                      :page-sizes="[10,20,50]" show-size-picker
+                      @update:page="p => load(p)"
+                      @update:page-size="s => { limit = s; load(1); }"></n-pagination>
       </div>
-    </div>
+    </n-card>
 
-    <div v-if="editing" class="ad-mask" @click.self="editing = null">
-      <div class="ad-modal">
-        <h2>{{ editing.id === 0 ? "写文章" : "编辑文章" }}</h2>
-        <div v-if="formErr" class="flash bad">{{ formErr }}</div>
-        <form class="ad-form" @submit.prevent="save">
-          <label>标题</label>
-          <input class="input" v-model="editing.title" required maxlength="200">
-          <label>分类</label>
-          <select class="input" v-model.number="editing.categoryId">
-            <option :value="0">未分类</option>
-            <option v-for="c in editing.categories" :key="c.id" :value="c.id">{{ c.name }}</option>
-          </select>
-          <label>作者</label>
-          <input class="input" v-model="editing.author" maxlength="64">
-          <label>标签</label>
-          <input class="input" v-model="editing.tags" maxlength="255" placeholder="逗号分隔">
-          <label>封面</label>
-          <input class="input" v-model="editing.cover" maxlength="255">
-          <label>状态</label>
-          <select class="input" v-model="editing.published">
-            <option value="1">发布</option>
-            <option value="0">草稿</option>
-          </select>
-          <label>摘要</label>
-          <textarea class="input" v-model="editing.summary" rows="2"></textarea>
-          <label>正文</label>
-          <textarea class="input" v-model="editing.body" rows="12" required></textarea>
-          <div></div>
-          <div class="full" style="display:flex;justify-content:flex-end;gap:8px;margin-top:8px">
-            <button class="btn" type="button" @click="editing = null">取消</button>
-            <button class="btn btn-primary" type="submit" :disabled="busy">
-              {{ busy ? "保存中…" : "保存" }}
-            </button>
-          </div>
-        </form>
-      </div>
-    </div>
+    <n-modal :show="!!editing" style="width:640px" preset="card"
+             :title="editing && editing.id === 0 ? '写文章' : '编辑文章'"
+             :mask-closable="false" @update:show="v => { if (!v) editing = null; }">
+      <n-form v-if="editing" label-width="72">
+        <n-form-item label="标题" required>
+          <n-input v-model:value="editing.title" maxlength="200"></n-input>
+        </n-form-item>
+        <n-form-item label="分类">
+          <n-select v-model:value="editing.categoryId" :options="(editing.categories || []).map(c => ({ label: c.name, value: c.id }))"></n-select>
+        </n-form-item>
+        <n-grid :cols="2" :x-gap="12">
+          <n-gi><n-form-item label="作者"><n-input v-model:value="editing.author" maxlength="64"></n-input></n-form-item></n-gi>
+          <n-gi><n-form-item label="状态">
+            <n-radio-group v-model:value="editing.published">
+              <n-radio value="0">草稿</n-radio>
+              <n-radio value="1">发布</n-radio>
+            </n-radio-group>
+          </n-form-item></n-gi>
+        </n-grid>
+        <n-grid :cols="2" :x-gap="12">
+          <n-gi><n-form-item label="标签"><n-input v-model:value="editing.tags" maxlength="255" placeholder="逗号分隔"></n-input></n-form-item></n-gi>
+          <n-gi><n-form-item label="封面"><n-input v-model:value="editing.cover" maxlength="255"></n-input></n-form-item></n-gi>
+        </n-grid>
+        <n-form-item label="摘要">
+          <n-input v-model:value="editing.summary" type="textarea" :rows="2"></n-input>
+        </n-form-item>
+        <n-form-item label="正文" required>
+          <n-input v-model:value="editing.body" type="textarea" :rows="10"></n-input>
+        </n-form-item>
+      </n-form>
+      <template #footer>
+        <div style="display:flex;justify-content:flex-end;gap:10px">
+          <n-button @click="editing = null">取消</n-button>
+          <n-button type="primary" :loading="saving" @click="save">保存</n-button>
+        </div>
+      </template>
+    </n-modal>
   </div>`
 };
 
@@ -344,38 +407,75 @@ const App = {
       return "dashboard";
     });
 
+    const menuOptions = computed(() => [
+      { label: "仪表盘", key: "#/" },
+      ...menu.value.map(m => ({ label: m.title, key: "#r=" + m.path }))
+    ]);
+    const activeKey = computed(() => page.value === "posts" ? "#r=/admin/content/posts" : "#/");
+    function onMenuSelect(key) {
+      if (key === "#/") { location.hash = "#/"; } else { location.hash = key; }
+    }
+
     onMounted(boot);
-    return { me, menu, page, logout, go, active };
+    return { me, menu, page, logout, go, active, menuOptions, activeKey, onMenuSelect };
   },
   template: `
-  <component v-if="page === 'login'" :is="'login-view'"></component>
-  <div v-else class="ad-shell">
-    <aside class="ad-side">
-      <div class="ad-brand">管理后台</div>
-      <nav class="ad-nav">
-        <a class="ad-link" :class="{ active: page === 'dashboard' }" href="#/">仪表盘</a>
-        <template v-for="m in menu" :key="m.path">
-          <a class="ad-link" href="javascript:void(0)" @click="go(m.path)">{{ m.title }}</a>
-        </template>
-      </nav>
-      <div class="ad-foot">
-        <span>{{ me ? me.uid : "" }}</span>
-        <button class="btn btn-ghost btn-sm" @click="logout">退出</button>
-      </div>
-    </aside>
-    <main class="ad-main">
-      <header class="ad-head"><h1>{{ page === 'posts' ? "文章管理" : "仪表盘" }}</h1></header>
-      <div class="ad-body">
-        <dashboard-view v-if="page === 'dashboard'"></dashboard-view>
-        <posts-view v-else-if="page === 'posts'"></posts-view>
-      </div>
-    </main>
-  </div>`,
-  components: {
-    "login-view": LoginView,
-    "dashboard-view": DashboardView,
-    "posts-view": PostsView
-  }
+  <n-config-provider>
+    <login-view v-if="page === 'login'"></login-view>
+    <n-layout v-else has-sider style="height:100%">
+      <n-layout-sider bordered content-style="display:flex;flex-direction:column;height:100%" :width="220">
+        <div style="height:56px;display:flex;align-items:center;justify-content:center;font-weight:700;letter-spacing:.06em">管理后台</div>
+        <n-menu :options="menuOptions" :value="activeKey" @update:value="onMenuSelect"
+                style="flex:1"></n-menu>
+        <div style="padding:12px 16px;display:flex;align-items:center;justify-content:space-between;border-top:1px solid #efeff5">
+          <span>{{ me ? me.uid : "" }}</span>
+          <n-button quaternary size="small" @click="logout">退出</n-button>
+        </div>
+      </n-layout-sider>
+      <n-layout content-style="display:flex;flex-direction:column;height:100%">
+        <n-layout-header bordered style="height:56px;display:flex;align-items:center;padding:0 24px">
+          <h1 style="font-size:16px;font-weight:600;margin:0">{{ page === 'posts' ? "文章管理" : "仪表盘" }}</h1>
+        </n-layout-header>
+        <n-layout-content content-style="padding:20px 24px;flex:1;overflow:auto">
+          <dashboard-view v-if="page === 'dashboard'"></dashboard-view>
+          <posts-view v-else-if="page === 'posts'"></posts-view>
+        </n-layout-content>
+      </n-layout>
+    </n-layout>
+  </n-config-provider>`
 };
 
-createApp(App).mount("#app");
+/* ---- bootstrap ---- */
+function mountAdmin() {
+  // body 就绪后再建离散 API（内部要往 body 挂 provider 容器）
+  const discrete = createDiscreteApi(["message", "dialog"]);
+  message = discrete.message;
+  dialog = discrete.dialog;
+  const app = createApp(App);
+  app.use(naive);
+  // 业务子组件：根组件模板里 <login-view>/<dashboard-view>/<posts-view>
+  app.component("login-view", LoginView);
+  app.component("dashboard-view", DashboardView);
+  app.component("posts-view", PostsView);
+  // zan-grid UMD 全局是 ZanGrid（不提供插件安装，直接注册组件）
+  if (window.ZanGrid && window.ZanGrid.Grid) {
+    app.component("Grid", window.ZanGrid.Grid);
+  } else if (window.ZanGrid) {
+    const g = window.ZanGrid.default || window.ZanGrid.Grid || window.ZanGrid;
+    app.component("Grid", g);
+  }
+  // zan-layer：全局安装注册 <zan-layer> 容器与 $layer
+  if (window.ZanLayer && window.ZanLayer.default) {
+    app.use(window.ZanLayer.default);
+  }
+  app.mount("#app");
+}
+
+/* 兼容两种执行时机：同步执行（脚本位于 #app 之后）与文档未就绪时等待 */
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", mountAdmin);
+} else {
+  mountAdmin();
+}
+
+})();
