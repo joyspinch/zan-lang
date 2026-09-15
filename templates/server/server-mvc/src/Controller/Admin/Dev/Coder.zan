@@ -161,6 +161,8 @@ class Coder : AdminController {
 
         List<GenColumn> cols = await this.GenColumn
             .Where(a => a.tableId == id).OrderBy(a => a.sortOrder).ToListAsync();
+        /* 行内控件（勾选/名称/类型/控件/排序）只对可更新者可用，只读者拿到禁用态。 */
+        bool canEdit = await this.Can((int)PermBit.Update);
         List<StrMap> list = d.AddList("columns");
         for (int i = 0; i < cols.Count; i = i + 1) {
             GenColumn c = cols[i];
@@ -171,11 +173,12 @@ class Coder : AdminController {
             row.Set("kind", c.kind);
             row.Set("widget", c.widget);
             row.Set("sortOrder", Convert.ToString(c.sortOrder));
-            row.Set("inList", Coder.Tick(c.inList));
-            row.Set("inFilter", Coder.Tick(c.inFilter));
-            row.Set("inCreate", Coder.Tick(c.inCreate));
-            row.Set("inEdit", Coder.Tick(c.inEdit));
-            row.Set("required", Coder.Tick(c.required));
+            row.Set("inList", Coder.Checked(c.inList));
+            row.Set("inFilter", Coder.Checked(c.inFilter));
+            row.Set("inCreate", Coder.Checked(c.inCreate));
+            row.Set("inEdit", Coder.Checked(c.inEdit));
+            row.Set("required", Coder.Checked(c.required));
+            if (!canEdit) { row.Set("dis", "disabled"); }
             row.Set("rel", Coder.Rel(c));
             list.Add(row);
         }
@@ -334,6 +337,96 @@ class Coder : AdminController {
         await this.Note("删除字段", c.name, n > 0,
             "数据库中的列保留");
         this.Saved("字段已从设计中移除，数据库中的列保留");
+    }
+
+    /* 行内快速改：设计表里的勾选/名称/类型/控件/排序就地提交，免去为一个小开关
+       开一次编辑框。只放行白名单列，每列单独校验后单独更新；列名永不来自请求，
+       更新构造器按字段写死，调用方无法指定任意列。深度属性（默认值/长度/字典/
+       关联）仍走编辑对话框。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("字段行内修改")]
+    async void ColumnQuick() {
+        int id = this.InInt("id", 0);
+        string field = this.Need("field", "属性");
+        string value = this.In("value");
+        GenColumn c = await this.GenColumn.Read(id);
+        if (c == null) { this.Fail(404, "0404", "字段不存在"); }
+
+        if (field == "label") {
+            string label = Coder.Clip(value, 64);
+            if (label.Length == 0) { label = c.name; }
+            int n = await this.GenColumn.Update()
+                .Set(a => a.label, label)
+                .Where(a => a.id == id).ExecuteAffrowsAsync();
+            await this.Note("编辑字段", c.name, n > 0, "label=" + label);
+            this.Ok("{}");
+            return;
+        }
+        if (field == "sortOrder") {
+            int sort = this.InInt("value", c.sortOrder);
+            if (sort < 0) { sort = 0; }
+            if (sort > 9999999) { sort = 9999999; }
+            int n = await this.GenColumn.Update()
+                .Set(a => a.sortOrder, sort)
+                .Where(a => a.id == id).ExecuteAffrowsAsync();
+            await this.Note("编辑字段", c.name, n > 0,
+                "sortOrder=" + Convert.ToString(sort));
+            this.Ok("{}");
+            return;
+        }
+        if (field == "kind") {
+            if (!Coder.InList(value, "string,text,int,long,decimal,bool,datetime")) {
+                this.Fail(400, "0004", "不支持的存储类型");
+            }
+            int n = await this.GenColumn.Update()
+                .Set(a => a.kind, value)
+                .Where(a => a.id == id).ExecuteAffrowsAsync();
+            await this.Note("编辑字段", c.name, n > 0, "kind=" + value);
+            this.Ok("{}");
+            return;
+        }
+        if (field == "widget") {
+            if (!Coder.InList(value,
+                    "text,textarea,number,select,switch,date,richtext,upload")) {
+                this.Fail(400, "0004", "不支持的控件");
+            }
+            int n = await this.GenColumn.Update()
+                .Set(a => a.widget, value)
+                .Where(a => a.id == id).ExecuteAffrowsAsync();
+            await this.Note("编辑字段", c.name, n > 0, "widget=" + value);
+            this.Ok("{}");
+            return;
+        }
+        if (field == "inList" || field == "inFilter" || field == "inCreate"
+            || field == "inEdit" || field == "required" || field == "nullable") {
+            int v = Coder.Flag(value);
+            int n = 0;
+            if (field == "inList") {
+                n = await this.GenColumn.Update().Set(a => a.inList, v)
+                    .Where(a => a.id == id).ExecuteAffrowsAsync();
+            } else if (field == "inFilter") {
+                n = await this.GenColumn.Update().Set(a => a.inFilter, v)
+                    .Where(a => a.id == id).ExecuteAffrowsAsync();
+            } else if (field == "inCreate") {
+                n = await this.GenColumn.Update().Set(a => a.inCreate, v)
+                    .Where(a => a.id == id).ExecuteAffrowsAsync();
+            } else if (field == "inEdit") {
+                n = await this.GenColumn.Update().Set(a => a.inEdit, v)
+                    .Where(a => a.id == id).ExecuteAffrowsAsync();
+            } else if (field == "required") {
+                n = await this.GenColumn.Update().Set(a => a.required, v)
+                    .Where(a => a.id == id).ExecuteAffrowsAsync();
+            } else {
+                n = await this.GenColumn.Update().Set(a => a.nullable, v)
+                    .Where(a => a.id == id).ExecuteAffrowsAsync();
+            }
+            await this.Note("编辑字段", c.name, n > 0,
+                field + "=" + Convert.ToString(v));
+            this.Ok("{}");
+            return;
+        }
+        this.Fail(400, "0004", "不支持行内修改的属性");
     }
 
     /* AI 字段设计：一句话业务 → 整表字段草稿。AI 只出草案，且过三道关才落设计：
@@ -740,11 +833,6 @@ class Coder : AdminController {
 
     static string Checked(int v) {
         if (v == 1) { return "checked"; }
-        return "";
-    }
-
-    static string Tick(int v) {
-        if (v == 1) { return "✓"; }
         return "";
     }
 

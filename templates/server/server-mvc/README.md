@@ -493,7 +493,15 @@ generation.
 **AI 生成字段** — on the field-design screen, describe the business in one
 sentence and the configured AI provider drafts the whole column list (names,
 Chinese labels, kinds, widgets, dict/relation suggestions, list/filter/edit
-flags). The flow is: prompt built server-side with the field contract plus the
+**Inline editing** — on the field-design table the cheap knobs are edited in
+place: the list/filter/create/edit/required checkboxes toggle on click, and the
+label, kind, widget and sort order are cell-level inputs/selects. Each change
+POSTs to `columnquick` (allow-listed fields only, one UPDATE per change) and a
+failed save reverts the control and toasts; deep attributes (size, default,
+dict, relation) still use the edit dialog. Read-only accounts get disabled
+controls.
+
+**AI 生成字段** — on the field-design screen, describe the business in one
 operator's real dict-type codes and designed tables → model answers strict
 JSON → **every column is re-validated server-side** (name legality, kind/widget
 whitelists, relation tables must actually exist, duplicate/id rejection) →
