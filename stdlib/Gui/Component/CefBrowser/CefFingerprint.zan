@@ -1,3 +1,4 @@
+using System.Json;
 using System;
 
 namespace Gui.Component.CefBrowser;
@@ -160,40 +161,45 @@ class CefFingerprint {
         }
         if (userAgent != "") { SendUserAgent(); }
         if (timezone != "") {
-            cdp.Send("Emulation.setTimezoneOverride",
-                "{\"timezoneId\":" + CefBrowser.JsonString(timezone) + "}",
-                null);
+            JsonValue p = JsonValue.NewObject();
+            p.PutStr("timezoneId", timezone);
+            cdp.Send("Emulation.setTimezoneOverride", p.ToJson(), null);
         }
         if (locale != "") {
-            cdp.Send("Emulation.setLocaleOverride",
-                "{\"locale\":" + CefBrowser.JsonString(locale) + "}", null);
+            JsonValue p = JsonValue.NewObject();
+            p.PutStr("locale", locale);
+            cdp.Send("Emulation.setLocaleOverride", p.ToJson(), null);
         }
         if (screenWidth > 0 && screenHeight > 0) {
             int pct = scalePercent > 0 ? scalePercent : 100;
-            cdp.Send("Emulation.setDeviceMetricsOverride",
-                "{\"width\":" + Convert.ToString(screenWidth)
-                + ",\"height\":" + Convert.ToString(screenHeight)
-                + ",\"screenWidth\":" + Convert.ToString(screenWidth)
-                + ",\"screenHeight\":" + Convert.ToString(screenHeight)
-                + ",\"deviceScaleFactor\":" + CefFingerprint.Ratio(pct)
-                + ",\"mobile\":" + (mobile ? "true" : "false") + "}", null);
+            JsonValue p = JsonValue.NewObject();
+            p.PutInt("width", screenWidth);
+            p.PutInt("height", screenHeight);
+            p.PutInt("screenWidth", screenWidth);
+            p.PutInt("screenHeight", screenHeight);
+            p.PutJson("deviceScaleFactor", CefFingerprint.Ratio(pct));
+            p.PutBool("mobile", mobile);
+            cdp.Send("Emulation.setDeviceMetricsOverride", p.ToJson(), null);
         }
         if (hardwareConcurrency > 0) {
-            cdp.Send("Emulation.setHardwareConcurrencyOverride",
-                "{\"hardwareConcurrency\":"
-                + Convert.ToString(hardwareConcurrency) + "}", null);
+            JsonValue p = JsonValue.NewObject();
+            p.PutInt("hardwareConcurrency", hardwareConcurrency);
+            cdp.Send("Emulation.setHardwareConcurrencyOverride", p.ToJson(), null);
         }
         if (acceptLanguage != "") {
             cdp.Enable("Network");
-            cdp.Send("Network.setExtraHTTPHeaders",
-                "{\"headers\":{\"Accept-Language\":"
-                + CefBrowser.JsonString(acceptLanguage) + "}}", null);
+            JsonValue headers = JsonValue.NewObject();
+            headers.PutStr("Accept-Language", acceptLanguage);
+            JsonValue p = JsonValue.NewObject();
+            p.Put("headers", headers);
+            cdp.Send("Network.setExtraHTTPHeaders", p.ToJson(), null);
         }
         string js = Script();
         if (js != "") {
             cdp.Enable("Page");
-            cdp.Send("Page.addScriptToEvaluateOnNewDocument",
-                "{\"source\":" + CefBrowser.JsonString(js) + "}",
+            JsonValue p = JsonValue.NewObject();
+            p.PutStr("source", js);
+            cdp.Send("Page.addScriptToEvaluateOnNewDocument", p.ToJson(),
                 (result) => { scriptId = CefCdp.Field(result, "identifier"); });
         }
     }
@@ -204,21 +210,22 @@ class CefFingerprint {
         cdp.Send("Emulation.clearDeviceMetricsOverride", "{}", null);
         // 时区给空串 = 撤掉覆盖；地区不带参数 = 回默认（这是 CDP 的约定，
         // 没有单独的 clear 命令）。
-        cdp.Send("Emulation.setTimezoneOverride", "{\"timezoneId\":\"\"}",
-            null);
+        JsonValue tz = JsonValue.NewObject();
+        tz.PutStr("timezoneId", "");
+        cdp.Send("Emulation.setTimezoneOverride", tz.ToJson(), null);
         cdp.Send("Emulation.setLocaleOverride", "{}", null);
         cdp.Send("Network.setExtraHTTPHeaders", "{\"headers\":{}}", null);
         // UA 同理没有 clear：把开工前问到的原值设回去。问不到就只能留着
         // （设空串会让页面真的读到空 UA，比留着更扎眼）。
         if (originalUa != "") {
-            cdp.Send("Emulation.setUserAgentOverride",
-                "{\"userAgent\":" + CefBrowser.JsonString(originalUa) + "}",
-                null);
+            JsonValue p = JsonValue.NewObject();
+            p.PutStr("userAgent", originalUa);
+            cdp.Send("Emulation.setUserAgentOverride", p.ToJson(), null);
         }
         if (scriptId != "") {
-            cdp.Send("Page.removeScriptToEvaluateOnNewDocument",
-                "{\"identifier\":" + CefBrowser.JsonString(scriptId) + "}",
-                null);
+            JsonValue p = JsonValue.NewObject();
+            p.PutStr("identifier", scriptId);
+            cdp.Send("Page.removeScriptToEvaluateOnNewDocument", p.ToJson(), null);
             scriptId = "";
         }
     }
@@ -229,29 +236,18 @@ class CefFingerprint {
     /// （随带 Client Hints 元数据），否则走 `Network.setUserAgentOverride`
     /// 老接口。
     void SendUserAgent() {
-        StringBuilder p = new StringBuilder();
-        p.Append("{\"userAgent\":");
-        p.Append(CefBrowser.JsonString(userAgent));
-        if (acceptLanguage != "") {
-            p.Append(",\"acceptLanguage\":");
-            p.Append(CefBrowser.JsonString(acceptLanguage));
-        }
-        if (platform != "") {
-            p.Append(",\"platform\":");
-            p.Append(CefBrowser.JsonString(platform));
-        }
-        if (brand != "" && brandVersion != "") {
-            p.Append(",\"userAgentMetadata\":");
-            p.Append(Metadata());
-        }
-        p.Append("}");
+        JsonValue p = JsonValue.NewObject();
+        p.PutStr("userAgent", userAgent);
+        if (acceptLanguage != "") { p.PutStr("acceptLanguage", acceptLanguage); }
+        if (platform != "") { p.PutStr("platform", platform); }
+        if (brand != "" && brandVersion != "") { p.PutJson("userAgentMetadata", Metadata()); }
         // Emulation 与 Network 两个域都能改 UA：Emulation 那份带 Client Hints，
         // Network 那份是老接口，只在没有 Client Hints 时才需要。
         if (brand != "" && brandVersion != "") {
-            cdp.Send("Emulation.setUserAgentOverride", p.ToString(), null);
+            cdp.Send("Emulation.setUserAgentOverride", p.ToJson(), null);
         } else {
             cdp.Enable("Network");
-            cdp.Send("Network.setUserAgentOverride", p.ToString(), null);
+            cdp.Send("Network.setUserAgentOverride", p.ToJson(), null);
         }
     }
 
@@ -260,38 +256,42 @@ class CefFingerprint {
     /// </summary>
     string Metadata() {
         string full = brandFullVersion != "" ? brandFullVersion : brandVersion;
-        StringBuilder b = new StringBuilder();
-        b.Append("{\"brands\":[");
-        b.Append("{\"brand\":\"Not.A/Brand\",\"version\":\"99\"},");
-        b.Append("{\"brand\":\"Chromium\",\"version\":");
-        b.Append(CefBrowser.JsonString(brandVersion));
-        b.Append("},{\"brand\":");
-        b.Append(CefBrowser.JsonString(brand));
-        b.Append(",\"version\":");
-        b.Append(CefBrowser.JsonString(brandVersion));
-        b.Append("}],\"fullVersionList\":[");
-        b.Append("{\"brand\":\"Not.A/Brand\",\"version\":\"99.0.0.0\"},");
-        b.Append("{\"brand\":\"Chromium\",\"version\":");
-        b.Append(CefBrowser.JsonString(full));
-        b.Append("},{\"brand\":");
-        b.Append(CefBrowser.JsonString(brand));
-        b.Append(",\"version\":");
-        b.Append(CefBrowser.JsonString(full));
-        b.Append("}],\"fullVersion\":");
-        b.Append(CefBrowser.JsonString(full));
-        b.Append(",\"platform\":");
-        b.Append(CefBrowser.JsonString(platform));
-        b.Append(",\"platformVersion\":");
-        b.Append(CefBrowser.JsonString(platformVersion));
-        b.Append(",\"architecture\":");
-        b.Append(CefBrowser.JsonString(
-            architecture != "" ? architecture : "x86"));
-        b.Append(",\"model\":");
-        b.Append(CefBrowser.JsonString(model));
-        b.Append(",\"mobile\":");
-        b.Append(mobile ? "true" : "false");
-        b.Append("}");
-        return b.ToString();
+        JsonValue brands = JsonValue.NewArray();
+        JsonValue notABrand = JsonValue.NewObject();
+        notABrand.PutStr("brand", "Not.A/Brand");
+        notABrand.PutStr("version", "99");
+        brands.Append(notABrand);
+        JsonValue chromium = JsonValue.NewObject();
+        chromium.PutStr("brand", "Chromium");
+        chromium.PutStr("version", brandVersion);
+        brands.Append(chromium);
+        JsonValue self = JsonValue.NewObject();
+        self.PutStr("brand", brand);
+        self.PutStr("version", brandVersion);
+        brands.Append(self);
+        JsonValue fullList = JsonValue.NewArray();
+        JsonValue notABrandFull = JsonValue.NewObject();
+        notABrandFull.PutStr("brand", "Not.A/Brand");
+        notABrandFull.PutStr("version", "99.0.0.0");
+        fullList.Append(notABrandFull);
+        JsonValue chromiumFull = JsonValue.NewObject();
+        chromiumFull.PutStr("brand", "Chromium");
+        chromiumFull.PutStr("version", full);
+        fullList.Append(chromiumFull);
+        JsonValue selfFull = JsonValue.NewObject();
+        selfFull.PutStr("brand", brand);
+        selfFull.PutStr("version", full);
+        fullList.Append(selfFull);
+        JsonValue m = JsonValue.NewObject();
+        m.Put("brands", brands);
+        m.Put("fullVersionList", fullList);
+        m.PutStr("fullVersion", full);
+        m.PutStr("platform", platform);
+        m.PutStr("platformVersion", platformVersion);
+        m.PutStr("architecture", architecture != "" ? architecture : "x86");
+        m.PutStr("model", model);
+        m.PutBool("mobile", mobile);
+        return m.ToJson();
     }
 
     // ---- 注入脚本 ---------------------------------------------------------
@@ -320,18 +320,13 @@ class CefFingerprint {
     /// 补 `navigator.languages` 的脚本片段：有 languages 列表用列表，
     /// 否则用单个 locale；getter 返回副本防外部改写。
     string LanguagesJs() {
-        StringBuilder arr = new StringBuilder();
-        arr.Append("[");
+        JsonValue arr = JsonValue.NewArray();
         if (languages.Count > 0) {
-            for (int i = 0; i < languages.Count; i = i + 1) {
-                if (i > 0) { arr.Append(","); }
-                arr.Append(CefBrowser.JsonString(languages[i]));
-            }
+            for (int i = 0; i < languages.Count; i = i + 1) { arr.AppendStr(languages[i]); }
         } else {
-            arr.Append(CefBrowser.JsonString(locale));
+            arr.AppendStr(locale);
         }
-        arr.Append("]");
-        return "try{var L=" + arr.ToString()
+        return "try{var L=" + arr.ToJson()
             + ";Object.defineProperty(Navigator.prototype,'languages',"
             + "{get:function(){return L.slice();}});}catch(e){}";
     }
@@ -344,9 +339,9 @@ class CefFingerprint {
         string r = webglRenderer != "" ? webglRenderer : "";
         StringBuilder js = new StringBuilder();
         js.Append("try{var V=");
-        js.Append(CefBrowser.JsonString(v));
+        js.Append(Encoding.JsonEscape(v));
         js.Append(",R=");
-        js.Append(CefBrowser.JsonString(r));
+        js.Append(Encoding.JsonEscape(r));
         // 37445/37446 是 WEBGL_debug_renderer_info 的 UNMASKED_*，
         // 7936/7937 是标准 VENDOR/RENDERER：两套都要接，指纹脚本两套都读。
         js.Append(";var g=function(orig){return function(p){");
