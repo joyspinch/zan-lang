@@ -3327,3 +3327,30 @@ P8 精简期全部剩余项处理与销账；roadmap P8 置 ✅。
   （legend:{} 应画整幅底部）、sparkline 的 x 轴末标签挤行 / y 轴
   "400/400" 重影（interval 9007199254740991 缺省）、mini bar 段内
   标签挤压。
+
+## 发布体积治理：数据逐符号分节已落地，PE/stdlib 两堵墙挂账（2026-09-15）
+
+**已修（本次提交）**：irgen_emit.c write_obj 在 publish 档给全局按符号分节
+（COFF 用 `.rdata$<名>`/`.data$<名>`，ELF/Mach-O 用点号），与逐函数
+`.text.<名>` 对称。此前单一 .rdata 块把 65 张虚表 + 全部 ARC 表钉活，进而
+钉住全部虚方法——空窗 GUI 探针 3624 个函数分节只被回收 13 个。修复过程中
+踩掉两个新坑（LLVMIsConstant 对 GlobalVariable 恒真，只读标志要用
+LLVMIsGlobalConstant；给 llvm.global_ctors 设 section 会静默废掉全部静态
+构造器），已沉淀进 zan-compiler-internals skill。
+
+**实测边界**（探针与对账脚本会话内 _scratch/sizeprobe2，可按 skill 配方重
+建）：Windows PE 上 GNU ld 把 .pdata/.xdata 当 GC 根，带展开表的函数永不
+回收（最小 gctest：零调用函数在 --gc-sections 下存活），故 PE 发布 .text
+不缩，本改动净效果≈0；ELF 上 ld.lld 正常回收（193 分节 / .text −280KB）。
+NewProject 发布 7,801,856 → 7,801,344（shared 链接；singleFile 的 13.4MB
+里另有静态 OpenSSL ~5MB + zan_gui ~1MB，属独立决策面）。
+
+**挂账一（链接器）**：PE 要真裁剪需二选一——①链接改 lld-link + /OPT:REF
+（关联 COMDAT 语义正确，工具链要新增 lld-link.exe 伴生件）；②发布档发
+no-unwind（Zan 无异常，崩溃日志只剩寄存器不展栈，需产品决策）。
+**挂账二（stdlib 架构）**：语义可达链 `Html_Clone → ControlFactory_Create
+→ new ChartHost()/DataTable` 把未用组件整体拖活（App_ctor 自身引用 45 个
+类描述符 + ImageHttp 拖活 TLS/OpenSSL）；解法是 ControlFactory 重臂照
+CEF/WebView 的 Bootstrap 注册模式移出主 switch（其注释里已有处方），
+App 的图表主题"构造即装载"改懒装载。落地后 ELF 侧可回收大头，PE 侧仍受
+挂账一压制。

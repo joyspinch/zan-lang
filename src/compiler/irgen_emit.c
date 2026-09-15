@@ -3170,6 +3170,56 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
             snprintf(sec, sizeof(sec), ".text.%s", nm);
             LLVMSetSection(fn, sec);
         }
+        /* Data-sections, same rationale: vtables, the per-class ARC tables
+         * (site dtors / tynames / refl mtabs) and named constants would
+         * otherwise coalesce into ONE .rdata/.data input section, and the
+         * linker GC can only drop whole input sections. Measured on an empty
+         * GUI window: one live string pinned all 65 vtables plus the release
+         * thunk tables, which pinned every virtual method -- Chart/DataTable/
+         * Excel code shipped to programs that never name them. Per-symbol
+         * sections let the linker drop a dead class's tables, taking its
+         * methods with it. Globals without a name or initializer (extern,
+         * tentative) stay in the merged blob; thread-locals keep their
+         * default placement.
+         *
+         * COFF/PE needs the '$' compose form: the linker turns everything
+         * before '$' into one output section while each input section stays
+         * individually gc-able. Dot-suffixed data sections would each become
+         * a private 4 KB-aligned output section (measured: +3.8 MB on the
+         * same probe). ELF and Mach-O linkers merge the dot form natively. */
+        int coff_obj = g->target_triple[0]
+                           ? strstr(g->target_triple, "windows-gnu") != NULL
+                           :
+#ifdef _WIN32
+                           1;
+#else
+                           0;
+#endif
+        const char *dsep = coff_obj ? "$" : ".";
+        for (LLVMValueRef gv = LLVMGetFirstGlobal(g->mod); gv;
+             gv = LLVMGetNextGlobal(gv)) {
+            if (LLVMGetSection(gv)) continue;
+            if (!LLVMGetInitializer(gv)) continue;
+            if (LLVMIsThreadLocal(gv)) continue;
+            size_t nlen = 0;
+            const char *nm = LLVMGetValueName2(gv, &nlen);
+            if (!nm || !nlen || nlen > 200) continue;
+            /* llvm.global_ctors must keep its special lowering: re-sectioning
+             * it silences every static constructor (string deobfuscation, the
+             * runtime registries) and the program dies at startup. */
+            if (strncmp(nm, "llvm.", 5) == 0) continue;
+            char sec[260];
+            /* LLVMIsConstant() answers "is this Value a Constant subclass",
+             * which is TRUE for every GlobalVariable; the read-only flag of
+             * the global itself is LLVMIsGlobalConstant(). Getting this wrong
+             * sends the mutable string-literal buffers (the deobfuscation
+             * ctor patches them at startup) into read-only .rdata -- instant
+             * SIGSEGV. */
+            snprintf(sec, sizeof(sec), "%s%s%s",
+                     LLVMIsGlobalConstant(gv) ? ".rdata" : ".data",
+                     dsep, nm);
+            LLVMSetSection(gv, sec);
+        }
     }
 
     LLVMTargetMachineRef tm;

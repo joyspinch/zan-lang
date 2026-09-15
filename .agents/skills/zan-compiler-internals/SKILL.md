@@ -1,6 +1,6 @@
 ---
 name: zan-compiler-internals
-description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式与坑——Dict 内建布局契约、LLVM select 死臂泄漏（用 branch+phi）、delegate 两形态与 wasm32 ZAN_CLOSURE_TAG 碰撞、nsresolve 冲突改名丢泛型实参（全量输入 vs 按需拉取行为不同）、ARC 所有权判定内建优先于 extern 借用、stdlib 按需拉入的坑、交叉工具链 .o 重出配方、conformance 处置四分法、scratch 卫生（bisect 用 worktree 即用即删）。做或改 src/compiler/*、交叉运行时对象、conformance golden 时使用。
+description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式与坑——Dict 内建布局契约、LLVM select 死臂泄漏（用 branch+phi）、delegate 两形态与 wasm32 ZAN_CLOSURE_TAG 碰撞、nsresolve 冲突改名丢泛型实参（全量输入 vs 按需拉取行为不同）、ARC 所有权判定内建优先于 extern 借用、stdlib 按需拉入的坑、LLVMIsConstant/llvm.global_ctors/PE 数据分节 $ 命名等发布体积分节陷阱、GNU ld PE 把 .pdata 当 GC 根、交叉工具链 .o 重出配方、conformance 处置四分法、scratch 卫生（bisect 用 worktree 即用即删）。做或改 src/compiler/*、交叉运行时对象、conformance golden、追发布体积时使用。
 ---
 
 # zanc 编译器内部定式与坑
@@ -42,6 +42,40 @@ description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式�
   branch+phi：两块各算各的，merge 处 phi 合流。
 - 返回 NULL 字符串是合法的空串形状：emit_str_concat 有 NULL→""、
   zan_rt_str_release 有 NULL 守卫，全链路安全。
+- **`LLVMIsConstant()` 不是「只读全局」**（2026-09-15）：它问 ValueKind
+  是否 Constant 子类，而 GlobalVariable 继承自 Constant——对任何全局恒
+  真。只读标志要用 `LLVMIsGlobalConstant()`。弄错会把可变的字符串字面
+  量缓冲（`__zan.deobf` 构造器启动时要写）放进只读 .rdata，发布程序启
+  动即 SIGSEGV。
+- **别给 `llvm.*` 全局设 section**：`llvm.global_ctors` 靠后端特殊降级
+  生成 `.ctors`；手动 `LLVMSetSection` 一旦碰到它，全部静态构造器（字符
+  串反混淆、运行时注册表）静默失联，症状是启动即崩且 .ctors 分节消失。
+
+## 发布体积：数据逐符号分节与链接器 GC 的边界（2026-09-15）
+
+irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名>` /
+`.data$<名>`），与既有的逐函数 `.text.<名>` 对称。背景实测（空窗 GUI 探
+针）：单一 .rdata 块里一个活字符串就把 65 张虚表 + 全部 ARC 表钉活，进而
+钉住全部虚方法——3624 个函数分节只被回收 13 个。四条定式：
+
+- **COFF/PE 数据分节必须 `$` 命名**：ld 把 '$' 前的基名合成一个输出段、
+  每个输入段保持独立可回收。点号命名（`.rdata.foo`）会让每个数据分节成
+  为独立输出段，PE 按 4KB 对齐——同一探针 +3.8MB。ELF/Mach-O 用点号。
+- **GNU ld 在 PE 上把 .pdata/.xdata 当 GC 根**：带展开表的函数永远收不
+  回（最小 gctest：零调用的 `dead()` 在 `--gc-sections` 下存活）。x64
+  win-gnu 上 LLVM 给所有非叶函数发展开表 ⇒ PE 发布的 .text 不缩，本改动
+  在 PE 净效果≈0；ELF 上 ld.lld 正常回收（实测 193 分节 / .text −280KB）。
+  PE 要真裁剪：换 lld-link `/OPT:REF`（关联 COMDAT 语义正确）或发布档发
+  no-unwind 表——都未做，见 TASKS.md 挂账。
+- **数据分节只是使能层，语义可达才决定死活**：空窗探针在 ELF 上
+  `Html_Clone → ControlFactory_Create → new ChartHost()` 一条链把整个组
+  件世界拖活（App_ctor 自身就引用 45 个类描述符 + ImageHttp 拖活 TLS）。
+  裁剪大头在 stdlib 解耦（ControlFactory 的重臂照 CEF/WebView 的
+  Bootstrap 注册模式移出主 switch），不在链接器。
+- **测量配方**：`zanc --publish -o x.a`（静态库输出路径保留完整对象，链
+  接后 obj_tmp 会删）→ `llvm-ar x` → 用 build/ld.exe（PE）或 ld.lld
+  （ELF）手动重链，加 `--print-gc-sections`；缺驱动符号时补
+  `-z undefs --noinhibit-exec`（ELF）即可只量回收不产出可执行。
 
 ## delegate 两形态与 wasm32 的 tag 碰撞
 
