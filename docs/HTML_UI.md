@@ -71,7 +71,7 @@ HTML 实体（`&amp;` `&lt;` `&#65;` 等）在文本与属性值里都解码。
 | style | 行内样式合成专属类 `.zgen-N { ... }`（复用整套级联与 !important 机制，见差异清单） |
 | data-on-\<evt\>="名" | 事件接线（见下） |
 | data-arg="字面量" | 本控件全部 data-on-* 处理器的实参（见下） |
-| data-bind="路径" | 绑定路径 bindPath |
+| data-bind="路径" | 绑定路径 bindPath（挂模型宿主每帧双向同步，见「动态原语」） |
 | data-if="路径" | 真值插拔声明 bindIf（见「动态原语」） |
 | data-for="路径" | `<template>` 行展开源数组（见「动态原语」；Element 上同时进属性表） |
 | href/title/disabled/… | 忽略（行为在宿主语言，不装死） |
@@ -130,7 +130,9 @@ h.AddArg("pick", (string arg) => { ... });   // 同名也可再 Add 无参版
 
 HTML 是声明，没有循环和条件表达式；这两条原语把"逐项渲染列表、
 按状态显隐"也声明化，**语义由挂了模型的宿主消费**（与 bindPath
-同一契约）——无模型的宿主（纯静态 UI、设计器画布）一律惰性。
+同一契约：`ChildWindow.SetRoot(tree, model)` 挂上的 JsonValue 状态
+实体，每帧双向同步——机制与边界见下节）——无模型的宿主（纯静态
+UI、设计器画布、主窗口 `LoadHtmlWith` 装载的树）一律惰性。
 
 ```html
 <ul class="cart">
@@ -143,9 +145,10 @@ HTML 是声明，没有循环和条件表达式；这两条原语把"逐项渲�
 ```
 
 **data-if → `Control.bindIf`**：挂模型的 ChildWindow 每帧取
-路径真值调 `SetShown`。真值裁决（`ChildWindow.Truthy`）：
-null（缺路径）→ 假；布尔原样；数字非 0；字符串非空且 ≠ "false"
-（比 `AsBool` 的严格 "true" 宽——路径值多是字符串状态名）。
+路径真值调 `SetShown`（同步节奏见下节「双向同步怎么跑」）。真值
+裁决（`ChildWindow.Truthy`）：null（缺路径）→ 假；布尔原样；数字
+非 0；字符串非空且 ≠ "false"（比 `AsBool` 的严格 "true" 宽——
+路径值多是字符串状态名）。
 
 **`<template data-for>` 行展开**：模板原型被 UA 样式表
 `template { display: none; }` 隐藏（Chrome 语义）；ChildWindow 在
@@ -190,6 +193,47 @@ IsModeledKey 名单，Inspector 经 extra 原样透传保真）：
   不带走。
 - 撤行走 Element 父的 `DropKid`（文档序表一并清），不留幽灵
   占位；行作用域登记随撤行清空（数组频繁重建不涨表）。
+
+**双向同步怎么跑（每帧两趟，无事件订阅）**：挂模型宿主
+（`ChildWindow.SetRoot(tree, model)`，模型是 JsonValue 状态实体）由
+渲染循环驱动两个方向——
+
+- **模型 → UI（帧前 `SyncFromModel`）**：`bindIf` 路径真值调
+  `SetShown`；`bindPath` 路径值经缺省绑定属性写控件（真控件 `value`、
+  Element `text`，`bindProp` 可指定），**值变才写**——无条件写会把
+  文本框光标弹回行尾。代码改模型（`Set`/`PathSet`/数组 `Append`）后
+  `RequestRedraw()` 出一帧即生效；模型改了但窗口静止，屏幕不会自己动。
+- **UI → 模型（帧后 `SyncChangedNode`）**：控件当前值与快照（模型侧
+  上次确认值）不同才回写；按叶子原类型折回 bool/number/string；行
+  作用域控件写回本项 JsonValue（数组元素引用，就地生效）。**回写没有
+  来源过滤**：绑定控件只要值变了就落模型，程序化 `SetProp` 与用户
+  编辑同待遇。因此"让 UI 显示新值"的正向姿势是改模型；既改模型又
+  `SetProp` 同一控件是两个写入源打架（帧后回写可能覆盖模型改动），
+  别混用。
+- **绑的是值槽不是结构**：`data-bind` 同步的是标量投影；对象/数组
+  的结构变化只有 `<template data-for>` 的长度对账一条路（整组重建，
+  无 keyed diff、无"改第 N 行"助手）——列表内容的局部高频更新不是
+  这条通道的设计场景。
+
+**动态操作选路：改模型，还是改树**。"程序运行中改变界面"两条路按
+变化类型选：
+
+- **值/显隐/列表内容 → 改模型（声明式）**：挂模型宿主里全是赋值——
+  `model.Set("title", ...)` 改 data-bind 文本、`Set("showBag", ...)`
+  翻 data-if、`Set("items", ...)` 重刷 data-for 行，末尾一句
+  `RequestRedraw()`。语义正向（帧前推送）、无树重建。
+- **结构 → 命令式树操作**：增删控件/换组件类型没有声明通道，走
+  retained 树 API（`Find` 定位 + `Add`/`InsertAt`/`Remove`/
+  `SetProp`）；整页换装 `app.LoadHtmlWith(newHtml, ...)`。已知代价
+  （台账）：① `LoadHtmlWith` 是**整树重载**，没有 diff——旧树上
+  手工 Add 的控件不在新文档里，频繁局部刷新留在模型通道；② 命令式
+  建树的行内 style 只吃视觉键，布局键（width/gap/pad…）要走类规则
+  或 log* 声明字段（见「字段内联 style」的几何拥有权边界）；③ 无
+  行级更新助手，"改第 N 行"要么整组重建要么自己定位行内控件。
+- **主窗口的树没有模型**：`App.LoadHtmlWith` 装在主窗口的树不走上述
+  两趟同步——bindPath/bindIf/data-for 全部惰性（data-bind 落了字段
+  也没人消费）。动态绑定内容放进 ChildWindow 宿主（`SetRoot(tree,
+  model)`）；主窗口树上改内容就是普通命令式 `SetProp`/树操作。
 
 ## 空白与文本语义（Chrome 同款）
 

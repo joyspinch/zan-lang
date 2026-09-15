@@ -186,6 +186,14 @@ small-medium 之间**:画廊卡片标题先后用 13/15 都被打回"太小",17 
 - `data-if` 只认路径真值,不支持比较表达式;多按钮控制中间区走
   `Nav.Embed`(路由出口:惰性实例化、切走保留、可配临态),别用
   N 个布尔 data-if 硬拼。
+- **运行中改界面先问"改值还是改结构"**(选路细则见
+  `references/html-window.md` 动态绑定节):值/显隐/列表内容一律
+  **改 JsonValue 模型 + RequestRedraw()**——挂模型宿主
+  (`SetRoot(tree, model)`)每帧双向同步,帧前推送、帧后回写;结构
+  变化(增删控件)才走命令式树操作或 `LoadHtmlWith` 整树重装
+  (无 diff)。两个硬边界:主窗口 `LoadHtmlWith` 装的树没有模型,
+  data-bind/data-if/data-for 全惰性;改模型与 `SetProp` 同一控件
+  是两个写入源打架,回写会把模型改动顶回去。
 - **zanc 编 .html 设计稿会先喷 `<unknown>` 噪音诊断,不是编译失败**:
   编译前置的命名空间预扫描对原始 HTML 文本跑一遍 Zan lexer,HTML 的中文
   与超长 data-uri 会报成 "unexpected character" 和 "string literal

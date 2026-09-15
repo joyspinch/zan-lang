@@ -76,13 +76,39 @@
 |---|---|---|
 | `data-on-click="名字"` | 事件 → 处理器注册表 | 设计稿只落名字；逻辑在 code-behind |
 | `data-arg="字面量"` | 带参事件（列表行共用处理器区分来源） | 只支持字面量，不求值表达式 |
-| `data-bind="路径"` | 绑 JsonValue 模型字段 | Element 缺省绑 text；真控件缺省 value |
+| `data-bind="路径"` | 绑 JsonValue 模型字段（ChildWindow 每帧双向同步，见下节选路） | Element 缺省绑 text；真控件缺省 value；**只在挂模型宿主生效**（主窗口 LoadHtmlWith 树上惰性） |
 | `data-if="路径"` | 显隐插拔 | **只认路径真值**（null/假/"false" 为隐），不支持 `a==b` 比较表达式 |
 | `<template data-for="路径">` | 数组行克隆 | 嵌套模板不支持；行内 bind/bindIf 以本项为第一作用域、回落根模型 |
 
 坑出处：data-if 的真值语义见 ChildWindow.Truthy——想按 `page=="bag"`
 切面板的人都在这里撞墙，解法见下节。模板原型子树靠 UA 样式
 `template{display:none}` 隐藏；克隆行撤除走文档序表防幽灵占位。
+
+## 动态绑定：改模型，还是改树（选路）
+
+绑定通道是 ChildWindow 的每帧同步（`SetRoot(tree, model)` 挂
+JsonValue 状态实体）：帧前模型→UI（`SyncFromModel`，值变才写）、
+帧后 UI→模型（`SyncChangedNode`，快照变了就回写，**没有来源
+过滤**——程序化 `SetProp` 同样落模型）。由此三条选路规则：
+
+- **值/显隐/列表内容 → 改模型**：`model.Set("title", ...)` /
+  `Set("showBag", ...)` / `Set("items", ...)`，末尾
+  `RequestRedraw()` 出一帧即生效（模型改了但窗口静止，屏幕不会
+  自己动）。别既改模型又 `SetProp` 同一控件——两个写入源打架，
+  帧后回写可能把模型改动顶回去。
+- **结构（增删控件/换组件类型）→ 命令式**：retained 树 API
+  （`Find` + `Add`/`InsertAt`/`Remove`/`SetProp`）或整页
+  `LoadHtmlWith` 重装。已知代价：重载是**整树无 diff**（手工 Add
+  的控件不在新文档里）；命令式行内 style 只吃视觉键、布局键走
+  类规则；没有"改第 N 行"助手——列表局部高频更新留在模型通道
+  （data-for 长度变了整组重建）。
+- **主窗口 `LoadHtmlWith` 装的树没有模型**：data-bind/data-if/
+  data-for 全部惰性，动态绑定内容必须放进 ChildWindow 宿主。
+
+代码内实时绑定是另一层：`Binding<T>`（stdlib 规范 §6.1），
+编译期字段直绑；字符串 bindPath 是"对话框 ↔ 状态实体"通道，
+两者互不替代（Control.zan bindPath 头注释、STDLIB_COMPONENT_
+STANDARDS.md §6.7）。
 
 ## 多按钮控制中间区（切页三路）
 
