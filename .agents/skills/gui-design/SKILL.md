@@ -156,6 +156,12 @@ small-medium 之间**:画廊卡片标题先后用 13/15 都被打回"太小",17 
   需宿主补一遍 `Html.AutoLinkTree(root, app)`。视觉:UA 给
   `a { color: var(--primary) }`(引擎没有下划线绘制原语,retained 模式
   也还没有 cursor 消费点——色差即示能)。
+- **`title` 属性原生就是悬停提示**(2026-09-15 起,此前静默忽略):
+  Element 上的 title 文本在指针停稳 500ms 后浮出皮肤样式的 Tooltip 气泡
+  (贴元素底边、260px 自动换行),指针挪走即消失。前提:元素要有命中区
+  (链接/带 data-on-click 的元素天然有,纯展示容器没有指针也就无提示)。
+  真控件(button/input/...)的 title 仍忽略;GenHtml 编译通道对 Element
+  发 elTitle,与运行时 LoadHtmlWith 同形。
 - **导入侧两个静默坑**(都真踩过):①读端属性循环里,专用分支必须排在
   通用分支之前——checkbox/radio 的 value 是文案(→label)、progress 的
   value/max 要截流(→percent),排进通用 value/min/max 分支之后就成了

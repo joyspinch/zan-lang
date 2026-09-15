@@ -283,7 +283,8 @@ font-size/transition）完全生效，不受几何影响。这是对浏览器 "i
   不是浏览器的 inline style 特异性（高于任何选择器）。与 id/类选择器
   的先后按"appCss 段内出现顺序"结算；`!important` 可覆盖。
 - **忽略的属性**：ARIA 等 a11y 属性一律静默忽略。href/target 是例外
-  ——`<a>` 有缺省导航语义（见下条）。
+  ——`<a>` 有缺省导航语义（见下条）；`title` 也是例外——悬停提示
+  （见下下条）。
 - **链接导航是桌面映射**：`<a href="http(s)://...">` 建树时由
   `Html.AutoLink` 接上缺省 Click 导航——缺省路由到内嵌 WebView
   （宿主 `App.UseWebview(box)` 注册的就地图优先，没有则懒建一个
@@ -300,6 +301,17 @@ font-size/transition）完全生效，不受几何影响。这是对浏览器 "i
   行克隆走 WireNode 补接，语义与浏览器差异见上。UA 样式表给
   `a { color: var(--primary) }` 示能（无 underline 绘制原语，
   retained 模式也没有 cursor 消费点——见 TASKS.md A47）。
+- **title 是悬停提示（tooltip）**：Element 记 `title` 文本，渲染期
+  `Html.PaintTip` 轮询——指针在元素上停稳 500ms（Tooltip
+  DefaultDelayMs）即向帧末提示队列登记，气泡贴元素底边、260px
+  自动换行；指针挪走或悬停目标一变即消失（计时在
+  `focus.hoverStartMs`，随 SetHovered 目标变化重置）。前提是元素
+  有命中区（链接/带 data-on-click 的元素天然有；纯展示容器无人
+  监听时不给指针，也就无提示）。真控件（button/input/...）的
+  title 忽略——不进控件属性面；GenHtml 编译通道对 Element 发
+  `elTitle`，双通道同形。与浏览器差异：气泡是 Zan 皮肤样式而非
+  系统原生；`title` 不承担浏览器里的其它兜底语义（如 img 替换
+  文本）。
 - **捕获控件的内嵌元素忽略**：`<button><span>x</span></button>` 的
   span 不建树，文本并入按钮标签。
 - **事件模型是宿主委托**：没有 DOM 冒泡/捕获/.preventDefault——

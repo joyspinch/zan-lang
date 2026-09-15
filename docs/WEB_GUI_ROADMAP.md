@@ -222,8 +222,12 @@ golden/audit/Inert 名单同步 → 提交 `gui-web(Pn): 主题`。
   AutoLinkTree 三挂载点；GenHtml 对 `<a>` 放行 href/target 落属性表。
   边界（http/https 才路由、data-on-click 接管不叠加、cursor 示能
   无 retained 消费点挂 A91）详见 docs/HTML_UI.md。
-- **（P5 台账）忽略的属性**：title/disabled/ARIA 等静默忽略，
-  行为在宿主语言；href/target 已升级为导航语义（见上条）。
+- **（P5 title 悬停提示，2026-09-15 补齐）`title` 属性 = tooltip**：
+  Element 记 elTitle，渲染期 Html.PaintTip 轮询（悬停停稳 500ms 经
+  focus.hoverStartMs 计时）登记帧末 Tooltip 气泡；GenHtml 对
+  Element 发 elTitle 保持双通道。真控件的 title 仍忽略。
+- **（P5 台账）忽略的属性**：disabled/ARIA 等静默忽略，
+  行为在宿主语言；href/target（导航）与 title（悬停提示）已升级。
 - **（P5 台账）捕获控件（button/textarea）内嵌元素忽略**：文本并入
   控件自己的捕获协议（button 标签 / textarea 初值）。
 - **（P5 台账）引擎级偏差对 HTML 层同样适用**：行内 run x 累计 ±3px
