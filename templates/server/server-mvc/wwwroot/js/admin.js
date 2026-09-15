@@ -1184,6 +1184,9 @@
   // carries its current value in data-value applies it after the fragment is
   // in the DOM. Same for the code preview's tabs, which are markup only.
   function applyFragmentWidgets(root) {
+    // 表格增强（排序/筛选/选择/密度）先跑：纯 DOM 重排，不动节点身份，
+    // 后面的脚本重放与委托事件都不受影响。
+    if (window.ZanTable) { ZanTable.wire(root); }
     var sels = root.querySelectorAll('select[data-value]');
     for (var i = 0; i < sels.length; i++) {
       var v = sels[i].getAttribute('data-value');
@@ -1413,6 +1416,9 @@
     }
     // The first screen is already in the panel, server-rendered (an SPA
     // injects its own panels later; startStream finds them per call).
+    // runScripts()/applyFragmentWidgets only run on fetched fragments —
+    // the server-rendered first panel needs its widget pass here.
+    if (panel && window.applyFragmentWidgets) { applyFragmentWidgets(panel); }
     startStream();
     wireModelPick(panel);
     // History repair belongs to the shell's URL space; an SPA host routes by

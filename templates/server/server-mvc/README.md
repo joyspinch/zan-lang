@@ -447,3 +447,36 @@ demonstrates the API-driven shape of the same features.
 {{#each rows}}...{{/each}} loop over ViewData.AddList("rows")
 layout.html + {{content}}  page wrapper
 ```
+
+## Table component (wwwroot/js/zan-table.js)
+
+`zan-table.js` progressively enhances the admin tables: the server template
+keeps emitting a plain `<table class="table">` with static rows, and the
+component wires itself onto any table that carries a `data-table` attribute
+(wired by `applyFragmentWidgets`, so fragments, dialogs and the first
+server-rendered panel all pick it up). No DOM re-rendering: the rows stay the
+same nodes, so `data-post`/`data-dialog` delegation and inline `<a>` keep
+working untouched.
+
+```html
+<table class="table" data-table="sort filter select">   <!-- empty = all -->
+  <thead><tr>
+    <th>标题</th>                    <!-- sortable, type auto-detected -->
+    <th class="num">阅读</th>         <!-- numeric sort -->
+    <th class="ops" data-nosort>操作</th>  <!-- ops columns are excluded anyway -->
+  </tr></thead>
+```
+
+What it adds, all client-side on the current page's data (zero requests):
+
+- **Column sort** — click a header; numeric/date/text kind is detected from
+  the first non-empty cell, arrows show the direction.
+- **Instant filter** — a 在当前页内筛选 box in the status bar; row
+  visibility toggles as you type, with a hit counter.
+- **Row selection** — a checkbox column with select-all/indeterminate head;
+  selected count, row highlight (`.on`), and a 取消选择 button.
+- **Density toggle** — 紧凑/舒适 per table, remembered in localStorage.
+
+Cross-page sort/filter belongs to the server (the pager is a link, the query
+is a form) — the component deliberately only manages the current page and
+resets on panel reload.
