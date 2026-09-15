@@ -27,8 +27,8 @@ import urllib.parse
 import urllib.request
 import urllib.error
 
-BASE = "http://127.0.0.1:8099"
-GAME = ("127.0.0.1", 7100)
+BASE = "http://127.0.0.1:48099"
+GAME = ("127.0.0.1", 47100)
 checks = 0
 
 T0 = time.time()

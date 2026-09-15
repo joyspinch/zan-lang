@@ -23,8 +23,8 @@ import urllib.parse
 import urllib.request
 import urllib.error
 
-BASE = "http://127.0.0.1:8099"
-GAME = ("127.0.0.1", 7100)
+BASE = "http://127.0.0.1:48099"
+GAME = ("127.0.0.1", 47100)
 results = {"pass": 0, "fail": 0, "obs": 0}
 
 def out(kind, name, detail=""):

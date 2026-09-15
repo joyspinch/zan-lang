@@ -24,8 +24,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-BASE = "http://127.0.0.1:8099"
-GAME = ("127.0.0.1", 7100)
+BASE = "http://127.0.0.1:48099"
+GAME = ("127.0.0.1", 47100)
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *a, **kw):
@@ -190,7 +190,7 @@ def login_worker(idx):
             if s is None:
                 s = socket.socket()
                 s.bind((f"127.0.0.{2 + idx % 8}", 0))
-                s.connect(("127.0.0.1", 8099))
+                s.connect(("127.0.0.1", 48099))
                 s.settimeout(10)
             payload = json.dumps({"user": f"perf{idx:02d}", "pass": "pass123"})
             s.sendall(("POST /api/game/login HTTP/1.1\r\nHost: 127.0.0.1\r\n"

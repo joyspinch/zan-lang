@@ -33,8 +33,8 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)          # templates/server/server-legend
-GAME = ("127.0.0.1", 7100)
-BASE = "http://127.0.0.1:8099"
+GAME = ("127.0.0.1", 47100)
+BASE = "http://127.0.0.1:48099"
 
 fails = []
 checks = 0
@@ -127,7 +127,7 @@ def start_server(exe):
     log = open(os.path.join(ROOT, "data", "e2e_legend_server.log"), "ab")
     proc = subprocess.Popen([exe], cwd=ROOT, stdout=log, stderr=log)
     if not wait_port():
-        raise SystemExit("server did not listen on 7100; see data/e2e_legend_server.log")
+        raise SystemExit("server did not listen on 47100; see data/e2e_legend_server.log")
     time.sleep(1.5)
     return proc
 

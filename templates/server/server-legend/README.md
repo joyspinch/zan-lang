@@ -30,11 +30,11 @@ GM 管理后台）与局域网 TCP 游戏网关跑在**同一个进程**里，�
 
 ```
                       ┌────────────── 单进程 ──────────────┐
-  玩家浏览器 ──HTTP──▶ WebApp :8099   / 首页(区服列表)      │
+  玩家浏览器 ──HTTP──▶ WebApp :48099   / 首页(区服列表)      │
                       │   · /register 网页注册             │
                       │   · /forgot 找回密码（三步密保）     │
                       │   · /admin GM 后台                 │
-  游戏客户端 ──TCP────▶ Gateway :7100  换行 JSON，一行一消息 │
+  游戏客户端 ──TCP────▶ Gateway :47100  换行 JSON，一行一消息 │
                       │        └ 流程：register → login →  │
                       │          realms → create/enter     │
                       │                                     │
@@ -97,13 +97,13 @@ zanc src/main.zan src/**/*.zan --auto-stdlib -o legend-server.exe
 # 或者用 IDE 新建项目（模板名"游戏服务端"）后直接运行
 
 ./legend-server.exe
-# [game] tcp://0.0.0.0:7100
-# http-worker http://0.0.0.0:8099
+# [game] tcp://0.0.0.0:47100
+# http-worker http://0.0.0.0:48099
 ```
 
-- 玩家网页：`http://127.0.0.1:8099/` — 区服列表 + **注册账号** +
+- 玩家网页：`http://127.0.0.1:48099/` — 区服列表 + **注册账号** +
   **找回密码**；注册即建 `game_account`，之后连 TCP 网关进游戏。
-- 管理后台：`http://127.0.0.1:8099/admin`，种子账号 **admin / admin1234**。
+- 管理后台：`http://127.0.0.1:48099/admin`，种子账号 **admin / admin1234**。
 - 数据库默认 SQLite（`data/app.db`），首次启动自动建表与种子；换 MySQL
   改 `[database]` 即可，游戏代码不感知驱动。
 
@@ -199,7 +199,7 @@ zanc src/main.zan src/**/*.zan --auto-stdlib -o legend-server.exe
 用 `nc` 就能当客户端试：
 
 ```
-$ nc 127.0.0.1 7100
+$ nc 127.0.0.1 47100
 {"op":"register","user":"bob","pass":"secret1","question":"宠物名字","answer":"旺财"}
 {"op":"login","user":"bob","pass":"secret1"}
 {"op":"create","realm":1,"name":"刀狂","job":0}
@@ -264,7 +264,7 @@ game_mob / game_item / game_bag / game_drop` 九张表由 `Schema.Ensure`
 
 ```json
 "game": {
-  "host": "0.0.0.0",   "port": 7100,
+  "host": "0.0.0.0",   "port": 47100,
   "tickMs": 1000,
   "kickSeconds": 90,
   "flushSeconds": 10,
@@ -302,12 +302,12 @@ game_mob / game_item / game_bag / game_drop` 九张表由 `Schema.Ensure`
 
 | 端口 | 用途 | 谁访问 |
 |---|---|---|
-| 8099 | HTTP 玩家注册/找回 + GM 后台 | 仅内网/运维段，建议防火墙不对公网放行 |
-| 7100 | TCP 游戏网关 | 局域网玩家 |
+| 48099 | HTTP 玩家注册/找回 + GM 后台 | 仅内网/运维段，建议防火墙不对公网放行 |
+| 47100 | TCP 游戏网关 | 局域网玩家 |
 
-- Windows 放行：`netsh advfirewall firewall add rule name="zan-game" dir=in action=allow protocol=TCP localport=7100`
-- Linux 放行：`ufw allow 7100/tcp`（或对应 iptables 规则）。
-- 玩家客户端连 `服务器内网IP:7100`；`[game].host` 保持 `0.0.0.0`。
+- Windows 放行：`netsh advfirewall firewall add rule name="zan-game" dir=in action=allow protocol=TCP localport=47100`
+- Linux 放行：`ufw allow 47100/tcp`（或对应 iptables 规则）。
+- 玩家客户端连 `服务器内网IP:47100`；`[game].host` 保持 `0.0.0.0`。
 - 修改端口/参数都在 `config/app.json` 的 `[game]` 段，重启生效。
 - 区服目前是**进程内逻辑分区**（广播按区收窄）；要做成多进程多物理服，
   给 `game_realm` 加 `host/port` 并按区路由网关连接即可，表结构已留好口。

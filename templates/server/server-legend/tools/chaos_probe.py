@@ -5,7 +5,7 @@ Run against a live instance. Duration defaults to 600s (override: argv[1]
 seconds). Mixes hostile traffic with normal clients and watches resources:
 
 - 3 garbler threads: random bytes / 300KB oversized frame / split frames,
-  reconnect loop on port 7100
+  reconnect loop on port 47100
 - 3 churn threads: connect-login-attach then RST close (SO_LINGER 0), ~1/s
 - 2 normal bots: login/enter/state loop at ~1 op/s, error + latency tracked
 - monitor: VmRSS + fd count of every legend-server pid every 5s
@@ -38,7 +38,7 @@ bot_ops = [0]
 CHURN_USER = "chaos_churn"
 
 def api(path, obj, timeout=10):
-    req = urllib.request.Request("http://127.0.0.1:8099" + path)
+    req = urllib.request.Request("http://127.0.0.1:48099" + path)
     req.add_header("Content-Type", "application/json")
     try:
         r = urllib.request.urlopen(req, json.dumps(obj).encode(), timeout=timeout)
@@ -58,7 +58,7 @@ def garbler(mode):
         try:
             s = socket.socket()
             s.settimeout(2)
-            s.connect(("127.0.0.1", 7100))
+            s.connect(("127.0.0.1", 47100))
             try:
                 s.recv(4096)
             except OSError:
@@ -84,7 +84,7 @@ def churn():
             s.settimeout(3)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
                          struct.pack("ii", 1, 0))
-            s.connect(("127.0.0.1", 7100))
+            s.connect(("127.0.0.1", 47100))
             s.recv(4096)
             s.sendall((f'{{"op":"login","user":"{CHURN_USER}",'
                        f'"pass":"pass123"}}\n').encode())
