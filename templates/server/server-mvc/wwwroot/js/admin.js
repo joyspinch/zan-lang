@@ -896,6 +896,7 @@
         calls: d ? (d.calls || 0) : 0,
         errors: d ? (d.errors || 0) : 0,
         avg_us: d ? (d.avg_us || 0) : 0,
+        p95_us: d ? (d.p95_us || 0) : 0,
         max_us: d ? (d.max_us || 0) : 0,
         total_us: d ? (d.total_us || 0) : 0,
         failed: l.failed || 0,
@@ -920,12 +921,13 @@
                  '</td><td class="num muted">' + share +
                  '</td><td class="num">' + num(s.errors) +
                  '</td><td class="num">' + d2(s.avg_us) +
+                 '</td><td class="num">' + d2(s.p95_us) +
                  '</td><td class="num">' + d2(s.max_us) +
                  '</td><td class="num">' + d2(s.total_us) +
                  '</td><td class="num">' + s.failed +
                  '</td><td class="num">' + s.rejected + '</td></tr>';
         }).join('')
-      : '<tr><td colspan="9" class="muted">今天还没有请求</td></tr>';
+      : '<tr><td colspan="10" class="muted">今天还没有请求</td></tr>';
   }
 
   // A bucket's wall clock as "hh:mm", for a chart whose x axis is one day.
@@ -1421,10 +1423,46 @@
     if (panel && window.applyFragmentWidgets) { applyFragmentWidgets(panel); }
     startStream();
     wireModelPick(panel);
+    wireBell();
     // History repair belongs to the shell's URL space; an SPA host routes by
     // hash and its popstate must not re-enter open()/load() here.
     if (tabs) { window.addEventListener('popstate', restoreHistory); }
   });
+
+
+  // ---- alert bell ----------------------------------------------------------
+  // 顶栏告警：轮询 /admin/monitor/alerts（30 秒一次，权限随运行监控屏）。
+  // 无告警时铃铛保持隐藏——没有消息就没有界面；有告警时显出红条并给出
+  // 条数，悬停看每条文案，点击进运行监控。失败静默：探活是尽力而为。
+  function wireBell() {
+    var bell = document.getElementById('ad-bell');
+    if (!bell) { return; }
+    var poll = function () {
+      fetch('/admin/monitor/alerts', {
+        headers: { 'X-Fragment': '1' }, credentials: 'same-origin'
+      }).then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (j) {
+          if (!j) { return; }
+          var list = j.alerts || [];
+          var n = list.length;
+          var count = bell.querySelector('.ad-bell-n');
+          if (count) {
+            count.textContent = String(n);
+            count.hidden = n === 0;
+          }
+          if (n > 0) {
+            var msgs = [];
+            list.forEach(function (a) { msgs.push(a.msg || ''); });
+            bell.title = msgs.join('\n');
+          } else {
+            bell.title = '运行告警';
+          }
+          bell.classList.toggle('alerting', n > 0);
+        }).catch(function () { /* offline or logged out: try again later */ });
+    };
+    poll();
+    setInterval(poll, 30000);
+  }
 
 
   // Account menu in the top-right corner.

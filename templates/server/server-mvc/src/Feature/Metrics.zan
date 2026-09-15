@@ -25,6 +25,11 @@ class MetricMinute {
     long totalUs;
     [Column(Name = "max_us")]
     long maxUs;
+    /* 该桶请求的 P95 耗时（微秒）：内存里按固定档位直方图累计，刷写时取
+       第 95 百分位所在档位的上沿。分位数不可加，多进程/多次刷写按最大
+       值合并——是全桶真值的上界，不会把慢请求算丢。 */
+    [Column(Name = "p95_us")]
+    long p95Us;
     /* 长连接推送的帧数与字节数（SSE/WebSocket），以帧/字节代替延迟度量流式接口。 */
     long frames;
     long bytes;
@@ -52,6 +57,13 @@ class LiveRow {
     string json;
 }
 
+/* 内存分钟桶：实体行 + 同一批请求的耗时直方图。直方图是 p95 的载体，
+   不落列——刷写时算一次档位上沿存进行里，随后桶连同直方图一起丢弃。 */
+class MinuteBucket {
+    MetricMinute row;
+    long[] hist;
+}
+
 /* 每个工作进程的实时快照行，按 worker id 主键覆盖更新。 */
 [Table(Name = "metrics_live")]
 class MetricLive {
@@ -77,7 +89,7 @@ class MetricError {
 
 /* 运行监控的历史数据存储：内存按分钟聚合后批量写入独立 SQLite 数据库。 */
 class MetricsStore {
-    static List<MetricMinute> buckets = new List<MetricMinute>();
+    static List<MinuteBucket> buckets = new List<MinuteBucket>();
     static List<MetricError> errors = new List<MetricError>();
     /* 待写入的 SQL 模板聚合（按模板聚合，每个慢查询只累加一次）。 */
     static List<MetricSql> sqlBuckets = new List<MetricSql>();
@@ -91,6 +103,9 @@ class MetricsStore {
     static bool ready = false;
     static bool flushing = false;
     static long lastSweep = 0;
+
+    /* 历史库是否就绪：不就绪时查询端（告警评估等）直接空手而回。 */
+    static bool Ready() { return MetricsStore.ready; }
 
     /* 初始化 metrics.db，创建表并启动后台刷新；失败时继续运行但不记历史。 */
     static async bool Start() {
@@ -168,20 +183,24 @@ class MetricsStore {
     }
 
     /* 获取当前分钟的桶，不存在则创建。 */
-    static MetricMinute Bucket(string method, string path) {
+    static MinuteBucket Bucket(string method, string path) {
         MetricsStore.Arm();
         long m = MetricsStore.Minute((long)WebApp.NowSeconds());
         int n = MetricsStore.buckets.Count;
         /* 当前分钟桶位于列表末尾，倒序查找即可。 */
         for (int i = n - 1; i >= 0; i = i - 1) {
-            MetricMinute b = MetricsStore.buckets[i];
-            if (b.minute != m) { break; }
-            if (b.method == method && b.path == path) { return b; }
+            MinuteBucket b = MetricsStore.buckets[i];
+            if (b.row.minute != m) { break; }
+            if (b.row.method == method && b.row.path == path) { return b; }
         }
-        MetricMinute b2 = new MetricMinute();
-        b2.minute = m;
-        b2.method = method;
-        b2.path = path;
+        MinuteBucket b2 = new MinuteBucket();
+        b2.row = new MetricMinute();
+        b2.row.minute = m;
+        b2.row.method = method;
+        b2.row.path = path;
+        /* 直方图与 ServerMetrics 实时序列同一套档位：同一耗时口径，
+           屏上实时 P95 与这里落库的 P95 可互相对照。 */
+        b2.hist = new long[ServerMetrics.HIST_BINS];
         MetricsStore.buckets.Add(b2);
         while (MetricsStore.buckets.Count > MetricsStore.MaxBuckets) {
             MetricsStore.buckets.RemoveAt(0);
@@ -192,19 +211,21 @@ class MetricsStore {
     /* 记录一次请求完成（含状态码与耗时）。 */
     static void Record(string method, string path, int status, long us) {
         if (!Cfg.Metrics.enabled) { return; }
-        MetricMinute b = MetricsStore.Bucket(method, path);
-        b.calls = b.calls + 1;
-        b.totalUs = b.totalUs + us;
-        if (us > b.maxUs) { b.maxUs = us; }
-        if (status >= 500) { b.errors = b.errors + 1; }
+        MinuteBucket b = MetricsStore.Bucket(method, path);
+        b.row.calls = b.row.calls + 1;
+        b.row.totalUs = b.row.totalUs + us;
+        if (us > b.row.maxUs) { b.row.maxUs = us; }
+        if (status >= 500) { b.row.errors = b.row.errors + 1; }
+        int bin = ServerMetrics.HistBin(us);
+        b.hist[bin] = b.hist[bin] + 1;
     }
 
     /* 长连接以推送帧数/字节计量，不计耗时。 */
     static void Pushed(string method, string path, long frames, long bytes) {
         if (!Cfg.Metrics.enabled) { return; }
-        MetricMinute b = MetricsStore.Bucket(method, path);
-        b.frames = b.frames + frames;
-        b.bytes = b.bytes + bytes;
+        MinuteBucket b = MetricsStore.Bucket(method, path);
+        b.row.frames = b.row.frames + frames;
+        b.row.bytes = b.row.bytes + bytes;
     }
 
     /* 记录一条 SQL 执行结果，累加到当天模板聚合中。SQL 已规范化，耗时单位微秒。 */
@@ -252,6 +273,24 @@ class MetricsStore {
         }
     }
 
+    /* 直方图 P95：第 95 百分位所在档位的上沿（微秒）；末档没有上沿，
+       用实测最慢值兜底。档位粒度是买的确定性的价格：每次请求一次增量，
+       不留样本、不排序。 */
+    static long HistP95(long[] hist, long calls, long maxUs) {
+        if (calls <= 0) { return 0; }
+        long cut = calls * 95 / 100;
+        if (cut < 1) { cut = 1; }
+        long acc = 0;
+        for (int b = 0; b < ServerMetrics.HIST_BINS; b = b + 1) {
+            acc = acc + hist[b];
+            if (acc >= cut) {
+                if (b >= ServerMetrics.HIST_BINS - 1) { return maxUs; }
+                return ServerMetrics.HistEdge(b);
+            }
+        }
+        return maxUs;
+    }
+
     /* 后台刷新协程：每秒检查一次，到达间隔或数量阈值时刷新。 */
     static async void Loop() {
         int waited = 0;
@@ -275,10 +314,16 @@ class MetricsStore {
             && MetricsStore.sqlBuckets.Count == 0) {
             return 0;
         }
-        List<MetricMinute> mine = MetricsStore.buckets;
+        List<MetricMinute> mine = new List<MetricMinute>();
+        for (int i = 0; i < MetricsStore.buckets.Count; i = i + 1) {
+            MinuteBucket b = MetricsStore.buckets[i];
+            b.row.p95Us = MetricsStore.HistP95(b.hist, b.row.calls,
+                b.row.maxUs);
+            mine.Add(b.row);
+        }
         List<MetricError> errs = MetricsStore.errors;
         List<MetricSql> sqls = MetricsStore.sqlBuckets;
-        MetricsStore.buckets = new List<MetricMinute>();
+        MetricsStore.buckets = new List<MinuteBucket>();
         MetricsStore.errors = new List<MetricError>();
         MetricsStore.sqlBuckets = new List<MetricSql>();
 
@@ -295,6 +340,7 @@ class MetricsStore {
                     .SetIncr(a => a.errors)
                     .SetIncr(a => a.totalUs)
                     .SetMax(a => a.maxUs)
+                    .SetMax(a => a.p95Us)
                     .SetIncr(a => a.frames)
                     .SetIncr(a => a.bytes)
                     .ExecuteAffrowsAsync();
@@ -388,7 +434,7 @@ class MetricsStore {
         if (stepSec < 1) { stepSec = 60; }
         string sql = "SELECT minute - (minute % " + Convert.ToString(stepSec)
             + "), SUM(calls), SUM(errors), SUM(total_us), MAX(max_us), "
-            + "SUM(frames), SUM(bytes) FROM metrics_minute "
+            + "MAX(p95_us), SUM(frames), SUM(bytes) FROM metrics_minute "
             + "WHERE minute >= ? AND minute <= ?";
         DbParams prms = new DbParams().AddLong(from).AddLong(to);
         if (method.Length > 0) {
@@ -416,8 +462,9 @@ class MetricsStore {
                 b.errors = r.GetLong(i, 2);
                 b.totalUs = r.GetLong(i, 3);
                 b.maxUs = r.GetLong(i, 4);
-                b.frames = r.GetLong(i, 5);
-                b.bytes = r.GetLong(i, 6);
+                b.p95Us = r.GetLong(i, 5);
+                b.frames = r.GetLong(i, 6);
+                b.bytes = r.GetLong(i, 7);
                 outp.Add(b);
             }
         } finally {
@@ -446,8 +493,8 @@ class MetricsStore {
             secondOrder = 3;
         }
         string sql = "SELECT method, path, SUM(calls), SUM(errors), "
-            + "SUM(total_us), MAX(max_us), SUM(frames), SUM(bytes) "
-            + "FROM metrics_minute WHERE minute >= ? AND minute <= ?";
+            + "SUM(total_us), MAX(max_us), MAX(p95_us), SUM(frames), "
+            + "SUM(bytes) FROM metrics_minute WHERE minute >= ? AND minute <= ?";
         DbParams prms = new DbParams().AddLong(from).AddLong(to);
         if (method.Length > 0) {
             sql = sql + " AND method = ?";
@@ -475,8 +522,9 @@ class MetricsStore {
                 e.errors = r.GetLong(i, 3);
                 e.totalUs = r.GetLong(i, 4);
                 e.maxUs = r.GetLong(i, 5);
-                e.frames = r.GetLong(i, 6);
-                e.bytes = r.GetLong(i, 7);
+                e.p95Us = r.GetLong(i, 6);
+                e.frames = r.GetLong(i, 7);
+                e.bytes = r.GetLong(i, 8);
                 outp.Add(e);
             }
         } finally {

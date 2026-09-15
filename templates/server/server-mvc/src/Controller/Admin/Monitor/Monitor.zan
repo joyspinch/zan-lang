@@ -103,6 +103,7 @@ class Monitor : AdminController {
             p.Put("calls", MetricsCluster.Num(b.calls));
             p.Put("errors", MetricsCluster.Num(b.errors));
             p.Put("avg_us", MetricsCluster.Num(Monitor.Avg(b.totalUs, b.calls)));
+            p.Put("p95_us", MetricsCluster.Num(b.p95Us));
             p.Put("max_us", MetricsCluster.Num(b.maxUs));
             pts.Append(p);
         }
@@ -148,6 +149,7 @@ class Monitor : AdminController {
             o.Put("calls", MetricsCluster.Num(b.calls));
             o.Put("errors", MetricsCluster.Num(b.errors));
             o.Put("avg_us", MetricsCluster.Num(Monitor.Avg(b.totalUs, b.calls)));
+            o.Put("p95_us", MetricsCluster.Num(b.p95Us));
             o.Put("max_us", MetricsCluster.Num(b.maxUs));
             o.Put("total_us", MetricsCluster.Num(b.totalUs));
             arr.Append(o);
@@ -243,6 +245,7 @@ class Monitor : AdminController {
             r.Set("errors", Convert.ToString(b.errors));
             r.Set("errRate", Monitor.Rate(b.errors, b.calls));
             r.Set("avg", Fmt.Dur(Monitor.Avg(b.totalUs, b.calls)));
+            r.Set("p95", Fmt.Dur(b.p95Us));
             r.Set("max", Fmt.Dur(b.maxUs));
             r.Set("frames", Convert.ToString(b.frames));
             r.Set("bytes", Fmt.Bytes(b.bytes));
@@ -262,6 +265,7 @@ class Monitor : AdminController {
             r.Set("errors", Convert.ToString(b.errors));
             r.Set("errRate", Monitor.Rate(b.errors, b.calls));
             r.Set("avg", Fmt.Dur(Monitor.Avg(b.totalUs, b.calls)));
+            r.Set("p95", Fmt.Dur(b.p95Us));
             r.Set("max", Fmt.Dur(b.maxUs));
             r.Set("total", Fmt.Dur(b.totalUs));
             r.Set("frames", Convert.ToString(b.frames));
@@ -399,6 +403,165 @@ class Monitor : AdminController {
         d.Set("shown", Convert.ToString(rows.Count));
         if (rows.Count == 0) { d.Set("empty", "1"); }
         this.Page(d);
+    }
+
+    /* SQL 模板统计屏：metrics_sql_day 的唯一读者。语句已规范化（字面量折叠，
+       不存用户输入），按天跨重启跨 worker 累积——实时面板的 top_sql 只见本
+       进程内存 ring、重启清零，隔天查慢 SQL 要看这里。 */
+    [HttpGet]
+    [Route("/admin/monitor/sql")]
+    [Custom(IsMenu = true, Icon = "mdi:database-search", Perm = PermBit.View)]
+    [Description("SQL 统计")]
+    async void Sql() {
+        ViewData d = await this.Layout("SQL 统计");
+        MetricWindow w = Monitor.Window(this.In("d"), this.In("d2"),
+            this.InInt("h", 24));
+        /* 三种排序回答三个问题：谁被调最多、谁占用服务器最多、谁最常慢——
+           慢率高的未必慢（低频慢 query），占时多的才拖整体。 */
+        string by = "calls";
+        if (this.In("by") == "time") { by = "time"; }
+        if (this.In("by") == "slow") { by = "slow"; }
+        int _w = await MetricsStore.Flush();
+        List<MetricSql> tops = await MetricsStore.SqlTotals(w.from, w.to,
+            Monitor.MaxRoutes, by);
+
+        List<StrMap> items = d.AddList("rows");
+        long calls = 0;
+        long slow = 0;
+        long totalUs = 0;
+        long maxUs = 0;
+        for (int i = 0; i < tops.Count; i = i + 1) {
+            MetricSql e = tops[i];
+            calls = calls + e.calls;
+            slow = slow + e.slow;
+            totalUs = totalUs + e.totalUs;
+            if (e.maxUs > maxUs) { maxUs = e.maxUs; }
+            StrMap r = new StrMap();
+            r.Set("sql", e.sql);
+            r.Set("calls", Convert.ToString(e.calls));
+            r.Set("slow", Convert.ToString(e.slow));
+            r.Set("slowRate", Monitor.Rate(e.slow, e.calls));
+            r.Set("avg", Fmt.Dur(Monitor.Avg(e.totalUs, e.calls)));
+            r.Set("max", Fmt.Dur(e.maxUs));
+            r.Set("total", Fmt.Dur(e.totalUs));
+            items.Add(r);
+        }
+
+        d.Set("by", by);
+        d.Set("by_" + by, "1");
+        d.Set("hours", Convert.ToString(w.hours));
+        d.Set("d", w.day);
+        d.Set("d2", w.day2);
+        /* 窗标签与历史统计同构：日历窗标日期，滚动窗标小时数。 */
+        string label = Convert.ToString(w.hours) + " 小时";
+        if (w.dated) {
+            label = w.day;
+            if (w.day2 != w.day) { label = label + " → " + w.day2; }
+        }
+        d.Set("window", label);
+        d.Set("shapes", Convert.ToString(tops.Count));
+        d.Set("calls", Convert.ToString(calls));
+        d.Set("slow", Convert.ToString(slow));
+        d.Set("slowRate", Monitor.Rate(slow, calls));
+        d.Set("total", Fmt.Dur(totalUs));
+        d.Set("max", Fmt.Dur(maxUs));
+        if (tops.Count == 0) { d.Set("empty", "1"); }
+        if (tops.Count >= Monitor.MaxRoutes) { d.Set("capped", "1"); }
+        this.Page(d);
+    }
+
+    /* 与屏同窗的 SQL 统计导出；同一条目上限，查询串不能一次拉走整库。 */
+    [HttpGet]
+    [Custom(Perm = PermBit.Export)]
+    [Description("导出 SQL 统计")]
+    async void SqlExport() {
+        MetricWindow win = Monitor.Window(this.In("d"), this.In("d2"),
+            this.InInt("h", 24));
+        string by = "calls";
+        if (this.In("by") == "time") { by = "time"; }
+        if (this.In("by") == "slow") { by = "slow"; }
+        int _w = await MetricsStore.Flush();
+        List<MetricSql> tops = await MetricsStore.SqlTotals(win.from, win.to,
+            Monitor.MaxRoutes, by);
+        StringBuilder sb = new StringBuilder();
+        sb.Append("sql,calls,slow,avg_us,max_us,total_us\n");
+        for (int i = 0; i < tops.Count; i = i + 1) {
+            MetricSql e = tops[i];
+            sb.Append(Monitor.Cell(e.sql));
+            sb.Append(",");
+            sb.Append(Convert.ToString(e.calls));
+            sb.Append(",");
+            sb.Append(Convert.ToString(e.slow));
+            sb.Append(",");
+            sb.Append(Convert.ToString(Monitor.Avg(e.totalUs, e.calls)));
+            sb.Append(",");
+            sb.Append(Convert.ToString(e.maxUs));
+            sb.Append(",");
+            sb.Append(Convert.ToString(e.totalUs));
+            sb.Append("\n");
+        }
+        this.Ctx().Download("sql-metrics.csv", "text/csv; charset=utf-8",
+            sb.ToString());
+    }
+
+    /* 顶栏铃铛的数据源：无状态即算即答，不存告警历史——历史是错误日志与
+       指标屏的职责，这里只回答"现在有事吗"。三信号：5 分钟窗错误率（调用量
+       达到门槛才评，避免深夜个位数请求一个 500 就是 100%）、窗内最差分钟档
+       P95 耗时、工作进程掉线（发布停止超过时效）。 */
+    static int AlertWindowSec = 300;
+
+    [HttpGet]
+    [Custom(Perm = PermBit.View)]
+    [Description("运行告警")]
+    async void Alerts() {
+        JsonValue arr = JsonValue.NewArray();
+        if (Cfg.Metrics.enabled && MetricsStore.Ready()) {
+            int _w = await MetricsStore.Flush();
+            long to = (long)WebApp.NowSeconds();
+            long from = to - Monitor.AlertWindowSec;
+            MetricMinute tot = await MetricsStore.WindowTotals(from, to, "", "");
+            if (Cfg.Metrics.alertErrPct > 0
+                    && tot.calls >= (long)Cfg.Metrics.alertErrCalls) {
+                long rate10 = tot.errors * 1000 / tot.calls;
+                if (rate10 >= (long)Cfg.Metrics.alertErrPct * 10) {
+                    arr.Append(Monitor.AlertMsg("近 5 分钟错误率 "
+                        + Monitor.Tenths(rate10) + "%（"
+                        + Convert.ToString(tot.errors) + "/"
+                        + Convert.ToString(tot.calls) + "）"));
+                }
+            }
+            if (Cfg.Metrics.alertP95Ms > 0) {
+                List<MetricMinute> rows = await MetricsStore.HistoryBuckets(
+                    from, to, "", "", 60, Monitor.MaxRows);
+                long worst = 0;
+                for (int i = 0; i < rows.Count; i = i + 1) {
+                    if (rows[i].p95Us > worst) { worst = rows[i].p95Us; }
+                }
+                if (worst >= (long)Cfg.Metrics.alertP95Ms * 1000) {
+                    arr.Append(Monitor.AlertMsg("近 5 分钟 P95 耗时 "
+                        + Fmt.Dur(worst)));
+                }
+            }
+            if (Cfg.Worker.count > 1) {
+                List<LiveRow> lives = await MetricsCluster.LiveRows("snapshot",
+                    MetricsCluster.FreshSeconds);
+                if (lives.Count < Cfg.Worker.count) {
+                    arr.Append(Monitor.AlertMsg("工作进程 "
+                        + Convert.ToString(lives.Count) + "/"
+                        + Convert.ToString(Cfg.Worker.count) + " 在线"));
+                }
+            }
+        }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("alerts", arr);
+        o.Put("ts", MetricsCluster.Num((long)WebApp.NowSeconds()));
+        this.Json(o.ToJson());
+    }
+
+    static JsonValue AlertMsg(string msg) {
+        JsonValue s = JsonValue.NewObject();
+        s.Put("msg", JsonValue.NewStr(msg));
+        return s;
     }
 
     /* 本进程映射的共享内存（只读）：每表一行，含所存内容与所耗成本；映射是预留地址空间（行可寻址但未必已占用），故创建大小与实际驻留为两列。数字按进程计：各 worker 在同驻留映射各自表。 */

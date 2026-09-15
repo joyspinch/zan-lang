@@ -269,6 +269,39 @@ The request lifecycle and database queries are instrumented into the shared
 - **Security:** `/admin/stats` leaks internal timing/paths. Guard it with
   `.Auth()`, an IP allow-list, or a separate admin bind before exposing it.
 
+## Monitoring screens (`/admin/monitor/*`)
+
+Four screens read the persisted history (`metrics.db`, `[metrics]` config):
+**运行监控** (live SSE snapshot + today's totals + per-route leaderboard),
+**历史统计** (time-bucketed windows, per-route ranking, CSV/JSON export),
+**错误日志** (persisted, sanitized error events), **SQL 统计**
+(`/admin/monitor/sql` — per-day per-normalized-statement aggregates from
+`metrics_sql_day`: calls, slow count, avg/max/total time; rank by calls,
+total time or slow count; CSV export). Slow SQL and slow requests are also
+logged at the `[log].slowSqlMs` / `[log].slowMs` thresholds.
+
+- **P95 is persisted.** `metrics_minute` carries `p95_us` per route per
+  minute, computed at flush time from a fixed-bin latency histogram (the same
+  bins as the live series, so live and stored P95 read the same scale).
+  Percentiles are not additive: multiple flushes/workers merge with MAX, so a
+  stored P95 is an upper bound of the true one — good enough to see "this
+  route's tail got slower" across hours and restarts, which avg/max cannot.
+- **Health probe** `GET /health` — no authentication (LB/watchdog/supervisor
+  probes cannot log in). Shallow answer is process facts only (status,
+  uptime_ms, requests, pid, worker). `GET /health?deep=1` also runs `SELECT 1`
+  on the main pool on the request's existing lease and answers **503** when
+  the database is unreachable.
+- **Alert bell** — the admin top bar polls `/admin/monitor/alerts` every 30s
+  (visible only to accounts granted the monitor screen) and shows a red badge
+  when something is wrong. Three signals, evaluated statelessly per poll over
+  a 5-minute window: error rate (`[metrics].alertErrPct` %, only once
+  `[metrics].alertErrCalls` calls have accumulated — avoids 1-of-2 = 100%
+  false alarms at night), worst per-minute P95
+  (`[metrics].alertP95Ms`), and workers below `[worker].count`. Set any
+  threshold to 0 to disable its check. There is deliberately no alert
+  history: history is the error log's and the metrics screens' job; the bell
+  only answers "is anything wrong right now".
+
 ## Run
 
 Build & run from the IDE (output streams into the terminal panel), or from a
