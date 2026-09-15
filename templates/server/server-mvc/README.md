@@ -384,16 +384,46 @@ directory. `StaticFiles.MaxAge(0)` while developing.
 ```
 wwwroot/css/app.css          the whole design system (no framework, no build)
 wwwroot/js/app.js            htmx glue: CSRF header, error/flash toasts
+wwwroot/admin/               Vue 3 SPA admin shell (no build step — see below)
 wwwroot/vendor/htmx.min.js   htmx 1.9.12    -- unpkg.com/htmx.org@1.9.12/dist/htmx.min.js
 wwwroot/vendor/alpine.min.js Alpine 3.14.1  -- unpkg.com/alpinejs@3.14.1/dist/cdn.min.js
+wwwroot/vendor/vue.global.prod.js  Vue 3.4.38  -- unpkg.com/vue@3.4.38/dist/vue.global.prod.js
 ```
 
-The two vendor files are committed on purpose: no CDN at runtime, versions
+The vendor files are committed on purpose: no CDN at runtime, versions
 pinned, works offline. To upgrade, download the new file over the old one and
 update the version in this list. There is no Node toolchain and nothing to
 compile -- `app.css` is hand-written CSS (variables, grid, a 900px breakpoint
 that turns the admin sidebar into a drawer, and tables that become cards under
 720px), so a page needs no build step to look right on phone or desktop.
+
+## SPA admin shell (wwwroot/admin/)
+
+`/static/admin/index.html` serves a second, alternative admin console: a Vue 3
+single-page app that talks to the server purely through the JSON API. It is a
+shell, not a replacement -- the server-rendered pages under `views/` remain the
+reference implementation of every screen; the SPA demonstrates the API-driven
+shape of the same features.
+
+- **Entry** `/static/admin/index.html` loads `vendor/vue.global.prod.js` and
+  `admin/app.js` (hash routing, three views: login / dashboard / posts).
+- **Endpoints** (all `Accept: application/json`, cookie session):
+  - `POST /api/auth/login`, `GET /api/auth/me` -- existing auth
+  - `GET /api/admin/menu` -- the sidebar as JSON, filtered by the same
+    permission resolver the dispatcher uses (MenuBuilder.JsonFor), so the
+    client cannot render a link the API would refuse
+  - `GET /api/admin/summary` -- dashboard counters
+  - `GET /api/admin/posts/list|get`, `POST .../create|update|publish|delete`
+    -- article CRUD as JSON (src/Controller/Api/Posts.zan)
+- **Optimistic concurrency**: post rows carry `version` (= updatedAt). The
+  form sends it back on save; when it no longer matches the stored row the
+  update is refused with `409 {"code":"1005"}` instead of silently
+  overwriting the other editor's changes. Two people editing the same article
+  cannot clobber each other.
+- **Auth shape**: a JSON request (Accept: application/json) that is not
+  signed in gets `401 {"code":"401"}`, never the sign-in redirect -- the
+  dispatcher picks the response shape once (WebApp.WantsPage), so the SPA can
+  branch on status instead of parsing HTML.
 
 ## Template syntax (views/*.html)
 
