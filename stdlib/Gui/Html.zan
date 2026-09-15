@@ -25,58 +25,43 @@ namespace Gui;
 /// data-on-<evt>="名" 经 HtmlHandlers 注册表接 BindEvent，
 /// data-bind → bindPath，data-if → bindIf。其余属性（Element 进
 /// 原始属性表；真控件忽略）。
-
-/// 解析产物：body 根 + 收集的样式。root 恒为 body 元素——片段没有
-/// body 标签时包一层隐式 body（对齐 Chrome 的文档语义）。
-class HtmlDoc {
-    Control root;
-    string css;
-    int gen;        // style 属性合成类的计数器（zgen-N）
-}
-
-/// data-on-* 的处理器注册表：`handlers.Add("submit", () => ...)`，
-/// HTML 里 `data-on-click="submit"` 命中同名条目即接线。带参变体
-/// `AddArg("row", a => ...)` 配 `data-arg` 使用（见 Html.WireArg）。
-class HtmlHandlers {
-    Dict<string, Action> map;
-    Dict<string, Action<string>> argMap;
-
-    void Add(string name, Action a) {
-        if (this.map == null) { this.map = new Dict<string, Action>(); }
-        this.map.Add(name, a);
-    }
-
-    /// 注册带参处理器：同名文档节点写了 `data-arg="x"`，触发时
-    /// 收到 "x"。
-    void AddArg(string name, Action<string> a) {
-        if (this.argMap == null) {
-            this.argMap = new Dict<string, Action<string>>();
-        }
-        this.argMap.Add(name, a);
-    }
-
-    /// 未注册的名字返回 null（静默不接线——HTML 是声明，事件在
-    /// 宿主语言里，名字打错表现为按钮没反应而非崩溃）。
-    Action Find(string name) {
-        if (this.map == null) { return null; }
-        Action a = null;
-        if (this.map.TryGetValue(name, out a)) { return a; }
-        return null;
-    }
-
-    /// 带参槽查找，未注册返回 null。
-    Action<string> FindArg(string name) {
-        if (this.argMap == null) { return null; }
-        Action<string> a = null;
-        if (this.argMap.TryGetValue(name, out a)) { return a; }
-        return null;
-    }
-}
-
+///
+/// 与 App 的解耦（auto-stdlib 按需拉取，活名才入编译图）：契约类型
+/// HtmlDoc/HtmlHandlers 在 Gui.HtmlApi（App.LoadHtml 的签名只背它们），
+/// 装载实现在本文件，经 <see cref="Install"/> 注册进 App 的装载槽。
+/// 只经 `app.LoadHtml(...)` 用 HTML 的宿主需在启动时调用一次 Install；
+/// 拼写了任何 Html.* 构建入口的程序会被自动安装。不安装的程序
+/// App 编译图不背解析器/渲染器/System.Web。
 class Html {
+    static bool loaderInstalled;
+
+    /// 向 App 注册 HTML 装载与链接扫描实现（App.LoadHtmlWith 的
+    /// 后端、ChildWindow.WireNode 的扫描通道），并补齐 Element 的
+    /// title 提示、模板行克隆与远端图片三个通道。
+    static void Install() {
+        if (loaderInstalled) { return; }
+        loaderInstalled = true;
+        App.SetHtmlLoader(LoadForApp);
+        App.SetLinkScanner(AutoLinkTree);
+        Element.SetTipPainter(Html.PaintTip);
+        App.SetCloneTree(Html.Clone);
+        ImageHttp.Install();
+    }
+
+    static Control LoadForApp(App app, string html, HtmlHandlers handlers,
+                              string baseDir) {
+        HtmlDoc doc = Html.Parse(html, baseDir, handlers);
+        string zs = app.NextLoadScope();
+        string scoped = doc.css == "" ? "" : HtmlScope.Styles(doc.css, zs);
+        app.ApplyScopedTree(doc.root, scoped, zs);
+        App.AutoLinkTree(doc.root, app);
+        return doc.root;
+    }
+
     /// 解析 `html`（整文档或片段）并建树。`baseDir` 是 `<link>`
     /// 相对路径的基目录（空 = 不解析 link）。`handlers` 可为 null。
     static HtmlDoc Parse(string html, string baseDir, HtmlHandlers handlers) {
+        Install();
         WDoc wd = HtmlParser.Parse(html, baseDir);
         HtmlDoc doc = new HtmlDoc();
         doc.css = wd.css;
@@ -108,6 +93,7 @@ class Html {
     /// 一条记录 → 一个控件（构造 + 属性协议）。容器自己的文本不在这
     /// 里加——装配阶段按 items 文档序与子控件交错加入。
     static Control Build(WDoc wd, WNode n, HtmlDoc doc, HtmlHandlers handlers) {
+        Install();
         string tag = n.tag;
         string id = HtmlText.Attr(n.attrNames, n.attrVals, "id");
         string type = HtmlText.Attr(n.attrNames, n.attrVals,
@@ -297,6 +283,7 @@ class Html {
     /// kind 重建（未注册返回 null，调用侧跳过不占位），Props 声明槽
     /// 与事件名照搬；几何与绑定声明逐项复制，子树递归。
     static Control Clone(Control c) {
+        Install();
         if (c is Element) {
             Element src = (Element)c;
             Element el = new Element();
@@ -450,6 +437,7 @@ class Html {
 
     /// 对一棵树做链接扫描（LoadHtmlWith / 宿主自挂的手搭或生成树）。
     static void AutoLinkTree(Control root, App app) {
+        Install();
         if (root == null) { return; }
         Html.AutoLink(root, app);
         for (int i = 0; i < root.children.Count; i = i + 1) {
@@ -466,19 +454,6 @@ class Html {
         string low = href.ToLower();
         return HtmlText.StartsWith(low, "http://")
             || HtmlText.StartsWith(low, "https://");
-    }
-
-    /// 系统关联程序打开 url（target="_blank" 与 WebView 不可用时的
-    /// 回落通道）。Windows 走 ShellExecuteW——不经 cmd.exe，URL 里
-    /// 的 & ? # 等元字符不会被 shell 吃掉；POSIX 经 RunDetached 的
-    /// sh，URL 单引号包裹 + '\'' 转义防注入。
-    static void OpenInSystemBrowser(string url) {
-        #if WINDOWS
-        Win32Shell.ShellOpenUrl(url);
-        #else
-        string q = url.Replace("'", "'\\''");
-        Process.RunDetached("(xdg-open '" + q + "' || open '" + q + "')");
-        #endif
     }
 }
 

@@ -2,7 +2,9 @@ if(NOT DEFINED ROOT)
   message(FATAL_ERROR "ROOT is required")
 endif()
 file(TO_CMAKE_PATH "${ROOT}" ROOT)
-set(factory "${ROOT}/stdlib/Gui/ControlFactory.zan")
+# 控件注册收编后，名单与构造分支住在 ControlBootstrap（安装进
+# HeavyControls）；ControlFactory 只做转发，策略改查 ControlBootstrap。
+set(factory "${ROOT}/stdlib/Gui/ControlBootstrap.zan")
 if(NOT EXISTS "${factory}")
   message(FATAL_ERROR "control factory is missing: ${factory}")
 endif()
@@ -99,6 +101,15 @@ if(last_class GREATER_EQUAL 0)
     list(APPEND kind_labels "${label}")
   endforeach()
 endif()
+# 拉入收编策略：ControlFactory 自身不得再内联任何控件构造分支，
+# 否则每个分支名都是活标识符，按需拉取会把全部控件拖进编译图。
+file(READ "${ROOT}/stdlib/Gui/ControlFactory.zan" factory_source)
+string(REGEX MATCH "return[ ]+new[ ]+" inlined "${factory_source}")
+if(inlined)
+  message(FATAL_ERROR
+    "ControlFactory inlines a return-new branch; register kinds via ControlBootstrap/HeavyControls instead")
+endif()
+
 list(LENGTH kinds kind_count)
 message(STATUS
   "control factory policy OK: ${kind_count} built-in kind entries and constructor branches have unique Kind() labels")

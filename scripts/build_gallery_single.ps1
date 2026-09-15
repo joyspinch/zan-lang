@@ -86,11 +86,13 @@ $zanArgs += @("--embed", "examples\gui_gallery\assets=assets")
 $zanArgs += @("--libpath", "build", "--link-lib", "zan_gui_gallery_gnu")
 $zanArgs += @("--link-input", (Join-Path (Get-Location) "build\embed_gen_gallery.o"))
 # Native Win32 backend needs only the system libs it imports directly (the
-# runtime's #pragma libs: dwmapi/user32/gdi32/imm32) plus the reactor deps.
+# runtime's #pragma libs: dwmapi/user32/gdi32/imm32) plus the reactor deps;
+# ole32 covers the WASAPI audio block (gui_runtime.c includes zan_audio.c).
 $zanArgs += @("--link-lib", "ws2_32", "--link-lib", "mswsock")
 $zanArgs += @("--link-lib", "psapi", "--link-lib", "advapi32")
 $zanArgs += @("--link-lib", "dwmapi", "--link-lib", "gdi32", "--link-lib", "imm32")
 $zanArgs += @("--link-lib", "user32", "--link-lib", "rpcrt4")
+$zanArgs += @("--link-lib", "ole32")
 $zanArgs += @("--icon", (Join-Path (Get-Location) "assets\zan.ico"))
 # EAP=Stop makes PowerShell promote zanc's stderr *notes* (redirected via
 # 2>&1) into terminating NativeCommandErrors, killing the script mid-link

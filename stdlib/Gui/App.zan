@@ -44,6 +44,26 @@ delegate void FrameBody();
 /// 已处理（含 WebView 不可用时转交系统浏览器的内部回落）。
 delegate bool LinkNavigateFn(App app, string url);
 
+/// HTML 装载后端（App.LoadHtmlWith 的实现，Gui.Html 经
+/// App.SetHtmlLoader 注册）。
+delegate Control HtmlLoadFn(App app, string html, HtmlHandlers handlers,
+                            string baseDir);
+
+/// 帧呈现尾段挂点（App.PresentFrame：弹层/提示绘制之后、原生浮层
+/// 结算之前）。重家族的跨帧收尾经 App.AddPresentTail 注册（Chart
+/// 的延迟提示刷新），App 编译图不背这些家族。
+delegate void AppHookFn(App app);
+
+/// <a href> 链接扫描（HTML 声明层 P5 语义：把声明 <a> 接到
+/// App.OpenLink），由 Gui.Html.Install() 经 App.SetLinkScanner 注册。
+/// 未安装 = 树里没有声明层 <a>，扫描空操作。
+delegate void LinkScanFn(Control root, App app);
+
+/// 深拷贝一棵控件树（HTML 模板行展开的原型复制），由
+/// Gui.Html.Install() 经 App.SetCloneTree 注册。未安装 = 没有
+/// 声明层模板原型可拷，返回 null（调用方跳过该行）。
+delegate Control CloneTreeFn(Control root);
+
 class App {
     Window window;
     Canvas canvas;
@@ -1135,24 +1155,72 @@ class App {
         return this.LoadHtmlWith(html, null, "");
     }
 
-    /// 完整形态：带处理器注册表与 `<link>` 的基目录。
+    /// 完整形态：带处理器注册表与 `<link>` 的基目录。实现在
+    /// Gui.Html（解析/建树/链接扫描），经 SetHtmlLoader 注册——
+    /// App 编译图不背 HTML 声明层（auto-stdlib 按需拉取）。未安装
+    /// （程序既没拼 Html.* 入口也没调 Html.Install()）时返回 null，
+    /// 调用方显式失败而不是静默空树。
     Control LoadHtmlWith(string html, HtmlHandlers handlers, string baseDir) {
-        HtmlDoc doc = Html.Parse(html, baseDir, handlers);
-        // 与 GenHtml 编译通道同一 scoping 语义：装载即组件——本次
-        // 文档的元素混入 zs-load-<序>，<style> 规则收窄到只命中本树，
-        // 多次装载的同名类互不串（System.Web.HtmlScope 共用实现）。
+        if (htmlLoader != null) {
+            return htmlLoader(this, html, handlers, baseDir);
+        }
+        return null;
+    }
+
+    /// HTML 装载后端槽：由 Gui.Html.Install() 注册，业务代码不要
+    /// 直接调。
+    static HtmlLoadFn htmlLoader;
+    static void SetHtmlLoader(HtmlLoadFn fn) { htmlLoader = fn; }
+
+    /// 链接扫描槽（声明层 <a href> 接线）：Gui.Html.Install() 注册；
+    /// ChildWindow.WireNode 的模板行克隆与 LoadHtml 后端都走这里。
+    static LinkScanFn linkScanner;
+    static void SetLinkScanner(LinkScanFn fn) { linkScanner = fn; }
+
+    /// 对一棵树做 <a href> 缺省导航接线（P5）。静态：无宿主进程
+    /// （headless 测试）也能走，app 为 null 时扫描器自行容忍。
+    /// 未安装 HTML 声明层时空操作——树里没有声明层 <a> 可扫。
+    static void AutoLinkTree(Control root, App app) {
+        if (linkScanner != null) { linkScanner(root, app); }
+    }
+
+    /// 模板行克隆槽：ChildWindow 展开声明层 `data-for` 模板行时经
+    /// 这里取原型深拷贝（Gui.Html.Install() 注册 Html.Clone）。
+    /// 未安装 HTML 声明层时返回 null——那时也没有 template 原型
+    /// 可展开，调用方按空行跳过。静态：无宿主也能走空槽语义。
+    static Control CloneTree(Control root) {
+        if (cloneTree != null) { return cloneTree(root); }
+        return null;
+    }
+
+    /// 克隆后端槽：由 Gui.Html.Install() 注册，业务代码不要直接调。
+    static CloneTreeFn cloneTree;
+    static void SetCloneTree(CloneTreeFn fn) { cloneTree = fn; }
+
+    /// 帧呈现尾段挂点表（AppHookFn）：重家族在自身入口处自挂
+    /// （如 ChartView 首帧渲染时挂 ChartView.FlushTooltips）。
+    static List<AppHookFn> presentTails;
+
+    /// 注册帧呈现尾段回调（重复注册以一次为准由调用方自行保证）。
+    static void AddPresentTail(AppHookFn fn) {
+        if (presentTails == null) { presentTails = new List<AppHookFn>(); }
+        presentTails.Add(fn);
+    }
+
+    /// 装载作用域类名（zs-load-<序>）由装载后端领取：每次装载唯一，
+    /// 多次装载的同名类互不串（System.Web.HtmlScope 共用实现）。
+    string NextLoadScope() {
         string zs = "zs-load-" + Convert.ToString(htmlLoadSeq);
         htmlLoadSeq = htmlLoadSeq + 1;
-        // 无样式文档也要走一遍 UseAppCss：appCss 链（含垫底的 UA
-        // 样式表）只有在 ApplyAppCss 跑过才挂上——过去无 <style> 的
-        // 文档整条 UA 语义（display 分层、body 边距、a 链接主色）
-        // 都缺席。
-        string scoped = doc.css == "" ? "" : HtmlScope.Styles(doc.css, zs);
-        string merged = appCss == "" ? scoped : appCss + "\n" + scoped;
+        return zs;
+    }
+
+    /// 装载后端的落树收尾：作用域 CSS 并进 appCss 链、整树补作用
+    ///域类（原 LoadHtmlWith 内联逻辑，搬进 Html.LoadForApp）。
+    void ApplyScopedTree(Control root, string scopedCss, string zs) {
+        string merged = appCss == "" ? scopedCss : appCss + "\n" + scopedCss;
         this.UseAppCss(merged);
-        this.MarkScope(doc.root, zs);
-        Html.AutoLinkTree(doc.root, this);
-        return doc.root;
+        this.MarkScope(root, zs);
     }
 
     /// <summary><a href> 的缺省路由（P5 链接语义）。newWindow
@@ -1166,7 +1234,21 @@ class App {
             linkNavigator(this, url);
             return;
         }
-        Html.OpenInSystemBrowser(url);
+        App.OpenInSystemBrowser(url);
+    }
+
+    /// 系统关联程序打开 url（target="_blank" 与内嵌导航不可用时的
+    /// 回落通道）。Windows 走 ShellExecuteW——不经 cmd.exe，URL 里
+    /// 的 & ? # 等元字符不会被 shell 吃掉；POSIX 经 RunDetached 的
+    /// sh，URL 单引号包裹 + '\'' 转义防注入。原在 Gui.Html（链接
+    /// 语义的底层通道属 App 核心，Html 未安装也要能用）。
+    static void OpenInSystemBrowser(string url) {
+        #if WINDOWS
+        Win32Shell.ShellOpenUrl(url);
+        #else
+        string q = url.Replace("'", "'\\''");
+        Process.RunDetached("(xdg-open '" + q + "' || open '" + q + "')");
+        #endif
     }
 
     /// WebView 家族（宿主就地图/链接窗口）向 App 注册 <a href> 内嵌
@@ -4566,7 +4648,7 @@ class App {
         // ——点不动、拖不动、关不掉。
         nint evh = Window.EventHwnd();
         if (evh != 0 && evh != window.GetHandle()) {
-            ChildWindows.Route(evh);
+            ChildWindows.RouteEvent(evh);
             return true;
         }
 
@@ -5121,7 +5203,13 @@ class App {
         // 会被同页后续内容甚至弹层盖住。宿主若已自行 Flush 过，
         // 这里就是空操作（队列已清空）。
         Widget.Tooltip.Flush(this);
-        Component.Chart.ChartView.FlushTooltips(this);
+        // 重家族的呈现尾段（Chart 提示刷新等）经 AddPresentTail
+        // 注册，App 编译图不背它们。
+        if (presentTails != null) {
+            for (int i = 0; i < presentTails.Count; i = i + 1) {
+                presentTails[i](this);
+            }
+        }
         // 弹层落定之后再结算原生浮层：此刻本帧所有拦截区都已注册，
         // 能算出网页视图真正该露出的区域（菜单/对话框压住的部分被
         // 裁掉），否则原生层会盖住它上面的一切。
