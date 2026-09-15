@@ -1,21 +1,27 @@
 (function(){
 'use strict';
-/* admin SPA：Vue 3 + Naive UI + 自有 zan 系组件（全部浏览器 bundle，无构建步骤）。
-   组合：Naive UI 出布局/表单/按钮等通用件；zan-grid 出文章列表（企业级表格）；
-   zan-charts 出仪表盘图表；zan-layer 出确认框/消息。
-   结构：api() 封装 fetch（错误码→异常）→ 登录/仪表盘/文章三屏 → hash 路由。
-   服务端是唯一事实：菜单来自 /api/admin/menu（权限过滤后），写操作失败
-   弹 layer.msg 不改本地状态；保存冲突 409 明确提示刷新。 */
+/* admin SPA 外壳：Naive UI 出深色侧栏 + 分组菜单 + 头部，内容区是 iframe
+   承载服务端渲染的管理屏（views/Admin/*）。选择 iframe 而非逐屏重写：
+   服务端页面已带完整的表格/表单/标签页交互（admin.css + admin.js），
+   外壳只做导航；每个菜单项都真实可达，页内一切功能开箱即用。
+   hash 路由：#/ = 仪表盘（壳内自绘 + zan-charts），#r=<path> = iframe 打开
+   服务端屏；未登录时整壳换成登录卡片。菜单来自 /api/admin/menu（服务端
+   权限过滤后的唯一事实），分组标题用 MenuBuilder 注册的中文标签。 */
 
-const { createApp, ref, reactive, computed, onMounted, h, nextTick } = Vue;
-const { NTag, NButton, NSpace } = naive;
+const { createApp, ref, computed, onMounted } = Vue;
 const { createDiscreteApi } = naive;
 
 /* 离散 API：不依赖 app 上下文，任意 setup 里可直接调用。
    必须延迟到 body 就绪后创建——同步执行时 body 可能尚未解析完成，
    createDiscreteApi 内部挂载 provider 会因 body 为 null 抛错，导致整个脚本失效。 */
-let message, dialog;
-const layer = window.ZanLayer && window.ZanLayer.layer ? window.ZanLayer.layer : null;
+let message;
+
+/* 菜单分组标签：与服务端 MenuBuilder.Section 注册保持同序（壳内兜底，
+   服务端注册后 group 字段即中文，此处映射仅给未注册段兜底）。 */
+const GROUP_LABELS = {
+  "": "概览", content: "内容管理", monitor: "运行监控",
+  system: "系统管理", dev: "开发工具"
+};
 
 /* ---- fetch 封装：统一 {code,msg,data} 信封 ---- */
 async function api(path, opts = {}) {
@@ -67,7 +73,7 @@ const LoginView = {
     return { form, busy, submit };
   },
   template: `
-  <div style="height:100%;display:flex;align-items:center;justify-content:center;background:#f5f7fa">
+  <div style="height:100%;display:flex;align-items:center;justify-content:center;background:#1d2430">
     <n-card title="管理后台" style="width:360px" :bordered="true" size="large">
       <n-form @keyup.enter="submit">
         <n-form-item label="账号">
@@ -83,7 +89,7 @@ const LoginView = {
   </div>`
 };
 
-/* ---- 仪表盘 ---- */
+/* ---- 仪表盘（壳内自绘的唯一一屏：摘要卡 + zan-charts 请求/错误时序） ---- */
 const DashboardView = {
   setup() {
     const sum = ref(null);
@@ -104,7 +110,40 @@ const DashboardView = {
       { label: "待审", value: sum.value.pending }
     ] : []);
     const uptime = computed(() => sum.value ? ("运行时长：" + sum.value.uptime) : "");
-    return { sum, cards, blogCards, uptime };
+    return { cards, blogCards, uptime };
+  },
+  mounted() {
+    this.$nextTick(() => this.drawChart());
+  },
+  methods: {
+    async drawChart() {
+      if (!window.ZanCharts || !window.ZanCharts.createChart) { return; }
+      const host = document.getElementById("chart-traffic");
+      if (!host) { return; }
+      let data = [];
+      try {
+        const s = await api("/api/admin/monitor/series?sec=60");
+        data = (s.points || []).map(p => ({
+          t: (p.t <= 0 ? (p.t + s.count) + "s" : "now"),
+          requests: p.req, errors: p.err
+        }));
+      } catch (e) { /* 无端点时退化为空图 */ }
+      if (data.length === 0) {
+        data = [{ t: "当前", requests: 0, errors: 0 }];
+      }
+      window.ZanCharts.createChart(host, {
+        type: "combo",
+        title: "",
+        categoryField: "t",
+        series: [
+          { field: "requests", label: "请求", type: "bar" },
+          { field: "errors", label: "错误", type: "line", yAxisIndex: 1 }
+        ],
+        data,
+        yAxes: [{ name: "请求" }, { name: "错误" }],
+        tooltip: { shared: true }
+      });
+    }
   },
   template: `
   <div>
@@ -122,253 +161,25 @@ const DashboardView = {
         </n-card>
       </n-gi>
     </n-grid>
-    <n-card size="small" title="内容概览" style="margin-top:14px">
+    <n-card size="small" title="实时流量（近 1 分钟）" style="margin-top:14px">
       <template #header-extra><n-text depth="3">{{ uptime }}</n-text></template>
       <div id="chart-traffic" style="width:100%;height:280px"></div>
     </n-card>
-  </div>`,
-  mounted() {
-    // 仪表盘图表：请求/错误数时序来自 /api/admin/metrics/history（若可用），
-    // 摘要数字来自 summary。图表容器在首次 summary 渲染后才有，故 nextTick 接入。
-    this.$nextTick(() => this.drawChart());
-  },
-  methods: {
-    async drawChart() {
-      if (!window.ZanCharts || !window.ZanCharts.createChart) { return; }
-      const host = document.getElementById("chart-traffic");
-      if (!host) { return; }
-      let data = [];
-      try {
-        const hist = await api("/api/admin/metrics/history?limit=30");
-        data = (hist.points || hist.rows || hist.items || []).map(p => ({
-          t: p.time || p.ts || p.createdAt, requests: p.requests, errors: p.errors
-        }));
-      } catch (e) { /* 无历史端点时退化为空图 */ }
-      if (data.length === 0) {
-        // 没有历史端点就用 summary 现值画单点，保证容器有内容
-        data = [{ t: "当前", requests: 0, errors: 0 }];
-      }
-      window.ZanCharts.createChart(host, {
-        type: "combo",
-        title: "",
-        categoryField: "t",
-        series: [
-          { field: "requests", label: "请求", type: "bar" },
-          { field: "errors", label: "错误", type: "line", yAxisIndex: 1 }
-        ],
-        data,
-        yAxes: [{ name: "请求" }, { name: "错误" }],
-        tooltip: { shared: true }
-      });
-    }
-  }
-};
-
-/* ---- 文章管理（zan-grid） ---- */
-const PostsView = {
-  setup() {
-    const rows = ref([]);
-    const total = ref(0);
-    const page = ref(1);
-    const limit = ref(20);
-    const kw = ref("");
-    const loading = ref(false);
-    const editing = ref(null);
-    const saving = ref(false);
-    const gridRef = ref(null);
-
-    async function load(p) {
-      loading.value = true;
-      try {
-        const data = await api("/api/admin/posts/list?page=" + p + "&limit=" + limit.value
-          + "&kw=" + encodeURIComponent(kw.value));
-        rows.value = data.items;
-        total.value = data.total;
-        page.value = data.page;
-      } catch (e) {
-        message.error(e.message);
-      } finally { loading.value = false; }
-    }
-
-    async function open(id) {
-      try {
-        const p = await api("/api/admin/posts/get?id=" + id);
-        editing.value = {
-          id: p.id, title: p.title, summary: p.summary, body: p.body,
-          tags: p.tags, cover: p.cover, author: p.author,
-          categoryId: p.categoryId, published: String(p.published),
-          version: p.version, categories: p.categories
-        };
-      } catch (e) { message.error(e.message); }
-    }
-
-    async function create() {
-      try {
-        let cats = [];
-        if (rows.value.length > 0) {
-          const p = await api("/api/admin/posts/get?id=" + rows.value[0].id);
-          cats = p.categories;
-        }
-        editing.value = {
-          id: 0, title: "", summary: "", body: "", tags: "", cover: "",
-          author: "", categoryId: 0, published: "1", version: -1, categories: cats
-        };
-      } catch (e) { message.error(e.message); }
-    }
-
-    async function save() {
-      saving.value = true;
-      try {
-        const isNew = editing.value.id === 0;
-        await api(isNew ? "/api/admin/posts/create" : "/api/admin/posts/update", {
-          method: "POST",
-          body: formBody(Object.assign({}, editing.value))
-        });
-        message.success("已保存");
-        editing.value = null;
-        await load(page.value);
-      } catch (e) {
-        if (e.status === 409) {
-          // 乐观锁冲突：明确引导刷新，不覆盖他人改动
-          dialog.warning({
-            title: "保存冲突",
-            content: e.message,
-            positiveText: "刷新重试",
-            negativeText: "留在本页",
-            onPositiveClick: () => { editing.value = null; load(page.value); }
-          });
-        } else {
-          message.error(e.message);
-        }
-      } finally { saving.value = false; }
-    }
-
-    async function togglePublish(row) {
-      try {
-        await api("/api/admin/posts/publish", {
-          method: "POST",
-          body: formBody({ id: row.id, published: row.published === 1 ? 0 : 1 })
-        });
-        message.success(row.published === 1 ? "已下架" : "已发布");
-        await load(page.value);
-      } catch (e) { message.error(e.message); }
-    }
-
-    async function remove(row) {
-      const d = dialog.warning({
-        title: "删除确认",
-        content: "删除「" + row.title + "」？删除后不可恢复。",
-        positiveText: "删除",
-        negativeText: "取消",
-        onPositiveClick: async () => {
-          try {
-            await api("/api/admin/posts/delete", { method: "POST", body: formBody({ id: row.id }) });
-            message.success("已删除");
-            await load(page.value);
-          } catch (e) { message.error(e.message); }
-        }
-      });
-    }
-
-    onMounted(() => load(1));
-
-    /* 列表用 n-data-table：zan-grid 1.2.x 在 Vue 3.4 下 setup 栈溢出（已挂账 TASKS.md），
-       等库修复后切回 <Grid> 获得类 Excel 交互。这里保持服务端分页 + 行操作。 */
-    const nColumns = [
-      { title: "标题", key: "title", minWidth: 260, ellipsis: { tooltip: true } },
-      { title: "分类", key: "category", width: 100 },
-      { title: "作者", key: "author", width: 100 },
-      {
-        title: "状态", key: "published", width: 90,
-        render: row => h(NTag, { size: "small", type: row.published === 1 ? "success" : "default" },
-          { default: () => row.published === 1 ? "已发布" : "草稿" })
-      },
-      {
-        title: "创建时间", key: "createdAt", width: 170,
-        render: row => { const d = new Date(row.createdAt * 1000); return d.toLocaleString("zh-CN", { hour12: false }); }
-      },
-      {
-        title: "操作", key: "op", width: 190,
-        render: row => h(NSpace, { size: "small" }, {
-          default: () => [
-            h(NButton, { size: "tiny", type: "primary", quaternary: true, onClick: () => open(row.id) }, { default: () => "编辑" }),
-            h(NButton, { size: "tiny", quaternary: true, onClick: () => togglePublish(row) },
-              { default: () => row.published === 1 ? "下架" : "发布" }),
-            h(NButton, { size: "tiny", type: "error", quaternary: true, onClick: () => remove(row) }, { default: () => "删除" })
-          ]
-        })
-      }
-    ];
-
-    return { rows, total, page, limit, kw, loading, editing, saving,
-             load, open, create, save, togglePublish, remove, nColumns };
-  },
-  template: `
-  <div>
-    <n-card size="small">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-        <n-input v-model:value="kw" placeholder="按标题搜索" style="width:240px" clearable
-                 @keyup.enter="load(1)" @clear="load(1)"></n-input>
-        <n-button type="primary" @click="create">写文章</n-button>
-      </div>
-      <n-data-table :columns="nColumns" :data="rows" :loading="loading" size="small" striped></n-data-table>
-      <div style="margin-top:10px;text-align:right">
-        <n-pagination :page="page" :page-size="limit" :item-count="total"
-                      :page-sizes="[10,20,50]" show-size-picker
-                      @update:page="p => load(p)"
-                      @update:page-size="s => { limit = s; load(1); }"></n-pagination>
-      </div>
-    </n-card>
-
-    <n-modal :show="!!editing" style="width:640px" preset="card"
-             :title="editing && editing.id === 0 ? '写文章' : '编辑文章'"
-             :mask-closable="false" @update:show="v => { if (!v) editing = null; }">
-      <n-form v-if="editing" label-width="72">
-        <n-form-item label="标题" required>
-          <n-input v-model:value="editing.title" maxlength="200"></n-input>
-        </n-form-item>
-        <n-form-item label="分类">
-          <n-select v-model:value="editing.categoryId" :options="(editing.categories || []).map(c => ({ label: c.name, value: c.id }))"></n-select>
-        </n-form-item>
-        <n-grid :cols="2" :x-gap="12">
-          <n-gi><n-form-item label="作者"><n-input v-model:value="editing.author" maxlength="64"></n-input></n-form-item></n-gi>
-          <n-gi><n-form-item label="状态">
-            <n-radio-group v-model:value="editing.published">
-              <n-radio value="0">草稿</n-radio>
-              <n-radio value="1">发布</n-radio>
-            </n-radio-group>
-          </n-form-item></n-gi>
-        </n-grid>
-        <n-grid :cols="2" :x-gap="12">
-          <n-gi><n-form-item label="标签"><n-input v-model:value="editing.tags" maxlength="255" placeholder="逗号分隔"></n-input></n-form-item></n-gi>
-          <n-gi><n-form-item label="封面"><n-input v-model:value="editing.cover" maxlength="255"></n-input></n-form-item></n-gi>
-        </n-grid>
-        <n-form-item label="摘要">
-          <n-input v-model:value="editing.summary" type="textarea" :rows="2"></n-input>
-        </n-form-item>
-        <n-form-item label="正文" required>
-          <n-input v-model:value="editing.body" type="textarea" :rows="10"></n-input>
-        </n-form-item>
-      </n-form>
-      <template #footer>
-        <div style="display:flex;justify-content:flex-end;gap:10px">
-          <n-button @click="editing = null">取消</n-button>
-          <n-button type="primary" :loading="saving" @click="save">保存</n-button>
-        </div>
-      </template>
-    </n-modal>
   </div>`
 };
 
-/* ---- 根组件：hash 路由 + 布局 ---- */
+/* ---- 根组件：深色侧栏 + 分组菜单 + iframe 内容区 ---- */
 const App = {
   setup() {
     const route = ref(location.hash || "#/");
     const me = ref(null);
     const menu = ref([]);
+    const iframeSrc = ref("");
+    const contentTitle = ref("仪表盘");
+
     window.addEventListener("hashchange", () => {
       route.value = location.hash || "#/";
-      loadMenu();
+      sync();
     });
     // 登录页与外壳是两个组件，登录成功后由 LoginView 广播重进
     window.addEventListener("zan:login", () => { boot(); });
@@ -377,6 +188,7 @@ const App = {
       try {
         me.value = await api("/api/auth/me");
         await loadMenu();
+        sync();
       } catch (e) {
         me.value = null;   // 未登录 → 登录页
       }
@@ -392,53 +204,95 @@ const App = {
       try { await api("/admin/logout"); } catch (e) { /* 302 非 JSON，忽略 */ }
       me.value = null;
       menu.value = [];
+      iframeSrc.value = "";
       location.hash = "#/";
     }
 
-    // 菜单路径 → hash 路由："#r=/admin/content/posts"
-    function go(path) { location.hash = "#r=" + path; }
-    function active(path) {
-      return ("#r=" + path) === route.value || route.value.indexOf("#r=" + path) === 0;
-    }
-
-    const page = computed(() => {
-      if (!me.value) { return "login"; }
-      if (route.value.indexOf("#r=/admin/content/posts") === 0) { return "posts"; }
-      return "dashboard";
+    /* hash → { page, path }：#/ 是壳内仪表盘，#r=<path> 是 iframe 屏 */
+    const current = computed(() => {
+      const h = route.value;
+      if (h.indexOf("#r=") === 0) { return { page: "frame", path: h.slice(3) }; }
+      return { page: "dashboard", path: "" };
     });
 
-    const menuOptions = computed(() => [
-      { label: "仪表盘", key: "#/" },
-      ...menu.value.map(m => ({ label: m.title, key: "#r=" + m.path }))
-    ]);
-    const activeKey = computed(() => page.value === "posts" ? "#r=/admin/content/posts" : "#/");
+    /* 把当前 hash 同步到 iframe/标题/高亮。菜单项一个不落：菜单里的每条
+       path 都直接作为 iframe 的 src——服务端屏自己带全套交互。 */
+    function sync() {
+      const c = current.value;
+      if (c.page !== "frame") {
+        iframeSrc.value = "";
+        contentTitle.value = "仪表盘";
+        return;
+      }
+      const hit = menu.value.find(m => m.path === c.path);
+      contentTitle.value = hit ? hit.title : c.path;
+      // 同址不去重赋值：服务端屏无外部状态，重赋即刷新面板
+      iframeSrc.value = c.path;
+    }
+
+    /* 菜单分组：服务端 group 字段（URL 首段）→ 中文标签；段内保持服务端
+       给出的顺序。无组的项（仪表盘、个人资料）排在最前。 */
+    const menuOptions = computed(() => {
+      const groups = [];
+      const byKey = {};
+      for (let i = 0; i < menu.value.length; i = i + 1) {
+        const m = menu.value[i];
+        const g = m.group || "";
+        if (!byKey.hasOwnProperty("g:" + g)) {
+          byKey["g:" + g] = {
+            type: "group", label: GROUP_LABELS[g] || g || "概览",
+            key: "g:" + g, children: []
+          };
+          groups.push(byKey["g:" + g]);
+        }
+        byKey["g:" + g].children.push({
+          label: m.title, key: "r:" + m.path
+        });
+      }
+      return groups;
+    });
+
+    const activeKey = computed(() => {
+      const c = current.value;
+      return c.page === "frame" ? "r:" + c.path : "";
+    });
+
     function onMenuSelect(key) {
-      if (key === "#/") { location.hash = "#/"; } else { location.hash = key; }
+      if (key.indexOf("r:") === 0) { location.hash = "#r=" + key.slice(2); }
     }
 
     onMounted(boot);
-    return { me, menu, page, logout, go, active, menuOptions, activeKey, onMenuSelect };
+    return { me, page: computed(() => me.value ? current.value.page : "login"),
+             iframeSrc, contentTitle, menuOptions, activeKey, onMenuSelect, logout };
   },
   template: `
   <n-config-provider>
     <login-view v-if="page === 'login'"></login-view>
     <n-layout v-else has-sider style="height:100%">
-      <n-layout-sider bordered content-style="display:flex;flex-direction:column;height:100%" :width="220">
-        <div style="height:56px;display:flex;align-items:center;justify-content:center;font-weight:700;letter-spacing:.06em">管理后台</div>
+      <n-layout-sider bordered :width="224" content-style="display:flex;flex-direction:column;height:100%"
+                      style="background:#1d2430">
+        <div style="height:56px;display:flex;align-items:center;justify-content:center;gap:8px;color:#fff;font-weight:700;letter-spacing:.06em">
+          <span style="width:22px;height:22px;border-radius:5px;background:#18a058;display:inline-flex;align-items:center;justify-content:center;font-size:12px">Z</span>
+          管理后台
+        </div>
         <n-menu :options="menuOptions" :value="activeKey" @update:value="onMenuSelect"
-                style="flex:1"></n-menu>
-        <div style="padding:12px 16px;display:flex;align-items:center;justify-content:space-between;border-top:1px solid #efeff5">
+                style="flex:1" dark></n-menu>
+        <div style="padding:12px 16px;display:flex;align-items:center;justify-content:space-between;border-top:1px solid #2a3342;color:#c8cedb">
           <span>{{ me ? me.uid : "" }}</span>
-          <n-button quaternary size="small" @click="logout">退出</n-button>
+          <n-button quaternary size="small" style="color:#c8cedb" @click="logout">退出</n-button>
         </div>
       </n-layout-sider>
       <n-layout content-style="display:flex;flex-direction:column;height:100%">
-        <n-layout-header bordered style="height:56px;display:flex;align-items:center;padding:0 24px">
-          <h1 style="font-size:16px;font-weight:600;margin:0">{{ page === 'posts' ? "文章管理" : "仪表盘" }}</h1>
+        <n-layout-header bordered style="height:52px;display:flex;align-items:center;justify-content:space-between;padding:0 20px">
+          <n-breadcrumb>
+            <n-breadcrumb-item>{{ contentTitle }}</n-breadcrumb-item>
+          </n-breadcrumb>
         </n-layout-header>
-        <n-layout-content content-style="padding:20px 24px;flex:1;overflow:auto">
-          <dashboard-view v-if="page === 'dashboard'"></dashboard-view>
-          <posts-view v-else-if="page === 'posts'"></posts-view>
+        <n-layout-content content-style="height:calc(100% - 52px);position:relative">
+          <dashboard-view v-if="page === 'dashboard'"
+                          style="padding:16px 20px;display:block;height:100%;overflow:auto"></dashboard-view>
+          <iframe v-else :src="iframeSrc" frameborder="0"
+                  style="display:block;width:100%;height:100%"></iframe>
         </n-layout-content>
       </n-layout>
     </n-layout>
@@ -448,26 +302,12 @@ const App = {
 /* ---- bootstrap ---- */
 function mountAdmin() {
   // body 就绪后再建离散 API（内部要往 body 挂 provider 容器）
-  const discrete = createDiscreteApi(["message", "dialog"]);
+  const discrete = createDiscreteApi(["message"]);
   message = discrete.message;
-  dialog = discrete.dialog;
   const app = createApp(App);
   app.use(naive);
-  // 业务子组件：根组件模板里 <login-view>/<dashboard-view>/<posts-view>
   app.component("login-view", LoginView);
   app.component("dashboard-view", DashboardView);
-  app.component("posts-view", PostsView);
-  // zan-grid UMD 全局是 ZanGrid（不提供插件安装，直接注册组件）
-  if (window.ZanGrid && window.ZanGrid.Grid) {
-    app.component("Grid", window.ZanGrid.Grid);
-  } else if (window.ZanGrid) {
-    const g = window.ZanGrid.default || window.ZanGrid.Grid || window.ZanGrid;
-    app.component("Grid", g);
-  }
-  // zan-layer：全局安装注册 <zan-layer> 容器与 $layer
-  if (window.ZanLayer && window.ZanLayer.default) {
-    app.use(window.ZanLayer.default);
-  }
   app.mount("#app");
 }
 
