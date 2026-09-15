@@ -2213,30 +2213,6 @@ static int zan_copy_file(const char *src, const char *dst) {
     return rc;
 }
 
-/* A bundle entry written `@shared/<group>/<file>` resolves inside the
- * stdlib's `_shared/` tree, where modules share one copy of a native
- * dependency (A47-1). Validate the relative part: no drive letters,
- * absolute paths, backslashes, ".." / "." segments or empty segments, so a
- * manifest can only reach files that actually live under `_shared/`. */
-static bool zan_is_safe_shared_rel(const char *rel) {
-    if (!rel || !rel[0] || rel[0] == '/') return false;
-    for (const char *s = rel; *s; s++) {
-        if (*s == '\\' || *s == ':') return false;
-    }
-    const char *s = rel;
-    while (*s) {
-        const char *e = strchr(s, '/');
-        size_t len = e ? (size_t)(e - s) : strlen(s);
-        if (len == 0) return false;
-        if (len == 1 && s[0] == '.') return false;
-        if (len == 2 && s[0] == '.' && s[1] == '.') return false;
-        if (!e) break;
-        s = e + 1;
-        if (!*s) return false; /* trailing slash */
-    }
-    return true;
-}
-
 /* A driver-bundle manifest lists runtime libraries to copy next to the
  * published executable. Each entry must be a bare filename inside the driver
  * directory: reject absolute paths, drive letters, path separators and ".."
@@ -6845,15 +6821,25 @@ int main(int argc, char **argv) {
                                 continue;
                         }
                         if (l > 0) {
-                            if (strncmp(line, "@shared/", 8) == 0) {
-                                if (zan_is_safe_shared_rel(line + 8)) {
-                                    snprintf(cands[ncand++], sizeof(cands[0]),
-                                             "%s", line);
-                                } else {
+                            if (strncmp(line, "@driver/", 8) == 0) {
+                                /* A dependency on another driver: "publish
+                                 * that driver's runtime files too, resolved
+                                 * through the registry to its owning module's
+                                 * directory" (e.g. libpq needs the ssl and
+                                 * crypto drivers owned by Cryptography).
+                                 * Ownership-directed, never a directory scan:
+                                 * a lib basename has exactly one registered
+                                 * owner. */
+                                const char *dep = line + 8;
+                                size_t dl = strlen(dep);
+                                if (dl == 0 || dl >= 64 ||
+                                    !zan_is_safe_bundle_name(dep)) {
                                     fprintf(stderr, "warning: ignoring unsafe "
-                                        "shared entry '%s' in %s (must be "
-                                        "@shared/<group>/<file> with no '..' "
-                                        "or absolute path)\n", line, manifest);
+                                        "@driver entry '%s' in %s (must be a "
+                                        "bare driver name)\n", line, manifest);
+                                } else if (ncand < 64) {
+                                    snprintf(cands[ncand++], sizeof(cands[0]),
+                                             "@driver/%s", dep);
                                 }
                             } else if (zan_is_safe_bundle_name(line)) {
                                 snprintf(cands[ncand++], sizeof(cands[0]), "%s", line);
@@ -6875,6 +6861,7 @@ int main(int argc, char **argv) {
                 }
 
                 int copied = 0;
+                int dself = 0; /* files copied from this driver's own dir */
                 for (int c = 0; c < ncand; c++) {
                     char src[1300], dst[1300];
                     if (used_driver_embedded[d] &&
@@ -6886,44 +6873,61 @@ int main(int argc, char **argv) {
                         continue;
                     }
                     bool got = false;
-                    if (strncmp(cands[c], "@shared/", 8) == 0) {
-                        /* A shared dependency: one copy under
-                         * <stdlib>/_shared/<group>/, still copied to the exe
-                         * under its own basename. Layouts, in order: the
-                         * literal path, then the per-target driver dir
-                         * _shared/<group>/drivers/<target>/<file> (how the
-                         * openssl-3 group actually stores its binaries). */
-                        const char *rel = cands[c] + 8;
-                        const char *base = strrchr(rel, '/');
-                        base = base ? base + 1 : rel;
-                        snprintf(dst, sizeof(dst), "%s/%s", outdir, base);
-                        if (resolved_stdlib_root[0]) {
-                            snprintf(src, sizeof(src), "%s/_shared/%s",
-                                     resolved_stdlib_root, rel);
-                            if (!zan_file_exists(src) && base != rel) {
-                                char group[128];
-                                size_t gl = (size_t)(base - rel - 1);
-                                if (gl < sizeof(group)) {
-                                    memcpy(group, rel, gl);
-                                    group[gl] = '\0';
-                                    snprintf(src, sizeof(src),
-                                             "%s/_shared/%s/drivers/%s/%s",
-                                             resolved_stdlib_root, group,
-                                             dsub, base);
+                    if (strncmp(cands[c], "@driver/", 8) == 0) {
+                        /* Another driver's runtime files: resolve the driver
+                         * through the registry to its owning module's
+                         * directory and copy the files its own bundle lists.
+                         * Copied under their basenames like any other entry,
+                         * so several consumers share one file beside the exe. */
+                        const char *dep = cands[c] + 8;
+                        int depidx = zan_driver_find(&driver_reg, dep,
+                                                     (int)strlen(dep));
+                        if (depidx >= 0 && resolved_stdlib_root[0]) {
+                            char depdir[1100];
+                            snprintf(depdir, sizeof(depdir), "%s/%s/drivers/%s",
+                                     resolved_stdlib_root,
+                                     driver_reg.entries[depidx].module, dsub);
+                            char depman[1200];
+                            snprintf(depman, sizeof(depman), "%s/%s.bundle",
+                                     depdir, dep);
+                            FILE *df = fopen(depman, "rb");
+                            if (df) {
+                                char dline[128];
+                                while (fgets(dline, sizeof(dline), df)) {
+                                    size_t dl = strlen(dline);
+                                    while (dl > 0 && (dline[dl-1] == '\n' ||
+                                                      dline[dl-1] == '\r' ||
+                                                      dline[dl-1] == ' ' ||
+                                                      dline[dl-1] == '\t'))
+                                        dline[--dl] = '\0';
+                                    if (dl == 0 || dline[0] == '#') continue;
+                                    if (!zan_is_safe_bundle_name(dline))
+                                        continue;
+                                    snprintf(src, sizeof(src), "%s/%s",
+                                             depdir, dline);
+                                    snprintf(dst, sizeof(dst), "%s/%s",
+                                             outdir, dline);
+                                    if (zan_file_exists(dst) ||
+                                        zan_copy_file(src, dst) == 0) {
+                                        if (!quiet)
+                                            printf("  bundled driver '%s' ? %s"
+                                                   " (via @driver/%s)\n",
+                                                   dep, dline, dep);
+                                        got = true;
+                                    }
                                 }
+                                fclose(df);
                             }
-                            got = zan_copy_file(src, dst) == 0;
                         }
                         if (!got)
-                            fprintf(stderr, "warning: shared bundle entry "
-                                "'%s' in %s not found under %s/_shared\n",
-                                cands[c], manifest,
-                                resolved_stdlib_root[0] ? resolved_stdlib_root
-                                                        : "<stdlib>");
+                            fprintf(stderr, "warning: @driver/%s listed in %s "
+                                "has no bundle under its owning module's "
+                                "drivers/%s\n", dep, manifest, dsub);
                     } else {
                         snprintf(src, sizeof(src), "%s/%s", driver_dir, cands[c]);
                         snprintf(dst, sizeof(dst), "%s/%s", outdir, cands[c]);
                         got = zan_copy_file(src, dst) == 0;
+                        if (got) dself++;
                     }
                     if (got) {
                         if (!quiet)
@@ -6940,7 +6944,7 @@ int main(int argc, char **argv) {
                         printf("  note: driver '%s' not bundled (%s is empty); the "
                                "program will use a system-installed %s\n",
                                drv, driver_dir, drv);
-                } else if (copied == 0) {
+                } else if (copied == 0 && dself == 0 && !used_driver_runtime[d]) {
                     fprintf(stderr,
                         "warning: driver '%s' was not bundled (no runtime library "
                         "found in %s). The published program will require '%s' to "
