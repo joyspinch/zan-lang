@@ -163,6 +163,20 @@ STANDARDS.md §6.7）。
 - 手工编 GUI 设计稿程序：设计稿 html 首参 + 全部 src + 
   `--subsystem windows`；跑起来截图对照（锚定 PID），交互用
   UiDriver 可重复驱动。
+- **真窗冒烟要带主窗骨架，裸页截图会"缺导航栏"**：页面文档只含
+  页内骨架，图标导航栏在主窗文档里——把单页 `Build(null)` 直接装
+  进裸 Form 截图，看到的永远是"少了左侧导航"（不是回归）。要看
+  真实形态就复刻 `Root` 的装配（UseAppCss 拼表 + 主窗文档 Build +
+  各页宿主挂页 + Pick），跳过登录泵。
+- **截屏三坑（当天连踩五次才抓到图）**：① 带中文注释的 `.ps1`
+  以无 BOM UTF-8 落盘，PowerShell 5.1 按 ANSI 误解析，多字节序列
+  会吞掉下一行语句——参数/环境变量"神秘变空"多半是这个，自动化
+  ps1 只写 ASCII；② bash→powershell 传参/传 env 都不可靠、`$!`
+  拿到的是 bash 包装进程不是 exe 的 PID——按进程名 `Get-Process`
+  找 PID 再 EnumWindows，窗口被遮挡用 `PrintWindow`（flags=2
+  PW_RENDERFULLCONTENT）抓整窗；③ 150% DPI 机器上 CSS 长度按逻辑
+  像素 ×1.5 渲染而冒烟窗按物理尺寸打开，截图右缘裁切是环境现象，
+  几何对不对以 headless 断言为准，别拿这种截图判布局。
 
 ## 游戏接入边界
 

@@ -11,15 +11,17 @@ class WxPageChat : Control {
     Input search;
     ListView<WxSession> list;
     ChatView chat;
-    Label headName;
-    Label headDesc;
+    /// 标题行的两个文字是骨架文档里的元素（WeChatChat.html 的
+    /// #HeadName/#HeadDesc）：切会话走 SetProp("text") 元素通道。
+    Control headName;
+    Control headDesc;
     TextArea box;
     List<WxSession> data;
     int current;
-    /// 输入框上方的引用条（点气泡菜单「引用」后出现）。
-    /// Wx.Row 返回 Flex（横排 flex 行），引用条声明为它的真类型。
-    Flex quoteBar;
-    Label quoteLbl;
+    /// 输入框上方的引用条（点气泡菜单「引用」后出现）——骨架文档
+    /// 里的 #QuoteBar 元素，显隐走 visible，文字走 SetProp。
+    Control quoteBar;
+    Control quoteText;
     /// 气泡右键菜单的锚点与载荷（跨帧持有，覆盖阶段画）。
     bool ctxOpen;
     int ctxMsg;
@@ -74,106 +76,84 @@ class WxPageChat : Control {
         this.Class = "wxmain";
         this.data = WxData.Sessions();
 
-        // ---- 左栏：搜索框 + 会话列表 ----
-        Panel col = Wx.Col("wxcol");
-        col.dock = 3;
-        Panel pad = Wx.Col("wxpad");
-        pad.dock = 1;
-        search = new Input("搜索");
-        search.dock = 5;
-        pad.Add(search);
-        col.Add(pad);
+        // ---- HTML 骨架（WeChatChat.html）：左栏搜索 + 会话列表宿主，
+        // 右栏标题行 / 聊天 / 弹出面板 / 输入区。树根是 body 元素
+        // （dock 0 = Manual）——与本页这类宿主只对 dock=Fill 的根
+        // 做填充（GenForm 时代由 __BuildForm 发射），runtime 文档
+        // 必须 code-behind 补上（收藏页同款）。
+        Control ui = WeChatChatHtml.Build(null);
+        ui.DockFill();
+        this.Add(ui);
+
+        // ---- 左栏：搜索框在文档里（<input> → Input，placeholder
+        // 直进构造）；会话列表是动态控件，挂进骨架预留的壳。壳是
+        // flex 列，行加 grow 类吃满主轴。骨架 id 都是文档里写死的，
+        // 找不到只可能是我改错了文档——兜底退回树根（收藏页同款）。
+        search = (Input)ui.Find("SearchBox");
+        Control listHost = ui.Find("SessionHost");
+        if (listHost == null) { listHost = ui; }
         list = new ListView<WxSession>(WxSessionRow.Of);
-        list.Class = "wxlist";
-        list.dock = 5;
+        list.Class = "wxlist grow";
         list.Bind(data);
         list.OnSelect(() => { this.Select(list.SelectedIndex()); });
-        col.Add(list);
-        this.Add(col);
+        listHost.Add(list);
 
-        // ---- 右侧会话标题 ----
-        // 头像右侧的四个图标：语音通话/视频通话（摆设）、聊天记录
-        // （开独立记录窗口）、...（开右侧抽屉），与原版同序。
-        Flex head = Wx.Row("wxhead");
-        head.dock = 1;
-        Panel ht = Panel.Column();
-        ht.Class = "grow";
-        headName = Wx.Lbl("", "wxheadname");
-        headDesc = Wx.Lbl("", "wxheaddesc");
-        ht.Add(headName);
-        ht.Add(headDesc);
-        head.Add(ht);
-        Button callBtn = Wx.IconBtn("phone");
+        // ---- 右侧标题行：文字是文档元素；头像右侧的四个图标按钮
+        // 是动态控件——语音通话/视频通话（摆设）、聊天记录（开独立
+        // 记录窗口）、...（开右侧抽屉）。runtime 通道没有
+        // data-x-props：图标与悬停提示 code-behind 补（导航栏同款）。
+        headName = ui.Find("HeadName");
+        headDesc = ui.Find("HeadDesc");
+        Button callBtn = (Button)ui.Find("HeadCall");
+        callBtn.SetProp("icon", "phone");
         callBtn.Tip = "语音通话";
-        head.Add(callBtn);
-        Button videoBtn = Wx.IconBtn("video");
+        Button videoBtn = (Button)ui.Find("HeadVideo");
+        videoBtn.SetProp("icon", "video");
         videoBtn.Tip = "视频通话";
-        head.Add(videoBtn);
-        Button histBtn = Wx.IconBtn("message");
+        Button histBtn = (Button)ui.Find("HeadHist");
+        histBtn.SetProp("icon", "message");
         histBtn.Tip = "聊天记录";
         histBtn.OnClick(() => { WxHistoryWindow.Open(this.app, data[current]); });
-        head.Add(histBtn);
-        Button dotsBtn = Wx.IconBtn("dots");
+        Button dotsBtn = (Button)ui.Find("HeadDots");
+        dotsBtn.SetProp("icon", "dots");
         dotsBtn.Tip = "更多";
         dotsBtn.OnClick(() => { this.ToggleDrawer(); });
-        head.Add(dotsBtn);
-        this.Add(head);
-        this.Add(Wx.Line());
 
-        // ---- 底部输入区（按微信的排布：输入框在上，图标与发送
-        //      在底部一条；先加输入区再加它上面的分隔线：dock 2 的
-        //      子节点按插入顺序自下而上排） ----
-        Panel comp = Wx.Col("wxcomposer");
-        comp.dock = 2;
-        // 引用条：点气泡菜单「引用」后出现在输入框上方（dock 2 的
-        // 子节点自下而上排：发送条 → 分隔线 → 输入框 → 引用条），
-        // 平时收起，随草稿显隐。
-        quoteBar = Wx.Row("wxquote");
-        quoteBar.dock = 2;
+        // ---- 底部输入区：输入框与发送条都在文档里（<textarea> →
+        // TextArea、发送钮是文档按钮）。引用条平时收起，随草稿显隐；
+        // 关闭钮与发送钮的点击行为、引用条的显隐在 code-behind 接。
+        quoteBar = ui.Find("QuoteBar");
         quoteBar.visible = false;
-        quoteLbl = Wx.Lbl("", "wxquotetext");
-        quoteLbl.dock = 5;
-        quoteBar.Add(quoteLbl);
-        Button quoteX = Wx.IconBtn("close");
+        quoteText = ui.Find("QuoteText");
+        Button quoteX = (Button)ui.Find("QuoteClose");
+        quoteX.SetProp("icon", "close");
         quoteX.Tip = "取消引用";
         quoteX.OnClick(() => { WxIm.DismissQuoteDraft(); });
-        quoteBar.Add(quoteX);
-        comp.Add(quoteBar);
-        Panel tw = Wx.Col("wxtypewrap");
-        tw.dock = 5;
-        box = new TextArea("");
-        box.Class = "wxtype";
-        box.dock = 5;
-        tw.Add(box);
-        comp.Add(tw);
-        Flex bb = Wx.Row("wxbottom");
-        bb.dock = 2;
+        box = (TextArea)ui.Find("TypeBox");
         // 图标工具条是标准库的 ToolStrip（按钮组），项本身就是扁平
         // 按钮（text small），表面色走皮肤的 toolstrip 规则——这里
         // 不摆裸按钮、不写一行式样；grow 把右侧两个按钮推到最右。
         // 左组五个按原版顺序：表情 / 常用头像 / 文件 / 截图(+下拉) /
         // 麦克风，群聊再加一个 ⊙；右组是发语音圆钮与文字发送钮。
+        Control toolsHost = ui.Find("ToolsHost");
+        if (toolsHost == null) { toolsHost = ui; }
         bar = new ToolStrip();
         bar.SetIconOnly(true);
         bar.Class = "grow";
-        bb.Add(bar);
-        Button send = new Button("发送");
-        send.Class = "primary small";
+        toolsHost.Add(bar);
+        Button send = (Button)ui.Find("SendBtn");
         send.OnClick(() => { this.Send(); });
-        bb.Add(send);
-        comp.Add(bb);
-        this.Add(comp);
-        this.Add(Wx.Line());
 
         // ---- 输入区上方的弹出面板（表情 / 常用头像 / 文件）----
-        // dock 2 的第三个子节点：排在分隔线之上、聊天记录之下，
-        // 显隐靠 visible，不做浮层。
+        // 面板本体是动态控件，挂进骨架的 #PopupHost（聊天区与输入区
+        // 之间）：收起时壳零高，聊天区吃满；展开时壳随面板长高。
         // 弹出面板的宿主用 flex 列 + 交叉轴起点：面板自己的宽度
         // （424）才会生效，否则 Panel 的列会把子项拉满整行。
+        Control popupHost = ui.Find("PopupHost");
+        if (popupHost == null) { popupHost = ui; }
         popup = Flex.Column();
         popup.AddClass("wxpopup");
         popup.AlignStart();
-        popup.dock = 2;
         popup.visible = false;
         emoPanel = WxEmojiPanel.Of((t) => { this.Type(t); });
         emoPanel.Root().visible = false;
@@ -184,9 +164,11 @@ class WxPageChat : Control {
         filePanel = WxFilePanel.Of((t) => { this.Type(t); });
         filePanel.Root().visible = false;
         popup.Add(filePanel.Root());
-        this.Add(popup);
+        popupHost.Add(popup);
 
         // ---- 「...」的右侧抽屉（私聊/群聊两种版式在同一列里翻）----
+        // 抽屉与名片是覆盖层，仍挂在页面根本身（dock 4 右缘，压在
+        // 骨架文档之上）；骨架是纯 flex 流，承载不了浮层。
         drawer = Wx.Col("wxdrawer");
         drawer.dock = 4;
         drawer.visible = false;
@@ -203,17 +185,19 @@ class WxPageChat : Control {
         prof.dock = 4;
         this.Add(prof);
 
-        // ---- 聊天记录本体 ----
+        // ---- 聊天记录本体：动态控件挂进骨架的 #ChatHost（标题行
+        // 与输入区之间，grow 类吃满剩余高度） ----
+        Control chatHost = ui.Find("ChatHost");
+        if (chatHost == null) { chatHost = ui; }
         chat = new ChatView();
-        chat.Class = "wxchat";
-        chat.dock = 5;
+        chat.Class = "wxchat grow";
         chat.WithStyle(ChatStyle.Bubble());
         chat.WithBubbleWidth(620);
         // 点气泡里的头像 = 弹发言人名片（原版同款交互）。
         chat.OnAvatarClick((idx) => { this.OpenMsgProfile(idx); });
         // 右键气泡 = 复制 / 引用；「引用」把草稿交给桥，随下一条发送。
         chat.OnBubbleMenu((idx, sel) => { this.OpenBubbleMenu(idx, sel); });
-        this.Add(chat);
+        chatHost.Add(chat);
 
         this.Select(0);
     }
@@ -226,7 +210,7 @@ class WxPageChat : Control {
 
     /// 引用条显隐（草稿由 WxIm 持有，这里只管画）。
     void ShowQuoteBar(string who, string text) {
-        quoteLbl.Text = "引用 " + who + "：" + text;
+        quoteText.SetProp("text", "引用 " + who + "：" + text);
         quoteBar.visible = true;
         { if (app != null) { app.RequestRedraw(); } }
     }
@@ -374,11 +358,12 @@ class WxPageChat : Control {
         if (i < 0 || i >= data.Count) { return; }
         current = i;
         WxSession s = data[i];
-        headName.Text = s.name;
+        headName.SetProp("text", s.name);
         if (s.group) {
-            headDesc.Text = "群聊 · " + Convert.ToString(s.people) + " 人";
+            headDesc.SetProp("text",
+                "群聊 · " + Convert.ToString(s.people) + " 人");
         } else {
-            headDesc.Text = "最后活跃 " + s.time;
+            headDesc.SetProp("text", "最后活跃 " + s.time);
         }
         this.BuildBar(s.group);
         this.ClosePopups();
@@ -427,11 +412,12 @@ class WxPageChat : Control {
     void OnDataChanged() {
         if (current >= 0 && current < data.Count) {
             WxSession s = data[current];
-            headName.Text = s.name;
+            headName.SetProp("text", s.name);
             if (s.group) {
-                headDesc.Text = "群聊 · " + Convert.ToString(s.people) + " 人";
+                headDesc.SetProp("text",
+                    "群聊 · " + Convert.ToString(s.people) + " 人");
             } else {
-                headDesc.Text = "最后活跃 " + s.time;
+                headDesc.SetProp("text", "最后活跃 " + s.time);
             }
             if (s.msgs.Count != shownCount) {
                 shownCount = s.msgs.Count;
@@ -535,7 +521,9 @@ class WxPageContacts : Control {
     Label cSub;
     WxRow cIntro;
     WxRow cSubject;
-    Label hint;
+    /// 底部提示行是骨架文档里的元素（WeChatContacts.html 的
+    /// #CardHint）：Ping 的回执文字走 SetProp("text") 元素通道。
+    Control hint;
     WxContact cur;
 
     WxPageContacts() {
@@ -546,28 +534,34 @@ class WxPageContacts : Control {
         // 默认展开「联系人」节：与原版一致，一进来就能看到字母列表。
         this.MarkOpen(5, true);
 
-        Panel col = Wx.Col("wxcol");
-        col.dock = 3;
-        // 「通讯录管理」入口：图标 + 文字的一整条按钮（图标走 IconView，
-        // Segoe 图标集里没有通讯簿这个字形）。点开独立的管理子窗口。
-        Flex mg = Wx.Row("wxmgmt");
-        mg.dock = 1;
+        // ---- HTML 骨架（WeChatContacts.html）：左栏管理入口 + 列表
+        // 宿主，右栏卡片宿主 + 提示行。树根是 body 元素（dock 0 =
+        // Manual）——code-behind 补 DockFill（收藏页同款）。
+        Control ui = WeChatContactsHtml.Build(null);
+        ui.DockFill();
+        this.Add(ui);
+
+        // 「通讯录管理」入口：图标与点击行为是动态配置（runtime
+        // 通道没有 data-x-props；图标走 IconView，Segoe 图标集里
+        // 没有通讯簿这个字形）。整条入口、图标、文字接同一个开窗
+        // 动作——子件先于父格吃到命中，与成员格同一套三重绑定。
         Action openMgmt = () => {
             if (this.app != null) { WxContactManagerWindow.Open(this.app); }
         };
         IconView mi = new IconView("address-book", 18);
-        Label mt = Wx.Lbl("通讯录管理", "wxmgmttext");
-        mg.Justify("center");
-        mg.OnClick(openMgmt);
+        Control mgmtIcon = ui.Find("MgmtIcon");
+        if (mgmtIcon == null) { mgmtIcon = ui; }
+        mgmtIcon.Add(mi);
+        Control mgmtEntry = ui.Find("MgmtEntry");
+        if (mgmtEntry != null) { mgmtEntry.OnClick(openMgmt); }
+        Control mgmtText = ui.Find("MgmtText");
+        if (mgmtText != null) { mgmtText.OnClick(openMgmt); }
         mi.OnClick(openMgmt);
-        mt.OnClick(openMgmt);
-        mg.Add(mi);
-        mg.Add(mt);
-        col.Add(mg);
 
+        Control listHost = ui.Find("ContactsListHost");
+        if (listHost == null) { listHost = ui; }
         list = new ListView<WxContact>(WxContactRow.Of);
-        list.Class = "wxlist";
-        list.dock = 5;
+        list.Class = "wxlist grow";
         list.Bind(view);
         // 字母头只是分节标题：不可选、不可点。
         list.WithSelectable(WxContactRow.Selectable);
@@ -575,24 +569,20 @@ class WxPageContacts : Control {
         // 第二次点同一行走 Activate：对节行就是「再点一下收起」；
         // 对内容行等于再看一眼卡片，无害。
         list.OnActivate(() => { this.Pick(list.SelectedIndex()); });
-        col.Add(list);
-        this.Add(col);
+        listHost.Add(list);
         this.Rebuild();
 
-        // 右侧三张卡叠在同一矩形里，只亮选中行对应的那张——隐藏的
+        // 右侧三张卡叠在 #CardsHost 里，只亮选中行对应的那张——隐藏的
         // 不参与排版/命中/绘制。
-        Panel card = Wx.Col("wxcard");
-        card.dock = 5;
+        Control cardsHost = ui.Find("CardsHost");
+        if (cardsHost == null) { cardsHost = ui; }
         cardA = this.BuildPersonCard();
         cardB = this.BuildGroupCard();
         cardC = this.BuildAccountCard();
-        card.Add(cardA);
-        card.Add(cardB);
-        card.Add(cardC);
-        hint = Wx.Lbl("", "wxhint");
-        hint.dock = 2;
-        card.Add(hint);
-        this.Add(card);
+        cardsHost.Add(cardA);
+        cardsHost.Add(cardB);
+        cardsHost.Add(cardC);
+        hint = ui.Find("CardHint");
         this.ShowCard(0);
 
         // 初始选中联系人节的第一位真实联系人。
@@ -837,7 +827,7 @@ class WxPageContacts : Control {
             gNick.SetVal(c.remark == "" ? "—" : c.remark);
             gNotice.SetVal(c.tag == "" ? "—" : c.tag);
             gSave.SetVal("是");
-            hint.Text = "";
+            hint.SetProp("text", "");
             return;
         }
         if (c.kind == 5) {
@@ -848,7 +838,7 @@ class WxPageContacts : Control {
             cSub.Text = "微信号：" + c.wxid;
             cIntro.SetVal(c.msg);
             cSubject.SetVal(c.org);
-            hint.Text = "";
+            hint.SetProp("text", "");
             return;
         }
         this.ShowCard(0);
@@ -877,7 +867,7 @@ class WxPageContacts : Control {
             msgBtn.visible = true;
             voiceBtn.visible = false;
             videoBtn.visible = false;
-            hint.Text = "";
+            hint.SetProp("text", "");
             return;
         }
         if (c.kind == 6) {
@@ -900,7 +890,7 @@ class WxPageContacts : Control {
             msgBtn.visible = true;
             voiceBtn.visible = c.initial != "";
             videoBtn.visible = c.initial != "";
-            hint.Text = "";
+            hint.SetProp("text", "");
             return;
         }
         // 联系人（kind 2）。
@@ -922,11 +912,11 @@ class WxPageContacts : Control {
         msgBtn.visible = true;
         voiceBtn.visible = true;
         videoBtn.visible = true;
-        hint.Text = "";
+        hint.SetProp("text", "");
     }
 
     void Ping(string t) {
-        if (cur != null) { hint.Text = t; }
+        if (cur != null) { hint.SetProp("text", t); }
     }
 
     override string Kind() { return "WxPageContacts"; }
