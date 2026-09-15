@@ -31,6 +31,21 @@
   var DENSITY_KEY = 'zanweb.zantable.density';
   var ARROW_DESC = ' \u2193';
   var ARROW_ASC = ' \u2191';
+  /* 当前打开的列显隐菜单：一次只开一个，document 级监听只注册一次，
+     面板重载不会累积监听器。 */
+  var openMenu = null;
+
+  document.addEventListener('click', function (ev) {
+    if (!openMenu) { return; }
+    if (openMenu.menu.contains(ev.target) || openMenu.btn.contains(ev.target)) { return; }
+    openMenu.menu.hidden = true;
+    openMenu = null;
+  });
+  document.addEventListener('keydown', function (ev) {
+    if (ev.key !== 'Escape' || !openMenu) { return; }
+    openMenu.menu.hidden = true;
+    openMenu = null;
+  });
 
   function el(tag, cls, text) {
     var n = document.createElement(tag);
@@ -119,6 +134,76 @@
       bar.appendChild(selInfo);
       bar.appendChild(clear);
     }
+
+    /* ---- 列显隐 --------------------------------------------------- */
+    /* 宽表按需藏列，按 表格身份（data-table-key 或 路径+#序号）记忆。 */
+    var colKey = table.getAttribute('data-table-key') ||
+      (location.pathname + '#' +
+        Array.prototype.indexOf.call(document.querySelectorAll('table[data-table]'), table));
+    var colStore = 'zanweb.zantable.cols.' + colKey;
+    var hiddenCols = {};
+    try {
+      JSON.parse(localStorage.getItem(colStore) || '[]').forEach(function (i) {
+        if (i >= 0 && i < cols.length) { hiddenCols[i] = true; }
+      });
+    } catch (e) { /* 坏数据当全可见 */ }
+
+    var colsBtn = el('button', 'btn sm zt-colsbtn', '列');
+    colsBtn.type = 'button';
+    var colsBox = el('div', 'zt-menu');
+    colsBox.hidden = true;
+    cols.forEach(function (col, i) {
+      var lab = el('label');
+      var box = el('input');
+      box.type = 'checkbox';
+      box.checked = !hiddenCols[i];
+      box.addEventListener('change', function () {
+        if (!box.checked) {
+          /* 至少留一列：取消最后一个可见列时回弹 */
+          var visibleLeft = cols.filter(function (c, j) {
+            return j !== i && !hiddenCols[j];
+          }).length;
+          if (visibleLeft === 0) { box.checked = true; return; }
+          hiddenCols[i] = true;
+        } else {
+          delete hiddenCols[i];
+        }
+        applyCols();
+        try {
+          localStorage.setItem(colStore,
+            JSON.stringify(cols.map(function (c, j) { return hiddenCols[j] ? j : -1; })
+              .filter(function (j) { return j >= 0; })));
+        } catch (e) { /* private mode */ }
+      });
+      lab.appendChild(box);
+      lab.appendChild(el('span', undefined, col.label || ('列 ' + (i + 1))));
+      colsBox.appendChild(lab);
+    });
+    colsBtn.addEventListener('click', function () {
+      if (openMenu && openMenu !== api) { openMenu.menu.hidden = true; }
+      openMenu = openMenu === api ? null : api;
+      colsBox.hidden = openMenu !== api;
+    });
+    var api = { menu: colsBox, btn: colsBtn };
+    var colsWrap = el('span', 'zt-cols');
+    colsWrap.appendChild(colsBtn);
+    colsWrap.appendChild(colsBox);
+    bar.insertBefore(colsWrap, density);
+
+    /* 隐藏/恢复一列：直接改该列 th 与每行 td 的 display——排序、筛选读的
+       是 textContent，藏起来的列照常参与。 */
+    function applyCols() {
+      var off = canSelect ? 1 : 0;
+      cols.forEach(function (col, i) {
+        var hide = !!hiddenCols[i];
+        col.th.style.display = hide ? 'none' : '';
+        for (var r = 0; r < tbody.rows.length; r++) {
+          var td = tbody.rows[r].cells[i + off];
+          if (td) { td.style.display = hide ? 'none' : ''; }
+        }
+      });
+    }
+    applyCols();
 
     var density = el('button', 'btn sm zt-density');
     density.type = 'button';

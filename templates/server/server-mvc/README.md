@@ -476,7 +476,15 @@ What it adds, all client-side on the current page's data (zero requests):
 - **Row selection** — a checkbox column with select-all/indeterminate head;
   selected count, row highlight (`.on`), and a 取消选择 button.
 - **Density toggle** — 紧凑/舒适 per table, remembered in localStorage.
+- **Column show/hide** — a 列 menu in the status bar toggles each column;
+  hidden columns still sort and filter normally. Persisted per table identity
+  (`data-table-key` attribute, or `pathname#tableIndex`) in localStorage; the
+  last visible column cannot be hidden.
+- **Sticky header** — the header row pins to the top of the scroll port while
+  the table scrolls (CSS only; an inset shadow replaces the collapsed border
+  that would otherwise scroll away).
 
 Cross-page sort/filter belongs to the server (the pager is a link, the query
 is a form) — the component deliberately only manages the current page and
-resets on panel reload.
+resets on panel reload. Column visibility survives reloads; sort/filter state
+does not.
