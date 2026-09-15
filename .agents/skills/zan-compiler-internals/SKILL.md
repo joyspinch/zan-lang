@@ -1,6 +1,6 @@
 ---
 name: zan-compiler-internals
-description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式与坑——Dict 内建布局契约、LLVM select 死臂泄漏（用 branch+phi）、delegate 两形态与 wasm32 ZAN_CLOSURE_TAG 碰撞、nsresolve 冲突改名丢泛型实参（全量输入 vs 按需拉取行为不同）、ARC 所有权判定内建优先于 extern 借用、stdlib 按需拉入的坑（using 整目录、潜伏缺 using、重臂 Bootstrap 注册制）、LLVMIsConstant/llvm.global_ctors/PE 数据分节 $ 命名等发布体积分节陷阱、GNU ld PE 把 .pdata 当 GC 根、交叉工具链 .o 重出配方、conformance 处置四分法、scratch 卫生（bisect 用 worktree 即用即删）。做或改 src/compiler/*、交叉运行时对象、conformance golden、追发布体积、动 stdlib 重组件目录或 ControlFactory/App 拉入面时使用。
+description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式与坑——Dict 内建布局契约、LLVM select 死臂泄漏（用 branch+phi）、delegate 两形态与 wasm32 ZAN_CLOSURE_TAG 碰撞、nsresolve 冲突改名丢泛型实参（全量输入 vs 按需拉取行为不同）、ARC 所有权判定内建优先于 extern 借用、stdlib 按需拉入的坑（AST 真引用闭包、stdlib 输入自我遮蔽、潜伏缺 using、重臂 Bootstrap 注册制）、LLVMIsConstant/llvm.global_ctors/PE 数据分节 $ 命名等发布体积分节陷阱、GNU ld PE 把 .pdata 当 GC 根、交叉工具链 .o 重出配方、conformance 处置四分法、scratch 卫生（bisect 用 worktree 即用即删）。做或改 src/compiler/*、交叉运行时对象、conformance golden、追发布体积、动 stdlib 重组件目录或 ControlFactory/App 拉入面时使用。
 ---
 
 # zanc 编译器内部定式与坑
@@ -79,11 +79,40 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
 
 ## auto-stdlib 拉入的真实语义与重臂注册制（2026-09-16 落地）
 
-- **拉入由 `using` 指令驱动、按整目录**：`using X.Y.Z;` ⇔ 把
-  `stdlib/X/Y/Z` 全部 .zan 编译进图，再不动点重扫新进文件的 using。
-  **全限定名引用与字符串字面量都不触发拉入**（但全限定名若指向未拉入
-  目录的类型 = unresolved，所以生成代码要类型就得发 using）。改"谁被
-  编译进"只看 using 边，别在标识符上找补。
+- **拉入两段制（2026-09-16 起为 AST 真引用闭包，旧"using 整目录 glob"
+  已废）**：`using X.Y.Z;` 只把 `stdlib/X/Y/Z` 变成**候选集**（真词法器扫
+  top 声明名/using/ext 标记，不 parse）；候选文件仅当 top 声明名是"活名"
+  才入图。活名 = 已入图文件 AST 里**类型位置**（TYPE_REF 各段）+
+  **成员访问链根**（写全的 `Static.Member` 头）+ qualified type 段；声明名、
+  链尾成员名、字符串字面量永不旗标。`ZAN_NO_PULLIN_FILTER=1` 一键回旧
+  glob 做 A/B 归因；`--emit-symbols`（IDE 符号索引）永远全量。显式传入的
+  stdlib 输入，其**自身目录**也进候选集（pi_reach_input_dir，旧
+  auto_include 输入命名空间 glob 的按需版）。实测 NewProject 2.6s/75 文件
+  （旧 glob 3.2s），空窗 GUI 68 文件。改"谁被编译进"先看旗标链，再谈 using。
+- **stdlib 输入自我遮蔽坑（2026-09-16，datatable 5 例红）**：显式传入的
+  stdlib 文件在 entry 循环被打 `user_decl`（本意：用户文件遮蔽 stdlib
+  同名类，防冲突改名），结果它自己写全的 `DataTable.CellTextRouted` 调用头
+  被 `pi_flag_istr` 的 user_decl 检查一并压制 → 同目录 30 个 partial 部件
+  一个都拉不进，报 `'DataTable' has no member 'CellTextRouted'`。
+  修法 `pi_seed_stdlib_input`：stdlib 树内的输入不做 user_decl 遮蔽（判定
+  复用 pi_reach_input_dir 的 stdlib 根叶名比对）。教训：`user_decl` 的语义
+  是"**用户**声明遮蔽 stdlib"，不是"所有输入都遮蔽"——stdlib 输入提到
+  自己的名字（partial 联动）是真引用，必须照常旗标。
+- **AST 播种要连 ns_root 一起搬（2026-09-16，pullin_qualified_escape
+  四变体全红）**：`ns_root`（using/namespace 的每一段 = 已知命名空间根）
+  原本是词法播种 pass 1 顺手填的；播种改走 AST 后没人填了，
+  `Gui.App.ISqrt(9)` 的链中段 `App` 逃逸不出 user_decl 遮蔽 → stdlib 的
+  Gui/App.zan 拉不进。修法两件套：pi_parse_and_seed 对**每个** parse 的
+  文件（不止 entry）把 using 段与自身 namespace 段标 ns_root；
+  AST_MEMBER_ACCESS 判链根是 ns_root 时中段走 `pi_flag_qualified` 直置
+  flagged（镜像词法回退的直置语义；TYPE_REF 段走 pi_flag_ident(NULL)
+  本来就直置）。教训：把一个机制从词法搬进 AST，它顺手维护的**旁路
+  状态**必须一起搬，否则语义静默丢失、只有专门守门用例能抓到。
+- **partial 部件联动靠真引用，别钉目录**：曾试"显式输入所在目录整目录
+  无条件入图"（钉住）——错：一次把 30 个部件全带进，违背按需编译本意；
+  且不必要——输入文件自己写全的 `ClassName.Member` 调用头旗标即可不动点
+  闭环。凡遇"部分成员缺失"，先确认引用方是否写了全名、是否被 user_decl
+  压制，而不是给目录开后门。
 - **潜伏缺 using 会被解耦暴露**：CodeEditor/FilePicker/SceneDesigner/
   Designer 用 `Lang.Tr`（System.Globalization）却从不声明 using——过去
   ControlFactory 的 `using Gui.Component.DataTable;` 把 DataTable.Lang.zan
@@ -552,14 +581,15 @@ parser 回溯，专项做。
   ——`File.ReadAllText` 内部就是这样把 chunk 变字符串的。自检：`.Length` 等于
   字节数（BOM 是 3 不是 6），首字节是你想要的码值。
 
-## stdlib 按需拉入（demand-driven pull-in，2026-09-10）
+## stdlib 按需拉入的词法级坑（2026-09-10 首版过滤；语义守门仍有效）
 
 > 以前 `using Gui;` = 目录全量 glob + 传递 using 扫描到不动点，一个空窗口
 > 程序 parse 380 个文件、2.8s，且 stdlib 树里任何文件有语法错全体拖垮。
-> 现在目录内文件按"声明名被拼写"过滤后才 parse（`main.c` 的 pi_* 块），
-> 空窗口 269 文件、纯 hello 3 文件 0.3s。语义等价性靠 conformance 三件套
+> 过滤迭代至今：词法"声明名被拼写"（269 文件）→ 今天的 AST 真引用闭包
+> （见上"拉入两段制"，空窗 68 文件）。语义等价性靠 conformance 三件套
 > （pullin_shadow_same_name / pullin_extension_host / pullin_qualified_escape）
-> 钉死。
+> 钉死；下面四个坑在**词法播种回退路径**（parse 失败时的 fallback）里
+> 仍然活着。
 
 - **词法级名字匹配的四个假阳性/假阴性坑，全踩过**：
   - 扩展方法宿主是"不可见名字"（调用处只写 `s.CompareTo(...)`），必须当

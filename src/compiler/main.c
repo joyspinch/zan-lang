@@ -665,28 +665,30 @@ static void scan_using_tokens(const char *source, size_t len,
  * The glob-everything scan above parses every *.zan under each used
  * namespace even when the program names a handful of types (`using Gui;`
  * parses ~370 files for one window). When the filter is active, globbed
- * files join the parse only when something live can name them:
+ * files join the parse only when a real reference can name them:
  *
- *   - every identifier token in the already-parsed sources seeds a worklist
- *     of live names (a deliberate over-approximation: namespace segments,
- *     member names and keywords only ever add candidates, never remove
- *     them);
+ *   - each entry file (and each included stdlib file) is parsed, and only
+ *     names written in type positions -- AST_TYPE_REF, the trailing
+ *     segment of a qualified name, the root of a member access -- flag a
+ *     live name (see pi_seed_ast below for why declarations and member
+ *     names must never count);
  *   - a reached directory is scanned once with the real lexer for its
- *     top-level declared type names, its `using` directives, an
- *     extension-method marker and its own identifier set -- no parse, no
- *     AST, so the scan is an order of magnitude cheaper than a parse;
+ *     top-level declared type names, its `using` directives and an
+ *     extension-method marker -- no parse, no AST, an order of magnitude
+ *     cheaper;
  *   - a file joins the parse when one of its top-level names is live, or
  *     when it hosts extension methods (an extension call names the receiver
  *     and the method, never the host class, so the host file needs its own
  *     trigger);
- *   - including a file flags its identifiers live and reaches its `using`
- *     directories; the closure runs to a fixpoint before any file parses.
+ *   - including a file schedules its parse-seed and reaches its `using`
+ *     directories; the closure runs to a fixpoint before any file reaches
+ *     the real parse.
  *
- * Observable semantics are preserved: every name user code spells pulls the
+ * Observable semantics are preserved: every type a program spells pulls the
  * declaring file exactly as the full glob did, so simple-name collision
  * mangling sees the same declaration pairs, and prune (which still runs)
  * keeps everything transitively referenced. What disappears is the parse of
- * files whose names appear nowhere reachable -- and with it the old
+ * files whose names appear nowhere in type position -- and with it the old
  * failure mode where a syntax error in an unreachable stdlib file failed
  * unrelated programs. Escape hatch: ZAN_NO_PULLIN_FILTER=1 restores the
  * glob-everything scan; --emit-symbols always uses it (the IDE symbol index
@@ -694,6 +696,12 @@ static void scan_using_tokens(const char *source, size_t len,
 
 static zan_arena_t *pi_arena = NULL;
 static int pi_filter_active = 0;
+/* The currently seeded input is itself a stdlib file (passed on the command
+ * line, e.g. a partial-class primary part). Its declared names are the
+ * stdlib's own, so mentions inside it -- including qualified calls into its
+ * partial siblings -- must flag normally instead of being suppressed as
+ * user shadowing. */
+static int pi_seed_stdlib_input = 0;
 
 typedef struct pi_name {
     const char *str;
@@ -720,6 +728,7 @@ typedef struct pi_file {
     int has_ext;                /* hosts an extension method */
     int included;               /* joins the parse */
     int parsed;                 /* already appended to the input list */
+    int seeded;                 /* already parse-seeded in the fixpoint */
     struct pi_file *dnext;
 } pi_file_t;
 
@@ -800,6 +809,66 @@ static void pi_reach(const char *subdir) {
     pi_dirs_tail = d;
 }
 
+/* Set when the filter activates: the stdlib root every input-relative
+ * directory probe compares against. */
+static const char *pi_stdlib_root_buf;
+
+/* An entry that IS a stdlib file (tests pass single stdlib sources as
+ * inputs) implicitly makes its own directory visible: siblings and
+ * partial-class parts live beside it and the unfiltered path pulled them
+ * through the same-directory glob. Walk up to the stdlib root's leaf name
+ * to recover the 'A/B/C' subdir. */
+static int pi_reach_input_dir(const char *file) {
+    char comps[32][64];
+    int n = 0;
+    size_t len = strlen(file);
+    size_t i = 0;
+    while (i < len && n < 32) {
+        size_t start = i;
+        while (i < len && file[i] != '/' && file[i] != 92) i++;
+        size_t cl = i - start;
+        if (cl > 0 && cl < 64) {
+            memcpy(comps[n], file + start, cl);
+            comps[n][cl] = 0;
+            n++;
+        }
+        i++;
+    }
+    if (n < 2 || !pi_stdlib_root_buf) return 0;
+    const char *root = pi_stdlib_root_buf;
+    size_t rl = strlen(root);
+    size_t rs = rl;
+    while (rs > 0 && root[rs - 1] != '/' && root[rs - 1] != 92) rs--;
+    const char *leaf = root + rs;
+    size_t ll = strlen(leaf);
+    int base = -1;
+    for (int k = n - 2; k >= 0; k--) {
+        if (strlen(comps[k]) == ll) {
+            int eq = 1;
+            for (size_t c = 0; c < ll; c++) {
+                char a = comps[k][c], b = leaf[c];
+                if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+                if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+                if (a != b) { eq = 0; break; }
+            }
+            if (eq) { base = k; break; }
+        }
+    }
+    if (base < 0 || base == n - 1) return 0;  /* not under the stdlib root */
+    char sub[1024];
+    size_t used = 0;
+    for (int k = base + 1; k < n - 1; k++) {  /* last comp = file name */
+        size_t cl = strlen(comps[k]);
+        if (used && used + 1 < sizeof(sub)) sub[used++] = '/';
+        if (used + cl + 1 > sizeof(sub)) return 1;
+        memcpy(sub + used, comps[k], cl);
+        used += cl;
+    }
+    sub[used] = 0;
+    pi_reach(sub);
+    return 1;
+}
+
 static void pi_add_file(pi_dir_t *d, const char *path) {
     if (!pi_reserve((void *)&d->files, d->file_count, &d->file_cap,
                     sizeof(pi_file_t)))
@@ -814,6 +883,7 @@ static void pi_add_file(pi_dir_t *d, const char *path) {
     f->has_ext = 0;
     f->included = 0;
     f->parsed = 0;
+    f->seeded = 0;
     f->dnext = NULL;
 }
 
@@ -1310,6 +1380,388 @@ static void pi_seed_source(const char *source, size_t len) {
     zan_arena_free(arena);
 }
 
+/* ---- AST-driven seeding: names only where the grammar names a type ----
+ *
+ * The lexical seeding above deliberately over-approximates -- every
+ * identifier token flags its name live -- and that over-approximation is
+ * only as good as its hand-written exemptions. Method declarations whose
+ * return type is an identifier (`HttpRouter Route(...)`) defeat the
+ * builtin-keyword exemption, and one flagged method name is enough to pull
+ * a same-named type's whole file: `static nint Slot(...)` in System/Interop
+ * pulled Gui/ImageHttp (its `class Slot`), ImageHttp's usings reached
+ * System/Net, HttpServer's `Route` method pulled System/Web's `class Route`,
+ * HttpContext's `Html` method pulled Gui/Html back -- unrelated stacks in
+ * every program, chained entirely through method-name coincidences.
+ *
+ * The AST spelling of the same idea collects a name only where the grammar
+ * can name a TYPE: AST_TYPE_REF nodes, the trailing segment of a qualified
+ * name, and the root identifier of a member access (`Static.Type.Member` --
+ * still over-approximated, since a local can shadow the root spelling). A
+ * declared name is never a reference: a method named Slot says nothing
+ * about ImageHttp's `class Slot`, and a member name after a dot was never
+ * a type position either. Partial-class siblings still co-include through
+ * the metadata top[] index: a mention matches every file declaring the
+ * name. Extension hosts keep their own trigger (an extension call names
+ * the receiver, never the host).
+ *
+ * Under-collection would surface as "undefined type" at bind time, so the
+ * walker errs on the side of walking: every child-bearing kind is listed
+ * below. On a parse failure the file falls back to the lexical seeding so
+ * the closure cannot silently shrink; the real parse later reports that
+ * error properly. */
+
+static void pi_seed_chain(const zan_ast_node_t *n, int in_chain);
+
+static void pi_seed_ast(const zan_ast_node_t *n) { pi_seed_chain(n, 0); }
+
+static void pi_seed_list(const zan_ast_list_t *list) {
+    for (int i = 0; i < list->count; i++) pi_seed_ast(list->items[i]);
+}
+
+static void pi_flag_istr(zan_istr_t name) {
+    if (!name.str || name.len <= 0) return;
+    pi_name_t *p = pi_intern(name.str, (size_t)name.len);
+    if (p && !p->user_decl) p->flagged = 1;
+}
+
+/* Flag a segment that sits in a chain rooted at a known namespace segment
+ * (`Gui.App.ISqrt`): the root spells a namespace, so trailing segments are
+ * qualified mentions and must escape a user-declared shadow -- the same
+ * carve-out the lexical seeding gives such chains (pi_seed_source pass 1
+ * sets flagged directly for the same shape). */
+static void pi_flag_qualified(zan_istr_t name) {
+    if (!name.str || name.len <= 0) return;
+    pi_name_t *p = pi_intern(name.str, (size_t)name.len);
+    if (p) p->flagged = 1;
+}
+
+static int pi_is_ns_root(zan_istr_t name) {
+    if (!name.str || name.len <= 0) return 0;
+    pi_name_t *p = pi_intern(name.str, (size_t)name.len);
+    return p && p->ns_root;
+}
+
+static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
+    if (!n) return;
+    pi_seed_list(&n->attributes);
+    switch (n->kind) {
+    /* ---- type positions: the only places a simple name is a reference */
+    case AST_TYPE_REF:
+        /* A qualified type (`Gui.Widget.Tabs`) parses into ONE type_ref
+         * whose name is the dotted spelling (nsresolve splits it later),
+         * so flag each '.'-separated segment: the trailing segment is the
+         * type name the candidate index holds. */
+        if (n->type_ref.name.str) {
+            const char *s = n->type_ref.name.str;
+            unsigned start = 0;
+            for (unsigned ci = 0; ci <= n->type_ref.name.len; ci++) {
+                if (ci == n->type_ref.name.len || s[ci] == '.') {
+                    if (ci > start)
+                        pi_flag_ident(NULL, s + start, (size_t)(ci - start));
+                    start = ci + 1;
+                }
+            }
+        }
+        pi_seed_list(&n->type_ref.type_args);
+        pi_seed_ast(n->type_ref.array_element);
+        return;
+    case AST_QUALIFIED_NAME:
+        /* a.b.c: flag every segment. The trailing segment is the type
+         * name; middle segments may carry it too (`Ns.Type.Member` in
+         * expression position); pure namespace segments match no
+         * top-level name and are harmless. */
+        for (int qi = 0; qi < n->qualified_name.parts.count; qi++)
+            pi_flag_istr(n->qualified_name.parts.items[qi]->ident.name);
+        return;
+
+    /* ---- declarations: declared names are NOT references */
+    case AST_METHOD_DECL:
+    case AST_CONSTRUCTOR_DECL:
+    case AST_DESTRUCTOR_DECL:
+    case AST_DELEGATE_DECL:
+        pi_seed_ast(n->method_decl.return_type);
+        pi_seed_list(&n->method_decl.params);
+        pi_seed_list(&n->method_decl.type_params);
+        pi_seed_list(&n->method_decl.where_clauses);
+        pi_seed_list(&n->method_decl.base_args);
+        pi_seed_ast(n->method_decl.body);
+        return;
+    case AST_CLASS_DECL:
+    case AST_STRUCT_DECL:
+    case AST_INTERFACE_DECL:
+        pi_seed_list(&n->type_decl.bases);
+        pi_seed_list(&n->type_decl.members);
+        pi_seed_list(&n->type_decl.where_clauses);
+        return;
+    case AST_ENUM_DECL:
+        pi_seed_list(&n->type_decl.bases);
+        pi_seed_list(&n->type_decl.members);
+        return;
+    case AST_FIELD_DECL:
+    case AST_PROPERTY_DECL:
+        pi_seed_ast(n->field_decl.type);
+        pi_seed_ast(n->field_decl.initializer);
+        pi_seed_ast(n->field_decl.getter_body);
+        pi_seed_ast(n->field_decl.setter_body);
+        if (n->field_decl.indexer_params)
+            pi_seed_list(n->field_decl.indexer_params);
+        return;
+    case AST_ENUM_MEMBER:
+        pi_seed_ast(n->enum_member.value);
+        return;
+    case AST_PARAM:
+        pi_seed_ast(n->param.type);
+        pi_seed_ast(n->param.default_val);
+        return;
+    case AST_VAR_DECL:
+        pi_seed_ast(n->var_decl.type);
+        pi_seed_ast(n->var_decl.initializer);
+        return;
+    case AST_TUPLE_DECON:
+        pi_seed_list(&n->tuple_decon.types);
+        pi_seed_ast(n->tuple_decon.initializer);
+        return;
+    case AST_WHERE_CLAUSE:
+        pi_seed_list(&n->where_clause.constraints);
+        return;
+    case AST_ATTRIBUTE:
+        if (n->attribute.name) {
+            if (n->attribute.name->kind == AST_IDENTIFIER)
+                pi_flag_istr(n->attribute.name->ident.name);
+            else
+                pi_seed_ast(n->attribute.name);
+        }
+        pi_seed_list(&n->attribute.args);
+        return;
+    case AST_USING_DECL:
+        return;
+    case AST_NAMESPACE_DECL:
+        pi_seed_list(&n->namespace_decl.members);
+        return;
+
+    /* ---- statements */
+    case AST_COMPILATION_UNIT:
+        /* usings are namespace visibility, not references; the seeding
+         * driver reaches their directories separately */
+        pi_seed_ast(n->comp_unit.ns);
+        pi_seed_list(&n->comp_unit.decls);
+        return;
+    case AST_BLOCK:
+        pi_seed_list(&n->block.stmts);
+        return;
+    case AST_EXPR_STMT:
+        pi_seed_ast(n->expr_stmt.expr);
+        return;
+    case AST_RETURN_STMT:
+        pi_seed_ast(n->ret.value);
+        return;
+    case AST_IF_STMT:
+        pi_seed_ast(n->if_stmt.cond);
+        pi_seed_ast(n->if_stmt.then_body);
+        pi_seed_ast(n->if_stmt.else_body);
+        return;
+    case AST_WHILE_STMT:
+    case AST_DO_WHILE_STMT:
+        pi_seed_ast(n->while_stmt.cond);
+        pi_seed_ast(n->while_stmt.body);
+        return;
+    case AST_FOR_STMT:
+        pi_seed_ast(n->for_stmt.init);
+        pi_seed_ast(n->for_stmt.cond);
+        pi_seed_ast(n->for_stmt.step);
+        pi_seed_ast(n->for_stmt.body);
+        return;
+    case AST_FOREACH_STMT:
+        pi_seed_ast(n->foreach_stmt.var_type);
+        pi_seed_ast(n->foreach_stmt.collection);
+        pi_seed_ast(n->foreach_stmt.body);
+        return;
+    case AST_THROW_STMT:
+        pi_seed_ast(n->throw_stmt.value);
+        return;
+    case AST_TRY_STMT:
+        pi_seed_ast(n->try_stmt.try_body);
+        pi_seed_list(&n->try_stmt.catches);
+        pi_seed_ast(n->try_stmt.finally_body);
+        return;
+    case AST_CATCH_CLAUSE:
+        pi_seed_ast(n->catch_clause.type);
+        pi_seed_ast(n->catch_clause.body);
+        return;
+    case AST_SWITCH_STMT:
+        pi_seed_ast(n->switch_stmt.expr);
+        pi_seed_list(&n->switch_stmt.cases);
+        return;
+    case AST_SWITCH_CASE:
+        pi_seed_ast(n->switch_case.pattern);
+        pi_seed_ast(n->switch_case.type_pattern);
+        pi_seed_ast(n->switch_case.when_cond);
+        pi_seed_ast(n->switch_case.body);
+        return;
+    case AST_SWITCH_EXPR:
+        pi_seed_ast(n->switch_expr.expr);
+        pi_seed_list(&n->switch_expr.arms);
+        return;
+    case AST_SWITCH_ARM:
+        pi_seed_ast(n->switch_arm.pattern);
+        pi_seed_ast(n->switch_arm.type_pattern);
+        pi_seed_ast(n->switch_arm.when_cond);
+        pi_seed_ast(n->switch_arm.result);
+        return;
+    case AST_YIELD_STMT:
+        pi_seed_ast(n->yield_stmt.value);
+        return;
+    case AST_LOCK_STMT:
+        pi_seed_ast(n->lock_stmt.expr);
+        pi_seed_ast(n->lock_stmt.body);
+        return;
+    case AST_CHECKED_STMT:
+        pi_seed_ast(n->checked_stmt.body);
+        return;
+    case AST_QUERY_EXPR:
+        pi_seed_ast(n->query.source);
+        pi_seed_list(&n->query.clauses);
+        pi_seed_ast(n->query.group_expr);
+        pi_seed_ast(n->query.group_key);
+        pi_seed_ast(n->query.select);
+        return;
+    case AST_QUERY_WHERE:
+    case AST_QUERY_LET:
+    case AST_QUERY_ORDERBY:
+        pi_seed_ast(n->query_clause.expr);
+        return;
+    case AST_QUERY_JOIN:
+        pi_seed_ast(n->query_clause.source);
+        pi_seed_ast(n->query_clause.left_key);
+        pi_seed_ast(n->query_clause.right_key);
+        return;
+    case AST_WITH_EXPR:
+        pi_seed_ast(n->with_expr.expr);
+        pi_seed_list(&n->with_expr.assigns);
+        return;
+
+    /* ---- expressions */
+    case AST_IDENTIFIER:
+        /* a bare identifier expression is a variable/delegate call, never
+         * a type mention; a generic type in expression position carries
+         * the type in inst_type_ref */
+        pi_seed_ast(n->inst_type_ref);
+        return;
+    case AST_BINARY:
+    case AST_ASSIGNMENT:
+        pi_seed_ast(n->binary.left);
+        pi_seed_ast(n->binary.right);
+        return;
+    case AST_UNARY:
+    case AST_POSTFIX_UNARY:
+        pi_seed_ast(n->unary.operand);
+        return;
+    case AST_CALL:
+        /* a bare callee names a method/delegate/local, not a type */
+        if (n->call.callee && n->call.callee->kind != AST_IDENTIFIER)
+            pi_seed_chain(n->call.callee, 0);
+        pi_seed_list(&n->call.args);
+        pi_seed_list(&n->call.type_args);
+        return;
+    case AST_MEMBER_ACCESS: {
+        zan_ast_node_t *obj = n->member.object;
+        /* `Ns.Type.member` parses as nested member accesses: every segment
+         * except the FINAL one may be a type (`Widget.Scrollbar.Render...`),
+         * so when this access is itself the object of a longer chain, its
+         * own member name is a middle segment and gets flagged. The final
+         * segment (receiver . method) is never a type position. */
+        if (in_chain) {
+            zan_ast_node_t *rt = n;
+            while (rt->kind == AST_MEMBER_ACCESS)
+                rt = rt->member.object;
+            if (rt->kind == AST_IDENTIFIER &&
+                pi_is_ns_root(rt->ident.name))
+                pi_flag_qualified(n->member.name);
+            else
+                pi_flag_istr(n->member.name);
+        }
+        if (obj && obj->kind == AST_IDENTIFIER) {
+            /* `Root.Member`: Root may be a static type (or a namespace
+             * segment that matches no top name), so flag it like the old
+             * pass flagged the chain root */
+            pi_flag_istr(obj->ident.name);
+            /* Mirror the parser's Task.WhenAll/WhenAny -> TaskJoin desugar
+             * or the TaskJoin file is never pulled. */
+            if (obj->ident.name.len == 4 &&
+                memcmp(obj->ident.name.str, "Task", 4) == 0) {
+                zan_istr_t m = n->member.name;
+                if (m.str && m.len == 7 &&
+                    (memcmp(m.str, "WhenAll", 7) == 0 ||
+                     memcmp(m.str, "WhenAny", 7) == 0)) {
+                    pi_name_t *tj = pi_intern("TaskJoin", 8);
+                    if (tj) tj->flagged = 1;
+                }
+            }
+        }
+        pi_seed_chain(obj, 1);
+        return;
+    }
+    case AST_INDEX:
+        pi_seed_ast(n->index.object);
+        pi_seed_ast(n->index.index);
+        pi_seed_list(&n->index.extra);
+        return;
+    case AST_NEW_EXPR:
+        pi_seed_ast(n->new_expr.type);
+        pi_seed_ast(n->new_expr.call_init);
+        pi_seed_list(&n->new_expr.args);
+        pi_seed_list(&n->new_expr.arg_inits);
+        return;
+    case AST_CAST_EXPR:
+    case AST_TYPEOF_EXPR:
+    case AST_SIZEOF_EXPR:
+        pi_seed_ast(n->cast.type);
+        pi_seed_ast(n->cast.expr);
+        return;
+    case AST_IS_EXPR:
+    case AST_AS_EXPR:
+        pi_seed_ast(n->type_test.expr);
+        pi_seed_ast(n->type_test.type);
+        return;
+    case AST_CONDITIONAL:
+        pi_seed_ast(n->conditional.cond);
+        pi_seed_ast(n->conditional.then_expr);
+        pi_seed_ast(n->conditional.else_expr);
+        return;
+    case AST_LAMBDA:
+        pi_seed_list(&n->lambda.params);
+        pi_seed_ast(n->lambda.body);
+        return;
+    case AST_AWAIT_EXPR:
+        pi_seed_ast(n->await_expr.expr);
+        return;
+    case AST_STRING_INTERP:
+        pi_seed_list(&n->string_interp.parts);
+        pi_seed_list(&n->string_interp.formats);
+        return;
+    case AST_TUPLE_EXPR:
+        pi_seed_list(&n->tuple_expr.items);
+        return;
+    case AST_TUPLE_TYPE:
+        pi_seed_list(&n->tuple_type.elems);
+        return;
+    case AST_REF_ARG:
+        pi_seed_ast(n->ref_arg.expr);
+        pi_seed_ast(n->ref_arg.decl_type);
+        return;
+    case AST_NAMED_ARG:
+        pi_seed_ast(n->named_arg.expr);
+        return;
+    case AST_COLL_INIT:
+        pi_seed_list(&n->coll_init.items);
+        return;
+
+    /* literals, this/base, goto/label: no children, no names */
+    default:
+        return;
+    }
+}
+
 /* Glob a reached directory (stdlib root + any package providing the
  * namespace) and metadata-scan every file once. Bookkeeping mirrors
  * auto_include_namespace so --list-missing and the install suggestion keep
@@ -1345,10 +1797,10 @@ static void pi_process_dir(pi_dir_t *d, const char *stdlib_root) {
 }
 
 /* One closure round over every reached directory: include files whose
- * top-level names are live (or that host extension methods), flag their
- * identifiers, reach their `using` directories. Returns 1 when anything
- * changed. Newly reached dirs were appended to the list, so the walking
- * pointer picks them up in the same or a later round. */
+ * top-level names are live (or that host extension methods), reach their
+ * `using` directories. Returns 1 when anything changed. Newly reached dirs
+ * were appended to the list, so the walking pointer picks them up in the
+ * same or a later round. */
 static int pi_close_once(const char *stdlib_root) {
     int changed = 0;
     for (pi_dir_t *d = pi_dirs_head; d; d = d->next) {
@@ -1366,8 +1818,6 @@ static int pi_close_once(const char *stdlib_root) {
                 fprintf(stderr, "[pullin] incl %s because %s\n",
                         f->path ? f->path : "?", why ? why : "?");
             changed = 1;
-            for (int k = 0; k < f->ident_count; k++)
-                f->idents[k]->flagged = 1;
             for (int k = 0; k < f->using_count; k++)
                 pi_reach(f->usings[k]);
         }
@@ -1375,8 +1825,133 @@ static int pi_close_once(const char *stdlib_root) {
     return changed;
 }
 
+/* Parse one included file and seed its AST's type-position names. On a
+ * parse failure, fall back to the lexical seeding of the same source: the
+ * closure must not shrink silently, and the main parse loop reports the
+ * error exactly as before. */
+static void pi_parse_and_seed(const char *src, size_t len, int is_entry) {
+    zan_arena_t *arena = zan_arena_new();
+    zan_diag_t *diag = zan_diag_new(arena);
+    zan_lexer_t lex;
+    zan_lexer_init(&lex, src, len, 0, arena, diag);
+    zan_apply_lex_defines(&lex, pi_target, pi_pp_defines, pi_pp_define_count);
+    zan_parser_t p;
+    zan_parser_init(&p, &lex, arena, diag);
+    zan_ast_node_t *unit = zan_parser_parse(&p);
+    int errors = diag ? diag->error_count : 0;
+    zan_diag_free_buffers(diag);
+    if (!unit || errors > 0) {
+        pi_seed_source(src, len);
+    } else {
+        /* entry-file usings reach their directories (stdlib files' usings
+         * are reached by the metadata scan); a static using imports a
+         * TYPE's members, so its trailing segment is a type mention */
+        /* Every segment of a `using` directive or the file's own namespace
+         * is a namespace root: expression chains rooted at one
+         * (`Gui.App.ISqrt`) are qualified mentions and escape a user-declared
+         * shadow via pi_flag_qualified. The lexical seeding marked these
+         * while scanning; the AST path must keep doing it or the escape
+         * never fires (nsresolve's shadow carve-out depends on it). */
+        for (int i = 0; i < unit->comp_unit.usings.count; i++) {
+            zan_ast_node_t *u = unit->comp_unit.usings.items[i];
+            zan_ast_node_t *qn = u ? u->using_decl.name : NULL;
+            if (!qn || qn->kind != AST_QUALIFIED_NAME) continue;
+            for (int k = 0; k < qn->qualified_name.parts.count; k++) {
+                zan_istr_t seg =
+                    qn->qualified_name.parts.items[k]->ident.name;
+                if (!seg.str) continue;
+                pi_name_t *nr = pi_intern(seg.str, (size_t)seg.len);
+                if (nr) nr->ns_root = 1;
+            }
+        }
+        if (unit->comp_unit.ns &&
+            unit->comp_unit.ns->kind == AST_NAMESPACE_DECL) {
+            zan_ast_node_t *qn = unit->comp_unit.ns->namespace_decl.name;
+            if (qn && qn->kind == AST_QUALIFIED_NAME)
+                for (int k = 0; k < qn->qualified_name.parts.count; k++) {
+                    zan_istr_t seg =
+                        qn->qualified_name.parts.items[k]->ident.name;
+                    if (!seg.str) continue;
+                    pi_name_t *nr = pi_intern(seg.str, (size_t)seg.len);
+                    if (nr) nr->ns_root = 1;
+                }
+        }
+        if (is_entry) {
+            for (int i = 0; i < unit->comp_unit.usings.count; i++) {
+                zan_ast_node_t *u = unit->comp_unit.usings.items[i];
+                zan_ast_node_t *qn = u ? u->using_decl.name : NULL;
+                if (!qn || qn->kind != AST_QUALIFIED_NAME) continue;
+                char subdir[1024];
+                size_t used = 0;
+                for (int k = 0; k < qn->qualified_name.parts.count; k++) {
+                    zan_istr_t seg =
+                        qn->qualified_name.parts.items[k]->ident.name;
+                    if (!seg.str) continue;
+                    if (used && used + 1 < sizeof(subdir))
+                        subdir[used++] = '/';
+                    for (unsigned c = 0;
+                         c < seg.len && used + 1 < sizeof(subdir); c++)
+                        subdir[used++] = seg.str[c];
+                }
+                subdir[used] = 0;
+                pi_reach(subdir);
+                if (u->using_decl.is_static &&
+                    qn->qualified_name.parts.count > 0)
+                    pi_flag_istr(qn->qualified_name.parts.items[
+                        qn->qualified_name.parts.count - 1]->ident.name);
+            }
+        }
+        /* top-level declared names of an entry are its OWN declarations:
+         * same-named stdlib files must not be pulled (user_decl), matching
+         * the lexical pass's entry handling */
+        if (is_entry && !pi_seed_stdlib_input) {
+            zan_ast_node_t *ns = unit->comp_unit.ns;
+            const zan_ast_list_t *scopes[2];
+            int scope_count = 0;
+            scopes[scope_count++] = &unit->comp_unit.decls;
+            if (ns && ns->kind == AST_NAMESPACE_DECL)
+                scopes[scope_count++] = &ns->namespace_decl.members;
+            for (int s = 0; s < scope_count; s++) {
+                for (int i = 0; i < scopes[s]->count; i++) {
+                    zan_ast_node_t *d = scopes[s]->items[i];
+                    if (!d || (d->kind != AST_CLASS_DECL && d->kind != AST_STRUCT_DECL &&
+                               d->kind != AST_INTERFACE_DECL &&
+                               d->kind != AST_DELEGATE_DECL))
+                        continue;
+                    /* `name` sits at offset 0 in both union arms */
+                    zan_istr_t name = d->type_decl.name;
+                    if (!name.str || name.len <= 0) continue;
+                    pi_name_t *nm = pi_intern(name.str,
+                                              (size_t)name.len);
+                    if (nm) nm->user_decl = 1;
+                }
+            }
+        }
+        pi_seed_ast(unit);
+    }
+    zan_arena_free(arena);
+}
+
 static void pi_close_all(const char *stdlib_root) {
-    while (pi_close_once(stdlib_root)) {}
+    for (;;) {
+        int changed = pi_close_once(stdlib_root);
+        int seeded = 0;
+        for (pi_dir_t *d = pi_dirs_head; d; d = d->next) {
+            if (!d->reached) pi_process_dir(d, stdlib_root);
+            for (int i = 0; i < d->file_count; i++) {
+                pi_file_t *f = &d->files[i];
+                if (!f->included || f->seeded || !f->path) continue;
+                f->seeded = 1;
+                size_t len = 0;
+                char *src = read_file(f->path, &len);
+                if (!src) continue;
+                pi_parse_and_seed(src, len, 0);
+                free(src);
+                seeded++;
+            }
+        }
+        if (!changed && !seeded) break;
+    }
     if (getenv("ZAN_PULLIN_DEBUG") != NULL) {
         for (pi_dir_t *d = pi_dirs_head; d; d = d->next)
             for (int i = 0; i < d->file_count; i++)
@@ -3089,10 +3664,12 @@ int main(int argc, char **argv) {
             pi_target = target;
             pi_pp_defines = pp_defines;
             pi_pp_define_count = pp_define_count;
+            pi_stdlib_root_buf = stdlib_root;
             for (int fi = 0; fi < input_count; fi++) {
                 /* A saved user component is generator data (consumed inside
                  * zan_gen_design); its JSON has no identifiers to seed. */
                 if (zan_is_zcomp_path(input_files[fi])) continue;
+                pi_seed_stdlib_input = pi_reach_input_dir(input_files[fi]);
                 size_t slen3 = 0;
                 char *src3 = read_file(input_files[fi], &slen3);
                 if (!src3) continue;
@@ -3102,10 +3679,16 @@ int main(int argc, char **argv) {
                     src3 = strdup(design_outs[fi]);
                     owned = src3;
                     if (!src3) { fprintf(stderr, "error: out of memory\n"); return 1; }
+                    /* The generated text differs in length from the .html
+                     * that produced it; like the real parse loop, the length
+                     * must track the buffer actually handed to the lexer
+                     * (a stale raw-file length silently truncates). */
+                    slen3 = strlen(src3);
                 }
-                pi_seed_source(src3, strlen(src3));
+                pi_parse_and_seed(src3, slen3, 1);
                 free(owned ? owned : src3);
             }
+            pi_seed_stdlib_input = 0;
             pi_close_all(stdlib_root);
             pi_append_included(&input_files, &input_count, &input_cap);
         } else {
@@ -3120,6 +3703,7 @@ int main(int argc, char **argv) {
                 /* A saved user component is generator data (consumed inside
                  * zan_gen_design); its JSON has no `using` directives. */
                 if (zan_is_zcomp_path(input_files[fi])) continue;
+                pi_reach_input_dir(input_files[fi]);
                 size_t slen3 = 0;
                 char *src3 = read_file(input_files[fi], &slen3);
                 if (!src3) continue;
