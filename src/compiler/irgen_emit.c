@@ -2454,22 +2454,55 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
      * exists, so a failed body turns a reported error into a compiler crash. */
     if (zan_diag_has_errors(g->diag)) return ZAN_ERROR;
 
-    /* Pass 3: find and emit static Main method */
-    for (int i = 0; i < unit->comp_unit.decls.count; i++) {
-        zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
-        if (decl->kind != AST_CLASS_DECL && decl->kind != AST_STRUCT_DECL) continue;
+    /* Pass 3: find and emit static Main method. An explicit user Main wins
+     * regardless of which input declared it; when no input has one, the
+     * primary design document's __DesignMain fallback (GenForm/GenScene emit
+     * it instead of a Main that would steal the entry from user sources)
+     * becomes the program entry. */
+    {
+        zan_ast_node_t *design_main = NULL;
+        for (int i = 0; i < unit->comp_unit.decls.count; i++) {
+            zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
+            if (decl->kind != AST_CLASS_DECL && decl->kind != AST_STRUCT_DECL)
+                continue;
 
-        for (int j = 0; j < decl->type_decl.members.count; j++) {
-            zan_ast_node_t *member = decl->type_decl.members.items[j];
-            if (member->kind == AST_METHOD_DECL &&
-                (member->method_decl.modifiers & MOD_STATIC) &&
-                member->method_decl.name.len == 4 &&
-                memcmp(member->method_decl.name.str, "Main", 4) == 0) {
-                {
-                    zan_symbol_t *main_type_sym = zan_binder_lookup(g->binder, decl->type_decl.name);
+            for (int j = 0; j < decl->type_decl.members.count; j++) {
+                zan_ast_node_t *member = decl->type_decl.members.items[j];
+                if (member->kind != AST_METHOD_DECL ||
+                    !(member->method_decl.modifiers & MOD_STATIC)) continue;
+                if (member->method_decl.name.len == 4 &&
+                    memcmp(member->method_decl.name.str, "Main", 4) == 0) {
+                    zan_symbol_t *main_type_sym =
+                        zan_binder_lookup(g->binder, decl->type_decl.name);
                     emit_main_method(g, member, main_type_sym, unit);
+                    goto done;
                 }
-                goto done;
+                if (!design_main && member->method_decl.name.len == 12 &&
+                    memcmp(member->method_decl.name.str, "__DesignMain",
+                           12) == 0) {
+                    design_main = member;
+                }
+            }
+        }
+        if (design_main) {
+            /* Re-find the owning type: the walk above kept only the member. */
+            for (int i = 0; i < unit->comp_unit.decls.count; i++) {
+                zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
+                if (decl->kind != AST_CLASS_DECL && decl->kind != AST_STRUCT_DECL)
+                    continue;
+                bool has = false;
+                for (int j = 0; j < decl->type_decl.members.count; j++) {
+                    if (decl->type_decl.members.items[j] == design_main) {
+                        has = true;
+                        break;
+                    }
+                }
+                if (has) {
+                    zan_symbol_t *main_type_sym =
+                        zan_binder_lookup(g->binder, decl->type_decl.name);
+                    emit_main_method(g, design_main, main_type_sym, unit);
+                    break;
+                }
             }
         }
     }

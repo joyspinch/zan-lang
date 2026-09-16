@@ -15,6 +15,15 @@
  * embedded files, or -1 when a spec names nothing readable. */
 int zan_embed_emit_specs(zan_irgen_t *g, const char *const *specs, int count);
 
+/* Same, but for a directory spec only first-level subdirectories named in
+ * `filter` (bare path segments, e.g. "dark") plus the spec root's loose files
+ * are baked; a NULL filter walks everything (the unfiltered behavior). Used by
+ * the Gui skin auto-embed so a zan.proj `skinlist = a,b` ships exactly those
+ * packs + the base.css baseline instead of all 16 stdlib packs. */
+int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
+                                  int count, const char *const *filter,
+                                  int filter_count);
+
 /* Resource-name prefix under which a run-time loaded native driver travels
  * inside the executable ("zan-drivers/<fp>/zan_cef.dll"). The stdlib module that
  * dlopens such a driver writes it out from this name, so the two sides must

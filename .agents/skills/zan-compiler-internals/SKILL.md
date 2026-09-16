@@ -129,9 +129,29 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   设计器生成代码（GenForm）的无条件重家族 using 改为按设计树实际 kind
   发射。实测：空窗 GUI 272→213 文件；NewProject singleFile 发布
   13.4MB→4.38MB（OpenSSL/Chart/DataTable/WebView 全部退出编译图）。
+  **槽反转必须全量清点旧调用点（2026-09-16，conformance_gui_html_runtime
+  连环红）**：`Html.Clone` 直调改 `App.CloneTree` 槽反转（null 槽返
+  null）后，凡是走克隆通道的宿主都得先 `Html.Install()` 注册实现——
+  测试只补了 zform_dynamic/compref_designer，html_runtime_test 漏补，
+  模板行展开拿到 null 行，ChildCount 断言红且行内越界段错误。归因
+  A/B 三步定式：先 stash 自己的编译器改动重跑（排除编译器）、再 stash
+  在途 stdlib 重跑（排除并发在途）、最后 HEAD 全基线复跑定谳"既有红"
+  还是"改造漏网"。凡给"直调 → 槽"的改造收尾，grep 旧函数名的**全部**
+  调用方逐个补 Install，别只补测试清单里点名的那几个。
 - **入口契约陷阱**：设计文档入口生成 `Name.OnLoad(form)` 调用，业务侧
   必须提供同名静态方法；只传 .html 不带同名 code-behind .zan 时报
   "type X has no method OnLoad"——是输入列表不全，不是生成器坏了。
+- **__DesignMain 回退是 irgen 的消费义务，发射端改了消费端必须同窗口
+  落地（2026-09-16，NewProject 发布连爆 undefined main/WinMain）**：
+  GenForm/GenScene 只对主设计稿发射 `__DesignMain`（不是 `Main`，免得
+  偷走用户入口），irgen Pass 3 必须先找显式用户 `Main`、没有才落回
+  `__DesignMain`。两提交只落了发射端，Pass 3 还只认 4 字节 "Main"——
+  设计稿+partial code-behind（无用户 Main）的工程编译通过却链接爆炸
+  （`undefined symbol: main` / `undefined reference to WinMain`）。
+  排查要点：链接期 undefined main 先数一数输入里有没有入口发射
+  （ZAN_KEEP_GEN_REQ=1 看 out.json 里 `__DesignMain`），别往 mingw CRT
+  /subsystem 方向猜。另注意成员名比较的 `len` 要与字面量同步
+  （"__DesignMain" 是 12 字节，写 13 永不命中——静默失配无任何诊断）。
 
 ## delegate 两形态与 wasm32 的 tag 碰撞
 

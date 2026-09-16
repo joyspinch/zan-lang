@@ -84,6 +84,7 @@ typedef struct {
     EGLSurface egl_surf;
     EGLContext egl_ctx;
     ANativeWindow *surf_nw;  /* the surface's window (rotation rebuilds) */
+    int        surf_w, surf_h; /* geometry the EGL surface was created for */
     GLuint     gl_prog;
     GLuint     gl_tex;
     GLuint     gl_vbo;
@@ -461,6 +462,23 @@ static void ant_cmd(struct android_app *app, int32_t cmd) {
             aq_push_locked(7, w, h, 0, 0, 0);
             aq_push_locked(14, 0, 0, 0, 0, 0);
             pthread_mutex_unlock(&g_aq_lock);
+            /* In-place resize: the surface survives but its EGL surface was
+             * created against the old buffer geometry. Mark it stale so the
+             * next present rebuilds (ant_gl_surface re-queries the real
+             * geometry) instead of swapping a wrong-sized buffer forever. */
+            g_anw.surf_w = 0;
+            g_anw.surf_h = 0;
+        }
+        break;
+    case APP_CMD_WINDOW_REDRAW_NEEDED:
+        /* The framework asks for a fresh frame after a surface disturbance it
+         * handled itself (in-place resize, fold/unfold): the surface was NOT
+         * re-INITed, so without this the app idles on its last frame and the
+         * disturbed band stays black until the next touch. */
+        if (g_anw.attached) {
+            pthread_mutex_lock(&g_aq_lock);
+            aq_push_locked(14, 0, 0, 0, 0, 0);
+            pthread_mutex_unlock(&g_aq_lock);
         }
         break;
     case APP_CMD_GAINED_FOCUS:
@@ -605,7 +623,8 @@ static int ant_gl_surface(zan_anw_t *w) {
     EGLint n = 0;
     if (!eglChooseConfig(w->egl_dpy, cfg_attrs, &cfg, 1, &n) || n < 1)
         return 1;
-    if (!w->egl_surf || w->nw != w->surf_nw) {
+    if (!w->egl_surf || w->nw != w->surf_nw
+        || w->w != w->surf_w || w->h != w->surf_h) {
         if (w->egl_surf) {
             eglMakeCurrent(w->egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE,
                            EGL_NO_CONTEXT);
@@ -616,6 +635,25 @@ static int ant_gl_surface(zan_anw_t *w) {
                                              (EGLNativeWindowType)w->nw, NULL);
         if (w->egl_surf == EGL_NO_SURFACE) return 1;
         w->surf_nw = w->nw;
+        /* Record the size the surface ACTUALLY got, not the attached one:
+         * a rotation (or in-place resize) can hand back the same ANativeWindow
+         * whose buffer geometry still reads the old size at INIT/RESIZED time.
+         * Keying the rebuild on w->w alone made a stale surface look current,
+         * the rebuild condition never fired again and every later frame drew
+         * at the old geometry -- a black (or letterboxed) stage for the rest
+         * of the session. The query reads the geometry eglCreateWindowSurface
+         * really used, so a mismatch keeps rebuilding until the geometry has
+         * settled (the OHOS shell's surf_w/surf_h fix, same shape). */
+        EGLint qw = 0, qh = 0;
+        if (eglQuerySurface(w->egl_dpy, w->egl_surf, EGL_WIDTH, &qw)
+            && eglQuerySurface(w->egl_dpy, w->egl_surf, EGL_HEIGHT, &qh)
+            && qw > 0 && qh > 0) {
+            w->surf_w = qw;
+            w->surf_h = qh;
+        } else {
+            w->surf_w = w->w;
+            w->surf_h = w->h;
+        }
         /* Rotation may hand back a *different* EGLDisplay/config: the GL
          * objects below belong to the old context, and a context that
          * survives the swap can still hold textures sized for the old

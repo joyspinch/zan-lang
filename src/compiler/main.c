@@ -574,11 +574,28 @@ static void resolve_package_project_root(const char *input) {
  * Plain "key = value" lines next to the existing name/type/target keys.
  * androidPermissions is a comma-separated list; bare names are prefixed
  * with "android.permission." (full names pass through). CLI overrides
- * (--apk-package/--apk-label) win over the proj file. */
+ * (--apk-package/--apk-label) win over the proj file.
+ *
+ * The same file also decides which Gui skin packs a build bakes in, so a
+ * published app carries the same picker contents on every platform (the IDE's
+ * staged publish has always honored these keys; this makes the bare-CLI and
+ * Android APK paths agree): baseline dark+light + base.css always ship, and
+ * `skins = 1` adds every pack named in `skinlist = a,b,c`. `skins = -` or
+ * `skinlist = -` ships the baseline only (the historical default when the
+ * keys are absent matches the IDE: baseline only). */
 static char proj_android_package[128];
 static char proj_android_label[128];
 static char proj_android_perms[16][128];
 static int proj_android_perm_count = 0;
+static char proj_skin_names[16][64];
+static int proj_skin_name_count = 0;
+static bool proj_skins_enabled = false;
+static bool load_proj_android_keys_done = false;
+/* Filter applied at zan_embed_emit_specs_filtered time: the stdlib skins
+ * folder spec bakes only these pack directories (plus its loose base.css).
+ * NULL = unfiltered, the historical behavior for builds with no zan.proj. */
+static const char **skin_filter = NULL;
+static int skin_filter_count = 0;
 
 static char *proj_trim(char *s) {
     while (*s == ' ' || *s == '\t') s++;
@@ -600,7 +617,9 @@ static void load_proj_android_keys(void) {
         *eq = 0;
         char *key = proj_trim(line);
         char *val = proj_trim(eq + 1);
-        if (strcmp(key, "androidPackage") == 0) {
+        if (strcmp(key, "skins") == 0) {
+            proj_skins_enabled = strcmp(val, "1") == 0;
+        } else if (strcmp(key, "androidPackage") == 0) {
             snprintf(proj_android_package, sizeof(proj_android_package), "%s", val);
         } else if (strcmp(key, "androidLabel") == 0) {
             snprintf(proj_android_label, sizeof(proj_android_label), "%s", val);
@@ -617,6 +636,18 @@ static void load_proj_android_keys(void) {
                         snprintf(dst, 128, "android.permission.%s", p);
                     }
                     proj_android_perm_count++;
+                }
+                tok = strtok_r(NULL, ",", &save);
+            }
+        } else if (strcmp(key, "skinlist") == 0) {
+            char *save = NULL;
+            char *tok = strtok_r(val, ",", &save);
+            while (tok && proj_skin_name_count < 16) {
+                char *p = proj_trim(tok);
+                if (*p && strcmp(p, "-") != 0) {
+                    snprintf(proj_skin_names[proj_skin_name_count],
+                             sizeof(proj_skin_names[0]), "%s", p);
+                    proj_skin_name_count++;
                 }
                 tok = strtok_r(NULL, ",", &save);
             }
@@ -4097,6 +4128,7 @@ int main(int argc, char **argv) {
          * CLI overrides keep precedence. */
         if (project_root_has_manifest()) {
             load_proj_android_keys();
+            load_proj_android_keys_done = true;
             if (!apk_package && proj_android_package[0]) {
                 apk_package = proj_android_package;
             }
@@ -4827,7 +4859,42 @@ int main(int argc, char **argv) {
                         snprintf(skin_spec, strlen(skins_dir) + 32,
                                  "%s=skins", skins_dir);
                         if (embed_spec_count < 64) {
-                            embed_specs[embed_spec_count++] = skin_spec;
+                            int spec_at = embed_spec_count++;
+                            embed_specs[spec_at] = skin_spec;
+                            /* Project skin selection (zan.proj skins/skinlist,
+                             * the same rule the IDE's staged publish applies):
+                             * walk the stdlib packs folder but bake only the
+                             * baseline packs + base.css unless skins=1 widens
+                             * the list with skinlist entries. */
+                            if (!load_proj_android_keys_done &&
+                                project_root_has_manifest()) {
+                                load_proj_android_keys();
+                                load_proj_android_keys_done = true;
+                            }
+                            static const char *baseline[2] = { "dark", "light" };
+                            const char *keep[18];
+                            int keep_count = 0;
+                            for (int b = 0; b < 2; b++) keep[keep_count++] = baseline[b];
+                            if (proj_skins_enabled && proj_skin_name_count > 0) {
+                                for (int k = 0; k < proj_skin_name_count
+                                        && keep_count < 18; k++) {
+                                    bool dup = false;
+                                    for (int j = 0; j < keep_count; j++) {
+                                        if (strcmp(keep[j],
+                                                   proj_skin_names[k]) == 0) {
+                                            dup = true; break;
+                                        }
+                                    }
+                                    if (!dup) keep[keep_count++] = proj_skin_names[k];
+                                }
+                            }
+                            skin_filter = (const char **)malloc(
+                                (size_t)keep_count * sizeof(char *));
+                            if (skin_filter) {
+                                memcpy(skin_filter, keep,
+                                       (size_t)keep_count * sizeof(char *));
+                                skin_filter_count = keep_count;
+                            }
                         } else {
                             fprintf(stderr, "warning: cannot auto-embed Gui "
                                     "skin packs from '%s'; --embed resources "
@@ -4989,7 +5056,8 @@ int main(int argc, char **argv) {
          * The read API is emitted with it -- and also for a program that only
          * calls it -- so no target needs a shipped zan_embed_api object. */
         if (embed_spec_count > 0 || irgen.uses_embed_api) {
-            int nres = zan_embed_emit_specs(&irgen, embed_specs, embed_spec_count);
+            int nres = zan_embed_emit_specs_filtered(&irgen, embed_specs,
+                embed_spec_count, skin_filter, skin_filter_count);
             if (nres < 0) {
                 zan_irgen_destroy(&irgen);
                 zan_arena_free(arena);

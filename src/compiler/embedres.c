@@ -163,6 +163,93 @@ static void embed_walk(zan_embed_list_t *l, const char *dir, const char *name) {
     embed_walk_impl(l, dir, name, 1);
 }
 
+/* Filtered walk: descends only into first-level directories whose name is in
+ * `filter`, always takes the loose files at the top level, and below a kept
+ * pack takes everything (the stdlib GUI skins shape: skins/<pack>/skin.css).
+ * depth 1 == the spec root, mirroring embed_walk. */
+static void embed_walk_filtered_impl(zan_embed_list_t *l, const char *dir,
+                                     const char *name, int depth,
+                                     const char *const *filter,
+                                     int filter_count) {
+    if (depth > EMBED_WALK_MAX_DEPTH) return;
+#ifdef _WIN32
+    char pattern[1024];
+    snprintf(pattern, sizeof(pattern), "%s\\*", dir);
+    wchar_t *wide_pattern = zan_utf8_to_wide_alloc(pattern);
+    if (!wide_pattern) return;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(wide_pattern, &fd);
+    free(wide_pattern);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        char *file_name = zan_wide_to_utf8_alloc(fd.cFileName);
+        if (!file_name) continue;
+        if (strcmp(file_name, ".") == 0 || strcmp(file_name, "..") == 0) {
+            free(file_name);
+            continue;
+        }
+        char path[1024];
+        snprintf(path, sizeof(path), "%s\\%s", dir, file_name);
+        char *sub = embed_join(name, file_name);
+        free(file_name);
+        if (!sub) continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) { free(sub); continue; }
+            int keep = depth == 1 ? 0 : 1;
+            const char *leaf = strrchr(sub, '/');
+            leaf = leaf ? leaf + 1 : sub;
+            for (int f = 0; depth == 1 && f < filter_count; f++) {
+                if (strcmp(filter[f], leaf) == 0) { keep = 1; break; }
+            }
+            if (keep) {
+                if (depth == 1) embed_walk_impl(l, path, sub, depth + 1);
+                else embed_walk_filtered_impl(l, path, sub, depth + 1,
+                                              filter, filter_count);
+            }
+        } else {
+            embed_add_file(l, path, sub);
+        }
+        free(sub);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+#else
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+            continue;
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+        struct stat st;
+        if (lstat(path, &st) != 0) continue;
+        char *sub = embed_join(name, e->d_name);
+        if (!sub) continue;
+        if (S_ISDIR(st.st_mode)) {
+            int keep = depth == 1 ? 0 : 1;
+            const char *leaf = strrchr(sub, '/');
+            leaf = leaf ? leaf + 1 : sub;
+            for (int f = 0; depth == 1 && f < filter_count; f++) {
+                if (strcmp(filter[f], leaf) == 0) { keep = 1; break; }
+            }
+            if (keep) {
+                if (depth == 1) embed_walk_impl(l, path, sub, depth + 1);
+                else embed_walk_filtered_impl(l, path, sub, depth + 1,
+                                              filter, filter_count);
+            }
+        } else if (S_ISREG(st.st_mode)) embed_add_file(l, path, sub);
+        free(sub);
+    }
+    closedir(d);
+#endif
+}
+
+static void embed_walk_filtered(zan_embed_list_t *l, const char *dir,
+                                const char *name,
+                                const char *const *filter, int filter_count) {
+    embed_walk_filtered_impl(l, dir, name, 1, filter, filter_count);
+}
+
 static int embed_is_dir(const char *path) {
 #ifdef _WIN32
     DWORD a = zan_utf8_get_file_attributes(path);
@@ -672,7 +759,21 @@ int zan_embed_driver_spec(const char *path, const char *file, char *out,
     return (n < 0 || (size_t)n >= out_sz) ? -1 : 0;
 }
 
+/* Same as zan_embed_emit_specs, but a directory spec walks only the pack
+ * folders named in `filter` (plus the loose files at the spec root). Names in
+ * the filter are bare path segments: "dark" matches "<path>/dark/skin.css".
+ * A NULL/empty filter walks everything. Returns the same contract. */
+int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
+                                  int count, const char *const *filter,
+                                  int filter_count);
+
 int zan_embed_emit_specs(zan_irgen_t *g, const char *const *specs, int count) {
+    return zan_embed_emit_specs_filtered(g, specs, count, NULL, 0);
+}
+
+int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
+                                  int count, const char *const *filter,
+                                  int filter_count) {
     zan_embed_list_t files;
     memset(&files, 0, sizeof(files));
 
@@ -684,7 +785,11 @@ int zan_embed_emit_specs(zan_irgen_t *g, const char *const *specs, int count) {
         if (eq) { *eq = 0; prefix = eq + 1; }
         if (!prefix || !prefix[0]) prefix = embed_basename(path);
         int before = files.n;
-        if (embed_is_dir(path)) embed_walk(&files, path, prefix);
+        int filtering = filter != NULL && filter_count > 0
+                        && embed_is_dir(path);
+        if (filtering) embed_walk_filtered(&files, path, prefix,
+                                           filter, filter_count);
+        else if (embed_is_dir(path)) embed_walk(&files, path, prefix);
         else embed_add_file(&files, path, prefix);
         if (files.n == before) {
             fprintf(stderr, "error: --embed '%s' matched no readable file\n",

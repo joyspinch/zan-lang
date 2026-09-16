@@ -64,6 +64,13 @@ build/zanc src/main.zan --auto-stdlib --target android-arm64 --emit-apk \
 `--emit-apk` 一条命令完成 编译→打包 SDLActivity 壳→二进制 AXML→签名
 （需要 JAVA_HOME 指向 JDK；`--apk-package`/`--apk-label` 定应用 ID 与名称）。
 
+**工程键（zan.proj）在所有构建路径一致生效**：`androidPackage`/
+`androidLabel`/`androidPermissions`（逗号分隔，裸名自动补
+`android.permission.` 前缀）只在缺省时被 CLI 覆盖项顶掉；`skins`/`skinlist`
+决定 GUI 皮肤基线烤入——`skins = 1` 时烤 `skinlist` 列出的 pack（逗号
+分隔，`-` 表示清空），否则只烤基线 dark+light（base.css 恒烤）。裸 CLI
+与 `--emit-apk` 均按此收敛，与 IDE 暂存发布的 CopyThemeSkins 同规则。
+
 ### 1.4 库与工具通道
 
 ```bash
