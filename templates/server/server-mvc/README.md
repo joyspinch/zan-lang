@@ -513,6 +513,20 @@ nothing is dropped or rewritten. Every designed table is immediately usable in
 the generic data manager (`/admin/monitor/data?t=...`) before any code
 generation.
 
+**生成代码 writes 8 files** — model (`src/Model/Gen/<Entity>.zan`), admin
+controller (`src/Controller/Admin/<Entity>.zan`), Dao
+(`src/Dao/Gen/<Entity>Dao.zan`), admin list + form views, and a public
+front-facing trio: controller (`src/Controller/Front/<Entity>Front.zan`,
+anonymous-readable list + detail shaped like `Blog.Posts` — writes stay in the
+admin area) plus its list and detail views. Output root follows the
+`gen.root` site setting (default `..`, i.e. the sources of the running
+server); all directories are created recursively. Preview
+(`/admin/dev/coder/preview`) renders the eight sources in tabs before
+writing anything. Generated code follows the hand-written module shape
+(attribute routing, `AppController` lease, view keys
+`<Module>.<Controller>.<Action>`), so it composes with layout, i18n and the
+permission index unchanged.
+
 **AI 生成字段** — on the field-design screen, describe the business in one
 sentence and the configured AI provider drafts the whole column list (names,
 Chinese labels, kinds, widgets, dict/relation suggestions, list/filter/edit

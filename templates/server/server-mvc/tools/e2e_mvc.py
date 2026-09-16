@@ -220,7 +220,9 @@ class Catcher:
 # ---- lifecycle -------------------------------------------------------------
 
 def build_exe():
-    zanc = os.path.join(REPO, "build", "zanc.exe")
+    # ZANC 覆盖：编译器车道在途重建 build/zanc.exe 时，用已知好二进制跑本套件
+    # （例：ZANC=_scratch/wt_xxx/build/zanc.exe）。缺省仍取 build/zanc.exe。
+    zanc = os.environ.get("ZANC") or os.path.join(REPO, "build", "zanc.exe")
     if not os.path.exists(zanc):
         print("zanc not found at", zanc)
         sys.exit(2)
@@ -555,6 +557,33 @@ def run_matrix(catcher):
     ok(code == 200 and "e2e_demo" in body, "generic data manager 200")
     code, body, _ = http("/admin/dev/coder/preview?id=%d" % tid, cookie=cookie)
     ok(code == 200 and "e2e_demo" in body, "preview generates code")
+    ok("FrontControllerSource" not in body
+       and "namespace ZanWeb.Front" in body
+       and "FrontListViewSource" not in body,
+       "preview contains front controller")
+    # 生成代码：默认 gen.root=".."，沙箱里落到 templates/server/ 上一级，
+    # 显式把 gen.root 指到 _scratch/genroot 再验证产物。
+    r = http("/admin/system/settings/save", cookie=cookie,
+             data={"gen.root": os.path.join(SANDBOX, "genroot")})
+    ok(r[0] in (200, 301, 302), "gen.root saved")
+    r = http("/admin/dev/coder/build", cookie=cookie, data={"id": tid})
+    ok(code_of(r[1]) == "0000", "build writes sources")
+    gr = os.path.join(SANDBOX, "genroot")
+    gen_files = [
+        os.path.join(gr, "src", "Model", "Gen", "E2eDemo.zan"),
+        os.path.join(gr, "src", "Controller", "Admin", "E2eDemo.zan"),
+        os.path.join(gr, "src", "Dao", "Gen", "E2eDemoDao.zan"),
+        os.path.join(gr, "views", "Admin", "E2eDemo.Index.html"),
+        os.path.join(gr, "views", "Admin", "E2eDemo.Form.html"),
+        os.path.join(gr, "src", "Controller", "Front", "E2eDemoFront.zan"),
+        os.path.join(gr, "views", "Front", "E2eDemoFront.Index.html"),
+        os.path.join(gr, "views", "Front", "E2eDemoFront.Show.html"),
+    ]
+    ok(all(os.path.isfile(p) for p in gen_files), "all 8 generated files exist")
+    fctl = open(gen_files[5], encoding="utf-8").read() if os.path.isfile(
+        gen_files[5]) else ""
+    ok("CustomAuthorization.None" in fctl and "/e2e_demo" in fctl.replace('\"', '"'),
+       "front controller is public and routed")
     r = http("/admin/dev/coder/tabledelete", cookie=cookie, data={"id": tid})
     ok(r[0] in (200, 301, 302), "design deleted")
     ok(not sql("SELECT 1 FROM sys_gen_table WHERE id=?", (tid,)),
