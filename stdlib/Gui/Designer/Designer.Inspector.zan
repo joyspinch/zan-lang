@@ -85,6 +85,10 @@ partial class Designer {
         selPrev = f;
         inspKeySeq = inspKeySeq + 1;
         optInput.SetText("");
+        // 表格的行实体（extra["of"]）读进检查器暂存，属性表经
+        // 绑定写 ofEd，渲染后差量写回 extra。
+        ofEd = "";
+        if (f.extra != null) { ofEd = f.extra.Str("of", ""); }
         List<string> evs = f.Events();
         if (evs.Count > 0) { evtEditing = evs[0]; } else { evtEditing = ""; }
         evtInput.SetText(f.GetHandler(evtEditing));
@@ -233,6 +237,18 @@ partial class Designer {
             don.flag = f.defOn;
             ps.Add(don);
         }
+        if (f.ftype == 23 || f.ftype == 41) {
+            // 行实体：声明式列（extra["columns"]）的类型化访问器读
+            // 它的字段（GenForm 生成 `__r => __r.<field>`），列属性
+            // 弹窗里配了列类型/可编辑时必填。
+            PropSpec ofr = PropSpec.Text("of",
+                Designer.T("Row entity (of)", "行实体 (of)"));
+            ofr.str = ofEd;
+            ofr.tip = Designer.T(
+                "Row entity type for declarative columns; column accessors read its fields (required for typed/editable columns).",
+                "声明式列的行实体类型；列访问器读取它的字段（列配了类型/可编辑时必填）。");
+            ps.Add(ofr);
+        }
         return ps;
     }
 
@@ -257,6 +273,17 @@ partial class Designer {
         f.name = f.fname;
         if (f.span < 1) { f.span = 1; }
         if (f.span > 24) { f.span = 24; }
+        // 行实体写回 extra["of"]：空值且原来也没设就不动文档。
+        if (f.ftype == 23 || f.ftype == 41) {
+            string ofCur = f.extra == null ? "" : f.extra.Str("of", "");
+            string ofNew = StyleSheet.Trim(ofEd);
+            if (ofNew != ofCur) {
+                if (f.extra == null) { f.extra = JsonValue.NewObject(); }
+                if (ofNew == "") { Designer.DropKey(f.extra, "of"); }
+                else { f.extra.Put("of", JsonValue.NewStr(ofNew)); }
+                app.RequestRedraw();
+            }
+        }
 
         // STYLE（CSS 声明行）：一行一条声明，与元素 style 属性同一
         // 语义（键: 值）。每帧重组回 f.styleText（空行跳过），画布
@@ -335,7 +362,10 @@ partial class Designer {
                 }
                 Label blb = new Label(Designer.T("WIDGET PROPS", "组件属性"));
                 blb.Class = "tertiary small";
-                blb.RenderInside(app, new Rect(ix, iy, iw, app.Scale(18)));
+                blb.RenderInside(app, new Rect(ix, iy, iw - app.Scale(76), app.Scale(18)));
+                int pbigId = SmallBtn(app, Designer.T("Edit…", "编辑…"), 0,
+                    ix + iw - app.Scale(72), iy - app.Scale(2), app.Scale(72));
+                if (Ui.Clicked(app, pbigId)) { this.OpenPropsEditor(app, f); }
                 iy = iy + app.Scale(20);
                 for (int bi = 0; bi < brows.Count; bi = bi + 1) {
                     int bar = brows[bi].IndexOf("|");
@@ -443,7 +473,12 @@ partial class Designer {
             if (table) { head = Designer.T("COLUMNS (title · field)", "列（标题 · 字段）"); }
             Label hl = new Label(head);
             hl.Class = "tertiary small";
-            hl.RenderInside(app, new Rect(ix, iy, iw, app.Scale(18)));
+            hl.RenderInside(app, new Rect(ix, iy, iw - app.Scale(76), app.Scale(18)));
+            // 弹窗大编辑器：面板太窄放不下完整表格（工具条还要
+            // 编辑图标/靠右/分隔条），行批量编辑在这里做。
+            int bigId = SmallBtn(app, Designer.T("Edit…", "编辑…"), 0,
+                ix + iw - app.Scale(72), iy - app.Scale(2), app.Scale(72));
+            if (Ui.Clicked(app, bigId)) { this.OpenRowsEditor(app, f); }
             iy = iy + app.Scale(20);
             for (int oi = 0; oi < f.OptionCount(); oi = oi + 1) {
                 string disp = f.OptionAt(oi);
@@ -492,6 +527,8 @@ partial class Designer {
     /// 让 Tabs 容器的活动标签/子标签超出范围）。
     void RemoveOptionFixup(FormField f, int oi) {
         f.RemoveOptionAt(oi);
+        // 列属性条目跟着走（extra["columns"] 与 options 下标对齐）。
+        Designer.RemoveColEntry(f, oi);
         if (f.kind == "Tabs") {
             for (int ki = 0; ki < f.kids.Count; ki = ki + 1) {
                 if (f.kids[ki].childTab == oi) { f.kids[ki].childTab = 0; }
@@ -1498,6 +1535,15 @@ partial class Designer {
             for (int k = 0; k < opts.Count(); k = k + 1) {
                 f.AddOption(opts.At(k).AsString(""));
             }
+        }
+        // 列声明（extra["columns"]）顺序对齐 options：设计器以
+        // options 为列序真相，GenForm 先行的设计稿里两者可能不同
+        // 序。条目数可以少于 options（缺 = 全缺省）；对齐后的数组
+        // 写回 o，随 UnmodeledKeys 进 extra，未匹配条目保留尾部。
+        JsonValue cols0 = o.Get("columns");
+        if (opts != null && opts.IsArray() && opts.Count() > 0
+                && cols0 != null && cols0.IsArray()) {
+            o.Set("columns", Designer.NormalizedColumns(f, cols0));
         }
         JsonValue kids = o.Get("kids");
         if (kids != null && kids.IsArray()) {

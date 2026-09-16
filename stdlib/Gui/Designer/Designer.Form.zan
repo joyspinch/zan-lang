@@ -1208,6 +1208,10 @@ partial class Designer {
     void RenderDesignCanvas(App app, Canvas c, Theme t, int cx, int cy, int cw, int ch) {
         int fs = Style.FontFallback(app, "small");
         bool free = layoutMode == 1;
+        // 大编辑器窗口开着时画布的裸指针路径整体让位：窗口矩形只
+        // 护得住走命中测试的控件，选中/拖拽/滚轮这些直接读指针
+        // 事件的路径会从窗口底下穿透到画布。
+        bool locked = this.BigEditorOpen();
         c.FillRoundRect(cx, cy, cw, ch, app.Scale(6), Style.Full(app, "designer", "", "", Style.SNormal()).BgOr(0));
         c.DrawRoundRect(cx, cy, cw, ch, app.Scale(6), Style.Full(app, "designer", "", "", Style.SNormal()).BorderOr(0), 1);
 
@@ -1317,7 +1321,8 @@ partial class Designer {
 
         // Ctrl+滚轮以当前缩放级别为中心缩放画布（Fit 从
         // 实际适配比例起步，因此从 Fit 缩出时平滑）。
-        if (InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)
+        // 编辑器窗口开着时让位（locked），滚轮别穿透到画布。
+        if (!locked && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)
                 && Modifiers.HasCtrl(app.window.EventMods())) {
             if (app.CaptureWheel(inX, inY, inW, inH)) {
                 int wdelta = app.window.EventKeyCode();
@@ -1330,7 +1335,7 @@ partial class Designer {
                 winZoom = z;
                 app.RequestRedraw();
             }
-        } else if (InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)) {
+        } else if (!locked && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)) {
             // 普通滚轮垂直平移，Shift+滚轮水平平移。
             if (app.CaptureWheel(inX, inY, inW, inH)) {
                 int wdelta = app.window.EventKeyCode();
@@ -1348,7 +1353,7 @@ partial class Designer {
 
         // 抓手：中键在视口任意处按下即抓住画布拖动，
         // 和场景设计器一致（左键留给选择和框选）。
-        if (ek == 2 && app.window.EventButton() == 2
+        if (!locked && ek == 2 && app.window.EventButton() == 2
                 && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)) {
             freePanning = true;
             freePanSX = app.mouseX;
@@ -1437,7 +1442,7 @@ partial class Designer {
         // 抓手模式：左键在面板任意处按下即拖动画布，
         // 选择/框选/调整大小全部让位。
         if (freeHand) { freeDragging = false; freeResizing = false; freeMarquee = false; }
-        if (freeHand && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)) {
+        if (!locked && freeHand && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)) {
             Window.SetCursor(1);
             if (ek == 2 && app.window.EventButton() == 0) {
                 freePanning = true;
@@ -1449,8 +1454,8 @@ partial class Designer {
         }
 
         // 指针按下：选中的调整大小手柄优先，否则选择并
-        // 开始拖拽；按在空白处清除选择。
-        if (!freeHand && !dragging && ek == 2 && app.window.EventButton() == 0
+        // 开始拖拽；按在空白处清除选择。编辑器窗口开着时让位。
+        if (!locked && !freeHand && !dragging && ek == 2 && app.window.EventButton() == 0
                 && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)) {
             bool started = false;
             // 拖拽基先对齐当前选中项：框选/撤销/换父之后存的旧基
@@ -2501,11 +2506,36 @@ partial class Designer {
             return;
         }
         if (ft == 53) {                      // Ribbon 工具栏
-            List<RibbonCmd> cmds = new List<RibbonCmd>{
-                RibbonCmd.Group("save", Designer.T("Save", "保存")),
-                new RibbonCmd("copy", Designer.T("Copy", "复制")),
-                new RibbonCmd("paste", Designer.T("Paste", "粘贴")),
-                new RibbonCmd("cut", Designer.T("Cut", "剪切")) };
+            // 画布预览跟随设计：选项为空给一组示例命令，有选项时
+            // 每项 "图标|标题"（与 ToolStrip 的 标题:图标 同语义、
+            // 顺带兼容 "标题" 单段），分隔条 "-" 画成分组线。
+            List<RibbonCmd> cmds = new List<RibbonCmd>();
+            if (f.OptionCount() == 0) {
+                cmds.Add(RibbonCmd.Group("save", Designer.T("Save", "保存")));
+                cmds.Add(new RibbonCmd("copy", Designer.T("Copy", "复制")));
+                cmds.Add(new RibbonCmd("paste", Designer.T("Paste", "粘贴")));
+                cmds.Add(new RibbonCmd("cut", Designer.T("Cut", "剪切")));
+            } else {
+                for (int i = 0; i < f.OptionCount(); i = i + 1) {
+                    string it = f.OptionAt(i);
+                    if (it == "-") { continue; }
+                    string icon = it;
+                    string text = it;
+                    int p = Designer.IndexOfColon(it);
+                    if (p > 0) {
+                        icon = it.Substring(0, p);
+                        text = it.Substring(p + 1, it.Length - p - 1);
+                    }
+                    if (i == 0 || cmds.Count == 0) {
+                        cmds.Add(RibbonCmd.Group(icon, text));
+                    } else {
+                        cmds.Add(new RibbonCmd(icon, text));
+                    }
+                }
+                if (cmds.Count == 0) {
+                    cmds.Add(RibbonCmd.Group("file", f.label));
+                }
+            }
             Ribbon.Render(app, x, y, w, Ribbon.Height(app), cmds);
             return;
         }
@@ -2774,7 +2804,12 @@ partial class Designer {
             string h = "Col " + Convert.ToString(i + 1);
             if (i < f.OptionCount()) { h = Designer.ColTitle(f.OptionAt(i)); }
             cols.Add(h);
-            widths.Add(colW);
+            // 声明了列宽（extra["columns"][i].width）就用声明值，
+            // 没声明的列均分剩余宽度（0/缺省 = 自适应）。
+            int wv = 0;
+            JsonValue ce = Designer.ColEntry(f, i);
+            if (ce != null) { wv = ce.Int("width", 0); }
+            widths.Add(wv > 0 ? PvS(app, wv) : colW);
             cells.Add("—");
         }
         int totalW = colW * nc;
