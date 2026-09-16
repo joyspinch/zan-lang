@@ -971,6 +971,13 @@ typedef struct {
      * does not own the value. A `foreach` loop variable borrows its element
      * from the collection, so the coroutine's cleanup must not release it. */
     bool         no_arc;
+    /* The declaration (or foreach/catch) node this slot was scanned from.
+     * Every declaration owns its own slot and binding finds it by NODE, so
+     * same-named shadowing declarations never alias each other's storage
+     * (A31x: name-dedup let a `string k` declared after a `foreach (k ...)`
+     * bind through the loop's borrowed-element slot, and its first
+     * capture-release freed the collection's internal key). */
+    zan_ast_node_t *decl;
 } async_local_t;
 
 typedef struct {
@@ -1016,11 +1023,16 @@ static bool async_type_is_frame_resident(LLVMTypeRef t) {
 static void async_scan_expr(async_scan_t *s, zan_ast_node_t *e);
 static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st);
 
-static void async_scan_add_local(async_scan_t *s, zan_istr_t name, LLVMTypeRef llvm, zan_type_t *zt) {
+static void async_scan_add_local(async_scan_t *s, zan_istr_t name, LLVMTypeRef llvm,
+                                 zan_type_t *zt, zan_ast_node_t *decl) {
     for (int i = 0; i < s->local_count; i++) {
-        if (s->locals[i].name.len == name.len &&
-            memcmp(s->locals[i].name.str, name.str, name.len) == 0) {
-            return; /* dedup by name (flat scope) */
+        if (decl) {
+            /* Key slots by declaration NODE: two same-named declarations are
+             * two variables and each gets its own frame slot. */
+            if (s->locals[i].decl == decl) return;
+        } else if (s->locals[i].name.len == name.len &&
+                   memcmp(s->locals[i].name.str, name.str, name.len) == 0) {
+            return; /* compiler-generated ($-prefixed) names are unique */
         }
     }
     if (s->local_count >= s->local_cap) {
@@ -1036,6 +1048,7 @@ static void async_scan_add_local(async_scan_t *s, zan_istr_t name, LLVMTypeRef l
     s->locals[s->local_count].ztype = zt;
     s->locals[s->local_count].frame_index = -1;
     s->locals[s->local_count].no_arc = false;
+    s->locals[s->local_count].decl = decl;
     s->local_count++;
 }
 
@@ -1051,8 +1064,8 @@ static zan_istr_t async_synth_name(zan_irgen_t *g, const char *prefix, int n) {
 }
 
 static void async_scan_add_storage_local(async_scan_t *s, zan_istr_t name,
-                                         LLVMTypeRef llvm) {
-    async_scan_add_local(s, name, llvm, NULL);
+                                         LLVMTypeRef llvm, zan_ast_node_t *decl) {
+    async_scan_add_local(s, name, llvm, NULL, decl);
     if (s->local_count > 0) s->locals[s->local_count - 1].no_arc = true;
 }
 
@@ -1235,7 +1248,7 @@ static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
         if (t && t->kind != TYPE_ERROR) {
             LLVMTypeRef lt = map_type(s->g, t);
             if (async_type_is_frame_resident(lt))
-                async_scan_add_local(s, st->var_decl.name, lt, t);
+                async_scan_add_local(s, st->var_decl.name, lt, t, st);
             async_scan_note_type(s, st->var_decl.name, t);
         }
         async_scan_expr(s, st->var_decl.initializer);
@@ -1284,13 +1297,13 @@ static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
             LLVMTypeRef lt = map_type(s->g, et);
             /* the element is borrowed from the collection: storage only */
             if (async_type_is_frame_resident(lt))
-                async_scan_add_storage_local(s, st->foreach_stmt.var_name, lt);
+                async_scan_add_storage_local(s, st->foreach_stmt.var_name, lt, st);
             async_scan_note_type(s, st->foreach_stmt.var_name, et);
         }
         async_scan_add_storage_local(s, async_synth_name(s->g, "fe.i", fe_id),
-            LLVMInt64TypeInContext(s->g->ctx));
+            LLVMInt64TypeInContext(s->g->ctx), NULL);
         async_scan_add_storage_local(s, async_synth_name(s->g, "fe.c", fe_id),
-            LLVMPointerType(LLVMInt8TypeInContext(s->g->ctx), 0));
+            LLVMPointerType(LLVMInt8TypeInContext(s->g->ctx), 0), NULL);
         if (foreach_proto_enum_type(s->g,
                 infer_expr_type(s->g, st->foreach_stmt.collection, s->scope)))
             /* protocol enumerator: lives for the whole loop, survives a
@@ -1298,7 +1311,7 @@ static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
              * bitcast back by the emitter) */
             async_scan_add_storage_local(s,
                 async_synth_name(s->g, "fe.e", fe_id),
-                LLVMPointerType(LLVMInt8TypeInContext(s->g->ctx), 0));
+                LLVMPointerType(LLVMInt8TypeInContext(s->g->ctx), 0), NULL);
         async_scan_stmt(s, st->foreach_stmt.body);
         break;
     }
@@ -1315,7 +1328,7 @@ static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
              * slot owns the object, this binding only borrows it */
             if (cc->catch_clause.var_name.len > 0) {
                 async_scan_add_storage_local(s, cc->catch_clause.var_name,
-                    LLVMPointerType(LLVMInt8TypeInContext(s->g->ctx), 0));
+                    LLVMPointerType(LLVMInt8TypeInContext(s->g->ctx), 0), cc);
                 if (cc->catch_clause.type)
                     async_scan_note_type(s, cc->catch_clause.var_name,
                         resolve_type_ctx(s->g, cc->catch_clause.type));

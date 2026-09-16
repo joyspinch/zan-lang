@@ -526,26 +526,19 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
          * just evaluate the initializer and store into it. */
         if (g->current_async_frame && g->current_async_slot_count > 0) {
             /* Bind this declaration to ITS OWN frame slot, keyed by the AST
-             * node the scan registered. A name lookup is wrong whenever more
-             * than one same-named declaration is frame-resident: it returns
-             * whichever entry sits last in the flat list, so a
-             * `foreach (string k in ...)` followed by `string k = keys[i]`
-             * left the second k on a plain stack alloca -- dead across the
-             * next suspension. */
+             * node the scan registered (A31x: one slot per declaration). A
+             * name lookup is wrong whenever more than one same-named
+             * declaration is frame-resident; name-dedup also let a `string k`
+             * declared after a `foreach (string k ...)` bind through the
+             * loop's borrowed-element slot, so its first capture-release
+             * freed the collection's internal key (async_shadow segfault,
+             * A321 transport corruption). */
             local_var_t *pre = local_find_async_decl(locals, stmt);
-            /* The scan side that keys frame slots by declaration node is not
-             * landed yet -- nothing sets local_var_t.async_decl, so the node
-             * lookup always misses. Fall back to the name lookup (the
-             * pre-A31x behavior): without it every async local skips
-             * frame-slot reuse and its storage dies across the next
-             * suspension (use-after-free in await-heavy code, A318 soak).
-             * Once the scan lands, the node match wins and this goes quiet. */
-            if (!pre) pre = local_find(locals, stmt->var_decl.name);
             if (pre) {
+                int pre_idx = (int)(pre - locals->vars);
                 /* Resolve this declaration's own type -- explicitly written or
                  * inferred from its initializer -- before deciding whether it
-                 * may reuse the frame slot a previous same-named declaration
-                 * scanned into the frame struct. */
+                 * may reuse the frame slot the scan registered for it. */
                 zan_type_t *type = stmt->var_decl.type
                     ? resolve_type_ctx(g, stmt->var_decl.type)
                     : NULL;
@@ -610,21 +603,23 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                             stmt->var_decl.initializer &&
                             call_targets_extern(g, stmt->var_decl.initializer))
                             pre->opaque_string = 1;
-                        /* Ownership deliberately STAYS on the pre-added slot
-                         * entry (async protocol: capture-release at every
+                        /* Name visibility starts at bind time: add a
+                         * release-inert alias pointing at THIS declaration's
+                         * slot so reads and assignments inside this scope
+                         * resolve to this storage, and scope truncation
+                         * restores the outer binding on exit. The alias never
+                         * owns (arc_owned stays 0, so every release walk
+                         * skips it -- ownership deliberately STAYS on the
+                         * pre-added slot entry: capture-release at every
                          * store, one release of the final value at coroutine
-                         * completion). Adding a name-visible runtime entry
-                         * here -- owned or not -- pushes loop-body
-                         * declarations onto the sync walker protocol whose
-                         * release walks then fight the frame protocol
-                         * (truncated entries skipped by completion, dangling
-                         * re-releases), corrupting the heap in await-heavy
-                         * code. Same-named shadowing reads resolve to the
-                         * innermost remaining entry: correct for the
-                         * declare-after-foreach shape, and memory-safe
-                         * everywhere (every slot is frame-resident and
-                         * null-initialized); full scope-correct shadowing
-                         * needs the sync-uniform slot registry (TASKS A31x). */
+                         * completion, abandonment releases from the frame
+                         * fields). Assignments through the alias route their
+                         * capture-release to the slot entry via frame_owner;
+                         * a plain store here would leak the previous
+                         * occupant on every re-assignment. */
+                        local_add(locals, stmt->var_decl.name,
+                                  locals->vars[pre_idx].alloca, type);
+                        locals->vars[locals->count - 1].frame_owner = pre_idx;
                         return;
                     }
                 }
@@ -2476,13 +2471,10 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                      * scan) whenever the method has one */
                     LLVMValueRef ea = NULL;
                     if (g->current_async_frame) {
+                        /* the scan registered this handler's binding slot
+                         * under THIS catch node (storage-only, ztype NULL);
+                         * node lookup cannot alias a same-named user local */
                         local_var_t *fv = local_find_async_decl(locals, cc);
-                        /* Scan side not landed yet (nothing sets async_decl):
-                         * fall back to the name lookup the scan registered,
-                         * else the handler binding lands on a fresh stack
-                         * alloca that holds garbage after a resume. */
-                        if (!fv)
-                            fv = local_find(locals, cc->catch_clause.var_name);
                         if (fv && !fv->type &&
                             LLVMGetTypeKind(local_slot_type(g, fv)) == LLVMPointerTypeKind)
                             ea = fv->alloca;
@@ -2770,11 +2762,11 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
              * foreach registered (keyed by this statement node, ztype NULL);
              * same-named user declarations own separate slots and must not be
              * aliased */
+            /* the loop variable's frame slot is the storage-only one THIS
+             * foreach registered (keyed by this statement node, ztype NULL);
+             * same-named user declarations own separate slots and must not be
+             * aliased (A31x) */
             local_var_t *ev = local_find_async_decl(locals, stmt);
-            /* Scan side not landed yet (nothing sets async_decl): fall back
-             * to the storage-only slot the scan registered by name, else the
-             * iteration variable loses its frame slot across suspensions. */
-            if (!ev) ev = local_find(locals, stmt->foreach_stmt.var_name);
             if (ev && !ev->type && LLVMGetTypeKind(elem_llvm) ==
                     LLVMGetTypeKind(local_slot_type(g, ev)))
                 iter_alloc = ev->alloca;

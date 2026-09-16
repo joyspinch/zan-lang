@@ -3052,6 +3052,26 @@ binding_lowered:
             } else if (local && local_slot_owns_rc(local)) {
                 /* ARC: release the previous occupant and retain the new one. */
                 emit_rc_capture_local(g, local->type, local->alloca, right, expr->binary.right, locals);
+            } else if (local && local->frame_owner >= 0) {
+                /* An async frame-slot alias (A31x): the storage lives in the
+                 * frame and the slot entry owns it, so route the
+                 * capture-release there -- a plain store through the alias
+                 * would leak the previous occupant on every re-assignment.
+                 * Only rc-managed pointer slots take the capture path: the
+                 * RHS may be wider than the slot (an i64 add lowered before
+                 * the int store), and a capture-store of that width into a
+                 * scalar alloca smashes the neighbouring slots. */
+                local_var_t *owner = &locals->vars[local->frame_owner];
+                if (owner->type && is_rc_managed_type(owner->type) &&
+                    LLVMGetTypeKind(local_slot_type(g, owner)) ==
+                        LLVMPointerTypeKind) {
+                    emit_rc_capture_local(g, owner->type, owner->alloca, right,
+                                          expr->binary.right, locals);
+                } else {
+                    LLVMValueRef sv = coerce_int_to(g, right,
+                        local_slot_type(g, owner));
+                    zan_store_fit(g, sv, owner->alloca);
+                }
             } else if (local) {
                 LLVMValueRef sv = coerce_int_to(g, right,
                     local_slot_type(g, local));

@@ -807,7 +807,30 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         }
         for (int k = 0; k < alocal_count; k++) {
             LLVMValueRef la = LLVMBuildAlloca(g->builder, w->alocals[k].llvm, "fl");
-            local_add(locals, w->alocals[k].name, la, w->alocals[k].ztype);
+            /* USER-declaration slots carry a $-prefixed scope name so they are
+             * invisible to by-name lookup: user visibility starts when the
+             * declaration BINDS and adds its own entry (the alias), so a
+             * same-named declaration later in the method can never shadow an
+             * earlier loop's variable from the prologue on. SYNTH slots
+             * ($fe.*) keep their names -- the foreach lowering looks them up
+             * by name to wire col_slot/idx_alloc/enum_slot. */
+            zan_istr_t fname;
+            if (w->alocals[k].decl) {
+                char flbuf[80];
+                int fln = snprintf(flbuf, sizeof(flbuf), "$fl%d.%s", k,
+                    w->alocals[k].name.str ? w->alocals[k].name.str : "l");
+                char *fp = (char *)zan_arena_alloc(g->arena, (size_t)fln + 1);
+                memcpy(fp, flbuf, (size_t)fln + 1);
+                fname.str = fp;
+                fname.len = (uint32_t)fln;
+            } else {
+                fname = w->alocals[k].name;
+            }
+            local_add(locals, fname, la, w->alocals[k].ztype);
+            /* A31x write side: tag the slot with the declaration node the
+             * scan registered it from; binding resolves its own slot by
+             * node (local_find_async_decl) instead of by name. */
+            locals->vars[locals->count - 1].async_decl = w->alocals[k].decl;
             /* Every pointer-shaped frame slot is null-initialized HERE, in the
              * entry block, regardless of arc ownership (A300): entry statically
              * dominates the co.exc landing pad (longjmp is not a CFG edge, so

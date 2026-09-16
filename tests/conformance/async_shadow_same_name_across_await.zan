@@ -1,0 +1,43 @@
+// A30x regression, async frame slots: the frame-slot scan deduped same-named
+// locals by NAME, so a declaration shadowing a foreach variable kept a plain
+// stack alloca and read freed-stack garbage across the next suspension (the
+// server template died in Dict.Remove on the wild key). Every declaration now
+// owns its own frame slot; key and value must both survive the await.
+using System;
+using System.Collections.Generic;
+
+class Program {
+    static Dict<string, string> kv = new Dict<string, string>();
+    static Dict<string, bool> dirty = new Dict<string, bool>();
+
+    static void Set(string key, string v) {
+        kv[key] = v;
+        dirty[key] = true;
+    }
+
+    static async int FlushAll() {
+        if (dirty.Count == 0) { return 0; }
+        List<string> keys = new List<string>();
+        foreach (string k in dirty.Keys) { keys.Add(k); }
+        int removed = 0;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            string k = keys[i];
+            string v = null;
+            if (!kv.TryGetValue(k, out v)) { continue; }
+            await Task.Delay(1);
+            if (v == kv[k]) { removed = removed + 1; }
+            dirty.Remove(k);
+        }
+        return removed;
+    }
+
+    static async void Main() {
+        Set("sup.atk.owner", "a");
+        Set("sup.atk.value", "b");
+        Set("city.1.owner", "c");
+        int removed = await FlushAll();
+        Console.WriteLine("removed=" + Convert.ToString(removed)
+            + " dirty=" + Convert.ToString(dirty.Count)
+            + " kv=" + Convert.ToString(kv.Count));
+    }
+}

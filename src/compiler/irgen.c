@@ -3878,9 +3878,15 @@ typedef struct {
     /* Non-NULL only on the pre-added async frame-slot entries: the declaration
      * node the slot was scanned from. Binding looks the slot up by node, never
      * by name, so same-named shadowing declarations cannot alias each other's
-     * storage. Reads still resolve by name through the runtime entry each
+     * storage. Reads resolve by name through the runtime entry each
      * declaration adds when it binds, keeping scope truncation semantics. */
     zan_ast_node_t *async_decl;
+    /* Index of the pre-added frame-slot entry a bind-time name entry aliases,
+     * -1 otherwise. The alias itself is release-inert (arc_owned stays 0: the
+     * frame protocol owns the storage and releases it exactly once), so an
+     * assignment through the alias must route its capture-release to the slot
+     * entry via this index rather than rely on its own ownership flags. */
+    int frame_owner;
 } local_var_t;
 
 /* A function's locals live in a single flat scope. The backing array grows
@@ -3943,6 +3949,7 @@ static void local_add(local_scope_t *scope, zan_istr_t name, LLVMValueRef alloca
     scope->vars[scope->count].opaque_string = 0;
     scope->vars[scope->count].obj_rc_flag = NULL;
     scope->vars[scope->count].async_decl = NULL;
+    scope->vars[scope->count].frame_owner = -1;
     scope->count++;
     /* Record the variable for the debugger (no-op unless building with -g). The
      * emit context supplies the compiler state; local_add itself is g-free.

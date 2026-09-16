@@ -1617,3 +1617,65 @@ driver_class 直接链接失败）。② 验证符号齐：
 `llvm-nm libzan_gui.a | grep T zan_gui_font_ascent` 对照 Render.zan 全部
 extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
 `--no-undefined`，档案过期从"实机闪退"左移成"发布当场报错"。
+
+## embedres：skin_filter 只属 skins 规格；多 spec 别拆多次 emit（2026-09-17）
+
+- **`zan_embed_emit_specs_filtered` 的 skin_filter 是 skins 规格专属**，
+  过滤条件必须按 `prefix=="skins"` 收窄（embedres.c 的 `filtering` 判定）。
+  它曾无条件作用于所有目录规格：一个只有子目录、根上无散文件的
+  assets 规格在 depth-1 只保留 dark/light 包名，整树清零后掉进
+  `--embed '...' matched no readable file` 硬错误。坑出处：wuwei 迁移
+  （assets/ 只有 audio/、images/ 两个子目录），dev 构建当天起全红。
+- **不要"修"成逐规格循环调用**：每次 `zan_embed_emit_specs*` 会新建独立
+  资源表、资源名全局编号（`zan.embed.n%d`）从头起，后一次 emit 覆盖前
+  一次——`--publish` 的多规格（packed-data、assets、skins）只剩最后一个
+  spec 的资源，embeddedArt/embeddedMusic 全 0 但程序照常启动，只有
+  探针断言能暴露。要改作用域就在 embedres 内部按前缀收窄，保持单次
+  调用。回归用例 conformance_file_embed_subdir（显式 --embed 子目录树 +
+  程序引用 Skin_ 前缀让 skin_filter 就位）。
+- **auto-embed 锚定扫描的路径裁剪**：候选 = 首个输入源目录截断 + 父目
+  录截断 + package_project_root，输入路径的 `/` 与 `\` 混用时 strrchr
+  取的是最后一个分隔符——build.ps1 里 `Join-Path $project 'src/App.html'`
+  这类混合分隔符路径会让截桶错位。诊断时先打印候选再怀疑逻辑。
+
+## GenForm：带字 label 的字段名会被 text 的 syncName 吃掉（2026-09-17）
+
+- **PropSpec.Text 工厂自带 `syncName=true`**：`SetProp("text", …)` 会把
+  控件 `name` 改写成文本。设计稿通道里 html 元素内容走兜底直通发射
+  `SetProp("text", …)`，在 `.name = 字段名` 之后执行——所有带文案的
+  label 字段名被标题覆盖，Find/id.探针/生成字段三者失联；空 label 不受
+  影响所以小样全绿、整页才塌。修法：GenForm 兜底循环发射 `text` 键后
+  立刻回写 `.name`（FormBuilder 通道同款不变式"属性写完以设计的字段名
+  为准"）。**作用域只限 `text` 键**——data-x-props 的同步（BatchJobProgress
+  的 titleText 按 caption 检索，gui_batchjob 断言依赖）是设计意图，无条
+  件的收尾回写会把那批测试打红。回归用例 conformance_gui_design_label_name。
+- **定位这类"整页塌缩"先读 UiDriver dump tree 的 rect，别猜像素**：
+  x/y/w/h 直读画布坐标，一处 237×0 与一处满高差一眼可辨；配合
+  `dump hitregions` 看当帧可见区域集。塌缩的第一嫌疑是"父容器尺寸没
+  到位/子树从未 Arrange"，而不是控件重叠。
+
+## async 帧槽：按名字去重必炸，同名遮蔽声明各占一槽（A31x，2026-09-17）
+
+- **`async_scan_add_local` 的去重键是 AST 声明节点，不是名字**。按名去重
+  时，`foreach (string k in ...)`（no_arc 借用槽）之后同名的
+  `string k = ...`（owned）会寄生在借用槽上：绑定期 capture-release 把槽
+  里残留的**集合内部元素**当 prior 值释放——野释放字典/列表内部字符串，
+  后续查找在 strcmp 上段错误。这就是 A321「后台协程 × 并发请求 → 传输层
+  损坏、进程不崩」的机理：后台协程里野释放的正是别的协程在用的串。
+- **发射侧必须把 `w->alocals[k].decl` 写进 `local_var_t.async_decl`**（写
+  侧），绑定期 `local_find_async_decl` 才能按节点命中；只落读侧不落写侧
+  =查找恒 miss 回落按名=回到 bug。
+- **用户声明槽的作用域名前缀 `$fl<k>.`**（对按名查找不可见）：名字可见性
+  从 prologue 预登记移到绑定期别名条目（`frame_owner` 指回槽条目下标、
+  自身 arc_owned=0 对一切释放遍历惰性）。**合成槽 `$fe.*` 千万不能跟着改
+  名**——foreach 降级按名找 `$fe.c%d` 接 col_slot，改名后 col_slot=NULL，
+  cond 块跨挂起复用集合 SSA，LLVM 验证报 "does not dominate all uses"
+  （三个 await-in-foreach 用例全红）。
+- **别名赋值的 capture-release 必须门在 rc 托管指针类型上**：标量槽走普
+  通存储。无门时 `i = i + 1` 的 i64 中间值 store 进 i32 alloca——越界砸
+  邻槽，且 `emit_rc_release_for_type(int,...)` 形同虚设。
+- **判定手法**：段错误先 cdb 看现场（strcmp 解引用 rcx=0 → 字典内部 key
+  被野释放 → 往 ARC 所有权簿记查）；IR 存疑用 `--emit-ir` + 
+  `ZANC_DUMP_BAD_IR=1` 落盘坏函数；归因用 targeted stash（只 stash 自己
+  的文件）重编基线 zanc 跑同用例。契约用例
+  conformance/async_shadow_same_name_across_await 四形态绿为准。

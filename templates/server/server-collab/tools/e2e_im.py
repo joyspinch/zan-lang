@@ -130,7 +130,9 @@ def start_server(exe):
     # 疑似编译器 A318（plain 帧展开槽 garbage）经由长寿命循环协程触发。
     # 本脚本断言的是 IM 业务契约，在缺陷修复前跳过后台协程以稳定判定。
     env = dict(os.environ)
-    env["ZAN_NO_BG"] = "1"
+    # 默认仍跳过后台协程（保守稳定判定）；显式设 ZAN_NO_BG=0 可连后台
+    # 协程一起压——A31x 帧槽根修后此形态已实跑通过。
+    env["ZAN_NO_BG"] = os.environ.get("ZAN_NO_BG", "1")
     proc = subprocess.Popen([exe], cwd=ROOT, stdout=log, stderr=log, env=env)
     if not wait_port():
         raise SystemExit("server did not listen on %d; see data/e2e_im_server.log" % PORT)
