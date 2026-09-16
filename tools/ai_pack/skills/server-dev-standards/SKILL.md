@@ -95,5 +95,29 @@ description: 服务端开发通用规范——四层架构（接入/业务/数�
 5. 命名同构成立吗？能否按名字一次检索到全部相关文件？
 6. 健壮性基线六条是内置的吗？
 
+## 七、服务端模板 e2e 定式（踩坑实锤）
+
+给 master+N worker 的 Zan 服务端模板写自动化 e2e/压测时，这几条都是
+踩过坑验证过的：
+
+1. **停服必须杀整树**（Windows：`taskkill /F /T /PID <master>`）。
+   只 `terminate()` 主进程，N 个 worker 变成攥着监听套接字的孤儿——
+   下一次起服新旧实例混着应答，症状是响应里掺二进制乱码、随机
+   connection reset，极易误判成协议 bug。重启前先 `tasklist` 确认清零。
+2. **admin 控制器 GET 默认整页 HTML**；要数据片段加请求头
+   `X-Fragment: 1`（同族：`X-Requested-With` / `Accept: application/json`，
+   见 WebApp.WantsPage）。裸 GET 拿到的是完整后台页，JSON 解析必炸。
+3. **checkbox 组必须按 `name[]` 惯例提交**：表单解析只对带 `[]` 后缀的
+   重复键合并成逗号串；不带 `[]` 的重复键后值覆盖前值——「绑定角色」
+   提交 roleIds=1&roleIds=2 只落最后一个，还报成功。
+4. **GenRoute 把 action 名归一成全小写**（RolesSave → rolessave）。
+   e2e 写路由前以门生成的路由表为准，别按方法名猜大小写。
+5. **长寿命后台 ORM 协程的已知雷**：模板里 `while(true)` 每秒扫库的
+   协程与请求并发时，偶发响应被未初始化内存覆盖（A321，A318/A320
+   同族）。修复前 e2e 起服用 `ZAN_NO_BG=1` 跳过后台协程（诊断开关
+   已在 server-collab main.zan），别把传输层损坏误判成业务 bug——
+   判据：同一断言只要响应完整送达即 PASS，红项全部伴随 BadStatusLine
+   二进制垃圾 / 10053 / 10054。
+
 数据建模通用准则（跨桌面/游戏/服务端）见数据建模通用 skill；
 服务端 DB 专属细则见服务端 DB 细则 skill。
