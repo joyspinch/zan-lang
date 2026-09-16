@@ -288,49 +288,26 @@ zan_dce_stats_t zan_opt_dce(zan_irgen_t *g) {
 /* ---- Inlining ---- */
 
 zan_inline_stats_t zan_opt_inline(zan_irgen_t *g, zan_opt_level_t level) {
+    (void)g;
+    (void)level;
+    /* No force, no hint. Every inline attribute this pass used to add
+     * (alwaysinline for small bodies, inlinehint for medium ones) rewired
+     * ARC ownership across the inline boundary: inlining a factory like
+     * HttpClient.CreateHttps into its caller let the caller's call-temp
+     * release free an object a still-registered EH variable slot guarded,
+     * so the handler's catch-entry unwind released freed memory -- the A318
+     * IDE crash. Bisection: with the attribute marking off, the -Os and
+     * --publish repro runs green; inlinehint alone still crashed (LLVM's
+     * cost model inlines hinted functions anyway, and its always-inliner
+     * ignores noinline when paired with alwaysinline, so gating per
+     * function is not airtight either). LLVM's own size-tier cost model
+     * keeps profitable inlining; revisiting needs an EH-ownership-aware
+     * policy (TASKS.md A318 follow-up). This also retires the old
+     * interposable-linkage carve-out: nothing is forced at all anymore, so
+     * weak/linkonce fallbacks (e.g. the zan_io_pump_timeout stub the real
+     * reactor pump overrides at link time) are simply left to LLVM, which
+     * honors interposition. */
     zan_inline_stats_t stats = {0, 0};
-
-    LLVMModuleRef mod = g->mod;
-    LLVMValueRef fn = LLVMGetFirstFunction(mod);
-
-    while (fn) {
-        /* Never force-inline interposable definitions (weak/linkonce/common):
-         * they exist to be replaced at link time. The prime example is the
-         * weak zan_io_pump_timeout fallback, which the real reactor pump in
-         * zanrt_io overrides at link time. Force-inlining the fallback would
-         * prevent socket IO from waking the scheduler, so any async/socket
-         * program (e.g. a server awaiting Accept) exits
-         * immediately instead of blocking on the reactor. Leave inlining of
-         * such functions to the LLVM pipeline, which honors link-time
-         * interposition. */
-        LLVMLinkage lk = LLVMGetLinkage(fn);
-        bool interposable =
-            (lk == LLVMWeakAnyLinkage || lk == LLVMWeakODRLinkage ||
-             lk == LLVMLinkOnceAnyLinkage || lk == LLVMLinkOnceODRLinkage ||
-             lk == LLVMCommonLinkage || lk == LLVMExternalWeakLinkage ||
-             lk == LLVMAvailableExternallyLinkage);
-        if (!LLVMIsDeclaration(fn) && !interposable) {
-            unsigned bb_count = LLVMCountBasicBlocks(fn);
-            unsigned small_cap = (level == ZAN_OPT_SIZE) ? 2 : 4;
-            if (bb_count <= small_cap && level >= ZAN_OPT_BASIC) {
-                LLVMAddAttributeAtIndex(fn, (LLVMAttributeIndex)(-1),
-                    LLVMCreateEnumAttribute(LLVMGetModuleContext(mod),
-                        LLVMGetEnumAttributeKindForName("alwaysinline", 12), 0));
-                stats.functions_inlined++;
-            } else if (bb_count <= 10 &&
-                       (level == ZAN_OPT_FULL || level == ZAN_OPT_AGGRESSIVE)) {
-                /* Size builds (Os) skip the larger inline-hint: hinting
-                 * 5-10 block functions bloats .text via duplication, which is
-                 * exactly what --publish must avoid. Small (<=4 bb) bodies are
-                 * still always-inlined above since they rarely grow code. */
-                LLVMAddAttributeAtIndex(fn, (LLVMAttributeIndex)(-1),
-                    LLVMCreateEnumAttribute(LLVMGetModuleContext(mod),
-                        LLVMGetEnumAttributeKindForName("inlinehint", 10), 0));
-            }
-        }
-        fn = LLVMGetNextFunction(fn);
-    }
-
     return stats;
 }
 

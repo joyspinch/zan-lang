@@ -3875,6 +3875,12 @@ typedef struct {
      * write through the slot must release the old occupant and retain the
      * new one -- while scope exit must NOT release it. */
     int          byref_slot;
+    /* Non-NULL only on the pre-added async frame-slot entries: the declaration
+     * node the slot was scanned from. Binding looks the slot up by node, never
+     * by name, so same-named shadowing declarations cannot alias each other's
+     * storage. Reads still resolve by name through the runtime entry each
+     * declaration adds when it binds, keeping scope truncation semantics. */
+    zan_ast_node_t *async_decl;
 } local_var_t;
 
 /* A function's locals live in a single flat scope. The backing array grows
@@ -3936,6 +3942,7 @@ static void local_add(local_scope_t *scope, zan_istr_t name, LLVMValueRef alloca
     scope->vars[scope->count].box_owned = 0;
     scope->vars[scope->count].opaque_string = 0;
     scope->vars[scope->count].obj_rc_flag = NULL;
+    scope->vars[scope->count].async_decl = NULL;
     scope->count++;
     /* Record the variable for the debugger (no-op unless building with -g). The
      * emit context supplies the compiler state; local_add itself is g-free.
@@ -3961,6 +3968,18 @@ static local_var_t *local_find(local_scope_t *scope, zan_istr_t name) {
             memcmp(scope->vars[i].name.str, name.str, (size_t)name.len) == 0) {
             return &scope->vars[i];
         }
+    }
+    return NULL;
+}
+
+/* Find the pre-added async frame slot of one declaration node (see
+ * local_var_t.async_decl). A name lookup cannot serve here: two same-named
+ * declarations each pre-add their own entry, and picking by name would hand
+ * the emit whichever entry happens to sit last in the flat list. */
+static local_var_t *local_find_async_decl(local_scope_t *scope, zan_ast_node_t *decl) {
+    if (!decl) return NULL;
+    for (int i = scope->count - 1; i >= 0; i--) {
+        if (scope->vars[i].async_decl == decl) return &scope->vars[i];
     }
     return NULL;
 }

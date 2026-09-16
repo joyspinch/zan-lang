@@ -147,7 +147,7 @@ static bool anf_stmt_contains_await(zan_ast_node_t *s);
 static void emit_async_save_slots(zan_irgen_t *g);
 static void emit_async_reload_slots(zan_irgen_t *g);
 static void emit_async_eh_unarm(zan_irgen_t *g);
-static void emit_async_check_sub_exc(zan_irgen_t *g, LLVMValueRef sub);
+static void emit_async_check_sub_exc(zan_irgen_t *g, LLVMValueRef sub, LLVMValueRef tmp_mark);
 
 /* Shared lowering for the Task instance members (`t.Wait()`, `t.Result`,
  * `t.IsCompleted`; the Task.Run/Spawn spawn-side lives in irgen_call.c).

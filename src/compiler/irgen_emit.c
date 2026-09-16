@@ -297,13 +297,16 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
         if (ramp && resume) {
             LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
             LLVMTypeRef mi8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            LLVMValueRef aw_tmp_mark = LLVMBuildLoad2(g->builder,
+                LLVMInt32TypeInContext(g->ctx), get_eh_tmp_top_global(g),
+                "main.tmpmark");
             LLVMValueRef sub = zan_call2(g->builder, LLVMGlobalGetValueType(ramp),
                 ramp, NULL, 0, "main.task");
             LLVMValueRef sub_i8 = LLVMBuildBitCast(g->builder, sub, mi8ptr, "main.task8");
             LLVMValueRef sched_args[] = { sub_i8, resume };
             zan_call2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");
             zan_call2(g->builder, g->rt_co_sched_run_type, g->rt_co_sched_run, NULL, 0, "");
-            emit_async_check_sub_exc(g, sub_i8);
+            emit_async_check_sub_exc(g, sub_i8, aw_tmp_mark);
             LLVMValueRef rptr = LLVMBuildStructGEP2(g->builder, g->co_header_type,
                 sub_i8, ASYNC_FRAME_RESULT, "main.res.p");
             LLVMValueRef res = LLVMBuildLoad2(g->builder, i64, rptr, "main.res");

@@ -525,7 +525,22 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
          * survive suspensions). Reuse that slot instead of a fresh alloca:
          * just evaluate the initializer and store into it. */
         if (g->current_async_frame && g->current_async_slot_count > 0) {
-            local_var_t *pre = local_find(locals, stmt->var_decl.name);
+            /* Bind this declaration to ITS OWN frame slot, keyed by the AST
+             * node the scan registered. A name lookup is wrong whenever more
+             * than one same-named declaration is frame-resident: it returns
+             * whichever entry sits last in the flat list, so a
+             * `foreach (string k in ...)` followed by `string k = keys[i]`
+             * left the second k on a plain stack alloca -- dead across the
+             * next suspension. */
+            local_var_t *pre = local_find_async_decl(locals, stmt);
+            /* The scan side that keys frame slots by declaration node is not
+             * landed yet -- nothing sets local_var_t.async_decl, so the node
+             * lookup always misses. Fall back to the name lookup (the
+             * pre-A31x behavior): without it every async local skips
+             * frame-slot reuse and its storage dies across the next
+             * suspension (use-after-free in await-heavy code, A318 soak).
+             * Once the scan lands, the node match wins and this goes quiet. */
+            if (!pre) pre = local_find(locals, stmt->var_decl.name);
             if (pre) {
                 /* Resolve this declaration's own type -- explicitly written or
                  * inferred from its initializer -- before deciding whether it
@@ -538,12 +553,11 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     type = infer_expr_type(g, stmt->var_decl.initializer, locals);
                 if (!type) type = pre->type;
                 for (int i = 0; i < g->current_async_slot_count; i++) {
-                    /* A shadowing declaration with a different type must NOT
-                     * reuse the slot: the slot's LLVM type is baked into the
-                     * frame struct, so storing through it would type-confuse
-                     * both variables (the frame save/reload would also move
-                     * the wrong width). Skip the reuse and let the ordinary
-                     * scoped declaration below shadow it instead. */
+                    /* The slot's LLVM type is baked into the frame struct, so
+                     * when emit-time inference disagrees with what the scan
+                     * registered for THIS declaration, storing through the
+                     * slot would move the wrong width. Skip the reuse and let
+                     * the ordinary scoped declaration below handle it. */
                     if (g->current_async_slots[i].slot_alloca == pre->alloca &&
                         !async_slot_type_compatible(type, pre->type))
                         continue;
@@ -596,6 +610,21 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                             stmt->var_decl.initializer &&
                             call_targets_extern(g, stmt->var_decl.initializer))
                             pre->opaque_string = 1;
+                        /* Ownership deliberately STAYS on the pre-added slot
+                         * entry (async protocol: capture-release at every
+                         * store, one release of the final value at coroutine
+                         * completion). Adding a name-visible runtime entry
+                         * here -- owned or not -- pushes loop-body
+                         * declarations onto the sync walker protocol whose
+                         * release walks then fight the frame protocol
+                         * (truncated entries skipped by completion, dangling
+                         * re-releases), corrupting the heap in await-heavy
+                         * code. Same-named shadowing reads resolve to the
+                         * innermost remaining entry: correct for the
+                         * declare-after-foreach shape, and memory-safe
+                         * everywhere (every slot is frame-resident and
+                         * null-initialized); full scope-correct shadowing
+                         * needs the sync-uniform slot registry (TASKS A31x). */
                         return;
                     }
                 }
@@ -2447,7 +2476,13 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                      * scan) whenever the method has one */
                     LLVMValueRef ea = NULL;
                     if (g->current_async_frame) {
-                        local_var_t *fv = local_find(locals, cc->catch_clause.var_name);
+                        local_var_t *fv = local_find_async_decl(locals, cc);
+                        /* Scan side not landed yet (nothing sets async_decl):
+                         * fall back to the name lookup the scan registered,
+                         * else the handler binding lands on a fresh stack
+                         * alloca that holds garbage after a resume. */
+                        if (!fv)
+                            fv = local_find(locals, cc->catch_clause.var_name);
                         if (fv && !fv->type &&
                             LLVMGetTypeKind(local_slot_type(g, fv)) == LLVMPointerTypeKind)
                             ea = fv->alloca;
@@ -2731,10 +2766,15 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             zan_istr_t in_ = { nm, (uint32_t)strlen(nm) };
             local_var_t *iv = local_find(locals, in_);
             if (iv) idx_alloc = iv->alloca;
-            /* the loop variable's frame slot is the storage-only one this
-             * foreach registered (ztype NULL); anything else with that name is
-             * a user local that merely shadows it, and must not be aliased */
-            local_var_t *ev = local_find(locals, stmt->foreach_stmt.var_name);
+            /* the loop variable's frame slot is the storage-only one THIS
+             * foreach registered (keyed by this statement node, ztype NULL);
+             * same-named user declarations own separate slots and must not be
+             * aliased */
+            local_var_t *ev = local_find_async_decl(locals, stmt);
+            /* Scan side not landed yet (nothing sets async_decl): fall back
+             * to the storage-only slot the scan registered by name, else the
+             * iteration variable loses its frame slot across suspensions. */
+            if (!ev) ev = local_find(locals, stmt->foreach_stmt.var_name);
             if (ev && !ev->type && LLVMGetTypeKind(elem_llvm) ==
                     LLVMGetTypeKind(local_slot_type(g, ev)))
                 iter_alloc = ev->alloca;

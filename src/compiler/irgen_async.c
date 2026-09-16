@@ -1648,8 +1648,15 @@ static void emit_eh_rethrow_current(zan_irgen_t *g) {
 
 /* At an await resume point: if the awaited coroutine completed by throwing,
  * move its exception back into the globals and re-throw it here, inside a live
- * invocation of this frame. `sub` is the (still owned) sub-frame handle. */
-static void emit_async_check_sub_exc(zan_irgen_t *g, LLVMValueRef sub) {
+ * invocation of this frame. `sub` is the (still owned) sub-frame handle.
+ * `tmp_mark` is the temp-stack depth captured at the await site before the
+ * awaited call ran (root drive only; NULL elsewhere). The sub chain pumped
+ * other coroutines on this same thread-global stack, and an exception inside
+ * them leaves their temp registrations above this handler's mark with nobody
+ * left to pop them -- releasing them here, while they are still alive, keeps
+ * the catch-entry unwind from releasing long-dead entries (A318). */
+static void emit_async_check_sub_exc(zan_irgen_t *g, LLVMValueRef sub,
+                                     LLVMValueRef tmp_mark) {
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef hdr = g->co_header_type;
@@ -1673,6 +1680,11 @@ static void emit_async_check_sub_exc(zan_irgen_t *g, LLVMValueRef sub) {
     LLVMBuildStore(g->builder, ev, exc_g);
     LLVMBuildStore(g->builder, tv, get_eh_exc_tid_global(g));
     LLVMBuildStore(g->builder, ov, get_eh_exc_owned_global(g));
+    if (tmp_mark) {
+        LLVMTypeRef uwty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+            &i32, 1, 0);
+        zan_call2(g->builder, uwty, get_eh_tmp_unwind_fn(g), &tmp_mark, 1, "");
+    }
     /* the sub-frame is dead once its exception has been taken over */
     zan_emit_frame_free(g, sub);
     emit_eh_rethrow_current(g);

@@ -1043,7 +1043,41 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
   -O2+符号的诊断 exe 的 .text 里字节匹配换名字（prologue 相同会误配，须全 24
   字节 + 帧尺寸一致性双重确认）。注意 crash 日志 backtrace 的 #00/#01 帧常是
   `zan__crash_write_record`/`zan__crash_veh`（handler 自己），只有 #05+ 才是
-  真实调用者。同族残留（plain 帧展开槽 garbage，IDE publish 启动期）挂账 A318。
+  真实调用者。同族残留（IDE publish 启动期）= A318，真根因与本节旧归因
+  （"未定义槽值"）不同：是**强制内联打破 ARC/EH 所有权**，释放的是已释放
+  对象，见下节。
+
+## -Os 强制内联打破 ARC/EH 槽位所有权：打内联标记=改写所有权（A318 已修，2026-09-16）
+
+- **症状**：publish(-Os) 秒崩 0xC0000005 @ `release_dyn+0x19`，dev(-O0) 稳定；
+  "没改源码也崩"——毒路径由内联器选择，与业务改动无关（IDE 启动即做 HTTP
+  超时请求+try/catch，必踩）。
+- **机制**：`zan_opt_inline` 曾给 ≤2 BB 函数打 `alwaysinline`。`return new
+  X(...)` 形状的工厂（如 HttpClient.CreateHttps——无局部→无 arc_own_local
+  槽位）被强制内联进调用方后，两套所有权簿记（EH 槽位注册 vs 调用临时释放）
+  跨内联边界错位：调用方把仍注册在 EH 变量槽里的对象提前 `release_dyn`；
+  异常进 catch 入口时 TMPS unwind 按 mark 二次释放 → UAF。
+- **为什么只能不打标**：`noinline` 闸门挡不住（LLVM always-inliner 无视与
+  alwaysinline 并存的 noinline）；改打 `inlinehint` 也挡不住（成本模型照样
+  内联）。修复=`zan_opt_inline` 全空（no force, no hint，交 LLVM 尺寸档成本
+  模型；顺带省 2.2MB IDE 体积）。**重开任何强制内联前，必须先做"EH 注册
+  函数的内联安全契约"**（TASKS A318 遗留）。
+- **调试手法（本次验证，可复用）**：① -Os 下单步（`t`）扰动 LFH 时序会
+  **掩盖崩溃**（rc 139 变 30 的 heisenbug）——只用非扰动日志断点；② zanc
+  自家 internal 符号 nm 可见但 cdb 不认，用 `bp mod+0x<RVA>`（nm 取 RVA +
+  默认基址 0x140000000）；③ cdb 日志 grep 要 `-a`；④ bash 双引号里 cdb
+  脚本的 `$<` 会被展开成 PID，`-c` 参数整段用单引号；⑤ EH 原语在 -Os 被
+  部分内联（push/slot_fast 内联不可见，pop/unwind/drop 留函数）——先在
+  -O0 用全原语断点做"完整台账"，再回 -Os 对账，别给不可见的符号设断。
+- **gen-cache 连带坑**：zanc 字节一变，嵌套 ZanGen 缓存键即失效；若 zanc
+  被本地改坏（如 LLVM API 误用段错误），外层症状只是"code-generator
+  compile failed (exit -1)"——先手动嵌编
+  `zanc stdlib/System/Compiler/ZanGen.zan --auto-stdlib --no-gen -DZAN_GEN_MAIN=1 -o …`
+  拿到真崩溃栈再修。
+- **共享树半成品护栏**：读侧换了查找函数、写侧没落（无人给字段赋非 NULL，
+  查找永远 miss）时，给读侧加"miss 回落旧路径"兜底而不是回滚读侧——
+  行为恢复到基线，写侧落地后节点路径自动生效（A31x 的
+  `local_find_async_decl` 三处即此写法）。
 
 ## leakcheck「仍可达」与停服排水（A302，未修）
 

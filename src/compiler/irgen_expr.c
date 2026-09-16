@@ -8479,6 +8479,14 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
          *     block reloads slots and reads sub.result.
          *   - at a non-async root (e.g. Main): drive the cooperative scheduler
          *     synchronously (init/ready/run) and then read sub.result. */
+        /* Temp-stack depth at the await site: on the exception path the root
+         * drive releases everything the sub chain left registered above this
+         * mark (see emit_async_check_sub_exc). Captured before the awaited
+         * call is emitted, so this frame's own balanced registrations sit
+         * below it and stay with the handler. */
+        LLVMValueRef aw_tmp_mark = LLVMBuildLoad2(g->builder,
+            LLVMInt32TypeInContext(g->ctx), get_eh_tmp_top_global(g),
+            "aw.tmpmark");
         LLVMValueRef sub = emit_expr(g, expr->await_expr.expr, locals);
         LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
         LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
@@ -8570,7 +8578,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 /* the sub may have completed by throwing: re-throw it here,
                  * where this frame has a live invocation and its handlers are
                  * armed again */
-                emit_async_check_sub_exc(g, sub_rl);
+                emit_async_check_sub_exc(g, sub_rl, NULL);
                 LLVMValueRef rptr = LLVMBuildStructGEP2(g->builder, hdr, sub_rl,
                     ASYNC_FRAME_RESULT, "sub.result");
                 LLVMValueRef awres = LLVMBuildLoad2(g->builder, i64, rptr, "awres");
@@ -8598,7 +8606,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 ASYNC_FRAME_DONE, "sub.done.p");
             zan_call2(g->builder, g->rt_co_sched_run_until_type,
                 g->rt_co_sched_run_until, (LLVMValueRef[]){ done_p }, 1, "");
-            emit_async_check_sub_exc(g, sub_i8);
+            emit_async_check_sub_exc(g, sub_i8, aw_tmp_mark);
             LLVMValueRef rptr = LLVMBuildStructGEP2(g->builder, hdr, sub_i8,
                 ASYNC_FRAME_RESULT, "sub.result");
             LLVMValueRef awres = LLVMBuildLoad2(g->builder, i64, rptr, "awres");
