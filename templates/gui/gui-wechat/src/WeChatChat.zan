@@ -1,0 +1,478 @@
+using System;
+using Gui;
+using Gui.Backend;
+using Gui.Component;
+using Gui.Widget;
+
+/// 聊天页：左栏搜索 + 会话列表，右侧标题 + 气泡聊天 + 底部输入区。
+/// 气泡本身由 `Gui.Component.ChatView` 的气泡模式画（左灰右绿、头像、
+/// 时刻分隔、群聊发言人名字），这里只负责喂数据与装配界面。
+class WxPageChat : Control {
+    Input search;
+    ListView<WxSession> list;
+    ChatView chat;
+    /// 标题行的两个文字是骨架文档里的元素（WeChatChat.html 的
+    /// #HeadName/#HeadDesc）：切会话走 SetProp("text") 元素通道。
+    Control headName;
+    Control headDesc;
+    TextArea box;
+    List<WxSession> data;
+    int current;
+    /// 输入框上方的引用条（点气泡菜单「引用」后出现）——骨架文档
+    /// 里的 #QuoteBar 元素，显隐走 visible，文字走 SetProp。
+    Control quoteBar;
+    Control quoteText;
+    /// 气泡右键菜单的锚点与载荷（跨帧持有，覆盖阶段画）。
+    bool ctxOpen;
+    int ctxMsg;
+    string ctxText;
+    int ctxX;
+    int ctxY;
+
+    /// 覆盖阶段：画右键菜单。菜单开启时拥有整窗（ContextMenu.Render
+    /// 内部 BlockHitsMenu），返回 -2（点外部/再右键）即收起。
+    override void OnPaintOverlay(App app) {
+        if (!ctxOpen) { return; }
+        app.BeginIdScope(730000);
+        List<string> items = new List<string>();
+        items.Add("复制");
+        items.Add("引用");
+        int pick = ContextMenu.Render(app, ctxX, ctxY, items);
+        if (pick == 0 - 2) {
+            ctxOpen = false;
+            app.RequestRedraw();
+            return;
+        }
+        if (pick == 0) {
+            string clip = ctxText != null ? ctxText : "";
+            if (clip.Length > 0) { Clipboard.SetText(clip); }
+            ctxOpen = false;
+            app.RequestRedraw();
+            return;
+        }
+        if (pick == 1) {
+            ctxOpen = false;
+            WxIm.SetQuoteDraft(ctxMsg, ctxText);
+            app.RequestRedraw();
+        }
+    }
+    /// 宿主 App（拖出行手势要按主窗口矩形判断「拖到窗外」）。
+    App app;
+    /// 「...」对应的右侧抽屉与输入区上方的弹出面板。
+    Panel drawer;
+    WxDrawerBody drawerBody;
+    Flex popup;
+    WxEmojiPanel emoPanel;
+    WxAvaPanel avaPanel;
+    WxFilePanel filePanel;
+    Control curPopup;
+    /// 输入区下排的图标条：群聊/私聊图标数不同，切会话时重建。
+    ToolStrip bar;
+    /// 点任意用户头像弹出的小名片（与抽屉互斥的右缘浮卡）。
+    WxProfilePanel prof;
+
+    WxPageChat() {
+        this.InitControl("wxPageChat", 5);
+        this.Class = "wxmain";
+        this.data = WxData.Sessions();
+
+        // ---- HTML 骨架（WeChatChat.html）：左栏搜索 + 会话列表宿主，
+        // 右栏标题行 / 聊天 / 弹出面板 / 输入区。树根是 body 元素
+        // （dock 0 = Manual）——与本页这类宿主只对 dock=Fill 的根
+        // 做填充（GenForm 时代由 __BuildForm 发射），runtime 文档
+        // 必须 code-behind 补上（收藏页同款）。
+        Control ui = WeChatChatHtml.Build(null);
+        ui.DockFill();
+        this.Add(ui);
+
+        // ---- 左栏：搜索框在文档里（<input> → Input，placeholder
+        // 直进构造）；会话列表是动态控件，挂进骨架预留的壳。壳是
+        // flex 列，行加 grow 类吃满主轴。骨架 id 都是文档里写死的，
+        // 找不到只可能是我改错了文档——兜底退回树根（收藏页同款）。
+        search = (Input)ui.Find("SearchBox");
+        Control listHost = ui.Find("SessionHost");
+        if (listHost == null) { listHost = ui; }
+        list = new ListView<WxSession>(WxSessionRow.Of);
+        list.Class = "wxlist grow";
+        list.Bind(data);
+        list.OnSelect(() => { this.Select(list.SelectedIndex()); });
+        listHost.Add(list);
+
+        // ---- 右侧标题行：文字是文档元素；头像右侧的四个图标按钮
+        // 是动态控件——语音通话/视频通话（摆设）、聊天记录（开独立
+        // 记录窗口）、...（开右侧抽屉）。runtime 通道没有
+        // data-x-props：图标与悬停提示 code-behind 补（导航栏同款）。
+        headName = ui.Find("HeadName");
+        headDesc = ui.Find("HeadDesc");
+        Button callBtn = (Button)ui.Find("HeadCall");
+        callBtn.SetProp("icon", "phone");
+        callBtn.Tip = "语音通话";
+        Button videoBtn = (Button)ui.Find("HeadVideo");
+        videoBtn.SetProp("icon", "video");
+        videoBtn.Tip = "视频通话";
+        Button histBtn = (Button)ui.Find("HeadHist");
+        histBtn.SetProp("icon", "message");
+        histBtn.Tip = "聊天记录";
+        histBtn.OnClick(() => { WxHistoryWindow.Open(this.app, data[current]); });
+        Button dotsBtn = (Button)ui.Find("HeadDots");
+        dotsBtn.SetProp("icon", "dots");
+        dotsBtn.Tip = "更多";
+        dotsBtn.OnClick(() => { this.ToggleDrawer(); });
+
+        // ---- 底部输入区：输入框与发送条都在文档里（<textarea> →
+        // TextArea、发送钮是文档按钮）。引用条平时收起，随草稿显隐；
+        // 关闭钮与发送钮的点击行为、引用条的显隐在 code-behind 接。
+        quoteBar = ui.Find("QuoteBar");
+        quoteBar.visible = false;
+        quoteText = ui.Find("QuoteText");
+        Button quoteX = (Button)ui.Find("QuoteClose");
+        quoteX.SetProp("icon", "close");
+        quoteX.Tip = "取消引用";
+        quoteX.OnClick(() => { WxIm.DismissQuoteDraft(); });
+        box = (TextArea)ui.Find("TypeBox");
+        // 图标工具条是标准库的 ToolStrip（按钮组），项本身就是扁平
+        // 按钮（text small），表面色走皮肤的 toolstrip 规则——这里
+        // 不摆裸按钮、不写一行式样；grow 把右侧两个按钮推到最右。
+        // 左组五个按原版顺序：表情 / 常用头像 / 文件 / 截图(+下拉) /
+        // 麦克风，群聊再加一个 ⊙；右组是发语音圆钮与文字发送钮。
+        Control toolsHost = ui.Find("ToolsHost");
+        if (toolsHost == null) { toolsHost = ui; }
+        bar = new ToolStrip();
+        bar.SetIconOnly(true);
+        bar.Class = "grow";
+        toolsHost.Add(bar);
+        Button send = (Button)ui.Find("SendBtn");
+        send.OnClick(() => { this.Send(); });
+
+        // ---- 输入区上方的弹出面板（表情 / 常用头像 / 文件）----
+        // 面板本体是动态控件，挂进骨架的 #PopupHost（聊天区与输入区
+        // 之间）：收起时壳零高，聊天区吃满；展开时壳随面板长高。
+        // 弹出面板的宿主用 flex 列 + 交叉轴起点：面板自己的宽度
+        // （424）才会生效，否则 Panel 的列会把子项拉满整行。
+        Control popupHost = ui.Find("PopupHost");
+        if (popupHost == null) { popupHost = ui; }
+        popup = Flex.Column();
+        popup.AddClass("wxpopup");
+        popup.AlignStart();
+        popup.visible = false;
+        emoPanel = WxEmojiPanel.Of((t) => { this.Type(t); });
+        emoPanel.Root().visible = false;
+        popup.Add(emoPanel.Root());
+        avaPanel = WxAvaPanel.Of((t) => { this.Type(t); });
+        avaPanel.Root().visible = false;
+        popup.Add(avaPanel.Root());
+        filePanel = WxFilePanel.Of((t) => { this.Type(t); });
+        filePanel.Root().visible = false;
+        popup.Add(filePanel.Root());
+        popupHost.Add(popup);
+
+        // ---- 「...」的右侧抽屉（私聊/群聊两种版式在同一列里翻）----
+        // 抽屉与名片是覆盖层，仍挂在页面根本身（dock 4 右缘，压在
+        // 骨架文档之上）；骨架是纯 flex 流，承载不了浮层。
+        drawer = Wx.Col("wxdrawer");
+        drawer.dock = 4;
+        drawer.visible = false;
+        drawerBody = WxDrawerBody.Of(
+            () => { WxHistoryWindow.Open(this.app, data[current]); },
+            () => { this.ClearCurrent(); },
+            (nm, ini, tint) => { this.ShowProfile(nm, ini, tint); });
+        drawerBody.Root().dock = 5;
+        drawer.Add(drawerBody.Root());
+        this.Add(drawer);
+
+        // ---- 资料名片：点任意用户头像弹出（右缘浮卡，与抽屉互斥）----
+        prof = WxProfilePanel.Of();
+        prof.dock = 4;
+        this.Add(prof);
+
+        // ---- 聊天记录本体：动态控件挂进骨架的 #ChatHost（标题行
+        // 与输入区之间，grow 类吃满剩余高度） ----
+        Control chatHost = ui.Find("ChatHost");
+        if (chatHost == null) { chatHost = ui; }
+        chat = new ChatView();
+        chat.Class = "wxchat grow";
+        chat.WithStyle(ChatStyle.Bubble());
+        chat.WithBubbleWidth(620);
+        // 点气泡里的头像 = 弹发言人名片（原版同款交互）。
+        chat.OnAvatarClick((idx) => { this.OpenMsgProfile(idx); });
+        // 右键气泡 = 复制 / 引用；「引用」把草稿交给桥，随下一条发送。
+        chat.OnBubbleMenu((idx, sel) => { this.OpenBubbleMenu(idx, sel); });
+        chatHost.Add(chat);
+
+        this.Select(0);
+    }
+
+    /// 把一段文字（表情 / @名片 / 文件占位）追加进输入框。
+    void Type(string t) {
+        box.SetText(box.GetText() + t);
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    /// 引用条显隐（草稿由 WxIm 持有，这里只管画）。
+    void ShowQuoteBar(string who, string text) {
+        quoteText.SetProp("text", "引用 " + who + "：" + text);
+        quoteBar.visible = true;
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    void HideQuoteBar() {
+        quoteBar.visible = false;
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    /// 桥要的当前会话本体（引用草稿按消息下标取被引消息）。
+    WxSession CurrentSession() {
+        if (current < 0 || current >= data.Count) { return null; }
+        return data[current];
+    }
+
+    /// 气泡右键菜单：复制（选中部分或整条）+ 引用。菜单是即时模式
+    /// 的（ContextMenu.Render），挂在覆盖阶段末尾、按右键坐标锚定，
+    /// 与 IDE 外壳同一套画法；ctxOpen 跨帧持有开关状态。
+    void OpenBubbleMenu(int msgIndex, string selText) {
+        ctxMsg = msgIndex;
+        ctxText = selText;
+        ctxX = app.mouseX;
+        ctxY = app.mouseY;
+        ctxOpen = true;
+        app.RequestRedraw();
+    }
+
+    /// 弹出面板的显隐：再点同一个图标等于收起；互斥——开一个关
+    /// 其余，开面板时也收起抽屉。
+    void ShowPopup(Control p) {
+        if (popup.visible && curPopup == p) {
+            this.ClosePopups();
+            return;
+        }
+        curPopup = p;
+        emoPanel.Root().visible = p == emoPanel.Root();
+        avaPanel.Root().visible = p == avaPanel.Root();
+        filePanel.Root().visible = p == filePanel.Root();
+        drawer.visible = false;
+        prof.Hide();
+        popup.visible = true;
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    void ClosePopups() {
+        curPopup = null;
+        popup.visible = false;
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    /// 抽屉显隐；打开前把内容对齐到当前会话（私聊/群聊版式翻面）。
+    void ToggleDrawer() {
+        this.ClosePopups();
+        prof.Hide();
+        drawerBody.Show(data[current]);
+        drawer.visible = !drawer.visible;
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    /// 点气泡头像弹名片：user = 我；带 agent 的按发言人注册表解析；
+    /// 其余（一对一的对方）用会话名。原版单点头像就是这个名片。
+    void OpenMsgProfile(int idx) {
+        if (idx < 0 || idx >= data[current].msgs.Count) { return; }
+        ChatMessage m = data[current].msgs[idx];
+        if (m.role == "user") {
+            this.ShowProfileCard(WxProfiles.Me());
+            return;
+        }
+        if (m.agent != "") {
+            string nm = WxData.NameOf(m.agent);
+            if (nm != null) {
+                this.ShowProfileCard(WxProfiles.Of(nm,
+                    WxData.IniOf(m.agent), WxData.TintOfId(m.agent)));
+                return;
+            }
+        }
+        WxSession s = data[current];
+        this.ShowProfileCard(WxProfiles.Of(s.name, s.initial, s.tint));
+    }
+
+    /// 弹名片（按数据）；抽屉与弹出面板一并收起——它们与名片同一
+    /// 一块右缘/弹出区，叠着就是自检报的重叠。
+    void ShowProfileCard(WxProfileCard c) {
+        this.ClosePopups();
+        drawer.visible = false;
+        prof.Show(c);
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    /// 弹名片（按 名字/首字/色调；抽屉与群成员格走这条）。
+    void ShowProfile(string nm, string ini, string tint) {
+        this.ShowProfileCard(WxProfiles.Of(nm, ini, tint));
+    }
+
+    /// 清空当前会话：共享的记录列表清掉，聊天区与列表摘要跟上
+    /// （抽屉底部那行红字）。
+    void ClearCurrent() {
+        WxSession s = data[current];
+        s.msgs.Clear();
+        s.snippet = "";
+        chat.Reset();
+        chat.Bind(s.msgs);
+        chat.Invalidate();
+        list.Refresh();
+        drawer.visible = false;
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    /// 输入区下排的图标条。两版式的并集只建一次（表情 / 常用头像 /
+    /// 文件 / 截图 / 截图下拉 / 麦克风 / 群目标 + 右组发语音），切会话
+    /// 只翻群目标图标的显隐——ToolStrip 的项表不随 RemoveAll 清空，
+    /// 每次重建会让 ItemAt 拿到旧项。
+    void BuildBar(bool group) {
+        if (bar.Count() > 0) {
+            Wx.Item(bar, 6).visible = group;
+            return;
+        }
+        bar.Add("", "mood-smile");
+        bar.Add("", "box");
+        bar.Add("", "folder");
+        bar.Add("", "scissors");
+        bar.Add("", "caret-down");
+        bar.Add("", "microphone");
+        bar.Add("", "target");
+        Wx.Item(bar, 0).Tip = "表情";
+        Wx.Item(bar, 0).OnClick(() => { this.ShowPopup(emoPanel.Root()); });
+        Wx.Item(bar, 1).Tip = "常用头像";
+        Wx.Item(bar, 1).OnClick(() => { this.ShowPopup(avaPanel.Root()); });
+        Wx.Item(bar, 2).Tip = "文件";
+        Wx.Item(bar, 2).OnClick(() => { this.ShowPopup(filePanel.Root()); });
+        Wx.Item(bar, 3).Tip = "截图";
+        Wx.Item(bar, 4).Tip = "截图范围";
+        Wx.Item(bar, 5).Tip = "麦克风";
+        Wx.Item(bar, 6).Tip = "群目标";
+        int voice = bar.AddRight("", "volume");
+        Wx.Item(bar, voice).AddClass("wxvoice");
+        Wx.Item(bar, voice).Tip = "发语音";
+        Wx.Item(bar, 6).visible = group;
+    }
+
+    /// 切到一个会话：换标题，换整份记录（Reset 会清掉重排缓存与滚动），
+    /// 一对一会话关掉发言人名字、用对方的昵称当左侧气泡的署名；
+    /// 抽屉与弹出面板一并收起，图标条按群聊/私聊翻群目标图标。
+    void Select(int i) {
+        if (i < 0 || i >= data.Count) { return; }
+        current = i;
+        WxSession s = data[i];
+        headName.SetProp("text", s.name);
+        if (s.group) {
+            headDesc.SetProp("text",
+                "群聊 · " + Convert.ToString(s.people) + " 人");
+        } else {
+            headDesc.SetProp("text", "最后活跃 " + s.time);
+        }
+        this.BuildBar(s.group);
+        this.ClosePopups();
+        drawer.visible = false;
+        ChatStrings cs = ChatStrings.Default();
+        cs.you = "我";
+        cs.assistant = s.name;
+        cs.empty = "还没有消息";
+        chat.WithStrings(cs);
+        chat.WithSpeakerNames(s.group);
+        chat.WithSpeakers(WxData.Speaker, WxData.KindLabel);
+        chat.Reset();
+        chat.Bind(s.msgs);
+        chat.Invalidate();
+        shownCount = s.msgs.Count;
+        // 接了服务端的会话：拉全量消息流（服务端顺带把未读落账已读）。
+        WxIm.Open(s);
+    }
+
+    /// 发送：接了服务端的会话走 WxIm.Send（本地气泡 → /api/im/send →
+    /// 回执轮询；输入区上方有引用条时随带 replyTo）；纯示例行维持原来
+    /// 的本地追加。
+    void Send() {
+        string t = box.GetText();
+        if (t == "") { return; }
+        WxSession s = data[current];
+        if (s.peer.Length > 0) {
+            // 引用草稿挂着就按引用回复发送（草稿由 WxIm 持有并清掉）。
+            WxIm.SendWithDraft(s, t);
+        } else {
+            ChatMessage m = ChatMessage.Create("user", t);
+            m.at = DateTime.UtcNow().ToUnixSeconds();
+            s.msgs.Add(m);
+            s.snippet = t;
+            s.time = "刚刚";
+            s.unread = 0;
+            chat.Invalidate();
+        }
+        box.SetText("");
+        list.Refresh();
+    }
+
+    /// 桥（WxIm）在数据并入后调：标题区/列表行跟新值走；当前会话的
+    /// 消息数变了才整体重绑（Reset 清滚动缓存，不重绑的话 ChatView
+    /// 还捏着旧的 List 引用——会话槽是复用的，对象换了内容）。
+    void OnDataChanged() {
+        if (current >= 0 && current < data.Count) {
+            WxSession s = data[current];
+            headName.SetProp("text", s.name);
+            if (s.group) {
+                headDesc.SetProp("text",
+                    "群聊 · " + Convert.ToString(s.people) + " 人");
+            } else {
+                headDesc.SetProp("text", "最后活跃 " + s.time);
+            }
+            if (s.msgs.Count != shownCount) {
+                shownCount = s.msgs.Count;
+                chat.Reset();
+                chat.Bind(s.msgs);
+            }
+            chat.Invalidate();
+        }
+        list.Refresh();
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    /// 当前会话已重绑时的消息条数（变了才 Reset+Bind，保滚动位置）。
+    int shownCount = 0 - 1;
+
+    /// 接桥（登录成功）：示例会话整批退场——登录是硬门，进了主窗口
+    /// 就只认服务端数据；残留的示例会话会把首屏聊天区画成别人的记录。
+    void BeginServerMode() {
+        data.Clear();
+        current = 0 - 1;
+        shownCount = 0 - 1;
+        chat.Reset();
+        chat.Bind(new List<ChatMessage>());
+        list.Refresh();
+    }
+
+    /// 桥要的当前会话下标（轮询判断"打开的会话是否正在看"）。
+    int CurrentIndex() { return current; }
+
+    /// 桥要的会话模型本体（WxIm.Use 与页共享同一份 List）。
+    List<WxSession> Model() { return data; }
+
+    /// 绑定宿主 App，并接上「会话行拖出列表成独立窗口」手势。
+    void UseDetach(App a) {
+        this.app = a;
+        list.OnDragOut((i) => { this.Detach(i); });
+    }
+
+    /// 行被拖出列表之后：只有拖到主窗口之外才开独立窗口。原版行为
+    /// 如此——窗口内拖放不开窗，那次手势留给列表自己的滚动/选择。
+    void Detach(int i) {
+        if (this.app == null || i < 0 || i >= data.Count) { return; }
+        int mx = this.app.mouseX;
+        int my = this.app.mouseY;
+        if (mx >= 0 && mx < this.app.ClientWidth()
+            && my >= 0 && my < this.app.ClientHeight()) { return; }
+        WxChatWindow.Open(this.app, data[i], () => { this.OnForeignSend(i); });
+    }
+
+    /// 浮窗里发出消息后回到主窗口：刷新列表摘要；当前会话跟着重绑
+    /// （同一条记录，重绑等于把新消息滚进视野）。
+    void OnForeignSend(int i) {
+        list.Refresh();
+        if (i == current) { this.Select(i); }
+    }
+
+    override string Kind() { return "WxPageChat"; }
+}

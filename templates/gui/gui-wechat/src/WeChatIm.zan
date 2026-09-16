@@ -48,29 +48,28 @@ static class WxIm {
         });
     }
 
-    /// 把服务端的 chats 数组重填进共享模型（保留对象身份，行模板
-    /// 与绑定的 ListView 直接看到新值）。
+    /// 把服务端的 chats 数组重填进共享模型。槽身份跟对端走，不跟
+    /// 下标走：服务端按最新消息排序，两次轮询之间顺序经常变——按下
+    /// 标复用会把槽悄悄换给别的对端（旧会话的消息记录被当"别人家的"
+    /// 清掉、拖出的浮窗拿着旧对象直接串台）。先按 peer 建索引，认领
+    /// 得到的原对象连同消息记录继续用，认领不到的开新槽；列表实例
+    /// 不换（页与列表绑定的是同一份引用），清掉按服务端顺序重填。
     static void ApplyChats(JsonValue items) {
         if (WxIm.sessions == null) { return; }
         int n = items.Count();
-        // 服务端会话数少于本地（比如别的端清了记录）：截掉尾部多余行。
-        while (WxIm.sessions.Count > n) { WxIm.sessions.RemoveAt(WxIm.sessions.Count - 1); }
+        Dict<string, WxSession> idle = new Dict<string, WxSession>();
+        for (int i = 0; i < WxIm.sessions.Count; i = i + 1) {
+            idle.Add(WxIm.sessions[i].peer, WxIm.sessions[i]);
+        }
+        List<WxSession> next = new List<WxSession>();
         for (int i = 0; i < n; i = i + 1) {
             JsonValue o = items.At(i);
-            WxSession s = null;
-            if (i < WxIm.sessions.Count) { s = WxIm.sessions[i]; }
-            if (s == null) {
-                s = WxSession.Blank();
-                WxIm.sessions.Add(s);
-            }
             string newPeer = o.Str("peerId", "");
-            // 槽被换给另一个对端时清空旧记录：会话槽是复用的（列表
-            // 行对象身份要保），但别人家的消息不能留在新对端的记录里
-            // ——示例数据首屏那一屏正是这么漏进来的。
-            if (s.peer != "" && s.peer != newPeer) {
-                s.msgs.Clear();
-                s.lastMark = 0;
-            }
+            WxSession s;
+            if (!idle.TryGetValue(newPeer, out s)) { s = null; }
+            if (s != null) { idle.Remove(newPeer); }
+            if (s == null) { s = WxSession.Blank(); }
+            next.Add(s);
             s.peer = newPeer;
             s.name = o.Str("peerName", "?");
             s.initial = WxIm.IniOf(s.name);
@@ -87,6 +86,10 @@ static class WxIm {
             // 有了这一条，"已送达"在对方没点开这条会话时就亮了。
             string ackId = o.Str("ackId", "0");
             if (ackId != "0" && ackId != "") { WxIm.QueueAck(newPeer); }
+        }
+        WxIm.sessions.Clear();
+        for (int i = 0; i < next.Count; i = i + 1) {
+            WxIm.sessions.Add(next[i]);
         }
         // 列表重建后当前选中行已经是新的槽对象。只有"还没选过"时才主动
         // 选一次（登录后首屏：不点行也能看到当前会话的记录）——每次轮询
@@ -412,8 +415,11 @@ static class WxIm {
         return t.ToDateString().Substring(5, 5);
     }
 
-    /// 让页面把新数据画出来（列表行 + 气泡 + 标题区）。
+    /// 让页面把新数据画出来（列表行 + 气泡 + 标题区）。拖出去的浮窗
+    /// 共享同一份会话模型，一并跟上——浮窗里才能实时看到新消息并入
+    /// 与回执翻位，而不是只停在发送那一刻的画面。
     static void RefreshViews() {
         if (WxIm.page != null) { WxIm.page.OnDataChanged(); }
+        WxChatWindow.RefreshAll();
     }
 }

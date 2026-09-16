@@ -6,6 +6,9 @@ using System.Web;
 
 /* {{NAME}} -- ZanWeb 企业级 Web 应用。主入口负责启动服务器与注册路由，运行时配置从 config/app.json 读取。 */
 class Program {
+    [DllImport("crt")]
+    static extern string getenv(string name);
+
     /* 慢请求阈值(ms)，启动时从 [log].slowMs 读取 */
     static int slowMs = 1000;
     /* 慢 SQL 阈值(微秒)，启动时从 [log].slowSqlMs 换算 */
@@ -94,12 +97,16 @@ class Program {
                 + " flush=" + Convert.ToString(Cfg.Metrics.flushSeconds) + "s");
         }
 
-        /* 日程提醒后台协程（T11）：多 worker 经 reminded 原子置位抢占，防重发。 */
-        Task.Spawn(CalendarRemind.Loop());
+        /* 日程提醒后台协程（T11）：多 worker 经 reminded 原子置位抢占，防重发。
+           ZAN_NO_BG=1 时不启（e2e/诊断开关：定位响应损坏是否与后台协程
+           和请求并发共享连接池有关）。 */
+        if (getenv("ZAN_NO_BG") == null) {
+            Task.Spawn(CalendarRemind.Loop());
 
-        /* IM 实时层（T13）：每 worker 扫描 oa_message 水位并只扇出本 worker
-           注册表命中的连接，落库为准无需抢占（见 MessageRelay.zan）。 */
-        Task.Spawn(MessageRelay.Loop());
+            /* IM 实时层（T13）：每 worker 扫描 oa_message 水位并只扇出本
+               worker 注册表命中的连接，落库为准无需抢占（见 MessageRelay.zan）。 */
+            Task.Spawn(MessageRelay.Loop());
+        }
 
         /* 路由：编译期从控制器属性生成，运行时只执行注册 */
         __AttrRoutes.Register(app);

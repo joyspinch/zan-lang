@@ -89,14 +89,31 @@ class WxChatWindow : ChildWindow {
         WxChatWindow.wins.Add(w);
     }
 
-    /// 已开着的该会话窗口（按会话名认：示例数据里会话名唯一）。
+    /// 已开着的该会话窗口（按会话对象认：槽身份跟对端走，同一会话
+    /// 在轮询重建前后是同一个对象）。
     static WxChatWindow Find(WxSession s) {
         if (WxChatWindow.wins == null) { return null; }
         for (int i = 0; i < WxChatWindow.wins.Count; i = i + 1) {
             WxChatWindow w = WxChatWindow.wins[i];
-            if (w.IsOpen() && w.sess.name == s.name) { return w; }
+            if (w.IsOpen() && w.sess == s) { return w; }
         }
         return null;
+    }
+
+    /// 共享模型变了（轮询并入新消息、回执翻位）就重画气泡区。
+    /// WxIm.RefreshViews 对每扇开着的窗调一遍。
+    static void RefreshAll() {
+        if (WxChatWindow.wins == null) { return; }
+        for (int i = 0; i < WxChatWindow.wins.Count; i = i + 1) {
+            WxChatWindow w = WxChatWindow.wins[i];
+            if (w.IsOpen()) { w.OnModelChanged(); }
+        }
+    }
+
+    void OnModelChanged() {
+        if (chat == null || !this.IsOpen()) { return; }
+        this.BindChat();
+        this.RequestRedraw();
     }
 
     override string Title() { return sess.name; }
@@ -222,15 +239,22 @@ class WxChatWindow : ChildWindow {
         chat.Invalidate();
     }
 
-    /// 在浮窗里发送：写进共享的会话记录，再让主窗口跟上。
+    /// 在浮窗里发送。接了服务端的会话走 WxIm.Send——与主窗口同一条
+    /// 链路：本地先进气泡、服务端落账、回执随轮询翻位；气泡上屏由
+    /// WxIm.RefreshViews → RefreshAll 回到这扇窗完成。没接服务端的
+    /// 示例行维持纯本地行为。
     void Send() {
         string t = box.GetText();
         if (t == "") { return; }
-        ChatMessage m = ChatMessage.Create("user", t);
-        m.at = DateTime.UtcNow().ToUnixSeconds();
-        sess.msgs.Add(m);
-        sess.snippet = t;
-        sess.time = "刚刚";
+        if (sess.peer.Length > 0) {
+            WxIm.Send(sess, t);
+        } else {
+            ChatMessage m = ChatMessage.Create("user", t);
+            m.at = DateTime.UtcNow().ToUnixSeconds();
+            sess.msgs.Add(m);
+            sess.snippet = t;
+            sess.time = "刚刚";
+        }
         sess.unread = 0;
         box.SetText("");
         chat.Invalidate();
@@ -250,6 +274,7 @@ class WxHistoryWindow : ChildWindow {
     WxSession sess;
     App owner;
     int count;
+    ListView<WxHistRow> lv;
 
     override string Title() {
         return "「" + sess.name + "」的聊天记录(" + Convert.ToString(count) + ")";
@@ -271,19 +296,51 @@ class WxHistoryWindow : ChildWindow {
         WxHistoryWindow w = new WxHistoryWindow();
         w.sess = s;
         w.owner = app;
-        List<WxHistRow> rows = WxData.History(s);
-        w.count = rows.Count;
-        w.Build(rows);
+        w.Build();
         WxHistoryWindow.live = w;
         WxHistoryWindow.cur = s;
     }
 
-    void Build(List<WxHistRow> rows) {
+    /// 共享会话记录 → 记录窗口的行。数据就是会话模型里那份：主窗口
+    /// 与浮窗发的每一条、服务端轮询并进来的每一条都在——记录窗与
+    /// 聊天区看到的历史从此一致，不再有虚构语料补长。`q` 非空时按
+    /// 正文过滤。
+    List<WxHistRow> RowsOf(string q) {
+        List<WxHistRow> rows = new List<WxHistRow>();
+        for (int i = 0; i < sess.msgs.Count; i = i + 1) {
+            ChatMessage m = sess.msgs[i];
+            if (q.Length > 0 && m.text.IndexOf(q) < 0) { continue; }
+            string who = "我";
+            string ini = "我";
+            string tint = "primary";
+            if (m.role != "user") {
+                tint = sess.tint;
+                who = sess.name;
+                ini = sess.initial;
+                if (m.agent != "") {
+                    string n = WxData.NameOf(m.agent);
+                    if (n != null) { who = n; }
+                    string t = WxData.IniOf(m.agent);
+                    if (t != "") { ini = t; }
+                    tint = WxData.TintOfId(m.agent);
+                }
+            }
+            // 日期与列表一致：今天 HH:MM、更早 MM-dd；发送中的气泡
+            // （服务端 id 还没回来，at=0）留空。
+            string date = m.at > 0 ? WxIm.ClockOf(Convert.ToString(m.at)) : "";
+            rows.Add(WxHistRow.Of(who, ini, m.text, date, tint));
+        }
+        return rows;
+    }
+
+    void Build() {
         Panel root = Wx.Col("wxhist");
 
         Flex head = Wx.Row("wxhisthead");
         Input q = new Input("搜索");
         q.Class = "grow";
+        // 每次编辑就地重筛：行是纯展示模型，重 Bind 即可。
+        q.BindEvent("Change", () => { this.Rebind(q.GetText()); });
         head.Add(q);
         root.Add(head);
 
@@ -307,10 +364,9 @@ class WxHistoryWindow : ChildWindow {
         root.Add(ts);
         root.Add(Wx.Line());
 
-        ListView<WxHistRow> lv = new ListView<WxHistRow>(WxHistRowTpl.Of);
+        lv = new ListView<WxHistRow>(WxHistRowTpl.Of);
         lv.Class = "wxhistlist";
         lv.dock = 5;
-        lv.Bind(rows);
         root.Add(lv);
 
         this.SetRoot(root, null);
@@ -318,6 +374,20 @@ class WxHistoryWindow : ChildWindow {
         this.OpenHost(this.owner);
         // 子窗口是另一个 App：主窗口铺的 .wx* 应用样式表要再铺一遍。
         this.host.UseAppCss(WxSkin.Css());
+        this.Rebind("");
+        this.RequestRedraw();
+    }
+
+    /// 按关键字重筛并重绑（搜索框每次编辑与首次打开都走这）。计数
+    /// 不含空态占位行。
+    void Rebind(string q) {
+        List<WxHistRow> rows = this.RowsOf(q);
+        count = rows.Count;
+        if (rows.Count == 0) {
+            rows.Add(WxHistRow.Of("", "",
+                q.Length > 0 ? "没有匹配的聊天记录" : "还没有聊天记录", "", ""));
+        }
+        lv.Bind(rows);
         this.RequestRedraw();
     }
 }
@@ -625,4 +695,200 @@ class WxContactManagerWindow : ChildWindow {
         w.RequestRedraw();
         WxContactManagerWindow.live = w;
     }
+}
+
+/// 设置层窗口里的内容：左列导航，右侧六个分区（只让当前分区可见，
+/// 六个分区共用同一条保留的控件树，切换不重建控件）。
+class WxSettingsView : Control {
+    Panel body;
+    List<Panel> secs;
+    List<Button> navs;
+    List<string> titles;
+    int cur;
+
+    WxSettingsView(App app) {
+        this.InitControl("wxSettingsView", 5);
+        this.Class = "wxset";
+        Panel nav = Wx.Col("wxsetnav");
+        nav.dock = 3;
+        body = Wx.Col("wxsetbody");
+        body.dock = 5;
+        this.Add(nav);
+        this.Add(body);
+
+        titles = new List<string>();
+        titles.Add("账号与存储");
+        titles.Add("通用");
+        titles.Add("快捷键");
+        titles.Add("通知");
+        titles.Add("插件");
+        titles.Add("关于微信");
+        secs = new List<Panel>();
+        secs.Add(this.SecAccount(app));
+        secs.Add(this.SecGeneral(app));
+        secs.Add(this.SecKeys(app));
+        secs.Add(this.SecNotify(app));
+        secs.Add(this.SecPlugins(app));
+        secs.Add(this.SecAbout(app));
+        for (int i = 0; i < secs.Count; i = i + 1) {
+            body.Add(secs[i]);
+        }
+
+        navs = new List<Button>();
+        for (int i = 0; i < titles.Count; i = i + 1) {
+            Button b = new Button(titles[i]);
+            b.Class = "wxsetnavbtn";
+            nav.Add(b);
+            navs.Add(b);
+            int idx = i;
+            b.OnClick(() => { this.Pick(idx); });
+        }
+        this.Pick(0);
+    }
+
+    void Pick(int i) {
+        if (i < 0 || i >= secs.Count) { return; }
+        cur = i;
+        for (int k = 0; k < secs.Count; k = k + 1) {
+            secs[k].visible = k == i;
+            navs[k].Class = Wx.NavCls(k == i);
+        }
+    }
+
+    Panel SecAccount(App app) {
+        Panel s = Wx.Col("");
+        s.dock = 5;
+        s.Add(Wx.Sec("账号"));
+        Flex r0 = Wx.Row("wxsetrow");
+        r0.Add(Wx.Lbl("退出登录", "wxsetkey grow"));
+        Button quit = new Button("退出登录");
+        quit.Class = "danger";
+        r0.Add(quit);
+        s.Add(r0);
+        s.Add(Wx.Line());
+        s.Add(WxRow.Kv("登录方式", "自动"));
+        s.Add(Wx.Line());
+        Flex r2 = Wx.Row("wxsetrow");
+        r2.Add(Wx.Lbl("保留聊天记录", "wxsetkey grow"));
+        Switch keep = new Switch();
+        keep.SetOn(false);
+        r2.Add(keep);
+        s.Add(r2);
+        s.Add(Wx.Line());
+        Flex r3 = Wx.Row("wxsetrow");
+        r3.Add(Wx.Lbl("存储空间", "wxsetkey grow"));
+        r3.Add(Wx.Lbl("已使用 148.6M", "wxsetval"));
+        r3.Add(new Button("管理"));
+        s.Add(r3);
+        s.Add(Wx.Line());
+        Flex r4 = Wx.Row("wxsetrow");
+        r4.Add(Wx.Lbl("存储位置", "wxsetkey grow"));
+        r4.Add(Wx.Lbl("D:\\微聊\\数据", "wxsetval"));
+        r4.Add(new Button("更改"));
+        s.Add(r4);
+        s.Add(Wx.Line());
+        Flex r5 = Wx.Row("wxsetrow");
+        r5.Add(Wx.Lbl("自动下载小于", "wxsetkey grow"));
+        SelectBox limit = new SelectBox("20 MB");
+        limit.AddOption("5 MB");
+        limit.AddOption("10 MB");
+        limit.AddOption("20 MB");
+        limit.AddOption("50 MB");
+        r5.Add(limit);
+        r5.Add(Wx.Lbl("的文件", "wxsetkey"));
+        Switch dl = new Switch();
+        dl.SetOn(true);
+        r5.Add(dl);
+        s.Add(r5);
+        s.Add(Wx.Line());
+        return s;
+    }
+
+    Panel SecGeneral(App app) {
+        Panel s = Wx.Col("");
+        s.dock = 5;
+        s.Add(Wx.Sec("外观"));
+        s.Add(WxRow.Kv("语言", "简体中文"));
+        s.Add(Wx.Line());
+        s.Add(WxRow.Kv("字体大小", "标准"));
+        s.Add(Wx.Line());
+        s.Add(WxRow.Kv("皮肤", "跟随系统"));
+        s.Add(Wx.Line());
+        s.Add(WxRow.Kv("界面缩放", "100%"));
+        s.Add(Wx.Line());
+        return s;
+    }
+
+    Panel SecKeys(App app) {
+        Panel s = Wx.Col("");
+        s.dock = 5;
+        s.Add(Wx.Sec("发送与截图"));
+        s.Add(WxRow.Kv("发送消息", "Enter"));
+        s.Add(Wx.Line());
+        s.Add(WxRow.Kv("换行", "Ctrl + Enter"));
+        s.Add(Wx.Line());
+        s.Add(WxRow.Kv("截图", "Alt + A"));
+        s.Add(Wx.Line());
+        s.Add(WxRow.Kv("锁定", "Ctrl + L"));
+        s.Add(Wx.Line());
+        return s;
+    }
+
+    Panel SecNotify(App app) {
+        Panel s = Wx.Col("");
+        s.dock = 5;
+        s.Add(Wx.Sec("消息提醒"));
+        Flex r0 = Wx.Row("wxsetrow");
+        r0.Add(Wx.Lbl("新消息提醒", "wxsetkey grow"));
+        Switch n1 = new Switch();
+        n1.SetOn(true);
+        r0.Add(n1);
+        s.Add(r0);
+        s.Add(Wx.Line());
+        Flex r1 = Wx.Row("wxsetrow");
+        r1.Add(Wx.Lbl("声音", "wxsetkey grow"));
+        Switch n2 = new Switch();
+        n2.SetOn(true);
+        r1.Add(n2);
+        s.Add(r1);
+        s.Add(Wx.Line());
+        Flex r2 = Wx.Row("wxsetrow");
+        r2.Add(Wx.Lbl("免打扰时段", "wxsetkey grow"));
+        r2.Add(Wx.Lbl("23:00 - 07:00", "wxsetval"));
+        s.Add(r2);
+        s.Add(Wx.Line());
+        return s;
+    }
+
+    Panel SecPlugins(App app) {
+        Panel s = Wx.Col("");
+        s.dock = 5;
+        s.Add(Wx.Sec("已安装的插件"));
+        s.Add(WxRow.Kv("剪贴板增强", "已启用"));
+        s.Add(Wx.Line());
+        s.Add(WxRow.Kv("代码片段", "已启用"));
+        s.Add(Wx.Line());
+        s.Add(WxRow.Kv("插件市场", "浏览"));
+        s.Add(Wx.Line());
+        return s;
+    }
+
+    Panel SecAbout(App app) {
+        Panel s = Wx.Col("");
+        s.dock = 5;
+        s.Add(Wx.Sec("版本信息"));
+        s.Add(WxRow.Kv("版本", "1.0.0 (build 20260911)"));
+        s.Add(Wx.Line());
+        s.Add(WxRow.Kv("内核", "Zan / Gui 标准库"));
+        s.Add(Wx.Line());
+        Flex r2 = Wx.Row("wxsetrow");
+        r2.Add(Wx.Lbl("检查更新", "wxsetkey grow"));
+        r2.Add(new Button("检查"));
+        s.Add(r2);
+        s.Add(Wx.Line());
+        s.Add(Wx.Lbl("示例数据全部虚构，与任何真实账号无关。", "wxhint"));
+        return s;
+    }
+
+    override string Kind() { return "WxSettingsView"; }
 }
