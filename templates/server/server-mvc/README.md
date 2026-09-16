@@ -533,6 +533,33 @@ round-trip is re-validated by the same sanitizer before insert. AI output is a
 draft, never trusted, never auto-saved. Requires `[站点设置 → AI]` enabled;
 the endpoint must be one of the allow-listed providers (or local Ollama).
 
+## Wiki knowledge base (`/admin/wiki`)
+
+Department-scoped knowledge bases with Markdown documents, AI curation and
+full revision history.
+
+- **Spaces** (`wiki_space`) — one knowledge base per department (bound to
+  `sys_department`, or generic with `departmentId = 0`); a space with docs
+  refuses deletion.
+- **Docs** (`wiki_doc`) — Markdown source stored verbatim, rendered to HTML
+  at read time by a small server-side renderer (headings / lists / quotes /
+  code fences / **bold** / `code`; everything is HTML-escaped before
+  markup is applied, so stored source can never inject HTML). Reading bumps
+  the view counter.
+- **Revisions** (`wiki_revision`) — every save (human edit, AI organize,
+  rollback) snapshots the whole doc and bumps `rev`. History page lists
+  snapshots with the operator's note; any revision can be viewed read-only
+  or rolled back — rollback itself creates a new revision, history is never
+  rewritten.
+- **AI 整理** — sends the current body through `Ai.CompleteRaw` with a
+  curation system prompt and stores the result as a new revision
+  (`note = AI 整理`); the same allow-list / ready-check rules as the table
+  designer apply, and people can keep editing or roll the AI version back.
+
+Markdown source must be read with `InRaw` — the default `In`/`InText`
+accessors run `Filter.Clean`, which strips CR/LF (header-injection defense)
+and would silently flatten multiline text into one line.
+
 ## Inline cell editing (generic, `data-quick`)
 
 Any admin list can opt its table into in-place editing without page-specific

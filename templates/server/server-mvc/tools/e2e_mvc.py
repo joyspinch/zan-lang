@@ -432,6 +432,65 @@ def run_matrix(catcher):
        not sql("SELECT 1 FROM sys_job_log WHERE jobId=?", (jid,)),
        "job delete removes logs too")
 
+    # ---- wiki: spaces, docs, revisions, guards ----
+    code, _b, _c = http("/admin/wiki", cookie=cookie)
+    ok(code == 200, "wiki page renders")
+    r = http("/admin/wiki/spacesave", cookie=cookie, data={
+        "name": "e2e 研发库", "description": "研发部门知识库", "icon": "",
+        "departmentId": "0", "sortOrder": "1", "status": "1"})
+    ok(code_of(r[1]) == "0000" or r[0] in (200, 301, 302), "space created")
+    sid = sql("SELECT id FROM wiki_space WHERE name='e2e 研发库'")[0][0]
+    body1 = "# 部署\n\n第一步 **准备** 机器。\n\n- 装依赖\n- 起服务"
+    r = http("/admin/wiki/save", cookie=cookie, data={
+        "spaceId": sid, "title": "部署手册", "body": body1,
+        "tags": "部署,运维", "note": "创建", "status": "1"})
+    ok(code_of(r[1]) == "0000" or r[0] in (200, 301, 302), "doc created")
+    did = sql("SELECT id FROM wiki_doc WHERE title='部署手册'")[0][0]
+    ok(sql("SELECT rev FROM wiki_doc WHERE id=?", (did,))[0][0] == 1,
+       "initial revision is 1")
+    ok(sql("SELECT note FROM wiki_revision WHERE docId=? AND rev=1",
+           (did,))[0][0] == "创建", "revision 1 snapshotted")
+    http("/admin/wiki/save", cookie=cookie, data={
+        "id": did, "spaceId": sid, "title": "部署手册",
+        "body": "# 部署\n\n补充：回滚章节。\n\n- 装依赖",
+        "tags": "部署,运维", "note": "补充回滚章节", "status": "1"})
+    ok(sql("SELECT rev FROM wiki_doc WHERE id=?", (did,))[0][0] == 2 and
+       sql("SELECT COUNT(*) FROM wiki_revision WHERE docId=?",
+           (did,))[0][0] == 2, "edit bumps revision to 2")
+    code, body, _ = http("/admin/wiki/page?id=%d" % did, cookie=cookie)
+    ok(code == 200 and "<strong>准备</strong>" not in body
+       and "<h3>" in body and "<li>装依赖</li>" in body,
+       "current markdown rendered to html")
+    code, body, _ = http("/admin/wiki/history?id=%d" % did, cookie=cookie)
+    ok(code == 200 and "补充回滚章节" in body, "history lists revisions")
+    code, body, _ = http("/admin/wiki/revision?id=%d&rev=1" % did,
+                         cookie=cookie)
+    ok(code == 200 and "<strong>准备</strong>" in body,
+       "revision view renders old content")
+    r = http("/admin/wiki/rollback", cookie=cookie,
+             data={"id": did, "rev": "1"})
+    ok(code_of(r[1]) == "0000" or r[0] in (200, 301, 302), "rollback ok")
+    ok(sql("SELECT rev FROM wiki_doc WHERE id=?", (did,))[0][0] == 3 and
+       sql("SELECT COUNT(*) FROM wiki_revision WHERE docId=?",
+           (did,))[0][0] == 3, "rollback created revision 3")
+    ok(sql("SELECT body FROM wiki_doc WHERE id=?", (did,))[0][0] == body1,
+       "rolled-back body matches r1")
+    r = http("/admin/wiki/aiorganize", cookie=cookie, data={"id": did})
+    ok(code_of(r[1]) != "0000", "ai organize guarded when AI off")
+    r = http("/admin/wiki/spacedelete", cookie=cookie, data={"id": sid})
+    ok(code_of(r[1]) != "0000", "space with docs not deletable")
+    r = http("/admin/wiki/save", data={
+        "spaceId": sid, "title": "anon", "body": "x", "note": "",
+        "status": "1"})
+    ok(code_of(r[1]) != "0000", "wiki save rejects anonymous")
+    http("/admin/wiki/delete", cookie=cookie, data={"id": did})
+    ok(not sql("SELECT 1 FROM wiki_doc WHERE id=?", (did,)) and
+       not sql("SELECT 1 FROM wiki_revision WHERE docId=?", (did,)),
+       "doc delete cascades revisions")
+    r = http("/admin/wiki/spacedelete", cookie=cookie, data={"id": sid})
+    ok(code_of(r[1]) == "0000" or r[0] in (200, 301, 302),
+       "empty space deletable after cleanup")
+
     # ---- coder: designer three-step ----
     r = http("/admin/dev/coder/tablesave", cookie=cookie, data={
         "tableName": "e2e_demo", "title": "e2e 演示"})
