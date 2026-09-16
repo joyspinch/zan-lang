@@ -1,0 +1,138 @@
+// Conformance: an owned local declared AFTER an await, released by the
+// exception landing of the same invocation (A320).
+//
+// `extra` below is an ARC-owned local whose declaration -- and therefore the
+// coroutine slot's first store -- sits after the first await. When `fail`
+// throws, the unwind longjmps back into this invocation's resume, whose
+// co.exc landing cleanup releases every owned local from its stack alloca.
+// The landing is not a CFG edge, so an optimized build folds the load of a
+// slot never stored on the entry-to-landing path to `ptr undef`, and
+// release_dyn materializes the undef as whatever the argument register
+// holds: a raw heap pointer, released -- the server-mvc /admin/wiki heap
+// corruption. Every pointer-shaped local slot is now null-initialized at
+// entry, so the landing reads at worst null and the cleanup releases
+// nothing when the body never stored.
+using System;
+
+class Boom : Exception {
+    Boom(string m) { Message = m; }
+}
+
+class Bag {
+    string tag;
+    List<string> rows;
+
+    static Bag Of(string tag) {
+        Bag b = new Bag();
+        b.tag = tag;
+        b.rows = new List<string>();
+        b.rows.Add(tag);
+        return b;
+    }
+}
+
+class RowsBuilder {
+    string tag;
+
+    RowsBuilder(string t) { tag = t; }
+
+    RowsBuilder Where(string p) {
+        return this;
+    }
+
+    async List<string> ToListAsync() {
+        await Task.Delay(1);
+        List<string> r = new List<string>();
+        r.Add(tag);
+        r.Add(tag);
+        return r;
+    }
+}
+
+class Driver {
+    void fail(string why) {
+        throw new Boom(why);
+    }
+
+    static async Bag Fetch(string tag) {
+        await Task.Delay(1);
+        return Bag.Of(tag);
+    }
+
+    async List<string> Rows(string tag) {
+        await Driver.Fetch(tag);
+        List<string> r = new List<string>();
+        r.Add(tag);
+        r.Add(tag);
+        return r;
+    }
+
+    List<string> Str(string s) {
+        List<string> r = new List<string>();
+        r.Add(s);
+        return r;
+    }
+
+    // The A320 shape: many live locals saved/restored around two awaits,
+    // `extra` declared after the first await; the throw after the second
+    // await unwinds through this invocation and its landing cleanup releases
+    // every owned local.
+    async int Late(bool bad) {
+        Bag a = await Driver.Fetch("a");
+        List<string> pad1 = this.Str("p1");
+        string pad2 = "p2";
+        List<string> pad3 = this.Str("p3");
+        string pad4 = "p4";
+        List<string> extra = await new RowsBuilder("x").Where("q").ToListAsync();
+        string pad5 = "p5";
+        List<string> pad6 = this.Str("p6");
+        if (bad) { this.fail("late failed"); }
+        return extra.Count + a.rows.Count
+            + pad1.Count + pad3.Count + pad6.Count
+            + pad2.Length + pad4.Length + pad5.Length;
+    }
+
+    static List<string> Log = new List<string>();
+    static int Done;
+
+    // The async void form: fire-and-forget completion, landing exercised by
+    // the catch in Run below.
+    async void Scan(bool bad) {
+        Bag a = await Driver.Fetch("a");
+        List<string> extra = await new RowsBuilder("x").Where("q").ToListAsync();
+        Driver.Log.Add("scan");
+        if (bad) { this.fail("scan failed"); }
+        Driver.Log.Add("done:" + Convert.ToString(extra.Count + a.rows.Count));
+        Driver.Done = Driver.Done + 1;
+    }
+
+    static async int Run() {
+        Driver d = new Driver();
+        Console.WriteLine("late ok=" + Convert.ToString(await d.Late(false)));
+
+        string caught = "";
+        try {
+            int bad = await d.Late(true);
+        } catch (Boom e) {
+            caught = e.Message;
+        }
+        Console.WriteLine("late threw=" + caught);
+
+        d.Scan(false);
+        for (int i = 0; i < 1000 && Driver.Done < 1; i = i + 1) {
+            await Task.Delay(1);
+        }
+        d.Scan(true);
+        for (int i = 0; i < 1000 && Driver.Done < 2; i = i + 1) {
+            await Task.Delay(1);
+        }
+        for (int i = 0; i < Driver.Log.Count; i = i + 1) {
+            Console.WriteLine(Driver.Log[i]);
+        }
+        return Driver.Done;
+    }
+
+    static async void Main() {
+        Console.WriteLine("done=" + Convert.ToString(await Run()));
+    }
+}

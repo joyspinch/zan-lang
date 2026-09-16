@@ -1052,11 +1052,25 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
   **别用 `emit_async_reload_slots`（从堆帧 reload）**：A293 契约是同调用 throw
   落地时栈槽比帧新（after-await），reload 会把帧里的旧值盖回来
   （async_throw_across_frames 当场变红）。
+- **残留洞（A320，2026-09-17 已修）**：A300 的入口 null-init 只盖了预登记
+  alocal/参数槽；**语句级声明走 `emit_entry_alloca` 的指针槽没有 init**。
+  「声明点在 await 之后」的 owned 局部（典型：ORM 动作里第二个查询的结果
+  局部）在 resume 的 co.exc 清理里 `load alloca; release_dyn` → -Os 折成
+  `release_dyn(ptr undef)` → undef 具体化成 rcx 现成值（页对齐堆块基址）→
+  ARC 头跨页 AV 或静默减垃圾 rc → 堆损坏（后续 0xC0000374 一批、EH chunk
+  calloc 失败报 OOM）；dev 档同一 load 读栈垃圾 → E0A2C002 first-chance
+  （guard 软接住，假装稳定）。修：`emit_entry_alloca` 对指针形 alloca 统一
+  入口 null-init。教训：修「某类槽」不如修「创建槽的入口」——所有语句级
+  alloca 都过 `emit_entry_alloca`，一处 init 全收，新槽族自动受庇。
 - **判定手法（可复用）**：publish 崩溃 + `--arc-guard` 复建**无 guard 报告**=
   释放的是纯垃圾指针（未定义槽值），不是已释放 Zan 对象（over-release 会触发
   guard）；`--emit-ir`（dump 的是**优化后** IR）grep catch phi 的 undef
-  incoming 直接实锤。注意 `--emit-ir` 跳过链接：经 build_ide 间接调 zanc 时
-  后续步骤对缺 exe 报错，要单跑截 stdout。
+  incoming 直接实锤（本例直接 grep `release_dyn(ptr undef)`，比 phi 更直指）。
+  注意 `--emit-ir` 跳过链接：经 build_ide 间接调 zanc 时后续步骤对缺 exe
+  报错，要单跑截 stdout。VEH backtrace 被 handler 帧截断时，叶桩调用的返回
+  地址就是 [rsp] 第一个字——rt_crash.h 崩溃记录已内置 Rsp 起原始栈转储，
+  直接读「raw stack (@rsp)」首行。**`-Os` 不带 `--publish` 不 strip**：同
+  优化档 + nm 全符号，崩溃 RVA 直接查表，不必碰 .pdata 字节匹配。
 - **符号化死路提示**：publish exe 是 strip 过的，llvm-nm/llvm-symbolizer 全空；
   cdb 可用但无符号只给 module+offset。破法：`.pdata`（RUNTIME_FUNCTION 数组，
   python struct 裸解析）把 fault RVA 定到函数边界，再把函数头 24 字节去

@@ -3958,6 +3958,17 @@ static LLVMValueRef emit_entry_alloca(zan_irgen_t *g, LLVMTypeRef ty, const char
     if (term) LLVMPositionBuilderBefore(g->builder, term);
     else LLVMPositionBuilderAtEnd(g->builder, entry);
     LLVMValueRef alloca = LLVMBuildAlloca(g->builder, ty, name);
+    /* Pointer-shaped slots are defined from entry (A320): the entry block
+     * statically dominates every setjmp landing, so the co.exc cleanup's
+     * owned-local release reads at worst null there. Without this, -Os folds
+     * the landing load of a slot whose first store sits after an await to
+     * `ptr undef`, and release_dyn materializes the undef as whatever the
+     * argument register holds -- a raw heap pointer -- corrupting the heap
+     * (async landing + declared-later local: the server-mvc /admin/wiki
+     * crash). In synchronous functions the extra store is dead the moment
+     * the declaration stores and the optimizer drops it. */
+    if (LLVMGetTypeKind(ty) == LLVMPointerTypeKind)
+        LLVMBuildStore(g->builder, LLVMConstNull(ty), alloca);
     LLVMPositionBuilderAtEnd(g->builder, cur);
     return alloca;
 }

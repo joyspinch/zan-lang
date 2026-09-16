@@ -659,6 +659,26 @@ static void zan__crash_write_record(EXCEPTION_POINTERS *ep,
             fprintf(f, "rax=%p rbx=%p rcx=%p rdx=%p rsi=%p rdi=%p\n",
                     (void *)c->Rax, (void *)c->Rbx, (void *)c->Rcx,
                     (void *)c->Rdx, (void *)c->Rsi, (void *)c->Rdi);
+            /* Raw stack words from Rsp: a fault in a frameless leaf stub
+             * (ARC fast paths, setjmp landings) stops the unwinder above,
+             * so the caller never shows in the backtrace -- its return
+             * address is simply the first word at Rsp. */
+            {
+                ULONG_PTR raw_rsp = ZAN_CTX_SP(c);
+                MEMORY_BASIC_INFORMATION raw_mbi;
+                if (raw_rsp && VirtualQuery((void *)raw_rsp, &raw_mbi,
+                                            sizeof raw_mbi)
+                    && raw_mbi.State == MEM_COMMIT
+                    && !(raw_mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+                    fprintf(f, "raw stack (@rsp):\n");
+                    for (unsigned w = 0; w < 16; w++) {
+                        ULONG_PTR p = raw_rsp + w * sizeof(ULONG_PTR);
+                        char tag[16];
+                        snprintf(tag, sizeof tag, "  [%02u] ", w);
+                        zan__crash_modline(f, (void *)(*(ULONG_PTR *)p), tag);
+                    }
+                }
+            }
         }
 #elif defined(_M_ARM64) || defined(__aarch64__)
         if (ep->ContextRecord) {
