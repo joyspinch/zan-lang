@@ -1355,8 +1355,44 @@
     // The first screen is already in the panel, server-rendered.
     startStream();
     wireModelPick(panel);
+    wireBell();
     window.addEventListener('popstate', restoreHistory);
   });
+
+
+  // ---- alert bell ----------------------------------------------------------
+  // 顶栏告警：轮询 /admin/monitor/alerts（30 秒一次，权限随运行监控屏）。
+  // 无告警时铃铛保持隐藏——没有消息就没有界面；有告警时显出红条并给出
+  // 条数，悬停看每条文案，点击进运行监控。失败静默：探活是尽力而为。
+  function wireBell() {
+    var bell = document.getElementById('ad-bell');
+    if (!bell) { return; }
+    var poll = function () {
+      fetch('/admin/monitor/alerts', {
+        headers: { 'X-Fragment': '1' }, credentials: 'same-origin'
+      }).then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (j) {
+          if (!j) { return; }
+          var list = j.alerts || [];
+          var n = list.length;
+          var count = bell.querySelector('.ad-bell-n');
+          if (count) {
+            count.textContent = String(n);
+            count.hidden = n === 0;
+          }
+          if (n > 0) {
+            var msgs = [];
+            list.forEach(function (a) { msgs.push(a.msg || ''); });
+            bell.title = msgs.join('\n');
+          } else {
+            bell.title = '运行告警';
+          }
+          bell.classList.toggle('alerting', n > 0);
+        }).catch(function () { /* offline or logged out: try again later */ });
+    };
+    poll();
+    setInterval(poll, 30000);
+  }
 
 
   // Account menu in the top-right corner.

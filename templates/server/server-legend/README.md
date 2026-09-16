@@ -225,6 +225,19 @@ $ nc 127.0.0.1 47100
 
 首页仪表盘带游戏 KPI：账号数/封禁数/角色数（跨区）/实时在线。
 
+运维面与 server-mvc 同代：
+
+- **`GET /health`** 免鉴权探活（LB/看门狗用），`?deep=1` 追加 `SELECT 1`
+  探主库、不可达答 503。
+- **监控屏** `/admin/monitor`：`metrics_minute` 落 **P95 列**（固定档位
+  直方图刷写时取档位上沿，多 worker 按 MAX 合并），历史统计两张表与实时
+  面板同加 P95；新增 **`/admin/monitor/sql`** SQL 统计屏（规范化语句按天
+  聚合，按调用/累计耗时/慢次数排序 + CSV 导出）。
+- **告警铃铛**：顶栏只在有告警时现身，30 秒轮询
+  `/admin/monitor/alerts`（仅可看监控屏的账号渲染）；三信号——5 分钟窗
+  错误率、窗内最差分钟档 P95、worker 掉线，阈值 `[metrics]`
+  `alertErrPct/alertErrCalls/alertP95Ms` 可配，0 关闭。
+
 权限沿用 RBAC：内置角色 `gm`（只管理游戏域：区服、玩家、在线、公告）
 只授 `/admin/game/*` 屏，`admin` 全量；新 GM 页只要控制器方法带
 `[Route]` + `[Custom(IsMenu)]` 就会出现在侧边栏与授权表里，启动时
