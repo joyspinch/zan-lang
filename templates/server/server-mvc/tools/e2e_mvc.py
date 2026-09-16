@@ -394,6 +394,44 @@ def run_matrix(catcher):
     else:
         ok(False, "seeded dict items exist")
 
+    # ---- jobs: in-process scheduler end to end ----
+    code, body, _ = http("/admin/system/jobs", cookie=cookie)
+    ok(code == 200 and "日志清理" in body, "jobs page lists seeded cleanup")
+    r = http("/admin/system/jobs/save", cookie=cookie, data={
+        "name": "e2e 心跳", "kind": "ping", "param": "",
+        "intervalSec": "5", "enabled": "1"})
+    ok(code_of(r[1]) == "0000" or r[0] in (200, 301, 302), "ping job created")
+    jid = sql("SELECT id FROM sys_job WHERE name='e2e 心跳'")[0][0]
+    time.sleep(8)
+    ok(sql("SELECT COUNT(*) FROM sys_job_log WHERE jobId=?",
+           (jid,))[0][0] >= 1, "scheduler fired the job on interval")
+    ok(sql("SELECT lastOk FROM sys_job WHERE id=?", (jid,))[0][0] == 1,
+       "ping run recorded ok")
+    r = http("/admin/system/jobs/quick", cookie=cookie,
+             data={"id": jid, "field": "enabled", "value": "0"})
+    ok(code_of(r[1]) == "0000", "quick disable ok")
+    before = sql("SELECT COUNT(*) FROM sys_job_log WHERE jobId=?",
+                 (jid,))[0][0]
+    time.sleep(7)
+    ok(sql("SELECT COUNT(*) FROM sys_job_log WHERE jobId=?",
+           (jid,))[0][0] == before, "disabled job not scheduled")
+    r = http("/admin/system/jobs/run", cookie=cookie, data={"id": jid})
+    ok(r[0] in (200, 301, 302), "run-now accepted")
+    ok(sql("SELECT COUNT(*) FROM sys_job_log WHERE jobId=?",
+           (jid,))[0][0] == before + 1, "run-now logged one run")
+    r = http("/admin/system/jobs/quick", cookie=cookie,
+             data={"id": jid, "field": "name", "value": "hijack"})
+    ok(code_of(r[1]) != "0000", "job name not inline-editable")
+    r = http("/admin/system/jobs/quick",
+             data={"id": jid, "field": "enabled", "value": "0"})
+    ok(code_of(r[1]) != "0000", "job quick rejects anonymous")
+    code, body, _ = http("/admin/system/jobs/logs?id=%d" % jid, cookie=cookie)
+    ok(code == 200 and "pong" in body, "job logs page shows runs")
+    http("/admin/system/jobs/delete", cookie=cookie, data={"id": jid})
+    ok(not sql("SELECT 1 FROM sys_job WHERE id=?", (jid,)) and
+       not sql("SELECT 1 FROM sys_job_log WHERE jobId=?", (jid,)),
+       "job delete removes logs too")
+
     # ---- coder: designer three-step ----
     r = http("/admin/dev/coder/tablesave", cookie=cookie, data={
         "tableName": "e2e_demo", "title": "e2e 演示"})

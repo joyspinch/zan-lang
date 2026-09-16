@@ -1,0 +1,261 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Diagnostics;
+using System.IO;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb;
+
+/* 进程内定时任务调度器。每个 worker 都跑同一条循环，到点后以
+   「UPDATE sys_job SET last_run_at=now WHERE id=? AND last_run_at=旧值」
+   的乐观锁抢单——只有一个进程能把行改掉，多 worker 天然不重复执行，
+   不依赖主从角色或共享内存。执行体是内置 kind（ping/log.cleanup），
+   定义入库、实现内聚在本类；运行历史写 sys_job_log 并按条数修剪。 */
+class JobHost {
+    /* 内存镜像只用于到期判断，数据库才是权威；管理页改动经 Touch()
+       立即失效本 worker 镜像，其他 worker 最迟 30 秒重读一次。 */
+    static List<SysJob> jobs = new List<SysJob>();
+    static bool dirty = true;
+    static bool armed = false;
+    static int ticks = 0;
+
+    /* 每任务保留的最近运行记录条数。 */
+    static int KeepLogs = 200;
+
+    /* 管理页增删改后调用：本 worker 下个 tick 重读任务表。 */
+    static void Touch() {
+        JobHost.dirty = true;
+    }
+
+    /* main.zan 在 schema 就绪后调用一次；数据库未就绪时循环空转，
+       每个 tick 自行重试借连接，服务照常启动。 */
+    static void Arm() {
+        if (JobHost.armed) { return; }
+        JobHost.armed = true;
+        Task.Spawn(JobHost.Loop());
+    }
+
+    static async void Loop() {
+        while (true) {
+            await Task.Delay(1000);
+            await JobHost.Tick();
+        }
+    }
+
+    static async void Tick() {
+        JobHost.ticks = JobHost.ticks + 1;
+        if (JobHost.dirty || JobHost.ticks >= 30) {
+            JobHost.ticks = 0;
+            JobHost.dirty = false;
+            await JobHost.Reload();
+        }
+        long now = WebApp.NowSeconds();
+        for (int i = 0; i < JobHost.jobs.Count; i = i + 1) {
+            SysJob j = JobHost.jobs[i];
+            if (j.enabled != 1) { continue; }
+            if (now - j.lastRunAt < j.intervalSec) { continue; }
+            await JobHost.Fire(j.id, j.lastRunAt, now);
+        }
+    }
+
+    static async void Reload() {
+        DbContext ctx = AppServices.Current().Db();
+        if (ctx == null) { return; }
+        IDbConnection db = await ctx.Acquire();
+        if (db == null) { return; }
+        try {
+            JobHost.jobs = await db.Select<SysJob>()
+                .OrderBy(a => a.id).ToListAsync();
+        } catch (Exception ex) {
+            Log.Error("[jobs] reload failed: " + ex.Message);
+        } finally {
+            ctx.Release(db);
+        }
+    }
+
+    /* 抢单并执行一次。prev 抢占基准来自内存镜像，抢不到说明别的
+       worker 已跑过或管理页刚改过，直接放弃本 tick。 */
+    static async void Fire(int jobId, long prev, long now) {
+        DbContext ctx = AppServices.Current().Db();
+        if (ctx == null) { return; }
+        IDbConnection db = await ctx.Acquire();
+        if (db == null) { return; }
+        try {
+            SysJob j = await db.Select<SysJob>()
+                .Where(a => a.id == jobId).FirstAsync();
+            if (j == null || j.enabled != 1) { return; }
+            if (now - j.lastRunAt < j.intervalSec) { return; }
+            int claimed = await db.Update<SysJob>()
+                .Set(a => a.lastRunAt, now)
+                .Where(a => a.id == jobId)
+                .Where(a => a.lastRunAt == prev)
+                .ExecuteAffrowsAsync();
+            if (claimed != 1) { return; }
+            JobHost.RefreshMirror(jobId, now);
+            string _m = await JobHost.Run(db, j, now);
+        } finally {
+            ctx.Release(db);
+        }
+    }
+
+    /* 抢单成功后把内存镜像的 lastRunAt 推到本次时间，避免下个 tick
+       重复发起注定失败的抢单 UPDATE。 */
+    static void RefreshMirror(int jobId, long now) {
+        for (int i = 0; i < JobHost.jobs.Count; i = i + 1) {
+            if (JobHost.jobs[i].id == jobId) {
+                JobHost.jobs[i].lastRunAt = now;
+            }
+        }
+    }
+
+    /* 执行任务体并落历史；异常算失败不外抛（循环必须活下去），
+       返回写入 last_message 的文本。 */
+    static async string Run(IDbConnection db, SysJob j, long startedAt) {
+        Stopwatch sw = new Stopwatch();
+        sw.Start();
+        string message = "";
+        bool ok = true;
+        try {
+            message = await JobHost.Execute(db, j);
+        } catch (Exception ex) {
+            ok = false;
+            message = ex.Message;
+            if (message.Length > 200) { message = message.Substring(0, 200); }
+        }
+        sw.Stop();
+        long ms = (long)sw.ElapsedMilliseconds();
+
+        int _u = await db.Update<SysJob>()
+            .Set(a => a.lastOk, ok ? 1 : 0)
+            .Set(a => a.lastMs, ms)
+            .Set(a => a.lastMessage, message)
+            .Set(a => a.runCount, j.runCount + 1)
+            .Where(a => a.id == j.id)
+            .ExecuteAffrowsAsync();
+
+        SysJobLog row = new SysJobLog();
+        row.jobId = j.id;
+        row.jobName = j.name;
+        row.startedAt = startedAt;
+        row.ms = ms;
+        row.ok = ok ? 1 : 0;
+        row.message = message;
+        int _id = await db.Insert<SysJobLog>(row).ExecuteIdentityAsync();
+
+        /* 每 50 次修剪一次：只保留最近 KeepLogs 条，高频任务不拖垮历史表。 */
+        if ((j.runCount + 1) % 50 == 0) {
+            List<SysJobLog> keep = await db.Select<SysJobLog>()
+                .Where(a => a.jobId == j.id)
+                .OrderByDescending(a => a.id)
+                .Take(JobHost.KeepLogs).ToListAsync();
+            if (keep.Count >= JobHost.KeepLogs) {
+                long minKeep = keep[keep.Count - 1].id;
+                int _d = await db.Delete<SysJobLog>()
+                    .Where(a => a.jobId == j.id)
+                    .Where(a => a.id < minKeep)
+                    .ExecuteAffrowsAsync();
+            }
+        }
+        return message;
+    }
+
+    /* 手动「执行一次」：不看到期与启用状态，同样以乐观锁改写
+       last_run_at（周期自然顺延），返回给管理页的消息文本。 */
+    static async string RunNow(IDbConnection db, SysJob j) {
+        long now = WebApp.NowSeconds();
+        int claimed = await db.Update<SysJob>()
+            .Set(a => a.lastRunAt, now)
+            .Where(a => a.id == j.id)
+            .Where(a => a.lastRunAt == j.lastRunAt)
+            .ExecuteAffrowsAsync();
+        if (claimed != 1) {
+            return "任务正在被其他工作进程执行";
+        }
+        JobHost.RefreshMirror(j.id, now);
+        return await JobHost.Run(db, j, now);
+    }
+
+    /* kind 分发表：新增内置任务在此加一支，并在 Kinds/KindName/
+       NormalizeParam 补三处登记。db 供任务自行读写业务表。 */
+    static async string Execute(IDbConnection db, SysJob j) {
+        if (j.kind == "ping") {
+            return "pong @" + Convert.ToString(WebApp.NowSeconds());
+        }
+        if (j.kind == "log.cleanup") {
+            return JobHost.CleanupLogs(j);
+        }
+        return "未知任务类型 " + j.kind;
+    }
+
+    /* 删除日志目录里超过保留天数的 .log 文件（按修改时间）。 */
+    static string CleanupLogs(SysJob j) {
+        int days = Filter.ToInt(j.param, 30);
+        if (days < 1) { days = 1; }
+        if (days > 365) { days = 365; }
+        string dir = Cfg.Log.dir;
+        if (dir.Length == 0 || !Directory.Exists(dir)) {
+            return "日志目录不存在，无事可做";
+        }
+        long cutoff = WebApp.NowSeconds() - (long)days * 86400;
+        List<string> files = DirectoryTree.Files(dir, PathFilter.Only(".log"));
+        int removed = 0;
+        for (int i = 0; i < files.Count; i = i + 1) {
+            if (FileInfo.GetLastWriteTime(files[i]) < cutoff) {
+                File.Delete(files[i]);
+                removed = removed + 1;
+            }
+        }
+        return "删除 " + Convert.ToString(removed) + " 个超过 "
+            + Convert.ToString(days) + " 天的日志文件";
+    }
+
+    /* 表单可选择的内置任务类型。 */
+    static List<string> Kinds() {
+        List<string> outp = new List<string>();
+        outp.Add("ping");
+        outp.Add("log.cleanup");
+        return outp;
+    }
+
+    /* kind 是否受支持。 */
+    static bool Known(string kind) {
+        List<string> all = JobHost.Kinds();
+        for (int i = 0; i < all.Count; i = i + 1) {
+            if (all[i] == kind) { return true; }
+        }
+        return false;
+    }
+
+    /* 列表与表单显示用名称。 */
+    static string KindName(string kind) {
+        if (kind == "ping") { return "存活心跳"; }
+        if (kind == "log.cleanup") { return "日志清理"; }
+        return kind;
+    }
+
+    /* param 的按类归一：不合法回落默认值。 */
+    static string NormalizeParam(string kind, string param) {
+        if (kind == "log.cleanup") {
+            int days = Filter.ToInt(param, 30);
+            if (days < 1) { days = 1; }
+            if (days > 365) { days = 365; }
+            return Convert.ToString(days);
+        }
+        return "";
+    }
+
+    /* 间隔的人读文本。 */
+    static string IntervalText(int sec) {
+        if (sec % 86400 == 0) {
+            return "每 " + Convert.ToString(sec / 86400) + " 天";
+        }
+        if (sec % 3600 == 0) {
+            return "每 " + Convert.ToString(sec / 3600) + " 小时";
+        }
+        if (sec % 60 == 0) {
+            return "每 " + Convert.ToString(sec / 60) + " 分钟";
+        }
+        return "每 " + Convert.ToString(sec) + " 秒";
+    }
+}

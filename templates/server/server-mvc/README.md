@@ -199,6 +199,7 @@ crashing.
 | In-memory views | `System.Web.View` | templates loaded ONCE at startup |
 | Streaming uploads | `.Upload()` routes | body streamed to disk in 64KB chunks |
 | Validation | `System.Web.Validate` | Require/MaxLen/IsInt/OneOf + SafeFileName |
+| Scheduled jobs | `src/Feature/JobHost.zan`, `/admin/system/jobs` | in-process scheduler: second-granularity intervals, DB optimistic-lock claim (multi-worker safe), built-in kinds (`ping`, `log.cleanup`), run history with pruning |
 | Shared-memory tables | `System.Web.RouteTable` / `RouteStats` / `PermTable` | route attributes, per-route timings, role×route rights across workers |
 
 ## Workers & scaling
