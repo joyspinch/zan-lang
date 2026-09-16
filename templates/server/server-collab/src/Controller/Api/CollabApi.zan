@@ -43,12 +43,25 @@ class CollabApi : ApiController {
             int members = await this.CollabMember
                 .Where(a => a.tenantId == this.TenantId()
                     && a.conversationId == c.id && a.status == "active").CountAsync();
+            CollabMessage last = await this.CollabMessage
+                .Where(a => a.tenantId == this.TenantId()
+                    && a.conversationId == c.id)
+                .OrderByDescending(a => a.id).FirstAsync();
+            int unread = await this.CollabMessage
+                .Where(a => a.tenantId == this.TenantId()
+                    && a.conversationId == c.id && a.id > m.lastReadMsgId
+                    && a.senderId != me.id).CountAsync();
             JsonValue o = JsonValue.NewObject();
             o.Put("id", JsonValue.NewStr(Convert.ToString(c.id)));
             o.Put("type", JsonValue.NewStr(c.type));
             o.Put("title", JsonValue.NewStr(c.title));
             o.Put("role", JsonValue.NewStr(m.role));
             o.Put("members", JsonValue.NewStr(Convert.ToString(members)));
+            o.Put("unread", JsonValue.NewStr(Convert.ToString(unread)));
+            o.Put("lastText", JsonValue.NewStr(last == null
+                ? "" : Fmt.Excerpt(last.body, 60)));
+            o.Put("lastAt", JsonValue.NewStr(last == null
+                ? "0" : Convert.ToString(last.createdAt)));
             o.Put("createdAt", JsonValue.NewStr(Convert.ToString(c.createdAt)));
             items.Append(o);
         }
@@ -89,6 +102,10 @@ class CollabApi : ApiController {
             await this.InsertMember(this.TenantId(), id, invitees[i].id, "member", now);
             added = added + 1;
         }
+        JsonValue cev = JsonValue.NewObject();
+        cev.Put("conversationId", JsonValue.NewStr(Convert.ToString(id)));
+        cev.Put("creatorId", JsonValue.NewStr(Convert.ToString(me.id)));
+        await this.InsertEvent("conversation.created", "conversation", id, me.id, cev);
         JsonValue body = JsonValue.NewObject();
         body.Put("id", JsonValue.NewStr(Convert.ToString(id)));
         body.Put("added", JsonValue.NewStr(Convert.ToString(added)));
@@ -157,7 +174,13 @@ class CollabApi : ApiController {
         long now = WebApp.NowSeconds();
         int added = 0;
         for (int i = 0; i < invitees.Count; i = i + 1) {
-            added = added + await this.Join(conversationId, invitees[i].id, now);
+            int j = await this.Join(conversationId, invitees[i].id, now);
+            if (j == 0) { continue; }
+            added = added + j;
+            JsonValue jev = JsonValue.NewObject();
+            jev.Put("conversationId", JsonValue.NewStr(Convert.ToString(conversationId)));
+            jev.Put("userId", JsonValue.NewStr(Convert.ToString(invitees[i].id)));
+            await this.InsertEvent("member.joined", "conversation", conversationId, me.id, jev);
         }
         JsonValue body = JsonValue.NewObject();
         body.Put("ok", JsonValue.NewStr("1"));
@@ -196,6 +219,10 @@ class CollabApi : ApiController {
             .Set(a => a.leftAt, now)
             .Where(a => a.id == mine.id && a.status == "active")
             .ExecuteAffrowsAsync();
+        JsonValue lev = JsonValue.NewObject();
+        lev.Put("conversationId", JsonValue.NewStr(Convert.ToString(conversationId)));
+        lev.Put("userId", JsonValue.NewStr(Convert.ToString(me.id)));
+        await this.InsertEvent("member.left", "conversation", conversationId, me.id, lev);
         JsonValue body = JsonValue.NewObject();
         body.Put("ok", JsonValue.NewStr("1"));
         await this.IdemFinish(me.id, "member.leave", crid,
@@ -241,11 +268,187 @@ class CollabApi : ApiController {
             .Set(a => a.leftAt, now)
             .Where(a => a.id == target.id && a.status == "active")
             .ExecuteAffrowsAsync();
+        JsonValue kev = JsonValue.NewObject();
+        kev.Put("conversationId", JsonValue.NewStr(Convert.ToString(conversationId)));
+        kev.Put("userId", JsonValue.NewStr(Convert.ToString(targetId)));
+        kev.Put("kicked", JsonValue.NewStr("1"));
+        await this.InsertEvent("member.left", "conversation", conversationId, me.id, kev);
         JsonValue body = JsonValue.NewObject();
         body.Put("ok", JsonValue.NewStr("1"));
         await this.IdemFinish(me.id, "member.kick", crid,
             "conversation", conversationId, body);
         await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* 发送消息（text）：成员闸；replyTo 必须本会话内既有消息，否则按 0 收下
+       （不悬空，Im 同口径）；幂等（message.send）；发送者已读水位随行推进；
+       message.created 事件与消息同事务落库（A327-04 只差消费端）。 */
+    [HttpPost]
+    [Description("发送消息")]
+    [Custom(Perm = PermBit.Update)]
+    async void Send() {
+        User me = await this.Me();
+        int conversationId = this.InInt("conversationId", 0);
+        string crid = this.Crid();
+        string content = this.InRaw("content");
+        if (content.Length == 0) { this.Fail(400, "0003", "消息内容不能为空"); }
+        if (content.Length > 2048) { content = content.Substring(0, 2048); }
+        CollabConversation c = await Policy.Conversation(this.Held(),
+            this.TenantId(), conversationId);
+        if (c == null) { this.Fail(404, "0404", "会话不存在"); }
+        CollabMember mine = await Policy.Member(this.Held(), this.TenantId(),
+            conversationId, me.id);
+        if (!Policy.IsActive(mine)) { this.Fail(403, "0403", "仅会话成员可发送消息"); }
+        int replyTo = this.InInt("replyTo", 0);
+        if (replyTo > 0) {
+            CollabMessage q = await this.CollabMessage
+                .Where(a => a.id == replyTo && a.tenantId == this.TenantId()
+                    && a.conversationId == conversationId).FirstAsync();
+            if (q == null) { replyTo = 0; }
+        }
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "message.send", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        CollabMessage r = new CollabMessage();
+        r.tenantId = this.TenantId();
+        r.conversationId = conversationId;
+        r.senderId = me.id;
+        r.kind = "text";
+        r.body = content;
+        r.replyTo = replyTo;
+        r.clientRequestId = crid;
+        r.createdAt = now;
+        r.deletedAt = 0;
+        int msgId = await this.CollabMessage.Insert(r).ExecuteIdentityAsync();
+        await this.CollabMember.Update()
+            .Set(a => a.lastReadMsgId, msgId)
+            .Where(a => a.id == mine.id && a.lastReadMsgId < msgId)
+            .ExecuteAffrowsAsync();
+        int _u = await this.CollabConversation.Update()
+            .Set(a => a.updatedAt, now)
+            .Where(a => a.id == conversationId && a.tenantId == this.TenantId())
+            .ExecuteAffrowsAsync();
+        JsonValue ev = JsonValue.NewObject();
+        ev.Put("conversationId", JsonValue.NewStr(Convert.ToString(conversationId)));
+        ev.Put("messageId", JsonValue.NewStr(Convert.ToString(msgId)));
+        ev.Put("senderId", JsonValue.NewStr(Convert.ToString(me.id)));
+        ev.Put("excerpt", JsonValue.NewStr(Fmt.Excerpt(content, 50)));
+        await this.InsertEvent("message.created", "message", msgId, me.id, ev);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("id", JsonValue.NewStr(Convert.ToString(msgId)));
+        body.Put("at", JsonValue.NewStr(Convert.ToString(now)));
+        await this.IdemFinish(me.id, "message.send", crid, "message", msgId, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* 消息历史（游标分页）：before=起始消息 id（缺省=最新一页），limit ≤200
+       缺省 50，时间正序返回。引用按读者相对解析（quoteWho=我/对方名，
+       Im 同口径）；被引消息已撤回或不在本会话 → 仅不带引用字段。
+       历史拉取不清未读——已读水位由 /read 显式推进（群语义：拉全页
+       不等于读到，客户端打开会话才调 read）。 */
+    [HttpGet]
+    [Description("消息历史")]
+    [Custom(Perm = PermBit.View)]
+    async void Messages() {
+        User me = await this.Me();
+        int conversationId = this.InInt("conversationId", 0);
+        int before = this.InInt("before", 0);
+        int limit = this.InInt("limit", 50);
+        if (limit <= 0) { limit = 50; }
+        if (limit > 200) { limit = 200; }
+        CollabConversation c = await Policy.Conversation(this.Held(),
+            this.TenantId(), conversationId);
+        if (c == null) { this.Fail(404, "0404", "会话不存在"); }
+        CollabMember mine = await Policy.Member(this.Held(), this.TenantId(),
+            conversationId, me.id);
+        if (!Policy.IsActive(mine)) { this.Fail(403, "0403", "仅会话成员可见消息"); }
+        List<CollabMessage> rows = await this.CollabMessage
+            .Where(a => a.tenantId == this.TenantId()
+                && a.conversationId == conversationId)
+            .WhereIf(before > 0, a => a.id < before)
+            .OrderByDescending(a => a.id).Take(limit).ToListAsync();
+        rows = CollabApi.Asc(rows);
+        /* 引用解析：收集本页 replyTo（去重）→ 一批取回（同会话闸）→ 键控。 */
+        List<int> qids = new List<int>();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            if (rows[i].replyTo > 0 && !qids.Contains(rows[i].replyTo)) {
+                qids.Add(rows[i].replyTo);
+            }
+        }
+        Dict<int, CollabMessage> quoted = new Dict<int, CollabMessage>();
+        if (qids.Count > 0) {
+            List<CollabMessage> qs = await this.CollabMessage
+                .Where(a => a.tenantId == this.TenantId()
+                    && a.conversationId == conversationId
+                    && qids.Contains(a.id)).ToListAsync();
+            for (int i = 0; i < qs.Count; i = i + 1) { quoted[qs[i].id] = qs[i]; }
+        }
+        List<User> users = await this.User
+            .Where(a => a.tenantId == this.TenantId()).ToListAsync();
+        JsonValue items = JsonValue.NewArray();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            CollabMessage r = rows[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Put("id", JsonValue.NewStr(Convert.ToString(r.id)));
+            o.Put("from", JsonValue.NewStr(Convert.ToString(r.senderId)));
+            o.Put("name", JsonValue.NewStr(CollabApi.NameOf(users, r.senderId)));
+            o.Put("mine", JsonValue.NewStr(r.senderId == me.id ? "1" : "0"));
+            if (r.deletedAt > 0) {
+                o.Put("kind", JsonValue.NewStr("deleted"));
+                o.Put("content", JsonValue.NewStr(""));
+            } else {
+                o.Put("kind", JsonValue.NewStr(r.kind));
+                o.Put("content", JsonValue.NewStr(r.body));
+            }
+            o.Put("at", JsonValue.NewStr(Convert.ToString(r.createdAt)));
+            if (r.replyTo > 0 && quoted.ContainsKey(r.replyTo)) {
+                CollabMessage q = quoted[r.replyTo];
+                if (q.deletedAt == 0) {
+                    o.Put("replyTo", JsonValue.NewStr(Convert.ToString(r.replyTo)));
+                    o.Put("quoteWho", JsonValue.NewStr(q.senderId == me.id
+                        ? "我" : CollabApi.NameOf(users, q.senderId)));
+                    o.Put("quoteText", JsonValue.NewStr(Fmt.Excerpt(q.body, 60)));
+                }
+            }
+            items.Append(o);
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("conversationId", JsonValue.NewStr(Convert.ToString(conversationId)));
+        body.Put("msgs", items);
+        this.Ok(body.ToJson());
+    }
+
+    /* 已读水位：推进到本会话当前最大消息 id（客户端打开会话时调用一次）。
+       幂等：重复调用水位只进不退。 */
+    [HttpPost]
+    [Description("已读")]
+    [Custom(Perm = PermBit.Update)]
+    async void Read() {
+        User me = await this.Me();
+        int conversationId = this.InInt("conversationId", 0);
+        CollabConversation c = await Policy.Conversation(this.Held(),
+            this.TenantId(), conversationId);
+        if (c == null) { this.Fail(404, "0404", "会话不存在"); }
+        CollabMember mine = await Policy.Member(this.Held(), this.TenantId(),
+            conversationId, me.id);
+        if (!Policy.IsActive(mine)) { this.Fail(403, "0403", "仅会话成员可标记已读"); }
+        CollabMessage last = await this.CollabMessage
+            .Where(a => a.tenantId == this.TenantId()
+                && a.conversationId == conversationId)
+            .OrderByDescending(a => a.id).FirstAsync();
+        int maxId = last == null ? 0 : last.id;
+        if (maxId > mine.lastReadMsgId) {
+            await this.CollabMember.Update()
+                .Set(a => a.lastReadMsgId, maxId)
+                .Where(a => a.id == mine.id && a.lastReadMsgId < maxId)
+                .ExecuteAffrowsAsync();
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        body.Put("readUpTo", JsonValue.NewStr(Convert.ToString(maxId)));
         this.Ok(body.ToJson());
     }
 
@@ -391,5 +594,27 @@ class CollabApi : ApiController {
             if (users[i].id == id) { return Fmt.Text(users[i].nickname, users[i].username); }
         }
         return "用户" + Convert.ToString(id);
+    }
+
+    /* 领域事件落库（A327-04 事实侧）：必须在事实所在请求事务内调用，
+       同生共死；payload 只放紧凑摘要。 */
+    async void InsertEvent(string type, string aggregateType, int aggregateId,
+                           int actorId, JsonValue payload) {
+        CollabEvent e = new CollabEvent();
+        e.tenantId = this.TenantId();
+        e.type = type;
+        e.aggregateType = aggregateType;
+        e.aggregateId = aggregateId;
+        e.actorId = actorId;
+        e.payload = payload.ToJson();
+        e.createdAt = WebApp.NowSeconds();
+        await this.CollabEvent.Insert(e).ExecuteIdentityAsync();
+    }
+
+    /* 倒序取页 → 时间正序输出（重建列表，不依赖原地反转）。 */
+    static List<CollabMessage> Asc(List<CollabMessage> desc) {
+        List<CollabMessage> asc = new List<CollabMessage>();
+        for (int i = desc.Count - 1; i >= 0; i = i - 1) { asc.Add(desc[i]); }
+        return asc;
     }
 }

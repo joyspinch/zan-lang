@@ -313,6 +313,95 @@ def run_flow():
     st, env = call("GET", "/api/collab/members?conversationId=%d" % conv, token=ta)
     ok(len(data_of(env).get("members") or []) == 3, "members count 3 (no duplicate rows)")
 
+    # ---- messages: three-member send/receive (A327-07/08 slice) ----------
+    st, env = call("POST", "/api/collab/send",
+                   {"conversationId": str(conv), "content": "会话消息一号-" + TS,
+                    "clientRequestId": crid("m1")}, token=ta)
+    mid1 = int(data_of(env).get("id", "0"))
+    ok(st == 200 and mid1 > 0, "A sends text message")
+    st, env = call("POST", "/api/collab/send",
+                   {"conversationId": str(conv), "content": "会话消息一号-" + TS,
+                    "clientRequestId": crid("m1")}, token=ta)
+    ok(st == 200 and int(data_of(env).get("id", "0")) == mid1
+       and data_of(env).get("replayed") == "1", "send replay -> same id replayed=1")
+
+    st, env = call("GET", "/api/collab/messages?conversationId=%d" % conv, token=tb)
+    msgs = data_of(env).get("msgs") or []
+    ok(st == 200 and len(msgs) == 1 and msgs[0]["mine"] == "0"
+       and msgs[0]["content"] == "会话消息一号-" + TS,
+       "B history sees A's message as incoming")
+    st, env = call("GET", "/api/collab/messages?conversationId=%d" % conv, token=ta)
+    msgs = data_of(env).get("msgs") or []
+    ok(len(msgs) == 1 and msgs[0]["mine"] == "1", "A history marks own message mine=1")
+    st, env = call("GET", "/api/collab/messages?conversationId=%d" % conv, token=tc)
+    ok(len(data_of(env).get("msgs") or []) == 1,
+       "C (3rd member) history sees it too - group send/receive closed loop")
+
+    # unread: history does NOT clear watermark; explicit read does
+    st, env = call("GET", "/api/collab/conversations", token=tb)
+    rows = [r for r in data_of(env).get("conversations") or []
+            if r["id"] == str(conv)]
+    ok(rows and rows[0].get("unread") == "1"
+       and rows[0].get("lastText") == "会话消息一号-" + TS,
+       "B conversations unread=1 with lastText (history did not clear)")
+    st, env = call("POST", "/api/collab/read",
+                   {"conversationId": str(conv)}, token=tb)
+    ok(st == 200 and int(data_of(env).get("readUpTo", "0")) >= mid1,
+       "B read -> watermark advanced")
+    st, env = call("GET", "/api/collab/conversations", token=tb)
+    rows = [r for r in data_of(env).get("conversations") or []
+            if r["id"] == str(conv)]
+    ok(rows and rows[0].get("unread") == "0", "B unread back to 0 after read")
+
+    # quote-reply: quoteWho is reader-relative
+    st, env = call("POST", "/api/collab/send",
+                   {"conversationId": str(conv), "content": "收到-" + TS,
+                    "replyTo": str(mid1), "clientRequestId": crid("m2")}, token=tb)
+    mid2 = int(data_of(env).get("id", "0"))
+    ok(st == 200 and mid2 > mid1, "B quote-replies")
+    st, env = call("GET", "/api/collab/messages?conversationId=%d" % conv, token=ta)
+    msgs = data_of(env).get("msgs") or []
+    last = msgs[-1] if msgs else {}
+    ok(last.get("replyTo") == str(mid1) and last.get("quoteWho") == "我",
+       "A sees quote with quoteWho=me (reader-relative)")
+    st, env = call("GET", "/api/collab/messages?conversationId=%d" % conv, token=tc)
+    msgs = data_of(env).get("msgs") or []
+    last = msgs[-1] if msgs else {}
+    ok(last.get("quoteWho") not in (None, "我"),
+       "C sees quote attributed to the sender's name")
+
+    # cursor pagination: before=mid2&limit=1 -> exactly [mid1]
+    st, env = call("GET",
+                   "/api/collab/messages?conversationId=%d&before=%d&limit=1"
+                   % (conv, mid2), token=ta)
+    msgs = data_of(env).get("msgs") or []
+    ok(len(msgs) == 1 and int(msgs[0]["id"]) == mid1,
+       "cursor page before+limit returns exact window")
+
+    # forged replyTo falls back to a plain message (no dangling reference)
+    st, env = call("POST", "/api/collab/send",
+                   {"conversationId": str(conv), "content": "伪造引用-" + TS,
+                    "replyTo": "999999", "clientRequestId": crid("m3")}, token=ta)
+    ok(st == 200, "forged replyTo accepted as plain message")
+    st, env = call("GET", "/api/collab/messages?conversationId=%d" % conv, token=ta)
+    msgs = data_of(env).get("msgs") or []
+    ok(bool(msgs) and msgs[-1].get("replyTo") is None,
+       "forged replyTo stored as replyTo=0")
+
+    # cross-tenant send -> 404 (no existence leak)
+    set_tenant("cx_c_" + TS, 2)
+    st, env = call("POST", "/api/collab/send",
+                   {"conversationId": str(conv), "content": "跨界",
+                    "clientRequestId": crid("m4")}, token=tc)
+    ok(st == 404, "cross-tenant send -> 404")
+    set_tenant("cx_c_" + TS, 1)
+
+    # empty content rejected
+    st, env = call("POST", "/api/collab/send",
+                   {"conversationId": str(conv), "content": "",
+                    "clientRequestId": crid("m5")}, token=ta)
+    ok(st != 200 or (env or {}).get("code") != "0000", "empty content rejected")
+
     # ---- leave -------------------------------------------------------------
     k3 = crid("l1")
     st, env = call("POST", "/api/collab/leave",
