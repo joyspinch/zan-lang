@@ -5925,7 +5925,7 @@ int main(int argc, char **argv) {
                         return 1;
                     }
                     snprintf(cmd, sizeof(cmd),
-                             "ld.lld -shared -o \"%s\""
+                             "ld.lld -shared --no-undefined -o \"%s\""
                              " \"%s/android_native_app_glue.o\" \"%s\"",
                              obj_path, sys3, obj_tmp);
                     for (int di = 0; di < zan_lib_ndirs; di++) {

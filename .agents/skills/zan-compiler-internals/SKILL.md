@@ -1561,3 +1561,25 @@ rt_timer.c 一处全部借它藏身；另有三处历史 abort 已改优雅路�
 
 **顺手坑**：CMakeLists 的参数列表里 `/* ... */` 不是注释，会被拆成参数
 传给命令——CMake 注释只有 `#` 行注释。
+
+## android 静态驱动档案 libzan_gui.a 过期 = 实机 dlopen "cannot locate symbol" 崩溃（2026-09-16 实录）
+
+**坑**：`--emit-apk` 的 libmain.so 链接是 `-shared`，lld 默认允许未解析符号
+（等运行期解析），stdlib/Gui/Render.zan 新增的 `static extern`（如
+`zan_gui_font_ascent`）在**过期的**
+`stdlib/Gui/drivers/android-{arm64,x64}/static/libzan_gui.a` 缺符号时
+**链接照样成功**，装到手机/模拟器一启动就
+`UnsatisfiedLinkError: dlopen failed: cannot locate symbol` 闪退。编译期
+零报错，只有实机 logcat 有真相。win-x64 的 DLL 驱动在重导出 def 时会
+当场报错，android 的静态档案不会——同源改动只炸移动端。
+
+**定式**：① 动 `src/runtime/gui_runtime*.c` 或给 stdlib 加跨平台 extern 后，
+重编 android 驱动档案：`bash scripts/build_gui_android_static.sh all`
+（NDK clang 单 TU 编 gui_runtime.c `-DZAN_GUI_ANDROID_NATIVE
+-DZAN_GUI_FREETYPE` + FreeType 模块成员，llvm-ar 打包；FreeType 用裁剪版
+ftmodule.h——脚本从上游头自动派生到 build/android_gui_drivers/ft-inc/，
+只登记实际编译的模块，否则 ftinit 引用未编译的 sdf/svg/type1 等
+driver_class 直接链接失败）。② 验证符号齐：
+`llvm-nm libzan_gui.a | grep T zan_gui_font_ascent` 对照 Render.zan 全部
+extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
+`--no-undefined`，档案过期从"实机闪退"左移成"发布当场报错"。
