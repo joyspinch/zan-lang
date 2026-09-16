@@ -4011,6 +4011,10 @@ static int lq_steal(zan_co_worker_t *v, zan_co_worker_t *w, zan_co_task *out) {
 
 static zan_co_fhdr *co_hdr(void *frame) { return (zan_co_fhdr *)frame; }
 
+#define ZAN_TR_RING 8192
+typedef struct { long long seq; unsigned long tid; const char* tag; const void* fp; } zan_tr_ent;
+static zan_tr_ent g_tr_ring[ZAN_TR_RING];
+static volatile long long g_tr_seq = -1;
 static int g_co_trace = -1;
 static void co_trace(const char *what, const void *fp) {
     if (g_co_trace < 0) {
@@ -4018,8 +4022,27 @@ static void co_trace(const char *what, const void *fp) {
         g_co_trace = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
     }
     if (!g_co_trace) return;
-    fprintf(stderr, "[cot %lu %s %p]\n",
-        (unsigned long)GetCurrentThreadId(), what, fp);
+    long long i = InterlockedIncrement64(&g_tr_seq);
+    zan_tr_ent *e = &g_tr_ring[i & (ZAN_TR_RING - 1)];
+    e->seq = i;
+    e->tid = GetCurrentThreadId();
+    e->tag = what;
+    e->fp = fp;
+}
+
+/* Drain stuck 3s: dump the whole ring (diagnostics; oldest overwritten). */
+static void co_trace_dump(long long live) {
+    long long total = g_tr_seq;
+    long long first = total - ZAN_TR_RING;
+    if (first < 0) first = -1;
+    fprintf(stderr, "[cot DUMP live=%lld seq=%lld]\n",
+        live, total);
+    for (long long s = (first > 0 ? first : 0) + 1; s <= total; s++) {
+        zan_tr_ent *e = &g_tr_ring[s & (ZAN_TR_RING - 1)];
+        if (e->seq != s) continue;
+        fprintf(stderr, "[cot %lld %lu %s %p]\n",
+            e->seq, (unsigned long)e->tid, e->tag, e->fp);
+    }
     fflush(stderr);
 }
 
@@ -4634,8 +4657,16 @@ void zan_co_sched_run(void) {
          * before the host ever called this). Do not start a second pool --
          * wait for the outstanding work, then hand back. */
         while (zan_co_pending() > 0 || zan_io_has_pending() ||
-               zan_timer_pending() > 0 || zan_co_live_count() > 0) {
+               zan_timer_pending() > 0 || zan_co_live_count() > 0 ||
+               g_co_running > 0) {
             Sleep(1);
+            static DWORD stuck_since = 0;
+            DWORD nowk = GetTickCount();
+            if (stuck_since == 0) { stuck_since = nowk; continue; }
+            if (nowk - stuck_since > 3000) {
+                co_trace_dump(zan_co_live_count());
+                stuck_since = nowk;
+            }
         }
         return;
     }
@@ -4682,8 +4713,16 @@ void zan_co_sched_run_until(const volatile int *done) {
             else Sleep(1);
         }
         while (zan_co_pending() > 0 || zan_io_has_pending() ||
-               zan_timer_pending() > 0 || zan_co_live_count() > 0) {
+               zan_timer_pending() > 0 || zan_co_live_count() > 0 ||
+               g_co_running > 0) {
             Sleep(1);
+            static DWORD stuck_since = 0;
+            DWORD nowk = GetTickCount();
+            if (stuck_since == 0) { stuck_since = nowk; continue; }
+            if (nowk - stuck_since > 3000) {
+                co_trace_dump(zan_co_live_count());
+                stuck_since = nowk;
+            }
         }
         return;
     }
