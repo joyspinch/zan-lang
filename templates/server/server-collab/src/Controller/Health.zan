@@ -1,0 +1,71 @@
+using System;
+using System.Data;
+using System.Json;
+using System.Web;
+using ZanWeb;
+
+namespace ZanWeb;
+
+/* 免鉴权健康检查：给负载均衡、看门狗与外部进程监督（systemd/Docker）探活。
+   监控屏都要登录，而探活端点必须不能要——认证墙内没有可用性观测。
+   默认只答进程自身事实（无依赖、微秒级）；?deep=1 再探主库（借还一条连接
+   执行 SELECT 1），库不可达答 503，让 LB 有摘除依据。本端点是一条普通路由，
+   探活成败本身就记入 /health 指标行——没有流量时Health检查就是心跳。 */
+[Route("[controller]/[action]")]
+[Custom(Authorization = CustomAuthorization.None)]
+[Description("健康检查")]
+class Health : AppController {
+    [HttpGet]
+    [Route("/health")]
+    [Description("健康检查")]
+    async void Index() {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("status", JsonValue.NewStr("ok"));
+        WebApp app = WebHost.Current();
+        if (app != null) {
+            JsonValue m = JsonValue.ParseLenient(app.MetricsJson());
+            if (m != null && m.IsObject()) {
+                o.Put("uptime_ms", MetricsCluster.Num(m.Long("uptime_ms", 0)));
+                JsonValue rq = m.Get("requests");
+                if (rq != null) {
+                    o.Put("requests", MetricsCluster.Num(rq.Long("count", 0)));
+                }
+            }
+        }
+        o.Put("pid", MetricsCluster.Num(ProcessHost.Pid()));
+        o.Put("worker", MetricsCluster.Num(ProcessHost.WorkerId()));
+
+        if (this.In("deep") == "1") {
+            /* 租约在 OnBeforeAsync 已取得：DbReady() 即"借到了连接"。
+               绝不再向池借第二条——持有租约时的嵌套借还会在连接耗尽时
+               变成人人持一等人人的循环等待（AdminController 有实测注）。 */
+            if (!this.DbReady()) {
+                o.Put("status", JsonValue.NewStr("down"));
+                o.Put("db", JsonValue.NewStr("pool not ready"));
+                this.Ctx().Status(503, "Service Unavailable");
+                this.Json(o.ToJson());
+                return;
+            }
+            string err = "";
+            bool dbUp = false;
+            try {
+                DbResult r = await this.Held().QueryAsync("SELECT 1",
+                    new DbParams());
+                dbUp = r != null;
+            } catch (Exception ex) {
+                err = ex.Message;
+            }
+            if (!dbUp) {
+                o.Put("status", JsonValue.NewStr("down"));
+                string why = "unreachable";
+                if (err.Length > 0) { why = err; }
+                o.Put("db", JsonValue.NewStr(why));
+                this.Ctx().Status(503, "Service Unavailable");
+                this.Json(o.ToJson());
+                return;
+            }
+            o.Put("db", JsonValue.NewStr("up"));
+        }
+        this.Json(o.ToJson());
+    }
+}

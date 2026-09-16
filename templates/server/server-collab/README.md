@@ -281,7 +281,16 @@ respawn-on-crash, daemonization and the control port live in
 `System.Net.Worker` / `System.Diagnostics.ProcessHost`, so any server gets
 them, not just this template.
 
-## Observability (`GET /admin/stats`)
+## Observability
+
+- **`GET /health`** — unauthenticated liveness probe for LB/watchdogs;
+  `?deep=1` also runs `SELECT 1` on the main pool and answers 503 when the
+  database is unreachable.
+- **`GET /robots.txt`** — the public landing page stays indexable, the
+  collaboration workspace (`/admin/`) and the sign-in/sign-up pages are
+  disallowed.
+
+### Runtime stats (`GET /admin/stats`)
 
 The request lifecycle and database queries are instrumented into the shared
 `System.Diagnostics.ServerMetrics` singleton, exposed as JSON at
