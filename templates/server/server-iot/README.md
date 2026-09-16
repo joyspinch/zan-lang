@@ -56,6 +56,7 @@ app.exe
 | Method & path                 | Auth      | Purpose                          |
 |-------------------------------|-----------|----------------------------------|
 | `GET  /`                      | —         | dashboard                        |
+| `GET  /health`                | —         | liveness probe (`db` field is informational — the broker does not depend on the database) |
 | `GET  /iot/clients`           | —         | connected clients                |
 | `GET  /iot/clients/{id}`      | —         | one client + its subscriptions   |
 | `POST /iot/clients/{id}/kick` | rank ≥ 9  | force-disconnect (global lock)   |
