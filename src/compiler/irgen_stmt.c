@@ -2322,10 +2322,25 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         }
         /* longjmp skipped the normal releases of temps pushed after this try
          * was entered (a throwing ctor's object, an owned receiver temp) —
-         * release them now, restoring the temp stack to the try-entry depth */
+         * release them now, restoring the temp stack to the depth this
+         * handler was armed at. Read the mark the arming wrote into the
+         * buffer (bufs[top].mark) rather than the live temp depth: this
+         * catch can be re-entered by an invocation that only re-armed the
+         * handler (its own try-entry code never ran), and across the
+         * suspension the scheduler pump interleaved other coroutines on the
+         * same thread-global temp stack — the depth live at re-entry belongs
+         * to whoever ran last, and a mark below the real boundary released
+         * the awaiter chain's live registrations (A318). A plain-frame
+         * thrower already unwound to this same mark before its longjmp
+         * (emit_eh_unwind_to_handler), so for it this stays the no-op it
+         * always was. */
         {
             LLVMTypeRef uwty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i32t, 1, 0);
-            LLVMValueRef tm = LLVMBuildLoad2(g->builder, i32t, tmp_mark_slot, "eh.tmpmark.re");
+            LLVMValueRef t1 = zan_add(g->builder,
+                LLVMBuildLoad2(g->builder, i32t, old_top_slot, "eh.old.re2"),
+                LLVMConstInt(i32t, 1, 0), "eh.buf1");
+            LLVMValueRef tm = LLVMBuildLoad2(g->builder, i32t,
+                emit_eh_mark_ptr(g, t1), "eh.bufmark");
             zan_call2(g->builder, uwty, get_eh_tmp_unwind_fn(g), &tm, 1, "");
         }
         LLVMValueRef exc_val = LLVMBuildLoad2(g->builder, i8ptr, exc_g, "exc");
