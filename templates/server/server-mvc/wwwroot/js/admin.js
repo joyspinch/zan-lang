@@ -405,7 +405,12 @@
         + (opts.kind ? ' ' + opts.kind : ''));
       box.style.zIndex = ++zTop;
       mask.style.zIndex = zTop;
-      if (opts.width) { box.style.width = opts.width; }
+      if (opts.width) {
+        var want = parseInt(opts.width, 10) || 0;
+        // 声明宽度超过视口时取视口内宽（.lay-box 的 max-width 再兜底）：
+        // 内容被横向挤压时表格列会整列消失，宁可窄出滚动也不压变形。
+        box.style.width = Math.min(want, window.innerWidth - 16) + 'px';
+      }
 
       var head = node('header');
       head.appendChild(node('span', 'title', opts.title || ''));
