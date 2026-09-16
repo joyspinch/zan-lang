@@ -94,3 +94,8 @@ build/licensing_server.exe        # 从项目根运行，config/views/wwwroot �
 `http://127.0.0.1:8096` 即可。其余部署细节（worker 数、守护、SQLite/MySQL、
 发布目录四件套）与 server-mvc 模板一致，见
 [server-mvc README](../server-mvc/README.md)。
+
+**探活**：`GET /health` 免鉴权答进程事实（uptime/requests/pid/worker），
+`?deep=1` 追加 `SELECT 1` 探主库、不可达答 503——给负载均衡与进程监督用，
+认证墙内没有可用性观测。指标采集与 server-mvc 同源（p95 直方图随
+`metrics_minute` 落库）。
