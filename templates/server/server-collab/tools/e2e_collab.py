@@ -619,6 +619,27 @@ def run_flow():
     ok(len(cards) == 1 and cards[0].get("taskId") == str(task1)
        and cards[0].get("taskStatus") == "done",
        "task card message carries taskId and live status")
+
+    st, env = call("POST", "/api/collab/send",
+                   {"conversationId": str(conv), "content": "将被撤回-" + TS,
+                    "clientRequestId": crid("mr1")}, token=ta)
+    mid_r = int(data_of(env).get("id", "0"))
+    ok(st == 200, "A sends message to recall")
+    st, env = call("POST", "/api/collab/recall",
+                   {"id": str(mid_r), "clientRequestId": crid("rc1")}, token=tb)
+    ok(st == 403, "non-sender recall -> 403")
+    st, env = call("POST", "/api/collab/recall",
+                   {"id": str(mid_r), "clientRequestId": crid("rc1")}, token=ta)
+    ok(st == 200 and data_of(env).get("ok") == "1", "A recalls own message")
+    st, env = call("POST", "/api/collab/recall",
+                   {"id": str(mid_r), "clientRequestId": crid("rc1")}, token=ta)
+    ok(st == 200 and data_of(env).get("replayed") == "1", "recall replay -> replayed=1")
+    st, env = call("GET", "/api/collab/messages?conversationId=%d" % conv, token=tb)
+    msgs = data_of(env).get("msgs") or []
+    del_row = [m for m in msgs if m["id"] == str(mid_r)]
+    ok(len(del_row) == 1 and del_row[0].get("kind") == "deleted"
+       and del_row[0].get("content") == "",
+       "recalled message renders deleted with no body")
     k3 = crid("l1")
     st, env = call("POST", "/api/collab/leave",
                    {"conversationId": str(conv), "clientRequestId": k3}, token=tc)

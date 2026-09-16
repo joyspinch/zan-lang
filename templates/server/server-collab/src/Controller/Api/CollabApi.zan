@@ -1291,6 +1291,48 @@ class CollabApi : ApiController {
         this.Ok(body.ToJson());
     }
 
+    /* 撤回（A327-08 收尾）：仅发送者本人；deletedAt 置时不抹行，历史按
+       deleted 形态呈现；message.recalled 事件同事务；已撤回按幂等成功。 */
+    [HttpPost]
+    [Description("撤回消息")]
+    [Custom(Perm = PermBit.Update)]
+    async void Recall() {
+        User me = await this.Me();
+        string crid = this.Crid();
+        CollabMessage r = await this.CollabMessage
+            .Where(a => a.id == this.InInt("id", 0)
+                && a.tenantId == this.TenantId()).FirstAsync();
+        if (r == null) { this.Fail(404, "0404", "消息不存在"); }
+        if (r.senderId != me.id) { this.Fail(403, "0403", "仅发送者可撤回"); }
+        CollabMember mine = await Policy.Member(this.Held(), this.TenantId(),
+            r.conversationId, me.id);
+        if (!Policy.IsActive(mine)) { this.Fail(403, "0403", "仅会话成员可撤回"); }
+        if (r.deletedAt > 0) {
+            JsonValue gone = JsonValue.NewObject();
+            gone.Put("ok", JsonValue.NewStr("1"));
+            this.Ok(gone.ToJson());
+        }
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "message.recall", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        int n = await this.CollabMessage.Update()
+            .Set(a => a.deletedAt, now)
+            .Where(a => a.id == r.id && a.deletedAt == 0)
+            .ExecuteAffrowsAsync();
+        if (n == 0) { this.Fail(409, "0409", "消息状态已变化"); }
+        JsonValue ev = JsonValue.NewObject();
+        ev.Put("conversationId", JsonValue.NewStr(Convert.ToString(r.conversationId)));
+        ev.Put("messageId", JsonValue.NewStr(Convert.ToString(r.id)));
+        await this.InsertEvent("message.recalled", "message", r.id,
+            r.conversationId, me.id, ev);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        await this.IdemFinish(me.id, "message.recall", crid, "message", r.id, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
     /* ---- helpers ---- */
 
     /* 当前登录账号（ApiAuth 下 uid 必在；查不到即 401——token 版本失效等）。 */
