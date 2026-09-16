@@ -549,6 +549,28 @@ def run_matrix(catcher):
         pass
     ok("alerts" in d and "ts" in d, "alerts endpoint shape")
 
+    # ---- i18n: language switch through site settings ----
+    r = http("/admin/system/settings/save", cookie=cookie,
+             data={"site.language": "en-US"})
+    ok(r[0] in (200, 301, 302), "language set to en-US")
+    code, body, _ = http("/admin/wiki", cookie=cookie)
+    ok(code == 200 and "Knowledge Base" in body
+       and "Data Dictionaries" in body and "{{i" not in body,
+       "english shell renders translated menu")
+    code, body, _ = http("/admin", cookie=cookie)
+    ok(code == 200 and "Dashboard" in body, "dashboard heading translated")
+    code, body, _ = http("/admin/system/jobs", cookie=cookie)
+    ok(code == 200 and "Scheduled Jobs" in body and "Run Once" in body,
+       "common actions translated")
+    r = http("/admin/system/settings/save", cookie=cookie,
+             data={"site.language": "xx-XX"})
+    code, body, _ = http("/admin/wiki", cookie=cookie)
+    ok(code == 200 and "知识库" in body, "unknown language falls back")
+    r = http("/admin/system/settings/save", cookie=cookie,
+             data={"site.language": "zh-CN"})
+    code, body, _ = http("/admin/wiki", cookie=cookie)
+    ok(code == 200 and "知识库" in body, "switch back to chinese works")
+
     # reset 会使旧会话失效，admin 会话断言放在邮件段之前。
     code, _b, _c = http("/admin", cookie=cookie)
     ok(code == 200, "admin alive before mail section")

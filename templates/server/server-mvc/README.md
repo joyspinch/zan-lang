@@ -560,6 +560,28 @@ Markdown source must be read with `InRaw` — the default `In`/`InText`
 accessors run `Filter.Clean`, which strips CR/LF (header-injection defense)
 and would silently flatten multiline text into one line.
 
+## Multi-language UI (`site.language` / `i18n`)
+
+The admin shell is translatable through a lightweight, Chinese-as-key layer
+(`src/Feature/Lang.zan`):
+
+- The UI language is the `site.language` site setting (`zh-CN` default,
+  `en-US` shipped). `zh-CN` renders the source strings directly — zero
+  overhead, zero behavior change.
+- Any other registered language loads a flat `{chinese: translated}` JSON
+  pack from `wwwroot/i18n/{lang}.json` at first render; a missing entry
+  falls back to the Chinese source, so a partially filled pack can never
+  break the screen. Packs ship with `wwwroot` (so `--publish` carries them)
+  and adding a language = one JSON file + one entry in `Lang.Known`.
+- Covered today: sidebar groups, menu titles, screen headings/titles, and
+  the common inline action labels. Views reference the common labels as
+  `{{iEdit}}` / `{{iSave}}` / `{{iOps}}` … injected into every page and
+  dialog by `AdminController.I18n`. Server messages (toasts, errors) and
+  front-site pages stay Chinese in v1 — translate by wrapping the literal
+  with `Lang.T(...)` or adding a key as needed.
+- Switching the setting takes effect on the next request (settings cache is
+  forgotten on save); unknown values fall back to `zh-CN`.
+
 ## Inline cell editing (generic, `data-quick`)
 
 Any admin list can opt its table into in-place editing without page-specific
