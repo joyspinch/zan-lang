@@ -141,6 +141,10 @@ class GenForm {
         JsonValue h = root.Get("winH");
         if (h != null && h.IsNumber() && h.AsInt(0) > 0) { win_h = h.AsInt(0); }
         bool free_mode = GenForm.ObjNum(root, "layoutMode", 0) == 1;
+        int form_size = GenForm.ObjNum(root, "formSize", 1);
+        string default_size_class = "";
+        if (form_size == 0) { default_size_class = "large"; }
+        else if (form_size == 2) { default_size_class = "small"; }
         /* role: "control" 生成可嵌入的 `partial class X : Control`(面板、
          * 视图、卡片),缺省或 "window" 生成窗体。控件文档没有窗口,
          * 因此不能充当项目入口。 */
@@ -252,7 +256,8 @@ class GenForm {
             for (int i = 0; i < fields.Count(); i = i + 1) {
                 id = GenForm.EmitField(decls, body, wire, valid, fields.At(i),
                                        rootParent, id, used, free_mode,
-                                       !free_mode, dispatch, ctl, false);
+                                       !free_mode, dispatch, ctl, false,
+                                       default_size_class);
             }
         }
 
@@ -451,7 +456,10 @@ class GenForm {
             out0.Append("        form.Run();\n");
             out0.Append("    }\n");
             if (emit_main) {
-                out0.Append("\n    static void Main() {\n");
+                // Internal fallback entry: the compiler prefers an explicit
+                // user Main anywhere in the input set and uses this only when
+                // the design document is the whole application.
+                out0.Append("\n    static void __DesignMain() {\n");
                 out0.Append("        " + name + ".Show();\n");
                 out0.Append("    }\n");
             }
@@ -1094,6 +1102,19 @@ static List<string> NonConstructibleKinds() {
         return parent + ".SlotHost(" + Convert.ToString(idx) + ")";
     }
 
+    /// 是否已经由控件自己声明尺寸档。按空格分词，避免把
+    /// `small-card` 这类普通语义类误判成尺寸覆盖。
+    static bool HasSizeClass(string classes) {
+        List<string> xs = classes.Split(" ");
+        for (int i = 0; i < xs.Count; i = i + 1) {
+            string x = xs[i].Trim();
+            if (x == "tiny" || x == "small" || x == "medium" || x == "large") {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// 直接子控件数:无 "kids" 数组则为 0。自动布局用它估容器高度。
     static int ChildrenCount(JsonValue o) {
         JsonValue kids = o.Get("kids");
@@ -1111,7 +1132,8 @@ static List<string> NonConstructibleKinds() {
                          JsonValue o, string parent, int id,
                          List<string> used, bool freeMode,
                          bool parentIsFlow, string dispatch,
-                         bool instanceFields, bool anon) {
+                         bool instanceFields, bool anon,
+                         string defaultSizeClass) {
         string kind = GenForm.TypeOf(o);
         string fname = GenForm.ObjStr(o, "name");
         string host = GenForm.ParentExpr(o, parent);
@@ -1194,8 +1216,14 @@ static List<string> NonConstructibleKinds() {
                 body.Append("\");\n");
             }
         }
-        /* 设计里的 class 就是控件的 CSS 类(皮肤/尺寸变体)。 */
+        /* 表单级 formSize 是未显式定档控件的默认尺寸。控件自己的
+         * tiny/small/medium/large 优先，外观类（text/primary 等）与
+         * 默认尺寸类合并；不能靠 CSS 继承，因为高度/padding 不继承。 */
         string dcls = GenForm.ObjStr(o, "class");
+        if (defaultSizeClass.Length > 0 && !GenForm.HasSizeClass(dcls)) {
+            if (dcls.Length > 0) { dcls = dcls + " "; }
+            dcls = dcls + defaultSizeClass;
+        }
         if (dcls.Length > 0) {
             body.Append("        " + vn + ".Class = \"");
             body.Append(GenCommon.Esc(dcls));
@@ -1402,7 +1430,8 @@ static List<string> NonConstructibleKinds() {
             for (int i = 0; i < kids.Count(); i = i + 1) {
                 next = GenForm.EmitField(decls, body, wire, valid, kids.At(i),
                                          vn, next, used, fm, false,
-                                         dispatch, instanceFields, anonKids);
+                                         dispatch, instanceFields, anonKids,
+                                         defaultSizeClass);
             }
         }
         return next;

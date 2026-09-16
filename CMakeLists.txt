@@ -2749,6 +2749,29 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_zform_html${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # A form-level size is the default for every generated control, including
+  # nested children; an explicit per-control size class still wins.
+  add_test(NAME conformance_gui_design_form_size
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/design_form_size_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/design_form_size_large.html;${CMAKE_SOURCE_DIR}/tests/gui/design_form_size_default.html;${CMAKE_SOURCE_DIR}/tests/gui/design_form_size_small.html;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_design_form_size.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_design_form_size${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
+  # A primary design document supplies only a fallback entry point. When a
+  # later Zan input declares Main, that explicit entry must win regardless of
+  # response-file order (large designed applications depend on this shape).
+  add_test(NAME conformance_gui_design_explicit_main
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/design_explicit_main.html
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/design_explicit_main_test.zan;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_design_explicit_main.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_design_explicit_main${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # Dynamic document primitives (P8): a design doc with <template
   # data-for> / data-if projects Rows.SetAttr("data-for") and
   # Title.bindIf through GenForm; the host attaches a JsonValue model
