@@ -2099,9 +2099,14 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             zan_symbol_t *es = zan_binder_lookup(g->binder,
                 expr->call.callee->member.object->ident.name);
             if (es && es->kind == SYM_ENUM && es->member_count > 0) {
-                zan_symbol_t *mems[256];
-                long long vals[256];
-                int n = irgen_enum_members(es, mems, vals, 256);
+                /* sized by the declared member count — a fixed cap here
+                 * silently truncated enum 257+ (A78-3: no silent caps) */
+                zan_symbol_t **mems = (zan_symbol_t **)calloc(
+                    (size_t)es->member_count, sizeof(*mems));
+                long long *vals = (long long *)calloc(
+                    (size_t)es->member_count, sizeof(*vals));
+                int n = irgen_enum_members(es, mems, vals,
+                                           es->member_count);
                 LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
                 LLVMTypeRef i8pt = LLVMPointerType(i8t, 0);
                 LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
@@ -2161,6 +2166,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMPositionBuilderAtEnd(g->builder, done_bb);
                 emit_release_owned_call_temp(g, expr->call.args.items[0], s,
                                              locals);
+                free(mems);
+                free(vals);
                 return LLVMBuildLoad2(g->builder, i32t, res_a, "tp.out");
             }
         }
@@ -2222,9 +2229,20 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                      * losing side. */
                     if (rt_ty->kind == TYPE_ENUM && rt_ty->sym &&
                         rt_ty->sym->member_count > 0) {
-                        zan_symbol_t *mems[256];
-                        long long vals[256];
-                        int n = irgen_enum_members(rt_ty->sym, mems, vals, 256);
+                        /* sized by the declared member count — a fixed cap
+                         * here silently truncated enum 257+ (A78-3: no
+                         * silent caps) */
+                        int cap = rt_ty->sym->member_count;
+                        zan_symbol_t **mems = (zan_symbol_t **)calloc(
+                            (size_t)cap, sizeof(*mems));
+                        long long *vals = (long long *)calloc(
+                            (size_t)cap, sizeof(*vals));
+                        int n = irgen_enum_members(rt_ty->sym, mems, vals,
+                                                   cap);
+                        if (n == 0) {
+                            free(mems);
+                            free(vals);
+                        }
                         if (n > 0) {
                             LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
                             LLVMValueRef v64 = emit_widen_i64_for_print(g, v);
@@ -2233,8 +2251,10 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             LLVMBasicBlockRef joinbb =
                                 LLVMAppendBasicBlockInContext(g->ctx, fn,
                                                               "em.join");
-                            LLVMBasicBlockRef hitbbs[256];
-                            LLVMValueRef lits[256];
+                            LLVMBasicBlockRef *hitbbs = (LLVMBasicBlockRef *)
+                                calloc((size_t)n, sizeof(*hitbbs));
+                            LLVMValueRef *lits = (LLVMValueRef *)calloc(
+                                (size_t)n, sizeof(*lits));
                             LLVMBasicBlockRef cur =
                                 LLVMGetInsertBlock(g->builder);
                             for (int i = 0; i < n; i++) {
@@ -2283,6 +2303,10 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                             LLVMAddIncoming(phi, vals_in, blks_in, n + 1);
                             free(vals_in);
                             free(blks_in);
+                            free(hitbbs);
+                            free(lits);
+                            free(mems);
+                            free(vals);
                             return phi;
                         }
                     }

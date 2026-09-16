@@ -118,11 +118,18 @@ typedef struct {
 
 typedef struct {
     buf_t out;
-    zip_ent_t ents[64];
+    zip_ent_t *ents;    /* grown on demand — a fixed cap silently dropped
+                         * entries past it and still shipped the APK */
     int nent;
+    int cap;
 } zip_t;
 
-static void zip_start(zip_t *z) { buf_init(&z->out); z->nent = 0; }
+static void zip_start(zip_t *z) {
+    buf_init(&z->out);
+    z->cap = 64;
+    z->nent = 0;
+    z->ents = (zip_ent_t *)calloc((size_t)z->cap, sizeof(*z->ents));
+}
 
 static void zip_end_align(zip_t *z, int boundary) {
     while (z->out.len % (size_t)boundary) buf_u8(&z->out, 0);
@@ -130,7 +137,18 @@ static void zip_end_align(zip_t *z, int boundary) {
 
 static int zip_add(zip_t *z, const char *name, const unsigned char *data,
                    size_t n, int compress, int align) {
-    if (z->nent >= (int)(sizeof(z->ents) / sizeof(z->ents[0]))) return -1;
+    if (!z->ents || z->nent == z->cap) {
+        int ncap = z->cap * 2;
+        zip_ent_t *ne = (zip_ent_t *)realloc(z->ents,
+            (size_t)ncap * sizeof(*ne));
+        if (!ne) {
+            fprintf(stderr, "error: out of memory adding zip entry '%s'\n",
+                    name);
+            return -1;
+        }
+        z->ents = ne;
+        z->cap = ncap;
+    }
     zip_ent_t *e = &z->ents[z->nent];
     memset(e, 0, sizeof(*e));
     snprintf(e->name, sizeof(e->name), "%s", name);
@@ -755,9 +773,13 @@ int zan_apk_build(const char *apk_path, const char *lib_main,
 
     /* ---- assemble the zip ---- */
     zip_t z; zip_start(&z);
-    zip_add(&z, "AndroidManifest.xml", man2, man2_len, 1, 4);
-    zip_add(&z, "resources.arsc", arsc, arsc_len, 0, 4);
-    zip_add(&z, "classes.dex", dex, dex_len, 1, 4);
+    if (zip_add(&z, "AndroidManifest.xml", man2, man2_len, 1, 4) != 0 ||
+        zip_add(&z, "resources.arsc", arsc, arsc_len, 0, 4) != 0 ||
+        zip_add(&z, "classes.dex", dex, dex_len, 1, 4) != 0) {
+        buf_free(&z.out); free(z.ents);
+        free(man2); free(arsc); free(dex); free(lib);
+        return 1;
+    }
     /* launcher icons: every PNG under <shell_dir>/res/ goes in at
      * res/<dpi-dir>/<name>.png (paths aapt2 precompiled into the arsc) */
     {
@@ -771,13 +793,21 @@ int zan_apk_build(const char *apk_path, const char *lib_main,
             if (!idata) continue;
             char ename[160];
             snprintf(ename, sizeof(ename), "res/%s-v4/ic_launcher.png", dpis[di]);
-            zip_add(&z, ename, idata, ilen, 1, 4);
+            if (zip_add(&z, ename, idata, ilen, 1, 4) != 0) {
+                free(idata); buf_free(&z.out); free(z.ents);
+                free(man2); free(arsc); free(dex); free(lib);
+                return 1;
+            }
             free(idata);
         }
     }
     char lname[160];
     snprintf(lname, sizeof(lname), "lib/%s/libmain.so", abi);
-    zip_add(&z, lname, lib, lib_len, 0, 4);
+    if (zip_add(&z, lname, lib, lib_len, 0, 4) != 0) {
+        buf_free(&z.out); free(z.ents);
+        free(man2); free(arsc); free(dex); free(lib);
+        return 1;
+    }
     for (int i = 0; i < extra_count; i++) {
         size_t elen = 0;
         unsigned char *edata = read_all(extra_libs[i], &elen);
@@ -793,12 +823,17 @@ int zan_apk_build(const char *apk_path, const char *lib_main,
         base = base ? base + 1 : extra_libs[i];
         char ename[200];
         snprintf(ename, sizeof(ename), "lib/%s/%s", abi, base);
-        zip_add(&z, ename, edata, elen, 0, 4);
+        if (zip_add(&z, ename, edata, elen, 0, 4) != 0) {
+            free(edata); buf_free(&z.out); free(z.ents);
+            free(man2); free(arsc); free(dex); free(lib);
+            return 1;
+        }
         free(edata);
     }
     zip_finish(&z);
     int rc = write_all(tmp_apk, z.out.p, z.out.len);
     buf_free(&z.out);
+    free(z.ents);
     free(man2); free(arsc); free(dex); free(lib);
     if (rc != 0) {
         fprintf(stderr, "error: cannot write '%s'\n", tmp_apk);

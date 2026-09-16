@@ -73,8 +73,17 @@ static void parser_expect_gt(zan_parser_t *p) {
         p->current.kind = TK_GREATER;
         p->current.loc.col += 1;
         return;
+    case TK_GREATER_GREATER_GREATER:
+        /* the token holds three closers: peel one off, keep two */
+        p->current.kind = TK_GREATER_GREATER;
+        p->current.loc.col += 1;
+        return;
     case TK_GREATER_GREATER_EQ:
         p->current.kind = TK_GREATER_EQ;
+        p->current.loc.col += 1;
+        return;
+    case TK_GREATER_GREATER_GREATER_EQ:
+        p->current.kind = TK_GREATER_GREATER_EQ;
         p->current.loc.col += 1;
         return;
     default:
@@ -1022,7 +1031,8 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         case TK_INT: case TK_LONG: case TK_SHORT: case TK_BYTE:
         case TK_UINT: case TK_ULONG: case TK_USHORT: case TK_SBYTE:
         case TK_DOUBLE: case TK_FLOAT: case TK_DECIMAL:
-        case TK_BOOL: case TK_CHAR: case TK_NINT: {
+        case TK_BOOL: case TK_CHAR: case TK_NINT:
+        case TK_STRING: case TK_OBJECT: {
             parser_advance(p); /* ( */
             zan_ast_node_t *ctype = parse_type_ref(p);
             parser_expect(p, TK_RPAREN);
@@ -1345,8 +1355,10 @@ static bool looks_like_call_type_args(zan_parser_t *p) {
         zan_token_kind_t k = p->current.kind;
         if (k == TK_LESS) {
             depth++;
-        } else if (k == TK_GREATER || k == TK_GREATER_GREATER) {
-            depth -= (k == TK_GREATER_GREATER) ? 2 : 1;
+        } else if (k == TK_GREATER || k == TK_GREATER_GREATER ||
+                   k == TK_GREATER_GREATER_GREATER) {
+            depth -= (k == TK_GREATER_GREATER_GREATER) ? 3
+                   : (k == TK_GREATER_GREATER) ? 2 : 1;
             if (depth <= 0) {
                 ok = (zan_lexer_peek(p->lex).kind == TK_LPAREN);
                 break;
@@ -1380,8 +1392,10 @@ static bool looks_like_type_args_before_dot(zan_parser_t *p) {
         zan_token_kind_t k = p->current.kind;
         if (k == TK_LESS) {
             depth++;
-        } else if (k == TK_GREATER || k == TK_GREATER_GREATER) {
-            depth -= (k == TK_GREATER_GREATER) ? 2 : 1;
+        } else if (k == TK_GREATER || k == TK_GREATER_GREATER ||
+                   k == TK_GREATER_GREATER_GREATER) {
+            depth -= (k == TK_GREATER_GREATER_GREATER) ? 3
+                   : (k == TK_GREATER_GREATER) ? 2 : 1;
             if (depth <= 0) {
                 ok = (zan_lexer_peek(p->lex).kind == TK_DOT);
                 break;
@@ -1414,8 +1428,10 @@ static bool looks_like_type_args_before_brace(zan_parser_t *p) {
         zan_token_kind_t k = p->current.kind;
         if (k == TK_LESS) {
             depth++;
-        } else if (k == TK_GREATER || k == TK_GREATER_GREATER) {
-            depth -= (k == TK_GREATER_GREATER) ? 2 : 1;
+        } else if (k == TK_GREATER || k == TK_GREATER_GREATER ||
+                   k == TK_GREATER_GREATER_GREATER) {
+            depth -= (k == TK_GREATER_GREATER_GREATER) ? 3
+                   : (k == TK_GREATER_GREATER) ? 2 : 1;
             if (depth <= 0) {
                 ok = (zan_lexer_peek(p->lex).kind == TK_LBRACE);
                 break;
@@ -2752,11 +2768,65 @@ static zan_ast_node_t *parse_for_stmt(zan_parser_t *p) {
     parser_expect(p, TK_LPAREN);
 
     zan_ast_node_t *init = NULL;
+    /* For-head declarations: `for (int i = 0, j = i; ...)` must keep every
+     * declarator inside the loop scope. parse_var_decl cannot be borrowed
+     * here: its extra declarators queue in pending_stmts and are spliced by
+     * the next enclosing statement collector — AFTER the for statement — so
+     * `j` escaped the loop scope and the body saw it as undeclared. The
+     * declarators are parsed right here; two or more of them wrap the head
+     * decls + the for itself in a synthetic block, which is exactly the C#
+     * scoping rule: the variables live for cond/step/body and die with the
+     * loop. A single declarator keeps the plain init shape. */
+    zan_ast_list_t head_decls;
+    zan_ast_list_init(&head_decls);
+    int head_count = 0;
     if (!parser_check(p, TK_SEMICOLON)) {
         if (looks_like_var_decl(p)) {
-            /* var decl without trailing ; — parse_var_decl handles it */
-            init = parse_var_decl(p);
-            /* parse_var_decl already consumed ; */
+            bool is_const = parser_match(p, TK_CONST);
+            bool is_let = parser_match(p, TK_LET);
+
+            zan_ast_node_t *dtype = NULL;
+            if (!is_let || parser_check(p, TK_IDENT)) {
+                dtype = parse_type_ref(p);
+            }
+            if (dtype && dtype->kind == AST_TYPE_REF &&
+                dtype->type_ref.name.len == 3 &&
+                memcmp(dtype->type_ref.name.str, "var", 3) == 0) {
+                dtype = NULL;
+            }
+
+            if (dtype == NULL && parser_check(p, TK_LPAREN) && !is_const) {
+                /* deconstruction head `for (var (a, b) = pair; ...)`: a
+                 * single statement-shaped node; parse_tuple_decon_body
+                 * consumes the `;` itself */
+                init = parse_tuple_decon_body(p, loc, dtype);
+            } else {
+                for (;;) {
+                    zan_istr_t name = {0};
+                    if (parser_check(p, TK_IDENT)) {
+                        parser_advance(p);
+                        name = p->previous.str_val;
+                    } else {
+                        zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
+                                      "expected variable name");
+                    }
+                    zan_ast_node_t *dinit = NULL;
+                    if (parser_match(p, TK_EQ)) {
+                        dinit = parse_expression(p);
+                    }
+                    zan_ast_node_t *decl = zan_ast_new(p->arena,
+                        AST_VAR_DECL, loc);
+                    decl->var_decl.name = name;
+                    decl->var_decl.type = dtype;
+                    decl->var_decl.initializer = dinit;
+                    decl->var_decl.is_const = is_const;
+                    decl->var_decl.is_let = is_let;
+                    zan_ast_list_push(&head_decls, decl, p->arena);
+                    head_count++;
+                    if (!parser_match(p, TK_COMMA)) break;
+                }
+                parser_expect(p, TK_SEMICOLON);
+            }
             goto parse_cond;
         } else {
             /* `for (r = 0; ...)` reusing an outer local: the init is a bare
@@ -2796,6 +2866,18 @@ parse_cond:;
     n->for_stmt.cond = cond;
     n->for_stmt.step = step;
     n->for_stmt.body = body;
+    if (head_count == 1) {
+        n->for_stmt.init = head_decls.items[0];
+    } else if (head_count > 1) {
+        zan_ast_node_t *wrap = zan_ast_new(p->arena, AST_BLOCK, loc);
+        zan_ast_list_init(&wrap->block.stmts);
+        for (int i = 0; i < head_decls.count; i++) {
+            zan_ast_list_push(&wrap->block.stmts, head_decls.items[i],
+                              p->arena);
+        }
+        zan_ast_list_push(&wrap->block.stmts, n, p->arena);
+        return wrap;
+    }
     return n;
 }
 
