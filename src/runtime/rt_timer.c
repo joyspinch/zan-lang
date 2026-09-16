@@ -1123,6 +1123,14 @@ void zan_co_live_del(void *frame) {
     live_unlock();
 }
 
+int zan_co_live_count(void) {
+    if (!g_colive_cap) return 0;
+    live_lock();
+    int n = (int)g_colive_live;
+    live_unlock();
+    return n;
+}
+
 int zan_co_live_has(void *frame) {
     if (!frame || !g_colive_cap) return 0;
     live_lock();

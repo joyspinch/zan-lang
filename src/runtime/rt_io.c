@@ -3781,7 +3781,8 @@ typedef struct {
     zan_co_task        lifo;
     int                lifo_full;
     int                lifo_budget;
-    int                index;
+    int         index;
+    int         bg_gen;
     int                searching;
     /* Set while this worker blocks on its shard, so a producer can aim the wake
      * packet at a port that actually has a waiter. */
@@ -3807,6 +3808,18 @@ static int              g_co_inited;
 static int              g_co_workers;
 static DWORD            g_co_tls = TLS_OUT_OF_INDEXES;
 static zan_co_worker_t  g_wk[ZAN_CO_MAXW];
+
+/* ---- background pool (Task-anywhere liveness) ----
+ * 0 = no pool yet / foreground run owns execution; 1 = a detached pool is
+ * serving the ready queues for the process lifetime. g_co_background marks
+ * workers that must NEVER take the quiescence exit (they park instead), so
+ * a task queued by any thread is executed without the host program ever
+ * entering zan_co_sched_run. Worker count stays ZAN_CO_WORKERS. */
+static volatile LONG g_co_pool_live;   /* a generation of background workers is serving */
+static int           g_co_pool_gen;     /* generation id (stale workers skip the handshake) */
+static volatile LONG g_co_pool_out;     /* workers of the current generation still running */
+static int           g_io_shards_live;  /* reactor sharded exactly once per process */
+static void co_pool_ensure(void);
 
 /* Shared injector queue: readies from threads that are not workers (program
  * start-up, DNS workers) and local-queue overflow. */
@@ -3998,6 +4011,18 @@ static int lq_steal(zan_co_worker_t *v, zan_co_worker_t *w, zan_co_task *out) {
 
 static zan_co_fhdr *co_hdr(void *frame) { return (zan_co_fhdr *)frame; }
 
+static int g_co_trace = -1;
+static void co_trace(const char *what, const void *fp) {
+    if (g_co_trace < 0) {
+        const char *e = getenv("ZAN_CO_TRACE");
+        g_co_trace = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    if (!g_co_trace) return;
+    fprintf(stderr, "[cot %lu %s %p]\n",
+        (unsigned long)GetCurrentThreadId(), what, fp);
+    fflush(stderr);
+}
+
 static void co_submit(void *frame, zan_co_step_t step) {
     zan_co_task t;
     t.frame = frame; t.step = step;
@@ -4006,6 +4031,7 @@ static void co_submit(void *frame, zan_co_step_t step) {
     if (!w) {
         inj_push(t);
         InterlockedIncrement(&g_inj_push_ext);
+        co_trace("inj", t.frame);
         co_notify();
         return;
     }
@@ -4049,11 +4075,20 @@ void zan_co_ready(void *frame, zan_co_step_t step) {
                 return;
             continue;
         }
-        if (__atomic_compare_exchange_n(&h->sched, &s, s | CO_QUEUED, 0,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-            break;
+    if (__atomic_compare_exchange_n(&h->sched, &s, s | CO_QUEUED, 0,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        break;
     }
     co_submit(frame, step);
+    /* Task-anywhere liveness: zan_co_ready fires on ANY thread (GUI handler,
+     * Thread.Start entry, DNS worker). The foreground zan_co_sched_run()
+     * contract -- the caller BECOMES worker 0 and joins at quiescence --
+     * cannot hold for those callers: a GUI event loop never enters the pump,
+     * so spawned frames would sit in the injector queue forever (observed as
+     * the OnePlus child-window downloads hanging at 0%). Keep a detached
+     * worker pool alive instead: a queued task must always find a worker,
+     * decoupled from any pump entry the host program may or may not make. */
+    co_pool_ensure();
 }
 
 /* Release an async frame. Called by the compiler (--async-workers) instead of
@@ -4119,6 +4154,9 @@ void zan_co_sched_init(void) {
     g_co_searching = 0;
     g_co_wake = 0;
     g_co_stop = 0;
+    g_co_pool_live = 0;
+    g_co_pool_gen = 0;
+    g_io_shards_live = 0;
     g_timer_owner = 0;
     g_timer_pumped_ms = 0;
     g_timer_next_ms = -1;
@@ -4245,7 +4283,9 @@ static void co_run(zan_co_worker_t *w, zan_co_task *t) {
     }
     InterlockedIncrement(&g_co_running);
     w->st.ran++;
+    co_trace("run", t->frame);
     t->step(t->frame);
+    co_trace("done", t->frame);
     for (;;) {
         s = __atomic_load_n(&h->sched, __ATOMIC_ACQUIRE);
         if (s & CO_DEAD) { free(t->frame); break; }
@@ -4396,13 +4436,16 @@ static int co_all_idle(void) {
     return idle;
 }
 
+static void co_pool_retire(zan_co_worker_t *w);
+
 static void co_worker(int worker) {
     zan_co_worker_t *w = &g_wk[worker];
+    w->bg_gen = g_co_pool_gen;
     if (g_co_tls != TLS_OUT_OF_INDEXES) TlsSetValue(g_co_tls, w);
     /* Quiescence is confirmed, not assumed: see the co_all_idle call below. */
     LONG idle_seen = -1;
     for (;;) {
-        if (g_co_stop) return;
+        if (g_co_stop) { co_pool_retire(w); return; }
         /* Pump due timers even while the run queues stay busy. Otherwise, at
          * high request rates co_next_task always succeeds first and the pump
          * (only reached when the queues drain) never runs, starving
@@ -4437,13 +4480,17 @@ static void co_worker(int worker) {
          * in the timer heap / in-flight count and not yet in a run queue, and
          * a worker sampling exactly then would stop a live program. Requiring
          * an unchanged activity counter across a 1ms re-check closes that
-         * window -- any queued frame or armed timer bumps the counter. */
+         * window -- any queued frame or armed timer bumps the counter.
+         * Background-pool workers never take this exit: they park for the
+         * process lifetime, so a task queued by any thread always finds a
+         * worker (Task-anywhere liveness). */
         if (co_all_idle()) {
             LONG seq = g_co_activity;
             if (idle_seen == seq) {
                 g_co_stop = 1;
                 for (int i = 0; i < g_co_workers; i++)
                     co_wake_shard(co_worker_shard(i));
+                co_pool_retire(w);
                 return;
             }
             idle_seen = seq;
@@ -4536,7 +4583,62 @@ static DWORD WINAPI co_worker_thunk(LPVOID p) {
     return 0;
 }
 
+/* Start the detached background pool (once per process). Every worker is a
+ * created thread; the caller returns immediately -- this is the path a GUI
+ * event loop takes without ever giving up its thread to the scheduler. */
+static void co_pool_start_background(void) {
+    zan_io_init();   /* the port must exist before workers block on it */
+    g_co_stop = 0;
+    int w = g_co_workers;
+    if (!g_io_shards_live) { io_shards_start(w); g_io_shards_live = 1; }
+    g_co_pool_gen = g_co_pool_gen + 1;
+    g_co_pool_out = w;
+    co_trace("start", NULL);
+    for (int i = 0; i < w; i++) {
+        g_wk[i].bg_gen = g_co_pool_gen;
+        HANDLE th = CreateThread(NULL, 0, co_worker_thunk,
+                                 (LPVOID)(uintptr_t)i, 0, NULL);
+        if (th) CloseHandle(th);   /* detached: joined only by the exit handshake */
+    }
+}
+
+/* Last worker of a generation out: hand the pool's liveness flag back under
+ * the injector lock, with a final emptiness re-check -- a task pushed between
+ * the quiescence decision and this point either re-arms a new generation here
+ * or (arriving later) finds g_co_pool_live == 0 and starts one itself. A
+ * queued task is therefore never stranded between generations. */
+static void co_pool_retire(zan_co_worker_t *w) {
+    if (w->bg_gen != g_co_pool_gen || g_co_pool_gen == 0) { return; }
+    co_trace("retire", w);
+    if (InterlockedDecrement(&g_co_pool_out) != 0) { return; }
+    EnterCriticalSection(&g_inj_lock);
+    if (g_inj_len > 0) {
+        LeaveCriticalSection(&g_inj_lock);
+        co_pool_start_background();
+        return;
+    }
+    g_co_pool_live = 0;
+    LeaveCriticalSection(&g_inj_lock);
+}
+
+static void co_pool_ensure(void) {
+    if (g_co_pool_live) return;
+    if (InterlockedCompareExchange(&g_co_pool_live, 1, 0) == 0) {
+        co_pool_start_background();
+    }
+}
+
 void zan_co_sched_run(void) {
+    if (g_co_pool_live) {
+        /* A background pool owns execution (a foreign thread spawned work
+         * before the host ever called this). Do not start a second pool --
+         * wait for the outstanding work, then hand back. */
+        while (zan_co_pending() > 0 || zan_io_has_pending() ||
+               zan_timer_pending() > 0 || zan_co_live_count() > 0) {
+            Sleep(1);
+        }
+        return;
+    }
     zan_io_init();   /* ensure the port exists before workers block on it */
     int w = g_co_workers;
     g_co_stop = 0;
@@ -4561,8 +4663,30 @@ void zan_co_sched_run(void) {
 
 /* The multi-worker driver owns the whole thread pool for the duration of a run,
  * so it has no way to hand control back mid-pool: awaiting one frame from a
- * synchronous context drains, as it always has. */
+ * synchronous context drains, as it always has. Under a background pool,
+ * though, the work is already being served: the calling thread only waits for
+ * the ONE frame it named (root-await entries -- Thread.Start bodies -- block
+ * until their own job completes, not until global quiescence). */
 void zan_co_sched_run_until(const volatile int *done) {
+    if (g_co_pool_live && done != NULL) {
+        /* Pool runs the work; this thread only waits. First for the ONE
+         * frame it named -- yield-spin so a frame that completes in
+         * microseconds (an ORM hit on a warm pool) does not eat a 1ms
+         * sleep granularity -- then for global quiescence, matching the
+         * foreground drain contract (a mid-flight frame must not be cut
+         * down by process exit; frames own ARC state that is released on
+         * completion). */
+        int spins = 0;
+        while (!*done) {
+            if (spins < 512) { Sleep(0); spins++; }
+            else Sleep(1);
+        }
+        while (zan_co_pending() > 0 || zan_io_has_pending() ||
+               zan_timer_pending() > 0 || zan_co_live_count() > 0) {
+            Sleep(1);
+        }
+        return;
+    }
     (void)done;
     zan_co_sched_run();
 }

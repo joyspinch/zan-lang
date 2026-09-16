@@ -61,6 +61,11 @@ void   zan_co_set_idle(zan_co_idle_fn fn);
 void   zan_co_live_add(void *frame);
 void   zan_co_live_del(void *frame);
 int    zan_co_live_has(void *frame);
+/* Live detached-frame count: the drain condition for a background pool --
+ * frames parked as awaiters are invisible to pending/io/timers, so "queue,
+ * IO and timers all empty" alone can green-light @main's static cleanup while
+ * stragglers still run (they then read nulled static slots). */
+int    zan_co_live_count(void);
 void   zan_co_live_reset(void);
 
 /* Per-program async runtime settings (rt_timer.c, i.e. always linked), exposed
