@@ -22,6 +22,9 @@ namespace ZanWeb.Api;
 [Custom(Authorization = CustomAuthorization.ApiAuth)]
 [Description("协作域")]
 class CollabApi : ApiController {
+    /* 流存活时长（秒）：整夜挂着不应永远占协程；客户端断开后重连，
+       重连重过鉴权并按 cursor 补拉（Notifies.Stream 同款收口）。 */
+    static int StreamSeconds = 1800;
 
     /* 我的会话列表：active 成员行 → 会话事实，附成员数与我的角色。
        memberCount 按会话计数（本人会话数有界）；全租户维度扫描的规模化
@@ -488,7 +491,11 @@ class CollabApi : ApiController {
                     && convs.Contains(a.conversationId))
                 .OrderBy(a => a.id).Take(limit).ToListAsync();
             for (int i = 0; i < rows.Count; i = i + 1) {
-                items.Append(Policy.Frame(rows[i]));
+                JsonValue fr = Policy.Frame(rows[i]);
+                /* 在线帧经 NotifyHub.PushTyped 会带 type="collab"（通道分派键），
+                   补拉在此补齐同一个键——客户端两通道拿到的形状完全一致。 */
+                fr.Put("type", JsonValue.NewStr("collab"));
+                items.Append(fr);
                 next = rows[i].id;
             }
         }
@@ -496,6 +503,55 @@ class CollabApi : ApiController {
         body.Put("events", items);
         body.Put("next", JsonValue.NewStr(Convert.ToString(next)));
         this.Ok(body.ToJson());
+    }
+
+    /* 实时事件通道（A327-05）：WS 主 + SSE 回退同一端点（Notifies.Stream
+       同款机制），ApiAuth 授权语义在升级前已生效。事件帧 = CollabEventRelay
+       扇出的 Policy.Frame 统一外形，通道分派键 type="collab"；首帧
+       collab.hello 只做身份提示，历史对账一律走 events?after=（落库为准，
+       在线层不承担补发）。 */
+    [HttpGet]
+    [Description("实时事件流")]
+    [Custom(Perm = PermBit.View)]
+    async void Listen() {
+        User me = await this.Me();
+        HttpContext ctx = this.Ctx();
+        WsSession ws = await ctx.WsUpgrade();
+        if (ws != null) {
+            JsonValue first = JsonValue.NewObject();
+            first.PutStr("type", "collab.hello");
+            first.PutStr("userId", Convert.ToString(me.id));
+            if (!await ws.SendText(first.ToJson())) { return; }
+            ZanWeb.NotifyHub.JoinWs(me.id, ws);
+            long started = WebApp.NowSeconds();
+            while (ws.Open()) {
+                string m = await ws.Recv();
+                if (m == null) { break; }
+                if (WebApp.NowSeconds() - started >= CollabApi.StreamSeconds) {
+                    await ws.Close(1000);
+                    break;
+                }
+                /* 入站文本（心跳 ping 等）一律忽略；协议级 ping/pong 在 Recv 内已答。 */
+            }
+            ZanWeb.NotifyHub.LeaveWs(ws);
+            return;
+        }
+        /* SSE 回退通道：与 WS 同一端点，按 Upgrade 头自动分流。 */
+        if (!await ctx.SseOpen()) { return; }
+        ZanWeb.NotifyHub.JoinSse(me.id, ctx);
+        if (!await ctx.SseSend("collab.hello", "{\"userId\":"
+                + Convert.ToString(me.id) + "}")) {
+            ZanWeb.NotifyHub.LeaveSse(ctx);
+            return;
+        }
+        int elapsed = 0;
+        while (elapsed < CollabApi.StreamSeconds) {
+            await Task.Delay(15000);
+            elapsed = elapsed + 15;
+            /* 保活注释行：空闲时让代理不误判断连；事件帧不受此影响。 */
+            if (!await ctx.SseSend("", ": keep-alive")) { break; }
+        }
+        ZanWeb.NotifyHub.LeaveSse(ctx);
     }
 
     /* ---- helpers ---- */

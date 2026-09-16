@@ -434,11 +434,14 @@ every sign-in "wrong password").
 - `GET /api/docs.json` — OpenAPI 3.0（`/api/docs` UI 已收进管理后台 docs 屏）
 - `GET|POST /api/im/chats|stream|send|ack|unread|contacts` — IM 私聊
   （gui-wechat 桌面端在用；Bearer 令牌，验证脚本 `tools/e2e_im.py`）
-- `/api/collab/*` — 协作域：**会话与成员管理已落地**（`conversations` / `create` /
-  `members` / `invite` / `leave` / `kick`）与文本消息（`send` / `messages` 游标分页 / `read`），
-  幂等键契约生效，见 `tools/e2e_collab.py`；任务卡片/图片文件消息、事件补拉、协作附件、AI 总结仍为提案，契约见下节「协作域契约（A327 提案）」
+- `/api/collab/*` — 协作域：**会话 / 成员 / 文本消息 / 实时事件已落地**
+  （`conversations` / `create` / `members` / `invite` / `leave` / `kick` / `send` /
+  `messages` 游标分页 / `read` / `events?after=` cursor 补拉 / `listen` WS 主 +
+  SSE 回退），幂等键契约生效；验证 `tools/e2e_collab.py`（契约 73 项）与
+  `tools/e2e_realtime.py`（生产配置实时 25 项，后台协程开启）；任务卡片/
+  图片文件消息、协作附件、AI 总结仍为提案，契约见下节「协作域契约（A327 提案）」
 
-## 协作域契约（A327 提案——会话/成员/文本消息已落地，其余端点未实现）
+## 协作域契约（A327 提案——会话/成员/消息/实时事件已落地，其余端点未实现）
 
 gui-wechat（桌面客户端）× server-collab 的闭环改造规划分四期：P0 契约与安全
 基础 → P1 协作 MVP → P2 后台治理 → P3 AI 经验总结，逐卡台账见仓库根
