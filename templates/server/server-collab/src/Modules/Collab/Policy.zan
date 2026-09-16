@@ -1,0 +1,46 @@
+using System.Collections;
+using System.Data;
+using ZanWeb.Model.Collab;
+
+namespace ZanWeb.Modules.Collab;
+
+/* 协作域权限矩阵（A327-02，README「协作域契约（A327 提案）」权限矩阵节的
+   落地）：三层判定——租户硬边在先、资源成员关系随后、角色位最后。口径：
+     - 会话行查无与跨租户同口径 404（不向跨租户泄露存在性，与平台 T17
+       「跨租户读写 404」一致）；
+     - 会话读（成员列表/后续消息）仅 active member，非成员 403；
+     - 群管理（加人/踢人/改名）owner|admin；admin 只能被 owner 踢；
+     - owner 不可被踢、不可退出（先转让；转让随任务域 A327-10 落地）。
+   全部静态纯判定：查询走传入连接，不做 Fail/应答（控制器负责把 false/null
+   翻译成 404/403），便于后续任务域（A327-10）复用同一条判定链。 */
+class Policy {
+    /* 会话行（租户闸在先）；查无返回 null，调用方统一 404。 */
+    static async CollabConversation Conversation(IDbConnection db, int tenantId,
+                                                 int conversationId) {
+        return await db.Select<CollabConversation>()
+            .Where(a => a.id == conversationId && a.tenantId == tenantId)
+            .FirstAsync();
+    }
+
+    /* 本人在会话中的成员行（含 left 行）；无行返回 null。 */
+    static async CollabMember Member(IDbConnection db, int tenantId,
+                                     int conversationId, int userId) {
+        List<CollabMember> rows = await db.Select<CollabMember>()
+            .Where(a => a.tenantId == tenantId && a.conversationId == conversationId
+                && a.userId == userId).ToListAsync();
+        return rows.Count > 0 ? rows[0] : null;
+    }
+
+    static bool IsActive(CollabMember m) {
+        return m != null && m.status == "active";
+    }
+
+    /* 群管理位：owner 或 admin。 */
+    static bool IsAdmin(CollabMember m) {
+        return Policy.IsActive(m) && (m.role == "owner" || m.role == "admin");
+    }
+
+    static bool IsOwner(CollabMember m) {
+        return Policy.IsActive(m) && m.role == "owner";
+    }
+}

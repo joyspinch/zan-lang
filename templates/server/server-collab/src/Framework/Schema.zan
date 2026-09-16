@@ -24,6 +24,7 @@ class Schema {
             /* 编译期已知所有 [Table] 类，一行调用覆盖全部，新模型无需补行。*/
             await db.SyncStructureAllAsync();
             await Schema.BackfillTenant(db);
+            if (!await Schema.EnsureCollabIndexes(db)) { return false; }
 
             if (!await Schema.SeedAdmin(db)) { return false; }
             if (!await Schema.SeedRoles(db)) { return false; }
@@ -72,6 +73,29 @@ class Schema {
         if (total > 0) {
             Console.WriteLine("[tenant] 已回填 " + Convert.ToString(total)
                 + " 行业务数据的租户归属为 1");
+        }
+        return true;
+    }
+
+    /* 协作域唯一约束（A327-02/03）：ORM [Index] 无唯一形态，原生 DDL 补——
+       collab_member 同会话同人一行（重入=复位不另起行）、collab_idem 幂等键
+       一键一行。IF NOT EXISTS 幂等；MySQL 无 CREATE INDEX IF NOT EXISTS，
+       失败仅告警不阻断启动（唯一性退化为 Join 的先查后插），按 provider
+       完整分支归 A327-19 治理。 */
+    static async bool EnsureCollabIndexes(IDbConnection db) {
+        try {
+            await db.ExecuteAsync(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_collab_member "
+                + "ON collab_member (tenantId, conversationId, userId)");
+        } catch (Exception ex) {
+            Console.WriteLine("[collab] ux_collab_member: " + ex.Message);
+        }
+        try {
+            await db.ExecuteAsync(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_collab_idem "
+                + "ON collab_idem (tenantId, actorId, operation, clientRequestId)");
+        } catch (Exception ex2) {
+            Console.WriteLine("[collab] ux_collab_idem: " + ex2.Message);
         }
         return true;
     }

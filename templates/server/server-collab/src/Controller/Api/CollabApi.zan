@@ -1,0 +1,395 @@
+using System;
+using System.Collections;
+using System.Data.Orm;
+using System.Json;
+using System.Web;
+using ZanWeb.Model.Collab;
+using ZanWeb.Model.Sys;
+using ZanWeb.Modules.Collab;
+
+namespace ZanWeb.Api;
+
+/* 桌面客户端（gui-wechat）协作域接口（A327-02/03/07 切片）：群会话与成员
+   管理的 JSON 面板（ApiAuth = Grant 的 token 形态），契约见 README
+   「协作域契约（A327 提案）」。口径：
+     - 全部端点 {code,msg,data}；会话查无与跨租户同答 404（不泄露存在性）；
+     - 非成员读 403；群管理位 owner|admin；owner 不可被踢/退出；
+     - 可重试写全部带 clientRequestId（collab_idem 幂等）：重放返回原应答并
+       标 replayed=1；占位未完成 409；
+     - 写路径在请求事务内（Begin/Commit）：占位行+事实行+应答回填同生共死，
+       Fail 中断即整体回滚，不留半开幂等键。 */
+[Route("api/collab/[action]")]
+[Custom(Authorization = CustomAuthorization.ApiAuth)]
+[Description("协作域")]
+class CollabApi : ApiController {
+
+    /* 我的会话列表：active 成员行 → 会话事实，附成员数与我的角色。
+       memberCount 按会话计数（本人会话数有界）；全租户维度扫描的规模化
+       （键控拼装/缓存）归 A327-19 治理。 */
+    [HttpGet]
+    [Description("我的会话")]
+    [Custom(Perm = PermBit.View)]
+    async void Conversations() {
+        User me = await this.Me();
+        List<CollabMember> mine = await this.CollabMember
+            .Where(a => a.tenantId == this.TenantId() && a.userId == me.id
+                && a.status == "active").ToListAsync();
+        JsonValue items = JsonValue.NewArray();
+        for (int i = 0; i < mine.Count; i = i + 1) {
+            CollabMember m = mine[i];
+            CollabConversation c = await Policy.Conversation(this.Held(),
+                this.TenantId(), m.conversationId);
+            if (c == null || c.archivedAt > 0) { continue; }
+            int members = await this.CollabMember
+                .Where(a => a.tenantId == this.TenantId()
+                    && a.conversationId == c.id && a.status == "active").CountAsync();
+            JsonValue o = JsonValue.NewObject();
+            o.Put("id", JsonValue.NewStr(Convert.ToString(c.id)));
+            o.Put("type", JsonValue.NewStr(c.type));
+            o.Put("title", JsonValue.NewStr(c.title));
+            o.Put("role", JsonValue.NewStr(m.role));
+            o.Put("members", JsonValue.NewStr(Convert.ToString(members)));
+            o.Put("createdAt", JsonValue.NewStr(Convert.ToString(c.createdAt)));
+            items.Append(o);
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("conversations", items);
+        this.Ok(body.ToJson());
+    }
+
+    /* 创建群聊：创建者即 owner；ids 为初始成员（本租户启用账号，重复/自邀忽略）。 */
+    [HttpPost]
+    [Description("创建群聊")]
+    [Custom(Perm = PermBit.Create)]
+    async void Create() {
+        User me = await this.Me();
+        string title = this.Need("title", "群聊名称");
+        if (title.Length > 64) { title = title.Substring(0, 64); }
+        string crid = this.Crid();
+        /* 先于幂等占位完成全部校验：参数/对象不存在时原键可干净重试。 */
+        List<User> invitees = await this.ResolveInvitees(me,
+            CollabApi.IdsOf(this.In("ids")));
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "conversation.create", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        CollabConversation c = new CollabConversation();
+        c.tenantId = this.TenantId();
+        c.type = "group";
+        c.title = title;
+        c.creatorId = me.id;
+        c.version = 1;
+        c.createdAt = now;
+        c.updatedAt = now;
+        c.archivedAt = 0;
+        int id = await this.CollabConversation.Insert(c).ExecuteIdentityAsync();
+        await this.InsertMember(this.TenantId(), id, me.id, "owner", now);
+        int added = 0;
+        for (int i = 0; i < invitees.Count; i = i + 1) {
+            await this.InsertMember(this.TenantId(), id, invitees[i].id, "member", now);
+            added = added + 1;
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("id", JsonValue.NewStr(Convert.ToString(id)));
+        body.Put("added", JsonValue.NewStr(Convert.ToString(added)));
+        await this.IdemFinish(me.id, "conversation.create", crid,
+            "conversation", id, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* 成员列表（active）：仅会话成员可见；跨租户/不存在同答 404。 */
+    [HttpGet]
+    [Description("成员列表")]
+    [Custom(Perm = PermBit.View)]
+    async void Members() {
+        User me = await this.Me();
+        int conversationId = this.InInt("conversationId", 0);
+        CollabConversation c = await Policy.Conversation(this.Held(),
+            this.TenantId(), conversationId);
+        if (c == null) { this.Fail(404, "0404", "会话不存在"); }
+        CollabMember mine = await Policy.Member(this.Held(), this.TenantId(),
+            conversationId, me.id);
+        if (!Policy.IsActive(mine)) { this.Fail(403, "0403", "仅会话成员可见成员列表"); }
+        List<CollabMember> rows = await this.CollabMember
+            .Where(a => a.tenantId == this.TenantId()
+                && a.conversationId == conversationId && a.status == "active")
+            .OrderBy(a => a.id).ToListAsync();
+        List<User> users = await this.User
+            .Where(a => a.tenantId == this.TenantId()).ToListAsync();
+        JsonValue items = JsonValue.NewArray();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            CollabMember m = rows[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Put("userId", JsonValue.NewStr(Convert.ToString(m.userId)));
+            o.Put("name", JsonValue.NewStr(CollabApi.NameOf(users, m.userId)));
+            o.Put("role", JsonValue.NewStr(m.role));
+            o.Put("joinedAt", JsonValue.NewStr(Convert.ToString(m.joinedAt)));
+            items.Append(o);
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("conversationId", JsonValue.NewStr(Convert.ToString(conversationId)));
+        body.Put("members", items);
+        this.Ok(body.ToJson());
+    }
+
+    /* 加人：owner|admin；对象须本租户启用账号；已在会话者跳过（added 只计
+       新增），left 行条件复位（重入不另起行）。 */
+    [HttpPost]
+    [Description("加人")]
+    [Custom(Perm = PermBit.Update)]
+    async void Invite() {
+        User me = await this.Me();
+        int conversationId = this.InInt("conversationId", 0);
+        string crid = this.Crid();
+        CollabConversation c = await Policy.Conversation(this.Held(),
+            this.TenantId(), conversationId);
+        if (c == null) { this.Fail(404, "0404", "会话不存在"); }
+        CollabMember mine = await Policy.Member(this.Held(), this.TenantId(),
+            conversationId, me.id);
+        if (!Policy.IsAdmin(mine)) { this.Fail(403, "0403", "仅群主或管理员可加人"); }
+        List<User> invitees = await this.ResolveInvitees(me,
+            CollabApi.IdsOf(this.Need("ids", "成员")));
+        if (invitees.Count == 0) { this.Fail(400, "0003", "没有可添加的成员"); }
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "member.invite", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        int added = 0;
+        for (int i = 0; i < invitees.Count; i = i + 1) {
+            added = added + await this.Join(conversationId, invitees[i].id, now);
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        body.Put("added", JsonValue.NewStr(Convert.ToString(added)));
+        await this.IdemFinish(me.id, "member.invite", crid,
+            "conversation", conversationId, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* 退出会话：owner 需先转让（转让随 A327-10）；已不在会话按幂等成功。 */
+    [HttpPost]
+    [Description("退出会话")]
+    [Custom(Perm = PermBit.Update)]
+    async void Leave() {
+        User me = await this.Me();
+        int conversationId = this.InInt("conversationId", 0);
+        string crid = this.Crid();
+        CollabConversation c = await Policy.Conversation(this.Held(),
+            this.TenantId(), conversationId);
+        if (c == null) { this.Fail(404, "0404", "会话不存在"); }
+        CollabMember mine = await Policy.Member(this.Held(), this.TenantId(),
+            conversationId, me.id);
+        if (!Policy.IsActive(mine)) {
+            JsonValue gone = JsonValue.NewObject();
+            gone.Put("ok", JsonValue.NewStr("1"));
+            this.Ok(gone.ToJson());
+        }
+        if (Policy.IsOwner(mine)) { this.Fail(403, "0403", "群主不能退出，请先转让群主"); }
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "member.leave", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        await this.CollabMember.Update()
+            .Set(a => a.status, "left")
+            .Set(a => a.leftAt, now)
+            .Where(a => a.id == mine.id && a.status == "active")
+            .ExecuteAffrowsAsync();
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        await this.IdemFinish(me.id, "member.leave", crid,
+            "conversation", conversationId, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* 移除成员：owner|admin；admin 只能移除 member；owner 不可被移除；
+       目标已不在会话按幂等成功。 */
+    [HttpPost]
+    [Description("移除成员")]
+    [Custom(Perm = PermBit.Update)]
+    async void Kick() {
+        User me = await this.Me();
+        int conversationId = this.InInt("conversationId", 0);
+        int targetId = this.InInt("userId", 0);
+        string crid = this.Crid();
+        CollabConversation c = await Policy.Conversation(this.Held(),
+            this.TenantId(), conversationId);
+        if (c == null) { this.Fail(404, "0404", "会话不存在"); }
+        CollabMember mine = await Policy.Member(this.Held(), this.TenantId(),
+            conversationId, me.id);
+        if (!Policy.IsAdmin(mine)) { this.Fail(403, "0403", "仅群主或管理员可移除成员"); }
+        CollabMember target = await Policy.Member(this.Held(), this.TenantId(),
+            conversationId, targetId);
+        if (!Policy.IsActive(target)) {
+            JsonValue gone = JsonValue.NewObject();
+            gone.Put("ok", JsonValue.NewStr("1"));
+            this.Ok(gone.ToJson());
+        }
+        if (Policy.IsOwner(target)) { this.Fail(403, "0403", "群主不能被移除"); }
+        if (target.userId == me.id) { this.Fail(400, "0004", "移除自己请使用退出会话"); }
+        if (mine.role == "admin" && target.role == "admin") {
+            this.Fail(403, "0403", "管理员只能由群主移除");
+        }
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "member.kick", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        await this.CollabMember.Update()
+            .Set(a => a.status, "left")
+            .Set(a => a.leftAt, now)
+            .Where(a => a.id == target.id && a.status == "active")
+            .ExecuteAffrowsAsync();
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        await this.IdemFinish(me.id, "member.kick", crid,
+            "conversation", conversationId, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* ---- helpers ---- */
+
+    /* 当前登录账号（ApiAuth 下 uid 必在；查不到即 401——token 版本失效等）。 */
+    async User Me() {
+        User me = await this.User
+            .Where(a => a.id == Filter.ToInt(this.uid, 0)).FirstAsync();
+        if (me == null || me.status != 1) {
+            this.Fail(401, "1001", "账号不可用，请重新登录");
+        }
+        return me;
+    }
+
+    /* 邀请对象校验：全部必须是本租户启用账号（先于幂等占位判定，
+       失败不留键、原键可重试）；自邀与重复 id 在此静默忽略。 */
+    async List<User> ResolveInvitees(User me, List<int> ids) {
+        List<User> users = new List<User>();
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            if (ids[i] == me.id) { continue; }
+            bool dup = false;
+            for (int j = 0; j < users.Count; j = j + 1) {
+                if (users[j].id == ids[i]) { dup = true; break; }
+            }
+            if (dup) { continue; }
+            User u = await this.User
+                .Where(a => a.id == ids[i] && a.tenantId == this.TenantId()
+                    && a.status == 1).FirstAsync();
+            if (u == null) { this.Fail(404, "0404", "邀请对象不存在或已停用"); }
+            users.Add(u);
+        }
+        return users;
+    }
+
+    /* 加入/重入：无行插入；left 行条件复位（并发重入仅一方生效，CAS 口径）。
+       返回本次实际新增/复活的行数。 */
+    async int Join(int conversationId, int userId, long now) {
+        CollabMember exist = await Policy.Member(this.Held(), this.TenantId(),
+            conversationId, userId);
+        if (exist == null) {
+            await this.InsertMember(this.TenantId(), conversationId, userId, "member", now);
+            return 1;
+        }
+        if (exist.status == "active") { return 0; }
+        int n = await this.CollabMember.Update()
+            .Set(a => a.status, "active")
+            .Set(a => a.leftAt, 0)
+            .Set(a => a.joinedAt, now)
+            .Where(a => a.id == exist.id && a.status == "left")
+            .ExecuteAffrowsAsync();
+        return n;
+    }
+
+    async void InsertMember(int tenantId, int conversationId, int userId,
+                            string role, long now) {
+        CollabMember m = new CollabMember();
+        m.tenantId = tenantId;
+        m.conversationId = conversationId;
+        m.userId = userId;
+        m.role = role;
+        m.status = "active";
+        m.lastReadMsgId = 0;
+        m.joinedAt = now;
+        m.leftAt = 0;
+        await this.CollabMember.Insert(m).ExecuteIdentityAsync();
+    }
+
+    /* ---- 幂等（collab_idem，A327-03 前半） ---- */
+
+    /* clientRequestId 必填（可重试写契约），超长截断。 */
+    string Crid() {
+        string crid = this.Need("clientRequestId", "clientRequestId");
+        if (crid.Length > 64) { crid = crid.Substring(0, 64); }
+        return crid;
+    }
+
+    /* 必须在请求事务内调用。返回 null = 首次（占位行已插入，收尾必须
+       IdemFinish）；非空 = 已有应答（空串 = 上次仍在处理，Replay 答 409）。
+       并发同键：占位行唯一索引裁决，后到者随事务整体回滚，原键重试即得。 */
+    async string IdemBegin(int actorId, string operation, string crid) {
+        List<CollabIdem> prev = await this.CollabIdem
+            .Where(a => a.tenantId == this.TenantId() && a.actorId == actorId
+                && a.operation == operation && a.clientRequestId == crid)
+            .ToListAsync();
+        if (prev.Count > 0) { return prev[0].response; }
+        CollabIdem k = new CollabIdem();
+        k.tenantId = this.TenantId();
+        k.actorId = actorId;
+        k.operation = operation;
+        k.clientRequestId = crid;
+        k.resourceType = "";
+        k.resourceId = 0;
+        k.response = "";
+        k.createdAt = WebApp.NowSeconds();
+        await this.CollabIdem.Insert(k).ExecuteIdentityAsync();
+        return null;
+    }
+
+    /* 事务收尾：回填应答与资源回链（提交前，与事实行同生共死）。 */
+    async void IdemFinish(int actorId, string operation, string crid,
+                          string resourceType, int resourceId, JsonValue body) {
+        await this.CollabIdem.Update()
+            .Set(a => a.response, body.ToJson())
+            .Set(a => a.resourceType, resourceType)
+            .Set(a => a.resourceId, resourceId)
+            .Where(a => a.tenantId == this.TenantId() && a.actorId == actorId
+                && a.operation == operation && a.clientRequestId == crid)
+            .ExecuteAffrowsAsync();
+    }
+
+    /* 重放收尾：原应答 + replayed=1；空串 = 占位未完成 → 409。
+       Set 非 Put（A324 教训：Put 追加不去重）。 */
+    void Replay(string stored) {
+        if (stored.Length == 0) {
+            this.Fail(409, "0009", "上次请求仍在处理，请稍后重试");
+        }
+        JsonValue body = JsonValue.ParseLenient(stored);
+        if (body == null) { body = JsonValue.NewObject(); }
+        body.Set("replayed", JsonValue.NewStr("1"));
+        this.Ok(body.ToJson());
+    }
+
+    /* "1,2,3" → 去重正整数表；空/脏片段忽略。 */
+    static List<int> IdsOf(string csv) {
+        List<int> ids = new List<int>();
+        if (csv == null || csv.Length == 0) { return ids; }
+        List<string> parts = csv.Split(",");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            int v = Filter.ToInt(parts[i].Trim(), 0);
+            if (v <= 0) { continue; }
+            bool dup = false;
+            for (int j = 0; j < ids.Count; j = j + 1) {
+                if (ids[j] == v) { dup = true; break; }
+            }
+            if (!dup) { ids.Add(v); }
+        }
+        return ids;
+    }
+
+    static string NameOf(List<User> users, int id) {
+        for (int i = 0; i < users.Count; i = i + 1) {
+            if (users[i].id == id) { return Fmt.Text(users[i].nickname, users[i].username); }
+        }
+        return "用户" + Convert.ToString(id);
+    }
+}

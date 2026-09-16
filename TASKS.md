@@ -3393,12 +3393,12 @@ Gui 根或改注册制；PE 侧 .text 回收仍受挂账一压制。
 
 * **A327 协同产品域改造（gui-wechat × server-collab 前后台闭环，2026-09-17 审计挂账）**：审计结论=两模板已有私聊/回执/通知/附件/正式流程/待办聚合/AI 外呼等零件，但未形成「会话—附件—任务责任—进度—审计—AI」闭环（客户端只消费 /api/im/* 且纯轮询、无任务入口、文件面板是假数据；服务端无群聊/协作任务/面向桌面端的附件与事件 API）。总原则：**旧域只读不动、新域旁路增量、存量零迁移**（oa_message/oa_attachment/flow_task/oa_todo 均不搬家，私聊以合成 direct 会话视图呈现，附件走引用表）；契约全文见 server-collab README「协作域契约（A327 提案）」节；本系列端点/表名均为提案，实现时以 /api/docs 派生实况校准。灰度：flag 阶段0 文档 → 阶段1 后端闲置 → 阶段2 客户端读 → 阶段3 客户端写 → 阶段4 对账后评估迁移；每卡验证过即单独提交并就地闭账。
   - **A327-01 [x] 契约冻结（2026-09-17，随本提交闭账）**：server-collab README 增补协作域契约节（领域边界/数据模型/API 提案表/幂等 CAS/事件协议/权限矩阵/灰度阶段/不做清单），零代码改动；Endpoints 补此前漏列的 /api/im/*（gui-wechat 在用）与 /api/collab/*（提案）指引。
-  - **A327-02 [ ] 权限矩阵落地**：租户+资源成员+业务角色三层判定；`Attachment.CanDownload` 的 `sc.Any()` 宽口对协作资源收窄（Feature/Attachment.zan 现状=任意非空数据范围即可下载，过宽）。判定：跨租户消息/任务/附件/缩略图/下载全 403；非会话成员猜 conversationId、非任务参与者猜 taskId 均拒。
-  - **A327-03 [ ] 幂等 + CAS 写模型**：clientRequestId 唯一索引去重（重放返原果标 replayed）、expectedVersion 409、认领条件 UPDATE 按 affected rows 判胜负。判定：同请求重发 5 次只落一条；两人并发认领恰好一人成功另一人 409。
+  - **A327-02 [x] 权限矩阵落地（2026-09-17 闭账，随 A327-07 切片同提交）**：Modules/Collab/Policy.zan 三层判定（租户硬边→资源成员→角色位）+ 会话/成员/幂等三模型。口径修准一处：跨租户会话与不存在同答 404（不泄露存在性，与平台 T17「跨租户读写 404」一致，替换本卡原拟 403 口径，README 契约节同步）。`Attachment.CanDownload` 的 sc.Any() 经核为源码注释言明的一期有意设计（数据范围=全部即可下载），协作资源不经该门，收窄落在 A327-09 协作附件流。判定全绿：tools/e2e_collab.py 45/45（非成员 403/跨租户 404/伪造 id 404/角色位 403/成员重入复位）。
+  - **A327-03 [~] 幂等 + CAS 写模型（幂等半已落地，2026-09-17）**：collab_idem（(tenantId,actorId,operation,clientRequestId) 唯一索引，Schema 原生 DDL 补）+ 事务内占位/回填：重放返原果标 replayed=1、占位未完成 409、事务回滚不留残键，e2e_collab.py 重放断言全绿；剩余：expectedVersion 409 与认领 CAS 随 A327-10 任务域落地。
   - **A327-04 [ ] 持久化事件 + cursor 补偿**：collab_event 与领域事实同事务落库；NotifyHub 在线投递 + events?after= 补拉；客户端按 eventId 去重、幂等应用；cursor 过期全量快照。判定：断线期间事件不漏不重；多 worker 各推一份不重复；非目标成员不见 payload。
   - **A327-05 [ ] 生产配置实时 e2e**：新 tools/e2e_realtime.py 不设 ZAN_NO_BG、默认 4 worker，覆盖 WS/SSE、断线补偿、重启后 cursor、消息/任务/通知事件混发；停服沿用进程树终止。现有 e2e_im.py 保持 ZAN_NO_BG=1 不动（A321 修复前的诊断配置）。
   - **A327-06 [ ] 认证与存量兼容**：401 → 登录态、token 过期/登出流；OaMessage 的「replyTo 一期恒 0」陈旧注释随手修；部署文档强调轮换默认 auth secret。判定：旧 e2e_im.py 全绿不回归。
-  - **A327-07 [ ] 会话与成员模型**：collab_conversation/collab_member，成员变更 CAS；离开成员不可读新消息。判定：三人群聊收发；非成员读拒；私聊兼容不回归。
+  - **A327-07 [~] 会话与成员模型（模型与成员管理已落地，2026-09-17）**：collab_conversation/collab_member + /api/collab create/members/invite/leave/kick（重入=left→active 条件复位，唯一索引 Schema 原生 DDL 补）；e2e_collab.py 45/45。剩余：群聊收发判定待 A327-08 消息域、改名/群主转让随任务域，届时闭账。
   - **A327-08 [ ] 协作消息 + 任务卡片**：collab_message 游标分页（不再整流拉历史）、kind=text/image/file/task/system、clientRequestId 去重。判定：离线补回；重发不重复；引用/@ 群内定位正确。
   - **A327-09 [ ] 真实文件/图片共享**：复用 oa_attachment 存储；collab_attachment_link 显式关联；上传 init→complete 幂等；图片缩略图/尺寸/扫描状态（uploading→pending_scan→clean，未 clean 不可绑定）；下载改流式（现 File.ReadAllBytes 全量读）；配额改租户计数器+CAS（现每传一次全表求和）；客户端用 FilePicker 标准件（BeginOpenFile* 族，实现前重查签名），二进制不走 WxNetReq.body 字符串路径。判定：伪造 MIME/路径遍历/跨租户全拒；并发上传不破配额。
   - **A327-10 [ ] 协作任务事实模型 + 状态机**：collab_task/collab_task_event（事件只追加）；unassigned→claimed→in_progress→review→done，in_progress⇄blocked，除 done 外可 cancelled；阻塞必填原因、转交必填理由；overdue 派生不落列。判定：并发认领一人成；进度追加不覆盖；删除=取消+事件。
