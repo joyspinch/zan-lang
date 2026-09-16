@@ -438,11 +438,14 @@ every sign-in "wrong password").
   已落地**（`conversations` / `create` / `members` / `invite` / `leave` / `kick` /
   `send` / `messages` 游标分页 / `read` / `events?after=` cursor 补拉 / `listen`
   WS 主 + SSE 回退 / `uploadattachment` 流式上传（原始请求体即字节，幂等）/
-  `downloadattachment` 成员闸下载），配额计数器 CAS（`oa_attach_usage`）；
-  验证 `tools/e2e_collab.py`（契约 89 项）与 `tools/e2e_realtime.py`（生产配置
-  实时 25 项）；任务卡片、AI 总结仍为提案，契约见下节「协作域契约（A327 提案）」
+  `downloadattachment` 成员闸下载）与**协作任务**（`taskcreate` / `tasksmine` /
+  `taskspool` / `taskdetail` / `taskclaim`（CAS 恰好一人）/ `taskassign`（分配与
+  转交）/ `taskstart` / `taskprogress` / `taskblock|taskunblock` / `tasksubmit` /
+  `taskapprove|taskreject` / `taskcancel`，事件时间线只追加），配额计数器 CAS（`oa_attach_usage`）；
+  验证 `tools/e2e_collab.py`（契约 113 项）与 `tools/e2e_realtime.py`（生产配置
+  实时 25 项）；AI 总结仍为提案，契约见下节「协作域契约（A327 提案）」
 
-## 协作域契约（A327 提案——会话/成员/消息/实时事件/附件已落地，其余端点未实现）
+## 协作域契约（A327 提案——会话/成员/消息/实时事件/附件/任务已落地，其余端点未实现）
 
 gui-wechat（桌面客户端）× server-collab 的闭环改造规划分四期：P0 契约与安全
 基础 → P1 协作 MVP → P2 后台治理 → P3 AI 经验总结，逐卡台账见仓库根

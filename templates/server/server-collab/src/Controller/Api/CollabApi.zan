@@ -300,6 +300,16 @@ class CollabApi : ApiController {
         int conversationId = this.InInt("conversationId", 0);
         string crid = this.Crid();
         string content = this.InRaw("content");
+        int taskId = this.InInt("taskId", 0);
+        CollabTask card = null;
+        if (taskId > 0) {
+            card = await this.CollabTask
+                .Where(a => a.id == taskId && a.tenantId == this.TenantId()).FirstAsync();
+            if (card == null) { this.Fail(404, "0404", "任务不存在"); }
+            if (card.conversationId > 0 && card.conversationId != conversationId) {
+                this.Fail(400, "0004", "任务不属于该会话");
+            }
+        }
         int attachmentId = this.InInt("attachmentId", 0);
         OaAttachment att = null;
         if (attachmentId > 0) {
@@ -314,12 +324,15 @@ class CollabApi : ApiController {
                 this.Fail(400, "0004", "附件已绑定过消息或任务");
             }
         }
-        if (content.Length == 0 && att == null) {
+        if (content.Length == 0 && att == null && card == null) {
             this.Fail(400, "0003", "消息内容不能为空");
         }
         if (content.Length > 2048) { content = content.Substring(0, 2048); }
         if (content.Length == 0 && att != null) {
             content = Fmt.Text(att.fileName, "附件");
+        }
+        if (content.Length == 0 && card != null) {
+            content = Fmt.Text(card.title, "任务");
         }
         CollabConversation c = await Policy.Conversation(this.Held(),
             this.TenantId(), conversationId);
@@ -342,10 +355,12 @@ class CollabApi : ApiController {
         r.tenantId = this.TenantId();
         r.conversationId = conversationId;
         r.senderId = me.id;
-        r.kind = att == null ? "text"
-            : (att.mime.StartsWith("image/") ? "image" : "file");
+        r.kind = card != null ? "task"
+            : (att == null ? "text"
+                : (att.mime.StartsWith("image/") ? "image" : "file"));
         r.body = content;
         r.replyTo = replyTo;
+        r.taskId = card != null ? card.id : 0;
         r.clientRequestId = crid;
         r.createdAt = now;
         r.deletedAt = 0;
@@ -441,6 +456,23 @@ class CollabApi : ApiController {
                 }
             }
         }
+        /* 任务卡片元数据（kind=task）。 */
+        Dict<int, CollabTask> cards = new Dict<int, CollabTask>();
+        List<int> tids = new List<int>();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            if (rows[i].kind == "task" && rows[i].taskId > 0
+                && !tids.Contains(rows[i].taskId)) {
+                tids.Add(rows[i].taskId);
+            }
+        }
+        if (tids.Count > 0) {
+            List<CollabTask> trows = await this.CollabTask
+                .Where(a => a.tenantId == this.TenantId()
+                    && tids.Contains(a.id)).ToListAsync();
+            for (int i = 0; i < trows.Count; i = i + 1) {
+                cards[trows[i].id] = trows[i];
+            }
+        }
         /* 引用解析：收集本页 replyTo（去重）→ 一批取回（同会话闸）→ 键控。 */
         List<int> qids = new List<int>();
         for (int i = 0; i < rows.Count; i = i + 1) {
@@ -493,6 +525,12 @@ class CollabApi : ApiController {
                     o.Put("width", JsonValue.NewStr(Convert.ToString(a0.imgWidth)));
                     o.Put("height", JsonValue.NewStr(Convert.ToString(a0.imgHeight)));
                 }
+            }
+            if (r.kind == "task" && cards.ContainsKey(r.taskId)) {
+                CollabTask ct = cards[r.taskId];
+                o.Put("taskId", JsonValue.NewStr(Convert.ToString(ct.id)));
+                o.Put("taskTitle", JsonValue.NewStr(ct.title));
+                o.Put("taskStatus", JsonValue.NewStr(ct.status));
             }
             items.Append(o);
         }
@@ -710,6 +748,547 @@ class CollabApi : ApiController {
         this.Ctx().SetHeader("Content-Disposition",
             "attachment; filename=\"" + Attachment.BaseName(att.fileName) + "\"");
         this.Ctx().Binary(att.mime, data, data.Length);
+    }
+
+    /* ---- 协作任务（A327-10）：状态机 unassigned→claimed→in_progress→
+       review→done；in_progress⇄blocked；除 done 外可 cancelled。所有迁移
+       CAS 条件 UPDATE（version 闸）+ collab_task_event 追加，幂等键全带。 ---- */
+
+    /* 单步迁移公共体（start/unblock/submit）：执行人闸 + CAS + 事件 +
+       幂等。 */
+    async void Transition(string op, string eventType, string fromStatus,
+                          string toStatus) {
+        User me = await this.Me();
+        CollabTask t = await this.LoadTask(this.InInt("id", 0));
+        string crid = this.Crid();
+        if (t.assigneeId != me.id) {
+            this.Fail(403, "0403", "仅执行人可执行该动作");
+        }
+        if (t.status != fromStatus) {
+            this.Fail(409, "0409", "任务当前为 " + t.status + "，不可执行该迁移");
+        }
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, op, crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        int n = await this.CollabTask.Update()
+            .Set(a => a.status, toStatus)
+            .Set(a => a.version, t.version + 1)
+            .Set(a => a.updatedAt, now)
+            .Where(a => a.id == t.id && a.tenantId == this.TenantId()
+                && a.version == t.version && a.status == fromStatus)
+            .ExecuteAffrowsAsync();
+        if (n == 0) { this.Fail(409, "0409", "任务状态已变化，请刷新后重试"); }
+        await this.TaskLog(t, t.id, eventType, me.id, toStatus, t.assigneeId,
+            t.ownerId, t.progress, "", this.In("content"), crid);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        body.Put("status", JsonValue.NewStr(toStatus));
+        await this.IdemFinish(me.id, op, crid, "task", t.id, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* 任务事件追加（只增不改）：from* 从迁移前快照取。 */
+    async void TaskLog(CollabTask t, int taskId, string eventType, int actorId,
+                       string toStatus, int toAssigneeId, int toOwnerId,
+                       int toProgress, string reason, string content,
+                       string crid) {
+        CollabTaskEvent e = new CollabTaskEvent();
+        e.tenantId = this.TenantId();
+        e.taskId = taskId;
+        e.actorId = actorId;
+        e.eventType = eventType;
+        e.fromStatus = t.status;
+        e.toStatus = toStatus;
+        e.fromOwnerId = t.ownerId;
+        e.toOwnerId = toOwnerId;
+        e.fromAssigneeId = t.assigneeId;
+        e.toAssigneeId = toAssigneeId;
+        e.fromProgress = t.progress;
+        e.toProgress = toProgress;
+        e.reason = reason == null ? "" : reason;
+        e.content = content == null ? "" : content;
+        e.clientRequestId = crid;
+        e.createdAt = WebApp.NowSeconds();
+        await this.CollabTaskEvent.Insert(e).ExecuteIdentityAsync();
+    }
+
+    /* 任务载入（租户闸在先，查无与跨租户同 404）。 */
+    async CollabTask LoadTask(int id) {
+        CollabTask t = await this.CollabTask
+            .Where(a => a.id == id && a.tenantId == this.TenantId()).FirstAsync();
+        if (t == null) { this.Fail(404, "0404", "任务不存在"); }
+        return t;
+    }
+
+    /* 责任侧：owner 或 creator（验收/驳回/转交/取消）。 */
+    static bool TaskOwns(CollabTask t, User me) {
+        return t.ownerId == me.id || t.createdBy == me.id;
+    }
+
+    /* 可见/参与：责任侧或执行人，或任务所属会话成员。 */
+    async bool TaskSees(CollabTask t, User me) {
+        if (CollabApi.TaskOwns(t, me) || t.assigneeId == me.id) { return true; }
+        if (t.conversationId <= 0) { return false; }
+        CollabMember m = await Policy.Member(this.Held(), this.TenantId(),
+            t.conversationId, me.id);
+        return Policy.IsActive(m);
+    }
+
+    [HttpPost]
+    [Description("创建任务")]
+    [Custom(Perm = PermBit.Create)]
+    async void TaskCreate() {
+        User me = await this.Me();
+        string title = this.Need("title", "任务标题");
+        if (title.Length > 128) { title = title.Substring(0, 128); }
+        string crid = this.Crid();
+        int conversationId = this.InInt("conversationId", 0);
+        if (conversationId > 0) {
+            CollabConversation c = await Policy.Conversation(this.Held(),
+                this.TenantId(), conversationId);
+            if (c == null) { this.Fail(404, "0404", "会话不存在"); }
+            CollabMember mine = await Policy.Member(this.Held(), this.TenantId(),
+                conversationId, me.id);
+            if (!Policy.IsActive(mine)) { this.Fail(403, "0403", "仅会话成员可建任务"); }
+        }
+        int assigneeId = this.InInt("assigneeId", 0);
+        User assignee = null;
+        if (assigneeId > 0) {
+            assignee = await this.User
+                .Where(a => a.id == assigneeId && a.tenantId == this.TenantId()
+                    && a.status == 1).FirstAsync();
+            if (assignee == null) { this.Fail(404, "0404", "执行人不存在或已停用"); }
+        }
+        int priority = this.InInt("priority", 0);
+        if (priority < 0) { priority = 0; }
+        if (priority > 3) { priority = 3; }
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "task.create", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        CollabTask t = new CollabTask();
+        t.tenantId = this.TenantId();
+        t.conversationId = conversationId;
+        t.createdBy = me.id;
+        t.ownerId = me.id;
+        t.assigneeId = assignee == null ? 0 : assignee.id;
+        t.title = title;
+        t.description = this.In("description");
+        t.status = assignee == null ? "unassigned" : "claimed";
+        t.priority = priority;
+        t.progress = 0;
+        t.dueAt = this.InInt("dueAt", 0);
+        t.blockedReason = "";
+        t.flowInstId = 0;
+        t.version = 1;
+        t.createdAt = now;
+        t.updatedAt = now;
+        t.completedAt = 0;
+        int id = await this.CollabTask.Insert(t).ExecuteIdentityAsync();
+        await this.TaskLog(t, id, "created", me.id, t.status, t.assigneeId,
+            t.ownerId, 0, "", "", crid);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("id", JsonValue.NewStr(Convert.ToString(id)));
+        body.Put("status", JsonValue.NewStr(t.status));
+        await this.IdemFinish(me.id, "task.create", crid, "task", id, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* 我的任务：执行人或责任侧；status 过滤（缺省全部）；overdue 由 dueAt
+       派生（视图），不落状态列。 */
+    [HttpGet]
+    [Description("我的任务")]
+    [Custom(Perm = PermBit.View)]
+    async void TasksMine() {
+        User me = await this.Me();
+        string status = this.In("status");
+        long now = WebApp.NowSeconds();
+        List<CollabTask> rows = await this.CollabTask
+            .Where(a => a.tenantId == this.TenantId()
+                && (a.assigneeId == me.id || a.ownerId == me.id))
+            .WhereIf(status.Length > 0 && status != "all", a => a.status == status)
+            .OrderBy(a => a.id).Take(100).ToListAsync();
+        JsonValue items = JsonValue.NewArray();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            CollabTask t = rows[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Put("id", JsonValue.NewStr(Convert.ToString(t.id)));
+            o.Put("title", JsonValue.NewStr(t.title));
+            o.Put("status", JsonValue.NewStr(t.status));
+            o.Put("priority", JsonValue.NewStr(Convert.ToString(t.priority)));
+            o.Put("progress", JsonValue.NewStr(Convert.ToString(t.progress)));
+            o.Put("ownerId", JsonValue.NewStr(Convert.ToString(t.ownerId)));
+            o.Put("assigneeId", JsonValue.NewStr(Convert.ToString(t.assigneeId)));
+            o.Put("mine", JsonValue.NewStr(t.assigneeId == me.id ? "1" : "0"));
+            o.Put("overdue", JsonValue.NewStr(
+                t.dueAt > 0 && t.dueAt < now && t.status != "done"
+                    && t.status != "cancelled" ? "1" : "0"));
+            o.Put("dueAt", JsonValue.NewStr(Convert.ToString(t.dueAt)));
+            o.Put("version", JsonValue.NewStr(Convert.ToString(t.version)));
+            items.Append(o);
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("tasks", items);
+        this.Ok(body.ToJson());
+    }
+
+    /* 任务池：未分配任务（可按会话过滤），认领入口。 */
+    [HttpGet]
+    [Description("任务池")]
+    [Custom(Perm = PermBit.View)]
+    async void TasksPool() {
+        User me = await this.Me();
+        int conversationId = this.InInt("conversationId", 0);
+        List<CollabTask> rows = await this.CollabTask
+            .Where(a => a.tenantId == this.TenantId() && a.status == "unassigned")
+            .WhereIf(conversationId > 0, a => a.conversationId == conversationId)
+            .OrderBy(a => a.id).Take(100).ToListAsync();
+        JsonValue items = JsonValue.NewArray();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            CollabTask t = rows[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Put("id", JsonValue.NewStr(Convert.ToString(t.id)));
+            o.Put("title", JsonValue.NewStr(t.title));
+            o.Put("conversationId", JsonValue.NewStr(Convert.ToString(t.conversationId)));
+            o.Put("priority", JsonValue.NewStr(Convert.ToString(t.priority)));
+            o.Put("dueAt", JsonValue.NewStr(Convert.ToString(t.dueAt)));
+            items.Append(o);
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("tasks", items);
+        this.Ok(body.ToJson());
+    }
+
+    /* 任务详情 + 不可变时间线（最近 100 条，升序）。参与可见：责任侧/
+       执行人/会话成员；跨租户同 404。 */
+    [HttpGet]
+    [Description("任务详情")]
+    [Custom(Perm = PermBit.View)]
+    async void TaskDetail() {
+        User me = await this.Me();
+        CollabTask t = await this.LoadTask(this.InInt("id", 0));
+        if (!await this.TaskSees(t, me)) { this.Fail(403, "0403", "无权查看该任务"); }
+        List<CollabTaskEvent> evs = await this.CollabTaskEvent
+            .Where(a => a.tenantId == this.TenantId() && a.taskId == t.id)
+            .OrderBy(a => a.id).Take(100).ToListAsync();
+        JsonValue items = JsonValue.NewArray();
+        for (int i = 0; i < evs.Count; i = i + 1) {
+            CollabTaskEvent e = evs[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Put("id", JsonValue.NewStr(Convert.ToString(e.id)));
+            o.Put("event", JsonValue.NewStr(e.eventType));
+            o.Put("actorId", JsonValue.NewStr(Convert.ToString(e.actorId)));
+            o.Put("fromStatus", JsonValue.NewStr(e.fromStatus));
+            o.Put("toStatus", JsonValue.NewStr(e.toStatus));
+            o.Put("fromAssigneeId", JsonValue.NewStr(Convert.ToString(e.fromAssigneeId)));
+            o.Put("toAssigneeId", JsonValue.NewStr(Convert.ToString(e.toAssigneeId)));
+            o.Put("fromProgress", JsonValue.NewStr(Convert.ToString(e.fromProgress)));
+            o.Put("toProgress", JsonValue.NewStr(Convert.ToString(e.toProgress)));
+            o.Put("reason", JsonValue.NewStr(e.reason));
+            o.Put("content", JsonValue.NewStr(e.content));
+            o.Put("at", JsonValue.NewStr(Convert.ToString(e.createdAt)));
+            items.Append(o);
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("id", JsonValue.NewStr(Convert.ToString(t.id)));
+        body.Put("title", JsonValue.NewStr(t.title));
+        body.Put("description", JsonValue.NewStr(t.description));
+        body.Put("status", JsonValue.NewStr(t.status));
+        body.Put("progress", JsonValue.NewStr(Convert.ToString(t.progress)));
+        body.Put("ownerId", JsonValue.NewStr(Convert.ToString(t.ownerId)));
+        body.Put("assigneeId", JsonValue.NewStr(Convert.ToString(t.assigneeId)));
+        body.Put("blockedReason", JsonValue.NewStr(t.blockedReason));
+        body.Put("dueAt", JsonValue.NewStr(Convert.ToString(t.dueAt)));
+        body.Put("version", JsonValue.NewStr(Convert.ToString(t.version)));
+        body.Put("events", items);
+        this.Ok(body.ToJson());
+    }
+
+    /* 认领：CAS——unassigned 且 assignee=0 且 version 相符才生效，
+       affected=0 即他人抢先（409）。 */
+    [HttpPost]
+    [Description("认领任务")]
+    [Custom(Perm = PermBit.Update)]
+    async void TaskClaim() {
+        User me = await this.Me();
+        CollabTask t = await this.LoadTask(this.InInt("id", 0));
+        string crid = this.Crid();
+        if (t.conversationId > 0) {
+            CollabMember mine = await Policy.Member(this.Held(), this.TenantId(),
+                t.conversationId, me.id);
+            if (!Policy.IsActive(mine)) { this.Fail(403, "0403", "仅会话成员可认领"); }
+        }
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "task.claim", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        int n = await this.CollabTask.Update()
+            .Set(a => a.assigneeId, me.id)
+            .Set(a => a.status, "claimed")
+            .Set(a => a.version, t.version + 1)
+            .Set(a => a.updatedAt, now)
+            .Where(a => a.id == t.id && a.tenantId == this.TenantId()
+                && a.status == "unassigned" && a.assigneeId == 0
+                && a.version == t.version)
+            .ExecuteAffrowsAsync();
+        if (n == 0) { this.Fail(409, "0409", "任务已被他人认领或状态已变化"); }
+        await this.TaskLog(t, t.id, "claimed", me.id, "claimed", me.id,
+            t.ownerId, t.progress, "", "", crid);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        body.Put("status", JsonValue.NewStr("claimed"));
+        await this.IdemFinish(me.id, "task.claim", crid, "task", t.id, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* 分配（unassigned→claimed）或转交（claimed/in_progress/blocked 内换人，
+       必填理由）：owner/creator；CAS 同认领。 */
+    [HttpPost]
+    [Description("分配或转交任务")]
+    [Custom(Perm = PermBit.Update)]
+    async void TaskAssign() {
+        User me = await this.Me();
+        CollabTask t = await this.LoadTask(this.InInt("id", 0));
+        string crid = this.Crid();
+        if (!CollabApi.TaskOwns(t, me)) { this.Fail(403, "0403", "仅责任人可分配或转交"); }
+        int userId = this.InInt("userId", 0);
+        User target = await this.User
+            .Where(a => a.id == userId && a.tenantId == this.TenantId()
+                && a.status == 1).FirstAsync();
+        if (target == null) { this.Fail(404, "0404", "执行人不存在或已停用"); }
+        bool isAssign = t.status == "unassigned";
+        string reason = "";
+        if (!isAssign) {
+            reason = this.Need("reason", "转交理由");
+            if (t.status != "claimed" && t.status != "in_progress"
+                && t.status != "blocked") {
+                this.Fail(409, "0409", "当前状态不可转交");
+            }
+        }
+        string toStatus = isAssign ? "claimed" : t.status;
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "task.assign", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        int n = await this.CollabTask.Update()
+            .Set(a => a.assigneeId, target.id)
+            .Set(a => a.status, toStatus)
+            .Set(a => a.version, t.version + 1)
+            .Set(a => a.updatedAt, now)
+            .Where(a => a.id == t.id && a.tenantId == this.TenantId()
+                && a.version == t.version
+                && a.status == (isAssign ? "unassigned" : t.status))
+            .ExecuteAffrowsAsync();
+        if (n == 0) { this.Fail(409, "0409", "任务状态已变化，请刷新后重试"); }
+        await this.TaskLog(t, t.id, isAssign ? "assigned" : "transferred", me.id,
+            toStatus, target.id, t.ownerId, t.progress, reason, "", crid);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        body.Put("assigneeId", JsonValue.NewStr(Convert.ToString(target.id)));
+        await this.IdemFinish(me.id, "task.assign", crid, "task", t.id, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* 开始：claimed→in_progress（执行人）。 */
+    [HttpPost]
+    [Description("开始任务")]
+    [Custom(Perm = PermBit.Update)]
+    async void TaskStart() {
+        await this.Transition("task.start", "started", "claimed", "in_progress");
+    }
+
+    /* 更新进度（0..100，追加事件不覆盖）：in_progress（执行人）。 */
+    [HttpPost]
+    [Description("更新进度")]
+    [Custom(Perm = PermBit.Update)]
+    async void TaskProgress() {
+        User me = await this.Me();
+        CollabTask t = await this.LoadTask(this.InInt("id", 0));
+        string crid = this.Crid();
+        if (t.assigneeId != me.id) { this.Fail(403, "0403", "仅执行人可更新进度"); }
+        int progress = this.InInt("progress", -1);
+        if (progress < 0 || progress > 100) { this.Fail(400, "0003", "进度需在 0..100"); }
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "task.progress", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        int n = await this.CollabTask.Update()
+            .Set(a => a.progress, progress)
+            .Set(a => a.version, t.version + 1)
+            .Set(a => a.updatedAt, now)
+            .Where(a => a.id == t.id && a.tenantId == this.TenantId()
+                && a.version == t.version && a.status == "in_progress"
+                && a.assigneeId == me.id)
+            .ExecuteAffrowsAsync();
+        if (n == 0) { this.Fail(409, "0409", "任务状态已变化，请刷新后重试"); }
+        await this.TaskLog(t, t.id, "progress", me.id, "in_progress", me.id,
+            t.ownerId, progress, "", this.In("content"), crid);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        body.Put("progress", JsonValue.NewStr(Convert.ToString(progress)));
+        await this.IdemFinish(me.id, "task.progress", crid, "task", t.id, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* 阻塞（必填原因）/解除阻塞：in_progress→blocked→in_progress
+       （执行人或责任人）。 */
+    [HttpPost]
+    [Description("标记阻塞")]
+    [Custom(Perm = PermBit.Update)]
+    async void TaskBlock() {
+        User me = await this.Me();
+        CollabTask t = await this.LoadTask(this.InInt("id", 0));
+        string crid = this.Crid();
+        if (!CollabApi.TaskOwns(t, me) && t.assigneeId != me.id) {
+            this.Fail(403, "0403", "仅执行人或责任人可标记阻塞");
+        }
+        string reason = this.Need("reason", "阻塞原因");
+        if (t.status != "in_progress") { this.Fail(409, "0409", "仅进行中任务可标记阻塞"); }
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "task.block", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        int n = await this.CollabTask.Update()
+            .Set(a => a.status, "blocked")
+            .Set(a => a.blockedReason, reason)
+            .Set(a => a.version, t.version + 1)
+            .Set(a => a.updatedAt, now)
+            .Where(a => a.id == t.id && a.tenantId == this.TenantId()
+                && a.version == t.version && a.status == "in_progress")
+            .ExecuteAffrowsAsync();
+        if (n == 0) { this.Fail(409, "0409", "任务状态已变化，请刷新后重试"); }
+        await this.TaskLog(t, t.id, "blocked", me.id, "blocked", t.assigneeId,
+            t.ownerId, t.progress, reason, "", crid);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        body.Put("status", JsonValue.NewStr("blocked"));
+        await this.IdemFinish(me.id, "task.block", crid, "task", t.id, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    [HttpPost]
+    [Description("解除阻塞")]
+    [Custom(Perm = PermBit.Update)]
+    async void TaskUnblock() {
+        await this.Transition("task.unblock", "unblocked", "blocked", "in_progress");
+    }
+
+    /* 提交验收：in_progress→review（执行人）。 */
+    [HttpPost]
+    [Description("提交验收")]
+    [Custom(Perm = PermBit.Update)]
+    async void TaskSubmit() {
+        await this.Transition("task.submit", "submitted", "in_progress", "review");
+    }
+
+    /* 验收通过：review→done（owner/creator），落 completedAt。 */
+    [HttpPost]
+    [Description("验收通过")]
+    [Custom(Perm = PermBit.Update)]
+    async void TaskApprove() {
+        User me = await this.Me();
+        CollabTask t = await this.LoadTask(this.InInt("id", 0));
+        string crid = this.Crid();
+        if (!CollabApi.TaskOwns(t, me)) { this.Fail(403, "0403", "仅责任人可验收"); }
+        if (t.status != "review") { this.Fail(409, "0409", "仅待验收任务可通过"); }
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "task.approve", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        int n = await this.CollabTask.Update()
+            .Set(a => a.status, "done")
+            .Set(a => a.progress, 100)
+            .Set(a => a.completedAt, now)
+            .Set(a => a.version, t.version + 1)
+            .Set(a => a.updatedAt, now)
+            .Where(a => a.id == t.id && a.tenantId == this.TenantId()
+                && a.version == t.version && a.status == "review")
+            .ExecuteAffrowsAsync();
+        if (n == 0) { this.Fail(409, "0409", "任务状态已变化，请刷新后重试"); }
+        await this.TaskLog(t, t.id, "approved", me.id, "done", t.assigneeId,
+            t.ownerId, 100, "", this.In("content"), crid);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        body.Put("status", JsonValue.NewStr("done"));
+        await this.IdemFinish(me.id, "task.approve", crid, "task", t.id, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* 驳回返工（必填理由）：review→in_progress（owner/creator）。 */
+    [HttpPost]
+    [Description("驳回返工")]
+    [Custom(Perm = PermBit.Update)]
+    async void TaskReject() {
+        User me = await this.Me();
+        CollabTask t = await this.LoadTask(this.InInt("id", 0));
+        string crid = this.Crid();
+        if (!CollabApi.TaskOwns(t, me)) { this.Fail(403, "0403", "仅责任人可驳回"); }
+        string reason = this.Need("reason", "驳回理由");
+        if (t.status != "review") { this.Fail(409, "0409", "仅待验收任务可驳回"); }
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "task.reject", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        int n = await this.CollabTask.Update()
+            .Set(a => a.status, "in_progress")
+            .Set(a => a.version, t.version + 1)
+            .Set(a => a.updatedAt, now)
+            .Where(a => a.id == t.id && a.tenantId == this.TenantId()
+                && a.version == t.version && a.status == "review")
+            .ExecuteAffrowsAsync();
+        if (n == 0) { this.Fail(409, "0409", "任务状态已变化，请刷新后重试"); }
+        await this.TaskLog(t, t.id, "rejected", me.id, "in_progress", t.assigneeId,
+            t.ownerId, t.progress, reason, "", crid);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        body.Put("status", JsonValue.NewStr("in_progress"));
+        await this.IdemFinish(me.id, "task.reject", crid, "task", t.id, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* 取消（owner/creator；done/cancelled 不可取消）：删除=取消+事件，
+       不抹行。 */
+    [HttpPost]
+    [Description("取消任务")]
+    [Custom(Perm = PermBit.Update)]
+    async void TaskCancel() {
+        User me = await this.Me();
+        CollabTask t = await this.LoadTask(this.InInt("id", 0));
+        string crid = this.Crid();
+        if (!CollabApi.TaskOwns(t, me)) { this.Fail(403, "0403", "仅责任人可取消"); }
+        string reason = this.Need("reason", "取消理由");
+        if (t.status == "done" || t.status == "cancelled") {
+            this.Fail(409, "0409", "任务已终结，不可取消");
+        }
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "task.cancel", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        long now = WebApp.NowSeconds();
+        int n = await this.CollabTask.Update()
+            .Set(a => a.status, "cancelled")
+            .Set(a => a.version, t.version + 1)
+            .Set(a => a.updatedAt, now)
+            .Where(a => a.id == t.id && a.tenantId == this.TenantId()
+                && a.version == t.version && a.status == t.status)
+            .ExecuteAffrowsAsync();
+        if (n == 0) { this.Fail(409, "0409", "任务状态已变化，请刷新后重试"); }
+        await this.TaskLog(t, t.id, "cancelled", me.id, "cancelled", t.assigneeId,
+            t.ownerId, t.progress, reason, "", crid);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        body.Put("status", JsonValue.NewStr("cancelled"));
+        await this.IdemFinish(me.id, "task.cancel", crid, "task", t.id, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
     }
 
     /* ---- helpers ---- */

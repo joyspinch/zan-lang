@@ -501,7 +501,124 @@ def run_flow():
     ok(st == 404, "cross-tenant download -> 404")
     set_tenant("cx_c_" + TS, 1)
 
-    # ---- leave -------------------------------------------------------------
+    # ---- tasks: state machine, claim CAS, audit timeline (A327-10) --------
+    k_t1 = crid("t1")
+    st, env = call("POST", "/api/collab/taskcreate",
+                   {"title": "任务一号" + TS, "conversationId": str(conv),
+                    "description": "跑通状态机", "clientRequestId": k_t1},
+                   token=ta)
+    task1 = int(data_of(env).get("id", "0"))
+    ok(st == 200 and task1 > 0 and data_of(env).get("status") == "unassigned",
+       "A creates task (unassigned)")
+    st, env = call("POST", "/api/collab/taskcreate",
+                   {"title": "任务一号" + TS, "conversationId": str(conv),
+                    "clientRequestId": k_t1}, token=ta)
+    ok(st == 200 and int(data_of(env).get("id", "0")) == task1
+       and data_of(env).get("replayed") == "1", "task create replay -> same id")
+
+    st, env = call("POST", "/api/collab/taskclaim",
+                   {"id": str(task1), "clientRequestId": crid("tc1")}, token=tb)
+    ok(st == 200 and data_of(env).get("status") == "claimed", "B claims first")
+    st, env = call("POST", "/api/collab/taskclaim",
+                   {"id": str(task1), "clientRequestId": crid("tc2")}, token=tc)
+    ok(st == 409, "C claims same task -> 409 (CAS, exactly one winner)")
+
+    st, env = call("POST", "/api/collab/taskprogress",
+                   {"id": str(task1), "progress": "40", "clientRequestId": crid("tp0")},
+                   token=tc)
+    ok(st == 403, "non-assignee progress -> 403")
+    st, env = call("POST", "/api/collab/taskstart",
+                   {"id": str(task1), "clientRequestId": crid("ts1")}, token=tb)
+    ok(st == 200 and data_of(env).get("status") == "in_progress", "B starts")
+    st, env = call("POST", "/api/collab/taskprogress",
+                   {"id": str(task1), "progress": "40",
+                    "content": "完成四成", "clientRequestId": crid("tp1")}, token=tb)
+    ok(st == 200 and data_of(env).get("progress") == "40", "B progress 40")
+    st, env = call("POST", "/api/collab/taskblock",
+                   {"id": str(task1), "clientRequestId": crid("tb1")}, token=tb)
+    ok(st != 200 or (env or {}).get("code") != "0000", "block without reason rejected")
+    st, env = call("POST", "/api/collab/taskblock",
+                   {"id": str(task1), "reason": "等上游接口",
+                    "clientRequestId": crid("tb1")}, token=tb)
+    ok(st == 200 and data_of(env).get("status") == "blocked", "B blocks with reason")
+    st, env = call("POST", "/api/collab/taskunblock",
+                   {"id": str(task1), "clientRequestId": crid("tu1")}, token=tb)
+    ok(st == 200 and data_of(env).get("status") == "in_progress", "B unblocks")
+    st, env = call("POST", "/api/collab/tasksubmit",
+                   {"id": str(task1), "clientRequestId": crid("tsu1")}, token=tb)
+    ok(st == 200 and data_of(env).get("status") == "review", "B submits for review")
+    st, env = call("POST", "/api/collab/taskapprove",
+                   {"id": str(task1), "clientRequestId": crid("ta1")}, token=tb)
+    ok(st == 403, "assignee cannot self-approve")
+    st, env = call("POST", "/api/collab/taskapprove",
+                   {"id": str(task1), "clientRequestId": crid("ta1")}, token=ta)
+    ok(st == 200 and data_of(env).get("status") == "done", "A approves -> done")
+
+    st, env = call("GET", "/api/collab/taskdetail?id=%d" % task1, token=tb)
+    evs = data_of(env).get("events") or []
+    kinds = [e["event"] for e in evs]
+    ok(st == 200 and kinds == ["created", "claimed", "started", "progress",
+                               "blocked", "unblocked", "submitted", "approved"],
+       "timeline immutable and complete in order")
+    pr = [e for e in evs if e["event"] == "progress"]
+    ok(len(pr) == 1 and pr[0]["fromProgress"] == "0" and pr[0]["toProgress"] == "40",
+       "progress event carries from/to snapshot")
+
+    st, env = call("POST", "/api/collab/taskcreate",
+                   {"title": "任务二号" + TS, "conversationId": str(conv),
+                    "clientRequestId": crid("t2")}, token=ta)
+    task2 = int(data_of(env).get("id", "0"))
+    st, env = call("POST", "/api/collab/taskassign",
+                   {"id": str(task2), "userId": str(cid),
+                    "clientRequestId": crid("ta2")}, token=ta)
+    ok(st == 200 and data_of(env).get("assigneeId") == str(cid),
+       "A assigns task2 to C")
+    st, env = call("POST", "/api/collab/taskassign",
+                   {"id": str(task2), "userId": str(bid),
+                    "clientRequestId": crid("ta3")}, token=ta)
+    ok(st != 200 or (env or {}).get("code") != "0000",
+       "transfer without reason rejected")
+    st, env = call("POST", "/api/collab/taskassign",
+                   {"id": str(task2), "userId": str(bid), "reason": "C 休假",
+                    "clientRequestId": crid("ta3")}, token=ta)
+    ok(st == 200 and data_of(env).get("assigneeId") == str(bid),
+       "transfer to B with reason")
+
+    st, env = call("POST", "/api/collab/taskcreate",
+                   {"title": "任务三号" + TS, "conversationId": str(conv),
+                    "dueAt": "1000000000", "clientRequestId": crid("t3")}, token=ta)
+    task3 = int(data_of(env).get("id", "0"))
+    st, env = call("GET", "/api/collab/tasksmine", token=ta)
+    rows = data_of(env).get("tasks") or []
+    r3 = [r for r in rows if r["id"] == str(task3)]
+    ok(st == 200 and bool(r3) and r3[0].get("overdue") == "1",
+       "overdue derived from dueAt (past deadline, not done)")
+    st, env = call("GET", "/api/collab/taskspool?conversationId=%d" % conv, token=tb)
+    pool_ids = [r["id"] for r in data_of(env).get("tasks") or []]
+    ok(str(task3) in pool_ids, "unassigned task3 visible in pool")
+
+    st, env = call("POST", "/api/collab/taskcancel",
+                   {"id": str(task3), "reason": "需求变更",
+                    "clientRequestId": crid("tx1")}, token=ta)
+    ok(st == 200 and data_of(env).get("status") == "cancelled", "A cancels task3")
+    st, env = call("POST", "/api/collab/taskclaim",
+                   {"id": str(task3), "clientRequestId": crid("tc3")}, token=tb)
+    ok(st == 409, "claim cancelled task -> 409")
+
+    st, env = call("POST", "/api/collab/send",
+                   {"conversationId": str(conv), "taskId": str(task1),
+                    "clientRequestId": crid("mcard")}, token=ta)
+    ok(st == 200, "A sends task card message")
+    st, env = call("GET", "/api/collab/messages?conversationId=%d" % conv, token=tb)
+    msgs = data_of(env).get("msgs") or []
+    cards = [m for m in msgs if m.get("kind") == "task"]
+    if not (len(cards) == 1 and cards[0].get("taskId") == str(task1)
+            and cards[0].get("taskStatus") == "done"):
+        print("  [dbg] cards=%r" % (cards,))
+        print("  [dbg] tail=%r" % (msgs[-3:],))
+    ok(len(cards) == 1 and cards[0].get("taskId") == str(task1)
+       and cards[0].get("taskStatus") == "done",
+       "task card message carries taskId and live status")
     k3 = crid("l1")
     st, env = call("POST", "/api/collab/leave",
                    {"conversationId": str(conv), "clientRequestId": k3}, token=tc)
