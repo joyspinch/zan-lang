@@ -25,6 +25,7 @@ class Posts : AppController {
         }
         string kw = this.In("kw");
         string slug = this.In("cat");
+        string tag = this.In("tag");
         int page = this.InInt("page", 1);
         if (page < 1) { page = 1; }
 
@@ -39,29 +40,52 @@ class Posts : AppController {
             }
         }
 
-        int total = await this.Post
-            .Where(a => a.published == 1)
-            .WhereIf(kw.Length > 0, a => a.title.Contains(kw))
-            .WhereIf(categoryId > 0, a => a.categoryId == categoryId)
-            .CountAsync();
-        List<Post> rows = await this.Post
-            .Where(a => a.published == 1)
-            .WhereIf(kw.Length > 0, a => a.title.Contains(kw))
-            .WhereIf(categoryId > 0, a => a.categoryId == categoryId)
-            .OrderByDescending(a => a.top)
-            .OrderByDescending(a => a.id)
-            .Skip((page - 1) * Posts.PageSize).Take(Posts.PageSize)
-            .ToListAsync();
+        List<Post> rows = new List<Post>();
+        int total = 0;
+        if (tag.Length > 0) {
+            /* 标签过滤不能下推 SQL LIKE——子串匹配会让 "arc" 命中 "search"，
+               只能整词比较；博客量级整表过滤足够快。 */
+            List<Post> all = await this.Post
+                .Where(a => a.published == 1)
+                .OrderByDescending(a => a.top).OrderByDescending(a => a.id)
+                .ToListAsync();
+            for (int i = 0; i < all.Count; i = i + 1) {
+                if (Prose.HasTag(all[i].tags, tag)) { rows.Add(all[i]); }
+            }
+            total = rows.Count;
+            int from = (page - 1) * Posts.PageSize;
+            List<Post> slice = new List<Post>();
+            for (int i = from; i < rows.Count && i < from + Posts.PageSize; i = i + 1) {
+                slice.Add(rows[i]);
+            }
+            rows = slice;
+        } else {
+            total = await this.Post
+                .Where(a => a.published == 1)
+                .WhereIf(kw.Length > 0, a => a.title.Contains(kw))
+                .WhereIf(categoryId > 0, a => a.categoryId == categoryId)
+                .CountAsync();
+            rows = await this.Post
+                .Where(a => a.published == 1)
+                .WhereIf(kw.Length > 0, a => a.title.Contains(kw))
+                .WhereIf(categoryId > 0, a => a.categoryId == categoryId)
+                .OrderByDescending(a => a.top)
+                .OrderByDescending(a => a.id)
+                .Skip((page - 1) * Posts.PageSize).Take(Posts.PageSize)
+                .ToListAsync();
+        }
 
         ViewData d = new ViewData();
         await Settings.Apply(d);
         string heading = "博客";
         if (categoryName.Length > 0) { heading = categoryName; }
+        if (tag.Length > 0) { heading = tag; }
         d.Set("title", heading);
         d.Set("heading", heading);
         d.Set("navBlog", "page");
         d.Set("kw", kw);
         d.Set("cat", slug);
+        d.Set("tag", tag);
         d.Set("total", Convert.ToString(total));
 
         List<StrMap> items = d.AddList("posts");
@@ -99,10 +123,10 @@ class Posts : AppController {
         d.Set("page", Convert.ToString(page));
         d.Set("pages", Convert.ToString(pages));
         if (page > 1) {
-            d.Set("prev", Posts.PageLink(kw, slug, page - 1));
+            d.Set("prev", Posts.PageLink(kw, slug, tag, page - 1));
         }
         if (page < pages) {
-            d.Set("next", Posts.PageLink(kw, slug, page + 1));
+            d.Set("next", Posts.PageLink(kw, slug, tag, page + 1));
         }
         this.View(d);
     }
@@ -127,6 +151,16 @@ class Posts : AppController {
         List<Category> cats = await this.Category.ToListAsync();
         ViewData d = new ViewData();
         await Settings.Apply(d);
+        /* 文章页自带 meta/OG：描述取摘要，缺摘要截正文；链接用绝对地址。 */
+        string desc = post.summary;
+        if (desc.Length == 0) { desc = Prose.Excerpt(post.body, 120); }
+        d.Set("pageDescription", desc);
+        d.Set("ogTitle", post.title);
+        string root = await Posts.BaseUrl(this.Ctx());
+        d.Set("ogUrl", root + "/blog/" + Convert.ToString(id));
+        if (post.cover.Length > 0) {
+            d.Set("ogImage", Posts.Absolute(root, post.cover));
+        }
         d.Set("title", post.title);
         d.Set("navBlog", "page");
         d.Set("id", Convert.ToString(id));
@@ -221,10 +255,179 @@ class Posts : AppController {
         this.Ctx().Redirect("/blog/" + Convert.ToString(id) + "?commented=1");
     }
 
-    static string PageLink(string kw, string slug, int page) {
+    /* ---- 公开站点的可发现性：feed、站点地图、爬虫协议 ----
+       内容全部来自已发布文章；未配置 site.url 时按请求 Host 推导绝对链接。 */
+
+    /* RSS 2.0：最新 20 篇已发布文章，pubDate 按站点时区。 */
+    [HttpGet]
+    [Route("/rss.xml")]
+    [Description("RSS 订阅")]
+    async void Rss() {
+        if (!this.DbReady()) {
+            this.Fail(503, "2001", "服务暂时不可用，请稍后再试");
+        }
+        string root = await Posts.BaseUrl(this.Ctx());
+        List<Category> cats = await this.Category.ToListAsync();
+        List<Post> rows = await this.Post
+            .Where(a => a.published == 1)
+            .OrderByDescending(a => a.top).OrderByDescending(a => a.id)
+            .Take(20).ToListAsync();
+        string siteTitle = await Settings.Get(SettingKeys.SiteTitle, "Zan");
+        string siteDesc = await Settings.Get(SettingKeys.SiteDescription, "");
+        if (siteDesc.Length == 0) {
+            siteDesc = await Settings.Get(SettingKeys.SiteSubtitle, "");
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        sb.Append("<rss version=\"2.0\"><channel>\n");
+        sb.Append("<title>" + Posts.Esc(siteTitle) + "</title>\n");
+        sb.Append("<link>" + Posts.Esc(root) + "/</link>\n");
+        sb.Append("<description>" + Posts.Esc(siteDesc) + "</description>\n");
+        sb.Append("<generator>ZanWeb</generator>\n");
+        long latest = 0;
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            if (rows[i].createdAt > latest) { latest = rows[i].createdAt; }
+        }
+        if (latest > 0) {
+            sb.Append("<lastBuildDate>" + Posts.Rfc822(latest) + "</lastBuildDate>\n");
+        }
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            Post p = rows[i];
+            string link = root + "/blog/" + Convert.ToString(p.id);
+            sb.Append("<item>\n");
+            sb.Append("<title>" + Posts.Esc(p.title) + "</title>\n");
+            sb.Append("<link>" + Posts.Esc(link) + "</link>\n");
+            sb.Append("<guid isPermaLink=\"true\">" + Posts.Esc(link) + "</guid>\n");
+            sb.Append("<pubDate>" + Posts.Rfc822(p.createdAt) + "</pubDate>\n");
+            sb.Append("<description>" + Posts.Esc(Posts.Summary(p)) + "</description>\n");
+            string cat = Posts.CategoryName(cats, p.categoryId);
+            if (cat != "未分类") {
+                sb.Append("<category>" + Posts.Esc(cat) + "</category>\n");
+            }
+            sb.Append("</item>\n");
+        }
+        sb.Append("</channel></rss>\n");
+        byte[] bytes = Encoding.GetBytes(sb.ToString());
+        this.Ctx().Binary("application/rss+xml; charset=utf-8", bytes, bytes.Length);
+    }
+
+    /* sitemap 协议：首页、博客列表与每篇已发布文章，lastmod 取更新日期。 */
+    [HttpGet]
+    [Route("/sitemap.xml")]
+    [Description("站点地图")]
+    async void Sitemap() {
+        if (!this.DbReady()) {
+            this.Fail(503, "2001", "服务暂时不可用，请稍后再试");
+        }
+        string root = await Posts.BaseUrl(this.Ctx());
+        List<Post> rows = await this.Post
+            .Where(a => a.published == 1)
+            .OrderByDescending(a => a.top).OrderByDescending(a => a.id)
+            .ToListAsync();
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        sb.Append("<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n");
+        sb.Append("<url><loc>" + Posts.Esc(root) + "/</loc></url>\n");
+        sb.Append("<url><loc>" + Posts.Esc(root) + "/blog</loc></url>\n");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            string lastmod = "";
+            string day = Posts.Day(rows[i].updatedAt);
+            if (day.Length > 0) { lastmod = "<lastmod>" + day + "</lastmod>"; }
+            sb.Append("<url><loc>" + Posts.Esc(root) + "/blog/"
+                + Convert.ToString(rows[i].id) + "</loc>" + lastmod + "</url>\n");
+        }
+        sb.Append("</urlset>\n");
+        byte[] bytes = Encoding.GetBytes(sb.ToString());
+        this.Ctx().Binary("application/xml; charset=utf-8", bytes, bytes.Length);
+    }
+
+    /* robots.txt：公开面放行、后台拒绝，给爬虫指路 sitemap。无 DB 依赖。 */
+    [HttpGet]
+    [Route("/robots.txt")]
+    [Description("爬虫协议")]
+    async void Robots() {
+        string root = await Posts.BaseUrl(this.Ctx());
+        StringBuilder sb = new StringBuilder();
+        sb.Append("User-agent: *\n");
+        sb.Append("Allow: /\n");
+        sb.Append("Disallow: /admin/\n");
+        sb.Append("Sitemap: " + root + "/sitemap.xml\n");
+        this.Ctx().Text(sb.ToString());
+    }
+
+    /* 站点绝对地址：site.url 设置优先（反代与自定义域名下唯一可靠），
+       未配置时用请求 Host 头推导；Host 来自客户端，只保留 URL 合法字符。 */
+    static async string BaseUrl(HttpContext ctx) {
+        string configured = (await Settings.Get(SettingKeys.SiteUrl, "")).Trim();
+        if (configured.Length > 0) {
+            while (configured.Length > 0
+                    && (configured[configured.Length - 1] & 255) == 47) {
+                configured = configured.Substring(0, configured.Length - 1);
+            }
+            if (configured.Length > 0) { return configured; }
+        }
+        string host = Posts.UrlClean(ctx.Header("Host"));
+        if (host.Length == 0) { host = "localhost"; }
+        return "http://" + host;
+    }
+
+    /* 只留 scheme/host/port/path 合法字符，挡掉注入头与杂质的 Host。 */
+    static string UrlClean(string s) {
+        StringBuilder outp = new StringBuilder();
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            bool ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90)
+                || (c >= 97 && c <= 122) || c == 46 || c == 45 || c == 58
+                || c == 91 || c == 93;
+            if (ok) { outp.Append(s.Substring(i, 1)); }
+        }
+        return outp.ToString();
+    }
+
+    /* 相对路径补绝对前缀，已是绝对的原样返回。 */
+    static string Absolute(string root, string url) {
+        if (url.Length == 0) { return url; }
+        if ((url[0] & 255) == 47) { return root + url; }
+        return url;
+    }
+
+    /* XML 文本转义并把换行折叠成空格——XML 1.0 不收 0x00-0x1F。 */
+    static string Esc(string s) {
+        string flat = s.Replace("\r", " ").Replace("\n", " ").Replace("\t", " ");
+        return flat.Replace("&", "&amp;").Replace("<", "&lt;")
+            .Replace(">", "&gt;").Replace("\"", "&quot;");
+    }
+
+    static string WeekNames = "SunMonTueWedThuFriSat";
+    static string MonthNames = "JanFebMarAprMayJunJulAugSepOctNovDec";
+
+    /* RFC-822 时刻：Thu, 17 Sep 2026 09:15:00 +0800——按站点时区展开，
+       偏移量与文章列表显示保持同源（site.timezone）。 */
+    static string Rfc822(long seconds) {
+        if (seconds <= 0) { return ""; }
+        DateTime t = DateTime.FromUnixSeconds(seconds);
+        int off = Fmt.OffsetMinutes();
+        string sign = "+";
+        if (off < 0) { sign = "-"; off = 0 - off; }
+        return Posts.WeekNames.Substring(t.dayOfWeek * 3, 3) + ", "
+            + Posts.Pad2(t.day) + " "
+            + Posts.MonthNames.Substring((t.month - 1) * 3, 3) + " "
+            + Convert.ToString(t.year) + " "
+            + Posts.Pad2(t.hour) + ":" + Posts.Pad2(t.minute) + ":"
+            + Posts.Pad2(t.second) + " " + sign + Posts.Pad2(off / 60)
+            + Posts.Pad2(off % 60);
+    }
+
+    static string Pad2(int v) {
+        if (v >= 10) { return Convert.ToString(v); }
+        return "0" + Convert.ToString(v);
+    }
+
+    static string PageLink(string kw, string slug, string tag, int page) {
         string q = "/blog?page=" + Convert.ToString(page);
         if (kw.Length > 0) { q = q + "&kw=" + Encoding.UrlEncode(kw); }
         if (slug.Length > 0) { q = q + "&cat=" + Encoding.UrlEncode(slug); }
+        if (tag.Length > 0) { q = q + "&tag=" + Encoding.UrlEncode(tag); }
         return q;
     }
 

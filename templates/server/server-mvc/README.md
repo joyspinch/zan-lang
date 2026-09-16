@@ -323,11 +323,13 @@ has those next to the executable) — never `cd build && ./app.exe`.
 A self-contained Python-stdlib suite that manages the whole lifecycle itself:
 it builds a sandbox under `_scratch/mvc_e2e/` (fresh DB, port 8299, memory
 cache, worker 1, views/wwwroot copied from the template), boots the server,
-runs ~54 HTTP/sqlite contract checks (auth, content, inline `data-quick`
-editing, table designer incl. real DDL migration, monitor, and the full
-password-reset mail chain against a local SMTP catcher on port 8725), stops
-the server via its control port and deletes the sandbox. It never kills by
-image name and touches nothing outside `_scratch/`.
+runs ~120 HTTP/sqlite contract checks (auth, content, inline `data-quick`
+editing, table designer incl. real DDL migration, monitor, wiki, jobs,
+i18n, media, the full password-reset mail chain against a local SMTP catcher
+on port 8725, and the public-site discoverability pack: rss/sitemap/robots,
+tag archive, meta/OG, `site.url` roundtrip), stops the server via its
+control port and deletes the sandbox. It never kills by image name and
+touches nothing outside `_scratch/`.
 
 ```
 python tools/e2e_mvc.py                 # build with zanc if no sandbox exe yet
@@ -385,6 +387,10 @@ every sign-in "wrong password").
 
 - `GET /` — HTML landing page from the in-memory template cache
 - `GET /blog`, `GET /blog/{id}`, `POST /blog/create` — server-rendered blog (author = signed-in account)
+- `GET /blog?tag=X` — tag archive (whole-tag match, not substring)
+- `GET /rss.xml` — RSS 2.0 feed of the latest 20 published posts
+- `GET /sitemap.xml` — home, blog index and every published post
+- `GET /robots.txt` — allows the public site, denies `/admin/`, points at the sitemap
 - `GET /admin/login`, `POST /admin/login`, `GET /admin/logout` — admin sign-in (seed: `admin` / `admin1234`)
 - `GET /admin` — admin dashboard (uptime, requests, CPU/RSS, slow requests, pool/cache)
 - `GET /admin/system/users`, `POST /admin/system/users/status`, `POST /admin/system/users/logout` — account administration
@@ -603,6 +609,35 @@ Streamed file uploads with a deny-by-default extension whitelist.
   the stored server-generated file name, never trusted as a full path.
 - The admin page's 上传文件 button posts the raw bytes with
   `?name=` (`data-upload` in `admin.js`) — no multipart machinery needed.
+
+## Public site discoverability (RSS / sitemap / robots / tags)
+
+Three machine-facing surfaces served by `Blog/Posts.zan` next to the human
+pages, all built from published posts only:
+
+- **`GET /rss.xml`** — RSS 2.0, latest 20 published posts (`application/rss+xml`).
+  Item links and GUIDs are absolute; `<pubDate>`/`<lastBuildDate>` are RFC-822
+  in the site timezone (`site.timezone`, the same offset the page views use).
+  Every text is XML-escaped and control characters are folded to spaces.
+- **`GET /sitemap.xml`** — the sitemap-protocol URL set: `/`, `/blog`, and one
+  `<url>` per published post with `<lastmod>` from the row's update date.
+- **`GET /robots.txt`** — `User-agent: *` / `Allow: /` / `Disallow: /admin/` /
+  `Sitemap: <base>/sitemap.xml`. No database involved, so it answers even when
+  the DB is down.
+- **Absolute base** — `site.url` (`站点地址` in 站点设置) is the source of truth
+  when configured (the only reliable choice behind a reverse proxy or custom
+  domain); left empty the base falls back to the request's `Host` header,
+  restricted to URL-safe characters. Saving the setting takes effect on the
+  next request (the settings cache is dropped per worker).
+- **Tag archive** — post tags are plain comma text, so a tag link is a
+  whole-word match over the split list (`Prose.HasTag`), never a SQL `LIKE`:
+  a search for `ar` must not surface the `arc` post. `/blog?tag=X` filters,
+  paginates and feeds the pager; tag chips on a post page link into the
+  archive.
+- **Head metadata** — the public layout renders an `<link rel="alternate">`
+  for the feed on every page; a post page overrides `<meta name="description">`
+  with its summary (body excerpt as fallback) and emits Open Graph tags
+  (`og:title` / `og:description` / `og:url` / `og:image` when a cover exists).
 
 ## Multi-language UI (`site.language` / `i18n`)
 

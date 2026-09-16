@@ -125,6 +125,15 @@ def code_of(body):
         return ""
 
 
+def ctype(path):
+    """GET returning (status, Content-Type) — for feed/mime contract checks."""
+    try:
+        resp = opener.open(BASE + path, timeout=15)
+        return (resp.status, resp.headers.get("Content-Type") or "")
+    except urllib.error.HTTPError as e:
+        return (e.code, e.headers.get("Content-Type") or "")
+
+
 def session_cookie(setc):
     for line in setc:
         if line.startswith("zsession="):
@@ -625,6 +634,60 @@ def run_matrix(catcher):
              data={"site.language": "zh-CN"})
     code, body, _ = http("/admin/wiki", cookie=cookie)
     ok(code == 200 and "知识库" in body, "switch back to chinese works")
+
+    # ---- seo: rss / sitemap / robots / tag archive / meta+og ----
+    # 种子文章 1=「Zan 是什么」tags "zan,llvm,arc"，站点绝对链接未配置时
+    # 按请求 Host 推导（沙箱端口可变，断言跟着 BASE 走）。
+    code, body, _ = http("/rss.xml")
+    ok(code == 200 and "<rss version=\"2.0\">" in body
+       and "<title>Zan 是什么：熟悉的语法，原生的产物</title>" in body,
+       "rss lists seed post")
+    ok("<link>" + BASE + "/blog/1</link>" in body
+       and "<guid isPermaLink=\"true\">" + BASE + "/blog/1</guid>" in body,
+       "rss links are absolute")
+    ok(re.search(r"<pubDate>\w{3}, \d{2} \w{3} \d{4} \d{2}:\d{2}:\d{2} [+-]\d{4}",
+                 body), "rss pubDate is rfc822")
+    st, ct = ctype("/rss.xml")
+    ok(st == 200 and "application/rss+xml" in ct, "rss content type")
+    code, body, _ = http("/sitemap.xml")
+    ok(code == 200 and "<url><loc>" + BASE + "/</loc></url>" in body
+       and "<loc>" + BASE + "/blog</loc>" in body
+       and "<loc>" + BASE + "/blog/1</loc><lastmod>20" in body,
+       "sitemap covers home, blog and posts")
+    code, body, _ = http("/robots.txt")
+    ok(code == 200 and "Disallow: /admin/" in body
+       and body.startswith("User-agent: *")
+       and "Sitemap: " + BASE + "/sitemap.xml" in body,
+       "robots allows public, denies admin, points at sitemap")
+    code, body, _ = http("/blog?tag=zan")
+    ok(code == 200 and "标签「zan」下的文章" in body
+       and "Zan 是什么" in body, "tag archive filters by whole tag")
+    code, body, _ = http("/blog?tag=ar")
+    ok(code == 200 and "还没有已发布的文章" in body,
+       "tag filter rejects substring matches")
+    code, body, _ = http("/blog/1")
+    ok(code == 200
+       and "property=\"og:title\" content=\"Zan 是什么" in body
+       and "name=\"description\" content=\"C# 的写法" in body
+       and "property=\"og:url\" content=\"" + BASE + "/blog/1\"" in body,
+       "post page carries description and og meta")
+    ok("href=\"/blog?tag=zan\"" in body
+       and "rel=\"alternate\" type=\"application/rss+xml\"" in body,
+       "post page links tags and feed")
+    # site.url 配置接管绝对链接（Settings.Forget 后下一请求即生效）。
+    r = http("/admin/system/settings/save", cookie=cookie,
+             data={"site.url": "https://feeds.example.com"})
+    ok(r[0] in (200, 301, 302), "site.url saved")
+    code, body, _ = http("/robots.txt")
+    ok("Sitemap: https://feeds.example.com/sitemap.xml" in body,
+       "site.url drives robots sitemap")
+    code, body, _ = http("/rss.xml")
+    ok("<link>https://feeds.example.com/</link>" in body,
+       "site.url drives rss links")
+    http("/admin/system/settings/save", cookie=cookie, data={"site.url": ""})
+    code, body, _ = http("/robots.txt")
+    ok("Sitemap: " + BASE + "/sitemap.xml" in body,
+       "site.url cleared falls back to request host")
 
     # ---- media: stream upload, serve, delete ----
     payload = b"\x89PNG\r\n\x1a\n" + b"e2e-media-bytes-0123456789" * 4
