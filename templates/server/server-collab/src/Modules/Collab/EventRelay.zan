@@ -1,0 +1,67 @@
+using System;
+using System.Collections;
+using System.Data;
+using ZanWeb.Model.Collab;
+
+namespace ZanWeb.Modules.Collab;
+
+/* 协作事件在线扇出（A327-04 消费端）：MessageRelay 同款「表即总线 + 每
+   worker 水位扫描 + 只扇本 worker NotifyHub 注册表命中的连接」——collab_event
+   落库即事实，断线补偿走 /api/collab/events?after= 补拉，两通道共用
+   Policy.Frame 同一事件外形，客户端按 eventId 去重、幂等应用即可无差别。
+   在线帧只推事件所属会话的 active member（逐事件查成员，事件量小可承受；
+   批量优化随 A327-19 治理）。首拍水位对齐 MAX(id)，重启不重推历史——
+   补偿语义由 cursor 端负责，不因重启改变。通道分派键 type="collab"，
+   事件类型在 payload.event（NotifyHub.PushTyped 会覆写顶层 type）。 */
+class CollabEventRelay {
+    /* 拍间隔（毫秒）：1s 一拍，与 MessageRelay 同口径。 */
+    static int IntervalMs = 1000;
+    /* 单拍扫描上限：突发超量时余量下拍续扫（水位只前进不回退）。 */
+    static int BatchSize = 200;
+
+    /* worker 内存水位：已扇出的最大 collab_event.id；-1 = 尚未 Init。 */
+    static long lastId = -1;
+
+    static async void Loop() {
+        while (true) {
+            await Task.Delay(CollabEventRelay.IntervalMs);
+            IDbConnection db = await AppServices.Current().Db().Acquire();
+            if (db == null) { continue; }
+            try {
+                await CollabEventRelay.Sweep(db);
+            } finally {
+                AppServices.Current().Db().Release(db);
+            }
+        }
+    }
+
+    static async void Sweep(IDbConnection db) {
+        /* 首拍 Init：水位对齐当前 MAX(id)，历史不推。 */
+        if (CollabEventRelay.lastId < 0) {
+            CollabEvent last = await db.Select<CollabEvent>()
+                .OrderByDescending(a => a.id).FirstAsync();
+            CollabEventRelay.lastId = last == null ? 0 : last.id;
+            return;
+        }
+        long mark = CollabEventRelay.lastId;
+        List<CollabEvent> rows = await db.Select<CollabEvent>()
+            .Where(a => a.id > mark).OrderBy(a => a.id)
+            .Take(CollabEventRelay.BatchSize).ToListAsync();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            CollabEvent r = rows[i];
+            CollabEventRelay.lastId = r.id;
+            if (r.conversationId <= 0) { continue; }
+            List<CollabMember> targets = await db.Select<CollabMember>()
+                .Where(a => a.tenantId == r.tenantId
+                    && a.conversationId == r.conversationId
+                    && a.status == "active").ToListAsync();
+            if (targets.Count == 0) { continue; }
+            /* 每目标独立成形：PushTyped 会向 payload 写顶层 type，共享同一
+               对象会被二次 Put 追加重复键（A324 教训）。 */
+            for (int j = 0; j < targets.Count; j = j + 1) {
+                await NotifyHub.PushTyped(targets[j].userId, "collab",
+                    Policy.Frame(r));
+            }
+        }
+    }
+}

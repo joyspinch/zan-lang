@@ -105,7 +105,8 @@ class CollabApi : ApiController {
         JsonValue cev = JsonValue.NewObject();
         cev.Put("conversationId", JsonValue.NewStr(Convert.ToString(id)));
         cev.Put("creatorId", JsonValue.NewStr(Convert.ToString(me.id)));
-        await this.InsertEvent("conversation.created", "conversation", id, me.id, cev);
+        await this.InsertEvent("conversation.created", "conversation", id,
+            id, me.id, cev);
         JsonValue body = JsonValue.NewObject();
         body.Put("id", JsonValue.NewStr(Convert.ToString(id)));
         body.Put("added", JsonValue.NewStr(Convert.ToString(added)));
@@ -180,7 +181,8 @@ class CollabApi : ApiController {
             JsonValue jev = JsonValue.NewObject();
             jev.Put("conversationId", JsonValue.NewStr(Convert.ToString(conversationId)));
             jev.Put("userId", JsonValue.NewStr(Convert.ToString(invitees[i].id)));
-            await this.InsertEvent("member.joined", "conversation", conversationId, me.id, jev);
+            await this.InsertEvent("member.joined", "conversation",
+                conversationId, conversationId, me.id, jev);
         }
         JsonValue body = JsonValue.NewObject();
         body.Put("ok", JsonValue.NewStr("1"));
@@ -222,7 +224,8 @@ class CollabApi : ApiController {
         JsonValue lev = JsonValue.NewObject();
         lev.Put("conversationId", JsonValue.NewStr(Convert.ToString(conversationId)));
         lev.Put("userId", JsonValue.NewStr(Convert.ToString(me.id)));
-        await this.InsertEvent("member.left", "conversation", conversationId, me.id, lev);
+        await this.InsertEvent("member.left", "conversation",
+            conversationId, conversationId, me.id, lev);
         JsonValue body = JsonValue.NewObject();
         body.Put("ok", JsonValue.NewStr("1"));
         await this.IdemFinish(me.id, "member.leave", crid,
@@ -272,7 +275,8 @@ class CollabApi : ApiController {
         kev.Put("conversationId", JsonValue.NewStr(Convert.ToString(conversationId)));
         kev.Put("userId", JsonValue.NewStr(Convert.ToString(targetId)));
         kev.Put("kicked", JsonValue.NewStr("1"));
-        await this.InsertEvent("member.left", "conversation", conversationId, me.id, kev);
+        await this.InsertEvent("member.left", "conversation",
+            conversationId, conversationId, me.id, kev);
         JsonValue body = JsonValue.NewObject();
         body.Put("ok", JsonValue.NewStr("1"));
         await this.IdemFinish(me.id, "member.kick", crid,
@@ -335,7 +339,8 @@ class CollabApi : ApiController {
         ev.Put("messageId", JsonValue.NewStr(Convert.ToString(msgId)));
         ev.Put("senderId", JsonValue.NewStr(Convert.ToString(me.id)));
         ev.Put("excerpt", JsonValue.NewStr(Fmt.Excerpt(content, 50)));
-        await this.InsertEvent("message.created", "message", msgId, me.id, ev);
+        await this.InsertEvent("message.created", "message", msgId,
+            conversationId, me.id, ev);
         JsonValue body = JsonValue.NewObject();
         body.Put("id", JsonValue.NewStr(Convert.ToString(msgId)));
         body.Put("at", JsonValue.NewStr(Convert.ToString(now)));
@@ -449,6 +454,47 @@ class CollabApi : ApiController {
         JsonValue body = JsonValue.NewObject();
         body.Put("ok", JsonValue.NewStr("1"));
         body.Put("readUpTo", JsonValue.NewStr(Convert.ToString(maxId)));
+        this.Ok(body.ToJson());
+    }
+
+    /* 事件补拉（cursor，A327-04）：after=客户端已见的最大事件 id，返回增量
+       （只含我是 active member 的会话），升序 ≤200/页，next=本页最大 id。
+       在线帧（CollabEventRelay）与补拉共用 Policy.Frame 同一外形，客户端
+       按 eventId 去重、幂等应用即两通道无差别。一期事件不清理（A327-19），
+       cursor 不存在过期路径；保留期治理落地后再引入快照重同步。 */
+    [HttpGet]
+    [Description("事件补拉")]
+    [Custom(Perm = PermBit.View)]
+    async void Events() {
+        User me = await this.Me();
+        int after = this.InInt("after", 0);
+        int limit = this.InInt("limit", 100);
+        if (limit <= 0) { limit = 100; }
+        if (limit > 200) { limit = 200; }
+        List<CollabMember> mine = await this.CollabMember
+            .Where(a => a.tenantId == this.TenantId() && a.userId == me.id
+                && a.status == "active").ToListAsync();
+        List<int> convs = new List<int>();
+        for (int i = 0; i < mine.Count; i = i + 1) {
+            if (!convs.Contains(mine[i].conversationId)) {
+                convs.Add(mine[i].conversationId);
+            }
+        }
+        JsonValue items = JsonValue.NewArray();
+        int next = after;
+        if (convs.Count > 0) {
+            List<CollabEvent> rows = await this.CollabEvent
+                .Where(a => a.tenantId == this.TenantId() && a.id > after
+                    && convs.Contains(a.conversationId))
+                .OrderBy(a => a.id).Take(limit).ToListAsync();
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                items.Append(Policy.Frame(rows[i]));
+                next = rows[i].id;
+            }
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("events", items);
+        body.Put("next", JsonValue.NewStr(Convert.ToString(next)));
         this.Ok(body.ToJson());
     }
 
@@ -597,14 +643,16 @@ class CollabApi : ApiController {
     }
 
     /* 领域事件落库（A327-04 事实侧）：必须在事实所在请求事务内调用，
-       同生共死；payload 只放紧凑摘要。 */
+       同生共死；payload 只放紧凑摘要；conversationId 供补拉与扇出做
+       成员资格过滤。 */
     async void InsertEvent(string type, string aggregateType, int aggregateId,
-                           int actorId, JsonValue payload) {
+                           int conversationId, int actorId, JsonValue payload) {
         CollabEvent e = new CollabEvent();
         e.tenantId = this.TenantId();
         e.type = type;
         e.aggregateType = aggregateType;
         e.aggregateId = aggregateId;
+        e.conversationId = conversationId;
         e.actorId = actorId;
         e.payload = payload.ToJson();
         e.createdAt = WebApp.NowSeconds();

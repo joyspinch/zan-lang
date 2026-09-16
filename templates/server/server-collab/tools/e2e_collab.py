@@ -460,5 +460,51 @@ def run_flow():
                     "clientRequestId": crid("n2")}, token=tc)
     ok(st == 403, "non-member kick -> 403")
 
+    # ---- events: cursor replay + entitlement (A327-04) --------------------
+    st, env = call("GET", "/api/collab/events?after=0", token=ta)
+    evs = data_of(env).get("events") or []
+    ok(st == 200 and len(evs) > 0, "A events replay non-empty")
+    kinds = [e.get("event") for e in evs]
+    ok("conversation.created" in kinds and "message.created" in kinds
+       and "member.joined" in kinds and "member.left" in kinds,
+       "all four event kinds present in replay")
+    ev_ids = [int(e["eventId"]) for e in evs]
+    ok(ev_ids == sorted(ev_ids) and len(set(ev_ids)) == len(ev_ids),
+       "events ascending and unique")
+    ok(all(e.get("conversationId") == str(conv) for e in evs),
+       "events scoped to the conversation")
+    kick_ev = [e for e in evs
+               if e.get("event") == "member.left" and e.get("kicked") == "1"]
+    ok(len(kick_ev) >= 1, "kick carries kicked=1 in payload")
+    m1ev = [e for e in evs if e.get("event") == "message.created"
+            and e.get("messageId") == str(mid1)]
+    ok(len(m1ev) == 1 and "会话消息一号" in (m1ev[0].get("excerpt") or ""),
+       "message.created carries excerpt")
+
+    nxt = int(data_of(env).get("next", "0"))
+    ok(nxt == ev_ids[-1], "next cursor is the largest eventId")
+    st, env = call("GET", "/api/collab/events?after=%d" % nxt, token=ta)
+    ok(len(data_of(env).get("events") or []) == 0, "incremental pull empty at cursor")
+
+    st, env = call("POST", "/api/collab/send",
+                   {"conversationId": str(conv), "content": "增量事件-" + TS,
+                    "clientRequestId": crid("m6")}, token=ta)
+    ok(st == 200, "A sends one more message")
+    st, env = call("GET", "/api/collab/events?after=%d" % nxt, token=ta)
+    evs = data_of(env).get("events") or []
+    ok(len(evs) == 1 and evs[0].get("event") == "message.created"
+       and evs[0].get("excerpt") == "增量事件-" + TS,
+       "incremental pull returns exactly the new event")
+
+    # entitlement: kicked B and left C must not see the conversation events
+    st, env = call("GET", "/api/collab/events?after=0", token=tb)
+    evs = data_of(env).get("events") or []
+    ok(all(e.get("conversationId") != str(conv) for e in evs),
+       "kicked B sees none of the conversation events")
+    st, env = call("GET", "/api/collab/events?after=0", token=tc)
+    evs = data_of(env).get("events") or []
+    ok(all(e.get("conversationId") != str(conv) for e in evs),
+       "left C sees none of the conversation events")
+
 if __name__ == "__main__":
     main()
