@@ -423,6 +423,122 @@ every sign-in "wrong password").
 - `/admin/flow/flows|tasks` — 流程定义/发起/审批（`flows/kill?id=`）
 - `GET /admin/flow/notifies` — 旧通知页（301 → `/admin/oa/notifies`；铃铛 API 原路径保留）
 - `GET /api/docs.json` — OpenAPI 3.0（`/api/docs` UI 已收进管理后台 docs 屏）
+- `GET|POST /api/im/chats|stream|send|ack|unread|contacts` — IM 私聊
+  （gui-wechat 桌面端在用；Bearer 令牌，验证脚本 `tools/e2e_im.py`）
+- `/api/collab/*` — 协作域（群聊 / 协作任务 / 事件 / 协作附件 / AI 总结）：
+  **提案未实现**，契约见下节「协作域契约（A327 提案）」
+
+## 协作域契约（A327 提案——方向已冻结，端点未实现）
+
+gui-wechat（桌面客户端）× server-collab 的闭环改造规划分四期：P0 契约与安全
+基础 → P1 协作 MVP → P2 后台治理 → P3 AI 经验总结，逐卡台账见仓库根
+`TASKS.md` **A327-01..22**。总原则：**旧域只读不动、新域旁路增量、存量零迁移**
+——`oa_message` / `oa_attachment` / `flow_task` / `oa_todo` 一律不搬家：私聊
+历史以合成 direct 会话视图呈现，协作附件经引用表指向 `oa_attachment` 原行。
+本节端点与表名均为提案，落地时以路由属性派生的 `/api/docs` 实况为准，并在
+对应台账卡闭账时校准。
+
+### 领域边界（四种语义不混用）
+
+| 领域 | 承载 | 现状 |
+|---|---|---|
+| direct | 一对一私聊（回执 / 引用） | 已实现：`/api/im/*`，永久兼容保留 |
+| group | 多人会话：成员、角色、加入退出 | 提案：`collab_conversation` + `collab_member` |
+| collab_task | 日常任务：认领/进度/阻塞/转交/验收 | 提案：`collab_task` + `collab_task_event` |
+| flow | 正式审批流（预定义节点顺序推进） | 已实现，语义不变；协作任务经 `flowInstId` 可选关联，两侧完成互不自动等同 |
+
+### 数据模型提案
+
+```text
+collab_conversation  id, tenantId, type(direct|group), title, creatorId,
+                     version, createdAt, updatedAt, archivedAt
+collab_member        id, tenantId, conversationId, userId,
+                     role(owner|admin|member), status(active|left),
+                     lastReadMsgId, joinedAt, leftAt
+                     唯一 (tenantId,conversationId,userId)；查询 (tenantId,userId,status)
+collab_message       id, tenantId, conversationId, senderId,
+                     kind(text|image|file|task|system), replyTo,
+                     clientRequestId, createdAt, deletedAt
+                     正文 ≤2048B 留主表，长内容拆正文表；索引 (tenantId,conversationId,id)
+collab_task          id, tenantId, conversationId?, createdBy, ownerId, assigneeId,
+                     reviewerId?, title, description, status, priority, progress,
+                     dueAt, blockedReason, flowInstId?, version,
+                     createdAt, updatedAt, completedAt
+collab_task_event    id, tenantId, taskId, actorId, eventType,
+                     from/to 的 状态·责任·进度 各一对, reason, content,
+                     clientRequestId, createdAt —— 只追加不更新；索引 (tenantId,taskId,id)
+collab_event         id, tenantId, type, aggregateType, aggregateId, version,
+                     actorId, payload(紧凑摘要), createdAt —— 与领域事实同事务落库
+collab_attachment_link  id, tenantId, attachmentId→oa_attachment,
+                     ownerType(message|task), ownerId, addedBy, createdAt
+                     —— 授权按资源成员关系判定，module 只是治理标签
+```
+
+任务状态机：`unassigned → claimed → in_progress → review → done`，
+`in_progress ⇄ blocked`，除 `done` 外可 `cancelled`；`overdue` 由 `dueAt`
+派生，不落状态列；删除 = 取消/归档 + 事件，不抹事实。
+
+### API 提案（均需 Bearer；沿用 {code,msg,data} 外壳）
+
+| 域 | 读 | 写 |
+|---|---|---|
+| 会话 | conversations / members / 未读摘要 | 创建群聊、加人/移除/退出/改名（成员变更 CAS） |
+| 消息 | 按 conversationId + before/after/limit 游标分页 | 发文本/引用/图片/文件/任务卡片；删除撤回 |
+| 附件 | 缩略图、预览、流式下载 | init → 二进制上传 → complete → 绑定到消息/任务 |
+| 任务 | 我的任务 / 任务池 / 详情 / 事件时间线 | 创建、分配、认领、进度、阻塞、转交、验收、完成/驳回、取消 |
+| 事件 | events?after=\<eventId\> | 由领域写事务产生，客户端只读 |
+| AI | 总结任务状态、来源引用 | 创建/取消/审核/发布（默认只读，不改任务与结构） |
+
+### 写模型：幂等 + CAS
+
+- 所有可重试写带客户端生成的 `clientRequestId`，服务端按
+  `(tenantId, actorId, operation, clientRequestId)` 唯一索引去重，重放返回
+  原始结果并标 `replayed=1`；
+- 状态迁移带 `expectedVersion`，冲突返回 409；
+- 认领是条件 UPDATE，按 affected rows 判胜负（先 SELECT 再 UPDATE 禁止）：
+
+```sql
+UPDATE collab_task SET assigneeId=?, status='claimed', version=version+1
+WHERE id=? AND tenantId=? AND assigneeId=0 AND status='unassigned' AND version=?
+```
+
+### 事件协议：落库为准 + cursor 补偿
+
+- `NotifyHub`（WS 主 + SSE 回落）只管在线投递；事实在 `collab_event`，
+  客户端断线重连后按 `after=<eventId>` 补拉，再切实时；
+- 客户端按 `eventId` 去重，事件应用必须幂等；cursor 过期走全量快照重同步；
+- payload 只放接收者有权看到的紧凑摘要，长正文留在领域表按权限另取；
+- 多 worker 沿用 MessageRelay 的「表即总线 + 每 worker 水位扫描」定案；
+- **验收纪律：后台协程开启（不设 `ZAN_NO_BG`）下的 e2e 才算实时链路验证**
+  ——现有 `e2e_im.py` 以 `ZAN_NO_BG=1` 起服规避 A321（见 `TASKS.md`），
+  该状态不作为生产实时能力已验证的依据。
+
+### 权限矩阵（最小规则）
+
+| 资源 | 可见 / 可操作 |
+|---|---|
+| 会话消息 / 成员 | 仅 active member；跨租户一律 403 |
+| 群管理（加人/移除/改名） | owner / admin |
+| 任务读写 | 创建者 / owner / assignee / reviewer / 观察者按动作分级 |
+| 附件上传 / 下载 | 继承所挂消息/任务的成员权限；上传者身份与后台屏权限不再是充分条件 |
+| 通知 / 待办 payload | 只含接收者有权看到的摘要 + 资源 id |
+
+### 灰度阶段（feature flag `collab.enabled`）
+
+| 阶段 | 内容 | 回滚 |
+|---|---|---|
+| 0 | 契约文档 + 台账挂账 | 纯文档 |
+| 1 | 新域后端落地，flag 关闭 | 关 flag 即闲置 |
+| 2 | 客户端读新域（群聊/任务可见） | 客户端切回 `/api/im/*` |
+| 3 | 客户端写新域（发送/上传/认领） | 同上；旧端点永不删除 |
+| 4 | 稳定后评估一次性迁移（对账 0 差异 + 备份先行） | 独立决策 |
+
+### 明确不纳入 MVP
+
+不重做 A322 已收口的 HTML 骨架；不改 `flow_task` 语义；`oa_todo` 只做个人
+待办；客户端文件面板弃用假数据改真上传；电话/视频按钮在具备真实能力前隐藏
+或标注未启用；AI 默认只读、不自动 DDL / 改权限 / 改任务状态；
+`ZAN_NO_BG=1` 下的测试不算实时已验证。
 
 ## 已知行为说明（T17 回归观察项，非缺陷）
 
