@@ -1,0 +1,136 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.IO;
+using System.Web;
+using ZanWeb;
+using ZanWeb.Model.Sys;
+
+namespace ZanWeb.Admin.Media;
+
+/* /admin/media 媒体库。上传走 [Upload] 流式路由：整个请求体先落到
+   uploads/ 暂存（服务器命名，客户端文件名不参与路径），文件名经 ?name=
+   传入；入库前 SafeFileName + 扩展名白名单双重消毒，再改名挪进公开目录
+   wwwroot/media/（由 /static 唯一挂载对外服务，URL /static/media/<名>）。
+   svg 可携带同源脚本，白名单默认不放行；保持默认拒绝——不在表内的一律
+   拒绝。 */
+[Route("admin/media/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("媒体库")]
+class MediaLib : AdminController {
+    /* 上传白名单：图片/文档/压缩包/音视频。 */
+    static string Allowed = "png,jpg,jpeg,gif,webp,ico,bmp,"
+        + "pdf,txt,md,csv,doc,docx,xls,xlsx,ppt,pptx,"
+        + "zip,gz,tar,mp3,wav,mp4,webm,json";
+
+    [HttpGet]
+    [Route("/admin/media")]
+    [Custom(IsMenu = true, Icon = "mdi:image-area", Perm = PermBit.View)]
+    [Description("媒体库")]
+    async void Index() {
+        ViewData d = await this.Layout("媒体库");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        List<MediaFile> rows = await this.MediaFile.OrderByDescending(a => a.id)
+            .Take(200).ToListAsync();
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            MediaFile m = rows[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(m.id));
+            row.Set("name", m.name);
+            row.Set("path", m.path);
+            row.Set("ext", m.ext);
+            row.Set("sizeText", MediaLib.SizeText(m.size));
+            row.Set("uploadedBy", m.uploadedBy);
+            row.Set("dateText", Fmt.Stamp(m.createdAt));
+            if (MediaLib.IsImage(m.ext)) { row.Set("isImage", "1"); }
+            items.Add(row);
+        }
+        if (rows.Count == 0) { d.Set("empty", "1"); }
+        this.Page(d);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Create, Upload = true)]
+    [Description("上传媒体")]
+    async void Upload() {
+        string spool = this.ctx.uploadPath;
+        if (spool.Length == 0) { this.Fail(400, "0004", "没有上传内容"); }
+        if (this.ctx.uploadSize <= 0) {
+            File.Delete(spool);
+            this.Fail(400, "0004", "上传内容为空");
+        }
+        string safe = Validator.SafeFileName(this.In("name"));
+        string ext = MediaLib.ExtOf(safe);
+        if (!Validator.ExtAllowed(safe.ToLower(), MediaLib.Allowed)) {
+            /* 拒收也要清掉暂存包，uploads/ 不留垃圾。 */
+            File.Delete(spool);
+            if (ext.Length > 0) { this.Fail(400, "0004", "不支持的文件类型 ." + ext); }
+            this.Fail(400, "0004", "文件缺少扩展名");
+        }
+        Directory.CreateDirectoryRecursive("wwwroot/media");
+        string fileName = safe;
+        string dest = "wwwroot/media/" + fileName;
+        for (int i = 1; i <= 100 && File.Exists(dest); i = i + 1) {
+            fileName = Convert.ToString(WebApp.NowSeconds()) + "_"
+                + Convert.ToString(i) + "_" + safe;
+            dest = "wwwroot/media/" + fileName;
+        }
+        File.Move(spool, dest);
+
+        MediaFile m = new MediaFile();
+        m.name = safe;
+        m.path = fileName;
+        m.ext = ext;
+        m.size = this.ctx.uploadSize;
+        m.uploadedBy = this.who != null ? this.who.username : "";
+        m.createdAt = WebApp.NowSeconds();
+        int newId = await this.MediaFile.Insert(m).ExecuteIdentityAsync();
+        await this.Note("上传媒体", safe, newId > 0, "");
+        this.Saved("已上传 " + safe);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Delete)]
+    [Description("删除媒体")]
+    async void Delete() {
+        int id = this.InInt("id", 0);
+        MediaFile m = await this.MediaFile.Read(id);
+        if (m == null) { this.Fail(404, "0404", "文件不存在"); }
+        /* path 是服务端 SafeFileName 的产物、无目录成分；删除仍按文件名
+           拼回媒体目录，不信任库里的完整路径。 */
+        string disk = "wwwroot/media/" + m.path;
+        if (File.Exists(disk)) { File.Delete(disk); }
+        int n = await this.MediaFile.Delete().Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+        await this.Note("删除媒体", m.name, n > 0, "");
+        this.Saved("文件已删除");
+    }
+
+    static bool IsImage(string ext) {
+        return ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "gif"
+            || ext == "webp" || ext == "ico" || ext == "bmp";
+    }
+
+    /* 取最后一个点之后的扩展名并转小写；无点或点在末尾视为无扩展名。 */
+    static string ExtOf(string name) {
+        int dot = 0 - 1;
+        for (int i = 0; i < name.Length; i = i + 1) {
+            if (name[i] == 46) { dot = i; }
+        }
+        if (dot < 0 || dot >= name.Length - 1) { return ""; }
+        return name.Substring(dot + 1).ToLower();
+    }
+
+    static string SizeText(long n) {
+        if (n < 1024) { return Convert.ToString(n) + " B"; }
+        if (n < 1048576) { return Convert.ToString(n / 1024) + " KB"; }
+        if (n < 1073741824) {
+            long mb10 = n * 10 / 1048576;
+            return Convert.ToString(mb10 / 10) + "."
+                + Convert.ToString(mb10 % 10) + " MB";
+        }
+        return Convert.ToString(n / 1073741824) + " GB";
+    }
+}

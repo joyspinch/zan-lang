@@ -1349,6 +1349,37 @@
       if (exportConfirm) { Layer.confirm(exportConfirm, runExport); } else { runExport(); }
       return;
     }
+    // Upload: a data-upload button opens a file picker and POSTs the raw
+    // bytes with ?name=<file name>. The server streams the body to disk
+    // (server-side naming), so no multipart machinery is needed here.
+    var up = ev.target.closest('[data-upload]');
+    if (up) {
+      ev.preventDefault();
+      var pick = document.createElement('input');
+      pick.type = 'file';
+      pick.style.display = 'none';
+      document.body.appendChild(pick);
+      pick.addEventListener('change', function () {
+        var f = pick.files && pick.files[0];
+        pick.remove();
+        if (!f) { return; }
+        fetch(up.getAttribute('data-upload') + '?name=' + encodeURIComponent(f.name), {
+          method: 'POST',
+          credentials: 'same-origin',
+          body: f
+        }).then(function (r) {
+          if (r.status === 401) { location.href = '/admin/login'; return null; }
+          return r.json();
+        }).then(function (j) {
+          if (!j) { return; }
+          var okFlag = j.code === '0000';
+          toast(j.msg || (okFlag ? '已上传' : '上传失败'), okFlag ? 'ok' : 'bad');
+          if (okFlag) { reload(true); }
+        }).catch(function () { toast('上传失败', 'bad'); });
+      });
+      pick.click();
+      return;
+    }
     var p = ev.target.closest('[data-post]');
     if (p) {
       ev.preventDefault();

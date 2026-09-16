@@ -560,6 +560,36 @@ Markdown source must be read with `InRaw` — the default `In`/`InText`
 accessors run `Filter.Clean`, which strips CR/LF (header-injection defense)
 and would silently flatten multiline text into one line.
 
+## Media library (`/admin/media`)
+
+Streamed file uploads with a deny-by-default extension whitelist.
+
+- **Upload** — the action is marked `[Custom(Upload = true)]`: the whole
+  request body streams to disk in 64 KB chunks (memory stays flat regardless
+  of size) into a server-named spool file under `uploads/`, so the client's
+  file name never touches a path. The real name travels as `?name=`, is
+  reduced through `Validator.SafeFileName`, its extension is checked against
+  a whitelist (`png/jpg/pdf/docx/zip/mp4/...`; **svg is deliberately
+  excluded** — an SVG served same-origin can carry script), and only then is
+  the file moved into `wwwroot/media/` and recorded in the `media` table.
+  Duplicate names get a timestamp prefix instead of overwriting; rejected
+  uploads delete their spool file.
+- **Serving** — `StaticFiles.Mount` has a single slot (a second call
+  replaces the prefix), so media lives **inside** the static root:
+  `wwwroot/media/<file>`, publicly served as `/static/media/<file>`. The
+  `uploads/` spool directory is never mounted.
+- **Cache note** — `StaticFiles` caches asset bodies per worker after the
+  first hit, so a deleted file may still be served from worker memory until
+  the next restart. Fine for an internal library; call it out if you build
+  user-facing deletion on top.
+- **Size cap** — `[server].uploadBodyMB` (default 64) feeds
+  `app.MaxUpload()`; over-cap requests are refused with 413 before the body
+  is read.
+- **Delete** — removes the row and the disk file; the path is rebuilt from
+  the stored server-generated file name, never trusted as a full path.
+- The admin page's 上传文件 button posts the raw bytes with
+  `?name=` (`data-upload` in `admin.js`) — no multipart machinery needed.
+
 ## Multi-language UI (`site.language` / `i18n`)
 
 The admin shell is translatable through a lightweight, Chinese-as-key layer

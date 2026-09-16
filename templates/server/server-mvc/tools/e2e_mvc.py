@@ -95,6 +95,28 @@ def http(path, data=None, cookie=None, timeout=15):
                 e.headers.get_all("Set-Cookie") or [])
 
 
+def raw_post(path, payload, cookie=None, timeout=15):
+    """POST raw bytes (streaming upload probe). Returns the decoded body."""
+    req = urllib.request.Request(BASE + path, data=payload, method="POST")
+    if cookie:
+        req.add_header("Cookie", cookie)
+    req.add_header("Content-Type", "application/octet-stream")
+    try:
+        resp = opener.open(req, timeout=timeout)
+        return resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.read().decode("utf-8", "replace")
+
+
+def raw_get(path, timeout=15):
+    """GET returning (status, raw bytes) — for binary static checks."""
+    try:
+        resp = opener.open(BASE + path, timeout=timeout)
+        return (resp.status, resp.read())
+    except urllib.error.HTTPError as e:
+        return (e.code, e.read())
+
+
 def code_of(body):
     """JSON envelope code, or "" when the reply is not the API envelope."""
     try:
@@ -216,8 +238,12 @@ def build_exe():
 
 
 def setup_sandbox(port):
+    # data/ 重建，uploads/（上传暂存）与 wwwroot/media（媒体落盘）清零：
+    # 三处都是运行时产物，残留会让断言看到上一轮的幽灵文件。
     shutil.rmtree(os.path.join(SANDBOX, "data"), ignore_errors=True)
     os.makedirs(os.path.join(SANDBOX, "data"), exist_ok=True)
+    shutil.rmtree(os.path.join(SANDBOX, "uploads"), ignore_errors=True)
+    shutil.rmtree(os.path.join(SANDBOX, "wwwroot", "media"), ignore_errors=True)
     shutil.copytree(os.path.join(TMPL, "views"),
                     os.path.join(SANDBOX, "views"), dirs_exist_ok=True)
     shutil.copytree(os.path.join(TMPL, "wwwroot"),
@@ -570,6 +596,37 @@ def run_matrix(catcher):
              data={"site.language": "zh-CN"})
     code, body, _ = http("/admin/wiki", cookie=cookie)
     ok(code == 200 and "知识库" in body, "switch back to chinese works")
+
+    # ---- media: stream upload, serve, delete ----
+    payload = b"\x89PNG\r\n\x1a\n" + b"e2e-media-bytes-0123456789" * 4
+    upbody = raw_post("/admin/media/upload?name=e2e-logo.png", payload,
+                      cookie=cookie)
+    ok(code_of(upbody) == "0000", "media upload accepted")
+    rows = sql("SELECT name, path, ext, size FROM media ORDER BY id DESC LIMIT 1")
+    ok(bool(rows) and rows[0][0] == "e2e-logo.png" and rows[0][2] == "png",
+       "media row recorded with clean name")
+    mpath = rows[0][1] if rows else ""
+    ok(bool(rows) and rows[0][3] == len(payload), "media size matches payload")
+    disk = os.path.join(SANDBOX, "wwwroot", "media", mpath)
+    ok(bool(mpath) and os.path.isfile(disk)
+       and open(disk, "rb").read() == payload, "file stored byte-identical")
+    gcode, got = raw_get("/static/media/" + mpath)
+    ok(gcode == 200 and got == payload, "uploaded file served back")
+    code, body, _ = http("/admin/media", cookie=cookie)
+    ok(code == 200 and "e2e-logo.png" in body, "media list shows the file")
+    ok(code_of(raw_post("/admin/media/upload?name=e2e-evil.exe", b"MZx",
+                        cookie=cookie)) != "0000",
+       "disallowed extension rejected")
+    ok(sql("SELECT COUNT(*) FROM media")[0][0] == 1, "rejected upload stored nothing")
+    spool_left = os.listdir(os.path.join(SANDBOX, "uploads"))
+    ok(not spool_left, "rejected upload leaves no spool file")
+    ok(code_of(raw_post("/admin/media/upload?name=x.png", b"x")) != "0000",
+       "anonymous upload rejected")
+    mid = sql("SELECT id FROM media ORDER BY id DESC LIMIT 1")[0][0]
+    r = http("/admin/media/delete", cookie=cookie, data={"id": str(mid)})
+    ok(code_of(r[1]) == "0000", "media delete ok")
+    ok(not sql("SELECT 1 FROM media WHERE id=?", (mid,)), "media row gone")
+    ok(not os.path.isfile(disk), "file removed from disk")
 
     # reset 会使旧会话失效，admin 会话断言放在邮件段之前。
     code, _b, _c = http("/admin", cookie=cookie)
