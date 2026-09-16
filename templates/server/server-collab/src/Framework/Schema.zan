@@ -25,6 +25,7 @@ class Schema {
             await db.SyncStructureAllAsync();
             await Schema.BackfillTenant(db);
             if (!await Schema.EnsureCollabIndexes(db)) { return false; }
+            if (!await Schema.EnsureAttachUsage(db)) { return false; }
 
             if (!await Schema.SeedAdmin(db)) { return false; }
             if (!await Schema.SeedRoles(db)) { return false; }
@@ -97,6 +98,25 @@ class Schema {
         } catch (Exception ex2) {
             Console.WriteLine("[collab] ux_collab_idem: " + ex2.Message);
         }
+        try {
+            await db.ExecuteAsync(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_collab_attach_link "
+                + "ON collab_attachment_link (attachmentId)");
+        } catch (Exception ex3) {
+            Console.WriteLine("[collab] ux_collab_attach_link: " + ex3.Message);
+        }
+        return true;
+    }
+
+    /* 附件配额计数行回填（A327-09）：oa_attach_usage 每租户一行，缺行时按
+       oa_attachment 存量求和建行（幂等，已有行不动）；此后计数是配额唯一
+       判据（Attachment.Save 的 CAS 条件 UPDATE）。 */
+    static async bool EnsureAttachUsage(IDbConnection db) {
+        await db.ExecuteAsync(
+            "INSERT INTO oa_attach_usage (tenantId, usedBytes, updatedAt) "
+            + "SELECT 1, COALESCE((SELECT SUM(size) FROM oa_attachment), 0), 0 "
+            + "WHERE NOT EXISTS "
+            + "(SELECT 1 FROM oa_attach_usage WHERE tenantId = 1)");
         return true;
     }
 

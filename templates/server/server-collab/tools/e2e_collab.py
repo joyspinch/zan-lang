@@ -162,6 +162,43 @@ def set_tenant(username, tenant):
 
 TS = str(int(time.time()))[-6:]
 
+def png_bytes(w, h):
+    # 服务器只嗅探签名 + IHDR 宽高（偏移 16..24 大端），无需合法 CRC
+    return (b"\x89PNG\r\n\x1a\n" + (13).to_bytes(4, "big") + b"IHDR"
+            + w.to_bytes(4, "big") + h.to_bytes(4, "big")
+            + b"\x08\x06\x00\x00\x00")
+
+def upload(name, data, token, crid):
+    """原始请求体即文件字节（服务端 [Upload] 流式管道），元数据走 query。"""
+    qs = urllib.parse.urlencode({"name": name, "clientRequestId": crid})
+    req = urllib.request.Request(BASE + "/api/collab/uploadattachment?" + qs,
+                                 data=data, method="POST")
+    req.add_header("Authorization", "Bearer " + token)
+    req.add_header("Content-Type", "application/octet-stream")
+    try:
+        resp = urllib.request.urlopen(req, timeout=10)
+        st, raw = resp.status, resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        st, raw = e.code, e.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError, HTTPException):
+        return 0, None
+    try:
+        return st, json.loads(raw)
+    except Exception:
+        return st, None
+
+def download(att_id, token):
+    req = urllib.request.Request(
+        BASE + "/api/collab/downloadattachment?id=%d" % att_id)
+    req.add_header("Authorization", "Bearer " + token)
+    try:
+        resp = urllib.request.urlopen(req, timeout=10)
+        return resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, b""
+    except (urllib.error.URLError, OSError, HTTPException):
+        return 0, b""
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--exe", default=os.path.join(REPO, "_scratch", "collab_server.exe"))
@@ -401,6 +438,68 @@ def run_flow():
                    {"conversationId": str(conv), "content": "",
                     "clientRequestId": crid("m5")}, token=ta)
     ok(st != 200 or (env or {}).get("code") != "0000", "empty content rejected")
+
+    # ---- attachments: upload / bind / download (A327-09) ------------------
+    png = png_bytes(64, 32)
+    k_att = crid("a1")
+    st, env = upload("截图" + TS + ".png", png, ta, k_att)
+    att_png = int(data_of(env).get("id", "0"))
+    ok(st == 200 and att_png > 0 and data_of(env).get("width") == "64"
+       and data_of(env).get("height") == "32"
+       and data_of(env).get("mime") == "image/png",
+       "A uploads PNG with server-sniffed dimensions")
+    st, env = upload("截图" + TS + ".png", png, ta, k_att)
+    ok(st == 200 and int(data_of(env).get("id", "0")) == att_png
+       and data_of(env).get("replayed") == "1", "upload replay -> same id replayed=1")
+    st, env = upload("..\\..\\evil" + TS + ".txt", "遍历测试".encode(), ta, crid("a2"))
+    ok(st == 200 and data_of(env).get("name") == "evil" + TS + ".txt",
+       "path traversal name sanitized to basename")
+    st, env = upload("notes" + TS + ".txt", ("附件正文-" + TS).encode(), ta, crid("a3"))
+    att_txt = int(data_of(env).get("id", "0"))
+    ok(st == 200 and att_txt > 0, "A uploads txt")
+
+    st, _er = download(att_txt, tb)
+    ok(st == 403, "B downloads unbound attachment -> 403 (uploader only)")
+    st, _er = download(999999, ta)
+    ok(st == 404, "forged attachment download -> 404")
+    st, env = upload("empty" + TS + ".txt", b"", ta, crid("a4"))
+    ok(st != 200 or (env or {}).get("code") != "0000", "empty upload rejected")
+
+    st, env = call("POST", "/api/collab/send",
+                   {"conversationId": str(conv), "attachmentId": str(att_png),
+                    "clientRequestId": crid("m7")}, token=ta)
+    ok(st == 200 and int(data_of(env).get("id", "0")) > 0,
+       "A sends image message (empty caption ok)")
+    st, env = call("POST", "/api/collab/send",
+                   {"conversationId": str(conv), "attachmentId": str(att_txt),
+                    "content": "", "clientRequestId": crid("m8")}, token=ta)
+    ok(st == 200, "A sends file message")
+    st, env = call("GET", "/api/collab/messages?conversationId=%d" % conv, token=tb)
+    msgs = data_of(env).get("msgs") or []
+    img_row = [m for m in msgs if m.get("kind") == "image"]
+    file_row = [m for m in msgs if m.get("kind") == "file"]
+    ok(len(img_row) == 1 and img_row[0].get("width") == "64"
+       and img_row[0].get("attachmentId") == str(att_png),
+       "history image row carries attachment meta with dimensions")
+    ok(len(file_row) == 1 and file_row[0].get("fileName", "").startswith("notes"),
+       "history file row carries fileName")
+
+    st, got = download(att_png, tb)
+    ok(st == 200 and got == png, "B downloads bound PNG, bytes roundtrip equal")
+    st, got = download(att_png, tc)
+    ok(st == 200 and got == png, "C (member) downloads bound PNG too")
+    st, got = download(att_txt, tb)
+    ok(st == 200 and got == ("附件正文-" + TS).encode(), "txt roundtrip equal")
+
+    st, env = call("POST", "/api/collab/send",
+                   {"conversationId": str(conv), "attachmentId": str(att_png),
+                    "clientRequestId": crid("m9")}, token=ta)
+    ok(st == 400, "re-binding an attachment rejected (400, not 500)")
+
+    set_tenant("cx_c_" + TS, 2)
+    st, _got = download(att_png, tc)
+    ok(st == 404, "cross-tenant download -> 404")
+    set_tenant("cx_c_" + TS, 1)
 
     # ---- leave -------------------------------------------------------------
     k3 = crid("l1")

@@ -105,11 +105,18 @@ class Attachment {
                           string mime, string spoolPath, long size) {
         long quota = Filter.ToInt(await Settings.Get("attachment.quotaMB",
             "1024"), 1024) * 1048576L;
-        List<OaAttachment> rows = await db.Select<OaAttachment>()
-            .Where(a => a.tenantId == tenantId).ToListAsync();
-        long used = 0;
-        for (int i = 0; i < rows.Count; i = i + 1) { used = used + rows[i].size; }
-        if (used + size > quota) {
+        /* CAS 配额（A327-09）：单条条件 UPDATE 原子预占——并发上传在同一处
+           判定，affected=0 即超限（旧行为每传一次全租户附件表求和：慢路径且
+           并发可同越配额）。纯整型内插无注入面（Schema.BackfillTenant 同口
+           径）；行由 Schema.EnsureAttachUsage 启动回填保证存在，多租户首传
+           建行归 A327-19。 */        long now = WebApp.NowSeconds();
+        int granted = await db.ExecuteAsync(
+            "UPDATE oa_attach_usage SET usedBytes = usedBytes + "
+            + Convert.ToString(size) + ", updatedAt = " + Convert.ToString(now)
+            + " WHERE tenantId = " + Convert.ToString(tenantId)
+            + " AND usedBytes + " + Convert.ToString(size)
+            + " <= " + Convert.ToString(quota));
+        if (granted <= 0) {
             throw new ApiError(403, "0403", "租户附件空间已满（配额 "
                 + Convert.ToString(quota / 1048576) + " MB）");
         }
@@ -151,5 +158,14 @@ class Attachment {
         if (sc != null && sc.Any()) { return true; }
         int mask = await AuthUser.MaskOf(uid, Attachment.ScreenOf(att.module));
         return (mask & (int)PermBit.View) != 0;
+    }
+
+    /* 释放配额计数（删除路径调用）：MAX 钳 0 防负——计数漂移只允许向保守
+       侧（多记）发生。 */
+    static async void Release(IDbConnection db, int tenantId, long size) {
+        await db.ExecuteAsync(
+            "UPDATE oa_attach_usage SET usedBytes = MAX(0, usedBytes - "
+            + Convert.ToString(size) + ") WHERE tenantId = "
+            + Convert.ToString(tenantId));
     }
 }

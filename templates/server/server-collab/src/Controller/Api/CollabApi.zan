@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.Data.Orm;
+using System.IO;
 using System.Json;
 using System.Web;
 using ZanWeb.Model.Collab;
@@ -299,8 +300,27 @@ class CollabApi : ApiController {
         int conversationId = this.InInt("conversationId", 0);
         string crid = this.Crid();
         string content = this.InRaw("content");
-        if (content.Length == 0) { this.Fail(400, "0003", "消息内容不能为空"); }
+        int attachmentId = this.InInt("attachmentId", 0);
+        OaAttachment att = null;
+        if (attachmentId > 0) {
+            att = await this.OaAttachment
+                .Where(a => a.id == attachmentId
+                    && a.tenantId == this.TenantId()).FirstAsync();
+            if (att == null) { this.Fail(404, "0404", "附件不存在"); }
+            CollabAttachmentLink bound = await this.CollabAttachmentLink
+                .Where(a => a.tenantId == this.TenantId()
+                    && a.attachmentId == attachmentId).FirstAsync();
+            if (bound != null) {
+                this.Fail(400, "0004", "附件已绑定过消息或任务");
+            }
+        }
+        if (content.Length == 0 && att == null) {
+            this.Fail(400, "0003", "消息内容不能为空");
+        }
         if (content.Length > 2048) { content = content.Substring(0, 2048); }
+        if (content.Length == 0 && att != null) {
+            content = Fmt.Text(att.fileName, "附件");
+        }
         CollabConversation c = await Policy.Conversation(this.Held(),
             this.TenantId(), conversationId);
         if (c == null) { this.Fail(404, "0404", "会话不存在"); }
@@ -322,13 +342,24 @@ class CollabApi : ApiController {
         r.tenantId = this.TenantId();
         r.conversationId = conversationId;
         r.senderId = me.id;
-        r.kind = "text";
+        r.kind = att == null ? "text"
+            : (att.mime.StartsWith("image/") ? "image" : "file");
         r.body = content;
         r.replyTo = replyTo;
         r.clientRequestId = crid;
         r.createdAt = now;
         r.deletedAt = 0;
         int msgId = await this.CollabMessage.Insert(r).ExecuteIdentityAsync();
+        if (att != null) {
+            CollabAttachmentLink link = new CollabAttachmentLink();
+            link.tenantId = this.TenantId();
+            link.attachmentId = att.id;
+            link.ownerType = "message";
+            link.ownerId = msgId;
+            link.addedBy = me.id;
+            link.createdAt = now;
+            await this.CollabAttachmentLink.Insert(link).ExecuteIdentityAsync();
+        }
         await this.CollabMember.Update()
             .Set(a => a.lastReadMsgId, msgId)
             .Where(a => a.id == mine.id && a.lastReadMsgId < msgId)
@@ -379,6 +410,37 @@ class CollabApi : ApiController {
             .WhereIf(before > 0, a => a.id < before)
             .OrderByDescending(a => a.id).Take(limit).ToListAsync();
         rows = CollabApi.Asc(rows);
+        /* 附件元数据（A327-09）：本页消息的绑定链接 → 附件行，两批键控取回
+           （不逐行查）。图片带宽高供客户端预排版；下载走 /download 授权链。 */
+        Dict<int, OaAttachment> atts = new Dict<int, OaAttachment>();
+        List<int> mids = new List<int>();
+        for (int i = 0; i < rows.Count; i = i + 1) { mids.Add(rows[i].id); }
+        if (mids.Count > 0) {
+            List<CollabAttachmentLink> links = await this.CollabAttachmentLink
+                .Where(a => a.tenantId == this.TenantId()
+                    && a.ownerType == "message"
+                    && mids.Contains(a.ownerId)).ToListAsync();
+            List<int> aids = new List<int>();
+            for (int i = 0; i < links.Count; i = i + 1) {
+                if (!aids.Contains(links[i].attachmentId)) {
+                    aids.Add(links[i].attachmentId);
+                }
+            }
+            Dict<int, OaAttachment> byId = new Dict<int, OaAttachment>();
+            if (aids.Count > 0) {
+                List<OaAttachment> arows = await this.OaAttachment
+                    .Where(a => a.tenantId == this.TenantId()
+                        && aids.Contains(a.id)).ToListAsync();
+                for (int i = 0; i < arows.Count; i = i + 1) {
+                    byId[arows[i].id] = arows[i];
+                }
+            }
+            for (int i = 0; i < links.Count; i = i + 1) {
+                if (byId.ContainsKey(links[i].attachmentId)) {
+                    atts[links[i].ownerId] = byId[links[i].attachmentId];
+                }
+            }
+        }
         /* 引用解析：收集本页 replyTo（去重）→ 一批取回（同会话闸）→ 键控。 */
         List<int> qids = new List<int>();
         for (int i = 0; i < rows.Count; i = i + 1) {
@@ -419,6 +481,17 @@ class CollabApi : ApiController {
                     o.Put("quoteWho", JsonValue.NewStr(q.senderId == me.id
                         ? "我" : CollabApi.NameOf(users, q.senderId)));
                     o.Put("quoteText", JsonValue.NewStr(Fmt.Excerpt(q.body, 60)));
+                }
+            }
+            if (atts.ContainsKey(r.id)) {
+                OaAttachment a0 = atts[r.id];
+                o.Put("attachmentId", JsonValue.NewStr(Convert.ToString(a0.id)));
+                o.Put("fileName", JsonValue.NewStr(a0.fileName));
+                o.Put("size", JsonValue.NewStr(Convert.ToString(a0.size)));
+                o.Put("mime", JsonValue.NewStr(a0.mime));
+                if (a0.imgWidth > 0) {
+                    o.Put("width", JsonValue.NewStr(Convert.ToString(a0.imgWidth)));
+                    o.Put("height", JsonValue.NewStr(Convert.ToString(a0.imgHeight)));
                 }
             }
             items.Append(o);
@@ -552,6 +625,91 @@ class CollabApi : ApiController {
             if (!await ctx.SseSend("", ": keep-alive")) { break; }
         }
         ZanWeb.NotifyHub.LeaveSse(ctx);
+    }
+
+    /* 上传附件（A327-09）：[Upload] 流式管道——原始请求体即文件字节，元
+       数据走 query（Admin Attachments 同款，客户端无需 multipart）。MIME
+       一律按扩展名推断（不信客户端声明，伪造 MIME 无门）；图片由服务端
+       嗅探 PNG/JPEG 头补写宽高；授权边界在「绑定」——未绑定仅上传者可见
+       可下。幂等 attachment.upload。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Create, ApiMax = 30, Upload = true)]
+    [Description("上传附件")]
+    async void UploadAttachment() {
+        User me = await this.Me();
+        if (this.ctx.uploadPath.Length == 0) {
+            this.Fail(400, "1002", "没有上传内容");
+        }
+        string name = Attachment.BaseName(this.In("name"));
+        string mime = Attachment.MimeOf(name, "");
+        string crid = this.Crid();
+        long size = this.ctx.uploadSize;
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "attachment.upload", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        int id = await Attachment.Save(this.Held(), this.TenantId(), me.id,
+            "collab", 0, name, mime, this.ctx.uploadPath, size);
+        OaAttachment att = await this.OaAttachment
+            .Where(a => a.id == id && a.tenantId == this.TenantId()).FirstAsync();
+        ImgDim dim = new ImgDim();
+        if (att != null) { dim = CollabApi.SniffImage(att.path, mime); }
+        int _u = await this.OaAttachment.Update()
+            .Set(a => a.imgWidth, dim.width)
+            .Set(a => a.imgHeight, dim.height)
+            .Set(a => a.scanStatus, "clean")
+            .Where(a => a.id == id).ExecuteAffrowsAsync();
+        JsonValue body = JsonValue.NewObject();
+        body.Put("id", JsonValue.NewStr(Convert.ToString(id)));
+        body.Put("name", JsonValue.NewStr(name));
+        body.Put("size", JsonValue.NewStr(Convert.ToString(size)));
+        body.Put("mime", JsonValue.NewStr(mime));
+        body.Put("width", JsonValue.NewStr(Convert.ToString(dim.width)));
+        body.Put("height", JsonValue.NewStr(Convert.ToString(dim.height)));
+        await this.IdemFinish(me.id, "attachment.upload", crid,
+            "attachment", id, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* 下载附件（A327-09）：授权链 = 租户闸（跨租户与不存在同 404，不泄露
+       存在性）→ 绑定关系（已绑消息 → 会话 active member；任务挂载随
+       A327-10；未绑定仅上传者）→ 字节应答（ctx.Binary 二进制唯一通道）。
+       大文件真流式需框架分块应答能力，暂与 Admin Download 同口径
+       ReadAllBytes（体量上限 uploadBodyMB），升级归 A327-19。 */
+    [HttpGet]
+    [Description("下载附件")]
+    [Custom(Perm = PermBit.View)]
+    async void DownloadAttachment() {
+        User me = await this.Me();
+        int id = this.InInt("id", 0);
+        OaAttachment att = await this.OaAttachment
+            .Where(a => a.id == id && a.tenantId == this.TenantId()).FirstAsync();
+        if (att == null) { this.Fail(404, "0404", "附件不存在"); }
+        List<CollabAttachmentLink> links = await this.CollabAttachmentLink
+            .Where(a => a.tenantId == this.TenantId()
+                && a.attachmentId == id).ToListAsync();
+        if (links.Count == 0) {
+            if (att.uploaderId != me.id) {
+                this.Fail(403, "0403", "附件尚未分享，仅上传者可下载");
+            }
+        } else if (links[0].ownerType == "message") {
+            CollabMessage msg = await this.CollabMessage
+                .Where(a => a.id == links[0].ownerId
+                    && a.tenantId == this.TenantId()).FirstAsync();
+            if (msg == null) { this.Fail(404, "0404", "附件不存在"); }
+            CollabMember mine = await Policy.Member(this.Held(),
+                this.TenantId(), msg.conversationId, me.id);
+            if (!Policy.IsActive(mine)) {
+                this.Fail(403, "0403", "仅会话成员可下载");
+            }
+        } else {
+            this.Fail(403, "0403", "该挂载类型暂未开放下载");
+        }
+        if (!File.Exists(att.path)) { this.Fail(404, "0404", "附件文件已丢失"); }
+        byte[] data = File.ReadAllBytes(att.path);
+        this.Ctx().SetHeader("Content-Disposition",
+            "attachment; filename=\"" + Attachment.BaseName(att.fileName) + "\"");
+        this.Ctx().Binary(att.mime, data, data.Length);
     }
 
     /* ---- helpers ---- */
@@ -720,5 +878,50 @@ class CollabApi : ApiController {
         List<CollabMessage> asc = new List<CollabMessage>();
         for (int i = desc.Count - 1; i >= 0; i = i - 1) { asc.Add(desc[i]); }
         return asc;
+    }
+
+    /* PNG/JPEG 头嗅探宽高（A327-09）：只看前 64KB；解析不出返回 0/0（非图
+       或变体格式），不影响上传。PNG 宽高在 16..24（大端）；JPEG 扫
+       SOF0..SOF15 段标记取高宽。缩略图一期不生成——桌面客户端本地图形栈
+       自行缩放（微信式），服务端无头环境不引图像编解码依赖。 */
+    static ImgDim SniffImage(string path, string mime) {
+        ImgDim d = new ImgDim();
+        if (mime != "image/png" && mime != "image/jpeg") { return d; }
+        try {
+            byte[] b = File.ReadAllBytes(path);
+            if (mime == "image/png") {
+                if (b.Length >= 24 && b[0] == 0x89 && b[1] == 0x50
+                    && b[2] == 0x4E && b[3] == 0x47) {
+                    d.width = (b[16] & 255) * 16777216 + (b[17] & 255) * 65536
+                        + (b[18] & 255) * 256 + (b[19] & 255);
+                    d.height = (b[20] & 255) * 16777216 + (b[21] & 255) * 65536
+                        + (b[22] & 255) * 256 + (b[23] & 255);
+                }
+                return d;
+            }
+            if (b.Length >= 4 && b[0] == 0xFF && b[1] == 0xD8) {
+                int i = 2;
+                while (i + 9 < b.Length) {
+                    if (b[i] != 0xFF) { break; }
+                    int mark = b[i + 1] & 255;
+                    if (mark >= 0xC0 && mark <= 0xCF && mark != 0xC4
+                        && mark != 0xC8 && mark != 0xCC) {
+                        d.height = (b[i + 5] & 255) * 256 + (b[i + 6] & 255);
+                        d.width = (b[i + 7] & 255) * 256 + (b[i + 8] & 255);
+                        break;
+                    }
+                    i = i + 2 + (b[i + 2] & 255) * 256 + (b[i + 3] & 255);
+                }
+            }
+        } catch (Exception) {
+            /* 读不到/解析不了按 0/0 处理，上传主流程不受影响。 */
+        }
+        return d;
+    }
+
+    /* 图片尺寸嗅探结果。 */
+    class ImgDim {
+        int width;
+        int height;
     }
 }

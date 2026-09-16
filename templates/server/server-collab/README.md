@@ -434,14 +434,15 @@ every sign-in "wrong password").
 - `GET /api/docs.json` — OpenAPI 3.0（`/api/docs` UI 已收进管理后台 docs 屏）
 - `GET|POST /api/im/chats|stream|send|ack|unread|contacts` — IM 私聊
   （gui-wechat 桌面端在用；Bearer 令牌，验证脚本 `tools/e2e_im.py`）
-- `/api/collab/*` — 协作域：**会话 / 成员 / 文本消息 / 实时事件已落地**
-  （`conversations` / `create` / `members` / `invite` / `leave` / `kick` / `send` /
-  `messages` 游标分页 / `read` / `events?after=` cursor 补拉 / `listen` WS 主 +
-  SSE 回退），幂等键契约生效；验证 `tools/e2e_collab.py`（契约 73 项）与
-  `tools/e2e_realtime.py`（生产配置实时 25 项，后台协程开启）；任务卡片/
-  图片文件消息、协作附件、AI 总结仍为提案，契约见下节「协作域契约（A327 提案）」
+- `/api/collab/*` — 协作域：**会话 / 成员 / 消息（含图片文件）/ 实时事件 / 附件
+  已落地**（`conversations` / `create` / `members` / `invite` / `leave` / `kick` /
+  `send` / `messages` 游标分页 / `read` / `events?after=` cursor 补拉 / `listen`
+  WS 主 + SSE 回退 / `uploadattachment` 流式上传（原始请求体即字节，幂等）/
+  `downloadattachment` 成员闸下载），配额计数器 CAS（`oa_attach_usage`）；
+  验证 `tools/e2e_collab.py`（契约 89 项）与 `tools/e2e_realtime.py`（生产配置
+  实时 25 项）；任务卡片、AI 总结仍为提案，契约见下节「协作域契约（A327 提案）」
 
-## 协作域契约（A327 提案——会话/成员/消息/实时事件已落地，其余端点未实现）
+## 协作域契约（A327 提案——会话/成员/消息/实时事件/附件已落地，其余端点未实现）
 
 gui-wechat（桌面客户端）× server-collab 的闭环改造规划分四期：P0 契约与安全
 基础 → P1 协作 MVP → P2 后台治理 → P3 AI 经验总结，逐卡台账见仓库根
@@ -497,7 +498,7 @@ collab_attachment_link  id, tenantId, attachmentId→oa_attachment,
 |---|---|---|
 | 会话 | conversations / members / 未读摘要 | 创建群聊、加人/移除/退出/改名（成员变更 CAS） |
 | 消息 | 按 conversationId + before/after/limit 游标分页 | 发文本/引用/图片/文件/任务卡片；删除撤回 |
-| 附件 | 缩略图、预览、流式下载 | init → 二进制上传 → complete → 绑定到消息/任务 |
+| 附件 | 缩略图、预览、流式下载 | 单请求流式上传（幂等键重放）→ 绑定到消息（任务随 A327-10） |
 | 任务 | 我的任务 / 任务池 / 详情 / 事件时间线 | 创建、分配、认领、进度、阻塞、转交、验收、完成/驳回、取消 |
 | 事件 | events?after=\<eventId\> | 由领域写事务产生，客户端只读 |
 | AI | 总结任务状态、来源引用 | 创建/取消/审核/发布（默认只读，不改任务与结构） |
