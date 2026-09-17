@@ -1,0 +1,101 @@
+using System;
+
+namespace System;
+
+/// <summary>
+/// 自进程两原语：本进程可执行文件的绝对路径与当前 PID（A332 肥边⑤）。
+/// 独立小文件——Gui 的图标/Skin/错误日志只要"自己 exe 在哪"一句话，
+/// 过去拼 ProcessHost/ProcessList 会把进程管理全家（1100+ 行）拉进
+/// 每个 GUI 程序；原语落这里，重家族委托回本类保持各自 API，
+/// 拼 AppPath 只拉这几十行。
+///
+/// 平台支持：Windows（kernel32）/ Linux（/proc）/ macOS（crt），
+/// 其余平台返回 ""/0，调用方按无法确定处理。
+/// </summary>
+class AppPath {
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "GetModuleFileNameW")]
+    static extern int GetModuleFileNameW(nint module, nint buf, int size);
+    [DllImport("kernel32", EntryPoint = "GetCurrentProcessId")]
+    static extern int GetCurrentProcessId();
+    #endif
+    #if !WINDOWS
+    [DllImport("crt")]
+    static extern int readlink(string path, byte[] buf, int size);
+    #endif
+    #if MACOS
+    [DllImport("crt", EntryPoint = "_NSGetExecutablePath")]
+    static extern int NSGetExecutablePath(nint buf, nint size);
+    #endif
+
+    /// <summary>正在运行的可执行文件的绝对路径；无法确定时返回 ""。
+    /// 单文件发布时是解包后的真实镜像路径（与 ProcessHost.SelfExe
+    /// 语义一致）。</summary>
+    static string Exe() {
+        #if WINDOWS
+        nint buf = NativeMemory.Alloc(8192);
+        int n = GetModuleFileNameW(0, buf, 4096);
+        string exe = "";
+        if (n > 0 && n < 4096) { exe = Wide.Read(buf); }
+        NativeMemory.Free(buf);
+        return exe;
+        #elif LINUX
+        byte[] buf = new byte[4097];
+        int n = readlink("/proc/self/exe", buf, 4096);
+        if (n <= 0 || n > 4096) { return ""; }
+        return buf.ToStr(0, n);
+        #elif MACOS
+        nint sizeBuf = NativeMemory.Alloc(4);
+        new Span<int>(sizeBuf, 1)[0] = 4096;
+        nint pathBuf = NativeMemory.Alloc(4096);
+        NativeMemory.Fill(pathBuf, 0, 4096);
+        int ok = NSGetExecutablePath(pathBuf, sizeBuf);
+        string exe = "";
+        if (ok == 0) {
+            // 成功时 _NSGetExecutablePath 不更新 *bufsize，实际长度按 NUL 查找。
+            int len = NativeMemory.Find(pathBuf, 0, 0, 4096);
+            if (len >= 0 && len < 4096) { exe = NativeMemory.GetString(pathBuf, 0, len); }
+        }
+        NativeMemory.Free(pathBuf);
+        NativeMemory.Free(sizeBuf);
+        return exe;
+        #else
+        return "";
+        #endif
+    }
+
+    /// <summary>当前进程的 PID；不支持的平台返回 0。</summary>
+    static int Pid() {
+        #if WINDOWS
+        return GetCurrentProcessId();
+        #elif LINUX
+        // /proc/self/stat 以 "<pid> (comm) ..." 开头。
+        string stat = File.ReadAllText("/proc/self/stat");
+        int sp = AppPath.IndexOf(stat, ' ');
+        if (sp < 0) { return 0; }
+        return AppPath.ParseInt(stat.Substring(0, sp));
+        #else
+        return 0;
+        #endif
+    }
+
+    #if LINUX
+    /// 子串首个下标；没有则 -1（Linux 分支专用的小助手）。
+    static int IndexOf(string s, char c) {
+        for (int i = 0; i < s.Length; i = i + 1) {
+            if (s[i] == c) { return i; }
+        }
+        return -1;
+    }
+
+    static int ParseInt(string s) {
+        int v = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int d = s[i] - 48;
+            if (d < 0 || d > 9) { return 0; }
+            v = v * 10 + d;
+        }
+        return v;
+    }
+    #endif
+}
