@@ -111,6 +111,16 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   `ZAN_GUI_LAYOUTLINT=1`+`ZAN_GUI_OVERLAP_LOG=<file>`，收尾断言日志空
   （重叠/尺寸自检零命中）。截图脚本按 PID+窗口类枚举取最大可见窗，
   `$pid` 是 PowerShell 保留自动变量，参数名不能叫 `$Pid`。
+- **后台窗口不 present：截图 diff 断言前必须点击激活**：数据并入（甚
+  至下载落盘回调都跑完）后，非前台窗口的呈现面停在上一个交互帧——实
+  测合并后 7s 截图仍逐字节同，一次合成点击立即出新帧，纯 SetCursorPos
+  hover 无效。所以「重绘发生」类断言的**每张**截图前注入一次中性点击
+  （点在无控件画布上，纯泵帧），并用 SetWindowPos 把窗口钉到屏内固定
+  位置再拍（默认布局偶尔比屏高，出屏窗口捕获几何不稳）。
+- **`Directory.ReadPath` 不是 cwd 解析器**：它对 cwd 里已存在的路径回
+  空串（「程序随附资源回落」语义——磁盘上有就用原路径），永远产不出
+  绝对路径；要取绝对 cwd 用 `Directory.GetCurrentDirectory()`（跨平
+  台）。想用 ReadPath(".") 拿 cwd 的写法静默失效，极难察觉。
 - **客户端程序链接报 `cannot find -lssl/-lcrypto`**：普通链接（非
   `--publish`）要求 TLS 导入库在搜索路径可达，报错不提示解法——设
   `ZAN_LIB_PATH` 指向 stdlib 的 System/Security/Cryptography/drivers/

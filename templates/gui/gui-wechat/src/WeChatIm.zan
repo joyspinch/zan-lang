@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.IO;
 using System.Json;
 using System.Threading;
 
@@ -287,6 +288,30 @@ static class WxIm {
             nm.quoteId = o.Str("replyTo", "");
             nm.quoteWho = o.Str("quoteWho", "");
             nm.quoteText = o.Str("quoteText", "");
+            // 附件行：图片（服务端嗅探宽高>0）占位 [图片]，字节落缓存
+            // 后原位补 img 强制重绑（缓存命中即画）；文件画「[文件]
+            // 名字（大小）」行，点击下载随后续卡。
+            string attId = o.Str("attachmentId", "");
+            if (attId.Length > 0) {
+                string fname = o.Str("fileName", "");
+                int w = Convert.ToInt32(o.Str("width", "0"));
+                int h = Convert.ToInt32(o.Str("height", "0"));
+                if (w > 0 && h > 0) {
+                    nm.text = "[图片]";
+                    string cache = WxIm.AttDir() + "/a" + attId
+                        + WxIm.ExtOf(fname);
+                    if (File.Exists(cache)) {
+                        nm.img = cache;
+                        nm.text = "";
+                    } else {
+                        WxIm.FetchAttImage(nm, attId, cache);
+                    }
+                } else {
+                    long fsz = Convert.ToInt64(o.Str("size", "0"));
+                    nm.text = "[文件] " + fname
+                        + "（" + WxIm.SizeOf(fsz) + "）";
+                }
+            }
             s.msgs.Add(nm);
         }
         WxIm.AfterStream(s, conv == openConv);
@@ -393,6 +418,8 @@ static class WxIm {
             m.mark = 0;
             s.lastMark = 0;
         } else {
+            // 图片气泡没有文字可翻红：占位改写成 [图片] 再翻。
+            if (m.img.Length > 0) { m.img = ""; m.text = "[图片]"; }
             m.role = "error";
         }
         WxIm.RefreshViews();
@@ -405,6 +432,135 @@ static class WxIm {
         WxIm.cridSeq = WxIm.cridSeq + 1;
         return "wx-" + Convert.ToString(DateTime.UtcNow().ToUnixSeconds())
             + "-" + Convert.ToString(WxIm.cridSeq);
+    }
+
+    /* ---- 附件（A327-13b）：真上传/真下载 ----
+       旧域 /api/im 没有附件端点，附件只走 collab 域（conv 会话）：
+       发送 = uploadattachment（原始字节，元数据走 query）→ send 带
+       attachmentId；接收 = 流行的行带 attachmentId/fileName/size/mime/
+       width/height（服务端嗅探 PNG/JPEG 回填宽高），图片下载落缓存后
+       画缩略图（ChatView 按自然尺寸缩放不放大），文件画「[文件]
+       名字（大小）」行。 */
+
+    /// 附件缓存目录（相对 cwd）：收到的图片按附件 id 落盘，二次
+    /// 渲染缓存命中不再走网络。
+    static string attDirCache = "";
+
+    static string AttDir() {
+        if (WxIm.attDirCache.Length == 0) {
+            WxIm.attDirCache = "wxatt";
+            Directory.CreateDirectoryRecursive(WxIm.attDirCache);
+        }
+        return WxIm.attDirCache;
+    }
+
+    /// 发送本地文件（聊天页文件选择器的入口，仅 collab 域会话）。
+    /// 本地气泡即插：png/jpg/jpeg 按图片画（本地路径直接当缩略图源，
+    /// 服务端嗅探口径一致），其余画「[文件] 名字（大小）」；上传失败
+    /// 翻红（与 Send 的红感叹号语义同款）。
+    static void SendFile(WxSession s, string localPath) {
+        if (s == null || s.conv.Length == 0) { return; }
+        if (localPath == null || localPath.Length == 0) { return; }
+        string name = WxIm.BaseNameOf(localPath);
+        bool image = WxIm.IsImageName(name);
+        ChatMessage m;
+        if (image) {
+            m = ChatMessage.CreateImage("user", localPath, "");
+        } else {
+            long sz = FileInfo.GetLength(localPath);
+            m = ChatMessage.Create("user", "[文件] " + name
+                + "（" + WxIm.SizeOf(sz) + "）");
+        }
+        m.at = DateTime.UtcNow().ToUnixSeconds();
+        m.msgId = "";
+        m.mark = 0;
+        s.msgs.Add(m);
+        s.snippet = image ? "[图片]" : m.text;
+        s.time = "刚刚";
+        WxIm.RefreshViews();
+        WxNetReq up = WxNet.NewReq();
+        WxNet.Upload(up, "/api/collab/uploadattachment",
+            "name=" + Encoding.UrlEncode(name)
+            + "&clientRequestId=" + WxIm.NextCrid(), localPath, () => {
+                if (!WxNet.OkOf(up) || WxNet.DataOf(up) == null
+                    || WxNet.DataOf(up).Str("id", "").Length == 0) {
+                    if (m.img.Length > 0) { m.img = ""; m.text = "[图片]"; }
+                    m.role = "error";
+                    WxIm.RefreshViews();
+                    return;
+                }
+                string attId = WxNet.DataOf(up).Str("id", "");
+                WxNetReq req = WxNet.NewReq();
+                WxNet.ApiPost(req, "/api/collab/send",
+                    "conversationId=" + Encoding.UrlEncode(s.conv)
+                    + "&attachmentId=" + Encoding.UrlEncode(attId)
+                    + "&clientRequestId=" + WxIm.NextCrid(), () => {
+                        WxIm.SettleSend(s, m, req);
+                    });
+            });
+    }
+
+    /// 收到的图片：下载落缓存后原位补 img 并强制重绑（气泡条数没变，
+    /// OnDataChanged 的条数门不会重绑）。失败占位改写，不静默。
+    static void FetchAttImage(ChatMessage m, string attId, string savePath) {
+        WxNetReq r = WxNet.NewReq();
+        WxNet.Download(r, "/api/collab/downloadattachment?id="
+            + Encoding.UrlEncode(attId), savePath, () => {
+                if ((r.err != null && r.err.Length > 0) || r.status != 200) {
+                    m.text = "[图片]（下载失败）";
+                    WxIm.RebindMsgs();
+                    return;
+                }
+                m.img = savePath;
+                m.text = "";
+                WxIm.RebindMsgs();
+            });
+    }
+
+    /// 气泡原位改写（图片字节落盘补 img）后的强制重绑。
+    static void RebindMsgs() {
+        if (WxIm.page != null) { WxIm.page.RebindChat(); }
+        WxChatWindow.RefreshAll();
+    }
+
+    /* ---- 附件小助手 ---- */
+
+    /// 路径基名（\\ 与 / 都认）。
+    static string BaseNameOf(string path) {
+        int slash = path.LastIndexOf("/");
+        int back = path.LastIndexOf("\\");
+        int at = slash > back ? slash : back;
+        return at >= 0 ? path.Substring(at + 1) : path;
+    }
+
+    /// 扩展名（含点，≤8 字符才认；无扩展名给空）。
+    static string ExtOf(string name) {
+        int i = name.LastIndexOf(".");
+        if (i < 0) { return ""; }
+        string e = name.Substring(i);
+        return e.Length <= 8 ? e : "";
+    }
+
+    /// 上传侧的图片判定：png/jpg/jpeg 与服务端嗅探口径一致（其他
+    /// 位图格式服务端不回宽高，按文件行走）。
+    static bool IsImageName(string name) {
+        string lo = name.ToLower();
+        return lo.EndsWith(".png") || lo.EndsWith(".jpg")
+            || lo.EndsWith(".jpeg");
+    }
+
+    /// 字节数 → 人读尺寸。
+    static string SizeOf(long n) {
+        if (n >= 1048576) {
+            int whole = (int)(n / 1048576);
+            int frac = (int)((n % 1048576) * 10 / 1048576);
+            return Convert.ToString(whole) + "."
+                + Convert.ToString(frac) + "MB";
+        }
+        if (n >= 1024) {
+            return Convert.ToString(n / 1024) + "KB";
+        }
+        return Convert.ToString(n) + "B";
     }
 
     /* ---- 引用草稿（输入区上方的引用条） ---- */

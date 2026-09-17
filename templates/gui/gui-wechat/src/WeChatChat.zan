@@ -66,6 +66,8 @@ class WxPageChat : Control {
     WxAvaPanel avaPanel;
     WxFilePanel filePanel;
     Control curPopup;
+    /// 文件按钮的真选择器（A327-13b）：懒建，选中即上传发送。
+    FilePicker pick;
     /// 输入区下排的图标条：群聊/私聊图标数不同，切会话时重建。
     ToolStrip bar;
     /// 点任意用户头像弹出的小名片（与抽屉互斥的右缘浮卡）。
@@ -340,7 +342,7 @@ class WxPageChat : Control {
         Wx.Item(bar, 1).Tip = "常用头像";
         Wx.Item(bar, 1).OnClick(() => { this.ShowPopup(avaPanel.Root()); });
         Wx.Item(bar, 2).Tip = "文件";
-        Wx.Item(bar, 2).OnClick(() => { this.ShowPopup(filePanel.Root()); });
+        Wx.Item(bar, 2).OnClick(() => { this.PickAttach(); });
         Wx.Item(bar, 3).Tip = "截图";
         Wx.Item(bar, 4).Tip = "截图范围";
         Wx.Item(bar, 5).Tip = "麦克风";
@@ -406,6 +408,35 @@ class WxPageChat : Control {
         list.Refresh();
     }
 
+    /// 文件按钮（A327-13b）：真文件选择器——选中即上传发送。仅 collab
+    /// 域会话可用（旧域 /api/im 没有附件端点，1:1 维持现状）。
+    void PickAttach() {
+        if (current < 0 || current >= data.Count) { return; }
+        WxSession s = data[current];
+        if (s.conv.Length == 0) { return; }
+        this.ClosePopups();
+        if (pick == null) {
+            pick = new FilePicker();
+            pick.Accepted.Add(this.OnPicked);
+        }
+        // 每次打开都重新登记（幂等）：弹窗关闭后注册表移出该实例，
+        // 复用同一实例的第二次打开不登记就不再被泵。
+        ChildWindows.RegisterComponentPicker(pick);
+        if (app != null) { pick.ApplySkin(app.ThemeMenuIndex()); }
+        List<FileFilter> filters = new List<FileFilter>();
+        filters.Add(new FileFilter("所有文件 (*.*)", ""));
+        pick.BeginOpenFileFilters("", filters, "发送文件");
+        if (app != null) { app.RequestRedraw(); }
+    }
+
+    /// 选择器确认回调：单选路径交给 WxIm 发送（取消/关闭无路径）。
+    void OnPicked() {
+        if (pick == null || current < 0 || current >= data.Count) { return; }
+        string p = pick.SelectedPath();
+        if (p == null || p.Length == 0) { return; }
+        WxIm.SendFile(data[current], p);
+    }
+
     /// 桥（WxIm）在数据并入后调：标题区/列表行跟新值走；当前会话的
     /// 消息数变了才整体重绑（Reset 清滚动缓存，不重绑的话 ChatView
     /// 还捏着旧的 List 引用——会话槽是复用的，对象换了内容）。
@@ -427,6 +458,17 @@ class WxPageChat : Control {
             chat.Invalidate();
         }
         list.Refresh();
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    /// 气泡原位改写（图片字节落盘补 img）后的强制重绑：条数没变，
+    /// OnDataChanged 的条数门挡住重绑，这里绕过它。
+    void RebindChat() {
+        if (current >= 0 && current < data.Count) {
+            chat.Reset();
+            chat.Bind(data[current].msgs);
+            chat.Invalidate();
+        }
         { if (app != null) { app.RequestRedraw(); } }
     }
 
