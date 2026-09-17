@@ -625,7 +625,7 @@ HTTP 解析、编码转换、路径处理这类纯逻辑，上移到 Zan。
   "全库 0 处"的说法已过时；但 `Gui` 仍有大量 `if (x == "...")` 链，随颜色迁移一起清。
   **2026-09-14 定量与定性**：switch-on-string 本身已被探针证通（返回分支正确），
   债在链体改写量而非能力。链数 Top：Theme.zan **92**、ChartView.zan 33、
-  StyleSheet.zan 25、Css.zan 17、Pagination.zan 14。抽样 Pagination/StyleSheet
+  StyleSheet.zan 25、Css.zan 17、Pagination.zan 14。**2026-09-18 复测（只增未减）**：全库 `== "` 共 **5,519 处**，Top 变为 StyleSheet 557、GenDb 201、CodeEditor.Intelli 197、Css 194、ChartModel 165、DesignerHtml 113、Icon 107、Theme 97、GenRoute 82、Designer 78；另 **75 个 Gui 控件文件各写一份 HitTest**、12+ 文件各手写 Trim/StartsWith 类字符串 helper——冗余收敛与 if-链清偿同批（颜色迁移）。抽样 Pagination/StyleSheet
   显示不少链**混卫语句**（`seg == "total" && showTotal`），并非纯单变量可机械转换；
   Theme.zan 的 92 条全部落在颜色迁移热路径上。结论：本条与颜色迁移**同一批做**，
   单独清链收益低；ChartView 等 Chart* 文件在并行会话在途，勿动。
@@ -1437,7 +1437,7 @@ sel = sel.OrderByDescending(x => x.id);   // error: 'string' has no member 'Orde
 `is`/模式匹配会按指针解引用（读 `ptr-8`）而崩溃。`object o = 42` 在 checker 已被拒
 （"no implicit conversion"），实参路径是漏网的同一规则。修法：AST_CALL 按形参类型
 调 `checker_check_assignable`（或标量进 object 槽前装箱）。这是 B5 之前的既有缺陷，
-非 B5 引入；B5 conformance 未覆盖该形态。
+非 B5 引入；B5 conformance 未覆盖该形态。**2026-09-18 对勘：已修**——checker.c `checker_arg_type_mismatch` 拦截标量→object/interface/delegate/array 实参（diag 负控在档），残留仅 scalar→class 靠构造器匹配兜底一路（注释自认 deliberate），见 A340-5。
 
 
 ---
@@ -1670,6 +1670,29 @@ POSIX gthr，`pthread_*` 全部未定义 → `emit_lib_windows_dll` 链接失败
   写明。先观察、暂不实现 `Use` 透传——profile 槽位有 `File.TryLock`
   串行化、helper 走 env 兜底够用，没有发现"撞 slot"的实际 bug。
 
+
+# A340 · 审计散件三修与审计结论对账（2026-09-18，"按顺序修"会话）
+
+背景：2026-09-18 全仓审计（编译器/运行时/标准库/C# 差距四路）产出六项排序，本轮按序落地：
+
+| # | 项 | 结果 |
+|---|---|---|
+| 1 | A327-② 多 worker 丢唤醒 | 已闭账（见 A327 条 2026-09-18 复核：84 直跑+MT 族 12/12 全净，e499f022 已含根修） |
+| 2 | A32-4/A32-5 EH 迁移 | 维持独立里程碑排期（A32 节已注记现状：61 处 `__zan_eh_`/23 setjmp，wasm 真 EH 与 native 不对称） |
+| 3 | A52-5/A52-8 | 收账表 3.3/3.2 已于 09-14 闭账；本轮闭 A52-8 的 host_oom 尾巴（4cadce08）+ A52-5 陈旧条目清理（734e7e62） |
+| 4 | 假语义三件套 | ✅ 本节，316fab05 |
+| 5 | BCL 欠账 | 决策记录，见 A340-4 |
+| 6 | 冗余清理 | 数据并入 A15-5 定量行，随颜色迁移批次做 |
+
+**A340-1 sealed 真强制**（316fab05）：MOD_SEALED 此前解析即蒸发（parser.c:529 存位、全仓无一处检查；stdlib/templates/examples 0 使用故零破坏面）。resolve_bases 类基类采纳点硬错误 `cannot derive from sealed type 'X'`（对齐 CS0709）；负控 `diag_sealed_derive`、正控 `conformance_sealed_class`。**方法级 sealed（sealed override / 覆写 sealed 方法）仍未强制**——小项另批。
+
+**A340-2 decimal 拒绝**（316fab05）：`decimal` 曾静默映射 double（binder resolve_type），SPEC.md:171 自认"保留关键字，尚无对应类型"——语义谎言：C# 金额移植拿二进制浮点、只在末位比特出错。改硬错误 `'decimal' is not supported: use 'long' (minor units), 'double', or a string column instead`（拒绝点在 resolve_type 内建分支，所有类型位次统一生效）；`diag_decimal_unsupported`。真 128-bit decimal 若立项属语言增强。
+
+**A340-3 null 守卫先序收紧**（316fab05）：null 接收者诊断（checker.c reject_null_receiver 家族）的守卫判定原为全方法体无序扫描——`c=F(); 用 c.X; if (c==null)` 也算"已守卫"。收紧：`node_guards_null` 家族加 `use` 位（zan_loc_t.offset 剪枝，只认文本先于访问点的测试；子树起点不早于父节点故剪枝健全）。保留两项既有立场：兄弟分支守卫仍算（无流图下的既定宽松）、null_src 重赋值不清（保守向）。负控 `diag_null_guard_after_use`、正控 `conformance_null_guard_order`（早退/?./??/is null/条件内守卫五形态）。**null 包容操作符 `!` 仍未做**——收紧后其价值上升（先序守卫表达不了的场合需要逃生门），小增强另批。
+
+**A340-4 BCL 欠账决策**：Console/Environment/Convert 纯 Zan 重写（A15-9 残留）**维持内建 lowering 为生产路径**——内建面覆盖颜色/ReadKey/Clear/Title（builtin_api.c members_console），只复刻 Write/WriteLine 的 Zan 版是能力倒退；该项本质是 B6 工具链 Zan 化纯度项，非用户可感缺口。CancellationToken（stdlib 0 命中）不另起半成品——A327 范围升级清单 ④取消语义（Task 句柄生命周期/取消树/CancellationToken.Register 等位）是其正主，半截包装类会与该设计冲突。Math 维持内建（A15-9 既有理由：O0 下 Zan 版 +13%）。
+
+**A340-5 审计对勘修正**：A43 尾"call 实参不校验可赋值性"已过时——checker.c `checker_arg_type_mismatch`（标量→object/interface/delegate/array 实参拦截）已修，残留仅 scalar→class 靠构造器匹配兜底一路（checker.c 注释自认 deliberate）。struct 内 rc 字段：集合槽位/类析构路径已由 `type_contains_collection_rc` 覆盖，**普通 struct 值拷贝（局部赋值/按值返回）路径未见 retain/release——疑似洞，需立探针定案后再挂账**（本轮审计新发现，未验证不入账）。
 
 # 已撤回的结论（早期草稿中的错误，勿再引用）
 
