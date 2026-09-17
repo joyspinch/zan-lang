@@ -1711,9 +1711,7 @@ POSIX gthr，`pthread_*` 全部未定义 → `emit_lib_windows_dll` 链接失败
 
 ## A52 剩余子项（原「下一批待做」）
 
-- [ ] **A52-5 `--publish` 的安全网**：`main.c:2335-2338` 让 `check_leaks` 与
-  `arc_guard` 都只在 `debug_info && !publish_mode` 下开启，发布版本恰好没有
-  over-release/UAF 检测；要定一个"低成本子集在发布版也保留"的方案。
+- [x] **A52-5 `--publish` 的安全网** —— ✅ 已闭（2026-09-14，fcf56e0bc；收账表 3.3）：--publish 默认开 over-release 网（emit_arc_underflow_check 双模式：报告走 fail-soft note 后继续、绝不 abort；--arc-guard 完整陷阱仍专属诊断档；--no-arc-guard 连网同关=性能逃生门）；饱和基准 ±0、体积 +512B/exe；负控档 conformance_arc_net_publish 常驻（2026-09-18 复跑绿）。本行旧 `[ ]` 为 A52 节陈旧副本，同日清理。
 - [x] **A52-6 null 解引用守卫**（2026-09-15 闭账）：
   `obj.f` 不再直接 fault——**出厂默认即带守卫**（`runtime_checks` 默认 true，
   A77 的接收者守卫后来已泛化到每次成员访问：字段读+方法调用接收者统一
