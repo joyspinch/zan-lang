@@ -1,0 +1,90 @@
+using Gui;
+
+namespace Gui;
+
+/// 通用抗锯齿列/带填充助手：与任何图表家族无关的纯 Canvas 几何
+/// 代码（1/256 px 定点覆盖率混合）。原先住在 ChartView partial
+/// 家族里，DataTable 迷你图列想复用时按需拉取会把 Chart 全家
+/// （21 个分片 + 布局/模型 ~35 文件）拖进编译图——抽成独立小文件，
+/// 谁拼 RenderAA 谁只拉这一个文件。
+class RenderAA {
+    /// 与打包不透明颜色相同的 RGB，但替换 alpha（0 透明..255 不透明）。
+    static int WithAlpha(int packed, int a) {
+        return (packed - (int)4278190080) + a * 16777216;
+    }
+
+    /// 单个抗锯齿列：顶边 yyF 是 1/256 定点（列顶落在边界行 iy
+    /// 内的覆盖率 = 256-frac），从边行到 baseY 之间实体填充。
+    /// gradient 时实体段用 FillVGrad（渐变强端贴数据线），否则
+    /// 用 solidA 均匀透明度。基线在路径上方（反向轴悬挂面积，
+    /// 如雨量图右轴）走镜像分支。
+    static void FillColumnAA(Canvas c, int px, int yyF, int baseY,
+                             int color, bool gradient, int topA, int botA, int solidA) {
+        int iy = yyF / 256;
+        int frac = yyF - iy * 256;      // 0..255：行 iy 位于路径上方的部分
+        if (baseY > iy) {
+            // 常规（基线在路径下方）：填 [iy+1, baseY)，边界行 iy
+            // 只覆盖路径以下的部分。渐变强端贴数据线。
+            int cover = 256 - frac;     // 填充对边界行 iy 的覆盖率
+            int solidTop = iy + 1;
+            if (gradient) {
+                c.FillVGrad(px, solidTop, 1, baseY - solidTop,
+                    RenderAA.WithAlpha(color, topA), RenderAA.WithAlpha(color, botA));
+            } else {
+                c.FillRect(px, solidTop, 1, baseY - solidTop, RenderAA.WithAlpha(color, solidA));
+            }
+            int edgeA = solidA;
+            if (gradient) { edgeA = topA; }
+            c.FillRect(px, iy, 1, 1, RenderAA.WithAlpha(color, edgeA * cover / 256));
+        } else if (baseY < iy) {
+            // 反向轴悬挂面积（基线在路径上方，雨量图右轴）：填
+            // [baseY, iy)，边界行 iy 只覆盖路径以上的部分。渐变
+            // 强端依旧贴数据线（此时在列底部）。
+            if (gradient) {
+                c.FillVGrad(px, baseY, 1, iy - baseY,
+                    RenderAA.WithAlpha(color, botA), RenderAA.WithAlpha(color, topA));
+            } else {
+                c.FillRect(px, baseY, 1, iy - baseY, RenderAA.WithAlpha(color, solidA));
+            }
+            c.FillRect(px, iy, 1, 1, RenderAA.WithAlpha(color, topA * frac / 256));
+        }
+    }
+
+    /// 堆叠色带的单个抗锯齿列：顶部和底部边界都带小数覆盖率。
+    /// 底部被吸附到整像素的色带会与下方色带（其顶部自带小数部分）
+    /// 形成阶梯状接缝，使两个堆叠颜色之间的接缝参差不齐——对两条
+    /// 边都混合，使共享行的两份覆盖率合计为一整行。
+    static void FillBandColumnAA(Canvas c, int px, int topF, int botF,
+                                 int color, bool gradient, int topA, int botA,
+                                 int solidA) {
+        if (botF <= topF) { return; }
+        int iyTop = topF / 256;
+        int iyBot = botF / 256;
+        int edgeA = solidA;
+        if (gradient) { edgeA = topA; }
+        if (iyTop == iyBot) {
+            int cover = botF - topF;
+            c.FillRect(px, iyTop, 1, 1, RenderAA.WithAlpha(color, edgeA * cover / 256));
+            return;
+        }
+        int topCover = 256 - (topF - iyTop * 256);
+        c.FillRect(px, iyTop, 1, 1, RenderAA.WithAlpha(color, edgeA * topCover / 256));
+        int solidTop = iyTop + 1;
+        if (iyBot > solidTop) {
+            if (gradient) {
+                c.FillVGrad(px, solidTop, 1, iyBot - solidTop,
+                    RenderAA.WithAlpha(color, topA), RenderAA.WithAlpha(color, botA));
+            } else {
+                c.FillRect(px, solidTop, 1, iyBot - solidTop,
+                    RenderAA.WithAlpha(color, solidA));
+            }
+        }
+        int botCover = botF - iyBot * 256;
+        int bottomEdgeA = solidA;
+        if (gradient) { bottomEdgeA = botA; }
+        if (botCover > 0) {
+            c.FillRect(px, iyBot, 1, 1,
+                RenderAA.WithAlpha(color, bottomEdgeA * botCover / 256));
+        }
+    }
+}
