@@ -1,6 +1,14 @@
 #ifndef ZAN_RT_TIMER_H
 #define ZAN_RT_TIMER_H
 
+/* Every TU that carries this header ships in the runtime and is always linked
+ * with this file (zan_rt_fatal's definition, see main.c: the timer object is
+ * injected unconditionally), so host_oom.h routes its allocation-failure
+ * abort through the zan_rt_fatal funnel and OOM becomes embedder-takeover
+ * observable like every other unrecoverable fault. Include this header before
+ * ../common/host_oom.h. */
+#define ZAN_OOM_TO_RUNTIME 1
+
 #include <stddef.h>
 #include <stdint.h>
 

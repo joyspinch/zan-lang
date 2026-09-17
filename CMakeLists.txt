@@ -195,6 +195,8 @@ add_custom_command(
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.c
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.h
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_co.h
+            ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.h
+            ${CMAKE_SOURCE_DIR}/src/common/host_oom.h
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.h
     COMMENT "Building socket-async reactor object (zanrt_io)"
     VERBATIM)
@@ -216,6 +218,7 @@ add_custom_command(
             -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.c -o ${ZAN_RT_TIMER_OBJ}
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.c
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.h
+            ${CMAKE_SOURCE_DIR}/src/common/host_oom.h
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.h
     COMMENT "Building unified timer runtime object (zanrt_timer)"
     VERBATIM)
@@ -241,6 +244,8 @@ add_custom_command(
             -c ${CMAKE_SOURCE_DIR}/src/runtime/zan_embed_api.c
             -o ${ZAN_EMBED_OBJ}
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/zan_embed_api.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.h
+            ${CMAKE_SOURCE_DIR}/src/common/host_oom.h
     COMMENT "Building embedded-resource API object (zan_embed_api)"
     VERBATIM)
 add_custom_target(zan_embed_api ALL DEPENDS ${ZAN_EMBED_OBJ})
@@ -292,6 +297,8 @@ add_custom_command(
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.c
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.h
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_co.h
+            ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.h
+            ${CMAKE_SOURCE_DIR}/src/common/host_oom.h
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.h
     COMMENT "Building multi-worker reactor object (zanrt_io_mt)"
     VERBATIM)

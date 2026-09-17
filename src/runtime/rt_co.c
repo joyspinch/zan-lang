@@ -1,6 +1,7 @@
 /* rt_co.c -- Zan stackless-coroutine driver (see rt_co.h). */
 
 #include "rt_co.h"
+#include "rt_timer.h"   /* ZAN_OOM_TO_RUNTIME: OOM joins the zan_rt_fatal funnel */
 
 #include <stdlib.h>
 

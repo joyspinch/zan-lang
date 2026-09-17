@@ -18,6 +18,8 @@
 #include <string.h>
 #include <stdlib.h>
 
+#include "rt_timer.h"   /* ZAN_OOM_TO_RUNTIME: OOM joins the zan_rt_fatal funnel */
+
 #include "../common/host_oom.h"
 
 typedef struct {

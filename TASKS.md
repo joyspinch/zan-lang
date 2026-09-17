@@ -1729,9 +1729,7 @@ POSIX gthr，`pthread_*` 全部未定义 → `emit_lib_windows_dll` 链接失败
   ② `zan_rt_soft_scratch()` 从每个守卫点各调一次改为每函数入口
   `emit_soft_scratch_cached` 缓存进 entry alloca（软路径 select 的调用曾坐在
   热循环里，微基准 73/99→68/97ms）。遗留（另记）：**opaque string 越界检查**已随 A58 3.4 拍板闭账（2026-09-15，选项②维持现状，契约见 docs/ABI.md §6.3）。
-- [ ] **A52-8 库内单方面终止进程**：OOM（`host_oom.h`）、契约违反
-  （`rt_sched.c:242`）、slab 一致性（`rt_mem.c:446,453`）共十余处 `abort()`，
-  作为被嵌入的库没有错误码出口。
+- [x] **A52-8 库内单方面终止进程** —— ✅ 主体已闭（2026-09-14，见 A56 后收账表 3.2：`zan_rt_set_fatal_handler`/`zan_rt_fatal` 收编 18 处活死点；当时 host_oom.h 明确留范围外）；**尾巴 2026-09-18 闭**：host_oom.h 的 `zan_host_oom()` 直 abort 是最后一个绕漏斗口子——rt_timer.h（runtime 私有头）定义 `ZAN_OOM_TO_RUNTIME`，host_oom.h 按宏分流，runtime TU（rt_io/rt_io_mt/rt_timer/rt_co/rt_embed_api）OOM 进漏斗（诊断行→嵌入者 handler→返回仍 abort 兜底），工具二进制（zanc/zan-lsp/zan-dap）保持 stderr+abort。弱符号方案试过并否决（clang/lld 弱未定义→NULL 正确；gcc/mingw ld 下 if(fn) 直接段错误——实测）。CMake 补 rt_io/rt_io_mt/rt_timer/zan_embed_api 四处 DEPENDS（rt_timer.h+host_oom.h，陈旧 obj 根）。验证：漏斗双向探针（handler→exit(42) / 无 handler→原 abort）；hello+MT 族 12/12+smoke 2702/2703（唯一红 conformance_gui_events_contract 归并行 A330 车道刚转正契约测试的 SKIP 分支缺失，纯 Zan 逻辑先于本改动）。gui_runtime.c 未纳入（跨平台预编 gui 归档陈旧风险，行为无损）。同窗法证：fan_mt O2 布局 2/38 execute-at-heap 段错误，符号表解码 = `zan_rt_release_dyn` 从 `Leaf$resume` 释放悬垂对象时 vtable 槽读到堆垃圾——A327 已挂账的过释放/帧回收残余竞态实锤一处调用点（非本改动：base 臂 0/50、Os/O0 臂 0/70 的布局敏感抖动与「打点躲时序」同类）。
 - [x] ~~A52-7 EH 线程表 1024 硬顶~~ → **A78-2** 已完成（2026-08-31，动态哈希表）。
 
 ---
