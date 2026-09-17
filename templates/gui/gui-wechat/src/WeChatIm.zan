@@ -3,25 +3,36 @@ using System.Collections;
 using System.Json;
 using System.Threading;
 
-/* gui-wechat ↔ server-collab 的业务桥：把 /api/im 的 JSON 翻成
+/* gui-wechat ↔ server-collab 的业务桥：把服务端 JSON 翻成
    WxSession/ChatMessage 模型。请求都走 WxNet 的队列（UI 线程提交、
    回调在 UI 线程并入），这里只做三件事：
      1. RefreshChats —— 会话列表全量重建（App.OnLoad 首拉 + 轮询）；
-     2. Open         —— 打开会话：/stream 拉全量消息（服务端顺带批量已读）；
+     2. Open         —— 打开会话：拉全量消息（collab 群聊顺带落已读水位）；
      3. Send         —— 发送：本地先插气泡，应答带回 id/at 定稿；失败
         把该气泡改成红色 error 角色（原版微信的红色感叹号语义）。
+   双域并行（A327 总原则「旧域只读不动、新域旁路增量」）：
+     - 1:1 私聊走旧域 /api/im 全家（oa_message，回执已送达/已读齐全），
+       槽身份键 "p"+peer；
+     - 群聊走 collab 域 /api/collab 全家（collab_message），槽身份键
+       "c"+conv——「去 peer=唯一键」后槽身份由 Key() 裁决，两域互不
+       串槽；collab 域没有送达/已读回执小字，群聊气泡不打勾。
+   实时：90ms 拍并入 WxEvents 帧（OnLiveEvent），轮询（Beat）兜底。
    回执：ChatMessage.mark 存 0 发出 / 1 送达 / 2 已读，渲染走 kind
-   （"wx-acked"/"wx-readed" → WxData.KindLabel 的头行小字）。
-   轮询：宿主开一个 form.Every 调 Beat()——打开的会话每拍拉流，
-   chats 与未读总数每 3 拍重拉。没有推送通道，轮询就是客户端的"实时"。 */
+   （"wx-acked"/"wx-readed" → WxData.KindLabel 的头行小字）。 */
 static class WxIm {
     /// 会话模型（页与桥共享同一份 List 引用，重建 = 清掉重填）。
     static List<WxSession> sessions;
     static WxPageChat page;
     /// 轮询节拍计数：chats 每 3 拍拉一次，打开的会话每拍拉流。
     static int tick;
-    /// 当前打开的会话对端 id（"" = 没开）。
+    /// 当前打开的会话：1:1 对端 id 或 collab 会话 id（"" = 没开）。
     static string openPeer = "";
+    static string openConv = "";
+    /// 两源快照：最近一次应答的数组节点，Merge() 消费。
+    static JsonValue imChats;
+    static JsonValue groupRows;
+    /// collab 群聊未读合计（徽标 = 旧域 unread + 群聊合计）。
+    static int groupUnread;
 
     /// 接桥：页把模型与自身交给桥（App.OnLoad 里调一次）。
     static void Use(List<WxSession> model, WxPageChat host) {
@@ -31,46 +42,53 @@ static class WxIm {
         host.BeginServerMode();
     }
 
-    /* ---- 会话列表 ---- */
+    /* ---- 会话列表（双源合并） ---- */
 
-    /// 拉会话列表并整表重建。done 在 UI 线程回调（可空）。
+    /// 拉会话列表并整表重建：1:1（/api/im/chats）与群聊
+    /// （/api/collab/conversations）各发一单，先到的先落快照、
+    /// 后到的再并一次——Merge 按槽身份认领，两单谁先谁后结果一致。
+    /// done 在 UI 线程回调（可空）。
     static void RefreshChats(Action done) {
         if (!WxNet.LoggedIn()) { return; }
         WxNetReq req = WxNet.NewReq();
         WxNet.Get(req, "chats", () => {
+            if (WxNet.OkOf(req)) {
+                JsonValue d = WxNet.DataOf(req);
+                WxIm.imChats = d == null ? null : d.Get("chats");
+                WxIm.Merge();
+            }
             if (done != null) { done(); }
-            if (!WxNet.OkOf(req)) { return; }
-            JsonValue d = WxNet.DataOf(req);
-            if (d == null) { return; }
-            JsonValue items = d.Get("chats");
-            if (items == null) { return; }
-            ApplyChats(items);
+        });
+        WxNetReq gr = WxNet.NewReq();
+        WxNet.ApiGet(gr, "/api/collab/conversations", () => {
+            if (!WxNet.OkOf(gr)) { return; }
+            JsonValue d = WxNet.DataOf(gr);
+            WxIm.groupRows = d == null ? null : d.Get("conversations");
+            WxIm.Merge();
         });
     }
 
-    /// 把服务端的 chats 数组重填进共享模型。槽身份跟对端走，不跟
-    /// 下标走：服务端按最新消息排序，两次轮询之间顺序经常变——按下
-    /// 标复用会把槽悄悄换给别的对端（旧会话的消息记录被当"别人家的"
-    /// 清掉、拖出的浮窗拿着旧对象直接串台）。先按 peer 建索引，认领
-    /// 得到的原对象连同消息记录继续用，认领不到的开新槽；列表实例
-    /// 不换（页与列表绑定的是同一份引用），清掉按服务端顺序重填。
-    static void ApplyChats(JsonValue items) {
+    /// 两源快照 → 共享模型整表重建。槽身份跟 Key() 走，不跟下标走：
+    /// 服务端按最新消息排序，两次轮询之间顺序经常变——按下标复用会
+    /// 把槽悄悄换给别的会话（旧消息记录被当"别人家的"清掉、拖出的
+    /// 浮窗拿着旧对象直接串台）。先按键建索引，认领得到的原对象连同
+    /// 消息记录继续用，认领不到的开新槽；列表实例不换（页与列表绑定
+    /// 的是同一份引用），清掉按 1:1 → 群聊的顺序重填。
+    static void Merge() {
         if (WxIm.sessions == null) { return; }
-        int n = items.Count();
         Dict<string, WxSession> idle = new Dict<string, WxSession>();
         for (int i = 0; i < WxIm.sessions.Count; i = i + 1) {
-            idle.Add(WxIm.sessions[i].peer, WxIm.sessions[i]);
+            idle.Add(WxIm.sessions[i].Key(), WxIm.sessions[i]);
         }
         List<WxSession> next = new List<WxSession>();
-        for (int i = 0; i < n; i = i + 1) {
-            JsonValue o = items.At(i);
+        int n1 = WxIm.imChats == null ? 0 : WxIm.imChats.Count();
+        for (int i = 0; i < n1; i = i + 1) {
+            JsonValue o = WxIm.imChats.At(i);
             string newPeer = o.Str("peerId", "");
-            WxSession s;
-            if (!idle.TryGetValue(newPeer, out s)) { s = null; }
-            if (s != null) { idle.Remove(newPeer); }
-            if (s == null) { s = WxSession.Blank(); }
+            WxSession s = WxIm.Claim(idle, "p" + newPeer);
             next.Add(s);
             s.peer = newPeer;
+            s.conv = "";
             s.name = o.Str("peerName", "?");
             s.initial = WxIm.IniOf(s.name);
             s.tint = WxData.TintOf(i);
@@ -87,9 +105,34 @@ static class WxIm {
             string ackId = o.Str("ackId", "0");
             if (ackId != "0" && ackId != "") { WxIm.QueueAck(newPeer); }
         }
+        int n2 = WxIm.groupRows == null ? 0 : WxIm.groupRows.Count();
+        int sumUnread = 0;
+        for (int i = 0; i < n2; i = i + 1) {
+            JsonValue o = WxIm.groupRows.At(i);
+            string cid = o.Str("id", "");
+            WxSession s = WxIm.Claim(idle, "c" + cid);
+            next.Add(s);
+            s.peer = "";
+            s.conv = cid;
+            s.name = o.Str("title", "?");
+            s.initial = WxIm.IniOf(s.name);
+            s.tint = WxData.TintOf(i);
+            s.group = true;
+            s.people = Convert.ToInt32(o.Str("members", "0"));
+            s.snippet = o.Str("lastText", "");
+            s.time = WxIm.ClockOf(o.Str("lastAt", "0"));
+            s.unread = Convert.ToInt32(o.Str("unread", "0"));
+            s.sentUnread = 0;          // collab 域一期没有送达回执小字
+            s.lastMark = 0;
+            sumUnread = sumUnread + s.unread;
+        }
         WxIm.sessions.Clear();
         for (int i = 0; i < next.Count; i = i + 1) {
             WxIm.sessions.Add(next[i]);
+        }
+        if (sumUnread != WxIm.groupUnread) {
+            WxIm.groupUnread = sumUnread;
+            WxIm.RefreshBadge();
         }
         // 列表重建后当前选中行已经是新的槽对象。只有"还没选过"时才主动
         // 选一次（登录后首屏：不点行也能看到当前会话的记录）——每次轮询
@@ -103,20 +146,38 @@ static class WxIm {
         WxIm.RefreshViews();
     }
 
+    /// 从 idle 索引认领槽对象（有则摘出复用，无则开新槽）。
+    static WxSession Claim(Dict<string, WxSession> idle, string key) {
+        WxSession s;
+        if (!idle.TryGetValue(key, out s)) { s = null; }
+        if (s != null) { idle.Remove(key); }
+        if (s == null) { s = WxSession.Blank(); }
+        return s;
+    }
+
     /* ---- 打开会话：拉消息流 ---- */
 
-    /// 打开（或刷新）某会话：记下对端，拉全量流。打开即已读由服务端
-    /// 在 Stream 里批量落账。
+    /// 打开（或刷新）某会话：记下身份键，拉全量流。1:1 打开即已读由
+    /// 旧域 Stream 落账；collab 群聊打开即调 read 推进水位。
     static void Open(WxSession s) {
-        if (s == null || s.peer.Length == 0) { return; }
+        if (s == null) { return; }
+        if (s.conv.Length > 0) {
+            openConv = s.conv;
+            openPeer = "";
+            WxIm.PullConvStream(s.conv, null);
+            WxIm.PostRead(s.conv);
+            return;
+        }
+        if (s.peer.Length == 0) { return; }
         openPeer = s.peer;
-        PullStream(s.peer, null);
+        openConv = "";
+        WxIm.PullStream(s.peer, null);
     }
 
     /// 当前打开的会话拉一遍流（轮询与新消息并入用）。
     static void RefreshOpen() {
-        if (openPeer.Length == 0) { return; }
-        PullStream(openPeer, null);
+        if (openConv.Length > 0) { WxIm.PullConvStream(openConv, null); }
+        if (openPeer.Length > 0) { WxIm.PullStream(openPeer, null); }
     }
 
     static void PullStream(string peer, Action done) {
@@ -127,7 +188,21 @@ static class WxIm {
             if (!WxNet.OkOf(req)) { return; }
             JsonValue d = WxNet.DataOf(req);
             if (d == null) { return; }
-            ApplyStream(d.Str("peer", ""), d.Get("msgs"));
+            WxIm.ApplyStream(d.Str("peer", ""), d.Get("msgs"));
+        });
+    }
+
+    /// collab 群聊消息流（before/limit 游标分页，一期整页 200 拉满）。
+    static void PullConvStream(string conv, Action done) {
+        if (!WxNet.LoggedIn()) { return; }
+        WxNetReq req = WxNet.NewReq();
+        WxNet.ApiGet(req, "/api/collab/messages?conversationId="
+            + Encoding.UrlEncode(conv) + "&limit=200", () => {
+            if (done != null) { done(); }
+            if (!WxNet.OkOf(req)) { return; }
+            JsonValue d = WxNet.DataOf(req);
+            if (d == null) { return; }
+            WxIm.ApplyConvStream(d.Str("conversationId", ""), d.Get("msgs"));
         });
     }
 
@@ -173,8 +248,59 @@ static class WxIm {
             s.msgs.Add(nm);
             WxData.Who("peer:" + peer, s.name, s.initial);
         }
-        // 摘要/时间/回执角标跟最新一条走；列表上的回执位取最后一条
-        // 我发的消息。
+        WxIm.AfterStream(s, peer == openPeer);
+    }
+
+    /// collab 群聊流并入：字段与旧域对齐（服务端已把发送者显示名、
+    /// 引用解析、附件/任务卡元数据都回在行上）。已撤回消息 kind=
+    /// deleted、正文为空——气泡显示「已撤回」占位。回执位不翻
+    /// （collab 域没有送达/已读小字）。附件与任务卡的完整呈现
+    /// （图片气泡/文件行/卡片）随 A327-13b/c。
+    static void ApplyConvStream(string conv, JsonValue msgs) {
+        if (WxIm.sessions == null || msgs == null) { return; }
+        WxSession s = WxIm.ByConv(conv);
+        if (s == null) { return; }
+        int appended = 0;
+        for (int i = 0; i < msgs.Count(); i = i + 1) {
+            JsonValue o = msgs.At(i);
+            string id = o.Str("id", "");
+            bool mine = o.Str("mine", "0") == "1";
+            ChatMessage m = WxIm.ById(s, id);
+            if (m != null) { continue; }
+            appended = appended + 1;
+            string kind = o.Str("kind", "text");
+            string body = o.Str("content", "");
+            if (kind == "deleted") { body = "已撤回"; }
+            ChatMessage nm = ChatMessage.Create(
+                mine ? "user" : "assistant", body);
+            // 群聊发言人：agent = "u:"+senderId，显示名/首字按服务端
+            // 回传登记（WhoOnce 幂等，不随每拍流重复注册）。
+            string from = o.Str("from", "");
+            nm.agent = mine ? "" : "u:" + from;
+            if (!mine) {
+                string nm2 = o.Str("name", "");
+                WxData.WhoOnce("u:" + from, nm2, WxIm.IniOf(nm2));
+            }
+            nm.at = Convert.ToInt64(o.Str("at", "0"));
+            nm.msgId = id;
+            nm.mark = mine ? 0 : -1;
+            nm.quoteId = o.Str("replyTo", "");
+            nm.quoteWho = o.Str("quoteWho", "");
+            nm.quoteText = o.Str("quoteText", "");
+            s.msgs.Add(nm);
+        }
+        WxIm.AfterStream(s, conv == openConv);
+        // 打开中并入的新消息就地落已读水位：Open 只在打开那一刻
+        // PostRead 一次，之后 Beat/live 并入的新消息若不跟着推进，
+        // 服务端未读（conversations.unread 按 lastReadMsgId 算）会一直
+        // 挂着——用户明明看着屏幕，Rail 徽标却亮着。幂等只进不退，
+        // 重复打无害。
+        if (appended > 0 && conv == openConv) { WxIm.PostRead(conv); }
+    }
+
+    /// 流并入后的共同收尾：摘要/时间跟最新一条、列表回执位取最后
+    /// 一条我发的消息、打开中的会话未读清零。
+    static void AfterStream(WxSession s, bool isOpen) {
         int lastMineMark = -1;
         if (s.msgs.Count > 0) {
             ChatMessage last = s.msgs[s.msgs.Count - 1];
@@ -188,7 +314,7 @@ static class WxIm {
             }
         }
         if (lastMineMark >= 0) { s.lastMark = lastMineMark; }
-        if (peer == openPeer) { s.unread = 0; }
+        if (isOpen) { s.unread = 0; }
         WxIm.RefreshViews();
     }
 
@@ -208,7 +334,7 @@ static class WxIm {
 
     static void Send(WxSession s, string text, string quoteId) {
         if (s == null || text.Length == 0) { return; }
-        if (s.peer.Length == 0) {
+        if (!s.Linked()) {
             // 没接上服务端的旧示例数据行：维持纯本地行为。
             return;
         }
@@ -229,27 +355,56 @@ static class WxIm {
         s.time = "刚刚";
         WxIm.RefreshViews();
         WxNetReq req = WxNet.NewReq();
-        string form = "peer=" + Encoding.UrlEncode(s.peer)
+        string form;
+        if (s.conv.Length > 0) {
+            // collab 群聊：clientRequestId 是服务端可重试写契约的
+            // 幂等键（必填），本地单调序号 + 秒级时钟足够唯一。
+            form = "conversationId=" + Encoding.UrlEncode(s.conv)
+                + "&content=" + Encoding.UrlEncode(text)
+                + "&clientRequestId=" + WxIm.NextCrid();
+            if (m.quoteId.Length > 0) {
+                form = form + "&replyTo=" + Encoding.UrlEncode(m.quoteId);
+            }
+            WxNet.ApiPost(req, "/api/collab/send", form, () => {
+                WxIm.SettleSend(s, m, req);
+            });
+            return;
+        }
+        form = "peer=" + Encoding.UrlEncode(s.peer)
             + "&content=" + Encoding.UrlEncode(text);
         if (m.quoteId.Length > 0) {
             form = form + "&replyTo=" + Encoding.UrlEncode(m.quoteId);
         }
         WxNet.Post(req, "send", form, () => {
-            if (WxNet.OkOf(req)) {
-                JsonValue d = WxNet.DataOf(req);
-                m.msgId = d == null ? "" : d.Str("id", "");
-                if (d != null) {
-                    long at = Convert.ToInt64(d.Str("at", "0"));
-                    if (at > 0) { m.at = at; }
-                }
-                // 送达/已读回执等轮询翻；先按"已发出"画。
-                m.mark = 0;
-                s.lastMark = 0;
-            } else {
-                m.role = "error";
-            }
-            WxIm.RefreshViews();
+            WxIm.SettleSend(s, m, req);
         });
+    }
+
+    /// Send 应答的共同定稿：成功拿 id/at，失败气泡翻红。
+    static void SettleSend(WxSession s, ChatMessage m, WxNetReq req) {
+        if (WxNet.OkOf(req)) {
+            JsonValue d = WxNet.DataOf(req);
+            m.msgId = d == null ? "" : d.Str("id", "");
+            if (d != null) {
+                long at = Convert.ToInt64(d.Str("at", "0"));
+                if (at > 0) { m.at = at; }
+            }
+            // 送达/已读回执等轮询翻；先按"已发出"画。
+            m.mark = 0;
+            s.lastMark = 0;
+        } else {
+            m.role = "error";
+        }
+        WxIm.RefreshViews();
+    }
+
+    /// 可重试写的幂等键：秒级时钟 + 进程内单调序号。
+    static int cridSeq;
+
+    static string NextCrid() {
+        WxIm.cridSeq = WxIm.cridSeq + 1;
+        return "wx-" + Convert.ToString(DateTime.UtcNow().ToUnixSeconds())
+            + "-" + Convert.ToString(WxIm.cridSeq);
     }
 
     /* ---- 引用草稿（输入区上方的引用条） ---- */
@@ -298,14 +453,41 @@ static class WxIm {
 
     static int unreadTotal;
 
-    /// 实时事件接线点（A327-12）：WxEvents 线程去重后的帧在 UI 线程
-    /// 递到这里。本卡只计数（探针据此断言「事件到达且在 UI 线程」）；
-    /// 事件 → 会话模型的完整落地（新消息入气泡、徽标即时+1、任务
-    /// 卡片刷新）归 A327-13 聊天接入。
+    /// 实时事件接线点（A327-12 接入、A327-13 落地）：WxEvents 线程
+    /// 去重后的帧在 UI 线程递到这里，按事件类型驱动会话模型——
+    /// message.created：打开中的群会话直接拉流并入；没打开的本地
+    /// 并入摘要与未读（服务端帧顶层带 excerpt，平铺外形见 Policy.Frame）。
+    /// conversation.created / member.joined / member.left：列表结构
+    /// 变化，整表重拉（两源快照合并，槽身份认领保消息记录）。
     static int liveEvents;
 
     static void OnLiveEvent(string eventJson) {
         WxIm.liveEvents = WxIm.liveEvents + 1;
+        JsonValue v = JsonValue.ParseLenient(eventJson);
+        if (v == null) { return; }
+        string ev = v.Str("event", "");
+        if (ev == "message.created") {
+            string conv = v.Str("conversationId", "");
+            if (conv.Length == 0) { return; }
+            if (conv == WxIm.openConv) {
+                WxIm.PullConvStream(conv, null);
+                return;
+            }
+            WxSession s = WxIm.ByConv(conv);
+            if (s != null) {
+                s.snippet = v.Str("excerpt", "");
+                s.time = "刚刚";
+                s.unread = s.unread + 1;
+                WxIm.groupUnread = WxIm.groupUnread + 1;
+                WxIm.RefreshBadge();
+                WxIm.RefreshViews();
+            }
+            return;
+        }
+        if (ev == "conversation.created" || ev == "member.joined"
+            || ev == "member.left") {
+            WxIm.RefreshChats(null);
+        }
     }
 
     /// 未读总数（Rail 徽标；App 轮询后读它刷新）。
@@ -327,6 +509,15 @@ static class WxIm {
         WxNet.Post(req, "ack", "id=" + Encoding.UrlEncode(id), null);
     }
 
+    /// collab 群聊已读水位：打开会话时调一次，服务端把水位推进到
+    /// 当前最大消息 id（幂等只进不退）。
+    static void PostRead(string conv) {
+        if (!WxNet.LoggedIn() || conv.Length == 0) { return; }
+        WxNetReq req = WxNet.NewReq();
+        WxNet.ApiPost(req, "/api/collab/read",
+            "conversationId=" + Encoding.UrlEncode(conv), null);
+    }
+
     static void PollUnread() {
         if (!WxNet.LoggedIn()) { return; }
         WxNetReq req = WxNet.NewReq();
@@ -334,12 +525,18 @@ static class WxIm {
             if (!WxNet.OkOf(req)) { return; }
             JsonValue d = WxNet.DataOf(req);
             if (d == null) { return; }
-            int n = Convert.ToInt32(d.Str("count", "0"));
-            if (n != WxIm.unreadTotal) {
-                WxIm.unreadTotal = n;
-                WxIm.RefreshBadge();
-            }
+            WxIm.SyncBadge(Convert.ToInt32(d.Str("count", "0")));
         });
+    }
+
+    /// 徽标总账：旧域 1:1 未读 + collab 群聊未读合计（群聊部分在
+    /// Merge 里随快照重算，live 事件就地增减）。
+    static void SyncBadge(int imUnread) {
+        int n = imUnread + WxIm.groupUnread;
+        if (n != WxIm.unreadTotal) {
+            WxIm.unreadTotal = n;
+            WxIm.RefreshBadge();
+        }
     }
 
     /// 一次拉流的应答体（WxNet.DataOf 的薄包装，回调里读得顺一些）。
@@ -394,6 +591,14 @@ static class WxIm {
         if (WxIm.sessions == null) { return null; }
         for (int i = 0; i < WxIm.sessions.Count; i = i + 1) {
             if (WxIm.sessions[i].peer == peer) { return WxIm.sessions[i]; }
+        }
+        return null;
+    }
+
+    static WxSession ByConv(string conv) {
+        if (WxIm.sessions == null || conv.Length == 0) { return null; }
+        for (int i = 0; i < WxIm.sessions.Count; i = i + 1) {
+            if (WxIm.sessions[i].conv == conv) { return WxIm.sessions[i]; }
         }
         return null;
     }

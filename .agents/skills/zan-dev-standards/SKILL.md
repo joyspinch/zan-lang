@@ -101,6 +101,22 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   静止窗口上永不点火——场景别挂在帧体上，用 worker 线程发消息
   （PostMessageW/IsZoomed 线程安全）+ `app.Post` 回 UI 线程收尾
   （Post 契约即线程安全）。
+- **GUI 客户端×服务端联调的实机冒烟定式**：客户端留
+  `ZAN_<APP>_AUTOLOGIN="user:pass"` 环境缝（登录窗独立泵起手前预填并
+  直走登录流，GUI e2e 复用同一缝）；断言优先取**服务端可观测痕迹**而
+  不是读屏——客户端行为落 DB 的状态列直接 sqlite 断言（如"打开会话"
+  必推进已读水位，>0 即证明打开链路真发生了）；「实时消息并入屏」用
+  前后两张窗口截图**逐字节 diff** 判重绘发生（PNG 确定性编码，内容同
+  则字节同），等待窗口给足——WS 建连与秒级轮询节拍都是秒级窗，3s 级
+  等待会假阴，6s 起拍、不等再兜底重拍；启动带 `ZAN_GUI_OVERLAP=1`+
+  `ZAN_GUI_LAYOUTLINT=1`+`ZAN_GUI_OVERLAP_LOG=<file>`，收尾断言日志空
+  （重叠/尺寸自检零命中）。截图脚本按 PID+窗口类枚举取最大可见窗，
+  `$pid` 是 PowerShell 保留自动变量，参数名不能叫 `$Pid`。
+- **客户端程序链接报 `cannot find -lssl/-lcrypto`**：普通链接（非
+  `--publish`）要求 TLS 导入库在搜索路径可达，报错不提示解法——设
+  `ZAN_LIB_PATH` 指向 stdlib 的 System/Security/Cryptography/drivers/
+  <plat>/（win 用 `;` 分隔，见 ZANC_CLI.md env 表）；运行期还要把
+  libssl-3-x64.dll/libcrypto-3-x64.dll 摆到 exe 旁。
 
 ## 四、经验沉淀纪律（skill 的准入标准）
 
