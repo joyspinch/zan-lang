@@ -23,9 +23,14 @@ namespace Gui.Component.WebView;
 ///
 /// 暴露常用浏览器功能：历史（Back/Forward/Reload/Stop）、
 /// URL 和标题监控（响应式 Url()/Title() 信号 + NavComplete）、
-/// 最近一次请求的 URL 和 HTTP 状态、JavaScript 求值（Eval 是
-/// 读取请求参数/响应体的通用后门）以及
-/// Cookie 访问（GetCookies/SetCookie/ClearCookies）。
+/// 最近一次请求的 URL 和 HTTP 状态、JavaScript 求值（Eval 同步取结果，
+/// EvalAsync 发射后不管）、JS↔native 消息桥（AddMessageHandler/
+/// TakeMessage，三端页面侧 API 同为 window.webkit.messageHandlers，
+/// Windows 由 shim 对齐）、每次导航的脚本/CSS 注入（InjectScript/
+/// InjectStyle）、整页缩放（SetZoom）、新窗口就地接管（window.open /
+/// target=_blank 不弹窗，落在本视图）、Cookie 与站点数据
+/// （GetCookies/SetCookie/ClearCookies/ClearBrowsingData）以及
+/// DevTools（OpenDevTools）。
 class WebView {
     int handle;        // 原生 webview 句柄（0 = 尚未创建/不支持）
     string profileId;  // 隔离配置文件："" = 共享默认存储，否则按账户隔离
@@ -221,8 +226,10 @@ class WebView {
 
     // ---- JS ↔ 原生 -------------------------------------------------------
 
-    /// 这个运行时上能不能收页面发来的消息（macOS 的 WKScriptMessageHandler；
-    /// 其他后端目前只有 Native→JS 的 <see cref="Eval"/>）。
+    /// <summary>这个运行时上能不能收页面发来的消息。三端同形：页面侧
+    /// 都是 window.webkit.messageHandlers.&lt;name&gt;.postMessage(x)
+    /// （Windows 由注入 shim 把 WebView2 的 window.chrome.webview 桥
+    /// 包装成同形），消息按 <see cref="TakeMessage"/> 逐条取。</summary>
     bool SupportsMessages() { return WebViewBackend.HasBridge(); }
 
     /// 让页面可以用
@@ -325,6 +332,22 @@ class WebView {
         if (supported && handle != 0) { WebViewBackend.ClearData(handle); }
     }
 
+    /// <summary>整页缩放，percent 为百分数（100 = 原大），立即生效；
+    /// 每次导航后保持。越界取 25..500。后端不支持时为空操作。</summary>
+    void SetZoom(int percent) {
+        if (!supported || handle == 0) { return; }
+        if (percent < 25) { percent = 25; }
+        if (percent > 500) { percent = 500; }
+        WebViewBackend.SetZoom(handle, percent);
+    }
+
+    /// <summary>为当前页打开浏览器 DevTools 窗口（调试用）。Windows
+    /// 直接弹出 DevTools 窗口；macOS 无程序化入口，创建时已启用
+    /// "Inspect Element"（右键菜单），因此此调用为空操作。</summary>
+    void OpenDevTools() {
+        if (supported && handle != 0) { WebViewBackend.OpenDevTools(handle); }
+    }
+
     /// 隐藏原生视图（对不在屏幕上的标签/面板调用）。
     void Hide() {
         if (created && supported && handle != 0) {
@@ -367,6 +390,11 @@ class WebView {
         // PresentFrame 在所有自绘 UI 之后算出未被遮挡的区域再下发
         // （完全被盖住时隐藏）。
         NativeLayer.Register(app, handle, x, y, w, h, WebViewBackend.ApplyClip);
+
+        // 上一帧被接管的新窗口请求（window.open / target=_blank）就地
+        // 落地为本视图导航——与 macOS 后端"同视图加载"策略一致。
+        string pendingNav = WebViewBackend.DrainWindowNav(handle);
+        if (pendingNav != "") { WebViewBackend.Navigate(handle, pendingNav); }
 
         bool dirty = false;
         string request = WebViewBackend.LastRequest(handle);

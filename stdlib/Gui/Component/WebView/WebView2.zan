@@ -15,6 +15,9 @@ delegate int WvRefFn(nint self);
 /// CreateCoreWebView2EnvironmentWithOptions，加载器唯一的扁平导出。
 delegate int WvCreateEnvFn(nint browserFolder, nint userDataFolder,
                            nint options, nint handler);
+/// ICoreWebView2Controller::put_ZoomFactor：双精度缩放系数按值传递
+/// （x64 ABI 走 xmm 寄存器，不能用指针型委托代替）。
+delegate int WvPutZoomFn(nint self, double zoom);
 
 /// <summary>
 /// Edge WebView2，由 Zan 直接驱动。
@@ -74,6 +77,8 @@ class WebView2 {
     long navToken;
     long startToken;
     long srcToken;
+    long msgToken;
+    long winToken;
     int navSeq;
     int lastStatus;
     bool loading;
@@ -82,6 +87,21 @@ class WebView2 {
     string lastRequest;
     string evalResult;
     string cookieResult;
+    // JS→native 消息桥：页面 postMessage 进入有界队列，宿主逐帧取走。
+    // handlerNames/shimIds 平行——每个通道一条 window.webkit shim 注入脚本，
+    // 记录其脚本 id 以便撤通道时一并移除。
+    List<string> msgQ;
+    int msgDrops;
+    List<string> handlerNames;
+    List<string> shimIds;
+    // InjectScript/InjectStyle 注册的文档级脚本 id（ClearInjected 撤用）。
+    List<string> scriptIds;
+    string pendingScriptId;
+    // 新窗口请求的就地加载目标：事件回调里不导航（避免在回调内重入），
+    // 记下目标由下一帧的轮询消费。
+    string pendingWindowNav;
+    nint msgSink;
+    nint winSink;
     PumpGate gate;
     // 最近下发的位置/裁剪/可见性。put_Bounds 与 SetWindowRgn 每帧
     // 重复下发既浪费又会让网页闪烁，因此只在真的变化时才调用。
@@ -175,6 +195,53 @@ class WebView2 {
     /// 槽 3：get_Uri，读取本次导航的目标 URI。
     static int SlotArgsUri() { return 3; }
 
+    /// ICoreWebView2 的 vtable 槽（27..51 一段，官方 WebView2.h 实数）。
+    /// 槽 27：AddScriptToExecuteOnDocumentCreated，注册每次导航（文档任何
+    /// 脚本之前）执行的脚本，完成回调回传脚本 id。
+    static int SlotAddDocScript() { return 27; }
+    /// 槽 28：RemoveScriptToExecuteOnDocumentCreated，按 id 撤掉注入脚本。
+    static int SlotRemoveDocScript() { return 28; }
+    /// 槽 34：add_WebMessageReceived，订阅页面 window.chrome.webview
+    /// .postMessage 事件。
+    static int SlotAddWebMessage() { return 34; }
+    /// 槽 35：remove_WebMessageReceived，按令牌退订页面消息事件。
+    static int SlotRemoveWebMessage() { return 35; }
+    /// 槽 44：add_NewWindowRequested，订阅新开窗口/ target=_blank 请求。
+    static int SlotAddNewWindow() { return 44; }
+    /// 槽 45：remove_NewWindowRequested，按令牌退订新开窗口事件。
+    static int SlotRemoveNewWindow() { return 45; }
+    /// 槽 51：OpenDevToolsWindow，为当前页打开 DevTools 窗口。
+    static int SlotOpenDevTools() { return 51; }
+
+    /// ICoreWebView2Controller 的 vtable 槽。
+    /// 槽 8：put_ZoomFactor，整页缩放（1.0 = 100%）。
+    static int SlotPutZoomFactor() { return 8; }
+
+    /// ICoreWebView2WebMessageReceivedEventArgs 的 vtable 槽。
+    /// 槽 5：TryGetWebMessageAsString，取消息正文（字符串原文或 JSON）。
+    static int SlotTryGetWebMessage() { return 5; }
+    /// ICoreWebView2NewWindowRequestedEventArgs 的 vtable 槽。
+    /// 槽 3：get_Uri，读取新窗口要加载的目标 URI。
+    static int SlotNewWinUri() { return 3; }
+    /// 槽 6：put_Handled，声明宿主已接管新窗口请求（阻止弹原生窗口）。
+    static int SlotNewWinHandled() { return 6; }
+
+    /// ICoreWebView2_13 的 IID，取 ICoreWebView2Profile 时用。
+    static string IidWebView2_13() {
+        return "F75F09A8-667E-4983-88D6-C8773F315E84";
+    }
+    /// ICoreWebView2_13 的 vtable 槽 3：get_Profile。
+    static int SlotGetProfile() { return 3; }
+    /// ICoreWebView2Profile2 的 IID，取 ClearBrowsingData 时用。
+    static string IidProfile2() {
+        return "FA740D4B-5EAE-4344-A8AD-74BE31925397";
+    }
+    /// ICoreWebView2Profile2 的 vtable 槽 3：ClearBrowsingData(kinds, handler)。
+    static int SlotClearBrowsingData() { return 3; }
+    /// COREWEBVIEW2_BROWSING_DATA_KINDS_ALL_SITE：Cookie、各类 DOM 存储、
+    /// 磁盘缓存与 Service Worker（"退出登录并忘记我"的取值）。
+    static int DataKindsAllSite() { return 0x80; }
+
     /// 全部存活视图的静态表（惰性创建；下标 0 对应句柄 1）。
     static List<WebView2> All() {
         if (WebView2.views == null) { WebView2.views = new List<WebView2>(); }
@@ -229,6 +296,13 @@ class WebView2 {
         w.lastRequest = "";
         w.evalResult = "";
         w.cookieResult = "";
+        w.msgQ = new List<string>();
+        w.msgDrops = 0;
+        w.handlerNames = new List<string>();
+        w.shimIds = new List<string>();
+        w.scriptIds = new List<string>();
+        w.pendingScriptId = "";
+        w.pendingWindowNav = "";
         w.gate = new PumpGate();
 
         List<WebView2> all = WebView2.All();
@@ -301,6 +375,10 @@ class WebView2 {
         startToken = this.Subscribe(WebView2.SlotAddNavigationStarting(), startSink);
         srcSink = this.Sink((nint)WebView2.OnSourceChanged);
         srcToken = this.Subscribe(WebView2.SlotAddSourceChanged(), srcSink);
+        msgSink = this.Sink((nint)WebView2.OnWebMessageReceived);
+        msgToken = this.Subscribe(WebView2.SlotAddWebMessage(), msgSink);
+        winSink = this.Sink((nint)WebView2.OnNewWindowRequested);
+        winToken = this.Subscribe(WebView2.SlotAddNewWindow(), winSink);
 
         // 以隐藏和空白状态启动；控件每帧从其所占区域
         // 驱动边界和可见性。
@@ -440,7 +518,45 @@ class WebView2 {
         return 0;
     }
 
+    /// 页面消息回调（COM）：window.chrome.webview.postMessage 的正文
+    /// （shim 已带 "通道名\t正文" 前缀）进有界队列，宿主逐帧取走。
+    static int OnWebMessageReceived(nint self, nint sender, nint args) {
+        WebView2 w = WebView2.Get(ComVtbl.State(self));
+        if (w == null) { return 0; }
+        if (args != 0) {
+            string line = Com.GetString(args, WebView2.SlotTryGetWebMessage());
+            if (line != "") { w.PushMessage(line); }
+        }
+        return 0;
+    }
+
+    /// 新窗口请求回调（COM）：与 macOS 后端同策略——接管请求、在本视图
+    /// 就地加载目标地址，不弹原生窗口。回调里只记目标，导航由下一帧的
+    /// 轮询消费（避免在事件回调内重入导航）。
+    static int OnNewWindowRequested(nint self, nint sender, nint args) {
+        WebView2 w = WebView2.Get(ComVtbl.State(self));
+        if (w == null) { return 0; }
+        if (args != 0) {
+            string uri = Com.GetString(args, WebView2.SlotNewWinUri());
+            Com.Call1(args, WebView2.SlotNewWinHandled(), (nint)1);
+            if (uri != "") { w.pendingWindowNav = uri; }
+        }
+        return 0;
+    }
+
+    /// AddScriptToExecuteOnDocumentCreated 完成回调（COM）：记下脚本 id
+    /// （Remove 用），唤醒 gate。id 串归引擎所有、回调返回后失效，只读
+    /// 不释放——按 CoTaskMemFree 释放会触发堆损坏（实测）。
+    static int OnDocScriptAdded(nint self, int hr, nint id) {
+        WebView2 w = WebView2.Get(ComVtbl.State(self));
+        if (w == null) { return 0; }
+        if (Com.Ok(hr)) { w.pendingScriptId = Wide.Read(id); }
+        w.gate.Signal();
+        return 0;
+    }
+
     /// Eval 完成回调（COM）：成功则记下 JSON 结果，唤醒 Eval 的 gate。
+    /// 结果串归引擎所有（见 OnDocScriptAdded 注），不能释放。
     static int OnScriptCompleted(nint self, int hr, nint json) {
         WebView2 w = WebView2.Get(ComVtbl.State(self));
         if (w == null) { return 0; }
@@ -450,11 +566,14 @@ class WebView2 {
     }
 
     /// GetCookies 完成回调（COM）：序列化 Cookie 列表到 cookieResult，
-    /// 唤醒 gate。
+    /// 唤醒 gate。list 与完成回调的其他参数一样归引擎所有，不得
+    /// Release（过释放会让后续 COM 调用在 STA 里挂死，实测）。
     static int OnCookiesCompleted(nint self, int hr, nint list) {
         WebView2 w = WebView2.Get(ComVtbl.State(self));
         if (w == null) { return 0; }
-        if (Com.Ok(hr) && list != 0) { w.cookieResult = WebView2.Serialize(list); }
+        if (Com.Ok(hr) && list != 0) {
+            w.cookieResult = WebView2.Serialize(list);
+        }
         w.gate.Signal();
         return 0;
     }
@@ -652,6 +771,229 @@ class WebView2 {
         return evalResult;
     }
 
+    /// 共享的空结果完成处理器：EvalAsync/ClearBrowsingData 等不需要
+    /// 返回值的异步调用共用一个（无状态，随进程存活，不逐调用分配）。
+    static nint voidSink;
+    static nint VoidSink() {
+        if (WebView2.voidSink == 0) {
+            ComVtbl v = ComVtbl.Create(4);
+            v.Add((nint)WebView2.OnQueryInterface);
+            v.Add((nint)WebView2.OnAddRef);
+            v.Add((nint)WebView2.OnRelease);
+            v.Add((nint)WebView2.OnVoidCompleted);
+            WebView2.voidSink = v.Build();
+        }
+        return WebView2.voidSink;
+    }
+
+    /// 空结果回调（COM）：结果串归引擎所有（见 OnDocScriptAdded 注），
+    /// 不释放、无状态。
+    static int OnVoidCompleted(nint self, int hr, nint json) {
+        return 0;
+    }
+
+    /// 发射后不管的 Native→JS：不泵消息等返回值，绘制/事件回调里也
+    /// 能安全调用。
+    void EvalAsync(string js) {
+        if (core == 0 || js == "") { return; }
+        nint script = Wide.Of(js);
+        Com.Call2(core, WebView2.SlotExecuteScript(), script, WebView2.VoidSink());
+        Wide.Free(script);
+    }
+
+    // ---- JS→native 消息桥 ---------------------------------------------
+    //
+    // 页面侧 API 与 macOS 对齐：window.webkit.messageHandlers.<name>
+    // .postMessage(x)。WebView2 的原生通道是 window.chrome.webview，因此
+    // 每注册一个通道就注入一条 shim 脚本做形变；消息正文带 "名\t正文"
+    // 前缀入队，TakeMessage 逐条取走。
+
+    /// 注册消息通道（原生视图创建前后皆可调用；创建前由 WebView 控件
+    /// 挂起，创建时补上）。同一通道重复注册为幂等成功。
+    bool AddHandler(string name) {
+        if (core == 0 || name == "") { return false; }
+        if (handlerNames.IndexOf(name) >= 0) { return true; }
+        string id = this.AddDocScript(WebView2.ShimScript(name));
+        if (id == "") { return false; }
+        handlerNames.Add(name);
+        shimIds.Add(id);
+        return true;
+    }
+
+    /// 撤掉消息通道：移除 shim 脚本（对之后的页面生效），名字出活跃表
+    /// （当前页残留的 shim 再 postMessage 也会被名字检查挡下）。
+    void RemoveHandler(string name) {
+        int i = handlerNames.IndexOf(name);
+        if (i < 0) { return; }
+        string id = shimIds[i];
+        handlerNames.RemoveAt(i);
+        shimIds.RemoveAt(i);
+        if (core != 0 && id != "") {
+            nint sid = Wide.Of(id);
+            Com.Call1(core, WebView2.SlotRemoveDocScript(), sid);
+            Wide.Free(sid);
+        }
+    }
+
+    void PushMessage(string line) {
+        if (msgQ == null) { msgQ = new List<string>(); }
+        if (msgQ.Count >= 128) {
+            msgQ.RemoveAt(0);
+            msgDrops = msgDrops + 1;
+        }
+        msgQ.Add(line);
+    }
+
+    string TakeMessage() {
+        if (msgQ == null || msgQ.Count == 0) { return ""; }
+        string m = msgQ[0];
+        msgQ.RemoveAt(0);
+        return m;
+    }
+
+    int PendingMessages() {
+        return msgQ == null ? 0 : msgQ.Count;
+    }
+
+    int DroppedMessages() { return msgDrops; }
+
+    // ---- 文档级脚本/CSS 注入 -------------------------------------------
+
+    /// AddScriptToExecuteOnDocumentCreated 的一次调用：返回完成回调回传的
+    /// 脚本 id（Remove 用），失败为 ""。
+    string AddDocScript(string js) {
+        if (core == 0 || js == "") { return ""; }
+        nint sink = this.Sink((nint)WebView2.OnDocScriptAdded);
+        nint code = Wide.Of(js);
+        pendingScriptId = "";
+        gate.Reset();
+        int hr = Com.Call2(core, WebView2.SlotAddDocScript(), code, sink);
+        Wide.Free(code);
+        if (Com.Ok(hr)) { Pump.Until(gate, 5000); }
+        return pendingScriptId;
+    }
+
+    /// 每次导航都注入的脚本：atEnd=true 包一层 readyState 门，文档解析完
+    /// 再跑（WebView2 只有"任何脚本之前"一档，document-end 语义由此
+    /// 仿真；脚本包在闭包里，页面可见的全局需显式挂到 window 上）。
+    bool InjectScript(string js, bool atEnd) {
+        if (js == "") { return false; }
+        string id = this.AddDocScript(atEnd ? WebView2.DeferToDomReady(js)
+                                            : js);
+        if (id == "") { return false; }
+        scriptIds.Add(id);
+        return true;
+    }
+
+    /// 每次导航都注入的 CSS：包成 <style> 追加脚本（与 macOS 后端同构）。
+    bool InjectStyle(string css) {
+        if (css == "") { return false; }
+        string js = "(function(){var s=document.createElement('style');"
+                  + "s.textContent=" + WebView2.JsQuote(css) + ";"
+                  + "(document.head||document.documentElement)"
+                  + ".appendChild(s);})();";
+        return this.InjectScript(js, true);
+    }
+
+    /// 撤掉全部 InjectScript/InjectStyle 注入（消息桥 shim 不受影响，
+    /// 与 macOS 的 removeAllUserScripts 语义一致）。
+    void ClearScripts() {
+        if (scriptIds == null) { return; }
+        for (int i = 0; i < scriptIds.Count; i = i + 1) {
+            string id = scriptIds[i];
+            if (id == "") { continue; }
+            nint sid = Wide.Of(id);
+            Com.Call1(core, WebView2.SlotRemoveDocScript(), sid);
+            Wide.Free(sid);
+        }
+        scriptIds = new List<string>();
+    }
+
+    /// JS 字符串字面量（带双引号）：转义反斜杠、引号与控制字符，防注入
+    /// 进的文本破坏脚本结构。
+    static string JsQuote(string s) {
+        char bs = (char)92;
+        char q = (char)34;
+        char nl = (char)10;
+        char cr = (char)13;
+        char tab = (char)9;
+        string outp = "" + q;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            char ch = s[i];
+            if (ch == bs) { outp = outp + "" + bs + bs; }
+            else if (ch == q) { outp = outp + "" + bs + q; }
+            else if (ch == nl) { outp = outp + "" + bs + "n"; }
+            else if (ch == cr) { outp = outp + "" + bs + "r"; }
+            else if (ch == tab) { outp = outp + "" + bs + "t"; }
+            else { outp = outp + s.Substring(i, 1); }
+        }
+        return outp + q;
+    }
+
+    /// <name> 通道的 shim：把 WebView2 的 window.chrome.webview 桥包装成
+    /// 与 macOS 同形的 window.webkit.messageHandlers.<name>.postMessage。
+    /// 字符串原样传递，其他类型 JSON 序列化，两端正文语义一致。
+    static string ShimScript(string name) {
+        char tab = (char)9;
+        string q = WebView2.JsQuote(name);
+        return "(function(){var w=window.webkit=window.webkit||{};"
+             + "var m=w.messageHandlers=w.messageHandlers||{};"
+             + "m[" + q + "]={postMessage:function(x){"
+             + "try{window.chrome.webview.postMessage(" + q
+             + "+" + WebView2.JsQuote("" + tab)
+             + "+(typeof x==='string'?x:JSON.stringify(x)));}catch(e){}}};})();";
+    }
+
+    /// document-end 语义仿真：解析未完挂 DOMContentLoaded，否则立即执行。
+    static string DeferToDomReady(string js) {
+        return "(function(){var f=function(){" + js + "};"
+             + "if(document.readyState==='loading'){"
+             + "document.addEventListener('DOMContentLoaded',f);}else{f();}})();";
+    }
+
+    // ---- 缩放 / DevTools / 站点数据 ------------------------------------
+
+    /// 整页缩放，percent 为百分数（100 = 原大）。旧运行时缺 ZoomFactor
+    /// 的情形不需处理：槽位自首个公开版即存在。
+    void SetZoom(int percent) {
+        if (ctrl == 0 || percent <= 0) { return; }
+        WvPutZoomFn put = (WvPutZoomFn)Com.Slot(ctrl,
+                                                WebView2.SlotPutZoomFactor());
+        if (put != null) { put(ctrl, percent / 100.0); }
+    }
+
+    /// 为当前页打开 DevTools 窗口（发布给最终用户的程序不必携带）。
+    void OpenDevTools() {
+        if (core != 0) { Com.Call0(core, WebView2.SlotOpenDevTools()); }
+    }
+
+    /// 清掉本视图数据仓的全部网站数据（Cookie、DOM 存储、缓存、
+    /// Service Worker）。需要较新的运行时（ICoreWebView2Profile2）；
+    /// 不可用时返回 false，调用方退化为只清 Cookie。
+    bool ClearBrowsingData() {
+        if (core == 0) { return false; }
+        nint c13 = Com.Query(core, WebView2.IidWebView2_13());
+        if (c13 == 0) { return false; }
+        nint profile = Com.Get(c13, WebView2.SlotGetProfile());
+        Com.Release(c13);
+        if (profile == 0) { return false; }
+        nint p2 = Com.Query(profile, WebView2.IidProfile2());
+        Com.Release(profile);
+        if (p2 == 0) { return false; }
+        int hr = Com.Call2(p2, WebView2.SlotClearBrowsingData(),
+                           (nint)WebView2.DataKindsAllSite(), WebView2.VoidSink());
+        Com.Release(p2);
+        return Com.Ok(hr);
+    }
+
+    /// 取走上一帧新窗口请求记下的就地加载目标（无则为 ""）。由每帧的
+    /// 轮询调用，把 window.open/target=_blank 落到本视图导航。
+    string DrainWindowNav() {
+        string uri = pendingWindowNav;
+        pendingWindowNav = "";
+        return uri;
+    }
+
     /// ICoreWebView2_2 带有 Cookie 管理器；较旧的运行时
     /// 则不产生任何 Cookie。
     nint Cookies() {
@@ -746,6 +1088,8 @@ class WebView2 {
             this.Unsubscribe(WebView2.SlotRemoveNavigationCompleted(), navToken);
             this.Unsubscribe(WebView2.SlotRemoveNavigationStarting(), startToken);
             this.Unsubscribe(WebView2.SlotRemoveSourceChanged(), srcToken);
+            this.Unsubscribe(WebView2.SlotRemoveWebMessage(), msgToken);
+            this.Unsubscribe(WebView2.SlotRemoveNewWindow(), winToken);
             Com.Release(core);
             core = 0;
         }

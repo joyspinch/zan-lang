@@ -41,6 +41,22 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
 - **UI 驱动用合成事件，不用真实 OS 点击**：driver 的 `clickid` 在点击时刻
   解析命中区中心并注入，天然免疫窗口框偏移；hit id 只在**同一次构建的
   同一次运行内**有效（控件增删会整体移位），点击前当场 dump。
+- **PowerShell 合成点击四连坑（PrintWindow 抓窗 + mouse_event 注入流）**：
+  ① 进程必须先 `SetProcessDpiAwarenessContext(-4)`——DPI 不感知时
+  `GetWindowRect`/`SetCursorPos` 全在虚拟化坐标系，注入点整体漂 1.5 倍；
+  ② 前台锁下 `SetForegroundWindow` 会被拒，点击会落进盖在上面的别的应用
+  （浏览器等），须 `SetWindowPos` TOPMOST 再 NOTOPMOST 置顶回合；已最大化的
+  窗口别再 restore/maximize 折腾——`SW_RESTORE`→`SW_MAXIMIZE` 与
+  `GetWindowRect` 的竞态会读到中间态矩形，坐标全体错位；③ 抓像素用
+  `PrintWindow(PW_RENDERFULLCONTENT)`，`CopyFromScreen` 抓的是屏幕合成，
+  输给前台竞争就是别人的壁纸/别的应用；④ 含中文注释的 ps1 若是 UTF-8 无 BOM
+  + LF，PowerShell 5.1 按 GBK 读，行尾汉字的尾字节会把换行吞进注释、把
+  下一行代码并进注释——报"意外的 }"，注释行尾保持 ASCII 或存成带 BOM/CRLF。
+- **无头/脚本驱动 Zan GUI 程序，帧循环要自唤醒**：`app.ProcessEvent()`
+  在消息队列空时会阻塞等消息——WebView2 创建完、页面稳定后没人发消息，
+  帧循环就停在那里（窗口"未挂起"、消息循环活着，但帧计数器不走，
+  超时断言永远不触发）。探针每帧末尾调一次 `app.RequestRedraw()` 保持
+  状态机推进，否则看起来像"卡死在某一帧"，实际是没消息可等。
 - **并发会话共用一块屏幕时，点击验证必须在同一次调用内闭环**：
   多个自动化会话都把 TOPMOST 窗口摆同一坐标（如 40,40），别人的合成
   点击会落在自己的窗口上——表现为"没人操作，日志里却在切页签/按按钮"，

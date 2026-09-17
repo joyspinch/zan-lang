@@ -25,9 +25,14 @@ web.Hide();
 
 暴露常用浏览器功能：历史（Back/Forward/Reload/Stop）、
 URL 和标题监控（响应式 Url()/Title() 信号 + NavComplete）、
-最近一次请求的 URL 和 HTTP 状态、JavaScript 求值（Eval 是
-读取请求参数/响应体的通用后门）以及
-Cookie 访问（GetCookies/SetCookie/ClearCookies）。
+最近一次请求的 URL 和 HTTP 状态、JavaScript 求值（Eval 同步取结果，
+EvalAsync 发射后不管）、JS↔native 消息桥（AddMessageHandler/
+TakeMessage，三端页面侧 API 同为 window.webkit.messageHandlers，
+Windows 由 shim 对齐）、每次导航的脚本/CSS 注入（InjectScript/
+InjectStyle）、整页缩放（SetZoom）、新窗口就地接管（window.open /
+target=_blank 不弹窗，落在本视图）、Cookie 与站点数据
+（GetCookies/SetCookie/ClearCookies/ClearBrowsingData）以及
+DevTools（OpenDevTools）。
 
 - int handle;
 
@@ -156,8 +161,10 @@ Cookie 访问（GetCookies/SetCookie/ClearCookies）。
     从页面获取的响应体。
 
 - bool SupportsMessages()
-  - 这个运行时上能不能收页面发来的消息（macOS 的 WKScriptMessageHandler；
-    其他后端目前只有 Native→JS 的 `Eval`）。
+  - 这个运行时上能不能收页面发来的消息。三端同形：页面侧都是
+    window.webkit.messageHandlers.<name>.postMessage(x)（Windows 由注入
+    shim 把 WebView2 的 window.chrome.webview 桥包装成同形），消息按
+    `TakeMessage` 逐条取。
 
 - void AddMessageHandler(string handlerName)
   - 让页面可以用
@@ -205,8 +212,17 @@ Cookie 访问（GetCookies/SetCookie/ClearCookies）。
 
 - void ClearBrowsingData()
   - 清掉这个配置文件的全部网站数据：Cookie、缓存、localStorage、
-    IndexedDB…（“退出登录并忘记我”）。运行时只支持 Cookie 时退化为
-    `ClearCookies`。
+    IndexedDB…（“退出登录并忘记我”）。Windows 运行时带 Profile2 接口
+    时走 ClearBrowsingData(ALL_SITE)，否则退化为 `ClearCookies`。
+
+- void SetZoom(int percent)
+  - 整页缩放，percent 为百分数（100 = 原大），立即生效；每次导航后
+    保持。越界取 25..500。后端不支持时为空操作。
+
+- void OpenDevTools()
+  - 为当前页打开浏览器 DevTools 窗口（调试用）。Windows 直接弹出
+    DevTools 窗口；macOS 无程序化入口，创建时已启用 "Inspect
+    Element"（右键菜单），因此此调用为空操作。
 
 - void Hide()
   - 隐藏原生视图（对不在屏幕上的标签/面板调用）。

@@ -1536,6 +1536,11 @@ EXPORT i32 zan_gui_webview_create(iptr hwnd_val, const char *profile_id) {
     if (slot < 0) return 0;
     @autoreleasepool {
         WKWebViewConfiguration *cfg = [[WKWebViewConfiguration alloc] init];
+        /* Enable the context-menu "Inspect Element" so embedded pages can be
+         * debugged from within the app (the Windows peer opens DevTools
+         * programmatically via ICoreWebView2::OpenDevToolsWindow; WebKit has
+         * no programmatic opener). KVC because older SDKs lack the property. */
+        [cfg.preferences setValue:@YES forKey:@"developerExtrasEnabled"];
         WKWebsiteDataStore *ds = wv_store_for_profile(profile_id);
         if (ds) cfg.websiteDataStore = ds;
         WKWebView *wv = [[WKWebView alloc] initWithFrame:NSMakeRect(0, 0, 100, 100)
@@ -2044,6 +2049,17 @@ EXPORT void zan_gui_webview_clear_data(i32 h) {
                 modifiedSince:[NSDate dateWithTimeIntervalSince1970:0]
             completionHandler:^{ done = YES; }];
         wv_spin(&done, 5.0);
+    }
+}
+
+/* Whole-page zoom as a percentage (100 = actual size). Like the Windows peer's
+ * put_ZoomFactor, the level survives navigations. WKWebView.pageZoom needs
+ * macOS 10.14+; resolved at runtime so older deployment targets no-op. */
+EXPORT void zan_gui_webview_set_zoom(i32 h, i32 percent) {
+    WKWebView *wv = wv_get(h);
+    if (!wv || percent <= 0) return;
+    if ([wv respondsToSelector:@selector(setPageZoom:)]) {
+        [wv setPageZoom:(CGFloat)percent / 100.0];
     }
 }
 

@@ -373,6 +373,7 @@ class WebViewBackend {
     static nint addr_evalAsync = 0;
     static nint addr_clearData = 0;
     static nint addr_setClip = 0;
+    static nint addr_setZoom = 0;
 
     /// 解析 zan_gui 里可选的 WKWebView 桥接入口。zan_gui 已被主程序加载，
     /// dlopen 只是拿到同一个镜像的句柄：先按可执行文件同目录找（发布包把
@@ -423,13 +424,18 @@ class WebViewBackend {
             Interop.Symbol(m, "zan_gui_webview_clear_data");
         WebViewBackend.addr_setClip =
             Interop.Symbol(m, "zan_gui_webview_set_clip");
+        WebViewBackend.addr_setZoom =
+            Interop.Symbol(m, "zan_gui_webview_set_zoom");
     }
     #endif
 
-    /// <summary>当前平台/运行时是否支持 JS→原生 的消息桥。仅 macOS
-    /// 运行时带桥接入口时为 true；Windows 走 WebView2 自身通道。</summary>
+    /// <summary>当前平台/运行时是否支持 JS→native 的消息桥。Windows 走
+    /// WebView2 的 WebMessageReceived（shim 对齐 window.webkit 语义）；
+    /// macOS/Android 由 zan_gui 运行时提供桥接入口时为 true。</summary>
     static bool HasBridge() {
-        #if MACOS || ANDROID
+        #if WINDOWS
+        return true;
+        #elif MACOS || ANDROID
         WebViewBackend.ResolveBridge();
         return WebViewBackend.addr_addHandler != 0
             && WebViewBackend.addr_takeMessage != 0;
@@ -439,10 +445,13 @@ class WebViewBackend {
     }
 
     /// <summary>注册 window.webkit.messageHandlers.<name> 消息通道；
-    /// 页面 postMessage 的内容随后用 TakeMessage 逐条取。运行时不
-    /// 支持时返回 false。</summary>
+    /// 页面 postMessage 的内容随后用 TakeMessage 逐条取。运行时
+    /// 不支持时返回 false。</summary>
     static bool AddHandler(int h, string handlerName) {
-        #if MACOS || ANDROID
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        return w != null && w.AddHandler(handlerName);
+        #elif MACOS || ANDROID
         WebViewBackend.ResolveBridge();
         if (WebViewBackend.addr_addHandler == 0) { return false; }
         WvNameFn f = (WvNameFn)WebViewBackend.addr_addHandler;
@@ -454,7 +463,10 @@ class WebViewBackend {
 
     /// 撤掉 AddHandler 注册的消息通道；不支持时为空操作。
     static void RemoveHandler(int h, string handlerName) {
-        #if MACOS || ANDROID
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        if (w != null) { w.RemoveHandler(handlerName); }
+        #elif MACOS || ANDROID
         WebViewBackend.ResolveBridge();
         if (WebViewBackend.addr_removeHandler == 0) { return; }
         WvNameVoidFn f = (WvNameVoidFn)WebViewBackend.addr_removeHandler;
@@ -464,7 +476,10 @@ class WebViewBackend {
 
     /// 队列里最早的一条消息，格式 "<handler>\t<body>"；空队列为 ""。
     static string TakeMessage(int h) {
-        #if MACOS || ANDROID
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        return w == null ? "" : w.TakeMessage();
+        #elif MACOS || ANDROID
         WebViewBackend.ResolveBridge();
         if (WebViewBackend.addr_takeMessage == 0) { return ""; }
         WvStrIntFn f = (WvStrIntFn)WebViewBackend.addr_takeMessage;
@@ -476,7 +491,10 @@ class WebViewBackend {
 
     /// 消息队列里还没取走的条数（不支持为 0）。
     static int PendingMessages(int h) {
-        #if MACOS || ANDROID
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        return w == null ? 0 : w.PendingMessages();
+        #elif MACOS || ANDROID
         WebViewBackend.ResolveBridge();
         if (WebViewBackend.addr_msgPending == 0) { return 0; }
         WvIntIntFn f = (WvIntIntFn)WebViewBackend.addr_msgPending;
@@ -488,7 +506,10 @@ class WebViewBackend {
 
     /// 因队列满而被丢掉的消息数（宿主没及时取走）。
     static int DroppedMessages(int h) {
-        #if MACOS || ANDROID
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        return w == null ? 0 : w.DroppedMessages();
+        #elif MACOS || ANDROID
         WebViewBackend.ResolveBridge();
         if (WebViewBackend.addr_msgDropped == 0) { return 0; }
         WvIntIntFn f = (WvIntIntFn)WebViewBackend.addr_msgDropped;
@@ -502,7 +523,10 @@ class WebViewBackend {
     /// 文档解析完后跑（DOM 就绪），false 在文档开始前跑。注册失败
     /// （含运行时不支持）返回 false。</summary>
     static bool AddScript(int h, string js, bool atEnd) {
-        #if MACOS || ANDROID
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        return w != null && w.InjectScript(js, atEnd);
+        #elif MACOS || ANDROID
         WebViewBackend.ResolveBridge();
         if (WebViewBackend.addr_addScript == 0) { return false; }
         WvScriptFn f = (WvScriptFn)WebViewBackend.addr_addScript;
@@ -517,7 +541,10 @@ class WebViewBackend {
     /// 为当前页注入一段 CSS（每次导航后仍生效）；注册失败（含运行时
     /// 不支持）返回 false。
     static bool AddStyle(int h, string css) {
-        #if MACOS || ANDROID
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        return w != null && w.InjectStyle(css);
+        #elif MACOS || ANDROID
         WebViewBackend.ResolveBridge();
         if (WebViewBackend.addr_addStyle == 0) { return false; }
         WvNameFn f = (WvNameFn)WebViewBackend.addr_addStyle;
@@ -529,7 +556,10 @@ class WebViewBackend {
 
     /// 撤掉全部注入脚本与样式；不支持时为空操作。
     static void RemoveScripts(int h) {
-        #if MACOS || ANDROID
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        if (w != null) { w.ClearScripts(); }
+        #elif MACOS || ANDROID
         WebViewBackend.ResolveBridge();
         if (WebViewBackend.addr_removeScripts == 0) { return; }
         WvVoidIntFn f = (WvVoidIntFn)WebViewBackend.addr_removeScripts;
@@ -537,10 +567,14 @@ class WebViewBackend {
         #endif
     }
 
-    /// <summary>不等待结果的 Native→JS 调用（Eval 会自旋 runloop 等
-    /// 返回值）；运行时没有这个入口时退回同步 Eval。</summary>
+    /// <summary>不等待结果的 Native→JS 调用（Eval 会泵消息等
+    /// 返回值，从绘制/事件回调里调不合适）；运行时没有这个入口时
+    /// 退回同步 Eval。</summary>
     static void EvalAsync(int h, string js) {
-        #if MACOS || ANDROID
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        if (w != null) { w.EvalAsync(js); return; }
+        #elif MACOS || ANDROID
         WebViewBackend.ResolveBridge();
         if (WebViewBackend.addr_evalAsync != 0) {
             WvNameVoidFn f = (WvNameVoidFn)WebViewBackend.addr_evalAsync;
@@ -552,9 +586,14 @@ class WebViewBackend {
     }
 
     /// <summary>清掉该视图数据仓的全部网站数据（Cookie、缓存、
-    /// localStorage…）；运行时不支持时退化为只清 Cookie。</summary>
+    /// localStorage…）。Windows 上运行时带 Profile2 接口时走
+    /// ClearBrowsingData(ALL_SITE)，否则退化为只清 Cookie；macOS/Android
+    /// 运行时不支持时同样退化。</summary>
     static void ClearData(int h) {
-        #if MACOS || ANDROID
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        if (w != null && w.ClearBrowsingData()) { return; }
+        #elif MACOS || ANDROID
         WebViewBackend.ResolveBridge();
         if (WebViewBackend.addr_clearData != 0) {
             WvVoidIntFn f = (WvVoidIntFn)WebViewBackend.addr_clearData;
@@ -564,6 +603,44 @@ class WebViewBackend {
         #endif
         WebViewBackend.ClearCookies(h);
     }
+
+    /// <summary>整页缩放，percent 为百分数（100 = 原大）。macOS/Android
+    /// 需运行时带 set_zoom 入口（旧库没有时为空操作）。</summary>
+    static void SetZoom(int h, int percent) {
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        if (w != null) { w.SetZoom(percent); }
+        #elif MACOS || ANDROID
+        WebViewBackend.ResolveBridge();
+        if (WebViewBackend.addr_setZoom == 0) { return; }
+        WvZoomIntFn f = (WvZoomIntFn)WebViewBackend.addr_setZoom;
+        f(h, percent);
+        #endif
+    }
+
+    /// <summary>为当前页打开 DevTools。Windows 直接开窗口；macOS 由
+    /// 创建时的 developerExtrasEnabled 支持右键检查，无程序化入口，
+    /// 因而为空操作。</summary>
+    static void OpenDevTools(int h) {
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        if (w != null) { w.OpenDevTools(); }
+        #endif
+    }
+
+    /// <summary>取走上一帧记下的新窗口就地加载目标（无则为 ""）。每帧
+    /// 由 Render 轮询：window.open/target=_blank 被接管后在下一帧落到
+    /// 本视图导航，避免在事件回调内重入导航。</summary>
+    static string DrainWindowNav(int h) {
+        #if WINDOWS
+        WebView2 w = WebView2.Get(h);
+        return w == null ? "" : w.DrainWindowNav();
+        #elif MACOS || ANDROID
+        return "";
+        #else
+        return "";
+        #endif
+    }
 }
 
 delegate int WvNameFn(int h, string name);
@@ -572,3 +649,4 @@ delegate string WvStrIntFn(int h);
 delegate int WvIntIntFn(int h);
 delegate void WvVoidIntFn(int h);
 delegate int WvScriptFn(int h, string js, int atEnd);
+delegate void WvZoomIntFn(int h, int percent);

@@ -8,6 +8,22 @@ using Gui;
 delegate int TwoArgFn(nint self, nint a);
 
 class Program {
+    static int fails;
+
+    static void Eq(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": "
+            + Convert.ToString(got) + " != " + Convert.ToString(want));
+    }
+
+    static void EqS(string what, string got, string want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": '" + got
+            + "' != '" + want + "'");
+    }
+
     static string Bytes(nint p, int n) {
         string digits = "0123456789abcdef";
         string outp = "";
@@ -52,5 +68,37 @@ class Program {
         Console.WriteLine($"bare={bare}");
         Console.WriteLine($"safe={WebView2.IsSafeChar('a')}{WebView2.IsSafeChar('/')}");
         Console.WriteLine($"missing={WebView2.Get(99) == null}");
+
+        // ---- 消息桥 shim 与注入包装（纯字符串构造器） ----------------
+        // JS 字面量转义：反斜杠/引号/控制字符不破坏脚本结构。
+        Program.EqS("quote plain", WebView2.JsQuote("zan"),
+            Program.Q() + "zan" + Program.Q());
+        Program.EqS("quote escapes",
+            WebView2.JsQuote("a" + Program.Q() + "b" + Program.Bs()),
+            Program.Q() + "a" + Program.Bs() + Program.Q() + "b"
+                + Program.Bs() + Program.Bs() + Program.Q());
+
+        // 通道 shim：带通道名、chrome.webview 转发和 "名\t正文" 前缀
+        // （正文前缀在 JS 源里是 \t 转义序列）。
+        string shim = WebView2.ShimScript("zan");
+        Program.Eq("shim names channel",
+            shim.IndexOf(Program.Q() + "zan" + Program.Q()) >= 0 ? 1 : 0, 1);
+        Program.Eq("shim forwards",
+            shim.IndexOf("window.chrome.webview.postMessage") >= 0 ? 1 : 0, 1);
+        Program.Eq("shim tab prefix",
+            shim.IndexOf(Program.Bs() + "t") >= 0 ? 1 : 0, 1);
+        Program.Eq("shim json for objects",
+            shim.IndexOf("JSON.stringify") >= 0 ? 1 : 0, 1);
+
+        // document-end 仿真：readyState 门包住原脚本。
+        string deferred = WebView2.DeferToDomReady("window.x=1;");
+        Program.Eq("defer readyState",
+            deferred.IndexOf("document.readyState==='loading'") >= 0 ? 1 : 0, 1);
+        Program.Eq("defer keeps body",
+            deferred.IndexOf("window.x=1;") >= 0 ? 1 : 0, 1);
     }
+
+    /// 测试字面量助手：源文件里不写裸转义，用码位拼出 "、\。
+    static string Q() { return "" + (char)34; }
+    static string Bs() { return "" + (char)92; }
 }

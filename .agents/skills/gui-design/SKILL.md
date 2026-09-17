@@ -205,6 +205,19 @@ small-medium 之间**:画廊卡片标题先后用 13/15 都被打回"太小",17 
   不调用的程序整个家族被 DCE 删光,发布目录不再出现浏览器 DLL。给
   其他重尾控件扩同类时,走 `HeavyControls.Register(kind, fn)` 同一
   注册表,别往主 switch 加分支。
+- **立即模式 WebView 的矩形是物理像素、内容区从 titlebarH 下开始**:
+  裸用 `WebView`(不经 WebViewBox/布局)直调 `view.Render(app, x, y, w, h)`
+  时,坐标是画布物理像素,且 y 要加 `app.titlebarH`——标题栏由
+  `app.RenderChrome(title)` 每帧最后叠画,PresentFrame 时 NativeLayer
+  把被盖住区域从原生视图裁掉。曾按 600x400 逻辑值直传,150% DPI 屏幕
+  上页面只盖住左上 2/3 还压住标题栏,被当成"组件位移 bug"白查一轮。
+- **WebView2 完成回调的参数归引擎所有,不得释放**: 手写 COM 桥里完成
+  handler 收到的结果串(`ExecuteScript` 的 JSON、`AddScript...` 的
+  脚本 id)和 `GetCookies` 的列表指针,Invoke 返回后引擎自己回收——
+  按"方法出参用 CoTaskMemFree"的惯例去释放,轻则堆损坏(0xC0000374,
+  Eval 加一次 Com.Free 即崩),重则过释放 CookieList 后后续 COM 调用
+  在 STA 里永久挂死。只有同步方法调用拿到的出参(get_Source 等)才走
+  `Com.GetString/Com.Free`;completion 参数一律只读。
 - **zanc 编 .html 设计稿会先喷 `<unknown>` 噪音诊断,不是编译失败**:
   编译前置的命名空间预扫描对原始 HTML 文本跑一遍 Zan lexer,HTML 的中文
   与超长 data-uri 会报成 "unexpected character" 和 "string literal
