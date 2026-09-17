@@ -69,6 +69,24 @@ class WsSession {
     /// 1002/1009. Returns null when the session is over (peer close, EOF,
     /// protocol error) — stop the loop.</summary>
     async string Recv() {
+        return await this.Recv(0);
+    }
+
+    /// <summary>Recv with an idle window: when no frame arrives within
+    /// timeoutMs the call returns "" while Open() stays true and any
+    /// partially buffered bytes survive for the next call — the handler's
+    /// cue to Ping() (which doubles as the keep-alive that re-arms the
+    /// connection deadline) and park again. A null return still means the
+    /// session is over. timeoutMs non-positive waits indefinitely.
+    ///
+    /// An empty data message is indistinguishable from the idle window
+    /// (both return "") — keep protocol payloads non-empty (heartbeats are
+    /// Ping frames, not empty texts) and there is no ambiguity. This also
+    /// lets a handler enforce its own session lifetime: a loop parked on
+    /// Recv now wakes every window even for sessions that only ever see
+    /// Pong traffic, so a wall-clock cap is checked on every tick instead
+    /// of only when a real message happens to arrive.</summary>
+    async string Recv(int timeoutMs) {
         while (this.open) {
             int total = this.reader.FrameSize();
             while (total < 0) {
@@ -84,12 +102,13 @@ class WsSession {
                     bool flushed = await this.FlushOut();
                     if (!flushed) { return null; }
                 }
-                int got = await this.reader.FillMore();
+                int got = await this.reader.FillMore(timeoutMs);
                 this.Touch();
                 if (got == 0) {
                     this.open = false;
                     return null;
                 }
+                if (got < 0) { return ""; }   // 空闲窗口到，会话保持
                 total = this.reader.FrameSize();
             }
 

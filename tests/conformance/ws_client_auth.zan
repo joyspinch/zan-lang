@@ -1,0 +1,171 @@
+// Conformance: WebSocketClient custom handshake headers + idle-window Recv.
+//
+// Pins the client capabilities the notification channels need:
+// 1. 授权在升级前生效的路由（needsAuth 同款：头不对就 401）——三参
+//    ConnectAsync 带不上 Authorization，握手必须被拒；四参
+//    ConnectAsyncHeaders 带上 Bearer 头后 101 打通并正常回显。
+// 2. 头行注入拒绝：自定义头里出现 CR/LF（能伪造额外头/截断握手块）
+//    时按握手失败返回，而不是把注入行发上线。
+// 3. 客户端空闲窗口：RecvText(timeout) 在时限内无帧时返回 "" 且
+//    IsConnected() 仍为 true（半截帧留在缓冲区），随后消息照常交付
+//    ——心跳调用方的判据；真断开（关闭帧）才 IsConnected()=false。
+// 4. 服务端空闲窗口：WsSession.Recv(timeout) 超时返回 "" 且 Open()
+    // 仍 true，处理器借这个拍子主动推帧（tick）——服务器主动推是
+//    通知通道的核心能力。
+// 5. 纯心跳会话的墙钟收口：只在超时拍里检查会话时长，到点 Close(1000)
+//    ——修掉「Recv 永久挂起、StreamSeconds 只在真实消息到达后才跑」
+//    的洞；客户端读到带状态码的关闭帧。
+using System;
+using System.Net.Sockets;
+using System.Net.WebSocket;
+using System.Threading;
+using System.Web;
+
+class Program {
+    static int PORT = 19735;
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            failures = failures + 1;
+        }
+    }
+
+    // /ws：授权门 + 回显（不主动推——客户端空闲窗口需要一条安静的连接）。
+    static async void WsAuth(HttpContext ctx) {
+        string auth = ctx.Header("Authorization");
+        if (auth != "Bearer tok123") {
+            ctx.Status(401, "denied");
+            return;
+        }
+        WsSession ws = await ctx.WsUpgrade();
+        if (ws == null) {
+            ctx.Text("not-a-websocket-request");
+            return;
+        }
+        while (ws.Open()) {
+            string m = await ws.Recv();
+            if (m == null) { break; }
+            if (m == "die") {
+                await ws.Close(1000);
+                break;
+            }
+            await ws.SendText("echo:" + m);
+        }
+    }
+
+    // /tick：授权门 + 空闲窗口拍。每个 300ms 空闲拍推一个 "tick"，
+    // 会话满 2 秒（墙钟）礼貌收口——不管中途有没有真实消息。
+    // （窗口取 2s：NowSeconds 是秒级粒度，1s 窗口会在升级跨秒沿时
+    // 于第一个超时拍就收口，tick 一帧都发不出去——50% 假失败。）
+    static async void WsTick(HttpContext ctx) {
+        string auth = ctx.Header("Authorization");
+        if (auth != "Bearer tok123") {
+            ctx.Status(401, "denied");
+            return;
+        }
+        WsSession ws = await ctx.WsUpgrade();
+        if (ws == null) {
+            ctx.Text("not-a-websocket-request");
+            return;
+        }
+        int started = WebApp.NowSeconds();
+        while (ws.Open()) {
+            string m = await ws.Recv(300);
+            if (m == null) { break; }
+            if (WebApp.NowSeconds() - started >= 2) {
+                await ws.Close(1000);
+                break;
+            }
+            if (m.Length == 0) {
+                // 空闲拍：主动推帧（Recv 的 Pong 队列也会在这里一并上线）。
+                await ws.SendText("tick");
+                continue;
+            }
+        }
+    }
+
+    static TcpListener listener;
+    static bool listening = true;
+
+    static async void Accept(WebApp app) {
+        TcpListener l = new TcpListener("127.0.0.1", PORT);
+        l.Start();
+        Program.listener = l;
+        while (Program.listening) {
+            nint sock = await l.AcceptAsync();
+            if (sock >= 0) { Task.Spawn(app.HandleConnection(sock)); }
+        }
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        WebApp app = new WebApp("127.0.0.1", PORT);
+        Route _r1 = app.Get("/ws", WsAuth);
+        Route _r2 = app.Get("/tick", WsTick);
+        // 直接驱动连接循环（app.Start() 的启动横幅含 pid，输出不可复现）。
+        Task.Spawn(Accept(app));
+        await Task.Delay(100);
+
+        // 1a. 无授权头：401 门当在升级前 → 握手失败。
+        WebSocketClient bad = await WebSocketClient.ConnectAsync(
+            "127.0.0.1", PORT, "/ws");
+        Check(bad != null && !bad.IsConnected(), "no-header handshake rejected");
+
+        // 1b. Bearer 头随握手上线 → 101 + 正常回显。
+        List<string> okHeaders = new List<string>();
+        okHeaders.Add("Authorization: Bearer tok123");
+        WebSocketClient c = await WebSocketClient.ConnectAsyncHeaders(
+            "127.0.0.1", PORT, "/ws", okHeaders);
+        Check(c != null && c.IsConnected(), "bearer header handshake 101");
+        await c.SendText("hello");
+        string echo = await c.RecvText(2000);
+        Check(echo == "echo:hello", "echo over authorized channel");
+
+        // 2. 头行注入（CR/LF）按握手失败返回，不出网。
+        List<string> evil = new List<string>();
+        evil.Add("X-Steal: one\r\nX-Evil: two");
+        WebSocketClient e = await WebSocketClient.ConnectAsyncHeaders(
+            "127.0.0.1", PORT, "/ws", evil);
+        Check(!e.IsConnected(), "header injection rejected");
+
+        // 3. 客户端空闲窗口：无帧时限内返回 "" 且连接保持，随后消息照常。
+        string idle = await c.RecvText(400);
+        Check(idle == "" && c.IsConnected(), "client idle window keeps conn");
+        await c.SendText("again");
+        string echo2 = await c.RecvText(2000);
+        Check(echo2 == "echo:again", "post-idle message delivered");
+
+        // 4+5. /tick：服务端空闲拍推 tick；满 1 秒墙钟收口（关闭帧 1000）。
+        WebSocketClient t = await WebSocketClient.ConnectAsyncHeaders(
+            "127.0.0.1", PORT, "/tick", okHeaders);
+        Check(t != null && t.IsConnected(), "tick channel up");
+        string tick = await t.RecvText(3000);
+        Check(tick == "tick", "server push on idle tick");
+        // 挂到收口：RecvText 循环吃掉 1~2 个 tick 后读到关闭帧 → ""。
+        string last = "pending";
+        for (int i = 0; i < 10; i = i + 1) {
+            last = await t.RecvText(3000);
+            if (!t.IsConnected()) { break; }
+        }
+        Check(!t.IsConnected() && last == "", "wall-clock close after ticks");
+
+        // 收尾：礼貌断开 /ws（也验了客户端 Close 路径）。
+        await c.Close();
+
+        Program.listening = false;
+        if (Program.listener != null) { Program.listener.Stop(); }
+        Console.WriteLine("failures=" + Convert.ToString(failures));
+        // 停服后留几个泵转：accept 协程以 -1 复位并退出，退出时的
+        // 泄漏探测才不会把服务端对象链记为仍可达。
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}

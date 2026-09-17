@@ -429,6 +429,42 @@ class WsReader {
         return got;
     }
 
+    /// <summary>带空闲窗口的 FillMore：时限内没有任何字节到达时返回
+    /// -1（连接未断，帧缓冲里已收到的半截字节原样保留，下次接着
+    /// 读）；数据/对端关闭的语义与 FillMore 相同（>0 = 字节数，
+    /// 0 = EOF）。timeoutMs 非正表示不限时，等价于 FillMore()。
+    ///
+    /// 实现走 Socket.RecvToOv——把接收与截止时间一起交给 reactor
+    /// 竞速（超时交付 -1，不 shutdown 套接字），而不是 HttpDeadline
+    /// 的手法：后者靠 ShutdownBoth 挂断唤醒，用一次连接就废一次，
+    /// 撑不起「每 15 秒空闲窗口到期就 Ping 一下再继续收」的长连接
+    /// 心跳循环。TLS 源分支没有对等的带截止时间原语，退化为不限时
+    /// （wss 心跳调用方应改用上层 Ping/Pong 探活）。</summary>
+    async int FillMore(int timeoutMs) {
+        if (timeoutMs <= 0 || this.tlsSrc != null) {
+            return await this.FillMore();
+        }
+        this.Compact();
+        int n = 0;
+        if (this.len == 0) {
+            // 快路径：缓冲区为空（常见的每 recv 一帧的情况）——
+            // 直接接收进缓冲区，无需中间拷贝。
+            n = await Socket.RecvToOv(this.sock, this.buf, this.cap, timeoutMs);
+            if (n > 0) { this.len = n; }
+            return n < 0 ? 0 - 1 : n;
+        }
+        // 缓冲区已有字节（部分帧/合并帧）：先收进临时缓冲区再追加。
+        n = await Socket.RecvToOv(this.sock, this.tmp, 65536, timeoutMs);
+        if (n > 0) {
+            this.Ensure(this.len + n);
+            for (int i = 0; i < n; i = i + 1) {
+                this.buf[this.len + i] = this.tmp[i];
+            }
+            this.len = this.len + n;
+        }
+        return n < 0 ? 0 - 1 : n;
+    }
+
     /// <summary>缓冲区头部帧的总字节长度；若完整帧尚未全部缓冲
     /// 则返回 -1。返回 -2 = 协议违规（64 位长度的高 32 位非零，
     /// RFC 要求连接失败）；-3 = 帧总长超过 maxLen（消息过大）。
@@ -702,6 +738,17 @@ class WebSocketClient {
     /// 一个 connected=false 的对象，用 IsConnected() 判断成败（失败
     /// 路径已顺手关闭底层连接）。
     static async WebSocketClient ConnectAsync(string host, int port, string path) {
+        return await WebSocketClient.ConnectAsyncHeaders(host, port, path, null);
+    }
+
+    /// <summary>带自定义握手头的连接。`headers` 里每一项是一个完整的
+    /// 头行（如 "Authorization: Bearer xxx"），原样追加在标准握手头
+    /// 之后——授权在升级前生效的 MVC 路由（needsAuth 检查先于
+    /// WsUpgrade）没有它就永远 401。行内出现 CR/LF/NUL/DEL 一律
+    /// 拒绝并按握手失败返回（头注入会伪造额外头/截断握手块），
+    /// 其余字节不校验——值里写什么由调用方负责。</summary>
+    static async WebSocketClient ConnectAsyncHeaders(string host, int port,
+            string path, List<string> headers) {
         WebSocketClient ws = new WebSocketClient();
         ws.host = host;
         ws.port = port;
@@ -730,7 +777,26 @@ class WebSocketClient {
         sb.Append("Sec-WebSocket-Key: ");
         sb.Append(key);
         sb.Append("\r\n");
-        sb.Append("Sec-WebSocket-Version: 13\r\n\r\n");
+        sb.Append("Sec-WebSocket-Version: 13\r\n");
+        if (headers != null) {
+            int hn = headers.Count;
+            for (int i = 0; i < hn; i = i + 1) {
+                string line = headers[i];
+                bool safe = true;
+                int ll = line.Length;
+                for (int j = 0; j < ll; j = j + 1) {
+                    int c = line[j] & 255;
+                    if (c == 13 || c == 10 || c == 0 || c == 127) {
+                        safe = false;
+                        break;
+                    }
+                }
+                if (!safe) { ws.conn.Close(); return ws; }
+                sb.Append(line);
+                sb.Append("\r\n");
+            }
+        }
+        sb.Append("\r\n");
         await ws.conn.SendAsync(sb.ToString());
 
         // 响应头可能被 TCP 分段；头之后的字节已是帧（可能含 NUL）。
@@ -810,12 +876,24 @@ class WebSocketClient {
     /// 继续循环；分片消息重组到 fin 后整条交付；Close 或断开
     /// 返回 ""。</summary>
     async string RecvText() {
+        return await this.RecvText(0);
+    }
+
+    /// <summary>带空闲窗口的 RecvText：时限内没有任何帧到达时返回 ""
+    /// ——连接未断，IsConnected() 仍为 true，已收到的半截帧留在
+    /// 缓冲区里下次接着读；这正是心跳调用方的判据（超时 → Ping()
+    /// → 继续 RecvText(timeout)）。真正的断开（对端关闭帧/EOF/协议
+    /// 错误）会 CloseNow，IsConnected() 变 false。timeoutMs 非正表示
+    /// 不限时。空数据消息与空闲超时都返回 ""，无法区分——协议上
+    /// 不发空消息（发心跳用 Ping）就没有歧义。</summary>
+    async string RecvText(int timeoutMs) {
         while (this.connected) {
             int total = this.reader.FrameSize();
             while (total < 0) {
                 if (total == -2 || total == -3) { this.CloseNow(); return ""; }
-                int n = await this.reader.FillMore();
+                int n = await this.reader.FillMore(timeoutMs);
                 if (n == 0) { this.CloseNow(); return ""; }
+                if (n < 0) { return ""; }   // 空闲窗口到，连接保持
                 total = this.reader.FrameSize();
             }
             WsFrame frame = this.reader.TakeFrame(total);

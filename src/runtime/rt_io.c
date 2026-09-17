@@ -1759,9 +1759,12 @@ typedef struct zan_io_op {
     SOCKET     sock;
     int        interest;     /* ZAN_IO_READ / ZAN_IO_WRITE */
     int        kind;         /* readiness/recv/accept */
-    int        rto;          /* recv-with-deadline op: the completion must
-                              * claim the frame's deadline entry before it may
-                              * touch *out_n or wake -- see the rto block below */
+    int        rto;          /* recv-with-deadline op state: 1 = armed, the
+                              * completion must claim the frame's deadline
+                              * entry before it may touch *out_n or wake;
+                              * 2 = the deadline already won (scan delivered
+                              * -1), the late completion is dropped whole --
+                              * see the rto block below */
     void      *co;           /* fiber handle, or stackless frame pointer */
     zan_co_step_t step;      /* stackless resume fn (NULL => stackful fiber) */
     int64_t   *out_n;        /* recv byte-count sink (NULL => readiness probe) */
@@ -2334,9 +2337,20 @@ static int rto_timeout_scan(void) {
         }
         LeaveCriticalSection(&g_rto_lock);
         if (!e) break;
-        /* The frame stays parked until we wake it below (the completion path
-         * can no longer claim: the entry is gone), so *out_n is safe to write. */
-        CancelIoEx((HANDLE)e->s, e->ov);   /* its late packet finds no entry: no wake */
+        /* The deadline won the race: deliver -1 and wake the frame here.
+         * The op itself is flagged (rto = 2) so its late completion packet
+         * -- CancelIoEx's OPERATION_ABORTED, or a transfer that raced the
+         * cancel -- is dropped whole. Arbitration must NOT go by frame
+         * pointer: the frame is parked only until the wake below, and a
+         * newer RecvToOv whose async frame reused this one's pooled memory
+         * registers its OWN entry under the same pointer -- a late packet
+         * claiming by frame would steal that live entry and write 0 (EOF)
+         * into the newer frame's result slot, killing a healthy connection.
+         * The op (which owns the OVERLAPPED the packet names) is the only
+         * stable identity. */
+        zan_io_op_t *win_op = CONTAINING_RECORD(e->ov, zan_io_op_t, ov);
+        win_op->rto = 2;
+        CancelIoEx((HANDLE)e->s, e->ov);   /* its late packet is flagged off */
         if (e->out_n) *e->out_n = -1;
         io_wake(e->frame, e->step);
         free(e);
@@ -2637,6 +2651,16 @@ int32_t zan_io_poll(int64_t timeout_ms) {
                                             zan_io_op_t, ov);
         void *co = op->co;
         zan_co_step_t step = op->step;
+        if (op->rto == 2) {
+            /* The deadline already delivered -1 and flagged this op: the
+             * packet is the cancel's own late completion (or a transfer
+             * that raced it) and must touch nothing -- its *out_n points
+             * into a frame that may already be freed and reused. Recycle. */
+            IOTRACE("poll_op rto-dead op=%p kind=%d", (void*)op, op->kind);
+            op_free(op);
+            g_io_count--;
+            continue;
+        }
         if (op->rto && !rto_claim(co)) {
             /* The deadline won: the frame was already re-readied with -1 (and
              * may since have completed and been freed) -- io_complete_op's
@@ -4421,6 +4445,16 @@ static void co_wait_io(zan_co_worker_t *w, long long timeout_ms) {
                                             zan_io_op_t, ov);
         void *co = op->co;
         zan_co_step_t step = op->step;
+        if (op->rto == 2) {
+            /* The deadline already delivered -1 and flagged this op: the
+             * packet is the cancel's own late completion (or a transfer
+             * that raced it) and must touch nothing -- its *out_n points
+             * into a frame that may already be freed and reused. Recycle. */
+            IOTRACE("poll_op rto-dead op=%p kind=%d", (void*)op, op->kind);
+            op_free(op);
+            IO_CNT_DEC();
+            continue;
+        }
         if (op->rto && !rto_claim(co)) {
             /* The deadline won: the frame was already re-readied with -1 (and
              * may since have completed and been freed) -- io_complete_op's
