@@ -822,57 +822,6 @@ class HttpContext {
         return this.request.GetHeader("Sec-WebSocket-Key").Length > 0;
     }
 
-    /// <summary>Completes the RFC 6455 handshake and hands the connection to
-    /// a <see cref="WsSession"/>. The upgrade runs AFTER routing and
-    /// authorization, so a WebSocket session on the MVC port inherits the
-    /// route's full permission semantics — the part a standalone WS port
-    /// cannot give you.
-    ///
-    /// Session lifetime follows the SSE hijack contract: the handler that
-    /// called WsUpgrade owns the connection until it returns; the connection
-    /// loop then sees hijacked and tears down without writing a response.
-    /// null = not an upgrade request (answer normally) or the 101 write
-    /// failed (peer gone).
-    ///
-    /// An idle session is cut by the connection sweeper at the request
-    /// timeout. Recv/Send re-arm the deadline automatically on activity; a
-    /// session that may go quiet should be kept alive with periodic Ping()
-    /// pushes.</summary>
-    async WsSession WsUpgrade() {
-        if (!this.IsWebSocketRequest()) { return null; }
-        string key = this.request.GetHeader("Sec-WebSocket-Key");
-        StringBuilder sb = new StringBuilder();
-        sb.Append("HTTP/1.1 101 Switching Protocols\r\n");
-        sb.Append("Upgrade: websocket\r\n");
-        sb.Append("Connection: Upgrade\r\n");
-        sb.Append("Sec-WebSocket-Accept: ");
-        sb.Append(Encoding.WebSocketAccept(key));
-        sb.Append("\r\n\r\n");
-        bool ok = await this.SendAllTcp(sb.ToString());
-        if (!ok) { return null; }
-        this.hijacked = true;
-        this.wasHijacked = true;
-        this.ended = true;
-        ServerMetrics.Global().StreamOpened();
-        WsReader reader = new WsReader(this.conn.Sock());
-        // Frames the client pipelined behind the handshake head are already
-        // in the framer's buffer: slice them out by exact count (binary
-        // safe) and seed the reader, like Worker.HandleWebSocket does. The
-        // connection loop consumed the request itself, so everything still
-        // pending is frame bytes.
-        if (this.framer != null) {
-            int pending = this.framer.Pending();
-            if (pending > 0) {
-                reader.Prime(this.framer.Slice(0, pending), pending);
-            }
-        }
-        // The framer is not disposed here: during the session it is idle
-        // memory only, and the connection loop releases it on teardown —
-        // same lifecycle as SSE.
-        WsWriter writer = new WsWriter();
-        WsAssembler asm = new WsAssembler(reader.MaxLen());
-        return new WsSession(this.conn, reader, writer, asm, this);
-    }
 
     /// 序列化为完整 HTTP/1.1 报文：状态行、Content-Type/Length、依
     /// keepAlive 的 Connection 头、Server 头，再接已清洗的自定义头。

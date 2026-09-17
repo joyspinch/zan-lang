@@ -1,0 +1,68 @@
+using System;
+using System.Net.Sockets;
+using System.Net.WebSocket;
+using System.Text;
+
+namespace System.Web;
+
+/// <summary>
+/// Web 层 WebSocket 升级装配（A332 肥边⑥）：把 HttpContext.WsUpgrade 的
+/// 帧编解码依赖（WsReader/WsWriter/WsAssembler/WsSession，连带 WebSocket
+/// 家族 866 行）从核心 HttpContext 外迁为独立类。HttpContext 是一切
+/// WebApp 程序的必经类型——它的方法签名引用 WsSession 就会把 ws 编解码
+/// 拉进每一个纯 HTTP 服务。应用调用 <c>WebWs.Upgrade(ctx)</c> 即 opt-in，
+/// 升级前路由/权限已生效的语义不变（ctx 的握手/劫持状态经公开成员操作）。
+/// </summary>
+class WebWs {
+    /// <summary>Completes the RFC 6455 handshake and hands the connection to
+    /// a <see cref="WsSession"/>. The upgrade runs AFTER routing and
+    /// authorization, so a WebSocket session on the MVC port inherits the
+    /// route's full permission semantics — the part a standalone WS port
+    /// cannot give you.
+    ///
+    /// Session lifetime follows the SSE hijack contract: the handler that
+    /// called Upgrade owns the connection until it returns; the connection
+    /// loop then sees hijacked and tears down without writing a response.
+    /// null = not an upgrade request (answer normally) or the 101 write
+    /// failed (peer gone).
+    ///
+    /// An idle session is cut by the connection sweeper at the request
+    /// timeout. Recv/Send re-arm the deadline automatically on activity; a
+    /// session that may go quiet should be kept alive with periodic Ping()
+    /// pushes.</summary>
+    static async WsSession Upgrade(HttpContext ctx) {
+        if (!ctx.IsWebSocketRequest()) { return null; }
+        string key = ctx.request.GetHeader("Sec-WebSocket-Key");
+        StringBuilder sb = new StringBuilder();
+        sb.Append("HTTP/1.1 101 Switching Protocols\r\n");
+        sb.Append("Upgrade: websocket\r\n");
+        sb.Append("Connection: Upgrade\r\n");
+        sb.Append("Sec-WebSocket-Accept: ");
+        sb.Append(Encoding.WebSocketAccept(key));
+        sb.Append("\r\n\r\n");
+        bool ok = await ctx.SendAllTcp(sb.ToString());
+        if (!ok) { return null; }
+        ctx.hijacked = true;
+        ctx.wasHijacked = true;
+        ctx.ended = true;
+        ServerMetrics.Global().StreamOpened();
+        WsReader reader = new WsReader(ctx.conn.Sock());
+        // Frames the client pipelined behind the handshake head are already
+        // in the framer's buffer: slice them out by exact count (binary
+        // safe) and seed the reader, like WorkerWs.HandleWebSocket does. The
+        // connection loop consumed the request itself, so everything still
+        // pending is frame bytes.
+        if (ctx.framer != null) {
+            int pending = ctx.framer.Pending();
+            if (pending > 0) {
+                reader.Prime(ctx.framer.Slice(0, pending), pending);
+            }
+        }
+        // The framer is not disposed here: during the session it is idle
+        // memory only, and the connection loop releases it on teardown —
+        // same lifecycle as SSE.
+        WsWriter writer = new WsWriter();
+        WsAssembler asm = new WsAssembler(reader.MaxLen());
+        return new WsSession(ctx.conn, reader, writer, asm, ctx);
+    }
+}
