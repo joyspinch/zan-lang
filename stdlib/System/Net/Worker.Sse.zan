@@ -1,0 +1,79 @@
+using System;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Net.Sse;
+
+namespace System.Net;
+
+/// <summary>Invoked when an SSE subscriber completes its handshake. The
+/// application keeps the SseConnection and pushes events through it. Async.
+/// （原 Worker.zan 顶层委托——签名引用 SseConnection，随 SSE 分片外迁，
+/// 否则核心文件会把 SSE 家族拖进一切 Worker 程序。）</summary>
+async delegate void SseSubscriberHandler(SseConnection conn);
+
+/// <summary>
+/// SSE 协议分片（A332 肥边③）：订阅握手/事件流处理，从 Worker.zan 外迁
+/// 为独立类。应用调用一次 WorkerSse.Install() 本文件才进编译图（并连带
+/// 拉入 Sse.zan），纯 HTTP 服务不背 SSE；订阅回调从原来的 Worker 字段
+/// 改为这里的静态字段 WorkerSse.onSseSubscriber（签名引用 SseConnection，
+/// 放在核心会把 SSE 拖回编译图）。槽反转与独立类（不写 partial Worker）
+/// 的理由见 Worker.ProtoEntryFn 的文档。
+/// </summary>
+class WorkerSse {
+    /// SSE 订阅者握手完成后调用；应用持有 SseConnection 主动推事件。
+    static SseSubscriberHandler onSseSubscriber;
+
+    /// <summary>Installs the SSE shard into the Worker entry slot. Call once
+    /// before Worker.RunAll().</summary>
+    static void Install() {
+        Worker.sseEntry = WorkerSse.HandleSse;
+    }
+
+    /// SSE 订阅：读取 GET 请求头后回 200 text/event-stream（带 no-cache 与
+    /// CORS 通配头），把连接包成 SseConnection 交给 onSseSubscriber（未设
+    /// 回调时立即关闭）；此后连接由应用持有。请求头读取与 HTTP 路径
+    /// 一样武装 requestTimeout（慢速滴字客户端不能永久钉住连接），
+    /// 清理在 finally 中执行——onSseSubscriber 抛出时 DropConn 不能丢。
+    static async void HandleSse(Worker w, nint clientSock) {
+        TcpClient client = TcpClient.FromSocket(clientSock);
+        HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, w.requestTimeout);
+
+        // Read the subscriber's GET request head.
+        string req = "";
+        try {
+            while (HttpServer.FindHeaderEnd(req) < 0 && req.Length < 65536) {
+                string chunk = await client.RecvAsync(4096);
+                if (chunk.Length == 0) {
+                    client.Close();
+                    return;
+                }
+                req = req + chunk;
+            }
+        } finally {
+            HttpDeadline.Disarm(watch);
+        }
+        string path = "/";
+        HttpRequest head = HttpRequest.Parse(req);
+        if (head.path.Length > 0) { path = head.path; }
+
+        try {
+            int _n = await client.SendAsync("HTTP/1.1 200 OK\r\n"
+                + "Content-Type: text/event-stream\r\n"
+                + "Cache-Control: no-cache\r\n"
+                + "Connection: keep-alive\r\n"
+                + "Access-Control-Allow-Origin: *\r\n"
+                + "\r\n");
+
+            Worker.BumpStat();
+            SseConnection sse = SseConnection.Of(client, path);
+            if (WorkerSse.onSseSubscriber != null) {
+                await WorkerSse.onSseSubscriber(sse);
+            } else {
+                sse.Close();
+            }
+        } finally {
+            // The application owns the SseConnection from here.
+            w.DropConn();
+        }
+    }
+}

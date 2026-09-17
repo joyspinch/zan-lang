@@ -1,9 +1,6 @@
 using System;
 using System.Net.Sockets;
 using System.Net.Http;
-using System.Net.WebSocket;
-using System.Net.Sse;
-using System.Net.Mqtt;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
@@ -28,9 +25,6 @@ async delegate void ConnectionCloseHandler(Connection conn);
 /// sent back to the datagram's sender; return "" to send nothing. Async.</summary>
 async delegate string DatagramHandler(string data);
 
-/// <summary>Invoked when an SSE subscriber completes its handshake. The
-/// application keeps the SseConnection and pushes events through it. Async.</summary>
-async delegate void SseSubscriberHandler(SseConnection conn);
 
 /// <summary>Invoked with a freshly accepted (and, on Windows, handed-off)
 /// client socket. When set it overrides the built-in per-protocol handling:
@@ -39,6 +33,16 @@ async delegate void SseSubscriberHandler(SseConnection conn);
 /// accept + WSADuplicateSocket handoff + supervision while keeping its own
 /// request pipeline. Async so it can await I/O.</summary>
 async delegate void RawConnHandler(nint sock);
+
+/// <summary>Per-connection entry of a protocol shard (ws/sse/mqtt). The
+/// implementations live in Worker.Ws/Sse/Mqtt.zan as independent classes
+/// (WorkerWs/WorkerSse/WorkerMqtt) that install themselves into the static
+/// entry slots on Worker from their Install(); until an app calls those, the
+/// shard files never join the compile graph at all (A332 lazy pull-in: a
+/// stdlib file is pulled only when a type it declares is spelled in type
+/// position, so a pure-HTTP server compiles without the ws codec, the SSE
+/// helper or the MQTT broker). Async so it can await I/O.</summary>
+async delegate void ProtoEntryFn(Worker w, nint sock);
 
 /// <summary>
 /// Workerman-style multi-protocol server: one Worker per listen address,
@@ -51,20 +55,24 @@ async delegate void RawConnHandler(nint sock);
 ///   Worker.RunAll();                    // never returns
 ///
 /// Protocols: "tcp", "udp", "http", "websocket" (or "ws"), "sse", "mqtt".
-/// Callbacks (assign what the protocol needs); the second name is an alias
-/// reading the way that protocol usually does:
+/// The ws/sse/mqtt protocol machinery compiles in only when its shard is
+/// installed -- call once before RunAll: WorkerWs.Install() (websocket +
+/// ws-upgrade on http ports), WorkerSse.Install(), WorkerMqtt.Install().
+/// RunAll fails fast with a message when a dedicated protocol worker has no
+/// shard installed. Callbacks (assign what the protocol needs); the second
+/// name is an alias reading the way that protocol usually does:
 ///   onConnect / onOpen                  -- tcp, websocket: connection up
 ///   onMessage / onReceive               -- tcp, websocket: data in, reply out
 ///   onClose                             -- tcp, websocket: connection gone
 ///   onHttpRequest / onRequest           -- http
 ///   onUdpMessage / onPacket             -- udp
-///   onSseSubscriber                     -- sse
+///   WorkerSse.onSseSubscriber           -- sse (shard static, not a field)
 ///   (none)                              -- mqtt: connections are served by
 ///                                          the built-in MqttBroker.Global()
 ///
 /// An "http" worker with onOpen/onMessage set also serves WebSocket on that
-/// same port: a request asking to upgrade becomes a frame loop, everything else
-/// is answered by onRequest.
+/// same port once WorkerWs.Install() has run: a request asking to upgrade
+/// becomes a frame loop, everything else is answered by onRequest.
 ///
 /// MULTI-PROCESS MODEL (count > 1). The initially launched process becomes the
 /// MASTER: it spawns `count` worker copies of this executable and supervises
@@ -120,8 +128,6 @@ class Worker {
     HttpRequestHandler onHttpRequest;
     /// 每个完整 UDP 数据报调用；返回串回发给发送方，返回 "" 不回发。
     DatagramHandler onUdpMessage;
-    /// SSE 订阅者握手完成后调用；应用持有 SseConnection 主动推事件。
-    SseSubscriberHandler onSseSubscriber;
     /// 设置后接管该 Worker 的整条连接：socket 交给回调自主驱动，
     /// 绕过内建协议处理与连接数闸门。
     RawConnHandler onRawConnection;
@@ -139,14 +145,6 @@ class Worker {
     /// onHttpRequest 的 HTTP 叫法（请求已解析）。
     HttpRequestHandler onRequest;    // http: request parsed
 
-    // WebSocket 连接注册表（对标 workerman $server->connections）：Upgrade
-    // 成功时登记，连接结束/回调关闭后移除。list 上的协程切换只发生在
-    // await 点，Add/Remove/快照拷贝都是同步段，无需加锁。多 worker 进程
-    // 时注册表是进程内的——跨进程广播属 SharedTable/事件总线范畴。
-    List<Connection> wsConns;
-    // 同步段进出 WS 连接协程用的互斥（--async-workers 下连接协程跑在
-    // 不同线程，List 本身不是线程安全）。
-    static nint wsRegLock = 0;
 
     static List<Worker> workers = new List<Worker>();
     static bool daemonize = false;
@@ -288,13 +286,11 @@ class Worker {
         this.onClose = null;
         this.onHttpRequest = null;
         this.onUdpMessage = null;
-        this.onSseSubscriber = null;
         this.onRawConnection = null;
         this.onOpen = null;
         this.onReceive = null;
         this.onPacket = null;
         this.onRequest = null;
-        this.wsConns = new List<Connection>();
         workers.Add(this);
     }
 
@@ -322,87 +318,6 @@ class Worker {
         return this.onHttpRequest;
     }
 
-    // ---- WebSocket 连接注册表（对标 workerman connections + push）----
-
-    /// 惰性创建 WebSocket 注册表用的互斥锁。
-    static void WsRegInit() {
-        if (Worker.wsRegLock == 0) { Worker.wsRegLock = Mutex.Create(); }
-    }
-
-    /// Upgrade 成功后由 HandleWebSocket 调用（单线程 accept 路径）。
-    void WsConnAdd(Connection conn) {
-        Worker.WsRegInit();
-        Mutex.Lock(Worker.wsRegLock);
-        this.wsConns.Add(conn);
-        Mutex.Unlock(Worker.wsRegLock);
-    }
-
-    /// 连接结束后由 HandleWebSocket 调用。
-    void WsConnRemove(Connection conn) {
-        Worker.WsRegInit();
-        Mutex.Lock(Worker.wsRegLock);
-        int id = conn.GetId();
-        int i = 0;
-        while (i < this.wsConns.Count) {
-            if (this.wsConns[i].GetId() == id) {
-                this.wsConns.RemoveAt(i);
-                break;
-            }
-            i = i + 1;
-        }
-        Mutex.Unlock(Worker.wsRegLock);
-    }
-
-    /// <summary>本 Worker 当前在线 WebSocket 连接数（进程内）。</summary>
-    int WsConnCount() {
-        Worker.WsRegInit();
-        Mutex.Lock(Worker.wsRegLock);
-        int n = this.wsConns.Count;
-        Mutex.Unlock(Worker.wsRegLock);
-        return n;
-    }
-
-    /// <summary>按连接 id 取在线连接；不存在（已断开）返回 null。
-    /// 用于定时器等无引用上下文里找回连接后 conn.Push(...)。</summary>
-    Connection WsConnById(int id) {
-        Worker.WsRegInit();
-        Mutex.Lock(Worker.wsRegLock);
-        Connection found = null;
-        int i = 0;
-        while (i < this.wsConns.Count) {
-            if (this.wsConns[i].GetId() == id) {
-                found = this.wsConns[i];
-                break;
-            }
-            i = i + 1;
-        }
-        Mutex.Unlock(Worker.wsRegLock);
-        return found;
-    }
-
-    /// <summary>向所有在线 WebSocket 连接广播一条 Text 帧，返回成功
-    /// 投递数。快照在锁内拷出、Push 在锁外执行——Push 是 await 点，
-    /// 决不能持锁挂起。断开的连接由其帧循环稍后自行移除。</summary>
-    async int WsBroadcast(string data) {
-        Worker.WsRegInit();
-        Mutex.Lock(Worker.wsRegLock);
-        List<Connection> snap = new List<Connection>();
-        int i = 0;
-        while (i < this.wsConns.Count) {
-            snap.Add(this.wsConns[i]);
-            i = i + 1;
-        }
-        Mutex.Unlock(Worker.wsRegLock);
-        int sent = 0;
-        int j = 0;
-        while (j < snap.Count) {
-            Connection c = snap[j];
-            bool ok = await c.Push(data);
-            if (ok) { sent = sent + 1; }
-            j = j + 1;
-        }
-        return sent;
-    }
 
     /// Whether this worker can serve WebSocket connections, i.e. whether an HTTP
     /// port should honour an Upgrade request instead of answering it as HTTP.
@@ -956,6 +871,7 @@ class Worker {
             return;
         }
 
+        CheckProtoEntries();
         EnsureMasterLog();
         if (daemonize) {
             // Detaching must not throw the master's own output away: without a
@@ -2140,6 +2056,7 @@ class Worker {
     /// Every worker but the last is spawned as its own coroutine; the last is
     /// awaited so this call drives the scheduler forever.</summary>
     static async void RunAllLoopsOnSockets(List<nint> socks) {
+        CheckProtoEntries();
         int n = socks.Count;
         for (int j = 0; j < n - 1; j = j + 1) {
             Task.Spawn(workers[j].RunOnSocket(socks[j]));
@@ -2183,6 +2100,16 @@ class Worker {
         return s;
     }
 
+    // ---- protocol shard entry slots (A332 肥边③) ----
+    // ws/sse/mqtt 的连接处理实现在独立文件 Worker.Ws/Sse/Mqtt.zan（独立类
+    // WorkerWs/WorkerSse/WorkerMqtt），经 Install() 回填到这三个静态槽；
+    // 分片文件声明的类型名不被拼写就不进编译图（见 ProtoEntryFn 注释）。
+    // 专用协议在 RunAll 经 CheckProtoEntries 前置报错；http 端口只在
+    // HasWsHandlers() 且槽非空时才走升级路径。
+    static ProtoEntryFn wsEntry;
+    static ProtoEntryFn sseEntry;
+    static ProtoEntryFn mqttEntry;
+
     /// <summary>Serves this worker's protocol on an already-bound socket.</summary>
     async void RunOnSocket(nint sock) {
         this.running = true;
@@ -2224,19 +2151,64 @@ class Worker {
         if (this.protocol == "http") {
             // An HTTP port with WebSocket callbacks answers both, the way
             // swoole's WebSocket\Server does: the request head decides.
-            if (this.HasWsHandlers()) {
-                Task.Spawn(HandleWebSocket(clientSock));
+            // ws 分片未装（WorkerWs.Install() 没调）时槽为空，升级请求
+            // 由明文 HTTP 路径应答——RunAll 会为此打告警。
+            if (this.HasWsHandlers() && Worker.wsEntry != null) {
+                Task.Spawn(this.RunProto(Worker.wsEntry, clientSock));
             } else {
                 Task.Spawn(HandleHttp(clientSock));
             }
         } else if (this.protocol == "websocket" || this.protocol == "ws") {
-            Task.Spawn(HandleWebSocket(clientSock));
+            Task.Spawn(this.RunProto(Worker.wsEntry, clientSock));
         } else if (this.protocol == "sse") {
-            Task.Spawn(HandleSse(clientSock));
+            Task.Spawn(this.RunProto(Worker.sseEntry, clientSock));
         } else if (this.protocol == "mqtt") {
-            Task.Spawn(HandleMqtt(clientSock));
+            Task.Spawn(this.RunProto(Worker.mqttEntry, clientSock));
         } else {
             Task.Spawn(HandleTcp(clientSock));
+        }
+    }
+
+    /// Spawnable wrapper around a protocol-shard entry. Task.Spawn needs a
+    /// concrete async method frame (same reason as RunRaw); the shard entry
+    /// itself arrives as a delegate. 槽为空（分片未装）时关连接归还计数，
+    /// 不 NRE——专用协议在 RunAll 已先行报错，这里是兜底。
+    async void RunProto(ProtoEntryFn entry, nint clientSock) {
+        if (entry == null) {
+            Socket.Close(clientSock);
+            this.DropConn();
+            return;
+        }
+        await entry(this, clientSock);
+    }
+
+    /// RunAll 前的协议分片检查：专用协议（websocket/sse/mqtt）的入口槽为
+    /// 空说明对应分片没装（WorkerWs/WorkerSse/WorkerMqtt.Install()），
+    /// 直接报错退出——比第一个连接进来时静默断开可诊断得多。http 端口
+    /// 设了 ws 回调但没装分片只告警：明文 HTTP 语义不受影响。这里只读
+    /// 槽字段，不拼分片类型名（拼了会把分片拉回编译图，槽就白拆了）。
+    static void CheckProtoEntries() {
+        for (int i = 0; i < workers.Count; i = i + 1) {
+            Worker wk = workers[i];
+            if (wk.protocol == "websocket" || wk.protocol == "ws") {
+                if (Worker.wsEntry == null) {
+                    Console.WriteLine("[worker] protocol 'websocket' needs WorkerWs.Install() -- the ws codec compiles in only when installed");
+                    exit(1);
+                }
+            } else if (wk.protocol == "sse") {
+                if (Worker.sseEntry == null) {
+                    Console.WriteLine("[worker] protocol 'sse' needs WorkerSse.Install() -- the SSE helper compiles in only when installed");
+                    exit(1);
+                }
+            } else if (wk.protocol == "mqtt") {
+                if (Worker.mqttEntry == null) {
+                    Console.WriteLine("[worker] protocol 'mqtt' needs WorkerMqtt.Install() -- the MQTT broker compiles in only when installed");
+                    exit(1);
+                }
+            } else if (wk.protocol == "http" && wk.HasWsHandlers()
+                && Worker.wsEntry == null) {
+                Console.WriteLine("[worker] http port has ws callbacks but WorkerWs.Install() was not called; upgrade requests will be answered as plain HTTP");
+            }
         }
     }
 
@@ -2323,268 +2295,6 @@ class Worker {
         }
     }
 
-    // ---- websocket ----
-
-    /// A WebSocket port is an HTTP port until the client asks to upgrade, so the
-    /// request head is read and parsed first: an Upgrade request becomes a frame
-    /// loop, anything else is served as HTTP (swoole's WebSocket\Server does the
-    /// same). The bytes consumed here are handed to whichever path takes over.
-    async void HandleWebSocket(nint clientSock) {
-        TcpClient client = TcpClient.FromSocket(clientSock);
-
-        // The head is read with the shared HTTP framer, so the bytes that
-        // arrive with it (an HTTP body, pipelined WebSocket frames) keep their
-        // exact count instead of being length-counted with strlen.
-        // 握手读取与明文 HTTP 一样受 requestTimeout 约束（慢速客户端
-        // 每秒滴一个字节就能永久钉住协程与 64KB 复用缓冲）；WS 循环
-        // 的空闲不设限，与 HTTP keep-alive 的请求间空闲一致。
-        HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, this.requestTimeout);
-        HttpFramer framer = HttpFramer.Create(clientSock);
-        int headerEnd = 0;
-        try {
-            headerEnd = await framer.ReadHead(this.maxHeaderBytes);
-            HttpDeadline.Disarm(watch);
-            watch = null;
-        } finally {
-            // ReadHead 半途抛出时 deadline 槽位必须释放（幂等）。
-            HttpDeadline.Disarm(watch);
-        }
-        if (headerEnd <= 0) {
-            framer.Dispose();
-            client.Close();
-            this.DropConn();
-            return;
-        }
-        HttpRequest req = HttpRequest.Parse(framer.Head(headerEnd), headerEnd);
-        string wsKey = req.GetHeader("Sec-WebSocket-Key");
-
-        if (wsKey.Length == 0) {
-            // Plain HTTP on the same port. The framer already holds the head
-            // (and whatever followed it), so it is handed to the HTTP loop
-            // as-is rather than re-read or converted back to a string.
-            await HttpServer.ServeFramed(clientSock, this.RequestHandler(), framer,
-                this.maxHeaderBytes, this.maxRequestBytes, this.requestTimeout);
-            this.DropConn();
-            return;
-        }
-        // 之后的路径全部收口到帧循环末尾的统一清理；本函数内不再
-        // 有提前 return。
-
-        StringBuilder sb = new StringBuilder();
-        sb.Append("HTTP/1.1 101 Switching Protocols\r\n");
-        sb.Append("Upgrade: websocket\r\n");
-        sb.Append("Connection: Upgrade\r\n");
-        sb.Append("Sec-WebSocket-Accept: ");
-        sb.Append(Encoding.WebSocketAccept(wsKey));
-        sb.Append("\r\n\r\n");
-        int _hs = await client.SendAsync(sb.ToString());
-
-        Connection conn = NewConnection(clientSock);
-
-        // Reassemble whole frames via WsReader (handles partial and coalesced
-        // frames), rather than assuming one recv == one frame.
-        WsReader reader = new WsReader(clientSock);
-        int afterHead = framer.Pending() - headerEnd;
-        if (afterHead > 0) {
-            // The client pipelined frames behind the handshake. Frame bytes are
-            // binary, so they are sliced out of the framer by exact count.
-            reader.Prime(framer.Slice(headerEnd, afterHead), afterHead);
-        }
-        framer.Dispose();
-        WsWriter writer = new WsWriter();
-        // 连接级出站能力：conn.Push/PushBinary 与帧循环共用这个 writer，
-        // 回调里（onOpen 欢迎、定时器广播）无需入站消息先行即可推帧。
-        conn.wsWriter = writer;
-        conn.wsClient = client;
-        this.WsConnAdd(conn);
-        // onOpen 必须在 wsWriter/wsClient 挂载并登记之后触发：回调里的
-        // conn.Push/PushBinary 依赖 wsWriter 非 null（否则静默返回 false，
-        // 欢迎帧丢失且无任何错误迹象）。
-        // WS 帧循环的收尾清理在 finally 中：onOpen/onFrameData 抛出时
-        // Close/WsConnRemove/DropConn 一个都不能少——连接留在广播表里
-        // 会对死 socket 持续推送，计数漂移则自我拒绝服务。
-        ConnectionHandler onUp = this.OpenHandler();
-        try {
-        if (onUp != null) { await onUp(conn); }
-        WsAssembler asm = new WsAssembler(reader.MaxLen());
-        MessageHandler onFrameData = this.MessageHandlerOf();
-        bool active = true;
-        while (active && !conn.closed) {
-            int total = reader.FrameSize();
-            while (total < 0) {
-                if (total == -2 || total == -3) {
-                    // -2 = 帧长编码违规（1002）；-3 = 消息过大（1009）。
-                    // 无上限时对端声明一个 2GB 的帧就能把缓冲撑到 OOM。
-                    byte[] enc = WsFrame.CloseFrameWithCode(total == -3 ? 1009 : 1002).Encode();
-                    writer.Append(enc, 4);
-                    int _v = await writer.Flush(client);
-                    active = false;
-                    break;
-                }
-                // Nothing more to answer from this batch: put the replies on the
-                // wire before parking on the reactor.
-                if (writer.Pending()) { int _f = await writer.Flush(client); }
-                int got = await reader.FillMore();
-                if (got == 0) {
-                    active = false;
-                    break;
-                }
-                total = reader.FrameSize();
-            }
-            if (!active) { break; }
-
-            WsFrame frame = reader.TakeFrame(total);
-
-            // RFC 6455 入站帧门禁：§5.2 保留 opcode（3-7 数据、11-15
-            // 控制）、§5.5 控制帧载荷 ≤125、§5.1 客户端帧必须掩码。
-            // 此前非法 opcode 落进数据帧路径被原样回显给对端。
-            bool protoErr = frame.opcode >= 3 && frame.opcode <= 7
-                || frame.opcode >= 11 && frame.opcode <= 15
-                || frame.opcode >= 8 && frame.payloadLen > 125
-                || !frame.masked;
-            if (protoErr) {
-                byte[] enc = WsFrame.CloseFrameWithCode(1002).Encode();
-                writer.Append(enc, 4);
-                int _b = await writer.Flush(client);
-                active = false;
-                break;
-            }
-            if (frame.opcode == WsOpcode.Ping) {
-                // §5.5.3：Pong 必须原样带回 Ping 的应用数据——空 Pong
-                // 会让按载荷配对的心跳客户端断连。
-                WsFrame pong = WsFrame.RawFrame(WsOpcode.Pong, frame.payload, frame.payloadLen);
-                byte[] encoded = pong.Encode();
-                writer.Append(encoded, WsFrame.HeaderLen(frame.payloadLen) + frame.payloadLen);
-                continue;
-            }
-            if (frame.opcode == WsOpcode.Pong) { continue; }
-            if (frame.opcode == WsOpcode.Close) {
-                WsFrame closeResp = WsFrame.CloseFrame();
-                byte[] enc2 = closeResp.Encode();
-                writer.Append(enc2, 2);
-                int _c = await writer.Flush(client);
-                active = false;
-                break;
-            }
-            // 数据帧（Text/Binary/Continuation）：分片消息在 fin 时
-            // 整条交付——此前 continuation 帧被静默丢弃。
-            int feed = asm.Feed(frame);
-            if (feed < 0) {
-                byte[] enc = WsFrame.CloseFrameWithCode(feed == -2 ? 1009 : 1002).Encode();
-                writer.Append(enc, 4);
-                int _r = await writer.Flush(client);
-                active = false;
-                break;
-            }
-            if (feed == 0) { continue; }
-
-            int msgOpcode = asm.MessageOpcode();
-            string message = asm.Complete();
-
-            BumpStat();
-            string response = "";
-            if (onFrameData != null) {
-                // 同 HandleTcp：用户帧回调抛出只丢弃本条消息，
-                // 连接与循环存活。
-                try {
-                    response = await onFrameData(conn, message);
-                    if (response == null) { response = ""; }
-                } catch (Exception e) {
-                    Console.WriteLine("[ws] onMessage exception: " + e.Message);
-                    response = "";
-                }
-            } else {
-                response = message;   // default: echo
-            }
-            // One length drives both the frame header and the Append count.
-            // Reading .Length twice around the handler call is not safe: a
-            // cross-unit call can invalidate the cached length of a writable
-            // string (compiler stamps strlen back into the header), so the
-            // two reads can disagree for payloads containing NUL bytes and
-            // the frame goes out with a header larger than its body. strlen
-            // is stable across calls and matches the truncation contract the
-            // old server had (a NUL-payload echo re-delivers up to the NUL).
-            int respLen = (int)strlen(response);
-            if (respLen > 0) {
-                WsFrame respFrame = WsFrame.RawFrame(msgOpcode, response, respLen);
-                byte[] encoded = respFrame.Encode();
-                writer.Append(encoded, WsFrame.HeaderLen(respLen) + respLen);
-                BumpSent();
-            }
-        }   // while (active && !conn.closed)
-        } finally {
-            client.Close();
-            conn.closed = true;
-            conn.wsWriter = null;    // Push 之后拒绝写已关闭的 socket
-            this.WsConnRemove(conn);
-            this.DropConn();
-            ConnectionCloseHandler onDown = this.onClose;
-            if (onDown != null) { await onDown(conn); }
-        }
-    }
-
-    // ---- sse ----
-
-    /// SSE 订阅：读取 GET 请求头后回 200 text/event-stream（带 no-cache 与
-    /// CORS 通配头），把连接包成 SseConnection 交给 onSseSubscriber（未设
-    /// 回调时立即关闭）；此后连接由应用持有。请求头读取与 HTTP 路径
-    /// 一样武装 requestTimeout（慢速滴字客户端不能永久钉住连接），
-    /// 清理在 finally 中执行——onSseSubscriber 抛出时 DropConn 不能丢。
-    async void HandleSse(nint clientSock) {
-        TcpClient client = TcpClient.FromSocket(clientSock);
-        HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, this.requestTimeout);
-
-        // Read the subscriber's GET request head.
-        string req = "";
-        try {
-            while (HttpServer.FindHeaderEnd(req) < 0 && req.Length < 65536) {
-                string chunk = await client.RecvAsync(4096);
-                if (chunk.Length == 0) {
-                    client.Close();
-                    return;
-                }
-                req = req + chunk;
-            }
-        } finally {
-            HttpDeadline.Disarm(watch);
-        }
-        string path = "/";
-        HttpRequest head = HttpRequest.Parse(req);
-        if (head.path.Length > 0) { path = head.path; }
-
-        try {
-            int _n = await client.SendAsync("HTTP/1.1 200 OK\r\n"
-                + "Content-Type: text/event-stream\r\n"
-                + "Cache-Control: no-cache\r\n"
-                + "Connection: keep-alive\r\n"
-                + "Access-Control-Allow-Origin: *\r\n"
-                + "\r\n");
-
-            BumpStat();
-            SseConnection sse = SseConnection.Of(client, path);
-            if (this.onSseSubscriber != null) {
-                await this.onSseSubscriber(sse);
-            } else {
-                sse.Close();
-            }
-        } finally {
-            // The application owns the SseConnection from here.
-            this.DropConn();
-        }
-    }
-
-    // ---- mqtt ----
-
-    /// 把连接交给内置的 MqttBroker.Global() 处理；mqtt 协议没有应用回调。
-    async void HandleMqtt(nint clientSock) {
-        BumpStat();
-        try {
-            await MqttBroker.Global().HandleConnection(clientSock);
-        } finally {
-            this.DropConn();
-        }
-    }
-
     // ---- udp ----
 
     /// UDP 事件循环：每收到一个数据报调用 onPacket（未设回调时默认回显），
@@ -2628,11 +2338,6 @@ class Connection {
     string protocol;
     string userData;
     bool closed;
-    // WebSocket 连接的出站缓冲（服务端帧不掩码）。帧循环与 Push 共用
-    // 同一 writer：Append 到 Flush 之间没有 await，协程切换只发生在
-    // await 点，因此帧序天然一致，无需加锁。null = 非 WS 连接。
-    WsWriter wsWriter;
-    TcpClient wsClient;
 
     Connection(int id, nint sock, string protocol) {
         this.id = id;
@@ -2640,8 +2345,6 @@ class Connection {
         this.protocol = protocol;
         this.userData = "";
         this.closed = false;
-        this.wsWriter = null;
-        this.wsClient = null;
     }
 
     /// <summary>Arbitrary per-connection state for the application.</summary>
@@ -2670,8 +2373,9 @@ class Connection {
     }
 
     /// <summary>Queues raw bytes to the peer (fire-and-forget; usable from
-    /// synchronous callbacks). For "websocket" workers, prefer Push (framed)
-    /// or returning the reply from onMessage; Send writes raw bytes.</summary>
+    /// synchronous callbacks). On a WebSocket connection prefer WorkerWs.Push
+    /// (framed) or returning the reply from onMessage; Send writes raw
+    /// bytes.</summary>
     void Send(string data) {
         Task.Spawn(Socket.SendStringAsync(this.sock, data));
         Worker.BumpSent();
@@ -2682,42 +2386,6 @@ class Connection {
         int n = await Socket.SendStringAsync(this.sock, data);
         Worker.BumpSent();
         return n;
-    }
-
-    /// <summary>WebSocket push：把一条 Text 帧排进该连接的出站缓冲并立即
-    /// 写出（服务端帧不掩码）。可从任何回调上下文调用——包括 onOpen 里
-    /// 主动欢迎、定时器里广播等没有入站消息先行的场景，这正是与"从
-    /// onMessage 返回应答"的区别。连接已关或非 WS 连接返回 false。
-    /// 帧序与帧循环共用同一缓冲，Append 到 Flush 之间不让出，天然一致。</summary>
-    async bool Push(string data) {
-        if (this.closed || this.wsWriter == null) { return false; }
-        int len = (int)strlen(data);
-        WsFrame frame = WsFrame.RawFrame(WsOpcode.Text, data, len);
-        byte[] encoded = frame.Encode();
-        this.wsWriter.Append(encoded, WsFrame.HeaderLen(len) + len);
-        int n = await this.wsWriter.Flush(this.wsClient);
-        if (n < 0) {
-            this.closed = true;
-            return false;
-        }
-        Worker.BumpSent();
-        return true;
-    }
-
-    /// <summary>WebSocket 二进制 push：`data` 可含 NUL，`len` 为精确
-    /// 字节数（绝不 strlen）。语义同 Push。</summary>
-    async bool PushBinary(string data, int len) {
-        if (this.closed || this.wsWriter == null) { return false; }
-        WsFrame frame = WsFrame.RawFrame(WsOpcode.Binary, data, len);
-        byte[] encoded = frame.Encode();
-        this.wsWriter.Append(encoded, WsFrame.HeaderLen(len) + len);
-        int n = await this.wsWriter.Flush(this.wsClient);
-        if (n < 0) {
-            this.closed = true;
-            return false;
-        }
-        Worker.BumpSent();
-        return true;
     }
 
     /// <summary>Marks the connection to be closed by its worker loop.</summary>

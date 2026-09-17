@@ -153,6 +153,45 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   /subsystem 方向猜。另注意成员名比较的 `len` 要与字面量同步
   （"__DesignMain" 是 12 字节，写 13 永不命中——静默失配无任何诊断）。
 
+## stdlib 肥边治理：独立类分片 + 槽反转 + 实例方法组注入（A332 肥边③④，2026-09-17）
+
+- **重文件被"字段类型"钉进图，与被调用钉进同罪**：`HttpFramer` 有个
+  `TlsStream tls` 字段（+`CreateTls` 工厂），Worker.zan 拼了
+  `WsOpcode/SseConnection/MqttBroker`——字段类型与活引用一样是编译边，
+  把 TLS 全家（连带 Base64/Sha256 与 6.4MB ssl/crypto 驱动拷贝）、ws
+  编解码（866 行）、SSE（285 行）、MQTT broker+client（1299 行）拖进
+  **每一个** HTTP 程序。实测纯 HTTP 服务端探针 43→34 发布文件、
+  exe 679,936→528,896、bundled driver 行消失。
+- **切法 = 独立类分片 + 静态槽 + Install opt-in（partial 不可用）**：
+  实现搬到独立文件独立类（WorkerWs/WorkerSse/WorkerMqtt/HttpFramerTls，
+  **绝不能写 partial Worker**——分家名会拉全家，A332 肥边②已验），
+  核心留 `static ProtoEntryFn ws/sse/mqttEntry` 静态槽，Dispatch 经槽
+  分发；RunAll 前置 `CheckProtoEntries()`：专用协议槽空即打印
+  "needs WorkerXxx.Install()" 并 exit(1)（比首连接静默断开可诊断得多；
+  http 端口设了 ws 回调但没装分片只告警，明文语义不受影响）。
+  **CheckProtoEntries 只能读槽、不能拼分片类型名**——拼了（哪怕只为
+  报错文案的代码路径）就把分片拉回图，槽白拆；报错文案写进字符串没事。
+- **delegate 实例方法组绑定可用，async lambda 捕局部会段错误（探针
+  实测）**：`framer.recv = stream.RecvIntoAsync;`（把实例方法组赋给
+  `async delegate int(string,int)` 槽）编译且运行正确；但
+  `delegate(string b,int c){ return await s.Recv(b,c); }`（async lambda
+  捕局部 `s`）**编译通过、运行 SEGV**。字节源/回调注入一律走实例方法组
+  或"显式 self 参数的静态委托"，别写 async lambda。
+- **ZAN_PULLIN_DEBUG 日志两坑**：① 日志里混着"代码生成器自举"的另一次
+  zanc 闭包——`zan: compiling code generators (first use; cached …)` 之后
+  的 `incl Gen*/Web/Html` 行是生成器子编译的图，不是本程序的图（首次会
+  因 stdlib 变更缓存失效而打印，曾被误读成"删了反而多拉 14 个文件"）；
+  程序自己的图以下一行 `Published N files` / exe 尺寸为准。② 日志带
+  CRLF——从日志抽文件列表再 `grep`/`[ -f ]` 探测时必须先
+  `tr -d '\r'`，否则路径带 \r 全部 MISS，得出"图内没人引用它"的假阴性
+  （本次差点据此推翻真实触发链）。
+- **改 Worker/HttpFramer 这类"唯一宿主"的收尾清单**：grep 全仓库旧 API
+  调用点逐个补（`CreateTls`→`HttpFramerTls.Create`、`onSseSubscriber`→
+  `WorkerSse.onSseSubscriber` 静态字段、`conn.Push`→`WorkerWs.Push`），
+  examples/templates/conformance 三处都要；ws_loopback/ws_protocol_gate/
+  mqtt_loopback/sse_stream 四个 conformance 是这次拆分的守门用例。
+
+
 ## delegate 两形态与 wasm32 的 tag 碰撞
 
 - **形态契约（zan_abi.h）**：delegate 值一个指针两形态，bit 0 区分——偶数

@@ -1,9 +1,15 @@
 using System;
 using System.IO;
 using System.Net.Sockets;
-using System.Net.Tls;
 
 namespace System.Net.Http;
+
+/// TLS 分片注入的字节源：从 TLS 记录层精确收 (buf, cap) 内的字节，
+/// 返回收到的字节数（0 = 对端关闭），形态跟随 Socket.RecvIntoAsync，
+/// 使分片可以逐参转发。核心文件不拼 TlsStream 类型名——拼了会把
+/// TLS 全家（连带 Base64/Sha256 与 ssl/crypto 驱动拷贝）拉进一切
+/// HTTP 程序（A332 肥边④）。
+async delegate int FramerRecvFn(string buf, int cap);
 
 /// <summary>
 /// 一条 HTTP/1.1 连接上的请求拆包器：把字节流切成请求，
@@ -31,9 +37,9 @@ namespace System.Net.Http;
 /// </summary>
 class HttpFramer {
     nint sock;
-    // TLS 连接时的字节源（为空则直接从 sock 读）。HTTPS 的拆包
-    // 与明文 HTTP 完全一致，只是读字节的一步走 TLS 记录层。
-    TlsStream tls;
+    // TLS 字节源槽（明文为空，直接从 sock 读）。核心不拼 TlsStream
+    // 类型名——分片经 FramerRecvFn 注入实例方法组（HttpFramerTls.Create）。
+    FramerRecvFn recv;
     // 接收暂存区：从连接池借来的 64KB 复用缓冲区（每条连接构建一块
     // 的代价在短连接负载下比处理请求本身还贵）。
     string buf;
@@ -50,10 +56,10 @@ class HttpFramer {
     // 分块编码则是整个分块序列）。
     int wireBytes;
 
-    /// <summary>私有构造：用 <see cref="Create"/> / <see cref="CreateTls"/> 创建。</summary>
+    /// <summary>私有构造：用 <see cref="Create"/> 创建；TLS 变体见 HttpFramerTls.Create。</summary>
     HttpFramer() {
         this.sock = -1;
-        this.tls = null;
+        this.recv = null;
         this.buf = null;
         this.bufCap = 65536;
         this.pend = null;
@@ -66,17 +72,6 @@ class HttpFramer {
     static HttpFramer Create(nint sock) {
         HttpFramer f = new HttpFramer();
         f.sock = sock;
-        f.buf = TcpClient.RentRecvBuffer(65536);
-        f.bufCap = 65536;
-        f.pend = ByteBuffer.Alloc(4096);
-        return f;
-    }
-
-    /// <summary>从 TLS 连接拆包：除了字节源不同，定界规则与明文
-    /// HTTP 完全一样（TlsStream.RecvIntoAsync 同样给出精确字节数）。</summary>
-    static HttpFramer CreateTls(TlsStream stream) {
-        HttpFramer f = new HttpFramer();
-        f.tls = stream;
         f.buf = TcpClient.RentRecvBuffer(65536);
         f.bufCap = 65536;
         f.pend = ByteBuffer.Alloc(4096);
@@ -100,8 +95,8 @@ class HttpFramer {
     /// 返回收到的字节数，0 表示对端关闭。</summary>
     async int Fill() {
         int n = 0;
-        if (this.tls != null) {
-            n = await this.tls.RecvIntoAsync(this.buf, this.bufCap);
+        if (this.recv != null) {
+            n = await this.recv(this.buf, this.bufCap);
         } else {
             n = await Socket.RecvIntoAsync(this.sock, this.buf, this.bufCap);
         }
@@ -148,8 +143,8 @@ class HttpFramer {
         int want = this.bufCap;
         if (want > room) { want = room; }
         int n = 0;
-        if (this.tls != null) {
-            n = await this.tls.RecvIntoAsync(this.buf, want);
+        if (this.recv != null) {
+            n = await this.recv(this.buf, want);
         } else {
             n = await Socket.RecvIntoAsync(this.sock, this.buf, want);
         }
