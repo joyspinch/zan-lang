@@ -633,8 +633,17 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
     else if (istr_eq(name, "ulong",  5)) base = b->type_ulong;
     else if (istr_eq(name, "float",  5)) base = b->type_float;
     else if (istr_eq(name, "double", 6)) base = b->type_double;
-    /* decimal: mapped to double (no 128-bit decimal representation yet) */
-    else if (istr_eq(name, "decimal", 7)) base = b->type_double;
+    /* decimal is a reserved keyword with no type behind it (SPEC "保留关键
+     * 字，尚无对应类型"). It briefly resolved to double, which silently gave
+     * money math binary-floating semantics -- a C# port would run and only
+     * misbehave in the last bits. Reject so the representation (long minor
+     * units, double, or a string column) is chosen by the programmer. */
+    else if (istr_eq(name, "decimal", 7)) {
+        zan_diag_emit(b->diag, DIAG_ERROR, type_ref->loc,
+                      "'decimal' is not supported: use 'long' (minor units), "
+                      "'double', or a string column instead");
+        base = b->type_error;
+    }
     else if (istr_eq(name, "char",   4)) base = b->type_char;
     else if (istr_eq(name, "string", 6)) base = b->type_string;
     else if (istr_eq(name, "object", 6)) base = b->type_object;
@@ -1074,6 +1083,17 @@ static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
             }
             if ((base_sym->kind == SYM_CLASS || base_sym->kind == SYM_STRUCT) &&
                 !type_sym->type->base_type) {
+                /* C# sealed closes the derivation chain. The modifier used to
+                 * parse and vanish, so `sealed class X` derived everywhere
+                 * compiled fine -- the check lives at the adoption point so a
+                 * generic or partial base is caught by its symbol, not its
+                 * spelling. */
+                if ((base_sym->modifiers & MOD_SEALED) != 0) {
+                    zan_diag_emit(b->diag, DIAG_ERROR, base_ref->loc,
+                                  "cannot derive from sealed type '%.*s'",
+                                  (int)base_name.len, base_name.str);
+                    continue;
+                }
                 /* make sure the base has its own inherited fields first */
                 if (base_sym->decl &&
                     (base_sym->decl->kind == AST_CLASS_DECL ||

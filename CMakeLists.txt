@@ -3514,6 +3514,39 @@ add_test(NAME diag_generic_constraint_unknown
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_generic_constraint_unknown PROPERTIES TIMEOUT 60)
 
+# sealed used to parse and vanish: deriving from a `sealed class` compiled
+# with zero diagnostics. C# makes sealed a hard derivation barrier (CS0709).
+add_test(NAME diag_sealed_derive
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/sealed_derive.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_sealed_derive${_exe_ext}
+    "-DEXPECT_REGEX=cannot derive from sealed type 'Base'"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_sealed_derive PROPERTIES TIMEOUT 60)
+
+# `decimal` is a reserved keyword with no type: it used to resolve to double
+# silently, giving money math binary-floating semantics. Now a hard error.
+add_test(NAME diag_decimal_unsupported
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/decimal_unsupported.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_decimal_unsupported${_exe_ext}
+    "-DEXPECT_REGEX='decimal' is not supported: use 'long' \\(minor units\\)"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_decimal_unsupported PROPERTIES TIMEOUT 60)
+
+# The null-receiver guard used to be order-blind: a `x == null` test AFTER
+# the offending member access counted as a guard. Only preceding tests do.
+add_test(NAME diag_null_guard_after_use
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/null_guard_after_use.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_null_guard_after_use${_exe_ext}
+    "-DEXPECT_REGEX=can return null; accessing 'Name' on its result"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_null_guard_after_use PROPERTIES TIMEOUT 60)
+
 # Generic type arguments are invariant: List<int> is not a List<Box>, even
 # though both erase to the same object pointer in IR. Passing a mismatched
 # container used to compile and then dereference the elements as the wrong

@@ -3371,12 +3371,23 @@ static bool method_can_return_null(zan_symbol_t *m) {
 /* Does the body ever compare `name` against null (`x == null`, `x != null`,
  * `x is null`, `x?.y`, `x ?? y`)? A local that is tested anywhere in its method
  * is assumed guarded: the checker has no flow graph, and a guard in a sibling
- * branch is far more often correct code than a bug. */
-static bool node_guards_null(zan_ast_node_t *n, zan_istr_t name, int depth);
+ * branch is far more often correct code than a bug. `use` bounds the scan:
+ * only a test that starts BEFORE the offending access counts -- `s = F();
+ * use(s.X); if (s == null) ...` used to read as guarded because the test
+ * existed somewhere, while guarding nothing. */
+static bool loc_at_or_after(zan_loc_t a, zan_loc_t b) {
+    if (a.file_id != b.file_id)
+        return a.line > b.line || (a.line == b.line && a.col >= b.col);
+    return a.offset >= b.offset;
+}
 
-static bool list_guards_null(zan_ast_list_t *l, zan_istr_t name, int depth) {
+static bool node_guards_null(zan_ast_node_t *n, zan_istr_t name, int depth,
+                             zan_loc_t use);
+
+static bool list_guards_null(zan_ast_list_t *l, zan_istr_t name, int depth,
+                             zan_loc_t use) {
     for (int i = 0; i < l->count; i++)
-        if (node_guards_null(l->items[i], name, depth + 1)) return true;
+        if (node_guards_null(l->items[i], name, depth + 1, use)) return true;
     return false;
 }
 
@@ -3386,8 +3397,12 @@ static bool is_named_ident(zan_ast_node_t *n, zan_istr_t name) {
            memcmp(n->ident.name.str, name.str, (size_t)name.len) == 0;
 }
 
-static bool node_guards_null(zan_ast_node_t *n, zan_istr_t name, int depth) {
+static bool node_guards_null(zan_ast_node_t *n, zan_istr_t name, int depth,
+                             zan_loc_t use) {
     if (!n || depth > CHECKER_DERIVES_MAX_DEPTH) return false;
+    /* Children never start before their parent, so pruning a subtree that
+     * begins at or after the use is sound -- nothing inside it can guard. */
+    if (loc_at_or_after(n->loc, use)) return false;
     switch (n->kind) {
     case AST_BINARY:
         /* `x == null` / `x != null` / `x ?? fallback`, either operand order */
@@ -3398,73 +3413,73 @@ static bool node_guards_null(zan_ast_node_t *n, zan_istr_t name, int depth) {
             (n->binary.op == TK_QUESTION_QUESTION &&
              is_named_ident(n->binary.left, name)))
             return true;
-        return node_guards_null(n->binary.left, name, depth + 1) ||
-               node_guards_null(n->binary.right, name, depth + 1);
+        return node_guards_null(n->binary.left, name, depth + 1, use) ||
+               node_guards_null(n->binary.right, name, depth + 1, use);
     case AST_IS_EXPR:
     case AST_AS_EXPR:
         if (is_named_ident(n->type_test.expr, name)) return true;
-        return node_guards_null(n->type_test.expr, name, depth + 1);
+        return node_guards_null(n->type_test.expr, name, depth + 1, use);
     case AST_MEMBER_ACCESS:
         if (n->member.null_cond && is_named_ident(n->member.object, name))
             return true;
-        return node_guards_null(n->member.object, name, depth + 1);
+        return node_guards_null(n->member.object, name, depth + 1, use);
     case AST_UNARY:
-        return node_guards_null(n->unary.operand, name, depth + 1);
+        return node_guards_null(n->unary.operand, name, depth + 1, use);
     case AST_CAST_EXPR:
-        return node_guards_null(n->cast.expr, name, depth + 1);
+        return node_guards_null(n->cast.expr, name, depth + 1, use);
     case AST_CALL:
-        return node_guards_null(n->call.callee, name, depth + 1) ||
-               list_guards_null(&n->call.args, name, depth + 1);
+        return node_guards_null(n->call.callee, name, depth + 1, use) ||
+               list_guards_null(&n->call.args, name, depth + 1, use);
     case AST_INDEX:
-        return node_guards_null(n->index.object, name, depth + 1) ||
-               node_guards_null(n->index.index, name, depth + 1);
+        return node_guards_null(n->index.object, name, depth + 1, use) ||
+               node_guards_null(n->index.index, name, depth + 1, use);
     case AST_CONDITIONAL:
-        return node_guards_null(n->conditional.cond, name, depth + 1) ||
-               node_guards_null(n->conditional.then_expr, name, depth + 1) ||
-               node_guards_null(n->conditional.else_expr, name, depth + 1);
+        return node_guards_null(n->conditional.cond, name, depth + 1, use) ||
+               node_guards_null(n->conditional.then_expr, name, depth + 1, use) ||
+               node_guards_null(n->conditional.else_expr, name, depth + 1, use);
     case AST_ASSIGNMENT:
-        return node_guards_null(n->binary.left, name, depth + 1) ||
-               node_guards_null(n->binary.right, name, depth + 1);
+        return node_guards_null(n->binary.left, name, depth + 1, use) ||
+               node_guards_null(n->binary.right, name, depth + 1, use);
     case AST_BLOCK:
-        return list_guards_null(&n->block.stmts, name, depth + 1);
+        return list_guards_null(&n->block.stmts, name, depth + 1, use);
     case AST_EXPR_STMT:
-        return node_guards_null(n->expr_stmt.expr, name, depth + 1);
+        return node_guards_null(n->expr_stmt.expr, name, depth + 1, use);
     case AST_RETURN_STMT:
-        return node_guards_null(n->ret.value, name, depth + 1);
+        return node_guards_null(n->ret.value, name, depth + 1, use);
     case AST_THROW_STMT:
-        return node_guards_null(n->throw_stmt.value, name, depth + 1);
+        return node_guards_null(n->throw_stmt.value, name, depth + 1, use);
     case AST_VAR_DECL:
-        return node_guards_null(n->var_decl.initializer, name, depth + 1);
+        return node_guards_null(n->var_decl.initializer, name, depth + 1, use);
     case AST_IF_STMT:
-        return node_guards_null(n->if_stmt.cond, name, depth + 1) ||
-               node_guards_null(n->if_stmt.then_body, name, depth + 1) ||
-               node_guards_null(n->if_stmt.else_body, name, depth + 1);
+        return node_guards_null(n->if_stmt.cond, name, depth + 1, use) ||
+               node_guards_null(n->if_stmt.then_body, name, depth + 1, use) ||
+               node_guards_null(n->if_stmt.else_body, name, depth + 1, use);
     case AST_WHILE_STMT:
     case AST_DO_WHILE_STMT:
-        return node_guards_null(n->while_stmt.cond, name, depth + 1) ||
-               node_guards_null(n->while_stmt.body, name, depth + 1);
+        return node_guards_null(n->while_stmt.cond, name, depth + 1, use) ||
+               node_guards_null(n->while_stmt.body, name, depth + 1, use);
     case AST_FOR_STMT:
-        return node_guards_null(n->for_stmt.init, name, depth + 1) ||
-               node_guards_null(n->for_stmt.cond, name, depth + 1) ||
-               node_guards_null(n->for_stmt.step, name, depth + 1) ||
-               node_guards_null(n->for_stmt.body, name, depth + 1);
+        return node_guards_null(n->for_stmt.init, name, depth + 1, use) ||
+               node_guards_null(n->for_stmt.cond, name, depth + 1, use) ||
+               node_guards_null(n->for_stmt.step, name, depth + 1, use) ||
+               node_guards_null(n->for_stmt.body, name, depth + 1, use);
     case AST_FOREACH_STMT:
-        return node_guards_null(n->foreach_stmt.collection, name, depth + 1) ||
-               node_guards_null(n->foreach_stmt.body, name, depth + 1);
+        return node_guards_null(n->foreach_stmt.collection, name, depth + 1, use) ||
+               node_guards_null(n->foreach_stmt.body, name, depth + 1, use);
     case AST_TRY_STMT: {
-        if (node_guards_null(n->try_stmt.try_body, name, depth + 1)) return true;
+        if (node_guards_null(n->try_stmt.try_body, name, depth + 1, use)) return true;
         for (int i = 0; i < n->try_stmt.catches.count; i++) {
             zan_ast_node_t *cc = n->try_stmt.catches.items[i];
-            if (cc && node_guards_null(cc->catch_clause.body, name, depth + 1))
+            if (cc && node_guards_null(cc->catch_clause.body, name, depth + 1, use))
                 return true;
         }
-        return node_guards_null(n->try_stmt.finally_body, name, depth + 1);
+        return node_guards_null(n->try_stmt.finally_body, name, depth + 1, use);
     }
     case AST_SWITCH_STMT: {
-        if (node_guards_null(n->switch_stmt.expr, name, depth + 1)) return true;
+        if (node_guards_null(n->switch_stmt.expr, name, depth + 1, use)) return true;
         for (int i = 0; i < n->switch_stmt.cases.count; i++) {
             zan_ast_node_t *cs = n->switch_stmt.cases.items[i];
-            if (cs && node_guards_null(cs->switch_case.body, name, depth + 1))
+            if (cs && node_guards_null(cs->switch_case.body, name, depth + 1, use))
                 return true;
         }
         return false;
@@ -3484,11 +3499,12 @@ static void checker_reject_null_receiver(zan_checker_t *c, zan_ast_node_t *expr)
         if (obj != c->last_call_node) return;
         m = c->last_call_method;
     } else if (obj->kind == AST_IDENTIFIER) {
-        /* a local holding a nullable call result, never tested in this body */
+        /* a local holding a nullable call result, tested before this access */
         struct checker_local *l = checker_find_local_slot(c, obj->ident.name);
         if (!l || !l->null_src) return;
         if (!c->current_body) return;
-        if (node_guards_null(c->current_body, obj->ident.name, 0)) return;
+        if (node_guards_null(c->current_body, obj->ident.name, 0, expr->loc))
+            return;
         m = l->null_src;
     } else {
         return;
