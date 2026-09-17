@@ -254,6 +254,22 @@ DevTools（OpenDevTools）。
   - 是否带协议前缀（"://"）。
 
 
+## WebViewBootstrap (class)
+
+HeavyControls/链接路由注册入口：宿主启动时调一次 `Install()`，之后
+设计稿里的 WebViewBox 可用、`<a href>` 走内嵌导航器。不调用的程序
+整个家族被 DCE 删光，发布不携带浏览器 DLL。
+
+- static bool EnsureRuntime()
+  - 确保系统装着 WebView2 运行时，可直接内嵌网页时返回 true。没装则
+    下载微软官方 bootstrapper（约 1.8MB）静默安装（弹一次 UAC 提权），
+    装成功返回 true——之后要**新建 WebView/WebViewBox 实例**才会重试
+    创建。Win7/8.1 上 bootstrapper 已不派发兼容版（109 为最后版本），
+    会打开官方下载页并返回 false（用户装 109 离线包，或发布带 CEF 的
+    zan_cef109 驱动）。macOS 返回 true（WKWebView 系统自带）。建议在
+    `IsSupported()==false` 时询问用户后再调，不要默认静默下载执行
+    安装程序。
+
 ## WebView2 (class)
 
 Edge WebView2，由 Zan 直接驱动。

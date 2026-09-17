@@ -218,6 +218,22 @@ small-medium 之间**:画廊卡片标题先后用 13/15 都被打回"太小",17 
   Eval 加一次 Com.Free 即崩),重则过释放 CookieList 后后续 COM 调用
   在 STA 里永久挂死。只有同步方法调用拿到的出参(get_Source 等)才走
   `Com.GetString/Com.Free`;completion 参数一律只读。
+
+- **WebView2 完成回调的参数归引擎所有,不得释放**: 手写 COM 桥里完成
+  handler 收到的结果串(`ExecuteScript` 的 JSON、`AddScript...` 的
+  脚本 id)和 `GetCookies` 的列表指针,Invoke 返回后引擎自己回收——
+  按"方法出参用 CoTaskMemFree"的惯例去释放,轻则堆损坏(0xC0000374,
+  Eval 加一次 Com.Free 即崩),重则过释放 CookieList 后后续 COM 调用
+  在 STA 里永久挂死。只有同步方法调用拿到的出参(get_Source 等)才走
+  `Com.GetString/Com.Free`;completion 参数一律只读。
+- **WebView2 是"加载器+系统运行时"两层,缺运行时可自动装**: 随应用只发
+  166KB WebView2Loader.dll(组件 drivers/ 目录),引擎本体 Win10/11 自带;
+  没装的机器调 `WebViewBootstrap.EnsureRuntime()` 下载官方 bootstrapper
+  (~1.8MB)静默安装(弹一次 UAC),装后要新建 WebView 实例才重试创建
+  (created 标志一次性);Win7/8.1 的 bootstrapper 已不派发兼容版(109 为
+  最后),会改为打开官方下载页——要 Win7 免安装就发布带 CEF 的
+  zan_cef109 驱动。探测用 `WebView2.RuntimeVersion()`;用户装没装运行时
+  与代码无关,程序只认探测结果,别写死"一定有"。
 - **zanc 编 .html 设计稿会先喷 `<unknown>` 噪音诊断,不是编译失败**:
   编译前置的命名空间预扫描对原始 HTML 文本跑一遍 Zan lexer,HTML 的中文
   与超长 data-uri 会报成 "unexpected character" 和 "string literal

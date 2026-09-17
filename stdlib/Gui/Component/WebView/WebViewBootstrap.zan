@@ -63,4 +63,117 @@ class WebViewBootstrap {
         if (kind == "WebViewBox") { return new WebViewBox(); }
         return null;
     }
+
+    // ---- 运行时自动部署（Windows）-----------------------------------
+    //
+    // WebView2 是"加载器 + 系统运行时"两层：随应用发的只有 166KB 的
+    // WebView2Loader.dll，引擎本体（几百 MB Runtime）Win10/11 系统自带，
+    // 没装的机器由这里下载微软官方 bootstrapper（~1.8MB）静默安装；
+    // Win7/8.1 的 bootstrapper 已不派发兼容版（109 为最后版本），退化为
+    // 打开官方下载页让用户装 109 离线包。macOS 的 WKWebView 系统自带，
+    // 无此问题。
+
+    [DllImport("urlmon", EntryPoint = "URLDownloadToFileW")]
+    static extern int UrlDownloadToFile(nint caller, nint url, nint file,
+                                        int reserved, nint callback);
+    [DllImport("ntdll", EntryPoint = "RtlGetVersion")]
+    static extern int RtlGetVersion(nint info);
+    [DllImport("kernel32", EntryPoint = "CreateProcessW")]
+    static extern int CreateProcess(nint app, nint cmdline, nint procAttr,
+                                    nint threadAttr, int inheritHandles,
+                                    int flags, nint env, nint dir,
+                                    nint startupInfo, nint procInfo);
+    [DllImport("kernel32", EntryPoint = "WaitForSingleObject")]
+    static extern int WaitForSingleObject(nint handle, int ms);
+    [DllImport("kernel32", EntryPoint = "CloseHandle")]
+    static extern int CloseHandle(nint handle);
+    [DllImport("shell32", EntryPoint = "ShellExecuteW")]
+    static extern nint ShellExecute(nint hwnd, nint verb, nint file,
+                                    nint parameters, nint dir, int show);
+
+    /// 微软官方 Evergreen Bootstrapper 直链（fwlink 永久重定向）。
+    static string BootstrapperUrl() {
+        return "https://go.microsoft.com/fwlink/p/?LinkId=2124703";
+    }
+
+    /// <summary>确保系统装着 WebView2 运行时，可直接内嵌网页时返回
+    /// true。没装则下载官方 bootstrapper 静默安装（会弹一次 UAC 提权，
+    /// 视网速等半分钟到几分钟），装成功返回 true——之后要**新建
+    /// WebView/WebViewBox 实例**才会重试创建（旧实例 created 标志是
+    /// 一次性的）。Win7/8.1 打开官方下载页并返回 false（由用户装
+    /// 109 离线包，程序里 <c>IsSupported()</c> 为 false 时引导即可）。
+    /// macOS 返回 true（WKWebView 系统自带），其他平台返回 false。
+    /// 建议在首帧发现 <c>IsSupported()==false</c> 时询问用户后再调，
+    /// 不要默认静默下载执行安装程序。</summary>
+    static bool EnsureRuntime() {
+        #if MACOS
+        return true;
+        #elif WINDOWS
+        if (WebView2.RuntimeVersion() != "") { return true; }
+        if (IsWindows7Or8()) {
+            OpenUrl("https://developer.microsoft.com/en-us"
+                    + "/microsoft-edge/webview2/consumer");
+            return false;
+        }
+        string temp = Interop.EnvVar("TEMP");
+        if (temp == "") { temp = "."; }
+        string file = temp + "\\MicrosoftEdgeWebview2Setup.exe";
+        nint u = Wide.Of(BootstrapperUrl());
+        nint f = Wide.Of(file);
+        int hr = UrlDownloadToFile(0, u, f, 0, 0);
+        Wide.Free(u);
+        Wide.Free(f);
+        if (hr != 0) { return false; }
+        if (!RunInstaller(file)) { return false; }
+        return WebView2.RuntimeVersion() != "";
+        #else
+        return false;
+        #endif
+    }
+
+    /// Win7/8.1 判定：ntdll RtlGetVersion 的主版本号 < 10。
+    static bool IsWindows7Or8() {
+        nint info = NativeMemory.Alloc(288);   // OSVERSIONINFOW，首 4 字节 cb
+        new Span<int>(info, 1)[0] = 288;
+        int r = RtlGetVersion(info);
+        int major = new Span<int>(info + 4, 1)[0];
+        NativeMemory.Free(info);
+        return r == 0 && major < 10;
+    }
+
+    /// 以 `exe` 为命令行首起进程并等它退出（至多 10 分钟）：
+    /// bootstrapper 的 manifest 自带提权，UAC 弹窗由它自己触发。
+    static bool RunInstaller(string exe) {
+        nint cmd = Wide.Of("\"" + exe + "\" /silent /install");
+        nint si = NativeMemory.Alloc(104);     // STARTUPINFOW，cb = 104
+        for (int i = 0; i < 104; i = i + 1) {
+            new Span<byte>(si + i, 1)[0] = 0;
+        }
+        new Span<int>(si, 1)[0] = 104;
+        nint pi = NativeMemory.Alloc(24);      // PROCESS_INFORMATION
+        int ok = CreateProcess(0, cmd, 0, 0, 0, 0, 0, 0, si, pi);
+        Wide.Free(cmd);
+        NativeMemory.Free(si);
+        if (ok == 0) {
+            NativeMemory.Free(pi);
+            return false;
+        }
+        nint hProc = new Span<long>(pi, 1)[0];
+        nint hThread = new Span<long>(pi + 8, 1)[0];
+        NativeMemory.Free(pi);
+        if (hProc != 0) {
+            WaitForSingleObject(hProc, 600000);
+            CloseHandle(hProc);
+        }
+        if (hThread != 0) { CloseHandle(hThread); }
+        return true;
+    }
+
+    static void OpenUrl(string url) {
+        nint u = Wide.Of(url);
+        nint verb = Wide.Of("open");
+        ShellExecute(0, verb, u, 0, 0, 1);
+        Wide.Free(verb);
+        Wide.Free(u);
+    }
 }
