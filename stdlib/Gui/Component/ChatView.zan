@@ -57,6 +57,10 @@ class ChatMessage {
     string quoteText;
     /// 被引消息的宿主 id（发送时原样回给服务端，对端才能还原引用关系）。
     string quoteId;
+    /// 卡片消息（任务卡片一类「整体即入口」的消息）：左键单击（未拖动）
+    /// 交给宿主 OnBubbleActivate，不进文本选区——卡片没有可选中正文，
+    /// IM 惯例里单击选区对它没有意义。默认 false。
+    bool card;
 
     /// 一条普通消息：无思考、无信封，时间戳取当前 UTC 时刻。
     static ChatMessage Create(string role, string text) {
@@ -295,6 +299,12 @@ class ChatView : Control {
     ChatAvatarClick avatarClick;
     /// 气泡上右键的宿主回调（bubble 模式；null = 不响应右键）。
     ChatBubbleMenu bubbleMenu;
+    /// 卡片消息（msg.card）左键单击的宿主回调（null = 卡片不响应单击）。
+    ChatBubbleMenu bubbleActivate;
+    /// 卡片单击的按下状态：命中消息下标与按下点（未拖动即视为单击）。
+    int actMsg;
+    int actX;
+    int actY;
     /// 命中测试要从鼠标坐标换算气泡几何，而点击事件到达时手里没有
     /// App 参数——OnPaint 把当帧的 app 缓存下来供 AvatarHit 用。
     App uiApp;
@@ -814,8 +824,18 @@ class ChatView : Control {
                     this.ClearBubbleSelection();
                     app.RequestRedraw();
                 }
+                this.actMsg = -1;
                 return;
             }
+            // 卡片消息：按下只记命中与落点，不建选区——单击（未拖出
+            // 按下泡）在松开帧交给宿主 OnBubbleActivate。
+            if (data[h.msg].card) {
+                this.actMsg = h.msg;
+                this.actX = app.mouseX;
+                this.actY = app.mouseY;
+                return;
+            }
+            this.actMsg = -1;
             selMsg0 = h.msg; selOff0 = h.off;
             selMsg1 = h.msg; selOff1 = h.off;
             selDrag = true;
@@ -828,6 +848,21 @@ class ChatView : Control {
                 app.RequestRedraw();
                 return;
             }
+            // 卡片单击：松开还在同一泡、且基本没挪动才算（拖动手势
+            // 不触发，交给滚动/选区语义）。
+            if (app.window.EventButton() == 0 && this.actMsg >= 0
+                    && bubbleActivate != null && inside) {
+                ChatHit h = this.SnapHit(this.HitBubble(app, app.mouseX, app.mouseY, false));
+                int dx = app.mouseX - this.actX;
+                int dy = app.mouseY - this.actY;
+                if (h.msg == this.actMsg && dx * dx + dy * dy <= 64) {
+                    this.actMsg = -1;
+                    bubbleActivate(h.msg, data[h.msg].text);
+                    app.RequestRedraw();
+                    return;
+                }
+            }
+            this.actMsg = -1;
             // 右键：把落点与当前选中交给宿主菜单。组件不带菜单文案。
             if (app.window.EventButton() == 1 && bubbleMenu != null && inside) {
                 ChatHit h = this.SnapHit(this.HitBubble(app, app.mouseX, app.mouseY, false));
@@ -847,6 +882,7 @@ class ChatView : Control {
         if (bubKey == "" || data == null) { return; }
         ChatHit h = this.HitBubble(app, app.mouseX, app.mouseY, false);
         if (h.msg < 0 || h.msg >= data.Count) { return; }
+        if (data[h.msg].card) { return; }
         selMsg0 = h.msg; selOff0 = 0;
         selMsg1 = h.msg; selOff1 = data[h.msg].text.Length;
         app.RequestRedraw();
@@ -855,6 +891,13 @@ class ChatView : Control {
     /// 宿主注册「气泡被右键」回调（复制/引用/转发一类菜单由宿主出）。
     ChatView OnBubbleMenu(ChatBubbleMenu cb) {
         bubbleMenu = cb;
+        return this;
+    }
+
+    /// 宿主注册「卡片消息被单击」回调（任务卡片一类整体即入口的消息；
+    /// 只对 msg.card = true 的消息生效，见 BubbleMouse）。
+    ChatView OnBubbleActivate(ChatBubbleMenu cb) {
+        bubbleActivate = cb;
         return this;
     }
 
@@ -875,6 +918,12 @@ class ChatView : Control {
     /// 指针在气泡区上时滚轮滚动：气泡是像素滚动的，一档滚 40px（约一
     /// 行多一点），而不是记录模式的一整行。
     void TakeBubbleWheel(App app) {
+        // 认领以真溢出为前提：内容放得下视口时不认领，滚轮穿透给
+        // 外层容器/页面（认领了 bscr 也只会被钳回 0 白吃一格）。
+        int padV = app.Scale(10);
+        int viewH = bh - padV * 2;
+        int over = bubH - viewH;
+        if (over <= 0) { return; }
         if (!app.CaptureWheel(bx, by, bw, bh)) { return; }
         int d = app.window.EventKeyCode();
         int step = d / 120;
@@ -882,10 +931,6 @@ class ChatView : Control {
             if (d > 0) { step = 1; }
             else if (d < 0) { step = 0 - 1; }
         }
-        int padV = app.Scale(10);
-        int viewH = bh - padV * 2;
-        int over = bubH - viewH;
-        if (over < 0) { over = 0; }
         // bscr 是「离底部多少像素」（与记录模式的 scrollSig 同一语义：
         // 0 = 贴住最新一条）。滚轮向上 = step 为正 = 要看更旧的内容 =
         // 离底部更远，所以是加不是减——此前这里写成减号，滚轮方向整个
@@ -898,6 +943,10 @@ class ChatView : Control {
 
     /// 指针在记录上时滚轮滚动。
     void TakeWheel(App app) {
+        // 认领以真溢出为前提：grid.maxScroll 是上一帧绘制算出的界限
+        // （本帧绘制在子控件那步才更新），跨界时认领晚一帧，无害；
+        // 记录放得下时不认领，滚轮穿透给外层。
+        if (grid.maxScroll <= 0) { return; }
         if (!app.CaptureWheel(bx, by, bw, bh)) { return; }
         int d = app.window.EventKeyCode();
         int step = d / 120;

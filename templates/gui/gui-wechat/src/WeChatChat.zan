@@ -64,7 +64,6 @@ class WxPageChat : Control {
     Flex popup;
     WxEmojiPanel emoPanel;
     WxAvaPanel avaPanel;
-    WxFilePanel filePanel;
     Control curPopup;
     /// 文件按钮的真选择器（A327-13b）：懒建，选中即上传发送。
     FilePicker pick;
@@ -72,6 +71,8 @@ class WxPageChat : Control {
     ToolStrip bar;
     /// 点任意用户头像弹出的小名片（与抽屉互斥的右缘浮卡）。
     WxProfilePanel prof;
+    /// 点任务卡片弹出的详情卡（与抽屉/名片互斥，A327-13c）。
+    WxTaskSheet taskSheet;
 
     WxPageChat() {
         this.InitControl("wxPageChat", 5);
@@ -100,18 +101,19 @@ class WxPageChat : Control {
         list.OnSelect(() => { this.Select(list.SelectedIndex()); });
         listHost.Add(list);
 
-        // ---- 右侧标题行：文字是文档元素；头像右侧的四个图标按钮
-        // 是动态控件——语音通话/视频通话（摆设）、聊天记录（开独立
-        // 记录窗口）、...（开右侧抽屉）。runtime 通道没有
-        // data-x-props：图标与悬停提示 code-behind 补（导航栏同款）。
+        // ---- 右侧标题行：文字是文档元素；头像右侧的图标按钮
+        // 是动态控件——聊天记录（开独立记录窗口）、...（开右侧
+        // 抽屉）；语音/视频通话未启用（A327-13c 直接隐藏，不再
+        // 摆摆设）。runtime 通道没有 data-x-props：图标与悬停
+        // 提示 code-behind 补（导航栏同款）。
         headName = ui.Find("HeadName");
         headDesc = ui.Find("HeadDesc");
         Button callBtn = (Button)ui.Find("HeadCall");
         callBtn.SetProp("icon", "phone");
-        callBtn.Tip = "语音通话";
+        callBtn.visible = false;
         Button videoBtn = (Button)ui.Find("HeadVideo");
         videoBtn.SetProp("icon", "video");
-        videoBtn.Tip = "视频通话";
+        videoBtn.visible = false;
         Button histBtn = (Button)ui.Find("HeadHist");
         histBtn.SetProp("icon", "message");
         histBtn.Tip = "聊天记录";
@@ -146,7 +148,7 @@ class WxPageChat : Control {
         Button send = (Button)ui.Find("SendBtn");
         send.OnClick(() => { this.Send(); });
 
-        // ---- 输入区上方的弹出面板（表情 / 常用头像 / 文件）----
+        // ---- 输入区上方的弹出面板（表情 / 常用头像）----
         // 面板本体是动态控件，挂进骨架的 #PopupHost（聊天区与输入区
         // 之间）：收起时壳零高，聊天区吃满；展开时壳随面板长高。
         // 弹出面板的宿主用 flex 列 + 交叉轴起点：面板自己的宽度
@@ -163,9 +165,6 @@ class WxPageChat : Control {
         avaPanel = WxAvaPanel.Of((t) => { this.Type(t); });
         avaPanel.Root().visible = false;
         popup.Add(avaPanel.Root());
-        filePanel = WxFilePanel.Of((t) => { this.Type(t); });
-        filePanel.Root().visible = false;
-        popup.Add(filePanel.Root());
         popupHost.Add(popup);
 
         // ---- 「...」的右侧抽屉（私聊/群聊两种版式在同一列里翻）----
@@ -187,6 +186,12 @@ class WxPageChat : Control {
         prof.dock = 4;
         this.Add(prof);
 
+        // ---- 任务详情卡：点聊天的任务卡片弹出（右缘浮卡，与名片同
+        // 一互斥组；A327-13c）----
+        taskSheet = WxTaskSheet.Of();
+        taskSheet.dock = 4;
+        this.Add(taskSheet);
+
         // ---- 聊天记录本体：动态控件挂进骨架的 #ChatHost（标题行
         // 与输入区之间，grow 类吃满剩余高度） ----
         Control chatHost = ui.Find("ChatHost");
@@ -199,6 +204,8 @@ class WxPageChat : Control {
         chat.OnAvatarClick((idx) => { this.OpenMsgProfile(idx); });
         // 右键气泡 = 复制 / 引用；「引用」把草稿交给桥，随下一条发送。
         chat.OnBubbleMenu((idx, sel) => { this.OpenBubbleMenu(idx, sel); });
+        // 点任务卡片 = 拉详情弹右缘详情卡（card 消息才有单击语义）。
+        chat.OnBubbleActivate((idx, sel) => { this.OpenTaskCard(idx); });
         chatHost.Add(chat);
 
         this.Select(0);
@@ -250,7 +257,6 @@ class WxPageChat : Control {
         curPopup = p;
         emoPanel.Root().visible = p == emoPanel.Root();
         avaPanel.Root().visible = p == avaPanel.Root();
-        filePanel.Root().visible = p == filePanel.Root();
         drawer.visible = false;
         prof.Hide();
         popup.visible = true;
@@ -306,6 +312,28 @@ class WxPageChat : Control {
     void ShowProfile(string nm, string ini, string tint) {
         this.ShowProfileCard(WxProfiles.Of(nm, ini, tint));
     }
+
+    /// 点任务卡片（A327-13c）：按消息里的 taskId 拉详情弹右缘详情卡。
+    /// 与名片同一互斥组——弹卡前收抽屉与弹出面板；详情还没拉到先
+    /// 摆「加载中」占位，失败就地改写。
+    void OpenTaskCard(int idx) {
+        if (current < 0 || current >= data.Count) { return; }
+        if (idx < 0 || idx >= data[current].msgs.Count) { return; }
+        ChatMessage m = data[current].msgs[idx];
+        if (!m.card || m.taskId == null || m.taskId.Length == 0) { return; }
+        this.ClosePopups();
+        drawer.visible = false;
+        taskSheet.ShowLoading();
+        WxIm.FetchTaskCard(m.taskId, (d) => {
+            if (d == null) {
+                taskSheet.ShowError("任务详情拉取失败");
+                return;
+            }
+            taskSheet.Show(d);
+        });
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
 
     /// 清空当前会话：共享的记录列表清掉，聊天区与列表摘要跟上
     /// （抽屉底部那行红字）。

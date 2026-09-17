@@ -122,6 +122,13 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   空串（「程序随附资源回落」语义——磁盘上有就用原路径），永远产不出
   绝对路径；要取绝对 cwd 用 `Directory.GetCurrentDirectory()`（跨平
   台）。想用 ReadPath(".") 拿 cwd 的写法静默失效，极难察觉。
+- **截图 diff 断言必须选「内容必然变化」的动作**：PNG 确定性编码下，
+  「重拉同一份数据再渲染」的重绘字节与之前完全相同（重绘发生了但断言
+  假阴）——重开同一个详情面板这类动作判不了重绘，改判开/关切换（收起
+  必然少一块像素）或数据必然不同的两步。
+- **Windows 控制台命令的 subprocess 捕获别用 `text=True`**：tasklist
+  这类工具按系统码页（GBK）输出，UTF-8 reader 直接 UnicodeDecodeError
+  崩线程；拿 bytes 自己按 `errors="replace"` 解码。
 - **客户端程序链接报 `cannot find -lssl/-lcrypto`**：普通链接（非
   `--publish`）要求 TLS 导入库在搜索路径可达，报错不提示解法——设
   `ZAN_LIB_PATH` 指向 stdlib 的 System/Security/Cryptography/drivers/

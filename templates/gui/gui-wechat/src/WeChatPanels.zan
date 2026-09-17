@@ -278,35 +278,134 @@ class WxAvaPanel {
     }
 }
 
-/// 「选择文件」面板（聊天框的文件夹按钮）：最近文件列表，
-/// 点一行把「[文件] 名字（大小）」填进输入框——原版这里开系统
-/// 文件对话框，示例里用虚构的最近文件代替。
-class WxFilePanel {
-    Flex root;
+/// 任务详情卡（A327-13c）：点聊天里的任务卡片弹出。dock 4 右缘浮卡，
+/// 与资料名片同一互斥组（宿主弹卡前收抽屉/弹出面板）；外观复用名片
+/// 那套 wxp* 皮肤类。数据来自 /api/collab/taskdetail 的 data 节点，
+/// 拉取与失败改写由宿主负责（WxIm.FetchTaskCard → WeChatChat）。
+class WxTaskSheet : Control {
+    Label titleLbl;
+    Label statusLbl;
+    Label ownerLbl;
+    Label descLbl;
+    Label progLbl;
+    Panel evBox;
 
-    static WxFilePanel Of(Action<string> insert) {
-        WxFilePanel p = new WxFilePanel();
-        p.Build(insert);
-        return p;
+    static WxTaskSheet Of() { return new WxTaskSheet(); }
+
+    WxTaskSheet() {
+        this.InitControl("wxtasksheet", 4);
+        this.Class = "wxprofile";
+        this.visible = false;
+
+        Flex head = Wx.Row("wxphead");
+        head.dock = 1;
+        Panel ht = Panel.Column();
+        ht.Class = "grow";
+        titleLbl = Wx.Lbl("任务", "wxpname");
+        ht.Add(titleLbl);
+        statusLbl = Wx.Lbl("", "wxpsub");
+        ht.Add(statusLbl);
+        head.Add(ht);
+        Button dots = Wx.IconBtn("dots");
+        dots.dock = 4;
+        dots.OnClick(() => { this.Hide(); });
+        head.Add(dots);
+        this.Add(head);
+        this.Add(Wx.Line());
+
+        Panel body = Wx.Col("wxpbody");
+        body.dock = 5;
+        ownerLbl = Wx.Lbl("", "wxpsub");
+        body.Add(ownerLbl);
+        progLbl = Wx.Lbl("", "wxpsub");
+        body.Add(progLbl);
+        descLbl = Wx.Lbl("", "wxpval");
+        body.Add(descLbl);
+        body.Add(Wx.Line());
+        body.Add(Wx.Lbl("动态", "wxemotitle"));
+        evBox = Panel.Column();
+        evBox.Class = "grow";
+        body.Add(evBox);
+        this.Add(body);
     }
 
-    Control Root() { return root; }
+    /// 详情没拉到前的占位（taskId 已带上，异步回填）。
+    void ShowLoading() {
+        titleLbl.Text = "任务";
+        statusLbl.Text = "加载中…";
+        ownerLbl.Text = "";
+        progLbl.Text = "";
+        descLbl.Text = "";
+        evBox.RemoveAll();
+        this.visible = true;
+    }
 
-    void Build(Action<string> insert) {
-        root = Flex.Column();
-        root.AddClass("wxfilepanel");
-        root.Add(Wx.Lbl("选择文件", "wxemotitle"));
-        List<WxFileRow> fs = WxData.Files();
-        for (int i = 0; i < fs.Count; i = i + 1) {
-            WxFileRow f = fs[i];
-            Button b = new Button(f.name);
-            b.Icon = f.icon;
-            b.Class = "text small wxfilebtn";
-            b.Tip = f.size + " · " + f.date;
-            b.OnClick(() => { insert("[文件] " + f.name + "（" + f.size + "）"); });
-            root.Add(b);
+    /// 拉取失败就地改写（卡片还开着，用户看得见失败）。
+    void ShowError(string msg) {
+        statusLbl.Text = msg;
+        evBox.RemoveAll();
+        this.visible = true;
+    }
+
+    /// 按 taskdetail 的 data 节点摆卡。负责人名单解析走发言人注册表
+    /// （会话成员那侧登记过就有名字），认不出的给「成员#id」。
+    void Show(JsonValue d) {
+        titleLbl.Text = d.Str("title", "");
+        statusLbl.Text = WxIm.StatusZh(d.Str("status", ""));
+        ownerLbl.Text = "创建 " + WxTaskSheet.Who(d.Str("ownerId", "0"))
+            + " · 负责 " + WxTaskSheet.Who(d.Str("assigneeId", "0"));
+        int prog = Convert.ToInt32(d.Str("progress", "0"));
+        progLbl.Text = "进度 " + Convert.ToString(prog) + "%";
+        string desc = d.Str("description", "");
+        descLbl.Text = desc.Length > 0 ? desc : "（无描述）";
+
+        evBox.RemoveAll();
+        JsonValue evs = d.Get("events");
+        int n = evs == null ? 0 : evs.Count();
+        // 最近 8 条（events 按 id 升序，取尾段），新动作排前。
+        int from = n > 8 ? n - 8 : 0;
+        for (int i = n - 1; i >= from; i = i - 1) {
+            JsonValue e = evs.At(i);
+            string line = WxIm.StatusZh(WxTaskSheet.EventZh(e.Str("event", "")))
+                + " · " + WxIm.ClockOf(e.Str("at", "0"));
+            string why = e.Str("reason", "");
+            if (why.Length == 0) { why = e.Str("content", ""); }
+            if (why.Length > 0) { line = line + "：" + why; }
+            evBox.Add(Wx.Lbl(line, "wxpsub"));
         }
-        root.Add(Wx.Lbl("示例不会打开系统对话框：点文件名直接填入输入框",
-            "wxemotitle"));
+        if (n == 0) {
+            evBox.Add(Wx.Lbl("暂无动态", "wxpsub"));
+        }
+        this.visible = true;
+    }
+
+    void Hide() {
+        this.visible = false;
+    }
+
+    /// 成员 id → 显示名（注册表认不出给「成员#id」）。
+    static string Who(string idStr) {
+        long id = Convert.ToInt64(idStr);
+        if (id <= 0) { return "—"; }
+        string key = "u:" + Convert.ToString(id);
+        string nm = WxData.NameOf(key);
+        if (nm != null) { return nm; }
+        return "成员#" + Convert.ToString(id);
+    }
+
+    /// 事件类型 → 中文（服务端 TaskLog 的 eventType 词典）。
+    static string EventZh(string ev) {
+        if (ev == "created") { return "创建"; }
+        if (ev == "claimed") { return "认领"; }
+        if (ev == "assigned") { return "转交"; }
+        if (ev == "started") { return "开工"; }
+        if (ev == "progress") { return "汇报进度"; }
+        if (ev == "blocked") { return "阻塞"; }
+        if (ev == "unblocked") { return "解除阻塞"; }
+        if (ev == "submitted") { return "提交验收"; }
+        if (ev == "approved") { return "验收通过"; }
+        if (ev == "rejected") { return "验收驳回"; }
+        if (ev == "cancelled") { return "取消"; }
+        return ev;
     }
 }
