@@ -654,26 +654,48 @@ class GenForm {
         }
     }
 
-    /// 校验 DataGrid 的声明式列:columns 必须是对象数组,每列的
-    /// "field" 是行实体上的字段路径(点分标识符),"type" 只认
-    /// text/num/real/bool/date。带列的网格还必须写 "of"——列访问器
-    /// 读的是 "of" 类型的字段,缺省的 string 上没有它们。
+    /// 校验 DataGrid 的声明式列。列有两个声明面：手写文档的
+    /// columns 对象数组，与设计器列编辑器写出的 options
+    /// "标题:字段" 选项串（设计器以 options 为列序真相，columns
+    /// 条目只是同下标的声明属性跟随表）。任一面声明了带字段的
+    /// 列，"of" 就是必需的——列访问器读的是 "of" 类型的字段，
+    /// 缺省的 string 上没有它们。
     static void ValidateColumns(JsonValue reply, JsonValue o, string f0,
                                 int idx) {
         JsonValue cols = o.Get("columns");
-        if (cols == null) { return; }
-        if (!cols.IsArray()) {
+        if (cols != null && !cols.IsArray()) {
             GenCommon.Fail(reply, f0 + ": design field " +
                 Convert.ToString(idx) +
                 ": DataGrid \"columns\" must be an array of column objects");
             return;
         }
-        if (cols.Count() > 0 && GenForm.ObjStr(o, "of").Length == 0) {
+        JsonValue opts = o.Get("options");
+        bool optField = false;
+        if (opts != null && opts.IsArray()) {
+            for (int j = 0; j < opts.Count(); j = j + 1) {
+                string opt = opts.At(j).AsString("");
+                string fld = GenForm.OptFieldOf(opt);
+                if (fld.Length > 0) {
+                    optField = true;
+                    if (!GenForm.ValidFieldPath(fld)) {
+                        GenCommon.Fail(reply, f0 + ": design field " +
+                            Convert.ToString(idx) + " column option '" +
+                            opt + "' has an invalid field '" + fld +
+                            "'; use dotted identifiers (name, addr.city)");
+                    }
+                }
+            }
+        }
+        bool hasCols = cols != null && cols.IsArray() && cols.Count() > 0;
+        if (!hasCols && !optField) { return; }
+        if (GenForm.ObjStr(o, "of").Length == 0) {
             GenCommon.Fail(reply, f0 + ": design field " +
                 Convert.ToString(idx) +
-                ": a DataGrid with \"columns\" requires \"of\" naming the row" +
-                " entity type");
+                ": a DataGrid with declarative columns (\"columns\" or" +
+                " \"options\" title:field entries) requires \"of\" naming" +
+                " the row entity type");
         }
+        if (cols == null || !cols.IsArray()) { return; }
         for (int j = 0; j < cols.Count(); j = j + 1) {
             JsonValue c = cols.At(j);
             if (c == null || !c.IsObject()) {
@@ -682,11 +704,21 @@ class GenForm {
                     " must be an object");
                 continue;
             }
+            /* 条目自己的 field 缺省时，同下标 options 的 "标题:字段"
+             * 供给字段名（设计器的跟随表形态）——两处都没有才报错。 */
             string field = GenForm.ObjStr(c, "field");
-            if (!GenForm.ValidFieldPath(field)) {
+            if (field.Length == 0) {
+                field = GenForm.OptFieldAt(opts, j);
+            }
+            if (field.Length == 0) {
                 GenCommon.Fail(reply, f0 + ": design field " +
                     Convert.ToString(idx) + " column " + Convert.ToString(j) +
                     " requires \"field\": a field name on the row entity");
+            } else if (!GenForm.ValidFieldPath(field)) {
+                GenCommon.Fail(reply, f0 + ": design field " +
+                    Convert.ToString(idx) + " column " + Convert.ToString(j) +
+                    " has an invalid \"field\" '" + field +
+                    "'; use dotted identifiers (name, addr.city)");
             }
             string t = GenForm.ObjStr(c, "type");
             if (t.Length > 0 && t != "text" && t != "num" && t != "real" &&
@@ -955,9 +987,29 @@ static List<string> NonConstructibleKinds() {
     /// ({"field":"name"} -> `__r => __r.name`),不经过任何字符串行
     /// 中间层;字段名或列类型与实体不符时由编译器在生成代码上报错。
     /// 数据本身由 code-behind 用 `grid.Bind(list)` 传入 List<of>。
+    /// 设计器文档的列序真相在 options（"标题:字段" 选项串，列编辑
+    /// 器写的就是它），columns[i] 只是同下标的声明属性跟随表——
+    /// options 非空时按它合成列，两处声明在 EmitColumn 汇合。
     static void EmitColumns(StringBuilder b, JsonValue o, string vn) {
         JsonValue cols = o.Get("columns");
-        if (cols != null && cols.IsArray()) {
+        JsonValue opts = o.Get("options");
+        if (opts != null && opts.IsArray() && opts.Count() > 0) {
+            string of = GenForm.ObjStr(o, "of");
+            for (int i = 0; i < opts.Count(); i = i + 1) {
+                string opt = opts.At(i).AsString("");
+                JsonValue entry = GenForm.ColEntryAt(cols, i);
+                GenForm.EmitOptionColumn(b, vn, opt, entry, of);
+            }
+            /* columns 比 options 长的部分照旧发射（两处声明并存
+             * 时不丢列）。 */
+            if (cols != null && cols.IsArray()) {
+                for (int i = opts.Count(); i < cols.Count(); i = i + 1) {
+                    JsonValue c = cols.At(i);
+                    if (c == null || !c.IsObject()) { continue; }
+                    GenForm.EmitColumn(b, c, vn);
+                }
+            }
+        } else if (cols != null && cols.IsArray()) {
             for (int i = 0; i < cols.Count(); i = i + 1) {
                 JsonValue c = cols.At(i);
                 if (c == null || !c.IsObject()) { continue; }
@@ -973,6 +1025,77 @@ static List<string> NonConstructibleKinds() {
                          of + "());\n");
             }
         }
+    }
+
+    /// columns 数组第 i 个条目（缺失/非数组/越界/非对象返回 null）。
+    static JsonValue ColEntryAt(JsonValue cols, int i) {
+        if (cols == null || !cols.IsArray()) { return null; }
+        if (i < 0 || i >= cols.Count()) { return null; }
+        JsonValue e = cols.At(i);
+        if (e == null || !e.IsObject()) { return null; }
+        return e;
+    }
+
+    /// 设计器列选项 "标题:字段" 的字段部分（首个冒号之后；没有
+    /// 冒号返回 ""）。与 Designer.ColField 同约定。
+    static string OptFieldOf(string opt) {
+        for (int i = 0; i < opt.Length; i = i + 1) {
+            if (opt.Substring(i, 1) == ":") {
+                return opt.Substring(i + 1, opt.Length - i - 1);
+            }
+        }
+        return "";
+    }
+
+    /// options 数组第 i 项的字段部分（opts 非数组/越界返回 ""）。
+    static string OptFieldAt(JsonValue opts, int i) {
+        if (opts == null || !opts.IsArray()) { return ""; }
+        if (i < 0 || i >= opts.Count()) { return ""; }
+        return GenForm.OptFieldOf(opts.At(i).AsString(""));
+    }
+
+    /// 列选项的标题部分（首个冒号之前；没有冒号是整串）。
+    static string OptTitleOf(string opt) {
+        for (int i = 0; i < opt.Length; i = i + 1) {
+            if (opt.Substring(i, 1) == ":") {
+                return opt.Substring(0, i);
+            }
+        }
+        return opt;
+    }
+
+    /// 把一条 options 列选项（"标题:字段"）连同同下标的 columns
+    /// 声明条目发射成列：field/title 以显式条目优先，缺省从选项串
+    /// 解析，条目的其余声明键（width/type/align/聚合…）原样并入，
+    /// 走与手写 columns 相同的 EmitColumn 通道。只有标题的列在无
+    /// "of"（DataGrid<string>，行即文本）时发射 `__r => __r` 直读
+    /// 行文本；有 "of" 时无法构成访问器，跳过（与手写 columns 缺
+    /// field 的行为一致）。
+    static void EmitOptionColumn(StringBuilder b, string vn,
+                                 string opt, JsonValue entry, string of) {
+        string field = entry != null ? GenForm.ObjStr(entry, "field") : "";
+        string title = entry != null ? GenForm.ObjStr(entry, "title") : "";
+        if (field.Length == 0) { field = GenForm.OptFieldOf(opt); }
+        if (title.Length == 0) { title = GenForm.OptTitleOf(opt); }
+        if (field.Length == 0) {
+            if (opt.Length == 0 || of.Length > 0) { return; }
+            int width = entry != null ? GenForm.ObjNum(entry, "width", 100) : 100;
+            b.Append("        " + vn + ".Col(\"" + GenCommon.Esc(title) +
+                     "\", " + Convert.ToString(width) + ", __r => __r);\n");
+            return;
+        }
+        if (title.Length == 0) { title = field; }
+        JsonValue m = JsonValue.NewObject();
+        m.Put("field", JsonValue.NewStr(field));
+        m.Put("title", JsonValue.NewStr(title));
+        if (entry != null && entry.IsObject()) {
+            for (int k = 0; k < entry.Count(); k = k + 1) {
+                string ek = entry.KeyAt(k);
+                if (ek == "field" || ek == "title") { continue; }
+                m.Put(ek, entry.ValAt(k));
+            }
+        }
+        GenForm.EmitColumn(b, m, vn);
     }
 
     /// 把一列的声明展开成 DataGrid<T> 的链式列构造调用

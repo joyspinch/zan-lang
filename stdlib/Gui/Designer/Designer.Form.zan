@@ -654,7 +654,10 @@ partial class Designer {
     }
 
     /// 把一层停靠组件排进 (ax, ay, aw, ah)。`tabFilter >= 0` 时
-    /// 只排该标签页下的子级。
+    /// 只排该标签页下的子级。两遍式与运行时 Control.Arrange 同构：
+    /// 第一遍四边停靠按子序切剩余矩形，第二遍 Fill 统一铺最终的
+    /// 剩余矩形——Fill 若内联在切边途中取矩形，会盖住排在其后
+    /// 的边停靠条（运行时不会），画布和发布窗体从此不一致。
     void ApplyDockLayer(List<FormField> lst, int ax, int ay, int aw, int ah,
             int tabFilter) {
         int rx = ax;
@@ -684,14 +687,15 @@ partial class Designer {
                 f.SetLayoutRect(fx, ry, tw, rh);
                 if (d == 3) { rx = rx + tw; }
                 rw = rw - tw;
-            } else if (d == 5) {
-                // Fill 铺满剩下的矩形但不吃掉它（跟运行时
-                // Control.Arrange 一致）：否则同一层里第二个 Fill
-                // 以及 Fill 后面的组件全部只能拿到 0×0。
-                f.SetLayoutRect(rx, ry, rw, rh);
             }
             if (rw < 0) { rw = 0; }
             if (rh < 0) { rh = 0; }
+        }
+        for (int i = 0; i < lst.Count; i = i + 1) {
+            FormField f = lst[i];
+            if (f.IsNonVisual()) { continue; }
+            if (tabFilter >= 0 && f.childTab != tabFilter) { continue; }
+            if (f.dockSide == 5) { f.SetLayoutRect(rx, ry, rw, rh); }
         }
     }
 
@@ -1526,6 +1530,15 @@ partial class Designer {
                         msg = Designer.T("locked", "已锁定");
                     } else if (!openReq && free) {
                         this.PushUndo();
+                        // 拖动即解除停靠：画布解算与生成代码都是
+                        // dock 优先于 fx/fy，带 dock 的组件拖动写下
+                        // 的作者矩形没人消费，下一帧又被解算摆回
+                        // 原位——拖了等于没拖。要重新停靠走检查器
+                        // 的停靠边下拉。
+                        if (hit.dockSide != 0) {
+                            hit.dockSide = 0;
+                            msg = Designer.T("docked -> free", "已解除停靠");
+                        }
                         freeDragging = true;
                         freeDragDx = mDesX - (freeSelPX + hit.LayoutX());
                         freeDragDy = mDesY - (freeSelPY + hit.LayoutY());
@@ -1624,6 +1637,9 @@ partial class Designer {
                     if (ef == null || ef.locked) { continue; }
                     if (ef == sel || this.IsAncestorOf(sel, ef)
                             || this.HasAncestorIn(ef, freeExtra)) { continue; }
+                    // 同主选中项：拖动即解除停靠，否则写下的
+                    // fx/fy 没人消费、下一帧被解算摆回去。
+                    ef.dockSide = 0;
                     ef.fx = ef.LayoutX() + mvdx;
                     ef.fy = ef.LayoutY() + mvdy;
                     if (ef.fx < 0) { ef.fx = 0; }
