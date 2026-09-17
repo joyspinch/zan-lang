@@ -2762,6 +2762,18 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_design_form_size${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # The full designer palette generates compiling, constructing code even
+  # when user classes share a kind's name: GenForm must emit real
+  # namespace paths (Gui.Widget.* / Gui.Hmi.*) for every toolbox kind.
+  add_test(NAME conformance_gui_design_palette
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/design_palette_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/design_palette.html;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_design_palette.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_design_palette${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # A primary design document supplies only a fallback entry point. When a
   # later Zan input declares Main, that explicit entry must win regardless of
   # response-file order (large designed applications depend on this shape).

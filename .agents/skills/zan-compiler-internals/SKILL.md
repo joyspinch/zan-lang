@@ -1,6 +1,6 @@
 ---
 name: zan-compiler-internals
-description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式与坑——Dict 内建布局契约、LLVM select 死臂泄漏（用 branch+phi）、delegate 两形态与 wasm32 ZAN_CLOSURE_TAG 碰撞、nsresolve 冲突改名丢泛型实参（全量输入 vs 按需拉取行为不同）、ARC 所有权判定内建优先于 extern 借用、stdlib 按需拉入的坑（AST 真引用闭包、stdlib 输入自我遮蔽、潜伏缺 using、重臂 Bootstrap 注册制）、LLVMIsConstant/llvm.global_ctors/PE 数据分节 $ 命名等发布体积分节陷阱、GNU ld PE 把 .pdata 当 GC 根、交叉工具链 .o 重出配方、conformance 处置四分法、scratch 卫生（bisect 用 worktree 即用即删）。做或改 src/compiler/*、交叉运行时对象、conformance golden、追发布体积、动 stdlib 重组件目录或 ControlFactory/App 拉入面时使用。
+description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式与坑——Dict 内建布局契约、LLVM select 死臂泄漏（用 branch+phi）、delegate 两形态与 wasm32 ZAN_CLOSURE_TAG 碰撞、nsresolve 冲突改名丢泛型实参（全量输入 vs 按需拉取行为不同）、限定名简单名回退（错命名空间的发射被用户同名类击穿）、ARC 所有权判定内建优先于 extern 借用、stdlib 按需拉入的坑（AST 真引用闭包、stdlib 输入自我遮蔽、潜伏缺 using、重臂 Bootstrap 注册制）、LLVMIsConstant/llvm.global_ctors/PE 数据分节 $ 命名等发布体积分节陷阱、GNU ld PE 把 .pdata 当 GC 根、交叉工具链 .o 重出配方、conformance 处置四分法、scratch 卫生（bisect 用 worktree 即用即删）。做或改 src/compiler/*、交叉运行时对象、conformance golden、追发布体积、动 stdlib 重组件目录或 ControlFactory/App 拉入面时使用。
 ---
 
 # zanc 编译器内部定式与坑
@@ -260,6 +260,25 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   提前终止编译"的运行误判成 pass（codegen 没跑当然没有 verifier 错）
   ——本轮设计文档二分的全部结论因此作废。二分前先确认每个子集都能
   走到被观测的阶段（closed set），或把 pass 判据定为"编译成功"。
+
+## 限定名解析的简单名回退：错命名空间的发射碰巧编过，用户同名类一出现就炸（design_palette，2026-09-17）
+
+- **症状**：GenForm 给告警件（类在 `Gui.Hmi`）发射 `Gui.Widget.AlarmBanner`
+  字段与构造，设计稿编译全绿；用户项目一旦声明同名全局类，同一行变成
+  `undefined type 'AlarmBanner'`——"没动 stdlib 却编不过"。实测还可能
+  静默绑到用户类（继承基类的 Kind() 自报名暴露）。
+- **根因**：限定名解析在限定路径走不通时**退回简单名解析**
+  （using import / 可见域）。所以限定错命名空间的名字平时碰巧编过，
+  "限定名"并不锁真身；用户同名类让简单名出现双绑定后回退失效。
+  只有**逐段真实存在**的限定路径才遮蔽免疫。
+- **修法/纪律**：生成器/元编程发射限定名必须用真实路径。QualifyKind
+  加 `Gui.Hmi.*` 支路，且支路必须在 IsStdWidgetKind 门槛**之前**——
+  门槛先放行裸名，探针立刻打回（Led 绑到用户类）。新增工具箱 kind
+  三处同步：FormField.KindForType、GenForm（IsStdWidgetKind/IsHmiKind）、
+  ControlBootstrap（Names/Make，policy_control_factory 强约束
+  键=分支=Kind() 自报且标签唯一、漏 `override` 修饰符会骗过扫描）。
+  回归锁：conformance_gui_design_palette（设计文档放全 25 个
+  展示/工控 kind + 探针侧 Tag/Led/Dropdown 三个同名用户类）。
 
 ## wasm32 局部数爆炸：V8 每函数 5 万局部硬上限
 
