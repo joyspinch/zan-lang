@@ -604,10 +604,12 @@ if(ZAN_BUILD_GUI)
             endif()
         endif()
         # Embedded WebView needs nothing here: the Edge WebView2 backend is
-        # written in Zan (stdlib/Gui/WebView2.zan) against its COM interfaces,
-        # and resolves WebView2Loader.dll (shipped in the zan_gui driver
-        # bundle) at run time, so a machine without the WebView2 runtime still
-        # runs GUI apps -- the widget falls back to its placeholder.
+        # written in Zan (stdlib/Gui/Component/WebView/WebView2.zan) against
+        # its COM interfaces, and resolves WebView2Loader.dll (shipped in the
+        # WebView component's own driver bundle under
+        # stdlib/Gui/Component/WebView/drivers) at run time, so a machine
+        # without the WebView2 runtime still runs GUI apps -- the widget falls
+        # back to its placeholder.
         set(ZAN_GUI_AVAILABLE TRUE)
     elseif(APPLE)
         # Real Cocoa backend (Objective-C) + shared software renderer. The C file
