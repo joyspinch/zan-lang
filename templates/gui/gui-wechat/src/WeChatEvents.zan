@@ -1,0 +1,222 @@
+using System;
+using System.Collections;
+using System.Json;
+using System.Net.External;
+using System.Net.Http.Client;
+using System.Net.Sockets;
+using System.Net.WebSocket;
+using System.Threading;
+
+/* 桌面客户端实时事件通道（A327-12）：WS 主、轮询兜底，事件统一经
+   Poll() 并入 UI 线程。定式与 WxNet 同源但线程独立——专用 WS 线程跑
+   自己的协程循环（stdlib 协程 M:1，await 只活在本线程上），与 WxNet
+   的请求 worker 互不阻塞：断线重连/补拉卡住时消息照发（判定「断线
+   不阻塞发送」的结构保证）。
+
+   三条判定对应的机制：
+     - 事件回调回 UI 线程：回调只在 Poll() 里被调用，而 Poll 只从
+       UI 线程的 form.Every / PumpStandaloneUntil 心跳进入；
+     - 断线不阻塞发送：本线程独立于 WxNet worker（见上）；
+     - 重复事件不重复入列：单一高水位 cursor 裁决—— eventId <= cursor
+       的帧一律丢弃（在线帧与补拉帧共用同一判据，两通道无差别）。
+
+   无缝收口（为什么「先连 WS 再补拉」）：连接建立（服务端 JoinWs）在
+   补拉之前，之后补拉一次追平——补拉读不到的（补拉读之后提交的）必然
+   在 JoinWs 之后提交、由在线层推给本会话；补拉读得到的必然不靠在线
+   层。两段之间无空窗，重连时同序重跑一遍即可，事件不丢不重。
+
+   轮询兜底：WS 连不上（服务端未起/网络抖动）时本线程按退避节奏反复
+   补拉（1s→2s→…→30s 封顶），事件仍以 ≤退避窗口 的延迟到达；WS 一旦
+   连上即回到主通道。补拉分页至追平（limit=200/页），401 会话失效即
+   DropSession 收工（登录门重新拉起）。 */
+delegate void WxEventFn(string eventJson);
+
+static class WxEvents {
+    /// 事件高水位（collab_event 行 id）：<= 此值的帧已交付或已入列。
+    static long cursor = 0;
+    /// 已去重、待并入 UI 的原始事件帧（Policy.Frame 统一外形 JSON）。
+    static List<string> pending;
+    static nint lockId = 0;
+    static bool threadUp;
+    static bool stopRequested;
+    static WxEventFn sink;
+    /// 最近一次通道异常（诊断用；空串 = 无）。
+    static string lastErr = "";
+
+    /// WS 空闲窗口（秒）：期间无帧则 Ping 一发保活（同协程写帧，
+    /// 不与收帧并发，无撕裂）。
+    static int IdleWindowMs = 15000;
+
+    /* ---- 生命周期 ---- */
+
+    /// 启动事件线程（幂等；重复 Start 只更新回调）。线程常驻应用
+    /// 生命周期，未登录时 1s 一拍等登录门，登录后自动接管；sink 在
+    /// UI 线程被调用。
+    static void Start(WxEventFn fn) {
+        WxEvents.sink = fn;
+        if (WxEvents.lockId == 0) {
+            WxEvents.lockId = Mutex.Create();
+            WxEvents.pending = new List<string>();
+        }
+        if (WxEvents.threadUp) { return; }
+        WxEvents.stopRequested = false;
+        WxEvents.threadUp = true;
+        if (!Thread.Start(WxEvents.LoopEntry)) {
+            WxEvents.threadUp = false;
+        }
+    }
+
+    /// 停止事件线程（登出时用）。线程在当前等待点醒来后退出——
+    /// 最迟一个空闲窗口（15s）。
+    static void Stop() {
+        WxEvents.stopRequested = true;
+    }
+
+    /// 事件线程是否在跑（诊断用）。
+    static bool Running() { return WxEvents.threadUp; }
+
+    /// 当前高水位（诊断用）。
+    static long Cursor() { return WxEvents.cursor; }
+
+    /// 登出/换号时清水位（下次登录从 0 重拉）。
+    static void ResetCursor() {
+        Mutex.Lock(WxEvents.lockId);
+        WxEvents.cursor = 0;
+        WxEvents.pending = new List<string>();
+        Mutex.Unlock(WxEvents.lockId);
+    }
+
+    /* ---- 事件线程主循环 ---- */
+
+    static void LoopEntry() {
+        Socket.Initialize();
+        int backoff = 1;
+        while (!WxEvents.stopRequested) {
+            if (!WxNet.LoggedIn()) {
+                // 未登录（应用启动即 Start，或中途登出）：1s 一拍等
+                // 登录门，登录后自然接管——调用方无需重新 Start。
+                await WxEvents.Idle(1);
+                continue;
+            }
+            // 连接+补拉+收帧整体包异常护盾：网络线程上未接住的异常会
+            // 带走整个进程（WeChatNet worker 的 try/catch 同款纪律）。
+            // 连接/握手失败不抛（IsConnected()==false），异常只来自
+            // 补拉 HTTP 与收发中途的 IO。
+            bool up = false;
+            try {
+                // 连 WS（授权在升级前生效，必须带 Bearer 头）。
+                List<string> headers = new List<string>();
+                headers.Add("Authorization: Bearer " + WxNet.Token());
+                WebSocketClient ws = await WebSocketClient.ConnectAsyncHeaders(
+                    WxNet.Host(), WxNet.Port(), "/api/collab/listen", headers);
+                up = ws.IsConnected();
+                if (up) {
+                    // 先连后补拉：与在线推送之间无空窗（见文件头注释）。
+                    up = await WxEvents.CatchUp();
+                }
+                if (WxEvents.stopRequested || !WxNet.LoggedIn()) { break; }
+                if (up) {
+                    backoff = 1;
+                    while (WxNet.LoggedIn() && !WxEvents.stopRequested) {
+                        string m = await ws.RecvText(WxEvents.IdleWindowMs);
+                        if (!ws.IsConnected()) { break; }   // 真断开 → 重连
+                        if (m.Length == 0) { await ws.Ping(); continue; }
+                        WxEvents.Accept(m);
+                    }
+                }
+            } catch (Exception ex) {
+                WxEvents.lastErr = ex.Message;
+                up = false;
+            }
+            if (WxEvents.stopRequested || !WxNet.LoggedIn()) { break; }
+            if (!up) {
+                // 轮询兜底：WS 没连上（服务端未起/握手失败）也补拉一次，
+                // 事件以 ≤退避窗口 的延迟到达；补拉失败只记诊断，不打断
+                // 退避节奏（401 已 DropSession，下圈走登录门）。
+                try {
+                    await WxEvents.CatchUp();
+                } catch (Exception ex2) {
+                    WxEvents.lastErr = ex2.Message;
+                }
+                await WxEvents.Idle(backoff);
+                backoff = backoff * 2;
+                if (backoff > 30) { backoff = 30; }
+            } else {
+                // 刚断开（服务端收口/网络断）：1s 小憩后重连补拉，
+                // 断线窗口由水位去重补齐。
+                await WxEvents.Idle(1);
+            }
+        }
+        WxEvents.threadUp = false;
+    }
+
+    /// 补拉到追平：分页 GET /api/collab/events?after=cursor，逐帧过
+    /// Accept 水位去重。false = 网络失败或会话失效（401 已 DropSession）。
+    static async bool CatchUp() {
+        while (!WxEvents.stopRequested && WxNet.LoggedIn()) {
+            HttpClient nh = new HttpClient(WxNet.Host(), WxNet.Port());
+            nh.SetHeader("Authorization", "Bearer " + WxNet.Token());
+            nh.SetCallPolicy(ExternalCallPolicy.Default()
+                .AllowLocalHttp()
+                .TotalTimeout(6000).ResponseLimit(1024 * 1024));
+            HttpResponse resp = await nh.SendBytesAsync("GET",
+                "/api/collab/events?after=" + Convert.ToString(WxEvents.cursor)
+                + "&limit=200", "");
+            if (resp == null) { return false; }
+            if (resp.statusCode == 401) { WxNet.DropSession(); return false; }
+            if (resp.statusCode != 200) { return false; }
+            JsonValue v = JsonValue.ParseLenient(resp.body);
+            JsonValue data = v == null ? null : v.Get("data");
+            if (data == null) { return false; }
+            JsonValue events = data.Get("events");
+            int n = events == null ? 0 : events.Count();
+            for (int i = 0; i < n; i = i + 1) {
+                WxEvents.Accept(events.At(i).ToJson());
+            }
+            long next = data.Str("next", "0").ToInt64();
+            if (n == 0 || next <= WxEvents.cursor) { return true; }
+            WxEvents.cursor = next;
+            if (n < 200) { return true; }   // 未满页 = 已追平
+        }
+        return false;
+    }
+
+    /// 帧入口（在线/补拉共用）：collab 分派键 + 水位裁决，通过者入列。
+    static void Accept(string raw) {
+        JsonValue v = JsonValue.ParseLenient(raw);
+        if (v == null) { return; }
+        if (v.Str("type", "") != "collab") { return; }   // hello 等非事件帧
+        long eid = v.Str("eventId", "0").ToInt64();
+        if (eid <= 0 || eid <= WxEvents.cursor) { return; }
+        WxEvents.cursor = eid;
+        Mutex.Lock(WxEvents.lockId);
+        WxEvents.pending.Add(raw);
+        Mutex.Unlock(WxEvents.lockId);
+    }
+
+    /// 退避小憩（秒级）。
+    static async void Idle(int seconds) {
+        await Task.Delay(seconds * 1000);
+    }
+
+    /* ---- 并入侧（UI 线程，form.Every 里调） ---- */
+
+    /// 把到达的事件帧交回 sink。返回 true = 本拍有帧并入（调用方可
+    /// 顺带 RequestRedraw）。
+    static bool Poll() {
+        if (WxEvents.lockId == 0 || WxEvents.pending.Count == 0) { return false; }
+        List<string> batch = null;
+        Mutex.Lock(WxEvents.lockId);
+        if (WxEvents.pending.Count > 0) {
+            batch = WxEvents.pending;
+            WxEvents.pending = new List<string>();
+        }
+        Mutex.Unlock(WxEvents.lockId);
+        if (batch == null) { return false; }
+        WxEventFn fn = WxEvents.sink;
+        for (int i = 0; i < batch.Count; i = i + 1) {
+            if (fn != null) { fn(batch[i]); }
+        }
+        return true;
+    }
+}

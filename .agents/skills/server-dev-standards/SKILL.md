@@ -117,7 +117,11 @@ description: 服务端开发通用规范——四层架构（接入/业务/数�
    同族）。修复前 e2e 起服用 `ZAN_NO_BG=1` 跳过后台协程（诊断开关
    已在 server-collab main.zan），别把传输层损坏误判成业务 bug——
    判据：同一断言只要响应完整送达即 PASS，红项全部伴随 BadStatusLine
-   二进制垃圾 / 10053 / 10054。
+   二进制垃圾 / 10053 / 10054。开关语义是**变量存在即关，值无关**
+   （main.zan 判 `getenv("ZAN_NO_BG") == null`）：实弹/探针要后台
+   协程开着必须把变量从环境里整个删掉，设 `ZAN_NO_BG=0` 照样静默
+   跳过、实时通道（事件扇出 relay）不会装配，表现为「发送 200 但
+   在线帧永不到达」。
 
 数据建模通用准则（跨桌面/游戏/服务端）见 `data-modeling` skill；
 服务端 DB 专属细则见 `server-db-design` skill。

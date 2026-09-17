@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.IO;
 using System.Json;
 using System.Net.External;
 using System.Net.Http.Client;
@@ -16,7 +17,13 @@ using System.Threading;
    worker 循环体只经静态字段与形参往返，不触碰任何实例状态。
    认证：/api/auth/login 拿 token，此后每请求带 Authorization: Bearer
    （WebApp 认 token 的两条路之一，无需 CookieJar）。每请求新建连接
-   （keep-alive 复用在大应答后串帧，legend/stdlib 先例同款注）。 */
+   （keep-alive 复用在大应答后串帧，legend/stdlib 先例同款注）。
+
+   传输三形态（A327-12）：kind 0 = JSON（SendBytesAsync，应答进
+   respBody）；1 = 上传（SendBytesBodyAsync 空头尾三段式——[Upload]
+   管道把原始请求体流式落盘，multipart 边界会被原样写进文件，所以
+   元数据一律走 query，正文就是文件原始字节）；2 = 下载（SendBytesAsync
+   + IsBinary，字节进 respBytes，savePath 非空时顺手落盘）。 */
 class WxNet {
     /// 连接目标（登录页可改，默认指向本机 server-collab）。
     static string host = "127.0.0.1";
@@ -79,6 +86,35 @@ class WxNet {
         WxNet.Submit(r, "POST", "/api/im/" + op, body, cb);
     }
 
+    /// GET 任意服务端路径（/api/collab/… 等非 /api/im 前缀的新域）。
+    static void ApiGet(WxNetReq r, string path, Action cb) {
+        WxNet.Submit(r, "GET", path, null, cb);
+    }
+
+    /// POST 任意服务端路径，body 为已编码的表单体或 JSON。
+    static void ApiPost(WxNetReq r, string path, string body, Action cb) {
+        WxNet.Submit(r, "POST", path, body, cb);
+    }
+
+    /// 上传本地文件：POST <path>?<query>，正文是文件原始字节
+    /// （[Upload] 端点把原始请求体流式落盘，元数据走 query——
+    /// 服务端 Crid()/文件名都从 query 取）。query 由调用方拼好
+    /// （如 "name=a.png&clientRequestId=…"，UrlEncode 自己负责）。
+    static void Upload(WxNetReq r, string path, string query,
+            string localPath, Action cb) {
+        r.kind = 1;
+        r.localPath = localPath;
+        r.query = query;
+        WxNet.Submit(r, "POST", path, null, cb);
+    }
+
+    /// 下载到内存（respBytes）；savePath 非空时顺带落盘。
+    static void Download(WxNetReq r, string path, string savePath, Action cb) {
+        r.kind = 2;
+        r.savePath = savePath;
+        WxNet.Submit(r, "GET", path, null, cb);
+    }
+
     /// 登录：POST /api/auth/login。cb 在 UI 线程拿结果。
     static void Login(WxNetReq r, string user, string pass, Action cb) {
         WxNet.Submit(r, "POST", "/api/auth/login",
@@ -135,24 +171,74 @@ class WxNet {
         string err = "";
         string body = null;
         int status = 0;
+        byte[] bytes = null;
+        int bytesLen = 0;
         try {
             HttpClient nh = new HttpClient(WxNet.host, WxNet.port);
-            nh.SetHeader("Content-Type", "application/x-www-form-urlencoded");
-            if (WxNet.token.Length > 0) {
-                nh.SetHeader("Authorization", "Bearer " + WxNet.token);
+            if (r.kind == 1) {
+                // 上传：原始文件字节三段式（空头尾），Content-Length 与
+                // 各段长度同源；元数据在 query（已由调用方拼进 r.query）。
+                nh.SetHeader("Content-Type", "application/octet-stream");
+                if (WxNet.token.Length > 0) {
+                    nh.SetHeader("Authorization", "Bearer " + WxNet.token);
+                }
+                long fl = FileInfo.GetLength(r.localPath);
+                if (fl <= 0 || fl > 32 * 1024 * 1024) {
+                    throw new Exception("file size out of range: "
+                        + Convert.ToString(fl));
+                }
+                int fileLen = (int)fl;
+                nh.SetCallPolicy(ExternalCallPolicy.Default()
+                    .AllowLocalHttp()
+                    .TotalTimeout(60000)
+                    .RequestLimit(32 * 1024 * 1024)
+                    .ResponseLimit(1024 * 1024));
+                string upath = r.query != null && r.query.Length > 0
+                    ? r.path + "?" + r.query : r.path;
+                HttpResponse up = await nh.SendBytesBodyAsync(r.method, upath,
+                    "", r.localPath, fileLen, "", fileLen);
+                status = up.statusCode;
+                body = up.body;
+            } else if (r.kind == 2) {
+                // 下载：字节安全应答（16MB 默认上限不够附件用，放宽）。
+                if (WxNet.token.Length > 0) {
+                    nh.SetHeader("Authorization", "Bearer " + WxNet.token);
+                }
+                nh.SetCallPolicy(ExternalCallPolicy.Default()
+                    .AllowLocalHttp()
+                    .TotalTimeout(60000)
+                    .ResponseLimit(32 * 1024 * 1024));
+                HttpResponse resp = await nh.SendBytesAsync(r.method, r.path, "");
+                status = resp.statusCode;
+                if (resp.IsBinary()) {
+                    bytes = resp.bodyBytes;
+                    bytesLen = resp.BodyLength();
+                    if (r.savePath != null && r.savePath.Length > 0) {
+                        File.WriteAllBytes(r.savePath, bytes);
+                    }
+                } else {
+                    body = resp.body;
+                }
+            } else {
+                nh.SetHeader("Content-Type", "application/x-www-form-urlencoded");
+                if (WxNet.token.Length > 0) {
+                    nh.SetHeader("Authorization", "Bearer " + WxNet.token);
+                }
+                nh.SetCallPolicy(ExternalCallPolicy.Default()
+                    .AllowLocalHttp()
+                    .TotalTimeout(6000).ResponseLimit(1024 * 1024));
+                HttpResponse resp = await nh.SendBytesAsync(r.method, r.path,
+                    r.body == null ? "" : r.body);
+                status = resp.statusCode;
+                body = resp.body;
             }
-            nh.SetCallPolicy(ExternalCallPolicy.Default()
-                .AllowLocalHttp()
-                .TotalTimeout(6000).ResponseLimit(1024 * 1024));
-            HttpResponse resp = await nh.SendBytesAsync(r.method, r.path,
-                r.body == null ? "" : r.body);
-            status = resp.statusCode;
-            body = resp.body;
         } catch (Exception ex) {
             err = ex.Message;
         }
         r.status = status;
         r.respBody = body;
+        r.respBytes = bytes;
+        r.respBytesLen = bytesLen;
         r.err = err;
         Mutex.Lock(WxNet.lockId);
         WxNet.done.Add(r);
@@ -219,13 +305,21 @@ class WxNet {
 
 /// 一条待发/已回的请求。op 是服务端路由尾段（/api/auth/<op>、
 /// /api/im/<op>），body 是已编码的表单体或 null（GET）。
+/// kind：0 = JSON 往返，1 = 上传（localPath→原始字节，query 携带
+/// 元数据），2 = 下载（respBytes 承接字节，savePath 非空时落盘）。
 /// （Zan 不支持从类外用 WxNet.Req 限定嵌套类型名，故提为顶层类。）
 class WxNetReq {
     string op;
+    int kind;
     string method;
     string path;
     string body;
+    string query;
+    string localPath;
+    string savePath;
     string respBody;
+    byte[] respBytes;
+    int respBytesLen;
     int status;
     string err;
     Action callback;

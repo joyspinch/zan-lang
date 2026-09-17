@@ -1291,6 +1291,15 @@ Log(q);                          // 打印 11 —— 闭包内外读写同一个
   `-DZAN_CO_DRIVER`）；改 rt_io.c 后用 `wsl zig cc -target x86_64-linux-musl
   -DZAN_IO_STACKLESS_ONLY -fPIC -O2 -c` 重出两份并同步 `toolchain/linux-musl/`。
   排查期可临时用 O0 打点副本顶替，收尾必须换回 O2 官方对象。
+- 晚到完成包的仲裁不能按帧指针，要按 op 自持身份（A327-12a，2026-09-17 已修）：
+  recv-with-deadline 赢家路径（`rto_timeout_scan` 交付 -1 后 `CancelIoEx`）的
+  OPERATION_ABORTED 晚到包出队时，原实现按 `CONTAINING_RECORD(帧指针)` claim——
+  async 帧是池化复用的，deadline 输了竞赛后帧立即回到就绪队列，同指针上新登记
+  的 RecvToOv 条目会被晚到包偷走并往新帧结果槽写 0（EOF）→ 健康连接被误杀，
+  症状是「空闲超时后紧接的 recv 秒回 EOF」。修法 = `rto=2` 标记整体丢弃：扫描
+  赢家先在 op 上落标记再 CancelIoEx，两处完成包出队点先查标记（op 拥有
+  OVERLAPPED，是完成包点名的唯一稳定身份）再 op_free。判定手法：
+  ZAN_IO_TRACE 看 aborted 包是否带 `rto-dead`，以及紧随超时的 recv 是否 0 字节。
 
 ## 泄漏报告的站点标签按类形状混叠；排查先做单站点最小复形（A64b，2026-09-12；已修同日）
 
