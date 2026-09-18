@@ -3094,8 +3094,6 @@ static void print_usage(void) {
     fprintf(stderr, "  --no-runtime-checks  Disable runtime guards (e.g. division by zero)\n");
     fprintf(stderr, "  --strict-runtime  Guard failures exit(70) without ZAN_RT_HARD=1\n");
     fprintf(stderr, "  --publish        Build optimized release binary (strip debug, optimize)\n");
-    fprintf(stderr, "  --async-workers, --mt  Run async programs on the multi-worker coroutine\n");
-    fprintf(stderr, "                   scheduler (worker count from ZAN_CO_WORKERS)\n");
     fprintf(stderr, "  --fast-alloc     Front-end malloc with the per-thread small-object\n");
     fprintf(stderr, "                   allocator (server workloads; native targets only)\n");
     fprintf(stderr, "  --link-mode <m>  Native driver linking on publish: shared (copy driver\n");
@@ -3294,7 +3292,6 @@ int main(int argc, char **argv) {
     bool strict_runtime = false;
     bool publish_mode = false;
     bool debug_info = false; /* -g / --debug: emit DWARF for source debugging */
-    bool mt_scheduler = false;
     bool fast_alloc = false;
     const char *stdlib_path = NULL;
     bool auto_stdlib = true;
@@ -3371,12 +3368,6 @@ int main(int argc, char **argv) {
             publish_mode = true;
         } else if (strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--debug") == 0) {
             debug_info = true;
-        } else if (strcmp(argv[i], "--async-workers") == 0 ||
-                   strcmp(argv[i], "--mt") == 0) {
-            /* Use the multi-worker coroutine scheduler: async programs run
-             * their ready queue across a thread pool (worker count from the
-             * ZAN_CO_WORKERS env var at run time; default = CPU count). */
-            mt_scheduler = true;
         } else if (strcmp(argv[i], "--fast-alloc") == 0) {
             /* Link the small-object allocator (src/runtime/rt_mem.c) in front
              * of the CRT's malloc: per-thread caches, size-class free lists
@@ -3575,6 +3566,13 @@ int main(int argc, char **argv) {
         zan_target_host(&target);
     }
     bool cross_compiling = (target_name != NULL);
+    /* The external executor is a target capability, not a user-selectable
+     * semantic mode. At present only the Windows ZAN_CO_DRIVER implementation
+     * is a real worker pool; POSIX builds of the same object are a single-thread
+     * fallback and must keep the compiler-emitted inline driver. */
+    bool external_async_executor = target.os == ZAN_OS_WINDOWS &&
+                                   (target.arch == ZAN_ARCH_X86_64 ||
+                                    target.arch == ZAN_ARCH_AARCH64);
 
     /* --auto-stdlib: discover stdlib path relative to compiler executable,
      * then scan using directives in source files and add matching stdlib .zan files */
@@ -4154,7 +4152,7 @@ int main(int argc, char **argv) {
     bool arc_net = publish_mode && arc_guard_opt != 1 && arc_guard_opt != 0;
     if (zan_irgen_init(&irgen, arena, diag, &binder, input_file,
                        irgen_triple,
-                       target.os == ZAN_OS_WINDOWS, mt_scheduler,
+                       target.os == ZAN_OS_WINDOWS, external_async_executor,
                        check_leaks, runtime_checks, arc_guard,
                        arc_net) != ZAN_OK) {
         fprintf(stderr, "error: failed to initialize code generator\n");
@@ -5144,12 +5142,10 @@ int main(int argc, char **argv) {
             rt_io_obj = rt_io_buf;
         }
 #endif
-        /* --async-workers (mt_scheduler): the inline single-thread coroutine
-         * driver was NOT emitted, so the program must link the multi-worker
-         * reactor variant, which supplies both the reactor and the driver.
-         * Force-link it even for non-socket async programs. */
+        /* Windows' external executor replaces the inline coroutine driver and
+         * must be linked even for timer-only async programs. */
 #ifdef ZAN_RT_IO_MT_OBJ
-        if (mt_scheduler) {
+        if (external_async_executor) {
             snprintf(rt_io_buf, sizeof(rt_io_buf), "%s/%s",
                      link_exe_dir, zan_path_basename(ZAN_RT_IO_MT_OBJ));
             rt_io_obj = rt_io_buf;
@@ -5588,7 +5584,7 @@ int main(int argc, char **argv) {
                     if (rt_io_obj) {
                         snprintf(rt_io_buf, sizeof(rt_io_buf), "%s/%s/%s",
                                  link_exe_dir, target_rt_sub,
-                                 mt_scheduler ? "zanrt_io_mt.o" : "zanrt_io.o");
+                                 external_async_executor ? "zanrt_io_mt.o" : "zanrt_io.o");
                         rt_io_obj = rt_io_buf;
                         if (!zan_file_exists(rt_io_obj)) missing = rt_io_obj;
                     }
@@ -6602,7 +6598,7 @@ int main(int argc, char **argv) {
             char winrt_embed[1400] = {0};
             if (rt_io_obj)
                 snprintf(winrt_io, sizeof(winrt_io), "%s/%s/%s", exe_dir2, wsub,
-                         mt_scheduler ? "zanrt_io_mt.o" : "zanrt_io.o");
+                         external_async_executor ? "zanrt_io_mt.o" : "zanrt_io.o");
             if (rt_sync_obj)
                 snprintf(winrt_sync, sizeof(winrt_sync), "%s/%s/zanrt_sync.o",
                          exe_dir2, wsub);
@@ -6926,7 +6922,7 @@ int main(int argc, char **argv) {
             char macrt_embed[1400] = {0};
             if (rt_io_obj) {
                 snprintf(macrt_io, sizeof(macrt_io), "%s/%s", macrt,
-                         mt_scheduler ? "zanrt_io_mt.o" : "zanrt_io.o");
+                         external_async_executor ? "zanrt_io_mt.o" : "zanrt_io.o");
             }
             if (rt_sync_obj) {
                 snprintf(macrt_sync, sizeof(macrt_sync), "%s/zanrt_sync.o",

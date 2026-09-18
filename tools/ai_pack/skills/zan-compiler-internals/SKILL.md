@@ -1,6 +1,6 @@
 ---
 name: zan-compiler-internals
-description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式与坑——Dict 内建布局契约、LLVM select 死臂泄漏（用 branch+phi）、delegate 两形态与 wasm32 ZAN_CLOSURE_TAG 碰撞、nsresolve 冲突改名丢泛型实参（全量输入 vs 按需拉取行为不同）、限定名简单名回退（错命名空间的发射被用户同名类击穿）、ARC 所有权判定内建优先于 extern 借用、stdlib 按需拉入的坑（AST 真引用闭包、stdlib 输入自我遮蔽、潜伏缺 using、重臂 Bootstrap 注册制）、LLVMIsConstant/llvm.global_ctors/PE 数据分节 $ 命名等发布体积分节陷阱、GNU ld PE 把 .pdata 当 GC 根、交叉工具链 .o 重出配方、conformance 处置四分法、scratch 卫生（bisect 用 worktree 即用即删）。做或改 src/compiler/*、交叉运行时对象、conformance golden、追发布体积、动 stdlib 重组件目录或 ControlFactory/App 拉入面时使用。
+description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式与坑——Dict 内建布局契约、LLVM select 死臂泄漏（用 branch+phi）、delegate 两形态与 wasm32 ZAN_CLOSURE_TAG 碰撞、nsresolve 冲突改名丢泛型实参（全量输入 vs 按需拉取行为不同）、限定名简单名回退（错命名空间的发射被用户同名类击穿）、ARC 所有权判定内建优先于 extern 借用、stdlib 按需拉入的坑（AST 真引用闭包、stdlib 输入自我遮蔽、潜伏缺 using、重臂 Bootstrap 注册制）、LLVMIsConstant/llvm.global_ctors/PE 数据分节 $ 命名等发布体积分节陷阱、GNU ld PE 把 .pdata 当 GC 根、交叉工具链 .o 重出配方、conformance 处置四分法、scratch 卫生（bisect 用 worktree 即用即删）。做或改 src/compiler/*、交叉运行时对象、conformance golden、追发布体积、动 stdlib 重组件目录或 ControlFactory/App 拉入面时使用；仓库内有同名项目级版本，会自动优先。
 ---
 
 # zanc 编译器内部定式与坑
@@ -1026,20 +1026,6 @@ parser 回溯，专项做。
   文件按锚切片、原样拼进基线**（find 定位 + 下标切），零转义零风险；
   写完断言 count==1/块内标记存在，再 md5 前后对比。
 
-## Windows 路径通配符与 C++ COM 运行时解耦（2026-09-18）
-
-- **Win32 FindFirstFileW 遇到混合斜杠在通配符下报 ERROR_FILE_NOT_FOUND (2)**：
-  在 Windows 下拼接通配符路径（如 `D:\project\stdlib/Gui/icons\\*`）时，若路径前段含有正斜杠 `/`，
-  Win32 的 `FindFirstFileW` 无法正确解析混合斜杠的通配模式，直接返回 `INVALID_HANDLE_VALUE` (GetLastError=2)。
-  在 `src/compiler/embedres.c` 等涉及文件目录遍历的代码中，进入 Win32 API 之前必须无条件将所有 `/` 归一化为 `\`。
-- **C++ 辅助源文件（如 DirectWrite）在 C 静态库中的 pure COM 准则**：
-  Windows SDK 的 `dwrite.h` 必须以 C++ 编译，但若在源文件中使用 `<string>`、`std::wstring` 或默认编译选项，
-  会导致输出对象产生 `__cxa_begin_catch`、`std::terminate`、`__gxx_personality_seh0`、`vtable for __cxxabiv1` 等对 C++ 运行时（`libstdc++`）的硬引用，导致 C 静态库在纯 C 链接时大面积报未定义符号。
-  解法：
-  ① 彻底杜绝 C++ 标准库头文件与 STL 容器，使用 `wchar_t[]`、`wcsncpy`、`wcscmp` 等 C 原生字符串操作；
-  ② 编译参数必须强制带 `-fno-exceptions -fno-rtti`；
-  实现 100% 零 C++ 运行时依赖的 pure COM 胶水，无缝打包进 C/GNU 目标库。
-
 ## 解析器别丢 token 原文本：格式化输出 ≠ 无损（A295，2026-09-11 已修）
 
 - 场景：`JsonValue.ParseNumberToken` 为性能把「含 . / e 的数字」直接转 double 且不存原文本，
@@ -1181,6 +1167,20 @@ parser 回溯，专项做。
 - Zan 的 leakcheck 对**仍可达**对象也报红（不区分丢失/仍被持有）。服务端对象
   （listener、连接、池）在 Stop() 后需要泵协程自然走完（accept 返回 -1、EOF 关链路）
   才不可达；测试里的固定排水（20x10ms）在负载下可能不够，`rc=0` 但 leakcheck 记红。
+
+## Windows 路径通配符与 C++ COM 运行时解耦（2026-09-18）
+
+- **Win32 FindFirstFileW 遇到混合斜杠在通配符下报 ERROR_FILE_NOT_FOUND (2)**：
+  在 Windows 下拼接通配符路径（如 `D:\project\stdlib/Gui/icons\\*`）时，若路径前段含有正斜杠 `/`，
+  Win32 的 `FindFirstFileW` 无法正确解析混合斜杠的通配模式，直接返回 `INVALID_HANDLE_VALUE` (GetLastError=2)。
+  在 `src/compiler/embedres.c` 等涉及文件目录遍历的代码中，进入 Win32 API 之前必须无条件将所有 `/` 归一化为 `\`。
+- **C++ 辅助源文件（如 DirectWrite）在 C 静态库中的 pure COM 准则**：
+  Windows SDK 的 `dwrite.h` 必须以 C++ 编译，但若在源文件中使用 `<string>`、`std::wstring` 或默认编译选项，
+  会导致输出对象产生 `__cxa_begin_catch`、`std::terminate`、`__gxx_personality_seh0`、`vtable for __cxxabiv1` 等对 C++ 运行时（`libstdc++`）的硬引用，导致 C 静态库在纯 C 链接时大面积报未定义符号。
+  解法：
+  ① 彻底杜绝 C++ 标准库头文件与 STL 容器，使用 `wchar_t[]`、`wcsncpy`、`wcscmp` 等 C 原生字符串操作；
+  ② 编译参数必须强制带 `-fno-exceptions -fno-rtti`；
+  实现 100% 零 C++ 运行时依赖的 pure COM 胶水，无缝打包进 C/GNU 目标库。
 - 判据：leak 行全指向服务端对象分配点、主输出全对 → 停服排水不足或 Stop 语义不
   可等待，不是真泄漏。修法方向：Stop 返回可等待句柄（服务端 join 自己的泵），
   而不是让每个用例猜排水时长。

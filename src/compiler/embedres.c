@@ -115,8 +115,11 @@ static void embed_walk_impl(zan_embed_list_t *l, const char *dir, const char *na
     if (!wide_pattern) return;
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW(wide_pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        free(wide_pattern);
+        return;
+    }
     free(wide_pattern);
-    if (h == INVALID_HANDLE_VALUE) return;
     do {
         char *file_name = zan_wide_to_utf8_alloc(fd.cFileName);
         if (!file_name) continue;
@@ -784,9 +787,20 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
         const char *prefix = NULL;
         if (eq) { *eq = 0; prefix = eq + 1; }
         if (!prefix || !prefix[0]) prefix = embed_basename(path);
+#ifdef _WIN32
+        for (char *p = path; *p; p++) {
+            if (*p == '/') *p = '\\';
+        }
+#endif
         int before = files.n;
+        /* The pack filter belongs to the skins spec alone ("skins/<pack>/
+         * skin.css" shape): applying it to any other directory spec deletes
+         * everything not named dark/light at that spec's root — a project
+         * assets/ tree of subfolders (audio/, images/) walked to zero files
+         * and died on the "matched no readable file" hard error below. */
         int filtering = filter != NULL && filter_count > 0
-                        && embed_is_dir(path);
+                        && embed_is_dir(path)
+                        && prefix != NULL && strcmp(prefix, "skins") == 0;
         if (filtering) embed_walk_filtered(&files, path, prefix,
                                            filter, filter_count);
         else if (embed_is_dir(path)) embed_walk(&files, path, prefix);

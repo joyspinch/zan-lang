@@ -40,12 +40,18 @@ $clangDir = Split-Path -Parent $clangExe
 # all retained widgets are pure Win32. Compiled for zanc's own
 # x86_64-w64-windows-gnu link ABI so it links straight through the compiler.
 # Rebuilt on every run (the compiler driver auto-links the async reactor).
-$runtimeLib = Join-Path $root "build\libzan_gui_ide_gnu.a"
-& $clangExe --target=x86_64-w64-windows-gnu -O2 -DZAN_GUI_STATIC `
-    -c src\runtime\gui_runtime.c -o build\zan_gui_ide_gnu.o
-if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_COMPILE_FAILED"; exit 1 }
-& (Join-Path $clangDir "llvm-ar.exe") rcs $runtimeLib build\zan_gui_ide_gnu.o
-if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_LIB_FAILED"; exit 1 }
+	$runtimeLib = Join-Path $root "build\libzan_gui_ide_gnu.a"
+	& $clangExe --target=x86_64-w64-windows-gnu -O2 -DZAN_GUI_STATIC `
+	    -c src\runtime\gui_runtime.c -o build\zan_gui_ide_gnu.o
+	if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_COMPILE_FAILED"; exit 1 }
+	$clangCxx = Join-Path $clangDir "clang++.exe"
+	if (-not (Test-Path $clangCxx)) { $clangCxx = $clangExe }
+	& $clangCxx --target=x86_64-w64-windows-gnu -O2 -DZAN_GUI_STATIC `
+	    -fno-exceptions -fno-rtti `
+	    -c src\runtime\gui_runtime_dwrite.cpp -o build\zan_gui_dwrite_ide_gnu.o
+	if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_DWRITE_COMPILE_FAILED"; exit 1 }
+	& (Join-Path $clangDir "llvm-ar.exe") rcs $runtimeLib build\zan_gui_ide_gnu.o build\zan_gui_dwrite_ide_gnu.o
+	if ($LASTEXITCODE -ne 0) { Write-Output "RUNTIME_LIB_FAILED"; exit 1 }
 
 # ---- 2) embedded resources (skins, help topics, ide.css) -------------------
 # Everything the IDE reads as data ships inside the exe and is looked up by name
@@ -86,9 +92,15 @@ $files = @()
 $files += (Get-ChildItem src\ide_zan\*.zan -Recurse).FullName
 $files += $registryPath
 # The GUI stdlib is namespaced across subfolders (Gui root + Widget /
-# Component / Designer / Hmi); recurse so every part is compiled.
+# Component / Designer); recurse so every part is compiled.
 $files += (Get-ChildItem stdlib\Gui -Recurse -Include *.zan |
     Where-Object { $_.Name -ne "ProjectComponents.zan" }).FullName
+if (Test-Path packages\Zan.Gui.Charts) {
+    $files += (Get-ChildItem packages\Zan.Gui.Charts\src -Recurse -Include *.zan).FullName
+}
+if (Test-Path packages\Zan.Industrial) {
+    $files += (Get-ChildItem packages\Zan.Industrial\src -Recurse -Include *.zan).FullName
+}
 # System pieces the editor/workspace rely on.
 $files += (Join-Path (Get-Location) "stdlib\System\IO\File.zan")
 $files += (Join-Path (Get-Location) "stdlib\System\IO\Directory.zan")
