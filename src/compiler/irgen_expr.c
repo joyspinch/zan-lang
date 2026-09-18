@@ -3052,6 +3052,12 @@ binding_lowered:
             } else if (local && local_slot_owns_rc(local)) {
                 /* ARC: release the previous occupant and retain the new one. */
                 emit_rc_capture_local(g, local->type, local->alloca, right, expr->binary.right, locals);
+            } else if (local && local->struct_rc) {
+                /* A341: whole-struct assignment into an owning value slot --
+                 * field-wise capture (retain borrowed fields, release the old
+                 * occupant's fields). */
+                emit_struct_local_capture(g, local->type, local->alloca, right,
+                                          expr->binary.right, locals);
             } else if (local && local->frame_owner >= 0) {
                 /* An async frame-slot alias (A31x): the storage lives in the
                  * frame and the slot entry owns it, so route the
@@ -3095,6 +3101,10 @@ binding_lowered:
                 if (fs->type && is_rc_managed_type(fs->type)) {
                     emit_rc_store_field(g, fs->type, gv, right, expr->binary.right, locals,
                                         (fs->modifiers & MOD_WEAK) ? 1 : 0);
+                } else if (fs->type && fs->type->kind == TYPE_STRUCT &&
+                           type_contains_collection_rc(g, fs->type, 0)) {
+                    emit_struct_field_capture(g, fs->type, gv, right,
+                                              expr->binary.right, locals);
                 } else {
                     LLVMTypeRef ft = fs->type ? map_type(g, fs->type)
                                               : LLVMInt64TypeInContext(g->ctx);
@@ -3148,6 +3158,14 @@ binding_lowered:
                         if (fst && is_rc_managed_type(fst)) {
                             emit_rc_store_field(g, fst, fptr, right, expr->binary.right, locals,
                                                 (fsym->modifiers & MOD_WEAK) ? 1 : 0);
+                        } else if (fst && fst->kind == TYPE_STRUCT &&
+                                   type_contains_collection_rc(g, fst, 0)) {
+                            /* A341: `this.inner = v` where inner is a struct
+                             * with rc fields -- the storage (borrowed `this`
+                             * pointing into the owner's frame) owns the old
+                             * occupant's +1s; hand the new value its own. */
+                            emit_struct_field_capture(g, fst, fptr, right,
+                                                      expr->binary.right, locals);
                         } else {
                             zan_store_fit(g, right, fptr);
                         }
@@ -3785,6 +3803,10 @@ binding_lowered:
                             emit_rc_store_field(g, fs->type, gv, right,
                                                 expr->binary.right, locals,
                                                 (fs->modifiers & MOD_WEAK) ? 1 : 0);
+                        } else if (fs->type && fs->type->kind == TYPE_STRUCT &&
+                                   type_contains_collection_rc(g, fs->type, 0)) {
+                            emit_struct_field_capture(g, fs->type, gv, right,
+                                                      expr->binary.right, locals);
                         } else {
                             LLVMTypeRef ft = fs->type ? map_type(g, fs->type)
                                                       : LLVMInt64TypeInContext(g->ctx);
@@ -3819,6 +3841,13 @@ binding_lowered:
                             if (aft && is_rc_managed_type(aft)) {
                                 emit_rc_store_field(g, aft, fptr, right, expr->binary.right, locals,
                                                     (afsym->modifiers & MOD_WEAK) ? 1 : 0);
+                            } else if (aft && aft->kind == TYPE_STRUCT &&
+                                       type_contains_collection_rc(g, aft, 0)) {
+                                /* A341: `x.inner = v` on a struct/class slot --
+                                 * the field's +1s belong to the enclosing
+                                 * storage, so capture them like a value store. */
+                                emit_struct_field_capture(g, aft, fptr, right,
+                                                          expr->binary.right, locals);
                             } else {
                                 zan_store_fit(g, right, fptr);
                             }
@@ -7555,31 +7584,33 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                                             fval = LLVMBuildFPTrunc(g->builder, fval, target_t, "trunc");
                                         }
                                     }
-                                    /* ARC: retain a borrowed RC value captured into the
-                                     * field so it survives release of any source local. */
-                                    if (fsym && fsym->type && is_rc_managed_type(fsym->type) &&
-                                        !fval_owned &&
-                                        !expr_yields_owned_ref(arg->binary.right)) {
-                                        emit_rc_retain_for_type(g, fsym->type, fval);
-                                    }
-                                    /* ARC: the constructor ran before these initializer
-                                     * writes and may have populated RC fields
-                                     * (`new Label { Text = "x" }` — Label's ctor wraps
-                                     * Text in a binding), so the overwritten value must
-                                     * be released or it leaks on every construction.
-                                     * Weak fields are non-owning slots: releasing the
-                                     * previous value there would over-release, and
-                                     * value-typed fields have nothing to release. */
-                                    if (fsym && fsym->type && fval &&
-                                        is_rc_managed_type(fsym->type) &&
-                                        !(fsym->modifiers & MOD_WEAK) &&
-                                        LLVMGetTypeKind(LLVMTypeOf(fval)) == LLVMPointerTypeKind) {
-                                        LLVMValueRef fval_old = LLVMBuildLoad2(g->builder,
-                                            LLVMTypeOf(fval), fptr, "arc.fold");
-                                        zan_store_fit(g, fval, fptr);
-                                        emit_rc_release_for_type(g, fsym->type, fval_old);
-                                    } else {
-                                        zan_store_fit(g, fval, fptr);
+                                    /* ARC: one field-store contract for every
+                                     * object-init write (A341): retain a
+                                     * borrowed value / release the previous
+                                     * occupant (the ctor may have populated RC
+                                     * fields: `new Label { Text = "x" }` -- a
+                                     * binding-wrapped Text) / move an owned one.
+                                     * The ownership test must be the shared
+                                     * expr_yields_owned_rc_value -- the old
+                                     * expr_yields_owned_ref (NEW/CALL/QUERY only)
+                                     * misjudged a string-concat RHS as borrowed
+                                     * and over-retained one reference per
+                                     * construction. Weak fields are non-owning
+                                     * slots and stay raw. */
+                                    if (fsym && fsym->type && fval) {
+                                        zan_type_t *fsty = field_store_type(
+                                            g, fsym, new_inst ? new_inst : sym->type);
+                                        if (fsty && is_rc_managed_type(fsty) &&
+                                            !(fsym->modifiers & MOD_WEAK)) {
+                                            emit_rc_store_field(g, fsty, fptr, fval,
+                                                arg->binary.right, locals, 0);
+                                        } else if (fsty && fsty->kind == TYPE_STRUCT &&
+                                                   type_contains_collection_rc(g, fsty, 0)) {
+                                            emit_struct_field_capture(g, fsty, fptr, fval,
+                                                arg->binary.right, locals);
+                                        } else {
+                                            zan_store_fit(g, fval, fptr);
+                                        }
                                     }
                                 }
                             }

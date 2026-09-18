@@ -348,6 +348,66 @@ static void emit_collection_value_release(zan_irgen_t *g, zan_type_t *type,
     }
 }
 
+/* ---- A341: struct value slots that embed rc-managed fields ----------------
+ * `is_rc_managed_type` only ever matches pointer shapes, so a value struct
+ * holding a `string`/List/delegate field had no lifecycle at all: every field
+ * write was a raw store (leaking the old occupant, aliasing a borrowed one)
+ * and scope exit never released anything. A struct_rc-flagged slot owns the
+ * +1s of the rc fields inside its aggregate; these helpers give it the same
+ * capture/release contract reference slots already have, walking the fields
+ * by value with the collection helpers above. */
+
+static void emit_struct_local_release(zan_irgen_t *g, zan_type_t *type,
+                                      LLVMValueRef slot) {
+    LLVMTypeRef st = LLVMIsAAllocaInst(slot)
+        ? LLVMGetAllocatedType(slot) : LLVMTypeOf(slot);
+    if (!st || LLVMGetTypeKind(st) != LLVMStructTypeKind) return;
+    LLVMValueRef cur = LLVMBuildLoad2(g->builder, st, slot, "arc.srel");
+    emit_collection_value_release(g, type, cur, 0);
+}
+
+static void emit_struct_local_retain(zan_irgen_t *g, zan_type_t *type,
+                                     LLVMValueRef slot) {
+    LLVMTypeRef st = LLVMIsAAllocaInst(slot)
+        ? LLVMGetAllocatedType(slot) : LLVMTypeOf(slot);
+    if (!st || LLVMGetTypeKind(st) != LLVMStructTypeKind) return;
+    LLVMValueRef cur = LLVMBuildLoad2(g->builder, st, slot, "arc.sret");
+    emit_collection_value_retain(g, type, cur, 0);
+}
+
+/* Whole-struct assignment `a = b` into an owning struct slot: the mirror of
+ * emit_rc_capture_local for aggregates (release old fields, retain borrowed
+ * new ones, store). */
+static void emit_struct_local_capture(zan_irgen_t *g, zan_type_t *type,
+                                      LLVMValueRef slot_alloca,
+                                      LLVMValueRef v, zan_ast_node_t *rhs,
+                                      local_scope_t *locals) {
+    LLVMTypeRef st = LLVMGetAllocatedType(slot_alloca);
+    if (!st || LLVMGetTypeKind(st) != LLVMStructTypeKind) return;
+    LLVMValueRef old = LLVMBuildLoad2(g->builder, st, slot_alloca, "arc.sold");
+    if (!expr_yields_owned_rc_value(g, rhs, locals))
+        emit_collection_value_retain(g, type, v, 0);
+    zan_store_fit(g, v, slot_alloca);
+    emit_collection_value_release(g, type, old, 0);
+}
+
+/* Field store `x.inner = v` where the field itself is a struct with rc
+ * fields: same capture contract, addressed by field pointer. */
+static void emit_struct_field_capture(zan_irgen_t *g, zan_type_t *ftype,
+                                      LLVMValueRef field_ptr, LLVMValueRef v,
+                                      zan_ast_node_t *rhs,
+                                      local_scope_t *locals) {
+    LLVMTypeRef st = map_type(g, ftype);
+    if (!st || LLVMGetTypeKind(st) != LLVMStructTypeKind) return;
+    if (LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMPointerTypeKind)
+        v = LLVMBuildLoad2(g->builder, st, v, "arc.sld");
+    LLVMValueRef old = LLVMBuildLoad2(g->builder, st, field_ptr, "arc.sold");
+    if (!expr_yields_owned_rc_value(g, rhs, locals))
+        emit_collection_value_retain(g, ftype, v, 0);
+    zan_store_fit(g, v, field_ptr);
+    emit_collection_value_release(g, ftype, old, 0);
+}
+
 static LLVMValueRef load_dict_value_words(zan_irgen_t *g, LLVMValueRef raw) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMValueRef dict = LLVMBuildBitCast(g->builder, raw,

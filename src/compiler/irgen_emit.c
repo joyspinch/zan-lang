@@ -1642,6 +1642,19 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             local_add(locals, param->param.name, param_alloca, pt);
             if (pt && pt->kind == TYPE_STRING)
                 locals->vars[locals->count - 1].opaque_string = 1;
+            /* A341: a struct param is a by-value copy whose rc fields alias
+             * the caller's refcounts. Retain them on entry (the copy is an
+             * owning borrow) so the scope-exit field release below releases
+             * only what this frame took; without it either the copy's writes
+             * alias the caller's +1s or the exit release double-frees them.
+             * By-ref params borrow the caller's slot and are excluded above. */
+            if (pt && pt->kind == TYPE_STRUCT &&
+                LLVMGetTypeKind(param_types[k + param_offset]) ==
+                    LLVMStructTypeKind &&
+                type_contains_collection_rc(g, pt, 0)) {
+                locals->vars[locals->count - 1].struct_rc = 1;
+                emit_struct_local_retain(g, pt, param_alloca);
+            }
             own_written_param(g, locals, param, pt,
                               param_types[k + param_offset], pv,
                               member->method_decl.body);
@@ -2324,6 +2337,14 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
         LLVMValueRef param_alloca = LLVMBuildAlloca(g->builder, param_types[pi], "p");
         LLVMBuildStore(g->builder, pv, param_alloca);
         local_add(locals, param->param.name, param_alloca, pt);
+        /* A341: same by-value struct copy rule as the unspecialized binding
+         * site above -- entry-retain the rc fields the copy aliases. */
+        if (pt && pt->kind == TYPE_STRUCT &&
+            LLVMGetTypeKind(param_types[pi]) == LLVMStructTypeKind &&
+            type_contains_collection_rc(g, pt, 0)) {
+            locals->vars[locals->count - 1].struct_rc = 1;
+            emit_struct_local_retain(g, pt, param_alloca);
+        }
         own_written_param(g, locals, param, pt, param_types[pi], pv,
                           member->method_decl.body);
     }

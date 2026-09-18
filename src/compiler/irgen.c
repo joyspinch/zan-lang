@@ -3887,6 +3887,12 @@ typedef struct {
      * assignment through the alias must route its capture-release to the slot
      * entry via this index rather than rely on its own ownership flags. */
     int frame_owner;
+    /* A341: 1 for a struct-typed slot whose aggregate embeds rc-managed
+     * fields (directly or through nested value structs). The slot owns its
+     * fields' +1s: a write must release the old occupant / retain a borrowed
+     * new one, and scope exit releases every field. Only private allocas are
+     * flagged -- by-ref params and the borrowed `this` pointer are not. */
+    int struct_rc;
 } local_var_t;
 
 /* A function's locals live in a single flat scope. The backing array grows
@@ -3950,6 +3956,7 @@ static void local_add(local_scope_t *scope, zan_istr_t name, LLVMValueRef alloca
     scope->vars[scope->count].obj_rc_flag = NULL;
     scope->vars[scope->count].async_decl = NULL;
     scope->vars[scope->count].frame_owner = -1;
+    scope->vars[scope->count].struct_rc = 0;
     scope->count++;
     /* Record the variable for the debugger (no-op unless building with -g). The
      * emit context supplies the compiler state; local_add itself is g-free.
@@ -4077,6 +4084,8 @@ static void emit_dict_release_elems(zan_irgen_t *g, zan_type_t *dict_type, LLVMV
 static void emit_array_release_elems(zan_irgen_t *g, zan_type_t *elem_type,
                                      LLVMValueRef arr, LLVMValueRef len);
 static void emit_release_obj_local(zan_irgen_t *g, local_var_t *v);
+static void emit_struct_local_release(zan_irgen_t *g, zan_type_t *type,
+                                      LLVMValueRef slot);
 static LLVMValueRef zan_store_fit(zan_irgen_t *g, LLVMValueRef val, LLVMValueRef ptr);
 
 /* Release all RC-managed local variables in scope (for throw/exception cleanup) */
@@ -4084,6 +4093,9 @@ static void release_all_arc_locals(zan_irgen_t *g, local_scope_t *locals) {
     for (int i = 0; i < locals->count; i++) {
         if (locals->vars[i].obj_rc_flag) {
             emit_release_obj_local(g, &locals->vars[i]);
+        } else if (locals->vars[i].struct_rc) {
+            emit_struct_local_release(g, locals->vars[i].type,
+                                      locals->vars[i].alloca);
         } else if (is_rc_managed_type(locals->vars[i].type)) {
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMValueRef val = LLVMBuildLoad2(g->builder, i8ptr,

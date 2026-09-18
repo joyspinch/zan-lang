@@ -341,11 +341,6 @@ static LLVMValueRef emit_dispatch_call(zan_irgen_t *g, zan_symbol_t *static_sym,
 
 /* A value already carrying an owned (+1) reference we may take over as-is;
  * anything else is a borrowed load that must be retained on capture. */
-static int expr_yields_owned_ref(zan_ast_node_t *e) {
-    return e && (e->kind == AST_NEW_EXPR || e->kind == AST_CALL ||
-                 e->kind == AST_QUERY_EXPR);
-}
-
 static int expr_is_arc_object(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals) {
     zan_type_t *t = infer_expr_type(g, e, locals);
     return is_rc_managed_type(t);
@@ -594,6 +589,17 @@ static int expr_member_of_owned_temp(zan_irgen_t *g, zan_ast_node_t *e,
 static void emit_release_owned_call_temp(zan_irgen_t *g, zan_ast_node_t *arg,
                                          LLVMValueRef val, local_scope_t *locals) {
     if (!arg || !locals || !val) return;
+    /* A341: a discarded struct call result (`Echo(a);`, `Use(Make())` where
+     * the callee returned a struct) carries +1 per rc field from the
+     * callee's return retain; without this the fields leak. */
+    if (LLVMGetTypeKind(LLVMTypeOf(val)) == LLVMStructTypeKind) {
+        zan_type_t *st = infer_expr_type(g, arg, locals);
+        if (st && st->kind == TYPE_STRUCT &&
+            type_contains_collection_rc(g, st, 0) &&
+            expr_yields_owned_rc_value(g, arg, locals))
+            emit_collection_value_release(g, st, val, 0);
+        return;
+    }
     if (LLVMGetTypeKind(LLVMTypeOf(val)) != LLVMPointerTypeKind) return;
     if (expr_is_local_ident(arg, locals)) return;
     /* A delegate argument written in place -- `Apply((a) => a * k, 5)`,
@@ -873,6 +879,10 @@ static void emit_release_owned_locals_except(zan_irgen_t *g, local_scope_t *loca
             emit_release_obj_local(g, &locals->vars[i]);
         } else if (locals->vars[i].box_cell) {
             release_boxed_local(g, &locals->vars[i]);
+        } else if (locals->vars[i].struct_rc) {
+            /* A341: the slot owns the rc fields inside its aggregate. */
+            emit_struct_local_release(g, locals->vars[i].type,
+                                      locals->vars[i].alloca);
         } else if (local_owns_arc(&locals->vars[i])) {
             LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr,
                                               locals->vars[i].alloca, "arc.rel");
@@ -894,6 +904,10 @@ static void emit_release_owned_locals_range(zan_irgen_t *g, local_scope_t *local
             emit_release_obj_local(g, &locals->vars[i]);
         } else if (locals->vars[i].box_cell) {
             release_boxed_local(g, &locals->vars[i]);
+        } else if (locals->vars[i].struct_rc) {
+            /* A341: function-exit / break-continue-edge field release. */
+            emit_struct_local_release(g, locals->vars[i].type,
+                                      locals->vars[i].alloca);
         } else if (local_owns_arc(&locals->vars[i])) {
             LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr,
                                               locals->vars[i].alloca, "arc.rel");
@@ -946,6 +960,13 @@ static void emit_clear_owned_locals_range(zan_irgen_t *g, local_scope_t *locals,
         if (local_owns_arc(&locals->vars[i])) {
             LLVMBuildStore(g->builder, LLVMConstNull(i8ptr),
                            locals->vars[i].alloca);
+        } else if (locals->vars[i].struct_rc) {
+            /* A341: a throw released the fields from this slot; zero the
+             * aggregate so a second cleanup pass (finally, catch) sees null
+             * instead of dangling field pointers. */
+            LLVMBuildStore(g->builder,
+                LLVMConstNull(LLVMGetAllocatedType(locals->vars[i].alloca)),
+                locals->vars[i].alloca);
         }
     }
 }
@@ -966,6 +987,10 @@ static void emit_release_owned_locals_from(zan_irgen_t *g, local_scope_t *locals
             emit_release_obj_local(g, &locals->vars[i]);
         } else if (!terminated && locals->vars[i].box_cell) {
             release_boxed_local(g, &locals->vars[i]);
+        } else if (!terminated && locals->vars[i].struct_rc) {
+            /* A341: the slot owns the rc fields inside its aggregate. */
+            emit_struct_local_release(g, locals->vars[i].type,
+                                      locals->vars[i].alloca);
         } else if (!terminated && local_owns_arc(&locals->vars[i])) {
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr,

@@ -912,6 +912,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                                     if (fi >= 0) {
                                         LLVMValueRef fptr = emit_field_ptr(g, sym, st, alloca, fi, "finit");
                                         LLVMValueRef fval = emit_expr(g, arg->binary.right, locals);
+                                        zan_type_t *fst = field_store_type(
+                                            g, fsym, new_inst ? new_inst : sym->type);
                                         if (fsym && fsym->type) {
                                             LLVMTypeRef target_t = map_type(g, fsym->type);
                                             LLVMTypeRef val_t = LLVMTypeOf(fval);
@@ -923,11 +925,32 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                                                 fval = LLVMBuildFPExt(g->builder, fval, target_t, "ext");
                                             }
                                         }
-                                        zan_store_fit(g, fval, fptr);
+                                        /* A341: the object owns its rc fields --
+                                         * retain a borrowed value / release the
+                                         * (null, zero-initialised) old occupant
+                                         * instead of storing the pointer raw, and
+                                         * a struct-typed field recurses the same
+                                         * contract into its own fields. */
+                                        if (fst && is_rc_managed_type(fst)) {
+                                            emit_rc_store_field(g, fst, fptr, fval,
+                                                arg->binary.right, locals,
+                                                (fsym->modifiers & MOD_WEAK) ? 1 : 0);
+                                        } else if (fst && fst->kind == TYPE_STRUCT &&
+                                                   type_contains_collection_rc(g, fst, 0)) {
+                                            emit_struct_field_capture(g, fst, fptr, fval,
+                                                arg->binary.right, locals);
+                                        } else {
+                                            zan_store_fit(g, fval, fptr);
+                                        }
                                     }
                                 }
                             }
                             local_add(locals, stmt->var_decl.name, alloca, type);
+                            /* A341: the constructed value's rc fields (set by
+                             * the ctor / the writes above) are owned here. */
+                            if (type && type->kind == TYPE_STRUCT &&
+                                type_contains_collection_rc(g, type, 0))
+                                locals->vars[locals->count - 1].struct_rc = 1;
                             return;
                         }
                     }
@@ -1183,6 +1206,17 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 emit_obj_local_store(g, &obj_slot, init_val,
                     infer_expr_type(g, stmt->var_decl.initializer, locals),
                     stmt->var_decl.initializer, locals);
+            } else if (type && type->kind == TYPE_STRUCT &&
+                       type_contains_collection_rc(g, type, 0)) {
+                /* A341: a struct initializer is a field-wise copy. A call/new
+                 * result carries +1 per rc field (return retain) and the slot
+                 * takes it over; any other shape (another local, a field
+                 * read) is a borrowed copy and must retain its own +1s. */
+                init_val = coerce_int_to(g, init_val, llvm_type);
+                zan_store_fit(g, init_val, alloca);
+                if (!expr_yields_owned_rc_value(g, init_src, locals) &&
+                    !conv_owned)
+                    emit_struct_local_retain(g, type, alloca);
             } else {
                 init_val = coerce_int_to(g, init_val, llvm_type);
                 zan_store_fit(g, init_val, alloca);
@@ -1214,6 +1248,12 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
         if (type && type->kind == TYPE_STRING && stmt->var_decl.initializer &&
             call_targets_extern(g, stmt->var_decl.initializer))
             locals->vars[locals->count - 1].opaque_string = 1;
+        /* A341: an owning struct slot -- scope exit and field writes manage
+         * the rc fields inside its aggregate (see the init store above). */
+        if (type && type->kind == TYPE_STRUCT &&
+            LLVMGetTypeKind(llvm_type) == LLVMStructTypeKind &&
+            type_contains_collection_rc(g, type, 0))
+            locals->vars[locals->count - 1].struct_rc = 1;
         if (arc_own) arc_own_local(g, locals);
         if (obj_own)
             locals->vars[locals->count - 1].obj_rc_flag = obj_slot.obj_rc_flag;
@@ -1450,6 +1490,16 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 !expr_yields_owned_rc_value(g, stmt->ret.value, locals) &&
                 !conv_ret) {
                 emit_rc_retain_for_type(g, ret_type, val);
+            } else if (ret_type && ret_type->kind == TYPE_STRUCT &&
+                       type_contains_collection_rc(g, ret_type, 0) &&
+                       !expr_yields_owned_rc_value(g, stmt->ret.value, locals) &&
+                       !conv_ret) {
+                /* A341: a returned struct must carry +1 per rc field (the
+                 * receiver releases them); a borrowed copy of an owning local
+                 * retains here, before the exit release below consumes the
+                 * local's own count. A call/new result already owns its +1s
+                 * and moves instead. */
+                emit_collection_value_retain(g, ret_type, val, 0);
             }
             if (g->finally_count > 0) {
                 LLVMValueRef v_slot =
