@@ -371,7 +371,18 @@ static int io_reject_dead_fd(intptr_t fd, void *co, zan_co_step_t step) {
 #if !defined(__linux__)
 static void io_deliver_recv(zan_io_entry_t *e) {
     if (e->out_accept) {
-        *e->out_accept = (intptr_t)accept(e->fd, NULL, NULL);
+        int cfd = accept(e->fd, NULL, NULL);
+        if (cfd >= 0) {
+#if defined(FD_CLOEXEC)
+            int flags = fcntl(cfd, F_GETFD);
+            if (flags >= 0) fcntl(cfd, F_SETFD, flags | FD_CLOEXEC);
+#endif
+#if defined(O_NONBLOCK)
+            int fl = fcntl(cfd, F_GETFL);
+            if (fl >= 0) fcntl(cfd, F_SETFL, fl | O_NONBLOCK);
+#endif
+        }
+        *e->out_accept = (intptr_t)cfd;
         return;
     }
     if (!e->out_n) return;
@@ -990,7 +1001,22 @@ static zan_io_slot_t *io_slot(int fd) {
 /* Perform the pending recv/accept for a woken waiter (see io_deliver_recv). */
 static void io_deliver_waiter(int fd, zan_io_waiter_t *w) {
     if (w->out_accept) {
-        *w->out_accept = (intptr_t)accept(fd, NULL, NULL);
+#if defined(__linux__) && defined(SOCK_NONBLOCK) && defined(SOCK_CLOEXEC)
+        *w->out_accept = (intptr_t)accept4(fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+#else
+        int cfd = accept(fd, NULL, NULL);
+        if (cfd >= 0) {
+#if defined(FD_CLOEXEC)
+            int flags = fcntl(cfd, F_GETFD);
+            if (flags >= 0) fcntl(cfd, F_SETFD, flags | FD_CLOEXEC);
+#endif
+#if defined(O_NONBLOCK)
+            int fl = fcntl(cfd, F_GETFL);
+            if (fl >= 0) fcntl(cfd, F_SETFL, fl | O_NONBLOCK);
+#endif
+        }
+        *w->out_accept = (intptr_t)cfd;
+#endif
         return;
     }
     if (!w->out_n) return;
@@ -2468,15 +2494,19 @@ void zan_io_accept_co(intptr_t fd, void *frame, zan_co_step_t step,
     int skip = ensure_assoc(listener);
     (void)skip;
 
-    LPFN_ACCEPTEX accept_ex = NULL;
-    GUID guid = WSAID_ACCEPTEX;
+    static LPFN_ACCEPTEX s_cached_accept_ex = NULL;
+    LPFN_ACCEPTEX accept_ex = s_cached_accept_ex;
     DWORD got = 0;
-    if (WSAIoctl(listener, SIO_GET_EXTENSION_FUNCTION_POINTER,
-                 &guid, sizeof(guid), &accept_ex, sizeof(accept_ex),
-                 &got, NULL, NULL) == SOCKET_ERROR) {
-        if (out_fd) *out_fd = -1;
-        if (step) zan_co_ready(frame, step);
-        return;
+    if (!accept_ex) {
+        GUID guid = WSAID_ACCEPTEX;
+        if (WSAIoctl(listener, SIO_GET_EXTENSION_FUNCTION_POINTER,
+                     &guid, sizeof(guid), &accept_ex, sizeof(accept_ex),
+                     &got, NULL, NULL) == SOCKET_ERROR) {
+            if (out_fd) *out_fd = -1;
+            if (step) zan_co_ready(frame, step);
+            return;
+        }
+        s_cached_accept_ex = accept_ex;
     }
 
     /* The accepted socket's family must match the listener's (AcceptEx

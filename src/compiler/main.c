@@ -370,6 +370,10 @@ static int subdir_globbed(const char *subdir) {
     return 0;
 }
 
+static const char *const s_gui_internal_subdirs[] = {
+    "Core", "Rendering", "Styling", "Layout", "Text", "Media", "Markup", NULL
+};
+
 /* Auto-include every *.zan file in stdlib_root/subdir (dedup + existence
  * checked). Returns 1 if any new file was added. `subdir` uses '/' separators
  * (accepted by the Win32 file APIs too). */
@@ -391,6 +395,24 @@ static int glob_stdlib_dir(const char *stdlib_root, const char *subdir,
         } while (FindNextFileA(h, &fd));
         FindClose(h);
     }
+    if (strcmp(subdir, "Gui") == 0) {
+        for (int si = 0; s_gui_internal_subdirs[si]; si++) {
+            char sub_glob[1024];
+            snprintf(sub_glob, sizeof(sub_glob), "%s\\%s\\%s\\*.zan",
+                     stdlib_root, subdir, s_gui_internal_subdirs[si]);
+            h = FindFirstFileA(sub_glob, &fd);
+            if (h != INVALID_HANDLE_VALUE) {
+                do {
+                    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                    char mod_path[1024];
+                    snprintf(mod_path, sizeof(mod_path), "%s\\%s\\%s\\%s",
+                             stdlib_root, subdir, s_gui_internal_subdirs[si], fd.cFileName);
+                    add_stdlib_input(files, count, cap, mod_path);
+                } while (FindNextFileA(h, &fd));
+                FindClose(h);
+            }
+        }
+    }
 #else
     char dir_path[1024];
     if (!resolve_stdlib_dir(stdlib_root, subdir, dir_path, sizeof(dir_path)))
@@ -406,6 +428,24 @@ static int glob_stdlib_dir(const char *stdlib_root, const char *subdir,
             add_stdlib_input(files, count, cap, mod_path);
         }
         closedir(d);
+    }
+    if (strcmp(subdir, "Gui") == 0) {
+        for (int si = 0; s_gui_internal_subdirs[si]; si++) {
+            char sub_dir[1024];
+            snprintf(sub_dir, sizeof(sub_dir), "%s/%s", dir_path, s_gui_internal_subdirs[si]);
+            DIR *subd = opendir(sub_dir);
+            if (subd) {
+                struct dirent *ent;
+                while ((ent = readdir(subd)) != NULL) {
+                    size_t nlen = strlen(ent->d_name);
+                    if (nlen < 5 || strcmp(ent->d_name + nlen - 4, ".zan") != 0) continue;
+                    char mod_path[1024];
+                    snprintf(mod_path, sizeof(mod_path), "%s/%s", sub_dir, ent->d_name);
+                    add_stdlib_input(files, count, cap, mod_path);
+                }
+                closedir(subd);
+            }
+        }
     }
 #endif
     return *count != before;
@@ -897,6 +937,9 @@ static int pi_reach_input_dir(const char *file) {
     }
     sub[used] = 0;
     pi_reach(sub);
+    if (strncmp(sub, "Gui/", 4) == 0) {
+        pi_reach("Gui");
+    }
     return 1;
 }
 
@@ -930,33 +973,71 @@ static void pi_glob_into(pi_dir_t *d, const char *root, const char *subdir) {
         snprintf(glob_path, sizeof(glob_path), "%s\\*.zan", root);
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA(glob_path, &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
-    do {
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        char mod_path[1024];
-        if (subdir[0])
-            snprintf(mod_path, sizeof(mod_path), "%s\\%s\\%s",
-                     root, subdir, fd.cFileName);
-        else
-            snprintf(mod_path, sizeof(mod_path), "%s\\%s", root, fd.cFileName);
-        pi_add_file(d, mod_path);
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            char mod_path[1024];
+            if (subdir[0])
+                snprintf(mod_path, sizeof(mod_path), "%s\\%s\\%s",
+                         root, subdir, fd.cFileName);
+            else
+                snprintf(mod_path, sizeof(mod_path), "%s\\%s", root, fd.cFileName);
+            pi_add_file(d, mod_path);
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    if (strcmp(subdir, "Gui") == 0) {
+        for (int si = 0; s_gui_internal_subdirs[si]; si++) {
+            char sub_glob[1024];
+            snprintf(sub_glob, sizeof(sub_glob), "%s\\%s\\%s\\*.zan",
+                     root, subdir, s_gui_internal_subdirs[si]);
+            h = FindFirstFileA(sub_glob, &fd);
+            if (h != INVALID_HANDLE_VALUE) {
+                do {
+                    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                    char mod_path[1024];
+                    snprintf(mod_path, sizeof(mod_path), "%s\\%s\\%s\\%s",
+                             root, subdir, s_gui_internal_subdirs[si], fd.cFileName);
+                    pi_add_file(d, mod_path);
+                } while (FindNextFileA(h, &fd));
+                FindClose(h);
+            }
+        }
+    }
 #else
     char dir_path[1024];
     if (!resolve_stdlib_dir(root, subdir, dir_path, sizeof(dir_path)))
         return;
     DIR *dr = opendir(dir_path);
-    if (!dr) return;
-    struct dirent *ent;
-    while ((ent = readdir(dr)) != NULL) {
-        size_t nlen = strlen(ent->d_name);
-        if (nlen < 5 || strcmp(ent->d_name + nlen - 4, ".zan") != 0) continue;
-        char mod_path[1024];
-        snprintf(mod_path, sizeof(mod_path), "%s/%s", dir_path, ent->d_name);
-        pi_add_file(d, mod_path);
+    if (dr) {
+        struct dirent *ent;
+        while ((ent = readdir(dr)) != NULL) {
+            size_t nlen = strlen(ent->d_name);
+            if (nlen < 5 || strcmp(ent->d_name + nlen - 4, ".zan") != 0) continue;
+            char mod_path[1024];
+            snprintf(mod_path, sizeof(mod_path), "%s/%s", dir_path, ent->d_name);
+            pi_add_file(d, mod_path);
+        }
+        closedir(dr);
     }
-    closedir(dr);
+    if (strcmp(subdir, "Gui") == 0) {
+        for (int si = 0; s_gui_internal_subdirs[si]; si++) {
+            char sub_dir[1024];
+            snprintf(sub_dir, sizeof(sub_dir), "%s/%s", dir_path, s_gui_internal_subdirs[si]);
+            DIR *subdr = opendir(sub_dir);
+            if (subdr) {
+                struct dirent *ent;
+                while ((ent = readdir(subdr)) != NULL) {
+                    size_t nlen = strlen(ent->d_name);
+                    if (nlen < 5 || strcmp(ent->d_name + nlen - 4, ".zan") != 0) continue;
+                    char mod_path[1024];
+                    snprintf(mod_path, sizeof(mod_path), "%s/%s", sub_dir, ent->d_name);
+                    pi_add_file(d, mod_path);
+                }
+                closedir(subdr);
+            }
+        }
+    }
 #endif
 }
 
