@@ -18,6 +18,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <dirent.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 #define PATH_SEP "/"
 #endif
 
@@ -487,6 +490,13 @@ bool zan_pkg_global_store(char *out, size_t out_size) {
 #endif
 }
 
+static bool pkg_dir_in_list(const char (*out_dirs)[1024], int count, const char *dir) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(out_dirs[i], dir) == 0) return true;
+    }
+    return false;
+}
+
 static int pkg_scan_store(const char *store, const char *namespace_path,
                           char (*out_dirs)[1024], int count, int max_dirs) {
     if (!pkg_is_dir(store)) return count;
@@ -500,9 +510,20 @@ static int pkg_scan_store(const char *store, const char *namespace_path,
             (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
             !pkg_safe_component(fd.cFileName)) continue;
         char cand[1024];
-        snprintf(cand, sizeof(cand), "%s\\%s\\stdlib\\%s", store,
+        /* 1. Prefer standard source package layout: <pkg>/src/<namespace_path> */
+        snprintf(cand, sizeof(cand), "%s\\%s\\src\\%s", store,
                  fd.cFileName, namespace_path);
-        if (pkg_is_dir(cand) && count < max_dirs) {
+        if (!pkg_is_dir(cand)) {
+            /* 2. Legacy package layout: <pkg>/stdlib/<namespace_path> */
+            snprintf(cand, sizeof(cand), "%s\\%s\\stdlib\\%s", store,
+                     fd.cFileName, namespace_path);
+        }
+        if (!pkg_is_dir(cand)) {
+            /* 3. Flat package layout: <pkg>/<namespace_path> */
+            snprintf(cand, sizeof(cand), "%s\\%s\\%s", store,
+                     fd.cFileName, namespace_path);
+        }
+        if (pkg_is_dir(cand) && count < max_dirs && !pkg_dir_in_list(out_dirs, count, cand)) {
             snprintf(out_dirs[count++], 1024, "%s", cand);
             zan_pkg_note_usage(store, fd.cFileName);
         }
@@ -516,8 +537,17 @@ static int pkg_scan_store(const char *store, const char *namespace_path,
         char root[1024], cand[1024]; struct stat st;
         snprintf(root, sizeof(root), "%s/%s", store, e->d_name);
         if (lstat(root, &st) != 0 || !S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode)) continue;
-        snprintf(cand, sizeof(cand), "%s/stdlib/%s", root, namespace_path);
-        if (pkg_is_dir(cand) && count < max_dirs) {
+        /* 1. Prefer standard source package layout: <pkg>/src/<namespace_path> */
+        snprintf(cand, sizeof(cand), "%s/src/%s", root, namespace_path);
+        if (!pkg_is_dir(cand)) {
+            /* 2. Legacy package layout: <pkg>/stdlib/<namespace_path> */
+            snprintf(cand, sizeof(cand), "%s/stdlib/%s", root, namespace_path);
+        }
+        if (!pkg_is_dir(cand)) {
+            /* 3. Flat package layout: <pkg>/<namespace_path> */
+            snprintf(cand, sizeof(cand), "%s/%s", root, namespace_path);
+        }
+        if (pkg_is_dir(cand) && count < max_dirs && !pkg_dir_in_list(out_dirs, count, cand)) {
             snprintf(out_dirs[count++], 1024, "%s", cand);
             zan_pkg_note_usage(store, e->d_name);
         }
@@ -532,8 +562,48 @@ int zan_pkg_find_namespace(const char *project_dir, const char *namespace_path,
     if (!project_dir || !pkg_safe_namespace_path(namespace_path) ||
         !out_dirs || max_dirs <= 0) return 0;
     char store[1024]; int count = 0;
+    /* 1. Project packages/ directory (monorepo / local packages) */
+    snprintf(store, sizeof(store), "%s" PATH_SEP "packages", project_dir);
+    count = pkg_scan_store(store, namespace_path, out_dirs, count, max_dirs);
+    /* 2. Project-local .zan-packages cache */
     snprintf(store, sizeof(store), "%s" PATH_SEP ".zan-packages", project_dir);
     count = pkg_scan_store(store, namespace_path, out_dirs, count, max_dirs);
+    /* 3. SDK / toolchain sibling packages/ directory */
+    {
+        char exe_dir[1024] = {0};
+#ifdef _WIN32
+        if (GetModuleFileNameA(NULL, exe_dir, sizeof(exe_dir))) {
+            char *last_sep = strrchr(exe_dir, '\\');
+            if (last_sep) *last_sep = '\0';
+            snprintf(store, sizeof(store), "%s\\..\\packages", exe_dir);
+            if (pkg_is_dir(store))
+                count = pkg_scan_store(store, namespace_path, out_dirs, count, max_dirs);
+            snprintf(store, sizeof(store), "%s\\packages", exe_dir);
+            if (pkg_is_dir(store))
+                count = pkg_scan_store(store, namespace_path, out_dirs, count, max_dirs);
+        }
+#elif defined(__APPLE__)
+        uint32_t exe_sz = sizeof(exe_dir);
+        if (_NSGetExecutablePath(exe_dir, &exe_sz) == 0) {
+            char *last_sep = strrchr(exe_dir, '/');
+            if (last_sep) *last_sep = '\0';
+            snprintf(store, sizeof(store), "%s/../packages", exe_dir);
+            if (pkg_is_dir(store))
+                count = pkg_scan_store(store, namespace_path, out_dirs, count, max_dirs);
+        }
+#else
+        ssize_t len = readlink("/proc/self/exe", exe_dir, sizeof(exe_dir) - 1);
+        if (len > 0) {
+            exe_dir[len] = '\0';
+            char *last_sep = strrchr(exe_dir, '/');
+            if (last_sep) *last_sep = '\0';
+            snprintf(store, sizeof(store), "%s/../packages", exe_dir);
+            if (pkg_is_dir(store))
+                count = pkg_scan_store(store, namespace_path, out_dirs, count, max_dirs);
+        }
+#endif
+    }
+    /* 4. Global installed packages */
     if (zan_pkg_global_store(store, sizeof(store)))
         count = pkg_scan_store(store, namespace_path, out_dirs, count, max_dirs);
     return count;

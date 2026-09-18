@@ -58,6 +58,7 @@ $b       = Join-Path $root 'build'
 $ideExe  = Join-Path $b 'ZanIDE.exe'
 $zancExe = Join-Path $b 'zanc.exe'
 $stdlib  = Join-Path $root 'stdlib'
+$packages = Join-Path $root 'packages'
 foreach ($p in @($ideExe, $zancExe, $stdlib)) {
     if (-not (Test-Path $p)) { Write-Output "PUBLISH_FAILED: missing $p"; exit 1 }
 }
@@ -71,7 +72,9 @@ foreach ($p in @($ideExe, $zancExe, $stdlib)) {
 # carries the same guard for the dev tree, plus the junction handling). Fail
 # fast here so a future path change cannot silently reintroduce it.
 $distFull = [IO.Path]::GetFullPath($dist)
-foreach ($src in @($b, $stdlib,
+foreach ($src in @($b, $stdlib, $packages,
+                   (Join-Path $root 'examples'),
+                   (Join-Path $root 'templates'))) {
                    (Join-Path $root 'examples'),
                    (Join-Path $root 'templates'))) {
     $srcFull = [IO.Path]::GetFullPath($src)
@@ -129,6 +132,9 @@ if ($stripped) {
 # The GUI runtime is statically linked into ZanIDE.exe (build_ide.ps1).
 # ships beside the IDE.
 Copy-Item $stdlib (Join-Path $dist 'stdlib') -Recurse
+if (Test-Path $packages) {
+    Copy-Item $packages (Join-Path $dist 'packages') -Recurse
+}
 
 # ---- the IDE's own page-layout stylesheet is baked into the exe ------------
 # ide.css travels as an embedded resource (scripts\gen_embed.ps1 -Prefix ide,
@@ -251,9 +257,14 @@ if (Test-Path $gdbExe) {
 }
 
 # ---- copy a small set of example programs, if present ----
+# robocopy + /XD：模板/示例树里可能躺着 gitignore 掉的 _scratch\ 和
+# build\（legend 的调试产物、server-mvc 的 19M 编译产物），
+# Copy-Item -Recurse 会整树照搬，把发布包塞满与发布无关的产物。
+# robocopy 退出码 >=8 才是失败。
 $examples = Join-Path $root 'examples'
 if (Test-Path $examples) {
-    Copy-Item $examples (Join-Path $dist 'examples') -Recurse
+    robocopy $examples (Join-Path $dist 'examples') /E /XD _scratch build /NFL /NDL /NJH /NJS /NP | Out-Null
+    if ($LASTEXITCODE -ge 8) { Write-Output "PUBLISH_WARN: examples robocopy failed ($LASTEXITCODE)" }
 }
 
 # ---- copy the built-in project templates (data-driven; read at runtime) ----
@@ -261,7 +272,8 @@ if (Test-Path $examples) {
 # adding a template needs no rebuild. Keep this folder next to ZanIDE.exe.
 $templates = Join-Path $root 'templates'
 if (Test-Path $templates) {
-    Copy-Item $templates (Join-Path $dist 'templates') -Recurse
+    robocopy $templates (Join-Path $dist 'templates') /E /XD _scratch build /NFL /NDL /NJH /NJS /NP | Out-Null
+    if ($LASTEXITCODE -ge 8) { Write-Output "PUBLISH_WARN: templates robocopy failed ($LASTEXITCODE)" }
 } else {
     Write-Output "PUBLISH_WARN: templates\ missing; New Project will use the built-in fallback set"
 }
