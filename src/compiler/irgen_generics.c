@@ -379,6 +379,10 @@ static int expr_yields_delegate_value(zan_irgen_t *g, zan_ast_node_t *e,
 static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
                                       local_scope_t *locals) {
     if (!e) return 0;
+    /* null-forgiving postfix `!` is transparent to ownership: the wrapper's
+     * contract is whatever its operand's is. */
+    if (e->kind == AST_POSTFIX_UNARY && e->unary.op == TK_BANG)
+        return expr_yields_owned_rc_value(g, e->unary.operand, locals);
     if (e->kind == AST_INDEX) {
         /* A user-defined op_index lowers to a method call, so an RC-managed
          * return is owned (+1) exactly like an AST_CALL result. This applies

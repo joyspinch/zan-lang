@@ -1815,6 +1815,19 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
             }
             parser_expect(p, TK_RBRACE);
             expr = n;
+        } else if (parser_check(p, TK_BANG)) {
+            /* null-forgiving postfix (C# `!`): a compile-time assertion that
+             * the operand is not null. The checker's null-receiver diagnostic
+             * keys on the receiver's shape (identifier / call), and this
+             * wrapper is neither, so `c!.Name` bypasses it by construction.
+             * Chaining continues: `c!.Name` must parse `.Name` onto the
+             * wrapper. */
+            parser_advance(p);
+            zan_ast_node_t *n = zan_ast_new(p->arena, AST_POSTFIX_UNARY, loc);
+            n->unary.op = TK_BANG;
+            n->unary.operand = expr;
+            expr = n;
+            continue;
         } else if (parser_check(p, TK_PLUS_PLUS) || parser_check(p, TK_MINUS_MINUS)) {
             /* postfix ++/--: consume exactly one operator and stop, so
              * `x++`/`x--` lower to a single AST_POSTFIX_UNARY. */

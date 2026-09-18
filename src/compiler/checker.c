@@ -2273,6 +2273,10 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
 
     case AST_POSTFIX_UNARY: {
         zan_type_t *operand = zan_checker_check_expr(c, expr->unary.operand);
+        /* postfix `!` (null-forgiving): the operand's own type, no
+         * increment/read-only semantics */
+        if (expr->unary.op == TK_BANG)
+            return operand ? operand : c->binder->type_error;
         check_readonly_incdec(c, expr);
         if (type_is_numeric(operand)) return operand;
         return c->binder->type_error;

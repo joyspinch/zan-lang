@@ -9213,6 +9213,10 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
         return emit_expr_with_expr(g, expr, locals);
 
     case AST_POSTFIX_UNARY:
+        /* postfix `!` (null-forgiving): a compile-time assertion with no
+         * runtime effect -- the operand's value, unchanged. */
+        if (expr->unary.op == TK_BANG)
+            return emit_expr(g, expr->unary.operand, locals);
         /* x++ / x-- — postfix yields the value before the change. */
         return emit_incdec_expr(g, expr, locals, 0);
 

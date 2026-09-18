@@ -1064,6 +1064,8 @@ static int expr_family(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals)
     case AST_UNARY:
         if (e->unary.op == TK_BANG) return FAM_BOOL;
         return expr_family(g, e->unary.operand, locals);
+    case AST_POSTFIX_UNARY:
+        return expr_family(g, e->unary.operand, locals);
     case AST_CONDITIONAL: {
         int tf = expr_family(g, e->conditional.then_expr, locals);
         if (tf != FAM_UNKNOWN) return tf;
@@ -2179,6 +2181,10 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
          * negated value still prints and feeds `var` inference. */
         if (e->unary.op == TK_BANG)
             return g->binder ? g->binder->type_bool : NULL;
+        return infer_expr_type(g, e->unary.operand, locals);
+    case AST_POSTFIX_UNARY:
+        /* postfix `!` (null-forgiving) is transparent: the wrapper's type is
+         * its operand's. ++/-- yield the scalar before the change. */
         return infer_expr_type(g, e->unary.operand, locals);
     case AST_BINARY:
         /* string concatenation (`a + b`) yields a freshly heap-allocated,
