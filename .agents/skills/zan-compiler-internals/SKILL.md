@@ -770,32 +770,23 @@ parser 回溯，专项做。
   所指代码已不存在），疑 A312 限定名逃逸根修顺带治愈——再遇到先隔离
   重跑，别急着当活缺陷修。
 
-## 闭包捕获语义：按变量分型
+## 闭包捕获语义：捕获变量，不捕获值快照
 
-写闭包相关的代码或文档时**不要假设捕获统一按引用装箱**——Zan 按变量分型
-：
-
-```zan
-int p = 1;
-Action r = () => { Log(p); };   // 只读捕获：创建时把值快照进闭包记录
-p = 42;
-r();                            // 打印 1 —— 外层之后的写入它看不见
-
-int q = 1;
-Action w = () => { q = q + 1; }; // 被闭包赋值的变量：局部提升为共享单元
-q = 10;
-w();
-Log(q);                          // 打印 11 —— 闭包内外读写同一个单元
-```
-
-- 坑出处：给 `zan-site/guides/gui.md` 校订「委托不能捕获局部变量」这类断言时，
-  差点按"闭包一律快照"或"一律共享"写成一句错的——实际语义是**逐变量**决定的
-  （只赋值的那一个才装箱）。写文档/写跨帧状态共享时先按这个分型核对。
-- 配套事实：对象捕获持有的是引用（`h.v = 9` 对闭包可见），所以"捕获后改状态
-  看不见"只适用于**只读捕获的值类型局部**。
+- C# 形态的 lambda 捕获的是**变量**：只要某个声明被 lambda 真正引用，声明方和
+  所有 closure 都必须读写同一个 heap cell；即使 lambda 只读，创建 closure 后的
+  外层赋值也必须可见。旧的“只读捕获按创建时快照、只有 lambda 写入才装箱”规则
+  已被共享捕获 oracle 推翻；它会让 `int n=1; Read r=()=>n; n=42; r()` 错误返回 1。
+- 判断捕获必须按**声明身份 + 词法作用域**，不能只按名字：lambda 参数、lambda
+  局部、for/foreach/query/catch/switch pattern 变量的同名遮蔽只在自己的作用域内
+  生效，退出后 sibling lambda 仍应能捕获外层声明。廉价 name-only 扫描只能当候选
+  过滤，真正装箱前必须再做 declaration-aware scoped scan。
+- cell 的所有权必须同时覆盖正常退出和 longjmp 展开：声明作用域持一份 tagged
+  cell owner，并把 owner slot 注册为 delegate 形态的 EH 临时；异常展开释放并清空
+  slot，随后正常 cleanup 见 null 不得二次释放。cell 内若是 ARC 值，参数借用值放入
+  cell 前先 retain，cell 析构再释放。
 - 委托形状决定调用方式：静态方法组/无捕获 lambda 是裸函数指针，实例方法组/
-  捕获 lambda 是带 tag 的堆闭包记录（rec-first）。判据、契约与 store-family
-  retain 规则见 `src/common/zan_abi.h` 与 `docs/ABI.md` §3.6。
+  捕获 lambda 是带 tag 的堆闭包记录（rec-first）。跨调用保存仍遵循 store-family
+  retain/release 规则。
 
 ## 并行会话下的 ctest 假红
 

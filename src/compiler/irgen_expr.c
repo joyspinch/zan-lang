@@ -9461,12 +9461,11 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
 }
 
 /* ---- lambda captures (A33-2) ---------------------------------------------
- * A lambda that mentions an enclosing local or `this` is lowered to a closure:
- * the mentioned values are copied into a heap record at the point the lambda
- * value is created (by value, rc values retained) and the lambda body reads
- * them from that record. Capture is by value, so a later write to the
- * enclosing local is not observed by the lambda -- and, symmetrically, the
- * lambda cannot dangle once the enclosing frame is gone. */
+ * A lambda that mentions an enclosing local or `this` is lowered to a closure.
+ * C# captures local variables, not value snapshots: every captured local lives
+ * in a shared heap cell, while the receiver is retained directly in the closure
+ * record. The cell both propagates writes across the closure boundary and keeps
+ * the variable alive after its declaring frame returns. */
 typedef struct {
     zan_istr_t   name;   /* captured local's name; empty for the receiver */
     LLVMValueRef slot;   /* the enclosing alloca, NULL for the receiver;
@@ -9500,6 +9499,14 @@ typedef struct {
     int              lam_depth;
     int              found_write;
     int              write_any;
+    /* Exact shared-cell probe: the cheap whole-body memo first identifies a
+     * name used in a lambda; this scoped walk then rejects parameter/local
+     * shadowing before the declaring local is boxed. */
+    zan_istr_t       want_capture;
+    zan_ast_node_t  *capture_decl;
+    int              capture_active;
+    int              capture_shadow_depth;
+    int              found_capture;
 } capture_scan_t;
 
 static int istr_eq_c(zan_istr_t a, zan_istr_t b) {
@@ -9619,8 +9626,15 @@ static void cap_scan(capture_scan_t *cs, zan_ast_node_t *n) {
             return;
         }
     }
+    if (cs->want_capture.len && cs->found_capture) return;
     switch (n->kind) {
-    case AST_IDENTIFIER:      cap_use(cs, n->ident.name); return;
+    case AST_IDENTIFIER:
+        if (cs->want_capture.len && cs->capture_active && cs->lam_depth > 0 &&
+            cs->capture_shadow_depth == 0 &&
+            istr_eq_c(n->ident.name, cs->want_capture))
+            cs->found_capture = 1;
+        cap_use(cs, n->ident.name);
+        return;
     case AST_THIS_EXPR:
     case AST_BASE_EXPR:       cs->needs_this = 1; return;
     case AST_BINARY:
@@ -9645,8 +9659,12 @@ static void cap_scan(capture_scan_t *cs, zan_ast_node_t *n) {
     case AST_REF_ARG:         cap_scan(cs, n->ref_arg.expr); return;
     case AST_STRING_INTERP:   cap_scan_list(cs, &n->string_interp.parts); return;
     case AST_QUERY_EXPR: {
+        int shadow_base = cs->shadow_count;
+        int capture_shadow_base = cs->capture_shadow_depth;
         cap_scan(cs, n->query.source);
         cap_shadow(cs, n->query.var);
+        if (cs->capture_active && istr_eq_c(n->query.var, cs->want_capture))
+            cs->capture_shadow_depth++;
         for (int ci = 0; ci < n->query.clauses.count; ci++) {
             zan_ast_node_t *cl = n->query.clauses.items[ci];
             if (cl->kind == AST_QUERY_JOIN) {
@@ -9654,34 +9672,61 @@ static void cap_scan(capture_scan_t *cs, zan_ast_node_t *n) {
                  * the lets; the right key sees the join var */
                 cap_scan(cs, cl->query_clause.source);
                 cap_scan(cs, cl->query_clause.left_key);
+                int join_shadow_base = cs->capture_shadow_depth;
                 cap_shadow(cs, cl->query_clause.name);
+                if (cs->capture_active &&
+                    istr_eq_c(cl->query_clause.name, cs->want_capture))
+                    cs->capture_shadow_depth++;
                 cap_scan(cs, cl->query_clause.right_key);
-                if (cl->query_clause.into.len > 0)
+                cs->capture_shadow_depth = join_shadow_base;
+                if (cl->query_clause.into.len > 0) {
                     cap_shadow(cs, cl->query_clause.into);
+                    if (cs->capture_active &&
+                        istr_eq_c(cl->query_clause.into, cs->want_capture))
+                        cs->capture_shadow_depth++;
+                }
             } else {
                 cap_scan(cs, cl->query_clause.expr);
-                if (cl->kind == AST_QUERY_LET)
+                if (cl->kind == AST_QUERY_LET) {
                     cap_shadow(cs, cl->query_clause.name);
+                    if (cs->capture_active &&
+                        istr_eq_c(cl->query_clause.name, cs->want_capture))
+                        cs->capture_shadow_depth++;
+                }
             }
         }
         if (n->query.group_expr) {
             cap_scan(cs, n->query.group_expr);
             cap_scan(cs, n->query.group_key);
-            if (n->query.group_into.len > 0)
+            if (n->query.group_into.len > 0) {
                 cap_shadow(cs, n->query.group_into);
+                if (cs->capture_active &&
+                    istr_eq_c(n->query.group_into, cs->want_capture))
+                    cs->capture_shadow_depth++;
+            }
         }
         if (n->query.select) cap_scan(cs, n->query.select);
+        cs->shadow_count = shadow_base;
+        cs->capture_shadow_depth = capture_shadow_base;
         return;
     }
     case AST_SWITCH_EXPR:
         cap_scan(cs, n->switch_expr.expr);
         for (int ai = 0; ai < n->switch_expr.arms.count; ai++) {
             zan_ast_node_t *arm = n->switch_expr.arms.items[ai];
+            int shadow_base = cs->shadow_count;
+            int capture_shadow_base = cs->capture_shadow_depth;
             if (arm->switch_arm.pattern) cap_scan(cs, arm->switch_arm.pattern);
-            if (arm->switch_arm.type_pattern && arm->switch_arm.var_name.len > 0)
+            if (arm->switch_arm.type_pattern && arm->switch_arm.var_name.len > 0) {
                 cap_shadow(cs, arm->switch_arm.var_name);
+                if (cs->capture_active &&
+                    istr_eq_c(arm->switch_arm.var_name, cs->want_capture))
+                    cs->capture_shadow_depth++;
+            }
             if (arm->switch_arm.when_cond) cap_scan(cs, arm->switch_arm.when_cond);
             cap_scan(cs, arm->switch_arm.result);
+            cs->shadow_count = shadow_base;
+            cs->capture_shadow_depth = capture_shadow_base;
         }
         return;
     case AST_WITH_EXPR:
@@ -9689,17 +9734,47 @@ static void cap_scan(capture_scan_t *cs, zan_ast_node_t *n) {
         for (int ai = 0; ai < n->with_expr.assigns.count; ai++)
             cap_scan(cs, n->with_expr.assigns.items[ai]);
         return;
-    case AST_LAMBDA:
-        /* a nested lambda's own parameters shadow the enclosing names */
-        for (int i = 0; i < n->lambda.params.count; i++)
-            cap_shadow(cs, n->lambda.params.items[i]->param.name);
+    case AST_LAMBDA: {
+        /* A lambda's parameters shadow only inside that lambda. Restore both
+         * the ordinary capture shadow set and this declaration's shadow depth
+         * afterwards so a sibling lambda can still capture the target. */
+        int shadow_base = cs->shadow_count;
+        int capture_shadow_base = cs->capture_shadow_depth;
+        for (int i = 0; i < n->lambda.params.count; i++) {
+            zan_istr_t pn = n->lambda.params.items[i]->param.name;
+            cap_shadow(cs, pn);
+            if (cs->capture_active && istr_eq_c(pn, cs->want_capture))
+                cs->capture_shadow_depth++;
+        }
         cs->lam_depth++;
         cap_scan(cs, n->lambda.body);
         cs->lam_depth--;
+        cs->shadow_count = shadow_base;
+        cs->capture_shadow_depth = capture_shadow_base;
         return;
-    case AST_BLOCK:           cap_scan_list(cs, &n->block.stmts); return;
-    case AST_VAR_DECL:        cap_scan(cs, n->var_decl.initializer);
-                              cap_shadow(cs, n->var_decl.name); return;
+    }
+    case AST_BLOCK: {
+        int shadow_base = cs->shadow_count;
+        int active_base = cs->capture_active;
+        int capture_shadow_base = cs->capture_shadow_depth;
+        cap_scan_list(cs, &n->block.stmts);
+        cs->shadow_count = shadow_base;
+        cs->capture_active = active_base;
+        cs->capture_shadow_depth = capture_shadow_base;
+        return;
+    }
+    case AST_VAR_DECL:
+        cap_scan(cs, n->var_decl.initializer);
+        if (cs->want_capture.len && n == cs->capture_decl) {
+            cs->capture_active = 1;
+            cs->capture_shadow_depth = 0;
+        } else {
+            cap_shadow(cs, n->var_decl.name);
+            if (cs->capture_active &&
+                istr_eq_c(n->var_decl.name, cs->want_capture))
+                cs->capture_shadow_depth++;
+        }
+        return;
     case AST_EXPR_STMT:       cap_scan(cs, n->expr_stmt.expr); return;
     case AST_RETURN_STMT:     cap_scan(cs, n->ret.value); return;
     case AST_IF_STMT:         cap_scan(cs, n->if_stmt.cond);
@@ -9708,23 +9783,71 @@ static void cap_scan(capture_scan_t *cs, zan_ast_node_t *n) {
     case AST_WHILE_STMT:
     case AST_DO_WHILE_STMT:   cap_scan(cs, n->while_stmt.cond);
                               cap_scan(cs, n->while_stmt.body); return;
-    case AST_FOR_STMT:        cap_scan(cs, n->for_stmt.init);
-                              cap_scan(cs, n->for_stmt.cond);
-                              cap_scan(cs, n->for_stmt.step);
-                              cap_scan(cs, n->for_stmt.body); return;
-    case AST_FOREACH_STMT:    cap_scan(cs, n->foreach_stmt.collection);
-                              cap_shadow(cs, n->foreach_stmt.var_name);
-                              cap_scan(cs, n->foreach_stmt.body); return;
+    case AST_FOR_STMT: {
+        int shadow_base = cs->shadow_count;
+        int active_base = cs->capture_active;
+        int capture_shadow_base = cs->capture_shadow_depth;
+        cap_scan(cs, n->for_stmt.init);
+        cap_scan(cs, n->for_stmt.cond);
+        cap_scan(cs, n->for_stmt.step);
+        cap_scan(cs, n->for_stmt.body);
+        cs->shadow_count = shadow_base;
+        cs->capture_active = active_base;
+        cs->capture_shadow_depth = capture_shadow_base;
+        return;
+    }
+    case AST_FOREACH_STMT: {
+        int shadow_base = cs->shadow_count;
+        int capture_shadow_base = cs->capture_shadow_depth;
+        cap_scan(cs, n->foreach_stmt.collection);
+        cap_shadow(cs, n->foreach_stmt.var_name);
+        if (cs->capture_active &&
+            istr_eq_c(n->foreach_stmt.var_name, cs->want_capture))
+            cs->capture_shadow_depth++;
+        cap_scan(cs, n->foreach_stmt.body);
+        cs->shadow_count = shadow_base;
+        cs->capture_shadow_depth = capture_shadow_base;
+        return;
+    }
     case AST_THROW_STMT:      cap_scan(cs, n->throw_stmt.value); return;
     case AST_TRY_STMT:        cap_scan(cs, n->try_stmt.try_body);
                               cap_scan_list(cs, &n->try_stmt.catches);
                               cap_scan(cs, n->try_stmt.finally_body); return;
-    case AST_CATCH_CLAUSE:    cap_shadow(cs, n->catch_clause.var_name);
-                              cap_scan(cs, n->catch_clause.body); return;
+    case AST_CATCH_CLAUSE: {
+        int shadow_base = cs->shadow_count;
+        int capture_shadow_base = cs->capture_shadow_depth;
+        cap_shadow(cs, n->catch_clause.var_name);
+        if (cs->capture_active &&
+            istr_eq_c(n->catch_clause.var_name, cs->want_capture))
+            cs->capture_shadow_depth++;
+        cap_scan(cs, n->catch_clause.body);
+        cs->shadow_count = shadow_base;
+        cs->capture_shadow_depth = capture_shadow_base;
+        return;
+    }
     case AST_SWITCH_STMT:     cap_scan(cs, n->switch_stmt.expr);
                               cap_scan_list(cs, &n->switch_stmt.cases); return;
-    case AST_SWITCH_CASE:     cap_scan(cs, n->switch_case.pattern);
-                              cap_scan(cs, n->switch_case.body); return;
+    case AST_SWITCH_CASE: {
+        int shadow_base = cs->shadow_count;
+        int active_base = cs->capture_active;
+        int capture_shadow_base = cs->capture_shadow_depth;
+        cap_scan(cs, n->switch_case.pattern);
+        if (cs->want_capture.len && n == cs->capture_decl) {
+            cs->capture_active = 1;
+            cs->capture_shadow_depth = 0;
+        } else if (n->switch_case.var_name.len > 0) {
+            cap_shadow(cs, n->switch_case.var_name);
+            if (cs->capture_active &&
+                istr_eq_c(n->switch_case.var_name, cs->want_capture))
+                cs->capture_shadow_depth++;
+        }
+        cap_scan(cs, n->switch_case.when_cond);
+        cap_scan(cs, n->switch_case.body);
+        cs->shadow_count = shadow_base;
+        cs->capture_active = active_base;
+        cs->capture_shadow_depth = capture_shadow_base;
+        return;
+    }
     case AST_LOCK_STMT:       cap_scan(cs, n->lock_stmt.expr);
                               cap_scan(cs, n->lock_stmt.body); return;
     case AST_CHECKED_STMT:    cap_scan(cs, n->checked_stmt.body); return;
@@ -9779,13 +9902,19 @@ static LLVMValueRef build_closure_dtor(zan_irgen_t *g, const char *lname,
         emit_arc_release_typed(g, NULL, LLVMBuildLoad2(b, i8ptr, p, "tgv"));
     }
     for (int i = 0; i < capc; i++) {
-        if (!caps[i].boxed && !is_rc_managed_type(caps[i].type)) continue;
+        int aggregate_rc = caps[i].type &&
+            caps[i].type->kind == TYPE_STRUCT &&
+            type_contains_collection_rc(g, caps[i].type, 0);
+        if (!caps[i].boxed && !is_rc_managed_type(caps[i].type) &&
+            !aggregate_rc) continue;
         LLVMValueRef p = LLVMBuildStructGEP2(g->builder, rec_ty, rec,
             (unsigned)(ZAN_CLOSURE_HDR_FIELDS + i), "cp");
         LLVMValueRef v = LLVMBuildLoad2(g->builder, caps[i].llvm, p, "cv");
         /* a boxed capture is a reference to the variable's cell, so this
          * closure drops its reference to the cell, not to a value */
         if (caps[i].boxed) emit_closure_record_release(g, v);
+        else if (aggregate_rc)
+            emit_collection_value_release(g, caps[i].type, v, 0);
         else emit_rc_release_for_type(g, caps[i].type, v);
     }
     if (has_this) {
@@ -9854,7 +9983,10 @@ static LLVMValueRef emit_closure_record(zan_irgen_t *g, zan_loc_t loc,
             continue;
         }
         LLVMValueRef v = LLVMBuildLoad2(g->builder, caps[i].llvm, caps[i].slot, "cap.v");
-        emit_rc_retain_for_type(g, caps[i].type, v);
+        if (type_contains_collection_rc(g, caps[i].type, 0))
+            emit_collection_value_retain(g, caps[i].type, v, 0);
+        else
+            emit_rc_retain_for_type(g, caps[i].type, v);
         LLVMBuildStore(g->builder, v,
             LLVMBuildStructGEP2(g->builder, rec_ty, rec,
                                 (unsigned)(ZAN_CLOSURE_HDR_FIELDS + i), "cap.sp"));
@@ -9884,8 +10016,8 @@ static LLVMValueRef emit_closure_record(zan_irgen_t *g, zan_loc_t loc,
  * the last one out frees it -- so the variable also outlives the frame when the
  * lambda does.
  *
- * Only locals a lambda actually assigns to are boxed; a read-only capture stays
- * a copy, which is cheaper and observationally identical. */
+ * Every captured variable is boxed, including a read-only lambda capture: code
+ * outside the lambda may still assign the variable after the closure is made. */
 #define ZAN_BOX_VALUE_FIELD ZAN_CLOSURE_HDR_FIELDS
 
 static LLVMTypeRef box_cell_type(zan_irgen_t *g, LLVMTypeRef payload) {
@@ -9975,12 +10107,23 @@ static struct zan_body_write_entry *body_write_memo_slot(zan_irgen_t *g,
 /* Collect every assigned identifier of `n` into the memo table (one entry per
  * {body, name}). `body` is the root the walk started from. A write at
  * lam_depth > 0 (inside a nested lambda) sets lam_written as well: the
- * boxed-local rule (A33-2b) asks specifically "does a lambda assign to this
- * local?", while the parameter-ownership rule asks "is it assigned at all?" --
- * the two bits keep both questions answerable from one walk. */
+ * parameter-ownership rule asks whether a name is assigned anywhere. */
 static void body_write_collect(zan_irgen_t *g, zan_ast_node_t *n,
                                zan_ast_node_t *body, int lam_depth) {
     if (!n) return;
+    if (lam_depth > 0 && n->kind == AST_IDENTIFIER) {
+        struct zan_body_write_entry *e = body_write_memo_slot(g, body,
+                                                              n->ident.name);
+        if (e) {
+            if (!e->known) {
+                e->body = body;
+                e->name = n->ident.name;
+                e->known = 1;
+                g->body_write_memo_count++;
+            }
+            e->lam_captured = 1;
+        }
+    }
     zan_istr_t w = node_write_name(n);
     if (w.str) {
         struct zan_body_write_entry *e = body_write_memo_slot(g, body, w);
@@ -10099,6 +10242,7 @@ static void body_write_collect(zan_irgen_t *g, zan_ast_node_t *n,
     case AST_SWITCH_STMT:     body_write_collect(g, n->switch_stmt.expr, body, lam_depth);
                               body_write_collect_list(g, &n->switch_stmt.cases, body, lam_depth); return;
     case AST_SWITCH_CASE:     body_write_collect(g, n->switch_case.pattern, body, lam_depth);
+                              body_write_collect(g, n->switch_case.when_cond, body, lam_depth);
                               body_write_collect(g, n->switch_case.body, body, lam_depth); return;
     case AST_LOCK_STMT:       body_write_collect(g, n->lock_stmt.expr, body, lam_depth);
                               body_write_collect(g, n->lock_stmt.body, body, lam_depth); return;
@@ -10154,25 +10298,53 @@ static int body_writes_ident(zan_irgen_t *g, zan_ast_node_t *body,
     return body_writes_ident_memo(g, body, name);
 }
 
-/* Does a lambda in the body being compiled assign to `name`? The memo carries
- * two per-name bits: writes anywhere in the body (the parameter-ownership
- * question) and writes from inside a lambda only (the boxed-local question --
- * an enclosing local a lambda assigns must become a shared heap cell, while a
- * local merely assigned by ordinary statements must NOT). */
-static int local_is_lambda_written(zan_irgen_t *g, local_scope_t *locals,
-                                   zan_istr_t name) {
+/* Does a lambda in the body being compiled capture this declaration? Every
+ * captured local must use the shared cell, even when the lambda only reads it:
+ * ordinary code may write the variable after the closure is created. The memo
+ * is a cheap name-only candidate filter; cap_scan then resolves lexical
+ * shadowing from the declaration point, so a lambda parameter/local with the
+ * same spelling does not box the outer declaration. */
+static int local_is_lambda_captured(zan_irgen_t *g, local_scope_t *locals,
+                                    zan_ast_node_t *body,
+                                    zan_ast_node_t *decl) {
     (void)locals;
-    if (!g->current_fn_body || !name.len) return 0;
-    body_writes_ident_memo(g, g->current_fn_body, name);
+    if (!body || !decl) return 0;
+    zan_istr_t name;
+    memset(&name, 0, sizeof(name));
+    if (decl->kind == AST_PARAM)
+        name = decl->param.name;
+    else if (decl->kind == AST_VAR_DECL)
+        name = decl->var_decl.name;
+    else if (decl->kind == AST_SWITCH_CASE)
+        name = decl->switch_case.var_name;
+    else
+        return 0;
+    if (!name.len) return 0;
+    body_writes_ident_memo(g, body, name);
     unsigned mask = g->body_write_memo_cap - 1;
-    unsigned i = body_write_memo_hash(g->current_fn_body, name) & mask;
+    unsigned i = body_write_memo_hash(body, name) & mask;
+    int candidate = 0;
     while (g->body_write_memo[i].known) {
-        if (g->body_write_memo[i].body == g->current_fn_body &&
-            memo_name_eq(g->body_write_memo[i].name, name))
-            return g->body_write_memo[i].lam_written;
+        if (g->body_write_memo[i].body == body &&
+            memo_name_eq(g->body_write_memo[i].name, name)) {
+            candidate = g->body_write_memo[i].lam_captured;
+            break;
+        }
         i = (i + 1) & mask;
     }
-    return 0;
+    if (!candidate) return 0;
+
+    capture_scan_t cs;
+    memset(&cs, 0, sizeof(cs));
+    cs.g = g;
+    cs.want_capture = name;
+    cs.capture_decl = decl;
+    cs.capture_active = decl->kind == AST_PARAM ||
+                          decl->kind == AST_SWITCH_CASE;
+    cap_scan(&cs, body);
+    int found = cs.found_capture;
+    cap_scan_free(&cs);
+    return found;
 }
 
 /* Allocate the cell for a boxed local and return it; `init` (may be null) is
@@ -10223,6 +10395,72 @@ static LLVMValueRef box_value_ptr(zan_irgen_t *g, LLVMValueRef cell,
                                   LLVMTypeRef payload) {
     return LLVMBuildStructGEP2(g->builder, box_cell_type(g, payload), cell,
                                ZAN_BOX_VALUE_FIELD, "box.v");
+}
+
+/* Give a declaring binding ownership of a shared cell. The unwind stack stores
+ * the tagged closure shape in a separate slot, so longjmp invokes the cell dtor
+ * (not plain object release), nulls the owner slot, and makes later cleanup a
+ * no-op. Lambda-body bindings borrow the cell and never call this helper. */
+static void own_box_cell(zan_irgen_t *g, local_var_t *v, LLVMValueRef cell) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef tagged_i = LLVMBuildOr(g->builder,
+        LLVMBuildPtrToInt(g->builder, cell, i64, "box.i"),
+        LLVMConstInt(i64, ZAN_CLOSURE_TAG, 0), "box.tag");
+    LLVMValueRef tagged = LLVMBuildIntToPtr(g->builder, tagged_i, i8ptr,
+                                            "box.owner.v");
+    LLVMValueRef owner = emit_entry_alloca(g, i8ptr, "box.owner");
+    LLVMBuildStore(g->builder, tagged, owner);
+    v->box_cell = cell;
+    v->box_owner_slot = owner;
+    v->box_owned = 1;
+    if (!g->current_async_frame) {
+        emit_eh_tmp_push_slot(g, owner, ZAN_EH_SLOT_DLG);
+        v->eh_slot = 1;
+    }
+}
+
+/* Move a by-value parameter into the shared cell required by C# variable
+ * capture. The incoming argument is borrowed; an RC payload therefore takes
+ * its own reference before the cell becomes its owner. */
+static void box_captured_parameter(zan_irgen_t *g, local_scope_t *locals,
+                                   zan_ast_node_t *param, zan_type_t *type,
+                                   LLVMTypeRef payload, LLVMValueRef value,
+                                   zan_ast_node_t *body) {
+    if (!locals || locals->count == 0 || !param ||
+        !local_is_lambda_captured(g, locals, body, param)) return;
+    if (param->param.by_ref) {
+        zan_diag_emit(g->diag, DIAG_ERROR, param->loc,
+            "cannot capture a ref or out parameter in a lambda");
+        return;
+    }
+    if (!type || type->kind == TYPE_OBJECT || type->kind == TYPE_TYPE_PARAM) {
+        zan_diag_emit(g->diag, DIAG_ERROR, param->loc,
+            "cannot capture parameter '%.*s' of type '%.*s': its runtime ownership is not representable yet",
+            (int)param->param.name.len, param->param.name.str,
+            type ? (int)type->name.len : 0,
+            type && type->name.str ? type->name.str : "");
+        return;
+    }
+    LLVMTypeKind k = LLVMGetTypeKind(payload);
+    int rc = is_rc_managed_type(type) && k == LLVMPointerTypeKind;
+    int aggregate_rc = type->kind == TYPE_STRUCT &&
+        type_contains_collection_rc(g, type, 0);
+    if (!rc && k != LLVMIntegerTypeKind && k != LLVMFloatTypeKind &&
+        k != LLVMDoubleTypeKind && k != LLVMStructTypeKind) {
+        zan_diag_emit(g->diag, DIAG_ERROR, param->loc,
+            "cannot capture parameter '%.*s': unsupported value representation",
+            (int)param->param.name.len, param->param.name.str);
+        return;
+    }
+    if (aggregate_rc) emit_collection_value_retain(g, type, value, 0);
+    else if (rc) emit_rc_retain_for_type(g, type, value);
+    LLVMValueRef cell = emit_box_cell(g, param->loc, payload, type, value);
+    local_var_t *v = &locals->vars[locals->count - 1];
+    v->alloca = box_value_ptr(g, cell, payload);
+    own_box_cell(g, v, cell);
+    if (rc) v->arc_owned = 1;
+    if (aggregate_rc) v->struct_rc = 1;
 }
 
 /* `obj.M` / bare `M` naming an instance method: bind the receiver into a
@@ -10566,6 +10804,8 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
                  * written, so a write here swaps the reference too */
                 if (is_rc_managed_type(cs.caps[i].type))
                     lambda_locals.vars[lambda_locals.count - 1].arc_owned = 1;
+                if (type_contains_collection_rc(g, cs.caps[i].type, 0))
+                    lambda_locals.vars[lambda_locals.count - 1].struct_rc = 1;
                 continue;
             }
             LLVMValueRef alloc = LLVMBuildAlloca(g->builder, cs.caps[i].llvm, "cap.slot");
@@ -10584,10 +10824,14 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     for (int k = 0; k < pc; k++) {
         zan_ast_node_t *param = expr->lambda.params.items[k];
         LLVMTypeRef lt = param_types[k];
+        LLVMValueRef pv = LLVMGetParam(lambda_fn,
+            (unsigned)(is_closure ? k + 1 : k));
         LLVMValueRef alloc = LLVMBuildAlloca(g->builder, lt, "lp");
-        zan_store_fit(g, LLVMGetParam(lambda_fn, (unsigned)(is_closure ? k + 1 : k)), alloc);
-        local_add(&lambda_locals, param->param.name, alloc,
-                  ptypes[k] ? ptypes[k] : g->binder->type_int);
+        zan_store_fit(g, pv, alloc);
+        zan_type_t *pt = ptypes[k] ? ptypes[k] : g->binder->type_int;
+        local_add(&lambda_locals, param->param.name, alloc, pt);
+        box_captured_parameter(g, &lambda_locals, param, pt, lt, pv,
+                               expr->lambda.body);
     }
 
     if (expr->lambda.body && expr->lambda.body->kind == AST_BLOCK) {

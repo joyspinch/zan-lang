@@ -835,7 +835,16 @@ static int local_owns_arc(local_var_t *v) {
  * which releases an rc-managed value inside it. */
 static void emit_closure_record_release(zan_irgen_t *g, LLVMValueRef rec);
 static void release_boxed_local(zan_irgen_t *g, local_var_t *v) {
-    if (v && v->box_cell && v->box_owned) emit_closure_record_release(g, v->box_cell);
+    if (!v || !v->box_cell || !v->box_owned) return;
+    if (v->box_owner_slot) {
+        LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+        LLVMValueRef tagged = LLVMBuildLoad2(g->builder, i8ptr,
+                                             v->box_owner_slot, "box.owner");
+        emit_closure_release(g, tagged);
+        LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), v->box_owner_slot);
+        return;
+    }
+    emit_closure_record_release(g, v->box_cell);
 }
 
 /* Register the most recently declared local's slot with the unwinder and mark
@@ -2130,13 +2139,14 @@ static void emit_span_safe_window(zan_irgen_t *g, LLVMValueRef *start_out,
 }
 
 /* Resolve the base pointer to a struct/class instance held by a local.
- * A class local may be stored either inline (alloca of the struct itself,
- * a value-like representation) or as a pointer (alloca of a pointer to a
- * heap object). Inspect the allocated type and load through the pointer
- * only in the latter case, so field GEPs work for both representations. */
+ * A class local may be stored inline, in an alloca holding an object pointer,
+ * or in the payload slot of a captured-variable cell. Load through pointer
+ * slots before field/property access; value-struct storage remains direct. */
 static LLVMValueRef struct_base_ptr(zan_irgen_t *g, local_var_t *local, LLVMTypeRef st) {
     LLVMValueRef base = local->alloca;
-    if (LLVMIsAAllocaInst(base)) {
+    if (local->box_cell && local->type && local->type->kind == TYPE_CLASS) {
+        base = LLVMBuildLoad2(g->builder, LLVMPointerType(st, 0), base, "objld");
+    } else if (LLVMIsAAllocaInst(base)) {
         LLVMTypeRef alloc_t = LLVMGetAllocatedType(base);
         if (LLVMGetTypeKind(alloc_t) == LLVMPointerTypeKind) {
             base = LLVMBuildLoad2(g->builder, LLVMPointerType(st, 0), base, "objld");

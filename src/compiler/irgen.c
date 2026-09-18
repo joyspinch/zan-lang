@@ -3857,6 +3857,10 @@ typedef struct {
      * `alloca` then points *into* that cell, so the enclosing method and every
      * closure read and write the one variable. NULL for an ordinary local. */
     LLVMValueRef box_cell;
+    /* Tagged cell reference stored in an unwind-visible slot for the declaring
+     * binding. A longjmp releases and nulls this slot; lambda-body bindings
+     * borrow their closure's cell and therefore leave it NULL. */
+    LLVMValueRef box_owner_slot;
     /* 1 when this binding owns a reference to the cell (the declaring scope);
      * a lambda body's binding borrows the cell its closure record holds. */
     int          box_owned;
@@ -3875,6 +3879,11 @@ typedef struct {
      * write through the slot must release the old occupant and retain the
      * new one -- while scope exit must NOT release it. */
     int          byref_slot;
+    /* Non-NULL for a binding synthesized from a declaration node (currently
+     * switch pattern variables): the declaration identity is kept separately
+     * from its spelling so the guard-time binding and the case-body binding can
+     * alias one shared cell without confusing same-named sibling cases. */
+    zan_ast_node_t *binding_decl;
     /* Non-NULL only on the pre-added async frame-slot entries: the declaration
      * node the slot was scanned from. Binding looks the slot up by node, never
      * by name, so same-named shadowing declarations cannot alias each other's
@@ -3900,10 +3909,22 @@ typedef struct {
  * an over-large function into miscompiled code (unregistered locals resolved
  * to bogus storage, corrupting memory). Growth keeps large functions correct. */
 typedef struct {
+    zan_ast_node_t *decl;
+    LLVMValueRef cell;
+    LLVMValueRef owner_slot;
+    zan_type_t *type;
+    LLVMTypeRef payload;
+    int eh_slot;
+} pattern_binding_t;
+
+typedef struct {
     local_var_t *vars;
     int count;
     int cap;
     zan_arena_t *arena;
+    pattern_binding_t *patterns;
+    int pattern_count;
+    int pattern_cap;
 } local_scope_t;
 
 static void local_scope_init(local_scope_t *s, zan_arena_t *arena) {
@@ -3911,6 +3932,10 @@ static void local_scope_init(local_scope_t *s, zan_arena_t *arena) {
     s->cap = MAX_LOCALS;
     s->arena = arena;
     s->vars = (local_var_t *)zan_arena_alloc(arena, sizeof(local_var_t) * (size_t)s->cap);
+    s->pattern_count = 0;
+    s->pattern_cap = 16;
+    s->patterns = (pattern_binding_t *)zan_arena_alloc(
+        arena, sizeof(pattern_binding_t) * (size_t)s->pattern_cap);
 }
 
 static local_scope_t *local_scope_new(zan_arena_t *arena) {
@@ -3951,9 +3976,11 @@ static void local_add(local_scope_t *scope, zan_istr_t name, LLVMValueRef alloca
     scope->vars[scope->count].eh_slot = 0;
     scope->vars[scope->count].arr_len_slot = NULL;
     scope->vars[scope->count].box_cell = NULL;
+    scope->vars[scope->count].box_owner_slot = NULL;
     scope->vars[scope->count].box_owned = 0;
     scope->vars[scope->count].opaque_string = 0;
     scope->vars[scope->count].obj_rc_flag = NULL;
+    scope->vars[scope->count].binding_decl = NULL;
     scope->vars[scope->count].async_decl = NULL;
     scope->vars[scope->count].frame_owner = -1;
     scope->vars[scope->count].struct_rc = 0;
@@ -4007,6 +4034,45 @@ static local_var_t *local_find_async_decl(local_scope_t *scope, zan_ast_node_t *
         if (scope->vars[i].async_decl == decl) return &scope->vars[i];
     }
     return NULL;
+}
+
+/* Find a live binding entry synthesized from one declaration node. The switch
+ * lowering emits the same pattern twice (once for `when`, once for the body),
+ * so declaration identity—not the source spelling—selects the shared cell. */
+static local_var_t *local_find_binding_decl(local_scope_t *scope,
+                                            zan_ast_node_t *decl) {
+    if (!scope || !decl) return NULL;
+    for (int i = scope->count - 1; i >= 0; i--) {
+        if (scope->vars[i].binding_decl == decl) return &scope->vars[i];
+    }
+    return NULL;
+}
+
+static pattern_binding_t *local_find_pattern_binding(local_scope_t *scope,
+                                                      zan_ast_node_t *decl) {
+    if (!scope || !decl) return NULL;
+    for (int i = scope->pattern_count - 1; i >= 0; i--)
+        if (scope->patterns[i].decl == decl) return &scope->patterns[i];
+    return NULL;
+}
+
+static pattern_binding_t *local_add_pattern_binding(local_scope_t *scope,
+                                                     zan_ast_node_t *decl) {
+    if (!scope || !decl) return NULL;
+    if (scope->pattern_count >= scope->pattern_cap) {
+        int nc = scope->pattern_cap ? scope->pattern_cap * 2 : 16;
+        pattern_binding_t *np = (pattern_binding_t *)zan_arena_alloc(
+            scope->arena, sizeof(pattern_binding_t) * (size_t)nc);
+        if (scope->pattern_count)
+            memcpy(np, scope->patterns,
+                   sizeof(pattern_binding_t) * (size_t)scope->pattern_count);
+        scope->patterns = np;
+        scope->pattern_cap = nc;
+    }
+    pattern_binding_t *p = &scope->patterns[scope->pattern_count++];
+    memset(p, 0, sizeof(*p));
+    p->decl = decl;
+    return p;
 }
 
 /* Name-based recognition of the intrinsic collections. An array type carries
@@ -4091,6 +4157,10 @@ static LLVMValueRef zan_store_fit(zan_irgen_t *g, LLVMValueRef val, LLVMValueRef
 /* Release all RC-managed local variables in scope (for throw/exception cleanup) */
 static void release_all_arc_locals(zan_irgen_t *g, local_scope_t *locals) {
     for (int i = 0; i < locals->count; i++) {
+        /* A boxed binding owns one cell, not the payload slot separately. The
+         * owner is registered as an EH delegate temp and its destructor releases
+         * the payload during unwind; releasing the slot here would double-drop. */
+        if (locals->vars[i].box_cell) continue;
         if (locals->vars[i].obj_rc_flag) {
             emit_release_obj_local(g, &locals->vars[i]);
         } else if (locals->vars[i].struct_rc) {

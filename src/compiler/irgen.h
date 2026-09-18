@@ -761,21 +761,20 @@ struct zan_irgen {
      * is declared at depth 0, so its stack slot dominates every exit block. */
     int arc_stmt_depth;
 
-    /* Whole-body write-scan memo (A79-1). body_writes_ident / local_is_lambda_
-     * written re-walked the entire function body once per declared local or
-     * parameter to ask "is this name assigned somewhere?", which made a method
-     * with N declarations cost O(N^2) AST visits -- a 12k-statement body spent
-     * 18 minutes in that loop alone. Per function body the scan now runs once,
-     * recording every assigned identifier (keyed {body, name}; the lexer
-     * interns identifiers, so name equality is pointer equality) with two
-     * bits: `written` = assigned anywhere in the body, `lam_written` =
-     * assigned from inside a nested lambda (the boxed-local rule). One
+    /* Whole-body use-scan memo (A79-1). body_writes_ident / local_is_lambda_
+     * captured re-walked the entire function body once per declared local or
+     * parameter, which made a method with N declarations cost O(N^2) AST
+     * visits -- a 12k-statement body spent 18 minutes in that loop alone. Per
+     * function body the scan now runs once, recording identifiers (keyed
+     * {body, name}) with `written`, `lam_written`, and a name-only
+     * `lam_captured` candidate that a scoped scan confirms before boxing. One
      * open-addressing table, reset per compilation. */
     struct zan_body_write_entry {
         zan_ast_node_t *body;
         zan_istr_t      name;
         unsigned char   written;
         unsigned char   lam_written;
+        unsigned char   lam_captured; /* name-only candidate; scope checked before boxing */
         unsigned char   known;
     } *body_write_memo;
     unsigned body_write_memo_cap;   /* power of two, or 0 = not built */

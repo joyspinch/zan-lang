@@ -1239,6 +1239,40 @@ add_test(NAME diag_unassigned_out_param
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_unassigned_out_param PROPERTIES TIMEOUT 60)
 
+# Capturing a ref/out parameter is illegal in C#: the closure cannot extend a
+# caller-owned alias whose lifetime ends when the call returns.
+foreach(_mode ref out)
+  add_test(NAME diag_closure_${_mode}_capture
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/closure_${_mode}_capture.zan
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_closure_${_mode}_capture${_exe_ext}
+      "-DEXPECT_REGEX=cannot capture a ref or out parameter in a lambda"
+      -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+  set_tests_properties(diag_closure_${_mode}_capture PROPERTIES TIMEOUT 60)
+endforeach()
+
+# `object` is still a one-word untagged ABI: until it carries dynamic ownership
+# metadata, capturing it must fail explicitly rather than snapshot a potentially
+# dangling pointer. Cover both parameter and local binding paths.
+add_test(NAME diag_closure_object_capture
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/closure_object_capture.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_closure_object_capture${_exe_ext}
+    "-DEXPECT_REGEX=cannot capture parameter .value. of type .object.*runtime ownership is not representable yet"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_closure_object_capture PROPERTIES TIMEOUT 60)
+
+add_test(NAME diag_closure_object_local_capture
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/closure_object_local_capture.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_closure_object_local_capture${_exe_ext}
+    "-DEXPECT_REGEX=cannot capture local .value. of type .object.*runtime ownership is not representable yet"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_closure_object_local_capture PROPERTIES TIMEOUT 60)
+
 # The same rule for a string local, which irgen still starts empty so a stray
 # read cannot dereference null: the default is a backstop, not a licence to
 # read a variable no path has written.

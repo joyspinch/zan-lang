@@ -418,7 +418,16 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
             LLVMValueRef slot_a = emit_entry_alloca(g, i8ptrptr, "ma.slot");
             zan_store_fit(g, arr, slot_a);
             local_add(locals, param->param.name, slot_a, args_type);
-            arc_own_local(g, locals);
+            box_captured_parameter(g, locals, param, args_type, i8ptrptr, arr,
+                                   method->method_decl.body);
+            if (locals->vars[locals->count - 1].box_cell) {
+                /* The synthetic argv array arrives owned, unlike an ordinary
+                 * borrowed method argument. box_captured_parameter retained it
+                 * for the cell, so drop the original Main-slot reference. */
+                emit_rc_release_for_type(g, args_type, arr);
+            } else {
+                arc_own_local(g, locals);
+            }
         }
     }
 
@@ -477,8 +486,9 @@ static int generic_variant_count(zan_irgen_t *g, zan_symbol_t *type_sym) {
     return n;
 }
 
-static bool method_is_tp_template(zan_ast_node_t *member);
-static bool class_member_uses_tp(zan_ast_node_t *decl, zan_ast_node_t *member);
+static bool method_is_tp_template(zan_irgen_t *g, zan_ast_node_t *member);
+static bool class_member_uses_tp(zan_irgen_t *g, zan_ast_node_t *decl,
+                                 zan_ast_node_t *member);
 
 /* Body for the erased variant of a generic-class member that reaches into one
  * of the class's type parameters: there is no erased lowering for `t.Member`
@@ -1116,6 +1126,8 @@ static void own_written_param(zan_irgen_t *g, local_scope_t *locals,
                               zan_ast_node_t *body) {
     if (!pt || pt->kind == TYPE_OBJECT || !is_rc_managed_type(pt)) return;
     if (LLVMGetTypeKind(pty) != LLVMPointerTypeKind) return;
+    if (locals && locals->count > 0 &&
+        locals->vars[locals->count - 1].box_cell) return;
     if (!body_writes_ident(g, body, param->param.name)) return;
     emit_rc_retain_for_type(g, pt, pv);
     arc_own_local(g, locals);
@@ -1208,7 +1220,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
              * the specialized signature; a generic declaring type adds its
              * instantiation to the specialization key), and so does an async
              * one (its ramp/resume/frame are built per specialization). */
-            if (method_is_tp_template(member)) continue;
+            if (method_is_tp_template(g, member)) continue;
             /* extern/DllImport methods have no generic body: only the erased
              * variant declares them. */
             bool is_extern_decl =
@@ -1530,7 +1542,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             /* The erased variant of a member reaching into the class's own
              * type parameters has no valid lowering; only the specialized
              * variants below carry a real body. */
-            if (!cur_variant && class_member_uses_tp(decl, member)) {
+            if (!cur_variant && class_member_uses_tp(g, decl, member)) {
                 emit_tp_erased_stub(g, fn);
                 free(param_types);
                 continue;
@@ -1634,6 +1646,10 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 if (is_rc_managed_type(pt))
                     locals->vars[locals->count - 1].byref_slot =
                         locals->vars[locals->count - 1].arc_owned = 1;
+                box_captured_parameter(g, locals, param, pt,
+                                       param_types[k + param_offset],
+                                       LLVMGetParam(fn, (unsigned)(k + param_offset)),
+                                       member->method_decl.body);
                 continue;
             }
             LLVMValueRef pv = LLVMGetParam(fn, (unsigned)(k + param_offset));
@@ -1642,13 +1658,17 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             local_add(locals, param->param.name, param_alloca, pt);
             if (pt && pt->kind == TYPE_STRING)
                 locals->vars[locals->count - 1].opaque_string = 1;
+            box_captured_parameter(g, locals, param, pt,
+                                   param_types[k + param_offset], pv,
+                                   member->method_decl.body);
             /* A341: a struct param is a by-value copy whose rc fields alias
              * the caller's refcounts. Retain them on entry (the copy is an
              * owning borrow) so the scope-exit field release below releases
              * only what this frame took; without it either the copy's writes
              * alias the caller's +1s or the exit release double-frees them.
              * By-ref params borrow the caller's slot and are excluded above. */
-            if (pt && pt->kind == TYPE_STRUCT &&
+            if (!locals->vars[locals->count - 1].box_cell && pt &&
+                pt->kind == TYPE_STRUCT &&
                 LLVMGetTypeKind(param_types[k + param_offset]) ==
                     LLVMStructTypeKind &&
                 type_contains_collection_rc(g, pt, 0)) {
@@ -1864,6 +1884,8 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
  * is emitted for it and every call site must monomorphize (A7-1). */
 
 typedef struct {
+    zan_irgen_t    *g;
+    zan_ast_node_t *body;
     zan_ast_list_t *tps;
     /* Locals/params and fields whose declared type is a type parameter. Both
      * grow with the scan: fixed 32-entry tables silently stopped recording, so
@@ -2010,7 +2032,13 @@ static void tp_scan_stmt(tp_use_scan_t *s, zan_ast_node_t *st) {
             tp_scan_stmt(s, st->block.stmts.items[i]);
         return;
     case AST_VAR_DECL:
-        if (tp_typeref_is_tp(s, st->var_decl.type)) tp_scan_bind(s, st->var_decl.name);
+        if (tp_typeref_is_tp(s, st->var_decl.type)) {
+            tp_scan_bind(s, st->var_decl.name);
+            if (local_is_lambda_captured(s->g, NULL, s->body, st)) {
+                s->found = true;
+                return;
+            }
+        }
         tp_scan_expr(s, st->var_decl.initializer);
         return;
     case AST_EXPR_STMT:   tp_scan_expr(s, st->expr_stmt.expr); return;
@@ -2064,19 +2092,24 @@ static void tp_scan_stmt(tp_use_scan_t *s, zan_ast_node_t *st) {
 
 /* True when this generic method's body reaches through a value of one of its
  * own type parameters, i.e. it only makes sense monomorphized. */
-static bool method_is_tp_template(zan_ast_node_t *member) {
+static bool method_is_tp_template(zan_irgen_t *g, zan_ast_node_t *member) {
     if (!member || member->kind != AST_METHOD_DECL) return false;
     zan_ast_list_t *tps = &member->method_decl.type_params;
     if (tps->count == 0 || !member->method_decl.body) return false;
     tp_use_scan_t s;
     memset(&s, 0, sizeof(s));
+    s.g = g;
+    s.body = member->method_decl.body;
     s.tps = tps;
     for (int i = 0; i < member->method_decl.params.count; i++) {
         zan_ast_node_t *p = member->method_decl.params.items[i];
-        if (p && tp_typeref_is_tp(&s, p->param.type)) tp_scan_bind(&s, p->param.name);
+        if (p && tp_typeref_is_tp(&s, p->param.type)) {
+            tp_scan_bind(&s, p->param.name);
+            if (local_is_lambda_captured(g, NULL, s.body, p)) s.found = true;
+        }
     }
-    bool result = false;
-    if (s.count > 0) {
+    bool result = s.found;
+    if (!result && s.count > 0) {
         tp_scan_stmt(&s, member->method_decl.body);
         result = s.found;
     }
@@ -2088,7 +2121,8 @@ static bool method_is_tp_template(zan_ast_node_t *member) {
  * a value of one of the class's type parameters (a T field, a T parameter, a T
  * local)? The erased variant of such a body has nothing to resolve the member
  * against, so only the per-instantiation variants are emittable. */
-static bool class_member_uses_tp(zan_ast_node_t *decl, zan_ast_node_t *member) {
+static bool class_member_uses_tp(zan_irgen_t *g, zan_ast_node_t *decl,
+                                 zan_ast_node_t *member) {
     if (!decl || !member) return false;
     zan_ast_list_t *tps = &decl->type_decl.type_params;
     if (tps->count == 0) return false;
@@ -2101,6 +2135,8 @@ static bool class_member_uses_tp(zan_ast_node_t *decl, zan_ast_node_t *member) {
     if (!body) return false;
     tp_use_scan_t s;
     memset(&s, 0, sizeof(s));
+    s.g = g;
+    s.body = body;
     s.tps = tps;
     for (int i = 0; i < decl->type_decl.members.count; i++) {
         zan_ast_node_t *f = decl->type_decl.members.items[i];
@@ -2109,10 +2145,13 @@ static bool class_member_uses_tp(zan_ast_node_t *decl, zan_ast_node_t *member) {
     }
     for (int i = 0; params && i < params->count; i++) {
         zan_ast_node_t *p = params->items[i];
-        if (p && tp_typeref_is_tp(&s, p->param.type)) tp_scan_bind(&s, p->param.name);
+        if (p && tp_typeref_is_tp(&s, p->param.type)) {
+            tp_scan_bind(&s, p->param.name);
+            if (local_is_lambda_captured(g, NULL, body, p)) s.found = true;
+        }
     }
-    bool result = false;
-    if (s.count > 0 || s.field_count > 0) {
+    bool result = s.found;
+    if (!result && (s.count > 0 || s.field_count > 0)) {
         tp_scan_stmt(&s, body);
         result = s.found;
     }
@@ -2331,15 +2370,21 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
             if (is_rc_managed_type(pt))
                 locals->vars[locals->count - 1].byref_slot =
                     locals->vars[locals->count - 1].arc_owned = 1;
+            box_captured_parameter(g, locals, param, pt, param_types[pi],
+                                   LLVMGetParam(sp.fn, pi),
+                                   member->method_decl.body);
             continue;
         }
         LLVMValueRef pv = LLVMGetParam(sp.fn, pi);
         LLVMValueRef param_alloca = LLVMBuildAlloca(g->builder, param_types[pi], "p");
         LLVMBuildStore(g->builder, pv, param_alloca);
         local_add(locals, param->param.name, param_alloca, pt);
+        box_captured_parameter(g, locals, param, pt, param_types[pi], pv,
+                               member->method_decl.body);
         /* A341: same by-value struct copy rule as the unspecialized binding
          * site above -- entry-retain the rc fields the copy aliases. */
-        if (pt && pt->kind == TYPE_STRUCT &&
+        if (!locals->vars[locals->count - 1].box_cell && pt &&
+            pt->kind == TYPE_STRUCT &&
             LLVMGetTypeKind(param_types[pi]) == LLVMStructTypeKind &&
             type_contains_collection_rc(g, pt, 0)) {
             locals->vars[locals->count - 1].struct_rc = 1;

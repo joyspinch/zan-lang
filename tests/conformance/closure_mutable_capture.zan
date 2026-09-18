@@ -5,6 +5,21 @@ using System;
 // the variable outlives the frame that declared it when a closure does.
 delegate void Step();
 delegate int Read();
+delegate int ReadArg(int value);
+delegate Read MakeRead(int value);
+delegate string ReadText();
+
+class Box {
+    public int Value;
+
+    public int ReadValue() {
+        return Value;
+    }
+}
+
+struct TextCell {
+    public string Text;
+}
 
 class Counter {
     public Step Bump;
@@ -20,7 +35,37 @@ class Program {
         return c;
     }
 
-    static void Main() {
+    static Read CaptureParameter(int value) {
+        Read read = () => value;
+        value = 31;
+        return read;
+    }
+
+    static ReadText CaptureStructParameter(TextCell value) {
+        ReadText read = () => value.Text;
+        TextCell changed;
+        changed.Text = "param-" + Convert.ToString(52);
+        value = changed;
+        return read;
+    }
+
+    static ReadText CaptureGenericParameter<T>(T value) {
+        return () => Convert.ToString(value);
+    }
+
+    static ReadText CaptureGenericLocal<T>(T value) {
+        T local = value;
+        return () => Convert.ToString(local);
+    }
+
+    static void ThrowAfterCapture() {
+        TextCell value;
+        value.Text = "throw-" + Convert.ToString(3);
+        ReadText read = () => value.Text;
+        throw new Exception("captured");
+    }
+
+    static void Main(string[] args) {
         int n = 0;
         Step inc = () => { n = n + 1; };
         inc();
@@ -56,6 +101,85 @@ class Program {
         twice();
         twice();
         Console.WriteLine(Convert.ToString(peek()));
+
+        // a read-only closure still shares the variable with later outer writes
+        int later = 1;
+        Read readLater = () => later;
+        later = 42;
+        Console.WriteLine(Convert.ToString(readLater()));
+
+        // same-named lambda parameters/locals do not capture the outer variable
+        int shadow = 7;
+        ReadArg parameterShadow = (shadow) => shadow + 1;
+        Read localShadow = () => { int shadow = 9; return shadow; };
+        Console.WriteLine(Convert.ToString(parameterShadow(4)));
+        Console.WriteLine(Convert.ToString(localShadow()));
+        Console.WriteLine(Convert.ToString(shadow));
+        Read sibling = () => shadow;
+        shadow = 8;
+        Console.WriteLine(Convert.ToString(sibling()));
+
+        Read parameter = CaptureParameter(2);
+        Console.WriteLine(Convert.ToString(parameter()));
+        MakeRead nestedFactory = (value) => {
+            Read nested = () => value;
+            value = 33;
+            return nested;
+        };
+        Read nestedParameter = nestedFactory(3);
+        Console.WriteLine(Convert.ToString(nestedParameter()));
+
+        // reference payloads remain shared and owned after the declaring slot moves
+        Box first = new Box();
+        first.Value = 5;
+        Box box = first;
+        Read readBox = () => box.Value;
+        Read callBox = () => box.ReadValue();
+        Step writeBox = () => { box.Value = box.Value + 1; };
+        Box second = new Box();
+        second.Value = 44;
+        box = second;
+        Console.WriteLine(Convert.ToString(readBox()));
+        Console.WriteLine(Convert.ToString(callBox()));
+        writeBox();
+        Console.WriteLine(Convert.ToString(readBox()));
+
+        string text = "text-" + Convert.ToString(1);
+        ReadText readText = () => text;
+        text = "text-" + Convert.ToString(2);
+        Console.WriteLine(readText());
+
+        // value structs use one shared cell and retain/release their rc fields
+        TextCell cell;
+        cell.Text = "cell-" + Convert.ToString(1);
+        ReadText readCell = () => cell.Text;
+        TextCell replacement;
+        replacement.Text = "cell-" + Convert.ToString(2);
+        cell = replacement;
+        Console.WriteLine(readCell());
+
+        TextCell input;
+        input.Text = "input-" + Convert.ToString(7);
+        ReadText readStructParameter = CaptureStructParameter(input);
+        Console.WriteLine(readStructParameter());
+        Console.WriteLine(input.Text);
+
+        // concrete generic captures are monomorphized to the real payload type
+        ReadText genericParameter = CaptureGenericParameter<string>("generic-param");
+        ReadText genericLocal = CaptureGenericLocal<string>("generic-local");
+        Console.WriteLine(genericParameter());
+        Console.WriteLine(genericLocal());
+
+        // Main's synthetic string[] parameter follows the same shared-cell path
+        Read readArgs = () => args.Count;
+        args = new string[2];
+        Console.WriteLine(Convert.ToString(readArgs()));
+
+        try {
+            ThrowAfterCapture();
+        } catch (Exception e) {
+            Console.WriteLine("caught");
+        }
 
         // the variable outlives the frame that declared it
         Counter c = Make(10);

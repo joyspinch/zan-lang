@@ -382,7 +382,8 @@ static void emit_struct_local_capture(zan_irgen_t *g, zan_type_t *type,
                                       LLVMValueRef slot_alloca,
                                       LLVMValueRef v, zan_ast_node_t *rhs,
                                       local_scope_t *locals) {
-    LLVMTypeRef st = LLVMGetAllocatedType(slot_alloca);
+    LLVMTypeRef st = LLVMIsAAllocaInst(slot_alloca)
+        ? LLVMGetAllocatedType(slot_alloca) : map_type(g, type);
     if (!st || LLVMGetTypeKind(st) != LLVMStructTypeKind) return;
     LLVMValueRef old = LLVMBuildLoad2(g->builder, st, slot_alloca, "arc.sold");
     if (!expr_yields_owned_rc_value(g, rhs, locals))

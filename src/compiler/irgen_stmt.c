@@ -85,25 +85,96 @@ static void emit_eh_hook_call(zan_irgen_t *g, const char *name) {
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals);
 
 /* B5: bind a switch case's pattern variable (`case T x:`) to the discriminant.
- * Each call gets a fresh slot in the current scope, so `when` guards and case
- * bodies can reference x. The case-body loop rebinds after every body has
- * truncated locals back to switch_start (the chain-time binding lives at a
- * higher index and is wiped by the first body's scope-exit release). */
+ * A captured pattern variable follows the same shared-cell contract as every
+ * other C# local. The guard-time and body-time lowering sites therefore alias
+ * one cell keyed by the switch-case AST node; both visible bindings point at
+ * the same owner slot, while only the chain binding registers that slot with
+ * the unwinder. */
 static void emit_switch_pattern_bind(zan_irgen_t *g, local_scope_t *locals,
                                      zan_ast_node_t *sc, LLVMValueRef switch_val) {
     if (!sc->switch_case.type_pattern || sc->switch_case.var_name.len == 0) return;
     zan_type_t *pt = resolve_type_ctx(g, sc->switch_case.type_pattern);
     if (!pt) return;
     LLVMTypeRef ptll = map_type(g, pt);
-    LLVMValueRef slot = emit_entry_alloca(g, ptll, "cpat");
-    zan_store_fit(g, LLVMConstNull(ptll), slot);
     LLVMValueRef cv = switch_val;
     if (LLVMTypeOf(cv) != ptll &&
         LLVMGetTypeKind(ptll) == LLVMPointerTypeKind &&
         LLVMGetTypeKind(LLVMTypeOf(cv)) == LLVMPointerTypeKind)
         cv = LLVMBuildBitCast(g->builder, cv, ptll, "cpat.cast");
+
+    int captured = local_is_lambda_captured(g, locals, g->current_fn_body, sc);
+    if (captured && (pt->kind == TYPE_OBJECT || pt->kind == TYPE_TYPE_PARAM)) {
+        zan_diag_emit(g->diag, DIAG_ERROR, sc->loc,
+            "cannot capture pattern variable '%.*s' of type '%.*s': "
+            "its runtime ownership is not representable yet",
+            (int)sc->switch_case.var_name.len, sc->switch_case.var_name.str,
+            (int)pt->name.len, pt->name.str ? pt->name.str : "");
+        return;
+    }
+
+    if (captured) {
+        pattern_binding_t *pb = local_find_pattern_binding(locals, sc);
+        if (!pb || !pb->cell) {
+            pb = pb ? pb : local_add_pattern_binding(locals, sc);
+            if (!pb) return;
+            pb->type = pt;
+            pb->payload = ptll;
+            int aggregate_rc = pt->kind == TYPE_STRUCT &&
+                type_contains_collection_rc(g, pt, 0);
+            if (aggregate_rc)
+                emit_collection_value_retain(g, pt, cv, 0);
+            else if (is_rc_managed_type(pt) &&
+                     LLVMGetTypeKind(ptll) == LLVMPointerTypeKind)
+                emit_rc_retain_for_type(g, pt, cv);
+            pb->cell = emit_box_cell(g, sc->loc, ptll, pt, cv);
+            LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+            pb->owner_slot = emit_entry_alloca(g, i8ptr, "cpat.owner");
+            LLVMValueRef tagged = LLVMBuildIntToPtr(g->builder,
+                LLVMBuildOr(g->builder,
+                    LLVMBuildPtrToInt(g->builder, pb->cell, i64, "cpat.i"),
+                    LLVMConstInt(i64, ZAN_CLOSURE_TAG, 0), "cpat.tag"),
+                i8ptr, "cpat.owner.v");
+            LLVMBuildStore(g->builder, tagged, pb->owner_slot);
+            if (!g->current_async_frame) {
+                emit_eh_tmp_push_slot(g, pb->owner_slot, ZAN_EH_SLOT_DLG);
+                pb->eh_slot = 1;
+            }
+        }
+        local_var_t *prior = local_find_binding_decl(locals, sc);
+        LLVMValueRef slot = box_value_ptr(g, pb->cell, ptll);
+        local_add(locals, sc->switch_case.var_name, slot, pt);
+        local_var_t *v = &locals->vars[locals->count - 1];
+        v->binding_decl = sc;
+        v->box_cell = pb->cell;
+        v->box_owner_slot = pb->owner_slot;
+        v->box_owned = prior == NULL;
+        v->eh_slot = v->box_owned ? pb->eh_slot : 0;
+        if (is_rc_managed_type(pt)) v->arc_owned = 1;
+        if (pt->kind == TYPE_STRUCT && type_contains_collection_rc(g, pt, 0))
+            v->struct_rc = 1;
+        return;
+    }
+
+    LLVMValueRef slot = emit_entry_alloca(g, ptll, "cpat");
+    zan_store_fit(g, LLVMConstNull(ptll), slot);
     zan_store_fit(g, cv, slot);
     local_add(locals, sc->switch_case.var_name, slot, pt);
+    locals->vars[locals->count - 1].binding_decl = sc;
+}
+
+/* Release a captured pattern cell on a failed guard. The matching chain has no
+ * body scope to trigger the ordinary suffix release, so drop its owner here;
+ * the owner slot is nulled and any later scope cleanup becomes harmless. */
+static void emit_switch_pattern_fail_release(zan_irgen_t *g,
+                                             local_scope_t *locals,
+                                             zan_ast_node_t *sc) {
+    local_var_t *v = local_find_binding_decl(locals, sc);
+    if (!v || !v->box_cell || !v->box_owned) return;
+    /* Keep the unwind entry registered until the switch scope's ordinary
+     * suffix pops it. The owner slot is nulled now, so an unwind before that
+     * suffix is harmless and the later cleanup performs exactly one pop. */
+    release_boxed_local(g, v);
 }
 
 /* Run the `finally` bodies of the try statements this exit path leaves, from
@@ -388,13 +459,14 @@ static int call_targets_extern(zan_irgen_t *g, zan_ast_node_t *expr) {
            (sym->decl->method_decl.modifiers & MOD_EXTERN) != 0;
 }
 
-/* A33-2b: declare a local that a lambda assigns to. Its storage is a heap cell
- * shared with every closure that captures it (see the boxed-local comment in
- * irgen_expr.c), so both sides read and write the one variable. Returns 0 for
- * an ordinary local, which the general path below then handles.
+/* A33-2b: declare every local captured by a lambda in a heap cell shared with
+ * each closure (see the boxed-local comment in irgen_expr.c), so reads and
+ * writes on both sides denote the one variable. Returns 0 for an ordinary
+ * local, which the general path below then handles.
  *
- * Scalars and rc-managed references only; an async local already lives in the
- * coroutine frame, which every resumption shares. */
+ * Scalars, statically-owned references, and value structs are supported;
+ * untagged object/open-type payloads are diagnosed because their ownership is
+ * not representable. An async local already lives in the shared frame. */
 static int emit_boxed_var_decl(zan_irgen_t *g, zan_ast_node_t *stmt,
                                local_scope_t *locals) {
     if (g->current_async_frame || !g->current_fn_body) return 0;
@@ -407,18 +479,32 @@ static int emit_boxed_var_decl(zan_irgen_t *g, zan_ast_node_t *stmt,
     LLVMTypeRef payload = map_type(g, type);
     LLVMTypeKind k = LLVMGetTypeKind(payload);
     int rc = is_rc_managed_type(type) && k == LLVMPointerTypeKind;
+    int aggregate_rc = type->kind == TYPE_STRUCT &&
+        type_contains_collection_rc(g, type, 0);
+    if (!local_is_lambda_captured(g, locals, g->current_fn_body, stmt)) return 0;
+    if (type->kind == TYPE_OBJECT || type->kind == TYPE_TYPE_PARAM) {
+        zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
+            "cannot capture local '%.*s' of type '%.*s': its runtime ownership is not representable yet",
+            (int)stmt->var_decl.name.len, stmt->var_decl.name.str,
+            (int)type->name.len, type->name.str ? type->name.str : "");
+        return 0;
+    }
     if (!rc && k != LLVMIntegerTypeKind && k != LLVMFloatTypeKind &&
-        k != LLVMDoubleTypeKind) return 0;
-    if (!local_is_lambda_written(g, locals, stmt->var_decl.name)) return 0;
+        k != LLVMDoubleTypeKind && k != LLVMStructTypeKind) {
+        zan_diag_emit(g->diag, DIAG_ERROR, stmt->loc,
+            "cannot capture local '%.*s': unsupported value representation",
+            (int)stmt->var_decl.name.len, stmt->var_decl.name.str);
+        return 0;
+    }
 
     /* the cell is born holding a null payload, so its destructor is safe even
      * if the initializer throws, and the first capture releases nothing */
     LLVMValueRef cell = emit_box_cell(g, stmt->loc, payload, type, NULL);
     LLVMValueRef slot = box_value_ptr(g, cell, payload);
     local_add(locals, stmt->var_decl.name, slot, type);
-    locals->vars[locals->count - 1].box_cell = cell;
-    locals->vars[locals->count - 1].box_owned = 1;
+    own_box_cell(g, &locals->vars[locals->count - 1], cell);
     if (rc) locals->vars[locals->count - 1].arc_owned = 1;
+    if (aggregate_rc) locals->vars[locals->count - 1].struct_rc = 1;
     if (type && type->kind == TYPE_STRING && stmt->var_decl.initializer &&
         call_targets_extern(g, stmt->var_decl.initializer))
         locals->vars[locals->count - 1].opaque_string = 1;
@@ -431,6 +517,9 @@ static int emit_boxed_var_decl(zan_irgen_t *g, zan_ast_node_t *stmt,
         if (rc)
             emit_rc_capture_local(g, type, slot, init,
                                   stmt->var_decl.initializer, locals);
+        else if (aggregate_rc)
+            emit_struct_local_capture(g, type, slot, init,
+                                      stmt->var_decl.initializer, locals);
         else
             zan_store_fit(g, init, slot);
     }
@@ -517,8 +606,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                            infer_expr_type(g, stmt->var_decl.initializer, locals),
                            stmt->var_decl.initializer, "initializer");
         }
-        /* A33-2b: a local a lambda assigns to is one variable shared with the
-         * closure, so it is declared in a heap cell instead of the frame. */
+        /* A33-2b: a captured local is one variable shared with every closure,
+         * so it is declared in a heap cell instead of the frame. */
         if (emit_boxed_var_decl(g, stmt, locals)) return;
         /* In an async $resume body, named scalar locals were pre-allocated in
          * the entry block and their storage lives in the heap frame (so they
@@ -1925,10 +2014,19 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 } else {
                     LLVMBuildCondBr(g->builder, cond, match_bb, fail_bb);
                 }
+                /* A failed type/guard match never enters the case body. Drop
+                 * the chain binding's cell owner before testing the next case;
+                 * the body alias path performs the same release through the
+                 * ordinary scope suffix when a case does match. */
+                LLVMPositionBuilderAtEnd(g->builder, fail_bb);
+                emit_switch_pattern_fail_release(g, locals, sc);
                 pmatch[ci] = match_bb;
                 psrc[ci] = i;
                 ci++;
-                test_bb = fail_bb;
+                /* emit_switch_pattern_fail_release may split the failure edge
+                 * through the tagged-cell release helper; continue the chain
+                 * from whichever block that helper left current. */
+                test_bb = LLVMGetInsertBlock(g->builder);
             }
 
             /* the last test's failure lands in default / end */
