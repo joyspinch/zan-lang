@@ -3381,6 +3381,27 @@ static bool loc_at_or_after(zan_loc_t a, zan_loc_t b) {
     return a.offset >= b.offset;
 }
 
+/* Statement nodes carry a trustworthy subtree start (keyword / type head), so
+ * a statement beginning at or after the use cannot guard it. Expression nodes
+ * do NOT: binary/is/as nodes are stamped with their operator token
+ * (parser.c parse_binary) and calls with their callee, so pruning them by loc
+ * drops earlier operands of the very condition that guards the use -- in
+ * `a == null || a.X != "id" || a.Y != z` the outer node's loc is the second
+ * `||`, which sits after `a.X`, and pruning there un-guards the whole chain
+ * (broke the GenDb generator build tree-wide). Only statements bound the
+ * scan; expressions are walked in full under the depth cap. */
+static bool node_loc_prunable(zan_ast_kind_t k) {
+    switch (k) {
+    case AST_BLOCK: case AST_EXPR_STMT: case AST_RETURN_STMT:
+    case AST_THROW_STMT: case AST_VAR_DECL: case AST_IF_STMT:
+    case AST_WHILE_STMT: case AST_DO_WHILE_STMT: case AST_FOR_STMT:
+    case AST_FOREACH_STMT: case AST_TRY_STMT: case AST_SWITCH_STMT:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static bool node_guards_null(zan_ast_node_t *n, zan_istr_t name, int depth,
                              zan_loc_t use);
 
@@ -3400,9 +3421,10 @@ static bool is_named_ident(zan_ast_node_t *n, zan_istr_t name) {
 static bool node_guards_null(zan_ast_node_t *n, zan_istr_t name, int depth,
                              zan_loc_t use) {
     if (!n || depth > CHECKER_DERIVES_MAX_DEPTH) return false;
-    /* Children never start before their parent, so pruning a subtree that
-     * begins at or after the use is sound -- nothing inside it can guard. */
-    if (loc_at_or_after(n->loc, use)) return false;
+    /* See node_loc_prunable: the loc prune is only sound on statements. */
+    if (node_loc_prunable(n->kind) && loc_at_or_after(n->loc, use)) {
+        return false;
+    }
     switch (n->kind) {
     case AST_BINARY:
         /* `x == null` / `x != null` / `x ?? fallback`, either operand order */
