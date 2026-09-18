@@ -21,5 +21,7 @@ At a compatibility checkpoint, reject every remaining known red case:
 python tests/csharp_compat/run_oracle.py --dotnet dotnet --zanc build/zanc.exe --require-zan-pass
 ```
 
-Temporary projects and executables are written under `_scratch/csharp-compat`
-and removed after the run.
+The live oracle must match every checked-in `.expected` file. Zan failures are
+accepted only for entries explicitly marked `xfail`; an unexpected pass fails the
+run so the stale marker cannot become permanent. Temporary projects and binaries
+are written under `_scratch/csharp-compat` and removed after the run.
