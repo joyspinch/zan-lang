@@ -370,16 +370,75 @@ static int subdir_globbed(const char *subdir) {
     return 0;
 }
 
-static const char *const s_gui_internal_subdirs[] = {
-    "Core", "Rendering", "Styling", "Layout", "Text", "Media", "Markup", NULL
-};
+/* Quickly probe a .zan file's declared namespace from its header (first ~1KB).
+ * Returns 1 on success with out_ns populated, 0 otherwise. */
+static int probe_file_namespace(const char *path, char *out_ns, size_t cap) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    char buf[1024];
+    size_t nr = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (nr == 0) return 0;
+    buf[nr] = '\0';
+
+    const char *p = buf;
+    while (*p) {
+        if (p[0] == '/' && p[1] == '/') {
+            p += 2;
+            while (*p && *p != '\n' && *p != '\r') p++;
+            continue;
+        }
+        if (p[0] == '/' && p[1] == '*') {
+            p += 2;
+            while (*p && !(p[0] == '*' && p[1] == '/')) p++;
+            if (*p) p += 2;
+            continue;
+        }
+        if (*p == '"') {
+            p++;
+            while (*p && *p != '"') {
+                if (*p == '\\' && p[1]) p += 2;
+                else p++;
+            }
+            if (*p) p++;
+            continue;
+        }
+        if (strncmp(p, "namespace", 9) == 0 &&
+            (p == buf || (unsigned char)p[-1] <= 32 || p[-1] == ';') &&
+            ((unsigned char)p[9] <= 32)) {
+            p += 9;
+            while (*p && (unsigned char)*p <= 32) p++;
+            size_t idx = 0;
+            while (*p && (isalnum((unsigned char)*p) || *p == '_' || *p == '.')) {
+                if (idx + 1 < cap) out_ns[idx++] = *p;
+                p++;
+            }
+            out_ns[idx] = '\0';
+            return idx > 0;
+        }
+        p++;
+    }
+    return 0;
+}
+
+/* Convert a slash-separated subdir path ("A/B/C") to dot-separated namespace ("A.B.C"). */
+static void subdir_to_namespace(const char *subdir, char *out_ns, size_t cap) {
+    size_t i = 0;
+    for (; subdir[i] && i + 1 < cap; i++) {
+        out_ns[i] = (subdir[i] == '/' || subdir[i] == '\\') ? '.' : subdir[i];
+    }
+    out_ns[i] = '\0';
+}
 
 /* Auto-include every *.zan file in stdlib_root/subdir (dedup + existence
- * checked). Returns 1 if any new file was added. `subdir` uses '/' separators
- * (accepted by the Win32 file APIs too). */
+ * checked). Returns 1 if any new file was added. Also recursively discovers
+ * internal partition subdirectories whose files declare the same namespace. */
 static int glob_stdlib_dir(const char *stdlib_root, const char *subdir,
                            const char ***files, int *count, int *cap) {
     int before = *count;
+    char target_ns[256];
+    subdir_to_namespace(subdir, target_ns, sizeof(target_ns));
+
 #ifdef _WIN32
     char glob_path[1024];
     snprintf(glob_path, sizeof(glob_path), "%s\\%s\\*.zan", stdlib_root, subdir);
@@ -395,23 +454,40 @@ static int glob_stdlib_dir(const char *stdlib_root, const char *subdir,
         } while (FindNextFileA(h, &fd));
         FindClose(h);
     }
-    if (strcmp(subdir, "Gui") == 0) {
-        for (int si = 0; s_gui_internal_subdirs[si]; si++) {
-            char sub_glob[1024];
-            snprintf(sub_glob, sizeof(sub_glob), "%s\\%s\\%s\\*.zan",
-                     stdlib_root, subdir, s_gui_internal_subdirs[si]);
-            h = FindFirstFileA(sub_glob, &fd);
-            if (h != INVALID_HANDLE_VALUE) {
-                do {
-                    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-                    char mod_path[1024];
-                    snprintf(mod_path, sizeof(mod_path), "%s\\%s\\%s\\%s",
-                             stdlib_root, subdir, s_gui_internal_subdirs[si], fd.cFileName);
-                    add_stdlib_input(files, count, cap, mod_path);
-                } while (FindNextFileA(h, &fd));
-                FindClose(h);
+
+    /* Scan subdirectories to find partition dirs that share target_ns */
+    char sub_pattern[1024];
+    snprintf(sub_pattern, sizeof(sub_pattern), "%s\\%s\\*", stdlib_root, subdir);
+    h = FindFirstFileA(sub_pattern, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            if (fd.cFileName[0] == '.') continue;
+            char candidate_sub[1024];
+            snprintf(candidate_sub, sizeof(candidate_sub), "%s\\%s\\%s\\*.zan",
+                     stdlib_root, subdir, fd.cFileName);
+            WIN32_FIND_DATAA sub_fd;
+            HANDLE sub_h = FindFirstFileA(candidate_sub, &sub_fd);
+            if (sub_h != INVALID_HANDLE_VALUE) {
+                char first_path[1024];
+                snprintf(first_path, sizeof(first_path), "%s\\%s\\%s\\%s",
+                         stdlib_root, subdir, fd.cFileName, sub_fd.cFileName);
+                char declared_ns[256] = {0};
+                if (probe_file_namespace(first_path, declared_ns, sizeof(declared_ns)) &&
+                    strcmp(declared_ns, target_ns) == 0) {
+                    /* Partition sub-directory matches target namespace: add all its files */
+                    do {
+                        if (sub_fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                        char mod_path[1024];
+                        snprintf(mod_path, sizeof(mod_path), "%s\\%s\\%s\\%s",
+                                 stdlib_root, subdir, fd.cFileName, sub_fd.cFileName);
+                        add_stdlib_input(files, count, cap, mod_path);
+                    } while (FindNextFileA(sub_h, &sub_fd));
+                }
+                FindClose(sub_h);
             }
-        }
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
     }
 #else
     char dir_path[1024];
@@ -421,6 +497,38 @@ static int glob_stdlib_dir(const char *stdlib_root, const char *subdir,
     if (d) {
         struct dirent *ent;
         while ((ent = readdir(d)) != NULL) {
+            if (ent->d_name[0] == '.') continue;
+            char entry_path[1024];
+            snprintf(entry_path, sizeof(entry_path), "%s/%s", dir_path, ent->d_name);
+            struct stat st;
+            if (stat(entry_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+                /* Check candidate subdirectory for matching namespace */
+                DIR *subd = opendir(entry_path);
+                if (subd) {
+                    struct dirent *sub_ent;
+                    int sub_matched = 0;
+                    while ((sub_ent = readdir(subd)) != NULL) {
+                        size_t slen = strlen(sub_ent->d_name);
+                        if (slen < 5 || strcmp(sub_ent->d_name + slen - 4, ".zan") != 0) continue;
+                        char sub_file_path[1024];
+                        snprintf(sub_file_path, sizeof(sub_file_path), "%s/%s", entry_path, sub_ent->d_name);
+                        if (!sub_matched) {
+                            char declared_ns[256] = {0};
+                            if (probe_file_namespace(sub_file_path, declared_ns, sizeof(declared_ns)) &&
+                                strcmp(declared_ns, target_ns) == 0) {
+                                sub_matched = 1;
+                            } else {
+                                break; /* Different namespace */
+                            }
+                        }
+                        if (sub_matched) {
+                            add_stdlib_input(files, count, cap, sub_file_path);
+                        }
+                    }
+                    closedir(subd);
+                }
+                continue;
+            }
             size_t nlen = strlen(ent->d_name);
             if (nlen < 5 || strcmp(ent->d_name + nlen - 4, ".zan") != 0) continue;
             char mod_path[1024];
@@ -429,26 +537,8 @@ static int glob_stdlib_dir(const char *stdlib_root, const char *subdir,
         }
         closedir(d);
     }
-    if (strcmp(subdir, "Gui") == 0) {
-        for (int si = 0; s_gui_internal_subdirs[si]; si++) {
-            char sub_dir[1024];
-            snprintf(sub_dir, sizeof(sub_dir), "%s/%s", dir_path, s_gui_internal_subdirs[si]);
-            DIR *subd = opendir(sub_dir);
-            if (subd) {
-                struct dirent *ent;
-                while ((ent = readdir(subd)) != NULL) {
-                    size_t nlen = strlen(ent->d_name);
-                    if (nlen < 5 || strcmp(ent->d_name + nlen - 4, ".zan") != 0) continue;
-                    char mod_path[1024];
-                    snprintf(mod_path, sizeof(mod_path), "%s/%s", sub_dir, ent->d_name);
-                    add_stdlib_input(files, count, cap, mod_path);
-                }
-                closedir(subd);
-            }
-        }
-    }
 #endif
-    return *count != before;
+    return *count > before;
 }
 
 static int auto_include_namespace(const char *stdlib_root, const char *subdir,
@@ -937,8 +1027,17 @@ static int pi_reach_input_dir(const char *file) {
     }
     sub[used] = 0;
     pi_reach(sub);
-    if (strncmp(sub, "Gui/", 4) == 0) {
-        pi_reach("Gui");
+    char declared_ns[256] = {0};
+    if (probe_file_namespace(file, declared_ns, sizeof(declared_ns))) {
+        char canon_sub[256];
+        size_t c = 0;
+        for (; declared_ns[c] && c + 1 < sizeof(canon_sub); c++) {
+            canon_sub[c] = declared_ns[c] == '.' ? '/' : declared_ns[c];
+        }
+        canon_sub[c] = '\0';
+        if (canon_sub[0] && strcmp(canon_sub, sub) != 0) {
+            pi_reach(canon_sub);
+        }
     }
     return 1;
 }
@@ -965,6 +1064,9 @@ static void pi_add_file(pi_dir_t *d, const char *path) {
  * the compiler's input list. `root` may be the stdlib root or a package dir
  * (with an empty subdir). */
 static void pi_glob_into(pi_dir_t *d, const char *root, const char *subdir) {
+    char target_ns[256];
+    subdir_to_namespace(subdir, target_ns, sizeof(target_ns));
+
 #ifdef _WIN32
     char glob_path[1024];
     if (subdir[0])
@@ -986,22 +1088,40 @@ static void pi_glob_into(pi_dir_t *d, const char *root, const char *subdir) {
         } while (FindNextFileA(h, &fd));
         FindClose(h);
     }
-    if (strcmp(subdir, "Gui") == 0) {
-        for (int si = 0; s_gui_internal_subdirs[si]; si++) {
-            char sub_glob[1024];
-            snprintf(sub_glob, sizeof(sub_glob), "%s\\%s\\%s\\*.zan",
-                     root, subdir, s_gui_internal_subdirs[si]);
-            h = FindFirstFileA(sub_glob, &fd);
-            if (h != INVALID_HANDLE_VALUE) {
-                do {
-                    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-                    char mod_path[1024];
-                    snprintf(mod_path, sizeof(mod_path), "%s\\%s\\%s\\%s",
-                             root, subdir, s_gui_internal_subdirs[si], fd.cFileName);
-                    pi_add_file(d, mod_path);
-                } while (FindNextFileA(h, &fd));
-                FindClose(h);
-            }
+
+    /* Scan subdirectories to find partition dirs that share target_ns */
+    if (subdir[0]) {
+        char sub_pattern[1024];
+        snprintf(sub_pattern, sizeof(sub_pattern), "%s\\%s\\*", root, subdir);
+        h = FindFirstFileA(sub_pattern, &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                if (fd.cFileName[0] == '.') continue;
+                char candidate_sub[1024];
+                snprintf(candidate_sub, sizeof(candidate_sub), "%s\\%s\\%s\\*.zan",
+                         root, subdir, fd.cFileName);
+                WIN32_FIND_DATAA sub_fd;
+                HANDLE sub_h = FindFirstFileA(candidate_sub, &sub_fd);
+                if (sub_h != INVALID_HANDLE_VALUE) {
+                    char first_path[1024];
+                    snprintf(first_path, sizeof(first_path), "%s\\%s\\%s\\%s",
+                             root, subdir, fd.cFileName, sub_fd.cFileName);
+                    char declared_ns[256] = {0};
+                    if (probe_file_namespace(first_path, declared_ns, sizeof(declared_ns)) &&
+                        strcmp(declared_ns, target_ns) == 0) {
+                        do {
+                            if (sub_fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                            char mod_path[1024];
+                            snprintf(mod_path, sizeof(mod_path), "%s\\%s\\%s\\%s",
+                                     root, subdir, fd.cFileName, sub_fd.cFileName);
+                            pi_add_file(d, mod_path);
+                        } while (FindNextFileA(sub_h, &sub_fd));
+                    }
+                    FindClose(sub_h);
+                }
+            } while (FindNextFileA(h, &fd));
+            FindClose(h);
         }
     }
 #else
@@ -1012,6 +1132,37 @@ static void pi_glob_into(pi_dir_t *d, const char *root, const char *subdir) {
     if (dr) {
         struct dirent *ent;
         while ((ent = readdir(dr)) != NULL) {
+            if (ent->d_name[0] == '.') continue;
+            char entry_path[1024];
+            snprintf(entry_path, sizeof(entry_path), "%s/%s", dir_path, ent->d_name);
+            struct stat st;
+            if (stat(entry_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+                DIR *subdr = opendir(entry_path);
+                if (subdr) {
+                    struct dirent *sub_ent;
+                    int sub_matched = 0;
+                    while ((sub_ent = readdir(subdr)) != NULL) {
+                        size_t slen = strlen(sub_ent->d_name);
+                        if (slen < 5 || strcmp(sub_ent->d_name + slen - 4, ".zan") != 0) continue;
+                        char sub_file_path[1024];
+                        snprintf(sub_file_path, sizeof(sub_file_path), "%s/%s", entry_path, sub_ent->d_name);
+                        if (!sub_matched) {
+                            char declared_ns[256] = {0};
+                            if (probe_file_namespace(sub_file_path, declared_ns, sizeof(declared_ns)) &&
+                                strcmp(declared_ns, target_ns) == 0) {
+                                sub_matched = 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        if (sub_matched) {
+                            pi_add_file(d, sub_file_path);
+                        }
+                    }
+                    closedir(subdr);
+                }
+                continue;
+            }
             size_t nlen = strlen(ent->d_name);
             if (nlen < 5 || strcmp(ent->d_name + nlen - 4, ".zan") != 0) continue;
             char mod_path[1024];
@@ -1019,24 +1170,6 @@ static void pi_glob_into(pi_dir_t *d, const char *root, const char *subdir) {
             pi_add_file(d, mod_path);
         }
         closedir(dr);
-    }
-    if (strcmp(subdir, "Gui") == 0) {
-        for (int si = 0; s_gui_internal_subdirs[si]; si++) {
-            char sub_dir[1024];
-            snprintf(sub_dir, sizeof(sub_dir), "%s/%s", dir_path, s_gui_internal_subdirs[si]);
-            DIR *subdr = opendir(sub_dir);
-            if (subdr) {
-                struct dirent *ent;
-                while ((ent = readdir(subdr)) != NULL) {
-                    size_t nlen = strlen(ent->d_name);
-                    if (nlen < 5 || strcmp(ent->d_name + nlen - 4, ".zan") != 0) continue;
-                    char mod_path[1024];
-                    snprintf(mod_path, sizeof(mod_path), "%s/%s", sub_dir, ent->d_name);
-                    pi_add_file(d, mod_path);
-                }
-                closedir(subdr);
-            }
-        }
     }
 #endif
 }
@@ -3648,10 +3781,11 @@ int main(int argc, char **argv) {
     }
     bool cross_compiling = (target_name != NULL);
     /* The external executor is a target capability, not a user-selectable
-     * semantic mode. At present only the Windows ZAN_CO_DRIVER implementation
-     * is a real worker pool; POSIX builds of the same object are a single-thread
-     * fallback and must keep the compiler-emitted inline driver. */
-    bool external_async_executor = target.os == ZAN_OS_WINDOWS &&
+     * semantic mode. Windows, Linux and macOS ZAN_CO_DRIVER implementations
+     * provide high-performance work-stealing multi-worker pools. */
+    bool external_async_executor = (target.os == ZAN_OS_WINDOWS ||
+                                    target.os == ZAN_OS_LINUX ||
+                                    target.os == ZAN_OS_MACOS) &&
                                    (target.arch == ZAN_ARCH_X86_64 ||
                                     target.arch == ZAN_ARCH_AARCH64);
 
@@ -5224,7 +5358,8 @@ int main(int argc, char **argv) {
         }
 #endif
         /* Windows' external executor replaces the inline coroutine driver and
-         * must be linked even for timer-only async programs. */
+         * must be linked when the program contains async/await or timer/socket async.
+         * Pure synchronous console/compute programs skip it to avoid bloat and Winsock deps. */
 #ifdef ZAN_RT_IO_MT_OBJ
         if (external_async_executor) {
             snprintf(rt_io_buf, sizeof(rt_io_buf), "%s/%s",

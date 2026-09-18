@@ -3825,6 +3825,32 @@ static void desugar_yield_method(zan_parser_t *p, zan_ast_node_t *m) {
     zan_ast_list_push(&body->block.stmts, ret, p->arena);
 }
 
+static void desugar_async_task_method(zan_parser_t *p, zan_ast_node_t *m) {
+    if (!m || m->kind != AST_METHOD_DECL) return;
+    zan_ast_node_t *rt = m->method_decl.return_type;
+    if (!rt || rt->kind != AST_TYPE_REF) return;
+    bool is_task = (rt->type_ref.name.len == 4 && memcmp(rt->type_ref.name.str, "Task", 4) == 0);
+    bool is_valuetask = (rt->type_ref.name.len == 9 && memcmp(rt->type_ref.name.str, "ValueTask", 9) == 0);
+    if (!is_task && !is_valuetask) return;
+
+    /* C# compatibility: desugar `async Task<T>` -> `async T` and `async Task` -> `async void`.
+     * Also desugar abstract/interface method signatures without bodies. */
+    if ((m->method_decl.modifiers & MOD_ASYNC) != 0 || m->method_decl.body == NULL) {
+        if ((m->method_decl.modifiers & MOD_ASYNC) == 0) {
+            m->method_decl.modifiers |= MOD_ASYNC;
+        }
+        if (rt->type_ref.type_args.count == 1) {
+            m->method_decl.return_type = rt->type_ref.type_args.items[0];
+        } else if (rt->type_ref.type_args.count == 0) {
+            zan_ast_node_t *v = zan_ast_new(p->arena, AST_TYPE_REF, rt->loc);
+            v->type_ref.name = (zan_istr_t){"void", 4};
+            v->type_ref.is_nullable = false;
+            v->type_ref.is_array = false;
+            m->method_decl.return_type = v;
+        }
+    }
+}
+
 static void parse_attr_usages(zan_parser_t *p, zan_ast_list_t *out,
                               zan_istr_t *out_lib, zan_istr_t *out_entry,
                               bool *out_variadic) {
@@ -4381,6 +4407,7 @@ ordinary_member:
         n->method_decl.is_variadic = dll_variadic;
         n->method_decl.where_clauses = wheres;
         desugar_yield_method(p, n);
+        desugar_async_task_method(p, n);
         return n;
     }
 

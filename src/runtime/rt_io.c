@@ -3756,8 +3756,92 @@ typedef struct zan_co_node {
 
 static zan_co_node *g_rq_head, *g_rq_tail;
 
-#if defined(_WIN32)
-/* ---------------- Windows: multi-worker pool over IOCP ------------------
+#if !defined(_WIN32)
+#include <pthread.h>
+#include <sched.h>
+#include <unistd.h>
+#include <time.h>
+#include <sys/time.h>
+
+typedef pthread_mutex_t CRITICAL_SECTION;
+static inline void InitializeCriticalSection(CRITICAL_SECTION *cs) { pthread_mutex_init(cs, NULL); }
+static inline void EnterCriticalSection(CRITICAL_SECTION *cs) { pthread_mutex_lock(cs); }
+static inline void LeaveCriticalSection(CRITICAL_SECTION *cs) { pthread_mutex_unlock(cs); }
+static inline void DeleteCriticalSection(CRITICAL_SECTION *cs) { pthread_mutex_destroy(cs); }
+
+#ifndef InterlockedCompareExchange64
+#define InterlockedCompareExchange64(dst, exch, comp) \
+    __sync_val_compare_and_swap((long long volatile *)(dst), (long long)(comp), (long long)(exch))
+#endif
+
+#ifndef InterlockedIncrement
+#define InterlockedIncrement(dst) \
+    (LONG)__sync_add_and_fetch((LONG volatile *)(dst), 1)
+#endif
+
+#ifndef InterlockedDecrement
+#define InterlockedDecrement(dst) \
+    (LONG)__sync_sub_and_fetch((LONG volatile *)(dst), 1)
+#endif
+
+#ifndef InterlockedExchange
+#define InterlockedExchange(dst, val) \
+    (LONG)__sync_lock_test_and_set((LONG volatile *)(dst), (LONG)(val))
+#endif
+
+#ifndef InterlockedCompareExchange
+#define InterlockedCompareExchange(dst, exch, comp) \
+    (LONG)__sync_val_compare_and_swap((LONG volatile *)(dst), (LONG)(comp), (LONG)(exch))
+#endif
+
+#ifndef InterlockedExchangeAdd
+#define InterlockedExchangeAdd(dst, val) \
+    (LONG)__sync_fetch_and_add((LONG volatile *)(dst), (LONG)(val))
+#endif
+
+#ifndef MemoryBarrier
+#define MemoryBarrier() __sync_synchronize()
+#endif
+
+typedef pthread_key_t DWORD;
+#ifndef TLS_OUT_OF_INDEXES
+#define TLS_OUT_OF_INDEXES ((DWORD)-1)
+#endif
+
+static inline DWORD TlsAlloc(void) {
+    pthread_key_t k;
+    return (pthread_key_create(&k, NULL) == 0) ? k : TLS_OUT_OF_INDEXES;
+}
+#define TlsGetValue(k) pthread_getspecific(k)
+#define TlsSetValue(k, v) pthread_setspecific((k), (v))
+
+#define SwitchToThread() sched_yield()
+#define Sleep(ms) usleep((ms) * 1000)
+
+static inline unsigned long long GetTickCount64(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000ULL + (unsigned long long)(ts.tv_nsec / 1000000ULL);
+}
+#define GetTickCount() ((DWORD)GetTickCount64())
+typedef int BOOL;
+typedef unsigned long ULONG;
+typedef uintptr_t ULONG_PTR;
+typedef void* LPVOID;
+typedef void* HANDLE;
+#ifndef TRUE
+#define TRUE 1
+#endif
+#ifndef FALSE
+#define FALSE 0
+#endif
+#ifndef INFINITE
+#define INFINITE 0xFFFFFFFF
+#endif
+#endif
+
+#if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
+/* ---------------- Cross-platform: multi-worker pool (Work-Stealing) -----
  * Scheduler shape (the Go/Tokio arrangement):
  *
  *   - Every worker owns a bounded FIFO run queue plus a one-slot LIFO cell.
@@ -3902,8 +3986,20 @@ static volatile long long g_timer_next_ms;
 static volatile LONG      g_co_activity;
 
 static void co_wake_shard(int shard) {
+#if defined(_WIN32)
     HANDLE p = io_shard(shard);
     if (p) PostQueuedCompletionStatus(p, 0, ZAN_WAKE_KEY, NULL);
+#elif defined(__linux__)
+    if (g_dns_wake_fd >= 0) {
+        uint64_t one = 1;
+        (void)write(g_dns_wake_fd, &one, sizeof(one));
+    }
+#elif defined(__APPLE__)
+    if (g_dns_wake_wfd >= 0) {
+        char b = 1;
+        (void)write(g_dns_wake_wfd, &b, 1);
+    }
+#endif
 }
 
 /* Shard a worker waits on. Workers and shards are 1:1 unless ZAN_IO_SHARDS
@@ -4206,9 +4302,14 @@ static int co_worker_count(void) {
     const char *e = getenv("ZAN_CO_WORKERS");
     if (e && *e) w = atoi(e);
     if (w <= 0) {
+#if defined(_WIN32)
         SYSTEM_INFO si;
         GetSystemInfo(&si);
         w = (int)si.dwNumberOfProcessors;
+#else
+        long n = sysconf(_SC_NPROCESSORS_ONLN);
+        w = (n > 0) ? (int)n : 1;
+#endif
     }
     if (w < 1) w = 1;
     if (w > ZAN_CO_MAXW) w = ZAN_CO_MAXW;
@@ -4441,8 +4542,15 @@ static void co_wait_io(zan_co_worker_t *w, long long timeout_ms) {
     }
     /* Own shard only: every socket this worker's connections use is bound to
      * it, so their completions arrive here and nowhere else. */
+#if defined(_WIN32)
     BOOL ok = GetQueuedCompletionStatusEx(io_shard(co_worker_shard(w->index)),
                                           entries, 64, &removed, to, FALSE);
+#else
+    int polled = zan_io_pump_timeout(to == INFINITE ? -1 : (int64_t)to);
+    BOOL ok = (polled >= 0);
+    ULONG removed = 0;
+    if (g_co_wake > 0) InterlockedDecrement(&g_co_wake);
+#endif
     /* No longer parked. Dropping this before re-readying the completed
      * coroutines below lets those zan_co_ready calls skip the wake syscall
      * when this worker is the only idle one -- it drains the whole batch
@@ -4683,9 +4791,16 @@ static void co_pool_start_background(void) {
     co_trace("start", NULL);
     for (int i = 0; i < w; i++) {
         g_wk[i].bg_gen = g_co_pool_gen;
+#if defined(_WIN32)
         HANDLE th = CreateThread(NULL, 0, co_worker_thunk,
                                  (LPVOID)(uintptr_t)i, 0, NULL);
         if (th) CloseHandle(th);   /* detached: joined only by the exit handshake */
+#else
+        pthread_t th;
+        if (pthread_create(&th, NULL, (void*(*)(void*))co_worker_thunk, (void*)(uintptr_t)i) == 0) {
+            pthread_detach(th);
+        }
+#endif
     }
 }
 
@@ -4741,6 +4856,7 @@ void zan_co_sched_run(void) {
      * hold completions nobody dequeues. */
     io_shards_start(w);
 
+#if defined(_WIN32)
     HANDLE th[ZAN_CO_MAXW]; int nt = 0;
     for (int i = 1; i < w; i++) {
         th[nt] = CreateThread(NULL, 0, co_worker_thunk,
@@ -4752,6 +4868,18 @@ void zan_co_sched_run(void) {
         WaitForSingleObject(th[i], INFINITE);
         CloseHandle(th[i]);
     }
+#else
+    pthread_t th[ZAN_CO_MAXW]; int nt = 0;
+    for (int i = 1; i < w; i++) {
+        if (pthread_create(&th[nt], NULL, (void*(*)(void*))co_worker_thunk, (void*)(uintptr_t)i) == 0) {
+            nt++;
+        }
+    }
+    co_worker(0);   /* the calling thread is a worker too */
+    for (int i = 0; i < nt; i++) {
+        pthread_join(th[i], NULL);
+    }
+#endif
     co_stats_dump();
     zan_io_shutdown();
 }

@@ -525,6 +525,7 @@ static void declare_async_method(zan_irgen_t *g, method_body_work_t *w,
     LLVMValueRef fn = NULL, resume_fn = NULL;
     LLVMTypeRef frame_type = NULL;
     w->is_async = true;
+    g->has_async_work = true;
     w->handler_cap = 1;
         LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
         LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -1479,6 +1480,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             int a_handler_cap = 1;
 
             if (is_async) {
+                g->has_async_work = true;
                 method_body_work_t adecl;
                 memset(&adecl, 0, sizeof(adecl));
                 adecl.member = member;

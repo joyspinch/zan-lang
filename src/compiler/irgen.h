@@ -622,6 +622,7 @@ struct zan_irgen {
     LLVMValueRef rt_io_has_pending;       /* i32 zan_io_has_pending(void) */
     LLVMTypeRef  rt_io_has_pending_type;
     /* rt_io.o provides socket readiness and generic blocking-await jobs. */
+    bool         has_async_work;    /* set when any async method or await is emitted */
     bool         uses_socket_async; /* set when either IO await is lowered */
     bool         uses_timer_runtime; /* set by Timer API externs */
     bool         uses_sync_runtime; /* set by AtomicInt/SharedTable externs */
@@ -740,9 +741,9 @@ struct zan_irgen {
                                * the ELF libc `stdin`/`stdout`/`stderr` globals */
     bool target_is_wasm;      /* true for wasm32: EH lowers to WebAssembly
                                * exception handling instead of setjmp/longjmp */
-    bool mt_scheduler;        /* --async-workers: skip the inline single-thread
-                               * coroutine driver and link the multi-worker one
-                               * from the zanrt_io_mt reactor object instead. */
+    bool external_async_executor; /* target/runtime capability: omit the inline
+                                   * coroutine driver and link the external
+                                   * executor object instead. */
 
     /* DWARF debug info (opt-in via `zanc -g`). When emit_debug is false these
      * remain NULL and no debug metadata is produced (default/--publish builds
@@ -798,7 +799,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                             zan_diag_t *diag, zan_binder_t *binder,
                             const char *module_name,
                             const char *target_triple,
-                            bool target_is_windows, bool mt_scheduler,
+                            bool target_is_windows, bool external_async_executor,
                             bool check_leaks, bool runtime_checks,
                             bool arc_guard, bool arc_net);
 void zan_irgen_destroy(zan_irgen_t *g);

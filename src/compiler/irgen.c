@@ -1306,7 +1306,7 @@ static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
 /* Release an async coroutine frame (`frame` as i8*).
  *
  * Plain free() is only correct while one thread owns the frame. Under
- * --async-workers the scheduler can still hold a reference when the program
+ * an external async executor can still hold a reference when the program
  * drops the frame -- an awaiter freeing a completed sub-task runs concurrently
  * with the worker whose step() just completed it, and a cancelled or reaped
  * frame may still name a task sitting in some worker's queue. So the
@@ -1314,7 +1314,7 @@ static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
  * immediately when nothing references the frame and otherwise hands the free
  * to the worker that will drop the last reference. */
 static void zan_emit_frame_free(zan_irgen_t *g, LLVMValueRef frame_i8) {
-    if (g->mt_scheduler && g->rt_co_frame_free) {
+    if (g->external_async_executor && g->rt_co_frame_free) {
         zan_call2(g->builder, g->rt_co_frame_free_type, g->rt_co_frame_free,
                   &frame_i8, 1, "");
         return;
@@ -1799,7 +1799,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                             zan_diag_t *diag, zan_binder_t *binder,
                             const char *module_name,
                             const char *target_triple,
-                            bool target_is_windows, bool mt_scheduler,
+                            bool target_is_windows, bool external_async_executor,
                             bool check_leaks, bool runtime_checks,
                             bool arc_guard, bool arc_net) {
     memset(g, 0, sizeof(*g));
@@ -1831,7 +1831,8 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     }
     /* Must be set before the inline coroutine driver is (conditionally)
      * emitted below, so the multi-worker mode can skip it. */
-    g->mt_scheduler = mt_scheduler;
+    g->external_async_executor = external_async_executor;
+    g->has_async_work = false;
 
     /* --publish string obfuscation is off unless the driver turns it on. This
      * scrambling pad is not encryption: the key ships in the image next to the
@@ -2181,7 +2182,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         g->rt_io_pump_timeout = LLVMAddFunction(g->mod, "zan_io_pump_timeout",
             g->rt_io_pump_timeout_type);
         LLVMSetLinkage(g->rt_io_pump_timeout,
-            g->mt_scheduler ? LLVMExternalLinkage : LLVMWeakAnyLinkage);
+            g->external_async_executor ? LLVMExternalLinkage : LLVMExternalWeakLinkage);
 
         /* Pending-work predicate for the scheduler's termination decision;
          * same weak pattern as the pump so timer-only programs link. */
@@ -2189,7 +2190,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         g->rt_io_has_pending = LLVMAddFunction(g->mod, "zan_io_has_pending",
             g->rt_io_has_pending_type);
         LLVMSetLinkage(g->rt_io_has_pending,
-            g->mt_scheduler ? LLVMExternalLinkage : LLVMWeakAnyLinkage);
+            g->external_async_executor ? LLVMExternalLinkage : LLVMExternalWeakLinkage);
 
         LLVMTypeRef legacy_pump_type = LLVMFunctionType(i32d, NULL, 0, 0);
         LLVMValueRef legacy_pump = LLVMAddFunction(g->mod, "zan_io_pump",
@@ -2212,10 +2213,10 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
      * drains, popping+freeing a node before invoking its step (which may itself
      * enqueue). Semantically equivalent to src/runtime/rt_co.c.
      *
-     * Skipped under --async-workers (g->mt_scheduler): the driver symbols are
-     * then left as external declarations and resolved from the multi-worker
-     * reactor object (zanrt_io_mt) at link time. */
-    if (!g->mt_scheduler) {
+     * Skipped when an external executor is selected: the driver symbols are
+     * then left as external declarations and resolved from the selected
+     * external executor object at link time. */
+    if (!g->external_async_executor) {
         LLVMTypeRef voidt = LLVMVoidTypeInContext(g->ctx);
         LLVMTypeRef node_fields[] = { i8ptr /*next*/, i8ptr /*frame*/, g->co_step_ptr /*step*/ };
         LLVMTypeRef node_ty = LLVMStructCreateNamed(g->ctx, "zan.co.node");
