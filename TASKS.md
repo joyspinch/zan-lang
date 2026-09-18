@@ -1692,7 +1692,7 @@ POSIX gthr，`pthread_*` 全部未定义 → `emit_lib_windows_dll` 链接失败
 
 **A340-4 BCL 欠账决策**：Console/Environment/Convert 纯 Zan 重写（A15-9 残留）**维持内建 lowering 为生产路径**——内建面覆盖颜色/ReadKey/Clear/Title（builtin_api.c members_console），只复刻 Write/WriteLine 的 Zan 版是能力倒退；该项本质是 B6 工具链 Zan 化纯度项，非用户可感缺口。CancellationToken（stdlib 0 命中）不另起半成品——A327 范围升级清单 ④取消语义（Task 句柄生命周期/取消树/CancellationToken.Register 等位）是其正主，半截包装类会与该设计冲突。Math 维持内建（A15-9 既有理由：O0 下 Zan 版 +13%）。
 
-**A340-5 审计对勘修正**：A43 尾"call 实参不校验可赋值性"已过时——checker.c `checker_arg_type_mismatch`（标量→object/interface/delegate/array 实参拦截）已修，残留仅 scalar→class 靠构造器匹配兜底一路（checker.c 注释自认 deliberate）。struct 内 rc 字段：集合槽位/类析构路径已由 `type_contains_collection_rc` 覆盖，**普通 struct 值拷贝（局部赋值/按值返回）路径未见 retain/release——疑似洞，需立探针定案后再挂账**（本轮审计新发现，未验证不入账）。
+**A340-5 审计对勘修正**：A43 尾"call 实参不校验可赋值性"已过时——checker.c `checker_arg_type_mismatch`（标量→object/interface/delegate/array 实参拦截）已修，残留仅 scalar→class 靠构造器匹配兜底一路（checker.c 注释自认 deliberate）。struct 内 rc 字段：集合槽位/类析构路径已由 `type_contains_collection_rc` 覆盖；**普通 struct 值生命周期整体缺失已实锤立账 A341**（同日五形状探针 sh_l/sh_c/sh_p/sh_r/sh_k 在 leakcheck 下全漏 1 对象——局部字段写死亡、拷贝、按值传参、按值返回、KeyValuePair 局部无一幸免；根因=所有权契约全以 is_rc_managed_type 指针型为门，LLVM 聚合 struct 从不过闸）。修复协议（七步，含「传参=拷贝语义否则字段写即 UAF」的正确性关键）与探针正本在 `_scratch/structrc/README.md`，属独立会话的百行级 ARC 变更（牵 irgen_call 全调用形态+async 帧），须配 leakcheck/arcguard twins+standard 档。
 
 # 已撤回的结论（早期草稿中的错误，勿再引用）
 
