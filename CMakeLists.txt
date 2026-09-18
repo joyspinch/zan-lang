@@ -131,6 +131,7 @@ add_executable(zanc
     src/compiler/winres.c
     src/compiler/embedres.c
     src/compiler/apk.c
+    src/compiler/ipa.c
     src/compiler/builtin_api.c
     src/compiler/symbols.c
 )
@@ -459,6 +460,14 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/toolchain/macos/libSystem.tbd")
                 $<TARGET_FILE_DIR:zanc>/macos)
 endif()
 
+# ---- iOS libSystem stub (ios-arm64 cross-compilation) ----
+if(EXISTS "${CMAKE_SOURCE_DIR}/toolchain/ios/libSystem.tbd")
+    list(APPEND _cross_sysroot_cmds
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${CMAKE_SOURCE_DIR}/toolchain/ios"
+                $<TARGET_FILE_DIR:zanc>/ios)
+endif()
+
 # ---- WASI sysroot (wasm32 cross-compilation) ----
 if(EXISTS "${CMAKE_SOURCE_DIR}/toolchain/wasm32/libc.a")
     list(APPEND _cross_sysroot_cmds
@@ -583,7 +592,10 @@ option(ZAN_BUILD_GUI "Build the native zan_gui runtime library" ON)
 set(ZAN_GUI_AVAILABLE FALSE)
 if(ZAN_BUILD_GUI)
     if(WIN32)
-        add_library(zan_gui SHARED src/runtime/gui_runtime.c)
+        # gui_runtime_dwrite.cpp: DirectWrite glyph fallback (color emoji).
+        # C++ because the SDK's dwrite.h only parses as C++; the rest of the
+        # runtime stays C and calls it through the zan_dw_* extern "C" ABI.
+        add_library(zan_gui SHARED src/runtime/gui_runtime.c src/runtime/gui_runtime_dwrite.cpp)
         target_link_libraries(zan_gui PRIVATE user32 gdi32 dwmapi shcore imm32 ole32)
         # zanc's bundled GNU ld cannot read the MSVC zan_gui.lib the linker
         # emits, and --driver-dir points the [DllImport("zan_gui")] lookup at
@@ -630,7 +642,10 @@ if(ZAN_BUILD_GUI)
     else()
         find_package(X11)
         if(X11_FOUND)
-            add_library(zan_gui SHARED src/runtime/gui_runtime.c)
+            # gui_runtime_dwrite.cpp: DirectWrite glyph fallback (color emoji).
+        # C++ because the SDK's dwrite.h only parses as C++; the rest of the
+        # runtime stays C and calls it through the zan_dw_* extern "C" ABI.
+            add_library(zan_gui SHARED src/runtime/gui_runtime.c src/runtime/gui_runtime_dwrite.cpp)
             target_include_directories(zan_gui PRIVATE ${X11_INCLUDE_DIR})
             target_link_libraries(zan_gui PRIVATE ${X11_LIBRARIES} m)
             find_package(Freetype QUIET)
@@ -1481,10 +1496,7 @@ foreach(_src ${_conf_srcs})
     continue()
   endif()
   zan_uses_gui_driver(${_src} _needs_gui_driver)
-  if(_name MATCHES "^async_mt")
-    # ZAN_CO_DRIVER tests: exercise the multi-worker coroutine driver.
-    set(_extra_args "--async-workers")
-  elseif(_name STREQUAL "server_mvc_timezone")
+  if(_name STREQUAL "server_mvc_timezone")
     set(_extra_args
       "${CMAKE_SOURCE_DIR}/templates/server/server-mvc/src/Framework/Fmt.zan")
   elseif(_name STREQUAL "ns_conflict_generic_arity")
@@ -1497,6 +1509,13 @@ foreach(_src ${_conf_srcs})
     # they are registered under "assets/..." via --embed.
     set(_extra_args
       "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/embed_assets=assets")
+  elseif(_name STREQUAL "file_embed_subdir")
+    # Same shape as file_embed_bytes, but the embedded tree holds ONLY a
+    # subdirectory (no loose files at the spec root): with the skin-pack
+    # filter wrongly applied to every spec this spec walked to zero files
+    # and the build failed with a false "matched no readable file".
+    set(_extra_args
+      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/embed_subdir_assets=assets")
   elseif(_name STREQUAL "static_publish_tls_stub")
     # The case pins the Windows static-publish stub: DllImport libraries
     # (here ssl/crypto) that resolve to no archive and no shared DLL are
@@ -1596,11 +1615,7 @@ foreach(_src ${_conf_srcs})
   if(_name STREQUAL "arc_net_publish")
     continue()
   endif()
-  if(_name MATCHES "^async_mt")
-    set(_extra_args "--async-workers")
-  else()
-    set(_extra_args "")
-  endif()
+  set(_extra_args "")
   add_test(NAME determinism_${_name}
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
@@ -1682,9 +1697,7 @@ foreach(_src ${_conf_srcs})
   endif()
   zan_uses_gui_driver(${_src} _needs_gui_driver)
   set(_expect_leak_site "")
-  if(_name MATCHES "^async_mt")
-    set(_extra_args "--async-workers")
-  elseif(_name STREQUAL "server_mvc_timezone")
+  if(_name STREQUAL "server_mvc_timezone")
     set(_extra_args
       "${CMAKE_SOURCE_DIR}/templates/server/server-mvc/src/Framework/Fmt.zan")
   elseif(_name STREQUAL "ns_conflict_generic_arity")
@@ -1697,6 +1710,11 @@ foreach(_src ${_conf_srcs})
     # through the embedded-resource API, registered via --embed.
     set(_extra_args
       "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/embed_assets=assets")
+  elseif(_name STREQUAL "file_embed_subdir")
+    # Subdir-only embedded tree (see the conformance loop above): the
+    # regression target of the skin-pack filter scope fix.
+    set(_extra_args
+      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/embed_subdir_assets=assets")
   elseif(_needs_gui_driver)
     set(_extra_args "${_gui_driver_args}")
   elseif(_name STREQUAL "arc_leak_site_label")
@@ -1747,9 +1765,7 @@ foreach(_src ${_conf_srcs})
     continue()
   endif()
   zan_uses_gui_driver(${_src} _needs_gui_driver)
-  if(_name MATCHES "^async_mt")
-    set(_extra_args "--async-workers")
-  elseif(_name STREQUAL "server_mvc_timezone")
+  if(_name STREQUAL "server_mvc_timezone")
     set(_extra_args
       "${CMAKE_SOURCE_DIR}/templates/server/server-mvc/src/Framework/Fmt.zan")
   elseif(_name STREQUAL "ns_conflict_generic_arity")
@@ -1764,6 +1780,11 @@ foreach(_src ${_conf_srcs})
     # first File.Exists before any ARC property is exercised.)
     set(_extra_args
       "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/embed_assets=assets")
+  elseif(_name STREQUAL "file_embed_subdir")
+    # Subdir-only embedded tree (see the conformance loop above): the
+    # regression target of the skin-pack filter scope fix.
+    set(_extra_args
+      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/embed_subdir_assets=assets")
   elseif(_needs_gui_driver)
     set(_extra_args "${_gui_driver_args}")
   else()
@@ -2967,6 +2988,46 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_compref_designer${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
   set_tests_properties(conformance_gui_compref_designer PROPERTIES TIMEOUT 120)
+
+  # Designer "widget props" passthrough contract: every (kind, key) row in
+  # BuiltinPropRows must be consumed by the real widget (answered by its
+  # Props() specs, or a SetProp/GetProp round-trip for override-intercepted
+  # keys). Catches dead keys after widget key renames.
+  add_test(NAME conformance_gui_props_contract
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/props_contract_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_props_contract.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_props_contract${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_props_contract PROPERTIES TIMEOUT 120)
+
+  # Designer semantic-event contract: every event the designer's Events tab
+  # promises for a field type must be declared by the widget that
+  # KindForType generates (reachable via GenForm's BindEvent wiring).
+  add_test(NAME conformance_gui_events_contract
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/events_contract_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_events_contract.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_events_contract${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_events_contract PROPERTIES TIMEOUT 120)
+
+  # GenForm declarative column click events: columns[i].click must desugar
+  # into one HitField-filtered CellClick binding; columns without click stay
+  # binding-free.
+  add_test(NAME conformance_genform_click
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/genform_click_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/genform_click.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_genform_click${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_genform_click PROPERTIES TIMEOUT 120)
 
   # Designer-component dogfood, composed like the "批量任务进度窗" ask: a
   # saved component (BatchJobProgress.zcomp) declares title/percent/status

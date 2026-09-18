@@ -59,6 +59,10 @@ build/zanc --list-targets                 # 查看全部目标（见 §3）
 build/zanc src/main.zan --auto-stdlib --target linux-musl -o app      # musl 静态
 build/zanc src/main.zan --auto-stdlib --target android-arm64 --emit-apk \
     --apk-package com.example.app --apk-label 我的应用 -o app.apk
+build/zanc src/main.zan --auto-stdlib --target ios-arm64 -o app.ipa
+# 或显式指定参数生成免证书可安装的 iOS IPA：
+build/zanc src/main.zan --auto-stdlib --target ios-arm64 --emit-ipa app.ipa \
+    --ipa-bundle-id com.example.app --ipa-name 我的应用
 ```
 
 `--emit-apk` 一条命令完成 编译→打包 SDLActivity 壳→二进制 AXML→签名
@@ -103,6 +107,7 @@ build/zanc probe.zan --auto-stdlib --time              # 各阶段耗时
 | `--icon <f.ico>` / `--no-icon` | 嵌入/跳过 Windows 图标 |
 | `--embed <p[=n]>` | 把文件/目录烤进可执行资源（可重复）；GUI 程序自带 `skins/` 暂存时，仅当目录内含 base.css（完整替身）才跳过 stdlib 皮肤基线自动内嵌，pack-only 暂存照常内嵌基线且暂存包赢重名 |
 | `--emit-apk` | （未列入 help）Android APK 全链路打包；配 `--apk-package`/`--apk-label` |
+| `--emit-ipa` | iOS IPA 全链路打包；配 `--ipa-bundle-id`/`--ipa-name`（`-o <file.ipa>` 也自动开启） |
 
 ### 标准库与包
 | 参数 | 说明 |
@@ -156,6 +161,7 @@ build/zanc probe.zan --auto-stdlib --time              # 各阶段耗时
 | macos-x64 / macos-arm64 | Apple | macOS |
 | wasm32 | WASI | 浏览器/Node；EH 已支持；socket 不支持（清晰报错） |
 | android-x64 / android-arm64 | bionic API 28+ | 配 --emit-apk 出 APK |
+| ios-arm64 | Apple iOS | iPhone/iPad；配 --emit-ipa 或 -o <app.ipa> 出免证书 Ad-hoc 签名 IPA |
 | ohos-x64 / ohos-arm64 | musl 静态 | OpenHarmony |
 
 ## 4. 环境变量

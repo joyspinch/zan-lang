@@ -26,6 +26,7 @@ static const zan_target_info_t s_targets[] = {
     { "android-arm64", "aarch64-linux-android28",    "Android ARM64 (bionic, API 28+)" },
     { "ohos-x64",      "x86_64-unknown-linux-ohos",  "OpenHarmony x86-64 (musl static)" },
     { "ohos-arm64",    "aarch64-unknown-linux-ohos", "OpenHarmony ARM64 (musl static)" },
+    { "ios-arm64",     "arm64-apple-ios",            "iOS ARM64 (iPhone/iPad)" },
 };
 
 #define NUM_TARGETS (int)(sizeof(s_targets) / sizeof(s_targets[0]))
@@ -51,6 +52,7 @@ static zan_os_t parse_os(const char *s) {
     if (strstr(s, "android")) return ZAN_OS_ANDROID;
     if (strstr(s, "ohos")) return ZAN_OS_OHOS;
     if (strstr(s, "linux")) return ZAN_OS_LINUX;
+    if (strstr(s, "ios")) return ZAN_OS_IOS;
     if (strstr(s, "macos") || strstr(s, "darwin") || strstr(s, "apple")) return ZAN_OS_MACOS;
     if (strstr(s, "wasi")) return ZAN_OS_WASI;
     return ZAN_OS_FREESTANDING;
@@ -60,7 +62,7 @@ static zan_abi_t parse_abi(const char *s, zan_os_t os) {
     if (strstr(s, "msvc")) return ZAN_ABI_MSVC;
     if (strstr(s, "musl")) return ZAN_ABI_MUSL;
     if (strstr(s, "gnu")) return ZAN_ABI_GNU;
-    if (os == ZAN_OS_MACOS) return ZAN_ABI_APPLE;
+    if (os == ZAN_OS_MACOS || os == ZAN_OS_IOS) return ZAN_ABI_APPLE;
     if (os == ZAN_OS_WASI) return ZAN_ABI_WASM;
     if (os == ZAN_OS_WINDOWS) return ZAN_ABI_MSVC;
     return ZAN_ABI_GNU;
@@ -86,7 +88,7 @@ bool zan_target_parse(const char *triple_str, zan_target_t *out) {
     out->features[0] = 0;
     out->pointer_size = (out->arch == ZAN_ARCH_WASM32 ||
                          out->arch == ZAN_ARCH_RISCV32) ? 4 : 8;
-    out->pic = (out->os == ZAN_OS_LINUX || out->os == ZAN_OS_MACOS);
+    out->pic = (out->os == ZAN_OS_LINUX || out->os == ZAN_OS_MACOS || out->os == ZAN_OS_IOS);
 
     return true;
 }
