@@ -79,17 +79,19 @@ class Engine {
         }
 
         int assignTo = next.assignUserId;
-        /* 未指定人但有部门：落给部门负责人；无负责人则落给第一个启用成员。 */
+        /* 未指定人但有部门：落部门待认领池（assignUserId=0 + deptId 快照，
+           A327-14 工作流化）——部门成员经 flowclaim 认领后执行；知会部门
+           负责人一声。原自动指派（落负责人/首个成员）废弃：指派语义由
+           模板显式 assignUserId 承担，认领语义由池承担，两者不再混写。 */
         if (assignTo == 0 && next.deptId > 0) {
             Department dept = await db.Select<Department>()
                 .Where(a => a.id == next.deptId).FirstAsync();
             if (dept != null && dept.leaderUserId > 0) {
-                assignTo = dept.leaderUserId;
-            } else {
-                User first = await db.Select<User>()
-                    .Where(a => a.departmentId == next.deptId && a.status == 1)
-                    .FirstAsync();
-                if (first != null) { assignTo = first.id; }
+                await Engine.Note(db, inst.tenantId, dept.leaderUserId, "assign",
+                    "新待认领任务",
+                    "「" + inst.title + "」→ " + next.name
+                        + " 待" + dept.name + "认领",
+                    "/admin/flow/tasks");
             }
         }
 
@@ -97,6 +99,7 @@ class Engine {
         task.instId = inst.id;
         task.nodeId = next.id;
         task.assignUserId = next.kind == "ai" ? 0 : assignTo;
+        task.deptId = next.deptId;
         task.status = 0;
         task.result = "";
         long now = WebApp.NowSeconds();
@@ -195,6 +198,161 @@ class Engine {
                 "流程完结", "流程「" + inst.title + "」已全部完成",
                 "/admin/flow/instances");
         }
+        return true;
+    }
+
+    /* ---- 认领 / 验收 / 驳回（A327-14 工作流化）----
+       Complete 保留给后台「进度汇报」直通（验收人当面同屏，无需门）；
+       客户端域走 Claim→Submit→Accept/Reject：部门成员从池里认领、执行人
+       提交、发起人验收，驳回即重来（原人返工或清人回部门池重新认领）。 */
+
+    /* 认领：部门成员把池中任务落到自己名下（assignUserId 0 → me）。
+       CAS 条件 UPDATE（status==0 且仍无人认领）使并发认领恰好一人成功。
+       返回 false = 实例已终/非本部门/已被认领/状态不符。 */
+    static async bool Claim(IDbConnection db, FlowTask task, User me) {
+        FlowInst inst = await db.Select<FlowInst>()
+            .Where(a => a.id == task.instId).FirstAsync();
+        if (inst == null || inst.status != 1) { return false; }
+        if (task.status != 0 || task.assignUserId != 0) { return false; }
+        if (task.deptId > 0 && me.departmentId != task.deptId) { return false; }
+        int _u = await db.Update<FlowTask>()
+            .Set(a => a.assignUserId, me.id)
+            .Where(a => a.id == task.id && a.status == 0
+                && a.assignUserId == 0)
+            .ExecuteAffrowsAsync();
+        if (_u == 0) { return false; }
+        FlowLog log = new FlowLog();
+        log.taskId = task.id;
+        log.userId = me.id;
+        log.content = "认领";
+        log.mentionIds = "";
+        log.createdAt = WebApp.NowSeconds();
+        await db.Insert<FlowLog>(log).ExecuteIdentityAsync();
+        await Engine.Note(db, inst.tenantId, inst.startedBy, "assign",
+            "任务已认领", "「" + inst.title + "」· "
+                + await Engine.NodeNameOf(db, task.nodeId)
+                + " 由 " + Fmt.Text(me.nickname, me.username) + " 认领",
+            "/admin/flow/tasks");
+        return true;
+    }
+
+    /* 节点名（按 id 查一次，通知文案用；节点规模小，不值得缓存）。 */
+    static async string NodeNameOf(IDbConnection db, int nodeId) {
+        if (nodeId == 0) { return "-"; }
+        FlowNode n = await db.Select<FlowNode>()
+            .Where(a => a.id == nodeId).FirstAsync();
+        return n == null ? "-" : n.name;
+    }
+
+    /* 提交验收：执行人 0→3，汇报入流水，知会发起人。
+       返回 false = 实例已终/非执行人/状态不符（控制器转 403/409）。 */
+    static async bool Submit(IDbConnection db, FlowTask task, User me,
+                           string report) {
+        FlowInst inst = await db.Select<FlowInst>()
+            .Where(a => a.id == task.instId).FirstAsync();
+        if (inst == null || inst.status != 1) { return false; }
+        if (task.status != 0 || task.assignUserId != me.id) { return false; }
+        long now = WebApp.NowSeconds();
+        FlowLog log = new FlowLog();
+        log.taskId = task.id;
+        log.userId = me.id;
+        log.content = "提交验收：" + Fmt.Text(report, "完成");
+        log.mentionIds = "";
+        log.createdAt = now;
+        await db.Insert<FlowLog>(log).ExecuteIdentityAsync();
+        int _u = await db.Update<FlowTask>()
+            .Set(a => a.status, 3)
+            .Set(a => a.result, Fmt.Text(report, "完成"))
+            .Where(a => a.id == task.id && a.status == 0)
+            .ExecuteAffrowsAsync();
+        if (_u == 0) { return false; }
+        await Engine.Note(db, inst.tenantId, inst.startedBy, "done",
+            "待验收", "「" + inst.title + "」· "
+                + await Engine.NodeNameOf(db, task.nodeId) + " 已提交验收",
+            "/admin/flow/tasks");
+        return true;
+    }
+
+    /* 验收通过：发起人 3→1 并推进下一环；已是最后一环则收口实例。
+       状态门带乐观语义（Update 带 status==3 条件），并发验收只有一方生效。 */
+    static async bool Accept(IDbConnection db, FlowTask task, User me) {
+        FlowInst inst = await db.Select<FlowInst>()
+            .Where(a => a.id == task.instId).FirstAsync();
+        if (inst == null || inst.status != 1) { return false; }
+        if (inst.startedBy != me.id) { return false; }
+        if (task.status != 3) { return false; }
+        long now = WebApp.NowSeconds();
+        int _u = await db.Update<FlowTask>()
+            .Set(a => a.status, 1)
+            .Set(a => a.finishedAt, now)
+            .Where(a => a.id == task.id && a.status == 3)
+            .ExecuteAffrowsAsync();
+        if (_u == 0) { return false; }
+        FlowLog log = new FlowLog();
+        log.taskId = task.id;
+        log.userId = me.id;
+        log.content = "验收通过";
+        log.mentionIds = "";
+        log.createdAt = now;
+        await db.Insert<FlowLog>(log).ExecuteIdentityAsync();
+        await Engine.Note(db, inst.tenantId, task.assignUserId, "done",
+            "验收通过", "「" + inst.title + "」· "
+                + await Engine.NodeNameOf(db, task.nodeId) + " 验收通过",
+            "/admin/flow/tasks");
+        int nxt = await Engine.Advance(db, inst);
+        if (nxt == 0) {
+            int _f = await db.Update<FlowInst>()
+                .Set(a => a.status, 2)
+                .Set(a => a.currentNodeId, 0)
+                .Set(a => a.updatedAt, now)
+                .Where(a => a.id == inst.id).ExecuteAffrowsAsync();
+            await Engine.Note(db, inst.tenantId, inst.startedBy, "done",
+                "流程完结", "流程「" + inst.title + "」已全部完成",
+                "/admin/flow/instances");
+        }
+        return true;
+    }
+
+    /* 驳回重来：发起人 3→0；repool=true 同时清执行人回部门认领池
+       （谁都可以再认领），false 原人返工。实例与当前节点不动——
+       「是否重来、重来到哪」由验收人当场定。 */
+    static async bool Reject(IDbConnection db, FlowTask task, User me,
+                           string reason, bool repool) {
+        FlowInst inst = await db.Select<FlowInst>()
+            .Where(a => a.id == task.instId).FirstAsync();
+        if (inst == null || inst.status != 1) { return false; }
+        if (inst.startedBy != me.id) { return false; }
+        if (task.status != 3) { return false; }
+        long now = WebApp.NowSeconds();
+        FlowLog log = new FlowLog();
+        log.taskId = task.id;
+        log.userId = me.id;
+        log.content = "验收驳回：" + Fmt.Text(reason, "需返工");
+        log.mentionIds = "";
+        log.createdAt = now;
+        await db.Insert<FlowLog>(log).ExecuteIdentityAsync();
+        if (repool) {
+            int _r = await db.Update<FlowTask>()
+                .Set(a => a.status, 0)
+                .Set(a => a.assignUserId, 0)
+                .Set(a => a.finishedAt, 0)
+                .Where(a => a.id == task.id && a.status == 3)
+                .ExecuteAffrowsAsync();
+            if (_r == 0) { return false; }
+        } else {
+            int _k = await db.Update<FlowTask>()
+                .Set(a => a.status, 0)
+                .Set(a => a.finishedAt, 0)
+                .Where(a => a.id == task.id && a.status == 3)
+                .ExecuteAffrowsAsync();
+            if (_k == 0) { return false; }
+        }
+        await Engine.Note(db, inst.tenantId,
+            repool ? inst.startedBy : task.assignUserId, "assign",
+            "验收驳回", "「" + inst.title + "」· "
+                + await Engine.NodeNameOf(db, task.nodeId)
+                + " 驳回重来：" + Fmt.Text(reason, "需返工"),
+            "/admin/flow/tasks");
         return true;
     }
 

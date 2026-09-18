@@ -1,0 +1,521 @@
+using System;
+using System.Collections;
+using System.Data.Orm;
+using System.Json;
+using System.Web;
+using ZanWeb.Model.Flow;
+using ZanWeb.Model.Sys;
+using ZanWeb.Modules.Flow;
+
+namespace ZanWeb.Api;
+
+/* 桌面客户端（gui-wechat）工作流接口（A327-14 工作流化）：可定制可复用的
+   流程模板（flow_def + flow_node，多部门多人员按节点落责），实例走
+   认领（部门池）→ 提交 → 验收 → 驳回重来的成熟工作流闭环（ERPNext
+   Workflow 的 states/transitions 语义在节点粒度上的最小落地）。
+   口径：
+     - 全部端点 {code,msg,data}；模板/实例查无与跨租户同答 404；
+     - 节点待办三态人视角：我执行（assignee=me）/ 待我验收（inst.startedBy=me
+       且 status=3）/ 待我认领（池：assignee=0 且 deptId=我部门）；
+     - 验收门只有发起人能过；驳回重来由验收人当场定（原人返工 or 回池）；
+     - CAS 条件 UPDATE 管并发（认领恰好一人、验收只有一方生效），
+       幂等由状态门承担（重放得 409，不重复推进）。 */
+[Route("api/flow/[action]")]
+[Custom(Authorization = CustomAuthorization.ApiAuth)]
+[Description("工作流")]
+class FlowApi : ApiController {
+    /* 模板清单（启用中的）：附节点数。规模小，全量返回（分页归治理）。 */
+    [HttpGet]
+    [Description("流程模板清单")]
+    [Custom(Perm = PermBit.View)]
+    async void FlowTemplates() {
+        List<FlowDef> defs = await this.FlowDef
+            .Where(a => a.tenantId == this.TenantId() && a.status == 1)
+            .ToListAsync();
+        List<FlowNode> nodes = await this.FlowNode
+            .Where(a => a.defId > 0).ToListAsync();
+        JsonValue items = JsonValue.NewArray();
+        for (int i = 0; i < defs.Count; i = i + 1) {
+            FlowDef d = defs[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Put("id", JsonValue.NewStr(Convert.ToString(d.id)));
+            o.Put("name", JsonValue.NewStr(d.name));
+            o.Put("description", JsonValue.NewStr(d.description));
+            int count = 0;
+            for (int k = 0; k < nodes.Count; k = k + 1) {
+                if (nodes[k].defId == d.id) { count = count + 1; }
+            }
+            o.Put("nodeCount", JsonValue.NewStr(Convert.ToString(count)));
+            items.Append(o);
+        }
+        List<Department> depts = await this.Department
+            .Where(a => a.status == 1).ToListAsync();
+        JsonValue darr = JsonValue.NewArray();
+        for (int i = 0; i < depts.Count; i = i + 1) {
+            JsonValue d = JsonValue.NewObject();
+            d.Put("id", JsonValue.NewStr(Convert.ToString(depts[i].id)));
+            d.Put("name", JsonValue.NewStr(depts[i].name));
+            darr.Append(d);
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("defs", items);
+        body.Put("depts", darr);
+        this.Ok(body.ToJson());
+    }
+
+    /* 模板详情（含节点链）：发起确认页与模板编辑回填用。 */
+    [HttpGet]
+    [Description("流程模板详情")]
+    [Custom(Perm = PermBit.View)]
+    async void FlowTemplate() {
+        FlowDef def = await this.FlowDef
+            .Where(a => a.id == this.InInt("id", 0)
+                && a.tenantId == this.TenantId()).FirstAsync();
+        if (def == null) { this.Fail(404, "0404", "流程不存在"); }
+        List<FlowNode> nodes = await this.FlowNode
+            .Where(a => a.defId == def.id).ToListAsync();
+        List<FlowNode> ordered = ZanWeb.Modules.Flow.Engine.SortNodes(nodes);
+        JsonValue items = JsonValue.NewArray();
+        for (int i = 0; i < ordered.Count; i = i + 1) {
+            FlowNode n = ordered[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Put("id", JsonValue.NewStr(Convert.ToString(n.id)));
+            o.Put("name", JsonValue.NewStr(n.name));
+            o.Put("sort", JsonValue.NewStr(Convert.ToString(n.sort)));
+            o.Put("deptId", JsonValue.NewStr(Convert.ToString(n.deptId)));
+            o.Put("assignUserId",
+                JsonValue.NewStr(Convert.ToString(n.assignUserId)));
+            o.Put("kind", JsonValue.NewStr(n.kind));
+            items.Append(o);
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("id", JsonValue.NewStr(Convert.ToString(def.id)));
+        body.Put("name", JsonValue.NewStr(def.name));
+        body.Put("description", JsonValue.NewStr(def.description));
+        body.Put("status", JsonValue.NewStr(Convert.ToString(def.status)));
+        body.Put("nodes", items);
+        this.Ok(body.ToJson());
+    }
+
+    /* 保存模板：id=0 新建，id>0 更新（节点整表替换）。有进行中实例的
+       模板不可改——实例的 currentNodeId 指着旧节点 id，整表替换会让
+       在途流程失去落点（比后台更严；后台直改的隐患在此收口）。 */
+    [HttpPost]
+    [Description("保存流程模板")]
+    [Custom(Perm = PermBit.Create)]
+    async void FlowSave() {
+        string name = this.Need("name", "流程名称");
+        int id = this.InInt("id", 0);
+        JsonValue nodesIn = JsonValue.Parse(Fmt.Text(this.In("nodes"), "[]"));
+        if (nodesIn == null || nodesIn.kind != 4) {
+            this.Fail(400, "0003", "nodes 需为 JSON 数组");
+        }
+        int count = nodesIn.Count();
+        if (count <= 0 || count > 32) {
+            this.Fail(400, "0003", "环节需 1..32 个");
+        }
+        for (int i = 0; i < count; i = i + 1) {
+            if (nodesIn.At(i).Str("name", "").Length == 0) {
+                this.Fail(400, "0003", "第 "
+                    + Convert.ToString(i + 1) + " 个环节缺名称");
+            }
+        }
+        long now = WebApp.NowSeconds();
+        await this.Begin();
+        FlowDef def;
+        if (id > 0) {
+            def = await this.FlowDef
+                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .FirstAsync();
+            if (def == null) { this.Fail(404, "0404", "流程不存在"); }
+            int live = await this.FlowInst
+                .Where(a => a.defId == id && a.status == 1
+                    && a.tenantId == this.TenantId()).CountAsync();
+            if (live > 0) { this.Fail(409, "0409", "有进行中的实例，模板不可改"); }
+            int _u = await this.FlowDef.Update()
+                .Set(a => a.name, name)
+                .Set(a => a.description, this.In("description"))
+                .Set(a => a.updatedAt, now)
+                .Where(a => a.id == id && a.tenantId == this.TenantId())
+                .ExecuteAffrowsAsync();
+            int _d = await this.FlowNode.Delete()
+                .Where(a => a.defId == id).ExecuteAffrowsAsync();
+        } else {
+            def = new FlowDef();
+            def.tenantId = this.TenantId();
+            def.name = name;
+            def.description = this.In("description");
+            def.status = 1;
+            def.createdAt = now;
+            def.updatedAt = now;
+            id = await this.FlowDef.Insert(def).ExecuteIdentityAsync();
+        }
+        for (int i = 0; i < count; i = i + 1) {
+            JsonValue o = nodesIn.At(i);
+            FlowNode n = new FlowNode();
+            n.defId = id;
+            n.name = o.Str("name", "");
+            n.sort = i + 1;
+            n.deptId = Convert.ToInt32(o.Str("deptId", "0"));
+            n.assignUserId = Convert.ToInt32(o.Str("assignUserId", "0"));
+            string kind = o.Str("kind", "human");
+            n.kind = kind == "ai" ? "ai" : "human";
+            n.aiPrompt = o.Str("aiPrompt", "");
+            n.createdAt = now;
+            await this.FlowNode.Insert(n).ExecuteIdentityAsync();
+        }
+        await this.Commit();
+        JsonValue body = JsonValue.NewObject();
+        body.Put("id", JsonValue.NewStr(Convert.ToString(id)));
+        this.Ok(body.ToJson());
+    }
+
+    /* 发起实例：从启用模板创建一次运行，首个环节即落任务/入池。 */
+    [HttpPost]
+    [Description("发起流程")]
+    [Custom(Perm = PermBit.Create)]
+    async void FlowStart() {
+        User me = await this.Me();
+        string title = this.Need("title", "实例标题");
+        FlowDef def = await this.FlowDef
+            .Where(a => a.id == this.InInt("defId", 0)
+                && a.tenantId == this.TenantId()).FirstAsync();
+        if (def == null) { this.Fail(404, "0404", "流程不存在"); }
+        if (def.status != 1) { this.Fail(400, "0004", "流程已停用"); }
+        int instId = await ZanWeb.Modules.Flow.Engine.Start(
+            this.Held(), def, title, "", me.id);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("instId", JsonValue.NewStr(Convert.ToString(instId)));
+        this.Ok(body.ToJson());
+    }
+
+    /* 我的三态待办：mine=我执行 / pool=待我认领（部门池）/ accept=待我验收。 */
+    [HttpGet]
+    [Description("我的工作流待办")]
+    [Custom(Perm = PermBit.View)]
+    async void FlowMine() {
+        User me = await this.Me();
+        List<FlowTask> mine = await this.FlowTask
+            .Where(a => a.assignUserId == me.id
+                && (a.status == 0 || a.status == 3)).ToListAsync();
+        List<FlowTask> pool;
+        if (me.departmentId > 0) {
+            pool = await this.FlowTask
+                .Where(a => a.assignUserId == 0 && a.deptId == me.departmentId
+                    && a.status == 0).ToListAsync();
+        } else {
+            pool = new List<FlowTask>();
+        }
+        List<FlowInst> myInsts = await this.FlowInst
+            .Where(a => a.tenantId == this.TenantId() && a.startedBy == me.id
+                && a.status == 1).ToListAsync();
+        List<int> instIds = new List<int>();
+        for (int i = 0; i < myInsts.Count; i = i + 1) {
+            instIds.Add(myInsts[i].id);
+        }
+        List<FlowTask> accept;
+        if (instIds.Count > 0) {
+            accept = await this.FlowTask
+                .Where(a => a.status == 3 && instIds.Contains(a.instId))
+                .ToListAsync();
+        } else {
+            accept = new List<FlowTask>();
+        }
+        List<FlowInst> allInsts = await this.FlowInst
+            .Where(a => a.tenantId == this.TenantId()).ToListAsync();
+        List<FlowNode> allNodes = await this.FlowNode
+            .Where(a => a.defId > 0).ToListAsync();
+        JsonValue mineArr = this.Shape(mine, allInsts, allNodes);
+        JsonValue poolArr = this.Shape(pool, allInsts, allNodes);
+        JsonValue acceptArr = this.Shape(accept, allInsts, allNodes);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("mine", mineArr);
+        body.Put("pool", poolArr);
+        body.Put("accept", acceptArr);
+        this.Ok(body.ToJson());
+    }
+
+    /* 行装组：任务 → {taskId,instId,title,nodeName,status,result,at}。 */
+    JsonValue Shape(List<FlowTask> tasks, List<FlowInst> insts,
+                    List<FlowNode> nodes) {
+        JsonValue items = JsonValue.NewArray();
+        for (int i = 0; i < tasks.Count; i = i + 1) {
+            FlowTask t = tasks[i];
+            string title = "-";
+            for (int k = 0; k < insts.Count; k = k + 1) {
+                if (insts[k].id == t.instId) { title = insts[k].title; }
+            }
+            string node = "-";
+            for (int k = 0; k < nodes.Count; k = k + 1) {
+                if (nodes[k].id == t.nodeId) { node = nodes[k].name; }
+            }
+            JsonValue o = JsonValue.NewObject();
+            o.Put("taskId", JsonValue.NewStr(Convert.ToString(t.id)));
+            o.Put("instId", JsonValue.NewStr(Convert.ToString(t.instId)));
+            o.Put("title", JsonValue.NewStr(title));
+            o.Put("nodeName", JsonValue.NewStr(node));
+            o.Put("status", JsonValue.NewStr(Convert.ToString(t.status)));
+            o.Put("result", JsonValue.NewStr(t.result));
+            o.Put("at", JsonValue.NewStr(Convert.ToString(t.createdAt)));
+            items.Append(o);
+        }
+        return items;
+    }
+
+    /* 实例详情：节点链（各环节的任务历史）+ 流水。可见 = 发起人 /
+       任一环节执行人 / 任一环节部门成员。 */
+    [HttpGet]
+    [Description("流程实例详情")]
+    [Custom(Perm = PermBit.View)]
+    async void FlowInst() {
+        User me = await this.Me();
+        FlowInst inst = await this.FlowInst
+            .Where(a => a.id == this.InInt("id", 0)
+                && a.tenantId == this.TenantId()).FirstAsync();
+        if (inst == null) { this.Fail(404, "0404", "流程不存在"); }
+        FlowDef def = await this.FlowDef
+            .Where(a => a.id == inst.defId).FirstAsync();
+        List<FlowNode> nodes = await this.FlowNode
+            .Where(a => a.defId == inst.defId).ToListAsync();
+        List<FlowNode> ordered = ZanWeb.Modules.Flow.Engine.SortNodes(nodes);
+        List<FlowTask> tasks = await this.FlowTask
+            .Where(a => a.instId == inst.id).ToListAsync();
+        bool sees = inst.startedBy == me.id;
+        for (int i = 0; i < tasks.Count; i = i + 1) {
+            if (tasks[i].assignUserId == me.id) { sees = true; }
+            if (tasks[i].deptId > 0 && tasks[i].deptId == me.departmentId) {
+                sees = true;
+            }
+        }
+        if (!sees) { this.Fail(403, "0403", "无权查看该流程"); }
+
+        List<int> userIds = new List<int>();
+        userIds.Add(inst.startedBy);
+        for (int i = 0; i < tasks.Count; i = i + 1) {
+            if (tasks[i].assignUserId > 0
+                && !userIds.Contains(tasks[i].assignUserId)) {
+                userIds.Add(tasks[i].assignUserId);
+            }
+        }
+        List<FlowLog> logs;
+        List<int> taskIds = new List<int>();
+        for (int i = 0; i < tasks.Count; i = i + 1) {
+            taskIds.Add(tasks[i].id);
+        }
+        if (taskIds.Count > 0) {
+            logs = await this.FlowLog
+                .Where(a => taskIds.Contains(a.taskId))
+                .OrderBy(a => a.id).Take(50).ToListAsync();
+        } else {
+            logs = new List<FlowLog>();
+        }
+        for (int i = 0; i < logs.Count; i = i + 1) {
+            if (!userIds.Contains(logs[i].userId)) {
+                userIds.Add(logs[i].userId);
+            }
+        }
+        List<User> users = await this.User
+            .Where(a => userIds.Contains(a.id)).ToListAsync();
+
+        JsonValue nodesArr = JsonValue.NewArray();
+        for (int i = 0; i < ordered.Count; i = i + 1) {
+            FlowNode n = ordered[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Put("id", JsonValue.NewStr(Convert.ToString(n.id)));
+            o.Put("name", JsonValue.NewStr(n.name));
+            o.Put("sort", JsonValue.NewStr(Convert.ToString(n.sort)));
+            o.Put("deptId", JsonValue.NewStr(Convert.ToString(n.deptId)));
+            o.Put("assignUserId",
+                JsonValue.NewStr(Convert.ToString(n.assignUserId)));
+            JsonValue tarr = JsonValue.NewArray();
+            for (int k = 0; k < tasks.Count; k = k + 1) {
+                if (tasks[k].nodeId != n.id) { continue; }
+                JsonValue t = JsonValue.NewObject();
+                t.Put("id", JsonValue.NewStr(Convert.ToString(tasks[k].id)));
+                t.Put("status",
+                    JsonValue.NewStr(Convert.ToString(tasks[k].status)));
+                t.Put("assignUserId", JsonValue.NewStr(
+                    Convert.ToString(tasks[k].assignUserId)));
+                t.Put("result", JsonValue.NewStr(tasks[k].result));
+                t.Put("finishedAt",
+                    JsonValue.NewStr(Convert.ToString(tasks[k].finishedAt)));
+                tarr.Append(t);
+            }
+            o.Put("tasks", tarr);
+            nodesArr.Append(o);
+        }
+        JsonValue logsArr = JsonValue.NewArray();
+        for (int i = 0; i < logs.Count; i = i + 1) {
+            JsonValue l = JsonValue.NewObject();
+            l.Put("userName", JsonValue.NewStr(
+                this.NameOf(users, logs[i].userId)));
+            l.Put("content", JsonValue.NewStr(logs[i].content));
+            l.Put("at", JsonValue.NewStr(Convert.ToString(logs[i].createdAt)));
+            logsArr.Append(l);
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("id", JsonValue.NewStr(Convert.ToString(inst.id)));
+        body.Put("title", JsonValue.NewStr(inst.title));
+        body.Put("defName", JsonValue.NewStr(def == null ? "-" : def.name));
+        body.Put("status", JsonValue.NewStr(Convert.ToString(inst.status)));
+        body.Put("startedBy",
+            JsonValue.NewStr(Convert.ToString(inst.startedBy)));
+        body.Put("startedByName",
+            JsonValue.NewStr(this.NameOf(users, inst.startedBy)));
+        body.Put("createdAt",
+            JsonValue.NewStr(Convert.ToString(inst.createdAt)));
+        body.Put("nodes", nodesArr);
+        body.Put("logs", logsArr);
+        this.Ok(body.ToJson());
+    }
+
+    /* ---- helpers ---- */
+
+    /* 当前登录账号（ApiAuth 下 uid 必在；查不到即 401——token 版本失效等）。
+       与 CollabApi.Me 同款（基类无此件，各 Api 控制器自带）。 */
+    async User Me() {
+        User me = await this.User
+            .Where(a => a.id == Filter.ToInt(this.uid, 0)).FirstAsync();
+        if (me == null || me.status != 1) {
+            this.Fail(401, "1001", "账号不可用，请重新登录");
+        }
+        return me;
+    }
+
+    string NameOf(List<User> users, int userId) {
+        for (int i = 0; i < users.Count; i = i + 1) {
+            if (users[i].id == userId) {
+                return Fmt.Text(users[i].nickname, users[i].username);
+            }
+        }
+        return "-";
+    }
+
+    /* 待办行装载（认领/提交/验收/驳回共用）：inst 在手、任务在手。 */
+    async FlowTask HeldTask() {
+        FlowTask t = await this.FlowTask
+            .Where(a => a.id == this.InInt("taskId", 0)).FirstAsync();
+        if (t == null) { this.Fail(404, "0404", "任务不存在"); }
+        FlowInst inst = await this.FlowInst
+            .Where(a => a.id == t.instId
+                && a.tenantId == this.TenantId()).FirstAsync();
+        if (inst == null) { this.Fail(404, "0404", "任务不存在"); }
+        return t;
+    }
+
+    /* 认领：部门成员把池中任务落到自己名下。 */
+    [HttpPost]
+    [Description("认领流程任务")]
+    [Custom(Perm = PermBit.Update)]
+    async void FlowClaim() {
+        User me = await this.Me();
+        FlowTask t = await this.HeldTask();
+        if (t.status != 0 || t.assignUserId != 0) {
+            this.Fail(409, "0409", "任务已被认领或不在待处理态");
+        }
+        if (t.deptId > 0 && me.departmentId != t.deptId) {
+            this.Fail(403, "0403", "仅该部门成员可认领");
+        }
+        if (!await ZanWeb.Modules.Flow.Engine.Claim(this.Held(), t, me)) {
+            this.Fail(409, "0409", "任务已被他人认领");
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        this.Ok(body.ToJson());
+    }
+
+    /* 提交验收：执行人完成本环节，交发起人验收。 */
+    [HttpPost]
+    [Description("提交验收")]
+    [Custom(Perm = PermBit.Update)]
+    async void FlowSubmit() {
+        User me = await this.Me();
+        FlowTask t = await this.HeldTask();
+        if (t.assignUserId != me.id) { this.Fail(403, "0403", "仅执行人可提交"); }
+        if (t.status != 0) { this.Fail(409, "0409", "任务不在待处理态"); }
+        if (!await ZanWeb.Modules.Flow.Engine.Submit(this.Held(), t, me,
+                this.In("report"))) {
+            this.Fail(409, "0409", "任务状态已变化");
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        this.Ok(body.ToJson());
+    }
+
+    /* 验收通过：发起人收口本环节并推进下一环（最后一环收口实例）。 */
+    [HttpPost]
+    [Description("验收通过")]
+    [Custom(Perm = PermBit.Update)]
+    async void FlowAccept() {
+        User me = await this.Me();
+        FlowTask t = await this.HeldTask();
+        FlowInst inst = await this.FlowInst
+            .Where(a => a.id == t.instId).FirstAsync();
+        if (inst.startedBy != me.id) {
+            this.Fail(403, "0403", "仅发起人可验收");
+        }
+        if (t.status != 3) { this.Fail(409, "0409", "任务不在待验收态"); }
+        if (!await ZanWeb.Modules.Flow.Engine.Accept(this.Held(), t, me)) {
+            this.Fail(409, "0409", "任务状态已变化");
+        }
+        FlowInst after = await this.FlowInst
+            .Where(a => a.id == t.instId).FirstAsync();
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        body.Put("instStatus",
+            JsonValue.NewStr(Convert.ToString(after.status)));
+        this.Ok(body.ToJson());
+    }
+
+    /* 驳回重来：发起人把待验收打回待处理；repool=1 清人回部门池。 */
+    [HttpPost]
+    [Description("验收驳回")]
+    [Custom(Perm = PermBit.Update)]
+    async void FlowReject() {
+        User me = await this.Me();
+        FlowTask t = await this.HeldTask();
+        FlowInst inst = await this.FlowInst
+            .Where(a => a.id == t.instId).FirstAsync();
+        if (inst.startedBy != me.id) {
+            this.Fail(403, "0403", "仅发起人可驳回");
+        }
+        if (t.status != 3) { this.Fail(409, "0409", "任务不在待验收态"); }
+        if (!await ZanWeb.Modules.Flow.Engine.Reject(this.Held(), t, me,
+                this.In("reason"), this.InInt("repool", 0) > 0)) {
+            this.Fail(409, "0409", "任务状态已变化");
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        this.Ok(body.ToJson());
+    }
+
+    /* 终止实例：发起人收摊；在途待办（待处理/待验收）标记跳过。 */
+    [HttpPost]
+    [Description("终止流程")]
+    [Custom(Perm = PermBit.Update)]
+    async void FlowCancel() {
+        User me = await this.Me();
+        FlowInst inst = await this.FlowInst
+            .Where(a => a.id == this.InInt("instId", 0)
+                && a.tenantId == this.TenantId()).FirstAsync();
+        if (inst == null) { this.Fail(404, "0404", "流程不存在"); }
+        if (inst.startedBy != me.id) { this.Fail(403, "0403", "仅发起人可终止"); }
+        if (inst.status != 1) { this.Fail(409, "0409", "流程已结束"); }
+        long now = WebApp.NowSeconds();
+        int _u = await this.FlowInst.Update()
+            .Set(a => a.status, 3)
+            .Set(a => a.currentNodeId, 0)
+            .Set(a => a.updatedAt, now)
+            .Where(a => a.id == inst.id && a.status == 1)
+            .ExecuteAffrowsAsync();
+        if (_u == 0) { this.Fail(409, "0409", "流程状态已变化"); }
+        int _s = await this.FlowTask.Update()
+            .Set(a => a.status, 2)
+            .Where(a => a.instId == inst.id
+                && (a.status == 0 || a.status == 3))
+            .ExecuteAffrowsAsync();
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        this.Ok(body.ToJson());
+    }
+}

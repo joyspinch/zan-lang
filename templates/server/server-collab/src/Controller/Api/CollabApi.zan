@@ -749,6 +749,14 @@ class CollabApi : ApiController {
             if (!Policy.IsActive(mine)) {
                 this.Fail(403, "0403", "仅会话成员可下载");
             }
+        } else if (links[0].ownerType == "task") {
+            CollabTask t = await this.CollabTask
+                .Where(a => a.id == links[0].ownerId
+                    && a.tenantId == this.TenantId()).FirstAsync();
+            if (t == null) { this.Fail(404, "0404", "任务不存在"); }
+            if (!await this.TaskSees(t, me)) {
+                this.Fail(403, "0403", "仅任务参与者可下载");
+            }
         } else {
             this.Fail(403, "0403", "该挂载类型暂未开放下载");
         }
@@ -1012,6 +1020,34 @@ class CollabApi : ApiController {
         body.Put("blockedReason", JsonValue.NewStr(t.blockedReason));
         body.Put("dueAt", JsonValue.NewStr(Convert.ToString(t.dueAt)));
         body.Put("version", JsonValue.NewStr(Convert.ToString(t.version)));
+        /* 任务附件（A327-14）：task 绑定的附件行，与消息附件同字段形态。 */
+        List<CollabAttachmentLink> tlinks = await this.CollabAttachmentLink
+            .Where(a => a.tenantId == this.TenantId() && a.ownerType == "task"
+                && a.ownerId == t.id).ToListAsync();
+        List<int> taids = new List<int>();
+        for (int i = 0; i < tlinks.Count; i = i + 1) {
+            taids.Add(tlinks[i].attachmentId);
+        }
+        JsonValue atts2 = JsonValue.NewArray();
+        if (taids.Count > 0) {
+            List<OaAttachment> trows = await this.OaAttachment
+                .Where(a => a.tenantId == this.TenantId()
+                    && taids.Contains(a.id)).ToListAsync();
+            for (int i = 0; i < trows.Count; i = i + 1) {
+                OaAttachment a1 = trows[i];
+                JsonValue o2 = JsonValue.NewObject();
+                o2.Put("attachmentId", JsonValue.NewStr(Convert.ToString(a1.id)));
+                o2.Put("fileName", JsonValue.NewStr(a1.fileName));
+                o2.Put("size", JsonValue.NewStr(Convert.ToString(a1.size)));
+                o2.Put("mime", JsonValue.NewStr(a1.mime));
+                if (a1.imgWidth > 0) {
+                    o2.Put("width", JsonValue.NewStr(Convert.ToString(a1.imgWidth)));
+                    o2.Put("height", JsonValue.NewStr(Convert.ToString(a1.imgHeight)));
+                }
+                atts2.Append(o2);
+            }
+        }
+        body.Put("attachments", atts2);
         body.Put("events", items);
         this.Ok(body.ToJson());
     }
@@ -1296,6 +1332,49 @@ class CollabApi : ApiController {
         body.Put("ok", JsonValue.NewStr("1"));
         body.Put("status", JsonValue.NewStr("cancelled"));
         await this.IdemFinish(me.id, "task.cancel", crid, "task", t.id, body);
+        await this.Commit();
+        this.Ok(body.ToJson());
+    }
+
+    /* 任务附件（A327-14）：上传在 /uploadattachment（先传后绑，一字节
+       文件至多一个绑定——attachmentId 唯一约束），本端点把未绑定附件
+       挂到任务上（ownerType=task）。责任人或执行人可挂；下载走
+       /downloadattachment 的 task 分支（任务参与者可见）。 */
+    [HttpPost]
+    [Description("任务挂附件")]
+    [Custom(Perm = PermBit.Update)]
+    async void TaskAttach() {
+        User me = await this.Me();
+        CollabTask t = await this.LoadTask(this.InInt("id", 0));
+        if (!CollabApi.TaskOwns(t, me) && t.assigneeId != me.id) {
+            this.Fail(403, "0403", "仅责任人或执行人可挂附件");
+        }
+        int attachmentId = this.InInt("attachmentId", 0);
+        OaAttachment att = await this.OaAttachment
+            .Where(a => a.id == attachmentId
+                && a.tenantId == this.TenantId()).FirstAsync();
+        if (att == null) { this.Fail(404, "0404", "附件不存在"); }
+        List<CollabAttachmentLink> bound = await this.CollabAttachmentLink
+            .Where(a => a.tenantId == this.TenantId()
+                && a.attachmentId == attachmentId).ToListAsync();
+        if (bound.Count > 0) { this.Fail(409, "0409", "附件已绑定其他资源"); }
+        string crid = this.Crid();
+        await this.Begin();
+        string stored = await this.IdemBegin(me.id, "task.attach", crid);
+        if (stored != null) { await this.Rollback(); this.Replay(stored); return; }
+        CollabAttachmentLink link = new CollabAttachmentLink();
+        link.tenantId = this.TenantId();
+        link.attachmentId = att.id;
+        link.ownerType = "task";
+        link.ownerId = t.id;
+        link.addedBy = me.id;
+        link.createdAt = WebApp.NowSeconds();
+        await this.CollabAttachmentLink.Insert(link).ExecuteIdentityAsync();
+        await this.TaskLog(t, t.id, "attached", me.id, t.status, t.assigneeId,
+            t.ownerId, t.progress, "", att.fileName, crid);
+        JsonValue body = JsonValue.NewObject();
+        body.Put("ok", JsonValue.NewStr("1"));
+        await this.IdemFinish(me.id, "task.attach", crid, "task", t.id, body);
         await this.Commit();
         this.Ok(body.ToJson());
     }

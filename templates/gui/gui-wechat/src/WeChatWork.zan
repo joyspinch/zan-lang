@@ -1,0 +1,859 @@
+using System;
+using System.IO;
+using System.Json;
+using System.Text;
+using Gui;
+using Gui.Backend;
+using Gui.Component;
+using Gui.Widget;
+
+/// 工作台页（A327-14 工作流化）：导轨第五页。左栏 tab（我的待办 /
+/// 待认领 / 待我验收 / 模板）+ 新建模板；中栏行列表；右栏多形态
+/// （流程实例详情 / 模板详情与发起 / 模板编辑器 / 选负责人）。
+/// 数据全走 /api/flow：可定制可复用的流程模板（flow_def + flow_node，
+/// 按节点落部门/个人），实例走 认领（部门池）→ 提交 → 验收 → 驳回
+/// 重来。服务端是唯一裁判；客户端越权动作由 403 就地显形。
+///
+/// 纪律：每个事件回调体都 try/catch 把错误显到面板状态行——GUI 回调
+/// 里抛出的异常会沿事件循环带崩整个进程（实测点行即退，无任何痕迹），
+/// 守住回调等于守住页面。右栏内容重建只在代码构建的 Panel 上
+/// RemoveAll（文档 div 不动），与 WxTaskSheet 的 dock 卡片同构。
+class WxPageWork : Control {
+    ListView<string> tabs;
+    ListView<WxWorkItem> list;
+    /// 标题行的计数是骨架文档里的元素（#WorkTitle）。
+    Control titleEl;
+    Control detailCol;
+    /// 右栏内容壳：代码构建的 dock 卡片，重建只清它，不动文档 div。
+    /// 懒建——首次开详情才挂进文档列（构造期不放，进场布局零差异）。
+    Panel detailBody;
+    Control detailHostCtrl;
+    /// 详情底部的状态行（错误 / 提示共用一行，随面板重建换引用）。
+    Label statusLbl;
+
+    List<WxWorkItem> mine;
+    List<WxWorkItem> pool;
+    List<WxWorkItem> accept;
+    List<WxWorkItem> tpls;
+    List<WxWorkItem> shown;
+    /// 当前 tab：0 我的待办 / 1 待认领 / 2 待我验收 / 3 模板。
+    int tab;
+    /// 选中行（动作按钮的上下文：哪个 tab、哪个任务/模板）。
+    WxWorkItem picked;
+    /// 我的数字 id（/api/auth/me 的 uid，登录后取一次）。
+    string myId;
+    /// 部门表（flowtemplates 带回，模板编辑器选部门认领用）。
+    List<WxDept> depts;
+    /// 联系人缓存（选负责人用，懒拉一次）。
+    List<WxDept> contacts;
+
+    WxPageWork() {
+        this.InitControl("wxPageWork", 5);
+        this.Class = "wxmain";
+        mine = new List<WxWorkItem>();
+        pool = new List<WxWorkItem>();
+        accept = new List<WxWorkItem>();
+        tpls = new List<WxWorkItem>();
+        shown = new List<WxWorkItem>();
+        depts = new List<WxDept>();
+        contacts = new List<WxDept>();
+        tab = 0;
+        picked = null;
+        myId = "";
+
+        // ---- HTML 骨架（WeChatWork.html）：三栏，动态控件挂壳 ----
+        Control ui = WeChatWorkHtml.Build(null);
+        ui.DockFill();
+        this.Add(ui);
+
+        Control tabsHost = ui.Find("WorkTabsHost");
+        if (tabsHost == null) { tabsHost = ui; }
+        List<string> names = new List<string>();
+        names.Add("我的待办");
+        names.Add("待认领");
+        names.Add("待我验收");
+        names.Add("模板");
+        tabs = new ListView<string>(WxFilterRow.Of);
+        tabs.Class = "wxlist grow";
+        tabs.Bind(names);
+        tabs.OnSelect(() => {
+            try { this.SwitchTab(tabs.SelectedIndex()); }
+            catch (Exception ex) { this.Note(ex.Message); }
+        });
+        tabsHost.Add(tabs);
+
+        Button newBtn = (Button)ui.Find("WorkNewBtn");
+        if (newBtn != null) {
+            newBtn.OnClick(() => {
+                try {
+                    editDefId = "0";
+                    edName = "";
+                    edDesc = "";
+                    stages = new List<WxStageData>();
+                    this.BuildEditor();
+                }
+                catch (Exception ex) { this.Note(ex.Message); }
+            });
+        }
+
+        Control listHost = ui.Find("WorkListHost");
+        if (listHost == null) { listHost = ui; }
+        list = new ListView<WxWorkItem>(WxWorkRow.Of);
+        list.Class = "wxlist grow";
+        list.OnSelect(() => {
+            try { this.OpenRow(list.SelectedIndex()); }
+            catch (Exception ex) { this.Note(ex.Message); }
+        });
+        listHost.Add(list);
+
+        titleEl = ui.Find("WorkTitle");
+        detailCol = ui.Find("WorkDetail");
+        Control detailHost = ui.Find("WorkDetailHost");
+        if (detailHost == null) { detailHost = ui; }
+        detailBody = Panel.Root("wxworkdetail");
+        detailBody.Class = "grow";
+        detailHost.Add(detailBody);
+
+        this.SwitchTab(0);
+    }
+
+    /// 宿主 App（重绘要）。
+    App app;
+
+    /// App.OnLoad 接线（同 WxPageMoments.UseApp 的口径）。
+    void UseApp(App a) { app = a; }
+
+    /// 每次切到本页都重拉（App.Pick(4) 调）——工作流状态是别人也在推
+    /// 进的数据，进页面就是最新的；顺带补 me（登录后第一次进页才有）。
+    void OnShow() {
+        if (!WxNet.LoggedIn()) { return; }
+        if (myId.Length == 0) {
+            WxNetReq mr = WxNet.NewReq();
+            WxNet.ApiGet(mr, "/api/auth/me", () => {
+                try {
+                    if (WxNet.OkOf(mr) && WxNet.DataOf(mr) != null) {
+                        myId = WxNet.DataOf(mr).Str("uid", "0");
+                        // 详情「发起人」按注册表解析人名，联系人端点
+                        // 不含自己——把自己的显示名补登记（幂等）。
+                        if (myId.Length > 0 && myId != "0") {
+                            WxData.WhoOnce("u:" + myId, WxNet.Account(),
+                                StyledText.Initial(WxNet.Account()));
+                        }
+                    }
+                } catch (Exception ex) { this.Note(ex.Message); }
+                this.LoadAll();
+            });
+            return;
+        }
+        this.LoadAll();
+    }
+
+    /// 重拉三态待办 + 模板（+ 部门表，编辑器用）。
+    void LoadAll() {
+        WxNetReq a = WxNet.NewReq();
+        WxNet.ApiGet(a, "/api/flow/flowmine", () => {
+            try {
+                mine.Clear();
+                pool.Clear();
+                accept.Clear();
+                if (WxNet.OkOf(a) && WxNet.DataOf(a) != null) {
+                    this.Fill(mine, WxNet.DataOf(a).Get("mine"), 0);
+                    this.Fill(pool, WxNet.DataOf(a).Get("pool"), 0);
+                    this.Fill(accept, WxNet.DataOf(a).Get("accept"), 0);
+                }
+            } catch (Exception ex) { this.Note(ex.Message); }
+            this.LoadTpls();
+        });
+    }
+
+    void LoadTpls() {
+        WxNetReq b = WxNet.NewReq();
+        WxNet.ApiGet(b, "/api/flow/flowtemplates", () => {
+            try {
+                tpls.Clear();
+                depts.Clear();
+                if (WxNet.OkOf(b) && WxNet.DataOf(b) != null) {
+                    JsonValue d = WxNet.DataOf(b);
+                    this.Fill(tpls, d.Get("defs"), 1);
+                    JsonValue ds = d.Get("depts");
+                    int dn = ds == null ? 0 : ds.Count();
+                    for (int i = 0; i < dn; i = i + 1) {
+                        depts.Add(WxDept.Of(ds.At(i).Str("id", ""),
+                            ds.At(i).Str("name", "")));
+                    }
+                }
+            } catch (Exception ex) { this.Note(ex.Message); }
+            this.Rebind();
+        });
+    }
+
+    /// 行数组 → 模型（kind 0 任务行 / 1 模板行）。
+    void Fill(List<WxWorkItem> into, JsonValue rows, int kind) {
+        int n = rows == null ? 0 : rows.Count();
+        for (int i = 0; i < n; i = i + 1) {
+            into.Add(WxWorkItem.Of(rows.At(i), kind));
+        }
+    }
+
+    /// 列表重绑 + 标题计数。重绑清滚动缓存与选中——详情凭 picked 的
+    /// 上下文重建，不依赖 ListView 的选中态。
+    void Rebind() {
+        if (tab == 0) { shown = mine; }
+        else if (tab == 1) { shown = pool; }
+        else if (tab == 2) { shown = accept; }
+        else { shown = tpls; }
+        string label = tab == 0 ? "我的待办" : tab == 1 ? "待认领"
+            : tab == 2 ? "待我验收" : "模板";
+        if (titleEl != null) {
+            titleEl.SetProp("text", label
+                + "（" + Convert.ToString(shown.Count) + "）");
+        }
+        list.Bind(shown);
+    }
+
+    void SwitchTab(int i) {
+        if (i < 0 || i > 3) { i = 0; }
+        tab = i;
+        this.CloseDetail();
+        this.Rebind();
+    }
+
+    void OpenRow(int idx) {
+        if (idx < 0 || idx >= shown.Count) { return; }
+        picked = shown[idx];
+        if (picked.kind == 1) { this.FetchTemplate(picked.id); }
+        else { this.FetchInst(picked.instId); }
+    }
+
+    void FetchInst(string instId) {
+        WxNetReq r = WxNet.NewReq();
+        WxNet.ApiGet(r, "/api/flow/flowinst?id="
+            + Encoding.UrlEncode(instId), () => {
+                try {
+                    if (!WxNet.OkOf(r) || WxNet.DataOf(r) == null) {
+                        this.Note("详情拉取失败：" + WxNet.ErrOf(r));
+                        return;
+                    }
+                    this.BuildInstPanel(WxNet.DataOf(r));
+                } catch (Exception ex) { this.Note(ex.Message); }
+            });
+    }
+
+    void FetchTemplate(string id) {
+        WxNetReq r = WxNet.NewReq();
+        WxNet.ApiGet(r, "/api/flow/flowtemplate?id="
+            + Encoding.UrlEncode(id), () => {
+                try {
+                    if (!WxNet.OkOf(r) || WxNet.DataOf(r) == null) {
+                        this.Note("模板拉取失败：" + WxNet.ErrOf(r));
+                        return;
+                    }
+                    this.BuildTplPanel(WxNet.DataOf(r));
+                } catch (Exception ex) { this.Note(ex.Message); }
+            });
+    }
+
+    /// 右栏内容壳懒建（首次开详情才挂；构造期不碰文档列）。
+    void EnsureDetailBody() {
+        if (detailBody != null) { return; }
+        detailBody = Panel.Root("wxworkcard");
+        detailBody.Class = "grow";
+        detailHostCtrl.Add(detailBody);
+    }
+
+    void CloseDetail() {
+        picked = null;
+        if (detailCol != null) { detailCol.visible = false; }
+        if (detailBody != null) { detailBody.RemoveAll(); }
+        statusLbl = null;
+    }
+
+    /// 统一 POST：成功重拉全部（详情凭 picked 上下文重开），失败就地
+    /// 状态行红字。
+    void Act(string path, string body) {
+        WxNetReq r = WxNet.NewReq();
+        WxNet.ApiPost(r, path, body, () => {
+            try {
+                if (!WxNet.OkOf(r)) {
+                    this.Note(WxNet.ErrOf(r));
+                    return;
+                }
+                this.LoadAll();
+            } catch (Exception ex) { this.Note(ex.Message); }
+        });
+    }
+
+    /// 状态行提示（面板没开着就丢弃——下一拍刷新会带回面板）。
+    void Note(string msg) {
+        if (statusLbl == null) { return; }
+        statusLbl.Text = msg;
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    /// 右栏卡片头：标题 + 关闭钮；返回卡片本体（dock 容器，head 顶 / 
+    /// body 填），调用方往 body 里续内容。
+    Panel CardHead(string title, Panel into) {
+        Flex head = Wx.Row("wxphead");
+        Panel ht = Panel.Column();
+        ht.Class = "grow";
+        ht.Add(Wx.Lbl(title, "wxpname"));
+        head.Add(ht);
+        Button close = Wx.IconBtn("dots");
+        close.dock = 4;
+        close.OnClick(() => { this.CloseDetail(); });
+        head.Add(close);
+        into.Add(head);
+        into.Add(Wx.Line());
+        Panel body = Wx.Col("wxpbody");
+        body.dock = 5;
+        into.Add(body);
+        return body;
+    }
+
+    /// 摆一个动作钮。
+    void ActBtn(Panel body, string label, Action fire) {
+        Button b = new Button(label);
+        b.dock = 1;
+        b.OnClick(() => {
+            try { fire(); }
+            catch (Exception ex) { this.Note(ex.Message); }
+        });
+        body.Add(b);
+    }
+
+    /* ---- 形态一：流程实例详情 ---- */
+
+    void BuildInstPanel(JsonValue d) {
+        this.EnsureDetailBody();
+        detailBody.RemoveAll();
+        statusLbl = null;
+
+        Panel card = Panel.Root("wxworkcard");
+        card.Class = "grow";
+        Panel body = this.CardHead(d.Str("title", ""), card);
+        int st = Convert.ToInt32(d.Str("status", "1"));
+        body.Add(Wx.Lbl(WxPageWork.InstZh(st) + " · 流程 "
+            + d.Str("defName", "") + " · 发起 "
+            + d.Str("startedByName", ""), "wxpsub"));
+
+        // 节点链：顺序环节 + 最新一次任务状态。
+        JsonValue nodes = d.Get("nodes");
+        int nn = nodes == null ? 0 : nodes.Count();
+        body.Add(Wx.Line());
+        for (int i = 0; i < nn; i = i + 1) {
+            JsonValue n = nodes.At(i);
+            string line = Convert.ToString(i + 1) + ". " + n.Str("name", "");
+            JsonValue ts = n.Get("tasks");
+            int tn = ts == null ? 0 : ts.Count();
+            if (tn > 0) {
+                JsonValue t = ts.At(tn - 1);
+                line = line + " —— " + WxPageWork.TaskZh(
+                    Convert.ToInt32(t.Str("status", "0")));
+                string who = WxTaskSheet.Who(t.Str("assignUserId", "0"));
+                if (who != "-") { line = line + " · " + who; }
+                string res = t.Str("result", "");
+                if (res.Length > 0 && t.Str("status", "0") == "3") {
+                    line = line + "：" + res;
+                }
+            } else {
+                line = line + " —— 未开始";
+            }
+            body.Add(Wx.Lbl(line, "wxpval"));
+        }
+
+        // 动作区：按选中行的上下文（tab × 任务状态 × 发起人）摆钮。
+        body.Add(Wx.Line());
+        Input noteIn = new Input("汇报 / 驳回理由（动作要填的写这里）");
+        noteIn.dock = 1;
+        body.Add(noteIn);
+        Switch repool = new Switch();
+        Flex pr = Wx.Row("");
+        pr.Add(Wx.Lbl("驳回后回部门池重新认领", "wxpsub grow"));
+        repool.dock = 4;
+        pr.Add(repool);
+        body.Add(pr);
+        if (picked != null && st == 1) {
+            if (tab == 0 && picked.status == "0") {
+                this.ActBtn(body, "完成并提交", () => {
+                    this.Act("/api/flow/flowsubmit",
+                        "taskId=" + picked.taskId + "&report="
+                        + Encoding.UrlEncode(noteIn.GetText()));
+                });
+            }
+            if (tab == 1 && picked.status == "0") {
+                this.ActBtn(body, "认领", () => {
+                    this.Act("/api/flow/flowclaim",
+                        "taskId=" + picked.taskId);
+                });
+            }
+            if (tab == 2 && picked.status == "3") {
+                this.ActBtn(body, "验收通过", () => {
+                    this.Act("/api/flow/flowaccept",
+                        "taskId=" + picked.taskId);
+                });
+                this.ActBtn(body, "驳回重来", () => {
+                    this.Act("/api/flow/flowreject",
+                        "taskId=" + picked.taskId + "&reason="
+                        + Encoding.UrlEncode(noteIn.GetText())
+                        + "&repool=" + (repool.IsOn() ? "1" : "0"));
+                });
+            }
+            if (d.Str("startedBy", "0") == myId) {
+                this.ActBtn(body, "终止流程", () => {
+                    this.Act("/api/flow/flowcancel",
+                        "instId=" + picked.instId);
+                });
+            }
+        }
+        if (st != 1) {
+            body.Add(Wx.Lbl("流程已结束（"
+                + WxPageWork.InstZh(st) + "）", "wxemotitle"));
+        }
+
+        // 流水（最近 12 条，升序取尾段倒着摆，最新在上）。
+        body.Add(Wx.Line());
+        body.Add(Wx.Lbl("动态", "wxemotitle"));
+        JsonValue logs = d.Get("logs");
+        int ln = logs == null ? 0 : logs.Count();
+        int from = ln > 12 ? ln - 12 : 0;
+        for (int i = ln - 1; i >= from; i = i - 1) {
+            JsonValue e = logs.At(i);
+            body.Add(Wx.Lbl(e.Str("content", "") + " · "
+                + e.Str("userName", "") + " · "
+                + WxIm.ClockOf(e.Str("at", "0")), "wxpsub"));
+        }
+        if (ln == 0) { body.Add(Wx.Lbl("暂无动态", "wxpsub")); }
+
+        statusLbl = Wx.Lbl("", "wxpsub");
+        body.Add(statusLbl);
+        detailBody.Add(card);
+
+        if (detailCol != null) { detailCol.visible = true; }
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    /* ---- 形态二：模板详情 + 发起 ---- */
+
+    void BuildTplPanel(JsonValue d) {
+        this.EnsureDetailBody();
+        detailBody.RemoveAll();
+        statusLbl = null;
+
+        Panel card = Panel.Root("wxworkcard");
+        card.Class = "grow";
+        Panel body = this.CardHead(d.Str("name", ""), card);
+        string desc = d.Str("description", "");
+        body.Add(Wx.Lbl("流程模板 · "
+            + (desc.Length > 0 ? desc : "（无描述）"), "wxpsub"));
+        JsonValue nodes = d.Get("nodes");
+        int nn = nodes == null ? 0 : nodes.Count();
+        body.Add(Wx.Line());
+        for (int i = 0; i < nn; i = i + 1) {
+            JsonValue n = nodes.At(i);
+            string line = Convert.ToString(i + 1) + ". " + n.Str("name", "");
+            string uid = n.Str("assignUserId", "0");
+            if (uid != "0") {
+                line = line + " · " + WxTaskSheet.Who(uid);
+            } else {
+                line = line + " · 部门认领";
+            }
+            body.Add(Wx.Lbl(line, "wxpval"));
+        }
+
+        body.Add(Wx.Line());
+        Input title = new Input("实例标题（必填）");
+        title.dock = 1;
+        body.Add(title);
+        this.ActBtn(body, "发起流程", () => {
+            string t = title.GetText();
+            if (t.Length == 0) {
+                this.Note("标题不能为空");
+                return;
+            }
+            this.SwitchTab(0);
+            this.Act("/api/flow/flowstart",
+                "defId=" + d.Str("id", "") + "&title="
+                + Encoding.UrlEncode(t));
+        });
+        this.ActBtn(body, "编辑模板", () => { this.EditTemplate(d); });
+
+        statusLbl = Wx.Lbl("", "wxpsub");
+        body.Add(statusLbl);
+        detailBody.Add(card);
+
+        if (detailCol != null) { detailCol.visible = true; }
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    /* ---- 形态三：模板编辑器（新建 / 复用改造）----
+       状态全在数据侧（edName/edDesc/stages），每次增删/选人先
+       SaveEditorState 把输入框里的字收回去再整卡重建——重建不丢字。
+       回调里抛异常会带崩进程（见类注），故每个回调体都有守卫。 */
+
+    string edName = "";
+    string edDesc = "";
+    string editDefId = "0";
+    List<WxStageData> stages;
+    Panel stageBox;
+    Input eName;
+    Input eDesc;
+    /// 编辑中的行控件（与 stages 一一对应，只活在两次重建之间）。
+    List<WxStageRow> stageRows;
+
+    class WxStageData {
+        public string name = "";
+        public string userId = "0";
+        public string deptId = "0";
+        public string who = "部门认领";
+    }
+
+    class WxStageRow {
+        public Input name;
+        public Button pick;
+        public Button del;
+        public Flex row;
+        public WxStageData data;
+    }
+
+    void BuildEditor() {
+        this.EnsureDetailBody();
+        detailBody.RemoveAll();
+        statusLbl = null;
+        stageRows = new List<WxStageRow>();
+
+        Panel card = Panel.Root("wxworkcard");
+        card.Class = "grow";
+        Panel body = this.CardHead(editDefId == "0" ? "新建模板"
+            : "编辑模板", card);
+        body.Add(Wx.Lbl("环节按从上到下依次流转；不指派人的环节由所选"
+            + "部门整队认领。", "wxpsub"));
+        eName = new Input("流程名称（必填）");
+        eName.dock = 1;
+        if (edName.Length > 0) { eName.SetText(edName); }
+        body.Add(eName);
+        eDesc = new Input("描述（选填）");
+        eDesc.dock = 1;
+        if (edDesc.Length > 0) { eDesc.SetText(edDesc); }
+        body.Add(eDesc);
+        stageBox = Panel.Column();
+        stageBox.dock = 1;
+        body.Add(stageBox);
+        for (int i = 0; i < stages.Count; i = i + 1) {
+            this.AddStageRow(stages[i]);
+        }
+
+        this.ActBtn(body, "+ 添加环节", () => {
+            this.SaveEditorState();
+            stages.Add(new WxStageData());
+            this.BuildEditor();
+        });
+        this.ActBtn(body, "保存模板", () => { this.SaveTpl(); });
+        statusLbl = Wx.Lbl("", "wxpsub");
+        body.Add(statusLbl);
+        detailBody.Add(card);
+
+        if (detailCol != null) { detailCol.visible = true; }
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    WxStageRow AddStageRow(WxStageData data) {
+        WxStageRow r = new WxStageRow();
+        r.data = data;
+        r.row = Wx.Row("");
+        r.name = new Input("环节名称");
+        r.name.Class = "grow";
+        if (data.name.Length > 0) { r.name.SetText(data.name); }
+        r.row.Add(r.name);
+        r.pick = new Button(data.who);
+        r.pick.Class = "text small";
+        WxStageRow captured = r;
+        r.pick.OnClick(() => { this.BeginPickFor(captured); });
+        r.row.Add(r.pick);
+        r.del = new Button("删");
+        r.del.Class = "text small";
+        r.del.OnClick(() => {
+            this.SaveEditorState();
+            stages.Remove(captured.data);
+            this.BuildEditor();
+        });
+        r.row.Add(r.del);
+        stageRows.Add(r);
+        stageBox.Add(r.row);
+        return r;
+    }
+
+    /// 把两根输入框与各环节名的现值收回数据侧（重建前必调）。
+    void SaveEditorState() {
+        if (eName != null) { edName = eName.GetText(); }
+        if (eDesc != null) { edDesc = eDesc.GetText(); }
+        for (int i = 0; i < stageRows.Count; i = i + 1) {
+            stageRows[i].data.name = stageRows[i].name.GetText();
+        }
+    }
+
+    void SaveTpl() {
+        this.SaveEditorState();
+        if (edName.Length == 0) {
+            this.Note("名称不能为空");
+            return;
+        }
+        if (stages.Count == 0) {
+            this.Note("至少一个环节");
+            return;
+        }
+        string nodes = "[";
+        for (int i = 0; i < stages.Count; i = i + 1) {
+            WxStageData d = stages[i];
+            if (d.name.Length == 0) {
+                this.Note("第 " + Convert.ToString(i + 1) + " 个环节缺名称");
+                return;
+            }
+            if (i > 0) { nodes = nodes + ","; }
+            nodes = nodes + "{\"name\":\""
+                + Encoding.UrlEncode(d.name) + "\",\"assignUserId\":\""
+                + d.userId + "\",\"deptId\":\"" + d.deptId + "\"}";
+        }
+        nodes = nodes + "]";
+        WxNetReq r2 = WxNet.NewReq();
+        WxNet.ApiPost(r2, "/api/flow/flowsave",
+            "id=" + editDefId
+            + "&name=" + Encoding.UrlEncode(edName)
+            + "&description=" + Encoding.UrlEncode(edDesc)
+            + "&nodes=" + nodes
+            + "&clientRequestId=" + WxIm.NextCrid(), () => {
+                try {
+                    if (!WxNet.OkOf(r2)) {
+                        this.Note(WxNet.ErrOf(r2));
+                        return;
+                    }
+                    this.CloseDetail();
+                    this.LoadAll();
+                } catch (Exception ex) { this.Note(ex.Message); }
+            });
+    }
+
+    /* ---- 形态四：选负责人（联系人直派 或 部门整队认领）---- */
+
+    WxStageData picking;
+
+    void BeginPickFor(WxStageRow row) {
+        this.SaveEditorState();
+        picking = row.data;
+        if (contacts.Count > 0) { this.BuildPickPanel(); return; }
+        WxNetReq r = WxNet.NewReq();
+        WxNet.Get(r, "contacts", () => {
+            try {
+                if (!WxNet.OkOf(r) || WxNet.DataOf(r) == null) {
+                    this.Note("联系人拉取失败：" + WxNet.ErrOf(r));
+                    return;
+                }
+                JsonValue items = WxNet.DataOf(r).Get("contacts");
+                int n = items == null ? 0 : items.Count();
+                for (int i = 0; i < n; i = i + 1) {
+                    contacts.Add(WxDept.Of(items.At(i).Str("id", "0"),
+                        items.At(i).Str("name", "?")));
+                }
+                this.BuildPickPanel();
+            } catch (Exception ex) { this.Note(ex.Message); }
+        });
+    }
+
+    void BuildPickPanel() {
+        this.EnsureDetailBody();
+        detailBody.RemoveAll();
+        statusLbl = null;
+
+        Panel card = Panel.Root("wxworkcard");
+        card.Class = "grow";
+        Panel body = this.CardHead("环节负责人", card);
+        body.Add(Wx.Lbl("指定人直派本环节；部门则整队进认领池。", "wxpsub"));
+        body.Add(Wx.Line());
+        for (int i = 0; i < contacts.Count; i = i + 1) {
+            WxDept c = contacts[i];
+            Button b = new Button(c.name);
+            b.Class = "text small";
+            b.dock = 1;
+            b.OnClick(() => {
+                picking.userId = c.id;
+                picking.deptId = "0";
+                picking.who = c.name;
+                this.BuildEditor();
+            });
+            body.Add(b);
+        }
+        for (int i = 0; i < depts.Count; i = i + 1) {
+            WxDept dp = depts[i];
+            Button b = new Button("部门池：" + dp.name);
+            b.Class = "text small";
+            b.dock = 1;
+            b.OnClick(() => {
+                picking.userId = "0";
+                picking.deptId = dp.id;
+                picking.who = "部门池：" + dp.name;
+                this.BuildEditor();
+            });
+            body.Add(b);
+        }
+        Button back = new Button("返回编辑");
+        back.Class = "text small";
+        back.dock = 1;
+        back.OnClick(() => { this.BuildEditor(); });
+        body.Add(back);
+        statusLbl = Wx.Lbl("", "wxpsub");
+        body.Add(statusLbl);
+        detailBody.Add(card);
+        { if (app != null) { app.RequestRedraw(); } }
+    }
+
+    /// 模板详情卡里的「编辑」入口：详情喂进编辑器状态。
+    void EditTemplate(JsonValue d) {
+        editDefId = d.Str("id", "0");
+        edName = d.Str("name", "");
+        edDesc = d.Str("description", "");
+        stages = new List<WxStageData>();
+        JsonValue nodes = d.Get("nodes");
+        int nn = nodes == null ? 0 : nodes.Count();
+        for (int i = 0; i < nn; i = i + 1) {
+            JsonValue n = nodes.At(i);
+            WxStageData sd = new WxStageData();
+            sd.name = n.Str("name", "");
+            sd.userId = n.Str("assignUserId", "0");
+            sd.deptId = n.Str("deptId", "0");
+            if (sd.userId != "0") {
+                sd.who = WxTaskSheet.Who(sd.userId);
+            } else if (sd.deptId != "0") {
+                sd.who = this.DeptName(sd.deptId);
+            }
+            stages.Add(sd);
+        }
+        this.BuildEditor();
+    }
+
+    string DeptName(string id) {
+        for (int i = 0; i < depts.Count; i = i + 1) {
+            if (depts[i].id == id) { return "部门池：" + depts[i].name; }
+        }
+        return "部门认领";
+    }
+
+    override string Kind() { return "WxPageWork"; }
+
+    /* ---- 词典 ---- */
+
+    static string InstZh(int st) {
+        if (st == 2) { return "已完成"; }
+        if (st == 3) { return "已终止"; }
+        return "进行中";
+    }
+
+    static string TaskTint(int st) {
+        if (st == 3) { return "warning"; }
+        if (st == 1) { return "success"; }
+        return "info";
+    }
+
+    static string TaskZh(int st) {
+        if (st == 0) { return "待处理"; }
+        if (st == 1) { return "已完成"; }
+        if (st == 2) { return "已跳过"; }
+        if (st == 3) { return "待验收"; }
+        return "未知";
+    }
+}
+
+/// 工作台行模型：任务行（flowmine 三态）与模板行（flowtemplates）。
+class WxWorkItem {
+    public string id;
+    public string taskId;
+    public string instId;
+    public string title;
+    public string nodeName;
+    public string status;
+    public string description;
+    public string nodeCount;
+    public int kind;
+
+    static WxWorkItem Of(JsonValue o, int kind) {
+        WxWorkItem it = new WxWorkItem();
+        it.kind = kind;
+        if (kind == 1) {
+            it.id = o.Str("id", "");
+            it.title = o.Str("name", "");
+            it.description = o.Str("description", "");
+            it.nodeCount = o.Str("nodeCount", "0");
+            it.status = "0";
+            return it;
+        }
+        it.taskId = o.Str("taskId", "");
+        it.instId = o.Str("instId", "");
+        it.title = o.Str("title", "");
+        it.nodeName = o.Str("nodeName", "");
+        it.status = o.Str("status", "0");
+        return it;
+    }
+}
+
+/// 工作台行：图标 + 标题/摘要 + 右缘状态。
+class WxWorkRow : Control {
+    WxWorkItem item;
+
+    static Control Of(WxWorkItem it) { return new WxWorkRow(it); }
+
+    WxWorkRow(WxWorkItem it) {
+        this.InitControl("wxworkrowtpl", 5);
+        this.Class = "wxworkrow";
+        item = it;
+        string tint = it.kind == 1 ? "primary"
+            : WxPageWork.TaskTint(Convert.ToInt32(it.status));
+        Avatar av = Wx.AvaIcon(it.kind == 1 ? "target" : "box", 40, tint);
+        av.dock = 3;
+        this.Add(av);
+        Flex mid = Flex.Column();
+        mid.AddClass("wxmid");
+        mid.Justify("center");
+        mid.dock = 5;
+        mid.Add(Wx.Lbl(it.title, "wxfavname"));
+        string sub;
+        if (it.kind == 1) {
+            sub = it.description.Length > 0
+                ? it.description : it.nodeCount + " 个环节";
+        } else {
+            sub = it.nodeName + " · "
+                + WxPageWork.TaskZh(Convert.ToInt32(it.status));
+        }
+        mid.Add(Wx.Lbl(sub, "wxworksub"));
+        this.Add(mid);
+        Flex meta = Flex.Column();
+        meta.AddClass("wxmeta");
+        meta.Justify("center");
+        meta.dock = 4;
+        Flex r1 = Wx.Row("");
+        r1.Justify("end");
+        r1.Add(Wx.Lbl(it.kind == 1 ? it.nodeCount + " 环" : "", "wxworkmeta"));
+        meta.Add(r1);
+        this.Add(meta);
+    }
+
+    override string Kind() { return "WxWorkRow"; }
+    override string StyleType() { return "listrow"; }
+
+    override void OnMeasure(App app) {
+        // 行高归样式表（.wxworkrow 的 height），同收藏卡行。
+        StyleBox s = Style.Of(app, this.StyleType(), this.Class, 0);
+        prefH = s.HeightOr(app.Scale(64));
+        prefW = app.Scale(280);
+    }
+}
+
+/// 部门 / 联系人条目（id + 名）。
+class WxDept {
+    public string id;
+    public string name;
+
+    static WxDept Of(string i, string n) {
+        WxDept d = new WxDept();
+        d.id = i;
+        d.name = n;
+        return d;
+    }
+}
