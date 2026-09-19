@@ -107,6 +107,24 @@ class ProjType {
     }
 }
 
+/// 外部语义补全项（如 LSP / 智能分析器提供）
+class CodeCompletionItem {
+    string label;
+    string kind;
+    string detail;
+    string doc;
+
+    CodeCompletionItem(string label, string kind, string detail, string doc) {
+        this.label = label;
+        this.kind = kind;
+        this.detail = detail;
+        this.doc = doc;
+    }
+}
+
+delegate List<CodeCompletionItem> CodeCompletionProvider(string path, int line0, int col0);
+delegate string CodeSignatureProvider(string path, int line0, int col0, string callee);
+
 /// 右键菜单的一项：标签、右侧显示的快捷键提示，以及动作编号
 /// （0 = 分隔行，其余由编辑器的菜单执行器解释）。
 class ContextMenuItem {
@@ -147,6 +165,13 @@ partial class CodeEditor {
     // 因此单纯的滚轮/滚动条滚动不会被拉回光标行。
     int ensuredCaretLine;
     int lastId;
+
+    /// 当前编辑的文件完整路径（用于 LSP 语义服务）
+    public string documentPath = "";
+    /// 外部智能补全提供者（如 LSP）
+    public CodeCompletionProvider externalCompletion;
+    /// 外部参数签名提示提供者（如 LSP）
+    public CodeSignatureProvider externalSignature;
 
     // ---- 本帧的行布局 ----
     // CodeLens 标注位于其装饰的声明上方独占的一行
@@ -224,6 +249,9 @@ partial class CodeEditor {
     int clickCount;
     // 上次 Render 中完全可见的文本行数（供 Page Up/Down）。
     int pageRows;
+    int textVersion;
+    int lastScrollMs;
+    List<string> rowDecl;
 
     // ---- 多光标（次要光标，各在不同行） ----
     List<Caret> carets;
@@ -498,6 +526,9 @@ partial class CodeEditor {
         this.lastClickCol = -1;
         this.clickCount = 0;
         this.pageRows = 20;
+        this.textVersion = 1;
+        this.lastScrollMs = 0;
+        this.rowDecl = new List<string>();
         this.carets = new List<Caret>();
         this.clipboard = "";
         this.undoStack = new List<EditSnapshot>();
@@ -581,6 +612,12 @@ partial class CodeEditor {
         scrollLine = 0;
         ensuredCaretLine = -1;
         lastDiagLine = -1;  // 强制对新内容重新计算诊断
+        BumpTextVersion();
+    }
+
+    /// 标记文本已被修改，递增单调版本号。
+    void BumpTextVersion() {
+        textVersion = textVersion + 1;
     }
 
     /// 载入整段文本（SetLines 的字符串版），同时清空 CodeLens、
@@ -601,14 +638,10 @@ partial class CodeEditor {
         return string.Join("\n", lines);
     }
 
-    /// 廉价的内容指纹（行数 + 总字符数）；使宿主
-    /// 无需实例化完整文本即可每帧检测缓冲区变化。
+    /// O(1) 内容版本号：文本实际变更时才递增，
+    /// 彻底消除每帧遍历全文件所有行统计长度的巨大卡顿。
     int TextStamp() {
-        int n = 0;
-        for (int i = 0; i < lines.Count; i = i + 1) {
-            n = n + lines[i].Length;
-        }
-        return n * 131 + lines.Count;
+        return textVersion;
     }
 
     /// 缓冲区行数。
@@ -984,6 +1017,7 @@ partial class CodeEditor {
         }
         // 新编辑会使重做历史失效。
         redoStack = new List<EditSnapshot>();
+        BumpTextVersion();
     }
 
     /// 撤销最近一次编辑：撤销前状态先压入重做栈，恢复后清除选区。
@@ -1113,6 +1147,7 @@ partial class CodeEditor {
         rowLine = new List<int>();
         rowTop = new List<int>();
         rowLensY = new List<int>();
+        rowDecl = new List<string>();
         lensRowH = lensH;
         int y = area.y;
         int bottom = area.y + area.height;
@@ -1120,18 +1155,21 @@ partial class CodeEditor {
         if (ln < 0) { ln = 0; }
         while (ln < lines.Count && y + lineH <= bottom) {
             int ly = 0 - 1;
+            string decl = "";
+            string lnt = lines[ln];
             // lens 行要么完整绘制要么整行丢弃，而不是在顶部或底部边缘半绘，
-            // 因此代码行永远不会被自己的
-            // 注解挤出视野。
-            if (lensH > 0 && ln > scrollLine
-                && CodeEditor.DeclNameAt(lines[ln]).Length > 0
-                && y + lensH + lineH <= bottom) {
-                ly = y;
-                y = y + lensH;
+            // 因此代码行永远不会被自己的注解挤出视野。
+            if (lensH > 0 && ln > scrollLine && CodeEditor.MightBeDecl(lnt)) {
+                decl = CodeEditor.DeclNameAt(lnt);
+                if (decl.Length > 0 && y + lensH + lineH <= bottom) {
+                    ly = y;
+                    y = y + lensH;
+                }
             }
             rowLine.Add(ln);
             rowTop.Add(y);
             rowLensY.Add(ly);
+            rowDecl.Add(decl);
             y = y + lineH;
             ln = ln + 1;
         }

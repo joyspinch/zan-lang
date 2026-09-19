@@ -8,11 +8,13 @@ namespace Gui.Component.CodeEditor;
 class CodeSpan {
     string text;
     int color;
+    int width;
 
     /// 组装一段带色的高亮文本。
     CodeSpan(string text, int color) {
         this.text = text;
         this.color = color;
+        this.width = 0 - 1;
     }
 }
 
@@ -441,12 +443,16 @@ partial class CodeEditor {
         c.FillRect(area.x, area.y, gutterW, area.height, gutterStyle.BgOr(0));
         c.FillRect(area.x + gutterW, area.y, 1, area.height, dividerStyle.BgOr(0));
 
-        bool ownsWheel = app.CaptureWheel(
-            area.x, area.y, area.width, area.height);
-
+        // 认领以真溢出为前提：整个文档放得下一屏时不认领，滚轮穿透
+        // 给外层容器/页面（maxScroll 为 0 时滚了也是原样钳回）。
         int visLines = area.height / lineH;
         if (visLines < 1) { visLines = 1; }
         pageRows = visLines;
+        bool ownsWheel = false;
+        if (visLines < lines.Count) {
+            ownsWheel = app.CaptureWheel(
+                area.x, area.y, area.width, area.height);
+        }
 
         if (focused) { HandleInput(app); }
         // 光标移到不同行时重新校验诊断：
@@ -465,6 +471,17 @@ partial class CodeEditor {
         // 过期记忆，使其只重算一次而非每可见行一次。
         InvalidateDiagStale();
 
+        // 在滚动条滑块上拖拽：时序前移至排版与行绘制之前，
+        // 保证当前帧随着鼠标移动即刻呈现最新视口，实现所拖即所见与零延迟体验。
+        if (app.EventKind() == 1 && barDragging) {
+            int dtotal2 = lines.Count;
+            if (dtotal2 < 1) { dtotal2 = 1; }
+            scrollLine = (app.mouseY - area.y) * dtotal2 / area.height - visLines / 2;
+            if (scrollLine < 0) { scrollLine = 0; }
+            lastScrollMs = app.nowMs;
+            app.RequestRedraw();
+        }
+
         if (ownsWheel) {
             int delta = app.window.EventKeyCode();
             int step = delta / 120;
@@ -472,7 +489,9 @@ partial class CodeEditor {
                 if (delta > 0) { step = 1; }
                 else if (delta < 0) { step = 0 - 1; }
             }
-            scrollLine = scrollLine - step * 3;
+            // 滚轮步长调整为干脆利落的 5 行，彻底消除粘滞感与拖不动感
+            scrollLine = scrollLine - step * 5;
+            lastScrollMs = app.nowMs;
             app.RequestRedraw();
         }
 
@@ -511,8 +530,11 @@ partial class CodeEditor {
                     hoverStyle.BgOr(0), breakpointStyle.BgOr(0),
                     lineNumberStyle.FgOr(0), caretStyle.BgOr(0),
                     textStyle.FgOr(0));
-        // 本帧预算不足未完成的计数：下一帧继续完成。
-        if (LensPending()) { app.RequestRedraw(); }
+        // 本帧预算不足未完成的计数：在视口稳定后（滚动或编辑静默期结束）才继续请求下一帧，
+        // 确保滚动时完全零多余重绘，帧率极致稳定。
+        if (LensPending() && app.nowMs - lastScrollMs >= 200 && app.nowMs - lensQuietMs >= 250) {
+            app.RequestRedraw();
+        }
 
         // ---- 右侧诊断 / 滚动条（VS 风格概览标尺） ----
         RenderOverviewRuler(app, area, visLines);
@@ -628,18 +650,14 @@ partial class CodeEditor {
             scrollLine = dtgt - visLines / 2;
             if (scrollLine < 0) { scrollLine = 0; }
             barDragging = true;
+            lastScrollMs = app.nowMs;
             app.RequestRedraw();
             return id;
         }
 
-        // 在滚动条上拖动：视图跟随指针（滑块拖动），
-        // 滚动文档而不移动光标。
+        // 在滚动条滑块上拖动已在前置阶段完成视口更新与重绘请求，
+        // 此处直接拦截鼠标移动事件，避免穿透到文本区引发误选。
         if (app.EventKind() == 1 && barDragging) {
-            int dtotal2 = lines.Count;
-            if (dtotal2 < 1) { dtotal2 = 1; }
-            scrollLine = (app.mouseY - area.y) * dtotal2 / area.height - visLines / 2;
-            if (scrollLine < 0) { scrollLine = 0; }
-            app.RequestRedraw();
             return id;
         }
         if (app.EventKind() == 2 && app.window.EventButton() == 0 && ptrFree
@@ -1049,7 +1067,12 @@ partial class CodeEditor {
                 for (int si2 = 0; si2 < spans.Count; si2 = si2 + 1) {
                     CodeSpan span = spans[si2];
                     c.DrawText(sx, textY, span.text, span.color, fontSize);
-                    sx = sx + Canvas.MeasureText(span.text, fontSize);
+                    int sw = span.width;
+                    if (sw < 0) {
+                        sw = Canvas.MeasureText(span.text, fontSize);
+                        span.width = sw;
+                    }
+                    sx = sx + sw;
                 }
 
                 if (ln == curLine && focused) {
@@ -1065,7 +1088,12 @@ partial class CodeEditor {
                 // 预算不足）留空该行，而不显示
                 // 尚未得到的数字。
                 if (lensY >= 0) {
-                    string decl = CodeEditor.DeclNameAt(text);
+                    string decl = "";
+                    if (i < rowDecl.Count) {
+                        decl = rowDecl[i];
+                    } else {
+                        decl = CodeEditor.DeclNameAt(text);
+                    }
                     if (decl.Length > 0) {
                         int refs = LensRefCountBudgeted(decl, ln);
                         if (refs >= 0) {

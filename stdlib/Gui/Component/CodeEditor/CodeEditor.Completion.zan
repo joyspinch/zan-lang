@@ -341,6 +341,25 @@ partial class CodeEditor {
         Dict<string, bool> taken = new Dict<string, bool>();
         ScoreCandidates(cand, candKinds, "W", pfx, taken, scores);
         ScoreCandidates(words, null, "W", pfx, taken, scores);
+        if (pfx.Length >= 1 && externalCompletion != null && documentPath.Length > 0) {
+            List<CodeCompletionItem> lspItems = externalCompletion(documentPath, curLine, curCol);
+            if (lspItems != null && lspItems.Count > 0) {
+                for (int li = 0; li < lspItems.Count; li = li + 1) {
+                    string lab = lspItems[li].label;
+                    if (!taken.ContainsKey(lab)) {
+                        int sc = CodeEditor.MatchScore(lab, pfx);
+                        if (sc >= 0) {
+                            taken[lab] = true;
+                            acAllItems.Add(lab);
+                            string k = lspItems[li].kind;
+                            if (k.Length == 0) { k = "M"; }
+                            acAllKinds.Add(k);
+                            scores.Add(sc + 500);
+                        }
+                    }
+                }
+            }
+        }
         if (acAllItems.Count == 0) { acActive = false; return; }
         // 排序后保留最优的少数：按收集顺序截断会
         // 在明显候选项扫描较晚时将其丢弃。
@@ -463,11 +482,20 @@ partial class CodeEditor {
         return name;
     }
 
+    /// 快速前置判断：绝大多数语句、注释、控制流与空行都不可能声明成员，
+    /// 避免每行都去 TrimStr 和字符循环。
+    static bool MightBeDecl(string line) {
+        if (line.Length < 6) { return false; }
+        if (CodeEditor.Find(line, "{") < 0) { return false; }
+        return true;
+    }
+
     /// 若 `line` 声明了成员则返回其名称，否则返回 ""。
     /// 方法是标识符后跟参数列表，其匹配的 ')'
     /// 后跟方法体的 '{'，且不是控制语句；
     /// 属性是标识符后跟 get / set 访问器。
     static string DeclNameAt(string line) {
+        if (!CodeEditor.MightBeDecl(line)) { return ""; }
         string trimmed = CodeEditor.TrimStr(line);
         if (trimmed.Length == 0) { return ""; }
         // 必须包含一个 '('，其匹配的 ')' 后跟方法体的 '{'。
@@ -795,6 +823,12 @@ partial class CodeEditor {
             lensQuietMs = app.nowMs;
             for (int i = 0; i < lensFresh.Count; i = i + 1) { lensFresh[i] = 0; }
         }
+        // 滚动中或刚停止滚动（200ms 内）：视口正在移动，
+        // 优先保证 60fps 丝滑滚动体验，暂停重度符号扫描。
+        if (app.nowMs - lastScrollMs < 200) {
+            lensBudget = 0;
+            return;
+        }
         if (app.nowMs - lensQuietMs < 250) {
             lensBudget = 0;
             app.RequestRedraw();
@@ -1074,6 +1108,19 @@ partial class CodeEditor {
         acStart = curCol;
         acFull = new List<string>();
         acDot = true;
+
+        if (externalCompletion != null && documentPath.Length > 0) {
+            List<CodeCompletionItem> lspItems = externalCompletion(documentPath, curLine, curCol);
+            if (lspItems != null && lspItems.Count > 0) {
+                for (int li = 0; li < lspItems.Count; li = li + 1) {
+                    if (!CodeEditor.Has(acFull, lspItems[li].label)) {
+                        acFull.Add(lspItems[li].label);
+                    }
+                }
+                UpdateCompletion();
+                return;
+            }
+        }
 
         // 解析接收者类型，然后只列出该类型的真实成员。
         // 优先级：硬编码 stdlib 静态类型 -> 用户/项目类型 ->
