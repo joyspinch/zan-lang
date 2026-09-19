@@ -3,193 +3,36 @@ using System;
 namespace System.IO;
 
 /// <summary>
-/// 基础之外的路径辅助功能：glob 匹配（<c>*</c>、<c>?</c>、
-/// <c>**</c>）、相对路径解析，以及
-/// <c>.</c>/<c>..</c> 段的规范化清理。纯字符串逻辑，与平台无关。
-///
-///   bool hit = PathEx.IsMatch("src/**/*.zan", "src/a/b/c.zan");   // true
-///   string rel = PathEx.GetRelativePath("C:\\a\\b", "C:\\a\\b\\c\\d.txt");
+/// 历史路径扩展辅助工具（已收敛至 <see cref="Path"/>）。
+/// 本类完整保留全部公开方法以保证 100% 向后兼容，内部直接转发至 <see cref="Path"/>。
+/// 新代码建议直接使用 <see cref="Path.IsMatch"/>、<see cref="Path.IsUnder"/>、
+/// <see cref="Path.Clean"/> 与 <see cref="Path.GetRelativePath"/>。
 /// </summary>
 class PathEx {
     /// <summary>当 `path` 匹配 glob 模式 `pattern` 时为真。两者都接受
     /// `/` 或 `\` 分隔符。<c>*</c> 匹配单个路径段内，
     /// <c>?</c> 匹配一个字符，<c>**</c> 匹配零个或多个路径段。</summary>
     static bool IsMatch(string pattern, string path) {
-        List<string> pat = PathEx.SplitSegments(pattern);
-        List<string> pth = PathEx.SplitSegments(path);
-        return PathEx.MatchSegments(pat, 0, pth, 0);
+        return Path.IsMatch(pattern, path);
     }
 
     /// <summary>当 `path` 是 `dir` 的目录前缀（或等于 `dir`）时为真，
     /// 在 Windows 上按段不区分大小写比较。</summary>
     static bool IsUnder(string dir, string path) {
-        List<string> a = PathEx.SplitSegments(dir);
-        List<string> b = PathEx.SplitSegments(path);
-        if (b.Count < a.Count) { return false; }
-        for (int i = 0; i < a.Count; i = i + 1) {
-            if (!PathEx.Same(a[i], b[i])) { return false; }
-        }
-        return true;
+        return Path.IsUnder(dir, path);
     }
 
     /// <summary>移除 <c>.</c> 并解析 <c>..</c> 段
     /// （"a/./b/../c" -> "a/c"）。无法解析的前导 <c>..</c> 会
     /// 保留。分隔符按输入原样保留。</summary>
     static string Clean(string path) {
-        string sep = "/";
-        if (PathEx.IndexOf(path, "\\", 0) >= 0) { sep = "\\"; }
-        bool rooted = path.Length > 0 && (path.Substring(0, 1) == "/"
-                                          || path.Substring(0, 1) == "\\"
-                                          || (path.Length > 1 && path.Substring(1, 1) == ":"));
-        List<string> segs = PathEx.SplitSegments(path);
-        List<string> outSegs = new List<string>();
-        int i = 0;
-        for (; i < segs.Count; i = i + 1) {
-            string seg = segs[i];
-            if (seg == "." || seg == "") {
-                // 跳过
-            } else if (seg == "..") {
-                if (outSegs.Count > 0 && outSegs[outSegs.Count - 1] != "..") {
-                    outSegs.RemoveAt(outSegs.Count - 1);
-                } else if (!rooted) {
-                    outSegs.Add("..");
-                }
-            } else {
-                outSegs.Add(seg);
-            }
-        }
-        StringBuilder sb = new StringBuilder();
-        i = 0;
-        while (i < outSegs.Count) {
-            if (i > 0) { sb.Append(sep); }
-            sb.Append(outSegs[i]);
-            i = i + 1;
-        }
-        return sb.ToString();
+        return Path.Clean(path);
     }
 
-    /// <summary>从 `from`（目录）到 `to`（其下或其旁的路径）的相对路径
-    /// 两者按段拆分；公共前缀
-    /// 被去掉，剩余部分用 "../" 跳转连接。
+    /// <summary>从 `from`（目录）到 `to`（其下或其旁的路径）的相对路径。
+    /// 两者按段拆分；公共前缀被去掉，剩余部分用 "../" 跳转连接。
     /// Windows 盘符不区分大小写比较。</summary>
     static string GetRelativePath(string from, string to) {
-        string sep = "/";
-        if (PathEx.IndexOf(from, "\\", 0) >= 0 || PathEx.IndexOf(to, "\\", 0) >= 0) {
-            sep = "\\";
-        }
-        List<string> a = PathEx.SplitSegments(from);
-        List<string> b = PathEx.SplitSegments(to);
-        int common = 0;
-        for (; common < a.Count && common < b.Count && PathEx.Same(a[common], b[common]); common = common + 1) {
-        }
-        List<string> parts = new List<string>();
-        int up = a.Count - common;
-        int k = 0;
-        for (; k < up; k = k + 1) {
-            parts.Add("..");
-        }
-        int j = common;
-        while (j < b.Count) {
-            parts.Add(b[j]);
-            j = j + 1;
-        }
-        if (parts.Count == 0) { return "."; }
-        StringBuilder sb = new StringBuilder();
-        k = 0;
-        while (k < parts.Count) {
-            if (k > 0) { sb.Append(sep); }
-            sb.Append(parts[k]);
-            k = k + 1;
-        }
-        return sb.ToString();
-    }
-
-    /// 按段递归匹配；"**" 消耗零个或多个路径段。
-    static bool MatchSegments(List<string> pat, int pi, List<string> pth, int ti) {
-        if (pi >= pat.Count) { return ti >= pth.Count; }
-        string p = pat[pi];
-        if (p == "**") {
-            // 零个或多个段；尝试消费 0 到 remaining 个。
-            for (int k = 0; ti + k <= pth.Count; k = k + 1) {
-                if (PathEx.MatchSegments(pat, pi + 1, pth, ti + k)) { return true; }
-            }
-            return false;
-        }
-        if (ti >= pth.Count) { return false; }
-        if (!PathEx.SegmentMatch(p, pth[ti])) { return false; }
-        return PathEx.MatchSegments(pat, pi + 1, pth, ti + 1);
-    }
-
-    /// 单段通配符匹配：'*' 匹配任意字符序列，'?' 匹配单个字符。
-    /// Windows 上不区分大小写。
-    static bool SegmentMatch(string pattern, string segment) {
-        return PathEx.SegMatch(pattern, 0, segment, 0);
-    }
-
-    /// 单段匹配的回溯实现；连续 '*' 合并后尝试任意长度。
-    static bool SegMatch(string pat, int pi, string seg, int si) {
-        if (pi >= pat.Length) { return si >= seg.Length; }
-        string pc = pat.Substring(pi, 1);
-        if (pc == "*") {
-            // 合并连续的星号，然后尝试任意长度匹配。
-            while (pi < pat.Length && pat.Substring(pi, 1) == "*") { pi = pi + 1; }
-            for (int k = 0; si + k <= seg.Length; k = k + 1) {
-                if (PathEx.SegMatch(pat, pi, seg, si + k)) { return true; }
-            }
-            return false;
-        }
-        if (si >= seg.Length) { return false; }
-        if (pc == "?") {
-            return PathEx.SegMatch(pat, pi + 1, seg, si + 1);
-        }
-        if (!PathEx.CharEqual(pc, seg.Substring(si, 1))) { return false; }
-        return PathEx.SegMatch(pat, pi + 1, seg, si + 1);
-    }
-
-    /// 按 '/' 或 '\' 拆分路径（根路径保留空段）。
-    static List<string> SplitSegments(string path) {
-        List<string> segs = new List<string>();
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < path.Length; i = i + 1) {
-            string ch = path.Substring(i, 1);
-            if (ch == "/" || ch == "\\") {
-                segs.Add(sb.ToString());
-                sb = new StringBuilder();
-            } else {
-                sb.Append(ch);
-            }
-        }
-        segs.Add(sb.ToString());
-        return segs;
-    }
-
-    /// 段比较；Windows 上不区分大小写。
-    static bool Same(string a, string b) {
-        #if WINDOWS
-        return a.ToLower() == b.ToLower();
-        #else
-        return a == b;
-        #endif
-    }
-
-    /// 单字符比较；Windows 上不区分大小写。
-    static bool CharEqual(string a, string b) {
-        #if WINDOWS
-        return a.ToLower() == b.ToLower();
-        #else
-        return a == b;
-        #endif
-    }
-
-    /// 从 from 起查找子串；没有时返回 -1。
-    static int IndexOf(string hay, string needle, int from) {
-        int n = needle.Length;
-        int h = hay.Length;
-        int i = from;
-        while (i + n <= h) {
-            if (hay.Substring(i, n) == needle) { return i; }
-            i = i + 1;
-        }
-        return -1;
+        return Path.GetRelativePath(from, to);
     }
 }
