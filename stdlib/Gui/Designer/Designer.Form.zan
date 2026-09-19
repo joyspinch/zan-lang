@@ -782,7 +782,9 @@ partial class Designer {
             // 等比缩放里：字号、行高、内边距都随画布一起缩放，
             // 不会“矩形变了、里面的字与控件不变”。
             BeginCtrlZoom(app);
+            c.PushClip(ctlX, ctlY, ctlW, eh - (ctlY - ey));
             PreviewControl(app, c, t, f, ctlX, ctlY, ctlW, eh - (ctlY - ey));
+            c.PopClip();
             EndCtrlZoom(app);
             pvScale = 1000;
         }
@@ -796,7 +798,7 @@ partial class Designer {
                 int lsz = app.Scale(12);
                 c.DrawGlyphIn("lock", ex + ew - lsz - app.Scale(2),
                     ey + app.Scale(2), lsz, lsz, lsz, Style.Part(app, "designer", "accent", "", "warning", "", Style.SNormal()).BgOr(0));
-            } else if (free) {
+            } else if (free && f.dockSide != 5) {
                 int hs = app.Scale(7);
                 for (int hn = 0; hn < 8; hn = hn + 1) {
                     int hx = FreeHandleX(hn, ex, ew) - hs / 2;
@@ -1457,6 +1459,33 @@ partial class Designer {
             }
         }
 
+        // 画板右键菜单触发：在画板内右键点击，命中控件则选中该控件并弹出上下文菜单，点在空白处则弹出全局画布菜单
+        if (!locked && !freeHand && !dragging && ek == 2 && app.window.EventButton() == 1
+                && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)) {
+            int mDesX = (app.mouseX - ox) * 1000 / psMilli;
+            int mDesY = (app.mouseY - oy) * 1000 / psMilli;
+            FormField hit = FreePick(fields, mDesX, mDesY, 0, 0);
+            if (hit != null) {
+                if (hit != sel && !this.IsExtraSel(hit)) {
+                    this.ClearExtraSel();
+                    sel = hit;
+                    inspTab = 0;
+                    if (hit.IsContainer()) { activeContainer = hit; }
+                    else { activeContainer = ParentContainerOf(hit); }
+                }
+                canvasMenuHit = hit;
+            } else {
+                this.ClearExtraSel();
+                sel = null;
+                canvasMenuHit = null;
+            }
+            canvasMenuOpen = true;
+            canvasMenuArm = false;
+            canvasMenuX = app.mouseX;
+            canvasMenuY = app.mouseY;
+            app.RequestRedraw();
+        }
+
         // 指针按下：选中的调整大小手柄优先，否则选择并
         // 开始拖拽；按在空白处清除选择。编辑器窗口开着时让位。
         if (!locked && !freeHand && !dragging && ek == 2 && app.window.EventButton() == 0
@@ -1477,7 +1506,7 @@ partial class Designer {
                 msg = Designer.T("tab ", "标签页 ") + Convert.ToString(th.page + 1);
                 started = true;
             }
-            if (!started && free && sel != null && !sel.locked) {
+            if (!started && free && sel != null && !sel.locked && sel.dockSide != 5) {
                 int sx = ox + (freeSelPX + sel.LayoutX()) * psMilli / 1000;
                 int sy = oy + (freeSelPY + sel.LayoutY()) * psMilli / 1000;
                 int sw2 = sel.LayoutW() * psMilli / 1000;
@@ -1529,17 +1558,12 @@ partial class Designer {
                         // 锁定：选得中、改得了属性，就是拖不动。
                         msg = Designer.T("locked", "已锁定");
                     } else if (!openReq && free) {
-                        this.PushUndo();
-                        // 拖动即解除停靠：画布解算与生成代码都是
-                        // dock 优先于 fx/fy，带 dock 的组件拖动写下
-                        // 的作者矩形没人消费，下一帧又被解算摆回
-                        // 原位——拖了等于没拖。要重新停靠走检查器
-                        // 的停靠边下拉。
-                        if (hit.dockSide != 0) {
-                            hit.dockSide = 0;
-                            msg = Designer.T("docked -> free", "已解除停靠");
-                        }
+                        // 记录拖拽预备状态与起点坐标，只有产生真实位移时才解除停靠与压 Undo 栈，
+                        // 避免单纯点击或切换属性时误将组件的“填充/停靠”还原为自由定位。
                         freeDragging = true;
+                        freeDragStartX = mDesX;
+                        freeDragStartY = mDesY;
+                        freeDragHasMoved = false;
                         freeDragDx = mDesX - (freeSelPX + hit.LayoutX());
                         freeDragDy = mDesY - (freeSelPY + hit.LayoutY());
                     } else if (!openReq) {
@@ -1584,8 +1608,23 @@ partial class Designer {
         if (freeDragging && free && ek == 1 && sel != null) {
             int mDesX = (app.mouseX - ox) * 1000 / psMilli;
             int mDesY = (app.mouseY - oy) * 1000 / psMilli;
-            int newLeft = mDesX - freeDragDx;
-            int newTop = mDesY - freeDragDy;
+            if (!freeDragHasMoved) {
+                int dmx = mDesX - freeDragStartX;
+                int dmy = mDesY - freeDragStartY;
+                if (dmx < 0) { dmx = 0 - dmx; }
+                if (dmy < 0) { dmy = 0 - dmy; }
+                if (dmx >= 4 || dmy >= 4) {
+                    freeDragHasMoved = true;
+                    this.PushUndo();
+                    if (sel.dockSide != 0) {
+                        sel.dockSide = 0;
+                        msg = Designer.T("docked -> free", "已解除停靠");
+                    }
+                }
+            }
+            if (freeDragHasMoved) {
+                int newLeft = mDesX - freeDragDx;
+                int newTop = mDesY - freeDragDy;
             // 拖拽基每帧按当前父链重算：上面同帧的落点高亮探测会
             // 顺带改写 freeSelPX，不能直接信字段里的旧值。
             int baseX = this.AbsOriginX(sel);
@@ -1645,6 +1684,7 @@ partial class Designer {
                     if (ef.fx < 0) { ef.fx = 0; }
                     if (ef.fy < 0) { ef.fy = 0; }
                 }
+            }
             }
             app.RequestRedraw();
         }
@@ -1774,8 +1814,9 @@ partial class Designer {
         // 任意位置松开指针即结束拖拽/调整大小/平移，并撤掉参考线。
         // 指针没动过（一次点击）的话设计没变，把按下时压的栈退掉。
         if (ek == 3) {
-            if (!dragging) { this.PopUndoIfUnchanged(); }
+            if (!dragging && !freeDragHasMoved) { this.PopUndoIfUnchanged(); }
             freeDragging = false;
+            freeDragHasMoved = false;
             freeResizing = false;
             freePanning = false;
             this.freeGuideX = 0 - 1;
@@ -1926,23 +1967,79 @@ partial class Designer {
         msg = Designer.T("added ", "已添加 ") + FormField.TypeName(ftype);
     }
 
-    /// 新拖入自由画布组件的默认宽度：表格/时间线/树/图表等宽组件
-    /// 与 Tabs 320，标题及外壳类（工具条/状态栏等沿边铺满的）480，
-    /// 其余 200。
-    int DefaultFreeW(FormField f) {
-        if (f.kind == "Tabs" || f.ftype == 23 || f.ftype == 24 || f.ftype == 25
-            || f.ftype == 38 || f.ftype == 40 || f.ftype == 41 || f.ftype == 42
-            || f.ftype == 43 || f.ftype == 45 || f.ftype == 46) { return 320; }
-        if (f.ftype == 15) { return 480; }
+    /// 新拖入自由画布组件的默认宽度：依据各控件标准尺寸与内容度量确定，
+    /// 确保点选、选中框手柄与实际呈现区域严丝合缝。
+    static int DefaultFreeW(FormField f) {
+        int ft = f.ftype;
+        if (ft == 7) { return 50; }                         // 开关
+        if (ft == 8) { return 120; }                        // 评分
+        if (ft == 11) { return 48; }                        // 拾色器
+        if (ft == 19) { return 72; }                        // 标签
+        if (ft == 20) { return 64; }                        // 徽章
+        if (ft == 21) { return 40; }                        // 头像
+        if (ft == 22) { return 140; }                       // 统计数值
+        if (ft == 29) { return 260; }                       // 进度条
+        if (ft == 31) { return 440; }                       // 步骤条
+        if (ft == 35) { return 420; }                       // 穿梭框
+        if (ft == 37) { return 520; }                       // 分页器
+        if (ft == 50 || ft == 51) { return 200; }           // 气泡卡片 / 气泡确认
+        if (ft == 54) { return 40; }                        // 图标
+        if (ft == 62) { return 36; }                        // 指示灯
+        if (ft == 63) { return 150; }                       // 数显表
+        if (ft == 64) { return 160; }                       // 圆盘仪表
+        if (ft == 65) { return 64; }                        // 棒图
+        if (ft == 66) { return 320; }                       // 趋势曲线
+        if (ft == 67) { return 400; }                       // 报警横幅
+        if (ft == 68) { return 400; }                       // 报警列表
+        if (ft == 69) { return 200; }                       // 数字键盘
+        if (ft == 70) { return 240; }                       // 设备卡
+        if (ft == 71) { return 360; }                       // 设备面板
+        if (ft == 75) { return 160; }                       // 图片
+        if (ft == 76) { return 300; }                       // 日历
+        if (ft == 78) { return 120; }                       // 二维码
+        if (f.kind == "Tabs" || ft == 23 || ft == 24 || ft == 25
+            || ft == 38 || ft == 40 || ft == 41 || ft == 42
+            || ft == 43 || ft == 45 || ft == 46) { return 320; }
+        if (ft == 15) { return 480; }
         // 外壳类（工具条 / 状态栏 / 分栏 / 停靠面板）默认铺开，
         // 因为它们总是沿窗口边缘或充满内容区。
-        if (FormField.IsShellOf(f.ftype)) { return 480; }
+        if (FormField.IsShellOf(ft)) { return 480; }
         return 200;
     }
 
-    /// 新拖入自由画布组件的默认高度：直接取字段的行数单位。
-    int DefaultFreeH(FormField f) {
-        return f.RowUnits();
+    /// 新拖入自由画布组件的默认高度：依据各控件标准尺寸与内容度量确定。
+    static int DefaultFreeH(FormField f) {
+        int ft = f.ftype;
+        if (ft == 7) { return 28; }                         // 开关
+        if (ft == 8) { return 28; }                         // 评分
+        if (ft == 11) { return 32; }                        // 拾色器
+        if (ft == 19) { return 28; }                        // 标签
+        if (ft == 20) { return 28; }                        // 徽章
+        if (ft == 21) { return 40; }                        // 头像
+        if (ft == 22) { return 60; }                        // 统计数值
+        if (ft == 29) { return 24; }                        // 进度条
+        if (ft == 31) { return 60; }                        // 步骤条
+        if (ft == 35) { return 220; }                       // 穿梭框
+        if (ft == 37) { return 36; }                        // 分页器
+        if (ft == 50) { return 70; }                        // 气泡卡片
+        if (ft == 51) { return 80; }                        // 气泡确认
+        if (ft == 54) { return 40; }                        // 图标
+        if (ft == 62) { return 36; }                        // 指示灯
+        if (ft == 63) { return 72; }                        // 数显表
+        if (ft == 64) { return 160; }                       // 圆盘仪表
+        if (ft == 65) { return 180; }                       // 棒图
+        if (ft == 66) { return 200; }                       // 趋势曲线
+        if (ft == 67) { return 36; }                        // 报警横幅
+        if (ft == 68) { return 200; }                       // 报警列表
+        if (ft == 69) { return 260; }                       // 数字键盘
+        if (ft == 70) { return 140; }                       // 设备卡
+        if (ft == 71) { return 300; }                       // 设备面板
+        if (ft == 75) { return 120; }                       // 图片
+        if (ft == 76) { return 280; }                       // 日历
+        if (ft == 78) { return 120; }                       // 二维码
+        int rh = f.RowUnits();
+        if (rh > 0) { return rh; }
+        return 32;
     }
 
     /// 画字段的标签文本：必填字段前置红色星号（hideStar 时省略），
@@ -2271,7 +2368,7 @@ partial class Designer {
         }
         if (ft == 75) {                      // 图片：空源时控件自带占位
             int ih = avail - PvS(app, 6);
-            if (ih > PvS(app, 120)) { ih = PvS(app, 120); }
+            if (ih < PvS(app, 20)) { ih = PvS(app, 20); }
             Image im = new Image(f.bindPath, f.label);
             this.ApplyFieldProps(im, f);
             im.RenderInside(app, new Rect(x, y, w, ih));
@@ -2294,7 +2391,6 @@ partial class Designer {
             string qr = f.label;
             if (qr == "") { qr = "https://zan.design"; }
             int qs = w < avail ? w : avail;
-            if (qs > PvS(app, 110)) { qs = PvS(app, 110); }
             new QrCode(qr).RenderInside(app, new Rect(x, y, qs, qs));
             return;
         }
@@ -2419,7 +2515,7 @@ partial class Designer {
             Pagination pg = Pagination.Of(10, f.uiState);
             // 设计器画布在排布表单期间拥有点击所有权。
             pg.Disabled = preview;
-            pg.RenderAt(app, x, y + PvS(app, 2));
+            PvCtrl(app, pg, x, y + PvS(app, 2), w, avail - PvS(app, 4));
             return;
         }
         if (ft == 38) {                      // 菜单
@@ -2509,12 +2605,12 @@ partial class Designer {
             return;
         }
         if (ft == 50) {                      // 气泡卡片
-            Popover.Render(app, x + PvS(app, 90), y,
-                PvS(app, 180), PvS(app, 60), f.label, Designer.T("Popover body text", "气泡内容"));
+            Popover.Render(app, x, y,
+                w, avail, f.label, Designer.T("Popover body text", "气泡内容"));
             return;
         }
         if (ft == 51) {                      // 气泡确认
-            Layer.DrawPopconfirm(app, x + PvS(app, 110), y, f.label, Designer.T("OK", "确定"), Designer.T("Cancel", "取消"));
+            Layer.DrawPopconfirm(app, x, y, f.label, Designer.T("OK", "确定"), Designer.T("Cancel", "取消"));
             return;
         }
         if (ft == 52) {                      // 通知
@@ -2583,25 +2679,25 @@ partial class Designer {
         }
         if (ft == 62) {                      // 指示灯
             Led led = new Led(f.label, f.uiState);
-            PvCtrl(app, led, x, y, w, PvS(app, 26));
+            PvCtrl(app, led, x, y, w, avail);
             return;
         }
         if (ft == 63) {                      // 数显表
             Digital dg = new Digital(f.label, f.uiState, 10,
                                      Designer.T("C", "℃"));
-            PvCtrl(app, dg, x, y, PvS(app, 150), PvS(app, 72));
+            PvCtrl(app, dg, x, y, w, avail);
             return;
         }
         if (ft == 64) {                      // 圆盘仪表
             Gauge gg = new Gauge(f.label, f.uiState, 0, 100);
             gg.Limits(20, 80);
-            PvCtrl(app, gg, x, y, PvS(app, 160), PvS(app, 160));
+            PvCtrl(app, gg, x, y, w, avail);
             return;
         }
         if (ft == 65) {                      // 棒图
             Bargraph bg = new Bargraph(f.label, f.uiState, 0, 100);
             bg.Limits(20, 80);
-            PvCtrl(app, bg, x, y, PvS(app, 64), PvS(app, 180));
+            PvCtrl(app, bg, x, y, w, avail);
             return;
         }
         if (ft == 66) {                      // 趋势曲线
@@ -2612,14 +2708,14 @@ partial class Designer {
             for (int i = 0; i < 60; i = i + 1) {
                 pen.Push(50 + (i % 20) * 2 - 20);
             }
-            PvCtrl(app, tr, x, y, w, PvS(app, 200));
+            PvCtrl(app, tr, x, y, w, avail);
             return;
         }
         if (ft == 67) {                      // 报警横幅
             AlarmBuffer ab = new AlarmBuffer();
             ab.Raise(Designer.T("PT101", "PT101"), f.label, 2);
             AlarmBanner bn = new AlarmBanner(ab);
-            PvCtrl(app, bn, x, y, w, PvS(app, 32));
+            PvCtrl(app, bn, x, y, w, avail);
             return;
         }
         if (ft == 68) {                      // 报警列表
@@ -2627,13 +2723,13 @@ partial class Designer {
             ab.Raise("PT101", Designer.T("Pressure high", "压力高"), 2);
             ab.Raise("TIC101", Designer.T("Temp warning", "温度偏高"), 1);
             AlarmList al = new AlarmList(ab);
-            PvCtrl(app, al, x, y, w, PvS(app, 200));
+            PvCtrl(app, al, x, y, w, avail);
             return;
         }
         if (ft == 69) {                      // 数字键盘
             NumPad kp = new NumPad();
             kp.SetText("0");
-            PvCtrl(app, kp, x, y, PvS(app, 200), PvS(app, 260));
+            PvCtrl(app, kp, x, y, w, avail);
             return;
         }
         if (ft == 70) {                      // 设备状态卡
@@ -2642,7 +2738,7 @@ partial class Designer {
             IoTag demo = new IoTag(Designer.T("Current", "电流"), "A", 10);
             demo.SetRaw(1234);
             dc.Row(Designer.T("Current", "电流"), demo);
-            PvCtrl(app, dc, x, y, PvS(app, 240), PvS(app, 140));
+            PvCtrl(app, dc, x, y, w, avail);
             return;
         }
         if (ft == 71) {                      // 设备状态面板
@@ -2656,7 +2752,7 @@ partial class Designer {
                 ep.AddDevice(Designer.T("Pump 2", "2# 泵")).Set(2);
                 ep.AddDevice(Designer.T("Fan", "风机")).Set(0);
             }
-            PvCtrl(app, ep, x, y, w, PvS(app, 300));
+            PvCtrl(app, ep, x, y, w, avail);
             return;
         }
         if (ft == 72) {                      // 网页视图

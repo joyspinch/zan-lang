@@ -183,6 +183,17 @@ small-medium 之间**:画廊卡片标题先后用 13/15 都被打回"太小",17 
   Ellipsis 这类静态助手);③App 级全窗(Dialog/Wizard 全窗形态)。
   反例教训:ScrollView 名字像容器,真身是 `ScrollColumn` 背后的
   每帧滚动助手,差点当容器补卡——读类头注释+方法面,别望文生义。
+- **滚轮认领以"真溢出"为前提,不溢出不拦截**(滚动条乱跳的框架级
+  根因,2026-09-16 修):指针在内就 `CaptureWheel` 但内容放得下的
+  容器,会把 offset 钳回 0 空转、白白吃掉本属于外层的一格滚轮;
+  指针扫过这类区域时消费权内外横跳,外层滚动条走走停停、来回蹦,
+  用户感知为"滚轮一滚滚动条乱跳"。框架引擎已内置该门
+  (`Scroll.WheelXY` 双轴、`ScrollView.Begin` 的 `mo0 > 0`),自写
+  `CaptureWheel` 的内容滚动组件(日志/聊天/代码块/文本域/编辑器)
+  必须自带同款溢出门(`maxScroll > 0` 才认领);弹层、图表缩放这类
+  **有意拦截**滚轮的认领不受此限。回归锁定:
+  `conformance_gui_wheel_route` 场景 4(放得下的 flat 容器穿透,
+  外层逐格线性)。
 - `data-if` 只认路径真值,不支持比较表达式;多按钮控制中间区走
   `Nav.Embed`(路由出口:惰性实例化、切走保留、可配临态),别用
   N 个布尔 data-if 硬拼。
@@ -211,14 +222,6 @@ small-medium 之间**:画廊卡片标题先后用 13/15 都被打回"太小",17 
   `app.RenderChrome(title)` 每帧最后叠画,PresentFrame 时 NativeLayer
   把被盖住区域从原生视图裁掉。曾按 600x400 逻辑值直传,150% DPI 屏幕
   上页面只盖住左上 2/3 还压住标题栏,被当成"组件位移 bug"白查一轮。
-- **WebView2 完成回调的参数归引擎所有,不得释放**: 手写 COM 桥里完成
-  handler 收到的结果串(`ExecuteScript` 的 JSON、`AddScript...` 的
-  脚本 id)和 `GetCookies` 的列表指针,Invoke 返回后引擎自己回收——
-  按"方法出参用 CoTaskMemFree"的惯例去释放,轻则堆损坏(0xC0000374,
-  Eval 加一次 Com.Free 即崩),重则过释放 CookieList 后后续 COM 调用
-  在 STA 里永久挂死。只有同步方法调用拿到的出参(get_Source 等)才走
-  `Com.GetString/Com.Free`;completion 参数一律只读。
-
 - **WebView2 完成回调的参数归引擎所有,不得释放**: 手写 COM 桥里完成
   handler 收到的结果串(`ExecuteScript` 的 JSON、`AddScript...` 的
   脚本 id)和 `GetCookies` 的列表指针,Invoke 返回后引擎自己回收——
@@ -294,6 +297,16 @@ small-medium 之间**:画廊卡片标题先后用 13/15 都被打回"太小",17 
   border-bottom 画在控件整框底;页签条内容自然高=theme.heightMedium(34),
   控件 fh 设 44 时两线错开 12px 看着像双下划线。修法是控件 fh 对齐
   heightMedium,不是去改皮肤线位。
+- **设计器画布中控件选中框、默认宽高与预览渲染必须严丝合缝**
+  (Pagination、工业仪表等选区错位与拖拽失效教训):
+  ① `DefaultFreeW(f)` 与 `DefaultFreeH(f)` 必须依据各控件自身真实度量尺寸赋值
+  (如 Pagination 520x36，Switch 50x28，Gauge 160x160)，不可一律兜底成 200x32 导致空旷错位；
+  ② 调色板点击添加(`AddField`)与拖拽添加必须同步赋予正确的 `DefaultFreeW` 和 `DefaultFreeH` 并错落排布；
+  ③ 设计器 `PreviewControl` / `PreviewDisplay` 渲染控件时严禁写死尺寸
+  (如死写 `PvCtrl(..., 160, 160)` 或 `RenderAt(x, y)` 无视 `w`)，必须严格使用设计器传入的 `(w, avail)`，
+  让 8 个缩放手柄拖拽改变大小能够真正实时驱动控件尺寸；
+  ④ 浮层类预览(如 `Popover`、`Popconfirm`)必须在选区原点 `(x, y)` 呈现，禁止硬编码像素偏移；
+  ⑤ 自由画布必须在 `PreviewControl` 外层加 `c.PushClip` 约束，杜绝控件内容意外溢出选区破坏画布。
 - **富文本/自绘文本的默认前景兜底是纯白**(Arpg 深色底习惯):亮色皮肤
   里标记文本没写色码的段落、以及 #W 白/#Y 纯黄这类深底快捷色,画在
   亮底上全部隐形——不是"渲染丢了"。皮肤补
