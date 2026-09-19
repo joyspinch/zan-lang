@@ -3763,6 +3763,18 @@ static zan_co_node *g_rq_head, *g_rq_tail;
 #include <time.h>
 #include <sys/time.h>
 
+typedef long LONG;
+#define GetCurrentThreadId() ((unsigned long)(uintptr_t)pthread_self())
+#ifndef InterlockedIncrement64
+#define InterlockedIncrement64(dst) \
+    (long long)__sync_add_and_fetch((long long volatile *)(dst), 1)
+#endif
+static inline void io_shards_start(int n) { (void)n; }
+static inline void io_shards_stop(void) {}
+
+static volatile LONG g_shards = 1;
+static volatile LONG g_sync_inline = 0;
+
 typedef pthread_mutex_t CRITICAL_SECTION;
 static inline void InitializeCriticalSection(CRITICAL_SECTION *cs) { pthread_mutex_init(cs, NULL); }
 static inline void EnterCriticalSection(CRITICAL_SECTION *cs) { pthread_mutex_lock(cs); }
@@ -3837,6 +3849,9 @@ typedef void* HANDLE;
 #endif
 #ifndef INFINITE
 #define INFINITE 0xFFFFFFFF
+#endif
+#ifndef WINAPI
+#define WINAPI
 #endif
 #endif
 
@@ -4005,8 +4020,13 @@ static void co_wake_shard(int shard) {
 /* Shard a worker waits on. Workers and shards are 1:1 unless ZAN_IO_SHARDS
  * lowered the count, in which case several workers share one port. */
 static int co_worker_shard(int worker) {
+#if defined(_WIN32)
     int n = (int)g_shards;
     return (n <= 1) ? 0 : (worker % n);
+#else
+    (void)worker;
+    return 0;
+#endif
 }
 
 /* Wake one parked worker -- but only when nobody is searching already (that
@@ -4532,12 +4552,13 @@ static long long co_pump_timers(void) {
  * A NULL overlapped is a notification packet: the scheduler's wake (key
  * ZAN_WAKE_KEY) or a DNS completion. */
 static void co_wait_io(zan_co_worker_t *w, long long timeout_ms) {
-    OVERLAPPED_ENTRY entries[64];
-    ULONG removed = 0;
     /* Clamp before the DWORD conversion: a saturated LLONG_MAX timer deadline
      * truncated modulo 2^32 would wake early (or as a bogus small wait). */
     if (timeout_ms > 0x7FFFFFFF) timeout_ms = 0x7FFFFFFF;
     DWORD to = (timeout_ms < 0) ? INFINITE : (DWORD)timeout_ms;
+#if defined(_WIN32)
+    OVERLAPPED_ENTRY entries[64];
+    ULONG removed = 0;
     /* A completion packet whose Post failed left a finished job in
      * g_blocking_done with nothing to announce it. Drain before parking: if
      * that re-readied a coroutine, return so the loop runs it; otherwise block
@@ -4547,15 +4568,8 @@ static void co_wait_io(zan_co_worker_t *w, long long timeout_ms) {
     }
     /* Own shard only: every socket this worker's connections use is bound to
      * it, so their completions arrive here and nowhere else. */
-#if defined(_WIN32)
     BOOL ok = GetQueuedCompletionStatusEx(io_shard(co_worker_shard(w->index)),
                                           entries, 64, &removed, to, FALSE);
-#else
-    int polled = zan_io_pump_timeout(to == INFINITE ? -1 : (int64_t)to);
-    BOOL ok = (polled >= 0);
-    ULONG removed = 0;
-    if (g_co_wake > 0) InterlockedDecrement(&g_co_wake);
-#endif
     /* No longer parked. Dropping this before re-readying the completed
      * coroutines below lets those zan_co_ready calls skip the wake syscall
      * when this worker is the only idle one -- it drains the whole batch
@@ -4619,6 +4633,19 @@ static void co_wait_io(zan_co_worker_t *w, long long timeout_ms) {
         if (step) zan_co_ready(co, step);
         IO_CNT_DEC();
     }
+#else
+    (void)w;
+    int polled = zan_io_pump_timeout(to == INFINITE ? -1 : (int64_t)to);
+    BOOL ok = (polled >= 0);
+    if (g_co_wake > 0) InterlockedDecrement(&g_co_wake);
+    InterlockedExchange(&w->parked, 0);
+    InterlockedDecrement(&g_co_parked);
+    if (!ok) {
+        dns_timeout_scan();
+        rto_timeout_scan();   /* recv-to deadlines past their due */
+        dns_drain();
+    }
+#endif
 }
 
 static int co_all_idle(void) {
@@ -4714,10 +4741,12 @@ static void co_worker(int worker) {
         /* A parked recv-to deadline must wake the worker at its due time or
         * the timeout deliverer only runs on some other turn (rto_wait_ms is
         * rto_timeout_scan's dns_wait_ms twin). */
+#if defined(_WIN32)
         {
             long long rw = rto_wait_ms(-1);
             if (rw >= 0 && rw < to) to = rw;
         }
+#endif
         /* Publish the parked state before the final scan. A producer that
          * pushes first is found by the scan; one that pushes afterward
          * observes g_co_parked > 0 and posts a wake packet. */
