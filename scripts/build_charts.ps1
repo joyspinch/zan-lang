@@ -16,14 +16,22 @@ Write-Output "[1/2] Building native GUI runtime (Win32, static, mingw ABI)..."
 clang --target=x86_64-w64-windows-gnu -O2 -DZAN_GUI_STATIC `
     -c src\runtime\gui_runtime.c -o build\zan_gui_charts_gnu.o
 if ($LASTEXITCODE -ne 0) { throw "RUNTIME_COMPILE_FAILED" }
-llvm-ar rcs build\libzan_gui_charts_gnu.a build\zan_gui_charts_gnu.o
+clang++ --target=x86_64-w64-windows-gnu -O2 -DZAN_GUI_STATIC `
+    -fno-exceptions -fno-rtti `
+    -c src\runtime\gui_runtime_dwrite.cpp -o build\zan_gui_dwrite_charts_gnu.o
+if ($LASTEXITCODE -ne 0) { throw "RUNTIME_DWRITE_COMPILE_FAILED" }
+llvm-ar rcs build\libzan_gui_charts_gnu.a build\zan_gui_charts_gnu.o build\zan_gui_dwrite_charts_gnu.o
 if ($LASTEXITCODE -ne 0) { throw "RUNTIME_LIB_FAILED" }
 
 Write-Output "[2/2] Compiling and linking charts_test.exe..."
 $files = @()
 $files += (Get-ChildItem stdlib\Gui\*.zan).FullName
 $files += (Get-ChildItem stdlib\Gui\Widget\*.zan).FullName
-$files += (Get-ChildItem stdlib\Gui\Component\Chart\*.zan).FullName
+$chartDir = "packages\Zan.Gui.Charts\src\Gui\Component\Chart"
+if (-not (Test-Path $chartDir)) {
+    $chartDir = "stdlib\Gui\Component\Chart"
+}
+$files += (Get-ChildItem $chartDir\*.zan).FullName
 $files += (Get-ChildItem examples\gui_charts\*.zan).FullName
 $files += (Join-Path (Get-Location) "examples\gui_gallery\MapChinaData.zan")
 
@@ -45,7 +53,7 @@ $zanArgs += @("--libpath", "build", "--link-lib", "zan_gui_charts_gnu")
 $zanArgs += @("--link-lib", "ws2_32", "--link-lib", "mswsock")
 $zanArgs += @("--link-lib", "psapi", "--link-lib", "advapi32")
 $zanArgs += @("--link-lib", "dwmapi", "--link-lib", "gdi32", "--link-lib", "imm32")
-$zanArgs += @("--link-lib", "user32", "--link-lib", "rpcrt4", "--link-lib", "ole32")
+$zanArgs += @("--link-lib", "user32", "--link-lib", "rpcrt4", "--link-lib", "ole32", "--link-lib", "dwrite")
 $zanArgs += @("--icon", (Join-Path (Get-Location) "assets\zan.ico"))
 # zanc 的进度杂音走 stderr；EAP=Stop 会把首个 stderr 行升级成
 # NativeCommandError 并在 zanc 跑完前掐断管道（exe 不会重链）。

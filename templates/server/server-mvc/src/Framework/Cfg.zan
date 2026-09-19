@@ -7,6 +7,7 @@ namespace ZanWeb;
 /* [server] 配置。*/
 class ServerCfg {
     string name;
+    string mode;
     string host;
     int port;
     int maxBodyMB;
@@ -16,11 +17,60 @@ class ServerCfg {
     static ServerCfg Defaults() {
         ServerCfg c = new ServerCfg();
         c.name = "{{NAME}}";
+        c.mode = "full";
         c.host = "127.0.0.1";
         c.port = 8080;
         c.maxBodyMB = 2;
         c.uploadBodyMB = 64;
         c.globalLimitPerSec = 0;
+        return c;
+    }
+}
+
+/* [database.readOnly] 只读从库配置：开启后读写分离，查询借用从库连接池，写与事务走主库。*/
+class DatabaseReadOnlyCfg {
+    bool enabled;
+    string driver;
+    string sqlitePath;
+    string host;
+    int port;
+    string name;
+    string user;
+    string password;
+    int poolSize;
+
+    static DatabaseReadOnlyCfg Defaults() {
+        DatabaseReadOnlyCfg c = new DatabaseReadOnlyCfg();
+        c.enabled = false;
+        c.driver = "sqlite";
+        c.sqlitePath = "app.db";
+        c.host = "127.0.0.1";
+        c.port = 3306;
+        c.name = "app";
+        c.user = "root";
+        c.password = "";
+        c.poolSize = 8;
+        return c;
+    }
+}
+
+/* [cors] 跨域资源共享配置。*/
+class CorsCfg {
+    bool enabled;
+    string allowOrigin;
+    string allowMethods;
+    string allowHeaders;
+    bool allowCredentials;
+    int maxAge;
+
+    static CorsCfg Defaults() {
+        CorsCfg c = new CorsCfg();
+        c.enabled = true;
+        c.allowOrigin = "*";
+        c.allowMethods = "GET, POST, PUT, DELETE, OPTIONS";
+        c.allowHeaders = "Content-Type, Authorization, X-Request-Id";
+        c.allowCredentials = false;
+        c.maxAge = 86400;
         return c;
     }
 }
@@ -36,6 +86,7 @@ class DatabaseCfg {
     string password;
     /* 每个 worker 进程独立池的最大连接数；全服务最多 poolSize * worker.count。*/
     int poolSize;
+    DatabaseReadOnlyCfg readOnly;
 
     static DatabaseCfg Defaults() {
         DatabaseCfg c = new DatabaseCfg();
@@ -47,6 +98,7 @@ class DatabaseCfg {
         c.user = "root";
         c.password = "";
         c.poolSize = 8;
+        c.readOnly = DatabaseReadOnlyCfg.Defaults();
         return c;
     }
 }
@@ -156,6 +208,34 @@ class CacheCfg {
     }
 }
 
+/* [job] 配置：定时任务调度器。*/
+class JobCfg {
+    bool enabled;
+
+    static JobCfg Defaults() {
+        JobCfg c = new JobCfg();
+        c.enabled = true;
+        return c;
+    }
+}
+
+/* [cluster] 配置：跨物理节点状态同步总线。
+   enabled: false（默认保持单机高性能共享内存 PermTable + 本地 verUids，零网络开销）。
+   当多机集群部署时设为 true，自动启用 Redis Pub/Sub 广播状态失效事件。*/
+class ClusterCfg {
+    bool enabled;
+    string bus;
+    string channel;
+
+    static ClusterCfg Defaults() {
+        ClusterCfg c = new ClusterCfg();
+        c.enabled = false;
+        c.bus = "redis";
+        c.channel = "zanweb:cluster:events";
+        return c;
+    }
+}
+
 /* 运行时配置：启动时从 config/app.json 加载一次为全局强类型实体，通过 Cfg.Server.port 等直接访问。无编译期固化，改配置后重启生效。*/
 class Cfg {
     static ServerCfg Server = ServerCfg.Defaults();
@@ -165,6 +245,9 @@ class Cfg {
     static CacheCfg Cache = CacheCfg.Defaults();
     static AuthCfg Auth = AuthCfg.Defaults();
     static MetricsCfg Metrics = MetricsCfg.Defaults();
+    static JobCfg Job = JobCfg.Defaults();
+    static ClusterCfg Cluster = ClusterCfg.Defaults();
+    static CorsCfg Cors = CorsCfg.Defaults();
     static bool loaded = false;
 
     /* 依次查找约定的配置文件，找到后叠加到内置默认值之上。*/
@@ -211,6 +294,16 @@ class Cfg {
         Cfg.Cache.redisPort = Cfg.EnvInt("ZAN_REDIS_PORT", Cfg.Cache.redisPort);
         Cfg.Worker.count = Cfg.EnvInt("ZAN_WORKERS", Cfg.Worker.count);
         Cfg.Auth.secret = Cfg.EnvStr("ZAN_AUTH_SECRET", Cfg.Auth.secret);
+        Cfg.Job.enabled = Cfg.EnvBool("ZAN_JOB_ENABLED", Cfg.Job.enabled);
+        Cfg.Cluster.enabled = Cfg.EnvBool("ZAN_CLUSTER_ENABLED", Cfg.Cluster.enabled);
+    }
+
+    static bool EnvBool(string name, bool fallback) {
+        string v = ProcessHost.Env(name);
+        if (v.Length == 0) { return fallback; }
+        if (v == "1" || v == "true" || v == "TRUE") { return true; }
+        if (v == "0" || v == "false" || v == "FALSE") { return false; }
+        return fallback;
     }
 
     static string EnvStr(string name, string fallback) {
@@ -237,6 +330,7 @@ class Cfg {
     static void Apply(JsonValue root) {
         JsonValue s = Cfg.Sec(root, "server");
         Cfg.Server.name = s.Str("name", Cfg.Server.name);
+        Cfg.Server.mode = s.Str("mode", Cfg.Server.mode);
         Cfg.Server.host = s.Str("host", Cfg.Server.host);
         Cfg.Server.port = s.Int("port", Cfg.Server.port);
         Cfg.Server.maxBodyMB = s.Int("maxBodyMB", Cfg.Server.maxBodyMB);
@@ -252,6 +346,17 @@ class Cfg {
         Cfg.Db.user = d.Str("user", Cfg.Db.user);
         Cfg.Db.password = d.Str("password", Cfg.Db.password);
         Cfg.Db.poolSize = d.Int("poolSize", Cfg.Db.poolSize);
+
+        JsonValue ro = Cfg.Sec(d, "readOnly");
+        Cfg.Db.readOnly.enabled = ro.Bool("enabled", Cfg.Db.readOnly.enabled);
+        Cfg.Db.readOnly.driver = ro.Str("driver", Cfg.Db.readOnly.driver);
+        Cfg.Db.readOnly.sqlitePath = ro.Str("sqlitePath", Cfg.Db.readOnly.sqlitePath);
+        Cfg.Db.readOnly.host = ro.Str("host", Cfg.Db.readOnly.host);
+        Cfg.Db.readOnly.port = ro.Int("port", Cfg.Db.readOnly.port);
+        Cfg.Db.readOnly.name = ro.Str("name", Cfg.Db.readOnly.name);
+        Cfg.Db.readOnly.user = ro.Str("user", Cfg.Db.readOnly.user);
+        Cfg.Db.readOnly.password = ro.Str("password", Cfg.Db.readOnly.password);
+        Cfg.Db.readOnly.poolSize = ro.Int("poolSize", Cfg.Db.readOnly.poolSize);
 
         JsonValue w = Cfg.Sec(root, "worker");
         Cfg.Worker.count = w.Int("count", Cfg.Worker.count);
@@ -286,5 +391,21 @@ class Cfg {
 
         JsonValue a = Cfg.Sec(root, "auth");
         Cfg.Auth.secret = a.Str("secret", Cfg.Auth.secret);
+
+        JsonValue j = Cfg.Sec(root, "job");
+        Cfg.Job.enabled = j.Bool("enabled", Cfg.Job.enabled);
+
+        JsonValue cl = Cfg.Sec(root, "cluster");
+        Cfg.Cluster.enabled = cl.Bool("enabled", Cfg.Cluster.enabled);
+        Cfg.Cluster.bus = cl.Str("bus", Cfg.Cluster.bus);
+        Cfg.Cluster.channel = cl.Str("channel", Cfg.Cluster.channel);
+
+        JsonValue co = Cfg.Sec(root, "cors");
+        Cfg.Cors.enabled = co.Bool("enabled", Cfg.Cors.enabled);
+        Cfg.Cors.allowOrigin = co.Str("allowOrigin", Cfg.Cors.allowOrigin);
+        Cfg.Cors.allowMethods = co.Str("allowMethods", Cfg.Cors.allowMethods);
+        Cfg.Cors.allowHeaders = co.Str("allowHeaders", Cfg.Cors.allowHeaders);
+        Cfg.Cors.allowCredentials = co.Bool("allowCredentials", Cfg.Cors.allowCredentials);
+        Cfg.Cors.maxAge = co.Int("maxAge", Cfg.Cors.maxAge);
     }
 }

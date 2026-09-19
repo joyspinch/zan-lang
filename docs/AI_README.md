@@ -53,7 +53,7 @@ AGENTS.md            AI 在 Zan 项目里必须守的规矩（短，先读它）
 | 改之前评估影响 | `zan_find_refs`（谁引用它/谁继承它/多少是测试）、`zan_change_impact`（引用 + 受影响的路由和表）、`zan_project_overview`（工程全貌：模块/路由/实体） |
 | 服务器工程 | `zan_route_lookup`（URL→action→权限门）、`zan_orm_lookup`（实体→表→列→门面） |
 | 验证——说完要能证 | `zan_compile`（编译一个片段，返回结构化诊断）、`zan_build_project`（编译整个工程） |
-| 示例与表单 | `zan_example`（可编译的官方示例，带目录）、`zan_form_schema`（控件 PropSpec 目录：schema + Props/Events；资源名沿用历史 zform.json，与已删的 .zform 设计稿格式无关） |
+| 控件规格与示例 | `zan_example`（可编译的官方示例，带目录）、`zan_control_schema` / `zan_form_schema`（控件 PropSpec 目录：schema + Props/Events 规格；资源兼容 controls.json / zform.json） |
 | 文件与检索 | `list_dir` `read_file` `write_file` `edit_file` `search_text` `find_files` `run_command`、`mkdir`/`move_path`/`copy_path`/`delete_path`/`stat_path` |
 | 索引维护 | `zan_refresh_index`（加过控制器/实体后重建语义索引）、`zan_refresh_knowledge`（重建 gallery/zform） |
 | 技能 | `skills_list`（名字+一行摘要）、`skill_read`（读选中那一个的正文） |

@@ -21,9 +21,9 @@
 cmake_policy(SET CMP0007 NEW)
 
 set(_budget
-  "stdlib/Gui/Style.zan=15"
-  "stdlib/Gui/Theme.zan=15"
-  "stdlib/Gui/StyleBox.zan=1"
+  "stdlib/Gui/Styling/Style.zan=15"
+  "stdlib/Gui/Styling/Theme.zan=15"
+  "stdlib/Gui/Styling/StyleBox.zan=1"
   "stdlib/Gui/Backend/UiDriver.zan=5"
   "stdlib/Gui/Component/Chart/ChartResolved.zan=1"
   "stdlib/Gui/Component/CodeEditor/CodeEditor.zan=1"

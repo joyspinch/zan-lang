@@ -19,9 +19,15 @@ if (-not $Output) {
 $Output = [IO.Path]::GetFullPath($Output)
 New-Item -ItemType Directory -Force $Output | Out-Null
 $sources = @(Get-ChildItem (Join-Path $project 'src/*.zan') -File | Sort-Object Name | ForEach-Object { $_.FullName })
+# 设计稿排在整个源单最后：zanc 只把生成的 Main() 给第一个编译输入
+# （genrun.c 的 emitMain=paths[0]），而本游戏自管生命周期、main.zan
+# 里手写 Main —— App.html 绝不能当第一输入。
+$design = Join-Path $project 'src/App.html'
+if (Test-Path $design) { $sources += $design }
 $args = @($sources) + @('--auto-stdlib', '--subsystem', 'windows')
 if ($Stdlib) { $args += @('--stdlib-path', $Stdlib) }
 if ($Development) {
+    Write-Host "DBG-DEV-MODE project=$project"
     Copy-Item (Join-Path $project 'data') (Join-Path $Output 'data') -Recurse -Force
 } else {
     $packed = Join-Path (Split-Path -Parent $Output) 'protected-tables'

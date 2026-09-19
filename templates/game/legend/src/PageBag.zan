@@ -17,6 +17,12 @@ partial class LegendApp {
     /// 下段当前 tab：0=取出 1=说明 2=天书 3=内功 4=宝石 5=技能
     int bagTab = 0;
 
+    /// 仓库视图：whMode=物品栏切到仓库（联机读服务端 wh 行，离线读
+    /// `g.storage`）；whPick=入库选择模式（点背包物品整叠入库）。
+    /// 加锁/使用(A) 无对应玩法后端，本轮保持诚实占位（提示进聊天）。
+    bool whMode = false;
+    bool whPick = false;
+
     /* ---- 本页局部实测尺寸 ----
        尺寸常量全在 `Spec.Bag*`（唯一事实来源，逻辑像素 → Spec.Px 设备
        像素），页面里不再写死像素值。 */
@@ -93,6 +99,10 @@ partial class LegendApp {
         acts.Gap(Spec.BagActGap()); acts.Prefer(Spec.BagActW(), 0); top.With(acts);
         string[] labels = new string[] { "切换仓库", "入库(F)", "加锁", "使用(A)",
                             "整理", "放入图鉴", "一键熔炼", "卖出(X)" };
+        /* 视图状态直接落在按钮文字上：仓库视图 / 入库选择模式一眼可见，
+           不引入新皮肤类（.bag-act 的样式面保持原样）。 */
+        if (this.whMode) { labels[0] = "返回背包"; }
+        if (this.whPick) { labels[1] = "入库中…"; }
         for (int i = 0; i < 8; i = i + 1) {
             if (i == 6) {
                 Panel sep = Panel.Row(); sep.Prefer(0, Spec.BagActBigGap());
@@ -129,10 +139,49 @@ partial class LegendApp {
 
     /// 物品栏里第 i 格（行优先，0 起）：有道具画道具，没有就什么都不画
     /// （格的暗底与边线由背景图 `00083.jpg` 提供）。
+    /// 联机 live-first：背包/仓库格直接读服务端行（PageRecycle 同款），
+    /// 离线才读本地存档 `g.bag`/`g.storage`。有道具的格子可点：
+    /// 入库选择模式点背包物品=入库，仓库视图点物品=取回。
     Panel BagCellView(int i, int w, int h) {
+        if (net.Self() != null) {
+            JsonValue b = whMode ? net.WhAt(i) : net.BagAt(i);
+            if (b == null) { return SlotArt(w, h, "", "", ""); }
+            Panel c = ItemArtCell(w, h, b.Int("id", 0), b.Int("count", 1));
+            int idx = i;
+            c.OnClick(() => { BagCellTap(idx); });
+            return c;
+        }
         Equipment e = null;
-        if (g != null && i >= 0 && i < g.bag.Count) { e = g.bag[i]; }
-        return EquipArt(w, h, e);
+        if (whMode) { if (i >= 0 && i < g.storage.Count) { e = g.storage[i]; } }
+        else if (g != null && i >= 0 && i < g.bag.Count) { e = g.bag[i]; }
+        Panel p = EquipArt(w, h, e);
+        if (e != null) { int idx = i; p.OnClick(() => { BagCellTap(idx); }); }
+        return p;
+    }
+
+    /// 服务端物品行（id+count）→ 主物品栏格：只叠图标+角标（同 EquipArt
+    /// 的画法，不带 00211 石框——主格的框画在 00083 整图里）。
+    Panel ItemArtCell(int wDevice, int hDevice, int itemId, int count) {
+        string art = itemId > 0 ? ItemArtById(itemId) : "";
+        return SlotArt(wDevice, hDevice, art,
+            count > 1 ? Rules.N(count) : "", "slot-badge");
+    }
+
+    /// 物品栏点击：入库选择模式点背包物品=整叠入库；仓库视图点物品=
+    /// 整叠取回。其余情况不动作（穿戴/详情弹窗未还原，不假装有）。
+    void BagCellTap(int i) {
+        if (net.Self() != null) {
+            JsonValue b = whMode ? net.WhAt(i) : net.BagAt(i);
+            if (b == null) { return; }
+            int itemId = b.Int("id", 0);
+            int count = b.Int("count", 1);
+            if (itemId <= 0 || count <= 0) { return; }
+            if (whMode) { net.WhMove(itemId, count, false); }
+            else if (whPick) { net.WhMove(itemId, count, true); }
+            return;
+        }
+        if (whMode) { g.Store(i, true); this.Rebuild(); }
+        else if (whPick) { g.Store(i, false); this.Rebuild(); }
     }
 
     // =====================================================================
@@ -468,17 +517,44 @@ partial class LegendApp {
         return r;
     }
 
-    /// 8 个竖排功能钮的回调。原版功能键对应动作如下（无后端时全
-    /// 走 g.Log；联机时走 net.* op）。下标 = 上方 labels[] 顺序。
+    /// 8 个竖排功能钮的回调。已实装的：切换仓库（双源视图，联机顺手
+    /// 守卫拉一次 wh）、入库(F)（选择模式开关）、整理（离线
+    /// `g.SortInventory`，联机背包顺序由服务端保管不动）。加锁/使用(A)/
+    /// 放入图鉴/一键熔炼/卖出(X) 尚无对应玩法后端，保持诚实占位
+    /// （提示进聊天，不假装成功）。下标 = 上方 labels[] 顺序。
     void BagAct(int idx) {
-        if (idx == 0) { if (net.Self() != null) { net.AddChat("[系统]", "切换仓库。"); return; } g.Log("切换仓库"); return; }
-        if (idx == 1) { if (net.Self() != null) { net.AddChat("[系统]", "入库(F)。"); return; } g.Log("入库(F)"); return; }
-        if (idx == 2) { if (net.Self() != null) { net.AddChat("[系统]", "加锁/解锁。"); return; } g.Log("加锁/解锁"); return; }
-        if (idx == 3) { if (net.Self() != null) { net.AddChat("[系统]", "使用(A)。"); return; } g.Log("使用(A)"); return; }
-        if (idx == 4) { if (net.Self() != null) { net.AddChat("[系统]", "整理背包。"); return; } g.Log("整理背包"); return; }
-        if (idx == 5) { if (net.Self() != null) { net.AddChat("[系统]", "放入图鉴。"); return; } g.Log("放入图鉴"); return; }
-        if (idx == 6) { if (net.Self() != null) { net.AddChat("[系统]", "一键熔炼。"); return; } g.Log("一键熔炼"); return; }
-        if (net.Self() != null) { net.AddChat("[系统]", "卖出(X)。"); return; }
-        g.Log("卖出(X)");
+        bool online = net.Self() != null;
+        if (idx == 0) {
+            this.whMode = !this.whMode;
+            this.whPick = false;
+            if (online) { net.MaybeRefreshWh(); }
+            this.Rebuild();
+            return;
+        }
+        if (idx == 1) {
+            if (this.whMode) {
+                string tip = "仓库视图：点物品取回背包；入库请先返回背包。";
+                if (online) { net.AddChat("[系统]", tip); } else { g.Log(tip); }
+                return;
+            }
+            this.whPick = !this.whPick;
+            string msg = this.whPick ? "入库模式：点背包物品整叠存入仓库，再点「入库中…」退出。"
+                                     : "入库模式已关闭。";
+            if (online) { net.AddChat("[系统]", msg); } else { g.Log(msg); }
+            this.Rebuild();
+            return;
+        }
+        if (idx == 4) {
+            if (online) { net.AddChat("[系统]", "联机背包顺序由服务器保管，无需整理。"); return; }
+            g.SortInventory(this.whMode);
+            this.Rebuild();
+            return;
+        }
+        string stub = idx == 2 ? "加锁/解锁。"
+            : idx == 3 ? "使用(A)。"
+            : idx == 5 ? "放入图鉴。"
+            : idx == 6 ? "一键熔炼。" : "卖出(X)。";
+        if (online) { net.AddChat("[系统]", stub); return; }
+        g.Log(stub);
     }
 }

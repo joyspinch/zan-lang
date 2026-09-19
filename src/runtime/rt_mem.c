@@ -524,7 +524,7 @@ void *__wrap_realloc(void *p, size_t n) {
      * list (use-after-free) or whose header is garbage must abort, not hand
      * the caller a block that some other owner may already hold. */
     uint32_t cls;
-    if (zan_mem_hdr_check(p, &cls) != 0) return p;   /* not a block start: leave it alone */
+    if (zan_mem_hdr_check(p, &cls) != 0) return NULL;  /* not a block start: cannot realloc */
     size_t old = k_class_size[cls];
     if (n <= old) return p;
     void *np = __wrap_malloc(n);

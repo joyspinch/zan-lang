@@ -38,6 +38,7 @@ struct zan_diag {
      * When capture is enabled, diagnostics are stored in `entries` and the
      * usual stderr rendering is suppressed. */
     bool              capture;
+    bool              treat_warnings_as_errors;
     zan_diag_entry_t *entries;
     int               entry_count;
     int               entry_cap;
@@ -54,6 +55,7 @@ struct zan_diag {
 };
 
 zan_diag_t *zan_diag_new(zan_arena_t *arena);
+void zan_diag_set_deny_warnings(zan_diag_t *diag, bool enabled);
 void zan_diag_add_file(zan_diag_t *diag, const char *name, const char *source);
 void zan_diag_emit(zan_diag_t *diag, zan_diag_level_t level, zan_loc_t loc,
                    const char *fmt, ...);

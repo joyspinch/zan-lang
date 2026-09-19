@@ -30,6 +30,8 @@ for pair in linux-musl:x86_64 linux-arm64:aarch64 linux-riscv64:riscv64; do
     # non-PIC object emits.
     "$ZIG" cc -target "$arch-linux-musl" -g0 -DZAN_IO_STACKLESS_ONLY -fPIC \
         -I "$RT" -O2 -c "$RT/rt_io.c" -o "$out/zanrt_io.o"
+    "$ZIG" cc -target "$arch-linux-musl" -g0 -DZAN_IO_STACKLESS_ONLY -DZAN_CO_DRIVER -fPIC \
+        -I "$RT" -O2 -c "$RT/rt_io.c" -o "$out/zanrt_io_mt.o"
     "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 -fPIC \
         -I "$RT" -O2 -c "$RT/rt_sync.c" -o "$out/zanrt_sync.o"
     # File metadata / stream IO runtime (zan_file_*), linked by any program

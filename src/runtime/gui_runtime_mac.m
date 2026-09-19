@@ -764,6 +764,10 @@ EXPORT i32 zan_gui_present_dirty_add(i32 x, i32 y, i32 w, i32 h) {
     return 0;
 }
 
+EXPORT void zan_gui_present_full(void) {
+    /* macOS draws full surface on every swap; parity stub */
+}
+
 /* Re-center a window on the screen it currently sits on. */
 EXPORT i32 zan_gui_center_window(iptr hwnd_val) {
     zan_mwin_t *mw = mwin_find((long)hwnd_val);
@@ -782,11 +786,14 @@ EXPORT i32 zan_gui_center_window(iptr hwnd_val) {
 }
 
 EXPORT i32 zan_gui_event_kind(void)    { return g_evt[0]; }
+static i64 g_ev_seq_mac = 1;
+EXPORT i64 zan_gui_event_seq(void)     { return g_ev_seq_mac; }
 EXPORT i32 zan_gui_event_x(void)       { return g_evt[1]; }
 EXPORT i32 zan_gui_event_y(void)       { return g_evt[2]; }
 EXPORT i32 zan_gui_event_button(void)  { return g_evt[3]; }
 EXPORT i32 zan_gui_event_keycode(void) { return g_evt[4]; }
 EXPORT i32 zan_gui_event_mods(void)    { return g_evt[5]; }
+EXPORT i32 zan_gui_event_flag(void)    { return 0; }
 EXPORT iptr zan_gui_event_hwnd(void)    { return (iptr)g_evt[6]; }
 
 /* ---- native text rendering ---- */
@@ -984,6 +991,20 @@ EXPORT i32 zan_gui_font_height(i32 font_size) {
                      CTFontGetLeading(font);
     CFRelease(font);
     i64 r = (i64)ceil(height);
+    if (idx >= 0) cached[idx] = r;
+    return r;
+}
+
+EXPORT i32 zan_gui_font_ascent(i32 font_size) {
+    enum { MAXSZ = 128 };
+    static i32 cached[MAXSZ];
+    int idx = (font_size > 0 && font_size < MAXSZ) ? (int)font_size : -1;
+    if (idx >= 0 && cached[idx]) return cached[idx];
+    CTFontRef font = zan_font(font_size);
+    if (!font) return 0;
+    CGFloat ascent = CTFontGetAscent(font);
+    CFRelease(font);
+    i32 r = (i32)ceil(ascent);
     if (idx >= 0) cached[idx] = r;
     return r;
 }

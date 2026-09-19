@@ -40,6 +40,7 @@ GUI = ["src/runtime/gui_runtime.c", "src/runtime/gui_runtime_text.c",
 # bundle the platform's X11/freetype and are still built by hand, only report.
 ARTIFACTS = [
     ("toolchain/linux-musl/zanrt_io.o", RT_IO, "runtime"),
+    ("toolchain/linux-musl/zanrt_io_mt.o", RT_IO, "runtime"),
     ("toolchain/linux-musl/zanrt_sync.o", RT_SYNC, "runtime"),
     ("toolchain/linux-musl/zanrt_file.o", RT_FILE, "runtime"),
     ("toolchain/linux-arm64/zanrt_io.o", RT_IO, "runtime"),

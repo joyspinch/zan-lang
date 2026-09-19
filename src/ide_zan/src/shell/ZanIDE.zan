@@ -342,11 +342,7 @@ partial class ZanIDE {
                 app.RequestRedraw();
             } else if (kc == 123 && !designerMode && dbgState == 0) {
                 // F12 = Go to Definition
-                if (lspSess == null && !lspTried) {
-                    lspTried = true;
-                    lspSess = LspSession.Start(root);
-                    if (lspSess != null) { log.Add("> zan-lsp connected: semantic navigation enabled."); }
-                }
+                this.EnsureLsp();
                 string navW_gl12 = editor.WordAtCaret();
                 this.RememberTabView();
                 int gl12 = ZanIDE.GoToDefinitionSmart(lspSess, editor, tabs, activeTab, root, log);
@@ -574,6 +570,10 @@ partial class ZanIDE {
     /// 的时候各处照旧调 RequestRedraw，整窗帧一帧都没少。面板被收起
     /// （停到屏外）时范围为空，这一拍就只跑轮询逻辑、几乎不画东西。
     void PollNextIn(App app, int ms, Rect r) {
+        if (r == null || r.x < 0 || r.y < 0 || r.width <= 0 || r.height <= 0) {
+            app.RequestAnimationFrame(ms);
+            return;
+        }
         app.RequestAnimationFrameIn(ms, r.x, r.y, r.width, r.height);
     }
 
@@ -685,7 +685,13 @@ partial class ZanIDE {
             if (designerMode) {
                 List<FormField> flatSig = new List<FormField>();
                 ZanIDE.FlattenFields(formDesigner.fields, flatSig);
-                newSig = "F:" + Convert.ToString(stActTab) + ":" + Convert.ToString(flatSig.Count);
+                int nameHash = 0;
+                for (int fi = 0; fi < flatSig.Count; fi = fi + 1) {
+                    FormField ff = flatSig[fi];
+                    nameHash = nameHash * 31 + ff.fname.Length + ff.label.Length + ff.dockSide;
+                    if (ff.fname.Length > 0) { nameHash = nameHash + Convert.ToInt(ff.fname[0]); }
+                }
+                newSig = "F:" + Convert.ToString(stActTab) + ":" + Convert.ToString(flatSig.Count) + ":" + Convert.ToString(nameHash);
             } else if (sceneMode) {
                 newSig = "S:" + Convert.ToString(stActTab) + ":"
                     + Convert.ToString(sceneDesigner.doc.Count()) + ":"
@@ -785,6 +791,7 @@ partial class ZanIDE {
                     // language: an embedded .lua/.py script is not Zan.
                     editor.SetSyntaxLang(
                         CodeEditor.LangForName(tabs[act].path));
+                    editor.documentPath = tabs[act].path;
                     editor.LoadText(tabs[act].body);
                     // Feed the project's other sources to the editor so it
                     // can resolve cross-file types (a `Utils` class in
@@ -1136,11 +1143,7 @@ partial class ZanIDE {
                 }
                 // Ctrl+click in the editor requests Go to Definition.
                 if (editor.ConsumeGotoRequest()) {
-                    if (lspSess == null && !lspTried) {
-                        lspTried = true;
-                        lspSess = LspSession.Start(root);
-                        if (lspSess != null) { log.Add("> zan-lsp connected: semantic navigation enabled."); }
-                    }
+                    this.EnsureLsp();
                     string navW_glc = editor.WordAtCaret();
                     this.RememberTabView();
                     int glc = ZanIDE.GoToDefinitionSmart(lspSess, editor, tabs, activeTab, root, log);
@@ -1752,26 +1755,18 @@ partial class ZanIDE {
                     if (pj.ok) {
                         log.Add(ZanIDE.T("> Packaging completed.",
                                          "> 发布产物打包完成。"));
+                        log.Add(ZanIDE.T("> Publishing completed.",
+                                         "> 发布完成。"));
                     }
-                    pubPacking = false;
-                    pubBusy = false;
-                    pubPackStartMs = 0;
-                    pubExes = new List<string>();
-                    coLog.Reset();
-                    app.RequestRedraw();
+                    this.FinishPublish(pj.ok);
                 } else if (pubPackStartMs != 0
                     && Window.GetTickMs() - pubPackStartMs > 600000) {
                     string stage = PubPack.Stage();
-                    pubPacking = false;
-                    pubBusy = false;
-                    pubPackStartMs = 0;
-                    pubExes = new List<string>();
                     log.Add(ZanIDE.T("> Packaging timed out at: ",
                                      "> 打包超时，停在：") + stage);
-                    coLog.Reset();
-                    app.RequestRedraw();
+                    this.FinishPublish(false);
                 } else {
-                    this.PollNextIn(app, 250, orr);
+                    this.PollNextIn(app, 250, null);
                 }
             } else if (pubBusy) {
                 int pubConsumed = ZanIDE.PubPoll(pubLogLen, log);
@@ -1804,39 +1799,44 @@ partial class ZanIDE {
                     // is a window that stops pumping messages, i.e. "ZanIDE
                     // (not responding)" at the end of every macOS publish, so
                     // it runs on its own thread and this loop polls it.
-                    int packStart = PubPack.Start(pubRoot, pubExes, pubPacked);
-                    if (packStart == 1) {
-                        pubPacking = true;
-                        pubPackStartMs = Window.GetTickMs();
-                        log.Add(ZanIDE.T("> Packaging the published output ...",
-                                         "> 正在打包发布产物 ..."));
-                    } else if (packStart == 0) {
-                        PubPack.PackNow(pubRoot, pubExes, pubPacked, log);
-                        pubBusy = false;
-                        pubPackStartMs = 0;
-                        pubExes = new List<string>();
+                    if (pubOk > 0 && PubPack.NeedsPackaging(pubRoot, pubExes, pubPacked)) {
+                        int packStart = PubPack.Start(pubRoot, pubExes, pubPacked);
+                        if (packStart == 1) {
+                            pubPacking = true;
+                            pubPackStartMs = Window.GetTickMs();
+                            log.Add(ZanIDE.T("> Packaging the published output ...",
+                                             "> 正在打包发布产物 ..."));
+                        } else if (packStart == 0) {
+                            PubPack.PackNow(pubRoot, pubExes, pubPacked, log);
+                            log.Add(ZanIDE.T("> Publishing completed.",
+                                             "> 发布完成。"));
+                            this.FinishPublish(true);
+                        } else {
+                            log.Add(ZanIDE.T(
+                                "> The previous packaging worker is still running; "
+                                    + "this publish was not packaged.",
+                                "> 上一次超时的打包线程仍在运行，本次未继续打包。"));
+                            this.FinishPublish(false);
+                        }
+                    } else if (pubOk > 0) {
+                        log.Add(ZanIDE.T("> Publishing completed.",
+                                         "> 发布完成。"));
+                        this.FinishPublish(true);
                     } else {
-                        pubBusy = false;
-                        pubPackStartMs = 0;
-                        pubExes = new List<string>();
-                        log.Add(ZanIDE.T(
-                            "> The previous packaging worker is still running; "
-                                + "this publish was not packaged.",
-                            "> 上一次超时的打包线程仍在运行，本次未继续打包。"));
+                        log.Add(ZanIDE.T("> Publishing failed.",
+                                         "> 发布失败。"));
+                        this.FinishPublish(false);
                     }
-                    coLog.Reset();
-                    app.RequestRedraw();
                 }
                 if (pubBusy && !pubPacking && pubStartMs != 0
                     && Window.GetTickMs() - pubStartMs > 1800000) {
-                    pubBusy = false;
-                    pubExes = new List<string>();
                     log.Add(ZanIDE.T("> Publish timed out; no result reported.",
                                      "> 发布超时，未拿到结果。"));
-                    coLog.Reset();
-                    app.RequestRedraw();
+                    this.FinishPublish(false);
                 }
-                this.PollNextIn(app, 250, orr);
+                if (pubBusy) {
+                    this.PollNextIn(app, 250, null);
+                }
             }
             app.PerfMark("sh.pubpoll");
             // Poll the in-flight AI request. The Net worker thread streams
@@ -2260,22 +2260,14 @@ partial class ZanIDE {
                 }
                 else if (ecmd == "gotoline") { findMode = 3; app.RequestRedraw(); }
                 else if (ecmd == "gotodef") {
-                    if (lspSess == null && !lspTried) {
-                        lspTried = true;
-                        lspSess = LspSession.Start(root);
-                        if (lspSess != null) { log.Add("> zan-lsp connected: semantic navigation enabled."); }
-                    }
+                    this.EnsureLsp();
                     string navW_gl = editor.WordAtCaret();
                     this.RememberTabView();
                     int gl = ZanIDE.GoToDefinitionSmart(lspSess, editor, tabs, activeTab, root, log);
                     this.ApplyGotoResult(gl, navW_gl);
                     app.RequestRedraw();
                 } else if (ecmd == "findrefs") {
-                    if (lspSess == null && !lspTried) {
-                        lspTried = true;
-                        lspSess = LspSession.Start(root);
-                        if (lspSess != null) { log.Add("> zan-lsp connected: semantic navigation enabled."); }
-                    }
+                    this.EnsureLsp();
                     this.ShowReferences();
                     app.RequestRedraw();
                 }
@@ -2585,6 +2577,7 @@ partial class ZanIDE {
             // and below the transient feedback queues.
             app.BeginIdScope(940000);
             this.RenderDocDialogs();
+            this.RenderPublishDialog();
             app.EndIdScope();
             // Global operation feedback: toast + notification queues drawn
             // above everything so every action gives visible feedback.
@@ -2599,6 +2592,55 @@ partial class ZanIDE {
             app.NoteFrameError("ide-frame", frameEx.Message);
             app.CancelPartialFrame();
             app.RequestRedraw();
+        }
+    }
+
+    /// 结束发布状态并根据结果弹出提示或刷新界面
+    void FinishPublish(bool success) {
+        bool shouldPrompt = success;
+        if (shouldPrompt) {
+            this.PromptPublishComplete();
+        }
+        pubBusy = false;
+        pubPacking = false;
+        pubPackStartMs = 0;
+        pubExes = new List<string>();
+        coLog.Reset();
+        app.RequestRedraw();
+    }
+
+    /// 弹出“发布成功，是否打开文件夹”的模态对话框
+    void PromptPublishComplete() {
+        string pubDir = pubRoot + "/publish";
+        string target = pubRoot;
+        if (Directory.Exists(pubDir)) {
+            target = pubDir;
+        }
+        pubDoneTarget = target;
+        pubDoneAsk = LayerState.Confirm(
+            ZanIDE.T("Publish Succeeded", "发布成功"),
+            ZanIDE.T("Publish completed successfully. Do you want to open the output folder?",
+                     "项目发布已成功完成。是否打开输出文件夹？"),
+            1);
+        pubDoneAsk.okText = ZanIDE.T("Open Folder", "打开文件夹");
+        pubDoneAsk.cancelText = ZanIDE.T("Close", "关闭");
+        pubDoneAsk.Open();
+        app.RequestRedraw();
+    }
+
+    /// 渲染发布完成后的确认对话框
+    void RenderPublishDialog() {
+        if (pubDoneAsk != null && pubDoneAsk.open) {
+            Layer.Render(app, pubDoneAsk);
+            int a = pubDoneAsk.action;
+            if (a != 0) {
+                pubDoneAsk.action = 0;
+                pubDoneAsk.open = false;
+                if (a == 1 && pubDoneTarget != "") {
+                    ZanIDE.RevealInFileManager(pubDoneTarget);
+                }
+                app.RequestRedraw();
+            }
         }
     }
 
@@ -2652,5 +2694,16 @@ partial class ZanIDE {
         ide.log = new List<string>();
         ide.coFilter.SetText("");
         ide.OutputReset();
+    }
+
+    void EnsureLsp() {
+        if (lspSess == null && !lspTried) {
+            lspTried = true;
+            lspSess = LspSession.Start(root);
+            if (lspSess != null) {
+                log.Add("> zan-lsp connected: semantic navigation & completion enabled.");
+                lspSess.BindToEditor(editor);
+            }
+        }
     }
 }

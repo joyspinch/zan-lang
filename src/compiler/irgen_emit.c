@@ -3285,8 +3285,13 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
      * (vtables / site dtors / site tynames / refl mtabs) reference every
      * class's methods and pin them into the reachable set, but section GC
      * runs later with the linker's root set. Names are unique mangled
-     * symbols already (Zan_/__zan_/main), safe as section suffixes. */
-    if (g->obfuscate_strings /* publish */) {
+     * symbols already (Zan_/__zan_/main), safe as section suffixes.
+     *
+     * Mach-O (macOS / iOS) uses an atom-based linker model (-dead_strip via
+     * .subsections_via_symbols) instead of section GC; Mach-O section specifiers
+     * require "__SEGMENT,__section" and reject ELF/COFF-style ".text.<name>".
+     * Wasm also does not use ELF/COFF section GC. Only apply to ELF and COFF. */
+    if (g->obfuscate_strings /* publish */ && !g->target_is_macos && !g->target_is_wasm) {
         for (LLVMValueRef fn = LLVMGetFirstFunction(g->mod); fn;
              fn = LLVMGetNextFunction(fn)) {
             if (LLVMIsDeclaration(fn) || LLVMGetSection(fn)) continue;

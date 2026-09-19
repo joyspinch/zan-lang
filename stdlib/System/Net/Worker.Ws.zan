@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Net.Sockets;
 using System.Net.Http;
 using System.Net.WebSocket;
@@ -27,12 +28,12 @@ class WorkerWs {
 
     // ---- 连接注册表（对标 workerman $server->connections）----
 
-    // Upgrade 成功时登记，连接结束/回调关闭后移除。list 上的协程切换只
-    // 发生在 await 点，Add/Remove/快照拷贝都是同步段，无需加锁。多 worker
-    // 进程时注册表是进程内的——跨进程广播属 SharedTable/事件总线范畴。
-    static List<WsLink> conns = new List<WsLink>();
+    // Upgrade 成功时登记，连接结束/回调关闭后移除。
+    // 使用 Dict<int, WsLink> 确保高并发长连接增删查与反查均为严格 O(1)。
+    // 多 worker 进程时注册表是进程内的——跨进程广播属 SharedTable/事件总线范畴。
+    static Dict<int, WsLink> conns = new Dict<int, WsLink>();
     // 同步段进出 WS 连接协程用的互斥（--async-workers 下连接协程跑在
-    // 不同线程，List 本身不是线程安全）。
+    // 不同线程，Dict 本身不是线程安全）。
     static nint regLock = 0;
 
     /// 惰性创建注册表用的互斥锁。
@@ -49,38 +50,32 @@ class WorkerWs {
         link.conn = conn;
         link.writer = writer;
         link.client = client;
-        WorkerWs.conns.Add(link);
+        int id = conn.GetId();
+        if (WorkerWs.conns.ContainsKey(id)) {
+            WorkerWs.conns.Remove(id);
+        }
+        WorkerWs.conns.Add(id, link);
         Mutex.Unlock(WorkerWs.regLock);
     }
 
-    /// 连接结束后由 HandleWebSocket 调用。
+    /// 连接结束后由 HandleWebSocket 调用（O(1) 删除）。
     static void ConnRemove(Connection conn) {
         WorkerWs.RegInit();
         Mutex.Lock(WorkerWs.regLock);
         int id = conn.GetId();
-        int i = 0;
-        while (i < WorkerWs.conns.Count) {
-            if (WorkerWs.conns[i].conn.GetId() == id) {
-                WorkerWs.conns.RemoveAt(i);
-                break;
-            }
-            i = i + 1;
+        if (WorkerWs.conns.ContainsKey(id)) {
+            WorkerWs.conns.Remove(id);
         }
         Mutex.Unlock(WorkerWs.regLock);
     }
 
-    /// 按连接 id 找注册项；不存在（已断开）返回 null。
+    /// 按连接 id 找注册项；不存在（已断开）返回 null（O(1) 哈希查找）。
     static WsLink LinkOf(int id) {
         WorkerWs.RegInit();
         Mutex.Lock(WorkerWs.regLock);
         WsLink found = null;
-        int i = 0;
-        while (i < WorkerWs.conns.Count) {
-            if (WorkerWs.conns[i].conn.GetId() == id) {
-                found = WorkerWs.conns[i];
-                break;
-            }
-            i = i + 1;
+        if (WorkerWs.conns.ContainsKey(id)) {
+            found = WorkerWs.conns[id];
         }
         Mutex.Unlock(WorkerWs.regLock);
         return found;
@@ -109,12 +104,7 @@ class WorkerWs {
     static async int Broadcast(string data) {
         WorkerWs.RegInit();
         Mutex.Lock(WorkerWs.regLock);
-        List<WsLink> snap = new List<WsLink>();
-        int i = 0;
-        while (i < WorkerWs.conns.Count) {
-            snap.Add(WorkerWs.conns[i]);
-            i = i + 1;
-        }
+        List<WsLink> snap = WorkerWs.conns.Values;
         Mutex.Unlock(WorkerWs.regLock);
         int sent = 0;
         int j = 0;

@@ -1217,10 +1217,14 @@ class Win32Shell {
         int wh = ph;
         int ox = 0;
         int oy = 0;
+        int wx = 0;
+        int wy = 0;
         nint wrect = NativeMemory.Alloc(16);
         nint cpt = NativeMemory.Alloc(8);
         if (Win32Shell.GetWindowRect(hwnd, wrect) != 0
                 && Win32Shell.ClientToScreen(hwnd, cpt) != 0) {
+            wx = Win32Shell.S32(wrect, 0);
+            wy = Win32Shell.S32(wrect, 4);
             int tw = Win32Shell.S32(wrect, 8) - Win32Shell.S32(wrect, 0);
             int th = Win32Shell.S32(wrect, 12) - Win32Shell.S32(wrect, 4);
             int tx = Win32Shell.S32(cpt, 0) - Win32Shell.S32(wrect, 0);
@@ -1335,9 +1339,13 @@ class Win32Shell {
         new Span<byte>(blend + 1, 1)[0] = 0;
         new Span<byte>(blend + 2, 1)[0] = 255;
         new Span<byte>(blend + 3, 1)[0] = 1;         // AC_SRC_ALPHA
-        // pptDst = 0：只更新内容，绝不改动系统持有的位置。
-        int ulw = Win32Shell.UpdateLayeredWindow(hwnd, screenDc, 0, size,
+        nint dstPt = NativeMemory.Alloc(8);
+        new Span<int>(dstPt, 1)[0] = wx;
+        new Span<int>(dstPt + 4, 1)[0] = wy;
+        // 传递当前窗口屏幕位置，避免首次进入分层窗口时因 NULL 目标坐标引发系统定位丢失或失败
+        int ulw = Win32Shell.UpdateLayeredWindow(hwnd, screenDc, dstPt, size,
             Win32Shell.lwDc, src, 0, blend, 2);
+        NativeMemory.Free(dstPt);
         NativeMemory.Free(blend);
         NativeMemory.Free(src);
         NativeMemory.Free(size);
@@ -1818,9 +1826,9 @@ class Win32Shell {
         if (hwnd == 0) { return; }
         nint fn = Interop.Entry("dwmapi.dll", "DwmSetWindowAttribute");
         if (fn == 0) { return; }
-        // DWMWA_WINDOW_CORNER_PREFERENCE = 33; 1 = ROUND, 2 = DONOTROUND
+        // DWMWA_WINDOW_CORNER_PREFERENCE = 33; 1 = DONOTROUND, 2 = ROUND
         nint slot = NativeMemory.Alloc(4);
-        new Span<int>(slot, 1)[0] = on ? 1 : 2;
+        new Span<int>(slot, 1)[0] = on ? 2 : 1;
         DwmSetWindowAttrFn call = (DwmSetWindowAttrFn)fn;
         call(hwnd, 33, slot, 4);
         NativeMemory.Free(slot);
@@ -2100,8 +2108,6 @@ class Win32Shell {
                 Win32Shell.SetWindowLongPtrW(hwnd, 0 - 20, ex | 0x00080000);
             }
             Win32Shell.glassOn = true;                 // 将 Present 路由到 PresentLayered
-            int own = Win32Shell.SurfaceOf(hwnd);
-            if (own >= 0) { Win32Shell.PresentLayered(hwnd, own); }
         } else {
             // 无 DWM（如 Win7 关闭合成）：经典区域
             // 窗口。区域坐标为客户端像素（按物理像素缩放）。

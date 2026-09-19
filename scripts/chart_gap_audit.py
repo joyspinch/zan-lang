@@ -30,7 +30,9 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OPTIONS = os.path.join(ROOT, 'examples', 'gui_charts', 'options')
-ENGINE = os.path.join(ROOT, 'stdlib', 'Gui', 'Component', 'Chart')
+ENGINE = os.path.join(ROOT, 'packages', 'Zan.Gui.Charts', 'src', 'Gui', 'Component', 'Chart')
+if not os.path.exists(ENGINE):
+    ENGINE = os.path.join(ROOT, 'stdlib', 'Gui', 'Component', 'Chart')
 
 # Subtrees that hold data payload rather than option config. Their own key is a
 # config key (`data`, `children`, ...), but the objects inside them are points,

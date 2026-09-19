@@ -3314,6 +3314,7 @@ static void print_usage(void) {
     fprintf(stderr, "                   (--no-arc-guard also turns off the --publish over-release net)\n");
     fprintf(stderr, "  --no-runtime-checks  Disable runtime guards (e.g. division by zero)\n");
     fprintf(stderr, "  --strict-runtime  Guard failures exit(70) without ZAN_RT_HARD=1\n");
+    fprintf(stderr, "  --deny-warnings   Treat compiler warnings as fatal errors\n");
     fprintf(stderr, "  --publish        Build optimized release binary (strip debug, optimize)\n");
     fprintf(stderr, "  --fast-alloc     Front-end malloc with the per-thread small-object\n");
     fprintf(stderr, "                   allocator (server workloads; native targets only)\n");
@@ -3528,6 +3529,7 @@ int main(int argc, char **argv) {
     const char *package_name = NULL;
     const char *package_project = NULL;
     bool package_list_missing = false;
+    bool do_deny_warnings = false;
     zan_pkg_scope_t package_scope = ZAN_PKG_SCOPE_PROJECT;
     int opt_level = -1; /* -1 = auto (O0 default, O2 for publish) */
     const char *pp_defines[64];
@@ -3588,6 +3590,8 @@ int main(int argc, char **argv) {
             runtime_checks = false;
         } else if (strcmp(argv[i], "--strict-runtime") == 0) {
             strict_runtime = true;
+        } else if (strcmp(argv[i], "--deny-warnings") == 0) {
+            do_deny_warnings = true;
         } else if (strcmp(argv[i], "--publish") == 0) {
             publish_mode = true;
         } else if (strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--debug") == 0) {
@@ -4013,6 +4017,7 @@ int main(int argc, char **argv) {
     /* parse */
     zan_arena_t *arena = zan_arena_new();
     zan_diag_t *diag = zan_diag_new(arena);
+    zan_diag_set_deny_warnings(diag, do_deny_warnings);
 
     /* Parse every input file and merge their declarations into a single
      * compilation unit so that names resolve across files (multi-file
@@ -6506,9 +6511,17 @@ int main(int argc, char **argv) {
                 size_t cur = strlen(cmd);
                 snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", rt_timer_obj);
             }
-            if (irgen.uses_socket_async) {
-                size_t cur = strlen(cmd);
-                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s/zanrt_io.o\"", sys);
+            if (rt_io_obj || irgen.uses_socket_async || external_async_executor) {
+                const char *ioname = external_async_executor ? "zanrt_io_mt.o" : "zanrt_io.o";
+                char rt_io_path[1400];
+                snprintf(rt_io_path, sizeof(rt_io_path), "%s/%s", sys, ioname);
+                if (!zan_file_exists(rt_io_path) && external_async_executor) {
+                    snprintf(rt_io_path, sizeof(rt_io_path), "%s/zanrt_io.o", sys);
+                }
+                if (zan_file_exists(rt_io_path)) {
+                    size_t cur = strlen(cmd);
+                    snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", rt_io_path);
+                }
             }
             if (irgen.uses_sync_runtime) {
                 /* atomics / shared-table runtime; its pthread, flock and shm
@@ -7260,6 +7273,27 @@ int main(int argc, char **argv) {
             if (macrt_inflate[0]) {
                 size_t cur = strlen(cmd);
                 snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", macrt_inflate);
+            }
+            char macrt_gui[1400] = {0};
+            snprintf(macrt_gui, sizeof(macrt_gui), "%s/zanrt_gui.o", macrt);
+            if (!zan_file_exists(macrt_gui)) {
+                if (target.os == ZAN_OS_IOS) {
+                    snprintf(macrt_gui, sizeof(macrt_gui), "%s/toolchain/ios/arm64/zanrt_gui.o", exe_dir2);
+                    if (!zan_file_exists(macrt_gui)) {
+                        snprintf(macrt_gui, sizeof(macrt_gui), "toolchain/ios/arm64/zanrt_gui.o");
+                    }
+                } else {
+                    snprintf(macrt_gui, sizeof(macrt_gui), "%s/toolchain/macos/%s/zanrt_gui.o",
+                             exe_dir2, (target.arch == ZAN_ARCH_AARCH64) ? "arm64" : "x64");
+                    if (!zan_file_exists(macrt_gui)) {
+                        snprintf(macrt_gui, sizeof(macrt_gui), "toolchain/macos/%s/zanrt_gui.o",
+                                 (target.arch == ZAN_ARCH_AARCH64) ? "arm64" : "x64");
+                    }
+                }
+            }
+            if (zan_file_exists(macrt_gui)) {
+                size_t cur = strlen(cmd);
+                snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", macrt_gui);
             }
             for (int ei = 0; ei < extra_link_input_count; ei++) {
                 size_t cur = strlen(cmd);

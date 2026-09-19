@@ -17,6 +17,7 @@ zan_diag_t *zan_diag_new(zan_arena_t *arena) {
     d->file_sources = NULL;
     d->file_count = 0;
     d->capture = false;
+    d->treat_warnings_as_errors = false;
     d->entries = NULL;
     d->entry_count = 0;
     d->entry_cap = 0;
@@ -56,6 +57,10 @@ static int find_line_len(const char *line_start) {
 
 void zan_diag_set_capture(zan_diag_t *diag, bool enabled) {
     diag->capture = enabled;
+}
+
+void zan_diag_set_deny_warnings(zan_diag_t *diag, bool enabled) {
+    if (diag) diag->treat_warnings_as_errors = enabled;
 }
 
 int zan_diag_entry_count(const zan_diag_t *diag) {
@@ -103,6 +108,10 @@ void zan_diag_emit(zan_diag_t *diag, zan_diag_level_t level, zan_loc_t loc,
     va_start(args, fmt);
     vsnprintf(msgbuf, sizeof(msgbuf), fmt, args);
     va_end(args);
+
+    if (level == DIAG_WARNING && diag->treat_warnings_as_errors) {
+        level = DIAG_ERROR;
+    }
 
     if (level == DIAG_ERROR) {
         diag->error_count++;

@@ -238,6 +238,9 @@ class GameNet {
     JsonValue playScene1;
     JsonValue playScene2;
     JsonValue playScene3;
+    /* 仓库（wh）：列表缓存，行 {id,name,kind,slot,count}，服务端内联
+       模板信息，客户端直接出格子。 */
+    JsonValue playWh;
     int playTitlePages;
     JsonValue codexPage;
     int codexPageNo;
@@ -910,6 +913,7 @@ class GameNet {
         this.playAch = null; this.playLord = null; this.playMail = null;
         this.playSup = null; this.playTj = null;
         this.playScene1 = null; this.playScene2 = null; this.playScene3 = null;
+        this.playWh = null;
         this.codexPage = null; this.codexPageNo = 0; this.codexTotal = 0;
         this.uid = 0;
         /* realmId 不清零：断线重连分区窗仍默认选中上次玩过的区。 */
@@ -2104,6 +2108,41 @@ class GameNet {
         if (dim == 2) { return this.playScene2; }
         if (dim == 3) { return this.playScene3; }
         return this.playScene1;
+    }
+
+    /* 仓库（wh）：{}=拉列表；入库/出库回复同形（wh+bag+self 整份下发），
+       公共收尾一并换缓存。入库/出库都是整叠，count 防双花在服务端
+       条件更新里裁决，失败错误经 TakeSelf 进聊天。 */
+    bool TakeWh(JsonValue r) {
+        if (!this.TakeSelf(r)) { return false; }
+        JsonValue wh = r.Get("wh");
+        if (wh != null && wh.IsArray()) { this.playWh = wh; }
+        JsonValue bg = r.Get("bag");
+        if (bg != null && bg.IsArray()) { this.bag = bg; }
+        this.Bump();
+        return true;
+    }
+
+    void RefreshWh() {
+        this.Op("{\"op\":\"wh\"}", (JsonValue r) => { this.TakeWh(r); });
+    }
+
+    void MaybeRefreshWh() {
+        if (this.playWh != null) { return; }
+        this.RefreshWh();
+    }
+
+    JsonValue PlayWh() { return this.playWh; }
+    int WhCount() { return this.playWh != null && this.playWh.IsArray() ? this.playWh.Count() : 0; }
+    JsonValue WhAt(int i) { return this.playWh != null ? this.playWh.At(i) : null; }
+
+    /* into=true 入库（背包→仓库），false 出库（仓库→背包）。 */
+    void WhMove(int itemId, int count, bool into) {
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("op", "wh");
+        body.PutInt(into ? "in" : "out", itemId);
+        body.PutInt("count", count);
+        this.Op(body.ToJson(), (JsonValue r) => { this.TakeWh(r); });
     }
 
     /* put = 组号 slot = 格号：服务端从背包找该格对应装备放入（消耗，

@@ -2050,6 +2050,83 @@ class Play {
         for (int i = 0; i < wx.Length; i = i + 1) { sum = sum + wx[i]; }
         return sum;
     }
+
+    /* 仓库（wh）：{}=列表；{"in":itemId,"count":N}=入库（先扣会话
+       背包再 upsert 本表）；{"out":itemId,"count":N}=出库（条件更新
+       count 原值比对防双花，再 BagAdd 入会话背包）。低频操作直写
+       事实层，不进会话热缓存。行内联 name/kind/slot 供客户端直渲染
+       （图标客户端按 items.csv 自解析，同背包）。 */
+    static async JsonValue Wh(Session s, JsonValue m) {
+        IDbConnection db = await Gateway.Db();
+        if (db == null) { return Gateway.Err("数据库不可用，请稍后再试"); }
+        try {
+            int itemId = m.Int("in", 0) > 0 ? m.Int("in", 0) : m.Int("out", 0);
+            if (itemId > 0) {
+                int count = m.Int("count", 1);
+                if (count < 1) { return Gateway.Err("数量要大于 0"); }
+                ZanWeb.Model.Game.Item it = Fight.ById(itemId);
+                if (it == null) { return Gateway.Err("没有这种物品"); }
+                ZanWeb.Model.Game.Warehouse row = await db
+                    .Select<ZanWeb.Model.Game.Warehouse>()
+                    .Where(a => a.playerId == s.row.id && a.itemId == itemId)
+                    .FirstAsync();
+                if (m.Int("in", 0) > 0) {
+                    if (!Fight.BagTake(s, itemId, count)) {
+                        return Gateway.Err("背包里没有这么多 " + it.name);
+                    }
+                    if (row == null) {
+                        ZanWeb.Model.Game.Warehouse add =
+                            new ZanWeb.Model.Game.Warehouse();
+                        add.playerId = s.row.id;
+                        add.itemId = itemId;
+                        add.count = count;
+                        int _ins = await db.Insert<ZanWeb.Model.Game.Warehouse>(add)
+                            .ExecuteAffrowsAsync();
+                    } else {
+                        int _upd = await db.Update<ZanWeb.Model.Game.Warehouse>()
+                            .SetIncr(a => a.count, count)
+                            .Where(a => a.id == row.id)
+                            .ExecuteAffrowsAsync();
+                    }
+                } else {
+                    if (row == null || row.count < count) {
+                        return Gateway.Err("仓库里没有这么多 " + it.name);
+                    }
+                    int taken = await db.Update<ZanWeb.Model.Game.Warehouse>()
+                        .SetIncr(a => a.count, 0 - count)
+                        .Where(a => a.id == row.id && a.count == row.count)
+                        .ExecuteAffrowsAsync();
+                    if (taken <= 0) { return Gateway.Err("仓库状态已变化，请重试"); }
+                    Fight.BagAdd(s, itemId, count);
+                    s.bagDirty = true;
+                }
+            }
+            List<ZanWeb.Model.Game.Warehouse> rows = await db
+                .Select<ZanWeb.Model.Game.Warehouse>()
+                .Where(a => a.playerId == s.row.id)
+                .OrderBy(a => a.itemId).ToListAsync();
+            JsonValue arr = JsonValue.NewArray();
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                if (rows[i].count <= 0) { continue; }
+                ZanWeb.Model.Game.Item it = Fight.ById(rows[i].itemId);
+                if (it == null) { continue; }
+                JsonValue o = JsonValue.NewObject();
+                o.Set("id", JsonValue.NewNum(Convert.ToString(it.id)));
+                o.Set("name", JsonValue.NewStr(it.name));
+                o.Set("kind", JsonValue.NewNum(Convert.ToString(it.kind)));
+                o.Set("slot", JsonValue.NewNum(Convert.ToString(it.slot)));
+                o.Set("count", JsonValue.NewNum(Convert.ToString(rows[i].count)));
+                arr.Append(o);
+            }
+            JsonValue r = Gateway.Ok();
+            r.Set("wh", arr);
+            r.Set("bag", Fight.BagJson(s));
+            Gateway.SelfInto(r, s);
+            return r;
+        } finally {
+            Gateway.Give(db);
+        }
+    }
 }
 
 /* 一行称谓：列即快照小写原始字段。展示对（攻/魔/道/防/魔防）是

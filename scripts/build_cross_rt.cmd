@@ -23,6 +23,7 @@ for %%P in (linux-musl:x86_64 linux-arm64:aarch64 linux-riscv64:riscv64) do (
   for /f "tokens=1,2 delims=:" %%A in ("%%P") do (
     if not exist toolchain\%%A mkdir toolchain\%%A
     "%ZIG%" cc -target %%B-linux-musl -g0 -DZAN_IO_STACKLESS_ONLY -fPIC -I %RT% -O2 -c %RT%\rt_io.c    -o toolchain\%%A\zanrt_io.o    || exit /b 1
+    "%ZIG%" cc -target %%B-linux-musl -g0 -DZAN_IO_STACKLESS_ONLY -DZAN_CO_DRIVER -fPIC -I %RT% -O2 -c %RT%\rt_io.c -o toolchain\%%A\zanrt_io_mt.o || exit /b 1
     "%ZIG%" cc -target %%B-linux-musl -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_sync.c  -o toolchain\%%A\zanrt_sync.o  || exit /b 1
     "%ZIG%" cc -target %%B-linux-musl -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_file.c  -o toolchain\%%A\zanrt_file.o  || exit /b 1
     "%ZIG%" cc -target %%B-linux-musl -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\%%A\zanrt_timer.o || exit /b 1

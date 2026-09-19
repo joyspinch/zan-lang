@@ -7,6 +7,7 @@ namespace ZanWeb;
 /* 注入数据库与缓存访问的控制器基类。依赖在 main.zan 装配并经 AppServices.Use(...) 安装，动作通过 this.Conn()/this.Cache() 访问。连接按请求作用域：Conn() 首次调用时从连接池借出，同请求后续调用复用同一连接，OnAfter() 在动作返回时归还——故业务代码与 DAO 不含 Acquire/Release；按请求(非按查询)持一连接也使事务成为可能，事务内每条语句须在同一连接上执行。BEGIN/COMMIT/ROLLBACK 同其他语句一样需 await。子类清理覆盖 OnDone() 而非 OnAfterAsync()，以确保连接总是被释放。 */
 class AppController : Controller {
     IDbConnection lease;
+    IDbConnection readLease;
     bool inTx;
 
     /* 注入的数据库上下文（AppServices.Use 前为 null）。 */
@@ -34,6 +35,24 @@ class AppController : Controller {
 
     /* 本次请求已借出的连接，不 await；仅在 Conn() 或 Begin() 成功后有效。 */
     protected IDbConnection Held() {
+        return this.lease;
+    }
+
+    /* 借出只读连接：用于高并发纯查询（如文章列表、报表展示）。未配置从库时自动借主库（零区别）；若当前请求处于 [Tx] 事务中，强制借出主库连接（防主从同步延迟）。*/
+    protected async IDbConnection ReadConn() {
+        if (this.inTx) {
+            return await this.Conn();
+        }
+        if (this.readLease != null) { return this.readLease; }
+        DbContext ctx = this.Db();
+        if (ctx == null) { return null; }
+        this.readLease = await ctx.AcquireRead();
+        return this.readLease;
+    }
+
+    /* 本次请求已借出的只读连接（未借出则回退到主库连接）。*/
+    protected IDbConnection HeldRead() {
+        if (this.readLease != null) { return this.readLease; }
         return this.lease;
     }
 
@@ -95,6 +114,11 @@ class AppController : Controller {
             DbContext ctx = this.Db();
             if (ctx != null) { ctx.Release(this.lease); }
             this.lease = null;
+        }
+        if (this.readLease != null) {
+            DbContext ctx = this.Db();
+            if (ctx != null) { ctx.ReleaseRead(this.readLease); }
+            this.readLease = null;
         }
         this.OnDone();
     }

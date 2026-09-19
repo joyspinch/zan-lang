@@ -24,6 +24,8 @@ class PropertyGrid : Control {
     List<Switch> flags;
     /// 下拉行的编辑器（按行索引对齐，非下拉行为 null）。
     List<SelectBox> picks;
+    /// 选项少于等于 4 个时的分段单选按钮稳定控件 id。
+    List<List<int>> pickSegIds;
     /// 整数属性行的 -/+ 步进按钮稳定控件 id（按行索引对齐，
     /// 非整数行也占位）。
     List<int> minusIds;
@@ -34,6 +36,8 @@ class PropertyGrid : Control {
     string key;
     /// 纵向滚动偏移（像素）。
     SignalInt scroll;
+    /// 自定义标签列宽（逻辑像素，0 = 自动根据内容自适应）。
+    public int LabelWidth;
     /// 没有属性时显示的文本（"" 不画）。
     string Empty;
     /// 某一行被用户改动后触发（读 ChangedKey 得知是哪一个）。
@@ -48,6 +52,7 @@ class PropertyGrid : Control {
         texts = new List<Input>();
         flags = new List<Switch>();
         picks = new List<SelectBox>();
+        pickSegIds = new List<List<int>>();
         minusIds = new List<int>();
         plusIds = new List<int>();
         shadow = new List<string>();
@@ -93,6 +98,7 @@ class PropertyGrid : Control {
         texts = new List<Input>();
         flags = new List<Switch>();
         picks = new List<SelectBox>();
+        pickSegIds = new List<List<int>>();
         minusIds = new List<int>();
         plusIds = new List<int>();
         shadow = new List<string>();
@@ -103,16 +109,21 @@ class PropertyGrid : Control {
             Input inp = null;
             Switch sw = null;
             SelectBox sb = null;
+            List<int> sids = new List<int>();
             if (p.kind == 5) {
                 // 分组标题：没有编辑器。
             } else if (p.kind == 2) {
                 // 动态宿主不走 Binding<T>（无编译期字段可指），
                 // 统一经控件的属性协议驱动（§6.1）。
                 sw = new Switch();
-                sw.SetProp("checked", PropSpec.Flag(PropSpec.IsOn(cur)));
+                sw.Size = "small";
+                sw.SetOn(PropSpec.IsOn(cur));
             } else if (p.kind == 3) {
                 sb = SelectBox.FromOptions(p.options, "");
                 sb.SetIndex(this.IndexOfValue(p, cur));
+                for (int si = 0; si < p.options.Count; si = si + 1) {
+                    sids.Add(WidgetId.Next());
+                }
             } else {
                 inp = new Input("");
                 inp.SetText(cur);
@@ -120,6 +131,7 @@ class PropertyGrid : Control {
             texts.Add(inp);
             flags.Add(sw);
             picks.Add(sb);
+            pickSegIds.Add(sids);
             minusIds.Add(WidgetId.Next());
             plusIds.Add(WidgetId.Next());
         }
@@ -164,7 +176,7 @@ class PropertyGrid : Control {
     /// 编辑器当前值的字符串形式（与 PropSpec.Read 同一种表示）。
     string Editor(int i) {
         PropSpec p = data[i];
-        if (p.kind == 2) { return PropSpec.Flag(PropSpec.IsOn(flags[i].GetProp("value"))); }
+        if (p.kind == 2) { return flags[i].IsOn() ? "true" : "false"; }
         if (p.kind == 3) { return this.PickValue(p, picks[i].Value()); }
         return texts[i].GetText();
     }
@@ -172,7 +184,7 @@ class PropertyGrid : Control {
     /// 把模型值灌回编辑器（外部改了属性时）。
     void Load(int i, string val) {
         PropSpec p = data[i];
-        if (p.kind == 2) { flags[i].SetProp("checked", PropSpec.Flag(PropSpec.IsOn(val))); return; }
+        if (p.kind == 2) { flags[i].SetOn(PropSpec.IsOn(val)); return; }
         if (p.kind == 3) { picks[i].SetIndex(this.IndexOfValue(p, val)); return; }
         texts[i].SetText(val);
     }
@@ -290,8 +302,26 @@ class PropertyGrid : Control {
         int barW = app.Scale(6);
         int rowW = bw;
         if (overflow) { rowW = bw - barW; }
-        int labelW = app.Scale(92);
-        if (labelW > rowW * 2 / 5) { labelW = rowW * 2 / 5; }
+        int labelW = 0;
+        if (LabelWidth > 0) {
+            labelW = app.Scale(LabelWidth);
+        } else {
+            int maxNeed = 0;
+            for (int li = 0; li < data.Count; li = li + 1) {
+                if (data[li].kind != 5 && data[li].label != "") {
+                    int lw = Canvas.MeasureText(data[li].label, fs);
+                    if (lw > maxNeed) { maxNeed = lw; }
+                }
+            }
+            maxNeed = maxNeed + t.gapSmall * 2;
+            int minW = app.Scale(110);
+            int maxW = rowW * 52 / 100;
+            labelW = maxNeed;
+            if (labelW < minW) { labelW = minW; }
+            if (labelW > maxW) { labelW = maxW; }
+        }
+        if (rowW - labelW < app.Scale(60)) { labelW = rowW - app.Scale(60); }
+        if (labelW < app.Scale(40)) { labelW = app.Scale(40); }
         int y = by - scroll.Get();
 
         c.PushClip(bx, by, bw, bh);
@@ -299,6 +329,11 @@ class PropertyGrid : Control {
             bool onscreen = y + rowH > by && y < by + bh;
             if (onscreen) {
                 PropSpec p = data[i];
+                bool rowHover = Ui.Over(app, bx, y, rowW, rowH)
+                    && app.mouseY >= by && app.mouseY < by + bh;
+                if (rowHover && p.kind != 5) {
+                    c.FillRoundRect(bx, y, rowW, rowH, app.Scale(4), t.bgHover);
+                }
                 if (p.kind == 5) {
                     c.DrawText(bx, Canvas.CenterTextY(y, rowH, fs),
                         Ellipsis.Fit(p.label, rowW, fs), sectionStyle.FgOr(0), fs);
@@ -311,23 +346,92 @@ class PropertyGrid : Control {
                     int eh = app.Scale(24);
                     int ey = y + (rowH - eh) / 2;
                     if (p.kind == 2) {
-                        flags[i].Render(app, ex, ey);
+                        int swH = app.Scale(18);
+                        int swY = y + (rowH - swH) / 2;
+                        flags[i].Render(app, ex, swY);
                     } else if (p.kind == 3) {
-                        picks[i].Render(app, ex, ey, ew);
+                        int optCount = p.options.Count;
+                        // 选项在 2~4 个之间且宽度充裕时，自动升格为分段单选按钮组，点选更直观快捷
+                        bool useSegmented = optCount >= 2 && optCount <= 4;
+                        if (useSegmented) {
+                            int segW = ew / optCount;
+                            for (int si = 0; si < optCount; si = si + 1) {
+                                int tw = Canvas.MeasureText(p.options[si], fs);
+                                if (tw + app.Scale(6) > segW) {
+                                    useSegmented = false;
+                                    break;
+                                }
+                            }
+                            if (segW < app.Scale(24)) { useSegmented = false; }
+                        }
+
+                        if (useSegmented) {
+                            int curIdx = picks[i].Value();
+                            int segW = ew / optCount;
+                            int r = app.Scale(4);
+                            c.FillRoundRect(ex, ey, ew, eh, r, t.bgSecondary);
+                            c.DrawRoundRect(ex, ey, ew, eh, r, t.borderSecondary, 1);
+
+                            for (int si = 0; si < optCount; si = si + 1) {
+                                int sx = ex + si * segW;
+                                int sw = (si == optCount - 1) ? (ex + ew - sx) : segW;
+                                bool isSel = (si == curIdx);
+                                bool segHover = Ui.Over(app, sx, ey, sw, eh);
+                                int segId = (i < pickSegIds.Count && si < pickSegIds[i].Count)
+                                    ? pickSegIds[i][si] : WidgetId.Next();
+                                app.hitTester.RegisterRect(segId, sx, ey, sw, eh, 0);
+
+                                if (Ui.Clicked(app, segId)) {
+                                    if (!isSel) {
+                                        picks[i].SetIndex(si);
+                                        p.Write(this.PickValue(p, si));
+                                        shadow[i] = p.Read();
+                                        hitRow = i;
+                                        Change.Post();
+                                        app.RequestRedraw();
+                                    }
+                                }
+
+                                if (isSel) {
+                                    c.FillRoundRect(sx + app.Scale(1), ey + app.Scale(1),
+                                        sw - app.Scale(2), eh - app.Scale(2), app.Scale(3), t.primary);
+                                    int tw = Canvas.MeasureText(p.options[si], fs);
+                                    c.DrawText(sx + (sw - tw) / 2, Canvas.CenterTextY(ey, eh, fs),
+                                        p.options[si], 0xFFFFFFFF, fs);
+                                } else {
+                                    if (segHover) {
+                                        c.FillRoundRect(sx + app.Scale(1), ey + app.Scale(1),
+                                            sw - app.Scale(2), eh - app.Scale(2), app.Scale(3), t.bgHover);
+                                    }
+                                    int tw = Canvas.MeasureText(p.options[si], fs);
+                                    c.DrawText(sx + (sw - tw) / 2, Canvas.CenterTextY(ey, eh, fs),
+                                        p.options[si], valueStyle.FgOr(t.textPrimary), fs);
+                                    if (si > 0 && !isSel && (si - 1 != curIdx)) {
+                                        c.DrawLine(sx, ey + app.Scale(3), sx, ey + eh - app.Scale(3), t.borderSecondary, 1);
+                                    }
+                                }
+                            }
+                        } else {
+                            picks[i].Render(app, ex, ey, ew);
+                        }
                     } else if (p.kind == 1) {
-                        // 整数行：[-] [可点击键入的输入框] [+]。
-                        int gap = app.Scale(4);
-                        int inW = ew - (eh + gap) * 2;
-                        if (inW < app.Scale(24)) { inW = app.Scale(24); }
-                        if (this.StepBtn(app, minusIds[i], ex, ey, eh, "-",
-                                stepStyle, stepHoverStyle)) {
-                            this.Step(app, i, 0 - p.step);
-                        }
-                        texts[i].Render(app, ex + eh + gap, ey, inW, eh);
-                        if (this.StepBtn(app, plusIds[i], ex + eh + gap + inW + gap,
-                                ey, eh, "+", stepStyle, stepHoverStyle)) {
-                            this.Step(app, i, p.step);
-                        }
+	                        // 整数行：[-] [可点击键入的输入框] [+]。
+	                        int gap = app.Scale(4);
+	                        int minStepW = (eh + gap) * 2 + app.Scale(36);
+	                        if (ew >= minStepW) {
+	                            int inW = ew - (eh + gap) * 2;
+	                            if (this.StepBtn(app, minusIds[i], ex, ey, eh, "-",
+	                                    stepStyle, stepHoverStyle)) {
+	                                this.Step(app, i, 0 - p.step);
+	                            }
+	                            texts[i].Render(app, ex + eh + gap, ey, inW, eh);
+	                            if (this.StepBtn(app, plusIds[i], ex + ew - eh,
+	                                    ey, eh, "+", stepStyle, stepHoverStyle)) {
+	                                this.Step(app, i, p.step);
+	                            }
+	                        } else {
+	                            texts[i].Render(app, ex, ey, ew, eh);
+	                        }
                     } else {
                         texts[i].Render(app, ex, ey, ew, eh);
                     }

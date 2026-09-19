@@ -22,6 +22,8 @@ cmake_policy(SET CMP0007 NEW)
 # keep ThemeDoc, ThemeJson, and this note in sync.
 set(_budget
   "stdlib/Gui/Backend/UiDriver.zan=12"
+  "stdlib/Gui/Component/PropertyGrid.zan=7"
+  "stdlib/Gui/Designer/Designer.Inspector.zan=2"
 )
 
 set(_members "primary|primaryHover|primaryPressed|info|infoHover|infoPressed|success|successHover|successPressed|warning|warningHover|warningPressed|error|errorHover|errorPressed|textPrimary|textSecondary|textTertiary|textDisabled|textInverse|bgPrimary|bgSecondary|bgTertiary|bgHover|bgActive|bgDisabled|borderPrimary|borderSecondary|borderHover|borderFocus|divider|shadowColor|scrollbar|scrollbarHover|tooltipBg|tooltipBorder|tooltipText|glassTint|glassChromeTint")
@@ -31,8 +33,8 @@ file(GLOB_RECURSE _sources "${ROOT}/stdlib/Gui/*.zan")
 set(_fail "")
 foreach(_f ${_sources})
   file(RELATIVE_PATH _rel "${ROOT}" "${_f}")
-  if(_rel STREQUAL "stdlib/Gui/Theme.zan" OR _rel STREQUAL "stdlib/Gui/Style.zan"
-     OR _rel STREQUAL "stdlib/Gui/StyleBox.zan" OR _rel STREQUAL "stdlib/Gui/Fx.zan")
+  if(_rel STREQUAL "stdlib/Gui/Styling/Theme.zan" OR _rel STREQUAL "stdlib/Gui/Styling/Style.zan"
+     OR _rel STREQUAL "stdlib/Gui/Styling/StyleBox.zan" OR _rel STREQUAL "stdlib/Gui/Rendering/Fx.zan")
     continue()
   endif()
   file(STRINGS "${_f}" _lines ENCODING UTF-8)

@@ -68,4 +68,56 @@ class Health : AppController {
         }
         this.Json(o.ToJson());
     }
+
+    /* K8s 存活探针：进程与事件循环存活，微秒级直接应答。*/
+    [HttpGet]
+    [Route("/healthz/live")]
+    [Description("K8s存活探针")]
+    void Live() {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("status", JsonValue.NewStr("ok"));
+        o.Put("pid", MetricsCluster.Num(ProcessHost.Pid()));
+        o.Put("worker", MetricsCluster.Num(ProcessHost.WorkerId()));
+        this.Json(o.ToJson());
+    }
+
+    /* K8s 就绪探针：检查核心依赖（数据库、Redis）是否就绪，不可达时返回 503 让 Ingress/LB 摘除流量。*/
+    [HttpGet]
+    [Route("/healthz/ready")]
+    [Description("K8s就绪探针")]
+    async void Ready() {
+        JsonValue o = JsonValue.NewObject();
+        if (!this.DbReady()) {
+            o.Put("status", JsonValue.NewStr("down"));
+            o.Put("db", JsonValue.NewStr("pool not ready"));
+            this.Ctx().Status(503, "Service Unavailable");
+            this.Json(o.ToJson());
+            return;
+        }
+
+        string err = "";
+        bool dbUp = false;
+        try {
+            DbResult r = await this.Held().QueryAsync("SELECT 1", new DbParams());
+            dbUp = (r != null);
+        } catch (Exception ex) {
+            err = ex.Message;
+        }
+        if (!dbUp) {
+            o.Put("status", JsonValue.NewStr("down"));
+            string why = "unreachable";
+            if (err.Length > 0) { why = err; }
+            o.Put("db", JsonValue.NewStr(why));
+            this.Ctx().Status(503, "Service Unavailable");
+            this.Json(o.ToJson());
+            return;
+        }
+
+        o.Put("status", JsonValue.NewStr("ready"));
+        o.Put("db", JsonValue.NewStr("up"));
+        if (ClusterBus.Enabled()) {
+            o.Put("cluster", JsonValue.NewStr("up"));
+        }
+        this.Json(o.ToJson());
+    }
 }

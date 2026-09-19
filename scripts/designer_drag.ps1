@@ -2,7 +2,11 @@ param(
   [int]$X1 = 0, [int]$Y1 = 0, [int]$X2 = 0, [int]$Y2 = 0,
   [string]$Out = "d:\project\zan-lang\build\shot_drag.png",
   [switch]$Relaunch,
-  [switch]$MoveOnly
+  [switch]$MoveOnly,
+  # Capture via PrintWindow (the window's own pixels) instead of
+  # CopyFromScreen, so losing the foreground race never photographs
+  # another app / the wallpaper.
+  [switch]$Print
 )
 $exe = "d:\project\zan-lang\build\gallery_test.exe"
 if ($Relaunch) {
@@ -25,6 +29,7 @@ public class WG{
  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
  [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, uint d, IntPtr e);
+ [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
  public delegate bool EnumProc(IntPtr h,IntPtr l);
  public static IntPtr Found = IntPtr.Zero;
  [StructLayout(LayoutKind.Sequential)] public struct RECT{ public int L; public int T; public int R; public int B; }
@@ -80,6 +85,15 @@ Add-Type -AssemblyName System.Drawing
 $w = $r.R - $r.L; $ht = $r.B - $r.T
 $bmp = New-Object Drawing.Bitmap($w,$ht)
 $g = [Drawing.Graphics]::FromImage($bmp)
-$g.CopyFromScreen($r.L,$r.T,0,0,$bmp.Size)
+if ($Print) {
+  # PW_RENDERFULLCONTENT (0x2): the window renders through DirectComposition.
+  $hdc = $g.GetHdc()
+  $ok = [WG]::PrintWindow($h, $hdc, 2)
+  $g.ReleaseHdc($hdc)
+  if (-not $ok) { Write-Output "printwindow-failed"; $g.Dispose(); exit 1 }
+} else {
+  $g.CopyFromScreen($r.L,$r.T,0,0,$bmp.Size)
+}
+$g.Dispose()
 $bmp.Save($Out)
 Write-Output ("drag rect=" + $r.L + "," + $r.T + " " + $w + "x" + $ht + " from " + $sx1 + "," + $sy1 + " to " + $sx2 + "," + $sy2 + " -> " + $Out)

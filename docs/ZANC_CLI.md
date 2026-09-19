@@ -142,6 +142,8 @@ build/zanc probe.zan --auto-stdlib --time              # 各阶段耗时
 | `--dump-tokens` / `--dump-ast` / `--emit-ir` | 前端/IR 诊断 |
 | `--check-leaks` / `--arc-guard` | 泄漏报告 / 释放检疫（-g 默认开） |
 | `--no-check-leaks` / `--no-arc-guard` | 调试构建里关掉它们 |
+| `--strict-runtime` | 守卫失败 exit(70) 退出 |
+| `--deny-warnings` | 将编译警告视为致命错误（阻断构建） |
 | `--no-gen` | 禁用 Zan 脚本代码生成器（bootstrap 用） |
 | `--emit-symbols <f>` / `--gen-meta <f>` | 输出索引/元数据后退出（IDE/LSP 用） |
 | `--time` / `-q` / `--quiet` | 阶段计时 / 静默进度行 |

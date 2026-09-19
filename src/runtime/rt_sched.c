@@ -106,7 +106,11 @@ static int64_t plat_now_ms(void)       { return (int64_t)GetTickCount64(); }
 #else
 /* POSIX ucontext backend */
 static ucontext_t g_sched_ctx;
+#if UINTPTR_MAX > 0xFFFFFFFFu
 static void co_trampoline_posix(unsigned hi, unsigned lo);
+#else
+static void co_trampoline_posix(unsigned ptr);
+#endif
 
 typedef struct { ucontext_t ctx; char *stack; } posix_fiber_t;
 
@@ -161,11 +165,16 @@ static void *plat_fiber_new(zan_co_t *co) {
     pf->ctx.uc_stack.ss_sp = pf->stack;
     pf->ctx.uc_stack.ss_size = ZAN_CO_STACK;
     pf->ctx.uc_link = &g_sched_ctx;
-    /* makecontext passes int-sized args; split the co pointer across two.
+    /* makecontext passes int-sized args; split the co pointer across two on 64-bit.
      * The trampoline reconstructs it, so each fiber runs its own body. */
+#if UINTPTR_MAX > 0xFFFFFFFFu
     uintptr_t p = (uintptr_t)co;
     makecontext(&pf->ctx, (void (*)(void))co_trampoline_posix, 2,
                 (unsigned)(p >> 32), (unsigned)(p & 0xffffffffu));
+#else
+    makecontext(&pf->ctx, (void (*)(void))co_trampoline_posix, 1,
+                (unsigned)(uintptr_t)co);
+#endif
     return pf;
 }
 static void plat_fiber_delete(void *f) {
@@ -362,8 +371,13 @@ static void WINAPI co_trampoline(void *p) {
     switch_to_sched();
 }
 #else
+#if UINTPTR_MAX > 0xFFFFFFFFu
 static void co_trampoline_posix(unsigned hi, unsigned lo) {
     zan_co_t *co = (zan_co_t *)(((uintptr_t)hi << 32) | (uintptr_t)lo);
+#else
+static void co_trampoline_posix(unsigned ptr) {
+    zan_co_t *co = (zan_co_t *)(uintptr_t)ptr;
+#endif
     co->body(co->task);
     co->finished = 1;
     complete_task(co->task, 0);

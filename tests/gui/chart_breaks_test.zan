@@ -1,0 +1,170 @@
+using System;
+using Gui;
+using Gui.Component.Chart;
+
+/// A15 回归：axis.breaks 断轴的视觉层（breakArea 锯齿带 + 轴线断带）。
+///
+/// 缺口原状：breaks 的 elapsed 映射（Chart.BrkElapsed/YOfBrk）与刻度
+/// 表（Chart.BrkTicks）已有 conformance 数值金标，但 breakArea 的
+/// 绘制层此前不存在——官方（axisBreakHelperImpl.ts
+/// rectCoordBuildBreakAxis → addZigzagShapes）在每条断带上画两条跨满
+/// 绘图区的平行锯齿折线（端点不偏移、内部点 ±zigzagAmplitude 交替、
+/// dashed [3,3] 边框），gapReal≠0 再加两线之间的多边形填充
+///（itemStyle color/opacity），z=100 在系列之上；axisLine.breakLine
+///（缺省 true）让轴线只画断带之外的段。
+///
+/// 三组断言，全部确定性：
+///   1. BrkZigzag 几何：端点贴绘图区两边、内部点两向偏移都出现、
+///      步长落在 minSpan..maxSpan。
+///   2. DrawAxisLineBands：断带区间内不画、区间外照画。
+///   3. 离屏渲染真图：填充色/边框色的像素计数与包围盒（跨满绘图
+///      区宽），breakArea.show=false 与无 breaks 两态归零。
+/// 像素计数用精确色匹配（不透明填充/1px 实线段），阈值放宽，
+/// 不钉具体像素数，跨栅格化后端成立。
+class Program {
+    static int fails;
+
+    static void True(string what, bool got) {
+        if (got) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    static void Note(string s) {
+        if (fails > 0) { Console.WriteLine(s); }
+    }
+
+    static Canvas Render(string json, int w, int h) {
+        ChartOption o = ChartOption.FromJson(json);
+        App app = new App("a15", w, h);
+        app.BeginFrame();
+        ChartView v = ChartView.KeyedStatic(o, 7);
+        v.Render(app, 0, 0, w, h);
+        return app.canvas;
+    }
+
+    static int CountColor(Canvas c, int w, int h, int rgb,
+                          out int boxW, out int boxH) {
+        int n = 0;
+        int xLo = 0 - 1;
+        int xHi = 0 - 1;
+        int yLo = 0 - 1;
+        int yHi = 0 - 1;
+        for (int y = 0; y < h; y = y + 1) {
+            for (int x = 0; x < w; x = x + 1) {
+                if ((c.GetPixel(x, y) & 0x00FFFFFF) == rgb) {
+                    n = n + 1;
+                    if (xLo < 0 || x < xLo) { xLo = x; }
+                    if (xHi < 0 || x > xHi) { xHi = x; }
+                    if (yLo < 0 || y < yLo) { yLo = y; }
+                    if (yHi < 0 || y > yHi) { yHi = y; }
+                }
+            }
+        }
+        boxW = xLo < 0 ? 0 : xHi - xLo + 1;
+        boxH = yLo < 0 ? 0 : yHi - yLo + 1;
+        return n;
+    }
+
+    static void Main() {
+        fails = 0;
+        int W = 400;
+        int H = 300;
+
+        // ---- 1. BrkZigzag 几何（水平带在 y：扫 x）----
+        List<int> xa = new List<int>();
+        List<int> ya = new List<int>();
+        List<int> xb = new List<int>();
+        List<int> yb = new List<int>();
+        Chart.BrkZigzag(0, 4, 0, 200, 100, 110, false, xa, ya, xb, yb);
+        True("zigzag flush start", xa[0] == 0 && ya[0] == 100 && yb[0] == 110);
+        True("zigzag flush end",
+            xa[xa.Count - 1] == 200 && ya[ya.Count - 1] == 100
+            && yb[yb.Count - 1] == 110);
+        bool sawUp = false;
+        bool sawDown = false;
+        bool stepsOk = true;
+        for (int i = 1; i < xa.Count; i = i + 1) {
+            int step = xa[i] - xa[i - 1];
+            if (step < 4 || step > 20) { stepsOk = false; }
+            if (ya[i] == 96) { sawUp = true; }
+            if (ya[i] == 104) { sawDown = true; }
+        }
+        True("zigzag steps in 4..20", stepsOk);
+        True("zigzag amplitude both ways", sawUp && sawDown);
+        // 平行性：A/B 两线同向偏移，各内部点 y 差恒等于带宽。
+        bool parallel = xa.Count == xb.Count;
+        for (int i = 0; i < xa.Count && parallel; i = i + 1) {
+            if (yb[i] - ya[i] != 10) { parallel = false; }
+        }
+        True("zigzag lines parallel", parallel);
+
+        // ---- 2. 轴线断带分段 ----
+        App app2 = new App("a15b", 100, 220);
+        app2.BeginFrame();
+        Canvas c2 = app2.canvas;
+        c2.FillRect(0, 0, 100, 220, Chart.Rgb(255, 255, 255));
+        List<int> bands = new List<int>();
+        bands.Add(40);
+        bands.Add(60);
+        int blk = Chart.Rgb(0, 0, 0);
+        Chart.DrawAxisLineBands(c2, 10, 0, 200, true, 2, blk, bands);
+        True("axis line below band",
+            (c2.GetPixel(10, 30) & 0x00FFFFFF) == (blk & 0x00FFFFFF));
+        True("axis line gap inside band",
+            (c2.GetPixel(10, 50) & 0x00FFFFFF) != (blk & 0x00FFFFFF));
+        True("axis line above band",
+            (c2.GetPixel(10, 70) & 0x00FFFFFF) == (blk & 0x00FFFFFF));
+        True("axis line reaches end",
+            (c2.GetPixel(10, 199) & 0x00FFFFFF) == (blk & 0x00FFFFFF));
+
+        // ---- 3. 离屏渲染真图 ----
+        // 单条 3% 断带：填充不透明纯蓝、边框纯红，柱条绿色避免撞色。
+        // 断带画在系列之上（官方 zigzagZ=100），填充把柱整段盖住。
+        string head = "{\"xAxis\":{\"type\":\"category\","
+            + "\"data\":[\"a\",\"b\",\"c\",\"d\",\"e\",\"f\",\"g\"]},"
+            + "\"yAxis\":{\"type\":\"value\","
+            + "\"breaks\":[{\"start\":5000,\"end\":100000,\"gap\":\"3%\"}],";
+        string tail = "\"series\":[{\"type\":\"bar\","
+            + "\"itemStyle\":{\"color\":\"#00aa00\"},"
+            + "\"data\":[1500,2032,2001,3154,2190,4330,2410]}]}";
+        string brkArea = "\"breakArea\":{\"itemStyle\":{"
+            + "\"color\":\"#0000ff\",\"borderColor\":\"#ff0000\",\"opacity\":1}},";
+
+        Canvas cOn = Render(head + brkArea + tail, W, H);
+        int bw1 = 0;
+        int bh1 = 0;
+        int nFill = CountColor(cOn, W, H, 0x0000FF, out bw1, out bh1);
+        int bw2 = 0;
+        int bh2 = 0;
+        int nBorder = CountColor(cOn, W, H, 0xFF0000, out bw2, out bh2);
+        Note("fill: n=" + Convert.ToString(nFill) + " w=" + Convert.ToString(bw1));
+        Note("border: n=" + Convert.ToString(nBorder) + " w=" + Convert.ToString(bw2));
+        True("break fill drawn", nFill > 500);
+        True("break fill spans plot width", bw1 >= W / 2);
+        True("break border drawn", nBorder > 100);
+
+        // show=false：填充与边框都归零。
+        Canvas cOff = Render(head
+            + "\"breakArea\":{\"show\":false,\"itemStyle\":{"
+            + "\"color\":\"#0000ff\",\"borderColor\":\"#ff0000\",\"opacity\":1}},"
+            + tail, W, H);
+        int bw3 = 0;
+        int bh3 = 0;
+        True("show=false no fill", CountColor(cOff, W, H, 0x0000FF, out bw3, out bh3) == 0);
+        True("show=false no border", CountColor(cOff, W, H, 0xFF0000, out bw3, out bh3) == 0);
+
+        // 无 breaks：同样归零（意外画锯齿即回归）。
+        Canvas cNone = Render(
+            "{\"xAxis\":{\"type\":\"category\",\"data\":[\"a\"]},"
+            + "\"yAxis\":{\"type\":\"value\",\"breakArea\":{\"itemStyle\":{"
+            + "\"color\":\"#0000ff\",\"borderColor\":\"#ff0000\"}}},"
+            + "\"series\":[{\"type\":\"bar\",\"data\":[1]}]}", W, H);
+        int bw4 = 0;
+        int bh4 = 0;
+        True("no breaks no fill", CountColor(cNone, W, H, 0x0000FF, out bw4, out bh4) == 0);
+        True("no breaks no border", CountColor(cNone, W, H, 0xFF0000, out bw4, out bh4) == 0);
+
+        Console.WriteLine("a15-breaks:" + Convert.ToString(fails == 0 ? 1 : 0));
+    }
+}

@@ -700,6 +700,28 @@ def run_cas_and_worldstate(cookie):
        "scenerank dim3 世界BOSS damage board tops hero (floor=%s)"
        % (rows[0]["floor"] if rows else "-"))
 
+    # 仓库：入库扣背包 → 列表在 → 出库回背包 → 超量拒绝（事实层直写）
+    ok(gm_save(cookie, uid1, "市霸" + TS, gift=(124, 2)), "GM gift 祈祷之刃x2 for wh")
+    hero.clear()
+    hero.send({"op": "wh", "in": 124, "count": 2})
+    r = hero.reply_for(lambda m: "wh" in m or (m.get("ok") == 0 and "err" in m))
+    wh_rows = (r or {}).get("wh", [])
+    ok(any(x["id"] == 124 and x["count"] == 2 for x in wh_rows),
+       "wh in 124x2 lands in warehouse")
+    ok(not any(x["id"] == 124 and x.get("count", 0) > 0
+               for x in ((r or {}).get("bag") or [])),
+       "bag emptied of 124 after wh in")
+    hero.clear()
+    hero.send({"op": "wh", "out": 124, "count": 1})
+    r = hero.reply_for(lambda m: "wh" in m or (m.get("ok") == 0 and "err" in m))
+    wh_rows = (r or {}).get("wh", [])
+    ok(any(x["id"] == 124 and x["count"] == 1 for x in wh_rows),
+       "wh out 1 leaves 1 in warehouse")
+    hero.clear()
+    hero.send({"op": "wh", "out": 124, "count": 99})
+    r = hero.reply_for(lambda m: (m.get("ok") == 0 and "err" in m) or "wh" in m)
+    ok(r is not None and r.get("ok") == 0, "wh over-out rejected")
+
     # 攻占城池 1：建会需要 500 万金币 + 沃玛号角(330)，胜率随 power 抬满后必胜
     ok(gm_save(cookie, uid1, "市霸" + TS, gift=(330, 1)), "GM gift 沃玛号角")
     hero.clear()

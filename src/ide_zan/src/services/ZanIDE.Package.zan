@@ -42,21 +42,63 @@ partial class ZanIDE {
     /// path zanc should produce.
     static string MacAppPrepare(string root, string outDir, string baseName,
                                 bool windowed, List<string> log) {
-        string app = ZanIDE.MacAppDir(outDir, baseName);
-        Directory.CreateDirectoryRecursive(app + "/Contents/MacOS");
-        Directory.CreateDirectoryRecursive(app + "/Contents/Resources");
+        string outerApp = ZanIDE.MacAppDir(outDir, baseName);
+        Directory.CreateDirectoryRecursive(outerApp + "/Contents/MacOS");
+        Directory.CreateDirectoryRecursive(outerApp + "/Contents/Resources");
         string ver = ZanIDE.ProjField(root, "version");
         if (ver == "") { ver = "1.0.0"; }
         string ident = ZanIDE.ProjField(root, "bundleId");
         if (ident == "") { ident = "com.zanlang." + ZanIDE.BundleIdSafe(baseName); }
         bool icon = ZanIDE.WriteIcns(ZanIDE.IconFile(root),
-                                     app + "/Contents/Resources/app.icns");
-        if (!windowed) { ZanIDE.WriteMacLauncher(app, baseName); }
-        File.WriteAllText(app + "/Contents/Info.plist",
-            ZanIDE.InfoPlist(baseName, ident, ver, icon, windowed));
-        // A bundle without PkgInfo still launches, but Finder reads the type
-        // from it, so write the two words every .app carries.
-        File.WriteAllText(app + "/Contents/PkgInfo", "APPL????");
+                                     outerApp + "/Contents/Resources/app.icns");
+        bool multiInstance = ZanIDE.ProjMacMultiInstance(root);
+
+        if (!multiInstance) {
+            if (!windowed) {
+                ZanIDE.WriteMacLauncher(outerApp, baseName);
+            }
+            File.WriteAllText(outerApp + "/Contents/Info.plist",
+                ZanIDE.InfoPlist(baseName, ident, ver, icon, windowed, false));
+            File.WriteAllText(outerApp + "/Contents/PkgInfo", "APPL????");
+            if (icon) {
+                log.Add(ZanIDE.T("> macOS bundle: " + baseName
+                        + ".app (icon Contents/Resources/app.icns).",
+                    "> macOS 应用包：" + baseName
+                        + ".app（图标 Contents/Resources/app.icns）。"));
+            } else {
+                log.Add(ZanIDE.T("> macOS bundle: " + baseName
+                        + ".app (no icon: assets/app.ico has no PNG frame).",
+                    "> macOS 应用包：" + baseName
+                        + ".app（无图标：assets/app.ico 里没有 PNG 帧）。"));
+            }
+            return ZanIDE.MacAppExe(outDir, baseName);
+        }
+
+        // 允许多开模式：双 Bundle 跳板架构 (Two-Bundle Trampoline)
+        // 外层：outerApp (baseName.app)，作为跳板，点击后通过 open -n 启动内层核心包并立即退出
+        // 内层：coreApp (outerApp/Contents/Helpers/AppCore.app)，真实的前台 GUI 进程
+        string coreApp = outerApp + "/Contents/Helpers/AppCore.app";
+        Directory.CreateDirectoryRecursive(coreApp + "/Contents/MacOS");
+        Directory.CreateDirectoryRecursive(coreApp + "/Contents/Resources");
+
+        if (icon) {
+            ZanIDE.WriteIcns(ZanIDE.IconFile(root),
+                             coreApp + "/Contents/Resources/app.icns");
+        }
+
+        // 外层 Info.plist
+        File.WriteAllText(outerApp + "/Contents/Info.plist",
+            ZanIDE.InfoPlist(baseName, ident + ".launcher", ver, icon, true, false));
+        File.WriteAllText(outerApp + "/Contents/PkgInfo", "APPL????");
+
+        // 外层跳板脚本 (执行 open -n 启动内层 AppCore 并退出)
+        ZanIDE.WriteMacTrampoline(outerApp, baseName);
+
+        // 内层核心 Info.plist (真实前台 App)
+        File.WriteAllText(coreApp + "/Contents/Info.plist",
+            ZanIDE.InfoPlist(baseName, ident, ver, icon, windowed, false));
+        File.WriteAllText(coreApp + "/Contents/PkgInfo", "APPL????");
+
         if (icon) {
             log.Add(ZanIDE.T("> macOS bundle: " + baseName
                     + ".app (icon Contents/Resources/app.icns).",
@@ -68,7 +110,10 @@ partial class ZanIDE {
                 "> macOS 应用包：" + baseName
                     + ".app（无图标：assets/app.ico 里没有 PNG 帧）。"));
         }
-        return ZanIDE.MacAppExe(outDir, baseName);
+        log.Add(ZanIDE.T("> macOS multi-instance trampoline prepared (outer launcher -> Helpers/AppCore.app).",
+            "> macOS 允许多开跳板已就绪（外层跳板启动器 -> 辅助包 Contents/Helpers/AppCore.app）。"));
+
+        return coreApp + "/Contents/MacOS/" + baseName;
     }
 
     /// Bundle identifiers are reverse-DNS: keep letters, digits and hyphens and
@@ -105,6 +150,29 @@ partial class ZanIDE {
             + "exec /usr/bin/open -a Terminal \"$dir/" + baseName + "\"\n");
         // Only has an effect when the publish itself runs on macOS/Linux; a
         // publish from Windows carries the mode in the tar entry instead.
+        bool _x = File.SetExecutable(p, true);
+    }
+
+    /// Writes the trampoline launcher script for the outer .app bundle.
+    /// When double-clicked in macOS Finder, LaunchServices activates the existing
+    /// process if the bundle path/id is already running. The outer bundle acts as
+    /// a lightweight agent (LSUIElement=true, no Dock flash) whose executable runs
+    /// `/usr/bin/open -n -a` on the inner AppCore.app bundle and exits immediately.
+    /// Because the outer process terminates instantly, LaunchServices never considers
+    /// the outer bundle to be running, allowing every subsequent double-click to execute
+    /// the script and spawn a fresh, isolated GUI instance.
+    static void WriteMacTrampoline(string app, string baseName) {
+        string p = app + "/Contents/MacOS/" + baseName;
+        File.WriteAllText(p,
+            "#!/bin/sh\n"
+            + "dir=$(cd \"$(dirname \"$0\")\" && pwd)\n"
+            + "core=\"$dir/../Helpers/AppCore.app\"\n"
+            + "if [ $# -gt 0 ]; then\n"
+            + "    /usr/bin/open -n \"$core\" --args \"$@\"\n"
+            + "else\n"
+            + "    /usr/bin/open -n \"$core\"\n"
+            + "fi\n"
+            + "exit 0\n");
         bool _x = File.SetExecutable(p, true);
     }
 
@@ -233,7 +301,7 @@ partial class ZanIDE {
     }
 
     static string InfoPlist(string baseName, string ident, string ver,
-                            bool icon, bool windowed) {
+                            bool icon, bool windowed, bool isLauncher) {
         string exe = baseName;
         if (!windowed) { exe = ZanIDE.MacLauncherName; }
         string s = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
@@ -242,14 +310,19 @@ partial class ZanIDE {
             + "<plist version=\"1.0\">\n<dict>\n"
             + "\t<key>CFBundleName</key>\n\t<string>" + baseName + "</string>\n"
             + "\t<key>CFBundleDisplayName</key>\n\t<string>" + baseName + "</string>\n"
-            + "\t<key>CFBundleExecutable</key>\n\t<string>" + exe + "</string>\n"
-            + "\t<key>CFBundleIdentifier</key>\n\t<string>" + ident + "</string>\n"
-            + "\t<key>CFBundleVersion</key>\n\t<string>" + ver + "</string>\n"
+            + "\t<key>CFBundleExecutable</key>\n\t<string>" + exe + "</string>\n";
+        if (ident != "") {
+            s = s + "\t<key>CFBundleIdentifier</key>\n\t<string>" + ident + "</string>\n";
+        }
+        s = s + "\t<key>CFBundleVersion</key>\n\t<string>" + ver + "</string>\n"
             + "\t<key>CFBundleShortVersionString</key>\n\t<string>" + ver + "</string>\n"
             + "\t<key>CFBundlePackageType</key>\n\t<string>APPL</string>\n"
             + "\t<key>CFBundleInfoDictionaryVersion</key>\n\t<string>6.0</string>\n"
             + "\t<key>LSMinimumSystemVersion</key>\n\t<string>11.0</string>\n"
             + "\t<key>NSHighResolutionCapable</key>\n\t<true/>\n";
+        if (isLauncher) {
+            s = s + "\t<key>LSUIElement</key>\n\t<true/>\n";
+        }
         if (icon) {
             s = s + "\t<key>CFBundleIconFile</key>\n\t<string>app.icns</string>\n";
         }
@@ -371,8 +444,10 @@ partial class ZanIDE {
                                 List<string> log) {
         string dir = ZanIDE.DirOf(exe);
         if (ZanIDE.IsMacAppExe(exe)) {
-            // <dir>/<name>.app/Contents/MacOS/<name> -> the publish directory.
-            dir = ZanIDE.DirOf(ZanIDE.DirOf(ZanIDE.DirOf(dir)));
+            // Unwind past all .app bundle directory levels to the target root.
+            while (ZanIDE.ContainsS(dir, ".app")) {
+                dir = ZanIDE.DirOf(dir);
+            }
         }
         string id = Path.GetFileName(dir);
         if (!ZanIDE.StartsWith(id, "macos") && !ZanIDE.StartsWith(id, "linux")) {

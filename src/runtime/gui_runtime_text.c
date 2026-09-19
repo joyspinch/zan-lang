@@ -231,6 +231,132 @@ static int run_key_size(int size, int bold) {
     return bold ? (size | ZAN_RUN_BOLD_FLAG) : size;
 }
 
+/* ---- DirectWrite fallback runs -----------------------------------------
+ * GDI maps exactly one family per HFONT and has no glyph fallback: a code
+ * point the face lacks -- emoji above all, since Segoe UI Emoji is a color
+ * font GDI cannot paint -- rasterises as .notdef tofu. DirectWrite resolves
+ * the system fallback and paints COLR layers, and its bpp-4 tiles ride the
+ * same color-tile path the Linux FreeType (CBDT) tiles already use, so the
+ * backends need no change. dwrite.dll loads lazily and tolerates absence:
+ * without it a run keeps GDI's behaviour rather than degrading below it.
+ *
+ * The Windows SDK's dwrite.h only parses as C++, so the COM side lives in
+ * gui_runtime_dwrite.cpp; this side keeps the tile contract: family comes
+ * from the selected GDI face (labels keep their configured look), pixels
+ * come back straight-alpha BGRA, and the tile is marked ZAN_TILE_RGBA so
+ * both compositors treat it as color art, untinted. */
+extern int zan_dw_init(void);
+extern int zan_dw_text_width(const wchar_t *w, int len,
+    const wchar_t *family, float size, int bold);
+extern int zan_dw_render(const wchar_t *w, int len,
+    const wchar_t *family, float size, int bold,
+    unsigned char **out_px, int *out_w, int *out_h, int *out_advance);
+
+/* Emoji code-point ranges (Unicode 15 practical set): CJK faces like
+ * Microsoft YaHei carry MONOCHROME outline glyphs for these, so "the face
+ * has a glyph" is not enough -- a run containing one of these must go to
+ * DirectWrite, which maps it to the color emoji font. UTF-16: the SMP
+ * blocks appear as surrogate pairs, covered by the high-surrogate test. */
+static int win_cp_is_emoji(unsigned int cp) {
+    if (cp >= 0x1F000 && cp <= 0x1FFFF) return 1;   /* SMP emoji + tags */
+    if (cp >= 0xD83C && cp <= 0xD83E) return 1;     /* SMP high surrogates */
+    if (cp >= 0x2600 && cp <= 0x27BF) return 1;     /* misc symbols+dingbats */
+    if (cp >= 0x2B00 && cp <= 0x2BFF) return 1;     /* stars/arrows */
+    if (cp >= 0xFE00 && cp <= 0xFE0F) return 1;     /* variation selectors */
+    if (cp == 0x200D) return 1;                     /* ZWJ sequences */
+    if (cp == 0x20E3) return 1;                     /* keycap combine */
+    if (cp >= 0x2190 && cp <= 0x21AA) return 1;     /* arrows/hands */
+    if (cp >= 0x231A && cp <= 0x231B) return 1;
+    if (cp >= 0x23E9 && cp <= 0x23FA) return 1;
+    if (cp == 0x2139 || cp == 0x24C2) return 1;
+    if (cp >= 0x25AA && cp <= 0x25FE) return 1;
+    if (cp == 0x2934 || cp == 0x2935) return 1;
+    if (cp == 0x3030 || cp == 0x303D) return 1;
+    if (cp == 0x3297 || cp == 0x3299) return 1;
+    return 0;
+}
+
+/* Whether the run contains an emoji code point (see above): such runs must
+ * be rendered by DirectWrite -- the color emoji font is a color font GDI
+ * cannot paint, and CJK faces substitute monochrome outlines for them. */
+static int win_run_has_emoji(const wchar_t *w, int len) {
+    for (int i = 0; i < len; i++) {
+        if (win_cp_is_emoji((unsigned int)w[i])) return 1;
+    }
+    return 0;
+}
+
+/* Whether the currently selected GDI face covers every UTF-16 unit: the
+ * trigger that routes a run from the GDI tile path to the DWrite one. */
+static int win_run_has_missing(int size, int bold,
+                               const wchar_t *w, int len) {
+    HFONT font = get_or_create_font(size, bold);
+    HFONT old = (HFONT)SelectObject(g_text_dc, font);
+    WORD *gi = (WORD *)malloc((size_t)len * sizeof(WORD));
+    int missing = 0;
+    if (gi) {
+        if (GetGlyphIndicesW(g_text_dc, w, len, gi,
+                             GGI_MARK_NONEXISTING_GLYPHS)) {
+            for (int i = 0; i < len; i++) {
+                if (gi[i] == 0xFFFF) { missing = 1; break; }
+            }
+        }
+        free(gi);
+    }
+    SelectObject(g_text_dc, old);
+    return missing;
+}
+
+/* The DWrite run tile: everything the GDI face lacks resolves through the
+ * system fallback, color glyphs land as palette-colored layers. */
+static const zan_glyph_tile *win_dwrite_tile(const char *text, int size,
+                                             int bold) {
+    int key_len = (int)strlen(text);
+    int ksize = run_key_size(size, bold);
+    const zan_glyph_tile *cached =
+        zan_atlas_find(ZAN_TILE_RUN, ksize, text, key_len);
+    if (cached) return cached;
+
+    ensure_text_dc();
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
+    wchar_t *wtext = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
+    if (!wtext) return NULL;
+    MultiByteToWideChar(CP_UTF8, 0, text, -1, wtext, wlen);
+    HFONT font = get_or_create_font(size, bold);
+    HFONT old_font = (HFONT)SelectObject(g_text_dc, font);
+    wchar_t family[LF_FACESIZE];
+    GetTextFaceW(g_text_dc, LF_FACESIZE, family);
+    SelectObject(g_text_dc, old_font);
+
+    unsigned char *px = NULL;
+    int tw = 0, th = 0, adv = 0;
+    int ok = zan_dw_render(wtext, wlen - 1, family, (float)size,
+                           bold ? 1 : 0, &px, &tw, &th, &adv);
+    free(wtext);
+    if (!ok || !px) return NULL;
+
+    const zan_glyph_tile *tile = zan_atlas_store(ZAN_TILE_RUN, ksize, text,
+        key_len, tw, th, 0, 0, adv, px, 4);
+    if (tile) {
+        ((zan_glyph_tile *)tile)->flags = ZAN_TILE_RGBA;
+    }
+    free(px);
+    return tile;
+}
+
+static int win_dw_text_width(const wchar_t *w, int len, int size, int bold) {
+    ensure_text_dc();
+    HFONT font = get_or_create_font(size, bold);
+    HFONT old_font = (HFONT)SelectObject(g_text_dc, font);
+    wchar_t family[LF_FACESIZE];
+    GetTextFaceW(g_text_dc, LF_FACESIZE, family);
+    SelectObject(g_text_dc, old_font);
+    return zan_dw_text_width(w, len, family, (float)size, bold ? 1 : 0);
+}
+
+
+
+
 /* The coverage tile of a whole text run, rasterised by GDI on the first use of
  * that (text, size) and cached in the glyph atlas afterwards.
  *
@@ -311,6 +437,11 @@ EXPORT void zan_gui_draw_text(
     }
 
     const zan_glyph_tile *tile = win_run_tile(text, size, 0);
+    if (!tile) {
+        /* The GDI face lacks a glyph (emoji): re-render through DirectWrite
+         * with the system fallback, color glyphs included. */
+        tile = win_dwrite_tile(text, size, 0);
+    }
     if (tile) {
         zan_glyph_item item;
         item.tile = tile;
@@ -342,6 +473,7 @@ EXPORT void zan_gui_draw_text_bold(
 
     ensure_text_dc();
     const zan_glyph_tile *tile = win_run_tile(text, size, 1);
+    if (!tile) tile = win_dwrite_tile(text, size, 1);
     if (tile) {
         zan_glyph_item item;
         item.tile = tile;
@@ -539,8 +671,16 @@ static int measure_text_gdi(const char *text, int size) {
     HFONT old_font = (HFONT)SelectObject(g_text_dc, font);
     SIZE text_size;
     GetTextExtentPoint32W(g_text_dc, wtext, wlen - 1, &text_size);
+    int missing = win_run_has_emoji(wtext, wlen - 1);
     SelectObject(g_text_dc, old_font);
+    /* Emoji runs: GDI measures the .notdef boxes, the tile is drawn from
+     * the DWrite layout -- keep width and paint on the same metrics. */
+    int w = 0;
+    if (missing) {
+        w = win_dw_text_width(wtext, wlen - 1, size, 0);
+    }
     free(wtext);
+    if (w > 0) return w;
     return (int)text_size.cx;
 }
 

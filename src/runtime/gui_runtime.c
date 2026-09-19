@@ -110,8 +110,9 @@ typedef struct zan_surface_s {
     int clip_y0;
     int clip_x1;
     int clip_y1;
-    int clip_stack[64];
+    int clip_stack[256];
     int clip_depth;
+    int clip_overflow;
     /* 0 until a whole-surface clear has run on it: a brand-new surface holds
      * whatever the allocator handed back (usually the *previous* surface of a
      * drag-resize, laid out at its old stride), so presenting it paints sheared
@@ -367,6 +368,7 @@ static void clip_reset_full(zan_surface_t *s) {
     s->clip_x1 = s->width;
     s->clip_y1 = s->height;
     s->clip_depth = 0;
+    s->clip_overflow = 0;
     clip_notify(s);
 }
 
@@ -675,28 +677,30 @@ EXPORT void zan_gui_push_clip(i32 surface_id, i32 x, i32 y, i32 w, i32 h) {
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
     int cap = (int)(sizeof(s->clip_stack) / sizeof(s->clip_stack[0]));
-    if (s->clip_depth * 4 + 4 <= cap) {
+    if (s->clip_depth * 4 + 4 <= cap && s->clip_overflow == 0) {
         s->clip_stack[s->clip_depth * 4 + 0] = s->clip_x0;
         s->clip_stack[s->clip_depth * 4 + 1] = s->clip_y0;
         s->clip_stack[s->clip_depth * 4 + 2] = s->clip_x1;
         s->clip_stack[s->clip_depth * 4 + 3] = s->clip_y1;
         s->clip_depth++;
+        int nx0 = (int)x;
+        int ny0 = (int)y;
+        int nx1 = (int)x + (int)w;
+        int ny1 = (int)y + (int)h;
+        if (nx0 < s->clip_x0) nx0 = s->clip_x0;
+        if (ny0 < s->clip_y0) ny0 = s->clip_y0;
+        if (nx1 > s->clip_x1) nx1 = s->clip_x1;
+        if (ny1 > s->clip_y1) ny1 = s->clip_y1;
+        if (nx1 < nx0) nx1 = nx0;
+        if (ny1 < ny0) ny1 = ny0;
+        s->clip_x0 = nx0;
+        s->clip_y0 = ny0;
+        s->clip_x1 = nx1;
+        s->clip_y1 = ny1;
+        clip_notify(s);
+    } else {
+        s->clip_overflow++;
     }
-    int nx0 = (int)x;
-    int ny0 = (int)y;
-    int nx1 = (int)x + (int)w;
-    int ny1 = (int)y + (int)h;
-    if (nx0 < s->clip_x0) nx0 = s->clip_x0;
-    if (ny0 < s->clip_y0) ny0 = s->clip_y0;
-    if (nx1 > s->clip_x1) nx1 = s->clip_x1;
-    if (ny1 > s->clip_y1) ny1 = s->clip_y1;
-    if (nx1 < nx0) nx1 = nx0;
-    if (ny1 < ny0) ny1 = ny0;
-    s->clip_x0 = nx0;
-    s->clip_y0 = ny0;
-    s->clip_x1 = nx1;
-    s->clip_y1 = ny1;
-    clip_notify(s);
 }
 
 /* Restore the clip window saved by the most recent zan_gui_push_clip. */
@@ -704,6 +708,10 @@ EXPORT void zan_gui_pop_clip(i32 surface_id) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
+    if (s->clip_overflow > 0) {
+        s->clip_overflow--;
+        return;
+    }
     if (s->clip_depth > 0) {
         s->clip_depth--;
         s->clip_x0 = s->clip_stack[s->clip_depth * 4 + 0];

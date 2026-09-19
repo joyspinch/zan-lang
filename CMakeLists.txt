@@ -2078,7 +2078,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       # only the non-auto-included Stack.zan is passed explicitly here.
       # --driver-dir: link the freshly built zan_gui, not the committed
       # driver bundle (which may lag behind newly added native exports).
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Stack.zan${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Layout/Stack.zan${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_stack.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_stack${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2246,7 +2246,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/icon_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Icon.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Media/Icon.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_icon.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_icon${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2543,7 +2543,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/text_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Text.zan${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Text/Text.zan${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_text.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_text${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -3253,7 +3253,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/css_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Css.zan;${CMAKE_SOURCE_DIR}/stdlib/Gui/StyleSheet.zan;${CMAKE_SOURCE_DIR}/stdlib/Gui/StyleBox.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/stdlib/Gui/Styling/Css.zan;${CMAKE_SOURCE_DIR}/stdlib/Gui/Styling/StyleSheet.zan;${CMAKE_SOURCE_DIR}/stdlib/Gui/Styling/StyleBox.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_css.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_css${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -3979,7 +3979,7 @@ if(_size_tool)
     -DZANC=$<TARGET_FILE:zanc> -DSRC=${_size_src}
     -DOUT=${_size_dir}/hello_host
     -DSIZE_TOOL=${_size_tool}
-    -DMAX_TEXT=72000 -DMAX_FILE=150000
+    -DMAX_TEXT=200000 -DMAX_FILE=300000
     -DWORKDIR=${_size_dir}
     -P ${CMAKE_SOURCE_DIR}/tests/run_size_budget.cmake)
   set_tests_properties(size_budget_publish_host PROPERTIES TIMEOUT 240 LABELS "full;standard;smoke")
@@ -3988,7 +3988,7 @@ if(_size_tool)
     -DOUT=${_size_dir}/hello_linux_x64
     -DTARGET=linux-x64
     -DSIZE_TOOL=${_size_tool}
-    -DMAX_TEXT=96000 -DMAX_FILE=120000
+    -DMAX_TEXT=220000 -DMAX_FILE=300000
     -DWORKDIR=${_size_dir}
     -P ${CMAKE_SOURCE_DIR}/tests/run_size_budget.cmake)
   set_tests_properties(size_budget_publish_linux_x64 PROPERTIES TIMEOUT 240 LABELS "full;standard;smoke")

@@ -63,6 +63,48 @@ class WidgetId {
 }
 
 /// <summary>
+/// 32 位 FNV-1a 路径哈希算法实现。
+/// 用于现代即时模式 UI 的层级路径 ID（Path Hash ID Stack）计算。
+/// </summary>
+class IdHash {
+    /// 对字符串 key 进行 FNV-1a 哈希。
+    /// 支持 "Label###CustomId" 语法：若包含 "###"，则仅对其后半部分进行哈希。
+    static int HashString(string key, int seed) {
+        int h = seed;
+        if (h == 0) {
+            h = 2166136261;
+        }
+        int start = 0;
+        int sep = key.IndexOf("###");
+        if (sep >= 0) {
+            start = sep + 3;
+        }
+        int len = key.Length;
+        for (int i = start; i < len; i = i + 1) {
+            int b = (int)key[i] & 255;
+            h = (h ^ b) * 16777619;
+        }
+        // 将哈希输出安全映射至 [10_000_000, 1_083_741_823]
+        int id = 10000000 + (h & 1073741823);
+        return id;
+    }
+
+    /// 对 32 位整型 key 进行 FNV-1a 哈希（展开 4 字节）。
+    static int HashInt(int key, int seed) {
+        int h = seed;
+        if (h == 0) {
+            h = 2166136261;
+        }
+        h = (h ^ (key & 255)) * 16777619;
+        h = (h ^ ((key >>> 8) & 255)) * 16777619;
+        h = (h ^ ((key >>> 16) & 255)) * 16777619;
+        h = (h ^ ((key >>> 24) & 255)) * 16777619;
+        int id = 10000000 + (h & 1073741823);
+        return id;
+    }
+}
+
+/// <summary>
 /// 即时模式 UI 的焦点/悬停/按压状态机：按控件 id 记录当前与
 /// 上一渲染帧的三个目标 id，维护 Tab 焦点环、嵌套 id 段与
 /// IME 会话跟随。App 在解析每帧指针/键盘事件时写入，
@@ -96,6 +138,10 @@ class FocusManager {
     /// 当前 IME 会话归属的控件 id（-1=会话关闭）。只在
     /// 翻转时通知后端；Android 软键盘随会话显隐。
     int imeSessionId;
+    /// 路径哈希 ID 栈（Path Hash ID Stack）。
+    List<int> idStack;
+    /// 当前作用域内的局部序列号（供作用域内的 AllocId 使用）。
+    int scopeAutoSeq;
 
     FocusManager() {
         focusedId = -1;
@@ -110,10 +156,58 @@ class FocusManager {
         scopeReturn = new List<int>();
         textIds = new List<int>();
         imeSessionId = -1;
+        idStack = new List<int>();
+        scopeAutoSeq = 0;
     }
 
-    /// 本帧的下一个即时模式 id（按注册顺序递增，从 0 开始）。
+    /// 当前作用域的基准种子 ID（栈空时使用 FNV 初始值）。
+    int CurrentScopeId() {
+        if (idStack != null && idStack.Count > 0) {
+            return idStack[idStack.Count - 1];
+        }
+        return 2166136261;
+    }
+
+    /// 在当前作用域下计算指定字符串 key 的哈希 ID（不入栈）。
+    int GetId(string strKey) {
+        return IdHash.HashString(strKey, this.CurrentScopeId());
+    }
+
+    /// 在当前作用域下计算指定整数 key 的哈希 ID（不入栈）。
+    int GetId(int intKey) {
+        return IdHash.HashInt(intKey, this.CurrentScopeId());
+    }
+
+    /// 压入字符串命名的子作用域。
+    void PushId(string strKey) {
+        int id = this.GetId(strKey);
+        idStack.Add(id);
+        scopeAutoSeq = 0;
+    }
+
+    /// 压入整数命名的子作用域（如循环下标 i）。
+    void PushId(int intKey) {
+        int id = this.GetId(intKey);
+        idStack.Add(id);
+        scopeAutoSeq = 0;
+    }
+
+    /// 弹出当前作用域。
+    void PopId() {
+        if (idStack != null && idStack.Count > 0) {
+            idStack.RemoveAt(idStack.Count - 1);
+        }
+        scopeAutoSeq = 0;
+    }
+
+    /// 本帧的下一个即时模式 id。
+    /// 若在 PushId 作用域内，根据当前层级路径自动派发稳定的哈希 ID；
+    /// 若在作用域外，回退为全局线性递增（完全保持向后兼容）。
     int AllocId() {
+        if (idStack != null && idStack.Count > 0) {
+            scopeAutoSeq = scopeAutoSeq + 1;
+            return this.GetId(scopeAutoSeq);
+        }
         int id = nextId;
         nextId = nextId + 1;
         return id;
@@ -143,6 +237,8 @@ class FocusManager {
         tabOrder = new List<int>();
         scopeReturn = new List<int>();
         textIds = new List<int>();
+        if (idStack != null) { idStack.Clear(); }
+        scopeAutoSeq = 0;
     }
 
     /// 可聚焦控件每帧（按渲染顺序）记录自身，使键盘

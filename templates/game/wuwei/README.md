@@ -1,9 +1,10 @@
 # 无为修仙传 · Zan 重制版
 
-原版《无为修仙传》（Godot 版）的 Zan 原生重制：全部界面由标准库 Gui
-保留模式组件 + CSS 皮肤（`skins/wuwei`）完成，无自绘、无 WebView；
-数值全部来自 `data/` 下的表格；发布版表格 AES-GCM 加密、美术音频
-内嵌进 exe，单文件即可运行。
+原版《无为修仙传》（Godot 版）的 Zan 原生重制：界面结构由 `src/App.html`
+设计稿声明（GenForm 编译期展开成 partial 类的类型化字段），`main.zan`
+只写 code-behind（生命周期、事件、模型刷新、存档）；外观由 CSS 皮肤
+（`skins/wuwei`）完成，无自绘、无 WebView；数值全部来自 `data/` 下的
+表格；发布版表格 AES-GCM 加密、美术音频内嵌进 exe，单文件即可运行。
 
 ## 快速开始
 
@@ -33,6 +34,9 @@ tools/test.ps1 -Gui      # 追加 UiDriver 驱动的真实窗口回归
 - **成就**：33 项成就；设置页音量调节，背景音乐循环播放。
 
 主菜单按原作版式复刻：整幅背景、题字、四个入口，加载资源后进入。
+游戏主壳的中部 16 个页面均为 flex 纵列（`zan-flex class="column"`）：
+定高行声明尺寸、卡片与行带 `grow` 撑满剩余空间，任何窗口尺寸下页面
+正好填满视口——不出现滚动条，也不留页底死空间。
 
 ## 存档
 
@@ -43,7 +47,7 @@ tools/test.ps1 -Gui      # 追加 UiDriver 驱动的真实窗口回归
 
 | 路径 | 内容 |
 |------|------|
-| `src/` | 游戏源码（`main.zan` 界面与流程，`Game.zan` 无头模型，`Tables.zan` 表格装载，`Save.zan` 加密存档，`Profiles.zan` 槽位，`AudioService.zan` 音乐） |
+| `src/` | 游戏源码（`App.html` 界面设计稿，`main.zan` code-behind 生命周期与流程，`Game.zan` 无头模型，`Tables.zan` 表格装载，`Save.zan` 加密存档，`Profiles.zan` 槽位，`AudioService.zan` 音乐） |
 | `data/` | 21 张权威数值表（CSV，UTF-8）。`source_tables.csv` 是原作表格存档，仅参考、不参与发布 |
 | `assets/` | 美术与音频（WebP/OGG），发布时内嵌 |
 | `skins/wuwei/` | 皮肤包（按路径打包：IDE 与 `--embed skins=skins` 都认这个目录） |

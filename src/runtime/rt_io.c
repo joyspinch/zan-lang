@@ -4182,6 +4182,11 @@ static void co_trace(const char *what, const void *fp) {
 
 /* Drain stuck 3s: dump the whole ring (diagnostics; oldest overwritten). */
 static void co_trace_dump(long long live) {
+    if (g_co_trace < 0) {
+        const char *e = getenv("ZAN_CO_TRACE");
+        g_co_trace = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    if (!g_co_trace) return;
     long long total = g_tr_seq;
     long long first = total - ZAN_TR_RING;
     if (first < 0) first = -1;
@@ -4892,29 +4897,15 @@ void zan_co_sched_run(void) {
  * until their own job completes, not until global quiescence). */
 void zan_co_sched_run_until(const volatile int *done) {
     if (g_co_pool_live && done != NULL) {
-        /* Pool runs the work; this thread only waits. First for the ONE
-         * frame it named -- yield-spin so a frame that completes in
-         * microseconds (an ORM hit on a warm pool) does not eat a 1ms
-         * sleep granularity -- then for global quiescence, matching the
-         * foreground drain contract (a mid-flight frame must not be cut
-         * down by process exit; frames own ARC state that is released on
-         * completion). */
+        /* Pool runs the work; this thread only waits for the ONE frame it
+         * named -- yield-spin so a frame that completes in microseconds
+         * does not eat a 1ms sleep granularity. Once *done is set, return
+         * immediately so callers are not blocked by long-running background
+         * tasks (e.g. metrics flushers or timers). */
         int spins = 0;
         while (!*done) {
             if (spins < 512) { Sleep(0); spins++; }
             else Sleep(1);
-        }
-        while (zan_co_pending() > 0 || zan_io_has_pending() ||
-               zan_timer_pending() > 0 || zan_co_live_count() > 0 ||
-               g_co_running > 0) {
-            Sleep(1);
-            static DWORD stuck_since = 0;
-            DWORD nowk = GetTickCount();
-            if (stuck_since == 0) { stuck_since = nowk; continue; }
-            if (nowk - stuck_since > 3000) {
-                co_trace_dump(zan_co_live_count());
-                stuck_since = nowk;
-            }
         }
         return;
     }

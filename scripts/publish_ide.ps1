@@ -75,8 +75,6 @@ $distFull = [IO.Path]::GetFullPath($dist)
 foreach ($src in @($b, $stdlib, $packages,
                    (Join-Path $root 'examples'),
                    (Join-Path $root 'templates'))) {
-                   (Join-Path $root 'examples'),
-                   (Join-Path $root 'templates'))) {
     $srcFull = [IO.Path]::GetFullPath($src)
     $nested = $srcFull -eq $distFull -or $distFull -eq $srcFull -or
               $distFull.StartsWith($srcFull + [IO.Path]::DirectorySeparatorChar,
@@ -205,8 +203,12 @@ if (Test-Path $ld) {
 } else {
     Write-Output "PUBLISH_WARN: build\ld.exe missing; dist zanc will need a system LLVM/clang on PATH"
 }
-foreach ($sub in @('linux-musl', 'linux-arm64', 'win-x64', 'win-arm64', 'wasm32', 'riscv64', 'macos')) {
+foreach ($sub in @('linux-musl', 'linux-arm64', 'linux-riscv64', 'win-x64', 'win-arm64', 'wasm32', 'riscv64', 'macos', 'ios', 'ohos-x64', 'ohos-arm64')) {
     $sys = Join-Path $b $sub
+    if (-not (Test-Path $sys)) {
+        # Fallback to source tree toolchain/ if build/ has not staged it yet
+        $sys = Join-Path (Join-Path $root 'toolchain') $sub
+    }
     if (Test-Path $sys) { Copy-Item $sys (Join-Path $distTc $sub) -Recurse }
 }
 foreach ($rt in (Get-ChildItem $b -File -ErrorAction SilentlyContinue |

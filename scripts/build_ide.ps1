@@ -133,11 +133,14 @@ if ($designs.Count -gt 0) {
     Write-Output ("[designs] " + ($designs.Count + 1))
 }
 
+$exeOut = Join-Path (Get-Location) "build\ZanIDE.exe"
+$exeOld = Join-Path (Get-Location) "build\ZanIDE.prev.exe"
+
 $zanArgs = @()
 $zanArgs += $entry
 $zanArgs += $files
 $zanArgs += @("-DZAN_PROJECT_COMPONENTS")
-$zanArgs += @("-o", "build\ZanIDE.exe", "--subsystem", "windows")
+$zanArgs += @("-o", $exeOut, "--subsystem", "windows")
 # Release shape (--publish): Os codegen + the optimization sweep + a stripped
 # link. The unoptimized dev default (O0 + fast_codegen) made the exe ~21 MB,
 # of which 13.8 MB was .text alone; the same sources publish to ~14 MB. The
@@ -182,8 +185,6 @@ if ($env:ZAN_IDE_ZANC_ARGS) {
 # overwrite it ("Permission denied"). Windows does allow RENAMING a running
 # image: park it aside (and clear the previous parked copy) so a rebuild never
 # needs the editor to be closed first.
-$exeOut = Join-Path (Get-Location) "build\ZanIDE.exe"
-$exeOld = Join-Path (Get-Location) "build\ZanIDE.prev.exe"
 if (Test-Path -LiteralPath $exeOld) {
     Remove-Item -LiteralPath $exeOld -Force -ErrorAction SilentlyContinue
 }

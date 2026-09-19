@@ -3,6 +3,7 @@ using System.IO;
 using System.Diagnostics;
 using System.Json;
 using Platform;
+using Gui.Component;
 
 // ---- LSP protocol entities ------------------------------------------------
 // Request/notification envelopes and payloads are serialized via
@@ -84,6 +85,41 @@ class LspLocationsResult {
 
 class LspHoverResult {
     JsonValue result;
+}
+
+class LspCompletionItem {
+    string label;
+    int kind;
+    string detail;
+    JsonValue documentation;
+    string insertText;
+    int insertTextFormat;
+    string sortText;
+}
+
+class LspCompletionsResult {
+    List<LspCompletionItem> result;
+}
+
+class LspParameterInformation {
+    string label;
+    JsonValue documentation;
+}
+
+class LspSignatureInformation {
+    string label;
+    JsonValue documentation;
+    List<LspParameterInformation> parameters;
+}
+
+class LspSignatureHelp {
+    List<LspSignatureInformation> signatures;
+    int activeSignature;
+    int activeParameter;
+}
+
+class LspSignatureHelpResult {
+    LspSignatureHelp result;
 }
 
 /// A live Language Server Protocol client that drives a spawned `zan-lsp`
@@ -369,6 +405,27 @@ class LspSession {
         return contents.Str("value", "");
     }
 
+    /// Semantic completion items at the position (empty list when none).
+    List<LspCompletionItem> Completion(string path, int line0, int col0) {
+        List<LspCompletionItem> empty = new List<LspCompletionItem>();
+        string m = this.RequestWait("textDocument/completion",
+            LspSession.PosParams(path, line0, col0));
+        if (m.Length == 0) { return empty; }
+        LspCompletionsResult r = Json.Deserialize<LspCompletionsResult>(m);
+        if (r == null || r.result == null) { return empty; }
+        return r.result;
+    }
+
+    /// Signature help for the call at the position (null when none).
+    LspSignatureHelp SignatureHelp(string path, int line0, int col0) {
+        string m = this.RequestWait("textDocument/signatureHelp",
+            LspSession.PosParams(path, line0, col0));
+        if (m.Length == 0) { return null; }
+        LspSignatureHelpResult r = Json.Deserialize<LspSignatureHelpResult>(m);
+        if (r == null || r.result == null) { return null; }
+        return r.result;
+    }
+
     static string PosParams(string path, int line0, int col0) {
         LspDocPosParams p = new LspDocPosParams();
         p.textDocument = LspSession.UriObj(path);
@@ -574,5 +631,34 @@ class LspSession {
             this.rbuf = this.rbuf + chunk;
         }
         return "";
+    }
+
+    /// 把当前 LSP 会话挂载到 CodeEditor 上，接管智能补全与参数签名帮助
+    void BindToEditor(CodeEditor editor) {
+        if (editor == null) { return; }
+        LspSession self = this;
+        editor.externalCompletion = (string path, int line0, int col0) => {
+            List<LspCompletionItem> items = self.Completion(path, line0, col0);
+            if (items == null || items.Count == 0) { return null; }
+            List<CodeCompletionItem> res = new List<CodeCompletionItem>();
+            for (int i = 0; i < items.Count; i = i + 1) {
+                string k = "M";
+                if (items[i].kind == 7) { k = "C"; }
+                else if (items[i].kind == 5) { k = "F"; }
+                else if (items[i].kind == 10) { k = "P"; }
+                else if (items[i].kind == 14) { k = "K"; }
+                res.Add(new CodeCompletionItem(items[i].label, k, items[i].detail, ""));
+            }
+            return res;
+        };
+        editor.externalSignature = (string path, int line0, int col0, string callee) => {
+            LspSignatureHelp sh = self.SignatureHelp(path, line0, col0);
+            if (sh == null || sh.signatures == null || sh.signatures.Count == 0) {
+                return "";
+            }
+            int actSig = sh.activeSignature;
+            if (actSig < 0 || actSig >= sh.signatures.Count) { actSig = 0; }
+            return sh.signatures[actSig].label;
+        };
     }
 }

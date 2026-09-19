@@ -76,6 +76,7 @@ class App {
     // 声称有像素变了。自动化驱动、外部泵这类需要循环持续转的
     // 场景用它，避免为了轮询而把每一帧都升级成整窗重绘。
     bool pollPending;
+    int lastPollResult;
     /// 被 SafeFrame/PumpSafe 捕下的帧异常计数与最后一条消息：
     /// 界面可以把它当状态显示（“本次运行有 N 个错误”）。
     int frameErrors;
@@ -1369,7 +1370,7 @@ class App {
         skinPacks = Skin.Names();
         themeNames = Skin.Labels(skinPacks);
         if (themeMenuBaseId == 0) {
-            themeMenuBaseId = WidgetId.Block(themeNames.Count + 40);
+            themeMenuBaseId = WidgetId.Block(themeNames.Count);
         }
         themeMenuModel.Set(index);
         appliedSkin = index;
@@ -2152,6 +2153,12 @@ class App {
         StyleBox shapeStyle = Style.Part(this, "windowbg", "shape", "",
                                           "", "", Style.SNormal());
         int col = shapeStyle.BgOr(0);
+        if (col == 0) {
+            StyleBox bgStyle = Style.Full(this, "windowbg", "", "",
+                                          Style.SNormal());
+            col = bgStyle.BgOr(0);
+        }
+        if (col == 0) { return; }
         int i = 0;
         while (i + 5 < shapeRects.Count) {
             int t = shapeRects[i];
@@ -2616,6 +2623,21 @@ class App {
             phaseSecTop = Convert.ToString(scopeId);
         }
     }
+
+    /// 压入字符串命名的 ID 作用域（Path Hash ID Stack）。
+    void PushId(string strKey) { focus.PushId(strKey); }
+
+    /// 压入整数命名的 ID 作用域（如循环下标 i）。
+    void PushId(int intKey) { focus.PushId(intKey); }
+
+    /// 弹出当前 ID 作用域。
+    void PopId() { focus.PopId(); }
+
+    /// 计算指定字符串 key 在当前作用域下的唯一哈希 ID。
+    int GetId(string strKey) { return focus.GetId(strKey); }
+
+    /// 计算指定整数 key 在当前作用域下的唯一哈希 ID。
+    int GetId(int intKey) { return focus.GetId(intKey); }
 
     /// StyleBox 在画玻璃时登记面板矩形（本帧内有效）。见 glassRects。
     void NoteGlassRect(int x, int y, int w, int h) {
@@ -4505,6 +4527,19 @@ class App {
         pollPending = true;
     }
 
+    /// <summary>
+    /// 以非阻塞轮询方式处理一个挂起的 OS 消息/事件：
+    /// 返回 1 = 成功分发了一个事件；
+    /// 返回 0 = 当前队列无挂起事件（已排空）；
+    /// 返回 -1 = 收到窗口关闭请求 (WM_QUIT)。
+    /// </summary>
+    int PollOneEvent() {
+        this.SetPollEventMode();
+        if (!this.ProcessEvent()) { return 0 - 1; }
+        if (this.lastPollResult == 0) { return 1; }
+        return 0;
+    }
+
     bool ProcessEvent() {
         // 推进活动的自动化脚本（注入合成事件，
         // 由同一循环随后轮询并分发）。未启用驱动时为空操作。
@@ -4591,6 +4626,7 @@ class App {
             result = window.WaitEvent();
         }
         if (App.PerfOn()) { this.PerfLoopTick(loopT0, loopPath); }
+        this.lastPollResult = result;
         if (result < 0) {
             this.StopLoop();
             return false;
