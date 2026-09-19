@@ -570,20 +570,36 @@ static LLVMMetadataRef di_builtin_composite(zan_irgen_t *g, zan_type_t *t,
                                               0, "", 0);
     }
 
-    /* { i64 count, i64 capacity, i8** keys, i64* values, ... } -- Dict; the
+    /* { i64 count, i64 capacity, i8** keys, i64* values, ... } -- Dict / Dictionary; the
      * four documented fields are described, the hash-index tail stays out. */
-    if (di_type_named(t, "Dict")) {
+    if (di_type_named(t, "Dict") || di_type_named(t, "Dictionary")) {
         LLVMMetadataRef keys = LLVMDIBuilderCreatePointerType(
             g->di_builder, bytep, 64, 0, 0, "", 0);
+        LLVMMetadataRef vals = LLVMDIBuilderCreatePointerType(
+            g->di_builder, i64, 64, 0, 0, "", 0);
         LLVMMetadataRef members[4] = {
             di_member(g, file, file, "count", i64, 0, 8, 1),
             di_member(g, file, file, "capacity", i64, 8, 8, 1),
             di_member(g, file, file, "keys", keys, 16, 8, 1),
-            di_member(g, file, file, "values", keys, 24, 8, 1),
+            di_member(g, file, file, "values", vals, 24, 8, 1),
         };
         LLVMMetadataRef composite = LLVMDIBuilderCreateStructType(
             g->di_builder, file, name, strlen(name), file, 1, 0, 0,
             LLVMDIFlagZero, NULL, members, 4, 0, NULL, NULL, 0);
+        return LLVMDIBuilderCreatePointerType(g->di_builder, composite, 64, 0,
+                                              0, "", 0);
+    }
+
+    /* { i64 completed, i64 result, i64 thread_handle } -- Task */
+    if (di_type_named(t, "Task")) {
+        LLVMMetadataRef members[3] = {
+            di_member(g, file, file, "completed", i64, 0, 8, 1),
+            di_member(g, file, file, "result", i64, 8, 8, 1),
+            di_member(g, file, file, "thread_handle", i64, 16, 8, 1),
+        };
+        LLVMMetadataRef composite = LLVMDIBuilderCreateStructType(
+            g->di_builder, file, name, strlen(name), file, 1, 24 * 8, 0,
+            LLVMDIFlagZero, NULL, members, 3, 0, NULL, NULL, 0);
         return LLVMDIBuilderCreatePointerType(g->di_builder, composite, 64, 0,
                                               0, "", 0);
     }
@@ -643,6 +659,25 @@ static LLVMMetadataRef di_class_composite(zan_irgen_t *g, zan_type_t *t,
 
     unsigned long cursor = 0, max_align = 1, size = 0;
     int slot = 0;
+
+    if (vptr && slot < nslots) {
+        unsigned long fsize = abi_size_of(e->field_llvm[0]);
+        unsigned long off;
+        if (e->explicit_layout) {
+            off = e->field_offsets[0];
+        } else {
+            unsigned long fa = abi_align_of(e->field_llvm[0]);
+            off = di_align_up(cursor, fa);
+            cursor = off + fsize;
+            if (fa > max_align) max_align = fa;
+            if (cursor > size) size = cursor;
+        }
+        LLVMMetadataRef mty = di_byte_ptr(g); /* hidden vtable pointer */
+        members[slot] = di_member(g, rec->placeholder, file, "$vptr", mty, off,
+                                  fsize, line);
+        slot++;
+    }
+
     for (int i = 0; i < sym->member_count && slot < nslots; i++) {
         zan_symbol_t *m = sym->members[i];
         if ((m->kind != SYM_FIELD && m->kind != SYM_PROPERTY) ||
@@ -660,23 +695,14 @@ static LLVMMetadataRef di_class_composite(zan_irgen_t *g, zan_type_t *t,
             if (cursor > size) size = cursor;
         }
 
-        LLVMMetadataRef mty = NULL;
         zan_type_t *ft = di_subst_param(m->type, t);
         if (!ft) ft = m->type;
-        if (vptr && slot == 0) {
-            mty = di_byte_ptr(g); /* hidden vtable pointer */
-        } else {
-            mty = di_type_for_zan(g, ft, t, depth + 1);
-            if (!mty) mty = di_byte_ptr(g);
-        }
+        LLVMMetadataRef mty = di_type_for_zan(g, ft, t, depth + 1);
+        if (!mty) mty = di_byte_ptr(g);
 
         char mname[128];
-        if (vptr && slot == 0) {
-            snprintf(mname, sizeof(mname), "$vptr");
-        } else {
-            snprintf(mname, sizeof(mname), "%.*s", (int)m->name.len,
-                     m->name.str);
-        }
+        snprintf(mname, sizeof(mname), "%.*s", (int)m->name.len,
+                 m->name.str);
         members[slot] = di_member(g, rec->placeholder, file, mname, mty, off,
                                   fsize, line);
         slot++;
@@ -872,7 +898,11 @@ static LLVMMetadataRef di_type_for_zan(zan_irgen_t *g, zan_type_t *t,
         return di_type_for_zan(g, t->element_type, inst, depth + 1);
     case TYPE_ENUM:
         return di_basic(g, "int", 32, ZAN_DI_ATE_SIGNED);
-    case TYPE_TASK:
+    case TYPE_TASK: {
+        LLVMMetadataRef bi = di_builtin_composite(g, t, depth);
+        if (bi) return bi;
+        return di_byte_ptr(g);
+    }
     case TYPE_DELEGATE:
     case TYPE_OBJECT:
         return di_byte_ptr(g);
@@ -890,7 +920,8 @@ static LLVMMetadataRef di_type_for_zan(zan_irgen_t *g, zan_type_t *t,
 static void di_declare_var(zan_irgen_t *g, zan_istr_t name, LLVMValueRef storage,
                            zan_type_t *zt) {
     if (!g || !g->emit_debug || !g->builder) return;
-    if (!storage || !LLVMIsAAllocaInst(storage)) return;
+    if (!storage) return;
+    if (!LLVMIsAAllocaInst(storage) && !zt) return;
     if (name.len == 0 || !name.str) return;
     LLVMBasicBlockRef bb = LLVMGetInsertBlock(g->builder);
     if (!bb) return;
@@ -898,7 +929,7 @@ static void di_declare_var(zan_irgen_t *g, zan_istr_t name, LLVMValueRef storage
     if (!sp) return;
     LLVMMetadataRef ty = NULL;
     if (zt) ty = di_type_for_zan(g, zt, zt, 0);
-    if (!ty) ty = di_type_from_llvm(g, LLVMGetAllocatedType(storage));
+    if (!ty && LLVMIsAAllocaInst(storage)) ty = di_type_from_llvm(g, LLVMGetAllocatedType(storage));
     if (!ty) return; /* aggregate: not described yet */
     LLVMMetadataRef file = di_file_for(g, g->di_cur_file);
     unsigned line = g->di_cur_line ? g->di_cur_line : 1;
