@@ -17,6 +17,11 @@ class DateTime {
     [DllImport("crt")]
     static extern long time(nint ptr);
 
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "GetSystemTimeAsFileTime")]
+    static extern void GetSystemTimeAsFileTime(nint lpFileTime);
+    #endif
+
     /// 本机时区换算全部交给 libc 的时区库：localtime 把纪元秒展开成本地
     /// 墙钟字段，再用 timegm（Windows 上是 _mkgmtime）把这组字段当作 UTC
     /// 折回纪元秒，两者之差就是该时刻的实际偏移（自带夏令时）。
@@ -32,7 +37,9 @@ class DateTime {
     static extern long plat_timegm(nint tm);
     #endif
 
-    /// 自 1970-01-01T00:00:00Z 以来的秒数。
+    /// 自 1970-01-01T00:00:00Z 以来的毫秒数。
+    long epochMs;
+    /// 自 1970-01-01T00:00:00Z 以来的秒数（向后兼容）。
     long epoch;
     /// 年。
     int year;
@@ -46,15 +53,40 @@ class DateTime {
     int minute;
     /// 秒，0..59。
     int second;
+    /// 毫秒，0..999。
+    int millisecond;
     /// 星期几，0=星期日 .. 6=星期六。
     int dayOfWeek;
 
-    /// <summary>根据 Unix 时间戳（秒，UTC）构造时刻。</summary>
-    DateTime(long unixSeconds) {
-        epoch = unixSeconds;
+    /// <summary>内部精确获取当前系统 Unix 纪元毫秒。</summary>
+    static long GetCurrentUnixMilliseconds() {
+        #if WINDOWS
+        nint p = NativeMemory.Alloc(8);
+        GetSystemTimeAsFileTime(p);
+        long ft = new Span<long>(p, 1)[0];
+        NativeMemory.Free(p);
+        // 100ns 刻度折算为毫秒，减去 1601 到 1970 偏移 (11644473600000 ms)
+        return (ft / 10000) - 11644473600000;
+        #else
+        return time(0) * 1000;
+        #endif
+    }
 
-        int days = (int)FloorDivL(unixSeconds, 86400);
-        int sod = (int)(unixSeconds - (long)days * 86400);   // 0..86399
+    /// <summary>根据 Unix 时间戳（秒，UTC）构造时刻（毫秒置 0）。</summary>
+    DateTime(long unixSeconds) : this(unixSeconds * 1000, 0) {}
+
+    /// <summary>根据 Unix 时间戳（毫秒，UTC）构造时刻。</summary>
+    DateTime(long unixMs, int dummy) {
+        epochMs = unixMs;
+        epoch = unixMs / 1000;
+
+        long totalSeconds = FloorDivL(unixMs, 1000);
+        int remMs = (int)(unixMs - totalSeconds * 1000);
+        if (remMs < 0) { remMs = remMs + 1000; }
+        millisecond = remMs;
+
+        int days = (int)FloorDivL(totalSeconds, 86400);
+        int sod = (int)(totalSeconds - (long)days * 86400);   // 0..86399
         hour = sod / 3600;
         minute = (sod / 60) - hour * 60;
         second = sod - hour * 3600 - minute * 60;
@@ -80,14 +112,14 @@ class DateTime {
 
     // ---- 构造 -------------------------------------------------------
 
-    /// <summary>当前时刻（UTC）。</summary>
+    /// <summary>当前时刻（UTC，毫秒精度）。</summary>
     static DateTime UtcNow() {
-        return new DateTime(time(0));
+        return DateTime.FromUnixMilliseconds(GetCurrentUnixMilliseconds());
     }
 
     /// <summary><see cref="UtcNow"/> 的别名；不应用本地时区偏移。</summary>
     static DateTime Now() {
-        return new DateTime(time(0));
+        return DateTime.UtcNow();
     }
 
     // ---- 本机时区 ---------------------------------------------------
@@ -131,6 +163,11 @@ class DateTime {
     /// <summary>根据 Unix 时间戳（自纪元起的秒数）构造时刻。</summary>
     static DateTime FromUnixSeconds(long seconds) {
         return new DateTime(seconds);
+    }
+
+    /// <summary>根据 Unix 时间戳（自纪元起的毫秒数）构造时刻。</summary>
+    static DateTime FromUnixMilliseconds(long milliseconds) {
+        return new DateTime(milliseconds, 0);
     }
 
     /// <summary>给定日历日期当天的 UTC 午夜零点。</summary>
@@ -220,33 +257,41 @@ class DateTime {
     /// <summary>星期几，0=星期日 .. 6=星期六。</summary>
     int DayOfWeek() { return dayOfWeek; }
 
+    /// <summary>毫秒（0..999）。</summary>
+    int Millisecond() { return millisecond; }
+
     /// <summary>Unix 纪元以来的秒数（UTC）。</summary>
     long ToUnixSeconds() { return epoch; }
 
+    /// <summary>Unix 纪元以来的毫秒数（UTC）。</summary>
+    long ToUnixMilliseconds() { return epochMs; }
+
     // ---- 算术 -------------------------------------------------------
 
+    /// 加 n 毫秒。
+    DateTime AddMilliseconds(long ms) { return DateTime.FromUnixMilliseconds(epochMs + ms); }
     /// 加 n 秒。
-    DateTime AddSeconds(long n) { return new DateTime(epoch + n); }
+    DateTime AddSeconds(long n) { return DateTime.FromUnixMilliseconds(epochMs + n * 1000); }
     /// 加 n 分钟。
-    DateTime AddMinutes(long n) { return new DateTime(epoch + n * 60); }
+    DateTime AddMinutes(long n) { return DateTime.FromUnixMilliseconds(epochMs + n * 60000); }
     /// 加 n 小时。
-    DateTime AddHours(long n) { return new DateTime(epoch + n * 3600); }
+    DateTime AddHours(long n) { return DateTime.FromUnixMilliseconds(epochMs + n * 3600000); }
     /// 加 n 天。
-    DateTime AddDays(long n) { return new DateTime(epoch + n * 86400); }
+    DateTime AddDays(long n) { return DateTime.FromUnixMilliseconds(epochMs + n * 86400000); }
 
-    /// <summary>此时刻与 <paramref name="other"/> 之间的间隔。</summary>
+    /// <summary>此时刻与 <paramref name="other"/> 之间的间隔（毫秒精度）。</summary>
     TimeSpan Subtract(DateTime other) {
-        return new TimeSpan(epoch - other.epoch);
+        return TimeSpan.FromMilliseconds(epochMs - other.epochMs);
     }
 
     // ---- 比较 -------------------------------------------------------
 
-    /// 同一时刻（纪元秒相等）。
-    bool Equals(DateTime other) { return epoch == other.epoch; }
+    /// 同一时刻（纪元毫秒相等）。
+    bool Equals(DateTime other) { return epochMs == other.epochMs; }
     /// 早于 other。
-    bool IsBefore(DateTime other) { return epoch < other.epoch; }
+    bool IsBefore(DateTime other) { return epochMs < other.epochMs; }
     /// 晚于 other。
-    bool IsAfter(DateTime other) { return epoch > other.epoch; }
+    bool IsAfter(DateTime other) { return epochMs > other.epochMs; }
 
     // ---- 格式化 -------------------------------------------------------
 
@@ -254,6 +299,14 @@ class DateTime {
     string ToString() {
         return "" + year + "-" + Pad2(month) + "-" + Pad2(day) + " " +
                Pad2(hour) + ":" + Pad2(minute) + ":" + Pad2(second);
+    }
+
+    /// <summary>带毫秒的类 ISO 文本："YYYY-MM-DD HH:MM:SS.fff"。</summary>
+    string ToStringWithMillis() {
+        string msStr = Convert.ToString(millisecond);
+        if (millisecond < 10) { msStr = "00" + msStr; }
+        else if (millisecond < 100) { msStr = "0" + msStr; }
+        return this.ToString() + "." + msStr;
     }
 
     /// <summary>仅日期："YYYY-MM-DD"。</summary>
