@@ -40,6 +40,7 @@ typedef enum {
     TK_CONST,
     TK_CONTINUE,
     TK_DEFAULT,
+    TK_DEFER,
     TK_DELEGATE,
     TK_DO,
     TK_DOUBLE,

@@ -2232,6 +2232,52 @@ static zan_ast_node_t *parse_expression_inner(zan_parser_t *p) {
 /* Cap on type-reference nesting (generics, tuple types, dotted qualifiers):
  * see the definition at the top of this file. */
 
+static void parse_block_stmts(zan_parser_t *p, zan_ast_list_t *stmts_list) {
+    while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
+        if (parser_check(p, TK_DEFER)) {
+            zan_loc_t defer_loc = p->current.loc;
+            parser_advance(p); /* defer */
+            zan_ast_node_t *defer_stmt = parse_statement(p);
+            zan_ast_node_t *fin_body = defer_stmt;
+            if (!fin_body || fin_body->kind != AST_BLOCK) {
+                zan_ast_node_t *fb = zan_ast_new(p->arena, AST_BLOCK, defer_loc);
+                zan_ast_list_init(&fb->block.stmts);
+                if (defer_stmt) {
+                    zan_ast_list_push(&fb->block.stmts, defer_stmt, p->arena);
+                    splice_pending_stmts(p, &fb->block.stmts);
+                }
+                fin_body = fb;
+            }
+
+            /* Tail statements in this block become the try_body */
+            zan_ast_node_t *tail_block = zan_ast_new(p->arena, AST_BLOCK, defer_loc);
+            zan_ast_list_init(&tail_block->block.stmts);
+            parse_block_stmts(p, &tail_block->block.stmts);
+
+            zan_ast_node_t *try_node = zan_ast_new(p->arena, AST_TRY_STMT, defer_loc);
+            try_node->try_stmt.try_body = tail_block;
+            zan_ast_list_init(&try_node->try_stmt.catches);
+            try_node->try_stmt.finally_body = fin_body;
+
+            zan_ast_list_push(stmts_list, try_node, p->arena);
+            break;
+        }
+
+        uint32_t before = p->current.loc.offset;
+        zan_ast_node_t *stmt = parse_statement(p);
+        if (stmt) {
+            zan_ast_list_push(stmts_list, stmt, p->arena);
+            splice_pending_stmts(p, stmts_list);
+        }
+        /* guarantee forward progress: if a malformed statement was not
+         * consumed, skip a token so error recovery can't spin forever
+         * (previously this looped, allocating until OOM). */
+        if (p->current.loc.offset == before && !parser_check(p, TK_EOF)) {
+            parser_advance(p);
+        }
+    }
+}
+
 static zan_ast_node_t *parse_block(zan_parser_t *p) {
     if (p->stmt_depth >= ZAN_PARSER_MAX_STMT_DEPTH) {
         zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
@@ -2252,20 +2298,7 @@ static zan_ast_node_t *parse_block(zan_parser_t *p) {
     zan_ast_node_t *block = zan_ast_new(p->arena, AST_BLOCK, loc);
     zan_ast_list_init(&block->block.stmts);
 
-    while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
-        uint32_t before = p->current.loc.offset;
-        zan_ast_node_t *stmt = parse_statement(p);
-        if (stmt) {
-            zan_ast_list_push(&block->block.stmts, stmt, p->arena);
-            splice_pending_stmts(p, &block->block.stmts);
-        }
-        /* guarantee forward progress: if a malformed statement was not
-         * consumed, skip a token so error recovery can't spin forever
-         * (previously this looped, allocating until OOM). */
-        if (p->current.loc.offset == before && !parser_check(p, TK_EOF)) {
-            parser_advance(p);
-        }
-    }
+    parse_block_stmts(p, &block->block.stmts);
 
     p->stmt_depth--;
     parser_expect(p, TK_RBRACE);
@@ -3373,6 +3406,28 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         return parse_switch_stmt(p);
     case TK_TRY:
         return parse_try_stmt(p);
+    case TK_DEFER: {
+        zan_loc_t loc = p->current.loc;
+        parser_advance(p); /* defer */
+        zan_ast_node_t *stmt = parse_statement(p);
+        zan_ast_node_t *n = zan_ast_new(p->arena, AST_BLOCK, loc);
+        zan_ast_list_init(&n->block.stmts);
+        zan_ast_node_t *try_node = zan_ast_new(p->arena, AST_TRY_STMT, loc);
+        zan_ast_node_t *empty_try = zan_ast_new(p->arena, AST_BLOCK, loc);
+        zan_ast_list_init(&empty_try->block.stmts);
+        try_node->try_stmt.try_body = empty_try;
+        zan_ast_list_init(&try_node->try_stmt.catches);
+        zan_ast_node_t *fin = stmt;
+        if (!fin || fin->kind != AST_BLOCK) {
+            zan_ast_node_t *fb = zan_ast_new(p->arena, AST_BLOCK, loc);
+            zan_ast_list_init(&fb->block.stmts);
+            if (stmt) zan_ast_list_push(&fb->block.stmts, stmt, p->arena);
+            fin = fb;
+        }
+        try_node->try_stmt.finally_body = fin;
+        zan_ast_list_push(&n->block.stmts, try_node, p->arena);
+        return n;
+    }
     case TK_USING: {
         /* `using (expr) body` / `using (Type name = expr) body` -- deterministic
          * disposal. Lowered to try/finally + a Dispose() call on the resource:
