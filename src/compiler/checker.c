@@ -2094,6 +2094,45 @@ static void reject_method_group(zan_checker_t *c, zan_ast_node_t *e) {
                   (int)m->name.len, m->name.str);
 }
 
+static bool patterns_match_same(zan_ast_node_t *a, zan_ast_node_t *b) {
+    if (!a && !b) return true;
+    if (!a || !b) return false;
+    while (a && a->kind == AST_CAST_EXPR) a = a->cast.expr;
+    while (b && b->kind == AST_CAST_EXPR) b = b->cast.expr;
+    if (!a || !b) return false;
+    if (a->kind != b->kind) return false;
+    switch (a->kind) {
+    case AST_INT_LITERAL:
+    case AST_CHAR_LITERAL:
+        return a->int_val == b->int_val;
+    case AST_STRING_LITERAL:
+        return a->str_val.len == b->str_val.len &&
+               memcmp(a->str_val.str, b->str_val.str, (size_t)a->str_val.len) == 0;
+    case AST_BOOL_LITERAL:
+        return a->bool_val == b->bool_val;
+    case AST_NULL_LITERAL:
+        return true;
+    case AST_MEMBER_ACCESS:
+        if (a->member.name.len != b->member.name.len ||
+            memcmp(a->member.name.str, b->member.name.str, (size_t)a->member.name.len) != 0)
+            return false;
+        if (a->member.object && b->member.object &&
+            a->member.object->kind == AST_IDENTIFIER &&
+            b->member.object->kind == AST_IDENTIFIER) {
+            return a->member.object->ident.name.len == b->member.object->ident.name.len &&
+                   memcmp(a->member.object->ident.name.str,
+                          b->member.object->ident.name.str,
+                          (size_t)a->member.object->ident.name.len) == 0;
+        }
+        return false;
+    case AST_IDENTIFIER:
+        return a->ident.name.len == b->ident.name.len &&
+               memcmp(a->ident.name.str, b->ident.name.str, (size_t)a->ident.name.len) == 0;
+    default:
+        return false;
+    }
+}
+
 zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     if (!expr) return c->binder->type_error;
 
@@ -3191,16 +3230,54 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
          * arm's result is checked and the common type is returned (C# requires
          * every arm to convert to the same type). A pattern variable (`T x =>
          * ...`) is in scope only for its own arm's guard and result. */
-        zan_checker_check_expr(c, expr->switch_expr.expr);
+        zan_type_t *disc_type = zan_checker_check_expr(c, expr->switch_expr.expr);
         zan_type_t *merged = NULL;
         bool has_result = false;
+        bool seen_wildcard = false;
+
         for (int i = 0; i < expr->switch_expr.arms.count; i++) {
             zan_ast_node_t *arm = expr->switch_expr.arms.items[i];
             struct checker_local *saved_locals = c->locals;
+
+            if (seen_wildcard) {
+                zan_diag_emit(c->diag, DIAG_WARNING, arm->loc,
+                              "unreachable switch arm: previous discard arm '_' matches all remaining values");
+            }
+
+            if (arm->switch_arm.pattern) {
+                zan_checker_check_expr(c, arm->switch_arm.pattern);
+                if (arm->switch_arm.when_cond == NULL) {
+                    for (int prev = 0; prev < i; prev++) {
+                        zan_ast_node_t *prev_arm = expr->switch_expr.arms.items[prev];
+                        if (prev_arm->switch_arm.when_cond == NULL &&
+                            prev_arm->switch_arm.pattern != NULL &&
+                            patterns_match_same(arm->switch_arm.pattern, prev_arm->switch_arm.pattern)) {
+                            zan_diag_emit(c->diag, DIAG_ERROR, arm->loc,
+                                          "duplicate pattern in switch expression");
+                            break;
+                        }
+                    }
+                }
+            } else if (arm->switch_arm.is_default) {
+                for (int prev = 0; prev < i; prev++) {
+                    zan_ast_node_t *prev_arm = expr->switch_expr.arms.items[prev];
+                    if (prev_arm->switch_arm.is_default) {
+                        zan_diag_emit(c->diag, DIAG_ERROR, arm->loc,
+                                      "duplicate discard arm '_' in switch expression");
+                        break;
+                    }
+                }
+                seen_wildcard = true;
+            }
+
             if (arm->switch_arm.type_pattern && arm->switch_arm.var_name.len > 0) {
                 zan_type_t *pt = zan_binder_resolve_type(
                     c->binder, arm->switch_arm.type_pattern);
                 checker_add_local(c, arm->switch_arm.var_name, pt);
+                if (arm->switch_arm.when_cond == NULL &&
+                    (pt && (pt->kind == TYPE_OBJECT || pt == disc_type))) {
+                    seen_wildcard = true;
+                }
             }
             if (arm->switch_arm.when_cond) {
                 zan_checker_check_expr(c, arm->switch_arm.when_cond);
@@ -3214,6 +3291,41 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 } else {
                     zan_type_t *m2 = merge_conditional_types(c, merged, rt);
                     if (m2) merged = m2;
+                }
+            }
+        }
+
+        /* Enum exhaustiveness check: if disc_type is enum and no wildcard arm exists */
+        if (disc_type && disc_type->kind == TYPE_ENUM && disc_type->sym && !seen_wildcard) {
+            zan_symbol_t *esym = disc_type->sym;
+            for (int mi = 0; mi < esym->member_count; mi++) {
+                zan_symbol_t *em = esym->members[mi];
+                if (em->kind != SYM_ENUM_MEMBER) continue;
+                bool handled = false;
+                for (int ai = 0; ai < expr->switch_expr.arms.count; ai++) {
+                    zan_ast_node_t *arm = expr->switch_expr.arms.items[ai];
+                    if (arm->switch_arm.pattern) {
+                        zan_ast_node_t *pat = arm->switch_arm.pattern;
+                        while (pat && pat->kind == AST_CAST_EXPR) pat = pat->cast.expr;
+                        if (pat && pat->kind == AST_MEMBER_ACCESS &&
+                            pat->member.name.len == em->name.len &&
+                            memcmp(pat->member.name.str, em->name.str, em->name.len) == 0) {
+                            handled = true;
+                            break;
+                        }
+                        if (pat && pat->kind == AST_IDENTIFIER &&
+                            pat->ident.name.len == em->name.len &&
+                            memcmp(pat->ident.name.str, em->name.str, em->name.len) == 0) {
+                            handled = true;
+                            break;
+                        }
+                    }
+                }
+                if (!handled) {
+                    zan_diag_emit(c->diag, DIAG_WARNING, expr->loc,
+                                  "switch expression does not handle enum member '%.*s' of '%.*s'; add missing case or '_' discard arm",
+                                  (int)em->name.len, em->name.str,
+                                  (int)esym->name.len, esym->name.str);
                 }
             }
         }
@@ -3432,21 +3544,63 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
         }
         if (!has_patterns && !type_is_numeric(sw_type) &&
             sw_type->kind != TYPE_STRING && sw_type->kind != TYPE_CHAR &&
+            sw_type->kind != TYPE_ENUM && sw_type->kind != TYPE_BOOL &&
             sw_type->kind != TYPE_ERROR) {
             zan_diag_emit(c->diag, DIAG_WARNING, stmt->loc,
                           "switch expression has non-switchable type '%s'", type_name(sw_type));
         }
+
+        bool seen_wildcard = false;
         for (int i = 0; i < stmt->switch_stmt.cases.count; i++) {
             zan_ast_node_t *sc = stmt->switch_stmt.cases.items[i];
+            bool is_default = (sc->switch_case.pattern == NULL &&
+                               sc->switch_case.type_pattern == NULL &&
+                               sc->switch_case.var_name.len == 0);
+
+            if (seen_wildcard) {
+                zan_diag_emit(c->diag, DIAG_WARNING, sc->loc,
+                              "unreachable switch case: previous default/catch-all case matches all remaining values");
+            }
+
             if (sc->switch_case.pattern) {
                 zan_checker_check_expr(c, sc->switch_case.pattern);
+                if (sc->switch_case.when_cond == NULL) {
+                    for (int prev = 0; prev < i; prev++) {
+                        zan_ast_node_t *prev_sc = stmt->switch_stmt.cases.items[prev];
+                        if (prev_sc->switch_case.when_cond == NULL &&
+                            prev_sc->switch_case.pattern != NULL &&
+                            patterns_match_same(sc->switch_case.pattern, prev_sc->switch_case.pattern)) {
+                            zan_diag_emit(c->diag, DIAG_ERROR, sc->loc,
+                                          "duplicate case label in switch statement");
+                            break;
+                        }
+                    }
+                }
+            } else if (is_default) {
+                for (int prev = 0; prev < i; prev++) {
+                    zan_ast_node_t *prev_sc = stmt->switch_stmt.cases.items[prev];
+                    bool prev_is_default = (prev_sc->switch_case.pattern == NULL &&
+                                            prev_sc->switch_case.type_pattern == NULL &&
+                                            prev_sc->switch_case.var_name.len == 0);
+                    if (prev_is_default) {
+                        zan_diag_emit(c->diag, DIAG_ERROR, sc->loc,
+                                      "duplicate default label in switch statement");
+                        break;
+                    }
+                }
+                seen_wildcard = true;
             }
+
             /* B5 pattern variable: `case T x:` brings x into scope for the
              * guard and the body. */
             if (sc->switch_case.type_pattern && sc->switch_case.var_name.len > 0) {
                 zan_type_t *pt = zan_binder_resolve_type(
                     c->binder, sc->switch_case.type_pattern);
                 checker_add_local(c, sc->switch_case.var_name, pt);
+                if (sc->switch_case.when_cond == NULL &&
+                    (pt->kind == TYPE_OBJECT || pt == sw_type)) {
+                    seen_wildcard = true;
+                }
             }
             if (sc->switch_case.when_cond) {
                 zan_checker_check_expr(c, sc->switch_case.when_cond);
