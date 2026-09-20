@@ -157,8 +157,25 @@ partial class CodeEditor {
                         // the block state and throw the colouring away.
                         ke.spans = null;
                         ke.blockIn = inBlock;
-                        scratch = new List<CodeSpan>();
-                        ke.blockOpen = Highlight(kt, t, defaultText, inBlock, scratch);
+                        // 快速推导：绝大多数普通代码行不含块注释定界符，inBlock 状态保持不变，
+                        // 无需为屏幕外行构造分词与对象分配，极大加速跨行滚动。
+                        bool canQuick = false;
+                        bool quick = false;
+                        if (!inBlock) {
+                            if (syntaxLang == 0 && kt.IndexOf("/*") < 0) { quick = false; canQuick = true; }
+                            else if (syntaxLang == 1 && kt.IndexOf("--[[") < 0) { quick = false; canQuick = true; }
+                            else if (syntaxLang == 2 && kt.IndexOf("\"\"\"") < 0 && kt.IndexOf("'''") < 0) { quick = false; canQuick = true; }
+                        } else {
+                            if (syntaxLang == 0 && kt.IndexOf("*/") < 0) { quick = true; canQuick = true; }
+                            else if (syntaxLang == 1 && kt.IndexOf("]]") < 0) { quick = true; canQuick = true; }
+                            else if (syntaxLang == 2 && kt.IndexOf("\"\"\"") < 0 && kt.IndexOf("'''") < 0) { quick = true; canQuick = true; }
+                        }
+                        if (canQuick) {
+                            ke.blockOpen = quick;
+                        } else {
+                            scratch = new List<CodeSpan>();
+                            ke.blockOpen = Highlight(kt, t, defaultText, inBlock, scratch);
+                        }
                         inBlock = ke.blockOpen;
                         while (hlCache.Count <= k) { hlCache.Add(null); }
                         hlCache[k] = ke;
@@ -479,20 +496,26 @@ partial class CodeEditor {
             scrollLine = (app.mouseY - area.y) * dtotal2 / area.height - visLines / 2;
             if (scrollLine < 0) { scrollLine = 0; }
             lastScrollMs = app.nowMs;
-            app.RequestRedraw();
+            app.NoteScrollDamage(area.x, area.y, area.width, area.height);
         }
 
         if (ownsWheel) {
             int delta = app.window.EventKeyCode();
-            int step = delta / 120;
-            if (step == 0) {
-                if (delta > 0) { step = 1; }
-                else if (delta < 0) { step = 0 - 1; }
+            // 反向滚动时清空积累的小数滚轮
+            if ((wheelAccum > 0 && delta < 0) || (wheelAccum < 0 && delta > 0)) {
+                wheelAccum = 0;
             }
-            // 滚轮步长调整为干脆利落的 5 行，彻底消除粘滞感与拖不动感
-            scrollLine = scrollLine - step * 5;
+            wheelAccum = wheelAccum + delta;
+            int step = wheelAccum / 120;
+            if (step != 0) {
+                // 滚轮步长：每 120 刻度滚 5 行，干脆利落
+                scrollLine = scrollLine - step * 5;
+                wheelAccum = wheelAccum - step * 120;
+            }
             lastScrollMs = app.nowMs;
-            app.RequestRedraw();
+            // 滚轮事件当帧已由 App.NoteScrollDamage 标记局部重绘，
+            // 排版与绘制直接基于新 scrollLine，不调用 app.RequestRedraw() 
+            // 避免冲掉局部重绘并产生额外的空转重绘帧。
         }
 
         // 仅当本帧光标实际移动时才保持其在视野内；
