@@ -544,6 +544,173 @@ static zan_type_t *checker_index_set_target(zan_checker_t *c,
     return NULL;
 }
 
+/* Check if an expression (typically in a lambda body) captures 'this' or accesses
+ * instance members of 'this'. Returns true if 'this' is captured. */
+static bool expr_captures_this(zan_checker_t *c, zan_ast_node_t *node) {
+    if (!node) return false;
+    switch (node->kind) {
+    case AST_THIS_EXPR:
+        return true;
+    case AST_IDENTIFIER: {
+        zan_istr_t name = node->ident.name;
+        /* If resolved to a local or parameter, it is not 'this' */
+        if (checker_find_local(c, name)) return false;
+        /* If resolved to an instance member of current class, it implicitly captures 'this' */
+        if (c->current_type_sym) {
+            zan_symbol_t *f = checker_find_field(c->current_type_sym, name);
+            if (f && !(f->modifiers & MOD_STATIC)) return true;
+            zan_symbol_t *m = checker_find_method(c->current_type_sym, name);
+            if (m && !(m->modifiers & MOD_STATIC)) return true;
+        }
+        return false;
+    }
+    case AST_MEMBER_ACCESS:
+        if (node->member.object && node->member.object->kind == AST_THIS_EXPR)
+            return true;
+        return expr_captures_this(c, node->member.object);
+    case AST_CALL:
+        if (expr_captures_this(c, node->call.callee)) return true;
+        for (int i = 0; i < node->call.args.count; i++) {
+            if (expr_captures_this(c, node->call.args.items[i])) return true;
+        }
+        return false;
+    case AST_BINARY:
+    case AST_ASSIGNMENT:
+        return expr_captures_this(c, node->binary.left) ||
+               expr_captures_this(c, node->binary.right);
+    case AST_UNARY:
+    case AST_POSTFIX_UNARY:
+        return expr_captures_this(c, node->unary.operand);
+    case AST_INDEX:
+        if (expr_captures_this(c, node->index.object)) return true;
+        if (expr_captures_this(c, node->index.index)) return true;
+        for (int i = 0; i < node->index.extra.count; i++) {
+            if (expr_captures_this(c, node->index.extra.items[i])) return true;
+        }
+        return false;
+    case AST_CONDITIONAL:
+        return expr_captures_this(c, node->conditional.cond) ||
+               expr_captures_this(c, node->conditional.then_expr) ||
+               expr_captures_this(c, node->conditional.else_expr);
+    case AST_NEW_EXPR:
+        if (node->new_expr.call_init && expr_captures_this(c, node->new_expr.call_init))
+            return true;
+        for (int i = 0; i < node->new_expr.args.count; i++) {
+            if (expr_captures_this(c, node->new_expr.args.items[i])) return true;
+        }
+        for (int i = 0; i < node->new_expr.arg_inits.count; i++) {
+            if (expr_captures_this(c, node->new_expr.arg_inits.items[i])) return true;
+        }
+        return false;
+    case AST_LAMBDA:
+        /* Nested lambda inside lambda */
+        return expr_captures_this(c, node->lambda.body);
+    case AST_BLOCK:
+        for (int i = 0; i < node->block.stmts.count; i++) {
+            if (expr_captures_this(c, node->block.stmts.items[i])) return true;
+        }
+        return false;
+    case AST_RETURN_STMT:
+        return expr_captures_this(c, node->ret.value);
+    case AST_IF_STMT:
+        return expr_captures_this(c, node->if_stmt.cond) ||
+               expr_captures_this(c, node->if_stmt.then_body) ||
+               expr_captures_this(c, node->if_stmt.else_body);
+    case AST_WHILE_STMT:
+        return expr_captures_this(c, node->while_stmt.cond) ||
+               expr_captures_this(c, node->while_stmt.body);
+    case AST_FOR_STMT:
+        return expr_captures_this(c, node->for_stmt.init) ||
+               expr_captures_this(c, node->for_stmt.cond) ||
+               expr_captures_this(c, node->for_stmt.step) ||
+               expr_captures_this(c, node->for_stmt.body);
+    case AST_EXPR_STMT:
+        return expr_captures_this(c, node->expr_stmt.expr);
+    case AST_CAST_EXPR:
+        return expr_captures_this(c, node->cast.expr);
+    case AST_AWAIT_EXPR:
+        return expr_captures_this(c, node->await_expr.expr);
+    case AST_VAR_DECL:
+        return expr_captures_this(c, node->var_decl.initializer);
+    case AST_TUPLE_EXPR:
+        for (int i = 0; i < node->tuple_expr.items.count; i++) {
+            if (expr_captures_this(c, node->tuple_expr.items.items[i])) return true;
+        }
+        return false;
+    default:
+        return false;
+    }
+}
+
+static bool has_closure_capturing_this(zan_checker_t *c, zan_ast_node_t *node) {
+    if (!node) return false;
+    while (node && node->kind == AST_CAST_EXPR) node = node->cast.expr;
+    if (!node) return false;
+    if (node->kind == AST_LAMBDA) {
+        return expr_captures_this(c, node->lambda.body);
+    }
+    if (node->kind == AST_ASSIGNMENT) {
+        return has_closure_capturing_this(c, node->binary.right);
+    }
+    if (node->kind == AST_NEW_EXPR) {
+        for (int i = 0; i < node->new_expr.args.count; i++) {
+            if (has_closure_capturing_this(c, node->new_expr.args.items[i])) return true;
+        }
+        for (int i = 0; i < node->new_expr.arg_inits.count; i++) {
+            if (has_closure_capturing_this(c, node->new_expr.arg_inits.items[i])) return true;
+        }
+    }
+    return false;
+}
+
+/* Check for potential strong reference cycle when a closure capturing 'this' is assigned
+ * to a field/property of 'this' (or 'this' itself). */
+static void check_closure_cycle_warning(zan_checker_t *c, zan_ast_node_t *lhs,
+                                       zan_ast_node_t *rhs, zan_loc_t loc) {
+    if (!c->current_type_sym || !lhs || !rhs) return;
+    /* Only classes participate in ARC cycles */
+    if (c->current_type_sym->kind != SYM_CLASS) return;
+
+    /* Check if lhs is a member of 'this', e.g.:
+     *   this.field = () => { ... }
+     *   this.obj.field = () => { ... }
+     *   obj.field = () => { ... } (where obj is an instance field of 'this')
+     *   field = () => { ... } (where field is an instance member of current class)
+     */
+    bool targets_this = false;
+    if (lhs->kind == AST_MEMBER_ACCESS) {
+        zan_ast_node_t *obj = lhs->member.object;
+        while (obj && obj->kind == AST_MEMBER_ACCESS) {
+            obj = obj->member.object;
+        }
+        if (obj && obj->kind == AST_THIS_EXPR) {
+            targets_this = true;
+        } else if (obj && obj->kind == AST_IDENTIFIER) {
+            zan_istr_t name = obj->ident.name;
+            if (!checker_find_local(c, name)) {
+                zan_symbol_t *f = checker_find_field(c->current_type_sym, name);
+                if (f && !(f->modifiers & MOD_STATIC)) {
+                    targets_this = true;
+                }
+            }
+        }
+    } else if (lhs->kind == AST_IDENTIFIER) {
+        zan_istr_t name = lhs->ident.name;
+        if (!checker_find_local(c, name)) {
+            zan_symbol_t *f = checker_find_field(c->current_type_sym, name);
+            if (f && !(f->modifiers & MOD_STATIC)) {
+                targets_this = true;
+            }
+        }
+    }
+
+    if (targets_this && has_closure_capturing_this(c, rhs)) {
+        zan_diag_emit(c->diag, DIAG_WARNING, loc,
+            "closure captures 'this' while assigned to a member of 'this'; "
+            "this creates a potential strong reference cycle under ARC");
+    }
+}
+
 /* ---- generic constraint checking ---- */
 
 /* True when `arg` is, implements, or derives from `cons`. Depth-guarded so a
@@ -2666,6 +2833,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         if (target)
             checker_check_assignable(c, target, right, expr->binary.right,
                                      expr->loc, "assignment");
+        check_closure_cycle_warning(c, expr->binary.left, expr->binary.right, expr->loc);
         return right;
     }
 
@@ -2817,10 +2985,10 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                         zan_istr_t add_istr = {(char *)"Add", 3};
                         bool builtin_list = false;
                         zan_type_t *coll = field->type;
-                        if (coll && (coll->name.len == 4 &&
-                                     memcmp(coll->name.str, "List", 4) == 0 ||
-                                     coll->name.len == 4 &&
-                                     memcmp(coll->name.str, "Dict", 4) == 0))
+                        if (coll && ((coll->name.len == 4 &&
+                                      memcmp(coll->name.str, "List", 4) == 0) ||
+                                     (coll->name.len == 4 &&
+                                      memcmp(coll->name.str, "Dict", 4) == 0)))
                             builtin_list = true;
                         zan_symbol_t *coll_sym =
                             coll && (coll->kind == TYPE_CLASS ||
