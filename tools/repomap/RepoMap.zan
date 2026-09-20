@@ -113,6 +113,41 @@ class RefBucket {
     }
 }
 
+/// <summary>One node in the directed call graph (Caller -> Callee).</summary>
+class CallNode {
+    string id;        // "ClassName.MethodName"
+    string name;      // "MethodName"
+    string owner;     // "ClassName"
+    string file;      // "src/Foo.zan"
+    int line;         // declaration line
+    string sig;       // method signature
+    List<string> callees;  // target method IDs called inside this method
+    List<string> callers;  // caller method IDs that invoke this method
+
+    static CallNode Create(string id, string name, string owner, string file, int line, string sig) {
+        CallNode c = new CallNode();
+        c.id = id;
+        c.name = name;
+        c.owner = owner;
+        c.file = file;
+        c.line = line;
+        c.sig = sig;
+        c.callees = new List<string>();
+        c.callers = new List<string>();
+        return c;
+    }
+
+    static void AddUnique(List<string> target, string value) {
+        if (value.Length == 0) { return; }
+        int i = 0;
+        while (i < target.Count) {
+            if (target[i] == value) { return; }
+            i = i + 1;
+        }
+        target.Add(value);
+    }
+}
+
 /// <summary>String helpers on Substring/Length only.</summary>
 class Str {
     static string Lower(string s) {
@@ -270,6 +305,11 @@ class Program {
             refCount = buckets.Count;
         }
 
+        List<CallNode> callNodes = Program.BuildCallGraph(files);
+        string cgJson = Program.RenderCallGraph(callNodes);
+        File.WriteAllText(Program.OUT_DIR + "/callgraph.json", cgJson);
+        File.WriteAllText(Program.OUT_DIR + "/callgraph.jsonl", Program.RenderCallGraphJsonl(callNodes));
+
         // Route table, when this looks like a ZanWeb server project.
         string controllerDir = root + "/src/Controller";
         if (!Directory.Exists(controllerDir)) { controllerDir = root + "/src/controller"; }
@@ -285,6 +325,7 @@ class Program {
         while (i < files.Count) { symCount = symCount + files[i].syms.Count; i = i + 1; }
         Console.WriteLine("[repomap] " + Convert.ToString(files.Count) + " files, "
             + Convert.ToString(symCount) + " symbols, "
+            + Convert.ToString(callNodes.Count) + " call nodes, "
             + Convert.ToString(refCount) + " indexed names, "
             + Convert.ToString(routeCount) + " routes -> " + Program.OUT_DIR + "/");
         return 0;
@@ -292,9 +333,20 @@ class Program {
 
     static bool SkipDir(string name) {
         string n = Str.Lower(name);
+        int slash = Str.Find(n, "/", 0);
+        while (slash >= 0) {
+            n = n.Substring(slash + 1, n.Length - slash - 1);
+            slash = Str.Find(n, "/", 0);
+        }
+        slash = Str.Find(n, "\\", 0);
+        while (slash >= 0) {
+            n = n.Substring(slash + 1, n.Length - slash - 1);
+            slash = Str.Find(n, "\\", 0);
+        }
         return n == "_scratch" || n == "build" || n == "dist" || n == ".git"
             || n == "assets" || n == "toolchain" || n == "node_modules"
-            || n == ".zanmap" || n == "uploads" || n == "obj" || n == "bin";
+            || n == ".zanmap" || n == "uploads" || n == "obj" || n == "bin"
+            || n == "cmakefiles" || n == ".vs" || n == ".idea";
     }
 
     static void ScanDir(string dir, string rel, List<FileInfo> outp) {
@@ -1361,5 +1413,193 @@ class Program {
         string m = Str.Lower(method);
         if (m == "index") { return "/" + prefix + cbase; }
         return "/" + prefix + cbase + "/" + m;
+    }
+
+    static List<CallNode> BuildCallGraph(List<FileInfo> files) {
+        List<CallNode> nodes = new List<CallNode>();
+        Dictionary<string, int> knownIds = new Dictionary<string, int>();
+        Dictionary<string, List<CallNode>> fileToMethods = new Dictionary<string, List<CallNode>>();
+
+        // 1. Register all methods
+        int fi = 0;
+        while (fi < files.Count) {
+            FileInfo f = files[fi];
+            fi = fi + 1;
+            string owner = "";
+            List<CallNode> curFileMethods = new List<CallNode>();
+            fileToMethods[f.path] = curFileMethods;
+
+            int si = 0;
+            while (si < f.syms.Count) {
+                Sym s = f.syms[si];
+                si = si + 1;
+                if (s.kind == "class" || s.kind == "struct" || s.kind == "interface") {
+                    owner = s.name;
+                } else if (s.kind == "method" || s.kind == "function") {
+                    string full = s.name;
+                    if (owner.Length > 0) { full = owner + "." + s.name; }
+                    CallNode node = CallNode.Create(full, s.name, owner, f.path, s.line, s.sig);
+                    nodes.Add(node);
+                    curFileMethods.Add(node);
+                    knownIds[full] = 1;
+                }
+            }
+        }
+
+        // 2. Scan file lines for callees
+        fi = 0;
+        while (fi < files.Count) {
+            FileInfo f = files[fi];
+            fi = fi + 1;
+            List<CallNode> fileMethods = fileToMethods[f.path];
+            if (fileMethods.Count == 0) { continue; }
+
+            string text = File.ReadAllText(f.abs);
+            List<string> lines = Program.SplitLines(text);
+
+            CallNode currentMethod = null;
+            int methodCursor = 0;
+            int li = 0;
+            while (li < lines.Count) {
+                string line = Str.Trim(lines[li]);
+                int lineNum = li + 1;
+                li = li + 1;
+
+                while (methodCursor < fileMethods.Count && fileMethods[methodCursor].line <= lineNum) {
+                    currentMethod = fileMethods[methodCursor];
+                    methodCursor = methodCursor + 1;
+                }
+
+                if (line.Length == 0 || Str.StartsWith(line, "//") || Str.StartsWith(line, "/*") || Str.StartsWith(line, "*")) {
+                    continue;
+                }
+
+                if (currentMethod == null) { continue; }
+
+                Program.ExtractCallsInLine(line, currentMethod, knownIds);
+            }
+        }
+
+        // 3. Build reverse callers
+        Dictionary<string, CallNode> nodeById = new Dictionary<string, CallNode>();
+        int ni = 0;
+        while (ni < nodes.Count) {
+            nodeById[nodes[ni].id] = nodes[ni];
+            ni = ni + 1;
+        }
+
+        ni = 0;
+        while (ni < nodes.Count) {
+            CallNode caller = nodes[ni];
+            ni = ni + 1;
+            int ci = 0;
+            while (ci < caller.callees.Count) {
+                string calleeId = caller.callees[ci];
+                ci = ci + 1;
+                if (nodeById.ContainsKey(calleeId)) {
+                    CallNode calleeNode = nodeById[calleeId];
+                    CallNode.AddUnique(calleeNode.callers, caller.id);
+                }
+            }
+        }
+
+        return nodes;
+    }
+
+    static void ExtractCallsInLine(string line, CallNode currentMethod, Dictionary<string, int> knownIds) {
+        int i = 0;
+        while (i < line.Length) {
+            int p = Str.Find(line, "(", i);
+            if (p < 0) { break; }
+            i = p + 1;
+
+            string name = Program.NameBefore(line, p);
+            if (name.Length == 0) { continue; }
+            if (name == "if" || name == "while" || name == "for" || name == "switch" || name == "catch" || name == "return" || name == "typeof" || name == "sizeof") {
+                continue;
+            }
+
+            int pos = p - 1;
+            while (pos >= 0 && Str.IsSpace(line.Substring(pos, 1))) { pos = pos - 1; }
+            pos = pos - name.Length;
+
+            string receiver = "";
+            if (pos >= 0 && line.Substring(pos, 1) == ".") {
+                receiver = Program.NameBefore(line, pos);
+            }
+
+            string targetId = "";
+            if (receiver.Length > 0 && receiver != "this") {
+                targetId = receiver + "." + name;
+            } else if (currentMethod.owner.Length > 0) {
+                targetId = currentMethod.owner + "." + name;
+            } else {
+                targetId = name;
+            }
+
+            if (knownIds.ContainsKey(targetId) && targetId != currentMethod.id) {
+                CallNode.AddUnique(currentMethod.callees, targetId);
+            }
+        }
+    }
+
+    static string RenderCallGraph(List<CallNode> nodes) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\n  \"totalNodes\": ");
+        sb.Append(Convert.ToString(nodes.Count));
+        sb.Append(",\n  \"nodes\": [\n");
+        int i = 0;
+        while (i < nodes.Count) {
+            if (i > 0) { sb.Append(",\n"); }
+            CallNode n = nodes[i];
+            i = i + 1;
+            sb.Append("    {\n");
+            sb.Append("      \"id\": \"");
+            sb.Append(Str.JsonEsc(n.id));
+            sb.Append("\",\n      \"name\": \"");
+            sb.Append(Str.JsonEsc(n.name));
+            sb.Append("\",\n      \"owner\": \"");
+            sb.Append(Str.JsonEsc(n.owner));
+            sb.Append("\",\n      \"file\": \"");
+            sb.Append(Str.JsonEsc(n.file));
+            sb.Append("\",\n      \"line\": ");
+            sb.Append(Convert.ToString(n.line));
+            sb.Append(",\n      \"sig\": \"");
+            sb.Append(Str.JsonEsc(n.sig));
+            sb.Append("\",\n      \"callees\": ");
+            sb.Append(Program.RenderStrArray(n.callees));
+            sb.Append(",\n      \"callers\": ");
+            sb.Append(Program.RenderStrArray(n.callers));
+            sb.Append("\n    }");
+        }
+        sb.Append("\n  ]\n}\n");
+        return sb.ToString();
+    }
+
+    static string RenderCallGraphJsonl(List<CallNode> nodes) {
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < nodes.Count) {
+            CallNode n = nodes[i];
+            i = i + 1;
+            sb.Append("{\"id\":\"");
+            sb.Append(Str.JsonEsc(n.id));
+            sb.Append("\",\"name\":\"");
+            sb.Append(Str.JsonEsc(n.name));
+            sb.Append("\",\"owner\":\"");
+            sb.Append(Str.JsonEsc(n.owner));
+            sb.Append("\",\"file\":\"");
+            sb.Append(Str.JsonEsc(n.file));
+            sb.Append("\",\"line\":");
+            sb.Append(Convert.ToString(n.line));
+            sb.Append(",\"sig\":\"");
+            sb.Append(Str.JsonEsc(n.sig));
+            sb.Append("\",\"callees\":");
+            sb.Append(Program.RenderStrArray(n.callees));
+            sb.Append(",\"callers\":");
+            sb.Append(Program.RenderStrArray(n.callers));
+            sb.Append("}\n");
+        }
+        return sb.ToString();
     }
 }

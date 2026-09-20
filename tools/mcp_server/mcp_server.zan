@@ -112,6 +112,7 @@ class McpServer {
     static string knowledge;
     static string indexPath;
     static string refsPath;
+    static string callGraphPath;
     static string galleryPath;
     static string formSchemaPath;
     /// Project semantic index (System.Compiler.GenIndex output, per workspace):
@@ -208,6 +209,7 @@ class McpServer {
         bool initAgent = false;
         string initTarget = "";
         bool force = false;
+        bool testSemantic = false;
 
         int i = 0;
         int argc = Environment.ArgCount();
@@ -269,6 +271,9 @@ class McpServer {
             }
             if (a == "--stdio") {
                 McpServer.stdio = true; i = i + 1; continue;
+            }
+            if (a == "--test-semantic") {
+                testSemantic = true; i = i + 1; continue;
             }
             if (a == "--read-only" || a == "--readonly") {
                 McpServer.readOnly = true; i = i + 1; continue;
@@ -346,6 +351,19 @@ class McpServer {
         McpServer.skillsDir = McpServer.TrimTrailingSep(McpServer.skillsDir);
         McpServer.indexPath = McpServer.knowledge + "/symbols.json";
         McpServer.refsPath = McpServer.knowledge + "/refs.json";
+        if (!File.Exists(McpServer.refsPath)
+            && File.Exists(McpServer.root + "/.zanmap/refs.json")) {
+            McpServer.refsPath = McpServer.root + "/.zanmap/refs.json";
+        }
+        McpServer.callGraphPath = McpServer.knowledge + "/callgraph.jsonl";
+        if (!File.Exists(McpServer.callGraphPath)
+            && File.Exists(McpServer.root + "/.zanmap/callgraph.jsonl")) {
+            McpServer.callGraphPath = McpServer.root + "/.zanmap/callgraph.jsonl";
+        }
+        if (!File.Exists(McpServer.callGraphPath)
+            && File.Exists(McpServer.root + "/.zanmap/callgraph.json")) {
+            McpServer.callGraphPath = McpServer.root + "/.zanmap/callgraph.json";
+        }
         McpServer.galleryPath = McpServer.knowledge + "/gallery.json";
         McpServer.formSchemaPath = McpServer.knowledge + "/zform.json";
         // Per-workspace, not per-installation: these describe the project
@@ -363,6 +381,23 @@ class McpServer {
         McpServer.KnowledgeCheck(false);
         McpServer.workRoot = McpServer.root + "/_scratch/mcp_compile";
         McpServer.InitJobs();
+
+        if (testSemantic) {
+            Console.WriteLine("========================================");
+            Console.WriteLine("1. Testing CallChain('McpServer.CallTool', 'outgoing', 2):");
+            Console.WriteLine(McpServer.CallChain("McpServer.CallTool", "outgoing", 2));
+            Console.WriteLine("----------------------------------------");
+            Console.WriteLine("2. Testing TypeHierarchy('Control'):");
+            Console.WriteLine(McpServer.TypeHierarchy("Control"));
+            Console.WriteLine("----------------------------------------");
+            Console.WriteLine("3. Testing BlastRadius('CallNode.Create', 3):");
+            Console.WriteLine(McpServer.BlastRadius("CallNode.Create", 3));
+            Console.WriteLine("----------------------------------------");
+            Console.WriteLine("4. Testing ArchCheck():");
+            Console.WriteLine(McpServer.ArchCheck());
+            Console.WriteLine("========================================");
+            return;
+        }
 
         // stdout belongs to the protocol in stdio mode: not one byte of
         // banner may go out before the first response.
@@ -1323,6 +1358,21 @@ class McpServer {
         }
         if (name == "zan_find_refs" || name == "find_refs") {
             return McpServer.FindRefs(args.Str("name", ""), args.Int("limit", 30));
+        }
+        if (name == "zan_call_chain" || name == "call_chain" || name == "get_call_chain") {
+            return McpServer.CallChain(args.Str("symbol", ""),
+                                      args.Str("direction", "outgoing"),
+                                      args.Int("depth", 3));
+        }
+        if (name == "zan_type_hierarchy" || name == "type_hierarchy" || name == "get_type_hierarchy") {
+            return McpServer.TypeHierarchy(args.Str("type", args.Str("name", "")));
+        }
+        if (name == "zan_blast_radius" || name == "blast_radius" || name == "analyze_impact") {
+            return McpServer.BlastRadius(args.Str("symbol", ""),
+                                        args.Int("depth", 4));
+        }
+        if (name == "zan_arch_check" || name == "arch_check" || name == "check_architecture") {
+            return McpServer.ArchCheck();
         }
         if (name == "zan_project_overview" || name == "project_overview") {
             return McpServer.ProjectOverview(args.Int("limit", 40));
@@ -2932,6 +2982,346 @@ class McpServer {
     /// Rebuild .zanmap/{routes,entities,index}.json: export the workspace's
     /// unit metadata with zanc --gen-meta, then run the same GenIndex the
     /// compiler runs, so the index cannot drift from the generated code.
+    // ---- Advanced Semantic Tools: Call Chain, Type Hierarchy, Blast Radius, Arch Check ----
+
+    static string CleanJsonStr(string s) {
+        if (s.Length >= 2 && s.Substring(0, 1) == "\"" && s.Substring(s.Length - 1, 1) == "\"") {
+            return s.Substring(1, s.Length - 2);
+        }
+        return s;
+    }
+
+    // ---- Advanced Semantic Tools: Call Chain, Type Hierarchy, Blast Radius, Arch Check ----
+
+    static bool LoadCallGraph(Dictionary<string, JsonValue> byId, Dictionary<string, List<JsonValue>> byName) {
+        if (!File.Exists(McpServer.callGraphPath)) { return false; }
+        if (McpServer.callGraphPath.Length >= 6 && McpServer.callGraphPath.Substring(McpServer.callGraphPath.Length - 6, 6) == ".jsonl") {
+            List<string> lines = File.ReadAllLines(McpServer.callGraphPath);
+            for (int i = 0; i < lines.Count; i = i + 1) {
+                string l = lines[i];
+                if (l.Length == 0) { continue; }
+                JsonValue n = McpServer.ParseBody(l);
+                if (n == null) { continue; }
+                string id = n.Str("id", "");
+                string name = n.Str("name", "");
+                byId[id] = n;
+                if (!byName.ContainsKey(name)) { byName[name] = new List<JsonValue>(); }
+                byName[name].Add(n);
+            }
+            return true;
+        }
+        string raw = File.ReadAllText(McpServer.callGraphPath);
+        JsonValue doc = McpServer.ParseBody(raw);
+        if (doc == null) { return false; }
+        JsonValue nodes = doc.Get("nodes");
+        if (nodes == null || !nodes.IsArray()) { return false; }
+        for (int i = 0; i < nodes.Count(); i = i + 1) {
+            JsonValue n = nodes.At(i);
+            string id = n.Str("id", "");
+            string name = n.Str("name", "");
+            byId[id] = n;
+            if (!byName.ContainsKey(name)) { byName[name] = new List<JsonValue>(); }
+            byName[name].Add(n);
+        }
+        return true;
+    }
+
+    static string CallChain(string symbol, string direction, int maxDepth) {
+        if (symbol == "") { return "error: 'symbol' is required (e.g. 'Program.Main' or 'CallTool')"; }
+        if (!File.Exists(McpServer.callGraphPath)) {
+            return "error: call graph not found at " + McpServer.callGraphPath
+                + "; generate it with: repomap.exe .";
+        }
+        Dictionary<string, JsonValue> byId = new Dictionary<string, JsonValue>();
+        Dictionary<string, List<JsonValue>> byName = new Dictionary<string, List<JsonValue>>();
+        if (!McpServer.LoadCallGraph(byId, byName)) {
+            return "error: failed to load call graph from " + McpServer.callGraphPath;
+        }
+
+        JsonValue rootNode = null;
+        if (byId.ContainsKey(symbol)) {
+            rootNode = byId[symbol];
+        } else if (byName.ContainsKey(symbol)) {
+            List<JsonValue> cands = byName[symbol];
+            if (cands.Count == 1) {
+                rootNode = cands[0];
+            } else {
+                StringBuilder candMsg = new StringBuilder();
+                candMsg.Append("Ambiguous symbol '" + symbol + "', matches " + Convert.ToString(cands.Count) + " methods:\n");
+                for (int c = 0; c < cands.Count && c < 8; c = c + 1) {
+                    candMsg.Append("  - " + cands[c].Str("id", "") + " (" + cands[c].Str("file", "") + ":" + Convert.ToString(cands[c].Int("line", 0)) + ")\n");
+                }
+                candMsg.Append("Please specify full ID: ClassName.MethodName");
+                return candMsg.ToString();
+            }
+        }
+
+        if (rootNode == null) {
+            return "Symbol '" + symbol + "' not found in project call graph.";
+        }
+
+        bool outgoing = (direction != "incoming");
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[Call Hierarchy (" + (outgoing ? "outgoing / Callee Tree" : "incoming / Caller Tree") + ", maxDepth=" + Convert.ToString(maxDepth) + ")]\n");
+
+        List<string> visited = new List<string>();
+        McpServer.FormatCallTree(rootNode, byId, outgoing, 0, maxDepth, visited, sb);
+        return sb.ToString();
+    }
+
+    static void FormatCallTree(JsonValue current, Dictionary<string, JsonValue> byId, bool outgoing, int depth, int maxDepth, List<string> visited, StringBuilder sb) {
+        string indent = "";
+        for (int i = 0; i < depth; i = i + 1) { indent = indent + "  "; }
+
+        string id = current.Str("id", "");
+        string file = current.Str("file", "");
+        int line = current.Int("line", 0);
+        string sig = current.Str("sig", "");
+
+        sb.Append(indent);
+        if (depth > 0) { sb.Append("├── "); }
+        sb.Append(id);
+        if (line > 0) {
+            sb.Append(" [");
+            sb.Append(file);
+            sb.Append(":");
+            sb.Append(Convert.ToString(line));
+            sb.Append("]");
+        }
+        if (sig.Length > 0 && depth == 0) {
+            sb.Append(" :: ");
+            sb.Append(sig);
+        }
+
+        for (int v = 0; v < visited.Count; v = v + 1) {
+            if (visited[v] == id) {
+                sb.Append(" (recursion)\n");
+                return;
+            }
+        }
+        sb.Append("\n");
+
+        if (depth >= maxDepth) { return; }
+
+        visited.Add(id);
+
+        JsonValue targets = outgoing ? current.Get("callees") : current.Get("callers");
+        if (targets != null && targets.IsArray()) {
+            for (int i = 0; i < targets.Count(); i = i + 1) {
+                string targetId = McpServer.CleanJsonStr(targets.At(i).ToJson());
+                if (byId.ContainsKey(targetId)) {
+                    McpServer.FormatCallTree(byId[targetId], byId, outgoing, depth + 1, maxDepth, visited, sb);
+                } else {
+                    sb.Append(indent + "  ├── " + targetId + " (external/stdlib)\n");
+                }
+            }
+        }
+
+        visited.RemoveAt(visited.Count - 1);
+    }
+
+    static string TypeHierarchy(string typeName) {
+        if (typeName == "") { return "error: 'type' is required"; }
+        if (!File.Exists(McpServer.refsPath)) {
+            return "error: refs.json not found at " + McpServer.refsPath;
+        }
+        List<string> lines = File.ReadAllLines(McpServer.refsPath);
+        string simple = McpServer.AfterLastDot(typeName).ToLower();
+        JsonValue targetRec = null;
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            if (McpServer.NameField(lines[i]) == simple) {
+                targetRec = McpServer.IndexRecord(lines[i]);
+                if (targetRec != null) { break; }
+            }
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.Append("=== [Type Hierarchy for '" + typeName + "'] ===\n");
+        if (targetRec == null) {
+            sb.Append("Type '" + typeName + "' not found in reference index.\n");
+            return sb.ToString();
+        }
+
+        JsonValue defs = targetRec.Get("defs");
+        if (defs != null && defs.IsArray() && defs.Count() > 0) {
+            sb.Append("Declared at:\n");
+            for (int d = 0; d < defs.Count(); d = d + 1) {
+                sb.Append("  - " + defs.At(d).ToJson() + "\n");
+            }
+        }
+
+        JsonValue subtypes = targetRec.Get("subtypes");
+        if (subtypes != null && subtypes.IsArray() && subtypes.Count() > 0) {
+            sb.Append("Derived Classes / Implementations (" + Convert.ToString(subtypes.Count()) + "):\n");
+            for (int s = 0; s < subtypes.Count(); s = s + 1) {
+                sb.Append("  ├── " + subtypes.At(s).ToJson() + "\n");
+            }
+        } else {
+            sb.Append("No known derived classes or subtypes in this workspace.\n");
+        }
+        return sb.ToString();
+    }
+
+    static string BlastRadius(string symbol, int maxDepth) {
+        if (symbol == "") { return "error: 'symbol' is required"; }
+        if (!File.Exists(McpServer.callGraphPath)) {
+            return "error: call graph not found at " + McpServer.callGraphPath;
+        }
+        Dictionary<string, JsonValue> byId = new Dictionary<string, JsonValue>();
+        Dictionary<string, List<JsonValue>> byName = new Dictionary<string, List<JsonValue>>();
+        if (!McpServer.LoadCallGraph(byId, byName)) {
+            return "error: failed to load call graph from " + McpServer.callGraphPath;
+        }
+
+        JsonValue rootNode = null;
+        if (byId.ContainsKey(symbol)) { rootNode = byId[symbol]; }
+        else if (byName.ContainsKey(symbol)) {
+            List<JsonValue> cands = byName[symbol];
+            if (cands.Count == 1) { rootNode = cands[0]; }
+        }
+
+        if (rootNode == null) {
+            return "Symbol '" + symbol + "' not found in call graph.";
+        }
+
+        string rootId = rootNode.Str("id", "");
+        List<string> directCallers = new List<string>();
+        List<string> indirectCallers = new List<string>();
+        List<string> affectedFiles = new List<string>();
+        List<string> queue = new List<string>();
+        Dictionary<string, int> visited = new Dictionary<string, int>();
+
+        visited[rootId] = 1;
+        string rootFile = rootNode.Str("file", "");
+        if (rootFile.Length > 0) { affectedFiles.Add(rootFile); }
+
+        JsonValue callers = rootNode.Get("callers");
+        if (callers != null && callers.IsArray()) {
+            for (int i = 0; i < callers.Count(); i = i + 1) {
+                string cid = McpServer.CleanJsonStr(callers.At(i).ToJson());
+                directCallers.Add(cid);
+                queue.Add(cid);
+                visited[cid] = 1;
+            }
+        }
+
+        int curDepth = 1;
+        while (queue.Count > 0 && curDepth < maxDepth) {
+            int qLen = queue.Count;
+            for (int q = 0; q < qLen; q = q + 1) {
+                string nextId = queue[0];
+                queue.RemoveAt(0);
+                if (byId.ContainsKey(nextId)) {
+                    JsonValue n = byId[nextId];
+                    string f = n.Str("file", "");
+                    bool found = false;
+                    for (int fi = 0; fi < affectedFiles.Count; fi = fi + 1) {
+                        if (affectedFiles[fi] == f) { found = true; break; }
+                    }
+                    if (!found && f.Length > 0) { affectedFiles.Add(f); }
+
+                    JsonValue upCallers = n.Get("callers");
+                    if (upCallers != null && upCallers.IsArray()) {
+                        for (int u = 0; u < upCallers.Count(); u = u + 1) {
+                            string upId = McpServer.CleanJsonStr(upCallers.At(u).ToJson());
+                            if (!visited.ContainsKey(upId)) {
+                                visited[upId] = 1;
+                                indirectCallers.Add(upId);
+                                queue.Add(upId);
+                            }
+                        }
+                    }
+                }
+            }
+            curDepth = curDepth + 1;
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.Append("=== [Blast Radius / Impact Matrix for " + rootId + "] ===\n");
+        sb.Append("Target: " + rootNode.Str("file", "") + ":" + Convert.ToString(rootNode.Int("line", 0)) + "\n");
+        sb.Append("Direct Callers (" + Convert.ToString(directCallers.Count) + "):\n");
+        for (int i = 0; i < directCallers.Count; i = i + 1) {
+            sb.Append("  - " + directCallers[i]);
+            if (byId.ContainsKey(directCallers[i])) {
+                sb.Append(" (" + byId[directCallers[i]].Str("file", "") + ")");
+            }
+            sb.Append("\n");
+        }
+        sb.Append("Indirect Callers (" + Convert.ToString(indirectCallers.Count) + "):\n");
+        for (int i = 0; i < indirectCallers.Count && i < 15; i = i + 1) {
+            sb.Append("  - " + indirectCallers[i]);
+            if (byId.ContainsKey(indirectCallers[i])) {
+                sb.Append(" (" + byId[indirectCallers[i]].Str("file", "") + ")");
+            }
+            sb.Append("\n");
+        }
+        if (indirectCallers.Count > 15) {
+            sb.Append("  ... and " + Convert.ToString(indirectCallers.Count - 15) + " more.\n");
+        }
+
+        sb.Append("Total Affected Files: " + Convert.ToString(affectedFiles.Count) + "\n");
+        string risk = "Low";
+        if (directCallers.Count > 10 || indirectCallers.Count > 25) { risk = "HIGH (Critical Hub Symbol)"; }
+        else if (directCallers.Count > 3 || indirectCallers.Count > 8) { risk = "MEDIUM"; }
+        sb.Append("Risk Rating: " + risk + "\n");
+        return sb.ToString();
+    }
+
+    static string ArchCheck() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("=== [Zan Architecture & Rules Check (Rules as Code)] ===\n");
+        int violations = 0;
+
+        // Rule 1: ZanIDE No Custom Drawing Rule (AGENTS.md hard constraint: ZanIDE禁止任何自绘必须全部用标准库组件来完成)
+        string ideDir = McpServer.root + "/src/ide_zan";
+        if (Directory.Exists(ideDir)) {
+            List<string> ideFiles = new List<string>();
+            McpServer.Walk("src/ide_zan", ideDir, "*.zan", "", 1000, ideFiles, 0);
+            for (int i = 0; i < ideFiles.Count; i = i + 1) {
+                string rel = ideFiles[i];
+                string abs = McpServer.root + "/" + rel;
+                string content = File.ReadAllText(abs);
+                List<string> lines = File.ReadAllLines(abs);
+                for (int l = 0; l < lines.Count; l = l + 1) {
+                    string line = lines[l];
+                    if (McpServer.Find(line, "DirectDraw(") >= 0 || McpServer.Find(line, "DrawText(") >= 0 || McpServer.Find(line, "FillRect(") >= 0) {
+                        violations = violations + 1;
+                        sb.Append("[FAIL - ArchRule-01: ZanIDE Custom Draw Forbidden]\n");
+                        sb.Append("  File: " + rel + ":" + Convert.ToString(l + 1) + "\n");
+                        sb.Append("  Code: " + line.Trim() + "\n");
+                        sb.Append("  Constraint: ZanIDE must use standard library components (stdlib/Gui/Component/*), direct drawing is forbidden.\n");
+                    }
+                }
+            }
+        }
+
+        // Rule 2: Controller Layer Purity (Controller must not import or invoke Native DllImport directly)
+        string ctrlDir = McpServer.root + "/src/Controller";
+        if (Directory.Exists(ctrlDir)) {
+            List<string> ctrlFiles = new List<string>();
+            McpServer.Walk("src/Controller", ctrlDir, "*.zan", "", 1000, ctrlFiles, 0);
+            for (int i = 0; i < ctrlFiles.Count; i = i + 1) {
+                string rel = ctrlFiles[i];
+                string abs = McpServer.root + "/" + rel;
+                string content = File.ReadAllText(abs);
+                if (McpServer.Find(content, "DllImport(") >= 0) {
+                    violations = violations + 1;
+                    sb.Append("[FAIL - ArchRule-02: Controller Native Leak]\n");
+                    sb.Append("  File: " + rel + "\n");
+                    sb.Append("  Constraint: Web Controllers must delegate through Service layer and never invoke Native DllImport directly.\n");
+                }
+            }
+        }
+
+        if (violations == 0) {
+            sb.Append("All Architecture Rules PASSED (0 violations detected).\n");
+        } else {
+            sb.Append("Total Violations: " + Convert.ToString(violations) + ". Build gate BLOCKED.\n");
+        }
+        return sb.ToString();
+    }
+
+
     static async string RefreshIndex() {
         List<string> srcs = new List<string>();
         string scope = "src";
