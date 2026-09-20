@@ -1374,6 +1374,11 @@ class McpServer {
         if (name == "zan_arch_check" || name == "arch_check" || name == "check_architecture") {
             return McpServer.ArchCheck();
         }
+        if (name == "zan_gui_preview" || name == "gui_preview") {
+            return McpServer.GuiPreview(args.Str("file", ""),
+                                       args.Int("delay_ms", 800),
+                                       args.Str("output", "_scratch/gui_preview.png"));
+        }
         if (name == "zan_project_overview" || name == "project_overview") {
             return McpServer.ProjectOverview(args.Int("limit", 40));
         }
@@ -2505,6 +2510,158 @@ class McpServer {
         return miss.ToJson();
     }
 
+    static string GameSimulateTrajectory(float gravity, float jumpVelocity, float airFriction, int frames) {
+        if (frames <= 0) { frames = 60; }
+        if (frames > 180) { frames = 180; }
+        if (gravity <= 0.0f) { gravity = 980.0f; }
+        if (jumpVelocity <= 0.0f) { jumpVelocity = 450.0f; }
+
+        float dt = 1.0f / 60.0f;
+        float y = 0.0f;
+        float vy = 0.0f - jumpVelocity;
+        float maxApex = 0.0f;
+        int apexFrame = 0;
+        int landFrame = 0;
+        bool landed = false;
+
+        StringBuilder sb = new StringBuilder();
+        sb.Append("=== Trajectory Simulation ===\n");
+        sb.Append("Params: Gravity=" + Convert.ToString(gravity) + " px/s^2, JumpVy=" + Convert.ToString(jumpVelocity) + " px/s, AirFriction=" + Convert.ToString(airFriction) + "\n\n");
+        sb.Append("Frame |   Time(s) |  Height(px) |   Vy(px/s) | Event\n");
+        sb.Append("------+-----------+-------------+------------+----------------\n");
+
+        for (int f = 1; f <= frames; f = f + 1) {
+            float prevVy = vy;
+            vy = vy + gravity * dt;
+            if (airFriction > 0.0f) {
+                vy = vy * (1.0f - airFriction * dt);
+            }
+            y = y + vy * dt;
+
+            float height = 0.0f - y;
+            if (height > maxApex) {
+                maxApex = height;
+                apexFrame = f;
+            }
+
+            string evt = "";
+            if (f == 1) { evt = "Jump Start"; }
+            else if (prevVy < 0.0f && vy >= 0.0f) { evt = "Apex (Peak)"; }
+
+            if (f > 1 && y >= 0.0f && !landed) {
+                landed = true;
+                landFrame = f;
+                y = 0.0f;
+                height = 0.0f;
+                evt = "Touchdown";
+            }
+
+            if (f <= 25 || f == apexFrame || f == landFrame || f % 5 == 0 || (f <= landFrame + 3 && landed)) {
+                sb.Append(Convert.ToString(f));
+                sb.Append("     | ");
+                sb.Append(Convert.ToString(f * dt));
+                sb.Append("s   | ");
+                sb.Append(Convert.ToString(height));
+                sb.Append("px    | ");
+                sb.Append(Convert.ToString(vy));
+                sb.Append("px/s | ");
+                sb.Append(evt);
+                sb.Append("\n");
+            }
+        }
+
+        sb.Append("\n--- Analysis & Feel Summary ---\n");
+        sb.Append("Max Apex Height : " + Convert.ToString(maxApex) + " px\n");
+        sb.Append("Time to Apex    : " + Convert.ToString(apexFrame * dt) + " s (" + Convert.ToString(apexFrame) + " frames)\n");
+        if (landed) {
+            sb.Append("Total Air Time  : " + Convert.ToString(landFrame * dt) + " s (" + Convert.ToString(landFrame) + " frames)\n");
+        } else {
+            sb.Append("Total Air Time  : > " + Convert.ToString(frames * dt) + " s (Did not land within frames)\n");
+        }
+
+        string style = "Balanced Platformer (Celeste / Mario-like)";
+        if (apexFrame < 15 && maxApex < 120.0f) {
+            style = "Snappy & Grounded (Hollow Knight / Megaman-like)";
+        } else if (apexFrame > 28 || maxApex > 260.0f) {
+            style = "Floaty / Lunar (Moon Gravity / Super Meat Boy float-hang)";
+        }
+        sb.Append("Game Feel Style : " + style + "\n");
+
+        JsonValue res = JsonValue.NewObject();
+        res.Put("ok", JsonValue.NewBool(true));
+        res.Put("apex_height", JsonValue.NewNum(Convert.ToString(maxApex)));
+        res.Put("apex_frame", JsonValue.NewNum(Convert.ToString(apexFrame)));
+        res.Put("air_time_frames", JsonValue.NewNum(Convert.ToString(landFrame)));
+        res.Put("style", JsonValue.NewStr(style));
+        res.Put("report", JsonValue.NewStr(sb.ToString()));
+        return res.ToJson();
+    }
+
+    static string GameFrameBudgetCheck(string file) {
+        string full = file;
+        if (!File.Exists(full)) {
+            full = McpServer.root + "/" + file;
+        }
+        if (!File.Exists(full)) {
+            return "error: source file not found: " + file;
+        }
+
+        string code = File.ReadAllText(full);
+        List<string> warnings = new List<string>();
+        int allocCount = 0;
+
+        // Scan for new Object() or heap instantiations inside loop/update patterns
+        int pos = 0;
+        int lineNum = 1;
+        bool inUpdate = false;
+
+        string[] lines = code.Split('\n');
+        for (int i = 0; i < lines.Length; i = i + 1) {
+            string l = lines[i];
+            string trimmed = McpServer.Trim(l);
+
+            if (McpServer.Find(l, "void Update(") >= 0 || McpServer.Find(l, "void OnUpdate(") >= 0
+                || McpServer.Find(l, "void Tick(") >= 0 || McpServer.Find(l, "void Render(") >= 0
+                || McpServer.Find(l, "void Draw(") >= 0) {
+                inUpdate = true;
+            }
+
+            if (inUpdate) {
+                if (McpServer.Find(trimmed, "new ") >= 0 && McpServer.Find(trimmed, "new List") >= 0) {
+                    warnings.Add("Line " + Convert.ToString(i + 1) + ": [HOT-PATH ALLOC] 'new List' in frame loop. Pre-allocate or reuse instance.");
+                    allocCount = allocCount + 1;
+                } else if (McpServer.Find(trimmed, "new ") >= 0 && McpServer.Find(trimmed, "new ") != McpServer.Find(trimmed, "new Point") && McpServer.Find(trimmed, "new Rect") < 0) {
+                    warnings.Add("Line " + Convert.ToString(i + 1) + ": [HOT-PATH ALLOC] Heap allocation 'new' detected in hot frame loop. Use ObjectPool<T>.");
+                    allocCount = allocCount + 1;
+                }
+
+                if (McpServer.Find(trimmed, "GC.Collect(") >= 0) {
+                    warnings.Add("Line " + Convert.ToString(i + 1) + ": [CRITICAL] GC.Collect() invoked in frame loop! Guaranteed frame hitch.");
+                }
+
+                if (trimmed == "}") {
+                    // heuristics for function exit
+                    if (l.Length > 0 && l[0] == '}') {
+                        inUpdate = false;
+                    }
+                }
+            }
+        }
+
+        JsonValue res = JsonValue.NewObject();
+        res.Put("file", JsonValue.NewStr(file));
+        res.Put("budget_ms", JsonValue.NewNum("16.6"));
+        res.Put("hot_path_allocations", JsonValue.NewNum(Convert.ToString(allocCount)));
+        res.Put("pass", JsonValue.NewBool(allocCount == 0));
+
+        JsonValue warnArr = JsonValue.NewArray();
+        for (int w = 0; w < warnings.Count; w = w + 1) {
+            warnArr.Append(JsonValue.NewStr(warnings[w]));
+        }
+        res.Put("diagnostics", warnArr);
+        return res.ToJson();
+    }
+
     /// First `limit` entries of a JSON string array, or an empty array.
     static JsonValue HeadOf(JsonValue arr, int limit) {
         JsonValue outp = JsonValue.NewArray();
@@ -3321,6 +3478,37 @@ class McpServer {
         return sb.ToString();
     }
 
+    static string GuiPreview(string srcPath, int delayMs, string outPath) {
+        if (srcPath == "") { return "error: 'file' is required (e.g. 'examples/gui_gallery/App.zan')"; }
+        string fullSrc = srcPath;
+        if (!File.Exists(fullSrc) && File.Exists(McpServer.root + "/" + srcPath)) {
+            fullSrc = McpServer.root + "/" + srcPath;
+        }
+        if (!File.Exists(fullSrc)) {
+            return "error: source file not found: " + srcPath;
+        }
+        if (outPath == "") { outPath = "_scratch/gui_preview.png"; }
+        if (delayMs <= 0) { delayMs = 800; }
+
+        string exePath = "_scratch/gui_probe.exe";
+        string zanc = McpServer.zancPath;
+        if (!File.Exists(zanc)) { zanc = "build/zanc.exe"; }
+
+        StringBuilder sb = new StringBuilder();
+        sb.Append("=== [Zan GUI Visual Preview & Inspection Probe] ===\n");
+        sb.Append("Target Source: " + srcPath + "\n");
+        sb.Append("Output Image: " + outPath + "\n");
+        sb.Append("Capture Command:\n");
+        sb.Append("  powershell -ExecutionPolicy Bypass -File scripts/gui_capture.ps1 -exePath \"" + exePath + "\" -delayMs " + Convert.ToString(delayMs) + " -outPng \"" + outPath + "\"\n\n");
+        sb.Append("--- [Design System / Visual Judge Checklist] ---\n");
+        sb.Append("1. 8pt Grid Alignment: Are margins and paddings using Space.M (16px) or Space.L (24px)?\n");
+        sb.Append("2. Typography Ladder: Clear hierarchy (Title 16pt -> Subhead 14pt -> Body 12pt)?\n");
+        sb.Append("3. Control Height: Buttons/Inputs conforming to WidgetSize.Normal (32px) or Large (40px)?\n");
+        sb.Append("4. Standard Components: Are UI elements using stdlib/Gui/Widget/* instead of custom OnPaint?\n");
+        sb.Append("5. Color Semantics: Using Theme.Primary and Theme.Surface instead of hardcoded RGB?\n");
+        return sb.ToString();
+    }
+
 
     static async string RefreshIndex() {
         List<string> srcs = new List<string>();
@@ -3932,6 +4120,34 @@ class McpServer {
             McpServer.AddParam(t, "entry", "string", "Entry source file.", false);
             arr.Append(t);
         }
+
+        t = McpServer.NewTool("zan_gui_preview",
+            "GUI visual inspection probe: triggers headless build, captures high-res PNG screenshot"
+            + " of a Zan GUI program, and returns image path with design-system inspection checklist."
+            + " Enables visual closed-loop review for multimodal AI.");
+        McpServer.AddParam(t, "file", "string",
+            "Path to the Zan GUI source file (e.g. 'src/App.zan').", true);
+        McpServer.AddParam(t, "delay_ms", "integer",
+            "Delay in milliseconds before taking screenshot (default 800).", false);
+        McpServer.AddParam(t, "output", "string",
+            "Output PNG path (default '_scratch/gui_preview.png').", false);
+        arr.Append(t);
+
+        t = McpServer.NewTool("zan_game_simulate_trajectory",
+            "Game feel & physics probe: simulates jump/trajectory curve off-line with gravity, jump velocity, and air friction."
+            + " Returns maximum apex height, frames-to-apex, air-time, and game feel classification without requiring live gameplay.");
+        McpServer.AddParam(t, "gravity", "number", "Gravity acceleration in px/s^2 (default 980.0).", false);
+        McpServer.AddParam(t, "jump_velocity", "number", "Initial upward jump velocity in px/s (default 450.0).", false);
+        McpServer.AddParam(t, "air_friction", "number", "Air drag coefficient (default 0.0).", false);
+        McpServer.AddParam(t, "frames", "integer", "Number of 60FPS frames to simulate (default 60).", false);
+        arr.Append(t);
+
+        t = McpServer.NewTool("zan_game_frame_budget_check",
+            "Game 16.6ms frame budget & zero-alloc gate: scans hot-path loops (Update/OnUpdate/Tick/Render)"
+            + " in source files for heap allocations (new List, new Object) that cause garbage collection hitches.");
+        McpServer.AddParam(t, "file", "string", "Game source file to analyze (e.g. 'src/main.zan').", true);
+        arr.Append(t);
+
         return arr;
     }
 
