@@ -50,3 +50,9 @@ for pair in arm64:aarch64 x64:x86_64; do
         -c "$RT/gui_compat_mac.c" -o "$out/zanrt_gui.o"
     echo "built toolchain/macos/$sub: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_timer.o zanrt_gui.o"
 done
+
+mkdir -p "$TOOLCHAIN/ios/arm64"
+"$ZIG" cc -target aarch64-ios -g0 -std=c11 -fPIC -I "$RT" -O2 \
+    -c "$RT/gui_compat_mac.c" -o "$TOOLCHAIN/ios/arm64/zanrt_gui.o"
+echo "built toolchain/ios/arm64: zanrt_gui.o"
+

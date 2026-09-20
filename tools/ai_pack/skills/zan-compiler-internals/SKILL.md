@@ -980,9 +980,10 @@ parser 回溯，专项做。
   不是稳态）。中文字形必须 pre-start 往 worker 内存 FS 挂 `/fonts/ui.ttf`
   + `/fonts/cjk.ttf`（与引擎同法 ≤4MB 分片），缺字体不报错、只画"?"。
 - **渲染入口声明即契约**：Render.zan 无条件引用 `zan_gui_draw_text_bold`
-  （图表标题默认加粗），非 Win32 的 gui_runtime_font.c 必须出这个符号
-  （回退=画常规体），否则 wasm/非 Win32 链接期 undefined symbol；同族
-  "对象 mtime 新于源码但缺符号"的坑用 nm 验对象内容，别信 mtime。
+  （图表标题默认加粗）与 `zan_gui_draw_polybatch`，非 Win32 的 gui_runtime_font.c / gui_compat_mac.c 必须出这些符号
+  （回退=画常规体 / 循环调用 polyline），否则 wasm/非 Win32 链接期 undefined symbol；同族
+  "对象 mtime 新于源码但缺符号"的坑用 nm 验对象内容，别信 mtime。macOS/iOS 编译
+  还依赖 `toolchain/macos/*/zanrt_gui.o` 和 `toolchain/ios/arm64/zanrt_gui.o`。
 
 ## 改仓库文件的静默陷阱
 

@@ -32,6 +32,7 @@ RT_FILE = ["src/runtime/rt_file.c"]
 RT_TIMER = ["src/runtime/rt_timer.c"]
 RT_WASM = ["src/runtime/rt_wasm.c"]   # zanrt_wasm.o compiles rt_wasm.c only; rt_file.c
                                      # links alongside as its own object (build_cross_rt.cmd)
+RT_GUI_MAC = ["src/runtime/gui_compat_mac.c"]
 ANDROID_NDK = []  # NDK-derived: no repo source drives it; never "stale" by src
 GUI = ["src/runtime/gui_runtime.c", "src/runtime/gui_runtime_text.c",
        "src/runtime/gui_runtime_font.c", "src/runtime/gui_runtime_x11.c",
@@ -59,10 +60,15 @@ ARTIFACTS = [
     ("toolchain/macos/arm64/zanrt_io_mt.o", RT_IO, "runtime"),
     ("toolchain/macos/arm64/zanrt_sync.o", RT_SYNC, "runtime"),
     ("toolchain/macos/arm64/zanrt_file.o", RT_FILE, "runtime"),
+    ("toolchain/macos/arm64/zanrt_timer.o", RT_TIMER, "runtime"),
+    ("toolchain/macos/arm64/zanrt_gui.o", RT_GUI_MAC, "runtime"),
     ("toolchain/macos/x64/zanrt_io.o", RT_IO, "runtime"),
     ("toolchain/macos/x64/zanrt_io_mt.o", RT_IO, "runtime"),
     ("toolchain/macos/x64/zanrt_sync.o", RT_SYNC, "runtime"),
     ("toolchain/macos/x64/zanrt_file.o", RT_FILE, "runtime"),
+    ("toolchain/macos/x64/zanrt_timer.o", RT_TIMER, "runtime"),
+    ("toolchain/macos/x64/zanrt_gui.o", RT_GUI_MAC, "runtime"),
+    ("toolchain/ios/arm64/zanrt_gui.o", RT_GUI_MAC, "runtime"),
     ("toolchain/wasm32/zanrt_wasm.o", RT_WASM, "runtime"),
     ("toolchain/wasm32/zanrt_file.o", RT_FILE, "runtime"),
     ("toolchain/wasm32/zanrt_timer.o", RT_TIMER, "runtime"),

@@ -41,9 +41,15 @@ for %%P in (arm64:aarch64 x64:x86_64) do (
     "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_sync.c  -o toolchain\macos\%%A\zanrt_sync.o  || exit /b 1
     "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_file.c  -o toolchain\macos\%%A\zanrt_file.o  || exit /b 1
     "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\macos\%%A\zanrt_timer.o || exit /b 1
+    "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\gui_compat_mac.c -o toolchain\macos\%%A\zanrt_gui.o || exit /b 1
     echo built toolchain\macos\%%A
   )
 )
+
+rem iOS
+if not exist toolchain\ios\arm64 mkdir toolchain\ios\arm64
+"%ZIG%" cc -target aarch64-ios -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\gui_compat_mac.c -o toolchain\ios\arm64\zanrt_gui.o || exit /b 1
+echo built toolchain\ios\arm64\zanrt_gui.o
 
 rem wasm32 (WASI): single-threaded, so no rt_io / rt_sync -- the wasm link
 rem rejects those programs before the object would be needed (see main.c's
