@@ -352,6 +352,8 @@ class Win32Shell {
     // 没有 DWM 也能工作。所有区域之外的像素点击穿透。
     static int shapeMode;
     static List<int> shapeRegions;
+    static int winOpacityPercent;
+    static bool hasShadowBand;
     // 分层路径缓存的逐像素覆盖掩码（0..255，直通
     // alpha）：仅在窗口或形状列表变化时重建。
     static List<byte> shapeMask;
@@ -460,6 +462,7 @@ class Win32Shell {
         Win32Shell.hitGuardWins = new List<nint>();
         Win32Shell.lastSurface = 0 - 1;
         Win32Shell.bgColor = 0;
+        Win32Shell.winOpacityPercent = 100;
 
         Win32Shell.injectCs = NativeMemory.Alloc(64);
         Win32Shell.InitializeCriticalSection(Win32Shell.injectCs);
@@ -805,6 +808,11 @@ class Win32Shell {
         } else if (msg == 0x0084) {                // WM_NCHITTEST
             return Win32Shell.HitTest(hwnd, Win32Shell.LoWord(lp),
                 Win32Shell.HiWord(lp));
+        } else if (msg == 0x0085) {                // WM_NCPAINT
+            return 0;                              // 阻止系统绘制默认方形非客户区边框
+        } else if (msg == 0x0086) {                // WM_NCACTIVATE
+            // 阻止 DefWindowProc 绘制默认方形激活/非激活边框高亮（消灭点击激活时的方角）
+            return 1;
         } else if (msg == 0x00A3) {                // WM_NCLBUTTONDBLCLK
             // 双击标题栏默认最大化；固定尺寸的窗口吃掉它，
             // 关闭了最大化按钮的窗口同样吃掉。已经最大的窗口
@@ -1297,7 +1305,18 @@ class Win32Shell {
                     if (mask != null) {
                         int cov = mask[sy * pw + (x - ox)];
                         if (cov <= 0) {
-                            new Span<int>(dstRow + x * 4, 1)[0] = 0;
+                            // 在真实内容轮廓外部：若开启了阴影带，仅允许半透明阴影透出；
+                            // 子控件或背景越界画的不透明方角（a > 120）在此被直接裁去，
+                            // 确保组件圆角与窗口轮廓完全吻合。
+                            if (Win32Shell.hasShadowBand && a > 0 && a <= 120) {
+                                int r0 = ((p >> 16) & 255) * a / 255;
+                                int g0 = ((p >> 8) & 255) * a / 255;
+                                int b0 = (p & 255) * a / 255;
+                                new Span<int>(dstRow + x * 4, 1)[0] =
+                                    (a << 24) | (r0 << 16) | (g0 << 8) | b0;
+                            } else {
+                                new Span<int>(dstRow + x * 4, 1)[0] = 0;
+                            }
                             x = x + 1;
                             continue;
                         }
@@ -1337,7 +1356,10 @@ class Win32Shell {
         nint blend = NativeMemory.Alloc(4);
         new Span<byte>(blend, 1)[0] = 0;         // AC_SRC_OVER
         new Span<byte>(blend + 1, 1)[0] = 0;
-        new Span<byte>(blend + 2, 1)[0] = 255;
+        int constAlpha = (Win32Shell.winOpacityPercent * 255) / 100;
+        if (constAlpha < 0) { constAlpha = 0; }
+        if (constAlpha > 255) { constAlpha = 255; }
+        new Span<byte>(blend + 2, 1)[0] = (byte)constAlpha;
         new Span<byte>(blend + 3, 1)[0] = 1;         // AC_SRC_ALPHA
         nint dstPt = NativeMemory.Alloc(8);
         new Span<int>(dstPt, 1)[0] = wx;
@@ -2033,11 +2055,25 @@ class Win32Shell {
     static void SetOpacity(nint hwnd, int percent) {
         Win32Shell.Init();
         if (hwnd == 0) { return; }
-        // 半透明靠 SetLayeredWindowAttributes，必须分层；分层会连
+        // 半透明靠 SetLayeredWindowAttributes 或 UpdateLayeredWindow，必须分层；分层会连
         // 原生子窗口一起藏掉，宿主窗口只能整窗不透明。
         if (Win32Shell.IsLayerHost(hwnd)) { return; }
         if (percent < 10) { percent = 10; }
         if (percent > 100) { percent = 100; }
+        Win32Shell.winOpacityPercent = percent;
+
+        // 若当前窗口使用异形/圆角或原生玻璃等逐像素分层呈现模式，
+        // 绝不可调用 SetLayeredWindowAttributes，否则会导致与 UpdateLayeredWindow 互斥失败，
+        // 使得渲染管道损坏并将所有组件刷白；亦不可在 percent == 100 时摘掉 WS_EX_LAYERED。
+        // 通过 UpdateLayeredWindow 的 SourceConstantAlpha 完成整窗混合。
+        if (Win32Shell.shapeMode != 0 || Win32Shell.glassOn) {
+            int own = Win32Shell.SurfaceOf(hwnd);
+            if (own >= 0) {
+                Win32Shell.PresentLayered(hwnd, own);
+            }
+            return;
+        }
+
         nint ex = Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20);
         if (percent >= 100) {
             if (!Win32Shell.glassOn && (ex & 0x00080000) != 0) {
@@ -2081,6 +2117,7 @@ class Win32Shell {
         }
         if (regs.Count == 0) {
             // 恢复普通不透明窗口：清除所有区域 + 分层样式。
+            Win32Shell.hasShadowBand = false;
             Win32Shell.SetWindowRgn(hwnd, 0, true);
             nint ex = Win32Shell.GetWindowLongPtrW(hwnd, 0 - 20);
             if ((ex & 0x00080000) != 0) {
@@ -2094,6 +2131,13 @@ class Win32Shell {
             return;
         }
         Win32Shell.shapeRegions = regs;
+        bool sb = false;
+        int si = 0;
+        while (si + 5 < regs.Count) {
+            if (regs[si] == 3) { sb = true; }
+            si = si + 6;
+        }
+        Win32Shell.hasShadowBand = sb;
         Win32Shell.shapeMask = new List<byte>();
         // 在缩小之前标记异形：FitShapeWindow 的 SetWindowPos
         // 不能被主框架 800x600 的 WM_GETMINMAXINFO 最小值夹紧。
@@ -2198,6 +2242,11 @@ class Win32Shell {
         int i = 0;
         while (i + 5 < regs.Count) {
             int t = regs[i];
+            if (t == 3) {
+                // 类型 3（阴影带）仅用于分层外扩，不属于窗口可交互实体区域
+                i = i + 6;
+                continue;
+            }
             int x = regs[i + 1] * scale / 100;
             int y = regs[i + 2] * scale / 100;
             int w = regs[i + 3] * scale / 100;
@@ -2232,6 +2281,11 @@ class Win32Shell {
         int i = 0;
         while (i + 5 < regs.Count) {
             int t = regs[i];
+            if (t != 1 && t != 2) {
+                // 类型 3（阴影带）仅用于分层表面柔和阴影透出，不计入实体内容轮廓 SDF
+                i = i + 6;
+                continue;
+            }
             long x = (long)(regs[i + 1] * scale / 100) * 16;
             long y = (long)(regs[i + 2] * scale / 100) * 16;
             long w = (long)(regs[i + 3] * scale / 100) * 16;
@@ -2239,14 +2293,26 @@ class Win32Shell {
             long r = (long)(regs[i + 5] * scale / 100) * 16;
             long d = 0;
             if (t == 2) {
-                long cx = x + w / 2;
-                long cy = y + h / 2;
-                long rad = w / 2;
-                if (rad < 1) { rad = 1; }
+                long rx = w / 2;
+                long ry = h / 2;
+                if (rx < 1) { rx = 1; }
+                if (ry < 1) { ry = 1; }
+                long cx = x + rx;
+                long cy = y + ry;
                 long dx = sx - cx;
+                if (dx < 0) { dx = 0 - dx; }
                 long dy = sy - cy;
-                long dist = Win32Shell.ISqrt64(dx * dx + dy * dy);
-                d = dist - rad;
+                if (dy < 0) { dy = 0 - dy; }
+                if (rx == ry) {
+                    long dist = Win32Shell.ISqrt64(dx * dx + dy * dy);
+                    d = dist - rx;
+                } else {
+                    long term1 = dx * ry;
+                    long term2 = dy * rx;
+                    long k = Win32Shell.ISqrt64(term1 * term1 + term2 * term2);
+                    long denom = rx > ry ? rx : ry;
+                    d = (k - rx * ry) / denom;
+                }
             } else {
                 if (r < 0) { r = 0; }
                 if (r * 2 > w) { r = w / 2; }
@@ -2323,33 +2389,6 @@ class Win32Shell {
             }
             int c2 = sum; // 16 samples * 0..16 = 0..256
             if (c2 > 255) { c2 = 255; }
-            if (c2 == 0) {
-                // 类型 3 阴影带区域仅扩展系统表面：
-                // 画布自身的 alpha（PaintShapeShadow 绘制的柔和阴影）
-                // 必须原样合成，因此该带在掩码中不透明。
-                // 阴影未到达的像素因画布 alpha 为 0
-                // 而保持透明。真实轮廓（类型 1/2）的覆盖
-                // 在其非零处优先，因此角落的抗锯齿
-                // 绝不会被该带抹平。
-                int inBand = 0;
-                int rj = 0;
-                while (rj + 5 < Win32Shell.shapeRegions.Count) {
-                    if (Win32Shell.shapeRegions[rj] == 3) {
-                        long bx0 = (long)Win32Shell.shapeRegions[rj + 1] * scale / 100 * 16;
-                        long by0 = (long)Win32Shell.shapeRegions[rj + 2] * scale / 100 * 16;
-                        long bx1 = bx0 + (long)Win32Shell.shapeRegions[rj + 3] * scale / 100 * 16;
-                        long by1 = by0 + (long)Win32Shell.shapeRegions[rj + 4] * scale / 100 * 16;
-                        long sx = (long)px * 16 + 8;
-                        long sy = (long)py * 16 + 8;
-                        if (sx >= bx0 && sx < bx1 && sy >= by0 && sy < by1) {
-                            inBand = 1;
-                            rj = Win32Shell.shapeRegions.Count;
-                        }
-                    }
-                    rj = rj + 6;
-                }
-                if (inBand != 0) { c2 = 255; }
-            }
             mask.Add((byte)c2);
         }
         Win32Shell.shapeMask = mask;
