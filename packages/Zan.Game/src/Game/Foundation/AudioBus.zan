@@ -1,0 +1,297 @@
+using System;
+using System.Collections.Generic;
+using System.Media;
+
+namespace Game.Foundation;
+
+/// <summary>
+/// 音频总线通道标识。
+/// </summary>
+class AudioChannel {
+    const int Master = 0;
+    const int Bgm = 1;
+    const int Sfx = 2;
+    const int Voice = 3;
+}
+
+/// <summary>
+/// 游戏级音频总线与混音管理器。
+/// 提供分级通道音量控制、独立静音、BGM 平滑淡入淡出、以及音效防爆音限频机制。
+/// </summary>
+class AudioBus {
+    double masterVolume;
+    double bgmVolume;
+    double sfxVolume;
+    double voiceVolume;
+
+    bool masterMuted;
+    bool bgmMuted;
+    bool sfxMuted;
+    bool voiceMuted;
+
+    // BGM 淡入淡出状态
+    AudioVoice currentBgmVoice;
+    AudioClip pendingBgmClip;
+    int fadeOutDurationMs;
+    int fadeInDurationMs;
+    int fadeElapsedMs;
+    double fadeStartGain;
+    double fadeTargetGain;
+    int fadePhase; // 0=None, 1=FadeOut, 2=FadeIn
+
+    // 音效冷却防爆音记录
+    Dictionary<string, int> sfxCooldowns;
+
+    AudioBus() {
+        this.masterVolume = 1.0;
+        this.bgmVolume = 1.0;
+        this.sfxVolume = 1.0;
+        this.voiceVolume = 1.0;
+
+        this.masterMuted = false;
+        this.bgmMuted = false;
+        this.sfxMuted = false;
+        this.voiceMuted = false;
+
+        this.currentBgmVoice = null;
+        this.pendingBgmClip = null;
+        this.fadePhase = 0;
+        this.sfxCooldowns = new Dictionary<string, int>();
+    }
+
+    // --- 音量与静音控制 ---
+
+    void SetMasterVolume(double volume) {
+        if (volume < 0.0) { volume = 0.0; }
+        if (volume > 1.0) { volume = 1.0; }
+        this.masterVolume = volume;
+        Audio.SetVolume(this.masterVolume);
+    }
+
+    double MasterVolume() { return this.masterVolume; }
+
+    void SetBgmVolume(double volume) {
+        if (volume < 0.0) { volume = 0.0; }
+        if (volume > 1.0) { volume = 1.0; }
+        this.bgmVolume = volume;
+        this.ApplyBgmVoiceGain();
+    }
+
+    double BgmVolume() { return this.bgmVolume; }
+
+    void SetSfxVolume(double volume) {
+        if (volume < 0.0) { volume = 0.0; }
+        if (volume > 1.0) { volume = 1.0; }
+        this.sfxVolume = volume;
+    }
+
+    double SfxVolume() { return this.sfxVolume; }
+
+    void SetVoiceVolume(double volume) {
+        if (volume < 0.0) { volume = 0.0; }
+        if (volume > 1.0) { volume = 1.0; }
+        this.voiceVolume = volume;
+    }
+
+    double VoiceVolume() { return this.voiceVolume; }
+
+    void SetMasterMuted(bool muted) {
+        this.masterMuted = muted;
+        if (muted) {
+            Audio.SetVolume(0.0);
+        } else {
+            Audio.SetVolume(this.masterVolume);
+        }
+    }
+
+    bool IsMasterMuted() { return this.masterMuted; }
+
+    void SetBgmMuted(bool muted) {
+        this.bgmMuted = muted;
+        this.ApplyBgmVoiceGain();
+    }
+
+    bool IsBgmMuted() { return this.bgmMuted; }
+
+    void SetSfxMuted(bool muted) { this.sfxMuted = muted; }
+    bool IsSfxMuted() { return this.sfxMuted; }
+
+    void SetVoiceMuted(bool muted) { this.voiceMuted = muted; }
+    bool IsVoiceMuted() { return this.voiceMuted; }
+
+    /// <summary>
+    /// 计算某通道当前声音的实际有效增益（考虑主音量、通道音量与静音状态）。
+    /// </summary>
+    double EffectiveGain(int channel, double localGain) {
+        if (this.masterMuted) {
+            return 0.0;
+        }
+
+        double chanVol = 1.0;
+        if (channel == AudioChannel.Bgm) {
+            if (this.bgmMuted) return 0.0;
+            chanVol = this.bgmVolume;
+        } else if (channel == AudioChannel.Sfx) {
+            if (this.sfxMuted) return 0.0;
+            chanVol = this.sfxVolume;
+        } else if (channel == AudioChannel.Voice) {
+            if (this.voiceMuted) return 0.0;
+            chanVol = this.voiceVolume;
+        }
+
+        return this.masterVolume * chanVol * localGain;
+    }
+
+    // --- BGM 播放与平滑淡入淡出 ---
+
+    /// <summary>
+    /// 立即播放背景音乐（循环）。
+    /// </summary>
+    void PlayBgm(AudioClip clip, double gain) {
+        this.StopBgm();
+        if (clip == null || !clip.IsValid()) {
+            return;
+        }
+        double eff = this.EffectiveGain(AudioChannel.Bgm, gain);
+        this.currentBgmVoice = clip.PlayLooping(eff);
+    }
+
+    /// <summary>
+    /// 停止当前 BGM。
+    /// </summary>
+    void StopBgm() {
+        if (this.currentBgmVoice != null) {
+            this.currentBgmVoice.Stop();
+            this.currentBgmVoice = null;
+        }
+        this.fadePhase = 0;
+    }
+
+    /// <summary>
+    /// 触发 BGM 平滑淡出。
+    /// </summary>
+    void FadeOutBgm(int durationMs) {
+        if (durationMs <= 0) {
+            this.SetBgmVolume(0.0);
+            return;
+        }
+        this.fadePhase = 1;
+        this.fadeOutDurationMs = durationMs;
+        this.fadeElapsedMs = 0;
+        this.fadeStartGain = this.bgmVolume;
+        this.fadeTargetGain = 0.0;
+    }
+
+    /// <summary>
+    /// 平滑淡出当前音乐并淡入新音乐。
+    /// </summary>
+    void CrossFadeBgm(AudioClip nextClip, int fadeOutMs, int fadeInMs, double targetVolume) {
+        this.pendingBgmClip = nextClip;
+        this.fadeInDurationMs = fadeInMs;
+        this.fadeTargetGain = targetVolume;
+        this.FadeOutBgm(fadeOutMs);
+    }
+
+    bool IsBgmFading() {
+        return this.fadePhase != 0;
+    }
+
+    // --- 音效播放与防爆音限频 ---
+
+    /// <summary>
+    /// 检查指定音效是否允许播放（若距上次播放超过 cooldownMs 则允许并刷新时间戳）。
+    /// </summary>
+    bool CanPlaySfx(string sfxKey, int cooldownMs) {
+        if (this.sfxMuted || this.masterMuted) {
+            return false;
+        }
+        if (this.sfxCooldowns.ContainsKey(sfxKey)) {
+            int remaining = this.sfxCooldowns[sfxKey];
+            if (remaining > 0) {
+                return false;
+            }
+        }
+        this.sfxCooldowns[sfxKey] = cooldownMs;
+        return true;
+    }
+
+    /// <summary>
+    /// 播放一次性音效，带防爆音限频过滤。
+    /// </summary>
+    AudioVoice PlaySfxThrottled(string sfxKey, AudioClip clip, int cooldownMs, double gain) {
+        if (!this.CanPlaySfx(sfxKey, cooldownMs)) {
+            return null;
+        }
+        if (clip == null || !clip.IsValid()) {
+            return null;
+        }
+        double eff = this.EffectiveGain(AudioChannel.Sfx, gain);
+        return clip.Play(eff, 0);
+    }
+
+    /// <summary>
+    /// 帧循环推进：负责更新淡入淡出插值与音效冷却倒计时。
+    /// </summary>
+    void Update(int deltaMs) {
+        if (deltaMs <= 0) return;
+
+        // 1. 推进 BGM 淡入淡出
+        if (this.fadePhase == 1) {
+            // 淡出阶段
+            this.fadeElapsedMs += deltaMs;
+            if (this.fadeElapsedMs >= this.fadeOutDurationMs) {
+                this.bgmVolume = this.fadeTargetGain;
+                this.ApplyBgmVoiceGain();
+
+                if (this.pendingBgmClip != null) {
+                    // 进入淡入阶段
+                    this.StopBgm();
+                    this.fadePhase = 2;
+                    this.fadeElapsedMs = 0;
+                    this.fadeStartGain = 0.0;
+                    this.bgmVolume = 0.0;
+                    this.currentBgmVoice = this.pendingBgmClip.PlayLooping(0.0);
+                    this.pendingBgmClip = null;
+                } else {
+                    this.fadePhase = 0;
+                }
+            } else {
+                double t = (double)this.fadeElapsedMs / (double)this.fadeOutDurationMs;
+                this.bgmVolume = this.fadeStartGain + (this.fadeTargetGain - this.fadeStartGain) * t;
+                this.ApplyBgmVoiceGain();
+            }
+        } else if (this.fadePhase == 2) {
+            // 淡入阶段
+            this.fadeElapsedMs += deltaMs;
+            if (this.fadeElapsedMs >= this.fadeInDurationMs) {
+                this.bgmVolume = this.fadeTargetGain;
+                this.ApplyBgmVoiceGain();
+                this.fadePhase = 0;
+            } else {
+                double t = (double)this.fadeElapsedMs / (double)this.fadeInDurationMs;
+                this.bgmVolume = this.fadeStartGain + (this.fadeTargetGain - this.fadeStartGain) * t;
+                this.ApplyBgmVoiceGain();
+            }
+        }
+
+        // 2. 推进音效冷却计时
+        List<string> keys = this.sfxCooldowns.Keys;
+        int count = keys.Count;
+        for (int i = 0; i < count; i++) {
+            string k = keys[i];
+            int rem = this.sfxCooldowns[k];
+            if (rem > 0) {
+                rem -= deltaMs;
+                if (rem < 0) rem = 0;
+                this.sfxCooldowns[k] = rem;
+            }
+        }
+    }
+
+    void ApplyBgmVoiceGain() {
+        if (this.currentBgmVoice != null && this.currentBgmVoice.IsPlaying()) {
+            double eff = this.EffectiveGain(AudioChannel.Bgm, 1.0);
+            this.currentBgmVoice.SetGain(eff);
+        }
+    }
+}

@@ -371,3 +371,21 @@ Post 调用核对编码，别信二手注释。
   注意 Agent 会话注入的点击可能到不了用户交互桌面的窗口（WM_CLOSE 能到而
   鼠标不到=会话隔离），此时用"探针页码"（构造后直接 ShowPage(n) 的静态槽）
   做无头布局截图，交互行为留给用户实机点。
+
+## 游戏基础设施定式（Tween 缓动 / 高级碰撞 / 音频总线 / Tilemap）
+
+- **动效与手感：Tween 缓动统一收拢进 `Game.Foundation.Tween`**：
+  - 严禁在 Update 里手写散乱的线性积分算百分比，UI 弹窗、受击果冻与击退位移统一使用 `Tween` / `Easing.Evaluate`。
+  - 弹性与弹跳动效使用 `EaseType.BackOut`（轻微回弹）或 `EaseType.BounceOut`（落地弹跳）。
+  - 批量临时动效放进 `TweenGroup`，每帧 `group.Update(deltaMs)`，完成态自动清理，不留悬挂对象。
+- **碰撞与物理：射线与流形计算收拢进 `Game.Arcade2D.Collision2D`**：
+  - 视线遮挡（LOS）、弹道轨迹统一使用 `RaycastAabb` 或 `RaycastCircle`，避免逐像素步进测试性能抖动。
+  - 实体碰撞推开使用 `RectManifold(a, b)`，提取 `normal` 和 `depth`，位移修复公式：`pos += normal * depth`。
+- **音频系统：多总线管理统一使用 `Game.Foundation.AudioBus`**：
+  - 严禁业务层直接硬编码播放音量，统一通过 `AudioBus` 按 `Master` / `Bgm` / `Sfx` / `Voice` 路由。
+  - 切场景音乐使用 `FadeBgm(nextClip, fadeOutMs, fadeInMs, targetGain)` 平滑过渡，防突兀卡顿。
+  - 连续触发音效使用 `PlaySfxThrottled(key, clip, cooldownMs, gain)` 设 50~150ms 冷却，防止同帧/快速多次重叠导致音频溢出爆音。
+- **关卡瓦片：碰撞体水平线段合并优化**：
+  - 加载瓦片地图（`TileLayer`）后，严禁为每个 solid tile 创建一个独立碰撞体（易产生接缝卡角且拖慢遍历）。
+  - 调用 `layer.ExtractColliders(solidTileId)` 走水平连续瓦片合并算法，合并为宽矩形数组，大幅削减碰撞体开销。
+

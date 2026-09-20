@@ -1,0 +1,371 @@
+using System;
+
+namespace Game.Arcade2D;
+
+/// <summary>
+/// 2D 射线检测结果。包含命中状态、碰撞距离、接触点坐标与法线向量。
+/// </summary>
+class RaycastHit2D {
+    bool hit;
+    double distance;
+    double pointX;
+    double pointY;
+    double normalX;
+    double normalY;
+
+    RaycastHit2D(bool hit, double distance, double px, double py, double nx, double ny) {
+        this.hit = hit;
+        this.distance = distance;
+        this.pointX = px;
+        this.pointY = py;
+        this.normalX = nx;
+        this.normalY = ny;
+    }
+
+    /// 创建未命中结果
+    static RaycastHit2D Miss() {
+        return new RaycastHit2D(false, 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+
+    /// 是否命中目标
+    bool Hit() { return this.hit; }
+    /// 从射线起点到命中点的距离
+    double Distance() { return this.distance; }
+    /// 命中点世界坐标 X
+    double PointX() { return this.pointX; }
+    /// 命中点世界坐标 Y
+    double PointY() { return this.pointY; }
+    /// 命中表面单位法线 X
+    double NormalX() { return this.normalX; }
+    /// 命中表面单位法线 Y
+    double NormalY() { return this.normalY; }
+}
+
+/// <summary>
+/// 2D 碰撞接触流形（Collision Manifold）。
+/// 包含两物体相交时的法线方向与重叠穿透深度，供物理位移分离（Depenetration）使用。
+/// </summary>
+class CollisionManifold {
+    bool collided;
+    double normalX;
+    double normalY;
+    double depth;
+
+    CollisionManifold(bool collided, double nx, double ny, double depth) {
+        this.collided = collided;
+        this.normalX = nx;
+        this.normalY = ny;
+        this.depth = depth;
+    }
+
+    /// 创建未碰撞流形
+    static CollisionManifold None() {
+        return new CollisionManifold(false, 0.0, 0.0, 0.0);
+    }
+
+    /// 是否发生碰撞接触
+    bool Collided() { return this.collided; }
+    /// 物体 A 推开物体 B 的分离法线 X（从 A 指向 B）
+    double NormalX() { return this.normalX; }
+    /// 物体 A 推开物体 B 的分离法线 Y（从 A 指向 B）
+    double NormalY() { return this.normalY; }
+    /// 沿法线方向的重叠穿透深度
+    double Depth() { return this.depth; }
+}
+
+/// <summary>
+/// 高级 2D 碰撞检测与空间几何计算扩展。
+/// </summary>
+class AdvancedCollision2D {
+    const double EPSILON = 0.0000001;
+
+    /// <summary>
+    /// 2D 射线与轴对齐矩形 (AABB) 快速相交检测（Slab 法）。
+    /// </summary>
+    static RaycastHit2D RaycastRect(
+        double ox, double oy,
+        double dx, double dy,
+        double maxDist,
+        Rect2 rect
+    ) {
+        if (rect == null || maxDist <= 0.0) {
+            return RaycastHit2D.Miss();
+        }
+
+        // 归一化方向
+        double lenSq = dx * dx + dy * dy;
+        if (lenSq < EPSILON) {
+            return RaycastHit2D.Miss();
+        }
+        double len = Math.Sqrt(lenSq);
+        double dirX = dx / len;
+        double dirY = dy / len;
+
+        double rx1 = rect.X();
+        double rx2 = rect.Right();
+        double ry1 = rect.Y();
+        double ry2 = rect.Bottom();
+
+        double tmin = 0.0;
+        double tmax = maxDist;
+        double normX = 0.0;
+        double normY = 0.0;
+
+        // X 轴 Slab 测试
+        if (Math.Abs(dirX) < EPSILON) {
+            if (ox < rx1 || ox > rx2) {
+                return RaycastHit2D.Miss();
+            }
+        } else {
+            double invX = 1.0 / dirX;
+            double t1 = (rx1 - ox) * invX;
+            double t2 = (rx2 - ox) * invX;
+            double nx = -1.0;
+            if (t1 > t2) {
+                double temp = t1; t1 = t2; t2 = temp;
+                nx = 1.0;
+            }
+            if (t1 > tmin) {
+                tmin = t1;
+                normX = nx;
+                normY = 0.0;
+            }
+            if (t2 < tmax) {
+                tmax = t2;
+            }
+            if (tmin > tmax) {
+                return RaycastHit2D.Miss();
+            }
+        }
+
+        // Y 轴 Slab 测试
+        if (Math.Abs(dirY) < EPSILON) {
+            if (oy < ry1 || oy > ry2) {
+                return RaycastHit2D.Miss();
+            }
+        } else {
+            double invY = 1.0 / dirY;
+            double t1 = (ry1 - oy) * invY;
+            double t2 = (ry2 - oy) * invY;
+            double ny = -1.0;
+            if (t1 > t2) {
+                double temp = t1; t1 = t2; t2 = temp;
+                ny = 1.0;
+            }
+            if (t1 > tmin) {
+                tmin = t1;
+                normX = 0.0;
+                normY = ny;
+            }
+            if (t2 < tmax) {
+                tmax = t2;
+            }
+            if (tmin > tmax) {
+                return RaycastHit2D.Miss();
+            }
+        }
+
+        if (tmin < 0.0 || tmin > maxDist) {
+            return RaycastHit2D.Miss();
+        }
+
+        double hitX = ox + dirX * tmin;
+        double hitY = oy + dirY * tmin;
+        return new RaycastHit2D(true, tmin, hitX, hitY, normX, normY);
+    }
+
+    /// <summary>
+    /// 2D 射线与圆的相交检测。
+    /// </summary>
+    static RaycastHit2D RaycastCircle(
+        double ox, double oy,
+        double dx, double dy,
+        double maxDist,
+        Circle2 circle
+    ) {
+        if (circle == null || maxDist <= 0.0) {
+            return RaycastHit2D.Miss();
+        }
+
+        double lenSq = dx * dx + dy * dy;
+        if (lenSq < EPSILON) {
+            return RaycastHit2D.Miss();
+        }
+        double len = Math.Sqrt(lenSq);
+        double dirX = dx / len;
+        double dirY = dy / len;
+
+        double cx = circle.X();
+        double cy = circle.Y();
+        double r = circle.Radius();
+
+        double mx = ox - cx;
+        double my = oy - cy;
+        double b = mx * dirX + my * dirY;
+        double c = mx * mx + my * my - r * r;
+
+        // 起点在圆外且射线背向圆
+        if (c > 0.0 && b > 0.0) {
+            return RaycastHit2D.Miss();
+        }
+
+        double discr = b * b - c;
+        if (discr < 0.0) {
+            return RaycastHit2D.Miss();
+        }
+
+        double t = -b - Math.Sqrt(discr);
+        if (t < 0.0) {
+            t = 0.0; // 起点就在圆内
+        }
+        if (t > maxDist) {
+            return RaycastHit2D.Miss();
+        }
+
+        double hx = ox + dirX * t;
+        double hy = oy + dirY * t;
+        double nx = hx - cx;
+        double ny = hy - cy;
+        double nlen = Math.Sqrt(nx * nx + ny * ny);
+        if (nlen > EPSILON) {
+            nx = nx / nlen;
+            ny = ny / nlen;
+        } else {
+            nx = -dirX;
+            ny = -dirY;
+        }
+
+        return new RaycastHit2D(true, t, hx, hy, nx, ny);
+    }
+
+    /// <summary>
+    /// 计算点 P 到线段 AB 的最近投影点。
+    /// </summary>
+    static Vector2 ClosestPointOnSegment(
+        double px, double py,
+        double ax, double ay,
+        double bx, double by
+    ) {
+        double abx = bx - ax;
+        double aby = by - ay;
+        double lenSq = abx * abx + aby * aby;
+        if (lenSq < EPSILON) {
+            return new Vector2(ax, ay);
+        }
+
+        double apx = px - ax;
+        double apy = py - ay;
+        double t = (apx * abx + apy * aby) / lenSq;
+        if (t < 0.0) { t = 0.0; }
+        if (t > 1.0) { t = 1.0; }
+
+        return new Vector2(ax + t * abx, ay + t * aby);
+    }
+
+    /// <summary>
+    /// 判断两条 2D 线段 A1A2 与 B1B2 是否相交，相交时通过 outHit 返回交点坐标。
+    /// </summary>
+    static bool SegmentIntersect(
+        double ax1, double ay1, double ax2, double ay2,
+        double bx1, double by1, double bx2, double by2,
+        Vector2 outHit
+    ) {
+        double dxA = ax2 - ax1;
+        double dyA = ay2 - ay1;
+        double dxB = bx2 - bx1;
+        double dyB = by2 - by1;
+
+        double denom = dxA * dyB - dyA * dxB;
+        if (Math.Abs(denom) < EPSILON) {
+            return false; // 平行或共线
+        }
+
+        double dxBA = ax1 - bx1;
+        double dyBA = ay1 - by1;
+
+        double s = (dxA * dyBA - dyA * dxBA) / denom;
+        double t = (dxB * dyBA - dyB * dxBA) / denom;
+
+        if (s >= 0.0 && s <= 1.0 && t >= 0.0 && t <= 1.0) {
+            if (outHit != null) {
+                outHit.Set(ax1 + t * dxA, ay1 + t * dyA);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// 便捷版本：若两线段相交返回交点 Vector2，否则返回 null。
+    /// </summary>
+    static Vector2 FindSegmentIntersection(
+        double ax1, double ay1, double ax2, double ay2,
+        double bx1, double by1, double bx2, double by2
+    ) {
+        Vector2 hit = new Vector2(0.0, 0.0);
+        if (SegmentIntersect(ax1, ay1, ax2, ay2, bx1, by1, bx2, by2, hit)) {
+            return hit;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// 圆形与线段（骨架线段/胶囊体端点）相交测试。
+    /// </summary>
+    static bool CircleVsSegment(
+        Circle2 circle,
+        double ax, double ay,
+        double bx, double by
+    ) {
+        if (circle == null) { return false; }
+        Vector2 closest = ClosestPointOnSegment(circle.X(), circle.Y(), ax, ay, bx, by);
+        double distSq = Collision2D.DistanceSquared(circle.X(), circle.Y(), closest.X(), closest.Y());
+        return distSq <= (circle.Radius() * circle.Radius());
+    }
+
+    /// <summary>
+    /// 计算两个 AABB 轴对齐矩形的碰撞流形。
+    /// 若相交，返回最小分离法线（Normal 指向物体 B）与穿透深度（Depth），
+    /// 用于将重叠物体推开纠正物理穿模。
+    /// </summary>
+    static CollisionManifold RectManifold(Rect2 a, Rect2 b) {
+        if (a == null || b == null) {
+            return CollisionManifold.None();
+        }
+
+        // 计算中心点与半宽
+        double halfAw = a.Width() * 0.5;
+        double halfAh = a.Height() * 0.5;
+        double centerAx = a.X() + halfAw;
+        double centerAy = a.Y() + halfAh;
+
+        double halfBw = b.Width() * 0.5;
+        double halfBh = b.Height() * 0.5;
+        double centerBx = b.X() + halfBw;
+        double centerBy = b.Y() + halfBh;
+
+        double dx = centerBx - centerAx;
+        double dy = centerBy - centerAy;
+
+        double overlapX = (halfAw + halfBw) - Math.Abs(dx);
+        if (overlapX <= 0.0) {
+            return CollisionManifold.None();
+        }
+
+        double overlapY = (halfAh + halfBh) - Math.Abs(dy);
+        if (overlapY <= 0.0) {
+            return CollisionManifold.None();
+        }
+
+        // 沿重叠量最小的方向（MTD）进行分离
+        if (overlapX < overlapY) {
+            double nx = 1.0;
+            if (dx < 0.0) { nx = -1.0; }
+            return new CollisionManifold(true, nx, 0.0, overlapX);
+        } else {
+            double ny = 1.0;
+            if (dy < 0.0) { ny = -1.0; }
+            return new CollisionManifold(true, 0.0, ny, overlapY);
+        }
+    }
+}
