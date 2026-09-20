@@ -1,0 +1,101 @@
+// Copyright (c) 2026 Zan Lang. All rights reserved.
+
+using System;
+using System.Diagnostics;
+using System.Threading;
+
+namespace System.Net.Mqtt;
+
+/// <summary>基于 SharedTable 共享内存环形缓冲区的跨进程 MQTT 消息总线。
+/// 在 Worker 多进程模型下无需部署外部中间件即可实现零拷贝/极低延迟的跨进程主题广播。</summary>
+class MqttSharedBus {
+    SharedTable busTable;
+    string name;
+    int ringCapacity;
+    long lastReadSeq;
+    bool running;
+    MqttBroker broker;
+    int pid;
+
+    public MqttSharedBus(MqttBroker broker, string name, int ringCapacity) {
+        this.broker = broker;
+        this.name = name;
+        this.ringCapacity = ringCapacity;
+        this.lastReadSeq = 0;
+        this.running = false;
+        this.pid = ProcessHost.Pid();
+        this.InitTable();
+    }
+
+    void InitTable() {
+        SharedTable table = SharedTable.Open(this.name);
+        if (table != null && table.IsOpen()) {
+            this.busTable = table;
+        } else {
+            table = new SharedTable(this.name, this.ringCapacity + 16);
+            table.KeySize(32);
+            table.ColumnString("topic", 128);
+            table.ColumnString("payload", 2048);
+            table.ColumnInt("payloadLen");
+            table.ColumnInt("seq");
+            table.ColumnInt("srcPid");
+            if (table.Create()) {
+                this.busTable = table;
+            } else {
+                this.busTable = SharedTable.Open(this.name);
+            }
+        }
+    }
+
+    public bool IsAvailable() {
+        return this.busTable != null && this.busTable.IsOpen();
+    }
+
+    /// <summary>向跨进程总线广播消息，由各 Worker 进程异步抓取并下发给各自连接的本地订阅者。</summary>
+    public void Broadcast(string topic, string payload, int payloadLen) {
+        if (!this.IsAvailable()) { return; }
+        long seq = this.busTable.Increment("bus_meta", "seq", 1);
+        int slot = (int)(seq % (long)this.ringCapacity);
+        string key = "slot_" + Convert.ToString(slot);
+
+        this.busTable.SetString(key, "topic", topic);
+        this.busTable.SetString(key, "payload", payload);
+        this.busTable.SetInt(key, "payloadLen", (long)payloadLen);
+        this.busTable.SetInt(key, "srcPid", (long)this.pid);
+        this.busTable.SetInt(key, "seq", seq);
+    }
+
+    /// <summary>启动跨进程总线轮询协程。</summary>
+    public async void StartPolling() {
+        if (this.running || !this.IsAvailable()) { return; }
+        this.running = true;
+        this.lastReadSeq = this.busTable.GetInt("bus_meta", "seq");
+
+        while (this.running) {
+            long head = this.busTable.GetInt("bus_meta", "seq");
+            if (head > this.lastReadSeq) {
+                long start = this.lastReadSeq + 1;
+                if (head - start >= (long)this.ringCapacity) {
+                    start = head - (long)this.ringCapacity + 1;
+                }
+                while (start <= head) {
+                    int slot = (int)(start % (long)this.ringCapacity);
+                    string key = "slot_" + Convert.ToString(slot);
+                    long slotSeq = this.busTable.GetInt(key, "seq");
+                    if (slotSeq == start) {
+                        int srcPid = (int)this.busTable.GetInt(key, "srcPid");
+                        if (srcPid != this.pid) {
+                            string topic = this.busTable.GetString(key, "topic");
+                            string payload = this.busTable.GetString(key, "payload");
+                            int payloadLen = (int)this.busTable.GetInt(key, "payloadLen");
+                            await this.broker.PublishLocal(topic, payload, payloadLen);
+                        }
+                    }
+                    start = start + 1;
+                }
+                this.lastReadSeq = head;
+            }
+            await Task.Delay(10);
+        }
+    }
+}

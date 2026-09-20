@@ -1,0 +1,103 @@
+// Copyright (c) 2026 Zan Lang. All rights reserved.
+// Conformance test: MQTT Last Will and Testament (LWT), Retained Messages & KeepAlive Timeout
+
+using System;
+using System.Net;
+using System.Net.Mqtt;
+using System.Net.Sockets;
+using System.Threading;
+
+class Program {
+    static async int Run() {
+        Socket.Initialize();
+        int port = 28833;
+        Worker broker = new Worker("mqtt", "127.0.0.1", port);
+        WorkerMqtt.Install();
+        nint listenSock = broker.BindSocket(false);
+        if (listenSock < 0) {
+            Console.WriteLine("bind failed");
+            return 1;
+        }
+        List<nint> socks = new List<nint>();
+        socks.Add(listenSock);
+        Task.Spawn(Worker.RunAllLoopsOnSockets(socks));
+
+        // 等待 broker 启动监听并连接
+        MqttClient sub = null;
+        for (int i = 0; i < 50; i = i + 1) {
+            sub = await MqttClient.ConnectAsync("127.0.0.1", port, "sub-client");
+            if (sub.IsConnected()) { break; }
+            Thread.Sleep(20);
+        }
+
+        if (!sub.IsConnected()) {
+            Console.WriteLine("sub connect failed");
+            return 2;
+        }
+
+        // ---- Part 1: Retained Message Test ----
+        // 客户端 1 发布一条保留消息到 "device/status"
+        MqttClient p1 = await MqttClient.ConnectAsync("127.0.0.1", port, "p1");
+        if (!p1.IsConnected()) {
+            Console.WriteLine("p1 connect failed");
+            return 3;
+        }
+        await p1.PublishAsync("device/status", "ONLINE_RETAINED", MqttQos.AtMostOnce, true);
+        await p1.DisconnectAsync();
+
+        // sub 订阅 "device/status"，应立即收到该保留消息
+        await sub.SubscribeAsync("device/status", MqttQos.AtMostOnce);
+        string retainedMsg = await sub.ReceiveAsync();
+        if (retainedMsg != "ONLINE_RETAINED") {
+            Console.WriteLine("Retained message mismatch: got " + retainedMsg);
+            return 4;
+        }
+
+        // ---- Part 2: LWT (Last Will and Testament) Abort Test ----
+        // sub 订阅遗嘱主题 "device/lwt"
+        await sub.SubscribeAsync("device/lwt", MqttQos.AtMostOnce);
+
+        // 客户端 3 带遗嘱连接
+        MqttClient p3 = await MqttClient.ConnectAsync("127.0.0.1", port, "p3", "device/lwt", "NODE_CRASHED", MqttQos.AtMostOnce, false);
+        if (!p3.IsConnected()) {
+            Console.WriteLine("p3 connect failed");
+            return 5;
+        }
+
+        // p3 异常中断连接（直接关闭底层 socket，不发 DISCONNECT）
+        p3.Abort();
+
+        // sub 应该收到由 Broker 替 p3 发送的遗嘱消息
+        string willMsg = await sub.ReceiveAsync();
+        if (willMsg != "NODE_CRASHED") {
+            Console.WriteLine("Will message mismatch: got " + willMsg);
+            return 6;
+        }
+
+        // ---- Part 3: KeepAlive 超时自动断网触发 LWT ----
+        // keepAlive 设为 1 秒，并配置遗嘱
+        MqttClient p4 = await MqttClient.ConnectAsync("127.0.0.1", port, "p4", 1, "device/lwt", "KEEPALIVE_DEAD", MqttQos.AtMostOnce, false);
+        if (!p4.IsConnected()) {
+            Console.WriteLine("p4 connect failed");
+            return 7;
+        }
+
+        // p4 保持静默，不发 PINGREQ；超过 1.5 * 1s = 1.5s 后，Broker 的 KeepAlive 巡检器应踢出该假死连接并代发遗嘱
+        string timeoutMsg = await sub.ReceiveAsync();
+        if (timeoutMsg != "KEEPALIVE_DEAD") {
+            Console.WriteLine("KeepAlive timeout LWT message mismatch: got " + timeoutMsg);
+            return 8;
+        }
+
+        await sub.DisconnectAsync();
+        Console.WriteLine("MQTT LWT, Retained and KeepAlive tests passed!");
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+        if (r != 0) {
+            Environment.Exit(r);
+        }
+    }
+}

@@ -1,0 +1,90 @@
+// Copyright (c) 2026 Zan Lang. All rights reserved.
+// Conformance test: MQTT QoS 2 Exactly-Once & Cross-Worker SharedBus
+
+using System;
+using System.Net;
+using System.Net.Mqtt;
+using System.Net.Sockets;
+using System.Threading;
+
+namespace Tests.Conformance;
+
+class MqttQos2BusTest {
+    static async Task<int> Run() {
+        int port = 28841;
+
+        Socket.Initialize();
+        Worker broker = new Worker("mqtt", "127.0.0.1", port);
+        WorkerMqtt.Install();
+
+        nint listenSock = broker.BindSocket(false);
+        if (listenSock < 0) {
+            Console.WriteLine("bind failed");
+            return 1;
+        }
+        List<nint> socks = new List<nint>();
+        socks.Add(listenSock);
+        Task.Spawn(Worker.RunAllLoopsOnSockets(socks));
+
+        // 等待 broker 启动监听并连接 sub1
+        MqttClient sub1 = null;
+        for (int i = 0; i < 50; i = i + 1) {
+            sub1 = await MqttClient.ConnectAsync("127.0.0.1", port, "sub1");
+            if (sub1.IsConnected()) { break; }
+            Thread.Sleep(20);
+        }
+        if (sub1 == null || !sub1.IsConnected()) {
+            Console.WriteLine("sub1 connect failed");
+            return 1;
+        }
+
+        // ---- Part 1: MQTT QoS 2 严格四步往返握手测试 ----
+        await sub1.SubscribeAsync("sensors/temp", MqttQos.AtMostOnce);
+
+        MqttClient pub1 = await MqttClient.ConnectAsync("127.0.0.1", port, "pub1");
+        if (pub1 == null || !pub1.IsConnected()) {
+            Console.WriteLine("pub1 connect failed");
+            return 1;
+        }
+
+        // 以 ExactlyOnce (QoS 2) 发送，内部将完整执行 PUBLISH -> PUBREC -> PUBREL -> PUBCOMP 握手
+        int sent = await pub1.PublishAsync("sensors/temp", "24.5C", MqttQos.ExactlyOnce);
+        if (sent <= 0) {
+            Console.WriteLine("QoS 2 publish failed: sent=" + Convert.ToString(sent));
+            return 1;
+        }
+
+        string qos2Msg = await sub1.ReceiveAsync();
+        if (qos2Msg != "24.5C") {
+            Console.WriteLine("QoS 2 message mismatch: got " + qos2Msg);
+            return 2;
+        }
+        await pub1.DisconnectAsync();
+
+        // ---- Part 2: MqttSharedBus 跨进程共享内存总线广播测试 ----
+        MqttBroker globalBroker = MqttBroker.Global();
+        MqttSharedBus bus = new MqttSharedBus(globalBroker, "zan_test_bus", 64);
+        if (!bus.IsAvailable()) {
+            Console.WriteLine("MqttSharedBus initialization failed");
+            return 3;
+        }
+
+        // 验证向跨进程总线广播
+        bus.Broadcast("cluster/event", "CROSS_BUS_MSG", 13);
+
+        await sub1.DisconnectAsync();
+        broker.Stop();
+        Socket.Close(listenSock);
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+
+        Console.WriteLine("MQTT QoS 2 and SharedBus tests passed!");
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+        if (r != 0) {
+            Environment.Exit(r);
+        }
+    }
+}

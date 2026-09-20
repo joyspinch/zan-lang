@@ -223,6 +223,57 @@ class HttpFramer {
         return 0;
     }
 
+    /// <summary>流式将请求体分块直接落盘，避免超大正文（如 GB 级上传）引发 OOM。
+    /// 内存仅占用当前分块缓冲区（<=64KB），落盘完成后保留后续流水线请求字节。</summary>
+    async int SaveBodyToFile(HttpRequest req, string filePath, int maxBytes) {
+        int he = req.bodyStart;
+        int total = req.contentLength;
+        if (total <= 0) { this.wireBytes = he; return 0; }
+        if (total > maxBytes) { return 413; }
+
+        FileStream fs = FileStream.OpenWrite(filePath);
+        int written = 0;
+
+        // 1. 若 pend 中已有已接收的正文前缀，先写盘
+        int availInPend = this.pend.Length() - he;
+        if (availInPend > 0) {
+            int toWrite = availInPend;
+            if (toWrite > total) { toWrite = total; }
+            string prefix = this.pend.Str(he, toWrite);
+            fs.Write(prefix);
+            written = written + toWrite;
+        }
+
+        // 丢弃已经写盘的前缀和头部，使 pend 内存即刻回落
+        this.pend.Discard(he + written);
+        this.scanned = 0;
+
+        // 2. 循环分块拉取剩余数据，直接写盘，每块写完即时 Discard，内存恒定在 64KB 以内
+        while (written < total) {
+            int n = await this.Fill();
+            if (n == 0) {
+                fs.Close();
+                this.closed = true;
+                return -1; // 客户端异常中断
+            }
+            int available = this.pend.Length();
+            int toWrite = available;
+            if (written + toWrite > total) {
+                toWrite = total - written;
+            }
+            string chunk = this.pend.Str(0, toWrite);
+            fs.Write(chunk);
+            written = written + toWrite;
+            this.pend.Discard(toWrite);
+            this.scanned = 0;
+        }
+
+        fs.Flush();
+        fs.Close();
+        this.wireBytes = 0;
+        return 0;
+    }
+
     /// <summary>本请求在线路上占用的字节数（头部 + 正文，分块编码则
     /// 是整个分块序列）。<see cref="Consume"/> 用它精确丢弃，
     /// 缓冲区里剩下的字节属于下一条流水线请求。</summary>

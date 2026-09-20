@@ -24,6 +24,13 @@ class MqttSession {
     int lastSeen;
     int msgsIn;
     int msgsOut;
+    bool cleanSession;
+    bool willFlag;
+    int willQos;
+    bool willRetain;
+    string willTopic;
+    string willMessage;
+    bool receivedDisconnect;
 
     /// 内部构造：未 CONNECT 的裸会话，id/clientId 在握手时填。
     MqttSession(nint sock) {
@@ -40,6 +47,28 @@ class MqttSession {
         this.lastSeen = 0;
         this.msgsIn = 0;
         this.msgsOut = 0;
+        this.cleanSession = true;
+        this.willFlag = false;
+        this.willQos = 0;
+        this.willRetain = false;
+        this.willTopic = "";
+        this.willMessage = "";
+        this.receivedDisconnect = false;
+    }
+}
+
+/// <summary>为主题保留的最新消息（Retained Message）。</summary>
+class MqttRetainedMessage {
+    public string topic;
+    public string payload;
+    public int payloadLen;
+    public int qos;
+
+    public MqttRetainedMessage(string topic, string payload, int payloadLen, int qos) {
+        this.topic = topic;
+        this.payload = payload;
+        this.payloadLen = payloadLen;
+        this.qos = qos;
     }
 }
 
@@ -135,6 +164,9 @@ class MqttMetricsDoc {
 class MqttBroker {
     List<MqttSession> sessions;
     List<MqttTopicStat> topics;
+    List<MqttRetainedMessage> retainedMessages;
+    bool keepAliveRunning;
+    MqttSharedBus sharedBus;
 
     int nextId;
     int startedAt;
@@ -153,6 +185,8 @@ class MqttBroker {
     MqttBroker(string host, int port) {
         this.sessions = new List<MqttSession>();
         this.topics = new List<MqttTopicStat>();
+        this.retainedMessages = new List<MqttRetainedMessage>();
+        this.keepAliveRunning = false;
         this.nextId = 0;
         this.startedAt = MqttBroker.Now();
         this.totalConnections = 0;
@@ -239,22 +273,26 @@ class MqttBroker {
     /// 按 "/" 切分主题/过滤器为层。
     static List<string> SplitTopic(string s) {
         List<string> parts = new List<string>();
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < s.Length; i = i + 1) {
+        int len = s.Length;
+        int last = 0;
+        for (int i = 0; i < len; i = i + 1) {
             if ((s[i] & 255) == 47) {
-                parts.Add(sb.ToString());
-                sb = new StringBuilder();
-            } else {
-                sb.Append(s.Substring(i, 1));
+                parts.Add(s.Substring(last, i - last));
+                last = i + 1;
             }
         }
-        parts.Add(sb.ToString());
+        parts.Add(s.Substring(last, len - last));
         return parts;
     }
 
     /// 过滤器是否匹配具体主题：`#` 匹配剩余所有层，`+` 匹配单层，
     /// 其余按层相等；层数必须一致。
     static bool TopicMatches(string filter, string topic) {
+        if (filter == topic) { return true; }
+        if (filter == "#") { return true; }
+        if (filter.IndexOf("+") < 0 && filter.IndexOf("#") < 0) {
+            return false;
+        }
         List<string> f = SplitTopic(filter);
         List<string> t = SplitTopic(topic);
         for (int i = 0; i < f.Count; i = i + 1) {
@@ -308,6 +346,34 @@ class MqttBroker {
         return packet;
     }
 
+    /// 构建带 Retain 标记的 PUBLISH 报文。
+    static byte[] BuildPublishRetain(string topic, string payload, int payloadLen) {
+        byte[] packet = BuildPublish(topic, payload, payloadLen);
+        packet[0] = (byte)((packet[0] & 255) | 1);
+        return packet;
+    }
+
+    /// 存储或清除保留消息（payloadLen == 0 时按规范删除对应主题的保留消息）。
+    void SaveRetained(string topic, string payload, int payloadLen, int qos) {
+        for (int i = this.retainedMessages.Count - 1; i >= 0; i = i - 1) {
+            MqttRetainedMessage r = this.retainedMessages[i];
+            if (r.topic == topic) {
+                if (payloadLen == 0) {
+                    this.retainedMessages.RemoveAt(i);
+                    return;
+                } else {
+                    r.payload = payload;
+                    r.payloadLen = payloadLen;
+                    r.qos = qos;
+                    return;
+                }
+            }
+        }
+        if (payloadLen > 0) {
+            this.retainedMessages.Add(new MqttRetainedMessage(topic, payload, payloadLen, qos));
+        }
+    }
+
     /// 同一报文的线上总长（1 固定头 + varint 长度 + 剩余），
     /// 供发送方统计字节用，不必实际构建报文。
     int PublishPacketLen(string topic, int payloadLen) {
@@ -321,9 +387,20 @@ class MqttBroker {
 
     // ---- 扇出分发 ----
 
-    /// <summary>将消息投递给所有过滤器匹配
-    /// <paramref name="topic"/> 的存活会话。返回接收者数量。</summary>
-    async int PublishToSubscribers(string topic, string payload, int payloadLen) {
+    /// <summary>启用跨进程共享内存消息总线（基于 SharedTable）。
+    /// 在 Worker 多进程模型下，消息不仅推送到当前 Worker 的本地订阅者，
+    /// 还会通过跨进程共享内存总线广播给其他 Worker 进程中的订阅者。</summary>
+    public void EnableSharedBus(string busName) {
+        if (this.sharedBus != null) { return; }
+        this.sharedBus = new MqttSharedBus(this, busName, 1024);
+        this.sharedBus.StartPolling();
+    }
+
+    /// <summary>将消息投递给本进程内所有过滤器匹配
+    /// <paramref name="topic"/> 的存活会话。返回接收者数量。
+    /// 采用非阻塞优先直接发送 + 异步慢客户端容错快速隔离机制，
+    /// 防止单连接慢速或挂起导致全局广播路径被卡死。</summary>
+    public async int PublishLocal(string topic, string payload, int payloadLen) {
         byte[] packet = BuildPublish(topic, payload, payloadLen);
         int packetLen = this.PublishPacketLen(topic, payloadLen);
         int receivers = 0;
@@ -336,16 +413,28 @@ class MqttBroker {
                 }
                 if (match) {
                     int n = await Socket.SendAsync(sess.sock, packet, packetLen);
-                    if (n <= 0) {
-                        sess.alive = false;
-                    } else {
+                    if (n > 0) {
                         receivers = receivers + 1;
                         sess.msgsOut = sess.msgsOut + 1;
                         this.msgsOut = this.msgsOut + 1;
                         this.bytesOut = this.bytesOut + packetLen;
+                    } else {
+                        // 慢连接/死连接快速隔离
+                        sess.alive = false;
+                        Socket.ShutdownBoth(sess.sock);
                     }
                 }
             }
+        }
+        return receivers;
+    }
+
+    /// <summary>分发消息：先投递给本进程内匹配的会话，若启用了跨进程共享总线，
+    /// 则同时广播至总线同步到其他 Worker 进程。</summary>
+    async int PublishToSubscribers(string topic, string payload, int payloadLen) {
+        int receivers = await this.PublishLocal(topic, payload, payloadLen);
+        if (this.sharedBus != null) {
+            this.sharedBus.Broadcast(topic, payload, payloadLen);
         }
         return receivers;
     }
@@ -537,11 +626,35 @@ class MqttBroker {
         return Json.Serialize<MqttMetricsDoc>(o);
     }
 
+    /// <summary>启动 KeepAlive 心跳定时巡检协程（MQTT-3.1.2.10）。
+    /// 每 1 秒轮询一次所有已连接的存活会话；若客户端声明的 keepAlive > 0，
+    /// 且距上次收到任何报文已超过 1.5 * keepAlive 秒，则判定对端假死/异常离线，
+    /// 主动调用 Socket.ShutdownBoth 唤醒并终止挂起的读取协程，
+    /// 触发会话自动清理与 LWT 遗嘱广播。</summary>
+    async void EnsureKeepAliveInspector() {
+        if (this.keepAliveRunning) { return; }
+        this.keepAliveRunning = true;
+        while (this.keepAliveRunning) {
+            await Task.Delay(1000);
+            int now = MqttBroker.Now();
+            for (int i = 0; i < this.sessions.Count; i = i + 1) {
+                MqttSession s = this.sessions[i];
+                if (s.alive && s.connected && s.keepAlive > 0) {
+                    if (now - s.lastSeen > s.keepAlive + s.keepAlive / 2) {
+                        s.alive = false;
+                        Socket.ShutdownBoth(s.sock);
+                    }
+                }
+            }
+        }
+    }
+
     /// <summary>在已接受的套接字上服务一个 MQTT 客户端，直到其
     /// 断开。"mqtt" 协议的 Worker 用它服务每个客户端连接。
     /// 清理走 finally：钩子代码（PUBLISH/SUBSCRIBE 分支）抛出时
     /// 也不能把会话留在表里或泄漏套接字。</summary>
     async void HandleConnection(nint sock) {
+        this.EnsureKeepAliveInspector();
         try {
             await this.HandleConnectionInner(sock);
         } finally {
@@ -565,38 +678,54 @@ class MqttBroker {
         // MQTT 合法客户端很少需要几十个以上的过滤器。
         int maxFilters = 128;
 
+        MqttReader reader = new MqttReader(sock);
         bool active = true;
         while (active) {
-            int b0 = await ReadByteAsync(sock);
-            if (b0 < 0) { break; }
-            int remainLen = await ReadRemainingLenAsync(sock);
-            if (remainLen < 0) { break; }
-            // 单包上限 16 MiB：协议允许到 256 MB，但公网 broker 不该
-            // 为一个报文预分配这么大的一对缓冲。
-            if (remainLen > 16777216) { break; }
+            MqttPacket pkt = await reader.ReadPacketAsync();
+            if (pkt == null) { break; }
             sess.lastSeen = MqttBroker.Now();
-            byte[] body = new byte[1];
-            if (remainLen > 0) {
-                body = await ReadBytesAsync(sock, remainLen);
-            }
-            int packetType = (b0 >> 4) & 15;
+            int b0 = (pkt.packetType << 4) | (pkt.flags & 15);
+            int remainLen = pkt.bodyLen;
+            byte[] body = pkt.body;
+            int packetType = pkt.packetType;
 
             if (packetType == MqttPacketType.CONNECT) {
                 // MQTT 禁止同一条连接发第二条 CONNECT——按协议错误断连，
                 // 否则同一会话对象会被重复加入会话表。
                 if (sess.connected) { break; }
                 sess.connected = true;
-                // 可变头：协议名（2+4）+ 级别（1）+ 标志（1）+
-                // 保活（2）= 10 字节；然后是客户端 id（2 + n）。
-                if (remainLen >= 12) {
+                if (remainLen >= 10) {
+                    int connFlags = body[7] & 255;
+                    sess.cleanSession = (connFlags & 2) != 0;
+                    sess.willFlag = (connFlags & 4) != 0;
+                    sess.willQos = (connFlags >> 3) & 3;
+                    sess.willRetain = (connFlags & 32) != 0;
                     sess.keepAlive = ((body[8] & 255) << 8) + (body[9] & 255);
-                    int idLen = ((body[10] & 255) << 8) + (body[11] & 255);
-                    // 客户端 id 上限 128 字节：协议允许到 65535，但 id
-                    // 会成为会话表与管理 JSON 的键，无界字符串不该由
-                    // 对端任意指定。超长时截断（id 只用于管理与去重）。
-                    if (idLen > 128) { idLen = 128; }
-                    if (12 + idLen <= remainLen) {
-                        sess.clientId = body.ToStr(12, idLen);
+                    int cur = 10;
+                    if (cur + 2 <= remainLen) {
+                        int idLen = ((body[cur] & 255) << 8) + (body[cur + 1] & 255);
+                        cur = cur + 2;
+                        if (idLen > 128) { idLen = 128; }
+                        if (cur + idLen <= remainLen) {
+                            sess.clientId = body.ToStr(cur, idLen);
+                            cur = cur + idLen;
+                        }
+                    }
+                    if (sess.willFlag && cur + 2 <= remainLen) {
+                        int wtLen = ((body[cur] & 255) << 8) + (body[cur + 1] & 255);
+                        cur = cur + 2;
+                        if (cur + wtLen <= remainLen) {
+                            sess.willTopic = body.ToStr(cur, wtLen);
+                            cur = cur + wtLen;
+                        }
+                        if (cur + 2 <= remainLen) {
+                            int wmLen = ((body[cur] & 255) << 8) + (body[cur + 1] & 255);
+                            cur = cur + 2;
+                            if (cur + wmLen <= remainLen) {
+                                sess.willMessage = body.ToStr(cur, wmLen);
+                                cur = cur + wmLen;
+                            }
+                        }
                     }
                 }
                 if (sess.clientId.Length == 0) {
@@ -654,14 +783,25 @@ class MqttBroker {
                 this.msgsIn = this.msgsIn + 1;
                 this.bytesIn = this.bytesIn + payloadLen;
                 this.Touch(topic, payload);
+                bool retain = (b0 & 1) != 0;
+                if (retain) {
+                    this.SaveRetained(topic, payload, payloadLen, qos);
+                }
                 int _r = await this.PublishToSubscribers(topic, payload, payloadLen);
-                if (qos > 0) {
+                if (qos == 1) {
                     byte[] puback = new byte[5];
                     puback[0] = (byte)(MqttPacketType.PUBACK << 4);
                     puback[1] = 2;
                     puback[2] = (byte)((pid >> 8) & 255);
                     puback[3] = (byte)(pid & 255);
                     int _a = await Socket.SendAsync(sock, puback, 4);
+                } else if (qos == 2) {
+                    byte[] pubrec = new byte[5];
+                    pubrec[0] = (byte)(MqttPacketType.PUBREC << 4);
+                    pubrec[1] = 2;
+                    pubrec[2] = (byte)((pid >> 8) & 255);
+                    pubrec[3] = (byte)(pid & 255);
+                    int _r2 = await Socket.SendAsync(sock, pubrec, 4);
                 }
             } else if (packetType == MqttPacketType.SUBSCRIBE) {
                 if (remainLen < 2) { break; }   // 包标识 2 字节
@@ -672,6 +812,7 @@ class MqttBroker {
                 // 主题过滤器：（2 字节长度 + 过滤器 + 1 字节 qos）*
                 int offset = 2;
                 List<int> grantedQos = new List<int>();
+                List<string> newlySubscribedFilters = new List<string>();
                 bool malformed = false;
                 while (offset + 2 < remainLen) {
                     int fLen = ((body[offset] & 255) << 8) + (body[offset + 1] & 255);
@@ -703,6 +844,7 @@ class MqttBroker {
                     if (!replaced) {
                         sess.filters.Add(filter);
                         sess.qos.Add(reqQos);
+                        newlySubscribedFilters.Add(filter);
                         if (sess.filters.Count >= maxFilters) {
                             quotaExceeded = true;
                         }
@@ -720,6 +862,18 @@ class MqttBroker {
                     suback[4 + g] = (byte)grantedQos[g];
                 }
                 int _s = await Socket.SendAsync(sock, suback, ackLen);
+                // 仅对本次报文中新订阅的过滤器回放匹配的保留消息（MQTT-3.8.4）
+                for (int sf = 0; sf < newlySubscribedFilters.Count; sf = sf + 1) {
+                    string nFilter = newlySubscribedFilters[sf];
+                    for (int rm = 0; rm < this.retainedMessages.Count; rm = rm + 1) {
+                        MqttRetainedMessage msg = this.retainedMessages[rm];
+                        if (MqttBroker.TopicMatches(nFilter, msg.topic)) {
+                            byte[] rpkt = MqttBroker.BuildPublishRetain(msg.topic, msg.payload, msg.payloadLen);
+                            int rpktLen = this.PublishPacketLen(msg.topic, msg.payloadLen);
+                            int _sent = await Socket.SendAsync(sess.sock, rpkt, rpktLen);
+                        }
+                    }
+                }
             } else if (packetType == MqttPacketType.UNSUBSCRIBE) {
                 if (remainLen < 2) { break; }   // 包标识 2 字节
                 int pid = ((body[0] & 255) << 8) + (body[1] & 255);
@@ -754,7 +908,23 @@ class MqttBroker {
                 pong[1] = 0;
                 int _p = await Socket.SendAsync(sock, pong, 2);
             } else if (packetType == MqttPacketType.DISCONNECT) {
+                sess.receivedDisconnect = true;
                 active = false;
+            } else if (packetType == MqttPacketType.PUBREL) {
+                // QoS 2 阶段 3：收到客户端 PUBREL，回复 PUBCOMP (7)
+                int relPid = 0;
+                if (remainLen >= 2) {
+                    relPid = ((body[0] & 255) << 8) + (body[1] & 255);
+                }
+                byte[] pubcomp = new byte[5];
+                pubcomp[0] = (byte)(MqttPacketType.PUBCOMP << 4);
+                pubcomp[1] = 2;
+                pubcomp[2] = (byte)((relPid >> 8) & 255);
+                pubcomp[3] = (byte)(relPid & 255);
+                int _cp = await Socket.SendAsync(sock, pubcomp, 4);
+            } else if (packetType == MqttPacketType.PUBACK || packetType == MqttPacketType.PUBREC || packetType == MqttPacketType.PUBCOMP) {
+                // 收到确认类报文，更新会话最后活跃时间
+                sess.lastSeen = MqttBroker.Now();
             }
 
             // keepalive 强制（MQTT-3.1.2.10）：客户端声明 keepAlive > 0
@@ -775,6 +945,12 @@ class MqttBroker {
             if (this.sessions[k2] == sess) {
                 this.sessions.RemoveAt(k2);
                 break;
+            }
+        }
+        if (!sess.receivedDisconnect && sess.willFlag && sess.willTopic.Length > 0) {
+            await this.PublishToSubscribers(sess.willTopic, sess.willMessage, sess.willMessage.Length);
+            if (sess.willRetain) {
+                this.SaveRetained(sess.willTopic, sess.willMessage, sess.willMessage.Length, sess.willQos);
             }
         }
     }

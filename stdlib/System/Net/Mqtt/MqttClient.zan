@@ -13,6 +13,12 @@ class MqttPacketType {
     static const int PUBLISH = 3;
     /// <summary>QoS 1 发布确认。</summary>
     static const int PUBACK = 4;
+    /// <summary>QoS 2 发布已收到（第二阶段）。</summary>
+    static const int PUBREC = 5;
+    /// <summary>QoS 2 发布释放（第三阶段）。</summary>
+    static const int PUBREL = 6;
+    /// <summary>QoS 2 发布完成（第四阶段）。</summary>
+    static const int PUBCOMP = 7;
     /// <summary>订阅请求。</summary>
     static const int SUBSCRIBE = 8;
     /// <summary>订阅确认。</summary>
@@ -58,12 +64,18 @@ class MqttQos {
 /// </summary>
 class MqttClient {
     TcpClient conn;
+    MqttReader reader;
     string clientId;
     string host;
     int port;
     bool connected;
     int nextPacketId;
     int keepAlive;
+    string willTopic;
+    string willMessage;
+    int willQos;
+    bool willRetain;
+    bool hasWill;
 
     [DllImport("crt")]
     static extern long strlen(string str);
@@ -76,6 +88,20 @@ class MqttClient {
         this.connected = false;
         this.nextPacketId = 1;
         this.keepAlive = 60;
+        this.willTopic = "";
+        this.willMessage = "";
+        this.willQos = 0;
+        this.willRetain = false;
+        this.hasWill = false;
+    }
+
+    /// <summary>设置客户端遗嘱（LWT）属性，在连接建立前配置。</summary>
+    public void SetWill(string topic, string message, int qos, bool retain) {
+        this.willTopic = topic;
+        this.willMessage = message;
+        this.willQos = qos;
+        this.willRetain = retain;
+        this.hasWill = true;
     }
 
     // ---- 帧解析辅助 ----
@@ -188,59 +214,58 @@ class MqttClient {
     /// <summary>读取并丢弃一个完整控制报文（如 SUBACK / PUBACK），
     /// 返回其报文类型以保持流帧同步。</summary>
     async int DrainPacketAsync() {
-        int b0 = await ReadByteAsync();
-        if (b0 < 0) {
-            return -1;
-        }
-        int remainLen = await ReadRemainingLenAsync();
-        if (remainLen < 0) {
-            return -1;
-        }
-        // 不设上限时恶意/错乱的 broker 报一个巨大 remainLen 会让
-        // ReadBytesAsync 预分配同等大小的两个缓冲——与 broker 端
-        // 同样的 16 MiB 上限。
-        if (remainLen > 16777216) {
+        if (this.reader == null) { return -1; }
+        MqttPacket pkt = await this.reader.ReadPacketAsync();
+        if (pkt == null) {
             this.connected = false;
             return -1;
         }
-        if (remainLen > 0) {
-            byte[] _body = await ReadBytesAsync(remainLen);
-        }
-        return (b0 >> 4) & 15;
+        return pkt.packetType;
     }
 
     /// <summary>连接 broker 并执行 MQTT CONNECT/CONNACK
     /// 握手，每个网络步骤都在 IO reactor 上挂起。</summary>
     static async MqttClient ConnectAsync(string host, int port, string clientId) {
+        return await MqttClient.ConnectAsync(host, port, clientId, "", "", 0, false);
+    }
+
+    /// <summary>带遗嘱（LWT）配置连接 broker 并执行 MQTT CONNECT/CONNACK 握手。</summary>
+    static async MqttClient ConnectAsync(string host, int port, string clientId, string willTopic, string willMessage, int willQos, bool willRetain) {
+        return await MqttClient.ConnectAsync(host, port, clientId, 60, willTopic, willMessage, willQos, willRetain);
+    }
+
+    /// <summary>带遗嘱（LWT）与自定义 KeepAlive 秒数连接 broker 并执行 MQTT CONNECT/CONNACK 握手。</summary>
+    static async MqttClient ConnectAsync(string host, int port, string clientId, int keepAlive, string willTopic, string willMessage, int willQos, bool willRetain) {
         MqttClient mqtt = new MqttClient();
         mqtt.host = host;
         mqtt.port = port;
         mqtt.clientId = clientId;
+        if (keepAlive > 0) {
+            mqtt.keepAlive = keepAlive;
+        }
+        if (willTopic != null && willTopic.Length > 0) {
+            mqtt.SetWill(willTopic, willMessage, willQos, willRetain);
+        }
 
         mqtt.conn = await TcpClient.ConnectAsync(host, port);
         // 连接失败/超时按文档返回 null：直接解引用是空对象虚调用，
         // 进程 SIGSEGV。保持 connected=false 由调用方检查。
         if (mqtt.conn == null) { return mqtt; }
 
+        mqtt.reader = new MqttReader(mqtt.conn.GetSocket());
+
         byte[] packet = mqtt.BuildConnectPacket();
         int sent = await mqtt.conn.SendBytesAsync(packet, packet.Length);
 
         // CONNACK：固定头（2 字节）+ 可变头（2 字节）；
         // body 的第 2 字节为连接返回码（0 = 已接受）。
-        int b0 = await mqtt.ReadByteAsync();
-        int remainLen = await mqtt.ReadRemainingLenAsync();
-        // 未认证的对端也能报出巨大的 remainLen（varint 上限 256 MiB），
-        // ReadBytesAsync 随即预分配两个 remainLen+1 的缓冲——单次连接
-        // 尝试约 512 MiB。套用与 DrainPacketAsync / broker 端一致的
-        // 16 MiB 上限，超过即判流不可信。
-        if (remainLen > 16777216) {
+        MqttPacket ack = await mqtt.reader.ReadPacketAsync();
+        if (ack == null || ack.packetType != MqttPacketType.CONNACK) {
             mqtt.connected = false;
             return mqtt;
         }
-        byte[] body = await mqtt.ReadBytesAsync(remainLen);
-        int packetType = (b0 >> 4) & 15;
-        if (packetType == MqttPacketType.CONNACK && remainLen >= 2) {
-            int returnCode = body[1] & 255;
+        if (ack.bodyLen >= 2) {
+            int returnCode = ack.body[1] & 255;
             if (returnCode == 0) {
                 mqtt.connected = true;
             }
@@ -251,12 +276,20 @@ class MqttClient {
     /// <summary>发布消息，在 IO reactor 上挂起。QoS 1 时
     /// 还会等待 PUBACK。返回已发送的字节数。</summary>
     async int PublishAsync(string topic, string message, int qos) {
+        return await this.PublishAsync(topic, message, qos, false);
+    }
+
+    /// <summary>发布消息并指定 retain 标志，在 IO reactor 上挂起。</summary>
+    async int PublishAsync(string topic, string message, int qos, bool retain) {
         int topicLen = (int)strlen(topic);
         int msgLen = (int)strlen(message);
 
         int byte0 = (MqttPacketType.PUBLISH << 4);
         if (qos > 0) {
             byte0 = byte0 + (qos << 1);
+        }
+        if (retain) {
+            byte0 = byte0 | 1;
         }
 
         int remainLen = 2 + topicLen + msgLen;
@@ -301,6 +334,22 @@ class MqttClient {
 
         if (qos == MqttQos.AtLeastOnce) {
             int acked = await DrainPacketAsync();
+        } else if (qos == MqttQos.ExactlyOnce) {
+            // QoS 2 严格四步往返握手：
+            // 1. 等待 broker 返回 PUBREC (5)
+            MqttPacket rec = await this.reader.ReadPacketAsync();
+            if (rec != null && rec.packetType == MqttPacketType.PUBREC) {
+                // 2. 发送 PUBREL (6)，固定头必须带 flags=0010 (0x62)
+                int pid = this.nextPacketId - 1;
+                byte[] pubrel = new byte[4];
+                pubrel[0] = 98; // 0x62 (type=6, flags=0010)
+                pubrel[1] = 2;
+                pubrel[2] = (byte)((pid >> 8) & 255);
+                pubrel[3] = (byte)(pid & 255);
+                await this.conn.SendBytesAsync(pubrel, 4);
+                // 3. 等待 broker 返回 PUBCOMP (7)
+                MqttPacket comp = await this.reader.ReadPacketAsync();
+            }
         }
 
         return sent;
@@ -383,28 +432,20 @@ class MqttClient {
     /// 在 IO reactor 上挂起直到数据到达。对 broker 的
     /// PINGREQ 透明响应，并继续等待真正的消息。</summary>
     async string ReceiveAsync() {
+        if (this.reader == null) { return ""; }
         // 循环而非递归：恶意 broker 连发 PINGREQ 会把
         // 递归版本的协程栈打穿。
         while (true) {
-            int byte0 = await ReadByteAsync();
-            if (byte0 < 0) {
+            MqttPacket pkt = await this.reader.ReadPacketAsync();
+            if (pkt == null) {
                 this.connected = false;
                 return "";
             }
-            int remainLen = await ReadRemainingLenAsync();
-            if (remainLen < 0) {
-                this.connected = false;
-                return "";
-            }
-            if (remainLen > 16777216) {
-                // 恶意/错乱 broker 的巨型 remainLen：直接判流不可信，
-                // 不预分配两个 16 MiB+ 的缓冲。
-                this.connected = false;
-                return "";
-            }
-            byte[] body = await ReadBytesAsync(remainLen);
 
-            int packetType = (byte0 >> 4) & 15;
+            int byte0 = (pkt.packetType << 4) | (pkt.flags & 15);
+            int remainLen = pkt.bodyLen;
+            byte[] body = pkt.body;
+            int packetType = pkt.packetType;
 
             if (packetType == MqttPacketType.PUBLISH) {
                 // 请求体：主题长度（2）+ 主题 + [qos>0 时的报文 id（2）] + 负载
@@ -460,6 +501,14 @@ class MqttClient {
         return sent;
     }
 
+    /// <summary>强制断开底层连接（不发送 DISCONNECT 报文），用于模拟客户端异常断开并触发遗嘱消息（LWT）。</summary>
+    public void Abort() {
+        if (this.conn != null) {
+            this.conn.Close();
+        }
+        this.connected = false;
+    }
+
     /// <summary>连接是否仍存活：CONNACK 返回码为 0 后为 true，
     /// 对端关闭或 <see cref="DisconnectAsync"/> 后为 false。</summary>
     bool IsConnected() {
@@ -467,10 +516,26 @@ class MqttClient {
     }
 
     /// <summary>编码 CONNECT 报文：协议名 "MQTT"、协议级别 4（3.1.1）、
-    /// clean session 标志、keepAlive 秒数与 client id。</summary>
+    /// clean session 标志、遗嘱标志与载荷、keepAlive 秒数与 client id。</summary>
     byte[] BuildConnectPacket() {
+        int flags = 2; // CleanSession
+        int willTopicLen = 0;
+        int willMsgLen = 0;
+        if (this.hasWill) {
+            flags = flags | 4;
+            flags = flags | ((this.willQos & 3) << 3);
+            if (this.willRetain) {
+                flags = flags | 32;
+            }
+            willTopicLen = (int)strlen(this.willTopic);
+            willMsgLen = (int)strlen(this.willMessage);
+        }
+
         int clientIdLen = (int)strlen(this.clientId);
         int remainLen = 10 + 2 + clientIdLen;
+        if (this.hasWill) {
+            remainLen = remainLen + 2 + willTopicLen + 2 + willMsgLen;
+        }
 
         byte[] packet = new byte[1 + MqttClient.RemainLenBytes(remainLen) + remainLen];
         int offset = 0;
@@ -495,7 +560,7 @@ class MqttClient {
         packet[offset] = 4;
         offset = offset + 1;
 
-        packet[offset] = 2;
+        packet[offset] = (byte)flags;
         offset = offset + 1;
 
         packet[offset] = (byte)((this.keepAlive >> 8) & 255);
@@ -511,6 +576,26 @@ class MqttClient {
         for (int i = 0; i < clientIdLen; i = i + 1) {
             packet[offset] = (byte)(this.clientId[i]);
             offset = offset + 1;
+        }
+
+        if (this.hasWill) {
+            packet[offset] = (byte)((willTopicLen >> 8) & 255);
+            offset = offset + 1;
+            packet[offset] = (byte)(willTopicLen & 255);
+            offset = offset + 1;
+            for (int i = 0; i < willTopicLen; i = i + 1) {
+                packet[offset] = (byte)(this.willTopic[i]);
+                offset = offset + 1;
+            }
+
+            packet[offset] = (byte)((willMsgLen >> 8) & 255);
+            offset = offset + 1;
+            packet[offset] = (byte)(willMsgLen & 255);
+            offset = offset + 1;
+            for (int i = 0; i < willMsgLen; i = i + 1) {
+                packet[offset] = (byte)(this.willMessage[i]);
+                offset = offset + 1;
+            }
         }
 
         return packet;

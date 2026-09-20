@@ -1,0 +1,175 @@
+using System;
+using System.Net.Sockets;
+
+namespace System.Net.Mqtt;
+
+/// <summary>
+/// 表示一个解码完成的完整 MQTT 报文。
+/// </summary>
+public class MqttPacket {
+    public int packetType;
+    public int flags;
+    public byte[] body;
+    public int bodyLen;
+}
+
+/// <summary>
+/// 纯内存滑动窗口 MQTT 报文预读与帧解析器。
+/// 彻底消除逐字节 RecvOv(1) 系统调用，一次 RecvOv 批量读入多字节，并在纯内存中
+/// 状态机解码变长剩余长度（Remaining Length）与报文帧边界。
+/// </summary>
+public class MqttReader {
+    nint sock;
+    byte[] buf;
+    int len;
+    int cap;
+    int start;
+    byte[] tmp;
+    int maxPacketLen;
+
+    public MqttReader(nint sock) {
+        this.sock = sock;
+        this.cap = 16384;
+        this.buf = new byte[this.cap + 1];
+        this.len = 0;
+        this.start = 0;
+        this.tmp = new byte[16385];
+        this.maxPacketLen = 16777216; // 16 MiB
+    }
+
+    public void SetSocket(nint sock) {
+        this.sock = sock;
+        this.len = 0;
+        this.start = 0;
+    }
+
+    public void Compact() {
+        if (this.start == 0) { return; }
+        int rem = this.len - this.start;
+        for (int i = 0; i < rem; i = i + 1) {
+            this.buf[i] = this.buf[this.start + i];
+        }
+        this.len = rem;
+        this.start = 0;
+    }
+
+    public void Ensure(int need) {
+        if (need <= this.cap) { return; }
+        int nc = this.cap * 2;
+        while (nc < need) { nc = nc * 2; }
+        byte[] nb = new byte[nc + 1];
+        for (int i = 0; i < this.len; i = i + 1) {
+            nb[i] = this.buf[i];
+        }
+        this.buf = nb;
+        this.cap = nc;
+    }
+
+    public async int FillMore() {
+        this.Compact();
+        int space = this.cap - this.len;
+        if (space < 4096) {
+            this.Ensure(this.cap * 2);
+            space = this.cap - this.len;
+        }
+        int n = await Socket.RecvOv(this.sock, this.tmp, 16384);
+        if (n <= 0) {
+            return n;
+        }
+        this.Ensure(this.len + n);
+        for (int i = 0; i < n; i = i + 1) {
+            this.buf[this.len + i] = this.tmp[i];
+        }
+        this.len = this.len + n;
+        return n;
+    }
+
+    /// <summary>
+    /// 检测当前缓冲中是否已经包含完整的下一个 MQTT 报文。
+    /// 返回值：
+    ///   > 0 : 完整报文总字节数（固定头 + 剩余长度字节 + 载荷）；
+    ///   -1  : 数据未收全，需要等待更多数据；
+    ///   -2  : 畸形协议：变长长度超过 4 字节；
+    ///   -3  : 报文长度超过 maxPacketLen。
+    /// </summary>
+    public int PacketSize() {
+        int avail = this.len - this.start;
+        if (avail < 2) {
+            return -1;
+        }
+        int idx = 1;
+        int multiplier = 1;
+        int remainLen = 0;
+        bool complete = false;
+        while (idx < 5 && idx < avail) {
+            int b = this.buf[this.start + idx] & 255;
+            remainLen = remainLen + (b & 127) * multiplier;
+            if ((b & 128) == 0) {
+                complete = true;
+                idx = idx + 1;
+                break;
+            }
+            multiplier = multiplier * 128;
+            idx = idx + 1;
+        }
+        if (!complete) {
+            if (idx >= 5) {
+                return -2;
+            }
+            return -1;
+        }
+        int headerLen = idx;
+        int total = headerLen + remainLen;
+        if (total > this.maxPacketLen) {
+            return -3;
+        }
+        if (avail < total) {
+            return -1;
+        }
+        return total;
+    }
+
+    /// <summary>
+    /// 读取下一个完整报文。返回 null 表示流结束或协议错误。
+    /// </summary>
+    public async MqttPacket ReadPacketAsync() {
+        while (true) {
+            int sz = this.PacketSize();
+            if (sz > 0) {
+                int byte0 = this.buf[this.start] & 255;
+                int packetType = (byte0 >> 4) & 15;
+                int flags = byte0 & 15;
+
+                int idx = 1;
+                while (idx < 5) {
+                    int b = this.buf[this.start + idx] & 255;
+                    idx = idx + 1;
+                    if ((b & 128) == 0) { break; }
+                }
+                int headerLen = idx;
+                int bodyLen = sz - headerLen;
+
+                byte[] body = new byte[bodyLen + 1];
+                for (int i = 0; i < bodyLen; i = i + 1) {
+                    body[i] = this.buf[this.start + headerLen + i];
+                }
+
+                this.start = this.start + sz;
+
+                MqttPacket pkt = new MqttPacket();
+                pkt.packetType = packetType;
+                pkt.flags = flags;
+                pkt.body = body;
+                pkt.bodyLen = bodyLen;
+                return pkt;
+            } else if (sz == -1) {
+                int n = await this.FillMore();
+                if (n <= 0) {
+                    return null;
+                }
+            } else {
+                return null;
+            }
+        }
+    }
+}
