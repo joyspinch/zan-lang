@@ -1,3 +1,5 @@
+> **归档说明（2026-09-21）**：本文档定义的 Web GUI P0~P8 阶段已全量落地实现（✅）。现行 HTML UI 架构规范与编译器声明式展开机制请参考 [docs/HTML_UI.md](../HTML_UI.md)。
+
 # Web 等价 GUI 路线图（Web-Equivalent GUI Roadmap）
 
 > 目标：让 AI 用 web 心智写的界面在 Zan GUI 产生与浏览器相同的渲染结果。

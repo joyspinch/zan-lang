@@ -1,3 +1,5 @@
+> **归档说明（2026-09-21）**：本文档为 2026-09 编译器能力冲刺执行计划，各阶段目标均已闭环。现行现代语言演进准则请参考 [docs/EVOLUTION_PLAN_CSHARP_ALIGNMENT.md](../EVOLUTION_PLAN_CSHARP_ALIGNMENT.md)。
+
 # zan-lang 综合执行计划（2026-07-23）
 
 > 本计划整合三类问题：(A) ZanIDE 生产可用差距（承接 `docs/PRODUCTION_PLAN.md`，

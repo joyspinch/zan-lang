@@ -2,7 +2,7 @@
 
 演示 C 端成品软件接入官方授权体系的最小完整程序：启动校验 →
 激活码/账号密码激活 → 心跳占座 → 登出释放。SDK 是
-[stdlib/System/Commercial/LicenseClient.zan](../../stdlib/System/Commercial/LicenseClient.zan)，
+[packages/Zan.Commercial/src/System/Commercial/LicenseClient.zan](../../packages/Zan.Commercial/src/System/Commercial/LicenseClient.zan)，
 服务端是 [templates/server/server-licensing](../../templates/server/server-licensing)
 （授权服务端模板，`--publish` 后 `licensing_server.exe` 即可部署）。
 
@@ -40,5 +40,5 @@ build/zanc.exe examples/licensed_app/licensed_app.zan --auto-stdlib -o licensed_
 
 客户端↔服务端的四个端点（activate/login/heartbeat/logout）与响应封套
 `{"code":"0000","msg","data":{mode,subject,session,expires_at,grace_seconds}}`
-在服务端模板 `docs/` 的 [API.md](../../templates/server/server-licensing/docs/API.md)
+在服务端模板的 [README.md](../../templates/server/server-licensing/README.md#客户端契约apilicense)
 有完整字段表；改契约必须两边同步。

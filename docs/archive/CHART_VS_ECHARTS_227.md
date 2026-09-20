@@ -1,3 +1,5 @@
+> **归档说明（2026-09-21）**：本文档为 ECharts 2.2.7 对照记录。现行代码级对照账本请参考 [docs/CHART_CODE_GAP_LEDGER.md](../CHART_CODE_GAP_LEDGER.md)。
+
 # Zan Chart 与 ECharts 2.2.7 全示例可表达性对照
 
 > 基准：ECharts 2.2.7 官方 `doc/example.html` 全部 134 个示例页（含内联 option

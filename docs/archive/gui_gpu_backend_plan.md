@@ -1,3 +1,5 @@
+> **归档说明（2026-09-21）**：本文档为 GUI 自研 GPU 光栅化渲染后端切分方案设计，后端抽象 vtable 已完全在运行时落地。现行实现请参考 `src/runtime/gui_backend.h` 与 [docs/ARCHITECTURE.md](../ARCHITECTURE.md)。
+
 # GUI 渲染后端切分方案（自研 GPU 光栅，零外部依赖，跨平台）
 
 目标：从根源解决渲染性能，同时保持正确性（不依赖控件手写脏区申报）、不引入任何第三方运行时、Windows/Linux/macOS 一份实现。

@@ -1,3 +1,5 @@
+> **归档说明（2026-09-21）**：本文档为 2026-09 生产化阶段推进计划，各能力项已合并落地。现行语言与架构演进请参考 [docs/EVOLUTION_PLAN_CSHARP_ALIGNMENT.md](../EVOLUTION_PLAN_CSHARP_ALIGNMENT.md)。
+
 # ZanIDE 生产可用执行计划（2026-07）
 
 > 本计划来自对当前代码（非文档）的逐项核实。目标：把 ZanIDE 发布成生产可用、

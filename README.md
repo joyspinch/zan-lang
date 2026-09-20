@@ -9,7 +9,7 @@ Modern systems programming language with **C# syntax**, **LLVM backend**, and **
 - **ARC memory** — automatic reference counting with deterministic destruction
 - **Value semantics** — structs on stack, copy-on-write collections
 - **Easy FFI** — direct DllImport for system APIs and native libraries
-- **Lightweight IDE** — self-contained development environment (planned)
+- **Lightweight IDE** — self-hosted development environment written in Zan with integrated visual designer, LSP, and DAP
 - **Source-based stdlib** — standard library distributed as .zan source files
 
 ## Quick Example
@@ -37,9 +37,8 @@ class Program {
 ## Building
 
 ```bash
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build .
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
 ```
 
 Requires LLVM 17+ with development libraries.
@@ -48,21 +47,18 @@ Requires LLVM 17+ with development libraries.
 
 ```
 src/
-├── compiler/          # Compiler sources (C11)
-│   ├── lexer.c/h      # Tokenizer
-│   ├── parser.c/h     # Recursive descent parser
-│   ├── ast.c/h        # AST node definitions
-│   ├── binder.c/h     # Name resolution & symbol table
-│   ├── checker.c/h    # Type checking & inference
-│   ├── irgen.c/h      # LLVM IR generation
-│   ├── diag.c/h       # Error/warning reporting
-│   └── driver.c/h     # Compilation pipeline
-├── runtime/           # Runtime library
-└── ide/               # Integrated development environment
-stdlib/                # Standard library (.zan source)
-tests/                 # Test suite
-examples/              # Example programs
-docs/                  # Documentation
+├── compiler/          # Compiler front/back end (C11: lexer, parser, binder, checker, irgen)
+├── runtime/           # Runtime library (C11: ARC, async reactor, scheduler, gui backends)
+├── lsp/               # Language server (zan-lsp) & IntelliSense engine
+├── dap/               # Debug adapter (zan-dap) & debugger engine
+├── ide_zan/           # Integrated development environment (self-hosted, written in Zan)
+├── common/            # Shared C utilities (json, rpc)
+└── selfhost/          # Self-hosted compiler sources (.zan)
+stdlib/                # Standard library (.zan source + native driver bundles)
+templates/             # Project wizard templates (console, gui, game, server, library)
+examples/              # Curated, runnable example programs (each with its own README)
+tests/                 # Comprehensive test suite (conformance, abi, runtime, gui, lsp, dap)
+docs/                  # Language specifications & architectural documentation
 ```
 
 ## License

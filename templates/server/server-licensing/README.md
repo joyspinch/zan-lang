@@ -4,7 +4,7 @@ C 端成品软件的官方授权服务模板（从 server-mvc 复制裁剪而来
 软件通过**激活码**或**账号密码**在本服务激活，支持按月/季/年/终身的有效期、
 限制或不限制设备、限制并发在线终端数；管理后台发放授权、解绑设备、
 封停授权。客户端侧的接入 SDK 是
-[stdlib/System/Commercial/LicenseClient.zan](../../../stdlib/System/Commercial/LicenseClient.zan)
+[packages/Zan.Commercial/src/System/Commercial/LicenseClient.zan](../../../packages/Zan.Commercial/src/System/Commercial/LicenseClient.zan)
 （约五行接入），配套示例见
 [examples/licensed_app](../../../examples/licensed_app)。
 

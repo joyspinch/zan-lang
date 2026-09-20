@@ -1,3 +1,5 @@
+> **归档说明（2026-09-21）**：本文档为针对 ECharts 2.2.7 旧版本的兼容性审计基线。现行主图表库已全面基于 ECharts 6.x 基准，请参考 [docs/CHART_COMPATIBILITY_5.md](../CHART_COMPATIBILITY_5.md)。
+
 # Zan Chart 与 ECharts 2.2.7 兼容性合同
 
 ## 目标与范围

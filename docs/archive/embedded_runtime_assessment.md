@@ -1,3 +1,5 @@
+> **归档说明（2026-09-21）**：本文档为嵌入式运行时（ESP32-C3 / RV32）可行性评估与落地阶段记录，第 1~4 步已全部完成。现行参考代码与工程配置请参考 [examples/esp32_hello/](../../examples/esp32_hello/README.md) 与 [examples/rv32_qemu/](../../examples/rv32_qemu/README.md)。
+
 # 嵌入式（ESP32 类单片机）可行性评估与裁剪方案
 
 结论先说：**现在跑不了，但门槛不在 flash 体积，在 RAM 常驻和目标架构。** 下面全部是实测数字
