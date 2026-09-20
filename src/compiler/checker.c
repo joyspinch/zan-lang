@@ -2447,7 +2447,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             }
             if (left->kind != TYPE_ERROR && right->kind != TYPE_ERROR)
                 zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
-                              "cannot apply '??' to '%s' and '%s'",
+                              "cannot apply '?' '?' to '%s' and '%s'",
                               type_name(left), type_name(right));
             return c->binder->type_error;
         }
@@ -3842,6 +3842,17 @@ static void checker_reject_null_receiver(zan_checker_t *c, zan_ast_node_t *expr)
     if (expr->member.null_cond) return;
     zan_ast_node_t *obj = expr->member.object;
     if (!obj) return;
+
+    /* 1. Direct null literal dereference: `null.Member` or `((T)null).Member` */
+    zan_ast_node_t *core_obj = obj;
+    while (core_obj && core_obj->kind == AST_CAST_EXPR) core_obj = core_obj->cast.expr;
+    if (core_obj && core_obj->kind == AST_NULL_LITERAL) {
+        zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                      "cannot access member '%.*s' on 'null'; null reference dereference faults at runtime",
+                      (int)expr->member.name.len, expr->member.name.str);
+        return;
+    }
+
     zan_symbol_t *m = NULL;
     if (obj->kind == AST_CALL) {
         if (obj != c->last_call_node) return;
@@ -3930,6 +3941,25 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
                 }
             }
         }
+    }
+    /* Nullable value types (T?): only .HasValue, .Value, and .GetValueOrDefault() are direct members.
+     * Accessing underlying value members directly without .Value is a compile-time error. */
+    if (obj_type && obj_type->kind == TYPE_NULLABLE) {
+        zan_istr_t mn = expr->member.name;
+        if (mn.len == 8 && memcmp(mn.str, "HasValue", 8) == 0) {
+            return c->binder->type_bool;
+        }
+        if (mn.len == 5 && memcmp(mn.str, "Value", 5) == 0) {
+            return obj_type->element_type ? obj_type->element_type : c->binder->type_error;
+        }
+        if (mn.len == 17 && memcmp(mn.str, "GetValueOrDefault", 17) == 0) {
+            return obj_type->element_type ? obj_type->element_type : c->binder->type_error;
+        }
+        const char *elem_name = obj_type->element_type ? type_name(obj_type->element_type) : "T";
+        zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                      "cannot access member '%.*s' directly on nullable type '%s?'; access via '.Value' or check '.HasValue' first",
+                      (int)mn.len, mn.str, elem_name);
+        return c->binder->type_error;
     }
     /* resolve field/method on known struct/class types. Inherited fields are the
      * layout prefix, so a field that hides a base one of the same name appears
