@@ -92,6 +92,7 @@
     document.querySelectorAll('.ad-side a.mi').forEach(function (a) {
       a.classList.toggle('active', a.getAttribute('href') === base(state.active));
     });
+    if (window._ensureActiveMenuGroupOpen) { window._ensureActiveMenuGroupOpen(); }
     save();
     showActiveTab();
     paintTabNav();
@@ -1209,13 +1210,126 @@
     });
   })();
 
-  // Ctrl+F filters the sidebar. Chinese entries also match their pinyin
+  // Ctrl+K filters the sidebar. Chinese entries also match their pinyin
   // initials ("wzgl" -> 文章管理): the first letter of a han character is
   // found by collating it against the 26 boundary characters of the zh-CN
+  // ---- collapsible sidebar menu groups -------------------------------------
+  (function sideMenuGroups() {
+    var side = document.querySelector('.ad-side');
+    if (!side) { return; }
+    var groups = side.querySelectorAll('.ad-group');
+    if (!groups.length) { return; }
+
+    var STORAGE_KEY = 'zanweb.admin.menu.collapsed.v1';
+    var savedCollapsed = {};
+    var hasSaved = false;
+    try {
+      var raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        savedCollapsed = JSON.parse(raw) || {};
+        hasSaved = Object.keys(savedCollapsed).length > 0;
+      }
+    } catch (e) {
+      savedCollapsed = {};
+    }
+
+    var groupList = [];
+    for (var g = 0; g < groups.length; g++) {
+      var grp = groups[g];
+      var name = grp.textContent.trim();
+      var items = [];
+      var n = grp.nextElementSibling;
+      while (n && !n.classList.contains('ad-group') && !n.classList.contains('ad-foot')) {
+        if (n.classList.contains('mi')) { items.push(n); }
+        n = n.nextElementSibling;
+      }
+      groupList.push({ el: grp, name: name, items: items });
+    }
+
+    function saveState() {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(savedCollapsed));
+      } catch (e) {}
+    }
+
+    function applyState(info) {
+      var isCollapsed = !!savedCollapsed[info.name];
+      info.el.classList.toggle('collapsed', isCollapsed);
+      for (var i = 0; i < info.items.length; i++) {
+        info.items[i].classList.toggle('collapsed-by-group', isCollapsed);
+      }
+    }
+
+    function findActiveGroup() {
+      for (var i = 0; i < groupList.length; i++) {
+        var hasActive = groupList[i].items.some(function (el) {
+          return el.classList.contains('active');
+        });
+        if (hasActive) { return groupList[i]; }
+      }
+      return null;
+    }
+
+    // Default strategy on first open (when user has not customized collapse state):
+    // If there are more than 2 groups, collapse all except the active group (or first group)
+    // to prevent an overwhelmingly long menu.
+    var activeGrp = findActiveGroup();
+    if (!hasSaved && groupList.length > 2) {
+      var defaultOpen = activeGrp || groupList[0];
+      for (var j = 0; j < groupList.length; j++) {
+        if (groupList[j] !== defaultOpen) {
+          savedCollapsed[groupList[j].name] = true;
+        }
+      }
+      saveState();
+    } else if (activeGrp && savedCollapsed[activeGrp.name]) {
+      delete savedCollapsed[activeGrp.name];
+      saveState();
+    }
+
+    groupList.forEach(function (info) {
+      applyState(info);
+      info.el.setAttribute('role', 'button');
+      info.el.setAttribute('tabindex', '0');
+      info.el.title = '点击折叠/展开';
+      info.el.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        var willCollapse = !info.el.classList.contains('collapsed');
+        if (willCollapse) {
+          savedCollapsed[info.name] = true;
+        } else {
+          delete savedCollapsed[info.name];
+        }
+        saveState();
+        applyState(info);
+      });
+      info.el.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Enter' || ev.key === ' ') {
+          ev.preventDefault();
+          info.el.click();
+        }
+      });
+    });
+
+    window._ensureActiveMenuGroupOpen = function () {
+      var cur = findActiveGroup();
+      if (cur && cur.el.classList.contains('collapsed')) {
+        delete savedCollapsed[cur.name];
+        saveState();
+        applyState(cur);
+      }
+    };
+  })();
+
   // order, which needs no lookup table.
   (function menuFilter() {
     var box = document.getElementById('ad-find');
     if (!box) { return; }
+    var kbd = document.querySelector('.ad-find-kbd');
+    if (kbd && /Mac|iPod|iPhone|iPad/.test(navigator.platform || '')) {
+      kbd.textContent = '⌘K';
+    }
     var side = document.querySelector('.ad-side');
     var bounds = '阿八嚓咑妸发旮铪丌咔垃妈拏噢妑七呥仨他屲夕丫帀';
     var letters = 'abcdefghjklmnopqrstwxyz';
@@ -1242,6 +1356,7 @@
 
     function apply() {
       var q = box.value.trim().toLowerCase();
+      side.classList.toggle('filtering', !!q);
       var items = side.querySelectorAll('a.mi');
       var first = null;
       for (var i = 0; i < items.length; i++) {
@@ -1273,7 +1388,7 @@
       }
     });
     document.addEventListener('keydown', function (ev) {
-      if ((ev.ctrlKey || ev.metaKey) && (ev.key === 'f' || ev.key === 'F')) {
+      if ((ev.ctrlKey || ev.metaKey) && (ev.key === 'k' || ev.key === 'K')) {
         ev.preventDefault();
         document.body.classList.add('side-open');
         box.focus();

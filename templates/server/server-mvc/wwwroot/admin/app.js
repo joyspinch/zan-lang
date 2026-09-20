@@ -284,16 +284,23 @@ const App = {
       for (let i = 0; i < menu.value.length; i = i + 1) {
         const m = menu.value[i];
         const g = m.group || "";
-        if (!byKey.hasOwnProperty("g:" + g)) {
-          byKey["g:" + g] = {
-            type: "group", label: GROUP_LABELS[g] || g || "概览",
-            key: "g:" + g, children: []
-          };
-          groups.push(byKey["g:" + g]);
+        if (!g) {
+          groups.push({
+            label: m.title,
+            key: "r:" + m.path
+          });
+        } else {
+          if (!byKey.hasOwnProperty("g:" + g)) {
+            byKey["g:" + g] = {
+              label: GROUP_LABELS[g] || g,
+              key: "g:" + g, children: []
+            };
+            groups.push(byKey["g:" + g]);
+          }
+          byKey["g:" + g].children.push({
+            label: m.title, key: "r:" + m.path
+          });
         }
-        byKey["g:" + g].children.push({
-          label: m.title, key: "r:" + m.path
-        });
       }
       return groups;
     });
@@ -323,7 +330,7 @@ const App = {
           管理后台
         </div>
         <n-menu :options="menuOptions" :value="activeKey" @update:value="onMenuSelect"
-                style="flex:1" dark></n-menu>
+                accordion style="flex:1" dark></n-menu>
         <div style="padding:12px 16px;display:flex;align-items:center;justify-content:space-between;border-top:1px solid #2a3342;color:#c8cedb">
           <span>{{ me ? me.uid : "" }}</span>
           <n-button quaternary size="small" style="color:#c8cedb" @click="logout">退出</n-button>
