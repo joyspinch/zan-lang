@@ -807,6 +807,16 @@ parser 回溯，专项做。
 - **归因顺序（四步）**：单跑该用例 → 删 `build/conf_<name>.exe` 重编单跑 →
   手工 `zanc` 编译 + 直接跑 exe → 旧编译器快照（如 `_scratch/zanc_head.exe`）
   复现。四步都指向"不是我"再继续；否则停下来查自己。
+
+## macOS 交叉编译与运行契约（ld64.lld / codesign / Cocoa 生命周期，2026-09-20）
+
+- **Apple Silicon 必须带 `-adhoc_codesign`**：macOS 11+ arm64 Mach-O 可执行文件若无 `LC_CODE_SIGNATURE`（即使未加开发者证书也必须有 ad-hoc 签名），XNU 内核在 `execve` 时会直接 `SIGKILL`（namespace `CODESIGNING`），现象为启动即闪退。`ld64.lld` 针对 macOS target 必须常开 `-adhoc_codesign`。
+- **GUI 兼容对象 `zanrt_gui.o` 仅在存在 GUI 驱动时链接**：CLI 程序不能无条件引入 `zanrt_gui.o`，否则会报 `_zan_gui_draw_text` / `_zan_gui_font_height` 等未定义符号错误。通过检查 `cross_dylibs` 是否包含 `zan_gui` 门控链接。
+- **macOS 退出事件与 Cocoa Delegate 契约**：Dock 右键 Quit / Cmd+Q 发送 `kAEQuitApplication` 走 AppKit `[NSApp terminate:]`。若 `NSApp.delegate` 为 nil 或未实现 `applicationShouldTerminate:`，AppKit 回退调用各窗口 `windowShouldClose:`；如果 `windowShouldClose:` 返回 `NO` 且未调用 `zan_gui_wake()`，终止过程被静默取消且事件泵继续挂起阻塞，造成“右键退出无法退出”。正确做法：
+  1. 为 `NSApp` 设置代理 `ZanDelegate`（实现 `applicationShouldTerminate:`），返回 `NSTerminateCancel` 并派发事件 8（Window Close）以及调用 `zan_gui_wake()`，让 Zan 运行时正常触发安全清理退出；
+  2. `windowShouldClose:` 中也必须调用 `zan_gui_wake()` 唤醒阻塞在 `nextEventMatchingMask:` 的事件泵；
+  3. `zanrt_gui.o` 在运行时通过 ObjC 运行时动态注入/挂载上述 delegate，确保即使动态链接旧版 `libzan_gui.dylib` 也能生效。
+- **多开外层跳板必须声明 `LSUIElement`**：多开跳板外层 App 仅用于执行脚本 `open -n AppCore.app`，其 `Info.plist` 必须包含 `<key>LSUIElement</key><true/>`（即 `isLauncher=true`），否则外层进程执行脚本完毕退出时 Dock 图标闪烁后消失，容易被误认为崩溃闪退。
 - 另一条会一次打红**整档**的：并行会话重链 `build/zanc.exe`（
   而我这轮 ctest 是 07:20:58 起的）。编译器一换，所有 `conf_*.exe`/golden 产物
   全部过期，逐条归因毫无意义；判据是 `ls -l build/zanc.exe` 的 mtime 落在你的运行

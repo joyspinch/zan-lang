@@ -311,7 +311,7 @@ static int zan_points_to_pixels(CGFloat points, CGFloat scale) {
 /* Window delegate: surfaces resize (kind 7) and close (kind 8) events, which
  * do not flow through -nextEventMatchingMask:, so the app can relayout and
  * quit exactly as it does on the Win32/X11 backends. */
-@interface ZanDelegate : NSObject <NSWindowDelegate>
+@interface ZanDelegate : NSObject <NSWindowDelegate, NSApplicationDelegate>
 @end
 
 @implementation ZanDelegate
@@ -330,7 +330,20 @@ static int zan_points_to_pixels(CGFloat points, CGFloat scale) {
 - (BOOL)windowShouldClose:(NSWindow *)sender {
     g_evt_win = (long)(intptr_t)sender;
     evq_push(8, 0, 0, 0, 0, 0);
+    zan_gui_wake();
     return NO; /* let the app decide when to quit rather than tearing down */
+}
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
+    (void)sender;
+    /* Dock Quit / Cmd+Q sends terminate:. Push event 8 (close) so the Zan event loop
+     * shuts down cleanly and triggers the app's exit hooks. */
+    if (g_mwin_count > 0) {
+        g_evt_win = (long)(intptr_t)g_mwins[0].window;
+        evq_push(8, 0, 0, 0, 0, 0);
+        zan_gui_wake();
+        return NSTerminateCancel;
+    }
+    return NSTerminateNow;
 }
 /* Visibility changes (occluded by other windows, miniaturized, restored) wake
  * the event pump with an empty (kind 0) event so the app can pause or resume
@@ -362,6 +375,7 @@ EXPORT iptr zan_gui_create_window(const char *title, i32 width, i32 height) {
         [ZanApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
         if (!g_delegate) g_delegate = [[ZanDelegate alloc] init];
+        [NSApp setDelegate:g_delegate];
 
         /* The ABI takes physical pixels; AppKit's window frame takes points. */
         CGFloat scale = zan_window_scale(nil);
@@ -511,6 +525,9 @@ EXPORT i32 zan_gui_close_window(iptr hwnd_val) {
     }
     int idx = (int)(mw - g_mwins);
     g_mwins[idx] = g_mwins[--g_mwin_count];
+    if (g_mwin_count == 0) {
+        [NSApp setDelegate:nil];
+    }
     return 0;
 }
 

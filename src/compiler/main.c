@@ -7245,7 +7245,7 @@ int main(int argc, char **argv) {
                          obj_path, obj_tmp);
             } else {
                 snprintf(cmd, sizeof(cmd),
-                         "ld64.lld -arch %s -platform_version macos 11.0 11.0"
+                         "ld64.lld -arch %s -platform_version macos 11.0 11.0 -adhoc_codesign"
                          "%s -o \"%s\" \"%s\"",
                          march, publish_mode ? " -dead_strip" : "",
                          obj_path, obj_tmp);
@@ -7291,7 +7291,14 @@ int main(int argc, char **argv) {
                     }
                 }
             }
-            if (zan_file_exists(macrt_gui)) {
+            bool has_gui_driver = false;
+            for (int di = 0; di < cross_dylib_count; di++) {
+                if (strstr(cross_dylibs[di], "zan_gui") != NULL) {
+                    has_gui_driver = true;
+                    break;
+                }
+            }
+            if (has_gui_driver && zan_file_exists(macrt_gui)) {
                 size_t cur = strlen(cmd);
                 snprintf(cmd + cur, sizeof(cmd) - cur, " \"%s\"", macrt_gui);
             }
