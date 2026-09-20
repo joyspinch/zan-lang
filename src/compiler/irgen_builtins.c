@@ -978,6 +978,7 @@ static LLVMValueRef eh_add_global(zan_irgen_t *g, LLVMTypeRef ty,
 static LLVMValueRef get_eh_self_slot(zan_irgen_t *g) {
     if (g->target_is_windows ||
         strstr(g->target_triple, "wasm") ||
+        strstr(g->target_triple, "android") ||
         strncmp(g->target_triple, "riscv32", 7) == 0) return NULL;
     LLVMValueRef v = LLVMGetNamedGlobal(g->mod, "__zan_eh_self");
     if (v) return v;

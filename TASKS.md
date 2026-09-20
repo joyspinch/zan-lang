@@ -2162,7 +2162,7 @@ null 解引用那半同理：普通 `obj.f` 直接 fault，加通用守卫是每
 * **win-arm64/ohos 交叉 rt 对象重出收尾（2026-09-09 完成）**：rt_crash.h 架构门控等两处真缺口一并修。
 * **组件库配置面全量审计·首批（2026-09-09 完成）**：两代理盘点 Props()/可配字段/工厂参数对照 Element-Plus/AntD/Naive UI，首批 9 组件缺口关闭（T1 真控件补 Props()）。
 * **组件配置审计 T2a 深模型批（2026-09-09 完成）**：派生键三件套定式（文本是结构状态视图的键、Props() 绑表达式快照、SetProp 截到重建入口）。
-* **平台缺口：Android 交叉链接不桩 win 系统库（已实测，待修编译器）**（2026-09-09）：`src/compiler/main.c` Android 交叉链接的桩循环里 `zan_win_system_lib(...)` 命中即 `continue`（跳过不桩），而 Linux/OHOS 交叉路径与原生非 Windows 路径同场景都是生成 stub——任何可达的 `[DllImport("kernel32")]` extern（如 stdlib Wide）留在 libmain.so 成 undefined symbol，NativeActivity dlopen 即 UnsatisfiedLinkError。本次治标：runtime shims 补 MultiByteToWideChar/WideCharToMultiByte（93ed2fc5）；治本应在 Android 路径对齐其余路径的桩策略。探针：`_scratch/anw`（出包链路）、dlopen 崩溃栈见 goldminer 首包。
+* **平台缺口：Android 交叉链接不桩 win 系统库（2026-09-20 完成）**：`src/compiler/main.c` 非 Windows 目标统一对 `zan_win_system_lib` 生成桩函数并从链接库列表 drop，解决 Android/Linux/macOS 交叉编译时 Windows 系统库符号未定义报错；补全 sqlite3 驱动在 android-arm64 与 android-x64 的 .so/.a 原生构建。
 * **IDE 不可用双缺陷定位与临时交付（2026-09-09 晚完成）**：build_ide --link-lib 缺 ole32（zan_audio WASAPI COM）等两处，定位并交付可用 IDE。
 
 * **平台缺口：Android 上内嵌资产解析不通（已实测，待修 Assets/File 内嵌链路）**（2026-09-09）：`--publish --emit-apk` 打出的 APK，运行期 `Assets.Find("assets/bg.jpg")` 返回相对路径且 `File.Exists=false`（`_scratch/guiprobe` 探针 v2 实测，find=assets/bg.jpg exists=no）——纹理资产全部拿不到路径，BlitImage 走不到，模板矢量兜底成了真机实际画面。桌面/发布目录行走同一 API 正常。需要让 Android 运行期的 Assets.Find/File.Exists/读文件打通内嵌镜像（或解出到 files 目录）。探针：`_scratch/guiprobe/main.zan`（v2 带资产诊断段）。
