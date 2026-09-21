@@ -50,6 +50,11 @@ class WebView {
     List<string> pendingHandlers;
     List<string> pendingScripts;   // 每项 "0"/"1" + js，前缀是注入时机
     List<string> pendingStyles;
+    bool pendingDevTools;
+    bool devToolsEnabled;
+    bool devToolsExplicit;
+    bool contextMenuEnabled;
+    bool contextMenuExplicit;
 
     SignalString url;
     SignalString title;
@@ -86,6 +91,11 @@ class WebView {
         this.pendingHandlers = new List<string>();
         this.pendingScripts = new List<string>();
         this.pendingStyles = new List<string>();
+        this.pendingDevTools = false;
+        this.devToolsEnabled = true;
+        this.devToolsExplicit = false;
+        this.contextMenuEnabled = true;
+        this.contextMenuExplicit = false;
         this.url = new SignalString("");
         this.title = new SignalString("");
         this.NavComplete = new UiEvent();
@@ -138,6 +148,16 @@ class WebView {
             WebViewBackend.LoadHtml(handle, pendingHtml, pendingBase);
             pendingHtml = "";
             pendingBase = "";
+        }
+        if (devToolsExplicit) {
+            WebViewBackend.SetDevToolsEnabled(handle, devToolsEnabled);
+        }
+        if (contextMenuExplicit) {
+            WebViewBackend.SetContextMenuEnabled(handle, contextMenuEnabled);
+        }
+        if (pendingDevTools) {
+            pendingDevTools = false;
+            WebViewBackend.OpenDevTools(handle);
         }
     }
 
@@ -217,11 +237,25 @@ class WebView {
     }
 
     /// 在页面中运行 JavaScript 并返回字符串化的结果（出错/无结果时为
-    /// ""）。用于读取请求参数、DOM 状态或
-    /// 从页面获取的响应体。
+    /// 同步读取 JS 执行结果（非阻塞，禁止在 GUI 线程跑消息泵）。
+    /// 如需异步等待计算结果，请优先使用 <see cref="EvalWithResultAsync"/>。
     string Eval(string js) {
         if (!supported || handle == 0) { return ""; }
         return WebViewBackend.Eval(handle, js);
+    }
+
+    /// 异步运行 JavaScript 并等待返回值（协程挂起，零消息泵，不阻塞 GUI 线程）。
+    async string EvalWithResultAsync(string js, int timeoutMs = 5000) {
+        if (!supported || handle == 0) { return ""; }
+        string res = await WebViewBackend.EvalWithResultAsync(handle, js, timeoutMs);
+        return res;
+    }
+
+    /// 异步等待 WebView 引擎完全就绪（零阻塞）。
+    async bool EnsureReadyAsync(int timeoutMs = 15000) {
+        if (!supported || handle == 0) { return false; }
+        bool ok = await WebViewBackend.EnsureReadyAsync(handle, timeoutMs);
+        return ok;
     }
 
     // ---- JS ↔ 原生 -------------------------------------------------------
@@ -309,10 +343,17 @@ class WebView {
     }
 
     /// `url` 的 Cookie，序列化为 "name=value; name2=value2"（无则为 ""）。
-    /// 传 "" 获取存储中的所有 Cookie。
+    /// 读取当前缓存（非阻塞，禁止在 GUI 线程跑消息泵）。
     string GetCookies(string forUrl) {
         if (!supported || handle == 0) { return ""; }
         return WebViewBackend.GetCookies(handle, forUrl);
+    }
+
+    /// 异步获取 `url` 的 Cookie（协程挂起，零消息泵，不阻塞 GUI 线程）。
+    async string GetCookiesAsync(string forUrl, int timeoutMs = 5000) {
+        if (!supported || handle == 0) { return ""; }
+        string res = await WebViewBackend.GetCookiesAsync(handle, forUrl, timeoutMs);
+        return res;
     }
     /// 为 `url` 的主机在存储中设置 Cookie（路径默认为 "/"）。
     void SetCookie(string forUrl, string cookieName, string cookieValue) {
@@ -341,11 +382,34 @@ class WebView {
         WebViewBackend.SetZoom(handle, percent);
     }
 
-    /// <summary>为当前页打开浏览器 DevTools 窗口（调试用）。Windows
-    /// 直接弹出 DevTools 窗口；macOS 无程序化入口，创建时已启用
-    /// "Inspect Element"（右键菜单），因此此调用为空操作。</summary>
+    /// <summary>为当前页打开浏览器 DevTools 窗口（调试用）。
+    /// 原生视图尚未创建时自动挂起，首帧创建后立即弹出。</summary>
     void OpenDevTools() {
+        if (!created || handle == 0) {
+            pendingDevTools = true;
+            return;
+        }
         if (supported && handle != 0) { WebViewBackend.OpenDevTools(handle); }
+    }
+
+    /// <summary>设置是否允许开发者工具（F12、快捷键及检查元素）。
+    /// 生产发布模式建议设为 false，内核层彻底物理阻断调试。</summary>
+    void SetDevToolsEnabled(bool enabled) {
+        devToolsEnabled = enabled;
+        devToolsExplicit = true;
+        if (created && supported && handle != 0) {
+            WebViewBackend.SetDevToolsEnabled(handle, enabled);
+        }
+    }
+
+    /// <summary>设置是否允许默认右键上下文菜单。
+    /// 生产发布模式建议设为 false，防止弹出 Chromium / 原生右键菜单。</summary>
+    void SetContextMenuEnabled(bool enabled) {
+        contextMenuEnabled = enabled;
+        contextMenuExplicit = true;
+        if (created && supported && handle != 0) {
+            WebViewBackend.SetContextMenuEnabled(handle, enabled);
+        }
     }
 
     /// 隐藏原生视图（对不在屏幕上的标签/面板调用）。

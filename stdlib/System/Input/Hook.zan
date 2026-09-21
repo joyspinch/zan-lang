@@ -106,7 +106,9 @@ class Hook {
         Hook.wantUnhook = 1;
         // 唤醒 GetMessage 循环；线程自行卸载钩子并退出。
         Hook.PostThreadMessageW(Hook.hookThreadId, 0x0012 /*WM_QUIT*/, 0, 0);
-        while (Hook.hookHandle != 0) { Thread.Sleep(1); }
+        for (int waited = 0; Hook.hookHandle != 0 && waited < 500; waited = waited + 1) {
+            Thread.Sleep(1);
+        }
         Hook.wantUnhook = 0;
         Hook.keyboardCb = null;
         Hook.mouseCb = null;
@@ -117,8 +119,30 @@ class Hook {
     }
 
     #if WINDOWS
+    /// 异步安装 `kind` 类型钩子（协程驱动，非阻塞等待）。
+    static async Task<bool> InstallAsync(int kind, KeyboardHookCallback kcb, MouseHookCallback mcb) {
+        if (Hook.hookHandle != 0) { return false; }
+        Hook.keyboardCb = kcb;
+        Hook.mouseCb = mcb;
+        Hook.hookKind = kind;
+        Hook.wantUnhook = 0;
+        Hook.threadFailed = 0;
+        Thread.Start(Hook.HookThreadEntry);
+        int waited = 0;
+        while (Hook.hookHandle == 0 && Hook.threadFailed == 0 && waited < 2000) {
+            await Task.Delay(10);
+            waited = waited + 10;
+        }
+        if (Hook.hookHandle == 0) {
+            Hook.keyboardCb = null;
+            Hook.mouseCb = null;
+            return false;
+        }
+        return true;
+    }
+
     /// 安装 `kind` 类型钩子（13 = WH_KEYBOARD_LL，14 = WH_MOUSE_LL）；
-    /// 已有钩子或 3 秒内未安装成功返回 false。
+    /// 已有钩子或超时未安装成功返回 false。
     static bool Install(int kind, KeyboardHookCallback kcb, MouseHookCallback mcb) {
         if (Hook.hookHandle != 0) { return false; }
         Hook.keyboardCb = kcb;
@@ -128,7 +152,7 @@ class Hook {
         Hook.threadFailed = 0;
         Thread.Start(Hook.HookThreadEntry);
         // 等待钩子生效（或线程安装失败）。
-        for (int waited = 0; Hook.hookHandle == 0 && Hook.threadFailed == 0 && waited < 3000; waited = waited + 1) {
+        for (int waited = 0; Hook.hookHandle == 0 && Hook.threadFailed == 0 && waited < 500; waited = waited + 1) {
             Thread.Sleep(1);
         }
         if (Hook.hookHandle == 0) {

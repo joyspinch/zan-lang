@@ -106,6 +106,12 @@ class WebView2 {
     nint msgSink;
     nint winSink;
     PumpGate gate;
+    bool ready;
+    bool initFailed;
+    Gate readyGate;
+    Gate evalGate;
+    Gate cookieGate;
+    string pendingInitUrl;
     // 最近下发的位置/裁剪/可见性。put_Bounds 与 SetWindowRgn 每帧
     // 重复下发既浪费又会让网页闪烁，因此只在真的变化时才调用。
     int fx;
@@ -117,8 +123,23 @@ class WebView2 {
     bool clipSet;
     bool visible;
     bool visibleSet;
+    bool devToolsEnabled;
+    bool contextMenuEnabled;
+    bool devToolsSet;
+    bool contextMenuSet;
 
     /// ICoreWebView2 的 vtable 槽。
+    /// 槽 3：get_Settings，读取当前环境设置接口 ICoreWebView2Settings。
+    static int SlotGetSettings() { return 3; }
+    /// ICoreWebView2Settings 的 vtable 槽。
+    /// 槽 11：get_AreDevToolsEnabled
+    static int SlotGetAreDevToolsEnabled() { return 11; }
+    /// 槽 12：put_AreDevToolsEnabled
+    static int SlotPutAreDevToolsEnabled() { return 12; }
+    /// 槽 13：get_AreDefaultContextMenusEnabled
+    static int SlotGetAreDefaultContextMenusEnabled() { return 13; }
+    /// 槽 14：put_AreDefaultContextMenusEnabled
+    static int SlotPutAreDefaultContextMenusEnabled() { return 14; }
     /// 槽 4：get_Source，读取当前页面 URI。
     static int SlotGetSource() { return 4; }
     /// 槽 5：Navigate，导航到指定 URI。
@@ -327,6 +348,12 @@ class WebView2 {
         w.pendingScriptId = "";
         w.pendingWindowNav = "";
         w.gate = new PumpGate();
+        w.ready = false;
+        w.initFailed = false;
+        w.readyGate = new Gate();
+        w.evalGate = new Gate();
+        w.cookieGate = new Gate();
+        w.pendingInitUrl = "";
 
         List<WebView2> all = WebView2.All();
         all.Add(w);
@@ -369,29 +396,38 @@ class WebView2 {
         return h;
     }
 
-    /// 启动序列：建宿主子窗口 → 创建 Environment（泵消息至多 8s）→
-    /// 创建 Controller（泵至多 12s，成功时顺带取 core）→ 订阅
-    /// NavigationStarting/SourceChanged/NavigationCompleted 三个事件 →
-    /// 以隐藏的零尺寸空白状态收尾。任一步失败返回 false。
+    /// 启动序列：建宿主子窗口 → 异步发起 Environment 创建流水线（非阻塞，零消息泵）→
+    /// 待 OnController 回调触发后由主消息循环自然挂载 core 并应用几何。
     bool Start(nint hwnd, string profileId) {
         host = WebView2.CreateHost(hwnd);
-        if (host == 0) { return false; }
+        if (host == 0) {
+            initFailed = true;
+            return false;
+        }
         envSink = this.Sink((nint)WebView2.OnEnvironment);
         nint folder = Wide.Of(WebView2.ProfileDir(profileId));
         WvCreateEnvFn create = (WvCreateEnvFn)WebView2.createEnv;
+        ready = false;
+        initFailed = false;
         gate.Reset();
+        readyGate = new Gate();
         int hr = create(0, folder, 0, envSink);
         Wide.Free(folder);
-        if (!Com.Ok(hr)) { return false; }
-        Pump.Until(gate, 8000);
-        if (env == 0) { return false; }
+        if (!Com.Ok(hr)) {
+            initFailed = true;
+            return false;
+        }
 
-        ctlSink = this.Sink((nint)WebView2.OnController);
-        gate.Reset();
-        hr = Com.Call2(env, WebView2.SlotCreateController(), host, ctlSink);
-        if (Com.Ok(hr)) { Pump.Until(gate, 12000); }
-        if (core == 0) { return false; }
+        // 以隐藏和空白状态启动；不阻塞等待，待 OnController 回调触发后
+        // 自动完成 AttachCore 并下发控件排队的真实边界和可见性。
+        this.SetFrame(0, 0, 0, 0);
+        this.SetVisible(false);
+        return true;
+    }
 
+    /// 在 Controller 回调就绪后挂载事件并应用排队的几何与状态。
+    void AttachCore() {
+        if (core == 0) { return; }
         navSink = this.Sink((nint)WebView2.OnNavigationCompleted);
         navToken = this.Subscribe(WebView2.SlotAddNavigationCompleted(), navSink);
         startSink = this.Sink((nint)WebView2.OnNavigationStarting);
@@ -403,11 +439,39 @@ class WebView2 {
         winSink = this.Sink((nint)WebView2.OnNewWindowRequested);
         winToken = this.Subscribe(WebView2.SlotAddNewWindow(), winSink);
 
-        // 以隐藏和空白状态启动；控件每帧从其所占区域
-        // 驱动边界和可见性。
-        this.SetFrame(0, 0, 0, 0);
-        this.SetVisible(false);
-        return true;
+        this.ApplySettings();
+
+        // 应用就绪前由控件排队的几何尺寸和可见性
+        if (frameSet) {
+            this.SetFrame(fx, fy, fw, fh);
+        }
+        if (visibleSet) {
+            this.SetVisible(visible);
+        }
+        if (clipSet) {
+            this.SetClip(clipSpec);
+        }
+
+        // 刷新在就绪前添加的 message handler
+        if (handlerNames.Count > 0) {
+            for (int i = 0; i < handlerNames.Count; i = i + 1) {
+                this.AddDocScript(WebView2.ShimScript(handlerNames[i]));
+            }
+        }
+
+        // 执行就绪前 pending 的导航
+        if (pendingInitUrl != "") {
+            this.Navigate(pendingInitUrl);
+            pendingInitUrl = "";
+        }
+    }
+
+    /// 异步等待 WebView2 完全就绪（协程挂起，零消息泵，不阻塞 GUI 线程）。
+    async bool EnsureReadyAsync(int timeoutMs = 15000) {
+        if (ready) { return true; }
+        if (initFailed) { return false; }
+        await readyGate.Wait(timeoutMs);
+        return ready;
     }
 
     /// add_* 接受处理器和一个 EventRegistrationToken 输出参数；
@@ -434,6 +498,8 @@ class WebView2 {
     /// %LOCALAPPDATA%\ZanGui\WebView2\<profile>；WebView2 按此文件夹
     /// 划分 Cookie 和存储，这正是配置文件隔离的原理。
     static string ProfileDir(string profileId) {
+        string userEnv = Interop.EnvVar("WEBVIEW2_USER_DATA_FOLDER");
+        if (userEnv != "") { return userEnv; }
         string id = profileId;
         if (id == "") { id = "default"; }
         string safe = "";
@@ -472,25 +538,42 @@ class WebView2 {
     static int OnRelease(nint self) { return 1; }
 
     /// Environment 创建完成回调（COM）：成功则保留 env 引用，
-    /// 并唤醒 Start 里的 gate。
+    /// 并立刻发起 Controller 的异步创建（无需消息泵轮询等待）。
     static int OnEnvironment(nint self, int hr, nint result) {
         WebView2 w = WebView2.Get(ComVtbl.State(self));
         if (w == null) { return 0; }
-        if (Com.Ok(hr)) { w.env = Com.Keep(result); }
-        w.gate.Signal();
+        if (Com.Ok(hr) && result != 0) {
+            w.env = Com.Keep(result);
+            w.ctlSink = w.Sink((nint)WebView2.OnController);
+            int chr = Com.Call2(w.env, WebView2.SlotCreateController(), w.host, w.ctlSink);
+            if (!Com.Ok(chr)) {
+                w.initFailed = true;
+                w.gate.Signal();
+                w.readyGate.Signal();
+            }
+        } else {
+            w.initFailed = true;
+            w.gate.Signal();
+            w.readyGate.Signal();
+        }
         return 0;
     }
 
     /// Controller 创建完成回调（COM）：成功则保留 ctrl 并取 core，
-    /// 唤醒 Start 里的 gate。
+    /// 自动挂载事件与设置，唤醒等待方，零阻塞完成就绪。
     static int OnController(nint self, int hr, nint result) {
         WebView2 w = WebView2.Get(ComVtbl.State(self));
         if (w == null) { return 0; }
         if (Com.Ok(hr) && result != 0) {
             w.ctrl = Com.Keep(result);
             w.core = Com.Get(w.ctrl, WebView2.SlotGetCoreWebView2());
+            w.AttachCore();
+            w.ready = true;
+        } else {
+            w.initFailed = true;
         }
         w.gate.Signal();
+        w.readyGate.Signal();
         return 0;
     }
 
@@ -573,7 +656,13 @@ class WebView2 {
     static int OnDocScriptAdded(nint self, int hr, nint id) {
         WebView2 w = WebView2.Get(ComVtbl.State(self));
         if (w == null) { return 0; }
-        if (Com.Ok(hr)) { w.pendingScriptId = Wide.Read(id); }
+        if (Com.Ok(hr) && id != 0) {
+            string sid = Wide.Read(id);
+            if (sid != "") {
+                w.pendingScriptId = sid;
+                w.scriptIds.Add(sid);
+            }
+        }
         w.gate.Signal();
         return 0;
     }
@@ -585,6 +674,7 @@ class WebView2 {
         if (w == null) { return 0; }
         if (Com.Ok(hr)) { w.evalResult = Wide.Read(json); }
         w.gate.Signal();
+        w.evalGate.Signal();
         return 0;
     }
 
@@ -598,6 +688,7 @@ class WebView2 {
             w.cookieResult = WebView2.Serialize(list);
         }
         w.gate.Signal();
+        w.cookieGate.Signal();
         return 0;
     }
 
@@ -722,9 +813,12 @@ class WebView2 {
         this.SetVisible(true);
     }
 
-    /// 导航到 target；core 未就绪时忽略。
+    /// 导航到 target；core 未就绪时记入 pendingInitUrl 等就绪后自动导航。
     void Navigate(string target) {
-        if (core == 0) { return; }
+        if (core == 0) {
+            pendingInitUrl = target;
+            return;
+        }
         nint u = Wide.Of(target);
         Com.Call1(core, WebView2.SlotNavigate(), u);
         Wide.Free(u);
@@ -781,16 +875,29 @@ class WebView2 {
         return title;
     }
 
-    /// 运行 JavaScript 并等待其 JSON 结果（出错/超时返回 ""）。
+    /// 异步运行 JavaScript 并等待其 JSON 结果（协程挂起，零消息泵，不卡死 GUI 线程）。
+    async string EvalWithResultAsync(string js, int timeoutMs = 5000) {
+        if (core == 0) { return ""; }
+        evalResult = "";
+        nint sink = this.Sink((nint)WebView2.OnScriptCompleted);
+        nint script = Wide.Of(js);
+        evalGate = new Gate();
+        int hr = Com.Call2(core, WebView2.SlotExecuteScript(), script, sink);
+        Wide.Free(script);
+        if (!Com.Ok(hr)) { return ""; }
+        await evalGate.Wait(timeoutMs);
+        return evalResult;
+    }
+
+    /// 运行 JavaScript 并返回就绪的 JSON 结果（非阻塞，禁止在 GUI 线程跑消息泵）。
+    /// 如需异步等待计算结果，请优先使用 <see cref="EvalWithResultAsync"/>。
     string Eval(string js) {
         if (core == 0) { return ""; }
         nint sink = this.Sink((nint)WebView2.OnScriptCompleted);
         nint script = Wide.Of(js);
         evalResult = "";
-        gate.Reset();
-        int hr = Com.Call2(core, WebView2.SlotExecuteScript(), script, sink);
+        Com.Call2(core, WebView2.SlotExecuteScript(), script, sink);
         Wide.Free(script);
-        if (Com.Ok(hr)) { Pump.Until(gate, 5000); }
         return evalResult;
     }
 
@@ -882,18 +989,16 @@ class WebView2 {
 
     // ---- 文档级脚本/CSS 注入 -------------------------------------------
 
-    /// AddScriptToExecuteOnDocumentCreated 的一次调用：返回完成回调回传的
-    /// 脚本 id（Remove 用），失败为 ""。
+    /// AddScriptToExecuteOnDocumentCreated 的一次调用：非阻塞向引擎注册（零消息泵），
+    /// 回调到达后自动记录脚本 id。
     string AddDocScript(string js) {
         if (core == 0 || js == "") { return ""; }
         nint sink = this.Sink((nint)WebView2.OnDocScriptAdded);
         nint code = Wide.Of(js);
         pendingScriptId = "";
-        gate.Reset();
         int hr = Com.Call2(core, WebView2.SlotAddDocScript(), code, sink);
         Wide.Free(code);
-        if (Com.Ok(hr)) { Pump.Until(gate, 5000); }
-        return pendingScriptId;
+        return "";
     }
 
     /// 每次导航都注入的脚本：atEnd=true 包一层 readyState 门，文档解析完
@@ -901,10 +1006,8 @@ class WebView2 {
     /// 仿真；脚本包在闭包里，页面可见的全局需显式挂到 window 上）。
     bool InjectScript(string js, bool atEnd) {
         if (js == "") { return false; }
-        string id = this.AddDocScript(atEnd ? WebView2.DeferToDomReady(js)
-                                            : js);
-        if (id == "") { return false; }
-        scriptIds.Add(id);
+        this.AddDocScript(atEnd ? WebView2.DeferToDomReady(js)
+                                : js);
         return true;
     }
 
@@ -1017,6 +1120,34 @@ class WebView2 {
         return uri;
     }
 
+    /// 设置是否允许开发者工具（F12、快捷键及检查元素）
+    void SetDevToolsEnabled(bool enabled) {
+        devToolsEnabled = enabled;
+        devToolsSet = true;
+        this.ApplySettings();
+    }
+
+    /// 设置是否允许默认右键上下文菜单
+    void SetContextMenuEnabled(bool enabled) {
+        contextMenuEnabled = enabled;
+        contextMenuSet = true;
+        this.ApplySettings();
+    }
+
+    /// 同步设置到底层 ICoreWebView2Settings
+    void ApplySettings() {
+        if (core == 0) { return; }
+        nint settings = Com.Get(core, WebView2.SlotGetSettings());
+        if (settings == 0) { return; }
+        if (devToolsSet) {
+            Com.Call1(settings, WebView2.SlotPutAreDevToolsEnabled(), devToolsEnabled ? 1 : 0);
+        }
+        if (contextMenuSet) {
+            Com.Call1(settings, WebView2.SlotPutAreDefaultContextMenusEnabled(), contextMenuEnabled ? 1 : 0);
+        }
+        Com.Release(settings);
+    }
+
     /// ICoreWebView2_2 带有 Cookie 管理器；较旧的运行时
     /// 则不产生任何 Cookie。
     nint Cookies() {
@@ -1028,18 +1159,33 @@ class WebView2 {
         return cm;
     }
 
-    /// `forUrl` 的 Cookie，形如 "name=value; ..."；"" 表示整个存储。
-    string GetCookies(string forUrl) {
+    /// 异步获取 `forUrl` 的 Cookie（协程挂起等待，零消息泵，不阻塞 GUI 线程）。
+    async string GetCookiesAsync(string forUrl, int timeoutMs = 5000) {
         nint cm = this.Cookies();
         if (cm == 0) { return ""; }
         nint sink = this.Sink((nint)WebView2.OnCookiesCompleted);
         nint u = 0;
         if (forUrl != "") { u = Wide.Of(forUrl); }
         cookieResult = "";
-        gate.Reset();
+        cookieGate = new Gate();
         int hr = Com.Call2(cm, WebView2.SlotGetCookies(), u, sink);
         if (u != 0) { Wide.Free(u); }
-        if (Com.Ok(hr)) { Pump.Until(gate, 5000); }
+        Com.Release(cm);
+        if (!Com.Ok(hr)) { return ""; }
+        await cookieGate.Wait(timeoutMs);
+        return cookieResult;
+    }
+
+    /// `forUrl` 的 Cookie，形如 "name=value; ..."；"" 表示整个存储。
+    /// 读取当前缓存（非阻塞，禁止在 GUI 线程跑消息泵）。如需等待最新 Cookie，请使用 <see cref="GetCookiesAsync"/>。
+    string GetCookies(string forUrl) {
+        nint cm = this.Cookies();
+        if (cm == 0) { return cookieResult; }
+        nint sink = this.Sink((nint)WebView2.OnCookiesCompleted);
+        nint u = 0;
+        if (forUrl != "") { u = Wide.Of(forUrl); }
+        Com.Call2(cm, WebView2.SlotGetCookies(), u, sink);
+        if (u != 0) { Wide.Free(u); }
         Com.Release(cm);
         return cookieResult;
     }
