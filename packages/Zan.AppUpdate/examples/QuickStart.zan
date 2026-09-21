@@ -1,0 +1,102 @@
+using System;
+using System.IO;
+using Zan.AppUpdate;
+
+class QuickStart {
+    static int Main() {
+        Console.WriteLine("=================================================");
+        Console.WriteLine("        Zan.AppUpdate 通用版本更新与自愈演示      ");
+        Console.WriteLine("=================================================");
+
+        string demoDir = "_scratch/appupdate_demo";
+        string releaseDir = demoDir + "/release_app";
+        string clientDir = demoDir + "/client_app";
+        string distDir = demoDir + "/dist";
+
+        if (Directory.Exists(demoDir)) {
+            // 确保目录清空
+        }
+        Directory.CreateDirectoryRecursive(releaseDir + "/bin");
+        Directory.CreateDirectoryRecursive(releaseDir + "/assets");
+        Directory.CreateDirectoryRecursive(releaseDir + "/config");
+        Directory.CreateDirectoryRecursive(distDir);
+        Directory.CreateDirectoryRecursive(clientDir);
+
+        // 1. 模拟构建好的应用程序
+        File.WriteAllText(releaseDir + "/bin/app.exe", "ZanAppBinaryContent_v1.0.0");
+        File.WriteAllText(releaseDir + "/assets/logo.png", "FakePngData_12345678");
+        File.WriteAllText(releaseDir + "/config/settings.json", "{\"theme\":\"dark\",\"port\":8080}");
+
+        string zipPath = distDir + "/update_v1.0.0.zip";
+        string manifestPath = distDir + "/manifest.json";
+
+        // 2. 版本打包发布
+        Console.WriteLine("\n[第 1 步] 正在发布打包应用程序为 Zip 格式...");
+        UpdateManifest manifest = ReleasePackager.Pack(
+            releaseDir,
+            zipPath,
+            manifestPath,
+            "MyZanApp",
+            "1.0.0",
+            "初始发布，支持通用更新与防篡改自愈",
+            "https://update.example.com/dl/update_v1.0.0.zip",
+            ConsoleProgressRenderer.Render
+        );
+
+        if (manifest == null) {
+            Console.WriteLine("打包发布失败！");
+            return 1;
+        }
+
+        Console.WriteLine("\n发布成功！生成更新包: " + zipPath);
+        Console.WriteLine("生成清单: " + manifestPath);
+        Console.WriteLine("清单内文件数: " + manifest.files.Count);
+
+        // 3. 客户端安装/升级
+        Console.WriteLine("\n[第 2 步] 客户端正在安装/升级更新包...");
+        bool applyOk = AppUpdater.ApplyPackage(zipPath, clientDir, false, ConsoleProgressRenderer.Render);
+        if (!applyOk) {
+            Console.WriteLine("更新失败！");
+            return 1;
+        }
+
+        // 4. 初次纯净性自检
+        Console.WriteLine("\n\n[第 3 步] 运行启动时完整性与防篡改自检...");
+        IntegrityReport rep1 = TamperDetector.Check(clientDir, manifest, null);
+        Console.WriteLine(rep1.Summary());
+        if (!rep1.isClean) {
+            Console.WriteLine("错误：刚安装完的程序不纯净！");
+            return 1;
+        }
+
+        // 5. 模拟文件被恶意篡改和误删
+        Console.WriteLine("\n[第 4 步] 模拟恶意篡改与文件损坏：");
+        Console.WriteLine(" -> 篡改 bin/app.exe 的字节内容！");
+        File.WriteAllText(clientDir + "/bin/app.exe", "MALICIOUS_PATCHED_PAYLOAD");
+        Console.WriteLine(" -> 删除 assets/logo.png 模拟文件损坏缺失！");
+        File.Delete(clientDir + "/assets/logo.png");
+
+        // 6. 防篡改检测
+        Console.WriteLine("\n[第 5 步] 重新运行防篡改检测：");
+        IntegrityReport rep2 = TamperDetector.Check(clientDir, manifest, null);
+        Console.WriteLine(rep2.Summary());
+
+        // 7. 执行自动自愈还原
+        Console.WriteLine("[第 6 步] 启动受损文件自动还原（从官方 Zip 包按需解压还原受损文件）...");
+        int restored = TamperDetector.RestoreFromZip(clientDir, rep2, zipPath, ConsoleProgressRenderer.Render);
+        Console.WriteLine("\n自愈执行完毕，已修复还原 " + restored + " 个受损文件。");
+
+        // 8. 复核验证
+        Console.WriteLine("\n[第 7 步] 自愈后二次复核验证：");
+        IntegrityReport rep3 = TamperDetector.Check(clientDir, manifest, null);
+        Console.WriteLine(rep3.Summary());
+
+        if (rep3.isClean) {
+            Console.WriteLine(">>> 恭喜！程序已完美自愈，所有文件恢复至官方纯净状态！");
+            return 0;
+        } else {
+            Console.WriteLine(">>> 失败：自愈后仍存在异常文件！");
+            return 1;
+        }
+    }
+}
