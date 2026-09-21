@@ -37,15 +37,38 @@ class Equipment {
     int level;
     int upgrade;
     bool locked;
+
+    // 传奇核心博弈：幸运与极品随机词缀
+    int luck;          // 武器/项链幸运（+1~+7）
+    int extraAttack;   // 极品额外攻击
+    int extraMagic;    // 极品额外魔法
+    int extraTao;      // 极品额外道术
+    int extraDefense;  // 极品额外防御
+    int extraHp;       // 极品额外生命
+
+    bool HasAffix() {
+        return luck > 0 || extraAttack > 0 || extraMagic > 0 || extraTao > 0 || extraDefense > 0 || extraHp > 0;
+    }
+
     DataRow Definition() { return GameTables.current.items.At(definitionId); }
+
     // Each stat scales its own base. A sword does not acquire HP/defense from its score.
     int Stat(string key) {
         int value = Definition().Int(key);
         DataRow rule = GameTables.current.attributes.Get(key);
         long scaled = (long)value * GameTables.current.qualities.At(tier).Int("stat_pct") * coefficient / 100;
         if (slot == 11) { scaled = scaled + (long)GameTables.current.TianShuBonus(key) * coefficient; }
+
+        // 极品词缀附加属性
+        if (key == "attack_max") { scaled = scaled + extraAttack; }
+        else if (key == "magic_max") { scaled = scaled + extraMagic; }
+        else if (key == "tao_max") { scaled = scaled + extraTao; }
+        else if (key == "defense_max") { scaled = scaled + extraDefense; }
+        else if (key == "hp") { scaled = scaled + extraHp; }
+
         return Rules.Bounded(scaled * (100 + upgrade * rule.Int("upgrade_pct")) / 100);
     }
+
     int Score(string school) {
         long score = 0;
         foreach (DataRow rule in GameTables.current.attributes.rows) {
@@ -55,26 +78,54 @@ class Equipment {
         }
         return Rules.Bounded(score);
     }
+
     int Power() { return Score(""); }
+
     bool CanWear(int job, int level, int rebirth) {
         DataRow d = Definition();
         return level >= d.Int("min_level") && rebirth >= d.Int("required_rebirth") && (d.Int("required_job") < 0 || d.Int("required_job") == job);
     }
-    string Name() { return Definition().Text("name") + "  ×" + Rules.N(coefficient) + "  +" + Rules.N(upgrade); }
+
+    string Name() {
+        string n = Definition().Text("name");
+        if (HasAffix()) { n = "★极品 " + n; }
+        if (luck > 0) { n = n + " 幸+" + Rules.N(luck); }
+        return n + "  ×" + Rules.N(coefficient) + "  +" + Rules.N(upgrade);
+    }
+
     string Pair(string key) { return Rules.N(Stat(key + "_min")) + "–" + Rules.N(Stat(key + "_max")); }
+
     string Detail() {
         DataRow d = Definition(); int required = d.Int("required_job");
-        return Rules.Quality(tier) + " · 需求Lv." + Rules.N(d.Int("min_level")) + " / " + Rules.N(d.Int("required_rebirth")) + "转 / " + (required < 0 ? "全职业" : Rules.Job(required))
+        string s = Rules.Quality(tier) + " · 需求Lv." + Rules.N(d.Int("min_level")) + " / " + Rules.N(d.Int("required_rebirth")) + "转 / " + (required < 0 ? "全职业" : Rules.Job(required))
             + "\n攻击加成 " + Pair("attack") + "  魔法 " + Pair("magic") + "  道术 " + Pair("tao")
             + "\n防御加成 " + Pair("defense") + "  魔防 " + Pair("magic_defense") + "  生命 +" + Rules.N(Stat("hp")) + "  法力 +" + Rules.N(Stat("mp"))
             + "\n重量 " + Rules.N(d.Int("weight")) + " · 基准售价 " + Rules.N(d.Int("sell_price")) + " · 评分 " + Rules.N(Power());
+        if (luck > 0) { s = s + "\n【神圣幸运】 幸运 +" + Rules.N(luck) + "（凑齐运9套触发刀刀攻击上限）"; }
+        if (extraAttack > 0 || extraMagic > 0 || extraTao > 0 || extraDefense > 0 || extraHp > 0) {
+            s = s + "\n【极品属性】";
+            if (extraAttack > 0) { s = s + " 攻击+" + Rules.N(extraAttack); }
+            if (extraMagic > 0) { s = s + " 魔法+" + Rules.N(extraMagic); }
+            if (extraTao > 0) { s = s + " 道术+" + Rules.N(extraTao); }
+            if (extraDefense > 0) { s = s + " 防御+" + Rules.N(extraDefense); }
+            if (extraHp > 0) { s = s + " 生命+" + Rules.N(extraHp); }
+        }
+        return s;
     }
+
     JsonValue Encode() {
         JsonValue j = JsonValue.NewObject();
         Rules.Put(j, "definitionId", definitionId); Rules.Put(j, "slot", slot); Rules.Put(j, "tier", tier); Rules.Put(j, "coefficient", coefficient);
         Rules.Put(j, "level", level); Rules.Put(j, "upgrade", upgrade); Rules.Put(j, "locked", locked ? 1 : 0);
+        Rules.Put(j, "luck", luck);
+        Rules.Put(j, "extraAttack", extraAttack);
+        Rules.Put(j, "extraMagic", extraMagic);
+        Rules.Put(j, "extraTao", extraTao);
+        Rules.Put(j, "extraDefense", extraDefense);
+        Rules.Put(j, "extraHp", extraHp);
         return j;
     }
+
     static Equipment Decode(JsonValue j) {
         if (j == null || !j.IsObject()) { return null; }
         if (j.Int("slot", -1) < 0 || j.Int("slot", -1) > 11) { return null; }
@@ -91,6 +142,65 @@ class Equipment {
         if (definition.Int("slot") != GameTables.current.slots.At(e.slot).Int("group")) { throw new Exception("Save equipment definition/slot mismatch"); }
         e.tier = Rules.Clamp(j.Int("tier", 0), 0, 4); e.coefficient = Rules.Clamp(j.Int("coefficient", 1), 1, 10);
         e.level = Rules.Clamp(j.Int("level", 1), 1, GameTables.current.levels.rows.Count); e.upgrade = Rules.Clamp(j.Int("upgrade", 0), 0, 20);
-        e.locked = j.Int("locked", 0) == 1; return e;
+        e.locked = j.Int("locked", 0) == 1;
+        e.luck = Rules.Clamp(j.Int("luck", 0), 0, 7);
+        e.extraAttack = j.Int("extraAttack", 0);
+        e.extraMagic = j.Int("extraMagic", 0);
+        e.extraTao = j.Int("extraTao", 0);
+        e.extraDefense = j.Int("extraDefense", 0);
+        e.extraHp = j.Int("extraHp", 0);
+        return e;
     }
 }
+
+
+class CombatEvent {
+    int damage;
+    bool isCrit;
+    bool isLuckMax;
+    string skillName;
+    bool isMiss;
+    bool isPoison;
+    bool isPlayerAttack;
+    int targetX;
+    int targetY;
+
+    static CombatEvent PlayerStrike(int dmg, bool crit, bool luckMax, string skill, int tx, int ty) {
+        CombatEvent ev = new CombatEvent();
+        ev.damage = dmg;
+        ev.isCrit = crit;
+        ev.isLuckMax = luckMax;
+        ev.skillName = skill;
+        ev.isMiss = false;
+        ev.isPoison = false;
+        ev.isPlayerAttack = true;
+        ev.targetX = tx;
+        ev.targetY = ty;
+        return ev;
+    }
+
+    static CombatEvent MonsterStrike(int dmg, int tx, int ty) {
+        CombatEvent ev = new CombatEvent();
+        ev.damage = dmg;
+        ev.isCrit = false;
+        ev.isLuckMax = false;
+        ev.skillName = "";
+        ev.isMiss = false;
+        ev.isPoison = false;
+        ev.isPlayerAttack = false;
+        ev.targetX = tx;
+        ev.targetY = ty;
+        return ev;
+    }
+
+    static CombatEvent Miss(int tx, int ty) {
+        CombatEvent ev = new CombatEvent();
+        ev.damage = 0;
+        ev.isMiss = true;
+        ev.isPlayerAttack = true;
+        ev.targetX = tx;
+        ev.targetY = ty;
+        return ev;
+    }
+}
+

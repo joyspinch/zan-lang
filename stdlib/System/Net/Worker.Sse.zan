@@ -1,7 +1,9 @@
 using System;
+using System.Threading;
 using System.Net.Sockets;
 using System.Net.Http;
 using System.Net.Sse;
+using System.Net.WebSocket;
 
 namespace System.Net;
 
@@ -23,10 +25,112 @@ class WorkerSse {
     /// SSE 订阅者握手完成后调用；应用持有 SseConnection 主动推事件。
     static SseSubscriberHandler onSseSubscriber;
 
+    static List<SseConnection> conns = new List<SseConnection>();
+    static nint sseLock = 0;
+    static WsSharedBus sharedBus = null;
+    static WorkerSseConsumer busConsumer = null;
+
+    static void SseInit() {
+        if (WorkerSse.sseLock == 0) { WorkerSse.sseLock = Mutex.Create(); }
+    }
+
+    /// <summary>启用基于 SharedTable 的跨进程 SSE 广播总线。</summary>
+    static void EnableSharedBus(string busName) {
+        if (WorkerSse.sharedBus != null) { return; }
+        WorkerSse.sharedBus = new WsSharedBus(busName, 128);
+        if (WorkerSse.sharedBus.IsAvailable()) {
+            WorkerSse.busConsumer = new WorkerSseConsumer();
+            WorkerSse.sharedBus.StartPolling(WorkerSse.busConsumer);
+        }
+    }
+
     /// <summary>Installs the SSE shard into the Worker entry slot. Call once
     /// before Worker.RunAll().</summary>
     static void Install() {
         Worker.sseEntry = WorkerSse.HandleSse;
+        WorkerSse.EnableSharedBus("zan_sse_worker_bus");
+    }
+
+    /// <summary>登记本进程活跃的 SSE 连接。</summary>
+    static void Attach(SseConnection conn) {
+        WorkerSse.SseInit();
+        Mutex.Lock(WorkerSse.sseLock);
+        WorkerSse.conns.Add(conn);
+        Mutex.Unlock(WorkerSse.sseLock);
+        if (WorkerSse.sharedBus != null) {
+            WorkerSse.sharedBus.OnConnChange(1);
+        }
+    }
+
+    /// <summary>注销 SSE 连接。</summary>
+    static void Detach(SseConnection conn) {
+        WorkerSse.SseInit();
+        Mutex.Lock(WorkerSse.sseLock);
+        for (int i = 0; i < WorkerSse.conns.Count; i = i + 1) {
+            if (WorkerSse.conns[i] == conn) {
+                WorkerSse.conns.RemoveAt(i);
+                break;
+            }
+        }
+        Mutex.Unlock(WorkerSse.sseLock);
+        if (WorkerSse.sharedBus != null) {
+            WorkerSse.sharedBus.OnConnChange(-1);
+        }
+    }
+
+    /// <summary>本 Worker 进程在线 SSE 连接数。</summary>
+    static int ConnCount() {
+        WorkerSse.SseInit();
+        Mutex.Lock(WorkerSse.sseLock);
+        int n = WorkerSse.conns.Count;
+        Mutex.Unlock(WorkerSse.sseLock);
+        return n;
+    }
+
+    /// <summary>获取集群跨 Worker 实时在线 SSE 连接总数。</summary>
+    static int ClusterConnCount() {
+        if (WorkerSse.sharedBus != null && WorkerSse.sharedBus.IsAvailable()) {
+            return WorkerSse.sharedBus.GetTotalConnCount();
+        }
+        return WorkerSse.ConnCount();
+    }
+
+    /// <summary>向本进程内所有活跃 SSE 连接本地广播事件。</summary>
+    static async int BroadcastLocal(string eventName, string data) {
+        WorkerSse.SseInit();
+        Mutex.Lock(WorkerSse.sseLock);
+        List<SseConnection> snap = new List<SseConnection>();
+        for (int i = 0; i < WorkerSse.conns.Count; i = i + 1) {
+            snap.Add(WorkerSse.conns[i]);
+        }
+        Mutex.Unlock(WorkerSse.sseLock);
+        int sent = 0;
+        for (int i = 0; i < snap.Count; i = i + 1) {
+            SseConnection s = snap[i];
+            if (s.IsOpen()) {
+                int n = await s.SendAsync(eventName, data);
+                if (n > 0) { sent = sent + 1; }
+            }
+        }
+        return sent;
+    }
+
+    /// <summary>跨 Worker 向全集群所有在线 SSE 客户端广播具名事件。</summary>
+    static async int Broadcast(string eventName, string data) {
+        int sent = await WorkerSse.BroadcastLocal(eventName, data);
+        if (WorkerSse.sharedBus != null && WorkerSse.sharedBus.IsAvailable()) {
+            WorkerSse.sharedBus.PublishChannel(eventName, data, data.Length);
+        }
+        return sent;
+    }
+
+    /// <summary>跨 Worker 向全集群所有在线 SSE 客户端广播无名事件。</summary>
+    static async int Broadcast(string data) {
+        return await WorkerSse.Broadcast("", data);
+    }
+
+    public static async void OnSharedMessage(int targetType, string channel, int targetId, string payload, int payloadLen) {
+        await WorkerSse.BroadcastLocal(channel, payload);
     }
 
     /// SSE 订阅：读取 GET 请求头后回 200 text/event-stream（带 no-cache 与
@@ -66,14 +170,25 @@ class WorkerSse {
 
             Worker.BumpStat();
             SseConnection sse = SseConnection.Of(client, path);
-            if (WorkerSse.onSseSubscriber != null) {
-                await WorkerSse.onSseSubscriber(sse);
-            } else {
-                sse.Close();
+            WorkerSse.Attach(sse);
+            try {
+                if (WorkerSse.onSseSubscriber != null) {
+                    await WorkerSse.onSseSubscriber(sse);
+                } else {
+                    sse.Close();
+                }
+            } finally {
+                WorkerSse.Detach(sse);
             }
         } finally {
             // The application owns the SseConnection from here.
             w.DropConn();
         }
+    }
+}
+
+class WorkerSseConsumer : IWsSharedBusConsumer {
+    public void OnSharedBusMessage(int targetType, string channel, int targetId, string payload, int payloadLen) {
+        WorkerSse.OnSharedMessage(targetType, channel, targetId, payload, payloadLen);
     }
 }

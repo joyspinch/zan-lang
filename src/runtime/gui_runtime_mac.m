@@ -14,6 +14,8 @@
 #import <QuartzCore/QuartzCore.h>
 #import <IOSurface/IOSurface.h>
 #import <WebKit/WebKit.h>
+#import <pthread.h>
+#import <dispatch/dispatch.h>
 #include <objc/message.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -39,6 +41,31 @@ i32 zan_gui_get_dpi_scale(void);
 i32 zan_gui_wake(void);
 
 #define EXPORT __attribute__((visibility("default")))
+
+/* ---- Main-thread marshalling & exception protection ----
+ * AppKit requires all NSWindow, NSView, NSApplication and CoreAnimation calls
+ * to run on the main thread (thread 0). If called from a coroutine worker or
+ * background thread, automatically marshal to GCD main queue synchronously. */
+#define ZAN_MAC_ENSURE_MAIN_THREAD(expr) \
+    do { \
+        if (!pthread_main_np()) { \
+            __block __typeof__(expr) _zan_res; \
+            dispatch_sync(dispatch_get_main_queue(), ^{ \
+                _zan_res = (expr); \
+            }); \
+            return _zan_res; \
+        } \
+    } while (0)
+
+#define ZAN_MAC_ENSURE_MAIN_THREAD_VOID(expr) \
+    do { \
+        if (!pthread_main_np()) { \
+            dispatch_sync(dispatch_get_main_queue(), ^{ \
+                expr; \
+            }); \
+            return; \
+        } \
+    } while (0)
 
 /* ---- per-window registry ----
  * One process can drive several top-level windows. Each keeps its own view
@@ -367,91 +394,111 @@ static ZanDelegate *g_delegate = nil;
 /* ---- window lifecycle ---- */
 
 EXPORT iptr zan_gui_create_window(const char *title, i32 width, i32 height) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_create_window(title, width, height));
     if (g_mwin_count >= ZAN_MAX_WINDOWS) return 0;
     @autoreleasepool {
-        /* +sharedApplication instantiates the receiver class, so this is what
-         * makes NSApp the CefAppProtocol-conforming subclass; it has to happen
-         * before cef_initialize, i.e. before the first browser is created. */
-        [ZanApplication sharedApplication];
-        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
-        if (!g_delegate) g_delegate = [[ZanDelegate alloc] init];
-        [NSApp setDelegate:g_delegate];
+        @try {
+            /* +sharedApplication instantiates the receiver class, so this is what
+             * makes NSApp the CefAppProtocol-conforming subclass; it has to happen
+             * before cef_initialize, i.e. before the first browser is created. */
+            [ZanApplication sharedApplication];
+            [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+            if (!g_delegate) g_delegate = [[ZanDelegate alloc] init];
+            [NSApp setDelegate:g_delegate];
 
-        /* The ABI takes physical pixels; AppKit's window frame takes points. */
-        CGFloat scale = zan_window_scale(nil);
-        NSRect rect = NSMakeRect(0, 0, (CGFloat)width / scale,
-                                  (CGFloat)height / scale);
-        /* Borderless: the app paints its own title bar/caption buttons, matching
-         * the Win32 (WS_POPUP) and X11 (override caption) backends. Keep the
-         * resizable/miniaturizable capabilities so edge-resize still works. */
-        NSUInteger style = NSWindowStyleMaskBorderless |
-                           NSWindowStyleMaskMiniaturizable |
-                           NSWindowStyleMaskResizable;
-        NSWindow *window = [[ZanWindow alloc] initWithContentRect:rect
-                                               styleMask:style
-                                                 backing:NSBackingStoreBuffered
-                                                   defer:NO];
-        ZanView *view = [[ZanView alloc] initWithFrame:rect];
-        view->frame = NULL;
-        view->iosurf[0] = NULL;
-        view->iosurf[1] = NULL;
-        view->ioW = 0;
-        view->ioH = 0;
-        view->backingIdx = 0;
-        /* Layer-backed: present hands the frame to Core Animation as
-         * layer.contents, so colour conversion and compositing run on the GPU
-         * in the WindowServer instead of a CPU drawRect blit. */
-        [view setWantsLayer:YES];
-        view.layerContentsRedrawPolicy = NSViewLayerContentsRedrawNever;
-        view.layer.contentsGravity = kCAGravityResize;
-        view.layer.opaque = NO;
-        [window setContentView:view];
-        [window makeFirstResponder:view];        /* key/IME input lands on the view */
-        [window setAcceptsMouseMovedEvents:YES]; /* deliver mouseMoved for hover */
-        [window setDelegate:g_delegate];          /* one delegate serves all windows */
-        [window setMovableByWindowBackground:NO]; /* dragging is caption-driven */
-        if (title) {
-            [window setTitle:[NSString stringWithUTF8String:title]];
-        }
-        if (g_mwin_count > 0) {
-            NSRect parent = [g_mwins[0].window frame];
-            NSRect child = [window frame];
-            NSPoint origin = NSMakePoint(
-                NSMidX(parent) - child.size.width / 2.0,
-                NSMidY(parent) - child.size.height / 2.0);
-            NSScreen *screen = [g_mwins[0].window screen];
-            if (screen) {
-                NSRect work = [screen visibleFrame];
-                if (origin.x < NSMinX(work)) origin.x = NSMinX(work);
-                if (origin.y < NSMinY(work)) origin.y = NSMinY(work);
-                if (origin.x + child.size.width > NSMaxX(work))
-                    origin.x = NSMaxX(work) - child.size.width;
-                if (origin.y + child.size.height > NSMaxY(work))
-                    origin.y = NSMaxY(work) - child.size.height;
+            /* The ABI takes physical pixels; AppKit's window frame takes points. */
+            CGFloat scale = zan_window_scale(nil);
+            NSRect rect = NSMakeRect(0, 0, (CGFloat)width / scale,
+                                      (CGFloat)height / scale);
+            /* Borderless: the app paints its own title bar/caption buttons, matching
+             * the Win32 (WS_POPUP) and X11 (override caption) backends. Keep the
+             * resizable/miniaturizable capabilities so edge-resize still works. */
+            NSUInteger style = NSWindowStyleMaskBorderless |
+                               NSWindowStyleMaskMiniaturizable |
+                               NSWindowStyleMaskResizable;
+            NSWindow *window = [[ZanWindow alloc] initWithContentRect:rect
+                                                   styleMask:style
+                                                     backing:NSBackingStoreBuffered
+                                                       defer:NO];
+            ZanView *view = [[ZanView alloc] initWithFrame:rect];
+            view->frame = NULL;
+            view->iosurf[0] = NULL;
+            view->iosurf[1] = NULL;
+            view->ioW = 0;
+            view->ioH = 0;
+            view->backingIdx = 0;
+            /* Layer-backed: present hands the frame to Core Animation as
+             * layer.contents, so colour conversion and compositing run on the GPU
+             * in the WindowServer instead of a CPU drawRect blit. */
+            [view setWantsLayer:YES];
+            view.layerContentsRedrawPolicy = NSViewLayerContentsRedrawNever;
+            view.layer.contentsGravity = kCAGravityResize;
+            view.layer.opaque = NO;
+            [window setContentView:view];
+            [window makeFirstResponder:view];        /* key/IME input lands on the view */
+            [window setAcceptsMouseMovedEvents:YES]; /* deliver mouseMoved for hover */
+            [window setDelegate:g_delegate];          /* one delegate serves all windows */
+            [window setMovableByWindowBackground:NO]; /* dragging is caption-driven */
+            if (title) {
+                [window setTitle:[NSString stringWithUTF8String:title]];
             }
-            [window setFrameOrigin:origin];
-        } else {
-            [window center];
-        }
+            if (g_mwin_count > 0) {
+                NSRect parent = [g_mwins[0].window frame];
+                NSRect child = [window frame];
+                NSPoint origin = NSMakePoint(
+                    NSMidX(parent) - child.size.width / 2.0,
+                    NSMidY(parent) - child.size.height / 2.0);
+                NSScreen *screen = [g_mwins[0].window screen];
+                if (screen) {
+                    NSRect work = [screen visibleFrame];
+                    if (origin.x < NSMinX(work)) origin.x = NSMinX(work);
+                    if (origin.y < NSMinY(work)) origin.y = NSMinY(work);
+                    if (origin.x + child.size.width > NSMaxX(work))
+                        origin.x = NSMaxX(work) - child.size.width;
+                    if (origin.y + child.size.height > NSMaxY(work))
+                        origin.y = NSMaxY(work) - child.size.height;
+                }
+                [window setFrameOrigin:origin];
+            } else {
+                [window center];
+            }
 
-        zan_mwin_t *mw = &g_mwins[g_mwin_count++];
-        mw->window = window;
-        mw->view = view;
-        mw->w = (int)width;
-        mw->h = (int)height;
-        mw->caption_btns = 5;
-        mw->glassFx = nil;
-        return (iptr)window;
+            zan_mwin_t *mw = &g_mwins[g_mwin_count++];
+            mw->window = window;
+            mw->view = view;
+            mw->w = (int)width;
+            mw->h = (int)height;
+            mw->caption_btns = 5;
+            mw->glassFx = nil;
+            return (iptr)window;
+        } @catch (NSException *ex) {
+            fprintf(stderr,
+                "\n=======================================================\n"
+                "[Zan GUI Error] Failed to create NSWindow on macOS:\n"
+                "  Name:   %s\n"
+                "  Reason: %s\n"
+                "=======================================================\n",
+                [[ex name] UTF8String],
+                [[ex reason] UTF8String]);
+            return 0;
+        }
     }
 }
 
 EXPORT i32 zan_gui_show_window(iptr hwnd_val) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_show_window(hwnd_val));
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw) return 1;
     @autoreleasepool {
-        [NSApp activateIgnoringOtherApps:YES];
-        [mw->window makeKeyAndOrderFront:nil];
+        @try {
+            [NSApp activateIgnoringOtherApps:YES];
+            [mw->window makeKeyAndOrderFront:nil];
+        } @catch (NSException *ex) {
+            fprintf(stderr, "[Zan GUI Error] show_window failed: %s: %s\n",
+                    [[ex name] UTF8String], [[ex reason] UTF8String]);
+            return 1;
+        }
     }
     return 0;
 }
@@ -463,31 +510,38 @@ EXPORT i32 zan_gui_show_window(iptr hwnd_val) {
  * acrylic, behind the same Gui.Native.Window.EnableGlass API. tint is unused:
  * macOS derives the material tint from the system appearance. */
 EXPORT i32 zan_gui_enable_glass(iptr hwnd_val, i32 tint_argb) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_enable_glass(hwnd_val, tint_argb));
     (void)tint_argb;
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw) return 1;
     @autoreleasepool {
-        NSWindow *win = mw->window;
-        ZanView *view = (ZanView *)mw->view;
-        [win setOpaque:NO];
-        [win setBackgroundColor:[NSColor clearColor]];
-        if (!mw->glassFx) {
-            NSVisualEffectView *fx =
-                [[NSVisualEffectView alloc] initWithFrame:[view frame]];
-            [fx setMaterial:NSVisualEffectMaterialUnderWindowBackground];
-            [fx setBlendingMode:NSVisualEffectBlendingModeBehindWindow];
-            [fx setState:NSVisualEffectStateActive];
-            [fx setAutoresizingMask:(NSViewWidthSizable | NSViewHeightSizable)];
-            /* Re-parent: the effect view becomes the content view and the
-             * drawing view sits on top so its transparent pixels reveal it. */
-            [win setContentView:fx];
-            [view setFrame:[fx bounds]];
-            [view setAutoresizingMask:(NSViewWidthSizable | NSViewHeightSizable)];
-            [fx addSubview:view];
-            mw->glassFx = fx;
+        @try {
+            NSWindow *win = mw->window;
+            ZanView *view = (ZanView *)mw->view;
+            [win setOpaque:NO];
+            [win setBackgroundColor:[NSColor clearColor]];
+            if (!mw->glassFx) {
+                NSVisualEffectView *fx =
+                    [[NSVisualEffectView alloc] initWithFrame:[view frame]];
+                [fx setMaterial:NSVisualEffectMaterialUnderWindowBackground];
+                [fx setBlendingMode:NSVisualEffectBlendingModeBehindWindow];
+                [fx setState:NSVisualEffectStateActive];
+                [fx setAutoresizingMask:(NSViewWidthSizable | NSViewHeightSizable)];
+                /* Re-parent: the effect view becomes the content view and the
+                 * drawing view sits on top so its transparent pixels reveal it. */
+                [win setContentView:fx];
+                [view setFrame:[fx bounds]];
+                [view setAutoresizingMask:(NSViewWidthSizable | NSViewHeightSizable)];
+                [fx addSubview:view];
+                mw->glassFx = fx;
+            }
+            [view setNeedsDisplay:YES];
+        } @catch (NSException *ex) {
+            fprintf(stderr, "[Zan GUI Error] enable_glass failed: %s: %s\n",
+                    [[ex name] UTF8String], [[ex reason] UTF8String]);
+            return 1;
         }
-        [view setNeedsDisplay:YES];
     }
     return 0;
 }
@@ -495,33 +549,46 @@ EXPORT i32 zan_gui_enable_glass(iptr hwnd_val, i32 tint_argb) {
 /* Revert to an opaque window: pull the drawing view back out as the content
  * view and drop the vibrancy material. */
 EXPORT i32 zan_gui_disable_glass(iptr hwnd_val) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_disable_glass(hwnd_val));
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw) return 1;
     @autoreleasepool {
-        NSWindow *win = mw->window;
-        ZanView *view = (ZanView *)mw->view;
-        if (mw->glassFx) {
-            [view removeFromSuperview];
-            [win setContentView:view];
-            mw->glassFx = nil;
+        @try {
+            NSWindow *win = mw->window;
+            ZanView *view = (ZanView *)mw->view;
+            if (mw->glassFx) {
+                [view removeFromSuperview];
+                [win setContentView:view];
+                mw->glassFx = nil;
+            }
+            [win setOpaque:YES];
+            [win setBackgroundColor:[NSColor windowBackgroundColor]];
+            [view setNeedsDisplay:YES];
+        } @catch (NSException *ex) {
+            fprintf(stderr, "[Zan GUI Error] disable_glass failed: %s: %s\n",
+                    [[ex name] UTF8String], [[ex reason] UTF8String]);
+            return 1;
         }
-        [win setOpaque:YES];
-        [win setBackgroundColor:[NSColor windowBackgroundColor]];
-        [view setNeedsDisplay:YES];
     }
     return 0;
 }
 
 EXPORT i32 zan_gui_close_window(iptr hwnd_val) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_close_window(hwnd_val));
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count == 1) mw = &g_mwins[0];
     if (!mw) return 0;
     @autoreleasepool {
-        ZanView *view = (ZanView *)mw->view;
-        if (view && view->frame) { CGImageRelease(view->frame); view->frame = NULL; }
-        [mw->window setDelegate:nil];
-        [mw->window close];
+        @try {
+            ZanView *view = (ZanView *)mw->view;
+            if (view && view->frame) { CGImageRelease(view->frame); view->frame = NULL; }
+            [mw->window setDelegate:nil];
+            [mw->window close];
+        } @catch (NSException *ex) {
+            fprintf(stderr, "[Zan GUI Error] close_window failed: %s: %s\n",
+                    [[ex name] UTF8String], [[ex reason] UTF8String]);
+        }
     }
     int idx = (int)(mw - g_mwins);
     g_mwins[idx] = g_mwins[--g_mwin_count];
@@ -686,22 +753,32 @@ static void decode_event(NSEvent *ev) {
 }
 
 static i64 pump(bool wait) {
+    if (!pthread_main_np()) {
+        fprintf(stderr, "[Zan GUI Error] Event loop (zan_gui_wait_event / poll_event) must run on the main thread!\n");
+        return -1;
+    }
     if (g_mwin_count == 0) return -1;
     if (evq_pop()) return 0;               /* drain already-decoded events first */
     memset(g_evt, 0, sizeof(g_evt));
     @autoreleasepool {
-        for (;;) {
-            NSDate *until = wait ? [NSDate distantFuture] : [NSDate distantPast];
-            NSEvent *ev = [NSApp nextEventMatchingMask:NSEventMaskAny
-                                             untilDate:until
-                                                inMode:NSDefaultRunLoopMode
-                                               dequeue:YES];
-            if (!ev) return 1;             /* nothing pending (poll) */
-            decode_event(ev);
-            [NSApp sendEvent:ev];          /* keep the window responsive */
-            if (evq_pop()) return 0;
-            if (!wait) return 1;           /* polled event produced nothing decodable */
-            /* wait: keep pumping until an event decodes into something */
+        @try {
+            for (;;) {
+                NSDate *until = wait ? [NSDate distantFuture] : [NSDate distantPast];
+                NSEvent *ev = [NSApp nextEventMatchingMask:NSEventMaskAny
+                                                 untilDate:until
+                                                    inMode:NSDefaultRunLoopMode
+                                                   dequeue:YES];
+                if (!ev) return 1;             /* nothing pending (poll) */
+                decode_event(ev);
+                [NSApp sendEvent:ev];          /* keep the window responsive */
+                if (evq_pop()) return 0;
+                if (!wait) return 1;           /* polled event produced nothing decodable */
+                /* wait: keep pumping until an event decodes into something */
+            }
+        } @catch (NSException *ex) {
+            fprintf(stderr, "[Zan GUI Error] Exception in pump: %s: %s\n",
+                    [[ex name] UTF8String], [[ex reason] UTF8String]);
+            return -1;
         }
     }
 }
@@ -714,21 +791,31 @@ EXPORT i32 zan_gui_poll_event(void) { return pump(false); }
  * in the kernel (nextEventMatchingMask blocks) until either input arrives or
  * its next frame deadline -- far cheaper than poll + sleep slices. */
 EXPORT i32 zan_gui_wait_event_timeout(i32 ms) {
+    if (!pthread_main_np()) {
+        fprintf(stderr, "[Zan GUI Error] Event loop (zan_gui_wait_event_timeout) must run on the main thread!\n");
+        return -1;
+    }
     if (g_mwin_count == 0) return -1;
     if (evq_pop()) return 0;
     memset(g_evt, 0, sizeof(g_evt));
     if (ms < 0) ms = 0;
     @autoreleasepool {
-        NSDate *until = [NSDate dateWithTimeIntervalSinceNow:(double)ms / 1000.0];
-        for (;;) {
-            NSEvent *ev = [NSApp nextEventMatchingMask:NSEventMaskAny
-                                             untilDate:until
-                                                inMode:NSDefaultRunLoopMode
-                                               dequeue:YES];
-            if (!ev) return 1;             /* deadline reached */
-            decode_event(ev);
-            [NSApp sendEvent:ev];
-            if (evq_pop()) return 0;
+        @try {
+            NSDate *until = [NSDate dateWithTimeIntervalSinceNow:(double)ms / 1000.0];
+            for (;;) {
+                NSEvent *ev = [NSApp nextEventMatchingMask:NSEventMaskAny
+                                                 untilDate:until
+                                                    inMode:NSDefaultRunLoopMode
+                                                   dequeue:YES];
+                if (!ev) return 1;             /* deadline reached */
+                decode_event(ev);
+                [NSApp sendEvent:ev];
+                if (evq_pop()) return 0;
+            }
+        } @catch (NSException *ex) {
+            fprintf(stderr, "[Zan GUI Error] Exception in wait_event_timeout: %s: %s\n",
+                    [[ex name] UTF8String], [[ex reason] UTF8String]);
+            return -1;
         }
     }
 }
@@ -787,19 +874,28 @@ EXPORT void zan_gui_present_full(void) {
 
 /* Re-center a window on the screen it currently sits on. */
 EXPORT i32 zan_gui_center_window(iptr hwnd_val) {
-    zan_mwin_t *mw = mwin_find((long)hwnd_val);
-    NSWindow *win = mw ? mw->window
-                       : (g_mwin_count > 0 ? g_mwins[0].window : nil);
-    if (!win) return 0;
-    NSScreen *screen = [win screen];
-    if (!screen) screen = [NSScreen mainScreen];
-    if (!screen) { [win center]; return 1; }
-    NSRect vis = [screen visibleFrame];
-    NSRect f = [win frame];
-    NSPoint o = NSMakePoint(vis.origin.x + (vis.size.width - f.size.width) / 2.0,
-                            vis.origin.y + (vis.size.height - f.size.height) / 2.0);
-    [win setFrameOrigin:o];
-    return 1;
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_center_window(hwnd_val));
+    @autoreleasepool {
+        @try {
+            zan_mwin_t *mw = mwin_find((long)hwnd_val);
+            NSWindow *win = mw ? mw->window
+                               : (g_mwin_count > 0 ? g_mwins[0].window : nil);
+            if (!win) return 0;
+            NSScreen *screen = [win screen];
+            if (!screen) screen = [NSScreen mainScreen];
+            if (!screen) { [win center]; return 1; }
+            NSRect vis = [screen visibleFrame];
+            NSRect f = [win frame];
+            NSPoint o = NSMakePoint(vis.origin.x + (vis.size.width - f.size.width) / 2.0,
+                                    vis.origin.y + (vis.size.height - f.size.height) / 2.0);
+            [win setFrameOrigin:o];
+            return 1;
+        } @catch (NSException *ex) {
+            fprintf(stderr, "[Zan GUI Error] center_window failed: %s: %s\n",
+                    [[ex name] UTF8String], [[ex reason] UTF8String]);
+            return 0;
+        }
+    }
 }
 
 EXPORT i32 zan_gui_event_kind(void)    { return g_evt[0]; }
@@ -1068,6 +1164,7 @@ EXPORT i32 zan_gui_client_height(iptr hwnd_val) {
 EXPORT i32 zan_gui_titlebar_height(void) { return (i32)zan_titlebar_h(); }
 EXPORT i32 zan_gui_caption_button_width(void) { return (i32)zan_caption_btn_w(); }
 EXPORT i32 zan_gui_set_caption_buttons(iptr hwnd_val, i32 count) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_set_caption_buttons(hwnd_val, count));
     if (count < 0 || count > 8) return 0;
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (mw) mw->caption_btns = (int)count;
@@ -1078,6 +1175,7 @@ EXPORT i32 zan_gui_set_caption_buttons(iptr hwnd_val, i32 count) {
 /* ---- present: blit the software surface to the window ---- */
 
 EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_present(hwnd_val, surface_id));
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw || !mw->view) return 1;
@@ -1087,46 +1185,52 @@ EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
     if (!pixels || w <= 0 || h <= 0) return 1;
 
     @autoreleasepool {
-        if (view->ioW != w || view->ioH != h ||
-            !view->iosurf[0] || !view->iosurf[1]) {
-            for (int i = 0; i < 2; i++) {
-                if (view->iosurf[i]) { CFRelease(view->iosurf[i]); view->iosurf[i] = NULL; }
-                NSDictionary *props = @{
-                    (__bridge NSString *)kIOSurfaceWidth: @(w),
-                    (__bridge NSString *)kIOSurfaceHeight: @(h),
-                    (__bridge NSString *)kIOSurfaceBytesPerElement: @4,
-                    (__bridge NSString *)kIOSurfacePixelFormat: @((uint32_t)'BGRA'),
-                };
-                view->iosurf[i] = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+        @try {
+            if (view->ioW != w || view->ioH != h ||
+                !view->iosurf[0] || !view->iosurf[1]) {
+                for (int i = 0; i < 2; i++) {
+                    if (view->iosurf[i]) { CFRelease(view->iosurf[i]); view->iosurf[i] = NULL; }
+                    NSDictionary *props = @{
+                        (__bridge NSString *)kIOSurfaceWidth: @(w),
+                        (__bridge NSString *)kIOSurfaceHeight: @(h),
+                        (__bridge NSString *)kIOSurfaceBytesPerElement: @4,
+                        (__bridge NSString *)kIOSurfacePixelFormat: @((uint32_t)'BGRA'),
+                    };
+                    view->iosurf[i] = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+                }
+                view->ioW = w;
+                view->ioH = h;
             }
-            view->ioW = w;
-            view->ioH = h;
-        }
-        view->backingIdx = 1 - view->backingIdx;
-        IOSurfaceRef surf = view->iosurf[view->backingIdx];
-        if (!surf) return 1;
-        /* Surface pixels are 0xAARRGGBB in memory (little-endian bytes
-         * B,G,R,A) which is exactly IOSurface 'BGRA'; row-copy into the
-         * surface and hand it to the layer -- the WindowServer composites it
-         * on the GPU with no CPU format/colour conversion. */
-        IOSurfaceLock(surf, 0, NULL);
-        uint8_t *dst = (uint8_t *)IOSurfaceGetBaseAddress(surf);
-        size_t dbpr = IOSurfaceGetBytesPerRow(surf);
-        size_t sbpr = (size_t)stride * 4;
-        size_t row = (size_t)w * 4;
-        for (int py = 0; py < h; py++)
-            memcpy(dst + (size_t)py * dbpr,
-                   (const uint8_t *)pixels + (size_t)py * sbpr, row);
-        IOSurfaceUnlock(surf, 0, NULL);
-        CALayer *layer = [view layer];
-        if (layer) {
-            [CATransaction begin];
-            [CATransaction setDisableActions:YES];
-            /* The layer receives a physical-pixel bitmap; contentsScale maps
-             * those pixels to AppKit points without an additional stretch. */
-            layer.contentsScale = zan_window_scale([view window]);
-            layer.contents = (__bridge id)surf;
-            [CATransaction commit];
+            view->backingIdx = 1 - view->backingIdx;
+            IOSurfaceRef surf = view->iosurf[view->backingIdx];
+            if (!surf) return 1;
+            /* Surface pixels are 0xAARRGGBB in memory (little-endian bytes
+             * B,G,R,A) which is exactly IOSurface 'BGRA'; row-copy into the
+             * surface and hand it to the layer -- the WindowServer composites it
+             * on the GPU with no CPU format/colour conversion. */
+            IOSurfaceLock(surf, 0, NULL);
+            uint8_t *dst = (uint8_t *)IOSurfaceGetBaseAddress(surf);
+            size_t dbpr = IOSurfaceGetBytesPerRow(surf);
+            size_t sbpr = (size_t)stride * 4;
+            size_t row = (size_t)w * 4;
+            for (int py = 0; py < h; py++)
+                memcpy(dst + (size_t)py * dbpr,
+                       (const uint8_t *)pixels + (size_t)py * sbpr, row);
+            IOSurfaceUnlock(surf, 0, NULL);
+            CALayer *layer = [view layer];
+            if (layer) {
+                [CATransaction begin];
+                [CATransaction setDisableActions:YES];
+                /* The layer receives a physical-pixel bitmap; contentsScale maps
+                 * those pixels to AppKit points without an additional stretch. */
+                layer.contentsScale = zan_window_scale([view window]);
+                layer.contents = (__bridge id)surf;
+                [CATransaction commit];
+            }
+        } @catch (NSException *ex) {
+            fprintf(stderr, "[Zan GUI Error] present failed: %s: %s\n",
+                    [[ex name] UTF8String], [[ex reason] UTF8String]);
+            return 1;
         }
     }
     return 0;
@@ -1135,22 +1239,35 @@ EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
 /* ---- misc ---- */
 
 EXPORT i32 zan_gui_set_title(iptr hwnd_val, const char *title) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_set_title(hwnd_val, title));
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (mw && title) {
-        @autoreleasepool { [mw->window setTitle:[NSString stringWithUTF8String:title]]; }
+        @autoreleasepool {
+            @try {
+                [mw->window setTitle:[NSString stringWithUTF8String:title]];
+            } @catch (NSException *ex) {
+                fprintf(stderr, "[Zan GUI Error] set_title failed: %s: %s\n",
+                        [[ex name] UTF8String], [[ex reason] UTF8String]);
+            }
+        }
     }
     return 0;
 }
 
 EXPORT i32 zan_gui_set_cursor(i32 cursor) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_set_cursor(cursor));
     @autoreleasepool {
-        switch (cursor) {
-        case 1:  [[NSCursor pointingHandCursor] set]; break;
-        case 2:  [[NSCursor IBeamCursor] set]; break;
-        case 3:  [[NSCursor resizeLeftRightCursor] set]; break;
-        case 4:  [[NSCursor resizeUpDownCursor] set]; break;
-        default: [[NSCursor arrowCursor] set]; break;
+        @try {
+            switch (cursor) {
+            case 1:  [[NSCursor pointingHandCursor] set]; break;
+            case 2:  [[NSCursor IBeamCursor] set]; break;
+            case 3:  [[NSCursor resizeLeftRightCursor] set]; break;
+            case 4:  [[NSCursor resizeUpDownCursor] set]; break;
+            default: [[NSCursor arrowCursor] set]; break;
+            }
+        } @catch (NSException *ex) {
+            return 1;
         }
     }
     return 0;
@@ -1169,79 +1286,131 @@ EXPORT void zan_gui_sleep_ms(i32 ms) {
 /* ---- window management ---- */
 
 EXPORT i32 zan_gui_minimize(iptr hwnd_val) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_minimize(hwnd_val));
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
-    if (mw) { @autoreleasepool { [mw->window miniaturize:nil]; } }
+    if (mw) {
+        @autoreleasepool {
+            @try {
+                [mw->window miniaturize:nil];
+            } @catch (NSException *ex) {
+                return 1;
+            }
+        }
+    }
     return 0;
 }
 
 EXPORT i32 zan_gui_toggle_maximize(iptr hwnd_val) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_toggle_maximize(hwnd_val));
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
-    if (mw) { @autoreleasepool { [mw->window zoom:nil]; } }
+    if (mw) {
+        @autoreleasepool {
+            @try {
+                [mw->window zoom:nil];
+            } @catch (NSException *ex) {
+                return 1;
+            }
+        }
+    }
     return 0;
 }
 
 EXPORT i32 zan_gui_is_maximized(iptr hwnd_val) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_is_maximized(hwnd_val));
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw) return 0;
-    return [mw->window isZoomed] ? 1 : 0;
+    @autoreleasepool {
+        @try {
+            return [mw->window isZoomed] ? 1 : 0;
+        } @catch (NSException *ex) {
+            return 0;
+        }
+    }
 }
 
 /* 1 while any part of the window can be seen (not miniaturized and not fully
  * occluded by other windows); ambient animations pause while this reports 0. */
 EXPORT i32 zan_gui_window_visible(iptr hwnd_val) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_window_visible(hwnd_val));
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw) return 0;
     @autoreleasepool {
-        if ([mw->window isMiniaturized]) return 0;
-        return ([mw->window occlusionState] & NSWindowOcclusionStateVisible)
-            ? 1 : 0;
+        @try {
+            if ([mw->window isMiniaturized]) return 0;
+            return ([mw->window occlusionState] & NSWindowOcclusionStateVisible)
+                ? 1 : 0;
+        } @catch (NSException *ex) {
+            return 0;
+        }
     }
 }
 
 /* 1 while the window is the key window -- see the X11 backend. */
 EXPORT i32 zan_gui_window_focused(iptr hwnd_val) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_window_focused(hwnd_val));
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw) return 0;
     @autoreleasepool {
-        return [mw->window isKeyWindow] ? 1 : 0;
+        @try {
+            return [mw->window isKeyWindow] ? 1 : 0;
+        } @catch (NSException *ex) {
+            return 0;
+        }
     }
 }
 
 EXPORT i32 zan_gui_set_topmost(iptr hwnd_val, i32 on) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_set_topmost(hwnd_val, on));
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (mw) {
-        [mw->window setLevel:(on ? NSFloatingWindowLevel : NSNormalWindowLevel)];
+        @autoreleasepool {
+            @try {
+                [mw->window setLevel:(on ? NSFloatingWindowLevel : NSNormalWindowLevel)];
+            } @catch (NSException *ex) {
+                return 1;
+            }
+        }
     }
     return 0;
 }
 
 /* Whole-window opacity, 10..100 percent. */
 EXPORT i32 zan_gui_set_opacity(iptr hwnd_val, i32 percent) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_set_opacity(hwnd_val, percent));
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw) return 1;
     if (percent < 10) percent = 10;
     if (percent > 100) percent = 100;
     @autoreleasepool {
-        [mw->window setAlphaValue:((CGFloat)percent / 100.0)];
-        [mw->window setOpaque:(percent >= 100 ? YES : NO)];
+        @try {
+            [mw->window setAlphaValue:((CGFloat)percent / 100.0)];
+            [mw->window setOpaque:(percent >= 100 ? YES : NO)];
+        } @catch (NSException *ex) {
+            return 1;
+        }
     }
     return 0;
 }
 
 EXPORT i32 zan_gui_get_dpi_scale(void) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_get_dpi_scale());
     @autoreleasepool {
-        NSWindow *w = g_mwin_count > 0 ? g_mwins[0].window : nil;
-        CGFloat scale = w ? [w backingScaleFactor]
-                          : [[NSScreen mainScreen] backingScaleFactor];
-        if (scale <= 0) scale = 1.0;
-        return (i64)(scale * 100.0 + 0.5);
+        @try {
+            NSWindow *w = g_mwin_count > 0 ? g_mwins[0].window : nil;
+            CGFloat scale = w ? [w backingScaleFactor]
+                              : [[NSScreen mainScreen] backingScaleFactor];
+            if (scale <= 0) scale = 1.0;
+            return (i64)(scale * 100.0 + 0.5);
+        } @catch (NSException *ex) {
+            return 100;
+        }
     }
 }
 
@@ -1564,6 +1733,7 @@ static WKWebsiteDataStore *wv_store_for_profile(const char *profile_id) {
 }
 
 EXPORT i32 zan_gui_webview_create(iptr hwnd_val, const char *profile_id) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_webview_create(hwnd_val, profile_id));
     zan_mwin_t *mw = mwin_find(hwnd_val);
     if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
     if (!mw || !mw->view) return 0;
@@ -1573,47 +1743,54 @@ EXPORT i32 zan_gui_webview_create(iptr hwnd_val, const char *profile_id) {
     }
     if (slot < 0) return 0;
     @autoreleasepool {
-        WKWebViewConfiguration *cfg = [[WKWebViewConfiguration alloc] init];
-        /* Enable the context-menu "Inspect Element" so embedded pages can be
-         * debugged from within the app (the Windows peer opens DevTools
-         * programmatically via ICoreWebView2::OpenDevToolsWindow; WebKit has
-         * no programmatic opener). KVC because older SDKs lack the property. */
-        [cfg.preferences setValue:@YES forKey:@"developerExtrasEnabled"];
-        WKWebsiteDataStore *ds = wv_store_for_profile(profile_id);
-        if (ds) cfg.websiteDataStore = ds;
-        WKWebView *wv = [[WKWebView alloc] initWithFrame:NSMakeRect(0, 0, 100, 100)
-                                           configuration:cfg];
-        [cfg release];
-        ZanWebViewDelegate *d = [[ZanWebViewDelegate alloc] init];
-        d.slot = slot;
-        wv.navigationDelegate = d;   /* weak; the +1 from alloc keeps it alive */
-        wv.UIDelegate = d;
-        [wv setHidden:YES];
-        [mw->view addSubview:wv];    /* view retains wv; keep our +1 too */
+        @try {
+            WKWebViewConfiguration *cfg = [[WKWebViewConfiguration alloc] init];
+            /* Enable the context-menu "Inspect Element" so embedded pages can be
+             * debugged from within the app (the Windows peer opens DevTools
+             * programmatically via ICoreWebView2::OpenDevToolsWindow; WebKit has
+             * no programmatic opener). KVC because older SDKs lack the property. */
+            [cfg.preferences setValue:@YES forKey:@"developerExtrasEnabled"];
+            WKWebsiteDataStore *ds = wv_store_for_profile(profile_id);
+            if (ds) cfg.websiteDataStore = ds;
+            WKWebView *wv = [[WKWebView alloc] initWithFrame:NSMakeRect(0, 0, 100, 100)
+                                               configuration:cfg];
+            [cfg release];
+            ZanWebViewDelegate *d = [[ZanWebViewDelegate alloc] init];
+            d.slot = slot;
+            wv.navigationDelegate = d;   /* weak; the +1 from alloc keeps it alive */
+            wv.UIDelegate = d;
+            [wv setHidden:YES];
+            [mw->view addSubview:wv];    /* view retains wv; keep our +1 too */
 
-        zan_webview_t *w = &g_webviews[slot];
-        w->used = 1;
-        w->wv = wv;
-        w->delegate = d;
-        w->ownerWindow = mw->window;
-        w->navSeq = 0;
-        w->lastStatus = 0;
-        w->urlBuf = NULL;
-        w->titleBuf = NULL;
-        w->lastReqBuf = NULL;
-        w->evalBuf = NULL;
-        w->cookieBuf = NULL;
-        w->clipSpec = NULL;
-        w->msgCount = 0;
-        w->msgDrops = 0;
-        w->msgBuf = NULL;
-        w->msgHandler = nil;
-        w->msgNames = nil;
+            zan_webview_t *w = &g_webviews[slot];
+            w->used = 1;
+            w->wv = wv;
+            w->delegate = d;
+            w->ownerWindow = mw->window;
+            w->navSeq = 0;
+            w->lastStatus = 0;
+            w->urlBuf = NULL;
+            w->titleBuf = NULL;
+            w->lastReqBuf = NULL;
+            w->evalBuf = NULL;
+            w->cookieBuf = NULL;
+            w->clipSpec = NULL;
+            w->msgCount = 0;
+            w->msgDrops = 0;
+            w->msgBuf = NULL;
+            w->msgHandler = nil;
+            w->msgNames = nil;
+        } @catch (NSException *ex) {
+            fprintf(stderr, "[Zan GUI Error] webview_create failed: %s: %s\n",
+                    [[ex name] UTF8String], [[ex reason] UTF8String]);
+            return 0;
+        }
     }
     return (i64)(slot + 1);
 }
 
 EXPORT void zan_gui_webview_destroy(i32 h) {
+    ZAN_MAC_ENSURE_MAIN_THREAD_VOID(zan_gui_webview_destroy(h));
     if (h < 1 || h > ZAN_MAX_WEBVIEWS) return;
     zan_webview_t *w = &g_webviews[(int)h - 1];
     if (!w->used) return;
@@ -1647,6 +1824,7 @@ EXPORT void zan_gui_webview_destroy(i32 h) {
 }
 
 EXPORT void zan_gui_webview_set_frame(i32 h, i32 x, i32 y, i32 w, i32 hh) {
+    ZAN_MAC_ENSURE_MAIN_THREAD_VOID(zan_gui_webview_set_frame(h, x, y, w, hh));
     WKWebView *wv = wv_get(h);
     if (!wv) return;
     CGFloat scale = zan_window_scale([wv window]);
@@ -1664,6 +1842,7 @@ EXPORT void zan_gui_webview_set_frame(i32 h, i32 x, i32 y, i32 w, i32 hh) {
 }
 
 EXPORT void zan_gui_webview_set_visible(i32 h, i32 visible) {
+    ZAN_MAC_ENSURE_MAIN_THREAD_VOID(zan_gui_webview_set_visible(h, visible));
     WKWebView *wv = wv_get(h);
     if (!wv) return;
     [wv setHidden:(visible ? NO : YES)];
@@ -1678,6 +1857,7 @@ EXPORT void zan_gui_webview_set_visible(i32 h, i32 visible) {
  * covers the whole frame drops the mask entirely (no mask = no compositing
  * cost while nothing overlaps the page). */
 EXPORT void zan_gui_webview_set_clip(i32 h, const char *spec) {
+    ZAN_MAC_ENSURE_MAIN_THREAD_VOID(zan_gui_webview_set_clip(h, spec));
     WKWebView *wv = wv_get(h);
     if (!wv) return;
     if (!spec || !*spec) {
@@ -1748,6 +1928,7 @@ EXPORT void zan_gui_webview_set_clip(i32 h, const char *spec) {
 }
 
 EXPORT void zan_gui_webview_navigate(i32 h, const char *url) {
+    ZAN_MAC_ENSURE_MAIN_THREAD_VOID(zan_gui_webview_navigate(h, url));
     WKWebView *wv = wv_get(h);
     if (!wv || !url || !*url) return;
     @autoreleasepool {
@@ -1761,6 +1942,7 @@ EXPORT void zan_gui_webview_navigate(i32 h, const char *url) {
 }
 
 EXPORT void zan_gui_webview_load_html(i32 h, const char *html, const char *base_url) {
+    ZAN_MAC_ENSURE_MAIN_THREAD_VOID(zan_gui_webview_load_html(h, html, base_url));
     WKWebView *wv = wv_get(h);
     if (!wv || !html) return;
     @autoreleasepool {
@@ -1773,21 +1955,25 @@ EXPORT void zan_gui_webview_load_html(i32 h, const char *html, const char *base_
 }
 
 EXPORT void zan_gui_webview_back(i32 h) {
+    ZAN_MAC_ENSURE_MAIN_THREAD_VOID(zan_gui_webview_back(h));
     WKWebView *wv = wv_get(h);
     if (wv && [wv canGoBack]) [wv goBack];
 }
 
 EXPORT void zan_gui_webview_forward(i32 h) {
+    ZAN_MAC_ENSURE_MAIN_THREAD_VOID(zan_gui_webview_forward(h));
     WKWebView *wv = wv_get(h);
     if (wv && [wv canGoForward]) [wv goForward];
 }
 
 EXPORT void zan_gui_webview_reload(i32 h) {
+    ZAN_MAC_ENSURE_MAIN_THREAD_VOID(zan_gui_webview_reload(h));
     WKWebView *wv = wv_get(h);
     if (wv) [wv reload];
 }
 
 EXPORT void zan_gui_webview_stop(i32 h) {
+    ZAN_MAC_ENSURE_MAIN_THREAD_VOID(zan_gui_webview_stop(h));
     WKWebView *wv = wv_get(h);
     if (wv) [wv stopLoading];
 }
@@ -2102,11 +2288,16 @@ EXPORT void zan_gui_webview_set_zoom(i32 h, i32 percent) {
 }
 
 EXPORT i32 zan_gui_set_clipboard(const char *utf8) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_set_clipboard(utf8));
     @autoreleasepool {
-        NSPasteboard *pb = [NSPasteboard generalPasteboard];
-        [pb clearContents];
-        NSString *s = [NSString stringWithUTF8String:(utf8 ? utf8 : "")];
-        [pb setString:(s ? s : @"") forType:NSPasteboardTypeString];
+        @try {
+            NSPasteboard *pb = [NSPasteboard generalPasteboard];
+            [pb clearContents];
+            NSString *s = [NSString stringWithUTF8String:(utf8 ? utf8 : "")];
+            [pb setString:(s ? s : @"") forType:NSPasteboardTypeString];
+        } @catch (NSException *ex) {
+            return 1;
+        }
     }
     return 0;
 }
@@ -2115,16 +2306,21 @@ EXPORT i32 zan_gui_set_clipboard(const char *utf8) {
  * returns a NUL-terminated i8* valid until the next call (the previous buffer
  * is freed each time), or "" when the pasteboard holds no text. */
 EXPORT const char *zan_gui_get_clipboard(void) {
+    ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_get_clipboard());
     static char *g_clip_buf = NULL;
     @autoreleasepool {
-        NSPasteboard *pb = [NSPasteboard generalPasteboard];
-        NSString *s = [pb stringForType:NSPasteboardTypeString];
-        const char *utf8 = s ? [s UTF8String] : NULL;
-        if (!utf8) return "";
-        char *nb = strdup(utf8);
-        if (!nb) return "";
-        free(g_clip_buf);
-        g_clip_buf = nb;
-        return g_clip_buf;
+        @try {
+            NSPasteboard *pb = [NSPasteboard generalPasteboard];
+            NSString *s = [pb stringForType:NSPasteboardTypeString];
+            const char *utf8 = s ? [s UTF8String] : NULL;
+            if (!utf8) return "";
+            char *nb = strdup(utf8);
+            if (!nb) return "";
+            free(g_clip_buf);
+            g_clip_buf = nb;
+            return g_clip_buf;
+        } @catch (NSException *ex) {
+            return "";
+        }
     }
 }

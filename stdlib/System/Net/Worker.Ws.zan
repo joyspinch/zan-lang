@@ -24,13 +24,101 @@ class WorkerWs {
     /// through its own Main.</summary>
     static void Install() {
         Worker.wsEntry = WorkerWs.HandleWebSocket;
+        WorkerWs.EnableSharedBus("zan_ws_worker_bus");
+    }
+
+    // ---- 跨进程消息总线与频道/房间管理 ----
+    static WsSharedBus sharedBus = null;
+    static WorkerWsConsumer busConsumer = null;
+    static Dict<string, List<Connection>> channels = new Dict<string, List<Connection>>();
+    static nint chanLock = 0;
+
+    static void ChanInit() {
+        if (WorkerWs.chanLock == 0) { WorkerWs.chanLock = Mutex.Create(); }
+    }
+
+    /// <summary>启用基于 SharedTable 共享内存的跨 Worker 进程 WebSocket 消息总线。</summary>
+    static void EnableSharedBus(string busName) {
+        if (WorkerWs.sharedBus != null) { return; }
+        WorkerWs.sharedBus = new WsSharedBus(busName, 128);
+        if (WorkerWs.sharedBus.IsAvailable()) {
+            WorkerWs.busConsumer = new WorkerWsConsumer();
+            WorkerWs.sharedBus.StartPolling(WorkerWs.busConsumer);
+        }
+    }
+
+    /// <summary>订阅者加入频道/房间。</summary>
+    static void Join(string channel, Connection conn) {
+        if (conn == null || channel == "") { return; }
+        WorkerWs.ChanInit();
+        Mutex.Lock(WorkerWs.chanLock);
+        List<Connection> list = null;
+        if (WorkerWs.channels.ContainsKey(channel)) {
+            list = WorkerWs.channels[channel];
+        } else {
+            list = new List<Connection>();
+            WorkerWs.channels.Add(channel, list);
+        }
+        int id = conn.GetId();
+        bool exists = false;
+        for (int i = 0; i < list.Count; i = i + 1) {
+            if (list[i].GetId() == id) {
+                exists = true;
+                break;
+            }
+        }
+        if (!exists) {
+            list.Add(conn);
+        }
+        Mutex.Unlock(WorkerWs.chanLock);
+    }
+
+    /// <summary>订阅者离开频道/房间。</summary>
+    static void Leave(string channel, Connection conn) {
+        if (conn == null || channel == "") { return; }
+        WorkerWs.ChanInit();
+        Mutex.Lock(WorkerWs.chanLock);
+        if (WorkerWs.channels.ContainsKey(channel)) {
+            List<Connection> list = WorkerWs.channels[channel];
+            int id = conn.GetId();
+            for (int i = 0; i < list.Count; i = i + 1) {
+                if (list[i].GetId() == id) {
+                    list.RemoveAt(i);
+                    break;
+                }
+            }
+            if (list.Count == 0) {
+                WorkerWs.channels.Remove(channel);
+            }
+        }
+        Mutex.Unlock(WorkerWs.chanLock);
+    }
+
+    /// <summary>断开时从所有频道中自动清理该连接。</summary>
+    static void LeaveAllChannels(Connection conn) {
+        if (conn == null) { return; }
+        WorkerWs.ChanInit();
+        Mutex.Lock(WorkerWs.chanLock);
+        int id = conn.GetId();
+        List<string> keys = WorkerWs.channels.Keys;
+        for (int k = 0; k < keys.Count; k = k + 1) {
+            string ch = keys[k];
+            List<Connection> list = WorkerWs.channels[ch];
+            for (int i = 0; i < list.Count; i = i + 1) {
+                if (list[i].GetId() == id) {
+                    list.RemoveAt(i);
+                    break;
+                }
+            }
+        }
+        Mutex.Unlock(WorkerWs.chanLock);
     }
 
     // ---- 连接注册表（对标 workerman $server->connections）----
 
     // Upgrade 成功时登记，连接结束/回调关闭后移除。
     // 使用 Dict<int, WsLink> 确保高并发长连接增删查与反查均为严格 O(1)。
-    // 多 worker 进程时注册表是进程内的——跨进程广播属 SharedTable/事件总线范畴。
+    // 多 worker 进程时注册表是进程内的——跨进程广播经 WsSharedBus 分发。
     static Dict<int, WsLink> conns = new Dict<int, WsLink>();
     // 同步段进出 WS 连接协程用的互斥（--async-workers 下连接协程跑在
     // 不同线程，Dict 本身不是线程安全）。
@@ -56,6 +144,9 @@ class WorkerWs {
         }
         WorkerWs.conns.Add(id, link);
         Mutex.Unlock(WorkerWs.regLock);
+        if (WorkerWs.sharedBus != null) {
+            WorkerWs.sharedBus.OnConnChange(1);
+        }
     }
 
     /// 连接结束后由 HandleWebSocket 调用（O(1) 删除）。
@@ -67,6 +158,10 @@ class WorkerWs {
             WorkerWs.conns.Remove(id);
         }
         Mutex.Unlock(WorkerWs.regLock);
+        WorkerWs.LeaveAllChannels(conn);
+        if (WorkerWs.sharedBus != null) {
+            WorkerWs.sharedBus.OnConnChange(-1);
+        }
     }
 
     /// 按连接 id 找注册项；不存在（已断开）返回 null（O(1) 哈希查找）。
@@ -90,6 +185,14 @@ class WorkerWs {
         return n;
     }
 
+    /// <summary>获取集群跨 Worker 实时在线 WebSocket 连接总数。</summary>
+    static int ClusterConnCount() {
+        if (WorkerWs.sharedBus != null && WorkerWs.sharedBus.IsAvailable()) {
+            return WorkerWs.sharedBus.GetTotalConnCount();
+        }
+        return WorkerWs.ConnCount();
+    }
+
     /// <summary>按连接 id 取在线连接；不存在（已断开）返回 null。
     /// 用于定时器等无引用上下文里找回连接后 WorkerWs.Push(conn, ...)。</summary>
     static Connection ConnById(int id) {
@@ -98,10 +201,8 @@ class WorkerWs {
         return link.conn;
     }
 
-    /// <summary>向所有在线 WebSocket 连接广播一条 Text 帧，返回成功
-    /// 投递数。快照在锁内拷出、Push 在锁外执行——Push 是 await 点，
-    /// 决不能持锁挂起。断开的连接由其帧循环稍后自行移除。</summary>
-    static async int Broadcast(string data) {
+    /// <summary>向本进程内所有在线 WebSocket 连接广播一条 Text 帧，返回成功投递数。</summary>
+    static async int BroadcastLocal(string data) {
         WorkerWs.RegInit();
         Mutex.Lock(WorkerWs.regLock);
         List<WsLink> snap = WorkerWs.conns.Values;
@@ -114,6 +215,75 @@ class WorkerWs {
             j = j + 1;
         }
         return sent;
+    }
+
+    /// <summary>向所有 Worker 进程的所有在线 WebSocket 连接全局广播一条 Text 帧。
+    /// 本进程连接立即本地推送，其他 Worker 进程经 SharedTable 环形总线接收后推送。</summary>
+    static async int Broadcast(string data) {
+        int sent = await WorkerWs.BroadcastLocal(data);
+        if (WorkerWs.sharedBus != null && WorkerWs.sharedBus.IsAvailable()) {
+            WorkerWs.sharedBus.PublishBroadcast(data, data.Length);
+        }
+        return sent;
+    }
+
+    /// <summary>向本进程内加入指定频道/房间的所有连接广播一条 Text 帧。</summary>
+    static async int BroadcastToLocal(string channel, string data) {
+        WorkerWs.ChanInit();
+        Mutex.Lock(WorkerWs.chanLock);
+        List<Connection> snap = new List<Connection>();
+        if (WorkerWs.channels.ContainsKey(channel)) {
+            List<Connection> list = WorkerWs.channels[channel];
+            for (int i = 0; i < list.Count; i = i + 1) {
+                snap.Add(list[i]);
+            }
+        }
+        Mutex.Unlock(WorkerWs.chanLock);
+        int sent = 0;
+        int j = 0;
+        while (j < snap.Count) {
+            bool ok = await WorkerWs.Push(snap[j], data);
+            if (ok) { sent = sent + 1; }
+            j = j + 1;
+        }
+        return sent;
+    }
+
+    /// <summary>跨 Worker 向加入指定频道/房间的所有在线连接广播 Text 帧。</summary>
+    static async int BroadcastTo(string channel, string data) {
+        int sent = await WorkerWs.BroadcastToLocal(channel, data);
+        if (WorkerWs.sharedBus != null && WorkerWs.sharedBus.IsAvailable()) {
+            WorkerWs.sharedBus.PublishChannel(channel, data, data.Length);
+        }
+        return sent;
+    }
+
+    /// <summary>精准向指定连接 ID 发送消息。若该连接在本进程则立即发送；
+    /// 若在集群其他 Worker 进程，则经 SharedTable 路由至目标进程发送。</summary>
+    static async bool PushTo(int connId, string data) {
+        Connection localConn = WorkerWs.ConnById(connId);
+        if (localConn != null) {
+            return await WorkerWs.Push(localConn, data);
+        }
+        if (WorkerWs.sharedBus != null && WorkerWs.sharedBus.IsAvailable()) {
+            WorkerWs.sharedBus.PublishDirect(connId, data, data.Length);
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>接收来自其他 Worker 进程发来的跨进程共享总线消息。</summary>
+    public static async void OnSharedMessage(int targetType, string channel, int targetId, string payload, int payloadLen) {
+        if (targetType == 0) {
+            await WorkerWs.BroadcastLocal(payload);
+        } else if (targetType == 1) {
+            await WorkerWs.BroadcastToLocal(channel, payload);
+        } else if (targetType == 2) {
+            Connection c = WorkerWs.ConnById(targetId);
+            if (c != null) {
+                await WorkerWs.Push(c, payload);
+            }
+        }
     }
 
     /// <summary>WebSocket push：把一条 Text 帧排进该连接的出站缓冲并立即
@@ -360,3 +530,10 @@ class WsLink {
     WsWriter writer;
     TcpClient client;
 }
+
+class WorkerWsConsumer : IWsSharedBusConsumer {
+    public void OnSharedBusMessage(int targetType, string channel, int targetId, string payload, int payloadLen) {
+        WorkerWs.OnSharedMessage(targetType, channel, targetId, payload, payloadLen);
+    }
+}
+

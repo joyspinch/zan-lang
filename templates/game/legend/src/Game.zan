@@ -4,6 +4,10 @@ namespace Legend;
 
 // All actions are validated here. UI buttons are not the authority for cost checks.
 class Game {
+    CombatEvent lastCombatEvent;
+    bool hasNewCombatEvent;
+    List<Equipment> lastDroppedItems = new List<Equipment>();
+    bool hasNewBurst;
     int job = -1;
     int level = 1;
     int xp;
@@ -134,7 +138,21 @@ class Game {
     int StatMax(string group) { int lo = Stat(group + "_min"); int hi = Stat(group + "_max"); return hi < lo ? lo : hi; }
     string StatPair(string group) { return Rules.N(Stat(group + "_min")) + "–" + Rules.N(StatMax(group)); }
     int RollRange(int lo, int hi) { return hi <= lo ? lo : lo + Random(hi - lo + 1); }
-    int RollStat(string group) { return RollRange(Stat(group + "_min"), StatMax(group)); }
+    int TotalLuck() {
+        int lk = 0;
+        if (equipped[0] != null) { lk = lk + equipped[0].luck; }
+        if (equipped[3] != null) { lk = lk + equipped[3].luck; }
+        return lk;
+    }
+    int RollStat(string group) {
+        int luck = TotalLuck();
+        int max = StatMax(group);
+        if (luck >= 9) { return max; }
+        int min = Stat(group + "_min");
+        if (max <= min) { return min; }
+        if (luck > 0 && Random(10) < luck) { return max; }
+        return RollRange(min, max);
+    }
     int Attack() { return StatMax(AttackSchool()); }
     int Defense() { return StatMax("defense"); }
     int MaxHp() { return Stat("hp"); }
@@ -250,13 +268,32 @@ class Game {
         hp = Rules.Clamp(hp, 0, MaxHp()); mp = Rules.Clamp(mp, 0, MaxMp());
         Log("形态增长成功：" + e.Name() + "（第 " + Rules.N(step + 1) + " 形态）。消耗龙珠" + Rules.N(step) + "★ ×" + Rules.N(ballCost) + " 与1枚" + Rules.N(runeLevel) + "#符文。"); return true;
     }
+    void RollAffixes(Equipment e) {
+        if (e == null) { return; }
+        if (Random(100) < 15) {
+            int count = 1 + Random(2);
+            for (int i = 0; i < count; i = i + 1) {
+                int type = Random(5);
+                int val = 1 + Random(4);
+                if (type == 0) { e.extraAttack = e.extraAttack + val; }
+                else if (type == 1) { e.extraMagic = e.extraMagic + val; }
+                else if (type == 2) { e.extraTao = e.extraTao + val; }
+                else if (type == 3) { e.extraDefense = e.extraDefense + val; }
+                else { e.extraHp = e.extraHp + val * 20; }
+            }
+        }
+        if (e.slot == 3 && Random(100) < 5) {
+            e.luck = 1 + Random(2);
+        }
+    }
     Equipment CreateItem(int definitionId, int tier, int atLevel) {
         DataRow d = GameTables.current.items.At(definitionId);
         if (d.Int("slot") < 0) { throw new Exception("Cannot equip non-equipment item " + Rules.N(definitionId)); }
         DataRow quality = GameTables.current.qualities.At(tier);
         Equipment e = new Equipment(); e.definitionId = definitionId; e.slot = d.Int("slot"); e.tier = tier;
         e.level = Rules.Clamp(atLevel, 1, GameTables.current.levels.rows.Count);
-        e.coefficient = quality.Int("coefficient_min") + Random(quality.Int("coefficient_max") - quality.Int("coefficient_min") + 1); return e;
+        e.coefficient = quality.Int("coefficient_min") + Random(quality.Int("coefficient_max") - quality.Int("coefficient_min") + 1);
+        return e;
     }
     Equipment Make(int slot, int tier, int atLevel) {
         int group = GameTables.current.slots.At(slot).Int("group"); int id = 0; int minimum = 0;
@@ -320,8 +357,11 @@ class Game {
         foreach (DataRow row in GameTables.current.drops.rows) { if (row.Int("pool") == pool) { total = total + row.Int("weight"); } }
         roll = Random(total); int itemId = 0;
         foreach (DataRow row in GameTables.current.drops.rows) { if (row.Int("pool") == pool) { roll = roll - row.Int("weight"); if (roll < 0) { itemId = row.Int("item_id"); break; } } }
-        Equipment e = CreateItem(itemId, tier, level);
+        Equipment e = CreateItem(itemId, tier, level); RollAffixes(e);
         if ((e.slot == 4 || e.slot == 6) && Random(2) == 1) { e.slot = e.slot + 1; }
+        if (lastDroppedItems.Count >= 16) { lastDroppedItems.RemoveAt(0); }
+        lastDroppedItems.Add(e);
+        hasNewBurst = true;
         if (applyFilter && !KeepDrop(e)) { return; }
         if (bag.Count >= capacity) { Log("背包已满，掉落未拾取。"); return; }
         bag.Add(e); Log("拾获 " + e.Name() + " · " + Rules.Quality(e.tier));
@@ -385,20 +425,28 @@ class Game {
         round = round + 1;
         mp = Rules.Clamp(mp + B("mp_regen"), 0, MaxMp());
         if (autoPotion && (long)hp * 100 < (long)MaxHp() * B("potion_trigger_pct") && potions > 0) { potions = potions - 1; hp = Rules.Clamp(Rules.Bounded((long)hp + (long)MaxHp() * B("potion_heal_pct") / 100), 0, MaxHp()); }
+        bool luckMax = (TotalLuck() >= 9);
         int damage = Strike(AttackSchool(), 100);
-        bool critical = Random(100) < B("critical_chance");
-        if (critical) { damage = Rules.Bounded((long)damage * B("critical_damage_pct") / 100); }
+        bool critical = luckMax || (Random(100) < B("critical_chance"));
+        if (critical) {
+            int critPct = luckMax ? 150 : B("critical_damage_pct");
+            damage = Rules.Bounded((long)damage * critPct / 100);
+        }
+        string usedSkillName = "";
         for (int slot = 0; slot < 8; slot = slot + 1) {
             DataRow ability = SkillAtSlot(slot); int rank = SkillRank(slot);
             if (IsSkillEquipped(slot) && ability.Text("kind") == "active" && ability.Int("cooldown") > 0 && tick % ability.Int("cooldown") == 0 && mp >= ability.Int("mana")) {
                 mp = mp - ability.Int("mana");
                 damage = Rules.Bounded((long)damage + Strike(ability.Text("school"), ability.Int("damage_pct") + rank * ability.Int("damage_per_level")));
                 hp = Rules.Clamp(Rules.Bounded((long)hp + (long)MaxHp() * (ability.Int("heal_pct") + rank * ability.Int("heal_per_level")) / 100), 0, MaxHp());
+                usedSkillName = ability.Text("name");
                 break;
             }
         }
         if (JobData().Int("pet_attack_pct") > 0) { damage = Rules.Bounded((long)damage + Strike(AttackSchool(), JobData().Int("pet_attack_pct"))); }
         damage = Rules.Clamp(damage, 1, 10000000); enemyHp = enemyHp - damage;
+        lastCombatEvent = CombatEvent.PlayerStrike(damage, critical, luckMax, usedSkillName, 180, 150);
+        hasNewCombatEvent = true;
         if (enemyHp <= 0) { Victory(); return; }
         int incoming = Hit(RollEnemy(EnemySchool()), RollStat(EnemySchool() == "attack" ? "defense" : "magic_defense"));
         incoming = (int)((long)incoming * JobData().Int("damage_taken_pct") / 100);
@@ -813,4 +861,51 @@ class Game {
         rebirth = rebirth + 1; level = 1; xp = 0; floor = 1; best = 1; wave = 0; recovery = 0;
         hp = MaxHp(); mp = MaxMp(); Spawn(); Log("转生成功！保留装备与养成，属性加成已更新。");
     }
+
+    void DrinkBlessingOil() {
+        Equipment w = equipped[0];
+        if (w == null) { Log("请先穿戴武器后再使用祝福油！"); return; }
+        if (w.luck >= 7) { Log("你的武器幸运已达 +7 上限，无需再喝油！"); return; }
+        if (gold < 5000) { Log("使用祝福油需要 5000 金币手续费。"); return; }
+        gold = gold - 5000;
+
+        int roll = Random(100);
+        if (roll < 55) {
+            w.luck = w.luck + 1;
+            Log("【神圣祝福】一道金光降临！你的武器幸运提升至 +" + Rules.N(w.luck) + "！");
+        } else if (roll < 85) {
+            Log("你喝下了祝福油，但感觉武器毫无变化。");
+        } else {
+            if (w.luck > 0) {
+                w.luck = w.luck - 1;
+                Log("【邪恶诅咒】一股黑气缠绕！你的武器被诅咒了，幸运降至 +" + Rules.N(w.luck) + "！");
+            } else {
+                Log("你喝下了祝福油，一股苦涩涌上心头，但幸运已为 0，未被诅咒。");
+            }
+        }
+    }
+    void RecycleByTier(int maxTier) {
+        int count = 0;
+        long rewardGold = 0;
+        long rewardXp = 0;
+        for (int i = bag.Count - 1; i >= 0; i = i - 1) {
+            Equipment e = bag[i];
+            if (e != null && !e.locked && e.tier <= maxTier) {
+                rewardGold = rewardGold + (long)RecyclePrice(e, 0);
+                rewardXp = rewardXp + (long)RecyclePrice(e, 1);
+                bag.RemoveAt(i);
+                recycled = Rules.Bounded((long)recycled + 1);
+                count = count + 1;
+            }
+        }
+        if (count > 0) {
+            Gold(Rules.Bounded(rewardGold));
+            GainXp(Rules.Bounded(rewardXp));
+            Log("【一键回收】成功熔炼 " + Rules.N(count) + " 件装备，获得金币 +" + Rules.N(Rules.Bounded(rewardGold)) + "，经验 +" + Rules.N(Rules.Bounded(rewardXp)));
+        } else {
+            Log("背包中没有符合条件的可回收装备。");
+        }
+    }
+
 }
+
