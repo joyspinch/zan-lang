@@ -21,6 +21,20 @@ class CodeSpan {
 /// CodeEditor 分部：语法高亮（按行缓存的词法分析）
 /// 和主渲染路径（装订线、文本、光标、弹窗、缩略图）。
 partial class CodeEditor {
+    static List<string> s_lineNumPool;
+    static string GetLineNumStr(int line1) {
+        if (s_lineNumPool == null) {
+            s_lineNumPool = new List<string>();
+            for (int i = 1; i <= 2048; i = i + 1) {
+                s_lineNumPool.Add(Convert.ToString(i));
+            }
+        }
+        if (line1 >= 1 && line1 <= s_lineNumPool.Count) {
+            return s_lineNumPool[line1 - 1];
+        }
+        return Convert.ToString(line1);
+    }
+
     // ---- 语法高亮 ----
 
     /// 单字符字符串 `ch` 出现在 `set` 中时返回 true。
@@ -465,10 +479,20 @@ partial class CodeEditor {
         int visLines = area.height / lineH;
         if (visLines < 1) { visLines = 1; }
         pageRows = visLines;
+
+        maxScrollY = (lines.Count - visLines) * lineH;
+        if (maxScrollY < 0) { maxScrollY = 0; }
+
         bool ownsWheel = false;
-        if (visLines < lines.Count) {
+        if (lines.Count > visLines) {
             ownsWheel = app.CaptureWheel(
                 area.x, area.y, area.width, area.height);
+        }
+
+        // 外部通过 SetScrollLine 改变行号或首次布局时的像素初始化
+        if (scrollY < 0) {
+            scrollY = scrollLine * lineH;
+            targetScrollY = scrollY;
         }
 
         if (focused) { HandleInput(app); }
@@ -476,11 +500,10 @@ partial class CodeEditor {
         // 刚离开的行现已完整可查，而活动行被
         // CheckErrors 有意跳过。这还避免行内每次击键
         // 触发整文档重扫。
-        // 拖拽选择进行中跳过整文档诊断：
-        // 指针每越过一行就运行一次会让多行
-        // 选择卡顿。拖动结束后才运行（光标行在
-        // 未选择期间变化时）。
-        if (curLine != lastDiagLine && !mouseSelecting) {
+        // 拖拽选择或滚动条滑块拖动期间跳过整文档诊断：
+        // 指针每越过一行就运行一次会让多行选择或滚动严重卡顿。
+        // 滚动静止或拖动结束后才运行（光标行在未选择/未拖动期间变化时）。
+        if (curLine != lastDiagLine && !mouseSelecting && !barDragging && (app.nowMs - lastScrollMs >= 200)) {
             CheckErrors();
             lastDiagLine = curLine;
         }
@@ -488,51 +511,90 @@ partial class CodeEditor {
         // 过期记忆，使其只重算一次而非每可见行一次。
         InvalidateDiagStale();
 
-        // 在滚动条滑块上拖拽：时序前移至排版与行绘制之前，
-        // 保证当前帧随着鼠标移动即刻呈现最新视口，实现所拖即所见与零延迟体验。
+        // 在滚动条滑块上拖拽：绝对像素响应，零延迟同步视口
         if (app.EventKind() == 1 && barDragging) {
-            int dtotal2 = lines.Count;
-            if (dtotal2 < 1) { dtotal2 = 1; }
-            scrollLine = (app.mouseY - area.y) * dtotal2 / area.height - visLines / 2;
-            if (scrollLine < 0) { scrollLine = 0; }
+            int total = lines.Count;
+            if (total < 1) { total = 1; }
+            int thumbH = visLines * area.height / total;
+            if (thumbH < app.Scale(24)) { thumbH = app.Scale(24); }
+            if (thumbH > area.height) { thumbH = area.height; }
+            int travel = area.height - thumbH;
+            int newY = 0;
+            if (travel > 0 && maxScrollY > 0) {
+                int my = app.mouseY - area.y - thumbH / 2;
+                newY = my * maxScrollY / travel;
+            }
+            if (newY < 0) { newY = 0; }
+            if (newY > maxScrollY) { newY = maxScrollY; }
+            scrollY = newY;
+            targetScrollY = newY;
+            scrollLine = scrollY / lineH;
             lastScrollMs = app.nowMs;
             app.NoteScrollDamage(area.x, area.y, area.width, area.height);
         }
 
+        // 滚轮事件：按像素平滑累加目标偏移，触控板小步进与鼠标均细腻响应
         if (ownsWheel) {
             int delta = app.window.EventKeyCode();
-            // 反向滚动时清空积累的小数滚轮
-            if ((wheelAccum > 0 && delta < 0) || (wheelAccum < 0 && delta > 0)) {
-                wheelAccum = 0;
+            // 每 120 刻度对应 3 行像素高度
+            int pixStep = (delta * lineH * 3) / 120;
+            if (pixStep == 0) {
+                if (delta > 0) { pixStep = 1; }
+                else if (delta < 0) { pixStep = 0 - 1; }
             }
-            wheelAccum = wheelAccum + delta;
-            int step = wheelAccum / 120;
-            if (step != 0) {
-                // 滚轮步长：每 120 刻度滚 5 行，干脆利落
-                scrollLine = scrollLine - step * 5;
-                wheelAccum = wheelAccum - step * 120;
+            // 突然反向滚动时重设目标，防止惯性滞后
+            if ((targetScrollY > scrollY && delta > 0) || (targetScrollY < scrollY && delta < 0)) {
+                targetScrollY = scrollY;
             }
+            targetScrollY = targetScrollY - pixStep;
+            if (targetScrollY < 0) { targetScrollY = 0; }
+            if (targetScrollY > maxScrollY) { targetScrollY = maxScrollY; }
             lastScrollMs = app.nowMs;
-            // 滚轮事件当帧已由 App.NoteScrollDamage 标记局部重绘，
-            // 排版与绘制直接基于新 scrollLine，不调用 app.RequestRedraw() 
-            // 避免冲掉局部重绘并产生额外的空转重绘帧。
+            app.RequestRedraw();
+            app.NoteScrollDamage(area.x, area.y, area.width, area.height);
+        }
+
+        // 平滑滚动追赶：每帧按指数衰减向 targetScrollY 逼近
+        if (!barDragging && scrollY != targetScrollY) {
+            int diff = targetScrollY - scrollY;
+            int step = diff * 35 / 100;
+            if (step == 0) {
+                if (diff > 0) { step = 1; }
+                else { step = 0 - 1; }
+            }
+            scrollY = scrollY + step;
+            scrollLine = scrollY / lineH;
+            app.RequestRedraw();
+            app.NoteScrollDamage(area.x, area.y, area.width, area.height);
         }
 
         // 仅当本帧光标实际移动时才保持其在视野内；
-        // 单纯的滚轮/滚动条滚动不改变光标行，不应
-        // 把视图拉回光标处。
+        // 单纯的滚轮/滚动条滚动不改变光标行，不应把视图拉回光标处。
         if (curLine != ensuredCaretLine) {
-            if (curLine < scrollLine) { scrollLine = curLine; }
-            if (curLine >= scrollLine + visLines) { scrollLine = curLine - visLines + 1; }
+            int topL = scrollY / lineH;
+            if (curLine < topL) {
+                targetScrollY = curLine * lineH;
+                scrollY = targetScrollY;
+                scrollLine = curLine;
+            } else if (curLine >= topL + visLines) {
+                targetScrollY = (curLine - visLines + 1) * lineH;
+                scrollY = targetScrollY;
+                scrollLine = curLine - visLines + 1;
+            }
             ensuredCaretLine = curLine;
         }
-        int maxScroll = lines.Count - visLines;
-        if (maxScroll < 0) { maxScroll = 0; }
-        if (scrollLine > maxScroll) { scrollLine = maxScroll; }
-        if (scrollLine < 0) { scrollLine = 0; }
+        if (scrollY > maxScrollY) { scrollY = maxScrollY; }
+        if (scrollY < 0) { scrollY = 0; }
+        if (targetScrollY > maxScrollY) { targetScrollY = maxScrollY; }
+        if (targetScrollY < 0) { targetScrollY = 0; }
+        scrollLine = scrollY / lineH;
 
         int textX = area.x + gutterW + t.paddingSmall;
-        codeLens = new List<CodeLensRef>();
+        if (codeLens == null) {
+            codeLens = new List<CodeLensRef>();
+        } else {
+            codeLens.Clear();
+        }
         BeginLensFrame(app);
         // 引用计数标注在声明上方独占的一行，
         // 与 Visual Studio 一致，因此本帧所绘行先
@@ -667,11 +729,17 @@ partial class CodeEditor {
             if (dtgt < 0) { dtgt = 0; }
             if (dtgt >= lines.Count) { dtgt = lines.Count - 1; }
             curLine = dtgt;
+            lastDiagLine = dtgt; // 同步跳过滚动条点击瞬间的诊断扫描
             if (curCol > lines[curLine].Length) { curCol = lines[curLine].Length; }
             selActive = false;
             ClearExtraCarets();
-            scrollLine = dtgt - visLines / 2;
-            if (scrollLine < 0) { scrollLine = 0; }
+            int targetLine = dtgt - visLines / 2;
+            if (targetLine < 0) { targetLine = 0; }
+            if (targetLine > lines.Count - visLines) { targetLine = lines.Count - visLines; }
+            if (targetLine < 0) { targetLine = 0; }
+            scrollLine = targetLine;
+            scrollY = scrollLine * lineH;
+            targetScrollY = scrollY;
             barDragging = true;
             lastScrollMs = app.nowMs;
             app.RequestRedraw();
@@ -740,11 +808,20 @@ partial class CodeEditor {
             app.RequestRedraw();
         }
 
-        // ---- 悬停：重绘使符号提示跟随指针 ----
+        // ---- 悬停：指针静止防抖后才触发重绘以展示符号提示，避免高速滑过引发整窗无效重绘 ----
         if (app.EventKind() == 1 && !mouseSelecting && !acActive && ptrFree) {
             if (app.mouseX >= area.x && app.mouseX < area.x + area.width
                 && app.mouseY >= area.y && app.mouseY < area.y + area.height) {
-                app.RequestRedraw();
+                // 仅当鼠标移动超过一定像素，重置悬停静止计时器
+                int mdx = app.mouseX - lastHoverX;
+                int mdy = app.mouseY - lastHoverY;
+                if (mdx < 0) { mdx = -mdx; }
+                if (mdy < 0) { mdy = -mdy; }
+                if (mdx > 3 || mdy > 3) {
+                    lastHoverX = app.mouseX;
+                    lastHoverY = app.mouseY;
+                    lastHoverMoveMs = app.nowMs;
+                }
             }
         }
 
@@ -911,8 +988,10 @@ partial class CodeEditor {
             }
         }
 
-        // ---- 符号悬停提示（方法/属性签名 + 文档） ----
-        if (!acActive && !ctxOpen && execLine < 0 && ptrFree) {
+        // ---- 符号悬停提示（方法/属性签名 + 文档）：滚动中抑制，且需鼠标静止 250ms 后才解析显示 ----
+        if (!acActive && !ctxOpen && execLine < 0 && ptrFree
+            && (app.nowMs - lastScrollMs >= 200)
+            && (app.nowMs - lastHoverMoveMs >= 250)) {
             string hw = WordAtMouse(app, area, gutterW, fontSize);
             if (hw.Length > 0) {
                 string hsig = SigHelpFor(hw);
@@ -1034,6 +1113,8 @@ partial class CodeEditor {
         // 装订线、选区高亮和行内错误提示就绝不会绘制
         // 到编辑器矩形之外的相邻窗格。
         c.PushClip(area.x, area.y, area.width, area.height);
+        int digitW = Canvas.MeasureText("9", fontSize);
+        if (digitW < 1) { digitW = app.Scale(7); }
         for (int i = 0; i < rowLine.Count; i = i + 1) {
             int ln = rowLine[i];
             if (ln < lines.Count) {
@@ -1061,8 +1142,8 @@ partial class CodeEditor {
                     c.FillRoundRect(ax, ay, aw, aw, app.Scale(2), pal.warn);
                 }
 
-                string num = Convert.ToString(ln + 1);
-                int numW = Canvas.MeasureText(num, fontSize);
+                string num = GetLineNumStr(ln + 1);
+                int numW = num.Length * digitW;
                 c.DrawText(area.x + gutterW - numW - app.Scale(8), textY, num,
                            lineNumberColor, fontSize);
 
@@ -1074,12 +1155,13 @@ partial class CodeEditor {
                         curLine, curCol, ln, text, textX, rowY, lineH, fontSize, area);
                 }
 
-                // 错误指示（红色下划线）。真实编译器错误
-                // 优先，且画得比启发式错误略粗。
+                // 错误指示（红色下划线）。真实编译器错误具有权威优先权；
+                // 当存在有效的真实编译器诊断时，仅以真实编译器错误为准，消除启发式误报。
+                bool hasCompVal = (compErrors != null && !CompilerDiagStale());
                 if (HasCompilerErr(ln)) {
                     c.FillRect(textX, rowY + lineH - app.Scale(2),
                         Canvas.MeasureText(text, fontSize), app.Scale(2), pal.error);
-                } else if (CodeEditor.DiagHas(errors, ln)) {
+                } else if (!hasCompVal && CodeEditor.DiagHas(errors, ln)) {
                     c.FillRect(textX, rowY + lineH - app.Scale(2),
                         Canvas.MeasureText(text, fontSize), app.Scale(2), pal.errorDim);
                 }
@@ -1149,11 +1231,13 @@ partial class CodeEditor {
                     }
                 }
 
-                // 显示光标行的错误原因。编译器诊断
-                // 与启发式猜测并存时优先。
-                if ((HasCompilerErr(ln) || CodeEditor.DiagHas(errors, ln)) && ln == curLine) {
+                // 显示光标行的错误原因。编译器诊断具有权威优先权；
+                // 当存在有效的真实编译器诊断时，仅以真实诊断为准。
+                bool hasCompVal2 = (compErrors != null && !CompilerDiagStale());
+                bool shouldShowErr = HasCompilerErr(ln) || (!hasCompVal2 && CodeEditor.DiagHas(errors, ln));
+                if (shouldShowErr && ln == curLine) {
                     string errMsg = CompilerErrMsg(ln);
-                    if (errMsg.Length == 0) { errMsg = CodeEditor.DiagMsg(errors, ln); }
+                    if (errMsg.Length == 0 && !hasCompVal2) { errMsg = CodeEditor.DiagMsg(errors, ln); }
                     if (errMsg.Length > 0) {
                         int ttW = Canvas.MeasureText(errMsg, fontSize) + app.Scale(12);
                         int ttH = lineH;
@@ -1184,9 +1268,16 @@ partial class CodeEditor {
             c.FillRect(stripX, area.y, app.Scale(1), area.height, pal.border);
             int total = lines.Count;
             if (total < 1) { total = 1; }
-            int thumbY = area.y + scrollLine * area.height / total;
             int thumbH = visLines * area.height / total;
             if (thumbH < app.Scale(24)) { thumbH = app.Scale(24); }
+            if (thumbH > area.height) { thumbH = area.height; }
+            int travel = area.height - thumbH;
+            int thumbY = area.y;
+            if (travel > 0 && maxScrollY > 0) {
+                thumbY = area.y + scrollY * travel / maxScrollY;
+            } else {
+                thumbY = area.y + scrollLine * area.height / total;
+            }
             if (thumbY + thumbH > area.y + area.height) { thumbY = area.y + area.height - thumbH; }
             if (thumbY < area.y) { thumbY = area.y; }
             c.FillRoundRect(stripX + app.Scale(3), thumbY, stripW - app.Scale(6), thumbH, app.Scale(3), pal.minimapThumb);

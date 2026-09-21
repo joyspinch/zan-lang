@@ -160,6 +160,9 @@ partial class CodeEditor {
     int curLine;
     int curCol;
     int scrollLine;
+    int scrollY;
+    int targetScrollY;
+    int maxScrollY;
     // 视图上次自动滚动保持可见的行。"保持光标
     // 在视野内"的钳制只在光标行变化时触发（输入/方向键/点击），
     // 因此单纯的滚轮/滚动条滚动不会被拉回光标行。
@@ -383,6 +386,9 @@ partial class CodeEditor {
     DbgVar hoverTip;        // 当前悬停提示条目（无则为 null）
     int hoverTipX;
     int hoverTipY;
+    int lastHoverMoveMs;
+    int lastHoverX;
+    int lastHoverY;
 
     // 右键上下文菜单状态。
     bool ctxOpen;
@@ -490,6 +496,9 @@ partial class CodeEditor {
         this.curLine = 0;
         this.curCol = 0;
         this.scrollLine = 0;
+        this.scrollY = 0;
+        this.targetScrollY = 0;
+        this.maxScrollY = 0;
         this.ensuredCaretLine = -1;
         this.lastId = -1;
         this.rowLine = new List<int>();
@@ -591,6 +600,9 @@ partial class CodeEditor {
         this.hoverTip = null;
         this.hoverTipX = 0;
         this.hoverTipY = 0;
+        this.lastHoverMoveMs = 0;
+        this.lastHoverX = 0;
+        this.lastHoverY = 0;
         this.ctxOpen = false;
         this.ctxX = 0;
         this.ctxY = 0;
@@ -612,6 +624,8 @@ partial class CodeEditor {
         curLine = 0;
         curCol = 0;
         scrollLine = 0;
+        scrollY = 0;
+        targetScrollY = 0;
         ensuredCaretLine = -1;
         lastDiagLine = -1;  // 强制对新内容重新计算诊断
         BumpTextVersion();
@@ -679,6 +693,18 @@ partial class CodeEditor {
         if (line >= lines.Count) { line = lines.Count - 1; }
         if (line < 0) { line = 0; }
         scrollLine = line;
+        scrollY = 0 - 1; // 标记由下一次 Render 转换为精确像素
+        targetScrollY = 0 - 1;
+    }
+
+    /// 当前视口垂直像素滚动偏移。
+    int ScrollY() { return scrollY; }
+    /// 设置垂直像素滚动偏移。
+    void SetScrollY(int y) {
+        if (y < 0) { y = 0; }
+        if (maxScrollY > 0 && y > maxScrollY) { y = maxScrollY; }
+        scrollY = y;
+        targetScrollY = y;
     }
 
     // ---- 自动化 / 自省访问器（供 Gui.UiDriver 使用） ----
@@ -741,12 +767,17 @@ partial class CodeEditor {
     /// 用上次 Run/Build 针对本文件报告的真实错误
     /// 替换红色下划线 + 提示显示的编译器诊断，并
     /// 把光标跳到第一个错误，使其原因立即可见。
+    /// 当编译成功（diagnostics 为空）时，清空启发式扫描的假阳性错误，保证与编译器一致。
     void SetCompilerDiagnostics(List<Diagnostic> diagnostics) {
         compErrors = diagnostics;
         cErrStamp = BufLen();
         diagStaleFrame = 0 - 1;
         if (compErrors.Count > 0) {
             GoToLine(compErrors[0].line);
+        } else {
+            // 真实编译器验证无任何错误：权威冲刷本地启发式假阳性，消除误导性红线
+            errors = new List<Diagnostic>();
+            fixes = new List<QuickFix>();
         }
     }
 
@@ -1142,20 +1173,34 @@ partial class CodeEditor {
         }
     }
 
-    /// 布局本帧各行：从 `scrollLine` 起所有能放入
+    /// 布局本帧各行：从 `scrollY` 起所有能放入
     /// `area` 的代码行，声明了成员的代码行前加 lens 行。
-    /// 每帧在行与像素互相换算之前调用一次。
+    /// 逐像素计算首行偏移与位置，并复用表容器消除每帧堆分配。
     void BuildRowLayout(Rect area, int lineH, int lensH) {
-        rowLine = new List<int>();
-        rowTop = new List<int>();
-        rowLensY = new List<int>();
-        rowDecl = new List<string>();
+        if (rowLine == null) {
+            rowLine = new List<int>();
+            rowTop = new List<int>();
+            rowLensY = new List<int>();
+            rowDecl = new List<string>();
+        } else {
+            rowLine.Clear();
+            rowTop.Clear();
+            rowLensY.Clear();
+            rowDecl.Clear();
+        }
         lensRowH = lensH;
-        int y = area.y;
         int bottom = area.y + area.height;
-        int ln = scrollLine;
+        if (lineH < 1) { lineH = 1; }
+        if (scrollY < 0) {
+            scrollY = scrollLine * lineH;
+            targetScrollY = scrollY;
+        }
+        int ln = scrollY / lineH;
         if (ln < 0) { ln = 0; }
-        while (ln < lines.Count && y + lineH <= bottom) {
+        int subOffset = scrollY % lineH;
+        if (subOffset < 0) { subOffset = 0; }
+        int y = area.y - subOffset;
+        while (ln < lines.Count && y < bottom) {
             int ly = 0 - 1;
             string decl = "";
             string lnt = lines[ln];
@@ -1218,8 +1263,13 @@ partial class CodeEditor {
         int lineH = Canvas.FontHeight(fontSize) + app.Scale(4);
         int clicked = LineAtY(lineH, app.mouseY);
         if (clicked < 0) {
-            if (app.mouseY < area.y) { clicked = scrollLine; }
-            else { clicked = scrollLine + VisibleRowCount() - 1; }
+            if (app.mouseY < area.y) {
+                if (rowLine.Count > 0) { clicked = rowLine[0]; }
+                else { clicked = scrollLine; }
+            } else {
+                if (rowLine.Count > 0) { clicked = rowLine[rowLine.Count - 1]; }
+                else { clicked = scrollLine + VisibleRowCount() - 1; }
+            }
         }
         if (clicked >= lines.Count) { clicked = lines.Count - 1; }
         if (clicked < 0) { clicked = 0; }
