@@ -1,0 +1,147 @@
+using System;
+using System.IO;
+using System.IO.Compression;
+using System.Collections.Generic;
+using System.Security.Cryptography;
+
+namespace Zan.AppUpdate;
+
+/// <summary>
+/// 版本发布打包器：扫描程序目录、计算所有文件 MD5、生成更新清单、压缩为 Zip 包。
+/// </summary>
+class ReleasePackager {
+    /// <summary>递归收集目录下的所有相对路径文件。</summary>
+    static void CollectFiles(string baseDir, string relDir, List<string> outList) {
+        string fullDir = relDir.Length == 0 ? baseDir : (baseDir + "/" + relDir);
+        if (!Directory.Exists(fullDir)) { return; }
+
+        List<string> files = Directory.GetFiles(fullDir);
+        for (int i = 0; i < files.Count; i = i + 1) {
+            string file = files[i];
+            // 忽略更新临时文件或版本描述自身
+            if (file == "manifest.json" || file == "update.manifest" || file.EndsWith(".tmp") || file.EndsWith(".bak")) {
+                continue;
+            }
+            string rel = relDir.Length == 0 ? file : (relDir + "/" + file);
+            outList.Add(UpdateFileEntry.NormalizePath(rel));
+        }
+
+        List<string> subDirs = Directory.GetDirectories(fullDir);
+        for (int i = 0; i < subDirs.Count; i = i + 1) {
+            string sub = subDirs[i];
+            if (sub == ".git" || sub == ".svn" || sub == "_backup") {
+                continue;
+            }
+            string nextRel = relDir.Length == 0 ? sub : (relDir + "/" + sub);
+            CollectFiles(baseDir, nextRel, outList);
+        }
+    }
+
+    /// <summary>
+    /// 将指定应用程序目录打包为版本更新 Zip 包，并生成 Manifest 清单。
+    /// </summary>
+    /// <param name="appDir">应用程序所在根目录</param>
+    /// <param name="outputZipPath">输出的 Zip 压缩包完整路径</param>
+    /// <param name="outputManifestPath">输出的 Manifest.json 路径（传空则放在 Zip 同级目录）</param>
+    /// <param name="appName">应用程序名称</param>
+    /// <param name="version">新发布的版本号（如 1.2.0）</param>
+    /// <param name="changelog">更新日志说明</param>
+    /// <param name="packageUrl">远程部署时的下载 URL</param>
+    /// <param name="cb">进度回调委托（可传 null）</param>
+    /// <returns>构建完成的 UpdateManifest 对象</returns>
+    static UpdateManifest Pack(
+        string appDir,
+        string outputZipPath,
+        string outputManifestPath,
+        string appName,
+        string version,
+        string changelog,
+        string packageUrl,
+        UpdateProgressCallback cb
+    ) {
+        if (!Directory.Exists(appDir)) {
+            if (cb != null) { cb(UpdateProgressInfo.Fail(UpdatePhase.Failed, "源应用目录不存在: " + appDir)); }
+            return null;
+        }
+
+        if (outputManifestPath == null || outputManifestPath.Length == 0) {
+            outputManifestPath = outputZipPath + ".manifest.json";
+        }
+
+        if (cb != null) {
+            cb(UpdateProgressInfo.Create(UpdatePhase.Checking, 0, "", "正在扫描源应用目录..."));
+        }
+
+        List<string> relFiles = new List<string>();
+        CollectFiles(appDir, "", relFiles);
+
+        int totalFiles = relFiles.Count;
+        if (totalFiles == 0) {
+            if (cb != null) { cb(UpdateProgressInfo.Fail(UpdatePhase.Failed, "源应用目录中没有可打包的文件: " + appDir)); }
+            return null;
+        }
+
+        UpdateManifest manifest = new UpdateManifest();
+        manifest.appName = appName;
+        manifest.version = version;
+        manifest.changelog = changelog;
+        manifest.packageUrl = packageUrl;
+        manifest.releaseDate = DateTime.Now().ToString();
+
+        List<ZipEntry> zipEntries = new List<ZipEntry>();
+
+        // 逐一扫描、读取数据、计算 MD5 并加入 Zip 条目
+        for (int i = 0; i < totalFiles; i = i + 1) {
+            string rel = relFiles[i];
+            string fullPath = appDir + "/" + rel;
+
+            byte[] fileBytes = File.ReadAllBytes(fullPath);
+            int fileSize = fileBytes != null ? fileBytes.Length : 0;
+            string fileMd5 = Md5.HashToHex(fileBytes);
+
+            UpdateFileEntry entry = UpdateFileEntry.Create(rel, fileSize, fileMd5, true);
+            manifest.AddFile(entry);
+
+            ZipEntry ze = new ZipEntry(rel);
+            ze.data = fileBytes;
+            ze.uncompressedSize = fileSize;
+            zipEntries.Add(ze);
+
+            if (cb != null) {
+                int percent = ((i + 1) * 60) / totalFiles;
+                cb(UpdateProgressInfo.Progress(UpdatePhase.Checking, percent, i + 1, totalFiles, rel, "已计算 MD5 校验码"));
+            }
+        }
+
+        if (cb != null) {
+            cb(UpdateProgressInfo.Create(UpdatePhase.Extracting, 70, "", "正在进行 Zip 压缩打包..."));
+        }
+
+        // 确保输出目录存在
+        string outDir = Path.GetDirectoryName(outputZipPath);
+        if (outDir != null && outDir.Length > 0 && !Directory.Exists(outDir)) {
+            Directory.CreateDirectory(outDir);
+        }
+
+        // 使用 Level 6 进行标准 Zip 压缩
+        byte[] zipData = Zip.Create(zipEntries, 6);
+        File.WriteAllBytes(outputZipPath, zipData);
+
+        // 计算生成 Zip 包的整体大小与 MD5
+        manifest.packageSize = zipData.Length;
+        manifest.packageMd5 = Md5.HashToHex(zipData);
+
+        if (cb != null) {
+            cb(UpdateProgressInfo.Create(UpdatePhase.Extracting, 90, "", "正在写入 Manifest 清单..."));
+        }
+
+        // 保存 Manifest
+        manifest.SaveToFile(outputManifestPath);
+
+        if (cb != null) {
+            cb(UpdateProgressInfo.Create(UpdatePhase.Completed, 100, outputZipPath, "版本发布打包完成！总计打包文件数: " + totalFiles.ToString()));
+        }
+
+        return manifest;
+    }
+}

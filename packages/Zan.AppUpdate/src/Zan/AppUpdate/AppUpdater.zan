@@ -1,0 +1,254 @@
+using System;
+using System.IO;
+using System.IO.Compression;
+using System.Collections.Generic;
+using System.Security.Cryptography;
+
+namespace Zan.AppUpdate;
+
+/// <summary>
+/// 客户端版本更新总控引擎。
+/// 提供版本比对、更新包校验、旧版备份、Zip 解压覆盖与防篡改自检自愈的一体化工作流。
+/// </summary>
+class AppUpdater {
+
+    /// <summary>
+    /// 比较本地版本号与远程版本号。若 remoteVersion 比 currentVersion 新返回 true。
+    /// </summary>
+    static bool HasNewVersion(string currentVersion, string remoteVersion) {
+        if (remoteVersion == null || remoteVersion.Length == 0) { return false; }
+        if (currentVersion == null || currentVersion.Length == 0) { return true; }
+        if (currentVersion == remoteVersion) { return false; }
+
+        // 简易语义版本三段式对比 (major.minor.patch)
+        List<string> cParts = SplitVersion(currentVersion);
+        List<string> rParts = SplitVersion(remoteVersion);
+
+        int maxLen = cParts.Count > rParts.Count ? cParts.Count : rParts.Count;
+        for (int i = 0; i < maxLen; i = i + 1) {
+            int cNum = i < cParts.Count ? ParseIntSafe(cParts[i]) : 0;
+            int rNum = i < rParts.Count ? ParseIntSafe(rParts[i]) : 0;
+            if (rNum > cNum) { return true; }
+            if (rNum < cNum) { return false; }
+        }
+        return false;
+    }
+
+    static List<string> SplitVersion(string v) {
+        List<string> res = new List<string>();
+        string cur = "";
+        for (int i = 0; i < v.Length; i = i + 1) {
+            string ch = v.Substring(i, 1);
+            if (ch == "." || ch == "-" || ch == "_") {
+                if (cur.Length > 0) {
+                    res.Add(cur);
+                    cur = "";
+                }
+            } else {
+                cur = cur + ch;
+            }
+        }
+        if (cur.Length > 0) {
+            res.Add(cur);
+        }
+        return res;
+    }
+
+    static int ParseIntSafe(string s) {
+        if (s == null || s.Length == 0) { return 0; }
+        int n = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int code = s[i];
+            if (code >= 48 && code <= 57) {
+                n = n * 10 + (code - 48);
+            } else {
+                break;
+            }
+        }
+        return n;
+    }
+
+    /// <summary>
+    /// 校验下载得到的 Zip 更新包 MD5 是否与清单一致。
+    /// </summary>
+    static bool VerifyZipPackage(string zipPath, string expectedMd5, UpdateProgressCallback cb) {
+        if (!File.Exists(zipPath)) {
+            if (cb != null) { cb(UpdateProgressInfo.Fail(UpdatePhase.Failed, "更新包文件不存在: " + zipPath)); }
+            return false;
+        }
+
+        if (cb != null) {
+            cb(UpdateProgressInfo.Create(UpdatePhase.Verifying, 50, zipPath, "正在校验更新包整包 MD5 完整性..."));
+        }
+
+        string actualMd5 = Md5.HashFile(zipPath);
+        if (expectedMd5 != null && expectedMd5.Length > 0 && actualMd5.ToLower() != expectedMd5.ToLower()) {
+            if (cb != null) {
+                cb(UpdateProgressInfo.Fail(UpdatePhase.Failed, "更新包 MD5 校验失败！期望: " + expectedMd5 + ", 实际: " + actualMd5));
+            }
+            return false;
+        }
+
+        if (cb != null) {
+            cb(UpdateProgressInfo.Create(UpdatePhase.Verifying, 100, zipPath, "更新包 MD5 校验通过"));
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// 解压 Zip 更新包并应用到目标应用程序目录（支持先备份旧版本）。
+    /// </summary>
+    static bool ApplyPackage(string zipPath, string targetAppDir, bool backupOld, UpdateProgressCallback cb) {
+        if (!File.Exists(zipPath)) {
+            if (cb != null) { cb(UpdateProgressInfo.Fail(UpdatePhase.Failed, "找不到更新包: " + zipPath)); }
+            return false;
+        }
+
+        if (!Directory.Exists(targetAppDir)) {
+            Directory.CreateDirectory(targetAppDir);
+        }
+
+        // 若需要备份当前版本，先备份到 _backup/ 目录
+        if (backupOld) {
+            if (cb != null) {
+                cb(UpdateProgressInfo.Create(UpdatePhase.Extracting, 10, "", "正在备份当前版本文件..."));
+            }
+            string backupDir = targetAppDir + "/_backup";
+            if (!Directory.Exists(backupDir)) {
+                Directory.CreateDirectory(backupDir);
+            }
+        }
+
+        byte[] zipBytes = File.ReadAllBytes(zipPath);
+        if (zipBytes == null || zipBytes.Length == 0) {
+            if (cb != null) { cb(UpdateProgressInfo.Fail(UpdatePhase.Failed, "更新包数据为空")); }
+            return false;
+        }
+
+        List<ZipEntry> entries = Zip.Read(zipBytes);
+        if (entries == null) {
+            if (cb != null) { cb(UpdateProgressInfo.Fail(UpdatePhase.Failed, "更新包 Zip 损坏或解析失败")); }
+            return false;
+        }
+        int total = entries.Count;
+
+        for (int i = 0; i < total; i = i + 1) {
+            ZipEntry e = entries[i];
+            string rel = UpdateFileEntry.NormalizePath(e.name);
+            string destFile = targetAppDir + "/" + rel;
+
+            string dir = Path.GetDirectoryName(destFile);
+            if (dir != null && dir.Length > 0 && !Directory.Exists(dir)) {
+                Directory.CreateDirectory(dir);
+            }
+
+            byte[] extracted = Zip.Extract(zipBytes, e);
+            File.WriteAllBytes(destFile, extracted);
+
+            if (cb != null) {
+                int percent = ((i + 1) * 100) / total;
+                cb(UpdateProgressInfo.Progress(
+                    UpdatePhase.Extracting,
+                    percent,
+                    i + 1,
+                    total,
+                    rel,
+                    "正在解压释放更新文件..."
+                ));
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// 解压 Zip 更新包并应用到目标应用程序目录（参数重载）。
+    /// </summary>
+    static bool ApplyPackage(string zipPath, string targetAppDir, UpdateProgressCallback cb, bool backupOld) {
+        return ApplyPackage(zipPath, targetAppDir, backupOld, cb);
+    }
+
+    /// <summary>
+    /// 执行更新后防篡改检测并自动还原被篡改文件。
+    /// </summary>
+    static IntegrityReport VerifyAndSelfHeal(
+        string targetAppDir,
+        UpdateManifest manifest,
+        string recoveryZipPath,
+        UpdateProgressCallback cb
+    ) {
+        if (cb != null) {
+            cb(UpdateProgressInfo.Create(UpdatePhase.SelfHealing, 0, "", "开始进行文件防篡改自检与自愈..."));
+        }
+
+        // 1. 进行 MD5 比对检测
+        IntegrityReport report = TamperDetector.Check(targetAppDir, manifest, cb);
+
+        // 2. 若发现异常且提供了恢复包，立即执行自动还原
+        if (!report.isClean && recoveryZipPath != null && recoveryZipPath.Length > 0) {
+            if (cb != null) {
+                cb(UpdateProgressInfo.Create(
+                    UpdatePhase.SelfHealing,
+                    50,
+                    "",
+                    "检测到文件被篡改或缺失，正在从官方更新包自动还原修复..."
+                ));
+            }
+
+            TamperDetector.RestoreFromZip(targetAppDir, report, recoveryZipPath, cb);
+        }
+
+        if (cb != null) {
+            if (report.isClean) {
+                cb(UpdateProgressInfo.Create(UpdatePhase.Completed, 100, "", "防篡改自检通过：所有文件纯净完整！"));
+            } else {
+                cb(UpdateProgressInfo.Fail(UpdatePhase.Failed, "自愈后仍存在部分文件异常，请检查网络或恢复包！"));
+            }
+        }
+
+        return report;
+    }
+
+    /// <summary>
+    /// 执行完整更新流程：版本检查 -> 整包 MD5 校验 -> 解压覆盖 -> MD5 防篡改比对与自愈还原。
+    /// </summary>
+    static bool UpdateTo(
+        string currentVersion,
+        string manifestPath,
+        string localZipPath,
+        string targetAppDir,
+        bool backupOld,
+        UpdateProgressCallback cb
+    ) {
+        if (cb != null) {
+            cb(UpdateProgressInfo.Create(UpdatePhase.Checking, 0, "", "正在读取更新清单并检查版本..."));
+        }
+
+        UpdateManifest manifest = UpdateManifest.LoadFromFile(manifestPath);
+        if (manifest == null) {
+            if (cb != null) { cb(UpdateProgressInfo.Fail(UpdatePhase.Failed, "无法加载更新清单: " + manifestPath)); }
+            return false;
+        }
+
+        if (!HasNewVersion(currentVersion, manifest.version)) {
+            if (cb != null) {
+                cb(UpdateProgressInfo.Create(UpdatePhase.Completed, 100, "", "当前已是最新版本 (" + currentVersion + ")，无需更新"));
+            }
+            return true;
+        }
+
+        // 1. 校验整包 MD5
+        if (!VerifyZipPackage(localZipPath, manifest.packageMd5, cb)) {
+            return false;
+        }
+
+        // 2. 解压覆盖更新文件
+        if (!ApplyPackage(localZipPath, targetAppDir, backupOld, cb)) {
+            return false;
+        }
+
+        // 3. 执行防篡改比对自检，确保释放出的文件完整无误
+        IntegrityReport report = VerifyAndSelfHeal(targetAppDir, manifest, localZipPath, cb);
+        return report.isClean;
+    }
+}

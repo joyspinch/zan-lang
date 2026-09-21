@@ -1,0 +1,84 @@
+using System;
+using System.IO;
+using Zan.AppUpdate;
+
+class Program {
+    static int Main() {
+        string srcDir = "_scratch/conf_app_src";
+        string clientDir = "_scratch/conf_app_client";
+        string zipPath = "_scratch/conf_app_v1.zip";
+        string manifestPath = "_scratch/conf_app_v1.manifest.json";
+
+        if (!Directory.Exists(srcDir)) { Directory.CreateDirectory(srcDir); }
+        if (!Directory.Exists(srcDir + "/assets")) { Directory.CreateDirectory(srcDir + "/assets"); }
+        if (!Directory.Exists(clientDir)) { Directory.CreateDirectory(clientDir); }
+
+        string originalExe = "ZAN_APP_BINARY_v1.0.0_ORIGINAL";
+        string originalCfg = "{\"name\":\"test_app\",\"theme\":\"dark\"}";
+        byte[] originalPng = new byte[8] { 137, 80, 78, 71, 13, 10, 26, 10 };
+
+        File.WriteAllText(srcDir + "/app.exe", originalExe);
+        File.WriteAllText(srcDir + "/config.json", originalCfg);
+        File.WriteAllBytes(srcDir + "/assets/ui.png", originalPng);
+
+        // 1. 打包
+        UpdateManifest manifest = ReleasePackager.Pack(
+            srcDir, zipPath, manifestPath,
+            "ConformanceApp", "1.0.0", "Initial release",
+            "", null
+        );
+
+        if (manifest == null || manifest.files.Count != 3) {
+            Console.WriteLine("FAIL: pack manifest failed");
+            return 1;
+        }
+
+        // 2. 客户端解压安装
+        bool ok = AppUpdater.ApplyPackage(zipPath, clientDir, null, false);
+        if (!ok) {
+            Console.WriteLine("FAIL: apply package failed");
+            return 2;
+        }
+
+        // 3. 初始自检
+        IntegrityReport rep1 = TamperDetector.Check(clientDir, manifest, null);
+        if (!rep1.isClean || rep1.tamperedCount != 0 || rep1.missingCount != 0) {
+            Console.WriteLine("FAIL: initial integrity failed");
+            return 3;
+        }
+
+        // 4. 模拟篡改与缺失
+        File.WriteAllText(clientDir + "/app.exe", "MALICIOUS_TAMPERED_EXE");
+        File.Delete(clientDir + "/assets/ui.png");
+
+        // 5. 防篡改检测
+        IntegrityReport rep2 = TamperDetector.Check(clientDir, manifest, null);
+        if (rep2.isClean || rep2.tamperedCount != 1 || rep2.missingCount != 1) {
+            Console.WriteLine("FAIL: tamper detection failed");
+            return 4;
+        }
+
+        // 6. 自动还原自愈
+        int healed = TamperDetector.RestoreFromZip(clientDir, rep2, zipPath, null);
+        if (healed != 2) {
+            Console.WriteLine("FAIL: healed count mismatch");
+            return 5;
+        }
+
+        // 7. 自愈后二次复检
+        IntegrityReport rep3 = TamperDetector.Check(clientDir, manifest, null);
+        if (!rep3.isClean || rep3.tamperedCount != 0 || rep3.missingCount != 0) {
+            Console.WriteLine("FAIL: healed verification failed");
+            return 6;
+        }
+
+        string restoredExe = File.ReadAllText(clientDir + "/app.exe");
+        if (restoredExe != originalExe) {
+            Console.WriteLine("FAIL: restored content mismatch");
+            return 7;
+        }
+
+        Console.WriteLine("App update and tamper self-healing tests passed!");
+        return 0;
+    }
+}
