@@ -49,6 +49,20 @@ gui-webapp/
 - 启动时自动开启 DevTools（按 F12 调试控制台与 DOM）；
 - 可在 Zan IDE 中直接按 F5 运行和调试。
 
+**前端热开发（免打包免编译）**：开发模式下内嵌 WebServer 优先从磁盘
+直读前端资产，并由 `WebDevWatch` 递归监视变化自动刷新页面——改
+HTML/CSS/JS 保存后约半秒 WebView 自动重载，完全跳过 `PackWeb` 打包与
+主程序重编译：
+
+- 磁盘 Web 根目录解析优先级与打包器一致：`wwwroot/` > `web/dist/` > `web/`；
+  可用环境变量 `ZAN_WEBROOT` 显式指定，找不到磁盘目录时回退加密内嵌资产；
+- 纯 HTML 开发：模板自带预构建的 `web/dist/`，默认直读的就是它；若要直接
+  编辑 `web/` 下的源文件，删除 `web/dist/` 或设置 `ZAN_WEBROOT=web`；
+- Vue 开发：改 `web/src/` 后执行 `npm run build`（或 `npm run build -- --watch`
+  持续构建），产物落盘 `web/dist/` 时页面自动刷新；
+- Zan 侧 RPC 逻辑改动仍需重编译主程序（AOT 固有），前端无需任何操作；
+- 控制台可见 `[zan-webapp] dev` 前缀的日志（webRoot 路径、服务地址、刷新事件）。
+
 ### 3. 生产发布阶段（加密打包）
 执行纯 Zan 自举打包器：
 ```bash

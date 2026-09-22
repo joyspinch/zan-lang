@@ -1,12 +1,23 @@
 using System;
+using System.IO;
 using System.Net.Http;
+using Gui.Component.WebView;
 
 public class WebServer {
     static HttpServer server;
     static string currentToken = "";
     static int currentPort = 0;
 
+    // 开发模式状态：isDevMode 下优先从磁盘 webRoot 直读前端资产，
+    // 并由 WebDevWatch 监视变化自动刷新页面，跳过打包与重编译。
+    static bool devMode = false;
+    static string webRoot = "";
+    // 变化事件到达后的刷新倒计时（UI 定时器 tick 数），合并编辑器一次保存的连续写盘
+    static int reloadCountdown = 0;
+
     public static string StartAndVerify(bool isDevMode) {
+        devMode = isDevMode;
+
         // 生成 16 字节强随机十六进制 Session Token，用于全内存服务路由隔离
         currentToken = WebSecurity.GenerateToken();
 
@@ -29,7 +40,38 @@ public class WebServer {
             throw new Exception("Failed to bind random loopback port");
         }
 
-        return "http://127.0.0.1:" + currentPort.ToString() + "/" + currentToken + "/index.html";
+        string url = "http://127.0.0.1:" + currentPort.ToString() + "/" + currentToken + "/index.html";
+
+        // 开发模式：解析磁盘 webRoot 并启动递归监视（改前端无需重新打包编译）。
+        // 解析优先级与打包器 PackWeb 一致：wwwroot/ > web/dist/ > web/，
+        // 可用环境变量 ZAN_WEBROOT 显式覆盖；找不到磁盘目录则回退内嵌资产。
+        if (devMode) {
+            webRoot = ResolveWebRoot();
+            if (webRoot.Length > 0) {
+                WebDevWatch.Start(webRoot);
+                Console.WriteLine("[zan-webapp] dev webRoot: " + webRoot);
+            } else {
+                Console.WriteLine("[zan-webapp] dev: no disk webRoot found, serving embedded assets");
+            }
+            Console.WriteLine("[zan-webapp] dev server: " + url);
+        }
+
+        return url;
+    }
+
+    /// 解析开发模式的磁盘 Web 根目录，找不到返回空串（回退内嵌资产）。
+    static string ResolveWebRoot() {
+        string env = Environment.GetEnvironmentVariable("ZAN_WEBROOT");
+        if (env != null && env.Length > 0 && Directory.ExistsOnDisk(env)) {
+            return env;
+        }
+        string[] candidates = new string[] { "wwwroot", "web/dist", "web" };
+        for (int i = 0; i < candidates.Length; i = i + 1) {
+            if (Directory.ExistsOnDisk(candidates[i])) {
+                return candidates[i];
+            }
+        }
+        return "";
     }
 
     static async HttpResponse HandleRequest(HttpRequest req) {
@@ -52,6 +94,24 @@ public class WebServer {
             return HttpResponse.Ok("ready");
         }
 
+        // 开发模式：优先磁盘直读（保存后刷新即生效，无需重新打包编译）。
+        // 拒绝含 .. 的路径防目录穿越；读取失败（正被写入等）回退内嵌资产。
+        if (devMode && webRoot.Length > 0 && !subPath.Contains("..")) {
+            string full = webRoot + subPath;
+            if (File.Exists(full)) {
+                try {
+                    byte[] diskData = File.ReadAllBytes(full);
+                    if (diskData != null) {
+                        HttpResponse diskResp = HttpResponse.Bytes(diskData, diskData.Length, FileInfoEx.Mime(full));
+                        diskResp.SetHeader("Cache-Control", "no-cache");
+                        return diskResp;
+                    }
+                } catch (Exception ex) {
+                    // 读取失败，回退到内嵌资产
+                }
+            }
+        }
+
         // 内存读取并解密静态资产（全内存流转，绝不落地磁盘）
         WebAssetEntry entry = WebAssets.GetEntry(subPath);
         if (entry == null) {
@@ -64,5 +124,21 @@ public class WebServer {
         }
 
         return HttpResponse.Bytes(data, data.Length, entry.mime);
+    }
+
+    /// <summary>开发模式自动刷新：由 WebBridge 的 UI 轮询定时器调用。
+    /// 监视线程置脏后倒计约 250 ms 再刷新，合并编辑器一次保存的多次写盘。</summary>
+    public static void PollDevReload(WebViewBox box) {
+        if (!devMode) { return; }
+        if (reloadCountdown > 0) {
+            reloadCountdown = reloadCountdown - 1;
+            if (reloadCountdown == 0 && box != null) {
+                Console.WriteLine("[zan-webapp] dev: assets changed, reloading");
+                box.Reload();
+            }
+        }
+        if (WebDevWatch.ConsumeDirty()) {
+            reloadCountdown = 5;
+        }
     }
 }

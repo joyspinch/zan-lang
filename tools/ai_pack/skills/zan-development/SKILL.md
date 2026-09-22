@@ -107,6 +107,11 @@ the change.
 过没过"，必须手编直跑（`build/zanc.exe <case>.zan --auto-stdlib -o
 _scratch/x.exe && _scratch/x.exe`）当真值，ctest 只当台账。
 
+**`System.Threading.Timer` 构造后不自启**（2026-09-22 实证）：`new Timer(50, cb)`
+只是注册，必须再调 `t.Start()`，否则共享泵根本不投 tick——全程无任何报错，
+依赖它的轮询/消息泵整个静默失效（gui-webapp 模板的桥消息泵就因此死过，
+前端 RPC 与窗口控制全无响应）。构造后紧跟 Start，并实跑验证回调确实在触发。
+
 ## 6b. Writing windows in HTML (Gui P5)
 
 Windows can be described in plain HTML + CSS instead of hand-built control
