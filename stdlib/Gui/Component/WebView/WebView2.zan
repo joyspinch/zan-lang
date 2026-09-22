@@ -90,6 +90,8 @@ class WebView2 {
     string lastRequest;
     string evalResult;
     string cookieResult;
+    string cookieDetailsResult;
+    List<WebCookie> cookieListResult;
     // JS→native 消息桥：页面 postMessage 进入有界队列，宿主逐帧取走。
     // handlerNames/shimIds 平行——每个通道一条 window.webkit shim 注入脚本，
     // 记录其脚本 id 以便撤通道时一并移除。
@@ -174,7 +176,7 @@ class WebView2 {
     static int SlotStop() { return 43; }
     /// 槽 48：get_DocumentTitle，读取页面标题。
     static int SlotGetDocumentTitle() { return 48; }
-    /// ICoreWebView2_2（新增 Cookie 管理器）的 vtable 槽。
+    /// ICoreWebView2_2 接口虚函数 get_CookieManager（继承 ICoreWebView2，槽位 66）。
     static int SlotGetCookieManager() { return 66; }
     /// ICoreWebView2_2 的接口 IID，QueryInterface 取 Cookie 管理器时使用。
     static string IidWebView2_2() {
@@ -206,6 +208,10 @@ class WebView2 {
     static int SlotCookieName() { return 3; }
     /// ICoreWebView2Cookie 槽 4：get_Value，读 Cookie 值。
     static int SlotCookieValue() { return 4; }
+    /// ICoreWebView2Cookie 槽 6：get_Domain，读所属域名。
+    static int SlotCookieDomain() { return 6; }
+    /// ICoreWebView2Cookie 槽 7：get_Path，读路径。
+    static int SlotCookiePath() { return 7; }
     /// ICoreWebView2CookieList 槽 3：get_Count，读列表长度。
     static int SlotCookieCount() { return 3; }
     /// ICoreWebView2CookieList 槽 4：按下标异步取 Cookie。
@@ -686,6 +692,8 @@ class WebView2 {
         if (w == null) { return 0; }
         if (Com.Ok(hr) && list != 0) {
             w.cookieResult = WebView2.Serialize(list);
+            w.cookieDetailsResult = WebView2.SerializeDetails(list);
+            w.cookieListResult = WebView2.ExtractCookies(list);
         }
         w.gate.Signal();
         w.cookieGate.Signal();
@@ -713,6 +721,55 @@ class WebView2 {
             }
         }
         return outp;
+    }
+
+    /// 将 Cookie 列表呈现为包含完整信息的制表符分隔行（每行一个：name\tvalue\tdomain\tpath\n）。
+    static string SerializeDetails(nint list) {
+        int n = Com.GetInt(list, WebView2.SlotCookieCount());
+        string outp = "";
+        for (int i = 0; i < n; i = i + 1) {
+            nint cell = NativeMemory.Alloc(8);
+            new Span<long>(cell, 1)[0] = 0;
+            int hr = Com.Call2(list, WebView2.SlotCookieAt(), i, cell);
+            nint cookie = new Span<long>(cell, 1)[0];
+            NativeMemory.Free(cell);
+            if (Com.Ok(hr) && cookie != 0) {
+                string name = Com.GetString(cookie, WebView2.SlotCookieName());
+                string val = Com.GetString(cookie, WebView2.SlotCookieValue());
+                string dom = Com.GetString(cookie, WebView2.SlotCookieDomain());
+                string path = Com.GetString(cookie, WebView2.SlotCookiePath());
+                if (name != "") {
+                    outp = outp + name + "\t" + val + "\t" + dom + "\t" + path + "\n";
+                }
+                Com.Release(cookie);
+            }
+        }
+        return outp;
+    }
+
+    /// 直接从 COM 接口解构出强类型 List<WebCookie>，零中间字符串，完全保留所有原生字段。
+    static List<WebCookie> ExtractCookies(nint list) {
+        List<WebCookie> result = new List<WebCookie>();
+        if (list == 0) { return result; }
+        int n = Com.GetInt(list, WebView2.SlotCookieCount());
+        for (int i = 0; i < n; i = i + 1) {
+            nint cell = NativeMemory.Alloc(8);
+            new Span<long>(cell, 1)[0] = 0;
+            int hr = Com.Call2(list, WebView2.SlotCookieAt(), i, cell);
+            nint cookie = new Span<long>(cell, 1)[0];
+            NativeMemory.Free(cell);
+            if (Com.Ok(hr) && cookie != 0) {
+                string name = Com.GetString(cookie, WebView2.SlotCookieName());
+                string val = Com.GetString(cookie, WebView2.SlotCookieValue());
+                string dom = Com.GetString(cookie, WebView2.SlotCookieDomain());
+                string path = Com.GetString(cookie, WebView2.SlotCookiePath());
+                if (name != "") {
+                    result.Add(new WebCookie(name, val, dom, path));
+                }
+                Com.Release(cookie);
+            }
+        }
+        return result;
     }
 
     // ---- 操作 ----
@@ -875,16 +932,32 @@ class WebView2 {
         return title;
     }
 
-    /// 异步运行 JavaScript 并等待其 JSON 结果（协程挂起，零消息泵，不卡死 GUI 线程）。
+    /// 把 COM 发起投回 UI 线程：get_CookieManager/ExecuteScript 等
+    /// WebView2 入口有 UI 线程亲和（跨线程调用直接回 UI_E_WRONG_THREAD，
+    /// 即 0x802A000C），而 async 体由后台协程池驱动、不在 GUI 线程上——
+    /// 经 Dispatcher 投回，由 GUI 帧循环 DrainPosts 消费。Dispatcher
+    /// 未初始化（headless 探针）或队列满时 Post 失败，退化为就地发起。
+    static void IssueOnUi(Action issue) {
+        if (!Dispatcher.Post(issue)) { issue(); }
+    }
+
+    /// 异步运行 JavaScript 并等待其 JSON 结果（协程挂起，零消息泵，不卡死
+    /// GUI 线程）。发起经 IssueOnUi 投回 UI 线程，完成回调本就在 UI 线程
+    /// 点亮 evalGate。
     async string EvalWithResultAsync(string js, int timeoutMs = 5000) {
         if (core == 0) { return ""; }
         evalResult = "";
         nint sink = this.Sink((nint)WebView2.OnScriptCompleted);
-        nint script = Wide.Of(js);
         evalGate = new Gate();
-        int hr = Com.Call2(core, WebView2.SlotExecuteScript(), script, sink);
-        Wide.Free(script);
-        if (!Com.Ok(hr)) { return ""; }
+        WebView2.IssueOnUi(() => {
+            nint script = Wide.Of(js);
+            int hr = Com.Call2(core, WebView2.SlotExecuteScript(), script, sink);
+            Wide.Free(script);
+            if (!Com.Ok(hr)) {
+                Console.WriteLine("[WV2] ExecuteScript hr=" + Convert.ToString(hr));
+                evalGate.Signal();
+            }
+        });
         await evalGate.Wait(timeoutMs);
         return evalResult;
     }
@@ -1153,27 +1226,103 @@ class WebView2 {
     nint Cookies() {
         if (core == 0) { return 0; }
         nint c2 = Com.Query(core, WebView2.IidWebView2_2());
-        if (c2 == 0) { return 0; }
-        nint cm = Com.Get(c2, WebView2.SlotGetCookieManager());
+        if (c2 == 0) {
+            Console.WriteLine("[WV2] Query IidWebView2_2 failed, c2=0!");
+            return 0;
+        }
+        nint cell = NativeMemory.Alloc(8);
+        new Span<long>(cell, 1)[0] = 0;
+        int hr = Com.Call1(c2, WebView2.SlotGetCookieManager(), cell);
+        nint cm = new Span<long>(cell, 1)[0];
+        NativeMemory.Free(cell);
         Com.Release(c2);
+        if (!Com.Ok(hr) || cm == 0) {
+            Console.WriteLine("[WV2] SlotGetCookieManager failed hr=" + Convert.ToString(hr) + " cm=" + Convert.ToString((long)cm));
+            return 0;
+        }
         return cm;
     }
 
-    /// 异步获取 `forUrl` 的 Cookie（协程挂起等待，零消息泵，不阻塞 GUI 线程）。
+    /// 异步读取 `forUrl` 匹配域名的 Cookie 并在回调到达时恢复（协程挂起，
+    /// 零消息泵，不卡死 GUI 线程）。发起经 IssueOnUi 投回 UI 线程（下同）。
     async string GetCookiesAsync(string forUrl, int timeoutMs = 5000) {
-        nint cm = this.Cookies();
-        if (cm == 0) { return ""; }
         nint sink = this.Sink((nint)WebView2.OnCookiesCompleted);
-        nint u = 0;
-        if (forUrl != "") { u = Wide.Of(forUrl); }
         cookieResult = "";
         cookieGate = new Gate();
-        int hr = Com.Call2(cm, WebView2.SlotGetCookies(), u, sink);
-        if (u != 0) { Wide.Free(u); }
-        Com.Release(cm);
-        if (!Com.Ok(hr)) { return ""; }
+        WebView2.IssueOnUi(() => {
+            nint cm = this.Cookies();
+            if (cm == 0) {
+                Console.WriteLine("[WV2] Cookies() returned 0!");
+                cookieGate.Signal();
+                return;
+            }
+            nint u = 0;
+            if (forUrl != "") { u = Wide.Of(forUrl); }
+            int hr = Com.Call2(cm, WebView2.SlotGetCookies(), u, sink);
+            if (u != 0) { Wide.Free(u); }
+            Com.Release(cm);
+            if (!Com.Ok(hr)) {
+                Console.WriteLine("[WV2] SlotGetCookies hr=" + Convert.ToString(hr));
+                cookieGate.Signal();
+            }
+        });
         await cookieGate.Wait(timeoutMs);
         return cookieResult;
+    }
+
+    /// 异步读取 `forUrl` 匹配域名的 Cookie 详情列表（name\tvalue\tdomain\tpath\n）。
+    async string GetCookieDetailsAsync(string forUrl, int timeoutMs = 5000) {
+        nint sink = this.Sink((nint)WebView2.OnCookiesCompleted);
+        cookieResult = "";
+        cookieDetailsResult = "";
+        cookieGate = new Gate();
+        WebView2.IssueOnUi(() => {
+            nint cm = this.Cookies();
+            if (cm == 0) {
+                Console.WriteLine("[WV2] Cookies() returned 0!");
+                cookieGate.Signal();
+                return;
+            }
+            nint u = 0;
+            if (forUrl != "") { u = Wide.Of(forUrl); }
+            int hr = Com.Call2(cm, WebView2.SlotGetCookies(), u, sink);
+            if (u != 0) { Wide.Free(u); }
+            Com.Release(cm);
+            if (!Com.Ok(hr)) {
+                Console.WriteLine("[WV2] SlotGetCookies hr=" + Convert.ToString(hr));
+                cookieGate.Signal();
+            }
+        });
+        await cookieGate.Wait(timeoutMs);
+        return cookieDetailsResult;
+    }
+
+    /// 异步读取强类型 Cookie 对象列表（零字符串中转，包含完整 Name/Value/Domain/Path）。
+    async List<WebCookie> GetCookieListAsync(string forUrl = "", int timeoutMs = 5000) {
+        nint sink = this.Sink((nint)WebView2.OnCookiesCompleted);
+        cookieResult = "";
+        cookieDetailsResult = "";
+        cookieListResult = new List<WebCookie>();
+        cookieGate = new Gate();
+        WebView2.IssueOnUi(() => {
+            nint cm = this.Cookies();
+            if (cm == 0) {
+                Console.WriteLine("[WV2] Cookies() returned 0!");
+                cookieGate.Signal();
+                return;
+            }
+            nint u = 0;
+            if (forUrl != "") { u = Wide.Of(forUrl); }
+            int hr = Com.Call2(cm, WebView2.SlotGetCookies(), u, sink);
+            if (u != 0) { Wide.Free(u); }
+            Com.Release(cm);
+            if (!Com.Ok(hr)) {
+                Console.WriteLine("[WV2] SlotGetCookies hr=" + Convert.ToString(hr));
+                cookieGate.Signal();
+            }
+        });
+        await cookieGate.Wait(timeoutMs);
+        return cookieListResult;
     }
 
     /// `forUrl` 的 Cookie，形如 "name=value; ..."；"" 表示整个存储。
