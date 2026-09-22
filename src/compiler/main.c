@@ -912,9 +912,11 @@ static pi_dir_t *pi_dirs_tail = NULL;
 static zan_target_t pi_target;
 static const char *const *pi_pp_defines = NULL;
 static int pi_pp_define_count = 0;
+static bool pi_publish_mode = false;
 static void zan_apply_lex_defines(zan_lexer_t *lex, zan_target_t target,
                                   const char *const *pp_defines,
-                                  int pp_define_count);
+                                  int pp_define_count,
+                                  bool is_publish);
 
 static unsigned pi_hash(const char *s, size_t len) {
     unsigned h = 2166136261u;
@@ -1228,7 +1230,8 @@ static void pi_scan_file(pi_file_t *f) {
     zan_diag_set_capture(diag, true);
     zan_lexer_t lex;
     zan_lexer_init(&lex, src, len, 0, arena, diag);
-    zan_apply_lex_defines(&lex, pi_target, pi_pp_defines, pi_pp_define_count);
+    zan_apply_lex_defines(&lex, pi_target, pi_pp_defines, pi_pp_define_count,
+                          pi_publish_mode);
     int depth = 0;
     zan_token_kind_t prev = TK_EOF;
     pi_name_t *last_id = NULL;  /* previous chain segment (Task.WhenAll
@@ -1408,7 +1411,7 @@ static void pi_seed_source(const char *source, size_t len) {
     for (int pass = 0; pass < 2; pass++) {
         zan_lexer_init(&lex, source, len, 0, arena, diag);
         zan_apply_lex_defines(&lex, pi_target, pi_pp_defines,
-                              pi_pp_define_count);
+                              pi_pp_define_count, pi_publish_mode);
         int depth = 0;
         zan_token_kind_t prev = TK_EOF;
         pi_name_t *chain = NULL;    /* first segment of the dotted chain */
@@ -2080,7 +2083,8 @@ static void pi_parse_and_seed(const char *src, size_t len, int is_entry) {
     zan_diag_t *diag = zan_diag_new(arena);
     zan_lexer_t lex;
     zan_lexer_init(&lex, src, len, 0, arena, diag);
-    zan_apply_lex_defines(&lex, pi_target, pi_pp_defines, pi_pp_define_count);
+    zan_apply_lex_defines(&lex, pi_target, pi_pp_defines, pi_pp_define_count,
+                          pi_publish_mode);
     zan_parser_t p;
     zan_parser_init(&p, &lex, arena, diag);
     zan_ast_node_t *unit = zan_parser_parse(&p);
@@ -2229,7 +2233,8 @@ static int pi_append_included(const char ***files, int *count, int *cap) {
  * the main parse loop and by the demand-driven pull-in's secondary rounds. */
 static void zan_apply_lex_defines(zan_lexer_t *lex, zan_target_t target,
                                   const char *const *pp_defines,
-                                  int pp_define_count) {
+                                  int pp_define_count,
+                                  bool is_publish) {
     switch (target.os) {
     case ZAN_OS_WINDOWS:
         zan_lexer_define(lex, "WINDOWS", "1");
@@ -2296,6 +2301,12 @@ static void zan_apply_lex_defines(zan_lexer_t *lex, zan_target_t target,
         }
         zan_lexer_define(lex, dname, dval);
     }
+    if (is_publish) {
+        zan_lexer_define(lex, "PUBLISH", "1");
+        zan_lexer_define(lex, "RELEASE", "1");
+    } else {
+        zan_lexer_define(lex, "DEBUG", "1");
+    }
 }
 
 /* Parse one extra file with the same preprocessor environment as the main
@@ -2305,6 +2316,7 @@ static zan_ast_node_t *parse_secondary_unit(const char *path,
                                             zan_target_t target,
                                             const char *const *pp_defines,
                                             int pp_define_count,
+                                            bool is_publish,
                                             zan_arena_t *arena,
                                             zan_diag_t *diag) {
     size_t slen = 0;
@@ -2314,7 +2326,8 @@ static zan_ast_node_t *parse_secondary_unit(const char *path,
     zan_diag_add_file(diag, path, src);
     zan_lexer_t lex;
     zan_lexer_init(&lex, src, slen, file_id, arena, diag);
-    zan_apply_lex_defines(&lex, target, pp_defines, pp_define_count);
+    zan_apply_lex_defines(&lex, target, pp_defines, pp_define_count,
+                          is_publish);
     zan_parser_t parser;
     zan_parser_init(&parser, &lex, arena, diag);
     zan_ast_node_t *unit = zan_parser_parse(&parser);
@@ -3929,6 +3942,7 @@ int main(int argc, char **argv) {
             pi_target = target;
             pi_pp_defines = pp_defines;
             pi_pp_define_count = pp_define_count;
+            pi_publish_mode = publish_mode;
             pi_stdlib_root_buf = stdlib_root;
             for (int fi = 0; fi < input_count; fi++) {
                 /* A saved user component is generator data (consumed inside
@@ -4096,7 +4110,8 @@ int main(int argc, char **argv) {
         zan_lexer_t lex;
         zan_lexer_init(&lex, src, slen, fi, arena, diag);
 
-        zan_apply_lex_defines(&lex, target, pp_defines, pp_define_count);
+        zan_apply_lex_defines(&lex, target, pp_defines, pp_define_count,
+                              publish_mode);
 
         zan_parser_t parser;
         zan_parser_init(&parser, &lex, arena, diag);
@@ -4210,7 +4225,7 @@ int main(int argc, char **argv) {
             for (int fi = input_count - fresh; fi < input_count; fi++) {
                 zan_ast_node_t *unit = parse_secondary_unit(
                     input_files[fi], target, pp_defines, pp_define_count,
-                    arena, diag);
+                    publish_mode, arena, diag);
                 if (!unit) {
                     fprintf(stderr, "error: cannot read '%s'\n",
                             input_files[fi]);
