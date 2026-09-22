@@ -357,6 +357,12 @@ EXPORT void zan_gui_webview_set_cookie(i32 h, const char *url, const char *name,
     (void)h; (void)url; (void)name; (void)value;
 }
 EXPORT void zan_gui_webview_clear_cookies(i32 h) { (void)h; }
+EXPORT void zan_gui_webview_set_devtools_enabled(i32 h, i32 enabled) {
+    (void)h; (void)enabled;
+}
+EXPORT void zan_gui_webview_set_context_menu_enabled(i32 h, i32 enabled) {
+    (void)h; (void)enabled;
+}
 
 /* ---- UI dispatch (Gui.Dispatcher's queue) ------------------------------
  * The desktop implementation lives in rt_sync.c behind a mutex; wasm32 has

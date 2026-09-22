@@ -2287,6 +2287,30 @@ EXPORT void zan_gui_webview_set_zoom(i32 h, i32 percent) {
     }
 }
 
+EXPORT void zan_gui_webview_set_devtools_enabled(i32 h, i32 enabled) {
+    WKWebView *wv = wv_get(h);
+    if (!wv) return;
+    @autoreleasepool {
+        @try {
+            [wv.configuration.preferences setValue:@(enabled ? YES : NO) forKey:@"developerExtrasEnabled"];
+            if ([wv respondsToSelector:@selector(setInspectable:)]) {
+                [wv performSelector:@selector(setInspectable:) withObject:(id)(intptr_t)(enabled ? YES : NO)];
+            }
+        } @catch (NSException *ex) {}
+    }
+}
+
+EXPORT void zan_gui_webview_set_context_menu_enabled(i32 h, i32 enabled) {
+    WKWebView *wv = wv_get(h);
+    if (!wv) return;
+    @autoreleasepool {
+        if (!enabled) {
+            NSString *js = @"window.addEventListener('contextmenu', function(e){e.preventDefault();}, true);";
+            [wv evaluateJavaScript:js completionHandler:nil];
+        }
+    }
+}
+
 EXPORT i32 zan_gui_set_clipboard(const char *utf8) {
     ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_set_clipboard(utf8));
     @autoreleasepool {

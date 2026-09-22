@@ -737,4 +737,12 @@ EXPORT void zan_gui_webview_set_clip(i32 h, const char *spec) {
     awv_call_s(g_awv_mid.clip, h, s);
 }
 
+EXPORT void zan_gui_webview_set_devtools_enabled(i32 h, i32 enabled) {
+    (void)h; (void)enabled;
+}
+
+EXPORT void zan_gui_webview_set_context_menu_enabled(i32 h, i32 enabled) {
+    (void)h; (void)enabled;
+}
+
 #endif /* __ANDROID__ */
