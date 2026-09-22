@@ -4,6 +4,7 @@ using System.Data.Orm;
 using System.Web;
 using ZanWeb;
 using ZanWeb.Model.Sys;
+using ZanWeb.Dao.Sys;
 
 namespace ZanWeb.Admin.System;
 
@@ -115,22 +116,13 @@ class Roles : AdminController {
             }
         }
 
-        Role clash = await this.Role.Where(a => a.code == code).FirstAsync();
+        RoleDao roleDao = new RoleDao(this.Db());
+        Role clash = await roleDao.ByCode(code);
         if (clash != null && clash.id != id) {
             this.Fail(400, Codes.Conflict, "角色标识 " + code + " 已存在");
         }
         if (id > 0) {
-            int n = await this.Role.Update()
-                .Set(a => a.name, name)
-                .Set(a => a.code, code)
-                .Set(a => a.rank, rank)
-                .Set(a => a.status, status)
-                .Set(a => a.description, description)
-                .Set(a => a.dataScope, dataScope)
-                .Set(a => a.scopeDepts, scopeDepts)
-                .Set(a => a.updatedAt, WebApp.NowSeconds())
-                .Where(a => a.id == id)
-                .ExecuteAffrowsAsync();
+            int n = await roleDao.UpdateBasic(id, name, code, rank, status, description, dataScope, scopeDepts, WebApp.NowSeconds());
             await this.RefreshRoles();
             await this.Note("编辑角色", code, n > 0, "");
             this.Saved("角色已保存");
@@ -146,7 +138,7 @@ class Roles : AdminController {
         r.scopeDepts = scopeDepts;
         r.createdAt = WebApp.NowSeconds();
         r.updatedAt = r.createdAt;
-        int newId = await this.Role.Insert(r).ExecuteIdentityAsync();
+        int newId = await roleDao.Insert(r);
         await this.RefreshRoles();
         await this.Note("新增角色", code, newId > 0, "");
         this.Saved("角色已创建");
@@ -163,7 +155,8 @@ class Roles : AdminController {
             this.Fail(400, Codes.Conflict, "还有 " + Convert.ToString(held)
                 + " 个账号在使用该角色，请先解除分配");
         }
-        int n = await this.Role.Delete().Where(a => a.id == id).ExecuteAffrowsAsync();
+        RoleDao roleDao = new RoleDao(this.Db());
+        int n = await roleDao.Delete(id);
         int _g = await this.RoleGrant.Delete().Where(a => a.roleId == id)
             .ExecuteAffrowsAsync();
         await this.RefreshRoles();
@@ -256,21 +249,23 @@ class Roles : AdminController {
     }
 
     async void RefreshRoles() {
-        List<Role> roles = await this.Role.ToListAsync();
+        RoleDao roleDao = new RoleDao(this.Db());
+        List<Role> roles = await roleDao.All();
         List<RoleGrant> grants = await this.RoleGrant.ToListAsync();
         await AuthUser.RolesChanged(roles, grants);
     }
 
     async Role Find(int id) {
-        Role r = await this.Role.Read(id);
+        RoleDao roleDao = new RoleDao(this.Db());
+        Role r = await roleDao.ById(id);
         if (r == null) { this.Fail(404, Codes.NotFound, "角色不存在"); }
         return r;
     }
 
     /* 提交的部门存作 ",3,7,"；只保留存在的——与 GrantSave 仅保留存在的动作同理，防止伪造字段把不可见部门 id 写进 scope。 */
     async string ScopeDepts(string picked) {
-        List<Department> all = await this.Department
-            .OrderBy(a => a.sortOrder).ToListAsync();
+        DepartmentDao deptDao = new DepartmentDao(this.Db());
+        List<Department> all = await deptDao.All();
         StringBuilder outp = new StringBuilder();
         outp.Append(",");
         int kept = 0;

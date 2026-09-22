@@ -1,6 +1,8 @@
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.Data;
+using ZanWeb.Dao.Collab;
 using ZanWeb.Model.Collab;
 
 namespace ZanWeb.Modules.Collab;
@@ -36,25 +38,22 @@ class CollabEventRelay {
     }
 
     static async void Sweep(IDbConnection db) {
+        CollabEventDao eventDao = new CollabEventDao(db);
+        CollabMemberDao memberDao = new CollabMemberDao(db);
+
         /* 首拍 Init：水位对齐当前 MAX(id)，历史不推。 */
         if (CollabEventRelay.lastId < 0) {
-            CollabEvent last = await db.Select<CollabEvent>()
-                .OrderByDescending(a => a.id).FirstAsync();
+            CollabEvent last = await eventDao.Latest();
             CollabEventRelay.lastId = last == null ? 0 : last.id;
             return;
         }
         long mark = CollabEventRelay.lastId;
-        List<CollabEvent> rows = await db.Select<CollabEvent>()
-            .Where(a => a.id > mark).OrderBy(a => a.id)
-            .Take(CollabEventRelay.BatchSize).ToListAsync();
+        List<CollabEvent> rows = await eventDao.AfterId(mark, CollabEventRelay.BatchSize);
         for (int i = 0; i < rows.Count; i = i + 1) {
             CollabEvent r = rows[i];
             CollabEventRelay.lastId = r.id;
             if (r.conversationId <= 0) { continue; }
-            List<CollabMember> targets = await db.Select<CollabMember>()
-                .Where(a => a.tenantId == r.tenantId
-                    && a.conversationId == r.conversationId
-                    && a.status == "active").ToListAsync();
+            List<CollabMember> targets = await memberDao.ActiveMembers(r.tenantId, r.conversationId);
             if (targets.Count == 0) { continue; }
             /* 每目标独立成形：PushTyped 会向 payload 写顶层 type，共享同一
                对象会被二次 Put 追加重复键（A324 教训）。 */

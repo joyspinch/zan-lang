@@ -1,7 +1,12 @@
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.Data;
 using System.Data.Orm;
+using ZanWeb.Dao.Crm;
+using ZanWeb.Dao.Flow;
+using ZanWeb.Dao.Oa;
+using ZanWeb.Dao.Wms;
 using ZanWeb.Model.Crm;
 using ZanWeb.Model.Flow;
 using ZanWeb.Model.Oa;
@@ -73,9 +78,8 @@ class TodoCenter {
         List<TodoItem> items = new List<TodoItem>();
 
         /* manual：本人真待办行直接入流。 */
-        List<OaTodo> manual = await db.Select<OaTodo>()
-            .Where(a => a.tenantId == tenantId && a.userId == me.id
-                && a.source == "manual" && a.status == 0).ToListAsync();
+        OaTodoDao todoDao = new OaTodoDao(db);
+        List<OaTodo> manual = await todoDao.ActiveManual(tenantId, me.id);
         for (int i = 0; i < manual.Count; i = i + 1) {
             OaTodo t = manual[i];
             TodoItem it = new TodoItem();
@@ -90,9 +94,7 @@ class TodoCenter {
         }
 
         /* 虚拟源标记行：status=1/2 的 (source,relatedType,relatedId) 集合。 */
-        List<OaTodo> marks = await db.Select<OaTodo>()
-            .Where(a => a.tenantId == tenantId && a.userId == me.id
-                && a.status != 0 && a.source != "manual").ToListAsync();
+        List<OaTodo> marks = await todoDao.DoneMarks(tenantId, me.id);
         Dict<string, int> done = new Dict<string, int>();
         for (int i = 0; i < marks.Count; i = i + 1) {
             OaTodo t = marks[i];
@@ -142,26 +144,16 @@ class TodoCenter {
                            string source, string relatedType, int relatedId,
                            int status, string title) {
         long now = WebApp.NowSeconds();
+        OaTodoDao todoDao = new OaTodoDao(db);
         if (source == "manual") {
-            OaTodo row = await db.Select<OaTodo>()
-                .Where(a => a.tenantId == tenantId && a.userId == userId
-                    && a.id == relatedId && a.source == "manual").FirstAsync();
+            OaTodo row = await todoDao.FindManual(tenantId, userId, relatedId);
             if (row == null) { return false; }
-            await db.Update<OaTodo>()
-                .Set(a => a.status, status)
-                .Set(a => a.doneAt, now)
-                .Where(a => a.id == row.id).ExecuteAffrowsAsync();
+            await todoDao.UpdateStatus(row.id, status, now);
             return true;
         }
-        OaTodo mark = await db.Select<OaTodo>()
-            .Where(a => a.tenantId == tenantId && a.userId == userId
-                && a.source == source && a.relatedType == relatedType
-                && a.relatedId == relatedId).FirstAsync();
+        OaTodo mark = await todoDao.FindMark(tenantId, userId, source, relatedType, relatedId);
         if (mark != null) {
-            await db.Update<OaTodo>()
-                .Set(a => a.status, status)
-                .Set(a => a.doneAt, now)
-                .Where(a => a.id == mark.id).ExecuteAffrowsAsync();
+            await todoDao.UpdateStatus(mark.id, status, now);
             return true;
         }
         OaTodo t = new OaTodo();
@@ -176,7 +168,7 @@ class TodoCenter {
         t.relatedId = relatedId;
         t.createdAt = now;
         t.doneAt = now;
-        await db.Insert<OaTodo>(t).ExecuteAffrowsAsync();
+        await todoDao.Insert(t);
         return true;
     }
 }
@@ -187,11 +179,11 @@ class TodoSources {
        （完成即从源消失，自然同步，无需标记行）。 */
     static async List<TodoItem> Flow(IDbConnection db, int tenantId, User me) {
         List<TodoItem> items = new List<TodoItem>();
-        List<FlowTask> tasks = await db.Select<FlowTask>()
-            .Where(a => a.assignUserId == me.id && a.status == 0).ToListAsync();
+        FlowTaskDao taskDao = new FlowTaskDao(db);
+        FlowInstDao instDao = new FlowInstDao(db);
+        List<FlowTask> tasks = await taskDao.PendingByAssignee(me.id);
         if (tasks.Count == 0) { return items; }
-        List<FlowInst> insts = await db.Select<FlowInst>()
-            .Where(a => a.tenantId == tenantId).ToListAsync();
+        List<FlowInst> insts = await instDao.ByTenant(tenantId);
         for (int i = 0; i < tasks.Count; i = i + 1) {
             FlowTask t = tasks[i];
             TodoItem it = new TodoItem();
@@ -212,11 +204,8 @@ class TodoSources {
     static async List<TodoItem> Crm(IDbConnection db, int tenantId, User me) {
         List<TodoItem> items = new List<TodoItem>();
         long horizon = WebApp.NowSeconds() + 7 * 86400;
-        List<CrmOpportunity> rows = await db.Select<CrmOpportunity>()
-            .Where(a => a.tenantId == tenantId && a.ownerId == me.id
-                && a.stage >= 1 && a.stage <= 4
-                && a.expectedCloseAt > 0 && a.expectedCloseAt <= horizon)
-            .OrderBy(a => a.expectedCloseAt).ToListAsync();
+        CrmOpportunityDao oppDao = new CrmOpportunityDao(db);
+        List<CrmOpportunity> rows = await oppDao.ApproachingByOwner(tenantId, me.id, horizon);
         for (int i = 0; i < rows.Count; i = i + 1) {
             CrmOpportunity o = rows[i];
             TodoItem it = new TodoItem();
@@ -238,11 +227,11 @@ class TodoSources {
         List<TodoItem> items = new List<TodoItem>();
         long threshold = Filter.ToInt(await Settings.Get("wms.reorder.qty",
             "10"), 10);
-        List<WmsInventory> rows = await db.Select<WmsInventory>()
-            .Where(a => a.tenantId == tenantId && a.qty <= threshold).ToListAsync();
+        WmsInventoryDao invDao = new WmsInventoryDao(db);
+        WmsSkuDao skuDao = new WmsSkuDao(db);
+        List<WmsInventory> rows = await invDao.LowStockByTenant(tenantId, threshold);
         if (rows.Count == 0) { return items; }
-        List<WmsSku> skus = await db.Select<WmsSku>()
-            .Where(a => a.tenantId == tenantId).ToListAsync();
+        List<WmsSku> skus = await skuDao.ByTenant(tenantId);
         for (int i = 0; i < rows.Count; i = i + 1) {
             WmsInventory inv = rows[i];
             string name = Convert.ToString(inv.skuId);

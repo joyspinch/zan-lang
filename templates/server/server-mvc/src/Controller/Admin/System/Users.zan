@@ -3,6 +3,7 @@ using System.Data;
 using System.Data.Orm;
 using System.Security.Cryptography;
 using System.Web;
+using System.Json;
 using ZanWeb;
 using ZanWeb.Model.Sys;
 using ZanWeb.Dao.Sys;
@@ -34,23 +35,14 @@ class Users : AdminController {
         List<int> scoped = sc.Depts();
         int mine = sc.UserId();
 
-        int total = await this.User
-            .WhereIf(kw.Length > 0, a => a.username.Contains(kw))
-            .WhereIf(status >= 0, a => a.status == status)
-            .WhereIf(sc.ByDept(), a => scoped.Contains(a.departmentId))
-            .WhereIf(sc.Mine(), a => a.id == mine)
-            .CountAsync();
-        List<User> rows = await this.User
-            .WhereIf(kw.Length > 0, a => a.username.Contains(kw))
-            .WhereIf(status >= 0, a => a.status == status)
-            .WhereIf(sc.ByDept(), a => scoped.Contains(a.departmentId))
-            .WhereIf(sc.Mine(), a => a.id == mine)
-            .OrderByDescending(a => a.id)
-            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        int total = await new UserDao(this.Held()).CountPaged(
+            kw, status, sc.ByDept(), scoped, sc.Mine(), mine);
+        List<User> rows = await new UserDao(this.Held()).PagedList(
+            kw, status, sc.ByDept(), scoped, sc.Mine(), mine, q.Skip(), q.Limit());
 
-        List<Department> depts = await this.Department.ToListAsync();
-        List<Role> roles = await this.Role.ToListAsync();
-        List<UserRole> links = await this.UserRole.ToListAsync();
+        List<Department> depts = await new DepartmentDao(this.Held()).All();
+        List<Role> roles = await new RoleDao(this.Held()).All();
+        List<UserRole> links = await new UserRoleDao(this.Held()).All();
 
         List<StrMap> items = d.AddList("rows");
         for (int i = 0; i < rows.Count; i = i + 1) {
@@ -59,8 +51,8 @@ class Users : AdminController {
             row.Set("id", Convert.ToString(u.id));
             row.Set("username", u.username);
             row.Set("nickname", Fmt.Dash(u.nickname));
-            row.Set("email", Fmt.Dash(u.email));
-            row.Set("mobile", Fmt.Dash(u.mobile));
+            row.Set("email", Fmt.Dash(Fmt.MaskEmail(u.email)));
+            row.Set("mobile", Fmt.Dash(Fmt.MaskMobile(u.mobile)));
             row.Set("dept", Users.DeptName(depts, u.departmentId));
             row.Set("roles", Users.RoleNames(roles, links, u.id));
             row.Set("statusText", Users.StatusText(u.status));
@@ -104,10 +96,8 @@ class Users : AdminController {
         /* 仅该账号可写部门入选，使对话框无法提议 Save 随后拒绝的迁移；仅本人 scope 一处都不可写。 */
         DataScope sc = await this.Scope();
         List<int> scoped = sc.Depts();
-        List<Department> depts = await this.Department
-            .WhereIf(sc.ByDept(), a => scoped.Contains(a.id))
-            .WhereIf(sc.Mine(), a => a.id < 0)
-            .OrderBy(a => a.sortOrder).ToListAsync();
+        List<Department> depts = await new DepartmentDao(this.Held()).Scoped(
+            sc.ByDept(), scoped, sc.Mine());
         List<StrMap> opts = d.AddList("depts");
         for (int i = 0; i < depts.Count; i = i + 1) {
             StrMap o = new StrMap();
@@ -133,7 +123,7 @@ class Users : AdminController {
         string password = this.In("password");
         if (status != 1) { status = 0; }
 
-        User clash = await this.User.Where(a => a.username == username).FirstAsync();
+        User clash = await new UserDao(this.Held()).ByUsername(username);
         if (clash != null && clash.id != id) {
             this.Fail(400, "0004", "账号 " + username + " 已存在");
         }
@@ -142,16 +132,8 @@ class Users : AdminController {
         await this.Reachable(departmentId);
 
         if (id > 0) {
-            int n = await this.User.Update()
-                .Set(a => a.username, username)
-                .Set(a => a.nickname, nickname)
-                .Set(a => a.email, email)
-                .Set(a => a.mobile, mobile)
-                .Set(a => a.departmentId, departmentId)
-                .Set(a => a.status, status)
-                .Set(a => a.updatedAt, WebApp.NowSeconds())
-                .Where(a => a.id == id)
-                .ExecuteAffrowsAsync();
+            UserDao userDao = new UserDao(this.Db());
+            int n = await userDao.UpdateProfile(id, username, nickname, email, mobile, departmentId, status, WebApp.NowSeconds());
             /* 禁用账号须使其已持会话失效，否则禁令只对下次登录生效。 */
             if (status == 0) { await this.Revoke(id); }
             AuthUser.Forget(Convert.ToString(id));
@@ -178,7 +160,8 @@ class Users : AdminController {
         u.tokenVersion = 1;
         u.createdAt = WebApp.NowSeconds();
         u.updatedAt = u.createdAt;
-        int newId = await this.User.Insert(u).ExecuteIdentityAsync();
+        UserDao userDao = new UserDao(this.Db());
+        int newId = await userDao.Insert(u);
         await this.Note("新增账号",
             "#" + Convert.ToString(newId) + " " + username, newId > 0, "");
         this.Saved("账号已创建");
@@ -197,10 +180,9 @@ class Users : AdminController {
         if (me != null && me.id == id) {
             this.Fail(400, "0004", "不能删除当前登录的账号");
         }
-        int n = await this.User.Delete().Where(a => a.id == id)
-            .ExecuteAffrowsAsync();
-        int _r = await this.UserRole.Delete().Where(a => a.userId == id)
-            .ExecuteAffrowsAsync();
+        UserDao userDao = new UserDao(this.Held());
+        int n = await userDao.Delete(id);
+        int _r = await new UserRoleDao(this.Held()).DeleteByUserId(id);
         AuthUser.Forget(Convert.ToString(id));
         await this.Note("删除账号",
             "#" + Convert.ToString(id) + " " + u.username, n > 0, "");
@@ -218,11 +200,8 @@ class Users : AdminController {
         if (u.isSuper == 1 && status == 0) {
             this.Fail(400, "0004", "超级管理员账号不能禁用");
         }
-        int n = await this.User.Update()
-            .Set(a => a.status, status)
-            .Set(a => a.updatedAt, WebApp.NowSeconds())
-            .Where(a => a.id == id)
-            .ExecuteAffrowsAsync();
+        UserDao userDao = new UserDao(this.Db());
+        int n = await userDao.SetStatus(id, status);
         if (status == 0) { await this.Revoke(id); }
         AuthUser.Forget(Convert.ToString(id));
         await this.Note("启用或禁用账号",
@@ -269,13 +248,8 @@ class Users : AdminController {
         User u = await this.Reach(id);
         string salt = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
         string hash = AuthUser.PasswordHash(password, salt);
-        int n = await this.User.Update()
-            .Set(a => a.passwordSalt, salt)
-            .Set(a => a.passwordHash, hash)
-            .Set(a => a.tokenVersion, u.tokenVersion + 1)
-            .Set(a => a.updatedAt, WebApp.NowSeconds())
-            .Where(a => a.id == id)
-            .ExecuteAffrowsAsync();
+        UserDao userDao = new UserDao(this.Db());
+        int n = await userDao.ResetPassword(id, salt, hash, u.tokenVersion + 1, WebApp.NowSeconds());
         await this.Note("重置密码",
             "#" + Convert.ToString(id) + " " + u.username, n > 0, "");
         this.Saved("密码已重置，该账号需要重新登录");
@@ -291,9 +265,8 @@ class Users : AdminController {
         ViewData d = new ViewData();
         d.Set("id", Convert.ToString(id));
         d.Set("username", u.username);
-        List<Role> roles = await this.Role.OrderBy(a => a.rank).ToListAsync();
-        List<UserRole> mine = await this.UserRole
-            .Where(a => a.userId == id).ToListAsync();
+        List<Role> roles = await new RoleDao(this.Held()).All();
+        List<UserRole> mine = await new UserRoleDao(this.Held()).ByUserId(id);
         List<StrMap> rows = d.AddList("roles");
         for (int i = 0; i < roles.Count; i = i + 1) {
             Role r = roles[i];
@@ -317,16 +290,16 @@ class Users : AdminController {
         int id = this.InInt("id", 0);
         User u = await this.Reach(id);
         string picked = this.In("roleIds");
-        int _cleared = await this.UserRole.Delete().Where(a => a.userId == id)
-            .ExecuteAffrowsAsync();
-        List<Role> roles = await this.Role.ToListAsync();
+        UserRoleDao urDao = new UserRoleDao(this.Held());
+        int _cleared = await urDao.DeleteByUserId(id);
+        List<Role> roles = await new RoleDao(this.Held()).All();
         int granted = 0;
         for (int i = 0; i < roles.Count; i = i + 1) {
             if (!AuthUser.Holds(picked, Convert.ToString(roles[i].id))) { continue; }
             UserRole link = new UserRole();
             link.userId = id;
             link.roleId = roles[i].id;
-            int _n = await this.UserRole.Insert(link).ExecuteIdentityAsync();
+            int _n = await urDao.Insert(link);
             granted = granted + 1;
         }
         AuthUser.Forget(Convert.ToString(id));
@@ -338,7 +311,7 @@ class Users : AdminController {
 
     /* 请求有权操作的账号；超调用方数据 scope 的答与不存在的行同 404——无法列表的账号不得在对话框或 POST 中确认其存在。 */
     async User Reach(int id) {
-        User u = await this.User.Where(a => a.id == id).FirstAsync();
+        User u = await new UserDao(this.Held()).ById(id);
         if (u == null) { this.Fail(404, "0404", "账号不存在"); }
         DataScope sc = await this.Scope();
         if (!sc.Covers(u.id, u.departmentId)) {
@@ -356,12 +329,7 @@ class Users : AdminController {
 
     /* 使该账号已发的所有令牌失效。 */
     async void Revoke(int id) {
-        User u = await this.User.Where(a => a.id == id).FirstAsync();
-        if (u == null) { return; }
-        int _n = await this.User.Update()
-            .Set(a => a.tokenVersion, u.tokenVersion + 1)
-            .Where(a => a.id == id)
-            .ExecuteAffrowsAsync();
+        int _n = await new UserDao(this.Held()).BumpTokenVersion(id);
     }
 
     static string DeptName(List<Department> depts, int id) {

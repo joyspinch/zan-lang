@@ -1,7 +1,9 @@
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.Data;
 using System.Data.Orm;
+using ZanWeb.Dao.Oa;
 using ZanWeb.Model.Oa;
 using ZanWeb.Model.Sys;
 
@@ -46,20 +48,14 @@ class CalendarRemind {
         /* ORM 谓词不允许字段间算术（a.startAt - a.remindMinutes*60 不可编译），
            预取上限改为按最大提醒档 1440min 扩窗取行；逐行"是否已到提醒时刻"
            在循环内判定（普通算术）。 */
-        List<OaCalendarEvent> rows = await db.Select<OaCalendarEvent>()
-            .Where(a => a.remindMinutes > 0 && a.reminded == 0
-                && a.startAt > now - CalendarRemind.GraceSeconds
-                && a.startAt <= now + 86400)
-            .ToListAsync();
+        OaCalendarEventDao calDao = new OaCalendarEventDao(db);
+        List<OaCalendarEvent> rows = await calDao.CandidateReminds(now, CalendarRemind.GraceSeconds);
         for (int i = 0; i < rows.Count; i = i + 1) {
             OaCalendarEvent ev = rows[i];
             /* 未到提醒时刻（startAt-remindMinutes*60 > now）：跳过等下一拍。 */
             if (ev.startAt - (long)ev.remindMinutes * 60 > now) { continue; }
             /* 抢占：UPDATE 命中 1 行的 worker 独得发送权，其余跳过。 */
-            int hit = await db.Update<OaCalendarEvent>()
-                .Set(a => a.reminded, 1)
-                .Where(a => a.id == ev.id && a.reminded == 0)
-                .ExecuteAffrowsAsync();
+            int hit = await calDao.MarkReminded(ev.id);
             if (hit != 1) { continue; }
             await Notify.Send(db, ev.tenantId, ev.ownerId, "calendar",
                 "remind", "日程提醒：" + ev.title,
@@ -77,10 +73,8 @@ class CalendarSources {
         List<TodoItem> items = new List<TodoItem>();
         long start = Fmt.TodayStart(WebApp.NowSeconds());
         long end = start + 7 * 86400;
-        List<OaCalendarEvent> rows = await db.Select<OaCalendarEvent>()
-            .Where(a => a.tenantId == tenantId && a.ownerId == me.id
-                && a.startAt >= start && a.startAt < end)
-            .OrderBy(a => a.startAt).ToListAsync();
+        OaCalendarEventDao calDao = new OaCalendarEventDao(db);
+        List<OaCalendarEvent> rows = await calDao.UpcomingEvents(tenantId, me.id, start, end);
         for (int i = 0; i < rows.Count; i = i + 1) {
             OaCalendarEvent ev = rows[i];
             TodoItem it = new TodoItem();

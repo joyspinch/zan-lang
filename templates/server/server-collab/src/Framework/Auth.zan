@@ -9,6 +9,18 @@ using ZanWeb.Dao.Sys;
 
 namespace ZanWeb;
 
+class AuthVersionEntry {
+    public string uid;
+    public int version;
+    public int goodUntil;
+
+    public AuthVersionEntry(string uid, int version, int goodUntil) {
+        this.uid = uid;
+        this.version = version;
+        this.goodUntil = goodUntil;
+    }
+}
+
 class AuthUser {
     /* 可登录账号的状态值。*/
     static int Active = 1;
@@ -47,8 +59,7 @@ class AuthUser {
             nint tbl = NativeMemory.Alloc(16);
             NativeMemory.PutString(tbl, 0, "0123456789abcdef", 16);
             Span<byte> dt = new Span<byte>(tbl, 16);
-            int i = 0;
-            while (i < 12000) {
+            for (int i = 0; i < 12000; i = i + 1) {
                 NativeMemory.PutString(buf, len, ":", 1);
                 NativeMemory.PutString(buf, len + 1, salt, saltLen);
                 string digest = NativeMemory.Sha256(buf, len + 1 + saltLen);
@@ -58,7 +69,6 @@ class AuthUser {
                     hex[2 * b + 1] = dt[v & 15];
                 }
                 len = 64;
-                i = i + 1;
             }
             NativeMemory.Free(tbl);
             /* 最后一轮的 hex 摘要就在缓冲前 64 字节 */
@@ -106,16 +116,15 @@ class AuthUser {
        后旧 token 最迟再有效 VerTtlSec 秒——对管理动作足够快，且 Forget 时主动失效。*/
     static int VerTtlSec = 30;
 
-    static List<string> verUids = new List<string>();
-    static List<int> verVals = new List<int>();
-    static List<int> verGoodUntil = new List<int>();
+    static List<AuthVersionEntry> verEntries = new List<AuthVersionEntry>();
 
     /* 命中返回缓存的版本号，过期/缺失返回 -1。 */
     static int CachedVersion(string uid, int now) {
-        lock (AuthUser.verUids) {
-            for (int i = 0; i < AuthUser.verUids.Count; i = i + 1) {
-                if (AuthUser.verUids[i] == uid && AuthUser.verGoodUntil[i] > now) {
-                    return AuthUser.verVals[i];
+        lock (AuthUser.verEntries) {
+            for (int i = 0; i < AuthUser.verEntries.Count; i = i + 1) {
+                AuthVersionEntry e = AuthUser.verEntries[i];
+                if (e.uid == uid && e.goodUntil > now) {
+                    return e.version;
                 }
             }
         }
@@ -123,36 +132,30 @@ class AuthUser {
     }
 
     static void StoreVersion(string uid, int version, int now) {
-        lock (AuthUser.verUids) {
+        lock (AuthUser.verEntries) {
             /* 顺带清扫过期项：列表长度受活跃账号约束，线性扫描足够。 */
             int i = 0;
-            while (i < AuthUser.verUids.Count) {
-                if (AuthUser.verGoodUntil[i] <= now) {
-                    AuthUser.verUids.RemoveAt(i);
-                    AuthUser.verVals.RemoveAt(i);
-                    AuthUser.verGoodUntil.RemoveAt(i);
+            while (i < AuthUser.verEntries.Count) {
+                if (AuthUser.verEntries[i].goodUntil <= now) {
+                    AuthUser.verEntries.RemoveAt(i);
                     continue;
                 }
-                if (AuthUser.verUids[i] == uid) {
-                    AuthUser.verVals[i] = version;
-                    AuthUser.verGoodUntil[i] = now + AuthUser.VerTtlSec;
+                if (AuthUser.verEntries[i].uid == uid) {
+                    AuthUser.verEntries[i].version = version;
+                    AuthUser.verEntries[i].goodUntil = now + AuthUser.VerTtlSec;
                     return;
                 }
                 i = i + 1;
             }
-            AuthUser.verUids.Add(uid);
-            AuthUser.verVals.Add(version);
-            AuthUser.verGoodUntil.Add(now + AuthUser.VerTtlSec);
+            AuthUser.verEntries.Add(new AuthVersionEntry(uid, version, now + AuthUser.VerTtlSec));
         }
     }
 
     static void DropCachedVersion(string uid) {
-        lock (AuthUser.verUids) {
-            for (int i = 0; i < AuthUser.verUids.Count; i = i + 1) {
-                if (AuthUser.verUids[i] == uid) {
-                    AuthUser.verUids.RemoveAt(i);
-                    AuthUser.verVals.RemoveAt(i);
-                    AuthUser.verGoodUntil.RemoveAt(i);
+        lock (AuthUser.verEntries) {
+            for (int i = 0; i < AuthUser.verEntries.Count; i = i + 1) {
+                if (AuthUser.verEntries[i].uid == uid) {
+                    AuthUser.verEntries.RemoveAt(i);
                     return;
                 }
             }
@@ -183,10 +186,8 @@ class AuthUser {
     }
 
     static void ForgetAll() {
-        lock (AuthUser.verUids) {
-            AuthUser.verUids.Clear();
-            AuthUser.verVals.Clear();
-            AuthUser.verGoodUntil.Clear();
+        lock (AuthUser.verEntries) {
+            AuthUser.verEntries.Clear();
         }
         PermTable.ForgetAll();
     }
@@ -258,7 +259,7 @@ class AuthUser {
             db = owned;
         }
         try {
-            User me = await db.Select<User>().Where(a => a.id == id).FirstAsync();
+            User me = await new UserDao(db).ById(id);
             if (me == null || me.status != AuthUser.Active) { return ""; }
             if (me.isSuper == 1) {
                 PermTable.SetUser(uid, true, "");
@@ -275,15 +276,13 @@ class AuthUser {
     /* 账号已启用的角色（自身 + 所在部门），输出 ",3,7,"。*/
     static async string RoleIds(IDbConnection db, User me) {
         List<int> roleIds = new List<int>();
-        List<UserRole> mine = await db.Select<UserRole>()
-            .Where(a => a.userId == me.id).ToListAsync();
+        List<UserRole> mine = await new UserRoleDao(db).ByUserId(me.id);
         for (int i = 0; i < mine.Count; i = i + 1) {
             AuthUser.AddId(roleIds, mine[i].roleId);
         }
         int dept = me.departmentId;
         if (dept > 0) {
-            List<DepartmentRole> byDept = await db.Select<DepartmentRole>()
-                .Where(a => a.departmentId == dept).ToListAsync();
+            List<DepartmentRole> byDept = await new DepartmentRoleDao(db).ByDepartmentId(dept);
             for (int i = 0; i < byDept.Count; i = i + 1) {
                 AuthUser.AddId(roleIds, byDept[i].roleId);
             }
@@ -292,7 +291,7 @@ class AuthUser {
 
         StringBuilder outp = new StringBuilder();
         outp.Append(",");
-        List<Role> roles = await db.Select<Role>().ToListAsync();
+        List<Role> roles = await new RoleDao(db).All();
         for (int i = 0; i < roles.Count; i = i + 1) {
             Role r = roles[i];
             if (r.status != 1 || !AuthUser.HasId(roleIds, r.id)) { continue; }

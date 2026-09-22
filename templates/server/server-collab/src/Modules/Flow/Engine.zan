@@ -1,5 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.Data;
+using ZanWeb.Dao.Flow;
+using ZanWeb.Dao.Sys;
 using ZanWeb.Model.Flow;
 using ZanWeb.Model.Sys;
 
@@ -57,9 +60,7 @@ class Engine {
 
     /* 推进到下一节点：生成任务、按 kind 分派、通知责任人；全部节点完成则收口实例。返回新任务 id；0 = 实例已完结。 */
     static async int Advance(IDbConnection db, FlowInst inst) {
-        List<FlowNode> nodes = await db.Select<FlowNode>()
-            .Where(a => a.defId == inst.defId)
-            .ToListAsync();
+        List<FlowNode> nodes = await new FlowNodeDao(db).ByDefId(inst.defId);
         if (nodes.Count == 0) { return 0; }
         /* 按 sort 升序（内存排序，模板规模节点数小）。 */
         List<FlowNode> ordered = Engine.SortNodes(nodes);
@@ -84,8 +85,7 @@ class Engine {
            负责人一声。原自动指派（落负责人/首个成员）废弃：指派语义由
            模板显式 assignUserId 承担，认领语义由池承担，两者不再混写。 */
         if (assignTo == 0 && next.deptId > 0) {
-            Department dept = await db.Select<Department>()
-                .Where(a => a.id == next.deptId).FirstAsync();
+            Department dept = await new DepartmentDao(db).ById(next.deptId);
             if (dept != null && dept.leaderUserId > 0) {
                 await Engine.Note(db, inst.tenantId, dept.leaderUserId, "assign",
                     "新待认领任务",
@@ -105,12 +105,9 @@ class Engine {
         long now = WebApp.NowSeconds();
         task.createdAt = now;
         task.finishedAt = 0;
-        int taskId = await db.Insert<FlowTask>(task).ExecuteIdentityAsync();
+        int taskId = await new FlowTaskDao(db).Insert(task);
 
-        int _u = await db.Update<FlowInst>()
-            .Set(a => a.currentNodeId, next.id)
-            .Set(a => a.updatedAt, now)
-            .Where(a => a.id == inst.id).ExecuteAffrowsAsync();
+        int _u = await new FlowInstDao(db).UpdateCurrentNode(inst.id, next.id, now);
 
         if (next.kind == "ai") {
             /* AI 节点：系统代跑——模板内置占位执行（真实接 AI 供应商属演进项），完成后自动再推进。
@@ -118,11 +115,7 @@ class Engine {
             string text = next.aiPrompt.Length > 0
                 ? next.aiPrompt : next.name;
             string summary = "[AI] " + text + "（已由系统代为执行）";
-            int _d = await db.Update<FlowTask>()
-                .Set(a => a.status, 1)
-                .Set(a => a.result, summary)
-                .Set(a => a.finishedAt, now)
-                .Where(a => a.id == taskId).ExecuteAffrowsAsync();
+            int _d = await new FlowTaskDao(db).FinishTask(taskId, summary, now);
             await Engine.Note(db, inst.tenantId, inst.startedBy, "done",
                 "AI 节点完成", "AI 节点「" + next.name + "」已完成",
                 "/admin/flow/instances");
@@ -153,7 +146,7 @@ class Engine {
         inst.currentNodeId = 0;
         inst.createdAt = now;
         inst.updatedAt = now;
-        int id = await db.Insert<FlowInst>(inst).ExecuteIdentityAsync();
+        int id = await new FlowInstDao(db).Insert(inst);
         inst.id = id;
         await Engine.Advance(db, inst);
         return id;
@@ -163,8 +156,7 @@ class Engine {
     static async bool Complete(IDbConnection db, FlowTask task, User me,
                             string report, string mentions) {
         long now = WebApp.NowSeconds();
-        FlowInst inst = await db.Select<FlowInst>()
-            .Where(a => a.id == task.instId).FirstAsync();
+        FlowInst inst = await new FlowInstDao(db).ById(task.instId);
         if (inst == null || inst.status != 1) { return false; }
 
         FlowLog log = new FlowLog();
@@ -173,7 +165,7 @@ class Engine {
         log.content = Fmt.Text(report, "完成");
         log.mentionIds = Fmt.Text(mentions, "");
         log.createdAt = now;
-        await db.Insert<FlowLog>(log).ExecuteIdentityAsync();
+        await new FlowLogDao(db).Insert(log);
 
         if (mentions.Length > 0) {
             await Engine.NoteMentions(db, inst.tenantId, mentions,
@@ -181,19 +173,18 @@ class Engine {
                 "/admin/flow/tasks");
         }
 
-        int _d = await db.Update<FlowTask>()
-            .Set(a => a.status, 1)
-            .Set(a => a.result, Fmt.Text(report, "完成"))
-            .Set(a => a.finishedAt, now)
-            .Where(a => a.id == task.id).ExecuteAffrowsAsync();
+        int _d = await new FlowTaskDao(db).FinishTask(task.id, Fmt.Text(report, "完成"), now);
+        if (_d == 0) { return false; }
+
+        await Engine.Note(db, inst.tenantId, inst.startedBy, "done",
+            "环节已完成", "「" + inst.title + "」· "
+                + await Engine.NodeNameOf(db, task.nodeId)
+                + " 由 " + Fmt.Text(me.nickname, me.username) + " 完成",
+            "/admin/flow/tasks");
 
         int nxt = await Engine.Advance(db, inst);
         if (nxt == 0) {
-            int _f = await db.Update<FlowInst>()
-                .Set(a => a.status, 2)
-                .Set(a => a.currentNodeId, 0)
-                .Set(a => a.updatedAt, now)
-                .Where(a => a.id == inst.id).ExecuteAffrowsAsync();
+            int _f = await new FlowInstDao(db).CloseInstance(inst.id, now);
             await Engine.Note(db, inst.tenantId, inst.startedBy, "done",
                 "流程完结", "流程「" + inst.title + "」已全部完成",
                 "/admin/flow/instances");
@@ -210,16 +201,11 @@ class Engine {
        CAS 条件 UPDATE（status==0 且仍无人认领）使并发认领恰好一人成功。
        返回 false = 实例已终/非本部门/已被认领/状态不符。 */
     static async bool Claim(IDbConnection db, FlowTask task, User me) {
-        FlowInst inst = await db.Select<FlowInst>()
-            .Where(a => a.id == task.instId).FirstAsync();
+        FlowInst inst = await new FlowInstDao(db).ById(task.instId);
         if (inst == null || inst.status != 1) { return false; }
         if (task.status != 0 || task.assignUserId != 0) { return false; }
         if (task.deptId > 0 && me.departmentId != task.deptId) { return false; }
-        int _u = await db.Update<FlowTask>()
-            .Set(a => a.assignUserId, me.id)
-            .Where(a => a.id == task.id && a.status == 0
-                && a.assignUserId == 0)
-            .ExecuteAffrowsAsync();
+        int _u = await new FlowTaskDao(db).ClaimTask(task.id, me.id);
         if (_u == 0) { return false; }
         FlowLog log = new FlowLog();
         log.taskId = task.id;
@@ -227,7 +213,7 @@ class Engine {
         log.content = "认领";
         log.mentionIds = "";
         log.createdAt = WebApp.NowSeconds();
-        await db.Insert<FlowLog>(log).ExecuteIdentityAsync();
+        await new FlowLogDao(db).Insert(log);
         await Engine.Note(db, inst.tenantId, inst.startedBy, "assign",
             "任务已认领", "「" + inst.title + "」· "
                 + await Engine.NodeNameOf(db, task.nodeId)
@@ -239,8 +225,7 @@ class Engine {
     /* 节点名（按 id 查一次，通知文案用；节点规模小，不值得缓存）。 */
     static async string NodeNameOf(IDbConnection db, int nodeId) {
         if (nodeId == 0) { return "-"; }
-        FlowNode n = await db.Select<FlowNode>()
-            .Where(a => a.id == nodeId).FirstAsync();
+        FlowNode n = await new FlowNodeDao(db).ById(nodeId);
         return n == null ? "-" : n.name;
     }
 
@@ -248,8 +233,7 @@ class Engine {
        返回 false = 实例已终/非执行人/状态不符（控制器转 403/409）。 */
     static async bool Submit(IDbConnection db, FlowTask task, User me,
                            string report) {
-        FlowInst inst = await db.Select<FlowInst>()
-            .Where(a => a.id == task.instId).FirstAsync();
+        FlowInst inst = await new FlowInstDao(db).ById(task.instId);
         if (inst == null || inst.status != 1) { return false; }
         if (task.status != 0 || task.assignUserId != me.id) { return false; }
         long now = WebApp.NowSeconds();
@@ -259,12 +243,8 @@ class Engine {
         log.content = "提交验收：" + Fmt.Text(report, "完成");
         log.mentionIds = "";
         log.createdAt = now;
-        await db.Insert<FlowLog>(log).ExecuteIdentityAsync();
-        int _u = await db.Update<FlowTask>()
-            .Set(a => a.status, 3)
-            .Set(a => a.result, Fmt.Text(report, "完成"))
-            .Where(a => a.id == task.id && a.status == 0)
-            .ExecuteAffrowsAsync();
+        await new FlowLogDao(db).Insert(log);
+        int _u = await new FlowTaskDao(db).SubmitForReview(task.id, Fmt.Text(report, "完成"));
         if (_u == 0) { return false; }
         await Engine.Note(db, inst.tenantId, inst.startedBy, "done",
             "待验收", "「" + inst.title + "」· "
@@ -276,17 +256,12 @@ class Engine {
     /* 验收通过：发起人 3→1 并推进下一环；已是最后一环则收口实例。
        状态门带乐观语义（Update 带 status==3 条件），并发验收只有一方生效。 */
     static async bool Accept(IDbConnection db, FlowTask task, User me) {
-        FlowInst inst = await db.Select<FlowInst>()
-            .Where(a => a.id == task.instId).FirstAsync();
+        FlowInst inst = await new FlowInstDao(db).ById(task.instId);
         if (inst == null || inst.status != 1) { return false; }
         if (inst.startedBy != me.id) { return false; }
         if (task.status != 3) { return false; }
         long now = WebApp.NowSeconds();
-        int _u = await db.Update<FlowTask>()
-            .Set(a => a.status, 1)
-            .Set(a => a.finishedAt, now)
-            .Where(a => a.id == task.id && a.status == 3)
-            .ExecuteAffrowsAsync();
+        int _u = await new FlowTaskDao(db).AcceptReview(task.id, now);
         if (_u == 0) { return false; }
         FlowLog log = new FlowLog();
         log.taskId = task.id;
@@ -294,18 +269,14 @@ class Engine {
         log.content = "验收通过";
         log.mentionIds = "";
         log.createdAt = now;
-        await db.Insert<FlowLog>(log).ExecuteIdentityAsync();
+        await new FlowLogDao(db).Insert(log);
         await Engine.Note(db, inst.tenantId, task.assignUserId, "done",
             "验收通过", "「" + inst.title + "」· "
                 + await Engine.NodeNameOf(db, task.nodeId) + " 验收通过",
             "/admin/flow/tasks");
         int nxt = await Engine.Advance(db, inst);
         if (nxt == 0) {
-            int _f = await db.Update<FlowInst>()
-                .Set(a => a.status, 2)
-                .Set(a => a.currentNodeId, 0)
-                .Set(a => a.updatedAt, now)
-                .Where(a => a.id == inst.id).ExecuteAffrowsAsync();
+            int _f = await new FlowInstDao(db).CloseInstance(inst.id, now);
             await Engine.Note(db, inst.tenantId, inst.startedBy, "done",
                 "流程完结", "流程「" + inst.title + "」已全部完成",
                 "/admin/flow/instances");
@@ -318,8 +289,7 @@ class Engine {
        「是否重来、重来到哪」由验收人当场定。 */
     static async bool Reject(IDbConnection db, FlowTask task, User me,
                            string reason, bool repool) {
-        FlowInst inst = await db.Select<FlowInst>()
-            .Where(a => a.id == task.instId).FirstAsync();
+        FlowInst inst = await new FlowInstDao(db).ById(task.instId);
         if (inst == null || inst.status != 1) { return false; }
         if (inst.startedBy != me.id) { return false; }
         if (task.status != 3) { return false; }
@@ -330,23 +300,9 @@ class Engine {
         log.content = "验收驳回：" + Fmt.Text(reason, "需返工");
         log.mentionIds = "";
         log.createdAt = now;
-        await db.Insert<FlowLog>(log).ExecuteIdentityAsync();
-        if (repool) {
-            int _r = await db.Update<FlowTask>()
-                .Set(a => a.status, 0)
-                .Set(a => a.assignUserId, 0)
-                .Set(a => a.finishedAt, 0)
-                .Where(a => a.id == task.id && a.status == 3)
-                .ExecuteAffrowsAsync();
-            if (_r == 0) { return false; }
-        } else {
-            int _k = await db.Update<FlowTask>()
-                .Set(a => a.status, 0)
-                .Set(a => a.finishedAt, 0)
-                .Where(a => a.id == task.id && a.status == 3)
-                .ExecuteAffrowsAsync();
-            if (_k == 0) { return false; }
-        }
+        await new FlowLogDao(db).Insert(log);
+        int _r = await new FlowTaskDao(db).RejectReview(task.id, repool);
+        if (_r == 0) { return false; }
         await Engine.Note(db, inst.tenantId,
             repool ? inst.startedBy : task.assignUserId, "assign",
             "验收驳回", "「" + inst.title + "」· "
@@ -374,16 +330,13 @@ class Engine {
     static async void NoteMentions(IDbConnection db, int tenantId,
                                 string mentionIds, string content, string link) {
         int from = 0;
-        int i = 0;
-        while (i <= mentionIds.Length) {
+        for (int i = 0; i <= mentionIds.Length; i = i + 1) {
             if (i == mentionIds.Length || mentionIds.Substring(i, 1) == ",") {
                 string one = mentionIds.Substring(from, i - from);
                 if (one.Length > 0) {
                     int uid = Filter.ToInt(one, 0);
                     if (uid > 0) {
-                        User u = await db.Select<User>()
-                            .Where(a => a.id == uid && a.tenantId == tenantId)
-                            .FirstAsync();
+                        User u = await new UserDao(db).ByTenantAndId(tenantId, uid);
                         if (u != null) {
                             await Engine.Note(db, tenantId, uid, "mention",
                                 "流程提及", content, link);
@@ -392,7 +345,6 @@ class Engine {
                 }
                 from = i + 1;
             }
-            i = i + 1;
         }
     }
 }

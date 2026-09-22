@@ -4,6 +4,7 @@ using System.Security.Cryptography;
 using System.Web;
 using ZanWeb;
 using ZanWeb.Model.Sys;
+using ZanWeb.Dao.Sys;
 
 namespace ZanWeb.Account;
 
@@ -61,9 +62,10 @@ class Register : AppController {
         if (!this.DbReady()) {
             await this.Back("数据库不可用，请稍后再试", user, email); return;
         }
-        int clash = await this.User.Where(a => a.username == user).CountAsync();
+        UserDao userDao = new UserDao(this.Held());
+        int clash = await userDao.CountByUsername(user);
         if (clash > 0) { await this.Back("账号已被使用", user, email); return; }
-        int mailClash = await this.User.Where(a => a.email == email).CountAsync();
+        int mailClash = await userDao.CountByEmail(email);
         if (mailClash > 0) { await this.Back("该邮箱已注册", user, email); return; }
 
         string salt = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
@@ -80,7 +82,7 @@ class Register : AppController {
         u.tokenVersion = 1;
         u.createdAt = WebApp.NowSeconds();
         u.updatedAt = u.createdAt;
-        int _id = await this.User.Insert(u).ExecuteIdentityAsync();
+        int _id = await userDao.Insert(u);
 
         string token = await AuthUser.Login(user, pass);
         if (token.Length > 0) {
@@ -139,19 +141,14 @@ class Register : AppController {
             return;
         }
         bool done = false;
-        User u = await this.User.Where(a => a.email == email).FirstAsync();
+        UserDao userDao = new UserDao(this.Held());
+        User u = await userDao.ByEmail(email);
         if (u != null) {
             string salt = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
             int id = u.id;
-            int version = u.tokenVersion + 1;
+            string newHash = AuthUser.PasswordHash(pass, salt);
             /* 改密码须同时让旧密码开启的会话失效，否则找回的账号仍处于共享状态。 */
-            int n = await this.User.Update()
-                .Set(a => a.passwordSalt, salt)
-                .Set(a => a.passwordHash, AuthUser.PasswordHash(pass, salt))
-                .Set(a => a.tokenVersion, version)
-                .Set(a => a.updatedAt, WebApp.NowSeconds())
-                .Where(a => a.id == id)
-                .ExecuteAffrowsAsync();
+            int n = await userDao.ResetPassword(id, salt, newHash, u.tokenVersion + 1, WebApp.NowSeconds());
             done = n > 0;
         }
         if (!done) {

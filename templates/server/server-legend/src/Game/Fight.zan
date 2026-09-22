@@ -7,6 +7,22 @@ using ZanWeb.Model.Game;
 
 namespace ZanWeb.Game;
 
+class MonsterInstance {
+    public int id;
+    public int tplId;
+    public int hp;
+    public bool alive;
+    public long respawnAt;
+
+    public MonsterInstance(int id, int tplId, int hp, bool alive, long respawnAt) {
+        this.id = id;
+        this.tplId = tplId;
+        this.hp = hp;
+        this.alive = alive;
+        this.respawnAt = respawnAt;
+    }
+}
+
 /* 战斗闭环：怪物模板/物品模板装载、刷怪实例、一轮战斗（hunt 与
    自动挂机共用）、经验升级、掉落入包、背包与商店结算。
    模板与刷怪实例是进程内只读/运行态，不落库；背包走会话内存副本
@@ -22,13 +38,8 @@ class Fight {
     static Dictionary<int, ZanWeb.Model.Game.Mob> mobById =
         new Dictionary<int, ZanWeb.Model.Game.Mob>();
 
-    /* 刷怪实例（运行态）：id 自增；hp/alive/respawnAt 随战斗变化。
-       平行列表按实例下标访问，tplOf 存模板 id。 */
-    static List<int> instId = new List<int>();
-    static List<int> instTpl = new List<int>();
-    static List<int> instHp = new List<int>();
-    static List<bool> instAlive = new List<bool>();
-    static List<long> instRespawnAt = new List<long>();
+    /* 刷怪实例（运行态）：id 自增；hp/alive/respawnAt 随战斗变化。 */
+    static List<MonsterInstance> insts = new List<MonsterInstance>();
     static int nextInst = 1;
 
     /* 掉落表（启动装载）：每刷怪点一个独立掷骰清单。 */
@@ -347,20 +358,12 @@ class Fight {
             }
 
             long now = WebApp.NowSeconds();
-            List<int> newInstId = new List<int>();
-            List<int> newInstTpl = new List<int>();
-            List<int> newInstHp = new List<int>();
-            List<bool> newInstAlive = new List<bool>();
-            List<long> newInstRespawnAt = new List<long>();
+            List<MonsterInstance> newInsts = new List<MonsterInstance>();
             for (int i = 0; i < rows.Count; i = i + 1) {
                 ZanWeb.Model.Game.Mob t = rows[i];
                 for (int n = 0; n < t.count; n = n + 1) {
-                    newInstId.Add(Fight.nextInst);
+                    newInsts.Add(new MonsterInstance(Fight.nextInst, t.id, t.hp, true, 0));
                     Fight.nextInst = Fight.nextInst + 1;
-                    newInstTpl.Add(t.id);
-                    newInstHp.Add(t.hp);
-                    newInstAlive.Add(true);
-                    newInstRespawnAt.Add(0);
                 }
             }
 
@@ -376,11 +379,7 @@ class Fight {
             Fight.maps = newMaps;
             Fight.mapById = newMapById;
             Fight.mapBoss = newMapBoss;
-            Fight.instId = newInstId;
-            Fight.instTpl = newInstTpl;
-            Fight.instHp = newInstHp;
-            Fight.instAlive = newInstAlive;
-            Fight.instRespawnAt = newInstRespawnAt;
+            Fight.insts = newInsts;
 
             /* 挂机目标已不存在的会话关掉挂机，避免永远打不中。 */
             List<Session> sessions = World.All();
@@ -394,12 +393,12 @@ class Fight {
 
             if (bootstrap) {
                 Console.WriteLine("[fight] 怪物 "
-                    + Convert.ToString(Fight.instId.Count) + " 只 / 物品 "
+                    + Convert.ToString(Fight.insts.Count) + " 只 / 物品 "
                     + Convert.ToString(Fight.items.Count) + " 种 / 掉落条目 "
                     + Convert.ToString(drops.Count));
             } else {
                 Console.WriteLine("[fight] 目录热重载：怪物 "
-                    + Convert.ToString(Fight.instId.Count) + " 只 / 物品 "
+                    + Convert.ToString(Fight.insts.Count) + " 只 / 物品 "
                     + Convert.ToString(Fight.items.Count) + " 种 / 掉落条目 "
                     + Convert.ToString(drops.Count));
             }
@@ -419,13 +418,14 @@ class Fight {
     /* ---- tick：重生 + 自动挂机 ---- */
 
     static void Tick(long now) {
-        for (int i = 0; i < Fight.instAlive.Count; i = i + 1) {
-            if (Fight.instAlive[i]) { continue; }
-            if (now >= Fight.instRespawnAt[i]) {
-                ZanWeb.Model.Game.Mob t = Fight.Tpl(Fight.instTpl[i]);
+        for (int i = 0; i < Fight.insts.Count; i = i + 1) {
+            MonsterInstance inst = Fight.insts[i];
+            if (inst.alive) { continue; }
+            if (now >= inst.respawnAt) {
+                ZanWeb.Model.Game.Mob t = Fight.Tpl(inst.tplId);
                 if (t == null) { continue; }
-                Fight.instAlive[i] = true;
-                Fight.instHp[i] = t.hp;
+                inst.alive = true;
+                inst.hp = t.hp;
             }
         }
         List<Session> rows = World.All();
@@ -503,9 +503,10 @@ class Fight {
     static int FindAlive(int tplId, int mapId) {
         ZanWeb.Model.Game.Mob t = Fight.Tpl(tplId);
         if (t == null) { return -1; }
-        for (int i = 0; i < Fight.instTpl.Count; i = i + 1) {
-            if (!Fight.instAlive[i]) { continue; }
-            if (Fight.instTpl[i] != tplId) { continue; }
+        for (int i = 0; i < Fight.insts.Count; i = i + 1) {
+            MonsterInstance inst = Fight.insts[i];
+            if (!inst.alive) { continue; }
+            if (inst.tplId != tplId) { continue; }
             if (t.mapId != mapId) { continue; }
             return i;
         }
@@ -524,15 +525,16 @@ class Fight {
         int at = Fight.FindAlive(tplId, s.row.mapId);
         if (at < 0) { return null; }
 
+        MonsterInstance target = Fight.insts[at];
         JsonValue f = JsonValue.NewObject();
         int dmg = Fight.Damage(Fight.Atk(s.row), t.def);
-        int left = Fight.instHp[at] - dmg;
+        int left = target.hp - dmg;
         f.Set("dmg", JsonValue.NewNum(Convert.ToString(dmg)));
         f.Set("killed", JsonValue.NewNum("0"));
         if (left <= 0) {
-            Fight.instAlive[at] = false;
-            Fight.instHp[at] = 0;
-            Fight.instRespawnAt[at] = now + t.respawnSec;
+            target.alive = false;
+            target.hp = 0;
+            target.respawnAt = now + t.respawnSec;
             f.Set("killed", JsonValue.NewNum("1"));
             f.Set("exp", JsonValue.NewNum(Convert.ToString(t.exp)));
             f.Set("mobhp", JsonValue.NewNum("0"));
@@ -540,7 +542,7 @@ class Fight {
             Fight.StampProgress(s, f);
             return f;
         }
-        Fight.instHp[at] = left;
+        target.hp = left;
         f.Set("mobhp", JsonValue.NewNum(Convert.ToString(left)));
 
         /* 怪物还手：玩家防住一部分，血量见底按死亡结算。 */
@@ -806,22 +808,23 @@ class Fight {
     /* 当前地图的怪物列表（含未重生的，带剩余秒数）。 */
     static JsonValue MobList(Session s, long now) {
         JsonValue arr = JsonValue.NewArray();
-        for (int i = 0; i < Fight.instTpl.Count; i = i + 1) {
-            ZanWeb.Model.Game.Mob t = Fight.Tpl(Fight.instTpl[i]);
+        for (int i = 0; i < Fight.insts.Count; i = i + 1) {
+            MonsterInstance inst = Fight.insts[i];
+            ZanWeb.Model.Game.Mob t = Fight.Tpl(inst.tplId);
             if (t == null) { continue; }
             if (t.mapId != s.row.mapId) { continue; }
             JsonValue o = JsonValue.NewObject();
-            o.Set("inst", JsonValue.NewNum(Convert.ToString(Fight.instId[i])));
+            o.Set("inst", JsonValue.NewNum(Convert.ToString(inst.id)));
             o.Set("tpl", JsonValue.NewNum(Convert.ToString(t.id)));
             o.Set("name", JsonValue.NewStr(t.name));
             o.Set("level", JsonValue.NewNum(Convert.ToString(t.level)));
             o.Set("picture", JsonValue.NewNum(Convert.ToString(t.picture)));
-            o.Set("alive", JsonValue.NewNum(Fight.instAlive[i] ? "1" : "0"));
-            if (Fight.instAlive[i]) {
-                o.Set("hp", JsonValue.NewNum(Convert.ToString(Fight.instHp[i])));
+            o.Set("alive", JsonValue.NewNum(inst.alive ? "1" : "0"));
+            if (inst.alive) {
+                o.Set("hp", JsonValue.NewNum(Convert.ToString(inst.hp)));
                 o.Set("maxhp", JsonValue.NewNum(Convert.ToString(t.hp)));
             } else {
-                long left = Fight.instRespawnAt[i] - now;
+                long left = inst.respawnAt - now;
                 if (left < 0) { left = 0; }
                 o.Set("respawnIn", JsonValue.NewNum(Convert.ToString(left)));
             }
@@ -1209,10 +1212,11 @@ class Fight {
             if (t == null || t.count != 1 || t.status != 1) { continue; }
             bool alive = false;
             long respawnIn = 0;
-            for (int j = 0; j < Fight.instTpl.Count; j = j + 1) {
-                if (Fight.instTpl[j] != t.id) { continue; }
-                if (Fight.instAlive[j]) { alive = true; break; }
-                long left = Fight.instRespawnAt[j] - now;
+            for (int j = 0; j < Fight.insts.Count; j = j + 1) {
+                MonsterInstance inst = Fight.insts[j];
+                if (inst.tplId != t.id) { continue; }
+                if (inst.alive) { alive = true; break; }
+                long left = inst.respawnAt - now;
                 if (left > respawnIn) { respawnIn = left; }
             }
             JsonValue o = JsonValue.NewObject();
