@@ -39,6 +39,42 @@ class CeFileIndex {
     }
 }
 
+class CeSymbolMember {
+    public string owner;
+    public string name;
+    public string kind;
+    public string sig;
+    public bool isStatic;
+
+    public CeSymbolMember(string owner, string name, string kind, string sig, bool isStatic) {
+        this.owner = owner;
+        this.name = name;
+        this.kind = kind;
+        this.sig = sig;
+        this.isStatic = isStatic;
+    }
+}
+
+class CeSymbolType {
+    public string name;
+    public string baseTypes;
+
+    public CeSymbolType(string name, string baseTypes) {
+        this.name = name;
+        this.baseTypes = baseTypes;
+    }
+}
+
+class CeTypeScope {
+    public string typeName;
+    public int depth;
+
+    public CeTypeScope(string typeName, int depth) {
+        this.typeName = typeName;
+        this.depth = depth;
+    }
+}
+
 /// CodeEditor 分部：由 `zanc --emit-symbols` 生成的符号索引。
 ///
 /// 补全此前用 CodeEditor.Completion.zan 中手写的表回答成员查询，
@@ -48,13 +84,8 @@ class CeFileIndex {
 /// 优先于这些表；它们保留为尚未
 /// 建立索引的工作区的回退。
 partial class CodeEditor {
-    static List<string> symOwners;   // 每个成员记录所属的类型
-    static List<string> symNames;    // 成员名称
-    static List<string> symKinds;    // M 方法、P 属性、F 字段、C 构造函数、E 事件
-    static List<string> symSigs;     // 显示签名
-    static List<string> symStatics;  // 成员为静态时是 "1"
-    static List<string> symTypes;    // 索引中的每个类型名
-    static List<string> symBases;    // symTypes[i] 的基类列表，逗号分隔
+    static List<CeSymbolMember> symMembers;
+    static List<CeSymbolType> symTypes;
 
     /// 索引成功加载后返回 true。
     static bool SymbolIndexLoaded() {
@@ -63,13 +94,8 @@ partial class CodeEditor {
 
     /// 丢弃已加载的索引（构建后重新加载前使用）。
     static void ClearSymbolIndex() {
-        symOwners = new List<string>();
-        symNames = new List<string>();
-        symKinds = new List<string>();
-        symSigs = new List<string>();
-        symStatics = new List<string>();
-        symTypes = new List<string>();
-        symBases = new List<string>();
+        symMembers = new List<CeSymbolMember>();
+        symTypes = new List<CeSymbolType>();
     }
 
     /// 加载 `zanc --emit-symbols <path>` 写入的索引：制表符分隔的
@@ -93,20 +119,18 @@ partial class CodeEditor {
             if (f.Count < 4) { continue; }
             if (f[0] == "T") {
                 string tn = f[3];
-                if (tn.Length > 0 && !CodeEditor.Has(symTypes, tn)) {
-                    symTypes.Add(tn);
-                    if (f.Count > 4) { symBases.Add(f[4]); } else { symBases.Add(""); }
+                if (tn.Length > 0 && !CodeEditor.HasSymbolType(tn)) {
+                    string bases = "";
+                    if (f.Count > 4) { bases = f[4]; }
+                    symTypes.Add(new CeSymbolType(tn, bases));
                 }
             } else if (f[0] == "M" && f.Count >= 6) {
                 // extern（DllImport）声明是 FFI 绑定而非 API，
                 // 不应提供：WebApp 的 crt `time`/`fopen`/`fwrite`/`fclose`
                 // 是该类型的成员，看起来像 WebApp 自己的方法。
                 if (f.Count > 6 && CodeEditor.Find(f[6], "x") >= 0) { continue; }
-                symOwners.Add(f[1]);
-                symNames.Add(f[2]);
-                symKinds.Add(f[3]);
-                symSigs.Add(f[5]);
-                symStatics.Add(f[4]);
+                bool isSt = f[4] == "1";
+                symMembers.Add(new CeSymbolMember(f[1], f[2], f[3], f[5], isSt));
             }
         }
         return symTypes.Count > 0;
@@ -115,7 +139,10 @@ partial class CodeEditor {
     /// 索引描述了 `typeName` 时返回 true。
     static bool HasSymbolType(string typeName) {
         if (!CodeEditor.SymbolIndexLoaded()) { return false; }
-        return CodeEditor.Has(symTypes, typeName);
+        for (int i = 0; i < symTypes.Count; i = i + 1) {
+            if (symTypes[i].name == typeName) { return true; }
+        }
+        return false;
     }
 
     // ---- 按类型限定的源码搜索 -----------------------------------------
@@ -197,19 +224,17 @@ partial class CodeEditor {
 
     /// OwnerPerLine，但行已经抹除过。
     static void OwnerPerLinePre(List<string> stripped, List<string> outOwners) {
-        List<string> stack = new List<string>();
-        List<int> depths = new List<int>();
+        List<CeTypeScope> stack = new List<CeTypeScope>();
         int depth = 0;
         for (int i = 0; i < stripped.Count; i = i + 1) {
             string s = stripped[i];
             string tn = CodeEditor.TypeNameOn(s);
-            if (tn.Length > 0) { stack.Add(tn); depths.Add(depth); }
-            if (stack.Count > 0) { outOwners.Add(stack[stack.Count - 1]); }
+            if (tn.Length > 0) { stack.Add(new CeTypeScope(tn, depth)); }
+            if (stack.Count > 0) { outOwners.Add(stack[stack.Count - 1].typeName); }
             else { outOwners.Add(""); }
             depth = depth + CodeEditor.BraceDeltaPre(s);
-            while (stack.Count > 0 && depth <= depths[depths.Count - 1]) {
+            while (stack.Count > 0 && depth <= stack[stack.Count - 1].depth) {
                 stack.RemoveAt(stack.Count - 1);
-                depths.RemoveAt(depths.Count - 1);
             }
         }
     }
@@ -432,8 +457,9 @@ partial class CodeEditor {
         if (!CodeEditor.SymbolIndexLoaded()) { return ""; }
         string cur = typeName;
         for (int depth = 0; cur.Length > 0 && depth < 8; depth = depth + 1) {
-            for (int i = 0; i < symOwners.Count; i = i + 1) {
-                if (symOwners[i] == cur && symNames[i] == member) { return cur; }
+            for (int i = 0; i < symMembers.Count; i = i + 1) {
+                CeSymbolMember m = symMembers[i];
+                if (m.owner == cur && m.name == member) { return cur; }
             }
             cur = CodeEditor.SymbolFirstBase(cur);
         }
@@ -455,15 +481,15 @@ partial class CodeEditor {
         if (!CodeEditor.SymbolIndexLoaded()) { return; }
         string cur = typeName;
         for (int depth = 0; cur.Length > 0 && depth < 8; depth = depth + 1) {
-            for (int i = 0; i < symOwners.Count; i = i + 1) {
-                if (symOwners[i] == cur && symKinds[i] != "C") {
+            for (int i = 0; i < symMembers.Count; i = i + 1) {
+                CeSymbolMember m = symMembers[i];
+                if (m.owner == cur && m.kind != "C") {
                     bool want = wantStatic < 0;
-                    if (!want && i < symStatics.Count) {
-                        bool st = symStatics[i] == "1";
-                        want = st == (wantStatic == 1);
+                    if (!want) {
+                        want = m.isStatic == (wantStatic == 1);
                     }
-                    if (want && !CodeEditor.Has(out2, symNames[i])) {
-                        out2.Add(symNames[i]);
+                    if (want && !CodeEditor.Has(out2, m.name)) {
+                        out2.Add(m.name);
                     }
                 }
             }
@@ -484,10 +510,10 @@ partial class CodeEditor {
     static void SymbolSubtypesOf(string typeName, List<string> out2) {
         if (!CodeEditor.SymbolIndexLoaded()) { return; }
         for (int i = 0; i < symTypes.Count; i = i + 1) {
-            string cur = CodeEditor.SymbolFirstBase(symTypes[i]);
+            string cur = CodeEditor.SymbolFirstBase(symTypes[i].name);
             for (int depth = 0; cur.Length > 0 && depth < 8; depth = depth + 1) {
                 if (cur == typeName) {
-                    if (!CodeEditor.Has(out2, symTypes[i])) { out2.Add(symTypes[i]); }
+                    if (!CodeEditor.Has(out2, symTypes[i].name)) { out2.Add(symTypes[i].name); }
                     break;
                 }
                 cur = CodeEditor.SymbolFirstBase(cur);
@@ -499,8 +525,8 @@ partial class CodeEditor {
     static string SymbolFirstBase(string typeName) {
         if (!CodeEditor.SymbolIndexLoaded()) { return ""; }
         for (int i = 0; i < symTypes.Count; i = i + 1) {
-            if (symTypes[i] == typeName) {
-                string b = symBases[i];
+            if (symTypes[i].name == typeName) {
+                string b = symTypes[i].baseTypes;
                 if (b.Length == 0) { return ""; }
                 int c = b.IndexOf(",");
                 if (c >= 0) { b = b.Substring(0, c); }
@@ -518,8 +544,9 @@ partial class CodeEditor {
         if (!CodeEditor.SymbolIndexLoaded()) { return ""; }
         string cur = typeName;
         for (int depth = 0; cur.Length > 0 && depth < 8; depth = depth + 1) {
-            for (int i = 0; i < symOwners.Count; i = i + 1) {
-                if (symOwners[i] == cur && symNames[i] == member) { return symSigs[i]; }
+            for (int i = 0; i < symMembers.Count; i = i + 1) {
+                CeSymbolMember m = symMembers[i];
+                if (m.owner == cur && m.name == member) { return m.sig; }
             }
             cur = CodeEditor.SymbolFirstBase(cur);
         }
@@ -527,10 +554,11 @@ partial class CodeEditor {
         // PadLeft(this string s, ...)"），因此还要查找 `this <typeName>`
         // 接收者。
         string want = "(this " + typeName;
-        for (int k = 0; k < symOwners.Count; k = k + 1) {
-            if (symNames[k] == member) {
-                int at = symSigs[k].IndexOf(want);
-                if (at >= 0) { return symSigs[k]; }
+        for (int k = 0; k < symMembers.Count; k = k + 1) {
+            CeSymbolMember m = symMembers[k];
+            if (m.name == member) {
+                int at = m.sig.IndexOf(want);
+                if (at >= 0) { return m.sig; }
             }
         }
         return "";
@@ -540,8 +568,8 @@ partial class CodeEditor {
     /// 接收者类型未知的悬停/签名条。
     static string SymbolSignatureAny(string member) {
         if (!CodeEditor.SymbolIndexLoaded()) { return ""; }
-        for (int i = 0; i < symNames.Count; i = i + 1) {
-            if (symNames[i] == member) { return symSigs[i]; }
+        for (int i = 0; i < symMembers.Count; i = i + 1) {
+            if (symMembers[i].name == member) { return symMembers[i].sig; }
         }
         return "";
     }
@@ -550,11 +578,12 @@ partial class CodeEditor {
     static void SymbolOverloads(string typeName, string member, List<string> out2) {
         if (!CodeEditor.SymbolIndexLoaded()) { return; }
         string want = "(this " + typeName;
-        for (int i = 0; i < symOwners.Count; i = i + 1) {
-            bool mine = symOwners[i] == typeName && symNames[i] == member;
-            bool ext = symNames[i] == member && symSigs[i].IndexOf(want) >= 0;
+        for (int i = 0; i < symMembers.Count; i = i + 1) {
+            CeSymbolMember m = symMembers[i];
+            bool mine = m.owner == typeName && m.name == member;
+            bool ext = m.name == member && m.sig.IndexOf(want) >= 0;
             if (mine || ext) {
-                if (!CodeEditor.Has(out2, symSigs[i])) { out2.Add(symSigs[i]); }
+                if (!CodeEditor.Has(out2, m.sig)) { out2.Add(m.sig); }
             }
         }
     }
@@ -563,8 +592,9 @@ partial class CodeEditor {
     /// 索引未描述时返回 ""。
     static string SymbolKind(string typeName, string member) {
         if (!CodeEditor.SymbolIndexLoaded()) { return ""; }
-        for (int i = 0; i < symOwners.Count; i = i + 1) {
-            if (symOwners[i] == typeName && symNames[i] == member) { return symKinds[i]; }
+        for (int i = 0; i < symMembers.Count; i = i + 1) {
+            CeSymbolMember m = symMembers[i];
+            if (m.owner == typeName && m.name == member) { return m.kind; }
         }
         return "";
     }
@@ -574,8 +604,8 @@ partial class CodeEditor {
     static void SymbolTypesStartingWith(string prefix, List<string> out2) {
         if (!CodeEditor.SymbolIndexLoaded()) { return; }
         for (int i = 0; i < symTypes.Count; i = i + 1) {
-            if (CodeEditor.StartsWithI(symTypes[i], prefix)) {
-                if (!CodeEditor.Has(out2, symTypes[i])) { out2.Add(symTypes[i]); }
+            if (CodeEditor.StartsWithI(symTypes[i].name, prefix)) {
+                if (!CodeEditor.Has(out2, symTypes[i].name)) { out2.Add(symTypes[i].name); }
             }
         }
     }
@@ -585,15 +615,16 @@ partial class CodeEditor {
     static void SymbolExtensionsFor(string typeName, List<string> out2) {
         if (!CodeEditor.SymbolIndexLoaded()) { return; }
         string want = "(this " + typeName;
-        for (int i = 0; i < symOwners.Count; i = i + 1) {
-            string sig = symSigs[i];
+        for (int i = 0; i < symMembers.Count; i = i + 1) {
+            CeSymbolMember m = symMembers[i];
+            string sig = m.sig;
             int at = sig.IndexOf(want);
             if (at >= 0) {
                 int after = at + want.Length;
                 string next = "";
                 if (after < sig.Length) { next = sig.Substring(after, 1); }
                 if (next == " " || next == "<") {
-                    if (!CodeEditor.Has(out2, symNames[i])) { out2.Add(symNames[i]); }
+                    if (!CodeEditor.Has(out2, m.name)) { out2.Add(m.name); }
                 }
             }
         }

@@ -19,6 +19,30 @@ class FileFilter {
     }
 }
 
+/// 目录树节点实体（路径 + 缩进层级），保证数据一致性。
+class FilePickerTreeNode {
+    public string path;
+    public int depth;
+
+    public FilePickerTreeNode(string path, int depth) {
+        this.path = path;
+        this.depth = depth;
+    }
+}
+
+/// 列表条目实体（名称 + 路径 + 类型 0:文件 1:文件夹），保证数据一致性。
+class FilePickerItem {
+    public string name;
+    public string path;
+    public int kind;
+
+    public FilePickerItem(string name, string path, int kind) {
+        this.name = name;
+        this.path = path;
+        this.kind = kind;
+    }
+}
+
 /// 可复用的应用内路径选择器，承载于独立 GUI 窗口。
 class FilePicker {
     static string lang = "zh";
@@ -329,19 +353,17 @@ class FilePicker {
     void BuildTree(
         string dir,
         int depth,
-        List<string> paths,
-        List<int> depths
+        List<FilePickerTreeNode> nodes
     ) {
-        if (paths.Count >= 400 || !Directory.ExistsUtf8(dir)) { return; }
-        paths.Add(dir);
-        depths.Add(depth);
+        if (nodes.Count >= 400 || !Directory.ExistsUtf8(dir)) { return; }
+        nodes.Add(new FilePickerTreeNode(dir, depth));
         if (!IsExpanded(dir)) { return; }
 
         List<string> dirs = Directory.GetDirectoriesFiltered(
             dir, showHidden.Get());
-        for (int i = 0; i < dirs.Count && paths.Count < 400; i = i + 1) {
+        for (int i = 0; i < dirs.Count && nodes.Count < 400; i = i + 1) {
             string child = FilePicker.Join(dir, dirs[i]);
-            BuildTree(child, depth + 1, paths, depths);
+            BuildTree(child, depth + 1, nodes);
         }
     }
 
@@ -656,12 +678,12 @@ class FilePicker {
         Closed.Raise();
     }
 
-    /// `idx` 行在多选集合里时为 true。列表行每帧重建（names/paths
+    /// `idx` 行在多选集合里时为 true。列表行每帧重建（items
     /// 是 RenderContent 的局部量），这里按路径字符串比较——多选集合
     /// 存的本来就是路径。
-    bool InMultiSelection(int idx, List<string> paths) {
-        if (idx < 0 || idx >= paths.Count) { return false; }
-        return selectedPaths.Contains(paths[idx]);
+    bool InMultiSelection(int idx, List<FilePickerItem> items) {
+        if (idx < 0 || idx >= items.Count) { return false; }
+        return selectedPaths.Contains(items[idx].path);
     }
 
     /// 从多选集合摘除一条路径（List<string> 无 Remove 成员，
@@ -1014,8 +1036,7 @@ class FilePicker {
 
         bool releaseConsumed = treeDragging || listDragging || suppressOthers;
 
-        List<string> treePaths = new List<string>();
-        List<int> treeDepths = new List<int>();
+        List<FilePickerTreeNode> treeNodes = new List<FilePickerTreeNode>();
         if (treeW > 0) {
             // 单栏（窄视口）不建树：递归枚举整个文件系统纯浪费。
             List<string> roots = Directory.GetRootsUtf8();
@@ -1023,14 +1044,14 @@ class FilePicker {
                     rootIndex = rootIndex + 1) {
                 if (Directory.ExistsUtf8(roots[rootIndex])) {
                     BuildTree(
-                        roots[rootIndex], 0, treePaths, treeDepths);
+                        roots[rootIndex], 0, treeNodes);
                 }
             }
         }
 
         int treeRows = paneH / rowH;
         if (treeRows < 1) { treeRows = 1; }
-        int treeMax = treePaths.Count - treeRows;
+        int treeMax = treeNodes.Count - treeRows;
         if (treeMax < 0) { treeMax = 0; }
         int treeOff = treeScroll.Get();
         bool overTree = FilePicker.Inside(
@@ -1043,11 +1064,12 @@ class FilePicker {
         if (treeOff < 0) { treeOff = 0; }
         if (treeOff > treeMax) { treeOff = treeMax; }
 
-        for (int treeShown = 0; treeW > 0 && treeOff + treeShown < treePaths.Count
+        for (int treeShown = 0; treeW > 0 && treeOff + treeShown < treeNodes.Count
                && treeShown < treeRows; treeShown = treeShown + 1) {
             int idx = treeOff + treeShown;
-            string path = treePaths[idx];
-            int depth = treeDepths[idx];
+            FilePickerTreeNode node = treeNodes[idx];
+            string path = node.path;
+            int depth = node.depth;
             int rowY = paneY + treeShown * rowH;
             int rowId = app.focus.AllocId();
             bool selected = path == dir;
@@ -1094,9 +1116,9 @@ class FilePicker {
             }
         }
 
-        if (treeW > 0 && treePaths.Count > treeRows) {
+        if (treeW > 0 && treeNodes.Count > treeRows) {
             int trackX = pad + treeW - scrollW;
-            int thumbH = paneH * treeRows / treePaths.Count;
+            int thumbH = paneH * treeRows / treeNodes.Count;
             if (thumbH < app.Scale(24)) { thumbH = app.Scale(24); }
             int range = paneH - thumbH;
             int thumbY = paneY;
@@ -1132,9 +1154,7 @@ class FilePicker {
             }
         }
 
-        List<string> names = new List<string>();
-        List<string> paths = new List<string>();
-        List<int> kinds = new List<int>();
+        List<FilePickerItem> items = new List<FilePickerItem>();
         if (valid) {
             // 筛选框按子串同时过滤文件夹和文件，因此输入 "rep"
             // 既能缩小报告目录，也能缩小其子文件夹；"" 显示全部。
@@ -1148,9 +1168,8 @@ class FilePicker {
                 dir, showHidden.Get());
             for (int di = 0; di < dirs.Count; di = di + 1) {
                 if (FilePicker.ContainsText(dirs[di], nameFilter)) {
-                    names.Add(dirs[di]);
-                    paths.Add(FilePicker.Join(dir, dirs[di]));
-                    kinds.Add(1);
+                    items.Add(new FilePickerItem(
+                        dirs[di], FilePicker.Join(dir, dirs[di]), 1));
                 }
             }
             if (mode != 0) {
@@ -1159,9 +1178,8 @@ class FilePicker {
                 for (int fi = 0; fi < files.Count; fi = fi + 1) {
                     if (MatchesCurrentFilter(files[fi])
                             && FilePicker.ContainsText(files[fi], nameFilter)) {
-                        names.Add(files[fi]);
-                        paths.Add(FilePicker.Join(dir, files[fi]));
-                        kinds.Add(0);
+                        items.Add(new FilePickerItem(
+                            files[fi], FilePicker.Join(dir, files[fi]), 0));
                     }
                 }
             }
@@ -1169,7 +1187,7 @@ class FilePicker {
 
         int listRows = paneH / rowH;
         if (listRows < 1) { listRows = 1; }
-        int listMax = names.Count - listRows;
+        int listMax = items.Count - listRows;
         if (listMax < 0) { listMax = 0; }
         int listOff = listScroll.Get();
         bool overList = FilePicker.Inside(
@@ -1184,12 +1202,13 @@ class FilePicker {
         if (listOff > listMax) { listOff = listMax; }
 
         int clicked = 0 - 1;
-        for (int shown = 0; listOff + shown < names.Count && shown < listRows; shown = shown + 1) {
+        for (int shown = 0; listOff + shown < items.Count && shown < listRows; shown = shown + 1) {
             int idx = listOff + shown;
+            FilePickerItem item = items[idx];
             int rowY = paneY + shown * rowH;
             int rowId = app.focus.AllocId();
-            bool multiPicked = allowMulti && this.InMultiSelection(idx, paths);
-            bool selected = selectedPath == paths[idx] || multiPicked;
+            bool multiPicked = allowMulti && this.InMultiSelection(idx, items);
+            bool selected = selectedPath == item.path || multiPicked;
             if (selected) {
                 // 多选行不做满行大色块：左侧细标记条 + 行内对勾，
                 // 满行高亮留给悬停/单选当前行，避免整屏都是绿色块。
@@ -1222,7 +1241,7 @@ class FilePicker {
             int color = rowStyle.FgOr(0);
             string iconName = "file";
             int iconColor = iconStyle.FgOr(0);
-            if (kinds[idx] == 1) {
+            if (item.kind == 1) {
                 iconName = "folder";
                 iconColor = folderIconStyle.FgOr(0);
                 color = folderIconStyle.FgOr(0);
@@ -1235,7 +1254,7 @@ class FilePicker {
             int textW = listX + listW - scrollW
                 - app.Scale(8) - textX;
             string shownName = Ellipsis.Fit(
-                names[idx], textW, Style.FontFallback(app, "medium"));
+                item.name, textW, Style.FontFallback(app, "medium"));
             c.DrawText(
                 textX, rowY + app.Scale(7),
                 shownName, color, Style.FontFallback(app, "medium"));
@@ -1249,7 +1268,7 @@ class FilePicker {
             }
         }
 
-        if (names.Count == 0) {
+        if (items.Count == 0) {
             string emptyText = FilePicker.T(
                 "This folder is empty.", "此文件夹为空。");
             if (!valid) {
@@ -1261,9 +1280,9 @@ class FilePicker {
                 emptyText, emptyStyle.FgOr(0), Style.FontFallback(app, "medium"));
         }
 
-        if (names.Count > listRows) {
+        if (items.Count > listRows) {
             int trackX = listX + listW - scrollW;
-            int thumbH = paneH * listRows / names.Count;
+            int thumbH = paneH * listRows / items.Count;
             if (thumbH < app.Scale(24)) { thumbH = app.Scale(24); }
             int range = paneH - thumbH;
             int thumbY = paneY;
@@ -1327,17 +1346,18 @@ class FilePicker {
                 statusText = "";
                 app.RequestRedraw();
             }
-        } else if (!suppressOthers && clicked >= 0 && clicked < paths.Count) {
-            if (kinds[clicked] == 1) {
-                Navigate(paths[clicked]);
+        } else if (!suppressOthers && clicked >= 0 && clicked < items.Count) {
+            FilePickerItem clickedItem = items[clicked];
+            if (clickedItem.kind == 1) {
+                Navigate(clickedItem.path);
             } else if (allowMulti) {
                 // 多选：普通点击重置为单行；Ctrl+点击切换；Shift+点击
                 // 从锚点扩展。文件夹行永远走 Navigate。
                 int mods = app.window.EventMods();
                 bool blocked = false;
                 if (Modifiers.HasCtrl(mods)) {
-                    if (this.InMultiSelection(clicked, paths)) {
-                        this.RemoveSelectedPath(paths[clicked]);
+                    if (this.InMultiSelection(clicked, items)) {
+                        this.RemoveSelectedPath(clickedItem.path);
                         statusText = "";
                     } else if (maxSelect > 0
                                && selectedPaths.Count >= maxSelect) {
@@ -1348,7 +1368,7 @@ class FilePicker {
                             + Convert.ToString(maxSelect)
                             + FilePicker.T(" files.", " 个。");
                     } else {
-                        selectedPaths.Add(paths[clicked]);
+                        selectedPaths.Add(clickedItem.path);
                         statusText = "";
                     }
                     anchorIdx = clicked;
@@ -1359,8 +1379,8 @@ class FilePicker {
                     selectedPaths = new List<string>();
                     int r = a;
                     while (r <= b) {
-                        if (r < paths.Count && kinds[r] == 0
-                                && !selectedPaths.Contains(paths[r])) {
+                        if (r < items.Count && items[r].kind == 0
+                                && !selectedPaths.Contains(items[r].path)) {
                             if (maxSelect > 0
                                     && selectedPaths.Count >= maxSelect) {
                                 blocked = true;
@@ -1370,24 +1390,24 @@ class FilePicker {
                                     + FilePicker.T(" files.", " 个。");
                                 break;
                             }
-                            selectedPaths.Add(paths[r]);
+                            selectedPaths.Add(items[r].path);
                         }
                         r = r + 1;
                     }
                 } else {
                     selectedPaths = new List<string>();
-                    selectedPaths.Add(paths[clicked]);
+                    selectedPaths.Add(clickedItem.path);
                     anchorIdx = clicked;
                 }
-                selectedPath = paths[clicked];
-                nameInput.SetText(names[clicked]);
+                selectedPath = clickedItem.path;
+                nameInput.SetText(clickedItem.name);
                 // 上限拦截信息必须存活到渲染：仅当本次点击
                 // 真正改动了选区时才清状态。
                 if (!blocked) { statusText = ""; }
                 app.RequestRedraw();
             } else {
-                selectedPath = paths[clicked];
-                nameInput.SetText(names[clicked]);
+                selectedPath = clickedItem.path;
+                nameInput.SetText(clickedItem.name);
                 statusText = "";
                 app.RequestRedraw();
             }

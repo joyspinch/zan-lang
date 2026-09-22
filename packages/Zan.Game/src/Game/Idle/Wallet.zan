@@ -3,6 +3,18 @@ using Gui;
 
 namespace Game.Idle;
 
+class WalletSlot {
+    public string key;
+    public long amount;
+    public long cap;
+
+    public WalletSlot(string key, long amount, long cap) {
+        this.key = key;
+        this.amount = amount;
+        this.cap = cap;
+    }
+}
+
 /// <summary>多资源容器：放置类"金币/宝石/素材…"的通用账本。
 /// 每种资源一个槽（名字→余额+上限），Add/TrySpend 原子增减，
 /// 变更走事件（UI 进度条/按钮可用性订阅）。余额 long，钳在
@@ -10,9 +22,7 @@ namespace Game.Idle;
 /// 同一策略：卡住而不是回绕出负余额）。名字区分大小写，槽序即
 /// 插入序（UI 按创建顺序画进度条）。</summary>
 class Wallet {
-    List<string> keys;
-    List<long> amounts;
-    List<long> caps;
+    List<WalletSlot> slots;
 
     /// 变更快照：最近一次变动的键与新余额（UI 每帧轮询对账，
     /// 放置结算一秒可触发几百次，内联事件反而烧帧——宿主自己
@@ -21,9 +31,7 @@ class Wallet {
     long changedValue;
 
     Wallet() {
-        keys = new List<string>();
-        amounts = new List<long>();
-        caps = new List<long>();
+        slots = new List<WalletSlot>();
         changedKey = "";
         changedValue = 0;
     }
@@ -31,16 +39,14 @@ class Wallet {
     /// 注册一个资源槽（重复注册返回 false 不覆盖）。
     bool Define(string key, long cap) {
         if (this.IndexOf(key) >= 0) { return false; }
-        keys.Add(key);
-        amounts.Add(0);
-        caps.Add(cap);
+        slots.Add(new WalletSlot(key, 0, cap));
         return true;
     }
 
     /// 槽下标；未注册返回 -1。
     int IndexOf(string key) {
-        for (int i = 0; i < keys.Count; i = i + 1) {
-            if (keys[i] == key) { return i; }
+        for (int i = 0; i < slots.Count; i = i + 1) {
+            if (slots[i].key == key) { return i; }
         }
         return 0 - 1;
     }
@@ -48,13 +54,13 @@ class Wallet {
     long Amount(string key) {
         int i = this.IndexOf(key);
         if (i < 0) { return 0; }
-        return amounts[i];
+        return slots[i].amount;
     }
 
     long Cap(string key) {
         int i = this.IndexOf(key);
         if (i < 0) { return 0; }
-        return caps[i];
+        return slots[i].cap;
     }
 
     /// 入账 `v`（可为负），返回实际入账量（被 cap 吃掉的部分不计）。
@@ -62,13 +68,14 @@ class Wallet {
     long Add(string key, long v) {
         int i = this.IndexOf(key);
         if (i < 0 || v == 0) { return 0; }
-        long now = amounts[i];
+        WalletSlot slot = slots[i];
+        long now = slot.amount;
         long want = now + v;
         if (want < 0) { want = 0; }
-        if (want > caps[i]) { want = caps[i]; }
+        if (want > slot.cap) { want = slot.cap; }
         long real = want - now;
         if (real == 0) { return 0; }
-        amounts[i] = want;
+        slot.amount = want;
         this.Fire(key, want);
         return real;
     }
@@ -79,9 +86,10 @@ class Wallet {
         if (v <= 0) { return false; }
         int i = this.IndexOf(key);
         if (i < 0) { return false; }
-        if (amounts[i] < v) { return false; }
-        amounts[i] = amounts[i] - v;
-        this.Fire(key, amounts[i]);
+        WalletSlot slot = slots[i];
+        if (slot.amount < v) { return false; }
+        slot.amount = slot.amount - v;
+        this.Fire(key, slot.amount);
         return true;
     }
 
@@ -113,9 +121,9 @@ class Wallet {
     /// 与引擎无关——放置存档里只需要余额，cap 由代码重定义）。
     string ToSaveText() {
         string s = "";
-        for (int i = 0; i < keys.Count; i = i + 1) {
+        for (int i = 0; i < slots.Count; i = i + 1) {
             if (i > 0) { s = s + ";"; }
-            s = s + keys[i] + "|" + Convert.ToString(amounts[i]);
+            s = s + slots[i].key + "|" + Convert.ToString(slots[i].amount);
         }
         return s;
     }
@@ -125,15 +133,15 @@ class Wallet {
     /// 自然蒸发），缺失键保持 0。
     void LoadSaveText(string s) {
         if (s == null || s == "") { return; }
-        List<string> slots = s.Split(";");
-        for (int i = 0; i < slots.Count; i = i + 1) {
-            int bar = slots[i].IndexOf("|");
+        List<string> rawSlots = s.Split(";");
+        for (int i = 0; i < rawSlots.Count; i = i + 1) {
+            int bar = rawSlots[i].IndexOf("|");
             if (bar <= 0) { continue; }
-            string k = slots[i].Substring(0, bar);
+            string k = rawSlots[i].Substring(0, bar);
             int j = this.IndexOf(k);
             if (j < 0) { continue; }
             long v = 0;
-            string numText = slots[i].Substring(bar + 1);
+            string numText = rawSlots[i].Substring(bar + 1);
             bool ok = true;
             for (int c = 0; c < numText.Length && ok; c = c + 1) {
                 string ch = numText.Substring(c, 1);
@@ -146,8 +154,8 @@ class Wallet {
                 v = Convert.ToInt64(numText);
             }
             if (v < 0) { v = 0; }
-            if (v > caps[j]) { v = caps[j]; }
-            amounts[j] = v;
+            if (v > slots[j].cap) { v = slots[j].cap; }
+            slots[j].amount = v;
         }
     }
 }
