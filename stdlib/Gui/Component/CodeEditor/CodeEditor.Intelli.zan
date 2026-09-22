@@ -82,13 +82,31 @@ partial class CodeEditor {
     /// 从当前缓冲区解析，再查其他项目文件。找不到返回 ""
     /// —— 调用方可回退到精编的 stdlib 签名。
     string RealSigFor(string name) {
-        string here = CodeEditor.SigInSource(GetText(), name);
-        if (here.Length > 0) { return here; }
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string tr = CodeEditor.TrimStr(lines[i]);
+            if (CodeEditor.MemberDeclName(tr) == name) {
+                string sig = CodeEditor.SigFromLine(tr);
+                if (sig.Length > 0) { return sig; }
+            }
+        }
         for (int i = 0; i < projFileSrc.Count; i = i + 1) {
             string s = CodeEditor.SigInSource(projFileSrc[i], name);
             if (s.Length > 0) { return s; }
         }
         return "";
+    }
+
+    /// 鼠标悬停时的符号签名查询：优先查内置标准库与项目源码声明，
+    /// 绝不触发光标位置的 LSP 同步调用，避免光标与鼠标分离时的错误请求与主线程卡顿。
+    string SigHelpForHover(string name) {
+        int stamp = lines.Count;
+        if (sigMemoName == name && sigMemoStamp == stamp) { return sigMemoText; }
+        string sig = CodeEditor.DescSig(name);
+        if (sig.Length == 0) { sig = RealSigFor(name); }
+        sigMemoName = name;
+        sigMemoStamp = stamp;
+        sigMemoText = sig;
+        return sig;
     }
 
     /// `name` 用于参数提示的签名，按被调用者记忆化。
@@ -663,11 +681,11 @@ partial class CodeEditor {
         if (code == 8) {
             if (selActive) { ClearExtraCarets(); DeleteSelection(); }
             else if (carets.Count > 0) { McBackspace(); }
-            else { SaveUndo(); BackspaceEdit(); }
-            CheckErrors();
+            else { SaveUndoBackspace(); BackspaceEdit(); }
             UpdateCompletion();
             app.RequestRedraw();
         } else if (code == 13) {
+            EndUndoGroup();
             if (acActive) { AcceptCompletion(false); }
             else {
                 ClearExtraCarets();
@@ -678,6 +696,7 @@ partial class CodeEditor {
             }
             app.RequestRedraw();
         } else if (code == 9) {
+            EndUndoGroup();
             bool tabShift = Modifiers.HasShift(app.window.EventMods());
             if (acActive) { AcceptCompletion(true); }
             else if (tabShift) {
@@ -696,6 +715,7 @@ partial class CodeEditor {
             }
             app.RequestRedraw();
         } else if (code == 27) {
+            EndUndoGroup();
             acActive = false;
             acFilter = "";
             selActive = false;
@@ -707,7 +727,7 @@ partial class CodeEditor {
             string ch = Text.CharStr(code);
             if (ch.Length > 0) {
                 if (selActive) { ClearExtraCarets(); DeleteSelection(); }
-                else { SaveUndo(); }
+                else { SaveUndoTyping(); }
                 if (carets.Count > 0) { McInsertStr(ch); }
                 else { InsertStr(ch); }
                 selActive = false;
@@ -757,20 +777,23 @@ partial class CodeEditor {
             acSel = acSel + 1;
             if (acSel >= acItems.Count) { acSel = 0; }
             app.RequestRedraw();
-        } else if (kc == 27) { acActive = false; acFilter = ""; selActive = false; refPopOpen = false; app.RequestRedraw(); }
+        } else if (kc == 27) { EndUndoGroup(); acActive = false; acFilter = ""; selActive = false; refPopOpen = false; app.RequestRedraw(); }
         else if (kc == 37) {
+            EndUndoGroup();
             int m37 = app.window.EventMods();
             acActive = false; ClearExtraCarets(); SelPrepare(Modifiers.HasShift(m37));
             if (Modifiers.HasCtrl(m37)) { MoveWordLeft(); } else { MoveLeft(); }
             app.RequestRedraw();
         }
         else if (kc == 39) {
+            EndUndoGroup();
             int m39 = app.window.EventMods();
             acActive = false; ClearExtraCarets(); SelPrepare(Modifiers.HasShift(m39));
             if (Modifiers.HasCtrl(m39)) { MoveWordRight(); } else { MoveRight(); }
             app.RequestRedraw();
         }
         else if (kc == 38) {
+            EndUndoGroup();
             int mods38 = app.window.EventMods();
             if (Modifiers.HasCtrl(mods38) && Modifiers.HasAlt(mods38)) { AddCaretAbove(); }
             else if (Modifiers.HasAlt(mods38)) { ClearExtraCarets(); MoveLineUp(); CheckErrors(); }
@@ -778,6 +801,7 @@ partial class CodeEditor {
             app.RequestRedraw();
         }
         else if (kc == 40) {
+            EndUndoGroup();
             int mods40 = app.window.EventMods();
             if (Modifiers.HasCtrl(mods40) && Modifiers.HasAlt(mods40)) { AddCaretBelow(); }
             else if (Modifiers.HasAlt(mods40)) { ClearExtraCarets(); MoveLineDown(); CheckErrors(); }
@@ -785,6 +809,7 @@ partial class CodeEditor {
             app.RequestRedraw();
         }
         else if (kc == 33) {
+            EndUndoGroup();
             int vis = pageRows;
             bool sh = Modifiers.HasShift(app.window.EventMods());
             acActive = false; ClearExtraCarets(); SelPrepare(sh);
@@ -792,6 +817,7 @@ partial class CodeEditor {
             curLine = np; ClampCol(); app.RequestRedraw();
         }
         else if (kc == 34) {
+            EndUndoGroup();
             int vis = pageRows;
             bool sh = Modifiers.HasShift(app.window.EventMods());
             acActive = false; ClearExtraCarets(); SelPrepare(sh);
@@ -799,6 +825,7 @@ partial class CodeEditor {
             curLine = np; ClampCol(); app.RequestRedraw();
         }
         else if (kc == 36) {
+            EndUndoGroup();
             int m36 = app.window.EventMods();
             acActive = false; ClearExtraCarets(); SelPrepare(Modifiers.HasShift(m36));
             if (Modifiers.HasCtrl(m36)) { curLine = 0; curCol = 0; }
@@ -806,6 +833,7 @@ partial class CodeEditor {
             app.RequestRedraw();
         }
         else if (kc == 35) {
+            EndUndoGroup();
             int m35 = app.window.EventMods();
             acActive = false; ClearExtraCarets(); SelPrepare(Modifiers.HasShift(m35));
             if (Modifiers.HasCtrl(m35)) { curLine = lines.Count - 1; }
@@ -813,10 +841,10 @@ partial class CodeEditor {
             app.RequestRedraw();
         }
         else if (kc == 46) {
+            EndUndoGroup();
             if (selActive) { DeleteSelection(); }
             else { SaveUndo(); DeleteEdit(); }
             acActive = false;
-            CheckErrors();
             app.RequestRedraw();
         }
     }

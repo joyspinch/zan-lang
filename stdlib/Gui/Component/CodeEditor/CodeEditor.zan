@@ -21,14 +21,23 @@ class CeHlLine {
     bool blockOpen;
 }
 
-/// <summary>一条撤销/重做记录：完整的缓冲区文本及要恢复的
-/// 光标行/列。用单个实体取代并行的文本/行/列栈。</summary>
+/// <summary>一条撤销/重做记录：以行列表深拷贝（引用复制）及光标行/列
+/// 构成的快照，彻底消灭旧实现每次击键 string.Join 全文的巨大开销。</summary>
 class EditSnapshot {
+    List<string> lines;
     string text;
     int line;
     int col;
 
+    EditSnapshot(List<string> lines, int line, int col) {
+        this.lines = lines;
+        this.text = "";
+        this.line = line;
+        this.col = col;
+    }
+
     EditSnapshot(string text, int line, int col) {
+        this.lines = null;
         this.text = text;
         this.line = line;
         this.col = col;
@@ -267,6 +276,10 @@ partial class CodeEditor {
     bool ateCtrlKey;
     List<EditSnapshot> undoStack;
     List<EditSnapshot> redoStack;
+    // 连续键入合并撤销状态：0=无、1=打字、2=退格。
+    int undoEditKind;
+    int undoEditLine;
+    int undoEditCol;
 
     // ---- 错误诊断 ----
     List<Diagnostic> errors;
@@ -544,6 +557,9 @@ partial class CodeEditor {
         this.clipboard = "";
         this.undoStack = new List<EditSnapshot>();
         this.redoStack = new List<EditSnapshot>();
+        this.undoEditKind = 0;
+        this.undoEditLine = 0 - 1;
+        this.undoEditCol = 0 - 1;
         this.errors = new List<Diagnostic>();
         this.lastDiagLine = -1;
         this.compErrors = new List<Diagnostic>();
@@ -1040,46 +1056,103 @@ partial class CodeEditor {
         if (curCol < 0) { curCol = 0; }
     }
 
-    /// ---- 撤销 / 重做 ----
-    /// 把当前全文与光标压入撤销栈（上限 50 条，超出丢最旧），
-    /// 并清空重做栈。
-    void SaveUndo() {
-        undoStack.Add(new EditSnapshot(GetText(), curLine, curCol));
+    static List<string> CloneLines(List<string> src) {
+        List<string> copy = new List<string>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            copy.Add(src[i]);
+        }
+        return copy;
+    }
+
+    /// 终结连续输入/退格的合并事务。在回车、选区编辑、粘贴、光标移动时调用。
+    void EndUndoGroup() {
+        this.undoEditKind = 0;
+        this.undoEditLine = 0 - 1;
+        this.undoEditCol = 0 - 1;
+    }
+
+    /// 压入一个完整的撤销快照（浅拷贝行引用列表，零 string.Join 开销）。
+    void PushUndoSnapshot() {
+        undoStack.Add(new EditSnapshot(CodeEditor.CloneLines(lines), curLine, curCol));
         if (undoStack.Count > 50) {
             undoStack.RemoveAt(0);
         }
-        // 新编辑会使重做历史失效。
         redoStack = new List<EditSnapshot>();
         BumpTextVersion();
     }
 
+    /// ---- 撤销 / 重做 ----
+    /// 普通离散编辑动作：终结之前的合并事务，压入快照。
+    void SaveUndo() {
+        EndUndoGroup();
+        PushUndoSnapshot();
+    }
+
+    /// 连续单字输入的合并撤销：同一行连续键入时只在输入起始压一次栈，避免每击一键都分配快照。
+    void SaveUndoTyping() {
+        if (undoEditKind == 1 && curLine == undoEditLine && curCol == undoEditCol) {
+            undoEditCol = curCol + 1;
+            redoStack = new List<EditSnapshot>();
+            BumpTextVersion();
+            return;
+        }
+        PushUndoSnapshot();
+        undoEditKind = 1;
+        undoEditLine = curLine;
+        undoEditCol = curCol + 1;
+    }
+
+    /// 连续单字退格的合并撤销：同一行连续退格时合并。
+    void SaveUndoBackspace() {
+        if (undoEditKind == 2 && curLine == undoEditLine && curCol == undoEditCol) {
+            undoEditCol = curCol - 1;
+            redoStack = new List<EditSnapshot>();
+            BumpTextVersion();
+            return;
+        }
+        PushUndoSnapshot();
+        undoEditKind = 2;
+        undoEditLine = curLine;
+        undoEditCol = curCol - 1;
+    }
+
+    void RestoreSnapshot(EditSnapshot s) {
+        if (s.lines != null) {
+            this.lines = CodeEditor.CloneLines(s.lines);
+            if (this.lines.Count == 0) { this.lines.Add(""); }
+            this.extRefDirty = true;
+            this.lastDiagLine = 0 - 1;
+            BumpTextVersion();
+        } else {
+            LoadText(s.text);
+        }
+        this.curLine = s.line;
+        this.curCol = s.col;
+        ClampCol();
+        this.selActive = false;
+    }
+
     /// 撤销最近一次编辑：撤销前状态先压入重做栈，恢复后清除选区。
     void Undo() {
+        EndUndoGroup();
         if (undoStack.Count == 0) { return; }
         int last = undoStack.Count - 1;
         EditSnapshot s = undoStack[last];
         undoStack.RemoveAt(last);
         // 记录撤销前的状态，供 Redo 恢复。
-        redoStack.Add(new EditSnapshot(GetText(), curLine, curCol));
-        LoadText(s.text);
-        curLine = s.line;
-        curCol = s.col;
-        ClampCol();
-        selActive = false;
+        redoStack.Add(new EditSnapshot(CodeEditor.CloneLines(lines), curLine, curCol));
+        RestoreSnapshot(s);
     }
 
     /// 重做最近一次被撤销的编辑（对称地更新撤销栈）。
     void Redo() {
+        EndUndoGroup();
         if (redoStack.Count == 0) { return; }
         int last = redoStack.Count - 1;
         EditSnapshot s = redoStack[last];
         redoStack.RemoveAt(last);
-        undoStack.Add(new EditSnapshot(GetText(), curLine, curCol));
-        LoadText(s.text);
-        curLine = s.line;
-        curCol = s.col;
-        ClampCol();
-        selActive = false;
+        undoStack.Add(new EditSnapshot(CodeEditor.CloneLines(lines), curLine, curCol));
+        RestoreSnapshot(s);
     }
 
     /// ---- 选区 ----
