@@ -5252,6 +5252,19 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                 }
             }
         }
+        if (g->diag->error_count == 0) {
+            zan_symbol_t *rcls = expr_class_sym(g, expr->member.object, locals);
+            if (rcls) {
+                zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                    "'%.*s' has no member '%.*s'",
+                    (int)rcls->name.len, rcls->name.str,
+                    (int)expr->member.name.len, expr->member.name.str);
+            } else {
+                zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                    "cannot resolve member '%.*s'",
+                    (int)expr->member.name.len, expr->member.name.str);
+            }
+        }
         return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
 }

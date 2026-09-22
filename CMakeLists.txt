@@ -1194,6 +1194,24 @@ add_test(NAME diag_unresolved_call_member_chain
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_unresolved_call_member_chain PROPERTIES TIMEOUT 60)
 
+add_test(NAME diag_method_group_as_receiver
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/method_group_as_receiver.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_method_group_as_receiver${_exe_ext}
+    "-DEXPECT_REGEX=.GetWorker. is a method, not a value; call it as .GetWorker\\(\\)."
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_method_group_as_receiver PROPERTIES TIMEOUT 60)
+
+add_test(NAME diag_nonexistent_member_access
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/nonexistent_member_access.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_nonexistent_member_access${_exe_ext}
+    "-DEXPECT_REGEX=.Thing. has no member .NonExistent."
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_nonexistent_member_access PROPERTIES TIMEOUT 60)
+
 # A `"role": "control"` .html design doc is an embeddable Control, not a window: it has
 # no Main/Show, so naming one as the project entry has to fail at formgen time
 # instead of linking a program with no entry point.

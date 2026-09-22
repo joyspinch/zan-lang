@@ -1552,11 +1552,21 @@ static bool checker_cast_is_valid(zan_checker_t *c, zan_type_t *dst,
     return checker_type_assignable(dst, src);
 }
 
+static zan_symbol_t *expr_method_group(zan_checker_t *c, zan_ast_node_t *e);
+static void reject_method_group(zan_checker_t *c, zan_ast_node_t *e);
+
 static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
                                      zan_type_t *value, zan_ast_node_t *expr,
                                      zan_loc_t loc, const char *what) {
-    if (!target || !value || target == c->binder->type_error ||
-        value == c->binder->type_error)
+    if (!target || !value) return;
+    if (expr && target->kind != TYPE_DELEGATE) {
+        zan_symbol_t *mg = expr_method_group(c, expr);
+        if (mg) {
+            reject_method_group(c, expr);
+            return;
+        }
+    }
+    if (target == c->binder->type_error || value == c->binder->type_error)
         return;
     /* A void call used as a value used to slip through silently and reach
      * irgen as a `void` SSA operand (invalid IR, verifier failure). C#
@@ -1618,7 +1628,7 @@ static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
  * work below it, so a fluent chain cost 2^links and a generated route table
  * never finished checking at all. */
 static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
-                                       zan_type_t *obj_type);
+                                       zan_type_t *obj_type, bool in_call_callee);
 static void checker_reject_null_receiver(zan_checker_t *c, zan_ast_node_t *expr);
 
 /* How many arguments `m` accepts: [min..max], min counting the parameters
@@ -1989,9 +1999,7 @@ static bool binary_op_compares(zan_token_kind_t op) {
 }
 
 /* The method a value-position member access names, if any: `set.Count`
- * without an argument list is a method group. Only simple receivers are
- * resolved, so no expression is type-checked (and no diagnostic duplicated)
- * on this path. */
+ * without an argument list is a method group. */
 static zan_symbol_t *expr_method_group(zan_checker_t *c, zan_ast_node_t *e) {
     if (!e || e->kind != AST_MEMBER_ACCESS) return NULL;
     zan_ast_node_t *obj = e->member.object;
@@ -1999,12 +2007,15 @@ static zan_symbol_t *expr_method_group(zan_checker_t *c, zan_ast_node_t *e) {
         return NULL;
     zan_type_t *ot = zan_checker_check_expr(c, obj);
     if (!ot || !ot->sym) return NULL;
-    for (int i = ot->sym->member_count - 1; i >= 0; i--) {
-        zan_symbol_t *m = ot->sym->members[i];
-        if (!m) continue;
-        if (m->name.len == e->member.name.len &&
-            memcmp(m->name.str, e->member.name.str, (size_t)m->name.len) == 0)
-            return m->kind == SYM_METHOD ? m : NULL;
+    for (zan_symbol_t *s = ot->sym; s;
+         s = (s->type && s->type->base_type) ? s->type->base_type->sym : NULL) {
+        for (int i = s->member_count - 1; i >= 0; i--) {
+            zan_symbol_t *m = s->members[i];
+            if (!m) continue;
+            if (m->name.len == e->member.name.len &&
+                memcmp(m->name.str, e->member.name.str, (size_t)m->name.len) == 0)
+                return m->kind == SYM_METHOD ? m : NULL;
+        }
     }
     return NULL;
 }
@@ -2563,7 +2574,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             if (!callee_is_method) {
                 callee_type = type_is_scalar_primitive(recv)
                     ? c->binder->type_error
-                    : check_member_access(c, expr->call.callee, recv);
+                    : check_member_access(c, expr->call.callee, recv, true);
             }
         } else {
             callee_type = zan_checker_check_expr(c, expr->call.callee);
@@ -2720,7 +2731,8 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
 
     case AST_MEMBER_ACCESS:
         return check_member_access(c, expr,
-                                   zan_checker_check_expr(c, expr->member.object));
+                                   zan_checker_check_expr(c, expr->member.object),
+                                   false);
 
     case AST_INDEX: {
         zan_type_t *obj = zan_checker_check_expr(c, expr->index.object);
@@ -3438,15 +3450,27 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
             /* `var x = ...`: register with the inferred type so later bare
              * uses in the body resolve to it, not to a field/type of the
              * same name */
+            if (stmt->var_decl.initializer) {
+                zan_symbol_t *mg = expr_method_group(c, stmt->var_decl.initializer);
+                if (mg) {
+                    reject_method_group(c, stmt->var_decl.initializer);
+                }
+            }
             checker_add_local(c, stmt->var_decl.name, iv);
             checker_mark_local_null_src(c, stmt);
         }
         break;
     }
 
-    case AST_EXPR_STMT:
-        zan_checker_check_expr(c, stmt->expr_stmt.expr);
+    case AST_EXPR_STMT: {
+        zan_symbol_t *mg = expr_method_group(c, stmt->expr_stmt.expr);
+        if (mg) {
+            reject_method_group(c, stmt->expr_stmt.expr);
+        } else {
+            zan_checker_check_expr(c, stmt->expr_stmt.expr);
+        }
         break;
+    }
 
     case AST_RETURN_STMT:
         if (stmt->ret.value) {
@@ -3900,8 +3924,15 @@ static bool receiver_is_value_expr(zan_checker_t *c, zan_ast_node_t *obj) {
 }
 
 static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
-                                       zan_type_t *obj_type) {
+                                       zan_type_t *obj_type, bool in_call_callee) {
     checker_reject_null_receiver(c, expr);
+    if (expr->member.object) {
+        zan_symbol_t *mg = expr_method_group(c, expr->member.object);
+        if (mg) {
+            reject_method_group(c, expr->member.object);
+            return c->binder->type_error;
+        }
+    }
     /* Static enum member access: EnumType.Member must be a declared member.
      * A miss used to fall through to irgen, which silently folded the
      * access to the constant 0 (masking stale references, e.g. a removed
@@ -3966,41 +3997,44 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
      * twice: the search runs back to front, which picks the declaration this
      * static type contributes (C# hiding). */
     if (obj_type && obj_type->sym) {
-        for (int i = obj_type->sym->member_count - 1; i >= 0; i--) {
-            zan_symbol_t *m = obj_type->sym->members[i];
-            if (!m) continue;
-            if (m->name.len == expr->member.name.len &&
-                memcmp(m->name.str, expr->member.name.str, m->name.len) == 0) {
-                if (!access_member_allowed(c, m)) {
-                    report_inaccessible(c, m, expr->loc);
-                    return c->binder->type_error;
+        for (zan_symbol_t *s = obj_type->sym; s;
+             s = (s->type && s->type->base_type) ? s->type->base_type->sym : NULL) {
+            for (int i = s->member_count - 1; i >= 0; i--) {
+                zan_symbol_t *m = s->members[i];
+                if (!m) continue;
+                if (m->name.len == expr->member.name.len &&
+                    memcmp(m->name.str, expr->member.name.str, m->name.len) == 0) {
+                    if (!access_member_allowed(c, m)) {
+                        report_inaccessible(c, m, expr->loc);
+                        return c->binder->type_error;
+                    }
+                    /* A method in value position is a method group: only a
+                     * delegate-typed slot (or a call, typed in the AST_CALL case)
+                     * consumes it. Returning the method's *return* type here would
+                     * let `int x = obj.Method;` type as the return value and then
+                     * be rejected against a delegate target; type_error is what the
+                     * delegate assignability rule expects for method groups. */
+                    if (m->kind == SYM_METHOD)
+                        return c->binder->type_error;
+                    if (m->kind == SYM_FIELD && (m->modifiers & MOD_STATIC) &&
+                        expr->member.object &&
+                        receiver_is_value_expr(c, expr->member.object)) {
+                        zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                                      "'%.*s' is a static field of '%.*s'; "
+                                      "qualify it with the type name "
+                                      "('%.*s.%.*s'), not an instance",
+                                      (int)expr->member.name.len,
+                                      expr->member.name.str,
+                                      (int)obj_type->sym->name.len,
+                                      obj_type->sym->name.str,
+                                      (int)obj_type->sym->name.len,
+                                      obj_type->sym->name.str,
+                                      (int)expr->member.name.len,
+                                      expr->member.name.str);
+                        return c->binder->type_error;
+                    }
+                    return m->type ? m->type : c->binder->type_error;
                 }
-                /* A method in value position is a method group: only a
-                 * delegate-typed slot (or a call, typed in the AST_CALL case)
-                 * consumes it. Returning the method's *return* type here would
-                 * let `int x = obj.Method;` type as the return value and then
-                 * be rejected against a delegate target; type_error is what the
-                 * delegate assignability rule expects for method groups. */
-                if (m->kind == SYM_METHOD)
-                    return c->binder->type_error;
-                if (m->kind == SYM_FIELD && (m->modifiers & MOD_STATIC) &&
-                    expr->member.object &&
-                    receiver_is_value_expr(c, expr->member.object)) {
-                    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
-                                  "'%.*s' is a static field of '%.*s'; "
-                                  "qualify it with the type name "
-                                  "('%.*s.%.*s'), not an instance",
-                                  (int)expr->member.name.len,
-                                  expr->member.name.str,
-                                  (int)obj_type->sym->name.len,
-                                  obj_type->sym->name.str,
-                                  (int)obj_type->sym->name.len,
-                                  obj_type->sym->name.str,
-                                  (int)expr->member.name.len,
-                                  expr->member.name.str);
-                    return c->binder->type_error;
-                }
-                return m->type ? m->type : c->binder->type_error;
             }
         }
     }
@@ -4035,6 +4069,16 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
         zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
                       "type '%.*s' has no member '%.*s'",
                       (int)obj_type->name.len, obj_type->name.str,
+                      (int)expr->member.name.len, expr->member.name.str);
+        return c->binder->type_error;
+    }
+    if (!in_call_callee && obj_type &&
+        (obj_type->kind == TYPE_CLASS || obj_type->kind == TYPE_STRUCT ||
+         obj_type->kind == TYPE_INTERFACE) &&
+        obj_type != c->binder->type_error && obj_type->sym) {
+        zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                      "'%.*s' has no member '%.*s'",
+                      (int)obj_type->sym->name.len, obj_type->sym->name.str,
                       (int)expr->member.name.len, expr->member.name.str);
         return c->binder->type_error;
     }
