@@ -1,0 +1,176 @@
+// BurstDrop.zan - 传奇经典怪物大爆散落与冲天光柱引擎
+// 职责：BOSS击杀满地爆装散落、品阶光柱视觉、自动/手动拾取闭环
+
+class GroundItem {
+    Equipment item;
+    string name;
+    int tier;
+    int x;
+    int y;
+    bool hasPillar;
+    string pillarClass;
+    Label widget;
+    int life;
+
+    static GroundItem Create(Equipment eq, int x, int y) {
+        GroundItem gi = new GroundItem();
+        gi.item = eq;
+        gi.name = eq.Name();
+        gi.tier = eq.tier;
+        gi.x = x;
+        gi.y = y;
+        gi.life = 200; // 存活帧数
+        gi.hasPillar = false;
+        gi.pillarClass = "";
+
+        if (eq.tier >= 5 || eq.HasAffix()) {
+            gi.hasPillar = true;
+            gi.pillarClass = "fct-pillar-gold";
+        } else if (eq.tier == 4) {
+            gi.hasPillar = true;
+            gi.pillarClass = "fct-pillar-orange";
+        } else if (eq.tier == 3) {
+            gi.hasPillar = true;
+            gi.pillarClass = "fct-pillar-purple";
+        }
+        return gi;
+    }
+}
+
+class BurstDropEngine {
+    List<GroundItem> groundItems;
+    Panel hostLayer;
+    Game game;
+    int seed;
+    int autoLootTimer;
+
+    BurstDropEngine() {
+        groundItems = new List<GroundItem>();
+        seed = 54321;
+        autoLootTimer = 0;
+    }
+
+    void Attach(Panel host, Game g) {
+        hostLayer = host;
+        game = g;
+    }
+
+    int NextRand(int max) {
+        if (max <= 0) { return 0; }
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+        return seed % max;
+    }
+
+    void TriggerBurst(int centerX, int centerY, List<Equipment> drops) {
+        if (drops == null || drops.Count == 0 || hostLayer == null) { return; }
+
+        int count = drops.Count;
+        // 散落半径与角度分布
+        int[] dx = new int[] { 0, 35, 50, 35, 0, -35, -50, -35, 20, -20, 45, -45 };
+        int[] dy = new int[] { -40, -30, 0, 30, 40, 30, 0, -30, -50, 50, 20, -20 };
+
+        for (int i = 0; i < count; i = i + 1) {
+            Equipment eq = drops[i];
+            int offsetIdx = i % 12;
+            int dropX = centerX + dx[offsetIdx] + (NextRand(10) - 5);
+            int dropY = centerY + dy[offsetIdx] + (NextRand(10) - 5);
+
+            GroundItem gi = GroundItem.Create(eq, dropX, dropY);
+            string displayText = eq.Name();
+            if (gi.hasPillar) {
+                displayText = "★ " + displayText;
+            }
+
+            Label lbl = new Label(displayText);
+            if (gi.hasPillar) {
+                lbl.Class = gi.pillarClass;
+            } else {
+                lbl.Class = "fct-loot";
+            }
+            lbl.Place(dropX, dropY);
+            gi.widget = lbl;
+
+            hostLayer.With(lbl);
+            groundItems.Add(gi);
+        }
+        // 大爆触发清脆金币散落与装备落地声
+        AudioEngine.Get().PlayCoin();
+    }
+
+    void Step() {
+        if (groundItems.Count == 0) { return; }
+
+        autoLootTimer = autoLootTimer + 1;
+        // 挂机模式每 8 拍 (约 1 秒) 自动拾取地面 1 件装备
+        if (autoLootTimer >= 8) {
+            autoLootTimer = 0;
+            AutoPickOne();
+        }
+
+        // 刷新生命期
+        for (int i = groundItems.Count - 1; i >= 0; i = i - 1) {
+            GroundItem gi = groundItems[i];
+            gi.life = gi.life - 1;
+            if (gi.life <= 0) {
+                if (hostLayer != null && gi.widget != null) {
+                    hostLayer.Remove(gi.widget);
+                }
+                groundItems.RemoveAt(i);
+            }
+        }
+    }
+
+    void AutoPickOne() {
+        if (groundItems.Count == 0 || game == null) { return; }
+        // 优先拾取高阶光柱装备
+        int pickIndex = 0;
+        for (int i = 0; i < groundItems.Count; i = i + 1) {
+            if (groundItems[i].hasPillar) {
+                pickIndex = i;
+                break;
+            }
+        }
+
+        GroundItem gi = groundItems[pickIndex];
+        if (hostLayer != null && gi.widget != null) {
+            hostLayer.Remove(gi.widget);
+        }
+        groundItems.RemoveAt(pickIndex);
+
+        // 收入玩家背包
+        game.bag.Add(gi.item);
+        AudioEngine.Get().PlayLoot();
+        if (gi.hasPillar) {
+            game.Log("大爆吸纳! 获得 " + gi.name + " · " + Rules.Quality(gi.tier));
+        } else {
+            game.Log("拾取 " + gi.name);
+        }
+    }
+
+    void PickAll() {
+        if (game == null) { return; }
+        if (groundItems.Count > 0) {
+            AudioEngine.Get().PlayLoot();
+        }
+        for (int i = 0; i < groundItems.Count; i = i + 1) {
+            GroundItem gi = groundItems[i];
+            if (hostLayer != null && gi.widget != null) {
+                hostLayer.Remove(gi.widget);
+            }
+            game.bag.Add(gi.item);
+        }
+        groundItems.Clear();
+        game.Log("已拾取地面所有战利品！");
+    }
+
+    void Clear() {
+        if (hostLayer != null) {
+            for (int i = 0; i < groundItems.Count; i = i + 1) {
+                if (groundItems[i].widget != null) {
+                    hostLayer.Remove(groundItems[i].widget);
+                }
+            }
+        }
+        groundItems.Clear();
+    }
+}

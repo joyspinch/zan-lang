@@ -1,0 +1,182 @@
+// CombatFx.zan - 传奇核心战斗打击感与演出引擎
+// 职责：抛物线伤害跳字、暴击金红大字、技能爆发、闪避MISS、毒伤绿字、震屏与受击顿挫
+
+class CombatDamagePopup {
+    string text;
+    string cssClass;
+    int x;
+    int y;
+    int startY;
+    int life;
+    int maxLife;
+    Label label;
+    bool alive;
+
+    static CombatDamagePopup Create(string text, string cssClass, int x, int y, int duration) {
+        CombatDamagePopup p = new CombatDamagePopup();
+        p.text = text;
+        p.cssClass = cssClass;
+        p.x = x;
+        p.y = y;
+        p.startY = y;
+        p.life = duration;
+        p.maxLife = duration;
+        p.alive = true;
+        return p;
+    }
+
+    void Update() {
+        if (!alive) { return; }
+        // 向上平滑漂浮
+        y = y - 3;
+        life = life - 1;
+        if (life <= 0) {
+            alive = false;
+        }
+        if (label != null) {
+            label.Place(x, y);
+        }
+    }
+}
+
+class CombatFxEngine {
+    List<CombatDamagePopup> popups;
+    Panel hostLayer;
+    int shakeX;
+    int shakeY;
+    int shakeFrames;
+    int hitPauseFrames;
+    int seed;
+
+    CombatFxEngine() {
+        popups = new List<CombatDamagePopup>();
+        shakeX = 0;
+        shakeY = 0;
+        shakeFrames = 0;
+        hitPauseFrames = 0;
+        seed = 12345;
+    }
+
+    void Attach(Panel host) {
+        hostLayer = host;
+    }
+
+    int NextRand(int max) {
+        if (max <= 0) { return 0; }
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+        return seed % max;
+    }
+
+    void Shake(int frames) {
+        shakeFrames = frames;
+    }
+
+    void TriggerEvent(CombatEvent ev) {
+        if (hostLayer == null) { return; }
+
+        if (ev.isMiss) {
+            SpawnPopup("MISS", "fct-miss", ev.targetX, ev.targetY, 8);
+            AudioEngine.Get().PlaySwing();
+            return;
+        }
+
+        if (ev.isPlayerAttack) {
+            // 命中受击顿挫
+            hitPauseFrames = 2;
+
+            if (ev.isLuckMax) {
+                // 运9刀刀上限触发！
+                Shake(3);
+                SpawnPopup("运9·上限! -" + ev.damage, "fct-luck", ev.targetX - 25, ev.targetY - 20, 12);
+                AudioEngine.Get().PlayCrit();
+            } else if (ev.isCrit) {
+                // 暴击
+                Shake(2);
+                SpawnPopup("暴击! -" + ev.damage, "fct-crit", ev.targetX - 20, ev.targetY - 15, 10);
+                AudioEngine.Get().PlayCrit();
+            } else if (ev.skillName != null && ev.skillName.Length > 0) {
+                // 技能伤害
+                Shake(1);
+                SpawnPopup(ev.skillName + " -" + ev.damage, "fct-fire", ev.targetX - 15, ev.targetY - 10, 10);
+                if (ev.skillName.Contains("烈火")) {
+                    AudioEngine.Get().PlayFireSlash();
+                } else if (ev.skillName.Contains("雷电")) {
+                    AudioEngine.Get().PlayLightning();
+                } else if (ev.skillName.Contains("毒")) {
+                    AudioEngine.Get().PlayPoison();
+                } else if (ev.skillName.Contains("半月")) {
+                    AudioEngine.Get().PlayCrescent();
+                } else {
+                    AudioEngine.Get().PlayHit();
+                }
+            } else {
+                // 普通攻击
+                int scatterX = NextRand(15) - 7;
+                SpawnPopup("-" + ev.damage, "fct-white", ev.targetX + scatterX, ev.targetY, 7);
+                AudioEngine.Get().PlayHit();
+            }
+        } else {
+            // 怪物反击玩家
+            SpawnPopup("-" + ev.damage, "fct-fire", ev.targetX, ev.targetY, 7);
+            AudioEngine.Get().PlayHit();
+        }
+    }
+
+    void TriggerPlayerHit(int damage, bool isCrit, bool isLuckMax, string skillName, int tx, int ty) {
+        TriggerEvent(CombatEvent.PlayerStrike(damage, isCrit, isLuckMax, skillName, tx, ty));
+    }
+
+    void SpawnPopup(string text, string cssClass, int x, int y, int duration) {
+        if (hostLayer == null) { return; }
+        CombatDamagePopup p = CombatDamagePopup.Create(text, cssClass, x, y, duration);
+        Label lbl = new Label(text);
+        lbl.Class = cssClass;
+        lbl.Place(x, y);
+        p.label = lbl;
+        hostLayer.With(lbl);
+        popups.Add(p);
+    }
+
+    void Step() {
+        // 更新震屏
+        if (shakeFrames > 0) {
+            shakeFrames = shakeFrames - 1;
+            int r = NextRand(5) - 2;
+            shakeX = r;
+            shakeY = -r;
+        } else {
+            shakeX = 0;
+            shakeY = 0;
+        }
+
+        if (hitPauseFrames > 0) {
+            hitPauseFrames = hitPauseFrames - 1;
+        }
+
+        // 更新跳字
+        for (int i = popups.Count - 1; i >= 0; i = i - 1) {
+            CombatDamagePopup p = popups[i];
+            p.Update();
+            if (!p.alive) {
+                if (hostLayer != null && p.label != null) {
+                    hostLayer.Remove(p.label);
+                }
+                popups.RemoveAt(i);
+            }
+        }
+    }
+
+    void Clear() {
+        if (hostLayer != null) {
+            for (int i = 0; i < popups.Count; i = i + 1) {
+                if (popups[i].label != null) {
+                    hostLayer.Remove(popups[i].label);
+                }
+            }
+        }
+        popups.Clear();
+        shakeFrames = 0;
+        shakeX = 0;
+        shakeY = 0;
+    }
+}
