@@ -1,0 +1,121 @@
+// Copyright (c) 2026 Zan Lang. All rights reserved.
+// Conformance test: WebSocket Cross-Worker SharedBus & Cluster Management
+
+using System;
+using System.Diagnostics;
+using System.Threading;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Net.WebSocket;
+using System.Net;
+
+namespace Tests.Conformance;
+
+class MockWsConsumer : IWsSharedBusConsumer {
+    public int broadcastCount = 0;
+    public string lastBroadcast = "";
+    public int channelCount = 0;
+    public string lastChannel = "";
+    public string lastChannelMsg = "";
+    public int directCount = 0;
+    public int lastDirectId = 0;
+    public string lastDirectMsg = "";
+
+    public void OnSharedBusMessage(int targetType, string channel, int targetId, string payload, int payloadLen) {
+        if (targetType == 0) {
+            this.broadcastCount = this.broadcastCount + 1;
+            this.lastBroadcast = payload;
+        } else if (targetType == 1) {
+            this.channelCount = this.channelCount + 1;
+            this.lastChannel = channel;
+            this.lastChannelMsg = payload;
+        } else if (targetType == 2) {
+            this.directCount = this.directCount + 1;
+            this.lastDirectId = targetId;
+            this.lastDirectMsg = payload;
+        }
+    }
+}
+
+class WsClusterBusTest {
+    static async Task<int> Run() {
+        string busName = "zan_ws_test_bus_" + Convert.ToString(ProcessHost.Pid());
+        WsSharedBus busA = new WsSharedBus(busName, 32);
+        if (!busA.IsAvailable()) {
+            Console.WriteLine("busA init failed");
+            return 1;
+        }
+
+        MockWsConsumer consumerB = new MockWsConsumer();
+        WsSharedBus busB = new WsSharedBus(busName, 32);
+        if (!busB.IsAvailable()) {
+            Console.WriteLine("busB init failed");
+            return 2;
+        }
+
+        // 启动 B 节点的后台拉取循环
+        busB.StartPolling(consumerB);
+
+        // 验证在线连接数原子计数在共享内存的跨节点同步
+        busA.OnConnChange(5);
+        int total = busB.GetTotalConnCount();
+        if (total != 5) {
+            Console.WriteLine("TotalConnCount mismatch: got " + Convert.ToString(total));
+            return 3;
+        }
+        busB.OnConnChange(-2);
+        total = busA.GetTotalConnCount();
+        if (total != 3) {
+            Console.WriteLine("TotalConnCount after decrement mismatch: got " + Convert.ToString(total));
+            return 4;
+        }
+
+        // 1. 测试节点 A 全局广播 -> 节点 B 接收
+        busA.PublishBroadcast("CLUSTER_BROADCAST", 17);
+
+        // 2. 测试节点 A 频道房间组播 -> 节点 B 接收
+        busA.PublishChannel("room_alpha", "HELLO_ROOM", 10);
+
+        // 3. 测试节点 A 精准单发 -> 节点 B 接收
+        busA.PublishDirect(8888, "TARGETED_MSG", 12);
+
+        // 等待轮询协程消费
+        int waitCount = 0;
+        while (waitCount < 50) {
+            if (consumerB.broadcastCount > 0 && consumerB.channelCount > 0 && consumerB.directCount > 0) {
+                break;
+            }
+            await Task.Delay(20);
+            waitCount = waitCount + 1;
+        }
+
+        if (consumerB.broadcastCount != 1 || consumerB.lastBroadcast != "CLUSTER_BROADCAST") {
+            Console.WriteLine("Broadcast failed: count=" + Convert.ToString(consumerB.broadcastCount)
+                + " msg=" + consumerB.lastBroadcast);
+            return 5;
+        }
+
+        if (consumerB.channelCount != 1 || consumerB.lastChannel != "room_alpha" || consumerB.lastChannelMsg != "HELLO_ROOM") {
+            Console.WriteLine("Channel broadcast failed: count=" + Convert.ToString(consumerB.channelCount)
+                + " ch=" + consumerB.lastChannel + " msg=" + consumerB.lastChannelMsg);
+            return 6;
+        }
+
+        if (consumerB.directCount != 1 || consumerB.lastDirectId != 8888 || consumerB.lastDirectMsg != "TARGETED_MSG") {
+            Console.WriteLine("Direct push failed: count=" + Convert.ToString(consumerB.directCount)
+                + " id=" + Convert.ToString(consumerB.lastDirectId) + " msg=" + consumerB.lastDirectMsg);
+            return 7;
+        }
+
+        busB.Stop();
+        Console.WriteLine("WS cluster shared bus tests passed!");
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+        if (r != 0) {
+            Environment.Exit(r);
+        }
+    }
+}
