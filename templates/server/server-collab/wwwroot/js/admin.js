@@ -272,6 +272,15 @@
   /* innerHTML does not execute <script>, and a screen may carry one. */
   function runScripts(root) {
     if (window.applyFragmentWidgets) { window.applyFragmentWidgets(root); }
+    root.querySelectorAll('.form input[required], .form select[required], .form textarea[required]').forEach(function (inp) {
+      var prev = inp.previousElementSibling;
+      while (prev && prev.tagName !== 'LABEL') {
+        prev = prev.previousElementSibling;
+      }
+      if (prev && prev.tagName === 'LABEL') {
+        prev.classList.add('req');
+      }
+    });
     root.querySelectorAll('script').forEach(function (old) {
       var s = document.createElement('script');
       s.textContent = old.textContent;
@@ -368,10 +377,14 @@
       var id = ++seq;
       var mask = node('div', 'lay-mask');
       var box = node('div', 'lay-box' + (opts.drawer ? ' drawer' : '')
+        + (opts.wide ? ' wide' : '')
         + (opts.kind ? ' ' + opts.kind : ''));
       box.style.zIndex = ++zTop;
       mask.style.zIndex = zTop;
-      if (opts.width) { box.style.width = opts.width; }
+      if (opts.width && window.innerWidth > 768) {
+        var want = parseInt(opts.width, 10) || 0;
+        box.style.width = Math.min(want, window.innerWidth - 24) + 'px';
+      }
 
       var head = node('header');
       head.appendChild(node('span', 'title', opts.title || ''));
@@ -410,11 +423,11 @@
 
     // Centred on first paint, then wherever the user drags it.
     function place(box, opts) {
-      if (opts.drawer) { return; }
+      if (opts.drawer || window.innerWidth <= 768) { return; }
       var w = box.offsetWidth;
       var h = box.offsetHeight;
       var left = Math.max(8, (window.innerWidth - w) / 2);
-      var top = Math.max(8, (window.innerHeight - h) / 3);
+      var top = Math.max(16, (window.innerHeight - h) / 2.6);
       box.style.left = Math.round(left) + 'px';
       box.style.top = Math.round(top) + 'px';
     }
@@ -475,7 +488,11 @@
 
     function ready(w, opts) {
       runScripts(w.body);
-      if (!opts.drawer) { place(w.box, opts); }
+      var ft = w.body.querySelector('footer, form > footer');
+      if (ft) { ft.classList.add('lay-footer'); }
+      if (!opts.drawer) {
+        requestAnimationFrame(function () { place(w.box, opts); });
+      }
       var first = w.body.querySelector('input:not([type=hidden]), textarea, select');
       if (first) { first.focus(); }
     }
@@ -596,7 +613,8 @@
 
   function dialog(url, wide, title) {
     return Layer.open({ url: url, title: title || '编辑',
-                        width: wide ? '820px' : '560px' });
+                        wide: !!wide,
+                        width: wide ? '840px' : '580px' });
   }
 
   // Writes launched from INSIDE a dialog (row delete, form save opened over a
@@ -684,9 +702,14 @@
       parts.push(encodeURIComponent(name) + '=' + encodeURIComponent(groups[name].join(',')));
     });
     var btn = form.querySelector('[type=submit]');
-    if (btn) { btn.disabled = true; }
+    var originText = '';
+    if (btn) {
+      originText = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = '保存中…';
+    }
     post(form.getAttribute('action'), parts.join('&')).then(function (j) {
-      if (btn) { btn.disabled = false; }
+      if (btn) { btn.disabled = false; btn.textContent = originText || '保存'; }
       if (!j) { return; }
       if (j.code === '0000') {
         toast(j.msg || '已保存', 'ok');
@@ -696,7 +719,7 @@
       }
       toast(j.msg || '保存失败', 'bad');
     }).catch(function () {
-      if (btn) { btn.disabled = false; }
+      if (btn) { btn.disabled = false; btn.textContent = originText || '保存'; }
       toast('请求失败', 'bad');
     });
   }
