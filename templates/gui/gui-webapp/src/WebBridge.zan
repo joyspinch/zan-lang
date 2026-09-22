@@ -1,0 +1,202 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Backend;
+using Gui.Component.WebView;
+
+public delegate string BridgeHandler(string payload);
+
+public class WebBridge {
+    Form form;
+    Window win;
+    WebViewBox webViewBox;
+    nint hwnd;
+    Dictionary<string, BridgeHandler> handlers;
+    Timer pollTimer;
+    bool lastMaximized;
+
+    #if WINDOWS
+    [DllImport("user32")]
+    static extern bool ReleaseCapture();
+
+    [DllImport("user32")]
+    static extern nint SendMessageW(nint hWnd, uint msg, nint wParam, nint lParam);
+
+    [DllImport("user32")]
+    static extern int GetWindowLongW(nint hWnd, int nIndex);
+
+    [DllImport("user32")]
+    static extern int SetWindowLongW(nint hWnd, int nIndex, int dwNewLong);
+
+    [DllImport("user32")]
+    static extern bool SetWindowPos(nint hWnd, nint hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+    #endif
+
+    public WebBridge(Form form, WebViewBox box) {
+        this.form = form;
+        this.win = form.GetApp().window;
+        this.webViewBox = box;
+        this.handlers = new Dictionary<string, BridgeHandler>();
+        this.hwnd = this.win != null ? this.win.GetHandle() : 0;
+        this.lastMaximized = this.win != null && this.win.IsMaximized();
+
+        #if WINDOWS
+        // 为无边框窗口注入 WS_THICKFRAME (0x00040000) 与最大化/最小化样式，使其边缘支持鼠标自由拖拽缩放
+        if (this.hwnd != 0) {
+            int style = GetWindowLongW(this.hwnd, -16);
+            if ((style & 0x00040000) == 0) {
+                SetWindowLongW(this.hwnd, -16, style | 0x00040000 | 0x00010000 | 0x00020000);
+                SetWindowPos(this.hwnd, 0, 0, 0, 0, 0, 0x0027);
+            }
+        }
+        #endif
+
+        RegisterBuiltinHandlers();
+        InitNativeBridge();
+    }
+
+    void RegisterBuiltinHandlers() {
+        // 内置获取当前窗口状态 RPC
+        Register("__get_window_state", (string payload) => {
+            bool isMax = this.win != null && this.win.IsMaximized();
+            return "{\"isMaximized\":" + (isMax ? "true" : "false") + "}";
+        });
+    }
+
+    void InitNativeBridge() {
+        this.webViewBox.View().AddMessageHandler("zan");
+        this.pollTimer = new Timer(50, PollMessages);
+    }
+
+    public void NotifyWindowState() {
+        if (this.win == null) return;
+        bool isMax = this.win.IsMaximized();
+        this.lastMaximized = isMax;
+        string val = isMax ? "true" : "false";
+        string script = "window.__zan_event_dispatch && window.__zan_event_dispatch('window_state_changed', { isMaximized: " + val + " });";
+        this.webViewBox.View().Eval(script);
+    }
+
+    void PollMessages() {
+        if (this.win != null) {
+            bool currMax = this.win.IsMaximized();
+            if (currMax != this.lastMaximized) {
+                this.lastMaximized = currMax;
+                NotifyWindowState();
+            }
+        }
+
+        WebView view = this.webViewBox.View();
+        while (view.MessagePending() > 0) {
+            string msg = view.TakeMessage();
+            if (msg != null && msg.Length > 0) {
+                HandleIncomingMessage(msg);
+            }
+        }
+    }
+
+    void HandleIncomingMessage(string json) {
+        if (json == null || json.Length == 0) return;
+
+        // 仅处理明确为窗口控制类型的原生指令，避免业务 RPC 误判
+        if (json.Contains("\"type\":\"window\"") || json.Contains("\"type\": \"window\"")) {
+            HandleWindowAction(json);
+            return;
+        }
+
+        // 解析标准 RPC 调用: {"id": 123, "method": "...", "params": {...}}
+        int idIdx = json.IndexOf("\"id\":");
+        int methodIdx = json.IndexOf("\"method\":");
+        if (idIdx >= 0 && methodIdx >= 0) {
+            int idStart = idIdx + 5;
+            while (idStart < json.Length && (json[idStart] == ' ' || json[idStart] == ':')) idStart++;
+            int idEnd = idStart;
+            while (idEnd < json.Length && json[idEnd] >= '0' && json[idEnd] <= '9') idEnd++;
+            string idStr = json.Substring(idStart, idEnd - idStart);
+
+            int mNameStart = json.IndexOf('\"', methodIdx + 9) + 1;
+            int mNameEnd = json.IndexOf('\"', mNameStart);
+            string method = json.Substring(mNameStart, mNameEnd - mNameStart);
+
+            string resultJson = "null";
+            if (handlers.ContainsKey(method)) {
+                try {
+                    resultJson = handlers[method](json);
+                } catch (Exception ex) {
+                    resultJson = "{\"error\":\"" + ex.Message + "\"}";
+                }
+            }
+
+            string responseJs = "window.__zan_rpc_resolve && window.__zan_rpc_resolve(" + idStr + ", " + resultJson + ");";
+            this.webViewBox.View().Eval(responseJs);
+        }
+    }
+
+    void HandleWindowAction(string json) {
+        if (this.win == null) return;
+
+        // 拖拽窗口
+        if (json.Contains("\"drag\"")) {
+            #if WINDOWS
+            if (this.hwnd != 0) {
+                ReleaseCapture();
+                SendMessageW(this.hwnd, 0x0112, 0xF012, 0); // SC_MOVE + HTCAPTION
+                SendMessageW(this.hwnd, 0x00A1, 2, 0);      // WM_NCLBUTTONDOWN
+            }
+            #endif
+            return;
+        }
+
+        // 最小化
+        if (json.Contains("\"minimize\"")) {
+            this.win.Minimize();
+            NotifyWindowState();
+            return;
+        }
+
+        // 显式最大化
+        if (json.Contains("\"maximize\"")) {
+            if (!this.win.IsMaximized()) {
+                this.win.ToggleMaximize();
+            }
+            NotifyWindowState();
+            return;
+        }
+
+        // 显式还原
+        if (json.Contains("\"restore\"")) {
+            if (this.win.IsMaximized()) {
+                this.win.ToggleMaximize();
+            }
+            NotifyWindowState();
+            return;
+        }
+
+        // 最大化/还原切换
+        if (json.Contains("\"toggleMaximize\"")) {
+            this.win.ToggleMaximize();
+            NotifyWindowState();
+            return;
+        }
+
+        // 请求关闭窗口（触发优雅退出生命周期）
+        if (json.Contains("\"close\"")) {
+            if (this.form != null) {
+                this.form.Close();
+            } else {
+                this.win.Close();
+            }
+            return;
+        }
+
+        // 获取窗口状态
+        if (json.Contains("\"isMaximized\"")) {
+            NotifyWindowState();
+            return;
+        }
+    }
+
+    public void Register(string method, BridgeHandler handler) {
+        handlers[method] = handler;
+    }
+}
