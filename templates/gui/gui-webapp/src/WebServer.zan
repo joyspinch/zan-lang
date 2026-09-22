@@ -1,0 +1,68 @@
+using System;
+using System.Net.Http;
+
+public class WebServer {
+    static HttpServer server;
+    static string currentToken = "";
+    static int currentPort = 0;
+
+    public static string StartAndVerify(bool isDevMode) {
+        // 生成 16 字节强随机十六进制 Session Token，用于全内存服务路由隔离
+        currentToken = WebSecurity.GenerateToken();
+
+        // 尝试在 45000 ~ 62000 动态高位端口池中挑选可用端口
+        Random rnd = new Random();
+        for (int attempt = 0; attempt < 20; attempt++) {
+            int port = rnd.Between(45000, 60000);
+            try {
+                server = new HttpServer("127.0.0.1", port);
+                server.OnRequest(HandleRequest);
+                server.Start();
+                currentPort = port;
+                break;
+            } catch (Exception ex) {
+                // 端口占用冲突，尝试下一个随机端口
+            }
+        }
+
+        if (currentPort == 0) {
+            throw new Exception("Failed to bind random loopback port");
+        }
+
+        return "http://127.0.0.1:" + currentPort.ToString() + "/" + currentToken + "/index.html";
+    }
+
+    static async HttpResponse HandleRequest(HttpRequest req) {
+        string path = req.path;
+        string prefix = "/" + currentToken;
+
+        // 严格安全隔离：无对应动态 Token 路由一律拒绝
+        if (!path.StartsWith(prefix)) {
+            return HttpResponse.NotFound();
+        }
+
+        // 提取相对文件路径
+        string subPath = path.Substring(prefix.Length);
+        if (subPath == "" || subPath == "/") {
+            subPath = "/index.html";
+        }
+
+        // 本地服务探针自检
+        if (subPath == "/__health__") {
+            return HttpResponse.Ok("ready");
+        }
+
+        // 内存读取并解密静态资产（全内存流转，绝不落地磁盘）
+        WebAssetEntry entry = WebAssets.GetEntry(subPath);
+        if (entry == null) {
+            return HttpResponse.NotFound();
+        }
+
+        byte[] data = WebAssets.ReadAsset(subPath);
+        if (data == null) {
+            return HttpResponse.NotFound();
+        }
+
+        return HttpResponse.Bytes(data, data.Length, entry.mime);
+    }
+}

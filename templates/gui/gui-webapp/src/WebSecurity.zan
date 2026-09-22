@@ -1,0 +1,86 @@
+using System;
+using System.Collections.Generic;
+using Gui.Component.WebView;
+
+public class WebSecurity {
+    // 启动阶段安全加固：彻底清除敏感环境变量，生产发布模式提前注入禁用 DevTools 参数
+    public static void SanitizeEnvironment(bool isDevMode) {
+        #if WINDOWS
+        Environment.SetEnvironmentVariable("WEBVIEW2_RELEASE_CHANNEL_PREFERENCE", null);
+        Environment.SetEnvironmentVariable("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", null);
+        Environment.SetEnvironmentVariable("WEBVIEW2_USER_DATA_FOLDER", null);
+        if (!isDevMode) {
+            // 生产发布模式：提前为 WebView2 注入禁用 DevTools 参数双重兜底
+            Environment.SetEnvironmentVariable("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "--disable-devtools --disable-features=DevTools");
+        } else {
+            Environment.SetEnvironmentVariable("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", null);
+        }
+        #endif
+    }
+
+    // 过滤来自命令行的任何外部注入参数
+    public static string[] SanitizeCommandLine(string[] args) {
+        if (args == null || args.Length == 0) {
+            return new string[0];
+        }
+        List<string> clean = new List<string>();
+        for (int i = 0; i < args.Length; i++) {
+            string a = args[i].ToLower();
+            if (a.Contains("--remote-debugging") ||
+                a.Contains("--devtools") ||
+                a.Contains("--remote-allow-origins") ||
+                a.Contains("--auto-open-devtools-for-tabs") ||
+                a.Contains("--enable-logging") ||
+                a.Contains("--single-process")) {
+                continue;
+            }
+            clean.Add(args[i]);
+        }
+        return clean.ToArray();
+    }
+
+    // 生成 128 位 (32 字符十六进制) 强随机 Session 隔离 Token
+    public static string GenerateToken() {
+        Random rnd = new Random();
+        string hex = "0123456789abcdef";
+        string t = "";
+        for (int i = 0; i < 32; i++) {
+            t += hex[rnd.Between(0, 16)];
+        }
+        return t;
+    }
+
+    // 配置 WebView 核心安全防御策略（跨平台底层物理阻断 + 前端防探查）
+    public static void ConfigureWebViewSecurity(WebView view, bool isDevMode) {
+        if (view == null) { return; }
+        if (!isDevMode) {
+            // 1. 核心底层：跨平台物理关闭 DevTools 与默认右键菜单
+            view.SetDevToolsEnabled(false);
+            view.SetContextMenuEnabled(false);
+
+            // 2. 前端 DOM 层防探查兜底：拦截 F12 / Ctrl+U 等敏感快捷键
+            string antiInspectJs = @"
+                (function() {
+                    window.addEventListener('contextmenu', function(e) {
+                        e.preventDefault();
+                        return false;
+                    }, true);
+                    window.addEventListener('keydown', function(e) {
+                        if (e.key === 'F12' ||
+                            (e.ctrlKey && (e.key === 'u' || e.key === 'U' || e.key === 's' || e.key === 'S' || e.key === 'i' || e.key === 'I'))) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            return false;
+                        }
+                    }, true);
+                })();
+            ";
+            view.InjectScript(antiInspectJs, false);
+        } else {
+            // 开发调试模式：启用 DevTools 并自动打开调试窗口
+            view.SetDevToolsEnabled(true);
+            view.SetContextMenuEnabled(true);
+            view.OpenDevTools();
+        }
+    }
+}

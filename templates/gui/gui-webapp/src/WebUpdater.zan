@@ -1,0 +1,115 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+
+/// <summary>
+/// 跨平台应用更新核心 (WebUpdater)
+/// 支持：
+/// 1. 原生二进制整包自更新 (Windows 重命名接力 / macOS & Linux 原子替换)
+/// 2. 静态资源热更新 (webpatch.bin 增量补丁)
+/// 3. 启动期自动清理上一版本的 .old 残留文件
+/// </summary>
+class WebUpdater {
+    public const string CURRENT_VERSION = "1.0.0";
+
+    /// <summary>
+    /// 启动时自检：清理上次更新遗留的 .old 临时备份文件
+    /// </summary>
+    public static void CleanupOldFiles() {
+        try {
+            string currentExe = Environment.ProcessPath;
+            if (currentExe == null || currentExe.Length == 0) {
+                return;
+            }
+            string oldFile = currentExe + ".old";
+            if (File.Exists(oldFile)) {
+                File.Delete(oldFile);
+            }
+        } catch (Exception ex) {
+            // 忽略未完全释放时的锁异常，下次启动再清理
+        }
+    }
+
+    /// <summary>
+    /// 获取当前应用版本与平台信息
+    /// </summary>
+    public static string GetVersionInfo() {
+        return "{\"version\":\"" + CURRENT_VERSION + "\",\"platform\":\"" + GetPlatformName() + "\"}";
+    }
+
+    /// <summary>
+    /// 获取标准化平台标识 (windows-x64, linux-x64, darwin-arm64 等)
+    /// </summary>
+    public static string GetPlatformName() {
+        #if WINDOWS
+        return "windows-x64";
+        #elif MACOS
+        return "darwin-x64";
+        #else
+        return "linux-x64";
+        #endif
+    }
+
+    /// <summary>
+    /// 跨平台执行二进制替换并重启应用
+    /// 核心原理：
+    /// - Windows：独占锁禁止删除/写入，但支持对运行中文件进行 Move(重命名)。
+    ///   将 current.exe 重命名为 current.exe.old，再将 new.exe 移至 current.exe，最后拉起新进程并退出。
+    /// - macOS/Linux：依靠 POSIX inode 特性与原子覆盖，重命名后调用 SetExecutable(true)，拉起新进程并退出。
+    /// </summary>
+    public static bool ApplyBinaryUpdate(string newBinaryPath) {
+        if (!File.Exists(newBinaryPath)) {
+            return false;
+        }
+
+        try {
+            string currentExe = Environment.ProcessPath;
+            if (currentExe == null || currentExe.Length == 0) {
+                return false;
+            }
+
+            string oldExe = currentExe + ".old";
+            if (File.Exists(oldExe)) {
+                File.Delete(oldExe);
+            }
+
+            // 1. 将当前正在运行的文件重命名为 .old
+            File.Move(currentExe, oldExe);
+
+            // 2. 将新文件移动到正式执行路径
+            File.Move(newBinaryPath, currentExe);
+
+            // 3. POSIX 系统赋予可执行权限 (755)
+            File.SetExecutable(currentExe, true);
+
+            // 4. 启动新版本程序
+            Process.StartProgram(currentExe, "");
+
+            // 5. 优雅退出当前旧版本进程
+            Environment.Exit(0);
+            return true;
+        } catch (Exception ex) {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 应用前端资源增量热更新补丁 (webpatch.bin)
+    /// </summary>
+    public static bool ApplyResourcePatch(string patchFilePath) {
+        if (!File.Exists(patchFilePath)) {
+            return false;
+        }
+
+        try {
+            string targetPath = "webpatch.bin";
+            if (File.Exists(targetPath)) {
+                File.Delete(targetPath);
+            }
+            File.Move(patchFilePath, targetPath);
+            return true;
+        } catch (Exception ex) {
+            return false;
+        }
+    }
+}
