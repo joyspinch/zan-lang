@@ -4890,10 +4890,16 @@ void zan_co_sched_run(void) {
     if (g_co_pool_live) {
         /* A background pool owns execution (a foreign thread spawned work
          * before the host ever called this). Do not start a second pool --
-         * wait for the outstanding work, then hand back. */
+         * wait for the outstanding work, then hand back. Every schedulable
+         * state is covered by the four counters: queued (pending), parked on
+         * IO, parked on a timer, or running. A live-but-done frame is NOT
+         * work and must not block the pump: a Task<T> spawn deliberately
+         * leaves its frame unreaped so Task.Result can read it, so
+         * live_count never reaches 0 while a result is pending -- waiting on
+         * it here deadlocked the very Wait/Result pump that should reap it
+         * (cs_b15_task, 2026-09-23). */
         while (zan_co_pending() > 0 || zan_io_has_pending() ||
-               zan_timer_pending() > 0 || zan_co_live_count() > 0 ||
-               g_co_running > 0) {
+               zan_timer_pending() > 0 || g_co_running > 0) {
             Sleep(1);
             static DWORD stuck_since = 0;
             DWORD nowk = GetTickCount();

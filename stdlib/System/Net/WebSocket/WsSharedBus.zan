@@ -27,6 +27,8 @@ class WsSharedBus {
     long lastReadSeq;
     bool running;
     int pid;
+    long busNonce;
+    static long nonceCounter = 0;
 
     public WsSharedBus(string name, int ringCapacity) {
         this.name = name;
@@ -34,6 +36,8 @@ class WsSharedBus {
         this.lastReadSeq = 0;
         this.running = false;
         this.pid = ProcessHost.Pid();
+        nonceCounter = nonceCounter + 1;
+        this.busNonce = nonceCounter;
         this.InitTable();
     }
 
@@ -51,6 +55,10 @@ class WsSharedBus {
             table.ColumnInt("payloadLen");
             table.ColumnInt("seq");
             table.ColumnInt("srcPid");
+            table.ColumnInt("srcBus");
+            // OnConnChange/GetTotalConnCount 走自增列：列必须在建表时声明，
+            // 否则 zan_find_column 落空、Increment/GetInt 双双静默得 0。
+            table.ColumnInt("totalConns");
             if (table.Create()) {
                 this.busTable = table;
             } else {
@@ -89,6 +97,7 @@ class WsSharedBus {
         this.busTable.SetString(key, "payload", payload);
         this.busTable.SetInt(key, "payloadLen", (long)payloadLen);
         this.busTable.SetInt(key, "srcPid", (long)this.pid);
+        this.busTable.SetInt(key, "srcBus", this.busNonce);
         this.busTable.SetInt(key, "seq", seq);
     }
 
@@ -107,10 +116,17 @@ class WsSharedBus {
     }
 
     /// <summary>启动后台轮询协程，监听其他 Worker 发来的跨进程消息。</summary>
-    public async void StartPolling(IWsSharedBusConsumer consumer) {
+    /// <remarks>必须是同步方法：Zan 的 async 方法体在首次调度泵时才启动，
+    /// 若把快照写进 async 体，调用点与首次泵之间发布的消息会被当旧序号跳过。
+    /// 快照必须在调用点急切完成，循环体晚一点启动无所谓。</remarks>
+    public void StartPolling(IWsSharedBusConsumer consumer) {
         if (this.running || !this.IsAvailable() || consumer == null) { return; }
         this.running = true;
         this.lastReadSeq = this.busTable.GetInt("bus_meta", "seq");
+        this.PollLoop(consumer);
+    }
+
+    private async void PollLoop(IWsSharedBusConsumer consumer) {
         while (this.running) {
             long head = this.busTable.GetInt("bus_meta", "seq");
             if (head > this.lastReadSeq) {
@@ -124,7 +140,10 @@ class WsSharedBus {
                     long slotSeq = this.busTable.GetInt(key, "seq");
                     if (slotSeq == start) {
                         int srcPid = (int)this.busTable.GetInt(key, "srcPid");
-                        if (srcPid != this.pid) {
+                        long srcBus = this.busTable.GetInt(key, "srcBus");
+                        // 自过滤按 (pid, 实例 nonce) 判定：同进程多 worker 各持
+                        // 独立实例必须互相收到消息，只按 pid 会把同进程节点全滤掉。
+                        if (srcPid != this.pid || srcBus != this.busNonce) {
                             int targetType = (int)this.busTable.GetInt(key, "targetType");
                             string channel = this.busTable.GetString(key, "channel");
                             int targetId = (int)this.busTable.GetInt(key, "targetId");

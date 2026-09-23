@@ -1696,6 +1696,28 @@ rt_timer.c 一处全部借它藏身；另有三处历史 abort 已改优雅路�
 **顺手坑**：CMakeLists 的参数列表里 `/* ... */` 不是注释，会被拆成参数
 传给命令——CMake 注释只有 `#` 行注释。
 
+## async 启动语义与 sched_run 泵等待：三类静默挂死/丢消息（2026-09-23）
+
+- **丢弃 async 调用（`Foo();` 裸语句、async void）的体在首次调度泵时才运行**，
+  不是 C# 的急切执行：emit_expr 只发射 ramp（分配堆帧、返回句柄），
+  AST_EXPR_STMT 对该句柄调 emit_detach_async_call 排队——首拍前什么都不跑。
+  依赖"调用点立刻执行前导"的逻辑必错：WsSharedBus.StartPolling 把
+  `lastReadSeq = 当前 head` 写在 async 体首行，调用点与首拍之间发布的消息
+  全被当旧序号跳过（ws_cluster_bus 红）。修法=快照放同步方法（StartPolling
+  同步快照 + 内部派生 PollLoop），不要指望改编译器语义。
+- **`zan_co_sched_run` 后台分支的等待条件绝不能含 `zan_co_live_count`**：
+  Task<T> 的 spawn 刻意留帧不收割（Result 读完才 reap），存活≠有工作。
+  条件里有 live_count 后，任何 Wait/Result 泵都死等一个永不归零的计数
+  （cs_b15_task 120s 超时，831577d60 引入）。可调度状态已被四个计数覆盖：
+  queued(pending)/io/timer/running。
+- **SharedTable 的列必须建表时声明**：`zan_find_column` 对未声明列名返回
+  NULL，Increment/GetInt/GetInt 全链路静默得 0——无诊断、无崩溃，
+  只有业务断言失败。WsSharedBus 用 "totalConns" 列却从未 ColumnInt 声明，
+  连接计数恒 0。
+- 排查手法：这三类都"测试红但单点看不出"——先写最小 Zan 探针分离
+  原语与组合层（SharedTable 直连两实例→原语 OK；复刻 WsSharedBus 建表→
+  列声明即现形），再用逐拍打印暴露调度时序（轮询体的真实启动时刻）。
+
 ## android 静态驱动档案 libzan_gui.a 过期 = 实机 dlopen "cannot locate symbol" 崩溃（2026-09-16 实录）
 
 **坑**：`--emit-apk` 的 libmain.so 链接是 `-shared`，lld 默认允许未解析符号
