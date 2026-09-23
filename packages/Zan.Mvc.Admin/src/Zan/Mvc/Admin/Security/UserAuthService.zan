@@ -1,0 +1,92 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Collections.Generic;
+using Zan.Mvc.Admin.Model;
+
+namespace Zan.Mvc.Admin.Security;
+
+/// <summary>
+/// 统一用户授权与菜单生成服务。
+/// 全链路纯 ORM 强类型实体驱动：
+/// 1. 只有一张统一用户表 sys_users，没有任何管理员 vs 普通用户特权列标记；
+/// 2. 用户的权限与可见菜单，完全由其所绑定的角色（Role）和规则（Rule）通过 ORM 动态解析；
+/// 3. 前端侧边栏菜单通过 GetUserMenuTree 实时由角色权限动态计算生成；
+/// 4. 彻底消除底层 DbResult 游标列索引（res.GetInt(0, 0)）的脆弱耦合。
+/// </summary>
+public class UserAuthService {
+    /// <summary>
+    /// 获取用户分配的角色 ID 列表（ORM 实体查询）
+    /// </summary>
+    public static List<int> GetUserRoleIds(IDbConnection conn, int userId) {
+        List<int> roleIds = new List<int>();
+        List<SysUserRole> list = conn.Select<SysUserRole>()
+            .Where(ur => ur.user_id == userId)
+            .ToList();
+
+        for (int i = 0; i < list.Count; i = i + 1) {
+            roleIds.Add(list[i].role_id);
+        }
+        return roleIds;
+    }
+
+    /// <summary>
+    /// 获取用户所有角色的规则 ID 集合（去重哈希索引，O(1) 判定）
+    /// </summary>
+    public static Dictionary<int, bool> GetUserRuleIdMap(IDbConnection conn, int userId) {
+        Dictionary<int, bool> ruleMap = new Dictionary<int, bool>();
+        List<int> roleIds = GetUserRoleIds(conn, userId);
+
+        for (int i = 0; i < roleIds.Count; i = i + 1) {
+            int rid = roleIds[i];
+            List<SysRoleRule> bindings = conn.Select<SysRoleRule>()
+                .Where(rr => rr.role_id == rid)
+                .ToList();
+
+            for (int j = 0; j < bindings.Count; j = j + 1) {
+                ruleMap[bindings[j].rule_id] = true;
+            }
+        }
+        return ruleMap;
+    }
+
+    /// <summary>
+    /// 核心算法：按用户角色权限动态构建可见菜单树。
+    /// 无论何种身份，能看到的菜单完全由此处授权规则过滤出的树形结构决定。
+    /// </summary>
+    public static List<SysRule> GetUserMenuTree(IDbConnection conn, int userId) {
+        Dictionary<int, bool> allowedRuleIds = GetUserRuleIdMap(conn, userId);
+        if (allowedRuleIds.Count == 0) {
+            return new List<SysRule>();
+        }
+
+        // 1. 查询全部菜单类型规则（通过 ORM 实体查询，强类型属性绑定）
+        List<SysRule> allMenus = new List<SysRule>();
+        Dictionary<int, SysRule> menuMap = new Dictionary<int, SysRule>();
+
+        List<SysRule> rawMenus = conn.Select<SysRule>()
+            .Where(r => r.is_menu)
+            .OrderBy(r => r.order_num)
+            .ToList();
+
+        for (int i = 0; i < rawMenus.Count; i = i + 1) {
+            SysRule r = rawMenus[i];
+            if (allowedRuleIds.ContainsKey(r.id)) {
+                allMenus.Add(r);
+                menuMap[r.id] = r;
+            }
+        }
+
+        // 2. 组装为多级树形结构
+        List<SysRule> rootMenus = new List<SysRule>();
+        for (int i = 0; i < allMenus.Count; i = i + 1) {
+            SysRule node = allMenus[i];
+            if (node.parent_id == 0) {
+                rootMenus.Add(node);
+            } else if (menuMap.ContainsKey(node.parent_id)) {
+                menuMap[node.parent_id].children.Add(node);
+            }
+        }
+        return rootMenus;
+    }
+}

@@ -2,15 +2,43 @@ using System;
 using System.IO;
 using System.Web;
 using System.Data;
-using System.Data.SQLite;
-using System.Json;
+using System.Data.Sqlite;
+using Zan.Mvc.Admin.Model;
 using Zan.Mvc.Admin.Web;
 
 namespace Zan.Mvc.Admin.Installer;
 
+public class DbConfig {
+    public string type;
+    public string path;
+    public DbConfig() {
+        this.type = "sqlite";
+        this.path = "data/app.db";
+    }
+}
+
+public class AppSectionConfig {
+    public string name;
+    public bool installed;
+    public AppSectionConfig() {
+        this.name = "Zan Admin Platform";
+        this.installed = true;
+    }
+}
+
+public class AppConfigFile {
+    public DbConfig db;
+    public AppSectionConfig app;
+    public AppConfigFile() {
+        this.db = new DbConfig();
+        this.app = new AppSectionConfig();
+    }
+}
+
 /// <summary>
 /// 安装向导 Web 控制器。
 /// 首次启动提供多步骤配置与检测，执行完毕后写入 install.lock 触发全系统永久熔断。
+/// 彻底废弃手写 JSON 拼装，全部由编译器强类型序列化驱动。
 /// </summary>
 public class InstallController : Controller {
     [HttpGet]
@@ -21,7 +49,6 @@ public class InstallController : Controller {
             return;
         }
 
-        // 读取或渲染安装界面 HTML
         string html = GetInstallerHtml();
         this.Html(html);
     }
@@ -35,25 +62,7 @@ public class InstallController : Controller {
         }
 
         SystemProbeResult probe = SystemProbe.Check();
-        JsonValue root = JsonValue.NewObject();
-        root.PutStr("code", "0000");
-
-        JsonValue dataObj = JsonValue.NewObject();
-        dataObj.PutBool("passed", probe.AllPassed);
-
-        JsonValue itemsArr = JsonValue.NewArray();
-        for (int i = 0; i < probe.Items.Count; i = i + 1) {
-            ProbeItem item = probe.Items[i];
-            JsonValue jItem = JsonValue.NewObject();
-            jItem.PutStr("name", item.Name);
-            jItem.PutStr("status", item.Current);
-            jItem.PutBool("passed", item.Passed);
-            itemsArr.Append(jItem);
-        }
-        dataObj.Put("items", itemsArr);
-        root.Put("data", dataObj);
-
-        this.Json(root.ToJson());
+        this.Json(Json.Serialize<SystemProbeResult>(probe));
     }
 
     [HttpPost]
@@ -84,34 +93,29 @@ public class InstallController : Controller {
             Directory.CreateDirectory(dir);
         }
 
-        string connStr = "Data Source=" + dbPath;
         try {
-            using (var conn = new SQLiteConnection(connStr)) {
-                conn.Open();
-                string err;
-                bool ok = SchemaMigrator.ExecuteInstall(conn, adminUser, adminPass, out err);
-                if (!ok) {
-                    this.SendJson("9999", "DDL 执行失败: " + err);
-                    return;
-                }
+            SqliteConnection conn = SqliteConnection.Open(dbPath);
+            if (!conn.IsConnected()) {
+                this.SendJson("9999", "打开数据库失败: " + dbPath);
+                return;
+            }
+            string err;
+            bool ok = SchemaMigrator.ExecuteInstall(conn, adminUser, adminPass, out err);
+            conn.Close();
+            if (!ok) {
+                this.SendJson("9999", "DDL 执行失败: " + err);
+                return;
             }
 
-            // 写入配置文件（通过 System.Json 安全生成）
+            // 写入配置文件（强类型 DTO 编译器自动序列化）
             if (!Directory.Exists("config")) {
                 Directory.CreateDirectory("config");
             }
-            JsonValue cfgRoot = JsonValue.NewObject();
-            JsonValue dbObj = JsonValue.NewObject();
-            dbObj.PutStr("type", "sqlite");
-            dbObj.PutStr("path", dbPath.Replace("\\", "/"));
-            cfgRoot.Put("db", dbObj);
+            AppConfigFile cfg = new AppConfigFile();
+            cfg.db.path = dbPath.Replace("\\", "/");
+            cfg.app.installed = true;
 
-            JsonValue appObj = JsonValue.NewObject();
-            appObj.PutStr("name", "Zan Admin Platform");
-            appObj.PutBool("installed", true);
-            cfgRoot.Put("app", appObj);
-
-            File.WriteAllText("config/app.json", cfgRoot.ToJson());
+            File.WriteAllText("config/app.json", Json.Serialize<AppConfigFile>(cfg));
 
             // 写入 install.lock 物理安全锁
             string lockContent = "Installed at " + DateTime.UtcNow().ToString() + " by " + adminUser + "\n";
@@ -124,10 +128,10 @@ public class InstallController : Controller {
     }
 
     private void SendJson(string code, string msg) {
-        JsonValue root = JsonValue.NewObject();
-        root.PutStr("code", code);
-        root.PutStr("msg", msg);
-        this.Json(root.ToJson());
+        ApiResponse resp = new ApiResponse();
+        resp.code = code;
+        resp.msg = msg;
+        this.Json(Json.Serialize<ApiResponse>(resp));
     }
 
     private string GetInstallerHtml() {
@@ -148,25 +152,37 @@ public class InstallController : Controller {
             + "<div class=\"box\">"
             + "<h1>🚀 系统初始安装向导</h1>"
             + "<p>检测到系统未完成初始配置。完成以下向导即可自动初始化系统 Schema、管理员凭据与安全熔断锁。</p>"
-            + "<div style=\"margin:20px 0;\">"
-            + "<div class=\"item\"><span>Zan 运行时环境</span><span class=\"tag-ok\">通过</span></div>"
-            + "<div class=\"item\"><span>配置目录读写权限</span><span class=\"tag-ok\">通过</span></div>"
-            + "<div class=\"item\"><span>安全哈希引擎</span><span class=\"tag-ok\">就绪</span></div>"
+            + "<div id=\"step1\">"
+            + "<h3>第一步：基础设施探针</h3>"
+            + "<div id=\"probeList\">正在检测环境...</div>"
+            + "<button id=\"btnNext\" style=\"display:none\" onclick=\"goStep2()\">下一步：配置参数</button>"
             + "</div>"
-            + "<form onsubmit=\"doInstall(event)\">"
-            + "<div class=\"input-group\"><label>数据库文件路径 (SQLite)</label><input id=\"dbPath\" value=\"data/app.db\" required></div>"
-            + "<div class=\"input-group\"><label>超级管理员账号</label><input id=\"adminUser\" value=\"admin\" required></div>"
-            + "<div class=\"input-group\"><label>初始登录密码 (至少6位)</label><input id=\"adminPass\" type=\"password\" value=\"admin1234\" required></div>"
-            + "<button type=\"submit\" id=\"btn\">立即完成初始化安装</button>"
-            + "</form>"
+            + "<div id=\"step2\" style=\"display:none;\">"
+            + "<h3>第二步：初始化管理员与数据库</h3>"
+            + "<div class=\"input-group\"><label>数据库存储路径 (SQLite)</label><input id=\"dbPath\" value=\"data/app.db\" /></div>"
+            + "<div class=\"input-group\"><label>初始管理员账号</label><input id=\"adminUser\" value=\"admin\" /></div>"
+            + "<div class=\"input-group\"><label>初始管理员密码 (>= 6位)</label><input id=\"adminPass\" type=\"password\" value=\"admin123\" /></div>"
+            + "<button onclick=\"submitInstall()\">确认安装并锁定</button>"
+            + "</div>"
             + "</div>"
             + "<script>"
-            + "function doInstall(e){e.preventDefault();"
-            + "var btn=document.getElementById('btn');btn.disabled=true;btn.textContent='正在执行迁移...';"
-            + "var fd=new URLSearchParams();fd.append('dbPath',document.getElementById('dbPath').value);"
-            + "fd.append('adminUser',document.getElementById('adminUser').value);fd.append('adminPass',document.getElementById('adminPass').value);"
-            + "fetch('/install/api/submit',{method:'POST',body:fd}).then(function(r){return r.json();}).then(function(j){"
-            + "if(j.code==='0000'){alert('安装成功！点击确定跳转至登录页');location.href='/admin/login';}else{alert(j.msg||'安装失败');btn.disabled=false;btn.textContent='立即完成初始化安装';}});"
+            + "fetch('/install/api/probe', {method:'POST'}).then(r=>r.json()).then(res=>{"
+            + "  let el = document.getElementById('probeList'); el.innerHTML='';"
+            + "  (res.items || []).forEach(it=>{"
+            + "    el.innerHTML += '<div class=\"item\"><span>'+it.name+'</span><span class=\"tag-ok\">'+it.current+'</span></div>';"
+            + "  });"
+            + "  if(res.allPassed) document.getElementById('btnNext').style.display='block';"
+            + "});"
+            + "function goStep2(){ document.getElementById('step1').style.display='none'; document.getElementById('step2').style.display='block'; }"
+            + "function submitInstall(){"
+            + "  let p = new URLSearchParams();"
+            + "  p.append('dbPath', document.getElementById('dbPath').value);"
+            + "  p.append('adminUser', document.getElementById('adminUser').value);"
+            + "  p.append('adminPass', document.getElementById('adminPass').value);"
+            + "  fetch('/install/api/submit', {method:'POST', body:p}).then(r=>r.json()).then(res=>{"
+            + "    if(res.code==='0000'){ alert('初始化安装成功！正在重定向到后台登录页...'); window.location.href='/admin/login'; }"
+            + "    else { alert('安装失败: '+res.msg); }"
+            + "  });"
             + "}"
             + "</script></body></html>";
     }
