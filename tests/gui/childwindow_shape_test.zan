@@ -14,19 +14,25 @@ using Gui.Widget;
 /// 的排版原点恰好等于 ShapeOffX（>= ShapeOffY）；一个普通宿主，
 /// 断言偏移为 0 时行为不变（原点仍在画布 0）。像素判定只读画布，
 /// 跨栅格化后端成立。
+/// 按相位分槽记录：两个子窗口宿主在同一进程并发存活，共享静态量会被
+/// 另一宿主的重绘回写（父泵会顺带泵到已显示的子宿主），必须分槽。
 class MarkerBox : Control {
-    static int paints;
-    static int lastBx;
-    static int lastBy;
-    MarkerBox() { this.InitControl("marker", 0); }
+    static int[] paints = new int[2];
+    static int[] lastBx = new int[2];
+    static int[] lastBy = new int[2];
+    int tag;
+    MarkerBox(int t) {
+        tag = t;
+        this.InitControl("marker", 0);
+    }
     override void OnMeasure(App app) {
         prefW = app.Scale(60);
         prefH = app.Scale(40);
     }
     override void OnPaint(App app) {
-        paints = paints + 1;
-        lastBx = bx;
-        lastBy = by;
+        paints[tag] = paints[tag] + 1;
+        lastBx[tag] = bx;
+        lastBy[tag] = by;
         app.canvas.FillRect(bx, by, bw, bh, 0xFF00FF00);
     }
 }
@@ -37,7 +43,7 @@ class ShapeChild : ChildWindow {
     override int Height() { return 200; }
     void OpenShaped(App parent) {
         this.OpenHost(parent);
-        MarkerBox marker = new MarkerBox();
+        MarkerBox marker = new MarkerBox(0);
         Panel root = Panel.Column() { Children = { marker } };
         root.Pad(0);
         this.SetRoot(root, null);
@@ -54,7 +60,7 @@ class PlainChild : ChildWindow {
     override int Height() { return 200; }
     void OpenPlain(App parent) {
         this.OpenHost(parent);
-        MarkerBox marker = new MarkerBox();
+        MarkerBox marker = new MarkerBox(1);
         Panel root = Panel.Column() { Children = { marker } };
         root.Pad(0);
         this.SetRoot(root, null);
@@ -103,13 +109,17 @@ class ChildWindowShapeTest {
         True("shadow band applied", offX > 0 && offY > 0);
         True("host resized to band bbox",
             h1.canvas.Width() > 300 * h1.dpiScale / 100);
-        True("marker painted", MarkerBox.paints > 0);
-        True("tree lands on content origin x", MarkerBox.lastBx == offX);
-        True("tree lands below content top", MarkerBox.lastBy >= offY);
+        // Render 在内容原点外再留一圈随 DPI 缩放的 5 逻辑像素呼吸边距
+        // （ChildWindow.Render 的统一弹窗外边距），排版点 = 原点 + 边距。
+        True("marker painted", MarkerBox.paints[0] > 0);
+        True("tree lands on content origin x",
+            MarkerBox.lastBx[0] == offX + h1.Scale(5));
+        True("tree lands below content top",
+            MarkerBox.lastBy[0] >= offY + h1.ContentTop());
         True("content painted", Greens(h1) > 100);
 
         // ---- 普通宿主：off=0，行为不变 ----
-        int paintsBefore = MarkerBox.paints;
+        int paintsBefore = MarkerBox.paints[1];
         PlainChild pl = new PlainChild();
         pl.OpenPlain(parent);
         App h2 = pl.Host();
@@ -120,8 +130,9 @@ class ChildWindowShapeTest {
         }
         True("plain host has no offset",
             h2.ShapeOffX() == 0 && h2.ShapeOffY() == 0);
-        True("plain marker painted", MarkerBox.paints > paintsBefore);
-        True("plain tree at canvas origin", MarkerBox.lastBx == 0);
+        True("plain marker painted", MarkerBox.paints[1] > paintsBefore);
+        True("plain tree at canvas origin",
+            MarkerBox.lastBx[1] == h2.Scale(5));
         True("plain content painted", Greens(h2) > 100);
 
         sh.Close();
