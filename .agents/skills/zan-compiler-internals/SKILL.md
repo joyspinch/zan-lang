@@ -452,16 +452,6 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   AST 里不存在"类型位置的标识符"节点；这一点 checker/irgen 里所有
   对类型实参做结构匹配的代码都适用。
 
-## `is T ?` 三元歧义：类型语法吃掉 `?`（2026-09-13，挂账未修）
-
-`x is T ? a : b` 解析失败：parse_binary 对 `is` 的类型操作数走
-`parse_type_ref`（parser.c:1933），而类型语法把 `?` 无条件当可空类型
-标记（parser.c:412），`Element ? "a"` 被读成可空类型 `Element?` 接
-字符串，报 `expected ';' got STRING_LIT`。**现状合法写法**：括号
-`(x is T) ? a : b`（括号内不进 parse_type_ref，`?` 留给三元）或
-if/else。修法是 C# 式歧义消解（`?` 后跟表达式起点则归三元），要动
-parser 回溯，专项做。
-
 ## 字符串位的可空值类型
 
 - C# 语义：`"a=" + int?` 合法，null 拼空串。checker
@@ -469,9 +459,11 @@ parser 回溯，专项做。
   irgen emit_to_cstr_of 对 `zan.nullable.<payload>` 命名结构解包——
   has ? cstr(payload) : NULL（branch+phi，见上）。无符号元素
   （uint?/ulong?）要传 emit_to_cstr_u 的 unsigned 旗标。
-- `Convert.ToString(int?)` 与 `.ToString()` 直接调至今会炸 verifier
-  （nullable 结构按值进了 itoa64 形参）——拼接路径能走是因为有解包；
-  直接调用是另一个待修缺口。
+- `Convert.ToString(T?)` 与插值 `"{x}"` 同样走 emit_to_cstr_u 的
+  nullable 分支（2026-09-23 修复：此前这两条自建分支链把 nullable
+  结构按值递进 itoa64 炸 verifier）。`.ToString()` 直调被 checker 以
+  "cannot access member on nullable type" 拦下——要文本就走
+  `Convert.ToString(x)`。
 
 ## 交叉运行时对象（toolchain/*/*.o）重出配方
 

@@ -4401,6 +4401,21 @@ static LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr
                     strs[i] = buf;
                     lens[i] = zan_call2(g->builder, strlen_type, g->fn_strlen, &buf, 1, "clen");
                     owns[i] = 1;
+                } else if (llvm_is_nullable(vt)) {
+                    /* T? interpolates through the same coercion as `+` concat
+                     * (the checker documents that contract): the payload's
+                     * text for a some, "" for a none (C#). emit_to_cstr_u
+                     * allocates both arms, so the owned release below is
+                     * exact. Passing the struct to the integer branch's itoa
+                     * made the LLVM verifier reject the call. */
+                    zan_type_t *st = infer_expr_type(g, part, locals);
+                    bool uns = st && st->element_type &&
+                               (st->element_type->kind == TYPE_UINT ||
+                                st->element_type->kind == TYPE_ULONG);
+                    strs[i] = emit_to_cstr_u(g, val, uns ? 1 : 0);
+                    lens[i] = zan_call2(g->builder, strlen_type, g->fn_strlen,
+                                        &strs[i], 1, "nvlen");
+                    owns[i] = 1;
                 } else {
                     /* integer types — format with %lld (%llu for ulong), or a
                      * {v:D4}/{v:X2} spec lowered by interp_format_to_printf.

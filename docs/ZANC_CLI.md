@@ -122,7 +122,7 @@ build/zanc probe.zan --auto-stdlib --time              # 各阶段耗时
 | `--target <name>` | 交叉编译（§3 全表） |
 | `--list-targets` | 列出全部目标 |
 | `--subsystem <console\|windows>` | PE 子系统；GUI 程序用 windows（仅 Windows） |
-| `--async-workers, --mt` | 链入多 worker 协程调度器（worker 数运行期从 ZAN_CO_WORKERS 读，默认=逻辑核数） |
+| （无旗标，按目标自动） | Windows/Linux/macOS 的 x64/arm64 目标自动链入多 worker 协程调度器（`zanrt_io_mt`）；worker 数解析顺序：`System.Threading.AsyncRuntime.SetWorkers`（Main 内设置）→ `ZAN_CO_WORKERS` 环境变量 → 逻辑核数。IO 分片与同步完成快路径同理由 `AsyncRuntime` 优先于 `ZAN_IO_SHARDS`/`ZAN_IO_SYNCFAST` |
 | `--fast-alloc` | 前端 malloc 换每线程小对象分配器（服务端负载，native） |
 | `--no-runtime-checks` | 关运行时守卫（如除零） |
 | `--strict-runtime` | 守卫失败直接 exit(70)（否则受 ZAN_RT_HARD 控制） |

@@ -1821,8 +1821,15 @@ static volatile LONG g_sync_inline;     /* completions delivered without a packe
 static int syncfast_on(void) {
     LONG v = g_syncfast;
     if (v < 0) {
-        const char *e = getenv("ZAN_IO_SYNCFAST");
-        v = (e && *e && e[0] != '0') ? 1 : 0;
+        /* System.Threading.AsyncRuntime.SyncFast set from Main wins; unset
+         * (-1) falls back to the ZAN_IO_SYNCFAST env var (see rt_co.h). */
+        int cfg = zan_async_cfg_sync_fast();
+        if (cfg >= 0) {
+            v = cfg;
+        } else {
+            const char *e = getenv("ZAN_IO_SYNCFAST");
+            v = (e && *e && e[0] != '0') ? 1 : 0;
+        }
         InterlockedExchange(&g_syncfast, v);
     }
     return (int)v;
@@ -1865,6 +1872,11 @@ static HANDLE io_shard_of(SOCKET s) {
  * on. ZAN_IO_SHARDS overrides the count: 1 restores the single shared port,
  * which is the escape hatch for comparing the two reactors. */
 static void io_shards_start(int n) {
+    /* AsyncRuntime.IoShards set from Main wins; unset (0) falls back to the
+     * ZAN_IO_SHARDS env var (see rt_co.h). Both only lower the default,
+     * which keeps "1 restores the single shared port" as the escape hatch. */
+    int cfg = zan_async_cfg_io_shards();
+    if (cfg > 0 && cfg < n) n = cfg;
     const char *e = getenv("ZAN_IO_SHARDS");
     if (e && *e) {
         int v = atoi(e);
@@ -4324,8 +4336,14 @@ void zan_co_delay(long long ms, void *frame, zan_co_step_t step) {
 
 static int co_worker_count(void) {
     int w = 0;
-    const char *e = getenv("ZAN_CO_WORKERS");
-    if (e && *e) w = atoi(e);
+    /* System.Threading.AsyncRuntime.Workers set from Main wins; unset (0)
+     * falls back to the ZAN_CO_WORKERS env var, then the CPU count
+     * (see rt_co.h). */
+    w = zan_async_cfg_workers();
+    if (w <= 0) {
+        const char *e = getenv("ZAN_CO_WORKERS");
+        if (e && *e) w = atoi(e);
+    }
     if (w <= 0) {
 #if defined(_WIN32)
         SYSTEM_INFO si;
@@ -4818,6 +4836,10 @@ static DWORD WINAPI co_worker_thunk(LPVOID p) {
 static void co_pool_start_background(void) {
     zan_io_init();   /* the port must exist before workers block on it */
     g_co_stop = 0;
+    /* Re-resolve at pool start: Main configures AsyncRuntime between
+     * sched_init and the first start (rt_co.h), so the init snapshot can
+     * be stale; later restarts pick up the current resolution the same way. */
+    g_co_workers = co_worker_count();
     int w = g_co_workers;
     if (!g_io_shards_live) { io_shards_start(w); g_io_shards_live = 1; }
     g_co_pool_gen = g_co_pool_gen + 1;
@@ -4884,6 +4906,9 @@ void zan_co_sched_run(void) {
         return;
     }
     zan_io_init();   /* ensure the port exists before workers block on it */
+    /* Re-resolve here, not just at sched_init: Main configures AsyncRuntime
+     * between the two (rt_co.h), so the init-time snapshot can be stale. */
+    g_co_workers = co_worker_count();
     int w = g_co_workers;
     g_co_stop = 0;
     /* Shard the reactor before any worker starts: a shard with no waiter would

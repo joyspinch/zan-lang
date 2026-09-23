@@ -1711,6 +1711,19 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                          * decimal code the numeric branch would print. */
                         if (expr_is_char(g, expr->call.args.items[0], locals))
                             return emit_char_to_cstr(g, arg);
+                        /* T? formats through the shared coercion helper: the
+                         * payload's text for a some, the empty string for a
+                         * none (C#). Reaching the itoa below with the nullable
+                         * struct still by value made the LLVM verifier reject
+                         * the call ("Call parameter type does not match"). */
+                        if (llvm_is_nullable(LLVMTypeOf(arg))) {
+                            zan_type_t *st = infer_expr_type(
+                                g, expr->call.args.items[0], locals);
+                            bool uns = st && st->element_type &&
+                                       (st->element_type->kind == TYPE_UINT ||
+                                        st->element_type->kind == TYPE_ULONG);
+                            return emit_to_cstr_u(g, arg, uns ? 1 : 0);
+                        }
                         /* allocate buffer and sprintf; 40 bytes fits the
                          * longest shortest-round-trip double (the -1.79689...
                          * E+308 family and the 15-digit fixed forms) */

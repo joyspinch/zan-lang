@@ -4135,7 +4135,7 @@ add_test(NAME tool_zandoc
 get_property(_all_tests DIRECTORY PROPERTY TESTS)
 foreach(_t ${_all_tests})
   set(_labels "full")
-  if(_t MATCHES "^(golden_|diag_|abi_|cross_|runtime_|tool_|policy_)" OR _t MATCHES "^conformance_gui_")
+  if(_t MATCHES "^(golden_|diag_|abi_|cross_|runtime_|tool_|policy_|unit_)" OR _t MATCHES "^conformance_gui_")
     list(APPEND _labels "standard" "smoke")
   elseif(_t MATCHES "^(conformance_|emit_lib_|dap_)")
     list(APPEND _labels "standard")

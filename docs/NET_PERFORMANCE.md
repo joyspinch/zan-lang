@@ -114,10 +114,14 @@ powershell -File _scratch/bench/sample.ps1 -names zsrv -seconds 16 -outfile out.
 
 ## 7. 过程中发现并处理的问题
 
-1. **编译器 bug（已绕过，待修复）**：实例 `async` 方法内写类静态字段时，async 降级把静态
-   按值捕获进协程帧，写入落在副本上丢失（探针：10 个协程各自增 2 次，期望 20 实得 1；
-   静态方法/静态 async 方法中则正确）。Worker 的统计计数改为经静态辅助方法
-   `BumpStat()` 写入。修复应让 async 降级对静态字段保持引用语义。
+1. **编译器 bug（2026-09-23 复核：join 场景不再复现）**：曾报告实例 `async`
+   方法内写类静态字段时，async 降级把静态按值捕获进协程帧，写入落在副本上
+   丢失（探针：10 个协程各自增 2 次，期望 20 实得 1；静态方法/静态 async
+   方法中则正确），Worker 统计计数当时改为经静态辅助方法 `BumpStat()` 写入。
+   2026-09-23 以 Task.Spawn + Task.WhenAll join 探针复核：裸名/限定名/local
+   三种写静态字段均精确（10/10/10），当前构建不再复现；detached（无 join）
+   形状因主线程退出即 drain 无法用探针取证，若在服务器场景再遇丢失写入，
+   按编译器缺陷挂账（降级须对静态字段保持引用语义）。
 2. **Windows 跨进程环境变量**：`cmd /c set X=..&& exe` 与 CRT `getenv` 都读不到
    继承环境，改用 `SetEnvironmentVariableA` + `CreateProcess` 继承 +
    `GetEnvironmentVariableA` 读取（`ProcessHost.Env` 已改）。
