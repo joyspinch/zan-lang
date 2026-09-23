@@ -2,21 +2,24 @@ using System;
 using System.Data;
 using System.Data.Orm;
 using System.Text;
-using System.Collections.Generic;
 using Zan.Mvc.Admin.Model;
 
 namespace Zan.Mvc.Admin.Installer;
 
 /// <summary>
 /// 安装向导模型结构迁移器与初始数据装载引擎。
-/// 采用纯 CodeFirst 实体驱动：由 Model 实体类（[Table]/[Column]）直接生成物理表结构，
-/// 初始数据均通过强类型实体对象初始化并经 ORM Insert 写入。
+/// 纯 CodeFirst 实体驱动：
+/// 1. 物理表结构完全由 Model 实体类（[Table]/[Column]）自动生成；
+/// 2. 仅初始化基础系统角色（超级管理员）、组织根节点与初始管理员用户并完成绑定；
+/// 3. 绝不硬编码任何菜单规则（SysRule）或权限映射（SysRoleRule）——超级管理员默认拥有全量系统权限，其余业务权限由后台动态配置。
 /// </summary>
 public class SchemaMigrator {
     /// <summary>
-    /// 模型直接生表与初始种子数据装载：
-    /// 1. 调用 conn.SyncStructureAll() 由实体元数据自动构建物理 Schema（具备跨 SQLite/MySQL/PostgreSQL 方言安全与幂等加列能力）；
-    /// 2. 使用统一对象初始化器初始基础角色、部门、规则、统一用户与关联绑定。
+    /// 模型直接生表与系统基线初始化：
+    /// 1. conn.SyncStructureAll() 自动同步所有物理表结构；
+    /// 2. 初始化超级管理角色 (key = "admin")；
+    /// 3. 初始化总公司顶级部门；
+    /// 4. 插入初始管理员用户并绑定超级管理员角色。
     /// </summary>
     public static bool ExecuteInstall(IDbConnection conn, string adminUser, string adminPassword, out string error) {
         error = "";
@@ -24,24 +27,16 @@ public class SchemaMigrator {
             // 1. 模型直接生表：由实体模型 [Table] 自动构建全部物理表结构
             conn.SyncStructureAll();
 
-            // 2. 插入初始化基础角色（统一对象初始化器）
+            // 2. 插入初始化超级管理角色（拥有全量系统权限与菜单，其他角色靠后台配置）
             conn.Insert<SysRole>(new SysRole {
                 id = 1,
-                name = "超级管理角色",
+                name = "超级管理员",
                 key = "admin",
                 data_scope = 1,
                 status = 1
             }).ExecuteAffrows();
 
-            conn.Insert<SysRole>(new SysRole {
-                id = 2,
-                name = "通用业务角色",
-                key = "staff",
-                data_scope = 4,
-                status = 1
-            }).ExecuteAffrows();
-
-            // 3. 插入总公司顶级部门（统一对象初始化器）
+            // 3. 插入总公司顶级部门
             conn.Insert<SysDepartment>(new SysDepartment {
                 id = 1,
                 parent_id = 0,
@@ -50,62 +45,7 @@ public class SchemaMigrator {
                 order_num = 1
             }).ExecuteAffrows();
 
-            // 4. 初始化核心菜单与权限规则（统一对象初始化器）
-            conn.Insert<SysRule>(new SysRule {
-                id = 1,
-                parent_id = 0,
-                key = "sys",
-                title = "系统设置",
-                route = "/admin/sys",
-                method = "GET",
-                is_menu = true,
-                icon = "gear",
-                order_num = 1
-            }).ExecuteAffrows();
-
-            conn.Insert<SysRule>(new SysRule {
-                id = 2,
-                parent_id = 1,
-                key = "sys:user",
-                title = "用户管理",
-                route = "/admin/sys/user",
-                method = "GET",
-                is_menu = true,
-                icon = "user",
-                order_num = 1
-            }).ExecuteAffrows();
-
-            conn.Insert<SysRule>(new SysRule {
-                id = 3,
-                parent_id = 1,
-                key = "sys:role",
-                title = "角色管理",
-                route = "/admin/sys/role",
-                method = "GET",
-                is_menu = true,
-                icon = "shield",
-                order_num = 2
-            }).ExecuteAffrows();
-
-            conn.Insert<SysRule>(new SysRule {
-                id = 4,
-                parent_id = 1,
-                key = "sys:dept",
-                title = "部门管理",
-                route = "/admin/sys/dept",
-                method = "GET",
-                is_menu = true,
-                icon = "tree",
-                order_num = 3
-            }).ExecuteAffrows();
-
-            // 5. 角色赋予规则绑定（统一对象初始化器）
-            conn.Insert<SysRoleRule>(new SysRoleRule { role_id = 1, rule_id = 1 }).ExecuteAffrows();
-            conn.Insert<SysRoleRule>(new SysRoleRule { role_id = 1, rule_id = 2 }).ExecuteAffrows();
-            conn.Insert<SysRoleRule>(new SysRoleRule { role_id = 1, rule_id = 3 }).ExecuteAffrows();
-            conn.Insert<SysRoleRule>(new SysRoleRule { role_id = 1, rule_id = 4 }).ExecuteAffrows();
-
-            // 6. 插入初始化统一用户（同一张 sys_users 表，无任何特权列，通过角色获得权限）
+            // 4. 插入初始化用户（同一张 sys_users 表，通过角色获得权限）
             long now = DateTime.UtcNow().ToUnixSeconds();
             string pwdHash = HashPassword(adminPassword, "zan_salt_");
 
@@ -113,14 +53,14 @@ public class SchemaMigrator {
                 id = 1,
                 username = adminUser,
                 password_hash = pwdHash,
-                nickname = "系统管理员",
+                nickname = "超级管理员",
                 department_id = 1,
                 status = 1,
                 created_at = now,
                 updated_at = now
             }).ExecuteAffrows();
 
-            // 7. 绑定用户与角色（统一对象初始化器）
+            // 5. 绑定用户与超级管理员角色
             conn.Insert<SysUserRole>(new SysUserRole { user_id = 1, role_id = 1 }).ExecuteAffrows();
 
             return true;

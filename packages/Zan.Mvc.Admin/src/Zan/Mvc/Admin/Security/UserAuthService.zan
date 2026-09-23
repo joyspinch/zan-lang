@@ -8,13 +8,31 @@ namespace Zan.Mvc.Admin.Security;
 
 /// <summary>
 /// 统一用户授权与菜单生成服务。
-/// 全链路纯 ORM 强类型实体驱动：
-/// 1. 只有一张统一用户表 sys_users，没有任何管理员 vs 普通用户特权列标记；
-/// 2. 用户的权限与可见菜单，完全由其所绑定的角色（Role）和规则（Rule）通过 ORM 动态解析；
-/// 3. 前端侧边栏菜单通过 GetUserMenuTree 实时由角色权限动态计算生成；
-/// 4. 彻底消除底层 DbResult 游标列索引（res.GetInt(0, 0)）的脆弱耦合。
+/// 纯 ORM 强类型实体驱动：
+/// 1. 只有一张统一用户表 sys_users，无任何特殊特权字段；
+/// 2. 超级管理员角色（key = "admin"）默认自动拥有全量系统菜单与权限，无需在数据库中逐条初始化规则映射；
+/// 3. 普通角色严格依据后台配置绑定的角色-规则关系（sys_role_rule）动态判定权限与计算可见菜单树；
+/// 4. 彻底杜绝底层字段索引与硬编码初始化数据。
 /// </summary>
 public class UserAuthService {
+    /// <summary>
+    /// 判断用户是否属于超级管理员角色（key = "admin"）
+    /// </summary>
+    public static bool IsSuperAdmin(IDbConnection conn, int userId) {
+        List<SysUserRole> userRoles = conn.Select<SysUserRole>()
+            .Where(ur => ur.user_id == userId)
+            .ToList();
+
+        for (int i = 0; i < userRoles.Count; i = i + 1) {
+            int rid = userRoles[i].role_id;
+            SysRole r = conn.Select<SysRole>().Where(role => role.id == rid).First();
+            if (r != null && r.key == "admin") {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// <summary>
     /// 获取用户分配的角色 ID 列表（ORM 实体查询）
     /// </summary>
@@ -52,12 +70,17 @@ public class UserAuthService {
 
     /// <summary>
     /// 核心算法：按用户角色权限动态构建可见菜单树。
-    /// 无论何种身份，能看到的菜单完全由此处授权规则过滤出的树形结构决定。
+    /// - 超级管理员：自动拥有系统中全部注册的菜单，无需数据库绑定任何 sys_role_rule；
+    /// - 普通角色：严格根据后台配置绑定的规则集合过滤展示。
     /// </summary>
     public static List<SysRule> GetUserMenuTree(IDbConnection conn, int userId) {
-        Dictionary<int, bool> allowedRuleIds = GetUserRuleIdMap(conn, userId);
-        if (allowedRuleIds.Count == 0) {
-            return new List<SysRule>();
+        bool isSuper = IsSuperAdmin(conn, userId);
+        Dictionary<int, bool> allowedRuleIds = null;
+        if (!isSuper) {
+            allowedRuleIds = GetUserRuleIdMap(conn, userId);
+            if (allowedRuleIds.Count == 0) {
+                return new List<SysRule>();
+            }
         }
 
         // 1. 查询全部菜单类型规则（通过 ORM 实体查询，强类型属性绑定）
@@ -71,7 +94,7 @@ public class UserAuthService {
 
         for (int i = 0; i < rawMenus.Count; i = i + 1) {
             SysRule r = rawMenus[i];
-            if (allowedRuleIds.ContainsKey(r.id)) {
+            if (isSuper || allowedRuleIds.ContainsKey(r.id)) {
                 allMenus.Add(r);
                 menuMap[r.id] = r;
             }
@@ -88,5 +111,25 @@ public class UserAuthService {
             }
         }
         return rootMenus;
+    }
+
+    /// <summary>
+    /// 校验用户是否拥有指定权限标识（如 "sys:user:add"）：
+    /// - 超级管理员角色一律直接放行；
+    /// - 普通角色根据后台配置的 sys_role_rule 关联判定。
+    /// </summary>
+    public static bool HasPermission(IDbConnection conn, int userId, string ruleKey) {
+        if (IsSuperAdmin(conn, userId)) {
+            return true;
+        }
+        Dictionary<int, bool> allowedRuleIds = GetUserRuleIdMap(conn, userId);
+        if (allowedRuleIds.Count == 0) {
+            return false;
+        }
+        SysRule rule = conn.Select<SysRule>().Where(r => r.key == ruleKey).First();
+        if (rule == null) {
+            return false;
+        }
+        return allowedRuleIds.ContainsKey(rule.id);
     }
 }
