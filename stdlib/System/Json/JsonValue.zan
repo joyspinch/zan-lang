@@ -42,6 +42,8 @@ class JsonValue {
     List<string> keys;
     /// kind 5 时与 keys 并置的值列表。
     List<JsonValue> vals;
+    /// kind 5 时的键索引哈希表（键数 > 8 且被频繁查找时懒加载构建，加速宽对象属性访问）。
+    Dict<string, int> keyIndex;
 
     /// 组树（WriteTo/WritePretty）与解析（ReadValueAt）共用的
     /// 嵌套深度上限。序列化同样是递归的：无界深度的树会在
@@ -133,6 +135,9 @@ class JsonValue {
 
     /// 追加键值对（对象）。不去重。
     void Put(string key, JsonValue v) {
+        if (this.keyIndex != null) {
+            this.keyIndex[key] = keys.Count;
+        }
         keys.Add(key);
         vals.Add(v);
     }
@@ -140,25 +145,64 @@ class JsonValue {
     /// 对象是否含该 key；不是对象时返回 false。
     bool Has(string key) {
         if (kind != 5) { return false; }
-        for (int i = 0; i < keys.Count; i = i + 1) {
-            if (keys[i] == key) { return true; }
+        int n = keys.Count;
+        if (n <= 8) {
+            for (int i = 0; i < n; i = i + 1) {
+                if (keys[i] == key) { return true; }
+            }
+            return false;
+        }
+        if (this.keyIndex == null) {
+            Get(key);
+        }
+        if (this.keyIndex != null) {
+            return this.keyIndex.ContainsKey(key);
         }
         return false;
     }
 
     /// `key` 对应的值；不存在或不是对象时返回 null。
+    /// 键数量 <= 8 时走连续内存线性扫描（零额外内存、缓存行友好）；
+    /// 键数量 > 8 时自动激活懒加载哈希索引，O(1) 访问。
     JsonValue Get(string key) {
         if (kind != 5) { return null; }
-        for (int i = 0; i < keys.Count; i = i + 1) {
-            if (keys[i] == key) { return vals[i]; }
+        int n = keys.Count;
+        if (n <= 8) {
+            for (int i = 0; i < n; i = i + 1) {
+                if (keys[i] == key) { return vals[i]; }
+            }
+            return null;
+        }
+        if (this.keyIndex == null) {
+            Dict<string, int> ki = new Dict<string, int>();
+            for (int i = 0; i < n; i = i + 1) {
+                ki[keys[i]] = i;
+            }
+            this.keyIndex = ki;
+        }
+        if (this.keyIndex.ContainsKey(key)) {
+            int idx = this.keyIndex[key];
+            return vals[idx];
         }
         return null;
     }
 
     /// 若 `key` 已存在则替换其值，否则追加（对象）。
     void Set(string key, JsonValue v) {
+        if (this.keyIndex != null && this.keyIndex.ContainsKey(key)) {
+            int idx = this.keyIndex[key];
+            vals[idx] = v;
+            return;
+        }
         for (int i = 0; i < keys.Count; i = i + 1) {
-            if (keys[i] == key) { vals[i] = v; return; }
+            if (keys[i] == key) {
+                vals[i] = v;
+                if (this.keyIndex != null) { this.keyIndex[key] = i; }
+                return;
+            }
+        }
+        if (this.keyIndex != null) {
+            this.keyIndex[key] = keys.Count;
         }
         keys.Add(key);
         vals.Add(v);
