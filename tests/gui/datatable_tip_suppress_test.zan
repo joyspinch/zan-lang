@@ -1,0 +1,147 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Component.DataTable;
+
+/// datatable: 右键菜单展开后及打开时抑制后方表格与表头悬停提示。
+///
+/// 缺陷背景：用户报告「表格的右键菜单展开以后，鼠标悬停还是会显示后面表格的内容的tips,应该是不显示的」。
+/// 根因分析：
+/// 1. 单元格截断 Tooltip 评估早于行体右键事件处理，右键按下当帧 pendingText 未撤销便直接画在刚弹出的菜单上；
+/// 2. 悬停提示条件中仅判断局部状态 !st.ctxOpen，未判断 app.PointerCaptured() 与 app.HasOverlays()，
+///    在外部右键菜单（ExternalRowMenu/ContextMenu）展开时，底层表格仍按几何坐标响应 hover 并弹出提示；
+/// 3. OpenRowMenu / OpenHdrMenu 未重置 tipOi / hdrTipCol 状态且未撤销挂起提示。
+///
+/// 本测试对齐真实帧事件分发，锁定这套抑制契约。
+class KeyRowSource : DataSource {
+    List<DataRow> rows;
+    KeyRowSource(List<DataRow> values) { this.rows = values; }
+    override int RowCount() { return this.rows.Count; }
+    override string CellText(int row, int col) { return this.rows[row].At(col); }
+    override RowKey GetRowKey(int row) {
+        return RowKey.Of("id" + Convert.ToString(row));
+    }
+}
+
+class Program {
+    static App app;
+    static List<DataColumn> cols;
+    static DataSource src;
+    static DataTableState st;
+    static bool externalOverlayOpen = false;
+
+    static void Body() {
+        WidgetId.ResetFrame();
+        if (st != null && cols != null && src != null) {
+            DataTable.RenderSource(app, 20, 20, 420, 300, cols, src, st);
+        }
+        if (externalOverlayOpen) {
+            app.BlockHitsBelow();
+        }
+        app.RunOverlays();
+    }
+
+    static void PumpFrame() {
+        app.RequestRedraw();
+        app.PumpGuarded();
+        app.FrameGuarded(Body);
+    }
+
+    static void Assert(string name, bool condition) {
+        if (condition) {
+            Console.WriteLine(name + "=1");
+        } else {
+            Console.WriteLine(name + "=0 (FAILED)");
+        }
+    }
+
+    static void Main() {
+        app = new App("dt-tip-suppress-test", 480, 360);
+        app.Show();
+
+        cols = new List<DataColumn>{
+            DataColumn.Text("Very Long Column Title That Exceeds Width", 60),
+            DataColumn.Text("ShortCol", 80)
+        };
+        cols[0].description = "Detailed column description for tooltip";
+
+        List<DataRow> rows = new List<DataRow>();
+        for (int i = 0; i < 10; i = i + 1) {
+            DataRow r = new DataRow();
+            r.Push("Super Long Long Cell Content That Exceeds 60 Pixels " + Convert.ToString(i));
+            r.Push("Short");
+            rows.Add(r);
+        }
+        src = new KeyRowSource(rows);
+        st = new DataTableState();
+
+        int numW = app.Scale(46);
+        int selW = app.Scale(40);
+        int cellX = 20 + numW + selW + 10;
+        int cellY = 20 + app.theme.heightMedium + app.theme.heightMedium / 2;
+
+        // 1. 无菜单状态下悬停超时，正常显示单元格截断提示
+        app.window.InjectEvent(1, cellX, cellY, 0, 0, 0);
+        PumpFrame();
+        System.Threading.Thread.Sleep(600);
+        app.window.InjectEvent(1, cellX, cellY, 0, 0, 0);
+        PumpFrame();
+        Assert("normalHoverShowsTip", st.tipOi == 0);
+
+        // 2. 右键按下当帧打开行菜单，提示必须立即取消
+        app.window.InjectEvent(2, cellX, cellY, 1, 0, 0);
+        PumpFrame();
+        Assert("rightDownCancelsTip", st.ctxOpen && st.tipOi == -1);
+
+        // 3. 右键释放并在此处悬停 600ms，菜单展开期间不得显示提示
+        app.window.InjectEvent(3, cellX, cellY, 1, 0, 0);
+        PumpFrame();
+        app.window.InjectEvent(1, cellX + 10, cellY + 10, 0, 0, 0);
+        PumpFrame();
+        System.Threading.Thread.Sleep(600);
+        app.window.InjectEvent(1, cellX + 10, cellY + 10, 0, 0, 0);
+        PumpFrame();
+        Assert("hoverDuringBuiltinMenuSuppressed", st.ctxOpen && st.tipOi == -1);
+
+        // 4. 关闭内置菜单，开启外部覆盖层（模拟外部右键菜单/ContextMenu 展开）
+        st.ctxOpen = false;
+        st.ctxMenuOpen.Set(false);
+        externalOverlayOpen = true;
+        PumpFrame();
+
+        // 5. 外部菜单展开且指针被捕获时，鼠标在后方表格上悬停不得显示提示
+        app.window.InjectEvent(1, cellX, cellY, 0, 0, 0);
+        PumpFrame();
+        System.Threading.Thread.Sleep(600);
+        app.window.InjectEvent(1, cellX, cellY, 0, 0, 0);
+        PumpFrame();
+        Assert("hoverDuringExternalMenuSuppressed", externalOverlayOpen && app.PointerCaptured() && st.tipOi == -1);
+
+        // 6. 关闭外部菜单，悬停应恢复正常
+        externalOverlayOpen = false;
+        PumpFrame();
+        PumpFrame();
+        app.window.InjectEvent(1, cellX, cellY, 0, 0, 0);
+        PumpFrame();
+        System.Threading.Thread.Sleep(600);
+        app.window.InjectEvent(1, cellX, cellY, 0, 0, 0);
+        PumpFrame();
+        Assert("hoverAfterCloseRestores", st.tipOi == 0);
+
+        // 7. 表头右键菜单打开当帧及展开期间抑制表头提示
+        int hdrX = 20 + numW + selW + 10;
+        int hdrY = 20 + app.theme.heightMedium / 2;
+        app.window.InjectEvent(2, hdrX, hdrY, 1, 0, 0);
+        PumpFrame();
+        Assert("hdrRightDownCancelsTip", st.hdrCtxOpen && st.hdrTipCol == -1);
+
+        app.window.InjectEvent(3, hdrX, hdrY, 1, 0, 0);
+        PumpFrame();
+        app.window.InjectEvent(1, hdrX, hdrY, 0, 0, 0);
+        PumpFrame();
+        System.Threading.Thread.Sleep(600);
+        app.window.InjectEvent(1, hdrX, hdrY, 0, 0, 0);
+        PumpFrame();
+        Assert("hdrHoverDuringMenuSuppressed", st.hdrCtxOpen && st.hdrTipCol == -1);
+    }
+}
