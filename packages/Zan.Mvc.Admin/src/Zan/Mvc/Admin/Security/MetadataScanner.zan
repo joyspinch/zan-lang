@@ -1,0 +1,157 @@
+using System;
+using System.Data;
+using System.Collections.Generic;
+using System.Web;
+using Zan.Mvc.Admin.Model;
+using Zan.Mvc.Admin.Dao;
+
+namespace Zan.Mvc.Admin.Security;
+
+/// <summary>
+/// 声明式元数据扫描与权限规则自动同步引擎。
+/// 启动期纯由属性特性（[AdminModule]、[AdminAction]、[Description]、[Menu]）与路由表自动扫描，
+/// 增量对比、幂等同步系统模块与功能菜单到 sys_rules 表，彻底免去手写数据库初始化 SQL 或硬编码配置。
+/// </summary>
+public class MetadataScanner {
+    /// <summary>
+    /// 自动从 WebApp 路由表与元数据扫描并同步所有规则与菜单
+    /// </summary>
+    public static void SyncFromRouter(Router router, IDbConnection conn) {
+        if (conn == null || router == null) { return; }
+        try {
+            SysRuleDao dao = SysRuleDao.Of(conn);
+            List<Route> routes = router.All();
+
+            // 1. 第一遍扫描：发现所有管理模块 (Module) 并幂等同步到 sys_rules 表
+            Dictionary<string, int> moduleIds = new Dictionary<string, int>();
+
+            for (int i = 0; i < routes.Count; i = i + 1) {
+                Route r = routes[i];
+                if (!r.pattern.StartsWith("/admin")) { continue; }
+
+                string modKey = r.meta.Get("ModuleKey");
+                if (modKey.Length == 0) {
+                    List<string> segs = Router.SplitPath(r.pattern);
+                    // 仅当具备至少 3 级路径 (/admin/{mod}/{ctrl}...) 时才推断为模块，避免 /admin/login 误判
+                    if (segs.Count >= 3 && segs[0] == "admin") {
+                        modKey = segs[1];
+                    }
+                }
+                if (modKey.Length == 0 || modKey == "api" || modKey == "static" || modKey == "assets" || modKey == "install") { continue; }
+
+                if (!moduleIds.ContainsKey(modKey)) {
+                    string modTitle = r.meta.Get("ModuleTitle");
+                    if (modTitle.Length == 0) {
+                        modTitle = modKey == "sys" ? "系统管理" : modKey;
+                    }
+                    string modIcon = r.meta.Get("ModuleIcon");
+                    if (modIcon.Length == 0) { modIcon = "grid"; }
+                    string modOrderStr = r.meta.Get("ModuleOrder");
+                    int modOrder = modOrderStr.Length > 0 ? Convert.ToInt32(modOrderStr) : 100;
+
+                    SysRule modRule = dao.FindByKey(modKey);
+                    if (modRule == null) {
+                        modRule = new SysRule();
+                        modRule.parent_id = 0;
+                        modRule.key = modKey;
+                        modRule.title = modTitle;
+                        modRule.route = "";
+                        modRule.method = "GET";
+                        modRule.is_menu = true;
+                        modRule.icon = modIcon;
+                        modRule.order_num = modOrder;
+                        dao.Insert(modRule);
+                        modRule = dao.FindByKey(modKey);
+                    } else {
+                        bool modChanged = false;
+                        if (modRule.title != modTitle && modTitle.Length > 0) { modRule.title = modTitle; modChanged = true; }
+                        if (modRule.icon != modIcon && modIcon.Length > 0) { modRule.icon = modIcon; modChanged = true; }
+                        if (modOrder < 100 && modRule.order_num != modOrder) { modRule.order_num = modOrder; modChanged = true; }
+                        if (modChanged) { dao.Update(modRule); }
+                    }
+                    if (modRule != null) {
+                        moduleIds.Add(modKey, modRule.id);
+                    }
+                }
+            }
+
+            // 2. 第二遍扫描：由 r.inMenu 驱动发现所有功能菜单
+            for (int i = 0; i < routes.Count; i = i + 1) {
+                Route r = routes[i];
+                if (!r.pattern.StartsWith("/admin")) { continue; }
+                if (!r.inMenu) { continue; }
+
+                string modKey = r.meta.Get("ModuleKey");
+                if (modKey.Length == 0) {
+                    List<string> segs = Router.SplitPath(r.pattern);
+                    if (segs.Count >= 2 && segs[0] == "admin") {
+                        modKey = segs[1];
+                    }
+                }
+                int parentId = 0;
+                if (modKey.Length > 0 && moduleIds.ContainsKey(modKey)) {
+                    parentId = moduleIds[modKey];
+                }
+
+                string actionKey = r.meta.Get("Key");
+                if (actionKey.Length == 0) {
+                    string p = r.pattern;
+                    if (p.StartsWith("/admin/")) { p = p.Substring(7); }
+                    actionKey = p.Replace("/", ":");
+                }
+                string title = r.title;
+                if (title.Length == 0) { title = r.meta.Get("Title"); }
+                if (title.Length == 0) { title = actionKey; }
+
+                string icon = r.meta.Get("Icon");
+                if (icon.Length == 0) { icon = "file"; }
+
+                string orderStr = r.meta.Get("Order");
+                if (orderStr.Length == 0) { orderStr = r.meta.Get("Rank"); }
+                int order = orderStr.Length > 0 ? Convert.ToInt32(orderStr) : 100;
+
+                EnsureRule(dao, parentId, actionKey, title, r.pattern, r.method, true, icon, order);
+            }
+        } catch (Exception) {
+            // 未安装或物理表结构尚未创建时静默，等待安装向导或建表后自动同步
+            return;
+        }
+    }
+
+    /// <summary>
+    /// 兼容入口：未显式传 router 时自动从全局 AdminApp.App 获取
+    /// </summary>
+    public static void SyncRules(IDbConnection conn) {
+        if (conn == null) { return; }
+        if (AdminApp.App != null) {
+            SyncFromRouter(AdminApp.App.router, conn);
+        }
+    }
+
+    private static void EnsureRule(SysRuleDao dao, int parentId, string key, string title, string route, string method, bool isMenu, string icon, int order) {
+        SysRule r = dao.FindByKey(key);
+        if (r == null) {
+            r = new SysRule();
+            r.parent_id = parentId;
+            r.key = key;
+            r.title = title;
+            r.route = route;
+            r.method = method;
+            r.is_menu = isMenu;
+            r.icon = icon;
+            r.order_num = order;
+            dao.Insert(r);
+        } else {
+            bool changed = false;
+            if (r.parent_id != parentId && parentId > 0) { r.parent_id = parentId; changed = true; }
+            if (r.title != title) { r.title = title; changed = true; }
+            if (r.route != route) { r.route = route; changed = true; }
+            if (r.method != method) { r.method = method; changed = true; }
+            if (r.icon != icon && icon.Length > 0) { r.icon = icon; changed = true; }
+            if (r.order_num != order) { r.order_num = order; changed = true; }
+            if (changed) {
+                dao.Update(r);
+            }
+        }
+    }
+}

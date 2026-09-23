@@ -1,0 +1,156 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Web;
+using Zan.Mvc.Admin.Dao;
+using Zan.Mvc.Admin.Model;
+using Zan.Mvc.Admin.UI;
+using Zan.Mvc.Admin.Attributes;
+using Zan.Mvc.Admin.Security;
+
+namespace Zan.Mvc.Admin.Web;
+
+/// <summary>
+/// 系统角色权限管理控制器。
+/// 继承自企业级通用 CRUD 微内核基类 CrudController<SysRole>。
+/// 负责系统角色的增删改查、5 级数据范围配置以及与权限规则（SysRule）的绑定维护。
+/// </summary>
+[AdminModule(Key = "sys", Title = "系统管理", Icon = "setting", Order = 1)]
+[AdminAction(Key = "sys:role", Title = "角色管理", IsMenu = true, Icon = "lock", Order = 2)]
+[Description("角色管理")]
+public class SysRoleController : CrudController<SysRole> {
+    private SysRoleDao dao;
+
+    public SysRoleController(IDbConnection db = null) : base(db != null ? db : GetDb()) {
+        this.dao = SysRoleDao.Of(this.db);
+    }
+
+    private static IDbConnection GetDb() {
+        IDbConnection db = AdminApp.Db;
+        if (db == null) {
+            db = AdminApp.OpenDb();
+        }
+        return db;
+    }
+
+    /// <summary>声明角色表格规格、列定义与操作栏</summary>
+    protected override TableConfig BuildTableConfig() {
+        TableConfig cfg = new TableConfig();
+        cfg.Conf.SetKey("id", "系统角色");
+        cfg.AddColumn("id", "ID", "number", 60, true, false)
+           .AddColumn("name", "角色名称", "input", 140, true, true)
+           .AddColumn("key", "角色标识", "text", 140, true, false)
+           .AddColumn("data_scope", "数据范围", "dict", 120, false, true)
+           .AddColumn("status", "状态", "dict", 80, false, true)
+           .AddFilter("name", "角色名称", "Input", "请输入角色名称搜索")
+           .AddFilter("key", "角色标识", "Input", "请输入角色唯一标识")
+           .AddTool("新增角色", "Add", "角色", "Primary", false, "520px", "380px")
+           .AddTool("批量删除", "Delete", "角色", "Error", true, "400px", "260px");
+        return cfg;
+    }
+
+    /// <summary>声明角色新增与编辑表单规格 Schema</summary>
+    protected override FormView BuildFormView() {
+        FormView form = new FormView("系统角色");
+        form.AddField("name", "角色名称", "input", true, "请输入角色名称", 12)
+            .AddField("key", "角色标识", "input", true, "如 admin, finance, manager", 12)
+            .AddField("data_scope", "数据范围", "number", true, "1:全部 2:本部门及下级 3:本部门 4:仅本人", 12);
+        return form;
+    }
+
+    /// <summary>角色分页检索业务逻辑</summary>
+    protected override string OnPage(int page, int pageSize) {
+        List<SysRole> all = this.dao.Page(page, pageSize);
+        int total = this.dao.Count();
+        RolePagedResult res = new RolePagedResult(total, all);
+        return Json.Serialize<RolePagedResult>(res);
+    }
+
+    /// <summary>新增角色业务保存</summary>
+    protected override int OnInsert(SysRole entity) {
+        if (entity.name.Length == 0 || entity.key.Length == 0) {
+            return 0;
+        }
+        SysRole existing = this.dao.FindByKey(entity.key);
+        if (existing != null) {
+            return 0;
+        }
+        if (entity.data_scope <= 0) {
+            entity.data_scope = 1;
+        }
+        if (entity.status == 0) {
+            entity.status = 1;
+        }
+        return this.dao.Insert(entity);
+    }
+
+    /// <summary>编辑角色业务保存</summary>
+    protected override int OnUpdate(SysRole entity) {
+        SysRole r = this.dao.FindById(entity.id);
+        if (r == null) {
+            return 0;
+        }
+        r.name = entity.name;
+        r.data_scope = entity.data_scope;
+        r.status = entity.status;
+        return this.dao.Update(r);
+    }
+
+    /// <summary>删除角色业务逻辑（保护超级管理员角色）</summary>
+    protected override void OnDelete(int id) {
+        if (id == 1) {
+            return;
+        }
+        this.dao.DeleteById(id);
+    }
+
+    /// <summary>行内即时修改字段安全落地</summary>
+    protected override bool OnField(int id, string fieldName, string fieldValue) {
+        SysRole r = this.dao.FindById(id);
+        if (r == null) {
+            return false;
+        }
+        if (fieldName == "name") {
+            r.name = fieldValue;
+        } else if (fieldName == "status") {
+            r.status = Convert.ToInt32(fieldValue);
+        } else if (fieldName == "data_scope") {
+            r.data_scope = Convert.ToInt32(fieldValue);
+        } else {
+            return false;
+        }
+        return this.dao.Update(r) > 0;
+    }
+
+    /// <summary>查询指定角色绑定的规则 ID 集合（逗号分隔）</summary>
+    public void Rules(int roleId) {
+        List<int> ruleIds = this.dao.GetRuleIdsByRoleId(roleId);
+        string ids = "";
+        for (int i = 0; i < ruleIds.Count; i = i + 1) {
+            if (i > 0) { ids = ids + ","; }
+            ids = ids + Convert.ToString(ruleIds[i]);
+        }
+        this.JsonSuccessData(ids);
+    }
+
+    /// <summary>保存指定角色关联的权限规则集合</summary>
+    public void SaveRules(int roleId, string ruleIds) {
+        if (roleId <= 0) {
+            this.JsonFail("角色 ID 无效", "4001");
+            return;
+        }
+        List<int> ids = new List<int>();
+        if (ruleIds != null && ruleIds.Length > 0) {
+            List<string> parts = ruleIds.Split(",");
+            for (int i = 0; i < parts.Count; i = i + 1) {
+                string p = parts[i].Trim();
+                if (p.Length > 0) {
+                    ids.Add(Convert.ToInt32(p));
+                }
+            }
+        }
+        this.dao.SetRoleRules(roleId, ids);
+        this.AuditLog("RoleRules", "更新角色权限规则 (角色 ID: " + Convert.ToString(roleId) + ")");
+        this.JsonSuccess("权限分配已保存");
+    }
+}

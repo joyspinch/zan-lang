@@ -7,155 +7,136 @@ using Zan.Mvc.Admin.Model;
 using Zan.Mvc.Admin.UI;
 using Zan.Mvc.Admin.Attributes;
 using Zan.Mvc.Admin.Installer;
+using Zan.Mvc.Admin.Security;
 
 namespace Zan.Mvc.Admin.Web;
 
 /// <summary>
 /// 系统用户管理控制器。
-/// 声明式业务模块与菜单（自动被中台菜单扫描识别）。
-/// 纯 DataGrid 强类型原语 + SysUserDao 驱动，杜绝模板繁复手写与游标字段映射。
+/// 继承自企业级通用 CRUD 微内核基类 CrudController<SysUser>。
+/// 彻底废除手写 HTML/JS 拼接与手拼 JSON，纯 TableConfig 与 FormView 规格驱动。
 /// </summary>
 [AdminModule(Key = "sys", Title = "系统管理", Icon = "setting", Order = 1)]
-public class SysUserController : BaseAdminController {
-    [HttpGet]
-    [Route("/admin/sys/user")]
-    [AdminAction(Key = "sys:user:list", Title = "用户管理", Route = "/admin/sys/user", IsMenu = true, Order = 1)]
-    public void Index() {
-        DataGrid grid = new DataGrid("用户管理", "/admin/sys/user/data");
-        grid.AddColumn("id", "ID", 60, "center")
-            .AddColumn("username", "用户名", 140, "left")
-            .AddColumn("nickname", "姓名/昵称", 140, "left")
-            .AddColumn("department_id", "部门编号", 100, "center")
-            .AddColumn("status", "状态", 80, "center", "badge")
-            .AddColumn("created_at", "创建时间", 160, "center", "datetime");
+[AdminAction(Key = "sys:user", Title = "用户管理", IsMenu = true, Icon = "user", Order = 1)]
+[Description("用户管理")]
+public class SysUserController : CrudController<SysUser> {
+    private SysUserDao dao;
 
-        grid.AddFilter("username", "用户名", "text", "输入用户名模糊搜索")
-            .AddTopAction("新增用户", "/admin/sys/user/add", "dialog", "plus", "primary", "sys:user:add");
-
-        string schemaJson = grid.ToSchemaJson();
-
-        // 注入视图模板
-        string html = "<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"UTF-8\"><title>用户管理</title>"
-            + "<link rel=\"stylesheet\" href=\"/static/zan/css/admin.css\">"
-            + "<script>window.GRID_SCHEMA = " + schemaJson + ";</script>"
-            + "</head><body>"
-            + "<div id=\"gridMount\"></div>"
-            + "<script src=\"/static/zan/js/core/event-bus.js\"></script>"
-            + "<script src=\"/static/zan/js/core/layer.js\"></script>"
-            + "<script src=\"/static/zan/js/admin.js\"></script>"
-            + "</body></html>";
-
-        this.Html(html);
+    public SysUserController(IDbConnection db = null) : base(db != null ? db : GetDb()) {
+        this.dao = SysUserDao.Of(this.db);
     }
 
-    [HttpGet]
-    [Route("/admin/sys/user/data")]
-    public void Data() {
-        int page = 1;
-        int pageSize = 20;
-
-        string pageStr = this.In("page");
-        if (pageStr.Length > 0) {
-            page = Convert.ToInt32(pageStr);
+    private static IDbConnection GetDb() {
+        IDbConnection db = AdminApp.Db;
+        if (db == null) {
+            db = AdminApp.OpenDb();
         }
-        if (page <= 0) { page = 1; }
-
-        IDbConnection conn = AdminApp.Db;
-        if (conn == null) { conn = AdminApp.OpenDb(); }
-
-        SysUserDao userDao = SysUserDao.Of(conn);
-        List<SysUser> items = userDao.Page(page, pageSize);
-        int total = userDao.Count();
-
-        string itemsJson = Json.Serialize<List<SysUser>>(items);
-        this.Json("{\"code\":\"0000\",\"msg\":\"ok\",\"data\":{\"items\":" + itemsJson + ",\"total\":" + Convert.ToString(total) + "}}");
+        return db;
     }
 
-    [HttpPost]
-    [Route("/admin/sys/user/save")]
-    public void Save() {
-        int id = 0;
-        string idStr = this.In("id");
-        if (idStr.Length > 0) {
-            id = Convert.ToInt32(idStr);
-        }
-
-        string username = this.In("username");
-        string password = this.In("password");
-        string nickname = this.In("nickname");
-        int deptId = 1;
-        string deptStr = this.In("department_id");
-        if (deptStr.Length > 0) {
-            deptId = Convert.ToInt32(deptStr);
-        }
-
-        if (username.Length == 0) {
-            this.JsonFail("用户名不能为空");
-            return;
-        }
-
-        IDbConnection conn = AdminApp.Db;
-        if (conn == null) { conn = AdminApp.OpenDb(); }
-        SysUserDao userDao = SysUserDao.Of(conn);
-
-        if (id > 0) {
-            // 更新用户
-            SysUser u = userDao.FindById(id);
-            if (u == null) {
-                this.JsonFail("用户不存在");
-                return;
-            }
-            u.nickname = nickname;
-            u.department_id = deptId;
-            if (password.Length >= 6) {
-                u.password_hash = SchemaMigrator.HashPassword(password, "zan_salt_");
-            }
-            u.updated_at = DateTime.UtcNow().ToUnixSeconds();
-            userDao.Update(u);
-            this.JsonSuccess("更新用户成功");
-        } else {
-            // 新增用户
-            if (userDao.ExistsUsername(username)) {
-                this.JsonFail("用户名已存在");
-                return;
-            }
-            if (password.Length < 6) {
-                this.JsonFail("密码长度不能小于 6 位");
-                return;
-            }
-            long now = DateTime.UtcNow().ToUnixSeconds();
-            SysUser u = new SysUser();
-            u.username = username;
-            u.password_hash = SchemaMigrator.HashPassword(password, "zan_salt_");
-            u.nickname = nickname.Length > 0 ? nickname : username;
-            u.department_id = deptId;
-            u.status = 1;
-            u.created_at = now;
-            u.updated_at = now;
-            userDao.Insert(u);
-            this.JsonSuccess("新增用户成功");
-        }
+    /// <summary>声明用户表格规格与列字段、搜索项及操作栏</summary>
+    protected override TableConfig BuildTableConfig() {
+        TableConfig cfg = new TableConfig();
+        cfg.Conf.SetKey("id", "系统用户");
+        cfg.AddColumn("id", "ID", "number", 60, true, false)
+           .AddColumn("username", "用户名", "input", 140, true, false)
+           .AddColumn("nickname", "姓名/昵称", "input", 140, true, true)
+           .AddColumn("department_id", "部门编号", "number", 100, false, false)
+           .AddColumn("status", "状态", "dict", 80, false, true)
+           .AddColumn("created_at", "创建时间", "datetime", 160, false, false)
+           .AddFilter("username", "用户名", "Input", "请输入用户名搜索")
+           .AddFilter("nickname", "姓名", "Input", "请输入姓名搜索")
+           .AddTool("新增用户", "Add", "用户", "Primary", false, "600px", "420px")
+           .AddTool("批量删除", "Delete", "用户", "Error", true, "400px", "260px");
+        return cfg;
     }
 
-    [HttpPost]
-    [Route("/admin/sys/user/delete")]
-    public void Delete() {
-        string idStr = this.In("id");
-        if (idStr.Length == 0) {
-            this.JsonFail("缺少用户 ID");
-            return;
+    /// <summary>声明新增与编辑用户动态表单规格</summary>
+    protected override FormView BuildFormView() {
+        FormView form = new FormView("系统用户");
+        form.AddField("username", "用户名", "input", true, "登录用户名", 12)
+            .AddField("password_hash", "登录密码", "password", true, "请输入密码（不少于6位）", 12)
+            .AddField("nickname", "姓名/昵称", "input", true, "显示昵称", 12)
+            .AddField("department_id", "归属部门", "number", true, "所属部门编号", 12);
+        return form;
+    }
+
+    /// <summary>分页数据检索（集成 DataScope 数据权限过滤）</summary>
+    protected override string OnPage(int page, int pageSize) {
+        List<SysUser> all = this.dao.Page(page, pageSize);
+        List<SysUser> filtered = new List<SysUser>();
+        DataScope scope = this.CurrentDataScope;
+        for (int i = 0; i < all.Count; i = i + 1) {
+            SysUser u = all[i];
+            if (scope.Covers(u.id, u.department_id)) {
+                filtered.Add(u);
+            }
         }
-        int id = Convert.ToInt32(idStr);
+        UserPagedResult res = new UserPagedResult(filtered.Count, filtered);
+        return Json.Serialize<UserPagedResult>(res);
+    }
+
+    /// <summary>新增用户保存业务逻辑</summary>
+    protected override int OnInsert(SysUser entity) {
+        if (entity.username.Length == 0) {
+            return 0;
+        }
+        if (this.dao.ExistsUsername(entity.username)) {
+            return 0;
+        }
+        long now = DateTime.UtcNow().ToUnixSeconds();
+        if (entity.password_hash.Length > 0 && !entity.password_hash.StartsWith("$zan$")) {
+            entity.password_hash = SchemaMigrator.HashPassword(entity.password_hash, "zan_salt_");
+        }
+        if (entity.nickname.Length == 0) {
+            entity.nickname = entity.username;
+        }
+        if (entity.status == 0) {
+            entity.status = 1;
+        }
+        entity.created_at = now;
+        entity.updated_at = now;
+        return this.dao.Insert(entity);
+    }
+
+    /// <summary>更新用户保存业务逻辑</summary>
+    protected override int OnUpdate(SysUser entity) {
+        SysUser u = this.dao.FindById(entity.id);
+        if (u == null) {
+            return 0;
+        }
+        u.nickname = entity.nickname;
+        u.department_id = entity.department_id;
+        u.status = entity.status;
+        if (entity.password_hash.Length >= 6 && !entity.password_hash.StartsWith("$zan$")) {
+            u.password_hash = SchemaMigrator.HashPassword(entity.password_hash, "zan_salt_");
+        }
+        u.updated_at = DateTime.UtcNow().ToUnixSeconds();
+        return this.dao.Update(u);
+    }
+
+    /// <summary>删除用户业务逻辑（禁止删除超级管理员）</summary>
+    protected override void OnDelete(int id) {
         if (id == 1) {
-            this.JsonFail("超级管理员账号不可删除");
             return;
         }
+        this.dao.DeleteById(id);
+    }
 
-        IDbConnection conn = AdminApp.Db;
-        if (conn == null) { conn = AdminApp.OpenDb(); }
-        SysUserDao userDao = SysUserDao.Of(conn);
-        userDao.DeleteById(id);
-
-        this.JsonSuccess("删除成功");
+    /// <summary>行内即时编辑修改安全落地</summary>
+    protected override bool OnField(int id, string fieldName, string fieldValue) {
+        SysUser user = this.dao.FindById(id);
+        if (user == null) {
+            return false;
+        }
+        if (fieldName == "nickname") {
+            user.nickname = fieldValue;
+        } else if (fieldName == "status") {
+            user.status = Convert.ToInt32(fieldValue);
+        } else {
+            return false;
+        }
+        user.updated_at = DateTime.UtcNow().ToUnixSeconds();
+        return this.dao.Update(user) > 0;
     }
 }

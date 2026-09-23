@@ -819,6 +819,10 @@ static void gm_export_type(zan_ast_node_t *decl, json_value *classes) {
         json_obj_set(o, "kind", json_new_str(
             decl->kind == AST_CLASS_DECL ? "class" :
             decl->kind == AST_STRUCT_DECL ? "struct" : "interface"));
+        json_obj_set(o, "abstract", json_new_bool(
+            (decl->type_decl.modifiers & MOD_ABSTRACT) != 0));
+        json_obj_set(o, "generic", json_new_bool(
+            decl->type_decl.type_params.count > 0));
         if (decl->orig_name.len)
             json_obj_set(o, "orig", json_new_str(
                 decl->orig_name.str ? (const char *)decl->orig_name.str : ""));
