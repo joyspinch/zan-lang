@@ -241,6 +241,45 @@ static int zip_finish(zip_t *z) {
  * manifest end-element chunk. The resource-id map is keyed by attribute
  * pool index and "name" already exists, so nothing there changes. */
 
+/* ResStringPool length prefix: 8 bits below 128, else two bytes
+ * "0x80 | (v >> 8), v & 0xFF". Returns the number of bytes written. */
+static size_t pool_put_len(unsigned char *out, size_t v) {
+    if (v < 128) { out[0] = (unsigned char)v; return 1; }
+    out[0] = (unsigned char)(0x80 | (v >> 8));
+    out[1] = (unsigned char)(v & 0xFF);
+    return 2;
+}
+
+/* UTF-16 code units of a UTF-8 string (surrogate pairs count as 2) — the
+ * value of the u16len prefix on UTF-8 pool entries. */
+static size_t utf8_utf16_units(const char *s, size_t bytes) {
+    size_t units = 0, c = 0;
+    while (c < bytes) {
+        unsigned char b0 = (unsigned char)s[c];
+        uint32_t cp = b0;
+        size_t adv = 1;
+        if ((b0 & 0xE0) == 0xC0 && c + 1 < bytes) {
+            cp = ((uint32_t)(b0 & 0x1F) << 6)
+               | ((unsigned char)s[c + 1] & 0x3F);
+            adv = 2;
+        } else if ((b0 & 0xF0) == 0xE0 && c + 2 < bytes) {
+            cp = ((uint32_t)(b0 & 0x0F) << 12)
+               | (((uint32_t)(unsigned char)s[c + 1] & 0x3F) << 6)
+               | ((unsigned char)s[c + 2] & 0x3F);
+            adv = 3;
+        } else if ((b0 & 0xF8) == 0xF0 && c + 3 < bytes) {
+            cp = ((uint32_t)(b0 & 0x07) << 18)
+               | (((uint32_t)(unsigned char)s[c + 1] & 0x3F) << 12)
+               | (((uint32_t)(unsigned char)s[c + 2] & 0x3F) << 6)
+               | ((unsigned char)s[c + 3] & 0x3F);
+            adv = 4;
+        }
+        units += cp >= 0x10000 ? 2 : 1;
+        c += adv;
+    }
+    return units;
+}
+
 static int axml_patch(const unsigned char *xml, size_t xml_len,
                       const char *package, const char *label,
                       int nperms, const char (*perms)[128],
@@ -285,36 +324,54 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
     for (uint32_t i = 0; i < str_count; i++) {
         size_t p = (size_t)(base - pool) + offs[i];
         if (p >= first_size) return -1;
+        size_t hl = 1;                /* length-prefix bytes */
+        size_t n = 0;                 /* string length in pool data units */
+        size_t rl;                    /* raw entry: prefixes + data + term */
         if (utf8) {
-            uint16_t u16n, u8n;
-            memcpy(&u8n, pool + p, 1); u8n = pool[p];       /* chars (8-bit) */
-            memcpy(&u16n, pool + p + 1, 1);
-            /* handle the two forms: 8-bit or 16-bit length prefix */
-            if (pool[p] & 0x80) return -1; /* long strings unsupported */
-            size_t n = pool[p];
-            size_t hl = 1;
-            /* aapt2 writes len8 then data; but some encoders use len16 */
-            memcpy(text[i], pool + p + hl, n < 255 ? n : 255);
-            text[i][n < 255 ? n : 255] = '\0';
-            raw_len[i] = hl + n + 1; /* len + data + nul */
-            raw[i] = (unsigned char *)malloc(raw_len[i] ? raw_len[i] : 1);
-            if (!raw[i]) zan_host_oom();
-            memcpy(raw[i], pool + p, raw_len[i]);
+            /* UTF-8 entries carry TWO length prefixes — UTF-16 unit count
+             * then UTF-8 byte count — each 8-bit, or widened to 16-bit
+             * "0x80 | hi, lo" once the value reaches 128 (aapt2 spec). */
+            size_t hl2 = 1;
+            n = pool[p];
+            if (n & 0x80) { n = ((n & 0x7F) << 8) | pool[p + 1]; hl = 2; }
+            size_t nb = pool[p + hl];
+            if (nb & 0x80) {
+                nb = ((nb & 0x7F) << 8) | pool[p + hl + 1];
+                hl2 = 2;
+            }
+            if (p + hl + hl2 + nb + 1 > first_size) return -1;
+            size_t keep = nb < 255 ? nb : 255;
+            memcpy(text[i], pool + p + hl + hl2, keep);
+            text[i][keep] = '\0';
+            rl = hl + hl2 + nb + 1;
         } else {
-            uint16_t n;
-            memcpy(&n, pool + p, 2);
+            uint16_t n16;
+            memcpy(&n16, pool + p, 2);
+            hl = 2;
+            if (n16 & 0x8000) {       /* 32-bit length form at 0x8000+ */
+                uint16_t n16b;
+                memcpy(&n16b, pool + p + 2, 2);
+                n = ((size_t)(n16 & 0x7FFF) << 16) | n16b;
+                hl = 4;
+            } else {
+                n = n16;
+            }
+            if (p + hl + n * 2 + 2 > first_size) return -1;
             size_t chars = n < 255 ? n : 255;
             for (size_t c = 0; c < chars; c++) {
                 uint16_t ch;
-                memcpy(&ch, pool + p + 2 + c * 2, 2);
+                memcpy(&ch, pool + p + hl + c * 2, 2);
                 text[i][c] = (char)(ch < 128 ? ch : '?');
             }
             text[i][chars] = '\0';
-            raw_len[i] = 2 + (size_t)n * 2 + 2;
-            raw[i] = (unsigned char *)malloc(raw_len[i] ? raw_len[i] : 1);
-            if (!raw[i]) zan_host_oom();
-            memcpy(raw[i], pool + p, raw_len[i]);
+            rl = hl + n * 2 + 2;
         }
+        /* untouched strings must survive the rebuild byte-exact, so keep the
+         * raw entry (prefixes + data + terminator) instead of re-encoding */
+        raw_len[i] = rl;
+        raw[i] = (unsigned char *)malloc(rl);
+        if (!raw[i]) zan_host_oom();
+        memcpy(raw[i], pool + p, rl);
     }
 
     /* locate package + label by value; the template holds exactly one of each */
@@ -326,7 +383,7 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
     if (pkg_i < 0) { fprintf(stderr, "error: template manifest lacks the "
                              "package placeholder\n"); return -1; }
 
-    /* replace helper: build "len + utf16 + nul" (or utf8 form) */
+    /* replacement entries: pool-encoded package/label blobs */
     unsigned char repl[2][1200];
     size_t repl_len[2];
     const char *vals[2] = { package, label };
@@ -335,15 +392,32 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
         if (slots[v] < 0) { repl_len[v] = 0; continue; }
         size_t n = strlen(vals[v]);
         if (utf8) {
-            repl[v][0] = (unsigned char)n;
-            memcpy(repl[v] + 1, vals[v], n);
-            repl[v][1 + n] = 0;
-            repl_len[v] = 1 + n + 1;
+            /* spec entry: UTF-16 unit count prefix, UTF-8 byte count prefix,
+             * data, nul — both prefixes widen at 128 */
+            size_t units = utf8_utf16_units(vals[v], n);
+            if (4 + n + 1 > sizeof(repl[v])) {
+                fprintf(stderr, "error: manifest string replacement "
+                        "(%zu bytes) exceeds the pool entry buffer\n", n);
+                return -1;
+            }
+            size_t dl = pool_put_len(repl[v], units);
+            dl += pool_put_len(repl[v] + dl, n);
+            memcpy(repl[v] + dl, vals[v], n);
+            dl += n;
+            repl[v][dl++] = 0;
+            repl_len[v] = dl;
         } else {
             /* pool is UTF-16: decode UTF-8 input to UTF-16LE code units so
-             * non-ASCII labels (zan.proj is UTF-8) survive the patch */
+             * non-ASCII labels (zan.proj is UTF-8) survive the patch. Every
+             * input byte expands to at most two output bytes (a 4-byte char
+             * yields a surrogate pair), so 2 + 2n + 2 bounds the entry. */
+            if (4 + n * 2 > sizeof(repl[v])) {
+                fprintf(stderr, "error: manifest string replacement "
+                        "(%zu bytes) exceeds the pool entry buffer\n", n);
+                return -1;
+            }
             size_t out = 0;
-            for (size_t c = 0; c < n && out + 4 <= sizeof(repl[v]) - 4; ) {
+            for (size_t c = 0; c < n; ) {
                 unsigned char b0 = (unsigned char)vals[v][c];
                 uint32_t cp = b0;
                 size_t adv = 1;

@@ -714,8 +714,12 @@ static void resolve_package_project_root(const char *input) {
  * `skins = 1` adds every pack named in `skinlist = a,b,c`. `skins = -` or
  * `skinlist = -` ships the baseline only (the historical default when the
  * keys are absent matches the IDE: baseline only). */
-static char proj_android_package[128];
-static char proj_android_label[128];
+/* Package/label get 256 bytes (aapt accepts names up to 255 chars); the
+ * parser refuses over-long values instead of silently truncating them into
+ * a wrong-but-plausible APK manifest (see proj_android_keys_ok). */
+static char proj_android_package[256];
+static char proj_android_label[256];
+static bool proj_android_keys_ok = true;
 static char proj_android_perms[16][128];
 static int proj_android_perm_count = 0;
 static char proj_skin_names[16][64];
@@ -751,22 +755,46 @@ static void load_proj_android_keys(void) {
         if (strcmp(key, "skins") == 0) {
             proj_skins_enabled = strcmp(val, "1") == 0;
         } else if (strcmp(key, "androidPackage") == 0) {
-            snprintf(proj_android_package, sizeof(proj_android_package), "%s", val);
+            if (strlen(val) >= sizeof(proj_android_package)) {
+                fprintf(stderr, "error: zan.proj androidPackage exceeds "
+                        "%zu bytes\n", sizeof(proj_android_package) - 1);
+                proj_android_keys_ok = false;
+            } else {
+                snprintf(proj_android_package,
+                         sizeof(proj_android_package), "%s", val);
+            }
         } else if (strcmp(key, "androidLabel") == 0) {
-            snprintf(proj_android_label, sizeof(proj_android_label), "%s", val);
+            if (strlen(val) >= sizeof(proj_android_label)) {
+                fprintf(stderr, "error: zan.proj androidLabel exceeds "
+                        "%zu bytes\n", sizeof(proj_android_label) - 1);
+                proj_android_keys_ok = false;
+            } else {
+                snprintf(proj_android_label,
+                         sizeof(proj_android_label), "%s", val);
+            }
         } else if (strcmp(key, "androidPermissions") == 0) {
             char *save = NULL;
             char *tok = strtok_r(val, ",", &save);
-            while (tok && proj_android_perm_count < 16) {
+            while (tok) {
                 char *p = proj_trim(tok);
                 if (*p) {
-                    char *dst = proj_android_perms[proj_android_perm_count];
-                    if (strncmp(p, "android.permission.", 19) == 0) {
-                        snprintf(dst, 128, "%s", p);
-                    } else {
-                        snprintf(dst, 128, "android.permission.%s", p);
+                    if (proj_android_perm_count >= 16) {
+                        fprintf(stderr, "error: zan.proj androidPermissions: "
+                                "more than 16 entries\n");
+                        proj_android_keys_ok = false;
+                        break;
                     }
-                    proj_android_perm_count++;
+                    char *dst = proj_android_perms[proj_android_perm_count];
+                    int wn = strncmp(p, "android.permission.", 19) == 0
+                           ? snprintf(dst, 128, "%s", p)
+                           : snprintf(dst, 128, "android.permission.%s", p);
+                    if (wn >= 128) {
+                        fprintf(stderr, "error: zan.proj androidPermissions: "
+                                "'%s' exceeds 127 bytes\n", p);
+                        proj_android_keys_ok = false;
+                    } else {
+                        proj_android_perm_count++;
+                    }
                 }
                 tok = strtok_r(NULL, ",", &save);
             }
@@ -4379,8 +4407,11 @@ int main(int argc, char **argv) {
          * project's zan.proj so publishing needs no extra CLI flags.
          * CLI overrides keep precedence. */
         if (project_root_has_manifest()) {
-            load_proj_android_keys();
-            load_proj_android_keys_done = true;
+            if (!load_proj_android_keys_done) {
+                load_proj_android_keys();
+                load_proj_android_keys_done = true;
+            }
+            if (!proj_android_keys_ok) return 1;
             if (!apk_package && proj_android_package[0]) {
                 apk_package = proj_android_package;
             }
