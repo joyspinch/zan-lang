@@ -29,18 +29,88 @@ static double get_time_ms(void) {
 
 /* ---- ARC optimization ---- */
 
-static bool is_arc_call(LLVMValueRef inst, const char *name) {
-    if (LLVMGetInstructionOpcode(inst) != LLVMCall) return false;
+typedef enum {
+    ARC_NONE = 0,
+    ARC_RETAIN_OBJ,
+    ARC_RELEASE_OBJ,
+    ARC_RETAIN_STR,
+    ARC_RELEASE_STR,
+} zan_arc_call_kind_t;
+
+static zan_arc_call_kind_t get_arc_call_kind(LLVMValueRef inst) {
+    if (!inst || LLVMGetInstructionOpcode(inst) != LLVMCall) return ARC_NONE;
     LLVMValueRef callee = LLVMGetCalledValue(inst);
-    if (!callee) return false;
+    if (!callee) return ARC_NONE;
     const char *fn_name = LLVMGetValueName(callee);
-    if (!fn_name) return false;
-    return strcmp(fn_name, name) == 0;
+    if (!fn_name) return ARC_NONE;
+    if (strcmp(fn_name, "zan_rt_retain") == 0 || strcmp(fn_name, "zan_retain") == 0)
+        return ARC_RETAIN_OBJ;
+    if (strcmp(fn_name, "zan_rt_release") == 0 || strcmp(fn_name, "zan_rt_release_dyn") == 0 ||
+        strcmp(fn_name, "zan_release") == 0)
+        return ARC_RELEASE_OBJ;
+    if (strcmp(fn_name, "zan_rt_str_retain") == 0)
+        return ARC_RETAIN_STR;
+    if (strcmp(fn_name, "zan_rt_str_release") == 0)
+        return ARC_RELEASE_STR;
+    return ARC_NONE;
+}
+
+static LLVMValueRef strip_pointer_casts(LLVMValueRef v) {
+    int depth = 0;
+    while (v && LLVMIsAInstruction(v) && depth < 16) {
+        LLVMOpcode op = LLVMGetInstructionOpcode(v);
+        if (op == LLVMBitCast || op == LLVMAddrSpaceCast) {
+            v = LLVMGetOperand(v, 0);
+            depth++;
+        } else {
+            break;
+        }
+    }
+    return v;
 }
 
 static LLVMValueRef get_arc_operand(LLVMValueRef call) {
-    if (LLVMGetNumOperands(call) < 1) return NULL;
-    return LLVMGetOperand(call, 0);
+    if (!call || LLVMGetNumOperands(call) < 1) return NULL;
+    return strip_pointer_casts(LLVMGetOperand(call, 0));
+}
+
+static bool is_safe_arc_intermediate(LLVMValueRef inst, LLVMValueRef target_obj) {
+    if (!inst) return false;
+    LLVMOpcode opcode = LLVMGetInstructionOpcode(inst);
+
+    /* Terminators are not safe: do not cross basic block boundaries */
+    if (LLVMIsATerminatorInst(inst)) return false;
+
+    /* Calls are unsafe unless they are ARC calls on different objects */
+    if (opcode == LLVMCall) {
+        zan_arc_call_kind_t k = get_arc_call_kind(inst);
+        if (k != ARC_NONE) {
+            LLVMValueRef op = get_arc_operand(inst);
+            /* If it operates on the same object, stop: must pair in program order */
+            if (op == target_obj) return false;
+            /* ARC calls on other objects do not mutate target_obj's refcount */
+            return true;
+        }
+        return false;
+    }
+
+    /* Store: safe only if target_obj itself is not being stored */
+    if (opcode == LLVMStore) {
+        LLVMValueRef val = LLVMGetOperand(inst, 0);
+        if (strip_pointer_casts(val) == target_obj) {
+            return false; /* Object stored to memory, potentially escaping */
+        }
+        return true;
+    }
+
+    /* Atomic operations and fences: unsafe */
+    if (opcode == LLVMFence || opcode == LLVMAtomicRMW || opcode == LLVMAtomicCmpXchg) {
+        return false;
+    }
+
+    /* Pure arithmetic, logical, bitwise, comparison, selection,
+     * addressing, casting, extraction, and local load instructions are safe. */
+    return true;
 }
 
 zan_arc_opt_stats_t zan_opt_arc(zan_irgen_t *g, zan_opt_level_t level) {
@@ -56,32 +126,59 @@ zan_arc_opt_stats_t zan_opt_arc(zan_irgen_t *g, zan_opt_level_t level) {
             LLVMValueRef inst = LLVMGetFirstInstruction(bb);
             while (inst) {
                 LLVMValueRef next = LLVMGetNextInstruction(inst);
+                zan_arc_call_kind_t k1 = get_arc_call_kind(inst);
 
-                /* Pattern: retain(x) followed by release(x) */
-                if (next && is_arc_call(inst, "zan_retain") && is_arc_call(next, "zan_release")) {
-                    LLVMValueRef op1 = get_arc_operand(inst);
-                    LLVMValueRef op2 = get_arc_operand(next);
-                    if (op1 && op2 && op1 == op2) {
-                        LLVMValueRef after_next = LLVMGetNextInstruction(next);
-                        LLVMInstructionEraseFromParent(next);
+                /* Eliminate no-op ARC operations on null pointers */
+                if (k1 != ARC_NONE) {
+                    LLVMValueRef op = get_arc_operand(inst);
+                    if (op && (LLVMIsNull(op) || (LLVMIsAConstant(op) && LLVMIsNull(op)))) {
                         LLVMInstructionEraseFromParent(inst);
                         stats.pairs_elided++;
-                        inst = after_next;
+                        inst = next;
                         continue;
                     }
                 }
 
-                /* Pattern: release(x) followed by retain(x) */
-                if (next && is_arc_call(inst, "zan_release") && is_arc_call(next, "zan_retain")) {
+                /* Eliminate redundant pairs: retain(x) followed by release(x) within safe window */
+                if (k1 == ARC_RETAIN_OBJ || k1 == ARC_RETAIN_STR) {
                     LLVMValueRef op1 = get_arc_operand(inst);
-                    LLVMValueRef op2 = get_arc_operand(next);
-                    if (op1 && op2 && op1 == op2) {
-                        LLVMValueRef after_next = LLVMGetNextInstruction(next);
-                        LLVMInstructionEraseFromParent(next);
-                        LLVMInstructionEraseFromParent(inst);
-                        stats.pairs_elided++;
-                        inst = after_next;
-                        continue;
+                    if (op1) {
+                        LLVMValueRef curr = next;
+                        int steps = 0;
+                        const int MAX_ARC_WINDOW = 64;
+                        LLVMValueRef match_release = NULL;
+
+                        while (curr && steps < MAX_ARC_WINDOW) {
+                            zan_arc_call_kind_t k2 = get_arc_call_kind(curr);
+                            if (k2 != ARC_NONE) {
+                                LLVMValueRef op2 = get_arc_operand(curr);
+                                if (op1 == op2) {
+                                    if ((k1 == ARC_RETAIN_OBJ && k2 == ARC_RELEASE_OBJ) ||
+                                        (k1 == ARC_RETAIN_STR && k2 == ARC_RELEASE_STR)) {
+                                        match_release = curr;
+                                    }
+                                    break;
+                                }
+                            }
+
+                            if (!is_safe_arc_intermediate(curr, op1)) {
+                                break;
+                            }
+                            curr = LLVMGetNextInstruction(curr);
+                            steps++;
+                        }
+
+                        if (match_release) {
+                            LLVMValueRef after_retain = LLVMGetNextInstruction(inst);
+                            if (after_retain == match_release) {
+                                after_retain = LLVMGetNextInstruction(match_release);
+                            }
+                            LLVMInstructionEraseFromParent(match_release);
+                            LLVMInstructionEraseFromParent(inst);
+                            stats.pairs_elided++;
+                            inst = after_retain;
+                            continue;
+                        }
                     }
                 }
 
@@ -153,7 +250,13 @@ static bool value_escapes(LLVMValueRef alloc, LLVMValueRef fn) {
         case LLVMCall: {
             LLVMValueRef callee = LLVMGetCalledValue(user);
             const char *name = callee ? LLVMGetValueName(callee) : NULL;
-            if (name && (strcmp(name, "zan_retain") == 0 || strcmp(name, "zan_release") == 0))
+            if (name && (strcmp(name, "zan_retain") == 0 ||
+                         strcmp(name, "zan_rt_retain") == 0 ||
+                         strcmp(name, "zan_release") == 0 ||
+                         strcmp(name, "zan_rt_release") == 0 ||
+                         strcmp(name, "zan_rt_release_dyn") == 0 ||
+                         strcmp(name, "zan_rt_str_retain") == 0 ||
+                         strcmp(name, "zan_rt_str_release") == 0))
                 break;
             return true;
         }
@@ -185,7 +288,7 @@ zan_escape_stats_t zan_opt_escape_analysis(zan_irgen_t *g) {
                 if (LLVMGetInstructionOpcode(inst) == LLVMCall) {
                     LLVMValueRef callee = LLVMGetCalledValue(inst);
                     const char *name = callee ? LLVMGetValueName(callee) : NULL;
-                    if (name && strcmp(name, "zan_alloc") == 0) {
+                    if (name && (strcmp(name, "zan_alloc") == 0 || strcmp(name, "zan_rt_alloc") == 0)) {
                         if (!value_escapes(inst, fn)) {
                             stats.objects_stack_allocated++;
                         }
@@ -404,6 +507,19 @@ void zan_opt_strip_unused(zan_irgen_t *g) {
     LLVMDisposePassBuilderOptions(opts);
 }
 
+static void zan_opt_early_mem2reg(zan_irgen_t *g) {
+    LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
+    LLVMPassBuilderOptionsSetVerifyEach(opts, 0);
+    LLVMPassBuilderOptionsSetDebugLogging(opts, 0);
+    LLVMErrorRef err = LLVMRunPasses(g->mod, "sroa,early-cse", NULL, opts);
+    if (err) {
+        char *msg = LLVMGetErrorMessage(err);
+        fprintf(stderr, "warning: LLVM early sroa error: %s\n", msg);
+        LLVMDisposeErrorMessage(msg);
+    }
+    LLVMDisposePassBuilderOptions(opts);
+}
+
 /* ---- Combined pipeline ---- */
 
 zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder, zan_opt_level_t level) {
@@ -413,6 +529,7 @@ zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder, zan_opt_leve
 
     double t0 = get_time_ms();
 
+    zan_opt_early_mem2reg(g);
     report.arc = zan_opt_arc(g, level);
     report.devirt = zan_opt_devirtualize(g, binder);
     report.escape = zan_opt_escape_analysis(g);
