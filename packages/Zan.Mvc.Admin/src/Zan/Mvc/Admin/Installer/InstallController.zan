@@ -1,9 +1,9 @@
 using System;
 using System.IO;
-using System.Text;
 using System.Web;
 using System.Data;
 using System.Data.SQLite;
+using System.Json;
 using Zan.Mvc.Admin.Web;
 
 namespace Zan.Mvc.Admin.Installer;
@@ -23,7 +23,7 @@ public class InstallController : Controller {
 
         // 读取或渲染安装界面 HTML
         string html = GetInstallerHtml();
-        this.Ok(html, "text/html; charset=utf-8");
+        this.Html(html);
     }
 
     [HttpPost]
@@ -35,17 +35,25 @@ public class InstallController : Controller {
         }
 
         SystemProbeResult probe = SystemProbe.Check();
-        StringBuilder sb = new StringBuilder();
-        sb.Append("{\"code\":\"0000\",\"data\":{\"passed\":");
-        sb.Append(probe.AllPassed ? "true" : "false");
-        sb.Append(",\"items\":[");
+        JsonValue root = JsonValue.NewObject();
+        root.PutStr("code", "0000");
+
+        JsonValue dataObj = JsonValue.NewObject();
+        dataObj.PutBool("passed", probe.AllPassed);
+
+        JsonValue itemsArr = JsonValue.NewArray();
         for (int i = 0; i < probe.Items.Count; i = i + 1) {
             ProbeItem item = probe.Items[i];
-            if (i > 0) sb.Append(",");
-            sb.Append("{\"name\":\"" + item.Name + "\",\"status\":\"" + item.Current + "\",\"passed\":" + (item.Passed ? "true" : "false") + "}");
+            JsonValue jItem = JsonValue.NewObject();
+            jItem.PutStr("name", item.Name);
+            jItem.PutStr("status", item.Current);
+            jItem.PutBool("passed", item.Passed);
+            itemsArr.Append(jItem);
         }
-        sb.Append("]}}");
-        this.Ok(sb.ToString(), "application/json");
+        dataObj.Put("items", itemsArr);
+        root.Put("data", dataObj);
+
+        this.Json(root.ToJson());
     }
 
     [HttpPost]
@@ -66,7 +74,7 @@ public class InstallController : Controller {
         }
         string adminPass = this.In("adminPass");
         if (adminPass.Length < 6) {
-            this.Ok("{\"code\":\"9999\",\"msg\":\"管理员密码长度不能小于 6 位\"}", "application/json");
+            this.SendJson("9999", "管理员密码长度不能小于 6 位");
             return;
         }
 
@@ -83,26 +91,43 @@ public class InstallController : Controller {
                 string err;
                 bool ok = SchemaMigrator.ExecuteInstall(conn, adminUser, adminPass, out err);
                 if (!ok) {
-                    this.Ok("{\"code\":\"9999\",\"msg\":\"DDL 执行失败: " + err + "\"}", "application/json");
+                    this.SendJson("9999", "DDL 执行失败: " + err);
                     return;
                 }
             }
 
-            // 写入配置文件
+            // 写入配置文件（通过 System.Json 安全生成）
             if (!Directory.Exists("config")) {
                 Directory.CreateDirectory("config");
             }
-            string configJson = "{\n  \"db\": {\n    \"type\": \"sqlite\",\n    \"path\": \"" + dbPath.Replace("\\", "/") + "\"\n  },\n  \"app\": {\n    \"name\": \"Zan Admin Platform\",\n    \"installed\": true\n  }\n}\n";
-            File.WriteAllText("config/app.json", configJson);
+            JsonValue cfgRoot = JsonValue.NewObject();
+            JsonValue dbObj = JsonValue.NewObject();
+            dbObj.PutStr("type", "sqlite");
+            dbObj.PutStr("path", dbPath.Replace("\\", "/"));
+            cfgRoot.Put("db", dbObj);
+
+            JsonValue appObj = JsonValue.NewObject();
+            appObj.PutStr("name", "Zan Admin Platform");
+            appObj.PutBool("installed", true);
+            cfgRoot.Put("app", appObj);
+
+            File.WriteAllText("config/app.json", cfgRoot.ToJson());
 
             // 写入 install.lock 物理安全锁
             string lockContent = "Installed at " + DateTime.UtcNow().ToString() + " by " + adminUser + "\n";
             File.WriteAllText(InstallGateMiddleware.LOCK_FILE, lockContent);
 
-            this.Ok("{\"code\":\"0000\",\"msg\":\"安装成功！\"}", "application/json");
+            this.SendJson("0000", "安装成功！");
         } catch (Exception ex) {
-            this.Ok("{\"code\":\"9999\",\"msg\":\"安装异常: " + ex.Message + "\"}", "application/json");
+            this.SendJson("9999", "安装异常: " + ex.Message);
         }
+    }
+
+    private void SendJson(string code, string msg) {
+        JsonValue root = JsonValue.NewObject();
+        root.PutStr("code", code);
+        root.PutStr("msg", msg);
+        this.Json(root.ToJson());
     }
 
     private string GetInstallerHtml() {
