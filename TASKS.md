@@ -177,6 +177,9 @@
 
 ## 近期专项闭账记录（2026-09-09 ~ 2026-09-22 全部完成）
 
+* **A342 · nullable→字符串双通道 verifier 崩溃** ✅ `Convert.ToString(T?)` 与插值 `"{x}"` 的自建分支链把 `zan.nullable.<payload>` 结构按值递进 `__zan_itoa64`（拼接/打印路径有解包、这两条没有），LLVM verifier 拒绝模块（"Call parameter type does not match"）；修复=两处统一改走 `emit_to_cstr_u` 的 nullable 分支（some 格式化载荷、none 空串，与 `+` 拼接同一实现，none 臂分配新鲜空串保证 owned 精确），`.ToString()` 直调维持 checker 拦截诊断。`nullable_tostring` conformance 锁定 some/none × int?/double?/ulong?（提交 `9e0daec5`，2026-09-23）。
+* **A343 · 多 worker 驱动程序化配置死管道** ✅ `zan_async_set_workers/io_shards/sync_fast`（rt_timer.c）自落地起无任何消费点：Zan 侧 `System.Threading.AsyncRuntime` 类从未存在（rt_co.h 注释承诺与实现相反），驱动只读 `ZAN_CO_WORKERS/ZAN_IO_SHARDS/ZAN_IO_SYNCFAST` 环境变量，且 worker 数在 `zan_co_sched_init` 固化快照、Main 内设置天然晚到。修复=stdlib 新增 `System/Threading/AsyncRuntime.zan`（DllImport crt 直连 setter/getter）、`zan_co_sched_run` 与 `co_pool_start_background` 两个池启动点重解析 `co_worker_count`（cfg 优先、env 回退、CPU 兜底；io_shards/syncfast 惰性读点本就在 Main 之后）。A/B 实证：`SetWorkers(1)` + `ZAN_CO_WORKERS=8` 环境下 8×50000 无同步计数精确 400000（对照 8 workers 丢失至 15~22 万）（提交 `9e0daec5`，2026-09-23）。
+* **测试门禁三缺口（随 A342/A343 同批）** ✅ ctest 分层正则无 `unit_` 前缀致 `unit_json_oom/unit_json_trailing/unit_rpc_framing` 永远只挂 full 标签（smoke/standard 形同虚设）——正则补 `unit_` 入 smoke+standard；Windows CI 构建集（仅 zanc+zanrt_sync_selfhost）与测试花名册不对称——构建行补三纯 C 单测目标；`-E` 过滤器清除已无注册项的 `dm_database`；ZANC_CLI.md 撤除已不存在的 `--async-workers/--mt` 旗标行，改为按目标自动链入 `zanrt_io_mt` + `AsyncRuntime`→env→CPU 的解析顺序说明（提交 `9e0daec5`，2026-09-23）。
 * **server-mvc 冗余第三方前端库清理与 A317 闭账** ✅ 彻底移除 `vue.global.prod` / `naive-ui` / `zan-charts` / `zan-grid` / `zan-layer` 等未用/冗余前端脚本与对应 SPA 壳，回归轻量标准服务端 MVC 架构；关联第三方库缺陷 A317 闭账（2026-09-22）。
 * **LSP 深度完善** ✅ 文档优先类型补全、增量 didChange、诊断工作线程与 using 命名空间补全全通（2026-09-09）。
 * **ZanIDE 启动稳定性** ✅ 修复启动中间产物竞态段错误，确立 IDE 崩溃日志自愈标准（2026-09-09）。
