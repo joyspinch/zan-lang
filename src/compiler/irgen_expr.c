@@ -6702,6 +6702,8 @@ static LLVMValueRef emit_expr_tuple(zan_irgen_t *g, zan_ast_node_t *expr,
     return alloca;
 }
 
+static zan_ast_node_t *owned_rhs_marker(zan_irgen_t *g, zan_loc_t loc);
+
 static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         /* `FactoryCall(...) { Members = {...} }`: the braces continue a call
@@ -7630,12 +7632,27 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                                             g, fsym, new_inst ? new_inst : sym->type);
                                         if (fsty && is_rc_managed_type(fsty) &&
                                             !(fsym->modifiers & MOD_WEAK)) {
+                                            /* fval from emit_binding_value is
+                                             * freshly owned (+1): the store
+                                             * must move it, not consult the
+                                             * raw rhs (a literal/param reads
+                                             * borrowed) or the binding starts
+                                             * at +2 and the exit cascade
+                                             * frees only one -- one leak per
+                                             * `new C { f = v }`. Mirror the
+                                             * plain-assignment path's dummy
+                                             * marker (leakcheck p6 probe). */
                                             emit_rc_store_field(g, fsty, fptr, fval,
-                                                arg->binary.right, locals, 0);
+                                                fval_owned
+                                                    ? owned_rhs_marker(g, arg->binary.right->loc)
+                                                    : arg->binary.right,
+                                                locals, 0);
                                         } else if (fsty && fsty->kind == TYPE_STRUCT &&
                                                    type_contains_collection_rc(g, fsty, 0)) {
                                             emit_struct_field_capture(g, fsty, fptr, fval,
-                                                arg->binary.right, locals);
+                                                fval_owned
+                                                    ? owned_rhs_marker(g, arg->binary.right->loc)
+                                                    : arg->binary.right, locals);
                                         } else {
                                             zan_store_fit(g, fval, fptr);
                                         }

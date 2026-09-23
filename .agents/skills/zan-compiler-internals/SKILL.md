@@ -1847,3 +1847,23 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   与失败用例的**最小形状差**——本轮一眼扫过去是"接收者形态"（局部/
   字段/参数全红，假象），真差异是**类名**（Program vs T）。改类名二分
   一击定位，比读打分代码快一个数量级。
+
+## 合成值进 store 必带 owned 信号：算了没用的 fval_owned = 半截线（A351，2026-09-23）
+
+- **症状**：full 门禁档 leakcheck 孪生红，退出恒剩 1 个 Binding 盒；
+  探针二分只有"对象初始化器写 Binding 字段"这一种形状漏（纯赋值、
+  局部声明、两次普通赋值全绿）。
+- **根因**：`emit_binding_value` 交出 **+1 新盒**，但初始化器路径把
+  **原始 RHS**（字面量/参数=借用）递给 `emit_rc_store_field`——所有权
+  测试跑在 AST 节点上，判定借用再 retain 一次，盒 rc=2 落字段，出口
+  级联只放一次。普通赋值路径靠**换 dummy AST_NEW_EXPR 节点**（
+  `expr_yields_owned_rc_value` 对 NEW 恒真）传递 +1 信号；初始化器里
+  `fval_owned` 标志算了**从没接线**。IR 直读 `--emit-ir` 的
+  `retain %bindobj → store → release old` 序列一锤定音。
+- **铁律**：任何 lowering 合成出 +1 值再走共享 store 路径时，所有权
+  信号必须**随值一起交接**（dummy marker），不能指望 store 路径"知道"
+  调用方上下文；新糖落地时 grep 一遍 `fval_owned`/同形标志是否真被
+  消费——算了没用的标志就是断线的信号。
+- **定位手法**：leakcheck 红先做**形状二分**（删构造器/删初始化器/
+  换局部），一个维度一轮 30 秒；判 ownership 争议直接 `--emit-ir`
+  数 retain/release，比读三层调用链快。
