@@ -1,0 +1,229 @@
+using System;
+using System.IO;
+using System.Json;
+using System.Linq;
+using System.Data.ZanDb;
+
+class Program {
+    static int pass = 0;
+    static int fail = 0;
+
+    static void Check(string name, bool ok) {
+        if (ok) {
+            pass = pass + 1;
+        } else {
+            fail = fail + 1;
+            Console.WriteLine("FAIL: " + name);
+        }
+    }
+
+    static JsonValue Doc(string name, string city, string dept, int age) {
+        JsonValue obj = JsonValue.NewObject();
+        obj.Put("name", JsonValue.NewStr(name));
+        obj.Put("city", JsonValue.NewStr(city));
+        obj.Put("dept", JsonValue.NewStr(dept));
+        obj.Put("age", JsonValue.NewInt(age));
+        string agePad = Convert.ToString(age);
+        if (age < 10) { agePad = "00" + agePad; }
+        else if (age < 100) { agePad = "0" + agePad; }
+        obj.Put("age_str", JsonValue.NewStr(agePad));
+        return obj;
+    }
+
+    static void Clean(string basePath) {
+        File.Delete(basePath);
+        File.Delete(basePath + ".m0");
+        File.Delete(basePath + ".m1");
+        for (int i = 0; i < 40; i = i + 1) {
+            File.Delete(basePath + ".s" + Convert.ToString(i));
+        }
+    }
+
+    static void TestLinq() {
+        // 1. Distinct / DistinctStr
+        List<int> nums = new List<int>();
+        nums.Add(3); nums.Add(1); nums.Add(4); nums.Add(1);
+        nums.Add(5); nums.Add(9); nums.Add(2); nums.Add(6);
+        nums.Add(5); nums.Add(3); nums.Add(5);
+        List<int> distinctNums = nums.Distinct<int>();
+        Check("distinct_int_count", distinctNums.Count == 7);
+        Check("distinct_int_order", distinctNums[0] == 3 && distinctNums[1] == 1 && distinctNums[2] == 4);
+
+        List<string> words = new List<string>();
+        words.Add("apple"); words.Add("banana"); words.Add("apple");
+        words.Add("orange"); words.Add("banana"); words.Add("pear");
+        words.Add("apple"); words.Add("grape");
+        List<string> distinctWords = words.DistinctStr();
+        Check("distinct_str_count", distinctWords.Count == 5);
+        Check("distinct_str_order", distinctWords[0] == "apple" && distinctWords[4] == "grape");
+
+        // 2. GroupBy
+        List<Grouping<string>> groups = words.GroupBy<string>((string w) => w.Length);
+        Check("groupby_count", groups.Count == 3);
+        Grouping<string> g0 = groups[0];
+        Check("groupby_g0", g0.IntKey == 5 && g0.Items.Count == 4 && g0.Items[0] == "apple");
+
+        // 3. In / InStr
+        List<string> allowed = new List<string>();
+        allowed.Add("apple"); allowed.Add("banana"); allowed.Add("cherry");
+        allowed.Add("date"); allowed.Add("fig"); allowed.Add("grape");
+        List<string> matchedWords = words.InStr(allowed);
+        Check("instr_count", matchedWords.Count == 6);
+
+        // 4. TakeTop / TakeTopDescending
+        List<int> raw = new List<int>();
+        for (int i = 100; i >= 1; i = i - 1) {
+            raw.Add(i * 3 % 97);
+        }
+        List<int> top5Asc = raw.TakeTop<int>((int x) => x, 5);
+        Check("taketop_asc_count", top5Asc.Count == 5);
+        bool ascOk = true;
+        for (int i = 0; i < 4; i = i + 1) {
+            if (top5Asc[i] > top5Asc[i + 1]) { ascOk = false; }
+        }
+        Check("taketop_asc_sorted", ascOk);
+
+        List<int> top5Desc = raw.TakeTopDescending<int>((int x) => x, 5);
+        Check("taketop_desc_count", top5Desc.Count == 5);
+        bool descOk = true;
+        for (int i = 0; i < 4; i = i + 1) {
+            if (top5Desc[i] < top5Desc[i + 1]) { descOk = false; }
+        }
+        Check("taketop_desc_sorted", descOk);
+        Check("taketop_k0", raw.TakeTop<int>((int x) => x, 0).Count == 0);
+        Check("taketop_k_gt_n", raw.TakeTop<int>((int x) => x, 200).Count == 100);
+    }
+
+    static void TestZanDb() {
+        string dbPath = "_scratch/test_opt_db.zdb";
+        Clean(dbPath);
+
+        ZanDatabase db = ZanDatabase.Open(dbPath, ZanStore.DUR_SYNC);
+        Collection col = db.GetCollection("staff");
+
+        string[] cities = new string[] { "beijing", "shanghai", "shenzhen", "guangzhou" };
+        string[] depts = new string[] { "dev", "qa", "ops", "sales" };
+
+        for (int i = 0; i < 160; i = i + 1) {
+            string c = cities[i % 4];
+            string d = depts[(i / 4) % 4];
+            int age = 20 + (i * 7) % 40;
+            col.Insert(Doc("emp_" + Convert.ToString(i), c, d, age));
+        }
+
+        col.EnsureIndex("city");
+        col.EnsureIndex("dept");
+        col.EnsureIndex("age_str");
+        Check("indices_ready", col.IndexReady("city") && col.IndexReady("dept") && col.IndexReady("age_str"));
+
+        // 1. 多索引求交 (Index Intersection)
+        List<JsonValue> intersected = col.Query()
+            .WhereEq("city", "beijing")
+            .WhereEq("dept", "dev")
+            .ToList();
+        Check("intersect_count", intersected.Count == 10);
+        bool allMatch = true;
+        for (int i = 0; i < intersected.Count; i = i + 1) {
+            if (intersected[i].Str("city", "") != "beijing" || intersected[i].Str("dept", "") != "dev") {
+                allMatch = false;
+            }
+        }
+        Check("intersect_matched", allMatch);
+
+        // 2. 范围查询下推 (WhereRange)
+        List<JsonValue> ranged = col.Query()
+            .WhereRange("age_str", "020", "025")
+            .ToList();
+        Check("range_nonempty", ranged.Count > 0);
+        bool rangeMatch = true;
+        for (int i = 0; i < ranged.Count; i = i + 1) {
+            string astr = ranged[i].Str("age_str", "");
+            if (String.CompareOrdinal(astr, "020") < 0 || String.CompareOrdinal(astr, "025") > 0) {
+                rangeMatch = false;
+            }
+        }
+        Check("range_valid", rangeMatch);
+
+        // 复合索引等值 + 范围查询
+        List<JsonValue> rangeWithEq = col.Query()
+            .WhereEq("city", "shanghai")
+            .WhereRange("age_str", "020", "030")
+            .ToList();
+        Check("compound_range_nonempty", rangeWithEq.Count > 0);
+        bool compoundMatch = true;
+        for (int i = 0; i < rangeWithEq.Count; i = i + 1) {
+            if (rangeWithEq[i].Str("city", "") != "shanghai") { compoundMatch = false; }
+            string astr = rangeWithEq[i].Str("age_str", "");
+            if (String.CompareOrdinal(astr, "020") < 0 || String.CompareOrdinal(astr, "030") > 0) {
+                compoundMatch = false;
+            }
+        }
+        Check("compound_range_valid", compoundMatch);
+
+        // 3. 无排序 Take 提前终止
+        List<JsonValue> take5 = col.Query().WhereEq("city", "beijing").Take(5).ToList();
+        Check("take_early_termination", take5.Count == 5);
+        JsonValue firstDoc = col.Query().WhereEq("city", "guangzhou").First();
+        Check("first_early_termination", firstDoc != null && firstDoc.Str("city", "") == "guangzhou");
+
+        // 4. Top-K 局部堆排序与全局排序等价性
+        List<JsonValue> top5Age = col.Query()
+            .OrderByInt((JsonValue u) => u.Int("age", 0))
+            .Take(5)
+            .ToList();
+        List<JsonValue> allSortedAge = col.Query()
+            .OrderByInt((JsonValue u) => u.Int("age", 0))
+            .ToList();
+        Check("topk_age_count", top5Age.Count == 5);
+        bool topKMatches = true;
+        for (int i = 0; i < 5; i = i + 1) {
+            if (top5Age[i].Int("age", 0) != allSortedAge[i].Int("age", 0)) {
+                topKMatches = false;
+            }
+        }
+        Check("topk_age_eq_full", topKMatches);
+
+        List<JsonValue> top5AgeDesc = col.Query()
+            .OrderByIntDesc((JsonValue u) => u.Int("age", 0))
+            .Take(5)
+            .ToList();
+        List<JsonValue> allSortedAgeDesc = col.Query()
+            .OrderByIntDesc((JsonValue u) => u.Int("age", 0))
+            .ToList();
+        Check("topk_desc_count", top5AgeDesc.Count == 5);
+        bool topKDescMatches = true;
+        for (int i = 0; i < 5; i = i + 1) {
+            if (top5AgeDesc[i].Int("age", 0) != allSortedAgeDesc[i].Int("age", 0)) {
+                topKDescMatches = false;
+            }
+        }
+        Check("topk_desc_eq_full", topKDescMatches);
+
+        List<JsonValue> top5Str = col.Query()
+            .OrderByStr((JsonValue u) => u.Str("name", ""))
+            .Take(5)
+            .ToList();
+        List<JsonValue> allSortedStr = col.Query()
+            .OrderByStr((JsonValue u) => u.Str("name", ""))
+            .ToList();
+        Check("topk_str_count", top5Str.Count == 5);
+        bool topKStrMatches = true;
+        for (int i = 0; i < 5; i = i + 1) {
+            if (top5Str[i].Str("name", "") != allSortedStr[i].Str("name", "")) {
+                topKStrMatches = false;
+            }
+        }
+        Check("topk_str_eq_full", topKStrMatches);
+
+        db.Close();
+        Clean(dbPath);
+    }
+
+    static void Main() {
+        TestLinq();
+        TestZanDb();
+
+        Console.WriteLine("pass: " + Convert.ToString(pass));
+        Console.WriteLine("fail: " + Convert.ToString(fail));
+    }
+}

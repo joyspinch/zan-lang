@@ -16,20 +16,33 @@ delegate string DocStrKey(JsonValue doc);
 /// 作为过滤器应用。用一个实体而非并行的
 /// 字段/值列表。</summary>
 class EqFilter {
-    string field;
-    string val;
+    public string field;
+    public string val;
 
     /// 私有构造；经 <see cref="DocQuery.WhereEq"/> 创建。
-    EqFilter(string field, string val) {
+    public EqFilter(string field, string val) {
         this.field = field;
         this.val = val;
     }
 }
 
+/// <summary>待处理的范围约束 [lo, hi]（闭区间，序数比较）。</summary>
+class RangeFilter {
+    public string field;
+    public string lo;
+    public string hi;
+
+    public RangeFilter(string field, string lo, string hi) {
+        this.field = field;
+        this.lo = lo;
+        this.hi = hi;
+    }
+}
+
 /// <summary>
 /// 针对 <see cref="Collection"/> 的流畅 LINQ 风格查询：类型安全的 lambda
-/// 谓词、索引加速的等值比较、O(n log n) 归并排序、
-/// Skip/Take 分页。求值推迟到 ToList/First/Count 时才进行。
+/// 谓词、多索引求交加速、范围索引下推、O(n log n) 稳定归并排序与 Top-K 堆优化、
+/// Skip/Take 提前终止分页。求值推迟到 ToList/First/Count 时才进行。
 ///
 ///   List&lt;JsonValue&gt; adults = users.Query()
 ///       .WhereEq("city", "北京")                       // uses 索引 若存在
@@ -42,6 +55,7 @@ class DocQuery {
     Collection col;
     List<DocPredicate> preds;
     List<EqFilter> eqFilters;
+    List<RangeFilter> rangeFilters;
     string idxField;
     string idxValue;
     bool hasIdxEq;
@@ -57,6 +71,7 @@ class DocQuery {
     DocQuery() {
         this.preds = new List<DocPredicate>();
         this.eqFilters = new List<EqFilter>();
+        this.rangeFilters = new List<RangeFilter>();
         this.idxField = "";
         this.idxValue = "";
         this.hasIdxEq = false;
@@ -82,13 +97,12 @@ class DocQuery {
 
     /// <summary>字段等值约束（字符串形式）。当字段有
     /// 二级索引时，候选集来自索引而非
-    /// 全表扫描；否则作为过滤器应用。</summary>
+    /// 全表扫描；若有多个索引字段则自动执行双指针多索引求交。</summary>
     DocQuery WhereEq(string field, string val) {
         if (!this.hasIdxEq && this.col.HasIndex(field)) {
             this.hasIdxEq = true;
             this.idxField = field;
             this.idxValue = val;
-            return this;
         }
         this.eqFilters.Add(new EqFilter(field, val));
         return this;
@@ -97,6 +111,13 @@ class DocQuery {
     /// <summary>字段的整数等值约束。</summary>
     DocQuery WhereEqInt(string field, int val) {
         return WhereEq(field, Convert.ToString(val));
+    }
+
+    /// <summary>字段序数范围约束 [lo, hi]（lo 为空表示无下界，hi 为空表示无上界）。
+    /// 当字段有二级索引时，自动下推至 B+Tree 范围扫描。</summary>
+    DocQuery WhereRange(string field, string lo, string hi) {
+        this.rangeFilters.Add(new RangeFilter(field, lo, hi));
+        return this;
     }
 
     /// 按整数键升序排序（再次调用覆盖先前排序设置）。
@@ -143,25 +164,119 @@ class DocQuery {
         return this;
     }
 
+    // ===== 多索引求交辅助 =====
+
+    /// <summary>两个严格递增的整数 ID 列表的双指针有序求交集：O(A + B)。</summary>
+    static List<int> IntersectSortedIds(List<int> a, List<int> b) {
+        List<int> outp = new List<int>();
+        int i = 0;
+        int j = 0;
+        while (i < a.Count && j < b.Count) {
+            int ai = a[i];
+            int bj = b[j];
+            if (ai == bj) {
+                outp.Add(ai);
+                i = i + 1;
+                j = j + 1;
+            } else if (ai < bj) {
+                i = i + 1;
+            } else {
+                j = j + 1;
+            }
+        }
+        return outp;
+    }
+
     // ===== 执行 =====
 
-    /// 候选集：有索引等值用索引；否则用第一个等值约束做字段扫描
-    /// 缩小范围；再否则取整个集合。
+    /// <summary>候选集检索：
+    /// 1. 若有多个就绪二级索引约束，执行有序双指针求交（Index Intersection）；
+    /// 2. 若单索引就绪，直接索引定位；
+    /// 3. 若无索引，优先使用首个等值约束或范围约束做存储层单字段快筛扫描；
+    /// 4. 否则全表扫描。</summary>
     List<JsonValue> Candidates() {
-        if (this.hasIdxEq) {
-            return this.col.FindByIndex(this.idxField, this.idxValue);
+        // 统计所有已就绪的二级索引条件
+        List<int> readyEq = new List<int>();
+        for (int i = 0; i < this.eqFilters.Count; i = i + 1) {
+            if (this.col.IndexReady(this.eqFilters[i].field)) {
+                readyEq.Add(i);
+            }
         }
+        List<int> readyRange = new List<int>();
+        for (int i = 0; i < this.rangeFilters.Count; i = i + 1) {
+            if (this.col.IndexReady(this.rangeFilters[i].field)) {
+                readyRange.Add(i);
+            }
+        }
+
+        int totalReady = readyEq.Count + readyRange.Count;
+
+        // 单索引特化快路径
+        if (totalReady == 1) {
+            if (readyEq.Count == 1) {
+                EqFilter f = this.eqFilters[readyEq[0]];
+                return this.col.FindByIndex(f.field, f.val);
+            }
+            RangeFilter rf = this.rangeFilters[readyRange[0]];
+            List<int> rids = this.col.FindIdsByFieldRange(rf.field, rf.lo, rf.hi);
+            List<JsonValue> rdocs = new List<JsonValue>();
+            for (int i = 0; i < rids.Count; i = i + 1) {
+                JsonValue d = this.col.FindById(rids[i]);
+                if (d != null) { rdocs.Add(d); }
+            }
+            return rdocs;
+        }
+
+        // 多索引求交路径：拉取各索引匹配 ID 并归并求交
+        if (totalReady > 1) {
+            List<int> curIds = null;
+            for (int i = 0; i < readyEq.Count; i = i + 1) {
+                EqFilter f = this.eqFilters[readyEq[i]];
+                List<int> ids = this.col.FindIdsByField(f.field, f.val);
+                if (curIds == null) {
+                    curIds = ids;
+                } else {
+                    curIds = DocQuery.IntersectSortedIds(curIds, ids);
+                    if (curIds.Count == 0) { break; }
+                }
+            }
+            if (curIds != null && curIds.Count > 0) {
+                for (int i = 0; i < readyRange.Count; i = i + 1) {
+                    RangeFilter rf = this.rangeFilters[readyRange[i]];
+                    List<int> ids = this.col.FindIdsByFieldRange(rf.field, rf.lo, rf.hi);
+                    curIds = DocQuery.IntersectSortedIds(curIds, ids);
+                    if (curIds.Count == 0) { break; }
+                }
+            }
+            List<JsonValue> rdocs = new List<JsonValue>();
+            if (curIds != null) {
+                for (int i = 0; i < curIds.Count; i = i + 1) {
+                    JsonValue d = this.col.FindById(curIds[i]);
+                    if (d != null) { rdocs.Add(d); }
+                }
+            }
+            return rdocs;
+        }
+
+        // 无就绪索引回退：首选等值字段流式快筛
         if (this.eqFilters.Count > 0) {
-            // 扫描时用第一个等值约束缩小范围：集合
-            // 只从每条记录中读取该字段，并且只解码
-            // 匹配项。其余过滤器仍在幸存者上运行。
             EqFilter f = this.eqFilters[0];
             return this.col.FindByFieldScan(f.field, f.val);
+        }
+        if (this.rangeFilters.Count > 0) {
+            RangeFilter rf = this.rangeFilters[0];
+            List<int> rids = this.col.FindIdsByFieldRange(rf.field, rf.lo, rf.hi);
+            List<JsonValue> rdocs = new List<JsonValue>();
+            for (int i = 0; i < rids.Count; i = i + 1) {
+                JsonValue d = this.col.FindById(rids[i]);
+                if (d != null) { rdocs.Add(d); }
+            }
+            return rdocs;
         }
         return this.col.FindAll();
     }
 
-    /// 检查余下的等值约束与 lambda 过滤器
+    /// 检查余下的等值约束、范围约束与 lambda 过滤器
     /// （首个等值约束已由 <see cref="Candidates"/> 的扫描应用）。
     bool MatchesRest(JsonValue d) {
         int i = 1;
@@ -172,24 +287,49 @@ class DocQuery {
             if (v.AsString("") != f.val) { return false; }
             i = i + 1;
         }
+        for (int r = 0; r < this.rangeFilters.Count; r = r + 1) {
+            RangeFilter rf = this.rangeFilters[r];
+            JsonValue v = d.Get(rf.field);
+            if (v == null) { return false; }
+            string sv = v.AsString("");
+            if (rf.lo != "" && String.CompareOrdinal(sv, rf.lo) < 0) { return false; }
+            if (rf.hi != "" && String.CompareOrdinal(sv, rf.hi) > 0) { return false; }
+        }
         foreach (DocPredicate p in this.preds) {
             if (!p(d)) { return false; }
         }
         return true;
     }
 
-    /// <summary>当候选集已经应用了第一个等值
-    /// 过滤器时为 true，重复检查将浪费工作。</summary>
+    /// <summary>当候选集已经由单字段快筛扫描应用了首个等值条件时为 true。</summary>
     bool EqAppliedByScan() {
-        return !this.hasIdxEq && this.eqFilters.Count > 0;
+        bool hasReady = false;
+        for (int i = 0; i < this.eqFilters.Count; i = i + 1) {
+            if (this.col.IndexReady(this.eqFilters[i].field)) { hasReady = true; break; }
+        }
+        if (!hasReady) {
+            for (int i = 0; i < this.rangeFilters.Count; i = i + 1) {
+                if (this.col.IndexReady(this.rangeFilters[i].field)) { hasReady = true; break; }
+            }
+        }
+        return !hasReady && this.eqFilters.Count > 0;
     }
 
-    /// 检查全部等值约束与 lambda 过滤器。
+    /// 检查全部等值约束、范围约束与 lambda 过滤器。
     bool Matches(JsonValue d) {
-        foreach (EqFilter f in this.eqFilters) {
+        for (int i = 0; i < this.eqFilters.Count; i = i + 1) {
+            EqFilter f = this.eqFilters[i];
             JsonValue v = d.Get(f.field);
             if (v == null) { return false; }
             if (v.AsString("") != f.val) { return false; }
+        }
+        for (int r = 0; r < this.rangeFilters.Count; r = r + 1) {
+            RangeFilter rf = this.rangeFilters[r];
+            JsonValue v = d.Get(rf.field);
+            if (v == null) { return false; }
+            string sv = v.AsString("");
+            if (rf.lo != "" && String.CompareOrdinal(sv, rf.lo) < 0) { return false; }
+            if (rf.hi != "" && String.CompareOrdinal(sv, rf.hi) > 0) { return false; }
         }
         foreach (DocPredicate p in this.preds) {
             if (!p(d)) { return false; }
@@ -258,29 +398,232 @@ class DocQuery {
         }
     }
 
+    /// <summary>基于二叉堆的整数键 Top-K 局部堆排序：O(N log K)，严格无死循环。</summary>
+    List<JsonValue> SortTopDocsInt(List<JsonValue> docs, int k) {
+        List<JsonValue> hDoc = new List<JsonValue>();
+        List<int> hKey = new List<int>();
+        bool isMaxHeap = !this.sortDesc;
+
+        for (int i = 0; i < docs.Count; i = i + 1) {
+            JsonValue d = docs[i];
+            int key = this.intKey(d);
+
+            if (hDoc.Count < k) {
+                hDoc.Add(d);
+                hKey.Add(key);
+                int cur = hDoc.Count - 1;
+                while (cur > 0) {
+                    int parent = (cur - 1) / 2;
+                    bool swap = false;
+                    if (isMaxHeap) { swap = hKey[cur] > hKey[parent]; }
+                    else { swap = hKey[cur] < hKey[parent]; }
+                    if (swap) {
+                        JsonValue td = hDoc[cur]; hDoc[cur] = hDoc[parent]; hDoc[parent] = td;
+                        int tk = hKey[cur]; hKey[cur] = hKey[parent]; hKey[parent] = tk;
+                        cur = parent;
+                    } else {
+                        break;
+                    }
+                }
+            } else {
+                bool replace = false;
+                if (isMaxHeap) { replace = key < hKey[0]; }
+                else { replace = key > hKey[0]; }
+                if (replace) {
+                    hDoc[0] = d;
+                    hKey[0] = key;
+                    int p = 0;
+                    int n = hDoc.Count;
+                    while (p * 2 + 1 < n) {
+                        int left = p * 2 + 1;
+                        int right = p * 2 + 2;
+                        int best = p;
+                        if (isMaxHeap) {
+                            if (hKey[left] > hKey[best]) { best = left; }
+                            if (right < n && hKey[right] > hKey[best]) { best = right; }
+                        } else {
+                            if (hKey[left] < hKey[best]) { best = left; }
+                            if (right < n && hKey[right] < hKey[best]) { best = right; }
+                        }
+                        if (best != p) {
+                            JsonValue td = hDoc[p]; hDoc[p] = hDoc[best]; hDoc[best] = td;
+                            int tk = hKey[p]; hKey[p] = hKey[best]; hKey[best] = tk;
+                            p = best;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        int heapSize = hDoc.Count;
+        while (heapSize > 1) {
+            int last = heapSize - 1;
+            JsonValue td = hDoc[0]; hDoc[0] = hDoc[last]; hDoc[last] = td;
+            int tk = hKey[0]; hKey[0] = hKey[last]; hKey[last] = tk;
+            heapSize = heapSize - 1;
+
+            int p = 0;
+            while (p * 2 + 1 < heapSize) {
+                int left = p * 2 + 1;
+                int right = p * 2 + 2;
+                int best = p;
+                if (isMaxHeap) {
+                    if (hKey[left] > hKey[best]) { best = left; }
+                    if (right < heapSize && hKey[right] > hKey[best]) { best = right; }
+                } else {
+                    if (hKey[left] < hKey[best]) { best = left; }
+                    if (right < heapSize && hKey[right] < hKey[best]) { best = right; }
+                }
+                if (best != p) {
+                    JsonValue swapD = hDoc[p]; hDoc[p] = hDoc[best]; hDoc[best] = swapD;
+                    int swapK = hKey[p]; hKey[p] = hKey[best]; hKey[best] = swapK;
+                    p = best;
+                } else {
+                    break;
+                }
+            }
+        }
+        return hDoc;
+    }
+
+    /// <summary>基于二叉堆的字符串键 Top-K 局部堆排序：O(N log K)，严格无死循环。</summary>
+    List<JsonValue> SortTopDocsStr(List<JsonValue> docs, int k) {
+        List<JsonValue> hDoc = new List<JsonValue>();
+        List<string> hKey = new List<string>();
+        bool isMaxHeap = !this.sortDesc;
+
+        for (int i = 0; i < docs.Count; i = i + 1) {
+            JsonValue d = docs[i];
+            string key = this.strKey(d);
+
+            if (hDoc.Count < k) {
+                hDoc.Add(d);
+                hKey.Add(key);
+                int cur = hDoc.Count - 1;
+                while (cur > 0) {
+                    int parent = (cur - 1) / 2;
+                    bool swap = false;
+                    if (isMaxHeap) { swap = String.CompareOrdinal(hKey[cur], hKey[parent]) > 0; }
+                    else { swap = String.CompareOrdinal(hKey[cur], hKey[parent]) < 0; }
+                    if (swap) {
+                        JsonValue td = hDoc[cur]; hDoc[cur] = hDoc[parent]; hDoc[parent] = td;
+                        string tk = hKey[cur]; hKey[cur] = hKey[parent]; hKey[parent] = tk;
+                        cur = parent;
+                    } else {
+                        break;
+                    }
+                }
+            } else {
+                bool replace = false;
+                if (isMaxHeap) { replace = String.CompareOrdinal(key, hKey[0]) < 0; }
+                else { replace = String.CompareOrdinal(key, hKey[0]) > 0; }
+                if (replace) {
+                    hDoc[0] = d;
+                    hKey[0] = key;
+                    int p = 0;
+                    int n = hDoc.Count;
+                    while (p * 2 + 1 < n) {
+                        int left = p * 2 + 1;
+                        int right = p * 2 + 2;
+                        int best = p;
+                        if (isMaxHeap) {
+                            if (String.CompareOrdinal(hKey[left], hKey[best]) > 0) { best = left; }
+                            if (right < n && String.CompareOrdinal(hKey[right], hKey[best]) > 0) { best = right; }
+                        } else {
+                            if (String.CompareOrdinal(hKey[left], hKey[best]) < 0) { best = left; }
+                            if (right < n && String.CompareOrdinal(hKey[right], hKey[best]) < 0) { best = right; }
+                        }
+                        if (best != p) {
+                            JsonValue td = hDoc[p]; hDoc[p] = hDoc[best]; hDoc[best] = td;
+                            string tk = hKey[p]; hKey[p] = hKey[best]; hKey[best] = tk;
+                            p = best;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        int heapSize = hDoc.Count;
+        while (heapSize > 1) {
+            int last = heapSize - 1;
+            JsonValue td = hDoc[0]; hDoc[0] = hDoc[last]; hDoc[last] = td;
+            string tk = hKey[0]; hKey[0] = hKey[last]; hKey[last] = tk;
+            heapSize = heapSize - 1;
+
+            int p = 0;
+            while (p * 2 + 1 < heapSize) {
+                int left = p * 2 + 1;
+                int right = p * 2 + 2;
+                int best = p;
+                if (isMaxHeap) {
+                    if (String.CompareOrdinal(hKey[left], hKey[best]) > 0) { best = left; }
+                    if (right < heapSize && String.CompareOrdinal(hKey[right], hKey[best]) > 0) { best = right; }
+                } else {
+                    if (String.CompareOrdinal(hKey[left], hKey[best]) < 0) { best = left; }
+                    if (right < heapSize && String.CompareOrdinal(hKey[right], hKey[best]) < 0) { best = right; }
+                }
+                if (best != p) {
+                    JsonValue swapD = hDoc[p]; hDoc[p] = hDoc[best]; hDoc[best] = swapD;
+                    string swapK = hKey[p]; hKey[p] = hKey[best]; hKey[best] = swapK;
+                    p = best;
+                } else {
+                    break;
+                }
+            }
+        }
+        return hDoc;
+    }
+
     /// <summary>执行查询并具体化匹配的文档。</summary>
     List<JsonValue> ToList() {
         List<JsonValue> cand = Candidates();
         bool scanned = EqAppliedByScan();
         List<JsonValue> matched = new List<JsonValue>();
+
+        // 优化：无排序时，如果指定了 Take(k)，达到数量立即提前终止，无需遍历全量候选集
+        int limit = 0;
+        if (!this.sortInt && !this.sortStr && this.takeN > 0) {
+            limit = this.skipN + this.takeN;
+        }
+
         for (int i = 0; i < cand.Count; i = i + 1) {
             bool keep = false;
             if (scanned) { keep = MatchesRest(cand[i]); }
             else { keep = Matches(cand[i]); }
-            if (keep) { matched.Add(cand[i]); }
-        }
-        if (this.sortInt || this.sortStr) {
-            SortDocs(matched);
-            if (this.sortDesc) {
-                List<JsonValue> rev = new List<JsonValue>();
-                int r = matched.Count - 1;
-                while (r >= 0) {
-                    rev.Add(matched[r]);
-                    r = r - 1;
+            if (keep) {
+                matched.Add(cand[i]);
+                if (limit > 0 && matched.Count >= limit) {
+                    break;
                 }
-                matched = rev;
             }
         }
+
+        if (this.sortInt || this.sortStr) {
+            int needed = 0;
+            if (this.takeN > 0) {
+                needed = this.skipN + this.takeN;
+            }
+            if (needed > 0 && needed < matched.Count / 2) {
+                if (this.sortInt) { matched = SortTopDocsInt(matched, needed); }
+                else { matched = SortTopDocsStr(matched, needed); }
+            } else {
+                SortDocs(matched);
+                if (this.sortDesc) {
+                    List<JsonValue> rev = new List<JsonValue>();
+                    int r = matched.Count - 1;
+                    while (r >= 0) {
+                        rev.Add(matched[r]);
+                        r = r - 1;
+                    }
+                    matched = rev;
+                }
+            }
+        }
+
         if (this.skipN > 0 || this.takeN > 0) {
             List<JsonValue> page = new List<JsonValue>();
             int p = this.skipN;
@@ -294,7 +637,8 @@ class DocQuery {
         return matched;
     }
 
-    /// <summary>返回第一个匹配项，没有则返回 null。</summary>
+    /// <summary>返回第一个匹配项，没有则返回 null。
+    /// 借助无排序提前终止特性，找到第 1 项立即返回，避免无效扫描。</summary>
     JsonValue First() {
         List<JsonValue> r = Take(1).ToList();
         if (r.Count > 0) { return r[0]; }
@@ -306,11 +650,21 @@ class DocQuery {
     /// 用索引键，否则从每条记录读取
     /// 一个字段来计数。</summary>
     int Count() {
-        if (this.preds.Count == 0) {
-            if (this.hasIdxEq && this.eqFilters.Count == 0) {
-                return this.col.CountByField(this.idxField, this.idxValue);
+        if (this.preds.Count == 0 && this.rangeFilters.Count == 0) {
+            bool hasReady = false;
+            int readyIdx = -1;
+            for (int i = 0; i < this.eqFilters.Count; i = i + 1) {
+                if (this.col.IndexReady(this.eqFilters[i].field)) {
+                    hasReady = true;
+                    readyIdx = i;
+                    break;
+                }
             }
-            if (!this.hasIdxEq && this.eqFilters.Count == 1) {
+            if (hasReady && this.eqFilters.Count == 1) {
+                EqFilter only = this.eqFilters[readyIdx];
+                return this.col.CountByField(only.field, only.val);
+            }
+            if (!hasReady && this.eqFilters.Count == 1) {
                 EqFilter only = this.eqFilters[0];
                 return this.col.CountByField(only.field, only.val);
             }
