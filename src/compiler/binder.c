@@ -1134,7 +1134,17 @@ static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
                  * walk forever. Skip the edge (the cycle was already
                  * diagnosed at the re-entry site). */
                 if (base_sym->type->bases_resolved != 2) continue;
-                type_sym->type->base_type = base_sym->type;
+                if (base_args_resolvable(b, base_ref)) {
+                    zan_type_t *inst = zan_binder_resolve_type(b, base_ref);
+                    if (inst && (inst->kind == TYPE_CLASS || inst->kind == TYPE_STRUCT) &&
+                        inst != b->type_error) {
+                        type_sym->type->base_type = inst;
+                    } else {
+                        type_sym->type->base_type = base_sym->type;
+                    }
+                } else {
+                    type_sym->type->base_type = base_sym->type;
+                }
                 /* inherit base fields and properties (prefix layout): count
                  * them, then prepend them to the derived member list */
                 int ninherit = 0;

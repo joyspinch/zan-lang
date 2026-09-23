@@ -66,5 +66,9 @@ void zan_parser_desugar_events(zan_ast_node_t *unit, zan_arena_t *arena,
  * hoisted types participate in those passes. */
 void zan_parser_flatten_nested_types(zan_ast_node_t *unit, zan_arena_t *arena,
                                      zan_diag_t *diag);
+/* Specialize inherited methods from generic base classes into derived classes
+ * before codegen and binding so type parameters are bound to concrete types. */
+void zan_parser_specialize_generic_bases(zan_ast_node_t *unit, zan_arena_t *arena,
+                                         zan_diag_t *diag);
 
 #endif /* ZAN_PARSER_H */

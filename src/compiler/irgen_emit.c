@@ -1546,6 +1546,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
              * variants below carry a real body. */
             if (!cur_variant && class_member_uses_tp(g, decl, member)) {
                 emit_tp_erased_stub(g, fn);
+                if (resume_fn) emit_tp_erased_stub(g, resume_fn);
                 free(param_types);
                 continue;
             }

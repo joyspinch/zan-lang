@@ -205,6 +205,8 @@ static void discover_generic_insts(zan_irgen_t *g, zan_ast_node_t *unit) {
                 decl->kind != AST_INTERFACE_DECL)
                 continue;
             g->collect_inst_ctx = NULL;
+            for (int j = 0; j < decl->type_decl.bases.count; j++)
+                collect_inst_typeref(g, decl->type_decl.bases.items[j]);
             for (int j = 0; j < decl->type_decl.members.count; j++)
                 collect_inst_member(g, decl->type_decl.members.items[j]);
             /* Then once per known instantiation of this generic class, so its
@@ -260,6 +262,20 @@ static LLVMValueRef route_generic_method(zan_irgen_t *g, zan_type_t *recv_ty,
                                          LLVMTypeRef *out_ty) {
     if (out_ty) *out_ty = erased_ty;
     if (!recv_ty || !recv_ty->sym) return erased_fn;
+    if (!is_user_generic_sym(recv_ty->sym)) {
+        for (zan_type_t *bt = recv_ty->base_type; bt; bt = bt->base_type) {
+            if (bt->sym && is_user_generic_sym(bt->sym)) {
+                if (method_sym && method_sym->parent &&
+                    (method_sym->parent == bt->sym ||
+                     (method_sym->parent->name.len == bt->sym->name.len &&
+                      memcmp(method_sym->parent->name.str, bt->sym->name.str,
+                             (size_t)bt->sym->name.len) == 0))) {
+                    recv_ty = bt;
+                    break;
+                }
+            }
+        }
+    }
     if (!is_user_generic_sym(recv_ty->sym)) return erased_fn;
     zan_type_t **args = recv_ty->type_args;
     int argc = recv_ty->type_arg_count;

@@ -88,6 +88,11 @@ static bool type_mentions_type_param(zan_type_t *t, int depth) {
  * erased template and the real code lives in the specializations". */
 static bool call_receiver_is_open_generic(zan_irgen_t *g, zan_ast_node_t *call,
                                          local_scope_t *locals) {
+    if (g->current_type_sym && g->current_type_sym->decl &&
+        (g->current_type_sym->decl->kind == AST_CLASS_DECL ||
+         g->current_type_sym->decl->kind == AST_STRUCT_DECL) &&
+        g->current_type_sym->decl->type_decl.type_params.count > 0)
+        return true;
     zan_ast_node_t *callee = call->call.callee;
     if (!callee) return false;
     if (callee->kind == AST_MEMBER_ACCESS)

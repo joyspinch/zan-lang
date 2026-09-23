@@ -1142,8 +1142,13 @@ static bool checker_type_derives_from_depth(zan_type_t *sub, zan_type_t *sup,
     if (!sub || !sup) return false;
     if (depth > CHECKER_DERIVES_MAX_DEPTH) return false;
     if (sub == sup) return true;
-    if (sub->sym && sup->sym && sub->sym == sup->sym)
+    if (sub->sym && sup->sym && sub->sym == sup->sym) {
+        if (sup->type_arg_count == 0 && sup->sym->decl &&
+            (sup->sym->decl->kind == AST_CLASS_DECL || sup->sym->decl->kind == AST_STRUCT_DECL) &&
+            sup->sym->decl->type_decl.type_params.count > 0)
+            return true;
         return checker_type_equal(sub, sup);
+    }
     if (sub->kind == sup->kind && checker_type_equal(sub, sup)) return true;
     for (int i = 0; i < sub->interface_count; i++)
         if (checker_type_derives_from_depth(sub->interfaces[i], sup, depth + 1))

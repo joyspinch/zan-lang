@@ -4158,6 +4158,8 @@ int main(int argc, char **argv) {
         zan_parser_desugar_events(ast, arena, diag);
         zan_compile_trace("nsresolve");
         zan_nsresolve_run(ast, arena, diag);
+        zan_compile_trace("specialize generic bases");
+        zan_parser_specialize_generic_bases(ast, arena, diag);
 
         /* --gen-meta: dump the compilation-unit metadata the Zan-scripted
          * code generators consume (see genmeta.h) and exit. Must run before
