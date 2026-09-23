@@ -617,6 +617,13 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   那条路径"**——按"谁 retain 了它"反查消费点（这里是 emit_closure_record 的
   retain_target），别只盯着 new。
 
+- **extern string 不只不能释放，也不能下标（A347，2026-09-23）**：
+  `DllImport` 返回的串（如 crt `calloc`）无长度元数据，字符串下标守卫
+  对它按 0 界处理——任何读写都报 "string index out of bounds"。收发
+  缓冲必须用 `byte[]`（真驱动 recvExact 的形态）；`byte[]` 实参可隐式
+  传给 `string` 形参且带真实长度。测试手搓 `Fake.calloc` 字符串缓冲层
+  让 firebird_wire/sqlserver_tds 全红，后者还因假服务协程崩在守卫上
+  表现为客户端挂死超时——**"超时"先看协程是否早崩**。
 ## 数组字面量初始化循环必须走 ARC retain 协议（2026-09-13 已修）
 
 - `new T[]{a, b}` 与定长 `new T[n] {...}` 的元素初始化循环原先只

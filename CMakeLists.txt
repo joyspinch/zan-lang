@@ -1510,7 +1510,9 @@ foreach(_src ${_conf_srcs})
   # arc_net_publish 有专属档（run_arcnet.cmake，--publish + 网静默
   # 契约，见 3691 行的手工登记），四个 GLOB 孪生档全部跳过它，
   # 否则 add_test 撞名配置失败。
-  if(_name STREQUAL "arc_net_publish")
+  # genform_click_test 同理：期望输出是 genform_click.out（与
+  # <名>_test.zan 同目录不同名），3043 行的手工登记按真实文件名注册。
+  if(_name STREQUAL "arc_net_publish" OR _name STREQUAL "genform_click_test")
     continue()
   endif()
   zan_uses_gui_driver(${_src} _needs_gui_driver)
