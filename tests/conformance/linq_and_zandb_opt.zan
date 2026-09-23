@@ -3,6 +3,7 @@ using System.IO;
 using System.Json;
 using System.Linq;
 using System.Data.ZanDb;
+using System.Net.Http;
 
 class Program {
     static int pass = 0;
@@ -297,11 +298,122 @@ class Program {
         Check("stream_distinct", uniq.Count == 3 && uniq[0] == 10 && uniq[1] == 20 && uniq[2] == 30);
     }
 
+    static void TestZanDbBufferPool() {
+        string dbPath = "_scratch/zandb_bp_test.db";
+        Clean(dbPath);
+        ZanDatabase db = ZanDatabase.Open(dbPath);
+        Collection col = db.GetCollection("items");
+
+        // 默认缓存容量为 256
+        Check("bp_default_cap", col.GetCacheCapacity() == 256);
+        col.SetCacheCapacity(3); // 限制容量为 3，测试 LRU 淘汰
+        Check("bp_set_cap", col.GetCacheCapacity() == 3);
+
+        JsonValue d1 = JsonValue.NewObject();
+        d1.Put("name", JsonValue.NewStr("item_1"));
+        int id1 = col.Insert(d1);
+
+        JsonValue d2 = JsonValue.NewObject();
+        d2.Put("name", JsonValue.NewStr("item_2"));
+        int id2 = col.Insert(d2);
+
+        JsonValue d3 = JsonValue.NewObject();
+        d3.Put("name", JsonValue.NewStr("item_3"));
+        int id3 = col.Insert(d3);
+
+        Check("bp_cached_3", col.CachedDocCount() == 3);
+
+        // 点查缓存命中
+        JsonValue f1 = col.FindById(id1);
+        Check("bp_hit_1", f1 != null && f1.Str("name", "") == "item_1");
+
+        // 验证外部修改副本不污染缓存
+        f1.Set("name", JsonValue.NewStr("tampered"));
+        JsonValue f1Again = col.FindById(id1);
+        Check("bp_isolated_tamper", f1Again != null && f1Again.Str("name", "") == "item_1");
+
+        // 插入第 4 个文档，容量上限为 3，淘汰最久未访问者
+        // 访问顺序：前面访问了 id1，最近使用队列为 [id2, id3, id1]
+        // 故淘汰应为 id2
+        JsonValue d4 = JsonValue.NewObject();
+        d4.Put("name", JsonValue.NewStr("item_4"));
+        int id4 = col.Insert(d4);
+
+        Check("bp_cached_still_3", col.CachedDocCount() == 3);
+        // id2 被淘汰，但仍能从磁盘查到
+        JsonValue f2 = col.FindById(id2);
+        Check("bp_fetch_disk_after_evict", f2 != null && f2.Str("name", "") == "item_2");
+
+        // 更新测试：更新后缓存立即同步
+        JsonValue up1 = JsonValue.NewObject();
+        up1.Put("name", JsonValue.NewStr("item_1_updated"));
+        col.Update(id1, up1);
+        JsonValue f1Up = col.FindById(id1);
+        Check("bp_update_cached", f1Up != null && f1Up.Str("name", "") == "item_1_updated");
+
+        // 删除测试：删除后缓存与磁盘均无
+        col.DeleteById(id1);
+        JsonValue f1Del = col.FindById(id1);
+        Check("bp_delete_evicted", f1Del == null);
+
+        // 清空缓存测试
+        col.ClearCache();
+        Check("bp_clear", col.CachedDocCount() == 0);
+
+        db.Close();
+        Clean(dbPath);
+    }
+
+    static void TestHttpSlice() {
+        string raw = "GET /api/v1/search?category=books&author=tolkien&page=2&limit=50&sort=asc HTTP/1.1\r\n"
+                   + "Host: example.com\r\n"
+                   + "User-Agent: ZanClient/1.0\r\n"
+                   + "Accept: application/json\r\n"
+                   + "Cookie: sid=abc123xyz\r\n"
+                   + "\r\n";
+
+        HttpRequest req = HttpRequest.Parse(raw);
+        Check("http_method", req.method == "GET");
+        Check("http_path", req.path == "/api/v1/search");
+        Check("http_host", req.host == "example.com");
+        Check("http_ua", req.UserAgent() == "ZanClient/1.0");
+        Check("http_ua_header", req.GetHeader("user-agent") == "ZanClient/1.0");
+        Check("http_ua_header_ci", req.GetHeader("User-Agent") == "ZanClient/1.0");
+        Check("http_accept", req.GetHeader("Accept") == "application/json");
+
+        // 零分配切片查询单个 Query 参数
+        Check("http_query_author", req.GetQueryParam("author") == "tolkien");
+        Check("http_query_page", req.GetQueryParam("page") == "2");
+        Check("http_query_limit", req.GetQueryParam("limit") == "50");
+        Check("http_query_sort", req.GetQueryParam("sort") == "asc");
+        Check("http_query_none", req.GetQueryParam("not_exist") == "");
+
+        // 批量提取字典
+        Dict<string, string> qmap = req.GetQueryParams();
+        Check("http_qmap_count", qmap.Count == 5);
+        Check("http_qmap_books", qmap["category"] == "books");
+        Check("http_qmap_author", qmap["author"] == "tolkien");
+
+        // POST 表单零分配解析
+        string postRaw = "POST /login HTTP/1.1\r\n"
+                       + "Host: example.com\r\n"
+                       + "Content-Type: application/x-www-form-urlencoded\r\n"
+                       + "Content-Length: 40\r\n"
+                       + "\r\n"
+                       + "username=admin&password=secret%21%40%23";
+        HttpRequest postReq = HttpRequest.Parse(postRaw);
+        Check("http_form_user", postReq.GetFormField("username") == "admin");
+        Check("http_form_pass", postReq.GetFormField("password") == "secret!@#");
+        Check("http_form_none", postReq.GetFormField("missing") == "");
+    }
+
     static void Main() {
         TestLinq();
         TestZanDb();
         TestJsonWide();
         TestStreamPipeline();
+        TestZanDbBufferPool();
+        TestHttpSlice();
 
         Console.WriteLine("pass: " + Convert.ToString(pass));
         Console.WriteLine("fail: " + Convert.ToString(fail));

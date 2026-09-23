@@ -44,6 +44,10 @@ class Collection {
     /// 单写者模型下安全：序列键仍随每次分配落盘（事务覆盖层
     /// 会在提交时去重成一帧），崩溃后经重开恢复，缓存作废重读。
     int nextIdCache;
+    /// 进程内热点文档 LRU 缓存池与访问序列，避免重复 I/O 与反序列化。
+    Dict<int, JsonValue> docCache;
+    List<int> docCacheOrder;
+    int docCacheCapacity;
 
     /// <summary>批量索引构建中每个事务索引的文档数。</summary>
     static int INDEX_BATCH = 500;
@@ -63,6 +67,9 @@ class Collection {
         this.keyDictDirty = false;
         this.metaVersion = 0 - 1;
         this.nextIdCache = 0;
+        this.docCache = new Dict<int, JsonValue>();
+        this.docCacheOrder = new List<int>();
+        this.docCacheCapacity = 256;
     }
 
     /// 绑定到底层 ZanStore 的一个命名空间，并加载索引列表与字段名字典。
@@ -71,6 +78,9 @@ class Collection {
         c.kv = kv;
         c.rw = rw;
         c.name = name;
+        c.docCache = new Dict<int, JsonValue>();
+        c.docCacheOrder = new List<int>();
+        c.docCacheCapacity = 256;
         c.LoadIndexMeta();
         c.LoadKeyDict();
         c.metaVersion = kv.Version();
@@ -91,6 +101,7 @@ class Collection {
         // （事务中编码中途的条目）——否则它们会丢失。
         if (this.keyDictDirty) { return; }
         this.metaVersion = v;
+        ClearCache();
         LoadIndexMeta();
         LoadKeyDict();
     }
@@ -943,7 +954,94 @@ class Collection {
         return this.nextIdCache;
     }
 
-    // ===== CRUD =====
+    // ===== 缓存池与 CRUD =====
+
+    /// <summary>设置集合的文档缓存池容量（0 为关闭缓存，默认 256）。</summary>
+    void SetCacheCapacity(int capacity) {
+        if (capacity < 0) { capacity = 0; }
+        this.docCacheCapacity = capacity;
+        if (capacity == 0) {
+            ClearCache();
+        } else {
+            int pruneMax = this.docCacheOrder.Count;
+            for (int i = 0; i < pruneMax; i = i + 1) {
+                if (this.docCacheOrder.Count <= this.docCacheCapacity) { break; }
+                int evictId = this.docCacheOrder[0];
+                this.docCacheOrder.RemoveAt(0);
+                this.docCache.Remove(evictId);
+            }
+        }
+    }
+
+    /// <summary>获取当前集合文档缓存池的缓存容量。</summary>
+    int GetCacheCapacity() { return this.docCacheCapacity; }
+
+    /// <summary>获取当前集合文档缓存池中已缓存的文档数。</summary>
+    int CachedDocCount() { return this.docCache.Count; }
+
+    /// <summary>清空文档缓存池。</summary>
+    void ClearCache() {
+        this.docCache.Clear();
+        this.docCacheOrder.Clear();
+    }
+
+    /// <summary>从文档缓存中获取文档，若存在则更新 LRU 访问热度并返回其只读副本。</summary>
+    JsonValue CacheGet(int id) {
+        if (this.docCacheCapacity <= 0 || !this.docCache.ContainsKey(id)) {
+            return null;
+        }
+        int lastIdx = this.docCacheOrder.Count - 1;
+        if (lastIdx >= 0 && this.docCacheOrder[lastIdx] != id) {
+            for (int i = 0; i < this.docCacheOrder.Count; i = i + 1) {
+                if (this.docCacheOrder[i] == id) {
+                    this.docCacheOrder.RemoveAt(i);
+                    this.docCacheOrder.Add(id);
+                    break;
+                }
+            }
+        }
+        return this.docCache[id];
+    }
+
+    /// <summary>将文档放入 LRU 缓存池；超过容量时淘汰最久未访问的条目。</summary>
+    void CachePut(int id, JsonValue doc) {
+        if (this.docCacheCapacity <= 0 || doc == null) { return; }
+        if (this.docCache.ContainsKey(id)) {
+            this.docCache[id] = doc.Clone();
+            int lastIdx = this.docCacheOrder.Count - 1;
+            if (lastIdx >= 0 && this.docCacheOrder[lastIdx] != id) {
+                for (int i = 0; i < this.docCacheOrder.Count; i = i + 1) {
+                    if (this.docCacheOrder[i] == id) {
+                        this.docCacheOrder.RemoveAt(i);
+                        this.docCacheOrder.Add(id);
+                        break;
+                    }
+                }
+            }
+            return;
+        }
+        if (this.docCacheOrder.Count >= this.docCacheCapacity && this.docCacheOrder.Count > 0) {
+            int evictId = this.docCacheOrder[0];
+            this.docCacheOrder.RemoveAt(0);
+            this.docCache.Remove(evictId);
+        }
+        this.docCache[id] = doc.Clone();
+        this.docCacheOrder.Add(id);
+    }
+
+    /// <summary>从缓存池中显式失效指定文档。</summary>
+    void CacheEvict(int id) {
+        if (this.docCacheCapacity <= 0) { return; }
+        if (this.docCache.ContainsKey(id)) {
+            this.docCache.Remove(id);
+            for (int i = 0; i < this.docCacheOrder.Count; i = i + 1) {
+                if (this.docCacheOrder[i] == id) {
+                    this.docCacheOrder.RemoveAt(i);
+                    break;
+                }
+            }
+        }
+    }
 
     /// <summary>存储新文档，分配并返回其 _id
     /// （同时写入文档中）。</summary>
@@ -955,6 +1053,8 @@ class Collection {
         this.kv.Put(DocKey(id), EncodeDoc(doc));
         AddIndexEntries(id, doc);
         this.kv.Commit();
+        this.metaVersion = this.kv.Version();
+        CachePut(id, doc);
         return id;
     }
 
@@ -972,19 +1072,30 @@ class Collection {
             AddIndexEntries(id, docs[i]);
         }
         this.kv.Commit();
+        this.metaVersion = this.kv.Version();
+        for (int i = 0; i < docs.Count; i = i + 1) {
+            int cid = first + i;
+            CachePut(cid, docs[i]);
+        }
         return first;
     }
 
-    /// <summary>返回文档；不存在则返回 null。</summary>
+    /// <summary>返回文档；优先走内存 LRU Buffer Pool，未命中则反序列化；不存在则返回 null。</summary>
     JsonValue FindById(int id) {
         SyncMeta();
+        JsonValue cached = CacheGet(id);
+        if (cached != null) {
+            return cached.Clone();
+        }
         string body = this.kv.Get(DocKey(id));
         JsonValue doc = null;
         if (body.Length > 0) {
             doc = DecodeDoc(body);
             doc.Set("_id", JsonValue.NewNum(Convert.ToString(id)));
+            CachePut(id, doc);
+            return doc.Clone();
         }
-        return doc;
+        return null;
     }
 
     /// 文档 id 是否存在。
@@ -1000,6 +1111,8 @@ class Collection {
         this.kv.Put(DocKey(id), EncodeDoc(doc));
         AddIndexEntries(id, doc);
         this.kv.Commit();
+        this.metaVersion = this.kv.Version();
+        CachePut(id, doc);
         return true;
     }
 
@@ -1024,6 +1137,8 @@ class Collection {
         this.kv.Put(DocKey(id), EncodeDoc(doc));
         AddIndexEntries(id, doc);
         this.kv.Commit();
+        this.metaVersion = this.kv.Version();
+        CachePut(id, doc);
     }
 
     /// 删除文档及其索引条目；返回该 id 是否原本存在。
@@ -1033,6 +1148,10 @@ class Collection {
         if (this.indexedFields.Count > 0) { RemoveIndexEntries(id, FindById(id)); }
         bool existed = this.kv.Delete(DocKey(id));
         this.kv.Commit();
+        this.metaVersion = this.kv.Version();
+        if (existed) {
+            CacheEvict(id);
+        }
         return existed;
     }
 

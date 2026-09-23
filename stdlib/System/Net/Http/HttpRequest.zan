@@ -22,6 +22,7 @@ class HttpRequest {
     // 唯一的那次扫描里就取出来，GetHeader 直接命中。
     string authorization;
     string cookie;
+    string userAgent;
     int contentLength;
     bool keepAlive;
     // 正文的真实字节数。字符串以 NUL 结尾，body.Length 只数到第一个
@@ -54,6 +55,7 @@ class HttpRequest {
         this.contentType = "";
         this.authorization = "";
         this.cookie = "";
+        this.userAgent = "";
         this.contentLength = 0;
         this.keepAlive = true;
         this.bodyLength = 0;
@@ -258,6 +260,11 @@ class HttpRequest {
                     if (req.cookie.Length == 0) {
                         req.cookie = raw.Substring(vStart, vStop - vStart);
                     }
+                } else if (nameLen == 10
+                           && RegionIs(raw, pos, colonPos, "user-agent")) {
+                    if (req.userAgent.Length == 0) {
+                        req.userAgent = raw.Substring(vStart, vStop - vStart);
+                    }
                 } else if (nameLen == 14
                            && RegionIs(raw, pos, colonPos, "content-length")) {
                     // 用 64 位累加：32 位 int 下 `4294967297` 会回绕成 1，
@@ -423,6 +430,7 @@ class HttpRequest {
         // 解析时已捕获的头部不必重扫头部块。
         if (HttpRequest.NameIs(name, "authorization")) { return this.authorization; }
         if (HttpRequest.NameIs(name, "cookie")) { return this.cookie; }
+        if (HttpRequest.NameIs(name, "user-agent")) { return this.userAgent; }
         // 在 rawHeaders 中搜索（按字节扫描；只分配返回值本身）
         int pos = 0;
         int len = this.rawHeaders.Length;
@@ -451,10 +459,19 @@ class HttpRequest {
         return "";
     }
 
+    /// <summary>比对 raw[pos..stop) 与 str 是否逐字节完全匹配（零分配）。</summary>
+    static bool RegionExact(string raw, int pos, int stop, string str) {
+        if (stop - pos != str.Length) { return false; }
+        for (int i = 0; pos + i < stop; i = i + 1) {
+            if ((raw[pos + i] & 255) != (str[i] & 255)) { return false; }
+        }
+        return true;
+    }
+
     /// <summary>按名称获取查询参数值（值已 url 解码，与
-    /// <see cref="GetFormField"/> 一致）。</summary>
+    /// <see cref="GetFormField"/> 一致）。采用零分配切片匹配，未命中项不产生任何堆分配。</summary>
     string GetQueryParam(string name) {
-        if (this.queryString.Length == 0) { return ""; }
+        if (this.queryString.Length == 0 || name.Length == 0) { return ""; }
         int pos = 0;
         int len = this.queryString.Length;
         string qs = this.queryString;
@@ -465,21 +482,21 @@ class HttpRequest {
                 if (c == 61 || c == 38) { break; } // '=' or '&'
                 eqPos = eqPos + 1;
             }
-            string paramName = qs.Substring(pos, eqPos - pos);
-            string paramValue = "";
+            bool match = HttpRequest.RegionExact(qs, pos, eqPos, name);
             if (eqPos < len && (qs[eqPos] & 255) == 61) {
                 int valEnd = eqPos + 1;
                 while (valEnd < len && (qs[valEnd] & 255) != 38) { // '&'
                     valEnd = valEnd + 1;
                 }
-                paramValue = Encoding.UrlDecode(
-                    qs.Substring(eqPos + 1, valEnd - eqPos - 1));
+                if (match) {
+                    return Encoding.UrlDecode(qs.Substring(eqPos + 1, valEnd - eqPos - 1));
+                }
                 pos = valEnd + 1;
             } else {
+                if (match) {
+                    return "";
+                }
                 pos = eqPos + 1;
-            }
-            if (paramName == name) {
-                return paramValue;
             }
         }
         return "";
@@ -487,19 +504,24 @@ class HttpRequest {
 
     /// <summary>从 application/x-www-form-urlencoded 正文中读取字段，
     /// 对值做 url 解码。相当于 GetQueryParam 的 POST 正文版；
-    /// 字段不存在时返回 ""。</summary>
+    /// 采用零拷贝切片匹配，字段不存在时返回 ""，且不分配任何字符串。</summary>
     string GetFormField(string name) {
         string b = this.body;
         int pos = 0;
         int len = b.Length;
+        if (len == 0 || name.Length == 0) { return ""; }
         while (pos < len) {
             int amp = pos;
             while (amp < len && (b[amp] & 255) != 38) { amp = amp + 1; }
-            string pair = b.Substring(pos, amp - pos);
-            int eq = pair.IndexOf("=");
-            if (eq > 0) {
-                if (pair.Substring(0, eq) == name) {
-                    return Encoding.UrlDecode(pair.Substring(eq + 1));
+            int eq = pos;
+            while (eq < amp && (b[eq] & 255) != 61) { eq = eq + 1; }
+            if (eq < amp) {
+                if (HttpRequest.RegionExact(b, pos, eq, name)) {
+                    return Encoding.UrlDecode(b.Substring(eq + 1, amp - eq - 1));
+                }
+            } else {
+                if (HttpRequest.RegionExact(b, pos, amp, name)) {
+                    return "";
                 }
             }
             pos = amp + 1;
@@ -539,5 +561,39 @@ class HttpRequest {
     /// <summary>构建 POST 请求。</summary>
     static string BuildPost(string path, string host, string body) {
         return Build("POST", path, host, body);
+    }
+
+    /// <summary>获取请求的 User-Agent 标头值。</summary>
+    string UserAgent() {
+        return this.userAgent;
+    }
+
+    /// <summary>一次性解析所有查询参数为键值对字典（零多余反序列化）。</summary>
+    Dict<string, string> GetQueryParams() {
+        Dict<string, string> map = new Dict<string, string>();
+        if (this.queryString.Length == 0) { return map; }
+        int pos = 0;
+        int len = this.queryString.Length;
+        string qs = this.queryString;
+        while (pos < len) {
+            int eqPos = pos;
+            while (eqPos < len) {
+                int c = qs[eqPos] & 255;
+                if (c == 61 || c == 38) { break; }
+                eqPos = eqPos + 1;
+            }
+            string key = qs.Substring(pos, eqPos - pos);
+            if (eqPos < len && (qs[eqPos] & 255) == 61) {
+                int valEnd = eqPos + 1;
+                while (valEnd < len && (qs[valEnd] & 255) != 38) { valEnd = valEnd + 1; }
+                string val = Encoding.UrlDecode(qs.Substring(eqPos + 1, valEnd - eqPos - 1));
+                map[key] = val;
+                pos = valEnd + 1;
+            } else {
+                map[key] = "";
+                pos = eqPos + 1;
+            }
+        }
+        return map;
     }
 }
