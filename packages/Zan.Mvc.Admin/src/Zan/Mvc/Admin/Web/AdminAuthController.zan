@@ -1,0 +1,112 @@
+using System;
+using System.Data;
+using System.Web;
+using Zan.Mvc.Admin.Dao;
+using Zan.Mvc.Admin.Model;
+using Zan.Mvc.Admin.Installer;
+
+namespace Zan.Mvc.Admin.Web;
+
+/// <summary>
+/// 统一管理后台身份认证控制器。
+/// 提供登录界面、凭据校验、Session 绑定与注销登出。
+/// </summary>
+public class AdminAuthController : BaseAdminController {
+    [HttpGet]
+    [Route("/admin/login")]
+    public void LoginPage() {
+        string redirectUrl;
+        if (InstallGateMiddleware.Check(this.Ctx().path, out redirectUrl) == 302) {
+            this.Redirect("/install");
+            return;
+        }
+
+        string html = "<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"UTF-8\"><title>系统登录 - Zan 管理中台</title>"
+            + "<style>"
+            + "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f172a;color:#f8fafc;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;}"
+            + ".login-card{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:36px;width:100%;max-width:400px;box-shadow:0 12px 30px rgba(0,0,0,0.4);}"
+            + "h1{font-size:22px;color:#38bdf8;margin-bottom:8px;font-weight:600;}"
+            + "p{color:#94a3b8;font-size:13px;margin-bottom:24px;}"
+            + ".field{margin-bottom:18px;display:flex;flex-direction:column;gap:6px;}"
+            + "label{font-size:13px;color:#cbd5e1;}"
+            + "input{background:#0f172a;border:1px solid #475569;border-radius:6px;padding:10px 12px;color:#fff;font-size:14px;outline:none;}"
+            + "input:focus{border-color:#38bdf8;}"
+            + ".btn-submit{background:#38bdf8;color:#0f172a;border:none;border-radius:6px;padding:12px;font-size:14px;font-weight:600;cursor:pointer;width:100%;margin-top:10px;}"
+            + ".btn-submit:hover{background:#0ea5e9;}"
+            + "</style></head><body>"
+            + "<div class=\"login-card\">"
+            + "<h1>管理中台登录</h1>"
+            + "<p>请输入系统管理员凭据以进入管理工作台</p>"
+            + "<form id=\"loginForm\">"
+            + "<div class=\"field\"><label>用户名</label><input id=\"username\" name=\"username\" value=\"admin\" required /></div>"
+            + "<div class=\"field\"><label>登录密码</label><input id=\"password\" name=\"password\" type=\"password\" value=\"admin123\" required /></div>"
+            + "<button type=\"button\" class=\"btn-submit\" onclick=\"doLogin()\">登 录</button>"
+            + "</form>"
+            + "</div>"
+            + "<script>"
+            + "function doLogin(){"
+            + "  let p = new URLSearchParams();"
+            + "  p.append('username', document.getElementById('username').value);"
+            + "  p.append('password', document.getElementById('password').value);"
+            + "  fetch('/admin/api/login', {method:'POST', body:p}).then(r=>r.json()).then(res=>{"
+            + "    if(res.code==='0000') window.location.href='/admin';"
+            + "    else alert('登录失败: ' + res.msg);"
+            + "  });"
+            + "}"
+            + "</script></body></html>";
+
+        this.Html(html);
+    }
+
+    [HttpPost]
+    [Route("/admin/api/login")]
+    public void ApiLogin() {
+        string username = this.In("username");
+        string password = this.In("password");
+
+        if (username.Length == 0 || password.Length == 0) {
+            this.JsonFail("用户名和密码不能为空");
+            return;
+        }
+
+        IDbConnection conn = AdminApp.Db;
+        if (conn == null) {
+            conn = AdminApp.OpenDb();
+        }
+
+        SysUserDao userDao = SysUserDao.Of(conn);
+        SysUser user = userDao.FindByUsername(username);
+
+        if (user == null) {
+            this.JsonFail("用户名或密码错误");
+            return;
+        }
+
+        string expectedHash = SchemaMigrator.HashPassword(password, "zan_salt_");
+        if (user.password_hash != expectedHash) {
+            this.JsonFail("用户名或密码错误");
+            return;
+        }
+
+        if (user.status != 1) {
+            this.JsonFail("该账号已被停用，请联系超级管理员");
+            return;
+        }
+
+        // 写入登录状态 Cookie (有效 24 小时)
+        this.Ctx().SetCookie("zan_admin_uid", Convert.ToString(user.id), 86400);
+        this.Ctx().SetCookie("zan_admin_name", user.username, 86400);
+        this.Ctx().SetCookie("zan_admin_nick", user.nickname, 86400);
+
+        this.JsonSuccess("登录成功");
+    }
+
+    [HttpGet]
+    [Route("/admin/logout")]
+    public void Logout() {
+        this.Ctx().SetCookie("zan_admin_uid", "", 0);
+        this.Ctx().SetCookie("zan_admin_name", "", 0);
+        this.Ctx().SetCookie("zan_admin_nick", "", 0);
+        this.Redirect("/admin/login");
+    }
+}

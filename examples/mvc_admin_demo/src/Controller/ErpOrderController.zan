@@ -1,0 +1,164 @@
+using System;
+using System.Web;
+using System.Data;
+using System.Collections.Generic;
+using Zan.Mvc.Admin.Attributes;
+using Zan.Mvc.Admin.Web;
+using Zan.Mvc.Admin.UI;
+using Zan.Mvc.Admin.Security;
+using Zan.Mvc.Admin.Model;
+using MvcAdminDemo.Model;
+using MvcAdminDemo.Dao;
+
+namespace MvcAdminDemo.Controller;
+
+public class OrderPagedResult {
+    public int total;
+    public List<ErpOrder> list;
+    public OrderPagedResult() {
+        this.total = 0;
+        this.list = new List<ErpOrder>();
+    }
+}
+
+/// <summary>
+/// 业务控制器：销售订单管理。
+/// 继承自基础中台控制器 BaseAdminController，开箱即用获得：
+/// 1. 声明式模块与菜单自动化归集（[AdminModule], [AdminAction]）
+/// 2. 5 级 DataScope 数据隔离自动织入（根据当前操作人部门与权限范围过滤）
+/// 3. 强类型 DataGrid 页面与接口自动化联动
+/// 4. 零样板 CRUD 代码（底层依托泛型 BaseDao<ErpOrder>）
+/// </summary>
+[AdminModule(Key = "erp", Title = "销售供应链", Icon = "shopping-cart", Order = 2)]
+public class ErpOrderController : BaseAdminController {
+    private ErpOrderDao dao;
+
+    public ErpOrderController() {
+        // 请求入口懒加载或通过连接池注入
+        IDbConnection db = Zan.Mvc.Admin.AdminApp.Db;
+        if (db == null) {
+            db = Zan.Mvc.Admin.AdminApp.OpenDb("data/demo.db");
+        }
+        this.dao = ErpOrderDao.Of(db);
+    }
+
+    /// <summary>订单管理页面：渲染强类型 DataGrid 通用原语界面</summary>
+    [HttpGet]
+    [Route("/admin/erp/order")]
+    [AdminAction(Key = "erp:order", Title = "订单管理", Route = "/admin/erp/order", IsMenu = true, Order = 1)]
+    public void OrderPage() {
+        DataGrid grid = new DataGrid("订单管理", "/admin/erp/order/data");
+        grid.AddColumn("id", "ID", 60)
+            .AddColumn("order_no", "订单编号", 160)
+            .AddColumn("customer_name", "客户名称", 180)
+            .AddColumn("amount", "金额(元)", 100)
+            .AddColumn("department_id", "部门ID", 90)
+            .AddColumn("status", "状态", 90)
+            .AddFilter("order_no", "订单号", "text")
+            .AddFilter("customer_name", "客户名", "text")
+            .AddRowAction("编辑", "/admin/erp/order/edit", "dialog", "", "primary")
+            .AddRowAction("删除", "/admin/erp/order/delete", "post", "", "danger");
+
+        string schemaJson = grid.ToSchemaJson();
+        string html = "<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"UTF-8\"><title>订单管理</title>"
+            + "<link rel=\"stylesheet\" href=\"/static/zan/css/admin.css\">"
+            + "<style>"
+            + "body{margin:0;padding:16px;background:#0f172a;color:#f8fafc;font-family:-apple-system,sans-serif;}"
+            + ".grid-card{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:20px;}"
+            + ".toolbar{display:flex;justify-content:space-between;margin-bottom:16px;}"
+            + "table{width:100%;border-collapse:collapse;margin-top:12px;}"
+            + "th,td{padding:10px 12px;text-align:left;border-bottom:1px solid #334155;font-size:13px;}"
+            + "th{background:#0f172a;color:#94a3b8;font-weight:600;}"
+            + ".btn{background:#38bdf8;color:#0f172a;border:none;border-radius:4px;padding:6px 12px;font-weight:600;cursor:pointer;}"
+            + "</style></head><body>"
+            + "<div class=\"grid-card\">"
+            + "<div class=\"toolbar\"><h2>📦 销售订单管理</h2><button class=\"btn\" onclick=\"addOrder()\">+ 新增订单</button></div>"
+            + "<table id=\"orderTable\"><thead><tr><th>ID</th><th>订单号</th><th>客户名称</th><th>金额</th><th>部门</th><th>操作</th></tr></thead>"
+            + "<tbody id=\"tbody\"><tr><td colspan=\"6\" style=\"text-align:center;color:#94a3b8;\">数据加载中...</td></tr></tbody>"
+            + "</table></div>"
+            + "<script>"
+            + "fetch('/admin/erp/order/data').then(r=>r.json()).then(res=>{"
+            + "  let tb = document.getElementById('tbody'); tb.innerHTML='';"
+            + "  if(!res.data || !res.data.list || res.data.list.length===0){ tb.innerHTML='<tr><td colspan=\"6\" style=\"text-align:center;color:#94a3b8;\">暂无订单数据</td></tr>'; return; }"
+            + "  res.data.list.forEach(item=>{"
+            + "    tb.innerHTML += '<tr><td>'+item.id+'</td><td>'+item.order_no+'</td><td>'+item.customer_name+'</td><td>￥'+item.amount+'</td><td>'+item.department_id+'</td><td><a href=\"#\" onclick=\"delOrder('+item.id+')\" style=\"color:#f87171;\">删除</a></td></tr>';"
+            + "  });"
+            + "});"
+            + "function delOrder(id){ if(confirm('确定删除订单 #'+id+' 吗？')){ fetch('/admin/erp/order/delete?id='+id, {method:'POST'}).then(r=>r.json()).then(res=>{ alert(res.msg); location.reload(); }); } }"
+            + "function addOrder(){ alert('新增订单'); }"
+            + "</script></body></html>";
+
+        this.Html(html);
+    }
+
+    /// <summary>订单分页数据接口：自动基于当前用户 DataScope 过滤</summary>
+    [HttpGet]
+    [Route("/admin/erp/order/data")]
+    public void OrderData() {
+        int page = this.InInt("page", 1);
+        int pageSize = this.InInt("pageSize", 20);
+
+        List<ErpOrder> all = this.dao.Page(page, pageSize);
+        List<ErpOrder> filtered = new List<ErpOrder>();
+
+        // 5 级 DataScope 数据隔离过滤校验
+        DataScope scope = this.CurrentDataScope;
+        for (int i = 0; i < all.Count; i = i + 1) {
+            ErpOrder o = all[i];
+            if (scope.Covers(o.owner_id, o.department_id)) {
+                filtered.Add(o);
+            }
+        }
+
+        OrderPagedResult res = new OrderPagedResult();
+        res.total = filtered.Count;
+        res.list = filtered;
+
+        ApiResponse resp = ApiResponse.Ok("查询成功");
+        resp.data = Json.Serialize<OrderPagedResult>(res);
+        this.Json(Json.Serialize<ApiResponse>(resp));
+    }
+
+    /// <summary>保存订单</summary>
+    [HttpPost]
+    [Route("/admin/erp/order/save")]
+    public void OrderSave() {
+        string orderNo = this.In("order_no");
+        string customer = this.In("customer_name");
+        double amount = this.InDouble("amount", 0.0);
+        int deptId = this.InInt("department_id", this.Context.DeptId);
+
+        if (orderNo.Length == 0 || customer.Length == 0) {
+            this.JsonFail("订单号和客户名称不能为空");
+            return;
+        }
+
+        ErpOrder order = new ErpOrder();
+        order.order_no = orderNo;
+        order.customer_name = customer;
+        order.amount = amount;
+        order.department_id = deptId;
+        order.owner_id = this.CurrentAdminId;
+        order.status = 1;
+        order.created_at = DateTime.UtcNow().ToUnixSeconds();
+
+        int id = this.dao.InsertAndGetId(order);
+        this.AuditLog("CREATE_ORDER", "新增订单: " + orderNo + ", ID=" + Convert.ToString(id));
+        this.JsonSuccess("订单创建成功");
+    }
+
+    /// <summary>删除订单</summary>
+    [HttpPost]
+    [Route("/admin/erp/order/delete")]
+    public void OrderDelete() {
+        int id = this.InInt("id", 0);
+        if (id <= 0) {
+            this.JsonFail("无效的订单 ID");
+            return;
+        }
+
+        this.dao.DeleteById(id);
+        this.AuditLog("DELETE_ORDER", "删除订单 ID=" + Convert.ToString(id));
+        this.JsonSuccess("订单删除成功");
+    }
+}

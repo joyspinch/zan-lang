@@ -1,0 +1,161 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Web;
+using Zan.Mvc.Admin.Dao;
+using Zan.Mvc.Admin.Model;
+using Zan.Mvc.Admin.UI;
+using Zan.Mvc.Admin.Attributes;
+using Zan.Mvc.Admin.Installer;
+
+namespace Zan.Mvc.Admin.Web;
+
+/// <summary>
+/// 系统用户管理控制器。
+/// 声明式业务模块与菜单（自动被中台菜单扫描识别）。
+/// 纯 DataGrid 强类型原语 + SysUserDao 驱动，杜绝模板繁复手写与游标字段映射。
+/// </summary>
+[AdminModule(Key = "sys", Title = "系统管理", Icon = "setting", Order = 1)]
+public class SysUserController : BaseAdminController {
+    [HttpGet]
+    [Route("/admin/sys/user")]
+    [AdminAction(Key = "sys:user:list", Title = "用户管理", Route = "/admin/sys/user", IsMenu = true, Order = 1)]
+    public void Index() {
+        DataGrid grid = new DataGrid("用户管理", "/admin/sys/user/data");
+        grid.AddColumn("id", "ID", 60, "center")
+            .AddColumn("username", "用户名", 140, "left")
+            .AddColumn("nickname", "姓名/昵称", 140, "left")
+            .AddColumn("department_id", "部门编号", 100, "center")
+            .AddColumn("status", "状态", 80, "center", "badge")
+            .AddColumn("created_at", "创建时间", 160, "center", "datetime");
+
+        grid.AddFilter("username", "用户名", "text", "输入用户名模糊搜索")
+            .AddTopAction("新增用户", "/admin/sys/user/add", "dialog", "plus", "primary", "sys:user:add");
+
+        string schemaJson = grid.ToSchemaJson();
+
+        // 注入视图模板
+        string html = "<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"UTF-8\"><title>用户管理</title>"
+            + "<link rel=\"stylesheet\" href=\"/static/zan/css/admin.css\">"
+            + "<script>window.GRID_SCHEMA = " + schemaJson + ";</script>"
+            + "</head><body>"
+            + "<div id=\"gridMount\"></div>"
+            + "<script src=\"/static/zan/js/core/event-bus.js\"></script>"
+            + "<script src=\"/static/zan/js/core/layer.js\"></script>"
+            + "<script src=\"/static/zan/js/admin.js\"></script>"
+            + "</body></html>";
+
+        this.Html(html);
+    }
+
+    [HttpGet]
+    [Route("/admin/sys/user/data")]
+    public void Data() {
+        int page = 1;
+        int pageSize = 20;
+
+        string pageStr = this.In("page");
+        if (pageStr.Length > 0) {
+            page = Convert.ToInt32(pageStr);
+        }
+        if (page <= 0) { page = 1; }
+
+        IDbConnection conn = AdminApp.Db;
+        if (conn == null) { conn = AdminApp.OpenDb(); }
+
+        SysUserDao userDao = SysUserDao.Of(conn);
+        List<SysUser> items = userDao.Page(page, pageSize);
+        int total = userDao.Count();
+
+        string itemsJson = Json.Serialize<List<SysUser>>(items);
+        this.Json("{\"code\":\"0000\",\"msg\":\"ok\",\"data\":{\"items\":" + itemsJson + ",\"total\":" + Convert.ToString(total) + "}}");
+    }
+
+    [HttpPost]
+    [Route("/admin/sys/user/save")]
+    public void Save() {
+        int id = 0;
+        string idStr = this.In("id");
+        if (idStr.Length > 0) {
+            id = Convert.ToInt32(idStr);
+        }
+
+        string username = this.In("username");
+        string password = this.In("password");
+        string nickname = this.In("nickname");
+        int deptId = 1;
+        string deptStr = this.In("department_id");
+        if (deptStr.Length > 0) {
+            deptId = Convert.ToInt32(deptStr);
+        }
+
+        if (username.Length == 0) {
+            this.JsonFail("用户名不能为空");
+            return;
+        }
+
+        IDbConnection conn = AdminApp.Db;
+        if (conn == null) { conn = AdminApp.OpenDb(); }
+        SysUserDao userDao = SysUserDao.Of(conn);
+
+        if (id > 0) {
+            // 更新用户
+            SysUser u = userDao.FindById(id);
+            if (u == null) {
+                this.JsonFail("用户不存在");
+                return;
+            }
+            u.nickname = nickname;
+            u.department_id = deptId;
+            if (password.Length >= 6) {
+                u.password_hash = SchemaMigrator.HashPassword(password, "zan_salt_");
+            }
+            u.updated_at = DateTime.UtcNow().ToUnixSeconds();
+            userDao.Update(u);
+            this.JsonSuccess("更新用户成功");
+        } else {
+            // 新增用户
+            if (userDao.ExistsUsername(username)) {
+                this.JsonFail("用户名已存在");
+                return;
+            }
+            if (password.Length < 6) {
+                this.JsonFail("密码长度不能小于 6 位");
+                return;
+            }
+            long now = DateTime.UtcNow().ToUnixSeconds();
+            SysUser u = new SysUser();
+            u.username = username;
+            u.password_hash = SchemaMigrator.HashPassword(password, "zan_salt_");
+            u.nickname = nickname.Length > 0 ? nickname : username;
+            u.department_id = deptId;
+            u.status = 1;
+            u.created_at = now;
+            u.updated_at = now;
+            userDao.Insert(u);
+            this.JsonSuccess("新增用户成功");
+        }
+    }
+
+    [HttpPost]
+    [Route("/admin/sys/user/delete")]
+    public void Delete() {
+        string idStr = this.In("id");
+        if (idStr.Length == 0) {
+            this.JsonFail("缺少用户 ID");
+            return;
+        }
+        int id = Convert.ToInt32(idStr);
+        if (id == 1) {
+            this.JsonFail("超级管理员账号不可删除");
+            return;
+        }
+
+        IDbConnection conn = AdminApp.Db;
+        if (conn == null) { conn = AdminApp.OpenDb(); }
+        SysUserDao userDao = SysUserDao.Of(conn);
+        userDao.DeleteById(id);
+
+        this.JsonSuccess("删除成功");
+    }
+}

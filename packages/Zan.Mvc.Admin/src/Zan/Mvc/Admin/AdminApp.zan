@@ -1,0 +1,81 @@
+using System;
+using System.IO;
+using System.Data;
+using System.Data.Sqlite;
+using System.Web;
+using Zan.Mvc.Admin.Web;
+using Zan.Mvc.Admin.Security;
+using Zan.Mvc.Admin.Installer;
+
+namespace Zan.Mvc.Admin;
+
+/// <summary>
+/// Zan.Mvc.Admin 通用管理中台统一初始化与装配中枢。
+/// 零侵入、零手写菜单注册、纯实体 ORM 驱动。
+/// 业务系统只需在程序启动时：
+///   AdminApp.UseAdmin(app, db);
+/// 即可一键挂载：
+/// 1. 安装锁防护与初始安装向导网关 (InstallGateMiddleware)；
+/// 2. 静态 UI 资产 (/static/zan/*)；
+/// 3. 全局统一安全与 5 级 DataScope 数据隔离中枢 (SecurityRegistry)；
+/// 4. 属性路由与中台管理端控制器支持。
+/// </summary>
+public class AdminApp {
+    private static IDbConnection _db;
+
+    public static IDbConnection Db {
+        get { return _db; }
+    }
+
+    /// <summary>
+    /// 一键装配管理中台基础设施
+    /// </summary>
+    public static void UseAdmin(WebApp app, IDbConnection db) {
+        _db = db;
+
+        // 1. 注册安装守卫中间件（未安装时拦截重定向至 /install，已安装时永久熔断 /install）
+        app.Before((HttpContext ctx) => {
+            string redirectUrl;
+            int code = InstallGateMiddleware.Check(ctx.path, out redirectUrl);
+            if (code == 302 && redirectUrl.Length > 0) {
+                ctx.Redirect(redirectUrl);
+                return false;
+            }
+            if (code == 404) {
+                ctx.Status(404, "Not Found");
+                ctx.Text("Not Found");
+                return false;
+            }
+            return true;
+        });
+
+        // 2. 挂载随包附带的静态资产 (/static/zan/*)
+        StaticFiles.Mount(app, "/static/zan", "packages/Zan.Mvc.Admin/assets");
+    }
+
+    /// <summary>
+    /// 自动从 config/app.json 初始化数据库连接，若不存在则使用默认 SQLite
+    /// </summary>
+    public static IDbConnection OpenDb(string defaultPath = "data/app.db") {
+        string dbPath = defaultPath;
+        if (File.Exists("config/app.json")) {
+            try {
+                string json = File.ReadAllText("config/app.json");
+                AppConfigFile cfg = Json.Deserialize<AppConfigFile>(json);
+                if (cfg != null && cfg.db != null && cfg.db.path.Length > 0) {
+                    dbPath = cfg.db.path;
+                }
+            } catch (Exception ex) {
+            }
+        }
+
+        string dir = Path.GetDirectoryName(dbPath);
+        if (dir.Length > 0 && !Directory.Exists(dir)) {
+            Directory.CreateDirectory(dir);
+        }
+
+        SqliteConnection conn = SqliteConnection.Open(dbPath);
+        _db = conn;
+        return conn;
+    }
+}
