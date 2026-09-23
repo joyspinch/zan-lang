@@ -214,6 +214,35 @@ class MqttBroker {
     /// 进程级共享实例（未 Use 时返回惰性创建的默认实例）。
     static MqttBroker Instance() { return MqttBroker.Global(); }
 
+    /// <summary>进程退出前的拆卸入口：停掉共享总线轮询并清空
+    /// 注册表，再解除进程级实例。静态 inst 是 broker 及其
+    /// sessions/topics/retained 列表在泄漏探测里的保持根，
+    /// 不拆就恒报"退出仍可达"（A352）。</summary>
+    static void TeardownGlobal() {
+        if (inst != null) {
+            inst.Shutdown();
+            inst = null;
+        }
+    }
+
+    /// <summary>停机：停 KeepAlive 巡检协程（其帧持有 this，不置
+    /// 停止标志它就永生，broker 及列表在退出泄漏探测里恒可达）、
+    /// 停总线轮询、断开并清空全部会话/统计/保留消息。可随后
+    /// TeardownGlobal 一并解除静态实例。</summary>
+    void Shutdown() {
+        this.keepAliveRunning = false;
+        if (this.sharedBus != null) {
+            this.sharedBus.Stop();
+            this.sharedBus = null;
+        }
+        for (int i = 0; i < this.sessions.Count; i = i + 1) {
+            this.sessions[i].alive = false;
+        }
+        this.sessions.Clear();
+        this.topics.Clear();
+        this.retainedMessages.Clear();
+    }
+
     /// 当前连接的客户端数。
     int Count() { return this.sessions.Count; }
 
@@ -634,8 +663,16 @@ class MqttBroker {
     async void EnsureKeepAliveInspector() {
         if (this.keepAliveRunning) { return; }
         this.keepAliveRunning = true;
+        // 100ms 观察步长 ×10 计满才扫表：扫表周期仍是 1s，但停机
+        // 置标志后帧最迟 100ms 就能看到并退出，测试的泵等待
+        // （200ms）来得及让它完成——1s 的 Delay 会让帧在退出时
+        // 仍停靠在 Delay 上，broker 被帧钉住（A352）。
+        int tick = 0;
         while (this.keepAliveRunning) {
-            await Task.Delay(1000);
+            await Task.Delay(100);
+            tick = tick + 1;
+            if (tick < 10) { continue; }
+            tick = 0;
             int now = MqttBroker.Now();
             for (int i = 0; i < this.sessions.Count; i = i + 1) {
                 MqttSession s = this.sessions[i];
