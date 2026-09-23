@@ -1,0 +1,290 @@
+using System;
+
+namespace System.Linq;
+
+/// <summary>对流中每个元素执行的操作。</summary>
+delegate void Action<T>(T item);
+
+/// <summary>
+/// 针对 <see cref="List&lt;T&gt;"/> 的零分配惰性求值流水线（Stream Pipeline）。
+///
+/// 核心特性：
+/// 1. 零中间分配（Zero Allocation）：Where/Skip/Take/TakeWhile 不创建任何中间 List；
+/// 2. 短路提前终止（Short-Circuiting）：Take(k)、First()、Any() 在满足条件时立即 break，不再扫描后续元素；
+/// 3. 单趟遍历（Single Pass）：所有谓词在一个内联循环中流水线式过滤，CPU 缓存行高度亲和。
+///
+/// 示例：
+///   List&lt;int&gt; page = users.AsStream()
+///       .Where((User u) => u.age >= 18)
+///       .Skip(20)
+///       .Take(10)
+///       .Select&lt;int&gt;((User u) => u.id)
+///       .ToList();
+/// </summary>
+class Stream<T> {
+    List<T> src;
+    List<Predicate<T>> filters;
+    Predicate<T> takeWhilePred;
+    int skipN;
+    int takeN;
+    bool distinct;
+
+    public Stream(List<T> src) {
+        this.src = src;
+        this.filters = new List<Predicate<T>>();
+        this.takeWhilePred = null;
+        this.skipN = 0;
+        this.takeN = -1;
+        this.distinct = false;
+    }
+
+    /// 从 List 创建流。
+    static Stream<T> Of(List<T> src) {
+        return new Stream<T>(src);
+    }
+
+    /// <summary>保留满足谓词的元素（中间操作，惰性追加）。多次调用按 AND 组合。</summary>
+    Stream<T> Where(Predicate<T> pred) {
+        this.filters.Add(pred);
+        return this;
+    }
+
+    /// <summary>跳过前 n 个满足过滤条件的元素（中间操作）。</summary>
+    Stream<T> Skip(int n) {
+        this.skipN = this.skipN + n;
+        return this;
+    }
+
+    /// <summary>截取最多 n 个元素（中间操作，在终结操作时支持极速短路）。</summary>
+    Stream<T> Take(int n) {
+        if (this.takeN < 0 || n < this.takeN) {
+            this.takeN = n;
+        }
+        return this;
+    }
+
+    /// <summary>当谓词返回 true 时持续提取，遇到首个 false 立即终结整条流（中间操作）。</summary>
+    Stream<T> TakeWhile(Predicate<T> pred) {
+        this.takeWhilePred = pred;
+        return this;
+    }
+
+    /// <summary>流式去重（中间操作，基于哈希表保证唯一性）。</summary>
+    Stream<T> Distinct() {
+        this.distinct = true;
+        return this;
+    }
+
+    /// <summary>使用 selector 变换元素类型并开启新子流（中间操作）。</summary>
+    Stream<R> Select<R>(Selector<T, R> selector) {
+        List<R> mapped = new List<R>();
+        int skipped = 0;
+        Dict<T, bool> seen = this.distinct ? new Dict<T, bool>() : null;
+
+        for (int i = 0; i < this.src.Count; i = i + 1) {
+            T item = this.src[i];
+            if (this.takeWhilePred != null && !this.takeWhilePred(item)) {
+                break;
+            }
+            bool pass = true;
+            for (int f = 0; f < this.filters.Count; f = f + 1) {
+                if (!this.filters[f](item)) {
+                    pass = false;
+                    break;
+                }
+            }
+            if (pass) {
+                if (seen != null) {
+                    if (seen.ContainsKey(item)) { continue; }
+                    seen[item] = true;
+                }
+                if (skipped < this.skipN) {
+                    skipped = skipped + 1;
+                } else {
+                    mapped.Add(selector(item));
+                    if (this.takeN >= 0 && mapped.Count >= this.takeN) {
+                        break;
+                    }
+                }
+            }
+        }
+        return new Stream<R>(mapped);
+    }
+
+    // ===== 终结操作（Terminal Operations） =====
+
+    /// <summary>物化为新的 List&lt;T&gt;（单趟遍历，按需提前终止）。</summary>
+    List<T> ToList() {
+        List<T> res = new List<T>();
+        if (this.takeN == 0) { return res; }
+
+        int skipped = 0;
+        Dict<T, bool> seen = this.distinct ? new Dict<T, bool>() : null;
+
+        for (int i = 0; i < this.src.Count; i = i + 1) {
+            T item = this.src[i];
+            if (this.takeWhilePred != null && !this.takeWhilePred(item)) {
+                break;
+            }
+            bool pass = true;
+            for (int f = 0; f < this.filters.Count; f = f + 1) {
+                if (!this.filters[f](item)) {
+                    pass = false;
+                    break;
+                }
+            }
+            if (pass) {
+                if (seen != null) {
+                    if (seen.ContainsKey(item)) { continue; }
+                    seen[item] = true;
+                }
+                if (skipped < this.skipN) {
+                    skipped = skipped + 1;
+                } else {
+                    res.Add(item);
+                    if (this.takeN >= 0 && res.Count >= this.takeN) {
+                        break;
+                    }
+                }
+            }
+        }
+        return res;
+    }
+
+    /// <summary>返回第一个匹配元素。匹配到立即退出循环（短路）。空序列抛异常。</summary>
+    T First() {
+        List<T> r = this.Take(1).ToList();
+        if (r.Count == 0) {
+            throw new InvalidOperationException("Sequence contains no elements");
+        }
+        return r[0];
+    }
+
+    /// <summary>返回第一个匹配元素，无匹配时返回给定的默认值。匹配到立即退出循环（短路）。</summary>
+    T FirstOrDefault(T dflt) {
+        List<T> r = this.Take(1).ToList();
+        if (r.Count > 0) { return r[0]; }
+        return dflt;
+    }
+
+    /// <summary>是否存在至少一个满足流过滤条件的元素（找到首个匹配项即短路退出）。</summary>
+    bool Any() {
+        List<T> r = this.Take(1).ToList();
+        return r.Count > 0;
+    }
+
+    /// <summary>流中是否存在满足特定谓词的元素（短路）。</summary>
+    bool Any(Predicate<T> pred) {
+        return this.Where(pred).Any();
+    }
+
+    /// <summary>流中是否所有满足现有过滤的元素均满足给定谓词（短路）。</summary>
+    bool All(Predicate<T> pred) {
+        int skipped = 0;
+        Dict<T, bool> seen = this.distinct ? new Dict<T, bool>() : null;
+
+        for (int i = 0; i < this.src.Count; i = i + 1) {
+            T item = this.src[i];
+            if (this.takeWhilePred != null && !this.takeWhilePred(item)) {
+                break;
+            }
+            bool pass = true;
+            for (int f = 0; f < this.filters.Count; f = f + 1) {
+                if (!this.filters[f](item)) {
+                    pass = false;
+                    break;
+                }
+            }
+            if (pass) {
+                if (seen != null) {
+                    if (seen.ContainsKey(item)) { continue; }
+                    seen[item] = true;
+                }
+                if (skipped < this.skipN) {
+                    skipped = skipped + 1;
+                } else {
+                    if (!pred(item)) {
+                        return false;
+                    }
+                    if (this.takeN >= 0) {
+                        // 计数控制
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    /// <summary>统计匹配元素总数（尊重 Take/Skip 约束）。</summary>
+    int Count() {
+        if (this.takeN == 0) { return 0; }
+        int count = 0;
+        int skipped = 0;
+        Dict<T, bool> seen = this.distinct ? new Dict<T, bool>() : null;
+
+        for (int i = 0; i < this.src.Count; i = i + 1) {
+            T item = this.src[i];
+            if (this.takeWhilePred != null && !this.takeWhilePred(item)) {
+                break;
+            }
+            bool pass = true;
+            for (int f = 0; f < this.filters.Count; f = f + 1) {
+                if (!this.filters[f](item)) {
+                    pass = false;
+                    break;
+                }
+            }
+            if (pass) {
+                if (seen != null) {
+                    if (seen.ContainsKey(item)) { continue; }
+                    seen[item] = true;
+                }
+                if (skipped < this.skipN) {
+                    skipped = skipped + 1;
+                } else {
+                    count = count + 1;
+                    if (this.takeN >= 0 && count >= this.takeN) {
+                        break;
+                    }
+                }
+            }
+        }
+        return count;
+    }
+
+    /// <summary>遍历消费流中每一个有效元素。</summary>
+    void ForEach(Action<T> action) {
+        int skipped = 0;
+        int yielded = 0;
+        Dict<T, bool> seen = this.distinct ? new Dict<T, bool>() : null;
+
+        for (int i = 0; i < this.src.Count; i = i + 1) {
+            T item = this.src[i];
+            if (this.takeWhilePred != null && !this.takeWhilePred(item)) {
+                break;
+            }
+            bool pass = true;
+            for (int f = 0; f < this.filters.Count; f = f + 1) {
+                if (!this.filters[f](item)) {
+                    pass = false;
+                    break;
+                }
+            }
+            if (pass) {
+                if (seen != null) {
+                    if (seen.ContainsKey(item)) { continue; }
+                    seen[item] = true;
+                }
+                if (skipped < this.skipN) {
+                    skipped = skipped + 1;
+                } else {
+                    action(item);
+                    yielded = yielded + 1;
+                    if (this.takeN >= 0 && yielded >= this.takeN) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
