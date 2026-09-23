@@ -1,0 +1,115 @@
+using System;
+using System.Collections.Generic;
+
+namespace Zan.Mvc.Admin.Security;
+
+/// <summary>
+/// 内存单一事实源（Single Source of Truth）全局安全中枢。
+/// 启动时一次性组装完毕，运行时只读无锁、零并发冲突、O(1) 单步位运算鉴权。
+/// </summary>
+public class SecurityRegistry {
+    private static SecurityRegistry instance;
+
+    // 1. 快速路由匹配表（Key: "METHOD:PATH" -> PermNode）
+    public Dictionary<string, PermNode> RouteMap;
+
+    // 2. 权限键匹配表（Key: "erp.purchase.view" -> PermNode）
+    public Dictionary<string, PermNode> KeyMap;
+
+    // 3. 角色权限位图表（RoleId -> uint 掩码，O(1) 位运算鉴权）
+    public Dictionary<int, uint> RoleMasks;
+
+    // 4. 结构化整树（用于前台侧边栏菜单渲染，按 Order 已排序）
+    public List<PermNode> MenuTree;
+
+    public SecurityRegistry() {
+        this.RouteMap = new Dictionary<string, PermNode>();
+        this.KeyMap = new Dictionary<string, PermNode>();
+        this.RoleMasks = new Dictionary<int, uint>();
+        this.MenuTree = new List<PermNode>();
+    }
+
+    public static SecurityRegistry Current {
+        get {
+            if (instance == null) {
+                instance = new SecurityRegistry();
+            }
+            return instance;
+        }
+    }
+
+    /// <summary>
+    /// 注册一个权限/菜单节点至中枢（启动时或元数据扫描时调用）。
+    /// </summary>
+    public void RegisterNode(PermNode node) {
+        if (node.Route.Length > 0) {
+            string routeKey = node.Method.ToUpper() + ":" + node.Route.ToLower();
+            this.RouteMap[routeKey] = node;
+        }
+        if (node.Key.Length > 0) {
+            this.KeyMap[node.Key] = node;
+        }
+        if (node.IsMenu && node.ParentId == 0) {
+            this.MenuTree.Add(node);
+        }
+    }
+
+    /// <summary>
+    /// 根据 HTTP 请求定位权限节点（O(1) 字典查找）。
+    /// </summary>
+    public PermNode FindByRoute(string method, string path) {
+        string routeKey = method.ToUpper() + ":" + path.ToLower();
+        if (this.RouteMap.ContainsKey(routeKey)) {
+            return this.RouteMap[routeKey];
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// O(1) 单步 CPU 位运算判权：比对角色位掩码与节点掩码。
+    /// 彻底消灭遍历权限字符串列表的线性垃圾代码。
+    /// </summary>
+    public bool CheckAccess(int roleId, uint permMask, bool isSuper) {
+        if (isSuper) {
+            return true;
+        }
+        if (permMask == 0) {
+            return true; // 公开免鉴权
+        }
+        if (this.RoleMasks.ContainsKey(roleId)) {
+            uint userMask = this.RoleMasks[roleId];
+            return (userMask & permMask) != 0;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// 为特定角色过滤可见菜单树（深度克隆只读副本，隐藏无权项）。
+    /// </summary>
+    public List<PermNode> FilterMenuForRole(int roleId, bool isSuper) {
+        List<PermNode> visible = new List<PermNode>();
+        for (int i = 0; i < this.MenuTree.Count; i = i + 1) {
+            PermNode mod = this.MenuTree[i];
+            PermNode copyMod = new PermNode();
+            copyMod.Id = mod.Id;
+            copyMod.Key = mod.Key;
+            copyMod.Title = mod.Title;
+            copyMod.Icon = mod.Icon;
+            copyMod.Route = mod.Route;
+            copyMod.Order = mod.Order;
+            copyMod.IsMenu = true;
+
+            for (int j = 0; j < mod.Children.Count; j = j + 1) {
+                PermNode child = mod.Children[j];
+                if (child.IsMenu && this.CheckAccess(roleId, child.PermMask, isSuper)) {
+                    copyMod.Children.Add(child);
+                }
+            }
+
+            if (isSuper || copyMod.Children.Count > 0 || (copyMod.Route.Length > 0 && this.CheckAccess(roleId, mod.PermMask, isSuper))) {
+                visible.Add(copyMod);
+            }
+        }
+        return visible;
+    }
+}

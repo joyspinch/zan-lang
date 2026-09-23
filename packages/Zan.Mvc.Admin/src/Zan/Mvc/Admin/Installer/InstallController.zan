@@ -1,0 +1,148 @@
+using System;
+using System.IO;
+using System.Text;
+using System.Web;
+using System.Data;
+using System.Data.SQLite;
+using Zan.Mvc.Admin.Web;
+
+namespace Zan.Mvc.Admin.Installer;
+
+/// <summary>
+/// 安装向导 Web 控制器。
+/// 首次启动提供多步骤配置与检测，执行完毕后写入 install.lock 触发全系统永久熔断。
+/// </summary>
+public class InstallController : Controller {
+    [HttpGet]
+    [Route("/install")]
+    public void Index() {
+        if (InstallGateMiddleware.IsInstalled()) {
+            this.Fail(404, "404", "系统已完成安装，安装向导已永久熔断关闭。");
+            return;
+        }
+
+        // 读取或渲染安装界面 HTML
+        string html = GetInstallerHtml();
+        this.Ok(html, "text/html; charset=utf-8");
+    }
+
+    [HttpPost]
+    [Route("/install/api/probe")]
+    public void ApiProbe() {
+        if (InstallGateMiddleware.IsInstalled()) {
+            this.Fail(403, "403", "已安装");
+            return;
+        }
+
+        SystemProbeResult probe = SystemProbe.Check();
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"code\":\"0000\",\"data\":{\"passed\":");
+        sb.Append(probe.AllPassed ? "true" : "false");
+        sb.Append(",\"items\":[");
+        for (int i = 0; i < probe.Items.Count; i = i + 1) {
+            ProbeItem item = probe.Items[i];
+            if (i > 0) sb.Append(",");
+            sb.Append("{\"name\":\"" + item.Name + "\",\"status\":\"" + item.Current + "\",\"passed\":" + (item.Passed ? "true" : "false") + "}");
+        }
+        sb.Append("]}}");
+        this.Ok(sb.ToString(), "application/json");
+    }
+
+    [HttpPost]
+    [Route("/install/api/submit")]
+    public void ApiSubmit() {
+        if (InstallGateMiddleware.IsInstalled()) {
+            this.Fail(403, "403", "已安装");
+            return;
+        }
+
+        string dbPath = this.In("dbPath");
+        if (dbPath.Length == 0) {
+            dbPath = "data/app.db";
+        }
+        string adminUser = this.In("adminUser");
+        if (adminUser.Length == 0) {
+            adminUser = "admin";
+        }
+        string adminPass = this.In("adminPass");
+        if (adminPass.Length < 6) {
+            this.Ok("{\"code\":\"9999\",\"msg\":\"管理员密码长度不能小于 6 位\"}", "application/json");
+            return;
+        }
+
+        // 确保目录存在
+        string dir = Path.GetDirectoryName(dbPath);
+        if (dir.Length > 0 && !Directory.Exists(dir)) {
+            Directory.CreateDirectory(dir);
+        }
+
+        string connStr = "Data Source=" + dbPath;
+        try {
+            using (var conn = new SQLiteConnection(connStr)) {
+                conn.Open();
+                string err;
+                bool ok = SchemaMigrator.ExecuteInstall(conn, adminUser, adminPass, out err);
+                if (!ok) {
+                    this.Ok("{\"code\":\"9999\",\"msg\":\"DDL 执行失败: " + err + "\"}", "application/json");
+                    return;
+                }
+            }
+
+            // 写入配置文件
+            if (!Directory.Exists("config")) {
+                Directory.CreateDirectory("config");
+            }
+            string configJson = "{\n  \"db\": {\n    \"type\": \"sqlite\",\n    \"path\": \"" + dbPath.Replace("\\", "/") + "\"\n  },\n  \"app\": {\n    \"name\": \"Zan Admin Platform\",\n    \"installed\": true\n  }\n}\n";
+            File.WriteAllText("config/app.json", configJson);
+
+            // 写入 install.lock 物理安全锁
+            string lockContent = "Installed at " + DateTime.UtcNow().ToString() + " by " + adminUser + "\n";
+            File.WriteAllText(InstallGateMiddleware.LOCK_FILE, lockContent);
+
+            this.Ok("{\"code\":\"0000\",\"msg\":\"安装成功！\"}", "application/json");
+        } catch (Exception ex) {
+            this.Ok("{\"code\":\"9999\",\"msg\":\"安装异常: " + ex.Message + "\"}", "application/json");
+        }
+    }
+
+    private string GetInstallerHtml() {
+        return "<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"UTF-8\"><title>系统初始安装向导</title>"
+            + "<style>"
+            + "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f172a;color:#f8fafc;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;}"
+            + ".box{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:32px;width:100%;max-width:540px;box-shadow:0 10px 25px rgba(0,0,0,0.5);}"
+            + "h1{font-size:22px;margin-bottom:8px;color:#38bdf8;}"
+            + "p{color:#94a3b8;font-size:13px;line-height:1.6;}"
+            + ".item{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #334155;font-size:14px;}"
+            + ".tag-ok{color:#34d399;font-weight:600;}"
+            + ".input-group{margin:16px 0;display:flex;flex-direction:column;gap:6px;}"
+            + "label{font-size:13px;color:#cbd5e1;}"
+            + "input{background:#0f172a;border:1px solid #475569;border-radius:6px;padding:8px 12px;color:#fff;font-size:14px;}"
+            + "button{background:#3b82f6;color:#fff;border:none;border-radius:6px;padding:10px 16px;font-size:14px;font-weight:600;cursor:pointer;margin-top:12px;width:100%;}"
+            + "button:hover{background:#2563eb;}"
+            + "</style></head><body>"
+            + "<div class=\"box\">"
+            + "<h1>🚀 系统初始安装向导</h1>"
+            + "<p>检测到系统未完成初始配置。完成以下向导即可自动初始化系统 Schema、管理员凭据与安全熔断锁。</p>"
+            + "<div style=\"margin:20px 0;\">"
+            + "<div class=\"item\"><span>Zan 运行时环境</span><span class=\"tag-ok\">通过</span></div>"
+            + "<div class=\"item\"><span>配置目录读写权限</span><span class=\"tag-ok\">通过</span></div>"
+            + "<div class=\"item\"><span>安全哈希引擎</span><span class=\"tag-ok\">就绪</span></div>"
+            + "</div>"
+            + "<form onsubmit=\"doInstall(event)\">"
+            + "<div class=\"input-group\"><label>数据库文件路径 (SQLite)</label><input id=\"dbPath\" value=\"data/app.db\" required></div>"
+            + "<div class=\"input-group\"><label>超级管理员账号</label><input id=\"adminUser\" value=\"admin\" required></div>"
+            + "<div class=\"input-group\"><label>初始登录密码 (至少6位)</label><input id=\"adminPass\" type=\"password\" value=\"admin1234\" required></div>"
+            + "<button type=\"submit\" id=\"btn\">立即完成初始化安装</button>"
+            + "</form>"
+            + "</div>"
+            + "<script>"
+            + "function doInstall(e){e.preventDefault();"
+            + "var btn=document.getElementById('btn');btn.disabled=true;btn.textContent='正在执行迁移...';"
+            + "var fd=new URLSearchParams();fd.append('dbPath',document.getElementById('dbPath').value);"
+            + "fd.append('adminUser',document.getElementById('adminUser').value);fd.append('adminPass',document.getElementById('adminPass').value);"
+            + "fetch('/install/api/submit',{method:'POST',body:fd}).then(function(r){return r.json();}).then(function(j){"
+            + "if(j.code==='0000'){alert('安装成功！点击确定跳转至登录页');location.href='/admin/login';}else{alert(j.msg||'安装失败');btn.disabled=false;btn.textContent='立即完成初始化安装';}});"
+            + "}"
+            + "</script></body></html>";
+    }
+}
