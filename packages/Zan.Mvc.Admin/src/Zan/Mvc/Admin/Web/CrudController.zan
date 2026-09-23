@@ -13,21 +13,31 @@ namespace Zan.Mvc.Admin.Web;
 /// <summary>
 /// 通用企业级业务中台 CRUD 控制器微内核基类。
 /// 深度践行“配置下发，配置保存”中台架构哲学：
-/// 1. 端点标准化：Conf (视图配置+三级合并), SaveConf (视图差异持久化), List (分页+5级数据隔离),
-///    AddConf / EditConf (表单规格下发), AddSave / EditSave (增改保存), Field (单元格安全行内修改), Delete (单删/批删)。
+/// 1. 端点标准化：
+///    - Conf (视图配置下发与三级合并)
+///    - SaveConf (可视化设计差异持久化)
+///    - List (统一分页检索与数据范围隔离)
+///    - AddConf / EditConf (动态表单规格下发)
+///    - AddSave / EditSave (强类型实体增改保存)
+///    - Field (行内单元格即时编辑与安全熔断)
+///    - Delete / BatchDelete (单记录与批量删除)
 /// 2. 彻底消灭样板代码：业务控制器无需手写模板、手拼 SQL 或维护重复端点，仅需继承本类并声明 TableConfig 与 FormView。
 /// 3. 安全防护熔断：内置 FieldSecurityGuard，严防越权篡改核心字段。
 /// </summary>
-public abstract class CurdController<TEntity> : BaseAdminController {
+public abstract class CrudController<TEntity> : BaseAdminController {
     protected IDbConnection db;
     protected TableConfig tableConfig;
     protected FormView formView;
 
-    public CurdController(IDbConnection db) {
+    public CrudController(IDbConnection db) {
         this.db = db;
         this.tableConfig = null;
         this.formView = null;
     }
+
+    // =========================================================================
+    // 业务生命周期钩子（子类重写）
+    // =========================================================================
 
     /// <summary>
     /// 子类重写：声明表格基础配置（列定义、筛选器、快捷工具栏）
@@ -40,6 +50,13 @@ public abstract class CurdController<TEntity> : BaseAdminController {
     protected abstract FormView BuildFormView();
 
     /// <summary>
+    /// 子类重写：执行分页检索并返回 PagedResult JSON 字符串（由具体实体控制器具化序列化）
+    /// </summary>
+    protected virtual string OnPage(int page, int pageSize) {
+        return "";
+    }
+
+    /// <summary>
     /// 子类重写：新增保存业务落地钩子
     /// </summary>
     protected abstract int OnInsert(TEntity entity);
@@ -50,7 +67,7 @@ public abstract class CurdController<TEntity> : BaseAdminController {
     protected abstract int OnUpdate(TEntity entity);
 
     /// <summary>
-    /// 子类重写：删除钩子
+    /// 子类重写：单记录删除钩子
     /// </summary>
     protected abstract void OnDelete(int id);
 
@@ -60,6 +77,10 @@ public abstract class CurdController<TEntity> : BaseAdminController {
     protected virtual bool OnField(int id, string fieldName, string fieldValue) {
         return false;
     }
+
+    // =========================================================================
+    // 配置解析与三级合并引擎
+    // =========================================================================
 
     /// <summary>
     /// 获取当前路由下的生效表格配置（代码基线 ⊕ 数据库持久化差异）
@@ -88,7 +109,7 @@ public abstract class CurdController<TEntity> : BaseAdminController {
     }
 
     // =========================================================================
-    // 标准化中台 8 大 CRUD 协议端点
+    // 标准化中台 CRUD 协议端点
     // =========================================================================
 
     /// <summary>
@@ -116,7 +137,25 @@ public abstract class CurdController<TEntity> : BaseAdminController {
     }
 
     /// <summary>
-    /// 端点 3：下发新增表单规格 Schema
+    /// 端点 3：标准分页数据检索（对接通用 DataTable / 前端网格）
+    /// </summary>
+    public virtual void List() {
+        int page = 1;
+        int pageSize = 20;
+        if (this.Ctx() != null) {
+            page = this.InInt("page", 1);
+            pageSize = this.InInt("pageSize", 20);
+        }
+        string dataJson = this.OnPage(page, pageSize);
+        if (dataJson != null && dataJson.Length > 0) {
+            this.JsonSuccessData(dataJson);
+        } else {
+            this.JsonFail("分页查询未配置或实现", "5003");
+        }
+    }
+
+    /// <summary>
+    /// 端点 4：下发新增表单规格 Schema
     /// </summary>
     public virtual void AddConf() {
         FormView view = this.GetFormView();
@@ -127,7 +166,7 @@ public abstract class CurdController<TEntity> : BaseAdminController {
     }
 
     /// <summary>
-    /// 端点 4：下发编辑表单规格 Schema
+    /// 端点 5：下发编辑表单规格 Schema
     /// </summary>
     public virtual void EditConf() {
         FormView view = this.GetFormView();
@@ -138,7 +177,7 @@ public abstract class CurdController<TEntity> : BaseAdminController {
     }
 
     /// <summary>
-    /// 端点 5：通用新增保存
+    /// 端点 6：通用新增保存
     /// </summary>
     public virtual void AddSave(TEntity entity) {
         if (entity == null) {
@@ -155,7 +194,7 @@ public abstract class CurdController<TEntity> : BaseAdminController {
     }
 
     /// <summary>
-    /// 端点 6：通用编辑保存
+    /// 端点 7：通用编辑保存
     /// </summary>
     public virtual void EditSave(TEntity entity) {
         if (entity == null) {
@@ -172,7 +211,7 @@ public abstract class CurdController<TEntity> : BaseAdminController {
     }
 
     /// <summary>
-    /// 端点 7：单元格行内即时修改（安全熔断保护）
+    /// 端点 8：单元格行内即时修改（安全熔断保护）
     /// 严禁越权修改密码、金额、部门、主键等高危列。通过子类 OnField 业务钩子安全落地。
     /// </summary>
     public virtual void Field(int id, string fieldName, string fieldValue) {
@@ -193,11 +232,43 @@ public abstract class CurdController<TEntity> : BaseAdminController {
     }
 
     /// <summary>
-    /// 端点 8：删除操作
+    /// 端点 9：单记录删除
     /// </summary>
     public virtual void Delete(int id) {
         this.OnDelete(id);
         this.AuditLog("Delete", "删除记录 ID: " + Convert.ToString(id));
         this.JsonSuccess("删除成功");
+    }
+
+    /// <summary>
+    /// 端点 10：批量删除（支持逗号分隔 ID 串）
+    /// </summary>
+    public virtual void BatchDelete(string ids) {
+        if (ids == null || ids.Length == 0) {
+            this.JsonFail("请选择需要删除的记录", "4003");
+            return;
+        }
+        List<string> parts = ids.Split(",");
+        int count = 0;
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            string part = parts[i].Trim();
+            if (part.Length > 0) {
+                int id = Convert.ToInt32(part);
+                if (id > 0) {
+                    this.OnDelete(id);
+                    count = count + 1;
+                }
+            }
+        }
+        this.AuditLog("BatchDelete", "批量删除 " + Convert.ToString(count) + " 条记录: " + ids);
+        this.JsonSuccess("成功删除 " + Convert.ToString(count) + " 条数据");
+    }
+}
+
+/// <summary>
+/// 兼容别名：历史代码中习惯写成 CurdController 的场景无缝平滑兼容。
+/// </summary>
+public abstract class CurdController<TEntity> : CrudController<TEntity> {
+    public CurdController(IDbConnection db) : base(db) {
     }
 }
