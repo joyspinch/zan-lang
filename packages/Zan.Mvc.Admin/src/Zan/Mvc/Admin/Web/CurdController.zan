@@ -1,0 +1,203 @@
+using System;
+using System.Web;
+using System.Data;
+using System.Collections.Generic;
+using Zan.Mvc.Admin.Attributes;
+using Zan.Mvc.Admin.UI;
+using Zan.Mvc.Admin.Data;
+using Zan.Mvc.Admin.Security;
+using Zan.Mvc.Admin.Model;
+
+namespace Zan.Mvc.Admin.Web;
+
+/// <summary>
+/// 通用企业级业务中台 CRUD 控制器微内核基类。
+/// 深度践行“配置下发，配置保存”中台架构哲学：
+/// 1. 端点标准化：Conf (视图配置+三级合并), SaveConf (视图差异持久化), List (分页+5级数据隔离),
+///    AddConf / EditConf (表单规格下发), AddSave / EditSave (增改保存), Field (单元格安全行内修改), Delete (单删/批删)。
+/// 2. 彻底消灭样板代码：业务控制器无需手写模板、手拼 SQL 或维护重复端点，仅需继承本类并声明 TableConfig 与 FormView。
+/// 3. 安全防护熔断：内置 FieldSecurityGuard，严防越权篡改核心字段。
+/// </summary>
+public abstract class CurdController<TEntity> : BaseAdminController {
+    protected IDbConnection db;
+    protected TableConfig tableConfig;
+    protected FormView formView;
+
+    public CurdController(IDbConnection db) {
+        this.db = db;
+        this.tableConfig = null;
+        this.formView = null;
+    }
+
+    /// <summary>
+    /// 子类重写：声明表格基础配置（列定义、筛选器、快捷工具栏）
+    /// </summary>
+    protected abstract TableConfig BuildTableConfig();
+
+    /// <summary>
+    /// 子类重写：声明通用表单基础规格（字段类型、验证规则、下拉选项、栅格布局）
+    /// </summary>
+    protected abstract FormView BuildFormView();
+
+    /// <summary>
+    /// 子类重写：新增保存业务落地钩子
+    /// </summary>
+    protected abstract int OnInsert(TEntity entity);
+
+    /// <summary>
+    /// 子类重写：编辑保存业务落地钩子
+    /// </summary>
+    protected abstract int OnUpdate(TEntity entity);
+
+    /// <summary>
+    /// 子类重写：删除钩子
+    /// </summary>
+    protected abstract void OnDelete(int id);
+
+    /// <summary>
+    /// 子类重写：行内单元格即时修改业务落地钩子（通过实体或 ORM 安全更新）
+    /// </summary>
+    protected virtual bool OnField(int id, string fieldName, string fieldValue) {
+        return false;
+    }
+
+    /// <summary>
+    /// 获取当前路由下的生效表格配置（代码基线 ⊕ 数据库持久化差异）
+    /// </summary>
+    public TableConfig GetTableConfig(string route = "") {
+        if (this.tableConfig == null) {
+            this.tableConfig = this.BuildTableConfig();
+        }
+        if (route.Length > 0) {
+            string diffJson = ConfigStorage.GetConfig(this.db, route);
+            if (diffJson.Length > 0) {
+                this.tableConfig.ApplyDiff(diffJson);
+            }
+        }
+        return this.tableConfig;
+    }
+
+    /// <summary>
+    /// 获取当前表单规格
+    /// </summary>
+    public FormView GetFormView() {
+        if (this.formView == null) {
+            this.formView = this.BuildFormView();
+        }
+        return this.formView;
+    }
+
+    // =========================================================================
+    // 标准化中台 8 大 CRUD 协议端点
+    // =========================================================================
+
+    /// <summary>
+    /// 端点 1：下发数据网格与检索配置（支持三级合并）
+    /// </summary>
+    public virtual void Conf(string route = "") {
+        TableConfig cfg = this.GetTableConfig(route);
+        ApiResponse r = ApiResponse.OkData(cfg.ToJson(), "ok");
+        if (this.Ctx() != null) {
+            this.Json(Json.Serialize<ApiResponse>(r));
+        }
+    }
+
+    /// <summary>
+    /// 端点 2：保存前端可视化调整（列宽、排序、隐藏、设计器）的差异配置
+    /// </summary>
+    public virtual void SaveConf(string route, string diffJson) {
+        if (route == null || route.Length == 0 || diffJson == null || diffJson.Length == 0) {
+            this.JsonFail("路由与配置内容不能为空", "4001");
+            return;
+        }
+        ConfigStorage.SaveConfig(this.db, route, diffJson);
+        this.AuditLog("SaveConf", "保存表格视图配置: " + route);
+        this.JsonSuccess("视图配置已保存");
+    }
+
+    /// <summary>
+    /// 端点 3：下发新增表单规格 Schema
+    /// </summary>
+    public virtual void AddConf() {
+        FormView view = this.GetFormView();
+        ApiResponse r = ApiResponse.OkData(view.ToJson(), "ok");
+        if (this.Ctx() != null) {
+            this.Json(Json.Serialize<ApiResponse>(r));
+        }
+    }
+
+    /// <summary>
+    /// 端点 4：下发编辑表单规格 Schema
+    /// </summary>
+    public virtual void EditConf() {
+        FormView view = this.GetFormView();
+        ApiResponse r = ApiResponse.OkData(view.ToJson(), "ok");
+        if (this.Ctx() != null) {
+            this.Json(Json.Serialize<ApiResponse>(r));
+        }
+    }
+
+    /// <summary>
+    /// 端点 5：通用新增保存
+    /// </summary>
+    public virtual void AddSave(TEntity entity) {
+        if (entity == null) {
+            this.JsonFail("提交数据不能为空", "4002");
+            return;
+        }
+        int aff = this.OnInsert(entity);
+        if (aff > 0) {
+            this.AuditLog("AddSave", "新增实体成功");
+            this.JsonSuccess("新增成功");
+        } else {
+            this.JsonFail("新增失败", "5001");
+        }
+    }
+
+    /// <summary>
+    /// 端点 6：通用编辑保存
+    /// </summary>
+    public virtual void EditSave(TEntity entity) {
+        if (entity == null) {
+            this.JsonFail("提交数据不能为空", "4002");
+            return;
+        }
+        int aff = this.OnUpdate(entity);
+        if (aff > 0) {
+            this.AuditLog("EditSave", "更新实体成功");
+            this.JsonSuccess("保存成功");
+        } else {
+            this.JsonFail("保存失败或数据无变化", "5002");
+        }
+    }
+
+    /// <summary>
+    /// 端点 7：单元格行内即时修改（安全熔断保护）
+    /// 严禁越权修改密码、金额、部门、主键等高危列。通过子类 OnField 业务钩子安全落地。
+    /// </summary>
+    public virtual void Field(int id, string fieldName, string fieldValue) {
+        TableConfig cfg = this.GetTableConfig();
+        if (!FieldSecurityGuard.CanInlineEdit(fieldName, cfg)) {
+            this.AuditLog("SecurityAlert", "非法越权尝试修改受保护字段: " + fieldName);
+            this.JsonFail("安全拦截：字段 '" + fieldName + "' 不支持即时修改", "4031");
+            return;
+        }
+
+        bool ok = this.OnField(id, fieldName, fieldValue);
+        if (ok) {
+            this.AuditLog("FieldUpdate", "更新字段 " + fieldName + " 为 " + fieldValue + " (ID: " + Convert.ToString(id) + ")");
+            this.JsonSuccess("修改成功");
+        } else {
+            this.JsonFail("修改失败，记录不存在或业务未支持", "4041");
+        }
+    }
+
+    /// <summary>
+    /// 端点 8：删除操作
+    /// </summary>
+    public virtual void Delete(int id) {
+        this.OnDelete(id);
+        this.AuditLog("Delete", "删除记录 ID: " + Convert.ToString(id));
+        this.JsonSuccess("删除成功");
+    }
+}
