@@ -1147,8 +1147,7 @@ static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
          * call (`Calc.Sum(1, 2, 3)`), while ranking on the element type is what
          * tells `op_call(params double[])` from `op_call(params string[])`. */
         if (ps->items[j]->kind == AST_PARAM && ps->items[j]->param.is_params) {
-            zan_type_t *bundle =
-                zan_binder_resolve_type(g->binder, ps->items[j]->param.type);
+            zan_type_t *bundle = method_param_type(g, m, j);
             if (!bundle || bundle->kind != TYPE_ARRAY ||
                 !bundle->element_type || type_mentions_tp(bundle))
                 break;
@@ -1210,7 +1209,12 @@ static int method_args_score(zan_irgen_t *g, zan_symbol_t *m,
             score += ms;
             continue;
         }
-        zan_type_t *pt = zan_binder_resolve_type(g->binder, ps->items[j]->param.type);
+        /* The bound parameter type, not a fresh resolve: a class type
+         * parameter (`Binding<T>.Set(T v)`) must stay a TYPE_TYPE_PARAM here
+         * even when the user declared `class T`, or the parameter reads as a
+         * concrete user type and disqualifies the only matching overload
+         * (see method_param_type). */
+        zan_type_t *pt = method_param_type(g, m, j);
         if (!pt) continue;
         if (type_mentions_tp(pt)) {
             /* A parameter written over the class's own type parameters has no

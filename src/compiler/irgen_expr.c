@@ -10945,6 +10945,18 @@ static zan_type_t *method_param_type(zan_irgen_t *g, zan_symbol_t *msym, int idx
     if (idx < 0 || idx >= params->count) return NULL;
     zan_ast_node_t *p = params->items[idx];
     if (!p || !p->param.type) return NULL;
+    /* Prefer the parameter symbol the binder bound inside the declaring
+     * class's scope. There the class's own type parameters shadow any user
+     * type of the same simple name; re-resolving the bare type_ref from a
+     * call-site scope would bind `T` to a user `class T` and mis-rank every
+     * overload of the method (a Binding<T>.Set(int) call scored against a
+     * foreign class parameter) and coerce arguments to a bogus signature.
+     * Members of a method symbol are exactly its SYM_PARAM children, matched
+     * by declaration node so ordering cannot alias. */
+    for (int i = 0; i < msym->member_count; i++) {
+        zan_symbol_t *ps = msym->members[i];
+        if (ps && ps->kind == SYM_PARAM && ps->decl == p) return ps->type;
+    }
     return zan_binder_resolve_type(g->binder, p->param.type);
 }
 
