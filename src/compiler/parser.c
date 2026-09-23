@@ -5168,6 +5168,10 @@ static int hoist_nested_types(zan_ast_node_t *unit, zan_ast_node_t *type_node,
         } else if (mem->kind == AST_CLASS_DECL || mem->kind == AST_STRUCT_DECL ||
                    mem->kind == AST_INTERFACE_DECL || mem->kind == AST_ENUM_DECL) {
             hoisted += hoist_nested_types(unit, mem, decls, arena);
+            /* Remember the host so the binder can re-link the lifted type
+             * into it (Host.Nested member access). Delegates share the
+             * method_decl union and cannot carry this stamp. */
+            mem->type_decl.nested_host = type_node;
             zan_ast_list_push(decls, mem, arena);
             hoisted++;
             /* remove from the member list (order-preserving) */

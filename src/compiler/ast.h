@@ -432,6 +432,12 @@ struct zan_ast_node {
             bool is_explicit_layout; /* [StructLayout(LayoutKind.Explicit)]:
                                       * every field carries [FieldOffset(n)] */
             zan_ast_list_t where_clauses; /* AST_WHERE_CLAUSE generic constraints */
+            /* Set by hoist_nested_types: the type this declaration was nested
+             * in before being lifted to unit level. The binder links the
+             * symbol back into the host's member list so `Host.Nested`
+             * resolves like the source wrote it. Delegate decls share the
+             * method_decl union and carry no stamp. */
+            zan_ast_node_t *nested_host;
         } type_decl;
 
         /* method / constructor */

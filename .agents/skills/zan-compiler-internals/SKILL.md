@@ -319,6 +319,31 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   回归锁：conformance_gui_design_palette（设计文档放全 25 个
   展示/工控 kind + 探针侧 Tag/Led/Dropdown 三个同名用户类）。
 
+## 嵌套类型提升：hoist 拿走 AST 嵌套关系，binder 必须挂回宿主 members[]（namespace_qualified_call，2026-09-23）
+
+- **症状**：`class Outer { public class Inner { ... } }` + `Outer.Inner.Value()`
+  被 checker 拒绝 `'Outer' has no member 'Inner'`，而这个限定调用在旧版
+  编译运行全绿——"测试突然红"，且 binder/checker 当时的 diff 都是无关改动。
+- **根因**：parser 的 `zan_parser_flatten_nested_types` 把嵌套类型**整体搬到
+  单元级**（宿主 AST members 里不再有 Inner），类型注册靠简单名。早期
+  checker 对非标量接收者的成员 miss 只返回 type_error **不发诊断**，
+  irgen 的限定名处理器按简单名接住发射，所以"碰巧绿"；后来 typo 守卫把
+  该诊断放宽到所有类/结构接收者（守卫本身是对的，fully_qualified_unresolved
+  靠它），合法的 `Outer.Inner` 一起被拒。
+- **修法**：提升时在 AST 节点盖宿主戳（`type_decl.nested_host` 存宿主**节点
+  指针**），binder 注册完全部顶层类型后按节点指针找到宿主符号，
+  `symbol_add_member` 挂回宿主 members[]。members[] 的消费方
+  （get_field_index 数槽、checker 成员遍历、property getter 查找）全部按
+  kind 过滤或按名匹配，非字段符号入表不动字段布局（类型参数本来就走
+  这条路）。
+- **纪律**：① union 陷阱——AST_DELEGATE_DECL 与 method_decl 共用 union，
+  不能写 type_decl 字段，嵌套 delegate 不盖戳。② 挂回必须在**全部注册完
+  成之后**做（深嵌套 A{B{C}} 提升顺序是 C、B 追加到 decls 尾部，B 注册在
+  C 之后），宿主按节点指针找、不按名字，避免同名类错挂。③ 排查"旧版绿
+  现在红"时先问：当年是不是**没有诊断的静默路径**在兜底——守卫收紧只是
+  让老病灶显形。回归锁：tests/conformance/namespace_qualified_call.zan
+  （负例孪生 fully_qualified_unresolved 必须保持红）。
+
 ## wasm32 局部数爆炸：V8 每函数 5 万局部硬上限
 
 - **症状**：浏览器 `WebAssembly.instantiate` 报 `Compiling function #N:"X"

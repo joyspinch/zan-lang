@@ -919,7 +919,13 @@ static zan_type_kind_t ast_kind_to_type_kind(zan_ast_kind_t kind) {
 
 /* Pass 1: register type declarations */
 static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
+    /* Per-decl symbols, filled as types register: the nested-type relink
+     * below needs the host's symbol by AST node identity, not by name. */
+    zan_symbol_t **syms = (zan_symbol_t **)zan_arena_alloc(
+        b->arena, sizeof(zan_symbol_t *) *
+                      (size_t)(decls->count > 0 ? decls->count : 1));
     for (int i = 0; i < decls->count; i++) {
+        syms[i] = NULL;
         zan_ast_node_t *node = decls->items[i];
 
         /* delegate declarations use method_decl union */
@@ -961,7 +967,30 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
             type->base_type = NULL;
 
             scope_add(b->arena, b->current_scope, sym);
+            syms[i] = sym;
         }
+    }
+
+    /* Re-link hoisted nested types onto their host: the parser lifts
+     * `class Inner` out of `class Outer` to unit level, which loses the
+     * nesting the source wrote. Without this, `Outer.Inner.Value()` fails
+     * the checker's member walk ("'Outer' has no member 'Inner'") even
+     * though irgen's qualified-call path resolves it. Runs after every
+     * registration (deep nesting lifts C before its host B), and matches
+     * hosts by AST node identity, so declaration order is irrelevant. */
+    for (int i = 0; i < decls->count; i++) {
+        zan_ast_node_t *node = decls->items[i];
+        if (node->kind != AST_CLASS_DECL && node->kind != AST_STRUCT_DECL &&
+            node->kind != AST_INTERFACE_DECL && node->kind != AST_ENUM_DECL)
+            continue;
+        zan_ast_node_t *host = node->type_decl.nested_host;
+        if (!host) continue;
+        zan_symbol_t *sym = syms[i];
+        zan_symbol_t *host_sym = NULL;
+        for (int j = 0; j < decls->count; j++) {
+            if (decls->items[j] == host) { host_sym = syms[j]; break; }
+        }
+        if (sym && host_sym) symbol_add_member(b->arena, host_sym, sym);
     }
 
     /* Resolve delegate signatures only after every named type is registered.
