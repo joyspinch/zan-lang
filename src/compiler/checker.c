@@ -2362,6 +2362,10 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             if (left->kind == TYPE_TYPE_PARAM && right->kind == TYPE_TYPE_PARAM &&
                 checker_type_equal(left, right))
                 return c->binder->type_bool;
+            /* Comparing a generic type parameter against null or object (`T a == null`) */
+            if ((left->kind == TYPE_TYPE_PARAM && (right->kind == TYPE_OBJECT || expr_is_null_literal(expr->binary.right))) ||
+                (right->kind == TYPE_TYPE_PARAM && (left->kind == TYPE_OBJECT || expr_is_null_literal(expr->binary.left))))
+                return c->binder->type_bool;
             /* Reference equality is valid for null and types connected by an
              * implicit reference conversion. Sharing the LLVM pointer carrier
              * alone is not enough: unrelated object layouts must not compare
