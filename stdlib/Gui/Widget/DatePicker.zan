@@ -3,6 +3,19 @@ using Gui;
 
 namespace Gui.Widget;
 
+/// 日期选择器的快捷选项定义（相对今天的天数偏移，0=今天，-1=昨天）。
+class DateShortcut {
+    string label;
+    int startOffset;
+    int endOffset;
+
+    DateShortcut(string label, int startOffset, int endOffset) {
+        this.label = label;
+        this.startOffset = startOffset;
+        this.endOffset = endOffset;
+    }
+}
+
 /// 日期编辑控件：可键盘编辑的取值输入框，右侧带日历按钮。
 /// 弹层在覆盖层中绘制，取值通过 OnChange 报告。
 /// Type 字段控制变体（Naive UI type prop）：
@@ -58,6 +71,8 @@ class DatePicker : Control {
     /// Naive UI type prop：date | datetime | daterange | datetimerange |
     /// week | month | monthrange | quarter | quarterrange | year | yearrange。
     string Type;
+    /// 快捷选项配置列表（为空时不显示侧边栏；由配置项动态驱动）。
+    List<DateShortcut> shortcuts;
     /// Naive UI size prop：small | medium | large。Binding<string>
     /// 映射为 input.small/large 档位 class，支持响应式换档。
     Binding<string> Size;
@@ -74,6 +89,7 @@ class DatePicker : Control {
         Change = new UiEvent();
         open = false;
         Type = "date";
+        shortcuts = null;
         Size = "medium";
         selected = DateTime.Now();
         viewYear = selected.Year();
@@ -137,17 +153,28 @@ class DatePicker : Control {
         return ps;
     }
 
-    /// 覆写：应答扩展属性键（日期文本与 type）。
+    /// 覆写：应答扩展属性键（日期文本、type 与 shortcuts 配置）。
     override string GetExtra(string key) {
         if (key == "text" || key == "value") { return this.Text(); }
         if (key == "type") { return Type; }
+        if (key == "shortcuts") {
+            return (shortcuts != null && shortcuts.Count > 0) ? "true" : "false";
+        }
         return "";
     }
 
-    /// 覆写：写回扩展属性键（文本经 SetText 解析，type 合法值切换粒度）。
+    /// 覆写：写回扩展属性键（文本经 SetText 解析，type 合法值切换粒度，shortcuts 配置快捷项）。
     override bool SetExtra(string key, string val) {
         if (key == "text" || key == "value") {
             this.SetText(val);
+            return true;
+        }
+        if (key == "shortcuts") {
+            if (val == "true" || val == "default") {
+                this.UseDefaultShortcuts();
+            } else if (val == "false" || val == "none" || val == "") {
+                this.ClearShortcuts();
+            }
             return true;
         }
         if (key == "type") {
@@ -162,6 +189,35 @@ class DatePicker : Control {
             return true;
         }
         return false;
+    }
+
+    /// 清空快捷选项。
+    DatePicker ClearShortcuts() {
+        this.shortcuts = null;
+        return this;
+    }
+
+    /// 增加一项快捷选项（相对今天的天数偏移，0=今天，-1=昨天）。
+    DatePicker AddShortcut(string label, int startOffset, int endOffset) {
+        if (this.shortcuts == null) {
+            this.shortcuts = new List<DateShortcut>();
+        }
+        this.shortcuts.Add(new DateShortcut(label, startOffset, endOffset));
+        return this;
+    }
+
+    /// 一键配置常用电商/广告报表标准快捷选项（今天、昨天、过去7/14/15/30/60/90天）。
+    DatePicker UseDefaultShortcuts() {
+        this.ClearShortcuts();
+        this.AddShortcut("今天", 0, 0);
+        this.AddShortcut("昨天", 0 - 1, 0 - 1);
+        this.AddShortcut("过去7天", 0 - 7, 0 - 1);
+        this.AddShortcut("过去14天", 0 - 14, 0 - 1);
+        this.AddShortcut("过去15天", 0 - 15, 0 - 1);
+        this.AddShortcut("过去30天", 0 - 30, 0 - 1);
+        this.AddShortcut("过去60天", 0 - 60, 0 - 1);
+        this.AddShortcut("过去90天", 0 - 90, 0 - 1);
+        return this;
     }
 
     /// 覆写：公共事件之外提供 "Change"。
@@ -694,12 +750,15 @@ class DatePicker : Control {
         string gran = this.Granularity();
         bool dayPanels = gran == "day";
         bool dual = this.IsRange();
+        bool hasShortcuts = dual && dayPanels && this.shortcuts != null &&
+                            this.shortcuts.Count > 0;
+        int sidebarW = hasShortcuts ? app.Scale(84) : 0;
         int panelW = app.Scale(224);
         int popH = app.Scale(200);
         if (this.HasTime()) { popH = popH + app.Scale(40); }
         // range 弹层横向并排两个面板（Naive UI *range 系列）。
         int popW = panelW;
-        if (dual) { popW = panelW + panelW; }
+        if (dual) { popW = sidebarW + panelW + panelW; }
         int popX = OverlayPopup.FitX(app, bx, popW);
         int popY = OverlayPopup.FitY(app, by + bh + app.Scale(4), bh, popH);
         StyleBox pop = this.ResolvePartAs(app, "select", "popup", "popup",
@@ -724,6 +783,37 @@ class DatePicker : Control {
             cellH = app.Scale(38);
         }
         int top = popY + headerH;
+        int panelsX = popX + sidebarW;
+
+        if (hasShortcuts) {
+            c.FillRect(panelsX - app.Scale(1), popY, app.Scale(1), popH,
+                       pop.BorderOr(pop.fg));
+            int scCount = this.shortcuts.Count;
+            int itemH = (popH - pad * 2) / (scCount > 0 ? scCount : 1);
+            for (int i = 0; i < scCount; i = i + 1) {
+                DateShortcut sc = this.shortcuts[i];
+                int iy = popY + pad + i * itemH;
+                bool hover = app.mouseX >= popX && app.mouseX < panelsX &&
+                             app.mouseY >= iy && app.mouseY < iy + itemH;
+                if (hover) {
+                    StyleBox hov = Style.Part(app, "datepicker", "cell", "", "",
+                                              "", Style.SHover());
+                    c.FillRoundRect(popX + app.Scale(2), iy + app.Scale(1),
+                                    sidebarW - app.Scale(4), itemH - app.Scale(2),
+                                    app.Scale(3), hov.BgOr(pop.accent));
+                    if (clicked) {
+                        this.ApplyShortcut(sc);
+                        app.ClaimClick();
+                        app.RequestRedraw();
+                        return;
+                    }
+                }
+                string name = sc.label;
+                int color = hover ? pop.accent : pop.fg;
+                c.DrawText(popX + (sidebarW - Canvas.MeasureText(name, fs)) / 2,
+                           Canvas.CenterTextY(iy, itemH, fs), name, color, fs);
+            }
+        }
 
         // 双面板时右面板 = 左面板的下一档：day=下个月，
         // month/quarter=下一年，year=下一个 12 年页。
@@ -754,21 +844,21 @@ class DatePicker : Control {
             int titleW = panelW - pad * 2 - arrowW * 2;
             string leftTitle = this.TitleText(viewYear, viewMonth);
             string rightTitle = this.TitleText(rightYear, rightMonth);
-            c.DrawText(popX + pad + arrowW +
+            c.DrawText(panelsX + pad + arrowW +
                        (titleW - Canvas.MeasureText(leftTitle, fs)) / 2,
                        Canvas.CenterTextY(popY, headerH, fs),
                        leftTitle, pop.fg, fs);
-            c.DrawText(popX + panelW + pad + arrowW +
+            c.DrawText(panelsX + panelW + pad + arrowW +
                        (titleW - Canvas.MeasureText(rightTitle, fs)) / 2,
                        Canvas.CenterTextY(popY, headerH, fs),
                        rightTitle, pop.fg, fs);
-            c.DrawGlyphIn("chevron-left", popX + pad, popY, arrowW,
+            c.DrawGlyphIn("chevron-left", panelsX + pad, popY, arrowW,
                           headerH, app.Scale(13), pop.fg);
             c.DrawGlyphIn("chevron-right", popX + popW - pad - arrowW,
                           popY, arrowW, headerH, app.Scale(13), pop.fg);
             if (clicked) {
-                if (app.mouseX >= popX &&
-                    app.mouseX < popX + pad + arrowW &&
+                if (app.mouseX >= panelsX &&
+                    app.mouseX < panelsX + pad + arrowW &&
                     app.mouseY >= popY && app.mouseY < popY + headerH) {
                     this.MoveView(-1); app.ClaimClick(); app.RequestRedraw(); return;
                 }
@@ -804,41 +894,41 @@ class DatePicker : Control {
         hasHover = false;
         hoverDate = null;
         if (dayPanels) {
-            hoverDate = this.HoverDay(app, popX, top, pad, cellW, cellH,
+            hoverDate = this.HoverDay(app, panelsX, top, pad, cellW, cellH,
                                       viewYear, viewMonth);
             if (dual && hoverDate == null) {
-                hoverDate = this.HoverDay(app, popX + panelW, top, pad,
+                hoverDate = this.HoverDay(app, panelsX + panelW, top, pad,
                                           cellW, cellH, rightYear, rightMonth);
             }
         } else {
-            hoverDate = this.HoverCell(app, popX, top, pad, cellW, cellH,
+            hoverDate = this.HoverCell(app, panelsX, top, pad, cellW, cellH,
                                        leftBase);
             if (dual && hoverDate == null) {
-                hoverDate = this.HoverCell(app, popX + panelW, top, pad,
+                hoverDate = this.HoverCell(app, panelsX + panelW, top, pad,
                                            cellW, cellH, rightBase);
             }
         }
         hasHover = hoverDate != null;
 
         if (dayPanels) {
-            if (this.PaintMonth(app, c, pop, popX, top, pad, cellW, cellH,
+            if (this.PaintMonth(app, c, pop, panelsX, top, pad, cellW, cellH,
                                 fs, pop.fg, viewYear, viewMonth, clicked)) {
                 return;
             }
             if (dual) {
-                if (this.PaintMonth(app, c, pop, popX + panelW, top, pad,
+                if (this.PaintMonth(app, c, pop, panelsX + panelW, top, pad,
                                     cellW, cellH, fs, pop.fg,
                                     rightYear, rightMonth, clicked)) {
                     return;
                 }
             }
         } else {
-            if (this.PaintCellGrid(app, c, pop, popX, top, pad, cellW, cellH,
+            if (this.PaintCellGrid(app, c, pop, panelsX, top, pad, cellW, cellH,
                                    fs, pop.fg, leftBase, clicked)) {
                 return;
             }
             if (dual) {
-                if (this.PaintCellGrid(app, c, pop, popX + panelW, top, pad,
+                if (this.PaintCellGrid(app, c, pop, panelsX + panelW, top, pad,
                                        cellW, cellH, fs, pop.fg, rightBase,
                                        clicked)) {
                     return;
@@ -900,6 +990,30 @@ class DatePicker : Control {
             open = false;
             app.ClaimClick();
             app.RequestRedraw();
+        }
+    }
+
+    /// 快捷区间点选应用：按配置的相对今天偏移计算起止日期。
+    void ApplyShortcut(DateShortcut sc) {
+        long so = sc.startOffset;
+        long eo = sc.endOffset;
+        DateTime startV = DateTime.Now().AddDays(so);
+        DateTime endV = DateTime.Now().AddDays(eo);
+        pendingStart = startV;
+        selected = endV;
+        hasPending = true;
+        pickingEnd = false;
+        viewYear = startV.Year();
+        viewMonth = startV.Month();
+        editor.SetText(this.FormatText());
+        open = false;
+        Change.Raise();
+    }
+
+    /// 按索引应用已配置的快捷选项（供程序化触发与测试）。
+    void ApplyShortcutIndex(int index) {
+        if (this.shortcuts != null && index >= 0 && index < this.shortcuts.Count) {
+            this.ApplyShortcut(this.shortcuts[index]);
         }
     }
 

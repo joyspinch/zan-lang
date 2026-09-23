@@ -36,18 +36,29 @@ public abstract class CrudController<TEntity> : BaseAdminController {
     }
 
     // =========================================================================
-    // 业务生命周期钩子（子类重写）
+    // 业务生命周期钩子（开箱即用默认实现，子类可按需重写）
     // =========================================================================
 
     /// <summary>
-    /// 子类重写：声明表格基础配置（列定义、筛选器、快捷工具栏）
+    /// 子类重写：声明表格基础配置（列定义、筛选器、快捷工具栏）。
+    /// 默认提供标准 ID 列、新增与批量删除快捷工具。
     /// </summary>
-    protected abstract TableConfig BuildTableConfig();
+    protected virtual TableConfig BuildTableConfig() {
+        TableConfig cfg = new TableConfig();
+        cfg.Conf.SetKey("id", "数据列表");
+        cfg.AddColumn("id", "ID", "number", 80, true, false);
+        cfg.AddTool("添加", "Add", "数据", "Primary", false, "600px", "400px");
+        cfg.AddTool("批量删除", "Delete", "数据", "Error", true, "400px", "260px");
+        return cfg;
+    }
 
     /// <summary>
-    /// 子类重写：声明通用表单基础规格（字段类型、验证规则、下拉选项、栅格布局）
+    /// 子类重写：声明通用表单基础规格（字段类型、验证规则、下拉选项、栅格布局）。
     /// </summary>
-    protected abstract FormView BuildFormView();
+    protected virtual FormView BuildFormView() {
+        FormView form = new FormView("编辑表单");
+        return form;
+    }
 
     /// <summary>
     /// 子类重写：执行分页检索并返回 PagedResult JSON 字符串（由具体实体控制器具化序列化）
@@ -57,19 +68,44 @@ public abstract class CrudController<TEntity> : BaseAdminController {
     }
 
     /// <summary>
-    /// 子类重写：新增保存业务落地钩子
+    /// 子类重写：新增保存业务落地钩子（默认通过 ORM 自动插入）
     /// </summary>
-    protected abstract int OnInsert(TEntity entity);
+    protected virtual int OnInsert(TEntity entity) {
+        if (this.db == null || entity == null) { return 0; }
+        return this.db.Insert<TEntity>(entity).ExecuteAffrows();
+    }
 
     /// <summary>
-    /// 子类重写：编辑保存业务落地钩子
+    /// 子类重写：编辑保存业务落地钩子（默认通过 ORM 自动全字段更新）
     /// </summary>
-    protected abstract int OnUpdate(TEntity entity);
+    protected virtual int OnUpdate(TEntity entity) {
+        if (this.db == null || entity == null) { return 0; }
+        return this.db.Update<TEntity>().SetSource(entity).ExecuteAffrows();
+    }
 
     /// <summary>
-    /// 子类重写：单记录删除钩子
+    /// 子类重写：单记录删除钩子（默认通过 ORM 自动按主键删除）
     /// </summary>
-    protected abstract void OnDelete(int id);
+    protected virtual void OnDelete(int id) {
+        if (this.db == null || id <= 0) { return; }
+        this.db.Delete<TEntity>().W("id = ?").Pi(id).ExecuteAffrows();
+    }
+
+    /// <summary>
+    /// 子类重写：批量删除钩子（默认通过 ORM 自动按 ID 数组向量化删除）
+    /// </summary>
+    protected virtual int OnBatchDelete(List<int> ids) {
+        if (this.db == null || ids == null || ids.Count == 0) { return 0; }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            if (i > 0) { sb.Append(", "); }
+            sb.Append("?");
+        }
+        return this.db.Delete<TEntity>()
+            .W("id IN (" + sb.ToString() + ")")
+            .InI(ids)
+            .ExecuteAffrows();
+    }
 
     /// <summary>
     /// 子类重写：行内单元格即时修改业务落地钩子（通过实体或 ORM 安全更新）
@@ -260,17 +296,21 @@ public abstract class CrudController<TEntity> : BaseAdminController {
             return;
         }
         List<string> parts = ids.Split(",");
-        int count = 0;
+        List<int> idList = new List<int>();
         for (int i = 0; i < parts.Count; i = i + 1) {
             string part = parts[i].Trim();
             if (part.Length > 0) {
                 int id = Convert.ToInt32(part);
                 if (id > 0) {
-                    this.OnDelete(id);
-                    count = count + 1;
+                    idList.Add(id);
                 }
             }
         }
+        if (idList.Count == 0) {
+            this.JsonFail("有效记录 ID 为空", "4003");
+            return;
+        }
+        int count = this.OnBatchDelete(idList);
         this.AuditLog("BatchDelete", "批量删除 " + Convert.ToString(count) + " 条记录: " + ids);
         this.JsonSuccess("成功删除 " + Convert.ToString(count) + " 条数据");
     }
