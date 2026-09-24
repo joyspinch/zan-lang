@@ -1,0 +1,251 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Text;
+
+namespace Zan.Mvc.Admin.Generator;
+
+/// <summary>
+/// 数据库逆向工程结构探测器。
+/// 跨方言（SQLite、MySQL、PostgreSQL 等）自动探测物理表结构与字段，
+/// 并智能推导组件类型（Input / Number / DateTime / Select 等）与默认校验规则。
+/// </summary>
+public class DbSchemaProbe {
+
+    /// <summary>
+    /// 获取当前数据库中所有的用户表清单
+    /// </summary>
+    public static List<TableMeta> ListTables(IDbConnection db) {
+        List<TableMeta> list = new List<TableMeta>();
+        if (db == null) { return list; }
+
+        int provider = db.GetProvider();
+        string sql = "";
+        if (provider == DbProvider.SQLite) {
+            sql = "SELECT name, '' AS comment FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name";
+        } else if (provider == DbProvider.MySQL || provider == DbProvider.MariaDB) {
+            sql = "SELECT table_name, table_comment FROM information_schema.tables WHERE table_schema = DATABASE() ORDER BY table_name";
+        } else {
+            sql = "SELECT table_name, '' AS comment FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name";
+        }
+
+        DbResult r = db.Query(sql);
+        for (int i = 0; i < r.RowCount(); i = i + 1) {
+            string tbl = r.GetString(i, 0);
+            string comment = r.GetString(i, 1);
+            TableMeta t = new TableMeta();
+            t.tableName = tbl;
+            t.entityName = ToPascalCase(tbl);
+            if (comment.Length > 0) {
+                t.title = comment;
+            } else {
+                t.title = InferTableTitle(tbl);
+            }
+            list.Add(t);
+        }
+        return list;
+    }
+
+    /// <summary>
+    /// 探测单张表的完整列结构与推导属性
+    /// </summary>
+    public static TableMeta ProbeTable(IDbConnection db, string tableName) {
+        TableMeta meta = new TableMeta();
+        meta.tableName = tableName;
+        meta.entityName = ToPascalCase(tableName);
+        meta.title = InferTableTitle(tableName);
+
+        if (db == null || tableName.Length == 0) { return meta; }
+
+        int provider = db.GetProvider();
+        if (provider == DbProvider.SQLite) {
+            DbResult r = db.Query("PRAGMA table_info(" + tableName + ")");
+            for (int i = 0; i < r.RowCount(); i = i + 1) {
+                string name = r.GetString(i, 1);
+                string colType = r.GetString(i, 2);
+                int notNull = r.GetInt(i, 3);
+                int pk = r.GetInt(i, 5);
+
+                ColumnMeta col = new ColumnMeta();
+                col.name = name;
+                col.sqlType = colType;
+                col.isPk = pk > 0;
+                col.isIdentity = pk > 0 && colType.ToUpper().Contains("INT");
+                col.isNullable = notNull == 0;
+                InferColumnProperties(col);
+                meta.AddColumn(col);
+            }
+        } else if (provider == DbProvider.MySQL || provider == DbProvider.MariaDB) {
+            string sql = "SELECT column_name, data_type, is_nullable, column_key, column_comment, extra " +
+                         "FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? " +
+                         "ORDER BY ordinal_position";
+            DbResult r = db.Query(sql, new DbParams().Add(tableName));
+            for (int i = 0; i < r.RowCount(); i = i + 1) {
+                string name = r.GetString(i, 0);
+                string dataType = r.GetString(i, 1);
+                string isNullable = r.GetString(i, 2);
+                string colKey = r.GetString(i, 3);
+                string comment = r.GetString(i, 4);
+                string extra = r.GetString(i, 5);
+
+                ColumnMeta col = new ColumnMeta();
+                col.name = name;
+                col.sqlType = dataType;
+                col.isPk = colKey == "PRI";
+                col.isIdentity = extra.Contains("auto_increment");
+                col.isNullable = isNullable == "YES";
+                if (comment.Length > 0) {
+                    col.title = comment;
+                }
+                InferColumnProperties(col);
+                meta.AddColumn(col);
+            }
+        } else {
+            // 标准 information_schema 回退
+            string sql = "SELECT column_name, data_type, is_nullable " +
+                         "FROM information_schema.columns WHERE table_name = ? " +
+                         "ORDER BY ordinal_position";
+            DbResult r = db.Query(sql, new DbParams().Add(tableName));
+            for (int i = 0; i < r.RowCount(); i = i + 1) {
+                string name = r.GetString(i, 0);
+                string dataType = r.GetString(i, 1);
+                string isNullable = r.GetString(i, 2);
+
+                ColumnMeta col = new ColumnMeta();
+                col.name = name;
+                col.sqlType = dataType;
+                col.isPk = (name == "id");
+                col.isIdentity = (name == "id");
+                col.isNullable = isNullable == "YES";
+                InferColumnProperties(col);
+                meta.AddColumn(col);
+            }
+        }
+
+        return meta;
+    }
+
+    /// <summary>
+    /// 根据字段名和物理类型智能推导 Zan 类型、UI 控件类型、业务文案及校验规则
+    /// </summary>
+    private static void InferColumnProperties(ColumnMeta col) {
+        string n = col.name.ToLower();
+        string t = col.sqlType.ToUpper();
+
+        // 1. Zan 语言强类型映射
+        if (t.Contains("BIGINT") || n.EndsWith("_at") || n.EndsWith("_time")) {
+            col.zanType = "long";
+        } else if (t.Contains("INT") || t.Contains("TINYINT") || t.Contains("SMALLINT")) {
+            col.zanType = "int";
+        } else if (t.Contains("DECIMAL") || t.Contains("DOUBLE") || t.Contains("FLOAT") || t.Contains("REAL") || t.Contains("NUMERIC")) {
+            col.zanType = "double";
+        } else if (t.Contains("BOOL")) {
+            col.zanType = "bool";
+        } else {
+            col.zanType = "string";
+        }
+
+        // 2. 字段业务显示文案推导（若数据库无注释）
+        if (col.title.Length == 0) {
+            col.title = InferFieldTitle(n);
+        }
+
+        // 3. UI 控件推导
+        if (col.isPk) {
+            col.component = "Number";
+            col.width = 70;
+            col.isRequired = false;
+        } else if (n.Contains("password") || n.Contains("pwd")) {
+            col.component = "Password";
+            col.width = 120;
+            col.isRequired = true;
+            col.ruleExpr = "min:6";
+        } else if (n == "status" || n == "state" || n.EndsWith("_status")) {
+            col.component = "Select";
+            col.width = 90;
+            col.isRequired = true;
+            col.ruleExpr = "in:0,1";
+        } else if (n.EndsWith("_at") || n.EndsWith("_time") || t.Contains("DATETIME") || t.Contains("TIMESTAMP")) {
+            col.component = "DateTime";
+            col.width = 170;
+            col.isRequired = false;
+        } else if (n.Contains("desc") || n.Contains("remark") || n.Contains("content") || t.Contains("TEXT")) {
+            col.component = "TextArea";
+            col.width = 200;
+            col.isRequired = false;
+            col.ruleExpr = "max:500";
+        } else if (col.zanType == "int" || col.zanType == "double") {
+            col.component = "Number";
+            col.width = 100;
+            col.isRequired = !col.isNullable;
+            col.ruleExpr = "min:0";
+        } else if (col.zanType == "bool") {
+            col.component = "Switch";
+            col.width = 80;
+            col.isRequired = false;
+        } else {
+            col.component = "Input";
+            col.width = 130;
+            col.isRequired = !col.isNullable;
+            col.ruleExpr = col.isRequired ? "require|max:64" : "max:64";
+        }
+    }
+
+    /// <summary>
+    /// 表名转帕斯卡驼峰（如 sys_operation_logs -> SysOperationLog）
+    /// </summary>
+    public static string ToPascalCase(string name) {
+        if (name == null || name.Length == 0) { return ""; }
+        List<string> parts = name.Split("_");
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            string p = parts[i];
+            if (p.Length > 0) {
+                sb.Append(p.Substring(0, 1).ToUpper());
+                if (p.Length > 1) {
+                    sb.Append(p.Substring(1).ToLower());
+                }
+            }
+        }
+        string res = sb.ToString();
+        // 抹除末尾单复数 's'（例如 Users -> User, Roles -> Role）
+        if (res.EndsWith("s") && !res.EndsWith("ss") && res.Length > 2) {
+            res = res.Substring(0, res.Length - 1);
+        }
+        return res;
+    }
+
+    private static string InferTableTitle(string tbl) {
+        string t = tbl.ToLower();
+        if (t.Contains("user")) { return "用户管理"; }
+        if (t.Contains("role")) { return "角色管理"; }
+        if (t.Contains("dept") || t.Contains("department")) { return "部门管理"; }
+        if (t.Contains("log")) { return "审计日志"; }
+        if (t.Contains("config") || t.Contains("setting")) { return "系统配置"; }
+        if (t.Contains("order")) { return "订单管理"; }
+        if (t.Contains("goods") || t.Contains("product")) { return "商品管理"; }
+        if (t.Contains("article") || t.Contains("post")) { return "文章内容"; }
+        return ToPascalCase(tbl) + "管理";
+    }
+
+    private static string InferFieldTitle(string field) {
+        if (field == "id") { return "ID"; }
+        if (field == "username") { return "用户名"; }
+        if (field == "password" || field == "password_hash") { return "登录密码"; }
+        if (field == "nickname" || field == "name") { return "姓名/名称"; }
+        if (field == "title") { return "标题"; }
+        if (field == "status") { return "状态"; }
+        if (field == "email") { return "电子邮箱"; }
+        if (field == "mobile" || field == "phone") { return "联系电话"; }
+        if (field == "department_id" || field == "dept_id") { return "部门编号"; }
+        if (field == "role_id") { return "角色编号"; }
+        if (field == "created_at" || field == "create_time") { return "创建时间"; }
+        if (field == "updated_at" || field == "update_time") { return "更新时间"; }
+        if (field == "remark" || field == "desc" || field == "description") { return "备注说明"; }
+        if (field == "order_num" || field == "sort") { return "排序号"; }
+        if (field == "price") { return "单价"; }
+        if (field == "amount") { return "金额"; }
+        if (field == "count" || field == "qty") { return "数量"; }
+        return field;
+    }
+}

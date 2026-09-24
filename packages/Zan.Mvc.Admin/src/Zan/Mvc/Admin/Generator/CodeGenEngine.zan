@@ -1,0 +1,218 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+namespace Zan.Mvc.Admin.Generator;
+
+/// <summary>
+/// 企业级通用代码生成引擎。
+/// 依据 TableMeta 元数据，秒级全自动生成符合 Zan.Mvc.Admin 架构规范的：
+/// 1. ORM 实体（Model）：带 [Table]、[Column]、[Index] 规范化声明与初始字段赋值
+/// 2. 结构化校验器（Validator）：继承 BaseValidator，支持场景化管道校验
+/// 3. CRUD 控制器（Controller）：继承 CrudController<T>，声明 TableConfig、FormView 与业务钩子
+/// </summary>
+public class CodeGenEngine {
+
+    /// <summary>
+    /// 生成 ORM 实体类源码
+    /// </summary>
+    public static string GenerateEntity(TableMeta meta, string ns = "App.Model") {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("using System;\n");
+        sb.Append("using System.Data.Orm;\n\n");
+        sb.Append("namespace " + ns + ";\n\n");
+        sb.Append("/// <summary>\n");
+        sb.Append("/// " + meta.title + "（自动生成实体，映射物理表 " + meta.tableName + "）\n");
+        sb.Append("/// </summary>\n");
+        sb.Append("[Table(Name = \"" + meta.tableName + "\")]\n");
+
+        // 智能为常见高频检索字段生成二级索引
+        for (int i = 0; i < meta.columns.Count; i = i + 1) {
+            ColumnMeta c = meta.columns[i];
+            if (c.isPk) { continue; }
+            if (c.name == "status" || c.name.EndsWith("_status")) {
+                sb.Append("[Index(Name = \"ix_" + meta.tableName + "_" + c.name + "\", Fields = \"" + c.name + "\")]\n");
+            } else if (c.name.EndsWith("_id") && c.zanType == "int") {
+                sb.Append("[Index(Name = \"ix_" + meta.tableName + "_" + c.name + "\", Fields = \"" + c.name + "\")]\n");
+            }
+        }
+
+        sb.Append("public class " + meta.entityName + " {\n");
+
+        // 字段列表
+        for (int i = 0; i < meta.columns.Count; i = i + 1) {
+            ColumnMeta c = meta.columns[i];
+            if (c.isPk) {
+                sb.Append("    [Column(IsIdentity = true, IsPrimary = true)]\n");
+            } else if (c.zanType == "string" && !c.component.Contains("Text")) {
+                sb.Append("    [Column(StringLength = 128)]\n");
+            }
+            sb.Append("    public " + c.zanType + " " + c.name + ";\n");
+        }
+
+        // 无参构造器
+        sb.Append("\n    public " + meta.entityName + "() {\n");
+        for (int i = 0; i < meta.columns.Count; i = i + 1) {
+            ColumnMeta c = meta.columns[i];
+            if (c.zanType == "string") {
+                sb.Append("        this." + c.name + " = \"\";\n");
+            } else if (c.zanType == "bool") {
+                sb.Append("        this." + c.name + " = false;\n");
+            } else {
+                sb.Append("        this." + c.name + " = 0;\n");
+            }
+        }
+        sb.Append("    }\n");
+        sb.Append("}\n");
+
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// 生成业务结构化校验器源码
+    /// </summary>
+    public static string GenerateValidator(TableMeta meta, string ns = "App.Validation") {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("using System;\n");
+        sb.Append("using Zan.Mvc.Admin.Validation;\n\n");
+        sb.Append("namespace " + ns + ";\n\n");
+        sb.Append("/// <summary>\n");
+        sb.Append("/// " + meta.title + "校验器（声明式规则管道与场景隔离）\n");
+        sb.Append("/// </summary>\n");
+        sb.Append("public class " + meta.entityName + "Validator : BaseValidator {\n");
+        sb.Append("    public " + meta.entityName + "Validator() {\n");
+
+        StringBuilder addFields = new StringBuilder();
+        StringBuilder editFields = new StringBuilder();
+
+        for (int i = 0; i < meta.columns.Count; i = i + 1) {
+            ColumnMeta c = meta.columns[i];
+            if (c.isPk) { continue; }
+            if (c.ruleExpr.Length > 0) {
+                sb.Append("        this.Rule(\"" + c.name + "\", \"" + c.ruleExpr + "\");\n");
+            }
+            if (addFields.Length > 0) { addFields.Append(","); }
+            addFields.Append(c.name);
+
+            if (editFields.Length > 0) { editFields.Append(","); }
+            editFields.Append(c.name);
+        }
+
+        sb.Append("\n        // 场景隔离：新增与编辑验证字段集合\n");
+        sb.Append("        this.Scene(\"add\", \"" + addFields.ToString() + "\");\n");
+        sb.Append("        this.Scene(\"edit\", \"" + editFields.ToString() + "\");\n");
+        sb.Append("    }\n");
+        sb.Append("}\n");
+
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// 生成标准 CRUD 控制器源码
+    /// </summary>
+    public static string GenerateController(TableMeta meta, string ns = "App.Web", string modelNs = "App.Model", string valNs = "App.Validation") {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("using System;\n");
+        sb.Append("using System.Collections.Generic;\n");
+        sb.Append("using System.Data;\n");
+        sb.Append("using System.Web;\n");
+        sb.Append("using Zan.Mvc.Admin.Attributes;\n");
+        sb.Append("using Zan.Mvc.Admin.UI;\n");
+        sb.Append("using Zan.Mvc.Admin.Web;\n");
+        sb.Append("using Zan.Mvc.Admin.Validation;\n");
+        sb.Append("using " + modelNs + ";\n");
+        sb.Append("using " + valNs + ";\n\n");
+        sb.Append("namespace " + ns + ";\n\n");
+        sb.Append("/// <summary>\n");
+        sb.Append("/// " + meta.title + "控制器（纯规格驱动，继承企业级通用中台 CrudController<T>）\n");
+        sb.Append("/// </summary>\n");
+        sb.Append("[Description(\"" + meta.title + "\")]\n");
+        sb.Append("[AdminAction(Icon = \"file-text\", Order = 10)]\n");
+        sb.Append("public class " + meta.entityName + "Controller : CrudController<" + meta.entityName + "> {\n\n");
+
+        // 构造方法
+        sb.Append("    public " + meta.entityName + "Controller(IDbConnection db = null) : base(db != null ? db : AdminApp.Db) {\n");
+        sb.Append("    }\n\n");
+
+        // 注入结构化校验器
+        sb.Append("    /// <summary>挂载专用结构化验证器</summary>\n");
+        sb.Append("    protected override BaseValidator GetValidator() {\n");
+        sb.Append("        return new " + meta.entityName + "Validator();\n");
+        sb.Append("    }\n\n");
+
+        // 构建表格规格
+        sb.Append("    /// <summary>声明表格列规格、搜索项及操作栏</summary>\n");
+        sb.Append("    protected override TableConfig BuildTableConfig() {\n");
+        sb.Append("        TableConfig cfg = new TableConfig();\n");
+        sb.Append("        cfg.Conf.SetKey(\"" + meta.pkColumn + "\", \"" + meta.title + "\");\n");
+
+        for (int i = 0; i < meta.columns.Count; i = i + 1) {
+            ColumnMeta c = meta.columns[i];
+            string cType = "input";
+            if (c.zanType == "int" || c.zanType == "long" || c.zanType == "double") {
+                cType = (c.name == "status") ? "dict" : "number";
+            } else if (c.component == "DateTime") {
+                cType = "datetime";
+            } else if (c.component == "Switch") {
+                cType = "switch";
+            }
+            bool inlineEdit = (c.name == "status" || c.name == "name" || c.name == "title");
+            sb.Append("        cfg.AddColumn(\"" + c.name + "\", \"" + c.title + "\", \"" + cType + "\", " + Convert.ToString(c.width) + ", " + (c.isPk ? "true" : "false") + ", " + (inlineEdit ? "true" : "false") + ");\n");
+        }
+
+        // 添加常用筛选与工具栏
+        for (int i = 0; i < meta.columns.Count; i = i + 1) {
+            ColumnMeta c = meta.columns[i];
+            if (!c.isPk && (c.name.Contains("name") || c.name.Contains("title"))) {
+                sb.Append("        cfg.AddFilter(\"" + c.name + "\", \"" + c.title + "\", \"Input\", \"请输入" + c.title + "搜索\");\n");
+                break;
+            }
+        }
+        sb.Append("        cfg.AddTool(\"新增" + meta.title + "\", \"Add\", \"" + meta.title + "\", \"Primary\", false, \"600px\", \"480px\");\n");
+        sb.Append("        cfg.AddTool(\"批量删除\", \"Delete\", \"" + meta.title + "\", \"Error\", true, \"400px\", \"260px\");\n");
+        sb.Append("        return cfg;\n");
+        sb.Append("    }\n\n");
+
+        // 构建动态表单规格
+        sb.Append("    /// <summary>声明动态新增/编辑表单字段规格</summary>\n");
+        sb.Append("    protected override FormView BuildFormView() {\n");
+        sb.Append("        FormView form = new FormView(\"" + meta.title + "\");\n");
+        for (int i = 0; i < meta.columns.Count; i = i + 1) {
+            ColumnMeta c = meta.columns[i];
+            if (c.isPk) { continue; }
+            string comp = c.component.ToLower();
+            sb.Append("        form.AddField(\"" + c.name + "\", \"" + c.title + "\", \"" + comp + "\", " + (c.isRequired ? "true" : "false") + ", \"请输入" + c.title + "\", 12);\n");
+        }
+        sb.Append("        return form;\n");
+        sb.Append("    }\n\n");
+
+        // 行内单元格安全即时编辑按需更新
+        sb.Append("    /// <summary>单元格即时编辑落地（采用 DbValues 按需差量单列更新）</summary>\n");
+        sb.Append("    protected override bool OnField(int id, string fieldName, string fieldValue) {\n");
+        sb.Append("        DbValues vals = new DbValues();\n");
+        sb.Append("        if (fieldName == \"status\") {\n");
+        sb.Append("            vals.Set(\"status\", Convert.ToInt32(fieldValue));\n");
+        sb.Append("        } else if (fieldName == \"title\" || fieldName == \"name\") {\n");
+        sb.Append("            vals.Set(fieldName, fieldValue);\n");
+        sb.Append("        } else {\n");
+        sb.Append("            return false;\n");
+        sb.Append("        }\n");
+        sb.Append("        return this.db.Update<" + meta.entityName + ">().SetDict(vals).Where(e => e." + meta.pkColumn + " == id).ExecuteAffrows() > 0;\n");
+        sb.Append("    }\n");
+
+        sb.Append("}\n");
+
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// 全量打包生成三件套代码（返回文件名与源码映射表）
+    /// </summary>
+    public static Dict<string, string> GenerateAll(TableMeta meta, string baseNs = "App") {
+        Dict<string, string> files = new Dict<string, string>();
+        files[meta.entityName + ".zan"] = GenerateEntity(meta, baseNs + ".Model");
+        files[meta.entityName + "Validator.zan"] = GenerateValidator(meta, baseNs + ".Validation");
+        files[meta.entityName + "Controller.zan"] = GenerateController(meta, baseNs + ".Web", baseNs + ".Model", baseNs + ".Validation");
+        return files;
+    }
+}

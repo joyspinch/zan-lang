@@ -1,0 +1,166 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.IO;
+using System.Text;
+using System.Web;
+using Zan.Mvc.Admin.Attributes;
+using Zan.Mvc.Admin.Web;
+using Zan.Mvc.Admin.Security;
+
+namespace Zan.Mvc.Admin.Generator;
+
+/// <summary>
+/// 研发中台逆向工程与自动化代码生成控制器。
+/// 提供在线数据表探测、字段 UI/校验推导、多端源码实时预览及一键秒级生成落盘。
+/// </summary>
+[AdminModule(Key = "tool", Title = "研发工具", Icon = "tool", Order = 90)]
+[Description("代码生成器")]
+[AdminAction(Icon = "cpu", Order = 1)]
+public class GenController : BaseAdminController {
+    private IDbConnection db;
+
+    public GenController(IDbConnection db = null) {
+        if (db != null) {
+            this.db = db;
+        } else {
+            this.db = AdminApp.Db;
+            if (this.db == null) {
+                this.db = AdminApp.OpenDb();
+            }
+        }
+    }
+
+    /// <summary>
+    /// 端点 1：获取数据库物理表清单
+    /// </summary>
+    public void Tables() {
+        List<TableMeta> list = DbSchemaProbe.ListTables(this.db);
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[");
+        for (int i = 0; i < list.Count; i = i + 1) {
+            TableMeta t = list[i];
+            if (i > 0) { sb.Append(","); }
+            sb.Append("{\"tableName\":\"" + t.tableName + "\",");
+            sb.Append("\"entityName\":\"" + t.entityName + "\",");
+            sb.Append("\"title\":\"" + t.title + "\"}");
+        }
+        sb.Append("]");
+        this.JsonSuccessData(sb.ToString(), "获取数据表列表成功");
+    }
+
+    /// <summary>
+    /// 端点 2：探测指定表的列元数据与 UI 推导规格
+    /// </summary>
+    public void TableDetail(string tableName) {
+        if (tableName == null || tableName.Length == 0) {
+            this.JsonFail("表名不能为空", "4001");
+            return;
+        }
+        TableMeta meta = DbSchemaProbe.ProbeTable(this.db, tableName);
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"tableName\":\"" + meta.tableName + "\",");
+        sb.Append("\"entityName\":\"" + meta.entityName + "\",");
+        sb.Append("\"title\":\"" + meta.title + "\",");
+        sb.Append("\"pkColumn\":\"" + meta.pkColumn + "\",");
+        sb.Append("\"columns\":[");
+        for (int i = 0; i < meta.columns.Count; i = i + 1) {
+            ColumnMeta c = meta.columns[i];
+            if (i > 0) { sb.Append(","); }
+            sb.Append("{\"name\":\"" + c.name + "\",");
+            sb.Append("\"sqlType\":\"" + c.sqlType + "\",");
+            sb.Append("\"zanType\":\"" + c.zanType + "\",");
+            sb.Append("\"title\":\"" + c.title + "\",");
+            sb.Append("\"isPk\":" + (c.isPk ? "true" : "false") + ",");
+            sb.Append("\"isIdentity\":" + (c.isIdentity ? "true" : "false") + ",");
+            sb.Append("\"component\":\"" + c.component + "\",");
+            sb.Append("\"isRequired\":" + (c.isRequired ? "true" : "false") + ",");
+            sb.Append("\"width\":" + Convert.ToString(c.width) + ",");
+            sb.Append("\"ruleExpr\":\"" + c.ruleExpr + "\"}");
+        }
+        sb.Append("]}");
+        this.JsonSuccessData(sb.ToString(), "探测表结构成功");
+    }
+
+    /// <summary>
+    /// 端点 3：在线预览生成的实体、校验器与控制器源码
+    /// </summary>
+    public void Preview(string tableName, string baseNs = "App") {
+        if (tableName == null || tableName.Length == 0) {
+            this.JsonFail("表名不能为空", "4001");
+            return;
+        }
+        TableMeta meta = DbSchemaProbe.ProbeTable(this.db, tableName);
+        string entityCode = CodeGenEngine.GenerateEntity(meta, baseNs + ".Model");
+        string validatorCode = CodeGenEngine.GenerateValidator(meta, baseNs + ".Validation");
+        string controllerCode = CodeGenEngine.GenerateController(meta, baseNs + ".Web", baseNs + ".Model", baseNs + ".Validation");
+
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"entity\":");
+        sb.Append(EscapeJsonString(entityCode));
+        sb.Append(",\"validator\":");
+        sb.Append(EscapeJsonString(validatorCode));
+        sb.Append(",\"controller\":");
+        sb.Append(EscapeJsonString(controllerCode));
+        sb.Append("}");
+
+        this.JsonSuccessData(sb.ToString(), "代码生成预览成功");
+    }
+
+    /// <summary>
+    /// 端点 4：一键秒级生成代码并物理落盘
+    /// </summary>
+    public void Generate(string tableName, string baseNs = "App", string outputDir = "src") {
+        if (tableName == null || tableName.Length == 0) {
+            this.JsonFail("表名不能为空", "4001");
+            return;
+        }
+        TableMeta meta = DbSchemaProbe.ProbeTable(this.db, tableName);
+        string modelDir = outputDir + "/Model";
+        string valDir = outputDir + "/Validation";
+        string webDir = outputDir + "/Web";
+
+        if (!Directory.Exists(modelDir)) { Directory.CreateDirectory(modelDir); }
+        if (!Directory.Exists(valDir)) { Directory.CreateDirectory(valDir); }
+        if (!Directory.Exists(webDir)) { Directory.CreateDirectory(webDir); }
+
+        string entityPath = modelDir + "/" + meta.entityName + ".zan";
+        string validatorPath = valDir + "/" + meta.entityName + "Validator.zan";
+        string controllerPath = webDir + "/" + meta.entityName + "Controller.zan";
+
+        string entityCode = CodeGenEngine.GenerateEntity(meta, baseNs + ".Model");
+        string validatorCode = CodeGenEngine.GenerateValidator(meta, baseNs + ".Validation");
+        string controllerCode = CodeGenEngine.GenerateController(meta, baseNs + ".Web", baseNs + ".Model", baseNs + ".Validation");
+
+        File.WriteAllText(entityPath, entityCode);
+        File.WriteAllText(validatorPath, validatorCode);
+        File.WriteAllText(controllerPath, controllerCode);
+
+        this.AuditLog("CodeGen", "自动生成业务代码表: " + tableName + " -> " + meta.entityName);
+        this.JsonSuccess("代码生成成功！已生成: " + meta.entityName + ".zan, " + meta.entityName + "Validator.zan, " + meta.entityName + "Controller.zan");
+    }
+
+    private static string EscapeJsonString(string s) {
+        if (s == null) { return "\"\""; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("\"");
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            if (ch == "\\") {
+                sb.Append("\\\\");
+            } else if (ch == "\"") {
+                sb.Append("\\\"");
+            } else if (ch == "\n") {
+                sb.Append("\\n");
+            } else if (ch == "\r") {
+                sb.Append("\\r");
+            } else if (ch == "\t") {
+                sb.Append("\\t");
+            } else {
+                sb.Append(ch);
+            }
+        }
+        sb.Append("\"");
+        return sb.ToString();
+    }
+}

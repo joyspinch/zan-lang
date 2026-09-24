@@ -1,0 +1,99 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+
+namespace Zan.Mvc.Admin.Validation;
+
+/// <summary>
+/// 声明式业务数据验证器基类。
+/// 支持规则管道（Rule）、自定义提示信息（Message）以及业务场景隔离（Scene）。
+/// </summary>
+public abstract class BaseValidator {
+    protected Dict<string, string> rules;
+    protected Dict<string, string> messages;
+    protected Dict<string, List<string>> scenes;
+
+    public BaseValidator() {
+        this.rules = new Dict<string, string>();
+        this.messages = new Dict<string, string>();
+        this.scenes = new Dict<string, List<string>>();
+    }
+
+    /// <summary>注册字段规则与提示（管道分隔，例如 "require|min:6"）</summary>
+    protected void Rule(string field, string ruleExpr, string messageExpr = "") {
+        this.rules[field] = ruleExpr;
+        if (messageExpr.Length > 0) {
+            this.messages[field] = messageExpr;
+        }
+    }
+
+    /// <summary>注册业务场景生效字段列表（逗号分隔，例如 "username,password,phone"）</summary>
+    protected void Scene(string sceneName, string fieldsCsv) {
+        List<string> list = new List<string>();
+        List<string> parts = fieldsCsv.Split(",");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            string p = parts[i].Trim();
+            if (p.Length > 0) { list.Add(p); }
+        }
+        this.scenes[sceneName] = list;
+    }
+
+    /// <summary>对字典数据执行结构化校验</summary>
+    public virtual ValidateResult Check(Dict<string, string> data, string scene = "") {
+        Validator engine = new Validator();
+        List<string> targetFields = this.GetTargetFields(scene);
+
+        for (int i = 0; i < targetFields.Count; i = i + 1) {
+            string field = targetFields[i];
+            string r;
+            if (!this.rules.TryGetValue(field, out r)) { continue; }
+
+            string val = "";
+            if (data.TryGetValue(field, out val)) { }
+
+            string msg = "";
+            if (this.messages.TryGetValue(field, out msg)) { }
+
+            Validator.ApplyRule(engine, field, val, r, msg);
+            // 默认快速失败阻断
+            if (!engine.Result.IsOk()) {
+                return engine.Result;
+            }
+        }
+        return engine.Result;
+    }
+
+    /// <summary>对 JsonValue 数据执行结构化校验</summary>
+    public virtual ValidateResult CheckJson(JsonValue json, string scene = "") {
+        Dict<string, string> dict = new Dict<string, string>();
+        if (json != null && json.IsObject()) {
+            for (int i = 0; i < json.Count(); i = i + 1) {
+                string k = json.KeyAt(i);
+                JsonValue val = json.ValAt(i);
+                if (val.IsString()) {
+                    dict[k] = val.AsString("");
+                } else if (val.IsNumber()) {
+                    dict[k] = Convert.ToString(val.AsLong(0));
+                } else if (val.IsBool()) {
+                    dict[k] = val.AsBool(false) ? "1" : "0";
+                }
+            }
+        }
+        return this.Check(dict, scene);
+    }
+
+    /// <summary>获取当前场景参与校验的字段集合</summary>
+    private List<string> GetTargetFields(string scene) {
+        if (scene != null && scene.Length > 0) {
+            List<string> sceneList;
+            if (this.scenes.TryGetValue(scene, out sceneList)) {
+                return sceneList;
+            }
+        }
+        List<string> all = new List<string>();
+        foreach (string k in this.rules.Keys) {
+            all.Add(k);
+        }
+        return all;
+    }
+}
