@@ -4,6 +4,7 @@ using Gui;
 using Gui.Widget;
 using Gui.Animation;
 using Gui.Rendering;
+using Game.Idle;
 
 namespace IdleGame;
 
@@ -41,10 +42,14 @@ class Program {
     Progress autoMineBar;
     MineCoreView coreView;
 
-    // 核心反应炉动画状态
+    // 核心反应炉动画与打击动效系统
     double coreScale = 1.0;
     Tween coreTween;
     double autoProgress = 0.0;
+    SquashAndStretch coreJuice;
+    FloatingTextManager fctManager;
+    OfflineRewardCalculator offlineCalc;
+    string offlineInfoText = "";
 
     // 统计弹窗浮层状态
     double modalY = 800.0;
@@ -66,6 +71,20 @@ class Program {
 
         state = GameState.CreateDefault();
         particles = ParticleSystem.Create();
+        coreJuice = SquashAndStretch.Create();
+        fctManager = FloatingTextManager.Create(64);
+        offlineCalc = OfflineRewardCalculator.Create(8.0, state.TotalDps > 0.0 ? state.TotalDps : 5.0);
+
+        // 模拟上次离线 2.5 小时结算
+        long now = 1700000000;
+        long last = now - 9000;
+        long elapsedSec;
+        long cappedSec;
+        double rewardGold;
+        offlineCalc.CalculateReward(last, now, out elapsedSec, out cappedSec, out rewardGold);
+        offlineInfoText = "离线收益已入账: +" + Convert.ToString((long)rewardGold) + " 💰 (挂机 " + OfflineRewardCalculator.FormatDuration(cappedSec) + ")";
+        state.AddGold(rewardGold);
+
         buyButtons = new List<Button>();
         levelLabels = new List<Label>();
         costLabels = new List<Label>();
@@ -76,6 +95,10 @@ class Program {
         form.Every(100, () => {
             state.Tick(0.1);
 
+            // 步进打击物理振荡与飘字池
+            coreJuice.Update(0.1);
+            fctManager.Update(0.1);
+
             // 更新自动采矿进度条
             autoProgress = autoProgress + 0.1;
             if (autoProgress >= 1.0) {
@@ -85,9 +108,11 @@ class Program {
                 autoMineBar.SetPercent((int)(autoProgress * 100.0));
             }
 
-            // 更新粒子
-            if (particles.HasActiveParticles) {
-                particles.Update(0.1);
+            // 更新粒子与重绘
+            if (particles.HasActiveParticles || fctManager.ActiveCount > 0) {
+                if (particles.HasActiveParticles) {
+                    particles.Update(0.1);
+                }
                 app.RequestRedraw();
             }
 
@@ -248,7 +273,15 @@ class Program {
     void DoMine(double x, double y) {
         state.Mine();
 
-        // 1. 触发矿晶弹性回弹动画（1.25 -> 1.0，使用 BackOut 曲线）
+        // 1. 触发弹簧阻尼打击感挤压与回弹
+        coreJuice.Trigger(0.35);
+
+        // 2. 产生暴击判定与高性能跳字
+        bool isCrit = ((int)state.Gold % 5 == 0);
+        fctManager.SpawnDamage(x - 20.0, y - 15.0, state.ClickPower * (isCrit ? 2 : 1), isCrit);
+        fctManager.SpawnGold(x + 10.0, y - 25.0, Convert.ToString(state.ClickPower));
+
+        // 3. 矿晶动画
         coreScale = 1.25;
         if (coreTween != null) { coreTween.Stop(); }
         coreTween = Gui.Animation.Timeline.To(1.25f, 1.0f, 350, EaseType.BackOut, (float val) => {
@@ -256,7 +289,7 @@ class Program {
             app.RequestRedraw();
         });
 
-        // 2. 喷射飞行动画金币与火花
+        // 4. 喷射飞行动画金币与火花
         particles.Burst(x, y, 6);
 
         UpdateLabels();
@@ -264,20 +297,23 @@ class Program {
     }
 
     /// <summary>
-    /// 由 MineCoreView 驱动绘制动态矿石和粒子。
+    /// 由 MineCoreView 驱动绘制动态矿石、打击形变、粒子和高性能飘字。
     /// </summary>
     void RenderMiningArea(Canvas c, int bx, int by, int bw, int bh) {
         int cx = bx + bw / 2;
         int cy = by + bh / 2;
 
-        // 根据 coreScale 计算半径
-        int r = (int)(55.0 * coreScale);
+        // 根据 coreJuice 的弹性缩放与 coreScale 计算动态核心尺寸
+        int baseR = (int)(55.0 * coreScale);
+        int rx = (int)((double)baseR * coreJuice.ScaleX);
+        int ry = (int)((double)baseR * coreJuice.ScaleY);
+        int r = (rx + ry) / 2;
 
         // 外层能量光晕
         c.FillCircle(cx, cy, r + 15, 0x22F59E0B);
         c.FillCircle(cx, cy, r + 8, 0x44F59E0B);
 
-        // 晶体六边形或多层圆环
+        // 晶体六边形或多层圆环（响应打击缩放）
         c.FillCircle(cx, cy, r, 0xFFD97706);
         c.DrawCircle(cx, cy, r, 0xFFFDE68A, 3);
         c.FillCircle(cx, cy, (int)(r * 0.7), 0xFFF59E0B);
@@ -285,6 +321,9 @@ class Program {
 
         // 绘制粒子
         particles.Render(c);
+
+        // 绘制高性能无 GC 飘字
+        fctManager.Render(c, null);
 
         // 如果弹窗正在显示，绘制浮层
         if (modalY < 700.0) {

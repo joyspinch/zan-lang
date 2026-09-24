@@ -1,0 +1,187 @@
+using System;
+using Game.Idle;
+using Game.Net;
+using Game.Core;
+using Game.Arpg;
+
+class GameCompleteEcosystemSuite {
+    static void Assert(bool condition, string message) {
+        if (!condition) {
+            Console.WriteLine("[FAIL] " + message);
+            Environment.Exit(1);
+        }
+    }
+
+    static void TestFloatingText() {
+        FloatingTextManager mgr = FloatingTextManager.Create(32);
+        Assert(mgr.ActiveCount == 0, "Initial active floating text count should be 0");
+
+        mgr.SpawnDamage(100.0, 200.0, 999, false);
+        Assert(mgr.ActiveCount == 1, "Active count should be 1 after spawning damage");
+
+        mgr.SpawnDamage(120.0, 200.0, 8888, true); // 暴击
+        Assert(mgr.ActiveCount == 2, "Active count should be 2 after spawning crit");
+
+        mgr.SpawnGold(150.0, 200.0, "500");
+        Assert(mgr.ActiveCount == 3, "Active count should be 3 after spawning gold");
+
+        // 步进 0.2 秒
+        mgr.Update(0.2);
+        Assert(mgr.ActiveCount == 3, "All 3 items should still be active at 0.2s");
+
+        // 步进 1.5 秒，所有跳字都应超时衰减回收
+        mgr.Update(1.5);
+        Assert(mgr.ActiveCount == 0, "All items should expire and be recycled to 0");
+        Console.WriteLine("[PASS] TestFloatingText");
+    }
+
+    static void TestSquashAndStretch() {
+        SquashAndStretch juice = SquashAndStretch.Create();
+        Assert(juice.ScaleX == 1.0 && juice.ScaleY == 1.0, "Initial scale should be 1.0");
+
+        // 触发挤压
+        juice.Trigger(0.3);
+        Assert(juice.ScaleX > 1.2, "ScaleX should expand upon trigger");
+        Assert(juice.ScaleY < 0.8, "ScaleY should compress upon trigger");
+
+        // 步进物理模拟 0.1s
+        juice.Update(0.1);
+        Assert(juice.ScaleX != 1.0, "ScaleX should still be oscillating");
+
+        // 步进足够长的时间，弹簧阻尼应平稳收敛回归 1.0
+        for (int i = 0; i < 50; i = i + 1) {
+            juice.Update(0.1);
+        }
+        Assert(juice.ScaleX == 1.0 && juice.ScaleY == 1.0, "Juice should converge to 1.0 resting state");
+        Console.WriteLine("[PASS] TestSquashAndStretch");
+    }
+
+    static void TestOfflineReward() {
+        OfflineRewardCalculator calc = OfflineRewardCalculator.Create(8.0, 10.0); // 8小时上限，每秒10金币
+
+        long now = 1700000000;
+        long last = now - 3600; // 离线 1 小时 (3600s)
+        long elapsedSec;
+        long cappedSec;
+        double rewardGold;
+        calc.CalculateReward(last, now, out elapsedSec, out cappedSec, out rewardGold);
+
+        Assert(elapsedSec == 3600, "Elapsed seconds should be 3600");
+        Assert(cappedSec == 3600, "Capped seconds should be 3600");
+        Assert(rewardGold == 36000.0, "Reward gold should be 3600 * 10 = 36000");
+
+        // 离线 20 小时 (超过 8 小时上限)
+        last = now - 72000;
+        calc.CalculateReward(last, now, out elapsedSec, out cappedSec, out rewardGold);
+        Assert(elapsedSec == 72000, "Elapsed seconds should be 72000");
+        Assert(cappedSec == 28800, "Capped seconds should be 8 * 3600 = 28800");
+        Assert(rewardGold == 288000.0, "Reward gold should be capped at 288000");
+
+        string formatted = OfflineRewardCalculator.FormatDuration(3665);
+        Assert(formatted == "01小时01分", "Formatted duration should match: " + formatted);
+        Console.WriteLine("[PASS] TestOfflineReward");
+    }
+
+    static void TestLockstepSync() {
+        LockstepManager ls = LockstepManager.Create(20.0, 128); // 20Hz (50ms), 128 帧历史
+        Assert(ls.CurrentLogicFrame == 0, "Initial logic frame should be 0");
+        Assert(ls.ServerConfirmedFrame == 0, "Initial server frame should be 0");
+
+        // 模拟接收服务器广播帧 1
+        PlayerCommand[] cmds = new PlayerCommand[2];
+        cmds[0] = PlayerCommand.Create(1, 10, 100.0, 200.0, 0, 0);
+        cmds[1] = PlayerCommand.Create(2, 20, 0.0, 0.0, 99, 1);
+        ls.ReceiveServerFrame(1, cmds, 2);
+
+        Assert(ls.ServerConfirmedFrame == 1, "Server frame should update to 1");
+
+        // 步进 50ms (0.05s) 驱动逻辑执行
+        int executedTicks = 0;
+        int executedFrame = 0;
+        ls.Update(0.05, (int fIdx, FrameBucket b) => {
+            executedTicks = executedTicks + 1;
+            executedFrame = fIdx;
+            Assert(b.CommandCount == 2, "Bucket should have 2 commands");
+        });
+
+        Assert(executedTicks == 1, "Should execute exactly 1 tick");
+        Assert(executedFrame == 1, "Executed frame should be 1");
+        Assert(ls.CurrentLogicFrame == 1, "Current logic frame should advance to 1");
+
+        // 测试追帧模式 (若服务器已经广播到第 10 帧，客户端落后 9 帧)
+        ls.ReceiveServerFrame(10, null, 0);
+        // 单步推进时间
+        ls.Update(0.016, null);
+        Assert(ls.IsCatchingUp, "Client lagging behind by >5 frames should enter CatchUp mode");
+        Console.WriteLine("[PASS] TestLockstepSync");
+    }
+
+    static void TestSceneAudioLinkage() {
+        SceneManager sm = SceneManager.Create(4);
+        Scene sc1 = Scene.Create("Scene1", 800, 600, 128);
+        Scene sc2 = Scene.Create("Scene2", 800, 600, 128);
+        sm.Push(sc1);
+        sm.Update(0.016);
+
+        // 设置音频平滑过渡联动
+        bool audioTransitionCalled = false;
+        int passedOutMs = 0;
+        int passedInMs = 0;
+        sm.SetAudioTransitionCallback((int outMs, int inMs) => {
+            audioTransitionCalled = true;
+            passedOutMs = outMs;
+            passedInMs = inMs;
+        });
+
+        // 触发切场景 (0.2s 淡出淡入)
+        sm.SwitchScene(sc2, 0.2);
+        Assert(sm.IsTransitioning, "SceneManager should be transitioning");
+        Assert(audioTransitionCalled, "Audio transition callback should have been triggered");
+        Assert(passedOutMs == 200 && passedInMs == 200, "Audio fade duration should match 200ms");
+
+        // 推进切场景步进 (0.1s 渐暗一半)
+        sm.Update(0.1);
+        Assert(sm.FadeAlpha > 0.4 && sm.FadeAlpha < 0.6, "FadeAlpha should be ~0.5");
+
+        // 步进跨越全黑点并进入淡入
+        sm.Update(0.15);
+        Assert(sm.GetActiveScene() == sc2, "Active scene should be switched to sc2");
+
+        // 步进结束淡入
+        sm.Update(0.25);
+        Assert(!sm.IsTransitioning, "Transition should be finished");
+        Console.WriteLine("[PASS] TestSceneAudioLinkage");
+    }
+
+    static void TestLootScatter() {
+        LootScatter scatter = LootScatter.Create(64);
+        scatter.Burst(400.0, 300.0, 8, 1001);
+        Assert(scatter.ActiveCount == 8, "LootScatter should have 8 active items");
+
+        // 模拟重力抛物线与地面弹跳 1.5 秒
+        for (int i = 0; i < 90; i = i + 1) {
+            scatter.Update(0.016);
+        }
+
+        // 物品应该落地平稳
+        int settledCount = 0;
+        for (int i = 0; i < scatter.ActiveCount; i = i + 1) {
+            if (scatter.IsSettled(i)) {
+                settledCount = settledCount + 1;
+            }
+        }
+        Assert(settledCount > 0, "At least some loot items should be settled on ground");
+        Console.WriteLine("[PASS] TestLootScatter");
+    }
+
+    static void Main() {
+        Console.WriteLine("--- STARTING GAME COMPLETE ECOSYSTEM SUITE ---");
+        TestFloatingText();
+        TestSquashAndStretch();
+        TestOfflineReward();
+        TestLockstepSync();
+        TestSceneAudioLinkage();
+        TestLootScatter();
+        Console.WriteLine("GAME_COMPLETE_ECOSYSTEM_ALL_PASSED");
+    }
+}

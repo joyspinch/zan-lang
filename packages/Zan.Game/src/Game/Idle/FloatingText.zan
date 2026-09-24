@@ -1,0 +1,183 @@
+using System;
+using Gui;
+using Game.Core;
+
+namespace Game.Idle;
+
+/// <summary>
+/// 单个动态跳字粒子。
+/// </summary>
+class FloatingTextItem {
+    bool active;
+    string text;
+    double x;
+    double y;
+    double vx;
+    double vy;
+    double lifeTime;
+    double maxLife;
+    int color;
+    double scale;
+    bool isCrit;
+
+    FloatingTextItem() {
+        this.active = false;
+        this.text = "";
+        this.x = 0.0;
+        this.y = 0.0;
+        this.vx = 0.0;
+        this.vy = 0.0;
+        this.lifeTime = 0.0;
+        this.maxLife = 1.0;
+        this.color = 0xFFFFFF;
+        this.scale = 1.0;
+        this.isCrit = false;
+    }
+
+    static FloatingTextItem Create() {
+        return new FloatingTextItem();
+    }
+
+    bool Active { get { return active; } }
+    string Text { get { return text; } }
+    double X { get { return x; } }
+    double Y { get { return y; } }
+    double Scale { get { return scale; } }
+    int Color { get { return color; } }
+    double Alpha {
+        get {
+            if (maxLife <= 0.0) { return 0.0; }
+            double remain = 1.0 - (lifeTime / maxLife);
+            return remain < 0.0 ? 0.0 : (remain > 1.0 ? 1.0 : remain);
+        }
+    }
+
+    void Spawn(double startX, double startY, string text, int color, double scale, bool isCrit, double duration) {
+        this.active = true;
+        this.x = startX;
+        this.y = startY;
+        this.text = text != null ? text : "";
+        this.color = color;
+        this.scale = scale > 0.1 ? scale : 1.0;
+        this.isCrit = isCrit;
+        this.lifeTime = 0.0;
+        this.maxLife = duration > 0.1 ? duration : 0.8;
+
+        // 向上喷射与微小横向离散初速度
+        this.vy = isCrit ? -120.0 : -80.0;
+        this.vx = 0.0; // 默认垂直上升
+    }
+
+    void Update(double dt) {
+        if (!active) { return; }
+        lifeTime = lifeTime + dt;
+        if (lifeTime >= maxLife) {
+            active = false;
+            return;
+        }
+
+        // 减速上升
+        y = y + vy * dt;
+        vy = vy * 0.92; // 空气阻尼减速
+
+        // 暴击在初期轻微弹跳放大
+        if (isCrit && lifeTime < 0.15) {
+            scale = scale + dt * 2.0;
+        }
+    }
+}
+
+/// <summary>
+/// 放置游戏/ARPG 高性能飘字管理器（零 GC 对象池）。
+/// 支持伤害跳字、暴击金黄放大、金币产出喷涌与经验获取飘字。
+/// </summary>
+class FloatingTextManager {
+    FloatingTextItem[] pool;
+    int maxCount;
+
+    FloatingTextManager(int capacity) {
+        this.maxCount = capacity > 16 ? capacity : 128;
+        this.pool = new FloatingTextItem[this.maxCount];
+        for (int i = 0; i < this.maxCount; i = i + 1) {
+            this.pool[i] = FloatingTextItem.Create();
+        }
+    }
+
+    static FloatingTextManager Create(int capacity) {
+        return new FloatingTextManager(capacity);
+    }
+
+    int ActiveCount {
+        get {
+            int cnt = 0;
+            for (int i = 0; i < maxCount; i = i + 1) {
+                if (pool[i] != null && pool[i].Active) {
+                    cnt = cnt + 1;
+                }
+            }
+            return cnt;
+        }
+    }
+
+    /// <summary>产生伤害飘字。</summary>
+    void SpawnDamage(double x, double y, long amount, bool isCrit) {
+        string txt = amount.ToString();
+        int color = isCrit ? 0xFFD700 : 0xFF4444; // 暴击金黄，普通鲜红
+        double scale = isCrit ? 1.5 : 1.0;
+        Spawn(x, y, txt, color, scale, isCrit, isCrit ? 1.0 : 0.7);
+    }
+
+    /// <summary>产生金币产出飘字。</summary>
+    void SpawnGold(double x, double y, string formattedAmount) {
+        string txt = "+" + formattedAmount;
+        Spawn(x, y, txt, 0xFFE066, 1.1, false, 0.8);
+    }
+
+    /// <summary>底层生成跳字。</summary>
+    void Spawn(double x, double y, string text, int color, double scale, bool isCrit, double duration) {
+        for (int i = 0; i < maxCount; i = i + 1) {
+            if (pool[i] != null && !pool[i].Active) {
+                pool[i].Spawn(x, y, text, color, scale, isCrit, duration);
+                return;
+            }
+        }
+        // 若满，覆盖最旧项
+        if (pool[0] != null) {
+            pool[0].Spawn(x, y, text, color, scale, isCrit, duration);
+        }
+    }
+
+    /// <summary>时钟推进。</summary>
+    void Update(double dt) {
+        for (int i = 0; i < maxCount; i = i + 1) {
+            if (pool[i] != null && pool[i].Active) {
+                pool[i].Update(dt);
+            }
+        }
+    }
+
+    /// <summary>极速渲染所有活跃跳字。</summary>
+    void Render(Canvas c, Camera2D cam) {
+        if (c == null) { return; }
+        for (int i = 0; i < maxCount; i = i + 1) {
+            FloatingTextItem item = pool[i];
+            if (item != null && item.Active) {
+                double sx = item.X;
+                double sy = item.Y;
+                if (cam != null) {
+                    cam.WorldToScreen(item.X, item.Y, out sx, out sy);
+                }
+                int alpha = (int)(item.Alpha * 255.0);
+                if (alpha < 0) { alpha = 0; }
+                if (alpha > 255) { alpha = 255; }
+                int renderColor = (alpha << 24) | (item.Color & 0xFFFFFF);
+
+                int fontSize = item.Scale > 1.2 ? 18 : 14;
+
+                // 绘制文本（带阴影描边提升视觉质感）
+                c.DrawText((int)sx + 1, (int)sy + 1, item.Text, (alpha << 24) | 0x000000, fontSize);
+                c.DrawText((int)sx, (int)sy, item.Text, renderColor, fontSize);
+            }
+        }
+    }
+}

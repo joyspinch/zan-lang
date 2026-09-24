@@ -127,7 +127,7 @@ if (-not $SkipBuild) {
     Write-Output "[3/4] Compiling $name ..."
     # 源文件作为独立 argv 逐个传给 zanc（空格拼接成单个字符串会被 zanc
     # 当成一个路径："cannot open file 'a.zan b.zan'"）。
-    $srcs = @((Get-ChildItem -Path $Project -Filter *.zan | ForEach-Object { ($_.FullName -replace '\\', '/') }))
+    $srcs = @((Get-ChildItem -Path $Project -Filter *.zan -Recurse | ForEach-Object { ($_.FullName -replace '\\', '/') }))
     # Game.Kit is a stdlib namespace now; --auto-stdlib pulls it in via `using`.
     build/zanc.exe @srcs --auto-stdlib -o $exe
     if ($LASTEXITCODE -ne 0) { Write-Output "PACK_FAIL: zanc"; exit 1 }
