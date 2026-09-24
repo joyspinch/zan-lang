@@ -94,6 +94,13 @@ build/zanc probe.zan --auto-stdlib --time              # 各阶段耗时
 调试构建（`-g`）自动开启泄漏检测与 ARC 检疫（等于 `--check-leaks
 --arc-guard`），程序退出时报告未释放对象并隔离悬垂指针。
 
+泄漏排查时再设环境变量 `ZAN_ARC_TRACE=1` 运行该程序，可打印每笔
+ARC 事件（alloc/retain/release/release-dyn，含对象地址、分配站点索引、
+事件后引用计数、调用点返回地址）；`--check-leaks` 构建才带此探针。
+注意泄漏报表的 file:line 站点名按分配形状共享槽位（`-g` 才按
+file:line 键控），同形状分配点会互相顶掉名字——定位持有人时以
+trace 的事件序为准，不要顺着报表的站点名硬找。
+
 ## 2. 全参数表（与 --help 一致 + 隐藏参数）
 
 ### 输出

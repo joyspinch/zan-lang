@@ -1826,6 +1826,26 @@ static void emit_header_read_guard(zan_irgen_t *g, LLVMValueRef fn,
     LLVMPositionBuilderAtEnd(g->builder, readable_bb);
 }
 
+/* Emit one __zan_arc_trace_ev call: tag letter, object, post-op refcount,
+ * allocation-site index, and the immediate caller's return address (A355
+ * diagnostic; the trace function itself gates printing on $ZAN_ARC_TRACE). */
+static void emit_arc_trace_call(zan_irgen_t *g, LLVMValueRef ev_fn,
+                                const char *tag, LLVMValueRef obj,
+                                LLVMValueRef rc, LLVMValueRef site) {
+    if (!ev_fn) return;
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef ra_ty = LLVMFunctionType(i8p, (LLVMTypeRef[]){ i32t }, 1, 0);
+    LLVMValueRef ra_fn = LLVMGetNamedFunction(g->mod, "llvm.returnaddress");
+    if (!ra_fn) return;
+    LLVMValueRef ra_arg = LLVMConstInt(i32t, 0, 0);
+    LLVMValueRef ra = zan_call2(g->builder, ra_ty, ra_fn, &ra_arg, 1, "tra");
+    LLVMValueRef tagc = zan_irgen_intern_string(g, tag);
+    LLVMValueRef args[5] = { tagc, obj, rc, site, ra };
+    zan_call2(g->builder, LLVMGlobalGetValueType(ev_fn), ev_fn, args, 5, "");
+}
+
 zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                             zan_diag_t *diag, zan_binder_t *binder,
                             const char *module_name,
@@ -2611,6 +2631,80 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     LLVMTypeRef strcat_type = LLVMFunctionType(i8ptr, strcat_args, 2, 0);
     g->fn_strcat = LLVMAddFunction(g->mod, "strcat", strcat_type);
 
+    /* A355 diagnostic: per-event ARC trace for check-leaks builds. The events
+     * are printed only when ZAN_ARC_TRACE is set in the environment, so plain
+     * --check-leaks runs stay quiet. Each event records the tag (A=alloc,
+     * R=retain, r=release, D=release-dispatch), the object, its allocation
+     * site index, the post-op refcount, and the caller's return address --
+     * enough to attribute a stray +1 to the exact call site offline. */
+    LLVMValueRef arc_trace_ev = NULL;
+    LLVMTypeRef arc_ra_ty = NULL;
+    LLVMTypeRef arc_ev_ty = NULL;
+    if (g->check_leaks) {
+        LLVMTypeRef arc_i64 = LLVMInt64TypeInContext(g->ctx);
+        LLVMTypeRef arc_i32t = LLVMInt32TypeInContext(g->ctx);
+        LLVMTypeRef arc_i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+        LLVMValueRef arc_trace_glob = LLVMAddGlobal(g->mod, arc_i32t, "__zan_arc_trace");
+        LLVMSetInitializer(arc_trace_glob,
+            LLVMConstInt(arc_i32t, (uint64_t)-1, 0));
+        LLVMSetLinkage(arc_trace_glob, LLVMInternalLinkage);
+        LLVMTypeRef arc_getenv_ty = LLVMFunctionType(arc_i8p,
+            (LLVMTypeRef[]){ arc_i8p }, 1, 0);
+        LLVMValueRef arc_getenv = LLVMGetNamedFunction(g->mod, "getenv");
+        if (!arc_getenv) arc_getenv = LLVMAddFunction(g->mod, "getenv", arc_getenv_ty);
+        arc_ra_ty = LLVMFunctionType(arc_i8p, (LLVMTypeRef[]){ arc_i32t }, 1, 0);
+        LLVMValueRef arc_returnaddr = LLVMAddFunction(g->mod, "llvm.returnaddress", arc_ra_ty);
+        LLVMTypeRef arc_ev_args[] = { arc_i8p, arc_i8p, arc_i64, arc_i64, arc_i8p };
+        arc_ev_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), arc_ev_args, 5, 0);
+        arc_trace_ev = LLVMAddFunction(g->mod, "__zan_arc_trace_ev", arc_ev_ty);
+        LLVMSetLinkage(arc_trace_ev, LLVMInternalLinkage);
+        LLVMBasicBlockRef ev_bb = LLVMAppendBasicBlockInContext(g->ctx, arc_trace_ev, "entry");
+        LLVMBasicBlockRef ev_init = LLVMAppendBasicBlockInContext(g->ctx, arc_trace_ev, "init");
+        LLVMBasicBlockRef ev_check = LLVMAppendBasicBlockInContext(g->ctx, arc_trace_ev, "check");
+        LLVMBasicBlockRef ev_print = LLVMAppendBasicBlockInContext(g->ctx, arc_trace_ev, "print");
+        LLVMBasicBlockRef ev_ret = LLVMAppendBasicBlockInContext(g->ctx, arc_trace_ev, "ret");
+        LLVMPositionBuilderAtEnd(g->builder, ev_bb);
+        LLVMValueRef ev_tag = LLVMGetParam(arc_trace_ev, 0);
+        LLVMValueRef ev_obj = LLVMGetParam(arc_trace_ev, 1);
+        LLVMValueRef ev_rc = LLVMGetParam(arc_trace_ev, 2);
+        LLVMValueRef ev_site = LLVMGetParam(arc_trace_ev, 3);
+        LLVMValueRef ev_ra = LLVMGetParam(arc_trace_ev, 4);
+        LLVMValueRef ev_t = LLVMBuildLoad2(g->builder, arc_i32t, arc_trace_glob, "t");
+        LLVMBuildCondBr(g->builder,
+            zan_icmp(g->builder, LLVMIntEQ, ev_t,
+                LLVMConstInt(arc_i32t, (uint64_t)-1, 0), "uninit"),
+            ev_init, ev_check);
+        LLVMPositionBuilderAtEnd(g->builder, ev_init);
+        LLVMValueRef ev_key = zan_irgen_intern_string(g, "ZAN_ARC_TRACE");
+        LLVMValueRef ev_hit = zan_call2(g->builder, arc_getenv_ty, arc_getenv,
+            &ev_key, 1, "hit");
+        LLVMValueRef ev_on = zan_icmp(g->builder, LLVMIntNE, ev_hit,
+            LLVMConstNull(arc_i8p), "on");
+        LLVMValueRef ev_on32 = LLVMBuildZExt(g->builder, ev_on, arc_i32t, "on32");
+        LLVMBuildStore(g->builder, ev_on32, arc_trace_glob);
+        LLVMBuildBr(g->builder, ev_check);
+        LLVMPositionBuilderAtEnd(g->builder, ev_check);
+        LLVMValueRef ev_phi = LLVMBuildPhi(g->builder, arc_i32t, "t2");
+        LLVMValueRef ev_incomings[2] = { ev_t, ev_on32 };
+        LLVMBasicBlockRef ev_inblocks[2] = { ev_bb, ev_init };
+        LLVMAddIncoming(ev_phi, ev_incomings, ev_inblocks, 2);
+        LLVMValueRef ev_off = zan_icmp(g->builder, LLVMIntEQ, ev_phi,
+            LLVMConstInt(arc_i32t, 0, 0), "off");
+        LLVMBuildCondBr(g->builder, ev_off, ev_ret, ev_print);
+        LLVMPositionBuilderAtEnd(g->builder, ev_print);
+        LLVMValueRef ev_obji = LLVMBuildPtrToInt(g->builder, ev_obj, arc_i64, "obji");
+        LLVMValueRef ev_rai = LLVMBuildPtrToInt(g->builder, ev_ra, arc_i64, "rai");
+        LLVMValueRef ev_msg = zan_irgen_intern_string(g,
+            "[arc] %s obj=0x%llx site=%lld rc=%lld ra=0x%llx\n");
+        LLVMValueRef ev_pargs[6] = { ev_msg, ev_tag, ev_obji, ev_site, ev_rc, ev_rai };
+        zan_call2(g->builder, g->printf_type, g->fn_printf, ev_pargs, 6, "");
+        LLVMBuildBr(g->builder, ev_ret);
+        LLVMPositionBuilderAtEnd(g->builder, ev_ret);
+        LLVMBuildRetVoid(g->builder);
+        (void)ev_phi; (void)ev_obj; (void)ev_rc; (void)ev_site; (void)ev_ra;
+        (void)ev_tag;
+    }
+
     /* ARC runtime: zan_rt_retain(void*) -> void */
     LLVMTypeRef retain_args[] = { i8ptr };
     LLVMTypeRef retain_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), retain_args, 1, 0);
@@ -2645,6 +2739,17 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         emit_arc_underflow_check(g, g->rt_retain, rc_pre, obj, NULL,
                                  ZAN_ARC_FAULT_RETAIN,
                                  "retain of an already-freed object");
+        if (arc_trace_ev) {
+            LLVMValueRef trc_new = zan_add(g->builder, rc_pre,
+                LLVMConstInt(i64, 1, 0), "trcnew");
+            LLVMValueRef tneg8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
+            LLVMValueRef tsp = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx),
+                obj, &tneg8, 1, "trsp");
+            LLVMValueRef tsite = LLVMBuildLoad2(g->builder, i64,
+                LLVMBuildBitCast(g->builder, tsp, LLVMPointerType(i64, 0), "trsip"),
+                "trsite");
+            emit_arc_trace_call(g, arc_trace_ev, "R", obj, trc_new, tsite);
+        }
         LLVMBuildBr(g->builder, ret_bb);
         LLVMPositionBuilderAtEnd(g->builder, ret_bb);
         LLVMBuildRetVoid(g->builder);
@@ -2692,6 +2797,15 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                                      "release of an already-freed object");
         }
         LLVMValueRef rc1 = zan_sub(g->builder, rc_old, LLVMConstInt(i64, 1, 0), "rc1");
+        if (arc_trace_ev) {
+            LLVMValueRef rsneg8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
+            LLVMValueRef rsp = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx),
+                obj, &rsneg8, 1, "rrsp");
+            LLVMValueRef rsite = LLVMBuildLoad2(g->builder, i64,
+                LLVMBuildBitCast(g->builder, rsp, LLVMPointerType(i64, 0), "rrsip"),
+                "rrsite");
+            emit_arc_trace_call(g, arc_trace_ev, "r", obj, rc1, rsite);
+        }
         /* if rc1 == 0, free the object (16-byte header precedes obj) */
         LLVMValueRef is_zero = zan_icmp(g->builder, LLVMIntEQ, rc1,
             LLVMConstInt(i64, 0, 0), "iszero");
@@ -2763,6 +2877,21 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                 LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 0), "issent"),
             ret_bb, literal);
         LLVMPositionBuilderAtEnd(g->builder, literal);
+        if (arc_trace_ev) {
+            LLVMValueRef dneg16 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_RC_OFF, 1);
+            LLVMValueRef drcp = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx),
+                obj, &dneg16, 1, "drcp");
+            LLVMValueRef drc = LLVMBuildLoad2(g->builder, i64,
+                LLVMBuildBitCast(g->builder, drcp, LLVMPointerType(i64, 0), "drcip"),
+                "drc");
+            LLVMValueRef dneg8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
+            LLVMValueRef dsp = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx),
+                obj, &dneg8, 1, "ddsp");
+            LLVMValueRef dsite = LLVMBuildLoad2(g->builder, i64,
+                LLVMBuildBitCast(g->builder, dsp, LLVMPointerType(i64, 0), "ddsip"),
+                "dsite");
+            emit_arc_trace_call(g, arc_trace_ev, "D", obj, drc, dsite);
+        }
         LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
         LLVMValueRef sptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg8, 1, "sptr");
         LLVMValueRef siptr = LLVMBuildBitCast(g->builder, sptr, LLVMPointerType(i64, 0), "siptr");
@@ -2851,6 +2980,8 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             emit_leak_counter_add(g, sc_ptr, 1);
             LLVMValueRef nm_ptr = LLVMBuildGEP2(g->builder, g->site_names_type, g->g_site_names, gidx, 2, "nmptr");
             LLVMBuildStore(g->builder, name, nm_ptr);
+            emit_arc_trace_call(g, arc_trace_ev, "A", user_ptr,
+                LLVMConstInt(i64, 1, 0), site);
         }
         LLVMBuildRet(g->builder, user_ptr);
     }

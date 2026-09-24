@@ -770,6 +770,20 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                     expr->call.args.count == 1);
                 int sb_is_appendline = (sbm.len == 10 && memcmp(sbm.str, "AppendLine", 10) == 0 &&
                                         expr->call.args.count <= 1);
+                int sb_is_tostring = (sbm.len == 8 && memcmp(sbm.str, "ToString", 8) == 0 &&
+                                      expr->call.args.count == 0);
+                /* The intrinsic evaluates its receiver expression directly, so
+                 * an owned (+1) receiver (`this.BuildHeadersSb().ToString()` in
+                 * HttpResponse.BuildHeaders -- the empty-body response path)
+                 * leaked one StringBuilder per execution: the intrinsic never
+                 * released the receiver, and Append's void result meant the
+                 * statement-level discard release never fired either. Same
+                 * recipe as the collection intrinsics: EH-register the receiver
+                 * while the arguments run, drop it once the intrinsic is done. */
+                int sb_recv_own = 0;
+                if (sb_is_append || sb_is_appendline || sb_is_tostring)
+                    sb_recv_own = emit_intrinsic_own_recv(g,
+                        sbcallee->member.object, raw, locals);
                 if (sb_is_append || sb_is_appendline) {
                     if (expr->call.args.count == 1) {
                         zan_ast_node_t *arg0 = expr->call.args.items[0];
@@ -822,10 +836,14 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMValueRef nls = emit_string_literal_rc(g, nl);
                         emit_sb_append_bytes(g, sbp, nls, LLVMConstInt(i64, 1, 0));
                     }
+                    /* Append is declared void, so the returned receiver is
+                     * never consumed as an owned value: end its ownership
+                     * here. */
+                    emit_intrinsic_drop_recv(g, sbcallee->member.object, raw,
+                                             locals, sb_recv_own);
                     return raw;
                 }
-                if (sbm.len == 8 && memcmp(sbm.str, "ToString", 8) == 0 &&
-                    expr->call.args.count == 0) {
+                if (sb_is_tostring) {
                     LLVMValueRef cptr = LLVMBuildStructGEP2(g->builder, g->sb_struct_type, sbp, 0, "sbcp");
                     LLVMValueRef count = LLVMBuildLoad2(g->builder, i64, cptr, "sbcv");
                     LLVMValueRef dptr = LLVMBuildStructGEP2(g->builder, g->sb_struct_type, sbp, 2, "sbdp");
@@ -847,6 +865,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                      * this the first reader cached a strlen and `%00` content
                      * still collapsed at the NUL, A279). */
                     emit_string_len_set(g, buf, count);
+                    emit_intrinsic_drop_recv(g, sbcallee->member.object, raw,
+                                             locals, sb_recv_own);
                     return buf;
                 }
             }

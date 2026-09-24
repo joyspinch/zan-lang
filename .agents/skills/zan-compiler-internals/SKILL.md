@@ -1887,3 +1887,33 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
 - **定位手法**：泄漏计数对不上预期时，按"谁还可达"往根上追——
   报表给的是分配点，持有人要在类型图里找（static 槽 → 帧 → this
   → 字段列表）；改完先跑单测试再跑窄层，别拿泵等待时长硬凑。
+## 链式 owned 接收者在内建分支泄漏；泄漏报表的站点名会撒谎（A355，2026-09-24）
+
+- **症状**：webdav/HTTP 服务端 leakcheck 恒报漏 N 个
+  `HttpClient.zan:1271` 的 StringBuilder，但**有体响应不漏、空体
+  （204/304/CL:0）必漏**；对 stdlib 做变体矩阵（删 Append/删
+  ToString/删 AbsorbCookies）全部照漏，语言级 async 形状探针又全绿。
+- **根因**：真凶根本不在报表指的那个文件——**同形状分配点共享站点
+  槽，报表名是最后注册者的**（`-g` 才按 file:line 键控）。真泄漏对象
+  是 `HttpResponse.BuildHeaders()`（空体路径）里的链式临时
+  `this.BuildHeadersSb().ToString()`：`StringBuilder` 的
+  Append/AppendLine/ToString 内建分支（irgen_call.c）**直接求值接收者
+  表达式**，owned (+1) 接收者从不释放；`Append` 又声明为 void，语句级
+  丢弃兜底（EXPR_STMT 的 owned 释放）也永不触发。有体路径 `Build()`
+  先存局部变量，借用接收者不走 owned 通道，所以只有空体漏。普通类/
+  List/Dict/string 的链式接收者都各自有释放路径，**洞只在 SB**。
+- **修法**：SB 内建分支复用集合内建已有的
+  `emit_intrinsic_own_recv/emit_intrinsic_drop_recv` 定式（EH 暂存
+  接收者→求值实参→内建完成后 drop），**只在真正走到返回点的分支挂
+  载**（该分支会 fall-through 到 Console 等其他内建，提前挂会导致
+  push 无 pop）。新增内建/改内建分发时，用
+  `Probe.Make().Method()` 四形态（return 位/丢弃语句/实参位/局部
+  位）各写一个 `--check-leaks` 探针过一遍。
+- **定位手法（本次决定性的一手）**：怀疑 ARC 事件序时给运行时发射
+  加**site 感知 trace**（alloc/retain/release/release-dyn 时读 obj-8
+  的 site 字段 + `llvm.returnaddress(0)` 记调用点，env 门控打印）；
+  事件序显示泄漏对象只有一个多余 retain 后，把返回地址经
+  `llvm-objdump -d`（首选基址 0x140000000，运行基址 64KB 对齐）映射
+  回函数——A 事件落在 BuildHeadersSb 开场，当场推翻"客户端 rsb"的
+  前提。**教训：leakcheck 报表的 file:line 只是同形状槽位的名字，
+  不是持有人；先验证站点名，再顺着名字修**。
