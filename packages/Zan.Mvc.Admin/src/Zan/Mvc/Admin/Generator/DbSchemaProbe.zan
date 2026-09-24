@@ -25,6 +25,14 @@ public class DbSchemaProbe {
             sql = "SELECT name, '' AS comment FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name";
         } else if (provider == DbProvider.MySQL || provider == DbProvider.MariaDB) {
             sql = "SELECT table_name, table_comment FROM information_schema.tables WHERE table_schema = DATABASE() ORDER BY table_name";
+        } else if (provider == DbProvider.PostgreSQL || provider == DbProvider.Kingbase || provider == DbProvider.OpenGauss) {
+            sql = "SELECT t.table_name, COALESCE(d.description, '') AS comment " +
+                  "FROM information_schema.tables t " +
+                  "JOIN pg_class c ON c.relname = t.table_name " +
+                  "JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = t.table_schema " +
+                  "LEFT JOIN pg_description d ON d.objoid = c.oid AND d.objsubid = 0 " +
+                  "WHERE t.table_schema = 'public' AND t.table_type = 'BASE TABLE' " +
+                  "ORDER BY t.table_name";
         } else {
             sql = "SELECT table_name, '' AS comment FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name";
         }
@@ -93,6 +101,35 @@ public class DbSchemaProbe {
                 col.sqlType = dataType;
                 col.isPk = colKey == "PRI";
                 col.isIdentity = extra.Contains("auto_increment");
+                col.isNullable = isNullable == "YES";
+                if (comment.Length > 0) {
+                    col.title = comment;
+                }
+                InferColumnProperties(col);
+                meta.AddColumn(col);
+            }
+        } else if (provider == DbProvider.PostgreSQL || provider == DbProvider.Kingbase || provider == DbProvider.OpenGauss) {
+            string sql = "SELECT c.column_name, c.data_type, c.is_nullable, COALESCE(c.column_default, '') as col_def, " +
+                         "COALESCE(d.description, '') as comment " +
+                         "FROM information_schema.columns c " +
+                         "JOIN pg_class pc ON pc.relname = c.table_name " +
+                         "JOIN pg_namespace pn ON pn.oid = pc.relnamespace AND pn.nspname = c.table_schema " +
+                         "LEFT JOIN pg_description d ON d.objoid = pc.oid AND d.objsubid = c.ordinal_position " +
+                         "WHERE c.table_schema = 'public' AND c.table_name = ? " +
+                         "ORDER BY c.ordinal_position";
+            DbResult r = db.Query(sql, new DbParams().Add(tableName));
+            for (int i = 0; i < r.RowCount(); i = i + 1) {
+                string name = r.GetString(i, 0);
+                string dataType = r.GetString(i, 1);
+                string isNullable = r.GetString(i, 2);
+                string colDef = r.GetString(i, 3);
+                string comment = r.GetString(i, 4);
+
+                ColumnMeta col = new ColumnMeta();
+                col.name = name;
+                col.sqlType = dataType;
+                col.isPk = (name == "id" || colDef.Contains("nextval"));
+                col.isIdentity = colDef.Contains("nextval") || (name == "id" && dataType.ToUpper().Contains("INT"));
                 col.isNullable = isNullable == "YES";
                 if (comment.Length > 0) {
                     col.title = comment;

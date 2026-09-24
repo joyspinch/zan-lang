@@ -1,6 +1,7 @@
 using System;
 using System.Web;
 using System.Data;
+using System.Data.Excel;
 using System.Collections.Generic;
 using Zan.Mvc.Admin.Attributes;
 using Zan.Mvc.Admin.UI;
@@ -395,11 +396,24 @@ public abstract class CrudController<TEntity> : BaseAdminController {
     }
 
     /// <summary>
-    /// 端点 11：通用数据导出（导出为 RFC 4180 标准 CSV，首部注入 UTF-8 BOM 解决 Excel 打开中文乱码）
-    /// 支持按当前 TableConfig 列规格自动对齐字段，数据源由子类 OnExportRows() 生命周期钩子提供
+    /// 端点 11：通用数据导出
+    /// 支持双重导出格式：
+    /// 1. 默认 RFC 4180 标准 CSV，首部注入 UTF-8 BOM 解决 Excel 打开中文乱码；
+    /// 2. 当 URL 参数携带 format=xlsx 或 format=excel 时，自动流式生成原生 .xlsx 压缩二进制包输出。
+    /// 支持按当前 TableConfig 列规格自动对齐字段，数据源由子类 OnExportRows() 生命周期钩子提供。
     /// </summary>
     public virtual void Export() {
         if (!this.CheckRateLimit("Export", 10, 60)) { return; }
+
+        string fmt = "";
+        if (this.Ctx() != null) {
+            fmt = this.Ctx().Query("format").ToLower();
+        }
+        if (fmt == "xlsx" || fmt == "excel") {
+            this.ExportXlsx();
+            return;
+        }
+
         TableConfig cfg = this.GetTableConfig();
         List<Dict<string, string>> rows = this.OnExportRows();
 
@@ -430,12 +444,53 @@ public abstract class CrudController<TEntity> : BaseAdminController {
             sb.Append("\r\n");
         }
 
-        this.AuditLog("Export", "导出数据报表, 共 " + Convert.ToString(rows.Count) + " 行");
+        this.AuditLog("Export", "导出 CSV 数据报表, 共 " + Convert.ToString(rows.Count) + " 行");
 
         if (this.Ctx() != null) {
             this.Ctx().SetHeader("Content-Type", "text/csv; charset=utf-8");
             this.Ctx().SetHeader("Content-Disposition", "attachment; filename=\"export_" + Convert.ToString(DateTime.Now().ToUnixSeconds()) + ".csv\"");
             this.Text(sb.ToString());
+        }
+    }
+
+    /// <summary>
+    /// 端点 12：生成原生 Microsoft Excel (.xlsx) OpenXML 二进制格式报表
+    /// 基于 stdlib 中的 System.Data.Excel.XlsxBook 纯 Zan 压缩生成器，原生兼容 Office 与 WPS
+    /// </summary>
+    public virtual void ExportXlsx() {
+        if (!this.CheckRateLimit("Export", 10, 60)) { return; }
+        TableConfig cfg = this.GetTableConfig();
+        List<Dict<string, string>> rows = this.OnExportRows();
+
+        List<List<string>> matrix = new List<List<string>>();
+        List<string> header = new List<string>();
+        for (int i = 0; i < cfg.Columns.Count; i = i + 1) {
+            header.Add(cfg.Columns[i].headerName);
+        }
+        matrix.Add(header);
+
+        for (int r = 0; r < rows.Count; r = r + 1) {
+            Dict<string, string> row = rows[r];
+            List<string> line = new List<string>();
+            for (int c = 0; c < cfg.Columns.Count; c = c + 1) {
+                TableColumn col = cfg.Columns[c];
+                string val = "";
+                if (row != null && row.ContainsKey(col.field)) {
+                    val = row[col.field];
+                }
+                line.Add(val);
+            }
+            matrix.Add(line);
+        }
+
+        XlsxBook book = XlsxBook.FromText(matrix, true);
+        byte[] bytes = book.SaveToBytes();
+
+        this.AuditLog("ExportXlsx", "导出 Excel (.xlsx) 原生报表, 共 " + Convert.ToString(rows.Count) + " 行");
+
+        if (this.Ctx() != null) {
+            this.Ctx().SetHeader("Content-Disposition", "attachment; filename=\"export_" + Convert.ToString(DateTime.Now().ToUnixSeconds()) + ".xlsx\"");
+            this.Ctx().Binary("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", bytes, bytes.Length);
         }
     }
 

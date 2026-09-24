@@ -69,6 +69,44 @@
         .btn-secondary { background: var(--border-color); color: var(--text-main); }
         .btn-danger { background: var(--danger); color: #fff; }
         
+        .tree-toggle {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 16px;
+            height: 16px;
+            margin-right: 6px;
+            cursor: pointer;
+            user-select: none;
+            font-size: 10px;
+            color: var(--primary);
+            border-radius: 3px;
+            background: rgba(56, 189, 248, 0.1);
+            transition: all 0.15s ease;
+        }
+        .tree-toggle:hover {
+            background: rgba(56, 189, 248, 0.25);
+            transform: scale(1.1);
+        }
+        .tree-indent {
+            display: inline-block;
+            flex-shrink: 0;
+        }
+        .tree-leaf-spacer {
+            display: inline-block;
+            width: 16px;
+            margin-right: 6px;
+            flex-shrink: 0;
+        }
+        .tree-node-title {
+            display: inline-flex;
+            align-items: center;
+            vertical-align: middle;
+        }
+        .tree-node-collapsed {
+            display: none !important;
+        }
+
         table {
             width: 100%;
             border-collapse: collapse;
@@ -134,6 +172,9 @@
             var page = 1;
             var columns = schema.columns || schema.Columns || [];
             var tools = schema.tools || schema.Tools || schema.topActions || [];
+            var conf = schema.conf || schema.Conf || {};
+            var isTree = !!(conf.treeData === true || conf.treeData === 'true');
+            var collapsedNodes = {};
 
             // 获取 CSRF 令牌
             function getCsrfToken() {
@@ -143,21 +184,38 @@
 
             // 渲染顶部工具栏按钮
             var topActions = document.getElementById('topActions');
-            if (topActions && tools.length > 0) {
-                tools.forEach(function(tool) {
-                    var btn = document.createElement('button');
-                    var btnClass = 'btn';
-                    var tType = (tool.type || tool.color || '').toLowerCase();
-                    if (tType === 'primary') btnClass += ' btn-primary';
-                    else if (tType === 'error' || tType === 'danger') btnClass += ' btn-danger';
-                    else btnClass += ' btn-secondary';
-                    btn.className = btnClass;
-                    btn.textContent = tool.name || tool.title;
-                    btn.onclick = function() {
-                        handleToolAction(tool);
-                    };
-                    topActions.appendChild(btn);
-                });
+            if (topActions) {
+                // 如果是树形表格，自动注入“全部展开”和“全部折叠”按钮
+                if (isTree) {
+                    var btnExpand = document.createElement('button');
+                    btnExpand.className = 'btn btn-secondary';
+                    btnExpand.textContent = '全部展开';
+                    btnExpand.onclick = function() { expandAllTree(); };
+                    topActions.appendChild(btnExpand);
+
+                    var btnCollapse = document.createElement('button');
+                    btnCollapse.className = 'btn btn-secondary';
+                    btnCollapse.textContent = '全部折叠';
+                    btnCollapse.onclick = function() { collapseAllTree(); };
+                    topActions.appendChild(btnCollapse);
+                }
+
+                if (tools.length > 0) {
+                    tools.forEach(function(tool) {
+                        var btn = document.createElement('button');
+                        var btnClass = 'btn';
+                        var tType = (tool.type || tool.color || '').toLowerCase();
+                        if (tType === 'primary') btnClass += ' btn-primary';
+                        else if (tType === 'error' || tType === 'danger') btnClass += ' btn-danger';
+                        else btnClass += ' btn-secondary';
+                        btn.className = btnClass;
+                        btn.textContent = tool.name || tool.title;
+                        btn.onclick = function() {
+                            handleToolAction(tool);
+                        };
+                        topActions.appendChild(btn);
+                    });
+                }
             }
 
             function getSelectedIds() {
@@ -172,8 +230,13 @@
             function handleToolAction(tool) {
                 var action = tool.action || tool.actionType;
                 var base = window.location.pathname.replace(/\/+$/, '');
-                if (action === 'Export') {
-                    window.location.href = base + '/Export';
+                if (action === 'Export' || action === 'ExportXlsx') {
+                    // 默认采用原生 Excel .xlsx 格式流式导出
+                    window.location.href = base + '/Export?format=xlsx';
+                    return;
+                }
+                if (action === 'ExportCsv') {
+                    window.location.href = base + '/Export?format=csv';
                     return;
                 }
                 if (action === 'Add') {
@@ -266,10 +329,72 @@
             function renderRows(items) {
                 var tbody = document.getElementById('tableBody');
                 tbody.innerHTML = '';
-                var pk = (schema.conf && schema.conf.primaryKey) || 'id';
+                var pk = (schema.conf && schema.conf.primaryKey) || (schema.Conf && schema.Conf.primaryKey) || 'id';
+
+                // 树形表格元数据构建
+                var hasChildrenMap = {};
+                var parentMap = {};
+                var depthMap = {};
+                var treeColIndex = 0;
+
+                if (isTree) {
+                    // 1. 建立上下级关系索引与层级探测
+                    items.forEach(function(row) {
+                        var idStr = String(row[pk]);
+                        var pIdStr = row.parent_id !== undefined ? String(row.parent_id) : '';
+                        if (pIdStr && pIdStr !== '0' && pIdStr !== idStr) {
+                            hasChildrenMap[pIdStr] = true;
+                            parentMap[idStr] = pIdStr;
+                        }
+                        if (row.tree_path) {
+                            var parts = row.tree_path.split('/').filter(function(x) { return x.length > 0; });
+                            depthMap[idStr] = Math.max(0, parts.length - 1);
+                        }
+                    });
+
+                    // 对缺少 tree_path 的场景基于 parent_id 计算 depth
+                    items.forEach(function(row) {
+                        var idStr = String(row[pk]);
+                        if (depthMap[idStr] === undefined) {
+                            var d = 0;
+                            var curr = parentMap[idStr];
+                            var guard = 0;
+                            while (curr && curr !== '0' && guard < 20) {
+                                d++;
+                                curr = parentMap[curr];
+                                guard++;
+                            }
+                            depthMap[idStr] = d;
+                        }
+                    });
+
+                    // 确定缩进与折叠挂载的列（优先 name, title 或首个非隐藏列）
+                    var foundTreeCol = false;
+                    for (var ci = 0; ci < columns.length; ci++) {
+                        var c = columns[ci];
+                        if (c.hidden) continue;
+                        if (c.field === 'name' || c.field === 'title' || c.field === 'department_name') {
+                            treeColIndex = ci;
+                            foundTreeCol = true;
+                            break;
+                        }
+                    }
+                    if (!foundTreeCol) {
+                        for (var ci2 = 0; ci2 < columns.length; ci2++) {
+                            if (!columns[ci2].hidden) {
+                                treeColIndex = ci2;
+                                break;
+                            }
+                        }
+                    }
+                }
 
                 items.forEach(function(row) {
                     var tr = document.createElement('tr');
+                    var idStr = String(row[pk]);
+                    tr.setAttribute('data-id', idStr);
+                    if (row.parent_id !== undefined) tr.setAttribute('data-parent-id', String(row.parent_id));
+                    if (row.tree_path) tr.setAttribute('data-tree-path', row.tree_path);
                     
                     // 行复选框
                     var tdCheck = document.createElement('td');
@@ -281,14 +406,125 @@
                     tdCheck.appendChild(cb);
                     tr.appendChild(tdCheck);
 
-                    columns.forEach(function(col) {
+                    columns.forEach(function(col, colIdx) {
                         if (col.hidden) return;
                         var td = document.createElement('td');
                         td.style.textAlign = col.align || 'left';
-                        td.textContent = row[col.field] !== undefined ? row[col.field] : '';
+                        var rawVal = row[col.field] !== undefined ? row[col.field] : '';
+
+                        if (isTree && colIdx === treeColIndex) {
+                            var wrap = document.createElement('div');
+                            wrap.className = 'tree-node-title';
+
+                            var depth = depthMap[idStr] || 0;
+                            if (depth > 0) {
+                                var indent = document.createElement('span');
+                                indent.className = 'tree-indent';
+                                indent.style.width = (depth * 20) + 'px';
+                                wrap.appendChild(indent);
+                            }
+
+                            if (hasChildrenMap[idStr]) {
+                                var toggle = document.createElement('span');
+                                toggle.className = 'tree-toggle';
+                                toggle.setAttribute('data-toggle-id', idStr);
+                                toggle.textContent = collapsedNodes[idStr] ? '▶' : '▼';
+                                toggle.onclick = function(e) {
+                                    e.stopPropagation();
+                                    toggleTreeNode(idStr);
+                                };
+                                wrap.appendChild(toggle);
+                            } else {
+                                var spacer = document.createElement('span');
+                                spacer.className = 'tree-leaf-spacer';
+                                wrap.appendChild(spacer);
+                            }
+
+                            var textNode = document.createElement('span');
+                            textNode.textContent = rawVal;
+                            wrap.appendChild(textNode);
+                            td.appendChild(wrap);
+                        } else {
+                            td.textContent = rawVal;
+                        }
                         tr.appendChild(td);
                     });
                     tbody.appendChild(tr);
+                });
+
+                if (isTree) {
+                    updateTreeVisibility();
+                }
+            }
+
+            // 树形表格折叠/展开与状态刷新
+            function toggleTreeNode(nodeId) {
+                collapsedNodes[nodeId] = !collapsedNodes[nodeId];
+                updateTreeVisibility();
+            }
+
+            function expandAllTree() {
+                collapsedNodes = {};
+                updateTreeVisibility();
+            }
+
+            function collapseAllTree() {
+                var toggles = document.querySelectorAll('.tree-toggle');
+                toggles.forEach(function(t) {
+                    var nid = t.getAttribute('data-toggle-id');
+                    if (nid) collapsedNodes[nid] = true;
+                });
+                updateTreeVisibility();
+            }
+
+            function updateTreeVisibility() {
+                var tbody = document.getElementById('tableBody');
+                if (!tbody) return;
+                var rows = tbody.querySelectorAll('tr');
+
+                // 更新所有折叠图标
+                var toggles = tbody.querySelectorAll('.tree-toggle');
+                toggles.forEach(function(t) {
+                    var nid = t.getAttribute('data-toggle-id');
+                    t.textContent = collapsedNodes[nid] ? '▶' : '▼';
+                });
+
+                // 更新每一行的隐藏/展现状态
+                rows.forEach(function(tr) {
+                    var idStr = tr.getAttribute('data-id');
+                    var pIdStr = tr.getAttribute('data-parent-id');
+                    var treePath = tr.getAttribute('data-tree-path');
+
+                    var isHidden = false;
+                    if (treePath) {
+                        var parts = treePath.split('/').filter(function(x) { return x.length > 0; });
+                        // 祖先节点集合：排除自身后的所有上级
+                        for (var i = 0; i < parts.length; i++) {
+                            var anc = parts[i];
+                            if (anc !== idStr && collapsedNodes[anc]) {
+                                isHidden = true;
+                                break;
+                            }
+                        }
+                    } else if (pIdStr && pIdStr !== '0') {
+                        var curr = pIdStr;
+                        var guard = 0;
+                        while (curr && curr !== '0' && guard < 20) {
+                            if (collapsedNodes[curr]) {
+                                isHidden = true;
+                                break;
+                            }
+                            var parentTr = tbody.querySelector('tr[data-id="' + curr + '"]');
+                            curr = parentTr ? parentTr.getAttribute('data-parent-id') : null;
+                            guard++;
+                        }
+                    }
+
+                    if (isHidden) {
+                        tr.classList.add('tree-node-collapsed');
+                    } else {
+                        tr.classList.remove('tree-node-collapsed');
+                    }
                 });
             }
 
