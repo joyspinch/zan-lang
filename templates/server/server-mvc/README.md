@@ -4,43 +4,51 @@ Enterprise web application skeleton modeled on a production swoole (ZxPHP)
 framework, rebuilt on Zan's coroutine runtime — a layered controller/model
 structure, an external config file, and the ORM and cache wired in by default.
 
-The framework itself is **not** part of the template: routing, request context,
-hooks, views, filters, validation, sessions, rate limiting, request locks and
-the server bootstrap live in the standard library under `System.Web`
-(`WebApp`, `Router`, `HttpContext`, `Controller`, `View`, `WebServer`, …) next
-to `RouteTable` / `RouteStats` / `PermTable`. The template keeps only what is
-its own: config, DB, cache, controllers, models and views.
+Two layers sit under the application code, and neither is part of the template:
+
+- **`Zan.Web` package** (`packages/Zan.Web`) — the application framework:
+  bootstrap (`ZanWeb.Boot`), config/DB/cache contexts, auth, RBAC, settings,
+  schema + seed hook, metrics, job host, the sys entities and their DAOs, and
+  the three controller base classes. Referenced by `using ZanWeb;` and pulled
+  in automatically — see the package README for the boundary and the hooks.
+- **`System.Web` standard library** — the web kernel itself: `WebApp`,
+  `Router`, `HttpContext`, `Controller`, `View`, `WebServer`, next to
+  `RouteTable` / `RouteStats` / `PermTable`.
+
+The template keeps only what is its own: the composition root, business
+controllers/models/DAOs, the seed, views, static assets and config. Framework
+fixes land in the package — a package refresh updates this template without
+touching a line of its application code.
 
 ## Layout
 
 ```
 config/app.json         runtime config (host/port/limits/db/cache) — NOT compiled in
-src/main.zan            bootstrap only — routes come from controller attributes
+src/main.zan            composition root only: menu sections, route hook, seed
+                        registration, Boot.Run()
+src/Seed/BlogSeed.zan   business seed — registered via Schema.OnSeed hook
 src/Controller/         request handlers, one directory per module
   Index/Index.zan         HTML landing page
-  Blog/Posts.zan          list / detail / publish (ORM + cache + views)
+  Blog/Posts.zan          list / detail / comments / rss / sitemap (ORM + cache + views)
   Account/Login.zan       GET/POST /admin/login, /admin/logout (own bare layout)
   Admin/Dashboard.zan     GET /admin — metrics dashboard
   Admin/Users.zan         GET /admin/system/users + enable/disable, force logout
   Admin/Posts.zan         GET /admin/content/posts + publish/unpublish
   Api/Auth.zan            POST /api/auth/login, GET /api/auth/me
   User/Users.zan          /users, /user/{id}
-src/Dao/<Module>/       every query and write for that module
-src/Model/<Module>/     entities only: table structure, no queries
-src/Framework/          application wiring that belongs to this app
-  AppController.zan       request-scoped connection + transactions
-  AdminController.zan     admin base: anonymous -> redirect to /admin/login
-  Cfg.zan                 loads config/app.json into the typed Cfg entity
-  Db.zan                  builds the DB pool + Redis from [database]/[cache]
-  DbContext.zan           per-request connection lease
-  Schema.zan              CodeFirst DDL + seed, once at startup
-  Auth.zan                token issue/verify against sys_user
+src/Dao/Blog/           every query and write for the blog module
+src/Model/Blog/         blog entities only: table structure, no queries
 views/                  templates, in the module structure of the controllers
   layout.html             the site-wide page wrapper (global {{content}} layout)
   <Module>/*.html         that module's views; a module's own layout.html
                           overrides the global one for that module only
 wwwroot/                the ONLY web-reachable directory, served at /static
 ```
+
+The framework code (`ZanWeb` core, `Model.Sys`, `Dao.Sys`, the controller base
+classes) lives in `packages/Zan.Web/src/ZanWeb/…` and is not in the template
+tree at all. Business models/DAOs follow the same per-module layout in the
+application (`src/Model/Blog`, `src/Dao/Blog`) — same convention, app-owned.
 
 `views/` and `wwwroot/` sit next to `src/`, not inside it, because both are read
 at run time: a release is a copy of the executable plus `config/`, `views/` and
