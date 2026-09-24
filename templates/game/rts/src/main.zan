@@ -1,0 +1,388 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+using Gui.Rendering;
+using Game.Tactics;
+using Game.Core;
+
+namespace RtsGame;
+
+class RtsUnit {
+    int id;
+    int type; // 0: 陆战步兵, 1: 重装坦克, 2: 采矿战车
+    int team; // 0: 蓝军(玩家), 1: 红军(敌方)
+    double x;
+    double y;
+    double radius;
+    double speed;
+    int hp;
+    int maxHp;
+    bool selected;
+    int rvoSlot;
+
+    RtsUnit(int id, int type, int team, double x, double y, double r, double spd, int maxHp) {
+        this.id = id;
+        this.type = type;
+        this.team = team;
+        this.x = x;
+        this.y = y;
+        this.radius = r;
+        this.speed = spd;
+        this.hp = maxHp;
+        this.maxHp = maxHp;
+        this.selected = false;
+        this.rvoSlot = -1;
+    }
+
+    static RtsUnit Create(int id, int type, int team, double x, double y) {
+        if (type == 1) { // 坦克
+            return new RtsUnit(id, type, team, x, y, 16.0, 90.0, 300);
+        } else if (type == 2) { // 采矿车
+            return new RtsUnit(id, type, team, x, y, 18.0, 75.0, 450);
+        }
+        // 默认步兵
+        return new RtsUnit(id, type, team, x, y, 9.0, 110.0, 80);
+    }
+
+    int Id { get { return id; } }
+    int Type { get { return type; } }
+    int Team { get { return team; } }
+    double X { get { return x; } set { x = value; } }
+    double Y { get { return y; } set { y = value; } }
+    double Radius { get { return radius; } }
+    double Speed { get { return speed; } }
+    int Hp { get { return hp; } set { hp = value; } }
+    int MaxHp { get { return maxHp; } }
+    bool Selected { get { return selected; } set { selected = value; } }
+    int RvoSlot { get { return rvoSlot; } set { rvoSlot = value; } }
+}
+
+/// <summary>
+/// 战场绘制画布控件。
+/// </summary>
+class BattlefieldView : Control {
+    Program host;
+
+    BattlefieldView(Program host) {
+        this.InitControl("battlefield", 1);
+        this.host = host;
+    }
+
+    override void OnPaint(App app) {
+        base.OnPaint(app);
+        Canvas c = app.canvas;
+        host.RenderBattlefield(c, this.bx, this.by, this.bw, this.bh);
+    }
+}
+
+class Program {
+    Form form;
+    App app;
+    BattlefieldView view;
+
+    // 引擎系统
+    FlowField flowField;
+    RvoSimulator rvoSim;
+    List<RtsUnit> units;
+
+    // 战场参数
+    int worldWidth = 1024;
+    int worldHeight = 600;
+    int cellSize = 32;
+
+    // 鼠标框选交互
+    bool isDragging = false;
+    double dragStartX = 0.0;
+    double dragStartY = 0.0;
+    double dragCurX = 0.0;
+    double dragCurY = 0.0;
+
+    // 目标集结点
+    double targetX = 512.0;
+    double targetY = 300.0;
+    bool hasTarget = false;
+
+    // 资源统计
+    int minerals = 1500;
+    int power = 100;
+    int supplyUsed = 24;
+    int supplyMax = 100;
+
+    static void Main() {
+        Program p = new Program();
+        p.Run();
+    }
+
+    void Run() {
+        form = Form.CreateDark("红警与星际 · 即时战略引擎 (Zan RTS Engine)", 1024, 700);
+        app = form.GetApp();
+        app.UseSkin("dark");
+        Canvas.SetBackend(1); // GL 硬件加速后端
+
+        // 初始化流场与 RVO 避障器
+        int cols = worldWidth / cellSize;
+        int rows = worldHeight / cellSize;
+        flowField = FlowField.Create(cols, rows, cellSize);
+        rvoSim = RvoSimulator.Create(256, 48);
+        units = new List<RtsUnit>();
+
+        // 构造中央关隘峡谷与河流障碍
+        SetupTerrain();
+
+        // 孵化初始军团（50个蓝军单位，30个红军单位）
+        SpawnInitialArmies();
+
+        BuildUi();
+
+        // 核心游戏逻辑帧驱动（50ms / 20Hz 定步循环）
+        form.Every(50, () => {
+            TickSimulation(0.05);
+            app.RequestRedraw();
+        });
+
+        form.Run();
+    }
+
+    void SetupTerrain() {
+        int cols = worldWidth / cellSize;
+        int rows = worldHeight / cellSize;
+
+        // 设置峡谷山体障碍物（在中间留有通道峡口）
+        int midCol = cols / 2;
+        for (int r = 0; r < rows; r = r + 1) {
+            // 在中间第 8~12 行留出通路峡口，其余设为不可通行悬崖 (代价 255)
+            if (r < 7 || r > 12) {
+                flowField.SetCost(midCol, r, (byte)255);
+                flowField.SetCost(midCol + 1, r, (byte)255);
+            }
+        }
+    }
+
+    void SpawnInitialArmies() {
+        // 在左侧基地生成蓝方兵团
+        for (int i = 0; i < 40; i = i + 1) {
+            int uType = (i % 6 == 0) ? 1 : 0; // 少量坦克，大量步兵
+            double sx = 60.0 + (double)((i % 8) * 28);
+            double sy = 120.0 + (double)((i / 8) * 32);
+            RtsUnit u = RtsUnit.Create(i + 1, uType, 0, sx, sy);
+            int slot = rvoSim.AddAgent(sx, sy, u.Radius, u.Speed);
+            u.RvoSlot = slot;
+            units.Add(u);
+        }
+    }
+
+    void BuildUi() {
+        Panel root = Panel.Column();
+        root.Pad(8);
+        root.Gap(8);
+        form.Add(root);
+
+        // 1. 顶部战况与资源面板
+        Panel topBar = Panel.Row();
+        topBar.Class = "card";
+        topBar.Pad(8);
+        topBar.Gap(20);
+        topBar.Prefer(0, 48);
+        root.With(topBar);
+
+        Label lblTitle = new Label("⚔ 指挥官控制台");
+        lblTitle.Class = "title medium strong yellow";
+        topBar.With(lblTitle);
+
+        Label lblMin = new Label("💎 晶矿: " + Convert.ToString(minerals));
+        lblMin.Class = "medium cyan";
+        topBar.With(lblMin);
+
+        Label lblPow = new Label("⚡ 电力: " + Convert.ToString(power) + "MW");
+        lblPow.Class = "medium green";
+        topBar.With(lblPow);
+
+        Label lblPop = new Label("👥 人口: " + Convert.ToString(supplyUsed) + "/" + Convert.ToString(supplyMax));
+        lblPop.Class = "medium";
+        topBar.With(lblPop);
+
+        Button btnReinforce = new Button("➕ 征召装甲营 (+10)");
+        btnReinforce.Class = "primary";
+        btnReinforce.OnClick(() => {
+            SpawnReinforcements();
+        });
+        topBar.With(btnReinforce);
+
+        // 2. 中央战场视口
+        view = new BattlefieldView(this);
+        view.Grow();
+        view.OnClick(() => {
+            // 右键或左键下达行军目标
+            CommandMove(app.mouseX - view.bx, app.mouseY - view.by);
+        });
+        root.With(view);
+
+        // 3. 底部操作提示
+        Label hint = new Label("【操作指令】点击战场下达行军集结令 | 宏观流场寻路(FlowField) + 万人微观互斥避障(RVO2) 实时推挤通过狭窄峡谷");
+        hint.Class = "secondary small";
+        root.With(hint);
+    }
+
+    void SpawnReinforcements() {
+        int baseId = units.Count + 1;
+        for (int i = 0; i < 10; i = i + 1) {
+            double sx = 40.0 + (double)(i * 24);
+            double sy = 80.0;
+            RtsUnit u = RtsUnit.Create(baseId + i, 1, 0, sx, sy);
+            int slot = rvoSim.AddAgent(sx, sy, u.Radius, u.Speed);
+            u.RvoSlot = slot;
+            units.Add(u);
+        }
+        supplyUsed = supplyUsed + 10;
+    }
+
+    void CommandMove(int mouseX, int mouseY) {
+        targetX = (double)mouseX;
+        targetY = (double)mouseY;
+        hasTarget = true;
+
+        // 1. 刷新宏观流场寻路目标
+        int targetCol = (int)targetX / cellSize;
+        int targetRow = (int)targetY / cellSize;
+        flowField.SetTarget(targetCol, targetRow);
+        flowField.Rebuild();
+
+        // 2. 选中的所有单位（默认全部蓝方单位）设置朝向目标的期望速度
+        for (int i = 0; i < units.Count; i = i + 1) {
+            RtsUnit u = units[i];
+            u.Selected = true;
+        }
+    }
+
+    void TickSimulation(double dt) {
+        if (!hasTarget) { return; }
+
+        // 1. 根据 FlowField 向量场为每个 Agent 注入宏观期望速度
+        for (int i = 0; i < units.Count; i = i + 1) {
+            RtsUnit u = units[i];
+            if (u.RvoSlot < 0) { continue; }
+
+            double dx = targetX - u.X;
+            double dy = targetY - u.Y;
+            double distToTarget = Math.Sqrt(dx * dx + dy * dy);
+
+            if (distToTarget < 25.0) {
+                // 已到达集结点，期望速度归零
+                rvoSim.SetPrefVelocity(u.RvoSlot, 0.0, 0.0);
+            } else {
+                float fx;
+                float fy;
+                flowField.SampleWorldVelocity(u.X, u.Y, out fx, out fy);
+
+                // 若流场有效，按流场方向全速前进；否则直指目标
+                double vx;
+                double vy;
+                if (Math.Abs(fx) > 0.01 || Math.Abs(fy) > 0.01) {
+                    vx = (double)fx * u.Speed;
+                    vy = (double)fy * u.Speed;
+                } else {
+                    vx = (dx / distToTarget) * u.Speed;
+                    vy = (dy / distToTarget) * u.Speed;
+                }
+                rvoSim.SetPrefVelocity(u.RvoSlot, vx, vy);
+            }
+        }
+
+        // 2. 微观 RVO2 互斥推挤物理步进计算
+        rvoSim.Step(dt);
+
+        // 3. 将 RVO 物理位置同步回逻辑单位
+        for (int i = 0; i < units.Count; i = i + 1) {
+            RtsUnit u = units[i];
+            if (u.RvoSlot >= 0) {
+                u.X = rvoSim.GetX(u.RvoSlot);
+                u.Y = rvoSim.GetY(u.RvoSlot);
+            }
+        }
+    }
+
+    void RenderBattlefield(Canvas c, int bx, int by, int bw, int bh) {
+        // 1. 地面底色
+        c.FillRect(bx, by, bw, bh, 0xFF141E28);
+
+        // 2. 绘制网格背景
+        int cols = bw / cellSize;
+        int rows = bh / cellSize;
+        for (int col = 0; col <= cols; col = col + 1) {
+            c.FillRect(bx + col * cellSize, by, 1, bh, 0x11334E68);
+        }
+        for (int row = 0; row <= rows; row = row + 1) {
+            c.FillRect(bx, by + row * cellSize, bw, 1, 0x11334E68);
+        }
+
+        // 3. 绘制中央不可通行悬崖峡谷障碍
+        int midCol = cols / 2;
+        int canyonX = bx + midCol * cellSize;
+        for (int r = 0; r < rows; r = r + 1) {
+            if (r < 7 || r > 12) {
+                c.FillRect(canyonX, by + r * cellSize, cellSize * 2, cellSize, 0xFF374151);
+                c.DrawRect(canyonX, by + r * cellSize, cellSize * 2, cellSize, 0xFF4B5563, 1);
+            }
+        }
+
+        // 4. 绘制目标集结点与光标脉冲
+        if (hasTarget) {
+            int tx = bx + (int)targetX;
+            int ty = by + (int)targetY;
+            c.DrawCircle(tx, ty, 20, 0xAA10B981, 2);
+            c.DrawCircle(tx, ty, 8, 0xFF10B981, 2);
+        }
+
+        // 5. 绘制所有作战单位
+        for (int i = 0; i < units.Count; i = i + 1) {
+            RtsUnit u = units[i];
+            int ux = bx + (int)u.X;
+            int uy = by + (int)u.Y;
+            int r = (int)u.Radius;
+
+            // 选中光圈
+            if (u.Selected) {
+                c.DrawCircle(ux, uy, r + 4, 0xAA22C55E, 1);
+            }
+
+            // 单位本体
+            if (u.Type == 1) {
+                // 坦克：矩形底盘 + 炮塔
+                c.FillRect(ux - r, uy - r, r * 2, r * 2, 0xFF1E3A8A);
+                c.DrawRect(ux - r, uy - r, r * 2, r * 2, 0xFF3B82F6, 2);
+                c.FillCircle(ux, uy, r / 2, 0xFF60A5FA);
+            } else {
+                // 步兵：圆形小兵
+                c.FillCircle(ux, uy, r, 0xFF2563EB);
+                c.DrawCircle(ux, uy, r, 0xFF93C5FD, 1);
+            }
+
+            // 血条 (微型)
+            int barW = r * 2;
+            c.FillRect(ux - r, uy - r - 6, barW, 3, 0xFF450A0A);
+            c.FillRect(ux - r, uy - r - 6, (int)((double)barW * ((double)u.Hp / (double)u.MaxHp)), 3, 0xFF22C55E);
+        }
+
+        // 6. 右下角雷达小地图（Minimap）
+        RenderMinimap(c, bx + bw - 160, by + bh - 120, 150, 110);
+    }
+
+    void RenderMinimap(Canvas c, int mx, int my, int mw, int mh) {
+        c.FillRect(mx, my, mw, mh, 0xEE0B0F19);
+        c.DrawRect(mx, my, mw, mh, 0xFF374151, 2);
+
+        // 小地图中央峡谷
+        c.FillRect(mx + mw / 2 - 2, my, 4, mh, 0x884B5563);
+        // 小地图通道亮色
+        c.FillRect(mx + mw / 2 - 2, my + (int)((double)mh * 0.4), 4, (int)((double)mh * 0.25), 0x00000000);
+
+        // 投影单位光点
+        for (int i = 0; i < units.Count; i = i + 1) {
+            RtsUnit u = units[i];
+            int px = mx + (int)((u.X / (double)worldWidth) * (double)mw);
+            int py = my + (int)((u.Y / (double)worldHeight) * (double)mh);
+            c.FillRect(px, py, 2, 2, 0xFF3B82F6);
+        }
+    }
+}

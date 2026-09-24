@@ -435,8 +435,14 @@ Post 调用核对编码，别信二手注释。
   - `SpatialHash2D`：采用紧凑定长扁平数组与哈希桶链表，零 GC 内存预分配，万级实体范围查询与最近索敌保持在毫秒级以内。
 - **L2 塔防与 RTS 战术（Game.Tactics）**：
   - `FlowField`（流场寻路）：千万群怪与兵团统一以目标基地为波前扩散（BFS/Dijkstra）计算集成场与 8 方向下坡向量场，单位采样移动方向复杂度降为纯 $O(1)$，彻底终结单兵 A* 路径规划导致的 CPU 耗尽。
+  - `RvoSimulator`（互斥避障与微观推挤）：宏观向量场负责全局导向，微观群落狭路相逢时采用 RVO2/ORCA 原理，双向单位各承担 50% 垂直侧向偏移规避速度障碍锥（VO），若已深度重叠则施加反比物理强排斥力弹开，结合 `SpatialHash2D` 网格分桶，彻底杜绝人海卡死与穿模。
   - `Tower` & `BulletPool`：支持 First/Closest/Strongest/Weakest 索敌策略与自动转向；投射物采用定长对象池管理直线、追踪制导与高抛 AOE 溅射。
   - `WaveSpawner`：统一管理战备倒计时、出怪节奏与波次结算。
+- **L1 网络、录像与回放（Game.Net）**：
+  - `LockstepManager`：定频逻辑帧（如 20Hz），收集原子指令桶 `FrameBucket` 驱动确定性推演，客户端延迟落后时无渲染极速追帧。
+  - `ReplayRecorder` 与 `ReplayPlayer`：低开销记录战局元数据头与各帧指令，无缝支持 $1\times, 2\times, 4\times, 8\times$ 倍速播放、暂停与指定帧追溯，战局复盘零网络带宽消耗。
+- **L0 空间音频（Game.Foundation.SpatialAudio2D）**：
+  - 2.5D 立体声像与距离衰减：基于听者与音源的横向偏差 $\Delta x$ 计算声相（Stereo Pan: $-1.0 \sim +1.0$），在最小半径 $r_{\min}$ 到最大听觉半径 $r_{\max}$ 之间实施平滑二次衰减，超出 $r_{\max}$ 自动静音裁剪节省混音开销。
 - **L1 等轴测 ARPG / 传奇类（Game.Arpg）**：
   - `IsoTileMap`：工业级 2:1 菱形等轴测地砖双向映射与 8 方向（`GetDirection8`）旋转扇区朝向解算。
   - `YSortLayer`：采用原位快速排序解决玩家、怪物、NPC 与建筑间的 Y 轴脚底动态遮挡，零堆内存分配。

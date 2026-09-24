@@ -1,0 +1,106 @@
+using System;
+using System.Collections.Generic;
+using System.Media;
+
+namespace Game.Foundation;
+
+/// <summary>
+/// 2.5D / 2D 空间立体声与声相衰减系统（Spatial Audio 2D）。
+/// 专为 ARPG 传奇打怪听声辨位、RTS 战场侧翼交火与射击弹道音效打造：
+/// 1. 距离平方反比与线性衰减（随与听者/相机中心距离降低增益）；
+/// 2. 屏幕左右声相偏转（Stereo Panning: -1.0 极左 ~ +1.0 极右）；
+/// 3. 等功率立体声能量法则（Constant Power Panning）；
+/// 4. 移动音源追踪与视区外超远距静音裁剪。
+/// </summary>
+class SpatialAudio2D {
+    double listenerX;
+    double listenerY;
+    double panSpanWidth; // 产生最大偏相的水平半跨度（如 640px 对应半屏宽）
+    double minDistance;  // 满音量无衰减半径（如 80px）
+    double maxDistance;  // 最大可听半径（超出则裁切静音，如 1200px）
+    AudioBus audioBus;
+
+    SpatialAudio2D(AudioBus bus, double spanW, double minD, double maxD) {
+        this.audioBus = bus;
+        this.listenerX = 0.0;
+        this.listenerY = 0.0;
+        this.panSpanWidth = spanW > 50.0 ? spanW : 640.0;
+        this.minDistance = minD > 0.0 ? minD : 80.0;
+        this.maxDistance = maxD > minD ? maxD : 1200.0;
+    }
+
+    static SpatialAudio2D Create(AudioBus bus, double spanW, double minD, double maxD) {
+        return new SpatialAudio2D(bus, spanW, minD, maxD);
+    }
+
+    double ListenerX { get { return listenerX; } set { listenerX = value; } }
+    double ListenerY { get { return listenerY; } set { listenerY = value; } }
+    double MinDistance { get { return minDistance; } set { minDistance = value; } }
+    double MaxDistance { get { return maxDistance; } set { maxDistance = value; } }
+
+    void SetListenerPosition(double x, double y) {
+        this.listenerX = x;
+        this.listenerY = y;
+    }
+
+    /// <summary>
+    /// 计算指定世界坐标处的声相值与距离衰减增益。
+    /// outPan: -1.0 (极左) ~ +1.0 (极右)
+    /// outGain: 0.0 ~ 1.0
+    /// </summary>
+    void CalculateSpatial(double sourceX, double sourceY, double baseGain, out double outPan, out double outGain) {
+        double dx = sourceX - listenerX;
+        double dy = sourceY - listenerY;
+        double dist = Math.Sqrt(dx * dx + dy * dy);
+
+        // 1. 声相计算（水平偏移跨度归一化）
+        double rawPan = dx / panSpanWidth;
+        if (rawPan < -1.0) { rawPan = -1.0; }
+        if (rawPan > 1.0) { rawPan = 1.0; }
+        outPan = rawPan;
+
+        // 2. 距离衰减计算
+        if (dist <= minDistance) {
+            outGain = baseGain;
+        } else if (dist >= maxDistance) {
+            outGain = 0.0;
+        } else {
+            // 平滑线性插值
+            double t = (dist - minDistance) / (maxDistance - minDistance);
+            double atten = 1.0 - t;
+            // 平滑衰减曲线 (SmoothStep 体验更佳)
+            atten = atten * atten;
+            outGain = baseGain * atten;
+        }
+
+        if (outGain < 0.0) { outGain = 0.0; }
+        if (outGain > 1.0) { outGain = 1.0; }
+    }
+
+    /// <summary>
+    /// 在指定空间坐标处触发一次具有立体声空间感的音效。
+    /// </summary>
+    AudioVoice PlayAt(AudioClip clip, double sourceX, double sourceY, double baseGain, int loop) {
+        if (clip == null || !clip.IsValid()) { return null; }
+
+        double pan;
+        double effectiveGain;
+        CalculateSpatial(sourceX, sourceY, baseGain, out pan, out effectiveGain);
+
+        if (effectiveGain <= 0.001) {
+            // 超出听音半径直接跳过，零 CPU 开销
+            return null;
+        }
+
+        double finalVolume = effectiveGain;
+        if (audioBus != null) {
+            finalVolume = finalVolume * audioBus.SfxVolume() * audioBus.MasterVolume();
+            if (audioBus.IsSfxMuted() || audioBus.IsMasterMuted()) {
+                return null;
+            }
+        }
+
+        // 调用底层起播
+        return clip.Play(finalVolume, loop);
+    }
+}

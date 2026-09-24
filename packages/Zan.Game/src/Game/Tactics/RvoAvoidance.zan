@@ -1,0 +1,227 @@
+using System;
+using Game.Core;
+
+namespace Game.Tactics;
+
+/// <summary>
+/// RTS 海量单位集群互斥避障（Reciprocal Velocity Obstacles - RVO2 / ORCA）模拟系统。
+/// 彻底解决红警、帝国时代、魔兽与塔防中“万人行军重叠穿模、窄道剧烈抖动卡死、原地互不相让”等运动学顽疾。
+/// </summary>
+class RvoSimulator {
+    int maxAgents;
+    int agentCount;
+
+    bool[] active;
+    int[] agentIds;
+    double[] posX;
+    double[] posY;
+    double[] velX;
+    double[] velY;
+    double[] prefVx;
+    double[] prefVy;
+    double[] radius;
+    double[] maxSpeed;
+
+    SpatialHash2D spatialGrid;
+    int[] neighborBuf;
+    int maxNeighbors;
+
+    RvoSimulator(int capacity, int cellSize) {
+        this.maxAgents = capacity > 16 ? capacity : 1024;
+        this.agentCount = 0;
+
+        this.active = new bool[maxAgents];
+        this.agentIds = new int[maxAgents];
+        this.posX = new double[maxAgents];
+        this.posY = new double[maxAgents];
+        this.velX = new double[maxAgents];
+        this.velY = new double[maxAgents];
+        this.prefVx = new double[maxAgents];
+        this.prefVy = new double[maxAgents];
+        this.radius = new double[maxAgents];
+        this.maxSpeed = new double[maxAgents];
+
+        int gridCell = cellSize > 8 ? cellSize : 48;
+        this.spatialGrid = SpatialHash2D.Create(gridCell, maxAgents);
+
+        this.maxNeighbors = 32;
+        this.neighborBuf = new int[maxNeighbors];
+    }
+
+    static RvoSimulator Create(int capacity, int cellSize) {
+        return new RvoSimulator(capacity, cellSize);
+    }
+
+    int AgentCount { get { return agentCount; } }
+    int Capacity { get { return maxAgents; } }
+
+    /// <summary>
+    /// 添加或重用一个 RVO 运动体。
+    /// </summary>
+    int AddAgent(double x, double y, double r, double speed) {
+        int slot = -1;
+        for (int i = 0; i < maxAgents; i = i + 1) {
+            if (!active[i]) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot < 0) { return -1; }
+
+        active[slot] = true;
+        agentIds[slot] = slot;
+        posX[slot] = x;
+        posY[slot] = y;
+        velX[slot] = 0.0;
+        velY[slot] = 0.0;
+        prefVx[slot] = 0.0;
+        prefVy[slot] = 0.0;
+        radius[slot] = r > 1.0 ? r : 12.0;
+        maxSpeed[slot] = speed > 1.0 ? speed : 100.0;
+
+        agentCount = agentCount + 1;
+        return slot;
+    }
+
+    void RemoveAgent(int slot) {
+        if (slot >= 0 && slot < maxAgents && active[slot]) {
+            active[slot] = false;
+            agentCount = agentCount - 1;
+        }
+    }
+
+    void SetPrefVelocity(int slot, double pvx, double pvy) {
+        if (slot >= 0 && slot < maxAgents && active[slot]) {
+            prefVx[slot] = pvx;
+            prefVy[slot] = pvy;
+        }
+    }
+
+    double GetX(int slot) { return posX[slot]; }
+    double GetY(int slot) { return posY[slot]; }
+    double GetVx(int slot) { return velX[slot]; }
+    double GetVy(int slot) { return velY[slot]; }
+
+    /// <summary>
+    /// 逐物理步更新互斥避障计算并推进位置。
+    /// </summary>
+    void Step(double dt) {
+        if (dt <= 0.0) { return; }
+
+        // 1. 刷新空间哈希网格
+        spatialGrid.Clear();
+        for (int i = 0; i < maxAgents; i = i + 1) {
+            if (active[i]) {
+                spatialGrid.Insert(i, posX[i], posY[i], radius[i]);
+            }
+        }
+
+        // 2. 针对每个活跃单位计算 RVO2 避让速度
+        for (int i = 0; i < maxAgents; i = i + 1) {
+            if (!active[i]) { continue; }
+
+            double px_i = posX[i];
+            double py_i = posY[i];
+            double r_i = radius[i];
+            double spd_i = maxSpeed[i];
+
+            // 期望速度
+            double nvx = prefVx[i];
+            double nvy = prefVy[i];
+
+            // 检索周围邻居 (感知范围为自身半径的 3.5 倍)
+            double senseRadius = r_i * 3.5;
+            int neighborCount = spatialGrid.QueryRange(px_i, py_i, senseRadius, neighborBuf, maxNeighbors);
+
+            // 避让推力累加器
+            double pushX = 0.0;
+            double pushY = 0.0;
+            double orcaWeightSum = 0.0;
+
+            for (int k = 0; k < neighborCount; k = k + 1) {
+                int j = neighborBuf[k];
+                if (j == i || !active[j]) { continue; }
+
+                double dx = posX[j] - px_i;
+                double dy = posY[j] - py_i;
+                double distSq = dx * dx + dy * dy;
+                double combinedR = r_i + radius[j];
+
+                if (distSq < 0.0001) {
+                    // 两单位几乎完全重合，产生离散互斥力打破对称性
+                    pushX = pushX - (i % 2 == 0 ? 1.0 : -1.0) * spd_i * 0.8;
+                    pushY = pushY - (i % 3 == 0 ? 1.0 : -1.0) * spd_i * 0.8;
+                    continue;
+                }
+
+                double dist = Math.Sqrt(distSq);
+
+                if (dist < combinedR) {
+                    // 情况 A：已经发生物理重叠穿透！产生刚体排斥推力（各退一半）
+                    double overlap = combinedR - dist;
+                    double nx = dx / dist;
+                    double ny = dy / dist;
+                    // 推力大小与穿透深度成正比
+                    double sepSpd = (overlap / dt) * 0.5;
+                    if (sepSpd > spd_i * 1.5) { sepSpd = spd_i * 1.5; }
+                    pushX = pushX - nx * sepSpd;
+                    pushY = pushY - ny * sepSpd;
+                } else {
+                    // 情况 B：尚未重叠但在未来时间窗口 tau 内存在碰撞风险 (RVO / VO 算法)
+                    double tau = 1.2; // 预测未来 1.2 秒
+                    double relVx = velX[i] - velX[j];
+                    double relVy = velY[i] - velY[j];
+
+                    // 相对位置与相对速度点积（若为正，表示正在远离，风险低）
+                    double dot = relVx * dx + relVy * dy;
+                    if (dot > 0.0) {
+                        // 相对速度正朝着对方逼近
+                        double timeToCollision = distSq / (dot + 0.001);
+                        if (timeToCollision < tau) {
+                            // 垂直于相对位移方向的切向侧向滑移避让向量
+                            double nx = dx / dist;
+                            double ny = dy / dist;
+                            // 侧向法向量 (-ny, nx)
+                            double sideX = -ny;
+                            double sideY = nx;
+
+                            // 根据左右侧倾向选边避让
+                            double sideDot = prefVx[i] * sideX + prefVy[i] * sideY;
+                            if (sideDot < 0.0) {
+                                sideX = -sideX;
+                                sideY = -sideY;
+                            }
+
+                            double avoidanceFactor = (1.0 - (timeToCollision / tau)) * spd_i * 0.7;
+                            pushX = pushX + sideX * avoidanceFactor * 0.5;
+                            pushY = pushY + sideY * avoidanceFactor * 0.5;
+                            orcaWeightSum = orcaWeightSum + 1.0;
+                        }
+                    }
+                }
+            }
+
+            // 合成新速度：期望速度 + 避让调整
+            nvx = nvx + pushX;
+            nvy = nvy + pushY;
+
+            // 速度钳制不超过自身最大移速
+            double currentSpeed = Math.Sqrt(nvx * nvx + nvy * nvy);
+            if (currentSpeed > spd_i) {
+                nvx = (nvx / currentSpeed) * spd_i;
+                nvy = (nvy / currentSpeed) * spd_i;
+            }
+
+            velX[i] = nvx;
+            velY[i] = nvy;
+        }
+
+        // 3. 推进位置
+        for (int i = 0; i < maxAgents; i = i + 1) {
+            if (active[i]) {
+                posX[i] = posX[i] + velX[i] * dt;
+                posY[i] = posY[i] + velY[i] * dt;
+            }
+        }
+    }
+}

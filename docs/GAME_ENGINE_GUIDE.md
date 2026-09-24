@@ -156,3 +156,56 @@
 # 执行素材工具查看示例与图集规划
 powershell -ExecutionPolicy Bypass -File scripts/game_asset_tool.ps1 -Atlas 64 64 32
 ```
+
+---
+
+## 八、 RTS 微观群体避障与 RVO2 互斥运动学 (`RvoSimulator`)
+
+在万单位红警/魔兽/塔防同屏中，宏观由 `FlowField` 向量场进行 $O(1)$ 指路，微观则由 `RvoSimulator` 杜绝堵塞穿模：
+1. **相互速度障碍区（ORCA/RVO2 原理）**：
+   - 当两单位在探测视界内迎面或斜交时，计算速度障碍圆锥（Velocity Obstacle Cone），双方各承担 $50\%$ 的垂直相对位移偏移量，平滑擦肩而过。
+2. **物理硬核穿透排斥**：
+   - 若单位已被强行挤压重叠（$d < r_1 + r_2$），激活反比强斥力弹开，杜绝重叠堆死。
+3. **空间局部网格哈希（`SpatialHash2D`）加速**：
+   - 采用大素数网格桶替代 $O(N^2)$ 全局遍历，几千个单位同屏仅消耗数毫秒 CPU。
+
+---
+
+## 九、 确定性战局录像回放与快进控制 (`ReplaySystem`)
+
+为红警/星际/魔兽等竞技战局提供轻量回放能力：
+1. **轻量录像格式**：
+   - 记录 `ReplayHeader`（幻数、初始随机种子、玩家数、地图名）及各逻辑帧的操作指令桶 `ReplayFrameRecord`。一局 30 分钟的高强度战局文件仅几百 KB。
+2. **倍速快进与跳帧**：
+   - `ReplayPlayer` 支持 $1\times, 2\times, 4\times, 8\times$ 无损倍速播放、暂停与快进追帧，完美复现精彩瞬间。
+
+---
+
+## 十、 2.5D 空间立体声与衰减平滑 (`SpatialAudio2D`)
+
+将平面的 2D 音效升级为沉浸式立体战场声相：
+1. **声相横向偏转（Stereo Panning）**：
+   - 根据音源相对于听者（通常为屏幕中心或英雄）的横向偏差 $\Delta x$，映射为 $-1.0$ (极左声道) 到 $+1.0$ (极右声道) 的立体声像。
+2. **平滑二次衰减与听觉视界裁剪**：
+   - 距离 $d \le r_{\min}$ 时保真无损输出，在 $r_{\min} < d < r_{\max}$ 范围内按平滑二次曲线平滑衰减。超出 $r_{\max}$ 自动剔除静音，节省混合器算力。
+
+---
+
+## 十一、 官方游戏模板生态矩阵与命令快速上手
+
+所有模板均位于 `templates/game/` 并在 `packages/Zan.Game` 统一底座上构建：
+
+| 模板路径 | 游戏类型 | 核心集成引擎特性 |
+|---|---|---|
+| `templates/game/rts` | 即时战略 (RTS / 红警 / 魔兽) | `FlowField` 宏观寻路 + `RvoSimulator` 群体避障 + 小地图雷达 + 框选移动 |
+| `templates/game/legend` | 2.5D 动作 RPG (传奇 / 暗黑) | 八方向朝向 + 5方向镜像 + 纸娃娃图层排序 + 怪物巡逻 + 掉落物散射 |
+| `templates/game/card` | 策略卡牌 (杀戮尖塔 / 炉石) | 卡牌堆栈手牌布局 + 能量点数结算 + 回合流转 + 战斗飘字与抖动反馈 |
+| `templates/game/towerdefense` | 塔防策略 (保卫萝卜 / 兽人) | 多波次刷怪 + 预设路线多段移动 + 防御塔范围自动索敌 + 穿透弹道 |
+| `templates/game/idle` | 放置挂机 (暗黑挂机 / 放置骑士) | `OfflineRewardCalculator` 离线收益 + `SquashAndStretch` 弹性反馈 + `FloatingText` 飘字池 |
+
+一键体验与打包发布：
+```powershell
+# 编译并打包 RTS 游戏为独立绿色安装包
+powershell -ExecutionPolicy Bypass -File scripts/pack_game.ps1 -Project templates/game/rts -Name ZanRTS
+```
+

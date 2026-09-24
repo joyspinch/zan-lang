@@ -1,0 +1,192 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Net;
+
+/// <summary>
+/// 录像元数据头信息。
+/// </summary>
+class ReplayHeader {
+    int magic;          // 0x5A524550 ("ZREP")
+    int version;        // 协议版本号
+    long randomSeed;    // 初始随机种子
+    int playerCount;    // 玩家总数
+    string mapName;     // 对战地图
+    int totalFrames;    // 总逻辑帧数
+
+    ReplayHeader(long seed, int players, string map) {
+        this.magic = 0x5A524550;
+        this.version = 1;
+        this.randomSeed = seed;
+        this.playerCount = players > 0 ? players : 1;
+        this.mapName = map != null ? map : "default";
+        this.totalFrames = 0;
+    }
+
+    static ReplayHeader Create(long seed, int players, string map) {
+        return new ReplayHeader(seed, players, map);
+    }
+
+    long RandomSeed { get { return randomSeed; } }
+    int PlayerCount { get { return playerCount; } }
+    string MapName { get { return mapName; } }
+    int TotalFrames { get { return totalFrames; } set { totalFrames = value; } }
+}
+
+/// <summary>
+/// 单帧录像数据（帧序号 + 该帧全部玩家指令）。
+/// </summary>
+class ReplayFrameRecord {
+    int frameIndex;
+    List<PlayerCommand> commands;
+
+    ReplayFrameRecord(int frameIdx) {
+        this.frameIndex = frameIdx;
+        this.commands = new List<PlayerCommand>();
+    }
+
+    static ReplayFrameRecord Create(int frameIdx) {
+        return new ReplayFrameRecord(frameIdx);
+    }
+
+    int FrameIndex { get { return frameIndex; } }
+    List<PlayerCommand> Commands { get { return commands; } }
+
+    void AddCommand(PlayerCommand cmd) {
+        if (cmd != null) {
+            commands.Add(cmd);
+        }
+    }
+}
+
+/// <summary>
+/// 战局录制器（ReplayRecorder）：
+/// 零侵入挂载在 Lockstep 循环中，将每帧玩家指令原子记录。
+/// </summary>
+class ReplayRecorder {
+    ReplayHeader header;
+    List<ReplayFrameRecord> recordedFrames;
+    bool isRecording;
+
+    ReplayRecorder(long seed, int players, string map) {
+        this.header = ReplayHeader.Create(seed, players, map);
+        this.recordedFrames = new List<ReplayFrameRecord>();
+        this.isRecording = true;
+    }
+
+    static ReplayRecorder Create(long seed, int players, string map) {
+        return new ReplayRecorder(seed, players, map);
+    }
+
+    bool IsRecording { get { return isRecording; } }
+    int FrameCount { get { return recordedFrames.Count; } }
+    ReplayHeader Header { get { return header; } }
+
+    /// <summary>记录当前逻辑帧的命令桶。</summary>
+    void RecordFrame(int frameIdx, FrameBucket bucket) {
+        if (!isRecording || bucket == null) { return; }
+
+        ReplayFrameRecord rec = ReplayFrameRecord.Create(frameIdx);
+        for (int i = 0; i < bucket.CommandCount; i = i + 1) {
+            PlayerCommand cmd = bucket.GetCommand(i);
+            if (cmd != null) {
+                rec.AddCommand(cmd);
+            }
+        }
+        recordedFrames.Add(rec);
+        header.TotalFrames = recordedFrames.Count;
+    }
+
+    /// <summary>结束录制。</summary>
+    void Stop() {
+        this.isRecording = false;
+    }
+
+    List<ReplayFrameRecord> GetFrames() {
+        return recordedFrames;
+    }
+}
+
+/// <summary>
+/// 录像回放播放器（ReplayPlayer）：
+/// 支持暂停、恢复、快进倍速播放（1x, 2x, 4x, 8x）与步进帧同步。
+/// </summary>
+class ReplayPlayer {
+    ReplayHeader header;
+    List<ReplayFrameRecord> frames;
+    int currentPlayIndex;
+    bool isPlaying;
+    bool isPaused;
+    double speedMultiplier; // 1.0, 2.0, 4.0, 8.0
+    double accumulator;
+    double frameIntervalSec;
+
+    ReplayPlayer(ReplayHeader header, List<ReplayFrameRecord> frames, double tickRateHz) {
+        this.header = header;
+        this.frames = frames != null ? frames : new List<ReplayFrameRecord>();
+        this.currentPlayIndex = 0;
+        this.isPlaying = false;
+        this.isPaused = false;
+        this.speedMultiplier = 1.0;
+        this.accumulator = 0.0;
+        double rate = tickRateHz > 1.0 ? tickRateHz : 20.0;
+        this.frameIntervalSec = 1.0 / rate;
+    }
+
+    static ReplayPlayer Create(ReplayHeader header, List<ReplayFrameRecord> frames, double tickRateHz) {
+        return new ReplayPlayer(header, frames, tickRateHz);
+    }
+
+    bool IsPlaying { get { return isPlaying; } }
+    bool IsPaused { get { return isPaused; } }
+    bool IsFinished { get { return currentPlayIndex >= frames.Count; } }
+    double SpeedMultiplier { get { return speedMultiplier; } set { speedMultiplier = value > 0.1 ? value : 1.0; } }
+    int CurrentFrameIndex {
+        get {
+            if (currentPlayIndex < frames.Count) {
+                return frames[currentPlayIndex].FrameIndex;
+            }
+            return header != null ? header.TotalFrames : 0;
+        }
+    }
+    int TotalFrames { get { return header != null ? header.TotalFrames : frames.Count; } }
+
+    void Play() {
+        this.isPlaying = true;
+        this.isPaused = false;
+    }
+
+    void Pause() {
+        this.isPaused = true;
+    }
+
+    void Resume() {
+        this.isPaused = false;
+    }
+
+    /// <summary>
+    /// 推进回放时间轴，按倍速逐帧触发执行回调。
+    /// </summary>
+    int Update(double dt, Action<int, List<PlayerCommand>> onExecuteFrame) {
+        if (!isPlaying || isPaused || IsFinished) { return 0; }
+
+        accumulator = accumulator + dt * speedMultiplier;
+        int executedFrames = 0;
+
+        while (accumulator >= frameIntervalSec && currentPlayIndex < frames.Count) {
+            accumulator = accumulator - frameIntervalSec;
+            ReplayFrameRecord rec = frames[currentPlayIndex];
+            currentPlayIndex = currentPlayIndex + 1;
+
+            if (onExecuteFrame != null && rec != null) {
+                onExecuteFrame(rec.FrameIndex, rec.Commands);
+            }
+            executedFrames = executedFrames + 1;
+        }
+
+        if (currentPlayIndex >= frames.Count) {
+            isPlaying = false;
+        }
+        return executedFrames;
+    }
+}
