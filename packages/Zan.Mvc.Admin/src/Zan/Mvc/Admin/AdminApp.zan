@@ -2,10 +2,13 @@ using System;
 using System.IO;
 using System.Data;
 using System.Data.Sqlite;
+using System.Diagnostics;
 using System.Web;
 using Zan.Mvc.Admin.Web;
 using Zan.Mvc.Admin.Security;
 using Zan.Mvc.Admin.Installer;
+using Zan.Mvc.Admin.Dao;
+using Zan.Mvc.Admin.Model;
 
 namespace Zan.Mvc.Admin;
 
@@ -18,7 +21,8 @@ namespace Zan.Mvc.Admin;
 /// 1. 安装锁防护与初始安装向导网关 (InstallGateMiddleware)；
 /// 2. 静态 UI 资产 (/static/zan/*)；
 /// 3. 全局统一安全与 5 级 DataScope 数据隔离中枢 (SecurityRegistry)；
-/// 4. 属性路由与中台管理端控制器支持。
+/// 4. 属性路由与中台管理端控制器支持；
+/// 5. 全链路微秒级 APM 监控 (ServerMetrics/DbTrace) 与异常自动捕获。
 /// </summary>
 public class AdminApp {
     private static IDbConnection _db;
@@ -33,7 +37,11 @@ public class AdminApp {
     }
 
     public static void SetDb(IDbConnection db) {
-        _db = db;
+        if (db != null) {
+            _db = TracedDbConnection.Wrap(db);
+        } else {
+            _db = null;
+        }
     }
 
     /// <summary>
@@ -41,7 +49,29 @@ public class AdminApp {
     /// </summary>
     public static void UseAdmin(WebApp app, IDbConnection db) {
         _app = app;
-        _db = db;
+        if (db != null) {
+            _db = TracedDbConnection.Wrap(db);
+        }
+
+        // 0. 挂载微秒级数据库 APM 探针与慢查询聚合
+        DbTrace.Sink((string sql, long us) => {
+            ServerMetrics.Global().RecordQuery(sql, us);
+        });
+
+        // 挂载全局异常持久化汇流器（自动将未捕获异常与系统故障入库并按天写日志）
+        ServerMetrics.Global().OnError((long ts, string origin, string detail) => {
+            if (_db != null) {
+                try {
+                    SysOperationLog log = new SysOperationLog();
+                    log.admin_id = 0;
+                    log.action = "SYSTEM_ERROR";
+                    log.detail = origin + " | " + detail;
+                    log.ip = "127.0.0.1";
+                    log.created_at = ts;
+                    SysOperationLogDao.Of(_db).Insert(log);
+                } catch (Exception ex) {}
+            }
+        });
 
         // 1. 注册安装守卫中间件（未安装时拦截重定向至 /install，已安装时永久熔断 /install）
         app.Before((HttpContext ctx) => {
@@ -93,7 +123,8 @@ public class AdminApp {
         }
 
         SqliteConnection conn = SqliteConnection.Open(dbPath);
-        _db = conn;
-        return conn;
+        IDbConnection traced = TracedDbConnection.Wrap(conn);
+        _db = traced;
+        return traced;
     }
 }

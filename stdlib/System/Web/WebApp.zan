@@ -721,9 +721,15 @@ class WebApp {
         // here and take the whole process down with no trace, so it is
         // contained: record the failure (persisted to the error log) and answer
         // 500, so one bad request never kills the server.
+        bool errLogged = false;
         try {
             await h(ctx);
         } catch (ApiError ae) {
+            if (ae.Status() >= 500) {
+                this.metrics.RecordError((long)WebApp.NowSeconds(),
+                    ctx.method + " " + ctx.path, WebApp.Redact(ae.Message));
+                errLogged = true;
+            }
             if (!ctx.ended) {
                 ctx.Status(ae.Status(), ApiError.Reason(ae.Status()));
                 ctx.Api(ae.Code(), ae.Message, "null");
@@ -731,6 +737,7 @@ class WebApp {
         } catch (Exception e) {
             this.metrics.RecordError((long)WebApp.NowSeconds(),
                 ctx.method + " " + ctx.path, WebApp.Redact(e.Message));
+            errLogged = true;
             if (!ctx.ended) {
                 ctx.Status(500, "Internal Server Error");
                 ctx.Json(WebApp.ErrorJson("500", "internal server error"));
@@ -738,8 +745,19 @@ class WebApp {
         }
         if (lockLease != null) { this.Locks().Release(lockLease); }
         if (!ctx.ended) {
+            this.metrics.RecordError((long)WebApp.NowSeconds(),
+                ctx.method + " " + ctx.path, "handler produced no response");
+            errLogged = true;
             ctx.Status(500, "Internal Server Error");
             ctx.Json(WebApp.ErrorJson("500", "handler produced no response"));
+        }
+        if (ctx.status >= 500 && !errLogged) {
+            string detail = ctx.statusText;
+            if (detail == null || detail.Length == 0) {
+                detail = "HTTP " + Convert.ToString(ctx.status);
+            }
+            this.metrics.RecordError((long)WebApp.NowSeconds(),
+                ctx.method + " " + ctx.path, detail);
         }
 
         // A hijacked connection (SSE, upgrade) is held open for as long as the
