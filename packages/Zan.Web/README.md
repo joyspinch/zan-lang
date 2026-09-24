@@ -76,10 +76,10 @@ ZanWeb.Blog 等业务命名空间  在应用侧，不在包内
 - DAO 每表一个、同 action 多 DAO 共享同一租约与事务；缓存键属于数据层，
   留在 DAO 里，不散落到控制器。
 
-## 列表页声明式基座（ListPage）
+## 列表页声明式基座（ListPage / FormPage）
 
-后台列表页的搜索区、工具条、条件收集、翻页链接由一个 `ListPage` 声明驱动，
-同一份声明产出四样东西，UI 与 SQL 不再各写一遍：
+后台通用屏 = **列表**（ListPage）+ **表单**（FormPage），各一份声明驱动
+渲染与取数/校验，UI 与 SQL 不再各写一遍：
 
 ```zan
 ListPage lp = ListPage.Of()
@@ -95,6 +95,30 @@ lp.Toolbar(d);                             /* d.toolbarHtml：批量带确认 */
 d.Set("prevUrl", lp.Query(conds, q.Page() - 1, q.Limit()));  /* 翻页保留全部筛选 */
 ```
 
+```zan
+/* 一份字段声明：Form 渲染与 Save 校验同源；新增/编辑共用。 */
+static FormPage PostForm(List<StrMap> catRows) {
+    return FormPage.Of("/admin/posts/save").Wide()
+        .Text("标题", "title").Req().Max(120).Span()
+        .SelectList("分类", "categoryId", catRows).Blank("未分类")
+        .Select("状态", "published", "1=发布,0=草稿").Val("1")
+        .Area("正文", "body").Req().Rows(14).Span();
+}
+
+async void Form() {            /* 新增/编辑：声明 → 渲染 → 共享壳对话框 */
+    FormPage fp = PostForm(await LoadCatRows());
+    if (id > 0) { fp.Id(...); fp.Field("title").Val(p.title); /* …回显 */ }
+    fp.Render(d);
+    this.FormDialog(d);        /* views/Admin/_FormDialog.html，零视图文件 */
+}
+
+async void Save() {            /* 校验从声明来：required/min/max */
+    string invalid = fp.Validate(this);
+    if (invalid.Length > 0) { this.Fail(400, "0004", invalid); }
+    /* …In/InInt 取值落库（范围/唯一性等业务规则仍归动作） */
+}
+```
+
 - **列名只来自声明**（`col` 是代码常量），用户输入永远走占位符——DAO 侧
   `ApplyConds(__DbQ_Post sel, List<ListCond> conds)` 把 LIKE/EQ/GE/LE 拼成
   参数化 WHERE（多列 LIKE 用 `|` 分组 OR），SQL 留在数据层。
@@ -103,6 +127,9 @@ d.Set("prevUrl", lp.Query(conds, q.Page() - 1, q.Limit()));  /* 翻页保留全�
 - **远程搜索单选（Pick）**：服务端只渲染隐藏值输入 + 搜索框，选项由
   `?kw=` 端点即时返回（`{code:'0000',data:[{id,label}]}`），回显走
   `?id=N`；选项端点同时服务表单选择器。
+- **表单条件可见性**：`OnlyNew`（初始密码）/`OnlyEdit`（编辑提示）按
+  主键值判定，渲染与校验同步生效——编辑时初始密码既不渲染也不校验。
+  密码类型恒不回显；值回填经 Esc 转义。
 
 ## 无侵入更新
 

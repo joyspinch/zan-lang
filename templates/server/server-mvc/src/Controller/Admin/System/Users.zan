@@ -82,45 +82,51 @@ class Users : AdminController {
     }
 
     /* 新建/编辑对话框；片段非页，列表不动、对话框覆盖其上。 */
+    /* 一份声明：Form 渲染与 Save 校验同源（新增/编辑屏 = 声明 + 两动作）。
+       部门选项由调用方查询传入（Save 校验用不到，传空列表即可）。 */
+    static FormPage UserForm(List<StrMap> deptRows) {
+        return FormPage.Of("/admin/system/users/save")
+            .Text("账号", "username").Req().Max(32).Ph("登录名")
+            .Text("姓名", "nickname").Max(32)
+            .Text("邮箱", "email").Max(64)
+            .Text("手机", "mobile").Max(20)
+            .SelectList("部门", "departmentId", deptRows).Blank("未分配")
+            .Select("状态", "status", "1=启用,0=禁用").Val("1")
+            .Pass("初始密码", "password").Min(8).Req().Ph("至少 8 位").OnlyNew()
+            .Hint("修改密码请在列表中使用「重置密码」。").OnlyEdit();
+    }
+
     [HttpGet]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
     [Description("账号表单")]
     async void Form() {
         int id = this.InInt("id", 0);
-        int deptId = 0;
-        ViewData d = new ViewData();
-        d.Set("id", Convert.ToString(id));
-        d.Set("dialogTitle", "新增账号");
-        d.Set("new", "1");
-        d.Set("status1", "selected");
-        if (id > 0) {
-            User u = await this.Reach(id);
-            d.Set("dialogTitle", "编辑账号");
-            d.Set("username", u.username);
-            d.Set("nickname", u.nickname);
-            d.Set("email", u.email);
-            d.Set("mobile", u.mobile);
-            d.Set("edit", "1");
-            d.Set("new", "");
-            d.Set("status1", "");
-            if (u.status == 1) { d.Set("status1", "selected"); }
-            else { d.Set("status0", "selected"); }
-            deptId = u.departmentId;
-        }
         /* 仅该账号可写部门入选，使对话框无法提议 Save 随后拒绝的迁移；仅本人 scope 一处都不可写。 */
         DataScope sc = await this.Scope();
-        List<int> scoped = sc.Depts();
         List<Department> depts = await new DepartmentDao(this).Scoped(
-            sc.ByDept(), scoped, sc.Mine());
-        List<StrMap> opts = d.AddList("depts");
+            sc.ByDept(), sc.Depts(), sc.Mine());
+        List<StrMap> deptRows = new List<StrMap>();
         for (int i = 0; i < depts.Count; i = i + 1) {
             StrMap o = new StrMap();
             o.Set("id", Convert.ToString(depts[i].id));
             o.Set("name", depts[i].name);
-            if (depts[i].id == deptId) { o.Set("selected", "selected"); }
-            opts.Add(o);
+            deptRows.Add(o);
         }
-        this.Dialog(d);
+        FormPage fp = Users.UserForm(deptRows);
+        ViewData d = new ViewData();
+        d.Set("dialogTitle", id > 0 ? "编辑账号" : "新增账号");
+        if (id > 0) {
+            User u = await this.Reach(id);
+            fp.Id(Convert.ToString(id));
+            fp.Field("username").Val(u.username);
+            fp.Field("nickname").Val(u.nickname);
+            fp.Field("email").Val(u.email);
+            fp.Field("mobile").Val(u.mobile);
+            fp.Field("departmentId").Val(Convert.ToString(u.departmentId));
+            fp.Field("status").Val(u.status == 1 ? "1" : "0");
+        }
+        fp.Render(d);
+        this.FormDialog(d);
     }
 
     [HttpPost]
@@ -128,6 +134,12 @@ class Users : AdminController {
     [Description("保存账号")]
     async void Save() {
         int id = this.InInt("id", 0);
+        /* 声明即校验：与 Form 渲染同一份约束（required/min/max），
+           初始密码规则（新增才必填、至少 8 位）也出自声明。 */
+        FormPage fp = Users.UserForm(new List<StrMap>());
+        fp.Id(Convert.ToString(id));
+        string invalid = fp.Validate(this);
+        if (invalid.Length > 0) { this.Fail(400, "0004", invalid); }
         string username = this.Need("username", "账号");
         string nickname = this.In("nickname");
         string email = this.In("email");
@@ -157,9 +169,6 @@ class Users : AdminController {
             return;
         }
 
-        if (password.Length < 8) {
-            this.Fail(400, "0004", "新账号必须设置至少 8 位的初始密码");
-        }
         string salt = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
         User u = new User();
         u.username = username;

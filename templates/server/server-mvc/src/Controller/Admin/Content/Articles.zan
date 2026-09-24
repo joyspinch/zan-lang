@@ -193,45 +193,57 @@ class Articles : AdminController {
         this.Saved("已删除 " + Convert.ToString(n) + " 篇文章");
     }
 
+    /* 一份声明：Form 渲染与 Save 校验同源。分类选项由调用方查询传入
+       （Save 校验用不到，传空列表即可）。 */
+    static FormPage ArticleForm(List<StrMap> catRows) {
+        return FormPage.Of("/admin/content/posts/save").Wide()
+            .Text("标题", "title").Req().Max(120).Span()
+            .SelectList("分类", "categoryId", catRows).Blank("未分类")
+            .Text("作者", "author").Max(32)
+            .Text("标签", "tags").Max(120).Ph("逗号分隔")
+            .Text("封面", "cover").Max(255).Ph("图片地址，可留空")
+            .Select("状态", "published", "1=发布,0=草稿").Val("1")
+            .Select("置顶", "top", "0=否,1=是").Val("0")
+            .Area("摘要", "summary").Max(255).Rows(2).Span()
+            .Area("正文", "body").Req().Rows(14).Span()
+            .Hint("正文按空行分段展示，摘要留空时自动截取正文开头。");
+    }
+
     [HttpGet]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
     [Description("文章表单")]
     async void Form() {
         int id = this.InInt("id", 0);
-        int categoryId = 0;
-        ViewData d = new ViewData();
-        d.Set("id", Convert.ToString(id));
-        d.Set("dialogTitle", "写文章");
-        d.Set("state1", "selected");
-        if (id > 0) {
-            Post p = await this.Post.ById(id);
-            if (p == null) { this.Fail(404, "0404", "文章不存在"); }
-            d.Set("dialogTitle", "编辑文章");
-            d.Set("title", p.title);
-            d.Set("summary", p.summary);
-            d.Set("body", p.body);
-            d.Set("tags", p.tags);
-            d.Set("cover", p.cover);
-            d.Set("author", p.author);
-            categoryId = p.categoryId;
-            d.Set("state1", "");
-            if (p.published == 1) { d.Set("state1", "selected"); }
-            else { d.Set("state0", "selected"); }
-            if (p.top == 1) { d.Set("topChecked", "checked"); }
-        } else {
-            User me = await this.Admin();
-            if (me != null) { d.Set("author", me.username); }
-        }
         List<Category> cats = await this.Category.OrderBy(a => a.sortOrder).ToListAsync();
-        List<StrMap> opts = d.AddList("categories");
+        List<StrMap> catRows = new List<StrMap>();
         for (int i = 0; i < cats.Count; i = i + 1) {
             StrMap o = new StrMap();
             o.Set("id", Convert.ToString(cats[i].id));
             o.Set("name", cats[i].name);
-            if (cats[i].id == categoryId) { o.Set("selected", "selected"); }
-            opts.Add(o);
+            catRows.Add(o);
         }
-        this.Dialog(d);
+        FormPage fp = Articles.ArticleForm(catRows);
+        ViewData d = new ViewData();
+        d.Set("dialogTitle", id > 0 ? "编辑文章" : "写文章");
+        if (id > 0) {
+            Post p = await this.Post.ById(id);
+            if (p == null) { this.Fail(404, "0404", "文章不存在"); }
+            fp.Id(Convert.ToString(id));
+            fp.Field("title").Val(p.title);
+            fp.Field("categoryId").Val(Convert.ToString(p.categoryId));
+            fp.Field("author").Val(p.author);
+            fp.Field("tags").Val(p.tags);
+            fp.Field("cover").Val(p.cover);
+            fp.Field("published").Val(p.published == 1 ? "1" : "0");
+            fp.Field("top").Val(p.top == 1 ? "1" : "0");
+            fp.Field("summary").Val(p.summary);
+            fp.Field("body").Val(p.body);
+        } else {
+            User me = await this.Admin();
+            if (me != null) { fp.Field("author").Val(me.username); }
+        }
+        fp.Render(d);
+        this.FormDialog(d);
     }
 
     [HttpPost]
@@ -239,6 +251,11 @@ class Articles : AdminController {
     [Description("保存文章")]
     async void Save() {
         int id = this.InInt("id", 0);
+        /* 声明即校验：与 Form 渲染同一份约束。 */
+        FormPage fp = Articles.ArticleForm(new List<StrMap>());
+        fp.Id(Convert.ToString(id));
+        string invalid = fp.Validate(this);
+        if (invalid.Length > 0) { this.Fail(400, "0004", invalid); }
         string title = this.Need("title", "标题");
         string body = this.NeedText("body", "正文");
         string summary = this.InText("summary");
