@@ -39,6 +39,22 @@ class RangeFilter {
     }
 }
 
+/// <summary>待处理的集合包含约束（field IN (val1, val2, ...)）。</summary>
+class InFilter {
+    public string field;
+    public List<string> values;
+    public Dict<string, bool> valSet;
+
+    public InFilter(string field, List<string> values) {
+        this.field = field;
+        this.values = values;
+        this.valSet = new Dict<string, bool>();
+        for (int i = 0; i < values.Count; i = i + 1) {
+            this.valSet[values[i]] = true;
+        }
+    }
+}
+
 /// <summary>
 /// 针对 <see cref="Collection"/> 的流畅 LINQ 风格查询：类型安全的 lambda
 /// 谓词、多索引求交加速、范围索引下推、O(n log n) 稳定归并排序与 Top-K 堆优化、
@@ -56,6 +72,7 @@ class DocQuery {
     List<DocPredicate> preds;
     List<EqFilter> eqFilters;
     List<RangeFilter> rangeFilters;
+    List<InFilter> inFilters;
     string idxField;
     string idxValue;
     bool hasIdxEq;
@@ -72,6 +89,7 @@ class DocQuery {
         this.preds = new List<DocPredicate>();
         this.eqFilters = new List<EqFilter>();
         this.rangeFilters = new List<RangeFilter>();
+        this.inFilters = new List<InFilter>();
         this.idxField = "";
         this.idxValue = "";
         this.hasIdxEq = false;
@@ -118,6 +136,28 @@ class DocQuery {
     DocQuery WhereRange(string field, string lo, string hi) {
         this.rangeFilters.Add(new RangeFilter(field, lo, hi));
         return this;
+    }
+
+    /// <summary>字段集合约束（字符串列表形式：WHERE field IN (...)）。
+    /// 当字段有二级索引时，自动按索引合并求并集并参与求交加速；无索引时基于哈希表 O(1) 过滤。</summary>
+    DocQuery WhereIn(string field, List<string> values) {
+        if (values == null) {
+            this.inFilters.Add(new InFilter(field, new List<string>()));
+            return this;
+        }
+        this.inFilters.Add(new InFilter(field, values));
+        return this;
+    }
+
+    /// <summary>字段集合约束（整数列表形式）。</summary>
+    DocQuery WhereInInt(string field, List<int> values) {
+        List<string> svals = new List<string>();
+        if (values != null) {
+            for (int i = 0; i < values.Count; i = i + 1) {
+                svals.Add(Convert.ToString(values[i]));
+            }
+        }
+        return WhereIn(field, svals);
     }
 
     /// 按整数键升序排序（再次调用覆盖先前排序设置）。
@@ -187,6 +227,48 @@ class DocQuery {
         return outp;
     }
 
+    /// <summary>两个严格递增的整数 ID 列表的双指针有序求并集：O(A + B)。</summary>
+    static List<int> UnionSortedIds(List<int> a, List<int> b) {
+        List<int> outp = new List<int>();
+        int i = 0;
+        int j = 0;
+        while (i < a.Count && j < b.Count) {
+            int ai = a[i];
+            int bj = b[j];
+            if (ai == bj) {
+                outp.Add(ai);
+                i = i + 1;
+                j = j + 1;
+            } else if (ai < bj) {
+                outp.Add(ai);
+                i = i + 1;
+            } else {
+                outp.Add(bj);
+                j = j + 1;
+            }
+        }
+        while (i < a.Count) {
+            outp.Add(a[i]);
+            i = i + 1;
+        }
+        while (j < b.Count) {
+            outp.Add(b[j]);
+            j = j + 1;
+        }
+        return outp;
+    }
+
+    List<int> FindIdsByInValues(string field, List<string> vals) {
+        List<int> unionIds = new List<int>();
+        for (int i = 0; i < vals.Count; i = i + 1) {
+            List<int> ids = this.col.FindIdsByField(field, vals[i]);
+            if (ids != null && ids.Count > 0) {
+                unionIds = DocQuery.UnionSortedIds(unionIds, ids);
+            }
+        }
+        return unionIds;
+    }
+
     // ===== 执行 =====
 
     /// <summary>候选集检索：
@@ -208,8 +290,14 @@ class DocQuery {
                 readyRange.Add(i);
             }
         }
+        List<int> readyIn = new List<int>();
+        for (int i = 0; i < this.inFilters.Count; i = i + 1) {
+            if (this.col.IndexReady(this.inFilters[i].field)) {
+                readyIn.Add(i);
+            }
+        }
 
-        int totalReady = readyEq.Count + readyRange.Count;
+        int totalReady = readyEq.Count + readyRange.Count + readyIn.Count;
 
         // 单索引特化快路径
         if (totalReady == 1) {
@@ -217,8 +305,18 @@ class DocQuery {
                 EqFilter f = this.eqFilters[readyEq[0]];
                 return this.col.FindByIndex(f.field, f.val);
             }
-            RangeFilter rf = this.rangeFilters[readyRange[0]];
-            List<int> rids = this.col.FindIdsByFieldRange(rf.field, rf.lo, rf.hi);
+            if (readyRange.Count == 1) {
+                RangeFilter rf = this.rangeFilters[readyRange[0]];
+                List<int> rids = this.col.FindIdsByFieldRange(rf.field, rf.lo, rf.hi);
+                List<JsonValue> rdocs = new List<JsonValue>();
+                for (int i = 0; i < rids.Count; i = i + 1) {
+                    JsonValue d = this.col.FindById(rids[i]);
+                    if (d != null) { rdocs.Add(d); }
+                }
+                return rdocs;
+            }
+            InFilter inf = this.inFilters[readyIn[0]];
+            List<int> rids = FindIdsByInValues(inf.field, inf.values);
             List<JsonValue> rdocs = new List<JsonValue>();
             for (int i = 0; i < rids.Count; i = i + 1) {
                 JsonValue d = this.col.FindById(rids[i]);
@@ -240,12 +338,28 @@ class DocQuery {
                     if (curIds.Count == 0) { break; }
                 }
             }
-            if (curIds != null && curIds.Count > 0) {
+            if (curIds == null || curIds.Count > 0) {
                 for (int i = 0; i < readyRange.Count; i = i + 1) {
                     RangeFilter rf = this.rangeFilters[readyRange[i]];
                     List<int> ids = this.col.FindIdsByFieldRange(rf.field, rf.lo, rf.hi);
-                    curIds = DocQuery.IntersectSortedIds(curIds, ids);
-                    if (curIds.Count == 0) { break; }
+                    if (curIds == null) {
+                        curIds = ids;
+                    } else {
+                        curIds = DocQuery.IntersectSortedIds(curIds, ids);
+                        if (curIds.Count == 0) { break; }
+                    }
+                }
+            }
+            if (curIds == null || curIds.Count > 0) {
+                for (int i = 0; i < readyIn.Count; i = i + 1) {
+                    InFilter inf = this.inFilters[readyIn[i]];
+                    List<int> ids = FindIdsByInValues(inf.field, inf.values);
+                    if (curIds == null) {
+                        curIds = ids;
+                    } else {
+                        curIds = DocQuery.IntersectSortedIds(curIds, ids);
+                        if (curIds.Count == 0) { break; }
+                    }
                 }
             }
             List<JsonValue> rdocs = new List<JsonValue>();
@@ -295,6 +409,13 @@ class DocQuery {
             if (rf.lo != "" && String.CompareOrdinal(sv, rf.lo) < 0) { return false; }
             if (rf.hi != "" && String.CompareOrdinal(sv, rf.hi) > 0) { return false; }
         }
+        for (int k = 0; k < this.inFilters.Count; k = k + 1) {
+            InFilter inf = this.inFilters[k];
+            JsonValue v = d.Get(inf.field);
+            if (v == null) { return false; }
+            string sv = v.AsString("");
+            if (!inf.valSet.ContainsKey(sv)) { return false; }
+        }
         foreach (DocPredicate p in this.preds) {
             if (!p(d)) { return false; }
         }
@@ -310,6 +431,11 @@ class DocQuery {
         if (!hasReady) {
             for (int i = 0; i < this.rangeFilters.Count; i = i + 1) {
                 if (this.col.IndexReady(this.rangeFilters[i].field)) { hasReady = true; break; }
+            }
+        }
+        if (!hasReady) {
+            for (int i = 0; i < this.inFilters.Count; i = i + 1) {
+                if (this.col.IndexReady(this.inFilters[i].field)) { hasReady = true; break; }
             }
         }
         return !hasReady && this.eqFilters.Count > 0;
@@ -330,6 +456,13 @@ class DocQuery {
             string sv = v.AsString("");
             if (rf.lo != "" && String.CompareOrdinal(sv, rf.lo) < 0) { return false; }
             if (rf.hi != "" && String.CompareOrdinal(sv, rf.hi) > 0) { return false; }
+        }
+        for (int k = 0; k < this.inFilters.Count; k = k + 1) {
+            InFilter inf = this.inFilters[k];
+            JsonValue v = d.Get(inf.field);
+            if (v == null) { return false; }
+            string sv = v.AsString("");
+            if (!inf.valSet.ContainsKey(sv)) { return false; }
         }
         foreach (DocPredicate p in this.preds) {
             if (!p(d)) { return false; }

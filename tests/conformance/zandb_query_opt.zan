@@ -1,0 +1,116 @@
+using System;
+using System.IO;
+using System.Data.ZanDb;
+using System.Json;
+using System.Collections.Generic;
+
+class Program {
+    static int pass = 0;
+    static int fail = 0;
+
+    static void Check(string name, bool ok) {
+        if (ok) { pass = pass + 1; }
+        else { fail = fail + 1; Console.WriteLine("FAIL: " + name); }
+    }
+
+    static void Clean(string basePath) {
+        File.Delete(basePath);
+        File.Delete(basePath + ".m0");
+        File.Delete(basePath + ".m1");
+        for (int i = 0; i < 40; i = i + 1) {
+            File.Delete(basePath + ".s" + Convert.ToString(i));
+        }
+    }
+
+    static int Main() {
+        string dbPath = "_scratch/test_zandb_query_opt_db.zdb";
+        Clean(dbPath);
+
+        ZanDatabase db = ZanDatabase.Open(dbPath, 64);
+        Collection col = db.GetCollection("items");
+
+        col.EnsureIndex("category");
+        col.EnsureIndex("tag");
+        col.EnsureIndex("price_str");
+
+        for (int i = 1; i <= 20; i = i + 1) {
+            JsonValue doc = JsonValue.NewObject();
+            doc.Put("id", JsonValue.NewInt(i));
+            string cat = (i % 2 == 0) ? "electronics" : "books";
+            if (i > 15) { cat = "clothing"; }
+            doc.Put("category", JsonValue.NewStr(cat));
+
+            string tag = (i % 3 == 0) ? "sale" : "regular";
+            doc.Put("tag", JsonValue.NewStr(tag));
+
+            int price = i * 10;
+            doc.Put("price", JsonValue.NewInt(price));
+            doc.Put("price_str", JsonValue.NewStr(Convert.ToString(price).PadLeft(4, "0")));
+            col.Insert(doc);
+        }
+
+        // 1. WhereIn 多索引求交 (category in ["electronics"] and tag in ["sale"] -> i=6, 12)
+        List<string> cats = new List<string>();
+        cats.Add("electronics");
+        List<string> tags = new List<string>();
+        tags.Add("sale");
+
+        List<JsonValue> q1 = col.Query()
+            .WhereIn("category", cats)
+            .WhereIn("tag", tags)
+            .ToList();
+        Check("WhereIn multi-index intersection count", q1.Count == 2);
+        Check("WhereIn item 1 id", q1.Count == 2 && q1[0].Int("id", 0) == 6);
+        Check("WhereIn item 2 id", q1.Count == 2 && q1[1].Int("id", 0) == 12);
+
+        // 2. WhereRange 范围索引下推 (price_str: 0050..0100 -> i=5..10)
+        List<JsonValue> q2 = col.Query()
+            .WhereRange("price_str", "0050", "0100")
+            .OrderByInt(delegate(JsonValue d) { return d.Int("price", 0); })
+            .ToList();
+        Check("WhereRange count", q2.Count == 6);
+        Check("WhereRange min price", q2.Count == 6 && q2[0].Int("price", 0) == 50);
+        Check("WhereRange max price", q2.Count == 6 && q2[5].Int("price", 0) == 100);
+
+        // 3. Top-K 堆排序 (升序取前 3)
+        List<JsonValue> q3 = col.Query()
+            .OrderByInt(delegate(JsonValue d) { return d.Int("price", 0); })
+            .Take(3)
+            .ToList();
+        Check("Top-K count", q3.Count == 3);
+        Check("Top-K prices", q3.Count == 3 && q3[0].Int("price", 0) == 10 && q3[1].Int("price", 0) == 20 && q3[2].Int("price", 0) == 30);
+
+        // 4. Top-K 降序 (降序取前 2)
+        List<JsonValue> q4 = col.Query()
+            .OrderByIntDesc(delegate(JsonValue d) { return d.Int("price", 0); })
+            .Take(2)
+            .ToList();
+        Check("Top-K desc count", q4.Count == 2);
+        Check("Top-K desc prices", q4.Count == 2 && q4[0].Int("price", 0) == 200 && q4[1].Int("price", 0) == 190);
+
+        // 5. 无排序提前终止分页
+        List<JsonValue> q5 = col.Query()
+            .WhereEq("category", "books")
+            .Take(2)
+            .ToList();
+        Check("Early termination count", q5.Count == 2);
+
+        // 6. WhereInInt 无索引字段过滤
+        List<int> targetPrices = new List<int>();
+        targetPrices.Add(20);
+        targetPrices.Add(40);
+        targetPrices.Add(999);
+        List<JsonValue> q6 = col.Query()
+            .WhereInInt("price", targetPrices)
+            .OrderByInt(delegate(JsonValue d) { return d.Int("price", 0); })
+            .ToList();
+        Check("WhereInInt count", q6.Count == 2);
+
+        Console.WriteLine("pass: " + Convert.ToString(pass));
+        Console.WriteLine("fail: " + Convert.ToString(fail));
+
+        db.Close();
+        Clean(dbPath);
+        return fail == 0 ? 0 : 1;
+    }
+}
