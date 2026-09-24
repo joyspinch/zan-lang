@@ -1,0 +1,97 @@
+using System;
+using System.IO;
+using System.Data;
+using System.Data.Sqlite;
+using System.Data.Orm;
+using System.Web;
+using Zan.Mvc.Admin;
+using Zan.Mvc.Admin.Web;
+using Zan.Mvc.Admin.Installer;
+using Zan.Mvc.Admin.Model;
+using Demo.Model;
+using Demo.Controller;
+
+class AdminDemoProgram {
+    static async void IndexRedirect(HttpContext ctx) {
+        ctx.Redirect("/admin");
+    }
+
+    static async void Main() {
+        Console.WriteLine("=========================================================");
+        Console.WriteLine("  正在启动 Zan.Mvc.Admin 生产级管理后台演示系统...");
+        Console.WriteLine("=========================================================");
+
+        string dbDir = "_scratch/admin_demo_data";
+        if (!Directory.Exists(dbDir)) {
+            Directory.CreateDirectory(dbDir);
+        }
+        string dbPath = dbDir + "/demo.db";
+        InstallGateMiddleware.LockFilePath = dbDir + "/install.lock";
+        if (!File.Exists(InstallGateMiddleware.LockFilePath)) {
+            File.WriteAllText(InstallGateMiddleware.LockFilePath, "demo installed\n");
+        }
+
+        // 1. 打开数据库并包装 APM 监控
+        SqliteConnection rawConn = SqliteConnection.Open(dbPath);
+        if (rawConn == null) {
+            Console.WriteLine("[Error] 无法打开 SQLite 数据库: " + dbPath);
+            return;
+        }
+        IDbConnection db = TracedDbConnection.Wrap(rawConn);
+        if (db == null) {
+            db = rawConn;
+        }
+
+        // 2. 检查并自动执行基础安装与结构同步
+        string err;
+        bool needInit = true;
+        try {
+            DbResult r = db.Query("SELECT count(1) FROM sqlite_master WHERE type='table' AND name='sys_users'");
+            if (r != null && r.RowCount() > 0 && r.GetInt(0, 0) > 0) {
+                DbResult r2 = db.Query("SELECT count(1) FROM sys_users");
+                if (r2 != null && r2.RowCount() > 0 && r2.GetInt(0, 0) > 0) {
+                    needInit = false;
+                }
+            }
+        } catch (Exception ex) {
+            needInit = true;
+        }
+
+        if (needInit) {
+            Console.WriteLine("[Init] 正在初始化管理后台基座物理表与超级管理员...");
+            SchemaMigrator.ExecuteInstall(db, "admin", "admin123", out err);
+            // 同步业务演示表结构
+            db.SyncStructure<Product>();
+
+            // 注入示例商品数据
+            long now = DateTime.UtcNow().ToUnixSeconds();
+            db.Insert<Product>(new Product { id = 1, name = "ThinkPad X1 Carbon 商务本", category = "数码3C", price = 9999.0, stock = 42, status = 1, created_at = now }).ExecuteAffrows();
+            db.Insert<Product>(new Product { id = 2, name = "4K 极清电竞显示器 27寸", category = "数码3C", price = 1899.0, stock = 120, status = 1, created_at = now }).ExecuteAffrows();
+            db.Insert<Product>(new Product { id = 3, name = "人体工学办公转椅", category = "家居日用", price = 899.0, stock = 65, status = 1, created_at = now }).ExecuteAffrows();
+            db.Insert<Product>(new Product { id = 4, name = "云南精品高山咖啡豆 500g", category = "生鲜食品", price = 88.0, stock = 300, status = 1, created_at = now }).ExecuteAffrows();
+            Console.WriteLine("[Init] 基础表与演示数据初始化完成！");
+        } else {
+            db.SyncStructure<Product>();
+        }
+
+        // 3. 构建 WebApp 并一键装配管理后台基座
+        int port = 8888;
+        WebApp app = new WebApp("0.0.0.0", port);
+        AdminApp.UseAdmin(app, db);
+
+        // 4. 根路径自动引导至管理后台
+        app.Get("/", IndexRedirect);
+
+        Console.WriteLine("");
+        Console.WriteLine("---------------------------------------------------------");
+        Console.WriteLine("  Zan.Mvc.Admin 管理后台服务已启动！");
+        Console.WriteLine("  访问地址: http://127.0.0.1:" + Convert.ToString(port) + "/admin");
+        Console.WriteLine("  超级管理员: admin / admin123");
+        Console.WriteLine("  内置功能: 工作台仪表盘、用户管理、角色管理、部门架构(树形)、操作日志");
+        Console.WriteLine("  业务演示: 电商商城 -> 商品管理 (CRUD/XLSX导出/行内编辑)");
+        Console.WriteLine("---------------------------------------------------------");
+        Console.WriteLine("");
+
+        await WebServer.Run(app, 1, false);
+    }
+}
