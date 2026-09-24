@@ -1,0 +1,242 @@
+using System;
+using System.Collections.Generic;
+using Game.Tactics;
+using Game.Net;
+using Game.Foundation;
+using Game.Arpg;
+using Game.Idle;
+using Game.Core;
+using Game.Graphics;
+
+class GameFullStressAndInvariantsSuite {
+    static void Assert(bool cond, string msg) {
+        if (!cond) {
+            Console.WriteLine("[FATAL ASSERT FAIL] " + msg);
+            Environment.Exit(1);
+        }
+    }
+
+    /// <summary>
+    /// 测试 1: 500 单位高密群体在障碍迷宫中的 1000 步长程寻路与 RVO 互斥压力测试
+    /// 验证：无 NaN、无坐标越界、无严重穿模死锁、大量单位平滑突破瓶颈窄口。
+    /// </summary>
+    static void TestMassiveCrowdStress() {
+        Console.WriteLine("[STRESS 1/4] 运行 500 单位 1000 步长程 RVO + FlowField 极端防堵推挤仿真...");
+        
+        // 构建 64x64 网格流场（每个格子 32px，总世界尺寸 2048x2048）
+        FlowField field = FlowField.Create(64, 64, 32);
+        // 在中间放置一道带狭窄通道的城墙（X: 30, Y: 0~63，通道仅保留 Y: 31~32）
+        for (int y = 0; y < 64; y = y + 1) {
+            if (y < 31 || y > 32) {
+                field.SetCost(30, y, (byte)255);
+            }
+        }
+        // 目标设在右侧深处 (50, 32)
+        field.SetTarget(50, 32);
+        field.Rebuild();
+
+        // 构造 RVO 模拟器（容量 600，视距 48）
+        RvoSimulator sim = RvoSimulator.Create(600, 48);
+
+        // 在左侧 (5~24, 5~29) 区域散布 500 个单位
+        int N = 500;
+        int[] ids = new int[500];
+        for (int i = 0; i < N; i = i + 1) {
+            int gx = 5 + (i % 20);
+            int gy = 5 + (i / 20);
+            double sx = (double)(gx * 32 + 16);
+            double sy = (double)(gy * 32 + 16);
+            ids[i] = sim.AddAgent(sx, sy, 8.0, 60.0);
+        }
+        Assert(sim.AgentCount == N, "Agent count must be 500");
+
+        // 步进 1000 帧（相当于 20Hz 下的 50 秒高强度对战）
+        float vx = 0.0f;
+        float vy = 0.0f;
+
+        for (int step = 0; step < 1000; step = step + 1) {
+            // 每帧根据 FlowField 采样世界理想速度并灌入 RVO
+            for (int i = 0; i < N; i = i + 1) {
+                double ax = sim.GetX(ids[i]);
+                double ay = sim.GetY(ids[i]);
+                field.SampleWorldVelocity(ax, ay, out vx, out vy);
+                sim.SetPrefVelocity(ids[i], (double)(vx * 60.0f), (double)(vy * 60.0f));
+            }
+
+            // 物理与避障步进
+            sim.Step(0.05);
+
+            // 每 200 步检查坐标健康度（无 NaN、无越界）
+            if (step % 200 == 0) {
+                for (int i = 0; i < N; i = i + 1) {
+                    double cx = sim.GetX(ids[i]);
+                    double cy = sim.GetY(ids[i]);
+                    Assert(cx == cx && cy == cy, "Agent coordinates must not be NaN");
+                    Assert(cx >= 0.0 && cx <= 2048.0 && cy >= 0.0 && cy <= 2048.0, "Agent coordinates out of world bounds");
+                }
+            }
+        }
+
+        // 验证大量单位成功穿过了狭窄关口（X > 31*32 = 992）
+        int passedGateCount = 0;
+        for (int i = 0; i < N; i = i + 1) {
+            if (sim.GetX(ids[i]) > 992.0) {
+                passedGateCount = passedGateCount + 1;
+            }
+        }
+        Console.WriteLine("    [Crowd Metric] 500 单位中顺利突破峡谷瓶颈总数: " + passedGateCount.ToString() + "/500");
+        Assert(passedGateCount > 200, "At least 200 units must successfully navigate the bottleneck without deadlock");
+        Console.WriteLine("[PASS] Massive Crowd Stress Test Passed!");
+    }
+
+    /// <summary>
+    /// 测试 2: 1000 逻辑帧录像录制与 8 倍速全量确定性无损复现测试
+    /// 验证：录像头校验、定频推进帧数完全一致、无事件漏执行。
+    /// </summary>
+    static void TestLongReplayFidelity() {
+        Console.WriteLine("[STRESS 2/4] 运行 1000 逻辑帧确定性录像与 8 倍速极速回放保真度验证...");
+        ReplayRecorder recorder = ReplayRecorder.Create(1234567, 4, "TournamentFinal");
+
+        int totalCommandsSent = 0;
+        for (int f = 1; f <= 1000; f = f + 1) {
+            FrameBucket bucket = FrameBucket.Create(f, 4);
+            // 每一帧下发一些模拟微操指令
+            if (f % 5 == 0) {
+                bucket.AddCommand(PlayerCommand.Create(1, 1, (double)f, 100.0, 0, 0));
+                bucket.AddCommand(PlayerCommand.Create(2, 2, (double)f, 200.0, 0, 0));
+                totalCommandsSent = totalCommandsSent + 2;
+            }
+            recorder.RecordFrame(f, bucket);
+        }
+        recorder.Stop();
+        Assert(recorder.FrameCount == 1000, "Recorder must have captured all 1000 frames");
+
+        // 8 倍速播放
+        ReplayPlayer player = ReplayPlayer.Create(recorder.Header, recorder.GetFrames(), 20.0);
+        player.Play();
+        player.SpeedMultiplier = 8.0;
+
+        int totalExecutedCommands = 0;
+        int executedFrames = 0;
+
+        // 每次给 0.1 秒渲染 dt，以 8 倍速相当于每次跑 16 个逻辑帧
+        while (!player.IsFinished) {
+            player.Update(0.1, (int frameIdx, List<PlayerCommand> cmds) => {
+                executedFrames = executedFrames + 1;
+                totalExecutedCommands = totalExecutedCommands + cmds.Count;
+            });
+        }
+
+        Assert(executedFrames == 1000, "Replay must execute exactly 1000 frames");
+        Assert(totalExecutedCommands == totalCommandsSent, "Command count in replay must strictly equal recorded commands");
+        Console.WriteLine("    [Replay Metric] 1000 帧全指令执行完毕，总指令数: " + totalExecutedCommands.ToString() + "/" + totalCommandsSent.ToString());
+        Console.WriteLine("[PASS] Long Replay Fidelity Test Passed!");
+    }
+
+    /// <summary>
+    /// 测试 3: 纸娃娃动态层深与 5 方向镜像矩阵在 10000 次随机抽样下的零穿模与稳定性验证
+    /// </summary>
+    static void TestPaperdollLayerIntegrity() {
+        Console.WriteLine("[STRESS 3/4] 验证 10,000 次 8 方向纸娃娃装备图层动态插入排序稳定性...");
+        SpriteSheet bodySheet = SpriteSheet.Create("body", 256, 256, 32, 32);
+        SpriteSheet wingSheet = SpriteSheet.Create("wing", 256, 256, 32, 32);
+        SpriteSheet weaponSheet = SpriteSheet.Create("weapon", 256, 256, 32, 32);
+        SpriteSheet clothSheet = SpriteSheet.Create("cloth", 256, 256, 32, 32);
+
+        PaperdollRenderer doll = PaperdollRenderer.Create(bodySheet, 8);
+
+        // 翅膀：朝北（背面，dir=6）在最前(30)，朝南（正面，dir=2）在最后(-20)
+        int[] wingOffsets = new int[8];
+        wingOffsets[2] = -20; // 南
+        wingOffsets[6] = 30;  // 北
+        doll.AddLayer("wing", wingSheet, 0, wingOffsets, true);
+
+        // 身体
+        doll.AddLayer("body", bodySheet, 10, null, true);
+
+        // 衣服
+        doll.AddLayer("cloth", clothSheet, 20, null, true);
+
+        // 武器：朝南在最前(10)，朝北收在身后(-30)
+        int[] weaponOffsets = new int[8];
+        weaponOffsets[2] = 10;  // 南
+        weaponOffsets[6] = -30; // 北
+        doll.AddLayer("weapon", weaponSheet, 30, weaponOffsets, true);
+
+        doll.MasterAnimator.AddState("run", 0, 4, 8.0, true);
+
+        // 模拟 10,000 次方向切换和渲染排序
+        for (int i = 0; i < 10000; i = i + 1) {
+            int dir = i % 8;
+            doll.Play("run", dir, true);
+            int count = doll.SortLayersByDirection();
+            Assert(count == 4, "Should have 4 active layers");
+
+            if (dir == 2) {
+                // 正南面：weapon 在最顶层，wing 在最底层
+                int firstIdx = doll.GetSortedLayerIndex(0);
+                int lastIdx = doll.GetSortedLayerIndex(3);
+                Assert(firstIdx == 0, "Wing should be at bottom when facing South");
+                Assert(lastIdx == 3, "Weapon should be at top when facing South");
+            } else if (dir == 6) {
+                // 正北面：wing 在最顶层，weapon 在最底层
+                int firstIdx = doll.GetSortedLayerIndex(0);
+                int lastIdx = doll.GetSortedLayerIndex(3);
+                Assert(firstIdx == 3, "Weapon should be behind body when facing North");
+                Assert(lastIdx == 0, "Wing should cover body when facing North");
+            }
+        }
+        Console.WriteLine("[PASS] Paperdoll Layer Integrity Test Passed!");
+    }
+
+    /// <summary>
+    /// 测试 4: 飘字与弹性阻尼对象池在 20,000 次超高频并发下的零泄漏与极限收敛测试
+    /// </summary>
+    static void TestJuiceAndTextPoolStress() {
+        Console.WriteLine("[STRESS 4/4] 验证飘字对象池与果冻弹簧在 20,000 次超高频高并发下的稳定收敛...");
+        FloatingTextManager pool = FloatingTextManager.Create(100);
+
+        for (int i = 0; i < 20000; i = i + 1) {
+            if (i % 2 == 0) {
+                pool.SpawnDamage((double)(i % 500), (double)(i % 500), (long)i, i % 4 == 0);
+            } else {
+                pool.SpawnGold((double)(i % 500), (double)(i % 500), i.ToString());
+            }
+
+            if (i % 50 == 0) {
+                pool.Update(0.1);
+            }
+        }
+        // 持续衰减 5 秒，确保所有飘字平稳回收到对象池，无悬挂野指针
+        for (int s = 0; s < 50; s = s + 1) {
+            pool.Update(0.1);
+        }
+        Assert(pool.ActiveCount == 0, "All floating texts must naturally expire and return to pool");
+
+        // 验证弹簧果冻在超大扰动下的无爆炸收敛
+        SquashAndStretch spring = SquashAndStretch.Create();
+        for (int hit = 0; hit < 50; hit = hit + 1) {
+            spring.Trigger(0.5);
+            // 步进 1 秒
+            for (int step = 0; step < 60; step = step + 1) {
+                spring.Update(0.0166);
+            }
+            Assert(spring.ScaleX == spring.ScaleX && spring.ScaleY == spring.ScaleY, "Spring scale must not be NaN");
+        }
+        Assert(spring.ScaleX == 1.0 && spring.ScaleY == 1.0, "Spring must converge to 1.0 rest state");
+        Console.WriteLine("[PASS] Juice and Text Pool Stress Test Passed!");
+    }
+
+    static void Main() {
+        Console.WriteLine("=================================================================");
+        Console.WriteLine("         ZAN 游戏引擎工业级全套极端压力与状态不变量测试          ");
+        Console.WriteLine("=================================================================");
+        TestMassiveCrowdStress();
+        TestLongReplayFidelity();
+        TestPaperdollLayerIntegrity();
+        TestJuiceAndTextPoolStress();
+        Console.WriteLine("=================================================================");
+        Console.WriteLine(">>>>> ALL_STRESS_AND_INVARIANTS_TESTS_PASSED_CLEANLY <<<<<");
+        Console.WriteLine("=================================================================");
+    }
+}

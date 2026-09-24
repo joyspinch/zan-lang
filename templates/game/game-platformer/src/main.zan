@@ -1,14 +1,18 @@
 using System;
+using System.Collections.Generic;
+using Gui;
 using Game.Kit;
+using Game.Foundation.Gui;
 
-// 游戏实体结构（值语义/复用实例，零GC堆分配）
+namespace GamePlatformer;
+
 class Platform {
-    public float x;
-    public float y;
-    public float w;
-    public float h;
+    public double x;
+    public double y;
+    public double w;
+    public double h;
 
-    public Platform(float x, float y, float w, float h) {
+    public Platform(double x, double y, double w, double h) {
         this.x = x;
         this.y = y;
         this.w = w;
@@ -17,15 +21,15 @@ class Platform {
 }
 
 class Particle {
-    public float x;
-    public float y;
-    public float vx;
-    public float vy;
-    public float life;
-    public float maxLife;
+    public double x;
+    public double y;
+    public double vx;
+    public double vy;
+    public double life;
+    public double maxLife;
     public bool active;
 
-    public void Reset(float px, float py, float pvx, float pvy, float duration) {
+    public void Reset(double px, double py, double pvx, double pvy, double duration) {
         this.x = px;
         this.y = py;
         this.vx = pvx;
@@ -36,101 +40,127 @@ class Particle {
     }
 }
 
-class {{NAME}} {
+class PlatformerGame {
+    public Canvas c;
+    public int stageW = 1280;
+    public int stageH = 720;
+
     // 物理与手感参数常量
-    const float GRAVITY = 1100.0f;
-    const float MOVE_SPEED = 320.0f;
-    const float JUMP_VELOCITY = -520.0f;
-    const float COYOTE_TIME_MAX = 0.12f;   // 土狼时间（离台后仍可起跳窗口）
-    const float JUMP_BUFFER_MAX = 0.15f;   // 跳跃输入缓冲（着陆前按键有效窗口）
+    const double GRAVITY = 1100.0;
+    const double MOVE_SPEED = 320.0;
+    const double JUMP_VELOCITY = -540.0;
+    const double COYOTE_TIME_MAX = 0.12;   // 土狼时间（离台后仍可起跳窗口）
+    const double JUMP_BUFFER_MAX = 0.15;   // 跳跃输入缓冲（着陆前按键有效窗口）
 
     // 角色状态
-    static float playerX = 100.0f;
-    static float playerY = 300.0f;
-    static float playerVx = 0.0f;
-    static float playerVy = 0.0f;
-    static float playerW = 28.0f;
-    static float playerH = 44.0f;
-    static bool isGrounded = false;
-    static float coyoteTimer = 0.0f;
-    static float jumpBufferTimer = 0.0f;
+    double playerX = 100.0;
+    double playerY = 300.0;
+    double playerVx = 0.0;
+    double playerVy = 0.0;
+    double playerW = 28.0;
+    double playerH = 44.0;
+    bool isGrounded = false;
+    double coyoteTimer = 0.0;
+    double jumpBufferTimer = 0.0;
+
+    // 按键输入状态
+    public bool keyLeft = false;
+    public bool keyRight = false;
+    public bool keyJump = false;
+    public bool keyJumpHeld = false;
 
     // 平滑弹性相机
-    static float cameraX = 0.0f;
-    static float cameraY = 0.0f;
-    static float cameraShake = 0.0f;
+    double cameraX = 0.0;
+    double cameraY = 0.0;
 
-    // 静态场景物件与粒子对象池（彻底消除运行时堆分配）
-    static List<Platform> platforms = new List<Platform>();
-    static Particle[] particlePool = new Particle[64];
+    // 静态场景物件与粒子对象池
+    List<Platform> platforms = new List<Platform>();
+    Particle[] particlePool = new Particle[64];
 
-    static void Main() {
-        InitScene();
-        GameEngine.Init("2D Platformer Engine - Zero-Alloc Loop", 1280, 720);
-        GameEngine.Run(Update, Render);
+    public static PlatformerGame Create(GuiHost host) {
+        PlatformerGame g = new PlatformerGame();
+        g.InitScene();
+        return g;
     }
 
-    static void InitScene() {
-        // 初始化平台地图
-        platforms.Add(new Platform(0.0f, 620.0f, 1280.0f, 100.0f)); // 地面
-        platforms.Add(new Platform(200.0f, 500.0f, 220.0f, 24.0f));
-        platforms.Add(new Platform(500.0f, 400.0f, 260.0f, 24.0f));
-        platforms.Add(new Platform(850.0f, 320.0f, 200.0f, 24.0f));
-        platforms.Add(new Platform(400.0f, 220.0f, 180.0f, 24.0f));
+    void InitScene() {
+        platforms.Add(new Platform(0.0, 620.0, 2000.0, 100.0)); // 主地面
+        platforms.Add(new Platform(200.0, 500.0, 220.0, 24.0));
+        platforms.Add(new Platform(500.0, 400.0, 260.0, 24.0));
+        platforms.Add(new Platform(850.0, 320.0, 200.0, 24.0));
+        platforms.Add(new Platform(400.0, 220.0, 180.0, 24.0));
+        platforms.Add(new Platform(700.0, 140.0, 220.0, 24.0));
 
-        // 预分配粒子池（Zero-Alloc）
         for (int i = 0; i < 64; i = i + 1) {
             particlePool[i] = new Particle();
             particlePool[i].active = false;
         }
     }
 
-    // 零分配 60FPS 物理循环
-    static void Update(float dt) {
-        // 限制极端单帧步长防止穿模
-        if (dt > 0.033f) { dt = 0.033f; }
+    public void SyncStage(GuiHost host) {
+        if (host != null) {
+            this.stageW = host.StageWidth();
+            this.stageH = host.StageHeight();
+        }
+    }
 
-        // 1. 水平输入响应
-        float moveDir = 0.0f;
-        if (GameEngine.IsKeyDown(KeyCode.A) || GameEngine.IsKeyDown(KeyCode.Left)) {
-            moveDir = moveDir - 1.0f;
+    public void OnKeyDown(int code) {
+        // A / Left Arrow
+        if (code == 65 || code == 37) { keyLeft = true; }
+        // D / Right Arrow
+        if (code == 68 || code == 39) { keyRight = true; }
+        // Space / W / Up Arrow
+        if (code == 32 || code == 87 || code == 38) {
+            keyJump = true;
+            keyJumpHeld = true;
+            jumpBufferTimer = JUMP_BUFFER_MAX;
         }
-        if (GameEngine.IsKeyDown(KeyCode.D) || GameEngine.IsKeyDown(KeyCode.Right)) {
-            moveDir = moveDir + 1.0f;
-        }
+    }
+
+    public void OnKeyUp(int code) {
+        if (code == 65 || code == 37) { keyLeft = false; }
+        if (code == 68 || code == 39) { keyRight = false; }
+        if (code == 32 || code == 87 || code == 38) { keyJumpHeld = false; }
+    }
+
+    public void Tick(double dt) {
+        if (dt > 0.033) { dt = 0.033; }
+
+        // 1. 水平移动输入
+        double moveDir = 0.0;
+        if (keyLeft) { moveDir = moveDir - 1.0; }
+        if (keyRight) { moveDir = moveDir + 1.0; }
         playerVx = moveDir * MOVE_SPEED;
 
-        // 2. 输入缓冲（Jump Buffering）更新
-        if (GameEngine.IsKeyPressed(KeyCode.Space) || GameEngine.IsKeyPressed(KeyCode.W)) {
-            jumpBufferTimer = JUMP_BUFFER_MAX;
-        } else if (jumpBufferTimer > 0.0f) {
-            jumpBufferTimer = jumpBufferTimer - dt;
-        }
-
-        // 3. 土狼时间（Coyote Time）更新
+        // 2. 土狼时间
         if (isGrounded) {
             coyoteTimer = COYOTE_TIME_MAX;
-        } else if (coyoteTimer > 0.0f) {
+        } else if (coyoteTimer > 0.0) {
             coyoteTimer = coyoteTimer - dt;
         }
 
-        // 4. 起跳判定（结合缓冲与土狼时间，消除失灵手感）
-        if (jumpBufferTimer > 0.0f && coyoteTimer > 0.0f) {
-            playerVy = JUMP_VELOCITY;
-            jumpBufferTimer = 0.0f;
-            coyoteTimer = 0.0f;
-            isGrounded = false;
-            SpawnDust(playerX + playerW * 0.5f, playerY + playerH, 6);
+        // 3. 跳跃缓冲衰减
+        if (jumpBufferTimer > 0.0) {
+            jumpBufferTimer = jumpBufferTimer - dt;
         }
 
-        // 5. 变高跳跃支持（松开跳跃键截断重力上升）
-        if (!GameEngine.IsKeyDown(KeyCode.Space) && playerVy < -100.0f) {
-            playerVy = playerVy + GRAVITY * dt * 1.5f;
+        // 4. 起跳判定
+        if (jumpBufferTimer > 0.0 && coyoteTimer > 0.0) {
+            playerVy = JUMP_VELOCITY;
+            jumpBufferTimer = 0.0;
+            coyoteTimer = 0.0;
+            isGrounded = false;
+            SpawnDust(playerX + playerW * 0.5, playerY + playerH, 6);
+        }
+
+        // 5. 变高跳跃支持（松开跳跃键加大下落加速度截断）
+        if (!keyJumpHeld && playerVy < -100.0) {
+            playerVy = playerVy + GRAVITY * dt * 1.5;
         } else {
             playerVy = playerVy + GRAVITY * dt;
         }
 
-        // 6. 水平移动与平台碰撞
+        // 6. 水平移动
         playerX = playerX + playerVx * dt;
 
         // 7. 垂直移动与碰撞
@@ -139,84 +169,136 @@ class {{NAME}} {
 
         for (int i = 0; i < platforms.Count; i = i + 1) {
             Platform p = platforms[i];
-            // AABB 碰撞检测
             if (playerX + playerW > p.x && playerX < p.x + p.w) {
-                // 自上而下着陆判定
-                if (playerY + playerH >= p.y && playerY + playerH - playerVy * dt <= p.y + 12.0f && playerVy >= 0.0f) {
+                if (playerY + playerH >= p.y && playerY + playerH - playerVy * dt <= p.y + 16.0 && playerVy >= 0.0) {
                     playerY = p.y - playerH;
-                    playerVy = 0.0f;
+                    playerVy = 0.0;
                     isGrounded = true;
                 }
             }
         }
 
-        // 8. 平滑弹性相机跟随（Spring-Damper）
-        float targetCamX = playerX - 640.0f + playerW * 0.5f;
-        float targetCamY = playerY - 360.0f + playerH * 0.5f;
-        cameraX = cameraX + (targetCamX - cameraX) * (dt * 8.0f);
-        cameraY = cameraY + (targetCamY - cameraY) * (dt * 8.0f);
+        // 8. 弹性相机跟随
+        double targetCamX = playerX - (double)stageW * 0.5 + playerW * 0.5;
+        double targetCamY = playerY - (double)stageH * 0.5 + playerH * 0.5;
+        cameraX = cameraX + (targetCamX - cameraX) * (dt * 8.0);
+        cameraY = cameraY + (targetCamY - cameraY) * (dt * 8.0);
 
-        // 9. 更新粒子系统（零堆分配）
+        // 9. 粒子步进
         UpdateParticles(dt);
     }
 
-    static void SpawnDust(float px, float py, int count) {
+    void SpawnDust(double px, double py, int count) {
         int spawned = 0;
         for (int i = 0; i < 64; i = i + 1) {
             if (!particlePool[i].active) {
-                float vx = (Convert.ToSingle((i * 17) % 100) - 50.0f) * 1.2f;
-                float vy = -Convert.ToSingle((i * 13) % 60 + 20);
-                particlePool[i].Reset(px, py, vx, vy, 0.35f);
+                double vx = ((double)((i * 17) % 100) - 50.0) * 1.5;
+                double vy = -((double)((i * 13) % 60 + 30));
+                particlePool[i].Reset(px, py, vx, vy, 0.35);
                 spawned = spawned + 1;
                 if (spawned >= count) { break; }
             }
         }
     }
 
-    static void UpdateParticles(float dt) {
+    void UpdateParticles(double dt) {
         for (int i = 0; i < 64; i = i + 1) {
             if (particlePool[i].active) {
                 Particle p = particlePool[i];
                 p.x = p.x + p.vx * dt;
                 p.y = p.y + p.vy * dt;
                 p.life = p.life - dt;
-                if (p.life <= 0.0f) {
+                if (p.life <= 0.0) {
                     p.active = false;
                 }
             }
         }
     }
 
-    // 渲染循环（全部基于当前相机偏移变换）
-    static void Render() {
-        GameEngine.Clear(0x18181B); // 暗色沉浸背景
+    public void Render() {
+        if (c == null) { return; }
+        // 背景
+        CDraw.Clear(c, stageW, stageH, CDraw.Argb(255, 24, 24, 28));
 
-        float offsetX = cameraX;
-        float offsetY = cameraY;
+        int offX = (int)cameraX;
+        int offY = (int)cameraY;
 
-        // 绘制平台
+        // 平台
         for (int i = 0; i < platforms.Count; i = i + 1) {
             Platform p = platforms[i];
-            GameEngine.DrawRect(p.x - offsetX, p.y - offsetY, p.w, p.h, 0x3F3F46);
-            // 平台顶沿高光
-            GameEngine.DrawRect(p.x - offsetX, p.y - offsetY, p.w, 4.0f, 0xA1A1AA);
+            int px = (int)p.x - offX;
+            int py = (int)p.y - offY;
+            int pw = (int)p.w;
+            int ph = (int)p.h;
+            CDraw.FillRect(c, px, py, pw, ph, CDraw.Argb(255, 60, 60, 72));
+            CDraw.FillRect(c, px, py, pw, 4, CDraw.Argb(255, 140, 150, 170));
         }
 
-        // 绘制粒子
+        // 粒子
         for (int i = 0; i < 64; i = i + 1) {
             if (particlePool[i].active) {
                 Particle pt = particlePool[i];
-                GameEngine.DrawRect(pt.x - offsetX, pt.y - offsetY, 4.0f, 4.0f, 0xE4E4E7);
+                int ptx = (int)pt.x - offX;
+                int pty = (int)pt.y - offY;
+                CDraw.FillRect(c, ptx, pty, 4, 4, CDraw.Argb(220, 220, 230, 240));
             }
         }
 
-        // 绘制主角（带动效颜色）
-        int heroColor = isGrounded ? 0x22C55E : 0x38BDF8;
-        GameEngine.DrawRect(playerX - offsetX, playerY - offsetY, playerW, playerH, heroColor);
+        // 主角
+        int hx = (int)playerX - offX;
+        int hy = (int)playerY - offY;
+        int hw = (int)playerW;
+        int hh = (int)playerH;
+        int heroColor = isGrounded ? CDraw.Argb(255, 34, 197, 94) : CDraw.Argb(255, 56, 189, 248);
+        CDraw.RoundRectFill(c, hx, hy, hw, hh, 6, isGrounded ? 34 : 56, isGrounded ? 197 : 189, isGrounded ? 94 : 248, 255);
+        // 主角眼睛
+        CDraw.FillCircle(c, hx + (keyLeft ? 6 : 20), hy + 12, 3, 255, 255, 255, 255);
 
-        // 绘制 HUD
-        GameEngine.DrawText("2D Platformer Engine (Coyote Time + Jump Buffer + Zero-Alloc)", 24, 24, 18, 0xFFFFFF);
-        string statusText = "Grounded: " + (isGrounded ? "YES" : "NO") + " | Coyote: " + Convert.ToString(coyoteTimer);
-        GameEngine.DrawText(statusText, 24, 52, 14, 0x94A3B8);
+        // HUD 信息
+        CText.DrawShadow(c, "2D Platformer Engine · Coyote Time + Jump Buffer", 24, 20, 3, 255, 255, 255, 255);
+        string info = "A/D: 移动  Space/W: 跳跃  |  在空中有土狼时间保护与起跳缓冲";
+        CText.DrawShadow(c, info, 24, 52, 2, 160, 180, 200, 255);
+    }
+}
+
+class PlatformerLoop : IGuiHostLoop {
+    PlatformerGame g;
+
+    public void Start(GuiHost host) {
+        this.g = PlatformerGame.Create(host);
+    }
+
+    public void Event(GuiHost host, int kind, int code) {
+        if (kind == 4) { // KeyDown
+            if (code == 27) { // ESC
+                host.App().isRunning = false;
+            } else {
+                this.g.OnKeyDown(code);
+            }
+        } else if (kind == 5) { // KeyUp
+            this.g.OnKeyUp(code);
+        }
+    }
+
+    public void FixedUpdate(GuiHost host, int dt) {
+        this.g.Tick((double)dt / 1000.0);
+    }
+
+    public void Update(GuiHost host, int dt) { }
+
+    public void Render(GuiHost host, Canvas c, double alpha) {
+        this.g.c = c;
+        this.g.SyncStage(host);
+        CDraw.Origin(0, host.ContentTop());
+        this.g.Render();
+    }
+
+    public void Stop(GuiHost host) { }
+}
+
+class App {
+    static void Main() {
+        GuiHost host = new GuiHost("2D Platformer - Zan Game", 1280, 720, 16);
+        host.Run(new PlatformerLoop());
     }
 }
