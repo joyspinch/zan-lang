@@ -50,6 +50,10 @@ description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式�
 - **别给 `llvm.*` 全局设 section**：`llvm.global_ctors` 靠后端特殊降级
   生成 `.ctors`；手动 `LLVMSetSection` 一旦碰到它，全部静态构造器（字符
   串反混淆、运行时注册表）静默失联，症状是启动即崩且 .ctors 分节消失。
+- **`emit_*_call` 拦截内建原语的方法名比对**：若使用 `method.len == N && memcmp(method.str, "Name", N) == 0`，
+  `N` 必须与方法名字符串长度严格一致（建议核对 `sizeof("Name") - 1`，避免手误数错长度）。
+  长度不一致会导致拦截静默落空，AST 降级穿透到链接期符号解析（如 CRT 或动态库），
+  产生 `undefined reference to 'MethodName'` 链接报错。
 
 ## 发布体积：数据逐符号分节与链接器 GC 的边界（2026-09-15）
 
@@ -1926,3 +1930,22 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
 - **macOS 跨平台交叉链接的未解析符号**：
   macOS 动态库在没有宿主完整 SDK 的情况下使用 lld 交叉链接时，动态运行时符号（`calloc`, `free`, `snprintf` 等）需要添加 `-fno-stack-protector "-Wl,-undefined,dynamic_lookup"`，否则 ld64.lld 会将 libc 符号报错为 undefined symbol；在 PowerShell 中执行时必须将包含逗号的链接器参数整体双引号引起来（`"-Wl,-undefined,dynamic_lookup"`），避免逗号被 PowerShell 语法解析为数组分割符。
 
+
+## 编译期生成器（GenRoute/GenDb）：合成源码的三类坑（2026-09-25）
+
+- **表单类绑定不得写静态字段**：GenRoute 对类参数逐字段生成
+  `sc.<F> = __c.InInt(...)`，genmeta 字段元数据带 `"static"` 布尔
+  （genmeta.c），绑定循环必须先跳过它，否则合成源码必炸（静态字段经
+  实例写入），且诊断 file/line 错标到无关文件成"幽灵行列"。验证坑时
+  用 `ZAN_GEN_REPLY=<path>` dump 合成源码，一眼见真凶。
+- **包内同命名空间的分区子目录永远不会被自动拉入**：包发现对包目录调
+  `glob_stdlib_dir(package_dir, "")`，target_ns 为空串——`src/ZanWeb/`
+  下再开 `Feature/` 这类同 ns 子目录（文件声明 `namespace ZanWeb;`）永远
+  命不中，症状是"undefined type"却只见于包形态。包内布局按 stdlib 惯例
+  每命名空间一层目录、命名空间路径=目录路径，不设同 ns 分区目录。
+- **仓库内输入会" inherits" 仓库 packages/**：包发现从输入文件向上找
+  zan.proj，找不到则落到盘根——此时盘下任何 packages/ 目录（含 monorepo
+  的）都可能进入发现面，同类型在旧布局与包里各一份即报 ambiguous。
+  要编译"没有包的历史版本"做对照，必须把源码树和 zanc 一起搬到仓库外
+  （exe 旁 `../packages` 也是发现面之一），runtime obj（build/*.obj）要
+  随 zanc 同拷。

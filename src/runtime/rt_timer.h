@@ -133,6 +133,8 @@ long long swoole_timer_list_count(void);
 long long swoole_timer_list_at(long long index);
 void swoole_timer_stats(long long *initialized, long long *num, long long *round);
 
+#include "rt_hw_accel.h"
+
 #ifdef __cplusplus
 }
 #endif

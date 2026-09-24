@@ -1,0 +1,184 @@
+using System;
+
+namespace System.Drawing;
+
+/// <summary>
+/// 纯 Zan 自举的托管 32 位 ARGB 图像缓冲区。
+/// 封装内存管理、边界安全与高性能图像处理流水线（Crop、Resize、Blit、Fill）。
+/// 所有热路径计算全部下沉至底层物理原语（NativeMemory.Copy2D 与 PixelOps），
+/// 杜绝 C 业务胶水依赖，具备工业级运行效率。
+/// </summary>
+class ImageBuffer : IDisposable {
+    public int Width;
+    public int Height;
+    public int Stride;
+    public nint Pixels;
+
+    public ImageBuffer(int width, int height) {
+        if (width <= 0 || height <= 0) {
+            this.Width = 0;
+            this.Height = 0;
+            this.Stride = 0;
+            this.Pixels = 0;
+            return;
+        }
+        this.Width = width;
+        this.Height = height;
+        this.Stride = width * 4;
+        this.Pixels = NativeMemory.Alloc(this.Stride * height);
+    }
+
+    public void Dispose() {
+        if (this.Pixels != 0) {
+            NativeMemory.Free(this.Pixels);
+            this.Pixels = 0;
+        }
+    }
+
+    /// <summary>以指定 32 位 ARGB 颜色清空图像。</summary>
+    public void Clear(int color) {
+        if (this.Pixels == 0 || this.Width <= 0 || this.Height <= 0) return;
+        PixelOps.FillRect(this.Pixels, this.Stride, 0, 0, this.Width, this.Height, color);
+    }
+
+    /// <summary>在指定矩形区域填充 32 位 ARGB 颜色（自动边界裁剪）。</summary>
+    public void FillRect(int x, int y, int w, int h, int color) {
+        if (this.Pixels == 0 || w <= 0 || h <= 0) return;
+        if (x < 0) { w += x; x = 0; }
+        if (y < 0) { h += y; y = 0; }
+        if (x + w > this.Width) { w = this.Width - x; }
+        if (y + h > this.Height) { h = this.Height - y; }
+        if (w <= 0 || h <= 0) return;
+
+        PixelOps.FillRect(this.Pixels, this.Stride, x, y, w, h, color);
+    }
+
+    /// <summary>
+    /// 裁剪子区域并返回新的 ImageBuffer（由 Copy2D 物理加速，零冗余遍历）。
+    /// </summary>
+    public ImageBuffer Crop(int x, int y, int w, int h) {
+        if (this.Pixels == 0 || w <= 0 || h <= 0) return new ImageBuffer(0, 0);
+        if (x < 0) { w += x; x = 0; }
+        if (y < 0) { h += y; y = 0; }
+        if (x + w > this.Width) { w = this.Width - x; }
+        if (y + h > this.Height) { h = this.Height - y; }
+        if (w <= 0 || h <= 0) return new ImageBuffer(0, 0);
+
+        ImageBuffer sub = new ImageBuffer(w, h);
+        nint srcOff = this.Pixels + (nint)(y * this.Stride + x * 4);
+        NativeMemory.Copy2D(sub.Pixels, sub.Stride, srcOff, this.Stride, w * 4, h);
+        return sub;
+    }
+
+    /// <summary>
+    /// 双线性重采样拉伸到目标尺寸（由 ResampleBilinearRow 向量化物理加速）。
+    /// </summary>
+    public ImageBuffer Resize(int newWidth, int newHeight) {
+        if (this.Pixels == 0 || this.Width <= 0 || this.Height <= 0 || newWidth <= 0 || newHeight <= 0) {
+            return new ImageBuffer(0, 0);
+        }
+
+        ImageBuffer dst = new ImageBuffer(newWidth, newHeight);
+        if (this.Width == 1 && this.Height == 1) {
+            Span<int> sp = new Span<int>(this.Pixels, 1);
+            dst.Clear(sp[0]);
+            return dst;
+        }
+
+        nint xIdxBuf = NativeMemory.Alloc(newWidth * 4);
+        nint xWeightBuf = NativeMemory.Alloc(newWidth * 4);
+        Span<int> xIndices = new Span<int>(xIdxBuf, newWidth);
+        Span<int> xWeights = new Span<int>(xWeightBuf, newWidth);
+
+        // 预计算 X 轴坐标与插值权重 (16.16 定点数)
+        for (int dx = 0; dx < newWidth; dx++) {
+            int fp = (int)(((long)dx * (long)(this.Width - 1) << 16) / (long)(newWidth > 1 ? newWidth - 1 : 1));
+            int sx = fp >> 16;
+            int wx = (fp & 0xFFFF) >> 8; // 0..256
+            if (sx >= this.Width - 1) {
+                sx = this.Width - 2;
+                wx = 256;
+            }
+            if (sx < 0) {
+                sx = 0;
+                wx = 0;
+            }
+            xIndices[dx] = sx;
+            xWeights[dx] = wx;
+        }
+
+        // 逐行调度物理插值微内核
+        for (int dy = 0; dy < newHeight; dy++) {
+            int fpY = (int)(((long)dy * (long)(this.Height - 1) << 16) / (long)(newHeight > 1 ? newHeight - 1 : 1));
+            int sy = fpY >> 16;
+            int wy = (fpY & 0xFFFF) >> 8; // 0..256
+            if (sy >= this.Height - 1) {
+                sy = this.Height - 2;
+                wy = 256;
+            }
+            if (sy < 0) {
+                sy = 0;
+                wy = 0;
+            }
+
+            nint src0 = this.Pixels + (nint)(sy * this.Stride);
+            nint src1 = this.Pixels + (nint)((sy + 1) * this.Stride);
+            nint dstRow = dst.Pixels + (nint)(dy * dst.Stride);
+
+            PixelOps.ResampleBilinearRow(dstRow, src0, src1, xIdxBuf, xWeightBuf, wy, newWidth);
+        }
+
+        NativeMemory.Free(xIdxBuf);
+        NativeMemory.Free(xWeightBuf);
+        return dst;
+    }
+
+    /// <summary>
+    /// 将另一个 ImageBuffer 绘制到当前图像（支持直接覆盖与 Porter-Duff Over 混合）。
+    /// </summary>
+    public void Blit(ImageBuffer src, int dx, int dy, bool alphaBlend) {
+        if (src == null || src.Pixels == 0 || src.Width <= 0 || src.Height <= 0) return;
+        if (this.Pixels == 0 || this.Width <= 0 || this.Height <= 0) return;
+
+        int sx = 0;
+        int sy = 0;
+        int w = src.Width;
+        int h = src.Height;
+
+        if (dx < 0) {
+            sx -= dx;
+            w += dx;
+            dx = 0;
+        }
+        if (dy < 0) {
+            sy -= dy;
+            h += dy;
+            dy = 0;
+        }
+        if (dx + w > this.Width) {
+            w = this.Width - dx;
+        }
+        if (dy + h > this.Height) {
+            h = this.Height - dy;
+        }
+        if (w <= 0 || h <= 0) return;
+
+        if (!alphaBlend) {
+            nint dOff = this.Pixels + (nint)(dy * this.Stride + dx * 4);
+            nint sOff = src.Pixels + (nint)(sy * src.Stride + sx * 4);
+            NativeMemory.Copy2D(dOff, this.Stride, sOff, src.Stride, w * 4, h);
+        } else {
+            for (int r = 0; r < h; r++) {
+                nint dRow = this.Pixels + (nint)((dy + r) * this.Stride + dx * 4);
+                nint sRow = src.Pixels + (nint)((sy + r) * src.Stride + sx * 4);
+                PixelOps.BlendOver(dRow, sRow, w);
+            }
+        }
+    }
+
+    /// <summary>将当前图像的通道在 RGBA 与 BGRA 之间翻转。</summary>
+    public void SwapRB() {
+        if (this.Pixels == 0 || this.Width <= 0 || this.Height <= 0) return;
+        PixelOps.SwapRB(this.Pixels, this.Pixels, this.Width * this.Height);
+    }
+}

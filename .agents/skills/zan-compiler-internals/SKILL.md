@@ -50,6 +50,11 @@ description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式�
 - **别给 `llvm.*` 全局设 section**：`llvm.global_ctors` 靠后端特殊降级
   生成 `.ctors`；手动 `LLVMSetSection` 一旦碰到它，全部静态构造器（字符
   串反混淆、运行时注册表）静默失联，症状是启动即崩且 .ctors 分节消失。
+- **`emit_*_call` 拦截内建原语的方法名比对**：若使用 `method.len == N && memcmp(method.str, "Name", N) == 0`，
+  `N` 必须与方法名字符串长度严格一致（建议核对 `sizeof("Name") - 1`，避免手误数错长度）。
+  长度不一致会导致拦截静默落空，AST 降级穿透到链接期符号解析（如 CRT 或动态库），
+  产生 `undefined reference to 'MethodName'` 链接报错。
+- **LLVM 内建硬件原语（BitOperations 等）整型重载判定**：在 Zan 的 irgen 体系中，整型字面量（`AST_INT_LITERAL`）在 `emit_expr` 中默认发射为 64 位整型（`i64`）。在降低多重载原语（如 `PopCount`, `LeadingZeroCount`, `TrailingZeroCount`, `RotateLeft`, `RotateRight`, `ReverseEndianness`, `Log2`, `RoundUpToPowerOf2` 等）时，切勿仅凭发射值的 LLVM 类型宽度（`LLVMGetIntTypeWidth == 64`）判断是否为 64 位，否则 32 位整数字面量（如 0, 1, 0x12345678）会被误判为 64 位，导致 `bswap` 翻转 8 字节而非 4 字节，或 `LeadingZeroCount(0)` 错返回 64。必须通过 `infer_expr_type(g, arg, locals)` 查询语义类型（`TYPE_LONG` / `TYPE_ULONG` 为 64 位，其余标量为 32 位）。
 
 ## 发布体积：数据逐符号分节与链接器 GC 的边界（2026-09-15）
 
@@ -1927,3 +1932,22 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   回函数——A 事件落在 BuildHeadersSb 开场，当场推翻"客户端 rsb"的
   前提。**教训：leakcheck 报表的 file:line 只是同形状槽位的名字，
   不是持有人；先验证站点名，再顺着名字修**。
+
+## 编译期生成器（GenRoute/GenDb）：合成源码的三类坑（2026-09-25）
+
+- **表单类绑定不得写静态字段**：GenRoute 对类参数逐字段生成
+  `sc.<F> = __c.InInt(...)`，genmeta 字段元数据带 `"static"` 布尔
+  （genmeta.c），绑定循环必须先跳过它，否则合成源码必炸（静态字段经
+  实例写入），且诊断 file/line 错标到无关文件成"幽灵行列"。验证坑时
+  用 `ZAN_GEN_REPLY=<path>` dump 合成源码，一眼见真凶。
+- **包内同命名空间的分区子目录永远不会被自动拉入**：包发现对包目录调
+  `glob_stdlib_dir(package_dir, "")`，target_ns 为空串——`src/ZanWeb/`
+  下再开 `Feature/` 这类同 ns 子目录（文件声明 `namespace ZanWeb;`）永远
+  命不中，症状是"undefined type"却只见于包形态。包内布局按 stdlib 惯例
+  每命名空间一层目录、命名空间路径=目录路径，不设同 ns 分区目录。
+- **仓库内输入会" inherits" 仓库 packages/**：包发现从输入文件向上找
+  zan.proj，找不到则落到盘根——此时盘下任何 packages/ 目录（含 monorepo
+  的）都可能进入发现面，同类型在旧布局与包里各一份即报 ambiguous。
+  要编译"没有包的历史版本"做对照，必须把源码树和 zanc 一起搬到仓库外
+  （exe 旁 `../packages` 也是发现面之一），runtime obj（build/*.obj）要
+  随 zanc 同拷。

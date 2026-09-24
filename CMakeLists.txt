@@ -219,6 +219,8 @@ add_custom_command(
             -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.c -o ${ZAN_RT_TIMER_OBJ}
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.c
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.h
+            ${CMAKE_SOURCE_DIR}/src/runtime/rt_hw_accel.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/rt_hw_accel.h
             ${CMAKE_SOURCE_DIR}/src/common/host_oom.h
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.h
     COMMENT "Building unified timer runtime object (zanrt_timer)"

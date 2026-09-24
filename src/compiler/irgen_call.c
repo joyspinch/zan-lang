@@ -1158,6 +1158,27 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 return nm_out;
         }
 
+        /* High-performance physical pixel operations (System.Drawing.PixelOps). */
+        {
+            LLVMValueRef px_out = NULL;
+            if (emit_pixel_ops_call(g, expr, locals, &px_out))
+                return px_out;
+        }
+
+        /* Hardware intrinsics: BitOperations (POPCNT, LZCNT, TZCNT, ROL, ROR, BSWAP). */
+        {
+            LLVMValueRef bit_out = NULL;
+            if (emit_bit_operations_call(g, expr, locals, &bit_out))
+                return bit_out;
+        }
+
+        /* CPU feature detection (System.Runtime.Intrinsics.Cpu). */
+        {
+            LLVMValueRef cpu_out = NULL;
+            if (emit_cpu_call(g, expr, locals, &cpu_out))
+                return cpu_out;
+        }
+
         /* Span<T> views: arr.AsSpan(), span.Slice() -> value struct. */
         {
             LLVMValueRef sp_out = NULL;

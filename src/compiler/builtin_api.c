@@ -146,6 +146,7 @@ static const zan_builtin_member_t members_nativemem[] = {
     { "Alloc",     'M', "nint Alloc(long size)" },
     { "Free",      'M', "void Free(nint ptr)" },
     { "Copy",      'M', "void Copy(nint dst, nint src, long size)" },
+    { "Copy2D",    'M', "void Copy2D(nint dst, long dstStride, nint src, long srcStride, long rowBytes, long height)" },
     { "Fill",      'M', "void Fill(nint ptr, int value, long size)" },
     { "Compare",   'M', "int Compare(nint a, nint b, long size)" },
     { "ScanNotByte", 'M', "long ScanNotByte(nint ptr, long offset, int byte, long limit)" },
@@ -157,6 +158,49 @@ static const zan_builtin_member_t members_nativemem[] = {
     { "GetString", 'M', "string GetString(nint ptr)" },
     { "PutString", 'M', "void PutString(nint ptr, string text)" },
     { "Sha256", 'M', "string Sha256(nint ptr, long size)" },
+    { "Crc32",  'M', "long Crc32(nint ptr, long size)" },
+    { "Crc32C", 'M', "long Crc32C(nint ptr, long size)" },
+    { "Aes128CbcEncrypt", 'M', "void Aes128CbcEncrypt(nint dst, nint src, long size, nint key, nint iv)" },
+    { "Aes128CbcDecrypt", 'M', "void Aes128CbcDecrypt(nint dst, nint src, long size, nint key, nint iv)" },
+};
+
+static const zan_builtin_member_t members_x86_aes[] = {
+    { "Encrypt",            'M', "Vector128 Encrypt(Vector128 value, Vector128 roundKey)" },
+    { "EncryptLast",        'M', "Vector128 EncryptLast(Vector128 value, Vector128 roundKey)" },
+    { "Decrypt",            'M', "Vector128 Decrypt(Vector128 value, Vector128 roundKey)" },
+    { "DecryptLast",        'M', "Vector128 DecryptLast(Vector128 value, Vector128 roundKey)" },
+    { "KeygenAssist",       'M', "Vector128 KeygenAssist(Vector128 value, byte rcon)" },
+    { "InverseMixColumns",  'M', "Vector128 InverseMixColumns(Vector128 value)" },
+    { "IsSupported",        'P', "bool IsSupported" },
+};
+
+static const zan_builtin_member_t members_x86_sse2[] = {
+    { "Xor",            'M', "Vector128 Xor(Vector128 left, Vector128 right)" },
+    { "LoadVector128",  'M', "Vector128 LoadVector128(nint address)" },
+    { "Store",          'M', "void Store(nint address, Vector128 source)" },
+    { "IsSupported",    'P', "bool IsSupported" },
+};
+
+static const zan_builtin_member_t members_bitops[] = {
+    { "PopCount",           'M', "int PopCount(int value)" },
+    { "LeadingZeroCount",   'M', "int LeadingZeroCount(int value)" },
+    { "TrailingZeroCount",  'M', "int TrailingZeroCount(int value)" },
+    { "RotateLeft",         'M', "int RotateLeft(int value, int offset)" },
+    { "RotateRight",        'M', "int RotateRight(int value, int offset)" },
+    { "ReverseEndianness",  'M', "int ReverseEndianness(int value)" },
+    { "Log2",               'M', "int Log2(int value)" },
+    { "IsPow2",             'M', "bool IsPow2(int value)" },
+    { "RoundUpToPowerOf2",  'M', "int RoundUpToPowerOf2(int value)" },
+};
+
+static const zan_builtin_member_t members_cpu[] = {
+    { "HasPopcnt", 'P', "bool HasPopcnt" },
+    { "HasLzcnt",  'P', "bool HasLzcnt" },
+    { "HasSse42",  'P', "bool HasSse42" },
+    { "HasAvx2",   'P', "bool HasAvx2" },
+    { "HasAesNi",  'P', "bool HasAesNi" },
+    { "HasNeon",   'P', "bool HasNeon" },
+    { "CpuFeature",'M', "int CpuFeature(int id)" },
 };
 
 static const zan_builtin_member_t members_task[] = {
@@ -168,6 +212,13 @@ static const zan_builtin_member_t members_task[] = {
     { "IsDone", 'M', "int IsDone(long handle)" },
     { "Cancel", 'M', "void Cancel(long handle)" },
     { "IsCancellationRequested", 'M', "int IsCancellationRequested()" },
+};
+
+static const zan_builtin_member_t members_pixelops[] = {
+    { "BlendOver",           'M', "void BlendOver(nint dst, nint src, int count)" },
+    { "SwapRB",              'M', "void SwapRB(nint dst, nint src, int count)" },
+    { "FillRect",            'M', "void FillRect(nint dst, int dstStride, int x, int y, int w, int h, int color)" },
+    { "ResampleBilinearRow", 'M', "void ResampleBilinearRow(nint dst, nint src0, nint src1, nint xIndices, nint xWeights, int weightY, int width)" },
 };
 
 #define BT(name, pub, disp, stat, arr) \
@@ -188,6 +239,11 @@ static const zan_builtin_type_t builtin_types[] = {
     BT("Environment", "Environment", "Environment", 1, members_env),
     BT("NativeMemory", "NativeMemory", "NativeMemory", 1, members_nativemem),
     BT("Task", "Task", "Task", 1, members_task),
+    BT("PixelOps", "PixelOps", "PixelOps", 1, members_pixelops),
+    BT("BitOperations", "BitOperations", "BitOperations", 1, members_bitops),
+    BT("Cpu", "Cpu", "Cpu", 1, members_cpu),
+    BT("Aes", "Aes", "Aes", 1, members_x86_aes),
+    BT("Sse2", "Sse2", "Sse2", 1, members_x86_sse2),
 };
 
 const zan_builtin_type_t *zan_builtin_types(int *count) {
@@ -212,6 +268,7 @@ const char *zan_builtin_member_result(const char *type, const char *name,
     static const char *results[] = {
         "string", "int", "long", "double", "bool", "void", "nint",
         "List<string>", "List<K>", "List<V>", "ConsoleColor", "T[]",
+        "Vector128",
     };
     const zan_builtin_type_t *bt = zan_builtin_find(type);
     if (!bt || !name || name_len <= 0) return NULL;

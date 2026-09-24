@@ -1276,3 +1276,7 @@ double zan_rt_dbl_parse(const char *s, char **endp) {
     }
     return strtod(s, endp);
 }
+
+/* Zan Hardware Acceleration Engine & Cryptographic / SIMD Drivers */
+#include "rt_hw_accel.c"
+
