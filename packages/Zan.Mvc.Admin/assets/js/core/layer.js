@@ -88,6 +88,10 @@
             };
         }
 
+        open(options) {
+            return this.dialog(options);
+        }
+
         dialog(options) {
             const { title = '窗口', url, width = '720px', height = '500px', onComplete } = options;
             const mask = document.createElement('div');
