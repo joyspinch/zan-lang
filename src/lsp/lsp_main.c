@@ -53,6 +53,9 @@ typedef SOCKET lsp_sock_t;
 #include <unistd.h>
 #include <pthread.h>
 #include <time.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 typedef int lsp_sock_t;
 #define LSP_INVALID_SOCK (-1)
 #endif
@@ -911,6 +914,18 @@ static bool lsp_stdlib_root(char *out, size_t cap) {
         }
     }
     return true;
+#elif defined(__APPLE__)
+    char exe_path[1024];
+    uint32_t size = sizeof(exe_path);
+    if (_NSGetExecutablePath(exe_path, &size) != 0) { return false; }
+    char *last_sep = strrchr(exe_path, '/');
+    if (!last_sep) { return false; }
+    *last_sep = '\0';
+    snprintf(out, cap, "%s/../stdlib", exe_path);
+    struct stat st;
+    if (stat(out, &st) == 0 && S_ISDIR(st.st_mode)) { return true; }
+    snprintf(out, cap, "%s/stdlib", exe_path);
+    return stat(out, &st) == 0 && S_ISDIR(st.st_mode);
 #else
     char exe_path[1024];
     ssize_t elen = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
@@ -921,6 +936,8 @@ static bool lsp_stdlib_root(char *out, size_t cap) {
     *last_sep = '\0';
     snprintf(out, cap, "%s/../stdlib", exe_path);
     struct stat st;
+    if (stat(out, &st) == 0 && S_ISDIR(st.st_mode)) { return true; }
+    snprintf(out, cap, "%s/stdlib", exe_path);
     return stat(out, &st) == 0 && S_ISDIR(st.st_mode);
 #endif
 }

@@ -144,6 +144,7 @@ class AppUpdater {
 
             byte[] extracted = Zip.Extract(zipBytes, e);
             File.WriteAllBytes(destFile, extracted);
+            RestoreExecutablePermissionIfNeeded(destFile, extracted);
 
             if (cb != null) {
                 int percent = ((i + 1) * 100) / total;
@@ -250,5 +251,39 @@ class AppUpdater {
         // 3. 执行防篡改比对自检，确保释放出的文件完整无误
         IntegrityReport report = VerifyAndSelfHeal(targetAppDir, manifest, localZipPath, cb);
         return report.isClean;
+    }
+
+    /// <summary>
+    /// 若写入的文件属于可执行文件（ELF、Mach-O、脚本 shebang、.sh 等），在 POSIX 平台上自动赋予可执行权限 (0755)。
+    /// </summary>
+    static void RestoreExecutablePermissionIfNeeded(string filePath, byte[] content) {
+        #if !WINDOWS
+        if (filePath == null || content == null || content.Length < 2) {
+            return;
+        }
+        bool isExec = false;
+        if (filePath.EndsWith(".sh")) {
+            isExec = true;
+        } else if (content.Length >= 4) {
+            // ELF 魔数: 0x7F, 'E', 'L', 'F'
+            if (content[0] == 0x7F && content[1] == 0x45 && content[2] == 0x4C && content[3] == 0x46) {
+                isExec = true;
+            }
+            // Mach-O 魔数: 0xCF 0xFA 0xED 0xFE (64位), 0xCE 0xFA 0xED 0xFE (32位), 0xCA 0xFE 0xBA 0xBE (fat)
+            else if ((content[0] == 0xCF && content[1] == 0xFA && content[2] == 0xED && content[3] == 0xFE)
+                  || (content[0] == 0xCE && content[1] == 0xFA && content[2] == 0xED && content[3] == 0xFE)
+                  || (content[0] == 0xFE && content[1] == 0xED && content[2] == 0xFA && content[3] == 0xCF)
+                  || (content[0] == 0xCA && content[1] == 0xFE && content[2] == 0xBA && content[3] == 0xBE)) {
+                isExec = true;
+            }
+            // Shebang 脚本: #!
+            else if (content[0] == 0x23 && content[1] == 0x21) {
+                isExec = true;
+            }
+        }
+        if (isExec) {
+            File.SetExecutable(filePath, true);
+        }
+        #endif
     }
 }

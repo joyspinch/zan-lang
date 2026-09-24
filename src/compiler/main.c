@@ -7688,6 +7688,10 @@ int main(int argc, char **argv) {
             size_t cur = strlen(link_cmd);
             snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\"", rt_embed_obj);
         }
+        if (rt_inflate_obj) {
+            size_t cur = strlen(link_cmd);
+            snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\"", rt_inflate_obj);
+        }
         if (rt_timer_obj) {
             size_t cur = strlen(link_cmd);
 #ifdef __APPLE__
@@ -7696,6 +7700,16 @@ int main(int argc, char **argv) {
 #else
             snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
                      " \"%s\" -pthread -lrt", rt_timer_obj);
+#endif
+        }
+        if (rt_mem_obj) {
+            size_t cur = strlen(link_cmd);
+#ifdef __APPLE__
+            snprintf(link_cmd + cur, sizeof(link_cmd) - cur, " \"%s\"", rt_mem_obj);
+#else
+            snprintf(link_cmd + cur, sizeof(link_cmd) - cur,
+                     " \"%s\" -Wl,--wrap=malloc -Wl,--wrap=free"
+                     " -Wl,--wrap=calloc -Wl,--wrap=realloc", rt_mem_obj);
 #endif
         }
         for (int di = 0; di < zan_lib_ndirs; di++) {
