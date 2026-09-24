@@ -1,0 +1,165 @@
+using System;
+
+namespace Game.Core;
+
+/// <summary>
+/// 高性能二维紧凑空间哈希网格（Spatial Hash Grid）。
+/// 专为塔防怪群、ARPG 怪物碰撞、RTS 寻敌等海量实体设计。
+/// 内部基于紧凑静态扁平链表实现，查询与插入完全零 GC 分配，O(1) 检索周围邻域。
+/// </summary>
+class SpatialHash2D {
+    int cellSize;
+    int tableSize;      // 哈希桶总数（质数或 2 的幂）
+    int maxEntities;    // 支持的最大实体容量
+    int count;
+
+    // 扁平链表池
+    int[] bucketHead;   // [tableSize]
+    int[] nextEntry;    // [maxEntities]
+    int[] entityIds;    // [maxEntities]
+    double[] posX;      // [maxEntities]
+    double[] posY;      // [maxEntities]
+    double[] radius;    // [maxEntities]
+
+    SpatialHash2D(int cellSize, int maxEntities) {
+        if (cellSize <= 8) { cellSize = 64; }
+        if (maxEntities < 100) { maxEntities = 2048; }
+
+        this.cellSize = cellSize;
+        this.maxEntities = maxEntities;
+        this.tableSize = 4099; // 优质哈希素数桶
+        this.count = 0;
+
+        this.bucketHead = new int[tableSize];
+        this.nextEntry = new int[maxEntities];
+        this.entityIds = new int[maxEntities];
+        this.posX = new double[maxEntities];
+        this.posY = new double[maxEntities];
+        this.radius = new double[maxEntities];
+
+        Clear();
+    }
+
+    static SpatialHash2D Create(int cellSize, int maxCapacity) {
+        return new SpatialHash2D(cellSize, maxCapacity);
+    }
+
+    /// <summary>
+    /// 清空整张网格，准备下一帧重新插入（复杂度仅为 O(tableSize)）。
+    /// </summary>
+    void Clear() {
+        for (int i = 0; i < tableSize; i = i + 1) {
+            bucketHead[i] = -1;
+        }
+        count = 0;
+    }
+
+    int HashCoords(int cellX, int cellY) {
+        // 优质大质数混淆哈希，防止聚簇
+        long h = ((long)cellX * 73856093L) ^ ((long)cellY * 19349663L);
+        int idx = (int)(h % (long)tableSize);
+        if (idx < 0) { idx = idx + tableSize; }
+        return idx;
+    }
+
+    /// <summary>
+    /// 插入一个实体到哈希网格中。
+    /// </summary>
+    bool Insert(int id, double x, double y, double r) {
+        if (count >= maxEntities) {
+            return false;
+        }
+
+        int entryIdx = count;
+        count = count + 1;
+
+        entityIds[entryIdx] = id;
+        posX[entryIdx] = x;
+        posY[entryIdx] = y;
+        radius[entryIdx] = r;
+
+        int cx = (int)Math.Floor(x / (double)cellSize);
+        int cy = (int)Math.Floor(y / (double)cellSize);
+        int bIdx = HashCoords(cx, cy);
+
+        // 头插法接入链表
+        nextEntry[entryIdx] = bucketHead[bIdx];
+        bucketHead[bIdx] = entryIdx;
+        return true;
+    }
+
+    /// <summary>
+    /// 查询指定圆心 (cx, cy) 范围内 radius 半径内的所有实体。
+    /// 结果输出到传入的 outIds 数组中，返回命中实体数量。零堆分配。
+    /// </summary>
+    int QueryRange(double qx, double qy, double qRadius, int[] outIds, int maxOut) {
+        if (maxOut <= 0 || outIds == null) { return 0; }
+
+        int minCx = (int)Math.Floor((qx - qRadius) / (double)cellSize);
+        int maxCx = (int)Math.Floor((qx + qRadius) / (double)cellSize);
+        int minCy = (int)Math.Floor((qy - qRadius) / (double)cellSize);
+        int maxCy = (int)Math.Floor((qy + qRadius) / (double)cellSize);
+
+        double r2 = qRadius * qRadius;
+        int hitCount = 0;
+
+        for (int cx = minCx; cx <= maxCx; cx = cx + 1) {
+            for (int cy = minCy; cy <= maxCy; cy = cy + 1) {
+                int bIdx = HashCoords(cx, cy);
+                int curr = bucketHead[bIdx];
+
+                while (curr != -1) {
+                    double dx = posX[curr] - qx;
+                    double dy = posY[curr] - qy;
+                    double totalR = qRadius + radius[curr];
+
+                    if (dx * dx + dy * dy <= totalR * totalR) {
+                        outIds[hitCount] = entityIds[curr];
+                        hitCount = hitCount + 1;
+                        if (hitCount >= maxOut) {
+                            return hitCount;
+                        }
+                    }
+                    curr = nextEntry[curr];
+                }
+            }
+        }
+
+        return hitCount;
+    }
+
+    /// <summary>
+    /// 寻找离指定点 (qx, qy) 在 maxRange 范围内最近的实体 ID，未找到返回 -1。
+    /// 塔防防御塔攻击索敌、自动施法的关键核心算子。
+    /// </summary>
+    int FindNearest(double qx, double qy, double maxRange) {
+        int minCx = (int)Math.Floor((qx - maxRange) / (double)cellSize);
+        int maxCx = (int)Math.Floor((qx + maxRange) / (double)cellSize);
+        int minCy = (int)Math.Floor((qy - maxRange) / (double)cellSize);
+        int maxCy = (int)Math.Floor((qy + maxRange) / (double)cellSize);
+
+        double bestDist2 = maxRange * maxRange;
+        int bestId = -1;
+
+        for (int cx = minCx; cx <= maxCx; cx = cx + 1) {
+            for (int cy = minCy; cy <= maxCy; cy = cy + 1) {
+                int bIdx = HashCoords(cx, cy);
+                int curr = bucketHead[bIdx];
+
+                while (curr != -1) {
+                    double dx = posX[curr] - qx;
+                    double dy = posY[curr] - qy;
+                    double d2 = dx * dx + dy * dy;
+
+                    if (d2 <= bestDist2) {
+                        bestDist2 = d2;
+                        bestId = entityIds[curr];
+                    }
+                    curr = nextEntry[curr];
+                }
+            }
+        }
+
+        return bestId;
+    }
+}

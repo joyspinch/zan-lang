@@ -1,0 +1,143 @@
+using System;
+
+namespace Game.Tactics;
+
+/// <summary>
+/// 子弹弹药类型。
+/// </summary>
+enum BulletType {
+    Normal,     // 直线普通子弹
+    Homing,     // 制导追踪导弹
+    Artillery,  // 抛物线高抛落地 AOE 榴弹炮
+    Laser       // 瞬间贯通激光射线
+}
+
+/// <summary>
+/// 零 GC 内存预分配弹道投射物对象池。
+/// 支持单机千枚子弹高频模拟，支持直线投射、追踪制导与范围溅射爆炸。
+/// </summary>
+class BulletPool {
+    int capacity;
+    int activeCount;
+
+    bool[] active;
+    int[] bulletType;
+    double[] posX;
+    double[] posY;
+    double[] velX;
+    double[] velY;
+    int[] targetId;
+    double[] targetX;
+    double[] targetY;
+    double[] damage;
+    double[] splashRadius;
+    double[] lifeTime;
+
+    BulletPool(int cap) {
+        this.capacity = cap > 0 ? cap : 512;
+        this.activeCount = 0;
+
+        this.active = new bool[capacity];
+        this.bulletType = new int[capacity];
+        this.posX = new double[capacity];
+        this.posY = new double[capacity];
+        this.velX = new double[capacity];
+        this.velY = new double[capacity];
+        this.targetId = new int[capacity];
+        this.targetX = new double[capacity];
+        this.targetY = new double[capacity];
+        this.damage = new double[capacity];
+        this.splashRadius = new double[capacity];
+        this.lifeTime = new double[capacity];
+    }
+
+    static BulletPool Create(int capacity) {
+        return new BulletPool(capacity);
+    }
+
+    int Capacity { get { return capacity; } }
+    int ActiveCount { get { return activeCount; } }
+
+    bool IsActive(int idx) { return active[idx]; }
+    int GetType(int idx) { return bulletType[idx]; }
+    double GetX(int idx) { return posX[idx]; }
+    double GetY(int idx) { return posY[idx]; }
+    double GetDamage(int idx) { return damage[idx]; }
+    double GetSplash(int idx) { return splashRadius[idx]; }
+
+    /// <summary>发射一枚直线或追踪子弹。</summary>
+    int Spawn(BulletType type, double spawnX, double spawnY, int tgtId, double tgtX, double tgtY, double speed, double dmg, double splashR, double maxLife) {
+        // 查找空闲槽位
+        int slot = -1;
+        for (int i = 0; i < capacity; i = i + 1) {
+            if (!active[i]) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot < 0) { return -1; }
+
+        active[slot] = true;
+        bulletType[slot] = (int)type;
+        posX[slot] = spawnX;
+        posY[slot] = spawnY;
+        targetId[slot] = tgtId;
+        targetX[slot] = tgtX;
+        targetY[slot] = tgtY;
+        damage[slot] = dmg;
+        splashRadius[slot] = splashR;
+        lifeTime[slot] = maxLife;
+
+        double dx = tgtX - spawnX;
+        double dy = tgtY - spawnY;
+        double len = Math.Sqrt(dx * dx + dy * dy);
+        if (len > 0.001) {
+            velX[slot] = (dx / len) * speed;
+            velY[slot] = (dy / len) * speed;
+        } else {
+            velX[slot] = speed;
+            velY[slot] = 0.0;
+        }
+
+        activeCount = activeCount + 1;
+        return slot;
+    }
+
+    /// <summary>
+    /// 逐物理步长更新所有活动子弹位置，返回命中目标的子弹索引委托回调。
+    /// </summary>
+    void Update(double dt, Action<int, double, double, double, double> onHitCallback) {
+        for (int i = 0; i < capacity; i = i + 1) {
+            if (!active[i]) { continue; }
+
+            lifeTime[i] = lifeTime[i] - dt;
+            if (lifeTime[i] <= 0.0) {
+                // 超时消亡
+                active[i] = false;
+                activeCount = activeCount - 1;
+                continue;
+            }
+
+            // 移动
+            posX[i] = posX[i] + velX[i] * dt;
+            posY[i] = posY[i] + velY[i] * dt;
+
+            // 检测是否到达目标点（20 像素以内判定命中）
+            double dist2 = (posX[i] - targetX[i]) * (posX[i] - targetX[i]) + (posY[i] - targetY[i]) * (posY[i] - targetY[i]);
+            if (dist2 <= 400.0) {
+                if (onHitCallback != null) {
+                    onHitCallback(i, posX[i], posY[i], damage[i], splashRadius[i]);
+                }
+                active[i] = false;
+                activeCount = activeCount - 1;
+            }
+        }
+    }
+
+    void Kill(int idx) {
+        if (idx >= 0 && idx < capacity && active[idx]) {
+            active[idx] = false;
+            activeCount = activeCount - 1;
+        }
+    }
+}

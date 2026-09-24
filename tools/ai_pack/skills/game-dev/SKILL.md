@@ -402,3 +402,27 @@ Post 调用核对编码，别信二手注释。
   - 加载瓦片地图（`TileLayer`）后，严禁为每个 solid tile 创建一个独立碰撞体（易产生接缝卡角且拖慢遍历）。
   - 调用 `layer.ExtractColliders(solidTileId)` 走水平连续瓦片合并算法，合并为宽矩形数组，大幅削减碰撞体开销。
 
+## 游戏基座引擎体系与各类型定式（Core / Tactics / Arpg / Cards）
+
+- **渲染引擎与游戏引擎职责严格解耦**：
+  - 渲染引擎（`stdlib/Gui/Rendering`、GPU Quad Batcher `SpriteBatch`、纹理烘焙 `BakeSprite`、`Canvas`）只管 GPU 显存纹理、视口裁剪与着色器四边形极速绘制（实测 10,000 精灵仅 0.085ms/frame），不包含任何血量、碰撞或游戏业务概念。
+  - 游戏引擎（`packages/Zan.Game`）负责纯逻辑状态推进、定步时钟、空间检索、路径解算，向渲染引擎单向提交轻量绘制指令。
+- **L0 核心底座（Game.Core）**：
+  - `GameClock`：固定时间步长（50Hz/60Hz），`InterpolationAlpha()` 导出亚帧平滑插值比例，严格内置 `maxAccumulator` 熔断防止“螺旋死锁”。
+  - `Camera2D`：支持阻尼指数衰减屏幕震颤（`Shake`）、平滑 Lerp 跟随及视锥矩形裁剪判定（`IsVisible`）。
+  - `SpatialHash2D`：采用紧凑定长扁平数组与哈希桶链表，零 GC 内存预分配，万级实体范围查询与最近索敌保持在毫秒级以内。
+- **L2 塔防与 RTS 战术（Game.Tactics）**：
+  - `FlowField`（流场寻路）：千万群怪与兵团统一以目标基地为波前扩散（BFS/Dijkstra）计算集成场与 8 方向下坡向量场，单位采样移动方向复杂度降为纯 $O(1)$，彻底终结单兵 A* 路径规划导致的 CPU 耗尽。
+  - `Tower` & `BulletPool`：支持 First/Closest/Strongest/Weakest 索敌策略与自动转向；投射物采用定长对象池管理直线、追踪制导与高抛 AOE 溅射。
+  - `WaveSpawner`：统一管理战备倒计时、出怪节奏与波次结算。
+- **L1 等轴测 ARPG / 传奇类（Game.Arpg）**：
+  - `IsoTileMap`：工业级 2:1 菱形等轴测地砖双向映射与 8 方向（`GetDirection8`）旋转扇区朝向解算。
+  - `YSortLayer`：采用原位快速排序解决玩家、怪物、NPC 与建筑间的 Y 轴脚底动态遮挡，零堆内存分配。
+  - `LootScatter`：模拟经典“怪物大爆”物品 360 度四散抛射、重力加速度与地面弹性跳跃衰减物理收敛。
+- **L3 卡牌与策略（Game.Cards）**：
+  - `HandFanLayout`：扇面弧度排布算法，动态计算间距、倾角与 Y 拱起曲线，配合悬停聚焦浮起与两侧推开。
+  - `CardZoneManager`：支持卡槽包围盒与磁吸感应门限判定，防止已占用槽位吸附。
+  - `ActionQueue`：阻塞式时序演播队列，保证回合制打牌中抽牌、伤害跳字、亡语触发依次连贯展现。
+- **数学与转向算子**：
+  - 编译器内置 `Math.Atan2(y, x)` / `Atan` / `Asin` / `Acos`，原生直通 libc/libm，游戏转向、炮塔瞄准与弹道追踪严禁手写低精度的经验近似。
+

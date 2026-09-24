@@ -1,0 +1,221 @@
+using System;
+using System.Diagnostics;
+using Game.Core;
+using Game.Tactics;
+using Game.Arpg;
+using Game.Cards;
+
+class MainClass {
+    static void Main() {
+        TestClock();
+        TestCamera2D();
+        TestSpatialHash();
+        TestFlowField();
+        TestTowerAndBullets();
+        TestWaveSpawner();
+        TestIsoTileMap();
+        TestYSortLayer();
+        TestLootScatter();
+        TestHandFanLayout();
+        TestCardZone();
+        TestActionQueue();
+
+        Console.WriteLine("ALL_PASSED");
+    }
+
+    static void Assert(bool condition, string message) {
+        if (!condition) {
+            Console.WriteLine("[FAIL] " + message);
+            throw new Exception("Assertion failed: " + message);
+        }
+    }
+
+    static void TestClock() {
+        GameClock clock = new GameClock(0.016666667);
+        clock.Advance();
+        double alpha = clock.InterpolationAlpha();
+        Assert(alpha >= 0.0 && alpha <= 1.0, "InterpolationAlpha must be in [0, 1]");
+    }
+
+    static void TestCamera2D() {
+        Camera2D cam = Camera2D.Create(1280, 720);
+        cam.X = 1000.0;
+        cam.Y = 1000.0;
+
+        double sx, sy;
+        cam.WorldToScreen(1000.0, 1000.0, out sx, out sy);
+        Assert(Math.Abs(sx - 640.0) < 0.01 && Math.Abs(sy - 360.0) < 0.01, "Center world point must map to screen center");
+
+        double wx, wy;
+        cam.ScreenToWorld(640.0, 360.0, out wx, out wy);
+        Assert(Math.Abs(wx - 1000.0) < 0.01 && Math.Abs(wy - 1000.0) < 0.01, "Screen center must map back to center world point");
+
+        Assert(cam.IsVisible(950.0, 950.0, 50.0, 50.0), "Box near center must be visible");
+        Assert(!cam.IsVisible(5000.0, 5000.0, 10.0, 10.0), "Far box must be culled");
+    }
+
+    static void TestSpatialHash() {
+        SpatialHash2D grid = SpatialHash2D.Create(64, 12000);
+        for (int i = 0; i < 10000; i = i + 1) {
+            double x = (double)(i % 100) * 30.0;
+            double y = (double)(i / 100) * 30.0;
+            grid.Insert(i, x, y, 10.0);
+        }
+        int[] outIds = new int[128];
+        int hits = grid.QueryRange(300.0, 300.0, 60.0, outIds, 128);
+        Assert(hits > 0, "QueryRange should find neighbor entities");
+
+        int nearestId = grid.FindNearest(302.0, 301.0, 50.0);
+        Assert(nearestId >= 0, "FindNearest should locate closest entity");
+    }
+
+    static void TestFlowField() {
+        FlowField field = FlowField.Create(32, 32, 32);
+        field.SetCost(10, 10, 255);
+        Assert(field.IsBlocked(10, 10), "Block cell should be blocked");
+
+        field.SetTarget(16, 16);
+        field.Rebuild();
+
+        float vx, vy;
+        field.SampleWorldVelocity(16.0 * 32.0, 5.0 * 32.0, out vx, out vy);
+        Assert(vy > 0.0f, "Flow field should guide downward towards target y=16");
+    }
+
+    static void TestTowerAndBullets() {
+        Tower tower = Tower.Create(1, 1, 100.0, 100.0, 200.0, 0.5, 35.0, 100);
+        tower.AimAt(200.0, 100.0);
+        Assert(Math.Abs(tower.AimAngle - 0.0) < 0.001, "Angle to right should be 0 radian");
+
+        BulletPool pool = BulletPool.Create(128);
+        int bIdx = pool.Spawn(BulletType.Normal, 100.0, 100.0, 2, 150.0, 100.0, 200.0, 50.0, 0.0, 2.0);
+        Assert(bIdx >= 0, "Bullet spawn must succeed");
+
+        bool hitTriggered = false;
+        pool.Update(0.3, (int id, double x, double y, double dmg, double splash) => {
+            hitTriggered = true;
+            Assert(dmg == 50.0, "Damage should match");
+        });
+
+        Assert(hitTriggered, "Bullet hit callback should fire");
+        Assert(pool.ActiveCount == 0, "Hit bullet should be recycled to pool");
+    }
+
+    static void TestWaveSpawner() {
+        WaveSpawner spawner = WaveSpawner.Create(10, 5.0);
+        spawner.StartNextWaveImmediately();
+
+        int spawnedCount = 0;
+        for (int i = 0; i < 3; i = i + 1) {
+            spawner.Update(0.1, 0, (int wave, int mobType) => {
+                spawnedCount = spawnedCount + 1;
+            }, (int completedWave) => {});
+        }
+
+        Assert(spawner.IsWaveActive, "Wave should be active");
+        Assert(spawnedCount > 0, "Monster should be spawned");
+    }
+
+    static void TestIsoTileMap() {
+        IsoTileMap map = IsoTileMap.Create(64, 64, 64, 32);
+        double sx, sy;
+        map.GridToWorld(10, 5, out sx, out sy);
+
+        int gx, gy;
+        map.WorldToGrid(sx, sy, out gx, out gy);
+        Assert(gx == 10 && gy == 5, "Iso projection must be exactly reversible");
+
+        int dirEast = IsoTileMap.GetDirection8(0.0, 0.0, 100.0, 0.0);
+        Assert(dirEast == 0, "East direction must be 0");
+
+        int dirSouth = IsoTileMap.GetDirection8(0.0, 0.0, 0.0, 100.0);
+        Assert(dirSouth == 2, "South direction must be 2");
+    }
+
+    static void TestYSortLayer() {
+        YSortLayer layer = YSortLayer.Create(1200);
+        for (int i = 0; i < 1000; i = i + 1) {
+            double footY = (double)((1000 - i) * 3);
+            layer.Push(i, 1, footY);
+        }
+
+        layer.Sort();
+
+        double lastY = -999999.0;
+        int checkCount = 0;
+        layer.ForEachSorted((int id, int type, double y) => {
+            Assert(y >= lastY, "YSort entities must be strictly non-decreasing");
+            lastY = y;
+            checkCount = checkCount + 1;
+        });
+
+        Assert(checkCount == 1000, "All entities must be iterated");
+    }
+
+    static void TestLootScatter() {
+        LootScatter loot = LootScatter.Create(256);
+        loot.Burst(500.0, 500.0, 20, 1001);
+        Assert(loot.ActiveCount == 20, "20 loot items should burst out");
+
+        for (int step = 0; step < 180; step = step + 1) {
+            loot.Update(0.01666667);
+        }
+
+        bool allSettled = true;
+        for (int i = 0; i < 20; i = i + 1) {
+            if (!loot.IsSettled(i)) {
+                allSettled = false;
+                break;
+            }
+        }
+        Assert(allSettled, "All burst items should settle on ground after 3 seconds");
+    }
+
+    static void TestHandFanLayout() {
+        HandFanLayout fan = HandFanLayout.Create(600.0, 40.0, 70.0);
+
+        double x0, y0, r0, s0;
+        fan.CalculateCardTransform(0, 5, 2, 640.0, 700.0, out x0, out y0, out r0, out s0);
+
+        double xHover, yHover, rHover, sHover;
+        fan.CalculateCardTransform(2, 5, 2, 640.0, 700.0, out xHover, out yHover, out rHover, out sHover);
+
+        Assert(sHover > s0, "Hovered card should scale up");
+        Assert(yHover < y0, "Hovered card should lift upwards");
+    }
+
+    static void TestCardZone() {
+        CardZoneManager zone = CardZoneManager.Create(7);
+        zone.SetupPlayerSlot(0, 100.0, 400.0, 120.0, 160.0);
+        zone.SetupPlayerSlot(1, 240.0, 400.0, 120.0, 160.0);
+
+        int snap0 = zone.FindSnapPlayerSlot(110.0, 410.0, 80.0);
+        Assert(snap0 == 0, "Dragging inside slot 0 should snap to 0");
+
+        int snap1 = zone.FindSnapPlayerSlot(280.0, 460.0, 80.0);
+        Assert(snap1 == 1, "Dragging near slot 1 should snap to 1");
+
+        BoardSlot s0 = zone.GetPlayerSlot(0);
+        if (s0 != null) {
+            s0.OccupantCardId = 99;
+        }
+        int snapOccupied = zone.FindSnapPlayerSlot(110.0, 410.0, 50.0);
+        Assert(snapOccupied == -1, "Occupied slot must not snap");
+    }
+
+    static void TestActionQueue() {
+        ActionQueue queue = ActionQueue.Create(64);
+        queue.Enqueue(ActionKind.PlayCardAnim, 1, 2, 0, 0.1);
+        queue.Enqueue(ActionKind.DealDamage, 1, 2, 10, 0.1);
+
+        int finishedActions = 0;
+        for (int i = 0; i < 25; i = i + 1) {
+            queue.Update(0.01, null, (GameAction act) => {
+                finishedActions = finishedActions + 1;
+            });
+        }
+
+        Assert(finishedActions == 2, "Both actions should finish in order");
+        Assert(!queue.IsPlaying, "Queue should become idle when empty");
+    }
+}

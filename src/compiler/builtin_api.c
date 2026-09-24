@@ -87,6 +87,10 @@ static const zan_builtin_member_t members_math[] = {
     { "Sin",     'M', "double Sin(double value)" },
     { "Cos",     'M', "double Cos(double value)" },
     { "Tan",     'M', "double Tan(double value)" },
+    { "Atan2",   'M', "double Atan2(double y, double x)" },
+    { "Atan",    'M', "double Atan(double value)" },
+    { "Asin",    'M', "double Asin(double value)" },
+    { "Acos",    'M', "double Acos(double value)" },
 };
 
 static const zan_builtin_member_t members_convert[] = {

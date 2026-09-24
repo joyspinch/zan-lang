@@ -1,0 +1,165 @@
+using System;
+
+namespace Game.Core;
+
+/// <summary>
+/// 2D 游戏正交相机与视口管理。
+/// 支持平滑插值跟随、视口内外剔除判定、地图边界钳制与阻尼屏幕震动。
+/// </summary>
+class Camera2D {
+    double x;               // 相机中心的世界坐标 X
+    double y;               // 相机中心的世界坐标 Y
+    int viewWidth;          // 视口屏幕宽度（像素）
+    int viewHeight;         // 视口屏幕高度（像素）
+    double zoom;            // 缩放系数（默认 1.0）
+
+    // 边界限制
+    bool hasBounds;
+    double minX;
+    double minY;
+    double maxX;
+    double maxY;
+
+    // 震屏效果
+    double shakeIntensity;
+    double shakeTimer;
+    double shakeOffsetX;
+    double shakeOffsetY;
+    Random rnd;
+
+    Camera2D(int viewW, int viewH) {
+        this.x = 0.0;
+        this.y = 0.0;
+        this.viewWidth = viewW > 0 ? viewW : 1280;
+        this.viewHeight = viewH > 0 ? viewH : 720;
+        this.zoom = 1.0;
+        this.hasBounds = false;
+        this.shakeIntensity = 0.0;
+        this.shakeTimer = 0.0;
+        this.shakeOffsetX = 0.0;
+        this.shakeOffsetY = 0.0;
+        this.rnd = new Random();
+    }
+
+    static Camera2D Create(int viewW, int viewH) {
+        return new Camera2D(viewW, viewH);
+    }
+
+    double X { get { return x + shakeOffsetX; } set { x = value; ClampToBounds(); } }
+    double Y { get { return y + shakeOffsetY; } set { y = value; ClampToBounds(); } }
+    double Zoom { get { return zoom; } set { zoom = value > 0.1 ? value : 0.1; } }
+    int ViewWidth { get { return viewWidth; } }
+    int ViewHeight { get { return viewHeight; } }
+
+    void Resize(int w, int h) {
+        if (w > 0) { viewWidth = w; }
+        if (h > 0) { viewHeight = h; }
+        ClampToBounds();
+    }
+
+    void SetBounds(double minX, double minY, double maxX, double maxY) {
+        this.hasBounds = true;
+        this.minX = minX;
+        this.minY = minY;
+        this.maxX = maxX;
+        this.maxY = maxY;
+        ClampToBounds();
+    }
+
+    void ClearBounds() {
+        this.hasBounds = false;
+    }
+
+    /// <summary>
+    /// 触发屏幕震动（例如暴击、爆炸、地震）。
+    /// </summary>
+    void Shake(double intensity, double durationSec) {
+        this.shakeIntensity = intensity;
+        this.shakeTimer = durationSec;
+    }
+
+    /// <summary>
+    /// 逐帧更新相机插值运动与震屏衰减。
+    /// </summary>
+    void Update(double dt) {
+        if (shakeTimer > 0.0) {
+            shakeTimer = shakeTimer - dt;
+            if (shakeTimer <= 0.0) {
+                shakeTimer = 0.0;
+                shakeOffsetX = 0.0;
+                shakeOffsetY = 0.0;
+            } else {
+                double rad = ((double)rnd.NextBelow(360) / 180.0) * 3.14159265;
+                shakeOffsetX = Math.Cos(rad) * shakeIntensity;
+                shakeOffsetY = Math.Sin(rad) * shakeIntensity;
+                shakeIntensity = shakeIntensity * Math.Max(0.0, 1.0 - dt * 5.0); // 指数衰减
+            }
+        }
+    }
+
+    /// <summary>
+    /// 平滑跟随目标世界坐标（Lerp 缓动）。
+    /// </summary>
+    void Follow(double targetX, double targetY, double smoothSpeed, double dt) {
+        double factor = 1.0 - Math.Exp(-smoothSpeed * dt);
+        x = x + (targetX - x) * factor;
+        y = y + (targetY - y) * factor;
+        ClampToBounds();
+    }
+
+    void ClampToBounds() {
+        if (!hasBounds) { return; }
+        double halfW = ((double)viewWidth * 0.5) / zoom;
+        double halfH = ((double)viewHeight * 0.5) / zoom;
+
+        if (maxX - minX <= halfW * 2.0) {
+            x = (minX + maxX) * 0.5;
+        } else {
+            if (x - halfW < minX) { x = minX + halfW; }
+            if (x + halfW > maxX) { x = maxX - halfW; }
+        }
+
+        if (maxY - minY <= halfH * 2.0) {
+            y = (minY + maxY) * 0.5;
+        } else {
+            if (y - halfH < minY) { y = minY + halfH; }
+            if (y + halfH > maxY) { y = maxY - halfH; }
+        }
+    }
+
+    /// <summary>世界坐标转换为屏幕像素坐标。</summary>
+    void WorldToScreen(double wx, double wy, out double sx, out double sy) {
+        double curX = x + shakeOffsetX;
+        double curY = y + shakeOffsetY;
+        sx = (wx - curX) * zoom + (double)viewWidth * 0.5;
+        sy = (wy - curY) * zoom + (double)viewHeight * 0.5;
+    }
+
+    /// <summary>屏幕像素坐标转换为世界坐标（例如鼠标点击位置拾取）。</summary>
+    void ScreenToWorld(double sx, double sy, out double wx, out double wy) {
+        double curX = x + shakeOffsetX;
+        double curY = y + shakeOffsetY;
+        wx = (sx - (double)viewWidth * 0.5) / zoom + curX;
+        wy = (sy - (double)viewHeight * 0.5) / zoom + curY;
+    }
+
+    /// <summary>
+    /// 视锥范围裁剪判定：判断一个世界矩形是否在屏幕可见范围内。
+    /// </summary>
+    bool IsVisible(double wx, double wy, double w, double h) {
+        double curX = x + shakeOffsetX;
+        double curY = y + shakeOffsetY;
+        double halfW = ((double)viewWidth * 0.5) / zoom;
+        double halfH = ((double)viewHeight * 0.5) / zoom;
+
+        double left = curX - halfW;
+        double right = curX + halfW;
+        double top = curY - halfH;
+        double bottom = curY + halfH;
+
+        if (wx + w < left || wx > right || wy + h < top || wy > bottom) {
+            return false;
+        }
+        return true;
+    }
+}

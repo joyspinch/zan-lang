@@ -1,0 +1,233 @@
+using System;
+
+namespace Game.Tactics;
+
+/// <summary>
+/// 海量单位集群流场寻路系统（Flow Field Pathfinding）。
+/// 解决红警、帝国时代、千万塔防怪群的寻路 CPU 爆炸问题。
+/// 算法原理：
+/// 1. 代价图（Cost Field）：障碍物与地形通行阻力。
+/// 2. 集成场（Integration Field）：以目标点为基准的波前扩散（Dijkstra/BFS）。
+/// 3. 向量场（Vector Field / Flow Field）：每个格子预先计算出指向最小代价邻居的移动方向向量。
+/// 无论视野内有 100 只怪还是 10,000 只怪，每个单位只需要 O(1) 地读取所在格子的向量即可完美避障并直奔目标！
+/// </summary>
+class FlowField {
+    int cols;
+    int rows;
+    int cellSize;
+
+    byte[] costField;           // 0~254: 通行代价(默认1), 255: 不可通行障碍
+    int[] integrationField;     // 到达目标的累计总代价(65535 为不可达)
+    float[] flowDirX;           // X 方向单位流动向量 [-1.0 .. 1.0]
+    float[] flowDirY;           // Y 方向单位流动向量 [-1.0 .. 1.0]
+
+    // 广度优先循环队列（零堆分配复用）
+    int[] queueX;
+    int[] queueY;
+    int queueHead;
+    int queueTail;
+    int queueCap;
+
+    int targetCol;
+    int targetRow;
+    bool isDirty;
+
+    FlowField(int cols, int rows, int cellSize) {
+        this.cols = cols > 0 ? cols : 64;
+        this.rows = rows > 0 ? rows : 64;
+        this.cellSize = cellSize > 0 ? cellSize : 32;
+
+        int totalCells = this.cols * this.rows;
+        this.costField = new byte[totalCells];
+        this.integrationField = new int[totalCells];
+        this.flowDirX = new float[totalCells];
+        this.flowDirY = new float[totalCells];
+
+        this.queueCap = totalCells + 1;
+        this.queueX = new int[queueCap];
+        this.queueY = new int[queueCap];
+        this.queueHead = 0;
+        this.queueTail = 0;
+
+        this.targetCol = -1;
+        this.targetRow = -1;
+        this.isDirty = true;
+
+        ResetCost();
+    }
+
+    static FlowField Create(int cols, int rows, int cellSize) {
+        return new FlowField(cols, rows, cellSize);
+    }
+
+    int Cols { get { return cols; } }
+    int Rows { get { return rows; } }
+    int CellSize { get { return cellSize; } }
+
+    int Index(int c, int r) {
+        return r * cols + c;
+    }
+
+    /// <summary>重置整个地图代价（默认全部通行代价为 1）。</summary>
+    void ResetCost() {
+        int total = cols * rows;
+        for (int i = 0; i < total; i = i + 1) {
+            costField[i] = (byte)1;
+            integrationField[i] = 65535;
+            flowDirX[i] = 0.0f;
+            flowDirY[i] = 0.0f;
+        }
+        isDirty = true;
+    }
+
+    /// <summary>设置指定格子的代价（255 代表不可通行的墙壁或建筑物）。</summary>
+    void SetCost(int col, int row, byte cost) {
+        if (col < 0 || col >= cols || row < 0 || row >= rows) { return; }
+        int idx = Index(col, row);
+        if (costField[idx] != cost) {
+            costField[idx] = cost;
+            isDirty = true;
+        }
+    }
+
+    /// <summary>判断指定格子是否为障碍物。</summary>
+    bool IsBlocked(int col, int row) {
+        if (col < 0 || col >= cols || row < 0 || row >= rows) { return true; }
+        return costField[Index(col, row)] >= (byte)255;
+    }
+
+    /// <summary>指定流场汇聚的目的地（例如水晶、基地、领袖角色）。</summary>
+    void SetTarget(int col, int row) {
+        if (col < 0 || col >= cols || row < 0 || row >= rows) { return; }
+        if (targetCol != col || targetRow != row) {
+            targetCol = col;
+            targetRow = row;
+            isDirty = true;
+        }
+    }
+
+    /// <summary>
+    /// 重构集成场与向量场。
+    /// 只有在障碍物发生变化或目标移动时才需调用。
+    /// </summary>
+    void Rebuild() {
+        if (targetCol < 0 || targetRow < 0) { return; }
+
+        int total = cols * rows;
+        for (int i = 0; i < total; i = i + 1) {
+            integrationField[i] = 65535;
+            flowDirX[i] = 0.0f;
+            flowDirY[i] = 0.0f;
+        }
+
+        // 目标点集成代价为 0
+        int targetIdx = Index(targetCol, targetRow);
+        integrationField[targetIdx] = 0;
+
+        // BFS 队列初始化
+        queueHead = 0;
+        queueTail = 0;
+        queueX[queueTail] = targetCol;
+        queueY[queueTail] = targetRow;
+        queueTail = queueTail + 1;
+
+        // 1. 波前扩散计算集成场 (Integration Field)
+        int[] dCol = new int[4] { 1, -1, 0, 0 };
+        int[] dRow = new int[4] { 0, 0, 1, -1 };
+
+        while (queueHead != queueTail) {
+            int curC = queueX[queueHead];
+            int curR = queueY[queueHead];
+            queueHead = (queueHead + 1) % queueCap;
+
+            int curIntCost = integrationField[Index(curC, curR)];
+
+            for (int i = 0; i < 4; i = i + 1) {
+                int nc = curC + dCol[i];
+                int nr = curR + dRow[i];
+
+                if (nc >= 0 && nc < cols && nr >= 0 && nr < rows) {
+                    int nIdx = Index(nc, nr);
+                    byte cCost = costField[nIdx];
+                    if (cCost < (byte)255) {
+                        int newCost = curIntCost + (int)cCost;
+                        if (newCost < integrationField[nIdx]) {
+                            integrationField[nIdx] = newCost;
+                            queueX[queueTail] = nc;
+                            queueY[queueTail] = nr;
+                            queueTail = (queueTail + 1) % queueCap;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. 计算向量场 (Vector Field)
+        // 遍历所有 8 个邻居寻找集成代价最小的邻居，求出下坡方向向量
+        int[] n8C = new int[8] { 0, 1, 1, 1, 0, -1, -1, -1 };
+        int[] n8R = new int[8] { -1, -1, 0, 1, 1, 1, 0, -1 };
+
+        for (int r = 0; r < rows; r = r + 1) {
+            for (int c = 0; c < cols; c = c + 1) {
+                int idx = Index(c, r);
+                if (costField[idx] >= (byte)255 || (c == targetCol && r == targetRow)) {
+                    continue;
+                }
+
+                int bestCost = integrationField[idx];
+                int bestDir = -1;
+
+                for (int d = 0; d < 8; d = d + 1) {
+                    int nc = c + n8C[d];
+                    int nr = r + n8R[d];
+
+                    if (nc >= 0 && nc < cols && nr >= 0 && nr < rows) {
+                        int nIdx = Index(nc, nr);
+                        if (costField[nIdx] < (byte)255) {
+                            int nCost = integrationField[nIdx];
+                            if (nCost < bestCost) {
+                                bestCost = nCost;
+                                bestDir = d;
+                            }
+                        }
+                    }
+                }
+
+                if (bestDir >= 0) {
+                    float vx = (float)n8C[bestDir];
+                    float vy = (float)n8R[bestDir];
+                    float len = (float)Math.Sqrt((double)(vx * vx + vy * vy));
+                    if (len > 0.0001f) {
+                        flowDirX[idx] = vx / len;
+                        flowDirY[idx] = vy / len;
+                    }
+                }
+            }
+        }
+
+        isDirty = false;
+    }
+
+    /// <summary>
+    /// O(1) 采样任意世界坐标处的流场速度方向向量。
+    /// 输出单位化向量 (vx, vy)。
+    /// </summary>
+    void SampleWorldVelocity(double wx, double wy, out float vx, out float vy) {
+        if (isDirty) {
+            Rebuild();
+        }
+
+        int c = (int)Math.Floor(wx / (double)cellSize);
+        int r = (int)Math.Floor(wy / (double)cellSize);
+
+        if (c < 0 || c >= cols || r < 0 || r >= rows) {
+            vx = 0.0f;
+            vy = 0.0f;
+            return;
+        }
+
+        int idx = Index(c, r);
+        vx = flowDirX[idx];
+        vy = flowDirY[idx];
+    }
+}

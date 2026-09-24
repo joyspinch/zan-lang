@@ -1,0 +1,136 @@
+using System;
+
+namespace Game.Arpg;
+
+/// <summary>
+/// 经典 ARPG 爆装与金币四散飞出弹跳物理系统（“怪物大爆”）。
+/// 模拟物品从怪物体内向四周抛射、在重力作用下抛物线运动并在地面多次弹性跳跃落地的全套真实物理轨迹。
+/// </summary>
+class LootScatter {
+    int capacity;
+    int activeCount;
+
+    bool[] active;
+    int[] itemIds;
+    int[] itemTypes;    // 0:金币, 1:药水, 2:普通装备, 3:极品神装
+    double[] posX;      // 世界地表 X
+    double[] posY;      // 世界地表 Y
+    double[] posZ;      // 距离地面的浮空高度 Z (像素)
+    double[] velX;      // 水平速度 X
+    double[] velY;      // 水平速度 Y
+    double[] velZ;      // 垂直向上的弹跳速度 Z
+    int[] bounceCount;  // 剩余弹跳次数
+    bool[] isSettled;   // 是否已平稳落地可拾取
+    Random rnd;
+
+    LootScatter(int cap) {
+        this.capacity = cap > 0 ? cap : 512;
+        this.activeCount = 0;
+        this.rnd = new Random();
+
+        this.active = new bool[capacity];
+        this.itemIds = new int[capacity];
+        this.itemTypes = new int[capacity];
+        this.posX = new double[capacity];
+        this.posY = new double[capacity];
+        this.posZ = new double[capacity];
+        this.velX = new double[capacity];
+        this.velY = new double[capacity];
+        this.velZ = new double[capacity];
+        this.bounceCount = new int[capacity];
+        this.isSettled = new bool[capacity];
+    }
+
+    static LootScatter Create(int cap) {
+        return new LootScatter(cap);
+    }
+
+    int ActiveCount { get { return activeCount; } }
+    bool IsActive(int idx) { return active[idx]; }
+    bool IsSettled(int idx) { return isSettled[idx]; }
+    double GetX(int idx) { return posX[idx]; }
+    double GetY(int idx) { return posY[idx] - posZ[idx]; } // 屏幕渲染坐标加上高度 Z 偏移
+    double GetGroundY(int idx) { return posY[idx]; }
+    int GetType(int idx) { return itemTypes[idx]; }
+    int GetItemId(int idx) { return itemIds[idx]; }
+
+    /// <summary>
+    /// 在 (originX, originY) 处引爆多件战利品向四周喷射。
+    /// </summary>
+    void Burst(double originX, double originY, int count, int startItemId) {
+        for (int i = 0; i < count; i = i + 1) {
+            int slot = -1;
+            for (int s = 0; s < capacity; s = s + 1) {
+                if (!active[s]) {
+                    slot = s;
+                    break;
+                }
+            }
+            if (slot < 0) { break; }
+
+            active[slot] = true;
+            itemIds[slot] = startItemId + i;
+            itemTypes[slot] = (i == 0) ? 3 : (i % 3); // 第一件为极品神装
+            posX[slot] = originX;
+            posY[slot] = originY;
+            posZ[slot] = 10.0;
+
+            // 随机 360 度向外喷射
+            double angle = ((double)rnd.NextBelow(360) / 180.0) * 3.14159265;
+            double hSpeed = 80.0 + (double)rnd.NextBelow(160); // 水平抛射速度
+            velX[slot] = Math.Cos(angle) * hSpeed;
+            velY[slot] = Math.Sin(angle) * hSpeed * 0.5; // 椭圆等轴比例
+            velZ[slot] = 180.0 + (double)rnd.NextBelow(120); // 向上初速度
+            bounceCount[slot] = 3;
+            isSettled[slot] = false;
+
+            activeCount = activeCount + 1;
+        }
+    }
+
+    /// <summary>逐物理步长更新弹跳重力模拟。</summary>
+    void Update(double dt) {
+        double gravity = 600.0; // 重力加速度 (px/s^2)
+
+        for (int i = 0; i < capacity; i = i + 1) {
+            if (!active[i] || isSettled[i]) { continue; }
+
+            // 水平滑行衰减
+            posX[i] = posX[i] + velX[i] * dt;
+            posY[i] = posY[i] + velY[i] * dt;
+            velX[i] = velX[i] * Math.Max(0.0, 1.0 - dt * 2.0);
+            velY[i] = velY[i] * Math.Max(0.0, 1.0 - dt * 2.0);
+
+            // 垂直跳跃
+            posZ[i] = posZ[i] + velZ[i] * dt;
+            velZ[i] = velZ[i] - gravity * dt;
+
+            // 触地检测
+            if (posZ[i] <= 0.0) {
+                posZ[i] = 0.0;
+                if (bounceCount[i] > 0) {
+                    bounceCount[i] = bounceCount[i] - 1;
+                    velZ[i] = -velZ[i] * 0.45; // 45% 弹性恢复系数
+                    velX[i] = velX[i] * 0.6;
+                    velY[i] = velY[i] * 0.6;
+                } else {
+                    // 彻底落地静止
+                    velX[i] = 0.0;
+                    velY[i] = 0.0;
+                    velZ[i] = 0.0;
+                    isSettled[i] = true;
+                }
+            }
+        }
+    }
+
+    /// <summary>拾取战利品。</summary>
+    bool Collect(int slot) {
+        if (slot >= 0 && slot < capacity && active[slot] && isSettled[slot]) {
+            active[slot] = false;
+            activeCount = activeCount - 1;
+            return true;
+        }
+        return false;
+    }
+}

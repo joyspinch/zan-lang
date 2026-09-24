@@ -1216,7 +1216,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         /* Math.Sin/Cos/Tan/Log/Exp(expr) → libm call (double -> double) */
         {
             static const char *math1[] = { "Sin", "sin", "Cos", "cos", "Tan", "tan",
-                                           "Log", "log", "Exp", "exp", NULL };
+                                           "Log", "log", "Exp", "exp",
+                                           "Atan", "atan", "Asin", "asin", "Acos", "acos", NULL };
             for (int mi = 0; math1[mi]; mi += 2) {
                 if (!zan_type_defines(g, "Math", math1[mi]) &&
                     is_call_to(expr, "Math", math1[mi]) && expr->call.args.count == 1) {
@@ -1233,6 +1234,31 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     return zan_call2(g->builder, fty, fn, &arg, 1, math1[mi + 1]);
                 }
             }
+        }
+
+        /* Math.Atan2(y, x) */
+        if (!zan_type_defines(g, "Math", "Atan2") &&
+            is_call_to(expr, "Math", "Atan2") && expr->call.args.count == 2) {
+            LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
+            LLVMValueRef y_v = emit_expr(g, expr->call.args.items[0], locals);
+            LLVMValueRef x_v = emit_expr(g, expr->call.args.items[1], locals);
+            if (LLVMGetTypeKind(LLVMTypeOf(y_v)) == LLVMIntegerTypeKind)
+                y_v = LLVMBuildSIToFP(g->builder, y_v, dbl, "tofp");
+            else if (LLVMGetTypeKind(LLVMTypeOf(y_v)) == LLVMFloatTypeKind)
+                y_v = LLVMBuildFPExt(g->builder, y_v, dbl, "ext");
+            if (LLVMGetTypeKind(LLVMTypeOf(x_v)) == LLVMIntegerTypeKind)
+                x_v = LLVMBuildSIToFP(g->builder, x_v, dbl, "tofp");
+            else if (LLVMGetTypeKind(LLVMTypeOf(x_v)) == LLVMFloatTypeKind)
+                x_v = LLVMBuildFPExt(g->builder, x_v, dbl, "ext");
+            LLVMValueRef atan2_fn = LLVMGetNamedFunction(g->mod, "atan2");
+            if (!atan2_fn) {
+                LLVMTypeRef atan2_args[] = { dbl, dbl };
+                LLVMTypeRef atan2_type = LLVMFunctionType(dbl, atan2_args, 2, 0);
+                atan2_fn = LLVMAddFunction(g->mod, "atan2", atan2_type);
+            }
+            LLVMValueRef args[] = { y_v, x_v };
+            return zan_call2(g->builder, LLVMFunctionType(dbl, (LLVMTypeRef[]){ dbl, dbl }, 2, 0),
+                atan2_fn, args, 2, "atan2");
         }
 
         /* Math.Abs(expr) */
