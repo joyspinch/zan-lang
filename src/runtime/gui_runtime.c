@@ -3851,13 +3851,42 @@ EXPORT i32 zan_gui_image_load_svg(const char *key, const char *text, i32 len,
  * i*src/dst pinned destination column 0 to source column 0 and duplicated the
  * left/top edge, so upscaled sprites hugged one corner. 1:1 is exact under
  * both formulas, so unscaled blits are bit-identical to before. */
-static void cpu_blit_image(zan_surface_t *s, const char *path,
-                           int dx, int dy, int dw, int dh,
-                           int sx, int sy, int sw, int sh)
+/* ---- sprite registry: stable int handles over cached images (A356) ----
+ * A game frame submits sprites by handle, not by path, so one packed batch
+ * crosses the FFI once per (layer, atlas). Handles index this registry of
+ * keys; the decode cache stays free to evict (a sprite whose image was
+ * evicted re-decodes on next use, same key -> same pixels -> same texture). */
+#define ZAN_SPRITE_CAP 256
+typedef struct {
+    char key[512];       /* path or "mem:" key, resolved via zan_img_load */
+    unsigned int tex;    /* GL texture; 0 until the GPU backend uploads it */
+} zan_sprite_t;
+static zan_sprite_t g_sprites[ZAN_SPRITE_CAP];
+static int g_sprite_n = 0;
+
+static int zan_sprite_handle(const char *key) {
+    int i;
+    if (!key || !key[0]) return 0;
+    for (i = 0; i < g_sprite_n; i++)
+        if (strcmp(g_sprites[i].key, key) == 0) return i + 1;
+    if (g_sprite_n >= ZAN_SPRITE_CAP) return 0;
+    if (!zan_img_load(key)) return 0;   /* must decode once to be usable */
+    snprintf(g_sprites[g_sprite_n].key, sizeof(g_sprites[0].key), "%s", key);
+    g_sprites[g_sprite_n].tex = 0;
+    g_sprite_n++;
+    return g_sprite_n;
+}
+
+static zan_sprite_t *zan_sprite_get(int handle) {
+    if (handle <= 0 || handle > g_sprite_n) return NULL;
+    return &g_sprites[handle - 1];
+}
+
+static void cpu_blit_img(zan_surface_t *s, zan_img_t *img, int tint,
+                         int dx, int dy, int dw, int dh,
+                         int sx, int sy, int sw, int sh)
 {
-    zan_img_t *img;
     int isx, isy, isw, ish, idx2, idy, idw, idh, x0, y0, x1, y1, py, px;
-    img = zan_img_load(path);
     if (!img) return;
     isx = sx; isy = sy; isw = sw; ish = sh;
     if (isw <= 0) { isx = 0; isw = img->w; }
@@ -3945,12 +3974,42 @@ static void cpu_blit_image(zan_surface_t *s, const char *path,
                    | (u32)((sg + ha) / n) << 8
                    | (u32)((sb + ha) / n);
             }
+            if (tint != -1)
+                sp = ((((sp >> 24) & 255) * ((tint >> 24) & 255) / 255) << 24)
+                   | ((((sp >> 16) & 255) * ((tint >> 16) & 255) / 255) << 16)
+                   | ((((sp >> 8) & 255) * ((tint >> 8) & 255) / 255) << 8)
+                   | (((sp & 255) * (tint & 255)) / 255);
             u32 dp = drow[px];
             u32 da = sp >> 24;
             if (da == 0) continue;
             if (da == 0xFF) { drow[px] = sp; continue; }
             drow[px] = blend_over(dp, sp);
         }
+    }
+}
+
+static void cpu_blit_image(zan_surface_t *s, const char *path,
+                           int dx, int dy, int dw, int dh,
+                           int sx, int sy, int sw, int sh)
+{
+    cpu_blit_img(s, zan_img_load(path), -1, dx, dy, dw, dh, sx, sy, sw, sh);
+}
+
+/* Packed sprite batch on the CPU path: one blit per quad out of the decoded
+ * pixels -- the same fixed-point scaler BlitImage uses, tint applied per
+ * channel (identity for the -1 sentinel). */
+static void cpu_sprite_batch(zan_surface_t *s, int handle,
+                             const float *quads, int count) {
+    zan_sprite_t *sp = zan_sprite_get(handle);
+    zan_img_t *img = sp ? zan_img_load(sp->key) : NULL;
+    int i;
+    if (!img) return;
+    for (i = 0; i < count; i++) {
+        const float *q = quads + i * 10;
+        u32 tint_raw;
+        memcpy(&tint_raw, q + 8, sizeof(u32));
+        cpu_blit_img(s, img, (int)tint_raw, (int)q[0], (int)q[1], (int)q[2],
+                     (int)q[3], (int)q[4], (int)q[5], (int)q[6], (int)q[7]);
     }
 }
 
@@ -3963,6 +4022,79 @@ EXPORT void zan_gui_blit_image(
     ZAN_IMPL(s, blit_image)->blit_image(s, path, (int)dx, (int)dy, (int)dw,
                                         (int)dh, (int)sx, (int)sy, (int)sw,
                                         (int)sh);
+}
+
+/* Register a sprite source and return its stable handle (>0; 0 = failure):
+ * `key` is an image path or an "mem:" key registered earlier through
+ * zan_gui_image_load_mem / _svg. Repeat calls return the same handle. */
+EXPORT i32 zan_gui_sprite_handle(const char *key) {
+    return zan_sprite_handle(key);
+}
+
+EXPORT i32 zan_gui_bake_sprite(const char *key, i32 surface_id,
+                               i32 x, i32 y, i32 w, i32 h) {
+    if (!key || !key[0]) return 0;
+    if (surface_id < 0 || surface_id >= g_surface_count || !g_surfaces[surface_id])
+        return 0;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (s->be) {
+        if (s->be->flush) s->be->flush(s);
+        if (s->be->read_pixels) s->be->read_pixels(s);
+    }
+    if (w <= 0) w = s->width;
+    if (h <= 0) h = s->height;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > s->width) w = s->width - x;
+    if (y + h > s->height) h = s->height - y;
+    if (w <= 0 || h <= 0) return 0;
+
+    u32 *pix = (u32 *)malloc((size_t)w * (size_t)h * sizeof(u32));
+    if (!pix) return 0;
+    for (int r = 0; r < h; r++) {
+        memcpy(pix + (size_t)r * (size_t)w,
+               s->pixels + (size_t)(y + r) * (size_t)s->stride + (size_t)x,
+               (size_t)w * sizeof(u32));
+    }
+
+    char full_key[512];
+    if (strncmp(key, "mem:", 4) == 0) {
+        strncpy(full_key, key, 511);
+    } else {
+        snprintf(full_key, sizeof(full_key), "mem:%s", key);
+    }
+    full_key[511] = '\0';
+
+    zan_img_t *e = zan_img_mem_find(full_key);
+    if (e) {
+        free(e->pix);
+        e->pix = pix;
+        e->w = w;
+        e->h = h;
+    } else {
+        zan_img_mem_put(full_key, pix, w, h);
+    }
+
+    int handle = zan_sprite_handle(full_key);
+    if (handle > 0) {
+        zan_sprite_t *sp = zan_sprite_get(handle);
+        if (sp && sp->tex) {
+            if (s->be && s->be->drop_tex) s->be->drop_tex(sp->tex);
+            sp->tex = 0;
+        }
+    }
+    return handle;
+}
+
+/* Submit a packed sprite batch (see zan_gui_backend::sprite_batch). */
+EXPORT void zan_gui_sprite_batch(i32 surf_id, i32 handle,
+                                 const float *quads, i32 count) {
+    zan_surface_t *s;
+    if (!quads || count <= 0) return;
+    if (surf_id < 0 || surf_id >= g_surface_count || !g_surfaces[surf_id])
+        return;
+    s = g_surfaces[surf_id];
+    ZAN_IMPL(s, sprite_batch)->sprite_batch(s, (int)handle, quads, (int)count);
 }
 
 /* ---- 3D: meshes and depth-tested draws ---------------------------------
@@ -4196,6 +4328,7 @@ const zan_gui_backend zan_cpu_backend = {
     .draw_text    = NULL,   /* the font engine is platform code, not a backend */
     .glyph_run    = cpu_glyph_run,
     .blit_image   = cpu_blit_image,
+    .sprite_batch = cpu_sprite_batch,
     .set_clip     = NULL,   /* the CPU path clips per pixel from the surface */
     .flush        = NULL,   /* nothing is queued: writes land in s->pixels */
     .read_pixels  = NULL,   /* the frame already is s->pixels */

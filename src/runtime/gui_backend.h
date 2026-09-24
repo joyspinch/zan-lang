@@ -219,6 +219,14 @@ typedef struct zan_gui_backend_s {
     void (*blit_image)(struct zan_surface_s *s, const char *path,
                        int dx, int dy, int dw, int dh,
                        int sx, int sy, int sw, int sh);
+    /* Packed sprite batch out of the image registered under `handle`
+     * (zan_gui_sprite_handle): quads holds count * 10 floats --
+     * dx, dy, dw, dh, sx, sy, sw, sh, tint (0xAABBGGRR, -1 = untinted),
+     * reserved. One call per (layer, atlas) lets a GPU backend append the
+     * quads to its textured vertex batch; the CPU backend blits them from
+     * the decoded pixels. Source w/h <= 0 means the whole image. */
+    void (*sprite_batch)(struct zan_surface_s *s, int handle,
+                         const float *quads, int count);
 
     /* --- 3D --------------------------------------------------------------- */
     /* Uploads a mesh and returns a backend-local id (>0), 0 on refusal. The
@@ -256,6 +264,8 @@ typedef struct zan_gui_backend_s {
      * GPU texture and framebuffer). Surface ids are recycled, so a backend that
      * keyed anything on the id must not carry it into the next surface. */
     void (*drop_surface)(struct zan_surface_s *s);
+    /* Drop a GPU sprite texture (e.g. when rebaking a sprite handle). */
+    void (*drop_tex)(unsigned int tex);
 
     /* --- keeping the two sides in step ---------------------------------- */
     /* A backend that keeps the frame somewhere other than s->pixels (a GPU

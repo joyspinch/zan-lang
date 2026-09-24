@@ -330,6 +330,19 @@ Post 调用核对编码，别信二手注释。
 - 内嵌资源全程内存加载（ReadAllBytes→内存解码），不落盘解压。字节链要
   显式长度——**内嵌 NUL 会截断**，音频/图片"随机坏一块"先查这里。
 
+## 渲染增强与精灵合批（SpriteBatch、烘焙与动画时间轴）
+
+- **精灵批量渲染（SpriteBatch）性能基线**：
+  - 弃用逐个 `DrawImage` 的高频开销，使用 `SpriteBatch` + GL `ZGL_K_SPRITE`（Kind 10）单批次提交成千上万个带 tint 颜色的四边形。万精灵批处理可在 0.1ms 内完成，完全满足 60fps 预算。
+  - **浮点转整型 NaN 踩坑规避**：C/GL 后端解析 tint 时，严禁把 float 数组槽位强转为 int `(int)q[8]`，因为 `0xFFFFFFFF`（纯白不透明）在 IEEE 754 浮点下是 NaN，x86 `cvttss2si` 指令会将其强制转换为 `0x80000000`（导致半透明纯黑）。必须使用 `memcpy(&tint_raw, q + 8, sizeof(u32))` 保持原始 bit 模式。
+- **离屏自绘烘焙为 GPU 纹理（BakeSprite）**：
+  - 复杂粒子、光环与动态生成的矢量图，可通过 `Canvas.FillCircle/DrawRect` 等离屏绘制后调用 `Canvas.BakeSprite(key, ...)` 直接写入 GPU 纹理缓存并获取 handle，供 `SpriteBatch` 单批次极速复用。
+  - 若重新烘焙同名 key，GL 后端自动销毁旧纹理并重绑，避免 GPU 句柄泄漏。
+- **动画驱动与按需出帧契约（Timeline.BindApp）**：
+  - 放置类游戏或交互界面最佳实践：使用 `Gui.Animation.Timeline.Shared.BindApp(app)`。当有 `Tween`、数值滚动或粒子发射时按需触发重绘；当动画结束时自动休眠，实现真正的 0% CPU 闲置占用。
+  - **App.Show() 后的表面重建契约**：`App.Show()` 内部会调用 `SwapCanvas()` 重新分配主表面，因此在 `Show()` 之前的 Canvas 句柄会失效，绘制代码中必须始终动态获取 `app.canvas`。
+  - **命名空间同名防坑**：`Gui.Widget.Timeline` 与 `Gui.Animation.Timeline` 类名同名时，在同时引用两命名空间的源码中，调用静态方法必须写全限定名 `Gui.Animation.Timeline`。
+
 ## 验证仪式（每轮全做）
 
 - 编译零错误 → **无头仿真**：模拟一个"会连点的中等玩家"打关，多种子

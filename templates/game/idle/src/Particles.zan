@@ -1,0 +1,174 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Rendering;
+
+namespace IdleGame;
+
+/// <summary>
+/// 纯数据轻量粒子。
+/// </summary>
+class Particle {
+    double x;
+    double y;
+    double vx;
+    double vy;
+    double life;
+    double maxLife;
+    double size;
+    int tint;
+    bool isCoin;
+
+    static Particle Spawn(double x, double y, double vx, double vy, double duration, double size, int tint, bool isCoin) {
+        Particle p = new Particle();
+        p.x = x;
+        p.y = y;
+        p.vx = vx;
+        p.vy = vy;
+        p.life = duration;
+        p.maxLife = duration;
+        p.size = size;
+        p.tint = tint;
+        p.isCoin = isCoin;
+        return p;
+    }
+
+    bool Step(double dt) {
+        life = life - dt;
+        if (life <= 0.0) { return false; }
+        x = x + vx * dt;
+        y = y + vy * dt;
+        vy = vy + 300.0 * dt; // 重力加速度
+        return true;
+    }
+
+    double Progress { get { return 1.0 - (life / maxLife); } }
+    double X { get { return x; } }
+    double Y { get { return y; } }
+    double Size { get { return size; } }
+    int Tint { get { return tint; } }
+    bool IsCoin { get { return isCoin; } }
+}
+
+/// <summary>
+/// 高性能粒子发射与批量渲染器（使用 SpriteBatch 统一合批）。
+/// </summary>
+class ParticleSystem {
+    List<Particle> particles;
+    SpriteBatch sb;
+    int coinSprite;
+    int sparkSprite;
+    Random rnd;
+
+    ParticleSystem() {
+        particles = new List<Particle>();
+        sb = SpriteBatch.Create(512);
+        rnd = new Random();
+        coinSprite = -1;
+        sparkSprite = -1;
+    }
+
+    static ParticleSystem Create() {
+        return new ParticleSystem();
+    }
+
+    /// <summary>
+    /// 初始化并把离屏绘制的矢量金币与火花烘焙为 GPU 精灵。
+    /// </summary>
+    void EnsureBaked(Canvas c) {
+        if (coinSprite >= 0) { return; }
+
+        // 1. 烘焙金币：金黄色圆圈 + 内部高亮
+        c.FillCircle(16, 16, 14, 0xFFEAB308); // 外金
+        c.DrawCircle(16, 16, 14, 0xFFCA8A04, 2);
+        c.FillCircle(16, 16, 9, 0xFFFACC15); // 内亮
+        c.DrawCircle(16, 16, 9, 0xFFCA8A04, 1);
+        c.BakeSprite("idle:coin", 0, 0, 32, 32);
+        coinSprite = c.SpriteHandle("idle:coin");
+
+        // 2. 烘焙火花星芒
+        c.FillRect(0, 0, 32, 32, 0x00000000);
+        c.FillCircle(16, 16, 12, 0x44FDE047);
+        c.FillCircle(16, 16, 6, 0xAAFEF08A);
+        c.FillCircle(16, 16, 2, 0xFFFFFFFF);
+        c.BakeSprite("idle:spark", 0, 0, 32, 32);
+        sparkSprite = c.SpriteHandle("idle:spark");
+    }
+
+    /// <summary>
+    /// 在点击点发射一组金币与火花爆炸。
+    /// </summary>
+    void Burst(double x, double y, int count) {
+        for (int i = 0; i < count; i = i + 1) {
+            double angle = ((double)rnd.NextBelow(360) / 180.0) * 3.14159265;
+            double speed = 120.0 + (double)rnd.NextBelow(180);
+            double vx = Math.Cos(angle) * speed;
+            double vy = -Math.Abs(Math.Sin(angle) * speed) - 50.0; // 向上炸开
+            double dur = 0.5 + (double)rnd.NextBelow(40) * 0.01;
+            particles.Add(Particle.Spawn(x, y, vx, vy, dur, 24.0, (int)0xFFFFFFFF, true));
+        }
+
+        // 额外伴随 4 颗火花
+        for (int i = 0; i < 4; i = i + 1) {
+            double vx = (double)(rnd.NextBelow(200) - 100);
+            double vy = (double)(rnd.NextBelow(200) - 120);
+            particles.Add(Particle.Spawn(x, y, vx, vy, 0.35, 16.0, (int)0xFFFEF08A, false));
+        }
+    }
+
+    bool HasActiveParticles {
+        get { return particles.Count > 0; }
+    }
+
+    void Update(double dt) {
+        int i = 0;
+        while (i < particles.Count) {
+            if (!particles[i].Step(dt)) {
+                particles.RemoveAt(i);
+            } else {
+                i = i + 1;
+            }
+        }
+    }
+
+    /// <summary>
+    /// 使用 SpriteBatch 一次性高效绘制所有活跃粒子。
+    /// </summary>
+    void Render(Canvas c) {
+        if (particles.Count == 0) { return; }
+        EnsureBaked(c);
+
+        sb.Begin();
+        for (int i = 0; i < particles.Count; i = i + 1) {
+            Particle p = particles[i];
+            int spr = p.IsCoin ? coinSprite : sparkSprite;
+            if (spr < 0) { continue; }
+
+            // 淡出效果：计算 alpha
+            double pgr = p.Progress;
+            int alpha = (int)((1.0 - pgr) * 255.0);
+            if (alpha < 0) { alpha = 0; }
+            if (alpha > 255) { alpha = 255; }
+            int tint = (alpha << 24) | (p.Tint & 0x00FFFFFF);
+
+            double sz = p.Size * (1.0 - pgr * 0.3); // 稍微缩小
+            float dx = (float)(p.X - sz * 0.5);
+            float dy = (float)(p.Y - sz * 0.5);
+            float dsz = (float)sz;
+
+            sb.Add(dx, dy, dsz, dsz, 0.0f, 0.0f, 32.0f, 32.0f, tint);
+        }
+
+        // 统一提交批次！
+        if (coinSprite >= 0) {
+            sb.Draw(c, coinSprite);
+        }
+    }
+
+    void Dispose() {
+        if (sb != null) {
+            sb.Dispose();
+            sb = null;
+        }
+    }
+}

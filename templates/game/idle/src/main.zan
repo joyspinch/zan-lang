@@ -1,0 +1,368 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+using Gui.Animation;
+using Gui.Rendering;
+
+namespace IdleGame;
+
+/// <summary>
+/// 核心开采视区控件：在控件自身区域内绘制动态矿晶与喷射粒子。
+/// </summary>
+class MineCoreView : Control {
+    Program host;
+
+    MineCoreView(Program host) {
+        this.InitControl("minecore", 1);
+        this.host = host;
+    }
+
+    override void OnPaint(App app) {
+        base.OnPaint(app);
+        Canvas c = app.canvas;
+        host.RenderMiningArea(c, this.bx, this.by, this.bw, this.bh);
+    }
+}
+
+class Program {
+    Form form;
+    App app;
+    GameState state;
+    ParticleSystem particles;
+
+    // 界面控件
+    Label lblGold;
+    Label lblDps;
+    Label lblClickPower;
+    List<Button> buyButtons;
+    List<Label> levelLabels;
+    List<Label> costLabels;
+    Progress autoMineBar;
+    MineCoreView coreView;
+
+    // 核心反应炉动画状态
+    double coreScale = 1.0;
+    Tween coreTween;
+    double autoProgress = 0.0;
+
+    // 统计弹窗浮层状态
+    double modalY = 800.0;
+    bool isModalOpen = false;
+
+    static void Main() {
+        Program p = new Program();
+        p.Run();
+    }
+
+    void Run() {
+        form = Form.CreateDark("放置矿工 · 地心开采 (Idle Miner)", 1024, 640);
+        app = form.GetApp();
+        app.UseSkin("dark");
+        Canvas.SetBackend(1); // 启用 GL 硬件加速后端
+
+        // 绑定 Timeline，按需驱动出帧
+        Gui.Animation.Timeline.Shared.BindApp(app);
+
+        state = GameState.CreateDefault();
+        particles = ParticleSystem.Create();
+        buyButtons = new List<Button>();
+        levelLabels = new List<Label>();
+        costLabels = new List<Label>();
+
+        BuildUi();
+
+        // 核心游戏逻辑时钟（每 100ms 刷新一次收益）
+        form.Every(100, () => {
+            state.Tick(0.1);
+
+            // 更新自动采矿进度条
+            autoProgress = autoProgress + 0.1;
+            if (autoProgress >= 1.0) {
+                autoProgress = 0.0;
+            }
+            if (autoMineBar != null) {
+                autoMineBar.SetPercent((int)(autoProgress * 100.0));
+            }
+
+            // 更新粒子
+            if (particles.HasActiveParticles) {
+                particles.Update(0.1);
+                app.RequestRedraw();
+            }
+
+            UpdateLabels();
+        });
+
+        form.OnExit(() => {
+            particles.Dispose();
+        });
+
+        form.Run();
+    }
+
+    void BuildUi() {
+        Panel root = Panel.Column();
+        root.Pad(16);
+        root.Gap(12);
+        form.Add(root);
+
+        // 1. 顶部资源栏
+        Panel topBar = Panel.Row();
+        topBar.Class = "card";
+        topBar.Pad(12);
+        topBar.Gap(24);
+        topBar.Prefer(0, 64);
+        root.With(topBar);
+
+        Label title = new Label("⚒ 放置矿工");
+        title.Class = "title strong";
+        topBar.With(title);
+
+        lblGold = new Label("金币: 0");
+        lblGold.Class = "large strong yellow";
+        topBar.With(lblGold);
+
+        lblDps = new Label("秒产: +0/s");
+        lblDps.Class = "medium green";
+        topBar.With(lblDps);
+
+        lblClickPower = new Label("单次挖掘: +1");
+        lblClickPower.Class = "medium cyan";
+        topBar.With(lblClickPower);
+
+        Button btnStats = new Button("📊 采矿统计");
+        btnStats.Class = "secondary";
+        btnStats.OnClick(() => {
+            ToggleModal();
+        });
+        topBar.With(btnStats);
+
+        // 2. 主体区（双栏：左侧开采核心，右侧建筑生产线）
+        Panel mainRow = Panel.Row();
+        mainRow.Gap(16);
+        mainRow.Grow();
+        root.With(mainRow);
+
+        // 左栏：矿石操作台
+        Panel leftCol = Panel.Column();
+        leftCol.Class = "card";
+        leftCol.Pad(16);
+        leftCol.Gap(16);
+        leftCol.Prefer(340, 0);
+        mainRow.With(leftCol);
+
+        Label coreTitle = new Label("地心矿晶核心");
+        coreTitle.Class = "title medium";
+        leftCol.With(coreTitle);
+
+        // 自定义矿石核心视图
+        coreView = new MineCoreView(this);
+        coreView.Prefer(300, 220);
+        coreView.OnClick(() => {
+            DoMine(coreView.bx + coreView.bw / 2, coreView.by + coreView.bh / 2);
+        });
+        leftCol.With(coreView);
+
+        Button btnMine = new Button("🔨 立即开采 (+1)");
+        btnMine.Class = "primary large";
+        btnMine.Prefer(0, 48);
+        btnMine.OnClick(() => {
+            DoMine(coreView.bx + coreView.bw / 2, coreView.by + coreView.bh / 2);
+        });
+        leftCol.With(btnMine);
+
+        Label lblAuto = new Label("自动开采循环");
+        lblAuto.Class = "secondary small";
+        leftCol.With(lblAuto);
+
+        autoMineBar = new Progress(0, 1);
+        autoMineBar.SetPercent(0);
+        autoMineBar.Prefer(0, 16);
+        leftCol.With(autoMineBar);
+
+        // 右栏：工业建筑列表
+        Panel rightCol = Panel.Column();
+        rightCol.Class = "card";
+        rightCol.Pad(12);
+        rightCol.Gap(8);
+        rightCol.Grow();
+        mainRow.With(rightCol);
+
+        Label listTitle = new Label("自动化生产矩阵");
+        listTitle.Class = "title medium";
+        rightCol.With(listTitle);
+
+        List<Building> list = state.Buildings;
+        for (int i = 0; i < list.Count; i = i + 1) {
+            Building b = list[i];
+            int idx = i;
+
+            Panel item = Panel.Row();
+            item.Class = "subcard";
+            item.Pad(8);
+            item.Gap(12);
+            item.Prefer(0, 62);
+            rightCol.With(item);
+
+            Panel infoCol = Panel.Column();
+            infoCol.Gap(2);
+            infoCol.Grow();
+            item.With(infoCol);
+
+            Label nameLbl = new Label(b.Name);
+            nameLbl.Class = "strong";
+            infoCol.With(nameLbl);
+
+            Label descLbl = new Label(b.Desc);
+            descLbl.Class = "secondary tiny";
+            infoCol.With(descLbl);
+
+            Label lvLbl = new Label("Lv." + Convert.ToString(b.Level));
+            lvLbl.Class = "cyan strong";
+            levelLabels.Add(lvLbl);
+            item.With(lvLbl);
+
+            Label costLbl = new Label("💰 " + Convert.ToString(b.Cost));
+            costLbl.Class = "yellow";
+            costLabels.Add(costLbl);
+            item.With(costLbl);
+
+            Button btnBuy = new Button("升级");
+            btnBuy.Class = "primary";
+            btnBuy.Prefer(70, 36);
+            btnBuy.OnClick(() => {
+                if (state.UpgradeBuilding(idx)) {
+                    UpdateLabels();
+                    app.RequestRedraw();
+                }
+            });
+            buyButtons.Add(btnBuy);
+            item.With(btnBuy);
+        }
+    }
+
+    /// <summary>
+    /// 手动点击矿石开采。
+    /// </summary>
+    void DoMine(double x, double y) {
+        state.Mine();
+
+        // 1. 触发矿晶弹性回弹动画（1.25 -> 1.0，使用 BackOut 曲线）
+        coreScale = 1.25;
+        if (coreTween != null) { coreTween.Stop(); }
+        coreTween = Gui.Animation.Timeline.To(1.25f, 1.0f, 350, EaseType.BackOut, (float val) => {
+            coreScale = (double)val;
+            app.RequestRedraw();
+        });
+
+        // 2. 喷射飞行动画金币与火花
+        particles.Burst(x, y, 6);
+
+        UpdateLabels();
+        app.RequestRedraw();
+    }
+
+    /// <summary>
+    /// 由 MineCoreView 驱动绘制动态矿石和粒子。
+    /// </summary>
+    void RenderMiningArea(Canvas c, int bx, int by, int bw, int bh) {
+        int cx = bx + bw / 2;
+        int cy = by + bh / 2;
+
+        // 根据 coreScale 计算半径
+        int r = (int)(55.0 * coreScale);
+
+        // 外层能量光晕
+        c.FillCircle(cx, cy, r + 15, 0x22F59E0B);
+        c.FillCircle(cx, cy, r + 8, 0x44F59E0B);
+
+        // 晶体六边形或多层圆环
+        c.FillCircle(cx, cy, r, 0xFFD97706);
+        c.DrawCircle(cx, cy, r, 0xFFFDE68A, 3);
+        c.FillCircle(cx, cy, (int)(r * 0.7), 0xFFF59E0B);
+        c.FillCircle(cx, cy, (int)(r * 0.4), 0xFFFEF3C7);
+
+        // 绘制粒子
+        particles.Render(c);
+
+        // 如果弹窗正在显示，绘制浮层
+        if (modalY < 700.0) {
+            RenderModal(c);
+        }
+    }
+
+    /// <summary>
+    /// 切换统计弹窗抽屉显示，带平滑上浮动画。
+    /// </summary>
+    void ToggleModal() {
+        isModalOpen = !isModalOpen;
+        double targetY = isModalOpen ? 180.0 : 800.0;
+        Gui.Animation.Timeline.To((float)modalY, (float)targetY, 400, EaseType.BackOut, (float val) => {
+            modalY = (double)val;
+            app.RequestRedraw();
+        });
+    }
+
+    void RenderModal(Canvas c) {
+        int mx = 260;
+        int my = (int)modalY;
+        int mw = 500;
+        int mh = 320;
+
+        // 半透明暗色遮罩
+        c.FillRect(0, 0, 1024, 640, 0x66000000);
+
+        // 模态弹窗卡片本体
+        c.FillRect(mx, my, mw, mh, 0xFF1F2937);
+        c.DrawRect(mx, my, mw, mh, 0xFF4B5563, 2);
+
+        // 标题与统计内容
+        c.FillRect(mx, my, mw, 48, 0xFF111827);
+        c.FillRect(mx + 20, my + 60, mw - 40, 1, 0xFF374151);
+        c.FillRect(mx + 24, my + 80, 12, 12, 0xFFF59E0B);
+    }
+
+    void UpdateLabels() {
+        if (lblGold != null) {
+            lblGold.Text = "金币: " + FormatNumber(state.Gold);
+        }
+        if (lblDps != null) {
+            lblDps.Text = "秒产: +" + FormatNumber(state.TotalDps) + "/s";
+        }
+        if (lblClickPower != null) {
+            lblClickPower.Text = "单次挖掘: +" + Convert.ToString(state.ClickPower);
+        }
+
+        List<Building> list = state.Buildings;
+        for (int i = 0; i < list.Count; i = i + 1) {
+            Building b = list[i];
+            if (i < levelLabels.Count) {
+                levelLabels[i].Text = "Lv." + Convert.ToString(b.Level);
+            }
+            if (i < costLabels.Count) {
+                costLabels[i].Text = "💰 " + FormatNumber((double)b.Cost);
+            }
+            if (i < buyButtons.Count) {
+                bool canAfford = state.CanAfford(b);
+                buyButtons[i].Disabled = !canAfford;
+            }
+        }
+    }
+
+    string FormatNumber(double n) {
+        if (n >= 1000000000.0) {
+            double b = n / 1000000000.0;
+            return Convert.ToString((int)b) + "." + Convert.ToString(((int)(b * 10.0)) % 10) + "B";
+        }
+        if (n >= 1000000.0) {
+            double m = n / 1000000.0;
+            return Convert.ToString((int)m) + "." + Convert.ToString(((int)(m * 10.0)) % 10) + "M";
+        }
+        if (n >= 1000.0) {
+            double k = n / 1000.0;
+            return Convert.ToString((int)k) + "." + Convert.ToString(((int)(k * 10.0)) % 10) + "K";
+        }
+        return Convert.ToString((long)n);
+    }
+}

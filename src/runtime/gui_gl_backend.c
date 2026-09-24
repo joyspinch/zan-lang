@@ -69,6 +69,7 @@ typedef enum {
 #define ZGL_K_UNION   7   /* sample completed polyline coverage */
 #define ZGL_K_TEXTRGBA 9 /* color glyph tile: own BGRA + straight alpha */
 #define ZGL_K_SURFACE 8   /* combined rounded fill and border */
+#define ZGL_K_SPRITE  10  /* textured quad from the sprite registry (A356) */
 
 /* Tile side for the upload comparison below: 64x64 is 16 KiB of pixels, small
  * enough that a scrolled list or a hovered button touches few tiles, large
@@ -96,6 +97,9 @@ static struct {
     zgl_int  u_viewport_shape, u_viewport_text, u_atlas1, u_atlas4, u_coverage,
              u_destination;
     zgl_uint atlas1, atlas4;         /* R8 and RGBA8 glyph atlases */
+    zgl_int  u_atlas2;               /* sprite batch sampler (shape program) */
+    int      sprite_handle;          /* handle whose texture unit 2 holds */
+    zgl_uint sprite_tex;             /* 0 = no sprite batch in flight */
     float   *verts;
     size_t   count, cap;             /* in floats */
     zgl_mode mode;
@@ -161,6 +165,7 @@ static const char *ZGL_FS_SHAPE =
 ZGL_FS_COMMON
 "uniform sampler2D uCoverage;\n"
 "uniform sampler2D uDestination;\n"
+"uniform sampler2D uAtlas2;\n"
 "vec4 over(vec4 src) {\n"
 "    vec4 dst = texelFetch(uDestination, ivec2(gl_FragCoord.xy), 0);\n"
 "    vec4 s = floor(clamp(src, 0.0, 1.0)*255.0 + 0.0001);\n"
@@ -283,6 +288,12 @@ ZGL_FS_COMMON
 "        if (alpha <= 0.0) discard;\n"
 "        o_color = over(vec4((v_col0.rgb * fill + v_col1.rgb * border) / alpha, alpha));\n"
 "        return;\n"
+"    }\n"
+/* Textured sprite: straight-alpha texel scaled by the tint colour; the
+   regular BLEND pipeline does the source-over. */
+"    if (kind == 10) {\n"
+"        col = texture(uAtlas2, v_uv) * v_col0;\n"
+"        cov = 1.0;\n"
 "    }\n"
 "    if (cov <= 0.0) discard;\n"
 "    o_color = (kind == 4 && v_kind.y > 0.5) ? vec4(cov)\n"
@@ -434,6 +445,7 @@ static int zgl_init(void) {
     g_zgl.u_viewport_text = gl.GetUniformLocation(g_zgl.prog_text, "uViewport");
     g_zgl.u_coverage = gl.GetUniformLocation(g_zgl.prog_shape, "uCoverage");
     g_zgl.u_destination = gl.GetUniformLocation(g_zgl.prog_shape, "uDestination");
+    g_zgl.u_atlas2 = gl.GetUniformLocation(g_zgl.prog_shape, "uAtlas2");
     g_zgl.u_atlas1 = gl.GetUniformLocation(g_zgl.prog_text, "uAtlas1");
     g_zgl.u_atlas4 = gl.GetUniformLocation(g_zgl.prog_text, "uAtlas4");
 
@@ -956,6 +968,15 @@ static void zgl_flush(void) {
         if (g_zgl.mode != ZGL_MODE_UNION) {
             gl.BindTexture(ZGL_TEXTURE_2D, t->cov_tex);
             gl.Uniform1i(g_zgl.u_coverage, 0);
+        }
+        /* Sprite batch texture rides unit 2 (0 = coverage, 1 = destination
+         * snapshot / text atlas4). Bound whenever a sprite batch is in
+         * flight; sticky across flushes until the handle changes. */
+        if (g_zgl.sprite_tex) {
+            gl.ActiveTexture(ZGL_TEXTURE2);
+            gl.BindTexture(ZGL_TEXTURE_2D, g_zgl.sprite_tex);
+            gl.Uniform1i(g_zgl.u_atlas2, 2);
+            gl.ActiveTexture(ZGL_TEXTURE0);
         }
         if (g_zgl.mode == ZGL_MODE_REPLACE || shader_over) {
             gl.Disable(ZGL_BLEND);
@@ -1636,6 +1657,95 @@ static void gl_drop_surface(zan_surface_t *s) {
     memset(t, 0, sizeof(*t));
 }
 
+static void gl_drop_tex(unsigned int tex) {
+    if (g_gl_state > 0 && tex) {
+        if (g_zgl.sprite_tex == tex) {
+            zgl_flush();
+            g_zgl.sprite_tex = 0;
+            g_zgl.sprite_handle = 0;
+        }
+        zan_gl_ctx_make_current();
+        gl.DeleteTextures(1, &tex);
+    }
+}
+
+/* ---- textured sprite batch (A356 P0) -----------------------------------*/
+
+/* Upload the handle's image once; the texture lives in the sprite registry
+ * entry, so decode-cache eviction + re-decode does not re-create it. */
+static zgl_uint zgl_sprite_tex(int handle) {
+    zan_sprite_t *sp = zan_sprite_get(handle);
+    zan_img_t *img;
+    zgl_uint tex;
+    if (!sp) return 0;
+    if (sp->tex) return (zgl_uint)sp->tex;
+    img = zan_img_load(sp->key);
+    if (!img) return 0;
+    gl.GenTextures(1, &tex);
+    gl.BindTexture(ZGL_TEXTURE_2D, tex);
+    gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MIN_FILTER, ZGL_LINEAR);
+    gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MAG_FILTER, ZGL_LINEAR);
+    gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_S, ZGL_CLAMP_TO_EDGE);
+    gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_T, ZGL_CLAMP_TO_EDGE);
+    gl.PixelStorei(ZGL_UNPACK_ROW_LENGTH, 0);
+    /* zan_img_t holds ARGB32 (a<<24|r<<16|g<<8|b, memory B,G,R,A); GL wants
+     * bytes in sampling order -- BGRA reads the same memory straight across. */
+    gl.TexImage2D(ZGL_TEXTURE_2D, 0, ZGL_RGBA8, img->w, img->h, 0, ZGL_BGRA,
+                  ZGL_UNSIGNED_BYTE, img->pix);
+    if (gl.GetError() != ZGL_NO_ERROR) { gl.DeleteTextures(1, &tex); return 0; }
+    sp->tex = (unsigned int)tex;
+    return tex;
+}
+
+static void zgl_sprite_batch(zan_surface_t *s, int handle,
+                             const float *quads, int count) {
+    zan_sprite_t *sp;
+    zan_img_t *img;
+    zgl_uint tex;
+    int iw, ih, i;
+    tex = zgl_sprite_tex(handle);
+    if (!tex) return;
+    if (!zgl_begin(s, ZGL_MODE_BLEND)) {
+        /* GPU cannot take the primitive (no target / dead context): the
+         * surface's pixels are the truth, same seam the shape entries use. */
+        cpu_sprite_batch(s, handle, quads, count);
+        return;
+    }
+    if (g_zgl.sprite_handle != handle || g_zgl.sprite_tex != tex) {
+        zgl_flush();             /* never switch atlases mid-batch */
+        g_zgl.sprite_handle = handle;
+        g_zgl.sprite_tex = tex;
+    }
+    sp = zan_sprite_get(handle);
+    img = zan_img_load(sp->key);
+    if (!img) return;
+    iw = img->w; ih = img->h;
+    for (i = 0; i < count; i++) {
+        const float *q = quads + i * 10;
+        u32 tint_raw;
+        zgl_quad sq;
+        float dx = q[0], dy = q[1], dw = q[2], dh = q[3];
+        float sx = q[4], sy = q[5], sw = q[6], sh = q[7];
+        memcpy(&tint_raw, q + 8, sizeof(u32));
+        memset(&sq, 0, sizeof(sq));
+        sq.kind = ZGL_K_SPRITE;
+        if (dw <= 0.0f) dw = (float)iw;
+        if (dh <= 0.0f) dh = (float)ih;
+        if (sw <= 0.0f) { sx = 0.0f; sw = (float)iw; }
+        if (sh <= 0.0f) { sy = 0.0f; sh = (float)ih; }
+        sq.cx = dx + dw * 0.5f;
+        sq.cy = dy + dh * 0.5f;
+        sq.hw = dw * 0.5f;
+        sq.hh = dh * 0.5f;
+        sq.u0 = sx / (float)iw;
+        sq.v0 = sy / (float)ih;
+        sq.u1 = (sx + sw) / (float)iw;
+        sq.v1 = (sy + sh) / (float)ih;
+        zgl_color(sq.col0, tint_raw, 0);
+        zgl_push(s, &sq, dx, dy, dx + dw, dy + dh);
+    }
+}
+
 static const zan_gui_backend zan_gl_backend = {
     .name         = "gl",
     .clear_rect   = gl_clear_rect,
@@ -1661,6 +1771,7 @@ static const zan_gui_backend zan_gl_backend = {
     .draw_text    = NULL,
     .glyph_run    = gl_glyph_run,
     .blit_image   = NULL,
+    .sprite_batch = zgl_sprite_batch,
     .mesh_create  = gl_mesh_create,
     .draw3d       = gl_draw3d,
     .set_clip     = gl_set_clip,
@@ -1669,6 +1780,7 @@ static const zan_gui_backend zan_gl_backend = {
     .present      = gl_present,
     .drop_window  = gl_drop_window,
     .drop_surface = gl_drop_surface,
+    .drop_tex     = gl_drop_tex,
     .sync_to_cpu  = gl_sync_to_cpu,
     .sync_from_cpu = gl_sync_from_cpu,
 };

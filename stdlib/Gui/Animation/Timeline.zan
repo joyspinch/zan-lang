@@ -1,0 +1,163 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+
+namespace Gui.Animation;
+
+/// <summary>
+/// 动画时间轴与调度器（A356 P0 动画引擎基座）：
+/// 集中管理所有活跃的值动画与精灵动画。
+/// 与 App 联动实现"有动画自动出帧、无动画彻底静默"的按需重绘，
+/// 并提供对象池避免高频飘字、掉落动画的垃圾颠簸。
+/// </summary>
+class Timeline {
+    static Timeline shared;
+
+    public static Timeline Shared {
+        get {
+            if (shared == null) { shared = new Timeline(); }
+            return shared;
+        }
+    }
+
+    List<Tween> tweens;
+    List<SpriteAnimator> animators;
+    List<Tween> tweenPool;
+    App boundApp;
+
+    public Timeline() {
+        this.tweens = new List<Tween>();
+        this.animators = new List<SpriteAnimator>();
+        this.tweenPool = new List<Tween>();
+        this.boundApp = null;
+    }
+
+    /// <summary>绑定主应用窗口。动画更新时自动触发 RequestRedraw。</summary>
+    public void BindApp(App app) {
+        this.boundApp = app;
+    }
+
+    /// <summary>是否有动画正在活跃播放。</summary>
+    public bool HasActive() {
+        return this.tweens.Count > 0 || this.animators.Count > 0;
+    }
+
+    /// <summary>从对象池获取或新建一个 Tween。</summary>
+    public Tween ObtainTween(float fromVal, float toVal, int durationMs,
+                             int easeType, Action<float> onUpdate) {
+        Tween t;
+        if (this.tweenPool.Count > 0) {
+            int lastIdx = this.tweenPool.Count - 1;
+            t = this.tweenPool[lastIdx];
+            this.tweenPool.RemoveAt(lastIdx);
+        } else {
+            t = new Tween();
+        }
+        t.fromVal = fromVal;
+        t.toVal = toVal;
+        t.durationMs = durationMs > 0 ? durationMs : 1;
+        t.easeType = easeType;
+        t.updateAction = onUpdate;
+        t.completeAction = null;
+        return t;
+    }
+
+    /// <summary>启动一个值动画并纳入调度。</summary>
+    public static Tween To(float fromVal, float toVal, int durationMs,
+                           int easeType, Action<float> onUpdate) {
+        Timeline tl = Timeline.Shared;
+        Tween t = tl.ObtainTween(fromVal, toVal, durationMs, easeType, onUpdate);
+        tl.Add(t);
+        t.Play();
+        if (tl.boundApp != null) { tl.boundApp.RequestRedraw(); }
+        return t;
+    }
+
+    /// <summary>添加一个值动画到时间轴。</summary>
+    public void Add(Tween t) {
+        if (t == null) { return; }
+        if (!this.tweens.Contains(t)) {
+            this.tweens.Add(t);
+        }
+        if (this.boundApp != null) { this.boundApp.RequestRedraw(); }
+    }
+
+    /// <summary>添加一个序列帧动画到时间轴。</summary>
+    public void Add(SpriteAnimator a) {
+        if (a == null) { return; }
+        if (!this.animators.Contains(a)) {
+            this.animators.Add(a);
+        }
+        if (this.boundApp != null) { this.boundApp.RequestRedraw(); }
+    }
+
+    /// <summary>移除一个值动画并归还池。</summary>
+    public void Remove(Tween t) {
+        if (t == null) { return; }
+        int idx = this.tweens.IndexOf(t);
+        if (idx >= 0) {
+            this.tweens.RemoveAt(idx);
+            t.Stop();
+            if (this.tweenPool.Count < 64) {
+                this.tweenPool.Add(t);
+            }
+        }
+    }
+
+    /// <summary>移除一个序列帧动画。</summary>
+    public void Remove(SpriteAnimator a) {
+        if (a == null) { return; }
+        int idx = this.animators.IndexOf(a);
+        if (idx >= 0) {
+            this.animators.RemoveAt(idx);
+        }
+    }
+
+    /// <summary>清空所有活跃动画。</summary>
+    public void Clear() {
+        for (int i = 0; i < this.tweens.Count; i = i + 1) {
+            Tween t = this.tweens[i];
+            t.Stop();
+            if (this.tweenPool.Count < 64) { this.tweenPool.Add(t); }
+        }
+        this.tweens.Clear();
+        this.animators.Clear();
+    }
+
+    /// <summary>
+    /// 推进所有动画一个时间步（毫秒）。
+    /// 如果有动画仍在运行，自动通知 boundApp 触发下一帧重绘。
+    /// </summary>
+    public void Tick(int deltaMs) {
+        if (deltaMs <= 0) { return; }
+        bool anyActive = false;
+
+        // 1. 推进值动画
+        for (int i = this.tweens.Count - 1; i >= 0; i = i - 1) {
+            Tween t = this.tweens[i];
+            bool stillRunning = t.Step(deltaMs);
+            if (stillRunning) {
+                anyActive = true;
+            } else {
+                this.tweens.RemoveAt(i);
+                if (this.tweenPool.Count < 64) { this.tweenPool.Add(t); }
+            }
+        }
+
+        // 2. 推进精灵序列动画
+        for (int i = this.animators.Count - 1; i >= 0; i = i - 1) {
+            SpriteAnimator a = this.animators[i];
+            bool stillRunning = a.Step(deltaMs);
+            if (stillRunning) {
+                anyActive = true;
+            } else {
+                this.animators.RemoveAt(i);
+            }
+        }
+
+        // 3. 还有未完成动画时，调度下一帧重绘；无动画时完全不打扰应用，零空转！
+        if (anyActive && this.boundApp != null) {
+            this.boundApp.RequestRedraw();
+        }
+    }
+}

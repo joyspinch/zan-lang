@@ -76,6 +76,7 @@ typedef float         zgl_float;
 #define ZGL_CLAMP_TO_EDGE                0x812F
 #define ZGL_TEXTURE0                     0x84C0
 #define ZGL_TEXTURE1                     0x84C1
+#define ZGL_TEXTURE2                     0x84C2
 #define ZGL_ARRAY_BUFFER                 0x8892
 #define ZGL_STREAM_DRAW                  0x88E0
 #define ZGL_STATIC_DRAW                  0x88E4
