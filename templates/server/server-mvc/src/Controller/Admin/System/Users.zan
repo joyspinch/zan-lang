@@ -23,22 +23,33 @@ class Users : AdminController {
         ViewData d = await this.Layout("账号管理");
         if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
 
-        ListQuery q = this.Paged("id", 20);
-        string kw = q.Kw();
-        int status = this.InInt("status", -1);
-        d.Set("status", Convert.ToString(status));
-        if (status == 1) { d.Set("statusOn", "selected"); }
-        if (status == 0) { d.Set("statusOff", "selected"); }
+        /* 声明本屏搜索与工具栏：渲染、收集、分页链接三处同源（ListPage），
+           改一处声明，界面与 SQL 同时生效。 */
+        ListPage lp = ListPage.Of()
+            .Text("账号 / 姓名 / 邮箱", "kw", "t.username|t.nickname|t.email", "搜索账号 / 姓名 / 邮箱")
+            .Select("状态", "status", "t.status", "1=启用,0=禁用")
+            .Time("创建日期", "createdAt", "t.createdAt")
+            .TbarAdd("新增账号", "/admin/system/users/form")
+            .TbarReload()
+            .TbarSep()
+            .TbarEnable("/admin/system/users/batchstatus")
+            .TbarDisable("/admin/system/users/batchstatus")
+            .TbarDelete("/admin/system/users/batchdelete");
+        List<ListCond> conds = lp.Collect(this);
+        lp.Search(this, d, "/admin/system/users");
+        lp.Toolbar(d);
 
-        /* 该账号角色允许可见的行，与关键字/状态过滤同链。 */
+        ListQuery q = this.Paged("id", 20);
+
+        /* 该账号角色允许可见的行，与声明条件同链。 */
         DataScope sc = await this.Scope();
         List<int> scoped = sc.Depts();
         int mine = sc.UserId();
 
-        int total = await new UserDao(this).CountPaged(
-            kw, status, sc.ByDept(), scoped, sc.Mine(), mine);
-        List<User> rows = await new UserDao(this).PagedList(
-            kw, status, sc.ByDept(), scoped, sc.Mine(), mine, q.Skip(), q.Limit());
+        int total = await new UserDao(this).CountBy(
+            conds, sc.ByDept(), scoped, sc.Mine(), mine);
+        List<User> rows = await new UserDao(this).PagedListBy(
+            conds, sc.ByDept(), scoped, sc.Mine(), mine, q.Skip(), q.Limit());
 
         List<Department> depts = await new DepartmentDao(this).All();
         List<Role> roles = await new RoleDao(this).All();
@@ -64,6 +75,9 @@ class Users : AdminController {
             items.Add(row);
         }
         this.Pager(d, q, total);
+        /* 分页链接保留全部筛选——旧版只带 kw，一翻页搜索条件全丢。 */
+        if (q.Page() > 1) { d.Set("prevUrl", lp.Query(conds, q.Page() - 1, q.Limit())); }
+        if (q.Page() < q.Pages(total)) { d.Set("nextUrl", lp.Query(conds, q.Page() + 1, q.Limit())); }
         this.Page(d);
     }
 
@@ -209,6 +223,73 @@ class Users : AdminController {
             Users.StatusText(status));
         if (status == 1) { this.Saved("账号已启用"); return; }
         this.Saved("账号已禁用，其登录状态同时失效");
+    }
+
+    /* 批量启禁：工具栏对勾选行一次提交（ids=1,2,3）。越权行零容忍——
+       名单里有超管或（禁用时的）本人即整体拒绝，不做"能做多少做多少"
+       的部分成功，避免操作者误以为全部生效。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("批量启禁账号")]
+    async void BatchStatus() {
+        List<int> ids = this.Ids("ids");
+        if (ids.Count == 0) { this.Fail(400, "0004", "未选择账号"); return; }
+        int status = this.InInt("value", 1);
+        if (status != 1) { status = 0; }
+        List<User> rows = await new UserDao(this).ByIds(ids);
+        if (rows.Count == 0) { this.Fail(400, "0004", "所选账号不存在"); return; }
+        User me = await this.Admin();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            if (rows[i].isSuper == 1) {
+                this.Fail(400, "0004", "所选账号包含超级管理员，不能批量操作");
+                return;
+            }
+            if (status == 0 && me != null && rows[i].id == me.id) {
+                this.Fail(400, "0004", "所选账号包含当前登录账号，不能批量禁用");
+                return;
+            }
+        }
+        int n = await new UserDao(this).SetStatusByIds(ids, status);
+        if (status == 0) {
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                await this.Revoke(rows[i].id);
+                AuthUser.Forget(Convert.ToString(rows[i].id));
+            }
+        }
+        await this.Note("批量启禁账号",
+            Convert.ToString(rows.Count) + " 个账号", n > 0,
+            status == 1 ? "启用" : "禁用");
+        this.Saved("已" + (status == 1 ? "启用" : "禁用") + " " + Convert.ToString(n) + " 个账号");
+    }
+
+    /* 批量删除：同零容忍口径。连带清角色关联并失效其会话。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Delete)]
+    [Description("批量删除账号")]
+    async void BatchDelete() {
+        List<int> ids = this.Ids("ids");
+        if (ids.Count == 0) { this.Fail(400, "0004", "未选择账号"); return; }
+        List<User> rows = await new UserDao(this).ByIds(ids);
+        if (rows.Count == 0) { this.Fail(400, "0004", "所选账号不存在"); return; }
+        User me = await this.Admin();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            if (rows[i].isSuper == 1) {
+                this.Fail(400, "0004", "所选账号包含超级管理员，不能批量删除");
+                return;
+            }
+            if (me != null && rows[i].id == me.id) {
+                this.Fail(400, "0004", "所选账号包含当前登录账号，不能批量删除");
+                return;
+            }
+        }
+        int n = await new UserDao(this).DeleteByIds(ids);
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            int _r = await new UserRoleDao(this).DeleteByUserId(rows[i].id);
+            AuthUser.Forget(Convert.ToString(rows[i].id));
+        }
+        await this.Note("批量删除账号",
+            Convert.ToString(rows.Count) + " 个账号", n > 0, "");
+        this.Saved("已删除 " + Convert.ToString(n) + " 个账号");
     }
 
     [HttpPost]

@@ -1272,6 +1272,7 @@
     // 后面的脚本重放与委托事件都不受影响。
     if (window.ZanTable) { ZanTable.wire(root); }
     wireInlineEdit(root);
+    wirePick(root);
     var sels = root.querySelectorAll('select[data-value]');
     for (var i = 0; i < sels.length; i++) {
       var v = sels[i].getAttribute('data-value');
@@ -1291,6 +1292,100 @@
             bodies[b].getAttribute('data-code-body') === name);
         }
       });
+    }
+  }
+  /* data-pick —— 搜索区远程搜索单选（外键筛选用）。服务端只渲染
+     <span class="pick" data-pick="选项端点"> 与隐藏值输入，本组件负责
+     下拉、防抖搜索、回显（?id=N 换 label）与清空。选项端点契约：
+     ?kw= → {code:'0000', data:[{"id":1,"label":"…"}]}；
+     ?id= → {code:'0000', data:{"id":1,"label":"…"}}（可空）。 */
+  function wirePick(root) {
+    if (!root) { return; }
+    var picks = root.matches && root.matches('.pick[data-pick]')
+      ? [root] : root.querySelectorAll('.pick[data-pick]');
+    for (var i = 0; i < picks.length; i++) {
+      (function (pick) {
+        if (pick.getAttribute('data-pick-wired')) { return; }
+        pick.setAttribute('data-pick-wired', '1');
+        var hidden = pick.querySelector('input[type="hidden"]');
+        var box = pick.querySelector('input[type="search"]');
+        var url = pick.getAttribute('data-pick');
+        if (!hidden || !box || !url) { return; }
+        var menu = document.createElement('div');
+        menu.className = 'pick-menu';
+        menu.hidden = true;
+        pick.appendChild(menu);
+        var timer = null;
+        function close() { menu.hidden = true; }
+        function fetchUrl(params) {
+          return url + (url.indexOf('?') >= 0 ? '&' : '?') + params;
+        }
+        function render(items) {
+          menu.innerHTML = '';
+          if (!items.length) {
+            var none = document.createElement('div');
+            none.className = 'pick-none';
+            none.textContent = '无匹配结果';
+            menu.appendChild(none);
+          }
+          for (var k = 0; k < items.length; k++) {
+            (function (it) {
+              var opt = document.createElement('div');
+              opt.className = 'pick-opt';
+              opt.textContent = it.label;
+              opt.addEventListener('mousedown', function (ev) {
+                ev.preventDefault();
+                hidden.value = it.id;
+                box.value = it.label;
+                close();
+              });
+              menu.appendChild(opt);
+            })(items[k]);
+          }
+          menu.hidden = false;
+        }
+        function apply(j, many) {
+          if (!j || j.code !== '0000' || !j.data) { render([]); return; }
+          /* data 是真正的数组/对象；也兼容被序列化成字符串的旧契约。 */
+          var parsed = j.data;
+          if (typeof parsed === 'string') {
+            try { parsed = JSON.parse(parsed); } catch (e) { render([]); return; }
+          }
+          render(many ? (parsed || []) : (parsed && parsed.id ? [parsed] : []));
+        }
+        function query(kw) {
+          fetch(fetchUrl('kw=' + encodeURIComponent(kw)),
+                { credentials: 'same-origin' })
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (j) { apply(j, true); })
+            .catch(function () { close(); });
+        }
+        box.addEventListener('input', function () {
+          hidden.value = '';
+          clearTimeout(timer);
+          timer = setTimeout(function () { query(box.value.trim()); }, 250);
+        });
+        box.addEventListener('focus', function () {
+          if (box.value.trim()) { query(box.value.trim()); }
+        });
+        box.addEventListener('blur', function () { setTimeout(close, 150); });
+        /* 回显：带值首渲染时把 ?id=N 换成 label 填进搜索框；
+           只填值不开下拉。 */
+        if (hidden.value && !box.value) {
+          fetch(fetchUrl('id=' + encodeURIComponent(hidden.value)),
+                { credentials: 'same-origin' })
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (j) {
+              if (!j || j.code !== '0000' || !j.data) { return; }
+              var it = j.data;
+              if (typeof it === 'string') {
+                try { it = JSON.parse(it); } catch (e) { return; }
+              }
+              if (it && it.label) { box.value = it.label; }
+            })
+            .catch(function () { /* 静默：id 仍在，条件有效 */ });
+        }
+      })(picks[i]);
     }
   }
   window.applyFragmentWidgets = applyFragmentWidgets;
@@ -1402,6 +1497,53 @@
         }).catch(function () { toast('上传失败', 'bad'); });
       });
       pick.click();
+      return;
+    }
+    // Batch toolbar action: gather the checked rows of the enclosing
+    // card's table (zan-table injects the checkboxes) and POST their ids
+    // as a comma list. Nothing selected is a toast, not a request.
+    var bt = ev.target.closest('[data-batch]');
+    if (bt) {
+      ev.preventDefault();
+      var scope = bt.closest('.card') || document;
+      var ids = [];
+      var checked = scope.querySelectorAll('tr[data-id] td.zt-cell input[type="checkbox"]');
+      for (var bi = 0; bi < checked.length; bi++) {
+        if (checked[bi].checked) {
+          var tr = checked[bi].closest('tr[data-id]');
+          if (tr) { ids.push(tr.getAttribute('data-id')); }
+        }
+      }
+      if (!ids.length) { toast('请先选择数据', 'bad'); return; }
+      var runBatch = function () {
+        var args = 'ids=' + encodeURIComponent(ids.join(','));
+        var val = bt.getAttribute('data-value');
+        if (val !== null && val !== '') { args += '&value=' + encodeURIComponent(val); }
+        post(bt.getAttribute('data-batch'), args)
+          .then(function (j) {
+            if (!j) { return; }
+            toast(j.msg || '完成', j.code === '0000' ? 'ok' : 'bad');
+            if (j.code !== '0000') { return; }
+            closeDialog();
+            reload(true);
+          })
+          .catch(function () { toast('请求失败', 'bad'); });
+      };
+      var batchConfirm = bt.getAttribute('data-confirm');
+      if (batchConfirm) { Layer.confirm(batchConfirm, runBatch); } else { runBatch(); }
+      return;
+    }
+    // Clear a remote-search pick (the × next to the search box).
+    var pc = ev.target.closest('[data-pick-clear]');
+    if (pc) {
+      ev.preventDefault();
+      var wrap = pc.closest('.pick');
+      if (wrap) {
+        var hid = wrap.querySelector('input[type="hidden"]');
+        var txt = wrap.querySelector('input[type="search"]');
+        if (hid) { hid.value = ''; }
+        if (txt) { txt.value = ''; txt.focus(); }
+      }
       return;
     }
     var p = ev.target.closest('[data-post]');

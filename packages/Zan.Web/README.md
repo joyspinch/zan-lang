@@ -76,6 +76,34 @@ ZanWeb.Blog 等业务命名空间  在应用侧，不在包内
 - DAO 每表一个、同 action 多 DAO 共享同一租约与事务；缓存键属于数据层，
   留在 DAO 里，不散落到控制器。
 
+## 列表页声明式基座（ListPage）
+
+后台列表页的搜索区、工具条、条件收集、翻页链接由一个 `ListPage` 声明驱动，
+同一份声明产出四样东西，UI 与 SQL 不再各写一遍：
+
+```zan
+ListPage lp = ListPage.Of()
+    .Text("账号 / 姓名 / 邮箱", "kw", "t.username|t.nickname|t.email", "搜索…")
+    .Select("状态", "status", "t.status", "1=启用,0=禁用")
+    .Time("创建日期", "createdAt", "t.createdAt")
+    .Pick("分类", "categoryId", "t.categoryId", "/admin/posts/cats")
+    .TbarAdd("新增", "/admin/posts/form").TbarReload().TbarSep()
+    .TbarEnable("/admin/posts/batchstatus").TbarDelete("/admin/posts/batchdelete");
+List<ListCond> conds = lp.Collect(this);   /* 只收声明过的名字，空值跳过 */
+lp.Search(this, d, "/admin/posts");        /* d.searchHtml：回显 + 渲染 */
+lp.Toolbar(d);                             /* d.toolbarHtml：批量带确认 */
+d.Set("prevUrl", lp.Query(conds, q.Page() - 1, q.Limit()));  /* 翻页保留全部筛选 */
+```
+
+- **列名只来自声明**（`col` 是代码常量），用户输入永远走占位符——DAO 侧
+  `ApplyConds(__DbQ_Post sel, List<ListCond> conds)` 把 LIKE/EQ/GE/LE 拼成
+  参数化 WHERE（多列 LIKE 用 `|` 分组 OR），SQL 留在数据层。
+- **批量端点零容忍**：`Ids()` 收 CSV 主键（上限 500），任一行越权
+  （超管/自身停用）整批拒绝，不做部分成功。
+- **远程搜索单选（Pick）**：服务端只渲染隐藏值输入 + 搜索框，选项由
+  `?kw=` 端点即时返回（`{code:'0000',data:[{id,label}]}`），回显走
+  `?id=N`；选项端点同时服务表单选择器。
+
 ## 无侵入更新
 
 框架缺陷修在包里、随包版本走；应用只在组合根（`main.zan`）对接挂点。

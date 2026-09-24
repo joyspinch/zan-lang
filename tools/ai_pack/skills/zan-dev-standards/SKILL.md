@@ -31,6 +31,13 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   不写"本轮修改了什么"。
 - 常量收拢：魔法数进常量；字段名引用 schema 生成物或常量，不散落裸字符串。
 - 资源（图片/字体/大 JSON）走内嵌或声明式引用，不在业务代码里手写路径拼接。
+- **GenDb 查询链：表访问器只当链头，命名变量走 `__DbBind` 门面**。`this.Post`
+  只在链式调用头部存在，裸赋值（`__DbQ_Post sel = this.Post;`）与当静态成员调
+  （`Articles.PostList(...)`）都编译不过；要起名字（DAO 里拼条件、跨方法传选链）
+  用生成的门面根 `__DbQ_Post sel = __DbBind.Q_Post(conn);`。门面原始转发器与
+  类型化 lambda 并存：`W("t.id IN (?)")` + `InI(ids)` 即参数化 IN，`P/Pi/Pl`
+  按值类型绑占位符（条件收集/列表筛选的落地定式，2026-09-25 实机验证）。
+  坑出处：三处编译错全是这两形态踩出来的。
 
 ## 三、验证纪律（实机/无头通用）
 
@@ -41,6 +48,16 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
 - **UI 驱动用合成事件，不用真实 OS 点击**：driver 的 `clickid` 在点击时刻
   解析命中区中心并注入，天然免疫窗口框偏移；hit id 只在**同一次构建的
   同一次运行内**有效（控件增删会整体移位），点击前当场 dump。
+- **ZanWeb 模板实机核对四坑**（2026-09-25 ListPage 验证，每条都白折腾过一轮）：
+  ① 静态资产挂在 `/static/*`（`StaticFiles.Mount(app, "/static", "wwwroot")`），
+  curl `/js/x.js` 拿到的是 API 层 `{"code":"404"}` JSON——不是"服务了旧文件"，
+  先核对 URL 再怀疑缓存；② 改 wwwroot 的 JS/CSS 必须同步升 `views/Admin/layout.html`
+  里的 `?v=N`：资产响应带 `Cache-Control: max-age=3600`，浏览器缓存键含查询串，
+  只 reload 页面拿不到新 JS（新代码 "确认加载" 要看执行中的函数源码或版本参数）；
+  ③ `app.exe start` 会 daemon 出脱离启动任务的 worker，杀后台任务杀不掉它——
+  重建 exe 报 `Permission denied`、旧进程继续占端口继续服务旧视图，须
+  `app.exe stop` 或按监听端口 PID 杀；④ config/views/wwwroot 按进程工作目录
+  相对读取，起服务必须 cd 到发布目录，且 views 改动要重启才生效（视图缓存）。
 - **PowerShell 合成点击四连坑（PrintWindow 抓窗 + mouse_event 注入流）**：
   ① 进程必须先 `SetProcessDpiAwarenessContext(-4)`——DPI 不感知时
   `GetWindowRect`/`SetCursorPos` 全在虚拟化坐标系，注入点整体漂 1.5 倍；
