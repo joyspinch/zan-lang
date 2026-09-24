@@ -42,6 +42,7 @@ class DirectionalAnimator {
 
     int currentStateIndex;
     int currentDir8;        // 当前朝向 (0:东, 1:东南, 2:南, 3:西南, 4:西, 5:西北, 6:北, 7:东北)
+    bool is5DirMode;        // 是否启用工业级 5方向镜像模式（省37.5%图具体积与显存）
     double frameTimer;
     int currentFrameInDir;
     bool isFinished;
@@ -53,6 +54,7 @@ class DirectionalAnimator {
 
         this.currentStateIndex = -1;
         this.currentDir8 = 2; // 默认朝南
+        this.is5DirMode = false;
         this.frameTimer = 0.0;
         this.currentFrameInDir = 0;
         this.isFinished = false;
@@ -64,7 +66,17 @@ class DirectionalAnimator {
 
     SpriteSheet Sheet { get { return sheet; } }
     int Direction { get { return currentDir8; } set { currentDir8 = (value >= 0 && value < 8) ? value : 2; } }
+    bool Is5DirMode { get { return is5DirMode; } set { is5DirMode = value; } }
     bool IsFinished { get { return isFinished; } }
+    int CurrentFrameInDir { get { return currentFrameInDir; } }
+    string CurrentStateName {
+        get {
+            if (currentStateIndex >= 0 && currentStateIndex < stateCount && states[currentStateIndex] != null) {
+                return states[currentStateIndex].Name;
+            }
+            return "";
+        }
+    }
 
     /// <summary>注册一个动作状态配置。</summary>
     void AddState(string name, int startRow, int framesPerDir, double fps, bool loop) {
@@ -125,23 +137,82 @@ class DirectionalAnimator {
     }
 
     /// <summary>
+    /// 5 方向对称工业标准映射矩阵。
+    /// 将 8 方向逻辑朝向解算为 5 行贴图索引与水平翻转标志（FlipX）。
+    /// </summary>
+    static void ResolveDir5(int dir8, out int outRowOffset, out bool outFlipX) {
+        int d = (dir8 >= 0 && dir8 < 8) ? dir8 : 2;
+        if (d == 2) {
+            outRowOffset = 0; // 南 (正下)
+            outFlipX = false;
+        } else if (d == 1) {
+            outRowOffset = 1; // 东南 (右下)
+            outFlipX = false;
+        } else if (d == 0) {
+            outRowOffset = 2; // 东 (正右)
+            outFlipX = false;
+        } else if (d == 7) {
+            outRowOffset = 3; // 东北 (右上)
+            outFlipX = false;
+        } else if (d == 6) {
+            outRowOffset = 4; // 北 (正上)
+            outFlipX = false;
+        } else if (d == 3) {
+            outRowOffset = 1; // 西南 (左下) -> 镜像东南
+            outFlipX = true;
+        } else if (d == 4) {
+            outRowOffset = 2; // 西 (正左) -> 镜像正东
+            outFlipX = true;
+        } else { // d == 5
+            outRowOffset = 3; // 西北 (左上) -> 镜像东北
+            outFlipX = true;
+        }
+    }
+
+    /// <summary>
     /// 获取当前帧在 SpriteSheet 中的全局绝对图元帧索引。
-    /// 公式：(startRow + dir8) * cols + currentFrameInDir
+    /// 8方向模式：(startRow + dir8) * cols + currentFrameInDir
+    /// 5方向模式：(startRow + dir5) * cols + currentFrameInDir
     /// </summary>
     int GetCurrentGlobalFrame() {
         if (currentStateIndex < 0 || sheet == null) { return 0; }
         AnimationState st = states[currentStateIndex];
         if (st == null) { return 0; }
 
-        int row = st.StartRow + currentDir8;
+        int rowOffset = currentDir8;
+        if (is5DirMode) {
+            int r5 = 0;
+            bool fx = false;
+            ResolveDir5(currentDir8, out r5, out fx);
+            rowOffset = r5;
+        }
+
+        int row = st.StartRow + rowOffset;
         return row * sheet.Cols + currentFrameInDir;
     }
 
     /// <summary>
+    /// 获取当前是否处于水平镜像翻转状态（仅在 5 方向模式下生效）。
+    /// </summary>
+    bool IsCurrentFlipped() {
+        if (!is5DirMode) { return false; }
+        int r5 = 0;
+        bool fx = false;
+        ResolveDir5(currentDir8, out r5, out fx);
+        return fx;
+    }
+
+    /// <summary>
     /// 直接获取当前帧对应的纹理 UV 矩形。
+    /// 若启用 5方向镜像模式且当前朝向处于西侧，自动交换 u0 与 u1 实现 GPU 零开销硬件镜像。
     /// </summary>
     void GetCurrentUV(out float u0, out float v0, out float u1, out float v1) {
         int gFrame = GetCurrentGlobalFrame();
         sheet.GetFrameUV(gFrame, out u0, out v0, out u1, out v1);
+        if (IsCurrentFlipped()) {
+            float temp = u0;
+            u0 = u1;
+            u1 = temp;
+        }
     }
 }

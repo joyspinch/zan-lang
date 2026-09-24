@@ -425,6 +425,18 @@ Post 调用核对编码，别信二手注释。
   - `ActionQueue`：阻塞式时序演播队列，保证回合制打牌中抽牌、伤害跳字、亡语触发依次连贯展现。
 - **数学与转向算子**：
   - 编译器内置 `Math.Atan2(y, x)` / `Atan` / `Asin` / `Acos`，原生直通 libc/libm，游戏转向、炮塔瞄准与弹道追踪严禁手写低精度的经验近似。
+- **2.5D 纯贴图工业级定式（5方向镜像与纸娃娃防穿模）**：
+  - 传统 8 方向素材爆炸破局：采用 5 方向（南/东南/东/东北/北）对称映射，西侧 3 方向自动借用东侧切片并在 GPU 绘制时交换 $u_0, u_1$ 水平镜像翻转（`FlipX`），立省 37.5% 贴图体积与显存。
+  - 纸娃娃（Paperdoll）挂件管理：身体、衣服、武器、翅膀等必须由单主控动画机（`masterAnimator`）统一推进时间轴，杜绝帧率漂移脱节；结合 8 方向动态层深矩阵（`orderPerDir`），正面武器置顶、背面武器收在身后，彻底杜绝穿模。
+- **2.5D 背景 + 3D 角色混合表现层（Mesh3DProjection）**：
+  - 逻辑 2D（寻路、碰撞、流场）与表现 3D 严格解耦，通过固定 PPU（Pixels Per Unit，如 64px=1m）对齐正交等轴测俯视角。
+  - 支持 360° 任意角度最短角阻尼平滑旋转，消除传统 2D 转向离散跳跃；动作切换支持 Cross-Fade 平滑权重混合（0.0 -> 1.0）；骨骼挂点（Socket）支持武器与翅膀旋转贴合跟随。
+- **场景状态栈与平滑黑屏遮罩切场（SceneManager）**：
+  - 严禁直接粗暴替换场景造成掉帧与瞬时白屏。采用场景栈（`Push/Pop` 挂起与即时恢复子场景）。
+  - 主场景切换必须走黑屏遮罩管线（`FadeOut -> Switching -> FadeIn`），在完全黑屏遮蔽下安全执行关卡资产卸载、垃圾回收与新场景预热。
+- **素材自动化管线（AssetPipeline & game_asset_tool）**：
+  - 提供图集最紧凑 2 的幂次方（POT）网格自动计算与 UV Manifest 导出；
+  - 自动输出 5方向镜像至 8方向映射表与纸娃娃层深配置 JSON，杜绝人工手工拼接切片与算坐标。
 - **引擎管线全流程缝合基础设施（Scene / Entity / Viewport / Input）**：
   - `Scene` & `Entity`：生命周期规范收拢（`OnAwake` / `OnFixedUpdate` / `OnRender` / `OnDestroy`）。`Scene` 内部自动将 `GameClock`、`Camera2D`、`SpatialHash2D` 与 `YSortLayer` 串接成自动化流水线，步进时自动重建空间哈希，渲染时自动亚帧平滑插值滤波与视锥剔除，严禁业务层手动写散乱的多层循环。
   - `SpriteSheet` & `DirectionalAnimator`：标准化 8 方向角色动作骨骼切片（`idle`, `walk`, `attack`, `die`），根据朝向与 FPS 自动映射 UV 纹理坐标，彻底消除手写零碎帧数计算。

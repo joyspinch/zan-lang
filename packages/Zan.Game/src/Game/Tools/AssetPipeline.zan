@@ -1,0 +1,221 @@
+using System;
+using System.IO;
+
+namespace Game.Tools;
+
+/// <summary>
+/// 图集切片矩形元数据。
+/// </summary>
+class FrameRect {
+    int id;
+    int x;
+    int y;
+    int width;
+    int height;
+    float u0;
+    float v0;
+    float u1;
+    float v1;
+
+    FrameRect(int id, int x, int y, int w, int h, float u0, float v0, float u1, float v1) {
+        this.id = id;
+        this.x = x;
+        this.y = y;
+        this.width = w;
+        this.height = h;
+        this.u0 = u0;
+        this.v0 = v0;
+        this.u1 = u1;
+        this.v1 = v1;
+    }
+
+    static FrameRect Create(int id, int x, int y, int w, int h, float u0, float v0, float u1, float v1) {
+        return new FrameRect(id, x, y, w, h, u0, v0, u1, v1);
+    }
+
+    int Id { get { return id; } }
+    int X { get { return x; } }
+    int Y { get { return y; } }
+    int Width { get { return width; } }
+    int Height { get { return height; } }
+    float U0 { get { return u0; } }
+    float V0 { get { return v0; } }
+    float U1 { get { return u1; } }
+    float V1 { get { return v1; } }
+}
+
+/// <summary>
+/// 游戏素材自动化处理管线：
+/// 1. 图集栅格与紧凑布局烘焙计算（AtlasBaker）；
+/// 2. 5 方向切片映射为 8 方向元数据导出（FiveDirProcessor）；
+/// 3. 纸娃娃部位层深与挂点配置文件生成（PaperdollConfigGenerator）。
+/// </summary>
+class AssetPipeline {
+    /// <summary>
+    /// 计算将 N 个等宽高帧紧凑打包进 Atlas 纹理的规格（自动选取最接近的 2 的幂次方尺寸，如 512, 1024, 2048）。
+    /// </summary>
+    static void CalculateOptimalAtlasSize(int frameWidth, int frameHeight, int totalFrames, out int atlasWidth, out int atlasHeight, out int cols, out int rows) {
+        int fw = frameWidth > 0 ? frameWidth : 64;
+        int fh = frameHeight > 0 ? frameHeight : 64;
+        int count = totalFrames > 0 ? totalFrames : 1;
+
+        // 估算粗略面积
+        int totalArea = fw * fh * count;
+        int side = 256;
+        while ((side * side) < totalArea && side < 4096) {
+            side = side * 2;
+        }
+
+        cols = side / fw;
+        if (cols < 1) { cols = 1; }
+        rows = (count + cols - 1) / cols;
+
+        int requiredH = rows * fh;
+        int h = 256;
+        while (h < requiredH && h < 4096) {
+            h = h * 2;
+        }
+
+        atlasWidth = side;
+        atlasHeight = h;
+    }
+
+    /// <summary>
+    /// 生成包含每个切片 UV 坐标的标准图集描述元数据 JSON 文本。
+    /// </summary>
+    static string GenerateAtlasManifestJson(string atlasName, int atlasWidth, int atlasHeight, int frameWidth, int frameHeight, int cols, int rows, int totalFrames) {
+        string json = "{\n";
+        json = json + "  \"name\": \"" + atlasName + "\",\n";
+        json = json + "  \"atlasWidth\": " + atlasWidth.ToString() + ",\n";
+        json = json + "  \"atlasHeight\": " + atlasHeight.ToString() + ",\n";
+        json = json + "  \"frameWidth\": " + frameWidth.ToString() + ",\n";
+        json = json + "  \"frameHeight\": " + frameHeight.ToString() + ",\n";
+        json = json + "  \"cols\": " + cols.ToString() + ",\n";
+        json = json + "  \"rows\": " + rows.ToString() + ",\n";
+        json = json + "  \"totalFrames\": " + totalFrames.ToString() + ",\n";
+        json = json + "  \"frames\": [\n";
+
+        for (int i = 0; i < totalFrames; i = i + 1) {
+            int c = i % cols;
+            int r = i / cols;
+            int px = c * frameWidth;
+            int py = r * frameHeight;
+            double u0 = (double)px / (double)atlasWidth;
+            double v0 = (double)py / (double)atlasHeight;
+            double u1 = (double)(px + frameWidth) / (double)atlasWidth;
+            double v1 = (double)(py + frameHeight) / (double)atlasHeight;
+
+            json = json + "    { \"id\": " + i.ToString() + ", \"x\": " + px.ToString() + ", \"y\": " + py.ToString()
+                + ", \"u0\": " + u0.ToString() + ", \"v0\": " + v0.ToString()
+                + ", \"u1\": " + u1.ToString() + ", \"v1\": " + v1.ToString() + " }";
+
+            if (i < totalFrames - 1) {
+                json = json + ",\n";
+            } else {
+                json = json + "\n";
+            }
+        }
+
+        json = json + "  ]\n";
+        json = json + "}\n";
+        return json;
+    }
+
+    /// <summary>
+    /// 生成 5 方向转 8 方向的映射对照元数据 JSON 文本。
+    /// </summary>
+    static string Generate5DirMappingJson(string characterModelName) {
+        string json = "{\n";
+        json = json + "  \"model\": \"" + characterModelName + "\",\n";
+        json = json + "  \"mode\": \"5DirSymmetricMirror\",\n";
+        json = json + "  \"directions\": [\n";
+
+        string[] dirNames = new string[8];
+        dirNames[0] = "East";
+        dirNames[1] = "SouthEast";
+        dirNames[2] = "South";
+        dirNames[3] = "SouthWest";
+        dirNames[4] = "West";
+        dirNames[5] = "NorthWest";
+        dirNames[6] = "North";
+        dirNames[7] = "NorthEast";
+
+        int[] mappedSource = new int[8];
+        mappedSource[0] = 2; // East -> row 2
+        mappedSource[1] = 1; // SouthEast -> row 1
+        mappedSource[2] = 0; // South -> row 0
+        mappedSource[3] = 1; // SouthWest -> row 1 (Mirror)
+        mappedSource[4] = 2; // West -> row 2 (Mirror)
+        mappedSource[5] = 3; // NorthWest -> row 3 (Mirror)
+        mappedSource[6] = 4; // North -> row 4
+        mappedSource[7] = 3; // NorthEast -> row 3
+
+        bool[] flipX = new bool[8];
+        flipX[0] = false;
+        flipX[1] = false;
+        flipX[2] = false;
+        flipX[3] = true;
+        flipX[4] = true;
+        flipX[5] = true;
+        flipX[6] = false;
+        flipX[7] = false;
+
+        for (int i = 0; i < 8; i = i + 1) {
+            json = json + "    { \"dir8\": " + i.ToString()
+                + ", \"name\": \"" + dirNames[i] + "\""
+                + ", \"sourceRow5\": " + mappedSource[i].ToString()
+                + ", \"flipX\": " + (flipX[i] ? "true" : "false") + " }";
+
+            if (i < 7) {
+                json = json + ",\n";
+            } else {
+                json = json + "\n";
+            }
+        }
+
+        json = json + "  ]\n";
+        json = json + "}\n";
+        return json;
+    }
+
+    /// <summary>
+    /// 生成纸娃娃装备部件与层深遮挡矩阵配置 JSON 文本。
+    /// </summary>
+    static string GeneratePaperdollManifestJson(string charClass) {
+        string json = "{\n";
+        json = json + "  \"class\": \"" + charClass + "\",\n";
+        json = json + "  \"layers\": [\n";
+
+        // Wing 层
+        json = json + "    {\n";
+        json = json + "      \"name\": \"wing\",\n";
+        json = json + "      \"baseOrder\": 0,\n";
+        json = json + "      \"orderPerDir\": [-20, -20, -20, -20, -20, 30, 30, 30]\n"; // 朝北时翅膀遮挡身体正面
+        json = json + "    },\n";
+
+        // Body 身体裸模
+        json = json + "    {\n";
+        json = json + "      \"name\": \"body\",\n";
+        json = json + "      \"baseOrder\": 10,\n";
+        json = json + "      \"orderPerDir\": [0, 0, 0, 0, 0, 0, 0, 0]\n";
+        json = json + "    },\n";
+
+        // Cloth 衣服层
+        json = json + "    {\n";
+        json = json + "      \"name\": \"cloth\",\n";
+        json = json + "      \"baseOrder\": 20,\n";
+        json = json + "      \"orderPerDir\": [0, 0, 0, 0, 0, 0, 0, 0]\n";
+        json = json + "    },\n";
+
+        // Weapon 武器层
+        json = json + "    {\n";
+        json = json + "      \"name\": \"weapon\",\n";
+        json = json + "      \"baseOrder\": 30,\n";
+        json = json + "      \"orderPerDir\": [10, 10, 10, 10, 10, -30, -30, -30]\n"; // 朝北时右手武器收在身后
+        json = json + "    }\n";
+
+        json = json + "  ]\n";
+        json = json + "}\n";
+        return json;
+    }
+}

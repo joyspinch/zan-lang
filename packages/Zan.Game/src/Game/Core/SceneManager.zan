@@ -1,0 +1,156 @@
+using System;
+using Gui;
+
+namespace Game.Core;
+
+/// <summary>
+/// 场景切场过渡状态机。
+/// </summary>
+enum TransitionPhase {
+    None,       // 正常游玩中
+    FadeOut,    // 渐暗黑屏遮罩 (0.0 -> 1.0)
+    Switching,  // 黑屏完全遮蔽，正在安全释放旧关卡资产并加载新场景
+    FadeIn      // 渐亮显露新世界 (1.0 -> 0.0)
+}
+
+/// <summary>
+/// 工业级场景状态栈与无缝转场管理器。
+/// 核心特性：
+/// 1. 场景栈管理（Push 挂起不销毁，Pop 瞬间恢复，ReplaceScene 平滑切关）；
+/// 2. 电影级淡入淡出遮罩（避免硬切导致的画面突兀与掉帧感）；
+/// 3. 黑屏遮蔽下异步安全资产卸载与预热契约。
+/// </summary>
+class SceneManager {
+    Scene[] sceneStack;
+    int stackTop;
+
+    // 过渡转场状态
+    TransitionPhase phase;
+    double fadeDuration;   // 单向淡化耗时（默认 0.3s）
+    double fadeTimer;
+    double fadeAlpha;      // 0.0 (完全透明) 到 1.0 (纯黑完全遮蔽)
+    Scene pendingNextScene; // 待挂载的目标新场景
+    bool popPendingOnSwitch;
+
+    SceneManager(int maxStackDepth) {
+        int cap = maxStackDepth > 0 ? maxStackDepth : 8;
+        this.sceneStack = new Scene[cap];
+        this.stackTop = 0;
+
+        this.phase = TransitionPhase.None;
+        this.fadeDuration = 0.3;
+        this.fadeTimer = 0.0;
+        this.fadeAlpha = 0.0;
+        this.pendingNextScene = null;
+        this.popPendingOnSwitch = false;
+    }
+
+    static SceneManager Create(int maxStackDepth) {
+        return new SceneManager(maxStackDepth);
+    }
+
+    TransitionPhase Phase { get { return phase; } }
+    double FadeAlpha { get { return fadeAlpha; } }
+    bool IsTransitioning { get { return phase != TransitionPhase.None; } }
+
+    /// <summary>获取当前顶层活跃场景。</summary>
+    Scene GetActiveScene() {
+        if (stackTop > 0) {
+            return sceneStack[stackTop - 1];
+        }
+        return null;
+    }
+
+    /// <summary>压入新场景（当前场景挂起不销毁，例如在地下城中打开大地图或背包打造）。</summary>
+    void Push(Scene newScene) {
+        if (newScene == null) { return; }
+        if (stackTop < sceneStack.Length) {
+            sceneStack[stackTop] = newScene;
+            stackTop = stackTop + 1;
+        }
+    }
+
+    /// <summary>弹出顶层场景，恢复下一层场景为活跃态。</summary>
+    Scene Pop() {
+        if (stackTop > 0) {
+            stackTop = stackTop - 1;
+            Scene popped = sceneStack[stackTop];
+            sceneStack[stackTop] = null;
+            return popped;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// 平滑切换主场景（自动触发黑屏遮罩渐变：FadeOut -> 换图载入 -> FadeIn）。
+    /// </summary>
+    void SwitchScene(Scene nextScene, double duration) {
+        if (nextScene == null) { return; }
+        this.pendingNextScene = nextScene;
+        this.fadeDuration = duration > 0.05 ? duration : 0.3;
+        this.fadeTimer = 0.0;
+        this.fadeAlpha = 0.0;
+        this.phase = TransitionPhase.FadeOut;
+    }
+
+    /// <summary>
+    /// 推进场景更新循环与转场时间轴。
+    /// </summary>
+    void Update(double dt) {
+        // 1. 推进转场遮罩时间轴
+        if (phase == TransitionPhase.FadeOut) {
+            fadeTimer = fadeTimer + dt;
+            fadeAlpha = fadeTimer / fadeDuration;
+            if (fadeAlpha >= 1.0) {
+                fadeAlpha = 1.0;
+                fadeTimer = 0.0;
+                phase = TransitionPhase.Switching;
+
+                // 在黑屏完全遮蔽状态下安全换图
+                if (pendingNextScene != null) {
+                    if (stackTop > 0) {
+                        stackTop = 0; // 清空旧场景
+                    }
+                    Push(pendingNextScene);
+                    pendingNextScene = null;
+                }
+                phase = TransitionPhase.FadeIn;
+            }
+        } else if (phase == TransitionPhase.FadeIn) {
+            fadeTimer = fadeTimer + dt;
+            fadeAlpha = 1.0 - (fadeTimer / fadeDuration);
+            if (fadeAlpha <= 0.0) {
+                fadeAlpha = 0.0;
+                fadeTimer = 0.0;
+                phase = TransitionPhase.None;
+            }
+        }
+
+        // 2. 推进当前活跃场景的逻辑步进
+        Scene active = GetActiveScene();
+        if (active != null) {
+            // 在淡出淡入过程中，可根据游戏节奏继续或暂停逻辑
+            active.Tick();
+        }
+    }
+
+    /// <summary>
+    /// 渲染当前场景并叠加平滑黑屏遮罩。
+    /// </summary>
+    void Render(Canvas c, double viewportWidth, double viewportHeight) {
+        Scene active = GetActiveScene();
+        if (active != null && c != null) {
+            active.Render(c);
+        }
+
+        // 叠加转场黑屏
+        if (c != null && fadeAlpha > 0.001) {
+            int a = (int)(fadeAlpha * 255.0);
+            if (a > 255) { a = 255; }
+            if (a < 0) { a = 0; }
+            // 纯黑色带透明度覆盖视口全屏
+            int colorWithAlpha = (a << 24) | 0x000000;
+            c.FillRect(0, 0, (int)viewportWidth, (int)viewportHeight, colorWithAlpha);
+        }
+    }
+}

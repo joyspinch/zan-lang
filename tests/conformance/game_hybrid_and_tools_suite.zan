@@ -1,0 +1,219 @@
+using System;
+using Game.Core;
+using Game.Graphics;
+using Game.Tools;
+
+class GameHybridAndToolsTestSuite {
+    static void Assert(bool condition, string message) {
+        if (!condition) {
+            Console.WriteLine("[FAIL] " + message);
+            Environment.Exit(1);
+        }
+    }
+
+    static void Main(string[] args) {
+        Console.WriteLine("=== 开始验证 2.5D贴图/3D混合方案与素材工具链套件 ===");
+
+        Test5DirMirroring();
+        TestPaperdollSystem();
+        TestMesh3DProjection();
+        TestSceneManagerTransitions();
+        TestAssetPipelineTools();
+
+        Console.WriteLine("HYBRID_AND_TOOLS_ALL_PASSED");
+    }
+
+    static void Test5DirMirroring() {
+        Console.WriteLine("[1/5] 验证 5方向工业级贴图镜像映射与 UV 翻转...");
+        SpriteSheet sheet = SpriteSheet.Create("char_walk", 256, 256, 64, 64);
+        DirectionalAnimator anim = DirectionalAnimator.Create(sheet, 8);
+        anim.Is5DirMode = true;
+        anim.AddState("walk", 0, 4, 10.0, true);
+
+        // 1. 朝东南 (1)：不翻转，源行 1
+        anim.Play("walk", 1, true);
+        Assert(!anim.IsCurrentFlipped(), "SE should not be flipped");
+        int rowOffset = 0; bool flip = false;
+        DirectionalAnimator.ResolveDir5(1, out rowOffset, out flip);
+        Assert(rowOffset == 1 && !flip, "SE should map to row 1 without flip");
+
+        // 2. 朝西南 (3)：水平翻转，源行借用东南(1)
+        anim.Play("walk", 3, true);
+        Assert(anim.IsCurrentFlipped(), "SW must be flipped");
+        DirectionalAnimator.ResolveDir5(3, out rowOffset, out flip);
+        Assert(rowOffset == 1 && flip, "SW should map to row 1 with flipX");
+
+        // 3. 验证 UV 坐标在翻转时 u0 与 u1 互换
+        float u0 = 0.0f; float v0 = 0.0f; float u1 = 0.0f; float v1 = 0.0f;
+        anim.GetCurrentUV(out u0, out v0, out u1, out v1);
+        Assert(u0 > u1, "Flipped UV must swap u0 and u1 horizontally");
+
+        Console.WriteLine("  -> 5方向镜像映射与 GPU 零开销翻转验证通过");
+    }
+
+    static void TestPaperdollSystem() {
+        Console.WriteLine("[2/5] 验证 Paperdoll 纸娃娃多层挂件与 8方向防穿模层深动态调序...");
+        SpriteSheet bodySheet = SpriteSheet.Create("body", 256, 256, 64, 64);
+        SpriteSheet clothSheet = SpriteSheet.Create("cloth", 256, 256, 64, 64);
+        SpriteSheet weaponSheet = SpriteSheet.Create("weapon", 256, 256, 64, 64);
+        SpriteSheet wingSheet = SpriteSheet.Create("wing", 256, 256, 64, 64);
+
+        PaperdollRenderer doll = PaperdollRenderer.Create(bodySheet, 8);
+
+        // 挂载各部件
+        // 翅膀：朝北（背面，dir=6）在最前(30)，朝南（正面，dir=2）在最后(-20)
+        int[] wingOffsets = new int[8];
+        wingOffsets[2] = -20; // 南
+        wingOffsets[6] = 30;  // 北
+        doll.AddLayer("wing", wingSheet, 0, wingOffsets, true);
+
+        // 身体
+        doll.AddLayer("body", bodySheet, 10, null, true);
+
+        // 衣服
+        doll.AddLayer("cloth", clothSheet, 20, null, true);
+
+        // 武器：朝南在最前(10)，朝北收在身后(-30)
+        int[] weaponOffsets = new int[8];
+        weaponOffsets[2] = 10;  // 南
+        weaponOffsets[6] = -30; // 北
+        doll.AddLayer("weapon", weaponSheet, 30, weaponOffsets, true);
+
+        doll.MasterAnimator.AddState("idle", 0, 4, 8.0, true);
+
+        // 测试 A：朝南 (正面视角)
+        doll.Play("idle", 2, true);
+        int activeCount = doll.SortLayersByDirection();
+        Assert(activeCount == 4, "Should have 4 active layers");
+
+        // 预期升序：Wing(0-20=-20) -> Body(10) -> Cloth(20) -> Weapon(30+10=40)
+        int firstIdx = doll.GetSortedLayerIndex(0);
+        int lastIdx = doll.GetSortedLayerIndex(3);
+        PaperdollLayer firstLayer = doll.GetLayer("wing");
+        PaperdollLayer lastLayer = doll.GetLayer("weapon");
+        Assert(firstIdx == 0, "Wing should be at bottom when facing South");
+        Assert(lastIdx == 3, "Weapon should be at top when facing South");
+
+        // 测试 B：朝北 (背面视角)
+        doll.Play("idle", 6, true);
+        doll.SortLayersByDirection();
+        // 预期升序：Weapon(30-30=0) -> Body(10) -> Cloth(20) -> Wing(0+30=30)
+        firstIdx = doll.GetSortedLayerIndex(0);
+        lastIdx = doll.GetSortedLayerIndex(3);
+        Assert(firstIdx == 3, "Weapon should be behind body when facing North");
+        Assert(lastIdx == 0, "Wing should cover body when facing North");
+
+        Console.WriteLine("  -> 纸娃娃多层部件同步驱动与动态层深重排验证通过");
+    }
+
+    static void TestMesh3DProjection() {
+        Console.WriteLine("[3/5] 验证 3D 角色投影桥接、360度无级平滑旋转与 Cross-Fade 动作融合...");
+        Mesh3DProjection proj = Mesh3DProjection.Create(64.0, 8);
+
+        // 1. 2D 坐标到 3D 坐标转换 (PPU = 64)
+        double x3d = 0.0; double y3d = 0.0; double z3d = 0.0;
+        proj.World2Dto3D(128.0, 256.0, 64.0, out x3d, out y3d, out z3d);
+        Assert(x3d == 2.0, "128px should map to 2.0m");
+        Assert(z3d == 4.0, "256px should map to 4.0m");
+        Assert(y3d == 1.0, "64px height should map to 1.0m");
+
+        // 2. 360 度任意旋转朝向与平滑旋转
+        proj.CurrentYaw = 0.0;
+        proj.SetLookDirection(0.0, 1.0); // 瞄准南方 (Math.PI / 2 ≈ 1.57079)
+        proj.RotationSpeed = 10.0;
+        proj.Update(0.1);
+        Assert(proj.CurrentYaw > 0.5, "Yaw should smoothly rotate towards target");
+
+        // 3. 骨骼挂点 (Socket)
+        proj.RegisterSocket("weapon_r", 0.5, 1.0, 0.0);
+        proj.CurrentYaw = 0.0;
+        double sx = 0.0; double sy = 0.0; double sz = 0.0;
+        bool found = proj.GetSocketWorldPosition("weapon_r", 2.0, 1.0, 4.0, out sx, out sy, out sz);
+        Assert(found, "Socket should be resolved");
+        Assert(sx == 2.5 && sy == 2.0 && sz == 4.0, "Socket position should match offset");
+
+        // 4. 动作平滑融合 (CrossFade)
+        proj.CrossFade("idle", 1.0, 1.0, true, 0.0);
+        Assert(proj.CurrentTrack.ClipName == "idle" && proj.CurrentTrack.Weight == 1.0, "Initial clip should have weight 1");
+
+        // 从 idle 融合到 attack，融合时间 0.2s
+        proj.CrossFade("attack", 0.8, 1.0, false, 0.2);
+        Assert(proj.IsFading, "Should enter fading state");
+
+        // 推进 0.1s（过了一半时间）
+        proj.Update(0.1);
+        Assert(Math.Abs(proj.CurrentTrack.Weight - 0.5) < 0.05, "Attack weight should be approx 0.5");
+        Assert(Math.Abs(proj.FadeTrack.Weight - 0.5) < 0.05, "Idle weight should be approx 0.5");
+
+        // 推进 0.15s（超过融合时间，融合完成）
+        proj.Update(0.15);
+        Assert(!proj.IsFading, "Fade should be complete");
+        Assert(proj.CurrentTrack.Weight == 1.0, "Attack weight should reach 1.0");
+        Assert(proj.FadeTrack == null, "Fade track should be cleaned up");
+
+        Console.WriteLine("  -> 3D 坐标投影、无级旋转与动作平滑混合验证通过");
+    }
+
+    static void TestSceneManagerTransitions() {
+        Console.WriteLine("[4/5] 验证 SceneManager 场景状态栈与平滑黑屏遮罩切场...");
+        SceneManager sm = SceneManager.Create(4);
+
+        Scene s1 = Scene.Create("s1", 800, 600, 256);
+        Scene s2 = Scene.Create("s2", 800, 600, 256);
+
+        // 1. Push / Pop
+        sm.Push(s1);
+        Assert(sm.GetActiveScene() == s1, "Active scene should be s1");
+        sm.Push(s2);
+        Assert(sm.GetActiveScene() == s2, "Active scene should be s2");
+        Scene popped = sm.Pop();
+        Assert(popped == s2, "Popped scene should be s2");
+        Assert(sm.GetActiveScene() == s1, "Active scene should resume to s1");
+
+        // 2. 带黑屏遮罩平滑切场 (FadeDuration = 0.2s)
+        Scene dungeon = Scene.Create("dungeon", 800, 600, 256);
+        sm.SwitchScene(dungeon, 0.2);
+
+        Assert(sm.Phase == TransitionPhase.FadeOut, "Phase should be FadeOut");
+        Assert(sm.IsTransitioning, "Should be transitioning");
+
+        // 步进 0.1s (渐暗一半)
+        sm.Update(0.1);
+        Assert(sm.FadeAlpha > 0.4 && sm.FadeAlpha < 0.6, "FadeAlpha should be ~0.5");
+
+        // 步进 0.15s (完成淡出，进入黑屏完全遮蔽的 Switching 阶段并切换场景，再进入 FadeIn)
+        sm.Update(0.15);
+        Assert(sm.GetActiveScene() == dungeon, "Dungeon scene should now be mounted under black mask");
+
+        // 步进 0.25s (完全淡入，恢复正常游玩状态)
+        sm.Update(0.25);
+        Assert(sm.Phase == TransitionPhase.None, "Phase should be None");
+        Assert(sm.FadeAlpha == 0.0, "FadeAlpha should return to 0.0");
+
+        Console.WriteLine("  -> 场景栈与黑屏遮罩平滑转场管线验证通过");
+    }
+
+    static void TestAssetPipelineTools() {
+        Console.WriteLine("[5/5] 验证 AssetPipeline 素材与图集自动化计算与元数据导出...");
+
+        // 1. 图集规格计算：64x64 单帧，40 个帧
+        int atlasW = 0; int atlasH = 0; int cols = 0; int rows = 0;
+        AssetPipeline.CalculateOptimalAtlasSize(64, 64, 40, out atlasW, out atlasH, out cols, out rows);
+        Assert(atlasW >= 256 && atlasH >= 256, "Atlas size should be power of two >= 256");
+        Assert(cols * rows >= 40, "Atlas cells should accommodate all 40 frames");
+
+        // 2. 导出图集 Manifest JSON
+        string atlasJson = AssetPipeline.GenerateAtlasManifestJson("Hero", atlasW, atlasH, 64, 64, cols, rows, 40);
+        Assert(atlasJson.Length > 100, "Atlas json should be generated");
+
+        // 3. 导出 5方向映射 JSON
+        string mirrorJson = AssetPipeline.Generate5DirMappingJson("Warrior");
+        Assert(mirrorJson.Length > 100, "5Dir mirror json should be generated");
+
+        // 4. 导出纸娃娃层深配置 JSON
+        string dollJson = AssetPipeline.GeneratePaperdollManifestJson("Warrior");
+        Assert(dollJson.Length > 100, "Paperdoll json should be generated");
+
+        Console.WriteLine("  -> 素材与图集自动化管线验证通过");
+    }
+}

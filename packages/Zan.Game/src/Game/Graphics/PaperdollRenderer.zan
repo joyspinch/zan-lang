@@ -1,0 +1,204 @@
+using System;
+
+namespace Game.Graphics;
+
+/// <summary>
+/// 纸娃娃独立挂件层（如：身体、服饰、武器、翅膀、头饰）。
+/// </summary>
+class PaperdollLayer {
+    string name;
+    SpriteSheet sheet;
+    bool is5DirMode;
+    bool visible;
+    double offsetX;
+    double offsetY;
+    int baseOrder;
+    int[] orderPerDir; // 8 个朝向下的微调层深（解决正面武器在前、背面武器在后的遮挡穿模问题）
+
+    PaperdollLayer(string name, SpriteSheet sheet, int baseOrder, int[] orderPerDir, bool is5DirMode) {
+        this.name = name != null ? name : "";
+        this.sheet = sheet;
+        this.baseOrder = baseOrder;
+        this.is5DirMode = is5DirMode;
+        this.visible = true;
+        this.offsetX = 0.0;
+        this.offsetY = 0.0;
+
+        this.orderPerDir = new int[8];
+        if (orderPerDir != null) {
+            int n = orderPerDir.Length < 8 ? orderPerDir.Length : 8;
+            for (int i = 0; i < n; i = i + 1) {
+                this.orderPerDir[i] = orderPerDir[i];
+            }
+        }
+    }
+
+    static PaperdollLayer Create(string name, SpriteSheet sheet, int baseOrder, int[] orderPerDir, bool is5DirMode) {
+        return new PaperdollLayer(name, sheet, baseOrder, orderPerDir, is5DirMode);
+    }
+
+    string Name { get { return name; } }
+    SpriteSheet Sheet { get { return sheet; } set { sheet = value; } }
+    bool Visible { get { return visible; } set { visible = value; } }
+    bool Is5DirMode { get { return is5DirMode; } set { is5DirMode = value; } }
+    double OffsetX { get { return offsetX; } set { offsetX = value; } }
+    double OffsetY { get { return offsetY; } set { offsetY = value; } }
+    int BaseOrder { get { return baseOrder; } set { baseOrder = value; } }
+
+    int GetOrder(int dir8) {
+        int d = (dir8 >= 0 && dir8 < 8) ? dir8 : 2;
+        return baseOrder + orderPerDir[d];
+    }
+}
+
+/// <summary>
+/// 2.5D / ARPG 传奇与暗黑类纸娃娃换装与分层渲染系统。
+/// 主控单一时间轴，保证各挂件同帧严格对齐；
+/// 支持 5 方向自动镜像与 8 方向动态层深调序（彻底消除穿模）。
+/// </summary>
+class PaperdollRenderer {
+    PaperdollLayer[] layers;
+    int layerCount;
+    DirectionalAnimator masterAnimator; // 主控动作与时间轴
+
+    int[] sortedLayerIndices; // 预分配排序索引缓存（零 GC）
+    int[] sortKeys;
+
+    PaperdollRenderer(SpriteSheet baseSheet, int maxLayers) {
+        int cap = maxLayers > 0 ? maxLayers : 12;
+        this.layers = new PaperdollLayer[cap];
+        this.layerCount = 0;
+        this.sortedLayerIndices = new int[cap];
+        this.sortKeys = new int[cap];
+
+        // 默认主控动画机
+        this.masterAnimator = DirectionalAnimator.Create(baseSheet, 16);
+    }
+
+    static PaperdollRenderer Create(SpriteSheet baseSheet, int maxLayers) {
+        return new PaperdollRenderer(baseSheet, maxLayers);
+    }
+
+    DirectionalAnimator MasterAnimator { get { return masterAnimator; } }
+    int LayerCount { get { return layerCount; } }
+
+    /// <summary>添加或挂载一个纸娃娃部件层。</summary>
+    void AddLayer(string name, SpriteSheet sheet, int baseOrder, int[] orderPerDir, bool is5DirMode) {
+        if (layerCount < layers.Length) {
+            layers[layerCount] = PaperdollLayer.Create(name, sheet, baseOrder, orderPerDir, is5DirMode);
+            sortedLayerIndices[layerCount] = layerCount;
+            layerCount = layerCount + 1;
+        }
+    }
+
+    /// <summary>根据名字获取指定部件层。</summary>
+    PaperdollLayer GetLayer(string name) {
+        for (int i = 0; i < layerCount; i = i + 1) {
+            if (layers[i] != null && layers[i].Name == name) {
+                return layers[i];
+            }
+        }
+        return null;
+    }
+
+    /// <summary>设置部件层可见性（例如隐藏头盔或脱下翅膀）。</summary>
+    void SetLayerVisible(string name, bool visible) {
+        PaperdollLayer l = GetLayer(name);
+        if (l != null) {
+            l.Visible = visible;
+        }
+    }
+
+    /// <summary>替换指定部位的图集（实现即时换装换武器）。</summary>
+    void SwapLayerSheet(string name, SpriteSheet newSheet) {
+        PaperdollLayer l = GetLayer(name);
+        if (l != null) {
+            l.Sheet = newSheet;
+        }
+    }
+
+    /// <summary>播放动作，统一主控动画机。</summary>
+    void Play(string stateName, int dir8, bool forceRestart) {
+        masterAnimator.Play(stateName, dir8, forceRestart);
+    }
+
+    /// <summary>时钟步进推进。</summary>
+    void Update(double dt) {
+        masterAnimator.Update(dt);
+    }
+
+    /// <summary>
+    /// 根据当前朝向对所有激活的部件层进行 Z-Order 快速排序（升序）。
+    /// 返回有效部件层数量，排序结果保存在 sortedLayerIndices 中。
+    /// </summary>
+    int SortLayersByDirection() {
+        int dir = masterAnimator.Direction;
+        int activeCount = 0;
+
+        for (int i = 0; i < layerCount; i = i + 1) {
+            PaperdollLayer l = layers[i];
+            if (l != null && l.Visible && l.Sheet != null) {
+                sortedLayerIndices[activeCount] = i;
+                sortKeys[activeCount] = l.GetOrder(dir);
+                activeCount = activeCount + 1;
+            }
+        }
+
+        // 原位插入排序（部件层数量极少通常在 3~10 之间，插入排序速度极快且零堆分配）
+        for (int i = 1; i < activeCount; i = i + 1) {
+            int curKey = sortKeys[i];
+            int curIdx = sortedLayerIndices[i];
+            int j = i - 1;
+            while (j >= 0 && sortKeys[j] > curKey) {
+                sortKeys[j + 1] = sortKeys[j];
+                sortedLayerIndices[j + 1] = sortedLayerIndices[j];
+                j = j - 1;
+            }
+            sortKeys[j + 1] = curKey;
+            sortedLayerIndices[j + 1] = curIdx;
+        }
+
+        return activeCount;
+    }
+
+    /// <summary>获取排序后的第 i 个图层索引。</summary>
+    int GetSortedLayerIndex(int sortedRank) {
+        if (sortedRank >= 0 && sortedRank < layerCount) {
+            return sortedLayerIndices[sortedRank];
+        }
+        return -1;
+    }
+
+    /// <summary>
+    /// 获取指定部件层在当前主控动画帧下的 UV 矩形与翻转标志。
+    /// </summary>
+    void GetLayerCurrentUV(int layerIndex, out float u0, out float v0, out float u1, out float v1, out bool flipped) {
+        u0 = 0.0f; v0 = 0.0f; u1 = 1.0f; v1 = 1.0f;
+        flipped = false;
+
+        if (layerIndex < 0 || layerIndex >= layerCount) { return; }
+        PaperdollLayer l = layers[layerIndex];
+        if (l == null || l.Sheet == null) { return; }
+
+        int dir8 = masterAnimator.Direction;
+        int frameInDir = masterAnimator.CurrentFrameInDir;
+        int rowOffset = dir8;
+
+        if (l.Is5DirMode) {
+            int r5 = 0;
+            bool fx = false;
+            DirectionalAnimator.ResolveDir5(dir8, out r5, out fx);
+            rowOffset = r5;
+            flipped = fx;
+        }
+
+        int globalFrame = rowOffset * l.Sheet.Cols + frameInDir;
+        l.Sheet.GetFrameUV(globalFrame, out u0, out v0, out u1, out v1);
+
+        if (flipped) {
+            float temp = u0;
+            u0 = u1;
+            u1 = temp;
+        }
+    }
+}
