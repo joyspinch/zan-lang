@@ -1,0 +1,175 @@
+using System;
+using Gui;
+using Game.Arpg;
+
+namespace Game.Core;
+
+/// <summary>
+/// 统一游戏场景与实体生命周期管理器。
+/// 将 GameClock、Camera2D、SpatialHash2D 与 YSortLayer 缝合成自动化流水线。
+/// </summary>
+class Scene {
+    string name;
+    Camera2D camera;
+    SpatialHash2D spatialGrid;
+    YSortLayer ySortLayer;
+    GameClock clock;
+
+    int maxEntities;
+    Entity[] entities;
+    int entityCount;
+
+    // 延迟添加与删除缓冲队列（防止在遍历时修改集合）
+    Entity[] pendingAdd;
+    int pendingAddCount;
+    int nextEntityId;
+
+    Scene(string name, int viewW, int viewH, int maxCap) {
+        this.name = name != null ? name : "DefaultScene";
+        this.maxEntities = maxCap > 64 ? maxCap : 2048;
+        this.entities = new Entity[maxEntities];
+        this.entityCount = 0;
+        this.pendingAdd = new Entity[256];
+        this.pendingAddCount = 0;
+        this.nextEntityId = 1;
+
+        this.camera = Camera2D.Create(viewW, viewH);
+        this.spatialGrid = SpatialHash2D.Create(64, maxEntities);
+        this.ySortLayer = YSortLayer.Create(maxEntities);
+        this.clock = new GameClock(0.0166666667); // 默认 60Hz 固定逻辑帧
+    }
+
+    static Scene Create(string name, int viewW, int viewH, int maxCap) {
+        return new Scene(name, viewW, viewH, maxCap);
+    }
+
+    string Name { get { return name; } }
+    Camera2D Camera { get { return camera; } }
+    SpatialHash2D SpatialGrid { get { return spatialGrid; } }
+    GameClock Clock { get { return clock; } }
+    int EntityCount { get { return entityCount; } }
+
+    int NextId() {
+        int id = nextEntityId;
+        nextEntityId = nextEntityId + 1;
+        return id;
+    }
+
+    /// <summary>登记并向场景添加实体。</summary>
+    void AddEntity(Entity e) {
+        if (e == null) { return; }
+        if (pendingAddCount < 256) {
+            pendingAdd[pendingAddCount] = e;
+            pendingAddCount = pendingAddCount + 1;
+        }
+    }
+
+    void FlushPendingAdd() {
+        for (int i = 0; i < pendingAddCount; i = i + 1) {
+            Entity e = pendingAdd[i];
+            if (entityCount < maxEntities) {
+                entities[entityCount] = e;
+                entityCount = entityCount + 1;
+                e.OnAwake(this);
+            }
+            pendingAdd[i] = null;
+        }
+        pendingAddCount = 0;
+    }
+
+    /// <summary>
+    /// 推进固定步长物理循环。
+    /// 自动调用实体的 OnFixedUpdate 并重建空间哈希索引。
+    /// </summary>
+    void AdvanceFixedStep(double fixedDt) {
+        FlushPendingAdd();
+
+        // 1. 刷新空间哈希桶
+        spatialGrid.Clear();
+
+        // 2. 步进更新与死亡回收
+        int aliveCount = 0;
+        for (int i = 0; i < entityCount; i = i + 1) {
+            Entity e = entities[i];
+            if (e != null && e.IsAlive) {
+                e.SnapshotHistory();
+                if (e.IsActive) {
+                    e.OnFixedUpdate(this, fixedDt);
+                }
+                // 注册进空间哈希桶，支持 O(1) 近邻索敌与碰撞检索
+                spatialGrid.Insert(e.Id, e.X, e.Y, e.Radius);
+
+                entities[aliveCount] = e;
+                aliveCount = aliveCount + 1;
+            } else if (e != null) {
+                e.OnDestroy(this);
+            }
+        }
+
+        // 清理空闲尾部槽位
+        for (int i = aliveCount; i < entityCount; i = i + 1) {
+            entities[i] = null;
+        }
+        entityCount = aliveCount;
+    }
+
+    /// <summary>
+    /// 驱动整个场景的时钟泵。
+    /// 自动处理螺旋死锁并根据累计耗时推进固定物理步长。
+    /// </summary>
+    int Tick() {
+        int steps = clock.Advance();
+        for (int s = 0; s < steps; s = s + 1) {
+            AdvanceFixedStep(clock.FixedDeltaTime);
+        }
+        camera.Update(clock.FixedDeltaTime);
+        return steps;
+    }
+
+    /// <summary>
+    /// 场景完整视锥剔除与深度 Y 排序渲染。
+    /// 自动解算亚帧平滑插值，按脚底 Y 坐标从小到大绘制，消除一切抖动与层级遮挡错乱。
+    /// </summary>
+    void Render(Canvas c) {
+        double alpha = clock.InterpolationAlpha();
+        double invAlpha = 1.0 - alpha;
+
+        // 1. 视锥裁剪并推入 Y 深度排序层
+        ySortLayer.Clear();
+        for (int i = 0; i < entityCount; i = i + 1) {
+            Entity e = entities[i];
+            if (e != null && e.IsActive) {
+                // 计算平滑插值坐标
+                double ix = e.PrevX * invAlpha + e.X * alpha;
+                double iy = e.PrevY * invAlpha + e.Y * alpha;
+
+                // 视锥范围裁剪：视野之外的实体不参与排序与绘制
+                if (camera.IsVisible(ix - e.Width * 0.5, iy - e.Height * 0.5, e.Width, e.Height)) {
+                    ySortLayer.Push(i, e.SortLayer, iy + e.FootOffsetY);
+                }
+            }
+        }
+
+        // 2. 原位快速深度排序
+        ySortLayer.Sort();
+
+        // 3. 依正确深度层级有序提交绘制
+        ySortLayer.ForEachSorted((int entityIdx, int sortLayerId, double footY) => {
+            Entity e = entities[entityIdx];
+            if (e != null) {
+                double ix = e.PrevX * invAlpha + e.X * alpha;
+                double iy = e.PrevY * invAlpha + e.Y * alpha;
+                e.OnRender(this, c, ix, iy);
+            }
+        });
+    }
+
+    /// <summary>按 ID 查找场景内活跃实体，未找到返回 null。</summary>
+    Entity FindById(int id) {
+        for (int i = 0; i < entityCount; i = i + 1) {
+            Entity e = entities[i];
+            if (e != null && e.Id == id) { return e; }
+        }
+        return null;
+    }
+}

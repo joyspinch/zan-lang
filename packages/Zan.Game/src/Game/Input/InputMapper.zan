@@ -1,0 +1,194 @@
+using System;
+using Game.Core;
+using Game.Arpg;
+
+namespace Game.Input;
+
+/// <summary>
+/// 统一游戏输入映射器与世界空间拾取投影系统。
+/// 将屏幕原生鼠标点击、按键事件转化为抽象动作，
+/// 自动逆投影为世界坐标与 2.5D 等轴菱形网格坐标，内置框选矩形辅助。
+/// </summary>
+class InputMapper {
+    double screenMouseX;
+    double screenMouseY;
+    bool isLeftMouseDown;
+    bool isRightMouseDown;
+
+    // 框选拖拽状态（RTS 圈兵、框选目标）
+    bool isDragging;
+    double dragStartScreenX;
+    double dragStartScreenY;
+
+    // 按键状态表（256 个虚拟键码）
+    bool[] keyState;
+    bool[] keyJustPressed;
+    bool[] keyJustReleased;
+
+    // 动作绑定表（最多支持 32 个抽象语义动作）
+    string[] actionNames;
+    int[] actionKeyBindings;
+    int actionCount;
+
+    InputMapper() {
+        this.screenMouseX = 0.0;
+        this.screenMouseY = 0.0;
+        this.isLeftMouseDown = false;
+        this.isRightMouseDown = false;
+        this.isDragging = false;
+
+        this.keyState = new bool[256];
+        this.keyJustPressed = new bool[256];
+        this.keyJustReleased = new bool[256];
+
+        this.actionNames = new string[32];
+        this.actionKeyBindings = new int[32];
+        this.actionCount = 0;
+    }
+
+    static InputMapper Create() {
+        return new InputMapper();
+    }
+
+    double MouseX { get { return screenMouseX; } }
+    double MouseY { get { return screenMouseY; } }
+    bool IsLeftDown { get { return isLeftMouseDown; } }
+    bool IsRightDown { get { return isRightMouseDown; } }
+    bool IsDragging { get { return isDragging; } }
+
+    /// <summary>绑定抽象动作到虚拟键码（如 BindAction("Attack", 32) 空格攻击）。</summary>
+    void BindAction(string action, int keyCode) {
+        if (actionCount < actionNames.Length && keyCode >= 0 && keyCode < 256) {
+            actionNames[actionCount] = action;
+            actionKeyBindings[actionCount] = keyCode;
+            actionCount = actionCount + 1;
+        }
+    }
+
+    /// <summary>更新鼠标移动坐标。</summary>
+    void OnMouseMove(double sx, double sy) {
+        this.screenMouseX = sx;
+        this.screenMouseY = sy;
+        if (isLeftMouseDown && !isDragging) {
+            double dx = sx - dragStartScreenX;
+            double dy = sy - dragStartScreenY;
+            if (dx * dx + dy * dy >= 36.0) { // 拖动超过 6 像素触发框选
+                isDragging = true;
+            }
+        }
+    }
+
+    /// <summary>更新鼠标按键事件。</summary>
+    void OnMouseButton(int button, bool isDown) {
+        if (button == 0) { // 左键
+            this.isLeftMouseDown = isDown;
+            if (isDown) {
+                this.dragStartScreenX = screenMouseX;
+                this.dragStartScreenY = screenMouseY;
+                this.isDragging = false;
+            } else {
+                this.isDragging = false;
+            }
+        } else if (button == 1) { // 右键
+            this.isRightMouseDown = isDown;
+        }
+    }
+
+    /// <summary>更新按键按下状态。</summary>
+    void OnKeyDown(int keyCode) {
+        if (keyCode >= 0 && keyCode < 256) {
+            if (!keyState[keyCode]) {
+                keyJustPressed[keyCode] = true;
+            }
+            keyState[keyCode] = true;
+        }
+    }
+
+    /// <summary>更新按键抬起状态。</summary>
+    void OnKeyUp(int keyCode) {
+        if (keyCode >= 0 && keyCode < 256) {
+            if (keyState[keyCode]) {
+                keyJustReleased[keyCode] = true;
+            }
+            keyState[keyCode] = false;
+        }
+    }
+
+    /// <summary>在每帧末尾清除瞬态单次击发标记。</summary>
+    void FlushFrameEvents() {
+        for (int i = 0; i < 256; i = i + 1) {
+            keyJustPressed[i] = false;
+            keyJustReleased[i] = false;
+        }
+    }
+
+    /// <summary>查询指定动作当前是否处于按住状态。</summary>
+    bool IsActionDown(string action) {
+        for (int i = 0; i < actionCount; i = i + 1) {
+            if (actionNames[i] == action) {
+                int kc = actionKeyBindings[i];
+                return keyState[kc];
+            }
+        }
+        return false;
+    }
+
+    /// <summary>查询指定动作是否在当前帧刚刚按下。</summary>
+    bool IsActionJustPressed(string action) {
+        for (int i = 0; i < actionCount; i = i + 1) {
+            if (actionNames[i] == action) {
+                int kc = actionKeyBindings[i];
+                return keyJustPressed[kc];
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// 结合摄像机，将当前屏幕鼠标位置自动逆投影为游戏世界坐标。
+    /// </summary>
+    void GetWorldMouse(Camera2D cam, out double wx, out double wy) {
+        if (cam == null) {
+            wx = screenMouseX;
+            wy = screenMouseY;
+            return;
+        }
+        cam.ScreenToWorld(screenMouseX, screenMouseY, out wx, out wy);
+    }
+
+    /// <summary>
+    /// 结合摄像机和等轴测地砖，将当前屏幕鼠标位置直接逆投影为地图瓦片坐标 (gx, gy)。
+    /// 经典传奇点地跑位、暗黑拾取与 RTS 建造摆位核心算子。
+    /// </summary>
+    void GetIsoGridMouse(Camera2D cam, IsoTileMap map, out int gx, out int gy) {
+        double wx, wy;
+        GetWorldMouse(cam, out wx, out wy);
+        if (map == null) {
+            gx = (int)wx;
+            gy = (int)wy;
+            return;
+        }
+        map.WorldToGrid(wx, wy, out gx, out gy);
+    }
+
+    /// <summary>
+    /// 获取当前鼠标拖拽框选的世界坐标包围矩形 [minX, minY, maxX, maxY]。
+    /// RTS 圈选多个兵团、批量施法的核心功能。
+    /// </summary>
+    bool GetSelectionWorldBox(Camera2D cam, out double minX, out double minY, out double maxX, out double maxY) {
+        if (!isDragging || cam == null) {
+            minX = 0; minY = 0; maxX = 0; maxY = 0;
+            return false;
+        }
+
+        double w1, h1, w2, h2;
+        cam.ScreenToWorld(dragStartScreenX, dragStartScreenY, out w1, out h1);
+        cam.ScreenToWorld(screenMouseX, screenMouseY, out w2, out h2);
+
+        minX = Math.Min(w1, w2);
+        maxX = Math.Max(w1, w2);
+        minY = Math.Min(h1, h2);
+        maxY = Math.Max(h1, h2);
+        return true;
+    }
+}

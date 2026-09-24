@@ -425,4 +425,9 @@ Post 调用核对编码，别信二手注释。
   - `ActionQueue`：阻塞式时序演播队列，保证回合制打牌中抽牌、伤害跳字、亡语触发依次连贯展现。
 - **数学与转向算子**：
   - 编译器内置 `Math.Atan2(y, x)` / `Atan` / `Asin` / `Acos`，原生直通 libc/libm，游戏转向、炮塔瞄准与弹道追踪严禁手写低精度的经验近似。
+- **引擎管线全流程缝合基础设施（Scene / Entity / Viewport / Input）**：
+  - `Scene` & `Entity`：生命周期规范收拢（`OnAwake` / `OnFixedUpdate` / `OnRender` / `OnDestroy`）。`Scene` 内部自动将 `GameClock`、`Camera2D`、`SpatialHash2D` 与 `YSortLayer` 串接成自动化流水线，步进时自动重建空间哈希，渲染时自动亚帧平滑插值滤波与视锥剔除，严禁业务层手动写散乱的多层循环。
+  - `SpriteSheet` & `DirectionalAnimator`：标准化 8 方向角色动作骨骼切片（`idle`, `walk`, `attack`, `die`），根据朝向与 FPS 自动映射 UV 纹理坐标，彻底消除手写零碎帧数计算。
+  - `InputMapper`：将物理像素鼠标坐标自动逆投影为摄像机世界空间坐标与 2.5D 等轴测菱形地砖网格（`GetIsoGridMouse`），内置框选矩形辅助（`GetSelectionWorldBox`），并提供抽象动作语义映射（`BindAction` / `IsActionJustPressed`）。
+  - `GameViewport`：继承自标准 `Gui.Control`，内置 dock 布局与固定时钟自驱动泵，底层无缝消费 GPU Canvas/SpriteBatch，顶层暴露 `SetHudRenderer` 叠加标准 GUI 控件，实现沉浸式游戏世界与企业级桌面 UI 规范融合。
 

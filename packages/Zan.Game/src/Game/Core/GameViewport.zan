@@ -1,0 +1,73 @@
+using System;
+using Gui;
+using Game.Input;
+
+namespace Game.Core;
+
+/// <summary>
+/// 官方游戏世界视口集成控件（GameViewport）。
+/// 继承自 Gui.Control，无缝缝合底层 GPU Canvas 渲染与上层高频游戏世界逻辑。
+/// 自动同步视口边界、推进固定时钟步进并映射鼠标世界空间拾取。
+/// </summary>
+class GameViewport : Control {
+    Scene activeScene;
+    InputMapper input;
+    Action<Canvas, int, int> onRenderHudCallback;
+    bool autoDriveClock;
+
+    GameViewport(Scene scene, int dockMode) {
+        this.InitControl("game_viewport", dockMode > 0 ? dockMode : 5); // 默认 dock=5 铺满剩余空间
+        this.activeScene = scene;
+        this.input = InputMapper.Create();
+        this.onRenderHudCallback = null;
+        this.autoDriveClock = true;
+    }
+
+    static GameViewport Create(Scene scene) {
+        return new GameViewport(scene, 5);
+    }
+
+    Scene CurrentScene { get { return activeScene; } set { activeScene = value; } }
+    InputMapper Input { get { return input; } }
+    bool AutoDriveClock { get { return autoDriveClock; } set { autoDriveClock = value; } }
+
+    /// <summary>注册顶层 HUD / UI 绘制回调（在场景世界渲染完成后叠加）。</summary>
+    void SetHudRenderer(Action<Canvas, int, int> hudCallback) {
+        this.onRenderHudCallback = hudCallback;
+    }
+
+    override void OnMeasure(App app) {
+        base.OnMeasure(app);
+        // 允许自由拉伸自适应容器大小
+        this.grow = true;
+    }
+
+    override void OnPaint(App app) {
+        base.OnPaint(app);
+        if (activeScene == null) { return; }
+
+        Canvas c = app.canvas;
+        if (c == null) { return; }
+
+        // 1. 同步视口物理像素尺寸至摄像机
+        if (this.bw > 0 && this.bh > 0) {
+            activeScene.Camera.Resize(this.bw, this.bh);
+        }
+
+        // 2. 推进游戏时钟步进与实体物理
+        if (autoDriveClock) {
+            activeScene.Tick();
+        }
+
+        // 3. 游戏场景世界渲染（自动包含视锥剔除与 YSort 动态遮挡排序）
+        activeScene.Render(c);
+
+        // 4. 顶层游戏 HUD 叠加绘制（小地图、状态槽、技能快捷栏）
+        if (onRenderHudCallback != null) {
+            onRenderHudCallback(c, this.bw, this.bh);
+        }
+
+        // 5. 刷新单帧输入击发事件
+        input.FlushFrameEvents();
+    }
+}

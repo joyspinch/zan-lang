@@ -1,0 +1,147 @@
+using System;
+
+namespace Game.Graphics;
+
+/// <summary>
+/// 单个动作片段元数据（例如 "walk"、"attack"）。
+/// </summary>
+class AnimationState {
+    string name;
+    int startRow;       // 在图集中的起始行号（通常 8 方向各占一行）
+    int framesPerDir;   // 每个方向包含的连续动作帧数
+    double fps;         // 播放帧率（帧/秒）
+    bool loop;          // 是否循环
+
+    AnimationState(string name, int startRow, int framesPerDir, double fps, bool loop) {
+        this.name = name != null ? name : "";
+        this.startRow = startRow;
+        this.framesPerDir = framesPerDir > 0 ? framesPerDir : 1;
+        this.fps = fps > 0.1 ? fps : 10.0;
+        this.loop = loop;
+    }
+
+    static AnimationState Create(string name, int startRow, int framesPerDir, double fps, bool loop) {
+        return new AnimationState(name, startRow, framesPerDir, fps, loop);
+    }
+
+    string Name { get { return name; } }
+    int StartRow { get { return startRow; } }
+    int FramesPerDir { get { return framesPerDir; } }
+    double Fps { get { return fps; } }
+    bool Loop { get { return loop; } }
+}
+
+/// <summary>
+/// 2.5D / ARPG / RTS 经典 8 方向多状态骨骼级帧动画机。
+/// 自动衔接待机、行军、挥刀攻击、施法及死亡动画，杜绝手写零碎帧数判定。
+/// </summary>
+class DirectionalAnimator {
+    SpriteSheet sheet;
+    AnimationState[] states;
+    int stateCount;
+
+    int currentStateIndex;
+    int currentDir8;        // 当前朝向 (0:东, 1:东南, 2:南, 3:西南, 4:西, 5:西北, 6:北, 7:东北)
+    double frameTimer;
+    int currentFrameInDir;
+    bool isFinished;
+
+    DirectionalAnimator(SpriteSheet sheet, int maxStates) {
+        this.sheet = sheet;
+        this.states = new AnimationState[maxStates > 0 ? maxStates : 16];
+        this.stateCount = 0;
+
+        this.currentStateIndex = -1;
+        this.currentDir8 = 2; // 默认朝南
+        this.frameTimer = 0.0;
+        this.currentFrameInDir = 0;
+        this.isFinished = false;
+    }
+
+    static DirectionalAnimator Create(SpriteSheet sheet, int maxStates) {
+        return new DirectionalAnimator(sheet, maxStates);
+    }
+
+    SpriteSheet Sheet { get { return sheet; } }
+    int Direction { get { return currentDir8; } set { currentDir8 = (value >= 0 && value < 8) ? value : 2; } }
+    bool IsFinished { get { return isFinished; } }
+
+    /// <summary>注册一个动作状态配置。</summary>
+    void AddState(string name, int startRow, int framesPerDir, double fps, bool loop) {
+        if (stateCount < states.Length) {
+            states[stateCount] = AnimationState.Create(name, startRow, framesPerDir, fps, loop);
+            if (currentStateIndex == -1) {
+                currentStateIndex = stateCount;
+            }
+            stateCount = stateCount + 1;
+        }
+    }
+
+    /// <summary>切换播放状态（例如从 "idle" 切到 "attack"）。</summary>
+    void Play(string stateName, int dir8, bool forceRestart) {
+        this.currentDir8 = (dir8 >= 0 && dir8 < 8) ? dir8 : currentDir8;
+
+        int foundIdx = -1;
+        for (int i = 0; i < stateCount; i = i + 1) {
+            if (states[i] != null && states[i].Name == stateName) {
+                foundIdx = i;
+                break;
+            }
+        }
+
+        if (foundIdx >= 0) {
+            if (foundIdx != currentStateIndex || forceRestart) {
+                currentStateIndex = foundIdx;
+                currentFrameInDir = 0;
+                frameTimer = 0.0;
+                isFinished = false;
+            }
+        }
+    }
+
+    /// <summary>逐帧推进动画定时器。</summary>
+    void Update(double dt) {
+        if (currentStateIndex < 0 || isFinished) { return; }
+        AnimationState st = states[currentStateIndex];
+        if (st == null) { return; }
+
+        double frameDuration = 1.0 / st.Fps;
+        frameTimer = frameTimer + dt;
+
+        while (frameTimer >= frameDuration) {
+            frameTimer = frameTimer - frameDuration;
+            currentFrameInDir = currentFrameInDir + 1;
+
+            if (currentFrameInDir >= st.FramesPerDir) {
+                if (st.Loop) {
+                    currentFrameInDir = 0;
+                } else {
+                    currentFrameInDir = st.FramesPerDir - 1;
+                    isFinished = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// 获取当前帧在 SpriteSheet 中的全局绝对图元帧索引。
+    /// 公式：(startRow + dir8) * cols + currentFrameInDir
+    /// </summary>
+    int GetCurrentGlobalFrame() {
+        if (currentStateIndex < 0 || sheet == null) { return 0; }
+        AnimationState st = states[currentStateIndex];
+        if (st == null) { return 0; }
+
+        int row = st.StartRow + currentDir8;
+        return row * sheet.Cols + currentFrameInDir;
+    }
+
+    /// <summary>
+    /// 直接获取当前帧对应的纹理 UV 矩形。
+    /// </summary>
+    void GetCurrentUV(out float u0, out float v0, out float u1, out float v1) {
+        int gFrame = GetCurrentGlobalFrame();
+        sheet.GetFrameUV(gFrame, out u0, out v0, out u1, out v1);
+    }
+}
