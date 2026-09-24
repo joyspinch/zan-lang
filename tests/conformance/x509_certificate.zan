@@ -1,0 +1,99 @@
+using System;
+using System.IO;
+using System.Security.Cryptography;
+
+/* 纯 Zan 原生 X.509 证书解析与 RFC 6125 主机名验证测试：
+ * 验证 100% 纯 Zan 语言自举实现的 ASN.1 DER 解码器、
+ * Subject/Issuer 提取、SAN 扩展解析、SPKI 公钥提取与哈希计算，
+ * 以及严格的 RFC 6125 通配符与单级域名匹配规则。零 C 底座依赖。 */
+class Program {
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            failures = failures + 1;
+        }
+    }
+
+    static string CERT_WITH_SAN = "-----BEGIN CERTIFICATE-----\n"
+        + "MIIDGDCCAgCgAwIBAgIUaqrty6rrTvVQ2rRAeBvfwNJolBUwDQYJKoZIhvcNAQEL\n"
+        + "BQAwFjEUMBIGA1UEAwwLWmFuIFRlc3QgQ0EwHhcNMjYwODA2MTcxMTMyWhcNMzYw\n"
+        + "ODAzMTcxMTMyWjAYMRYwFAYDVQQDDA13cm9uZy5leGFtcGxlMIIBIjANBgkqhkiG\n"
+        + "9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqvgmHOa4fI0bR4y48uabV+hkIfiIMMQgMVGE\n"
+        + "6QdVXCQjGTbjavVhr655UkoPmA/g+8Lj+KKGCq3MpGSuIxRvWgp/Syl2O77l7Amd\n"
+        + "SdlidgLvlUg5h4hlnqIWLNxpiGF6TMIoyJ4ohWMqKuuIAPoeWF933yuSWsorG4fz\n"
+        + "FqUJi5zpfrVz9QGbz4cpOJXguuk6r8BzonL8mMqSglcyoiPearaYQWOSpohriCug\n"
+        + "p8PpGKskOKD8OBaKdvTc+e05Stsbgj+MCDkKSgLPi3IXDUPHS66MLVyOX4gNk7w+\n"
+        + "evhPCJJQtkr1wPHd9zFB9I98eZMwQzmEdqvDFeoYe6FUrFGqyQIDAQABo1wwWjAY\n"
+        + "BgNVHREEETAPgg13cm9uZy5leGFtcGxlMB0GA1UdDgQWBBSGH7lrfqpCUMF/8UYv\n"
+        + "LVX/XVGLFDAfBgNVHSMEGDAWgBSeKinxxpZl/nf2iUATBS7Oo4hFlDANBgkqhkiG\n"
+        + "9w0BAQsFAAOCAQEAN5byRoBRRJguzdZFJOOrwQxy47rNrnoKdL9QXV4s5XcRF5ZC\n"
+        + "K3pueEdmQMW4CgOJ38F03e3Fd8SF/d73pNimoeOUmjrDNC83GFPYsweiL4PNCqDU\n"
+        + "PKoixouw0gdl2eHUWg7qd+aTNVg2F2rFDcHzQu0/tQNSkHVmKC5ZIT4OjWt9IOjl\n"
+        + "bMT3/Bog5jXwKPMLdfMj8Z3J4432DE797PxY7UN9I+fXgTtj4AUQeR1BAi2jh7L8\n"
+        + "fIY9E5BPmY3+jNX0TEXiDYj6uKokXbx4N82ksSBAovOXPgiUYqRbmPlpyd7l5YE1\n"
+        + "XcaVSekej9G4zp6CQVO8o32S7vcVG3/giNJPRg==\n"
+        + "-----END CERTIFICATE-----\n";
+
+    static string CA_CERT = "-----BEGIN CERTIFICATE-----\n"
+        + "MIIDDTCCAfWgAwIBAgIUb/bsPNHjOsVxStVQV+eCJLvKtSEwDQYJKoZIhvcNAQEL\n"
+        + "BQAwFjEUMBIGA1UEAwwLWmFuIFRlc3QgQ0EwHhcNMjYwODA2MTcxMTI0WhcNMzYw\n"
+        + "ODAzMTcxMTI0WjAWMRQwEgYDVQQDDAtaYW4gVGVzdCBDQTCCASIwDQYJKoZIhvcN\n"
+        + "AQEBBQADggEPADCCAQoCggEBAK0xBdnDn6QVIaiCyPqPM3TDnomvnz3XrwUG54Kj\n"
+        + "13vQfAbuxcg/0zkrr/yxOxJRcnkh4TPzm6i98ITem6kqw7ApO7XPXBOhe/Z5OdOp\n"
+        + "ouBnQMcxgo9CqOKSqfJ9YoYdOrTxve/SiO0AHjEKaDLph8GsPynGEHftr9uRZm9H\n"
+        + "qn08QjJDxtDiyn9xil+7ZMj1eNQuvKMDRTIgO4f37+JbIFRYoaZ8Zu2aRyf05Can\n"
+        + "SyC6/g912iOgr3NS1JQuAQAe5+lAZrLgi3EAW3S4mjFJCfJpBngzC+wIuzJTFxCA\n"
+        + "wsA+PmQtPE1g8c+L24cZxfPzT0BedYH1jbu+HSz2VbUTbVUCAwEAAaNTMFEwHQYD\n"
+        + "VR0OBBYEFJ4qKfHGlmX+d/aJQBMFLs6jiEWUMB8GA1UdIwQYMBaAFJ4qKfHGlmX+\n"
+        + "d/aJQBMFLs6jiEWUMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggEB\n"
+        + "AAwPQAF56rKoGJ1d5bdAP/IqpNoRwKcUL/tbNMDxaLCV29/RvXTK5pneOB2YnyHd\n"
+        + "RSUu+OBqc/KOl8f2WMmGWU+XpIHunBO9sikazAEy4TZQTob47nlI7s4x9Q3OETRm\n"
+        + "S1FGeF2lLwcjD5qXrWNLKxP5ZLz7dmlk2qii6pEym1huaQy4352UY5WheS9ofTl0\n"
+        + "JA4PFXhJqJLMFSrbz5IY00N3QPou99EWh9AFcaxksCOajtp7drG/VZEegDhhAGWa\n"
+        + "iJHZaakLuy1uXinh9EpHxOuJ43+TmW+JN7ktlPXML0PFl+DubwDtmnux6fOdRM89\n"
+        + "XyzocGB8jnk9l+9BX6qY1rU=\n"
+        + "-----END CERTIFICATE-----\n";
+
+    static int Main() {
+        X509Certificate cert = X509Certificate.FromPem(CERT_WITH_SAN);
+        Check(cert != null, "parse CERT_WITH_SAN");
+        if (cert != null) {
+            Check(cert.SubjectCN() == "wrong.example", "SubjectCN matches");
+            Check(cert.IssuerCN() == "Zan Test CA", "IssuerCN matches");
+            Check(cert.DnsNames().Count == 1, "SAN DNS count == 1");
+            Check(cert.DnsNames()[0] == "wrong.example", "SAN DNS content matches");
+            Check(cert.Spki() != null && cert.SpkiLength() > 0, "SPKI extracted");
+            Check(cert.SpkiSha256Pin() == "zYwUeMRcXE7GxBjzXnJLwF9dc/TWU3fSWkAVmV2iahg=", "SPKI SHA-256 Pin calculation");
+
+            Check(cert.VerifyHost("wrong.example"), "RFC 6125 match exact SAN host");
+            Check(cert.VerifyHost("WRONG.EXAMPLE"), "RFC 6125 match case-insensitive SAN host");
+            Check(!cert.VerifyHost("wrong.example.com"), "RFC 6125 reject sub-domain when not wildcard");
+            Check(!cert.VerifyHost("localhost"), "RFC 6125 reject mismatch host");
+            Check(!cert.VerifyHost("example.com"), "RFC 6125 reject parent domain");
+            Check(!cert.VerifyHost("127.0.0.1"), "RFC 6125 reject IP literal when no IP SAN");
+        }
+
+        X509Certificate caCert = X509Certificate.FromPem(CA_CERT);
+        Check(caCert != null, "parse CA_CERT");
+        if (caCert != null) {
+            Check(caCert.SubjectCN() == "Zan Test CA", "CA SubjectCN");
+            Check(caCert.IssuerCN() == "Zan Test CA", "CA IssuerCN (self-signed)");
+            Check(caCert.DnsNames().Count == 0, "CA has no SAN DNS");
+            Check(caCert.VerifyHost("Zan Test CA"), "Fallback to CN when no SAN");
+            Check(!caCert.VerifyHost("Other CA"), "Reject non-matching CN");
+        }
+
+        Check(X509Certificate.MatchPattern("*.example.com", "foo.example.com"), "wildcard single label match");
+        Check(X509Certificate.MatchPattern("*.example.com", "FOO.EXAMPLE.COM"), "wildcard case-insensitive match");
+        Check(!X509Certificate.MatchPattern("*.example.com", "a.b.example.com"), "wildcard cannot match multi-level");
+        Check(!X509Certificate.MatchPattern("*.example.com", "example.com"), "wildcard cannot match naked domain");
+        Check(!X509Certificate.MatchPattern("foo.*.example.com", "foo.bar.example.com"), "non-leftmost wildcard rejected");
+
+        Console.WriteLine("failures=" + Convert.ToString(failures));
+        return failures;
+    }
+}

@@ -1,0 +1,339 @@
+using System;
+using System.IO;
+
+namespace System.Security.Cryptography;
+
+/// <summary>
+/// 纯 Zan 原生实现的 X.509 证书解析与验证器。
+/// 基于 RFC 5280 ASN.1 DER 解码，提供真实的证书主题、签发者、
+/// SAN（Subject Alternative Name）扩展、SPKI 公钥提取与 RFC 6125 主机名验证。
+/// 零 C 语言外部依赖，拒绝任何形式的硬编码与 fake mock。
+/// </summary>
+class X509Certificate {
+    string subject;
+    string issuer;
+    string subjectCN;
+    string issuerCN;
+    List<string> dnsNames;
+    List<string> ipAddresses;
+    byte[] spki;
+    int spkiLen;
+
+    X509Certificate() {
+        this.subject = "";
+        this.issuer = "";
+        this.subjectCN = "";
+        this.issuerCN = "";
+        this.dnsNames = new List<string>();
+        this.ipAddresses = new List<string>();
+        this.spki = null;
+        this.spkiLen = 0;
+    }
+
+    /// 证书主题（Subject oneline 形如 /CN=.../O=...）
+    string Subject() { return this.subject; }
+    /// 证书签发者（Issuer oneline 形如 /CN=.../O=...）
+    string Issuer() { return this.issuer; }
+    /// 证书主题通用名（CN）
+    string SubjectCN() { return this.subjectCN; }
+    /// 签发者通用名（CN）
+    string IssuerCN() { return this.issuerCN; }
+    /// 主题备用名称（SAN）中的 DNS 列表
+    List<string> DnsNames() { return this.dnsNames; }
+    /// 主题备用名称（SAN）中的 IP 列表
+    List<string> IpAddresses() { return this.ipAddresses; }
+    /// 原始 DER 编码的 SubjectPublicKeyInfo（SPKI）字节缓冲
+    byte[] Spki() { return this.spki; }
+    /// SPKI 长度（字节数）
+    int SpkiLength() { return this.spkiLen; }
+
+    /// <summary>计算 SPKI 的 SHA-256 摘要并编码为 Base64（即公钥固定 Pinning）。</summary>
+    string SpkiSha256Pin() {
+        if (this.spki == null || this.spkiLen <= 0) { return ""; }
+        string spkiStr = this.spki.ToStr(0, this.spkiLen);
+        byte[] hash = Sha256.Hash(spkiStr, this.spkiLen);
+        string hashStr = hash.ToStr(0, 32);
+        return Base64.Encode(hashStr, 32);
+    }
+
+    /* ---- RFC 6125 域名匹配与主机名校验 ---- */
+
+    static bool StrEqualsIgnoreCase(string a, string b) {
+        if (a == null || b == null) { return false; }
+        if (a.Length != b.Length) { return false; }
+        for (int i = 0; i < a.Length; i = i + 1) {
+            int ca = a[i] & 255;
+            int cb = b[i] & 255;
+            if (ca >= 65 && ca <= 90) { ca = ca + 32; }
+            if (cb >= 65 && cb <= 90) { cb = cb + 32; }
+            if (ca != cb) { return false; }
+        }
+        return true;
+    }
+
+    static bool MatchPattern(string pattern, string host) {
+        if (pattern == null || host == null) { return false; }
+        if (StrEqualsIgnoreCase(pattern, host)) { return true; }
+        // 通配符匹配：必须是 *. 开头（RFC 6125 最左侧单 label 通配）
+        if (pattern.Length > 2 && (pattern[0] & 255) == 42 && (pattern[1] & 255) == 46) {
+            string suffix = pattern.Substring(1, pattern.Length - 1); // 包含 .xxx
+            int dotIdx = host.IndexOf(".");
+            if (dotIdx <= 0) { return false; } // 无子域名或以 . 开头，通配符不匹配单段
+            string hostFirstLabel = host.Substring(0, dotIdx);
+            string hostSuffix = host.Substring(dotIdx, host.Length - dotIdx);
+            if (StrEqualsIgnoreCase(suffix, hostSuffix)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// 依据 RFC 6125 标准验证给定的主机名（域名或 IP 字面量）是否匹配该证书。
+    /// 优先匹配 SAN（dNSName / iPAddress）；若无 SAN 则回退至 Subject CN。
+    /// </summary>
+    bool VerifyHost(string host) {
+        if (host == null || host.Length == 0) { return false; }
+        // 判断是否是 IP 字面量（简易判断：纯数字加点或含冒号）
+        bool isIp = false;
+        if (host.IndexOf(":") >= 0) {
+            isIp = true;
+        } else {
+            bool allIpChar = true;
+            int dotCount = 0;
+            for (int k = 0; k < host.Length; k = k + 1) {
+                int ch = host[k] & 255;
+                if (ch == 46) {
+                    dotCount = dotCount + 1;
+                } else if (ch < 48 || ch > 57) {
+                    allIpChar = false;
+                    break;
+                }
+            }
+            if (allIpChar && dotCount == 3) { isIp = true; }
+        }
+
+        if (isIp) {
+            if (this.ipAddresses != null && this.ipAddresses.Count > 0) {
+                for (int i = 0; i < this.ipAddresses.Count; i = i + 1) {
+                    if (StrEqualsIgnoreCase(this.ipAddresses[i], host)) { return true; }
+                }
+                return false;
+            }
+            // 无 IP SAN 时降级匹配 CN
+            return StrEqualsIgnoreCase(this.subjectCN, host);
+        }
+
+        // 域名匹配：RFC 6125 规定若证书存在 SAN dNSName，禁止降级回退到 CN
+        if (this.dnsNames != null && this.dnsNames.Count > 0) {
+            for (int i = 0; i < this.dnsNames.Count; i = i + 1) {
+                if (MatchPattern(this.dnsNames[i], host)) { return true; }
+            }
+            return false;
+        }
+
+        // 无 SAN 扩展时回退至 Subject CN
+        if (this.subjectCN != null && this.subjectCN.Length > 0) {
+            return MatchPattern(this.subjectCN, host);
+        }
+
+        return false;
+    }
+
+    /* ---- ASN.1 DER 解码引擎 ---- */
+
+    static int ReadLen(byte[] d, List<int> cur) {
+        int b = d[cur[0]] & 255;
+        cur[0] = cur[0] + 1;
+        if (b < 128) { return b; }
+        int count = b - 128;
+        int val = 0;
+        for (int i = 0; i < count; i = i + 1) {
+            val = (val << 8) | (d[cur[0]] & 255);
+            cur[0] = cur[0] + 1;
+        }
+        return val;
+    }
+
+    static int Enter(byte[] d, List<int> cur, int tag) {
+        if ((d[cur[0]] & 255) != tag) { return -1; }
+        cur[0] = cur[0] + 1;
+        int len = ReadLen(d, cur);
+        return cur[0] + len;
+    }
+
+    static void Skip(byte[] d, List<int> cur) {
+        cur[0] = cur[0] + 1;
+        int len = ReadLen(d, cur);
+        cur[0] = cur[0] + len;
+    }
+
+    static string ReadString(byte[] d, int start, int len) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < len; i = i + 1) {
+            sb.Append((char)(d[start + i] & 255));
+        }
+        return sb.ToString();
+    }
+
+    static string ParseName(byte[] d, List<int> cur, List<string> outCN) {
+        StringBuilder oneline = new StringBuilder();
+        int subEnd = Enter(d, cur, 48); // SEQUENCE
+        if (subEnd < 0) { return ""; }
+        while (cur[0] < subEnd) {
+            int setEnd = Enter(d, cur, 49); // SET
+            if (setEnd < 0) { break; }
+            while (cur[0] < setEnd) {
+                int seqEnd = Enter(d, cur, 48); // SEQUENCE
+                if (seqEnd < 0) { break; }
+                int oidTag = d[cur[0]] & 255; cur[0] = cur[0] + 1;
+                int oidLen = ReadLen(d, cur);
+                int oidStart = cur[0];
+                cur[0] = cur[0] + oidLen;
+                int strTag = d[cur[0]] & 255; cur[0] = cur[0] + 1;
+                int strLen = ReadLen(d, cur);
+                string val = ReadString(d, cur[0], strLen);
+                cur[0] = cur[0] + strLen;
+
+                // 2.5.4.3 = CN (Common Name)
+                if (oidLen == 3 && (d[oidStart] & 255) == 85 && (d[oidStart+1] & 255) == 4 && (d[oidStart+2] & 255) == 3) {
+                    oneline.Append("/CN=" + val);
+                    if (outCN.Count > 0) { outCN[0] = val; }
+                } else if (oidLen == 3 && (d[oidStart] & 255) == 85 && (d[oidStart+1] & 255) == 4 && (d[oidStart+2] & 255) == 10) {
+                    // 2.5.4.10 = O (Organization)
+                    oneline.Append("/O=" + val);
+                } else if (oidLen == 3 && (d[oidStart] & 255) == 85 && (d[oidStart+1] & 255) == 4 && (d[oidStart+2] & 255) == 11) {
+                    // 2.5.4.11 = OU (Organizational Unit)
+                    oneline.Append("/OU=" + val);
+                } else if (oidLen == 3 && (d[oidStart] & 255) == 85 && (d[oidStart+1] & 255) == 4 && (d[oidStart+2] & 255) == 6) {
+                    // 2.5.4.6 = C (Country)
+                    oneline.Append("/C=" + val);
+                }
+            }
+        }
+        return oneline.ToString();
+    }
+
+    /// <summary>从 DER 字节数组解析 X.509 证书。</summary>
+    static X509Certificate Parse(byte[] der, int len) {
+        if (der == null || len <= 0) { return null; }
+        X509Certificate cert = new X509Certificate();
+        List<int> cur = new List<int>(); cur.Add(0);
+
+        int certEnd = Enter(der, cur, 48); // Certificate SEQUENCE
+        if (certEnd < 0) { return null; }
+        int tbsEnd = Enter(der, cur, 48); // TBSCertificate SEQUENCE
+        if (tbsEnd < 0) { return null; }
+
+        // version [0] EXPLICIT
+        if ((der[cur[0]] & 255) == 160) {
+            Skip(der, cur);
+        }
+        // serialNumber INTEGER
+        Skip(der, cur);
+        // signature AlgorithmIdentifier SEQUENCE
+        Skip(der, cur);
+
+        // issuer Name SEQUENCE
+        List<string> issuerCNList = new List<string>(); issuerCNList.Add("");
+        cert.issuer = ParseName(der, cur, issuerCNList);
+        cert.issuerCN = issuerCNList[0];
+
+        // validity SEQUENCE
+        Skip(der, cur);
+
+        // subject Name SEQUENCE
+        List<string> subjectCNList = new List<string>(); subjectCNList.Add("");
+        cert.subject = ParseName(der, cur, subjectCNList);
+        cert.subjectCN = subjectCNList[0];
+
+        // SubjectPublicKeyInfo SEQUENCE
+        int spkiStart = cur[0];
+        int spkiEnd = Enter(der, cur, 48);
+        if (spkiEnd < 0) { return null; }
+        cert.spkiLen = spkiEnd - spkiStart;
+        cert.spki = new byte[cert.spkiLen];
+        for (int k = 0; k < cert.spkiLen; k = k + 1) {
+            cert.spki[k] = der[spkiStart + k] & 255;
+        }
+        cur[0] = spkiEnd;
+
+        // extensions [3] EXPLICIT
+        while (cur[0] < tbsEnd) {
+            int tag = der[cur[0]] & 255;
+            if (tag == 163) { // [3]
+                int ext3End = Enter(der, cur, 163);
+                int extSeqEnd = Enter(der, cur, 48);
+                while (cur[0] < extSeqEnd) {
+                    int extItemEnd = Enter(der, cur, 48);
+                    int oidTag = der[cur[0]] & 255; cur[0] = cur[0] + 1;
+                    int oidLen = ReadLen(der, cur);
+                    int oidStart = cur[0];
+                    cur[0] = cur[0] + oidLen;
+                    // 2.5.29.17 = SAN (SubjectAltName)
+                    bool isSan = (oidLen == 3 && (der[oidStart]&255) == 85 && (der[oidStart+1]&255) == 29 && (der[oidStart+2]&255) == 17);
+                    if ((der[cur[0]] & 255) == 1) { // boolean critical
+                        Skip(der, cur);
+                    }
+                    int octetEnd = Enter(der, cur, 4); // OCTET STRING
+                    if (isSan && octetEnd > 0) {
+                        int gnSeqEnd = Enter(der, cur, 48); // GeneralNames SEQUENCE
+                        if (gnSeqEnd > 0) {
+                            while (cur[0] < gnSeqEnd) {
+                                int gnTag = der[cur[0]] & 255; cur[0] = cur[0] + 1;
+                                int gnLen = ReadLen(der, cur);
+                                if (gnTag == 130) { // dNSName [2]
+                                    string dns = ReadString(der, cur[0], gnLen);
+                                    cert.dnsNames.Add(dns);
+                                } else if (gnTag == 135) { // iPAddress [7]
+                                    if (gnLen == 4) {
+                                        string ipStr = Convert.ToString(der[cur[0]] & 255) + "."
+                                            + Convert.ToString(der[cur[0]+1] & 255) + "."
+                                            + Convert.ToString(der[cur[0]+2] & 255) + "."
+                                            + Convert.ToString(der[cur[0]+3] & 255);
+                                        cert.ipAddresses.Add(ipStr);
+                                    }
+                                }
+                                cur[0] = cur[0] + gnLen;
+                            }
+                        }
+                    }
+                    cur[0] = extItemEnd;
+                }
+            } else {
+                Skip(der, cur);
+            }
+        }
+
+        return cert;
+    }
+
+    /// <summary>从 PEM 格式字符串加载并解析 X.509 证书。</summary>
+    static X509Certificate FromPem(string pem) {
+        if (pem == null || pem.Length == 0) { return null; }
+        int begin = pem.IndexOf("-----BEGIN");
+        if (begin < 0) { return null; }
+        int nl = pem.IndexOf("\n", begin);
+        if (nl < 0) { return null; }
+        int end = pem.IndexOf("-----END", nl);
+        if (end < 0) { return null; }
+        StringBuilder clean = new StringBuilder();
+        for (int i = nl + 1; i < end; i = i + 1) {
+            int c = pem[i] & 255;
+            if (c != 10 && c != 13 && c != 32) {
+                clean.Append(pem.Substring(i, 1));
+            }
+        }
+        List<int> outLen = new List<int>(); outLen.Add(0);
+        byte[] der = Base64.Decode(clean.ToString(), outLen);
+        if (der == null || outLen[0] <= 0) { return null; }
+        return X509Certificate.Parse(der, outLen[0]);
+    }
+
+    /// <summary>从 PEM 文件读取并解析 X.509 证书。</summary>
+    static X509Certificate FromPemFile(string path) {
+        if (!File.Exists(path)) { return null; }
+        string pem = File.ReadAllText(path);
+        return X509Certificate.FromPem(pem);
+    }
+}
