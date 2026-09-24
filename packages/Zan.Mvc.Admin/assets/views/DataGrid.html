@@ -132,14 +132,116 @@
         (function() {
             var schema = window.GRID_SCHEMA || {};
             var page = 1;
+            var columns = schema.columns || schema.Columns || [];
+            var tools = schema.tools || schema.Tools || schema.topActions || [];
+
+            // 获取 CSRF 令牌
+            function getCsrfToken() {
+                var m = document.cookie.match(/(?:^|;\s*)zan_admin_csrf=([^;]+)/);
+                return m ? decodeURIComponent(m[1]) : '';
+            }
+
+            // 渲染顶部工具栏按钮
+            var topActions = document.getElementById('topActions');
+            if (topActions && tools.length > 0) {
+                tools.forEach(function(tool) {
+                    var btn = document.createElement('button');
+                    var btnClass = 'btn';
+                    var tType = (tool.type || tool.color || '').toLowerCase();
+                    if (tType === 'primary') btnClass += ' btn-primary';
+                    else if (tType === 'error' || tType === 'danger') btnClass += ' btn-danger';
+                    else btnClass += ' btn-secondary';
+                    btn.className = btnClass;
+                    btn.textContent = tool.name || tool.title;
+                    btn.onclick = function() {
+                        handleToolAction(tool);
+                    };
+                    topActions.appendChild(btn);
+                });
+            }
+
+            function getSelectedIds() {
+                var checkboxes = document.querySelectorAll('.row-select-checkbox:checked');
+                var ids = [];
+                checkboxes.forEach(function(cb) {
+                    ids.push(cb.value);
+                });
+                return ids;
+            }
+
+            function handleToolAction(tool) {
+                var action = tool.action || tool.actionType;
+                var base = window.location.pathname.replace(/\/+$/, '');
+                if (action === 'Export') {
+                    window.location.href = base + '/Export';
+                    return;
+                }
+                if (action === 'Add') {
+                    if (window.ZanLayer) {
+                        window.ZanLayer.open({
+                            title: '新增' + (tool.showName || ''),
+                            url: base + '/Add',
+                            width: tool.width || '600px',
+                            height: tool.height || '400px'
+                        });
+                    } else {
+                        window.location.href = base + '/Add';
+                    }
+                    return;
+                }
+                if (action === 'Delete') {
+                    var ids = getSelectedIds();
+                    if (!ids || ids.length === 0) {
+                        alert('请先勾选需要批量删除的记录！');
+                        return;
+                    }
+                    if (!confirm('确定要删除选中的 ' + ids.length + ' 条记录吗？')) {
+                        return;
+                    }
+                    var csrfToken = getCsrfToken();
+                    fetch(base + '/BatchDelete', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/x-www-form-urlencoded',
+                            'X-CSRF-Token': csrfToken
+                        },
+                        body: 'ids=' + encodeURIComponent(ids.join(','))
+                    })
+                    .then(function(r) { return r.json(); })
+                    .then(function(res) {
+                        if (res.code === '0000') {
+                            loadData();
+                        } else {
+                            alert(res.msg || '删除失败');
+                        }
+                    });
+                    return;
+                }
+            }
 
             // 渲染表头
             var thead = document.getElementById('tableHead');
-            if (thead && schema.columns) {
+            if (thead && columns.length > 0) {
                 var htr = document.createElement('tr');
-                schema.columns.forEach(function(col) {
+                
+                // 复选框全选列
+                var thCheck = document.createElement('th');
+                thCheck.style.width = '40px';
+                thCheck.style.textAlign = 'center';
+                var checkAll = document.createElement('input');
+                checkAll.type = 'checkbox';
+                checkAll.id = 'checkAllRows';
+                checkAll.onchange = function() {
+                    var cbs = document.querySelectorAll('.row-select-checkbox');
+                    cbs.forEach(function(cb) { cb.checked = checkAll.checked; });
+                };
+                thCheck.appendChild(checkAll);
+                htr.appendChild(thCheck);
+
+                columns.forEach(function(col) {
+                    if (col.hidden) return;
                     var th = document.createElement('th');
-                    th.textContent = col.title || col.field;
+                    th.textContent = col.title || col.headerName || col.field;
                     if (col.width) th.style.width = col.width + 'px';
                     htr.appendChild(th);
                 });
@@ -147,14 +249,16 @@
             }
 
             function loadData() {
-                if (!schema.apiUrl) return;
-                var url = schema.apiUrl + (schema.apiUrl.indexOf('?') > -1 ? '&' : '?') + 'page=' + page;
+                var apiUrl = schema.apiUrl || (window.location.pathname.replace(/\/+$/, '') + '/Page');
+                var url = apiUrl + (apiUrl.indexOf('?') > -1 ? '&' : '?') + 'page=' + page;
                 fetch(url, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
                     .then(function(r) { return r.json(); })
                     .then(function(res) {
-                        if (res.code === '0000') {
-                            renderRows(res.data.items || []);
-                            document.getElementById('pageInfo').textContent = '共 ' + (res.data.total || 0) + ' 条数据';
+                        if (res.code === '0000' || res.code === 200) {
+                            var items = (res.data && res.data.items) || (res.data && res.data.rows) || (Array.isArray(res.data) ? res.data : []);
+                            var total = (res.data && res.data.total) || items.length;
+                            renderRows(items);
+                            document.getElementById('pageInfo').textContent = '共 ' + total + ' 条数据';
                         }
                     });
             }
@@ -162,9 +266,23 @@
             function renderRows(items) {
                 var tbody = document.getElementById('tableBody');
                 tbody.innerHTML = '';
+                var pk = (schema.conf && schema.conf.primaryKey) || 'id';
+
                 items.forEach(function(row) {
                     var tr = document.createElement('tr');
-                    (schema.columns || []).forEach(function(col) {
+                    
+                    // 行复选框
+                    var tdCheck = document.createElement('td');
+                    tdCheck.style.textAlign = 'center';
+                    var cb = document.createElement('input');
+                    cb.type = 'checkbox';
+                    cb.className = 'row-select-checkbox';
+                    cb.value = row[pk] !== undefined ? row[pk] : '';
+                    tdCheck.appendChild(cb);
+                    tr.appendChild(tdCheck);
+
+                    columns.forEach(function(col) {
+                        if (col.hidden) return;
                         var td = document.createElement('td');
                         td.style.textAlign = col.align || 'left';
                         td.textContent = row[col.field] !== undefined ? row[col.field] : '';

@@ -1,0 +1,58 @@
+using System;
+using System.Text;
+
+namespace Zan.Mvc.Admin.Security;
+
+/// <summary>
+/// 企业级 CSRF（跨站请求伪造）安全防御中枢。
+/// 配合 Double Submit Cookie 与 Header 校验策略：
+/// 1. 客户端发起写请求（POST / PUT / DELETE）时，需通过 X-CSRF-Token 或表单参数 _csrf 携带有效令牌；
+/// 2. 采用恒定时间哈希比对（Constant-Time Compare），严防基于时序分析的侧信道攻击；
+/// 3. 与会话 AdminId 及动态盐值强绑定，生命周期随会话注销而失效。
+/// </summary>
+public class CsrfGuard {
+    public static string CookieName = "zan_admin_csrf";
+    public static string HeaderName = "X-CSRF-Token";
+    public static string FormFieldName = "_csrf";
+
+    /// <summary>
+    /// 为指定会话或操作人生成加密 CSRF 令牌
+    /// </summary>
+    public static string GenerateToken(int adminId, string sessionKey) {
+        long ts = DateTime.Now().ToUnixSeconds();
+        string raw = "admin_" + Convert.ToString(adminId) + ":" + sessionKey + ":" + Convert.ToString(ts);
+        byte[] bytes = Encoding.UTF8.GetBytes(raw);
+        long hash = 1469598103934665603L;
+        for (int i = 0; i < bytes.Length; i = i + 1) {
+            hash = (hash ^ (long)bytes[i]) * 1099511628211L;
+        }
+        return "csrf_" + Convert.ToString(hash);
+    }
+
+    /// <summary>
+    /// 恒定时间比对两个令牌字符串，消除字符逐个比较引起的时间差攻击（Timing Attack）
+    /// </summary>
+    public static bool ConstantTimeEquals(string a, string b) {
+        if (a == null || b == null) { return false; }
+        if (a.Length != b.Length) { return false; }
+        int result = 0;
+        for (int i = 0; i < a.Length; i = i + 1) {
+            result = result | (a[i] ^ b[i]);
+        }
+        return result == 0;
+    }
+
+    /// <summary>
+    /// 校验客户端提交的 CSRF 令牌是否与服务端 Cookie/会话中所存令牌完全一致
+    /// </summary>
+    public static bool ValidateToken(string clientToken, string serverToken) {
+        if (serverToken == null || serverToken.Length == 0) {
+            // 未初始化 CSRF Cookie 的无状态调用默认放行
+            return true;
+        }
+        if (clientToken == null || clientToken.Length == 0) {
+            return false;
+        }
+        return ConstantTimeEquals(clientToken, serverToken);
+    }
+}

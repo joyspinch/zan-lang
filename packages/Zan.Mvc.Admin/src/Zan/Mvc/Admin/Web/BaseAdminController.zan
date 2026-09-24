@@ -98,6 +98,62 @@ public abstract class BaseAdminController : Controller {
     }
 
     /// <summary>
+    /// 接口访问防刷与高频限流检查。
+    /// 超过限流阈值自动拦截输出 4029 并返回 false。
+    /// </summary>
+    protected bool CheckRateLimit(string actionKey, int maxPerWindow = 60, int windowSeconds = 60) {
+        if (this.Ctx() == null) { return true; }
+        string ip = this.Ctx().RemoteIp();
+        string key = ip + ":" + actionKey;
+        if (!AdminRateLimiter.Check(key, maxPerWindow, windowSeconds)) {
+            this.AuditLog("RateLimit", "触发高频请求阻断: " + key);
+            this.JsonFail("请求过于频繁，请稍后再试", "4029");
+            return false;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// 获取或生成当前会话的 CSRF 防御令牌
+    /// </summary>
+    protected string GetCsrfToken() {
+        if (this.Ctx() == null) { return ""; }
+        string token = this.Ctx().Cookie(CsrfGuard.CookieName);
+        if (token.Length == 0) {
+            token = CsrfGuard.GenerateToken(this.CurrentAdminId, "admin_session");
+            this.Ctx().SetCookieJs(CsrfGuard.CookieName, token, 86400);
+        }
+        return token;
+    }
+
+    /// <summary>
+    /// 验证客户端提交的 CSRF 令牌。
+    /// 优先从 Header (X-CSRF-Token) 提取，其次从表单 (_csrf) 提取。
+    /// 校验失败自动输出 4032 拦截错误并返回 false。
+    /// </summary>
+    protected bool VerifyCsrf() {
+        if (this.Ctx() == null) { return true; }
+        // GET/HEAD/OPTIONS 不执行 CSRF 校验
+        string m = this.Ctx().method;
+        if (m == "GET" || m == "HEAD" || m == "OPTIONS") {
+            return true;
+        }
+
+        string clientToken = this.Ctx().Header(CsrfGuard.HeaderName);
+        if (clientToken.Length == 0) {
+            clientToken = this.In(CsrfGuard.FormFieldName);
+        }
+
+        string expectedToken = this.Ctx().Cookie(CsrfGuard.CookieName);
+        if (!CsrfGuard.ValidateToken(clientToken, expectedToken)) {
+            this.AuditLog("SecurityAlert", "非法 CSRF 请求拦截: " + this.Ctx().path);
+            this.JsonFail("安全校验失败：CSRF 令牌无效或已过期", "4032");
+            return false;
+        }
+        return true;
+    }
+
+    /// <summary>
     /// 记录业务审计日志。
     /// </summary>
     protected void AuditLog(string action, string detail) {

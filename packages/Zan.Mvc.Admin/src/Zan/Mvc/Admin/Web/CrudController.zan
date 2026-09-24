@@ -50,6 +50,7 @@ public abstract class CrudController<TEntity> : BaseAdminController {
         cfg.AddColumn("id", "ID", "number", 80, true, false);
         cfg.AddTool("添加", "Add", "数据", "Primary", false, "600px", "400px");
         cfg.AddTool("批量删除", "Delete", "数据", "Error", true, "400px", "260px");
+        cfg.AddTool("导出数据", "Export", "数据", "Default", false, "", "");
         return cfg;
     }
 
@@ -66,6 +67,13 @@ public abstract class CrudController<TEntity> : BaseAdminController {
     /// </summary>
     protected virtual string OnPage(int page, int pageSize) {
         return "";
+    }
+
+    /// <summary>
+    /// 子类重写：获取待导出的数据行（字典键对应字段名）。默认返回空列表或由子类提供实现。
+    /// </summary>
+    protected virtual List<Dict<string, string>> OnExportRows() {
+        return new List<Dict<string, string>>();
     }
 
     /// <summary>
@@ -266,6 +274,8 @@ public abstract class CrudController<TEntity> : BaseAdminController {
     /// 端点 6：通用新增保存
     /// </summary>
     public virtual void AddSave(TEntity entity) {
+        if (!this.VerifyCsrf()) { return; }
+        if (!this.CheckRateLimit("AddSave", 30, 60)) { return; }
         if (entity == null) {
             this.JsonFail("提交数据不能为空", "4002");
             return;
@@ -290,6 +300,8 @@ public abstract class CrudController<TEntity> : BaseAdminController {
     /// 端点 7：通用编辑保存
     /// </summary>
     public virtual void EditSave(TEntity entity) {
+        if (!this.VerifyCsrf()) { return; }
+        if (!this.CheckRateLimit("EditSave", 60, 60)) { return; }
         if (entity == null) {
             this.JsonFail("提交数据不能为空", "4002");
             return;
@@ -315,6 +327,8 @@ public abstract class CrudController<TEntity> : BaseAdminController {
     /// 严禁越权修改密码、金额、部门、主键等高危列。通过子类 OnField 业务钩子安全落地。
     /// </summary>
     public virtual void Field(int id, string fieldName, string fieldValue) {
+        if (!this.VerifyCsrf()) { return; }
+        if (!this.CheckRateLimit("Field", 120, 60)) { return; }
         TableConfig cfg = this.GetTableConfig();
         if (!FieldSecurityGuard.CanInlineEdit(fieldName, cfg)) {
             this.AuditLog("SecurityAlert", "非法越权尝试修改受保护字段: " + fieldName);
@@ -343,6 +357,8 @@ public abstract class CrudController<TEntity> : BaseAdminController {
     /// 端点 9：单记录删除
     /// </summary>
     public virtual void Delete(int id) {
+        if (!this.VerifyCsrf()) { return; }
+        if (!this.CheckRateLimit("Delete", 30, 60)) { return; }
         this.OnDelete(id);
         this.AuditLog("Delete", "删除记录 ID: " + Convert.ToString(id));
         this.JsonSuccess("删除成功");
@@ -352,6 +368,8 @@ public abstract class CrudController<TEntity> : BaseAdminController {
     /// 端点 10：批量删除（支持逗号分隔 ID 串）
     /// </summary>
     public virtual void BatchDelete(string ids) {
+        if (!this.VerifyCsrf()) { return; }
+        if (!this.CheckRateLimit("BatchDelete", 20, 60)) { return; }
         if (ids == null || ids.Length == 0) {
             this.JsonFail("请选择需要删除的记录", "4003");
             return;
@@ -374,6 +392,67 @@ public abstract class CrudController<TEntity> : BaseAdminController {
         int count = this.OnBatchDelete(idList);
         this.AuditLog("BatchDelete", "批量删除 " + Convert.ToString(count) + " 条记录: " + ids);
         this.JsonSuccess("成功删除 " + Convert.ToString(count) + " 条数据");
+    }
+
+    /// <summary>
+    /// 端点 11：通用数据导出（导出为 RFC 4180 标准 CSV，首部注入 UTF-8 BOM 解决 Excel 打开中文乱码）
+    /// 支持按当前 TableConfig 列规格自动对齐字段，数据源由子类 OnExportRows() 生命周期钩子提供
+    /// </summary>
+    public virtual void Export() {
+        if (!this.CheckRateLimit("Export", 10, 60)) { return; }
+        TableConfig cfg = this.GetTableConfig();
+        List<Dict<string, string>> rows = this.OnExportRows();
+
+        StringBuilder sb = new StringBuilder();
+        // 注入 UTF-8 BOM (\uFEFF)
+        sb.Append("\uFEFF");
+
+        // 1. 生成表头
+        for (int i = 0; i < cfg.Columns.Count; i = i + 1) {
+            TableColumn col = cfg.Columns[i];
+            if (i > 0) { sb.Append(","); }
+            sb.Append(this.EscapeCsv(col.headerName));
+        }
+        sb.Append("\r\n");
+
+        // 2. 生成每一行数据
+        for (int r = 0; r < rows.Count; r = r + 1) {
+            Dict<string, string> row = rows[r];
+            for (int c = 0; c < cfg.Columns.Count; c = c + 1) {
+                TableColumn col = cfg.Columns[c];
+                if (c > 0) { sb.Append(","); }
+                string val = "";
+                if (row != null && row.ContainsKey(col.field)) {
+                    val = row[col.field];
+                }
+                sb.Append(this.EscapeCsv(val));
+            }
+            sb.Append("\r\n");
+        }
+
+        this.AuditLog("Export", "导出数据报表, 共 " + Convert.ToString(rows.Count) + " 行");
+
+        if (this.Ctx() != null) {
+            this.Ctx().SetHeader("Content-Type", "text/csv; charset=utf-8");
+            this.Ctx().SetHeader("Content-Disposition", "attachment; filename=\"export_" + Convert.ToString(DateTime.Now().ToUnixSeconds()) + ".csv\"");
+            this.Text(sb.ToString());
+        }
+    }
+
+    /// <summary>
+    /// 对 CSV 字段内容按 RFC 4180 标准进行转义
+    /// </summary>
+    protected virtual string EscapeCsv(string val) {
+        if (val == null) { return "\"\""; }
+        bool needQuotes = false;
+        if (val.Contains(",") || val.Contains("\"") || val.Contains("\n") || val.Contains("\r")) {
+            needQuotes = true;
+        }
+        string escaped = val.Replace("\"", "\"\"");
+        if (needQuotes) {
+            return "\"" + escaped + "\"";
+        }
+        return escaped;
     }
 }
 
