@@ -15,11 +15,11 @@ zanc 一条命令 = **编译 + 标准库拉入 + 原生驱动链接**，直接�
 build/zanc <入口和源文件...> [options] -o <输出>
 ```
 
-- 不需要先编 .o 再链接；也不用指定 -I/-l（stdlib 与原生驱动按拉入面自动带出）。
+- 不需要先编 .o 再链接；也不用指定 -I/-l（stdlib 默认自动按需拉入，原生驱动按拉入面自动带出）。
 - **输入是"文件集合"而不是"工程"**：zanc 只编译命令行上列出的 .zan（加上
   按需拉入的 stdlib/包命名空间）。多文件项目要把 `src/**/*.zan` 全部列上。
-- 参数分五类：输出形态（-o/--emit-lib/--publish）、标准库拉入
-  （--auto-stdlib/--stdlib-path）、目标平台（--target/--emit-apk）、
+- 参数分五类：输出形态（-o/--emit-lib/--publish）、标准库控制
+  （默认自动拉入；--no-stdlib/--stdlib-path）、目标平台（--target/--emit-apk）、
   原生链接（-L/--driver-dir/--link-lib）、诊断（--emit-ir/-g/--dump-*）。
 
 ## 1. 标准配方（复制即用）
@@ -27,29 +27,28 @@ build/zanc <入口和源文件...> [options] -o <输出>
 ### 1.1 日常开发循环
 
 ```bash
-# 编译 + 运行（调试默认档，O0）
-build/zanc src/main.zan --auto-stdlib -o _scratch/app.exe && _scratch/app.exe
+# 编译 + 运行（默认自动拉入标准库，调试默认档 O0）
+build/zanc src/main.zan -o _scratch/app.exe && _scratch/app.exe
 
 # 多文件项目：显式列出全部源（Git Bash）
-build/zanc $(find src -name '*.zan' | sort | tr '\n' ' ') --auto-stdlib -o _scratch/app.exe
+build/zanc $(find src -name '*.zan' | sort | tr '\n' ' ') -o _scratch/app.exe
 
 # Release 发布档（strip + 优化，默认 -Os）
-build/zanc src/main.zan --auto-stdlib --publish -o app.exe
+build/zanc src/main.zan --publish -o app.exe
 ```
 
 ### 1.2 GUI 程序
 
 ```bash
 # 纯逻辑探针（Html.Parse、布局计算等）：与控制台程序无异，无窗口也能跑
-build/zanc probe.zan --auto-stdlib -o probe.exe && probe.exe
+build/zanc probe.zan -o probe.exe && probe.exe
 
-# 带窗口的 GUI 程序：Windows 上加 windows 子系统
-build/zanc $(find src -name '*.zan' | tr '\n' ' ') --auto-stdlib --subsystem windows -o app.exe
+# 带窗口的 GUI 程序：Windows 上自动推断 windows 子系统（无黑框终端，无需手动指定 --subsystem）
+build/zanc $(find src -name '*.zan' | tr '\n' ' ') -o app.exe
 
 # 设计稿入口（.html/.zan 声明式 UI）：**设计稿必须是命令行第一个参数**，
-# zanc 从第一份设计文档合成 Main 与控件字段，其后跟全部 .zan 源
-build/zanc src/MyApp.html $(find src -name '*.zan' | sort | tr '\n' ' ') \
-    --auto-stdlib --subsystem windows -o app.exe
+# zanc 从第一份设计文档合成 Main 与控件字段，自动推断 windows 子系统
+build/zanc src/MyApp.html $(find src -name '*.zan' | sort | tr '\n' ' ') -o app.exe
 ```
 
 ### 1.3 交叉编译与移动端

@@ -1767,6 +1767,16 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   取的是最后一个分隔符——build.ps1 里 `Join-Path $project 'src/App.html'`
   这类混合分隔符路径会让截桶错位。诊断时先打印候选再怀疑逻辑。
 
+## 跨平台硬件加速 Crypto/TLS 微内核替换与 ABI 契约（2026-09-24）
+
+- **胖驱动瘦身与生命周期引用计数（X509 存储）**：
+  OpenSSL 历史多平台驱动体积达 5MB+，采用单 TU 原生微内核（AES-NI/PCLMULQDQ 硬件加速，几十 KB）替代时，必须精准遵循 OpenSSL 的所有权语义。例如 X509 证书同时被上层调用方句柄和 `SSL_CTX` 的 `cert_store` 引用；`X509_STORE_add_cert` 接管时必须递增 `ref_count`，`X509_free` 递减至 0 时才真正 free。若做浅拷贝或单侧硬析构，`SSL_CTX_free` 析构证书库时会触发严重的堆破坏与崩溃（`0xc0000374` @ `RtlFreeHeap`）。
+- **参数默认契约（X509_VERIFY_PARAM_set1_host len==0 语义）**：
+  在 OpenSSL C ABI 规范中，`X509_VERIFY_PARAM_set1_host(param, name, len)` 的 `len == 0` 并非清空期望主机名，而是指 `name` 为以 NUL 结尾的标准 C 字符串，长度由 `strlen(name)` 自动计算（`name == NULL` 才是重置清空）。微内核实现若凭直觉把 `len == 0` 当做空串清空，会导致上层（如 `TlsStream.zan` 传 0）失去主机名保护，测试判定域名不匹配反常通过或报失败。凡实现或复刻标准兼容层，必须严格对齐缺省参数语义。
+- **macOS 跨平台交叉链接的未解析符号**：
+  macOS 动态库在没有宿主完整 SDK 的情况下使用 lld 交叉链接时，动态运行时符号（`calloc`, `free`, `snprintf` 等）需要添加 `-fno-stack-protector "-Wl,-undefined,dynamic_lookup"`，否则 ld64.lld 会将 libc 符号报错为 undefined symbol；在 PowerShell 中执行时必须将包含逗号的链接器参数整体双引号引起来（`"-Wl,-undefined,dynamic_lookup"`），避免逗号被 PowerShell 语法解析为数组分割符。
+
+
 ## GenForm：带字 label 的字段名会被 text 的 syncName 吃掉（2026-09-17）
 
 - **PropSpec.Text 工厂自带 `syncName=true`**：`SetProp("text", …)` 会把

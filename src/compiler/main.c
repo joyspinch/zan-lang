@@ -3363,7 +3363,8 @@ static void print_usage(void) {
     fprintf(stderr, "                   libs next to the exe, default) or static (link into the exe)\n");
     fprintf(stderr, "  --driver-dir <d> Override the bundled native driver directory\n");
     fprintf(stderr, "  --stdlib-path <dir>  Path to stdlib directory\n");
-    fprintf(stderr, "  --auto-stdlib    Automatically find stdlib and installed package namespaces\n");
+    fprintf(stderr, "  --auto-stdlib    Automatically find stdlib and installed package namespaces (default)\n");
+    fprintf(stderr, "  --no-stdlib      Disable automatic stdlib and package discovery\n");
     fprintf(stderr, "  --package-api <url>  Configure marketplace API (HTTPS; localhost HTTP allowed)\n");
     fprintf(stderr, "  --package-list-missing  Scan inputs and print missing namespace diagnostics\n");
     fprintf(stderr, "  --package-install <dir> --package-name <name>  Install a local package directory\n");
@@ -3374,7 +3375,7 @@ static void print_usage(void) {
     fprintf(stderr, "  -g, --debug      Emit DWARF debug info for source-level debugging (forces -O0)\n");
     fprintf(stderr, "  --target <name>  Cross-compile for target (e.g. linux-x64, linux-musl)\n");
     fprintf(stderr, "  --list-targets   Show available cross-compilation targets\n");
-    fprintf(stderr, "  --subsystem <s>  PE subsystem: console (default) or windows (GUI, Win only)\n");
+    fprintf(stderr, "  --subsystem <s>  PE subsystem: windows (GUI, auto-detected for GUI/html apps) or console\n");
     fprintf(stderr, "  -L<dir>/--libpath <dir>  Add a native library search directory\n");
     fprintf(stderr, "  --link-lib <name>  Link an extra native library (-> -l<name>)\n");
     fprintf(stderr, "  --link-input <f>   Link an extra object/resource/library file\n");
@@ -3666,6 +3667,8 @@ int main(int argc, char **argv) {
             stdlib_path = argv[++i];
         } else if (strcmp(argv[i], "--auto-stdlib") == 0) {
             auto_stdlib = true;
+        } else if (strcmp(argv[i], "--no-stdlib") == 0) {
+            auto_stdlib = false;
         } else if (strcmp(argv[i], "--package-api") == 0 && i + 1 < argc) {
             package_api = argv[++i];
         } else if (strcmp(argv[i], "--package-list-missing") == 0) {
@@ -4916,6 +4919,27 @@ int main(int argc, char **argv) {
                                  mod, dsub);
                     }
                 }
+            }
+        }
+
+        /* Auto-detect GUI applications on Windows: when no explicit --subsystem
+         * was requested, infer 'windows' for design documents or apps referencing
+         * the GUI framework/driver, so windows apps don't spawn a console window. */
+        if (target.os == ZAN_OS_WINDOWS && link_subsystem == NULL) {
+            bool is_gui_app = (design_count > 0);
+            if (!is_gui_app) {
+                for (int d = 0; d < used_driver_count; d++) {
+                    if (used_driver_len[d] == 7 && memcmp(used_drivers[d], "zan_gui", 7) == 0) {
+                        is_gui_app = true;
+                        break;
+                    }
+                }
+            }
+            if (!is_gui_app && zan_irgen_defines_prefix(&irgen, "Gui_")) {
+                is_gui_app = true;
+            }
+            if (is_gui_app) {
+                link_subsystem = "windows";
             }
         }
 
@@ -7976,9 +8000,21 @@ int main(int argc, char **argv) {
         if (apk_path) {
             const char *abi = (target.arch == ZAN_ARCH_AARCH64)
                               ? "arm64-v8a" : "x86_64";
-            /* default package/label from the input file name unless set */
-            char pkg[128], lbl[128];
+            /* default package/label from the input file name unless set.
+             * 256 bytes to match proj_android_package/label; over-long CLI
+             * values fail loudly here instead of truncating into a
+             * wrong-but-plausible manifest (A349). */
+            char pkg[256], lbl[256];
             if (apk_package) {
+                if (strlen(apk_package) >= sizeof(pkg)) {
+                    fprintf(stderr, "error: --apk-package exceeds %zu bytes\n",
+                            sizeof(pkg) - 1);
+                    remove(obj_path);
+                    zan_irgen_destroy(&irgen);
+                    zan_arena_free(arena);
+                    free(source);
+                    return 1;
+                }
                 snprintf(pkg, sizeof(pkg), "%s", apk_package);
             } else {
               const char *base = strrchr(input_file, '/');
@@ -7997,6 +8033,15 @@ int main(int argc, char **argv) {
               }
             }
             if (apk_label) {
+                if (strlen(apk_label) >= sizeof(lbl)) {
+                    fprintf(stderr, "error: --apk-label exceeds %zu bytes\n",
+                            sizeof(lbl) - 1);
+                    remove(obj_path);
+                    zan_irgen_destroy(&irgen);
+                    zan_arena_free(arena);
+                    free(source);
+                    return 1;
+                }
                 snprintf(lbl, sizeof(lbl), "%s", apk_label);
             } else {
               const char *base = strrchr(input_file, '/');
