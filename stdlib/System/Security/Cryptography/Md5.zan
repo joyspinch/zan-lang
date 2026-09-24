@@ -3,37 +3,36 @@ using System.IO;
 
 namespace System.Security.Cryptography;
 
-/// <summary>RFC 1321 MD5。仅供遗留/互操作场景使用；不具有抗碰撞性，
-/// 不适合用于新的安全场景。</summary>
+/// <summary>RFC 1321 MD5 哈希算法。
+/// 100% 纯 Zan 自举实现，消除循环内部堆分配，采用原位分块与小端寄存器轮转。
+/// 仅供遗留/互操作场景使用；不具有抗碰撞性。</summary>
 class Md5 {
-    /// <summary>计算 MD5；返回新分配的 16 字节摘要。</summary>
-    static byte[] Hash(string msg, int len) {
-        if (msg == null || len <= 0) { return Hash(new byte[0], 0); }
-        byte[] b = new byte[len];
-        for (int i = 0; i < len; i = i + 1) { b[i] = msg[i] & 255; }
-        return Hash(b, len);
-    }
+    static int[] K;
+    static int[] S;
+    static bool inited = false;
 
-    /// <summary>计算 byte[] 数据的 MD5；返回新分配的 16 字节摘要。</summary>
-    static byte[] Hash(byte[] msg, int len) {
-        List<int> K = new List<int>{
-            3614090360, 3905402710, 606105819, 3250441966,
-            4118548399, 1200080426, 2821735955, 4249261313,
-            1770035416, 2336552879, 4294925233, 2304563134,
-            1804603682, 4254626195, 2792965006, 1236535329,
-            4129170786, 3225465664, 643717713, 3921069994,
-            3593408605, 38016083, 3634488961, 3889429448,
-            568446438, 3275163606, 4107603335, 1163531501,
-            2850285829, 4243563512, 1735328473, 2368359562,
-            4294588738, 2272392833, 1839030562, 4259657740,
-            2763975236, 1272893353, 4139469664, 3200236656,
-            681279174, 3936430074, 3572445317, 76029189,
-            3654602809, 3873151461, 530742520, 3299628645,
-            4096336452, 1126891415, 2878612391, 4237533241,
-            1700485571, 2399980690, 4293915773, 2240044497,
-            1873313359, 4264355552, 2734768916, 1309151649,
-            4149444226, 3174756917, 718787259, 3951481745 };
-        List<int> S = new List<int>{
+    static void InitTables() {
+        if (inited) { return; }
+        K = new int[] {
+            -680876936, -389564586, 606105819, -1044525330,
+            -176418897, 1200080426, -1473231341, -45705983,
+            1770035416, -1958414417, -42063, -1990404162,
+            1804603682, -40341101, -1502002290, 1236535329,
+            -165796510, -1069501632, 643717713, -373897302,
+            -701558691, 38016083, -660478335, -405537848,
+            568446438, -1019803690, -187363961, 1163531501,
+            -1444681467, -51403784, 1735328473, -1926607734,
+            -378558, -2022574463, 1839030562, -35309556,
+            -1530992060, 1272893353, -155497632, -1094730640,
+            681279174, -358537222, -722521979, 76029189,
+            -640364487, -421815835, 530742520, -995338651,
+            -198630844, 1126891415, -1416354905, -57434055,
+            1700485571, -1894986606, -1051523, -2054922799,
+            1873313359, -30611744, -1560198380, 1309151649,
+            -145523070, -1120210379, 718787259, -343485551
+        };
+
+        S = new int[] {
             7, 12, 17, 22, 7, 12, 17, 22,
             7, 12, 17, 22, 7, 12, 17, 22,
             5, 9, 14, 20, 5, 9, 14, 20,
@@ -41,44 +40,136 @@ class Md5 {
             4, 11, 16, 23, 4, 11, 16, 23,
             4, 11, 16, 23, 4, 11, 16, 23,
             6, 10, 15, 21, 6, 10, 15, 21,
-            6, 10, 15, 21, 6, 10, 15, 21 };
-        int a0=1732584193; int b0=4023233417; int c0=2562383102; int d0=271733878;
-        int total = len + 1 + 8;
-        int rem = total % 64; int pad = 0; if (rem != 0) { pad = 64 - rem; }
-        int plen = total + pad;
-        byte[] m = new byte[plen];
-        for (int i = 0; i < len; i = i + 1) { m[i] = msg[i] & 255; }
-        m[len] = 128;
-        long bits = (long)len * 8; int bi = plen - 8;
-        m[bi+0]=bits&255; m[bi+1]=(bits>>8)&255; m[bi+2]=(bits>>16)&255; m[bi+3]=(bits>>24)&255;
-        m[bi+4]=(bits>>32)&255; m[bi+5]=(bits>>40)&255; m[bi+6]=(bits>>48)&255; m[bi+7]=(bits>>56)&255;
-        int blocks = plen / 64; 
+            6, 10, 15, 21, 6, 10, 15, 21
+        };
+
+        inited = true;
+    }
+
+    static int RotL32(int x, int n) {
+        return (int)(((uint)x << n) | ((uint)x >> (32 - n)));
+    }
+
+    /// <summary>计算 MD5；返回新分配的 16 字节摘要。</summary>
+    static byte[] Hash(string msg, int len) {
+        if (msg == null || len <= 0) { return Hash(new byte[0], 0); }
+        InitTables();
+
+        int a0 = 1732584193; int b0 = -271733879; int c0 = -1732584194; int d0 = 271733878;
+
+        int[] M = new int[16];
+        int blocks = len / 64;
+
         for (int bl = 0; bl < blocks; bl = bl + 1) {
             int off = bl * 64;
-            List<int> M = new List<int>();
-            int t = 0;
-            for (; t < 16; t = t + 1) {
-                int j = off + t*4;
-                M.Add(((m[j]&255)|((m[j+1]&255)<<8)|((m[j+2]&255)<<16)|((m[j+3]&255)<<24)) & 4294967295);
+            for (int t = 0; t < 16; t = t + 1) {
+                int j = off + t * 4;
+                M[t] = (msg[j] & 255) | ((msg[j + 1] & 255) << 8) | ((msg[j + 2] & 255) << 16) | ((msg[j + 3] & 255) << 24);
             }
-            int A=a0; int B=b0; int C=c0; int D=d0;
-            t = 0;
-            while (t < 64) {
+
+            int A = a0; int B = b0; int C = c0; int D = d0;
+            for (int t = 0; t < 64; t = t + 1) {
                 int F; int g;
-                if (t < 16) { F = (B & C) | (((B ^ 4294967295)&4294967295) & D); g = t; }
-                else if (t < 32) { F = (D & B) | (((D ^ 4294967295)&4294967295) & C); g = (5*t + 1) % 16; }
-                else if (t < 48) { F = B ^ C ^ D; g = (3*t + 5) % 16; }
-                else { F = C ^ (B | ((D ^ 4294967295)&4294967295)); g = (7*t) % 16; }
-                F = (F + A + K[t] + M[g]) & 4294967295;
-                A = D; D = C; C = B;
-                B = (B + Bits.Rotl32(F, S[t])) & 4294967295;
-                t = t + 1;
+                if (t < 16) {
+                    F = (B & C) | ((~B) & D);
+                    g = t;
+                } else if (t < 32) {
+                    F = (D & B) | ((~D) & C);
+                    g = (5 * t + 1) % 16;
+                } else if (t < 48) {
+                    F = B ^ C ^ D;
+                    g = (3 * t + 5) % 16;
+                } else {
+                    F = C ^ (B | (~D));
+                    g = (7 * t) % 16;
+                }
+
+                F = F + A + K[t] + M[g];
+                A = D;
+                D = C;
+                C = B;
+                B = B + RotL32(F, S[t]);
             }
-            a0=(a0+A)&4294967295; b0=(b0+B)&4294967295; c0=(c0+C)&4294967295; d0=(d0+D)&4294967295;
+
+            a0 = a0 + A;
+            b0 = b0 + B;
+            c0 = c0 + C;
+            d0 = d0 + D;
         }
+
+        // 填充尾块 (Padding)
+        int rem = len - blocks * 64;
+        byte[] tail = new byte[128];
+        for (int i = 0; i < rem; i = i + 1) {
+            tail[i] = (byte)(msg[blocks * 64 + i] & 255);
+        }
+        tail[rem] = 128;
+        int tailPadBlocks = 1;
+        if (rem >= 56) {
+            tailPadBlocks = 2;
+        }
+        int totalTailBytes = tailPadBlocks * 64;
+        long bits = (long)len * 8;
+        int bi = totalTailBytes - 8;
+        tail[bi + 0] = (byte)(bits & 255);
+        tail[bi + 1] = (byte)((bits >> 8) & 255);
+        tail[bi + 2] = (byte)((bits >> 16) & 255);
+        tail[bi + 3] = (byte)((bits >> 24) & 255);
+        tail[bi + 4] = (byte)((bits >> 32) & 255);
+        tail[bi + 5] = (byte)((bits >> 40) & 255);
+        tail[bi + 6] = (byte)((bits >> 48) & 255);
+        tail[bi + 7] = (byte)((bits >> 56) & 255);
+
+        for (int tb = 0; tb < tailPadBlocks; tb = tb + 1) {
+            int toff = tb * 64;
+            for (int t = 0; t < 16; t = t + 1) {
+                int j = toff + t * 4;
+                M[t] = (tail[j] & 255) | ((tail[j + 1] & 255) << 8) | ((tail[j + 2] & 255) << 16) | ((tail[j + 3] & 255) << 24);
+            }
+
+            int A = a0; int B = b0; int C = c0; int D = d0;
+            for (int t = 0; t < 64; t = t + 1) {
+                int F; int g;
+                if (t < 16) {
+                    F = (B & C) | ((~B) & D);
+                    g = t;
+                } else if (t < 32) {
+                    F = (D & B) | ((~D) & C);
+                    g = (5 * t + 1) % 16;
+                } else if (t < 48) {
+                    F = B ^ C ^ D;
+                    g = (3 * t + 5) % 16;
+                } else {
+                    F = C ^ (B | (~D));
+                    g = (7 * t) % 16;
+                }
+
+                F = F + A + K[t] + M[g];
+                A = D;
+                D = C;
+                C = B;
+                B = B + RotL32(F, S[t]);
+            }
+
+            a0 = a0 + A;
+            b0 = b0 + B;
+            c0 = c0 + C;
+            d0 = d0 + D;
+        }
+
         byte[] o = new byte[16];
-        wLE(o,0,a0); wLE(o,4,b0); wLE(o,8,c0); wLE(o,12,d0);
+        wLE(o, 0, a0); wLE(o, 4, b0); wLE(o, 8, c0); wLE(o, 12, d0);
         return o;
+    }
+
+    /// <summary>计算 byte[] 数据的 MD5；返回新分配的 16 字节摘要。</summary>
+    static byte[] Hash(byte[] msg, int len) {
+        if (msg == null || len <= 0) {
+            string empty = "";
+            return Hash(empty, 0);
+        }
+        string s = msg;
+        return Hash(s, len);
     }
 
     /// <summary>计算整个 byte[] 的 MD5；返回新分配的 16 字节摘要。</summary>
@@ -100,5 +191,10 @@ class Md5 {
     }
 
     /// 按小端序把 32 位字 v 写入 b 偏移 o 处的 4 个字节。
-    static void wLE(byte[] b, int o, int v) { b[o]=v&255; b[o+1]=(v>>8)&255; b[o+2]=(v>>16)&255; b[o+3]=(v>>24)&255; }
+    static void wLE(byte[] b, int o, int v) {
+        b[o] = (byte)(v & 255);
+        b[o + 1] = (byte)((v >> 8) & 255);
+        b[o + 2] = (byte)((v >> 16) & 255);
+        b[o + 3] = (byte)((v >> 24) & 255);
+    }
 }

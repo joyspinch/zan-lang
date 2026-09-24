@@ -2,65 +2,176 @@ using System;
 
 namespace System.Security.Cryptography;
 
-/// <summary>GM/T 0004-2012 SM3（中国国家密码哈希），256 位
-/// 输出。纯 Zan 实现，直接操作原始字节缓冲区。</summary>
+/// <summary>GM/T 0004-2012 SM3（中国国家商用密码哈希算法），256 位输出。
+/// 100% 纯 Zan 自举实现，消除循环内堆分配，采用原位分块与布尔置换优化。</summary>
 class Sm3 {
-    /// 布尔置换 P0(x) = x ^ ROTL9(x) ^ ROTL17(x)。
-    static int p0(int x) { return (x ^ Bits.Rotl32(x,9) ^ Bits.Rotl32(x,17)) & 4294967295; }
-    /// 布尔置换 P1(x) = x ^ ROTL15(x) ^ ROTL23(x)。
-    static int p1(int x) { return (x ^ Bits.Rotl32(x,15) ^ Bits.Rotl32(x,23)) & 4294967295; }
+    static int RotL32(int x, int n) {
+        return (int)(((uint)x << n) | ((uint)x >> (32 - n)));
+    }
+
+    /// 布尔置换 P0(x) = x ^ ROTL9(x) ^ ROTL17(x)
+    static int P0(int x) {
+        return x ^ RotL32(x, 9) ^ RotL32(x, 17);
+    }
+
+    /// 布尔置换 P1(x) = x ^ ROTL15(x) ^ ROTL23(x)
+    static int P1(int x) {
+        return x ^ RotL32(x, 15) ^ RotL32(x, 23);
+    }
 
     /// <summary>计算 SM3；返回新分配的 32 字节摘要。</summary>
     static byte[] Hash(string msg, int len) {
-        int a0=1937774191; int b0=1226093241; int c0=388252375; int d0=3666478592;
-        int e0=2842636476; int f0=372324522; int g0=3817729613; int h0=2969243214;
-        int total = len + 1 + 8;
-        int rem = total % 64; int pad = 0; if (rem != 0) { pad = 64 - rem; }
-        int plen = total + pad;
-        byte[] m = new byte[plen];
-         for (int i = 0; i < len; i = i + 1) { m[i] = msg[i] & 255; }
-        m[len] = 128;
-        long bits = (long)len * 8; int bi = plen - 8;
-        m[bi+0]=(bits>>56)&255; m[bi+1]=(bits>>48)&255; m[bi+2]=(bits>>40)&255; m[bi+3]=(bits>>32)&255;
-        m[bi+4]=(bits>>24)&255; m[bi+5]=(bits>>16)&255; m[bi+6]=(bits>>8)&255; m[bi+7]=bits&255;
-        int blocks = plen / 64; 
+        if (len < 0) { return null; }
+        if (len > 0 && msg == null) { return null; }
+
+        int a0 = 1937774191; int b0 = 1226093241; int c0 = 388252375; int d0 = -628488704;
+        int e0 = -1452330820; int f0 = 372324522; int g0 = -477237683; int h0 = -1325724082;
+
+        int[] w = new int[68];
+        int[] w1 = new int[64];
+
+        int blocks = len / 64;
+
         for (int bl = 0; bl < blocks; bl = bl + 1) {
             int off = bl * 64;
-            List<int> w = new List<int>();
-            int t = 0;
-            for (; t < 16; t = t + 1) {
-                int j = off + t*4;
-                w.Add((((m[j]&255)<<24)|((m[j+1]&255)<<16)|((m[j+2]&255)<<8)|(m[j+3]&255)) & 4294967295);
+            for (int t = 0; t < 16; t = t + 1) {
+                int j = off + t * 4;
+                w[t] = ((msg[j] & 255) << 24) | ((msg[j + 1] & 255) << 16) | ((msg[j + 2] & 255) << 8) | (msg[j + 3] & 255);
             }
-            t = 16;
-            while (t < 68) {
-                int x = w[t-16] ^ w[t-9] ^ Bits.Rotl32(w[t-3],15);
-                w.Add((p1(x) ^ Bits.Rotl32(w[t-13],7) ^ w[t-6]) & 4294967295);
-                t = t + 1;
+            for (int t = 16; t < 68; t = t + 1) {
+                int x = w[t - 16] ^ w[t - 9] ^ RotL32(w[t - 3], 15);
+                w[t] = P1(x) ^ RotL32(w[t - 13], 7) ^ w[t - 6];
             }
-            List<int> w1 = new List<int>();
-            t = 0; while (t < 64) { w1.Add((w[t] ^ w[t+4]) & 4294967295); t = t + 1; }
-            int A=a0; int B=b0; int C=c0; int D=d0; int E=e0; int F=f0; int G=g0; int H=h0;
+            for (int t = 0; t < 64; t = t + 1) {
+                w1[t] = w[t] ^ w[t + 4];
+            }
+
+            int A = a0; int B = b0; int C = c0; int D = d0; int E = e0; int F = f0; int G = g0; int H = h0;
             for (int j2 = 0; j2 < 64; j2 = j2 + 1) {
-                int tj; if (j2 < 16) { tj = 2043430169; } else { tj = 2055708042; }
-                int ss1 = Bits.Rotl32((Bits.Rotl32(A,12) + E + Bits.Rotl32(tj, j2 % 32)) & 4294967295, 7);
-                int ss2 = ss1 ^ Bits.Rotl32(A,12);
+                int tj;
+                if (j2 < 16) {
+                    tj = 2043430169;
+                } else {
+                    tj = 2055708042;
+                }
+                int rotA12 = RotL32(A, 12);
+                int ss1 = RotL32(rotA12 + E + RotL32(tj, j2 % 32), 7);
+                int ss2 = ss1 ^ rotA12;
+
                 int ff; int gg;
-                if (j2 < 16) { ff = A ^ B ^ C; gg = E ^ F ^ G; }
-                else { ff = (A&B)|(A&C)|(B&C); gg = (E&F)|(((E^4294967295)&4294967295)&G); }
-                int tt1 = (ff + D + ss2 + w1[j2]) & 4294967295;
-                int tt2 = (gg + H + ss1 + w[j2]) & 4294967295;
-                D = C; C = Bits.Rotl32(B,9); B = A; A = tt1;
-                H = G; G = Bits.Rotl32(F,19); F = E; E = p0(tt2);
+                if (j2 < 16) {
+                    ff = A ^ B ^ C;
+                    gg = E ^ F ^ G;
+                } else {
+                    ff = (A & B) | (A & C) | (B & C);
+                    gg = (E & F) | ((~E) & G);
+                }
+
+                int tt1 = ff + D + ss2 + w1[j2];
+                int tt2 = gg + H + ss1 + w[j2];
+
+                D = C;
+                C = RotL32(B, 9);
+                B = A;
+                A = tt1;
+
+                H = G;
+                G = RotL32(F, 19);
+                F = E;
+                E = P0(tt2);
             }
-            a0=(a0^A)&4294967295; b0=(b0^B)&4294967295; c0=(c0^C)&4294967295; d0=(d0^D)&4294967295;
-            e0=(e0^E)&4294967295; f0=(f0^F)&4294967295; g0=(g0^G)&4294967295; h0=(h0^H)&4294967295;
+
+            a0 = a0 ^ A; b0 = b0 ^ B; c0 = c0 ^ C; d0 = d0 ^ D;
+            e0 = e0 ^ E; f0 = f0 ^ F; g0 = g0 ^ G; h0 = h0 ^ H;
         }
+
+        // 填充尾块 (Padding)
+        int rem = len - blocks * 64;
+        byte[] tail = new byte[128];
+        for (int i = 0; i < rem; i = i + 1) {
+            tail[i] = (byte)(msg[blocks * 64 + i] & 255);
+        }
+        tail[rem] = 128;
+        int tailPadBlocks = 1;
+        if (rem >= 56) {
+            tailPadBlocks = 2;
+        }
+        int totalTailBytes = tailPadBlocks * 64;
+        long bits = (long)len * 8;
+        int bi = totalTailBytes - 8;
+        tail[bi + 0] = (byte)((bits >> 56) & 255);
+        tail[bi + 1] = (byte)((bits >> 48) & 255);
+        tail[bi + 2] = (byte)((bits >> 40) & 255);
+        tail[bi + 3] = (byte)((bits >> 32) & 255);
+        tail[bi + 4] = (byte)((bits >> 24) & 255);
+        tail[bi + 5] = (byte)((bits >> 16) & 255);
+        tail[bi + 6] = (byte)((bits >> 8) & 255);
+        tail[bi + 7] = (byte)(bits & 255);
+
+        for (int tb = 0; tb < tailPadBlocks; tb = tb + 1) {
+            int toff = tb * 64;
+            for (int t = 0; t < 16; t = t + 1) {
+                int j = toff + t * 4;
+                w[t] = ((tail[j] & 255) << 24) | ((tail[j + 1] & 255) << 16) | ((tail[j + 2] & 255) << 8) | (tail[j + 3] & 255);
+            }
+            for (int t = 16; t < 68; t = t + 1) {
+                int x = w[t - 16] ^ w[t - 9] ^ RotL32(w[t - 3], 15);
+                w[t] = P1(x) ^ RotL32(w[t - 13], 7) ^ w[t - 6];
+            }
+            for (int t = 0; t < 64; t = t + 1) {
+                w1[t] = w[t] ^ w[t + 4];
+            }
+
+            int A = a0; int B = b0; int C = c0; int D = d0; int E = e0; int F = f0; int G = g0; int H = h0;
+            for (int j2 = 0; j2 < 64; j2 = j2 + 1) {
+                int tj;
+                if (j2 < 16) {
+                    tj = 2043430169;
+                } else {
+                    tj = 2055708042;
+                }
+                int rotA12 = RotL32(A, 12);
+                int ss1 = RotL32(rotA12 + E + RotL32(tj, j2 % 32), 7);
+                int ss2 = ss1 ^ rotA12;
+
+                int ff; int gg;
+                if (j2 < 16) {
+                    ff = A ^ B ^ C;
+                    gg = E ^ F ^ G;
+                } else {
+                    ff = (A & B) | (A & C) | (B & C);
+                    gg = (E & F) | ((~E) & G);
+                }
+
+                int tt1 = ff + D + ss2 + w1[j2];
+                int tt2 = gg + H + ss1 + w[j2];
+
+                D = C;
+                C = RotL32(B, 9);
+                B = A;
+                A = tt1;
+
+                H = G;
+                G = RotL32(F, 19);
+                F = E;
+                E = P0(tt2);
+            }
+
+            a0 = a0 ^ A; b0 = b0 ^ B; c0 = c0 ^ C; d0 = d0 ^ D;
+            e0 = e0 ^ E; f0 = f0 ^ F; g0 = g0 ^ G; h0 = h0 ^ H;
+        }
+
         byte[] o = new byte[32];
-        wBE(o,0,a0); wBE(o,4,b0); wBE(o,8,c0); wBE(o,12,d0);
-        wBE(o,16,e0); wBE(o,20,f0); wBE(o,24,g0); wBE(o,28,h0);
+        wBE(o, 0, a0); wBE(o, 4, b0); wBE(o, 8, c0); wBE(o, 12, d0);
+        wBE(o, 16, e0); wBE(o, 20, f0); wBE(o, 24, g0); wBE(o, 28, h0);
         return o;
     }
-    /// 按大端序把 32 位字 v 写入 b 偏移 o 处的 4 个字节。
-    static void wBE(byte[] b, int o, int v) { b[o]=(v>>24)&255; b[o+1]=(v>>16)&255; b[o+2]=(v>>8)&255; b[o+3]=v&255; }
+
+    /// <summary>按大端序把 32 位字 v 写入 b 偏移 o 处的 4 个字节。</summary>
+    static void wBE(byte[] b, int o, int v) {
+        b[o] = (byte)((v >> 24) & 255);
+        b[o + 1] = (byte)((v >> 16) & 255);
+        b[o + 2] = (byte)((v >> 8) & 255);
+        b[o + 3] = (byte)(v & 255);
+    }
 }

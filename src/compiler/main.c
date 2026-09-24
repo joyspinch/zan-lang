@@ -5001,7 +5001,9 @@ int main(int argc, char **argv) {
          * pulls TlsStream through Image.url's https branch without ever
          * opening an https connection) small and runnable. Without this,
          * -lssl drags ~4 MB of OpenSSL into every such exe. */
-        if (target.os == ZAN_OS_WINDOWS && link_static_drivers && publish_mode) {
+        if (target.os == ZAN_OS_WINDOWS) {
+            char win_exe_dir[1024] = {0};
+            zan_exe_dir(win_exe_dir, sizeof(win_exe_dir));
             /* Backwards: dropping a lib compacts extern_libs and shifts the
              * remaining slots, which would skip the next entry forwards. */
             for (int li = irgen.extern_lib_count - 1; li >= 0; li--) {
@@ -5012,7 +5014,7 @@ int main(int argc, char **argv) {
                 if (!nm || zan_win_system_lib(nm, nlen)) continue;
                 /* Which driver (if any) owns this lib, and where does it
                  * live? Non-system libs with no owning driver have no
-                 * resolution channel at all on a static publish. */
+                 * resolution channel. */
                 char dir[1200];
                 dir[0] = '\0';
                 for (int d = 0; d < used_driver_count; d++) {
@@ -5023,16 +5025,37 @@ int main(int argc, char **argv) {
                     }
                 }
                 bool resolvable = false;
-                static const char fmts[6][28] = {
+                static const char fmts[8][28] = {
                     "%s/static/lib%s.a", "%s/static/%s.lib",
                     "%s/lib%s.a",        "%s/%s.lib",
+                    "%s/lib%s.dll.a",    "%s/%s.dll.a",
                     "%s/lib%s.dll",      "%s/%s.dll"
                 };
                 if (dir[0]) {
-                    for (int f = 0; f < 6 && !resolvable; f++) {
+                    for (int f = 0; f < 8 && !resolvable; f++) {
                         char cand[1300];
                         snprintf(cand, sizeof(cand), fmts[f], dir, nm);
                         resolvable = zan_file_exists(cand);
+                    }
+                }
+                if (!resolvable && win_exe_dir[0]) {
+                    char mlib[1300];
+                    snprintf(mlib, sizeof(mlib), "%s\\mingw\\lib\\lib%s.a", win_exe_dir, nm);
+                    resolvable = zan_file_exists(mlib);
+                    if (!resolvable) {
+                        snprintf(mlib, sizeof(mlib), "%s\\mingw\\lib\\lib%s.dll.a", win_exe_dir, nm);
+                        resolvable = zan_file_exists(mlib);
+                    }
+                }
+                if (!resolvable) {
+                    for (int di = 0; di < extra_lib_path_count && !resolvable; di++) {
+                        char cand[1300];
+                        snprintf(cand, sizeof(cand), "%s/lib%s.a", extra_lib_paths[di], nm);
+                        resolvable = zan_file_exists(cand);
+                        if (!resolvable) {
+                            snprintf(cand, sizeof(cand), "%s/lib%s.dll.a", extra_lib_paths[di], nm);
+                            resolvable = zan_file_exists(cand);
+                        }
                     }
                 }
                 if (resolvable) continue;
@@ -5054,7 +5077,7 @@ int main(int argc, char **argv) {
                         (int)irgen.extern_libs[li].len);
                     fprintf(stderr,
                             "warning: no archive or shared library resolved "
-                            "for [DllImport(\"%s\")] in the static publish;"
+                            "for [DllImport(\"%s\")];"
                             " its %d function(s) are stubbed and will fail at"
                             " run time\n", libname, n);
                 }
