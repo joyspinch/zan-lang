@@ -1,0 +1,64 @@
+using System;
+using System.Text;
+using System.Security.Cryptography;
+
+namespace Zan.Mvc.Admin.Security;
+
+/// <summary>
+/// 管理后台安全会话令牌生成与防伪签名校验器
+/// </summary>
+public class AdminSessionToken {
+    public static const string CookieName = "zsession";
+    private static const string SecretKey = "zan_admin_secure_session_key_2026";
+    private static const long TokenValiditySeconds = 604800; // 7 天有效
+
+    public static string Create(int uid) {
+        long now = DateTime.UtcNow().ToUnixSeconds();
+        string payload = Convert.ToString(uid) + "." + Convert.ToString(now);
+        string toSign = payload + "." + SecretKey;
+        byte[] hash = Sha256.Hash(toSign, toSign.Length);
+        string sig = PasswordSecurity.ToHex(hash);
+        return payload + "." + sig;
+    }
+
+    public static int Verify(string token) {
+        if (token == null || token.Length == 0) { return 0; }
+        int dot1 = token.IndexOf(".");
+        if (dot1 <= 0) { return 0; }
+        int dot2 = token.IndexOf(".", dot1 + 1);
+        if (dot2 <= dot1 + 1) { return 0; }
+
+        string uidStr = token.Substring(0, dot1);
+        string timeStr = token.Substring(dot1 + 1, dot2 - (dot1 + 1));
+        string sig = token.Substring(dot2 + 1);
+
+        int uid = 0;
+        try {
+            uid = Convert.ToInt32(uidStr);
+        } catch (Exception ex) {
+            return 0;
+        }
+
+        long createdTime = 0;
+        try {
+            createdTime = Convert.ToInt64(timeStr);
+        } catch (Exception ex) {
+            return 0;
+        }
+
+        long now = DateTime.UtcNow().ToUnixSeconds();
+        if (now - createdTime > TokenValiditySeconds || createdTime > now + 3600) {
+            return 0;
+        }
+
+        string toSign = uidStr + "." + timeStr + "." + SecretKey;
+        byte[] hash = Sha256.Hash(toSign, toSign.Length);
+        string expectedSig = PasswordSecurity.ToHex(hash);
+
+        if (!PasswordSecurity.ConstantTimeEquals(sig, expectedSig)) {
+            return 0;
+        }
+
+        return uid;
+    }
+}

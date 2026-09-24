@@ -1,0 +1,231 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+using System.Web;
+using System.Json;
+using Zan.Mvc.Admin.Model;
+using Zan.Mvc.Admin.UI;
+
+namespace Zan.Mvc.Admin.Web;
+
+/// <summary>
+/// 系统角色管理控制器。
+/// 挂载可视化权限树查询与保存接口，严格保护核心超管角色。
+/// </summary>
+[Route("/admin/system/role")]
+[Custom(Authorization = CustomAuthorization.Grant, IsMenu = true, Icon = "shield-check", Perm = PermBit.View)]
+[Description("角色管理")]
+public class SysRoleController : CrudController<SysRole> {
+    public SysRoleController() {
+    }
+
+    protected override TableConfig BuildTableConfig() {
+        TableConfig cfg = new TableConfig();
+        cfg.Conf.SetKey("id", "角色管理");
+        cfg.AddColumn("id", "ID", "number", 60, true, false)
+           .AddColumn("name", "角色标识", "input", 140, true, true)
+           .AddColumn("remark", "角色说明", "input", 220, false, true)
+           .AddColumn("status", "状态", "dict", 80, true, true)
+           .AddColumn("created_at", "创建时间", "time", 150, true, false)
+           .AddFilter("name", "角色标识", "Input", "输入标识搜索")
+           .AddTool("添加角色", "Add", "角色", "Primary", false, "500px", "320px")
+           .AddTool("批量删除", "Delete", "角色", "Error", true, "400px", "260px")
+           .AddTool("导出角色", "Export", "角色", "Default", false, "", "");
+        return cfg;
+    }
+
+    protected override FormView BuildFormView() {
+        FormView form = new FormView("角色信息");
+        form.AddField("name", "角色标识", "input", true, "例如: editor, auditor", 12)
+            .AddField("remark", "角色描述", "input", false, "简要描述角色职能", 12)
+            .AddField("status", "状态", "radio", true, "1:正常,0:禁用", 12);
+        return form;
+    }
+
+    protected override string OnPage(int page, int pageSize) {
+        List<SysRole> list = this.SysRole.OrderBy("id DESC").Page(page, pageSize).ToList();
+        int total = this.SysRole.Count();
+        SysRolePagedResult res = new SysRolePagedResult(total, list);
+        return Json.Serialize<SysRolePagedResult>(res);
+    }
+
+    protected override bool OnSave(string body) {
+        string name = this.Ctx().form.Get("name");
+        string remark = this.Ctx().form.Get("remark");
+        string statusStr = this.Ctx().form.Get("status");
+
+        if (name.Length == 0) {
+            return false;
+        }
+
+        SysRole exist = this.SysRole.W("name = ?").P(name).First();
+        if (exist != null) {
+            return false;
+        }
+
+        SysRole r = new SysRole();
+        r.name = name;
+        r.remark = remark;
+        r.status = 1;
+        if (statusStr.Length > 0) {
+            try { r.status = Convert.ToInt32(statusStr); } catch (Exception ex) {}
+        }
+        r.created_at = DateTime.UtcNow().ToUnixSeconds();
+
+        return this.SysRole.Insert(r).ExecuteAffrows() > 0;
+    }
+
+    protected override bool OnDelete(int id) {
+        if (id == 1) { return false; }
+        SysRole r = this.SysRole.W("id = ?").Pi(id).First();
+        if (r != null && r.name == "admin") { return false; }
+        this.SysRoleRule.Delete().W("role_id = ?").Pi(id).ExecuteAffrows();
+        return this.SysRole.Delete().W("id = ?").Pi(id).ExecuteAffrows() > 0;
+    }
+
+    protected override bool OnBatchDelete(List<int> ids) {
+        bool ok = true;
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            int id = ids[i];
+            if (id == 1) { continue; }
+            SysRole r = this.SysRole.W("id = ?").Pi(id).First();
+            if (r != null && r.name == "admin") { continue; }
+            this.SysRoleRule.Delete().W("role_id = ?").Pi(id).ExecuteAffrows();
+            if (this.SysRole.Delete().W("id = ?").Pi(id).ExecuteAffrows() <= 0) {
+                ok = false;
+            }
+        }
+        return ok;
+    }
+
+    protected override bool OnField(int id, string field, string value) {
+        if (id == 1 && field == "status" && value == "0") {
+            return false;
+        }
+        if (id == 1 && field == "name" && value != "admin") {
+            return false;
+        }
+        if (field == "status") {
+            int st = 1;
+            try { st = Convert.ToInt32(value); } catch (Exception ex) {}
+            return this.SysRole.Update().SetI("status", st).W("id = ?").Pi(id).ExecuteAffrows() > 0;
+        }
+        return this.SysRole.Update().SetS(field, value).W("id = ?").Pi(id).ExecuteAffrows() > 0;
+    }
+
+    [HttpGet]
+    [Route("/admin/system/role/rules")]
+    public void GetRoleRules() {
+        string idStr = this.Ctx().query.Get("id");
+        if (idStr.Length == 0) {
+            idStr = this.Ctx().query.Get("role_id");
+        }
+        int roleId = 0;
+        try { roleId = Convert.ToInt32(idStr); } catch (Exception ex) {}
+
+        List<SysRule> allRules = this.SysRule.OrderBy("weigh ASC, id ASC").ToList();
+        List<SysRoleRule> roleRules = this.SysRoleRule.W("role_id = ?").Pi(roleId).ToList();
+
+        Dict<int, bool> checkedMap = new Dict<int, bool>();
+        for (int i = 0; i < roleRules.Count; i = i + 1) {
+            checkedMap.Add(roleRules[i].rule_id, true);
+        }
+
+        // 构建权限树
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[");
+
+        List<SysRule> roots = new List<SysRule>();
+        for (int i = 0; i < allRules.Count; i = i + 1) {
+            if (allRules[i].pid == 0) { roots.Add(allRules[i]); }
+        }
+
+        for (int i = 0; i < roots.Count; i = i + 1) {
+            if (i > 0) { sb.Append(","); }
+            SysRule root = roots[i];
+            bool isChecked = checkedMap.ContainsKey(root.id);
+            sb.Append("{");
+            sb.Append("\"id\":");
+            sb.Append(Convert.ToString(root.id));
+            sb.Append(",");
+            sb.Append("\"title\":\"");
+            sb.Append(root.title);
+            sb.Append("\",");
+            sb.Append("\"name\":\"");
+            sb.Append(root.name);
+            sb.Append("\",");
+            sb.Append("\"is_menu\":");
+            sb.Append(root.ismenu == 1 ? "true" : "false");
+            sb.Append(",");
+            sb.Append("\"checked\":");
+            sb.Append(isChecked ? "true" : "false");
+            sb.Append(",");
+            sb.Append("\"children\":[");
+
+            int childCount = 0;
+            for (int j = 0; j < allRules.Count; j = j + 1) {
+                if (allRules[j].pid == root.id) {
+                    if (childCount > 0) { sb.Append(","); }
+                    SysRule child = allRules[j];
+                    bool cChecked = checkedMap.ContainsKey(child.id);
+                    sb.Append("{");
+                    sb.Append("\"id\":");
+                    sb.Append(Convert.ToString(child.id));
+                    sb.Append(",");
+                    sb.Append("\"title\":\"");
+                    sb.Append(child.title);
+                    sb.Append("\",");
+                    sb.Append("\"name\":\"");
+                    sb.Append(child.name);
+                    sb.Append("\",");
+                    sb.Append("\"is_menu\":");
+                    sb.Append(child.ismenu == 1 ? "true" : "false");
+                    sb.Append(",");
+                    sb.Append("\"checked\":");
+                    sb.Append(cChecked ? "true" : "false");
+                    sb.Append("}");
+                    childCount = childCount + 1;
+                }
+            }
+            sb.Append("]}");
+        }
+        sb.Append("]");
+
+        this.JsonSuccessData(sb.ToString());
+    }
+
+    [HttpPost]
+    [Route("/admin/system/role/saverules")]
+    public void SaveRoleRules() {
+        string roleIdStr = this.Ctx().form.Get("role_id");
+        string ruleIdsStr = this.Ctx().form.Get("rule_ids");
+
+        int roleId = 0;
+        try { roleId = Convert.ToInt32(roleIdStr); } catch (Exception ex) {}
+        if (roleId <= 0) {
+            this.JsonFail("角色 ID 不合法");
+            return;
+        }
+
+        // 先清理该角色现有的规则
+        this.SysRoleRule.Delete().W("role_id = ?").Pi(roleId).ExecuteAffrows();
+
+        if (ruleIdsStr.Length > 0) {
+            List<string> parts = ruleIdsStr.Split(",");
+            for (int i = 0; i < parts.Count; i = i + 1) {
+                try {
+                    int rid = Convert.ToInt32(parts[i]);
+                    if (rid > 0) {
+                        SysRoleRule rr = new SysRoleRule();
+                        rr.role_id = roleId;
+                        rr.rule_id = rid;
+                        this.SysRoleRule.Insert(rr).ExecuteAffrows();
+                    }
+                } catch (Exception ex) {}
+            }
+        }
+
+        this.AuditLog("SaveRoleRules", "更新角色权限分配 (RoleID: " + Convert.ToString(roleId) + ")");
+        this.JsonSuccess("权限已更新并生效");
+    }
+}

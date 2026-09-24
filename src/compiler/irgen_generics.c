@@ -431,22 +431,14 @@ static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
         else if (obj && obj->kind == AST_THIS_EXPR)
             tsym = g->current_type_sym;
         if (!tsym && obj && obj->kind == AST_IDENTIFIER && locals &&
-            !local_find(locals, obj->ident.name) && g->current_type_sym) {
-            /* A bare member name inside the class body reads an instance
-             * field/property off `this` -- unless the name resolves to a
-             * static member's class/struct prefix, which stays borrowed
-             * (reads of static properties are shared globals). */
-            zan_symbol_t *fs = get_field_sym(g->current_type_sym,
-                                             e->member.name);
-            if (fs) {
-                if (fs->kind == SYM_PROPERTY && fs->decl &&
-                    fs->decl->field_decl.getter_body)
-                    return 1;
-            } else {
-                zan_symbol_t *cs = zan_binder_lookup(g->binder,
-                                                     obj->ident.name);
-                if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT))
-                    tsym = cs->type;
+            !local_find(locals, obj->ident.name)) {
+            zan_symbol_t *cs = zan_binder_lookup(g->binder, obj->ident.name);
+            if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT)) {
+                tsym = cs;
+            } else if (g->current_type_sym) {
+                zan_symbol_t *fs = get_field_sym(g->current_type_sym,
+                                                 obj->ident.name);
+                if (fs && fs->type) tsym = fs->type->sym;
             }
         }
         if (tsym) {

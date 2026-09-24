@@ -1949,3 +1949,16 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   要编译"没有包的历史版本"做对照，必须把源码树和 zanc 一起搬到仓库外
   （exe 旁 `../packages` 也是发现面之一），runtime obj（build/*.obj）要
   随 zanc 同拷。
+
+## expr_yields_owned_rc_value 成员访问与返回值 ARC 所有权判定（2026-09-25）
+
+- **症状**：调用返回静态字段/借用对象的方法（如 `public IDbConnection __Conn() { return AdminApp.Db; }`）后，调用方使用返回值（如 `ctrl.__Conn().Query(...)`）触发 `release through a stale reference (object was already freed)` 或野指针崩溃。
+- **根因**：
+  1. `src/compiler/irgen_generics.c` 的 `expr_yields_owned_rc_value` 在判定成员访问时，若当前类定义了与访问目标同名的实例属性（如 `BaseAdminController.Db` 属性），旧逻辑优先从 `g->current_type_sym` 查该名字，若为属性且有 getter 则返回 1（误判为 owned +1）。这导致 `return AdminApp.Db;` 被误认为会产生 +1 拥有值，跳过了 `emit_rc_retain_for_type`，使借用对象未加引用即交付调用方，调用方用毕无条件释放产生野释放；
+  2. 指针类型混淆：`zan_binder_lookup` 查到类/结构体符号 `cs` 时，直接将 `cs->type`（`zan_type_t*`）赋值给 `tsym`（`zan_symbol_t*`），导致后续将类型结构体误当符号指针解引用；
+  3. `src/compiler/irgen_stmt.c` 中，当 `infer_expr_type` 静态推导返回表达式类型为 NULL 时，未向函数声明返回类型 `g->current_fn_zan_ret_type` 回退，导致声明为 RC 托管类型的函数在返回借用值时漏掉 retain。
+- **修法**：
+  1. 优先判定 `obj` 为类名/结构体名符号（`SYM_CLASS` / `SYM_STRUCT`），以此类型的成员为准，不被当前类的同名属性遮蔽击穿；
+  2. 修复指针赋值：`tsym = cs;`；
+  3. 在 `irgen_stmt.c` 的返回语句处理中，当 `ret_type == NULL && g->current_fn_zan_ret_type` 时回退赋值，确保 RC 托管类型必定正确处理 retain。
+

@@ -1,0 +1,100 @@
+using System;
+using System.Collections.Generic;
+using System.Web;
+using Zan.Mvc.Admin.Model;
+using Zan.Mvc.Admin.Security;
+
+namespace Zan.Mvc.Admin.Web;
+
+/// <summary>
+/// 管理后台认证与会话登录控制器
+/// </summary>
+public class AdminAuthController : BaseAdminController {
+
+    [HttpGet]
+    [Route("/admin/login")]
+    public void LoginPage() {
+        int uid = this.CurrentAdminId;
+        if (uid > 0) {
+            this.Ctx().Redirect("/admin");
+            return;
+        }
+        string html = this.LoadView("Login");
+        this.Ctx().Html(html);
+    }
+
+    [HttpPost]
+    [Route("/admin/api/login")]
+    public void ApiLogin() {
+        string username = this.Ctx().form.Get("username");
+        string password = this.Ctx().form.Get("password");
+        if (username.Length == 0 || password.Length == 0) {
+            JsonValue jv = this.Ctx().JsonBody();
+            if (jv != null) {
+                if (username.Length == 0) { username = jv.Str("username", ""); }
+                if (password.Length == 0) { password = jv.Str("password", ""); }
+            }
+        }
+
+        string ip = this.Ctx().RemoteIp();
+        string ua = this.Ctx().request.GetHeader("User-Agent");
+        long now = DateTime.UtcNow().ToUnixSeconds();
+
+        if (username.Length == 0 || password.Length == 0) {
+            this.JsonFail("请输入账号与密码");
+            return;
+        }
+
+        List<SysUser> users = this.SysUser.W("username = ?").P(username).ToList();
+        if (users.Count == 0) {
+            this.RecordLoginLog(username, ip, ua, 0, "用户不存在", now);
+            this.JsonFail("用户名或密码错误");
+            return;
+        }
+
+        SysUser u = users[0];
+        if (u.status != 1) {
+            this.RecordLoginLog(username, ip, ua, 0, "账号已被停用", now);
+            this.JsonFail("该账号已被停用，请联系管理员");
+            return;
+        }
+
+        bool vOk = PasswordSecurity.VerifyPassword(password, u.password_hash, u.salt);
+        if (!vOk) {
+            this.RecordLoginLog(username, ip, ua, 0, "密码错误", now);
+            this.JsonFail("用户名或密码错误");
+            return;
+        }
+
+        u.last_login_time = now;
+        u.last_login_ip = ip;
+        this.SysUser.Update(u).ExecuteAffrows();
+
+        this.RecordLoginLog(username, ip, ua, 1, "登录成功", now);
+
+        string token = AdminSessionToken.Create(u.id);
+        this.Ctx().SetCookie(AdminSessionToken.CookieName, token, 604800);
+
+        this.JsonSuccess("登录成功");
+    }
+
+    [HttpGet]
+    [Route("/admin/logout")]
+    public void Logout() {
+        this.Ctx().SetCookie(AdminSessionToken.CookieName, "", 0);
+        this.Ctx().Redirect("/admin/login");
+    }
+
+    private void RecordLoginLog(string username, string ip, string ua, int status, string msg, long now) {
+        try {
+            SysLoginLog log = new SysLoginLog();
+            log.username = username;
+            log.ip = ip;
+            log.user_agent = ua;
+            log.status = status;
+            log.message = msg;
+            log.created_at = now;
+            this.SysLoginLog.Insert(log).ExecuteAffrows();
+        } catch (Exception ex) {}
+    }
+}

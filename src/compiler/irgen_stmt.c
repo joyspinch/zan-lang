@@ -1575,6 +1575,8 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             zan_type_t *ret_type = concretize(g,
                 infer_expr_type(g, stmt->ret.value, locals));
             if (conv_ret) ret_type = g->current_fn_zan_ret_type;
+            if (!ret_type && g->current_fn_zan_ret_type)
+                ret_type = g->current_fn_zan_ret_type;
             if (is_rc_managed_type(ret_type) &&
                 !expr_yields_owned_rc_value(g, stmt->ret.value, locals) &&
                 !conv_ret) {

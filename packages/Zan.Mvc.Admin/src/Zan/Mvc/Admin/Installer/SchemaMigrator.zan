@@ -1,0 +1,125 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using Zan.Mvc.Admin.Model;
+using Zan.Mvc.Admin.Security;
+
+namespace Zan.Mvc.Admin.Installer;
+
+/// <summary>
+/// 数据库结构安装与初始化迁移器
+/// </summary>
+public class SchemaMigrator {
+    public static bool ExecuteInstall(IDbConnection db, string adminUser, string adminPass, out string err) {
+        err = "";
+        if (db == null) {
+            err = "数据库未连接";
+            return false;
+        }
+
+        try {
+            // 同步表结构
+            db.SyncStructure<SysUser>();
+            db.SyncStructure<SysRole>();
+            db.SyncStructure<SysRule>();
+            db.SyncStructure<SysRoleRule>();
+            db.SyncStructure<SysUserRole>();
+            db.SyncStructure<SysDepartment>();
+            db.SyncStructure<SysLoginLog>();
+            db.SyncStructure<SysOperationLog>();
+
+            long now = DateTime.UtcNow().ToUnixSeconds();
+
+            // 1. 初始化超级管理员
+            List<SysUser> users = db.Select<SysUser>().W("username = ?").P(adminUser).ToList();
+            int adminUid = 1;
+            if (users.Count == 0) {
+                string salt = PasswordSecurity.GenerateSalt(16);
+                string hash = PasswordSecurity.HashPassword(adminPass, salt);
+                SysUser u = new SysUser();
+                u.id = 1;
+                u.username = adminUser;
+                u.nickname = "超级管理员";
+                u.password_hash = hash;
+                u.salt = salt;
+                u.status = 1;
+                u.created_at = now;
+                db.Insert<SysUser>(u).ExecuteAffrows();
+            } else {
+                adminUid = users[0].id;
+            }
+
+            // 2. 初始化超管角色
+            List<SysRole> roles = db.Select<SysRole>().W("name = 'admin'").ToList();
+            int adminRoleId = 1;
+            if (roles.Count == 0) {
+                SysRole r = new SysRole();
+                r.id = 1;
+                r.name = "admin";
+                r.remark = "超级管理员，拥有全局所有控制权限";
+                r.status = 1;
+                r.created_at = now;
+                db.Insert<SysRole>(r).ExecuteAffrows();
+            } else {
+                adminRoleId = roles[0].id;
+            }
+
+            // 关联超管与角色
+            List<SysUserRole> ur = db.Select<SysUserRole>().W("user_id = ? AND role_id = ?").Pi(adminUid).Pi(adminRoleId).ToList();
+            if (ur.Count == 0) {
+                SysUserRole r = new SysUserRole();
+                r.user_id = adminUid;
+                r.role_id = adminRoleId;
+                db.Insert<SysUserRole>(r).ExecuteAffrows();
+            }
+
+            // 3. 初始化默认菜单与权限规则
+            InitDefaultRules(db, now);
+
+            return true;
+        } catch (Exception ex) {
+            err = ex.Message;
+            return false;
+        }
+    }
+
+    private static void InitDefaultRules(IDbConnection db, long now) {
+        int count = db.Select<SysRule>().Count();
+        if (count > 0) { return; }
+
+        // 顶层分组 1: 控制台
+        AddRule(db, 1, 0, "dashboard", "控制台", "gauge", "/admin", "", 1, 10, now);
+
+        // 顶层分组 2: 系统管理
+        AddRule(db, 2, 0, "system", "系统管理", "settings", "/admin/system", "", 1, 20, now);
+        AddRule(db, 3, 2, "system/user", "用户管理", "user", "/admin/system/user", "", 1, 21, now);
+        AddRule(db, 4, 2, "system/role", "角色管理", "shield-check", "/admin/system/role", "", 1, 22, now);
+        AddRule(db, 5, 2, "system/rule", "菜单权限", "list-tree", "/admin/system/rule", "", 1, 23, now);
+        AddRule(db, 6, 2, "system/dept", "部门管理", "building", "/admin/system/dept", "", 1, 24, now);
+
+        // 顶层分组 3: 商城业务
+        AddRule(db, 7, 0, "shop", "商城业务", "shopping-bag", "/admin/shop", "", 1, 30, now);
+        AddRule(db, 8, 7, "shop/product", "商品管理", "box", "/admin/shop/product", "", 1, 31, now);
+
+        // 顶层分组 4: 监控审计
+        AddRule(db, 9, 0, "monitor", "监控审计", "activity", "/admin/monitor", "", 1, 40, now);
+        AddRule(db, 10, 9, "monitor/loginlog", "登录日志", "history", "/admin/monitor/loginlog", "", 1, 41, now);
+        AddRule(db, 11, 9, "monitor/oplog", "操作日志", "file-text", "/admin/monitor/oplog", "", 1, 42, now);
+    }
+
+    private static void AddRule(IDbConnection db, int id, int pid, string name, string title, string icon, string route, string comp, int ismenu, int weigh, long now) {
+        SysRule r = new SysRule();
+        r.id = id;
+        r.pid = pid;
+        r.name = name;
+        r.title = title;
+        r.icon = icon;
+        r.route = route;
+        r.component = comp;
+        r.ismenu = ismenu;
+        r.weigh = weigh;
+        r.status = 1;
+        r.created_at = now;
+        db.Insert<SysRule>(r).ExecuteAffrows();
+    }
+}
