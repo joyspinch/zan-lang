@@ -1,0 +1,205 @@
+using System;
+using System.Text;
+using System.Data;
+using System.Web;
+using System.Json;
+using ZanWeb.Core;
+
+namespace ZanWeb.Web;
+
+/* 声明驱动的通用写动作与前端表格配置。
+ *
+ * 写侧：字段/表名白名单出自 ListPage.Table/EditFields（代码声明，非
+ * 用户输入），标识符再过 Gen.Safe 字符校验双保险，值一律走 ? 占位符
+ * 参数——列名进 SQL 前不可能携带用户数据，注入面为零。行级授权由调用
+ * 方预检：allowed 集合里的 id 才可写，越权 id 与不存在的 id 同答 404，
+ * 不泄露存在性。审计经 AdminController.Note 落 sys_operation_log。
+ *
+ * 读侧：Conf() 把本屏声明投影为 adminUI ZanTable 的 ListConfData JSON
+ * （PUT {apiObj}/conf 契约）——服务端渲染与前端表格配置同源产出，
+ * 前端不再各自维护一份列定义。
+ */
+class Crud {
+    /* 单行单字段：POST id/field/value。field 必须在白名单内，值按声明
+       类型绑定（int 走整型参数，其余文本），id 必须在 allowed 内。 */
+    static async void Field(AdminController c, ListPage lp, string title,
+                            string field, string value, List<int> allowed) {
+        StrMap def = Crud.Find(lp, field);
+        if (def == null) { c.Fail(400, "0004", "该字段不可编辑"); return; }
+        if (allowed.Count == 0) { c.Fail(404, "0404", "记录不存在"); return; }
+        DbParams ps = new DbParams();
+        if (def.Get("type") == "int") {
+            ps.AddLong(Filter.ToLong(value, 0));
+        } else {
+            ps.Add(value);
+        }
+        ps.AddInt(allowed[0]);
+        int n = await c.__Conn().ExecuteAsync("UPDATE " + lp.table
+            + " SET " + def.Get("name") + " = ? WHERE id = ?", ps);
+        await c.Note(title + "·编辑字段",
+            "#" + Convert.ToString(allowed[0]) + " " + field, n > 0, value);
+        c.Saved("已保存");
+    }
+
+    /* 批量单字段：POST ids=1,2,3（或调用方直接给 allowed）。批量启禁、
+       批量改归属等"同一列一个值"的场景共用此形态；ids 上限 500 由
+       AdminController.Ids() 钳制，IN 逐个占位符。 */
+    static async void Batch(AdminController c, ListPage lp, string field,
+                            string value, List<int> allowed, string title) {
+        StrMap def = Crud.Find(lp, field);
+        if (def == null) { c.Fail(400, "0004", "该字段不可编辑"); return; }
+        if (allowed.Count == 0) { c.Fail(400, "0004", "未选择记录"); return; }
+        StringBuilder marks = new StringBuilder();
+        DbParams ps = new DbParams();
+        if (def.Get("type") == "int") {
+            ps.AddLong(Filter.ToLong(value, 0));
+        } else {
+            ps.Add(value);
+        }
+        for (int i = 0; i < allowed.Count; i = i + 1) {
+            if (i > 0) { marks.Append(","); }
+            marks.Append("?");
+            ps.AddInt(allowed[i]);
+        }
+        int n = await c.__Conn().ExecuteAsync("UPDATE " + lp.table
+            + " SET " + def.Get("name") + " = ? WHERE id IN ("
+            + marks.ToString() + ")", ps);
+        await c.Note(title,
+            Convert.ToString(allowed.Count) + " 条", n > 0, field + "=" + value);
+        c.Saved(Lang.T("已更新") + " " + Convert.ToString(n) + " " + Lang.T("条记录"));
+    }
+
+    /* 批量删除：DELETE ... WHERE id IN (占位符...); 关联清理（子表、
+       缓存失效）是业务语义，留在调用方——本方法只对声明的主表负责。 */
+    static async void Delete(AdminController c, ListPage lp,
+                             List<int> allowed, string title) {
+        if (allowed.Count == 0) { c.Fail(400, "0004", "未选择记录"); return; }
+        StringBuilder marks = new StringBuilder();
+        DbParams ps = new DbParams();
+        for (int i = 0; i < allowed.Count; i = i + 1) {
+            if (i > 0) { marks.Append(","); }
+            marks.Append("?");
+            ps.AddInt(allowed[i]);
+        }
+        int n = await c.__Conn().ExecuteAsync("DELETE FROM " + lp.table
+            + " WHERE id IN (" + marks.ToString() + ")", ps);
+        await c.Note(title, Convert.ToString(allowed.Count) + " 条", n > 0, "");
+        c.Saved(Lang.T("已删除") + " " + Convert.ToString(n) + " " + Lang.T("条记录"));
+    }
+
+    /* 白名单查找：field 必须精确匹配声明项，且表名/列名过 Gen.Safe——
+       双重防线，声明写错时在运行期显式拒绝而不是拼出意外 SQL。 */
+    static StrMap Find(ListPage lp, string field) {
+        if (!Gen.Safe(lp.table)) { return null; }
+        if (field.Length == 0 || field.Length > 64) { return null; }
+        for (int i = 0; i < lp.edits.Count; i = i + 1) {
+            if (lp.edits[i].Get("name") == field) {
+                if (!Gen.Safe(field)) { return null; }
+                return lp.edits[i];
+            }
+        }
+        return null;
+    }
+
+    /* adminUI ZanTable 契约：把本屏声明投影为 ListConfData JSON。
+       信封 {resp_code,status,msg,url,dynamicToken,t,data}，data =
+       {conf, columns, filters, tools}；列类型映射 text/muted→text、
+       num→number、time→date、tag/flag→dict；筛选映射 Input/Select/
+       DateRange/Select(remote)。editable 只对 EditFields 白名单为真。 */
+    static void Conf(AdminController c, ListPage lp) {
+        JsonValue data = JsonValue.NewObject();
+
+        JsonValue conf = JsonValue.NewObject();
+        conf.Put("showPages", JsonValue.NewBool(true));
+        conf.Put("pageSize", JsonValue.NewInt(20));
+        JsonValue sizes = JsonValue.NewArray();
+        sizes.Append(JsonValue.NewInt(10));
+        sizes.Append(JsonValue.NewInt(20));
+        sizes.Append(JsonValue.NewInt(50));
+        sizes.Append(JsonValue.NewInt(100));
+        conf.Put("pageSizes", sizes);
+        conf.Put("local", JsonValue.NewBool(false));
+        conf.Put("import", JsonValue.NewBool(false));
+        conf.Put("export", JsonValue.NewBool(false));
+        data.Put("conf", conf);
+
+        JsonValue cols = JsonValue.NewArray();
+        for (int i = 0; i < lp.cols.Count; i = i + 1) {
+            ListCol col = lp.cols[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Put("headerName", JsonValue.NewStr(col.title));
+            o.Put("field", JsonValue.NewStr(col.field));
+            string type = "text";
+            if (col.kind == "num") { type = "number"; }
+            else if (col.kind == "time") { type = "date"; }
+            else if (col.kind == "tag" || col.kind == "flag") { type = "dict"; }
+            o.Put("type", JsonValue.NewStr(type));
+            o.Put("sortable", JsonValue.NewBool(col.kind == "num"));
+            o.Put("editable", JsonValue.NewBool(Crud.Find(lp, col.field) != null));
+            if (col.width.Length > 0) {
+                o.Put("width", JsonValue.NewNum(Crud.WidthNum(col.width)));
+            }
+            if (col.opts.Length > 0) { o.Put("options", JsonValue.NewStr(col.opts)); }
+            cols.Append(o);
+        }
+        data.Put("columns", cols);
+
+        JsonValue filters = JsonValue.NewArray();
+        for (int i = 0; i < lp.fs.Count; i = i + 1) {
+            ListFilter f = lp.fs[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Put("title", JsonValue.NewStr(f.title));
+            o.Put("name", JsonValue.NewStr(f.name));
+            if (f.type == "text") {
+                o.Put("type", JsonValue.NewStr("Input"));
+                o.Put("placeholder", JsonValue.NewStr(f.ph));
+            } else if (f.type == "select") {
+                o.Put("type", JsonValue.NewStr("Select"));
+                o.Put("options", JsonValue.NewStr(f.options));
+            } else if (f.type == "time") {
+                o.Put("type", JsonValue.NewStr("DateRange"));
+            } else if (f.type == "pick") {
+                o.Put("type", JsonValue.NewStr("Select"));
+                o.Put("remote", JsonValue.NewStr(f.url));
+            }
+            filters.Append(o);
+        }
+        data.Put("filters", filters);
+
+        JsonValue tools = JsonValue.NewArray();
+        for (int i = 0; i < lp.bs.Count; i = i + 1) {
+            ListButton b = lp.bs[i];
+            if (b.type == "sep") { continue; }
+            JsonValue o = JsonValue.NewObject();
+            o.Put("name", JsonValue.NewStr(b.name));
+            o.Put("url", JsonValue.NewStr(b.url));
+            o.Put("type", JsonValue.NewStr(b.type));
+            if (b.value.Length > 0) { o.Put("value", JsonValue.NewStr(b.value)); }
+            if (b.confirm.Length > 0) { o.Put("confirm", JsonValue.NewStr(b.confirm)); }
+            tools.Append(o);
+        }
+        data.Put("tools", tools);
+
+        /* adminUI 信封：resp_code "0000" 为成功，与既有 JSON 应答并轨。 */
+        JsonValue body = JsonValue.NewObject();
+        body.Put("resp_code", JsonValue.NewStr("0000"));
+        body.Put("status", JsonValue.NewInt(200));
+        body.Put("msg", JsonValue.NewStr("ok"));
+        body.Put("url", JsonValue.NewStr(""));
+        body.Put("dynamicToken", JsonValue.NewStr(""));
+        body.Put("t", JsonValue.NewInt(0));
+        body.Put("data", data);
+        c.Json(body.ToJson());
+    }
+
+    /* "130px" → 130；非数字宽度（auto 等）不产出 width 键。 */
+    static string WidthNum(string width) {
+        string r = "";
+        for (int i = 0; i < width.Length; i = i + 1) {
+            string ch = width.Substring(i, 1);
+            if (ch >= "0" && ch <= "9") { r = r + ch; } else { break; }
+        }
+        if (r.Length == 0) { return "0"; }
+        return r;
+    }
+}

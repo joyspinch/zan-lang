@@ -379,6 +379,34 @@ def run_matrix(catcher):
     code, body, _ = http("/admin", cookie=cookie)
     ok(code == 200 and len(body) > 200, "dashboard renders with session")
 
+    # ---- users: declared table + conf contract + generic field ----
+    code, body, _ = http("/admin/system/users", cookie=cookie)
+    ok(code == 200 and ">账号</th>" in body
+       and 'data-table-key="/admin/system/users"' in body,
+       "users table rendered from column declaration")
+    ok('class="tag ok"' in body,
+       "status badges rendered from tag declaration")
+    ok('data-post="/admin/system/users/status"' in body and "{id}" not in body,
+       "row ops rendered with {field} substitution")
+    code, body, _ = http("/admin/system/users/conf", cookie=cookie)
+    ok(code == 200 and '"resp_code":"0000"' in body and '"field":"username"' in body,
+       "conf endpoint serves table config from declaration")
+    ok('"type":"Input"' in body and '"type":"DateRange"' in body,
+       "conf filters projected from declaration")
+    r = http("/admin/system/users/field", cookie=cookie,
+             data={"id": "1", "field": "nickname", "value": "e2e 改名"})
+    ok(code_of(r[1]) == "0000", "field endpoint edits whitelisted column")
+    ok(sql("SELECT nickname FROM sys_user WHERE id=1")[0][0] == "e2e 改名",
+       "field edit persisted")
+    r = http("/admin/system/users/field", cookie=cookie,
+             data={"id": "1", "field": "passwordHash", "value": "hijack"})
+    ok(code_of(r[1]) != "0000", "field endpoint rejects non-whitelisted column")
+    ok(sql("SELECT passwordHash FROM sys_user WHERE id=1")[0][0] != "hijack",
+       "credential material untouched")
+    r = http("/admin/system/users/field",
+             data={"id": "1", "field": "nickname", "value": "anon"})
+    ok(code_of(r[1]) != "0000", "field endpoint rejects anonymous")
+
     # ---- content: categories ----
     http("/admin/content/categories/save", cookie=cookie, data={
         "name": "e2e 分类", "slug": "e2e-cat", "description": "e2e 建的",

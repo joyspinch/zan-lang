@@ -19,17 +19,29 @@ namespace ZanWeb.Admin.System;
 [Custom(Authorization = CustomAuthorization.Grant)]
 [Description("账号管理")]
 class Users : AdminController {
-    [HttpGet]
-    [Route("/admin/system/users")]
-    [Custom(IsMenu = true, Icon = "mdi:account", Perm = PermBit.View)]
-    [Description("账号管理")]
-    async void Index() {
-        ViewData d = await this.Layout("账号管理");
-        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
-
-        /* 声明本屏搜索与工具栏：渲染、收集、分页链接三处同源（ListPage），
-           改一处声明，界面与 SQL 同时生效。 */
-        ListPage lp = ListPage.Of()
+    /* 本屏唯一声明：列、筛选、工具栏、行内操作、通用写动作白名单同源。
+       Index 渲染、Crud.Field/Batch/Delete 的白名单与 conf 端点的表格
+       配置都从这里派生——加一列或开放一个可编辑字段，只改这里。 */
+    static ListPage ScreenDef() {
+        return ListPage.Of()
+            .Col("id", "ID", "num", "56px")
+            .Col("username", "账号", "text", "130px")
+            .Flag("superTag", "", "64px")
+            .Col("nickname", "姓名", "text", "110px")
+            .Col("email", "邮箱", "muted", "170px")
+            .Col("mobile", "手机", "muted", "120px")
+            .Col("dept", "部门", "text", "110px")
+            .Col("roles", "角色", "text", "")
+            .Col("createdAt", "创建日期", "time", "130px")
+            .Tag("status", "状态", "1=启用|ok,0=禁用|off", "88px")
+            .OpsEdit("/admin/system/users/form")
+            .Ops("角色", "/admin/system/users/roles", "", "", "u")
+            .Ops("密码", "/admin/system/users/passwordform", "", "", "u")
+            .Ops("{toggleLabel}", "/admin/system/users/status", "",
+                 "id={id}&status={nextStatus}", "u")
+            .Ops("下线", "/admin/system/users/kick",
+                 "强制下线后该账号需要重新登录，确定吗？", "id={id}", "u")
+            .OpsDel("/admin/system/users/delete", "删除后不可恢复，确定删除该账号吗？")
             .Text("账号 / 姓名 / 邮箱", "kw", "t.username|t.nickname|t.email", "搜索账号 / 姓名 / 邮箱")
             .Select("状态", "status", "t.status", "1=启用,0=禁用")
             .Time("创建日期", "createdAt", "t.createdAt")
@@ -38,10 +50,21 @@ class Users : AdminController {
             .TbarSep()
             .TbarEnable("/admin/system/users/batchstatus")
             .TbarDisable("/admin/system/users/batchstatus")
-            .TbarDelete("/admin/system/users/batchdelete");
+            .TbarDelete("/admin/system/users/batchdelete")
+            .Table("sys_user")
+            .EditFields("nickname:text,email:text,mobile:text,departmentId:int,status:int");
+    }
+
+    [HttpGet]
+    [Route("/admin/system/users")]
+    [Custom(IsMenu = true, Icon = "mdi:account", Perm = PermBit.View)]
+    [Description("账号管理")]
+    async void Index() {
+        ViewData d = await this.Layout("账号管理");
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
+        ListPage lp = Users.ScreenDef();
         List<ListCond> conds = lp.Collect(this);
-        lp.Search(this, d, "/admin/system/users");
-        lp.Toolbar(d);
 
         ListQuery q = this.Paged("id", 20);
 
@@ -59,30 +82,55 @@ class Users : AdminController {
         List<Role> roles = await new RoleDao(this).All();
         List<UserRole> links = await new UserRoleDao(this).All();
 
+        /* 行投影只出原始值与衍生键：展示格式化（状态徽章、日期、空值 —）
+           由列声明在 TableHtml 里发生；投影列（部门名/角色名）与脱敏
+           （邮箱/手机）是业务语义，留在控制器。 */
         List<StrMap> items = d.AddList("rows");
         for (int i = 0; i < rows.Count; i = i + 1) {
             User u = rows[i];
             StrMap row = new StrMap();
             row.Set("id", Convert.ToString(u.id));
             row.Set("username", u.username);
-            row.Set("nickname", Fmt.Dash(u.nickname));
-            row.Set("email", Fmt.Dash(Fmt.MaskEmail(u.email)));
-            row.Set("mobile", Fmt.Dash(Fmt.MaskMobile(u.mobile)));
+            if (u.isSuper == 1) { row.Set("superTag", "超管|warn"); }
+            row.Set("nickname", u.nickname);
+            row.Set("email", Fmt.MaskEmail(u.email));
+            row.Set("mobile", Fmt.MaskMobile(u.mobile));
             row.Set("dept", Users.DeptName(depts, u.departmentId));
             row.Set("roles", Users.RoleNames(roles, links, u.id));
-            row.Set("statusText", Users.StatusText(u.status));
-            row.Set("statusClass", Users.StatusClass(u.status));
-            row.Set("nextStatus", Users.NextStatus(u.status));
-            row.Set("toggleText", Users.ToggleText(u.status));
-            row.Set("createdAt", Fmt.Day(u.createdAt));
-            if (u.isSuper == 1) { row.Set("super", "1"); }
+            row.Set("status", Convert.ToString(u.status));
+            row.Set("nextStatus", u.status == 1 ? "0" : "1");
+            row.Set("toggleLabel", u.status == 1 ? "禁用" : "启用");
             items.Add(row);
         }
-        this.Pager(d, q, total);
-        /* 分页链接保留全部筛选——旧版只带 kw，一翻页搜索条件全丢。 */
-        if (q.Page() > 1) { d.Set("prevUrl", lp.Query(conds, q.Page() - 1, q.Limit())); }
-        if (q.Page() < q.Pages(total)) { d.Set("nextUrl", lp.Query(conds, q.Page() + 1, q.Limit())); }
+        string path = this.Ctx().path;
+        bool canUpdate = await this.Can(PermBit.Update);
+        bool canDelete = await this.Can(PermBit.Delete);
+        lp.Screen(this, d, path, "/admin/system/users", conds, q, total, items,
+            canUpdate, canDelete);
         this.Page(d);
+    }
+
+    /* adminUI ZanTable 的表格配置契约：本屏声明 → ListConfData JSON。 */
+    [HttpGet]
+    [Custom(Perm = PermBit.View)]
+    [Description("账号表格配置")]
+    void Conf() {
+        Crud.Conf(this, Users.ScreenDef());
+    }
+
+    /* 单行单字段编辑（conf 契约的 field 端点）：行级授权走 Reach（越权
+       与不存在同答 404），列白名单出自 EditFields——密码散列、token
+       版本等凭证材料不在名单，永远无法经此篡改。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("编辑账号字段")]
+    async void Field() {
+        int id = this.InInt("id", 0);
+        User u = await this.Reach(id);
+        List<int> allowed = new List<int>();
+        allowed.Add(u.id);
+        await Crud.Field(this, Users.ScreenDef(), "账号",
+            this.In("field").Trim(), this.In("value"), allowed);
     }
 
     /* 新建/编辑对话框；片段非页，列表不动、对话框覆盖其上。 */
@@ -262,20 +310,20 @@ class Users : AdminController {
                 return;
             }
         }
-        int n = await new UserDao(this).SetStatusByIds(ids, status);
+        /* 通用批量写动作：白名单（sys_user.status:int）与参数化 SQL 由
+           声明供给；禁用会话失效与缓存失效是业务语义，留在屏内。 */
+        await Crud.Batch(this, Users.ScreenDef(), "status",
+            status == 1 ? "1" : "0", ids, "批量启禁账号");
         if (status == 0) {
             for (int i = 0; i < rows.Count; i = i + 1) {
                 await this.Revoke(rows[i].id);
                 AuthUser.Forget(Convert.ToString(rows[i].id));
             }
         }
-        await this.Note("批量启禁账号",
-            Convert.ToString(rows.Count) + " 个账号", n > 0,
-            status == 1 ? "启用" : "禁用");
-        this.Saved("已" + (status == 1 ? "启用" : "禁用") + " " + Convert.ToString(n) + " 个账号");
     }
 
-    /* 批量删除：同零容忍口径。连带清角色关联并失效其会话。 */
+    /* 批量删除：同零容忍口径。主行删除走通用动作；连带清角色关联并
+       失效其会话是业务语义，留在屏内。 */
     [HttpPost]
     [Custom(Perm = PermBit.Delete)]
     [Description("批量删除账号")]
@@ -295,14 +343,11 @@ class Users : AdminController {
                 return;
             }
         }
-        int n = await new UserDao(this).DeleteByIds(ids);
+        await Crud.Delete(this, Users.ScreenDef(), ids, "批量删除账号");
         for (int i = 0; i < rows.Count; i = i + 1) {
             int _r = await new UserRoleDao(this).DeleteByUserId(rows[i].id);
             AuthUser.Forget(Convert.ToString(rows[i].id));
         }
-        await this.Note("批量删除账号",
-            Convert.ToString(rows.Count) + " 个账号", n > 0, "");
-        this.Saved("已删除 " + Convert.ToString(n) + " 个账号");
     }
 
     [HttpPost]
@@ -450,20 +495,5 @@ class Users : AdminController {
     static string StatusText(int status) {
         if (status == 1) { return "启用"; }
         return "禁用";
-    }
-
-    static string StatusClass(int status) {
-        if (status == 1) { return "ok"; }
-        return "off";
-    }
-
-    static string NextStatus(int status) {
-        if (status == 1) { return "0"; }
-        return "1";
-    }
-
-    static string ToggleText(int status) {
-        if (status == 1) { return "禁用"; }
-        return "启用";
     }
 }

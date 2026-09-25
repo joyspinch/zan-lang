@@ -6,24 +6,35 @@ using ZanWeb.Core;
 
 namespace ZanWeb.Web;
 
-/* 声明式列表页：搜索区、工具栏、查询条件三处同源。
+/* 声明式列表页：搜索区、工具栏、表格、查询条件四处同源。
  *
- * 控制器对一张表声明一次筛选字段与工具栏按钮，渲染（HTML）与取数
- * （参数化 WHERE）都从这里派生——改一处声明，界面与 SQL 同时生效，
- * 不存在"界面加了字段、查询忘了接"的分叉。移植自作者 PHP 版的
- * search_text/tbar_* 与 C# 版 TableConfig 的合一形态，落在服务端
- * 渲染上：搜索区与工具栏整段 HTML 交给视图 {{{raw}}} 原样输出。
+ * 控制器对一张表声明一次列、筛选字段、行内操作与工具栏按钮，渲染
+ * （HTML）与取数（参数化 WHERE）、通用写动作的白名单都从这里派生——
+ * 改一处声明，界面与 SQL 同时生效，不存在"界面加了字段、查询忘了接"
+ * 的分叉。移植自作者 PHP 版的 search_text/tbar_* 与 C# 版 TableConfig
+ * 的合一形态，落在服务端渲染上：搜索区/工具栏/表格整段 HTML 交给
+ * 视图 {{{screenHtml}}} 原样输出。
  *
- * 列名是唯一进 SQL 的自由文本，声明在代码里（非用户输入），值一律
+ * 列名与表名是仅有的自由文本，全部声明在代码里（非用户输入）；值一律
  * 走占位符参数——LIKE 值包 %、多列组拆成每列一个占位符，注入面为零。
  */
 class ListPage {
     List<ListFilter> fs;
     List<ListButton> bs;
+    List<ListCol> cols;
+    List<ListOps> ops;
+    List<StrMap> edits;
+    string table;
+    string key;
 
     ListPage() {
         this.fs = new List<ListFilter>();
         this.bs = new List<ListButton>();
+        this.cols = new List<ListCol>();
+        this.ops = new List<ListOps>();
+        this.edits = new List<StrMap>();
+        this.table = "";
+        this.key = "";
     }
 
     /* 每屏一个实例：new ListPage() 后链式声明。 */
@@ -131,6 +142,95 @@ class ListPage {
         return this;
     }
 
+    /* ---- 声明：列与行内操作 -------------------------------------- */
+
+    /* 表格列：field 是行数据键（StrMap），kind 取 text/num/time/muted——
+       num 右对齐淡显（ID 类），time 的行值是 Unix 秒、渲染为日期，
+       muted 整格淡显。行投影只出原始值，展示格式化全在这里发生。 */
+    ListPage Col(string field, string title, string kind, string width) {
+        ListCol c = new ListCol();
+        c.field = field;
+        c.title = title;
+        c.kind = kind;
+        c.width = width;
+        this.cols.Add(c);
+        return this;
+    }
+
+    /* 状态徽章列：opts 形如 "1=启用|ok,0=禁用|off"（值=文案|样式类）。
+       值未命中时原样淡显——脏数据可见而不是被映射吞掉。 */
+    ListPage Tag(string field, string title, string opts, string width) {
+        ListCol c = new ListCol();
+        c.field = field;
+        c.title = title;
+        c.kind = "tag";
+        c.width = width;
+        c.opts = opts;
+        this.cols.Add(c);
+        return this;
+    }
+
+    /* 自由徽章列：行值本身就是 "文案|样式类"（如 "超管|warn"），空值
+       整格留白。用于行列间的衍生标记（超管、置顶、置灰）。 */
+    ListPage Flag(string field, string title, string width) {
+        ListCol c = new ListCol();
+        c.field = field;
+        c.title = title;
+        c.kind = "flag";
+        c.width = width;
+        this.cols.Add(c);
+        return this;
+    }
+
+    /* 行内操作：args 为空 → 对话框链接（url?id=N）；非空 → POST 按钮
+       （data-args 模板，{field} 以行值替换，链接文本同样替换——行文案
+       随状态翻转的"启用/禁用"即由此而来）。perm 取 u/d/""：更新位/
+       删除位/不受限，与工具栏按钮同一授权掩码。 */
+    ListPage Ops(string name, string url, string confirm, string args, string perm) {
+        ListOps o = new ListOps();
+        o.name = name;
+        o.url = url;
+        o.confirm = confirm;
+        o.args = args;
+        o.perm = perm;
+        this.ops.Add(o);
+        return this;
+    }
+
+    ListPage OpsEdit(string url) {
+        return this.Ops("编辑", url, "", "", "u");
+    }
+
+    ListPage OpsDel(string url, string confirm) {
+        return this.Ops("删除", url, confirm, "id={id}", "d");
+    }
+
+    /* 通用写动作（Crud.Field/Batch/Delete）的物理表名与可写字段白名单，
+       代码声明、非用户输入；EditFields 形如 "nickname:text,status:int"。
+       显示列与可写列不必一致——投影列（如部门名）不在白名单里。 */
+    ListPage Table(string physicalName) {
+        this.table = physicalName;
+        return this;
+    }
+
+    ListPage EditFields(string defs) {
+        this.edits = new List<StrMap>();
+        string rest = defs;
+        while (rest.Length > 0) {
+            string one = rest;
+            int comma = rest.IndexOf(",");
+            if (comma >= 0) { one = rest.Substring(0, comma); rest = rest.Substring(comma + 1); }
+            else { rest = ""; }
+            int colon = one.IndexOf(":");
+            if (colon <= 0) { continue; }
+            StrMap e = new StrMap();
+            e.Set("name", one.Substring(0, colon).Trim());
+            e.Set("type", one.Substring(colon + 1).Trim());
+            this.edits.Add(e);
+        }
+        return this;
+    }
+
     /* ---- 取数：收集本请求的条件 ---------------------------------- */
 
     /* 只收声明过的名字：视图篡改的参数进不了 WHERE；空值与"-1"（下拉
@@ -181,8 +281,9 @@ class ListPage {
     /* ---- 渲染：搜索区 -------------------------------------------- */
 
     /* 整段 <form data-search> HTML 放入 d 的 searchHtml（视图 {{{searchHtml}}}
-       原样输出）。输入值直接回读请求，经 Esc 转义后回填，刷新不丢条件。 */
-    void Search(AppController c, ViewData d, string action) {
+       原样输出），并返回同串供 Screen 拼接。输入值直接回读请求，经 Esc
+       转义后回填，刷新不丢条件。 */
+    string Search(AppController c, ViewData d, string action) {
         StringBuilder sb = new StringBuilder();
         sb.Append("<form class=\"toolbar\" data-search action=\"" + ListPage.Esc(action) + "\">\n");
         for (int i = 0; i < this.fs.Count; i = i + 1) {
@@ -233,12 +334,13 @@ class ListPage {
         sb.Append("</form>\n");
         d.Set("searchHtml", sb.ToString());
         d.Set("hasSearch", "1");
+        return sb.ToString();
     }
 
-    /* 整段工具栏 HTML 放入 d 的 toolbarHtml。add 是 data-dialog 弹窗，
-       批量键是 data-batch（admin.js 汇集行选择后 POST）。 */
-    void Toolbar(ViewData d) {
-        if (this.bs.Count == 0) { return; }
+    /* 整段工具栏 HTML 放入 d 的 toolbarHtml 并返回同串。add 是
+       data-dialog 弹窗，批量键是 data-batch（admin.js 汇集行选择后 POST）。 */
+    string Toolbar(ViewData d) {
+        if (this.bs.Count == 0) { return ""; }
         StringBuilder sb = new StringBuilder();
         sb.Append("<div class=\"tbar\">\n");
         for (int i = 0; i < this.bs.Count; i = i + 1) {
@@ -265,6 +367,175 @@ class ListPage {
         }
         sb.Append("</div>\n");
         d.Set("toolbarHtml", sb.ToString());
+        return sb.ToString();
+    }
+
+    /* 整段 <table> HTML 放入 d 的 tableHtml 并返回同串。列头/单元格/操作列
+       全部出自声明：单元格按 kind 渲染（tag 查 opts、flag 行值自带文案|
+       样式、time 秒转日期、num 淡显、空值一律 —）；操作列按 Ops 声明渲染，
+       更新位/删除位决定可见性（canUpdate/canDelete 与 {{#if canX}} 同一
+       掩码）。行数据只读 StrMap，键 = Col 的 field。 */
+    string TableHtml(ViewData d, List<StrMap> rows, bool canUpdate, bool canDelete) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<table class=\"table\" data-table=\"sort filter select\" data-table-key=\""
+            + ListPage.Esc(this.key) + "\">\n  <thead><tr>\n");
+        for (int i = 0; i < this.cols.Count; i = i + 1) {
+            ListCol c = this.cols[i];
+            sb.Append("    <th");
+            if (c.kind == "num") { sb.Append(" class=\"num\""); }
+            if (c.width.Length > 0) { sb.Append(" style=\"width:" + ListPage.Esc(c.width) + "\""); }
+            sb.Append(">" + ListPage.Esc(Lang.T(c.title)) + "</th>\n");
+        }
+        if (this.ops.Count > 0) {
+            sb.Append("    <th class=\"ops\">" + ListPage.Esc(Lang.T("操作")) + "</th>\n");
+        }
+        sb.Append("  </tr></thead>\n  <tbody>\n");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            StrMap row = rows[i];
+            sb.Append("    <tr data-id=\"" + ListPage.Esc(row.Get("id")) + "\">");
+            for (int j = 0; j < this.cols.Count; j = j + 1) {
+                sb.Append(ListPage.Cell(this.cols[j], row));
+            }
+            if (this.ops.Count > 0) {
+                sb.Append(ListPage.OpsCell(this, row, canUpdate, canDelete));
+            }
+            sb.Append("</tr>\n");
+        }
+        sb.Append("  </tbody>\n</table>\n");
+        d.Set("tableHtml", sb.ToString());
+        return sb.ToString();
+    }
+
+    /* 一个单元格：kind 分派见 TableHtml。 */
+    static string Cell(ListCol c, StrMap row) {
+        string v = row.Get(c.field);
+        if (c.kind == "num") {
+            return "<td class=\"num muted\">" + ListPage.Esc(v) + "</td>";
+        }
+        if (c.kind == "time") {
+            long sec = Filter.ToLong(v, 0);
+            if (sec <= 0) { return "<td class=\"muted\">—</td>"; }
+            return "<td class=\"muted\">" + ListPage.Esc(Fmt.Day(sec)) + "</td>";
+        }
+        if (c.kind == "tag") {
+            string rest = c.opts;
+            while (rest.Length > 0) {
+                string pair = rest;
+                int comma = rest.IndexOf(",");
+                if (comma >= 0) { pair = rest.Substring(0, comma); rest = rest.Substring(comma + 1); }
+                else { rest = ""; }
+                int eq = pair.IndexOf("=");
+                if (eq <= 0) { continue; }
+                string key = pair.Substring(0, eq);
+                if (key != v) { continue; }
+                string label = pair.Substring(eq + 1);
+                string cls = "off";
+                int bar = label.IndexOf("|");
+                if (bar >= 0) { cls = label.Substring(bar + 1); label = label.Substring(0, bar); }
+                return "<td><span class=\"tag " + ListPage.Esc(cls) + "\">"
+                    + ListPage.Esc(Lang.T(label)) + "</span></td>";
+            }
+            return "<td class=\"muted\">" + ListPage.Esc(v) + "</td>";
+        }
+        if (c.kind == "flag") {
+            if (v.Length == 0) { return "<td></td>"; }
+            string label = v;
+            string cls = "off";
+            int bar = v.IndexOf("|");
+            if (bar >= 0) { cls = v.Substring(bar + 1); label = v.Substring(0, bar); }
+            return "<td><span class=\"tag " + ListPage.Esc(cls) + "\">"
+                + ListPage.Esc(label) + "</span></td>";
+        }
+        if (v.Length == 0) { return "<td class=\"muted\">—</td>"; }
+        if (c.kind == "muted") { return "<td class=\"muted\">" + ListPage.Esc(v) + "</td>"; }
+        return "<td>" + ListPage.Esc(v) + "</td>";
+    }
+
+    /* 操作列一格：perm 门控 + {field} 模板替换（链接文本与 data-args
+       都走行值）；替换后的整段属性出口统一 Esc。 */
+    static string OpsCell(ListPage lp, StrMap row, bool canUpdate, bool canDelete) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<td class=\"ops\">");
+        for (int i = 0; i < lp.ops.Count; i = i + 1) {
+            ListOps o = lp.ops[i];
+            if (o.perm == "u" && !canUpdate) { continue; }
+            if (o.perm == "d" && !canDelete) { continue; }
+            string name = ListPage.Fill(o.name, row);
+            if (o.args.Length == 0) {
+                sb.Append("<a href=\"" + ListPage.Esc(o.url) + "?id="
+                    + ListPage.Esc(row.Get("id")) + "\" data-dialog>"
+                    + ListPage.Esc(name) + "</a>");
+            } else {
+                sb.Append("<a href=\"#\" data-post=\"" + ListPage.Esc(o.url)
+                    + "\" data-args=\"" + ListPage.Esc(ListPage.Fill(o.args, row)) + "\"");
+                if (o.confirm.Length > 0) {
+                    sb.Append(" data-confirm=\"" + ListPage.Esc(Lang.T(o.confirm)) + "\"");
+                }
+                sb.Append(">" + ListPage.Esc(name) + "</a>");
+            }
+        }
+        sb.Append("</td>");
+        return sb.ToString();
+    }
+
+    /* 模板替换：{field} 以行值填充；值是投影出的展示串，出口统一 Esc。 */
+    static string Fill(string tpl, StrMap row) {
+        if (tpl.IndexOf("{") < 0) { return tpl; }
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < tpl.Length) {
+            int b = tpl.IndexOf("{", i);
+            if (b < 0) { sb.Append(tpl.Substring(i)); break; }
+            int e = tpl.IndexOf("}", b + 1);
+            if (e < 0) { sb.Append(tpl.Substring(i)); break; }
+            sb.Append(tpl.Substring(i, b - i));
+            sb.Append(row.Get(tpl.Substring(b + 1, e - b - 1)));
+            i = e + 1;
+        }
+        return sb.ToString();
+    }
+
+    /* 翻页 HTML：保留全部条件的链接（?page=..&limit=..&筛选..），空态
+       一并在这里出——视图不再各自手写 pager 块与 empty 判断。 */
+    string PagerHtml(string action, List<ListCond> conds, ListQuery q, int total) {
+        StringBuilder sb = new StringBuilder();
+        if (total == 0) {
+            sb.Append("<div class=\"empty\">" + ListPage.Esc(Lang.T("没有符合条件的记录")) + "</div>\n");
+        }
+        int pages = q.Pages(total);
+        sb.Append("<div class=\"pager\">\n  <span>" + ListPage.Esc(Lang.T("共"))
+            + " " + Convert.ToString(total) + " " + ListPage.Esc(Lang.T("条"))
+            + " · " + ListPage.Esc(Lang.T("第")) + " " + Convert.ToString(q.Page())
+            + "/" + Convert.ToString(pages) + " " + ListPage.Esc(Lang.T("页")) + "</span>\n");
+        sb.Append("  <span class=\"sp\"></span>\n");
+        if (q.Page() > 1) {
+            sb.Append("  <a class=\"btn sm\" href=\"" + ListPage.Esc(action)
+                + ListPage.Esc(this.Query(conds, q.Page() - 1, q.Limit()))
+                + "\" data-load>" + ListPage.Esc(Lang.T("上一页")) + "</a>\n");
+        }
+        if (q.Page() < pages) {
+            sb.Append("  <a class=\"btn sm\" href=\"" + ListPage.Esc(action)
+                + ListPage.Esc(this.Query(conds, q.Page() + 1, q.Limit()))
+                + "\" data-load>" + ListPage.Esc(Lang.T("下一页")) + "</a>\n");
+        }
+        sb.Append("</div>\n");
+        return sb.ToString();
+    }
+
+    /* 一屏一调：搜索区 + 工具栏 + 表格 + 翻页（含空态）整段产出
+       screenHtml——视图只剩 <div class="card">{{{screenHtml}}}</div>。
+       路径作为 data-table-key（排序偏好在同一路径下记忆）；行内操作的
+       可见性由调用方传入（子类才能读授权掩码，与工具栏按钮同源）。 */
+    void Screen(AppController c, ViewData d, string path, string action,
+                List<ListCond> conds, ListQuery q, int total, List<StrMap> rows,
+                bool canUpdate, bool canDelete) {
+        this.key = path;
+        StringBuilder sb = new StringBuilder();
+        sb.Append(this.Search(c, d, action));
+        sb.Append(this.Toolbar(d));
+        sb.Append(this.TableHtml(d, rows, canUpdate, canDelete));
+        sb.Append(this.PagerHtml(action, conds, q, total));
+        d.Set("screenHtml", sb.ToString());
     }
 
     /* 保留全部条件的分页链接：?page=2&limit=20&kw=..&status=1&..。
@@ -318,4 +589,23 @@ class ListCond {
     string col;
     string kind;
     string value;
+}
+
+/* 表格列声明（见 ListPage.Col/Tag/Flag）。 */
+class ListCol {
+    string field;
+    string title;
+    string kind;
+    string width;
+    string opts;
+}
+
+/* 行内操作声明（见 ListPage.Ops）。args 为空 = 对话框链接，非空 =
+   POST 的 data-args 模板（{field} 以行值替换）；perm u/d/"" 门控可见性。 */
+class ListOps {
+    string name;
+    string url;
+    string confirm;
+    string args;
+    string perm;
 }

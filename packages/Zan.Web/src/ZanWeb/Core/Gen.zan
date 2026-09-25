@@ -56,6 +56,14 @@ class Gen {
         return "string";
     }
 
+    /* 设计器字段类型 → 列表展示形态（见 ListPage.Col）。 */
+    static string ColKind(string kind) {
+        if (kind == "int" || kind == "long" || kind == "decimal") { return "num"; }
+        if (kind == "datetime") { return "time"; }
+        if (kind == "text") { return "muted"; }
+        return "text";
+    }
+
     /* 生成实体类源码。 */
     static string ModelSource(GenTable t, List<GenColumn> cols) {
         StringBuilder b = new StringBuilder();
@@ -109,18 +117,55 @@ class Gen {
         b.Append("[Description(\"" + t.title + "\")]\n");
         b.Append("class " + cls + " : AdminController {\n");
 
+        /* 本屏唯一声明：列、行内操作、通用写动作白名单。设计器元数据在
+           生成期展开为 ListPage 声明代码——改列回到设计器重新生成即可。 */
+        b.Append("    static ListPage ScreenDef() {\n");
+        b.Append("        return ListPage.Of()\n");
+        b.Append("            .Col(\"id\", \"ID\", \"num\", \"56px\")\n");
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            GenColumn c = cols[i];
+            if (c.name == "id" || c.inList != 1) { continue; }
+            string width = "";
+            if (Gen.ColKind(c.kind) == "num") { width = "90px"; }
+            if (c.kind == "datetime") { width = "130px"; }
+            if (c.kind == "bool") {
+                b.Append("            .Tag(\"" + c.name + "\", \"" + Gen.LabelOf(c)
+                    + "\", \"1=是|ok,0=否|off\", \"" + width + "\")\n");
+            } else {
+                b.Append("            .Col(\"" + c.name + "\", \"" + Gen.LabelOf(c)
+                    + "\", \"" + Gen.ColKind(c.kind) + "\", \"" + width + "\")\n");
+            }
+        }
+        b.Append("            .OpsEdit(\"/admin/" + route + "/form\")\n");
+        b.Append("            .OpsDel(\"/admin/" + route + "/delete\", \"确定删除吗？\")\n");
+        b.Append("            .Table(\"" + t.tableName + "\")\n");
+        b.Append("            .EditFields(\"");
+        string edits = "";
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            GenColumn c = cols[i];
+            if (c.name == "id" || (c.inCreate != 1 && c.inEdit != 1)) { continue; }
+            if (edits.Length > 0) { edits = edits + ","; }
+            string ft = "text";
+            if (c.kind == "int" || c.kind == "long") { ft = "int"; }
+            edits = edits + c.name + ":" + ft;
+        }
+        b.Append(edits + "\")\n");
+        b.Append("            ;\n    }\n\n");
+
         b.Append("    [HttpGet]\n    [Route(\"/admin/" + route + "\")]\n");
         b.Append("    [Custom(IsMenu = true)]\n");
         b.Append("    [Description(\"" + t.title + "列表\")]\n");
         b.Append("    async void Index() {\n");
         b.Append("        ViewData d = await this.Layout(\"" + t.title + "\");\n");
         b.Append("        if (!this.DbReady()) { d.Set(\"dbDown\", \"1\"); this.Page(d); return; }\n");
+        b.Append("        ListPage lp = " + cls + ".ScreenDef();\n");
+        b.Append("        List<ListCond> conds = lp.Collect(this);\n");
         b.Append("        ListQuery q = this.Paged(\"id\", 20);\n");
         b.Append("        int total = await this." + cls + ".CountAsync();\n");
         b.Append("        List<" + mdl + "> rows = await this." + cls + "\n");
         b.Append("            .OrderByDescending(a => a.id)\n");
         b.Append("            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();\n");
-        b.Append("        List<StrMap> list = d.AddList(\"rows\");\n");
+        b.Append("        List<StrMap> items = d.AddList(\"rows\");\n");
         b.Append("        for (int i = 0; i < rows.Count; i = i + 1) {\n");
         b.Append("            " + mdl + " e = rows[i];\n");
         b.Append("            StrMap row = new StrMap();\n");
@@ -135,8 +180,38 @@ class Gen {
                     + "\", Convert.ToString(e." + c.name + "));\n");
             }
         }
-        b.Append("            list.Add(row);\n        }\n");
-        b.Append("        this.Pager(d, q, total);\n        this.Page(d);\n    }\n\n");
+        b.Append("            items.Add(row);\n        }\n");
+        b.Append("        string path = this.Ctx().path;\n");
+        b.Append("        bool canUpdate = await this.Can(PermBit.Update);\n");
+        b.Append("        bool canDelete = await this.Can(PermBit.Delete);\n");
+        b.Append("        lp.Screen(this, d, path, \"/admin/" + route
+            + "\", conds, q, total, items, canUpdate, canDelete);\n");
+        b.Append("        this.Page(d);\n    }\n\n");
+
+        /* 表格配置契约：本屏声明 → adminUI ZanTable 的 ListConfData JSON。 */
+        b.Append("    [HttpGet]\n");
+        b.Append("    [Description(\"" + t.title + "表格配置\")]\n");
+        b.Append("    void Conf() {\n");
+        b.Append("        Crud.Conf(this, " + cls + ".ScreenDef());\n");
+        b.Append("    }\n\n");
+
+        b.Append("    [HttpPost]\n");
+        b.Append("    [Description(\"编辑" + t.title + "字段\")]\n");
+        b.Append("    async void Field() {\n");
+        b.Append("        int id = this.InInt(\"id\", 0);\n");
+        b.Append("        " + mdl + " cur = await this." + cls + ".Read(id);\n");
+        b.Append("        List<int> allowed = new List<int>();\n");
+        b.Append("        if (cur != null) { allowed.Add(id); }\n");
+        b.Append("        await Crud.Field(this, " + cls + ".ScreenDef(), \"" + t.title
+            + "\", this.In(\"field\").Trim(), this.In(\"value\"), allowed);\n");
+        b.Append("    }\n\n");
+
+        b.Append("    [HttpPost]\n");
+        b.Append("    [Description(\"批量删除" + t.title + "\")]\n");
+        b.Append("    async void BatchDelete() {\n");
+        b.Append("        await Crud.Delete(this, " + cls + ".ScreenDef(),"
+            + " this.Ids(\"ids\"), \"批量删除" + t.title + "\");\n");
+        b.Append("    }\n\n");
 
         b.Append("    [HttpGet]\n    [Description(\"" + t.title + "表单\")]\n");
         b.Append("    async void Form() {\n");
@@ -220,33 +295,10 @@ class Gen {
         return c.name;
     }
 
-    /* 生成列表视图源码。 */
+    /* 生成列表视图源码：表格由 ListPage.Screen 整段产出，视图只剩壳。 */
     static string ListViewSource(GenTable t, List<GenColumn> cols) {
-        string route = Gen.Route(t);
         StringBuilder b = new StringBuilder();
-        b.Append("<div class=\"card\">\n  <div class=\"toolbar\">\n");
-        b.Append("    <b>" + t.title + "</b>\n    <span class=\"sp\"></span>\n");
-        b.Append("    <a class=\"btn sm primary\" href=\"/admin/" + route
-            + "/form\" data-dialog>新增</a>\n  </div>\n");
-        b.Append("  <table class=\"table\">\n    <thead><tr>");
-        b.Append("<th style=\"width:70px\">ID</th>");
-        for (int i = 0; i < cols.Count; i = i + 1) {
-            if (cols[i].inList != 1 || cols[i].name == "id") { continue; }
-            b.Append("<th>" + Gen.LabelOf(cols[i]) + "</th>");
-        }
-        b.Append("<th class=\"ops\">操作</th></tr></thead>\n    <tbody>\n");
-        b.Append("      {{#each rows}}\n      <tr><td class=\"mono\">{{id}}</td>");
-        for (int i = 0; i < cols.Count; i = i + 1) {
-            if (cols[i].inList != 1 || cols[i].name == "id") { continue; }
-            b.Append("<td>{{" + cols[i].name + "}}</td>");
-        }
-        b.Append("<td class=\"ops\">");
-        b.Append("<a href=\"/admin/" + route + "/form?id={{id}}\" data-dialog>编辑</a>");
-        b.Append("<a href=\"#\" data-post=\"/admin/" + route
-            + "/delete\" data-args=\"id={{id}}\" data-confirm=\"确定删除吗？\">删除</a>");
-        b.Append("</td></tr>\n      {{/each}}\n    </tbody>\n  </table>\n");
-        b.Append("  {{#if empty}}<div class=\"empty\">还没有数据</div>{{/if}}\n");
-        b.Append("</div>\n");
+        b.Append("<div class=\"card\">\n  {{{screenHtml}}}\n</div>\n");
         return b.ToString();
     }
 
