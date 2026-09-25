@@ -64,13 +64,13 @@ ZanWeb.Blog 等业务命名空间  在应用侧，不在包内
 ## 分层约定（上下文自动处理，业务不传连接）
 
 - **请求连接由框架供给**：`AppController` 在动作运行前借出请求租约，
-  `this.<Entity>` 表访问器（`this.User`、`this.Post`…）经编译期改写自动
+  `this.<Entity>` 表访问器（`this.SysUser`、`this.Post`…）经编译期改写自动
   运行在该租约上——简单查询零仪式感，字段名编译期校验。
-- **DAO 收请求作用域，不收连接**：`new UserDao(this)`——DAO 经
+- **DAO 收请求作用域，不收连接**：`new SysUserDao(this)`——DAO 经
   `host.__Conn()` 解析请求租约，事务与只读从库口径与访问器完全一致；
   错传连接在编译期即被拒绝（`DbContext` 不是 `AppController`）。
 - **非请求场景显式给连接**：种子（`Schema.OnSeed`）、后台任务自己借还，
-  `new UserDao(db)`——借还协议只在框架层出现。
+  `new SysUserDao(db)`——借还协议只在框架层出现。
 - `AppController.Db()` 是 **private**：`DbContext` 是池借还协议，控制器不
   触碰（历史上曾 protected 被当连接传进 DAO，运行时才炸）。
 - DAO 每表一个、同 action 多 DAO 共享同一租约与事务；缓存键属于数据层，

@@ -541,23 +541,23 @@ def run_matrix(catcher):
         "name": "e2e 研发库", "description": "研发部门知识库", "icon": "",
         "departmentId": "0", "sortOrder": "1", "status": "1"})
     ok(code_of(r[1]) == "0000" or r[0] in (200, 301, 302), "space created")
-    sid = sql("SELECT id FROM wiki_space WHERE name='e2e 研发库'")[0][0]
+    sid = sql("SELECT id  FROM sys_wiki_space WHERE name='e2e 研发库'")[0][0]
     body1 = "# 部署\n\n第一步 **准备** 机器。\n\n- 装依赖\n- 起服务"
     r = http("/admin/wiki/save", cookie=cookie, data={
         "spaceId": sid, "title": "部署手册", "body": body1,
         "tags": "部署,运维", "note": "创建", "status": "1"})
     ok(code_of(r[1]) == "0000" or r[0] in (200, 301, 302), "doc created")
-    did = sql("SELECT id FROM wiki_doc WHERE title='部署手册'")[0][0]
-    ok(sql("SELECT rev FROM wiki_doc WHERE id=?", (did,))[0][0] == 1,
+    did = sql("SELECT id FROM sys_wiki_doc WHERE title='部署手册'")[0][0]
+    ok(sql("SELECT rev FROM sys_wiki_doc WHERE id=?", (did,))[0][0] == 1,
        "initial revision is 1")
-    ok(sql("SELECT note FROM wiki_revision WHERE docId=? AND rev=1",
+    ok(sql("SELECT note FROM sys_wiki_revision WHERE docId=? AND rev=1",
            (did,))[0][0] == "创建", "revision 1 snapshotted")
     http("/admin/wiki/save", cookie=cookie, data={
         "id": did, "spaceId": sid, "title": "部署手册",
         "body": "# 部署\n\n补充：回滚章节。\n\n- 装依赖",
         "tags": "部署,运维", "note": "补充回滚章节", "status": "1"})
-    ok(sql("SELECT rev FROM wiki_doc WHERE id=?", (did,))[0][0] == 2 and
-       sql("SELECT COUNT(*) FROM wiki_revision WHERE docId=?",
+    ok(sql("SELECT rev FROM sys_wiki_doc WHERE id=?", (did,))[0][0] == 2 and
+       sql("SELECT COUNT(*) FROM sys_wiki_revision WHERE docId=?",
            (did,))[0][0] == 2, "edit bumps revision to 2")
     code, body, _ = http("/admin/wiki/page?id=%d" % did, cookie=cookie)
     ok(code == 200 and "<strong>准备</strong>" not in body
@@ -572,10 +572,10 @@ def run_matrix(catcher):
     r = http("/admin/wiki/rollback", cookie=cookie,
              data={"id": did, "rev": "1"})
     ok(code_of(r[1]) == "0000" or r[0] in (200, 301, 302), "rollback ok")
-    ok(sql("SELECT rev FROM wiki_doc WHERE id=?", (did,))[0][0] == 3 and
-       sql("SELECT COUNT(*) FROM wiki_revision WHERE docId=?",
+    ok(sql("SELECT rev FROM sys_wiki_doc WHERE id=?", (did,))[0][0] == 3 and
+       sql("SELECT COUNT(*) FROM sys_wiki_revision WHERE docId=?",
            (did,))[0][0] == 3, "rollback created revision 3")
-    ok(sql("SELECT body FROM wiki_doc WHERE id=?", (did,))[0][0] == body1,
+    ok(sql("SELECT body FROM sys_wiki_doc WHERE id=?", (did,))[0][0] == body1,
        "rolled-back body matches r1")
     r = http("/admin/wiki/aiorganize", cookie=cookie, data={"id": did})
     ok(code_of(r[1]) != "0000", "ai organize guarded when AI off")
@@ -586,8 +586,8 @@ def run_matrix(catcher):
         "status": "1"})
     ok(code_of(r[1]) != "0000", "wiki save rejects anonymous")
     http("/admin/wiki/delete", cookie=cookie, data={"id": did})
-    ok(not sql("SELECT 1 FROM wiki_doc WHERE id=?", (did,)) and
-       not sql("SELECT 1 FROM wiki_revision WHERE docId=?", (did,)),
+    ok(not sql("SELECT 1 FROM sys_wiki_doc WHERE id=?", (did,)) and
+       not sql("SELECT 1 FROM sys_wiki_revision WHERE docId=?", (did,)),
        "doc delete cascades revisions")
     r = http("/admin/wiki/spacedelete", cookie=cookie, data={"id": sid})
     ok(code_of(r[1]) == "0000" or r[0] in (200, 301, 302),
@@ -759,7 +759,7 @@ def run_matrix(catcher):
     upbody = raw_post("/admin/media/upload?name=e2e-logo.png", payload,
                       cookie=cookie)
     ok(code_of(upbody) == "0000", "media upload accepted")
-    rows = sql("SELECT name, path, ext, size FROM media ORDER BY id DESC LIMIT 1")
+    rows = sql("SELECT name, path, ext, size FROM sys_media_file ORDER BY id DESC LIMIT 1")
     ok(bool(rows) and rows[0][0] == "e2e-logo.png" and rows[0][2] == "png",
        "media row recorded with clean name")
     mpath = rows[0][1] if rows else ""
@@ -774,15 +774,15 @@ def run_matrix(catcher):
     ok(code_of(raw_post("/admin/media/upload?name=e2e-evil.exe", b"MZx",
                         cookie=cookie)) != "0000",
        "disallowed extension rejected")
-    ok(sql("SELECT COUNT(*) FROM media")[0][0] == 1, "rejected upload stored nothing")
+    ok(sql("SELECT COUNT(*) FROM sys_media_file")[0][0] == 1, "rejected upload stored nothing")
     spool_left = os.listdir(os.path.join(SANDBOX, "uploads"))
     ok(not spool_left, "rejected upload leaves no spool file")
     ok(code_of(raw_post("/admin/media/upload?name=x.png", b"x")) != "0000",
        "anonymous upload rejected")
-    mid = sql("SELECT id FROM media ORDER BY id DESC LIMIT 1")[0][0]
+    mid = sql("SELECT id FROM sys_media_file ORDER BY id DESC LIMIT 1")[0][0]
     r = http("/admin/media/delete", cookie=cookie, data={"id": str(mid)})
     ok(code_of(r[1]) == "0000", "media delete ok")
-    ok(not sql("SELECT 1 FROM media WHERE id=?", (mid,)), "media row gone")
+    ok(not sql("SELECT 1 FROM sys_media_file WHERE id=?", (mid,)), "media row gone")
     ok(not os.path.isfile(disk), "file removed from disk")
 
     # reset 会使旧会话失效，admin 会话断言放在邮件段之前。
