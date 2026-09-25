@@ -89,7 +89,7 @@ ListPage lp = ListPage.Of()
     .Pick("分类", "categoryId", "t.categoryId", "/admin/posts/cats")
     .TbarAdd("新增", "/admin/posts/form").TbarReload().TbarSep()
     .TbarEnable("/admin/posts/batchstatus").TbarDelete("/admin/posts/batchdelete");
-List<ListCond> conds = lp.Collect(this);   /* 只收声明过的名字，空值跳过 */
+List<OrmCond> conds = lp.Collect(this);    /* 只收声明过的名字，空值跳过 */
 lp.Search(this, d, "/admin/posts");        /* d.searchHtml：回显 + 渲染 */
 lp.Toolbar(d);                             /* d.toolbarHtml：批量带确认 */
 d.Set("prevUrl", lp.Query(conds, q.Page() - 1, q.Limit()));  /* 翻页保留全部筛选 */
@@ -120,10 +120,13 @@ async void Save() {            /* 校验从声明来：required/min/max */
 ```
 
 - **列名只来自声明**（`col` 是代码常量），用户输入永远走占位符——DAO 侧
-  `ApplyConds(__DbQ_Post sel, List<ListCond> conds)` 把 LIKE/EQ/GE/LE 拼成
-  参数化 WHERE（多列 LIKE 用 `|` 分组 OR），SQL 留在数据层。
+  `sel.WhereConds(conds)`（stdlib `OrmSelect`）把 LIKE/EQ/GE/LE 落成
+  参数化 WHERE：列名按实体元数据校验（未知列运行期抛异常），多列 LIKE
+  用 `|` 分组 OR，值全部绑定参数，DAO 与控制器都不接触 SQL 文本。
 - **批量端点零容忍**：`Ids()` 收 CSV 主键（上限 500），任一行越权
-  （超管/自身停用）整批拒绝，不做部分成功。
+  （超管/自身停用）整批拒绝，不做部分成功。批量取数/写用类型化 IN 条件
+  （`ids.Contains(a.id)`，编译器降级为参数化绑定）或 `Crud` 的
+  DbTable 网关。
 - **远程搜索单选（Pick）**：服务端只渲染隐藏值输入 + 搜索框，选项由
   `?kw=` 端点即时返回（`{code:'0000',data:[{id,label}]}`），回显走
   `?id=N`；选项端点同时服务表单选择器。

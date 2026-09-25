@@ -172,13 +172,12 @@ class UserDao {
             .ToListAsync();
     }
 
-    /* 批量端点的取数与写：IN 占位符 "IN (?)" 由 InI 按参数个数展开，
-       id 列表永远参数化，调用方保证非空。 */
+    /* 批量端点的取数与写：类型化 IN 条件（ids.Contains）由编译器降级
+       成参数化绑定，调用方保证 ids 非空。 */
     async List<User> ByIds(List<int> ids) {
         if (ids.Count == 0) { return new List<User>(); }
         return await this.db.Select<User>()
-            .W("t.id IN (?)")
-            .InI(ids)
+            .Where(a => ids.Contains(a.id))
             .ToListAsync();
     }
 
@@ -187,73 +186,36 @@ class UserDao {
         return await this.db.Update<User>()
             .Set(a => a.status, status)
             .Set(a => a.updatedAt, WebApp.NowSeconds())
-            .W("t.id IN (?)")
-            .InI(ids)
+            .Where(a => ids.Contains(a.id))
             .ExecuteAffrowsAsync();
     }
 
     async int DeleteByIds(List<int> ids) {
         if (ids.Count == 0) { return 0; }
         return await this.db.Delete<User>()
-            .W("t.id IN (?)")
-            .InI(ids)
+            .Where(a => ids.Contains(a.id))
             .ExecuteAffrowsAsync();
     }
 
-    /* 声明式列表取数：conds 由 ListPage.Collect 产出，这里统一拼参数化
-     * WHERE——列名来自控制器声明（非用户输入），值走占位符。数据边界
-     * （部门/本人范围）仍由本 DAO 掌握，界面声明越不过权限。 */
-    static void ApplyConds(__DbQ_User sel, List<ListCond> conds) {
-        for (int i = 0; i < conds.Count; i = i + 1) {
-            ListCond q = conds[i];
-            if (q.kind == "LIKE") {
-                List<string> cols = q.col.Split("|");
-                string frag = "(";
-                int n = 0;
-                for (int p = 0; p < cols.Count; p = p + 1) {
-                    string part = cols[p].Trim();
-                    if (part.Length == 0) { continue; }
-                    if (n > 0) { frag = frag + " OR "; }
-                    frag = frag + part + " LIKE ?";
-                    sel.P("%" + q.value + "%");
-                    n = n + 1;
-                }
-                sel.W(frag + ")");
-            } else if (q.kind == "EQ") {
-                sel.W(q.col + " = ?");
-                sel.Pi(Filter.ToInt(q.value, 0));
-            } else if (q.kind == "GE") {
-                sel.W(q.col + " >= ?");
-                sel.Pl(Filter.ToLong(q.value, 0));
-            } else if (q.kind == "LE") {
-                sel.W(q.col + " <= ?");
-                sel.Pl(Filter.ToLong(q.value, 0));
-            }
-        }
+    /* 声明式列表取数：conds（ListPage.Collect 产出）交给 ORM 的
+     * WhereConds——列名按实体元数据校验、值全部走绑定参数，本层不再
+     * 接触 SQL 文本。数据边界（部门/本人范围）用类型化条件表达，仍由
+     * 本 DAO 掌握，界面声明越不过权限。 */
+    async int CountBy(List<OrmCond> conds, bool byDept, List<int> scoped, bool mine, int myId) {
+        return await this.db.Select<User>()
+            .WhereConds(conds)
+            .WhereIf(byDept, a => scoped.Contains(a.departmentId))
+            .WhereIf(mine, a => a.id == myId)
+            .CountAsync();
     }
 
-    async int CountBy(List<ListCond> conds, bool byDept, List<int> scoped, bool mine, int myId) {
-        __DbQ_User sel = this.db.Select<User>();
-        UserDao.ApplyConds(sel, conds);
-        if (byDept) {
-            if (scoped.Count == 0) { sel.W("1=0"); }
-            else { sel.W("t.departmentId IN (?)"); sel.InI(scoped); }
-        }
-        if (mine) { sel.W("t.id = ?"); sel.Pi(myId); }
-        return await sel.CountAsync();
-    }
-
-    async List<User> PagedListBy(List<ListCond> conds, bool byDept, List<int> scoped, bool mine, int myId, int skip, int limit) {
-        __DbQ_User sel = this.db.Select<User>();
-        UserDao.ApplyConds(sel, conds);
-        if (byDept) {
-            if (scoped.Count == 0) { sel.W("1=0"); }
-            else { sel.W("t.departmentId IN (?)"); sel.InI(scoped); }
-        }
-        if (mine) { sel.W("t.id = ?"); sel.Pi(myId); }
-        sel.OBD("t.id");
-        sel.Skip(skip);
-        sel.Take(limit);
-        return await sel.ToListAsync();
+    async List<User> PagedListBy(List<OrmCond> conds, bool byDept, List<int> scoped, bool mine, int myId, int skip, int limit) {
+        return await this.db.Select<User>()
+            .WhereConds(conds)
+            .WhereIf(byDept, a => scoped.Contains(a.departmentId))
+            .WhereIf(mine, a => a.id == myId)
+            .OrderByDescending(a => a.id)
+            .Skip(skip).Take(limit)
+            .ToListAsync();
     }
 }

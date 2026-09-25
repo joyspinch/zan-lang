@@ -65,7 +65,7 @@ partial class ZanIDE {
         if (after.Length < wl) { return false; }
         if (after.Substring(0, wl) != word) { return false; }
         if (after.Length == wl) { return true; }
-        return !CodeEditor.IsIdentChar(after.Substring(wl, 1));
+        return !CodeEditor.IsIdentByte(after[wl]);
     }
 
     /// True if the line declares a type named `word` (class/struct/enum/interface).
@@ -86,11 +86,11 @@ partial class ZanIDE {
     /// Index of a whole-word `word(` occurrence in s, or -1.
     static int FindWordCall(string s, string word) {
         int wl = word.Length;
-        if (wl == 0) { return 0 - 1; }
+        if (wl == 0 || s == null) { return 0 - 1; }
         for (int i = 0; i + wl < s.Length; i = i + 1) {
-            if (s.Substring(i, wl) == word && s.Substring(i + wl, 1) == "(") {
+            if ((s[i + wl] & 255) == 40 && s.Substring(i, wl) == word) {
                 bool leftOk = true;
-                if (i > 0) { leftOk = !CodeEditor.IsIdentChar(s.Substring(i - 1, 1)); }
+                if (i > 0) { leftOk = !CodeEditor.IsIdentByte(s[i - 1]); }
                 if (leftOk) { return i; }
             }
         }
@@ -158,30 +158,28 @@ partial class ZanIDE {
         return delta;
     }
 
-    /// True when `ch` is an identifier character. Uses a whitelist lookup
-    /// rather than string range comparisons, which are unreliable here.
+    /// True when `ch` is an identifier character.
     static bool OutlineIsIdentChar(string ch) {
-        string ok = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
-        return ZanIDE.OutlineFind(ok, ch) >= 0;
+        if (ch == null || ch.Length == 0) { return false; }
+        return CodeEditor.IsIdentByte(ch[0]);
     }
 
     /// Leading identifier of a token ("Foo<T>" -> "Foo", "bar;" -> "bar").
     static string OutlineIdent(string tok) {
-        string outp = "";
-        for (int i = 0; i < tok.Length; i = i + 1) {
-            string ch = tok.Substring(i, 1);
-            if (ZanIDE.OutlineIsIdentChar(ch)) { outp = outp + ch; }
-            else { break; }
+        if (tok == null || tok.Length == 0) { return ""; }
+        int i = 0;
+        int len = tok.Length;
+        while (i < len && CodeEditor.IsIdentByte(tok[i])) {
+            i = i + 1;
         }
-        return outp;
+        if (i == 0) { return ""; }
+        return tok.Substring(0, i);
     }
 
     /// Index of the first occurrence of single-char `ch` in `s`, or -1.
     static int OutlineFind(string s, string ch) {
-        for (int i = 0; i < s.Length; i = i + 1) {
-            if (s.Substring(i, 1) == ch) { return i; }
-        }
-        return 0 - 1;
+        if (s == null || ch == null || ch.Length == 0) { return 0 - 1; }
+        return s.IndexOf(ch);
     }
 
     /// The type name declared on `s` (class/struct/enum/interface), or "".
@@ -780,15 +778,16 @@ partial class ZanIDE {
     /// Counts whole-word occurrences of `word` in `line`.
     static int CountWord(string line, string word) {
         int wl = word.Length;
-        if (wl == 0) { return 0; }
+        if (wl == 0 || line == null) { return 0; }
         int count = 0;
         int i = 0;
-        while (i + wl <= line.Length) {
+        int len = line.Length;
+        while (i + wl <= len) {
             if (line.Substring(i, wl) == word) {
                 bool leftOk = true;
                 bool rightOk = true;
-                if (i > 0) { leftOk = !CodeEditor.IsIdentChar(line.Substring(i - 1, 1)); }
-                if (i + wl < line.Length) { rightOk = !CodeEditor.IsIdentChar(line.Substring(i + wl, 1)); }
+                if (i > 0) { leftOk = !CodeEditor.IsIdentByte(line[i - 1]); }
+                if (i + wl < len) { rightOk = !CodeEditor.IsIdentByte(line[i + wl]); }
                 if (leftOk && rightOk) { count = count + 1; i = i + wl; }
                 else { i = i + 1; }
             } else { i = i + 1; }
@@ -891,42 +890,49 @@ partial class ZanIDE {
     /// Replaces whole-word occurrences of `word` with `newName`, skipping
     /// string/char literals and line/block comments (same rules as zan-lsp).
     static string ReplaceWholeWord(string text, string word, string newName) {
-        string outp = "";
+        if (text == null || text.Length == 0) { return ""; }
+        StringBuilder sb = new StringBuilder();
         int i = 0;
         int n = text.Length;
+        int start = 0;
         while (i < n) {
-            string ch = text.Substring(i, 1);
-            if (ch == "/" && i + 1 < n && text.Substring(i + 1, 1) == "/") {
-                int j = i;
-                while (j < n && text.Substring(j, 1) != "\n") { j = j + 1; }
-                outp = outp + text.Substring(i, j - i);
-                i = j;
-            } else if (ch == "/" && i + 1 < n && text.Substring(i + 1, 1) == "*") {
+            int c = text[i] & 255;
+            if (c == 47 && i + 1 < n && (text[i + 1] & 255) == 47) {
                 int j = i + 2;
-                while (j + 1 < n && !(text.Substring(j, 1) == "*" && text.Substring(j + 1, 1) == "/")) { j = j + 1; }
-                if (j + 1 < n) { j = j + 2; } else { j = n; }
-                outp = outp + text.Substring(i, j - i);
+                while (j < n && (text[j] & 255) != 10) { j = j + 1; }
                 i = j;
-            } else if (ch == "\"" || ch == "'") {
+            } else if (c == 47 && i + 1 < n && (text[i + 1] & 255) == 42) {
+                int j = i + 2;
+                while (j + 1 < n && !((text[j] & 255) == 42 && (text[j + 1] & 255) == 47)) { j = j + 1; }
+                if (j + 1 < n) { j = j + 2; } else { j = n; }
+                i = j;
+            } else if (c == 34 || c == 39) {
+                int quote = c;
                 int j = i + 1;
-                for (j = i + 1; j < n && text.Substring(j, 1) != ch; j = j + 1) {
-                    if (text.Substring(j, 1) == "\\" && j + 1 < n) { j = j + 1; }
+                while (j < n && (text[j] & 255) != quote) {
+                    if ((text[j] & 255) == 92 && j + 1 < n) { j = j + 1; }
+                    j = j + 1;
                 }
                 if (j < n) { j = j + 1; }
-                outp = outp + text.Substring(i, j - i);
                 i = j;
-            } else if (CodeEditor.IsIdentChar(ch)) {
+            } else if (CodeEditor.IsIdentByte(c)) {
                 int j = i;
-                while (j < n && CodeEditor.IsIdentChar(text.Substring(j, 1))) { j = j + 1; }
+                while (j < n && CodeEditor.IsIdentByte(text[j])) { j = j + 1; }
                 string ident = text.Substring(i, j - i);
-                if (ident == word) { outp = outp + newName; } else { outp = outp + ident; }
+                if (ident == word) {
+                    if (i > start) { sb.Append(text.Substring(start, i - start)); }
+                    sb.Append(newName);
+                    start = j;
+                }
                 i = j;
             } else {
-                outp = outp + ch;
                 i = i + 1;
             }
         }
-        return outp;
+        if (i > start) {
+            sb.Append(text.Substring(start, i - start));
+        }
+        return sb.ToString();
     }
 
     // ================================================================

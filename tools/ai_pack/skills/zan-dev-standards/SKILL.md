@@ -37,13 +37,18 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   ③ 字符码点判断与十进制数字解析统一使用原生只读单周期字节索引 `s[i] & 255`，严禁通过 `NativeMemory.Alloc(8)` 写入再 Span 取首字节释放的堆外分配反模式，严禁逐位 `Substring(i, 1)`；
   ④ 文本转义、分词与模板解析统一采用分块游标切片（Window Chunking），无特殊字符时直通返回原始字符串（0 堆申请），含特殊字符时以区间切片追加，消灭逐字节碎片分配；字典键值查询优先使用 `vars.ContainsKey(key)` 与 `TryGetValue`，严禁遍历 `vars.Keys` 数组造成 $O(N)$ 性能降级；
   ⑤ GUI 与游戏高频渲染循环严禁闭包委托与多重 Span 重复构造：`YSortLayer` 等空间与深度排序结构采用紧凑索引直接访问（`GetSortedEntityId`）替代 `ForEachSorted` 委托闭包，消灭每帧闭包分配；`SpriteBatch.Add` 复用单一 `Span<float>` 实例完成 8 浮点装填；富文本与代码高亮词法探测（`CodeEditor.InSet/ContainsSub`、`Markdown` 行内解析、`ChatView.MdStrip`）全面直通原生 `IndexOf` 与分块游标区间切片。
-- **GenDb 查询链：表访问器只当链头，命名变量走 `__DbBind` 门面**。`this.Post`
-  只在链式调用头部存在，裸赋值（`__DbQ_Post sel = this.Post;`）与当静态成员调
-  （`Articles.PostList(...)`）都编译不过；要起名字（DAO 里拼条件、跨方法传选链）
-  用生成的门面根 `__DbQ_Post sel = __DbBind.Q_Post(conn);`。门面原始转发器与
-  类型化 lambda 并存：`W("t.id IN (?)")` + `InI(ids)` 即参数化 IN，`P/Pi/Pl`
-  按值类型绑占位符（条件收集/列表筛选的落地定式，2026-09-25 实机验证）。
-  坑出处：三处编译错全是这两形态踩出来的。
+- **ORM 条件只有值自带原语，裸 SQL 片段是生成代码专属**。用户面条件一律
+  `WhereEq/WhereGe/WhereLe/WhereIn/WhereLikeAny`（列名经实体元数据校验，
+  值全部参数化绑定）与类型化 lambda（`ids.Contains(a.id)` 降级为参数化
+  IN；空列表恒假，不会生成非法 `IN ()`）；列表筛选收集成 `List<OrmCond>`
+  后 `WhereConds(conds)` 一口吞（多列 LIKE 用 `|` 分组 OR）。批量更新/
+  删除走 `DbTable.Of(conn, "表").Query().WhereIn(...).ExecuteUpdateAsync(...)`
+  （列名过 RequireIdent 白名单）。`W("片段")+InI(...)` 这类片段/参数分离
+  写法已整体删除，只以 `__` 前缀（`__Frag/__Pi/...`）存在于编译器生成代码
+  里，手写代码不可见；要给查询链接名字仍用门面根
+  `__DbQ_Post sel = __DbBind.Q_Post(conn);`（裸赋值 `this.Post` 编译不过）。
+  坑出处：片段+参数靠位置配对，编译器查不出错位，历史上实烂三处
+  （2026-09-25 根治，值自带后错位不可能发生）。
 - **Zan.Web 菜单是显式选择（GenRoute 约定），别靠描述"顺便"进侧栏**。进
   管理菜单只认显式标注：`[Custom(IsMenu = true)]`（类级或动作级，图标/权限
   同写在那一处）、`[Menu]`、`[AdminAction(IsMenu = true)]`；类级
@@ -58,8 +63,11 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   `AdminController` 的 `Can/Note/Saved` 直接编译错）。包内协作面要么
   放开为默认公开（如 Note/Saved 这类通用应答/审计），要么像
   `Screen(canUpdate, canDelete)` 那样由子类调用方取好掩码再当参数传；
-  ② SQL 关键字不能当标识符——`where` 做变量名报
-  `unexpected token 'where' in expression` 一串（改名 `marks`）；
+  ② 关键字不能当标识符——`where`（lambda 语法）与 `set`/`get`（属性
+  访问器语法）都是保留字：`where` 做变量名报 `unexpected token` 一串，
+  `DbValues set` 参数把整段方法解析炸成上百条级联错（各改名实修）；
+  另 `StringBuilder.Append` 返回 void，`sb.Append(x).ToString()` 链式
+  取值编译不过，必须拆两条语句；
   ③ async 方法同一表达式里 await 前不得再求值带副作用的调用
   （`this.Ctx().path` 要先赋局部变量），编译期强制。
 - **声明驱动的 CRUD 定式（ListPage/Crud，2026-09-25 落地）**：一屏一个

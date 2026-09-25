@@ -1,6 +1,7 @@
 using System;
 using System.Text;
 using System.Data;
+using System.Data.Orm;
 using System.Web;
 using System.Json;
 using ZanWeb.Core;
@@ -10,10 +11,11 @@ namespace ZanWeb.Web;
 /* 声明驱动的通用写动作与前端表格配置。
  *
  * 写侧：字段/表名白名单出自 ListPage.Table/EditFields（代码声明，非
- * 用户输入），标识符再过 Gen.Safe 字符校验双保险，值一律走 ? 占位符
- * 参数——列名进 SQL 前不可能携带用户数据，注入面为零。行级授权由调用
- * 方预检：allowed 集合里的 id 才可写，越权 id 与不存在的 id 同答 404，
- * 不泄露存在性。审计经 AdminController.Note 落 sys_operation_log。
+ * 用户输入），标识符再过 Gen.Safe 字符校验与 DbTable 的 RequireIdent
+ * 双保险，SQL 全部由运行期网关 DbTable/DbTableQuery 生成，值一律走
+ * ? 占位符参数——本层不出现任何手拼 SQL。行级授权由调用方预检：
+ * allowed 集合里的 id 才可写，越权 id 与不存在的 id 同答 404，不泄露
+ * 存在性。审计经 AdminController.Note 落 sys_operation_log。
  *
  * 读侧：Conf() 把本屏声明投影为 adminUI ZanTable 的 ListConfData JSON
  * （PUT {apiObj}/conf 契约）——服务端渲染与前端表格配置同源产出，
@@ -27,15 +29,11 @@ class Crud {
         StrMap def = Crud.Find(lp, field);
         if (def == null) { c.Fail(400, "0004", "该字段不可编辑"); return; }
         if (allowed.Count == 0) { c.Fail(404, "0404", "记录不存在"); return; }
-        DbParams ps = new DbParams();
-        if (def.Get("type") == "int") {
-            ps.AddLong(Filter.ToLong(value, 0));
-        } else {
-            ps.Add(value);
-        }
-        ps.AddInt(allowed[0]);
-        int n = await c.__Conn().ExecuteAsync("UPDATE " + lp.table
-            + " SET " + def.Get("name") + " = ? WHERE id = ?", ps);
+        DbValues row = new DbValues();
+        if (def.Get("type") == "int") { row.Set(field, Filter.ToLong(value, 0)); }
+        else { row.Set(field, value); }
+        int n = await DbTable.Of(c.__Conn(), lp.table)
+            .UpdateAsync(row, "id", allowed[0]);
         await c.Note(title + "·编辑字段",
             "#" + Convert.ToString(allowed[0]) + " " + field, n > 0, value);
         c.Saved("已保存");
@@ -49,21 +47,12 @@ class Crud {
         StrMap def = Crud.Find(lp, field);
         if (def == null) { c.Fail(400, "0004", "该字段不可编辑"); return; }
         if (allowed.Count == 0) { c.Fail(400, "0004", "未选择记录"); return; }
-        StringBuilder marks = new StringBuilder();
-        DbParams ps = new DbParams();
-        if (def.Get("type") == "int") {
-            ps.AddLong(Filter.ToLong(value, 0));
-        } else {
-            ps.Add(value);
-        }
-        for (int i = 0; i < allowed.Count; i = i + 1) {
-            if (i > 0) { marks.Append(","); }
-            marks.Append("?");
-            ps.AddInt(allowed[i]);
-        }
-        int n = await c.__Conn().ExecuteAsync("UPDATE " + lp.table
-            + " SET " + def.Get("name") + " = ? WHERE id IN ("
-            + marks.ToString() + ")", ps);
+        DbValues row = new DbValues();
+        if (def.Get("type") == "int") { row.Set(field, Filter.ToLong(value, 0)); }
+        else { row.Set(field, value); }
+        int n = await DbTable.Of(c.__Conn(), lp.table).Query()
+            .WhereIn("id", allowed)
+            .ExecuteUpdateAsync(row);
         await c.Note(title,
             Convert.ToString(allowed.Count) + " 条", n > 0, field + "=" + value);
         c.Saved(Lang.T("已更新") + " " + Convert.ToString(n) + " " + Lang.T("条记录"));
@@ -74,15 +63,9 @@ class Crud {
     static async void Delete(AdminController c, ListPage lp,
                              List<int> allowed, string title) {
         if (allowed.Count == 0) { c.Fail(400, "0004", "未选择记录"); return; }
-        StringBuilder marks = new StringBuilder();
-        DbParams ps = new DbParams();
-        for (int i = 0; i < allowed.Count; i = i + 1) {
-            if (i > 0) { marks.Append(","); }
-            marks.Append("?");
-            ps.AddInt(allowed[i]);
-        }
-        int n = await c.__Conn().ExecuteAsync("DELETE FROM " + lp.table
-            + " WHERE id IN (" + marks.ToString() + ")", ps);
+        int n = await DbTable.Of(c.__Conn(), lp.table).Query()
+            .WhereIn("id", allowed)
+            .ExecuteDeleteAsync();
         await c.Note(title, Convert.ToString(allowed.Count) + " 条", n > 0, "");
         c.Saved(Lang.T("已删除") + " " + Convert.ToString(n) + " " + Lang.T("条记录"));
     }
