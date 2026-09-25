@@ -1,0 +1,138 @@
+using System;
+using System.Collections.Generic;
+using System.Data.Redis;
+using System.Threading;
+
+namespace Zan.Web.Cache;
+
+/// 缓存条目
+class CacheItem {
+    public string value;
+    public long expireAt; // 秒级时间戳，0 表示永不过期
+
+    public CacheItem(string value, long expireAt) {
+        this.value = value;
+        this.expireAt = expireAt;
+    }
+
+    public bool IsExpired(long now) {
+        if (this.expireAt <= 0) { return false; }
+        return now >= this.expireAt;
+    }
+}
+
+/// 进程内极速内存缓存（服务瞬时内存、本地热数据、字典缓存）
+class MemoryCache {
+    static Dict<string, CacheItem> store = new Dict<string, CacheItem>();
+
+    public static void Set(string key, string value, int ttlSeconds) {
+        long now = DateTime.Now().ToUnixSeconds();
+        long expireAt = ttlSeconds > 0 ? (now + ttlSeconds) : 0;
+        store[key] = new CacheItem(value, expireAt);
+    }
+
+    public static string Get(string key, string defVal) {
+        if (!store.ContainsKey(key)) {
+            return defVal;
+        }
+        CacheItem item = store[key];
+        long now = DateTime.Now().ToUnixSeconds();
+        if (item.IsExpired(now)) {
+            store.Remove(key);
+            return defVal;
+        }
+        return item.value;
+    }
+
+    public static bool Has(string key) {
+        if (!store.ContainsKey(key)) {
+            return false;
+        }
+        long now = DateTime.Now().ToUnixSeconds();
+        if (store[key].IsExpired(now)) {
+            store.Remove(key);
+            return false;
+        }
+        return true;
+    }
+
+    public static void Remove(string key) {
+        if (store.ContainsKey(key)) {
+            store.Remove(key);
+        }
+    }
+
+    public static void Clear() {
+        store.Clear();
+    }
+}
+
+/// 单实例 Redis 客户端适配器（支持分布式缓存与会话，严禁冗余集群）
+class RedisCache {
+    static RedisClient client;
+    static bool isEnabled = false;
+
+    public static async bool InitAsync(string host, int port, string password) {
+        try {
+            client = await RedisClient.ConnectAsync(host, port);
+            if (client == null) {
+                isEnabled = false;
+                return false;
+            }
+            if (password != null && password.Length > 0) {
+                await client.AuthAsync(password);
+            }
+            isEnabled = true;
+            return true;
+        } catch (Exception ex) {
+            isEnabled = false;
+            return false;
+        }
+    }
+
+    public static bool Enabled() {
+        return isEnabled && client != null;
+    }
+
+    public static async string GetAsync(string key, string defVal) {
+        if (!Enabled()) {
+            return MemoryCache.Get(key, defVal);
+        }
+        try {
+            string val = await client.GetAsync(key);
+            if (val == null) { return defVal; }
+            return val;
+        } catch (Exception ex) {
+            return defVal;
+        }
+    }
+
+    public static async bool SetAsync(string key, string value, int ttlSeconds) {
+        if (!Enabled()) {
+            MemoryCache.Set(key, value, ttlSeconds);
+            return true;
+        }
+        try {
+            await client.SetAsync(key, value);
+            if (ttlSeconds > 0) {
+                await client.ExpireAsync(key, ttlSeconds);
+            }
+            return true;
+        } catch (Exception ex) {
+            return false;
+        }
+    }
+
+    public static async bool DelAsync(string key) {
+        if (!Enabled()) {
+            MemoryCache.Remove(key);
+            return true;
+        }
+        try {
+            await client.DelAsync(key);
+            return true;
+        } catch (Exception ex) {
+            return false;
+        }
+    }
+}
