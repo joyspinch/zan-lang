@@ -78,15 +78,12 @@ static LLVMValueRef get_str_trim_fn(zan_irgen_t *g) {
     if (fn) return fn;
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
-    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef fnty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr }, 1, 0);
     fn = LLVMAddFunction(g->mod, "__zan_str_trim", fnty);
     LLVMSetLinkage(fn, LLVMInternalLinkage);
     LLVMTypeRef strlen_ty = LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr }, 1, 0);
-    LLVMTypeRef isspace_ty = LLVMFunctionType(i32, (LLVMTypeRef[]){ i32 }, 1, 0);
     LLVMTypeRef memcpy_ty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr, i64 }, 3, 0);
-    LLVMValueRef isspace_fn = get_libc_fn(g, "isspace", isspace_ty);
     LLVMValueRef memcpy_fn = get_libc_fn(g, "memcpy", memcpy_ty);
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
@@ -106,10 +103,10 @@ static LLVMValueRef get_str_trim_fn(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(g->builder, lead);
     LLVMValueRef p = LLVMBuildLoad2(g->builder, i8ptr, pvar, "p");
     LLVMValueRef c = LLVMBuildLoad2(g->builder, i8, p, "c");
-    LLVMValueRef c32 = LLVMBuildZExt(g->builder, c, i32, "c32");
-    LLVMValueRef ws = zan_call2(g->builder, isspace_ty, isspace_fn, &c32, 1, "ws");
-    LLVMValueRef nz = zan_icmp(g->builder, LLVMIntNE, ws,
-        LLVMConstInt(i32, 0, 0), "isws");
+    LLVMValueRef is_sp = zan_icmp(g->builder, LLVMIntEQ, c, LLVMConstInt(i8, 32, 0), "is_sp");
+    LLVMValueRef c_sub_9 = zan_sub(g->builder, c, LLVMConstInt(i8, 9, 0), "c_sub");
+    LLVMValueRef is_ctl_ws = zan_icmp(g->builder, LLVMIntULE, c_sub_9, LLVMConstInt(i8, 4, 0), "is_ctl");
+    LLVMValueRef nz = zan_or(g->builder, is_sp, is_ctl_ws, "isws");
     LLVMValueRef not_nul = zan_icmp(g->builder, LLVMIntNE, c,
         LLVMConstInt(i8, 0, 0), "notnul");
     LLVMValueRef adv = zan_and(g->builder, nz, not_nul, "adv");
@@ -133,10 +130,10 @@ static LLVMValueRef get_str_trim_fn(zan_irgen_t *g) {
     LLVMValueRef nm1 = zan_sub(g->builder, n, one64, "nm1");
     LLVMValueRef lastp = LLVMBuildGEP2(g->builder, i8, base, &nm1, 1, "lastp");
     LLVMValueRef lc = LLVMBuildLoad2(g->builder, i8, lastp, "lc");
-    LLVMValueRef lc32 = LLVMBuildZExt(g->builder, lc, i32, "lc32");
-    LLVMValueRef lws = zan_call2(g->builder, isspace_ty, isspace_fn, &lc32, 1, "lws");
-    LLVMValueRef lnz = zan_icmp(g->builder, LLVMIntNE, lws,
-        LLVMConstInt(i32, 0, 0), "lisws");
+    LLVMValueRef lis_sp = zan_icmp(g->builder, LLVMIntEQ, lc, LLVMConstInt(i8, 32, 0), "lis_sp");
+    LLVMValueRef lc_sub_9 = zan_sub(g->builder, lc, LLVMConstInt(i8, 9, 0), "lc_sub");
+    LLVMValueRef lis_ctl_ws = zan_icmp(g->builder, LLVMIntULE, lc_sub_9, LLVMConstInt(i8, 4, 0), "lis_ctl");
+    LLVMValueRef lnz = zan_or(g->builder, lis_sp, lis_ctl_ws, "lisws");
     LLVMBuildCondBr(g->builder, lnz, tail_ws, copy);
     LLVMPositionBuilderAtEnd(g->builder, tail_ws);
     LLVMBuildStore(g->builder, nm1, nvar);
@@ -162,14 +159,11 @@ static LLVMValueRef get_str_case_fn(zan_irgen_t *g, int upper) {
     if (fn) return fn;
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
-    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef fnty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr }, 1, 0);
     fn = LLVMAddFunction(g->mod, fname, fnty);
     LLVMSetLinkage(fn, LLVMInternalLinkage);
     LLVMTypeRef strlen_ty = LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr }, 1, 0);
-    LLVMTypeRef conv_ty = LLVMFunctionType(i32, (LLVMTypeRef[]){ i32 }, 1, 0);
-    LLVMValueRef conv_fn = get_libc_fn(g, upper ? "toupper" : "tolower", conv_ty);
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
     LLVMBasicBlockRef loop = LLVMAppendBasicBlockInContext(g->ctx, fn, "loop");
@@ -190,9 +184,14 @@ static LLVMValueRef get_str_case_fn(zan_irgen_t *g, int upper) {
     LLVMPositionBuilderAtEnd(g->builder, body);
     LLVMValueRef sp = LLVMBuildGEP2(g->builder, i8, s, &i, 1, "sp");
     LLVMValueRef c = LLVMBuildLoad2(g->builder, i8, sp, "c");
-    LLVMValueRef c32 = LLVMBuildZExt(g->builder, c, i32, "c32");
-    LLVMValueRef conv = zan_call2(g->builder, conv_ty, conv_fn, &c32, 1, "conv");
-    LLVMValueRef c8 = LLVMBuildTrunc(g->builder, conv, i8, "c8");
+    LLVMValueRef low_b = LLVMConstInt(i8, upper ? 'a' : 'A', 0);
+    LLVMValueRef high_b = LLVMConstInt(i8, upper ? 'z' : 'Z', 0);
+    LLVMValueRef diff = LLVMConstInt(i8, upper ? (uint64_t)(unsigned char)-32 : 32, 0);
+    LLVMValueRef ge = zan_icmp(g->builder, LLVMIntUGE, c, low_b, "ge");
+    LLVMValueRef le = zan_icmp(g->builder, LLVMIntULE, c, high_b, "le");
+    LLVMValueRef in_rng = zan_and(g->builder, ge, le, "in_rng");
+    LLVMValueRef conv = LLVMBuildAdd(g->builder, c, diff, "conv");
+    LLVMValueRef c8 = LLVMBuildSelect(g->builder, in_rng, conv, c, "c8");
     LLVMValueRef dp = LLVMBuildGEP2(g->builder, i8, buf, &i, 1, "dp");
     LLVMBuildStore(g->builder, c8, dp);
     LLVMValueRef i1v = zan_add(g->builder, i, LLVMConstInt(i64, 1, 0), "i1");

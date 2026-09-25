@@ -447,6 +447,13 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   `LLVM verification failed ... Call parameter type does not match function signature!`
   （第 16 参起仍是 i64 未被 coerce）。限定名 `A.big17(...)` 路径正常（探针
   `p17.zan` / `p60.zan` / `p17b.zan`）。
+
+## irgen_builtins 算术内联保宽：禁止对 8 位整型混用 zan_add 与 LLVMBuildSelect（2026-09-25）
+
+- **症状**：在编译器内置字符串方法生成（如 `__zan_str_to_upper` / `__zan_str_to_lower`）中，使用 SSA 计算 `%c8 = select i1 %in_rng, %conv, %c` 时，LLVM 校验直接报错 `Invalid operands for select instruction!`。
+- **根因**：编译器宏 `ZAN_IBIN(zan_add, LLVMBuildAdd)` 内部默认调用 `zan_ipair(b, &l, &r)`，遵循 C# 算术向 int/long 提升规则，若左右操作数为 i8 则会自动调用 `zan_iwiden` 零扩展为 `i64`。但后续 `LLVMBuildSelect` 接收的 `%c` 仍是原始加载的 `i8` 字符，导致 `select` 的 true 分支为 `i64`、false 分支为 `i8`，类型不匹配。
+- **纪律**：在生成 8 位或保宽标量 SSA 寄存器操作时，禁止随意混用通用整型二元运算包装宏（如 `zan_add`、`zan_sub`）；涉及 `select` 或定宽存储的逻辑，直接使用显式保宽的 `LLVMBuildAdd(g->builder, c, diff, "conv")` 或显式截断/强转，确保 LLVM 寄存器类型严格闭环。
+
 - **本类一个构造函数都没有时 `new C(args)` 静默丢实参**（`irgen_expr.c:7281-7287` 的
   诊断以 `type_has_ctor()` 为门，无 ctor 反而不报）→ 对象只用字段初始化器，args 不
   求值。探针 `_scratch/audit2/newargs.zan`。

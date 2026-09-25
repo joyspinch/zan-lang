@@ -32,6 +32,7 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   不写"本轮修改了什么"。
 - 常量收拢：魔法数进常量；字段名引用 schema 生成物或常量，不散落裸字符串。
 - 资源（图片/字体/大 JSON）走内嵌或声明式引用，不在业务代码里手写路径拼接。
+- **高频基础数据热路径杜绝逐字符/堆分配循环**：文本解码（`Encoding.UTF8.GetString`）优先利用 `bytes.IsAscii` AVX2 向量化探测，纯 ASCII 直通单次 `memcpy` 投影；十六进制编解码（`ToHexString`）禁止在循环体内使用 `Substring` + `StringBuilder`，必须单次预分配 `byte[]` 配合 16 字节字符常数表直接位运算寻址写入；图像像素批量处理（`ImageBuffer`）全面废除浮点乘除与逐点函数调用，统一采用定点数移位（如灰度加权 `(B*29 + G*150 + R*77) >> 8`）与向量化批处理。
 - **GenDb 查询链：表访问器只当链头，命名变量走 `__DbBind` 门面**。`this.Post`
   只在链式调用头部存在，裸赋值（`__DbQ_Post sel = this.Post;`）与当静态成员调
   （`Articles.PostList(...)`）都编译不过；要起名字（DAO 里拼条件、跨方法传选链）
