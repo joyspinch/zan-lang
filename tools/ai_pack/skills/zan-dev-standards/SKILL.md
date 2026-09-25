@@ -74,7 +74,10 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   从磁盘读，手动沙箱要自己把模板的 views/ wwwroot/ 拷进发布目录（e2e 也是
   copytree 布置的），漏了就是整页 `<!-- view not found -->`；
   ⑦ config `worker.daemon=false` 时 `app.exe restart` 会前台阻塞把脚本挂死——
-  起服务用 `(app.exe start > boot.log 2>&1 &)`，别用裸 restart。
+  起服务用 `(app.exe start > boot.log 2>&1 &)`，别用裸 restart；⑧ 手动起的
+  沙箱实例占着 e2e 的端口时，e2e 起服阶段不会报"端口占用"，而是对自己的
+  数据目录跑断言、拿到空表 IndexError 之类的假故障——跑 e2e 前先按 netstat
+  停掉自己的实例。
 - **PowerShell 合成点击四连坑（PrintWindow 抓窗 + mouse_event 注入流）**：
   ① 进程必须先 `SetProcessDpiAwarenessContext(-4)`——DPI 不感知时
   `GetWindowRect`/`SetCursorPos` 全在虚拟化坐标系，注入点整体漂 1.5 倍；
