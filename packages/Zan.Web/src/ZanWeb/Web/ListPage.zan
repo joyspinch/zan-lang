@@ -1,0 +1,321 @@
+using System;
+using System.Text;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb.Core;
+
+namespace ZanWeb.Web;
+
+/* 声明式列表页：搜索区、工具栏、查询条件三处同源。
+ *
+ * 控制器对一张表声明一次筛选字段与工具栏按钮，渲染（HTML）与取数
+ * （参数化 WHERE）都从这里派生——改一处声明，界面与 SQL 同时生效，
+ * 不存在"界面加了字段、查询忘了接"的分叉。移植自作者 PHP 版的
+ * search_text/tbar_* 与 C# 版 TableConfig 的合一形态，落在服务端
+ * 渲染上：搜索区与工具栏整段 HTML 交给视图 {{{raw}}} 原样输出。
+ *
+ * 列名是唯一进 SQL 的自由文本，声明在代码里（非用户输入），值一律
+ * 走占位符参数——LIKE 值包 %、多列组拆成每列一个占位符，注入面为零。
+ */
+class ListPage {
+    List<ListFilter> fs;
+    List<ListButton> bs;
+
+    ListPage() {
+        this.fs = new List<ListFilter>();
+        this.bs = new List<ListButton>();
+    }
+
+    /* 每屏一个实例：new ListPage() 后链式声明。 */
+    static ListPage Of() {
+        return new ListPage();
+    }
+
+    /* ---- 声明：搜索字段 ------------------------------------------ */
+
+    /* 文本模糊搜索；col 支持 "a|b|c" —— 多列 OR LIKE（如 账号|姓名|邮箱）。 */
+    ListPage Text(string title, string name, string col, string ph) {
+        ListFilter f = new ListFilter();
+        f.type = "text";
+        f.title = title;
+        f.name = name;
+        f.col = col;
+        f.ph = ph;
+        this.fs.Add(f);
+        return this;
+    }
+
+    /* 下拉等值筛选；options 形如 "1=启用,0=禁用"，首项自动补"全部"。 */
+    ListPage Select(string title, string name, string col, string options) {
+        ListFilter f = new ListFilter();
+        f.type = "select";
+        f.title = title;
+        f.name = name;
+        f.col = col;
+        f.options = options;
+        this.fs.Add(f);
+        return this;
+    }
+
+    /* 日期区间（创建时间类）：渲染两个 date 输入（name+From/To），
+       收集时折算为本时区当日 0 点/23:59:59 的 Unix 秒。 */
+    ListPage Time(string title, string name, string col) {
+        ListFilter f = new ListFilter();
+        f.type = "time";
+        f.title = title;
+        f.name = name;
+        f.col = col;
+        this.fs.Add(f);
+        return this;
+    }
+
+    /* 远程搜索单选（外键筛选用，如按分类/账号过滤）：url 为选项端点，
+       返回 {"data":[{"id":1,"label":".."}]}；前端 data-pick 组件驱动。 */
+    ListPage Pick(string title, string name, string col, string url) {
+        ListFilter f = new ListFilter();
+        f.type = "pick";
+        f.title = title;
+        f.name = name;
+        f.col = col;
+        f.url = url;
+        this.fs.Add(f);
+        return this;
+    }
+
+    /* ---- 声明：工具栏按钮 ---------------------------------------- */
+
+    ListPage TbarAdd(string name, string url) {
+        return this.Btn("add", name, url, "", "");
+    }
+
+    ListPage TbarReload() {
+        return this.Btn("reload", "刷新", "", "", "");
+    }
+
+    ListPage TbarSep() {
+        return this.Btn("sep", "", "", "", "");
+    }
+
+    /* 批量启/禁/删：发到批端点，POST ids=1,2,3&value=..；按钮要求
+       表格有行选择（data-table 含 select）。 */
+    ListPage TbarEnable(string url) {
+        return this.Btn("batch", "启用", url, "1", "确认启用所选记录吗？");
+    }
+
+    ListPage TbarDisable(string url) {
+        return this.Btn("batch", "禁用", url, "0", "确认禁用所选记录吗？");
+    }
+
+    ListPage TbarDelete(string url) {
+        return this.Btn("batch", "删除", url, "", "删除后不可恢复，确认删除所选记录吗？");
+    }
+
+    ListPage TbarCustom(string name, string url, string confirm) {
+        return this.Btn("custom", name, url, "", confirm);
+    }
+
+    /* 自定义批量键：标签/取值/文案自定（如 发布/转草稿），同一端点用
+       value 区分方向。 */
+    ListPage TbarBatch(string name, string url, string value, string confirm) {
+        return this.Btn("batch", name, url, value, confirm);
+    }
+
+    ListPage Btn(string type, string name, string url, string value, string confirm) {
+        ListButton b = new ListButton();
+        b.type = type;
+        b.name = name;
+        b.url = url;
+        b.value = value;
+        b.confirm = confirm;
+        this.bs.Add(b);
+        return this;
+    }
+
+    /* ---- 取数：收集本请求的条件 ---------------------------------- */
+
+    /* 只收声明过的名字：视图篡改的参数进不了 WHERE；空值与"-1"（下拉
+       全部项）不算条件。时间两端独立——只填一端就只出半开区间。 */
+    List<ListCond> Collect(AppController c) {
+        List<ListCond> out_ = new List<ListCond>();
+        for (int i = 0; i < this.fs.Count; i = i + 1) {
+            ListFilter f = this.fs[i];
+            if (f.type == "text") {
+                string v = c.In(f.name).Trim();
+                if (v.Length > 0) {
+                    out_.Add(ListPage.Cond(f.name, f.col, "LIKE", v));
+                }
+            } else if (f.type == "select" || f.type == "pick") {
+                string v = c.In(f.name).Trim();
+                if (v.Length > 0 && v != "-1") {
+                    out_.Add(ListPage.Cond(f.name, f.col, "EQ", v));
+                }
+            } else if (f.type == "time") {
+                string from = c.In(f.name + "From").Trim();
+                string to = c.In(f.name + "To").Trim();
+                if (from.Length > 0) {
+                    long s = Fmt.ParseDay(from);
+                    if (s > 0) { out_.Add(ListPage.Cond(f.name + "From", f.col, "GE", Convert.ToString(s))); }
+                }
+                if (to.Length > 0) {
+                    long s = Fmt.ParseDay(to);
+                    if (s > 0) { out_.Add(ListPage.Cond(f.name + "To", f.col, "LE", Convert.ToString(s + 86399))); }
+                }
+            }
+        }
+        return out_;
+    }
+
+    static ListCond Cond(string name, string col, string kind, string value) {
+        ListCond q = new ListCond();
+        q.name = name;
+        q.col = col;
+        q.kind = kind;
+        q.value = value;
+        return q;
+    }
+
+    /* 把收集到的条件拼进参数化 select 的语句形态由各 DAO 自己完成
+     * （SQL 是数据层的事，且 GenDb 的门面类型按实体各不相同）——本类
+     * 只产出 List<ListCond>，DAO 以其字段拼 W/P 参数化片段。 */
+
+    /* ---- 渲染：搜索区 -------------------------------------------- */
+
+    /* 整段 <form data-search> HTML 放入 d 的 searchHtml（视图 {{{searchHtml}}}
+       原样输出）。输入值直接回读请求，经 Esc 转义后回填，刷新不丢条件。 */
+    void Search(AppController c, ViewData d, string action) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<form class=\"toolbar\" data-search action=\"" + ListPage.Esc(action) + "\">\n");
+        for (int i = 0; i < this.fs.Count; i = i + 1) {
+            ListFilter f = this.fs[i];
+            if (f.type == "text") {
+                sb.Append("  <input class=\"input w160\" type=\"search\" name=\"" + f.name
+                    + "\" value=\"" + ListPage.Esc(c.In(f.name))
+                    + "\" placeholder=\"" + ListPage.Esc(Lang.T(f.ph)) + "\">\n");
+            } else if (f.type == "select") {
+                string cur = c.In(f.name);
+                sb.Append("  <select class=\"input w120\" name=\"" + f.name + "\">");
+                sb.Append("<option value=\"\">" + ListPage.Esc(Lang.T("全部")) + ListPage.Esc(Lang.T(f.title)) + "</option>");
+                string rest = f.options;
+                while (rest.Length > 0) {
+                    string pair = rest;
+                    int comma = rest.IndexOf(",");
+                    if (comma >= 0) { pair = rest.Substring(0, comma); rest = rest.Substring(comma + 1); }
+                    else { rest = ""; }
+                    int eq = pair.IndexOf("=");
+                    if (eq <= 0) { continue; }
+                    string v = pair.Substring(0, eq);
+                    string label = pair.Substring(eq + 1);
+                    sb.Append("<option value=\"" + ListPage.Esc(v) + "\""
+                        + (v == cur ? " selected" : "") + ">"
+                        + ListPage.Esc(Lang.T(label)) + "</option>");
+                }
+                sb.Append("</select>\n");
+            } else if (f.type == "time") {
+                sb.Append("  <input class=\"input w130\" type=\"date\" name=\"" + f.name + "From\" value=\""
+                    + ListPage.Esc(c.In(f.name + "From")) + "\">");
+                sb.Append("<span class=\"muted\">~</span>");
+                sb.Append("  <input class=\"input w130\" type=\"date\" name=\"" + f.name + "To\" value=\""
+                    + ListPage.Esc(c.In(f.name + "To")) + "\">\n");
+            } else if (f.type == "pick") {
+                sb.Append("  <span class=\"pick\" data-pick=\"" + ListPage.Esc(f.url) + "\">");
+                sb.Append("<input type=\"hidden\" name=\"" + f.name + "\" value=\""
+                    + ListPage.Esc(c.In(f.name)) + "\">");
+                sb.Append("<input class=\"input w150\" type=\"search\" placeholder=\""
+                    + ListPage.Esc(Lang.T(f.title)) + "\" data-pick-box autocomplete=\"off\">");
+                sb.Append("<button class=\"btn sm\" type=\"button\" data-pick-clear=\""
+                    + f.name + "\">×</button>");
+                sb.Append("</span>\n");
+            }
+        }
+        sb.Append("  <button class=\"btn sm\" type=\"submit\">" + ListPage.Esc(Lang.T("查询")) + "</button>\n");
+        sb.Append("  <a class=\"btn sm\" href=\"" + ListPage.Esc(action) + "\" data-load>"
+            + ListPage.Esc(Lang.T("重置")) + "</a>\n");
+        sb.Append("</form>\n");
+        d.Set("searchHtml", sb.ToString());
+        d.Set("hasSearch", "1");
+    }
+
+    /* 整段工具栏 HTML 放入 d 的 toolbarHtml。add 是 data-dialog 弹窗，
+       批量键是 data-batch（admin.js 汇集行选择后 POST）。 */
+    void Toolbar(ViewData d) {
+        if (this.bs.Count == 0) { return; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<div class=\"tbar\">\n");
+        for (int i = 0; i < this.bs.Count; i = i + 1) {
+            ListButton b = this.bs[i];
+            if (b.type == "sep") {
+                sb.Append("  <span class=\"tbar-sep\"></span>\n");
+            } else if (b.type == "add") {
+                sb.Append("  <a class=\"btn sm primary\" href=\"" + ListPage.Esc(b.url)
+                    + "\" data-dialog>" + ListPage.Esc(Lang.T(b.name)) + "</a>\n");
+            } else if (b.type == "reload") {
+                sb.Append("  <a class=\"btn sm\" href=\"#\" data-refresh>"
+                    + ListPage.Esc(Lang.T(b.name)) + "</a>\n");
+            } else if (b.type == "batch") {
+                sb.Append("  <a class=\"btn sm" + (b.name == "删除" ? " danger" : "")
+                    + "\" href=\"#\" data-batch=\"" + ListPage.Esc(b.url) + "\"");
+                if (b.value.Length > 0) { sb.Append(" data-value=\"" + ListPage.Esc(b.value) + "\""); }
+                if (b.confirm.Length > 0) { sb.Append(" data-confirm=\"" + ListPage.Esc(Lang.T(b.confirm)) + "\""); }
+                sb.Append(">" + ListPage.Esc(Lang.T(b.name)) + "</a>\n");
+            } else {
+                sb.Append("  <a class=\"btn sm\" href=\"" + ListPage.Esc(b.url) + "\"");
+                if (b.confirm.Length > 0) { sb.Append(" data-confirm=\"" + ListPage.Esc(Lang.T(b.confirm)) + "\""); }
+                sb.Append(">" + ListPage.Esc(Lang.T(b.name)) + "</a>\n");
+            }
+        }
+        sb.Append("</div>\n");
+        d.Set("toolbarHtml", sb.ToString());
+    }
+
+    /* 保留全部条件的分页链接：?page=2&limit=20&kw=..&status=1&..。
+       分页不再丢筛选——旧版手工拼 kw 的 href 是这个坑的残留。 */
+    string Query(List<ListCond> conds, int page, int limit) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("?page=" + Convert.ToString(page) + "&limit=" + Convert.ToString(limit));
+        for (int i = 0; i < conds.Count; i = i + 1) {
+            sb.Append("&" + conds[i].name + "=" + Encoding.UrlEncode(conds[i].value));
+        }
+        return sb.ToString();
+    }
+
+    /* HTML 文本转义：& < > " '。回填输入框与属性值必经此。 */
+    static string Esc(string s) {
+        if (s == null) { return ""; }
+        string r = s;
+        r = r.Replace("&", "&amp;");
+        r = r.Replace("<", "&lt;");
+        r = r.Replace(">", "&gt;");
+        r = r.Replace("\"", "&quot;");
+        r = r.Replace("'", "&#39;");
+        return r;
+    }
+}
+
+/* 搜索控件声明（见 ListPage）。 */
+class ListFilter {
+    string type;
+    string title;
+    string name;
+    string col;
+    string ph;
+    string options;
+    string url;
+}
+
+/* 工具栏按钮声明（见 ListPage）。 */
+class ListButton {
+    string type;
+    string name;
+    string url;
+    string value;
+    string confirm;
+}
+
+/* 一次请求收集到的条件：name 是来源参数名（分页链接回填用），
+   col/kind/value 由 DAO 拼参数化 WHERE（col 声明于 ListPage，非用户输入）。 */
+class ListCond {
+    string name;
+    string col;
+    string kind;
+    string value;
+}
