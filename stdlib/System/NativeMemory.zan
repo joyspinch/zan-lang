@@ -179,4 +179,83 @@ class NativeMemory {
         }
         return -1;
     }
+
+    /// <summary>利用 AVX2/SSE2 硬件向量化扫描，快速检测连续原始内存是否全为 ASCII 字符（0..127）。</summary>
+    public static bool IsAscii(nint p, int len) {
+        if (p == 0 || len <= 0) return true;
+        int i = 0;
+        while (i + 32 <= len) {
+            Vector256 v = Vector256.Load(p + (nint)i);
+            int mask = Vector256.ExtractMostSignificantBits(v);
+            if (mask != 0) return false;
+            i = i + 32;
+        }
+        while (i + 16 <= len) {
+            Vector128 v = Vector128.Load(p + (nint)i);
+            int mask = Vector128.ExtractMostSignificantBits(v);
+            if (mask != 0) return false;
+            i = i + 16;
+        }
+        Span<byte> sp = new Span<byte>(p, len);
+        while (i < len) {
+            if (sp[i] >= 128) return false;
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /// <summary>利用 AVX2/SSE2 硬件向量化并发匹配两个目标字节中的任意一个（例如快速扫描 \r 或 \n，引号或反斜杠）。</summary>
+    public static int IndexOfAny(nint p, int len, byte val1, byte val2) {
+        if (p == 0 || len <= 0) return -1;
+        int i = 0;
+        Vector256 t1_256 = Vector256.Create(val1);
+        Vector256 t2_256 = Vector256.Create(val2);
+        while (i + 32 <= len) {
+            Vector256 v = Vector256.Load(p + (nint)i);
+            Vector256 eq1 = Vector256.Equals(v, t1_256);
+            Vector256 eq2 = Vector256.Equals(v, t2_256);
+            Vector256 combined = Vector256.Or(eq1, eq2);
+            int mask = Vector256.ExtractMostSignificantBits(combined);
+            if (mask != 0) {
+                return i + BitOperations.TrailingZeroCount(mask);
+            }
+            i = i + 32;
+        }
+        Vector128 t1_128 = Vector128.Create(val1);
+        Vector128 t2_128 = Vector128.Create(val2);
+        while (i + 16 <= len) {
+            Vector128 v = Vector128.Load(p + (nint)i);
+            Vector128 eq1 = Vector128.Equals(v, t1_128);
+            Vector128 eq2 = Vector128.Equals(v, t2_128);
+            Vector128 combined = Vector128.Or(eq1, eq2);
+            int mask = Vector128.ExtractMostSignificantBits(combined);
+            if (mask != 0) {
+                return i + BitOperations.TrailingZeroCount(mask);
+            }
+            i = i + 16;
+        }
+        Span<byte> sp = new Span<byte>(p, len);
+        while (i < len) {
+            byte b = sp[i];
+            if (b == val1 || b == val2) return i;
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// <summary>SwissTable 16 字节控制组并发探测：单周期匹配 16 个槽位的 H2 标签，返回 16 位匹配掩码。</summary>
+    public static int MatchGroup16(nint groupPtr, byte targetH2) {
+        if (groupPtr == 0) return 0;
+        Vector128 g = Vector128.Load(groupPtr);
+        Vector128 t = Vector128.Create(targetH2);
+        Vector128 eq = Vector128.Equals(g, t);
+        return Vector128.ExtractMostSignificantBits(eq);
+    }
+
+    /// <summary>SwissTable 16 字节控制组空槽探测：提取最高位为 1（0x80 Empty / 0xFE Deleted）的所有槽位掩码。</summary>
+    public static int MatchEmpty16(nint groupPtr) {
+        if (groupPtr == 0) return 0;
+        Vector128 g = Vector128.Load(groupPtr);
+        return Vector128.ExtractMostSignificantBits(g);
+    }
 }

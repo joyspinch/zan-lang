@@ -348,4 +348,104 @@ class ImageBuffer : IDisposable {
             i = i + 1;
         }
     }
+
+    /// <summary>高性能双向可分离均值盒式模糊（Box Blur，可用于毛玻璃特效与平滑）。
+    /// radius: 模糊半径（像素），必须 >= 1。
+    /// 采用定点数倒数乘法加速，彻底消除每像素除法开销。</summary>
+    public void BoxBlur(int radius) {
+        if (this.Pixels == 0 || this.Width <= 1 || this.Height <= 1 || radius <= 0) return;
+        int w = this.Width;
+        int h = this.Height;
+        int r = radius;
+        if (r > w - 1) r = w - 1;
+        if (r > h - 1) r = h - 1;
+
+        int totalBytes = w * h * 4;
+        nint temp = NativeMemory.Alloc(totalBytes);
+        if (temp == 0) return;
+
+        Span<byte> srcSp = new Span<byte>(this.Pixels, totalBytes);
+        Span<byte> tmpSp = new Span<byte>(temp, totalBytes);
+
+        int winSize = 2 * r + 1;
+        // 定点数乘法比例因子 (1 << 16) / winSize
+        int invWin = (1 << 16) / winSize;
+
+        // 水平滤波通行：this.Pixels -> temp
+        for (int y = 0; y < h; y = y + 1) {
+            int rowOff = y * w * 4;
+            int sumA = 0; int sumR = 0; int sumG = 0; int sumB = 0;
+
+            for (int k = -r; k <= r; k = k + 1) {
+                int px = k;
+                if (px < 0) px = 0;
+                else if (px >= w) px = w - 1;
+                int pOff = rowOff + px * 4;
+                sumB = sumB + (int)srcSp[pOff + 0];
+                sumG = sumG + (int)srcSp[pOff + 1];
+                sumR = sumR + (int)srcSp[pOff + 2];
+                sumA = sumA + (int)srcSp[pOff + 3];
+            }
+
+            for (int x = 0; x < w; x = x + 1) {
+                int dstOff = rowOff + x * 4;
+                tmpSp[dstOff + 0] = (byte)((sumB * invWin) >> 16);
+                tmpSp[dstOff + 1] = (byte)((sumG * invWin) >> 16);
+                tmpSp[dstOff + 2] = (byte)((sumR * invWin) >> 16);
+                tmpSp[dstOff + 3] = (byte)((sumA * invWin) >> 16);
+
+                int enteringX = x + r + 1;
+                if (enteringX >= w) enteringX = w - 1;
+                int leavingX = x - r;
+                if (leavingX < 0) leavingX = 0;
+
+                int enterOff = rowOff + enteringX * 4;
+                int leaveOff = rowOff + leavingX * 4;
+
+                sumB = sumB + (int)srcSp[enterOff + 0] - (int)srcSp[leaveOff + 0];
+                sumG = sumG + (int)srcSp[enterOff + 1] - (int)srcSp[leaveOff + 1];
+                sumR = sumR + (int)srcSp[enterOff + 2] - (int)srcSp[leaveOff + 2];
+                sumA = sumA + (int)srcSp[enterOff + 3] - (int)srcSp[leaveOff + 3];
+            }
+        }
+
+        // 垂直滤波通行：temp -> this.Pixels
+        for (int x = 0; x < w; x = x + 1) {
+            int sumA = 0; int sumR = 0; int sumG = 0; int sumB = 0;
+
+            for (int k = -r; k <= r; k = k + 1) {
+                int py = k;
+                if (py < 0) py = 0;
+                else if (py >= h) py = h - 1;
+                int pOff = py * w * 4 + x * 4;
+                sumB = sumB + (int)tmpSp[pOff + 0];
+                sumG = sumG + (int)tmpSp[pOff + 1];
+                sumR = sumR + (int)tmpSp[pOff + 2];
+                sumA = sumA + (int)tmpSp[pOff + 3];
+            }
+
+            for (int y = 0; y < h; y = y + 1) {
+                int dstOff = y * w * 4 + x * 4;
+                srcSp[dstOff + 0] = (byte)((sumB * invWin) >> 16);
+                srcSp[dstOff + 1] = (byte)((sumG * invWin) >> 16);
+                srcSp[dstOff + 2] = (byte)((sumR * invWin) >> 16);
+                srcSp[dstOff + 3] = (byte)((sumA * invWin) >> 16);
+
+                int enteringY = y + r + 1;
+                if (enteringY >= h) enteringY = h - 1;
+                int leavingY = y - r;
+                if (leavingY < 0) leavingY = 0;
+
+                int enterOff = enteringY * w * 4 + x * 4;
+                int leaveOff = leavingY * w * 4 + x * 4;
+
+                sumB = sumB + (int)tmpSp[enterOff + 0] - (int)tmpSp[leaveOff + 0];
+                sumG = sumG + (int)tmpSp[enterOff + 1] - (int)tmpSp[leaveOff + 1];
+                sumR = sumR + (int)tmpSp[enterOff + 2] - (int)tmpSp[leaveOff + 2];
+                sumA = sumA + (int)tmpSp[enterOff + 3] - (int)tmpSp[leaveOff + 3];
+            }
+        }
+
+        NativeMemory.Free(temp);
+    }
 }

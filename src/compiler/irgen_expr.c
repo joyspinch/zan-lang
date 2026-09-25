@@ -1829,6 +1829,21 @@ static bool emit_vector128_call(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMValueRef res = LLVMBuildInsertValue(g->builder, LLVMGetUndef(st), low, 0, "s0");
             *out = LLVMBuildInsertValue(g->builder, res, high, 1, "s1");
             return true;
+        } else if (argc == 4) {
+            LLVMTypeRef f32t = LLVMFloatTypeInContext(g->ctx);
+            LLVMTypeRef v4f32 = LLVMVectorType(f32t, 4);
+            LLVMValueRef vec = LLVMGetUndef(v4f32);
+            for (int i = 0; i < 4; i++) {
+                LLVMValueRef elem = emit_expr(g, expr->call.args.items[i], locals);
+                if (LLVMGetTypeKind(LLVMTypeOf(elem)) == LLVMIntegerTypeKind) {
+                    elem = LLVMBuildSIToFP(g->builder, elem, f32t, "s2f");
+                } else if (LLVMTypeOf(elem) != f32t) {
+                    elem = LLVMBuildFPCast(g->builder, elem, f32t, "fpcast");
+                }
+                vec = LLVMBuildInsertElement(g->builder, vec, elem, LLVMConstInt(i32t, i, 0), "v4f_ins");
+            }
+            *out = v4f32_to_vec128(g, vec);
+            return true;
         }
     }
 

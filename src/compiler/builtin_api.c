@@ -225,6 +225,7 @@ static const zan_builtin_member_t members_vector128[] = {
     { "Prefetch",                     'M', "void Prefetch(nint address)" },
     { "Prefetch",                     'M', "void Prefetch(byte[] source, int offset)" },
     { "Create",                       'M', "Vector128 Create(float value)" },
+    { "Create",                       'M', "Vector128 Create(float e0, float e1, float e2, float e3)" },
     { "AddFloat",                     'M', "Vector128 AddFloat(Vector128 left, Vector128 right)" },
     { "SubtractFloat",                'M', "Vector128 SubtractFloat(Vector128 left, Vector128 right)" },
     { "Multiply",                     'M', "Vector128 Multiply(Vector128 left, Vector128 right)" },

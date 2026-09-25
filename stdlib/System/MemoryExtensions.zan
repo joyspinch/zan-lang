@@ -113,4 +113,196 @@ class MemoryExtensions {
     public static bool Contains(this byte[] source, byte value) {
         return MemoryExtensions.IndexOf(source, value, 0) >= 0;
     }
+
+    /// <summary>检查指定字节序列切片是否全为 ASCII 字符（0..127）。AVX2 32 字节并行扫描高位掩码（vpmovmskb == 0）。</summary>
+    public static bool IsAscii(this byte[] source, int offset, int length) {
+        if (source == null || length <= 0) return true;
+        int end = offset + length;
+        if (end > source.Length) end = source.Length;
+        int i = offset;
+
+        while (i + 32 <= end) {
+            Vector256 v = Vector256.Load(source, i);
+            int mask = Vector256.ExtractMostSignificantBits(v);
+            if (mask != 0) return false;
+            i = i + 32;
+        }
+
+        while (i + 16 <= end) {
+            Vector128 v = Vector128.Load(source, i);
+            int mask = Vector128.ExtractMostSignificantBits(v);
+            if (mask != 0) return false;
+            i = i + 16;
+        }
+
+        while (i < end) {
+            if (source[i] >= 128) return false;
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /// <summary>检查整段字节序列是否全为 ASCII 字符（0..127）。</summary>
+    public static bool IsAscii(this byte[] source) {
+        if (source == null) return true;
+        return MemoryExtensions.IsAscii(source, 0, source.Length);
+    }
+
+    /// <summary>在字节序列中并发查找两个目标字节中的任意一个匹配项（例如快速扫描 \r 或 \n，引号或反斜杠）。AVX2 32 字节双目标单周期比对。</summary>
+    public static int IndexOfAny(this byte[] source, byte value1, byte value2, int startIndex) {
+        if (source == null) return -1;
+        int n = source.Length;
+        if (startIndex < 0) startIndex = 0;
+        int i = startIndex;
+        Vector256 t1_256 = Vector256.Create(value1);
+        Vector256 t2_256 = Vector256.Create(value2);
+
+        while (i + 32 <= n) {
+            Vector256 v = Vector256.Load(source, i);
+            Vector256 eq1 = Vector256.Equals(v, t1_256);
+            Vector256 eq2 = Vector256.Equals(v, t2_256);
+            Vector256 combined = Vector256.Or(eq1, eq2);
+            int mask = Vector256.ExtractMostSignificantBits(combined);
+            if (mask != 0) {
+                int bit = BitOperations.TrailingZeroCount(mask);
+                return i + bit;
+            }
+            i = i + 32;
+        }
+
+        Vector128 t1_128 = Vector128.Create(value1);
+        Vector128 t2_128 = Vector128.Create(value2);
+        while (i + 16 <= n) {
+            Vector128 v = Vector128.Load(source, i);
+            Vector128 eq1 = Vector128.Equals(v, t1_128);
+            Vector128 eq2 = Vector128.Equals(v, t2_128);
+            Vector128 combined = Vector128.Or(eq1, eq2);
+            int mask = Vector128.ExtractMostSignificantBits(combined);
+            if (mask != 0) {
+                int bit = BitOperations.TrailingZeroCount(mask);
+                return i + bit;
+            }
+            i = i + 16;
+        }
+
+        while (i < n) {
+            byte b = source[i];
+            if (b == value1 || b == value2) return i;
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// <summary>在字节序列中查找两个目标字节中的任意一个匹配项。</summary>
+    public static int IndexOfAny(this byte[] source, byte value1, byte value2) {
+        return MemoryExtensions.IndexOfAny(source, value1, value2, 0);
+    }
+
+    /// <summary>将指定切片内的 ASCII 小写字母（a-z）就地转换为大写字母（A-Z）。AVX2 32 字节无分支饱和算术并行变换。</summary>
+    public static void ToUpperAscii(this byte[] source, int offset, int length) {
+        if (source == null || length <= 0) return;
+        int end = offset + length;
+        if (end > source.Length) end = source.Length;
+        int i = offset;
+
+        Vector256 baseA_256 = Vector256.Create((byte)97);
+        Vector256 range25_256 = Vector256.Create((byte)25);
+        Vector256 bit32_256 = Vector256.Create((byte)32);
+        Vector256 zero_256 = Vector256.Zero;
+
+        while (i + 32 <= end) {
+            Vector256 v = Vector256.Load(source, i);
+            Vector256 off = Vector256.Subtract(v, baseA_256);
+            Vector256 sat = Vector256.SubtractSaturate(off, range25_256);
+            Vector256 isLower = Vector256.Equals(sat, zero_256);
+            Vector256 mask = Vector256.And(isLower, bit32_256);
+            Vector256 upper = Vector256.Xor(v, mask);
+            Vector256.Store(source, i, upper);
+            i = i + 32;
+        }
+
+        Vector128 baseA_128 = Vector128.Create((byte)97);
+        Vector128 range25_128 = Vector128.Create((byte)25);
+        Vector128 bit32_128 = Vector128.Create((byte)32);
+        Vector128 zero_128 = Vector128.Zero;
+
+        while (i + 16 <= end) {
+            Vector128 v = Vector128.Load(source, i);
+            Vector128 off = Vector128.Subtract(v, baseA_128);
+            Vector128 sat = Vector128.SubtractSaturate(off, range25_128);
+            Vector128 isLower = Vector128.Equals(sat, zero_128);
+            Vector128 mask = Vector128.And(isLower, bit32_128);
+            Vector128 upper = Vector128.Xor(v, mask);
+            Vector128.Store(source, i, upper);
+            i = i + 16;
+        }
+
+        while (i < end) {
+            byte b = source[i];
+            if (b >= 97 && b <= 122) {
+                source[i] = (byte)(b - 32);
+            }
+            i = i + 1;
+        }
+    }
+
+    /// <summary>将整段字节序列内的 ASCII 小写字母（a-z）就地转换为大写字母（A-Z）。</summary>
+    public static void ToUpperAscii(this byte[] source) {
+        if (source == null) return;
+        MemoryExtensions.ToUpperAscii(source, 0, source.Length);
+    }
+
+    /// <summary>将指定切片内的 ASCII 大写字母（A-Z）就地转换为小写字母（a-z）。AVX2 32 字节无分支饱和算术并行变换。</summary>
+    public static void ToLowerAscii(this byte[] source, int offset, int length) {
+        if (source == null || length <= 0) return;
+        int end = offset + length;
+        if (end > source.Length) end = source.Length;
+        int i = offset;
+
+        Vector256 baseA_256 = Vector256.Create((byte)65);
+        Vector256 range25_256 = Vector256.Create((byte)25);
+        Vector256 bit32_256 = Vector256.Create((byte)32);
+        Vector256 zero_256 = Vector256.Zero;
+
+        while (i + 32 <= end) {
+            Vector256 v = Vector256.Load(source, i);
+            Vector256 off = Vector256.Subtract(v, baseA_256);
+            Vector256 sat = Vector256.SubtractSaturate(off, range25_256);
+            Vector256 isUpper = Vector256.Equals(sat, zero_256);
+            Vector256 mask = Vector256.And(isUpper, bit32_256);
+            Vector256 lower = Vector256.Or(v, mask);
+            Vector256.Store(source, i, lower);
+            i = i + 32;
+        }
+
+        Vector128 baseA_128 = Vector128.Create((byte)65);
+        Vector128 range25_128 = Vector128.Create((byte)25);
+        Vector128 bit32_128 = Vector128.Create((byte)32);
+        Vector128 zero_128 = Vector128.Zero;
+
+        while (i + 16 <= end) {
+            Vector128 v = Vector128.Load(source, i);
+            Vector128 off = Vector128.Subtract(v, baseA_128);
+            Vector128 sat = Vector128.SubtractSaturate(off, range25_128);
+            Vector128 isUpper = Vector128.Equals(sat, zero_128);
+            Vector128 mask = Vector128.And(isUpper, bit32_128);
+            Vector128 lower = Vector128.Or(v, mask);
+            Vector128.Store(source, i, lower);
+            i = i + 16;
+        }
+
+        while (i < end) {
+            byte b = source[i];
+            if (b >= 65 && b <= 90) {
+                source[i] = (byte)(b + 32);
+            }
+            i = i + 1;
+        }
+    }
+
+    /// <summary>将整段字节序列内的 ASCII 大写字母（A-Z）就地转换为小写字母（a-z）。</summary>
+    public static void ToLowerAscii(this byte[] source) {
+        if (source == null) return;
+        MemoryExtensions.ToLowerAscii(source, 0, source.Length);
+    }
 }
