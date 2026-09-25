@@ -1,0 +1,194 @@
+using System;
+using System.Web;
+using System.Data;
+using System.Data.Orm;
+using System.Collections.Generic;
+using System.Json;
+using ZanWeb.Dao;
+
+namespace ZanWeb.Web;
+
+/// <summary>
+/// 泛型统一 CURD 控制器基类：
+/// 驱动通用前端视图 vlist/index.vue (<ZanTable>)，对接 adminUI 10 大标准 CRUD 协议端点：
+/// - Conf: PUT {apiObj}/conf
+/// - List: POST {apiObj}/list
+/// - Add: GET {apiObj}/add
+/// - AddSave: POST {apiObj}/addsave
+/// - Edit: GET {apiObj}/edit
+/// - EditSave: POST {apiObj}/editsave
+/// - Field: POST {apiObj}/field
+/// - BatchField: POST {apiObj}/batchfield
+/// - Delete: POST {apiObj}/delete
+/// - BatchDelete: POST {apiObj}/batchdelete
+/// - Options: GET {apiObj}/options
+/// </summary>
+public class CurdController<TModel, TDao> : ApiController where TDao : BaseDao<TModel> {
+    protected TDao dao;
+
+    public TDao Dao() {
+        if (this.dao == null) {
+            this.dao = new TDao(this);
+        }
+        return this.dao;
+    }
+
+    /// <summary>
+    /// 获取当前模块的表格与表单元数据配置（子类重写覆盖以定义列、筛选、按钮与选项卡）
+    /// </summary>
+    public virtual TableConfig GetTableConfig() {
+        TableConfig cfg = new TableConfig();
+        cfg.conf = new TableConf();
+        cfg.conf.innerName = "数据列表";
+        cfg.conf.innerKey = "id";
+        cfg.columns = new List<TableColumn>();
+        cfg.filters = new List<TableFilter>();
+        cfg.tools = new List<TableColumnButton>();
+        cfg.tabs = new List<TableTab>();
+        return cfg;
+    }
+
+    /// <summary>
+    /// PUT {apiObj}/conf - 对应 ZanTable 的表头元数据配置接口
+    /// </summary>
+    public virtual void Conf() {
+        TableConfig cfg = this.GetTableConfig();
+        this.Ok(cfg.ToJson());
+    }
+
+    /// <summary>
+    /// POST {apiObj}/list - 对应 ZanTable 的分页列表数据接口
+    /// </summary>
+    public virtual async void List() {
+        string body = this.Body();
+        PostData post = PostData.FromJson(body);
+        ResponseList<TModel> res = await this.GetPageList(post);
+        if (res != null) {
+            this.Ok(res.ToJson());
+        } else {
+            this.Ok("{\"total\":0,\"page\":1,\"pageSize\":20,\"data\":[]}");
+        }
+    }
+
+    /// <summary>
+    /// 默认分页获取数据，子类重写提供特定查询
+    /// </summary>
+    public virtual async ResponseList<TModel> GetPageList(PostData post) {
+        return null;
+    }
+
+    /// <summary>
+    /// POST {apiObj}/field - 单字段行内快改（状态开关、单元格快改）
+    /// </summary>
+    public virtual async void Field() {
+        string body = this.Body();
+        FieldPostData data = FieldPostData.FromJson(body);
+        if (data == null || data.id == 0 || data.field == null || data.field.Length == 0) {
+            this.Fail(400, "参数错误");
+            return;
+        }
+        int n = await this.UpdateField(data.id, data.field, data.value);
+        if (n > 0) {
+            this.Ok(Convert.ToString(n));
+        } else {
+            this.Fail(500, "保存失败");
+        }
+    }
+
+    /// <summary>
+    /// 单字段更新实现（默认转发给 DAO）
+    /// </summary>
+    public virtual async int UpdateField(int id, string field, string value) {
+        TDao d = this.Dao();
+        if (d == null) { return 0; }
+        return await d.UpdateFieldAsync(id, field, value);
+    }
+
+    /// <summary>
+    /// POST {apiObj}/batchfield - 批量字段快改（批量启禁、批量改状态）
+    /// </summary>
+    public virtual async void BatchField() {
+        string body = this.Body();
+        FieldPostData data = FieldPostData.FromJson(body);
+        if (data == null || data.ids == null || data.ids.Count == 0 || data.field == null || data.field.Length == 0) {
+            this.Fail(400, "参数错误或未选定记录");
+            return;
+        }
+        int n = await this.BatchUpdateField(data.ids, data.field, data.value);
+        if (n > 0) {
+            this.Ok(Convert.ToString(n));
+        } else {
+            this.Fail(500, "批量保存失败");
+        }
+    }
+
+    /// <summary>
+    /// 批量字段更新实现（默认转发给 DAO）
+    /// </summary>
+    public virtual async int BatchUpdateField(List<int> ids, string field, string value) {
+        TDao d = this.Dao();
+        if (d == null) { return 0; }
+        return await d.BatchUpdateFieldAsync(ids, field, value);
+    }
+
+    /// <summary>
+    /// POST {apiObj}/delete - 单行删除
+    /// </summary>
+    public virtual async void Delete() {
+        string body = this.Body();
+        FieldPostData data = FieldPostData.FromJson(body);
+        if (data == null || data.id == 0) {
+            this.Fail(400, "未指定记录ID");
+            return;
+        }
+        int n = await this.DeleteById(data.id);
+        if (n > 0) {
+            this.Ok(Convert.ToString(n));
+        } else {
+            this.Fail(500, "删除失败");
+        }
+    }
+
+    /// <summary>
+    /// 单行删除实现（默认转发给 DAO）
+    /// </summary>
+    public virtual async int DeleteById(int id) {
+        TDao d = this.Dao();
+        if (d == null) { return 0; }
+        return await d.DeleteByIdAsync(id);
+    }
+
+    /// <summary>
+    /// POST {apiObj}/batchdelete - 批量删除
+    /// </summary>
+    public virtual async void BatchDelete() {
+        string body = this.Body();
+        FieldPostData data = FieldPostData.FromJson(body);
+        if (data == null || data.ids == null || data.ids.Count == 0) {
+            this.Fail(400, "未选择记录");
+            return;
+        }
+        int n = await this.DeleteByIds(data.ids);
+        if (n > 0) {
+            this.Ok(Convert.ToString(n));
+        } else {
+            this.Fail(500, "批量删除失败");
+        }
+    }
+
+    /// <summary>
+    /// 批量删除实现（默认转发给 DAO）
+    /// </summary>
+    public virtual async int DeleteByIds(List<int> ids) {
+        TDao d = this.Dao();
+        if (d == null) { return 0; }
+        return await d.DeleteByIdsAsync(ids);
+    }
+
+    /// <summary>
+    /// GET {apiObj}/options - 选项字典
+    /// </summary>
+    public virtual void Options() {
+        this.Ok("{}");
+    }
+}

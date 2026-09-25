@@ -166,8 +166,8 @@ class RedisClient {
         }
         if (this.inhead > 0) {
             int span = this.intail - this.inhead;
-            for (int k = 0; k < span; k = k + 1) {
-                this.inbuf[k] = this.inbuf[this.inhead + k];
+            if (span > 0) {
+                NativeMemory.Copy((nint)this.inbuf, (nint)this.inbuf + (nint)this.inhead, span);
             }
             this.inhead = 0;
             this.intail = span;
@@ -180,8 +180,8 @@ class RedisClient {
             ncap = ncap * 2;
         }
         byte[] nb = new byte[ncap + 1];
-        for (int j = 0; j < this.intail; j = j + 1) {
-            nb[j] = this.inbuf[j];
+        if (this.intail > 0) {
+            NativeMemory.Copy((nint)nb, (nint)this.inbuf, this.intail);
         }
         this.inbuf = nb;
         this.incap = ncap;
@@ -198,9 +198,7 @@ class RedisClient {
                 return 0;
             }
             this.ensureRoom(cl);
-            for (int k = 0; k < cl; k = k + 1) {
-                this.inbuf[this.intail + k] = (byte)(chunk[k] & 255);
-            }
+            NativeMemory.PutString((nint)this.inbuf, this.intail, chunk, cl);
             this.intail = this.intail + cl;
             return cl;
         }
@@ -210,9 +208,7 @@ class RedisClient {
             return 0;
         }
         this.ensureRoom(n);
-        for (int k = 0; k < n; k = k + 1) {
-            this.inbuf[this.intail + k] = this.tmp[k];
-        }
+        NativeMemory.Copy((nint)this.inbuf + (nint)this.intail, (nint)this.tmp, n);
         this.intail = this.intail + n;
         return n;
     }
@@ -230,19 +226,24 @@ class RedisClient {
     }
 
     /// <summary>从头游标处读取一行以 CRLF 结尾的行（不含 CRLF），
-    /// 需要时补读更多数据。对端
+    /// 借助 AVX2 向量化 IndexOf 快速跳过普通字节，需要时补读更多数据。对端
     /// 关闭时返回 null。</summary>
     async string readLine() {
         int scan = this.inhead;
         while (true) {
             while (scan + 1 < this.intail) {
-                if (this.inbuf[scan] == 13 && this.inbuf[scan + 1] == 10) {
-                    int lineLen = scan - this.inhead;
+                int pos = MemoryExtensions.IndexOf(this.inbuf, (byte)13, scan, this.intail - scan);
+                if (pos < 0 || pos >= this.intail - 1) {
+                    scan = (pos == this.intail - 1) ? pos : this.intail;
+                    break;
+                }
+                if (this.inbuf[pos + 1] == 10) {
+                    int lineLen = pos - this.inhead;
                     string line = this.sliceBytes(this.inhead, lineLen);
-                    this.inhead = scan + 2;
+                    this.inhead = pos + 2;
                     return line;
                 }
-                scan = scan + 1;
+                scan = pos + 1;
             }
             int got = await this.fillMore();
             if (got == 0) {

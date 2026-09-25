@@ -4,6 +4,7 @@ using System.Net.Http;
 using System.Net.Tls;
 using System.Text;
 using System.Security.Cryptography;
+using System.Runtime.Intrinsics;
 
 namespace System.Net.WebSocket;
 
@@ -141,22 +142,8 @@ class WsFrame {
             buf[1] = (byte)this.payloadLen;
         }
 
-        int i = 0;
-        int limit = this.payloadLen - 7;
-        while (i < limit) {
-            buf[headerLen + i] = (byte)this.payload[i];
-            buf[headerLen + i + 1] = (byte)this.payload[i + 1];
-            buf[headerLen + i + 2] = (byte)this.payload[i + 2];
-            buf[headerLen + i + 3] = (byte)this.payload[i + 3];
-            buf[headerLen + i + 4] = (byte)this.payload[i + 4];
-            buf[headerLen + i + 5] = (byte)this.payload[i + 5];
-            buf[headerLen + i + 6] = (byte)this.payload[i + 6];
-            buf[headerLen + i + 7] = (byte)this.payload[i + 7];
-            i = i + 8;
-        }
-        while (i < this.payloadLen) {
-            buf[headerLen + i] = (byte)this.payload[i];
-            i = i + 1;
+        if (this.payloadLen > 0) {
+            NativeMemory.PutString((nint)buf, headerLen, this.payload, this.payloadLen);
         }
 
         return buf;
@@ -197,27 +184,50 @@ class WsFrame {
         for (int m = 0; m < 4; m = m + 1) { buf[pos + m] = mask[m]; }
         pos = pos + 4;
 
-        int m0 = mask[0] & 255;
-        int m1 = mask[1] & 255;
-        int m2 = mask[2] & 255;
-        int m3 = mask[3] & 255;
-        int iEnc = 0;
-        int limitEnc = this.payloadLen - 3;
-        while (iEnc < limitEnc) {
-            buf[pos + iEnc] = (byte)((this.payload[iEnc] & 255) ^ m0);
-            buf[pos + iEnc + 1] = (byte)((this.payload[iEnc + 1] & 255) ^ m1);
-            buf[pos + iEnc + 2] = (byte)((this.payload[iEnc + 2] & 255) ^ m2);
-            buf[pos + iEnc + 3] = (byte)((this.payload[iEnc + 3] & 255) ^ m3);
-            iEnc = iEnc + 4;
-        }
-        if (iEnc < this.payloadLen) {
-            buf[pos + iEnc] = (byte)((this.payload[iEnc] & 255) ^ m0);
-            iEnc = iEnc + 1;
+        if (this.payloadLen > 0) {
+            NativeMemory.PutString((nint)buf, pos, this.payload, this.payloadLen);
+
+            long m0 = (long)(mask[0] & 255);
+            long m1 = (long)(mask[1] & 255);
+            long m2 = (long)(mask[2] & 255);
+            long m3 = (long)(mask[3] & 255);
+            long k32 = m0 | (m1 << 8) | (m2 << 16) | (m3 << 24);
+            long k64 = k32 | (k32 << 32);
+
+            Vector256 mask256 = Vector256.Create(k64, k64, k64, k64);
+            Vector128 mask128 = Vector128.Create(k64, k64);
+
+            int iEnc = 0;
+            while (iEnc + 32 <= this.payloadLen) {
+                Vector256 v = Vector256.Load(buf, pos + iEnc);
+                v = Vector256.Xor(v, mask256);
+                Vector256.Store(buf, pos + iEnc, v);
+                iEnc = iEnc + 32;
+            }
+            while (iEnc + 16 <= this.payloadLen) {
+                Vector128 v128 = Vector128.Load(buf, pos + iEnc);
+                v128 = Vector128.Xor(v128, mask128);
+                Vector128.Store(buf, pos + iEnc, v128);
+                iEnc = iEnc + 16;
+            }
+            int limitEnc = this.payloadLen - 3;
+            int sm0 = (int)m0; int sm1 = (int)m1; int sm2 = (int)m2; int sm3 = (int)m3;
+            while (iEnc < limitEnc) {
+                buf[pos + iEnc] = (byte)((buf[pos + iEnc] & 255) ^ sm0);
+                buf[pos + iEnc + 1] = (byte)((buf[pos + iEnc + 1] & 255) ^ sm1);
+                buf[pos + iEnc + 2] = (byte)((buf[pos + iEnc + 2] & 255) ^ sm2);
+                buf[pos + iEnc + 3] = (byte)((buf[pos + iEnc + 3] & 255) ^ sm3);
+                iEnc = iEnc + 4;
+            }
             if (iEnc < this.payloadLen) {
-                buf[pos + iEnc] = (byte)((this.payload[iEnc] & 255) ^ m1);
+                buf[pos + iEnc] = (byte)((buf[pos + iEnc] & 255) ^ sm0);
                 iEnc = iEnc + 1;
                 if (iEnc < this.payloadLen) {
-                    buf[pos + iEnc] = (byte)((this.payload[iEnc] & 255) ^ m2);
+                    buf[pos + iEnc] = (byte)((buf[pos + iEnc] & 255) ^ sm1);
+                    iEnc = iEnc + 1;
+                    if (iEnc < this.payloadLen) {
+                        buf[pos + iEnc] = (byte)((buf[pos + iEnc] & 255) ^ sm2);
+                    }
                 }
             }
         }
@@ -290,30 +300,53 @@ class WsFrame {
         if (copyLen < 0) { copyLen = 0; }
 
         if (f.masked) {
-            int mask0 = data[offset] & 255;
-            int mask1 = data[offset + 1] & 255;
-            int mask2 = data[offset + 2] & 255;
-            int mask3 = data[offset + 3] & 255;
+            long m0 = (long)(data[offset] & 255);
+            long m1 = (long)(data[offset + 1] & 255);
+            long m2 = (long)(data[offset + 2] & 255);
+            long m3 = (long)(data[offset + 3] & 255);
             offset = offset + 4;
 
             byte[] payload = new byte[copyLen + 1];
-            int iDec = 0;
-            int limitDec = copyLen - 3;
-            while (iDec < limitDec) {
-                payload[iDec] = (byte)((data[offset + iDec] & 255) ^ mask0);
-                payload[iDec + 1] = (byte)((data[offset + iDec + 1] & 255) ^ mask1);
-                payload[iDec + 2] = (byte)((data[offset + iDec + 2] & 255) ^ mask2);
-                payload[iDec + 3] = (byte)((data[offset + iDec + 3] & 255) ^ mask3);
-                iDec = iDec + 4;
-            }
-            if (iDec < copyLen) {
-                payload[iDec] = (byte)((data[offset + iDec] & 255) ^ mask0);
-                iDec = iDec + 1;
+            if (copyLen > 0) {
+                NativeMemory.Copy((nint)payload, (nint)data + (nint)offset, copyLen);
+
+                long k32 = m0 | (m1 << 8) | (m2 << 16) | (m3 << 24);
+                long k64 = k32 | (k32 << 32);
+
+                Vector256 mask256 = Vector256.Create(k64, k64, k64, k64);
+                Vector128 mask128 = Vector128.Create(k64, k64);
+
+                int iDec = 0;
+                while (iDec + 32 <= copyLen) {
+                    Vector256 v = Vector256.Load(payload, iDec);
+                    v = Vector256.Xor(v, mask256);
+                    Vector256.Store(payload, iDec, v);
+                    iDec = iDec + 32;
+                }
+                while (iDec + 16 <= copyLen) {
+                    Vector128 v128 = Vector128.Load(payload, iDec);
+                    v128 = Vector128.Xor(v128, mask128);
+                    Vector128.Store(payload, iDec, v128);
+                    iDec = iDec + 16;
+                }
+                int limitDec = copyLen - 3;
+                int sm0 = (int)m0; int sm1 = (int)m1; int sm2 = (int)m2; int sm3 = (int)m3;
+                while (iDec < limitDec) {
+                    payload[iDec] = (byte)((payload[iDec] & 255) ^ sm0);
+                    payload[iDec + 1] = (byte)((payload[iDec + 1] & 255) ^ sm1);
+                    payload[iDec + 2] = (byte)((payload[iDec + 2] & 255) ^ sm2);
+                    payload[iDec + 3] = (byte)((payload[iDec + 3] & 255) ^ sm3);
+                    iDec = iDec + 4;
+                }
                 if (iDec < copyLen) {
-                    payload[iDec] = (byte)((data[offset + iDec] & 255) ^ mask1);
+                    payload[iDec] = (byte)((payload[iDec] & 255) ^ sm0);
                     iDec = iDec + 1;
                     if (iDec < copyLen) {
-                        payload[iDec] = (byte)((data[offset + iDec] & 255) ^ mask2);
+                        payload[iDec] = (byte)((payload[iDec] & 255) ^ sm1);
+                        iDec = iDec + 1;
+                        if (iDec < copyLen) {
+                            payload[iDec] = (byte)((payload[iDec] & 255) ^ sm2);
+                        }
                     }
                 }
             }
@@ -392,8 +425,8 @@ class WsReader {
     void Compact() {
         if (this.start == 0) { return; }
         int rem = this.len - this.start;
-        for (int i = 0; i < rem; i = i + 1) {
-            this.buf[i] = this.buf[this.start + i];
+        if (rem > 0) {
+            NativeMemory.Copy((nint)this.buf, (nint)this.buf + (nint)this.start, rem);
         }
         this.len = rem;
         this.start = 0;
@@ -405,9 +438,7 @@ class WsReader {
     void Prime(string data, int n) {
         if (n <= 0) { return; }
         this.Ensure(this.len + n);
-        for (int i = 0; i < n; i = i + 1) {
-            this.buf[this.len + i] = (byte)data[i];
-        }
+        NativeMemory.PutString((nint)this.buf, this.len, data, n);
         this.len = this.len + n;
     }
 
@@ -417,8 +448,8 @@ class WsReader {
         int nc = this.cap * 2;
         while (nc < need) { nc = nc * 2; }
         byte[] nb = new byte[nc + 1];
-        for (int i = 0; i < this.len; i = i + 1) {
-            nb[i] = this.buf[i];
+        if (this.len > 0) {
+            NativeMemory.Copy((nint)nb, (nint)this.buf, this.len);
         }
         this.buf = nb;
         this.cap = nc;
@@ -436,9 +467,7 @@ class WsReader {
                 int tn = await this.tlsSrc.RecvIntoAsync(this.tmp, 65536);
                 if (tn <= 0) { return 0; }
                 this.Ensure(this.len + tn);
-                for (int i = 0; i < tn; i = i + 1) {
-                    this.buf[this.len + i] = this.tmp[i];
-                }
+                NativeMemory.Copy((nint)this.buf + (nint)this.len, (nint)this.tmp, tn);
                 this.len = this.len + tn;
                 got = tn;
                 continue;
@@ -461,9 +490,7 @@ class WsReader {
                 n = Socket.Recv(this.sock, this.tmp, 65536);
                 if (n > 0) {
                     this.Ensure(this.len + n);
-                    for (int i = 0; i < n; i = i + 1) {
-                        this.buf[this.len + i] = this.tmp[i];
-                    }
+                    NativeMemory.Copy((nint)this.buf + (nint)this.len, (nint)this.tmp, n);
                     this.len = this.len + n;
                     got = n;
                 } else if (n == 0) {
@@ -503,9 +530,7 @@ class WsReader {
         n = await Socket.RecvToOv(this.sock, this.tmp, 65536, timeoutMs);
         if (n > 0) {
             this.Ensure(this.len + n);
-            for (int i = 0; i < n; i = i + 1) {
-                this.buf[this.len + i] = this.tmp[i];
-            }
+            NativeMemory.Copy((nint)this.buf + (nint)this.len, (nint)this.tmp, n);
             this.len = this.len + n;
         }
         return n < 0 ? 0 - 1 : n;
@@ -556,39 +581,42 @@ class WsReader {
     }
 
     /// <summary>在缓冲的未读字节里扫描 HTTP 头部结束标记
-    /// （CRLFCRLF）。返回相对游标的偏移；未找到返回 -1。
+    /// （CRLFCRLF）。借助 AVX2 向量化 IndexOf 快速跳过普通字节。
+    /// 返回相对游标的偏移；未找到返回 -1。
     /// 握手与首帧常在同一段到达，而帧字节可能含 NUL，
     /// 因此扫描必须按字节下标进行，不能走字符串长度。</summary>
     int FindHeaderEnd() {
         int last = this.len - 4;
-        for (int i = this.start; i <= last; i = i + 1) {
-            if ((this.buf[i] & 255) == 13 && (this.buf[i + 1] & 255) == 10
-                && (this.buf[i + 2] & 255) == 13 && (this.buf[i + 3] & 255) == 10) {
-                return i - this.start;
+        int i = this.start;
+        while (i <= last) {
+            int pos = MemoryExtensions.IndexOf(this.buf, (byte)13, i, last + 1 - i);
+            if (pos < 0 || pos > last) {
+                return 0 - 1;
             }
+            if ((this.buf[pos + 1] & 255) == 10
+                && (this.buf[pos + 2] & 255) == 13
+                && (this.buf[pos + 3] & 255) == 10) {
+                return pos - this.start;
+            }
+            i = pos + 1;
         }
         return 0 - 1;
     }
 
     /// <summary>取出游标处 n 个字节，作为显式长度的字符串
-    /// （不推进游标）。头部是文本，但同一缓冲里可能已带有
-    /// 含 NUL 的帧字节——长度必须显式传递，不能用 strlen。</summary>
+    /// （不推进游标）。零额外堆分配拷贝。</summary>
     string Slice(int n) {
-        byte[] outp = new byte[n + 1];
-        for (int i = 0; i < n; i = i + 1) {
-            outp[i] = this.buf[this.start + i];
-        }
-        return outp.ToStr(0, n);
+        if (n <= 0) { return ""; }
+        return this.buf.ToStr(this.start, n);
     }
 
     /// <summary>把外部收到的字节（例如 TLS 流解密出的明文）
     /// 追加到累积缓冲区，绕过套接字。</summary>
     void Append(string data, int n) {
+        if (n <= 0) { return; }
         this.Compact();
         this.Ensure(this.len + n);
-        for (int i = 0; i < n; i = i + 1) {
-            this.buf[this.len + i] = (byte)data[i];
-        }
+        NativeMemory.PutString((nint)this.buf, this.len, data, n);
         this.len = this.len + n;
     }
 
@@ -629,8 +657,8 @@ class WsWriter {
         int nc = this.cap * 2;
         while (nc < need) { nc = nc * 2; }
         byte[] nb = new byte[nc + 1];
-        for (int i = 0; i < this.len; i = i + 1) {
-            nb[i] = this.buf[i];
+        if (this.len > 0) {
+            NativeMemory.Copy((nint)nb, (nint)this.buf, this.len);
         }
         this.buf = nb;
         this.cap = nc;
@@ -638,10 +666,9 @@ class WsWriter {
 
     /// 追加编码后帧的 `n` 个字节。
     void Append(string data, int n) {
+        if (n <= 0) { return; }
         this.Ensure(this.len + n);
-        for (int i = 0; i < n; i = i + 1) {
-            this.buf[this.len + i] = (byte)data[i];
-        }
+        NativeMemory.PutString((nint)this.buf, this.len, data, n);
         this.len = this.len + n;
     }
 
@@ -719,14 +746,14 @@ class WsAssembler {
             }
             if (cap != this.bufCap) {
                 byte[] nb = new byte[cap + 1];
-                for (int i = 0; i < this.dataLen; i = i + 1) {
-                    nb[i] = (byte)this.data[i];
+                if (this.dataLen > 0) {
+                    NativeMemory.PutString((nint)nb, 0, this.data, this.dataLen);
                 }
                 this.dataBuf = nb;
                 this.bufCap = cap;
             }
-            for (int i = 0; i < frame.payloadLen; i = i + 1) {
-                this.dataBuf[this.dataLen + i] = (byte)frame.payload[i];
+            if (frame.payloadLen > 0) {
+                NativeMemory.PutString((nint)this.dataBuf, this.dataLen, frame.payload, frame.payloadLen);
             }
             // 显式长度转换：`+` 按 strlen 定长，会在第一个 NUL 处截断
             // 二进制负载；ToStr 按字节计数，NUL 原样保留。
