@@ -1,4 +1,5 @@
 using System;
+using System.Data;
 using System.Diagnostics;
 using System.Json;
 using System.Web;
@@ -7,13 +8,80 @@ using Zan.Web.Modules.Monitor;
 
 namespace Zan.Web.Core;
 
-/// Web/API 控制器基类：提供标准协议响应、多语言、输入解析及全链路监控打点
+/// Web/API 控制器基类：提供请求作用域连接托管、标准协议响应、多语言、输入解析及全链路监控打点
 class WebController : Controller {
     private long _reqStartMs = 0;
+    protected IDbConnection _lease;
+    protected bool _inTx = false;
+
+    /// 获取本次请求的独占数据库连接（首次调用借出，同请求复用，退出时自动归还）
+    public async IDbConnection Conn() {
+        if (_lease != null) { return _lease; }
+        _lease = Db.Connection();
+        return _lease;
+    }
+
+    /// 编译器表访问器和内建绑定所识别的连接挂钩
+    public IDbConnection __Conn() {
+        if (_lease != null) { return _lease; }
+        _lease = Db.Connection();
+        return _lease;
+    }
+
+    /// 本次请求数据库连接是否就绪
+    public bool DbReady() {
+        return _lease != null || Db.Connection() != null;
+    }
+
+    /// 开启请求作用域事务
+    public async bool Begin() {
+        IDbConnection db = await this.Conn();
+        if (db == null) { return false; }
+        if (_inTx) { return true; }
+        await db.BeginTransactionAsync();
+        _inTx = true;
+        return true;
+    }
+
+    /// 提交请求作用域事务
+    public async void Commit() {
+        if (!_inTx || _lease == null) { return; }
+        _inTx = false;
+        await _lease.CommitAsync();
+    }
+
+    /// 回滚请求作用域事务
+    public async void Rollback() {
+        if (!_inTx || _lease == null) { return; }
+        _inTx = false;
+        await _lease.RollbackAsync();
+    }
+
+    /// [Tx] 特性支持的生命周期蹦床
+    override async bool __TxBegin() { return await this.Begin(); }
+    override async void __TxCommit() { await this.Commit(); }
+    override async void __TxRollback() { await this.Rollback(); }
+
+    /// 请求执行前异步钩子：初始化计时与连接预热
+    override async bool OnBeforeAsync() {
+        _reqStartMs = Stopwatch.GetMilliseconds();
+        return this.OnBefore();
+    }
+
+    /// 请求完成后异步钩子：事务安全回滚、监控打点、连接归还
+    override async void OnAfterAsync() {
+        if (_lease != null) {
+            await this.Rollback();
+            _lease = null;
+        }
+        this.OnAfter();
+    }
 
     /// 请求执行前钩子：记录启动微秒级/毫秒级时间戳
     public override bool OnBefore() {
-        _reqStartMs = Stopwatch.GetMilliseconds();
+        if (_reqStartMs == 0) {
+            _reqStartMs = Stopwatch.GetMilliseconds();
+        }
         return true;
     }
 
