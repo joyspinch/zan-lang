@@ -1,0 +1,103 @@
+using System;
+using System.Collections.Generic;
+using Zan.Web.Auth.Model;
+using Zan.Web.Auth.Dao;
+
+namespace Zan.Web.Auth;
+
+/// 权限与动态路由管理器（RBAC 基座）
+class AuthManager {
+    private SysMenuDao _menuDao = new SysMenuDao();
+    private SysRoleMenuDao _roleMenuDao = new SysRoleMenuDao();
+
+    /// 判断指定角色是否有权访问指定节点/路由
+    public async bool CanAccess(int roleId, string node) {
+        // 超级管理员拥有全量特权通行
+        if (roleId == 1) {
+            return true;
+        }
+
+        if (node == null || node.Length == 0) {
+            return false;
+        }
+
+        List<int> menuIds = await _roleMenuDao.GetMenuIdsByRoleId(roleId);
+        if (menuIds == null || menuIds.Count == 0) {
+            return false;
+        }
+
+        List<SysMenu> menus = await _menuDao.ByIds(menuIds);
+        for (int i = 0; i < menus.Count; i++) {
+            if (menus[i].node == node) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// 获取角色的动态路由菜单树（供 adminUI 的 /api/conf/menu 端点消费）
+    public async List<RouteNode> GetMenuTree(int roleId) {
+        List<SysMenu> menus;
+        if (roleId == 1) {
+            menus = await _menuDao.All();
+        } else {
+            List<int> menuIds = await _roleMenuDao.GetMenuIdsByRoleId(roleId);
+            menus = await _menuDao.ByIds(menuIds);
+        }
+
+        return BuildRouteNodes(menus);
+    }
+
+    /// 将扁平 SysMenu 列表组装为树形层级 RouteNode 列表
+    public static List<RouteNode> BuildRouteNodes(List<SysMenu> menus) {
+        List<RouteNode> rootNodes = new List<RouteNode>();
+        if (menus == null || menus.Count == 0) {
+            return rootNodes;
+        }
+
+        Dict<string, RouteNode> nodeMap = new Dict<string, RouteNode>();
+
+        // 阶段一：映射并实例化全部节点
+        for (int i = 0; i < menus.Count; i++) {
+            SysMenu m = menus[i];
+            RouteNode node = new RouteNode();
+            node.path = m.node;
+            node.parentPath = m.parentNode;
+            node.name = m.title;
+            node.rank = m.rank;
+            node.component = m.component;
+
+            RouteNodeMeta meta = new RouteNodeMeta();
+            meta.hidden = m.hidden == 1;
+            meta.keepAlive = true;
+            meta.showLink = m.hidden != 1;
+            meta.rank = m.rank;
+            meta.routeKey = m.node;
+            meta.title = m.title;
+            meta.icon = m.icon;
+            node.meta = meta;
+
+            nodeMap[m.node] = node;
+        }
+
+        // 阶段二：建立父子层级引用
+        for (int i = 0; i < menus.Count; i++) {
+            SysMenu m = menus[i];
+            if (!nodeMap.ContainsKey(m.node)) {
+                continue;
+            }
+            RouteNode current = nodeMap[m.node];
+
+            if (current.parentPath == null || current.parentPath.Length == 0) {
+                rootNodes.Add(current);
+            } else if (nodeMap.ContainsKey(current.parentPath)) {
+                RouteNode parent = nodeMap[current.parentPath];
+                parent.children.Add(current);
+            } else {
+                rootNodes.Add(current);
+            }
+        }
+
+        return rootNodes;
+    }
+}
