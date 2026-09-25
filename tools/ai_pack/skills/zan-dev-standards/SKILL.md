@@ -48,19 +48,24 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
 - **UI 驱动用合成事件，不用真实 OS 点击**：driver 的 `clickid` 在点击时刻
   解析命中区中心并注入，天然免疫窗口框偏移；hit id 只在**同一次构建的
   同一次运行内**有效（控件增删会整体移位），点击前当场 dump。
-- **ZanWeb 模板实机核对五坑**（2026-09-25 ListPage/FormPage 验证，每条都白折腾过一轮）：
+- **ZanWeb 模板实机核对七坑**（2026-09-25 ListPage/FormPage/视觉重绘验证，每条都白折腾过一轮）：
   ① 静态资产挂在 `/static/*`（`StaticFiles.Mount(app, "/static", "wwwroot")`），
   curl `/js/x.js` 拿到的是 API 层 `{"code":"404"}` JSON——不是"服务了旧文件"，
-  先核对 URL 再怀疑缓存；② 改 wwwroot 的 JS/CSS 必须同步升 `views/Admin/layout.html`
+  先核对 URL 再怀疑缓存；② 改 wwwroot 的 JS/CSS 必须同步升布局模板
   里的 `?v=N`：资产响应带 `Cache-Control: max-age=3600`，浏览器缓存键含查询串，
   只 reload 页面拿不到新 JS（新代码 "确认加载" 要看执行中的函数源码或版本参数）；
   ③ `app.exe start` 会 daemon 出脱离启动任务的 worker，杀后台任务杀不掉它——
   重建 exe 报 `Permission denied`、旧进程继续占端口继续服务旧视图，须
-  `app.exe stop` 或按监听端口 PID 杀；④ config/views/wwwroot 按进程工作目录
+  `app.exe stop` **并按 netstat 确认监听端口 PID 已清**（stop 不干净时链接
+  照样 Permission denied）；④ config/views/wwwroot 按进程工作目录
   相对读取，起服务必须 cd 到发布目录，且 views 改动要重启才生效（视图缓存）；
-  ⑤ e2e 与手动实机核对共用 `_scratch` 沙箱目录时，e2e 收尾会按自己的端口重写
+  ⑤ e2e 与手动实机核对共用临时沙箱目录时，e2e 收尾会按自己的端口重写
   甚至留下"无 config"状态——手动起服务报"未配置会话密钥"这类假故障，先重新
-  生成沙箱 config 再查代码。
+  生成沙箱 config 再查代码；⑥ `--publish` 不落盘 views/wwwroot——运行时
+  从磁盘读，手动沙箱要自己把模板的 views/ wwwroot/ 拷进发布目录（e2e 也是
+  copytree 布置的），漏了就是整页 `<!-- view not found -->`；
+  ⑦ config `worker.daemon=false` 时 `app.exe restart` 会前台阻塞把脚本挂死——
+  起服务用 `(app.exe start > boot.log 2>&1 &)`，别用裸 restart。
 - **PowerShell 合成点击四连坑（PrintWindow 抓窗 + mouse_event 注入流）**：
   ① 进程必须先 `SetProcessDpiAwarenessContext(-4)`——DPI 不感知时
   `GetWindowRect`/`SetCursorPos` 全在虚拟化坐标系，注入点整体漂 1.5 倍；

@@ -90,6 +90,13 @@ Direct:
 <ZAN_SDK>/toolchain/zanc <entry.zan> --auto-stdlib --check-leaks -o build/app
 ```
 
+**多文件项目必须枚举全部 .zan 源**（2026-09-25 实证）：`--auto-stdlib` 只自动
+发现 stdlib/包命名空间，**不拉取同项目的兄弟 .zan**——单入口
+`zanc src/main.zan ...` 报 `unresolved call 'X': X is not a known variable,
+type, or namespace`（X 是项目内另一文件的类）时，先数源文件齐不齐：
+`zanc $(find src -name "*.zan") --auto-stdlib ...`（模板 e2e 套件就是这么
+枚举的）。别急着判编译器回归。
+
 Read `diagnostics[]` (file, line, column, message) and fix from the first one
 down: later errors are usually fallout.
 

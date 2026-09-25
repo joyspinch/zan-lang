@@ -1951,6 +1951,17 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   要编译"没有包的历史版本"做对照，必须把源码树和 zanc 一起搬到仓库外
   （exe 旁 `../packages` 也是发现面之一），runtime obj（build/*.obj）要
   随 zanc 同拷。
+- **worktree 快照 zanc 拿的是 worktree 的包副本**（2026-09-25 实证）：exe
+  兄弟目录发现面对 worktree 编译器同样生效——`_scratch/wt_xxx/build/zanc.exe`
+  会解析 `_scratch/wt_xxx/packages/`（快照提交态），仓库里**未提交**的包
+  改动编不进去，症状是"改了包源码、产物行为照旧"。用快照二进制编当前
+  工作区前，把在途的包文件同步进 worktree（`diff -q` 先验一遍）。
+- **编译器重 build 会使 ZanGen 自举缓存失效**（`AppData/Local/Zan/gen/`），
+  首编重新拉起 codegen 自举编译——zanc WIP 的类型检查回归（如 string→nint
+  误报，探针见 `NativeMemory.Compare(string, string, n)`，ByteBuffer.zan:399
+  即此用法）会在这一步显形，别误判成自己代码的问题；最小探针 + 已知好
+  二进制（如 `_scratch/wt-fd20/build/zanc.exe`）对照即可定位，多文件项目
+  编译时 e2e 预留 `ZANC=` 环境变量切换二进制。
 
 ## expr_yields_owned_rc_value 成员访问与返回值 ARC 所有权判定（2026-09-25）
 
