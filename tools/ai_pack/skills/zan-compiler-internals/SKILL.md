@@ -57,6 +57,7 @@ description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式�
 - **LLVM 内建硬件原语（BitOperations 等）整型重载判定**：在 Zan 的 irgen 体系中，整型字面量（`AST_INT_LITERAL`）在 `emit_expr` 中默认发射为 64 位整型（`i64`）。在降低多重载原语（如 `PopCount`, `LeadingZeroCount`, `TrailingZeroCount`, `RotateLeft`, `RotateRight`, `ReverseEndianness`, `Log2`, `RoundUpToPowerOf2` 等）时，切勿仅凭发射值的 LLVM 类型宽度（`LLVMGetIntTypeWidth == 64`）判断是否为 64 位，否则 32 位整数字面量（如 0, 1, 0x12345678）会被误判为 64 位，导致 `bswap` 翻转 8 字节而非 4 字节，或 `LeadingZeroCount(0)` 错返回 64。必须通过 `infer_expr_type(g, arg, locals)` 查询语义类型（`TYPE_LONG` / `TYPE_ULONG` 为 64 位，其余标量为 32 位）。
 - **Vector128 通用硬件向量寄存器映射与零开销互转**：在 Zan 中 `Vector128` 定义为 16 字节值结构体 `{ long Low; long High; }`（LLVM `%struct.Vector128 = type { i64, i64 }`）。在 irgen 降阶时，通过 `extractvalue`/`insertelement` 与 `extractelement`/`insertvalue` 实现纯 SSA 寄存器与 `<16 x i8>` / `<2 x i64>` 的无损双向转换，不经过任何 `alloca` 栈内存中转，交由 LLVM 优化器直接映射至 128 位 XMM 寄存器（`movdqu`/`pxor`/`pcmpeqb` 等）。
 - **Vector128.Load/Store 非对齐与数组重载契约**：对于底层非对齐加载与存储，必须显式标记 `LLVMSetAlignment(ld, 1)` 防止在非 16 字节对齐的缓冲区上触发 General Protection Fault (#GP) 异常。支持 `byte[] source` 与 `byte[] source, int offset` 时，指针需通过 GEP 按字节偏移再 bitcast 为向量指针，保证纯 Zan 源码在处理大内存切片/数组匹配时发射单周期指令。
+- **LLVM x86 硬件指令集特性开关（`tm_features` 独立命名）**：使用 `llvm.x86.sse42.crc32.*` 机器指令时，仅仅开启 `+sse4.2` 不足以在 SelectionDAG 中完成指令选择，会导致 `LLVM ERROR: Cannot select: intrinsic %llvm.x86.sse42.crc32.*` 致命报错。这是因为 LLVM 将 CRC32 拆分在单独的 `+crc32` 子特性下。同理，FMA 融和乘加需要 `+fma`，单周期硬件位操作需要 `+bmi`。在 TargetMachine 的特性串中，必须显式传递 `+sse4.2,+crc32,+fma,+bmi`。
 
 ## 发布体积：数据逐符号分节与链接器 GC 的边界（2026-09-15）
 

@@ -85,7 +85,11 @@ bool zan_target_parse(const char *triple_str, zan_target_t *out) {
     out->os = parse_os(triple_str);
     out->abi = parse_abi(triple_str, out->os);
     snprintf(out->cpu, sizeof(out->cpu), "%s", "generic");
-    out->features[0] = 0;
+    if (out->arch == ZAN_ARCH_X86_64) {
+        snprintf(out->features, sizeof(out->features), "%s", "+sse3,+ssse3,+sse4.1,+sse4.2,+crc32,+aes,+avx,+avx2,+fma,+bmi");
+    } else {
+        out->features[0] = 0;
+    }
     out->pointer_size = (out->arch == ZAN_ARCH_WASM32 ||
                          out->arch == ZAN_ARCH_RISCV32) ? 4 : 8;
     out->pic = (out->os == ZAN_OS_LINUX || out->os == ZAN_OS_MACOS || out->os == ZAN_OS_IOS);

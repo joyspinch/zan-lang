@@ -3044,7 +3044,7 @@ static zan_status_t zan_bind_target_layout(zan_irgen_t *g,
                                   g->ctx, "ilp32", 5)));
     } else if (strncmp(triple, "x86_64", 6) == 0) {
         tm_cpu = "x86-64";
-        tm_features = "+sse3,+ssse3,+sse4.1,+sse4.2,+aes,+avx,+avx2";
+        tm_features = "+sse3,+ssse3,+sse4.1,+sse4.2,+crc32,+aes,+avx,+avx2,+fma,+bmi";
     }
     /* Machine codegen dominates compile time. Development builds (no
      * --publish / -O) use the fast path (FastISel, no machine-level

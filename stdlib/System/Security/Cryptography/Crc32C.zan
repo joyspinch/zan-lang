@@ -1,4 +1,6 @@
 using System;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 
 namespace System.Security.Cryptography;
 
@@ -32,14 +34,39 @@ public static class Crc32C {
         return t;
     }
 
-    /// <summary>对 byte[] 计算 CRC-32C。</summary>
+    /// <summary>对 byte[] 计算 CRC-32C。若硬件支持 SSE4.2 则自动走单周期硬件加速。</summary>
     public static int Compute(byte[] data, int offset, int len, int crc) {
-        int[] t = Crc32C.Table();
-        int c = crc ^ Crc32C.AllOnes;
-        for (int i = 0; i < len; i = i + 1) {
-            c = (int)((uint)c >> 8) ^ t[(c ^ data[offset + i]) & 255];
+        if (data == null || len <= 0) return crc;
+        if (Cpu.HasSse42) {
+            uint c = (uint)(crc ^ Crc32C.AllOnes);
+            int i = 0;
+            int limit8 = len - 8;
+            while (i <= limit8) {
+                int baseIdx = offset + i;
+                long w = ((long)data[baseIdx] & 255) |
+                         (((long)data[baseIdx + 1] & 255) << 8) |
+                         (((long)data[baseIdx + 2] & 255) << 16) |
+                         (((long)data[baseIdx + 3] & 255) << 24) |
+                         (((long)data[baseIdx + 4] & 255) << 32) |
+                         (((long)data[baseIdx + 5] & 255) << 40) |
+                         (((long)data[baseIdx + 6] & 255) << 48) |
+                         (((long)data[baseIdx + 7] & 255) << 56);
+                c = (uint)Sse42.Crc32((ulong)c, (ulong)w);
+                i += 8;
+            }
+            while (i < len) {
+                c = Sse42.Crc32(c, data[offset + i]);
+                i++;
+            }
+            return (int)(c ^ (uint)Crc32C.AllOnes);
         }
-        return c ^ Crc32C.AllOnes;
+
+        int[] t = Crc32C.Table();
+        int sc = crc ^ Crc32C.AllOnes;
+        for (int i = 0; i < len; i = i + 1) {
+            sc = (int)((uint)sc >> 8) ^ t[(sc ^ data[offset + i]) & 255];
+        }
+        return sc ^ Crc32C.AllOnes;
     }
 
     /// <summary>对整个 byte[] 计算 CRC-32C。</summary>

@@ -222,6 +222,11 @@ static const zan_builtin_member_t members_vector128[] = {
     { "LessThan",                     'M', "Vector128 LessThan(Vector128 left, Vector128 right)" },
     { "Prefetch",                     'M', "void Prefetch(nint address)" },
     { "Prefetch",                     'M', "void Prefetch(byte[] source, int offset)" },
+    { "Create",                       'M', "Vector128 Create(float value)" },
+    { "Multiply",                     'M', "Vector128 Multiply(Vector128 left, Vector128 right)" },
+    { "MultiplyAdd",                  'M', "Vector128 MultiplyAdd(Vector128 a, Vector128 b, Vector128 c)" },
+    { "Sqrt",                         'M', "Vector128 Sqrt(Vector128 value)" },
+    { "ReciprocalSqrt",               'M', "Vector128 ReciprocalSqrt(Vector128 value)" },
     { "Zero",                         'P', "Vector128 Zero" },
     { "AllBitsSet",                   'P', "Vector128 AllBitsSet" },
 };
@@ -240,8 +245,26 @@ static const zan_builtin_member_t members_vector256[] = {
     { "AndNot",                       'M', "Vector256 AndNot(Vector256 left, Vector256 right)" },
     { "Equals",                       'M', "Vector256 Equals(Vector256 left, Vector256 right)" },
     { "ExtractMostSignificantBits",   'M', "int ExtractMostSignificantBits(Vector256 value)" },
+    { "Add",                          'M', "Vector256 Add(Vector256 left, Vector256 right)" },
+    { "Subtract",                     'M', "Vector256 Subtract(Vector256 left, Vector256 right)" },
+    { "AddSaturate",                  'M', "Vector256 AddSaturate(Vector256 left, Vector256 right)" },
+    { "SubtractSaturate",             'M', "Vector256 SubtractSaturate(Vector256 left, Vector256 right)" },
+    { "Min",                          'M', "Vector256 Min(Vector256 left, Vector256 right)" },
+    { "Max",                          'M', "Vector256 Max(Vector256 left, Vector256 right)" },
+    { "Average",                      'M', "Vector256 Average(Vector256 left, Vector256 right)" },
+    { "ConditionalSelect",            'M', "Vector256 ConditionalSelect(Vector256 condition, Vector256 left, Vector256 right)" },
+    { "Prefetch",                     'M', "void Prefetch(nint address)" },
+    { "Prefetch",                     'M', "void Prefetch(byte[] source, int offset)" },
     { "Zero",                         'P', "Vector256 Zero" },
     { "AllBitsSet",                   'P', "Vector256 AllBitsSet" },
+};
+
+static const zan_builtin_member_t members_x86_sse42[] = {
+    { "Crc32",          'M', "uint Crc32(uint crc, byte data)" },
+    { "Crc32",          'M', "uint Crc32(uint crc, ushort data)" },
+    { "Crc32",          'M', "uint Crc32(uint crc, uint data)" },
+    { "Crc32",          'M', "ulong Crc32(ulong crc, ulong data)" },
+    { "IsSupported",    'P', "bool IsSupported" },
 };
 
 static const zan_builtin_member_t members_bitops[] = {
@@ -254,6 +277,8 @@ static const zan_builtin_member_t members_bitops[] = {
     { "Log2",               'M', "int Log2(int value)" },
     { "IsPow2",             'M', "bool IsPow2(int value)" },
     { "RoundUpToPowerOf2",  'M', "int RoundUpToPowerOf2(int value)" },
+    { "ResetLowestSetBit",  'M', "int ResetLowestSetBit(int value)" },
+    { "ExtractLowestSetBit",'M', "int ExtractLowestSetBit(int value)" },
 };
 
 static const zan_builtin_member_t members_cpu[] = {
@@ -307,6 +332,7 @@ static const zan_builtin_type_t builtin_types[] = {
     BT("Cpu", "Cpu", "Cpu", 1, members_cpu),
     BT("Aes", "Aes", "Aes", 1, members_x86_aes),
     BT("Sse2", "Sse2", "Sse2", 1, members_x86_sse2),
+    BT("Sse42", "Sse42", "Sse42", 1, members_x86_sse42),
     BT("Vector128", "Vector128", "Vector128", 1, members_vector128),
     BT("Vector256", "Vector256", "Vector256", 1, members_vector256),
 };

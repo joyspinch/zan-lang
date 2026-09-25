@@ -1179,7 +1179,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 return cpu_out;
         }
 
-        /* Hardware intrinsics: Vector128 / Vector256 / SSE2 / SSSE3 / AES-NI. */
+        /* Hardware intrinsics: Vector128 / Vector256 / SSE2 / SSSE3 / SSE4.2 / AES-NI. */
         {
             LLVMValueRef vec_out = NULL;
             if (emit_vector128_call(g, expr, locals, &vec_out))
@@ -1187,6 +1187,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             if (emit_vector256_call(g, expr, locals, &vec_out))
                 return vec_out;
             if (emit_sse2_call(g, expr, locals, &vec_out))
+                return vec_out;
+            if (emit_sse42_call(g, expr, locals, &vec_out))
                 return vec_out;
             if (emit_aes_call(g, expr, locals, &vec_out))
                 return vec_out;
