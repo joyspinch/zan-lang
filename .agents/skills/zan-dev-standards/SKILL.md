@@ -39,6 +39,9 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   ④ 文本转义、分词与模板解析统一采用分块游标切片（Window Chunking），无特殊字符时直通返回原始字符串（0 堆申请），含特殊字符时以区间切片追加，消灭逐字节碎片分配；字典键值查询优先使用 `vars.ContainsKey(key)` 与 `TryGetValue`，严禁遍历 `vars.Keys` 数组造成 $O(N)$ 性能降级；
   ⑤ GUI 与游戏高频渲染循环严禁闭包委托与多重 Span 重复构造：`YSortLayer` 等空间与深度排序结构采用紧凑索引直接访问（`GetSortedEntityId`）替代 `ForEachSorted` 委托闭包，消灭每帧闭包分配；`SpriteBatch.Add` 复用单一 `Span<float>` 实例完成 8 浮点装填；富文本与代码高亮词法探测（`CodeEditor.InSet/ContainsSub`、`Markdown` 行内解析、`ChatView.MdStrip`）全面直通原生 `IndexOf` 与分块游标区间切片；
   ⑥ 网络与通讯协议热路径（WebSocket、Redis RESP、HTTP 流）全面采用 AVX2/SSE2 向量化与 NativeMemory 零堆分配加速：WebSocket 数据帧 4 字节掩码在广播构造 64/128/256 位宽掩码向量后通过 `Vector256.Xor` / `Vector128.Xor` 单指令处理 32/16 字节，非对齐尾部按 4 字节整数步进异或；Redis RESP 文本行协议与 WebSocket HTTP 握手终止符（`\r\n` / `\r\n\r\n`）采用带界限限制的 `MemoryExtensions.IndexOf`（AVX2 `Equals` + `ExtractMostSignificantBits` + `TrailingZeroCount`）实现单周期 32 字节跳跃定位，杜绝逐字节标量比对与越界脏读；缓冲区扩容与搬移严禁使用 `for` 循环逐字节赋值，统一调用直接对接 libc `memmove`/`memcpy` 的 `NativeMemory.Copy` 与 `NativeMemory.PutString`。
+- **杜绝手拼 JSON 字符串与手拼 SQL 拼接（严禁裸字符串拼接与简陋的 Replace 引号）**：
+  ① JSON 序列化一律使用标准库 `System.Json.JsonValue` 构建器（`PutStr/PutInt/PutDouble/PutBool/PutNull/PutJson` 与 `Append`），字符串成员经原生转义安全处理特殊字符（引号、反斜杠、控制字符 `\n`/`\r`/`\t`），杜绝因换行或引号破坏 JSON 报文语法；嵌套片段利用 `PutJson`/`AppendJson` 原生嵌入，禁止通过文本剪裁与字符串拼接嵌入；
+  ② 数据库非查询/查询/聚合操作一律使用参数化 API（`DbParams` 与 `?` 占位符），禁止手写拼接 `Quote` 单引号或裸拼接变量（如 `"WHERE slot=" + key`），杜绝 SQL 注入漏洞并复用数据库预编译执行计划。
 - **ORM 条件只有值自带原语，裸 SQL 片段是生成代码专属**。用户面条件一律
   `WhereEq/WhereGe/WhereLe/WhereIn/WhereLikeAny`（列名经实体元数据校验，
   值全部参数化绑定）与类型化 lambda（`ids.Contains(a.id)` 降级为参数化
