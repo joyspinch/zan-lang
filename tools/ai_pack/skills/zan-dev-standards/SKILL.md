@@ -47,6 +47,23 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   有描述的公开端点曾被类描述隐式默认刷进侧栏，而监控类控制器的非根动作
   上已标注的 `[Custom(IsMenu=true)]` 又被反向吞掉（2026-09-25 GenRoute
   改约定后两端同时修复，一致性用例锁定）。
+- **语言事实三则（2026-09-25 CRUD 声明化实机踩出）**：① `protected`
+  是**仅子类可见**——同包同命名空间的协作类也访问不到（`Crud` 访问
+  `AdminController` 的 `Can/Note/Saved` 直接编译错）。包内协作面要么
+  放开为默认公开（如 Note/Saved 这类通用应答/审计），要么像
+  `Screen(canUpdate, canDelete)` 那样由子类调用方取好掩码再当参数传；
+  ② SQL 关键字不能当标识符——`where` 做变量名报
+  `unexpected token 'where' in expression` 一串（改名 `marks`）；
+  ③ async 方法同一表达式里 await 前不得再求值带副作用的调用
+  （`this.Ctx().path` 要先赋局部变量），编译期强制。
+- **声明驱动的 CRUD 定式（ListPage/Crud，2026-09-25 落地）**：一屏一个
+  `ScreenDef()` 静态声明（列 Col/Tag/Flag、行内操作 Ops、筛选、工具栏、
+  `Table/EditFields` 写白名单），渲染 `Screen()` 整段产出 screenHtml
+  （视图只剩壳），通用写动作走 `Crud.Field/Batch/Delete`（白名单+
+  Gen.Safe 双保险+`?` 占位符，行级授权由调用方预检 allowed 集合，
+  越权与不存在同答 404），`Crud.Conf` 同一声明投影 adminUI conf 契约。
+  新屏别再手写表格 HTML 与格式化帮静态方法；业务语义（会话失效、
+  关联清理）留在屏内动作，通用动作只对声明的主表负责。
 
 ## 三、验证纪律（实机/无头通用）
 
@@ -57,7 +74,7 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
 - **UI 驱动用合成事件，不用真实 OS 点击**：driver 的 `clickid` 在点击时刻
   解析命中区中心并注入，天然免疫窗口框偏移；hit id 只在**同一次构建的
   同一次运行内**有效（控件增删会整体移位），点击前当场 dump。
-- **ZanWeb 模板实机核对七坑**（2026-09-25 ListPage/FormPage/视觉重绘验证，每条都白折腾过一轮）：
+- **ZanWeb 模板实机核对九坑**（2026-09-25 ListPage/FormPage/视觉重绘验证，每条都白折腾过一轮）：
   ① 静态资产挂在 `/static/*`（`StaticFiles.Mount(app, "/static", "wwwroot")`），
   curl `/js/x.js` 拿到的是 API 层 `{"code":"404"}` JSON——不是"服务了旧文件"，
   先核对 URL 再怀疑缓存；② 改 wwwroot 的 JS/CSS 必须同步升布局模板
@@ -77,7 +94,11 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   起服务用 `(app.exe start > boot.log 2>&1 &)`，别用裸 restart；⑧ 手动起的
   沙箱实例占着 e2e 的端口时，e2e 起服阶段不会报"端口占用"，而是对自己的
   数据目录跑断言、拿到空表 IndexError 之类的假故障——跑 e2e 前先按 netstat
-  停掉自己的实例。
+  停掉自己的实例；⑨ e2e_mvc.py 不带 `--build` 会复用沙箱既有 app.exe——
+  改完源码直接跑，旧断言全绿、新断言全挂（测的是旧二进制，exe mtime 早于
+  改动），极像"功能写坏了"；改源后必须 `--build`，或先核对 exe 时间戳。
+  另：e2e 末轮 forgot 流程会把 admin 密码重置为 `newpass-e2e-123`，手动
+  补测登录拿种子密码 admin1234 会误判"登录坏了"。
 - **PowerShell 合成点击四连坑（PrintWindow 抓窗 + mouse_event 注入流）**：
   ① 进程必须先 `SetProcessDpiAwarenessContext(-4)`——DPI 不感知时
   `GetWindowRect`/`SetCursorPos` 全在虚拟化坐标系，注入点整体漂 1.5 倍；
