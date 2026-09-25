@@ -887,6 +887,8 @@ static void pixel_blend_over_sse2(uint8_t *dst, const uint8_t *src, int64_t coun
     __m128i zero = _mm_setzero_si128();
     __m128i k255 = _mm_set1_epi16(255);
     __m128i k128 = _mm_set1_epi16(128);
+    __m128i rgb_mask = _mm_setr_epi16(-1, -1, -1, 0, -1, -1, -1, 0);
+    __m128i k_alpha_255 = _mm_setr_epi16(0, 0, 0, 255, 0, 0, 0, 255);
 
     for (; i + 4 <= count; i += 4) {
         __m128i s = _mm_loadu_si128((const __m128i*)(src + i * 4));
@@ -900,16 +902,18 @@ static void pixel_blend_over_sse2(uint8_t *dst, const uint8_t *src, int64_t coun
         __m128i sa_0 = _mm_shufflelo_epi16(s_lo, _MM_SHUFFLE(3, 3, 3, 3));
         sa_0 = _mm_shufflehi_epi16(sa_0, _MM_SHUFFLE(3, 3, 3, 3));
         __m128i inv_sa_0 = _mm_sub_epi16(k255, sa_0);
+        __m128i sw_0 = _mm_or_si128(_mm_and_si128(sa_0, rgb_mask), k_alpha_255);
 
-        __m128i res_lo = _mm_add_epi16(_mm_mullo_epi16(s_lo, sa_0), _mm_mullo_epi16(d_lo, inv_sa_0));
+        __m128i res_lo = _mm_add_epi16(_mm_mullo_epi16(s_lo, sw_0), _mm_mullo_epi16(d_lo, inv_sa_0));
         res_lo = _mm_add_epi16(res_lo, k128);
         res_lo = _mm_srli_epi16(_mm_add_epi16(res_lo, _mm_srli_epi16(res_lo, 8)), 8);
 
         __m128i sa_1 = _mm_shufflelo_epi16(s_hi, _MM_SHUFFLE(3, 3, 3, 3));
         sa_1 = _mm_shufflehi_epi16(sa_1, _MM_SHUFFLE(3, 3, 3, 3));
         __m128i inv_sa_1 = _mm_sub_epi16(k255, sa_1);
+        __m128i sw_1 = _mm_or_si128(_mm_and_si128(sa_1, rgb_mask), k_alpha_255);
 
-        __m128i res_hi = _mm_add_epi16(_mm_mullo_epi16(s_hi, sa_1), _mm_mullo_epi16(d_hi, inv_sa_1));
+        __m128i res_hi = _mm_add_epi16(_mm_mullo_epi16(s_hi, sw_1), _mm_mullo_epi16(d_hi, inv_sa_1));
         res_hi = _mm_add_epi16(res_hi, k128);
         res_hi = _mm_srli_epi16(_mm_add_epi16(res_hi, _mm_srli_epi16(res_hi, 8)), 8);
 
