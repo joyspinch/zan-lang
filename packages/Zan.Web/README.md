@@ -4,11 +4,13 @@
 上下文、指标、任务宿主、代码生成器。**框架以包引用，业务在应用侧**——
 框架升级（拉新包版本）不动应用一行代码。
 
-包内代码与 server-mvc 模板同源（真迁移），经模板 e2e（121 断言）全量验证。
+包内代码与 server-mvc 模板同源（真迁移），经模板 e2e（144 断言）全量验证。
 
 ## 引用方式
 
-应用声明 `using ZanWeb;` 即自动拉入（包发现顺序：项目 `packages/` →
+应用源文件按层声明 `using`（`ZanWeb.Core` / `ZanWeb.Web` / `ZanWeb.Model` /
+`ZanWeb.Dao` / `ZanWeb.Security` / `ZanWeb.Services` / `ZanWeb.Ai`），
+zanc 自动发现并拉入包源（包发现顺序：项目 `packages/` →
 项目 `.zan-packages/` → exe 旁 `../packages/` / `packages/` → 全局库）。
 `zan.pkg` 是包清单，版本随包一起演进。
 
@@ -32,10 +34,30 @@ class Program {
 
 | 归属 | 内容 |
 |------|------|
-| **包**（本目录） | 框架核心 `ZanWeb.*`、系统模型 `ZanWeb.Model.Sys`（19 实体）、系统 DAO `ZanWeb.Dao.Sys`（19 表）、三个控制器基类（App/Api/Admin） |
+| **包**（本目录） | 框架核心（`ZanWeb.Core/Web/Security/Services/Ai`）、系统模型 `ZanWeb.Model`（19 实体）、系统 DAO `ZanWeb.Dao`（19 表）、三个控制器基类（App/Api/Admin） |
 | **应用** | 业务控制器、业务模型/DAO（如 Blog）、`views/`、`wwwroot/`、`config/app.json`、`main.zan` 组合根、业务种子（经 `Schema.OnSeed` 挂点注册） |
 
 原则：模型与 DAO 都在应用里，框架不预设任何业务；框架只提供挂点。
+
+## 目录分层地图（目录 = 命名空间 = 层）
+
+```
+src/ZanWeb/
+  Web/        接入层    控制器基类（App/Api/Admin）、ListPage/FormPage 屏基座、
+                        Crud 网关、Fmt/Lang/Prose 渲染件、AppServices 组合根
+  Services/   业务支撑  JobHost 任务宿主、Cache/CacheContext、Metrics、Mailer、
+                        ClusterBus/Presence、Settings
+  Model/      数据层    19 个系统实体（SysUser…，表名 sys_*）
+  Dao/        数据层    19 个系统 DAO（每表一个，全部查询与写入口）
+  Core/       基建      Boot/Cfg/Db/DbContext/Schema/Gen（代码生成器）
+  Security/   横切      Auth/Perm/PermTable/DataScope/Keys/LoginThrottle/VerifyCode
+  Ai/         横切      Ai/AiEndpointPolicy
+```
+
+目录名 = 命名空间名（`Web/` ↔ `namespace ZanWeb.Web`），看到路径即知
+层归属与 using 写法。实体与 DAO 扁平直放 `Model/`、`Dao/`——类名已带
+`Sys` 前缀（`SysUser` / `SysUserDao`），目录再套 `Sys/` 子层是重复表述，
+故不设。
 
 ## 应用侧三个挂点
 
@@ -50,16 +72,24 @@ class Program {
 `{{NAME}}` 等模板占位符只存在于模板侧；包内代码不含任何占位符
 （`Cfg.Server.name` 默认 `"app"`，由外部 `config/app.json` 覆盖）。
 
-## 命名空间地图
+## 页面在哪（屏基座在包，壳视图在应用）
 
-```
-ZanWeb                 框架核心：Boot/Cfg/Db/DbContext/CacheContext/AppServices/
-                       Schema/Auth/Perm/DataScope/Settings/Keys/Lang/Fmt/Metrics/
-                       Mailer/VerifyCode/Prose/Gen/JobHost/ClusterBus/Presence/Ai…
-ZanWeb.Model.Sys       系统实体（sys_user / sys_role / sys_operation_log / …）
-ZanWeb.Dao.Sys         系统 DAO（每表一个，全部查询与写入口）
-ZanWeb.Blog 等业务命名空间  在应用侧，不在包内
-```
+后台页面 = **动作代码里的声明式屏** + **应用侧薄壳视图** + **站点布局**，
+三段各管一段——只翻 `views/` 找不到页面本体，原因在此：
+
+1. **屏本体在代码里**：控制器动作声明 `ListPage`/`FormPage`（筛选、工具
+   栏、字段），调 `lp.Screen(this, d, path, …)` 渲染出整屏 HTML
+   （`screenHtml`）。声明与取数/校验同源，屏基座（`ListPage`/`FormPage`/
+   `Crud`）在包的 `Web/` 层，随包升级走。
+2. **壳视图在应用 `views/Admin/<类>.<动作>.html`**：大多是三行壳
+   `<div class="card">{{{screenHtml}}}</div>`，给站点布局留接口；运行时
+   按 `__SetView("类.动作")` 从发布目录磁盘读取（进程须位于发布目录）。
+3. **站点布局 `views/_Layout.html` + `wwwroot/`**：菜单、侧栏、静态资源，
+   完全归应用。
+
+视图文件名跟随控制器类名（`SysUsers.Index.html` ↔ `class SysUsers` +
+`Index()` 动作）；想找某个页面的实现，从 URL 段定位控制器类、再进动作
+即可——URL = 目录 = 类名 = 方法名，命名同构。
 
 ## 分层约定（上下文自动处理，业务不传连接）
 
