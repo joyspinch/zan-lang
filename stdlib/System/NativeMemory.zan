@@ -1,4 +1,6 @@
 using System;
+using System.Numerics;
+using System.Runtime.Intrinsics;
 
 namespace System;
 
@@ -115,4 +117,66 @@ class NativeMemory {
     /// 命中闭引号返回其正偏移量 (>= 0)；命中反斜杠转义符返回 -(esc_pos + 1)；未命中到达末尾返回 len。
     [DllImport("crt")]
     static extern long JsonScanString(nint ptr, long pos, long len);
+
+    /// <summary>利用 AVX2/SSE2 硬件向量化单指令周期，比较两块连续原始内存的内容是否完全一致。</summary>
+    public static bool SequenceEqual(nint a, nint b, int len) {
+        if (a == b) return true;
+        if (a == 0 || b == 0) return false;
+        int i = 0;
+        while (i + 32 <= len) {
+            Vector256 va = Vector256.Load(a + (nint)i);
+            Vector256 vb = Vector256.Load(b + (nint)i);
+            Vector256 eq = Vector256.Equals(va, vb);
+            int mask = Vector256.ExtractMostSignificantBits(eq);
+            if (mask != -1) return false;
+            i = i + 32;
+        }
+        while (i + 16 <= len) {
+            Vector128 va = Vector128.Load(a + (nint)i);
+            Vector128 vb = Vector128.Load(b + (nint)i);
+            Vector128 eq = Vector128.Equals(va, vb);
+            int mask = Vector128.ExtractMostSignificantBits(eq);
+            if (mask != 65535) return false;
+            i = i + 16;
+        }
+        Span<byte> sa = new Span<byte>(a, len);
+        Span<byte> sb = new Span<byte>(b, len);
+        while (i < len) {
+            if (sa[i] != sb[i]) return false;
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /// <summary>利用 AVX2 + BMI1 TrailingZeroCount 硬件加速单指令定位，在连续原始内存中查找字节 target 的偏移量。</summary>
+    public static int IndexOf(nint p, int len, byte target) {
+        if (p == 0 || len <= 0) return -1;
+        int i = 0;
+        Vector256 t256 = Vector256.Create(target);
+        while (i + 32 <= len) {
+            Vector256 v = Vector256.Load(p + (nint)i);
+            Vector256 eq = Vector256.Equals(v, t256);
+            int mask = Vector256.ExtractMostSignificantBits(eq);
+            if (mask != 0) {
+                return i + BitOperations.TrailingZeroCount(mask);
+            }
+            i = i + 32;
+        }
+        Vector128 t128 = Vector128.Create(target);
+        while (i + 16 <= len) {
+            Vector128 v = Vector128.Load(p + (nint)i);
+            Vector128 eq = Vector128.Equals(v, t128);
+            int mask = Vector128.ExtractMostSignificantBits(eq);
+            if (mask != 0) {
+                return i + BitOperations.TrailingZeroCount(mask);
+            }
+            i = i + 16;
+        }
+        Span<byte> sp = new Span<byte>(p, len);
+        while (i < len) {
+            if (sp[i] == target) return i;
+            i = i + 1;
+        }
+        return -1;
+    }
 }

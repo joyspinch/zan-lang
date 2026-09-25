@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.Intrinsics;
 
 namespace System.Drawing;
 
@@ -180,5 +181,171 @@ class ImageBuffer : IDisposable {
     public void SwapRB() {
         if (this.Pixels == 0 || this.Width <= 0 || this.Height <= 0) return;
         PixelOps.SwapRB(this.Pixels, this.Pixels, this.Width * this.Height);
+    }
+
+    /// <summary>调整整幅图像的明暗度（delta 为 -255..255）。基于 AVX2 饱和加减硬件指令，杜绝溢出反转。</summary>
+    public void AdjustBrightness(int delta) {
+        if (this.Pixels == 0 || delta == 0) return;
+        int totalBytes = this.Width * this.Height * 4;
+        int i = 0;
+        if (delta > 0) {
+            byte d = (byte)(delta > 255 ? 255 : delta);
+            Vector256 d256 = Vector256.Create(d);
+            Vector128 d128 = Vector128.Create(d);
+            while (i + 32 <= totalBytes) {
+                Vector256 v = Vector256.Load(this.Pixels + (nint)i);
+                Vector256 sat = Vector256.AddSaturate(v, d256);
+                Vector256.Store(this.Pixels + (nint)i, sat);
+                i = i + 32;
+            }
+            while (i + 16 <= totalBytes) {
+                Vector128 v = Vector128.Load(this.Pixels + (nint)i);
+                Vector128 sat = Vector128.AddSaturate(v, d128);
+                Vector128.Store(this.Pixels + (nint)i, sat);
+                i = i + 16;
+            }
+            Span<byte> sp = new Span<byte>(this.Pixels, totalBytes);
+            while (i < totalBytes) {
+                int val = (int)sp[i] + (int)d;
+                sp[i] = (byte)(val > 255 ? 255 : val);
+                i = i + 1;
+            }
+        } else {
+            int pos = -delta;
+            byte d = (byte)(pos > 255 ? 255 : pos);
+            Vector256 d256 = Vector256.Create(d);
+            Vector128 d128 = Vector128.Create(d);
+            while (i + 32 <= totalBytes) {
+                Vector256 v = Vector256.Load(this.Pixels + (nint)i);
+                Vector256 sat = Vector256.SubtractSaturate(v, d256);
+                Vector256.Store(this.Pixels + (nint)i, sat);
+                i = i + 32;
+            }
+            while (i + 16 <= totalBytes) {
+                Vector128 v = Vector128.Load(this.Pixels + (nint)i);
+                Vector128 sat = Vector128.SubtractSaturate(v, d128);
+                Vector128.Store(this.Pixels + (nint)i, sat);
+                i = i + 16;
+            }
+            Span<byte> sp = new Span<byte>(this.Pixels, totalBytes);
+            while (i < totalBytes) {
+                int val = (int)sp[i] - (int)d;
+                sp[i] = (byte)(val < 0 ? 0 : val);
+                i = i + 1;
+            }
+        }
+    }
+
+    /// <summary>50% 均值混合（基于 AVX2 vpavgb 32 字节并行硬件指令）。</summary>
+    public void Blend50(ImageBuffer other) {
+        if (this.Pixels == 0 || other == null || other.Pixels == 0) return;
+        int count = this.Width * this.Height;
+        if (other.Width * other.Height < count) count = other.Width * other.Height;
+        int totalBytes = count * 4;
+        int i = 0;
+        while (i + 32 <= totalBytes) {
+            Vector256 v1 = Vector256.Load(this.Pixels + (nint)i);
+            Vector256 v2 = Vector256.Load(other.Pixels + (nint)i);
+            Vector256 avg = Vector256.Average(v1, v2);
+            Vector256.Store(this.Pixels + (nint)i, avg);
+            i = i + 32;
+        }
+        while (i + 16 <= totalBytes) {
+            Vector128 v1 = Vector128.Load(this.Pixels + (nint)i);
+            Vector128 v2 = Vector128.Load(other.Pixels + (nint)i);
+            Vector128 avg = Vector128.Average(v1, v2);
+            Vector128.Store(this.Pixels + (nint)i, avg);
+            i = i + 16;
+        }
+        Span<byte> s1 = new Span<byte>(this.Pixels, totalBytes);
+        Span<byte> s2 = new Span<byte>(other.Pixels, totalBytes);
+        while (i < totalBytes) {
+            s1[i] = (byte)(((int)s1[i] + (int)s2[i] + 1) / 2);
+            i = i + 1;
+        }
+    }
+
+    /// <summary>变暗混合（Min 滤镜，基于 AVX2 vpminub 32 字节并行硬件指令）。</summary>
+    public void Darken(ImageBuffer other) {
+        if (this.Pixels == 0 || other == null || other.Pixels == 0) return;
+        int count = this.Width * this.Height;
+        if (other.Width * other.Height < count) count = other.Width * other.Height;
+        int totalBytes = count * 4;
+        int i = 0;
+        while (i + 32 <= totalBytes) {
+            Vector256 v1 = Vector256.Load(this.Pixels + (nint)i);
+            Vector256 v2 = Vector256.Load(other.Pixels + (nint)i);
+            Vector256 r = Vector256.Min(v1, v2);
+            Vector256.Store(this.Pixels + (nint)i, r);
+            i = i + 32;
+        }
+        while (i + 16 <= totalBytes) {
+            Vector128 v1 = Vector128.Load(this.Pixels + (nint)i);
+            Vector128 v2 = Vector128.Load(other.Pixels + (nint)i);
+            Vector128 r = Vector128.Min(v1, v2);
+            Vector128.Store(this.Pixels + (nint)i, r);
+            i = i + 16;
+        }
+        Span<byte> s1 = new Span<byte>(this.Pixels, totalBytes);
+        Span<byte> s2 = new Span<byte>(other.Pixels, totalBytes);
+        while (i < totalBytes) {
+            s1[i] = s1[i] < s2[i] ? s1[i] : s2[i];
+            i = i + 1;
+        }
+    }
+
+    /// <summary>变亮混合（Max 滤镜，基于 AVX2 vpmaxub 32 字节并行硬件指令）。</summary>
+    public void Lighten(ImageBuffer other) {
+        if (this.Pixels == 0 || other == null || other.Pixels == 0) return;
+        int count = this.Width * this.Height;
+        if (other.Width * other.Height < count) count = other.Width * other.Height;
+        int totalBytes = count * 4;
+        int i = 0;
+        while (i + 32 <= totalBytes) {
+            Vector256 v1 = Vector256.Load(this.Pixels + (nint)i);
+            Vector256 v2 = Vector256.Load(other.Pixels + (nint)i);
+            Vector256 r = Vector256.Max(v1, v2);
+            Vector256.Store(this.Pixels + (nint)i, r);
+            i = i + 32;
+        }
+        while (i + 16 <= totalBytes) {
+            Vector128 v1 = Vector128.Load(this.Pixels + (nint)i);
+            Vector128 v2 = Vector128.Load(other.Pixels + (nint)i);
+            Vector128 r = Vector128.Max(v1, v2);
+            Vector128.Store(this.Pixels + (nint)i, r);
+            i = i + 16;
+        }
+        Span<byte> s1 = new Span<byte>(this.Pixels, totalBytes);
+        Span<byte> s2 = new Span<byte>(other.Pixels, totalBytes);
+        while (i < totalBytes) {
+            s1[i] = s1[i] > s2[i] ? s1[i] : s2[i];
+            i = i + 1;
+        }
+    }
+
+    /// <summary>颜色反相（基于 AVX2 32 字节并行 XOR 硬件流水线）。</summary>
+    public void Invert() {
+        if (this.Pixels == 0) return;
+        int totalBytes = this.Width * this.Height * 4;
+        int i = 0;
+        Vector256 all256 = Vector256.AllBitsSet;
+        Vector128 all128 = Vector128.AllBitsSet;
+        while (i + 32 <= totalBytes) {
+            Vector256 v = Vector256.Load(this.Pixels + (nint)i);
+            Vector256 inv = Vector256.Xor(v, all256);
+            Vector256.Store(this.Pixels + (nint)i, inv);
+            i = i + 32;
+        }
+        while (i + 16 <= totalBytes) {
+            Vector128 v = Vector128.Load(this.Pixels + (nint)i);
+            Vector128 inv = Vector128.Xor(v, all128);
+            Vector128.Store(this.Pixels + (nint)i, inv);
+            i = i + 16;
+        }
+        Span<byte> sp = new Span<byte>(this.Pixels, totalBytes);
+        while (i < totalBytes) {
+            sp[i] = (byte)(sp[i] ^ 255);
+            i = i + 1;
+        }
     }
 }

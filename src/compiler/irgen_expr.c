@@ -1677,6 +1677,27 @@ static LLVMValueRef v4f32_to_vec128(zan_irgen_t *g, LLVMValueRef v4) {
     return v16i8_to_vec128(g, v16);
 }
 
+static int get_simd_array_element_size(zan_irgen_t *g, zan_ast_node_t *arg, local_scope_t *locals) {
+    zan_type_t *t = infer_expr_type(g, arg, locals);
+    if (!t || t->kind != TYPE_ARRAY || !t->element_type) return 1;
+    switch (t->element_type->kind) {
+    case TYPE_FLOAT:
+    case TYPE_INT:
+    case TYPE_UINT:
+        return 4;
+    case TYPE_LONG:
+    case TYPE_ULONG:
+    case TYPE_DOUBLE:
+        return 8;
+    case TYPE_SHORT:
+    case TYPE_USHORT:
+    case TYPE_CHAR:
+        return 2;
+    default:
+        return 1;
+    }
+}
+
 static bool emit_vector128_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                 local_scope_t *locals, LLVMValueRef *out) {
     if (expr->kind != AST_CALL) return false;
@@ -1701,7 +1722,7 @@ static bool emit_vector128_call(zan_irgen_t *g, zan_ast_node_t *expr,
         return true;
     }
 
-    /* Vector128.Load(nint address) / Load(byte[] buf) / Load(byte[] buf, int offset) */
+    /* Vector128.Load(nint address) / Load(byte[] buf) / Load(byte[] buf, int offset) / Load(float[] buf, int offset) */
     if (method.len == 4 && memcmp(method.str, "Load", 4) == 0 && (argc == 1 || argc == 2)) {
         LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
         LLVMValueRef addr_val = emit_expr(g, expr->call.args.items[0], locals);
@@ -1713,6 +1734,10 @@ static bool emit_vector128_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
         if (argc == 2) {
             LLVMValueRef off_val = coerce_int_to(g, emit_expr(g, expr->call.args.items[1], locals), i64t);
+            int esz = get_simd_array_element_size(g, expr->call.args.items[0], locals);
+            if (esz > 1) {
+                off_val = LLVMBuildMul(g->builder, off_val, LLVMConstInt(i64t, esz, 0), "off_bytes");
+            }
             base = LLVMBuildGEP2(g->builder, i8, base, &off_val, 1, "vload_gep");
         }
         LLVMValueRef ptr = LLVMBuildBitCast(g->builder, base, LLVMPointerType(v16i8, 0), "vload_ptr");
@@ -1735,6 +1760,10 @@ static bool emit_vector128_call(zan_irgen_t *g, zan_ast_node_t *expr,
         LLVMValueRef src_val;
         if (argc == 3) {
             LLVMValueRef off_val = coerce_int_to(g, emit_expr(g, expr->call.args.items[1], locals), i64t);
+            int esz = get_simd_array_element_size(g, expr->call.args.items[0], locals);
+            if (esz > 1) {
+                off_val = LLVMBuildMul(g->builder, off_val, LLVMConstInt(i64t, esz, 0), "off_bytes");
+            }
             base = LLVMBuildGEP2(g->builder, i8, base, &off_val, 1, "vstore_gep");
             src_val = emit_expr(g, expr->call.args.items[2], locals);
         } else {
@@ -1956,6 +1985,18 @@ static bool emit_vector128_call(zan_irgen_t *g, zan_ast_node_t *expr,
             *out = v4f32_to_vec128(g, LLVMBuildFMul(g->builder, a, b, "vmulf"));
             return true;
         }
+        if (method.len == 8 && memcmp(method.str, "AddFloat", 8) == 0) {
+            LLVMValueRef a = vec128_to_v4f32(g, emit_expr(g, expr->call.args.items[0], locals));
+            LLVMValueRef b = vec128_to_v4f32(g, emit_expr(g, expr->call.args.items[1], locals));
+            *out = v4f32_to_vec128(g, LLVMBuildFAdd(g->builder, a, b, "vfadd"));
+            return true;
+        }
+        if (method.len == 13 && memcmp(method.str, "SubtractFloat", 13) == 0) {
+            LLVMValueRef a = vec128_to_v4f32(g, emit_expr(g, expr->call.args.items[0], locals));
+            LLVMValueRef b = vec128_to_v4f32(g, emit_expr(g, expr->call.args.items[1], locals));
+            *out = v4f32_to_vec128(g, LLVMBuildFSub(g->builder, a, b, "vfsub"));
+            return true;
+        }
     }
 
     if (argc == 1 && method.len == 4 && memcmp(method.str, "Sqrt", 4) == 0) {
@@ -2129,6 +2170,10 @@ static bool emit_vector256_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }
         if (argc == 2) {
             LLVMValueRef off_val = coerce_int_to(g, emit_expr(g, expr->call.args.items[1], locals), i64t);
+            int esz = get_simd_array_element_size(g, expr->call.args.items[0], locals);
+            if (esz > 1) {
+                off_val = LLVMBuildMul(g->builder, off_val, LLVMConstInt(i64t, esz, 0), "off_bytes");
+            }
             base = LLVMBuildGEP2(g->builder, i8, base, &off_val, 1, "vload256_gep");
         }
         LLVMValueRef ptr = LLVMBuildBitCast(g->builder, base, LLVMPointerType(v32i8, 0), "vload256_ptr");
@@ -2150,6 +2195,10 @@ static bool emit_vector256_call(zan_irgen_t *g, zan_ast_node_t *expr,
         LLVMValueRef src_val;
         if (argc == 3) {
             LLVMValueRef off_val = coerce_int_to(g, emit_expr(g, expr->call.args.items[1], locals), i64t);
+            int esz = get_simd_array_element_size(g, expr->call.args.items[0], locals);
+            if (esz > 1) {
+                off_val = LLVMBuildMul(g->builder, off_val, LLVMConstInt(i64t, esz, 0), "off_bytes");
+            }
             base = LLVMBuildGEP2(g->builder, i8, base, &off_val, 1, "vstore256_gep");
             src_val = emit_expr(g, expr->call.args.items[2], locals);
         } else {

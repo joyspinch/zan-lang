@@ -1,0 +1,116 @@
+using System;
+using System.Numerics;
+using System.Runtime.Intrinsics;
+
+namespace System;
+
+/// <summary>
+/// 提供针对 byte[] 数组与连续内存块的高吞吐向量化加速扩展方法（SequenceEqual、IndexOf、LastIndexOf、Contains）。
+/// 核心循环全面基于 AVX2 256 位宽与 SSE2 128 位硬件向量单周期并行扫描，
+/// 配合 BitOperations.TrailingZeroCount / LeadingZeroCount 硬件指令实现 O(1) 瞬时索引定位。
+/// </summary>
+class MemoryExtensions {
+    /// <summary>确定两个字节序列是否在内容上完全相等（AVX2 32 字节并行扫描）。</summary>
+    public static bool SequenceEqual(this byte[] first, byte[] second) {
+        if (first == null || second == null) return first == second;
+        if (first.Length != second.Length) return false;
+        int n = first.Length;
+        int i = 0;
+        while (i + 32 <= n) {
+            Vector256 v1 = Vector256.Load(first, i);
+            Vector256 v2 = Vector256.Load(second, i);
+            Vector256 eq = Vector256.Equals(v1, v2);
+            int mask = Vector256.ExtractMostSignificantBits(eq);
+            if (mask != -1) return false;
+            i = i + 32;
+        }
+        while (i + 16 <= n) {
+            Vector128 v1 = Vector128.Load(first, i);
+            Vector128 v2 = Vector128.Load(second, i);
+            Vector128 eq = Vector128.Equals(v1, v2);
+            int mask = Vector128.ExtractMostSignificantBits(eq);
+            if (mask != 65535) return false;
+            i = i + 16;
+        }
+        while (i < n) {
+            if (first[i] != second[i]) return false;
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /// <summary>在字节序列中查找指定字节值的第一个匹配项索引（AVX2 32 字节并行 + TrailingZeroCount 硬件指令单周期定位）。</summary>
+    public static int IndexOf(this byte[] source, byte value, int startIndex) {
+        if (source == null) return -1;
+        int n = source.Length;
+        if (startIndex < 0) startIndex = 0;
+        int i = startIndex;
+        Vector256 target256 = Vector256.Create(value);
+
+        while (i + 32 <= n) {
+            Vector256 v = Vector256.Load(source, i);
+            Vector256 eq = Vector256.Equals(v, target256);
+            int mask = Vector256.ExtractMostSignificantBits(eq);
+            if (mask != 0) {
+                int bit = BitOperations.TrailingZeroCount(mask);
+                return i + bit;
+            }
+            i = i + 32;
+        }
+
+        Vector128 target128 = Vector128.Create(value);
+        while (i + 16 <= n) {
+            Vector128 v = Vector128.Load(source, i);
+            Vector128 eq = Vector128.Equals(v, target128);
+            int mask = Vector128.ExtractMostSignificantBits(eq);
+            if (mask != 0) {
+                int bit = BitOperations.TrailingZeroCount(mask);
+                return i + bit;
+            }
+            i = i + 16;
+        }
+
+        while (i < n) {
+            if (source[i] == value) return i;
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// <summary>在字节序列中查找指定字节值的第一个匹配项索引。</summary>
+    public static int IndexOf(this byte[] source, byte value) {
+        return MemoryExtensions.IndexOf(source, value, 0);
+    }
+
+    /// <summary>在字节序列中从后往前查找指定字节值的最后一个匹配项索引（AVX2 32 字节逆向扫描 + LeadingZeroCount 单周期定位）。</summary>
+    public static int LastIndexOf(this byte[] source, byte value) {
+        if (source == null || source.Length == 0) return -1;
+        int n = source.Length;
+        int i = n - 32;
+        Vector256 target256 = Vector256.Create(value);
+
+        while (i >= 0) {
+            Vector256 v = Vector256.Load(source, i);
+            Vector256 eq = Vector256.Equals(v, target256);
+            int mask = Vector256.ExtractMostSignificantBits(eq);
+            if (mask != 0) {
+                int bit = 31 - BitOperations.LeadingZeroCount(mask);
+                return i + bit;
+            }
+            i = i - 32;
+        }
+
+        int rem = i + 32;
+        int k = rem - 1;
+        while (k >= 0) {
+            if (source[k] == value) return k;
+            k = k - 1;
+        }
+        return -1;
+    }
+
+    /// <summary>判断字节序列中是否包含指定的字节值。</summary>
+    public static bool Contains(this byte[] source, byte value) {
+        return MemoryExtensions.IndexOf(source, value, 0) >= 0;
+    }
+}
