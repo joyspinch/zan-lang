@@ -1,0 +1,146 @@
+using System;
+using System.Collections.Generic;
+using System.Web;
+using Zan.Web.Core;
+using Zan.Web.Modules.System.Model;
+using Zan.Web.Modules.System.Dao;
+
+namespace Zan.Web.Modules.System.Controller;
+
+/// 系统用户管理控制器
+class SysUserController : WebController {
+    private SysUserDao _userDao = new SysUserDao();
+    private SysUserRoleDao _userRoleDao = new SysUserRoleDao();
+    private SysRoleDao _roleDao = new SysRoleDao();
+
+    /// GET /api/system/user/page - 分页查询用户列表
+    public async void Page() {
+        int page = this.InInt("page", 1);
+        int pageSize = this.InInt("pageSize", 20);
+        if (pageSize <= 0) { pageSize = this.InInt("limit", 20); }
+
+        List<SysUser> list = await _userDao.Page(page, pageSize);
+        long total = await _userDao.TotalCount();
+
+        string json = "{\"total\":" + Convert.ToString(total) + ",\"records\":[";
+        if (list != null) {
+            for (int i = 0; i < list.Count; i++) {
+                if (i > 0) { json += ","; }
+                SysUser u = list[i];
+                int roleId = await _userRoleDao.GetRoleId(u.id);
+                string roleName = "";
+                if (roleId > 0) {
+                    SysRole r = await _roleDao.ById(roleId);
+                    if (r != null && r.name != null) { roleName = r.name; }
+                }
+
+                json += "{\"id\":" + Convert.ToString(u.id) +
+                    ",\"username\":\"" + (u.username != null ? u.username : "") + "\"" +
+                    ",\"nickname\":\"" + (u.nickname != null ? u.nickname : "") + "\"" +
+                    ",\"email\":\"" + (u.email != null ? u.email : "") + "\"" +
+                    ",\"mobile\":\"" + (u.mobile != null ? u.mobile : "") + "\"" +
+                    ",\"avatar\":\"" + (u.avatar != null ? u.avatar : "") + "\"" +
+                    ",\"roleId\":" + Convert.ToString(roleId) +
+                    ",\"roleName\":\"" + roleName + "\"" +
+                    ",\"status\":" + Convert.ToString(u.status) +
+                    ",\"createdAt\":" + Convert.ToString(u.createdAt) +
+                    ",\"updatedAt\":" + Convert.ToString(u.updatedAt) + "}";
+            }
+        }
+        json += "]}";
+        this.OkJson(json);
+    }
+
+    /// POST /api/system/user/save - 新增或修改用户
+    public async void Save() {
+        int id = this.InInt("id", 0);
+        string username = this.In("username");
+        string password = this.In("password");
+        string nickname = this.In("nickname");
+        string email = this.In("email");
+        string mobile = this.In("mobile");
+        string avatar = this.In("avatar");
+        int status = this.InInt("status", 1);
+        int roleId = this.InInt("roleId", 0);
+
+        if (id == 0) {
+            if (username == null || username.Length == 0) {
+                this.FailJson(400, "用户名不能为空");
+                return;
+            }
+            if (password == null || password.Length == 0) {
+                this.FailJson(400, "初始密码不能为空");
+                return;
+            }
+            SysUser exist = await _userDao.ByUsername(username);
+            if (exist != null) {
+                this.FailJson(400, "用户名已存在");
+                return;
+            }
+
+            SysUser u = new SysUser();
+            u.username = username;
+            u.nickname = nickname != null && nickname.Length > 0 ? nickname : username;
+            u.email = email != null ? email : "";
+            u.mobile = mobile != null ? mobile : "";
+            u.avatar = avatar != null ? avatar : "";
+            u.status = status;
+            u.salt = Convert.ToString(DateTime.Now().ToUnixMilliseconds());
+            u.password = SysUserDao.HashPassword(password, u.salt);
+            long now = DateTime.Now().ToUnixSeconds();
+            u.createdAt = now;
+            u.updatedAt = now;
+
+            int newId = await _userDao.Insert(u);
+            if (roleId > 0) {
+                await _userRoleDao.SetUserRole(newId, roleId);
+            }
+            this.OkJson("{\"id\":" + Convert.ToString(newId) + "}");
+        } else {
+            SysUser u = await _userDao.ById(id);
+            if (u == null) {
+                this.FailJson(404, "用户不存在");
+                return;
+            }
+            if (nickname != null) { u.nickname = nickname; }
+            if (email != null) { u.email = email; }
+            if (mobile != null) { u.mobile = mobile; }
+            if (avatar != null) { u.avatar = avatar; }
+            u.status = status;
+
+            await _userDao.Update(u);
+            if (password != null && password.Length > 0) {
+                string newSalt = Convert.ToString(DateTime.Now().ToUnixMilliseconds());
+                await _userDao.UpdatePassword(id, password, newSalt);
+            }
+            if (roleId > 0) {
+                await _userRoleDao.SetUserRole(id, roleId);
+            }
+            this.OkJson("{\"id\":" + Convert.ToString(id) + "}");
+        }
+    }
+
+    /// POST /api/system/user/delete - 删除用户
+    public async void Delete() {
+        int id = this.InInt("id", 0);
+        if (id <= 0) {
+            this.FailJson(400, "参数错误");
+            return;
+        }
+        await _userDao.Delete(id);
+        await _userRoleDao.SetUserRole(id, 0);
+        this.OkJson("{\"success\":true}");
+    }
+
+    /// POST /api/system/user/status - 启用/禁用用户
+    public async void Status() {
+        int id = this.InInt("id", 0);
+        int status = this.InInt("status", 1);
+        if (id <= 0) {
+            this.FailJson(400, "参数错误");
+            return;
+        }
+        await _userDao.UpdateStatus(id, status);
+        this.OkJson("{\"success\":true}");
+    }
+}

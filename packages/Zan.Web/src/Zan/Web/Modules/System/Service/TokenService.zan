@@ -1,0 +1,110 @@
+using System;
+using System.Json;
+using Zan.Web.Cache;
+using Zan.Web.Core;
+using Zan.Web.Modules.System.Model;
+
+namespace Zan.Web.Modules.System.Service;
+
+/// 认证令牌与登录用户会话服务
+class TokenService {
+    static int DefaultTtl = 604800; // 7 天（秒）
+
+    /// 为指定用户签发 AccessToken 并存入缓存
+    public static async LoginUser CreateToken(SysUser user, int roleId, string roleName) {
+        Guid g = Guid.NewV4();
+        string rawToken = g != null ? g.text.Replace("-", "") : Convert.ToString(DateTime.Now().ToUnixSeconds());
+        string token = rawToken.ToLower();
+
+        long now = DateTime.Now().ToUnixSeconds();
+        LoginUser loginUser = new LoginUser();
+        loginUser.UserID = user.id;
+        loginUser.RoleID = roleId;
+        loginUser.RoleName = roleName;
+        loginUser.UserName = user.username;
+        loginUser.NickName = user.nickname != null ? user.nickname : user.username;
+        loginUser.Avatar = user.avatar != null ? user.avatar : "";
+        loginUser.AccessToken = token;
+        loginUser.Expires = (now + DefaultTtl) * 1000;
+
+        string json = loginUser.ToJson();
+        string key = "auth:token:" + token;
+        await RedisCache.SetAsync(key, json, DefaultTtl);
+
+        return loginUser;
+    }
+
+    /// 根据 Token 校验并恢复登录用户对象
+    public static async LoginUser GetLoginUser(string token) {
+        if (token == null || token.Length == 0) {
+            return null;
+        }
+        string key = "auth:token:" + token;
+        string json = await RedisCache.GetAsync(key, "");
+        if (json == null || json.Length == 0) {
+            return null;
+        }
+
+        JsonValue root = JsonValue.Parse(json);
+        if (root == null || !root.IsObject()) {
+            return null;
+        }
+
+        LoginUser u = new LoginUser();
+        u.UserID = root.Int("UserID", 0);
+        u.RoleID = root.Int("RoleID", 0);
+        u.RoleName = root.Str("RoleName", "");
+        u.UserName = root.Str("UserName", "");
+        u.NickName = root.Str("NickName", "");
+        u.Avatar = root.Str("Avatar", "");
+        u.AccessToken = root.Str("AccessToken", "");
+        u.Expires = root.Long("Expires", 0);
+        return u;
+    }
+
+    /// 注销使 Token 失效
+    public static async void RemoveToken(string token) {
+        if (token != null && token.Length > 0) {
+            string key = "auth:token:" + token;
+            await RedisCache.DelAsync(key);
+        }
+    }
+
+    /// 从当前 HTTP 请求中智能提取 Token（按 Header / Query / Cookie 优先级解析）
+    public static string ExtractToken(WebController ctrl) {
+        if (ctrl == null || ctrl.Ctx() == null) {
+            return "";
+        }
+        // 1. Authorization: Bearer <token>
+        string authHeader = ctrl.Ctx().Header("Authorization");
+        if (authHeader != null && authHeader.Length > 7) {
+            if (authHeader.StartsWith("Bearer ") || authHeader.StartsWith("bearer ")) {
+                return authHeader.Substring(7).Trim();
+            }
+        }
+        // 2. Header token / AccessToken
+        string hToken = ctrl.Ctx().Header("token");
+        if (hToken != null && hToken.Length > 0) {
+            return hToken.Trim();
+        }
+        string hAccess = ctrl.Ctx().Header("AccessToken");
+        if (hAccess != null && hAccess.Length > 0) {
+            return hAccess.Trim();
+        }
+        // 3. Query string: access_token / token
+        string qAccess = ctrl.In("access_token");
+        if (qAccess != null && qAccess.Length > 0) {
+            return qAccess.Trim();
+        }
+        string qToken = ctrl.In("token");
+        if (qToken != null && qToken.Length > 0) {
+            return qToken.Trim();
+        }
+        // 4. Cookie: token
+        string cToken = ctrl.Ctx().Cookie("token");
+        if (cToken != null && cToken.Length > 0) {
+            return cToken.Trim();
+        }
+        return "";
+    }
+}

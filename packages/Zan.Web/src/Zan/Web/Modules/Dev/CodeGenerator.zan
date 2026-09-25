@@ -1,0 +1,162 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using Zan.Web.Protocol;
+using Zan.Web.Modules.Dev.Model;
+
+namespace Zan.Web.Modules.Dev;
+
+/// 1:1:1 代码生成引擎：根据配置自动产出 Model / Dao / Controller 原生代码
+class CodeGenerator {
+    /// 校验并标准化标识符
+    public static string PascalCase(string str) {
+        if (str == null || str.Length == 0) { return ""; }
+        List<string> parts = str.Split("_");
+        string result = "";
+        for (int i = 0; i < parts.Count; i++) {
+            string p = parts[i];
+            if (p.Length > 0) {
+                string head = p.Substring(0, 1).ToUpper();
+                string tail = p.Length > 1 ? p.Substring(1) : "";
+                result += head + tail;
+            }
+        }
+        return result;
+    }
+
+    /// 生成强类型 1:1 Model 源码
+    public static string GenerateModel(SysCurd curd, TableConfig conf) {
+        string clsName = curd.className != null && curd.className.Length > 0 ? curd.className : PascalCase(curd.tableName);
+        string modName = curd.moduleName != null && curd.moduleName.Length > 0 ? curd.moduleName : "App";
+
+        string code = "using System;\nusing System.Data.Orm;\n\n";
+        code += "namespace " + modName + ".Model;\n\n";
+        code += "/// " + curd.title + " 实体模型（与 " + curd.tableName + " 表 1:1:1 强类型同构）\n";
+        code += "[Table(Name = \"" + curd.tableName + "\")]\n";
+        code += "class " + clsName + " {\n";
+
+        if (conf != null && conf.columns != null) {
+            for (int i = 0; i < conf.columns.Count; i++) {
+                TableColumn col = conf.columns[i];
+                if (col.field == null || col.field.Length == 0) { continue; }
+                bool isPk = (conf.conf != null && conf.conf.innerKey == col.field) || col.field == "id";
+                if (isPk) {
+                    code += "    [Column(IsIdentity = true)]\n";
+                    code += "    public int " + col.field + ";\n\n";
+                } else {
+                    if (col.headerName != null && col.headerName.Length > 0) {
+                        code += "    /// " + col.headerName + "\n";
+                    }
+                    string ztype = col.type != null && col.type.Length > 0 ? col.type : "string";
+                    code += "    public " + ztype + " " + col.field + ";\n\n";
+                }
+            }
+        } else {
+            code += "    [Column(IsIdentity = true)]\n    public int id;\n";
+        }
+
+        code += "}\n";
+        return code;
+    }
+
+    /// 生成强类型 1:1 Dao 源码
+    public static string GenerateDao(SysCurd curd, TableConfig conf) {
+        string clsName = curd.className != null && curd.className.Length > 0 ? curd.className : PascalCase(curd.tableName);
+        string modName = curd.moduleName != null && curd.moduleName.Length > 0 ? curd.moduleName : "App";
+        string daoName = clsName + "Dao";
+
+        string code = "using System;\nusing System.Collections.Generic;\nusing System.Data.Orm;\nusing Zan.Web.Core;\n";
+        code += "using " + modName + ".Model;\n\n";
+        code += "namespace " + modName + ".Dao;\n\n";
+        code += "/// " + curd.title + " 数据访问网关（全异步原生 ORM，杜绝拼接 SQL）\n";
+        code += "class " + daoName + " {\n";
+        code += "    public async " + clsName + " ById(int id) {\n";
+        code += "        return await Db.Connection().Select<" + clsName + ">().Where(a => a.id == id).FirstAsync();\n";
+        code += "    }\n\n";
+        code += "    public async List<" + clsName + "> Page(int page, int pageSize) {\n";
+        code += "        if (page < 1) { page = 1; }\n";
+        code += "        if (pageSize < 1) { pageSize = 20; }\n";
+        code += "        int skip = (page - 1) * pageSize;\n";
+        code += "        return await Db.Connection().Select<" + clsName + ">()\n";
+        code += "            .OrderByDescending(a => a.id)\n";
+        code += "            .Skip(skip)\n";
+        code += "            .Take(pageSize)\n";
+        code += "            .ToListAsync();\n";
+        code += "    }\n\n";
+        code += "    public async long TotalCount() {\n";
+        code += "        return await Db.Connection().Select<" + clsName + ">().CountAsync();\n";
+        code += "    }\n\n";
+        code += "    public async int Insert(" + clsName + " item) {\n";
+        code += "        return await Db.Connection().Insert<" + clsName + ">(item).ExecuteIdentityAsync();\n";
+        code += "    }\n\n";
+        code += "    public async int Delete(int id) {\n";
+        code += "        return await Db.Connection().Delete<" + clsName + ">().Where(a => a.id == id).ExecuteAffrowsAsync();\n";
+        code += "    }\n";
+        code += "}\n";
+        return code;
+    }
+
+    /// 生成强类型 1:1 Controller 源码
+    public static string GenerateController(SysCurd curd, TableConfig conf) {
+        string clsName = curd.className != null && curd.className.Length > 0 ? curd.className : PascalCase(curd.tableName);
+        string modName = curd.moduleName != null && curd.moduleName.Length > 0 ? curd.moduleName : "App";
+        string ctrlName = clsName + "Controller";
+        string daoName = clsName + "Dao";
+
+        string code = "using System;\nusing System.Collections.Generic;\nusing System.Web;\nusing System.Json;\nusing Zan.Web.Core;\nusing Zan.Web.Protocol;\n";
+        code += "using " + modName + ".Model;\nusing " + modName + ".Dao;\n\n";
+        code += "namespace " + modName + ".Controller;\n\n";
+        code += "/// " + curd.title + " 管理控制器\n";
+        code += "class " + ctrlName + " : WebController {\n";
+        code += "    private " + daoName + " _dao = new " + daoName + "();\n\n";
+        code += "    /// GET /" + curd.tableName + "/list - 分页数据列表\n";
+        code += "    public async void List() {\n";
+        code += "        PostData p = this.ReadPostData();\n";
+        code += "        List<" + clsName + "> rows = await _dao.Page(p.page, p.pageSize);\n";
+        code += "        long total = await _dao.TotalCount();\n";
+        code += "        string json = \"{\\\"total\\\":\" + Convert.ToString(total) + \",\\\"records\\\":[]}\";\n";
+        code += "        this.OkJson(json);\n";
+        code += "    }\n\n";
+        code += "    /// GET /" + curd.tableName + "/get - 获取单条明细\n";
+        code += "    public async void Get() {\n";
+        code += "        int id = this.InInt(\"id\", 0);\n";
+        code += "        " + clsName + " item = await _dao.ById(id);\n";
+        code += "        if (item == null) { this.FailJson(404, \"记录不存在\"); return; }\n";
+        code += "        this.OkJson(\"{}\");\n";
+        code += "    }\n\n";
+        code += "    /// POST /" + curd.tableName + "/delete - 删除数据\n";
+        code += "    public async void Delete() {\n";
+        code += "        int id = this.InInt(\"id\", 0);\n";
+        code += "        int aff = await _dao.Delete(id);\n";
+        code += "        if (aff > 0) { this.OkJson(\"{}\"); } else { this.FailJson(400, \"删除失败\"); }\n";
+        code += "    }\n";
+        code += "}\n";
+        return code;
+    }
+
+    /// 输出到指定工程目录
+    public static void EmitFiles(string outputDir, SysCurd curd, TableConfig conf) {
+        if (!Directory.Exists(outputDir)) {
+            Directory.CreateDirectoryRecursive(outputDir);
+        }
+
+        string clsName = curd.className != null && curd.className.Length > 0 ? curd.className : PascalCase(curd.tableName);
+
+        string modelDir = Path.Combine(outputDir, "Model");
+        string daoDir = Path.Combine(outputDir, "Dao");
+        string ctrlDir = Path.Combine(outputDir, "Controller");
+
+        if (!Directory.Exists(modelDir)) { Directory.CreateDirectoryRecursive(modelDir); }
+        if (!Directory.Exists(daoDir)) { Directory.CreateDirectoryRecursive(daoDir); }
+        if (!Directory.Exists(ctrlDir)) { Directory.CreateDirectoryRecursive(ctrlDir); }
+
+        string modelFile = Path.Combine(modelDir, clsName + ".zan");
+        string daoFile = Path.Combine(daoDir, clsName + "Dao.zan");
+        string ctrlFile = Path.Combine(ctrlDir, clsName + "Controller.zan");
+
+        File.WriteAllText(modelFile, GenerateModel(curd, conf));
+        File.WriteAllText(daoFile, GenerateDao(curd, conf));
+        File.WriteAllText(ctrlFile, GenerateController(curd, conf));
+    }
+}
