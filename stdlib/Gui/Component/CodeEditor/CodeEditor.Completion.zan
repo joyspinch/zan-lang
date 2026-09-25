@@ -282,7 +282,6 @@ partial class CodeEditor {
     /// DllImport/StructLayout）与周边词按匹配度打分合并，排序后截断
     /// 前 60 条再套种类过滤。无候选时收起弹窗。
     void UpdateCompletion() {
-        string idrest = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
         string ln = lines[curLine];
 
         // 若处于点号模式，按输入的前缀过滤完整成员列表
@@ -300,8 +299,8 @@ partial class CodeEditor {
                     dscores.Add(sc);
                 }
             }
-            CodeEditor.SortByScore(acAllItems, acAllKinds, dscores);
             if (acAllItems.Count == 0) { acActive = false; acDot = false; return; }
+            CodeEditor.SortByScore(acAllItems, acAllKinds, dscores);
             acSel = 0;
             ApplyKindFilter();
             return;
@@ -309,10 +308,8 @@ partial class CodeEditor {
 
         // 常规字词补全
         int st = curCol;
-        while (st > 0) {
-            string ch = ln.Substring(st - 1, 1);
-            if (CodeEditor.InSet(idrest, ch)) { st = st - 1; }
-            else { break; }
+        while (st > 0 && CodeEditor.IsIdentByte(ln[st - 1] & 255)) {
+            st = st - 1;
         }
         acStart = st;
         string pfx = ln.Substring(st, curCol - st);
@@ -405,8 +402,8 @@ partial class CodeEditor {
     /// 属性，*Changed/*Click → 事件，否则为方法。
     static string MemberKind(string name) {
         if (name.Length == 0) { return "M"; }
-        string lower = "abcdefghijklmnopqrstuvwxyz";
-        if (CodeEditor.InSet(lower, name.Substring(0, 1))) { return "F"; }
+        int fc = name[0] & 255;
+        if (fc >= 97 && fc <= 122) { return "F"; }
         if (CodeEditor.Find(name, "Changed") >= 0 || CodeEditor.Find(name, "Click") >= 0) { return "E"; }
         string props = " Count Length Keys Values Now Today UtcNow Year Month Day Hour Minute Second DayOfWeek DayOfYear Ticks PI E Capacity Empty Chars ForegroundColor BackgroundColor ResetColor Title WindowWidth WindowHeight ExitCode HasExited Id ProcessName StandardOutput StandardError StandardInput NewLine MachineName UserName OSVersion ProcessorCount TickCount StackTrace CommandLine CurrentDirectory Is64BitOperatingSystem DirectorySeparatorChar AltDirectorySeparatorChar ";
         if (CodeEditor.Find(props, " " + name + " ") >= 0) { return "P"; }
@@ -424,12 +421,9 @@ partial class CodeEditor {
     /// —— 声明前总有类型或修饰符，
     /// 这正是它与调用或裸代码块的区别。
     static string DeclIdentBefore(string trimmed, int at) {
-        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
         int e = at;
-        while (e > 0) {
-            string ch = trimmed.Substring(e - 1, 1);
-            if (CodeEditor.InSet(idset, ch)) { e = e - 1; }
-            else { break; }
+        while (e > 0 && CodeEditor.IsIdentByte(trimmed[e - 1] & 255)) {
+            e = e - 1;
         }
         string name = trimmed.Substring(e, at - e);
         if (name.Length == 0 || e == 0) { return ""; }
@@ -469,10 +463,9 @@ partial class CodeEditor {
         // 名称之前的内容必须以类型或修饰符结尾。`} else {`
         // 以花括号结尾，其内部可能有 "set"（如 "settings.Save()"），
         // 这就是代码块被误判为属性的原因。
-        string tail = before.Substring(before.Length - 1, 1);
-        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
-        if (!CodeEditor.InSet(idset, tail) && tail != ">" && tail != "]"
-            && tail != "?") {
+        int tc = before[before.Length - 1] & 255;
+        if (!CodeEditor.IsIdentByte(tc) && tc != 62 && tc != 93
+            && tc != 63) {
             return "";
         }
         // `class A { get; }` 不是属性，且类型名已由
@@ -583,19 +576,18 @@ partial class CodeEditor {
     /// 真实引用与命名实参（`Upload = true`）、
     /// 类型名（`class Index`）或同名成员声明的区别。
     static int FindCallSite(string code, string name, int from) {
-        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
         int at = from;
         while (true) {
             int p = CodeEditor.FindFrom(code, name, at);
             if (p < 0) { return -1; }
             at = p + name.Length;
             bool word = true;
-            if (p > 0 && CodeEditor.InSet(idset, code.Substring(p - 1, 1))) { word = false; }
-            if (at < code.Length && CodeEditor.InSet(idset, code.Substring(at, 1))) { word = false; }
+            if (p > 0 && CodeEditor.IsIdentByte(code[p - 1] & 255)) { word = false; }
+            if (at < code.Length && CodeEditor.IsIdentByte(code[at] & 255)) { word = false; }
             if (word) {
                 int q = at;
-                while (q < code.Length && code.Substring(q, 1) == " ") { q = q + 1; }
-                if (q < code.Length && code.Substring(q, 1) == "(") { return p; }
+                while (q < code.Length && (code[q] & 255) == 32) { q = q + 1; }
+                if (q < code.Length && (code[q] & 255) == 40) { return p; }
             }
         }
     }
@@ -938,18 +930,17 @@ partial class CodeEditor {
         if (relX > lineW + app.Scale(2)) { return ""; }
         int col = CodeEditor.ColFromX(s, relX, fontSize);
         if (col < 0 || col > s.Length) { return ""; }
-        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
         bool onId = false;
-        if (col < s.Length && CodeEditor.InSet(idset, s.Substring(col, 1))) {
+        if (col < s.Length && CodeEditor.IsIdentByte(s[col] & 255)) {
             onId = true;
-        } else if (col > 0 && CodeEditor.InSet(idset, s.Substring(col - 1, 1))) {
+        } else if (col > 0 && CodeEditor.IsIdentByte(s[col - 1] & 255)) {
             onId = true;
         }
         if (!onId) { return ""; }
         int a = col;
-        while (a > 0 && CodeEditor.InSet(idset, s.Substring(a - 1, 1))) { a = a - 1; }
+        while (a > 0 && CodeEditor.IsIdentByte(s[a - 1] & 255)) { a = a - 1; }
         int b = col;
-        while (b < s.Length && CodeEditor.InSet(idset, s.Substring(b, 1))) { b = b + 1; }
+        while (b < s.Length && CodeEditor.IsIdentByte(s[b] & 255)) { b = b + 1; }
         if (b <= a) { return ""; }
         return s.Substring(a, b - a);
     }
@@ -1023,35 +1014,30 @@ partial class CodeEditor {
     /// 接收者（`items.Where(x).Select` -> `items`，因为调用的
     /// 实参列表会整体跳过）。没有则返回空。
     string ReceiverBefore(string ln, int dotPos) {
-        string idchars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
         int pos = dotPos;
-        if (pos > 0 && ln.Substring(pos - 1, 1) == ")") {
+        if (pos > 0 && (ln[pos - 1] & 255) == 41) {
             int depth = 1;
             pos = pos - 1;
             while (pos > 0 && depth > 0) {
                 pos = pos - 1;
-                string pc = ln.Substring(pos, 1);
-                if (pc == ")") { depth = depth + 1; }
-                else if (pc == "(") { depth = depth - 1; }
+                int pc = ln[pos] & 255;
+                if (pc == 41) { depth = depth + 1; }
+                else if (pc == 40) { depth = depth - 1; }
             }
         }
         int end = pos;
-        while (pos > 0) {
-            string pc = ln.Substring(pos - 1, 1);
-            if (CodeEditor.InSet(idchars, pc)) { pos = pos - 1; }
-            else { break; }
+        while (pos > 0 && CodeEditor.IsIdentByte(ln[pos - 1] & 255)) {
+            pos = pos - 1;
         }
         string word = ln.Substring(pos, end - pos);
         if (word.Length > 0) { return word; }
         // 前面只有点号（跨行断开的链式调用后的 `.Select`）：
         // 回退到该点号之前的片段。
-        if (pos > 0 && ln.Substring(pos - 1, 1) == ".") {
+        if (pos > 0 && (ln[pos - 1] & 255) == 46) {
             int oEnd = pos - 1;
             int oStart = oEnd;
-            while (oStart > 0) {
-                string pc = ln.Substring(oStart - 1, 1);
-                if (CodeEditor.InSet(idchars, pc)) { oStart = oStart - 1; }
-                else { break; }
+            while (oStart > 0 && CodeEditor.IsIdentByte(ln[oStart - 1] & 255)) {
+                oStart = oStart - 1;
             }
             return ln.Substring(oStart, oEnd - oStart);
         }
@@ -1196,11 +1182,17 @@ partial class CodeEditor {
     void UsingDotCompletion() {
         string ln = lines[curLine];
         int dotPos = curCol - 1;
-        string nsset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.";
         int s = dotPos;
-        while (s > 0 && CodeEditor.InSet(nsset, ln.Substring(s - 1, 1))) { s = s - 1; }
+        while (s > 0) {
+            int c = ln[s - 1] & 255;
+            if (CodeEditor.IsIdentByte(c) || c == 46) {
+                s = s - 1;
+            } else {
+                break;
+            }
+        }
         string prefix = ln.Substring(s, dotPos - s);
-        while (prefix.Length > 0 && prefix.Substring(prefix.Length - 1, 1) == ".") {
+        while (prefix.Length > 0 && (prefix[prefix.Length - 1] & 255) == 46) {
             prefix = prefix.Substring(0, prefix.Length - 1);
         }
         acStart = curCol;
@@ -1500,15 +1492,12 @@ partial class CodeEditor {
         else if (CodeEditor.StartsWithP(s, "interface ")) { kw = "interface "; }
         else { return ""; }
         string rest = CodeEditor.LTrim(s.Substring(kw.Length, s.Length - kw.Length));
-        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
-        string name = "";
         int i = 0;
-        while (i < rest.Length) {
-            string ch = rest.Substring(i, 1);
-            if (CodeEditor.InSet(idset, ch)) { name = name + ch; i = i + 1; }
-            else { break; }
+        int rlen = rest.Length;
+        while (i < rlen && CodeEditor.IsIdentByte(rest[i] & 255)) {
+            i = i + 1;
         }
-        return name;
+        return rest.Substring(0, i);
     }
 
     /// 当 `head`（后跟 `(` 的名称之前的文本）
@@ -1516,18 +1505,20 @@ partial class CodeEditor {
     /// 像 `app.MaxBody(x);` 这样的调用前面有 `app.`，因此不能
     /// 将其报告为 `MaxBody` 的声明。
     static bool DeclHeadOk(string head) {
-        string h = head;
-        while (h.Length > 0) {
-            string last = h.Substring(h.Length - 1, 1);
-            if (last != " " && last != "\t") { break; }
-            h = h.Substring(0, h.Length - 1);
+        if (head == null) { return false; }
+        int hlen = head.Length;
+        int end = hlen;
+        while (end > 0) {
+            int c = head[end - 1] & 255;
+            if (c != 32 && c != 9) { break; }
+            end = end - 1;
         }
-        if (h.Length == 0) { return false; }
+        if (end == 0) { return false; }
         // 类型 token 必须与名称以空白分隔……
-        if (h.Length == head.Length) { return false; }
+        if (end == hlen) { return false; }
         // ……且不能以成员访问或运算符结尾。
-        string ok = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_>]";
-        return CodeEditor.InSet(ok, h.Substring(h.Length - 1, 1));
+        int last = head[end - 1] & 255;
+        return CodeEditor.IsIdentByte(last) || last == 62 || last == 93;
     }
 
     /// 若 `trimmed` 是直接成员声明（方法 / 字段 / 属性）
@@ -1538,12 +1529,11 @@ partial class CodeEditor {
         string f = s.Substring(0, 1);
         if (f == "/" || f == "*" || f == "#" || f == "@" || f == "[" || f == "}" || f == "{") { return ""; }
         if (CodeEditor.TypeDeclName(trimmed).Length > 0) { return ""; }
-        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
         // 方法：标识符后紧跟 '('。
         int paren = CodeEditor.Find(s, "(");
         if (paren > 0) {
             int e = paren;
-            while (e > 0 && CodeEditor.InSet(idset, s.Substring(e - 1, 1))) { e = e - 1; }
+            while (e > 0 && CodeEditor.IsIdentByte(s[e - 1] & 255)) { e = e - 1; }
             string mname = s.Substring(e, paren - e);
             if (mname.Length == 0) { return ""; }
             if (e == 0) { return ""; }
@@ -1553,22 +1543,22 @@ partial class CodeEditor {
         // 字段 / 属性："Type name;"、"Type name =" 或 "Type name {"。
         int term = -1;
         for (int ti = 0; ti < s.Length; ti = ti + 1) {
-            string ch = s.Substring(ti, 1);
-            if (ch == ";" || ch == "=" || ch == "{") { term = ti; break; }
+            int c = s[ti] & 255;
+            if (c == 59 || c == 61 || c == 123) { term = ti; break; }
         }
         if (term < 0) { return ""; }
         string head = CodeEditor.TrimStr(s.Substring(0, term));
         int b = head.Length;
-        while (b > 0 && !CodeEditor.InSet(idset, head.Substring(b - 1, 1))) { b = b - 1; }
+        while (b > 0 && !CodeEditor.IsIdentByte(head[b - 1] & 255)) { b = b - 1; }
         int a = b;
-        while (a > 0 && CodeEditor.InSet(idset, head.Substring(a - 1, 1))) { a = a - 1; }
+        while (a > 0 && CodeEditor.IsIdentByte(head[a - 1] & 255)) { a = a - 1; }
         if (b <= a) { return ""; }
         string name = head.Substring(a, b - a);
         string before = CodeEditor.TrimStr(head.Substring(0, a));
         if (before.Length == 0) { return ""; }        // 前面需要有类型 token
         if (CodeEditor.IsControlWord(name)) { return ""; }
-        string digits = "0123456789";
-        if (CodeEditor.InSet(digits, name.Substring(0, 1))) { return ""; }
+        int fc = name[0] & 255;
+        if (fc >= 48 && fc <= 57) { return ""; }
         return name;
     }
 
@@ -1876,26 +1866,25 @@ partial class CodeEditor {
     /// 无则 ""。
     string ResolveVarType(string name) {
         if (name.Length == 0) { return ""; }
-        string idset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
         for (int li = 0; li < lines.Count; li = li + 1) {
             string s = CodeEditor.TrimStr(lines[li]);
             int from = 0;
             while (true) {
                 int p = CodeEditor.FindFrom(s, name, from);
                 if (p < 0) { break; }
-                bool lok = (p > 0 && s.Substring(p - 1, 1) == " ");
+                bool lok = (p > 0 && (s[p - 1] & 255) == 32);
                 int rp = p + name.Length;
                 bool rok = false;
                 if (rp < s.Length) {
-                    string rc = s.Substring(rp, 1);
-                    if (rc == " " || rc == "=" || rc == ";") { rok = true; }
+                    int rc = s[rp] & 255;
+                    if (rc == 32 || rc == 61 || rc == 59) { rok = true; }
                 }
                 if (lok && rok) {
                     // `name` 紧邻之前的 token 必须是类型引用
                     int te = p - 1;
-                    while (te > 0 && s.Substring(te - 1, 1) == " ") { te = te - 1; }
+                    while (te > 0 && (s[te - 1] & 255) == 32) { te = te - 1; }
                     int ts = te;
-                    while (ts > 0 && CodeEditor.InSet(idset, s.Substring(ts - 1, 1))) { ts = ts - 1; }
+                    while (ts > 0 && CodeEditor.IsIdentByte(s[ts - 1] & 255)) { ts = ts - 1; }
                     // 允许类型后带泛型实参列表：List<int>
                     int gts = ts;
                     if (te > ts) {
@@ -1906,9 +1895,8 @@ partial class CodeEditor {
                         if (lt > 0) { typeTok = typeTok.Substring(0, lt); }
                         if (typeTok.Length > 0 && !CodeEditor.IsControlWord(typeTok)
                             && !CodeEditor.StartsWithP(typeTok, "return")) {
-                            string firstc = typeTok.Substring(0, 1);
-                            string digits = "0123456789";
-                            if (!CodeEditor.InSet(digits, firstc)) { return typeTok; }
+                            int fc = typeTok[0] & 255;
+                            if (fc < 48 || fc > 57) { return typeTok; }
                         }
                     }
                 }
