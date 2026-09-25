@@ -208,8 +208,40 @@ static const zan_builtin_member_t members_vector128[] = {
     { "Equals",                       'M', "Vector128 Equals(Vector128 left, Vector128 right)" },
     { "ExtractMostSignificantBits",   'M', "int ExtractMostSignificantBits(Vector128 value)" },
     { "Shuffle",                      'M', "Vector128 Shuffle(Vector128 value, Vector128 mask)" },
+    { "Add",                          'M', "Vector128 Add(Vector128 left, Vector128 right)" },
+    { "Subtract",                     'M', "Vector128 Subtract(Vector128 left, Vector128 right)" },
+    { "AddSaturate",                  'M', "Vector128 AddSaturate(Vector128 left, Vector128 right)" },
+    { "SubtractSaturate",             'M', "Vector128 SubtractSaturate(Vector128 left, Vector128 right)" },
+    { "Min",                          'M', "Vector128 Min(Vector128 left, Vector128 right)" },
+    { "Max",                          'M', "Vector128 Max(Vector128 left, Vector128 right)" },
+    { "Average",                      'M', "Vector128 Average(Vector128 left, Vector128 right)" },
+    { "ConditionalSelect",            'M', "Vector128 ConditionalSelect(Vector128 condition, Vector128 left, Vector128 right)" },
+    { "UnpackLow",                    'M', "Vector128 UnpackLow(Vector128 left, Vector128 right)" },
+    { "UnpackHigh",                   'M', "Vector128 UnpackHigh(Vector128 left, Vector128 right)" },
+    { "GreaterThan",                  'M', "Vector128 GreaterThan(Vector128 left, Vector128 right)" },
+    { "LessThan",                     'M', "Vector128 LessThan(Vector128 left, Vector128 right)" },
+    { "Prefetch",                     'M', "void Prefetch(nint address)" },
+    { "Prefetch",                     'M', "void Prefetch(byte[] source, int offset)" },
     { "Zero",                         'P', "Vector128 Zero" },
     { "AllBitsSet",                   'P', "Vector128 AllBitsSet" },
+};
+
+static const zan_builtin_member_t members_vector256[] = {
+    { "Create",                       'M', "Vector256 Create(byte value)" },
+    { "Load",                         'M', "Vector256 Load(nint address)" },
+    { "Load",                         'M', "Vector256 Load(byte[] source)" },
+    { "Load",                         'M', "Vector256 Load(byte[] source, int offset)" },
+    { "Store",                        'M', "void Store(nint address, Vector256 source)" },
+    { "Store",                        'M', "void Store(byte[] dest, Vector256 source)" },
+    { "Store",                        'M', "void Store(byte[] dest, int offset, Vector256 source)" },
+    { "And",                          'M', "Vector256 And(Vector256 left, Vector256 right)" },
+    { "Or",                           'M', "Vector256 Or(Vector256 left, Vector256 right)" },
+    { "Xor",                          'M', "Vector256 Xor(Vector256 left, Vector256 right)" },
+    { "AndNot",                       'M', "Vector256 AndNot(Vector256 left, Vector256 right)" },
+    { "Equals",                       'M', "Vector256 Equals(Vector256 left, Vector256 right)" },
+    { "ExtractMostSignificantBits",   'M', "int ExtractMostSignificantBits(Vector256 value)" },
+    { "Zero",                         'P', "Vector256 Zero" },
+    { "AllBitsSet",                   'P', "Vector256 AllBitsSet" },
 };
 
 static const zan_builtin_member_t members_bitops[] = {
@@ -276,6 +308,7 @@ static const zan_builtin_type_t builtin_types[] = {
     BT("Aes", "Aes", "Aes", 1, members_x86_aes),
     BT("Sse2", "Sse2", "Sse2", 1, members_x86_sse2),
     BT("Vector128", "Vector128", "Vector128", 1, members_vector128),
+    BT("Vector256", "Vector256", "Vector256", 1, members_vector256),
 };
 
 const zan_builtin_type_t *zan_builtin_types(int *count) {
@@ -300,7 +333,7 @@ const char *zan_builtin_member_result(const char *type, const char *name,
     static const char *results[] = {
         "string", "int", "long", "double", "bool", "void", "nint",
         "List<string>", "List<K>", "List<V>", "ConsoleColor", "T[]",
-        "Vector128",
+        "Vector128", "Vector256",
     };
     const zan_builtin_type_t *bt = zan_builtin_find(type);
     if (!bt || !name || name_len <= 0) return NULL;

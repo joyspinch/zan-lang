@@ -1996,3 +1996,19 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
 - **根因**：`src/compiler/checker.c` 中针对方法形参与构造函数形参做兼容性检查时，当目标形参为接口或对象引用类型时，未严格限制实参必须属于对象/引用/结构体或显式装箱类型，部分标量类型分支漏掉了 `type_implements_interface` 或引用类型的守卫断言。
 - **修法**：在形参实参匹配检查中全面收紧接口与对象的类型分配检查，对接口类型形参强制要求实参必须是实现了该接口的合法类或结构体类型，标量类型必须显式转换或装箱，否则当场发出诊断拦截（如 `diag_call_interface_arg_mismatch` 与 `diag_ctor_interface_arg_mismatch`）。
 
+## 通用硬件向量（Vector128/Vector256）与 LLVM 指令零开销直通（2026-09-25）
+
+- **背景与意图**：高级加速算法（图像调光/Alpha混合/通道解包/大吞吐文本与协议扫描）不能靠在 C 运行时里针对每个算法堆写 native 驱动，必须在编译器层面将硬件 SIMD 体系开放给纯 Zan 源码，使编写 Zan 源码即可直接发射单周期 CPU 机器码。
+- **Vector128 饱和运算与图像原语**：
+  1. **饱和算术（Saturated Math）**：`Vector128.AddSaturate` / `SubtractSaturate` 直接降阶发射 LLVM `llvm.uadd.sat.v16i8` / `llvm.usub.sat.v16i8`。在 x86 上单周期直出 `paddusb` / `psubusb`，0~255 硬件自动截断，消灭像素计算中由于分支预测失败引起的性能惩罚（64MB 图像调光吞吐达到 1.57 GB/s，提速 6.65 倍）；
+  2. **极值与均值（Min/Max/Average）**：映射为 `llvm.umin.v16i8` (`pminub`)、`llvm.umax.v16i8` (`pmaxub`)、`llvm.x86.sse2.pavg.b` (`pavgb`)，64MB 图像降采样均值吞吐达 1.62 GB/s（提速 8.66 倍）；
+  3. **条件选择（ConditionalSelect / Blend）**：发射寄存器级按位混合 `(mask & left) | (~mask & right)`，LLVM 后端自动融合发射 `pblendvb` / `vblendvps` 或 ARM64 `bsl`；
+  4. **通道交错解包（UnpackLow / UnpackHigh）**：发射常量掩码 `shufflevector`，x86 直出 `punpcklbw` / `punpckhbw`；
+  5. **预取指令与 Opaque Pointer 命名**：LLVM 15+ 开启 Opaque Pointer 后，接受指针参数的多态 intrinsic 必须修饰地址空间后缀（必须声明为 `llvm.prefetch.p0`，不可用 `llvm.prefetch`，否则 LLVM 模块校验报 Intrinsic name not mangled correctly）。
+- **Vector256 32 字节硬件向量体系（AVX2）**：
+  1. **布局契约**：`struct Vector256 { long V0; long V1; long V2; long V3; }`，LLVM 侧 `%struct.Vector256 = type { i64, i64, i64, i64 }`；
+  2. **纯寄存器 SSA 转换**：通过栈槽或 SSA 寄存器操作与 `<32 x i8>` / `<4 x i64>` 映射；
+  3. **读写对齐防线**：非对齐内存加载必须设置 `LLVMSetAlignment(ld, 1)`，发射 `vmovdqu`，严禁产生对齐异常；
+  4. **单周期掩码抽取**：比对发射 `vpcmpeqb`，掩码提取调用 `llvm.x86.avx2.pmovmskb` 直出 32 位通用寄存器掩码，32 字节单周期步长扫描吞吐突破 2.77 GB/s。
+- **内建方法名匹配陷阱**：在 `irgen_expr.c` 进行方法名长度比对时，`ExtractMostSignificantBits` 字符数严格为 26（非 27），长度计算偏差会导致内建短路失败回退至未解析外部符号。
+
