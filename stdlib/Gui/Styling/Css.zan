@@ -613,19 +613,24 @@ class Css {
 
     /// 括号外第一个整词 `kw`（前后是空白或边界）的下标，无则 -1。
     static int FindTopKeyword(string s, string kw) {
+        if (s == null || kw == null || kw.Length == 0) { return -1; }
         int depth = 0;
         int i = 0;
         int n = s.Length;
+        int kwLen = kw.Length;
+        string kwLower = kw.ToLower();
+        int firstByte = kwLower[0] & 255;
         while (i < n) {
-            string ch = s.Substring(i, 1);
-            if (ch == "(") { depth = depth + 1; i = i + 1; continue; }
-            if (ch == ")") { depth = depth - 1; i = i + 1; continue; }
-            if (depth == 0 && Css.Lower(ch) == kw.Substring(0, 1)
-                && i + kw.Length <= n
-                && Css.Lower(s.Substring(i, kw.Length)) == kw) {
-                bool before = (i == 0) || Css.Space(s.Substring(i - 1, 1));
-                int after = i + kw.Length;
-                bool okAfter = (after >= n) || Css.Space(s.Substring(after, 1));
+            int c = s[i] & 255;
+            if (c == 40) { depth = depth + 1; i = i + 1; continue; }
+            if (c == 41) { depth = depth - 1; i = i + 1; continue; }
+            int cLower = (c >= 65 && c <= 90) ? c + 32 : c;
+            if (depth == 0 && cLower == firstByte
+                && i + kwLen <= n
+                && s.Substring(i, kwLen).ToLower() == kwLower) {
+                bool before = (i == 0) || Css.IsSpaceByte(s[i - 1] & 255);
+                int after = i + kwLen;
+                bool okAfter = (after >= n) || Css.IsSpaceByte(s[after] & 255);
                 if (before && okAfter) { return i; }
             }
             i = i + 1;
@@ -635,12 +640,25 @@ class Css {
 
     /// 顶层（括号外）第一个 `tok` 的下标，无则 -1。
     static int TopToken(string s, string tok) {
+        if (s == null || tok == null || tok.Length == 0) { return -1; }
         int depth = 0;
-        for (int i = 0; i < s.Length; i = i + 1) {
-            string ch = s.Substring(i, 1);
-            if (ch == "(") { depth = depth + 1; }
-            else if (ch == ")") { if (depth > 0) { depth = depth - 1; } }
-            else if (ch == tok && depth == 0) { return i; }
+        int len = s.Length;
+        if (tok.Length == 1) {
+            int target = tok[0] & 255;
+            for (int i = 0; i < len; i = i + 1) {
+                int c = s[i] & 255;
+                if (c == 40) { depth = depth + 1; }
+                else if (c == 41) { if (depth > 0) { depth = depth - 1; } }
+                else if (c == target && depth == 0) { return i; }
+            }
+            return -1;
+        }
+        int tokLen = tok.Length;
+        for (int i = 0; i + tokLen <= len; i = i + 1) {
+            int c = s[i] & 255;
+            if (c == 40) { depth = depth + 1; }
+            else if (c == 41) { if (depth > 0) { depth = depth - 1; } }
+            else if (depth == 0 && s.Substring(i, tokLen) == tok) { return i; }
         }
         return -1;
     }
@@ -1042,9 +1060,15 @@ class Css {
         return s.IndexOf(needle, from);
     }
 
+    /// c 是否为空白字符码点（空格/制表/回车/换行）。
+    static bool IsSpaceByte(int c) {
+        return c == 32 || c == 9 || c == 13 || c == 10;
+    }
+
     /// ch 是否为空白字符（空格/制表/回车/换行）。
     static bool Space(string ch) {
-        return ch == " " || ch == "\t" || ch == "\r" || ch == "\n";
+        if (ch == null || ch.Length == 0) { return false; }
+        return Css.IsSpaceByte(ch[0] & 255);
     }
 
     /// 去除两端的空白字符（利用内置 SSA 硬件寄存器级极速裁剪）。
@@ -1578,57 +1602,58 @@ class Selector {
     /// 解析 `[...]` 的内容并记入本选择器；不建模的属性返回 false
     /// （调用方因此丢弃整条规则，与旧行为一致）。
     bool AddAttr(string inner) {
+        if (inner == null) { return false; }
         int k = 0;
         int m = inner.Length;
-        string name = "";
+        int nameStart = k;
         // 属性名不能吃到运算符字符（`^`/`$`/`|` 也是合法名字符，
         // 但在 `[...]` 里它们是 `^=`/`$=`/`|=` 的开头）。
         while (k < m) {
-            string c0 = inner.Substring(k, 1);
-            if (Css.Space(c0) || c0 == "=" || c0 == "~" || c0 == "|"
-                || c0 == "^" || c0 == "$" || c0 == "*") {
+            int c0 = inner[k] & 255;
+            if (Css.IsSpaceByte(c0) || c0 == 61 || c0 == 126 || c0 == 124
+                || c0 == 94 || c0 == 36 || c0 == 42) {
                 break;
             }
-            name = name + c0;
             k = k + 1;
         }
-        name = Css.Lower(name);
+        string name = inner.Substring(nameStart, k - nameStart).ToLower();
         if (name == "") { return false; }
-        while (k < m && Css.Space(inner.Substring(k, 1))) { k = k + 1; }
+        while (k < m && Css.IsSpaceByte(inner[k] & 255)) { k = k + 1; }
         string op = "";
         string val = "";
         bool nocase = false;
         if (k < m) {
-            string c = inner.Substring(k, 1);
-            if (c == "=") { op = "="; k = k + 1; }
-            else if ((c == "~" || c == "|" || c == "^" || c == "$" || c == "*")
-                     && k + 1 < m && inner.Substring(k + 1, 1) == "=") {
-                op = c + "=";
+            int c = inner[k] & 255;
+            if (c == 61) { op = "="; k = k + 1; }
+            else if ((c == 126 || c == 124 || c == 94 || c == 36 || c == 42)
+                     && k + 1 < m && (inner[k + 1] & 255) == 61) {
+                op = inner.Substring(k, 2);
                 k = k + 2;
             } else {
                 return false;
             }
-            while (k < m && Css.Space(inner.Substring(k, 1))) { k = k + 1; }
-            if (k < m && (inner.Substring(k, 1) == "\""
-                          || inner.Substring(k, 1) == "'")) {
-                string q = inner.Substring(k, 1);
+            while (k < m && Css.IsSpaceByte(inner[k] & 255)) { k = k + 1; }
+            if (k < m && ((inner[k] & 255) == 34 || (inner[k] & 255) == 39)) {
+                int qChar = inner[k] & 255;
+                string q = qChar == 34 ? "\"" : "'";
                 int e = Css.IndexFrom(inner, q, k + 1);
                 if (e < 0) { return false; }
                 val = inner.Substring(k + 1, e - k - 1);
                 k = e + 1;
             } else {
-                while (k < m && !Css.Space(inner.Substring(k, 1))) {
-                    val = val + inner.Substring(k, 1);
+                int valStart = k;
+                while (k < m && !Css.IsSpaceByte(inner[k] & 255)) {
                     k = k + 1;
                 }
+                val = inner.Substring(valStart, k - valStart);
             }
-            while (k < m && Css.Space(inner.Substring(k, 1))) { k = k + 1; }
+            while (k < m && Css.IsSpaceByte(inner[k] & 255)) { k = k + 1; }
             if (k < m) {
-                string f = Css.Lower(inner.Substring(k, 1));
-                if (f == "i") { nocase = true; k = k + 1; }
-                else if (f == "s") { k = k + 1; }
+                int f = inner[k] & 255;
+                if (f == 105 || f == 73) { nocase = true; k = k + 1; }
+                else if (f == 115 || f == 83) { k = k + 1; }
                 else { return false; }
-                while (k < m && Css.Space(inner.Substring(k, 1))) { k = k + 1; }
+                while (k < m && Css.IsSpaceByte(inner[k] & 255)) { k = k + 1; }
                 if (k < m) { return false; }
             }
             if (val == "") { return false; }

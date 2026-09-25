@@ -130,6 +130,140 @@ class OrmSelect {
         while (i < vs.Count) { this.ps.AddDouble(vs[i]); i = i + 1; }
     }
 
+    /* ---- 值自带条件原语：应用层拼条件的唯一入口 ----
+     * 条件与其值在同一次调用里原子绑定，片段与参数没有分开传递的
+     * 通道，顺序错配在编译期就写不出来。列名按实体元数据校验
+     * （可省略 "t." 别名），不属于实体的列一律抛异常。 */
+
+    /// 校验列名属于本实体并补全 "t." 别名；未知列抛异常。
+    string RequireCol(string c) {
+        string n = c;
+        if (n.Length > 2 && n.IndexOf("t.") == 0) { n = n.Substring(2); }
+        if (!this.meta.Has(n)) {
+            throw new Exception(this.meta.Table + " has no column: " + c);
+        }
+        return "t." + n;
+    }
+
+    /// column = 文本值。
+    void WhereEq(string c, string v) {
+        if (!this.on) { return; }
+        this.W(this.RequireCol(c) + " = ?");
+        this.ps.Add(v);
+    }
+
+    /// column = 整数值。
+    void WhereEq(string c, int v) {
+        if (!this.on) { return; }
+        this.W(this.RequireCol(c) + " = ?");
+        this.ps.AddInt(v);
+    }
+
+    /// column = 64 位整数值。
+    void WhereEq(string c, long v) {
+        if (!this.on) { return; }
+        this.W(this.RequireCol(c) + " = ?");
+        this.ps.AddLong(v);
+    }
+
+    /// column &gt;= 整数值。
+    void WhereGe(string c, long v) {
+        if (!this.on) { return; }
+        this.W(this.RequireCol(c) + " >= ?");
+        this.ps.AddLong(v);
+    }
+
+    /// column &lt;= 整数值。
+    void WhereLe(string c, long v) {
+        if (!this.on) { return; }
+        this.W(this.RequireCol(c) + " <= ?");
+        this.ps.AddLong(v);
+    }
+
+    /// column IN (逐个占位符)；空列表按恒假处理，不生成 `IN ()`。
+    void WhereIn(string c, List<int> vs) {
+        if (!this.on) { return; }
+        if (vs.Count == 0) { this.W("1 = 0"); return; }
+        StringBuilder sb = new StringBuilder(this.RequireCol(c) + " IN (");
+        for (int i = 0; i < vs.Count; i = i + 1) {
+            if (i > 0) { sb.Append(", "); }
+            sb.Append("?");
+            this.ps.AddInt(vs[i]);
+        }
+        this.W(sb.Append(")").ToString());
+    }
+
+    /// <see cref="WhereIn"/> 的 long 版本。
+    void WhereIn(string c, List<long> vs) {
+        if (!this.on) { return; }
+        if (vs.Count == 0) { this.W("1 = 0"); return; }
+        StringBuilder sb = new StringBuilder(this.RequireCol(c) + " IN (");
+        for (int i = 0; i < vs.Count; i = i + 1) {
+            if (i > 0) { sb.Append(", "); }
+            sb.Append("?");
+            this.ps.AddLong(vs[i]);
+        }
+        this.W(sb.Append(")").ToString());
+    }
+
+    /// <see cref="WhereIn"/> 的 string 版本。
+    void WhereIn(string c, List<string> vs) {
+        if (!this.on) { return; }
+        if (vs.Count == 0) { this.W("1 = 0"); return; }
+        StringBuilder sb = new StringBuilder(this.RequireCol(c) + " IN (");
+        for (int i = 0; i < vs.Count; i = i + 1) {
+            if (i > 0) { sb.Append(", "); }
+            sb.Append("?");
+            this.ps.Add(vs[i]);
+        }
+        this.W(sb.Append(")").ToString());
+    }
+
+    /// 多列 OR LIKE："username|email" 一并子串匹配同一个值，每列绑定
+    /// 自己的参数，列名逐一校验。
+    void WhereLikeAny(string cols, string v) {
+        if (!this.on) { return; }
+        List<string> parts = cols.Split("|");
+        StringBuilder sb = new StringBuilder("(");
+        int n = 0;
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            string part = parts[i].Trim();
+            if (part.Length == 0) { continue; }
+            if (n > 0) { sb.Append(" OR "); }
+            sb.Append(this.RequireCol(part) + " LIKE ?");
+            this.ps.Add("%" + v + "%");
+            n = n + 1;
+        }
+        if (n == 0) { throw new Exception("WhereLikeAny without columns"); }
+        this.W(sb.Append(")").ToString());
+    }
+
+    /// 恒假条件：数据边界为空集时用它表达"一行都不许看"。
+    void WhereNone() {
+        if (!this.on) { return; }
+        this.W("1 = 0");
+    }
+
+    /// 声明式条件（<see cref="OrmCond"/> 列表）落成参数化 WHERE：
+    /// LIKE 走多列 OR 匹配，EQ/GE/LE 按宽松数字解析后绑定。
+    void WhereConds(List<OrmCond> cs) {
+        if (cs == null) { return; }
+        for (int i = 0; i < cs.Count; i = i + 1) {
+            OrmCond q = cs[i];
+            if (q.kind == "LIKE") {
+                this.WhereLikeAny(q.col, q.value);
+            } else if (q.kind == "EQ") {
+                this.WhereEq(q.col, (int)OrmCond.Num(q.value));
+            } else if (q.kind == "GE") {
+                this.WhereGe(q.col, OrmCond.Num(q.value));
+            } else if (q.kind == "LE") {
+                this.WhereLe(q.col, OrmCond.Num(q.value));
+            } else {
+                throw new Exception("unknown cond kind: " + q.kind);
+            }
+        }
+    }
+
     /// ORDER BY 追加一列（升序）。
     void OB(string col) {
         if (this.ob.Length == 0) { this.ob = col; }
