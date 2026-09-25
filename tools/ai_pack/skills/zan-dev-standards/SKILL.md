@@ -35,7 +35,8 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   ① 文本解码（`Encoding.UTF8.GetString`）优先利用 `bytes.IsAscii` AVX2 向量化探测，纯 ASCII 直通单次 `memcpy` 投影；十六进制编解码（`ToHexString`）禁止在循环体内使用 `Substring` + `StringBuilder`，必须单次预分配 `byte[]` 配合 16 字节字符常数表直接位运算寻址写入；图像像素批量处理（`ImageBuffer`）全面废除浮点乘除与逐点函数调用，统一采用定点数移位（如灰度加权 `(B*29 + G*150 + R*77) >> 8`）与向量化批处理；
   ② 子串检索与前缀后缀匹配全面对接编译器原生机器指令 `s.IndexOf(needle, from)` / `s.LastIndexOf` / `s.StartsWith` / `s.EndsWith`，彻底杜绝手写 `while (i + n <= h) { if (hay.Substring(i, n) == needle) ... }` 反模式（消灭千万级临时堆分配与 ARC 记账，实测提升 49 倍）；
   ③ 字符码点判断与十进制数字解析统一使用原生只读单周期字节索引 `s[i] & 255`，严禁通过 `NativeMemory.Alloc(8)` 写入再 Span 取首字节释放的堆外分配反模式，严禁逐位 `Substring(i, 1)`；
-  ④ 文本转义、分词与模板解析统一采用分块游标切片（Window Chunking），无特殊字符时直通返回原始字符串（0 堆申请），含特殊字符时以区间切片追加，消灭逐字节碎片分配；字典键值查询优先使用 `vars.ContainsKey(key)` 与 `TryGetValue`，严禁遍历 `vars.Keys` 数组造成 $O(N)$ 性能降级。
+  ④ 文本转义、分词与模板解析统一采用分块游标切片（Window Chunking），无特殊字符时直通返回原始字符串（0 堆申请），含特殊字符时以区间切片追加，消灭逐字节碎片分配；字典键值查询优先使用 `vars.ContainsKey(key)` 与 `TryGetValue`，严禁遍历 `vars.Keys` 数组造成 $O(N)$ 性能降级；
+  ⑤ GUI 与游戏高频渲染循环严禁闭包委托与多重 Span 重复构造：`YSortLayer` 等空间与深度排序结构采用紧凑索引直接访问（`GetSortedEntityId`）替代 `ForEachSorted` 委托闭包，消灭每帧闭包分配；`SpriteBatch.Add` 复用单一 `Span<float>` 实例完成 8 浮点装填；富文本与代码高亮词法探测（`CodeEditor.InSet/ContainsSub`、`Markdown` 行内解析、`ChatView.MdStrip`）全面直通原生 `IndexOf` 与分块游标区间切片。
 - **GenDb 查询链：表访问器只当链头，命名变量走 `__DbBind` 门面**。`this.Post`
   只在链式调用头部存在，裸赋值（`__DbQ_Post sel = this.Post;`）与当静态成员调
   （`Articles.PostList(...)`）都编译不过；要起名字（DAO 里拼条件、跨方法传选链）
