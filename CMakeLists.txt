@@ -1412,7 +1412,7 @@ add_test(NAME policy_server_mvc_ai_endpoint
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/server_mvc/ai_endpoint_allowlist.out
     -DOUT_EXE=${CMAKE_BINARY_DIR}/policy_server_mvc_ai_endpoint${_exe_ext}
     -DSTDLIB_STAMP=${_stdlib_stamp}
-    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/templates/server/server-mvc/src/Feature/AiEndpointPolicy.zan"
+    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Web/src/ZanWeb/AiEndpointPolicy.zan"
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 set_tests_properties(policy_server_mvc_ai_endpoint PROPERTIES TIMEOUT 120)
 
