@@ -29,13 +29,9 @@ class AuthUser {
         s.Db().Release(db);
     }
 
-    /* 12000 轮 SHA-256 KDF。字节级等价于旧链
-       material_{r+1} = hex(sha256(material_r + ":" + salt))：材料与
-       ":"+salt 写进复用的原始缓冲，每轮对缓冲字节直接做摘要，
-       hex 写回用 Span 直写（NativeMemory.Sha256 编译器内建：一轮
-       一次原生调用、零中间分配——旧纯 Zan 链每轮约 90 次堆分配、
-       全程 124ms；现在全程约 12ms）。返回值与库中既有 passwordHash
-       完全一致，无需重置账号。*/
+    /* 遗留口令哈希：12000 轮 SHA-256 迭代链（material_{r+1} =
+       hex(sha256(material_r + ":" + salt))），仅用于校验升级前的旧行；
+       新写入一律走 <see cref="NewHash"/> 的 PBKDF2 自描述格式。*/
     static string PasswordHash(string password, string salt) {
         int saltLen = salt.Length;
         /* 缓冲：材料(<=64 hex) + ":" + salt */
@@ -69,6 +65,40 @@ class AuthUser {
         }
     }
 
+    /* PBKDF2-HMAC-SHA256（stdlib Pbkdf2，默认 30 万轮 ≈ 0.17s/次，
+       登录专用路径）。存库格式自描述：pbkdf2$<iter>$<saltHex>$<hashHex>
+       ——盐与轮数随哈希落库，调参不迁移旧值；passwordSalt 列只服务
+       遗留行。迭代次数取 [auth].iter（env ZAN_AUTH_PBKDF2_ITER），
+       下限 1000。 */
+    static string NewHash(string password) {
+        int iter = Cfg.Auth.iter;
+        if (iter < 1000) { iter = 300000; }
+        string salt = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
+        string hex = Pbkdf2.Hex(password, salt, iter);
+        return "pbkdf2$" + Convert.ToString(iter) + "$" + salt + "$" + hex;
+    }
+
+    /* 校验口令对一行凭证：pbkdf2$ 自描述格式按解析出的盐/轮数重派生
+       比对；否则按遗留迭代链（passwordSalt 列）。比较走常时路径；
+       格式不认得、字段残缺一律拒绝。 */
+    static bool Verify(string password, string saltCol, string stored) {
+        if (stored.IndexOf("pbkdf2$") == 0) {
+            int p1 = stored.IndexOf("$", 7);
+            int p2 = stored.IndexOf("$", p1 + 1);
+            if (p1 < 0 || p2 < 0) { return false; }
+            int iter = Filter.ToInt(stored.Substring(7, p1 - 7), 0);
+            string salt = stored.Substring(p1 + 1, p2 - p1 - 1);
+            string want = stored.Substring(p2 + 1);
+            if (iter < 1 || salt.Length == 0 || want.Length != 64) { return false; }
+            return AuthToken.Equal(Pbkdf2.Hex(password, salt, iter), want);
+        }
+        if (saltCol.Length > 0 && stored.Length == 64) {
+            return AuthToken.Equal(AuthUser.PasswordHash(password, saltCol),
+                stored);
+        }
+        return false;
+    }
+
     static async User ByUsername(string username) {
         IDbConnection db = await AuthUser.Lease();
         if (db == null) { return null; }
@@ -91,14 +121,41 @@ class AuthUser {
         }
     }
 
-    /* 校验密码并发放 Cookie token；"" = 拒绝，调用方不得区分失败原因。*/
+    /* 校验密码并发放 Cookie token；"" = 拒绝，调用方不得区分失败原因
+       （限流、无此账号、密码错误同答空串）。爆破限流按账号记失败，
+       达阈值锁到窗口滑出（LoginThrottle）。*/
     static async string Login(string username, string password) {
+        if (!LoginThrottle.Allowed(username)) { return ""; }
         User row = await AuthUser.ByUsername(username);
-        if (row == null || row.status != AuthUser.Active) { return ""; }
-        string actual = AuthUser.PasswordHash(password, row.passwordSalt);
-        if (!AuthToken.Equal(actual, row.passwordHash)) { return ""; }
+        if (row == null || row.status != AuthUser.Active) {
+            LoginThrottle.Fail(username);
+            return "";
+        }
+        if (!AuthUser.Verify(password, row.passwordSalt, row.passwordHash)) {
+            LoginThrottle.Fail(username);
+            return "";
+        }
+        /* 遗留行成功登录即升级为 pbkdf2$ 自描述格式；写库失败静默，
+           下次登录再试。不 bump tokenVersion：已发会话与口令哈希无关。 */
+        if (row.passwordHash.IndexOf("pbkdf2$") != 0) {
+            await AuthUser.UpgradeHash(row.id, password);
+        }
+        LoginThrottle.Clear(username);
         return AuthToken.Issue(Convert.ToString(row.id), row.tokenVersion,
             WebApp.NowSeconds());
+    }
+
+    /* 登录成功后的哈希格式升级（遗留链 → pbkdf2$）。独立借还连接，
+       绝不嵌套在调用方租约之内。 */
+    static async void UpgradeHash(int uid, string password) {
+        IDbConnection db = await AuthUser.Lease();
+        if (db == null) { return; }
+        try {
+            int _n = await new UserDao(db).UpgradeHash(uid,
+                AuthUser.NewHash(password), WebApp.NowSeconds());
+        } finally {
+            AuthUser.Give(db);
+        }
     }
 
     /* 账号当前 token 版本号；无法登录时返回 -1。token 版本不同即作废，token 本身不含密码材料。

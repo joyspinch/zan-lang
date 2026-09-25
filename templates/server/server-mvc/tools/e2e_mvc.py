@@ -34,6 +34,7 @@ Stdlib urllib/socket/subprocess/sqlite3 only.
 """
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
@@ -83,6 +84,25 @@ def http(path, data=None, cookie=None, timeout=15):
     req = urllib.request.Request(BASE + path)
     if cookie:
         req.add_header("Cookie", cookie)
+    body = urllib.parse.urlencode(data).encode() if data is not None else None
+    if body is not None:
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        resp = opener.open(req, body, timeout=timeout)
+        return (resp.status, resp.read().decode("utf-8", "replace"),
+                resp.headers.get_all("Set-Cookie") or [])
+    except urllib.error.HTTPError as e:
+        return (e.code, e.read().decode("utf-8", "replace"),
+                e.headers.get_all("Set-Cookie") or [])
+
+
+def http_h(path, data=None, headers=None, cookie=None, timeout=15):
+    """http() with extra request headers — for Origin/Sec-Fetch/XFP probes."""
+    req = urllib.request.Request(BASE + path)
+    if cookie:
+        req.add_header("Cookie", cookie)
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
     body = urllib.parse.urlencode(data).encode() if data is not None else None
     if body is not None:
         req.add_header("Content-Type", "application/x-www-form-urlencoded")
@@ -364,6 +384,23 @@ def run_matrix(catcher):
     ok(code == 200, "static admin.css 200")
     code, body, _ = http("/")
     ok(code == 200 and len(body) > 200, "front page renders")
+
+    # ---- CSRF 前哨：跨站 Origin/Sec-Fetch-Site 在管线入口拒 403（A367）----
+    # 前哨短路发生在控制器之前：这些失败不计入登录限流。
+    code, _b, _c = http_h("/admin/login", {"user": "admin", "pass": "x"},
+                          {"Origin": "https://evil.example"})
+    ok(code == 403, "cross-origin form POST rejected")
+    code, _b, _c = http_h("/api/auth/login", {"user": "admin", "pass": "x"},
+                          {"Origin": "https://evil.example"})
+    ok(code == 403, "cross-origin API POST rejected")
+    code, _b, _c = http_h("/api/auth/login", {"user": "admin", "pass": "x"},
+                          {"Sec-Fetch-Site": "cross-site"})
+    ok(code == 403, "Sec-Fetch-Site cross-site rejected")
+    code, _b, _c = http_h("/admin/login", {"user": "admin", "pass": "x"},
+                          {"Origin": BASE})
+    ok(code == 200, "same-origin POST passes the guard")
+    code, _b, _c = http("/admin")
+    ok(code in (301, 302), "safe method ignores Origin header")
 
     # ---- auth ----
     code, _b, setc = http("/admin")
@@ -791,6 +828,15 @@ def run_matrix(catcher):
                               {"user": "admin", "pass": "newpass-e2e-123"})
         ok(code in (301, 302) and session_cookie(setc),
            "login with new password works")
+        # Secure 标志按请求协议给出：明文直连不发（本地开发不丢 cookie），
+        # TLS 反代（X-Forwarded-Proto: https）追加。
+        ok(all("Secure" not in line for line in setc),
+           "cookie sent without Secure over plain http")
+        code, _b, setc2 = http_h("/admin/login",
+                                 {"user": "admin", "pass": "newpass-e2e-123"},
+                                 {"X-Forwarded-Proto": "https"})
+        ok(any("Secure" in line for line in setc2),
+           "cookie gains Secure behind TLS proxy")
         print("[wait] 31s for the token-version cache to expire")
         time.sleep(31)
         code, _b, _c = http("/admin", cookie=cookie)
@@ -802,6 +848,46 @@ def run_matrix(catcher):
         ok(False, "old password rejected")
         ok(False, "login with new password works")
         ok(False, "old session invalidated after reset")
+        ok(False, "cookie sent without Secure over plain http")
+        ok(False, "cookie gains Secure behind TLS proxy")
+
+    # ---- 口令格式升级（A367）：遗留 12000 轮链行登录成功即改写 pbkdf2$ ----
+    def legacy_hash(pw, salt):
+        # AuthUser.PasswordHash 的字节级等价链：m0 = salt+":"+pw，
+        # m_{r+1} = sha256(m_r + ":" + salt) 的 hex，12000 轮。
+        m = salt + ":" + pw
+        for _ in range(12000):
+            m = hashlib.sha256((m + ":" + salt).encode()).hexdigest()
+        return m
+
+    salt12 = "e2elegacy0123456789abcd"
+    sql("UPDATE sys_user SET passwordSalt=?, passwordHash=? "
+        "WHERE username='admin'",
+        (salt12, legacy_hash("newpass-e2e-123", salt12)))
+    code, _b, setc3 = http("/admin/login",
+                           {"user": "admin", "pass": "newpass-e2e-123"})
+    ok(code in (301, 302) and session_cookie(setc3),
+       "legacy-format row logs in")
+    row = sql("SELECT passwordHash FROM sys_user WHERE username='admin'"
+              )[0][0]
+    ok(row.startswith("pbkdf2$"), "legacy row upgraded to pbkdf2 format")
+    code, _b, setc4 = http("/admin/login",
+                           {"user": "admin", "pass": "newpass-e2e-123"})
+    ok(session_cookie(setc4), "login works on upgraded row")
+
+    # ---- 登录限流（A367）：窗口内 10 次失败即锁，锁内正确密码同拒 ----
+    # 此块必须最后跑：它把 admin 锁进 15 分钟窗口（进程内存态）。
+    for _ in range(10):
+        code, _b, _c = http("/admin/login",
+                            {"user": "admin", "pass": "totally-wrong"})
+    code, body, _c = http("/admin/login",
+                          {"user": "admin", "pass": "totally-wrong"})
+    ok("尝试过于频繁" in body, "11th failure throttled")
+    code, body, _c = http("/admin/login",
+                          {"user": "admin", "pass": "newpass-e2e-123"})
+    ok("尝试过于频繁" in body, "locked account rejects correct password")
+    ok(sql("SELECT COUNT(*) FROM sys_login_log WHERE message LIKE '%频繁%'"
+           )[0][0] >= 2, "throttled attempts logged distinctly")
 
 
 if __name__ == "__main__":

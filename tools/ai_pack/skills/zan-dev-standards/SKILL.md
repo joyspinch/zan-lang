@@ -69,6 +69,14 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   越权与不存在同答 404），`Crud.Conf` 同一声明投影 adminUI conf 契约。
   新屏别再手写表格 HTML 与格式化帮静态方法；业务语义（会话失效、
   关联清理）留在屏内动作，通用动作只对声明的主表负责。
+- **堆外密码学实现的三坑（stdlib Pbkdf2 首日踩出）**：① 内层消息
+  缓冲必须按 `max(saltLen+4, 32)` 分配——PBKDF2 的 U 链从第二轮起
+  消息是 32 字节摘要，按"盐+块序号"尺寸分配会在盐短、c≥2 时
+  span 越界；② 每轮算完 U 必须把 U 回写外层缓冲的消息位，只留下
+  内层摘要 ih 会让下一轮错拿 ih（链静默变错）；③ 最小对拍集必须含
+  c=1 与 c≥2、短盐与 >64B 长键、dkLen≤32 与 >32 分块——c=1 与
+  单块向量对上述两类 bug 全都测不出来（2026-09-25 RFC 7914 形状
+  向量 + Hmac.Compute 对拍双保险锁进 tests/conformance/pbkdf2）。
 
 ## 三、验证纪律（实机/无头通用）
 
@@ -103,7 +111,15 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   改完源码直接跑，旧断言全绿、新断言全挂（测的是旧二进制，exe mtime 早于
   改动），极像"功能写坏了"；改源后必须 `--build`，或先核对 exe 时间戳。
   另：e2e 末轮 forgot 流程会把 admin 密码重置为 `newpass-e2e-123`，手动
-  补测登录拿种子密码 admin1234 会误判"登录坏了"。
+  补测登录拿种子密码 admin1234 会误判"登录坏了"；⑩ 移动包内文件后
+  必须全仓 grep 旧路径——构建测试注册里写死的源文件绝对路径漏改，
+  就报 `cannot open file` 白挂一轮才发现。
+- **共享工作树上的测试归责：先隔离再定责**。测试结果异常先查
+  并发提交时间线（`git log --format="%h %ad %s" -3`）：共享树另一会话
+  在途编辑 stdlib/编译器期间跑测试，产物混进 WIP 源，无关测试假挂假绿
+  （2026-09-25 GUI 拖拽 ctest 挂死 vs 手动快速 FAIL 二相性， targeted
+  `git stash push -- <自己的文件>` 复跑一次即证明与己无关）。
+  同产物"ctest 挂死、手动跑通"先手动复跑再怀疑代码。
 - **PowerShell 合成点击四连坑（PrintWindow 抓窗 + mouse_event 注入流）**：
   ① 进程必须先 `SetProcessDpiAwarenessContext(-4)`——DPI 不感知时
   `GetWindowRect`/`SetCursorPos` 全在虚拟化坐标系，注入点整体漂 1.5 倍；
