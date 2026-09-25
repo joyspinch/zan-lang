@@ -851,6 +851,16 @@ static struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
 static bool implicit_ctor_for_arg(zan_irgen_t *g, zan_type_t *target,
                                   zan_type_t *source, zan_ast_node_t *arg,
                                   local_scope_t *locals);
+static bool class_implements_iface(zan_symbol_t *cls, zan_symbol_t *iface);
+
+static bool class_derives_from(zan_symbol_t *derived, zan_symbol_t *base) {
+    if (!derived || !base) return false;
+    for (zan_symbol_t *cur = derived; cur && cur->type && cur->type->base_type;
+         cur = cur->type->base_type->sym) {
+        if (cur->type->base_type->sym == base) return true;
+    }
+    return false;
+}
 
 static struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
                                         zan_ast_list_t *args, local_scope_t *locals,
@@ -959,6 +969,26 @@ static struct zan_ctor_entry *find_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
                 }
                 int pf = type_family(pt), af = type_family(at);
                 if (pf == af && pf != FAM_UNKNOWN) {
+                    if (pf == FAM_REF) {
+                        if (pt->kind == TYPE_OBJECT) {
+                            score += 1;
+                            continue;
+                        }
+                        if (pt->kind == TYPE_INTERFACE) {
+                            if (at->kind == TYPE_CLASS && at->sym && pt->sym) {
+                                if (!class_implements_iface(at->sym, pt->sym)) {
+                                    compatible = false;
+                                    break;
+                                }
+                            }
+                        } else if (pt->kind == TYPE_CLASS && at->kind == TYPE_CLASS) {
+                            if (pt->sym && at->sym && pt->sym != at->sym &&
+                                !class_derives_from(at->sym, pt->sym)) {
+                                compatible = false;
+                                break;
+                            }
+                        }
+                    }
                     score += 2;
                     continue;
                 }

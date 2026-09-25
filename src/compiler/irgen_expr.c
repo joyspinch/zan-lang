@@ -267,6 +267,30 @@ static LLVMValueRef nm_sha256_fn(zan_irgen_t *g) {
     return fn;
 }
 
+static LLVMValueRef nm_md5_fn(zan_irgen_t *g) {
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_md5");
+    if (fn) return fn;
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+        (LLVMTypeRef[]){ i8ptr, i64t, i8ptr }, 3, 0);
+    fn = LLVMAddFunction(g->mod, "zan_hw_md5", fnty);
+    return fn;
+}
+
+static LLVMValueRef nm_sm3_fn(zan_irgen_t *g) {
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_sm3");
+    if (fn) return fn;
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+        (LLVMTypeRef[]){ i8ptr, i64t, i8ptr }, 3, 0);
+    fn = LLVMAddFunction(g->mod, "zan_hw_sm3", fnty);
+    return fn;
+}
+
 /* 2D strided memory copy: copies height rows of row_bytes each from
  * (src + r * src_stride) to (dst + r * dst_stride).
  * Collapses to a single memmove when strides match row_bytes. */
@@ -836,6 +860,28 @@ static bool emit_native_memory_call(zan_irgen_t *g, zan_ast_node_t *expr,
         *out = s;
         return true;
     }
+    if (is_call_to(expr, "NativeMemory", "Md5") && expr->call.args.count == 2) {
+        /* RFC 1321 MD5 digest over len raw bytes; returns a real ARC string of
+         * 16 raw digest bytes handed to the caller +1 (same contract as Sha256).
+         * Direct unrolled hardware streaming via zan_hw_md5. */
+        LLVMValueRef p = nm_arg(g, expr, 0, locals);
+        LLVMValueRef len = nm_arg(g, expr, 1, locals);
+        len = LLVMBuildSelect(g->builder,
+            zan_icmp(g->builder, LLVMIntSLT, len, zero64, "nm.md5.neg"),
+            zero64, len, "nm.md5.len");
+        LLVMValueRef md5fn = nm_md5_fn(g);
+        LLVMTypeRef md5_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+            (LLVMTypeRef[]){ i8ptr, i64t, i8ptr }, 3, 0);
+        LLVMValueRef s = emit_string_alloc_rc(g, LLVMConstInt(i64t, 17, 0));
+        LLVMBuildCall2(g->builder, md5_ty, md5fn, (LLVMValueRef[]){
+            nm_addr(g, p, zero64), len, s }, 3, "");
+        LLVMValueRef endp = LLVMBuildGEP2(g->builder, i8, s,
+            (LLVMValueRef[]){ LLVMConstInt(i64t, 16, 0) }, 1, "nm.md5.end");
+        zan_store_fit(g, LLVMConstInt(i8, 0, 0), endp);
+        emit_string_len_set(g, s, LLVMConstInt(i64t, 16, 0));
+        *out = s;
+        return true;
+    }
     if (is_call_to(expr, "NativeMemory", "Aes128CbcEncrypt") && expr->call.args.count == 5) {
         LLVMValueRef dst = nm_arg(g, expr, 0, locals);
         LLVMValueRef src = nm_arg(g, expr, 1, locals);
@@ -864,6 +910,119 @@ static bool emit_native_memory_call(zan_irgen_t *g, zan_ast_node_t *expr,
         *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
             nm_addr(g, src, zero64), size, nm_addr(g, key, zero64), nm_addr(g, iv, zero64), nm_addr(g, dst, zero64)
         }, 5, "nm.aes_dec");
+        return true;
+    }
+    if (is_call_to(expr, "NativeMemory", "Sm3") && expr->call.args.count == 2) {
+        /* GB/T 32918.4 SM3 digest over len raw bytes; returns a real ARC string of
+         * 32 raw digest bytes handed to the caller +1 (same contract as Sha256).
+         * Direct unrolled hardware streaming via zan_hw_sm3. */
+        LLVMValueRef p = nm_arg(g, expr, 0, locals);
+        LLVMValueRef len = nm_arg(g, expr, 1, locals);
+        len = LLVMBuildSelect(g->builder,
+            zan_icmp(g->builder, LLVMIntSLT, len, zero64, "nm.sm3.neg"),
+            zero64, len, "nm.sm3.len");
+        LLVMValueRef sm3fn = nm_sm3_fn(g);
+        LLVMTypeRef sm3_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+            (LLVMTypeRef[]){ i8ptr, i64t, i8ptr }, 3, 0);
+        LLVMValueRef s = emit_string_alloc_rc(g, LLVMConstInt(i64t, 33, 0));
+        LLVMBuildCall2(g->builder, sm3_ty, sm3fn, (LLVMValueRef[]){
+            nm_addr(g, p, zero64), len, s }, 3, "");
+        LLVMValueRef endp = LLVMBuildGEP2(g->builder, i8, s,
+            (LLVMValueRef[]){ LLVMConstInt(i64t, 32, 0) }, 1, "nm.sm3.end");
+        zan_store_fit(g, LLVMConstInt(i8, 0, 0), endp);
+        emit_string_len_set(g, s, LLVMConstInt(i64t, 32, 0));
+        *out = s;
+        return true;
+    }
+    if (is_call_to(expr, "NativeMemory", "Sm4CbcEncrypt") && expr->call.args.count == 5) {
+        LLVMValueRef dst = nm_arg(g, expr, 0, locals);
+        LLVMValueRef src = nm_arg(g, expr, 1, locals);
+        LLVMValueRef size = nm_arg(g, expr, 2, locals);
+        LLVMValueRef key = nm_arg(g, expr, 3, locals);
+        LLVMValueRef iv = nm_arg(g, expr, 4, locals);
+        LLVMTypeRef ty = LLVMFunctionType(i64t,
+            (LLVMTypeRef[]){ i8ptr, i64t, i8ptr, i8ptr, i8ptr }, 5, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_sm4_cbc_encrypt");
+        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_sm4_cbc_encrypt", ty);
+        *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
+            nm_addr(g, src, zero64), size, nm_addr(g, key, zero64), nm_addr(g, iv, zero64), nm_addr(g, dst, zero64)
+        }, 5, "nm.sm4_enc");
+        return true;
+    }
+    if (is_call_to(expr, "NativeMemory", "Sm4CbcDecrypt") && expr->call.args.count == 5) {
+        LLVMValueRef dst = nm_arg(g, expr, 0, locals);
+        LLVMValueRef src = nm_arg(g, expr, 1, locals);
+        LLVMValueRef size = nm_arg(g, expr, 2, locals);
+        LLVMValueRef key = nm_arg(g, expr, 3, locals);
+        LLVMValueRef iv = nm_arg(g, expr, 4, locals);
+        LLVMTypeRef ty = LLVMFunctionType(i64t,
+            (LLVMTypeRef[]){ i8ptr, i64t, i8ptr, i8ptr, i8ptr }, 5, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_sm4_cbc_decrypt");
+        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_sm4_cbc_decrypt", ty);
+        *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
+            nm_addr(g, src, zero64), size, nm_addr(g, key, zero64), nm_addr(g, iv, zero64), nm_addr(g, dst, zero64)
+        }, 5, "nm.sm4_dec");
+        return true;
+    }
+    if (is_call_to(expr, "NativeMemory", "Base64Encode") && expr->call.args.count == 2) {
+        LLVMValueRef p = nm_arg(g, expr, 0, locals);
+        LLVMValueRef len = nm_arg(g, expr, 1, locals);
+        len = LLVMBuildSelect(g->builder,
+            zan_icmp(g->builder, LLVMIntSLT, len, zero64, "nm.b64e.neg"),
+            zero64, len, "nm.b64e.len");
+        LLVMValueRef plus2 = LLVMBuildAdd(g->builder, len, LLVMConstInt(i64t, 2, 0), "nm.b64e.p2");
+        LLVMValueRef div3 = LLVMBuildSDiv(g->builder, plus2, LLVMConstInt(i64t, 3, 0), "nm.b64e.d3");
+        LLVMValueRef mul4 = LLVMBuildMul(g->builder, div3, LLVMConstInt(i64t, 4, 0), "nm.b64e.m4");
+        LLVMValueRef cap = LLVMBuildAdd(g->builder, mul4, LLVMConstInt(i64t, 1, 0), "nm.b64e.cap");
+        LLVMValueRef s = emit_string_alloc_rc(g, cap);
+        LLVMTypeRef ty = LLVMFunctionType(i64t,
+            (LLVMTypeRef[]){ i8ptr, i64t, i8ptr }, 3, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_base64_encode");
+        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_base64_encode", ty);
+        LLVMValueRef written = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
+            nm_addr(g, p, zero64), len, s
+        }, 3, "nm.b64e.w");
+        emit_string_len_set(g, s, written);
+        *out = s;
+        return true;
+    }
+    if (is_call_to(expr, "NativeMemory", "Base64Decode") && expr->call.args.count == 3) {
+        LLVMValueRef dst = nm_arg(g, expr, 0, locals);
+        LLVMValueRef src = nm_arg(g, expr, 1, locals);
+        LLVMValueRef size = nm_arg(g, expr, 2, locals);
+        LLVMTypeRef ty = LLVMFunctionType(i64t,
+            (LLVMTypeRef[]){ i8ptr, i64t, i8ptr }, 3, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_base64_decode");
+        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_base64_decode", ty);
+        *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
+            nm_addr(g, src, zero64), size, nm_addr(g, dst, zero64)
+        }, 3, "nm.b64d.w");
+        return true;
+    }
+    if (is_call_to(expr, "NativeMemory", "JsonSkipWhitespace") && expr->call.args.count == 3) {
+        LLVMValueRef ptr = nm_arg(g, expr, 0, locals);
+        LLVMValueRef pos = nm_arg(g, expr, 1, locals);
+        LLVMValueRef len = nm_arg(g, expr, 2, locals);
+        LLVMTypeRef ty = LLVMFunctionType(i64t,
+            (LLVMTypeRef[]){ i8ptr, i64t, i64t }, 3, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_json_skip_whitespace");
+        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_json_skip_whitespace", ty);
+        *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
+            nm_addr(g, ptr, zero64), pos, len
+        }, 3, "nm.json_ws");
+        return true;
+    }
+    if (is_call_to(expr, "NativeMemory", "JsonScanString") && expr->call.args.count == 3) {
+        LLVMValueRef ptr = nm_arg(g, expr, 0, locals);
+        LLVMValueRef pos = nm_arg(g, expr, 1, locals);
+        LLVMValueRef len = nm_arg(g, expr, 2, locals);
+        LLVMTypeRef ty = LLVMFunctionType(i64t,
+            (LLVMTypeRef[]){ i8ptr, i64t, i64t }, 3, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_json_scan_string");
+        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_json_scan_string", ty);
+        *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
+            nm_addr(g, ptr, zero64), pos, len
+        }, 3, "nm.json_str");
         return true;
     }
     return false;
@@ -1385,6 +1544,440 @@ static bool emit_bit_operations_call(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMValueRef le1 = zan_icmp(g->builder, LLVMIntSLE, v, LLVMConstInt(i32t, 1, 0), "le1");
             *out = LLVMBuildSelect(g->builder, le1, LLVMConstInt(i32t, 1, 0), pow2, "roundup");
         }
+        return true;
+    }
+
+    return false;
+}
+
+static bool is_target_class_obj(zan_ast_node_t *obj, const char *name, size_t len, local_scope_t *locals) {
+    if (!obj) return false;
+    if (obj->kind == AST_IDENTIFIER) {
+        if (locals && local_find(locals, obj->ident.name)) return false;
+        return obj->ident.name.len == (int)len && memcmp(obj->ident.name.str, name, len) == 0;
+    } else if (obj->kind == AST_MEMBER_ACCESS) {
+        return obj->member.name.len == (int)len && memcmp(obj->member.name.str, name, len) == 0;
+    }
+    return false;
+}
+
+static LLVMTypeRef get_vector128_struct_type(zan_irgen_t *g) {
+    LLVMTypeRef st = LLVMGetTypeByName2(g->ctx, "struct.Vector128");
+    if (st) return st;
+    for (int i = 0; i < g->struct_type_count; i++) {
+        if (g->struct_types[i].sym && g->struct_types[i].sym->name.len == 9 &&
+            memcmp(g->struct_types[i].sym->name.str, "Vector128", 9) == 0) {
+            return g->struct_types[i].llvm_type;
+        }
+    }
+    LLVMTypeRef fields[2] = { LLVMInt64TypeInContext(g->ctx), LLVMInt64TypeInContext(g->ctx) };
+    return LLVMStructTypeInContext(g->ctx, fields, 2, 0);
+}
+
+static LLVMValueRef vec128_to_v16i8(zan_irgen_t *g, LLVMValueRef val) {
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef v16i8 = LLVMVectorType(LLVMInt8TypeInContext(g->ctx), 16);
+    LLVMTypeRef v2i64 = LLVMVectorType(LLVMInt64TypeInContext(g->ctx), 2);
+    LLVMTypeRef val_ty = LLVMTypeOf(val);
+
+    if (val_ty == v16i8) return val;
+    if (val_ty == v2i64) return LLVMBuildBitCast(g->builder, val, v16i8, "v16");
+
+    if (LLVMGetTypeKind(val_ty) == LLVMPointerTypeKind) {
+        LLVMValueRef ptr = LLVMBuildBitCast(g->builder, val, LLVMPointerType(v16i8, 0), "vptr");
+        LLVMValueRef ld = LLVMBuildLoad2(g->builder, v16i8, ptr, "vld");
+        LLVMSetAlignment(ld, 1);
+        return ld;
+    }
+    if (LLVMGetTypeKind(val_ty) == LLVMStructTypeKind) {
+        LLVMValueRef low = LLVMBuildExtractValue(g->builder, val, 0, "v.low");
+        LLVMValueRef high = LLVMBuildExtractValue(g->builder, val, 1, "v.high");
+        LLVMValueRef v2 = LLVMBuildInsertElement(g->builder, LLVMGetUndef(v2i64), low, LLVMConstInt(i32t, 0, 0), "v2_0");
+        v2 = LLVMBuildInsertElement(g->builder, v2, high, LLVMConstInt(i32t, 1, 0), "v2_1");
+        return LLVMBuildBitCast(g->builder, v2, v16i8, "v16");
+    }
+    return val;
+}
+
+static LLVMValueRef v16i8_to_vec128(zan_irgen_t *g, LLVMValueRef v16) {
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef v2i64 = LLVMVectorType(LLVMInt64TypeInContext(g->ctx), 2);
+    LLVMValueRef v2 = LLVMBuildBitCast(g->builder, v16, v2i64, "v2");
+    LLVMValueRef low = LLVMBuildExtractElement(g->builder, v2, LLVMConstInt(i32t, 0, 0), "r.low");
+    LLVMValueRef high = LLVMBuildExtractElement(g->builder, v2, LLVMConstInt(i32t, 1, 0), "r.high");
+
+    LLVMTypeRef st = get_vector128_struct_type(g);
+    LLVMValueRef res = LLVMBuildInsertValue(g->builder, LLVMGetUndef(st), low, 0, "s0");
+    return LLVMBuildInsertValue(g->builder, res, high, 1, "s1");
+}
+
+static LLVMValueRef vec128_to_v2i64(zan_irgen_t *g, LLVMValueRef val) {
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef v2i64 = LLVMVectorType(LLVMInt64TypeInContext(g->ctx), 2);
+    LLVMTypeRef val_ty = LLVMTypeOf(val);
+
+    if (val_ty == v2i64) return val;
+    if (LLVMGetTypeKind(val_ty) == LLVMVectorTypeKind) {
+        return LLVMBuildBitCast(g->builder, val, v2i64, "v2");
+    }
+    if (LLVMGetTypeKind(val_ty) == LLVMPointerTypeKind) {
+        LLVMValueRef ptr = LLVMBuildBitCast(g->builder, val, LLVMPointerType(v2i64, 0), "vptr2");
+        LLVMValueRef ld = LLVMBuildLoad2(g->builder, v2i64, ptr, "vld2");
+        LLVMSetAlignment(ld, 1);
+        return ld;
+    }
+    if (LLVMGetTypeKind(val_ty) == LLVMStructTypeKind) {
+        LLVMValueRef low = LLVMBuildExtractValue(g->builder, val, 0, "v.low");
+        LLVMValueRef high = LLVMBuildExtractValue(g->builder, val, 1, "v.high");
+        LLVMValueRef v2 = LLVMBuildInsertElement(g->builder, LLVMGetUndef(v2i64), low, LLVMConstInt(i32t, 0, 0), "v2_0");
+        return LLVMBuildInsertElement(g->builder, v2, high, LLVMConstInt(i32t, 1, 0), "v2_1");
+    }
+    return val;
+}
+
+static LLVMValueRef v2i64_to_vec128(zan_irgen_t *g, LLVMValueRef v2) {
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMValueRef low = LLVMBuildExtractElement(g->builder, v2, LLVMConstInt(i32t, 0, 0), "r.low");
+    LLVMValueRef high = LLVMBuildExtractElement(g->builder, v2, LLVMConstInt(i32t, 1, 0), "r.high");
+
+    LLVMTypeRef st = get_vector128_struct_type(g);
+    LLVMValueRef res = LLVMBuildInsertValue(g->builder, LLVMGetUndef(st), low, 0, "s0");
+    return LLVMBuildInsertValue(g->builder, res, high, 1, "s1");
+}
+
+static bool emit_vector128_call(zan_irgen_t *g, zan_ast_node_t *expr,
+                                local_scope_t *locals, LLVMValueRef *out) {
+    if (expr->kind != AST_CALL) return false;
+    zan_ast_node_t *callee = expr->call.callee;
+    if (callee->kind != AST_MEMBER_ACCESS) return false;
+    if (!is_target_class_obj(callee->member.object, "Vector128", 9, locals))
+        return false;
+
+    zan_istr_t method = callee->member.name;
+    int argc = expr->call.args.count;
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef v16i8 = LLVMVectorType(LLVMInt8TypeInContext(g->ctx), 16);
+
+    /* Vector128.Zero / Vector128.AllBitsSet getter call */
+    if (method.len == 4 && memcmp(method.str, "Zero", 4) == 0 && argc == 0) {
+        *out = v16i8_to_vec128(g, LLVMConstNull(v16i8));
+        return true;
+    }
+    if (method.len == 10 && memcmp(method.str, "AllBitsSet", 10) == 0 && argc == 0) {
+        *out = v16i8_to_vec128(g, LLVMConstAllOnes(v16i8));
+        return true;
+    }
+
+    /* Vector128.Load(nint address) / Load(byte[] buf) / Load(byte[] buf, int offset) */
+    if (method.len == 4 && memcmp(method.str, "Load", 4) == 0 && (argc == 1 || argc == 2)) {
+        LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+        LLVMValueRef addr_val = emit_expr(g, expr->call.args.items[0], locals);
+        LLVMValueRef base;
+        if (LLVMGetTypeKind(LLVMTypeOf(addr_val)) == LLVMPointerTypeKind) {
+            base = LLVMBuildBitCast(g->builder, addr_val, LLVMPointerType(i8, 0), "vload_base");
+        } else {
+            base = LLVMBuildIntToPtr(g->builder, addr_val, LLVMPointerType(i8, 0), "vload_base");
+        }
+        if (argc == 2) {
+            LLVMValueRef off_val = coerce_int_to(g, emit_expr(g, expr->call.args.items[1], locals), i64t);
+            base = LLVMBuildGEP2(g->builder, i8, base, &off_val, 1, "vload_gep");
+        }
+        LLVMValueRef ptr = LLVMBuildBitCast(g->builder, base, LLVMPointerType(v16i8, 0), "vload_ptr");
+        LLVMValueRef ld = LLVMBuildLoad2(g->builder, v16i8, ptr, "vload");
+        LLVMSetAlignment(ld, 1);
+        *out = v16i8_to_vec128(g, ld);
+        return true;
+    }
+
+    /* Vector128.Store(address/buf, source) / Store(buf, offset, source) */
+    if (method.len == 5 && memcmp(method.str, "Store", 5) == 0 && (argc == 2 || argc == 3)) {
+        LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+        LLVMValueRef addr_val = emit_expr(g, expr->call.args.items[0], locals);
+        LLVMValueRef base;
+        if (LLVMGetTypeKind(LLVMTypeOf(addr_val)) == LLVMPointerTypeKind) {
+            base = LLVMBuildBitCast(g->builder, addr_val, LLVMPointerType(i8, 0), "vstore_base");
+        } else {
+            base = LLVMBuildIntToPtr(g->builder, addr_val, LLVMPointerType(i8, 0), "vstore_base");
+        }
+        LLVMValueRef src_val;
+        if (argc == 3) {
+            LLVMValueRef off_val = coerce_int_to(g, emit_expr(g, expr->call.args.items[1], locals), i64t);
+            base = LLVMBuildGEP2(g->builder, i8, base, &off_val, 1, "vstore_gep");
+            src_val = emit_expr(g, expr->call.args.items[2], locals);
+        } else {
+            src_val = emit_expr(g, expr->call.args.items[1], locals);
+        }
+        LLVMValueRef ptr = LLVMBuildBitCast(g->builder, base, LLVMPointerType(v16i8, 0), "vstore_ptr");
+        LLVMValueRef v16 = vec128_to_v16i8(g, src_val);
+        LLVMValueRef st = LLVMBuildStore(g->builder, v16, ptr);
+        LLVMSetAlignment(st, 1);
+        *out = NULL;
+        return true;
+    }
+
+    /* Vector128.Create(...) */
+    if (method.len == 6 && memcmp(method.str, "Create", 6) == 0) {
+        if (argc == 1) {
+            zan_ast_node_t *arg0 = expr->call.args.items[0];
+            LLVMValueRef v = emit_expr(g, arg0, locals);
+            zan_type_t *arg_type = infer_expr_type(g, arg0, locals);
+            if (arg_type && (arg_type->kind == TYPE_LONG || arg_type->kind == TYPE_ULONG)) {
+                LLVMTypeRef v2i64 = LLVMVectorType(i64t, 2);
+                LLVMValueRef val = coerce_int_to(g, v, i64t);
+                LLVMValueRef ins = LLVMBuildInsertElement(g->builder, LLVMGetUndef(v2i64), val, LLVMConstInt(i32t, 0, 0), "l0");
+                LLVMValueRef mask_elems[2] = { LLVMConstInt(i32t, 0, 0), LLVMConstInt(i32t, 0, 0) };
+                LLVMValueRef mask = LLVMConstVector(mask_elems, 2);
+                LLVMValueRef bcast = LLVMBuildShuffleVector(g->builder, ins, LLVMGetUndef(v2i64), mask, "bcast64");
+                *out = v16i8_to_vec128(g, LLVMBuildBitCast(g->builder, bcast, v16i8, "v16"));
+                return true;
+            } else if (arg_type && (arg_type->kind == TYPE_BYTE || arg_type->kind == TYPE_SBYTE)) {
+                LLVMValueRef b = coerce_int_to(g, v, LLVMInt8TypeInContext(g->ctx));
+                LLVMValueRef ins = LLVMBuildInsertElement(g->builder, LLVMGetUndef(v16i8), b, LLVMConstInt(i32t, 0, 0), "b0");
+                LLVMValueRef mask_elems[16];
+                for (int i = 0; i < 16; i++) mask_elems[i] = LLVMConstInt(i32t, 0, 0);
+                LLVMValueRef mask = LLVMConstVector(mask_elems, 16);
+                LLVMValueRef bcast = LLVMBuildShuffleVector(g->builder, ins, LLVMGetUndef(v16i8), mask, "bcast8");
+                *out = v16i8_to_vec128(g, bcast);
+                return true;
+            } else {
+                /* default int32 broadcast */
+                LLVMTypeRef v4i32 = LLVMVectorType(i32t, 4);
+                LLVMValueRef val = coerce_int_to(g, v, i32t);
+                LLVMValueRef ins = LLVMBuildInsertElement(g->builder, LLVMGetUndef(v4i32), val, LLVMConstInt(i32t, 0, 0), "i0");
+                LLVMValueRef mask_elems[4];
+                for (int i = 0; i < 4; i++) mask_elems[i] = LLVMConstInt(i32t, 0, 0);
+                LLVMValueRef mask = LLVMConstVector(mask_elems, 4);
+                LLVMValueRef bcast = LLVMBuildShuffleVector(g->builder, ins, LLVMGetUndef(v4i32), mask, "bcast32");
+                *out = v16i8_to_vec128(g, LLVMBuildBitCast(g->builder, bcast, v16i8, "v16"));
+                return true;
+            }
+        } else if (argc == 2) {
+            LLVMValueRef low = coerce_int_to(g, emit_expr(g, expr->call.args.items[0], locals), i64t);
+            LLVMValueRef high = coerce_int_to(g, emit_expr(g, expr->call.args.items[1], locals), i64t);
+            LLVMTypeRef st = get_vector128_struct_type(g);
+            LLVMValueRef res = LLVMBuildInsertValue(g->builder, LLVMGetUndef(st), low, 0, "s0");
+            *out = LLVMBuildInsertValue(g->builder, res, high, 1, "s1");
+            return true;
+        }
+    }
+
+    /* Bitwise: And, Or, Xor, AndNot */
+    if (argc == 2) {
+        if (method.len == 3 && memcmp(method.str, "And", 3) == 0) {
+            LLVMValueRef a16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[0], locals));
+            LLVMValueRef b16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[1], locals));
+            *out = v16i8_to_vec128(g, LLVMBuildAnd(g->builder, a16, b16, "vand"));
+            return true;
+        }
+        if (method.len == 2 && memcmp(method.str, "Or", 2) == 0) {
+            LLVMValueRef a16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[0], locals));
+            LLVMValueRef b16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[1], locals));
+            *out = v16i8_to_vec128(g, LLVMBuildOr(g->builder, a16, b16, "vor"));
+            return true;
+        }
+        if (method.len == 3 && memcmp(method.str, "Xor", 3) == 0) {
+            LLVMValueRef a16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[0], locals));
+            LLVMValueRef b16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[1], locals));
+            *out = v16i8_to_vec128(g, LLVMBuildXor(g->builder, a16, b16, "vxor"));
+            return true;
+        }
+        if (method.len == 6 && memcmp(method.str, "AndNot", 6) == 0) {
+            LLVMValueRef a16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[0], locals));
+            LLVMValueRef b16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[1], locals));
+            LLVMValueRef not_a = LLVMBuildNot(g->builder, a16, "vnot");
+            *out = v16i8_to_vec128(g, LLVMBuildAnd(g->builder, not_a, b16, "vandn"));
+            return true;
+        }
+        if ((method.len == 6 && memcmp(method.str, "Equals", 6) == 0) ||
+            (method.len == 12 && memcmp(method.str, "CompareEqual", 12) == 0)) {
+            LLVMValueRef a16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[0], locals));
+            LLVMValueRef b16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[1], locals));
+            LLVMValueRef cmp = LLVMBuildICmp(g->builder, LLVMIntEQ, a16, b16, "vcmpeq");
+            LLVMValueRef mask = LLVMBuildSExt(g->builder, cmp, v16i8, "vmask");
+            *out = v16i8_to_vec128(g, mask);
+            return true;
+        }
+        if (method.len == 7 && memcmp(method.str, "Shuffle", 7) == 0) {
+            LLVMValueRef a16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[0], locals));
+            LLVMValueRef m16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[1], locals));
+            LLVMTypeRef fty = LLVMFunctionType(v16i8, (LLVMTypeRef[]){ v16i8, v16i8 }, 2, 0);
+            LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.ssse3.pshuf.b.128");
+            if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.ssse3.pshuf.b.128", fty);
+            LLVMValueRef args[2] = { a16, m16 };
+            LLVMValueRef r = zan_call2(g->builder, fty, fn, args, 2, "pshufb");
+            *out = v16i8_to_vec128(g, r);
+            return true;
+        }
+    }
+
+    /* ExtractMostSignificantBits(Vector128 value) / MoveMask */
+    if ((method.len == 26 && memcmp(method.str, "ExtractMostSignificantBits", 26) == 0) ||
+        (method.len == 8 && memcmp(method.str, "MoveMask", 8) == 0)) {
+        if (argc == 1) {
+            LLVMValueRef a16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[0], locals));
+            LLVMTypeRef fty = LLVMFunctionType(i32t, (LLVMTypeRef[]){ v16i8 }, 1, 0);
+            LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.sse2.pmovmskb.128");
+            if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.sse2.pmovmskb.128", fty);
+            *out = zan_call2(g->builder, fty, fn, &a16, 1, "pmovmskb");
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool emit_sse2_call(zan_irgen_t *g, zan_ast_node_t *expr,
+                           local_scope_t *locals, LLVMValueRef *out) {
+    if (expr->kind != AST_CALL) return false;
+    zan_ast_node_t *callee = expr->call.callee;
+    if (callee->kind != AST_MEMBER_ACCESS) return false;
+    if (!is_target_class_obj(callee->member.object, "Sse2", 4, locals))
+        return false;
+
+    zan_istr_t method = callee->member.name;
+    int argc = expr->call.args.count;
+
+    if (method.len == 13 && memcmp(method.str, "LoadVector128", 13) == 0 && argc == 1) {
+        LLVMTypeRef v16i8 = LLVMVectorType(LLVMInt8TypeInContext(g->ctx), 16);
+        LLVMValueRef addr_val = emit_expr(g, expr->call.args.items[0], locals);
+        LLVMValueRef ptr;
+        if (LLVMGetTypeKind(LLVMTypeOf(addr_val)) == LLVMPointerTypeKind) {
+            ptr = LLVMBuildBitCast(g->builder, addr_val, LLVMPointerType(v16i8, 0), "vload_ptr");
+        } else {
+            ptr = LLVMBuildIntToPtr(g->builder, addr_val, LLVMPointerType(v16i8, 0), "vload_ptr");
+        }
+        LLVMValueRef ld = LLVMBuildLoad2(g->builder, v16i8, ptr, "vload");
+        LLVMSetAlignment(ld, 1);
+        *out = v16i8_to_vec128(g, ld);
+        return true;
+    }
+    if (method.len == 5 && memcmp(method.str, "Store", 5) == 0 && argc == 2) {
+        LLVMTypeRef v16i8 = LLVMVectorType(LLVMInt8TypeInContext(g->ctx), 16);
+        LLVMValueRef addr_val = emit_expr(g, expr->call.args.items[0], locals);
+        LLVMValueRef src_val = emit_expr(g, expr->call.args.items[1], locals);
+        LLVMValueRef v16 = vec128_to_v16i8(g, src_val);
+        LLVMValueRef ptr;
+        if (LLVMGetTypeKind(LLVMTypeOf(addr_val)) == LLVMPointerTypeKind) {
+            ptr = LLVMBuildBitCast(g->builder, addr_val, LLVMPointerType(v16i8, 0), "vstore_ptr");
+        } else {
+            ptr = LLVMBuildIntToPtr(g->builder, addr_val, LLVMPointerType(v16i8, 0), "vstore_ptr");
+        }
+        LLVMValueRef st = LLVMBuildStore(g->builder, v16, ptr);
+        LLVMSetAlignment(st, 1);
+        *out = NULL;
+        return true;
+    }
+    if (method.len == 3 && memcmp(method.str, "Xor", 3) == 0 && argc == 2) {
+        LLVMValueRef a16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[0], locals));
+        LLVMValueRef b16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[1], locals));
+        *out = v16i8_to_vec128(g, LLVMBuildXor(g->builder, a16, b16, "vxor"));
+        return true;
+    }
+    if (method.len == 3 && memcmp(method.str, "And", 3) == 0 && argc == 2) {
+        LLVMValueRef a16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[0], locals));
+        LLVMValueRef b16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[1], locals));
+        *out = v16i8_to_vec128(g, LLVMBuildAnd(g->builder, a16, b16, "vand"));
+        return true;
+    }
+    if (method.len == 2 && memcmp(method.str, "Or", 2) == 0 && argc == 2) {
+        LLVMValueRef a16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[0], locals));
+        LLVMValueRef b16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[1], locals));
+        *out = v16i8_to_vec128(g, LLVMBuildOr(g->builder, a16, b16, "vor"));
+        return true;
+    }
+    if (method.len == 12 && memcmp(method.str, "CompareEqual", 12) == 0 && argc == 2) {
+        LLVMTypeRef v16i8 = LLVMVectorType(LLVMInt8TypeInContext(g->ctx), 16);
+        LLVMValueRef a16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[0], locals));
+        LLVMValueRef b16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[1], locals));
+        LLVMValueRef cmp = LLVMBuildICmp(g->builder, LLVMIntEQ, a16, b16, "vcmpeq");
+        LLVMValueRef mask = LLVMBuildSExt(g->builder, cmp, v16i8, "vmask");
+        *out = v16i8_to_vec128(g, mask);
+        return true;
+    }
+    if (method.len == 8 && memcmp(method.str, "MoveMask", 8) == 0 && argc == 1) {
+        LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+        LLVMTypeRef v16i8 = LLVMVectorType(LLVMInt8TypeInContext(g->ctx), 16);
+        LLVMValueRef a16 = vec128_to_v16i8(g, emit_expr(g, expr->call.args.items[0], locals));
+        LLVMTypeRef fty = LLVMFunctionType(i32t, (LLVMTypeRef[]){ v16i8 }, 1, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.sse2.pmovmskb.128");
+        if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.sse2.pmovmskb.128", fty);
+        *out = zan_call2(g->builder, fty, fn, &a16, 1, "pmovmskb");
+        return true;
+    }
+
+    return false;
+}
+
+static bool emit_aes_call(zan_irgen_t *g, zan_ast_node_t *expr,
+                          local_scope_t *locals, LLVMValueRef *out) {
+    if (expr->kind != AST_CALL) return false;
+    zan_ast_node_t *callee = expr->call.callee;
+    if (callee->kind != AST_MEMBER_ACCESS) return false;
+    if (!is_target_class_obj(callee->member.object, "Aes", 3, locals))
+        return false;
+
+    zan_istr_t method = callee->member.name;
+    int argc = expr->call.args.count;
+    LLVMTypeRef v2i64 = LLVMVectorType(LLVMInt64TypeInContext(g->ctx), 2);
+
+    if (method.len == 7 && memcmp(method.str, "Encrypt", 7) == 0 && argc == 2) {
+        LLVMValueRef v_val = vec128_to_v2i64(g, emit_expr(g, expr->call.args.items[0], locals));
+        LLVMValueRef v_key = vec128_to_v2i64(g, emit_expr(g, expr->call.args.items[1], locals));
+        LLVMTypeRef fty = LLVMFunctionType(v2i64, (LLVMTypeRef[]){ v2i64, v2i64 }, 2, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.aesni.aesenc");
+        if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.aesni.aesenc", fty);
+        LLVMValueRef r = zan_call2(g->builder, fty, fn, (LLVMValueRef[]){ v_val, v_key }, 2, "aesenc");
+        *out = v2i64_to_vec128(g, r);
+        return true;
+    }
+    if (method.len == 11 && memcmp(method.str, "EncryptLast", 11) == 0 && argc == 2) {
+        LLVMValueRef v_val = vec128_to_v2i64(g, emit_expr(g, expr->call.args.items[0], locals));
+        LLVMValueRef v_key = vec128_to_v2i64(g, emit_expr(g, expr->call.args.items[1], locals));
+        LLVMTypeRef fty = LLVMFunctionType(v2i64, (LLVMTypeRef[]){ v2i64, v2i64 }, 2, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.aesni.aesenclast");
+        if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.aesni.aesenclast", fty);
+        LLVMValueRef r = zan_call2(g->builder, fty, fn, (LLVMValueRef[]){ v_val, v_key }, 2, "aesenclast");
+        *out = v2i64_to_vec128(g, r);
+        return true;
+    }
+    if (method.len == 7 && memcmp(method.str, "Decrypt", 7) == 0 && argc == 2) {
+        LLVMValueRef v_val = vec128_to_v2i64(g, emit_expr(g, expr->call.args.items[0], locals));
+        LLVMValueRef v_key = vec128_to_v2i64(g, emit_expr(g, expr->call.args.items[1], locals));
+        LLVMTypeRef fty = LLVMFunctionType(v2i64, (LLVMTypeRef[]){ v2i64, v2i64 }, 2, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.aesni.aesdec");
+        if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.aesni.aesdec", fty);
+        LLVMValueRef r = zan_call2(g->builder, fty, fn, (LLVMValueRef[]){ v_val, v_key }, 2, "aesdec");
+        *out = v2i64_to_vec128(g, r);
+        return true;
+    }
+    if (method.len == 11 && memcmp(method.str, "DecryptLast", 11) == 0 && argc == 2) {
+        LLVMValueRef v_val = vec128_to_v2i64(g, emit_expr(g, expr->call.args.items[0], locals));
+        LLVMValueRef v_key = vec128_to_v2i64(g, emit_expr(g, expr->call.args.items[1], locals));
+        LLVMTypeRef fty = LLVMFunctionType(v2i64, (LLVMTypeRef[]){ v2i64, v2i64 }, 2, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.aesni.aesdeclast");
+        if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.aesni.aesdeclast", fty);
+        LLVMValueRef r = zan_call2(g->builder, fty, fn, (LLVMValueRef[]){ v_val, v_key }, 2, "aesdeclast");
+        *out = v2i64_to_vec128(g, r);
+        return true;
+    }
+    if (method.len == 12 && memcmp(method.str, "KeygenAssist", 12) == 0 && argc == 2) {
+        LLVMValueRef v_val = vec128_to_v2i64(g, emit_expr(g, expr->call.args.items[0], locals));
+        LLVMValueRef rcon = coerce_int_to(g, emit_expr(g, expr->call.args.items[1], locals), LLVMInt8TypeInContext(g->ctx));
+        LLVMTypeRef fty = LLVMFunctionType(v2i64, (LLVMTypeRef[]){ v2i64, LLVMInt8TypeInContext(g->ctx) }, 2, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.aesni.aeskeygenassist");
+        if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.aesni.aeskeygenassist", fty);
+        LLVMValueRef r = zan_call2(g->builder, fty, fn, (LLVMValueRef[]){ v_val, rcon }, 2, "aeskeygenassist");
+        *out = v2i64_to_vec128(g, r);
+        return true;
+    }
+    if (method.len == 18 && memcmp(method.str, "InverseMixColumns", 18) == 0 && argc == 1) {
+        LLVMValueRef v_val = vec128_to_v2i64(g, emit_expr(g, expr->call.args.items[0], locals));
+        LLVMTypeRef fty = LLVMFunctionType(v2i64, (LLVMTypeRef[]){ v2i64 }, 1, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.aesni.aesimc");
+        if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.aesni.aesimc", fty);
+        LLVMValueRef r = zan_call2(g->builder, fty, fn, &v_val, 1, "aesimc");
+        *out = v2i64_to_vec128(g, r);
         return true;
     }
 
@@ -4990,6 +5583,19 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                     LLVMTypeRef fnty = LLVMFunctionType(i32t, (LLVMTypeRef[]){ i32t }, 1, 0);
                     LLVMValueRef val = zan_call2(g->builder, fnty, fn, &id, 1, "cpu_feat");
                     return zan_icmp(g->builder, LLVMIntNE, val, LLVMConstInt(i32t, 0, 0), "has_feat");
+                }
+            }
+        }
+        /* Vector128.Zero / Vector128.AllBitsSet */
+        {
+            if (is_target_class_obj(expr->member.object, "Vector128", 9, locals)) {
+                zan_istr_t mn = expr->member.name;
+                LLVMTypeRef v16i8 = LLVMVectorType(LLVMInt8TypeInContext(g->ctx), 16);
+                if (mn.len == 4 && memcmp(mn.str, "Zero", 4) == 0) {
+                    return v16i8_to_vec128(g, LLVMConstNull(v16i8));
+                }
+                if (mn.len == 10 && memcmp(mn.str, "AllBitsSet", 10) == 0) {
+                    return v16i8_to_vec128(g, LLVMConstAllOnes(v16i8));
                 }
             }
         }

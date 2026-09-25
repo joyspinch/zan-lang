@@ -158,10 +158,18 @@ static const zan_builtin_member_t members_nativemem[] = {
     { "GetString", 'M', "string GetString(nint ptr)" },
     { "PutString", 'M', "void PutString(nint ptr, string text)" },
     { "Sha256", 'M', "string Sha256(nint ptr, long size)" },
+    { "Md5",    'M', "string Md5(nint ptr, long size)" },
     { "Crc32",  'M', "long Crc32(nint ptr, long size)" },
     { "Crc32C", 'M', "long Crc32C(nint ptr, long size)" },
-    { "Aes128CbcEncrypt", 'M', "void Aes128CbcEncrypt(nint dst, nint src, long size, nint key, nint iv)" },
-    { "Aes128CbcDecrypt", 'M', "void Aes128CbcDecrypt(nint dst, nint src, long size, nint key, nint iv)" },
+    { "Aes128CbcEncrypt", 'M', "long Aes128CbcEncrypt(nint dst, nint src, long size, nint key, nint iv)" },
+    { "Aes128CbcDecrypt", 'M', "long Aes128CbcDecrypt(nint dst, nint src, long size, nint key, nint iv)" },
+    { "Sm3",              'M', "string Sm3(nint ptr, long size)" },
+    { "Sm4CbcEncrypt",    'M', "long Sm4CbcEncrypt(nint dst, nint src, long size, nint key, nint iv)" },
+    { "Sm4CbcDecrypt",    'M', "long Sm4CbcDecrypt(nint dst, nint src, long size, nint key, nint iv)" },
+    { "Base64Encode",     'M', "string Base64Encode(nint ptr, long size)" },
+    { "Base64Decode",     'M', "long Base64Decode(nint dst, nint src, long size)" },
+    { "JsonSkipWhitespace", 'M', "long JsonSkipWhitespace(nint ptr, long pos, long len)" },
+    { "JsonScanString",     'M', "long JsonScanString(nint ptr, long pos, long len)" },
 };
 
 static const zan_builtin_member_t members_x86_aes[] = {
@@ -176,9 +184,32 @@ static const zan_builtin_member_t members_x86_aes[] = {
 
 static const zan_builtin_member_t members_x86_sse2[] = {
     { "Xor",            'M', "Vector128 Xor(Vector128 left, Vector128 right)" },
+    { "And",            'M', "Vector128 And(Vector128 left, Vector128 right)" },
+    { "Or",             'M', "Vector128 Or(Vector128 left, Vector128 right)" },
+    { "CompareEqual",   'M', "Vector128 CompareEqual(Vector128 left, Vector128 right)" },
+    { "MoveMask",       'M', "int MoveMask(Vector128 value)" },
     { "LoadVector128",  'M', "Vector128 LoadVector128(nint address)" },
     { "Store",          'M', "void Store(nint address, Vector128 source)" },
     { "IsSupported",    'P', "bool IsSupported" },
+};
+
+static const zan_builtin_member_t members_vector128[] = {
+    { "Create",                       'M', "Vector128 Create(byte value)" },
+    { "Load",                         'M', "Vector128 Load(nint address)" },
+    { "Load",                         'M', "Vector128 Load(byte[] source)" },
+    { "Load",                         'M', "Vector128 Load(byte[] source, int offset)" },
+    { "Store",                        'M', "void Store(nint address, Vector128 source)" },
+    { "Store",                        'M', "void Store(byte[] dest, Vector128 source)" },
+    { "Store",                        'M', "void Store(byte[] dest, int offset, Vector128 source)" },
+    { "And",                          'M', "Vector128 And(Vector128 left, Vector128 right)" },
+    { "Or",                           'M', "Vector128 Or(Vector128 left, Vector128 right)" },
+    { "Xor",                          'M', "Vector128 Xor(Vector128 left, Vector128 right)" },
+    { "AndNot",                       'M', "Vector128 AndNot(Vector128 left, Vector128 right)" },
+    { "Equals",                       'M', "Vector128 Equals(Vector128 left, Vector128 right)" },
+    { "ExtractMostSignificantBits",   'M', "int ExtractMostSignificantBits(Vector128 value)" },
+    { "Shuffle",                      'M', "Vector128 Shuffle(Vector128 value, Vector128 mask)" },
+    { "Zero",                         'P', "Vector128 Zero" },
+    { "AllBitsSet",                   'P', "Vector128 AllBitsSet" },
 };
 
 static const zan_builtin_member_t members_bitops[] = {
@@ -244,6 +275,7 @@ static const zan_builtin_type_t builtin_types[] = {
     BT("Cpu", "Cpu", "Cpu", 1, members_cpu),
     BT("Aes", "Aes", "Aes", 1, members_x86_aes),
     BT("Sse2", "Sse2", "Sse2", 1, members_x86_sse2),
+    BT("Vector128", "Vector128", "Vector128", 1, members_vector128),
 };
 
 const zan_builtin_type_t *zan_builtin_types(int *count) {

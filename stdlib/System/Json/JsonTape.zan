@@ -97,11 +97,7 @@ class JsonDoc {
             throw new JsonException("Malformed JSON at position "
                 + Convert.ToString(-1 - pos));
         }
-        while (pos < len) {
-            int c = d.buf[pos] & 255;
-            if (c != 32 && c != 9 && c != 10 && c != 13) { break; }
-            pos = pos + 1;
-        }
+        pos = (int)NativeMemory.JsonSkipWhitespace(d.buf, (long)pos, (long)len);
         if (pos < len) {
             throw new JsonException("Malformed JSON at position "
                 + Convert.ToString(pos));
@@ -133,28 +129,19 @@ class JsonDoc {
         bool wantKey = false;     // 对象帧期待键（其余情况恒 false）
         int pos = 0;
         while (true) {
-            // 跳过空白：pad 保证 Load64 恒安全（pos 最大 len），EOF
-            // 时 c=0 不是空白也不是任何 token 前缀，由各检查收口。
+            // 跳过空白：SIMD 向量化跳过，pad 保证 Load64 恒安全，EOF 时 c=0。
+            pos = (int)NativeMemory.JsonSkipWhitespace(buf, (long)pos, (long)len);
             long x = NativeMemory.Load64(buf, pos);
             int c = (int)(x & 255);
-            while (c == 32 || c == 9 || c == 10 || c == 13) {
-                pos = pos + 1;
-                x = NativeMemory.Load64(buf, pos);
-                c = (int)(x & 255);
-            }
             if (wantKey) {
-                // ---- 对象键：'"' + SWAR 扫描 + ':' ----
+                // ---- 对象键：'"' + SIMD 扫描 + ':' ----
                 if (c != 34) { return -1 - pos; }
                 pos = JsonDoc.ScanKey(sl, pr, pool, src, buf, len, pos,
                     pbase, fr);
                 if (pos < 0) { return pos; }
+                pos = (int)NativeMemory.JsonSkipWhitespace(buf, (long)pos, (long)len);
                 x = NativeMemory.Load64(buf, pos);
                 c = (int)(x & 255);
-                while (c == 32 || c == 9 || c == 10 || c == 13) {
-                    pos = pos + 1;
-                    x = NativeMemory.Load64(buf, pos);
-                    c = (int)(x & 255);
-                }
                 if (c != 58) { return -1 - pos; }
                 pos = pos + 1;
                 wantKey = false;
@@ -167,45 +154,20 @@ class JsonDoc {
             if (depth > maxd && fr[pbase] == 4) { return -1 - pos; }
             int vslot;
             if (c == 34) {
-                // ---- 字符串值：SWAR 扫引号/反斜杠（内联）----
+                // ---- 字符串值：SIMD 向量查找闭引号与转义符 ----
                 int p2 = pos + 1;
                 int start = p2;
-                int q = -1;
-                int esc = -1;
-                while (p2 + 8 <= len) {
-                    long sx = NativeMemory.Load64(buf, p2);
-                    long t1 = sx ^ 0x2222222222222222L;
-                    long t2 = sx ^ 0x5C5C5C5C5C5C5C5CL;
-                    long m = ((t1 - 0x0101010101010101L) & ~t1
-                        & 0x8080808080808080L)
-                        | ((t2 - 0x0101010101010101L) & ~t2
-                        & 0x8080808080808080L);
-                    if (m == 0) { p2 = p2 + 8; continue; }
-                    int idx = 0;
-                    long mm = m;
-                    while ((mm & 255L) == 0) { mm = mm >> 8; idx = idx + 1; }
-                    int cb = buf[p2 + idx] & 255;
-                    if (cb == 34) { q = p2 + idx; break; }
-                    if (cb == 92) { esc = p2 + idx; break; }
-                    p2 = p2 + idx + 1;     // 借位链伪阳性：越过续扫
-                }
-                if (q < 0 && esc < 0) {
-                    while (p2 < len) {     // 末尾不足 8 字节的尾巴
-                        int cb = buf[p2] & 255;
-                        if (cb == 34) { q = p2; break; }
-                        if (cb == 92) { esc = p2; break; }
-                        p2 = p2 + 1;
-                    }
-                }
-                if (q >= 0) {
+                long res = NativeMemory.JsonScanString(buf, (long)p2, (long)len);
+                if (res >= 0 && res < len) {
+                    int q = (int)res;
                     JsonSlot ts = new JsonSlot();
                     ts.a = (long)3 | ((long)start << 8);
                     ts.b = (long)(q - start);
                     sl.Add(ts);
                     pos = q + 1;
                     vslot = sl.Count - 1;
-                } else {
-                    if (esc < 0) { return -1 - len; }
+                } else if (res < 0) {
+                    int esc = (int)(-1 - res);
                     int pe = JsonDoc.EscStringInto(pool, src, buf, len,
                         start, esc);
                     if (pe < 0) { return pe; }
@@ -215,17 +177,14 @@ class JsonDoc {
                     sl.Add(ts2);
                     pos = pe;
                     vslot = sl.Count - 1;
+                } else {
+                    return -1 - len;
                 }
             } else if (c == 123) {
                 // ---- '{'：先窥探空对象（免推栈快路径）----
-                int pk = pos + 1;
+                int pk = (int)NativeMemory.JsonSkipWhitespace(buf, (long)(pos + 1), (long)len);
                 long px = NativeMemory.Load64(buf, pk);
                 int pc = (int)(px & 255);
-                while (pc == 32 || pc == 9 || pc == 10 || pc == 13) {
-                    pk = pk + 1;
-                    px = NativeMemory.Load64(buf, pk);
-                    pc = (int)(px & 255);
-                }
                 if (pc == 125) {
                     // 空对象：首对下标 -1（链立即终止，避免串进之后
                     // 别的对象的键），b = 1<<31 与旧实现槽一致。
@@ -255,14 +214,9 @@ class JsonDoc {
                 }
             } else if (c == 91) {
                 // ---- '['：先窥探空数组（免推栈快路径）----
-                int pk = pos + 1;
+                int pk = (int)NativeMemory.JsonSkipWhitespace(buf, (long)(pos + 1), (long)len);
                 long px = NativeMemory.Load64(buf, pk);
                 int pc = (int)(px & 255);
-                while (pc == 32 || pc == 9 || pc == 10 || pc == 13) {
-                    pk = pk + 1;
-                    px = NativeMemory.Load64(buf, pk);
-                    pc = (int)(px & 255);
-                }
                 if (pc == 93) {
                     JsonSlot te2 = new JsonSlot();
                     te2.a = 4;
@@ -399,13 +353,9 @@ class JsonDoc {
             }
             // ---- 分隔级联：逗号继续取值/键，收口逐层向上 ----
             while (true) {
+                pos = (int)NativeMemory.JsonSkipWhitespace(buf, (long)pos, (long)len);
                 x = NativeMemory.Load64(buf, pos);
                 c = (int)(x & 255);
-                while (c == 32 || c == 9 || c == 10 || c == 13) {
-                    pos = pos + 1;
-                    x = NativeMemory.Load64(buf, pos);
-                    c = (int)(x & 255);
-                }
                 if (c == 44) {
                     pos = pos + 1;
                     wantKey = fr[pbase] == 5;
@@ -431,41 +381,21 @@ class JsonDoc {
         }
     }
 
-    /// 对象键 token 扫描（起始引号在 pos）：SWAR 快径零拷贝写进 pr
-    /// 新对；含转义走 EscStringInto。对挂进 pbase 帧的键链并计数。
-    /// 返回闭引号后位置或 -(错误位置+1)。每键一次调用——预测好的
-    /// 直接调用实测便宜，不值得复制 60 行内联块。
+    /// 对象键 token 扫描（起始引号在 pos）：SIMD 向量查找闭引号与转义符。
     static int ScanKey(List<JsonSlot> sl, List<JsonPair> pr,
         List<string> pool, string src, byte[] buf, int len, int pos,
         int pbase, int[] fr) {
         int p2 = pos + 1;
         int start = p2;
+        long res = NativeMemory.JsonScanString(buf, (long)p2, (long)len);
         int q = -1;
         int esc = -1;
-        while (p2 + 8 <= len) {
-            long sx = NativeMemory.Load64(buf, p2);
-            long t1 = sx ^ 0x2222222222222222L;
-            long t2 = sx ^ 0x5C5C5C5C5C5C5C5CL;
-            long m = ((t1 - 0x0101010101010101L) & ~t1
-                & 0x8080808080808080L)
-                | ((t2 - 0x0101010101010101L) & ~t2
-                & 0x8080808080808080L);
-            if (m == 0) { p2 = p2 + 8; continue; }
-            int idx = 0;
-            long mm = m;
-            while ((mm & 255L) == 0) { mm = mm >> 8; idx = idx + 1; }
-            int cb = buf[p2 + idx] & 255;
-            if (cb == 34) { q = p2 + idx; break; }
-            if (cb == 92) { esc = p2 + idx; break; }
-            p2 = p2 + idx + 1;
-        }
-        if (q < 0 && esc < 0) {
-            while (p2 < len) {
-                int cb = buf[p2] & 255;
-                if (cb == 34) { q = p2; break; }
-                if (cb == 92) { esc = p2; break; }
-                p2 = p2 + 1;
-            }
+        if (res >= 0 && res < len) {
+            q = (int)res;
+        } else if (res < 0) {
+            esc = (int)(-1 - res);
+        } else {
+            return -1 - len;
         }
         JsonPair pair = new JsonPair();
         pair.nextPair = -1;
@@ -475,7 +405,6 @@ class JsonDoc {
             pair.keyLen = q - start;
             pos = q + 1;
         } else {
-            if (esc < 0) { return -1 - len; }
             int pe = JsonDoc.EscStringInto(pool, src, buf, len, start, esc);
             if (pe < 0) { return pe; }
             pair.keyStart = -1;

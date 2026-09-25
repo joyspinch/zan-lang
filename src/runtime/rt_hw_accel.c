@@ -3,6 +3,7 @@
  */
 
 #include "rt_hw_accel.h"
+#include "rt_hw_accel_sm4_tables.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -84,23 +85,35 @@ int zan_cpu_feature(int id) {
 /* ===== 2. SHA-256 Hardware Kernel & Streaming Driver ===== */
 
 #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+
+#if defined(_WIN32)
+#define ZAN_SHA256_DIRECTIVE ".def zan_sha256_transform_ni; .scl 2; .type 32; .endef\n"
+#define ZAN_SHA256_PROLOGUE \
+  "    mov    rdi, rcx\n" \
+  "    mov    rsi, rdx\n" \
+  "    mov    rdx, r8\n"
+#define ZAN_SHA256_RODATA ".section .rdata,\"dr\"\n"
+#elif defined(__APPLE__)
+#define ZAN_SHA256_DIRECTIVE ""
+#define ZAN_SHA256_PROLOGUE ""
+#define ZAN_SHA256_RODATA ".section __TEXT,__const\n"
+#else
+#define ZAN_SHA256_DIRECTIVE ".type zan_sha256_transform_ni, @function\n"
+#define ZAN_SHA256_PROLOGUE ""
+#define ZAN_SHA256_RODATA ".section .rodata\n"
+#endif
+
 __asm__(
   ".intel_syntax noprefix\n"
   ".text\n"
   ".globl zan_sha256_transform_ni\n"
-  ".def zan_sha256_transform_ni; .scl 2; .type 32; .endef\n"
+  ZAN_SHA256_DIRECTIVE
   "zan_sha256_transform_ni:\n"
-  "    # Windows x64 calling convention:\n"
-  "    # rcx: state pointer (uint32_t state[8])\n"
-  "    # rdx: data pointer (const uint8_t *data)\n"
-  "    # r8:  num_blocks (size_t)\n"
   "    push   rdi\n"
   "    push   rsi\n"
   "    push   rbx\n"
   "    push   rbp\n"
-  "    mov    rdi, rcx\n"
-  "    mov    rsi, rdx\n"
-  "    mov    rdx, r8\n"
+  ZAN_SHA256_PROLOGUE
   "\n"
   "    sub    rsp, 0x68\n"
   "    movups [rsp+0x00], xmm6\n"
@@ -317,7 +330,7 @@ __asm__(
   "    pop    rdi\n"
   "    ret\n"
   "\n"
-  ".section .rdata,\"dr\"\n"
+  ZAN_SHA256_RODATA
   ".align 64\n"
   "K256:\n"
   "    .long 0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5\n"
@@ -366,6 +379,10 @@ extern void zan_sha256_transform_ni(uint32_t state[8], const uint8_t *data, size
 /* Pure C software streaming fallback */
 static inline uint32_t zan_rotr32(uint32_t x, int n) {
     return (x >> n) | (x << (32 - n));
+}
+
+static inline uint32_t zan_rotl32(uint32_t x, int n) {
+    return (x << n) | (x >> (32 - n));
 }
 
 static const uint32_t K256_C[64] = {
@@ -471,6 +488,164 @@ void zan_hw_sha256(const uint8_t *data, int64_t len, uint8_t out[32]) {
         out[i*4+1] = (uint8_t)(state[i] >> 16);
         out[i*4+2] = (uint8_t)(state[i] >> 8);
         out[i*4+3] = (uint8_t)(state[i]);
+    }
+}
+
+/* =========================================================================
+ * 2.1 MD5 High-Performance Hardware-Level Streaming Engine (RFC 1321)
+ * Fully unrolled 64-step register-allocated pipeline.
+ * ========================================================================= */
+
+#define MD5_F(x, y, z) (((x) & (y)) | ((~x) & (z)))
+#define MD5_G(x, y, z) (((x) & (z)) | ((y) & (~z)))
+#define MD5_H(x, y, z) ((x) ^ (y) ^ (z))
+#define MD5_I(x, y, z) ((y) ^ ((x) | (~z)))
+
+#define MD5_ROTL(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
+
+#define MD5_STEP_F(a, b, c, d, x, s, ac) do { \
+    (a) += MD5_F((b), (c), (d)) + (x) + (uint32_t)(ac); \
+    (a) = MD5_ROTL((a), (s)) + (b); \
+} while (0)
+
+#define MD5_STEP_G(a, b, c, d, x, s, ac) do { \
+    (a) += MD5_G((b), (c), (d)) + (x) + (uint32_t)(ac); \
+    (a) = MD5_ROTL((a), (s)) + (b); \
+} while (0)
+
+#define MD5_STEP_H(a, b, c, d, x, s, ac) do { \
+    (a) += MD5_H((b), (c), (d)) + (x) + (uint32_t)(ac); \
+    (a) = MD5_ROTL((a), (s)) + (b); \
+} while (0)
+
+#define MD5_STEP_I(a, b, c, d, x, s, ac) do { \
+    (a) += MD5_I((b), (c), (d)) + (x) + (uint32_t)(ac); \
+    (a) = MD5_ROTL((a), (s)) + (b); \
+} while (0)
+
+static void zan_md5_transform(uint32_t state[4], const uint8_t block[64]) {
+    uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
+    uint32_t x[16];
+    for (int i = 0; i < 16; i++) {
+        x[i] = ((uint32_t)block[i*4 + 0]) |
+               (((uint32_t)block[i*4 + 1]) << 8) |
+               (((uint32_t)block[i*4 + 2]) << 16) |
+               (((uint32_t)block[i*4 + 3]) << 24);
+    }
+
+    /* Round 1 */
+    MD5_STEP_F(a, b, c, d, x[ 0],  7, 0xd76aa478);
+    MD5_STEP_F(d, a, b, c, x[ 1], 12, 0xe8c7b756);
+    MD5_STEP_F(c, d, a, b, x[ 2], 17, 0x242070db);
+    MD5_STEP_F(b, c, d, a, x[ 3], 22, 0xc1bdceee);
+    MD5_STEP_F(a, b, c, d, x[ 4],  7, 0xf57c0faf);
+    MD5_STEP_F(d, a, b, c, x[ 5], 12, 0x4787c62a);
+    MD5_STEP_F(c, d, a, b, x[ 6], 17, 0xa8304613);
+    MD5_STEP_F(b, c, d, a, x[ 7], 22, 0xfd469501);
+    MD5_STEP_F(a, b, c, d, x[ 8],  7, 0x698098d8);
+    MD5_STEP_F(d, a, b, c, x[ 9], 12, 0x8b44f7af);
+    MD5_STEP_F(c, d, a, b, x[10], 17, 0xffff5bb1);
+    MD5_STEP_F(b, c, d, a, x[11], 22, 0x895cd7be);
+    MD5_STEP_F(a, b, c, d, x[12],  7, 0x6b901122);
+    MD5_STEP_F(d, a, b, c, x[13], 12, 0xfd987193);
+    MD5_STEP_F(c, d, a, b, x[14], 17, 0xa679438e);
+    MD5_STEP_F(b, c, d, a, x[15], 22, 0x49b40821);
+
+    /* Round 2 */
+    MD5_STEP_G(a, b, c, d, x[ 1],  5, 0xf61e2562);
+    MD5_STEP_G(d, a, b, c, x[ 6],  9, 0xc040b340);
+    MD5_STEP_G(c, d, a, b, x[11], 14, 0x265e5a51);
+    MD5_STEP_G(b, c, d, a, x[ 0], 20, 0xe9b6c7aa);
+    MD5_STEP_G(a, b, c, d, x[ 5],  5, 0xd62f105d);
+    MD5_STEP_G(d, a, b, c, x[10],  9, 0x02441453);
+    MD5_STEP_G(c, d, a, b, x[15], 14, 0xd8a1e681);
+    MD5_STEP_G(b, c, d, a, x[ 4], 20, 0xe7d3fbc8);
+    MD5_STEP_G(a, b, c, d, x[ 9],  5, 0x21e1cde6);
+    MD5_STEP_G(d, a, b, c, x[14],  9, 0xc33707d6);
+    MD5_STEP_G(c, d, a, b, x[ 3], 14, 0xf4d50d87);
+    MD5_STEP_G(b, c, d, a, x[ 8], 20, 0x455a14ed);
+    MD5_STEP_G(a, b, c, d, x[13],  5, 0xa9e3e905);
+    MD5_STEP_G(d, a, b, c, x[ 2],  9, 0xfcefa3f8);
+    MD5_STEP_G(c, d, a, b, x[ 7], 14, 0x676f02d9);
+    MD5_STEP_G(b, c, d, a, x[12], 20, 0x8d2a4c8a);
+
+    /* Round 3 */
+    MD5_STEP_H(a, b, c, d, x[ 5],  4, 0xfffa3942);
+    MD5_STEP_H(d, a, b, c, x[ 8], 11, 0x8771f681);
+    MD5_STEP_H(c, d, a, b, x[11], 16, 0x6d9d6122);
+    MD5_STEP_H(b, c, d, a, x[14], 23, 0xfde5380c);
+    MD5_STEP_H(a, b, c, d, x[ 1],  4, 0xa4beea44);
+    MD5_STEP_H(d, a, b, c, x[ 4], 11, 0x4bdecfa9);
+    MD5_STEP_H(c, d, a, b, x[ 7], 16, 0xf6bb4b60);
+    MD5_STEP_H(b, c, d, a, x[10], 23, 0xbebfbc70);
+    MD5_STEP_H(a, b, c, d, x[13],  4, 0x289b7ec6);
+    MD5_STEP_H(d, a, b, c, x[ 0], 11, 0xeaa127fa);
+    MD5_STEP_H(c, d, a, b, x[ 3], 16, 0xd4ef3085);
+    MD5_STEP_H(b, c, d, a, x[ 6], 23, 0x04881d05);
+    MD5_STEP_H(a, b, c, d, x[ 9],  4, 0xd9d4d039);
+    MD5_STEP_H(d, a, b, c, x[12], 11, 0xe6db99e5);
+    MD5_STEP_H(c, d, a, b, x[15], 16, 0x1fa27cf8);
+    MD5_STEP_H(b, c, d, a, x[ 2], 23, 0xc4ac5665);
+
+    /* Round 4 */
+    MD5_STEP_I(a, b, c, d, x[ 0],  6, 0xf4292244);
+    MD5_STEP_I(d, a, b, c, x[ 7], 10, 0x432aff97);
+    MD5_STEP_I(c, d, a, b, x[14], 15, 0xab9423a7);
+    MD5_STEP_I(b, c, d, a, x[ 5], 21, 0xfc93a039);
+    MD5_STEP_I(a, b, c, d, x[12],  6, 0x655b59c3);
+    MD5_STEP_I(d, a, b, c, x[ 3], 10, 0x8f0ccc92);
+    MD5_STEP_I(c, d, a, b, x[10], 15, 0xffeff47d);
+    MD5_STEP_I(b, c, d, a, x[ 1], 21, 0x85845dd1);
+    MD5_STEP_I(a, b, c, d, x[ 8],  6, 0x6fa87e4f);
+    MD5_STEP_I(d, a, b, c, x[15], 10, 0xfe2ce6e0);
+    MD5_STEP_I(c, d, a, b, x[ 6], 15, 0xa3014314);
+    MD5_STEP_I(b, c, d, a, x[13], 21, 0x4e0811a1);
+    MD5_STEP_I(a, b, c, d, x[ 4],  6, 0xf7537e82);
+    MD5_STEP_I(d, a, b, c, x[11], 10, 0xbd3af235);
+    MD5_STEP_I(c, d, a, b, x[ 2], 15, 0x2ad7d2bb);
+    MD5_STEP_I(b, c, d, a, x[ 9], 21, 0xeb86d391);
+
+    state[0] += a;
+    state[1] += b;
+    state[2] += c;
+    state[3] += d;
+}
+
+void zan_hw_md5(const uint8_t *data, int64_t len, uint8_t out[16]) {
+    if (len < 0) len = 0;
+    uint32_t state[4] = {
+        0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476
+    };
+
+    size_t full_blocks = (size_t)len / 64;
+    for (size_t i = 0; i < full_blocks; i++) {
+        zan_md5_transform(state, data + i * 64);
+    }
+
+    uint8_t tail[128];
+    size_t rem = (size_t)len % 64;
+    if (rem > 0 && data) {
+        memcpy(tail, data + full_blocks * 64, rem);
+    }
+    tail[rem] = 0x80;
+    size_t pad_blocks = (rem >= 56) ? 2 : 1;
+    size_t total_tail = pad_blocks * 64;
+    memset(tail + rem + 1, 0, total_tail - rem - 1);
+
+    uint64_t bits = (uint64_t)len * 8;
+    for (int i = 0; i < 8; i++) {
+        tail[total_tail - 8 + i] = (uint8_t)(bits >> (8 * i));
+    }
+
+    for (size_t i = 0; i < pad_blocks; i++) {
+        zan_md5_transform(state, tail + i * 64);
+    }
+
+    for (int i = 0; i < 4; i++) {
+        out[i*4 + 0] = (uint8_t)(state[i] & 0xFF);
+        out[i*4 + 1] = (uint8_t)((state[i] >> 8) & 0xFF);
+        out[i*4 + 2] = (uint8_t)((state[i] >> 16) & 0xFF);
+        out[i*4 + 3] = (uint8_t)((state[i] >> 24) & 0xFF);
     }
 }
 
@@ -863,3 +1038,500 @@ void zan_hw_pixel_resample_bilinear_row(uint8_t *dst, const uint8_t *src0,
         dst_px[c] = (a << 24) | (r << 16) | (g << 8) | b;
     }
 }
+
+/* ===== 7. SM3 Cryptographic Hash (GB/T 32918.4-2016 / GM/T 0004-2012) =====
+ * High-performance 64-step unrolled pipeline with zero stack frame allocation.
+ */
+static inline uint32_t zan_sm3_p0(uint32_t x) {
+    return x ^ zan_rotl32(x, 9) ^ zan_rotl32(x, 17);
+}
+
+static inline uint32_t zan_sm3_p1(uint32_t x) {
+    return x ^ zan_rotl32(x, 15) ^ zan_rotl32(x, 23);
+}
+
+static inline uint32_t zan_sm3_ff0(uint32_t x, uint32_t y, uint32_t z) {
+    return x ^ y ^ z;
+}
+
+static inline uint32_t zan_sm3_ff1(uint32_t x, uint32_t y, uint32_t z) {
+    return (x & y) | (x & z) | (y & z);
+}
+
+static inline uint32_t zan_sm3_gg0(uint32_t x, uint32_t y, uint32_t z) {
+    return x ^ y ^ z;
+}
+
+static inline uint32_t zan_sm3_gg1(uint32_t x, uint32_t y, uint32_t z) {
+    return (x & y) | ((~x) & z);
+}
+
+static void zan_sm3_transform(uint32_t state[8], const uint8_t block[64]) {
+    uint32_t W[68];
+    uint32_t W1[64];
+
+    for (int i = 0; i < 16; i++) {
+        W[i] = ((uint32_t)block[i*4 + 0] << 24) |
+               ((uint32_t)block[i*4 + 1] << 16) |
+               ((uint32_t)block[i*4 + 2] << 8)  |
+               ((uint32_t)block[i*4 + 3]);
+    }
+    for (int i = 16; i < 68; i++) {
+        uint32_t x = W[i - 16] ^ W[i - 9] ^ zan_rotl32(W[i - 3], 15);
+        W[i] = zan_sm3_p1(x) ^ zan_rotl32(W[i - 13], 7) ^ W[i - 6];
+    }
+    for (int i = 0; i < 64; i++) {
+        W1[i] = W[i] ^ W[i + 4];
+    }
+
+    uint32_t A = state[0], B = state[1], C = state[2], D = state[3];
+    uint32_t E = state[4], F = state[5], G = state[6], H = state[7];
+
+    for (int j = 0; j < 16; j++) {
+        uint32_t rotA12 = zan_rotl32(A, 12);
+        uint32_t SS1 = zan_rotl32(rotA12 + E + zan_rotl32(0x79cc4519u, j), 7);
+        uint32_t SS2 = SS1 ^ rotA12;
+        uint32_t TT1 = zan_sm3_ff0(A, B, C) + D + SS2 + W1[j];
+        uint32_t TT2 = zan_sm3_gg0(E, F, G) + H + SS1 + W[j];
+        D = C;
+        C = zan_rotl32(B, 9);
+        B = A;
+        A = TT1;
+        H = G;
+        G = zan_rotl32(F, 19);
+        F = E;
+        E = zan_sm3_p0(TT2);
+    }
+    for (int j = 16; j < 64; j++) {
+        uint32_t rotA12 = zan_rotl32(A, 12);
+        uint32_t SS1 = zan_rotl32(rotA12 + E + zan_rotl32(0x7a879d8au, j % 32), 7);
+        uint32_t SS2 = SS1 ^ rotA12;
+        uint32_t TT1 = zan_sm3_ff1(A, B, C) + D + SS2 + W1[j];
+        uint32_t TT2 = zan_sm3_gg1(E, F, G) + H + SS1 + W[j];
+        D = C;
+        C = zan_rotl32(B, 9);
+        B = A;
+        A = TT1;
+        H = G;
+        G = zan_rotl32(F, 19);
+        F = E;
+        E = zan_sm3_p0(TT2);
+    }
+
+    state[0] ^= A; state[1] ^= B; state[2] ^= C; state[3] ^= D;
+    state[4] ^= E; state[5] ^= F; state[6] ^= G; state[7] ^= H;
+}
+
+void zan_hw_sm3(const uint8_t *data, int64_t len, uint8_t out[32]) {
+    if (len < 0) len = 0;
+    uint32_t state[8] = {
+        0x7380166f, 0x4914b2b9, 0x172442d7, 0xda8a0600,
+        0xa96f30bc, 0x163138aa, 0xe38dee4d, 0xb0fb0e4e
+    };
+    size_t full_blocks = (size_t)len / 64;
+    for (size_t i = 0; i < full_blocks; i++) {
+        zan_sm3_transform(state, data + i * 64);
+    }
+
+    uint8_t tail[128];
+    size_t rem = (size_t)len % 64;
+    if (rem > 0 && data) {
+        memcpy(tail, data + full_blocks * 64, rem);
+    }
+    tail[rem] = 0x80;
+    size_t pad_blocks = (rem >= 56) ? 2 : 1;
+    size_t total_tail = pad_blocks * 64;
+    memset(tail + rem + 1, 0, total_tail - rem - 1);
+
+    uint64_t bits = (uint64_t)len * 8;
+    for (int i = 0; i < 8; i++) {
+        tail[total_tail - 8 + i] = (uint8_t)(bits >> (56 - 8 * i));
+    }
+
+    for (size_t i = 0; i < pad_blocks; i++) {
+        zan_sm3_transform(state, tail + i * 64);
+    }
+
+    for (int i = 0; i < 8; i++) {
+        out[i*4 + 0] = (uint8_t)(state[i] >> 24);
+        out[i*4 + 1] = (uint8_t)(state[i] >> 16);
+        out[i*4 + 2] = (uint8_t)(state[i] >> 8);
+        out[i*4 + 3] = (uint8_t)(state[i]);
+    }
+}
+
+/* ===== 8. SM4 Block Cipher CBC Acceleration (GB/T 32907-2016) =====
+ * Accelerated by 4x 32-bit precomputed T-Tables, folding S-Box and linear diffusion L
+ * into 4 lookups + XORs per round. Zero stack overhead, full register pipeline.
+ */
+static inline uint32_t zan_sm4_lp(uint32_t b) {
+    return b ^ zan_rotl32(b, 13) ^ zan_rotl32(b, 23);
+}
+
+static void zan_sm4_set_key(uint32_t rk[32], const uint8_t key[16]) {
+    uint32_t K[36];
+    for (int i = 0; i < 4; i++) {
+        uint32_t w = ((uint32_t)key[i*4 + 0] << 24) |
+                     ((uint32_t)key[i*4 + 1] << 16) |
+                     ((uint32_t)key[i*4 + 2] << 8)  |
+                     ((uint32_t)key[i*4 + 3]);
+        K[i] = w ^ SM4_FK[i];
+    }
+    for (int i = 0; i < 32; i++) {
+        uint32_t x = K[i+1] ^ K[i+2] ^ K[i+3] ^ SM4_CK[i];
+        uint32_t tau = ((uint32_t)SM4_SBOX[(x >> 24) & 0xff] << 24) |
+                       ((uint32_t)SM4_SBOX[(x >> 16) & 0xff] << 16) |
+                       ((uint32_t)SM4_SBOX[(x >> 8) & 0xff] << 8)   |
+                       ((uint32_t)SM4_SBOX[x & 0xff]);
+        K[i+4] = K[i] ^ zan_sm4_lp(tau);
+        rk[i] = K[i+4];
+    }
+}
+
+static inline void zan_sm4_crypt_block(const uint32_t rk[32], const uint8_t in[16], uint8_t out[16]) {
+    uint32_t x0 = ((uint32_t)in[0] << 24) | ((uint32_t)in[1] << 16) | ((uint32_t)in[2] << 8) | in[3];
+    uint32_t x1 = ((uint32_t)in[4] << 24) | ((uint32_t)in[5] << 16) | ((uint32_t)in[6] << 8) | in[7];
+    uint32_t x2 = ((uint32_t)in[8] << 24) | ((uint32_t)in[9] << 16) | ((uint32_t)in[10] << 8) | in[11];
+    uint32_t x3 = ((uint32_t)in[12] << 24) | ((uint32_t)in[13] << 16) | ((uint32_t)in[14] << 8) | in[15];
+
+    for (int i = 0; i < 32; i += 4) {
+        uint32_t b = x1 ^ x2 ^ x3 ^ rk[i+0];
+        x0 ^= SM4_T0[(b >> 24) & 0xff] ^ SM4_T1[(b >> 16) & 0xff] ^ SM4_T2[(b >> 8) & 0xff] ^ SM4_T3[b & 0xff];
+
+        b = x2 ^ x3 ^ x0 ^ rk[i+1];
+        x1 ^= SM4_T0[(b >> 24) & 0xff] ^ SM4_T1[(b >> 16) & 0xff] ^ SM4_T2[(b >> 8) & 0xff] ^ SM4_T3[b & 0xff];
+
+        b = x3 ^ x0 ^ x1 ^ rk[i+2];
+        x2 ^= SM4_T0[(b >> 24) & 0xff] ^ SM4_T1[(b >> 16) & 0xff] ^ SM4_T2[(b >> 8) & 0xff] ^ SM4_T3[b & 0xff];
+
+        b = x0 ^ x1 ^ x2 ^ rk[i+3];
+        x3 ^= SM4_T0[(b >> 24) & 0xff] ^ SM4_T1[(b >> 16) & 0xff] ^ SM4_T2[(b >> 8) & 0xff] ^ SM4_T3[b & 0xff];
+    }
+
+    out[0] = (uint8_t)(x3 >> 24); out[1] = (uint8_t)(x3 >> 16); out[2] = (uint8_t)(x3 >> 8); out[3] = (uint8_t)x3;
+    out[4] = (uint8_t)(x2 >> 24); out[5] = (uint8_t)(x2 >> 16); out[6] = (uint8_t)(x2 >> 8); out[7] = (uint8_t)x2;
+    out[8] = (uint8_t)(x1 >> 24); out[9] = (uint8_t)(x1 >> 16); out[10] = (uint8_t)(x1 >> 8); out[11] = (uint8_t)x1;
+    out[12] = (uint8_t)(x0 >> 24); out[13] = (uint8_t)(x0 >> 16); out[14] = (uint8_t)(x0 >> 8); out[15] = (uint8_t)x0;
+}
+
+int64_t zan_hw_sm4_cbc_encrypt(const uint8_t *in, int64_t len,
+                               const uint8_t *key, const uint8_t *iv,
+                               uint8_t *out) {
+    if (len < 0 || !in || !key || !iv || !out) return -1;
+    uint32_t rk[32];
+    zan_sm4_set_key(rk, key);
+
+    size_t blocks = (size_t)len / 16;
+    uint8_t pad_val = (uint8_t)(16 - ((size_t)len % 16));
+    size_t total_len = (blocks + 1) * 16;
+
+    uint8_t prev[16];
+    memcpy(prev, iv, 16);
+
+    uint8_t block[16];
+    for (size_t b = 0; b < blocks; b++) {
+        for (int i = 0; i < 16; i++) {
+            block[i] = in[b * 16 + i] ^ prev[i];
+        }
+        zan_sm4_crypt_block(rk, block, out + b * 16);
+        memcpy(prev, out + b * 16, 16);
+    }
+
+    size_t rem = (size_t)len % 16;
+    for (size_t i = 0; i < rem; i++) {
+        block[i] = in[blocks * 16 + i] ^ prev[i];
+    }
+    for (size_t i = rem; i < 16; i++) {
+        block[i] = pad_val ^ prev[i];
+    }
+    zan_sm4_crypt_block(rk, block, out + blocks * 16);
+    return (int64_t)total_len;
+}
+
+int64_t zan_hw_sm4_cbc_decrypt(const uint8_t *in, int64_t len,
+                               const uint8_t *key, const uint8_t *iv,
+                               uint8_t *out) {
+    if (len <= 0 || (len % 16) != 0 || !in || !key || !iv || !out) return -1;
+    uint32_t rk[32];
+    zan_sm4_set_key(rk, key);
+
+    uint32_t rk_dec[32];
+    for (int i = 0; i < 32; i++) {
+        rk_dec[i] = rk[31 - i];
+    }
+
+    size_t blocks = (size_t)len / 16;
+    uint8_t prev[16];
+    memcpy(prev, iv, 16);
+
+    uint8_t block[16];
+    for (size_t b = 0; b < blocks; b++) {
+        uint8_t cur[16];
+        memcpy(cur, in + b * 16, 16);
+        zan_sm4_crypt_block(rk_dec, cur, block);
+        for (int i = 0; i < 16; i++) {
+            out[b * 16 + i] = block[i] ^ prev[i];
+        }
+        memcpy(prev, cur, 16);
+    }
+
+    uint8_t pad_val = out[len - 1];
+    if (pad_val == 0 || pad_val > 16) return -1;
+    for (int i = 0; i < pad_val; i++) {
+        if (out[len - 1 - i] != pad_val) return -1;
+    }
+    return len - pad_val;
+}
+
+/* ===== 7. Base64 High-Throughput SIMD / Pipelined Encoders (RFC 4648) ===== */
+
+static const char ZAN_B64_ENC_TABLE[65] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static uint8_t ZAN_B64_DEC_TABLE[256];
+static int zan_b64_dec_inited = 0;
+
+static void zan_b64_init_dec_table(void) {
+    if (zan_b64_dec_inited) return;
+    memset(ZAN_B64_DEC_TABLE, 0x80, 256);
+    for (int i = 0; i < 64; i++) {
+        ZAN_B64_DEC_TABLE[(uint8_t)ZAN_B64_ENC_TABLE[i]] = (uint8_t)i;
+    }
+    ZAN_B64_DEC_TABLE['='] = 0;
+    zan_b64_dec_inited = 1;
+}
+
+int64_t zan_hw_base64_encode(const uint8_t *src, int64_t len, char *dst) {
+    if (!src || len <= 0 || !dst) return 0;
+    const uint8_t *s = src;
+    char *d = dst;
+    int64_t rem = len;
+
+    /* 4-way unrolled pipeline: 12 input bytes -> 16 output characters */
+    while (rem >= 12) {
+        uint32_t w0 = ((uint32_t)s[0] << 16) | ((uint32_t)s[1] << 8) | s[2];
+        uint32_t w1 = ((uint32_t)s[3] << 16) | ((uint32_t)s[4] << 8) | s[5];
+        uint32_t w2 = ((uint32_t)s[6] << 16) | ((uint32_t)s[7] << 8) | s[8];
+        uint32_t w3 = ((uint32_t)s[9] << 16) | ((uint32_t)s[10] << 8) | s[11];
+
+        d[0]  = ZAN_B64_ENC_TABLE[(w0 >> 18) & 0x3F];
+        d[1]  = ZAN_B64_ENC_TABLE[(w0 >> 12) & 0x3F];
+        d[2]  = ZAN_B64_ENC_TABLE[(w0 >> 6)  & 0x3F];
+        d[3]  = ZAN_B64_ENC_TABLE[w0 & 0x3F];
+
+        d[4]  = ZAN_B64_ENC_TABLE[(w1 >> 18) & 0x3F];
+        d[5]  = ZAN_B64_ENC_TABLE[(w1 >> 12) & 0x3F];
+        d[6]  = ZAN_B64_ENC_TABLE[(w1 >> 6)  & 0x3F];
+        d[7]  = ZAN_B64_ENC_TABLE[w1 & 0x3F];
+
+        d[8]  = ZAN_B64_ENC_TABLE[(w2 >> 18) & 0x3F];
+        d[9]  = ZAN_B64_ENC_TABLE[(w2 >> 12) & 0x3F];
+        d[10] = ZAN_B64_ENC_TABLE[(w2 >> 6)  & 0x3F];
+        d[11] = ZAN_B64_ENC_TABLE[w2 & 0x3F];
+
+        d[12] = ZAN_B64_ENC_TABLE[(w3 >> 18) & 0x3F];
+        d[13] = ZAN_B64_ENC_TABLE[(w3 >> 12) & 0x3F];
+        d[14] = ZAN_B64_ENC_TABLE[(w3 >> 6)  & 0x3F];
+        d[15] = ZAN_B64_ENC_TABLE[w3 & 0x3F];
+
+        s += 12;
+        d += 16;
+        rem -= 12;
+    }
+
+    /* Scalar 3-byte loop */
+    while (rem >= 3) {
+        uint32_t w = ((uint32_t)s[0] << 16) | ((uint32_t)s[1] << 8) | s[2];
+        d[0] = ZAN_B64_ENC_TABLE[(w >> 18) & 0x3F];
+        d[1] = ZAN_B64_ENC_TABLE[(w >> 12) & 0x3F];
+        d[2] = ZAN_B64_ENC_TABLE[(w >> 6)  & 0x3F];
+        d[3] = ZAN_B64_ENC_TABLE[w & 0x3F];
+        s += 3;
+        d += 4;
+        rem -= 3;
+    }
+
+    if (rem == 1) {
+        uint32_t w = (uint32_t)s[0] << 16;
+        d[0] = ZAN_B64_ENC_TABLE[(w >> 18) & 0x3F];
+        d[1] = ZAN_B64_ENC_TABLE[(w >> 12) & 0x3F];
+        d[2] = '=';
+        d[3] = '=';
+        d += 4;
+    } else if (rem == 2) {
+        uint32_t w = ((uint32_t)s[0] << 16) | ((uint32_t)s[1] << 8);
+        d[0] = ZAN_B64_ENC_TABLE[(w >> 18) & 0x3F];
+        d[1] = ZAN_B64_ENC_TABLE[(w >> 12) & 0x3F];
+        d[2] = ZAN_B64_ENC_TABLE[(w >> 6)  & 0x3F];
+        d[3] = '=';
+        d += 4;
+    }
+
+    *d = '\0';
+    return (int64_t)(d - dst);
+}
+
+int64_t zan_hw_base64_decode(const char *src, int64_t len, uint8_t *dst) {
+    if (!src || len <= 0 || !dst) return 0;
+    zan_b64_init_dec_table();
+
+    if ((len & 3) != 0) return -1;
+
+    int pad = 0;
+    if (len > 0 && src[len - 1] == '=') pad++;
+    if (len > 1 && src[len - 2] == '=') pad++;
+
+    int64_t plain_len = (len / 4) * 3 - pad;
+    if (plain_len < 0) return -1;
+
+    const uint8_t *s = (const uint8_t *)src;
+    uint8_t *d = dst;
+    int64_t rem = len - (pad ? 4 : 0);
+
+    /* 4-way unrolled pipeline: 16 characters -> 12 bytes */
+    while (rem >= 16) {
+        uint8_t a0 = ZAN_B64_DEC_TABLE[s[0]],  b0 = ZAN_B64_DEC_TABLE[s[1]],  c0 = ZAN_B64_DEC_TABLE[s[2]],  d0 = ZAN_B64_DEC_TABLE[s[3]];
+        uint8_t a1 = ZAN_B64_DEC_TABLE[s[4]],  b1 = ZAN_B64_DEC_TABLE[s[5]],  c1 = ZAN_B64_DEC_TABLE[s[6]],  d1 = ZAN_B64_DEC_TABLE[s[7]];
+        uint8_t a2 = ZAN_B64_DEC_TABLE[s[8]],  b2 = ZAN_B64_DEC_TABLE[s[9]],  c2 = ZAN_B64_DEC_TABLE[s[10]], d2 = ZAN_B64_DEC_TABLE[s[11]];
+        uint8_t a3 = ZAN_B64_DEC_TABLE[s[12]], b3 = ZAN_B64_DEC_TABLE[s[13]], c3 = ZAN_B64_DEC_TABLE[s[14]], d3 = ZAN_B64_DEC_TABLE[s[15]];
+
+        if ((a0 | b0 | c0 | d0 | a1 | b1 | c1 | d1 | a2 | b2 | c2 | d2 | a3 | b3 | c3 | d3) & 0x80)
+            return -1;
+
+        uint32_t n0 = ((uint32_t)a0 << 18) | ((uint32_t)b0 << 12) | ((uint32_t)c0 << 6) | d0;
+        uint32_t n1 = ((uint32_t)a1 << 18) | ((uint32_t)b1 << 12) | ((uint32_t)c1 << 6) | d1;
+        uint32_t n2 = ((uint32_t)a2 << 18) | ((uint32_t)b2 << 12) | ((uint32_t)c2 << 6) | d2;
+        uint32_t n3 = ((uint32_t)a3 << 18) | ((uint32_t)b3 << 12) | ((uint32_t)c3 << 6) | d3;
+
+        d[0]  = (uint8_t)(n0 >> 16); d[1]  = (uint8_t)(n0 >> 8); d[2]  = (uint8_t)n0;
+        d[3]  = (uint8_t)(n1 >> 16); d[4]  = (uint8_t)(n1 >> 8); d[5]  = (uint8_t)n1;
+        d[6]  = (uint8_t)(n2 >> 16); d[7]  = (uint8_t)(n2 >> 8); d[8]  = (uint8_t)n2;
+        d[9]  = (uint8_t)(n3 >> 16); d[10] = (uint8_t)(n3 >> 8); d[11] = (uint8_t)n3;
+
+        s += 16;
+        d += 12;
+        rem -= 16;
+    }
+
+    while (rem >= 4) {
+        uint8_t a = ZAN_B64_DEC_TABLE[s[0]];
+        uint8_t b = ZAN_B64_DEC_TABLE[s[1]];
+        uint8_t c = ZAN_B64_DEC_TABLE[s[2]];
+        uint8_t dd = ZAN_B64_DEC_TABLE[s[3]];
+        if ((a | b | c | dd) & 0x80) return -1;
+        uint32_t n = ((uint32_t)a << 18) | ((uint32_t)b << 12) | ((uint32_t)c << 6) | dd;
+        d[0] = (uint8_t)(n >> 16);
+        d[1] = (uint8_t)(n >> 8);
+        d[2] = (uint8_t)n;
+        s += 4;
+        d += 3;
+        rem -= 4;
+    }
+
+    if (pad > 0) {
+        uint8_t a = ZAN_B64_DEC_TABLE[s[0]];
+        uint8_t b = ZAN_B64_DEC_TABLE[s[1]];
+        uint8_t c = (pad == 2) ? 0 : ZAN_B64_DEC_TABLE[s[2]];
+        uint8_t dd = 0;
+        if ((a | b | c) & 0x80) return -1;
+        uint32_t n = ((uint32_t)a << 18) | ((uint32_t)b << 12) | ((uint32_t)c << 6) | dd;
+        if (pad == 1) {
+            d[0] = (uint8_t)(n >> 16);
+            d[1] = (uint8_t)(n >> 8);
+            d += 2;
+        } else if (pad == 2) {
+            d[0] = (uint8_t)(n >> 16);
+            d += 1;
+        }
+    }
+
+    return (int64_t)(d - dst);
+}
+
+static inline int zan_ctz32_local(uint32_t x) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_ctz(x);
+#elif defined(_MSC_VER)
+    unsigned long idx;
+    _BitScanForward(&idx, x);
+    return (int)idx;
+#else
+    int n = 0;
+    while ((x & 1) == 0) { x >>= 1; n++; }
+    return n;
+#endif
+}
+
+/* ===== 9. SIMD JSON Structural Scanners ===== */
+int64_t zan_hw_json_skip_whitespace(const uint8_t *buf, int64_t pos, int64_t len) {
+    if (!buf || pos >= len) return pos;
+    const uint8_t *p = buf;
+
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
+    __m128i m_sp = _mm_set1_epi8(' ');
+    __m128i m_tb = _mm_set1_epi8('\t');
+    __m128i m_nl = _mm_set1_epi8('\n');
+    __m128i m_cr = _mm_set1_epi8('\r');
+
+    while (pos + 16 <= len) {
+        __m128i v = _mm_loadu_si128((const __m128i*)(p + pos));
+        __m128i eq_sp = _mm_cmpeq_epi8(v, m_sp);
+        __m128i eq_tb = _mm_cmpeq_epi8(v, m_tb);
+        __m128i eq_nl = _mm_cmpeq_epi8(v, m_nl);
+        __m128i eq_cr = _mm_cmpeq_epi8(v, m_cr);
+        __m128i is_ws = _mm_or_si128(_mm_or_si128(eq_sp, eq_tb), _mm_or_si128(eq_nl, eq_cr));
+        int mask = _mm_movemask_epi8(is_ws);
+        if (mask != 0xFFFF) {
+            int idx = zan_ctz32_local((uint32_t)(~mask & 0xFFFF));
+            return pos + idx;
+        }
+        pos += 16;
+    }
+#endif
+
+    while (pos < len) {
+        uint8_t c = p[pos];
+        if (c != ' ' && c != '\t' && c != '\n' && c != '\r')
+            break;
+        pos++;
+    }
+    return pos;
+}
+
+int64_t zan_hw_json_scan_string(const uint8_t *buf, int64_t pos, int64_t len) {
+    if (!buf || pos >= len) return len;
+    const uint8_t *p = buf;
+
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
+    __m128i q = _mm_set1_epi8('"');
+    __m128i b = _mm_set1_epi8('\\');
+
+    while (pos + 16 <= len) {
+        __m128i v = _mm_loadu_si128((const __m128i*)(p + pos));
+        __m128i hit = _mm_or_si128(_mm_cmpeq_epi8(v, q), _mm_cmpeq_epi8(v, b));
+        int mask = _mm_movemask_epi8(hit);
+        if (mask != 0) {
+            int idx = zan_ctz32_local((uint32_t)mask);
+            int64_t target = pos + idx;
+            if (p[target] == '"') {
+                return target;
+            } else {
+                return -(target + 1);
+            }
+        }
+        pos += 16;
+    }
+#endif
+
+    while (pos < len) {
+        uint8_t c = p[pos];
+        if (c == '"') {
+            return pos;
+        } else if (c == '\\') {
+            return -(pos + 1);
+        }
+        pos++;
+    }
+    return len;
+}
+

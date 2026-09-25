@@ -462,6 +462,12 @@ static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
             return 1;
         if (is_call_to(e, "NativeMemory", "Sha256") && e->call.args.count == 2)
             return 1;
+        if (is_call_to(e, "NativeMemory", "Md5") && e->call.args.count == 2)
+            return 1;
+        if (is_call_to(e, "NativeMemory", "Sm3") && e->call.args.count == 2)
+            return 1;
+        if (is_call_to(e, "NativeMemory", "Base64Encode") && e->call.args.count == 2)
+            return 1;
         /* A bodyless [DllImport] declared to return `string` hands back a
          * borrowed C pointer (extern memory, or a buffer the caller passed
          * in) with no rc header behind it: releasing the discarded result
@@ -3140,9 +3146,11 @@ static LLVMValueRef get_async_unwind_fn(zan_irgen_t *g) {
 
     LLVMPositionBuilderAtEnd(g->builder, head);
     LLVMValueRef cur = LLVMBuildLoad2(g->builder, i8ptr, cur_a, "cur");
-    LLVMValueRef nonnull = zan_icmp(g->builder, LLVMIntNE, cur,
-        LLVMConstNull(i8ptr), "cur.nn");
-    LLVMBuildCondBr(g->builder, nonnull, body, done);
+    LLVMTypeRef ptr_int_ty = g->target_is_wasm ? i32 : LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef cur_int = LLVMBuildPtrToInt(g->builder, cur, ptr_int_ty, "cur.int");
+    LLVMValueRef valid = zan_icmp(g->builder, LLVMIntUGT, cur_int,
+        LLVMConstInt(ptr_int_ty, 1, 0), "cur.valid");
+    LLVMBuildCondBr(g->builder, valid, body, done);
 
     LLVMPositionBuilderAtEnd(g->builder, body);
     cur = LLVMBuildLoad2(g->builder, i8ptr, cur_a, "cur");
@@ -3156,10 +3164,15 @@ static LLVMValueRef get_async_unwind_fn(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(g->builder, clean);
     LLVMValueRef aw = LLVMBuildLoad2(g->builder, i8ptr,
         LLVMBuildStructGEP2(g->builder, hdr, hf, ASYNC_FRAME_AWAITER, "aw.p"), "aw");
-    /* a detached (Task.Spawn) coroutine marks itself as its own awaiter */
-    LLVMValueRef det = zan_icmp(g->builder, LLVMIntEQ, aw, cur, "aw.det");
-    LLVMValueRef nxt = LLVMBuildSelect(g->builder, det,
-        LLVMConstNull(i8ptr), aw, "aw.next");
+    /* a detached (Task.Spawn) coroutine marks itself as its own awaiter, and
+     * sentinel (1) marks a completed frame without awaiter */
+    LLVMValueRef aw_int = LLVMBuildPtrToInt(g->builder, aw, ptr_int_ty, "aw.int");
+    LLVMValueRef aw_valid = zan_icmp(g->builder, LLVMIntUGT, aw_int,
+        LLVMConstInt(ptr_int_ty, 1, 0), "aw.valid");
+    LLVMValueRef not_det = zan_icmp(g->builder, LLVMIntNE, aw, cur, "aw.ndet");
+    LLVMValueRef has_nxt = zan_and(g->builder, aw_valid, not_det, "has.nxt");
+    LLVMValueRef nxt = LLVMBuildSelect(g->builder, has_nxt, aw,
+        LLVMConstNull(i8ptr), "aw.next");
     LLVMBuildStore(g->builder, nxt, next_a);
     LLVMValueRef cl = LLVMBuildLoad2(g->builder, g->co_step_ptr,
         LLVMBuildStructGEP2(g->builder, hdr, hf, ASYNC_FRAME_CLEANUP, "cl.p"), "cl");

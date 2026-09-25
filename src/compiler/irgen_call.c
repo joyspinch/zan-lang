@@ -1179,6 +1179,17 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 return cpu_out;
         }
 
+        /* Hardware intrinsics: Vector128 / SSE2 / SSSE3 / AES-NI. */
+        {
+            LLVMValueRef vec_out = NULL;
+            if (emit_vector128_call(g, expr, locals, &vec_out))
+                return vec_out;
+            if (emit_sse2_call(g, expr, locals, &vec_out))
+                return vec_out;
+            if (emit_aes_call(g, expr, locals, &vec_out))
+                return vec_out;
+        }
+
         /* Span<T> views: arr.AsSpan(), span.Slice() -> value struct. */
         {
             LLVMValueRef sp_out = NULL;
