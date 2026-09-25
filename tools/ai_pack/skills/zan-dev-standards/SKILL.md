@@ -40,7 +40,8 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   ⑥ 网络与通讯协议热路径（WebSocket、Redis RESP、HTTP 流）全面采用 AVX2/SSE2 向量化与 NativeMemory 零堆分配加速：WebSocket 数据帧 4 字节掩码在广播构造 64/128/256 位宽掩码向量后通过 `Vector256.Xor` / `Vector128.Xor` 单指令处理 32/16 字节，非对齐尾部按 4 字节整数步进异或；Redis RESP 文本行协议与 WebSocket HTTP 握手终止符（`\r\n` / `\r\n\r\n`）采用带界限限制的 `MemoryExtensions.IndexOf`（AVX2 `Equals` + `ExtractMostSignificantBits` + `TrailingZeroCount`）实现单周期 32 字节跳跃定位，杜绝逐字节标量比对与越界脏读；缓冲区扩容与搬移严禁使用 `for` 循环逐字节赋值，统一调用直接对接 libc `memmove`/`memcpy` 的 `NativeMemory.Copy` 与 `NativeMemory.PutString`。
 - **杜绝手拼 JSON 字符串与手拼 SQL 拼接（严禁裸字符串拼接与简陋的 Replace 引号）**：
   ① JSON 序列化一律使用标准库 `System.Json.JsonValue` 构建器（`PutStr/PutInt/PutDouble/PutBool/PutNull/PutJson` 与 `Append`），字符串成员经原生转义安全处理特殊字符（引号、反斜杠、控制字符 `\n`/`\r`/`\t`），杜绝因换行或引号破坏 JSON 报文语法；嵌套片段利用 `PutJson`/`AppendJson` 原生嵌入，禁止通过文本剪裁与字符串拼接嵌入；
-  ② 数据库非查询/查询/聚合操作一律使用参数化 API（`DbParams` 与 `?` 占位符），禁止手写拼接 `Quote` 单引号或裸拼接变量（如 `"WHERE slot=" + key`），杜绝 SQL 注入漏洞并复用数据库预编译执行计划。
+  ② 数据库非查询/查询/聚合操作一律使用参数化 API（`DbParams` 与 `?` 占位符），禁止手写拼接 `Quote` 单引号或裸拼接变量（如 `"WHERE slot=" + key`），杜绝 SQL 注入漏洞并复用数据库预编译执行计划；
+  ③ 实体持久化与业务数据访问优先使用原生 ORM 表达式与模型映射（`Select<T>()` / `Insert<T>()` / `Update<T>()` / `Delete<T>()` / `DbTable.Of()`），通过 lambda 强类型表达式（如 `a => a.slot == slot`）或类型化查询链，由编译器与 ORM 生成层自动完成列名白名单核验、类型绑定与参数化，从架构根源上根除手写裸 SQL 字符串的脆弱性。
 - **ORM 条件只有值自带原语，裸 SQL 片段是生成代码专属**。用户面条件一律
   `WhereEq/WhereGe/WhereLe/WhereIn/WhereLikeAny`（列名经实体元数据校验，
   值全部参数化绑定）与类型化 lambda（`ids.Contains(a.id)` 降级为参数化

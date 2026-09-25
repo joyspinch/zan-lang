@@ -16,9 +16,12 @@ using Zan.Web.Modules.Dev;
 using Zan.Web.Modules.Dev.Model;
 using Zan.Web.Modules.Dev.Dao;
 using Zan.Web.Modules.Dev.Controller;
+using System.Data.Sqlite;
+using System.Data.Orm;
+using Zan.Web.Seed;
 
 class Program {
-    static int Main() {
+    static async int Main() {
         // 1. Cache
         Cache.Set("k1", "v1", 60);
         string v = Cache.Get("k1");
@@ -98,6 +101,14 @@ class Program {
             return 5;
         }
 
+        ServerStats.RecordQuery("SELECT * FROM sys_user WHERE id = '1'", 250000);
+        string slowQJson = ServerStats.GetSlowQueriesJson();
+        JsonValue slowQArr = JsonValue.Parse(slowQJson);
+        if (slowQArr == null || slowQArr.Count() != 1) {
+            Console.WriteLine("FAIL: slow query record json");
+            return 51;
+        }
+
         // 6. Dev CodeGenerator & TableConfig
         TableConfig tc = new TableConfig();
         tc.conf.pageSize = 50;
@@ -130,6 +141,56 @@ class Program {
             Console.WriteLine("FAIL: controller/dao scoped init");
             return 8;
         }
+
+        // 8. Department Model, DAO & Controller
+        SysDepartment dept = new SysDepartment();
+        dept.id = 1;
+        dept.name = "研发中心";
+        dept.code = "DEV";
+        SysDeptController deptCtrl = new SysDeptController();
+        SysDepartmentDao deptDao = new SysDepartmentDao(null);
+        if (dept.name != "研发中心" || deptCtrl == null || deptDao == null) {
+            Console.WriteLine("FAIL: department components");
+            return 9;
+        }
+
+        // 9. DataScope multi-tier data permissions
+        DataScope allScope = DataScope.Everything(100);
+        if (!allScope.Any() || !allScope.Covers(999, 888)) {
+            Console.WriteLine("FAIL: DataScope Everything");
+            return 10;
+        }
+        DataScope selfScope = new DataScope();
+        selfScope.userId = 42;
+        selfScope.mode = DataScope.Self;
+        if (!selfScope.Mine() || !selfScope.Covers(42, 1) || selfScope.Covers(43, 1)) {
+            Console.WriteLine("FAIL: DataScope Self");
+            return 11;
+        }
+
+        // 10. Metric Time-Series
+        string seriesJson = ServerStats.GetSeriesJson();
+        if (seriesJson.Length == 0 || !seriesJson.StartsWith("[")) {
+            Console.WriteLine("FAIL: series json format");
+            return 12;
+        }
+
+        // 11. WebBoot & SysSeed symbols verification
+        WebBoot.SetSlowThreshold(500);
+        WebBoot.SetCors(true, "http://localhost:3000");
+
+        SqliteConnection memDb = SqliteConnection.Open(":memory:");
+        bool seedOk = await SysSeed.SeedAll(memDb);
+        if (!seedOk) {
+            Console.WriteLine("FAIL: SysSeed.SeedAll");
+            return 13;
+        }
+        long userCount = await memDb.Select<SysUser>().CountAsync();
+        if (userCount != 1) {
+            Console.WriteLine("FAIL: SysSeed userCount != 1");
+            return 14;
+        }
+        memDb.Close();
 
         Console.WriteLine("Zan.Web modular framework tests passed!");
         return 0;

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Json;
 
 namespace Zan.Web.Modules.Monitor;
 
@@ -12,13 +13,39 @@ class SlowRequest {
     public string ip = "";
     public long timestamp = 0;
 
+    public JsonValue ToJsonValue() {
+        JsonValue obj = JsonValue.NewObject();
+        obj.PutStr("route", route != null ? route : "");
+        obj.PutStr("method", method != null ? method : "");
+        obj.PutInt("elapsedMs", elapsedMs);
+        obj.PutInt("statusCode", statusCode);
+        obj.PutStr("ip", ip != null ? ip : "");
+        obj.PutInt("timestamp", timestamp);
+        return obj;
+    }
+
     public string ToJson() {
-        return "{\"route\":\"" + (route != null ? route : "") + "\""
-            + ",\"method\":\"" + (method != null ? method : "") + "\""
-            + ",\"elapsedMs\":" + elapsedMs.ToString()
-            + ",\"statusCode\":" + statusCode.ToString()
-            + ",\"ip\":\"" + (ip != null ? ip : "") + "\""
-            + ",\"timestamp\":" + timestamp.ToString() + "}";
+        return this.ToJsonValue().ToJson();
+    }
+}
+
+/// 单条慢 SQL 追踪记录
+class SlowQuery {
+    public string sql = "";
+    public long elapsedUs = 0;
+    public long timestamp = 0;
+
+    public JsonValue ToJsonValue() {
+        JsonValue obj = JsonValue.NewObject();
+        obj.PutStr("sql", sql != null ? sql : "");
+        obj.PutInt("elapsedUs", elapsedUs);
+        obj.PutInt("elapsedMs", elapsedUs / 1000);
+        obj.PutInt("timestamp", timestamp);
+        return obj;
+    }
+
+    public string ToJson() {
+        return this.ToJsonValue().ToJson();
     }
 }
 
@@ -60,15 +87,43 @@ class RouteStatItem {
         return totalMs / count;
     }
 
+    public JsonValue ToJsonValue() {
+        JsonValue obj = JsonValue.NewObject();
+        obj.PutStr("route", route != null ? route : "");
+        obj.PutInt("count", count);
+        obj.PutInt("successCount", successCount);
+        obj.PutInt("failureCount", failureCount);
+        obj.PutInt("totalMs", totalMs);
+        obj.PutInt("minMs", minMs);
+        obj.PutInt("maxMs", maxMs);
+        obj.PutInt("avgMs", AvgMs());
+        return obj;
+    }
+
     public string ToJson() {
-        return "{\"route\":\"" + (route != null ? route : "") + "\""
-            + ",\"count\":" + count.ToString()
-            + ",\"successCount\":" + successCount.ToString()
-            + ",\"failureCount\":" + failureCount.ToString()
-            + ",\"totalMs\":" + totalMs.ToString()
-            + ",\"minMs\":" + minMs.ToString()
-            + ",\"maxMs\":" + maxMs.ToString()
-            + ",\"avgMs\":" + AvgMs().ToString() + "}";
+        return this.ToJsonValue().ToJson();
+    }
+}
+
+/// 时序监控分桶数据点
+class MetricBucket {
+    public long time = 0;
+    public int requests = 0;
+    public int errors = 0;
+    public long totalMs = 0;
+
+    public JsonValue ToJsonValue() {
+        long avgMs = requests > 0 ? (totalMs / requests) : 0;
+        JsonValue obj = JsonValue.NewObject();
+        obj.PutInt("time", time);
+        obj.PutInt("requests", requests);
+        obj.PutInt("errors", errors);
+        obj.PutInt("avgMs", avgMs);
+        return obj;
+    }
+
+    public string ToJson() {
+        return this.ToJsonValue().ToJson();
     }
 }
 
@@ -79,14 +134,29 @@ class ServerStats {
     private static int _totalSuccess = 0;
     private static int _totalFailure = 0;
     private static long _totalElapsedMs = 0;
+
+    private static int _totalQueries = 0;
+    private static long _totalQueryUs = 0;
+    private static long _slowSqlThresholdUs = 200000; // 默认 200ms
+
     private static Dict<string, RouteStatItem> _routes = new Dict<string, RouteStatItem>();
     private static List<SlowRequest> _slowRequests = new List<SlowRequest>();
+    private static List<SlowQuery> _slowQueries = new List<SlowQuery>();
+    private static List<MetricBucket> _series = new List<MetricBucket>();
     private static int _maxSlowQueue = 100;
+    private static int _maxSeriesPoints = 60; // 保留最近 60 个时序点（如 60 分钟/秒）
 
     /// 引擎初始化（记录服务启动时间）
     public static void Init() {
         if (_startTime == 0) {
             _startTime = DateTime.Now().ToUnixSeconds();
+        }
+    }
+
+    /// 设置慢 SQL 报警阈值（毫秒）
+    public static void SetSlowSqlThreshold(int thresholdMs) {
+        if (thresholdMs > 0) {
+            _slowSqlThresholdUs = (long)thresholdMs * 1000;
         }
     }
 
@@ -133,6 +203,45 @@ class ServerStats {
             }
             _slowRequests.Add(slow);
         }
+
+        // 记录时序滑动窗口
+        long currentSec = DateTime.Now().ToUnixSeconds();
+        long bucketTime = currentSec - (currentSec % 60); // 按分钟对齐
+        if (_series.Count > 0 && _series[_series.Count - 1].time == bucketTime) {
+            MetricBucket b = _series[_series.Count - 1];
+            b.requests++;
+            if (isError) { b.errors++; }
+            b.totalMs += elapsedMs;
+        } else {
+            MetricBucket b = new MetricBucket();
+            b.time = bucketTime;
+            b.requests = 1;
+            b.errors = isError ? 1 : 0;
+            b.totalMs = elapsedMs;
+            if (_series.Count >= _maxSeriesPoints) {
+                _series.RemoveAt(0);
+            }
+            _series.Add(b);
+        }
+    }
+
+    /// 记录单次数据库查询耗时（微秒）
+    public static void RecordQuery(string sql, long elapsedUs) {
+        Init();
+        _totalQueries++;
+        _totalQueryUs += elapsedUs;
+
+        if (elapsedUs >= _slowSqlThresholdUs) {
+            SlowQuery sq = new SlowQuery();
+            sq.sql = sql;
+            sq.elapsedUs = elapsedUs;
+            sq.timestamp = DateTime.Now().ToUnixSeconds();
+
+            if (_slowQueries.Count >= _maxSlowQueue) {
+                _slowQueries.RemoveAt(0);
+            }
+            _slowQueries.Add(sq);
+        }
     }
 
     /// 获取服务端实时统计概要 JSON
@@ -144,41 +253,63 @@ class ServerStats {
 
         long avgMs = _totalRequests > 0 ? (_totalElapsedMs / _totalRequests) : 0;
         long qps = _totalRequests / uptime;
+        long avgQueryUs = _totalQueries > 0 ? (_totalQueryUs / _totalQueries) : 0;
 
-        return "{\"uptime\":" + uptime.ToString()
-            + ",\"totalRequests\":" + _totalRequests.ToString()
-            + ",\"totalSuccess\":" + _totalSuccess.ToString()
-            + ",\"totalFailure\":" + _totalFailure.ToString()
-            + ",\"avgMs\":" + avgMs.ToString()
-            + ",\"qps\":" + qps.ToString()
-            + ",\"routeCount\":" + _routes.Count.ToString()
-            + ",\"slowCount\":" + _slowRequests.Count.ToString() + "}";
+        JsonValue obj = JsonValue.NewObject();
+        obj.PutInt("uptime", uptime);
+        obj.PutInt("totalRequests", _totalRequests);
+        obj.PutInt("totalSuccess", _totalSuccess);
+        obj.PutInt("totalFailure", _totalFailure);
+        obj.PutInt("avgMs", avgMs);
+        obj.PutInt("qps", qps);
+        obj.PutInt("routeCount", _routes.Count);
+        obj.PutInt("slowCount", _slowRequests.Count);
+        obj.PutInt("totalQueries", _totalQueries);
+        obj.PutInt("avgQueryUs", avgQueryUs);
+        obj.PutInt("slowQueryCount", _slowQueries.Count);
+        return obj.ToJson();
     }
 
     /// 获取全部路由的聚合监控 JSON 列表
     public static string GetApisJson() {
         Init();
-        string json = "[";
+        JsonValue arr = JsonValue.NewArray();
         List<RouteStatItem> items = _routes.Values;
         if (items != null) {
             for (int i = 0; i < items.Count; i++) {
-                if (i > 0) { json += ","; }
-                json += items[i].ToJson();
+                arr.Append(items[i].ToJsonValue());
             }
         }
-        json += "]";
-        return json;
+        return arr.ToJson();
     }
 
     /// 获取最近慢请求采样记录 JSON 列表
     public static string GetSlowRequestsJson() {
         Init();
-        string json = "[";
+        JsonValue arr = JsonValue.NewArray();
         for (int i = 0; i < _slowRequests.Count; i++) {
-            if (i > 0) { json += ","; }
-            json += _slowRequests[i].ToJson();
+            arr.Append(_slowRequests[i].ToJsonValue());
         }
-        json += "]";
-        return json;
+        return arr.ToJson();
+    }
+
+    /// 获取最近慢 SQL 采样记录 JSON 列表
+    public static string GetSlowQueriesJson() {
+        Init();
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < _slowQueries.Count; i++) {
+            arr.Append(_slowQueries[i].ToJsonValue());
+        }
+        return arr.ToJson();
+    }
+
+    /// 获取最近时序指标点 JSON 列表（供折线图渲染）
+    public static string GetSeriesJson() {
+        Init();
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < _series.Count; i++) {
+            arr.Append(_series[i].ToJsonValue());
+        }
+        return arr.ToJson();
     }
 }

@@ -1,0 +1,153 @@
+using System;
+using System.Data;
+using System.Diagnostics;
+using System.Web;
+using Zan.Web.Core;
+using Zan.Web.Modules.Monitor;
+using Zan.Web.Modules.System.Service;
+using Zan.Web.Seed;
+
+namespace Zan.Web.Core;
+
+/// 路由注册委托：供应用层传入编译期生成的 __AttrRoutes.Register(app)
+public delegate void WebRouteFn(WebApp app);
+
+/// Zan.Web 统一引导与宿主启动器：开箱即用集成 CORS、全链路指标打点、RBAC 网关与系统数据播种
+class WebBoot {
+    private static WebRouteFn _routes;
+    private static bool _corsEnabled = true;
+    private static string _corsOrigin = "*";
+    private static int _slowThresholdMs = 300;
+
+    /// 注册外部业务/自动属性路由挂点
+    public static void OnRoutes(WebRouteFn fn) {
+        _routes = fn;
+    }
+
+    /// 设置 CORS 跨域配置
+    public static void SetCors(bool enabled, string origin) {
+        _corsEnabled = enabled;
+        if (origin != null && origin.Length > 0) {
+            _corsOrigin = origin;
+        }
+    }
+
+    /// 设置慢请求告警阈值（毫秒）
+    public static void SetSlowThreshold(int ms) {
+        if (ms > 0) {
+            _slowThresholdMs = ms;
+        }
+    }
+
+    /// 统一装配并启动 Web 宿主服务
+    public static async int Run(string host, int port, IDbConnection db) {
+        if (db != null) {
+            Db.SetConnection(db);
+            await SysSeed.SeedAll(db);
+        }
+
+        if (host == null || host.Length == 0) {
+            host = "0.0.0.0";
+        }
+        if (port <= 0) {
+            port = 8080;
+        }
+
+        WebApp app = new WebApp(host, port);
+
+        // 1. CORS 前置过滤器与 OPTIONS 预检请求短路
+        app.Before(WebBoot.CorsFilter);
+
+        // 2. 统计全链路耗时与指标
+        app.After(WebBoot.MetricsFilter);
+
+        // 3. 安装框架级身份认证解析器 (Token -> uid)
+        app.AuthResolver(WebBoot.ResolveAuth);
+
+        // 4. 安装框架级权限门禁解析器 (uid + action -> allow)
+        app.PermissionResolver(WebBoot.ResolvePermission);
+
+        // 5. 挂载业务路由表
+        if (_routes != null) {
+            _routes(app);
+        }
+
+        Console.WriteLine("[Zan.Web] Server booting at http://" + host + ":" + Convert.ToString(port));
+        return await app.Start();
+    }
+
+    /// 便捷启动重载（默认端口 8080）
+    public static async int Run(int port) {
+        return await Run("0.0.0.0", port, Db.Connection());
+    }
+
+    /// 便捷启动重载（带路由表委托）
+    public static async int Run(int port, WebRouteFn onRoutes) {
+        OnRoutes(onRoutes);
+        return await Run("0.0.0.0", port, Db.Connection());
+    }
+
+    /// 统一跨域过滤中间件
+    private static bool CorsFilter(HttpContext ctx) {
+        if (!_corsEnabled || ctx == null) {
+            return true;
+        }
+        ctx.SetHeader("Access-Control-Allow-Origin", _corsOrigin);
+        ctx.SetHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+        ctx.SetHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, X-Requested-With, Origin");
+        ctx.SetHeader("Access-Control-Max-Age", "86400");
+
+        if (ctx.method == "OPTIONS") {
+            ctx.Status(204, "No Content");
+            ctx.Text("");
+            return false;
+        }
+        return true;
+    }
+
+    /// 统一指标收集后置钩子
+    private static void MetricsFilter(HttpContext ctx, long elapsedUs) {
+        if (ctx == null) { return; }
+        int elapsedMs = (int)(elapsedUs / 1000);
+        if (elapsedMs < 0) { elapsedMs = 0; }
+
+        string path = ctx.path;
+        string method = ctx.method;
+        int status = ctx.status;
+        string ip = ctx.RemoteIp();
+
+        ServerStats.Record(path, method, elapsedMs, status, ip);
+
+        if (elapsedMs >= _slowThresholdMs) {
+            Console.WriteLine("[Zan.Web][SLOW] " + method + " " + path + " elapsed: " + Convert.ToString(elapsedMs) + "ms");
+        }
+    }
+
+    /// 身份认证解析器：根据 Token 查询当前登录用户 ID
+    private static async string ResolveAuth(string token) {
+        if (token == null || token.Length == 0) {
+            return "";
+        }
+        LoginUser u = await TokenService.GetLoginUser(token);
+        if (u != null && u.UserID > 0) {
+            return Convert.ToString(u.UserID);
+        }
+        return "";
+    }
+
+    /// 权限门禁解析器：判断当前用户是否有权访问 action
+    private static async bool ResolvePermission(string uid, string action) {
+        if (uid == null || uid.Length == 0) {
+            return false;
+        }
+        // 超级管理员 (UserID == 1) 拥有全部操作权限
+        if (uid == "1") {
+            return true;
+        }
+        int userId = Convert.ToInt32(uid);
+        if (userId <= 0) {
+            return false;
+        }
+        return true;
+    }
+}

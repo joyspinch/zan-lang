@@ -46,7 +46,11 @@ packages/Zan.Web/
         └── Web/
             ├── Core/                      # 基础核心 (Zan.Web.Core)
             │   ├── Db.zan                 # 全局连接与数据库上下文网关
-            │   └── WebController.zan      # Web 控制器基类（JSON 响应、参数解析、全链路耗时打点）
+            │   ├── DataScope.zan          # 多维度行级数据权限隔离 (All / ByDepts / Self)
+            │   ├── WebBoot.zan            # 一键引导启动器（CORS/指标/RBAC/开箱即用装配）
+            │   └── WebController.zan      # Web 控制器基类（租借事务、上下文注入、全链路打点）
+            ├── Seed/                      # 种子与表结构迁移 (Zan.Web.Seed)
+            │   └── SysSeed.zan            # 核心表 DDL 自动建表与超级管理员/默认数据播种
             ├── Protocol/                  # Web 与管理端通信协议契约 (Zan.Web.Protocol)
             │   ├── TableConfig.zan        # TableConfig / TableColumn / TableFilter / Tools
             │   ├── PostData.zan           # PostData / FieldPostData / ResponseList
@@ -60,6 +64,7 @@ packages/Zan.Web/
                 │   │   ├── SysUser.zan
                 │   │   ├── SysRole.zan
                 │   │   ├── SysUserRole.zan
+                │   │   ├── SysDepartment.zan
                 │   │   ├── SysMenu.zan
                 │   │   ├── SysRoleMenu.zan
                 │   │   ├── SysDictType.zan
@@ -70,6 +75,7 @@ packages/Zan.Web/
                 │   │   ├── SysUserDao.zan
                 │   │   ├── SysRoleDao.zan
                 │   │   ├── SysUserRoleDao.zan
+                │   │   ├── SysDepartmentDao.zan
                 │   │   ├── SysMenuDao.zan
                 │   │   ├── SysRoleMenuDao.zan
                 │   │   ├── SysDictTypeDao.zan
@@ -84,6 +90,7 @@ packages/Zan.Web/
                 │   └── Controller/        # 系统管理接口控制器
                 │       ├── AuthController.zan
                 │       ├── SysUserController.zan
+                │       ├── SysDeptController.zan
                 │       ├── SysRoleController.zan
                 │       ├── SysMenuController.zan
                 │       ├── DictController.zan
@@ -92,11 +99,40 @@ packages/Zan.Web/
                 ├── Monitor/               # 链路监控与性能度量模块 (Zan.Web.Modules.Monitor)
                 │   ├── Model/SysApiStat.zan
                 │   ├── Dao/SysApiStatDao.zan
-                │   ├── ServerStats.zan    # 内存高频聚合器与慢请求缓冲队列
-                │   └── Controller/StatController.zan # /api/stat/summary、apis、slow、daily
+                │   ├── ServerStats.zan    # 内存高频聚合器、慢SQL采样与分钟级时序
+                │   └── Controller/StatController.zan # 统计接口与 SSE 实时推流 (/api/monitor/stat/stream)
                 └── Dev/                   # 开发辅助与代码生成模块 (Zan.Web.Modules.Dev)
                     ├── Model/SysCurd.zan
                     ├── Dao/SysCurdDao.zan
                     ├── CodeGenerator.zan  # 1:1:1 原生代码产出引擎
                     └── Controller/CurdController.zan # 对接 adminUI 表格设计器
 ```
+
+---
+
+## 快速上手与开箱即用引导
+
+通过 `WebBoot` 一行代码即可启动完整企业级后台服务：
+
+```zan
+using System;
+using System.Data;
+using Zan.Web.Core;
+using Zan.Web.Seed;
+
+class Program {
+    static async void Main() {
+        // 1. 初始化数据库连接（支持 SQLite / MySQL / PostgreSQL / SQL Server）
+        IDbConnection db = ...;
+
+        // 2. 一键引导启动（自动建表、播种默认管理员、挂载 CORS 与监控打点）
+        await WebBoot.Run("0.0.0.0", 8080, db);
+    }
+}
+```
+
+默认内置超级管理员凭证：
+- **用户名**：`admin`
+- **初始密码**：`123456`
+- **默认组织**：总公司 (HQ)
+

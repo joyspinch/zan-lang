@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Json;
+using System.Threading;
 using System.Web;
 using Zan.Web.Core;
 using Zan.Web.Modules.Monitor;
@@ -16,7 +17,7 @@ namespace Zan.Web.Modules.Monitor.Controller;
 class StatController : WebController {
     private SysApiStatDao ApiStatDao() { return new SysApiStatDao(this.__Conn()); }
 
-    /// GET /api/monitor/stat/summary - 服务端实时统计概要（运行时长、QPS、请求量、失败数、平均耗时）
+    /// GET /api/monitor/stat/summary - 服务端实时统计概要（运行时长、QPS、请求量、失败数、慢查询等）
     [HttpGet]
     [Custom(IsMenu = true, Perm = PermBit.View)]
     [Description("运行统计概要")]
@@ -40,7 +41,44 @@ class StatController : WebController {
         this.OkJson(ServerStats.GetSlowRequestsJson());
     }
 
-    /// GET /api/monitor/stat/daily - 查询指定日期的持久化接口统计
+    /// GET /api/monitor/stat/slowSql - 实时慢 SQL 采样队列（>200ms 数据库查询诊断）
+    [HttpGet]
+    [Custom(Perm = PermBit.View)]
+    [Description("慢SQL分析")]
+    public void SlowSql() {
+        this.OkJson(ServerStats.GetSlowQueriesJson());
+    }
+
+    /// GET /api/monitor/stat/series - 最近时序指标走势（分钟级 QPS 与耗时曲线）
+    [HttpGet]
+    [Custom(Perm = PermBit.View)]
+    [Description("时序指标走势")]
+    public void Series() {
+        this.OkJson(ServerStats.GetSeriesJson());
+    }
+
+    /// GET /api/monitor/stat/stream - 监控指标 Server-Sent Events (SSE) 实时推流（用于前端大屏无感实时刷新）
+    [HttpGet]
+    [Custom(Perm = PermBit.View)]
+    [Description("监控实时推流")]
+    public async void Stream() {
+        HttpContext ctx = this.Ctx();
+        if (ctx == null) { return; }
+        if (!await ctx.SseOpen()) { return; }
+
+        // 推送首帧初始快照
+        if (!await ctx.SseSend("metrics", ServerStats.GetSummaryJson())) { return; }
+
+        // 持续推送心跳与指标数据（最长 30 分钟，客户端断开时自动退出）
+        for (int i = 0; i < 900; i++) {
+            await Task.Delay(2000);
+            if (!await ctx.SseSend("metrics", ServerStats.GetSummaryJson())) {
+                return;
+            }
+        }
+    }
+
+    /// GET /api/monitor/stat/daily - 查询指定日期的持久化历史统计
     [HttpGet]
     [Custom(Perm = PermBit.View)]
     [Description("历史统计报表")]

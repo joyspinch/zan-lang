@@ -1,15 +1,80 @@
 using System;
+using System.Collections.Generic;
 using System.Data;
+using System.Data.Orm;
 using System.Data.Sqlite;
 using Game.Arpg;
 
 namespace Game.Arpg.Data;
 
+[Table(Name = "zgm_save_slot")]
+class ArpgSaveSlotEntity {
+    [Id]
+    [Column(Name = "slot")]
+    public string slot;
+    [Column(Name = "map_name")]
+    public string map_name;
+    [Column(Name = "hero_x")]
+    public int hero_x;
+    [Column(Name = "hero_y")]
+    public int hero_y;
+    [Column(Name = "hero_direction")]
+    public int hero_direction;
+    [Column(Name = "hero_level")]
+    public int hero_level;
+    [Column(Name = "hero_hp")]
+    public int hero_hp;
+    [Column(Name = "hero_mp")]
+    public int hero_mp;
+    [Column(Name = "hero_experience")]
+    public int hero_experience;
+    [Column(Name = "hero_rage")]
+    public int hero_rage;
+}
+
+[Table(Name = "zgm_save_item")]
+class ArpgSaveItemEntity {
+    [Column(Name = "slot")]
+    public string slot;
+    [Column(Name = "item_name")]
+    public string item_name;
+    [Column(Name = "quantity")]
+    public int quantity;
+}
+
+[Table(Name = "zgm_save_equipment")]
+class ArpgSaveEquipmentEntity {
+    [Column(Name = "slot")]
+    public string slot;
+    [Column(Name = "equip_slot")]
+    public string equip_slot;
+    [Column(Name = "item_name")]
+    public string item_name;
+}
+
+[Table(Name = "zgm_save_skill")]
+class ArpgSaveSkillEntity {
+    [Column(Name = "slot")]
+    public string slot;
+    [Column(Name = "skill_name")]
+    public string skill_name;
+}
+
+[Table(Name = "zgm_save_buff")]
+class ArpgSaveBuffEntity {
+    [Column(Name = "slot")]
+    public string slot;
+    [Column(Name = "buff_name")]
+    public string buff_name;
+    [Column(Name = "remaining")]
+    public int remaining;
+}
+
 /// <summary>
 /// 基于通用 SQLite 连接的 ZGM 原生存档仓库。
-/// 其结构为 ZGM 私有：每个槽位一行，外加规范化的子行，用于
-/// 背包、装备、已学技能与生效中的增益。它与
-/// 通用 System.Data.Sqlite API 保持分离。
+/// 其结构由标准库 ORM 实体（ArpgSaveSlotEntity 等）与强类型表达式查询驱动，
+/// 涵盖主槽位及规范化的子表（背包、装备、已学技能与生效增益）。
+/// 完全杜绝手拼 SQL 字符串与裸 SQL 注入风险。
 /// </summary>
 class ArpgSaveRepository {
     ArpgDatabase database;
@@ -17,7 +82,7 @@ class ArpgSaveRepository {
 
     /// <summary>
     /// 在已打开的数据库上打开存档仓库：database 为 null 或未打开时
-    /// 返回 null，否则建表并返回仓库；IsReady() 反映建表是否成功，
+    /// 返回 null，否则同步实体结构建表并返回仓库；IsReady() 反映就绪状态，
     /// 未就绪时所有读写操作均失败。
     /// </summary>
     static ArpgSaveRepository Open(ArpgDatabase database) {
@@ -40,12 +105,12 @@ class ArpgSaveRepository {
         return ArpgSaveRepository.Open(database);
     }
 
-    /// 建表是否成功；为 false 时 Save/Load 等操作一律拒绝。
+    /// 建表与实体同步是否成功；为 false 时 Save/Load 等操作一律拒绝。
     bool IsReady() { return this.ready; }
     /// 底层数据库连接。
     ArpgDatabase Database() { return this.database; }
 
-    /// 表 table 是否已存在列 column（用 PRAGMA table_info 查询）。
+    /// 表 table 是否已存在列 column。
     bool HasColumn(string table, string column) {
         DbResult columns = this.database.Query(
             "PRAGMA table_info(" + table + ")");
@@ -54,206 +119,84 @@ class ArpgSaveRepository {
         }
         return false;
     }
-    /// 确保表 table 存在列 column：已存在直接返回 true，缺失时
-    /// ALTER TABLE 添加（definition 为列定义），失败返回 false。
-    bool EnsureColumn(string table, string column, string definition) {
-        if (this.HasColumn(table, column)) { return true; }
-        return this.database.Execute(
-            "ALTER TABLE " + table + " ADD COLUMN "
-            + column + " " + definition) >= 0;
-    }
 
     /// <summary>
-    /// 创建全部存档表（IF NOT EXISTS，含主槽表与物品/装备/技能/
-    /// 增益四张子表），并为旧库补齐 hero_experience/hero_rage 两列。
-    /// 任一步失败返回 false。
+    /// 基于 ORM CodeFirst 自动同步并迁移全部存档表结构（含主槽表与四张子表），
+    /// 自动补齐缺失列，任一步失败返回 false。
     /// </summary>
     bool Initialize() {
-        int saves = this.database.Execute(
-            "CREATE TABLE IF NOT EXISTS zgm_save_slot ("
-            + "slot TEXT PRIMARY KEY,"
-            + "map_name TEXT NOT NULL,"
-            + "hero_x INTEGER NOT NULL,"
-            + "hero_y INTEGER NOT NULL,"
-            + "hero_direction INTEGER NOT NULL,"
-            + "hero_level INTEGER NOT NULL,"
-            + "hero_hp INTEGER NOT NULL,"
-            + "hero_mp INTEGER NOT NULL,"
-            + "hero_experience INTEGER NOT NULL DEFAULT 0,"
-            + "hero_rage INTEGER NOT NULL DEFAULT 0)");
-        if (saves < 0) { return false; }
-        if (!this.EnsureColumn(
-            "zgm_save_slot", "hero_experience",
-            "INTEGER NOT NULL DEFAULT 0")) {
-            return false;
-        }
-        if (!this.EnsureColumn(
-            "zgm_save_slot", "hero_rage",
-            "INTEGER NOT NULL DEFAULT 0")) {
-            return false;
-        }
-
-        int items = this.database.Execute(
-            "CREATE TABLE IF NOT EXISTS zgm_save_item ("
-            + "slot TEXT NOT NULL,"
-            + "item_name TEXT NOT NULL,"
-            + "quantity INTEGER NOT NULL,"
-            + "PRIMARY KEY(slot, item_name))");
-        if (items < 0) { return false; }
-
-        int equipment = this.database.Execute(
-            "CREATE TABLE IF NOT EXISTS zgm_save_equipment ("
-            + "slot TEXT NOT NULL,"
-            + "equip_slot TEXT NOT NULL,"
-            + "item_name TEXT NOT NULL,"
-            + "PRIMARY KEY(slot, equip_slot))");
-        if (equipment < 0) { return false; }
-
-        int skills = this.database.Execute(
-            "CREATE TABLE IF NOT EXISTS zgm_save_skill ("
-            + "slot TEXT NOT NULL,"
-            + "skill_name TEXT NOT NULL,"
-            + "PRIMARY KEY(slot, skill_name))");
-        if (skills < 0) { return false; }
-
-        int buffs = this.database.Execute(
-            "CREATE TABLE IF NOT EXISTS zgm_save_buff ("
-            + "slot TEXT NOT NULL,"
-            + "buff_name TEXT NOT NULL,"
-            + "remaining INTEGER NOT NULL,"
-            + "PRIMARY KEY(slot, buff_name))");
-        return buffs >= 0;
+        if (this.database == null || this.database.Conn() == null) { return false; }
+        SqliteConnection db = this.database.Conn();
+        db.SyncStructure<ArpgSaveSlotEntity>();
+        db.SyncStructure<ArpgSaveItemEntity>();
+        db.SyncStructure<ArpgSaveEquipmentEntity>();
+        db.SyncStructure<ArpgSaveSkillEntity>();
+        db.SyncStructure<ArpgSaveBuffEntity>();
+        return true;
     }
 
     /// <summary>
-    /// 为 SQLite 转义一个值，无需第二套 SQL 参数 API。
-    /// 仓库只拼接槽位与物品标识符；数值
-    /// 快照字段以整数形式输出。
-    /// </summary>
-    static string Quote(string text) {
-        string result = "'";
-        for (int i = 0; i < text.Length; i = i + 1) {
-            string part = text.Substring(i, 1);
-            if (part == "'") {
-                result = result + "''";
-            } else {
-                result = result + part;
-            }
-        }
-        return result + "'";
-    }
-
-    /// <summary>
-    /// 将 state 全量覆写保存到槽位 slot：主行 INSERT OR REPLACE，
-    /// 四张子表先删后插，整个过程在一个事务内，任一步失败即
-    /// 回滚并返回 false。未就绪、slot 为空串或 state 为 null 时
+    /// 将 state 覆写保存到槽位 slot：主行与四张子表在事务内先删后插，
+    /// 全部采用 ORM 强类型表达式与实体写入。未就绪、slot 为空串或 state 为 null 时
     /// 直接返回 false。
     /// </summary>
     bool Save(string slot, ArpgSaveState state) {
         if (!this.ready || slot == "" || state == null) { return false; }
+        SqliteConnection db = this.database.Conn();
         this.database.Begin();
 
-        DbParams pMain = new DbParams();
-        pMain.Add(slot);
-        pMain.Add(state.MapName());
-        pMain.AddInt(state.HeroX());
-        pMain.AddInt(state.HeroY());
-        pMain.AddInt(state.HeroDirection());
-        pMain.AddInt(state.HeroLevel());
-        pMain.AddInt(state.HeroHp());
-        pMain.AddInt(state.HeroMp());
-        pMain.AddInt(state.HeroExperience());
-        pMain.AddInt(state.HeroRage());
+        db.Delete<ArpgSaveSlotEntity>().Where(a => a.slot == slot).ExecuteAffrows();
+        ArpgSaveSlotEntity slotEntity = new ArpgSaveSlotEntity();
+        slotEntity.slot = slot;
+        slotEntity.map_name = state.MapName();
+        slotEntity.hero_x = state.HeroX();
+        slotEntity.hero_y = state.HeroY();
+        slotEntity.hero_direction = state.HeroDirection();
+        slotEntity.hero_level = state.HeroLevel();
+        slotEntity.hero_hp = state.HeroHp();
+        slotEntity.hero_mp = state.HeroMp();
+        slotEntity.hero_experience = state.HeroExperience();
+        slotEntity.hero_rage = state.HeroRage();
+        db.Insert<ArpgSaveSlotEntity>(slotEntity).ExecuteAffrows();
 
-        int row = this.database.Execute(
-            "INSERT OR REPLACE INTO zgm_save_slot "
-            + "(slot,map_name,hero_x,hero_y,hero_direction,hero_level,"
-            + "hero_hp,hero_mp,hero_experience,hero_rage) VALUES ("
-            + "?,?,?,?,?,?,?,?,?,?)", pMain);
-        if (row < 0) {
-            this.database.Rollback();
-            return false;
-        }
+        db.Delete<ArpgSaveItemEntity>().Where(a => a.slot == slot).ExecuteAffrows();
+        db.Delete<ArpgSaveEquipmentEntity>().Where(a => a.slot == slot).ExecuteAffrows();
+        db.Delete<ArpgSaveSkillEntity>().Where(a => a.slot == slot).ExecuteAffrows();
+        db.Delete<ArpgSaveBuffEntity>().Where(a => a.slot == slot).ExecuteAffrows();
 
-        DbParams pSlot = new DbParams();
-        pSlot.Add(slot);
-
-        int removed = this.database.Execute(
-            "DELETE FROM zgm_save_item WHERE slot=?", pSlot);
-        if (removed < 0) {
-            this.database.Rollback();
-            return false;
-        }
-        int removedEquipment = this.database.Execute(
-            "DELETE FROM zgm_save_equipment WHERE slot=?", pSlot);
-        int removedSkills = this.database.Execute(
-            "DELETE FROM zgm_save_skill WHERE slot=?", pSlot);
-        int removedBuffs = this.database.Execute(
-            "DELETE FROM zgm_save_buff WHERE slot=?", pSlot);
-        if (removedEquipment < 0
-            || removedSkills < 0
-            || removedBuffs < 0) {
-            this.database.Rollback();
-            return false;
-        }
-
-        int i = 0;
-        for (; i < state.ItemCount(); i = i + 1) {
+        for (int i = 0; i < state.ItemCount(); i = i + 1) {
             ArpgSaveItem item = state.ItemAt(i);
-            DbParams pItem = new DbParams();
-            pItem.Add(slot);
-            pItem.Add(item.Name());
-            pItem.AddInt(item.Quantity());
-            int inserted = this.database.Execute(
-                "INSERT INTO zgm_save_item(slot,item_name,quantity) VALUES(?,?,?)", pItem);
-            if (inserted < 0) {
-                this.database.Rollback();
-                return false;
-            }
+            ArpgSaveItemEntity entity = new ArpgSaveItemEntity();
+            entity.slot = slot;
+            entity.item_name = item.Name();
+            entity.quantity = item.Quantity();
+            db.Insert<ArpgSaveItemEntity>(entity).ExecuteAffrows();
         }
-        i = 0;
-        while (i < state.EquipmentCount()) {
-            ArpgSaveEquipment equipment = state.EquipmentAt(i);
-            DbParams pEquip = new DbParams();
-            pEquip.Add(slot);
-            pEquip.Add(equipment.Slot());
-            pEquip.Add(equipment.ItemName());
-            int inserted = this.database.Execute(
-                "INSERT INTO zgm_save_equipment(slot,equip_slot,item_name) VALUES(?,?,?)", pEquip);
-            if (inserted < 0) {
-                this.database.Rollback();
-                return false;
-            }
-            i = i + 1;
+
+        for (int i = 0; i < state.EquipmentCount(); i = i + 1) {
+            ArpgSaveEquipment equip = state.EquipmentAt(i);
+            ArpgSaveEquipmentEntity entity = new ArpgSaveEquipmentEntity();
+            entity.slot = slot;
+            entity.equip_slot = equip.Slot();
+            entity.item_name = equip.ItemName();
+            db.Insert<ArpgSaveEquipmentEntity>(entity).ExecuteAffrows();
         }
-        i = 0;
-        while (i < state.SkillCount()) {
+
+        for (int i = 0; i < state.SkillCount(); i = i + 1) {
             ArpgSaveSkill skill = state.SkillAt(i);
-            DbParams pSkill = new DbParams();
-            pSkill.Add(slot);
-            pSkill.Add(skill.Name());
-            int inserted = this.database.Execute(
-                "INSERT INTO zgm_save_skill(slot,skill_name) VALUES(?,?)", pSkill);
-            if (inserted < 0) {
-                this.database.Rollback();
-                return false;
-            }
-            i = i + 1;
+            ArpgSaveSkillEntity entity = new ArpgSaveSkillEntity();
+            entity.slot = slot;
+            entity.skill_name = skill.Name();
+            db.Insert<ArpgSaveSkillEntity>(entity).ExecuteAffrows();
         }
-        i = 0;
-        while (i < state.BuffCount()) {
+
+        for (int i = 0; i < state.BuffCount(); i = i + 1) {
             ArpgSaveBuff buff = state.BuffAt(i);
-            DbParams pBuff = new DbParams();
-            pBuff.Add(slot);
-            pBuff.Add(buff.Name());
-            pBuff.AddInt(buff.Remaining());
-            int inserted = this.database.Execute(
-                "INSERT INTO zgm_save_buff(slot,buff_name,remaining) VALUES(?,?,?)", pBuff);
-            if (inserted < 0) {
-                this.database.Rollback();
-                return false;
-            }
-            i = i + 1;
+            ArpgSaveBuffEntity entity = new ArpgSaveBuffEntity();
+            entity.slot = slot;
+            entity.buff_name = buff.Name();
+            entity.remaining = buff.Remaining();
+            db.Insert<ArpgSaveBuffEntity>(entity).ExecuteAffrows();
         }
 
         this.database.Commit();
@@ -261,110 +204,85 @@ class ArpgSaveRepository {
     }
 
     /// <summary>
-    /// 读取槽位 slot 为 ArpgSaveState：主行不存在、未就绪或 slot
-    /// 为空串时返回 null。物品/装备/技能/增益子行分别按名称排序
-    /// 读回（与保存顺序无关）。
+    /// 读取槽位 slot 为 ArpgSaveState：使用 ORM 强类型表达式查询。
+    /// 主行不存在、未就绪或 slot 为空串时返回 null。
+    /// 物品/装备/技能/增益子行分别按实体表达式排序读回。
     /// </summary>
     ArpgSaveState Load(string slot) {
         if (!this.ready || slot == "") { return null; }
-        DbParams pSlot = new DbParams();
-        pSlot.Add(slot);
-        DbResult row = this.database.Query(
-            "SELECT map_name,hero_x,hero_y,hero_direction,hero_level,"
-            + "hero_hp,hero_mp,hero_experience,hero_rage "
-            + "FROM zgm_save_slot WHERE slot=?", pSlot);
-        if (row.RowCount() == 0) { return null; }
+        SqliteConnection db = this.database.Conn();
+        ArpgSaveSlotEntity row = db.Select<ArpgSaveSlotEntity>()
+            .Where(a => a.slot == slot)
+            .First();
+        if (row == null) { return null; }
 
         ArpgSaveState state = new ArpgSaveState(
-            row.GetString(0, 0),
-            Convert.ToInt32(row.GetString(0, 1)),
-            Convert.ToInt32(row.GetString(0, 2)),
-            Convert.ToInt32(row.GetString(0, 3)),
-            Convert.ToInt32(row.GetString(0, 4)),
-            Convert.ToInt32(row.GetString(0, 5)),
-            Convert.ToInt32(row.GetString(0, 6)))
+            row.map_name,
+            row.hero_x,
+            row.hero_y,
+            row.hero_direction,
+            row.hero_level,
+            row.hero_hp,
+            row.hero_mp)
             .SetProgress(
-                Convert.ToInt32(row.GetString(0, 7)),
-                Convert.ToInt32(row.GetString(0, 8)));
+                row.hero_experience,
+                row.hero_rage);
 
-        DbResult items = this.database.Query(
-            "SELECT item_name,quantity FROM zgm_save_item "
-            + "WHERE slot=? ORDER BY item_name", pSlot);
-        int i = 0;
-        for (; i < items.RowCount(); i = i + 1) {
-            state.AddItem(
-                items.GetString(i, 0),
-                Convert.ToInt32(items.GetString(i, 1)));
+        List<ArpgSaveItemEntity> items = db.Select<ArpgSaveItemEntity>()
+            .Where(a => a.slot == slot)
+            .OrderBy(a => a.item_name)
+            .ToList();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            state.AddItem(items[i].item_name, items[i].quantity);
         }
-        DbResult equipment = this.database.Query(
-            "SELECT equip_slot,item_name FROM zgm_save_equipment "
-            + "WHERE slot=? ORDER BY equip_slot", pSlot);
-        i = 0;
-        while (i < equipment.RowCount()) {
-            state.AddEquipment(
-                equipment.GetString(i, 0),
-                equipment.GetString(i, 1));
-            i = i + 1;
+
+        List<ArpgSaveEquipmentEntity> equipment = db.Select<ArpgSaveEquipmentEntity>()
+            .Where(a => a.slot == slot)
+            .OrderBy(a => a.equip_slot)
+            .ToList();
+        for (int i = 0; i < equipment.Count; i = i + 1) {
+            state.AddEquipment(equipment[i].equip_slot, equipment[i].item_name);
         }
-        DbResult skills = this.database.Query(
-            "SELECT skill_name FROM zgm_save_skill "
-            + "WHERE slot=? ORDER BY skill_name", pSlot);
-        i = 0;
-        while (i < skills.RowCount()) {
-            state.AddSkill(skills.GetString(i, 0));
-            i = i + 1;
+
+        List<ArpgSaveSkillEntity> skills = db.Select<ArpgSaveSkillEntity>()
+            .Where(a => a.slot == slot)
+            .OrderBy(a => a.skill_name)
+            .ToList();
+        for (int i = 0; i < skills.Count; i = i + 1) {
+            state.AddSkill(skills[i].skill_name);
         }
-        DbResult buffs = this.database.Query(
-            "SELECT buff_name,remaining FROM zgm_save_buff "
-            + "WHERE slot=? ORDER BY buff_name", pSlot);
-        i = 0;
-        while (i < buffs.RowCount()) {
-            state.AddBuff(
-                buffs.GetString(i, 0),
-                Convert.ToInt32(buffs.GetString(i, 1)));
-            i = i + 1;
+
+        List<ArpgSaveBuffEntity> buffs = db.Select<ArpgSaveBuffEntity>()
+            .Where(a => a.slot == slot)
+            .OrderBy(a => a.buff_name)
+            .ToList();
+        for (int i = 0; i < buffs.Count; i = i + 1) {
+            state.AddBuff(buffs[i].buff_name, buffs[i].remaining);
         }
+
         return state;
     }
 
     /// 槽位 slot 是否已有存档；未就绪或 slot 为空串时返回 false。
     bool Exists(string slot) {
         if (!this.ready || slot == "") { return false; }
-        DbParams pSlot = new DbParams();
-        pSlot.Add(slot);
-        string count = this.database.Scalar(
-            "SELECT COUNT(*) FROM zgm_save_slot WHERE slot=?", pSlot);
-        return Convert.ToInt32(count) > 0;
+        SqliteConnection db = this.database.Conn();
+        return db.Select<ArpgSaveSlotEntity>().Where(a => a.slot == slot).Count() > 0;
     }
 
     /// <summary>
-    /// 删除槽位 slot：在一个事务内删除主行与全部子行，任一步
-    /// 失败即回滚并返回 false。返回 true 表示槽位确实存在且已删除，
-    /// 槽位本不存在返回 false（此时数据已无变化）。
+    /// 删除槽位 slot：在一个事务内通过 ORM 表达式删除主行与全部子行。
+    /// 返回 true 表示槽位确实存在且已删除，槽位本不存在返回 false。
     /// </summary>
     bool Delete(string slot) {
         if (!this.ready || slot == "") { return false; }
-        DbParams pSlot = new DbParams();
-        pSlot.Add(slot);
+        SqliteConnection db = this.database.Conn();
         this.database.Begin();
-        int itemResult = this.database.Execute(
-            "DELETE FROM zgm_save_item WHERE slot=?", pSlot);
-        int equipmentResult = this.database.Execute(
-            "DELETE FROM zgm_save_equipment WHERE slot=?", pSlot);
-        int skillResult = this.database.Execute(
-            "DELETE FROM zgm_save_skill WHERE slot=?", pSlot);
-        int buffResult = this.database.Execute(
-            "DELETE FROM zgm_save_buff WHERE slot=?", pSlot);
-        int saveResult = this.database.Execute(
-            "DELETE FROM zgm_save_slot WHERE slot=?", pSlot);
-        if (itemResult < 0
-            || equipmentResult < 0
-            || skillResult < 0
-            || buffResult < 0
-            || saveResult < 0) {
-            this.database.Rollback();
-            return false;
-        }
+        db.Delete<ArpgSaveItemEntity>().Where(a => a.slot == slot).ExecuteAffrows();
+        db.Delete<ArpgSaveEquipmentEntity>().Where(a => a.slot == slot).ExecuteAffrows();
+        db.Delete<ArpgSaveSkillEntity>().Where(a => a.slot == slot).ExecuteAffrows();
+        db.Delete<ArpgSaveBuffEntity>().Where(a => a.slot == slot).ExecuteAffrows();
+        int saveResult = db.Delete<ArpgSaveSlotEntity>().Where(a => a.slot == slot).ExecuteAffrows();
         this.database.Commit();
         return saveResult > 0;
     }
@@ -372,18 +290,19 @@ class ArpgSaveRepository {
     /// 存档槽位总数；未就绪时返回 0。
     int SlotCount() {
         if (!this.ready) { return 0; }
-        return Convert.ToInt32(
-            this.database.Scalar("SELECT COUNT(*) FROM zgm_save_slot"));
+        SqliteConnection db = this.database.Conn();
+        return (int)db.Select<ArpgSaveSlotEntity>().Count();
     }
 
-    /// 按槽位名排序后的第 index 个槽位名；未就绪、index 为负或
-    /// 越界时返回空串。
+    /// 按槽位名排序后的第 index 个槽位名；未就绪、index 为负或越界时返回空串。
     string SlotAt(int index) {
         if (!this.ready || index < 0) { return ""; }
-        DbResult slots = this.database.Query(
-            "SELECT slot FROM zgm_save_slot ORDER BY slot");
-        if (index >= slots.RowCount()) { return ""; }
-        return slots.GetString(index, 0);
+        SqliteConnection db = this.database.Conn();
+        List<ArpgSaveSlotEntity> slots = db.Select<ArpgSaveSlotEntity>()
+            .OrderBy(a => a.slot)
+            .ToList();
+        if (index >= slots.Count) { return ""; }
+        return slots[index].slot;
     }
 
     /// 关闭底层数据库并将仓库置为未就绪；之后所有操作均失败。
@@ -392,6 +311,5 @@ class ArpgSaveRepository {
             this.database.Close();
         }
         this.ready = false;
-        this.database = null;
     }
 }
