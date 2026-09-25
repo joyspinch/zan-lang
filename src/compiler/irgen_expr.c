@@ -3695,9 +3695,7 @@ binding_lowered:
                     idx = emit_index_safe_bounds(g, idx, span_len, expr->loc, "span");
                     LLVMValueRef ep = LLVMBuildGEP2(g->builder, elem_llvm, typed, &idx, 1, "sps.ep");
                     LLVMValueRef sv = right;
-                    if (LLVMGetTypeKind(LLVMTypeOf(sv)) == LLVMIntegerTypeKind &&
-                        LLVMGetTypeKind(elem_llvm) == LLVMIntegerTypeKind &&
-                        LLVMTypeOf(sv) != elem_llvm)
+                    if (LLVMTypeOf(sv) != elem_llvm)
                         sv = coerce_int_to(g, sv, elem_llvm);
                     /* align 1: a span may view a raw address (protocol framing,
                      * FFI structs) whose elements are not naturally aligned. */
@@ -9095,25 +9093,50 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 int j = g->current_async_sub_next++;
                 LLVMValueRef selfframe = g->current_async_frame;
                 LLVMTypeRef self_ft = g->current_async_frame_type;
+                LLVMTypeRef ptr_int_ty = g->target_is_wasm ? i32 : i64;
+                LLVMValueRef fn = g->current_async_resume_fn;
 
-                /* stash sub handle in a frame slot (survives the suspension) */
+                LLVMBasicBlockRef fast_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "await.fast");
+                LLVMBasicBlockRef prep_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "await.prep");
+                LLVMBasicBlockRef suspend_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "await.suspend");
+                LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx, fn, "co.resume");
+                LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "await.cont");
+
+                LLVMAddCase(g->current_async_switch, LLVMConstInt(i32, (unsigned)k, 0), rk);
+
+                /* Fast path probe: if sub is already completed, inline directly. */
+                LLVMValueRef done_p = LLVMBuildStructGEP2(g->builder, hdr, sub_i8,
+                    ASYNC_FRAME_DONE, "sub.done.p");
+                LLVMValueRef is_done = LLVMBuildLoad2(g->builder, i32, done_p, "sub.is_done");
+                LLVMValueRef fast_cond = zan_icmp(g->builder, LLVMIntNE, is_done,
+                    LLVMConstInt(i32, 0, 0), "sub.already_done");
+                LLVMBuildCondBr(g->builder, fast_cond, fast_bb, prep_bb);
+
+                /* ---- await.prep: atomic handshake with sub ---- */
+                LLVMPositionBuilderAtEnd(g->builder, prep_bb);
+                zan_store_fit(g, g->current_async_resume_fn,
+                    LLVMBuildStructGEP2(g->builder, hdr, sub_i8, ASYNC_FRAME_AWAITER_STEP, "sub.aws"));
+                LLVMValueRef aw_ptr = LLVMBuildStructGEP2(g->builder, hdr, sub_i8,
+                    ASYNC_FRAME_AWAITER, "sub.aw");
+                LLVMValueRef aw_iptr = LLVMBuildBitCast(g->builder, aw_ptr,
+                    LLVMPointerType(ptr_int_ty, 0), "sub.aw.iptr");
+                LLVMValueRef self_i8 = LLVMBuildBitCast(g->builder, selfframe, i8ptr, "self");
+                LLVMValueRef self_int = LLVMBuildPtrToInt(g->builder, self_i8, ptr_int_ty, "self.int");
+                LLVMValueRef cas_res = LLVMBuildAtomicCmpXchg(g->builder, aw_iptr,
+                    LLVMConstInt(ptr_int_ty, 0, 0), self_int,
+                    LLVMAtomicOrderingSequentiallyConsistent,
+                    LLVMAtomicOrderingSequentiallyConsistent, 0);
+                LLVMValueRef won = LLVMBuildExtractValue(g->builder, cas_res, 1, "cas.won");
+                LLVMBuildCondBr(g->builder, won, suspend_bb, fast_bb);
+
+                /* ---- await.suspend: caller suspends ---- */
+                LLVMPositionBuilderAtEnd(g->builder, suspend_bb);
                 zan_store_fit(g, sub_i8,
                     LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
                         (unsigned)(g->current_async_sub_base + j), "sub.slot"));
-
-                /* sub.awaiter = self; sub.awaiter_step = Self$resume */
-                LLVMValueRef self_i8 = LLVMBuildBitCast(g->builder, selfframe, i8ptr, "self");
-                zan_store_fit(g, self_i8,
-                    LLVMBuildStructGEP2(g->builder, hdr, sub_i8, ASYNC_FRAME_AWAITER, "sub.aw"));
-                zan_store_fit(g, g->current_async_resume_fn,
-                    LLVMBuildStructGEP2(g->builder, hdr, sub_i8, ASYNC_FRAME_AWAITER_STEP, "sub.aws"));
-                /* self.child = sub: cancelling this coroutine has to reach the
-                 * one it is actually waiting on (cleared again at the top of
-                 * the next resume) */
                 zan_store_fit(g, sub_i8,
                     LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
                         ASYNC_FRAME_CHILD, "self.child"));
-
                 emit_async_save_slots(g);
                 zan_store_fit(g, LLVMConstInt(i32, (unsigned)k, 0),
                     LLVMBuildStructGEP2(g->builder, self_ft, selfframe, ASYNC_FRAME_STATE, "self.state"));
@@ -9122,31 +9145,37 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 emit_async_eh_unarm(g);
                 LLVMBuildRetVoid(g->builder);
 
-                /* resume-k: re-entered by the driver once the sub completes */
-                LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
-                    g->current_async_resume_fn, "co.resume");
-                LLVMAddCase(g->current_async_switch, LLVMConstInt(i32, (unsigned)k, 0), rk);
+                /* ---- co.resume (rk): re-entered by driver once sub completes ---- */
                 LLVMPositionBuilderAtEnd(g->builder, rk);
                 emit_async_reload_slots(g);
-                /* recompute the sub-slot GEP here (entry dominates rk; the
-                 * pre-suspend block does not). */
                 LLVMValueRef sub_slot = LLVMBuildStructGEP2(g->builder, self_ft, selfframe,
                     (unsigned)(g->current_async_sub_base + j), "sub.slot2");
                 LLVMValueRef sub_rl = LLVMBuildLoad2(g->builder, i8ptr, sub_slot, "sub.rl");
-                /* the sub may have completed by throwing: re-throw it here,
-                 * where this frame has a live invocation and its handlers are
-                 * armed again */
                 emit_async_check_sub_exc(g, sub_rl, NULL);
-                LLVMValueRef rptr = LLVMBuildStructGEP2(g->builder, hdr, sub_rl,
-                    ASYNC_FRAME_RESULT, "sub.result");
-                LLVMValueRef awres = LLVMBuildLoad2(g->builder, i64, rptr, "awres");
-                /* The awaited sub-coroutine has completed and we have copied its
-                 * result out of its heap frame; free the frame now (the awaiter
-                 * owns it once the sub is done). Without this, every awaited
-                 * async call leaks its frame -- a per-request leak that grows a
-                 * long-running socket server's memory without bound. */
+                LLVMValueRef rptr_slow = LLVMBuildStructGEP2(g->builder, hdr, sub_rl,
+                    ASYNC_FRAME_RESULT, "sub.result.slow");
+                LLVMValueRef awres_slow = LLVMBuildLoad2(g->builder, i64, rptr_slow, "awres.slow");
                 zan_emit_frame_free(g, sub_rl);
-                return coerce_await_result(g, expr, awres, locals);
+                LLVMBasicBlockRef rk_end = LLVMGetInsertBlock(g->builder);
+                LLVMBuildBr(g->builder, cont_bb);
+
+                /* ---- await.fast: sub already completed inline ---- */
+                LLVMPositionBuilderAtEnd(g->builder, fast_bb);
+                emit_async_check_sub_exc(g, sub_i8, NULL);
+                LLVMValueRef rptr_fast = LLVMBuildStructGEP2(g->builder, hdr, sub_i8,
+                    ASYNC_FRAME_RESULT, "sub.result.fast");
+                LLVMValueRef awres_fast = LLVMBuildLoad2(g->builder, i64, rptr_fast, "awres.fast");
+                zan_emit_frame_free(g, sub_i8);
+                LLVMBasicBlockRef fast_end = LLVMGetInsertBlock(g->builder);
+                LLVMBuildBr(g->builder, cont_bb);
+
+                /* ---- await.cont: continue inline ---- */
+                LLVMPositionBuilderAtEnd(g->builder, cont_bb);
+                LLVMValueRef phi = LLVMBuildPhi(g->builder, i64, "awres");
+                LLVMValueRef phi_vals[] = { awres_fast, awres_slow };
+                LLVMBasicBlockRef phi_bbs[] = { fast_end, rk_end };
+                LLVMAddIncoming(phi, phi_vals, phi_bbs, 2);
+                return coerce_await_result(g, expr, phi, locals);
             }
 
             /* root drive (non-async caller). The scheduler is initialized once
@@ -9154,16 +9183,28 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
              * would reset the ready queue and discard any coroutines already
              * enqueued by Task.Spawn before this await -- e.g. a spawned server
              * in a concurrent client/server program would never run. */
+            LLVMValueRef done_p = LLVMBuildStructGEP2(g->builder, hdr, sub_i8,
+                ASYNC_FRAME_DONE, "sub.done.p");
+            LLVMValueRef is_done = LLVMBuildLoad2(g->builder, i32, done_p, "sub.is_done");
+            LLVMValueRef need_pump = zan_icmp(g->builder, LLVMIntEQ, is_done,
+                LLVMConstInt(i32, 0, 0), "sub.need_pump");
+            LLVMValueRef fn = g->current_fn;
+            LLVMBasicBlockRef pump_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "await.pump");
+            LLVMBasicBlockRef fin_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "await.fin");
+            LLVMBuildCondBr(g->builder, need_pump, pump_bb, fin_bb);
+
+            LLVMPositionBuilderAtEnd(g->builder, pump_bb);
             LLVMValueRef sched_args[] = { sub_i8, sub_resume };
             zan_call2(g->builder, g->rt_co_ready_type, g->rt_co_ready, sched_args, 2, "");
             /* Pump until *this* coroutine is done, not until the whole queue
              * drains: a background coroutine spawned meanwhile (a metrics
              * flusher, a spawned server) never completes, and draining would
              * turn a root-level await into a program that never continues. */
-            LLVMValueRef done_p = LLVMBuildStructGEP2(g->builder, hdr, sub_i8,
-                ASYNC_FRAME_DONE, "sub.done.p");
             zan_call2(g->builder, g->rt_co_sched_run_until_type,
                 g->rt_co_sched_run_until, (LLVMValueRef[]){ done_p }, 1, "");
+            LLVMBuildBr(g->builder, fin_bb);
+
+            LLVMPositionBuilderAtEnd(g->builder, fin_bb);
             emit_async_check_sub_exc(g, sub_i8, aw_tmp_mark);
             LLVMValueRef rptr = LLVMBuildStructGEP2(g->builder, hdr, sub_i8,
                 ASYNC_FRAME_RESULT, "sub.result");

@@ -1975,3 +1975,22 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   2. 修复指针赋值：`tsym = cs;`；
   3. 在 `irgen_stmt.c` 的返回语句处理中，当 `ret_type == NULL && g->current_fn_zan_ret_type` 时回退赋值，确保 RC 托管类型必定正确处理 retain。
 
+## Span<T> 元素赋值类型强制转换缺口（A356，2026-09-25）
+
+- **症状**：向 `Span<float>` 等非 64 位宽或浮点 Span 元素赋值浮点字面量时，程序运行偶发退出码 127 或在后续 `free()` 时发生堆块元数据损坏崩溃（0xc0000374 / SIGSEGV）。
+- **根因**：`src/compiler/irgen_expr.c` 在发射 `span[idx] = right;` 存储时，守卫条件原写为 `if (LLVMGetTypeKind(LLVMTypeOf(sv)) == LLVMIntegerTypeKind && LLVMGetTypeKind(elem_llvm) == LLVMIntegerTypeKind && LLVMTypeOf(sv) != elem_llvm)`。在 Zan 语言中，浮点字面量推导为 double (f64)，当目标元素为 `float` (f32) 时，由于两侧类型 kind 均为 `LLVMDoubleTypeKind`/`LLVMFloatTypeKind` 而非整型，该判断跳过了 `coerce_int_to`，导致 LLVM 直接将 8 字节双精度浮点数存储进 4 字节的单精度浮点元素槽位中。在 10 元素的批处理缓冲数组尾部，多出的 4 字节直接越界覆盖了紧随其后的堆头元数据。
+- **修法**：简化类型对齐条件为无条件 `if (LLVMTypeOf(sv) != elem_llvm) sv = coerce_int_to(g, sv, elem_llvm);`。`coerce_int_to` 内部已有完善的 `fit.fptrunc` / `fit.sitofp` 等所有基本类型转换路径，保证任何元素宽度的存储严格对齐目标类型槽位尺寸。
+
+## await 同步完成 Fast Path 与无锁原子握手（A32-4，2026-09-25）
+
+- **机制**：当子任务是一个纯同步完成或已缓存命中的 Task/协程时，原本的 await 发射逻辑仍会无条件分配待续帧槽、保存状态码、将当前协程挂起并排队进调度泵，产生大量不必要的上下文切换与调度抖动。
+- **契约与实现**：
+  1. **Done 快速探测**：调用方在挂起前优先读取子协程帧头的 `ASYNC_FRAME_DONE` 标志，若已为非 0（已完成），直接跳过挂起，直接从结果槽读取返回值并调用 `zan_emit_frame_free` 回收子帧，在当前基本块内联继续执行；
+  2. **双向无锁原子握手**：若子任务尚未置位 Done，调用方将自身恢复函数存入 `ASYNC_FRAME_AWAITER_STEP`，并对 `ASYNC_FRAME_AWAITER` 执行 `atomicrmw cmpxchg`（将 NULL 换为调用方帧指针）。若 CAS 失败（说明子协程已完成并写入完成标记），调用方不进入挂起基本块，而是直通 fast path 执行后续逻辑；若 CAS 成功，调用方才安全退出交由子协程完成时唤醒。
+
+## 标量类型到接口形参类型隐式转换漏洞（A357，2026-09-25）
+
+- **症状**：在方法调用与构造函数调用中，若将基础标量类型（如 `int`、`bool` 等）误传给接口类型形参（如 `IMenu`、`IComparable`），类型检查器未报类型不匹配错误，导致编译通过但在运行期按对象指针访问时引发非法内存访问崩溃。
+- **根因**：`src/compiler/checker.c` 中针对方法形参与构造函数形参做兼容性检查时，当目标形参为接口或对象引用类型时，未严格限制实参必须属于对象/引用/结构体或显式装箱类型，部分标量类型分支漏掉了 `type_implements_interface` 或引用类型的守卫断言。
+- **修法**：在形参实参匹配检查中全面收紧接口与对象的类型分配检查，对接口类型形参强制要求实参必须是实现了该接口的合法类或结构体类型，标量类型必须显式转换或装箱，否则当场发出诊断拦截（如 `diag_call_interface_arg_mismatch` 与 `diag_ctor_interface_arg_mismatch`）。
+

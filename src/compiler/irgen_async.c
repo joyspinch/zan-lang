@@ -209,18 +209,26 @@ static void emit_async_complete(zan_irgen_t *g, local_scope_t *locals, LLVMValue
     }
     emit_async_eh_unarm(g);
 
-    /* if (awaiter != null) zan_co_ready(awaiter, awaiter_step); */
+    /* A32-4: race-free completion handshake via atomic exchange with sentinel (1).
+     * If an awaiter was already registered (old_aw > 1), ready it. If no awaiter
+     * was registered or it was already marked done (old_aw <= 1), do nothing. */
+    LLVMTypeRef ptr_int_ty = g->target_is_wasm ? i32 : i64;
     LLVMValueRef aw_ptr = LLVMBuildStructGEP2(g->builder, ft, frame,
         ASYNC_FRAME_AWAITER, "fr.awaiter");
-    LLVMValueRef awaiter = LLVMBuildLoad2(g->builder, i8ptr, aw_ptr, "awaiter");
-    LLVMValueRef has_awaiter = zan_icmp(g->builder, LLVMIntNE, awaiter,
-        LLVMConstNull(i8ptr), "has.awaiter");
+    LLVMValueRef aw_iptr = LLVMBuildBitCast(g->builder, aw_ptr,
+        LLVMPointerType(ptr_int_ty, 0), "fr.aw.iptr");
+    LLVMValueRef old_aw = LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpXchg,
+        aw_iptr, LLVMConstInt(ptr_int_ty, 1, 0),
+        LLVMAtomicOrderingSequentiallyConsistent, 0);
+    LLVMValueRef has_awaiter = zan_icmp(g->builder, LLVMIntUGT, old_aw,
+        LLVMConstInt(ptr_int_ty, 1, 0), "has.awaiter");
     LLVMValueRef fn = g->current_fn;
     LLVMBasicBlockRef wake_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "co.wake");
     LLVMBasicBlockRef ret_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "co.ret");
     LLVMBuildCondBr(g->builder, has_awaiter, wake_bb, ret_bb);
 
     LLVMPositionBuilderAtEnd(g->builder, wake_bb);
+    LLVMValueRef awaiter = LLVMBuildIntToPtr(g->builder, old_aw, i8ptr, "awaiter");
     LLVMValueRef aws_ptr = LLVMBuildStructGEP2(g->builder, ft, frame,
         ASYNC_FRAME_AWAITER_STEP, "fr.awaiter.step");
     LLVMValueRef aw_step = LLVMBuildLoad2(g->builder, g->co_step_ptr, aws_ptr, "awaiter.step");

@@ -3770,10 +3770,16 @@ set(_new_diag_cases
   call_not_callable
   expression_nesting_depth
   return_call_type_mismatch
-  await_type_conversion)
+  await_type_conversion
+  ctor_interface_arg_mismatch
+  call_interface_arg_mismatch)
 foreach(_case ${_new_diag_cases})
   if(_case STREQUAL cyclic_inheritance)
     set(_diag_regex "cyclic inheritance")
+  elseif(_case STREQUAL ctor_interface_arg_mismatch)
+    set(_diag_regex "cannot convert 'DbContext' to 'IDbConnection' in argument 1 of 'CategoryDao' constructor")
+  elseif(_case STREQUAL call_interface_arg_mismatch)
+    set(_diag_regex "cannot convert 'NotImp' to 'IPing' in argument 1 of 'Take'")
   elseif(_case STREQUAL mixed_comparison)
     set(_diag_regex "cannot compare")
   elseif(_case STREQUAL unrelated_reference_assignment)

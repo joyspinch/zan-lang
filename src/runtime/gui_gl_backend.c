@@ -1704,7 +1704,10 @@ static void zgl_sprite_batch(zan_surface_t *s, int handle,
     zgl_uint tex;
     int iw, ih, i;
     tex = zgl_sprite_tex(handle);
-    if (!tex) return;
+    if (!tex) {
+        cpu_sprite_batch(s, handle, quads, count);
+        return;
+    }
     if (!zgl_begin(s, ZGL_MODE_BLEND)) {
         /* GPU cannot take the primitive (no target / dead context): the
          * surface's pixels are the truth, same seam the shape entries use. */
@@ -1746,6 +1749,29 @@ static void zgl_sprite_batch(zan_surface_t *s, int handle,
     }
 }
 
+static void zgl_blit_image(zan_surface_t *s, const char *path,
+                           int dx, int dy, int dw, int dh,
+                           int sx, int sy, int sw, int sh) {
+    int handle = zan_sprite_handle(path);
+    if (!handle) {
+        cpu_blit_image(s, path, dx, dy, dw, dh, sx, sy, sw, sh);
+        return;
+    }
+    float quad[10];
+    quad[0] = (float)dx;
+    quad[1] = (float)dy;
+    quad[2] = (float)dw;
+    quad[3] = (float)dh;
+    quad[4] = (float)sx;
+    quad[5] = (float)sy;
+    quad[6] = (float)sw;
+    quad[7] = (float)sh;
+    u32 tint = 0xFFFFFFFFu;
+    memcpy(&quad[8], &tint, sizeof(u32));
+    quad[9] = 0.0f;
+    zgl_sprite_batch(s, handle, quad, 1);
+}
+
 static const zan_gui_backend zan_gl_backend = {
     .name         = "gl",
     .clear_rect   = gl_clear_rect,
@@ -1755,7 +1781,7 @@ static const zan_gui_backend zan_gl_backend = {
     .surface_round = gl_surface_round,
     .fill_vgrad   = gl_fill_vgrad,
     .fill_grad    = gl_fill_grad,
-    /* shadow_round, blur, snapshot, restore and blit_image are the CPU's for
+    /* shadow_round, blur, snapshot and restore are the CPU's for
      * now: the seam syncs the frame across for them (sync_to_cpu below). */
     .shadow_round = NULL,
     .fill_circle  = gl_fill_circle,
@@ -1770,7 +1796,7 @@ static const zan_gui_backend zan_gl_backend = {
     .restore      = NULL,
     .draw_text    = NULL,
     .glyph_run    = gl_glyph_run,
-    .blit_image   = NULL,
+    .blit_image   = zgl_blit_image,
     .sprite_batch = zgl_sprite_batch,
     .mesh_create  = gl_mesh_create,
     .draw3d       = gl_draw3d,

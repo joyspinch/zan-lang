@@ -14,6 +14,7 @@
 #include "arena.h"
 #include "builtin_api.h"
 #include <string.h>
+#include <stdio.h>
 
 static const char *type_name(zan_type_t *t);
 
@@ -993,7 +994,14 @@ static void check_ctor_available(zan_checker_t *c, zan_type_t *type,
             return;
         }
     }
-    if (declared == 0) return;
+    if (declared == 0) {
+        if (argc > 0) {
+            zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                "no constructor of '%s' accepts %d arguments",
+                type_name(type), argc);
+        }
+        return;
+    }
     zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
         "no constructor of '%s' takes %d argument(s); a class that declares "
         "constructors has no implicit parameterless one",
@@ -1838,6 +1846,7 @@ static bool type_refs_type_param(zan_type_t *t) { return type_refs_type_param_d(
 static bool checker_arg_type_mismatch(zan_checker_t *c, zan_type_t *target,
                                       zan_type_t *value) {
     if (!target || !value) return false;
+    if (target->kind == TYPE_ERROR || value->kind == TYPE_ERROR) return false;
     /* A generic *method* instantiation or a reference that still mentions a
      * type parameter (GridSource<T> inside the DataGrid<T> body) is re-checked
      * at the use site with substituted arguments -- the checker cannot see the
@@ -1860,17 +1869,13 @@ static bool checker_arg_type_mismatch(zan_checker_t *c, zan_type_t *target,
         if (checker_type_assignable(target, value)) return false;
         return !checker_has_user_conversion(c, target, value);
     }
-    if (target->kind != TYPE_CLASS && target->kind != TYPE_STRUCT) return false;
-    /* target->sym is absent on instantiated generic carriers (List<Cat>),
-     * which is exactly the shape we must reject a non-list argument for; the
-     * assignability helpers cope with NULL syms. */
-    bool ref_value = value->kind == TYPE_CLASS || value->kind == TYPE_STRUCT ||
-                     value->kind == TYPE_STRING || value->kind == TYPE_ARRAY ||
-                     value->kind == TYPE_DELEGATE ||
-                     value->kind == TYPE_INTERFACE;
-    if (!ref_value) return false;
-    if (checker_type_assignable(target, value)) return false;
-    return !checker_has_user_conversion(c, target, value);
+    bool ref_target = checker_type_is_ref(target) || target->kind == TYPE_STRUCT;
+    bool ref_value = checker_type_is_ref(value) || value->kind == TYPE_STRUCT;
+    if (ref_target && ref_value) {
+        if (checker_type_assignable(target, value)) return false;
+        return !checker_has_user_conversion(c, target, value);
+    }
+    return false;
 }
 
 /* The sole method of this name on `type_sym` or its bases; NULL when the name
@@ -1971,6 +1976,131 @@ static void check_call_arg_type(zan_checker_t *c, zan_symbol_t *sig, int index,
                   "no implicit conversion",
                   type_name(arg_type), type_name(pt), index + 1,
                   (int)sig->name.len, sig->name.str);
+}
+
+static void check_ctor_call_arguments(zan_checker_t *c, zan_type_t *type,
+                                      zan_ast_node_t *expr, int argc,
+                                      zan_type_t **arg_types) {
+    if (!type || type->kind != TYPE_CLASS || !type->sym || argc <= 0) return;
+    zan_symbol_t *sym = type->sym;
+    int declared = 0;
+    int arity_matches = 0;
+    int mismatch_first_arg = -1;
+    zan_type_t *mismatch_target = NULL;
+    zan_type_t *mismatch_source = NULL;
+    zan_ast_node_t *mismatch_node = NULL;
+
+    for (int i = 0; i < sym->member_count; i++) {
+        zan_symbol_t *m = sym->members[i];
+        if (!m || m->kind != SYM_CONSTRUCTOR || !m->decl) continue;
+        if (m->decl->kind != AST_CONSTRUCTOR_DECL) continue;
+        declared++;
+        int lo = 0, hi = 0;
+        ctor_arity(m->decl, &lo, &hi);
+        if (argc < lo || (hi >= 0 && argc > hi)) continue;
+        arity_matches++;
+
+        zan_ast_list_t *ps = &m->decl->method_decl.params;
+        bool match = true;
+        int cand_bad_arg = -1;
+        zan_type_t *cand_bad_tgt = NULL;
+        zan_type_t *cand_bad_src = NULL;
+        zan_ast_node_t *cand_bad_node = NULL;
+
+        for (int j = 0; j < argc; j++) {
+            zan_ast_node_t *arg_node = (j < expr->new_expr.args.count)
+                ? expr->new_expr.args.items[j] : NULL;
+            zan_type_t *at = arg_types[j];
+            zan_type_t *pt = NULL;
+
+            if (arg_node && arg_node->kind == AST_NAMED_ARG) {
+                for (int q = 0; q < ps->count; q++) {
+                    zan_ast_node_t *pp = ps->items[q];
+                    if (pp && pp->kind == AST_PARAM &&
+                        pp->param.name.len == arg_node->named_arg.name.len &&
+                        memcmp(pp->param.name.str, arg_node->named_arg.name.str,
+                               (size_t)arg_node->named_arg.name.len) == 0) {
+                        pt = zan_binder_resolve_type(c->binder, pp->param.type);
+                        break;
+                    }
+                }
+            } else if (j < ps->count) {
+                zan_ast_node_t *pp = ps->items[j];
+                if (pp && pp->kind == AST_PARAM) {
+                    pt = zan_binder_resolve_type(c->binder, pp->param.type);
+                    if (pp->param.is_params && pt && pt->kind == TYPE_ARRAY)
+                        pt = pt->element_type;
+                }
+            } else if (ps->count > 0) {
+                zan_ast_node_t *pp = ps->items[ps->count - 1];
+                if (pp && pp->kind == AST_PARAM && pp->param.is_params) {
+                    pt = zan_binder_resolve_type(c->binder, pp->param.type);
+                    if (pt && pt->kind == TYPE_ARRAY)
+                        pt = pt->element_type;
+                }
+            }
+
+            if (!pt || !at) continue;
+            if (at == c->binder->type_void) {
+                if (pt->kind != TYPE_DELEGATE) {
+                    match = false;
+                    if (cand_bad_arg < 0) {
+                        cand_bad_arg = j;
+                        cand_bad_tgt = pt;
+                        cand_bad_src = at;
+                        cand_bad_node = arg_node;
+                    }
+                }
+                continue;
+            }
+            if (checker_arg_type_mismatch(c, pt, at)) {
+                match = false;
+                if (cand_bad_arg < 0) {
+                    cand_bad_arg = j;
+                    cand_bad_tgt = pt;
+                    cand_bad_src = at;
+                    cand_bad_node = arg_node;
+                }
+                break;
+            }
+        }
+
+        if (match) {
+            return;
+        }
+
+        if (arity_matches == 1) {
+            mismatch_first_arg = cand_bad_arg;
+            mismatch_target = cand_bad_tgt;
+            mismatch_source = cand_bad_src;
+            mismatch_node = cand_bad_node;
+        }
+    }
+
+    if (declared == 0 || arity_matches == 0) {
+        return;
+    }
+
+    if (arity_matches == 1 && mismatch_first_arg >= 0 && mismatch_target && mismatch_source) {
+        zan_loc_t eloc = mismatch_node ? mismatch_node->loc : expr->loc;
+        if (mismatch_source == c->binder->type_void) {
+            zan_diag_emit(c->diag, DIAG_ERROR, eloc,
+                          "cannot use a 'void' value in argument %d of '%s' "
+                          "constructor: a void call has no result",
+                          mismatch_first_arg + 1, type_name(type));
+        } else {
+            zan_diag_emit(c->diag, DIAG_ERROR, eloc,
+                          "cannot convert '%s' to '%s' in argument %d of '%s' "
+                          "constructor: no implicit conversion",
+                          type_name(mismatch_source), type_name(mismatch_target),
+                          mismatch_first_arg + 1, type_name(type));
+        }
+        return;
+    }
+
+    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                  "no overload of constructor '%s' matches the given argument types",
+                  type_name(type));
 }
 
 /* Comparisons, which consume the *value* of both operands. `+`/`-` are left
@@ -2850,6 +2980,11 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 zan_checker_check_expr(c, expr->index.extra.items[i]);
             return obj->element_type;
         }
+        if (obj->kind == TYPE_STRING) {
+            for (int i = 0; i < expr->index.extra.count; i++)
+                zan_checker_check_expr(c, expr->index.extra.items[i]);
+            return c->binder->type_char;
+        }
         return c->binder->type_error;
     }
 
@@ -2987,6 +3122,12 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         /* A postfix generic-type initializer (`List<int> { ... }`) keeps its
          * member-writes in arg_inits (ctor args are always empty there), so
          * both lists are checked by the same loop below. */
+        int ctor_argc = (!factory_init && !expr->new_expr.is_array && type && type->sym)
+            ? ctor_arg_count(c, expr, type->sym) : 0;
+        zan_type_t *ctor_arg_types[64];
+        if (ctor_argc > 64) ctor_argc = 64;
+        for (int k = 0; k < ctor_argc; k++) ctor_arg_types[k] = NULL;
+
         zan_ast_list_t *init_lists[2] = { &expr->new_expr.args,
                                           &expr->new_expr.arg_inits };
         for (int li = 0; li < 2; li++) {
@@ -3121,6 +3262,9 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 }
             }
             zan_type_t *arg_type = zan_checker_check_expr(c, arg);
+            if (li == 0 && i < ctor_argc) {
+                ctor_arg_types[i] = arg_type;
+            }
             if (list_copy_candidate &&
                 arg_type && arg_type->kind == TYPE_CLASS &&
                 arg_type->type_arg_count == 1 && arg_type->name.len == 4 &&
@@ -3128,6 +3272,9 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 expr->new_expr.list_copy = true;
             }
         }
+        }
+        if (ctor_argc > 0) {
+            check_ctor_call_arguments(c, type, expr, ctor_argc, ctor_arg_types);
         }
         return type;
     }
