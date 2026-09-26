@@ -211,6 +211,28 @@ smoke/standard 档）。皮肤命名空间 `numberanim`（base.css 三处：size
 新增控件的落地清单：`Widget/<Name>.zan` → 在 gallery 里加演示 → 需要能被设计器摆放的话
 补 `PropSpec`/`ControlFactory` 注册 → `standard` + gallery 构建 + 截图。
 
+## 自定义组件按 kind 解析：HeavyControls 运行期注册，不要生成注册表文件
+
+宿主自有组件要在声明式页面（`.html`，运行期经 `ControlFactory` 按 kind 字符串建树）
+和设计器面板里可用，做法是**启动时显式注册**进 `HeavyControls`
+（`HeavyControls.Register(kind, 工厂委托)`，幂等的 `XxxBootstrap.Install()`，
+IDE 见 `src/ide_zan/src/components/IdeBootstrap.zan`，画廊在 `gui_gallery.zan`
+的 Main 里注册 StatusPill）。
+
+不要回到"构建期扫描源码生成注册表文件"的老路（已删的 `scan_components.ps1`
++ `ProjectComponents.*.zan`）：
+
+- 那张生成表把 `new DocsSectionTabs()` 这样的**活标识符**写进一个游离文件，
+  只能与宿主全量源码同编译；一旦被无关编译带上就是一串 undefined type。
+- 它落在 `build/` 里，而 IDE 的命名空间本地解析（工具面板双击运行时
+  `FindNamespaceFile` 沿目录上行找 `using Gui;` 的提供者）会物理落进 build
+  目录把它捞走——2026-09-26 工具面板运行报 8 个 undefined type 的根源。
+
+同一机制的连带坑：**任何按级上行的目录遍历，构建输出目录必须在每一级落点
+排除**，`PathFilter.Skip("build dist bin obj publish")` 只挡"进入哪些子目录"，
+挡不住字符串 `DirOf` 上行落回的目录本身（`build\ZanIDE.exe` 跑出的 ToolsDir
+带 `..`，上行会经过物理的 build/）。修复见 `ZanIDE.FindNamespaceFile`。
+
 ## HMI 与周期刷新
 
 工控画面要"自己动"：`Form.Every(...)` 注册周期回调（位号轮询、趋势推点、报警刷新）。

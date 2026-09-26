@@ -915,7 +915,7 @@
     解析失败返回 null，调用方退回占位块。
 
 - void AddCustomField(string kind)
-  - 按 ProjectComponents tag 添加发现的项目自定义组件
+  - 添加运行期注册（HeavyControls）的自定义组件
     到表单/活动容器，与内置组件的 AddField 对应。
 
 - bool InSubtree(FormField owner, FormField inner)

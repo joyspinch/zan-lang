@@ -72,29 +72,14 @@ if ($LASTEXITCODE -ne 0) { Write-Output "EMBED_GEN_FAILED"; exit 1 }
 $zanc = if (Test-Path "build\zanc.exe") { "build\zanc.exe" } else { "dist\win-x64\toolchain\zanc.exe" }
 Write-Output "[zanc] $zanc"
 
-$registryPath = Join-Path (Get-Location) "build\ProjectComponents.ide.zan"
-& powershell -ExecutionPolicy Bypass -File scripts\scan_components.ps1 `
-    -Source "src\ide_zan" -Out "build\ProjectComponents.ide.zan"
-if ($LASTEXITCODE -ne 0) { Write-Output "COMPONENT_SCAN_FAILED"; exit 1 }
-# An empty registry links fine and fails only at runtime: UiNode.Make yields a
-# null node for every `type` it cannot resolve, so each declarative child
-# window silently loses its title bar, its cards and the whole docs page while
-# the hand-drawn dialogs still look right. Refuse to ship that build instead
-# of leaving it to be spotted on screen.
-$registryText = [System.IO.File]::ReadAllText($registryPath)
-$componentCount = ([regex]::Matches($registryText, 'k\.Add\(')).Count
-if ($componentCount -lt 1) {
-    Write-Output "COMPONENT_REGISTRY_EMPTY"; exit 1
-}
-
 $files = @()
-# IDE sources (the standard project's own code).
+# IDE sources (the standard project's own code). The IDE's own components
+# register their kinds into HeavyControls at startup (IdeBootstrap.Install),
+# so no build-time component registry is generated any more.
 $files += (Get-ChildItem src\ide_zan\*.zan -Recurse).FullName
-$files += $registryPath
 # The GUI stdlib is namespaced across subfolders (Gui root + Widget /
 # Component / Designer); recurse so every part is compiled.
-$files += (Get-ChildItem stdlib\Gui -Recurse -Include *.zan |
-    Where-Object { $_.Name -ne "ProjectComponents.zan" }).FullName
+$files += (Get-ChildItem stdlib\Gui -Recurse -Include *.zan).FullName
 if (Test-Path packages\Zan.Gui.Charts) {
     $files += (Get-ChildItem packages\Zan.Gui.Charts\src -Recurse -Include *.zan).FullName
 }
@@ -139,7 +124,6 @@ $exeOld = Join-Path (Get-Location) "build\ZanIDE.prev.exe"
 $zanArgs = @()
 $zanArgs += $entry
 $zanArgs += $files
-$zanArgs += @("-DZAN_PROJECT_COMPONENTS")
 $zanArgs += @("-o", $exeOut, "--subsystem", "windows")
 # Release shape (--publish): Os codegen + the optimization sweep + a stripped
 # link. The unoptimized dev default (O0 + fast_codegen) made the exe ~21 MB,

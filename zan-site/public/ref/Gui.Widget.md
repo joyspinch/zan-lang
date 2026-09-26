@@ -3114,7 +3114,7 @@ if (Ui.Clicked(app, id)) { ... }
 
 设计器把它渲染在编辑外框内并叠加选中/handle 覆盖层；运行时把
 同一棵树放进 Form。因此“所见即所得”天然成立，自定义组件也走
-同一条实例化路径（ProjectComponents / 注入工厂）。
+同一条实例化路径（HeavyControls 注册工厂 / 注入工厂）。
 
 Canonical kind, layout metadata, and property setup are shared with
 formgen through the Control contract. Every setup is applied to the

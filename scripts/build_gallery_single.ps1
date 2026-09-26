@@ -33,7 +33,14 @@ if ($LASTEXITCODE -ne 0) { throw "EMBED_API_COMPILE_FAILED" }
 clang --target=x86_64-w64-windows-gnu -O2 -DZAN_GUI_STATIC `
     -c src\runtime\rt_timer.c -o build\zan_gui_gallery_timer_gnu.o
 if ($LASTEXITCODE -ne 0) { throw "TIMER_COMPILE_FAILED" }
-llvm-ar rcs build\libzan_gui_gallery_gnu.a build\zan_gui_gallery_gnu.o build\zan_embed_api.o build\zan_gui_gallery_timer_gnu.o
+# Text shaping goes through the DirectWrite backend: gui_runtime.c only
+# declares zan_dw_render, the implementation lives in gui_runtime_dwrite.cpp
+# (it LoadLibraryW's dwrite.dll at runtime, so no import lib is needed).
+clang --target=x86_64-w64-windows-gnu -O2 -DZAN_GUI_STATIC `
+    -fno-exceptions -fno-rtti `
+    -c src\runtime\gui_runtime_dwrite.cpp -o build\zan_gui_dwrite_gallery_gnu.o
+if ($LASTEXITCODE -ne 0) { throw "RUNTIME_DWRITE_COMPILE_FAILED" }
+llvm-ar rcs build\libzan_gui_gallery_gnu.a build\zan_gui_gallery_gnu.o build\zan_embed_api.o build\zan_gui_gallery_timer_gnu.o build\zan_gui_dwrite_gallery_gnu.o
 if ($LASTEXITCODE -ne 0) { throw "RUNTIME_LIB_FAILED" }
 
 # ---- bake the skin packs (base.css + skins) into the exe -----------------

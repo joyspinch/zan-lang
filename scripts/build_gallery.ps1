@@ -10,11 +10,10 @@ Set-Location $root
 # reactor (rt_io) and sync runtime (rt_sync) automatically.
 
 $galleryComponents = "examples\gui_gallery\components"
-$registryPath = Join-Path $root "build\ProjectComponents.gallery.zan"
 $failed = $false
 
 try {
-    Write-Output "[1/3] Building native GUI runtime (Win32, static, mingw ABI)..."
+    Write-Output "[1/2] Building native GUI runtime (Win32, static, mingw ABI)..."
     clang --target=x86_64-w64-windows-gnu -O2 -DZAN_GUI_STATIC `
         -c src\runtime\gui_runtime.c -o build\zan_gui_gallery_gnu.o
     if ($LASTEXITCODE -ne 0) { throw "RUNTIME_COMPILE_FAILED" }
@@ -23,27 +22,27 @@ try {
     clang --target=x86_64-w64-windows-gnu -O2 -DZAN_GUI_STATIC `
         -c src\runtime\rt_timer.c -o build\zan_gui_gallery_timer_gnu.o
     if ($LASTEXITCODE -ne 0) { throw "TIMER_COMPILE_FAILED" }
-    llvm-ar rcs build\libzan_gui_gallery_gnu.a build\zan_gui_gallery_gnu.o build\zan_gui_gallery_timer_gnu.o
+    # Text shaping goes through the DirectWrite backend: gui_runtime.c only
+    # declares zan_dw_render, the implementation lives in gui_runtime_dwrite.cpp
+    # (it LoadLibraryW's dwrite.dll at runtime, so no import lib is needed).
+    # Leaving the object out = undefined reference at link.
+    clang --target=x86_64-w64-windows-gnu -O2 -DZAN_GUI_STATIC `
+        -fno-exceptions -fno-rtti `
+        -c src\runtime\gui_runtime_dwrite.cpp -o build\zan_gui_dwrite_gallery_gnu.o
+    if ($LASTEXITCODE -ne 0) { throw "RUNTIME_DWRITE_COMPILE_FAILED" }
+    llvm-ar rcs build\libzan_gui_gallery_gnu.a build\zan_gui_gallery_gnu.o build\zan_gui_gallery_timer_gnu.o build\zan_gui_dwrite_gallery_gnu.o
     if ($LASTEXITCODE -ne 0) { throw "RUNTIME_LIB_FAILED" }
 
-    Write-Output "[2/3] Scanning custom components..."
-    powershell -ExecutionPolicy Bypass -File scripts\scan_components.ps1 `
-        -Source $galleryComponents -Out "build\ProjectComponents.gallery.zan"
-    if ($LASTEXITCODE -ne 0) { throw "COMPONENT_SCAN_FAILED" }
-
-    Write-Output "[3/3] Compiling and linking gallery_test.exe..."
+    Write-Output "[2/2] Compiling and linking gallery_test.exe..."
     $files = @()
-    $files += (Get-ChildItem stdlib\Gui\*.zan |
-        Where-Object { $_.Name -ne "ProjectComponents.zan" }).FullName
+    $files += (Get-ChildItem stdlib\Gui\*.zan).FullName
     $files += (Get-ChildItem stdlib\Gui\Widget\*.zan).FullName
     $files += (Get-ChildItem $galleryComponents\*.zan).FullName
-    $files += $registryPath
     $files += (Join-Path (Get-Location) "examples\gui_gallery\gui_gallery.zan")
     $files += (Join-Path (Get-Location) "examples\gui_gallery\MapChinaData.zan")
 
     $zanArgs = @()
     $zanArgs += $files
-    $zanArgs += @("-DZAN_PROJECT_COMPONENTS")
     $zanArgs += @("-o", "build\gallery_test.exe", "--subsystem", "windows")
     # Demo/props/events catalog + map geometry (assets/) travel inside the
     # exe; File.ReadAllText falls back to the embedded copy when the loose
@@ -70,10 +69,6 @@ try {
 } catch {
     Write-Output $_
     $failed = $true
-} finally {
-    if (Test-Path -LiteralPath $registryPath) {
-        Remove-Item -LiteralPath $registryPath -Force -ErrorAction SilentlyContinue
-    }
 }
 
 if ($failed) { exit 1 }

@@ -3,8 +3,9 @@
 # oneplus\app is a normal zan.proj project: `entry` names the program's Main
 # (src\OnePlusApp.zan), every .html design doc under src\ is a designed
 # document whose code-behind is the same-named .zan, and the custom components
-# (pages, toolbars, the command bar) are discovered by scan_components.ps1 so
-# the designer palette and the JSON loader know them.
+# (pages, toolbars, the command bar) register their kinds into HeavyControls
+# at startup (same contract as CefBootstrap etc.) so the designer palette and
+# the JSON loader know them.
 #
 #   -Console  build a console-subsystem exe so Console.WriteLine (CEF bootstrap
 #             diagnostics) shows up in a redirected log.
@@ -22,18 +23,6 @@ $proj = Join-Path $root "oneplus\app"
 $zanc = if (Test-Path "build\zanc.exe") { "build\zanc.exe" } else { "dist\win-x64\toolchain\zanc.exe" }
 Write-Output "[zanc] $zanc"
 
-# Project components (pages/toolbars marked with `/// @component`): the registry
-# is what lets ControlFactory build them from a design `kind`, so an empty one
-# means every designed page silently loses its custom children.
-$registryPath = Join-Path $root "build\ProjectComponents.oneplus.zan"
-& powershell -ExecutionPolicy Bypass -File scripts\scan_components.ps1 `
-    -Source "oneplus\app\src" -Out "build\ProjectComponents.oneplus.zan"
-if ($LASTEXITCODE -ne 0) { Write-Output "COMPONENT_SCAN_FAILED"; exit 1 }
-$registryText = [System.IO.File]::ReadAllText($registryPath)
-$componentCount = ([regex]::Matches($registryText, 'k\.Add\(')).Count
-if ($componentCount -lt 1) { Write-Output "COMPONENT_REGISTRY_EMPTY"; exit 1 }
-Write-Output "[components] $componentCount"
-
 # Entry FIRST: zanc gives the generated Main() to the first document on the
 # command line, so the manifest's `entry` has to lead the input list.
 $entryRel = ([regex]::Match(
@@ -50,14 +39,12 @@ $files = @()
 $files += @(Get-ChildItem $proj -Recurse -File -Filter *.zan |
     Where-Object { $_.FullName -ne $entry } |
     ForEach-Object { $_.FullName })
-$files += $registryPath
 $files += @(Get-ChildItem $proj -Recurse -File -Filter *.html |
     ForEach-Object { $_.FullName })
 
 $exeOut = Join-Path $root "build\oneplus.exe"
 $zanArgs = @($entry) + $files
 $zanArgs += @("--auto-stdlib", "--stdlib-path", (Join-Path $root "stdlib"))
-$zanArgs += @("-DZAN_PROJECT_COMPONENTS")
 $zanArgs += @("-o", $exeOut)
 if (-not $Console) { $zanArgs += @("--subsystem", "windows") }
 $zanArgs += @("--no-arc-guard", "--no-check-leaks")
