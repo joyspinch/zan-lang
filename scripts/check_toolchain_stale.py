@@ -18,10 +18,17 @@ source it is built from has a newer last commit.
 Exits non-zero when anything is stale. Rebuild on the target platform
 (scripts/build_macos_rt.sh, scripts/build_gui_driver.ps1, or the platform's
 CMake build) and commit the artifact to clear it.
+
+With --verify, every date-stale artifact that this machine can rebuild is
+actually rebuilt and byte-compared: an identical rebuild proves the committed
+content is already current (downgrades to ok), a differing one is real
+staleness. Artifacts with no local builder stay reported as stale.
 """
 import subprocess
 import sys
 import os
+import glob
+import shutil
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
@@ -186,6 +193,114 @@ def last_commit(path):
     return val
 
 
+def _find_zig():
+    zig = shutil.which("zig")
+    if not zig:
+        for c in [
+            r"D:\tools\zig-x86_64-windows-0.15.1\zig.exe",
+            os.path.expanduser(r"~/.mozbuild/zig/zig-x86_64-windows-0.14.1/zig.exe"),
+            r"C:\zig\zig.exe"
+        ]:
+            if os.path.isfile(c):
+                return c
+    return zig
+
+
+def _find_ndk():
+    ndk = os.environ.get("ANDROID_NDK")
+    if not ndk:
+        ndks = glob.glob(os.path.expanduser(r"~\AppData\Local\Android\Sdk\ndk\*"))
+        if ndks:
+            ndk = ndks[-1]
+    return ndk
+
+
+def rebuild_cmd(artifact, zig, ndk):
+    """The exact compile that (re)produces `artifact` locally, or None when
+    this machine has no builder for it (GUI drivers need the target platform;
+    ohos needs its NDK, whose sysroot headers zig does not carry). Mirrors
+    do_rebuild / build_cross_rt.cmd flag for flag."""
+    rt = "src/runtime"
+    d, name = os.path.split(artifact.replace("\\", "/"))
+    if d.startswith("toolchain/"):
+        d = d[len("toolchain/"):]
+    src = name.replace("zanrt_", "rt_").replace(".o", ".c")
+    c11 = ["-std=c11"]
+    if d == "wasm32":
+        target, std = "wasm32-wasi", c11
+    elif d.startswith("linux-"):
+        arch = {"linux-musl": "x86_64", "linux-arm64": "aarch64",
+                "linux-riscv64": "riscv64"}[d]
+        target, std = f"{arch}-linux-musl", c11
+    elif d.startswith("macos/"):
+        arch = {"arm64": "aarch64", "x64": "x86_64"}[d.split("/")[1]]
+        target, std = f"{arch}-macos.11.0", c11
+    elif d.startswith("android-"):
+        if not ndk:
+            return None
+        arch = {"x64": "x86_64", "arm64": "aarch64"}[d.split("-")[1]]
+        clang = os.path.join(ndk, r"toolchains\llvm\prebuilt\windows-x86_64\bin\clang.exe")
+        sysroot = os.path.join(ndk, r"toolchains\llvm\prebuilt\windows-x86_64\sysroot")
+        if not os.path.isfile(clang):
+            return None
+        return ([clang, "--sysroot", sysroot, "-target",
+                 f"{arch}-linux-android28", "-g0", "-fPIC", "-I", rt, "-O2"]
+                + ([] if src == "rt_io.c" else c11)
+                + (["-DZAN_IO_STACKLESS_ONLY"] if src == "rt_io.c" else [])
+                + ["-c", f"{rt}/{src}"])
+    else:
+        return None
+    if not zig:
+        return None
+    cmd = [zig, "cc", "-target", target, "-g0", "-fPIC", "-I", rt, "-O2"] + std
+    if src == "rt_io.c":
+        cmd += ["-DZAN_IO_STACKLESS_ONLY"]
+    if name == "zanrt_io_mt.o":
+        cmd += ["-DZAN_CO_DRIVER"]
+    return cmd + ["-c", f"{rt}/{src}"]
+
+
+def do_verify(stale_entries):
+    """Second opinion for date-detected staleness: actually rebuild each
+    artifact and byte-compare. A rebuild identical to the committed object
+    proves the committed content already matches current sources (the source
+    commits since then changed nothing this object embeds) and downgrades the
+    finding; a differing rebuild is real staleness."""
+    zig = _find_zig()
+    ndk = _find_ndk()
+    import hashlib
+    still = 0
+    for artifact, sources in stale_entries:
+        cmd = rebuild_cmd(artifact, zig, ndk)
+        if not cmd:
+            print(f"STALE {artifact}")
+            for src, when in sorted(sources.items(), key=lambda p: -p[1]):
+                print(f"        behind {src} by {(when - _commit_cache.get(artifact, when)) // 86400} day(s)")
+            print(f"        (no local builder to verify; rebuild on its platform)")
+            still += 1
+            continue
+        tmp = artifact + ".verify"
+        r = subprocess.run([c for c in cmd if c] + ["-o", tmp],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"STALE {artifact}  (verify build failed; see below)")
+            print(r.stderr.strip()[-400:])
+            still += 1
+            continue
+        def sha(p):
+            with open(p, "rb") as f:
+                return hashlib.sha256(f.read()).hexdigest()
+        same = os.path.isfile(tmp) and sha(tmp) == sha(artifact)
+        if os.path.isfile(tmp):
+            os.remove(tmp)
+        if same:
+            print(f"ok    {artifact}  (date-stale but rebuild is byte-identical)")
+        else:
+            print(f"STALE {artifact}  (rebuild differs -- commit the fresh object)")
+            still += 1
+    return still
+
+
 def do_rebuild():
     import os, glob, shutil
     with open("_scratch/check_result.txt", "a", encoding="utf-8") as f:
@@ -273,8 +388,10 @@ def main():
     for arg in sys.argv[1:]:
         if arg.startswith("--group="):
             group = arg.split("=", 1)[1]
+        elif arg == "--verify":
+            pass
         else:
-            print(f"usage: {sys.argv[0]} [--group=runtime|gui|all]")
+            print(f"usage: {sys.argv[0]} [--group=runtime|gui|all] [--verify]")
             return 2
 
     all_paths = set()
@@ -286,6 +403,7 @@ def main():
     preload_commit_times(all_paths)
 
     stale = 0
+    stale_list = []
     for artifact, sources, kind in ARTIFACTS:
         if group != "all" and kind != group:
             continue
@@ -293,15 +411,20 @@ def main():
         if built is None:
             print(f"skip  {artifact} (not in the repo)")
             continue
-        newer = [(s, t) for s in sources
-                 for t in [last_commit(s)] if t and t > built]
+        newer = {s: t for s in sources
+                 for t in [last_commit(s)] if t and t > built}
         if not newer:
             print(f"ok    {artifact}")
             continue
         stale += 1
+        stale_list.append((artifact, newer))
         print(f"STALE {artifact}")
-        for src, when in sorted(newer, key=lambda p: -p[1]):
+        for src, when in sorted(newer.items(), key=lambda p: -p[1]):
             print(f"        behind {src} by {(when - built) // 86400} day(s)")
+    if "--verify" in sys.argv:
+        print("\nverifying date-stale artifacts by byte-comparing a fresh rebuild...")
+        stale = do_verify(stale_list)
+        print(f"(verify verdicts above replace the date findings)")
     if stale:
         print(f"\n{stale} artifact(s) need a rebuild on their own platform.")
     with open("_scratch/check_result.txt", "w", encoding="utf-8") as f:
