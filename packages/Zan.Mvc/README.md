@@ -4,66 +4,49 @@ Enterprise web application skeleton modeled on a production swoole (ZxPHP)
 framework, rebuilt on Zan's coroutine runtime — a layered controller/model
 structure, an external config file, and the ORM and cache wired in by default.
 
-Two layers sit under the application code:
+本包以**包（基座）**形态存在，不再是一个项目：应用按层 `using ZanWeb.*;`
+引用包源（zanc 自动发现拉入），框架随包升级，应用代码零改动——非侵入。
 
-- **`Zan.Mvc` package** (this package, `src/ZanWeb/…`) — the application
-  framework:
-  bootstrap (`ZanWeb.Boot`), config/DB/cache contexts, auth, RBAC, settings,
-  schema + seed hook, metrics, job host, the sys entities and their DAOs, and
-  the three controller base classes. Referenced by `using ZanWeb;` and pulled
-  in automatically.
-- **`System.Web` standard library** — the web kernel itself: `WebApp`,
-  `Router`, `HttpContext`, `Controller`, `View`, `WebServer`, next to
-  `RouteTable` / `RouteStats` / `PermTable`.
+分层两件事：
 
-The template keeps only what is its own: the composition root, business
-controllers/models/DAOs, the seed, views, static assets and config. Framework
-fixes land in the package — a package refresh updates this template without
-touching a line of its application code.
+- **`Zan.Mvc` 包（本目录）** — 应用框架层与管理台：引导（`ZanWeb.Boot`）、
+  配置/DB/缓存上下文、鉴权 RBAC、设置、Schema + 种子挂点、指标、任务宿主、
+  sys 实体与 DAO、三个控制器基类（`AppController` / `ApiController` /
+  `AdminController`），以及管理台与前台控制器、随包视图与静态资产。
+- **`System.Web` 标准库** — Web 内核：`WebApp`、`Router`、`HttpContext`、
+  `Controller`、`View`、`WebServer`，与 `RouteTable` / `RouteStats` /
+  `PermTable`。
+
+应用侧只保留业务：组合根（main.zan）、业务控制器/模型/DAO、种子、应用自有
+配置。框架修复落在包里——拉新包版本即完成更新。
 
 ## Layout
 
 ```
-config/app.json         runtime config (host/port/limits/db/cache) — NOT compiled in
-src/main.zan            composition root only: menu sections, route hook, seed
-                        registration, Boot.Run()
-src/Seed/BlogSeed.zan   business seed — registered via Schema.OnSeed hook
-src/Controller/         request handlers, one directory per module
-  Index/Index.zan         HTML landing page
-  Blog/Posts.zan          list / detail / comments / rss / sitemap (ORM + cache + views)
-  Account/Login.zan       GET/POST /admin/login, /admin/logout (own bare layout)
-  Admin/Dashboard.zan     GET /admin — metrics dashboard
-  Admin/Users.zan         GET /admin/system/users + enable/disable, force logout
-  Admin/Posts.zan         GET /admin/content/posts + publish/unpublish
-  Api/Auth.zan            POST /api/auth/login, GET /api/auth/me
-  User/Users.zan          /users, /user/{id}
-src/Dao/Blog/           every query and write for the blog module
-src/Model/Blog/         blog entities only: table structure, no queries
-views/                  templates, in the module structure of the controllers
-  layout.html             the site-wide page wrapper (global {{content}} layout)
-  <Module>/*.html         that module's views; a module's own layout.html
-                          overrides the global one for that module only
-wwwroot/                the ONLY web-reachable directory, served at /static
+zan.pkg                 包清单（版本随包演进）
+src/ZanWeb/             包源码：目录 = 命名空间，`using ZanWeb.<Ns>;` 自动拉入对应子树
+  Health.zan              免鉴权健康检查 /health（deep=1 探主库）
+  Account/                登录 / 注册 / 找回密码
+  Admin/                  管理台：Content · Dev(代码生成器) · Media · Monitor · System · Wiki
+  Api/                    JSON API（auth / menu / 摘要 / 文章 CRUD）
+  Blog/                   示例博客模块（Posts 控制器 + BlogSeed 种子）
+  Index/  User/           前台首页与演示
+  Dao/Blog/  Model/Blog/  示例模块的 DAO 与实体（查询/实体永不放控制器里）
+views/                  页面模板，按控制器模块分目录（随包资产）
+  layout.html             全站布局；模块自有 layout.html 仅覆盖本模块
+wwwroot/                唯一 Web 可达目录，挂载在 /static（css/js/vendor/i18n）
 ```
 
-The framework code (`ZanWeb` core, `Model.Sys`, `Dao.Sys`, the controller base
-classes) lives in this package under `src/ZanWeb/…`. Business models/DAOs follow
-the same per-module layout in the application (`src/Model/Blog`,
-`src/Dao/Blog`) — same convention, app-owned.
-
-`views/` and `wwwroot/` sit next to `src/`, not inside it, because both are read
-at run time: a release is a copy of the executable plus `config/`, `views/` and
-`wwwroot/` — `src/` is a build input and never ships. The view keys are
-unchanged by the split: `views/Admin/Users.Index.html` is still
-`Admin.Users.Index`, since `View.LoadRec` derives the key from the directory
-path and the module directories are the same ones the controllers use.
+视图键由 `View.LoadRec` 按目录路径推导（`views/Admin/System/SysUsers.Index.html`
+→ `Admin.System.SysUsers.Index`），与控制器命名空间同构——看到路径即知键名。
 
 ## Attribute-driven routes
 
-Controllers declare routing with **attributes** instead of hand-wiring in
-`main.zan` (the Zan equivalent of the PHP `@title/@auth/@rank` docblocks). A
-compiler pass scans the controllers and synthesizes `__AttrRoutes.Register(app)`,
-which `main.zan` calls once — no generated file to maintain, no reflection.
+Controllers declare routing with **attributes** instead of hand-wiring in the
+composition root (the Zan equivalent of the PHP `@title/@auth/@rank` docblocks).
+A compiler pass scans the compile unit's controllers (package-pulled ones
+included) and synthesizes `__AttrRoutes.Register(app)`, which the composition
+root calls once — no generated file to maintain, no reflection.
 
 ```zan
 class ApiController {
@@ -143,7 +126,7 @@ this.Abort(403, "1004", "不是作者本人");          // same uniform answer, 
 
 ## Built-in API documentation
 
-`main.zan` calls `ApiDocs.Mount(app)`; nothing else is written or generated by
+The composition root calls `ApiDocs.Mount(app)`; nothing else is written or generated by
 hand:
 
 - `GET /api/docs` — offline reference UI (no CDN, no bundler, dark mode)
@@ -197,7 +180,7 @@ crashing.
 
 | Capability | Where | Notes |
 |---|---|---|
-| Layered controllers | `src/controller/` | thin `main.zan`, one class per resource |
+| Layered controllers | `src/ZanWeb/` | thin composition root, one class per resource |
 | Default ORM | `src/model/`, `framework/Db.zan` | `System.Data.Orm` models, config-driven engine |
 | Default cache | `framework/Cache.zan` | in-memory TTL; Redis via `System.Data.Redis` on async path |
 | External config | `config/app.json`, `framework/Cfg.zan` | runtime-loaded, not compiled in |
@@ -229,7 +212,7 @@ Set `worker.count` in `config/app.json`:
 
 Restart-on-crash is delegated to the process supervisor (systemd
 `Restart=always`, Docker `restart: unless-stopped`, Kubernetes), the standard
-way to supervise horizontally scaled services. `main.zan` boots via
+way to supervise horizontally scaled services. 组合根 boots via
 `WebServer.RunCommand(app, count, daemon)` from the standard library, so the
 binary is a service that answers `start`, `start -d`, `stop`, `restart`,
 `reload` (rolling worker replacement) and `status` on the command line; the
@@ -240,7 +223,7 @@ on Linux only -- on Windows the process stays in the foreground (use NSSM or a
 Windows service to run it in the background). Listener handoff,
 respawn-on-crash, daemonization and the control port live in
 `System.Net.Worker` / `System.Diagnostics.ProcessHost`, so any server gets
-them, not just this template.
+them, not just this package.
 
 ## Observability (`GET /admin/stats`)
 
@@ -312,44 +295,45 @@ logged at the `[log].slowSqlMs` / `[log].slowMs` thresholds.
   history: history is the error log's and the metrics screens' job; the bell
   only answers "is anything wrong right now".
 
-## Run
+## 在应用中使用本包（组合根）
 
-Build & run from the IDE (output streams into the terminal panel), or from a
-shell — **build into `build/`, run from the project root**:
+应用不复制本包代码：源文件按层 `using`，zanc 自动发现并拉入包源（发现顺序：
+应用 `packages/` → 应用 `.zan-packages/` → 编译器旁 `packages/` → 全局包库）。
+组合根只声明菜单分组、路由挂点与业务种子：
 
-```
-zanc src/main.zan src/**/*.zan --auto-stdlib -o build/app.exe
-build/app.exe          # cwd = project root, so ./config/app.json and ./wwwroot resolve
-```
+```zan
+using System;
+using System.Web;
+using ZanWeb;
 
-The working directory matters more than where the binary sits: the server reads
-`config/app.json`, loads `views/`, serves `wwwroot/` and opens the SQLite file by
-RELATIVE path, so run it from the project root (or from a deploy directory that
-has those next to the executable) — never `cd build && ./app.exe`.
+class Program {
+    static void Main() {
+        /* 侧栏分组：URL 首段 → 显示名（管理台外壳与 /api/admin/menu 同读） */
+        MenuBuilder.Section("content", "内容管理");
+        MenuBuilder.Section("monitor", "运行监控");
+        MenuBuilder.Section("system", "系统管理");
 
-### Contract e2e (`tools/e2e_mvc.py`)
-
-A self-contained Python-stdlib suite that manages the whole lifecycle itself:
-it builds a sandbox under `_scratch/mvc_e2e/` (fresh DB, port 8299, memory
-cache, worker 1, views/wwwroot copied from the template), boots the server,
-runs ~120 HTTP/sqlite contract checks (auth, content, inline `data-quick`
-editing, table designer incl. real DDL migration, monitor, wiki, jobs,
-i18n, media, the full password-reset mail chain against a local SMTP catcher
-on port 8725, and the public-site discoverability pack: rss/sitemap/robots,
-tag archive, meta/OG, `site.url` roundtrip), stops the server via its
-control port and deletes the sandbox. It never kills by image name and
-touches nothing outside `_scratch/`.
-
-```
-python tools/e2e_mvc.py                 # build with zanc if no sandbox exe yet
-python tools/e2e_mvc.py --build         # force rebuild
-python tools/e2e_mvc.py --exe path/to/app.exe   # reuse an existing build
-                                        # (its sibling *.dll are staged too)
-python tools/e2e_mvc.py --keep          # keep the sandbox for inspection
+        Boot.OnRoutes(Program.RegisterRoutes);
+        int _r = await Boot.Run();
+    }
+    static void RegisterRoutes(WebApp app) {
+        __AttrRoutes.Register(app);   // 属性路由（编译期按单元元数据生成）
+    }
+}
 ```
 
-Exit code is 0 only when every check passes. Re-run it after any controller,
-view or admin.js change — it is the template's regression gate.
+框架升级 = 拉取新包版本，应用代码零改动（非侵入）。路由由编译器对整个编译
+单元（含包拉入的控制器）生成，包内管理台控制器与应用业务控制器同表注册。
+
+**随包资产**：`views/` 与 `wwwroot/` 随包分发，但视图引擎运行时只读一个根
+（`View.LoadDir`），所以应用发布目录需携带这两个目录与应用自有的
+`config/app.json`（配置永远是应用所有，不编译进二进制）——从包复制一次后
+归应用所有，框架更新不覆盖。
+
+### 回归验证
+
+包此前以项目形态携带的 144 断言 e2e（`tools/e2e_mvc.py`）随项目形态移除，
+作为应用侧回归套件保留在 git 历史中，需要时取回到消费本包的应用。
 
 ### Deploying
 
@@ -434,7 +418,7 @@ Console.WriteLine(users.ToDefineCode());               // print model source
 
 ## Static assets
 
-`main.zan` mounts `wwwroot/` at `/static` before auth and routing:
+The composition root mounts `wwwroot/` at `/static` before auth and routing:
 
 ```zan
 StaticFiles.Mount(app, "/static", "wwwroot");   // GET /static/css/app.css
