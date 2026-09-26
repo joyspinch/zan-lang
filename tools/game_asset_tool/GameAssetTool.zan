@@ -1,0 +1,1383 @@
+using System;
+using System.IO;
+using System.Json;
+using System.Text;
+using Gui;
+using Gui.Backend;
+using Gui.Widget;
+
+// =============================================================================
+// GameAssetTool -- 现代化游戏素材管理工作台（ZanIDE 内置可视化工具）
+//
+// 专为 2D / 2.5D 及等轴测游戏开发设计的全流程素材管理工具：
+// 1. 【5向/8向动作序列 Studio】：5方向对称切片管理、自动 8 方向水平镜像映射（FlipX）、
+//    实时多朝向骨架/动作循环播放器与 5DirSymmetricMirror JSON 导出；
+// 2. 【纸娃娃多层层深矩阵】：身体/衣服/武器/翅膀/发型挂件解耦、8方向动态深度矩阵、
+//    前后穿模实时检测与 PaperdollConfig 导出；
+// 3. 【纹理图集紧凑打包计算器】：最优 POT 幂次方纹理图集自动计算、利用率与显存估算、
+//    UV 归一化网格与 AtlasManifest JSON 导出；
+// 4. 【等轴测 2:1 地砖与碰撞切片】：2:1 菱形等轴测地砖投影、障碍/遮挡属性涂刷、
+//    水平线段连续合并优化模拟与 TilemapConfig 导出。
+//
+// 在 ZanIDE 中直接一键双击运行：
+//   构建命令：zanc tools/game_asset_tool/GameAssetTool.zan --auto-stdlib -o build/game_asset_tool.exe
+// =============================================================================
+
+namespace Tools.GameAsset;
+
+/// <summary>
+/// 常用字符串与数据转换工具。
+/// </summary>
+class ToolUtil {
+    public static string FromInt(int v) { return Convert.ToString(v); }
+
+    public static int ToInt(string s, int dflt) {
+        if (s == null || s.Length == 0) { return dflt; }
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        bool negative = false;
+        if (s.StartsWith("-")) {
+            negative = true;
+            i = 1;
+        }
+        while (i < s.Length) {
+            char c = s[i];
+            if (c >= '0' && c <= '9') {
+                sb.Append(c);
+            }
+            i = i + 1;
+        }
+        string digits = sb.ToString();
+        if (digits.Length == 0) { return dflt; }
+        int val = Convert.ToInt(digits);
+        return negative ? -val : val;
+    }
+}
+
+/// <summary>
+/// 纸娃娃部件层级定义。
+/// </summary>
+class PaperdollPart {
+    public string id;
+    public string name;
+    public int color;
+    public int[] depthPerDir; // 8 个方向的深度偏移（-50 ~ +50）
+
+    public PaperdollPart(string id, string name, int color, int[] depths) {
+        this.id = id;
+        this.name = name;
+        this.color = color;
+        this.depthPerDir = depths;
+    }
+}
+
+/// <summary>
+/// 游戏素材管理主工具类。
+/// </summary>
+class GameAssetTool {
+    static App app;
+    static int currentTab = 0; // 0: 5向/8向动作, 1: 纸娃娃层深, 2: 图集打包, 3: 等轴测瓦片
+    static string statusMsg = "就绪 - 游戏素材管理工作台";
+
+    // ---- Tab 0: 5向/8向动作序列帧数据 ----
+    static string spriteModel = "Warrior_Male";
+    static string spriteAction = "Walk";
+    static int spriteFrameCount = 6;
+    static int spriteFrameWidth = 128;
+    static int spriteFrameHeight = 128;
+    static int spriteFps = 10;
+    static int selectedDir8 = 2; // 0: East, 1: SouthEast, 2: South, 3: SouthWest, 4: West, 5: NorthWest, 6: North, 7: NorthEast
+    static bool animPlaying = true;
+    static int animCurrentFrame = 0;
+    static long lastAnimTick = 0;
+
+    // ---- Tab 1: 纸娃娃层深矩阵数据 ----
+    static List<PaperdollPart> paperdollParts;
+    static int selectedPartIndex = 0;
+    static int paperdollDir8 = 2; // 默认朝南
+
+    // ---- Tab 2: 纹理图集紧凑打包数据 ----
+    static string atlasName = "hero_spritesheet";
+    static int atlasFrameW = 128;
+    static int atlasFrameH = 128;
+    static int atlasTotalFrames = 30; // 5 方向 x 6 帧
+    static int atlasResultWidth = 1024;
+    static int atlasResultHeight = 512;
+    static int atlasResultCols = 8;
+    static int atlasResultRows = 4;
+    static int hoveredAtlasFrame = -1;
+
+    // ---- Tab 3: 等轴测 2:1 菱形地砖切片数据 ----
+    static int tileWidth = 64;
+    static int tileHeight = 32;
+    static int tileCols = 8;
+    static int tileRows = 8;
+    static int[] tileGrid; // 0: 平地, 1: 障碍, 2: 透明遮挡, 3: 刷怪点
+    static int tileBrush = 1; // 默认画障碍
+
+    // 导出的 JSON 文本缓冲区
+    static string exportedJsonText = "";
+
+    // 输入控件
+    static Input inputSpriteModel;
+    static Input inputSpriteWidth;
+    static Input inputSpriteHeight;
+    static Input inputSpriteFrames;
+    static Input inputSpriteFps;
+
+    static Input inputAtlasName;
+    static Input inputAtlasW;
+    static Input inputAtlasH;
+    static Input inputAtlasCount;
+
+    static void Main() {
+        InitData();
+        App a = App.CreateDark("GameAssetTool · 游戏素材管理工作台", 1280, 800);
+        GameAssetTool.app = a;
+        a.Show();
+        WidgetId.Mark();
+
+        while (a.isRunning) {
+            if (!a.ProcessEvent()) { break; }
+
+            // 推进动画时间轴
+            long now = Window.GetTickMs();
+            if (animPlaying && spriteFps > 0) {
+                long interval = 1000 / spriteFps;
+                if (now - lastAnimTick >= interval) {
+                    animCurrentFrame = (animCurrentFrame + 1) % spriteFrameCount;
+                    lastAnimTick = now;
+                    a.RequestRedraw();
+                }
+            }
+
+            a.BeginFrame();
+            WidgetId.ResetFrame();
+            Render(a);
+            a.RenderChrome("GameAssetTool · 游戏素材管理工作台");
+            a.PresentFrame();
+        }
+    }
+
+    static void InitData() {
+        // 1. 初始化输入框
+        inputSpriteModel = new Input("Warrior_Male");
+        inputSpriteModel.SetText("Warrior_Male");
+        inputSpriteWidth = new Input("128");
+        inputSpriteWidth.SetText("128");
+        inputSpriteHeight = new Input("128");
+        inputSpriteHeight.SetText("128");
+        inputSpriteFrames = new Input("6");
+        inputSpriteFrames.SetText("6");
+        inputSpriteFps = new Input("10");
+        inputSpriteFps.SetText("10");
+
+        inputAtlasName = new Input("hero_spritesheet");
+        inputAtlasName.SetText("hero_spritesheet");
+        inputAtlasW = new Input("128");
+        inputAtlasW.SetText("128");
+        inputAtlasH = new Input("128");
+        inputAtlasH.SetText("128");
+        inputAtlasCount = new Input("30");
+        inputAtlasCount.SetText("30");
+
+        // 2. 初始化纸娃娃部件与层深
+        paperdollParts = new List<PaperdollPart>();
+        // 朝向定义：0:E, 1:SE, 2:S(正面), 3:SW, 4:W, 5:NW, 6:N(背面), 7:NE
+        // 翅膀：正面在后(-20)，背面在外覆盖后背(+30)
+        paperdollParts.Add(new PaperdollPart("wing", "翅膀 (Wing)", (int)0xFF9C27B0, new int[] { -10, -15, -20, -15, -10, 20, 30, 20 }));
+        // 身体：基准层 (0)
+        paperdollParts.Add(new PaperdollPart("body", "身体 (Body)", (int)0xFF2196F3, new int[] { 0, 0, 0, 0, 0, 0, 0, 0 }));
+        // 衣服：贴身覆盖身体 (+5)
+        paperdollParts.Add(new PaperdollPart("cloth", "重铠 (Cloth)", (int)0xFF4CAF50, new int[] { 5, 5, 5, 5, 5, -5, -5, -5 }));
+        // 发型/头盔：头部上方 (+8)
+        paperdollParts.Add(new PaperdollPart("hair", "头盔 (Hair)", (int)0xFFFF9800, new int[] { 8, 8, 8, 8, 8, 10, 10, 10 }));
+        // 武器：正面握在胸前最外层(+10)，背面收在身后被身体阻挡(-30)
+        paperdollParts.Add(new PaperdollPart("weapon", "武器 (Weapon)", (int)0xFFE91E63, new int[] { 8, 10, 10, 10, 8, -15, -30, -15 }));
+
+        // 3. 计算图集初值
+        CalculateAtlasLayout();
+
+        // 4. 初始化等轴测瓦片网格
+        tileGrid = new int[tileCols * tileRows];
+        for (int i = 0; i < tileGrid.Length; i = i + 1) {
+            tileGrid[i] = 0; // 平地
+        }
+        // 默认放几个障碍测试
+        tileGrid[2 * tileCols + 3] = 1;
+        tileGrid[2 * tileCols + 4] = 1;
+        tileGrid[2 * tileCols + 5] = 1;
+        tileGrid[4 * tileCols + 2] = 2; // 透明掩码
+
+        UpdateJsonExport();
+    }
+
+    // ---- 全局布局与渲染 --------------------------------------------------------
+
+    static void Render(App a) {
+        Canvas c = a.canvas;
+        Theme t = a.theme;
+        int W = c.Width();
+        int H = c.Height();
+        int top = a.titlebarH;
+        int railW = a.Scale(180);
+        int statusH = a.Scale(32);
+
+        // 1. 背景底色
+        c.FillRect(0, top, W, H - top, t.bgPrimary);
+
+        // 2. 左侧导航轨
+        RenderSidebarRail(a, 0, top, railW, H - top - statusH);
+
+        // 3. 右侧主工作区
+        int bodyX = railW;
+        int bodyW = W - railW;
+        int bodyH = H - top - statusH;
+
+        if (currentTab == 0) {
+            RenderTabSpriteStudio(a, bodyX, top, bodyW, bodyH);
+        } else if (currentTab == 1) {
+            RenderTabPaperdoll(a, bodyX, top, bodyW, bodyH);
+        } else if (currentTab == 2) {
+            RenderTabAtlasPacker(a, bodyX, top, bodyW, bodyH);
+        } else {
+            RenderTabIsoTilemap(a, bodyX, top, bodyW, bodyH);
+        }
+
+        // 4. 底部状态与操作栏
+        RenderStatusBar(a, 0, H - statusH, W, statusH);
+    }
+
+    static void RenderSidebarRail(App a, int x, int y, int w, int h) {
+        Canvas c = a.canvas;
+        Theme t = a.theme;
+        c.FillRect(x, y, w, h, t.bgSecondary);
+        c.DrawLine(x + w - 1, y, x + w - 1, y + h, t.divider, 1);
+
+        // 顶部工作台标题
+        int pad = a.Scale(12);
+        c.DrawText(x + pad, y + a.Scale(16), "游戏素材工作台", t.textPrimary, t.fontSizeMedium);
+        c.DrawText(x + pad, y + a.Scale(36), "Game Asset Studio", t.textTertiary, t.fontSizeTiny);
+        c.DrawLine(x + pad, y + a.Scale(54), x + w - pad, y + a.Scale(54), t.divider, 1);
+
+        List<string> tabs = new List<string>();
+        tabs.Add("5向/8向动作序列");
+        tabs.Add("纸娃娃层深矩阵");
+        tabs.Add("纹理图集紧凑打包");
+        tabs.Add("等轴测瓦片切片");
+
+        List<string> subheads = new List<string>();
+        subheads.Add("5-Dir / 8-Dir Studio");
+        subheads.Add("Paperdoll Inspector");
+        subheads.Add("Atlas POT Packer");
+        subheads.Add("2:1 Isometric Slicer");
+
+        int itemH = a.Scale(50);
+        int iy = y + a.Scale(64);
+        int i = 0;
+        while (i < tabs.Count) {
+            int id = WidgetId.Next();
+            int btnX = x + a.Scale(8);
+            int btnW = w - a.Scale(16);
+            a.hitTester.RegisterRect(id, btnX, iy, btnW, itemH, 0);
+
+            bool active = currentTab == i;
+            int bg = t.bgSecondary;
+            if (active) { bg = t.bgActive; }
+            else if (Ui.Hovered(a, id)) { bg = t.bgHover; }
+
+            c.FillRoundRect(btnX, iy, btnW, itemH, t.borderRadiusSmall, bg);
+            if (active) {
+                // 左侧高亮指示条
+                c.FillRect(btnX, iy + a.Scale(8), a.Scale(3), itemH - a.Scale(16), t.primary);
+            }
+
+            int fg = active ? t.textPrimary : t.textSecondary;
+            c.DrawText(btnX + a.Scale(12), iy + a.Scale(10), tabs[i], fg, t.fontSizeSmall);
+            c.DrawText(btnX + a.Scale(12), iy + a.Scale(28), subheads[i], t.textTertiary, t.fontSizeTiny);
+
+            if (Ui.Clicked(a, id)) {
+                currentTab = i;
+                UpdateJsonExport();
+                a.RequestRedraw();
+            }
+
+            iy = iy + itemH + a.Scale(6);
+            i = i + 1;
+        }
+    }
+
+    static void RenderStatusBar(App a, int x, int y, int w, int h) {
+        Canvas c = a.canvas;
+        Theme t = a.theme;
+        c.FillRect(x, y, w, h, t.bgSecondary);
+        c.DrawLine(x, y, x + w, y, t.divider, 1);
+
+        // 状态信息
+        c.DrawText(x + a.Scale(16), y + (h - Canvas.FontHeight(t.fontSizeSmall)) / 2, statusMsg, t.textSecondary, t.fontSizeSmall);
+
+        // 右侧操作按钮
+        int btnW = a.Scale(110);
+        int btnH = a.Scale(24);
+        int btnY = y + (h - btnH) / 2;
+
+        int copyId = WidgetId.Next();
+        int copyX = x + w - a.Scale(16) - btnW;
+        a.hitTester.RegisterRect(copyId, copyX, btnY, btnW, btnH, 0);
+        int copyBg = Ui.Hovered(a, copyId) ? t.bgHover : t.bgPrimary;
+        c.FillRoundRect(copyX, btnY, btnW, btnH, t.borderRadiusSmall, copyBg);
+        c.DrawRoundRect(copyX, btnY, btnW, btnH, t.borderRadiusSmall, t.divider, 1);
+        c.DrawTextCentered(copyX, btnY, btnW, btnH, "复制 JSON 配置", t.textPrimary, t.fontSizeTiny);
+
+        if (Ui.Clicked(a, copyId)) {
+            Clipboard.SetText(exportedJsonText);
+            statusMsg = "已复制当前配置 JSON 到系统剪贴板！";
+            a.RequestRedraw();
+        }
+
+        int exportId = WidgetId.Next();
+        int exportX = copyX - a.Scale(12) - btnW;
+        a.hitTester.RegisterRect(exportId, exportX, btnY, btnW, btnH, 0);
+        int exportBg = Ui.Hovered(a, exportId) ? t.primary : (int)0xFF1976D2;
+        c.FillRoundRect(exportX, btnY, btnW, btnH, t.borderRadiusSmall, exportBg);
+        c.DrawTextCentered(exportX, btnY, btnW, btnH, "保存配置文件", (int)0xFFFFFFFF, t.fontSizeTiny);
+
+        if (Ui.Clicked(a, exportId)) {
+            SaveCurrentConfig();
+            a.RequestRedraw();
+        }
+    }
+
+    // =========================================================================
+    // Tab 0: 5向/8向动作序列帧管理 Studio
+    // =========================================================================
+
+    static void RenderTabSpriteStudio(App a, int x, int y, int w, int h) {
+        Canvas c = a.canvas;
+        Theme t = a.theme;
+        int pad = a.Scale(16);
+
+        // 左右分栏：左侧属性与 8 方向控制 (360px)，中间预览播放器，右侧 JSON
+        int leftW = a.Scale(340);
+        int rightW = a.Scale(360);
+        int centerW = w - leftW - rightW;
+
+        // ---- 左侧参数面板 ----
+        c.FillRect(x, y, leftW, h, t.bgSecondary);
+        c.DrawLine(x + leftW - 1, y, x + leftW - 1, y + h, t.divider, 1);
+
+        int cy = y + pad;
+        c.DrawText(x + pad, cy, "5方向对称与8向映射配置", t.textPrimary, t.fontSizeMedium);
+        cy = cy + a.Scale(24);
+        c.DrawText(x + pad, cy, "东侧3向(SE/E/NE)对称镜像到西侧(SW/W/NW)，立省37.5%显存", t.textTertiary, t.fontSizeTiny);
+        cy = cy + a.Scale(18);
+        c.DrawLine(x + pad, cy, x + leftW - pad, cy, t.divider, 1);
+        cy = cy + a.Scale(14);
+
+        // 角色模型名称
+        c.DrawText(x + pad, cy, "角色模型标识:", t.textSecondary, t.fontSizeSmall);
+        cy = cy + a.Scale(18);
+        inputSpriteModel.Render(a, x + pad, cy, leftW - pad * 2, t.heightSmall);
+        cy = cy + t.heightSmall + a.Scale(12);
+
+        // 动作模式选择
+        c.DrawText(x + pad, cy, "动作类型 (Action):", t.textSecondary, t.fontSizeSmall);
+        cy = cy + a.Scale(18);
+        string[] actions = new string[] { "Idle", "Walk", "Attack", "Cast", "Die" };
+        int actBtnW = (leftW - pad * 2 - a.Scale(8) * 4) / 5;
+        for (int i = 0; i < actions.Length; i = i + 1) {
+            int bid = WidgetId.Next();
+            int bx = x + pad + i * (actBtnW + a.Scale(8));
+            a.hitTester.RegisterRect(bid, bx, cy, actBtnW, t.heightSmall, 0);
+            bool isAct = spriteAction == actions[i];
+            int bbg = isAct ? t.primary : (Ui.Hovered(a, bid) ? t.bgHover : t.bgPrimary);
+            c.FillRoundRect(bx, cy, actBtnW, t.heightSmall, t.borderRadiusSmall, bbg);
+            c.DrawTextCentered(bx, cy, actBtnW, t.heightSmall, actions[i], isAct ? (int)0xFFFFFFFF : t.textPrimary, t.fontSizeTiny);
+            if (Ui.Clicked(a, bid)) {
+                spriteAction = actions[i];
+                UpdateJsonExport();
+                a.RequestRedraw();
+            }
+        }
+        cy = cy + t.heightSmall + a.Scale(16);
+
+        // 8 方向罗盘切换
+        c.DrawText(x + pad, cy, "当前朝向与镜像检查 (8-Direction):", t.textSecondary, t.fontSizeSmall);
+        cy = cy + a.Scale(20);
+
+        string[] dirNames = new string[] { "正东 (E)", "东南 (SE)", "正南 (S)", "西南 (SW)", "正西 (W)", "西北 (NW)", "正北 (N)", "东北 (NE)" };
+        bool[] isMirrored = new bool[] { false, false, false, true, true, true, false, false };
+        int[] srcRow = new int[] { 2, 1, 0, 1, 2, 3, 4, 3 };
+
+        for (int d = 0; d < 8; d = d + 1) {
+            int did = WidgetId.Next();
+            int dbx = x + pad + (d % 2) * ((leftW - pad * 2 - a.Scale(8)) / 2 + a.Scale(8));
+            int dby = cy + (d / 2) * (a.Scale(28) + a.Scale(6));
+            int dbw = (leftW - pad * 2 - a.Scale(8)) / 2;
+            int dbh = a.Scale(28);
+
+            a.hitTester.RegisterRect(did, dbx, dby, dbw, dbh, 0);
+            bool isSel = selectedDir8 == d;
+            int dbg = isSel ? t.bgActive : (Ui.Hovered(a, did) ? t.bgHover : t.bgPrimary);
+            c.FillRoundRect(dbx, dby, dbw, dbh, t.borderRadiusSmall, dbg);
+            c.DrawRoundRect(dbx, dby, dbw, dbh, t.borderRadiusSmall, isSel ? t.primary : t.divider, 1);
+
+            string tag = isMirrored[d] ? " [镜像]" : "";
+            int dfg = isSel ? t.primary : (isMirrored[d] ? t.info : t.textSecondary);
+            c.DrawText(dbx + a.Scale(8), dby + a.Scale(6), dirNames[d] + tag, dfg, t.fontSizeTiny);
+
+            if (Ui.Clicked(a, did)) {
+                selectedDir8 = d;
+                UpdateJsonExport();
+                a.RequestRedraw();
+            }
+        }
+        cy = cy + 4 * (a.Scale(28) + a.Scale(6)) + a.Scale(16);
+
+        // 动画控制条 (Play / Pause / Next Frame)
+        c.DrawText(x + pad, cy, "播放器控制:", t.textSecondary, t.fontSizeSmall);
+        cy = cy + a.Scale(20);
+
+        int playBtnW = a.Scale(80);
+        int playId = WidgetId.Next();
+        a.hitTester.RegisterRect(playId, x + pad, cy, playBtnW, t.heightSmall, 0);
+        c.FillRoundRect(x + pad, cy, playBtnW, t.heightSmall, t.borderRadiusSmall, animPlaying ? (int)0xFF388E3C : t.bgPrimary);
+        c.DrawTextCentered(x + pad, cy, playBtnW, t.heightSmall, animPlaying ? "暂停" : "播放", (int)0xFFFFFFFF, t.fontSizeSmall);
+        if (Ui.Clicked(a, playId)) {
+            animPlaying = !animPlaying;
+            a.RequestRedraw();
+        }
+
+        int stepId = WidgetId.Next();
+        int stepX = x + pad + playBtnW + a.Scale(8);
+        a.hitTester.RegisterRect(stepId, stepX, cy, playBtnW, t.heightSmall, 0);
+        c.FillRoundRect(stepX, cy, playBtnW, t.heightSmall, t.borderRadiusSmall, t.bgPrimary);
+        c.DrawRoundRect(stepX, cy, playBtnW, t.heightSmall, t.borderRadiusSmall, t.divider, 1);
+        c.DrawTextCentered(stepX, cy, playBtnW, t.heightSmall, "单步步进", t.textPrimary, t.fontSizeSmall);
+        if (Ui.Clicked(a, stepId)) {
+            animPlaying = false;
+            animCurrentFrame = (animCurrentFrame + 1) % spriteFrameCount;
+            a.RequestRedraw();
+        }
+
+        // 当前帧指示
+        string frameInfo = "帧: " + ToolUtil.FromInt(animCurrentFrame + 1) + " / " + ToolUtil.FromInt(spriteFrameCount);
+        c.DrawText(stepX + playBtnW + a.Scale(12), cy + a.Scale(6), frameInfo, t.textSecondary, t.fontSizeSmall);
+
+        // ---- 中间可视化播放舞台 ----
+        int centerX = x + leftW;
+        c.FillRect(centerX, y, centerW, h, t.bgPrimary);
+
+        // 舞台网格背景
+        DrawStageBackground(c, centerX, y, centerW, h);
+
+        // 舞台中央绘制当前帧角色与朝向演示
+        int stageCenterX = centerX + centerW / 2;
+        int stageCenterY = y + h / 2 - a.Scale(20);
+
+        // 绘制 2:1 等轴测地砖基底
+        DrawIsoDiamond(c, stageCenterX, stageCenterY + a.Scale(64), 160, 80, (int)0xFF2A2E39, (int)0xFF3F4656);
+
+        // 绘制朝向指示箭头与光环
+        DrawDirectionCompass(c, stageCenterX, stageCenterY + a.Scale(64), selectedDir8);
+
+        // 绘制角色骨架动作剪影
+        DrawCharacterSilhouette(c, stageCenterX, stageCenterY, selectedDir8, isMirrored[selectedDir8], animCurrentFrame, spriteAction);
+
+        // 顶部 HUD 标签
+        string mirrorStatus = isMirrored[selectedDir8]
+            ? "[GPU 镜像 FlipX = true] 复用原始切片行 " + ToolUtil.FromInt(srcRow[selectedDir8])
+            : "[原始方向切片行 " + ToolUtil.FromInt(srcRow[selectedDir8]) + "] 无镜像";
+        c.DrawTextCentered(centerX, y + a.Scale(20), centerW, a.Scale(24),
+            "当前朝向: " + dirNames[selectedDir8] + " | " + mirrorStatus,
+            isMirrored[selectedDir8] ? t.info : t.textPrimary, t.fontSizeMedium);
+
+        // 底部帧切片指示条
+        DrawFrameFilmStrip(c, centerX + a.Scale(30), y + h - a.Scale(70), centerW - a.Scale(60), a.Scale(44),
+            animCurrentFrame, spriteFrameCount);
+
+        // ---- 右侧标准 JSON 规范输出 ----
+        int rightX = centerX + centerW;
+        c.FillRect(rightX, y, rightW, h, t.bgSecondary);
+        c.DrawLine(rightX, y, rightX, y + h, t.divider, 1);
+
+        c.DrawText(rightX + pad, y + pad, "5DirSymmetricMirror 描述协议", t.textPrimary, t.fontSizeMedium);
+        c.DrawText(rightX + pad, y + pad + a.Scale(22), "对接 Game.Tools.AssetPipeline & Game.Arpg", t.textTertiary, t.fontSizeTiny);
+        c.DrawLine(rightX + pad, y + pad + a.Scale(42), rightX + rightW - pad, y + pad + a.Scale(42), t.divider, 1);
+
+        // JSON 文本框渲染
+        int jsonY = y + pad + a.Scale(50);
+        int jsonH = h - pad * 2 - a.Scale(50);
+        RenderCodeView(a, rightX + pad, jsonY, rightW - pad * 2, jsonH, exportedJsonText);
+    }
+
+    // =========================================================================
+    // Tab 1: 纸娃娃部位与 8 方向层深矩阵
+    // =========================================================================
+
+    static void RenderTabPaperdoll(App a, int x, int y, int w, int h) {
+        Canvas c = a.canvas;
+        Theme t = a.theme;
+        int pad = a.Scale(16);
+
+        int leftW = a.Scale(360);
+        int rightW = a.Scale(360);
+        int centerW = w - leftW - rightW;
+
+        // ---- 左侧：部件清单与 8 方向深度偏移编辑 ----
+        c.FillRect(x, y, leftW, h, t.bgSecondary);
+        c.DrawLine(x + leftW - 1, y, x + leftW - 1, y + h, t.divider, 1);
+
+        int cy = y + pad;
+        c.DrawText(x + pad, cy, "纸娃娃挂件与动态层深矩阵", t.textPrimary, t.fontSizeMedium);
+        cy = cy + a.Scale(24);
+        c.DrawText(x + pad, cy, "解决背面武器穿身、正面翅膀挡人等前后穿模问题", t.textTertiary, t.fontSizeTiny);
+        cy = cy + a.Scale(18);
+        c.DrawLine(x + pad, cy, x + leftW - pad, cy, t.divider, 1);
+        cy = cy + a.Scale(14);
+
+        // 部件列表选择
+        c.DrawText(x + pad, cy, "选择配置部件 (Part):", t.textSecondary, t.fontSizeSmall);
+        cy = cy + a.Scale(20);
+
+        int partItemH = a.Scale(32);
+        for (int p = 0; p < paperdollParts.Count; p = p + 1) {
+            PaperdollPart part = paperdollParts[p];
+            int pid = WidgetId.Next();
+            int pbx = x + pad;
+            int pbw = leftW - pad * 2;
+            a.hitTester.RegisterRect(pid, pbx, cy, pbw, partItemH, 0);
+
+            bool isSel = selectedPartIndex == p;
+            int pbg = isSel ? t.bgActive : (Ui.Hovered(a, pid) ? t.bgHover : t.bgPrimary);
+            c.FillRoundRect(pbx, cy, pbw, partItemH, t.borderRadiusSmall, pbg);
+
+            // 色块标识
+            c.FillRoundRect(pbx + a.Scale(6), cy + a.Scale(6), a.Scale(12), partItemH - a.Scale(12), a.Scale(2), part.color);
+            c.DrawText(pbx + a.Scale(26), cy + a.Scale(7), part.name, isSel ? t.primary : t.textPrimary, t.fontSizeSmall);
+
+            if (Ui.Clicked(a, pid)) {
+                selectedPartIndex = p;
+                UpdateJsonExport();
+                a.RequestRedraw();
+            }
+
+            cy = cy + partItemH + a.Scale(6);
+        }
+
+        cy = cy + a.Scale(12);
+        c.DrawLine(x + pad, cy, x + leftW - pad, cy, t.divider, 1);
+        cy = cy + a.Scale(12);
+
+        // 选中部件在 8 方向上的深度滑块调节
+        PaperdollPart curPart = paperdollParts[selectedPartIndex];
+        c.DrawText(x + pad, cy, "【" + curPart.name + "】8 方向深度偏移调整 (-50 ~ +50):", t.primary, t.fontSizeSmall);
+        cy = cy + a.Scale(22);
+
+        string[] dirLabels = new string[] { "正东 (E)", "东南 (SE)", "正南 (S正面)", "西南 (SW)", "正西 (W)", "西北 (NW)", "正北 (N背面)", "东北 (NE)" };
+        for (int d = 0; d < 8; d = d + 1) {
+            c.DrawText(x + pad, cy + a.Scale(2), dirLabels[d], t.textSecondary, t.fontSizeTiny);
+
+            // - 按钮
+            int decId = WidgetId.Next();
+            int decX = x + pad + a.Scale(110);
+            int decW = a.Scale(24);
+            int decH = a.Scale(20);
+            a.hitTester.RegisterRect(decId, decX, cy, decW, decH, 0);
+            c.FillRoundRect(decX, cy, decW, decH, a.Scale(2), t.bgPrimary);
+            c.DrawTextCentered(decX, cy, decW, decH, "-", t.textPrimary, t.fontSizeTiny);
+            if (Ui.Clicked(a, decId)) {
+                curPart.depthPerDir[d] = curPart.depthPerDir[d] - 5;
+                UpdateJsonExport();
+                a.RequestRedraw();
+            }
+
+            // 当前数值
+            int val = curPart.depthPerDir[d];
+            string valStr = (val > 0 ? "+" : "") + ToolUtil.FromInt(val);
+            c.DrawTextCentered(decX + decW, cy, a.Scale(46), decH, valStr, val >= 0 ? t.textPrimary : t.info, t.fontSizeSmall);
+
+            // + 按钮
+            int incId = WidgetId.Next();
+            int incX = decX + decW + a.Scale(46);
+            a.hitTester.RegisterRect(incId, incX, cy, decW, decH, 0);
+            c.FillRoundRect(incX, cy, decW, decH, a.Scale(2), t.bgPrimary);
+            c.DrawTextCentered(incX, cy, decW, decH, "+", t.textPrimary, t.fontSizeTiny);
+            if (Ui.Clicked(a, incId)) {
+                curPart.depthPerDir[d] = curPart.depthPerDir[d] + 5;
+                UpdateJsonExport();
+                a.RequestRedraw();
+            }
+
+            cy = cy + a.Scale(26);
+        }
+
+        // ---- 中间：当前朝向的多部件层级堆叠与穿模测试舞台 ----
+        int centerX = x + leftW;
+        c.FillRect(centerX, y, centerW, h, t.bgPrimary);
+        DrawStageBackground(c, centerX, y, centerW, h);
+
+        int stageCenterX = centerX + centerW / 2;
+        int stageCenterY = y + h / 2 - a.Scale(20);
+
+        // 朝向切换按钮行
+        int dirBarY = y + a.Scale(16);
+        c.DrawText(centerX + a.Scale(24), dirBarY + a.Scale(4), "切换测试朝向:", t.textSecondary, t.fontSizeSmall);
+        int dirBtnW = a.Scale(50);
+        int dirStartX = centerX + a.Scale(130);
+        for (int d = 0; d < 8; d = d + 1) {
+            int bid = WidgetId.Next();
+            int bx = dirStartX + d * (dirBtnW + a.Scale(6));
+            a.hitTester.RegisterRect(bid, bx, dirBarY, dirBtnW, a.Scale(26), 0);
+            bool isCur = paperdollDir8 == d;
+            int bg = isCur ? t.primary : (Ui.Hovered(a, bid) ? t.bgHover : t.bgSecondary);
+            c.FillRoundRect(bx, dirBarY, dirBtnW, a.Scale(26), t.borderRadiusSmall, bg);
+            string[] shortDirs = new string[] { "E", "SE", "S", "SW", "W", "NW", "N", "NE" };
+            c.DrawTextCentered(bx, dirBarY, dirBtnW, a.Scale(26), shortDirs[d], isCur ? (int)0xFFFFFFFF : t.textPrimary, t.fontSizeTiny);
+            if (Ui.Clicked(a, bid)) {
+                paperdollDir8 = d;
+                a.RequestRedraw();
+            }
+        }
+
+        // 绘制纸娃娃部件多层堆叠可视化
+        DrawPaperdollStack(c, stageCenterX, stageCenterY, paperdollDir8);
+
+        // ---- 右侧：当前朝向的实际绘制排序与配置 JSON ----
+        int rightX = centerX + centerW;
+        c.FillRect(rightX, y, rightW, h, t.bgSecondary);
+        c.DrawLine(rightX, y, rightX, y + h, t.divider, 1);
+
+        c.DrawText(rightX + pad, y + pad, "Paperdoll 动态深度排序表", t.textPrimary, t.fontSizeMedium);
+        c.DrawText(rightX + pad, y + pad + a.Scale(22), "每帧执行插入排序，彻底杜绝装备穿模", t.textTertiary, t.fontSizeTiny);
+        c.DrawLine(rightX + pad, y + pad + a.Scale(42), rightX + rightW - pad, y + pad + a.Scale(42), t.divider, 1);
+
+        // 渲染当前方向的图层排序结果
+        int stackY = y + pad + a.Scale(50);
+        RenderCurrentLayerSorting(a, rightX + pad, stackY, rightW - pad * 2, paperdollDir8);
+
+        int jsonY = stackY + a.Scale(180);
+        int jsonH = h - (jsonY - y) - pad;
+        RenderCodeView(a, rightX + pad, jsonY, rightW - pad * 2, jsonH, exportedJsonText);
+    }
+
+    // =========================================================================
+    // Tab 2: 纹理图集紧凑打包计算器 (Atlas Packer)
+    // =========================================================================
+
+    static void RenderTabAtlasPacker(App a, int x, int y, int w, int h) {
+        Canvas c = a.canvas;
+        Theme t = a.theme;
+        int pad = a.Scale(16);
+
+        int leftW = a.Scale(340);
+        int rightW = a.Scale(360);
+        int centerW = w - leftW - rightW;
+
+        // ---- 左侧：切片与图集规格输入 ----
+        c.FillRect(x, y, leftW, h, t.bgSecondary);
+        c.DrawLine(x + leftW - 1, y, x + leftW - 1, y + h, t.divider, 1);
+
+        int cy = y + pad;
+        c.DrawText(x + pad, cy, "纹理图集紧凑打包计算器", t.textPrimary, t.fontSizeMedium);
+        cy = cy + a.Scale(24);
+        c.DrawText(x + pad, cy, "自动计算最优 POT 2的幂次方规格与 UV 归一化网格", t.textTertiary, t.fontSizeTiny);
+        cy = cy + a.Scale(18);
+        c.DrawLine(x + pad, cy, x + leftW - pad, cy, t.divider, 1);
+        cy = cy + a.Scale(14);
+
+        c.DrawText(x + pad, cy, "图集名称 (Atlas Name):", t.textSecondary, t.fontSizeSmall);
+        cy = cy + a.Scale(18);
+        inputAtlasName.Render(a, x + pad, cy, leftW - pad * 2, t.heightSmall);
+        cy = cy + t.heightSmall + a.Scale(12);
+
+        c.DrawText(x + pad, cy, "单切片宽度 (Frame Width):", t.textSecondary, t.fontSizeSmall);
+        cy = cy + a.Scale(18);
+        inputAtlasW.Render(a, x + pad, cy, leftW - pad * 2, t.heightSmall);
+        cy = cy + t.heightSmall + a.Scale(12);
+
+        c.DrawText(x + pad, cy, "单切片高度 (Frame Height):", t.textSecondary, t.fontSizeSmall);
+        cy = cy + a.Scale(18);
+        inputAtlasH.Render(a, x + pad, cy, leftW - pad * 2, t.heightSmall);
+        cy = cy + t.heightSmall + a.Scale(12);
+
+        c.DrawText(x + pad, cy, "总切片帧数 (Total Frames):", t.textSecondary, t.fontSizeSmall);
+        cy = cy + a.Scale(18);
+        inputAtlasCount.Render(a, x + pad, cy, leftW - pad * 2, t.heightSmall);
+        cy = cy + t.heightSmall + a.Scale(16);
+
+        // 重新计算按钮
+        int calcBtnId = WidgetId.Next();
+        a.hitTester.RegisterRect(calcBtnId, x + pad, cy, leftW - pad * 2, t.heightMedium, 0);
+        int calcBg = Ui.Hovered(a, calcBtnId) ? t.primary : (int)0xFF1976D2;
+        c.FillRoundRect(x + pad, cy, leftW - pad * 2, t.heightMedium, t.borderRadiusSmall, calcBg);
+        c.DrawTextCentered(x + pad, cy, leftW - pad * 2, t.heightMedium, "重新计算最优图集规格", (int)0xFFFFFFFF, t.fontSizeSmall);
+
+        if (Ui.Clicked(a, calcBtnId)) {
+            atlasName = inputAtlasName.GetText();
+            atlasFrameW = ToolUtil.ToInt(inputAtlasW.GetText(), 128);
+            atlasFrameH = ToolUtil.ToInt(inputAtlasH.GetText(), 128);
+            atlasTotalFrames = ToolUtil.ToInt(inputAtlasCount.GetText(), 30);
+            CalculateAtlasLayout();
+            UpdateJsonExport();
+            statusMsg = "已重新解算图集尺寸：" + ToolUtil.FromInt(atlasResultWidth) + "x" + ToolUtil.FromInt(atlasResultHeight);
+            a.RequestRedraw();
+        }
+        cy = cy + t.heightMedium + a.Scale(20);
+
+        // 解算结果摘要展示
+        c.DrawLine(x + pad, cy, x + leftW - pad, cy, t.divider, 1);
+        cy = cy + a.Scale(14);
+        c.DrawText(x + pad, cy, "最优解算指标:", t.primary, t.fontSizeSmall);
+        cy = cy + a.Scale(22);
+
+        c.DrawText(x + pad, cy, "推荐 POT 尺寸: " + ToolUtil.FromInt(atlasResultWidth) + " x " + ToolUtil.FromInt(atlasResultHeight) + " px", t.textPrimary, t.fontSizeSmall);
+        cy = cy + a.Scale(20);
+        c.DrawText(x + pad, cy, "排布网格: " + ToolUtil.FromInt(atlasResultCols) + " 列 x " + ToolUtil.FromInt(atlasResultRows) + " 行", t.textSecondary, t.fontSizeSmall);
+        cy = cy + a.Scale(20);
+
+        int totalPixels = atlasTotalFrames * atlasFrameW * atlasFrameH;
+        int atlasPixels = atlasResultWidth * atlasResultHeight;
+        int usagePercent = atlasPixels > 0 ? (totalPixels * 100) / atlasPixels : 0;
+        c.DrawText(x + pad, cy, "显存利用率: " + ToolUtil.FromInt(usagePercent) + "%", usagePercent > 70 ? t.success : t.warning, t.fontSizeSmall);
+        cy = cy + a.Scale(20);
+
+        int vramBytes = atlasResultWidth * atlasResultHeight * 4; // RGBA32
+        int vramKb = vramBytes / 1024;
+        c.DrawText(x + pad, cy, "显存占用 (RGBA32): ~" + ToolUtil.FromInt(vramKb) + " KB", t.textSecondary, t.fontSizeSmall);
+
+        // ---- 中间：图集切片网格与 UV 交互预览 ----
+        int centerX = x + leftW;
+        c.FillRect(centerX, y, centerW, h, t.bgPrimary);
+        DrawStageBackground(c, centerX, y, centerW, h);
+
+        int atlasPreviewW = centerW - a.Scale(60);
+        int atlasPreviewH = h - a.Scale(100);
+        int previewX = centerX + a.Scale(30);
+        int previewY = y + a.Scale(50);
+
+        DrawAtlasGrid(a, c, previewX, previewY, atlasPreviewW, atlasPreviewH);
+
+        // ---- 右侧：标准 Atlas Manifest JSON ----
+        int rightX = centerX + centerW;
+        c.FillRect(rightX, y, rightW, h, t.bgSecondary);
+        c.DrawLine(rightX, y, rightX, y + h, t.divider, 1);
+
+        c.DrawText(rightX + pad, y + pad, "Atlas Manifest JSON 规范", t.textPrimary, t.fontSizeMedium);
+        c.DrawText(rightX + pad, y + pad + a.Scale(22), "生成切片像素与归一化 UV 坐标", t.textTertiary, t.fontSizeTiny);
+        c.DrawLine(rightX + pad, y + pad + a.Scale(42), rightX + rightW - pad, y + pad + a.Scale(42), t.divider, 1);
+
+        int jsonY = y + pad + a.Scale(50);
+        int jsonH = h - pad * 2 - a.Scale(50);
+        RenderCodeView(a, rightX + pad, jsonY, rightW - pad * 2, jsonH, exportedJsonText);
+    }
+
+    // =========================================================================
+    // Tab 3: 等轴测 2:1 菱形地砖切片与碰撞标记 (Tilemap Slicer)
+    // =========================================================================
+
+    static void RenderTabIsoTilemap(App a, int x, int y, int w, int h) {
+        Canvas c = a.canvas;
+        Theme t = a.theme;
+        int pad = a.Scale(16);
+
+        int leftW = a.Scale(340);
+        int rightW = a.Scale(360);
+        int centerW = w - leftW - rightW;
+
+        // ---- 左侧：等轴测网格与画笔工具 ----
+        c.FillRect(x, y, leftW, h, t.bgSecondary);
+        c.DrawLine(x + leftW - 1, y, x + leftW - 1, y + h, t.divider, 1);
+
+        int cy = y + pad;
+        c.DrawText(x + pad, cy, "2:1 等轴测地砖与碰撞标记", t.textPrimary, t.fontSizeMedium);
+        cy = cy + a.Scale(24);
+        c.DrawText(x + pad, cy, "支持菱形地砖双向映射与水平线段碰撞体合并优化", t.textTertiary, t.fontSizeTiny);
+        cy = cy + a.Scale(18);
+        c.DrawLine(x + pad, cy, x + leftW - pad, cy, t.divider, 1);
+        cy = cy + a.Scale(14);
+
+        c.DrawText(x + pad, cy, "地砖规格: " + ToolUtil.FromInt(tileWidth) + " x " + ToolUtil.FromInt(tileHeight) + " px (2:1 菱形)", t.textPrimary, t.fontSizeSmall);
+        cy = cy + a.Scale(22);
+        c.DrawText(x + pad, cy, "网格尺寸: " + ToolUtil.FromInt(tileCols) + " 列 x " + ToolUtil.FromInt(tileRows) + " 行", t.textSecondary, t.fontSizeSmall);
+        cy = cy + a.Scale(24);
+
+        // 画笔类型切换
+        c.DrawText(x + pad, cy, "选择涂刷属性 (Tile Brush):", t.textSecondary, t.fontSizeSmall);
+        cy = cy + a.Scale(18);
+
+        string[] brushNames = new string[] { "平地 (Ground)", "阻挡 (Solid 障碍)", "透明遮挡 (Alpha)", "出生点 (Spawn)" };
+        int[] brushColors = new int[] { (int)0xFF4CAF50, (int)0xFFF44336, (int)0xFF2196F3, (int)0xFFFF9800 };
+
+        for (int b = 0; b < brushNames.Length; b = b + 1) {
+            int bid = WidgetId.Next();
+            int bbx = x + pad;
+            int bbw = leftW - pad * 2;
+            int bbh = a.Scale(30);
+            a.hitTester.RegisterRect(bid, bbx, cy, bbw, bbh, 0);
+
+            bool isCur = tileBrush == b;
+            int bbg = isCur ? t.bgActive : (Ui.Hovered(a, bid) ? t.bgHover : t.bgPrimary);
+            c.FillRoundRect(bbx, cy, bbw, bbh, t.borderRadiusSmall, bbg);
+
+            c.FillRoundRect(bbx + a.Scale(6), cy + a.Scale(7), a.Scale(14), a.Scale(16), a.Scale(2), brushColors[b]);
+            c.DrawText(bbx + a.Scale(28), cy + a.Scale(7), brushNames[b], isCur ? t.primary : t.textPrimary, t.fontSizeSmall);
+
+            if (Ui.Clicked(a, bid)) {
+                tileBrush = b;
+                a.RequestRedraw();
+            }
+
+            cy = cy + bbh + a.Scale(6);
+        }
+
+        cy = cy + a.Scale(16);
+        c.DrawLine(x + pad, cy, x + leftW - pad, cy, t.divider, 1);
+        cy = cy + a.Scale(14);
+
+        // 碰撞体水平合并优化指标演示
+        c.DrawText(x + pad, cy, "连续水平碰撞体合并优化 (优化指标):", t.primary, t.fontSizeSmall);
+        cy = cy + a.Scale(22);
+
+        int rawSolidCount = 0;
+        for (int i = 0; i < tileGrid.Length; i = i + 1) {
+            if (tileGrid[i] == 1) { rawSolidCount = rawSolidCount + 1; }
+        }
+
+        // 计算水平连续合并后的线段数
+        int mergedCount = CalculateMergedCollidersCount();
+        int savedColliders = rawSolidCount - mergedCount;
+        int savedPercent = rawSolidCount > 0 ? (savedColliders * 100) / rawSolidCount : 0;
+
+        c.DrawText(x + pad, cy, "原始单格碰撞体: " + ToolUtil.FromInt(rawSolidCount) + " 个", t.textSecondary, t.fontSizeSmall);
+        cy = cy + a.Scale(20);
+        c.DrawText(x + pad, cy, "水平合并后碰撞体: " + ToolUtil.FromInt(mergedCount) + " 组连续线段", t.success, t.fontSizeSmall);
+        cy = cy + a.Scale(20);
+        c.DrawText(x + pad, cy, "遍历开销削减: " + ToolUtil.FromInt(savedPercent) + "% (杜绝接缝卡角)", t.info, t.fontSizeSmall);
+
+        // ---- 中间：2:1 等轴测菱形地砖编辑画布 ----
+        int centerX = x + leftW;
+        c.FillRect(centerX, y, centerW, h, t.bgPrimary);
+        DrawStageBackground(c, centerX, y, centerW, h);
+
+        int stageCenterX = centerX + centerW / 2;
+        int stageCenterY = y + a.Scale(90);
+
+        c.DrawTextCentered(centerX, y + a.Scale(16), centerW, a.Scale(24),
+            "点击或拖拽菱形网格涂刷属性 (当前画笔: " + brushNames[tileBrush] + ")", t.textPrimary, t.fontSizeMedium);
+
+        DrawIsoTilemapGrid(a, c, stageCenterX, stageCenterY);
+
+        // ---- 右侧：Tilemap 配置与合并碰撞体 JSON ----
+        int rightX = centerX + centerW;
+        c.FillRect(rightX, y, rightW, h, t.bgSecondary);
+        c.DrawLine(rightX, y, rightX, y + h, t.divider, 1);
+
+        c.DrawText(rightX + pad, y + pad, "Tilemap & Collider JSON", t.textPrimary, t.fontSizeMedium);
+        c.DrawText(rightX + pad, y + pad + a.Scale(22), "导出地砖属性表与合并后的线段碰撞流形", t.textTertiary, t.fontSizeTiny);
+        c.DrawLine(rightX + pad, y + pad + a.Scale(42), rightX + rightW - pad, y + pad + a.Scale(42), t.divider, 1);
+
+        int jsonY = y + pad + a.Scale(50);
+        int jsonH = h - pad * 2 - a.Scale(50);
+        RenderCodeView(a, rightX + pad, jsonY, rightW - pad * 2, jsonH, exportedJsonText);
+    }
+
+    // =========================================================================
+    // 渲染辅助函数与几何模拟
+    // =========================================================================
+
+    static void DrawStageBackground(Canvas c, int x, int y, int w, int h) {
+        c.FillRect(x, y, w, h, (int)0xFF1B1E24);
+        // 绘制微弱点阵或网格线
+        int step = 32;
+        int gridColor = (int)0xFF232730;
+        for (int gx = x; gx < x + w; gx = gx + step) {
+            c.DrawLine(gx, y, gx, y + h, gridColor, 1);
+        }
+        for (int gy = y; gy < y + h; gy = gy + step) {
+            c.DrawLine(x, gy, x + w, gy, gridColor, 1);
+        }
+    }
+
+    static void DrawIsoDiamond(Canvas c, int cx, int cy, int w, int h, int fillCol, int borderCol) {
+        int hw = w / 2;
+        int hh = h / 2;
+        // 菱形四点: top(cx, cy-hh), right(cx+hw, cy), bottom(cx, cy+hh), left(cx-hw, cy)
+        // 简易绘制填充
+        for (int dy = -hh; dy <= hh; dy = dy + 1) {
+            int spanW = (int)((double)hw * (1.0 - (double)Math.Abs(dy) / (double)hh));
+            if (spanW > 0) {
+                c.FillRect(cx - spanW, cy + dy, spanW * 2, 1, fillCol);
+            }
+        }
+        c.DrawLine(cx, cy - hh, cx + hw, cy, borderCol, 1);
+        c.DrawLine(cx + hw, cy, cx, cy + hh, borderCol, 1);
+        c.DrawLine(cx, cy + hh, cx - hw, cy, borderCol, 1);
+        c.DrawLine(cx - hw, cy, cx, cy - hh, borderCol, 1);
+    }
+
+    static void DrawDirectionCompass(Canvas c, int cx, int cy, int dir8) {
+        double[] angles = new double[] { 0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0 };
+        double rad = angles[dir8] * 3.14159265 / 180.0;
+        int r = 70;
+        int tx = cx + (int)(Math.Cos(rad) * (double)r);
+        int ty = cy + (int)(Math.Sin(rad) * (double)(r / 2)); // 2:1 扁平感
+
+        c.DrawLine(cx, cy, tx, ty, (int)0xFF00E676, 2);
+        c.FillCircle(tx, ty, 5, (int)0xFF00E676);
+    }
+
+    static void DrawCharacterSilhouette(Canvas c, int cx, int cy, int dir8, bool mirror, int frame, string action) {
+        // 基础动画位移参数
+        int bob = (frame % 2 == 1) ? -4 : 0;
+        if (action == "Attack") {
+            bob = (frame == 2 || frame == 3) ? -8 : 0;
+        }
+
+        int bodyY = cy + bob;
+        int flipSign = mirror ? -1 : 1;
+
+        // 头部
+        c.FillCircle(cx, bodyY - 45, 14, (int)0xFFFFCC80);
+        // 头盔/发型
+        c.FillRect(cx - 15, bodyY - 60, 30, 12, (int)0xFFFF9800);
+
+        // 躯干 (Cloth / Armor)
+        c.FillRoundRect(cx - 18, bodyY - 30, 36, 40, 4, (int)0xFF4CAF50);
+
+        // 翅膀 (根据朝向决定是在身体后面还是前面)
+        bool wingInFront = (dir8 == 5 || dir8 == 6 || dir8 == 7); // 背向时翅膀在外层
+        int wingColor = (int)0x809C27B0; // 半透紫
+
+        if (!wingInFront) {
+            c.FillRoundRect(cx - 45, bodyY - 40, 90, 24, 6, wingColor);
+        }
+
+        // 双腿
+        int legOffset = (frame % 4 < 2) ? 6 : -6;
+        c.FillRect(cx - 12 + legOffset, bodyY + 10, 8, 26, (int)0xFF37474F);
+        c.FillRect(cx + 4 - legOffset, bodyY + 10, 8, 26, (int)0xFF263238);
+
+        // 武器手持方向
+        int weaponX = cx + flipSign * 24;
+        int weaponY = bodyY - 10;
+        if (action == "Attack") {
+            weaponX = cx + flipSign * (30 + frame * 4);
+            weaponY = bodyY - 10 - frame * 3;
+        }
+
+        // 武器巨剑
+        c.FillRect(weaponX - 3, weaponY - 35, 6, 45, (int)0xFFE91E63);
+        c.FillRect(weaponX - 8, weaponY - 5, 16, 4, (int)0xFFFFD54F);
+
+        if (wingInFront) {
+            // 背面视角：翅膀绘制在最外层
+            c.FillRoundRect(cx - 50, bodyY - 38, 100, 26, 6, (int)0xD09C27B0);
+        }
+    }
+
+    static void DrawFrameFilmStrip(Canvas c, int x, int y, int w, int h, int curFrame, int totalFrames) {
+        c.FillRoundRect(x, y, w, h, 4, (int)0xFF22262E);
+        c.DrawRoundRect(x, y, w, h, 4, (int)0xFF383D48, 1);
+
+        int cellW = w / totalFrames;
+        for (int f = 0; f < totalFrames; f = f + 1) {
+            int fx = x + f * cellW;
+            bool isCurrent = f == curFrame;
+            if (isCurrent) {
+                c.FillRoundRect(fx + 2, y + 2, cellW - 4, h - 4, 3, (int)0xFF1976D2);
+            }
+            c.DrawRoundRect(fx + 2, y + 2, cellW - 4, h - 4, 3, (int)0xFF454B58, 1);
+            c.DrawTextCentered(fx, y, cellW, h, ToolUtil.FromInt(f + 1), isCurrent ? (int)0xFFFFFFFF : (int)0xFFB0B3B8, 12);
+        }
+    }
+
+    static void DrawPaperdollStack(Canvas c, int cx, int cy, int dir8) {
+        // 展示纸娃娃各图层沿 Z 轴的相对排列剖面图
+        c.DrawTextCentered(cx - 200, cy - 140, 400, 24, "【朝向 " + ToolUtil.FromInt(dir8) + "】部件实际层深渲染堆叠剖面", (int)0xFFFFFFFF, 14);
+
+        // 收集并排序
+        List<PaperdollPart> sorted = new List<PaperdollPart>();
+        for (int i = 0; i < paperdollParts.Count; i = i + 1) {
+            sorted.Add(paperdollParts[i]);
+        }
+
+        // 插入排序
+        for (int i = 1; i < sorted.Count; i = i + 1) {
+            PaperdollPart key = sorted[i];
+            int j = i - 1;
+            while (j >= 0 && sorted[j].depthPerDir[dir8] > key.depthPerDir[dir8]) {
+                sorted[j + 1] = sorted[j];
+                j = j - 1;
+            }
+            sorted[j + 1] = key;
+        }
+
+        // 从后往前绘制堆叠卡片
+        int startY = cy + 60;
+        int layerH = 34;
+        for (int i = 0; i < sorted.Count; i = i + 1) {
+            PaperdollPart p = sorted[i];
+            int ly = startY - i * layerH;
+            int lw = 260;
+            int lx = cx - lw / 2;
+
+            c.FillRoundRect(lx, ly, lw, layerH - 4, 4, (int)0xFF2A2E39);
+            c.FillRoundRect(lx + 4, ly + 4, 10, layerH - 12, 2, p.color);
+
+            int depth = p.depthPerDir[dir8];
+            string depthStr = "Depth: " + (depth > 0 ? "+" : "") + ToolUtil.FromInt(depth);
+            string orderStr = "#" + ToolUtil.FromInt(i + 1) + " (最" + (i == 0 ? "底" : (i == sorted.Count - 1 ? "顶" : "中")) + ")";
+
+            c.DrawText(lx + 24, ly + 6, p.name, (int)0xFFFFFFFF, 12);
+            c.DrawText(lx + 130, ly + 6, depthStr, (int)0xFF00E676, 12);
+            c.DrawText(lx + lw - 55, ly + 6, orderStr, (int)0xFFB0B3B8, 11);
+        }
+    }
+
+    static void RenderCurrentLayerSorting(App a, int x, int y, int w, int dir8) {
+        Canvas c = a.canvas;
+        Theme t = a.theme;
+
+        // 收集并排序
+        List<PaperdollPart> sorted = new List<PaperdollPart>();
+        for (int i = 0; i < paperdollParts.Count; i = i + 1) {
+            sorted.Add(paperdollParts[i]);
+        }
+        for (int i = 1; i < sorted.Count; i = i + 1) {
+            PaperdollPart key = sorted[i];
+            int j = i - 1;
+            while (j >= 0 && sorted[j].depthPerDir[dir8] > key.depthPerDir[dir8]) {
+                sorted[j + 1] = sorted[j];
+                j = j - 1;
+            }
+            sorted[j + 1] = key;
+        }
+
+        c.DrawText(x, y, "渲染绘制队列 (从底到顶执行):", t.textSecondary, t.fontSizeSmall);
+        y = y + a.Scale(20);
+
+        for (int i = 0; i < sorted.Count; i = i + 1) {
+            PaperdollPart p = sorted[i];
+            int rowH = a.Scale(24);
+            int bg = (i % 2 == 0) ? t.bgPrimary : t.bgSecondary;
+            c.FillRoundRect(x, y, w, rowH, 2, bg);
+            c.FillRect(x + 2, y + 2, a.Scale(4), rowH - 4, p.color);
+
+            int depth = p.depthPerDir[dir8];
+            string line = ToolUtil.FromInt(i + 1) + ". " + p.name + " (偏移 " + (depth > 0 ? "+" : "") + ToolUtil.FromInt(depth) + ")";
+            c.DrawText(x + a.Scale(12), y + a.Scale(4), line, t.textPrimary, t.fontSizeTiny);
+            y = y + rowH + a.Scale(2);
+        }
+    }
+
+    static void DrawAtlasGrid(App a, Canvas c, int x, int y, int w, int h) {
+        c.FillRect(x, y, w, h, (int)0xFF21252D);
+        c.DrawRoundRect(x, y, w, h, 4, (int)0xFF3B404D, 1);
+
+        int cols = atlasResultCols > 0 ? atlasResultCols : 1;
+        int rows = atlasResultRows > 0 ? atlasResultRows : 1;
+        int cellW = w / cols;
+        int cellH = h / rows;
+
+        for (int r = 0; r < rows; r = r + 1) {
+            for (int col = 0; col < cols; col = col + 1) {
+                int frameIdx = r * cols + col;
+                int cx = x + col * cellW;
+                int cy = y + r * cellH;
+
+                if (frameIdx < atlasTotalFrames) {
+                    bool isHovered = a.mouseX >= cx && a.mouseX < cx + cellW && a.mouseY >= cy && a.mouseY < cy + cellH;
+                    int bg = isHovered ? (int)0xFF2E3B52 : (int)0xFF282D37;
+                    c.FillRect(cx + 1, cy + 1, cellW - 2, cellH - 2, bg);
+                    c.DrawRect(cx + 1, cy + 1, cellW - 2, cellH - 2, isHovered ? (int)0xFF00E676 : (int)0xFF3F4554, 1);
+
+                    // 绘制小人形动作剪影
+                    int dir = frameIdx / 6;
+                    int subFrame = frameIdx % 6;
+                    c.FillCircle(cx + cellW / 2, cy + cellH / 2 - 8, 8, (int)0xFFFFCC80);
+                    c.FillRoundRect(cx + cellW / 2 - 10, cy + cellH / 2 + 2, 20, 16, 2, (int)0xFF4CAF50);
+
+                    // 标号与 UV
+                    c.DrawText(cx + 4, cy + 4, "#" + ToolUtil.FromInt(frameIdx), (int)0xFFB0B3B8, 10);
+                    if (isHovered) {
+                        double u0 = (double)(col * atlasFrameW) / (double)atlasResultWidth;
+                        double v0 = (double)(r * atlasFrameH) / (double)atlasResultHeight;
+                        string uvText = "U:" + ToolUtil.FromInt((int)(u0 * 100)) + "% V:" + ToolUtil.FromInt((int)(v0 * 100)) + "%";
+                        c.DrawText(cx + 4, cy + cellH - 14, uvText, (int)0xFF00E676, 10);
+                    }
+                } else {
+                    // 空余空白显存区域
+                    c.FillRect(cx + 1, cy + 1, cellW - 2, cellH - 2, (int)0xFF1B1D22);
+                    c.DrawTextCentered(cx, cy, cellW, cellH, "(空闲)", (int)0xFF4A4E58, 10);
+                }
+            }
+        }
+    }
+
+    static void DrawIsoTilemapGrid(App a, Canvas c, int originX, int originY) {
+        int hw = tileWidth / 2;
+        int hh = tileHeight / 2;
+
+        int[] brushColors = new int[] { (int)0xFF2E323B, (int)0xFFD32F2F, (int)0xFF1976D2, (int)0xFFFFA000 };
+        int[] brushBorders = new int[] { (int)0xFF454B58, (int)0xFFFF5252, (int)0xFF448AFF, (int)0xFFFFD740 };
+
+        for (int gy = 0; gy < tileRows; gy = gy + 1) {
+            for (int gx = 0; gx < tileCols; gx = gx + 1) {
+                // 等轴测 2:1 双向投影公式：
+                // sx = originX + (gx - gy) * hw
+                // sy = originY + (gx + gy) * hh
+                int sx = originX + (gx - gy) * hw;
+                int sy = originY + (gx + gy) * hh;
+
+                int idx = gy * tileCols + gx;
+                int kind = tileGrid[idx];
+
+                // 交互点击判定
+                int tid = WidgetId.Next();
+                a.hitTester.RegisterRect(tid, sx - hw, sy - hh, tileWidth, tileHeight, 0);
+
+                bool isHover = Ui.Hovered(a, tid);
+                int fillCol = brushColors[kind];
+                int borderCol = isHover ? (int)0xFF00E676 : brushBorders[kind];
+
+                DrawIsoDiamond(c, sx, sy, tileWidth, tileHeight, fillCol, borderCol);
+
+                if (Ui.Clicked(a, tid) || (Ui.Pressed(a, tid) && a.window.EventKind() == 1)) {
+                    tileGrid[idx] = tileBrush;
+                    UpdateJsonExport();
+                    a.RequestRedraw();
+                }
+
+                // 标号
+                if (kind != 0) {
+                    string tag = kind == 1 ? "阻" : (kind == 2 ? "透" : "怪");
+                    c.DrawTextCentered(sx - hw, sy - hh, tileWidth, tileHeight, tag, (int)0xFFFFFFFF, 11);
+                }
+            }
+        }
+    }
+
+    static int CalculateMergedCollidersCount() {
+        // 水平线段合并统计：扫描每行连续的障碍块
+        int count = 0;
+        for (int r = 0; r < tileRows; r = r + 1) {
+            bool inSolid = false;
+            for (int col = 0; col < tileCols; col = col + 1) {
+                int cell = tileGrid[r * tileCols + col];
+                if (cell == 1) {
+                    if (!inSolid) {
+                        count = count + 1;
+                        inSolid = true;
+                    }
+                } else {
+                    inSolid = false;
+                }
+            }
+        }
+        return count;
+    }
+
+    static void CalculateAtlasLayout() {
+        int fw = atlasFrameW > 0 ? atlasFrameW : 64;
+        int fh = atlasFrameH > 0 ? atlasFrameH : 64;
+        int count = atlasTotalFrames > 0 ? atlasTotalFrames : 1;
+
+        int totalArea = fw * fh * count;
+        int side = 256;
+        while ((side * side) < totalArea && side < 4096) {
+            side = side * 2;
+        }
+
+        int cols = side / fw;
+        if (cols < 1) { cols = 1; }
+        int rows = (count + cols - 1) / cols;
+
+        int requiredH = rows * fh;
+        int h = 256;
+        while (h < requiredH && h < 4096) {
+            h = h * 2;
+        }
+
+        atlasResultWidth = side;
+        atlasResultHeight = h;
+        atlasResultCols = cols;
+        atlasResultRows = rows;
+    }
+
+    static void RenderCodeView(App a, int x, int y, int w, int h, string code) {
+        Canvas c = a.canvas;
+        Theme t = a.theme;
+        c.FillRoundRect(x, y, w, h, t.borderRadiusSmall, t.bgPrimary);
+        c.DrawRoundRect(x, y, w, h, t.borderRadiusSmall, t.divider, 1);
+
+        c.PushClip(x, y, w, h);
+        int pad = a.Scale(8);
+        int lineH = a.Scale(16);
+        int cy = y + pad;
+
+        int start = 0;
+        int lineIdx = 0;
+        while (start < code.Length && cy < y + h - pad) {
+            int end = code.IndexOf("\n", start);
+            string line = "";
+            if (end < 0) {
+                line = code.Substring(start, code.Length - start);
+                start = code.Length;
+            } else {
+                line = code.Substring(start, end - start);
+                start = end + 1;
+            }
+
+            int fg = t.textSecondary;
+            if (line.Contains("\"")) { fg = t.info; }
+            if (line.Contains(":")) { fg = t.textPrimary; }
+
+            c.DrawText(x + pad, cy, line, fg, t.fontSizeTiny);
+            cy = cy + lineH;
+            lineIdx = lineIdx + 1;
+        }
+        c.PopClip();
+    }
+
+    static void UpdateJsonExport() {
+        if (currentTab == 0) {
+            // Tab 0: 5DirSymmetricMirror JSON
+            JsonValue root = JsonValue.NewObject();
+            root.PutStr("model", spriteModel);
+            root.PutStr("action", spriteAction);
+            root.PutStr("mode", "5DirSymmetricMirror");
+            root.PutInt("frameCount", spriteFrameCount);
+            root.PutInt("fps", spriteFps);
+
+            JsonValue dirArr = JsonValue.NewArray();
+            string[] dirNames = new string[] { "East", "SouthEast", "South", "SouthWest", "West", "NorthWest", "North", "NorthEast" };
+            int[] mappedSource = new int[] { 2, 1, 0, 1, 2, 3, 4, 3 };
+            bool[] flipX = new bool[] { false, false, false, true, true, true, false, false };
+
+            for (int i = 0; i < 8; i = i + 1) {
+                JsonValue item = JsonValue.NewObject();
+                item.PutInt("directionIndex", i);
+                item.PutStr("directionName", dirNames[i]);
+                item.PutInt("sourceSliceRow", mappedSource[i]);
+                item.PutBool("flipX", flipX[i]);
+                dirArr.Append(item);
+            }
+            root.Put("directions", dirArr);
+            exportedJsonText = root.ToJson();
+        } else if (currentTab == 1) {
+            // Tab 1: PaperdollConfig JSON
+            JsonValue root = JsonValue.NewObject();
+            root.PutStr("kind", "PaperdollConfig");
+            root.PutInt("partCount", paperdollParts.Count);
+
+            JsonValue partArr = JsonValue.NewArray();
+            for (int i = 0; i < paperdollParts.Count; i = i + 1) {
+                PaperdollPart p = paperdollParts[i];
+                JsonValue pj = JsonValue.NewObject();
+                pj.PutStr("id", p.id);
+                pj.PutStr("name", p.name);
+
+                JsonValue depths = JsonValue.NewArray();
+                for (int d = 0; d < 8; d = d + 1) {
+                    depths.Append(JsonValue.NewInt(p.depthPerDir[d]));
+                }
+                pj.Put("depthPerDir", depths);
+                partArr.Append(pj);
+            }
+            root.Put("parts", partArr);
+            exportedJsonText = root.ToJson();
+        } else if (currentTab == 2) {
+            // Tab 2: Atlas Manifest JSON
+            JsonValue root = JsonValue.NewObject();
+            root.PutStr("atlasName", atlasName);
+            root.PutInt("atlasWidth", atlasResultWidth);
+            root.PutInt("atlasHeight", atlasResultHeight);
+            root.PutInt("frameWidth", atlasFrameW);
+            root.PutInt("frameHeight", atlasFrameH);
+            root.PutInt("cols", atlasResultCols);
+            root.PutInt("rows", atlasResultRows);
+            root.PutInt("totalFrames", atlasTotalFrames);
+
+            JsonValue framesArr = JsonValue.NewArray();
+            for (int i = 0; i < atlasTotalFrames; i = i + 1) {
+                int c = i % atlasResultCols;
+                int r = i / atlasResultCols;
+                int px = c * atlasFrameW;
+                int py = r * atlasFrameH;
+                double u0 = (double)px / (double)atlasResultWidth;
+                double v0 = (double)py / (double)atlasResultHeight;
+                double u1 = (double)(px + atlasFrameW) / (double)atlasResultWidth;
+                double v1 = (double)(py + atlasFrameH) / (double)atlasResultHeight;
+
+                JsonValue fj = JsonValue.NewObject();
+                fj.PutInt("id", i);
+                fj.PutInt("px", px);
+                fj.PutInt("py", py);
+                fj.PutDouble("u0", u0);
+                fj.PutDouble("v0", v0);
+                fj.PutDouble("u1", u1);
+                fj.PutDouble("v1", v1);
+                framesArr.Append(fj);
+            }
+            root.Put("frames", framesArr);
+            exportedJsonText = root.ToJson();
+        } else {
+            // Tab 3: Isometric Tilemap JSON
+            JsonValue root = JsonValue.NewObject();
+            root.PutStr("kind", "IsometricTilemap");
+            root.PutInt("tileWidth", tileWidth);
+            root.PutInt("tileHeight", tileHeight);
+            root.PutInt("cols", tileCols);
+            root.PutInt("rows", tileRows);
+
+            JsonValue gridArr = JsonValue.NewArray();
+            for (int i = 0; i < tileGrid.Length; i = i + 1) {
+                gridArr.Append(JsonValue.NewInt(tileGrid[i]));
+            }
+            root.Put("tiles", gridArr);
+
+            // 导出合并后的碰撞体
+            JsonValue collidersArr = JsonValue.NewArray();
+            for (int r = 0; r < tileRows; r = r + 1) {
+                int startCol = -1;
+                for (int col = 0; col < tileCols; col = col + 1) {
+                    if (tileGrid[r * tileCols + col] == 1) {
+                        if (startCol < 0) { startCol = col; }
+                    } else {
+                        if (startCol >= 0) {
+                            JsonValue cj = JsonValue.NewObject();
+                            cj.PutInt("row", r);
+                            cj.PutInt("startCol", startCol);
+                            cj.PutInt("endCol", col - 1);
+                            cj.PutInt("length", col - startCol);
+                            collidersArr.Append(cj);
+                            startCol = -1;
+                        }
+                    }
+                }
+                if (startCol >= 0) {
+                    JsonValue cj = JsonValue.NewObject();
+                    cj.PutInt("row", r);
+                    cj.PutInt("startCol", startCol);
+                    cj.PutInt("endCol", tileCols - 1);
+                    cj.PutInt("length", tileCols - startCol);
+                    collidersArr.Append(cj);
+                }
+            }
+            root.Put("mergedColliders", collidersArr);
+            exportedJsonText = root.ToJson();
+        }
+    }
+
+    static void SaveCurrentConfig() {
+        string fname = "asset_config.json";
+        if (currentTab == 0) { fname = "5dir_mapping_" + spriteModel + ".json"; }
+        else if (currentTab == 1) { fname = "paperdoll_depth_matrix.json"; }
+        else if (currentTab == 2) { fname = atlasName + "_manifest.json"; }
+        else { fname = "iso_tilemap_colliders.json"; }
+
+        File.WriteAllText(fname, exportedJsonText);
+        statusMsg = "成功导出配置文件: " + fname;
+    }
+}
