@@ -25,20 +25,27 @@ structure, an external config file, and the ORM and cache wired in by default.
 ```
 zan.pkg                 包清单（版本随包演进）
 src/ZanWeb/             包源码：目录 = 命名空间，`using ZanWeb.<Ns>;` 自动拉入对应子树
+  Core/                   基建层：Boot 引导 · Cfg 配置 · Db/DbContext · Schema · Gen 代码生成器
+  Web/                    接入层基座：App/Api/AdminController 三基类 · AppServices ·
+                          Crud 网关 · ListPage/FormPage 屏基座 · Fmt/Lang/Prose 渲染件
+  Services/               业务支撑层：JobHost 任务宿主 · Cache/CacheContext · Metrics ·
+                          Mailer · ClusterBus/Presence · Settings
+  Security/               横切层：Auth · Perm/PermTable · DataScope · Keys · LoginThrottle · VerifyCode
+  Ai/                     横切层：AI 接入与端点策略
+  Model/  Dao/            数据层：sys_* 实体与 DAO（每表一个 DAO，全部查询与写入口）
+  Account/ Admin/ Api/    接入层业务控制器，按模块分目录（登录注册 / 管理台 / JSON API）
+  Blog/  Index/  User/    示例博客（控制器+种子）· 前台首页 · 演示
   Health.zan              免鉴权健康检查 /health（deep=1 探主库）
-  Account/                登录 / 注册 / 找回密码
-  Admin/                  管理台：Content · Dev(代码生成器) · Media · Monitor · System · Wiki
-  Api/                    JSON API（auth / menu / 摘要 / 文章 CRUD）
-  Blog/                   示例博客模块（Posts 控制器 + BlogSeed 种子）
-  Index/  User/           前台首页与演示
-  Dao/Blog/  Model/Blog/  示例模块的 DAO 与实体（查询/实体永不放控制器里）
+  Model/Blog/  Dao/Blog/  示例模块的实体与 DAO
 views/                  页面模板，按控制器模块分目录（随包资产）
   layout.html             全站布局；模块自有 layout.html 仅覆盖本模块
 wwwroot/                唯一 Web 可达目录，挂载在 /static（css/js/vendor/i18n）
 ```
 
-视图键由 `View.LoadRec` 按目录路径推导（`views/Admin/System/SysUsers.Index.html`
-→ `Admin.System.SysUsers.Index`），与控制器命名空间同构——看到路径即知键名。
+目录分层即四层架构：基建 `Core/` → 接入 `Web/` + 各模块控制器 → 业务支撑
+`Services/` → 数据 `Model/`·`Dao/`；`Security/`·`Ai/` 横切。视图键由
+`View.LoadRec` 按目录路径推导（`views/Admin/System/SysUsers.Index.html` →
+`Admin.System.SysUsers.Index`），与控制器命名空间同构——看到路径即知键名。
 
 ## Attribute-driven routes
 
@@ -322,8 +329,19 @@ class Program {
 }
 ```
 
-框架升级 = 拉取新包版本，应用代码零改动（非侵入）。路由由编译器对整个编译
-单元（含包拉入的控制器）生成，包内管理台控制器与应用业务控制器同表注册。
+框架升级 = 拉取新包版本，应用代码零改动（非侵入）。
+
+**构建必须把包源与应用源一起显式列出**。属性路由与代码生成器只扫描显式
+列出的源文件；`using` 纯拉入路径下，包文件若从未被代码按名引用（控制器恰
+是靠属性发现、从不被引用）不会进入编译单元元数据——程序能编译、能启动、
+静态资产正常，但控制器路由静默缺失（404）。此编译器缺陷已定位（pull-in
+live-name 闭包所致，修复后纯 `using` 引用即可），当前消费配方：
+
+```sh
+zanc src/main.zan src/**/*.zan \
+     packages/Zan.Mvc/src/ZanWeb/**/*.zan \
+     --auto-stdlib -o build/app.exe
+```
 
 **随包资产**：`views/` 与 `wwwroot/` 随包分发，但视图引擎运行时只读一个根
 （`View.LoadDir`），所以应用发布目录需携带这两个目录与应用自有的

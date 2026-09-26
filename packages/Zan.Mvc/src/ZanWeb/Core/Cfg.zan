@@ -1,0 +1,417 @@
+using System;
+using System.IO;
+using System.Json;
+using ZanWeb.Security;
+using ZanWeb.Services;
+
+namespace ZanWeb.Core;
+
+/* [server] 配置。*/
+class ServerCfg {
+    string name;
+    string mode;
+    string host;
+    int port;
+    int maxBodyMB;
+    int uploadBodyMB;
+    int globalLimitPerSec;
+
+    static ServerCfg Defaults() {
+        ServerCfg c = new ServerCfg();
+        c.name = "app";
+        c.mode = "full";
+        c.host = "127.0.0.1";
+        c.port = 8080;
+        c.maxBodyMB = 2;
+        c.uploadBodyMB = 64;
+        c.globalLimitPerSec = 0;
+        return c;
+    }
+}
+
+/* [database.readOnly] 只读从库配置：开启后读写分离，查询借用从库连接池，写与事务走主库。*/
+class DatabaseReadOnlyCfg {
+    bool enabled;
+    string driver;
+    string sqlitePath;
+    string host;
+    int port;
+    string name;
+    string user;
+    string password;
+    int poolSize;
+
+    static DatabaseReadOnlyCfg Defaults() {
+        DatabaseReadOnlyCfg c = new DatabaseReadOnlyCfg();
+        c.enabled = false;
+        c.driver = "sqlite";
+        c.sqlitePath = "app.db";
+        c.host = "127.0.0.1";
+        c.port = 3306;
+        c.name = "app";
+        c.user = "root";
+        c.password = "";
+        c.poolSize = 8;
+        return c;
+    }
+}
+
+/* [cors] 跨域资源共享配置。*/
+class CorsCfg {
+    bool enabled;
+    string allowOrigin;
+    string allowMethods;
+    string allowHeaders;
+    bool allowCredentials;
+    int maxAge;
+
+    static CorsCfg Defaults() {
+        CorsCfg c = new CorsCfg();
+        c.enabled = true;
+        c.allowOrigin = "*";
+        c.allowMethods = "GET, POST, PUT, DELETE, OPTIONS";
+        c.allowHeaders = "Content-Type, Authorization, X-Request-Id";
+        c.allowCredentials = false;
+        c.maxAge = 86400;
+        return c;
+    }
+}
+
+/* [database] 配置。*/
+class DatabaseCfg {
+    string driver;
+    string sqlitePath;
+    string host;
+    int port;
+    string name;
+    string user;
+    string password;
+    /* 每个 worker 进程独立池的最大连接数；全服务最多 poolSize * worker.count。*/
+    int poolSize;
+    DatabaseReadOnlyCfg readOnly;
+
+    static DatabaseCfg Defaults() {
+        DatabaseCfg c = new DatabaseCfg();
+        c.driver = "sqlite";
+        c.sqlitePath = "app.db";
+        c.host = "127.0.0.1";
+        c.port = 3306;
+        c.name = "app";
+        c.user = "root";
+        c.password = "";
+        c.poolSize = 8;
+        c.readOnly = DatabaseReadOnlyCfg.Defaults();
+        return c;
+    }
+}
+
+/* [worker] 配置。*/
+class WorkerCfg {
+    int count;
+    bool daemon;
+
+    static WorkerCfg Defaults() {
+        WorkerCfg c = new WorkerCfg();
+        c.count = 1;
+        c.daemon = false;
+        return c;
+    }
+}
+
+/* [log] 配置。*/
+class LogCfg {
+    bool access;
+    int slowMs;
+    /* 慢 SQL 阈值，达此值即记入日志并计数。*/
+    int slowSqlMs;
+    /* 按日日志目录，"" 禁用文件输出。*/
+    string dir;
+    /* 日志文件名模式，每次写入展开。*/
+    string pattern;
+    /* 错误日志文件，"" 禁用。*/
+    string errorLog;
+    /* 同时向控制台输出错误，生产环境关闭。*/
+    bool debug;
+
+    static LogCfg Defaults() {
+        LogCfg c = new LogCfg();
+        c.access = false;
+        c.slowMs = 1000;
+        /* 故意低于请求阈值：单个 SQL 超过 200ms 已属异常。*/
+        c.slowSqlMs = 200;
+        c.dir = "logs";
+        c.pattern = "{yyyy}{MM}/{dd}.log";
+        c.errorLog = "logs/{yyyy}{MM}/{dd}.log";
+        c.debug = false;
+        return c;
+    }
+}
+
+/* [metrics] 配置：指标历史存储位置和刷写频率。请求仅累加分钟桶，不直接写入。*/
+class MetricsCfg {
+    bool enabled;
+    /* 独立的 SQLite 文件。*/
+    string path;
+    /* 定时刷写间隔（秒）；60 = 一分钟。*/
+    int flushSeconds;
+    /* 达到此行数也触发刷写。*/
+    int flushRows;
+    /* 保留天数，每小时清理。*/
+    int keepDays;
+    /* 顶栏告警阈值：5 分钟窗错误率百分比、参与评估的最少调用数（避免低流量
+       误报）、P95 耗时毫秒。任一为 0 关闭对应检查；铃铛轮询
+       /admin/monitor/alerts 时评估。*/
+    int alertErrPct;
+    int alertErrCalls;
+    int alertP95Ms;
+
+    static MetricsCfg Defaults() {
+        MetricsCfg c = new MetricsCfg();
+        c.enabled = true;
+        c.path = "metrics.db";
+        c.flushSeconds = 60;
+        c.flushRows = 2000;
+        c.keepDays = 30;
+        c.alertErrPct = 5;
+        c.alertErrCalls = 20;
+        c.alertP95Ms = 2000;
+        return c;
+    }
+}
+
+/* [auth] 配置。*/
+class AuthCfg {
+    /* 会话 Cookie 加密密钥（≥32 字符）。空则拒绝登录，防止伪造 Cookie。*/
+    string secret;
+    /* PBKDF2 口令哈希轮数（下限 1000，默认 300000 ≈ 0.17s/次）。
+       轮数随哈希落库（pbkdf2$ 自描述格式），调整只影响新写入。*/
+    int iter;
+
+    static AuthCfg Defaults() {
+        AuthCfg c = new AuthCfg();
+        c.secret = "";
+        c.iter = 300000;
+        return c;
+    }
+}
+
+/* [cache] 配置。*/
+class CacheCfg {
+    string driver;
+    string redisHost;
+    int redisPort;
+    int poolSize;
+    int connectTimeoutMs;
+
+    static CacheCfg Defaults() {
+        CacheCfg c = new CacheCfg();
+        c.driver = "memory";
+        c.redisHost = "127.0.0.1";
+        c.redisPort = 6379;
+        c.poolSize = 8;
+        c.connectTimeoutMs = 3000;
+        return c;
+    }
+}
+
+/* [job] 配置：定时任务调度器。*/
+class JobCfg {
+    bool enabled;
+
+    static JobCfg Defaults() {
+        JobCfg c = new JobCfg();
+        c.enabled = true;
+        return c;
+    }
+}
+
+/* [cluster] 配置：跨物理节点状态同步总线。
+   enabled: false（默认保持单机高性能共享内存 PermTable + 本地 verUids，零网络开销）。
+   当多机集群部署时设为 true，自动启用 Redis Pub/Sub 广播状态失效事件。*/
+class ClusterCfg {
+    bool enabled;
+    string bus;
+    string channel;
+
+    static ClusterCfg Defaults() {
+        ClusterCfg c = new ClusterCfg();
+        c.enabled = false;
+        c.bus = "redis";
+        c.channel = "zanweb:cluster:events";
+        return c;
+    }
+}
+
+/* 运行时配置：启动时从 config/app.json 加载一次为全局强类型实体，通过 Cfg.Server.port 等直接访问。无编译期固化，改配置后重启生效。*/
+class Cfg {
+    static ServerCfg Server = ServerCfg.Defaults();
+    static DatabaseCfg Db = DatabaseCfg.Defaults();
+    static WorkerCfg Worker = WorkerCfg.Defaults();
+    static LogCfg Log = LogCfg.Defaults();
+    static CacheCfg Cache = CacheCfg.Defaults();
+    static AuthCfg Auth = AuthCfg.Defaults();
+    static MetricsCfg Metrics = MetricsCfg.Defaults();
+    static JobCfg Job = JobCfg.Defaults();
+    static ClusterCfg Cluster = ClusterCfg.Defaults();
+    static CorsCfg Cors = CorsCfg.Defaults();
+    static bool loaded = false;
+
+    /* 依次查找约定的配置文件，找到后叠加到内置默认值之上。*/
+    static void Load(string relPath) {
+        loaded = true;
+        List<string> cands = new List<string>();
+        if (relPath.Length > 0) { cands.Add(relPath); }
+        cands.Add("config/app.json");
+        cands.Add("app.json");
+        cands.Add("../config/app.json");
+        JsonValue root = null;
+        for (int i = 0; i < cands.Count; i = i + 1) {
+            if (File.Exists(cands[i])) {
+                string txt = File.ReadAllText(cands[i]);
+                if (txt.Length > 0) {
+                    root = JsonValue.ParseLenient(txt);
+                    Console.WriteLine("[config] loaded " + cands[i]);
+                    break;
+                }
+            }
+        }
+        if (root == null) {
+            Console.WriteLine("[config] no config file found; using built-in defaults");
+            Cfg.ApplyEnv();
+            return;
+        }
+        Cfg.Apply(root);
+        Cfg.ApplyEnv();
+    }
+
+    /* 环境变量覆盖，最后应用：部署时不改文件即可指向其他数据库。密码等敏感值应放在此处。*/
+    static void ApplyEnv() {
+        Cfg.Db.driver = Cfg.EnvStr("ZAN_DB_DRIVER", Cfg.Db.driver);
+        Cfg.Db.host = Cfg.EnvStr("ZAN_DB_HOST", Cfg.Db.host);
+        Cfg.Db.port = Cfg.EnvInt("ZAN_DB_PORT", Cfg.Db.port);
+        Cfg.Db.name = Cfg.EnvStr("ZAN_DB_NAME", Cfg.Db.name);
+        Cfg.Db.user = Cfg.EnvStr("ZAN_DB_USER", Cfg.Db.user);
+        Cfg.Db.password = Cfg.EnvStr("ZAN_DB_PASSWORD", Cfg.Db.password);
+        Cfg.Db.sqlitePath = Cfg.EnvStr("ZAN_DB_SQLITE_PATH", Cfg.Db.sqlitePath);
+        Cfg.Db.poolSize = Cfg.EnvInt("ZAN_DB_POOL_SIZE", Cfg.Db.poolSize);
+        Cfg.Cache.redisHost = Cfg.EnvStr("ZAN_REDIS_HOST", Cfg.Cache.redisHost);
+        Cfg.Cache.redisPort = Cfg.EnvInt("ZAN_REDIS_PORT", Cfg.Cache.redisPort);
+        Cfg.Worker.count = Cfg.EnvInt("ZAN_WORKERS", Cfg.Worker.count);
+        Cfg.Auth.secret = Cfg.EnvStr("ZAN_AUTH_SECRET", Cfg.Auth.secret);
+        Cfg.Auth.iter = Cfg.EnvInt("ZAN_AUTH_PBKDF2_ITER", Cfg.Auth.iter);
+        Cfg.Job.enabled = Cfg.EnvBool("ZAN_JOB_ENABLED", Cfg.Job.enabled);
+        Cfg.Cluster.enabled = Cfg.EnvBool("ZAN_CLUSTER_ENABLED", Cfg.Cluster.enabled);
+    }
+
+    static bool EnvBool(string name, bool fallback) {
+        string v = ProcessHost.Env(name);
+        if (v.Length == 0) { return fallback; }
+        if (v == "1" || v == "true" || v == "TRUE") { return true; }
+        if (v == "0" || v == "false" || v == "FALSE") { return false; }
+        return fallback;
+    }
+
+    static string EnvStr(string name, string fallback) {
+        string v = ProcessHost.Env(name);
+        if (v.Length == 0) { return fallback; }
+        return v;
+    }
+
+    static int EnvInt(string name, int fallback) {
+        string v = ProcessHost.Env(name);
+        if (v.Length == 0) { return fallback; }
+        int n = Convert.ToInt32(v);
+        if (n <= 0) { return fallback; }
+        return n;
+    }
+
+    static JsonValue Sec(JsonValue root, string name) {
+        JsonValue v = root.Get(name);
+        if (v == null) { return JsonValue.NewObject(); }
+        if (!v.IsObject()) { return JsonValue.NewObject(); }
+        return v;
+    }
+
+    static void Apply(JsonValue root) {
+        JsonValue s = Cfg.Sec(root, "server");
+        Cfg.Server.name = s.Str("name", Cfg.Server.name);
+        Cfg.Server.mode = s.Str("mode", Cfg.Server.mode);
+        Cfg.Server.host = s.Str("host", Cfg.Server.host);
+        Cfg.Server.port = s.Int("port", Cfg.Server.port);
+        Cfg.Server.maxBodyMB = s.Int("maxBodyMB", Cfg.Server.maxBodyMB);
+        Cfg.Server.uploadBodyMB = s.Int("uploadBodyMB", Cfg.Server.uploadBodyMB);
+        Cfg.Server.globalLimitPerSec = s.Int("globalLimitPerSec", Cfg.Server.globalLimitPerSec);
+
+        JsonValue d = Cfg.Sec(root, "database");
+        Cfg.Db.driver = d.Str("driver", Cfg.Db.driver);
+        Cfg.Db.sqlitePath = d.Str("sqlitePath", Cfg.Db.sqlitePath);
+        Cfg.Db.host = d.Str("host", Cfg.Db.host);
+        Cfg.Db.port = d.Int("port", Cfg.Db.port);
+        Cfg.Db.name = d.Str("name", Cfg.Db.name);
+        Cfg.Db.user = d.Str("user", Cfg.Db.user);
+        Cfg.Db.password = d.Str("password", Cfg.Db.password);
+        Cfg.Db.poolSize = d.Int("poolSize", Cfg.Db.poolSize);
+
+        JsonValue ro = Cfg.Sec(d, "readOnly");
+        Cfg.Db.readOnly.enabled = ro.Bool("enabled", Cfg.Db.readOnly.enabled);
+        Cfg.Db.readOnly.driver = ro.Str("driver", Cfg.Db.readOnly.driver);
+        Cfg.Db.readOnly.sqlitePath = ro.Str("sqlitePath", Cfg.Db.readOnly.sqlitePath);
+        Cfg.Db.readOnly.host = ro.Str("host", Cfg.Db.readOnly.host);
+        Cfg.Db.readOnly.port = ro.Int("port", Cfg.Db.readOnly.port);
+        Cfg.Db.readOnly.name = ro.Str("name", Cfg.Db.readOnly.name);
+        Cfg.Db.readOnly.user = ro.Str("user", Cfg.Db.readOnly.user);
+        Cfg.Db.readOnly.password = ro.Str("password", Cfg.Db.readOnly.password);
+        Cfg.Db.readOnly.poolSize = ro.Int("poolSize", Cfg.Db.readOnly.poolSize);
+
+        JsonValue w = Cfg.Sec(root, "worker");
+        Cfg.Worker.count = w.Int("count", Cfg.Worker.count);
+        Cfg.Worker.daemon = w.Bool("daemon", Cfg.Worker.daemon);
+
+        JsonValue l = Cfg.Sec(root, "log");
+        Cfg.Log.access = l.Bool("access", Cfg.Log.access);
+        Cfg.Log.slowMs = l.Int("slowMs", Cfg.Log.slowMs);
+        Cfg.Log.slowSqlMs = l.Int("slowSqlMs", Cfg.Log.slowSqlMs);
+        Cfg.Log.dir = l.Str("dir", Cfg.Log.dir);
+        Cfg.Log.pattern = l.Str("pattern", Cfg.Log.pattern);
+        Cfg.Log.errorLog = l.Str("errorLog", Cfg.Log.errorLog);
+        Cfg.Log.debug = l.Bool("debug", Cfg.Log.debug);
+
+        JsonValue mt = Cfg.Sec(root, "metrics");
+        Cfg.Metrics.enabled = mt.Bool("enabled", Cfg.Metrics.enabled);
+        Cfg.Metrics.path = mt.Str("path", Cfg.Metrics.path);
+        Cfg.Metrics.flushSeconds = mt.Int("flushSeconds", Cfg.Metrics.flushSeconds);
+        Cfg.Metrics.flushRows = mt.Int("flushRows", Cfg.Metrics.flushRows);
+        Cfg.Metrics.keepDays = mt.Int("keepDays", Cfg.Metrics.keepDays);
+        Cfg.Metrics.alertErrPct = mt.Int("alertErrPct", Cfg.Metrics.alertErrPct);
+        Cfg.Metrics.alertErrCalls = mt.Int("alertErrCalls", Cfg.Metrics.alertErrCalls);
+        Cfg.Metrics.alertP95Ms = mt.Int("alertP95Ms", Cfg.Metrics.alertP95Ms);
+
+        JsonValue c = Cfg.Sec(root, "cache");
+        Cfg.Cache.driver = c.Str("driver", Cfg.Cache.driver);
+        Cfg.Cache.redisHost = c.Str("redisHost", Cfg.Cache.redisHost);
+        Cfg.Cache.redisPort = c.Int("redisPort", Cfg.Cache.redisPort);
+        Cfg.Cache.poolSize = c.Int("poolSize", Cfg.Cache.poolSize);
+        Cfg.Cache.connectTimeoutMs = c.Int(
+            "connectTimeoutMs", Cfg.Cache.connectTimeoutMs);
+
+        JsonValue a = Cfg.Sec(root, "auth");
+        Cfg.Auth.secret = a.Str("secret", Cfg.Auth.secret);
+        Cfg.Auth.iter = a.Int("iter", Cfg.Auth.iter);
+
+        JsonValue j = Cfg.Sec(root, "job");
+        Cfg.Job.enabled = j.Bool("enabled", Cfg.Job.enabled);
+
+        JsonValue cl = Cfg.Sec(root, "cluster");
+        Cfg.Cluster.enabled = cl.Bool("enabled", Cfg.Cluster.enabled);
+        Cfg.Cluster.bus = cl.Str("bus", Cfg.Cluster.bus);
+        Cfg.Cluster.channel = cl.Str("channel", Cfg.Cluster.channel);
+
+        JsonValue co = Cfg.Sec(root, "cors");
+        Cfg.Cors.enabled = co.Bool("enabled", Cfg.Cors.enabled);
+        Cfg.Cors.allowOrigin = co.Str("allowOrigin", Cfg.Cors.allowOrigin);
+        Cfg.Cors.allowMethods = co.Str("allowMethods", Cfg.Cors.allowMethods);
+        Cfg.Cors.allowHeaders = co.Str("allowHeaders", Cfg.Cors.allowHeaders);
+        Cfg.Cors.allowCredentials = co.Bool("allowCredentials", Cfg.Cors.allowCredentials);
+        Cfg.Cors.maxAge = co.Int("maxAge", Cfg.Cors.maxAge);
+    }
+}
