@@ -113,6 +113,21 @@ class Goods : CrudScreen {
 表不要声明批量删除**——批量删不过行级占用钩子（Categories 即如此：只有
 行删带占用检查）。
 
+### 与 OneAdmin/adminUI 的对照（借鉴结论）
+
+本引擎与 `D:\project\admin\OneAdmin`（后端）+ `adminUI`（前端）那套
+TableConfig/FormConfig 体系架构同构：约定端点（conf/list/save/field/
+batch/delete/options）、服务端下发表格配置、列即表单。借鉴落地的：
+字段单点声明（对方 buildFallbackFormConfig 的"从列推导表单"在这里是
+构造保证——可写列天然就是表单）、控件类型收敛（对方 29 种收敛到 10 种
+的教训，这里只留 text/area/int/opts/pass/time 六种）、`Pick(url)` 远程
+选项筛选（对方 OptionsUrl + `{api}/options` 约定）、`Pattern()` 校验
+（对方收敛后的 {required,min,max,pattern} 规则集）。明确不搬的：字段
+联动四件套（visibleWhen 等）——需要前端求值器，管理对话框规模下暂无
+必要；字典驱动 Opts（sys_dict 接入留待首个真实需求）；用户级列配置
+持久化（属前端 zan-table 职责）；弹窗 LayerConfig 式配置爆炸（对方自
+认的历史包袱）。
+
 ## Attribute-driven routes
 
 Controllers declare routing with **attributes** instead of hand-wiring in the
