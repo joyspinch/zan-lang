@@ -42,9 +42,10 @@ src/ZanWeb/             包源码。目录是工程组织（Framework/Modules �
       Model/  Dao/          数据层：sys_* 实体与 DAO（每表一个 DAO，全部查询
                             与写入口）；Model/Blog/、Dao/Blog/ 为示例模块
     Crud/                   配置驱动管理屏引擎
-      Controller/             CrudScreen.zan——接入层基座（继承
+      Controller/             CrudScreenController.zan——接入层基座（继承
                               AppController 即控制器，无论是否自带路由）
-      CrudConf.zan            声明 schema（非控制器非实体，挂模块根）
+      Model/                  CrudConf.zan——屏面声明模型（描述字段/表单/
+                              校验的数据模型，非表实体）
 views/                  页面模板，按控制器模块分目录（随包资产）
   layout.html             全站布局；模块自有 layout.html 仅覆盖本模块
 wwwroot/                唯一 Web 可达目录，挂载在 /static（css/js/vendor/i18n）
@@ -79,7 +80,7 @@ wwwroot/                唯一 Web 可达目录，挂载在 /static（css/js/ven
 [Route("admin/shop/goods/[action]")]
 [Custom(Authorization = CustomAuthorization.Grant)]
 [Description("商品管理")]
-class Goods : CrudScreen {
+class Goods : CrudScreenController {
     override CrudConf Def() {
         return CrudConf.Of("shop_goods", "商品管理", "admin/shop/goods")
             .Col("id", "ID", "num", "70px")
