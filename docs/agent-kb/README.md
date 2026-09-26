@@ -20,6 +20,8 @@
 | [stability.md](stability.md) | 防闪退：异常边界在哪、已知闪退根因、稳定性规约、发布前门禁 |
 | [diagnostics-reporting.md](diagnostics-reporting.md) | 帮助与反馈面板：错误采集、脱敏、上报协议（服务端后做） |
 | [gaps.md](gaps.md) | 小助手要能独立做出项目，还缺什么（现状 → 缺口 → 落地形式） |
+| [coding-standards.md](coding-standards.md) | 改 `src/` 的 C 代码前后：编译器 C11 开发标准与提交前检查单（原 CODING_STANDARDS.md） |
+| [bootstrap.md](bootstrap.md) | 碰自举/自托管：三代 fixpoint 流程与字节等值验证（原 BOOTSTRAP.md） |
 
 ## 三条硬规矩
 

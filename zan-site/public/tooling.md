@@ -121,7 +121,7 @@ tools/zan-mcp.exe . --host 0.0.0.0 --token-env ZAN_MCP_TOKEN --read-only  # HTTP
 - `--frozen-tools`：跨工作区保持工具目录稳定；不可用工具仍返回诊断。
 - 每个请求都要 Bearer 授权（`--token-env` 注入环境变量）。
 
-### 契约（docs/ai-assist.md 定义）
+### 契约（tools/ai_pack/docs/ai-assist.md 定义）
 
 - **路径约束**：所有路径相对单一 workspace 根，绝对路径/`..` 拒绝——
   AI 不需要也**不允许**乱翻根目录以外的文件。
@@ -149,5 +149,5 @@ tools/zan-mcp.exe . --host 0.0.0.0 --token-env ZAN_MCP_TOKEN --read-only  # HTTP
 - [AI 开发助手入口（文档地图）](/ai) — 本套文档的检索指南
 - [语言参考](/lang) — 语法能力与工具链细节
 - [GUI 指南](/gui) — 界面开发
-- 仓库内：`docs/ai-assist.md`（RepoMap+MCP 契约）、`docs/MCP_HOSTING.md`
+- 仓库内：`tools/ai_pack/docs/ai-assist.md`（RepoMap+MCP 契约）、`tools/ai_pack/docs/MCP_HOSTING.md`
   （部署）、`docs/agent-kb/`（方法论：workflow/debugging/testing/project-map）

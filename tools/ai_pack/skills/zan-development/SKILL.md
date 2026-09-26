@@ -9,7 +9,7 @@ description: The fixed workflow for writing or changing Zan code with the Zan SD
 
 MCP connected: `zan_start_here` → layout, entry point, build/test commands,
 which optional tools this installation actually has.
-No MCP: read `AGENTS.md` and `docs/AI_ONBOARDING.md` at the SDK root.
+No MCP: read `AGENTS.md` and `docs/AI_ONBOARDING.md` at the SDK root (shipped from this pack).
 
 ## 1. Locate before you read
 

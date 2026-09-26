@@ -1,3 +1,8 @@
+> **归档说明（2026-09-26）**：2026-07 后未逐节复审，部分细节已与实现漂移。
+> 编译器内部结构以 `src/compiler/` 源码为准；定位方法与现状地图见
+> [docs/agent-kb/project-map.md](../agent-kb/project-map.md) 与
+> `zan-compiler-internals` skill。
+
 # Zan Compiler Architecture
 
 ## 1. Overview

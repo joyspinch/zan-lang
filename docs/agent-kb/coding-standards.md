@@ -360,9 +360,9 @@ Semantic versioning: `MAJOR.MINOR.PATCH`
 ### 7.2 Release Checklist
 
 - [ ] All tests pass on Windows, Linux, macOS
-- [ ] Version number bumped in the root `VERSION` file (single source of truth; the build generates `zan_version.h` from it — see `docs/RELEASE.md` §1.1)
-- [ ] Binary size within target (zanc ~49.8 MB static-LLVM today; optimization path to ~10–15 MB is in `docs/SELF_CONTAINED_TOOLCHAIN.md` §3)
+- [ ] Version number bumped in the root `VERSION` file (single source of truth; the build generates `zan_version.h` from it — see `../RELEASE.md` §1.1)
+- [ ] Binary size within target (zanc ~49.8 MB static-LLVM today; optimization path to ~10–15 MB is in `../RELEASE.md`《附录 B：自包含工具链》 §3)
 - [ ] Performance benchmarks within targets
-- [ ] Self-hosting verification passes (when applicable; currently red — see `docs/BOOTSTRAP.md` B6-SH1)
+- [ ] Self-hosting verification passes (when applicable; currently red — see `bootstrap.md` B6-SH1)
 - [ ] Documentation updated for new features
 

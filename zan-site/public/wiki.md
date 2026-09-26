@@ -99,7 +99,7 @@ platforms = win-x64   # 可发布目标（逗号分隔）
   `api_search` / `example` 工具先检索再作答，不靠全量 grep；
 - **开放 MCP**：外部 AI（如 ZCode/其他 agent）可连接 IDE 的 MCP 服务，对
   项目增删改查、检索、打补丁（服务端工具见 `tools/mcp_server/`，文档见
-  `docs/MCP_HOSTING.md` 与 `docs/ai-assist.md`）；
+  `tools/ai_pack/docs/MCP_HOSTING.md` 与 `tools/ai_pack/docs/ai-assist.md`）；
 - 网站文档（本站）即是 AI 与人工的共同知识源：让 AI 抓 `/lang.md`、
   `/gui.md`、`/ref/<ns>.md` 即可获得准确上下文。
 - 想把外部 AI 编码工具（Claude Code / Cursor / Copilot / Windsurf 等）接到

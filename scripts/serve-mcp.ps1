@@ -5,7 +5,7 @@
 #
 # The token is read from the environment (--token-env), never passed on the
 # command line where the process list would show it. Never commit one.
-# Details and deployment notes: docs\MCP_HOSTING.md
+# Details and deployment notes: toolsi_pack\docs\MCP_HOSTING.md
 [CmdletBinding()]
 param(
     # Workspace root the tools operate in. Every path a client sends is

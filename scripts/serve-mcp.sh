@@ -6,7 +6,7 @@
 #
 # The token is read from the environment (--token-env), never passed on the
 # command line where the process list would show it. Never commit one.
-# Details and deployment notes: docs/MCP_HOSTING.md
+# Details and deployment notes: tools/ai_pack/docs/MCP_HOSTING.md
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)

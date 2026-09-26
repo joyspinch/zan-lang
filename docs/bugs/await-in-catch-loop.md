@@ -16,7 +16,7 @@ introduces, so the second `throw` unwinds into a stale landing pad.
 
 ## Minimal repro
 
-复现程序（原 `docs/bugs/repro_await_in_catch_loop.zan`，源码内联）：
+复现程序（原 `bugs/repro_await_in_catch_loop.zan`，源码内联）：
 
 ```zan
 using System;

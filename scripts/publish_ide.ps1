@@ -375,18 +375,23 @@ if (Test-Path (Join-Path $aiPack 'AGENTS.md')) {
     Get-ChildItem (Join-Path $aiPack 'skills') -Directory -ErrorAction SilentlyContinue |
         ForEach-Object { Copy-Item $_.FullName $distSkills -Recurse -Force }
 
-    $onboarding = Join-Path $root 'docs\AI_ONBOARDING.md'
+    $onboarding = Join-Path $root 'tools\ai_pack\docs\AI_ONBOARDING.md'
     if (Test-Path $onboarding) {
         New-Item -ItemType Directory -Force -Path (Join-Path $dist 'docs') | Out-Null
         Copy-Item $onboarding (Join-Path $dist 'docs\AI_ONBOARDING.md') -Force
     }
     # The human-facing "how AI uses this SDK" guide ships at the install root,
     # next to README.txt and llms.txt, so it is found without opening docs\.
-    $aiGuide = Join-Path $root 'docs\AI_README.md'
+    $aiGuide = Join-Path $root 'tools\ai_pack\docs\AI_README.md'
     if (Test-Path $aiGuide) { Copy-Item $aiGuide (Join-Path $dist 'AI_README.md') -Force }
-    foreach ($doc in @('TOOLING.md', 'ai-assist.md', 'MCP_HOSTING.md',
-                       'AI_DEV_INFRASTRUCTURE.md')) {
+    # TOOLING.md is a repo doc; the AI docs live in the ai_pack source tree.
+    # Dist layout is unchanged: all four land in dist\docs\.
+    foreach ($doc in @('TOOLING.md')) {
         $p = Join-Path $root "docs\$doc"
+        if (Test-Path $p) { Copy-Item $p (Join-Path $dist "docs\$doc") -Force }
+    }
+    foreach ($doc in @('ai-assist.md', 'MCP_HOSTING.md', 'AI_DEV_INFRASTRUCTURE.md')) {
+        $p = Join-Path $root "tools\ai_pack\docs\$doc"
         if (Test-Path $p) { Copy-Item $p (Join-Path $dist "docs\$doc") -Force }
     }
     Write-Output "PUBLISH_AIPACK_OK -> ai\ (AGENTS.md, skills\, mcp configs), docs\AI_ONBOARDING.md"

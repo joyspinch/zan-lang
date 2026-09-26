@@ -32,7 +32,7 @@ description: Zan GUI (stdlib/Gui) 审美与排版规范——对齐、间距、�
   排版规范即可。游戏内面板间距都走 4 的倍数档位。同屏混排(自绘 HUD +
   Gui 面板)时,缩放路径的边界按下文"缩放纪律"划分,字号必须同源。
 - 立即模式心智模型/控件目录:`docs/agent-kb/gui-development.md`
-- 样式解析规则:`docs/GUI_STYLE_RESOLUTION.md`(Tailwind 原子类引擎已移除,皮肤走语义类 + token)
+- 样式解析规则:`docs/STDLIB_COMPONENT_STANDARDS.md`《附录:取色与取字的统一封装》(Tailwind 原子类引擎已移除,皮肤走语义类 + token)
 
 ## 三条尺寸阶梯(硬规则)
 
@@ -848,7 +848,7 @@ ScreenToClient 与应用鼠标坐标同帧对照,不用注入式 SetCursorPos
 ## 在 zan-lang 仓库内工作(仅仓库内,发布给用户的版面无此节内容)
 
 - 完整心智模型、皮肤与样式解析:`docs/agent-kb/gui-development.md`、
-  `docs/GUI_STYLE_RESOLUTION.md`。
+  `docs/STDLIB_COMPONENT_STANDARDS.md`《附录:取色与取字的统一封装》。
 - 守门测试:`policy_no_widget_drawing`(examples 自绘)、三条颜色/字号预算
   棘轮;新组件必带 conformance 测试(`docs/STDLIB_COMPONENT_STANDARDS.md`)。
 - 构建回归:`scripts\build_gallery.ps1` + `scripts\build_ide.ps1` 必须过;

@@ -42,7 +42,7 @@ default). The first call should be `zan_start_here`, which reports the project
 layout, entry point, build/test commands, coding rules and the tool catalog in
 one response — no tree crawling, no reading the SDK sources.
 
-Full guide, including `zan-lsp` / `zan-dap`: `docs\AI_ONBOARDING.md`.
+Full guide, including `zan-lsp` / `zan-dap`: `docs\AI_ONBOARDING.md` (this pack ships it).
 
 ## One hosted server instead of one process per project
 

@@ -1,14 +1,20 @@
 # docs 索引
 
-`docs/` 全部文档的地图。维护规则见
-[DOCS_MAINTENANCE.md](DOCS_MAINTENANCE.md)：每份文档分三层——**当前实现**
-（描述代码此刻真实行为）、**目标设计**（未落地意图，挂 `TASKS.md` 能力编号）、
-**历史归档**（`archive/`，冻结）。新增/移动/归档文档时**同一次提交**更新本索引。
+本目录共 18 份现行文档（+1 份数据文件）。2026-09-26 深度整合：AI 系文档移至
+`tools/ai_pack/docs/`（随 SDK 发布，dist 布局不变），同主题文档并入对应主文档
+（RELEASE、HTML_UI、STDLIB_COMPONENT_STANDARDS、WORKSPACE_CONVENTIONS、
+GAME_ENGINE_GUIDE 各自的附录），逐文件仓库地图与编译器架构总览分别由
+`agent-kb/project-map.md` 与 `archive/ARCHITECTURE.md` 承担。
+
+维护规则见 [WORKSPACE_CONVENTIONS.md](WORKSPACE_CONVENTIONS.md)《附录：docs
+文档维护规则》：每份文档分三层——**当前实现**（描述代码此刻真实行为）、
+**目标设计**（未落地意图，挂 `TASKS.md` 能力编号）、**历史归档**（`archive/`，
+冻结）。新增/移动/归档文档时**同一次提交**更新本索引。
 
 > 根目录文档被源码注释、脚本和 skills 按路径锚定（如 `publish_ide.ps1` 的
 > 发布清单），移动前先全仓库 grep 旧路径。
 
-## 语言与运行时（当前实现）
+## 语言与运行时
 
 | 文档 | 内容 |
 | --- | --- |
@@ -21,44 +27,32 @@
 
 | 文档 | 内容 |
 | --- | --- |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | 编译器架构总览（2026-07 后未逐节复审，细节以 `src/compiler/` 为准） |
 | [ZANC_CLI.md](ZANC_CLI.md) | `zanc` 全部命令行参数与已知坑——改参数解析时同提交更新 |
 | [BUILD_TOOLCHAIN.md](BUILD_TOOLCHAIN.md) | 各平台固定的构建工具链（勿自行更换） |
 | [platform-targets.md](platform-targets.md) | 交叉编译目标平台矩阵 |
-| [BOOTSTRAP.md](BOOTSTRAP.md) | 自举三代 fixpoint（gen0→gen1→g2/g3 字节等值） |
-| [SELF_CONTAINED_TOOLCHAIN.md](SELF_CONTAINED_TOOLCHAIN.md) | 自包含工具链：MinGW ABI + 随包 `ld`，已落地 |
 | [TOOLING.md](TOOLING.md) | `zan-lsp` / `zan-dap` 协议与能力 |
-| [CODING_STANDARDS.md](CODING_STANDARDS.md) | 编译器 C11 开发标准 |
 | 仓库代码地图 | `AGENTS.md` 目录表 + [agent-kb/project-map.md](agent-kb/project-map.md)（需求 → 改哪儿，带 grep 关键字） |
 
 ## 标准库与 GUI
 
 | 文档 | 内容 |
 | --- | --- |
-| [STDLIB.md](STDLIB.md) | 标准库总览——写 Zan 代码前先查这里 |
-| [STDLIB_COMPONENT_STANDARDS.md](STDLIB_COMPONENT_STANDARDS.md) | 组件编写标准（通道/契约/样式解析） |
-| [HTML_UI.md](HTML_UI.md) | HTML+CSS 声明式窗口协议（运行时装载 + GenHtml 编译期展开） |
-| [ui-driver.md](ui-driver.md) | web 等价布局驱动与 oracle 对拍 |
-| [GUI_STYLE_RESOLUTION.md](GUI_STYLE_RESOLUTION.md) | 取色取字一律走样式层的三条门禁 |
-| [GAME_ENGINE_GUIDE.md](GAME_ENGINE_GUIDE.md) | 游戏引擎使用指南 |
-| [ASSET_PIPELINE.md](ASSET_PIPELINE.md) | 资产管线：IDE 资产管理器 → `.zrp` 资源包 |
+| [STDLIB.md](STDLIB.md) | 标准库总览（含 §3.7 任务/通道/异步 I/O 现状）——写 Zan 代码前先查这里 |
+| [STDLIB_COMPONENT_STANDARDS.md](STDLIB_COMPONENT_STANDARDS.md) | 组件编写标准 + 取色取字样式解析门禁（附录） |
+| [HTML_UI.md](HTML_UI.md) | HTML+CSS 声明式窗口协议 + web 等价布局驱动与 oracle（附录） |
+| [GAME_ENGINE_GUIDE.md](GAME_ENGINE_GUIDE.md) | 游戏引擎使用指南 + 资产管线（附录） |
 
-## 发布与运维
+## 发布与工具链状态
 
 | 文档 | 内容 |
 | --- | --- |
-| [RELEASE.md](RELEASE.md) | 发布流程与包布局（`package_bundle.sh` 锚定） |
-| [IDE_PUBLISH.md](IDE_PUBLISH.md) | IDE 发布布局（`dist\<platform>`） |
+| [RELEASE.md](RELEASE.md) | 发布流程 + IDE 发布布局（附录 A）+ 自包含工具链（附录 B）；`package_bundle.sh` 锚定 |
 
-## AI 协作
+## 仓库协作
 
 | 文档 | 内容 |
 | --- | --- |
-| [AI_ONBOARDING.md](AI_ONBOARDING.md) | AI 客户端接入指南（英文，随 SDK 发布） |
-| [AI_README.md](AI_README.md) | 给人的总说明：AI 怎么用这个 SDK |
-| [AI_DEV_INFRASTRUCTURE.md](AI_DEV_INFRASTRUCTURE.md) | 方案层：AI 辅助开发基础设施（与现状解耦） |
-| [ai-assist.md](ai-assist.md) | 现状层：RepoMap / MCP 桥契约 / IDE AI 设置 |
-| [MCP_HOSTING.md](MCP_HOSTING.md) | MCP 服务器 stdio/HTTP 共享部署 |
+| [WORKSPACE_CONVENTIONS.md](WORKSPACE_CONVENTIONS.md) | 仓库硬规则全文（hooks 强制）+ docs 维护规则（附录）；`AGENTS.md` 是其摘要 |
 
 ## 活跃设计 / 账本（目标设计层）
 
@@ -73,8 +67,14 @@
 
 | 目录 | 内容 |
 | --- | --- |
-| [agent-kb/](agent-kb/README.md) | 智能体开发知识库：怎么找到该改的地方、怎么证明改对了、怎么定位根因 |
-| [bugs/](bugs/) | 编译器 bug 复盘（每份带 Status 字段，规则见 DOCS_MAINTENANCE §4） |
+| [agent-kb/](agent-kb/README.md) | 智能体开发知识库：怎么找到该改的地方、怎么证明改对了、怎么定位根因；含编译器 C 标准（coding-standards.md）与自举（bootstrap.md） |
+| [bugs/](bugs/) | 编译器 bug 复盘（每份带 Status 字段）——stdlib 与各 SDK 包的代码注释按路径引用 |
 | [projects/zanide/](projects/zanide/STRUCTURE.md) | ZanIDE 项目专属文档（STRUCTURE.md 由 `check_structure.ps1` 强制） |
 | [arpg/](arpg/00-DM3体系总览.md) | ARPG（DM3 体系）参考资料（`templates/game/legend` 引用） |
 | [archive/](archive/) | 历史/过时文档，冻结不随实现更新 |
+
+## AI 协作文档（不在本目录）
+
+随 SDK 发布的 AI 接入文档在 `tools/ai_pack/docs/`：`AI_README.md`（给人的
+总说明）、`AI_ONBOARDING.md`（客户端接入）、`ai-assist.md`（RepoMap/MCP 桥
+现状）、`AI_DEV_INFRASTRUCTURE.md`（方案层）、`MCP_HOSTING.md`（共享部署）。
