@@ -151,6 +151,7 @@ static zan_mem_cache *g_cache_pool;
  * Elsewhere __thread is a plain register-relative load, and a pthread key
  * carrying no value serves only as the thread-exit hook. */
 static void zan_mem_retire(zan_mem_cache *c);
+static void zan_mem_drain_remote(zan_mem_cache *c);
 
 #if defined(_WIN32)
 static DWORD g_fls = FLS_OUT_OF_INDEXES;
@@ -263,6 +264,12 @@ static zan_mem_cache *zan_mem_cache_get(void) {
                                                __ATOMIC_ACQUIRE)) {
         int ok = pthread_key_create(&g_exit_key, zan_mem_thread_exit) == 0;
         __atomic_store_n(&g_exit_key_state, ok ? 2 : 0, __ATOMIC_RELEASE);
+    } else {
+        while (__atomic_load_n(&g_exit_key_state, __ATOMIC_ACQUIRE) == 1) {
+#if defined(__i386__) || defined(__x86_64__)
+            __builtin_ia32_pause();
+#endif
+        }
     }
 #endif
     zan_mem_lock();
@@ -275,6 +282,7 @@ static zan_mem_cache *zan_mem_cache_get(void) {
         memset(c, 0, sizeof *c);
     } else {
         c->next_free = NULL;
+        zan_mem_drain_remote(c);
     }
 #if defined(_WIN32)
     FlsSetValue(fls, c);
@@ -284,17 +292,6 @@ static zan_mem_cache *zan_mem_cache_get(void) {
         pthread_setspecific(g_exit_key, c);
 #endif
     return c;
-}
-
-/* Hand a cache back for adoption when its thread exits. Its blocks and bump
- * region stay exactly as they are -- the next thread to adopt it continues
- * from there -- and foreign frees that are still in flight land on `remote`
- * for that thread to drain. */
-static void zan_mem_retire(zan_mem_cache *c) {
-    zan_mem_lock();
-    c->next_free = g_cache_pool;
-    g_cache_pool = c;
-    zan_mem_unlock();
 }
 
 /* Move everything foreign threads have freed back into the class free lists.
@@ -312,6 +309,56 @@ static void zan_mem_drain_remote(zan_mem_cache *c) {
         }
         p = next;
     }
+}
+
+/* Hand a cache back for adoption when its thread exits. Its blocks and bump
+ * region stay exactly as they are -- the next thread to adopt it continues
+ * from there -- and foreign frees that are still in flight land on `remote`
+ * for that thread to drain. */
+static void zan_mem_retire(zan_mem_cache *c) {
+    zan_mem_drain_remote(c);
+    zan_mem_lock();
+    c->next_free = g_cache_pool;
+    g_cache_pool = c;
+    zan_mem_unlock();
+}
+
+/* Drain remote frees across all retired caches in the pool and harvest a free
+ * block if available, adopting the rest of that class free list into `c`. */
+static void *zan_mem_harvest_free_block(zan_mem_cache *c, int cls) {
+    if (!g_cache_pool) return NULL;
+    zan_mem_lock();
+    for (zan_mem_cache *rc = g_cache_pool; rc; rc = rc->next_free) {
+        zan_mem_drain_remote(rc);
+        void *p = rc->free_list[cls];
+        if (p) {
+            rc->free_list[cls] = NULL;
+            c->free_list[cls] = *(void **)p;
+            zan_mem_unlock();
+            return p;
+        }
+    }
+    zan_mem_unlock();
+    return NULL;
+}
+
+/* Adopt uncarved bump space from a retired cache in the pool if c's own bump
+ * region cannot satisfy `need`. */
+static int zan_mem_adopt_retired_bump(zan_mem_cache *c, size_t need) {
+    if (!g_cache_pool) return 0;
+    zan_mem_lock();
+    for (zan_mem_cache *rc = g_cache_pool; rc; rc = rc->next_free) {
+        if ((size_t)(rc->bump_end - rc->bump) >= need) {
+            c->bump = rc->bump;
+            c->bump_end = rc->bump_end;
+            rc->bump = NULL;
+            rc->bump_end = NULL;
+            zan_mem_unlock();
+            return 1;
+        }
+    }
+    zan_mem_unlock();
+    return 0;
 }
 
 /* Publish a slab base in the ownership set and hand it to `c` as its bump
@@ -395,8 +442,17 @@ static void *zan_mem_small(size_t n) {
         zan_mem_drain_remote(c);
         p = c->free_list[cls];
     }
+    if (!p) {
+        /* Try to harvest a freed block from retired caches in the pool */
+        p = zan_mem_harvest_free_block(c, cls);
+    }
     if (p) {
-        c->free_list[cls] = *(void **)p;
+        /* If p was found in c->free_list, advance the list. If it was returned
+         * by zan_mem_harvest_free_block, c->free_list was already populated with
+         * the tail, and p is the detached head. */
+        if (p == c->free_list[cls]) {
+            c->free_list[cls] = *(void **)p;
+        }
         /* A popped block is still marked FREED from its last free: reset the
          * header so the next free of this live block is not mistaken for a
          * double free (the guard keys on the FREED marker). */
@@ -408,7 +464,9 @@ static void *zan_mem_small(size_t n) {
     }
     size_t need = (size_t)k_class_size[cls] + ZAN_MEM_HDR;
     if ((size_t)(c->bump_end - c->bump) < need) {
-        if (!zan_mem_new_slab(c)) return NULL;
+        if (!zan_mem_adopt_retired_bump(c, need)) {
+            if (!zan_mem_new_slab(c)) return NULL;
+        }
     }
     zan_mem_hdr_t *h = (zan_mem_hdr_t *)c->bump;
     c->bump += need;

@@ -3894,6 +3894,7 @@ static void desugar_async_task_method(zan_parser_t *p, zan_ast_node_t *m) {
         if ((m->method_decl.modifiers & MOD_ASYNC) == 0) {
             m->method_decl.modifiers |= MOD_ASYNC;
         }
+        m->method_decl.is_task_return = true;
         if (rt->type_ref.type_args.count == 1) {
             m->method_decl.return_type = rt->type_ref.type_args.items[0];
         } else if (rt->type_ref.type_args.count == 0) {

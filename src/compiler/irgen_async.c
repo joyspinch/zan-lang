@@ -48,8 +48,31 @@ static LLVMValueRef coerce_to_frame_result(zan_irgen_t *g, LLVMValueRef v,
             ? LLVMBuildZExt(g->builder, v, i64, "res.slot")
             : LLVMBuildSExt(g->builder, v, i64, "res.slot");
     }
-    case LLVMPointerTypeKind:
+    case LLVMPointerTypeKind: {
+        if (ty) {
+            LLVMTypeRef want = map_type(g, ty);
+            if (want && LLVMGetTypeKind(want) == LLVMStructTypeKind &&
+                g->current_async_frame && g->current_async_ret_agg_slot >= 0) {
+                LLVMValueRef slot_ptr = LLVMBuildStructGEP2(g->builder,
+                    g->current_async_frame_type, g->current_async_frame,
+                    (unsigned)g->current_async_ret_agg_slot, "ret.agg.slot");
+                LLVMValueRef loaded = LLVMBuildLoad2(g->builder, want, v, "ret.agg.load");
+                LLVMBuildStore(g->builder, loaded, slot_ptr);
+                return LLVMBuildPtrToInt(g->builder, slot_ptr, i64, "res.slot");
+            }
+        }
         return LLVMBuildPtrToInt(g->builder, v, i64, "res.slot");
+    }
+    case LLVMStructTypeKind: {
+        if (g->current_async_frame && g->current_async_ret_agg_slot >= 0) {
+            LLVMValueRef slot_ptr = LLVMBuildStructGEP2(g->builder,
+                g->current_async_frame_type, g->current_async_frame,
+                (unsigned)g->current_async_ret_agg_slot, "ret.agg.slot");
+            LLVMBuildStore(g->builder, v, slot_ptr);
+            return LLVMBuildPtrToInt(g->builder, slot_ptr, i64, "res.slot");
+        }
+        return LLVMConstInt(i64, 0, 0);
+    }
     case LLVMDoubleTypeKind:
         return LLVMBuildBitCast(g->builder, v, i64, "res.slot");
     case LLVMFloatTypeKind: {
@@ -103,6 +126,8 @@ static LLVMValueRef coerce_async_ret(zan_irgen_t *g, LLVMValueRef val) {
     }
     if (wk == LLVMPointerTypeKind && hk == LLVMPointerTypeKind)
         return LLVMBuildBitCast(g->builder, val, want, "ret.cast");
+    if (wk == LLVMStructTypeKind && hk == LLVMPointerTypeKind)
+        return LLVMBuildLoad2(g->builder, want, val, "ret.struct");
     return val;
 }
 
@@ -110,6 +135,16 @@ static LLVMValueRef coerce_async_ret(zan_irgen_t *g, LLVMValueRef val) {
 static LLVMValueRef coerce_from_frame_result(zan_irgen_t *g, LLVMValueRef res,
                                              zan_type_t *ty) {
     if (!res || !ty) return res;
+    if (ty && ty->type_arg_count > 0) {
+        if (ty->kind == TYPE_TASK ||
+            (ty->name.str && ((ty->name.len >= 4 && memcmp(ty->name.str, "Task", 4) == 0) ||
+                             (ty->name.len >= 9 && memcmp(ty->name.str, "ValueTask", 9) == 0))) ||
+            (ty->sym &&
+             ((ty->sym->name.len == 4 && memcmp(ty->sym->name.str, "Task", 4) == 0) ||
+              (ty->sym->name.len == 9 && memcmp(ty->sym->name.str, "ValueTask", 9) == 0)))) {
+            ty = concretize(g, ty->type_args[0]);
+        }
+    }
     if (LLVMGetTypeKind(LLVMTypeOf(res)) != LLVMIntegerTypeKind) return res;
     LLVMTypeRef want = map_type(g, ty);
     if (!want || LLVMTypeOf(res) == want) return res;
@@ -126,6 +161,11 @@ static LLVMValueRef coerce_from_frame_result(zan_irgen_t *g, LLVMValueRef res,
     case LLVMFloatTypeKind: {
         LLVMValueRef fb = LLVMBuildTrunc(g->builder, res, i32, "aw.f32");
         return LLVMBuildBitCast(g->builder, fb, want, "aw.flt");
+    }
+    case LLVMStructTypeKind: {
+        LLVMValueRef ptr = LLVMBuildIntToPtr(g->builder, res,
+            LLVMPointerType(want, 0), "aw.agg.p");
+        return LLVMBuildLoad2(g->builder, want, ptr, "aw.agg");
     }
     default:
         return res;

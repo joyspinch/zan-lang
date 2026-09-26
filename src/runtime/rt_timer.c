@@ -863,7 +863,22 @@ long long zan_timer_dispatch_due(void) {
         g_dispatching = prev;
         if (entry->kind == ZAN_TIMER_PUBLIC) entry->exec_msec = elapsed;
         if (entry->kind == ZAN_TIMER_PUBLIC && entry->interval > 0 && !entry->removed) {
-            entry->due_ms = zan_timer_now_ms() + entry->interval;
+            long long cur_now = zan_timer_now_ms();
+            entry->due_ms = zan_timer_saturating_due(entry->due_ms, entry->interval);
+            if (entry->due_ms < cur_now) {
+                /* If delayed, allow catch-up for moderate lag, but prevent
+                 * unbounded catch-up loops when delayed by more than one interval
+                 * (e.g. process freeze, long blocking operation). Resynchronize
+                 * due_ms to the periodic grid. */
+                if (cur_now - entry->due_ms > entry->interval) {
+                    long long lag = cur_now - entry->due_ms;
+                    long long skips = lag / entry->interval;
+                    entry->due_ms = zan_timer_saturating_due(entry->due_ms, skips * entry->interval);
+                    if (entry->due_ms <= cur_now) {
+                        entry->due_ms = zan_timer_saturating_due(entry->due_ms, entry->interval);
+                    }
+                }
+            }
             entry->sequence = ++g_sequence;
             if (heap_push(entry) != 0) {
                 /* Heap growth failed: a repeating timer that cannot be

@@ -16,6 +16,9 @@ zan_ast_node_t *zan_ast_new(zan_arena_t *arena, zan_ast_kind_t kind, zan_loc_t l
          * keep a pointer at this offset. */
         node->binary.compound_base = TK_EOF;
     }
+    if (kind == AST_METHOD_DECL) {
+        node->method_decl.is_task_return = false;
+    }
     zan_ast_list_init(&node->attributes);
     node->ns_name.str = NULL; node->ns_name.len = 0;
     node->orig_name.str = NULL; node->orig_name.len = 0;

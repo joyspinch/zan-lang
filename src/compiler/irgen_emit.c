@@ -361,7 +361,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
                 LLVMConstInt(i64t, 0, 0), "ma.count");
             LLVMValueRef total = zan_mul(g->builder, n,
                 LLVMSizeOf(i8ptrptr), "ma.total");
-            LLVMValueRef arr = zan_array_alloc(g, total, n);
+            LLVMValueRef arr = zan_array_alloc_typed(g, total, n, g->binder->type_string);
             LLVMValueRef argv = LLVMBuildLoad2(g->builder, i8ptrptr, g_argv, "ma.argv");
             /* fill loop: copy each C string into an owned rc string. Strided
              * blocks share the alloc site; bounds are runtime values here, so
@@ -471,6 +471,7 @@ typedef struct {
     async_local_t  *alocals;       /* named scalar locals held in the frame */
     int             alocal_count;
     int             sub_base;       /* frame index of the first sub-task slot */
+    int             ret_agg_slot;   /* frame index of aggregate return slot (-1 if none) */
     int             handler_cap;    /* per-handler slots in the frame */
     zan_type_t     *cur_inst;       /* instantiation being specialized, or NULL */
     LLVMTypeRef     fn_type;        /* signature of `fn` (the ramp, when async) */
@@ -513,6 +514,17 @@ static void emit_tp_erased_stub(zan_irgen_t *g, LLVMValueRef fn) {
  * async method specialization created from a call site: with the type-param
  * bindings active (g->cur_mtps / g->cur_mbind / g->cur_inst) every type in the
  * signature, frame and local layout resolves to its concrete form. */
+static bool is_task_like_type(zan_type_t *t) {
+    if (!t) return false;
+    if (t->kind == TYPE_TASK) return true;
+    if (t->name.str && ((t->name.len >= 4 && memcmp(t->name.str, "Task", 4) == 0) ||
+                        (t->name.len >= 9 && memcmp(t->name.str, "ValueTask", 9) == 0))) return true;
+    if (t->sym && t->sym->name.str &&
+        ((t->sym->name.len == 4 && memcmp(t->sym->name.str, "Task", 4) == 0) ||
+         (t->sym->name.len == 9 && memcmp(t->sym->name.str, "ValueTask", 9) == 0))) return true;
+    return false;
+}
+
 static void declare_async_method(zan_irgen_t *g, method_body_work_t *w,
                                  const char *fn_name) {
     zan_ast_node_t *member = w->member;
@@ -570,6 +582,34 @@ static void declare_async_method(zan_irgen_t *g, method_body_work_t *w,
         int locals_base = ASYNC_FRAME_FIRST_PARAM + total_params;
         w->sub_base = locals_base + w->alocal_count;
         int nfields = w->sub_base + w->await_count;
+
+        int ret_agg_slot = -1;
+        zan_type_t *raw_ret = w->ret_type ? w->ret_type : g->binder->type_void;
+        if (member->method_decl.return_type) {
+            raw_ret = zan_binder_resolve_type(g->binder, member->method_decl.return_type);
+            if (w->cur_inst) raw_ret = subst_type_param_deep(g, raw_ret, w->cur_inst);
+        }
+        zan_type_t *ret_type = raw_ret;
+        bool is_task = member->method_decl.is_task_return;
+        if (ret_type && ret_type->type_arg_count > 0 && is_task_like_type(ret_type)) {
+            ret_type = concretize(g, ret_type->type_args[0]);
+            is_task = true;
+        }
+        if (!is_task && raw_ret && raw_ret->kind != TYPE_VOID) {
+            LLVMTypeRef art = map_type(g, raw_ret);
+            if (art && LLVMGetTypeKind(art) == LLVMStructTypeKind) {
+                zan_diag_emit(g->diag, DIAG_ERROR, member->loc,
+                              "an async method cannot return an aggregate type: "
+                              "the coroutine result slot is one machine word");
+            }
+        }
+        LLVMTypeRef lret = map_type(g, ret_type);
+        bool is_agg_ret = (lret && LLVMGetTypeKind(lret) == LLVMStructTypeKind);
+        if (is_agg_ret) {
+            ret_agg_slot = nfields++;
+        }
+        w->ret_agg_slot = ret_agg_slot;
+
         LLVMTypeRef *fields = (LLVMTypeRef *)calloc((size_t)nfields, sizeof(LLVMTypeRef));
         fields[ASYNC_FRAME_SCHED] = i64;
         fields[ASYNC_FRAME_SCHED_STEP] = g->co_step_ptr;
@@ -606,6 +646,9 @@ static void declare_async_method(zan_irgen_t *g, method_body_work_t *w,
         }
         for (int k = 0; k < w->await_count; k++) {
             fields[w->sub_base + k] = i8ptr;
+        }
+        if (is_agg_ret) {
+            fields[ret_agg_slot] = lret;
         }
         char frame_name[560];
         snprintf(frame_name, sizeof(frame_name), "%s$frame", fn_name);
@@ -888,6 +931,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         int saved_next_state = g->current_async_next_state;
         int saved_sub_base = g->current_async_sub_base;
         int saved_sub_next = g->current_async_sub_next;
+        int saved_ret_agg_slot = g->current_async_ret_agg_slot;
         void *saved_slots = (void *)g->current_async_slots;
         int saved_slot_count = g->current_async_slot_count;
         LLVMValueRef saved_eh_entry = g->current_async_eh_entry;
@@ -927,22 +971,12 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
             member->method_decl.return_type
                 ? zan_binder_resolve_type(g->binder, member->method_decl.return_type)
                 : g->binder->type_void);
-        g->current_fn_zan_ret_type = g->current_async_ret_type;
-        /* A coroutine result crosses the fixed 64-bit ASYNC_FRAME_RESULT slot,
-         * whose encoding only covers scalars and pointers: an aggregate has no
-         * representation there, so `coerce_to_frame_result` would reduce it to
-         * 0 and the awaiter would read 0/garbage for every field (A273).
-         * Reject the declaration instead of corrupting the value, so the
-         * failure is a compile error naming the method rather than a wrong
-         * number at run time. */
-        if (g->current_async_ret_type && g->current_async_ret_type->kind != TYPE_VOID) {
-            LLVMTypeRef art = map_type(g, g->current_async_ret_type);
-            if (art && LLVMGetTypeKind(art) == LLVMStructTypeKind) {
-                zan_diag_emit(g->diag, DIAG_ERROR, member->loc,
-                              "an async method cannot return an aggregate type: "
-                              "the coroutine result slot is one machine word");
-            }
+        if (g->current_async_ret_type && g->current_async_ret_type->type_arg_count > 0 &&
+            is_task_like_type(g->current_async_ret_type)) {
+            g->current_async_ret_type = concretize(g, g->current_async_ret_type->type_args[0]);
         }
+        g->current_fn_zan_ret_type = g->current_async_ret_type;
+        g->current_async_ret_agg_slot = w->ret_agg_slot;
         g->current_async_next_state = 1;
         g->current_async_sub_base = w->sub_base;
         g->current_async_sub_next = 0;
@@ -1040,6 +1074,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         g->current_async_next_state = saved_next_state;
         g->current_async_sub_base = saved_sub_base;
         g->current_async_sub_next = saved_sub_next;
+        g->current_async_ret_agg_slot = saved_ret_agg_slot;
         g->current_async_slots = saved_slots;
         g->current_async_slot_count = saved_slot_count;
         g->current_async_eh_entry = saved_eh_entry;
@@ -1477,6 +1512,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
             async_local_t *a_locals = NULL;
             int a_local_count = 0;
             int a_sub_base = 0;
+            int a_ret_agg_slot = -1;
             int a_handler_cap = 1;
 
             if (is_async) {
@@ -1489,6 +1525,9 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 adecl.param_types = param_types;
                 adecl.param_count = param_count;
                 adecl.param_offset = param_offset;
+                adecl.ret_type = ret_type;
+                adecl.llvm_ret = llvm_ret;
+                adecl.cur_inst = cur_variant;
                 declare_async_method(g, &adecl, fn_name);
                 fn = adecl.fn;
                 fn_type = adecl.fn_type;
@@ -1498,6 +1537,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 a_locals = adecl.alocals;
                 a_local_count = adecl.alocal_count;
                 a_sub_base = adecl.sub_base;
+                a_ret_agg_slot = adecl.ret_agg_slot;
                 a_handler_cap = adecl.handler_cap;
             } else {
                 fn_type = LLVMFunctionType(llvm_ret, param_types, (unsigned)total_params, 0);
@@ -1570,6 +1610,7 @@ static void emit_user_methods(zan_irgen_t *g, zan_ast_node_t *unit) {
                 work[work_count].alocals = a_locals;
                 work[work_count].alocal_count = a_local_count;
                 work[work_count].sub_base = a_sub_base;
+                work[work_count].ret_agg_slot = a_ret_agg_slot;
                 work[work_count].handler_cap = a_handler_cap;
                 work[work_count].cur_inst = cur_variant;
                 work_count++;

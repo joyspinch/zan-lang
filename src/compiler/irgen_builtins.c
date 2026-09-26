@@ -2514,8 +2514,47 @@ static LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g) {
         rel_arr, rel_dyn);
 
     LLVMPositionBuilderAtEnd(g->builder, rel_arr);
+    LLVMBasicBlockRef rel_arr_null = LLVMAppendBasicBlockInContext(g->ctx, fn, "relarr.null");
+    LLVMBasicBlockRef rel_arr_work = LLVMAppendBasicBlockInContext(g->ctx, fn, "relarr.work");
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntEQ, vobj, LLVMConstNull(i8ptr), "arr.isnull"),
+        rel_arr_null, rel_arr_work);
+
+    LLVMPositionBuilderAtEnd(g->builder, rel_arr_work);
+    LLVMValueRef neg8 = LLVMConstInt(i64t, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
+    LLVMValueRef site_p = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), vobj, &neg8, 1, "arr.sitep");
+    LLVMValueRef site_val = LLVMBuildLoad2(g->builder, i64t,
+        LLVMBuildBitCast(g->builder, site_p, LLVMPointerType(i64t, 0), "arr.siteip"), "arr.site");
+    LLVMValueRef is_magic = zan_icmp(g->builder, LLVMIntEQ, site_val,
+        LLVMConstInt(i64t, ZAN_ARRAY_MAGIC, 0), "arr.ismagic");
+    LLVMValueRef is_rank = zan_and(g->builder,
+        zan_icmp(g->builder, LLVMIntUGT, site_val, LLVMConstInt(i64t, 0, 0), "arr.nz"),
+        zan_icmp(g->builder, LLVMIntULT, site_val, LLVMConstInt(i64t, 4096, 0), "arr.rank"),
+        "arr.isrank");
+    LLVMValueRef is_raw = zan_or(g->builder, is_magic, is_rank, "arr.israw");
+    LLVMBasicBlockRef rel_arr_plain = LLVMAppendBasicBlockInContext(g->ctx, fn, "relarr.plain");
+    LLVMBasicBlockRef rel_arr_desc = LLVMAppendBasicBlockInContext(g->ctx, fn, "relarr.desc");
+    LLVMBuildCondBr(g->builder, is_raw, rel_arr_plain, rel_arr_desc);
+
+    LLVMPositionBuilderAtEnd(g->builder, rel_arr_desc);
+    LLVMValueRef desc_p = LLVMBuildIntToPtr(g->builder, site_val, LLVMPointerType(i8ptr, 0), "adesc.p");
+    LLVMValueRef adtor = LLVMBuildLoad2(g->builder, i8ptr, desc_p, "adesc.dtor");
+    LLVMValueRef has_adtor = zan_icmp(g->builder, LLVMIntNE, adtor, LLVMConstNull(i8ptr), "has.adtor");
+    LLVMBasicBlockRef rel_arr_call = LLVMAppendBasicBlockInContext(g->ctx, fn, "relarr.call");
+    LLVMBuildCondBr(g->builder, has_adtor, rel_arr_call, rel_arr_plain);
+
+    LLVMPositionBuilderAtEnd(g->builder, rel_arr_call);
+    LLVMTypeRef adfnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
+    LLVMValueRef adfn = LLVMBuildBitCast(g->builder, adtor, LLVMPointerType(adfnty, 0), "adfn");
+    zan_call2(g->builder, adfnty, adfn, &vobj, 1, "");
+    LLVMBuildBr(g->builder, head);
+
+    LLVMPositionBuilderAtEnd(g->builder, rel_arr_plain);
     zan_call2(g->builder, LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
         g->rt_arr_release, &vobj, 1, "");
+    LLVMBuildBr(g->builder, head);
+
+    LLVMPositionBuilderAtEnd(g->builder, rel_arr_null);
     LLVMBuildBr(g->builder, head);
 
     LLVMPositionBuilderAtEnd(g->builder, rel_dlg);

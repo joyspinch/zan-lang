@@ -3028,6 +3028,41 @@ static LLVMValueRef emit_typed_equality(zan_irgen_t *g, zan_type_t *type,
                              g->functions[fi].fn, args, 2, "eq.op");
         }
     }
+    if (type && type->kind == TYPE_STRING) {
+        LLVMTypeRef i8ptr = LLVMPointerType(
+            LLVMInt8TypeInContext(g->ctx), 0);
+        LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+        if (LLVMGetTypeKind(LLVMTypeOf(left)) == LLVMIntegerTypeKind) {
+            left = LLVMBuildIntToPtr(g->builder, left, i8ptr, "str.lp");
+        } else if (LLVMTypeOf(left) != i8ptr) {
+            left = LLVMBuildBitCast(g->builder, left, i8ptr, "str.lbc");
+        }
+        if (LLVMGetTypeKind(LLVMTypeOf(right)) == LLVMIntegerTypeKind) {
+            right = LLVMBuildIntToPtr(g->builder, right, i8ptr, "str.rp");
+        } else if (LLVMTypeOf(right) != i8ptr) {
+            right = LLVMBuildBitCast(g->builder, right, i8ptr, "str.rbc");
+        }
+        LLVMValueRef lc = emit_str_nonnull(g, left);
+        LLVMValueRef rc = emit_str_nonnull(g, right);
+        LLVMValueRef args[] = {lc, rc};
+        LLVMValueRef cmp = zan_call2(
+            g->builder,
+            LLVMFunctionType(i32, (LLVMTypeRef[]){i8ptr, i8ptr}, 2, 0),
+            g->fn_strcmp, args, 2, "eq.str");
+        return zan_icmp(g->builder, LLVMIntEQ, cmp,
+                        LLVMConstInt(i32, 0, 0), "eq.s");
+    }
+    if (type && type->kind == TYPE_STRUCT) {
+        LLVMTypeRef st = map_type(g, type);
+        if (st && LLVMGetTypeKind(st) == LLVMStructTypeKind) {
+            if (LLVMGetTypeKind(LLVMTypeOf(left)) == LLVMPointerTypeKind) {
+                left = LLVMBuildLoad2(g->builder, st, left, "eq.ld.l");
+            }
+            if (LLVMGetTypeKind(LLVMTypeOf(right)) == LLVMPointerTypeKind) {
+                right = LLVMBuildLoad2(g->builder, st, right, "eq.ld.r");
+            }
+        }
+    }
     LLVMTypeRef lt = LLVMTypeOf(left);
     LLVMTypeRef rt = LLVMTypeOf(right);
     if (LLVMGetTypeKind(lt) == LLVMStructTypeKind && lt == rt) {
@@ -3039,31 +3074,38 @@ static LLVMValueRef emit_typed_equality(zan_irgen_t *g, zan_type_t *type,
                 g->builder, left, i, "eq.l");
             LLVMValueRef rv = LLVMBuildExtractValue(
                 g->builder, right, i, "eq.r");
-            LLVMTypeKind kind = LLVMGetTypeKind(LLVMTypeOf(lv));
-            LLVMValueRef equal;
-            if (kind == LLVMDoubleTypeKind || kind == LLVMFloatTypeKind) {
-                equal = LLVMBuildFCmp(
-                    g->builder, LLVMRealOEQ, lv, rv, "eq.f");
-            } else if (kind == LLVMPointerTypeKind) {
-                equal = LLVMBuildICmp(g->builder, LLVMIntEQ, lv, rv, "eq.p");
+            zan_type_t *field_type = NULL;
+            if (type && type->sym) {
+                int cur_idx = 0;
+                for (int m = 0; m < type->sym->member_count; m++) {
+                    zan_symbol_t *sm = type->sym->members[m];
+                    if ((sm->kind == SYM_FIELD || sm->kind == SYM_PROPERTY) &&
+                        !field_member_is_static(sm)) {
+                        if (cur_idx == (int)i) {
+                            field_type = sm->type;
+                            break;
+                        }
+                        cur_idx++;
+                    }
+                }
+            }
+            LLVMValueRef equal = NULL;
+            if (field_type) {
+                equal = emit_typed_equality(g, field_type, lv, rv);
             } else {
-                equal = zan_icmp(g->builder, LLVMIntEQ, lv, rv, "eq.i");
+                LLVMTypeKind kind = LLVMGetTypeKind(LLVMTypeOf(lv));
+                if (kind == LLVMDoubleTypeKind || kind == LLVMFloatTypeKind) {
+                    equal = LLVMBuildFCmp(
+                        g->builder, LLVMRealOEQ, lv, rv, "eq.f");
+                } else if (kind == LLVMPointerTypeKind) {
+                    equal = LLVMBuildICmp(g->builder, LLVMIntEQ, lv, rv, "eq.p");
+                } else {
+                    equal = zan_icmp(g->builder, LLVMIntEQ, lv, rv, "eq.i");
+                }
             }
             result = LLVMBuildAnd(g->builder, result, equal, "eq.all");
         }
         return result;
-    }
-    if (type && type->kind == TYPE_STRING) {
-        LLVMTypeRef i8ptr = LLVMPointerType(
-            LLVMInt8TypeInContext(g->ctx), 0);
-        LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
-        LLVMValueRef args[] = {left, right};
-        LLVMValueRef cmp = zan_call2(
-            g->builder,
-            LLVMFunctionType(i32, (LLVMTypeRef[]){i8ptr, i8ptr}, 2, 0),
-            g->fn_strcmp, args, 2, "eq.str");
-        return zan_icmp(g->builder, LLVMIntEQ, cmp,
-                        LLVMConstInt(i32, 0, 0), "eq.s");
     }
     if (LLVMGetTypeKind(lt) == LLVMPointerTypeKind &&
         LLVMGetTypeKind(rt) == LLVMPointerTypeKind) {
@@ -8892,8 +8934,8 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMValueRef total = zan_mul(g->builder,
                 LLVMConstInt(i64t, (unsigned long long)n, 0),
                 LLVMSizeOf(elem_llvm), "total");
-            LLVMValueRef arr = zan_array_alloc(g, total,
-                LLVMConstInt(i64t, (unsigned long long)n, 0));
+            LLVMValueRef arr = zan_array_alloc_typed(g, total,
+                LLVMConstInt(i64t, (unsigned long long)n, 0), elem_type);
             for (int k = 0; k < n; k++) {
                 LLVMValueRef v = emit_arg_typed(g, expr->new_expr.args.items[k],
                                                 elem_type, locals);
@@ -8958,7 +9000,7 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             if (rank <= 1) {
                 LLVMValueRef total = zan_mul(g->builder, dims[0],
                     LLVMSizeOf(elem_llvm), "total");
-                arr = zan_array_alloc(g, total, dims[0]);
+                arr = zan_array_alloc_typed(g, total, dims[0], elem_type);
             } else {
                 arr = zan_mdarray_alloc(g, dims, rank, elem_llvm);
             }
@@ -9671,6 +9713,16 @@ static LLVMValueRef emit_expr_with_expr(zan_irgen_t *g, zan_ast_node_t *expr,
 static LLVMValueRef coerce_await_result(zan_irgen_t *g, zan_ast_node_t *expr,
         LLVMValueRef res, local_scope_t *locals) {
     zan_type_t *rt = concretize(g, infer_expr_type(g, expr->await_expr.expr, locals));
+    if (rt && rt->type_arg_count > 0) {
+        if (rt->kind == TYPE_TASK ||
+            (rt->name.str && ((rt->name.len >= 4 && memcmp(rt->name.str, "Task", 4) == 0) ||
+                             (rt->name.len >= 9 && memcmp(rt->name.str, "ValueTask", 9) == 0))) ||
+            (rt->sym &&
+             ((rt->sym->name.len == 4 && memcmp(rt->sym->name.str, "Task", 4) == 0) ||
+              (rt->sym->name.len == 9 && memcmp(rt->sym->name.str, "ValueTask", 9) == 0)))) {
+            rt = concretize(g, rt->type_args[0]);
+        }
+    }
     return coerce_from_frame_result(g, res, rt);
 }
 
@@ -10431,6 +10483,7 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMValueRef rptr_slow = LLVMBuildStructGEP2(g->builder, hdr, sub_rl,
                     ASYNC_FRAME_RESULT, "sub.result.slow");
                 LLVMValueRef awres_slow = LLVMBuildLoad2(g->builder, i64, rptr_slow, "awres.slow");
+                LLVMValueRef val_slow = coerce_await_result(g, expr, awres_slow, locals);
                 zan_emit_frame_free(g, sub_rl);
                 LLVMBasicBlockRef rk_end = LLVMGetInsertBlock(g->builder);
                 LLVMBuildBr(g->builder, cont_bb);
@@ -10441,17 +10494,22 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMValueRef rptr_fast = LLVMBuildStructGEP2(g->builder, hdr, sub_i8,
                     ASYNC_FRAME_RESULT, "sub.result.fast");
                 LLVMValueRef awres_fast = LLVMBuildLoad2(g->builder, i64, rptr_fast, "awres.fast");
+                LLVMValueRef val_fast = coerce_await_result(g, expr, awres_fast, locals);
                 zan_emit_frame_free(g, sub_i8);
                 LLVMBasicBlockRef fast_end = LLVMGetInsertBlock(g->builder);
                 LLVMBuildBr(g->builder, cont_bb);
 
                 /* ---- await.cont: continue inline ---- */
                 LLVMPositionBuilderAtEnd(g->builder, cont_bb);
-                LLVMValueRef phi = LLVMBuildPhi(g->builder, i64, "awres");
-                LLVMValueRef phi_vals[] = { awres_fast, awres_slow };
+                LLVMTypeRef phi_type = LLVMTypeOf(val_slow);
+                if (phi_type && LLVMGetTypeKind(phi_type) == LLVMVoidTypeKind) {
+                    return LLVMConstInt(i64, 0, 0);
+                }
+                LLVMValueRef phi = LLVMBuildPhi(g->builder, phi_type, "awres");
+                LLVMValueRef phi_vals[] = { val_fast, val_slow };
                 LLVMBasicBlockRef phi_bbs[] = { fast_end, rk_end };
                 LLVMAddIncoming(phi, phi_vals, phi_bbs, 2);
-                return coerce_await_result(g, expr, phi, locals);
+                return phi;
             }
 
             /* root drive (non-async caller). The scheduler is initialized once
@@ -10485,10 +10543,9 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMValueRef rptr = LLVMBuildStructGEP2(g->builder, hdr, sub_i8,
                 ASYNC_FRAME_RESULT, "sub.result");
             LLVMValueRef awres = LLVMBuildLoad2(g->builder, i64, rptr, "awres");
-            /* Root-driven sub has run to completion; copy out its result then
-             * free its heap frame (no awaiter will). */
+            LLVMValueRef val = coerce_await_result(g, expr, awres, locals);
             zan_emit_frame_free(g, sub_i8);
-            return coerce_await_result(g, expr, awres, locals);
+            return val;
         }
 
         /* Fallback: awaiting a legacy Task struct (busy-wait) or a plain value. */

@@ -677,6 +677,7 @@ struct zan_irgen {
     int          current_async_next_state;
     int          current_async_sub_base; /* frame index of first sub-task slot */
     int          current_async_sub_next;
+    int          current_async_ret_agg_slot; /* frame index of aggregate return slot (-1 if none) */
     zan_async_slot_t *current_async_slots;
     int          current_async_slot_count;
     /* async exception handling: the eh-stack depth on entry to the $resume

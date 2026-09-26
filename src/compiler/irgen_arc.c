@@ -884,6 +884,31 @@ static LLVMValueRef get_array_release_decl(zan_irgen_t *g, zan_type_t *elem_type
     return fn;
 }
 
+static LLVMValueRef get_array_desc(zan_irgen_t *g, zan_type_t *elem_type) {
+    char tok[192];
+    size_t off = 0;
+    tok[0] = '\0';
+    mangle_type_token(tok, sizeof(tok), &off, elem_type);
+    char name[256];
+    snprintf(name, sizeof(name), "__zan_arr_desc_%s_%016llx",
+             tok, (unsigned long long)arr_rel_type_key(elem_type));
+    LLVMValueRef eg = LLVMGetNamedGlobal(g->mod, name);
+    if (eg) return eg;
+
+    LLVMValueRef dtor = get_array_release_decl(g, elem_type, 0);
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef dt = arc_desc_type(g);
+    LLVMValueRef dg = LLVMAddGlobal(g->mod, dt, name);
+    LLVMSetLinkage(dg, LLVMInternalLinkage);
+    LLVMSetGlobalConstant(dg, 1);
+    LLVMValueRef z = LLVMConstNull(i8p);
+    LLVMValueRef dtor_c = LLVMConstBitCast(dtor, i8p);
+    LLVMSetInitializer(dg, LLVMConstNamedStruct(dt,
+        (LLVMValueRef[]){ dtor_c, z, z, LLVMConstInt(i64t, 0, 0) }, 4));
+    return dg;
+}
+
 /* Release of an array value: an element type that owns something goes through
  * the per-element-type destructor (rectangular arrays get the shape-aware
  * variant), anything else through the plain runtime helper. */

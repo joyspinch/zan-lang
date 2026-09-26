@@ -4275,8 +4275,65 @@ static void check_method_body(zan_checker_t *c, zan_ast_node_t *method) {
     c->in_ctor = saved_ctor;
 }
 
+static bool check_struct_cycle_dfs(zan_checker_t *c, zan_ast_node_t *struct_decl,
+                                   zan_ast_node_t **stack, int depth) {
+    if (!struct_decl || struct_decl->kind != AST_STRUCT_DECL) return false;
+    if (depth >= 64) {
+        zan_diag_emit(c->diag, DIAG_ERROR, struct_decl->loc,
+                      "struct '%.*s' exceeds maximum nesting depth",
+                      (int)struct_decl->type_decl.name.len,
+                      struct_decl->type_decl.name.str);
+        return false;
+    }
+    stack[depth] = struct_decl;
+
+    for (int j = 0; j < struct_decl->type_decl.members.count; j++) {
+        zan_ast_node_t *member = struct_decl->type_decl.members.items[j];
+        if (!member) continue;
+        if (member->kind != AST_FIELD_DECL && member->kind != AST_PROPERTY_DECL) continue;
+        if (member->field_decl.modifiers & MOD_STATIC) continue;
+        if (member->kind == AST_PROPERTY_DECL &&
+            (member->field_decl.getter_body || member->field_decl.setter_body)) continue;
+
+        zan_type_t *ftype = zan_binder_resolve_type(c->binder, member->field_decl.type);
+        if (!ftype || ftype->kind != TYPE_STRUCT) continue;
+        zan_symbol_t *fsym = ftype->sym;
+        if (!fsym && c->binder) fsym = zan_binder_lookup(c->binder, ftype->name);
+        if (fsym && fsym->decl && fsym->decl->kind == AST_STRUCT_DECL) {
+            for (int k = 0; k <= depth; k++) {
+                if (stack[k] == fsym->decl) {
+                    zan_diag_emit(c->diag, DIAG_ERROR, member->loc,
+                                  "struct member '%.*s' of type '%.*s' causes a cycle in the struct layout (recursive struct has infinite size)",
+                                  (int)member->field_decl.name.len,
+                                  member->field_decl.name.str,
+                                  (int)fsym->decl->type_decl.name.len,
+                                  fsym->decl->type_decl.name.str);
+                    return true;
+                }
+            }
+            if (check_struct_cycle_dfs(c, fsym->decl, stack, depth + 1)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static void check_all_struct_cycles(zan_checker_t *c, zan_ast_node_t *unit) {
+    if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
+    for (int i = 0; i < unit->comp_unit.decls.count; i++) {
+        zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
+        if (decl && decl->kind == AST_STRUCT_DECL) {
+            zan_ast_node_t *stack[64];
+            check_struct_cycle_dfs(c, decl, stack, 0);
+        }
+    }
+}
+
 void zan_checker_check(zan_checker_t *c, zan_ast_node_t *unit) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
+
+    check_all_struct_cycles(c, unit);
 
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {
         zan_ast_node_t *decl = unit->comp_unit.decls.items[i];

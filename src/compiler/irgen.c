@@ -2603,6 +2603,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->current_async_next_state = 1;
     g->current_async_sub_base = 0;
     g->current_async_sub_next = 0;
+    g->current_async_ret_agg_slot = -1;
     g->current_async_slots = NULL;
     g->current_async_slot_count = 0;
 
@@ -2847,6 +2848,10 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
      * makes release follow the *runtime* type, so derived-instance fields are
      * freed even when the value is held through a base-typed reference. */
     {
+        if (!g->rt_arr_release) {
+            LLVMTypeRef arr_fnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), release_args, 1, 0);
+            g->rt_arr_release = LLVMAddFunction(g->mod, "zan_rt_arr_release", arr_fnty);
+        }
         LLVMTypeRef reld_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), release_args, 1, 0);
         g->rt_release_dyn = LLVMAddFunction(g->mod, "zan_rt_release_dyn", reld_type);
         LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "entry");
@@ -2915,6 +2920,23 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             /* descriptor mode: the header word is the record pointer itself;
              * load its dtor field (offset 0) and call it when non-null */
             LLVMValueRef desc = LLVMBuildLoad2(g->builder, i64, siptr, "desc");
+            LLVMValueRef is_arr_magic = zan_icmp(g->builder, LLVMIntEQ, desc,
+                LLVMConstInt(i64, ZAN_ARRAY_MAGIC, 0), "is.arrmagic");
+            LLVMValueRef is_rank = zan_and(g->builder,
+                zan_icmp(g->builder, LLVMIntUGT, desc, LLVMConstInt(i64, 0, 0), "is.rnz"),
+                zan_icmp(g->builder, LLVMIntULT, desc, LLVMConstInt(i64, 4096, 0), "is.rank"),
+                "is.isrank");
+            LLVMValueRef is_raw_arr = zan_or(g->builder, is_arr_magic, is_rank, "is.rawarr");
+            LLVMBasicBlockRef rel_arr_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "relarr");
+            LLVMBasicBlockRef not_raw = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "notraw");
+            LLVMBuildCondBr(g->builder, is_raw_arr, rel_arr_bb, not_raw);
+
+            LLVMPositionBuilderAtEnd(g->builder, rel_arr_bb);
+            zan_call2(g->builder, LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
+                g->rt_arr_release, &obj, 1, "");
+            LLVMBuildBr(g->builder, ret_bb);
+
+            LLVMPositionBuilderAtEnd(g->builder, not_raw);
             LLVMValueRef dnz = zan_icmp(g->builder, LLVMIntNE, desc,
                 LLVMConstInt(i64, 0, 0), "descnz");
             LLVMBuildCondBr(g->builder, dnz, lookup, fb);
@@ -3037,8 +3059,10 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMTypeRef i8p = LLVMPointerType(i8t, 0);
         LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
                                             (LLVMTypeRef[]){ i8p }, 1, 0);
-        LLVMValueRef fn = LLVMAddFunction(g->mod,
-            rel ? "zan_rt_arr_release" : "zan_rt_arr_retain", fnty);
+        const char *fn_name = rel ? "zan_rt_arr_release" : "zan_rt_arr_retain";
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, fn_name);
+        if (!fn)
+            fn = LLVMAddFunction(g->mod, fn_name, fnty);
         if (rel) g->rt_arr_release = fn; else g->rt_arr_retain = fn;
         LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
         LLVMPositionBuilderAtEnd(g->builder, bb);
@@ -4391,21 +4415,6 @@ static void check_struct_fits_slot(zan_irgen_t *g, LLVMTypeRef st, zan_ast_node_
     zan_diag_emit(g->diag, DIAG_ERROR, loc,
         "this value struct cannot be a collection element: the slot allocator "
         "cannot compute its layout; use a class instead");
-}
-
-/* Operations that treat a slot as one raw word (equality search, swap, the
- * element-by-element copies) have no multi-word form yet: report that instead
- * of quietly reading half an element. */
-static int wide_elem_unsupported(zan_irgen_t *g, zan_type_t *elem,
-                                 zan_ast_node_t *at, const char *op) {
-    if (elem_slot_words(g, elem) <= 1) return 0;
-    zan_loc_t loc; memset(&loc, 0, sizeof(loc));
-    if (at) loc = at->loc;
-    zan_diag_emit(g->diag, DIAG_ERROR, loc,
-        "'%s' is not supported yet for a list whose element is a value struct "
-        "wider than 8 bytes; Add / [i] / foreach / RemoveAt / Clear are",
-        op);
-    return 1;
 }
 
 /* Store a struct element inline: the slot pointer addresses enough words for

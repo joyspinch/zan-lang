@@ -14,6 +14,9 @@ static zan_type_t *concretize(zan_irgen_t *g, zan_type_t *t);
 static zan_type_t *subst_type_param_deep(zan_irgen_t *g, zan_type_t *t,
                                          zan_type_t *recv);
 static bool type_is_concrete(zan_type_t *t);
+static int is_rc_managed_type(zan_type_t *t);
+static LLVMValueRef get_array_release_decl(zan_irgen_t *g, zan_type_t *elem_type, int rect);
+static LLVMValueRef get_array_desc(zan_irgen_t *g, zan_type_t *elem_type);
 static LLVMValueRef get_libc_fn(zan_irgen_t *g, const char *name, LLVMTypeRef ty);
 
 static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals);
@@ -2517,8 +2520,8 @@ static void zan_arr_hdr_store(zan_irgen_t *g, LLVMValueRef raw, int off,
         LLVMBuildBitCast(g->builder, p, LLVMPointerType(i64, 0), name));
 }
 
-static LLVMValueRef zan_array_alloc(zan_irgen_t *g, LLVMValueRef total,
-                                    LLVMValueRef count) {
+static LLVMValueRef zan_array_alloc_impl(zan_irgen_t *g, LLVMValueRef total,
+                                         LLVMValueRef count, zan_type_t *elem_type) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
@@ -2553,10 +2556,27 @@ static LLVMValueRef zan_array_alloc(zan_irgen_t *g, LLVMValueRef total,
     zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_ARR_RC_MAGIC_OFF,
                       LLVMConstInt(i64, ZAN_ARRAY_RC_MAGIC, 0), "arr.rcmagic");
     zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_OBJ_RC_OFF, count, "arr.count");
-    zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_OBJ_SITE_OFF,
-                      LLVMConstInt(i64, ZAN_ARRAY_MAGIC, 0), "arr.magic");
+    if (elem_type && is_rc_managed_type(elem_type)) {
+        LLVMValueRef desc = get_array_desc(g, elem_type);
+        LLVMValueRef desc_i64 = LLVMBuildPtrToInt(g->builder, desc, i64, "arr.desci");
+        zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_OBJ_SITE_OFF,
+                          desc_i64, "arr.desc");
+    } else {
+        zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_OBJ_SITE_OFF,
+                          LLVMConstInt(i64, ZAN_ARRAY_MAGIC, 0), "arr.magic");
+    }
     LLVMValueRef off = LLVMConstInt(i64, ZAN_ARR_HDR_SIZE, 0);
     return LLVMBuildGEP2(g->builder, i8, raw, &off, 1, "arr");
+}
+
+static LLVMValueRef zan_array_alloc_typed(zan_irgen_t *g, LLVMValueRef total,
+                                          LLVMValueRef count, zan_type_t *elem_type) {
+    return zan_array_alloc_impl(g, total, count, elem_type);
+}
+
+static LLVMValueRef zan_array_alloc(zan_irgen_t *g, LLVMValueRef total,
+                                    LLVMValueRef count) {
+    return zan_array_alloc_impl(g, total, count, NULL);
 }
 
 static LLVMValueRef zan_array_len(zan_irgen_t *g, LLVMValueRef arr) {

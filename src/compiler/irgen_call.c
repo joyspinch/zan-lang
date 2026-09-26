@@ -3830,6 +3830,67 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             }
         }
 
+        /* List.LastIndexOf(item) -> int (-1 if not found) */
+        if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
+            zan_ast_node_t *callee = expr->call.callee;
+            zan_istr_t method_name = callee->member.name;
+            if (method_name.len == 11 && memcmp(method_name.str, "LastIndexOf", 11) == 0 &&
+                expr->call.args.count == 1) {
+                zan_ast_node_t *lobj = callee->member.object;
+                zan_type_t *ltype = infer_expr_type(g, lobj, locals);
+                if (ltype && type_named(ltype, "List", 4)) {
+                    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+                    LLVMValueRef raw_ptr = emit_expr(g, lobj, locals);
+                    LLVMValueRef list_ptr = LLVMBuildBitCast(g->builder, raw_ptr,
+                        LLVMPointerType(g->list_struct_type, 0), "lptr");
+                    LLVMValueRef count_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type, list_ptr, 0, "cntp");
+                    LLVMValueRef count = LLVMBuildLoad2(g->builder, i64, count_ptr, "cnt");
+                    LLVMValueRef data_field = LLVMBuildStructGEP2(g->builder, g->list_struct_type, list_ptr, 2, "df");
+                    LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0), data_field, "data");
+                    zan_type_t *elem_type = concretize(g,
+                        container_elem_type(ltype));
+                    unsigned lio_words = elem_slot_words(g, elem_type);
+                    LLVMValueRef search = emit_expr(g, expr->call.args.items[0], locals);
+                    /* result alloca — -1 for not found */
+                    LLVMValueRef res = emit_entry_alloca(g, i64, "liofr");
+                    LLVMBuildStore(g->builder, LLVMConstInt(i64, (uint64_t)-1LL, 1), res);
+                    LLVMValueRef idx_a = emit_entry_alloca(g, i64, "lii");
+                    LLVMValueRef count_sub1 = zan_sub(g->builder, count, LLVMConstInt(i64, 1, 0), "cnt.m1");
+                    LLVMBuildStore(g->builder, count_sub1, idx_a);
+                    LLVMBasicBlockRef cond_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "lio.cond");
+                    LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "lio.body");
+                    LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "lio.done");
+                    LLVMBuildBr(g->builder, cond_bb);
+                    LLVMPositionBuilderAtEnd(g->builder, cond_bb);
+                    LLVMValueRef ci = LLVMBuildLoad2(g->builder, i64, idx_a, "ci");
+                    LLVMValueRef in_bounds = zan_icmp(g->builder, LLVMIntSGE, ci, LLVMConstInt(i64, 0, 0), "cinb");
+                    LLVMBuildCondBr(g->builder, in_bounds, body_bb, done_bb);
+                    LLVMPositionBuilderAtEnd(g->builder, body_bb);
+                    LLVMValueRef ci2 = LLVMBuildLoad2(g->builder, i64, idx_a, "ci2");
+                    LLVMValueRef iw = slot_word_index(g, ci2, lio_words);
+                    LLVMValueRef slot = LLVMBuildGEP2(g->builder, i64, data, &iw, 1, "sl");
+                    LLVMValueRef val = load_collection_slot_value(
+                        g, elem_type, slot);
+                    LLVMValueRef eq = emit_typed_equality(
+                        g, elem_type, val, search);
+                    LLVMBasicBlockRef found_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "lio.found");
+                    LLVMBasicBlockRef next_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "lio.next");
+                    LLVMBuildCondBr(g->builder, eq, found_bb, next_bb);
+                    LLVMPositionBuilderAtEnd(g->builder, found_bb);
+                    LLVMBuildStore(g->builder, ci2, res);
+                    LLVMBuildBr(g->builder, done_bb);
+                    LLVMPositionBuilderAtEnd(g->builder, next_bb);
+                    LLVMValueRef ni = zan_sub(g->builder, ci2, LLVMConstInt(i64, 1, 0), "ni");
+                    LLVMBuildStore(g->builder, ni, idx_a);
+                    LLVMBuildBr(g->builder, cond_bb);
+                    LLVMPositionBuilderAtEnd(g->builder, done_bb);
+                    emit_release_owned_call_temp(g, expr->call.args.items[0],
+                                                 search, locals);
+                    return LLVMBuildLoad2(g->builder, i64, res, "liofres");
+                }
+            }
+        }
+
         /* List.Contains(item) -> bool (uses IndexOf logic) */
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
             zan_ast_node_t *callee = expr->call.callee;
@@ -4089,7 +4150,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     unsigned ta_words = elem_slot_words(g, elem_type);
                     LLVMValueRef total = zan_mul(g->builder, count,
                         LLVMSizeOf(elem_llvm), "ta.total");
-                    LLVMValueRef arr = zan_array_alloc(g, total, count);
+                    LLVMValueRef arr = zan_array_alloc_typed(g, total, count, elem_type);
                     LLVMValueRef arrp = LLVMBuildBitCast(g->builder, arr,
                         LLVMPointerType(elem_llvm, 0), "ta.ap");
                     LLVMValueRef idx_a = emit_entry_alloca(g, i64, "ta.i");

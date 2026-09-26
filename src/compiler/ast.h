@@ -457,6 +457,7 @@ struct zan_ast_node {
             zan_ast_list_t base_args;  /* constructor `: base(...)` argument exprs */
             bool has_base_init;        /* constructor declared a `: base(...)` initializer */
             bool has_this_init;
+            bool is_task_return;       /* declared Task/Task<T>/ValueTask<T> before async desugaring */
         } method_decl;
 
         /* field */
