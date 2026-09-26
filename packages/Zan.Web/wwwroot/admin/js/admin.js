@@ -1,28 +1,12 @@
 let currentView = 'dashboard';
+let currentUser = null;
 
-async function getToken() {
-  let token = localStorage.getItem('zan_token');
-  if (token) return token;
-  try {
-    const res = await fetch('/api/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: 'username=admin&password=123456'
-    });
-    const d = await res.json();
-    if (d && d.data && d.data.AccessToken) {
-      token = d.data.AccessToken;
-      localStorage.setItem('zan_token', token);
-      return token;
-    }
-  } catch (err) {
-    console.error('Auto login failed:', err);
-  }
-  return null;
+function getToken() {
+  return localStorage.getItem('zan_token') || '';
 }
 
 async function apiFetch(url, options = {}) {
-  const token = await getToken();
+  const token = getToken();
   options.headers = options.headers || {};
   if (token) {
     options.headers['Authorization'] = 'Bearer ' + token;
@@ -30,13 +14,67 @@ async function apiFetch(url, options = {}) {
   let res = await fetch(url, options);
   if (res.status === 401) {
     localStorage.removeItem('zan_token');
-    const newToken = await getToken();
-    if (newToken) {
-      options.headers['Authorization'] = 'Bearer ' + newToken;
-      res = await fetch(url, options);
-    }
+    localStorage.removeItem('zan_user');
+    window.location.href = '/admin/login?next=' + encodeURIComponent(window.location.pathname);
   }
   return res;
+}
+
+async function initUserSession() {
+  try {
+    const res = await apiFetch('/users/index/userinfo');
+    if (!res || res.status === 401) return;
+    const json = await res.json();
+    if (json.code === 0 && json.data) {
+      currentUser = json.data;
+      localStorage.setItem('zan_user', JSON.stringify(currentUser));
+      updateUserUI(currentUser);
+    } else {
+      window.location.href = '/admin/login';
+    }
+  } catch (err) {
+    console.error('Failed to init session:', err);
+  }
+}
+
+function updateUserUI(user) {
+  if (!user) return;
+  const nameEl = document.getElementById('hdrUserName');
+  const roleEl = document.getElementById('hdrUserRole');
+  const avatarEl = document.getElementById('hdrAvatar');
+  const menuNick = document.getElementById('menuNick');
+  const menuDept = document.getElementById('menuDept');
+
+  if (nameEl) nameEl.innerText = user.UserName || 'admin';
+  if (roleEl) roleEl.innerText = user.RoleName || '超级管理员';
+  if (avatarEl) avatarEl.innerText = (user.UserName || 'A')[0].toUpperCase();
+  if (menuNick) menuNick.innerText = user.NickName || user.UserName || '管理员';
+  if (menuDept) menuDept.innerText = user.DeptName || (user.RoleName || '总公司');
+}
+
+function toggleUserDropdown(e) {
+  if (e) e.stopPropagation();
+  const menu = document.getElementById('userMenu');
+  if (menu) {
+    menu.classList.toggle('show');
+  }
+}
+
+document.addEventListener('click', (e) => {
+  const container = document.querySelector('.user-dropdown-container');
+  const menu = document.getElementById('userMenu');
+  if (container && menu && !container.contains(e.target)) {
+    menu.classList.remove('show');
+  }
+});
+
+async function doLogout() {
+  try {
+    await fetch('/admin/logout', { method: 'POST' });
+  } catch (e) {}
+  localStorage.removeItem('zan_token');
+  localStorage.removeItem('zan_user');
+  window.location.href = '/admin/login';
 }
 
 async function fetchStats() {
@@ -248,7 +286,7 @@ async function loadView(name, event) {
           </div>
           <div style="display:flex;gap:8px;">
             <a href="/api/docs" target="_blank" class="btn btn-primary" style="text-decoration:none;display:inline-flex;align-items:center;gap:4px;">📖 打开交互式文档 (Swagger UI)</a>
-            <a href="/api/docs.json" target="_blank" class="btn" style="text-decoration:none;background:#f1f5f9;color:#334155;border:1px solid #cbd5e1;">📥 OpenAPI 3.0 JSON</a>
+            <a href="/api/docs.json" target="_blank" class="btn btn-outline" style="text-decoration:none;">📥 OpenAPI 3.0 JSON</a>
           </div>
         </div>
         <table id="docsTable">
@@ -355,6 +393,7 @@ function escapeHtml(str) {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
+  initUserSession();
   fetchStats();
   loadView('dashboard');
   setInterval(fetchStats, 3000);

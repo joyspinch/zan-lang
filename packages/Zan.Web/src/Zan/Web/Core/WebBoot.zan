@@ -6,6 +6,8 @@ using System.Web;
 using Zan.Web.Core;
 using Zan.Web.Modules.Monitor;
 using Zan.Web.Modules.Monitor.Controller;
+using Zan.Web.Modules.System.Model;
+using Zan.Web.Modules.System.Dao;
 using Zan.Web.Modules.System.Service;
 using Zan.Web.Modules.System.Controller;
 using Zan.Web.Modules.Dev.Controller;
@@ -20,6 +22,7 @@ public delegate void WebRouteFn(WebApp app);
 class WebBoot {
     private static WebRouteFn _routes;
     private static WebApp _app;
+    private static IDbConnection _db;
     private static bool _corsEnabled = true;
     private static string _corsOrigin = "*";
     private static int _slowThresholdMs = 300;
@@ -59,6 +62,7 @@ class WebBoot {
 
     /// 统一装配并启动 Web 宿主服务
     public static async int Run(string host, int port, IDbConnection db) {
+        _db = db;
         if (db != null) {
             Db.SetConnection(db);
             await SysSeed.SeedAll(db);
@@ -87,25 +91,31 @@ class WebBoot {
         // 4. 安装框架级权限门禁解析器 (uid + action -> allow)
         app.PermissionResolver(WebBoot.ResolvePermission);
 
-        // 5. 挂载路由：优先全自动装配编译器生成的属性路由 __AttrRoutes，再执行用户自定义注册
+        // 5. 配置未登录拦截重定向路径
+        app.LoginPath("/admin/login");
+
+        // 6. 挂载路由：优先全自动装配编译器生成的属性路由 __AttrRoutes，再执行用户自定义注册
         __AttrRoutes.Register(app);
         if (_routes != null) {
             _routes(app);
         }
 
-        // 6. 全自动挂载 OpenAPI 3.0 规范 (/api/docs.json) 与离线交互文档 UI (/api/docs)
+        // 7. 全自动挂载 OpenAPI 3.0 规范 (/api/docs.json) 与离线交互文档 UI (/api/docs)
         ApiDocs.Mount(app, "/api/docs");
 
-        // 7. 从路由特性自动同步菜单与超管权限（配置驱动，无须代码硬编码）
+        // 8. 从路由特性自动同步菜单与超管权限（配置驱动，无须代码硬编码）
         if (db != null) {
             await SysMenuSync.SyncFromRouter(db, app, 1);
         }
 
-        // 8. 挂载管理端静态文件服务 (CSS / JS / Assets) 与首页
-        string adminDir = ResolveAdminDir();
-        StaticFiles.Mount(app, "/admin", adminDir);
+        // 9. 挂载管理端静态文件服务 (CSS / JS / Assets) 与页面路由
+        app.Before(WebBoot.ServeAdminStatic);
         app.Get("/admin", WebBoot.ServeAdminHome);
         app.Get("/admin/", WebBoot.ServeAdminHome);
+        app.Get("/admin/login", WebBoot.ServeAdminLogin);
+        app.Post("/admin/login", WebBoot.HandleAdminLogin);
+        app.Get("/admin/logout", WebBoot.HandleAdminLogout);
+        app.Post("/admin/logout", WebBoot.HandleAdminLogout);
         app.Get("/", WebBoot.ServeRootHome);
 
         Console.WriteLine("[Zan.Web] Server booting at http://" + host + ":" + Convert.ToString(port));
@@ -184,7 +194,81 @@ class WebBoot {
         if (userId <= 0) {
             return false;
         }
-        return true;
+
+        IDbConnection db = _db != null ? _db : Db.Connection();
+        if (db == null) {
+            return false;
+        }
+
+        // 校验账号状态
+        SysUserDao userDao = new SysUserDao(db);
+        SysUser user = await userDao.ById(userId);
+        if (user == null || user.status != 1) {
+            return false;
+        }
+
+        // 查询角色并判断权限
+        SysUserRoleDao urDao = new SysUserRoleDao(db);
+        int roleId = await urDao.GetRoleId(userId);
+        if (roleId <= 0) {
+            return false;
+        }
+        if (roleId == 1) {
+            return true;
+        }
+
+        AuthManager authMgr = new AuthManager(db);
+        return await authMgr.CanAccess(roleId, action);
+    }
+
+    /// 判断当前 HttpContext 会话是否已完成身份认证
+    public static async bool IsAuthenticated(HttpContext ctx) {
+        if (ctx == null) { return false; }
+        string token = TokenService.ExtractTokenFromContext(ctx);
+        if (token == null || token.Length == 0) {
+            return false;
+        }
+        LoginUser u = await TokenService.GetLoginUser(token);
+        return u != null && u.UserID > 0;
+    }
+
+    /// 管理后台静态资源服务钩子 (/admin/css/*, /admin/js/* 等)
+    private static bool ServeAdminStatic(HttpContext ctx) {
+        if (ctx == null) { return true; }
+        if (ctx.method != "GET" && ctx.method != "HEAD") { return true; }
+        string p = ctx.path;
+        if (p == null) { return true; }
+        if (!p.StartsWith("/admin/css/") && !p.StartsWith("/admin/js/") && !p.StartsWith("/admin/assets/")) {
+            return true;
+        }
+        string adminDir = ResolveAdminDir();
+        string rel = p.Substring(7);
+        string full = adminDir + "/" + rel;
+        if (!File.Exists(full)) {
+            return true;
+        }
+        int size = File.GetSize(full);
+        if (size < 0) {
+            return true;
+        }
+        string ext = "";
+        int dot = full.LastIndexOf(".");
+        if (dot >= 0) {
+            ext = full.Substring(dot);
+        }
+        string ctype = "application/octet-stream";
+        if (ext == ".css") { ctype = "text/css; charset=utf-8"; }
+        else if (ext == ".js") { ctype = "application/javascript; charset=utf-8"; }
+        else if (ext == ".png") { ctype = "image/png"; }
+        else if (ext == ".jpg" || ext == ".jpeg") { ctype = "image/jpeg"; }
+        else if (ext == ".svg") { ctype = "image/svg+xml"; }
+        else if (ext == ".ico") { ctype = "image/x-icon"; }
+        else if (ext == ".json") { ctype = "application/json; charset=utf-8"; }
+
+        ctx.SetHeader("Cache-Control", "public, max-age=86400");
+        byte[] bytes = File.ReadAllBytes(full);
+        ctx.Binary(ctype, bytes, size);
+        return false;
     }
 
     /// 解析管理后台静态资源物理目录
@@ -201,9 +285,13 @@ class WebBoot {
         return "wwwroot/admin";
     }
 
-    /// 内置 Admin 单页控制台入口：从独立的物理 index.html 模板文件加载
+    /// 内置 Admin 单页控制台入口：未登录强制 302 拦截重定向至 /admin/login
     private static async void ServeAdminHome(HttpContext ctx) {
         if (ctx == null) { return; }
+        if (!await IsAuthenticated(ctx)) {
+            ctx.Redirect("/admin/login");
+            return;
+        }
         string adminDir = ResolveAdminDir();
         string indexPath = adminDir + "/index.html";
         if (File.Exists(indexPath)) {
@@ -211,6 +299,93 @@ class WebBoot {
             return;
         }
         ctx.Status(404, "Not Found").Text("Admin files not found at: " + indexPath);
+    }
+
+    /// 管理后台登录页：已登录自动进入控制台，未登录渲染登录界面
+    private static async void ServeAdminLogin(HttpContext ctx) {
+        if (ctx == null) { return; }
+        if (await IsAuthenticated(ctx)) {
+            ctx.Redirect("/admin");
+            return;
+        }
+        string adminDir = ResolveAdminDir();
+        string loginPath = adminDir + "/login.html";
+        if (File.Exists(loginPath)) {
+            ctx.Html(File.ReadAllText(loginPath));
+            return;
+        }
+        ctx.Status(404, "Not Found").Text("Login page not found at: " + loginPath);
+    }
+
+    /// 管理后台表单/异步登录提交处理
+    private static async void HandleAdminLogin(HttpContext ctx) {
+        if (ctx == null) { return; }
+        string userName = ctx.In("userName");
+        if (userName == null || userName.Length == 0) {
+            userName = ctx.In("username");
+        }
+        string password = ctx.In("password");
+        if (userName == null || userName.Length == 0 || password == null || password.Length == 0) {
+            ctx.Status(400, "Bad Request").Json("{\"code\":400,\"msg\":\"请输入账号和密码\"}");
+            return;
+        }
+
+        IDbConnection db = _db != null ? _db : Db.Connection();
+        if (db == null) {
+            ctx.Status(500, "Internal Server Error").Json("{\"code\":500,\"msg\":\"数据库未连接\"}");
+            return;
+        }
+
+        SysUserDao userDao = new SysUserDao(db);
+        SysUser user = await userDao.ByUsername(userName);
+        if (user == null) {
+            ctx.Status(400, "Bad Request").Json("{\"code\":400,\"msg\":\"账号或密码错误\"}");
+            return;
+        }
+        if (user.status != 1) {
+            ctx.Status(403, "Forbidden").Json("{\"code\":403,\"msg\":\"该账号已被停用\"}");
+            return;
+        }
+
+        bool match = SysUserDao.VerifyPassword(password, user.salt, user.password);
+        if (!match) {
+            ctx.Status(400, "Bad Request").Json("{\"code\":400,\"msg\":\"账号或密码错误\"}");
+            return;
+        }
+
+        SysUserRoleDao urDao = new SysUserRoleDao(db);
+        int roleId = await urDao.GetRoleId(user.id);
+        string roleName = "普通用户";
+        if (roleId > 0) {
+            SysRoleDao roleDao = new SysRoleDao(db);
+            SysRole r = await roleDao.ById(roleId);
+            if (r != null && r.name != null && r.name.Length > 0) {
+                roleName = r.name;
+            }
+        }
+
+        LoginUser loginUser = await TokenService.CreateToken(user, roleId > 0 ? roleId : 1, roleName);
+        ctx.SetCookie("zsession", loginUser.AccessToken, 604800);
+        ctx.SetCookie("token", loginUser.AccessToken, 604800);
+
+        string accept = ctx.Header("Accept");
+        if (accept != null && accept.Contains("application/json")) {
+            ctx.Json("{\"code\":0,\"msg\":\"success\",\"data\":" + loginUser.ToJson() + "}");
+        } else {
+            ctx.Redirect("/admin");
+        }
+    }
+
+    /// 管理后台退出登录
+    private static async void HandleAdminLogout(HttpContext ctx) {
+        if (ctx == null) { return; }
+        string token = TokenService.ExtractTokenFromContext(ctx);
+        if (token != null && token.Length > 0) {
+            await TokenService.RemoveToken(token);
+        }
+        ctx.SetCookie("zsession", "", 0);
+        ctx.SetCookie("token", "", 0);
+        ctx.Redirect("/admin/login");
     }
 
     /// 根路径重定向至管理后台
