@@ -84,11 +84,10 @@ static int zan_android_shm_unlink(const char *name) {
 #endif
 
 #define ZAN_TABLE_MAGIC UINT64_C(0x5a414e54424c3031)
-/* Version 3: lock words gained the held-bit + holder-pid encoding below.
- * Version 2 tables store bare 0/1 words that a version-3 reader would decode
- * as "held by pid 1" and never reclaim, so old mappings are rejected. */
-#define ZAN_TABLE_VERSION 3
-#define ZAN_TABLE_MAX_COLUMNS 16
+/* Version 4: Expanded ZAN_TABLE_MAX_COLUMNS from 16 to 32, expanding header to 1600 bytes.
+ * Older mappings (version <= 3) are rejected on Open/Attach to prevent row offset shifts. */
+#define ZAN_TABLE_VERSION 4
+#define ZAN_TABLE_MAX_COLUMNS 32
 #define ZAN_TABLE_COLUMN_NAME 32
 /* Schema ceilings. The checker rejects a constant width past these where it
  * is declared (checker.c: CHECKER_SHARED_MAX_*), so raising one here means

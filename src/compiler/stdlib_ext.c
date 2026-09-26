@@ -132,22 +132,322 @@ zan_http_response_t *zan_http_post(const char *url, const char *body, const char
     return resp;
 }
 
-#else /* POSIX - use libcurl if available, otherwise stub */
+#else /* POSIX - dynamic libcurl with raw socket fallback */
 
-zan_http_response_t *zan_http_get(const char *url) {
-    (void)url;
+#include <dlfcn.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <errno.h>
+
+typedef void CURL;
+typedef enum {
+    CURLOPT_URL = 10002,
+    CURLOPT_WRITEDATA = 10001,
+    CURLOPT_WRITEFUNCTION = 20011,
+    CURLOPT_POSTFIELDS = 10015,
+    CURLOPT_POSTFIELDSIZE = 60,
+    CURLOPT_HTTPHEADER = 10023,
+    CURLOPT_FOLLOWLOCATION = 52,
+    CURLOPT_TIMEOUT = 13,
+    CURLOPT_USERAGENT = 10018,
+    CURLOPT_NOSIGNAL = 99
+} CURLoption;
+
+typedef enum {
+    CURLINFO_RESPONSE_CODE = 0x200000 + 2
+} CURLINFO;
+
+struct curl_slist {
+    char *data;
+    struct curl_slist *next;
+};
+
+typedef struct {
+    void *handle;
+    int initialized;
+    CURL *(*easy_init)(void);
+    int (*easy_setopt)(CURL *curl, CURLoption option, ...);
+    int (*easy_perform)(CURL *curl);
+    int (*easy_getinfo)(CURL *curl, CURLINFO info, ...);
+    void (*easy_cleanup)(CURL *curl);
+    struct curl_slist *(*slist_append)(struct curl_slist *, const char *);
+    void (*slist_free_all)(struct curl_slist *);
+    int (*global_init)(long flags);
+} zan_curl_api_t;
+
+static zan_curl_api_t g_curl;
+static int g_curl_attempted = 0;
+
+static int zan_init_curl_api(void) {
+    if (g_curl_attempted) return g_curl.initialized;
+    g_curl_attempted = 1;
+    memset(&g_curl, 0, sizeof(g_curl));
+
+    const char *libs[] = {
+#if defined(__APPLE__)
+        "/usr/lib/libcurl.4.dylib",
+        "libcurl.4.dylib",
+        "libcurl.dylib",
+#else
+        "libcurl.so.4",
+        "libcurl.so",
+        "libcurl.so.3",
+#endif
+        NULL
+    };
+
+    for (int i = 0; libs[i]; i++) {
+        g_curl.handle = dlopen(libs[i], RTLD_NOW | RTLD_LOCAL);
+        if (g_curl.handle) break;
+    }
+    if (!g_curl.handle) return 0;
+
+    g_curl.easy_init = dlsym(g_curl.handle, "curl_easy_init");
+    g_curl.easy_setopt = dlsym(g_curl.handle, "curl_easy_setopt");
+    g_curl.easy_perform = dlsym(g_curl.handle, "curl_easy_perform");
+    g_curl.easy_getinfo = dlsym(g_curl.handle, "curl_easy_getinfo");
+    g_curl.easy_cleanup = dlsym(g_curl.handle, "curl_easy_cleanup");
+    g_curl.slist_append = dlsym(g_curl.handle, "curl_slist_append");
+    g_curl.slist_free_all = dlsym(g_curl.handle, "curl_slist_free_all");
+    g_curl.global_init = dlsym(g_curl.handle, "curl_global_init");
+
+    if (!g_curl.easy_init || !g_curl.easy_setopt || !g_curl.easy_perform ||
+        !g_curl.easy_cleanup || !g_curl.easy_getinfo) {
+        dlclose(g_curl.handle);
+        g_curl.handle = NULL;
+        return 0;
+    }
+
+    if (g_curl.global_init) {
+        g_curl.global_init(3); /* CURL_GLOBAL_ALL */
+    }
+    g_curl.initialized = 1;
+    return 1;
+}
+
+typedef struct {
+    char *data;
+    size_t size;
+    size_t cap;
+} zan_http_buf_t;
+
+static size_t zan_curl_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata) {
+    size_t total = size * nmemb;
+    zan_http_buf_t *buf = (zan_http_buf_t *)userdata;
+    if (buf->size + total + 1 >= buf->cap) {
+        size_t new_cap = (buf->cap == 0) ? 4096 : buf->cap * 2;
+        while (new_cap <= buf->size + total + 1) new_cap *= 2;
+        char *p = (char *)realloc(buf->data, new_cap);
+        if (!p) return 0;
+        buf->data = p;
+        buf->cap = new_cap;
+    }
+    memcpy(buf->data + buf->size, ptr, total);
+    buf->size += total;
+    buf->data[buf->size] = '\0';
+    return total;
+}
+
+static zan_http_response_t *zan_posix_socket_http(const char *url, const char *method,
+                                                  const char *body, const char *content_type) {
     zan_http_response_t *resp = (zan_http_response_t *)calloc(1, sizeof(zan_http_response_t));
     resp->status_code = -1;
-    resp->body = strdup("HTTP not available on this platform without libcurl");
-    resp->body_len = strlen(resp->body);
+
+    if (strncmp(url, "http://", 7) != 0) {
+        resp->body = strdup("HTTPS requires libcurl on this platform");
+        resp->body_len = strlen(resp->body);
+        return resp;
+    }
+
+    const char *host_start = url + 7;
+    const char *slash = strchr(host_start, '/');
+    const char *colon = strchr(host_start, ':');
+
+    char host[256] = {0};
+    char port[16] = "80";
+    const char *path = slash ? slash : "/";
+
+    if (colon && (!slash || colon < slash)) {
+        size_t host_len = (size_t)(colon - host_start);
+        if (host_len >= sizeof(host)) host_len = sizeof(host) - 1;
+        memcpy(host, host_start, host_len);
+        size_t port_len = slash ? (size_t)(slash - colon - 1) : strlen(colon + 1);
+        if (port_len >= sizeof(port)) port_len = sizeof(port) - 1;
+        memcpy(port, colon + 1, port_len);
+    } else {
+        size_t host_len = slash ? (size_t)(slash - host_start) : strlen(host_start);
+        if (host_len >= sizeof(host)) host_len = sizeof(host) - 1;
+        memcpy(host, host_start, host_len);
+    }
+
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo(host, port, &hints, &res) != 0 || !res) {
+        resp->body = strdup("Host resolution failed");
+        resp->body_len = strlen(resp->body);
+        return resp;
+    }
+
+    int sock = -1;
+    for (struct addrinfo *p = res; p; p = p->ai_next) {
+        sock = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (sock < 0) continue;
+        if (connect(sock, p->ai_addr, p->ai_addrlen) == 0) break;
+        close(sock);
+        sock = -1;
+    }
+    freeaddrinfo(res);
+
+    if (sock < 0) {
+        resp->body = strdup("Connection failed");
+        resp->body_len = strlen(resp->body);
+        return resp;
+    }
+
+    char req[2048];
+    size_t body_sz = body ? strlen(body) : 0;
+    if (strcmp(method, "POST") == 0) {
+        snprintf(req, sizeof(req),
+                 "POST %s HTTP/1.1\r\n"
+                 "Host: %s\r\n"
+                 "User-Agent: Zan/1.0\r\n"
+                 "Content-Type: %s\r\n"
+                 "Content-Length: %zu\r\n"
+                 "Connection: close\r\n\r\n",
+                 path, host, content_type ? content_type : "application/json", body_sz);
+    } else {
+        snprintf(req, sizeof(req),
+                 "GET %s HTTP/1.1\r\n"
+                 "Host: %s\r\n"
+                 "User-Agent: Zan/1.0\r\n"
+                 "Connection: close\r\n\r\n",
+                 path, host);
+    }
+
+    send(sock, req, strlen(req), 0);
+    if (body_sz > 0) {
+        send(sock, body, body_sz, 0);
+    }
+
+    zan_http_buf_t recv_buf = {0};
+    char chunk[4096];
+    ssize_t n;
+    while ((n = recv(sock, chunk, sizeof(chunk), 0)) > 0) {
+        zan_curl_write_cb(chunk, 1, (size_t)n, &recv_buf);
+    }
+    close(sock);
+
+    if (recv_buf.data) {
+        if (strncmp(recv_buf.data, "HTTP/1.", 7) == 0) {
+            char *sp = strchr(recv_buf.data, ' ');
+            if (sp) resp->status_code = atoi(sp + 1);
+        }
+        char *header_end = strstr(recv_buf.data, "\r\n\r\n");
+        if (header_end) {
+            size_t header_len = (size_t)(header_end - recv_buf.data);
+            resp->headers = (char *)malloc(header_len + 1);
+            memcpy(resp->headers, recv_buf.data, header_len);
+            resp->headers[header_len] = '\0';
+
+            char *body_data = header_end + 4;
+            size_t blen = recv_buf.size - (size_t)(body_data - recv_buf.data);
+            resp->body = (char *)malloc(blen + 1);
+            memcpy(resp->body, body_data, blen);
+            resp->body[blen] = '\0';
+            resp->body_len = blen;
+        } else {
+            resp->body = recv_buf.data;
+            resp->body_len = recv_buf.size;
+            recv_buf.data = NULL;
+        }
+        free(recv_buf.data);
+    }
     return resp;
 }
 
+zan_http_response_t *zan_http_get(const char *url) {
+    if (zan_init_curl_api()) {
+        zan_http_response_t *resp = (zan_http_response_t *)calloc(1, sizeof(zan_http_response_t));
+        resp->status_code = -1;
+        CURL *curl = g_curl.easy_init();
+        if (curl) {
+            zan_http_buf_t buf = {0};
+            g_curl.easy_setopt(curl, CURLOPT_URL, url);
+            g_curl.easy_setopt(curl, CURLOPT_WRITEFUNCTION, zan_curl_write_cb);
+            g_curl.easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+            g_curl.easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+            g_curl.easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+            g_curl.easy_setopt(curl, CURLOPT_USERAGENT, "Zan/1.0");
+            g_curl.easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+            int res = g_curl.easy_perform(curl);
+            long code = 0;
+            if (res == 0) {
+                g_curl.easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+                resp->status_code = (int)code;
+                resp->body = buf.data ? buf.data : strdup("");
+                resp->body_len = buf.size;
+            } else {
+                free(buf.data);
+                resp->status_code = -1;
+            }
+            g_curl.easy_cleanup(curl);
+            return resp;
+        }
+        free(resp);
+    }
+    return zan_posix_socket_http(url, "GET", NULL, NULL);
+}
+
 zan_http_response_t *zan_http_post(const char *url, const char *body, const char *content_type) {
-    (void)url; (void)body; (void)content_type;
-    zan_http_response_t *resp = (zan_http_response_t *)calloc(1, sizeof(zan_http_response_t));
-    resp->status_code = -1;
-    return resp;
+    if (zan_init_curl_api()) {
+        zan_http_response_t *resp = (zan_http_response_t *)calloc(1, sizeof(zan_http_response_t));
+        resp->status_code = -1;
+        CURL *curl = g_curl.easy_init();
+        if (curl) {
+            zan_http_buf_t buf = {0};
+            struct curl_slist *headers = NULL;
+            if (content_type && g_curl.slist_append) {
+                char header_buf[256];
+                snprintf(header_buf, sizeof(header_buf), "Content-Type: %s", content_type);
+                headers = g_curl.slist_append(headers, header_buf);
+            }
+            g_curl.easy_setopt(curl, CURLOPT_URL, url);
+            g_curl.easy_setopt(curl, CURLOPT_POSTFIELDS, body ? body : "");
+            if (body) {
+                g_curl.easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(body));
+            }
+            if (headers) {
+                g_curl.easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+            }
+            g_curl.easy_setopt(curl, CURLOPT_WRITEFUNCTION, zan_curl_write_cb);
+            g_curl.easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+            g_curl.easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+            g_curl.easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+            g_curl.easy_setopt(curl, CURLOPT_USERAGENT, "Zan/1.0");
+            g_curl.easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+            int res = g_curl.easy_perform(curl);
+            long code = 0;
+            if (res == 0) {
+                g_curl.easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+                resp->status_code = (int)code;
+                resp->body = buf.data ? buf.data : strdup("");
+                resp->body_len = buf.size;
+            } else {
+                free(buf.data);
+                resp->status_code = -1;
+            }
+            if (headers && g_curl.slist_free_all) g_curl.slist_free_all(headers);
+            g_curl.easy_cleanup(curl);
+            return resp;
+        }
+        free(resp);
+    }
+    return zan_posix_socket_http(url, "POST", body, content_type);
 }
 
 #endif
@@ -305,7 +605,7 @@ static char *parse_json_string(const char **p, const char *end, size_t *out_len)
 /* Nesting cap for the recursive-descent JSON reader: the input ultimately
  * comes from the network, so an adversarial `[[[[[...` must fail cleanly
  * instead of exhausting the C stack. */
-#define ZAN_JSON_MAX_DEPTH 128
+#define ZAN_JSON_MAX_DEPTH 512
 
 static zan_json_value_t *parse_json_value(const char **p, const char *end,
                                           int depth) {

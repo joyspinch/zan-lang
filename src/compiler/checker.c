@@ -70,7 +70,7 @@ static zan_type_t *builtin_call_result_type(zan_checker_t *c,
 /* Depth cap for every walk that follows base_type / interface chains. The
  * binder rejects cyclic inheritance outright (binder.c resolve_bases), but a
  * stray ring must never turn a checker pass into an infinite loop. */
-#define CHECKER_DERIVES_MAX_DEPTH 512
+#define CHECKER_DERIVES_MAX_DEPTH 1024
 
 void zan_checker_init(zan_checker_t *c, zan_binder_t *binder,
                       zan_arena_t *arena, zan_diag_t *diag) {

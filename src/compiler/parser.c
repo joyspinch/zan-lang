@@ -21,7 +21,7 @@
 
 /* Caps shared by every depth-guarded recursion in the parser. Defined up
  * here because parse_type_ref sits above the statement section. */
-#define ZAN_PARSER_MAX_TYPE_DEPTH 256
+#define ZAN_PARSER_MAX_TYPE_DEPTH 512
 
 /* ---- helpers ---- */
 
@@ -1851,7 +1851,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
  * descent and turns pathological nesting (e.g. thousands of '(' or '!') into a
  * diagnostic instead of a stack overflow. The limit is far beyond any
  * hand-written or normally-generated expression. */
-#define ZAN_PARSER_MAX_EXPR_DEPTH 256
+#define ZAN_PARSER_MAX_EXPR_DEPTH 512
 
 static zan_ast_node_t *parse_unary_inner(zan_parser_t *p);
 
@@ -2003,7 +2003,7 @@ static bool is_question_is_conditional(zan_parser_t *p) {
  * recursively (inference, walkers, AST free), so a hostile or generated
  * million-token chain ends the compiler in a stack overflow well after the
  * parser has returned. Cap the chain here, where it is built. */
-#define ZAN_PARSER_MAX_BINOP_CHAIN 1024
+#define ZAN_PARSER_MAX_BINOP_CHAIN 2048
 
 static zan_ast_node_t *parse_binary(zan_parser_t *p, int min_prec) {
     zan_ast_node_t *left = parse_unary(p);
@@ -2227,7 +2227,7 @@ static zan_ast_node_t *parse_expression_inner(zan_parser_t *p) {
 /* Cap on statement/block nesting. Thousands of nested `{` recurse
  * parse_block -> parse_statement without bound and would exhaust the C stack
  * before any diagnostic fires; mirror the expression depth cap. */
-#define ZAN_PARSER_MAX_STMT_DEPTH 128
+#define ZAN_PARSER_MAX_STMT_DEPTH 256
 
 /* Cap on type-reference nesting (generics, tuple types, dotted qualifiers):
  * see the definition at the top of this file. */

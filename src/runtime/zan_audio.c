@@ -56,12 +56,17 @@
 #include <audioclient.h>
 #endif
 
+#ifndef _WIN32
+#include <pthread.h>
+#include <dlfcn.h>
+#include <unistd.h>
+#endif
+
 #ifdef __ANDROID__
 /* AAudio is API 26+; the driver targets android-28 so the header is
  * always available. Mixing runs on the stream's own callback thread,
  * serialized against the API thread by zan_audio_mutex. */
 #include <aaudio/AAudio.h>
-#include <pthread.h>
 #endif
 
 /* OGG Vorbis (background music): stb_vorbis single-file implementation,
@@ -122,11 +127,14 @@ static int zan_audio_dev_channels;
 static int zan_audio_dev_fmt;
 #endif
 
-#ifdef __ANDROID__
+#ifndef _WIN32
 static pthread_mutex_t zan_audio_mutex = PTHREAD_MUTEX_INITIALIZER;
-static AAudioStream *zan_audio_stream;
 static int zan_audio_dev_freq;      /* device sample rate */
 static int zan_audio_dev_channels;  /* device channel count (1/2) */
+#endif
+
+#ifdef __ANDROID__
+static AAudioStream *zan_audio_stream;
 #endif
 
 static void zan_audio_set_err(const char *msg) {
@@ -440,7 +448,7 @@ static void zan_audio_mix(unsigned char *dst, UINT32 frames) {
         cur = v->cursor;
         step = v->step;
         if (!(step > 0.0)) step = 1.0;
-        g = (double)v->gain * (double)zan_audio_master;
+        g = ((double)v->gain * (double)zan_audio_master) / 32767.0;
         if (g != 0.0) {
             for (f = 0; f < (int)frames; f++) {
                 int i0, i1;
@@ -676,7 +684,7 @@ thread_fail:
  * directly with no conversion pass after it.
  * =================================================================== */
 
-#ifdef __ANDROID__
+#ifndef _WIN32
 
 static void zan_audio_mix_s16(unsigned char *dst, int frames, int devch) {
     /* 4096 frames * 8 channels * 4 bytes = 128 KiB static accumulator;
@@ -706,7 +714,7 @@ static void zan_audio_mix_s16(unsigned char *dst, int frames, int devch) {
         cur = v->cursor;
         step = v->step;
         if (!(step > 0.0)) step = 1.0;
-        g = (double)v->gain * (double)zan_audio_master;
+        g = ((double)v->gain * (double)zan_audio_master) / 32767.0;
         if (g != 0.0) {
             for (f = 0; f < frames; f++) {
                 int i0, i1;
@@ -749,6 +757,73 @@ static void zan_audio_mix_s16(unsigned char *dst, int frames, int devch) {
         d[i] = (short)(int)(s * 32767.0f);
     }
 }
+
+static void zan_audio_mix_f32(float *dst, int frames, int devch) {
+    static float acc[ZAN_AUDIO_MAX_FILL * ZAN_AUDIO_MAX_CHANNELS];
+    int f, ch, i;
+    int total;
+
+    if (frames > ZAN_AUDIO_MAX_FILL) frames = ZAN_AUDIO_MAX_FILL;
+    if (devch < 1 || devch > ZAN_AUDIO_MAX_CHANNELS) devch = 2;
+    total = (int)frames * devch;
+    memset(acc, 0, sizeof(float) * (size_t)total);
+
+    for (i = 0; i < ZAN_VOICE_SLOTS; i++) {
+        ZanVoice *v = &zan_voices[i];
+        ZanAudioClip *c;
+        double cur, step, g;
+        int nf, clipch;
+        const short *pcm;
+        if (!v->active || !v->clip) continue;
+        c = v->clip;
+        nf = c->frames;
+        if (nf <= 0) { zan_voice_reset(v); continue; }
+        clipch = c->channels;
+        pcm = c->pcm;
+        cur = v->cursor;
+        step = v->step;
+        if (!(step > 0.0)) step = 1.0;
+        g = ((double)v->gain * (double)zan_audio_master) / 32767.0;
+        if (g != 0.0) {
+            for (f = 0; f < frames; f++) {
+                int i0, i1;
+                double frac;
+                if (v->loop) {
+                    while (cur >= (double)nf) cur -= (double)nf;
+                } else if (cur >= (double)nf) {
+                    break;
+                }
+                i0 = (int)cur;
+                frac = cur - (double)i0;
+                i1 = i0 + 1;
+                if (i1 >= nf) i1 = nf - 1;
+                for (ch = 0; ch < devch; ch++) {
+                    int cc = ch % clipch;
+                    float s0 = (float)pcm[(size_t)i0 * clipch + cc];
+                    float s1 = (float)pcm[(size_t)i1 * clipch + cc];
+                    acc[(size_t)f * devch + ch] += (s0 + (s1 - s0) * (float)frac) * (float)g;
+                }
+                cur += step;
+            }
+        }
+        v->cursor = cur;
+        if (!v->loop && cur >= (double)nf) zan_voice_reset(v);
+    }
+
+    for (i = 0; i < total; i++) {
+        float s = acc[i];
+        if (s > 0.5f) {
+            s = 0.5f + 0.5f * tanhf((s - 0.5f) * 2.0f);
+        } else if (s < -0.5f) {
+            s = -0.5f - 0.5f * tanhf((-s - 0.5f) * 2.0f);
+        }
+        dst[i] = s;
+    }
+}
+
+#endif /* !_WIN32 */
+
+#ifdef __ANDROID__
 
 /* AAudio callback thread: the stream was opened as s16 (see open), so
  * the mixed s16 frames go straight into the stream buffer. The device
@@ -812,6 +887,310 @@ static AAudioStream *zan_audio_aa_open_stream(void) {
 }
 
 #endif /* __ANDROID__ */
+
+#if defined(__linux__) && !defined(__ANDROID__)
+
+typedef struct {
+    void *handle;
+    int (*open)(void **pcm, const char *name, int stream, int mode);
+    int (*set_params)(void *pcm, int format, int access, unsigned int channels,
+                      unsigned int rate, int soft_resample, unsigned int latency);
+    long (*writei)(void *pcm, const void *buffer, unsigned long size);
+    int (*recover)(void *pcm, int err, int silent);
+    int (*close)(void *pcm);
+    int (*drain)(void *pcm);
+} zan_alsa_api_t;
+
+static zan_alsa_api_t zan_alsa;
+static void *zan_alsa_pcm = NULL;
+static pthread_t zan_alsa_th;
+static int zan_alsa_th_running = 0;
+
+static void *zan_alsa_worker(void *arg) {
+    (void)arg;
+    short buf[1024 * 2];
+    while (zan_audio_ready) {
+        pthread_mutex_lock(&zan_audio_mutex);
+        if (!zan_audio_ready) {
+            pthread_mutex_unlock(&zan_audio_mutex);
+            break;
+        }
+        zan_audio_mix_s16((unsigned char *)buf, 1024, zan_audio_dev_channels);
+        pthread_mutex_unlock(&zan_audio_mutex);
+
+        long written = zan_alsa.writei(zan_alsa_pcm, buf, 1024);
+        if (written < 0) {
+            zan_alsa.recover(zan_alsa_pcm, (int)written, 1);
+        }
+    }
+    return NULL;
+}
+
+static int zan_alsa_init(void) {
+    if (zan_alsa.handle) return 1;
+    zan_alsa.handle = dlopen("libasound.so.2", RTLD_NOW | RTLD_LOCAL);
+    if (!zan_alsa.handle) {
+        zan_alsa.handle = dlopen("libasound.so", RTLD_NOW | RTLD_LOCAL);
+    }
+    if (!zan_alsa.handle) {
+        zan_audio_set_err("ALSA driver: libasound.so.2 not found");
+        return 0;
+    }
+    zan_alsa.open = (int (*)(void **, const char *, int, int))dlsym(zan_alsa.handle, "snd_pcm_open");
+    zan_alsa.set_params = (int (*)(void *, int, int, unsigned int, unsigned int, int, unsigned int))dlsym(zan_alsa.handle, "snd_pcm_set_params");
+    zan_alsa.writei = (long (*)(void *, const void *, unsigned long))dlsym(zan_alsa.handle, "snd_pcm_writei");
+    zan_alsa.recover = (int (*)(void *, int, int))dlsym(zan_alsa.handle, "snd_pcm_recover");
+    zan_alsa.close = (int (*)(void *))dlsym(zan_alsa.handle, "snd_pcm_close");
+    zan_alsa.drain = (int (*)(void *))dlsym(zan_alsa.handle, "snd_pcm_drain");
+    if (!zan_alsa.open || !zan_alsa.set_params || !zan_alsa.writei ||
+        !zan_alsa.recover || !zan_alsa.close) {
+        dlclose(zan_alsa.handle);
+        zan_alsa.handle = NULL;
+        zan_audio_set_err("ALSA driver: missing required symbols in libasound");
+        return 0;
+    }
+    return 1;
+}
+
+static int zan_alsa_start(void) {
+    if (!zan_alsa_init()) return 0;
+    int err = zan_alsa.open(&zan_alsa_pcm, "default", 0 /* SND_PCM_STREAM_PLAYBACK */, 0);
+    if (err < 0 || !zan_alsa_pcm) {
+        zan_audio_set_err("ALSA driver: snd_pcm_open failed on default device");
+        return 0;
+    }
+    zan_audio_dev_freq = 44100;
+    zan_audio_dev_channels = 2;
+    err = zan_alsa.set_params(zan_alsa_pcm, 2 /* SND_PCM_FORMAT_S16_LE */, 3 /* SND_PCM_ACCESS_RW_INTERLEAVED */,
+                              (unsigned int)zan_audio_dev_channels, (unsigned int)zan_audio_dev_freq, 1, 50000);
+    if (err < 0) {
+        zan_audio_dev_freq = 48000;
+        err = zan_alsa.set_params(zan_alsa_pcm, 2, 3, (unsigned int)zan_audio_dev_channels,
+                                  (unsigned int)zan_audio_dev_freq, 1, 50000);
+    }
+    if (err < 0) {
+        zan_alsa.close(zan_alsa_pcm);
+        zan_alsa_pcm = NULL;
+        zan_audio_set_err("ALSA driver: snd_pcm_set_params failed");
+        return 0;
+    }
+    zan_alsa_th_running = (pthread_create(&zan_alsa_th, NULL, zan_alsa_worker, NULL) == 0);
+    if (!zan_alsa_th_running) {
+        zan_alsa.close(zan_alsa_pcm);
+        zan_alsa_pcm = NULL;
+        zan_audio_set_err("ALSA driver: failed to spawn worker thread");
+        return 0;
+    }
+    return 1;
+}
+
+static void zan_alsa_stop(void) {
+    if (zan_alsa_th_running) {
+        pthread_join(zan_alsa_th, NULL);
+        zan_alsa_th_running = 0;
+    }
+    if (zan_alsa_pcm && zan_alsa.close) {
+        zan_alsa.close(zan_alsa_pcm);
+        zan_alsa_pcm = NULL;
+    }
+}
+#endif /* __linux__ */
+
+#if defined(__APPLE__)
+
+typedef uint32_t zan_ca_OSType;
+typedef int32_t zan_ca_OSStatus;
+typedef void *zan_ca_AudioComponent;
+typedef void *zan_ca_AudioComponentInstance;
+
+typedef struct {
+    zan_ca_OSType componentType;
+    zan_ca_OSType componentSubType;
+    zan_ca_OSType componentManufacturer;
+    uint32_t componentFlags;
+    uint32_t componentFlagsMask;
+} zan_ca_AudioComponentDescription;
+
+typedef struct {
+    uint32_t mNumberChannels;
+    uint32_t mDataByteSize;
+    void *mData;
+} zan_ca_AudioBuffer;
+
+typedef struct {
+    uint32_t mNumberBuffers;
+    zan_ca_AudioBuffer mBuffers[1];
+} zan_ca_AudioBufferList;
+
+typedef struct {
+    double mSampleRate;
+    uint32_t mFormatID;
+    uint32_t mFormatFlags;
+    uint32_t mBytesPerPacket;
+    uint32_t mFramesPerPacket;
+    uint32_t mBytesPerFrame;
+    uint32_t mChannelsPerFrame;
+    uint32_t mBitsPerChannel;
+    uint32_t mReserved;
+} zan_ca_AudioStreamBasicDescription;
+
+typedef zan_ca_OSStatus (*zan_ca_AURenderCallback)(
+    void *inRefCon,
+    uint32_t *ioActionFlags,
+    const void *inTimeStamp,
+    uint32_t inBusNumber,
+    uint32_t inNumberFrames,
+    zan_ca_AudioBufferList *ioData);
+
+typedef struct {
+    zan_ca_AURenderCallback inputProc;
+    void *inputProcRefCon;
+} zan_ca_AURenderCallbackStruct;
+
+typedef struct {
+    void *handle;
+    zan_ca_AudioComponent (*FindNext)(zan_ca_AudioComponent inComponent, const zan_ca_AudioComponentDescription *inDesc);
+    zan_ca_OSStatus (*InstanceNew)(zan_ca_AudioComponent inComponent, zan_ca_AudioComponentInstance *outInstance);
+    zan_ca_OSStatus (*InstanceDispose)(zan_ca_AudioComponentInstance inInstance);
+    zan_ca_OSStatus (*UnitInitialize)(zan_ca_AudioComponentInstance inUnit);
+    zan_ca_OSStatus (*UnitUninitialize)(zan_ca_AudioComponentInstance inUnit);
+    zan_ca_OSStatus (*OutputStart)(zan_ca_AudioComponentInstance ci);
+    zan_ca_OSStatus (*OutputStop)(zan_ca_AudioComponentInstance ci);
+    zan_ca_OSStatus (*SetProperty)(zan_ca_AudioComponentInstance inUnit,
+                                   uint32_t inID, uint32_t inScope, uint32_t inElement,
+                                   const void *inData, uint32_t inDataSize);
+} zan_coreaudio_api_t;
+
+static zan_coreaudio_api_t zan_ca;
+static zan_ca_AudioComponentInstance zan_ca_unit = NULL;
+
+static zan_ca_OSStatus zan_coreaudio_render_cb(
+    void *inRefCon,
+    uint32_t *ioActionFlags,
+    const void *inTimeStamp,
+    uint32_t inBusNumber,
+    uint32_t inNumberFrames,
+    zan_ca_AudioBufferList *ioData) {
+    (void)inRefCon; (void)ioActionFlags; (void)inTimeStamp; (void)inBusNumber;
+    if (inNumberFrames <= 0 || !ioData || ioData->mNumberBuffers == 0) return 0;
+    float *dst = (float *)ioData->mBuffers[0].mData;
+    if (!dst) return 0;
+
+    pthread_mutex_lock(&zan_audio_mutex);
+    if (!zan_audio_ready) {
+        pthread_mutex_unlock(&zan_audio_mutex);
+        memset(dst, 0, (size_t)inNumberFrames * 2 * sizeof(float));
+        return 0;
+    }
+    zan_audio_mix_f32(dst, (int)inNumberFrames, zan_audio_dev_channels);
+    pthread_mutex_unlock(&zan_audio_mutex);
+    return 0;
+}
+
+static int zan_coreaudio_init(void) {
+    if (zan_ca.handle) return 1;
+    const char *paths[] = {
+        "/System/Library/Frameworks/AudioToolbox.framework/AudioToolbox",
+        "AudioToolbox.framework/AudioToolbox",
+        NULL
+    };
+    for (int i = 0; paths[i]; i++) {
+        zan_ca.handle = dlopen(paths[i], RTLD_NOW | RTLD_LOCAL);
+        if (zan_ca.handle) break;
+    }
+    if (!zan_ca.handle) {
+        zan_audio_set_err("CoreAudio driver: AudioToolbox framework not found");
+        return 0;
+    }
+    zan_ca.FindNext = (zan_ca_AudioComponent (*)(zan_ca_AudioComponent, const zan_ca_AudioComponentDescription *))dlsym(zan_ca.handle, "AudioComponentFindNext");
+    zan_ca.InstanceNew = (zan_ca_OSStatus (*)(zan_ca_AudioComponent, zan_ca_AudioComponentInstance *))dlsym(zan_ca.handle, "AudioComponentInstanceNew");
+    zan_ca.InstanceDispose = (zan_ca_OSStatus (*)(zan_ca_AudioComponentInstance))dlsym(zan_ca.handle, "AudioComponentInstanceDispose");
+    zan_ca.UnitInitialize = (zan_ca_OSStatus (*)(zan_ca_AudioComponentInstance))dlsym(zan_ca.handle, "AudioUnitInitialize");
+    zan_ca.UnitUninitialize = (zan_ca_OSStatus (*)(zan_ca_AudioComponentInstance))dlsym(zan_ca.handle, "AudioUnitUninitialize");
+    zan_ca.OutputStart = (zan_ca_OSStatus (*)(zan_ca_AudioComponentInstance))dlsym(zan_ca.handle, "AudioOutputUnitStart");
+    zan_ca.OutputStop = (zan_ca_OSStatus (*)(zan_ca_AudioComponentInstance))dlsym(zan_ca.handle, "AudioOutputUnitStop");
+    zan_ca.SetProperty = (zan_ca_OSStatus (*)(zan_ca_AudioComponentInstance, uint32_t, uint32_t, uint32_t, const void *, uint32_t))dlsym(zan_ca.handle, "AudioUnitSetProperty");
+    if (!zan_ca.FindNext || !zan_ca.InstanceNew || !zan_ca.UnitInitialize ||
+        !zan_ca.OutputStart || !zan_ca.OutputStop || !zan_ca.SetProperty) {
+        dlclose(zan_ca.handle);
+        zan_ca.handle = NULL;
+        zan_audio_set_err("CoreAudio driver: missing required symbols in AudioToolbox");
+        return 0;
+    }
+    return 1;
+}
+
+static int zan_coreaudio_start(void) {
+    if (!zan_coreaudio_init()) return 0;
+
+    zan_ca_AudioComponentDescription desc;
+    desc.componentType = 0x61756f75;        /* 'auou' = kAudioUnitType_Output */
+    desc.componentSubType = 0x64656620;     /* 'def ' = kAudioUnitSubType_DefaultOutput */
+    desc.componentManufacturer = 0x6170706c;/* 'appl' = kAudioUnitManufacturer_Apple */
+    desc.componentFlags = 0;
+    desc.componentFlagsMask = 0;
+
+    zan_ca_AudioComponent comp = zan_ca.FindNext(NULL, &desc);
+    if (!comp) {
+        zan_audio_set_err("CoreAudio driver: default output audio component not found");
+        return 0;
+    }
+
+    if (zan_ca.InstanceNew(comp, &zan_ca_unit) != 0 || !zan_ca_unit) {
+        zan_audio_set_err("CoreAudio driver: AudioComponentInstanceNew failed");
+        return 0;
+    }
+
+    zan_audio_dev_freq = 44100;
+    zan_audio_dev_channels = 2;
+
+    /* Set Stream Format: 44.1kHz, 2-ch float32 interleaved */
+    zan_ca_AudioStreamBasicDescription fmt;
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.mSampleRate = (double)zan_audio_dev_freq;
+    fmt.mFormatID = 0x6c70636d; /* 'lpcm' = kAudioFormatLinearPCM */
+    fmt.mFormatFlags = (1U << 0) | (1U << 3); /* kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked */
+    fmt.mChannelsPerFrame = (uint32_t)zan_audio_dev_channels;
+    fmt.mBitsPerChannel = 32;
+    fmt.mBytesPerFrame = (uint32_t)(zan_audio_dev_channels * sizeof(float));
+    fmt.mFramesPerPacket = 1;
+    fmt.mBytesPerPacket = fmt.mBytesPerFrame;
+
+    /* kAudioUnitProperty_StreamFormat = 8, kAudioUnitScope_Input = 1 */
+    zan_ca.SetProperty(zan_ca_unit, 8, 1, 0, &fmt, sizeof(fmt));
+
+    /* Set Render Callback: kAudioUnitProperty_SetRenderCallback = 26, kAudioUnitScope_Input = 1 */
+    zan_ca_AURenderCallbackStruct cb;
+    cb.inputProc = zan_coreaudio_render_cb;
+    cb.inputProcRefCon = NULL;
+    zan_ca.SetProperty(zan_ca_unit, 26, 1, 0, &cb, sizeof(cb));
+
+    if (zan_ca.UnitInitialize(zan_ca_unit) != 0) {
+        zan_ca.InstanceDispose(zan_ca_unit);
+        zan_ca_unit = NULL;
+        zan_audio_set_err("CoreAudio driver: AudioUnitInitialize failed");
+        return 0;
+    }
+
+    if (zan_ca.OutputStart(zan_ca_unit) != 0) {
+        zan_ca.UnitUninitialize(zan_ca_unit);
+        zan_ca.InstanceDispose(zan_ca_unit);
+        zan_ca_unit = NULL;
+        zan_audio_set_err("CoreAudio driver: AudioOutputUnitStart failed");
+        return 0;
+    }
+    return 1;
+}
+
+static void zan_coreaudio_stop(void) {
+    if (zan_ca_unit) {
+        if (zan_ca.OutputStop) zan_ca.OutputStop(zan_ca_unit);
+        if (zan_ca.UnitUninitialize) zan_ca.UnitUninitialize(zan_ca_unit);
+        if (zan_ca.InstanceDispose) zan_ca.InstanceDispose(zan_ca_unit);
+        zan_ca_unit = NULL;
+    }
+}
+#endif /* __APPLE__ */
 
 /* ------------------------------------------------------------------
  * Exported API. Signatures match the original audio bridge's
@@ -895,9 +1274,32 @@ open_fail:
         return 0;
     }
     return 1;
+#elif defined(__linux__)
+    if (zan_audio_ready) return 1;
+    zan_audio_set_err(NULL);
+    if (!zan_alsa_start()) {
+        if (zan_audio_err[0] == 0) zan_audio_set_err("ALSA device open failed");
+        return 0;
+    }
+    pthread_mutex_lock(&zan_audio_mutex);
+    for (int i = 0; i < ZAN_VOICE_SLOTS; i++) zan_voice_reset(&zan_voices[i]);
+    zan_audio_ready = 1;
+    pthread_mutex_unlock(&zan_audio_mutex);
+    return 1;
+#elif defined(__APPLE__)
+    if (zan_audio_ready) return 1;
+    zan_audio_set_err(NULL);
+    if (!zan_coreaudio_start()) {
+        if (zan_audio_err[0] == 0) zan_audio_set_err("CoreAudio device open failed");
+        return 0;
+    }
+    pthread_mutex_lock(&zan_audio_mutex);
+    for (int i = 0; i < ZAN_VOICE_SLOTS; i++) zan_voice_reset(&zan_voices[i]);
+    zan_audio_ready = 1;
+    pthread_mutex_unlock(&zan_audio_mutex);
+    return 1;
 #else
-    zan_audio_set_err("audio backend not available on this platform yet"
-                      " (planned: CoreAudio/ALSA/OH Audio)");
+    zan_audio_set_err("audio backend not available on this platform yet (planned: OH Audio / OpenSL)");
     return 0;
 #endif
 }
@@ -933,6 +1335,22 @@ EXPORT void zan_audio_close(void) {
     pthread_mutex_lock(&zan_audio_mutex);
     for (int i = 0; i < ZAN_VOICE_SLOTS; i++) zan_voice_reset(&zan_voices[i]);
     pthread_mutex_unlock(&zan_audio_mutex);
+#elif defined(__linux__)
+    pthread_mutex_lock(&zan_audio_mutex);
+    zan_audio_ready = 0;
+    pthread_mutex_unlock(&zan_audio_mutex);
+    zan_alsa_stop();
+    pthread_mutex_lock(&zan_audio_mutex);
+    for (int i = 0; i < ZAN_VOICE_SLOTS; i++) zan_voice_reset(&zan_voices[i]);
+    pthread_mutex_unlock(&zan_audio_mutex);
+#elif defined(__APPLE__)
+    pthread_mutex_lock(&zan_audio_mutex);
+    zan_audio_ready = 0;
+    pthread_mutex_unlock(&zan_audio_mutex);
+    zan_coreaudio_stop();
+    pthread_mutex_lock(&zan_audio_mutex);
+    for (int i = 0; i < ZAN_VOICE_SLOTS; i++) zan_voice_reset(&zan_voices[i]);
+    pthread_mutex_unlock(&zan_audio_mutex);
 #else
     zan_audio_ready = 0;
 #endif
@@ -956,6 +1374,10 @@ EXPORT const char *zan_audio_driver_name(void) {
     return zan_audio_ready ? "wasapi" : "";
 #elif defined(__ANDROID__)
     return zan_audio_ready ? "aaudio" : "";
+#elif defined(__linux__)
+    return zan_audio_ready ? "alsa" : "";
+#elif defined(__APPLE__)
+    return zan_audio_ready ? "coreaudio" : "";
 #else
     return "";
 #endif
@@ -972,7 +1394,7 @@ EXPORT int32_t zan_audio_active_voices(void) {
         LeaveCriticalSection(&zan_audio_cs);
         return n;
     }
-#elif defined(__ANDROID__)
+#else
     pthread_mutex_lock(&zan_audio_mutex);
     zan_voice_reap_locked();
     for (i = 0; i < ZAN_VOICE_SLOTS; i++)
@@ -994,7 +1416,7 @@ EXPORT void zan_audio_stop_all(void) {
         LeaveCriticalSection(&zan_audio_cs);
         return;
     }
-#elif defined(__ANDROID__)
+#else
     pthread_mutex_lock(&zan_audio_mutex);
     for (i = 0; i < ZAN_VOICE_SLOTS; i++) zan_voice_reset(&zan_voices[i]);
     pthread_mutex_unlock(&zan_audio_mutex);
@@ -1063,7 +1485,7 @@ EXPORT void zan_audio_free_clip(int64_t clip_handle) {
     if (!c) return;
 #if defined(_WIN32)
     if (zan_audio_cs_ok) EnterCriticalSection(&zan_audio_cs);
-#elif defined(__ANDROID__)
+#else
     pthread_mutex_lock(&zan_audio_mutex);
 #endif
     /* Voices reading this clip's samples have to go first. */
@@ -1071,7 +1493,7 @@ EXPORT void zan_audio_free_clip(int64_t clip_handle) {
         if (zan_voices[i].clip == c) zan_voice_reset(&zan_voices[i]);
 #if defined(_WIN32)
     if (zan_audio_cs_ok) LeaveCriticalSection(&zan_audio_cs);
-#elif defined(__ANDROID__)
+#else
     pthread_mutex_unlock(&zan_audio_mutex);
 #endif
     free(c->pcm);
@@ -1108,7 +1530,7 @@ EXPORT int64_t zan_audio_play(int64_t clip_handle, double gain, int32_t loop) {
     if (!zan_audio_cs_ok) return 0;
     EnterCriticalSection(&zan_audio_cs);
     zan_voice_reap_locked();
-#elif defined(__ANDROID__)
+#else
     pthread_mutex_lock(&zan_audio_mutex);
     zan_voice_reap_locked();
 #endif
@@ -1118,7 +1540,7 @@ EXPORT int64_t zan_audio_play(int64_t clip_handle, double gain, int32_t loop) {
     if (slot < 0) {
 #if defined(_WIN32)
         LeaveCriticalSection(&zan_audio_cs);
-#elif defined(__ANDROID__)
+#else
         pthread_mutex_unlock(&zan_audio_mutex);
 #endif
         return 0;
@@ -1132,19 +1554,15 @@ EXPORT int64_t zan_audio_play(int64_t clip_handle, double gain, int32_t loop) {
     v->gain = gain < 0.0 ? 0.0f : (float)gain;
     v->cursor = 0.0;
     /* zan_audio_dev_freq is set by the open path that armed
-     * zan_audio_ready (WASAPI thread startup / AAudio stream open), so
+     * zan_audio_ready (WASAPI thread startup / AAudio stream open / ALSA / CoreAudio), so
      * play() only reaches the resample step on a live device. The
      * fallback keeps a benign value instead of dividing by zero. */
-#if defined(_WIN32) || defined(__ANDROID__)
-    v->step = (double)c->freq / (double)zan_audio_dev_freq;
-#else
-    v->step = 1.0;
-#endif
+    v->step = (zan_audio_dev_freq > 0) ? ((double)c->freq / (double)zan_audio_dev_freq) : 1.0;
     if (!(v->step > 0.0)) v->step = 1.0;
     v->active = 1;
 #if defined(_WIN32)
     LeaveCriticalSection(&zan_audio_cs);
-#elif defined(__ANDROID__)
+#else
     pthread_mutex_unlock(&zan_audio_mutex);
 #endif
     return zan_voice_pack(slot, v->gen);
@@ -1164,7 +1582,7 @@ EXPORT int32_t zan_audio_voice_playing(int64_t voice) {
         LeaveCriticalSection(&zan_audio_cs);
         return playing;
     }
-#elif defined(__ANDROID__)
+#else
     int playing;
     pthread_mutex_lock(&zan_audio_mutex);
     {
@@ -1197,7 +1615,7 @@ EXPORT void zan_audio_voice_stop(int64_t voice) {
         LeaveCriticalSection(&zan_audio_cs);
         return;
     }
-#elif defined(__ANDROID__)
+#else
     pthread_mutex_lock(&zan_audio_mutex);
     {
         ZanVoice *v = zan_voice_of(voice);
@@ -1225,7 +1643,7 @@ EXPORT void zan_audio_voice_set_gain(int64_t voice, double gain) {
         LeaveCriticalSection(&zan_audio_cs);
         return;
     }
-#elif defined(__ANDROID__)
+#else
     pthread_mutex_lock(&zan_audio_mutex);
     {
         ZanVoice *v = zan_voice_of(voice);
