@@ -128,6 +128,36 @@ batch/delete/options）、服务端下发表格配置、列即表单。借鉴落
 持久化（属前端 zan-table 职责）；弹窗 LayerConfig 式配置爆炸（对方自
 认的历史包袱）。
 
+### adminUI 前端契约（无需改前端即可接）
+
+每个配置驱动屏同时供两类客户端：自研壳（SSR HTML，`/admin/...` 直接
+出页面）与 adminUI 系前端（axios + JSON 信封）。信封统一为
+`{resp_code:"0000",status,msg,url,dynamicToken,t,data}`（`resp_code`
+"0000" 为成功；错误走既有 `{code,msg}` 形状并带 HTTP 状态码）：
+
+| 端点（{api} = 屏路径） | 动词 | 请求 | data |
+|---|---|---|---|
+| `{api}/conf` | PUT | — | ZanTable ListConfData：{conf,columns,filters,tools} |
+| `{api}/list` | POST | JSON `{page,pageSize,...筛选}` 或表单 | `{data:[行],total}` |
+| `{api}/edit` | POST | JSON/表单 `{id}` | 整行对象（列名即键，值全部文本） |
+| `{api}/formconf` | PUT | — | legacy FormConfig `{title,width,labelWidth,size,cols,formItems}`，formItems 含 component/span/rules（{required,min,max,pattern}） |
+| `{api}/form` | GET | `?id=` | 表单对话框 HTML |
+| `{api}/save` | POST | 表单或 JSON `{字段...}` | 无（toast） |
+| `{api}/delete` | POST | `{id}` | 无 |
+| `{api}/batch` | POST | `ids` CSV 或 JSON 数组；`value` 空为批量删 | 无 |
+| `{api}/field` | POST | `{id,field,value}`（adminUI fieldAsync 的 `{data:{id},field,value}` 亦收） | 无 |
+| `{api}/options` | GET | `?kw=` / `?id=` | `[{id,label}]` |
+
+取参族 `InAny/InAnyInt` 对表单编码与 JSON 体双兼容：route/query/form 未
+命中时读 application/json 顶层标量字段，同一动作两类客户端共用。筛选
+条件仍由 `CrudConf` 声明收集（JSON 筛选与表单筛选同一入口）。
+
+已知边界（实测踩坑后的保守写法）：async 动作里不要从"helper 返回的
+`List<JsonValue>` 提取元素再跨静态调用传参"来构建应答体——该形状在
+服务端 async 延续语境下原生崩溃（最小同步探针无法复现，根因未定论，
+疑 zanc 对该形态的 ARC 处理有漏）；应答对象请在动作内就地
+`NewObject`+`Put` 构建（DoEdit/DoFormConf 即此写法）。
+
 ## Attribute-driven routes
 
 Controllers declare routing with **attributes** instead of hand-wiring in the

@@ -29,6 +29,10 @@ namespace ZanWeb.Crud;
  * 声明位的动作不可授权（与调度器同一掩码）。
  */
 class CrudScreen : AdminController {
+    /* 最近一次 LoadKeys 的行键集：结果集列名 + 声明的虚拟列（OnRows
+       投影）。StrMap 无键枚举，行 JSON 序列化按此显式键集进行。 */
+    List<string> rowKeys;
+
     /* 子类必覆写：本屏的完整声明。 */
     virtual CrudConf Def() {
         throw new ApiError(500, "9999", "CrudScreen 未覆写 Def()");
@@ -44,16 +48,9 @@ class CrudScreen : AdminController {
         if (!this.DbReady()) { d.Set("dbDown", "1"); this.CrudPage(d); return; }
 
         List<OrmCond> conds = lp.Collect(this);
-        DbTable t = DbTable.Of(this.Held(), conf.table);
-        long total = await CrudScreen.Apply(t.Query(), conds).CountAsync();
-
-        ListQuery q = this.Paged("id", 20);
-        DbTableQuery rq = CrudScreen.Apply(t.Query(), conds);
-        if (conf.orderDesc) { rq = rq.OrderByDesc(conf.orderCol); }
-        else { rq = rq.OrderBy(conf.orderCol); }
-        DbResult r = await rq.Page(q.Limit(), q.Skip()).ToResultAsync();
-        List<StrMap> rows = CrudScreen.StrMaps(r);
-        rows = await this.OnRows(rows);
+        long total = await this.CountRows(conf, conds);
+        ListQuery q = this.PagedAny();
+        List<StrMap> rows = await this.LoadRows(conf, conds, q);
 
         int mask = await this.Mask();
         bool canUpdate = (mask & (int)PermBit.Update) != 0;
@@ -61,6 +58,83 @@ class CrudScreen : AdminController {
         lp.Screen(this, d, "/" + conf.path, "/" + conf.path,
             conds, q, (int)total, rows, canUpdate, canDelete);
         this.CrudPage(d);
+    }
+
+    /* 列表数据（adminUI 契约 POST /list）：分页行 JSON + total，信封
+       data = {data:[行],total}——与 ZanTable.getData 的解包形状一致。
+       条件仍由声明收集：JSON 体筛选与表单编码共用 InAny 入口。 */
+    virtual async Task DoListData() {
+        CrudConf conf = this.Def();
+        ListPage lp = conf.Build(false);
+        if (!this.DbReady()) { this.Fail(503, "2001", "数据库不可用"); }
+        List<OrmCond> conds = lp.Collect(this);
+        long total = await this.CountRows(conf, conds);
+        ListQuery q = this.PagedAny();
+        List<StrMap> rows = await this.LoadRows(conf, conds, q);
+        JsonValue data = JsonValue.NewObject();
+        data.Put("total", JsonValue.NewInt((int)total));
+        data.Put("data", CrudScreen.JsonRows(rows, this.rowKeys));
+        CrudScreen.Env(this, data);
+    }
+
+    /* 行数据（adminUI 契约 POST /edit）：编辑表单回显取数，信封
+       data = 行对象（列名即键 + 声明的虚拟列，值全部文本）。 */
+    virtual async Task DoEdit() {
+        CrudConf conf = this.Def();
+        int id = this.InAnyInt("id");
+        if (id <= 0) { this.Fail(400, "0004", "缺少 id"); }
+        DbTable t = DbTable.Of(this.Held(), conf.table);
+        DbResult r = await t.ReadAsync("id", id);
+        if (r == null || r.RowCount() == 0) { this.Fail(404, "0404", "记录不存在"); }
+        this.LoadKeys(conf, r);
+        /* 行对象就地构建（与 DoFormConf 同形）：列名 + 声明的虚拟列，
+           虚拟列取空串（编辑回显不投影计数列）。 */
+        JsonValue row = JsonValue.NewObject();
+        for (int j = 0; j < this.rowKeys.Count; j = j + 1) {
+            int col = r.GetColumnIndex(this.rowKeys[j]);
+            string v = "";
+            if (col >= 0 && !r.IsNull(0, col)) { v = r.GetString(0, col); }
+            row.Put(this.rowKeys[j], JsonValue.NewStr(v));
+        }
+        CrudScreen.Env(this, row);
+    }
+
+    /* 表单 schema（adminUI 契约 PUT {api}/formconf）：字段表投影为
+       legacy FormConfig（formItems），GeneralForm/schema-adapter 直接
+       消费。控件映射 text→input、int→input-number、area→textarea、
+       pass→password、opts→select；校验规则同源导出。 */
+    virtual void DoFormConf() {
+        CrudConf conf = this.Def();
+        JsonValue data = JsonValue.NewObject();
+        data.Put("title", JsonValue.NewStr(conf.Title()));
+        data.Put("width", JsonValue.NewStr("600px"));
+        data.Put("labelWidth", JsonValue.NewInt(100));
+        data.Put("size", JsonValue.NewStr("medium"));
+        data.Put("cols", JsonValue.NewInt(24));
+        JsonValue items = JsonValue.NewArray();
+        for (int i = 0; i < conf.forms.Count; i = i + 1) {
+            FormField f = conf.forms[i];
+            JsonValue it = JsonValue.NewObject();
+            it.Put("field", JsonValue.NewStr(f.name));
+            it.Put("label", JsonValue.NewStr(f.label));
+            string comp = "input";
+            if (f.kind == "int") { comp = "input-number"; }
+            else if (f.kind == "area") { comp = "textarea"; }
+            else if (f.kind == "pass") { comp = "password"; }
+            else if (f.kind == "select") { comp = "select"; }
+            it.Put("component", JsonValue.NewStr(comp));
+            it.Put("span", JsonValue.NewInt(f.span ? 24 : 12));
+            it.Put("required", JsonValue.NewBool(f.required));
+            if (f.ph.Length > 0) { it.Put("placeholder", JsonValue.NewStr(f.ph)); }
+            if (f.value.Length > 0) { it.Put("defaultValue", JsonValue.NewStr(f.value)); }
+            if (f.kind == "select") {
+                it.Put("options", CrudScreen.SelectOptsJson(f.options));
+            }
+            it.Put("rules", CrudScreen.RulesJson(f));
+            items.Append(it);
+        }
+        data.Put("formItems", items);
+        CrudScreen.Env(this, data);
     }
 
     /* 通用屏共享一份视图（views/Crud/Index.html）：screenHtml 整段由
@@ -83,7 +157,7 @@ class CrudScreen : AdminController {
        编辑时按行回显（pass 字段恒不回显）。 */
     virtual async Task DoForm() {
         CrudConf conf = this.Def();
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id");
         bool isEdit = id > 0;
         FormPage fp = conf.ToFormPage(isEdit ? Convert.ToString(id) : "0");
         ViewData d = new ViewData();
@@ -107,7 +181,7 @@ class CrudScreen : AdminController {
        OnSaving 钩子 → 插入/更新 → 审计 → OnSaved 钩子。 */
     virtual async Task DoSave() {
         CrudConf conf = this.Def();
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id");
         bool isNew = id <= 0;
         ListPage lp = conf.Build(false);
         FormPage fp = conf.ToFormPage(isNew ? "0" : Convert.ToString(id));
@@ -123,7 +197,7 @@ class CrudScreen : AdminController {
             if (def == null) {
                 this.Fail(500, "9999", "表单字段 " + f.name + " 未列入 EditFields 写白名单");
             }
-            string v = this.In(f.name);
+            string v = this.InAny(f.name);
             if (def.Get("type") == "int") { row.Set(f.name, Filter.ToLong(v, 0)); }
             else { row.Set(f.name, v); }
         }
@@ -162,7 +236,7 @@ class CrudScreen : AdminController {
        钩子 → 经 Crud 网关删除并审计。 */
     virtual async Task DoDelete() {
         CrudConf conf = this.Def();
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id");
         ListPage lp = conf.Build(false);
         DbResult r = await DbTable.Of(this.Held(), conf.table).ReadAsync("id", id);
         if (r == null || r.RowCount() == 0) { this.Fail(404, "0404", "记录不存在"); }
@@ -179,8 +253,8 @@ class CrudScreen : AdminController {
        由行删端点保证。ids 上限与逐占位符由 Crud 网关与 Ids() 保证。 */
     virtual async Task DoBatch() {
         CrudConf conf = this.Def();
-        List<int> ids = this.Ids("ids");
-        string value = this.In("value");
+        List<int> ids = this.IdsAny();
+        string value = this.InAny("value");
         ListPage lp = conf.Build(true);
         if (value.Length == 0) {
             await Crud.Delete(this, lp, ids, conf.title + "·批量删除");
@@ -192,9 +266,22 @@ class CrudScreen : AdminController {
     /* 行内单字段修改：field 必须在行内白名单内，行必须存在。 */
     virtual async Task DoField() {
         CrudConf conf = this.Def();
-        int id = this.InInt("id", 0);
-        string field = this.Need("field", "属性");
-        string value = this.In("value");
+        int id = this.InAnyInt("id");
+        if (id <= 0) {
+            /* adminUI fieldAsync 把整行放 data 里提交：{data:{id:..},
+               field, value}。 */
+            JsonValue jb = this.Ctx().JsonBody();
+            if (jb != null && jb.IsObject()) {
+                JsonValue d = jb.Get("data");
+                if (d != null && d.IsObject()) {
+                    JsonValue idv = d.Get("id");
+                    if (idv != null) { id = idv.AsInt(0); }
+                }
+            }
+        }
+        string field = this.InAny("field");
+        if (field.Length == 0) { this.Fail(400, "0004", "属性不能为空"); }
+        string value = this.InAny("value");
         ListPage lp = conf.Build(true);
         DbResult r = await DbTable.Of(this.Held(), conf.table).ReadAsync("id", id);
         if (r == null || r.RowCount() == 0) { this.Fail(404, "0404", "记录不存在"); }
@@ -256,6 +343,161 @@ class CrudScreen : AdminController {
     virtual async Task OnSaved(bool isNew) { }
 
     /* ---- 内部 ---------------------------------------------------- */
+
+    /* 计数：声明条件下的总行数（分页不参与）。 */
+    async long CountRows(CrudConf conf, List<OrmCond> conds) {
+        DbTable t = DbTable.Of(this.Held(), conf.table);
+        return await CrudScreen.Apply(t.Query(), conds).CountAsync();
+    }
+
+    /* 取页：条件 + 排序 + 分页，行投影过 OnRows 钩子；同时记下本页
+       键集（供行 JSON 序列化）。 */
+    async List<StrMap> LoadRows(CrudConf conf, List<OrmCond> conds, ListQuery q) {
+        DbTable t = DbTable.Of(this.Held(), conf.table);
+        DbTableQuery rq = CrudScreen.Apply(t.Query(), conds);
+        if (conf.orderDesc) { rq = rq.OrderByDesc(conf.orderCol); }
+        else { rq = rq.OrderBy(conf.orderCol); }
+        DbResult r = await rq.Page(q.Limit(), q.Skip()).ToResultAsync();
+        this.LoadKeys(conf, r);
+        List<StrMap> rows = CrudScreen.StrMaps(r);
+        return await this.OnRows(rows);
+    }
+
+    /* 行键集 = 结果集列名 + 声明的虚拟列（去重）。 */
+    void LoadKeys(CrudConf conf, DbResult r) {
+        List<string> keys = new List<string>();
+        if (r != null) {
+            for (int j = 0; j < r.columnNames.Count; j = j + 1) {
+                keys.Add(r.columnNames[j]);
+            }
+        }
+        for (int i = 0; i < conf.vcols.Count; i = i + 1) {
+            bool has = false;
+            for (int j = 0; j < keys.Count; j = j + 1) {
+                if (keys[j] == conf.vcols[i]) { has = true; break; }
+            }
+            if (!has) { keys.Add(conf.vcols[i]); }
+        }
+        this.rowKeys = keys;
+    }
+
+    /* 分页参数兼容：自研壳 page/limit 走 query；adminUI 系 page/
+       pageSize 走 JSON 体。把 JSON 侧合并进 query（Paged 与分页链接
+       统一读取），query 已有值时不覆盖。 */
+    ListQuery PagedAny() {
+        StrMap query = this.Ctx().query;
+        string page = this.InAny("page");
+        if (page.Length > 0 && query.Get("page").Length == 0) {
+            query.Set("page", page);
+        }
+        string size = this.InAny("pageSize");
+        if (size.Length > 0 && query.Get("limit").Length == 0) {
+            query.Set("limit", size);
+        }
+        return this.Paged("id", 20);
+    }
+
+    /* 批量 id 列表：CSV（自研壳）或 JSON 数组（adminUI 系）皆收，只
+       收正 id、上限 500——与 AdminController.Ids 同一钳制。 */
+    List<int> IdsAny() {
+        List<int> out_ = new List<int>();
+        string csv = this.InAny("ids").Trim();
+        if (csv.Length > 0) {
+            List<string> parts = csv.Split(",");
+            for (int i = 0; i < parts.Count && out_.Count < 500; i = i + 1) {
+                string p = parts[i].Trim();
+                if (p.Length == 0 || p.Length > 9) { continue; }
+                int v = Filter.ToInt(p, 0);
+                if (v > 0) { out_.Add(v); }
+            }
+            return out_;
+        }
+        JsonValue jb = this.Ctx().JsonBody();
+        if (jb == null || !jb.IsObject()) { return out_; }
+        JsonValue arr = jb.Get("ids");
+        if (arr == null || !arr.IsArray()) { return out_; }
+        for (int i = 0; i < arr.Count() && out_.Count < 500; i = i + 1) {
+            int v = arr.At(i).AsInt(0);
+            if (v > 0) { out_.Add(v); }
+        }
+        return out_;
+    }
+
+    /* adminUI 统一信封（与 Crud.Conf 同形）：resp_code "0000" 为成功。 */
+    static void Env(AdminController c, JsonValue data) {
+        JsonValue body = JsonValue.NewObject();
+        body.Put("resp_code", JsonValue.NewStr("0000"));
+        body.Put("status", JsonValue.NewInt(200));
+        body.Put("msg", JsonValue.NewStr("ok"));
+        body.Put("url", JsonValue.NewStr(""));
+        body.Put("dynamicToken", JsonValue.NewStr(""));
+        body.Put("t", JsonValue.NewInt(0));
+        body.Put("data", data);
+        c.Json(body.ToJson());
+    }
+
+    /* 行 → JSON 数组：按显式键集序列化，值全部文本（NULL 一律空串）。 */
+    static JsonValue JsonRows(List<StrMap> rows, List<string> keys) {
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            JsonValue o = JsonValue.NewObject();
+            for (int j = 0; j < keys.Count; j = j + 1) {
+                o.Put(keys[j], JsonValue.NewStr(rows[i].Get(keys[j])));
+            }
+            arr.Append(o);
+        }
+        return arr;
+    }
+
+    /* "1=显示,0=隐藏" → [{value,label}]（下拉选项 JSON）。 */
+    static JsonValue SelectOptsJson(string opts) {
+        JsonValue arr = JsonValue.NewArray();
+        string rest = opts;
+        while (rest.Length > 0) {
+            string pair = rest;
+            int comma = rest.IndexOf(",");
+            if (comma >= 0) { pair = rest.Substring(0, comma); rest = rest.Substring(comma + 1); }
+            else { rest = ""; }
+            int eq = pair.IndexOf("=");
+            if (eq <= 0) { continue; }
+            JsonValue o = JsonValue.NewObject();
+            o.Put("value", JsonValue.NewStr(pair.Substring(0, eq)));
+            o.Put("label", JsonValue.NewStr(pair.Substring(eq + 1)));
+            arr.Append(o);
+        }
+        return arr;
+    }
+
+    /* FormField → 校验规则 JSON（adminUI FormRule 形状，与 FormPage.
+       Validate 同一规则集：required/min/max/pattern）。 */
+    static JsonValue RulesJson(FormField f) {
+        JsonValue rules = JsonValue.NewArray();
+        if (f.required) {
+            JsonValue r = JsonValue.NewObject();
+            r.Put("required", JsonValue.NewBool(true));
+            r.Put("message", JsonValue.NewStr(Lang.T(f.label) + Lang.T("不能为空")));
+            rules.Append(r);
+        }
+        if (f.min > 0) {
+            JsonValue r = JsonValue.NewObject();
+            r.Put("min", JsonValue.NewInt(f.min));
+            r.Put("message", JsonValue.NewStr(Lang.T(f.label) + Lang.T("长度不足")));
+            rules.Append(r);
+        }
+        if (f.max > 0) {
+            JsonValue r = JsonValue.NewObject();
+            r.Put("max", JsonValue.NewInt(f.max));
+            r.Put("message", JsonValue.NewStr(Lang.T(f.label) + Lang.T("超出长度")));
+            rules.Append(r);
+        }
+        if (f.pattern.Length > 0) {
+            JsonValue r = JsonValue.NewObject();
+            r.Put("pattern", JsonValue.NewStr(f.pattern));
+            r.Put("message", JsonValue.NewStr(Lang.T(f.label) + Lang.T("格式不正确")));
+            rules.Append(r);
+        }
+        return rules;
+    }
 
     /* 审计目标：Label() 列的提交值优先（人可读），否则 #id。 */
     string RowTarget(CrudConf conf, int id) {
