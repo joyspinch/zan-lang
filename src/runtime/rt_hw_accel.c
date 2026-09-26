@@ -15,6 +15,7 @@
   #include <smmintrin.h>
 #endif
 #if defined(__aarch64__) || defined(_M_ARM64)
+  #include <arm_neon.h>
   #if defined(_WIN32)
     /* windows.h normally arrives from the including TU (rt_timer.c); include
      * it here too so the unit compiles standalone. */
@@ -253,22 +254,25 @@ int zan_cpu_feature(int id) {
   "    mov    rsi, rdx\n" \
   "    mov    rdx, r8\n"
 #define ZAN_SHA256_RODATA ".section .rdata,\"dr\"\n"
+#define ZAN_SHA256_NAME "zan_sha256_transform_ni"
 #elif defined(__APPLE__)
 #define ZAN_SHA256_DIRECTIVE ""
 #define ZAN_SHA256_PROLOGUE ""
 #define ZAN_SHA256_RODATA ".section __TEXT,__const\n"
+#define ZAN_SHA256_NAME "_zan_sha256_transform_ni"
 #else
 #define ZAN_SHA256_DIRECTIVE ".type zan_sha256_transform_ni, @function\n"
 #define ZAN_SHA256_PROLOGUE ""
 #define ZAN_SHA256_RODATA ".section .rodata\n"
+#define ZAN_SHA256_NAME "zan_sha256_transform_ni"
 #endif
 
 __asm__(
   ".intel_syntax noprefix\n"
   ".text\n"
-  ".globl zan_sha256_transform_ni\n"
+  ".globl " ZAN_SHA256_NAME "\n"
   ZAN_SHA256_DIRECTIVE
-  "zan_sha256_transform_ni:\n"
+  ZAN_SHA256_NAME ":\n"
   "    push   rdi\n"
   "    push   rsi\n"
   "    push   rbx\n"
@@ -1797,39 +1801,213 @@ int64_t zan_hw_crc32c_update(uint32_t crc, const uint8_t *p, int64_t len) {
     return -1;
 }
 
+/* ===== Software Reference Fallbacks for Single-Cycle Intrinsics ===== */
+static uint8_t zan_aes_inv_sbox[256];
+static int zan_aes_tables_inited = 0;
+
+static inline uint8_t zan_aes_xtime(uint8_t a) {
+    return (uint8_t)((a << 1) ^ ((a & 0x80) ? 0x1B : 0));
+}
+
+static inline uint8_t zan_aes_gmul(uint8_t a, uint8_t b) {
+    uint8_t p = 0;
+    for (int i = 0; i < 8; i++) {
+        if (b & 1) p ^= a;
+        uint8_t hi = a & 0x80;
+        a <<= 1;
+        if (hi) a ^= 0x1B;
+        b >>= 1;
+    }
+    return p;
+}
+
+static void zan_aes_init_tables(void) {
+    if (zan_aes_tables_inited) return;
+    zan_aes_init_sbox();
+    for (int i = 0; i < 256; i++) {
+        zan_aes_inv_sbox[zan_aes_sbox[i]] = (uint8_t)i;
+    }
+    zan_aes_tables_inited = 1;
+}
+
+/* Single AES encryption round (x86 _mm_aesenc_si128 / _mm_aesenclast_si128 semantics) */
+static void zan_aes_encrypt_round_soft(const void *val, const void *key, void *out, int mix_columns) {
+    zan_aes_init_tables();
+    const uint8_t *s = (const uint8_t *)val;
+    const uint8_t *k = (const uint8_t *)key;
+    uint8_t state[16];
+
+    /* 1. SubBytes & ShiftRows */
+    state[0]  = zan_aes_sbox[s[0]];
+    state[4]  = zan_aes_sbox[s[4]];
+    state[8]  = zan_aes_sbox[s[8]];
+    state[12] = zan_aes_sbox[s[12]];
+
+    state[1]  = zan_aes_sbox[s[5]];
+    state[5]  = zan_aes_sbox[s[9]];
+    state[9]  = zan_aes_sbox[s[13]];
+    state[13] = zan_aes_sbox[s[1]];
+
+    state[2]  = zan_aes_sbox[s[10]];
+    state[6]  = zan_aes_sbox[s[14]];
+    state[10] = zan_aes_sbox[s[2]];
+    state[14] = zan_aes_sbox[s[6]];
+
+    state[3]  = zan_aes_sbox[s[15]];
+    state[7]  = zan_aes_sbox[s[3]];
+    state[11] = zan_aes_sbox[s[7]];
+    state[15] = zan_aes_sbox[s[11]];
+
+    /* 2. MixColumns (if mix_columns != 0) */
+    uint8_t mc[16];
+    if (mix_columns) {
+        for (int c = 0; c < 4; c++) {
+            int i = c * 4;
+            uint8_t s0 = state[i], s1 = state[i+1], s2 = state[i+2], s3 = state[i+3];
+            mc[i]   = zan_aes_xtime(s0 ^ s1) ^ s1 ^ s2 ^ s3;
+            mc[i+1] = zan_aes_xtime(s1 ^ s2) ^ s2 ^ s3 ^ s0;
+            mc[i+2] = zan_aes_xtime(s2 ^ s3) ^ s3 ^ s0 ^ s1;
+            mc[i+3] = zan_aes_xtime(s3 ^ s0) ^ s0 ^ s1 ^ s2;
+        }
+    } else {
+        memcpy(mc, state, 16);
+    }
+
+    /* 3. AddRoundKey */
+    uint8_t *res = (uint8_t *)out;
+    for (int i = 0; i < 16; i++) {
+        res[i] = mc[i] ^ k[i];
+    }
+}
+
+/* Single AES decryption round (x86 _mm_aesdec_si128 / _mm_aesdeclast_si128 semantics) */
+static void zan_aes_decrypt_round_soft(const void *val, const void *key, void *out, int inv_mix_columns) {
+    zan_aes_init_tables();
+    const uint8_t *s = (const uint8_t *)val;
+    const uint8_t *k = (const uint8_t *)key;
+    uint8_t state[16];
+
+    /* 1. InvShiftRows & InvSubBytes */
+    state[0]  = zan_aes_inv_sbox[s[0]];
+    state[4]  = zan_aes_inv_sbox[s[4]];
+    state[8]  = zan_aes_inv_sbox[s[8]];
+    state[12] = zan_aes_inv_sbox[s[12]];
+
+    state[1]  = zan_aes_inv_sbox[s[13]];
+    state[5]  = zan_aes_inv_sbox[s[1]];
+    state[9]  = zan_aes_inv_sbox[s[5]];
+    state[13] = zan_aes_inv_sbox[s[9]];
+
+    state[2]  = zan_aes_inv_sbox[s[10]];
+    state[6]  = zan_aes_inv_sbox[s[14]];
+    state[10] = zan_aes_inv_sbox[s[2]];
+    state[14] = zan_aes_inv_sbox[s[6]];
+
+    state[3]  = zan_aes_inv_sbox[s[7]];
+    state[7]  = zan_aes_inv_sbox[s[11]];
+    state[11] = zan_aes_inv_sbox[s[15]];
+    state[15] = zan_aes_inv_sbox[s[3]];
+
+    /* 2. InvMixColumns (if inv_mix_columns != 0) */
+    uint8_t imc[16];
+    if (inv_mix_columns) {
+        for (int c = 0; c < 4; c++) {
+            int i = c * 4;
+            uint8_t s0 = state[i], s1 = state[i+1], s2 = state[i+2], s3 = state[i+3];
+            imc[i]   = zan_aes_gmul(s0, 0x0e) ^ zan_aes_gmul(s1, 0x0b) ^ zan_aes_gmul(s2, 0x0d) ^ zan_aes_gmul(s3, 0x09);
+            imc[i+1] = zan_aes_gmul(s0, 0x09) ^ zan_aes_gmul(s1, 0x0e) ^ zan_aes_gmul(s2, 0x0b) ^ zan_aes_gmul(s3, 0x0d);
+            imc[i+2] = zan_aes_gmul(s0, 0x0d) ^ zan_aes_gmul(s1, 0x09) ^ zan_aes_gmul(s2, 0x0e) ^ zan_aes_gmul(s3, 0x0b);
+            imc[i+3] = zan_aes_gmul(s0, 0x0b) ^ zan_aes_gmul(s1, 0x0d) ^ zan_aes_gmul(s2, 0x09) ^ zan_aes_gmul(s3, 0x0e);
+        }
+    } else {
+        memcpy(imc, state, 16);
+    }
+
+    /* 3. AddRoundKey */
+    uint8_t *res = (uint8_t *)out;
+    for (int i = 0; i < 16; i++) {
+        res[i] = imc[i] ^ k[i];
+    }
+}
+
+/* InvMixColumns alone (_mm_aesimc_si128) */
+static void zan_aes_imc_soft(const void *val, void *out) {
+    const uint8_t *s = (const uint8_t *)val;
+    uint8_t *res = (uint8_t *)out;
+    for (int c = 0; c < 4; c++) {
+        int i = c * 4;
+        uint8_t s0 = s[i], s1 = s[i+1], s2 = s[i+2], s3 = s[i+3];
+        res[i]   = zan_aes_gmul(s0, 0x0e) ^ zan_aes_gmul(s1, 0x0b) ^ zan_aes_gmul(s2, 0x0d) ^ zan_aes_gmul(s3, 0x09);
+        res[i+1] = zan_aes_gmul(s0, 0x09) ^ zan_aes_gmul(s1, 0x0e) ^ zan_aes_gmul(s2, 0x0b) ^ zan_aes_gmul(s3, 0x0d);
+        res[i+2] = zan_aes_gmul(s0, 0x0d) ^ zan_aes_gmul(s1, 0x09) ^ zan_aes_gmul(s2, 0x0e) ^ zan_aes_gmul(s3, 0x0b);
+        res[i+3] = zan_aes_gmul(s0, 0x0b) ^ zan_aes_gmul(s1, 0x0d) ^ zan_aes_gmul(s2, 0x09) ^ zan_aes_gmul(s3, 0x0e);
+    }
+}
+
+/* Key generation assist (_mm_aeskeygenassist_si128) */
+static void zan_aes_keygenassist_soft(const void *val, uint8_t rcon, void *out) {
+    zan_aes_init_tables();
+    const uint8_t *s = (const uint8_t *)val;
+    uint8_t *res = (uint8_t *)out;
+
+    /* Word 0 (bytes 0..3): SubWord(SRC[63:32] = bytes 4..7) */
+    res[0] = zan_aes_sbox[s[4]];
+    res[1] = zan_aes_sbox[s[5]];
+    res[2] = zan_aes_sbox[s[6]];
+    res[3] = zan_aes_sbox[s[7]];
+
+    /* Word 1 (bytes 4..7): RotWord(SubWord(SRC[63:32])) ^ RCON */
+    res[4] = zan_aes_sbox[s[5]] ^ rcon;
+    res[5] = zan_aes_sbox[s[6]];
+    res[6] = zan_aes_sbox[s[7]];
+    res[7] = zan_aes_sbox[s[4]];
+
+    /* Word 2 (bytes 8..11): SubWord(SRC[127:96] = bytes 12..15) */
+    res[8]  = zan_aes_sbox[s[12]];
+    res[9]  = zan_aes_sbox[s[13]];
+    res[10] = zan_aes_sbox[s[14]];
+    res[11] = zan_aes_sbox[s[15]];
+
+    /* Word 3 (bytes 12..15): RotWord(SubWord(SRC[127:96])) ^ RCON */
+    res[12] = zan_aes_sbox[s[13]] ^ rcon;
+    res[13] = zan_aes_sbox[s[14]];
+    res[14] = zan_aes_sbox[s[15]];
+    res[15] = zan_aes_sbox[s[12]];
+}
+
 /* ===== 4. Single-Cycle Intrinsics Implementation ===== */
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
 
 __attribute__((target("aes,sse4.1")))
-void zan_hw_aes_encrypt(const void *val, const void *key, void *out) {
+static inline void zan_hw_aes_encrypt_ni(const void *val, const void *key, void *out) {
     __m128i v = _mm_loadu_si128((const __m128i*)val);
     __m128i k = _mm_loadu_si128((const __m128i*)key);
     _mm_storeu_si128((__m128i*)out, _mm_aesenc_si128(v, k));
 }
 
 __attribute__((target("aes,sse4.1")))
-void zan_hw_aes_encrypt_last(const void *val, const void *key, void *out) {
+static inline void zan_hw_aes_encrypt_last_ni(const void *val, const void *key, void *out) {
     __m128i v = _mm_loadu_si128((const __m128i*)val);
     __m128i k = _mm_loadu_si128((const __m128i*)key);
     _mm_storeu_si128((__m128i*)out, _mm_aesenclast_si128(v, k));
 }
 
 __attribute__((target("aes,sse4.1")))
-void zan_hw_aes_decrypt(const void *val, const void *key, void *out) {
+static inline void zan_hw_aes_decrypt_ni(const void *val, const void *key, void *out) {
     __m128i v = _mm_loadu_si128((const __m128i*)val);
     __m128i k = _mm_loadu_si128((const __m128i*)key);
     _mm_storeu_si128((__m128i*)out, _mm_aesdec_si128(v, k));
 }
 
 __attribute__((target("aes,sse4.1")))
-void zan_hw_aes_decrypt_last(const void *val, const void *key, void *out) {
+static inline void zan_hw_aes_decrypt_last_ni(const void *val, const void *key, void *out) {
     __m128i v = _mm_loadu_si128((const __m128i*)val);
     __m128i k = _mm_loadu_si128((const __m128i*)key);
     _mm_storeu_si128((__m128i*)out, _mm_aesdeclast_si128(v, k));
 }
 
 __attribute__((target("aes,sse4.1")))
-void zan_hw_aes_keygenassist(const void *val, uint8_t rcon, void *out) {
+static inline void zan_hw_aes_keygenassist_ni(const void *val, uint8_t rcon, void *out) {
     __m128i v = _mm_loadu_si128((const __m128i*)val);
     __m128i res;
     switch (rcon) {
@@ -1849,9 +2027,57 @@ void zan_hw_aes_keygenassist(const void *val, uint8_t rcon, void *out) {
 }
 
 __attribute__((target("aes,sse4.1")))
-void zan_hw_aes_imc(const void *val, void *out) {
+static inline void zan_hw_aes_imc_ni(const void *val, void *out) {
     __m128i v = _mm_loadu_si128((const __m128i*)val);
     _mm_storeu_si128((__m128i*)out, _mm_aesimc_si128(v));
+}
+
+void zan_hw_aes_encrypt(const void *val, const void *key, void *out) {
+    if (zan_hw_has_aesni()) {
+        zan_hw_aes_encrypt_ni(val, key, out);
+    } else {
+        zan_aes_encrypt_round_soft(val, key, out, 1);
+    }
+}
+
+void zan_hw_aes_encrypt_last(const void *val, const void *key, void *out) {
+    if (zan_hw_has_aesni()) {
+        zan_hw_aes_encrypt_last_ni(val, key, out);
+    } else {
+        zan_aes_encrypt_round_soft(val, key, out, 0);
+    }
+}
+
+void zan_hw_aes_decrypt(const void *val, const void *key, void *out) {
+    if (zan_hw_has_aesni()) {
+        zan_hw_aes_decrypt_ni(val, key, out);
+    } else {
+        zan_aes_decrypt_round_soft(val, key, out, 1);
+    }
+}
+
+void zan_hw_aes_decrypt_last(const void *val, const void *key, void *out) {
+    if (zan_hw_has_aesni()) {
+        zan_hw_aes_decrypt_last_ni(val, key, out);
+    } else {
+        zan_aes_decrypt_round_soft(val, key, out, 0);
+    }
+}
+
+void zan_hw_aes_keygenassist(const void *val, uint8_t rcon, void *out) {
+    if (zan_hw_has_aesni()) {
+        zan_hw_aes_keygenassist_ni(val, rcon, out);
+    } else {
+        zan_aes_keygenassist_soft(val, rcon, out);
+    }
+}
+
+void zan_hw_aes_imc(const void *val, void *out) {
+    if (zan_hw_has_aesni()) {
+        zan_hw_aes_imc_ni(val, out);
+    } else {
+        zan_aes_imc_soft(val, out);
+    }
 }
 
 __attribute__((target("sse2")))
@@ -1873,17 +2099,150 @@ void zan_hw_vec128_store(void *addr, const void *val) {
     _mm_storeu_si128((__m128i*)addr, v);
 }
 
+#elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+
+__attribute__((target("aes")))
+static inline void zan_hw_aes_encrypt_arm_hw(const void *val, const void *key, void *out) {
+    uint8x16_t v = vld1q_u8((const uint8_t*)val);
+    uint8x16_t k = vld1q_u8((const uint8_t*)key);
+    uint8x16_t z = vdupq_n_u8(0);
+    uint8x16_t res = veorq_u8(vaesmcq_u8(vaeseq_u8(v, z)), k);
+    vst1q_u8((uint8_t*)out, res);
+}
+
+__attribute__((target("aes")))
+static inline void zan_hw_aes_encrypt_last_arm_hw(const void *val, const void *key, void *out) {
+    uint8x16_t v = vld1q_u8((const uint8_t*)val);
+    uint8x16_t k = vld1q_u8((const uint8_t*)key);
+    uint8x16_t z = vdupq_n_u8(0);
+    uint8x16_t res = veorq_u8(vaeseq_u8(v, z), k);
+    vst1q_u8((uint8_t*)out, res);
+}
+
+__attribute__((target("aes")))
+static inline void zan_hw_aes_decrypt_arm_hw(const void *val, const void *key, void *out) {
+    uint8x16_t v = vld1q_u8((const uint8_t*)val);
+    uint8x16_t k = vld1q_u8((const uint8_t*)key);
+    uint8x16_t z = vdupq_n_u8(0);
+    uint8x16_t res = veorq_u8(vaesimcq_u8(vaesdq_u8(v, z)), k);
+    vst1q_u8((uint8_t*)out, res);
+}
+
+__attribute__((target("aes")))
+static inline void zan_hw_aes_decrypt_last_arm_hw(const void *val, const void *key, void *out) {
+    uint8x16_t v = vld1q_u8((const uint8_t*)val);
+    uint8x16_t k = vld1q_u8((const uint8_t*)key);
+    uint8x16_t z = vdupq_n_u8(0);
+    uint8x16_t res = veorq_u8(vaesdq_u8(v, z), k);
+    vst1q_u8((uint8_t*)out, res);
+}
+
+__attribute__((target("aes")))
+static inline void zan_hw_aes_imc_arm_hw(const void *val, void *out) {
+    uint8x16_t v = vld1q_u8((const uint8_t*)val);
+    vst1q_u8((uint8_t*)out, vaesimcq_u8(v));
+}
+
+void zan_hw_aes_encrypt(const void *val, const void *key, void *out) {
+    if (zan_hw_arm_aes()) {
+        zan_hw_aes_encrypt_arm_hw(val, key, out);
+    } else {
+        zan_aes_encrypt_round_soft(val, key, out, 1);
+    }
+}
+
+void zan_hw_aes_encrypt_last(const void *val, const void *key, void *out) {
+    if (zan_hw_arm_aes()) {
+        zan_hw_aes_encrypt_last_arm_hw(val, key, out);
+    } else {
+        zan_aes_encrypt_round_soft(val, key, out, 0);
+    }
+}
+
+void zan_hw_aes_decrypt(const void *val, const void *key, void *out) {
+    if (zan_hw_arm_aes()) {
+        zan_hw_aes_decrypt_arm_hw(val, key, out);
+    } else {
+        zan_aes_decrypt_round_soft(val, key, out, 1);
+    }
+}
+
+void zan_hw_aes_decrypt_last(const void *val, const void *key, void *out) {
+    if (zan_hw_arm_aes()) {
+        zan_hw_aes_decrypt_last_arm_hw(val, key, out);
+    } else {
+        zan_aes_decrypt_round_soft(val, key, out, 0);
+    }
+}
+
+void zan_hw_aes_keygenassist(const void *val, uint8_t rcon, void *out) {
+    zan_aes_keygenassist_soft(val, rcon, out);
+}
+
+void zan_hw_aes_imc(const void *val, void *out) {
+    if (zan_hw_arm_aes()) {
+        zan_hw_aes_imc_arm_hw(val, out);
+    } else {
+        zan_aes_imc_soft(val, out);
+    }
+}
+
+void zan_hw_vec128_xor(const void *a, const void *b, void *out) {
+    uint8x16_t va = vld1q_u8((const uint8_t*)a);
+    uint8x16_t vb = vld1q_u8((const uint8_t*)b);
+    vst1q_u8((uint8_t*)out, veorq_u8(va, vb));
+}
+
+void zan_hw_vec128_load(const void *addr, void *out) {
+    uint8x16_t v = vld1q_u8((const uint8_t*)addr);
+    vst1q_u8((uint8_t*)out, v);
+}
+
+void zan_hw_vec128_store(void *addr, const void *val) {
+    uint8x16_t v = vld1q_u8((const uint8_t*)val);
+    vst1q_u8((uint8_t*)addr, v);
+}
+
 #else
 
-void zan_hw_aes_encrypt(const void *val, const void *key, void *out) { (void)val; (void)key; (void)out; }
-void zan_hw_aes_encrypt_last(const void *val, const void *key, void *out) { (void)val; (void)key; (void)out; }
-void zan_hw_aes_decrypt(const void *val, const void *key, void *out) { (void)val; (void)key; (void)out; }
-void zan_hw_aes_decrypt_last(const void *val, const void *key, void *out) { (void)val; (void)key; (void)out; }
-void zan_hw_aes_keygenassist(const void *val, uint8_t rcon, void *out) { (void)val; (void)rcon; (void)out; }
-void zan_hw_aes_imc(const void *val, void *out) { (void)val; (void)out; }
-void zan_hw_vec128_xor(const void *a, const void *b, void *out) { (void)a; (void)b; (void)out; }
-void zan_hw_vec128_load(const void *addr, void *out) { (void)addr; (void)out; }
-void zan_hw_vec128_store(void *addr, const void *val) { (void)addr; (void)val; }
+void zan_hw_aes_encrypt(const void *val, const void *key, void *out) {
+    zan_aes_encrypt_round_soft(val, key, out, 1);
+}
+
+void zan_hw_aes_encrypt_last(const void *val, const void *key, void *out) {
+    zan_aes_encrypt_round_soft(val, key, out, 0);
+}
+
+void zan_hw_aes_decrypt(const void *val, const void *key, void *out) {
+    zan_aes_decrypt_round_soft(val, key, out, 1);
+}
+
+void zan_hw_aes_decrypt_last(const void *val, const void *key, void *out) {
+    zan_aes_decrypt_round_soft(val, key, out, 0);
+}
+
+void zan_hw_aes_keygenassist(const void *val, uint8_t rcon, void *out) {
+    zan_aes_keygenassist_soft(val, rcon, out);
+}
+
+void zan_hw_aes_imc(const void *val, void *out) {
+    zan_aes_imc_soft(val, out);
+}
+
+void zan_hw_vec128_xor(const void *a, const void *b, void *out) {
+    const uint8_t *pa = (const uint8_t*)a;
+    const uint8_t *pb = (const uint8_t*)b;
+    uint8_t *po = (uint8_t*)out;
+    for (int i = 0; i < 16; i++) po[i] = pa[i] ^ pb[i];
+}
+
+void zan_hw_vec128_load(const void *addr, void *out) {
+    memcpy(out, addr, 16);
+}
+
+void zan_hw_vec128_store(void *addr, const void *val) {
+    memcpy(addr, val, 16);
+}
 
 #endif
 

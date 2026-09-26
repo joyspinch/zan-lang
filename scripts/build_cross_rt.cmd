@@ -162,7 +162,11 @@ for %%P in (ohos-x64:x86_64-unknown-linux-ohos ohos-arm64:aarch64-unknown-linux-
     "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -DZAN_IO_STACKLESS_ONLY -fPIC -I %RT% -O2 -c %RT%\rt_io.c    -o toolchain\%%A\zanrt_io.o    || exit /b 1
     "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_sync.c  -o toolchain\%%A\zanrt_sync.o  || exit /b 1
     "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_file.c  -o toolchain\%%A\zanrt_file.o  || exit /b 1
-    "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\%%A\zanrt_timer.o || exit /b 1
+    rem arm64: OHOS clang 15's arm_neon.h declares the FEAT_SHA2 intrinsics
+    rem (rt_hw_accel.c's SHA-256 kernel) only under a TU-level feature macro
+    rem -- the target("sha2") attribute enables codegen but not the header
+    rem guard -- so the timer object needs -march. Handled after the loop;
+    %OHOSBIN%\clang.exe --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\%%A\zanrt_timer.o || if "%%B"=="x86_64-unknown-linux-ohos" exit /b 1
     "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -I src\common -O2 -c %RT%\zan_embed_api.c -o toolchain\%%A\zan_embed_api.o || exit /b 1
     "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO -DMINIZ_NO_TIME -I %RT% -I src\common -O2 -c %RT%\zan_inflate.c -o toolchain\%%A\zan_inflate.o || exit /b 1
     rem zap_main.o is the HAP XComponent shell adapter zanc puts at the head
@@ -177,3 +181,8 @@ for %%P in (ohos-x64:x86_64-unknown-linux-ohos ohos-arm64:aarch64-unknown-linux-
     echo built toolchain\%%A
   )
 )
+rem The arm64 timer rebuild promised in the loop: -march turns on the TU-level
+rem crypto feature macro so arm_neon.h declares the SHA-2 intrinsics. Runtime
+rem dispatch is unaffected -- the HWCAP_SHA2 gate plus KAT still decide per CPU.
+"%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target aarch64-unknown-linux-ohos -g0 -std=c11 -fPIC -march=armv8-a+crypto -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\ohos-arm64\zanrt_timer.o || exit /b 1
+echo built toolchain\ohos-arm64\zanrt_timer.o +crypto

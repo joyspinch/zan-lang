@@ -1412,7 +1412,7 @@ add_test(NAME policy_server_mvc_ai_endpoint
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/server_mvc/ai_endpoint_allowlist.out
     -DOUT_EXE=${CMAKE_BINARY_DIR}/policy_server_mvc_ai_endpoint${_exe_ext}
     -DSTDLIB_STAMP=${_stdlib_stamp}
-    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Web/src/ZanWeb/Ai/AiEndpointPolicy.zan"
+    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Mvc/src/ZanWeb/Framework/Ai/AiEndpointPolicy.zan"
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 set_tests_properties(policy_server_mvc_ai_endpoint PROPERTIES TIMEOUT 120)
 
@@ -1520,7 +1520,7 @@ foreach(_src ${_conf_srcs})
   zan_uses_gui_driver(${_src} _needs_gui_driver)
   if(_name STREQUAL "server_mvc_timezone")
     set(_extra_args
-      "${CMAKE_SOURCE_DIR}/packages/Zan.Web/src/ZanWeb/Web/Fmt.zan")
+      "${CMAKE_SOURCE_DIR}/packages/Zan.Mvc/src/ZanWeb/Framework/Fmt.zan")
   elseif(_name STREQUAL "ns_conflict_generic_arity")
     # The case needs a same-simple-name delegate in a second namespace so
     # nsresolve sees the cross-namespace collision it locks in.
@@ -1638,6 +1638,19 @@ foreach(_src ${_conf_srcs})
     continue()
   endif()
   set(_extra_args "")
+  if(_name STREQUAL "server_mvc_timezone")
+    set(_extra_args
+      "${CMAKE_SOURCE_DIR}/packages/Zan.Mvc/src/ZanWeb/Framework/Fmt.zan")
+  elseif(_name STREQUAL "ns_conflict_generic_arity")
+    set(_extra_args
+      "${CMAKE_SOURCE_DIR}/tests/conformance/helpers/ns_conflict_other_action.zan")
+  elseif(_name STREQUAL "file_embed_bytes")
+    set(_extra_args
+      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/embed_assets=assets")
+  elseif(_name STREQUAL "file_embed_subdir")
+    set(_extra_args
+      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/embed_subdir_assets=assets")
+  endif()
   add_test(NAME determinism_${_name}
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
@@ -1721,7 +1734,7 @@ foreach(_src ${_conf_srcs})
   set(_expect_leak_site "")
   if(_name STREQUAL "server_mvc_timezone")
     set(_extra_args
-      "${CMAKE_SOURCE_DIR}/packages/Zan.Web/src/ZanWeb/Web/Fmt.zan")
+      "${CMAKE_SOURCE_DIR}/packages/Zan.Mvc/src/ZanWeb/Framework/Fmt.zan")
   elseif(_name STREQUAL "ns_conflict_generic_arity")
     # The case needs a same-simple-name delegate in a second namespace so
     # nsresolve sees the cross-namespace collision it locks in.
@@ -1789,7 +1802,7 @@ foreach(_src ${_conf_srcs})
   zan_uses_gui_driver(${_src} _needs_gui_driver)
   if(_name STREQUAL "server_mvc_timezone")
     set(_extra_args
-      "${CMAKE_SOURCE_DIR}/packages/Zan.Web/src/ZanWeb/Web/Fmt.zan")
+      "${CMAKE_SOURCE_DIR}/packages/Zan.Mvc/src/ZanWeb/Framework/Fmt.zan")
   elseif(_name STREQUAL "ns_conflict_generic_arity")
     # The case needs a same-simple-name delegate in a second namespace so
     # nsresolve sees the cross-namespace collision it locks in.

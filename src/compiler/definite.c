@@ -19,17 +19,22 @@
  * lambda marks everything it could capture as assigned, and the right operand
  * of `&&` / `||` / `??` / `?:` never counts as a definite write. */
 
+#include <stdint.h>
 #include <string.h>
 
 #include "definite.h"
 #include "diag.h"
 #include "token.h"
 
-#define DA_MAX_LOCALS 256
+#define DA_MAX_LOCALS 1024
+#define DA_WORDS ((DA_MAX_LOCALS + 63) / 64)
+
+typedef struct {
+    uint64_t words[DA_WORDS];
+} da_state_t;
 
 struct da_var {
     zan_istr_t name;
-    unsigned char assigned;
     unsigned char is_out;   /* `out` parameter: must be written before return */
     unsigned char reported; /* already diagnosed, so a loop reports once */
 };
@@ -39,12 +44,13 @@ struct da_var {
 struct da_exit {
     struct da_exit *outer;
     unsigned char seen;
-    unsigned char state[DA_MAX_LOCALS];
+    da_state_t state;
 };
 
 struct da_ctx {
     zan_diag_t *diag;
     struct da_var v[DA_MAX_LOCALS];
+    da_state_t assigned;
     int count;
     bool reachable;
     bool bail;      /* a shape the analysis does not model: report nothing */
@@ -73,42 +79,49 @@ static void da_declare(struct da_ctx *c, zan_istr_t name, bool assigned,
                        bool is_out) {
     if (!name.str || name.len == 0) return;
     if (c->count >= DA_MAX_LOCALS) { c->bail = true; return; }
-    struct da_var *v = &c->v[c->count++];
+    int idx = c->count++;
+    struct da_var *v = &c->v[idx];
     v->name = name;
-    v->assigned = assigned ? 1 : 0;
     v->is_out = is_out ? 1 : 0;
     v->reported = 0;
+    if (assigned) {
+        c->assigned.words[idx / 64] |= ((uint64_t)1 << (idx % 64));
+    } else {
+        c->assigned.words[idx / 64] &= ~((uint64_t)1 << (idx % 64));
+    }
 }
 
-static void da_save(struct da_ctx *c, unsigned char *buf) {
-    for (int i = 0; i < c->count; i++) buf[i] = c->v[i].assigned;
+static void da_save(struct da_ctx *c, da_state_t *buf) {
+    *buf = c->assigned;
 }
 
-static void da_restore(struct da_ctx *c, const unsigned char *buf) {
-    for (int i = 0; i < c->count; i++) c->v[i].assigned = buf[i];
+static void da_restore(struct da_ctx *c, const da_state_t *buf) {
+    c->assigned = *buf;
 }
 
 /* Intersect: assigned only where both paths assigned. */
-static void da_merge(struct da_ctx *c, const unsigned char *buf) {
-    for (int i = 0; i < c->count; i++) {
-        if (!buf[i]) c->v[i].assigned = 0;
+static void da_merge(struct da_ctx *c, const da_state_t *buf) {
+    for (int i = 0; i < DA_WORDS; i++) {
+        c->assigned.words[i] &= buf->words[i];
     }
 }
 
 static void da_assign_all(struct da_ctx *c) {
-    for (int i = 0; i < c->count; i++) c->v[i].assigned = 1;
+    memset(c->assigned.words, 0xFF, sizeof(c->assigned.words));
 }
 
 static void da_mark(struct da_ctx *c, zan_ast_node_t *n) {
     if (!n || n->kind != AST_IDENTIFIER) return;
     int i = da_find(c, n->ident.name);
-    if (i >= 0) c->v[i].assigned = 1;
+    if (i >= 0) c->assigned.words[i / 64] |= ((uint64_t)1 << (i % 64));
 }
 
 static void da_use(struct da_ctx *c, zan_ast_node_t *n) {
     if (!n || n->kind != AST_IDENTIFIER) return;
     int i = da_find(c, n->ident.name);
-    if (i < 0 || c->v[i].assigned || c->v[i].reported) return;
+    if (i < 0) return;
+    bool assigned = (c->assigned.words[i / 64] & ((uint64_t)1 << (i % 64))) != 0;
+    if (assigned || c->v[i].reported) return;
     c->v[i].reported = 1;
     if (!c->emit) return;
     zan_diag_emit(c->diag, DIAG_ERROR, n->loc,
@@ -119,7 +132,8 @@ static void da_use(struct da_ctx *c, zan_ast_node_t *n) {
 /* Every `out` parameter has to be written on the path leaving the method. */
 static void da_check_out_params(struct da_ctx *c, zan_loc_t loc) {
     for (int i = 0; i < c->count; i++) {
-        if (!c->v[i].is_out || c->v[i].assigned || c->v[i].reported) continue;
+        bool assigned = (c->assigned.words[i / 64] & ((uint64_t)1 << (i % 64))) != 0;
+        if (!c->v[i].is_out || assigned || c->v[i].reported) continue;
         c->v[i].reported = 1;
         if (!c->emit) continue;
         zan_diag_emit(c->diag, DIAG_ERROR, loc,
@@ -133,12 +147,12 @@ static void da_record_exit(struct da_ctx *c) {
     struct da_exit *e = c->exits;
     if (!e) return;
     if (!e->seen) {
-        da_save(c, e->state);
+        da_save(c, &e->state);
         e->seen = 1;
         return;
     }
-    for (int i = 0; i < c->count; i++) {
-        if (!c->v[i].assigned) e->state[i] = 0;
+    for (int i = 0; i < DA_WORDS; i++) {
+        e->state.words[i] &= c->assigned.words[i];
     }
 }
 
@@ -180,32 +194,32 @@ static void da_call_args(struct da_ctx *c, zan_ast_list_t *args) {
 /* Operands that run conditionally: reads are checked against the state at
  * hand, writes are rolled back because the operand may not run. */
 static void da_maybe(struct da_ctx *c, zan_ast_node_t *n) {
-    unsigned char snap[DA_MAX_LOCALS];
-    da_save(c, snap);
+    da_state_t snap;
+    da_save(c, &snap);
     da_expr(c, n);
-    da_restore(c, snap);
+    da_restore(c, &snap);
 }
 
 static void da_ternary(struct da_ctx *c, zan_ast_node_t *n) {
-    unsigned char snap[DA_MAX_LOCALS];
-    unsigned char branch[DA_MAX_LOCALS];
+    da_state_t snap;
+    da_state_t branch;
     da_expr(c, n->conditional.cond);
-    da_save(c, snap);
+    da_save(c, &snap);
     da_expr(c, n->conditional.then_expr);
-    da_save(c, branch);
-    da_restore(c, snap);
+    da_save(c, &branch);
+    da_restore(c, &snap);
     da_expr(c, n->conditional.else_expr);
-    da_merge(c, branch);
+    da_merge(c, &branch);
 }
 
 static void da_switch_expr(struct da_ctx *c, zan_ast_node_t *n) {
-    unsigned char snap[DA_MAX_LOCALS];
+    da_state_t snap;
     da_expr(c, n->switch_expr.expr);
-    da_save(c, snap);
+    da_save(c, &snap);
     for (int i = 0; i < n->switch_expr.arms.count; i++) {
         zan_ast_node_t *arm = n->switch_expr.arms.items[i];
         if (!arm) continue;
-        da_restore(c, snap);
+        da_restore(c, &snap);
         int mark = c->count;
         if (arm->switch_arm.var_name.str && arm->switch_arm.var_name.len) {
             da_declare(c, arm->switch_arm.var_name, true, false);
@@ -214,7 +228,7 @@ static void da_switch_expr(struct da_ctx *c, zan_ast_node_t *n) {
         da_expr(c, arm->switch_arm.result);
         c->count = mark;
     }
-    da_restore(c, snap);
+    da_restore(c, &snap);
 }
 
 static void da_expr(struct da_ctx *c, zan_ast_node_t *n) {
@@ -366,16 +380,16 @@ static void da_block(struct da_ctx *c, zan_ast_node_t *n) {
 }
 
 static void da_if(struct da_ctx *c, zan_ast_node_t *n) {
-    unsigned char entry[DA_MAX_LOCALS];
-    unsigned char then_state[DA_MAX_LOCALS];
+    da_state_t entry;
+    da_state_t then_state;
     da_expr(c, n->if_stmt.cond);
-    da_save(c, entry);
+    da_save(c, &entry);
 
     da_stmt(c, n->if_stmt.then_body);
     bool then_out = c->reachable;
-    da_save(c, then_state);
+    da_save(c, &then_state);
 
-    da_restore(c, entry);
+    da_restore(c, &entry);
     c->reachable = true;
     bool else_out = true;
     if (n->if_stmt.else_body) {
@@ -384,10 +398,10 @@ static void da_if(struct da_ctx *c, zan_ast_node_t *n) {
     }
 
     if (then_out && else_out) {
-        da_merge(c, then_state);
+        da_merge(c, &then_state);
         c->reachable = true;
     } else if (then_out) {
-        da_restore(c, then_state);
+        da_restore(c, &then_state);
         c->reachable = true;
     } else if (else_out) {
         c->reachable = true;
@@ -400,8 +414,8 @@ static void da_if(struct da_ctx *c, zan_ast_node_t *n) {
  * loop entry (intersected with every `break`) survives. */
 static void da_loop(struct da_ctx *c, zan_ast_node_t *body,
                     zan_ast_node_t *step, bool endless) {
-    unsigned char entry[DA_MAX_LOCALS];
-    da_save(c, entry);
+    da_state_t entry;
+    da_save(c, &entry);
 
     struct da_exit exit;
     exit.outer = c->exits;
@@ -416,35 +430,35 @@ static void da_loop(struct da_ctx *c, zan_ast_node_t *body,
 
     if (endless) {
         if (exit.seen) {
-            da_restore(c, exit.state);
+            da_restore(c, &exit.state);
             c->reachable = true;
         } else {
             /* `while (true)` with no break: the code after it is dead. */
-            da_restore(c, entry);
+            da_restore(c, &entry);
             c->reachable = false;
         }
         return;
     }
-    da_restore(c, entry);
-    if (exit.seen) da_merge(c, exit.state);
+    da_restore(c, &entry);
+    if (exit.seen) da_merge(c, &exit.state);
     c->reachable = true;
 }
 
 static void da_try(struct da_ctx *c, zan_ast_node_t *n) {
-    unsigned char entry[DA_MAX_LOCALS];
-    unsigned char merged[DA_MAX_LOCALS];
-    da_save(c, entry);
+    da_state_t entry;
+    da_state_t merged;
+    da_save(c, &entry);
 
     da_stmt(c, n->try_stmt.try_body);
     bool any = c->reachable;
-    if (any) da_save(c, merged);
+    if (any) da_save(c, &merged);
 
     for (int i = 0; i < n->try_stmt.catches.count; i++) {
         zan_ast_node_t *cc = n->try_stmt.catches.items[i];
         if (!cc) continue;
         /* A catch runs from anywhere in the try, so it starts from the state
          * the try began with. */
-        da_restore(c, entry);
+        da_restore(c, &entry);
         c->reachable = true;
         int mark = c->count;
         if (cc->catch_clause.var_name.str && cc->catch_clause.var_name.len) {
@@ -454,19 +468,19 @@ static void da_try(struct da_ctx *c, zan_ast_node_t *n) {
         c->count = mark;
         if (!c->reachable) continue;
         if (!any) {
-            da_save(c, merged);
+            da_save(c, &merged);
             any = true;
         } else {
-            for (int k = 0; k < c->count; k++) {
-                if (!c->v[k].assigned) merged[k] = 0;
+            for (int k = 0; k < DA_WORDS; k++) {
+                merged.words[k] &= c->assigned.words[k];
             }
         }
     }
 
     if (any) {
-        da_restore(c, merged);
+        da_restore(c, &merged);
     } else {
-        da_restore(c, entry);
+        da_restore(c, &entry);
     }
     c->reachable = any;
 
@@ -481,9 +495,9 @@ static void da_try(struct da_ctx *c, zan_ast_node_t *n) {
 }
 
 static void da_switch(struct da_ctx *c, zan_ast_node_t *n) {
-    unsigned char entry[DA_MAX_LOCALS];
+    da_state_t entry;
     da_expr(c, n->switch_stmt.expr);
-    da_save(c, entry);
+    da_save(c, &entry);
 
     struct da_exit exit;
     exit.outer = c->exits;
@@ -497,7 +511,7 @@ static void da_switch(struct da_ctx *c, zan_ast_node_t *n) {
         if (!sc->switch_case.pattern && !sc->switch_case.type_pattern) {
             has_default = true;
         }
-        da_restore(c, entry);
+        da_restore(c, &entry);
         c->reachable = true;
         int mark = c->count;
         if (sc->switch_case.var_name.str && sc->switch_case.var_name.len) {
@@ -513,9 +527,9 @@ static void da_switch(struct da_ctx *c, zan_ast_node_t *n) {
 
     c->exits = exit.outer;
 
-    da_restore(c, entry);
+    da_restore(c, &entry);
     if (exit.seen && has_default) {
-        da_merge(c, exit.state);
+        da_merge(c, &exit.state);
     }
     c->reachable = true;
 }
@@ -594,9 +608,9 @@ static void da_stmt(struct da_ctx *c, zan_ast_node_t *n) {
         c->exits = exit.outer;
         if (exit.seen) {
             if (fell) {
-                da_merge(c, exit.state);
+                da_merge(c, &exit.state);
             } else {
-                da_restore(c, exit.state);
+                da_restore(c, &exit.state);
             }
         }
         c->reachable = true;
@@ -656,6 +670,7 @@ static void da_stmt(struct da_ctx *c, zan_ast_node_t *n) {
 
 static void da_run(struct da_ctx *c, zan_ast_node_t *method, bool emit) {
     c->count = 0;
+    memset(c->assigned.words, 0, sizeof(c->assigned.words));
     c->reachable = true;
     c->bail = false;
     c->emit = emit;
