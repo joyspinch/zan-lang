@@ -26,12 +26,19 @@
   （`SSL_new`/`SSL_connect` 等），与"零 C 依赖、实现全在 Zan"的基座冲突。
   改造路径：以 `AesGcm`/`ChaCha20`（待建）+ `Hkdf` + `Sha256` 重组握手与
   记录层，或明确定位为"可选系统 TLS 桥"并从 stdlib 核心摘出。
-- [ ] **B-HW2** ARM64 硬件内核落地：`rt_hw_accel.c` 的 x86 侧已全覆盖
+- [x] **B-HW2** ARM64 硬件内核落地：`rt_hw_accel.c` 的 x86 侧已全覆盖
   （SHA-1/256 NI、AES-NI 参数化 CBC/ECB/CTR、PCLMUL GHASH、CRC32C、
-  SM4 查表），ARM 侧只有门与 KAT 常量，缺内核：SHA-1/256（FEAT_SHA1/256）、
-  SHA-512（FEAT_SHA512）、AES（FEAT_AES 参数化）、GHASH（PMULL，寄存器
-  域反射折叠同 x86 语义）、SM3（FEAT_SM3）、CRC32C（ARMv8 CRC 指令）。
-  全部照 x86 先例挂 KAT 门控（发布常量向量），真机回归。
+  SM4 查表），ARM 侧缺内核。已落地（2026-09-26）：SHA-1/256（FEAT_SHA1/256，
+  vsha1*/vsha256* 全体内管线）、AES（FEAT_AES：enc 融合管线、dec 挂起密钥
+  管线 AESD 前异或语义、CBC/ECB/CTR 参数化）、GHASH（PMULL 寄存器域反射
+  折叠）、CRC32C（ARMv8 CRC 系统指令）、SM3（FEAT_SM3：sm3ss1/tt1a/1b/2a/
+  2b 状态反排 {D,C,B,A}、SS1 不含 W 项、partw1/partw2 各取不同 n 窗）。
+  全部挂三态 KAT 门控，qemu-aarch64（zig 交叉编译真执行 ARM 加密指令）
+  对官方向量全 GREEN（FIPS 180-4、FIPS-197、SP 800-38A、GB/T 32905、
+  RFC 4960），digest 另与 OpenSSL 逐长度（55..130 含块边界）比对一致；
+  x64 构建回归 + conformance crypto/hw 7 例过 + ZAN_NO_HWACCEL=1 软件
+  路径与硬件路径逐字节一致；standard 档过。SHA-512 保持诚实 -1
+  （FEAT_SHA512 真机罕见，纯 Zan 覆盖）。真机批量回归仍待硬件到手。
 - [ ] **B-HW3** SM4 AES-NI 仿射分解：x86 现为查表驱动（唯一引擎，保留）；
   AESNI 仿射变换分解可再提速，非阻塞优化项。
 - [x] **A-HW4** `byte[]`→`string` 零拷贝视图的 `.Length` 走 strlen，首个

@@ -2069,3 +2069,49 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   加器裸加载，域混用只在 y≠0 的第二步起污染——y=0 的首块自我测试
   掩住它。换装/仿写 SIMD 内核时，KAT 必须覆盖"累加器非零"的后续步，
   单块自测不算通过。
+  进制摘要（必然含 0x00 字节）恰好丢尾部。裸 FFI char* 无魔数，仍按
+  strlen 度量（正确的借用语义）。conformance：string_view_length。
+- **KAT 门控用公开常量向量，常量按 API 语义换算**：FIPS-197 C.1
+  （ECB）、SP800-38A F.2.1（CBC）/F.5.1（CTR）、FIPS 180-4
+  （SHA 族）、GB/T 32905（SM3）、RFC 4960（CRC32C）。CRC32C 的
+  更新函数是 continuation 语义（入参预反转、返回末反转），KAT 常量
+  必须按这个语义换算——拿标准表值直接取反手算，符号位一错就写成
+  0x1CF9637C 而正确是 0x1CF96D7C，且 KAT 永不通过时才暴露。
+- **逐步 KAT 才能抓域混用**：GHASH 的 x 块 BSWAP 进寄存器域而 y 累
+  加器裸加载，域混用只在 y≠0 的第二步起污染——y=0 的首块自我测试
+  掩住它。换装/仿写 SIMD 内核时，KAT 必须覆盖"累加器非零"的后续步，
+  单块自测不算通过。
+
+## ARM64 加密 intrinsic 内核：qemu 交叉验证闭环与指令语义探针（2026-09-26）
+
+- **无真机也能功能验证 ARM 内核**：`zig cc -target aarch64-linux-musl
+  -Xclang -target-feature -Xclang +<feat>` 交叉编译 + `qemu-aarch64` 运行，
+  加密指令被真执行，KAT 全跑得动。坑：① 管道 `zig cc ... | head` 会把编译
+  失败的退出码吃掉、接着跑旧二进制——先 `set -o pipefail`；重编前先
+  `rm -f` 旧产物，否则失败编译静默留下陈旧可执行。② zig 集成汇编器拒收
+  4 操作数 SM3 指令的内联汇编，只能走 intrinsics；FEAT 位用
+  `-Xclang -target-feature`，`-march=` 会被 zig cc 拒收。
+- **intrinsic 语义必须探针实证，不得凭文档/记忆**：编译器对 intrinsic
+  实参到指令寄存器角色的映射可能不是自然顺序（如 sm3ss1 的重排）。探针
+  定式：marker 常量喂入，调用后把**所有输入和输出都打印**——输入保持活跃
+  可强制编译器分寄存器，暴露 dest 别名行为；再对照 qemu 源码
+  `target/arm/tcg/crypto_helper.c`（指令语义的权威实现）逐式核验。
+  qemu 侧怪癖要记录：sm3ss1 会把 lane 0-2 清零，但算法只消费 lane 3
+  （TT 指令只读 n[3]），不受影响。
+- **SM3（FEAT_SM3）内核语义**：TT1/TT2 指令把工作变量**反排**存放——
+  A 侧 {D,C,B,A}、E 侧 {H,G,F,E}，A/E/SS1 恒在 lane 3，imm2 选 W/W′
+  泳道；轮转（B→A、C←B<<<9 等）和 P0 全在指令内。**SS1 不含 W 项**：
+  SM3SS1 只有三个加数（rol12(A)+E+rotl(T,j)），W 只进 TT2 的 m 操作数
+  ——指令形状本身就是规格证据。消息扩展 partw1 与 partw2 的 n 操作数
+  是**不同的窗**（W[i-9..i-6] 与 W[i-6..i-3]，用 vext 跨相邻 4 字窗拼接），
+  传同一个 n 必错。XOR 轮型（tt1a/2a，轮 0-15）与 maj/cho 轮型（tt1b/2b，
+  轮 16-63）**按组分**不按泳道分——宏展开按 l 写 a/b 会把每组装成
+  "4 条 a + 12 条 b"。滚动 4 向量窗要把扩展算到 W[64..67]（末组 W′ 的
+  上文）。
+- **跨语言 oracle 纪律**：用 Python 等脚本写标量参照时，多项求和必须先
+  `& 0xffffffff` 再旋转——C 的 uint32_t 截断是隐式的，脚本语言把高位带进
+  右移产生垃圾。参照必须先对官方向量自证（`assert == KAT`）才配用来抓
+  分歧；手写标量参照与被测内核往往共享同一个规格误解，**两者一致 ≠ 正确**
+  ——仲裁者只能是 OpenSSL/发布向量这类外部实现。另外经
+  `wsl.exe bash -c "<heredoc>"` 内联喂脚本有被引号损坏的风险，一律写成
+  文件再执行。

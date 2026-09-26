@@ -568,52 +568,67 @@ static void zan_sha256_transform_arm(uint32_t state[8], const uint8_t *data, siz
         uint32x4_t msg1 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p + 16)));
         uint32x4_t msg2 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p + 32)));
         uint32x4_t msg3 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p + 48)));
-        uint32x4_t tmp;
+        uint32x4_t tmp, save;
 
+        /* ACLE SHA-256 pair, verified against the FIPS loop: vsha256hq
+         * (abcd, efgh, wk) returns the new ABCD, vsha256h2q (efgh, abcd,
+         * wk) returns the new EFGH and reads the PRE-group ABCD. */
         /* Rounds 0-3 */
+        save = state0;
         tmp = vaddq_u32(msg0, vld1q_u32(&K256_C[0]));
-        state1 = vsha256hq_u32(state1, state0, tmp);
-        state0 = vsha256h2q_u32(state1, state0, tmp);
+        state0 = vsha256hq_u32(state0, state1, tmp);
+        state1 = vsha256h2q_u32(state1, save, tmp);
         msg0 = vsha256su0q_u32(msg0, msg1);
         /* Rounds 4-7 */
+        save = state0;
         tmp = vaddq_u32(msg1, vld1q_u32(&K256_C[4]));
-        state1 = vsha256hq_u32(state1, state0, tmp);
-        state0 = vsha256h2q_u32(state1, state0, tmp);
+        state0 = vsha256hq_u32(state0, state1, tmp);
+        state1 = vsha256h2q_u32(state1, save, tmp);
         msg1 = vsha256su0q_u32(msg1, msg2);
         msg0 = vsha256su1q_u32(msg0, msg2, msg3);
         /* Rounds 8-11 */
+        save = state0;
         tmp = vaddq_u32(msg2, vld1q_u32(&K256_C[8]));
-        state1 = vsha256hq_u32(state1, state0, tmp);
-        state0 = vsha256h2q_u32(state1, state0, tmp);
+        state0 = vsha256hq_u32(state0, state1, tmp);
+        state1 = vsha256h2q_u32(state1, save, tmp);
         msg2 = vsha256su0q_u32(msg2, msg3);
         msg1 = vsha256su1q_u32(msg1, msg3, msg0);
         /* Rounds 12-15 */
+        save = state0;
         tmp = vaddq_u32(msg3, vld1q_u32(&K256_C[12]));
-        state1 = vsha256hq_u32(state1, state0, tmp);
-        state0 = vsha256h2q_u32(state1, state0, tmp);
+        state0 = vsha256hq_u32(state0, state1, tmp);
+        state1 = vsha256h2q_u32(state1, save, tmp);
         msg3 = vsha256su0q_u32(msg3, msg0);
         msg2 = vsha256su1q_u32(msg2, msg0, msg1);
 
         for (int i = 16; i < 64; i += 16) {
+            save = state0;
             tmp = vaddq_u32(msg0, vld1q_u32(&K256_C[i]));
-            state1 = vsha256hq_u32(state1, state0, tmp);
-            state0 = vsha256h2q_u32(state1, state0, tmp);
+            state0 = vsha256hq_u32(state0, state1, tmp);
+            state1 = vsha256h2q_u32(state1, save, tmp);
+            msg0 = vsha256su0q_u32(msg0, msg1);
+            msg3 = vsha256su1q_u32(msg3, msg1, msg2);
+
+            save = state0;
+            tmp = vaddq_u32(msg1, vld1q_u32(&K256_C[i + 4]));
+            state0 = vsha256hq_u32(state0, state1, tmp);
+            state1 = vsha256h2q_u32(state1, save, tmp);
+            msg1 = vsha256su0q_u32(msg1, msg2);
             msg0 = vsha256su1q_u32(msg0, msg2, msg3);
 
-            tmp = vaddq_u32(msg1, vld1q_u32(&K256_C[i + 4]));
-            state1 = vsha256hq_u32(state1, state0, tmp);
-            state0 = vsha256h2q_u32(state1, state0, tmp);
+            save = state0;
+            tmp = vaddq_u32(msg2, vld1q_u32(&K256_C[i + 8]));
+            state0 = vsha256hq_u32(state0, state1, tmp);
+            state1 = vsha256h2q_u32(state1, save, tmp);
+            msg2 = vsha256su0q_u32(msg2, msg3);
             msg1 = vsha256su1q_u32(msg1, msg3, msg0);
 
-            tmp = vaddq_u32(msg2, vld1q_u32(&K256_C[i + 8]));
-            state1 = vsha256hq_u32(state1, state0, tmp);
-            state0 = vsha256h2q_u32(state1, state0, tmp);
-            msg2 = vsha256su1q_u32(msg2, msg0, msg1);
-
+            save = state0;
             tmp = vaddq_u32(msg3, vld1q_u32(&K256_C[i + 12]));
-            state1 = vsha256hq_u32(state1, state0, tmp);
-            state0 = vsha256h2q_u32(state1, state0, tmp);
-            msg3 = vsha256su1q_u32(msg3, msg1, msg2);
+            state0 = vsha256hq_u32(state0, state1, tmp);
+            state1 = vsha256h2q_u32(state1, save, tmp);
+            msg3 = vsha256su0q_u32(msg3, msg0);
+            msg2 = vsha256su1q_u32(msg2, msg0, msg1);
         }
 
         s0 = vaddq_u32(s0, state0);
@@ -643,7 +658,51 @@ static int zan_sha256_kat_arm(void) {
     }
     return 1;
 }
-#endif /* aarch64 sha2 */
+
+/* FEAT_SHA1 (sha1c/sha1p/sha1m rounds, sha1h rotate, su0/su1 schedule).
+ * Group invariant: after a 4-round group the new E equals (a_before_group)
+ * <<< 30, which is exactly what SHA1H extracts from the pre-group lane 0. */
+__attribute__((target("sha2")))
+static void zan_sha1_transform_arm(uint32_t state[5], const uint8_t *data, size_t num_blocks) {
+    uint32x4_t abcd = vld1q_u32(&state[0]);
+    uint32_t e = state[4];
+    for (size_t b = 0; b < num_blocks; b++) {
+        const uint8_t *p = data + b * 64;
+        uint32x4_t abcd0 = abcd;
+        uint32_t e0 = e;
+        uint32x4_t msg[4] = {
+            vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p))),
+            vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p + 16))),
+            vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p + 32))),
+            vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p + 48)))
+        };
+        for (int g = 0; g < 20; g++) {
+            uint32_t e_next = vsha1h_u32(vgetq_lane_u32(abcd, 0));
+            if (g >= 4) {
+                uint32x4_t t = vsha1su0q_u32(msg[g % 4], msg[(g + 1) % 4], msg[(g + 2) % 4]);
+                msg[g % 4] = vsha1su1q_u32(t, msg[(g + 3) % 4]);
+            }
+            /* The SHA-1 instructions carry no K constant: K rides in the
+             * message word (SHA1C/P/M fold m ^ k internally). The schedule
+             * updates above stay on the raw words. */
+            uint32_t k = (g < 5)   ? 0x5a827999u
+                       : (g < 10)  ? 0x6ed9eba1u
+                       : (g < 15)  ? 0x8f1bbcdcu
+                       :             0xca62c1d6u;
+            uint32x4_t wm = vaddq_u32(msg[g % 4], vdupq_n_u32(k));
+            if (g < 5)       abcd = vsha1cq_u32(abcd, e, wm);
+            else if (g < 10) abcd = vsha1pq_u32(abcd, e, wm);
+            else if (g < 15) abcd = vsha1mq_u32(abcd, e, wm);
+            else             abcd = vsha1pq_u32(abcd, e, wm);
+            e = e_next;
+        }
+        abcd = vaddq_u32(abcd, abcd0);
+        e += e0;
+    }
+    vst1q_u32(&state[0], abcd);
+    state[4] = e;
+}
+#endif /* aarch64 sha1+sha2 */
 
 #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
 static int zan_sha256_kat_x86(void) {
@@ -893,15 +952,14 @@ static void zan_sha1_transform_ni(uint32_t state[5], const uint8_t *data, size_t
 
 #endif /* x86 sha1 */
 
-/* B-HW2 pending: the ARM64 FEAT_SHA1 kernel (zan_sha1_transform_arm) is
- * not written yet, so the ARM64 branches below must stay compiled out --
- * referencing the missing symbol breaks every ARM64 cross link. The gate
- * then reads "engine absent", zan_hw_sha1 honestly returns -1, and pure
- * Zan takes over. To land the kernel: write the vsha1c*q-based transform
- * next to the SHA-2 one above and put the platform condition
- *   (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
- * back into this define. */
+/* FEAT_SHA1 rides LLVM's "sha2" target feature (SHA-1 and SHA-256 ship as
+ * one crypto unit), so the kernel below carries the same attribute as the
+ * SHA-2 one. */
+#if (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+#define ZAN_SHA1_ARM_KERNEL 1
+#else
 #define ZAN_SHA1_ARM_KERNEL 0
+#endif
 
 static int zan_sha1_kat(void) {
     /* FIPS 180-4: SHA-1("abc") = a9993e36 4706816a b3e25717 850c26c9 cd0d89d */
@@ -1270,6 +1328,227 @@ static uint32_t zan_crc32c_sse42(uint32_t crc, const uint8_t *p, int64_t n) {
 
 #endif /* x86 */
 
+/* ---- ARM64 FEAT_AES / FEAT_PMULL / FEAT_CRC32 kernels ----
+ * Mirrors of the x86 kernels above: same shared FIPS-197 scalar key
+ * schedule (consumed round by round in the same order), same PKCS#7 CBC /
+ * CTR / single-block-ECB semantics, same GHASH register-domain reflection.
+ * On ARM the round key is XORed BEFORE the S-box (AESE/AESD), so the
+ * pipeline is vaesmc(vaeseq(...)) over keys 0..nr-1 with the final round
+ * XORing the last key twice (the pre-XOR inside vaeseq and the explicit
+ * veor cancel, leaving the true post-round whitening). */
+#if (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+#include <arm_acle.h>
+
+typedef unsigned __int128 zan_u128;
+
+static inline uint8x16_t zan_bswap128_arm(uint8x16_t v) {
+    uint8x16_t r = vrev64q_u8(v);
+    return vextq_u8(r, r, 8);
+}
+
+__attribute__((target("aes")))
+static uint8x16_t zan_aes_enc_block_arm(const uint8_t *key, int keybits, uint8x16_t block) {
+    uint8_t rkb[15][16];
+    int nr;
+    zan_aes_expand_key(key, keybits, rkb, &nr);
+    /* ARM fusion: AESE folds the round key in before the S-box, so the raw
+     * schedule streams straight through vaeseq; vaesmc after every round
+     * but the last (FIPS-197 round Nr has no MixColumns) and the state
+     * stays "pre-whitened": b = state_{r+1} ^ rk[r+1]. The final vaeseq
+     * consumes the pending rk[nr-1] to finish round Nr-1, then a plain
+     * veor applies the true last key. */
+    for (int r = 0; r + 1 < nr; r++) block = vaesmcq_u8(vaeseq_u8(block, vld1q_u8(rkb[r])));
+    return veorq_u8(vaeseq_u8(block, vld1q_u8(rkb[nr - 1])), vld1q_u8(rkb[nr]));
+}
+
+__attribute__((target("aes")))
+static void zan_aes_expand_dec_arm(const uint8_t *key, int keybits, uint8x16_t *dec_rk) {
+    /* Mirror of the encryption fusion: plain reversed schedule — vaesimc is
+     * applied to the state inside the round loop, not to the keys (the x86
+     * aesdec flow pre-transforms its keys; ARM must not). */
+    uint8_t rkb[15][16];
+    int nr;
+    zan_aes_expand_key(key, keybits, rkb, &nr);
+    for (int i = 0; i <= nr; i++) dec_rk[i] = vld1q_u8(rkb[nr - i]);
+}
+
+__attribute__((target("aes")))
+static int64_t zan_aes_cbc_encrypt_arm(const uint8_t *in, int64_t len,
+                                       const uint8_t *key, int keybits,
+                                       const uint8_t *iv, uint8_t *out) {
+    uint8_t rkb[15][16];
+    int nr;
+    zan_aes_expand_key(key, keybits, rkb, &nr);
+    uint8x16_t rk[15];
+    for (int i = 0; i <= nr; i++) rk[i] = vld1q_u8(rkb[i]);
+
+    int pad_val = 16 - (int)(len % 16);
+    int64_t full_blocks = len / 16;
+    uint8x16_t feedback = vld1q_u8(iv);
+
+    for (int64_t i = 0; i < full_blocks; i++) {
+        uint8x16_t block = veorq_u8(vld1q_u8(in + i * 16), feedback);
+        for (int r = 0; r + 1 < nr; r++) block = vaesmcq_u8(vaeseq_u8(block, rk[r]));
+        block = veorq_u8(vaeseq_u8(block, rk[nr - 1]), rk[nr]);
+        vst1q_u8(out + i * 16, block);
+        feedback = block;
+    }
+
+    uint8_t tail[16];
+    int rem = (int)(len - full_blocks * 16);
+    for (int j = 0; j < rem; j++) tail[j] = in[full_blocks * 16 + j];
+    for (int j = rem; j < 16; j++) tail[j] = (uint8_t)pad_val;
+
+    uint8x16_t block = veorq_u8(vld1q_u8(tail), feedback);
+    for (int r = 0; r + 1 < nr; r++) block = vaesmcq_u8(vaeseq_u8(block, rk[r]));
+    block = veorq_u8(vaeseq_u8(block, rk[nr - 1]), rk[nr]);
+    vst1q_u8(out + full_blocks * 16, block);
+    return (full_blocks + 1) * 16;
+}
+
+__attribute__((target("aes")))
+static int64_t zan_aes_cbc_decrypt_arm(const uint8_t *in, int64_t len,
+                                       const uint8_t *key, int keybits,
+                                       const uint8_t *iv, uint8_t *out) {
+    if (len <= 0 || (len % 16) != 0) return -1;
+    uint8x16_t dec_rk[15];
+    zan_aes_expand_dec_arm(key, keybits, dec_rk);
+    int nr = keybits / 32 + 6;
+
+    int64_t blocks = len / 16;
+    uint8x16_t prev = vld1q_u8(iv);
+
+    for (int64_t i = 0; i < blocks; i++) {
+        uint8x16_t cur = vld1q_u8(in + i * 16);
+        /* AESD (like AESE) XORs its key BEFORE the S-box, but the inverse
+         * round needs the round key AFTER InvSubBytes — so the state
+         * register carries the pending key: ct = state0 ^ rk[Nr] already,
+         * each aesd cancels the pending key to feed the pure state through
+         * InvSubBytes, veor adds this round's key, vaesimc applies
+         * InvMixColumns, and that same key stays pending for the next
+         * round. The final aesd cancels rk[1] and its output is the
+         * plaintext once rk[0] is veor'd on. */
+        uint8x16_t block = cur;
+        for (int r = 1; r < nr; r++) {
+            uint8x16_t p = veorq_u8(vaesdq_u8(block, dec_rk[r - 1]), dec_rk[r]);
+            block = veorq_u8(vaesimcq_u8(p), dec_rk[r]);
+        }
+        uint8x16_t plain = veorq_u8(vaesdq_u8(block, dec_rk[nr - 1]), dec_rk[nr]);
+        plain = veorq_u8(plain, prev);
+        vst1q_u8(out + i * 16, plain);
+        prev = cur;
+    }
+
+    uint8_t pad_val = out[len - 1];
+    if (pad_val == 0 || pad_val > 16) return -1;
+    int bad = 0;
+    for (int i = 0; i < pad_val; i++) {
+        if (out[len - 1 - i] != pad_val) bad = 1;
+    }
+    if (bad) return -1;
+    return len - pad_val;
+}
+
+__attribute__((target("aes")))
+static int64_t zan_aes_ecb_block_arm(const uint8_t *key, int keybits,
+                                     const uint8_t *in16, uint8_t *out16) {
+    vst1q_u8(out16, zan_aes_enc_block_arm(key, keybits, vld1q_u8(in16)));
+    return 0;
+}
+
+__attribute__((target("aes")))
+static int64_t zan_aes_ctr_arm(const uint8_t *in, int64_t len,
+                               const uint8_t *key, int keybits,
+                               uint8_t *counter16, uint8_t *out) {
+    uint8_t rkb[15][16];
+    int nr;
+    zan_aes_expand_key(key, keybits, rkb, &nr);
+    uint8x16_t rk[15];
+    for (int i = 0; i <= nr; i++) rk[i] = vld1q_u8(rkb[i]);
+
+    uint8_t ctr[16];
+    memcpy(ctr, counter16, 16);
+    int64_t off = 0;
+    while (off < len) {
+        uint8x16_t ks = vld1q_u8(ctr);
+        for (int r = 0; r + 1 < nr; r++) ks = vaesmcq_u8(vaeseq_u8(ks, rk[r]));
+        ks = veorq_u8(vaeseq_u8(ks, rk[nr - 1]), rk[nr]);
+
+        uint8x16_t blk = vld1q_u8(in + off);
+        uint8x16_t o = veorq_u8(blk, ks);
+        int avail = (int)(len - off);
+        if (avail >= 16) {
+            vst1q_u8(out + off, o);
+        } else {
+            uint8_t tmp[16];
+            vst1q_u8(tmp, o);
+            memcpy(out + off, tmp, (size_t)avail);
+        }
+
+        /* 128-bit big-endian counter increment */
+        for (int j = 15; j >= 0; j--) {
+            if (++ctr[j] != 0) break;
+        }
+        off += 16;
+    }
+    memcpy(counter16, ctr, 16);
+    return len;
+}
+
+/* GHASH over PMULL (vmull_p64 = the 64x64->128 carry-less multiply, the
+ * ARM counterpart of PCLMULQDQ). Same register-domain reflection fold as
+ * the x86 kernel: byte-reverse blocks into the register so register bit
+ * r <-> GCM coefficient x^(127-r); product bit t <-> x^(254-t); reduction
+ * of bit t (t <= 126) lands at result bits {t-6, t-1, t, t+1}; the six
+ * lowest product bits spill through the second-level fold (0xE1 = q). */
+__attribute__((target("aes,neon")))
+static int64_t zan_ghash_block_pmull(const uint8_t *h16, const uint8_t *x16, uint8_t *y16) {
+    uint64x2_t h = vreinterpretq_u64_u8(zan_bswap128_arm(vld1q_u8(h16)));
+    uint64x2_t x = vreinterpretq_u64_u8(zan_bswap128_arm(vld1q_u8(x16)));
+    uint64x2_t y = vreinterpretq_u64_u8(zan_bswap128_arm(vld1q_u8(y16)));
+    uint64_t a_lo = vgetq_lane_u64(y, 0) ^ vgetq_lane_u64(x, 0);
+    uint64_t a_hi = vgetq_lane_u64(y, 1) ^ vgetq_lane_u64(x, 1);
+    uint64_t b_lo = vgetq_lane_u64(h, 0);
+    uint64_t b_hi = vgetq_lane_u64(h, 1);
+
+    zan_u128 m0  = (zan_u128)vmull_p64((poly64_t)a_lo, (poly64_t)b_lo);
+    zan_u128 m3  = (zan_u128)vmull_p64((poly64_t)a_hi, (poly64_t)b_hi);
+    zan_u128 mid = (zan_u128)vmull_p64((poly64_t)a_lo, (poly64_t)b_hi)
+                 ^ (zan_u128)vmull_p64((poly64_t)a_hi, (poly64_t)b_lo);
+    zan_u128 lo = m0 ^ (mid << 64);
+    zan_u128 hi = m3 ^ (mid >> 64);
+
+    uint64_t bit127 = (uint64_t)(lo >> 63) & 1;
+    zan_u128 E = lo ^ ((zan_u128)bit127 << 127);
+    zan_u128 F = (E >> 6) ^ (E >> 1) ^ E ^ (E << 1);
+    uint64_t s = 0, low6 = (uint64_t)lo & 0x3F;
+    for (int i = 0; i < 6; i++) if ((low6 >> i) & 1) {
+        s ^= 0xE1ULL << (51 + i);          /* x^(133-i) = x^(5-i) * q */
+        if (i == 0) s ^= 0xE1ULL << 56;    /* x^128 = q, only t = 0 */
+    }
+    zan_u128 direct = (hi << 1) ^ bit127;
+    zan_u128 res = F ^ direct ^ ((zan_u128)s << 64);
+
+    uint64x2_t rv = vcombine_u64(vmov_n_u64((uint64_t)res), vmov_n_u64((uint64_t)(res >> 64)));
+    vst1q_u8(y16, zan_bswap128_arm(vreinterpretq_u8_u64(rv)));
+    return 0;
+}
+
+/* CRC-32C (Castagnoli), reflected poly 0x82F63B78, FEAT_CRC32. The acle
+ * helpers carry their own target("crc") attribute in arm_acle.h. */
+__attribute__((target("crc")))
+static uint32_t zan_crc32c_pmull_arm(uint32_t crc, const uint8_t *p, int64_t n) {
+    uint64_t c = crc;
+    while (n >= 8 && ((uintptr_t)p & 7)) { c = __crc32cb((uint32_t)c, *p++); n--; }
+    while (n >= 8) { c = __crc32cd((uint32_t)c, *(const uint64_t*)p); p += 8; n -= 8; }
+    if (n >= 4) { c = __crc32cw((uint32_t)c, *(const uint32_t*)p); p += 4; n -= 4; }
+    if (n >= 2) { c = __crc32ch((uint32_t)c, *(const uint16_t*)p); p += 2; n -= 2; }
+    if (n >= 1) { c = __crc32cb((uint32_t)c, *p); }
+    return (uint32_t)c;
+}
+
+#endif /* aarch64 aes/ghash/crc32c */
+
 /* ---- KAT gates: published vectors only ---- */
 static int zan_aes_kat(void) {
     /* FIPS-197 appendix C: single ECB blocks for all three key sizes */
@@ -1352,12 +1631,39 @@ static int zan_aes_kat(void) {
     n = zan_aes_ctr_ni(cbc_pt, 32, cbc_key, 128, ctrb, out);
     if (n != 32 || memcmp(out, ctr_ct, 32) != 0) return 0;
     return 1;
+#elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+    uint8_t out[80];
+    uint8_t blk[16];
+
+    if (zan_aes_ecb_block_arm(key128, 128, pt, blk) != 0) return 0;
+    if (memcmp(blk, ct128, 16) != 0) return 0;
+    if (zan_aes_ecb_block_arm(key192, 192, pt, blk) != 0) return 0;
+    if (memcmp(blk, ct192, 16) != 0) return 0;
+    if (zan_aes_ecb_block_arm(key256, 256, pt, blk) != 0) return 0;
+    if (memcmp(blk, ct256, 16) != 0) return 0;
+
+    int64_t n = zan_aes_cbc_encrypt_arm(cbc_pt, 64, cbc_key, 128, cbc_iv, out);
+    if (n != 80 || memcmp(out, cbc_ct128, 64) != 0) return 0;
+    uint8_t back[80];
+    n = zan_aes_cbc_decrypt_arm(out, 80, cbc_key, 128, cbc_iv, back);
+    if (n != 64 || memcmp(back, cbc_pt, 64) != 0) return 0;
+
+    n = zan_aes_cbc_encrypt_arm(cbc_pt, 64, cbc_key256, 256, cbc_iv, out);
+    if (n != 80 || memcmp(out, cbc_ct256_1, 16) != 0) return 0;
+    n = zan_aes_cbc_decrypt_arm(out, 80, cbc_key256, 256, cbc_iv, back);
+    if (n != 64 || memcmp(back, cbc_pt, 64) != 0) return 0;
+
+    uint8_t ctrb[16];
+    memcpy(ctrb, ctr_iv, 16);
+    n = zan_aes_ctr_arm(cbc_pt, 32, cbc_key, 128, ctrb, out);
+    if (n != 32 || memcmp(out, ctr_ct, 32) != 0) return 0;
+    return 1;
 #else
     (void)pt; (void)key128; (void)key192; (void)key256;
     (void)ct128; (void)ct192; (void)ct256;
     (void)cbc_key; (void)cbc_iv; (void)cbc_pt; (void)cbc_ct128;
     (void)cbc_key256; (void)cbc_ct256_1; (void)ctr_iv; (void)ctr_ct;
-    return 1; /* ARM gate lands with the ARM kernel pass */
+    return 1;
 #endif
 }
 
@@ -1373,6 +1679,11 @@ static int zan_ghash_kat(void) {
     if (zan_ghash_block_clmul(H, X1, y) != 0) return 0;
     if (zan_ghash_block_clmul(H, X2, y) != 0) return 0;
     return memcmp(y, want, 16) == 0;
+#elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+    uint8_t y[16] = {0};
+    if (zan_ghash_block_pmull(H, X1, y) != 0) return 0;
+    if (zan_ghash_block_pmull(H, X2, y) != 0) return 0;
+    return memcmp(y, want, 16) == 0;
 #else
     (void)H; (void)X1; (void)X2; (void)want;
     return 1;
@@ -1384,6 +1695,8 @@ static int zan_crc32c_kat(void) {
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
     /* the kernel is a continuation (no final complement): raw state = ~E3069283 */
     return zan_crc32c_sse42(0xFFFFFFFFu, (const uint8_t*)"123456789", 9) == 0x1CF96D7Cu;
+#elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+    return zan_crc32c_pmull_arm(0xFFFFFFFFu, (const uint8_t*)"123456789", 9) == 0x1CF96D7Cu;
 #else
     return 1;
 #endif
@@ -1398,6 +1711,10 @@ int64_t zan_hw_aes_cbc_encrypt(const uint8_t *in, int64_t len,
     if (zan_hw_gate(&g_gate_aes, zan_hw_has_aesni(), zan_aes_kat)) {
         return zan_aes_cbc_encrypt_ni(in, len, key, keybits, iv, out);
     }
+#elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+    if (zan_hw_gate(&g_gate_aes, zan_hw_arm_aes(), zan_aes_kat)) {
+        return zan_aes_cbc_encrypt_arm(in, len, key, keybits, iv, out);
+    }
 #endif
     return -1;
 }
@@ -1411,6 +1728,10 @@ int64_t zan_hw_aes_cbc_decrypt(const uint8_t *in, int64_t len,
     if (zan_hw_gate(&g_gate_aes, zan_hw_has_aesni(), zan_aes_kat)) {
         return zan_aes_cbc_decrypt_ni(in, len, key, keybits, iv, out);
     }
+#elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+    if (zan_hw_gate(&g_gate_aes, zan_hw_arm_aes(), zan_aes_kat)) {
+        return zan_aes_cbc_decrypt_arm(in, len, key, keybits, iv, out);
+    }
 #endif
     return -1;
 }
@@ -1422,6 +1743,10 @@ int64_t zan_hw_aes_ecb_block(const uint8_t *key, int keybits,
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
     if (zan_hw_gate(&g_gate_aes, zan_hw_has_aesni(), zan_aes_kat)) {
         return zan_aes_ecb_block_ni(key, keybits, in16, out16);
+    }
+#elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+    if (zan_hw_gate(&g_gate_aes, zan_hw_arm_aes(), zan_aes_kat)) {
+        return zan_aes_ecb_block_arm(key, keybits, in16, out16);
     }
 #endif
     return -1;
@@ -1436,6 +1761,10 @@ int64_t zan_hw_aes_ctr_crypt(const uint8_t *in, int64_t len,
     if (zan_hw_gate(&g_gate_aes, zan_hw_has_aesni(), zan_aes_kat)) {
         return zan_aes_ctr_ni(in, len, key, keybits, counter16, out);
     }
+#elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+    if (zan_hw_gate(&g_gate_aes, zan_hw_arm_aes(), zan_aes_kat)) {
+        return zan_aes_ctr_arm(in, len, key, keybits, counter16, out);
+    }
 #endif
     return -1;
 }
@@ -1446,6 +1775,10 @@ int64_t zan_hw_ghash_block(const uint8_t *h16, const uint8_t *x16, uint8_t *y16)
     if (zan_hw_gate(&g_gate_ghash, zan_hw_has_pclmul(), zan_ghash_kat)) {
         return zan_ghash_block_clmul(h16, x16, y16);
     }
+#elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+    if (zan_hw_gate(&g_gate_ghash, zan_hw_arm_pmull(), zan_ghash_kat)) {
+        return zan_ghash_block_pmull(h16, x16, y16);
+    }
 #endif
     return -1;
 }
@@ -1455,6 +1788,10 @@ int64_t zan_hw_crc32c_update(uint32_t crc, const uint8_t *p, int64_t len) {
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
     if (zan_hw_gate(&g_gate_crc32c, zan_hw_has_sse42(), zan_crc32c_kat)) {
         return (int64_t)zan_crc32c_sse42(crc, p, len);
+    }
+#elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+    if (zan_hw_gate(&g_gate_crc32c, zan_hw_arm_crc32(), zan_crc32c_kat)) {
+        return (int64_t)zan_crc32c_pmull_arm(crc, p, len);
     }
 #endif
     return -1;
@@ -1715,10 +2052,128 @@ void zan_hw_pixel_resample_bilinear_row(uint8_t *dst, const uint8_t *src0,
     }
 }
 
-/* ===== 7. SM3 Cryptographic Hash (GB/T 32905-2012) =======================
- * The runtime carries no portable SM3 implementation: x86 has no SM3
- * instructions and the ARMv8 FEAT_SM3 (sm3ss1/sm3partw1/sm3partw2) kernel
- * lands with the ARM64 pass. Callers fall back to the pure-Zan Sm3 class.
+#if (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+
+/* ===== 7. SM3 Cryptographic Hash (GB/T 32905-2012), FEAT_SM3 =============
+ * Per-round hardware:
+ *   sm3ss1              -> SS1 = rotl(rotl(A,12) + E + W[j] + rotl(T_j,j), 7)
+ *   sm3tt1a/tt1b (imm2) -> TT1 with the A/B/C/D rotation folded in
+ *                          (FF = X^Y^Z for rounds 0-15, majority after);
+ *   sm3tt2a/tt2b (imm2) -> TT2 with the P0 compression folded in
+ *                          (GG = X^Y^Z for rounds 0-15, choice after);
+ *   sm3partw1/partw2    -> W[j] = P1(W[j-16]^W[j-9]^rotl(W[j-3],15))
+ *                          ^ rotl(W[j-13],7) ^ W[j-6].
+ * The TT instructions keep the working variables REVERSED — the A-side
+ * vector is {D,C,B,A}, the E-side {H,G,F,E} — and read A/E/SS1 at lane 3
+ * while imm2 selects the W/W' lane, so the per-round K+W[j] sum rides a
+ * vext rotation of the group's constant vector. */
+static const uint32_t zan_sm3_kc_arm[64] = {
+    0x79cc4519u,    0xf3988a32u,    0xe7311465u,    0xce6228cbu,
+    0x9cc45197u,    0x3988a32fu,    0x7311465eu,    0xe6228cbcu,
+    0xcc451979u,    0x988a32f3u,    0x311465e7u,    0x6228cbceu,
+    0xc451979cu,    0x88a32f39u,    0x11465e73u,    0x228cbce6u,
+    0x9d8a7a87u,    0x3b14f50fu,    0x7629ea1eu,    0xec53d43cu,
+    0xd8a7a879u,    0xb14f50f3u,    0x629ea1e7u,    0xc53d43ceu,
+    0x8a7a879du,    0x14f50f3bu,    0x29ea1e76u,    0x53d43cecu,
+    0xa7a879d8u,    0x4f50f3b1u,    0x9ea1e762u,    0x3d43cec5u,
+    0x7a879d8au,    0xf50f3b14u,    0xea1e7629u,    0xd43cec53u,
+    0xa879d8a7u,    0x50f3b14fu,    0xa1e7629eu,    0x43cec53du,
+    0x879d8a7au,    0x0f3b14f5u,    0x1e7629eau,    0x3cec53d4u,
+    0x79d8a7a8u,    0xf3b14f50u,    0xe7629ea1u,    0xcec53d43u,
+    0x9d8a7a87u,    0x3b14f50fu,    0x7629ea1eu,    0xec53d43cu,
+    0xd8a7a879u,    0xb14f50f3u,    0x629ea1e7u,    0xc53d43ceu,
+    0x8a7a879du,    0x14f50f3bu,    0x29ea1e76u,    0x53d43cecu,
+    0xa7a879d8u,    0x4f50f3b1u,    0x9ea1e762u,    0x3d43cec5u,
+};
+
+__attribute__((target("sm4")))
+static void zan_sm3_transform_arm(uint32_t state[8], const uint8_t *data, size_t num_blocks) {
+    uint32x4_t rev = vrev64q_u32(vld1q_u32(state));
+    uint32x4_t avec = vextq_u32(rev, rev, 2);                       /* {D,C,B,A} */
+    rev = vrev64q_u32(vld1q_u32(state + 4));
+    uint32x4_t evec = vextq_u32(rev, rev, 2);                       /* {H,G,F,E} */
+    uint32x4_t ss1;
+
+    for (size_t blk = 0; blk < num_blocks; blk++, data += 64) {
+        uint32x4_t a0 = avec, e0 = evec;
+        uint32x4_t W[4];
+        for (int i = 0; i < 4; i++) {
+            W[i] = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(data + 16 * i)));
+        }
+
+        for (int g = 0; g < 16; g++) {
+            uint32x4_t cur = W[g % 4];
+            uint32x4_t wprime = veorq_u32(cur, W[(g + 1) % 4]);
+            uint32x4_t kc = vld1q_u32(&zan_sm3_kc_arm[4 * g]);
+
+            /* Extend the schedule by four words into the rolling slot.
+             * Group 15 produces W[64..67], which only W'[60..63] reads. */
+            uint32x4_t n1 = vextq_u32(W[(g + 1) % 4], W[(g + 2) % 4], 3);
+            uint32x4_t n2 = vextq_u32(W[(g + 2) % 4], W[(g + 3) % 4], 2);
+            uint32x4_t m2 = vextq_u32(W[g % 4], W[(g + 1) % 4], 3);
+            uint32x4_t ext = vsm3partw1q_u32(W[g % 4], n1, W[(g + 3) % 4]);
+            W[g % 4] = vsm3partw2q_u32(ext, n2, m2);
+
+            /* Rounds 0-15 run the XOR boolean form (tt1a/tt2a), rounds 16-63
+             * the majority/choice form (tt1b/tt2b); imm2 stays per-lane. */
+#define ZAN_SM3_ROUND(l)                                                    \
+            ss1 = vsm3ss1q_u32(avec, evec, vextq_u32(kc, kc, ((l) + 1) & 3)); \
+            if (g < 4) {                                                    \
+                avec = vsm3tt1aq_u32(avec, ss1, wprime, (l));               \
+                evec = vsm3tt2aq_u32(evec, ss1, cur, (l));                  \
+            } else {                                                        \
+                avec = vsm3tt1bq_u32(avec, ss1, wprime, (l));               \
+                evec = vsm3tt2bq_u32(evec, ss1, cur, (l));                  \
+            }
+            ZAN_SM3_ROUND(0)
+            ZAN_SM3_ROUND(1)
+            ZAN_SM3_ROUND(2)
+            ZAN_SM3_ROUND(3)
+#undef ZAN_SM3_ROUND
+        }
+
+        avec = veorq_u32(avec, a0);
+        evec = veorq_u32(evec, e0);
+        vst1q_u32(state, vextq_u32(vrev64q_u32(avec), vrev64q_u32(avec), 2));
+        vst1q_u32(state + 4, vextq_u32(vrev64q_u32(evec), vrev64q_u32(evec), 2));
+    }
+}
+
+/* GB/T 32905-2012 appendix A sample: SM3("abc"). */
+static int zan_sm3_kat_arm(void) {
+    static const uint8_t expect[32] = {
+        0x66, 0xc7, 0xf0, 0xf4, 0x62, 0xee, 0xed, 0xd9,
+        0xd1, 0xf2, 0xd4, 0x6b, 0xdc, 0x10, 0xe4, 0xe2,
+        0x41, 0x67, 0xc4, 0x87, 0x5c, 0xf2, 0xf7, 0xa2,
+        0x29, 0x7d, 0xa0, 0x2b, 0x8f, 0x4b, 0xa8, 0xe0
+    };
+    uint32_t st[8] = {
+        0x7380166fu, 0x4914b2b9u, 0x172442d7u, 0xda8a0600u,
+        0xa96f30bcu, 0x163138aau, 0xe38dee4du, 0xb0fb0e4eu
+    };
+    uint8_t tail[64];
+    tail[0] = 'a'; tail[1] = 'b'; tail[2] = 'c';
+    tail[3] = 0x80;
+    memset(tail + 4, 0, 52);
+    uint64_t bits = 24;
+    for (int i = 0; i < 8; i++) {
+        tail[56 + i] = (uint8_t)(bits >> (56 - 8 * i));
+    }
+    zan_sm3_transform_arm(st, tail, 1);
+    uint8_t out[32];
+    for (int i = 0; i < 8; i++) {
+        out[i*4]   = (uint8_t)(st[i] >> 24);
+        out[i*4+1] = (uint8_t)(st[i] >> 16);
+        out[i*4+2] = (uint8_t)(st[i] >> 8);
+        out[i*4+3] = (uint8_t)(st[i]);
+    }
+    return memcmp(out, expect, 32) == 0 ? 1 : -1;
+}
+#endif /* aarch64 SM3 */
+
+/* ===== 7. SM3 driver (GB/T 32905-2012) ===================================
+ * x86 has no SM3 instructions; FEAT_SM3 covers ARM64. Everywhere else the
+ * pure-Zan Sm3 class is the implementation.
  * ======================================================================== */
 /* SHA-512 has no x86 hardware engine (SHA extensions cover SHA-1/256 only);
  * the FEAT_SHA512 kernel lands with the ARM64 pass. Pure-Zan covers x86. */
@@ -1728,8 +2183,50 @@ int64_t zan_hw_sha512(const uint8_t *data, int64_t len, uint8_t out[64]) {
 }
 
 int64_t zan_hw_sm3(const uint8_t *data, int64_t len, uint8_t out[32]) {
-    (void)data; (void)len; (void)out;
-    return -1;
+    if (len < 0) len = 0;
+    uint32_t state[8] = {
+        0x7380166f, 0x4914b2b9, 0x172442d7, 0xda8a0600,
+        0xa96f30bc, 0x163138aa, 0xe38dee4d, 0xb0fb0e4e
+    };
+
+    size_t full_blocks = (size_t)len / 64;
+    int use_ni = 0;
+#if (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+    use_ni = zan_hw_gate(&g_gate_sm3, zan_hw_arm_sm3(), zan_sm3_kat_arm);
+#endif
+    if (!use_ni) return -1;
+
+    if (full_blocks > 0 && data) {
+#if (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+        zan_sm3_transform_arm(state, data, full_blocks);
+#endif
+    }
+
+    // Stack tail padding: fixed 128 bytes
+    uint8_t tail[128];
+    size_t rem = (size_t)len % 64;
+    if (rem > 0 && data) {
+        memcpy(tail, data + full_blocks * 64, rem);
+    }
+    tail[rem] = 0x80;
+    size_t pad_blocks = (rem >= 56) ? 2 : 1;
+    size_t total_tail = pad_blocks * 64;
+    memset(tail + rem + 1, 0, total_tail - rem - 1);
+    uint64_t bits = (uint64_t)len * 8;
+    for (int i = 0; i < 8; i++) {
+        tail[total_tail - 8 + i] = (uint8_t)(bits >> (56 - 8 * i));
+    }
+#if (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+    zan_sm3_transform_arm(state, tail, pad_blocks);
+#endif
+
+    for (int i = 0; i < 8; i++) {
+        out[i*4]   = (uint8_t)(state[i] >> 24);
+        out[i*4+1] = (uint8_t)(state[i] >> 16);
+        out[i*4+2] = (uint8_t)(state[i] >> 8);
+        out[i*4+3] = (uint8_t)(state[i]);
+    }
+    return 0;
 }
 
 static inline uint32_t zan_rotl32(uint32_t x, int n) {
