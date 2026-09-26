@@ -295,7 +295,10 @@ __asm__(
   "    punpcklqdq xmm2, xmm0\n"
   "    jmp    .Lloop\n"
   "\n"
-  ".align 16\n"
+  /* .p2align, not .align: the operand is always a power-of-two exponent
+   * for every assembler, while plain .align switches meaning -- ELF/x86
+   * takes bytes, Mach-O takes an exponent (.align 64 = align 2^64). */
+  ".p2align 4\n"
   ".Lloop:\n"
   "    movdqu xmm3, [rsi]\n"
   "    movdqu xmm4, [rsi+0x10]\n"
@@ -491,7 +494,7 @@ __asm__(
   "    ret\n"
   "\n"
   ZAN_SHA256_RODATA
-  ".align 64\n"
+  ".p2align 6\n"
   "K256:\n"
   "    .long 0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5\n"
   "    .long 0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5\n"
@@ -890,6 +893,16 @@ static void zan_sha1_transform_ni(uint32_t state[5], const uint8_t *data, size_t
 
 #endif /* x86 sha1 */
 
+/* B-HW2 pending: the ARM64 FEAT_SHA1 kernel (zan_sha1_transform_arm) is
+ * not written yet, so the ARM64 branches below must stay compiled out --
+ * referencing the missing symbol breaks every ARM64 cross link. The gate
+ * then reads "engine absent", zan_hw_sha1 honestly returns -1, and pure
+ * Zan takes over. To land the kernel: write the vsha1c*q-based transform
+ * next to the SHA-2 one above and put the platform condition
+ *   (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+ * back into this define. */
+#define ZAN_SHA1_ARM_KERNEL 0
+
 static int zan_sha1_kat(void) {
     /* FIPS 180-4: SHA-1("abc") = a9993e36 4706816a b3e25717 850c26c9 cd0d89d */
     static const uint8_t blk[64] = {
@@ -901,7 +914,7 @@ static int zan_sha1_kat(void) {
     uint32_t a[5] = { 0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0 };
 #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
     zan_sha1_transform_ni(a, blk, 1);
-#elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+#elif ZAN_SHA1_ARM_KERNEL
     zan_sha1_transform_arm(a, blk, 1);
 #endif
     static const uint8_t wantb[20] = {
@@ -923,7 +936,7 @@ int64_t zan_hw_sha1(const uint8_t *data, int64_t len, uint8_t out[20]) {
     int use_ni = 0;
 #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
     use_ni = zan_hw_gate(&g_gate_sha1, zan_hw_has_shani(), zan_sha1_kat);
-#elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+#elif ZAN_SHA1_ARM_KERNEL
     use_ni = zan_hw_gate(&g_gate_sha1, zan_hw_arm_sha1(), zan_sha1_kat);
 #endif
     if (!use_ni) return -1;
@@ -933,7 +946,7 @@ int64_t zan_hw_sha1(const uint8_t *data, int64_t len, uint8_t out[20]) {
     if (full_blocks > 0 && data) {
 #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
         zan_sha1_transform_ni(state, data, full_blocks);
-#elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+#elif ZAN_SHA1_ARM_KERNEL
         zan_sha1_transform_arm(state, data, full_blocks);
 #endif
     }
@@ -954,7 +967,7 @@ int64_t zan_hw_sha1(const uint8_t *data, int64_t len, uint8_t out[20]) {
 
 #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
     zan_sha1_transform_ni(state, tail, pad_blocks);
-#elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+#elif ZAN_SHA1_ARM_KERNEL
     zan_sha1_transform_arm(state, tail, pad_blocks);
 #endif
 
@@ -1239,8 +1252,12 @@ static int64_t zan_ghash_block_clmul(const uint8_t *h16, const uint8_t *x16, uin
     return 0;
 }
 
-/* CRC-32C (Castagnoli), reflected poly 0x82F63B78, SSE4.2 single-cycle. */
-__attribute__((target("sse4.2")))
+/* CRC-32C (Castagnoli), reflected poly 0x82F63B78, SSE4.2 single-cycle.
+ * clang's feature model keeps the CRC32 instructions behind their own
+ * "crc32" feature -- target("sse4.2") alone covers the SIMD half only
+ * (-msse4.2 on the command line implies it, a function attribute does
+ * not), so the cross builds hard-error without it. */
+__attribute__((target("sse4.2,crc32")))
 static uint32_t zan_crc32c_sse42(uint32_t crc, const uint8_t *p, int64_t n) {
     uint64_t c = crc;
     while (n >= 8 && ((uintptr_t)p & 7)) { c = _mm_crc32_u8((uint32_t)c, *p++); n--; }
