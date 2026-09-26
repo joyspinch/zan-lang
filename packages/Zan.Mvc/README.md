@@ -24,28 +24,40 @@ structure, an external config file, and the ORM and cache wired in by default.
 
 ```
 zan.pkg                 包清单（版本随包演进）
-src/ZanWeb/             包源码：目录 = 命名空间，`using ZanWeb.<Ns>;` 自动拉入对应子树
-  Core/                   基建层：Boot 引导 · Cfg 配置 · Db/DbContext · Schema · Gen 代码生成器
-  Web/                    接入层基座：App/Api/AdminController 三基类 · AppServices ·
-                          Crud 网关 · ListPage/FormPage 屏基座 · Fmt/Lang/Prose 渲染件
-  Services/               业务支撑层：JobHost 任务宿主 · Cache/CacheContext · Metrics ·
-                          Mailer · ClusterBus/Presence · Settings
-  Security/               横切层：Auth · Perm/PermTable · DataScope · Keys · LoginThrottle · VerifyCode
-  Ai/                     横切层：AI 接入与端点策略
-  Model/  Dao/            数据层：sys_* 实体与 DAO（每表一个 DAO，全部查询与写入口）
-  Account/ Admin/ Api/    接入层业务控制器，按模块分目录（登录注册 / 管理台 / JSON API）
-  Blog/  Index/  User/    示例博客（控制器+种子）· 前台首页 · 演示
-  Health.zan              免鉴权健康检查 /health（deep=1 探主库）
-  Model/Blog/  Dao/Blog/  示例模块的实体与 DAO
+src/ZanWeb/             包源码。目录是工程组织（Framework/Modules 两块），
+                        命名空间保持扁平、与 URL 同构，不随目录加深
+  Framework/              框架层：所有模块共享的件；业务模块只依赖它
+    Core/                   基建：Boot 引导 · Cfg 配置 · Db/DbContext · Schema · Gen 代码生成器
+    Services/               业务支撑：JobHost 任务宿主 · Cache/CacheContext · Metrics ·
+                            Mailer · ClusterBus/Presence · Settings
+    Security/               横切·安全：Auth · Perm/PermTable · DataScope · Keys ·
+                            LoginThrottle · VerifyCode
+    Ai/                     横切·AI：AI 助手注册与端点策略
+    *.zan                   接入层基座：App/Api/AdminController 三基类 · AppServices ·
+                            Crud 网关 · ListPage/FormPage 屏基座 · Fmt/Lang/Prose 渲染件
+  Modules/                业务模块，一个目录一个模块（垂直切片：Controller+Model+Dao）
+    Sys/
+      Controller/           接入层：目录=URL 族（Account/ Admin/ Api/ Blog/
+                            Health/ Index/ User/），一类一文件
+      Model/  Dao/          数据层：sys_* 实体与 DAO（每表一个 DAO，全部查询
+                            与写入口）；Model/Blog/、Dao/Blog/ 为示例模块
 views/                  页面模板，按控制器模块分目录（随包资产）
   layout.html             全站布局；模块自有 layout.html 仅覆盖本模块
 wwwroot/                唯一 Web 可达目录，挂载在 /static（css/js/vendor/i18n）
 ```
 
-目录分层即四层架构：基建 `Core/` → 接入 `Web/` + 各模块控制器 → 业务支撑
-`Services/` → 数据 `Model/`·`Dao/`；`Security/`·`Ai/` 横切。视图键由
-`View.LoadRec` 按目录路径推导（`views/Admin/System/SysUsers.Index.html` →
-`Admin.System.SysUsers.Index`），与控制器命名空间同构——看到路径即知键名。
+两条不变式：
+
+1. **命名同构（扁平）**：URL ↔ Controller ↔ Model/Dao ↔ 表名一一对齐
+   （`/admin/system/*` ↔ `ZanWeb.Admin.System` ↔ `SysUsers` ↔
+   `sys_user`；`/health` ↔ `Health`）。目录负责工程分层，命名空间负责
+   URL 语义——两者解耦后，挪文件不引起改名，改名不引起挪文件。
+2. **依赖单向**：`Modules/* → Framework/*`；Framework 不引用任何模块，
+   控制器基类、屏幕原语、基础设施全部住在 Framework，新模块照 Sys 的
+   形状即可接入，不产生模块间依赖。
+
+视图键由 `View.LoadRec` 按目录路径推导（`views/Admin/System/SysUsers.Index.html`
+→ `Admin.System.SysUsers.Index`），与控制器命名空间同构——看到路径即知键名。
 
 ## Attribute-driven routes
 
@@ -312,6 +324,7 @@ logged at the `[log].slowSqlMs` / `[log].slowMs` thresholds.
 using System;
 using System.Web;
 using ZanWeb;
+using ZanWeb.Blog;
 
 class Program {
     static void Main() {
@@ -321,6 +334,7 @@ class Program {
         MenuBuilder.Section("system", "系统管理");
 
         Boot.OnRoutes(Program.RegisterRoutes);
+        BlogSeed.Register();   /* 业务种子：内置管理员与演示文章（幂等） */
         int _r = await Boot.Run();
     }
     static void RegisterRoutes(WebApp app) {
