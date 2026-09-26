@@ -50,9 +50,9 @@ import urllib.parse
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TMPL = os.path.dirname(HERE)                    # templates/server/server-mvc
-# repo root is three levels up: templates/server/server-mvc -> .. -> .. -> ..
-REPO = os.path.dirname(os.path.dirname(os.path.dirname(TMPL)))
+TMPL = os.path.dirname(HERE)                    # packages/Zan.Mvc
+# repo root is two levels up: packages/Zan.Mvc -> .. -> ..
+REPO = os.path.dirname(os.path.dirname(TMPL))
 SANDBOX = os.path.join(REPO, "_scratch", "mvc_e2e")
 EXE = os.path.join(SANDBOX, "app.exe")
 DB = os.path.join(SANDBOX, "data", "app.db")
@@ -635,7 +635,7 @@ def run_matrix(catcher):
        and "namespace ZanWeb.Front" in body
        and "FrontListViewSource" not in body,
        "preview contains front controller")
-    # 生成代码：默认 gen.root=".."，沙箱里落到 templates/server/ 上一级，
+    # 生成代码：默认 gen.root=".."，沙箱里落到 packages/Zan.Mvc/ 上一级，
     # 显式把 gen.root 指到 _scratch/genroot 再验证产物。
     r = http("/admin/system/settings/save", cookie=cookie,
              data={"gen.root": os.path.join(SANDBOX, "genroot")})

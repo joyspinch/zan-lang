@@ -1,16 +1,17 @@
-# {{NAME}} — ZanWeb Web MVC Framework
+# Zan.Mvc — ZanWeb Web MVC Framework
 
 Enterprise web application skeleton modeled on a production swoole (ZxPHP)
 framework, rebuilt on Zan's coroutine runtime — a layered controller/model
 structure, an external config file, and the ORM and cache wired in by default.
 
-Two layers sit under the application code, and neither is part of the template:
+Two layers sit under the application code:
 
-- **`Zan.Web` package** (`packages/Zan.Web`) — the application framework:
+- **`Zan.Mvc` package** (this package, `src/ZanWeb/…`) — the application
+  framework:
   bootstrap (`ZanWeb.Boot`), config/DB/cache contexts, auth, RBAC, settings,
   schema + seed hook, metrics, job host, the sys entities and their DAOs, and
   the three controller base classes. Referenced by `using ZanWeb;` and pulled
-  in automatically — see the package README for the boundary and the hooks.
+  in automatically.
 - **`System.Web` standard library** — the web kernel itself: `WebApp`,
   `Router`, `HttpContext`, `Controller`, `View`, `WebServer`, next to
   `RouteTable` / `RouteStats` / `PermTable`.
@@ -46,9 +47,9 @@ wwwroot/                the ONLY web-reachable directory, served at /static
 ```
 
 The framework code (`ZanWeb` core, `Model.Sys`, `Dao.Sys`, the controller base
-classes) lives in `packages/Zan.Web/src/ZanWeb/…` and is not in the template
-tree at all. Business models/DAOs follow the same per-module layout in the
-application (`src/Model/Blog`, `src/Dao/Blog`) — same convention, app-owned.
+classes) lives in this package under `src/ZanWeb/…`. Business models/DAOs follow
+the same per-module layout in the application (`src/Model/Blog`,
+`src/Dao/Blog`) — same convention, app-owned.
 
 `views/` and `wwwroot/` sit next to `src/`, not inside it, because both are read
 at run time: a release is a copy of the executable plus `config/`, `views/` and
