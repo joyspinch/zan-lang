@@ -41,7 +41,9 @@ src/ZanWeb/             包源码。目录是工程组织（Framework/Modules �
                             Health/ Index/ User/），一类一文件
       Model/  Dao/          数据层：sys_* 实体与 DAO（每表一个 DAO，全部查询
                             与写入口）；Model/Blog/、Dao/Blog/ 为示例模块
-    Crud/                   配置驱动管理屏引擎（CrudConf 声明 + CrudScreen 基座）
+    Crud/                   配置驱动管理屏引擎（CrudConf.zan 声明 +
+                            CrudScreen.zan 基座，扁平挂模块根——两者都
+                            不是路由控制器，Controller/ 只放真控制器）
 views/                  页面模板，按控制器模块分目录（随包资产）
   layout.html             全站布局；模块自有 layout.html 仅覆盖本模块
 wwwroot/                唯一 Web 可达目录，挂载在 /static（css/js/vendor/i18n）
