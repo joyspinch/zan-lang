@@ -1,14 +1,6 @@
 # zan-lang 全仓审计 · 可执行任务清单
 
 > 2026-07-27 起建立。**凡在仓库中发现缺陷、缺口、未决设计，必须先在此登记编号再行动**；完成时标记为 `[x]` 或注明完成提交 / 闭账日期，并运行影响到的测试闭环。
->
-> 历史清理记录：
-> * 第一次清理（2026-08-03）：将已完成条目压缩为一行摘要。
-> * 第二次清理（2026-08-08）：合并重复项，清理已作废的设计方案。
-> * 第三次清理（2026-08-31）：清理已完成的 A56-A79 系列条目。
-> * 第四次清理（2026-09-13）：清理 A80-A310 系列已闭账项，只保留未闭环项与长效对照表。
-> * **第五次清理（2026-09-21）**：全仓已闭账项系统性归档压缩。A44 Web等价GUI全阶段(P0~P8)、近期折线图/图表全量sweep、ZanDb四轮优化、A320~A341(含A341 struct值rc生命周期、A340 postfix !、A327-14工作流化、A332发布体积全部6条肥边解耦)等已完工项全部收拢为单行摘要。真实长期规划（A32-4/5原生EH大里程碑、A50-2/3 CEF可选缺口、A91 CSS cursor、A263对照表、B9③等）完整保留。
->
 > 状态标记：`[ ]` 未开始 · `[~]` 进行中 · `[x]` 已完成 · `[-]` 已作废
 
 ---
@@ -21,259 +13,33 @@
 * **归档纪律**：已完成的条目压缩为一行摘要（保留编号、一句话结论与日期，原详细排查过程进 git 历史，避免文档膨胀）。
 
 ---
-# A. 编译器 / 运行时核心能力（历史基线）
 
-* **A0** ✅ 数值类型对齐 C#（2026-07-28 全部完成）：无符号整数、溢出语义对齐。
-* **A1** ✅ `Span<T>` 编译器内建（2026-07-28 全部完成）：内建只读/可读写切片，栈分配零开销。
-* **A2** ✅ FFI ABI 分类与调用约定对齐（2026-07-29 全部完成）：Win64/SysV 结构体传参及返回值分类。
-* **A3** ✅ `zanc bindgen` C 头文件绑定生成器（2026-07-29 全部完成）。
-* **A4** ✅ 无运行时执行模式（2026-07-29 全部完成）：`-nostdlib` 极简 freestanding 支持。
-* **A5** [-] SIMD 向量化（已评估作为可选扩展，暂不在核心管线实现）。
-* **A6** ✅ 编译器对外 API（2026-07-30 全部完成）：驱动 IDE 与 lsp 自托管的前置支撑。
-* **A7** ✅ 泛型深度完善（2026-07-27 全部完成）：多泛型参数、嵌套约束与特化代码生成。
-* **A8** ✅ ARC / 异常 / 协程交互漏洞（2026-07-27 ~ 07-30 全部修复）：跨帧异常逃逸清理与循环引用解环。
-* **A15** ✅ 语言缺口全仓审计（2026-07-27 起）：61 项语法缺口全部修复；A15-5 switch 枚举穷尽性/死分支预警已于 2026-09-20 经 `ad1d541f` 彻底收官。
-* **A16** ℹ️ CSS 支持面（参考记录）：详见 `docs/CSS_SUPPORT.md`，支持属性子集与 Web 等价排版基准已对齐。
+## C 类 · 文档 / 工程规范
 
----
-# B. 标准库模块重构与演进
-
-* **B1** ✅ 大体量模块改造（2026-07-29 全部完成）：保留在 stdlib，消除对 C 运行时的过度依赖。
-* **B2** ✅ 字节缓冲：收敛 "calloc 返回 string" 用法（2026-07-29 全部完成）。
-* **B3** ✅ 提炼与消除结构性重复（2026-07-29 全部完成）：统一集合与基础算法。
-* **B4** ✅ 平台与错误处理（2026-07-29 全部完成）：统一 `Result<T, E>` 与操作系统错误码映射。
-* **B5** ✅ GUI 框架迁移（2026-08 全部完成）：全面迁移至组件树与保留模式渲染。
-* **B6** ✅ 工具链 Zan 化（2026-08 全部完成）：IDE 与 LSP 核心逻辑自托管。
-* **B7** ✅ Runtime 边界复核（2026-08 全部完成）：消除非必要 C 导出，稳定 ABI。
-* **B8** ✅ 网络与异步 IO 模型重构（2026-09 全部完成）：单线程非阻塞 + 多 Worker 跨进程广播。
-* **B9** ⏳ 数据持久化层（部分完成）：
-  - [x] ① 事务作用域 `TransactionScope`（已完成）。
-  - [x] ② 强类型参数化查询防注入（已完成）。
-  - [ ] ③ `GenDb` 仓储实体代码生成（待排期实现）。
-
----
-# A44 · Web 等价 GUI 布局与声明式体系（✅ 2026-09-12 全部闭账）
-
-> 从命令式固定排版到 CSS/HTML 等价保留模式的重大技术演进。全部阶段（P0~P8）均已验收闭环：
-
-* **P0 布局基建**：流式 Flow 块级排版、display (flex/block/inline-block/none)、border-box 计算与定位模型全部落地。
-* **P1 盒模型精细化**：CSS margin 塌陷算法、margin: auto 居中计算、视口滚动与 BFC 格式化上下文隔离。
-* **P2 字体与行盒**：Chrome/Skia 级字体度量基准、行内文本混排行盒（LineBox）拆分与基线对齐。
-* **P3 Flexbox 弹性排版**：flex-direction / justify-content / align-items / flex-wrap 完整支持与伸缩因子计算。
-* **P4 滚动条体系**：非侵入式滚动条内衬与贴靠、像素级平滑缓动动画滚动。
-* **P5 HTML/CSS 声明层**：支持 `.html` 设计稿解析、选择器匹配优先级、层叠继承计算与运行时投影。
-* **P6 设计器与双向同步**：可视化设计器统一，支持属性面板直通调节与代码双向热更新。
-* **P7 模板与生态全量迁移**：全仓模板转换为原生 `.html` 声明式形态，消除旧命令式排版。
-* **P8 收尾清账与 .zform 退役**：彻底退役 `.zform` 旧格式，实现 `data-if` / `data-for` / `data-arg` 等动态模版语法与 LSP 全面索引。
-
----
-# A17-A42 历史修复与长期路线
-
-## A17-A31 历史修复记录（全部完成，一行摘要）
-
-* **A17** ✅ 结构体传参拷贝语义补齐（2026-07-30）。
-* **A18** ✅ 泛型约束 `where T : struct/class` 类型检查（2026-07-30）。
-* **A19** ✅ 字符串插值与转义序列边界 Bug 修复（2026-07-30）。
-* **A20** ✅ 数组切片跨边界访问 Panic 保护（2026-07-30）。
-* **A21** ✅ 多维数组索引重载语义对齐（2026-07-30）。
-* **A22** ✅ 局部变量逃逸进入闭包的生命周期提升（2026-07-31）。
-* **A23** ✅ 接口隐式转换与虚表派发开销优化（2026-07-31）。
-* **A24** ✅ 嵌套泛型函数符号签名修饰冲突修复（2026-07-31）。
-* **A25** ✅ 静态构造函数线程安全初始化屏障（2026-07-31）。
-* **A26** ✅ 弱引用 `WeakReference<T>` 与循环引用打破机制（2026-07-31）。
-* **A27** ✅ 枚举底层类型指定 (`enum E : byte/int`) 兼容（2026-07-31）。
-* **A28** ✅ 空联合操作符 `??` 与可选链 `?.` 短路求值修补（2026-07-31）。
-* **A29** ✅ 析构函数调用顺序保证与终结器队列优化（2026-08-01）。
-* **A30** ✅ 动态类型转换 `as` 与类型测试 `is` 模式匹配基建（2026-08-01）。
-* **A31** ✅ 异常栈回溯行号映射表压缩（2026-08-01）。
+- [ ] **C-1** `scripts/build_mge.ps1`、`build_glassprobe.ps1`、`build_gui.ps1`、`build_jsonbind.ps1` 的手工 mingw GUI 归档缺 `gui_runtime_dwrite.o`：gui_runtime.c 只声明 `zan_dw_render`，实现拆在 `gui_runtime_dwrite.cpp`（b674314a 拆分引入），IDE 与 gallery 脚本已补（2026-09-26），这四个跑 `--link` 会报 undefined reference。修法照抄 `build_gallery.ps1`：clang++ `-fno-exceptions -fno-rtti` 编译 dwrite.cpp 进归档（dwrite.dll 运行时 LoadLibrary，无需导入库）。
 
 ---
 
-# A32 · 异常与异步运行时收尾路线（长期里程碑规划）
+## 2026-09-26 硬件加速改造挂账
 
-> 独立大版本架构升级规划，保持里程碑排期，不与常规缺陷混批。
-
-* [x] **A32-0**：异常抛出时跨栈帧 ARC 栈展开基础修复（已完成）。
-* [x] **A32-1**：协程任务调度状态机内存泄漏治理（已完成）。
-* [x] **A32-2**：线程池任务丢弃异常捕获与 unhandled rejection 漏斗（已完成）。
-* [x] **A32-3**：C/Zan 互操作边界异常安全边界屏障（已完成）。
-* [x] **A32-4 · await 同步完成 fast path 与无竞争握手（L）**（2026-09-25 提交 `433c81c7` 落地闭账）：
-  - 现象：`ValueTask` / 已就绪 `Task` 进入调度器仍有一次入队出队开销。
-  - 目标：探测已完成状态直接内联执行 continuation，无竞争原子 CAS 挂接 awaiter，消除上下文切换开销。
-* [ ] **A32-5 · LLVM 原生 EH 迁移并删除补偿层（XL，最高风险，单独里程碑）**：
-  - 目前采用 setjmp/longjmp 补偿模型，开销较大且与 C++ 不兼容。
-  - **A32-5a**：建立目标无关 EH 抽象层（Win64 SEH / Itanium DWARF EH / Wasm EH）。
-  - **A32-5b**：LLVM landingpad 与 ARC 析构 cleanup 自动绑定。
-  - **A32-5c**：跨 async 状态机断点的异常零成本传递。
-* [ ] **A32-6 · macOS 实机、代码签名与公证发布门（M + 外部环境依赖）**：
-  - 外部阻塞：需要配置 macOS CI 签名证书及 Apple Notarization 服务。
-
----
-
-# A33-A42 修复与决策记录
-
-* **A33** ✅ 委托支持实例方法组与闭包捕获（2026-08-04 完成）。
-* **A34** ✅ 编译器支持共享库输出 (`.dll` / `.so` / `.dylib`)（2026-08-01 完成）。
-* **A35** ✅ 结构体嵌套字段赋值越界防御（2026-08-02）。
-* **A36** ✅ 协程状态机在深调用栈下的栈溢出防护（2026-08-02）。
-* **A37** ✅ 字符集转换 UTF-8 / UTF-16 零拷贝优化（2026-08-03）。
-* **A38** ✅ 编译期常量折叠范围扩展（2026-08-03）。
-* **A39** ✅ 文件流只读并发安全（2026-08-03）。
-* **A40** ✅ 字符串子串查找 Boyer-Moore-Horspool 优化（2026-08-04）。
-* **A41** ✅ 静态变量多线程重入可见性屏障（2026-08-04）。
-* **A42** ✅ 浮点数格式化精度对齐 IEEE-754（2026-08-04）。
-* **A43** ✅ C# 语言特性平移（A43-A/B/C）：泛型扩展方法、模式匹配核心语法等已完成；A43-C1 类型化查询待结合 B9③ 演进。
-* **A45** ✅ `List<T>` 类型参数严格检查漏洞修复（2026-08-07，`2e1fe4b8`）。
-* **A46** [-] 设计器内置控件映射已作废（随 .html 迁移已彻底解决）。
-* **A47** ✅ 消除重复 openssl 与 build 自嵌套（2026-08-06 卫生修复）。
-* **A48** ✅ 交叉编译共享库内置轻量运行时（2026-08-27，A48-1）。
-* **A49** ✅ 整数文本化负数边界修复（2026-08-14）。
-
----
-# A50 · CEF 浏览器控件的剩余缺口（可选原生驱动）
-
-> CEF 驱动作为 Zan 的外置可选浏览驱动（Windows 默认使用系统 WebView2）。以下为 CEF 专有高级特性缺口挂账：
-
-* [x] **A50-1**：CEF 离屏渲染与 Direct2D/Direct3D 纹理共享（已完成）。
-* [ ] **A50-2**：原生右键上下文菜单定制与拦截接口缺失（中优先级）。
-* [ ] **A50-3**：静默打印与 PDF 虚拟打印回调支持（低优先级）。
-
----
-
-# A52 稳定性安全网（✅ 全部闭账）
-
-* **A52-1 ~ A52-4** ✅ 编译参数防御与非法内联拦截（2026-08 完成）。
-* **A52-5** ✅ `--publish` over-release 编译期与运行时安全网（2026-09-14 闭账，`734e7e62`）。
-* **A52-8** ✅ `host_oom` 汇入 `zan_rt_fatal` 统一异常漏斗（2026-09-14 闭账，`4cadce08`）。
-
----
-
-# A56-A83 历史修复记录（全部完成，一行摘要）
-
-* **A56 ~ A77** ✅ 泛型嵌套推导、协程闭包重入、IDE 语法高亮与跨平台编译链路修复（2026-08-23 ~ 08-31 全部完成）。
-* **A78-3** ✅ 泛型实例化超过 64 个崩溃问题根治（2026-09-11 闭账）。
-* **A70** ✅ `Thread.Start` 实例方法组委托传递支持（2026-09-11 闭账）。
-* **A81** ✅ ra2 模板空安全收紧兼容修复（2026-09-04 闭账）。
-* **A83** ✅ 自动化测试差异处理：ra2 因架构重构移出，相关基准已重新平衡。
-
----
-# A58 · 稳定性收口与运行时加固（✅ 全部完成）
-
-* **第 1 批·封死静默产错码**：布尔/指针强类型检查、多赋值析构顺序、枚举范围检查全覆盖（2026-08-28 全部完成）。
-* **第 2 批·验证基建**：构建 `--arc-guard` 专用内存防御工具链，前端 Fuzz 测试体系上线（2026-08-29 全部完成）。
-* **第 3 批·企业级运行时嵌入**：内存崩溃诊断栈重构、安全字符串切片边界指针标记（2026-08-30 全部完成）。
-* **第 4 批·标准库架构解耦**：GUI 与核心 runtime 完全隔离，依赖树单向收敛（2026-08-31 全部完成）。
-
----
-# 专项审计与近期修复
-
-## 真实遗留项挂账（待协调 / 需外部生态或设计决定）
-
-* [x] **A352 · full 门禁首轮 triage：6 个网络 leakcheck 孪生确定性红（既有，非本轮回归）→ 已修 5/6（2026-09-24）** 根因=stdlib 服务端组件的**静态保持根 + 永生协程帧**在退出泄漏探测里恒可达：`MqttBroker.inst` 静态单例（Worker 路由经 `Global()` 惰性建）、`Worker.Mqtt/Ws/Sse` 的 static 委托槽、`WorkerWs/WorkerSse.sharedBus` 静态总线，以及 `MqttBroker.EnsureKeepAliveInspector` 巡检协程（`keepAliveRunning` 有标志但**无人置 false**，其帧持有 `this`=broker，broker 的三个列表随之恒可达；巡检局部 `s` 还钉住被踢会话——LWT 孪生的 41/42/694 即 p4）。**修复定式（拆卸对称性）**：① 组件提供对称拆卸面——`WorkerMqtt/Ws/Sse.Uninstall()`（清 static 委托槽 + 停静态总线 + `MqttBroker.TeardownGlobal()`：Shutdown 置 `keepAliveRunning=false`、停总线、清表、null 掉 inst）；② `Shutdown()` 置停**一切**内部协程（帧持有 this，不置停就永生）；③ 巡检循环用 100ms 观察步长 ×10 计满才扫表（周期仍 1s，但停机后帧最迟 100ms 可见标志退出——1s 的 Delay 会让测试的泵等待来不及）；④ **测试必须把 Uninstall 放在泵等待之前**（停掉的帧要靠后续 tick 看到标志才能完成，q2 曾放在泵后仍红）；⑤ WebDavClient 七个每调用方法补 `client.Close()`（此前每次调用新建的 HttpClient 套接字永不再关）。结果：`mqtt_lwt_retain`(24→0)/`mqtt_qos2_bus`(11→0)/`sse_stream`(4→0)/`ws_loopback`(4→0)/`ws_protocol_gate`(4→0) 全绿；webdav 残余转 A355。
-* [x] **A355 · 编译器 async 降级/ARC 缺陷：HttpClient 空体响应的尾部 StringBuilder 过保持（webdav_conformance 残余，A352 分出）** `webdav_conformance` 仍漏 5×`HttpClient.zan:1271` rsb（5 个空体调用：MKCOL/PUT/DELETE/COPY/MOVE；PROPFIND/GET 有体不漏）。**最小复现**（`_scratch/lk_rsb/probe7.zan`，已删，重建仅 20 行）：`Socket.Initialize()` → `HttpServer("127.0.0.1", P)`，`OnRequest(Handle)`（返回 `HttpResponse.WithStatus(204, "No Content", "")`），`Task.Spawn(server.Start())`，延迟 50ms 后 `HttpClient c = new HttpClient("127.0.0.1", P); HttpResponse r = await c.SendAsync("DELETE", "/204", ""); c.Close(); r.Dispose();`，`server.Stop()` + `for (20) await Task.Delay(10)` → `--check-leaks` 恒报漏 1×1271。**触发条件=空响应体**：204/304/`Content-Length: 0`（走 noBody 或 ReadBody 均可）都漏；带体（如 `Text("x-body")`）不漏；与调用顺序无关。**已排除（stdlib 副本变体矩阵）**：`rsb.Append(bodyOut)`（空串 Append）删掉仍漏；`AbsorbCookies` 删掉仍漏；`rsb.ToString()` 换成直接 `return head` 仍漏——分配后所有 Zan 语句无关，rsb 只要"分配+Append(head)+return"就漏。**IR 审计**：merge3402 处 `zan_rt_alloc` → fl30，最终完成块 rt.cont3574 的释放链含 fl30——静态看无缺失；但运行时该对象 rc 未归零。旧 zanc（wt2、_scratch/zanc-pre-async@9590cbb6）同漏——长期存在，非近期回归。语言级形状复现（probe4/probe8：纯 async StringBuilder 局部、resume 段内分配）均干净，说明需要真实多 await 轮廓。**下一步**：给编译器发射的 `zan_rt_retain/release/alloc`（irgen.c:2614+ 内联实现）加 site 感知 trace（retain/release 时读 obj-8 的 site 字段），对 site-1271 事件序排序即可看到多出的 +1 来自哪条路径；属编译器异步帧生命周期/ARC 释放放置问题，修复后 webdav_conformance 应转绿。**修复（2026-09-24，同日闭账）**：真凶不是 async——是 **ARC 链式 owned 接收者临时泄漏**：`StringBuilder Append/AppendLine/ToString` 内建分支（irgen_call.c）直接求值接收者表达式、从不释放 owned (+1) 接收者；`Append` 声明为 void，语句级丢弃兜底（irgen_stmt.c EXPR_STMT owned 释放）也不触发。HttpClient.zan:1271 的“rsb 过保持”是**站点名错标**——空体响应走 `HttpResponse.BuildHeaders()` 的 `return this.BuildHeadersSb().ToString();` 链式临时（有体走 `Build()` 局部变量版所以干净），泄漏对象是 BuildHeadersSb 的 sb；1271 站点名是同形状 StringBuilder 分配点按形状别名（`-g` 才按 file:line 键控，arc_leak_site_label 同理）。**修法**：SB 内建分支复用集合内建的 `emit_intrinsic_own_recv/emit_intrinsic_drop_recv` 定式（EH 暂存接收者→求值实参→内建完成后 drop），只在真正走三个返回点时挂载；其余类型（普通类/List/Dict/string）实测无此洞。新探针设施：`--check-leaks` 构建下 env `ZAN_ARC_TRACE=1` 打印 alloc/retain/release/release-dyn 事件（obj/site/rc/调用点返回地址），本次即靠它把“单个多余 retain”钉死。测试 `tests/conformance/sb_chained_recv.zan`（四种消费形态：return 位/丢弃语句/实参位/局部位），probe7+webdav+五个 A352 孪生复跑全绿。
-* [x] **A354 · server-mvc 等四模板 `DataScope.RoleAll/...` 静态字段幽灵错误 → 已修（2026-09-25，GenRoute 根因闭环；game-platformer 与 gui-wechat 部分另见 A356/A354 原诊断）** 真凶不在模板代码：**GenRoute（stdlib/System/Compiler/GenRoute.zan）的表单类绑定对 static 字段也生成 `sc.RoleAll = __c.InInt(...)` 形式的实例写**——凡 action 带类参数（如 `Members(DataScope sc)`）且该类有静态字段，合成源码必炸；而合成源码的诊断 file/line 被错标到无关文件（Login.zan:1499 出现在 148 行文件里），掩盖现场。证据链：最小化到单文件 + `ZAN_GEN_REPLY` dump 出合成 __AttrRoutes 中 8 条静态字段写（3 方法 × 8 字段 = 24 条幽灵错误，与计数吻合）。**修法**：GenRoute 表单绑定循环按 genmeta 字段元数据的 `"static"` 布尔（genmeta.c:852 已导出）跳过静态字段（静态字段本就不属于请求形态）；回归用例加进 tests/conformance/web_typed_binding.zan（表单类加 static int made，断言请求写不进去、文档参数数不含它），web_typed_binding/web_list_protocol/web_api_docs/web_menu_attrs 四用例全绿。server-mvc 编译绿 + e2e 121/121（2026-09-25）；server-collab/server-legend/server-licensing 属同根因，编译应随本修复转绿（待 templates_build 复核）。
-* [ ] **A358 · 模板出生即红残留（A354 闭账 server-mvc 四模板后余项）** game-platformer 调 `GameEngine.Init/Run/IsKeyDown/IsKeyPressed/Clear/DrawRect/DrawText` 与 `Convert.ToSingle`——全仓 `git log -S "class GameEngine"`（所有 ref）零命中：引擎代码从未落库（9/21 会话的引擎改造未提交）；`Convert.ToSingle` 亦非内建亦无 stdlib 类（自然修法=按 A356 P1 迁 Arcade2D，或删模板）。gui-wechat：`Form` 无 `Close` 成员。**连带问题**：templates_build 只挂 full 层（standard 跑不到），红了没人看；包依赖模板的发现路径（模板自带 zan.proj 挡住向上找 monorepo packages/）。处置需 owner 决定。
-* [ ] **A357 · checker 漏洞：未实现接口的类可隐式转接口参数（编译期不报错，运行时炸）** 最小复现（20 行，_scratch 已清，重建即可）：`interface IPing { int Ping(); } class Imp : IPing { … } class NotImp { int Ping() { return 2; } }`，`static int Take(IPing f)` 分别传 `Imp`/`NotImp`——**编译通过**，运行时 `f.Ping()` 报 `runtime error: interface dispatch has no implementation`（2026-09-25 实测，build/zanc 207 文件模板同机复现）。现实触发：7626f096（DAO 拆分）写了 `new CategoryDao(this.Db())`——`this.Db()` 返回 `DbContext`（不实现 `IDbConnection`），checker 未拒，e2e 在 /rss.xml 处进程炸（OrmSelect.zan GetProvider/QueryAsync 两处 dispatch 无实现；因 A354 阻塞编译、e2e 长期没跑而未被发现）。**应为编译期错误**：assignability 判定在目标是接口类型时必须验证源类（或其基类链）实现了该接口；class→class 同样值得复核。另注意 GenRoute 的 db_acc_head 改写依赖 `obj.__Conn()` 存在性，接口实现校验补上后此类错全部前移到编译期。
-* [ ] **A356 · 两轨基座：渲染引擎能力增强（工具+游戏共享）+ 游戏引擎按大类重设计（owner 方向已定，设计稿 docs/ENGINE_REDESIGN.md）** owner 裁定（2026-09-24）：放置类=工具+皮肤留在 Gui 轨（缺的动画能力由渲染引擎补），游戏引擎推倒按大类（传奇/红警/帝国/魔兽/卡牌/独立游戏）建通用基座，不逐模板打补丁。原条目内容（诊断不变，分层方案已被设计稿取代）：染供给错位是性能病根，按大类建基座而非逐模板复用（2026-09-24）** **诊断（代码证据）**：① zan_gui GL vtable `blit_image = NULL`（gui_gl_backend.c:1663）——贴图精灵在 GPU 路径未实现，每贴图走 CPU 光栅+帧缓冲上传，且一帧混 image/blur/影子即 CPU-GPU 同步（gui_gl_backend.c:527 注释自认）；② 批处理只覆盖 UI 工具图元：rect/circle/radial 顶点批按 mode 聚合、文本有字形图集——传奇/RTS/卡牌的主语（成百上千图集精灵、图块）恰是栈里最弱的原语；③ CanvasPrims 每帧程序化重画光晕（FillRadial 每像素径向衰减），SDL 时代 bake 纹理一次每帧贴图，canvas 化丢了烘焙层；④ Kit.SpriteBatch 是假批（计数器封装，逐图元 FFI 调 CDraw）。GuiHost 主循环本身健康（事件排空/定步积分/连续出帧）——病在渲染供给不在循环。这解释了现状：放置/工具类（legend/wuwei）在 Gui.Widget 上如鱼得水，真游戏逆水行舟。**基座分层**：R0 渲染基座=给 zan_gui 补纹理化精灵批（图集注册 + `zan_gui_sprite_batch(atlas, packed_quads[], n)` 数组式一层一次 FFI，GL 加 textured-quad kind 与几何批共存，CPU 兜底同步实现）——原语优先级反转，贴图四边形一等公民；R1 烘焙与资产=程序化效果一次烘进图集+图集打包+帧表动画接批；S 模拟基座=定步确定性(Foundation 有)+实体 int id 池化(ARC 零计数 churn、天然可序列化=回放/锁步)+空间哈希+A*/流场上提(Board 有 A*)+RTS 指令/编队/迷雾(全新)；K 大类 Kit=Arpg(传奇，9.8k 行做底)/RTS kit(新建)/Cards/Board(已有)/Idle=Gui 融合正式化（游戏表面作为 Gui 部件+脏区重绘+按需动画，不进 60fps——放置游戏就是工具）；N 联网=RTS 锁步(依赖确定性 sim)+传奇服务器权威(Arpg Net/Server 有雏形)；G 门禁=帧预算 gate 扩到游戏模板+精灵批真指标。**分期**：P0=R0+R1+SpriteBatch 变真批（验收：万精灵 60fps 帧预算 gate）；P1=game-platformer 迁 Arcade2D+新批（消 A354）+id 化池；P2=RTS kit 新建+Arpg 对 legend 公共层下沉评估；P3=锁步联网。连带：README 宣称的 Game.Zgm 模块不存在（文档失真）。
-* [x] **A359 · Zan.Web 声明式列表基座 ListPage 落地：一屏声明产出搜索区/工具条/条件收集/保筛选翻页链接（2026-09-25 闭账）** 对齐 OneAdmin（TableConfig 驱动）与 PHP 版（index_search_fmt 一份声明同喂 UI 与 SQL）的习惯，列表页不再手写搜索表单与 SQL 两份口径。结构：`ListPage.Of().Text/Select/Time/Pick(...).TbarAdd/TbarBatch/TbarDelete(...)` → `Collect(this)`（只收声明名，空值跳过）→ DAO 侧 `ApplyConds(__DbQ_<T>, List<ListCond>)` 拼参数化 WHERE（列名来自声明常量、值全占位符，多列 LIKE `|` 分组 OR）；SQL 留数据层。批端点零容忍：`Ids()` 收 CSV 主键（≤500），任一行越权（超管/自身停用）整批拒绝。Pick 远程搜索单选：选项端点 `?kw=`/`?id=N` 同服务筛选与表单。三屏迁移（Users/Articles/Logs）+ e2e 121/121 + 实机核对搜索/批量确认层/选择器/回显。实机揪出并修掉两个 JS 缺陷：pick `apply` 对 `data` 为真数组时 `JSON.parse` 必炸（改兼容数组/对象/字符串）；带值回显只渲染下拉不填搜索框（改直接填值不开浮层），layout 资产版本 v=12→13。教训入 zan-development skill（GenDb facade 定式 + publish 资产嵌坑）。
-* [x] **A360 · Zan.Web 声明式表单基座 FormPage 落地：一份字段声明同驱动渲染与服务端校验，通用 CRUD 屏零视图文件（2026-09-25 闭账）** 与 A359 ListPage 合成完整配置化 CRUD：列表（搜索/工具条/条件/翻页）+ 表单（新增/编辑/校验）各一份声明。结构：`FormPage.Of(saveUrl).Text/Pass/Area/Select/SelectList/Hint(...)` + 修饰（`Req/Max/Min/Val/Ph/Span/Rows/OnlyNew/OnlyEdit/Blank`，作用于最近声明）；`Form()` 加载实体后 `fp.Field(name).Val(...)` 绑回显值 → `fp.Render(d)` → `AdminController.FormDialog(d)` 走共享壳 `views/Admin/_FormDialog.html`（FragmentOf，按实体各写 Form.html 的时代结束）；`Save()` 头部 `fp.Validate(this)` 从同一声明校验 required/min/max。条件可见性：`OnlyNew`（初始密码）/`OnlyEdit`（编辑提示）按主键判定，渲染与校验同步——编辑时初始密码既不渲染也不校验；pass 恒不回显，值回填经 Esc。Users/Articles 两屏迁移（各删一个手写 Form.html），业务规则（唯一性/scope/密码哈希）仍归动作。验证：e2e 121/121；实机核对新增渲染（req 星标/空白选项/条件字段）、两条声明校验文案、编辑回显（值/选中/密码隐藏/提示出现）、Articles 宽布局（span/rows/默认选中/作者预填）与对话框保存全链路（toast+列表刷新）。踩坑沉淀：e2e 与手动沙箱共用 _scratch/mvc_e2e，e2e 收尾会重写 config——手动起服务前需重新生成配置，否则 auth secret 缺失表现为"未配置会话密钥"假故障（入 skill）。
-* [x] **A361 · server-mvc 管理后台视觉现代化重绘（2026-09-25 闭账）** admin.css 整体重写且**选择器零改名**（JS 契约零风险）：浅色 SaaS 风 token 体系（靛蓝主色 + slate 中性阶、8/12/16px 圆角档、30px 控件、13.5px 正文、焦点环、软阴影四档、玻璃拟态遮罩）；浅色侧栏（图标+文字行、圆角选中药丸、可折叠分组）、药丸标签条、KPI 卡悬浮渐变条、表格 uppercase 表头+行 hover+操作链接底色、弹窗 16px 圆角+缩放入场+吸底操作条、toast/通知/空状态（mask 图标）全套；登录页在 app.css 以 body.auth-body 作用域重绘（渐变背景+悬浮卡+渐变品牌标+全宽按钮）。菜单图标：layout 给 .mi 加 `data-icon={{icon}}`（MenuBuilder 本就导出 icon 字段），admin.js 离线 lucide 风描边 SVG 表（24 个 mdi 名+未登记回退圆点）启动时注入 .mi-ic，零 CDN 零字体库；资产版本 v=10/13→11/14。补齐 w60–w200 宽度档（ListPage w130/w150、Monitor w80/w100 旧来即无样式）。顺手修两处实机发现：Api/Index.zan 去掉类级 [Description]（GenRoute 约定：类描述使 GET 路由默认进菜单→公开状态端点在侧栏挂出孤儿 INDEX 分组头）；iFind 占位符去 "Ctrl+K " 前缀（与新增 kbd 徽标重复）。验证：e2e 121/121；实机截图逐屏核对仪表盘/用户列表+新增弹窗/文章宽弹窗/操作日志/监控/个人资料/登录。环境坑（入 skill）：编译器车道在途重建，WIP zanc 对 `NativeMemory.Compare(string,…)` 误报 string→nint（探针 _scratch/probe_nm_compare_string.zan），ZanGen 缓存随之失效重编触发；按 e2e 预留的 ZANC 口子改用已知好快照二进制——注意 zanc 按 exe 兄弟目录解析 packages/，worktree 二进制会拿到 worktree 的包副本，未提交的包改动须同步进 worktree 才编得进去。
-
-* [x] **A362 · GenRoute 菜单属性约定修复：菜单改为显式选择，方法层标注永远赢（2026-09-25 闭账）** 用户反馈"有些不是菜单的也进了菜单"。根因（GenRoute.zan 代码级）：① 类级 `[Description]` 被当作隐式进菜单信号——登录/注册/健康检查/前台首页/文章列表/用户列表/服务状态这类"有描述的公开端点"全部漏进侧栏；② 非 Index 动作分支 `methodHasMenu` 只认 `[Menu]`/`[AdminAction(IsMenu=true)]` 拼写，把方法上已标注的 `[Custom(IsMenu=true)]`（Monitor 的历史统计/错误日志/SQL 统计/共享内存表）反向强制吞掉。修复：去掉 `clsDesc.Length > 0` 隐式默认（菜单只认 `[Menu]`/`[AdminAction]`/`[Custom(IsMenu=true)]` 显式标注）；类/方法两层 meta 合并间加 IsMenu 快照，方法层改写过 IsMenu 时类级默认不再落笔（根动作不被类默认覆盖方法级 `IsMenu=false`，非根动作的显式标注原样生效）。连带：Data.zan Index 补显式 `[Custom(IsMenu=true, Icon="mdi:table", Perm=...)]`（此前靠类描述隐式进菜单）；Api/Index.zan 恢复类级 `[Description]`（新约定下只是文档）；三个模板盘点后仅此一处需补标（Assistant 无 Index 动作本就不在菜单，licensing/legend 全员已显式标注）。验证：web_menu_attrs 一致性测试加三用例（纯 Description 控制器不进菜单/非根动作显式标注进菜单/方法级 `IsMenu=false` 压过类级 opt-in）并更新 golden；e2e 121/121；实机登录截图核对侧栏——垃圾条目零残留、Monitor 组六项全在位。
-
-* [x] **A363 · 登录页科技感动效：深色极光舞台 + 玻璃流光卡，纯 CSS 零依赖（2026-09-25 闭账）** `views/Account/layout.html` 加 `.auth-fx` 装饰层（三枚 blur 极光色斑各自 26–37s 漂移、28px 点阵缓移、`perspective+rotateX` 透视网格地面向观者流动、每 11s 一道斜向扫描光带），`app.css` auth 段整体重写：深墨底（浅色后台前的一扇暗色门厅）、玻璃卡（半透明+backdrop blur）+ `@property --fx-ang` 驱动的 conic 流光边框（mask-composite 只留 1px 环 + drop-shadow 辉光，6s/圈）+ 7.5s 扫过卡面的光带；品牌标呼吸浮动漫 + conic 光晕旋转 + 火花点轨道；表单子元素按序级联入场；渐变按钮呼吸辉光 + hover 扫光；深色适配的 input/autofill/flash/hint/code，次级按钮改半透明深色芯片；`prefers-reduced-motion` 一键全关。只动 transform/opacity/background-position，零 JS 零 CDN，Login/Register/Forgot 三页共用。验证：实机多帧截图（流光角度推进、极光漂移可见）+ 登录/找回页核对 + 登录流程可用 + e2e 121/121。教训：手动起的沙箱服务占 8299 会让 e2e 起服阶段假死（sys_job 空表 IndexError）——跑 e2e 前先停自己的实例（并入 A361 环境坑）。
-
-* [x] **A364 · Zan.Web 包四层命名空间拆分（2026-09-25 闭账）** 包根 31 个平铺文件按四层架构归位：Core（Boot/Cfg/Db/DbContext/Schema/Gen）、Security（Auth/Keys/Perm/PermTable/DataScope/VerifyCode）、Web（控制器三基类/ListPage/FormPage/Fmt/Lang/Prose/Crud）、Services（Mailer/Metrics/Cache/ClusterBus/JobHost/Presence/Settings）、Ai；namespace 与目录路径同构；Dao.Sys/Model.Sys 保持不动（共享管理域，模板副本按需拉入消解）。Gen.zan 生成控制器/前台源的 using 发射同步分层；包内跨层引用按需补最小 using；server-mvc（唯一用包的模板）与其 2 个测试文件同步迁移。验证：e2e_mvc 121/121；ai_endpoint_allowlist / server_mvc_timezone 编译通过。澄清基线（挂账 A366）：server-collab/legend/licensing/iot 四模板自带 Framework 扁平命名空间拷贝、不引包，HEAD 上本就编不过（`DbContext/CacheContext/AppServices undefined`），属搁荒状态非本次回归；admin_demo 引用已移除的 Zan.Mvc.Admin 包，同为 HEAD 既有死例。
-
-* [x] **A365 · CRUD 配置化增强：一屏声明产出表格/操作列/白名单写动作与 adminUI conf 契约（2026-09-25 闭账）** 对齐作者 C# 版 TableConfig 与 adminUI ZanTable 的"配置生成"设计，落在服务端渲染上。ListPage 增列声明（`Col/Tag/Flag`：kind 驱动单元格渲染——tag 查 opts 映射徽章、flag 行值自带文案|样式、time 秒转日期、num 淡显、空值一律 —）、行内操作声明（`Ops/OpsEdit/OpsDel`：args 空=对话框链接、非空=POST 模板，`{field}` 以行值替换实现"启用/禁用"随行翻转；perm u/d 与授权掩码同源门控）、表格整段渲染 `TableHtml` 与一屏一调 `Screen`（搜索区+工具栏+表格+翻页含空态 → `screenHtml`，视图只剩一个壳）。Crud 通用写动作（Field/Batch/Delete）：表名与可写字段白名单出自声明（`Table/EditFields`），标识符过 Gen.Safe 双保险，值一律 `?` 占位符；行级授权调用方预检（allowed 集合），越权与不存在同答 404 不泄露存在性；审计经 Note 落账。Crud.Conf 把同一声明投影为 adminUI ZanTable 的 ListConfData JSON（`conf/columns/filters/tools`，信封 resp_code 0000）——服务端渲染与前端表格配置同源，前端不再各养一份列定义。Users 屏迁移为参照实现：`ScreenDef()` 一处声明、Index 走 Screen、批量启禁/删除改走 Crud（会话失效等业务语义留屏内）、视图 48 行→3 行、删去 StatusClass/NextStatus/ToggleText 等格式化帮 ~20 行/屏；Gen.zan 表设计器同步升级：生成 ScreenDef 声明代码 + Screen 流 + Conf/Field/BatchDelete 动作 + 薄壳视图——新表从设计器出即是全 CRUD。语言坑（入 skill）：`protected` 仅子类可见（包内协作面 Note/Saved 放开为默认公开，权限位由子类调用方传入 Screen）；`where` 是保留字不能当变量名；async 表达式 await 前禁副作用调用（`Ctx().path` 先取局部）。验证：e2e +10 断言（声明化表格/徽章/操作替换/conf 契约/field 白名单/凭证拒改/匿名拒绝）131/131。
-
-* [x] **A367 · 安全加固第一梯队：PBKDF2 口令升级路径、登录限流、CSRF 前哨、Secure cookie（2026-09-25 闭账）** ① stdlib `System.Security.Cryptography.Pbkdf2`（RFC 2898/8018，HMAC-SHA256）：iPad/oPad 键块堆外备好、每轮仅两次 `NativeMemory.Sha256` 原生调用、Span 直读直写零托管堆分配，10 万轮 ≈58ms——默认 30 万轮（登录 ≈0.17s，`[auth].iter`/`ZAN_AUTH_PBKDF2_ITER` 可调），6 组 PBKDF2-HMAC-SHA256 已知向量全过（tests/conformance/pbkdf2，含 >32B 分块与 >64B 长键分支）。② 存库格式自描述 `pbkdf2$<iter>$<saltHex>$<hashHex>`（盐/轮数随哈希落库，调参不迁移）；`AuthUser.Verify` 双格式（遗留 12000 轮链按 passwordSalt 列）+ 常时比较；登录成功遇遗留行自动 `UpgradeHash`（独立借还连接、不 bump tokenVersion——已发会话与口令哈希无关）；改密点全量收口（Register/Profile/Users/Schema 种子），Profile 的当前密码校验顺带从 `!=` 换常时路径。③ `ZanWeb.Security.LoginThrottle`：按账号（归一+截断）记失败，固定窗 10 次/15 分钟锁到窗口滑出，不存在账号也记失败（堵计时枚举），键上限 4096 淘汰最旧；`AuthUser.Login` 内置（被限流/无账号/密码错误同答空串，无 oracle），Login 屏文案区分"尝试过于频繁"（锁状态来自攻击者自身失败次数，非新信息），sys_login_log 分文案留痕。④ stdlib `Csrf.OriginGuard`：不安全方法上 Sec-Fetch-Site=cross-site 直接拒、Origin authority 与 Host 不符（去默认端口、大小写不敏感）也拒——免客户端配合；`Csrf.Guard`（double-submit）前置同一校验形成纵深；ZanWeb.Boot 默认注册 OriginGuard（double-submit 仍由应用按需升级）。⑤ `HttpContext.SetCookie/SetCookieJs` 按请求协议加 `Secure`（`X-Forwarded-Proto: https`，明文直连不加——本地开发不丢 cookie）。验证：e2e_mvc **144/144**（新增 13 断言：跨站 form/API POST 403、Sec-Fetch-Site 403、同源放行、安全方法免疫、明文无 Secure/反代有 Secure、遗留行登录即改写 pbkdf2$（Python 复算遗留链构造旧行）、升级后行可登录、10 次失败锁定、锁内正确密码同拒、限流留痕）；pbkdf2 conformance 全绿；smoke 297 项 295 过（policy_server_mvc_ai_endpoint 为 A364 漏改的 ZANC_ARGS 旧路径，本次修复；GUI 拖拽超时见 A368，隔离实验证明与本梯队无关）。遗留（继续挂账）：double-submit token 全量铺开（admin.js/表单/e2e 线程 token）、SharedTable 跨 worker 共享限流计数、trampoline 级自动审计+变更 diff。
-
-* [x] **A371 · Zan.Web 包分层收尾：Model/Dao 扁平化 + 目录=命名空间=层 地图 + 「页面在哪」（2026-09-25 闭账）** 用户指"packages\Zan.Web 结构混乱、没分层、看不到页面"。① `Model/Sys/`、`Dao/Sys/` 二级目录拍平（38 文件 git mv 至 `Model/`、`Dao/`），`namespace ZanWeb.Model.Sys/Dao.Sys` → `ZanWeb.Model/Dao`，全仓 69 文件引用同步（包源 + server-mvc 模板 + conformance；Gen.zan 生成器模板串核查——生成命名空间是 `ZanWeb.Model.Gen/Dao.Gen` 与 `.Admin/.Front`，不属此次）；类名已带 Sys 前缀，目录再套 Sys/ 子层是重复表述。② 顺手清掉包与模板 21 处重复 using（.Sys 改名与既有平铺 using 并存所致；Lang.zan 3 处为存量）。③ 包 README 重写：新增「目录分层地图」（Web=接入 / Services=业务支撑 / Model+Dao=数据 / Core=基建 / Security+Ai=横切，目录=命名空间=层）与「页面在哪」三段解剖（屏本体=控制器动作里 ListPage/FormPage 声明 + `lp.Screen()` 渲染，基座在包 Web/ 层；壳视图=应用 views/Admin/<类>.<动作>.html 三行壳，`__SetView("类.动作")` 运行时从发布目录磁盘读；站点布局与 wwwroot 全归应用）——只翻 views/ 找不到页面本体的原因说透。server-collab/pkg-mall 为自含旧式 vendored 项目（自带 Framework 与旧名实体，不引用包源），本次不动。验证：模板 218 文件编译通过 + e2e_mvc **144/144** + orm_queries/web_typed_binding/server_mvc_timezone 三例复跑全绿。挂账：框架 owned 后台页若要整体进包（views 随包发布），需 zanc publish 支持复制包内容目录（现 `pkg_copy_tree` 只服务 `zan pkg install` 入 .zan-packages，embedres.c 是 IDE 单项 embed）——编译器侧能力缺口，另行立项。
-
-* [x] **A370 · Sys 前缀统一：系统层表名/Model/Dao/Controller 全链命名同构（2026-09-25 闭账）** 用户令"企业生产级标准，结构清晰，命名一致降维护难度"（对照 OneAdmin：SysUser↔sys_user 全 Sys 前缀）。包内 ZanWeb.Model.Sys/Dao.Sys 19 实体与 19 DAO 全部 Sys 前缀（User→SysUser、Role→SysRole、Department→SysDepartment、UserRole/RoleGrant/DepartmentRole/DictType/DictItem/OperationLog/LoginLog/GenTable/GenColumn/WikiDoc/WikiRevision/WikiSpace 同式；SiteSetting→SysSetting 对齐表 sys_setting；Media.zan 里装 MediaFile 类的文件/类错位一并理顺为 SysMediaFile）；media/wiki_doc/wiki_revision/wiki_space 四表补 sys_ 前缀（media→sys_media_file、wiki_*→sys_wiki_*，SyncStructureAll 自动迁移，e2e 重建库即生效）；Admin/System 八控制器类与文件加 Sys 前缀（Users→SysUsers 等），视图文件 `<Class>.<Action>.html` 随类名同步改名（19 个）；表访问器 `this.<Entity>` 随实体名自动变为 `this.SysUser` 等。路由 `[Route]` 显式声明故 URL/菜单/权限种子全部不动（权限码从控制器类名派生，PermTable/Schema 种子串与运行时同源同步）。坑（入 skill）：词边界批量改名把动作方法 Logs/Roles 一并改成 SysLogs/SysRoles——`[action]` 路由段=方法名，URL 随之变，job 日志页 e2e 失败暴露，恢复方法名；"User-Agent" 请求头同为词边界误伤（已还原）；前台 /users 示例控制器（业务模块）不改类名只改实体引用。验证：模板全源编译一次通过（945 处替换零残留 grep 证明）+ e2e_mvc **144/144** + orm_queries/web_typed_binding/server_mvc_timezone 三例复跑全绿。
-
-* [x] **A369 · ORM 根治：裸 SQL 片段+首拼配对写法从根清除，条件全部值自带（2026-09-25 闭账）** 用户令"拒绝首拼SQL拒绝那些奇奇怪怪的写法，历史病灶从根上清掉"。片段/参数靠位置配对（`W("t.id IN (?)")+InI(ids)`、`P/Pi/Pl`）编译器查不出错位，历史上实烂三处——整体删除用户面原语，只留四类值自带面：① stdlib `System.Data.Orm` 新增 `OrmCond`（name/col/kind/value）与 `OrmSelect` 条件原语 `WhereEq/WhereGe/WhereLe/WhereIn/WhereLikeAny/WhereNone/WhereConds`（列名经实体元数据 RequireCol 校验，未知列运行期抛异常；多列 LIKE 用 `|` 分组 OR；空 IN 恒假 `1 = 0`，杜绝非法 `IN ()`），`OrmUpdate/OrmDelete` 同面（RequireCol 无表别名）；`QueryBuilder.WhereInInts/WhereInLongs` 空表落 `IN (NULL)`。② 编译器降级面改 `__` 前缀（`__Frag/__P/__Pi/__Pl/__Pd/__InI/__InL/__InS/__InD/__OB/__OBD/__OBK/__OBDK/__GB/__H`）= 生成代码专属，GenDbEmit/GenDb 与 selfhost dbgen 两车道同步改名；lambda 降级（`ids.Contains(a.id)`→参数化 IN）、WhereIf、Set 门面全名化（SetInt/SetLong/SetDouble/SetString/SetBool/SetIncrInt/SetIncrLong/SetIncrDouble）。③ Zan.Web 包迁移：ListCond 删除由 OrmCond 取代（ListPage.Collect 直产 `List<OrmCond>`），UserDao/OperationLogDao 的 ApplyConds 手拼删除改 `WhereConds+WhereIf`，Crud 手拼 UPDATE/DELETE 全量改 `DbTable.Of(...).Query().WhereIn(...).ExecuteUpdateAsync/ExecuteDeleteAsync`（列名过 RequireIdent 双保险），Gen.zan 生成文本、README 同步。④ server-mvc 模板：Articles 数据访问沉到 PostDao（CountBy/PagedListBy/SetPublishedByIds/DeleteByIds），控制器只编排声明与审计。验证：模板全源编译通过 + e2e_mvc **144/144** + standard 层我辖区四例全绿——orm_queries（套件抓出 QueryBuilder.WhereIn 三方法被我丢了右括号、非空 IN 拼成 `IN (?` 的真回归，已修）、generic_base_dao_orm（测试本体迁值自带面：泛型 BaseDao 按实例化下降，`WhereEq("t.id", id)` 走通）、web_typed_binding（金样补 `a91c97c4` 加的 static-field 断言，陈账）、server_mvc_timezone（CMakeLists 三处特例仍指 A364 已删的 src/Framework/Fmt.zan，改指包内 ZanWeb.Web/Fmt.zan，与 A367 修的 policy 同类陈账）。其余 14 项失败均不触 ORM 面（grep 证明零引用）、定性非本会话：web_list_protocol=树内在途 GenRoute.zan 未提交改动致金样漂移；mysql/redis/sqlserver/tls_hostname/publish_tls/https_binary=并发工作流已删 crypto/ssl 驱动束；image/game×3/shadowing/wasm32=并发 perf 提交（3a71ccc5 等）行为面变化；gui_drag=A368 既有。语言坑（入 skill）：`set`/`get` 是保留字（属性访问器），`DbValues set` 参数炸百条级联错；`StringBuilder.Append` 返回 void，链式 `.Append(x).ToString()` 编译不过；zanc 文档注释多行须逐行 `///` 前缀。挂账：selfhost dbgen 值自带面对齐（`__` 面已同步，值自带转发器未加）；admin_demo 三处裸 SQL（A366 死例，随其迁包一并处理）；`AggR(string expr)`/ToListCol 仍收裸表达式（生成代码内部面，后续收敛）。
-
-* [ ] **A368 · conformance_gui_listview_scrollbar_drag 在 ctest 下挂死（并发会话在途工作，非本会话回归）** smoke 期间观察：ctest 下 240s 超时零输出，手动跑同一 exe 快速 FAIL（拖动 offset got 3320 want 1360、pixel-step stall got 1——拖动直接跳满程而非跟针）。隔离实验：暂存本会话全部 stdlib Web 改动重编译重跑，失败形态不变——与 A367 无关。时间线证据：测试在 e2641406 落账时 3/3 绿，其后 src/compiler 落了 10+ 提交（433c81c7/b15ab370/fbcc5c16/3a107803/a1348d1f/6c1db22f/8c9c7188/867bc63d/4132fb3c 等 SIMD/热路径重写），且本会话 smoke 跑在 16:00-16:44、恰逢共享树另一会话在途编辑（867bc63d 16:07、4132fb3c 16:46 落账）。ctest 挂死 vs 手动快速 FAIL 的二相性提示注入事件节奏/帧泵时序对编译产物敏感。待热路径会话收尾后归因复跑；不排除需按 e2641406 的"每注入事件独立 pump+帧+settle"节奏复核。
-
-
-* [ ] **A366 · 四个自包含 server 模板与 admin_demo 搁荒（HEAD 既有基线，非回归）** server-collab/legend/licensing/iot 的 src/Framework 携带旧扁平命名空间框架拷贝，`zanc src/main.zan --auto-stdlib` 单入口编译即报 `DbContext/CacheContext/AppServices undefined` 等 4 错（6c1db22f 实证，先于 A364）；examples/admin_demo 引用已移除的 Zan.Mvc.Admin 包（`160ddb1c 禁止还原`），同为死例。处置方向：统一迁到 Zan.Web 包薄组合根形态（server-mvc 即样板），或明确下线；迁移动作与 CRUD 声明化改造（A365 的 ScreenDef/Crud 形态）一并做，避免修两次。
-
-
-* [ ] **A91**：CSS `cursor` 属性在 Retained 模式下无消费点（待 GUI 事件总线统一注入鼠标光标切换）。
-* [ ] **A263**：ECharts 6.1 高级属性长效对照清单（长效非阻塞，按业务需求逐步扩充，详见 `docs/ECHARTS_SPEC.md`）。
-* [ ] **A305 / A306**：legend 迷你传奇模板在某些特定驱动下的偶发导航重绘白屏（已用保守双缓冲规避，待进一步根查底层显卡驱动 SwapChain 行为）。
-
----
-
-## 近期专项闭账记录（2026-09-09 ~ 2026-09-22 全部完成）
-
-* **A342 · nullable→字符串双通道 verifier 崩溃** ✅ `Convert.ToString(T?)` 与插值 `"{x}"` 的自建分支链把 `zan.nullable.<payload>` 结构按值递进 `__zan_itoa64`（拼接/打印路径有解包、这两条没有），LLVM verifier 拒绝模块（"Call parameter type does not match"）；修复=两处统一改走 `emit_to_cstr_u` 的 nullable 分支（some 格式化载荷、none 空串，与 `+` 拼接同一实现，none 臂分配新鲜空串保证 owned 精确），`.ToString()` 直调维持 checker 拦截诊断。`nullable_tostring` conformance 锁定 some/none × int?/double?/ulong?（提交 `9e0daec5`，2026-09-23）。
-* **A343 · 多 worker 驱动程序化配置死管道** ✅ `zan_async_set_workers/io_shards/sync_fast`（rt_timer.c）自落地起无任何消费点：Zan 侧 `System.Threading.AsyncRuntime` 类从未存在（rt_co.h 注释承诺与实现相反），驱动只读 `ZAN_CO_WORKERS/ZAN_IO_SHARDS/ZAN_IO_SYNCFAST` 环境变量，且 worker 数在 `zan_co_sched_init` 固化快照、Main 内设置天然晚到。修复=stdlib 新增 `System/Threading/AsyncRuntime.zan`（DllImport crt 直连 setter/getter）、`zan_co_sched_run` 与 `co_pool_start_background` 两个池启动点重解析 `co_worker_count`（cfg 优先、env 回退、CPU 兜底；io_shards/syncfast 惰性读点本就在 Main 之后）。A/B 实证：`SetWorkers(1)` + `ZAN_CO_WORKERS=8` 环境下 8×50000 无同步计数精确 400000（对照 8 workers 丢失至 15~22 万）（提交 `9e0daec5`，2026-09-23）。
-* **测试门禁三缺口（随 A342/A343 同批）** ✅ ctest 分层正则无 `unit_` 前缀致 `unit_json_oom/unit_json_trailing/unit_rpc_framing` 永远只挂 full 标签（smoke/standard 形同虚设）——正则补 `unit_` 入 smoke+standard；Windows CI 构建集（仅 zanc+zanrt_sync_selfhost）与测试花名册不对称——构建行补三纯 C 单测目标；`-E` 过滤器清除已无注册项的 `dm_database`；ZANC_CLI.md 撤除已不存在的 `--async-workers/--mt` 旗标行，改为按目标自动链入 `zanrt_io_mt` + `AsyncRuntime`→env→CPU 的解析顺序说明（提交 `9e0daec5`，2026-09-23）。
-* **A344 · 嵌套类型提升丢宿主关系，限定调用被 checker 拒绝** ✅ `Outer.Inner.Value()` 在 standard 门禁报 `'Outer' has no member 'Inner'`，而 A/B（worktree @ `7050fb2c`）实证 2026-08-08 编译运行全绿——回归而非空想用例。根因：parser `zan_parser_flatten_nested_types` 把嵌套类型整体搬到单元级、注册靠简单名，旧版 checker 对非标量接收者的成员 miss 只返回 type_error 不发诊断，irgen 限定名路径静默兜底；typo 守卫收紧（本身正确，fully_qualified_unresolved 依赖）后合法路径一起被拒。修复：hoist 时在 AST 盖 `type_decl.nested_host` 宿主节点戳（delegate 与 method_decl 共用 union 不盖戳），binder 全部注册完成后按节点指针 `symbol_add_member` 挂回宿主 members[]——全部消费方按 kind/名过滤，字段布局不受影响。smoke 294 项仅余并行会话已知两红，standard 921 项该用例转绿（提交本批，2026-09-23）。
-* **A345 · 后台池泵等待条件含 live_count → Task.Wait/Result 永久挂死** ✅ cs_b15_task 120s 超时：`Task<T>.Run` 刻意留帧不收割等 Result 读取，`zan_co_sched_run` 后台分支却等 `live_count==0` 才返回——泵自己等不到自己要收割的帧（`831577d60` 引入；A/B worktree @ `7050fb2c` 全绿证回归）。修复=等待条件收敛为 pending/io/timer/running 四个可调度计数，live-but-done 帧不是工作（提交本批，2026-09-23）。
-* **A346 · WsSharedBus 三缺陷同修（ws_cluster_bus 红）** ✅ ① 集群连接计数用 `totalConns` 列但建表从未 `ColumnInt` 声明——`zan_find_column` 落空，Increment/GetInt 静默得 0；② 轮询自过滤只比 pid，同进程多实例互发全被当自消息丢弃——身份改 (pid, 实例 nonce)，新增 srcBus 列；③ StartPolling 是 async 方法，Zan 丢弃 async 调用的体首次泵才启动，开场 head 快照晚于调用点发布→消息被当旧序号跳过——拆同步快照 + 内部 PollLoop（async 启动语义教训已沉淀 skill）（提交本批，2026-09-23）。
-* **A347 · 网络孪生测试手搓 calloc 串缓冲层全红 + genform_click 注册撞名** ✅ firebird_wire/sqlserver_tds 的 Fake 层用 `DllImport(crt) calloc` 返回的 string 当收发缓冲——外来串无长度元数据，下标守卫按 0 界拒绝，读写全崩；sqlserver_tds 的假服务协程崩在守卫上，客户端死等表现为 120s 超时（Timeout 假象）。两测试照真驱动 recvExact 的 `byte[]` 形态重写缓冲层，分别 127/0、83/0 全绿。genform_click_test 另有 GLOB 注册撞名：期望输出实为 genform_click.out，glob 机械按 `<名>.out` 找不到——照 arc_net_publish 先例在 glob 循环跳过，保留按真实文件名的手工登记（提交本批，2026-09-23）。
-* **A348 · childwindow_shape 断言与记录器缺陷（Gui 会话提交时 ctest 未能运行）** ✅ 探针实证 stdlib 修复本身按设计工作（排版点=offX(15)+Scale(5)边距(7)=22 设备像素、top(48)+offY(15)+7=70），但测试①拿设备像素 bx 比未乘边距的 ShapeOffX（100% DPI 碰巧相等、150% 必红）；②MarkerBox 静态记录器被并发存活的另一宿主重绘回写（父泵顺带泵到已显示子宿主），plain 阶段读到 shape 的值。修法=记录器按相位分槽（tag 索引静态数组）+ 断言计入边距与 DPI，相邻 upload/tree golden 三案回归绿（提交本批，2026-09-23）。
-* **A349 · APK manifest 字符串池补丁拒绝/静默截断长串** ✅ `axml_patch` 三层缺陷：① UTF-8 池条目带 **双前缀**（u16 单元数 + u8 字节数，≥128 时各自扩为 16 位形式 `0x80|hi,lo`），旧读侧见高位即 `return -1`（写侧还只写单前缀，与 aapt2 规范不符）；② zan.proj 的 androidPackage/androidLabel 落 128 字节缓冲，超长被 `snprintf` **静默截断成错的包名**（比拒绝更糟）；③ 替换超 ~1197 字节时写侧循环条件静默截断。修法=读侧照 ResStringPool 规范解双前缀 + UTF-16 条目 ≥0x8000 的 32 位长度形式、写侧 `pool_put_len` 规范双前缀 + 容量超限显式报错、proj 缓冲扩 256 且超限/权限名超 127/权限超 16 条全部显式报错。验证=独立探针（`#include apk.c`）对真实模板 UTF-16 池与 python 合成的规范 UTF-8 池各打 200 字符包名 + 多字节标签 + 权限追加，python 逐串复核未触碰串字节不变；proj 超长报错路径 e2e 落地。e2e 成功路径被 A350 挡住，A350 修复后 e2e 全链路闭环——并在闭环时抓出**第四层**截断：packaging 调用点还有 `char pkg[128], lbl[128]` 本地缓冲把 200 字符包名剪成 127，已扩 256 + 超限显式报错；签名 APK 解包逐串复核 200 字符包名/多字节标签/两权限字节精确在位（2026-09-23）。
-* **A350 · 用户类型与泛型类型参数同名击穿泛型方法调用（`class T` vs `Binding<T>`）** ✅ 初报为"android 交叉编译 stdlib Gui 类型检查红"，深挖后**比挂账严重且完全不同**：与任何用户代码无关 target——只要用户声明了与泛型类类型参数同名的类型（`class T`），该泛型类的**成员方法在桌面/安卓一切调用点全部报错**（`no overload of 'Binding.Set' matches argument type(s)`），PropSpec/Input/Checkbox/Button 全中，GUI 打包全灭。根因双层：① binder 把类型参数按**简单名**注册进单元作用域（`register_type_param_list` 的 `scope_find` 命中即跳过），用户类 T 抢走该名后泛型 T 全局失明；② 绑定期签名解析在类作用域内是**健康**的（`bind_members` 类局部 scope 无条件注册 TP），但产物只落了返回类型（`msym->type`），**参数类型没落**——irgen 侧 `method_param_type` 等对签名类型引用做裸 `resolve_type`，调用点作用域下一解析就命中用户类，重载打分把唯一匹配的重载判死。修法=irgen 取方法参数类型时**优先按 decl 命中方法符号上绑定期落下的 SYM_PARAM 子符号**（返回类型早已走此路），打分与发射同源。定位手法：报错形状矛盾（conformance 绿/探针红）时 diff 通过与失败用例的最小形状差——类名 Program 与 T，一击命中。回归锁 binding_tp_shadowed_by_user_class（Set 写穿回模型 + 用户类 T 照常可用）。修复后 A349 的 e2e emit-apk 全链路随之闭环（2026-09-23）。
-* **A351 · 对象初始化器写 Binding 字段多发一次 retain（full 门禁档 leakcheck 孪生红）** ✅ full 发布门禁首轮扫出 `leakcheck_objinit_ctor_field_overwrite` 红：`new Card { title = "x" }` 后再普通赋值，退出时恒剩 1 个 Binding 盒。探针二分定案（p1 纯赋值绿 / p6 仅初始化器红 / p7 两次普通赋值绿）：**对象初始化器路径** `emit_binding_value` 交出 +1 后，store 调用仍把原始 RHS 递给 `emit_rc_store_field`——字面量被判借用再 retain 一次，盒以 rc=2 落字段，出口级联只放一次。A341 重构留下的半截线：`fval_owned` 标志算了**从没用上**。修法=沿用普通赋值路径的 owned dummy 标记惯用法（`owned_rhs_marker`），初始化器两个 store 分支同补。IR 级实证：`retain %bindobj → store → release old` 序列在修复前直接可见。验证=5 探针 + objinit/binding 窄档 ctest 28/28（worktree zanc，主树 zanc 被并行会话 in-flight main.c 锁着不能重建）。A/B 定性：wt_pre(485f0127) 同红——既有缺陷非本轮回归（2026-09-23）。
-* **server-mvc 冗余第三方前端库清理与 A317 闭账** ✅ 彻底移除 `vue.global.prod` / `naive-ui` / `zan-charts` / `zan-grid` / `zan-layer` 等未用/冗余前端脚本与对应 SPA 壳，回归轻量标准服务端 MVC 架构；关联第三方库缺陷 A317 闭账（2026-09-22）。
-* **LSP 深度完善** ✅ 文档优先类型补全、增量 didChange、诊断工作线程与 using 命名空间补全全通（2026-09-09）。
-* **ZanIDE 启动稳定性** ✅ 修复启动中间产物竞态段错误，确立 IDE 崩溃日志自愈标准（2026-09-09）。
-* **跨平台运行时对象** ✅ win-arm64 / OpenHarmony / Android 原生对象重出与缺失符号补齐（2026-09-09 ~ 09-20）。
-* **设计器交互与属性面** ✅ 撤销重做快照修复、全组件调色板对齐、Tabs 标签条方向与 BuiltinPropRows 通用直通（2026-09-10）。
-* **GUI 审美与布局安全** ✅ ZAN_GUI_OVERLAP 重叠探测器与 ZAN_GUI_LAYOUTLINT 机械布局闸门落地（2026-09-10）。
-* **音频运行时解耦** ✅ 彻底移除 SDL3，自研 `zan_audio` 原生轻量音频运行时全平台落地（2026-09-09）。
-* **H5 / WebAssembly** ✅ wasm32 文件 IO 与异常控制流全通，最小 WebAssembly 运行闭环（2026-09-10）。
-* **游戏引擎与生态** ✅ `Game.Idle` 放置库、Tween 缓动补间、高级物理碰撞射线、分级音频总线全面落地（2026-09-10 ~ 09-20）。
-* **密码与网络吞吐** ✅ 加解密 Wrapper 零拷贝落地（吞吐跃升至 EVP 级别），发布种子明文移除（2026-09-10 ~ 09-11）。
-* **服务端框架与模板** ✅ 7 个服务端模板抽测复绿，server-game 与 server-mvc 架构强化（2026-09-11 ~ 09-12）。
-* **P8 组件精简与声明化** ✅ 流式 % 尺寸修复、Binding 初始化降级、Extra 冗余代码全删、`.zform` 全面退役（2026-09-13）。
-* **图表与渲染引擎 Sweep** ✅ 日历图表调色板 Alpha 修复、柱状图垂直堆叠基线修复、347 例图表 Demo 审查全绿（2026-09-13 ~ 09-15，`21044e83`）。
-* **ZanDb 核心引擎四轮攻坚** ✅ 扫描层零拷贝 + 段 CRC 校验 + 块级聚合内核 + 覆盖索引 GROUP BY + 跨度整读（2026-09-13 ~ 09-14 全部闭账）。
-* **地图组件修复** ✅ 地图区域接缝闭点、共享边几何拓扑一致化、geo lines 车道与悬停扰动消除（2026-09-14）。
-* **矩阵坐标系与复杂图表** ✅ ECharts 6 matrix 坐标系车道、直角坐标热力图车道与大数据平滑渲染（2026-09-15）。
-* **跨进程并发总线** ✅ WebSocket/SSE 多 Worker 跨进程广播与频道路由，支持无锁 SharedTable 总线与全网连接计数（2026-09-20，`302b7a30`）。
-* **现代化语法特性** ✅ 编译器支持现代 `defer` 确定性资源释放（LIFO 展开）、switch 重复标签阻断与穷尽性检查、闭包 this 环静态检测（2026-09-20）。
-* **应用更新与防篡改生态** ✅ 发布通用更新包 `Zan.AppUpdate`（Zip 解压缩/断点续传/MD5 自愈校验）并补齐生态文档（2026-09-21）。
-
----
-# A320-A341 审计落地与发布体积对账总表（✅ 全部闭账）
-
-## 1. 发布体积肥边六项治理对账
-
-| 肥边编号 | 解耦项目 | 治理手段与提交 | 状态 |
-|:---|:---|:---|:---|
-| **肥边①** | DataGrid 迷你图列 | 运行时弱引用注册，独立按需引入 | ✅ 已闭账 |
-| **肥边②** | DataTable 导出 Xlsx | 解耦压缩与 XML 生成，独立组件化 | ✅ 已闭账 |
-| **肥边③** | Worker 协议分片 | 按需拉取协议解析，消除全局依赖 | ✅ 已闭账 |
-| **肥边④** | HttpFramer TLS 注入 | TLS 加密流动态注入，避免无加密服务冗余 | ✅ 已闭账 |
-| **肥边⑤** | 自进程原语下沉 | AppPath/Process 原语下沉最小基础库 | ✅ 已闭账 |
-| **肥边⑥** | HttpContext.WsUpgrade | 迁至独立扩展 `WebWs.Upgrade`（提交 `12925efe`） | ✅ 已闭账 |
-
-> **体积基线实证结论**：
-> * **A328 PE 链接期回收**：A/B 实证测得 lld-link GC 正常工作，剥离存活符号收益仅 0.1%，决定维持现状不返工。
-> * **A330 stdlib 懒化第一期**：拍板维持默认全功能，不引入繁琐 opt-in，普查宣告闭账。
-
----
-
-## 2. A320~A341 近期关键攻坚项落地总表
-
-* **A323** ✅ 编译器五缺陷批修（2026-09-17）：最小探针闭环修复。
-* **A327-②** ✅ Windows 后台池丢唤醒漏洞根治（提交 `d94e58a3` 闭账）。
-* **A327-③** ✅ POSIX 多线程协程调度器平台适配（提交 `21044e83` 闭账）。
-* **A327-13** ✅ 协作中心三阶段（13a/13b/13c 假文件退役、真附件、任务卡片）全面落地（提交 `807283f4` 等闭账）。
-* **A327-14** ✅ 工作流中心自托管化与 10 个 FlowApi 闭环（提交 `886b0f69` 闭账）。
-* **A333** ✅ WebView2 多平台语义一致化（CSS 注入/DevTools/静默安装）（提交 `a2a9501e`、`f5fe69b4` 闭账）。
-* **A340** ✅ 审计散件全部落地：
-  - ① postfix `!` null 包容操作符（提交 `eb52aaa4` 落地闭账）。
-  - ② 假语义修复三则（`316fab05` 落地闭账）。
-  - ③ BCL 统一决策归档，冗余数据并入 A15-5。
-* **A341** ✅ `struct` 值内 `rc` 引用计数生命周期彻底修复（聚合 struct 复制/传参/返回 ARC 管理落地，提交 `f9c8d841` 闭账）。
-* **A356** ✅ 2D/UI 渲染底座 P0（图集注册、GL 纹理化精灵批与 blit_image 补齐）（2026-09-25 提交 `433c81c7` 落地闭账）。
-* **A357** ✅ 类型检查器接口可分配性与构造函数形参类型校验漏洞治理（2026-09-25 提交 `433c81c7` 落地闭账）。
-
----
+- [ ] **B-HW1** 纯 Zan TLS 重写：`stdlib` 的 `TlsStream` 仍持 OpenSSL DllImport
+  （`SSL_new`/`SSL_connect` 等），与"零 C 依赖、实现全在 Zan"的基座冲突。
+  改造路径：以 `AesGcm`/`ChaCha20`（待建）+ `Hkdf` + `Sha256` 重组握手与
+  记录层，或明确定位为"可选系统 TLS 桥"并从 stdlib 核心摘出。
+- [ ] **B-HW2** ARM64 硬件内核落地：`rt_hw_accel.c` 的 x86 侧已全覆盖
+  （SHA-1/256 NI、AES-NI 参数化 CBC/ECB/CTR、PCLMUL GHASH、CRC32C、
+  SM4 查表），ARM 侧只有门与 KAT 常量，缺内核：SHA-1/256（FEAT_SHA1/256）、
+  SHA-512（FEAT_SHA512）、AES（FEAT_AES 参数化）、GHASH（PMULL，寄存器
+  域反射折叠同 x86 语义）、SM3（FEAT_SM3）、CRC32C（ARMv8 CRC 指令）。
+  全部照 x86 先例挂 KAT 门控（发布常量向量），真机回归。
+- [ ] **B-HW3** SM4 AES-NI 仿射分解：x86 现为查表驱动（唯一引擎，保留）；
+  AESNI 仿射变换分解可再提速，非阻塞优化项。
+- [x] **A-HW4** `byte[]`→`string` 零拷贝视图的 `.Length` 走 strlen，首个
+  NUL 处静默截断（原始摘要转 hex 丢尾字节；`emit_string_length` 未开
+  array_count 模式，而边界检查早开了——铺了一半的缺陷）。已修：长度读取
+  统一识别 `ZAN_ARRAY_MAGIC` 头并取 -16 元素数（ABI 注释即此设计意图）。
+  conformance：`tests/conformance/string_view_length.zan`。2026-09-26。
+- [x] **A-HW5** `Md5.Hash` 空消息无限递归（`Hash(new byte[0], 0)` 自调用；
+  旧"总是成功"的 Md5 内建把它掩成死代码）。已修：删递归行，空消息直落
+  纯主体（与 Sha256.zan 同构）。conformance：hw_crypto_pixel md5 empty。
+  2026-09-26。
