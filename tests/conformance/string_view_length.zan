@@ -1,0 +1,62 @@
+// Conformance: the zero-copy byte[]-viewed-as-string contract must report the
+// ARRAY ELEMENT COUNT as its length, never a strlen. A raw digest (or any
+// binary buffer) legitimately contains NUL bytes; `.Length`, concatenation
+// and foreach all go through the string-length reader, which must recognize
+// the ZAN_ARRAY_MAGIC header and take the count word (emit_string_len_ex
+// array mode) instead of measuring to the first NUL and silently truncating
+// (A-HW4: hex-of-digest lost its last bytes exactly there).
+//
+// Run under the leakcheck twin -- every shape must balance; 0 objects remain.
+using System;
+
+class Program {
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) {
+            Console.WriteLine("ok " + name);
+        } else {
+            Console.WriteLine("FAIL " + name);
+            failures = failures + 1;
+        }
+    }
+
+    static int ViewLen(string s) {
+        return s.Length;
+    }
+
+    static string ViewConcat(string s) {
+        return s + "|end";
+    }
+
+    static int Main() {
+        // 8 bytes with a NUL in the middle: strlen would report 5
+        byte[] raw = new byte[8];
+        raw[0] = (byte)'A'; raw[1] = (byte)'B'; raw[2] = (byte)'C';
+        raw[3] = (byte)'D'; raw[4] = (byte)'E'; raw[5] = 0;
+        raw[6] = 0x7F; raw[7] = (byte)'Z';
+        string view = raw;
+        Check(view.Length == 8, "view length is count, not strlen");
+        Check(ViewLen(raw) == 8, "view length through a call boundary");
+        Check(view[5] == 0 && view[7] == (byte)'Z', "view bytes readable past NUL");
+
+        // concatenation and foreach consume the full count
+        string joined = ViewConcat(view);
+        Check(joined.Length == 12, "concat uses full view length");
+        int dots = 0;
+        foreach (byte c in view) { dots = dots + 1; }
+        Check(dots == 8, "foreach uses full view length");
+
+        // an empty buffer still reports 0, not garbage
+        byte[] none = new byte[0];
+        string emptyView = none;
+        Check(emptyView.Length == 0, "empty view length");
+
+        // a managed string keeps its own semantics (tagged header path)
+        string plain = "AB\0CD";
+        Check(plain.Length == 5, "managed string keeps embedded NUL");
+
+        Console.WriteLine(failures == 0 ? "ok" : "failures=" + Convert.ToString(failures));
+        return failures == 0 ? 0 : 1;
+    }
+}

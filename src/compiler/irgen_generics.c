@@ -2090,7 +2090,13 @@ static LLVMValueRef emit_string_buffer_len(zan_irgen_t *g, LLVMValueRef payload,
  * the walk for managed strings. */
 static LLVMValueRef emit_string_length(zan_irgen_t *g, LLVMValueRef payload,
                                        zan_loc_t loc) {
-    return emit_string_len_ex(g, payload, 0, loc);
+    /* array_count=1: a byte[] viewed as `string` (the zero-copy str/byte
+     * buffer contract) carries ZAN_ARRAY_MAGIC in the site word, and its
+     * honest length is the element count -- strlen would silently truncate
+     * at the first embedded NUL (a raw digest hashed to hex lost its last
+     * bytes exactly there). Bare FFI char* views miss the magic and still
+     * measure by strlen. */
+    return emit_string_len_ex(g, payload, 1, loc);
 }
 
 static void emit_span_window_check(zan_irgen_t *g, LLVMValueRef start,
