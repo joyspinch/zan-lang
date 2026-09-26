@@ -251,45 +251,87 @@ static LLVMValueRef nm_crc32c_fn(zan_irgen_t *g) {
     return fn;
 }
 
-/* FIPS 180-4 SHA-256 lowered directly to the runtime hardware-accelerated
- * engine: zan_hw_sha256(const uint8_t *data, int64_t len, uint8_t *out).
- * On modern x86 with SHA-NI, executes at hardware speed (2000+ MB/s)
- * with zero stack allocation, eliminating stack overflow on large buffers. */
-static LLVMValueRef nm_sha256_fn(zan_irgen_t *g) {
-    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_sha256");
+/* Digest kernels return an int64 status: 0 = digest written to `out`,
+ * -1 = no hardware path on this machine. The runtime keeps no portable C
+ * implementation (algorithm logic lives in the pure-Zan stdlib), so
+ * "feature absent" is a real outcome the call site must observe. */
+static LLVMValueRef nm_digest_fn(zan_irgen_t *g, const char *name) {
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, name);
     if (fn) return fn;
-    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
-    LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
-    LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+    LLVMTypeRef fnty = LLVMFunctionType(i64t,
         (LLVMTypeRef[]){ i8ptr, i64t, i8ptr }, 3, 0);
-    fn = LLVMAddFunction(g->mod, "zan_hw_sha256", fnty);
-    return fn;
+    return LLVMAddFunction(g->mod, name, fnty);
 }
 
-static LLVMValueRef nm_md5_fn(zan_irgen_t *g) {
-    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_md5");
-    if (fn) return fn;
+/* Shared lowering for the NativeMemory digest intrinsics (Sha256/Sha1/
+ * Sha512/Sm3): call the runtime kernel into a stack scratch block, and on
+ * success hand the caller a new ARC string holding the raw digest (+1,
+ * same contract as GetString -- the owned-classification whitelist in
+ * irgen_generics.c must cover the call). When no hardware path exists the
+ * kernel reports -1 and the call yields null; the pure-Zan implementation
+ * in the stdlib is the software fallback. zan_rt_release null-checks, so
+ * releasing a null digest at the consumer is a no-op. */
+static bool emit_nm_digest(zan_irgen_t *g, zan_ast_node_t *expr,
+                           local_scope_t *locals, LLVMValueRef *out,
+                           const char *kernel, int64_t digest_len) {
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
-    LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+    LLVMValueRef zero64 = LLVMConstInt(i64t, 0, 0);
+    LLVMValueRef p = nm_arg(g, expr, 0, locals);
+    LLVMValueRef len = nm_arg(g, expr, 1, locals);
+    /* a negative length would wrap the string allocation below */
+    len = LLVMBuildSelect(g->builder,
+        zan_icmp(g->builder, LLVMIntSLT, len, zero64, "nm.dg.neg"),
+        zero64, len, "nm.dg.len");
+    /* Scratch block for the raw digest, right at the current position --
+     * repositioning to the entry block here would drop the alloca after
+     * whatever terminator earlier `if (..) return ..` emission left there
+     * (LLVM verification: "entry does not have terminator"). A per-call
+     * stack alloca of 20..64 bytes costs nothing next to the digest. */
+    LLVMValueRef cur_fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+    LLVMValueRef buf = LLVMBuildArrayAlloca(g->builder, i8,
+        LLVMConstInt(i64t, digest_len, 0), "nm.dg.buf");
+
+    LLVMTypeRef fty = LLVMFunctionType(i64t,
         (LLVMTypeRef[]){ i8ptr, i64t, i8ptr }, 3, 0);
-    fn = LLVMAddFunction(g->mod, "zan_hw_md5", fnty);
-    return fn;
+    LLVMValueRef st = zan_call2(g->builder, fty, nm_digest_fn(g, kernel),
+        (LLVMValueRef[]){ nm_addr(g, p, zero64), len, buf }, 3, "nm.dg.st");
+
+    LLVMBasicBlockRef has_bb = LLVMAppendBasicBlockInContext(g->ctx, cur_fn, "nm.dg.has");
+    LLVMBasicBlockRef none_bb = LLVMAppendBasicBlockInContext(g->ctx, cur_fn, "nm.dg.none");
+    LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx, cur_fn, "nm.dg.done");
+    LLVMBuildCondBr(g->builder,
+        zan_icmp(g->builder, LLVMIntSGE, st, zero64, "nm.dg.ok"), has_bb, none_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, has_bb);
+    LLVMValueRef dlen = LLVMConstInt(i64t, digest_len, 0);
+    LLVMValueRef s = emit_string_alloc_rc(g, LLVMConstInt(i64t, digest_len + 1, 0));
+    LLVMTypeRef mty = LLVMFunctionType(i8ptr,
+        (LLVMTypeRef[]){ i8ptr, i8ptr, i64t }, 3, 0);
+    zan_call2(g->builder, mty, get_libc_fn(g, "memcpy", mty),
+        (LLVMValueRef[]){ s, buf, dlen }, 3, "");
+    LLVMValueRef endp = LLVMBuildGEP2(g->builder, i8, s, &dlen, 1, "nm.dg.end");
+    zan_store_fit(g, LLVMConstInt(i8, 0, 0), endp);
+    /* Same reasoning as the GetString stamp: the byte count is known here,
+     * and leaving it UNKNOWN lets the first reader cache a strlen that
+     * stops at an embedded NUL. */
+    emit_string_len_set(g, s, dlen);
+    LLVMBuildBr(g->builder, done_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, none_bb);
+    LLVMBuildBr(g->builder, done_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, done_bb);
+    LLVMValueRef res = LLVMBuildPhi(g->builder, i8ptr, "nm.dg.res");
+    LLVMAddIncoming(res, (LLVMValueRef[]){ s, LLVMConstNull(i8ptr) },
+        (LLVMBasicBlockRef[]){ has_bb, none_bb }, 2);
+    *out = res;
+    return true;
 }
 
-static LLVMValueRef nm_sm3_fn(zan_irgen_t *g) {
-    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_sm3");
-    if (fn) return fn;
-    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
-    LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
-    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
-    LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
-        (LLVMTypeRef[]){ i8ptr, i64t, i8ptr }, 3, 0);
-    fn = LLVMAddFunction(g->mod, "zan_hw_sm3", fnty);
-    return fn;
-}
 
 /* 2D strided memory copy: copies height rows of row_bytes each from
  * (src + r * src_stride) to (dst + r * dst_stride).
@@ -838,100 +880,109 @@ static bool emit_native_memory_call(zan_irgen_t *g, zan_ast_node_t *expr,
         return true;
     }
     if (is_call_to(expr, "NativeMemory", "Sha256") && expr->call.args.count == 2) {
-        /* FIPS 180-4 digest over len raw bytes; returns a real ARC string of
-         * 32 raw digest bytes handed to the caller +1 (same contract as
-         * GetString -- the owned-classification whitelist in irgen_generics.c
-         * must cover this call). Direct hardware/streaming execution via zan_hw_sha256. */
-        LLVMValueRef p = nm_arg(g, expr, 0, locals);
-        LLVMValueRef len = nm_arg(g, expr, 1, locals);
-        len = LLVMBuildSelect(g->builder,
-            zan_icmp(g->builder, LLVMIntSLT, len, zero64, "nm.sh.neg"),
-            zero64, len, "nm.sh.len");
-        LLVMValueRef shafn = nm_sha256_fn(g);
-        LLVMTypeRef sha_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
-            (LLVMTypeRef[]){ i8ptr, i64t, i8ptr }, 3, 0);
-        LLVMValueRef s = emit_string_alloc_rc(g, LLVMConstInt(i64t, 33, 0));
-        LLVMBuildCall2(g->builder, sha_ty, shafn, (LLVMValueRef[]){
-            nm_addr(g, p, zero64), len, s }, 3, "");
-        LLVMValueRef endp = LLVMBuildGEP2(g->builder, i8, s,
-            (LLVMValueRef[]){ LLVMConstInt(i64t, 32, 0) }, 1, "nm.sh.end");
-        zan_store_fit(g, LLVMConstInt(i8, 0, 0), endp);
-        emit_string_len_set(g, s, LLVMConstInt(i64t, 32, 0));
-        *out = s;
+        emit_nm_digest(g, expr, locals, out, "zan_hw_sha256", 32);
         return true;
     }
-    if (is_call_to(expr, "NativeMemory", "Md5") && expr->call.args.count == 2) {
-        /* RFC 1321 MD5 digest over len raw bytes; returns a real ARC string of
-         * 16 raw digest bytes handed to the caller +1 (same contract as Sha256).
-         * Direct unrolled hardware streaming via zan_hw_md5. */
-        LLVMValueRef p = nm_arg(g, expr, 0, locals);
-        LLVMValueRef len = nm_arg(g, expr, 1, locals);
-        len = LLVMBuildSelect(g->builder,
-            zan_icmp(g->builder, LLVMIntSLT, len, zero64, "nm.md5.neg"),
-            zero64, len, "nm.md5.len");
-        LLVMValueRef md5fn = nm_md5_fn(g);
-        LLVMTypeRef md5_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
-            (LLVMTypeRef[]){ i8ptr, i64t, i8ptr }, 3, 0);
-        LLVMValueRef s = emit_string_alloc_rc(g, LLVMConstInt(i64t, 17, 0));
-        LLVMBuildCall2(g->builder, md5_ty, md5fn, (LLVMValueRef[]){
-            nm_addr(g, p, zero64), len, s }, 3, "");
-        LLVMValueRef endp = LLVMBuildGEP2(g->builder, i8, s,
-            (LLVMValueRef[]){ LLVMConstInt(i64t, 16, 0) }, 1, "nm.md5.end");
-        zan_store_fit(g, LLVMConstInt(i8, 0, 0), endp);
-        emit_string_len_set(g, s, LLVMConstInt(i64t, 16, 0));
-        *out = s;
-        return true;
-    }
-    if (is_call_to(expr, "NativeMemory", "Aes128CbcEncrypt") && expr->call.args.count == 5) {
+    if (is_call_to(expr, "NativeMemory", "AesCbcEncrypt") && expr->call.args.count == 6) {
         LLVMValueRef dst = nm_arg(g, expr, 0, locals);
         LLVMValueRef src = nm_arg(g, expr, 1, locals);
         LLVMValueRef size = nm_arg(g, expr, 2, locals);
         LLVMValueRef key = nm_arg(g, expr, 3, locals);
-        LLVMValueRef iv = nm_arg(g, expr, 4, locals);
+        LLVMValueRef keybits = nm_arg(g, expr, 4, locals);
+        LLVMValueRef iv = nm_arg(g, expr, 5, locals);
         LLVMTypeRef ty = LLVMFunctionType(i64t,
-            (LLVMTypeRef[]){ i8ptr, i64t, i8ptr, i8ptr, i8ptr }, 5, 0);
-        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_aes128_cbc_encrypt");
-        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_aes128_cbc_encrypt", ty);
+            (LLVMTypeRef[]){ i8ptr, i64t, i8ptr, i32t, i8ptr, i8ptr }, 6, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_aes_cbc_encrypt");
+        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_aes_cbc_encrypt", ty);
         *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
-            nm_addr(g, src, zero64), size, nm_addr(g, key, zero64), nm_addr(g, iv, zero64), nm_addr(g, dst, zero64)
-        }, 5, "nm.aes_enc");
+            nm_addr(g, src, zero64), size, nm_addr(g, key, zero64),
+            coerce_int_to(g, keybits, i32t), nm_addr(g, iv, zero64),
+            nm_addr(g, dst, zero64) }, 6, "nm.aes_enc");
         return true;
     }
-    if (is_call_to(expr, "NativeMemory", "Aes128CbcDecrypt") && expr->call.args.count == 5) {
+    if (is_call_to(expr, "NativeMemory", "AesCbcDecrypt") && expr->call.args.count == 6) {
         LLVMValueRef dst = nm_arg(g, expr, 0, locals);
         LLVMValueRef src = nm_arg(g, expr, 1, locals);
         LLVMValueRef size = nm_arg(g, expr, 2, locals);
         LLVMValueRef key = nm_arg(g, expr, 3, locals);
-        LLVMValueRef iv = nm_arg(g, expr, 4, locals);
+        LLVMValueRef keybits = nm_arg(g, expr, 4, locals);
+        LLVMValueRef iv = nm_arg(g, expr, 5, locals);
         LLVMTypeRef ty = LLVMFunctionType(i64t,
-            (LLVMTypeRef[]){ i8ptr, i64t, i8ptr, i8ptr, i8ptr }, 5, 0);
-        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_aes128_cbc_decrypt");
-        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_aes128_cbc_decrypt", ty);
+            (LLVMTypeRef[]){ i8ptr, i64t, i8ptr, i32t, i8ptr, i8ptr }, 6, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_aes_cbc_decrypt");
+        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_aes_cbc_decrypt", ty);
         *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
-            nm_addr(g, src, zero64), size, nm_addr(g, key, zero64), nm_addr(g, iv, zero64), nm_addr(g, dst, zero64)
-        }, 5, "nm.aes_dec");
+            nm_addr(g, src, zero64), size, nm_addr(g, key, zero64),
+            coerce_int_to(g, keybits, i32t), nm_addr(g, iv, zero64),
+            nm_addr(g, dst, zero64) }, 6, "nm.aes_dec");
+        return true;
+    }
+    if (is_call_to(expr, "NativeMemory", "AesEcbBlock") && expr->call.args.count == 4) {
+        LLVMValueRef key = nm_arg(g, expr, 0, locals);
+        LLVMValueRef keybits = nm_arg(g, expr, 1, locals);
+        LLVMValueRef in16 = nm_arg(g, expr, 2, locals);
+        LLVMValueRef out16 = nm_arg(g, expr, 3, locals);
+        LLVMTypeRef ty = LLVMFunctionType(i64t,
+            (LLVMTypeRef[]){ i8ptr, i32t, i8ptr, i8ptr }, 4, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_aes_ecb_block");
+        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_aes_ecb_block", ty);
+        *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
+            nm_addr(g, key, zero64), coerce_int_to(g, keybits, i32t),
+            nm_addr(g, in16, zero64), nm_addr(g, out16, zero64) }, 4, "nm.aes_ecb");
+        return true;
+    }
+    if (is_call_to(expr, "NativeMemory", "AesCtrCrypt") && expr->call.args.count == 6) {
+        LLVMValueRef dst = nm_arg(g, expr, 0, locals);
+        LLVMValueRef src = nm_arg(g, expr, 1, locals);
+        LLVMValueRef size = nm_arg(g, expr, 2, locals);
+        LLVMValueRef key = nm_arg(g, expr, 3, locals);
+        LLVMValueRef keybits = nm_arg(g, expr, 4, locals);
+        LLVMValueRef counter = nm_arg(g, expr, 5, locals);
+        LLVMTypeRef ty = LLVMFunctionType(i64t,
+            (LLVMTypeRef[]){ i8ptr, i64t, i8ptr, i32t, i8ptr, i8ptr }, 6, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_aes_ctr_crypt");
+        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_aes_ctr_crypt", ty);
+        *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
+            nm_addr(g, src, zero64), size, nm_addr(g, key, zero64),
+            coerce_int_to(g, keybits, i32t), nm_addr(g, counter, zero64),
+            nm_addr(g, dst, zero64) }, 6, "nm.aes_ctr");
+        return true;
+    }
+    if (is_call_to(expr, "NativeMemory", "GhashBlock") && expr->call.args.count == 3) {
+        LLVMValueRef h = nm_arg(g, expr, 0, locals);
+        LLVMValueRef x = nm_arg(g, expr, 1, locals);
+        LLVMValueRef y = nm_arg(g, expr, 2, locals);
+        LLVMTypeRef ty = LLVMFunctionType(i64t,
+            (LLVMTypeRef[]){ i8ptr, i8ptr, i8ptr }, 3, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_ghash_block");
+        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_ghash_block", ty);
+        *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
+            nm_addr(g, h, zero64), nm_addr(g, x, zero64),
+            nm_addr(g, y, zero64) }, 3, "nm.ghash");
+        return true;
+    }
+    if (is_call_to(expr, "NativeMemory", "Crc32CUpdate") && expr->call.args.count == 3) {
+        LLVMValueRef crc = nm_arg(g, expr, 0, locals);
+        LLVMValueRef p = nm_arg(g, expr, 1, locals);
+        LLVMValueRef len = nm_arg(g, expr, 2, locals);
+        LLVMTypeRef ty = LLVMFunctionType(i64t,
+            (LLVMTypeRef[]){ i32t, i8ptr, i64t }, 3, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_crc32c_update");
+        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_crc32c_update", ty);
+        *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
+            coerce_int_to(g, crc, i32t), nm_addr(g, p, zero64), len }, 3, "nm.crc32c.u");
+        return true;
+    }
+    if (is_call_to(expr, "NativeMemory", "Sha1") && expr->call.args.count == 2) {
+        emit_nm_digest(g, expr, locals, out, "zan_hw_sha1", 20);
+        return true;
+    }
+    if (is_call_to(expr, "NativeMemory", "Sha512") && expr->call.args.count == 2) {
+        emit_nm_digest(g, expr, locals, out, "zan_hw_sha512", 64);
         return true;
     }
     if (is_call_to(expr, "NativeMemory", "Sm3") && expr->call.args.count == 2) {
-        /* GB/T 32918.4 SM3 digest over len raw bytes; returns a real ARC string of
-         * 32 raw digest bytes handed to the caller +1 (same contract as Sha256).
-         * Direct unrolled hardware streaming via zan_hw_sm3. */
-        LLVMValueRef p = nm_arg(g, expr, 0, locals);
-        LLVMValueRef len = nm_arg(g, expr, 1, locals);
-        len = LLVMBuildSelect(g->builder,
-            zan_icmp(g->builder, LLVMIntSLT, len, zero64, "nm.sm3.neg"),
-            zero64, len, "nm.sm3.len");
-        LLVMValueRef sm3fn = nm_sm3_fn(g);
-        LLVMTypeRef sm3_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
-            (LLVMTypeRef[]){ i8ptr, i64t, i8ptr }, 3, 0);
-        LLVMValueRef s = emit_string_alloc_rc(g, LLVMConstInt(i64t, 33, 0));
-        LLVMBuildCall2(g->builder, sm3_ty, sm3fn, (LLVMValueRef[]){
-            nm_addr(g, p, zero64), len, s }, 3, "");
-        LLVMValueRef endp = LLVMBuildGEP2(g->builder, i8, s,
-            (LLVMValueRef[]){ LLVMConstInt(i64t, 32, 0) }, 1, "nm.sm3.end");
-        zan_store_fit(g, LLVMConstInt(i8, 0, 0), endp);
-        emit_string_len_set(g, s, LLVMConstInt(i64t, 32, 0));
-        *out = s;
+        emit_nm_digest(g, expr, locals, out, "zan_hw_sm3", 32);
         return true;
     }
     if (is_call_to(expr, "NativeMemory", "Sm4CbcEncrypt") && expr->call.args.count == 5) {

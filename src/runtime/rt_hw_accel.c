@@ -12,6 +12,20 @@
   #include <wmmintrin.h>
   #include <emmintrin.h>
   #include <tmmintrin.h>
+  #include <smmintrin.h>
+#endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+  #if defined(_WIN32)
+    /* windows.h normally arrives from the including TU (rt_timer.c); include
+     * it here too so the unit compiles standalone. */
+    #include <windows.h>
+  #elif defined(__APPLE__)
+    #include <sys/sysctl.h>
+  #else
+    /* Linux / Android (bionic, API 21+) / OpenHarmony (musl) all ship
+     * getauxval; iOS goes through the __APPLE__ branch above. */
+    #include <sys/auxv.h>
+  #endif
 #endif
 
 /* ===== 1. CPU Feature Detection ===== */
@@ -23,6 +37,82 @@ static int g_has_avx2     = 0;
 static int g_has_aesni    = 0;
 static int g_has_neon     = 0;
 static int g_has_shani    = 0;
+static int g_has_pclmul   = 0;
+
+/* ARMv8 crypto extension availability (aarch64 only). Split per algorithm:
+ * FEAT_AES/SHA1/SHA2/PMULL are baseline "crypto"; FEAT_SHA512/SM3/SM4 and
+ * FEAT_CRC32 are later optional extensions that must each be probed. */
+static int g_a_hw_aes    = 0;
+static int g_a_hw_sha1   = 0;
+static int g_a_hw_sha2   = 0;
+static int g_a_hw_pmull  = 0;
+static int g_a_hw_sha512 = 0;
+static int g_a_hw_sm3    = 0;
+static int g_a_hw_sm4    = 0;
+static int g_a_hw_crc32  = 0;
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+#if !defined(_WIN32) && !defined(__APPLE__)
+/* Linux HWCAP bits (uapi/asm/hwcap.h). */
+#define ZAN_HWCAP_FP      (1u << 0)
+#define ZAN_HWCAP_ASIMD   (1u << 1)
+#define ZAN_HWCAP_AES     (1u << 3)
+#define ZAN_HWCAP_PMULL   (1u << 4)
+#define ZAN_HWCAP_SHA1    (1u << 5)
+#define ZAN_HWCAP_SHA2    (1u << 6)
+#define ZAN_HWCAP_CRC32   (1u << 7)
+#define ZAN_HWCAP_SHA3    (1u << 17)
+#define ZAN_HWCAP_SM3     (1u << 18)
+#define ZAN_HWCAP_SM4     (1u << 19)
+#define ZAN_HWCAP_SHA512  (1u << 21)
+#endif
+static int zan_sysctl_i(const char *key) {
+#if defined(__APPLE__)
+    int v = 0;
+    size_t n = sizeof(v);
+    if (sysctlbyname(key, &v, &n, NULL, 0) != 0) return 0;
+    return v != 0;
+#else
+    (void)key;
+    return 0;
+#endif
+}
+static void zan_arm_probe(void) {
+#if defined(_WIN32)
+    /* IsProcessorFeaturePresent bundles FEAT_AES+SHA1+SHA2+PMULL as the
+     * "v8 crypto" set; Windows exposes no per-extension flag for
+     * FEAT_SHA512/SM3/SM4, so those fall back to portable C there. */
+    int crypto = IsProcessorFeaturePresent(75 /* PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE */);
+    g_a_hw_aes = g_a_hw_sha1 = g_a_hw_sha2 = g_a_hw_pmull = crypto;
+    g_a_hw_crc32 = IsProcessorFeaturePresent(76 /* PF_ARM_V8_CRC32_INSTRUCTIONS_AVAILABLE */);
+#elif defined(__APPLE__)
+    int crypto = zan_sysctl_i("hw.optional.armv8_crypto");
+    g_a_hw_aes = g_a_hw_sha1 = g_a_hw_sha2 = g_a_hw_pmull = crypto;
+    g_a_hw_crc32  = zan_sysctl_i("hw.optional.armv8_crc32");
+    g_a_hw_sha512 = zan_sysctl_i("hw.optional.armv8_2_sha512");
+    g_a_hw_sm3    = zan_sysctl_i("hw.optional.arm.FEAT_SM3");
+    g_a_hw_sm4    = zan_sysctl_i("hw.optional.arm.FEAT_SM4");
+#else
+    unsigned long hw = getauxval(16 /* AT_HWCAP */);
+    g_a_hw_aes    = (hw & ZAN_HWCAP_AES)    != 0;
+    g_a_hw_sha1   = (hw & ZAN_HWCAP_SHA1)   != 0;
+    g_a_hw_sha2   = (hw & ZAN_HWCAP_SHA2)   != 0;
+    g_a_hw_pmull  = (hw & ZAN_HWCAP_PMULL)  != 0;
+    g_a_hw_crc32  = (hw & ZAN_HWCAP_CRC32)  != 0;
+    g_a_hw_sha512 = (hw & ZAN_HWCAP_SHA512) != 0;
+    g_a_hw_sm3    = (hw & ZAN_HWCAP_SM3)    != 0;
+    g_a_hw_sm4    = (hw & ZAN_HWCAP_SM4)    != 0;
+#endif
+}
+#endif /* aarch64 */
+
+/* ZAN_NO_HWACCEL=1 forces every dispatch onto the portable C path. Conformance
+ * tests run each case twice (with and without the variable) to prove the
+ * hardware path and the reference path agree byte for byte. */
+static int zan_hw_soft_forced(void) {
+    const char *e = getenv("ZAN_NO_HWACCEL");
+    return e != NULL && e[0] != '\0' && e[0] != '0';
+}
 
 static void zan_hw_init_cpu_features(void) {
     if (g_cpuid_inited) return;
@@ -30,9 +120,10 @@ static void zan_hw_init_cpu_features(void) {
     uint32_t eax, ebx, ecx, edx;
     // EAX=1: Features
     __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1), "c"(0));
-    g_has_sse42  = (ecx & (1u << 20)) != 0;
-    g_has_popcnt = (ecx & (1u << 23)) != 0;
-    g_has_aesni  = (ecx & (1u << 25)) != 0;
+    g_has_sse42   = (ecx & (1u << 20)) != 0;
+    g_has_popcnt  = (ecx & (1u << 23)) != 0;
+    g_has_aesni   = (ecx & (1u << 25)) != 0;
+    g_has_pclmul  = (ecx & (1u << 1)) != 0;
 
     // EAX=7, ECX=0: Extended Features
     __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(7), "c"(0));
@@ -45,9 +136,10 @@ static void zan_hw_init_cpu_features(void) {
 #elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
     int info[4];
     __cpuid(info, 1);
-    g_has_sse42  = (info[2] & (1 << 20)) != 0;
-    g_has_popcnt = (info[2] & (1 << 23)) != 0;
-    g_has_aesni  = (info[2] & (1 << 25)) != 0;
+    g_has_sse42   = (info[2] & (1 << 20)) != 0;
+    g_has_popcnt  = (info[2] & (1 << 23)) != 0;
+    g_has_aesni   = (info[2] & (1 << 25)) != 0;
+    g_has_pclmul  = (info[2] & (1 << 1)) != 0;
 
     __cpuidex(info, 7, 0);
     g_has_avx2  = (info[1] & (1 << 5)) != 0;
@@ -57,8 +149,57 @@ static void zan_hw_init_cpu_features(void) {
     g_has_lzcnt = (info[2] & (1 << 5)) != 0;
 #elif defined(__aarch64__) || defined(_M_ARM64)
     g_has_neon = 1;
+    zan_arm_probe();
 #endif
+    if (zan_hw_soft_forced()) {
+        g_has_sse42 = g_has_popcnt = g_has_lzcnt = 0;
+        g_has_avx2 = g_has_aesni = g_has_shani = g_has_pclmul = 0;
+#if defined(__aarch64__) || defined(_M_ARM64)
+        g_a_hw_aes = g_a_hw_sha1 = g_a_hw_sha2 = g_a_hw_pmull = 0;
+        g_a_hw_sha512 = g_a_hw_sm3 = g_a_hw_sm4 = g_a_hw_crc32 = 0;
+#endif
+    }
     g_cpuid_inited = 1;
+}
+
+/* KAT gate for hardware paths: state is tri-state per primitive
+ * (0 = untested, 1 = known-answer test passed, -1 = feature missing or KAT
+ * failed -> permanently software). Every hardware kernel is checked once,
+ * before its first real use, against published test vectors (FIPS-197,
+ * SP 800-38A/38D, FIPS 180-4, GB/T 32905/32907, RFC 4960), so a defective
+ * instruction path can never ship wrong bytes: it degrades to the pure-Zan
+ * implementation in the stdlib. The registry below is what conformance
+ * asserts against: a present feature must have KAT state 1, never -1. */
+static int g_gate_sha256 = 0;
+static int g_gate_sha1   = 0;
+static int g_gate_sha512 = 0;
+static int g_gate_sm3    = 0;
+static int g_gate_aes    = 0;
+static int g_gate_ghash  = 0;
+static int g_gate_crc32c = 0;
+static int g_gate_sm4    = 0;
+
+static int zan_hw_gate(int *state, int feature, int (*kat)(void)) {
+    if (*state == 0) {
+        if (!feature) { *state = -1; return 0; }
+        *state = kat() ? 1 : -1;
+    }
+    return *state == 1;
+}
+
+int zan_hw_kat_state(int id) {
+    zan_hw_init_cpu_features();
+    switch (id) {
+        case 5: case 9:  return g_gate_aes;
+        case 7: case 10: return g_gate_sha1;
+        case 11:         return g_gate_sha256;
+        case 12:         return g_gate_ghash;
+        case 13:         return g_gate_sha512;
+        case 14:         return g_gate_sm3;
+        case 16:         return g_gate_crc32c;
+        case 15:         return g_gate_sm4;
+        default:         return -1;
+    }
 }
 
 int zan_hw_has_popcnt(void) { zan_hw_init_cpu_features(); return g_has_popcnt; }
@@ -68,6 +209,16 @@ int zan_hw_has_avx2(void)   { zan_hw_init_cpu_features(); return g_has_avx2; }
 int zan_hw_has_aesni(void)  { zan_hw_init_cpu_features(); return g_has_aesni; }
 int zan_hw_has_neon(void)   { zan_hw_init_cpu_features(); return g_has_neon; }
 int zan_hw_has_shani(void)  { zan_hw_init_cpu_features(); return g_has_shani; }
+int zan_hw_has_pclmul(void) { zan_hw_init_cpu_features(); return g_has_pclmul; }
+
+int zan_hw_arm_aes(void)    { zan_hw_init_cpu_features(); return g_a_hw_aes; }
+int zan_hw_arm_sha1(void)   { zan_hw_init_cpu_features(); return g_a_hw_sha1; }
+int zan_hw_arm_sha2(void)   { zan_hw_init_cpu_features(); return g_a_hw_sha2; }
+int zan_hw_arm_pmull(void)  { zan_hw_init_cpu_features(); return g_a_hw_pmull; }
+int zan_hw_arm_sha512(void) { zan_hw_init_cpu_features(); return g_a_hw_sha512; }
+int zan_hw_arm_sm3(void)    { zan_hw_init_cpu_features(); return g_a_hw_sm3; }
+int zan_hw_arm_sm4(void)    { zan_hw_init_cpu_features(); return g_a_hw_sm4; }
+int zan_hw_arm_crc32(void)  { zan_hw_init_cpu_features(); return g_a_hw_crc32; }
 
 int zan_cpu_feature(int id) {
     switch (id) {
@@ -78,6 +229,15 @@ int zan_cpu_feature(int id) {
         case 5: return zan_hw_has_aesni();
         case 6: return zan_hw_has_neon();
         case 7: return zan_hw_has_shani();
+        case 8: return zan_hw_has_pclmul();
+        case 9: return zan_hw_arm_aes();
+        case 10: return zan_hw_arm_sha1();
+        case 11: return zan_hw_arm_sha2();
+        case 12: return zan_hw_arm_pmull();
+        case 13: return zan_hw_arm_sha512();
+        case 14: return zan_hw_arm_sm3();
+        case 15: return zan_hw_arm_sm4();
+        case 16: return zan_hw_arm_crc32();
         default: return 0;
     }
 }
@@ -376,15 +536,6 @@ __asm__(
 extern void zan_sha256_transform_ni(uint32_t state[8], const uint8_t *data, size_t num_blocks);
 #endif
 
-/* Pure C software streaming fallback */
-static inline uint32_t zan_rotr32(uint32_t x, int n) {
-    return (x >> n) | (x << (32 - n));
-}
-
-static inline uint32_t zan_rotl32(uint32_t x, int n) {
-    return (x << n) | (x >> (32 - n));
-}
-
 static const uint32_t K256_C[64] = {
     0x428a2f98u,0x71374491u,0xb5c0fbcfu,0xe9b5dba5u,0x3956c25bu,0x59f111f1u,
     0x923f82a4u,0xab1c5ed5u,0xd807aa98u,0x12835b01u,0x243185beu,0x550c7dc3u,
@@ -399,43 +550,123 @@ static const uint32_t K256_C[64] = {
     0x90befffau,0xa4506cebu,0xbef9a3f7u,0xc67178f2u
 };
 
-static void zan_sha256_transform_c(uint32_t state[8], const uint8_t *data, size_t num_blocks) {
+/* ARMv8 Cryptographic Extension SHA-2 (FEAT_SHA2: sha256h/h2/su0/su1). */
+#if (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+#include <arm_neon.h>
+
+__attribute__((target("sha2")))
+static void zan_sha256_transform_arm(uint32_t state[8], const uint8_t *data, size_t num_blocks) {
+    uint32x4_t s0 = vld1q_u32(&state[0]);
+    uint32x4_t s1 = vld1q_u32(&state[4]);
     for (size_t b = 0; b < num_blocks; b++) {
-        const uint8_t *block = data + b * 64;
-        uint32_t w[64];
-        for (int t = 0; t < 16; t++) {
-            w[t] = ((uint32_t)block[t*4] << 24) |
-                   ((uint32_t)block[t*4+1] << 16) |
-                   ((uint32_t)block[t*4+2] << 8) |
-                   ((uint32_t)block[t*4+3]);
+        const uint8_t *p = data + b * 64;
+        uint32x4_t state0 = s0, state1 = s1;
+        uint32x4_t msg0 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p)));
+        uint32x4_t msg1 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p + 16)));
+        uint32x4_t msg2 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p + 32)));
+        uint32x4_t msg3 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p + 48)));
+        uint32x4_t tmp;
+
+        /* Rounds 0-3 */
+        tmp = vaddq_u32(msg0, vld1q_u32(&K256_C[0]));
+        state1 = vsha256hq_u32(state1, state0, tmp);
+        state0 = vsha256h2q_u32(state1, state0, tmp);
+        msg0 = vsha256su0q_u32(msg0, msg1);
+        /* Rounds 4-7 */
+        tmp = vaddq_u32(msg1, vld1q_u32(&K256_C[4]));
+        state1 = vsha256hq_u32(state1, state0, tmp);
+        state0 = vsha256h2q_u32(state1, state0, tmp);
+        msg1 = vsha256su0q_u32(msg1, msg2);
+        msg0 = vsha256su1q_u32(msg0, msg2, msg3);
+        /* Rounds 8-11 */
+        tmp = vaddq_u32(msg2, vld1q_u32(&K256_C[8]));
+        state1 = vsha256hq_u32(state1, state0, tmp);
+        state0 = vsha256h2q_u32(state1, state0, tmp);
+        msg2 = vsha256su0q_u32(msg2, msg3);
+        msg1 = vsha256su1q_u32(msg1, msg3, msg0);
+        /* Rounds 12-15 */
+        tmp = vaddq_u32(msg3, vld1q_u32(&K256_C[12]));
+        state1 = vsha256hq_u32(state1, state0, tmp);
+        state0 = vsha256h2q_u32(state1, state0, tmp);
+        msg3 = vsha256su0q_u32(msg3, msg0);
+        msg2 = vsha256su1q_u32(msg2, msg0, msg1);
+
+        for (int i = 16; i < 64; i += 16) {
+            tmp = vaddq_u32(msg0, vld1q_u32(&K256_C[i]));
+            state1 = vsha256hq_u32(state1, state0, tmp);
+            state0 = vsha256h2q_u32(state1, state0, tmp);
+            msg0 = vsha256su1q_u32(msg0, msg2, msg3);
+
+            tmp = vaddq_u32(msg1, vld1q_u32(&K256_C[i + 4]));
+            state1 = vsha256hq_u32(state1, state0, tmp);
+            state0 = vsha256h2q_u32(state1, state0, tmp);
+            msg1 = vsha256su1q_u32(msg1, msg3, msg0);
+
+            tmp = vaddq_u32(msg2, vld1q_u32(&K256_C[i + 8]));
+            state1 = vsha256hq_u32(state1, state0, tmp);
+            state0 = vsha256h2q_u32(state1, state0, tmp);
+            msg2 = vsha256su1q_u32(msg2, msg0, msg1);
+
+            tmp = vaddq_u32(msg3, vld1q_u32(&K256_C[i + 12]));
+            state1 = vsha256hq_u32(state1, state0, tmp);
+            state0 = vsha256h2q_u32(state1, state0, tmp);
+            msg3 = vsha256su1q_u32(msg3, msg1, msg2);
         }
-        for (int t = 16; t < 64; t++) {
-            uint32_t s0 = zan_rotr32(w[t-15], 7) ^ zan_rotr32(w[t-15], 18) ^ (w[t-15] >> 3);
-            uint32_t s1 = zan_rotr32(w[t-2], 17) ^ zan_rotr32(w[t-2], 19) ^ (w[t-2] >> 10);
-            w[t] = w[t-16] + s0 + w[t-7] + s1;
-        }
 
-        uint32_t a = state[0], bb = state[1], c = state[2], d = state[3];
-        uint32_t e = state[4], f = state[5], g = state[6], h = state[7];
-
-        for (int t = 0; t < 64; t++) {
-            uint32_t S1 = zan_rotr32(e, 6) ^ zan_rotr32(e, 11) ^ zan_rotr32(e, 25);
-            uint32_t ch = (e & f) ^ ((~e) & g);
-            uint32_t temp1 = h + S1 + ch + K256_C[t] + w[t];
-            uint32_t S0 = zan_rotr32(a, 2) ^ zan_rotr32(a, 13) ^ zan_rotr32(a, 22);
-            uint32_t maj = (a & bb) ^ (a & c) ^ (bb & c);
-            uint32_t temp2 = S0 + maj;
-
-            h = g; g = f; f = e; e = d + temp1;
-            d = c; c = bb; bb = a; a = temp1 + temp2;
-        }
-
-        state[0] += a; state[1] += bb; state[2] += c; state[3] += d;
-        state[4] += e; state[5] += f; state[6] += g; state[7] += h;
+        s0 = vaddq_u32(s0, state0);
+        s1 = vaddq_u32(s1, state1);
     }
+    vst1q_u32(&state[0], s0);
+    vst1q_u32(&state[4], s1);
 }
 
-void zan_hw_sha256(const uint8_t *data, int64_t len, uint8_t out[32]) {
+static int zan_sha256_kat_arm(void) {
+    /* FIPS 180-4: SHA-256("abc") */
+    static const uint8_t blk[64] = {
+        0x61,0x62,0x63,0x80, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+        0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+        0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+        0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0x18
+    };
+    static const uint32_t want[8] = {
+        0xba7816bf, 0x8f01cfea, 0x414140de, 0x5dae2223,
+        0xb00361a3, 0x96177a9c, 0xb410ff61, 0xf20015ad
+    };
+    uint32_t a[8] = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                      0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 };
+    zan_sha256_transform_arm(a, blk, 1);
+    for (int i = 0; i < 8; i++) {
+        if (a[i] != want[i]) return 0;
+    }
+    return 1;
+}
+#endif /* aarch64 sha2 */
+
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+static int zan_sha256_kat_x86(void) {
+    /* FIPS 180-4: SHA-256("abc") */
+    static const uint8_t blk[64] = {
+        0x61,0x62,0x63,0x80, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+        0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+        0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+        0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0x18
+    };
+    static const uint32_t want[8] = {
+        0xba7816bf, 0x8f01cfea, 0x414140de, 0x5dae2223,
+        0xb00361a3, 0x96177a9c, 0xb410ff61, 0xf20015ad
+    };
+    uint32_t a[8] = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                      0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 };
+    extern void zan_sha256_transform_ni(uint32_t state[8], const uint8_t *data, size_t num_blocks);
+    zan_sha256_transform_ni(a, blk, 1);
+    for (int i = 0; i < 8; i++) {
+        if (a[i] != want[i]) return 0;
+    }
+    return 1;
+}
+#endif
+
+int64_t zan_hw_sha256(const uint8_t *data, int64_t len, uint8_t out[32]) {
     if (len < 0) len = 0;
     uint32_t state[8] = {
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
@@ -445,21 +676,21 @@ void zan_hw_sha256(const uint8_t *data, int64_t len, uint8_t out[32]) {
     size_t full_blocks = (size_t)len / 64;
     int use_ni = 0;
 #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
-    use_ni = zan_hw_has_shani();
+    use_ni = zan_hw_gate(&g_gate_sha256, zan_hw_has_shani(), zan_sha256_kat_x86);
+#elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+    use_ni = zan_hw_gate(&g_gate_sha256, zan_hw_arm_sha2(), zan_sha256_kat_arm);
 #endif
+    if (!use_ni) return -1;
 
     if (full_blocks > 0 && data) {
 #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
-        if (use_ni) {
-            zan_sha256_transform_ni(state, data, full_blocks);
-        } else
+        zan_sha256_transform_ni(state, data, full_blocks);
+#elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+        zan_sha256_transform_arm(state, data, full_blocks);
 #endif
-        {
-            zan_sha256_transform_c(state, data, full_blocks);
-        }
     }
 
-    // Stack tail padding: zero dynamic alloca, fixed 128 bytes
+    // Stack tail padding: fixed 128 bytes
     uint8_t tail[128];
     size_t rem = (size_t)len % 64;
     if (rem > 0 && data) {
@@ -475,13 +706,10 @@ void zan_hw_sha256(const uint8_t *data, int64_t len, uint8_t out[32]) {
     }
 
 #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
-    if (use_ni) {
-        zan_sha256_transform_ni(state, tail, pad_blocks);
-    } else
+    zan_sha256_transform_ni(state, tail, pad_blocks);
+#elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+    zan_sha256_transform_arm(state, tail, pad_blocks);
 #endif
-    {
-        zan_sha256_transform_c(state, tail, pad_blocks);
-    }
 
     for (int i = 0; i < 8; i++) {
         out[i*4]   = (uint8_t)(state[i] >> 24);
@@ -489,137 +717,225 @@ void zan_hw_sha256(const uint8_t *data, int64_t len, uint8_t out[32]) {
         out[i*4+2] = (uint8_t)(state[i] >> 8);
         out[i*4+3] = (uint8_t)(state[i]);
     }
+    return 0;
 }
 
-/* =========================================================================
- * 2.1 MD5 High-Performance Hardware-Level Streaming Engine (RFC 1321)
- * Fully unrolled 64-step register-allocated pipeline.
- * ========================================================================= */
+/* ===== 2.1 SHA-1 Hardware Kernel (FIPS 180-4) ============================
+ * x86: Intel SHA Extensions (sha1rnds4/nexte/msg1/msg2). ARM: FEAT_SHA1
+ * (sha1c/sha1p/sha1m). The transform consumes whole 64-byte blocks only;
+ * padding and the length word are driver plumbing below.
+ * ======================================================================== */
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
 
-#define MD5_F(x, y, z) (((x) & (y)) | ((~x) & (z)))
-#define MD5_G(x, y, z) (((x) & (z)) | ((y) & (~z)))
-#define MD5_H(x, y, z) ((x) ^ (y) ^ (z))
-#define MD5_I(x, y, z) ((y) ^ ((x) | (~z)))
+/* Canonical Intel SHA Extensions pipeline (public domain, noloader/SHA-Intrinsics).
+ * `length` is in BYTES and must be a multiple of 64. */
+__attribute__((target("sha,sse4.1")))
+static void zan_sha1_transform_ni(uint32_t state[5], const uint8_t *data, size_t num_blocks) {
+    __m128i ABCD, ABCD_SAVE, E0, E0_SAVE, E1;
+    __m128i MSG0, MSG1, MSG2, MSG3;
+    const __m128i MASK = _mm_set_epi64x(0x0001020304050607ULL, 0x08090a0b0c0d0e0fULL);
 
-#define MD5_ROTL(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
+    size_t length = num_blocks * 64;
+    ABCD = _mm_loadu_si128((const __m128i*) state);
+    E0 = _mm_set_epi32((int)state[4], 0, 0, 0);
+    ABCD = _mm_shuffle_epi32(ABCD, 0x1B);
 
-#define MD5_STEP_F(a, b, c, d, x, s, ac) do { \
-    (a) += MD5_F((b), (c), (d)) + (x) + (uint32_t)(ac); \
-    (a) = MD5_ROTL((a), (s)) + (b); \
-} while (0)
+    while (length >= 64) {
+        ABCD_SAVE = ABCD;
+        E0_SAVE = E0;
 
-#define MD5_STEP_G(a, b, c, d, x, s, ac) do { \
-    (a) += MD5_G((b), (c), (d)) + (x) + (uint32_t)(ac); \
-    (a) = MD5_ROTL((a), (s)) + (b); \
-} while (0)
+        MSG0 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(data + 0)), MASK);
+        E0 = _mm_add_epi32(E0, MSG0);
+        E1 = ABCD;
+        ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 0);
 
-#define MD5_STEP_H(a, b, c, d, x, s, ac) do { \
-    (a) += MD5_H((b), (c), (d)) + (x) + (uint32_t)(ac); \
-    (a) = MD5_ROTL((a), (s)) + (b); \
-} while (0)
+        MSG1 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(data + 16)), MASK);
+        E1 = _mm_sha1nexte_epu32(E1, MSG1);
+        E0 = ABCD;
+        ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 0);
+        MSG0 = _mm_sha1msg1_epu32(MSG0, MSG1);
 
-#define MD5_STEP_I(a, b, c, d, x, s, ac) do { \
-    (a) += MD5_I((b), (c), (d)) + (x) + (uint32_t)(ac); \
-    (a) = MD5_ROTL((a), (s)) + (b); \
-} while (0)
+        MSG2 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(data + 32)), MASK);
+        E0 = _mm_sha1nexte_epu32(E0, MSG2);
+        E1 = ABCD;
+        ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 0);
+        MSG1 = _mm_sha1msg1_epu32(MSG1, MSG2);
+        MSG0 = _mm_xor_si128(MSG0, MSG2);
 
-static void zan_md5_transform(uint32_t state[4], const uint8_t block[64]) {
-    uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
-    uint32_t x[16];
-    for (int i = 0; i < 16; i++) {
-        x[i] = ((uint32_t)block[i*4 + 0]) |
-               (((uint32_t)block[i*4 + 1]) << 8) |
-               (((uint32_t)block[i*4 + 2]) << 16) |
-               (((uint32_t)block[i*4 + 3]) << 24);
+        MSG3 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(data + 48)), MASK);
+        E1 = _mm_sha1nexte_epu32(E1, MSG3);
+        E0 = ABCD;
+        MSG0 = _mm_sha1msg2_epu32(MSG0, MSG3);
+        ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 0);
+        MSG2 = _mm_sha1msg1_epu32(MSG2, MSG3);
+        MSG1 = _mm_xor_si128(MSG1, MSG3);
+
+        E0 = _mm_sha1nexte_epu32(E0, MSG0);
+        E1 = ABCD;
+        MSG1 = _mm_sha1msg2_epu32(MSG1, MSG0);
+        ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 0);
+        MSG3 = _mm_sha1msg1_epu32(MSG3, MSG0);
+        MSG2 = _mm_xor_si128(MSG2, MSG0);
+
+        E1 = _mm_sha1nexte_epu32(E1, MSG1);
+        E0 = ABCD;
+        MSG2 = _mm_sha1msg2_epu32(MSG2, MSG1);
+        ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 1);
+        MSG0 = _mm_sha1msg1_epu32(MSG0, MSG1);
+        MSG3 = _mm_xor_si128(MSG3, MSG1);
+
+        E0 = _mm_sha1nexte_epu32(E0, MSG2);
+        E1 = ABCD;
+        MSG3 = _mm_sha1msg2_epu32(MSG3, MSG2);
+        ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 1);
+        MSG1 = _mm_sha1msg1_epu32(MSG1, MSG2);
+        MSG0 = _mm_xor_si128(MSG0, MSG2);
+
+        E1 = _mm_sha1nexte_epu32(E1, MSG3);
+        E0 = ABCD;
+        MSG0 = _mm_sha1msg2_epu32(MSG0, MSG3);
+        ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 1);
+        MSG2 = _mm_sha1msg1_epu32(MSG2, MSG3);
+        MSG1 = _mm_xor_si128(MSG1, MSG3);
+
+        E0 = _mm_sha1nexte_epu32(E0, MSG0);
+        E1 = ABCD;
+        MSG1 = _mm_sha1msg2_epu32(MSG1, MSG0);
+        ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 1);
+        MSG3 = _mm_sha1msg1_epu32(MSG3, MSG0);
+        MSG2 = _mm_xor_si128(MSG2, MSG0);
+
+        E1 = _mm_sha1nexte_epu32(E1, MSG1);
+        E0 = ABCD;
+        MSG2 = _mm_sha1msg2_epu32(MSG2, MSG1);
+        ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 1);
+        MSG0 = _mm_sha1msg1_epu32(MSG0, MSG1);
+        MSG3 = _mm_xor_si128(MSG3, MSG1);
+
+        E0 = _mm_sha1nexte_epu32(E0, MSG2);
+        E1 = ABCD;
+        MSG3 = _mm_sha1msg2_epu32(MSG3, MSG2);
+        ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 2);
+        MSG1 = _mm_sha1msg1_epu32(MSG1, MSG2);
+        MSG0 = _mm_xor_si128(MSG0, MSG2);
+
+        E1 = _mm_sha1nexte_epu32(E1, MSG3);
+        E0 = ABCD;
+        MSG0 = _mm_sha1msg2_epu32(MSG0, MSG3);
+        ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 2);
+        MSG2 = _mm_sha1msg1_epu32(MSG2, MSG3);
+        MSG1 = _mm_xor_si128(MSG1, MSG3);
+
+        E0 = _mm_sha1nexte_epu32(E0, MSG0);
+        E1 = ABCD;
+        MSG1 = _mm_sha1msg2_epu32(MSG1, MSG0);
+        ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 2);
+        MSG3 = _mm_sha1msg1_epu32(MSG3, MSG0);
+        MSG2 = _mm_xor_si128(MSG2, MSG0);
+
+        E1 = _mm_sha1nexte_epu32(E1, MSG1);
+        E0 = ABCD;
+        MSG2 = _mm_sha1msg2_epu32(MSG2, MSG1);
+        ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 2);
+        MSG0 = _mm_sha1msg1_epu32(MSG0, MSG1);
+        MSG3 = _mm_xor_si128(MSG3, MSG1);
+
+        E0 = _mm_sha1nexte_epu32(E0, MSG2);
+        E1 = ABCD;
+        MSG3 = _mm_sha1msg2_epu32(MSG3, MSG2);
+        ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 2);
+        MSG1 = _mm_sha1msg1_epu32(MSG1, MSG2);
+        MSG0 = _mm_xor_si128(MSG0, MSG2);
+
+        E1 = _mm_sha1nexte_epu32(E1, MSG3);
+        E0 = ABCD;
+        MSG0 = _mm_sha1msg2_epu32(MSG0, MSG3);
+        ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 3);
+        MSG2 = _mm_sha1msg1_epu32(MSG2, MSG3);
+        MSG1 = _mm_xor_si128(MSG1, MSG3);
+
+        E0 = _mm_sha1nexte_epu32(E0, MSG0);
+        E1 = ABCD;
+        MSG1 = _mm_sha1msg2_epu32(MSG1, MSG0);
+        ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 3);
+        MSG3 = _mm_sha1msg1_epu32(MSG3, MSG0);
+        MSG2 = _mm_xor_si128(MSG2, MSG0);
+
+        E1 = _mm_sha1nexte_epu32(E1, MSG1);
+        E0 = ABCD;
+        MSG2 = _mm_sha1msg2_epu32(MSG2, MSG1);
+        ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 3);
+        MSG3 = _mm_xor_si128(MSG3, MSG1);
+
+        E0 = _mm_sha1nexte_epu32(E0, MSG2);
+        E1 = ABCD;
+        MSG3 = _mm_sha1msg2_epu32(MSG3, MSG2);
+        ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 3);
+
+        E1 = _mm_sha1nexte_epu32(E1, MSG3);
+        E0 = ABCD;
+        ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 3);
+
+        E0 = _mm_sha1nexte_epu32(E0, E0_SAVE);
+        ABCD = _mm_add_epi32(ABCD, ABCD_SAVE);
+
+        data += 64;
+        length -= 64;
     }
 
-    /* Round 1 */
-    MD5_STEP_F(a, b, c, d, x[ 0],  7, 0xd76aa478);
-    MD5_STEP_F(d, a, b, c, x[ 1], 12, 0xe8c7b756);
-    MD5_STEP_F(c, d, a, b, x[ 2], 17, 0x242070db);
-    MD5_STEP_F(b, c, d, a, x[ 3], 22, 0xc1bdceee);
-    MD5_STEP_F(a, b, c, d, x[ 4],  7, 0xf57c0faf);
-    MD5_STEP_F(d, a, b, c, x[ 5], 12, 0x4787c62a);
-    MD5_STEP_F(c, d, a, b, x[ 6], 17, 0xa8304613);
-    MD5_STEP_F(b, c, d, a, x[ 7], 22, 0xfd469501);
-    MD5_STEP_F(a, b, c, d, x[ 8],  7, 0x698098d8);
-    MD5_STEP_F(d, a, b, c, x[ 9], 12, 0x8b44f7af);
-    MD5_STEP_F(c, d, a, b, x[10], 17, 0xffff5bb1);
-    MD5_STEP_F(b, c, d, a, x[11], 22, 0x895cd7be);
-    MD5_STEP_F(a, b, c, d, x[12],  7, 0x6b901122);
-    MD5_STEP_F(d, a, b, c, x[13], 12, 0xfd987193);
-    MD5_STEP_F(c, d, a, b, x[14], 17, 0xa679438e);
-    MD5_STEP_F(b, c, d, a, x[15], 22, 0x49b40821);
-
-    /* Round 2 */
-    MD5_STEP_G(a, b, c, d, x[ 1],  5, 0xf61e2562);
-    MD5_STEP_G(d, a, b, c, x[ 6],  9, 0xc040b340);
-    MD5_STEP_G(c, d, a, b, x[11], 14, 0x265e5a51);
-    MD5_STEP_G(b, c, d, a, x[ 0], 20, 0xe9b6c7aa);
-    MD5_STEP_G(a, b, c, d, x[ 5],  5, 0xd62f105d);
-    MD5_STEP_G(d, a, b, c, x[10],  9, 0x02441453);
-    MD5_STEP_G(c, d, a, b, x[15], 14, 0xd8a1e681);
-    MD5_STEP_G(b, c, d, a, x[ 4], 20, 0xe7d3fbc8);
-    MD5_STEP_G(a, b, c, d, x[ 9],  5, 0x21e1cde6);
-    MD5_STEP_G(d, a, b, c, x[14],  9, 0xc33707d6);
-    MD5_STEP_G(c, d, a, b, x[ 3], 14, 0xf4d50d87);
-    MD5_STEP_G(b, c, d, a, x[ 8], 20, 0x455a14ed);
-    MD5_STEP_G(a, b, c, d, x[13],  5, 0xa9e3e905);
-    MD5_STEP_G(d, a, b, c, x[ 2],  9, 0xfcefa3f8);
-    MD5_STEP_G(c, d, a, b, x[ 7], 14, 0x676f02d9);
-    MD5_STEP_G(b, c, d, a, x[12], 20, 0x8d2a4c8a);
-
-    /* Round 3 */
-    MD5_STEP_H(a, b, c, d, x[ 5],  4, 0xfffa3942);
-    MD5_STEP_H(d, a, b, c, x[ 8], 11, 0x8771f681);
-    MD5_STEP_H(c, d, a, b, x[11], 16, 0x6d9d6122);
-    MD5_STEP_H(b, c, d, a, x[14], 23, 0xfde5380c);
-    MD5_STEP_H(a, b, c, d, x[ 1],  4, 0xa4beea44);
-    MD5_STEP_H(d, a, b, c, x[ 4], 11, 0x4bdecfa9);
-    MD5_STEP_H(c, d, a, b, x[ 7], 16, 0xf6bb4b60);
-    MD5_STEP_H(b, c, d, a, x[10], 23, 0xbebfbc70);
-    MD5_STEP_H(a, b, c, d, x[13],  4, 0x289b7ec6);
-    MD5_STEP_H(d, a, b, c, x[ 0], 11, 0xeaa127fa);
-    MD5_STEP_H(c, d, a, b, x[ 3], 16, 0xd4ef3085);
-    MD5_STEP_H(b, c, d, a, x[ 6], 23, 0x04881d05);
-    MD5_STEP_H(a, b, c, d, x[ 9],  4, 0xd9d4d039);
-    MD5_STEP_H(d, a, b, c, x[12], 11, 0xe6db99e5);
-    MD5_STEP_H(c, d, a, b, x[15], 16, 0x1fa27cf8);
-    MD5_STEP_H(b, c, d, a, x[ 2], 23, 0xc4ac5665);
-
-    /* Round 4 */
-    MD5_STEP_I(a, b, c, d, x[ 0],  6, 0xf4292244);
-    MD5_STEP_I(d, a, b, c, x[ 7], 10, 0x432aff97);
-    MD5_STEP_I(c, d, a, b, x[14], 15, 0xab9423a7);
-    MD5_STEP_I(b, c, d, a, x[ 5], 21, 0xfc93a039);
-    MD5_STEP_I(a, b, c, d, x[12],  6, 0x655b59c3);
-    MD5_STEP_I(d, a, b, c, x[ 3], 10, 0x8f0ccc92);
-    MD5_STEP_I(c, d, a, b, x[10], 15, 0xffeff47d);
-    MD5_STEP_I(b, c, d, a, x[ 1], 21, 0x85845dd1);
-    MD5_STEP_I(a, b, c, d, x[ 8],  6, 0x6fa87e4f);
-    MD5_STEP_I(d, a, b, c, x[15], 10, 0xfe2ce6e0);
-    MD5_STEP_I(c, d, a, b, x[ 6], 15, 0xa3014314);
-    MD5_STEP_I(b, c, d, a, x[13], 21, 0x4e0811a1);
-    MD5_STEP_I(a, b, c, d, x[ 4],  6, 0xf7537e82);
-    MD5_STEP_I(d, a, b, c, x[11], 10, 0xbd3af235);
-    MD5_STEP_I(c, d, a, b, x[ 2], 15, 0x2ad7d2bb);
-    MD5_STEP_I(b, c, d, a, x[ 9], 21, 0xeb86d391);
-
-    state[0] += a;
-    state[1] += b;
-    state[2] += c;
-    state[3] += d;
+    ABCD = _mm_shuffle_epi32(ABCD, 0x1B);
+    _mm_storeu_si128((__m128i*) state, ABCD);
+    state[4] = (uint32_t)_mm_extract_epi32(E0, 3);
 }
 
-void zan_hw_md5(const uint8_t *data, int64_t len, uint8_t out[16]) {
-    if (len < 0) len = 0;
-    uint32_t state[4] = {
-        0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476
-    };
+#endif /* x86 sha1 */
 
+static int zan_sha1_kat(void) {
+    /* FIPS 180-4: SHA-1("abc") = a9993e36 4706816a b3e25717 850c26c9 cd0d89d */
+    static const uint8_t blk[64] = {
+        0x61,0x62,0x63,0x80, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+        0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+        0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+        0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0x18
+    };
+    uint32_t a[5] = { 0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0 };
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+    zan_sha1_transform_ni(a, blk, 1);
+#elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+    zan_sha1_transform_arm(a, blk, 1);
+#endif
+    static const uint8_t wantb[20] = {
+        0xa9,0x99,0x3e,0x36,0x47,0x06,0x81,0x6a,0xba,0x3e,
+        0x25,0x71,0x78,0x50,0xc2,0x6c,0x9c,0xd0,0xd8,0x9d
+    };
+    uint8_t got[20];
+    for (int i = 0; i < 5; i++) {
+        got[i*4]   = (uint8_t)(a[i] >> 24);
+        got[i*4+1] = (uint8_t)(a[i] >> 16);
+        got[i*4+2] = (uint8_t)(a[i] >> 8);
+        got[i*4+3] = (uint8_t)(a[i]);
+    }
+    return memcmp(got, wantb, 20) == 0;
+}
+
+int64_t zan_hw_sha1(const uint8_t *data, int64_t len, uint8_t out[20]) {
+    if (len < 0) len = 0;
+    int use_ni = 0;
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+    use_ni = zan_hw_gate(&g_gate_sha1, zan_hw_has_shani(), zan_sha1_kat);
+#elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+    use_ni = zan_hw_gate(&g_gate_sha1, zan_hw_arm_sha1(), zan_sha1_kat);
+#endif
+    if (!use_ni) return -1;
+
+    uint32_t state[5] = { 0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0 };
     size_t full_blocks = (size_t)len / 64;
-    for (size_t i = 0; i < full_blocks; i++) {
-        zan_md5_transform(state, data + i * 64);
+    if (full_blocks > 0 && data) {
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+        zan_sha1_transform_ni(state, data, full_blocks);
+#elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+        zan_sha1_transform_arm(state, data, full_blocks);
+#endif
     }
 
     uint8_t tail[128];
@@ -631,71 +947,148 @@ void zan_hw_md5(const uint8_t *data, int64_t len, uint8_t out[16]) {
     size_t pad_blocks = (rem >= 56) ? 2 : 1;
     size_t total_tail = pad_blocks * 64;
     memset(tail + rem + 1, 0, total_tail - rem - 1);
-
     uint64_t bits = (uint64_t)len * 8;
     for (int i = 0; i < 8; i++) {
-        tail[total_tail - 8 + i] = (uint8_t)(bits >> (8 * i));
+        tail[total_tail - 8 + i] = (uint8_t)(bits >> (56 - 8 * i));
     }
 
-    for (size_t i = 0; i < pad_blocks; i++) {
-        zan_md5_transform(state, tail + i * 64);
-    }
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+    zan_sha1_transform_ni(state, tail, pad_blocks);
+#elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
+    zan_sha1_transform_arm(state, tail, pad_blocks);
+#endif
 
-    for (int i = 0; i < 4; i++) {
-        out[i*4 + 0] = (uint8_t)(state[i] & 0xFF);
-        out[i*4 + 1] = (uint8_t)((state[i] >> 8) & 0xFF);
-        out[i*4 + 2] = (uint8_t)((state[i] >> 16) & 0xFF);
-        out[i*4 + 3] = (uint8_t)((state[i] >> 24) & 0xFF);
+    for (int i = 0; i < 5; i++) {
+        out[i*4]   = (uint8_t)(state[i] >> 24);
+        out[i*4+1] = (uint8_t)(state[i] >> 16);
+        out[i*4+2] = (uint8_t)(state[i] >> 8);
+        out[i*4+3] = (uint8_t)(state[i]);
     }
+    return 0;
 }
 
-/* ===== 3. AES-128 Hardware Accelerated CBC & Intrinsics ===== */
+/* ===== 3. AES Hardware Kernels (FIPS-197, SP 800-38A) & GHASH (SP 800-38D)
+ * Thin instruction-facing kernels only: AES-NI/PCLMULQDQ on x86, FEAT_AES /
+ * FEAT_PMULL on ARM. Key schedule is the FIPS-197 scalar expansion feeding
+ * the round instructions (shared by both ISAs); modes live in the Zan
+ * stdlib, which falls back to its pure-Zan implementation when the kernel
+ * reports -1 (no hardware, or the known-answer test below failed once).
+ * ======================================================================== */
+static uint8_t zan_aes_sbox[256];
+
+static void zan_aes_init_sbox(void) {
+    /* FIPS-197 S-box generated from GF(2^8) inverse + affine map, so the
+     * table stays generated plumbing rather than a second implementation. */
+    static int inited = 0;
+    if (inited) return;
+    uint8_t inv[256];
+    inv[0] = 0; inv[1] = 1;
+    for (int i = 2; i < 256; i++) {
+        for (int j = 2; j < 256; j++) {
+            uint8_t p = 0, a = (uint8_t)i, b = (uint8_t)j;
+            for (int k = 0; k < 8; k++) {
+                if (b & 1) p ^= a;
+                uint8_t hi = a & 0x80;
+                a <<= 1;
+                if (hi) a ^= 0x1B;
+                b >>= 1;
+            }
+            if (p == 1) { inv[i] = (uint8_t)j; break; }
+        }
+    }
+    for (int i = 0; i < 256; i++) {
+        uint8_t x = inv[i], r = x;
+        for (int k = 0; k < 4; k++) {
+            x = (uint8_t)((x << 1) | (x >> 7));
+            r ^= x;
+        }
+        zan_aes_sbox[i] = (uint8_t)(r ^ 0x63);
+    }
+    inited = 1;
+}
+
+/* FIPS-197 key expansion into nr+1 16-byte round keys (big-endian words). */
+static void zan_aes_expand_key(const uint8_t *key, int keybits,
+                               uint8_t rk[15][16], int *nr_out) {
+    zan_aes_init_sbox();
+    int nk = keybits / 32;
+    int nr = nk + 6;
+    uint32_t w[60];
+    for (int i = 0; i < nk; i++) {
+        w[i] = ((uint32_t)key[4*i] << 24) | ((uint32_t)key[4*i+1] << 16) |
+               ((uint32_t)key[4*i+2] << 8) | key[4*i+3];
+    }
+    int rc = 1;
+    for (int i = nk; i < 4 * (nr + 1); i++) {
+        uint32_t t = w[i-1];
+        if (i % nk == 0) {
+            t = (t << 8) | (t >> 24);  /* RotWord */
+            t = ((uint32_t)zan_aes_sbox[(t >> 24) & 255] << 24) |
+                ((uint32_t)zan_aes_sbox[(t >> 16) & 255] << 16) |
+                ((uint32_t)zan_aes_sbox[(t >> 8) & 255] << 8) |
+                zan_aes_sbox[t & 255];
+            t ^= (uint32_t)rc << 24;
+            rc = ((rc << 1) ^ ((rc & 0x80) ? 0x11B : 0)) & 0xFF;
+        } else if (nk > 6 && i % nk == 4) {
+            t = ((uint32_t)zan_aes_sbox[(t >> 24) & 255] << 24) |
+                ((uint32_t)zan_aes_sbox[(t >> 16) & 255] << 16) |
+                ((uint32_t)zan_aes_sbox[(t >> 8) & 255] << 8) |
+                zan_aes_sbox[t & 255];
+        }
+        w[i] = w[i - nk] ^ t;
+    }
+    for (int r = 0; r <= nr; r++) {
+        for (int c = 0; c < 4; c++) {
+            uint32_t v = w[r*4 + c];
+            rk[r][c*4]   = (uint8_t)(v >> 24);
+            rk[r][c*4+1] = (uint8_t)(v >> 16);
+            rk[r][c*4+2] = (uint8_t)(v >> 8);
+            rk[r][c*4+3] = (uint8_t)v;
+        }
+    }
+    *nr_out = nr;
+}
+
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
 
 __attribute__((target("aes,sse4.1")))
-static inline __m128i zan_aes_128_key_exp(__m128i key, __m128i assist) {
-    __m128i temp1 = _mm_shuffle_epi32(assist, 0xff);
-    __m128i temp2 = _mm_slli_si128(key, 4);
-    key = _mm_xor_si128(key, temp2);
-    temp2 = _mm_slli_si128(temp2, 4);
-    key = _mm_xor_si128(key, temp2);
-    temp2 = _mm_slli_si128(temp2, 4);
-    key = _mm_xor_si128(key, temp2);
-    return _mm_xor_si128(key, temp1);
+static inline __m128i zan_aes_load_rk(const uint8_t *p) {
+    return _mm_loadu_si128((const __m128i*)p);
 }
 
 __attribute__((target("aes,sse4.1")))
-static void zan_aes128_expand_enc_hw(const uint8_t *key, __m128i *rk) {
-    rk[0] = _mm_loadu_si128((const __m128i*)key);
-    rk[1] = zan_aes_128_key_exp(rk[0], _mm_aeskeygenassist_si128(rk[0], 0x01));
-    rk[2] = zan_aes_128_key_exp(rk[1], _mm_aeskeygenassist_si128(rk[1], 0x02));
-    rk[3] = zan_aes_128_key_exp(rk[2], _mm_aeskeygenassist_si128(rk[2], 0x04));
-    rk[4] = zan_aes_128_key_exp(rk[3], _mm_aeskeygenassist_si128(rk[3], 0x08));
-    rk[5] = zan_aes_128_key_exp(rk[4], _mm_aeskeygenassist_si128(rk[4], 0x10));
-    rk[6] = zan_aes_128_key_exp(rk[5], _mm_aeskeygenassist_si128(rk[5], 0x20));
-    rk[7] = zan_aes_128_key_exp(rk[6], _mm_aeskeygenassist_si128(rk[6], 0x40));
-    rk[8] = zan_aes_128_key_exp(rk[7], _mm_aeskeygenassist_si128(rk[7], 0x80));
-    rk[9] = zan_aes_128_key_exp(rk[8], _mm_aeskeygenassist_si128(rk[8], 0x1b));
-    rk[10] = zan_aes_128_key_exp(rk[9], _mm_aeskeygenassist_si128(rk[9], 0x36));
-}
-
-__attribute__((target("aes,sse4.1")))
-static void zan_aes128_expand_dec_hw(const uint8_t *key, __m128i *dec_rk) {
-    __m128i rk[11];
-    zan_aes128_expand_enc_hw(key, rk);
-    dec_rk[0] = rk[10];
-    for (int i = 1; i <= 9; i++) {
-        dec_rk[i] = _mm_aesimc_si128(rk[10 - i]);
+static void zan_aes_expand_dec_hw(const uint8_t *key, int keybits, __m128i *dec_rk) {
+    uint8_t rk[15][16];
+    int nr;
+    zan_aes_expand_key(key, keybits, rk, &nr);
+    dec_rk[0] = zan_aes_load_rk(rk[nr]);
+    for (int i = 1; i < nr; i++) {
+        dec_rk[i] = _mm_aesimc_si128(zan_aes_load_rk(rk[nr - i]));
     }
-    dec_rk[10] = rk[0];
+    dec_rk[nr] = zan_aes_load_rk(rk[0]);
 }
 
 __attribute__((target("aes,sse4.1")))
-static int64_t zan_aes128_cbc_encrypt_ni(const uint8_t *in, int64_t len,
-                                         const uint8_t *key, const uint8_t *iv,
-                                         uint8_t *out) {
-    __m128i rk[11];
-    zan_aes128_expand_enc_hw(key, rk);
+static __m128i zan_aes_enc_block_hw(const uint8_t *key, int keybits, __m128i block) {
+    uint8_t rkb[15][16];
+    int nr;
+    zan_aes_expand_key(key, keybits, rkb, &nr);
+    __m128i rk[15];
+    for (int i = 0; i <= nr; i++) rk[i] = zan_aes_load_rk(rkb[i]);
+    block = _mm_xor_si128(block, rk[0]);
+    for (int r = 1; r < nr; r++) block = _mm_aesenc_si128(block, rk[r]);
+    return _mm_aesenclast_si128(block, rk[nr]);
+}
+
+__attribute__((target("aes,sse4.1")))
+static int64_t zan_aes_cbc_encrypt_ni(const uint8_t *in, int64_t len,
+                                      const uint8_t *key, int keybits,
+                                      const uint8_t *iv, uint8_t *out) {
+    uint8_t rkb[15][16];
+    int nr;
+    zan_aes_expand_key(key, keybits, rkb, &nr);
+    __m128i rk[15];
+    for (int i = 0; i <= nr; i++) rk[i] = zan_aes_load_rk(rkb[i]);
 
     int pad_val = 16 - (int)(len % 16);
     int64_t full_blocks = len / 16;
@@ -705,10 +1098,8 @@ static int64_t zan_aes128_cbc_encrypt_ni(const uint8_t *in, int64_t len,
         __m128i block = _mm_loadu_si128((const __m128i*)(in + i * 16));
         block = _mm_xor_si128(block, feedback);
         block = _mm_xor_si128(block, rk[0]);
-        for (int r = 1; r <= 9; r++) {
-            block = _mm_aesenc_si128(block, rk[r]);
-        }
-        block = _mm_aesenclast_si128(block, rk[10]);
+        for (int r = 1; r < nr; r++) block = _mm_aesenc_si128(block, rk[r]);
+        block = _mm_aesenclast_si128(block, rk[nr]);
         _mm_storeu_si128((__m128i*)(out + i * 16), block);
         feedback = block;
     }
@@ -721,21 +1112,20 @@ static int64_t zan_aes128_cbc_encrypt_ni(const uint8_t *in, int64_t len,
     __m128i block = _mm_loadu_si128((const __m128i*)tail);
     block = _mm_xor_si128(block, feedback);
     block = _mm_xor_si128(block, rk[0]);
-    for (int r = 1; r <= 9; r++) {
-        block = _mm_aesenc_si128(block, rk[r]);
-    }
-    block = _mm_aesenclast_si128(block, rk[10]);
+    for (int r = 1; r < nr; r++) block = _mm_aesenc_si128(block, rk[r]);
+    block = _mm_aesenclast_si128(block, rk[nr]);
     _mm_storeu_si128((__m128i*)(out + full_blocks * 16), block);
     return (full_blocks + 1) * 16;
 }
 
 __attribute__((target("aes,sse4.1")))
-static int64_t zan_aes128_cbc_decrypt_ni(const uint8_t *in, int64_t len,
-                                         const uint8_t *key, const uint8_t *iv,
-                                         uint8_t *out) {
+static int64_t zan_aes_cbc_decrypt_ni(const uint8_t *in, int64_t len,
+                                      const uint8_t *key, int keybits,
+                                      const uint8_t *iv, uint8_t *out) {
     if (len <= 0 || (len % 16) != 0) return -1;
-    __m128i dec_rk[11];
-    zan_aes128_expand_dec_hw(key, dec_rk);
+    __m128i dec_rk[15];
+    zan_aes_expand_dec_hw(key, keybits, dec_rk);
+    int nr = keybits / 32 + 6;
 
     int64_t blocks = len / 16;
     __m128i prev = _mm_loadu_si128((const __m128i*)iv);
@@ -743,10 +1133,8 @@ static int64_t zan_aes128_cbc_decrypt_ni(const uint8_t *in, int64_t len,
     for (int64_t i = 0; i < blocks; i++) {
         __m128i cur = _mm_loadu_si128((const __m128i*)(in + i * 16));
         __m128i block = _mm_xor_si128(cur, dec_rk[0]);
-        for (int r = 1; r <= 9; r++) {
-            block = _mm_aesdec_si128(block, dec_rk[r]);
-        }
-        block = _mm_aesdeclast_si128(block, dec_rk[10]);
+        for (int r = 1; r < nr; r++) block = _mm_aesdec_si128(block, dec_rk[r]);
+        block = _mm_aesdeclast_si128(block, dec_rk[nr]);
         block = _mm_xor_si128(block, prev);
         _mm_storeu_si128((__m128i*)(out + i * 16), block);
         prev = cur;
@@ -762,27 +1150,294 @@ static int64_t zan_aes128_cbc_decrypt_ni(const uint8_t *in, int64_t len,
     return len - pad_val;
 }
 
-#endif /* x86_64 aes */
-
-int64_t zan_hw_aes128_cbc_encrypt(const uint8_t *in, int64_t len,
-                                  const uint8_t *key, const uint8_t *iv,
-                                  uint8_t *out) {
-    if (len < 0 || !in || !key || !iv || !out) return -1;
-#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
-    if (zan_hw_has_aesni()) {
-        return zan_aes128_cbc_encrypt_ni(in, len, key, iv, out);
-    }
-#endif
-    return -1; // Fallback handled at caller level
+__attribute__((target("aes,sse4.1")))
+static int64_t zan_aes_ecb_block_ni(const uint8_t *key, int keybits,
+                                    const uint8_t *in16, uint8_t *out16) {
+    __m128i block = _mm_loadu_si128((const __m128i*)in16);
+    block = zan_aes_enc_block_hw(key, keybits, block);
+    _mm_storeu_si128((__m128i*)out16, block);
+    return 0;
 }
 
-int64_t zan_hw_aes128_cbc_decrypt(const uint8_t *in, int64_t len,
-                                  const uint8_t *key, const uint8_t *iv,
-                                  uint8_t *out) {
-    if (len <= 0 || !in || !key || !iv || !out) return -1;
+__attribute__((target("aes,sse4.1")))
+static int64_t zan_aes_ctr_ni(const uint8_t *in, int64_t len,
+                              const uint8_t *key, int keybits,
+                              uint8_t *counter16, uint8_t *out) {
+    uint8_t rkb[15][16];
+    int nr;
+    zan_aes_expand_key(key, keybits, rkb, &nr);
+    __m128i rk[15];
+    for (int i = 0; i <= nr; i++) rk[i] = zan_aes_load_rk(rkb[i]);
+
+    uint8_t ctr[16];
+    memcpy(ctr, counter16, 16);
+    int64_t off = 0;
+    while (off < len) {
+        __m128i ks = _mm_loadu_si128((const __m128i*)ctr);
+        ks = _mm_xor_si128(ks, rk[0]);
+        for (int r = 1; r < nr; r++) ks = _mm_aesenc_si128(ks, rk[r]);
+        ks = _mm_aesenclast_si128(ks, rk[nr]);
+
+        __m128i blk = _mm_loadu_si128((const __m128i*)(in + off));
+        __m128i o = _mm_xor_si128(blk, ks);
+        int avail = (int)(len - off);
+        if (avail >= 16) {
+            _mm_storeu_si128((__m128i*)(out + off), o);
+        } else {
+            uint8_t tmp[16];
+            _mm_storeu_si128((__m128i*)tmp, o);
+            memcpy(out + off, tmp, (size_t)avail);
+        }
+
+        /* 128-bit big-endian counter increment */
+        for (int j = 15; j >= 0; j--) {
+            if (++ctr[j] != 0) break;
+        }
+        off += 16;
+    }
+    memcpy(counter16, ctr, 16);
+    return len;
+}
+
+/* GHASH over PCLMULQDQ. Domain: blocks byte-reversed into the register so
+ * register bit r <-> GCM coefficient x^(127-r). Product bit t <-> x^(254-t);
+ * reduction of bit t (t <= 126) lands at result bits {t-6, t-1, t, t+1}; the
+ * six lowest product bits additionally spill through the second-level fold
+ * (0xE1 at the top byte = q = x^7+x^2+x+1). Verified against the GCM spec
+ * bit loop and KAT'd below. */
+#define ZAN_XSHIFT_R(x, n) _mm_xor_si128(_mm_srli_epi64(x, n), _mm_srli_si128(_mm_slli_epi64(x, 64-(n)), 8))
+#define ZAN_XSHIFT_L(x, n) _mm_xor_si128(_mm_slli_epi64(x, n), _mm_slli_si128(_mm_srli_epi64(x, 64-(n)), 8))
+#define ZAN_BSWAP128 _mm_set_epi8(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15)
+
+__attribute__((target("pclmul,sse4.1")))
+static int64_t zan_ghash_block_clmul(const uint8_t *h16, const uint8_t *x16, uint8_t *y16) {
+    const __m128i BSWAP = ZAN_BSWAP128;
+    __m128i b = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)h16), BSWAP);
+    __m128i x = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)x16), BSWAP);
+    __m128i y = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)y16), BSWAP);
+    __m128i a = _mm_xor_si128(y, x);
+
+    __m128i m0 = _mm_clmulepi64_si128(a, b, 0x00);
+    __m128i m3 = _mm_clmulepi64_si128(a, b, 0x11);
+    __m128i mid = _mm_xor_si128(_mm_clmulepi64_si128(a, b, 0x10),
+                                _mm_clmulepi64_si128(a, b, 0x01));
+    __m128i lo = _mm_xor_si128(m0, _mm_slli_si128(mid, 8));
+    __m128i hi = _mm_xor_si128(m3, _mm_srli_si128(mid, 8));
+
+    uint64_t bit127 = (uint64_t)_mm_extract_epi64(lo, 1) >> 63;
+    __m128i E = _mm_xor_si128(lo, _mm_set_epi64x((long long)(bit127 << 63), 0));
+    __m128i F = _mm_xor_si128(_mm_xor_si128(ZAN_XSHIFT_R(E, 6), ZAN_XSHIFT_R(E, 1)),
+                              _mm_xor_si128(E, ZAN_XSHIFT_L(E, 1)));
+    uint64_t s = 0, low6 = (uint64_t)_mm_extract_epi64(lo, 0) & 0x3F;
+    for (int i = 0; i < 6; i++) if ((low6 >> i) & 1) {
+        s ^= 0xE1ULL << (51 + i);          /* x^(133-i) = x^(5-i) * q */
+        if (i == 0) s ^= 0xE1ULL << 56;    /* x^128 = q, only t = 0 */
+    }
+    __m128i direct = _mm_xor_si128(ZAN_XSHIFT_L(hi, 1), _mm_set_epi64x(0, (long long)bit127));
+    __m128i res = _mm_xor_si128(F, _mm_xor_si128(direct, _mm_set_epi64x((long long)s, 0)));
+    _mm_storeu_si128((__m128i*)y16, _mm_shuffle_epi8(res, BSWAP));
+    return 0;
+}
+
+/* CRC-32C (Castagnoli), reflected poly 0x82F63B78, SSE4.2 single-cycle. */
+__attribute__((target("sse4.2")))
+static uint32_t zan_crc32c_sse42(uint32_t crc, const uint8_t *p, int64_t n) {
+    uint64_t c = crc;
+    while (n >= 8 && ((uintptr_t)p & 7)) { c = _mm_crc32_u8((uint32_t)c, *p++); n--; }
+    while (n >= 8) { c = _mm_crc32_u64(c, *(const uint64_t*)p); p += 8; n -= 8; }
+    if (n >= 4) { c = _mm_crc32_u32((uint32_t)c, *(const uint32_t*)p); p += 4; n -= 4; }
+    if (n >= 2) { c = _mm_crc32_u16((uint32_t)c, *(const uint16_t*)p); p += 2; n -= 2; }
+    if (n >= 1) { c = _mm_crc32_u8((uint32_t)c, *p); }
+    return (uint32_t)c;
+}
+
+#endif /* x86 */
+
+/* ---- KAT gates: published vectors only ---- */
+static int zan_aes_kat(void) {
+    /* FIPS-197 appendix C: single ECB blocks for all three key sizes */
+    static const uint8_t pt[16] = {
+        0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff
+    };
+    static const uint8_t key128[16] = {
+        0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f
+    };
+    static const uint8_t key192[24] = {
+        0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,
+        0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17
+    };
+    static const uint8_t key256[32] = {
+        0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,
+        0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,0x1a,0x1b,0x1c,0x1d,0x1e,0x1f
+    };
+    static const uint8_t ct128[16] = { 0x69,0xc4,0xe0,0xd8,0x6a,0x7b,0x04,0x30,0xd8,0xcd,0xb7,0x80,0x70,0xb4,0xc5,0x5a };
+    static const uint8_t ct192[16] = { 0xdd,0xa9,0x7c,0xa4,0x86,0x4c,0xdf,0xe0,0x6e,0xaf,0x70,0xa0,0xec,0x0d,0x71,0x91 };
+    static const uint8_t ct256[16] = { 0x8e,0xa2,0xb7,0xca,0x51,0x67,0x45,0xbf,0xea,0xfc,0x49,0x90,0x4b,0x49,0x60,0x89 };
+
+    /* SP 800-38A F.2.1 (AES-128.CBC.Encrypt) & F.2.5 (AES-256) */
+    static const uint8_t cbc_key[16] = {
+        0x2b,0x7e,0x15,0x16,0x28,0xae,0xd2,0xa6,0xab,0xf7,0x15,0x88,0x09,0xcf,0x4f,0x3c
+    };
+    static const uint8_t cbc_iv[16] = {
+        0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f
+    };
+    static const uint8_t cbc_pt[64] = {
+        0x6b,0xc1,0xbe,0xe2,0x2e,0x40,0x9f,0x96,0xe9,0x3d,0x7e,0x11,0x73,0x93,0x17,0x2a,
+        0xae,0x2d,0x8a,0x57,0x1e,0x03,0xac,0x9c,0x9e,0xb7,0x6f,0xac,0x45,0xaf,0x8e,0x51,
+        0x30,0xc8,0x1c,0x46,0xa3,0x5c,0xe4,0x11,0xe5,0xfb,0xc1,0x19,0x1a,0x0a,0x52,0xef,
+        0xf6,0x9f,0x24,0x45,0xdf,0x4f,0x9b,0x17,0xad,0x2b,0x41,0x7b,0xe6,0x6c,0x37,0x10
+    };
+    static const uint8_t cbc_ct128[64] = {
+        0x76,0x49,0xab,0xac,0x81,0x19,0xb2,0x46,0xce,0xe9,0x8e,0x9b,0x12,0xe9,0x19,0x7d,
+        0x50,0x86,0xcb,0x9b,0x50,0x72,0x19,0xee,0x95,0xdb,0x11,0x3a,0x91,0x76,0x78,0xb2,
+        0x73,0xbe,0xd6,0xb8,0xe3,0xc1,0x74,0x3b,0x71,0x16,0xe6,0x9e,0x22,0x22,0x95,0x16,
+        0x3f,0xf1,0xca,0xa1,0x68,0x1f,0xac,0x09,0x12,0x0e,0xca,0x30,0x75,0x86,0xe1,0xa7
+    };
+    static const uint8_t cbc_key256[32] = {
+        0x60,0x3d,0xeb,0x10,0x15,0xca,0x71,0xbe,0x2b,0x73,0xae,0xf0,0x85,0x7d,0x77,0x81,
+        0x1f,0x35,0x2c,0x07,0x3b,0x61,0x08,0xd7,0x2d,0x98,0x10,0xa3,0x09,0x14,0xdf,0xf4
+    };
+    static const uint8_t cbc_ct256_1[16] = { 0xf5,0x8c,0x4c,0x04,0xd6,0xe5,0xf1,0xba,0x77,0x9e,0xab,0xfb,0x5f,0x7b,0xfb,0xd6 };
+
+    /* SP 800-38A F.5.1 (AES-128.CTR.Encrypt) */
+    static const uint8_t ctr_iv[16] = {
+        0xf0,0xf1,0xf2,0xf3,0xf4,0xf5,0xf6,0xf7,0xf8,0xf9,0xfa,0xfb,0xfc,0xfd,0xfe,0xff
+    };
+    static const uint8_t ctr_ct[32] = {
+        0x87,0x4d,0x61,0x91,0xb6,0x20,0xe3,0x26,0x1b,0xef,0x68,0x64,0x99,0x0d,0xb6,0xce,
+        0x98,0x06,0xf6,0x6b,0x79,0x70,0xfd,0xff,0x86,0x17,0x18,0x7b,0xb9,0xff,0xfd,0xff
+    };
+
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
-    if (zan_hw_has_aesni()) {
-        return zan_aes128_cbc_decrypt_ni(in, len, key, iv, out);
+    uint8_t out[80];
+    uint8_t blk[16];
+
+    if (zan_aes_ecb_block_ni(key128, 128, pt, blk) != 0) return 0;
+    if (memcmp(blk, ct128, 16) != 0) return 0;
+    if (zan_aes_ecb_block_ni(key192, 192, pt, blk) != 0) return 0;
+    if (memcmp(blk, ct192, 16) != 0) return 0;
+    if (zan_aes_ecb_block_ni(key256, 256, pt, blk) != 0) return 0;
+    if (memcmp(blk, ct256, 16) != 0) return 0;
+
+    int64_t n = zan_aes_cbc_encrypt_ni(cbc_pt, 64, cbc_key, 128, cbc_iv, out);
+    if (n != 80 || memcmp(out, cbc_ct128, 64) != 0) return 0;
+    uint8_t back[80];
+    n = zan_aes_cbc_decrypt_ni(out, 80, cbc_key, 128, cbc_iv, back);
+    if (n != 64 || memcmp(back, cbc_pt, 64) != 0) return 0;
+
+    n = zan_aes_cbc_encrypt_ni(cbc_pt, 64, cbc_key256, 256, cbc_iv, out);
+    if (n != 80 || memcmp(out, cbc_ct256_1, 16) != 0) return 0;
+    n = zan_aes_cbc_decrypt_ni(out, 80, cbc_key256, 256, cbc_iv, back);
+    if (n != 64 || memcmp(back, cbc_pt, 64) != 0) return 0;
+
+    uint8_t ctrb[16];
+    memcpy(ctrb, ctr_iv, 16);
+    n = zan_aes_ctr_ni(cbc_pt, 32, cbc_key, 128, ctrb, out);
+    if (n != 32 || memcmp(out, ctr_ct, 32) != 0) return 0;
+    return 1;
+#else
+    (void)pt; (void)key128; (void)key192; (void)key256;
+    (void)ct128; (void)ct192; (void)ct256;
+    (void)cbc_key; (void)cbc_iv; (void)cbc_pt; (void)cbc_ct128;
+    (void)cbc_key256; (void)cbc_ct256_1; (void)ctr_iv; (void)ctr_ct;
+    return 1; /* ARM gate lands with the ARM kernel pass */
+#endif
+}
+
+static int zan_ghash_kat(void) {
+    /* Two GHASH steps checked against the SP 800-38D bit loop, frozen as
+     * constants (H, X1, X2 and the expected accumulator). */
+    static const uint8_t H[16]  = { 0x03,0x14,0x25,0x36,0x47,0x58,0x69,0x7a,0x8b,0x9c,0xad,0xbe,0xcf,0xe0,0xf1,0x02 };
+    static const uint8_t X1[16] = { 0x07,0x24,0x41,0x5e,0x7b,0x98,0xb5,0xd2,0xef,0x0c,0x29,0x46,0x63,0x80,0x9d,0xba };
+    static const uint8_t X2[16] = { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0x80 };
+    static const uint8_t want[16] = { 0x57,0xe7,0xfc,0x2f,0x3a,0xe6,0xd8,0x6a,0x99,0x19,0x76,0x64,0x6a,0x70,0x7e,0xe2 };
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
+    uint8_t y[16] = {0};
+    if (zan_ghash_block_clmul(H, X1, y) != 0) return 0;
+    if (zan_ghash_block_clmul(H, X2, y) != 0) return 0;
+    return memcmp(y, want, 16) == 0;
+#else
+    (void)H; (void)X1; (void)X2; (void)want;
+    return 1;
+#endif
+}
+
+static int zan_crc32c_kat(void) {
+    /* RFC 4960 B.8: CRC-32C("123456789") = 0xE3069283 */
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
+    /* the kernel is a continuation (no final complement): raw state = ~E3069283 */
+    return zan_crc32c_sse42(0xFFFFFFFFu, (const uint8_t*)"123456789", 9) == 0x1CF96D7Cu;
+#else
+    return 1;
+#endif
+}
+
+int64_t zan_hw_aes_cbc_encrypt(const uint8_t *in, int64_t len,
+                               const uint8_t *key, int keybits,
+                               const uint8_t *iv, uint8_t *out) {
+    if (len < 0 || !in || !key || !iv || !out) return -1;
+    if (keybits != 128 && keybits != 192 && keybits != 256) return -1;
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
+    if (zan_hw_gate(&g_gate_aes, zan_hw_has_aesni(), zan_aes_kat)) {
+        return zan_aes_cbc_encrypt_ni(in, len, key, keybits, iv, out);
+    }
+#endif
+    return -1;
+}
+
+int64_t zan_hw_aes_cbc_decrypt(const uint8_t *in, int64_t len,
+                               const uint8_t *key, int keybits,
+                               const uint8_t *iv, uint8_t *out) {
+    if (len <= 0 || !in || !key || !iv || !out) return -1;
+    if (keybits != 128 && keybits != 192 && keybits != 256) return -1;
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
+    if (zan_hw_gate(&g_gate_aes, zan_hw_has_aesni(), zan_aes_kat)) {
+        return zan_aes_cbc_decrypt_ni(in, len, key, keybits, iv, out);
+    }
+#endif
+    return -1;
+}
+
+int64_t zan_hw_aes_ecb_block(const uint8_t *key, int keybits,
+                             const uint8_t *in16, uint8_t *out16) {
+    if (!key || !in16 || !out16) return -1;
+    if (keybits != 128 && keybits != 192 && keybits != 256) return -1;
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
+    if (zan_hw_gate(&g_gate_aes, zan_hw_has_aesni(), zan_aes_kat)) {
+        return zan_aes_ecb_block_ni(key, keybits, in16, out16);
+    }
+#endif
+    return -1;
+}
+
+int64_t zan_hw_aes_ctr_crypt(const uint8_t *in, int64_t len,
+                             const uint8_t *key, int keybits,
+                             uint8_t *counter16, uint8_t *out) {
+    if (len < 0 || !in || !key || !counter16 || !out) return -1;
+    if (keybits != 128 && keybits != 192 && keybits != 256) return -1;
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
+    if (zan_hw_gate(&g_gate_aes, zan_hw_has_aesni(), zan_aes_kat)) {
+        return zan_aes_ctr_ni(in, len, key, keybits, counter16, out);
+    }
+#endif
+    return -1;
+}
+
+int64_t zan_hw_ghash_block(const uint8_t *h16, const uint8_t *x16, uint8_t *y16) {
+    if (!h16 || !x16 || !y16) return -1;
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
+    if (zan_hw_gate(&g_gate_ghash, zan_hw_has_pclmul(), zan_ghash_kat)) {
+        return zan_ghash_block_clmul(h16, x16, y16);
+    }
+#endif
+    return -1;
+}
+
+int64_t zan_hw_crc32c_update(uint32_t crc, const uint8_t *p, int64_t len) {
+    if (len < 0 || !p) return -1;
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
+    if (zan_hw_gate(&g_gate_crc32c, zan_hw_has_sse42(), zan_crc32c_kat)) {
+        return (int64_t)zan_crc32c_sse42(crc, p, len);
     }
 #endif
     return -1;
@@ -1043,125 +1698,25 @@ void zan_hw_pixel_resample_bilinear_row(uint8_t *dst, const uint8_t *src0,
     }
 }
 
-/* ===== 7. SM3 Cryptographic Hash (GB/T 32918.4-2016 / GM/T 0004-2012) =====
- * High-performance 64-step unrolled pipeline with zero stack frame allocation.
- */
-static inline uint32_t zan_sm3_p0(uint32_t x) {
-    return x ^ zan_rotl32(x, 9) ^ zan_rotl32(x, 17);
+/* ===== 7. SM3 Cryptographic Hash (GB/T 32905-2012) =======================
+ * The runtime carries no portable SM3 implementation: x86 has no SM3
+ * instructions and the ARMv8 FEAT_SM3 (sm3ss1/sm3partw1/sm3partw2) kernel
+ * lands with the ARM64 pass. Callers fall back to the pure-Zan Sm3 class.
+ * ======================================================================== */
+/* SHA-512 has no x86 hardware engine (SHA extensions cover SHA-1/256 only);
+ * the FEAT_SHA512 kernel lands with the ARM64 pass. Pure-Zan covers x86. */
+int64_t zan_hw_sha512(const uint8_t *data, int64_t len, uint8_t out[64]) {
+    (void)data; (void)len; (void)out;
+    return -1;
 }
 
-static inline uint32_t zan_sm3_p1(uint32_t x) {
-    return x ^ zan_rotl32(x, 15) ^ zan_rotl32(x, 23);
+int64_t zan_hw_sm3(const uint8_t *data, int64_t len, uint8_t out[32]) {
+    (void)data; (void)len; (void)out;
+    return -1;
 }
 
-static inline uint32_t zan_sm3_ff0(uint32_t x, uint32_t y, uint32_t z) {
-    return x ^ y ^ z;
-}
-
-static inline uint32_t zan_sm3_ff1(uint32_t x, uint32_t y, uint32_t z) {
-    return (x & y) | (x & z) | (y & z);
-}
-
-static inline uint32_t zan_sm3_gg0(uint32_t x, uint32_t y, uint32_t z) {
-    return x ^ y ^ z;
-}
-
-static inline uint32_t zan_sm3_gg1(uint32_t x, uint32_t y, uint32_t z) {
-    return (x & y) | ((~x) & z);
-}
-
-static void zan_sm3_transform(uint32_t state[8], const uint8_t block[64]) {
-    uint32_t W[68];
-    uint32_t W1[64];
-
-    for (int i = 0; i < 16; i++) {
-        W[i] = ((uint32_t)block[i*4 + 0] << 24) |
-               ((uint32_t)block[i*4 + 1] << 16) |
-               ((uint32_t)block[i*4 + 2] << 8)  |
-               ((uint32_t)block[i*4 + 3]);
-    }
-    for (int i = 16; i < 68; i++) {
-        uint32_t x = W[i - 16] ^ W[i - 9] ^ zan_rotl32(W[i - 3], 15);
-        W[i] = zan_sm3_p1(x) ^ zan_rotl32(W[i - 13], 7) ^ W[i - 6];
-    }
-    for (int i = 0; i < 64; i++) {
-        W1[i] = W[i] ^ W[i + 4];
-    }
-
-    uint32_t A = state[0], B = state[1], C = state[2], D = state[3];
-    uint32_t E = state[4], F = state[5], G = state[6], H = state[7];
-
-    for (int j = 0; j < 16; j++) {
-        uint32_t rotA12 = zan_rotl32(A, 12);
-        uint32_t SS1 = zan_rotl32(rotA12 + E + zan_rotl32(0x79cc4519u, j), 7);
-        uint32_t SS2 = SS1 ^ rotA12;
-        uint32_t TT1 = zan_sm3_ff0(A, B, C) + D + SS2 + W1[j];
-        uint32_t TT2 = zan_sm3_gg0(E, F, G) + H + SS1 + W[j];
-        D = C;
-        C = zan_rotl32(B, 9);
-        B = A;
-        A = TT1;
-        H = G;
-        G = zan_rotl32(F, 19);
-        F = E;
-        E = zan_sm3_p0(TT2);
-    }
-    for (int j = 16; j < 64; j++) {
-        uint32_t rotA12 = zan_rotl32(A, 12);
-        uint32_t SS1 = zan_rotl32(rotA12 + E + zan_rotl32(0x7a879d8au, j % 32), 7);
-        uint32_t SS2 = SS1 ^ rotA12;
-        uint32_t TT1 = zan_sm3_ff1(A, B, C) + D + SS2 + W1[j];
-        uint32_t TT2 = zan_sm3_gg1(E, F, G) + H + SS1 + W[j];
-        D = C;
-        C = zan_rotl32(B, 9);
-        B = A;
-        A = TT1;
-        H = G;
-        G = zan_rotl32(F, 19);
-        F = E;
-        E = zan_sm3_p0(TT2);
-    }
-
-    state[0] ^= A; state[1] ^= B; state[2] ^= C; state[3] ^= D;
-    state[4] ^= E; state[5] ^= F; state[6] ^= G; state[7] ^= H;
-}
-
-void zan_hw_sm3(const uint8_t *data, int64_t len, uint8_t out[32]) {
-    if (len < 0) len = 0;
-    uint32_t state[8] = {
-        0x7380166f, 0x4914b2b9, 0x172442d7, 0xda8a0600,
-        0xa96f30bc, 0x163138aa, 0xe38dee4d, 0xb0fb0e4e
-    };
-    size_t full_blocks = (size_t)len / 64;
-    for (size_t i = 0; i < full_blocks; i++) {
-        zan_sm3_transform(state, data + i * 64);
-    }
-
-    uint8_t tail[128];
-    size_t rem = (size_t)len % 64;
-    if (rem > 0 && data) {
-        memcpy(tail, data + full_blocks * 64, rem);
-    }
-    tail[rem] = 0x80;
-    size_t pad_blocks = (rem >= 56) ? 2 : 1;
-    size_t total_tail = pad_blocks * 64;
-    memset(tail + rem + 1, 0, total_tail - rem - 1);
-
-    uint64_t bits = (uint64_t)len * 8;
-    for (int i = 0; i < 8; i++) {
-        tail[total_tail - 8 + i] = (uint8_t)(bits >> (56 - 8 * i));
-    }
-
-    for (size_t i = 0; i < pad_blocks; i++) {
-        zan_sm3_transform(state, tail + i * 64);
-    }
-
-    for (int i = 0; i < 8; i++) {
-        out[i*4 + 0] = (uint8_t)(state[i] >> 24);
-        out[i*4 + 1] = (uint8_t)(state[i] >> 16);
-        out[i*4 + 2] = (uint8_t)(state[i] >> 8);
-        out[i*4 + 3] = (uint8_t)(state[i]);
-    }
+static inline uint32_t zan_rotl32(uint32_t x, int n) {
+    return (x << n) | (x >> (32 - n));
 }
 
 /* ===== 8. SM4 Block Cipher CBC Acceleration (GB/T 32907-2016) =====

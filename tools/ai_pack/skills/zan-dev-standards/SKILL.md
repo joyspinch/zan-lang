@@ -230,11 +230,13 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
 - **Windows 控制台命令的 subprocess 捕获别用 `text=True`**：tasklist
   这类工具按系统码页（GBK）输出，UTF-8 reader 直接 UnicodeDecodeError
   崩线程；拿 bytes 自己按 `errors="replace"` 解码。
-- **客户端程序链接报 `cannot find -lssl/-lcrypto`**：普通链接（非
-  `--publish`）要求 TLS 导入库在搜索路径可达，报错不提示解法——设
-  `ZAN_LIB_PATH` 指向 stdlib 的 System/Security/Cryptography/drivers/
-  <plat>/（win 用 `;` 分隔，见 ZANC_CLI.md env 表）；运行期还要把
-  libssl-3-x64.dll/libcrypto-3-x64.dll 摆到 exe 旁。
+- **TLS（libssl/libcrypto）已无随库驱动**：stdlib 曾带的
+  System/Security/Cryptography/drivers/ 目录已随 OpenSSL 驱动下线而删除，
+  老资料"设 `ZAN_LIB_PATH` 指向该目录"的做法失效。`ZAN_LIB_PATH` 机制
+  本身仍在（任意放导入库的目录，win 用 `;` 分隔，见 ZANC_CLI.md env 表）：
+  需要真 TLS 时指向自备 OpenSSL 导入库目录，运行期把对应 DLL 摆到 exe 旁；
+  Windows 下只携带不触发 TLS 的程序可直接链接——不可解析的非系统库会被
+  自动桩化（调用时才报错），不再链接期失败。
 
 ## 四、经验沉淀纪律（skill 的准入标准）
 

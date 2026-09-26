@@ -52,8 +52,49 @@ class AesGcm {
         return gfmul(x, H);
     }
 
+    /// GHASH 硬件快路径（PCLMUL/PMULL 单步内核 y=(y^x)*h）：AAD 块、密文块
+    /// 再接长度块逐块累乘。任一步报告无硬件即返回 null，由调用方整体落回
+    /// 纯 Zan 位循环——不混用两条路径的中间状态。
+    static List<long> hwGhash(List<long> H, string aad, int aadLen, string data, int dataLen) {
+        byte[] hBlk = new byte[16];
+        store64(hBlk, 0, H[0]);
+        store64(hBlk, 8, H[1]);
+        string hStr = hBlk;
+        byte[] yb = new byte[16];
+        byte[] xb = new byte[16];
+        string yStr = yb;
+        string xStr = xb;
+        int p = 0;
+        while (p < aadLen) {
+            int avail = aadLen - p; if (avail > 16) { avail = 16; }
+            for (int i = 0; i < 16; i = i + 1) {
+                if (i < avail) { xb[i] = (byte)(aad[p + i] & 255); } else { xb[i] = 0; }
+            }
+            if (NativeMemory.GhashBlock(hStr, xStr, yStr) != 0) { return null; }
+            p = p + 16;
+        }
+        p = 0;
+        while (p < dataLen) {
+            int avail = dataLen - p; if (avail > 16) { avail = 16; }
+            for (int i = 0; i < 16; i = i + 1) {
+                if (i < avail) { xb[i] = (byte)(data[p + i] & 255); } else { xb[i] = 0; }
+            }
+            if (NativeMemory.GhashBlock(hStr, xStr, yStr) != 0) { return null; }
+            p = p + 16;
+        }
+        // 长度块：[aadBits(64) | dataBits(64)]
+        store64(xb, 0, (long)aadLen * 8);
+        store64(xb, 8, (long)dataLen * 8);
+        if (NativeMemory.GhashBlock(hStr, xStr, yStr) != 0) { return null; }
+        List<long> r = new List<long>(); r.Add(load64(yStr, 0)); r.Add(load64(yStr, 8));
+        return r;
+    }
+
     /// GHASH：AAD 块、密文块再接长度块，在 GF(2^128) 上逐块累乘 H。
     static List<long> ghash(List<long> H, string aad, int aadLen, string data, int dataLen) {
+        List<long> hw = hwGhash(H, aad, aadLen, data, dataLen);
+        if (hw != null) { return hw; }
+
         List<long> Y = new List<long>(); Y.Add(0); Y.Add(0);
         int p = 0;
         while (p < aadLen) {
@@ -92,17 +133,27 @@ class AesGcm {
 
     /// GCTR：由 AES(counter) 生成密钥流，与数据异或（原地写入 out）
     static void gctr(string key, int keyLen, string ctr, string data, int dataLen, byte[] outb) {
-        byte[] cnt = new byte[16];
-        for (int i = 0; i < 16; i = i + 1) { cnt[i] = (byte)(ctr[i] & 255); }
+        /* 硬件快路径：整段 keystream 异或一次完成，计数器在副本上原地
+           前进。无硬件（-1）落回下方纯 Zan 逐块循环。 */
+        if (dataLen > 0) {
+            byte[] cnt = new byte[16];
+            for (int i = 0; i < 16; i = i + 1) { cnt[i] = (byte)(ctr[i] & 255); }
+            string cntStr = cnt;
+            long got = NativeMemory.AesCtrCrypt(outb, data, (long)dataLen, key, keyLen, cntStr);
+            if (got >= 0) { return; }
+        }
+
+        byte[] cnt2 = new byte[16];
+        for (int i = 0; i < 16; i = i + 1) { cnt2[i] = (byte)(ctr[i] & 255); }
         int p = 0;
         while (p < dataLen) {
-            string cntStr = cnt;
+            string cntStr = cnt2;
             byte[] ks = Aes.EncryptBlockEcb(key, keyLen, cntStr);
             int avail = dataLen - p; if (avail > 16) { avail = 16; }
             for (int j = 0; j < avail; j = j + 1) {
                 outb[p + j] = (byte)((data[p + j] & 255) ^ (ks[j] & 255));
             }
-            inc32(cnt);
+            inc32(cnt2);
             p = p + 16;
         }
     }

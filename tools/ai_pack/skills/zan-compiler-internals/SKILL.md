@@ -2025,3 +2025,47 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   4. **单周期掩码抽取**：比对发射 `vpcmpeqb`，掩码提取调用 `llvm.x86.avx2.pmovmskb` 直出 32 位通用寄存器掩码，32 字节单周期步长扫描吞吐突破 2.77 GB/s。
 - **内建方法名匹配陷阱**：在 `irgen_expr.c` 进行方法名长度比对时，`ExtractMostSignificantBits` 字符数严格为 26（非 27），长度计算偏差会导致内建短路失败回退至未解析外部符号。
 
+## 硬件加速纵切：运行时只通能力、纯 Zan 承载实现（2026-09-26）
+
+- **架构定式（用户明确否决便携 C 参考实现）**：算法实现全部住在 stdlib
+  纯 Zan（带回退分支），runtime 只放三样——CPU 特性检测、薄 hw 内核、
+  KAT 门控。每个内核 tri-state：1=KAT 过 / 0=未评估 / -1=禁用或平台无
+  引擎。stdlib 侧 hw 调用一律先收状态码，<0 落回纯 Zan 循环——**平台
+  没有的引擎必须诚实返回 -1**（x86 无 SHA-512 引擎就 stub -1），返回
+  垃圾 = 静默数据损坏。ZAN_NO_HWACCEL=1 环境变量强制全软件派发，是
+  双路径等价验证的开关：hw / 纯 / leakcheck 三路径结果必须逐字节相同。
+- **新内建家族落地四件套，缺一即断链**：① stdlib 声明（checker 用它
+  定型，可空语义写在文档注释）；② irgen emission（is_call_to 按名
+  拦截降阶）；③ expr_yields_owned_rc_value 白名单（返回 string 的
+  内建不登记 = A262/A264 复刻，消费点各泄一条）；④ builtin_api.c
+  成员表（只喂 LSP 悬停/补全，漏了不报错但 IDE 显示缺员）。①有②无
+  = 链接期 undefined symbol；②有①无 = checker 拒绝调用。
+- **可空 digest 发射定式（emit_nm_digest）**：alloca 暂存 → 内核调用
+  → 按 KAT 状态分支 → 成功臂 emit_string_alloc_rc+memcpy+盖长度戳 /
+  失败臂 LLVM null → phi 合流。**alloca 必须留在当前插入位置，禁止
+  挪到 entry block**：entry 可能已被更早的 `if (..) return ..` 发射
+  放好 terminator，把 builder 挪回去再插指令 = LLVM 验证炸
+  "Basic Block does not have terminator! label %entry"；每次调用
+  20–64 字节的栈 alloca 开销可忽略，不值得冒险。null 结果安全性依赖
+  编译器发射的 zan_rt_release 先判 null（字符串是裸 LLVM 指针，
+  null=none），可空串正常释放。
+- **数值形参宽度假人**：nm_arg 类发射返回 i64（sext 过），内核形参
+  声明 i32 的（如 AES keybits）必须 coerce_int_to 收窄，直接传 = 类型
+  不匹配。
+- **byte[]→string 视图长度 = 元素计数，不是 strlen（A-HW4 已修）**：
+  零拷贝 str/byte 缓冲契约下，site 字带 ZAN_ARRAY_MAGIC 的"字符串"
+  诚实长度是 -16 计数字。emit_string_len_ex 有 array_count 形参，
+  **所有调用点都要给 1**——旧代码 bounds 检查已经用 1 而 .Length 还
+  用 0，两条路不一致正是 bug 藏身处：strlen 在首个 NUL 截断，十六
+  进制摘要（必然含 0x00 字节）恰好丢尾部。裸 FFI char* 无魔数，仍按
+  strlen 度量（正确的借用语义）。conformance：string_view_length。
+- **KAT 门控用公开常量向量，常量按 API 语义换算**：FIPS-197 C.1
+  （ECB）、SP800-38A F.2.1（CBC）/F.5.1（CTR）、FIPS 180-4
+  （SHA 族）、GB/T 32905（SM3）、RFC 4960（CRC32C）。CRC32C 的
+  更新函数是 continuation 语义（入参预反转、返回末反转），KAT 常量
+  必须按这个语义换算——拿标准表值直接取反手算，符号位一错就写成
+  0x1CF9637C 而正确是 0x1CF96D7C，且 KAT 永不通过时才暴露。
+- **逐步 KAT 才能抓域混用**：GHASH 的 x 块 BSWAP 进寄存器域而 y 累
+  加器裸加载，域混用只在 y≠0 的第二步起污染——y=0 的首块自我测试
+  掩住它。换装/仿写 SIMD 内核时，KAT 必须覆盖"累加器非零"的后续步，
+  单块自测不算通过。

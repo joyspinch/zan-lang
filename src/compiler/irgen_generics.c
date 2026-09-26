@@ -462,7 +462,9 @@ static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
             return 1;
         if (is_call_to(e, "NativeMemory", "Sha256") && e->call.args.count == 2)
             return 1;
-        if (is_call_to(e, "NativeMemory", "Md5") && e->call.args.count == 2)
+        if (is_call_to(e, "NativeMemory", "Sha1") && e->call.args.count == 2)
+            return 1;
+        if (is_call_to(e, "NativeMemory", "Sha512") && e->call.args.count == 2)
             return 1;
         if (is_call_to(e, "NativeMemory", "Sm3") && e->call.args.count == 2)
             return 1;

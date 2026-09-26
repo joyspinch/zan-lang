@@ -16,18 +16,29 @@ int zan_hw_has_avx2(void);
 int zan_hw_has_aesni(void);
 int zan_hw_has_neon(void);
 int zan_hw_has_shani(void);
+int zan_hw_has_pclmul(void);
 int zan_cpu_feature(int id);
 
-/* SHA-256 hardware accelerated / zero-stack-overflow streaming */
-void zan_hw_sha256(const uint8_t *data, int64_t len, uint8_t out[32]);
+/* Per-primitive known-answer-test gate state (conformance can assert that a
+ * present feature actually passed its KAT instead of silently degrading):
+ *   1 = KAT passed (hardware path live), 0 = not yet evaluated,
+ *  -1 = feature absent or KAT failed (hardware path disabled).
+ * Ids match zan_cpu_feature. */
+int zan_hw_kat_state(int id);
 
-/* MD5 high-performance unrolled streaming */
-void zan_hw_md5(const uint8_t *data, int64_t len, uint8_t out[16]);
+/* ---------------------------------------------------------------------
+ * Digest kernels. Each returns 0 and fills `out` on success, or -1 when
+ * no hardware path is available (the caller falls back to the pure-Zan
+ * implementation). No portable C implementation lives in the runtime.
+ * --------------------------------------------------------------------- */
+int64_t zan_hw_sha256(const uint8_t *data, int64_t len, uint8_t out[32]);
+int64_t zan_hw_sha1(const uint8_t *data, int64_t len, uint8_t out[20]);
+int64_t zan_hw_sha512(const uint8_t *data, int64_t len, uint8_t out[64]);
+int64_t zan_hw_sm3(const uint8_t *data, int64_t len, uint8_t out[32]);
 
-/* SM3 high-performance unrolled streaming (GB/T 32918.4-2016 / GM/T 0004-2012) */
-void zan_hw_sm3(const uint8_t *data, int64_t len, uint8_t out[32]);
-
-/* SM4 Block Cipher CBC mode with PKCS#7 padding (GB/T 32907-2016) */
+/* SM4 Block Cipher CBC mode with PKCS#7 padding (GB/T 32907-2016).
+ * Returns produced/plaintext length or -1. On ARM with FEAT_SM4 this is the
+ * sm4e instruction pipeline; elsewhere the maintained table driver. */
 int64_t zan_hw_sm4_cbc_encrypt(const uint8_t *in, int64_t len,
                                const uint8_t *key, const uint8_t *iv,
                                uint8_t *out);
@@ -35,13 +46,32 @@ int64_t zan_hw_sm4_cbc_decrypt(const uint8_t *in, int64_t len,
                                const uint8_t *key, const uint8_t *iv,
                                uint8_t *out);
 
-/* AES-128 CBC hardware accelerated */
-int64_t zan_hw_aes128_cbc_encrypt(const uint8_t *in, int64_t len,
-                                  const uint8_t *key, const uint8_t *iv,
-                                  uint8_t *out);
-int64_t zan_hw_aes128_cbc_decrypt(const uint8_t *in, int64_t len,
-                                  const uint8_t *key, const uint8_t *iv,
-                                  uint8_t *out);
+/* AES (FIPS-197) with 128/192/256-bit keys. CBC applies PKCS#7 padding and
+ * returns the produced/plaintext length (-1 on refusal). Every path is a
+ * thin hardware kernel (AES-NI on x86, FEAT_AES on ARM); the pure-Zan
+ * implementation in the stdlib is the software fallback. */
+int64_t zan_hw_aes_cbc_encrypt(const uint8_t *in, int64_t len,
+                               const uint8_t *key, int keybits,
+                               const uint8_t *iv, uint8_t *out);
+int64_t zan_hw_aes_cbc_decrypt(const uint8_t *in, int64_t len,
+                               const uint8_t *key, int keybits,
+                               const uint8_t *iv, uint8_t *out);
+/* Single-block ECB: 16 bytes in -> 16 bytes out. 0 or -1. */
+int64_t zan_hw_aes_ecb_block(const uint8_t *key, int keybits,
+                             const uint8_t *in16, uint8_t *out16);
+/* CTR keystream XOR over len bytes; counter16 is the 128-bit big-endian
+ * counter, advanced in place past the consumed blocks. Returns len or -1. */
+int64_t zan_hw_aes_ctr_crypt(const uint8_t *in, int64_t len,
+                             const uint8_t *key, int keybits,
+                             uint8_t *counter16, uint8_t *out);
+/* GHASH universal hash step (GCM, NIST SP 800-38D): y = (y ^ x) * h in
+ * GF(2^128). All three point at 16-byte blocks. 0 or -1. */
+int64_t zan_hw_ghash_block(const uint8_t *h16, const uint8_t *x16, uint8_t *y16);
+
+/* CRC-32C (Castagnoli, poly 0x82F63B78) continuation: returns the updated
+ * CRC of `crc` extended with len bytes at p, or -1 when no hardware path
+ * exists (SSE4.2 crc32 / ARMv8 CRC instructions). */
+int64_t zan_hw_crc32c_update(uint32_t crc, const uint8_t *p, int64_t len);
 
 /* Vector128 / AES-NI single-cycle primitive helpers */
 void zan_hw_aes_encrypt(const void *val, const void *key, void *out);
