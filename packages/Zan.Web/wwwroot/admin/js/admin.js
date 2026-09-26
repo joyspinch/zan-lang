@@ -1,8 +1,47 @@
 let currentView = 'dashboard';
 
+async function getToken() {
+  let token = localStorage.getItem('zan_token');
+  if (token) return token;
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'username=admin&password=123456'
+    });
+    const d = await res.json();
+    if (d && d.data && d.data.AccessToken) {
+      token = d.data.AccessToken;
+      localStorage.setItem('zan_token', token);
+      return token;
+    }
+  } catch (err) {
+    console.error('Auto login failed:', err);
+  }
+  return null;
+}
+
+async function apiFetch(url, options = {}) {
+  const token = await getToken();
+  options.headers = options.headers || {};
+  if (token) {
+    options.headers['Authorization'] = 'Bearer ' + token;
+  }
+  let res = await fetch(url, options);
+  if (res.status === 401) {
+    localStorage.removeItem('zan_token');
+    const newToken = await getToken();
+    if (newToken) {
+      options.headers['Authorization'] = 'Bearer ' + newToken;
+      res = await fetch(url, options);
+    }
+  }
+  return res;
+}
+
 async function fetchStats() {
   try {
-    const res = await fetch('/api/monitor/stat/summary');
+    const res = await apiFetch('/api/monitor/stat/summary');
     const data = (await res.json()).data || {};
     document.getElementById('stReq').innerText = data.totalRequests ?? 0;
     document.getElementById('stAvg').innerText = (data.avgLatencyMs ?? 0) + ' ms';
@@ -29,7 +68,7 @@ async function loadView(name, event) {
     title.innerText = '服务运行指标与慢SQL监控';
     tableTitle.innerText = '慢 SQL 追踪记录 (耗时 > 200ms)';
     try {
-      const res = await fetch('/api/monitor/stat/slowsql');
+      const res = await apiFetch('/api/monitor/stat/slowsql');
       const list = (await res.json()).data || [];
       if (!list || list.length === 0) {
         box.innerHTML = '<p style="color:#64748b;padding:20px 0;">暂无慢 SQL 记录，服务运行健康稳定。</p>';
@@ -51,7 +90,7 @@ async function loadView(name, event) {
     title.innerText = '组织用户体系管理';
     tableTitle.innerText = '系统用户列表';
     try {
-      const res = await fetch('/api/system/user/page?page=1&pageSize=20');
+      const res = await apiFetch('/api/system/user/page?page=1&pageSize=20');
       const data = (await res.json()).data || {};
       const list = data.records || [];
       let html = '<table><thead><tr><th>ID</th><th>用户名</th><th>昵称</th><th>归属部门</th><th>所属角色</th><th>手机号</th><th>状态</th></tr></thead><tbody>';
@@ -77,7 +116,7 @@ async function loadView(name, event) {
     title.innerText = '组织架构与部门管理';
     tableTitle.innerText = '系统部门架构列表';
     try {
-      const res = await fetch('/api/system/dept/all');
+      const res = await apiFetch('/api/system/dept/all');
       const list = (await res.json()).data || [];
       let html = '<table><thead><tr><th>ID</th><th>部门名称</th><th>部门编码</th><th>上级部门ID</th><th>排序号</th><th>状态</th></tr></thead><tbody>';
       list.forEach(d => {
@@ -101,7 +140,7 @@ async function loadView(name, event) {
     title.innerText = '角色与权限矩阵';
     tableTitle.innerText = '系统角色列表';
     try {
-      const res = await fetch('/api/system/role/all');
+      const res = await apiFetch('/api/system/role/all');
       const list = (await res.json()).data || [];
       let html = '<table><thead><tr><th>ID</th><th>角色名称</th><th>角色说明</th><th>状态</th></tr></thead><tbody>';
       list.forEach(r => {
@@ -119,11 +158,86 @@ async function loadView(name, event) {
     } catch (e) {
       box.innerHTML = '<p style="color:#dc2626;padding:20px 0;">加载角色列表失败</p>';
     }
+  } else if (name === 'jobs') {
+    title.innerText = '定时调度与任务中心';
+    tableTitle.innerText = '系统定时任务清单';
+    try {
+      const res = await apiFetch('/api/system/job/page?page=1&pageSize=20');
+      const data = (await res.json()).data || {};
+      const list = data.records || [];
+      if (!list || list.length === 0) {
+        box.innerHTML = '<p style="color:#64748b;padding:20px 0;">当前暂无已登记的定时任务。</p>';
+        return;
+      }
+      let html = '<table><thead><tr><th>ID</th><th>任务名称</th><th>分组</th><th>Cron 表达式</th><th>执行目标</th><th>状态</th><th style="width:160px;">操作</th></tr></thead><tbody>';
+      list.forEach(j => {
+        const statusBadge = j.status === 1
+          ? '<span class="badge badge-success">运行中</span>'
+          : '<span class="badge">已暂停</span>';
+        html += `<tr>
+          <td>${j.id}</td>
+          <td><strong>${escapeHtml(j.name)}</strong></td>
+          <td>${escapeHtml(j.groupName || 'DEFAULT')}</td>
+          <td class="code-cell">${escapeHtml(j.cron)}</td>
+          <td style="font-size:12px;color:#64748b;font-family:monospace;">${escapeHtml(j.invokeTarget)}</td>
+          <td>${statusBadge}</td>
+          <td>
+            <button class="btn btn-primary" style="padding:4px 8px;font-size:12px;" onclick="runJob(${j.id})">触发</button>
+            <button class="btn" style="padding:4px 8px;font-size:12px;margin-left:4px;" onclick="toggleJob(${j.id})">切换</button>
+          </td>
+        </tr>`;
+      });
+      box.innerHTML = html + '</tbody></table>';
+
+      window.runJob = async function(id) {
+        await apiFetch('/api/system/job/run', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'id=' + id });
+        alert('已发送执行指令');
+      };
+      window.toggleJob = async function(id) {
+        await apiFetch('/api/system/job/toggle', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'id=' + id });
+        loadView('jobs');
+      };
+    } catch (e) {
+      box.innerHTML = '<p style="color:#dc2626;padding:20px 0;">加载定时任务失败</p>';
+    }
+  } else if (name === 'media') {
+    title.innerText = '媒体库与资源存储';
+    tableTitle.innerText = '已上传媒体文件清单';
+    try {
+      const res = await apiFetch('/api/system/media/page?page=1&pageSize=20');
+      const data = (await res.json()).data || {};
+      const list = data.records || [];
+      if (!list || list.length === 0) {
+        box.innerHTML = '<p style="color:#64748b;padding:20px 0;">暂无已上传的媒体资源文件。</p>';
+        return;
+      }
+      let html = '<table><thead><tr><th>ID</th><th>文件原始名</th><th>存储路径</th><th>类型</th><th>大小</th><th>上传时间</th><th style="width:90px;">操作</th></tr></thead><tbody>';
+      list.forEach(m => {
+        html += `<tr>
+          <td>${m.id}</td>
+          <td><strong>${escapeHtml(m.originalName)}</strong></td>
+          <td class="code-cell">${escapeHtml(m.path)}</td>
+          <td><span class="badge">${escapeHtml(m.extension)}</span></td>
+          <td>${(m.size / 1024).toFixed(1)} KB</td>
+          <td>${new Date(m.createdAt * 1000).toLocaleString()}</td>
+          <td><button class="btn" style="padding:4px 8px;font-size:12px;color:#dc2626;" onclick="deleteMedia(${m.id})">删除</button></td>
+        </tr>`;
+      });
+      box.innerHTML = html + '</tbody></table>';
+
+      window.deleteMedia = async function(id) {
+        if (!confirm('确定删除该资源？')) return;
+        await apiFetch('/api/system/media/delete', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'id=' + id });
+        loadView('media');
+      };
+    } catch (e) {
+      box.innerHTML = '<p style="color:#dc2626;padding:20px 0;">加载媒体库失败</p>';
+    }
   } else if (name === 'docs') {
     title.innerText = '接口文档与 OpenAPI 规范';
     tableTitle.innerText = '已注册 API 端点清单 (自动反射自 [Route] / [HttpGet] / [HttpPost])';
     try {
-      const res = await fetch('/api/system/docs/page');
+      const res = await apiFetch('/api/system/docs/page');
       const data = (await res.json()).data || {};
       const list = data.records || [];
       let html = `
@@ -207,7 +321,7 @@ async function loadView(name, event) {
       if (!table) { alert('请输入表名'); return; }
       prev.innerHTML = '<p style="color:#64748b;">正在解析表结构并生成代码...</p>';
       try {
-        const res = await fetch('/api/dev/curd/generate?table=' + encodeURIComponent(table));
+        const res = await apiFetch('/api/dev/curd/generate?table=' + encodeURIComponent(table));
         const resJson = await res.json();
         if (resJson.code !== 0) {
           prev.innerHTML = `<p style="color:#dc2626;">生成失败: ${escapeHtml(resJson.msg)}</p>`;
