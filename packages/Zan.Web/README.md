@@ -82,12 +82,13 @@ packages/Zan.Web/
                 │   │   ├── SysDictItemDao.zan
                 │   │   ├── SysConfigDao.zan
                 │   │   └── SysLogDao.zan
-                │   ├── Service/           # 认证与路由业务服务
-                │   │   ├── LoginUser.zan
-                │   │   ├── TokenService.zan
-                │   │   ├── RouteNode.zan
-                │   │   └── AuthManager.zan
-                │   └── Controller/        # 系统管理接口控制器
+	                │   ├── Service/           # 认证与路由业务服务
+	                │   │   ├── LoginUser.zan
+	                │   │   ├── TokenService.zan
+	                │   │   ├── RouteNode.zan
+	                │   │   ├── AuthManager.zan
+	                │   │   └── SysMenuSync.zan    # 路由特性驱动的动态菜单同步器与构建器
+	                │   └── Controller/        # 系统管理接口控制器（统配 Conf() 元数据对接 ZanTable）
                 │       ├── AuthController.zan
                 │       ├── SysUserController.zan
                 │       ├── SysDeptController.zan
@@ -135,4 +136,10 @@ class Program {
 - **用户名**：`admin`
 - **初始密码**：`123456`
 - **默认组织**：总公司 (HQ)
+
+内置管理页面与 SPA 挂载：
+- **即开即用 Admin 控制台**：浏览器访问 `http://localhost:8080/admin` 即可查看服务运行看板与数据管理。
+- **对接 adminUI 静态资源**：通过 `WebBoot.MountAdmin("dist")` 挂载 Vue 3 管理工程。
+- **纯配置驱动菜单与表格**：所有控制器通过 `[Custom(IsMenu = true)]` 与 `[Description]` 自动生成路由菜单，通过 `Conf()` 接口向 `<ZanTable>` 输出完整 `TableConfig` 列声明与搜索项，无需手写页面与 SQL。
+
 

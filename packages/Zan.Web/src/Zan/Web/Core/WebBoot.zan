@@ -15,13 +15,27 @@ public delegate void WebRouteFn(WebApp app);
 /// Zan.Web 统一引导与宿主启动器：开箱即用集成 CORS、全链路指标打点、RBAC 网关与系统数据播种
 class WebBoot {
     private static WebRouteFn _routes;
+    private static WebApp _app;
     private static bool _corsEnabled = true;
     private static string _corsOrigin = "*";
     private static int _slowThresholdMs = 300;
+    private static string _adminDir = "";
+    private static bool _adminMounted = false;
 
     /// 注册外部业务/自动属性路由挂点
     public static void OnRoutes(WebRouteFn fn) {
         _routes = fn;
+    }
+
+    /// 获取运行中的 WebApp 实例
+    public static WebApp App() {
+        return _app;
+    }
+
+    /// 挂载管理端静态前端工程目录（如 adminUI 的 dist 目录）
+    public static void MountAdmin(string dir) {
+        _adminDir = dir;
+        _adminMounted = true;
     }
 
     /// 设置 CORS 跨域配置
@@ -54,6 +68,7 @@ class WebBoot {
         }
 
         WebApp app = new WebApp(host, port);
+        _app = app;
 
         // 1. CORS 前置过滤器与 OPTIONS 预检请求短路
         app.Before(WebBoot.CorsFilter);
@@ -70,6 +85,18 @@ class WebBoot {
         // 5. 挂载业务路由表
         if (_routes != null) {
             _routes(app);
+        }
+
+        // 6. 从路由特性自动同步菜单与超管权限（配置驱动，无须代码硬编码）
+        if (db != null) {
+            await SysMenuSync.SyncFromRouter(db, app, 1);
+        }
+
+        // 7. 挂载管理端页面
+        if (_adminMounted && _adminDir != null && _adminDir.Length > 0) {
+            StaticFiles.Mount(app, "/admin", _adminDir);
+        } else {
+            app.Get("/admin", WebBoot.ServeAdminHome);
         }
 
         Console.WriteLine("[Zan.Web] Server booting at http://" + host + ":" + Convert.ToString(port));
@@ -149,5 +176,157 @@ class WebBoot {
             return false;
         }
         return true;
+    }
+
+    /// 内置 Admin 单页控制台视图（开箱即用响应式管理端）
+    private static async void ServeAdminHome(HttpContext ctx) {
+        if (ctx == null) { return; }
+        ctx.Html(GetAdminHtml());
+    }
+
+    private static string GetAdminHtml() {
+        return "<!DOCTYPE html>\n"
+            + "<html lang=\"zh-CN\">\n"
+            + "<head>\n"
+            + "  <meta charset=\"UTF-8\" />\n"
+            + "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n"
+            + "  <title>Zan.Web 管理控制台</title>\n"
+            + "  <style>\n"
+            + "    * { box-sizing: border-box; margin: 0; padding: 0; }\n"
+            + "    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f8fafc; color: #1e293b; display: flex; height: 100vh; overflow: hidden; }\n"
+            + "    #sidebar { width: 230px; background: #0f172a; color: #f8fafc; display: flex; flex-direction: column; flex-shrink: 0; border-right: 1px solid #1e293b; }\n"
+            + "    .brand { padding: 18px 20px; font-size: 16px; font-weight: 700; border-bottom: 1px solid #1e293b; display: flex; align-items: center; gap: 8px; color: #38bdf8; }\n"
+            + "    .nav-list { list-style: none; padding: 12px 8px; overflow-y: auto; flex: 1; }\n"
+            + "    .nav-group { font-size: 11px; color: #64748b; padding: 10px 12px 4px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }\n"
+            + "    .nav-item { padding: 9px 12px; margin-bottom: 3px; border-radius: 6px; cursor: pointer; display: flex; align-items: center; gap: 8px; font-size: 13px; color: #cbd5e1; transition: all 0.15s; }\n"
+            + "    .nav-item:hover { background: #1e293b; color: #fff; }\n"
+            + "    .nav-item.active { background: #0284c7; color: #fff; font-weight: 500; }\n"
+            + "    #main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }\n"
+            + "    header { height: 56px; background: #fff; border-bottom: 1px solid #e2e8f0; display: flex; align-items: center; justify-content: space-between; padding: 0 20px; }\n"
+            + "    .header-title { font-size: 15px; font-weight: 600; color: #0f172a; }\n"
+            + "    .header-user { display: flex; align-items: center; gap: 12px; font-size: 13px; }\n"
+            + "    .badge { display: inline-block; padding: 2px 8px; border-radius: 9999px; font-size: 11px; font-weight: 600; background: #e0f2fe; color: #0369a1; }\n"
+            + "    .badge-success { background: #dcfce7; color: #15803d; }\n"
+            + "    #content { flex: 1; padding: 20px; overflow-y: auto; }\n"
+            + "    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 20px; }\n"
+            + "    .stat-card { background: #fff; padding: 16px; border-radius: 8px; border: 1px solid #e2e8f0; box-shadow: 0 1px 2px rgba(0,0,0,0.03); }\n"
+            + "    .stat-title { font-size: 12px; color: #64748b; margin-bottom: 4px; }\n"
+            + "    .stat-val { font-size: 22px; font-weight: 700; color: #0f172a; }\n"
+            + "    .card { background: #fff; border-radius: 8px; border: 1px solid #e2e8f0; padding: 18px; box-shadow: 0 1px 2px rgba(0,0,0,0.03); }\n"
+            + "    .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }\n"
+            + "    table { width: 100%; border-collapse: collapse; font-size: 13px; }\n"
+            + "    th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid #f1f5f9; }\n"
+            + "    th { background: #f8fafc; color: #475569; font-weight: 600; }\n"
+            + "    tr:hover td { background: #f8fafc; }\n"
+            + "    .btn { padding: 6px 12px; border-radius: 5px; border: none; font-size: 12px; cursor: pointer; font-weight: 500; transition: background 0.15s; }\n"
+            + "    .btn-primary { background: #0284c7; color: #fff; }\n"
+            + "    .btn-primary:hover { background: #0369a1; }\n"
+            + "  </style>\n"
+            + "</head>\n"
+            + "<body>\n"
+            + "  <div id=\"sidebar\">\n"
+            + "    <div class=\"brand\">⚡ Zan.Web 控制台</div>\n"
+            + "    <ul class=\"nav-list\" id=\"navList\">\n"
+            + "      <li class=\"nav-group\">系统监控</li>\n"
+            + "      <li class=\"nav-item active\" onclick=\"loadView('dashboard')\">📊 服务运行指标</li>\n"
+            + "      <li class=\"nav-group\">系统管理</li>\n"
+            + "      <li class=\"nav-item\" onclick=\"loadView('users')\">👥 用户体系</li>\n"
+            + "      <li class=\"nav-item\" onclick=\"loadView('depts')\">🏢 部门架构</li>\n"
+            + "      <li class=\"nav-item\" onclick=\"loadView('roles')\">🔒 角色与权限</li>\n"
+            + "      <li class=\"nav-group\">研发工具</li>\n"
+            + "      <li class=\"nav-item\" onclick=\"loadView('curd')\">🪄 代码生成 (CURD)</li>\n"
+            + "    </ul>\n"
+            + "  </div>\n"
+            + "  <div id=\"main\">\n"
+            + "    <header>\n"
+            + "      <div class=\"header-title\" id=\"pageTitle\">服务运行指标概览</div>\n"
+            + "      <div class=\"header-user\">\n"
+            + "        <span class=\"badge badge-success\">● 在线</span>\n"
+            + "        <span>管理员: <strong>admin</strong></span>\n"
+            + "      </div>\n"
+            + "    </header>\n"
+            + "    <div id=\"content\">\n"
+            + "      <div class=\"grid\">\n"
+            + "        <div class=\"stat-card\"><div class=\"stat-title\">累计请求数</div><div class=\"stat-val\" id=\"stReq\">-</div></div>\n"
+            + "        <div class=\"stat-card\"><div class=\"stat-title\">平均耗时 (ms)</div><div class=\"stat-val\" id=\"stAvg\">-</div></div>\n"
+            + "        <div class=\"stat-card\"><div class=\"stat-title\">慢请求数</div><div class=\"stat-val\" id=\"stSlowReq\">-</div></div>\n"
+            + "        <div class=\"stat-card\"><div class=\"stat-title\">慢 SQL 追踪数</div><div class=\"stat-val\" id=\"stSlowSql\">-</div></div>\n"
+            + "      </div>\n"
+            + "      <div class=\"card\">\n"
+            + "        <div class=\"toolbar\">\n"
+            + "          <h3 id=\"tableTitle\">数据视图</h3>\n"
+            + "          <button class=\"btn btn-primary\" onclick=\"refreshCurrent()\">刷新数据</button>\n"
+            + "        </div>\n"
+            + "        <div id=\"tableBox\">加载中...</div>\n"
+            + "      </div>\n"
+            + "    </div>\n"
+            + "  </div>\n"
+            + "  <script>\n"
+            + "    let current = 'dashboard';\n"
+            + "    async function fetchStats() {\n"
+            + "      try {\n"
+            + "        let r = await fetch('/api/monitor/stat/summary');\n"
+            + "        let res = await r.json();\n"
+            + "        let d = res.data || res;\n"
+            + "        document.getElementById('stReq').innerText = d.totalRequests ?? 0;\n"
+            + "        document.getElementById('stAvg').innerText = d.avgLatencyMs ?? 0;\n"
+            + "        document.getElementById('stSlowReq').innerText = d.slowRequests ?? 0;\n"
+            + "        document.getElementById('stSlowSql').innerText = d.slowQueries ?? 0;\n"
+            + "      } catch(e) {}\n"
+            + "    }\n"
+            + "    async function loadView(name) {\n"
+            + "      current = name;\n"
+            + "      document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));\n"
+            + "      let target = event?.target;\n"
+            + "      if (target) target.classList.add('active');\n"
+            + "      let title = document.getElementById('pageTitle');\n"
+            + "      let box = document.getElementById('tableBox');\n"
+            + "      box.innerHTML = '正在加载数据...';\n"
+            + "      if (name === 'dashboard') {\n"
+            + "        title.innerText = '服务运行指标概览';\n"
+            + "        document.getElementById('tableTitle').innerText = '慢 SQL 追踪记录';\n"
+            + "        let r = await fetch('/api/monitor/stat/slowsql');\n"
+            + "        let res = await r.json();\n"
+            + "        let list = res.data || [];\n"
+            + "        if (list.length === 0) { box.innerHTML = '<p style=\"color:#64748b;padding:20px;\">暂无慢 SQL 记录 (耗时 > 200ms)</p>'; return; }\n"
+            + "        let h = '<table><thead><tr><th>SQL 语句</th><th>耗时 (ms)</th><th>记录时间</th></tr></thead><tbody>';\n"
+            + "        list.forEach(q => { h += '<tr><td style=\"font-family:monospace;\">' + q.sql + '</td><td><span class=\"badge\" style=\"background:#fee2e2;color:#dc2626;\">' + q.elapsedMs + 'ms</span></td><td>' + new Date(q.timestamp*1000).toLocaleTimeString() + '</td></tr>'; });\n"
+            + "        box.innerHTML = h + '</tbody></table>';\n"
+            + "      } else if (name === 'users') {\n"
+            + "        title.innerText = '用户管理';\n"
+            + "        document.getElementById('tableTitle').innerText = '用户列表';\n"
+            + "        let r = await fetch('/api/system/user/page?page=1&pageSize=20');\n"
+            + "        let res = await r.json();\n"
+            + "        let list = (res.data && res.data.records) || [];\n"
+            + "        let h = '<table><thead><tr><th>ID</th><th>用户名</th><th>昵称</th><th>部门</th><th>角色</th><th>手机号</th><th>状态</th></tr></thead><tbody>';\n"
+            + "        list.forEach(u => { h += '<tr><td>' + u.id + '</td><td><strong>' + u.username + '</strong></td><td>' + (u.nickname||'-') + '</td><td>' + (u.departmentName||'-') + '</td><td>' + (u.roleName||'-') + '</td><td>' + (u.mobile||'-') + '</td><td>' + (u.status==1?'<span class=\"badge badge-success\">正常</span>':'<span class=\"badge\">禁用</span>') + '</td></tr>'; });\n"
+            + "        box.innerHTML = h + '</tbody></table>';\n"
+            + "      } else if (name === 'depts') {\n"
+            + "        title.innerText = '部门架构管理';\n"
+            + "        document.getElementById('tableTitle').innerText = '部门架构列表';\n"
+            + "        let r = await fetch('/api/system/dept/all');\n"
+            + "        let res = await r.json();\n"
+            + "        let list = res.data || [];\n"
+            + "        let h = '<table><thead><tr><th>ID</th><th>部门编码</th><th>部门名称</th><th>排序</th><th>状态</th></tr></thead><tbody>';\n"
+            + "        list.forEach(d => { h += '<tr><td>' + d.id + '</td><td>' + d.code + '</td><td>' + d.name + '</td><td>' + d.sortOrder + '</td><td>' + (d.status==1?'<span class=\"badge badge-success\">正常</span>':'<span class=\"badge\">禁用</span>') + '</td></tr>'; });\n"
+            + "        box.innerHTML = h + '</tbody></table>';\n"
+            + "      } else if (name === 'roles') {\n"
+            + "        title.innerText = '角色与权限管理';\n"
+            + "        document.getElementById('tableTitle').innerText = '系统角色列表';\n"
+            + "        let r = await fetch('/api/system/role/all');\n"
+            + "        let res = await r.json();\n"
+            + "        let list = res.data || [];\n"
+            + "        let h = '<table><thead><tr><th>ID</th><th>角色名称</th><th>说明</th><th>状态</th></tr></thead><tbody>';\n"
+            + "        list.forEach(ro => { h += '<tr><td>' + ro.id + '</td><td><strong>' + ro.name + '</strong></td><td>' + (ro.intro||'-') + '</td><td>' + (ro.status==1?'<span class=\"badge badge-success\">正常</span>':'<span class=\"badge\">禁用</span>') + '</td></tr>'; });\n"
+            + "        box.innerHTML = h + '</tbody></table>';\n"
+            + "      }\n"
+            + "    }\n"
+            + "    function refreshCurrent() { fetchStats(); loadView(current); }\n"
+            + "    fetchStats();\n"
+            + "    loadView('dashboard');\n"
+            + "    setInterval(fetchStats, 3000);\n"
+            + "  </script>\n"
+            + "</body>\n"
+            + "</html>";
     }
 }
