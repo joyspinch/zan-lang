@@ -3,198 +3,113 @@ using System.Data;
 using System.Data.Orm;
 using System.Web;
 using ZanWeb.Core;
+using ZanWeb.Crud;
 using ZanWeb.Security;
 using ZanWeb.Web;
 using ZanWeb.Model.Blog;
 
 namespace ZanWeb.Admin.Content;
 
-/* /admin/content/categories 博客栏目；slug 为公开 URL 所携带的标识，故唯一，改显示名不破坏链接。 */
+/* /admin/content/categories 博客栏目——配置驱动示范屏。列表/表单/保存/
+   删除/批量/行内修改/表格配置/选项八个端点全部由 CrudScreen 基座按
+   下面一份 Def() 声明供给，本类只保留三段业务语义（钩子与声明）：
+   slug 唯一（Unique 声明）、删前查文章占用（OnDeleting）、行内文章数
+   投影（OnRows）。slug 是公开 URL 携带的标识：保存走完整白名单，行内
+   快捷修改收窄为 Inline 子集、不含 slug——改标识必须走编辑框想清楚
+   再改，改显示名不破坏链接。 */
 [Route("admin/content/categories/[action]")]
 [Custom(Authorization = CustomAuthorization.Grant)]
 [Description("分类管理")]
-class Categories : AdminController {
+class Categories : CrudScreen {
+    override CrudConf Def() {
+        return CrudConf.Of("blog_category", "分类管理", "admin/content/categories")
+            .Col("id", "ID", "num", "70px")
+            .Col("name", "名称", "text", "180px")
+            .Col("slug", "标识", "muted", "150px")
+            .Col("description", "说明", "muted", "")
+            .Col("posts", "文章", "num", "70px")
+            .Col("sortOrder", "排序", "num", "70px")
+            .Tag("status", "状态", "1=显示|ok,0=隐藏|off", "90px")
+            .Col("createdAt", "创建时间", "time", "150px")
+            .Text("名称", "kw", "name", "搜索名称")
+            .Select("状态", "status", "status", "1=显示,0=隐藏")
+            .Time("创建日期", "createdAt", "createdAt")
+            .TbarAdd("新增分类")
+            .TbarReload()
+            .OpsEdit()
+            .OpsDel("删除后不可恢复，确认删除该分类吗？")
+            .EditFields("name:text,slug:text,description:text,sortOrder:int,status:int")
+            .Inline("name:text,description:text,sortOrder:int,status:int")
+            .Unique("slug", "该分类标识已被使用")
+            .FormText("名称", "name").Req().Max(64)
+            .FormText("标识", "slug").Req().Max(64).Ph("公开 URL 标识")
+            .FormArea("说明", "description").Max(255)
+            .FormText("排序", "sortOrder").Val("1")
+            .FormSelect("状态", "status", "1=显示,0=隐藏").Val("1")
+            .Order("sortOrder", false)
+            .Label("name")
+            .Toggle("status")
+            .Created("createdAt");
+    }
+
     [HttpGet]
     [Route("/admin/content/categories")]
     [Custom(IsMenu = true, Icon = "mdi:tag", Perm = PermBit.View)]
     [Description("分类管理")]
-    async void Index() {
-        ViewData d = await this.Layout("分类管理");
-        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+    async void Index() { await this.DoList(); }
 
-        List<Category> rows = await this.Category.OrderBy(a => a.sortOrder).ToListAsync();
-        List<Post> posts = await this.Post.ToListAsync();
-        List<StrMap> items = d.AddList("rows");
-        for (int i = 0; i < rows.Count; i = i + 1) {
-            Category c = rows[i];
-            StrMap row = new StrMap();
-            row.Set("id", Convert.ToString(c.id));
-            row.Set("name", c.name);
-            row.Set("slug", c.slug);
-            row.Set("description", c.description);
-            row.Set("descriptionDash", Fmt.Dash(c.description));
-            row.Set("sortOrder", Convert.ToString(c.sortOrder));
-            if (c.status == 1) { row.Set("statusChecked", "checked"); }
-            row.Set("posts", Convert.ToString(Categories.CountIn(posts, c.id)));
-            row.Set("statusText", Categories.StatusText(c.status));
-            row.Set("statusClass", Categories.StatusClass(c.status));
-            items.Add(row);
-        }
-        d.Set("total", Convert.ToString(rows.Count));
-        if (rows.Count == 0) { d.Set("empty", "1"); }
-        this.Page(d);
-    }
+    [HttpGet]
+    [Custom(Perm = PermBit.View)]
+    [Description("分类表格配置")]
+    void Conf() { this.DoConf(); }
 
     [HttpGet]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
     [Description("分类表单")]
-    async void Form() {
-        int id = this.InInt("id", 0);
-        ViewData d = new ViewData();
-        d.Set("id", Convert.ToString(id));
-        d.Set("dialogTitle", "新增分类");
-        d.Set("sortOrder", "1");
-        d.Set("status1", "selected");
-        if (id > 0) {
-            Category c = await this.Category.ById(id);
-            if (c == null) { this.Fail(404, "0404", "分类不存在"); }
-            d.Set("dialogTitle", "编辑分类");
-            d.Set("name", c.name);
-            d.Set("slug", c.slug);
-            d.Set("description", c.description);
-            d.Set("sortOrder", Convert.ToString(c.sortOrder));
-            d.Set("status1", "");
-            if (c.status == 1) { d.Set("status1", "selected"); }
-            else { d.Set("status0", "selected"); }
-        }
-        this.Dialog(d);
-    }
+    async void Form() { await this.DoForm(); }
 
     [HttpPost]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
     [Description("保存分类")]
-    async void Save() {
-        int id = this.InInt("id", 0);
-        string name = this.Need("name", "分类名称");
-        string slug = this.Need("slug", "分类标识");
-        string description = this.In("description");
-        int sortOrder = this.InInt("sortOrder", 1);
-        int status = this.InInt("status", 1);
-        if (status != 1) { status = 0; }
-        Category clash = await this.Category.Where(a => a.slug == slug).FirstAsync();
-        if (clash != null && clash.id != id) {
-            this.Fail(400, "0004", "分类标识 " + slug + " 已存在");
-        }
-        if (id > 0) {
-            int n = await this.Category.Update()
-                .Set(a => a.name, name)
-                .Set(a => a.slug, slug)
-                .Set(a => a.description, description)
-                .Set(a => a.sortOrder, sortOrder)
-                .Set(a => a.status, status)
-                .Where(a => a.id == id)
-                .ExecuteAffrowsAsync();
-            await this.Note("编辑分类", name, n > 0, "");
-            this.Saved("分类已保存");
-            return;
-        }
-        Category c = new Category();
-        c.name = name;
-        c.slug = slug;
-        c.description = description;
-        c.sortOrder = sortOrder;
-        c.status = status;
-        c.createdAt = WebApp.NowSeconds();
-        int newId = await this.Category.Insert(c).ExecuteIdentityAsync();
-        await this.Note("新增分类", name, newId > 0, "");
-        this.Saved("分类已创建");
-    }
+    async void Save() { await this.DoSave(); }
 
     [HttpPost]
     [Custom(Perm = PermBit.Delete)]
     [Description("删除分类")]
-    async void Delete() {
-        int id = this.InInt("id", 0);
-        Category c = await this.Category.ById(id);
-        if (c == null) { this.Fail(404, "0404", "分类不存在"); }
-        int used = await this.Post.Where(a => a.categoryId == id).CountAsync();
-        if (used > 0) {
-            this.Fail(400, "0004", "该分类下还有 " + Convert.ToString(used) + " 篇文章");
-        }
-        int n = await this.Category.Delete().Where(a => a.id == id)
-            .ExecuteAffrowsAsync();
-        await this.Note("删除分类", c.name, n > 0, "");
-        this.Saved("分类已删除");
-    }
+    async void Delete() { await this.DoDelete(); }
 
-    /* 行内快速改：列表里的名称/说明/排序/状态就地提交。只放行白名单字段；
-       slug 是公开 URL 标识，改动会打断外部链接，必须走编辑框想清楚再改；
-       文章数是计算列、id 与创建时间不可改。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("分类批量启停或删除")]
+    async void Batch() { await this.DoBatch(); }
+
     [HttpPost]
     [Custom(Perm = PermBit.Update)]
     [Description("分类行内修改")]
-    async void Quick() {
-        int id = this.InInt("id", 0);
-        string field = this.Need("field", "属性");
-        string value = this.In("value");
-        Category c = await this.Category.ById(id);
-        if (c == null) { this.Fail(404, "0404", "分类不存在"); }
+    async void Field() { await this.DoField(); }
 
-        if (field == "name") {
-            if (value.Length == 0) { this.Fail(400, "0004", "名称不能为空"); }
-            if (value.Length > 64) { value = value.Substring(0, 64); }
-            int n = await this.Category.Update().Set(a => a.name, value)
-                .Where(a => a.id == id).ExecuteAffrowsAsync();
-            await this.Note("编辑分类", value, n > 0, "行内");
-            this.Ok("{}");
-            return;
+    [HttpGet]
+    [Custom(Perm = PermBit.View)]
+    [Description("分类选项")]
+    async void Options() { await this.DoOptions(); }
+
+    /* 删前占用：栏目下还有文章时拒绝删除（与文章屏同一文案口径）。 */
+    override async string OnDeleting(long id) {
+        long used = await this.Post.Where(a => a.categoryId == id).CountAsync();
+        if (used > 0) {
+            return "该分类下还有 " + Convert.ToString(used) + " 篇文章";
         }
-        if (field == "description") {
-            if (value.Length > 255) { value = value.Substring(0, 255); }
-            int n = await this.Category.Update().Set(a => a.description, value)
-                .Where(a => a.id == id).ExecuteAffrowsAsync();
-            await this.Note("编辑分类", c.name, n > 0, "行内说明");
-            this.Ok("{}");
-            return;
-        }
-        if (field == "sortOrder") {
-            int sort = this.InInt("value", c.sortOrder);
-            if (sort < 0) { sort = 0; }
-            if (sort > 9999999) { sort = 9999999; }
-            int n = await this.Category.Update().Set(a => a.sortOrder, sort)
-                .Where(a => a.id == id).ExecuteAffrowsAsync();
-            await this.Note("编辑分类", c.name, n > 0, "行内排序");
-            this.Ok("{}");
-            return;
-        }
-        if (field == "status") {
-            int v = 0;
-            if (value == "1") { v = 1; }
-            int n = await this.Category.Update().Set(a => a.status, v)
-                .Where(a => a.id == id).ExecuteAffrowsAsync();
-            await this.Note("编辑分类", c.name, n > 0,
-                v == 1 ? "显示" : "隐藏");
-            this.Ok("{}");
-            return;
-        }
-        this.Fail(400, "0004", "该属性不支持行内修改");
+        return "";
     }
 
-    static int CountIn(List<Post> posts, int categoryId) {
-        int n = 0;
-        for (int i = 0; i < posts.Count; i = i + 1) {
-            if (posts[i].categoryId == categoryId) { n = n + 1; }
+    /* 投影：文章数列（每页至多 20 行的逐行计数，博客栏目规模下可忽
+       略；数据量大时应换分组查询）。 */
+    override async List<StrMap> OnRows(List<StrMap> rows) {
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            long cid = Filter.ToLong(rows[i].Get("id"), 0);
+            long used = await this.Post.Where(a => a.categoryId == cid).CountAsync();
+            rows[i].Set("posts", Convert.ToString(used));
         }
-        return n;
-    }
-
-    static string StatusText(int status) {
-        if (status == 1) { return "显示"; }
-        return "隐藏";
-    }
-
-    static string StatusClass(int status) {
-        if (status == 1) { return "ok"; }
-        return "off";
+        return rows;
     }
 }

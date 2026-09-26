@@ -1,0 +1,298 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Text;
+using System.Threading;
+using System.Web;
+using System.Json;
+using ZanWeb.Core;
+using ZanWeb.Security;
+using ZanWeb.Web;
+
+namespace ZanWeb.Crud;
+
+/* 配置驱动的管理屏基座（Modules/Crud）。
+ *
+ * 子类只做两件事：覆写 Def() 给出 CrudConf 声明；用属性声明各端点的
+ * 路由、菜单与权限位并转发到 Do* 方法——转发壳就是全部样板（约 30
+ * 行），屏体逻辑零行。业务语义的少数部分经四个钩子注入：
+ *   OnSaving(row, isNew)   保存前派生/规整，返回错误文案（"" 通过）
+ *   OnDeleting(id)         删除前占用检查，返回错误文案（"" 通过）
+ *   OnRows(rows)           列表页投影（计数列、关联名、衍生徽章）
+ *   OnSaved(isNew)         保存后副作用（缓存失效等）
+ * 此外 Unique() 声明把最常见的"唯一性校验"也配置化，写前检查并排除
+ * 自身行。
+ *
+ * 安全基线与全包一致：表名/列名出自声明，过 Gen.Safe 与 DbTable 的
+ * RequireIdent 双保险；值一律占位符参数；行级越权与不存在同答 404；
+ * 审计经 Note 落 sys_operation_log；权限位由子类属性壳显式声明，未
+ * 声明位的动作不可授权（与调度器同一掩码）。
+ */
+class CrudScreen : AdminController {
+    /* 子类必覆写：本屏的完整声明。 */
+    virtual CrudConf Def() {
+        throw new ApiError(500, "9999", "CrudScreen 未覆写 Def()");
+    }
+
+    /* ---- 基座端点（子类属性壳转发到这里） ------------------------ */
+
+    /* 列表屏：声明收集条件 → 计数 → 取页 → 投影钩子 → 整段渲染。 */
+    virtual async Task DoList() {
+        CrudConf conf = this.Def();
+        ListPage lp = conf.Build(false);
+        ViewData d = await this.Layout(conf.Title());
+        if (!this.DbReady()) { d.Set("dbDown", "1"); this.CrudPage(d); return; }
+
+        List<OrmCond> conds = lp.Collect(this);
+        DbTable t = DbTable.Of(this.Held(), conf.table);
+        long total = await CrudScreen.Apply(t.Query(), conds).CountAsync();
+
+        ListQuery q = this.Paged("id", 20);
+        DbTableQuery rq = CrudScreen.Apply(t.Query(), conds);
+        if (conf.orderDesc) { rq = rq.OrderByDesc(conf.orderCol); }
+        else { rq = rq.OrderBy(conf.orderCol); }
+        DbResult r = await rq.Page(q.Limit(), q.Skip()).ToResultAsync();
+        List<StrMap> rows = CrudScreen.StrMaps(r);
+        rows = await this.OnRows(rows);
+
+        int mask = await this.Mask();
+        bool canUpdate = (mask & (int)PermBit.Update) != 0;
+        bool canDelete = (mask & (int)PermBit.Delete) != 0;
+        lp.Screen(this, d, "/" + conf.path, "/" + conf.path,
+            conds, q, (int)total, rows, canUpdate, canDelete);
+        this.CrudPage(d);
+    }
+
+    /* 通用屏共享一份视图（views/Crud/Index.html）：screenHtml 整段由
+       ListPage 产出，整页/面板双形态与 Page() 同一分支。 */
+    void CrudPage(ViewData d) {
+        if (this.IsFragment()) {
+            this.Ctx().SetHeader("X-Tab-Title", Encoding.UrlEncode(this.headingText));
+            this.FragmentOf("Crud.Index", d);
+            return;
+        }
+        this.ViewOf("Crud.Index", d);
+    }
+
+    /* adminUI ZanTable 表格配置（列/筛选/工具栏与列表同源产出）。 */
+    virtual void DoConf() {
+        Crud.Conf(this, this.Def().Build(false));
+    }
+
+    /* 表单对话框：FormPage 产出表单体，共享壳 Admin._FormDialog 渲染；
+       编辑时按行回显（pass 字段恒不回显）。 */
+    virtual async Task DoForm() {
+        CrudConf conf = this.Def();
+        int id = this.InInt("id", 0);
+        bool isEdit = id > 0;
+        FormPage fp = conf.ToFormPage(isEdit ? Convert.ToString(id) : "0");
+        ViewData d = new ViewData();
+        d.Set("dialogTitle", (isEdit ? Lang.T("编辑") : Lang.T("新增")) + Lang.T(conf.title));
+        if (isEdit) {
+            DbResult r = await DbTable.Of(this.Held(), conf.table).ReadAsync("id", id);
+            if (r == null || r.RowCount() == 0) { this.Fail(404, "0404", "记录不存在"); }
+            for (int i = 0; i < conf.forms.Count; i = i + 1) {
+                FormField f = conf.forms[i];
+                if (f.name.Length == 0 || f.kind == "pass" || f.kind == "hint") { continue; }
+                int col = r.GetColumnIndex(f.name);
+                if (col < 0) { continue; }
+                fp.Field(f.name).Val(r.GetString(0, col));
+            }
+        }
+        fp.Render(d);
+        this.FormDialog(d);
+    }
+
+    /* 保存：表单校验（FormPage 同源规则）→ 写白名单绑定 → 唯一约束 →
+       OnSaving 钩子 → 插入/更新 → 审计 → OnSaved 钩子。 */
+    virtual async Task DoSave() {
+        CrudConf conf = this.Def();
+        int id = this.InInt("id", 0);
+        bool isNew = id <= 0;
+        ListPage lp = conf.Build(false);
+        FormPage fp = conf.ToFormPage(isNew ? "0" : Convert.ToString(id));
+        string err = fp.Validate(this);
+        if (err.Length > 0) { this.Fail(400, "0004", err); }
+
+        DbValues row = new DbValues();
+        for (int i = 0; i < conf.forms.Count; i = i + 1) {
+            FormField f = conf.forms[i];
+            if (f.name.Length == 0) { continue; }
+            if (f.kind == "pass" && !isNew && this.In(f.name).Length == 0) { continue; }
+            StrMap def = Crud.Find(lp, f.name);
+            if (def == null) {
+                this.Fail(500, "9999", "表单字段 " + f.name + " 未列入 EditFields 写白名单");
+            }
+            string v = this.In(f.name);
+            if (def.Get("type") == "int") { row.Set(f.name, Filter.ToLong(v, 0)); }
+            else { row.Set(f.name, v); }
+        }
+        long now = WebApp.NowSeconds();
+        if (isNew && conf.stampCreated.Length > 0) { row.Set(conf.stampCreated, now); }
+        if (conf.stampUpdated.Length > 0) { row.Set(conf.stampUpdated, now); }
+
+        DbTable t = DbTable.Of(this.Held(), conf.table);
+        List<string> onlyId = new List<string>();
+        onlyId.Add("id");
+        for (int i = 0; i < conf.uniques.Count; i = i + 1) {
+            StrMap u = conf.uniques[i];
+            string col = u.Get("col");
+            string val = this.In(col);
+            if (val.Length == 0) { continue; }
+            DbResult ur = await t.Query().WhereEq(col, val).ToResultAsync(onlyId);
+            if (ur == null) { continue; }
+            for (int j = 0; j < ur.RowCount(); j = j + 1) {
+                if (ur.GetLong(j, 0) != id) { this.Fail(400, "0004", u.Get("msg")); }
+            }
+        }
+
+        string why = this.OnSaving(row, isNew);
+        if (why.Length > 0) { this.Fail(400, "0004", why); }
+
+        int n;
+        if (isNew) { n = await t.InsertAsync(row); }
+        else { n = await t.UpdateAsync(row, "id", id); }
+        await this.Note(conf.title + (isNew ? "·新增" : "·编辑"),
+            this.RowTarget(conf, id), n > 0, "");
+        await this.OnSaved(isNew);
+        this.Saved(Lang.T("已保存"));
+    }
+
+    /* 删除：行存在（不存在同答 404，不泄露其他 id 的存在性）→ 占用
+       钩子 → 经 Crud 网关删除并审计。 */
+    virtual async Task DoDelete() {
+        CrudConf conf = this.Def();
+        int id = this.InInt("id", 0);
+        ListPage lp = conf.Build(false);
+        DbResult r = await DbTable.Of(this.Held(), conf.table).ReadAsync("id", id);
+        if (r == null || r.RowCount() == 0) { this.Fail(404, "0404", "记录不存在"); }
+        string why = await this.OnDeleting(id);
+        if (why.Length > 0) { this.Fail(400, "0004", why); }
+        List<int> allowed = new List<int>();
+        allowed.Add(id);
+        await Crud.Delete(this, lp, allowed, conf.title + "·删除");
+    }
+
+    /* 批量：value 为空 → 批量删除；否则写 toggleField（批量启停等
+       "同一列一个值"）。批量删除是表级清选，不走行级 OnDeleting 占用
+       钩子——有子记录的表不应声明批量删（如 Categories），占用约束
+       由行删端点保证。ids 上限与逐占位符由 Crud 网关与 Ids() 保证。 */
+    virtual async Task DoBatch() {
+        CrudConf conf = this.Def();
+        List<int> ids = this.Ids("ids");
+        string value = this.In("value");
+        ListPage lp = conf.Build(true);
+        if (value.Length == 0) {
+            await Crud.Delete(this, lp, ids, conf.title + "·批量删除");
+            return;
+        }
+        await Crud.Batch(this, lp, conf.toggleField, value, ids, conf.title + "·批量");
+    }
+
+    /* 行内单字段修改：field 必须在行内白名单内，行必须存在。 */
+    virtual async Task DoField() {
+        CrudConf conf = this.Def();
+        int id = this.InInt("id", 0);
+        string field = this.Need("field", "属性");
+        string value = this.In("value");
+        ListPage lp = conf.Build(true);
+        DbResult r = await DbTable.Of(this.Held(), conf.table).ReadAsync("id", id);
+        if (r == null || r.RowCount() == 0) { this.Fail(404, "0404", "记录不存在"); }
+        List<int> allowed = new List<int>();
+        allowed.Add(id);
+        await Crud.Field(this, lp, conf.title, field, value, allowed);
+    }
+
+    /* 选项端点（data-pick 契约）：?id= 单条回显、?kw= 文案包含匹配，
+       最多 20 条；文案列由 Label() 声明。 */
+    virtual async Task DoOptions() {
+        CrudConf conf = this.Def();
+        if (conf.labelCol.Length == 0) {
+            this.Fail(500, "9999", "本屏未声明 Label() 选项列");
+        }
+        string kw = this.In("kw").Trim();
+        string idv = this.In("id").Trim();
+        DbTable t = DbTable.Of(this.Held(), conf.table);
+        if (idv.Length > 0) {
+            DbResult r = await t.Query().WhereEq("id", Filter.ToLong(idv, 0))
+                .Limit(1).ToResultAsync();
+            JsonValue one = JsonValue.NewObject();
+            if (r != null && r.RowCount() > 0) {
+                one.Set("id", JsonValue.NewInt(Filter.ToInt(idv, 0)));
+                one.Set("label", JsonValue.NewStr(r.GetString(0, r.GetColumnIndex(conf.labelCol))));
+            }
+            this.Ctx().Api(Codes.Ok, "ok", one.ToJson());
+            return;
+        }
+        DbTableQuery q = t.Query();
+        if (kw.Length > 0) { q = q.WhereContains(conf.labelCol, kw); }
+        DbResult rows = await q.OrderBy(conf.orderCol).Limit(20).ToResultAsync();
+        JsonValue arr = JsonValue.NewArray();
+        if (rows != null) {
+            int idc = rows.GetColumnIndex("id");
+            int lbc = rows.GetColumnIndex(conf.labelCol);
+            for (int i = 0; i < rows.RowCount(); i = i + 1) {
+                JsonValue o = JsonValue.NewObject();
+                o.Set("id", JsonValue.NewInt(rows.GetInt(i, idc)));
+                o.Set("label", JsonValue.NewStr(rows.GetString(i, lbc)));
+                arr.Append(o);
+            }
+        }
+        this.Ctx().Api(Codes.Ok, "ok", arr.ToJson());
+    }
+
+    /* ---- 钩子（子类按需覆写） ------------------------------------ */
+
+    /* 保存前派生/规整（改写 row），返回错误文案，"" = 通过。 */
+    virtual string OnSaving(DbValues row, bool isNew) { return ""; }
+
+    /* 删除前占用检查，返回错误文案，"" = 通过。 */
+    virtual async string OnDeleting(long id) { return ""; }
+
+    /* 列表页投影：为行补计数列/关联名/衍生徽章；返回同一批行。 */
+    virtual async List<StrMap> OnRows(List<StrMap> rows) { return rows; }
+
+    /* 保存后副作用（缓存失效、联动重算）。 */
+    virtual async Task OnSaved(bool isNew) { }
+
+    /* ---- 内部 ---------------------------------------------------- */
+
+    /* 审计目标：Label() 列的提交值优先（人可读），否则 #id。 */
+    string RowTarget(CrudConf conf, int id) {
+        if (conf.labelCol.Length > 0) {
+            string v = this.In(conf.labelCol).Trim();
+            if (v.Length > 0) { return v; }
+        }
+        return "#" + Convert.ToString(id);
+    }
+
+    /* OrmCond → DbTableQuery：LIKE→包含、EQ→等值、GE/LE→整型边界。
+       列名出自声明，值全部占位符绑定——与实体 ORM 的 WhereConds 同一
+       语义，落在运行期表网关上。 */
+    static DbTableQuery Apply(DbTableQuery q, List<OrmCond> conds) {
+        for (int i = 0; i < conds.Count; i = i + 1) {
+            OrmCond c = conds[i];
+            if (c.kind == "LIKE") { q = q.WhereContains(c.col, c.value); }
+            else if (c.kind == "EQ") { q = q.WhereEq(c.col, c.value); }
+            else if (c.kind == "GE") { q = q.WhereGe(c.col, Filter.ToLong(c.value, 0)); }
+            else if (c.kind == "LE") { q = q.WhereLe(c.col, Filter.ToLong(c.value, 0)); }
+        }
+        return q;
+    }
+
+    /* DbResult → 行 StrMap 列表：列名即键（与 Col 声明的 field 对应），
+       NULL 一律空串。 */
+    static List<StrMap> StrMaps(DbResult r) {
+        List<StrMap> out_ = new List<StrMap>();
+        if (r == null) { return out_; }
+        for (int i = 0; i < r.RowCount(); i = i + 1) {
+            StrMap row = new StrMap();
+            for (int j = 0; j < r.columnNames.Count; j = j + 1) {
+                if (r.IsNull(i, j)) { continue; }
+                row.Set(r.columnNames[j], r.GetString(i, j));
+            }
+            out_.Add(row);
+        }
+        return out_;
+    }
+}

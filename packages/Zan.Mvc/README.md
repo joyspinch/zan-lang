@@ -41,6 +41,7 @@ src/ZanWeb/             包源码。目录是工程组织（Framework/Modules �
                             Health/ Index/ User/），一类一文件
       Model/  Dao/          数据层：sys_* 实体与 DAO（每表一个 DAO，全部查询
                             与写入口）；Model/Blog/、Dao/Blog/ 为示例模块
+    Crud/                   配置驱动管理屏引擎（CrudConf 声明 + CrudScreen 基座）
 views/                  页面模板，按控制器模块分目录（随包资产）
   layout.html             全站布局；模块自有 layout.html 仅覆盖本模块
 wwwroot/                唯一 Web 可达目录，挂载在 /static（css/js/vendor/i18n）
@@ -58,6 +59,59 @@ wwwroot/                唯一 Web 可达目录，挂载在 /static（css/js/ven
 
 视图键由 `View.LoadRec` 按目录路径推导（`views/Admin/System/SysUsers.Index.html`
 → `Admin.System.SysUsers.Index`），与控制器命名空间同构——看到路径即知键名。
+
+## 配置驱动的管理屏（Modules/Crud）
+
+大多数管理屏只有"一张表的增删改查"：`Modules/Crud` 把这一层做成引擎——
+子类写一份 `CrudConf` 声明 + 约三十行属性壳，即得到列表、表单、保存、
+删除、批量启停/删除、行内修改、表格配置（adminUI conf 契约）、远程选项
+（data-pick 契约）八个端点，共享一份视图。声明即白名单：搜索、保存、
+行内修改只收声明过的列名，值一律占位符参数，审计与权限位与手写屏同一
+机制。`ZanWeb.Admin.Content.Categories` 是完整的示范屏（配置 + 三个钩子）。
+
+```zan
+[Route("admin/shop/goods/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("商品管理")]
+class Goods : CrudScreen {
+    override CrudConf Def() {
+        return CrudConf.Of("shop_goods", "商品管理", "admin/shop/goods")
+            .Col("id", "ID", "num", "70px")
+            .Col("name", "名称", "text", "")
+            .Tag("status", "状态", "1=上架|ok,0=下架|off", "90px")
+            .Text("名称", "kw", "name", "搜索名称")
+            .TbarAdd("新增商品").TbarEnable().TbarDisable()
+            .OpsEdit().OpsDel("确认删除该商品吗？")
+            .EditFields("name:text,price:int,stock:int,status:int")
+            .Inline("stock:int,status:int")          /* 行内只放行库存与状态 */
+            .Unique("name", "商品名已存在")
+            .FormText("名称", "name").Req().Max(64)
+            .FormText("价格", "price").Req()
+            .Created("createdAt").Updated("updatedAt")
+            .Label("name").Toggle("status")
+            .Order("id", true);
+    }
+    [HttpGet] [Route("/admin/shop/goods")]
+    [Custom(IsMenu = true, Icon = "mdi:package", Perm = PermBit.View)]
+    [Description("商品管理")]
+    async void Index() { await this.DoList(); }
+    /* ...其余属性壳同样只转发：Conf/Form/Save/Delete/Batch/Field/Options */
+}
+```
+
+超出声明的业务语义经四个钩子注入（按需覆写，不必全写）：
+
+| 钩子 | 时机 | 典型用途 |
+|---|---|---|
+| `OnSaving(row, isNew)` | 保存前 | 派生字段、规整化，返回错误文案可拒绝 |
+| `OnDeleting(id)` | 删除前 | 占用检查（如分类下还有文章则拒绝） |
+| `OnRows(rows)` | 列表取数后 | 投影计数列、关联名、衍生徽章 |
+| `OnSaved(isNew)` | 保存后 | 缓存失效、联动重算 |
+
+边界约定：`EditFields` 是保存可写的全集，`Inline` 收窄行内/批量启停的
+子集；唯一约束用 `Unique()` 声明（写前检查、排除自身行）；**有子记录的
+表不要声明批量删除**——批量删不过行级占用钩子（Categories 即如此：只有
+行删带占用检查）。
 
 ## Attribute-driven routes
 
@@ -200,9 +254,10 @@ crashing.
 | Capability | Where | Notes |
 |---|---|---|
 | Layered controllers | `src/ZanWeb/` | thin composition root, one class per resource |
-| Default ORM | `src/model/`, `framework/Db.zan` | `System.Data.Orm` models, config-driven engine |
-| Default cache | `framework/Cache.zan` | in-memory TTL; Redis via `System.Data.Redis` on async path |
-| External config | `config/app.json`, `framework/Cfg.zan` | runtime-loaded, not compiled in |
+| Config-driven CRUD screens | `Modules/Crud` | one CrudConf declaration → list/form/save/delete/batch/inline/conf/options; hooks for the rest |
+| Default ORM | `Modules/Sys/Model`, `Framework/Core/Db.zan` | `System.Data.Orm` models, config-driven engine |
+| Default cache | `Framework/Services/Cache.zan` | in-memory TTL; Redis via `System.Data.Redis` on async path |
+| External config | `config/app.json`, `Framework/Core/Cfg.zan` | runtime-loaded, not compiled in |
 | High-performance routing | `System.Web.Router` | static-first match + `{param}`, 404/405 |
 | Rate limiting | `System.Web.Hooks` | global + per-route fixed windows, 429 |
 | Auth / sessions | `WebApp.AuthUser`, `Sessions` | Bearer token or session cookie, `.Auth()` guard |

@@ -1,0 +1,415 @@
+using System;
+using System.Web;
+using ZanWeb.Core;
+using ZanWeb.Web;
+
+namespace ZanWeb.Crud;
+
+/* 配置驱动的管理屏声明（Modules/Crud）。
+ *
+ * 一份 CrudConf 描述一张表的完整管理屏：物理表、URL 基路径、列、搜索、
+ * 工具栏、行内操作、可写字段白名单、表单字段、排序、唯一约束与选项列。
+ * 控制器只写这份声明，列表/表单/保存/删除/批量/行内修改/表格配置/选项
+ * 八类端点由 CrudScreen 基座统一供给——大多数管理功能不再写控制器逻辑，
+ * 只写配置。
+ *
+ * 声明即白名单：表名/列名全部出自代码声明（非用户输入），写侧再过
+ * Gen.Safe 与 DbTable.RequireIdent 双保险；搜索、保存、行内修改只收
+ * 声明过的名字。端点 URL 一律由 path 派生（path + index/form/save/
+ * del/batch/field/conf/options），声明里不重复写 URL。
+ *
+ * 写白名单与行内白名单分离：EditFields 是保存动作可写的全集，Inline
+ * 收窄行内快捷修改与批量启停的子集（如公开 URL 标识可保存但不宜就地
+ * 改）；未声明 Inline 时行内即全集。
+ *
+ * ListPage/FormPage 是逐请求对象（渲染时回读请求、写屏幕键），配置
+ * 不能持有它们——本类保存原始声明，Build()/ToFormPage() 每请求重放
+ * 出新实例，多屏并发互不串味。
+ */
+class CrudConf {
+    string table;
+    string title;
+    string path;
+    string orderCol;
+    bool orderDesc;
+    string labelCol;
+    string toggleField;
+    string stampCreated;
+    string stampUpdated;
+    List<ListFilter> fs;
+    List<ListButton> bs;
+    List<ListCol> cols;
+    List<ListOps> ops;
+    List<StrMap> uniques;
+    string editDefs;
+    string inlineDefs;
+    List<FormField> forms;
+    FormField last;
+
+    CrudConf() {
+        this.fs = new List<ListFilter>();
+        this.bs = new List<ListButton>();
+        this.cols = new List<ListCol>();
+        this.ops = new List<ListOps>();
+        this.uniques = new List<StrMap>();
+        this.forms = new List<FormField>();
+        this.orderCol = "id";
+        this.orderDesc = true;
+        this.labelCol = "";
+        this.toggleField = "status";
+        this.stampCreated = "";
+        this.stampUpdated = "";
+        this.editDefs = "";
+        this.inlineDefs = "";
+        this.last = null;
+    }
+
+    /* 每屏一个实例：Of(物理表, 屏标题, URL 基路径) 后链式声明。 */
+    static CrudConf Of(string table, string title, string path) {
+        CrudConf c = new CrudConf();
+        c.table = table;
+        c.title = title;
+        c.path = path;
+        return c;
+    }
+
+    /* ---- 屏级选项 ------------------------------------------------ */
+
+    /* 列表排序（默认 id 降序）。 */
+    CrudConf Order(string col, bool desc) {
+        this.orderCol = col;
+        this.orderDesc = desc;
+        return this;
+    }
+
+    /* Options() 选项端点的文案列（pick 远程搜索单选的数据源）。 */
+    CrudConf Label(string col) {
+        this.labelCol = col;
+        return this;
+    }
+
+    /* 批量启停字段（TbarEnable/TbarDisable 的目标列，默认 status）。 */
+    CrudConf Toggle(string field) {
+        this.toggleField = field;
+        return this;
+    }
+
+    /* 时间戳维护：保存时写入的列名（空串=不维护）。 */
+    CrudConf Created(string col) {
+        this.stampCreated = col;
+        return this;
+    }
+
+    CrudConf Updated(string col) {
+        this.stampUpdated = col;
+        return this;
+    }
+
+    /* 唯一约束（保存动作在写前检查，排除自身行）；msg 为冲突文案。 */
+    CrudConf Unique(string col, string msg) {
+        StrMap u = new StrMap();
+        u.Set("col", col);
+        u.Set("msg", msg);
+        this.uniques.Add(u);
+        return this;
+    }
+
+    /* ---- 列表声明（形状与 ListPage 同名同义） -------------------- */
+
+    CrudConf Col(string field, string title, string kind, string width) {
+        ListCol c = new ListCol();
+        c.field = field;
+        c.title = title;
+        c.kind = kind;
+        c.width = width;
+        c.opts = "";
+        this.cols.Add(c);
+        return this;
+    }
+
+    /* 状态徽章列：opts 形如 "1=显示|ok,0=隐藏|off"。 */
+    CrudConf Tag(string field, string title, string opts, string width) {
+        ListCol c = new ListCol();
+        c.field = field;
+        c.title = title;
+        c.kind = "tag";
+        c.width = width;
+        c.opts = opts;
+        this.cols.Add(c);
+        return this;
+    }
+
+    /* 自由徽章列：行值自带 "文案|样式类"（OnRows 投影）。 */
+    CrudConf Flag(string field, string title, string width) {
+        ListCol c = new ListCol();
+        c.field = field;
+        c.title = title;
+        c.kind = "flag";
+        c.width = width;
+        c.opts = "";
+        this.cols.Add(c);
+        return this;
+    }
+
+    /* ---- 搜索与工具栏 -------------------------------------------- */
+
+    CrudConf Text(string title, string name, string col, string ph) {
+        ListFilter f = new ListFilter();
+        f.type = "text";
+        f.title = title;
+        f.name = name;
+        f.col = col;
+        f.ph = ph;
+        f.options = "";
+        f.url = "";
+        this.fs.Add(f);
+        return this;
+    }
+
+    CrudConf Select(string title, string name, string col, string options) {
+        ListFilter f = new ListFilter();
+        f.type = "select";
+        f.title = title;
+        f.name = name;
+        f.col = col;
+        f.ph = "";
+        f.options = options;
+        f.url = "";
+        this.fs.Add(f);
+        return this;
+    }
+
+    CrudConf Time(string title, string name, string col) {
+        ListFilter f = new ListFilter();
+        f.type = "time";
+        f.title = title;
+        f.name = name;
+        f.col = col;
+        f.ph = "";
+        f.options = "";
+        f.url = "";
+        this.fs.Add(f);
+        return this;
+    }
+
+    /* 远程搜索单选：选项端点固定为本屏 options。 */
+    CrudConf Pick(string title, string name, string col) {
+        ListFilter f = new ListFilter();
+        f.type = "pick";
+        f.title = title;
+        f.name = name;
+        f.col = col;
+        f.ph = "";
+        f.options = "";
+        f.url = this.Act("options");
+        this.fs.Add(f);
+        return this;
+    }
+
+    CrudConf TbarAdd(string name) {
+        return this.Btn("add", name, this.Act("form"), "", "");
+    }
+
+    CrudConf TbarReload() {
+        return this.Btn("reload", "刷新", "", "", "");
+    }
+
+    CrudConf TbarSep() {
+        return this.Btn("sep", "", "", "", "");
+    }
+
+    CrudConf TbarEnable() {
+        return this.Btn("batch", "启用", this.Act("batch"), "1", "确认启用所选记录吗？");
+    }
+
+    CrudConf TbarDisable() {
+        return this.Btn("batch", "禁用", this.Act("batch"), "0", "确认禁用所选记录吗？");
+    }
+
+    CrudConf TbarDelete() {
+        return this.Btn("batch", "删除", this.Act("batch"), "", "删除后不可恢复，确认删除所选记录吗？");
+    }
+
+    /* 自定义批量键：value 区分方向（发布/转草稿），同一 batch 端点。 */
+    CrudConf TbarBatch(string name, string value, string confirm) {
+        return this.Btn("batch", name, this.Act("batch"), value, confirm);
+    }
+
+    CrudConf Btn(string type, string name, string url, string value, string confirm) {
+        ListButton b = new ListButton();
+        b.type = type;
+        b.name = name;
+        b.url = url;
+        b.value = value;
+        b.confirm = confirm;
+        this.bs.Add(b);
+        return this;
+    }
+
+    /* ---- 行内操作（URL 由 path 派生） ---------------------------- */
+
+    CrudConf OpsEdit() {
+        return this.Ops("编辑", this.Act("form"), "", "", "u");
+    }
+
+    CrudConf OpsDel(string confirm) {
+        return this.Ops("删除", this.Act("delete"), confirm, "id={id}", "d");
+    }
+
+    /* 自定义行内动作：action 为本屏动作名（如 "publish"），POST 按钮。 */
+    CrudConf OpsCustom(string name, string action, string confirm, string args, string perm) {
+        return this.Ops(name, this.Act(action), confirm, args, perm);
+    }
+
+    CrudConf Ops(string name, string url, string confirm, string args, string perm) {
+        ListOps o = new ListOps();
+        o.name = name;
+        o.url = url;
+        o.confirm = confirm;
+        o.args = args;
+        o.perm = perm;
+        this.ops.Add(o);
+        return this;
+    }
+
+    /* ---- 写白名单与表单 ------------------------------------------ */
+
+    /* 保存动作可写字段全集，形如 "name:text,sortOrder:int"。 */
+    CrudConf EditFields(string defs) {
+        this.editDefs = defs;
+        return this;
+    }
+
+    /* 行内快捷修改与批量启停的字段子集；未声明时即全集。 */
+    CrudConf Inline(string defs) {
+        this.inlineDefs = defs;
+        return this;
+    }
+
+    CrudConf FormText(string label, string name) {
+        return this.Form("text", label, name);
+    }
+
+    /* 密码：渲染 type=password，值恒不回显；编辑留空=不修改。 */
+    CrudConf FormPass(string label, string name) {
+        return this.Form("pass", label, name);
+    }
+
+    CrudConf FormArea(string label, string name) {
+        return this.Form("area", label, name);
+    }
+
+    CrudConf FormSelect(string label, string name, string options) {
+        this.Form("select", label, name);
+        this.last.options = options;
+        return this;
+    }
+
+    /* 提示块：不产生输入与校验。 */
+    CrudConf FormHint(string text) {
+        this.Form("hint", "", "");
+        this.last.value = text;
+        return this;
+    }
+
+    CrudConf Form(string kind, string label, string name) {
+        FormField f = new FormField();
+        f.kind = kind;
+        f.label = label;
+        f.name = name;
+        f.value = "";
+        f.ph = "";
+        f.options = "";
+        f.blank = "";
+        this.forms.Add(f);
+        this.last = f;
+        return this;
+    }
+
+    /* ---- 表单字段修饰（作用于最近一个 Form 声明） ---------------- */
+
+    CrudConf Val(string v) { this.last.value = v; return this; }
+
+    CrudConf Ph(string p) { this.last.ph = p; return this; }
+
+    CrudConf Max(int n) { this.last.max = n; return this; }
+
+    CrudConf Min(int n) { this.last.min = n; return this; }
+
+    CrudConf Req() { this.last.required = true; return this; }
+
+    CrudConf Span() { this.last.span = true; return this; }
+
+    CrudConf Rows(int n) { this.last.areaRows = n; return this; }
+
+    CrudConf OnlyNew() { this.last.onlyNew = true; return this; }
+
+    CrudConf OnlyEdit() { this.last.onlyEdit = true; return this; }
+
+    CrudConf Blank(string label) { this.last.blank = label; return this; }
+
+    /* ---- 派生 ---------------------------------------------------- */
+
+    string Act(string action) {
+        return "/" + this.path + "/" + action;
+    }
+
+    string Title() {
+        return this.title;
+    }
+
+    /* 逐请求重放：声明 → ListPage（渲染与取数引擎）。inline 收窄写
+       白名单（行内修改/批量启停用），保存动作走全集。 */
+    ListPage Build(bool inline) {
+        ListPage lp = ListPage.Of();
+        for (int i = 0; i < this.fs.Count; i = i + 1) {
+            ListFilter f = this.fs[i];
+            if (f.type == "text") { lp.Text(f.title, f.name, f.col, f.ph); }
+            else if (f.type == "select") { lp.Select(f.title, f.name, f.col, f.options); }
+            else if (f.type == "time") { lp.Time(f.title, f.name, f.col); }
+            else if (f.type == "pick") { lp.Pick(f.title, f.name, f.col, f.url); }
+        }
+        for (int i = 0; i < this.bs.Count; i = i + 1) {
+            ListButton b = this.bs[i];
+            lp.Btn(b.type, b.name, b.url, b.value, b.confirm);
+        }
+        for (int i = 0; i < this.cols.Count; i = i + 1) {
+            ListCol c = this.cols[i];
+            if (c.kind == "tag") { lp.Tag(c.field, c.title, c.opts, c.width); }
+            else if (c.kind == "flag") { lp.Flag(c.field, c.title, c.width); }
+            else { lp.Col(c.field, c.title, c.kind, c.width); }
+        }
+        for (int i = 0; i < this.ops.Count; i = i + 1) {
+            ListOps o = this.ops[i];
+            lp.Ops(o.name, o.url, o.confirm, o.args, o.perm);
+        }
+        lp.Table(this.table);
+        string defs = this.editDefs;
+        if (inline && this.inlineDefs.Length > 0) { defs = this.inlineDefs; }
+        if (defs.Length > 0) { lp.EditFields(defs); }
+        return lp;
+    }
+
+    /* 逐请求重放：声明 → FormPage（值绑定由引擎按行注入）。 */
+    FormPage ToFormPage(string idValue) {
+        FormPage fp = FormPage.Of(this.Act("save")).Id(idValue);
+        for (int i = 0; i < this.forms.Count; i = i + 1) {
+            FormField f = this.forms[i];
+            if (f.kind == "hint") { fp.Hint(f.value); continue; }
+            if (f.kind == "text") { fp.Text(f.label, f.name); }
+            else if (f.kind == "pass") { fp.Pass(f.label, f.name); }
+            else if (f.kind == "area") { fp.Area(f.label, f.name); }
+            else { fp.Select(f.label, f.name, f.options); }
+            if (f.ph.Length > 0) { fp.Ph(f.ph); }
+            if (f.max > 0) { fp.Max(f.max); }
+            if (f.min > 0) { fp.Min(f.min); }
+            if (f.required) { fp.Req(); }
+            if (f.span) { fp.Span(); }
+            if (f.areaRows > 0) { fp.Rows(f.areaRows); }
+            if (f.onlyNew) { fp.OnlyNew(); }
+            if (f.onlyEdit) { fp.OnlyEdit(); }
+            if (f.blank.Length > 0) { fp.Blank(f.blank); }
+        }
+        return fp;
+    }
+}
