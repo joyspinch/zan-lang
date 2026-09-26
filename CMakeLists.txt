@@ -3989,7 +3989,7 @@ add_test(NAME conformance_arc_net_publish COMMAND ${CMAKE_COMMAND}
   -P ${CMAKE_SOURCE_DIR}/tests/run_arcnet.cmake)
 set_tests_properties(conformance_arc_net_publish PROPERTIES TIMEOUT 120)
 
-# ---- Published-size budgets (docs/embedded_runtime_assessment.md) ----
+# ---- Published-size budgets (docs/archive/embedded_runtime_assessment.md) ----
 # A minimal --publish build must stay small: a reintroduced fixed static
 # table or a cross link that lost --gc-sections trips these. Ceilings are
 # ~1.5x the measured baselines (host win-x64 publish: text 44.3 KB / file

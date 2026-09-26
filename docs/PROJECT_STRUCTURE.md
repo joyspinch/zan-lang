@@ -6,13 +6,17 @@
 zan-lang/
 │
 ├── docs/                               # Documentation
+│   ├── README.md                       # Docs index (what each file is, status)
 │   ├── SPEC.md                         # Language specification
 │   ├── ARCHITECTURE.md                 # Compiler architecture
 │   ├── STDLIB.md                       # Standard library design
 │   ├── PROJECT_STRUCTURE.md            # This document
-│   ├── ABI.md, CONCURRENCY.md, SECURITY.md, PERFORMANCE.md,
+│   ├── ABI.md, CONCURRENCY.md, SECURITY.md, ASYNC_CPS_DESIGN.md,
 │   │   CODING_STANDARDS.md, TOOLING.md, WORKSPACE_CONVENTIONS.md,
-│   │   BOOTSTRAP.md, RELEASE.md, ...   # (see the docs/ directory itself)
+│   │   BOOTSTRAP.md, RELEASE.md, ...   # full map: docs/README.md
+│   ├── agent-kb/ bugs/ projects/ arpg/ # agent knowledge base, bug postmortems,
+│   │                                   #   per-project docs, ARPG reference
+│   └── archive/                        # frozen historical documents
 │
 ├── src/                                # All source code
 │   ├── compiler/                       # Compiler (C11)

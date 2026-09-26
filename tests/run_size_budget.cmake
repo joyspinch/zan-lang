@@ -1,5 +1,5 @@
 # Hard size budgets for a minimal --publish build.
-# See docs/embedded_runtime_assessment.md — the point is to catch a
+# See docs/archive/embedded_runtime_assessment.md — the point is to catch a
 # reintroduced fixed static table or a cross link that lost --gc-sections
 # (hello world cost ~20 KB of un-GC'd program text that way).
 #

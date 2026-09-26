@@ -83,7 +83,7 @@
   Chrome 时用带 padding 的接收者或 oracle 驱动的 escT 公式)。与 Chrome 的
   逐盒一致性由 `scripts/web_oracle.py` 裁决:用例 JSON(tests/weboracle/*.json)
   + Zan 侧驱动(*_driver.zan)输出同名 `sel x,y wxh` 行 `--compare` 对比;
-  其余偏差记录在 `docs/WEB_GUI_ROADMAP.md` 台账。
+  其余偏差记录在 `docs/archive/WEB_GUI_ROADMAP.md` 台账(已全量落地,历史留档)。
 - **行内混排(行盒,P2)**:`AddText("...")`/`AddKid(span)` 文档序交错 =
   真混排(16px 文本里混 28px span、inline-block 徽标都按浏览器行盒模型
   摆);span 不写 line-height/font-size 会**继承父级行高字号**(浏览器同款)。

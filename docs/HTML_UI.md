@@ -1,10 +1,11 @@
 # HTML 窗口规范（HTML UI）
 
-> WEB_GUI_ROADMAP P5 的主文档：用 HTML + CSS 描述窗口，事件走
+> HTML 声明式窗口（原 WEB_GUI_ROADMAP P5 阶段）的主文档：用 HTML + CSS 描述窗口，事件走
 > `data-on-*` 属性协议。同一份 .html 既能运行时动态装载（`App.LoadHtml`），
 > 也能编译期展开成建树代码（GenHtml 生成器）——两条路径吃同一个解析器，
 > 几何逐盒全等（oracle 裁决）。"web 一样"的布局语义（块流/行盒/float/
-> grid）见 `docs/WEB_GUI_ROADMAP.md`；本文只讲声明层本身的协议与支持面。
+> grid）见 `docs/archive/WEB_GUI_ROADMAP.md`（各阶段已全量落地，归档留档）；
+> 本文只讲声明层本身的协议与支持面。
 
 ## 两条装载路径
 
@@ -251,7 +252,7 @@ IsModeledKey 名单，Inspector 经 extra 原样透传保真）：
 2. `<link rel=stylesheet href=...>`（相对 baseDir）；
 3. style 属性合成的 `.zgen-N` 规则（按文档序编号）。
 
-级联、特异性、!important 全部复用引擎既有机制（`docs/WEB_GUI_ROADMAP.md`
+级联、特异性、!important 全部复用引擎既有机制（`docs/archive/WEB_GUI_ROADMAP.md`
 P0-P4 节）。CSS 支持面（含 grid/flex/float）见 TASKS.md A16。
 
 ## 验证

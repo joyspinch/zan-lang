@@ -59,7 +59,6 @@ views/                  templates, in the module structure of the controllers
   <Module>/*.html         that module's views; a module's own layout.html
                           overrides the global one for that module only
 wwwroot/                the ONLY web-reachable directory, served at /static
-docs/deploy-collab.md   部署、备份恢复演练、升级指引
 ```
 
 `views/` and `wwwroot/` sit next to `src/`, not inside it, because both are read
@@ -382,8 +381,7 @@ seed account. Set the session key — `[auth].secret` in `config/app.json`, or t
 `ZAN_AUTH_SECRET` environment variable which overrides it — to 32+ characters,
 or sign-in fails with a configuration error.
 
-生产部署、MySQL 迁移、备份恢复**演练**步骤与旧库升级路径见
-`docs/deploy-collab.md`。
+生产部署步骤见本文 `### Deploying` 一节。
 
 **Keep generated files out of the source tree.** `-o build/app.exe` exists so the
 executable and the driver DLLs the linker copies beside it land in one throwaway

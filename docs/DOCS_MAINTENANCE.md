@@ -39,8 +39,20 @@
 
 或 `**Status:** Open — <blocker>`。读者不必读全文即可判断该 bug 是否仍然有效。
 
-## 5. 归档位置
+## 5. 位置与索引
 
-- 语言规范层：`docs/`（`SPEC.md` / `ABI.md` 这类）。
+- `docs/README.md` 是全部文档的索引（分区分层 + 一句话说明）。
+- 语言/编译器/标准库等**现行**文档放 `docs/` 根目录。时点报告、被推翻的设计、
+  已全部落地的计划不是现行文档——移入 `docs/archive/`，顶部加归档说明
+  （日期 + 指向现行来源）。
 - 项目专属文档：`docs/projects/<project>/`。
-- 历史/过时文档：`docs/archive/`。
+- 历史/过时文档：`docs/archive/`，冻结不再随实现更新。
+
+## 6. 移动/归档必须同步引用
+
+根目录文档被源码注释、脚本、skills 按路径锚定（`publish_ide.ps1` 有固定发布
+清单，skills 有三份副本：`.agents/skills/` → `tools/ai_pack/skills/` →
+`C:\Users\<user>\.agents\skills\`）。移动或归档文档时，同一次提交里：
+
+1. 全仓库 grep 旧路径，逐处改指新位置（含 skills 三副本）；
+2. 更新 `docs/README.md` 索引。

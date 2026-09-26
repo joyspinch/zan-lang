@@ -210,4 +210,4 @@ automatically when clang is absent (`tests/run_fixedpoint.cmake`).
   a user `op_eq`). There is no universal structural-equality intrinsic.
 
 (The emitter uses a `StringBuilder`, so IR assembly is O(output size); see
-`docs/PERFORMANCE.md` for the memory history.)
+`docs/archive/PERFORMANCE.md` §6 for the memory history.)

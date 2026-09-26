@@ -1,4 +1,11 @@
-﻿# Zan Performance Specification
+﻿> **归档说明（2026-09-26）**：本文 §1–§5 是未落地的目标清单，其中引用的
+> `zan bench`、`zan build --time-report`、`zan run --profile/--mem-profile`、
+> `zan build --sanitize` 等命令**并不存在**（现行命令面见
+> [docs/ZANC_CLI.md](../ZANC_CLI.md)），`tests/benchmarks/` 基准套件与"PR 基准
+> 门禁"也未建设；仅 §6（自举 StringBuilder 内存修复）是已发生的事实记录。
+> 性能问题一律以实测探针为准，勿引用本文目标数字。
+
+# Zan Performance Specification
 
 ## 1. Performance Targets
 
