@@ -584,6 +584,38 @@ Differences from C# (by design or pending compiler work — see
 - **No `ToDictionary`** yet (blocked by a Dictionary generic-value bug).
 - `Grouping<T>` exposes `Key` (string), `IntKey` (int) and `Items`.
 
+### 3.7 System.Threading — tasks & channels (implemented surface)
+
+The shipped task API takes an *async call*, not a lambda (a spawned coroutine
+is a state machine the compiler lowers from a named `async` method):
+
+| Form | Meaning |
+|------|---------|
+| `long h = Task.Spawn(Worker(x))` | run `Worker` as a detached coroutine, return its handle |
+| `long h = Task.Run(Worker(x))` | same lowering under this name |
+| `await Task.Delay(ms)` | suspend this coroutine for `ms` (sleeps at a non-async root) |
+| `await Task.WhenAll(handles)` | suspend until every handle in a `List<long>` has completed |
+| `await Task.WhenAny(handles)` | suspend until one has completed; yields its index |
+| `Task.IsDone(h)` | 1 once that coroutine finished (also 1 for a reaped frame) |
+| `Task.Cancel(h)` / `Task.IsCancellationRequested()` | cooperative cancellation, propagated down the await chain |
+| `TaskJoin.CancelAll(handles)` | cancel every handle not yet finished |
+
+A handle is **not** a `Task<T>`: joins observe *completion only* — no result, no
+exception hand-off. A spawned coroutine publishes its result through shared
+state (a static field, a queue, `System.Threading.BlockingQueue`) that the
+joiner reads after the join. `TaskGroup`, lambda-form `Task.Run` and
+`CancellationToken` parameters do not exist.
+
+`Channel` **is** implemented, but it is **string-only** (non-generic):
+`Send(string)` / `async string Receive()`; a closed-and-drained channel returns
+`""` (`stdlib/System/Threading/Threading.zan:738`).
+
+The async I/O stack is implemented end to end and verified on Linux, macOS and
+Windows: one readiness/completion reactor (`src/runtime/rt_io.c`) with `epoll`
+(Linux), `kqueue` (macOS/BSD), `IOCP` (Windows) and `select` (fallback)
+backends; `Socket.*Async` / `AsyncSocket` / `TcpClient` / `TcpListener` /
+`UdpClient` suspend on it. Lowering details: `docs/ASYNC_CPS_DESIGN.md`.
+
 ## 4. Module Resolution Rules
 
 ### 4.1 Search Order

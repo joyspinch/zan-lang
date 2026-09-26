@@ -14,9 +14,8 @@
 | --- | --- |
 | [SPEC.md](SPEC.md) | 语言规范——语法与语义的权威 |
 | [ABI.md](ABI.md) | 二进制接口：类型布局、调用约定、运行时 ABI |
-| [ASYNC_CPS_DESIGN.md](ASYNC_CPS_DESIGN.md) | async/await 的 CPS 下降设计（编译器/运行时注释锚定） |
-| [CONCURRENCY.md](CONCURRENCY.md) | 并发模型。⚠ 混合文档：§2.1/§8.3 为现状，其余为设计目标（见文内标注） |
-| [SECURITY.md](SECURITY.md) | 安全模型。⚠ 混合文档：部分章节为设计目标（见文内横幅） |
+| [ASYNC_CPS_DESIGN.md](ASYNC_CPS_DESIGN.md) | async/await 的 CPS 下降设计 + I/O 反应器现状（编译器/运行时注释锚定） |
+| [SECURITY.md](SECURITY.md) | 内存安全/unsafe/FFI 的当前行为（含"不存在 X"负向事实清单） |
 
 ## 编译器与工具链
 
@@ -30,7 +29,7 @@
 | [SELF_CONTAINED_TOOLCHAIN.md](SELF_CONTAINED_TOOLCHAIN.md) | 自包含工具链：MinGW ABI + 随包 `ld`，已落地 |
 | [TOOLING.md](TOOLING.md) | `zan-lsp` / `zan-dap` 协议与能力 |
 | [CODING_STANDARDS.md](CODING_STANDARDS.md) | 编译器 C11 开发标准 |
-| [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) | 仓库布局规范 |
+| 仓库代码地图 | `AGENTS.md` 目录表 + [agent-kb/project-map.md](agent-kb/project-map.md)（需求 → 改哪儿，带 grep 关键字） |
 
 ## 标准库与 GUI
 

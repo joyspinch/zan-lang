@@ -1,7 +1,8 @@
-﻿# Zan Security Specification
+# Zan Security Specification
 
-> ⚠️ **本文档部分章节描述的是设计目标而非当前实现，且引用了不存在的 API。**
-> 2026-08-08 审计后修正如下，未逐节重写的部分请勿当作现状引用。
+> **当前实现（2026-09-26 复核）**：本文只描述代码此刻的真实行为；描述未落地
+> 机制（`zan.proj` 依赖验证、沙箱能力等）的旧 §7/§8 已删除。§1–§6 中的
+> "不存在 X"均为经核实的负向事实，勿凭 C# 习惯假设存在对应物。
 
 ## 1. Overview
 
@@ -233,47 +234,3 @@ in the original draft of this section exist. Diagnostics are plain
 there is no `zan build` subcommand.
 
 ---
-
-## 7. Supply Chain Security
-
-### 7.1 Dependency Verification
-
-When using external libraries:
-- Source-based distribution (auditable)
-- SHA256 hash verification for downloaded sources
-- No binary-only dependencies in safe mode
-- Dependency tree is explicit in `zan.proj`
-
-### 7.2 Sandboxing
-
-Future feature: module-level capability restrictions:
-
-```
-project MyApp {
-    dependencies {
-        untrusted_lib {
-            source = "https://..."
-            permissions {
-                allow_net = false       // No network access
-                allow_fs = false        // No filesystem access
-                allow_unsafe = false    // No unsafe code
-                allow_ffi = false       // No native calls
-            }
-        }
-    }
-}
-```
-
----
-
-## 8. Security Checklist for Library Authors
-
-- [ ] Mark all functions that use raw pointers as `unsafe` (`nint`-based APIs)
-- [ ] Validate all input sizes before native calls
-- [ ] Use `weak` references to break potential cycles
-- [ ] Keep managed references alive for callbacks that outlive native call duration
-- [ ] Verify `[StructLayout]` struct sizes match native expectations (mind the `char`/enum layout exception in `docs/ABI.md`)
-- [ ] Document ownership semantics for native resources
-- [ ] Provide safe wrappers around `NativeMemory` operations
-- [ ] Run the runtime/leak checks: compile with `--check-leaks` and run the leakcheck test family (`scripts/test.ps1`)
-
