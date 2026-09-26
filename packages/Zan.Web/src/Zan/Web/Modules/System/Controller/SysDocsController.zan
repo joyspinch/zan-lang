@@ -1,0 +1,134 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using System.Web;
+using Zan.Web.Core;
+using Zan.Web.Protocol;
+
+namespace Zan.Web.Modules.System.Controller;
+
+/// 系统接口文档控制器：读取 WebApp 路由表与编译器提取的参数文档元数据，提供统一视图与端点查询
+[Route("api/system/docs/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("接口文档")]
+class SysDocsController : WebController {
+
+    /// PUT or GET /api/system/docs/conf - 对接 adminUI ZanTable 表格元数据配置
+    [HttpGet]
+    [HttpPut]
+    [Custom(Perm = PermBit.View)]
+    [Description("接口文档表格配置")]
+    public void Conf() {
+        TableConfig tc = new TableConfig();
+        tc.conf.title = "系统接口文档";
+        tc.conf.pageSize = 50;
+
+        tc.columns.Add(new TableColumn("method", "请求方法", 90));
+        tc.columns.Add(new TableColumn("pattern", "接口路径", 240));
+        tc.columns.Add(new TableColumn("title", "接口摘要", 160));
+        tc.columns.Add(new TableColumn("action", "执行动作", 200));
+        tc.columns.Add(new TableColumn("authText", "权限等级", 100));
+        tc.columns.Add(new TableColumn("paramsText", "参数声明", 220));
+
+        tc.filters.Add(new TableFilter("kw", "搜索路径/名称", "text"));
+        tc.filters.Add(new TableFilter("method", "请求方法", "select"));
+
+        this.OkJson(tc.ToJson());
+    }
+
+    /// GET or POST /api/system/docs/page - 列表与分页查询所有注册接口
+    [HttpGet]
+    [HttpPost]
+    [Custom(IsMenu = true, Perm = PermBit.View)]
+    [Description("接口列表")]
+    public void Page() {
+        string kw = this.In("kw");
+        if (kw.Length == 0) { kw = this.In("query"); }
+        string methodFilter = this.In("method").ToUpper();
+        string groupFilter = this.In("group");
+
+        WebApp host = WebHost.Current();
+        List<Route> routes = null;
+        if (host != null) {
+            routes = host.router.All();
+        }
+        if (routes == null) {
+            routes = new List<Route>();
+        }
+
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < routes.Count; i++) {
+            Route r = routes[i];
+            if (methodFilter.Length > 0 && r.method != methodFilter) {
+                continue;
+            }
+            if (kw.Length > 0) {
+                if (!r.pattern.Contains(kw) && !r.title.Contains(kw) && !r.action.Contains(kw)) {
+                    continue;
+                }
+            }
+            if (groupFilter.Length > 0 && !r.pattern.StartsWith(groupFilter)) {
+                continue;
+            }
+
+            JsonValue item = JsonValue.NewObject();
+            item.PutStr("method", r.method);
+            item.PutStr("pattern", r.pattern);
+            item.PutStr("title", r.title.Length > 0 ? r.title : "-");
+            item.PutStr("action", r.action.Length > 0 ? r.action : "-");
+            item.PutStr("authText", SysDocsController.GetAuthText(r));
+            item.PutStr("paramsText", SysDocsController.FormatParams(r));
+            item.PutBool("inMenu", r.inMenu);
+
+            JsonValue pArr = JsonValue.NewArray();
+            for (int j = 0; j < r.docParams.Count; j++) {
+                ApiParam p = r.docParams[j];
+                JsonValue pObj = JsonValue.NewObject();
+                pObj.PutStr("name", p.Name());
+                pObj.PutStr("type", p.Type());
+                pObj.PutBool("required", p.Required());
+                pObj.PutStr("def", p.Default());
+                pObj.PutStr("desc", p.Desc());
+                pObj.PutStr("source", p.Source());
+                pArr.Append(pObj);
+            }
+            item.Put("docParams", pArr);
+            arr.Append(item);
+        }
+
+        JsonValue data = JsonValue.NewObject();
+        data.PutInt("total", arr.Count());
+        data.Put("records", arr);
+        this.OkJson(data.ToJson());
+    }
+
+    /// GET /api/system/docs/openapi - 获取 OpenAPI 3.0 规范 JSON
+    [HttpGet]
+    [Custom(Perm = PermBit.View)]
+    [Description("OpenAPI规范")]
+    public void OpenApi() {
+        WebApp host = WebHost.Current();
+        string spec = ApiDocs.SpecJson(host);
+        this.Ctx().Json(spec);
+    }
+
+    private static string GetAuthText(Route r) {
+        if (r.needsAuth) { return "需授权"; }
+        if (r.needsLogin) { return "需登录"; }
+        return "公开";
+    }
+
+    private static string FormatParams(Route r) {
+        if (r.docParams == null || r.docParams.Count == 0) {
+            return "-";
+        }
+        string s = "";
+        for (int i = 0; i < r.docParams.Count; i++) {
+            ApiParam p = r.docParams[i];
+            if (s.Length > 0) { s = s + ", "; }
+            s = s + p.Name() + ":" + p.Type();
+            if (p.Required()) { s = s + "*"; }
+        }
+        return s;
+    }
+}

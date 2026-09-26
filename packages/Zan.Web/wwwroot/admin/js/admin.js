@@ -119,6 +119,110 @@ async function loadView(name, event) {
     } catch (e) {
       box.innerHTML = '<p style="color:#dc2626;padding:20px 0;">加载角色列表失败</p>';
     }
+  } else if (name === 'docs') {
+    title.innerText = '接口文档与 OpenAPI 规范';
+    tableTitle.innerText = '已注册 API 端点清单 (自动反射自 [Route] / [HttpGet] / [HttpPost])';
+    try {
+      const res = await fetch('/api/system/docs/page');
+      const data = (await res.json()).data || {};
+      const list = data.records || [];
+      let html = `
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;gap:12px;flex-wrap:wrap;">
+          <div style="display:flex;gap:10px;align-items:center;">
+            <input type="text" id="docKw" placeholder="搜索接口路径或名称..." style="padding:6px 10px;border:1px solid #cbd5e1;border-radius:4px;font-size:13px;width:240px;" oninput="filterDocs()" />
+            <span style="font-size:12px;color:#64748b;">共找到 <strong id="docCount">${list.length}</strong> 个端点</span>
+          </div>
+          <div style="display:flex;gap:8px;">
+            <a href="/api/docs" target="_blank" class="btn btn-primary" style="text-decoration:none;display:inline-flex;align-items:center;gap:4px;">📖 打开交互式文档 (Swagger UI)</a>
+            <a href="/api/docs.json" target="_blank" class="btn" style="text-decoration:none;background:#f1f5f9;color:#334155;border:1px solid #cbd5e1;">📥 OpenAPI 3.0 JSON</a>
+          </div>
+        </div>
+        <table id="docsTable">
+          <thead>
+            <tr>
+              <th style="width:80px;">方法</th>
+              <th style="width:240px;">接口路径</th>
+              <th style="width:160px;">接口名称</th>
+              <th style="width:200px;">后端动作</th>
+              <th style="width:90px;">权限</th>
+              <th>参数声明 (由代码调用点自动推导)</th>
+            </tr>
+          </thead>
+          <tbody>`;
+
+      list.forEach(item => {
+        let mClass = 'badge-method-get';
+        if (item.method === 'POST') mClass = 'badge-method-post';
+        else if (item.method === 'PUT') mClass = 'badge-method-put';
+        else if (item.method === 'DELETE') mClass = 'badge-method-delete';
+
+        let authClass = item.authText === '公开' ? 'badge-success' : (item.authText === '需登录' ? 'badge' : 'badge-danger');
+
+        html += `<tr class="doc-row" data-search="${escapeHtml((item.pattern + ' ' + item.title + ' ' + item.action).toLowerCase())}">
+          <td><span class="badge ${mClass}">${item.method}</span></td>
+          <td class="code-cell"><strong>${escapeHtml(item.pattern)}</strong></td>
+          <td>${escapeHtml(item.title)}</td>
+          <td style="font-size:12px;color:#64748b;font-family:monospace;">${escapeHtml(item.action)}</td>
+          <td><span class="badge ${authClass}">${escapeHtml(item.authText)}</span></td>
+          <td style="font-size:12px;color:#475569;">${escapeHtml(item.paramsText)}</td>
+        </tr>`;
+      });
+      html += '</tbody></table>';
+      box.innerHTML = html;
+
+      window.filterDocs = function() {
+        const val = document.getElementById('docKw').value.toLowerCase().trim();
+        const rows = document.querySelectorAll('.doc-row');
+        let count = 0;
+        rows.forEach(r => {
+          const text = r.getAttribute('data-search') || '';
+          if (!val || text.indexOf(val) >= 0) {
+            r.style.display = '';
+            count++;
+          } else {
+            r.style.display = 'none';
+          }
+        });
+        document.getElementById('docCount').innerText = count;
+      };
+    } catch (e) {
+      box.innerHTML = '<p style="color:#dc2626;padding:20px 0;">加载接口文档失败</p>';
+    }
+  } else if (name === 'curd') {
+    title.innerText = '低代码代码生成器 (CURD)';
+    tableTitle.innerText = '数据库表反向工程与代码生成';
+    box.innerHTML = `
+      <div style="padding:16px 0;">
+        <p style="color:#475569;margin-bottom:16px;">基于 Zan.Web 的数据表架构元数据，一键逆向生成对应的 Model 实体、Dao 数据存取层、Controller 控制器以及前端 ZanTable 配置。</p>
+        <div style="display:flex;gap:10px;align-items:center;">
+          <input type="text" id="curdTable" placeholder="输入数据库表名，如 order_info..." style="padding:8px 12px;border:1px solid #cbd5e1;border-radius:6px;width:300px;font-size:14px;" />
+          <button class="btn btn-primary" onclick="generateCode()">🚀 生成代码并预览</button>
+        </div>
+        <div id="curdPreview" style="margin-top:20px;"></div>
+      </div>`;
+
+    window.generateCode = async function() {
+      const table = document.getElementById('curdTable').value.trim();
+      const prev = document.getElementById('curdPreview');
+      if (!table) { alert('请输入表名'); return; }
+      prev.innerHTML = '<p style="color:#64748b;">正在解析表结构并生成代码...</p>';
+      try {
+        const res = await fetch('/api/dev/curd/generate?table=' + encodeURIComponent(table));
+        const resJson = await res.json();
+        if (resJson.code !== 0) {
+          prev.innerHTML = `<p style="color:#dc2626;">生成失败: ${escapeHtml(resJson.msg)}</p>`;
+          return;
+        }
+        const data = resJson.data || {};
+        prev.innerHTML = `
+          <div style="display:flex;flex-direction:column;gap:12px;">
+            <h4>Model 实体代码预览:</h4>
+            <pre style="background:#0f172a;color:#f8fafc;padding:14px;border-radius:6px;font-size:12px;overflow-x:auto;">${escapeHtml(data.modelCode || '// 无 Model 代码')}</pre>
+          </div>`;
+      } catch (e) {
+        prev.innerHTML = '<p style="color:#dc2626;">请求失败，请检查网络或后端接口</p>';
+      }
+    };
   }
 }
 
