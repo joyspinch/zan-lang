@@ -34,13 +34,14 @@ src/ZanWeb/             包源码。目录是工程组织（Framework/Modules �
                             LoginThrottle · VerifyCode
     Ai/                     横切·AI：AI 助手注册与端点策略
     *.zan                   接入层基座：App/Api/AdminController 三基类 · AppServices ·
-                            Crud 网关 · ListPage/FormPage 屏基座 · Fmt/Lang/Prose 渲染件
+                            CrudOps 写网关 · ListPage/FormPage 屏基座 · Fmt/Lang/Prose 渲染件
   Modules/                业务模块，一个目录一个模块（垂直切片：Controller+Model+Dao）
     Sys/
       Controller/           接入层：目录=URL 族（Account/ Admin/ Api/ Blog/
                             Health/ Index/ User/），一类一文件
-      Model/  Dao/          数据层：sys_* 实体与 DAO（每表一个 DAO，全部查询
-                            与写入口）；Model/Blog/、Dao/Blog/ 为示例模块
+      Model/  Dao/          数据层：sys_* 实体与 DAO（DAO 只放跨表 JOIN/聚合/
+                            复杂动态条件，单表读写走实体链，见「代码规范」）；
+                            Model/Blog/、Dao/Blog/ 为示例模块
     Crud/                   配置驱动管理屏引擎
       Controller/             CrudScreenController.zan——接入层基座（继承
                               AppController 即控制器，无论是否自带路由）
@@ -66,6 +67,74 @@ wwwroot/                唯一 Web 可达目录，挂载在 /static（css/js/ven
 
 视图键由 `View.LoadRec` 按目录路径推导（`views/Admin/System/SysUsers.Index.html`
 → `Admin.System.SysUsers.Index`），与控制器命名空间同构——看到路径即知键名。
+
+## 代码规范
+
+词表化命名 + 三种 DB 形态各管一摊。规则全部机械可查；每条带"为什么"。
+
+### 命名词表
+
+**取参族：基名 + `Any` 变体。** 基名只读 route/query/form（表单编码）；
+`*Any` 变体在基语义上追加收 JSON 体顶层字段——自研壳（表单编码）与
+adminUI（JSON 体）两套前端同动作双兼容靠它。成员按所在层住：
+
+| 层                          | 基名                  | Any 变体            |
+|-----------------------------|-----------------------|---------------------|
+| stdlib `Controller`         | `In` `InInt` `Paged`  | —                   |
+| Framework `AppController`   | —                     | `InAny` `InAnyInt`  |
+| Framework `AdminController` | `Ids(name)`           | —                   |
+| Modules `CrudScreenController` | —                  | `IdsAny` `PagedAny` |
+
+新取参一律进这个族：基语义在哪个层就加在哪层，不发明第三个后缀。
+（为什么：Any 后缀在接 adminUI 时没成文，看着像随手起名——实际四对
+`In/InAny`、`InInt/InAnyInt`、`Ids/IdsAny`、`Paged/PagedAny` 全对齐；
+写下来之后"乱"变"规则"。）
+
+**动作词表。** 自有动作与前端合同动作分列；合同词由前端源码钉死，改词
+即断前端，改动前必须对照 adminUI：
+
+- 自有：`index` `form` `save` `delete` `batch` `field` `options`
+- adminUI 合同：`conf`(PUT 配置下发) · `list`(POST JSON 筛选列表) ·
+  `edit`(POST 单行回显——合同词，读语义) · `formconf`(PUT 表单配置)
+
+**`Crud*` 语义前缀**只有三类角色，新增类型先对号入座：
+
+| 类型                  | 位置                          | 角色                         |
+|-----------------------|-------------------------------|------------------------------|
+| `CrudConf`            | Modules/Crud/Model/           | 屏面声明（描述字段/表单/校验）|
+| `CrudScreenController`| Modules/Crud/Controller/      | 屏引擎基座                   |
+| `CrudOps`             | Framework/                    | 声明驱动的通用写动作与 conf 投影网关 |
+
+（为什么：曾有静态网关 `class Crud` 与模块命名空间 `ZanWeb.Crud` 撞名，
+看名字分不清角色——已更名 `CrudOps`。）
+
+### DB 访问规范
+
+三种形态各管一摊，不混用：
+
+1. **实体链（默认）**：`this.SysUser.Select<...>`——编译期表访问器，
+   字段名编译期校验。单表读写一律走它。
+2. **DAO（跨表/聚合才建）**：`XxxDao(AppController host)` 收宿主解析
+   连接；只放跨表 JOIN、聚合统计、复杂动态条件。**禁止**新增与实体链
+   逐字重复的方法（现存 `SysUserDao.ById` 等属历史债务：不扩散、不改
+   依赖它的调用点，但改到相关文件时顺手收敛到实体链）。
+3. **`DbTable` 运行期网关（仅配置驱动场景）**：表名/列名运行期才确定
+   的（Crud 引擎、代码生成器）走 `DbTable.Of`；标识符过 `Gen.Safe`+
+   `RequireIdent` 双校验，值一律 `?` 占位符。业务代码**禁手拼 SQL**
+   （现状为零，保持为零）。
+
+**连接获取 2×2 矩阵 + 协作者口**（共五个口，各有唯一语义）：
+
+| 取法                         | 写/默认              | 只读（从库，事务中强制主库） |
+|------------------------------|----------------------|------------------------------|
+| 异步借出（动作内首次取数）   | `await Conn()`       | `await ReadConn()`           |
+| 同步取已借（辅助函数）       | `Held()`             | `HeldRead()`                 |
+| 跨类协作者（静态网关/DAO 收宿主） | `__Conn()`（公开，唯此一处） |                    |
+
+规则：动作里第一次取数用异步口；`Held*` 只准在"同动作已 `await` 过对应
+异步口"之后使用；`__Conn` 供够不着 protected 口的协作者（静态网关、
+DAO）解析请求连接，控制器内部不用它。（为什么：五个口曾无成文语义，
+借还与只读回退全靠注释撑；矩阵写死后，用错口变成可 review 出来的事。）
 
 ## 配置驱动的管理屏（Modules/Crud）
 
