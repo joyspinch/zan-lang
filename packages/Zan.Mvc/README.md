@@ -41,9 +41,10 @@ src/ZanWeb/             包源码。目录是工程组织（Framework/Modules �
                             Health/ Index/ User/），一类一文件
       Model/  Dao/          数据层：sys_* 实体与 DAO（每表一个 DAO，全部查询
                             与写入口）；Model/Blog/、Dao/Blog/ 为示例模块
-    Crud/                   配置驱动管理屏引擎（CrudConf.zan 声明 +
-                            CrudScreen.zan 基座，扁平挂模块根——两者都
-                            不是路由控制器，Controller/ 只放真控制器）
+    Crud/                   配置驱动管理屏引擎
+      Controller/             CrudScreen.zan——接入层基座（继承
+                              AppController 即控制器，无论是否自带路由）
+      CrudConf.zan            声明 schema（非控制器非实体，挂模块根）
 views/                  页面模板，按控制器模块分目录（随包资产）
   layout.html             全站布局；模块自有 layout.html 仅覆盖本模块
 wwwroot/                唯一 Web 可达目录，挂载在 /static（css/js/vendor/i18n）
@@ -58,6 +59,9 @@ wwwroot/                唯一 Web 可达目录，挂载在 /static（css/js/ven
 2. **依赖单向**：`Modules/* → Framework/*`；Framework 不引用任何模块，
    控制器基类、屏幕原语、基础设施全部住在 Framework，新模块照 Sys 的
    形状即可接入，不产生模块间依赖。
+3. **`Controller/` 的成员资格机械可查**：继承 `AppController` 的类
+   （路由控制器与控制器基座）进 `Controller/`，其余类型（声明、实体、
+   DAO、视图助手）不进——判定看类声明的继承链，不看是否自带路由属性。
 
 视图键由 `View.LoadRec` 按目录路径推导（`views/Admin/System/SysUsers.Index.html`
 → `Admin.System.SysUsers.Index`），与控制器命名空间同构——看到路径即知键名。
