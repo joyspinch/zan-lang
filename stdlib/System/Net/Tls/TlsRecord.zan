@@ -82,25 +82,54 @@ class TlsCipherState {
     byte[] key;
     byte[] iv;
     long seq;
+    byte[] gcmCtx;
+    bool hasCtx;
+    byte[] nonceBuf;
+    byte[] seqBuf;
+    byte[] aadBuf;
 
     TlsCipherState(int version, byte[] key, byte[] iv) {
         this.version = version;
         this.key = key;
         this.iv = iv;
         this.seq = 0;
+        this.gcmCtx = new byte[384];
+        this.nonceBuf = new byte[12];
+        this.seqBuf = new byte[8];
+        this.aadBuf = new byte[13];
+        long initRes = NativeMemory.AesGcmInit(this.gcmCtx, 384, key, 128);
+        this.hasCtx = (initRes == 0);
     }
 
     int Version() { return this.version; }
     long SequenceNumber() { return this.seq; }
 
+    int RecordLen(int plainLen) {
+        if (this.version == TlsRecord.VersionTls13) {
+            return plainLen + 22; // 5 + (plainLen + 1) + 16
+        } else {
+            return plainLen + 29; // 5 + 8 + plainLen + 16
+        }
+    }
+
+    /// <summary>直写加密并封装为完整 TLS 记录（含 5 字节记录头）。返回写入的记录总字节数，失败返回 -1。</summary>
+    int EncryptToBuf(int contentType, nint dataPtr, int len, byte[] outBuf, int outOffset) {
+        if (outBuf == null || len < 0 || outOffset < 0) { return -1; }
+        if (this.version == TlsRecord.VersionTls13) {
+            return this.EncryptTls13ToBuf(contentType, dataPtr, len, outBuf, outOffset);
+        } else {
+            return this.EncryptTls12ToBuf(contentType, dataPtr, len, outBuf, outOffset);
+        }
+    }
+
     /// <summary>加密明文负载并封装为完整 TLS 记录（含 5 字节记录头）。</summary>
     byte[] Encrypt(int contentType, byte[] data, int offset, int len) {
         if (data == null || offset < 0 || len < 0 || offset + len > data.Length) { return null; }
-        if (this.version == TlsRecord.VersionTls13) {
-            return this.EncryptTls13(contentType, data, offset, len);
-        } else {
-            return this.EncryptTls12(contentType, data, offset, len);
-        }
+        int recLen = this.RecordLen(len);
+        byte[] record = new byte[recLen];
+        int written = this.EncryptToBuf(contentType, (nint)data + (nint)offset, len, record, 0);
+        if (written <= 0) { return null; }
+        return record;
     }
 
     /// <summary>解密 TLS 记录密文负载，剥离认证标签与填充，产出原始明文与真实 ContentType。</summary>
@@ -117,53 +146,57 @@ class TlsCipherState {
 
     /* ---- TLS 1.2 记录层加解密 (RFC 5246 / RFC 5288) ---- */
 
-    byte[] EncryptTls12(int contentType, byte[] data, int offset, int len) {
-        // 1. 生成 8 字节 explicit_nonce (采用大端序列号)
-        byte[] explicitNonce = new byte[8];
-        TlsRecord.WriteSeq64(explicitNonce, 0, this.seq);
-
-        // 2. 构造 12 字节 Nonce: 4 字节 implicit_iv || 8 字节 explicit_nonce
-        byte[] nonce = new byte[12];
-        for (int i = 0; i < 4; i = i + 1) { nonce[i] = (byte)(this.iv[i] & 255); }
-        for (int i = 0; i < 8; i = i + 1) { nonce[4 + i] = (byte)(explicitNonce[i] & 255); }
-
-        // 3. 构造 13 字节 AAD: seq(8) || type(1) || 0x03, 0x03 || len(2)
-        byte[] aad = new byte[13];
-        TlsRecord.WriteSeq64(aad, 0, this.seq);
-        aad[8] = (byte)(contentType & 255);
-        aad[9] = 3;
-        aad[10] = 3;
-        aad[11] = (byte)((len >> 8) & 255);
-        aad[12] = (byte)(len & 255);
-
-        // 4. 组装 TLS 1.2 记录: header(5) || explicitNonce(8) || ct(len) || tag(16)
+    int EncryptTls12ToBuf(int contentType, nint dataPtr, int len, byte[] outBuf, int outOffset) {
         int payloadLen = 8 + len + 16;
-        byte[] record = new byte[5 + payloadLen];
-        record[0] = (byte)(contentType & 255);
-        record[1] = 3;
-        record[2] = 3;
-        record[3] = (byte)((payloadLen >> 8) & 255);
-        record[4] = (byte)(payloadLen & 255);
+        int totalRecLen = 5 + payloadLen;
+        if (outOffset + totalRecLen > outBuf.Length) { return -1; }
 
-        NativeMemory.Copy((nint)record + 5, explicitNonce, 8);
+        nint outPtr = (nint)outBuf + (nint)outOffset;
 
-        nint ptPtr = (nint)data + (nint)offset;
-        nint ctPtr = (nint)record + 13;
+        // 1. 外部记录头 (5 字节)
+        outBuf[outOffset + 0] = (byte)(contentType & 255);
+        outBuf[outOffset + 1] = 3;
+        outBuf[outOffset + 2] = 3;
+        outBuf[outOffset + 3] = (byte)((payloadLen >> 8) & 255);
+        outBuf[outOffset + 4] = (byte)(payloadLen & 255);
+
+        // 2. 8 字节 explicitNonce
+        TlsRecord.WriteSeq64(this.seqBuf, 0, this.seq);
+        NativeMemory.Copy(outPtr + 5, this.seqBuf, 8);
+
+        // 3. 12 字节 Nonce: 4 字节 implicit_iv || 8 字节 explicit_nonce
+        for (int i = 0; i < 4; i = i + 1) { this.nonceBuf[i] = (byte)(this.iv[i] & 255); }
+        for (int i = 0; i < 8; i = i + 1) { this.nonceBuf[4 + i] = (byte)(this.seqBuf[i] & 255); }
+
+        // 4. 13 字节 AAD
+        TlsRecord.WriteSeq64(this.aadBuf, 0, this.seq);
+        this.aadBuf[8] = (byte)(contentType & 255);
+        this.aadBuf[9] = 3;
+        this.aadBuf[10] = 3;
+        this.aadBuf[11] = (byte)((len >> 8) & 255);
+        this.aadBuf[12] = (byte)(len & 255);
+
+        nint ctPtr = outPtr + 13;
         nint tagPtr = ctPtr + (nint)len;
 
-        long hwRes = NativeMemory.AesGcmEncrypt(this.key, 128, nonce, aad, 13, ptPtr, (long)len, ctPtr, tagPtr);
+        long hwRes = -1;
+        if (this.hasCtx) {
+            hwRes = NativeMemory.AesGcmEncryptCtx(this.gcmCtx, this.nonceBuf, this.aadBuf, 13, dataPtr, (long)len, ctPtr, tagPtr);
+        } else {
+            hwRes = NativeMemory.AesGcmEncrypt(this.key, 128, this.nonceBuf, this.aadBuf, 13, dataPtr, (long)len, ctPtr, tagPtr);
+        }
         if (hwRes < 0) {
             byte[] pt = new byte[len];
-            if (len > 0) { NativeMemory.Copy(pt, ptPtr, len); }
+            if (len > 0 && dataPtr != 0) { NativeMemory.Copy(pt, dataPtr, len); }
             byte[] tag = new byte[16];
-            byte[] ct = AesGcm.Encrypt(this.key, 16, nonce, aad, 13, pt, len, tag);
-            if (ct == null) { return null; }
-            if (len > 0) { NativeMemory.Copy(ctPtr, ct, len); }
+            byte[] ct = AesGcm.Encrypt(this.key, 16, this.nonceBuf, this.aadBuf, 13, pt, len, tag);
+            if (ct == null) { return -1; }
+            NativeMemory.Copy(ctPtr, ct, len);
             NativeMemory.Copy(tagPtr, tag, 16);
         }
 
         this.seq = this.seq + 1;
-        return record;
+        return totalRecLen;
     }
 
     byte[] DecryptTls12(byte[] header, byte[] payload, int pOffset, int pLen, List<int> outContentType) {
@@ -171,25 +204,28 @@ class TlsCipherState {
         if (pLen < 24) { return null; }
         int ctLen = pLen - 24;
 
-        // 1. 提取 8 字节 explicit_nonce
-        byte[] nonce = new byte[12];
-        NativeMemory.Copy(nonce, this.iv, 4);
-        NativeMemory.Copy((nint)nonce + 4, (nint)payload + (nint)pOffset, 8);
+        // 1. 提取 8 字节 explicit_nonce 并构造 12 字节 Nonce
+        NativeMemory.Copy(this.nonceBuf, this.iv, 4);
+        NativeMemory.Copy((nint)this.nonceBuf + 4, (nint)payload + (nint)pOffset, 8);
 
         // 2. 构造 13 字节 AAD
-        byte[] aad = new byte[13];
-        TlsRecord.WriteSeq64(aad, 0, this.seq);
-        aad[8] = (byte)(header[0] & 255);
-        aad[9] = 3;
-        aad[10] = 3;
-        aad[11] = (byte)((ctLen >> 8) & 255);
-        aad[12] = (byte)(ctLen & 255);
+        TlsRecord.WriteSeq64(this.aadBuf, 0, this.seq);
+        this.aadBuf[8] = (byte)(header[0] & 255);
+        this.aadBuf[9] = 3;
+        this.aadBuf[10] = 3;
+        this.aadBuf[11] = (byte)((ctLen >> 8) & 255);
+        this.aadBuf[12] = (byte)(ctLen & 255);
 
         nint ctPtr = (nint)payload + (nint)pOffset + 8;
         nint tagPtr = ctPtr + (nint)ctLen;
 
         byte[] pt = new byte[ctLen];
-        long hwRes = NativeMemory.AesGcmDecrypt(this.key, 128, nonce, aad, 13, ctPtr, (long)ctLen, tagPtr, pt);
+        long hwRes = -1;
+        if (this.hasCtx) {
+            hwRes = NativeMemory.AesGcmDecryptCtx(this.gcmCtx, this.nonceBuf, this.aadBuf, 13, ctPtr, (long)ctLen, tagPtr, pt);
+        } else {
+            hwRes = NativeMemory.AesGcmDecrypt(this.key, 128, this.nonceBuf, this.aadBuf, 13, ctPtr, (long)ctLen, tagPtr, pt);
+        }
         if (hwRes < 0) {
             if (hwRes == -2) { return null; }
             byte[] ct = new byte[ctLen];
@@ -197,7 +233,7 @@ class TlsCipherState {
             byte[] tag = new byte[16];
             NativeMemory.Copy(tag, tagPtr, 16);
             List<int> ok = new List<int>(); ok.Add(0);
-            pt = AesGcm.Decrypt(this.key, 16, nonce, aad, 13, ct, ctLen, tag, ok);
+            pt = AesGcm.Decrypt(this.key, 16, this.nonceBuf, this.aadBuf, 13, ct, ctLen, tag, ok);
             if (pt == null || ok[0] != -1) { return null; }
         }
 
@@ -208,51 +244,56 @@ class TlsCipherState {
 
     /* ---- TLS 1.3 记录层加解密 (RFC 8446 §5.2 / §5.3) ---- */
 
-    byte[] EncryptTls13(int contentType, byte[] data, int offset, int len) {
-        // 1. 构造内部明文: plaintext || real_content_type
+    int EncryptTls13ToBuf(int contentType, nint dataPtr, int len, byte[] outBuf, int outOffset) {
         int innerLen = len + 1;
-        byte[] inner = new byte[innerLen];
-        if (len > 0) {
-            NativeMemory.Copy(inner, (nint)data + (nint)offset, len);
-        }
-        inner[len] = (byte)(contentType & 255);
-
-        // 2. 构造 12 字节 Nonce: 12 字节 IV ^ (64 位大端 seq 放在低 8 字节)
-        byte[] nonce = new byte[12];
-        NativeMemory.Copy(nonce, this.iv, 12);
-        byte[] seqBytes = new byte[8];
-        TlsRecord.WriteSeq64(seqBytes, 0, this.seq);
-        for (int i = 0; i < 8; i = i + 1) {
-            nonce[4 + i] = (byte)((nonce[4 + i] & 255) ^ (seqBytes[i] & 255));
-        }
-
-        // 3. 构造 5 字节外部记录头与 AAD: 0x17, 0x03, 0x03, (innerLen + 16)
         int payloadLen = innerLen + 16;
-        byte[] header = new byte[5];
-        header[0] = (byte)TlsRecord.ContentTypeApplicationData; // 23
-        header[1] = 3;
-        header[2] = 3;
-        header[3] = (byte)((payloadLen >> 8) & 255);
-        header[4] = (byte)(payloadLen & 255);
+        int totalRecLen = 5 + payloadLen;
+        if (outOffset + totalRecLen > outBuf.Length) { return -1; }
 
-        // 4. 组装外层记录并一体化原地加密
-        byte[] record = new byte[5 + payloadLen];
-        NativeMemory.Copy(record, header, 5);
+        nint outPtr = (nint)outBuf + (nint)outOffset;
 
-        nint ctPtr = (nint)record + 5;
-        nint tagPtr = ctPtr + (nint)innerLen;
+        // 1. 外部记录头 (5 字节)
+        outBuf[outOffset + 0] = (byte)TlsRecord.ContentTypeApplicationData; // 23
+        outBuf[outOffset + 1] = 3;
+        outBuf[outOffset + 2] = 3;
+        outBuf[outOffset + 3] = (byte)((payloadLen >> 8) & 255);
+        outBuf[outOffset + 4] = (byte)(payloadLen & 255);
 
-        long hwRes = NativeMemory.AesGcmEncrypt(this.key, 128, nonce, header, 5, inner, (long)innerLen, ctPtr, tagPtr);
+        // 2. 将明文拷贝到内部明文位置 (outPtr + 5)，末尾追加 contentType
+        nint ptPtr = outPtr + 5;
+        if (len > 0 && dataPtr != 0) {
+            NativeMemory.Copy(ptPtr, dataPtr, len);
+        }
+        outBuf[outOffset + 5 + len] = (byte)(contentType & 255);
+
+        // 3. 构造 12 字节 Nonce: 12 字节 IV ^ (64 位大端 seq 放在低 8 字节)
+        NativeMemory.Copy(this.nonceBuf, this.iv, 12);
+        TlsRecord.WriteSeq64(this.seqBuf, 0, this.seq);
+        for (int i = 0; i < 8; i = i + 1) {
+            this.nonceBuf[4 + i] = (byte)((this.nonceBuf[4 + i] & 255) ^ (this.seqBuf[i] & 255));
+        }
+
+        // 4. AAD 即 5 字节外部记录头
+        nint tagPtr = ptPtr + (nint)innerLen;
+
+        long hwRes = -1;
+        if (this.hasCtx) {
+            hwRes = NativeMemory.AesGcmEncryptCtx(this.gcmCtx, this.nonceBuf, outPtr, 5, ptPtr, (long)innerLen, ptPtr, tagPtr);
+        } else {
+            hwRes = NativeMemory.AesGcmEncrypt(this.key, 128, this.nonceBuf, outPtr, 5, ptPtr, (long)innerLen, ptPtr, tagPtr);
+        }
         if (hwRes < 0) {
+            byte[] pt = new byte[innerLen];
+            NativeMemory.Copy(pt, ptPtr, innerLen);
             byte[] tag = new byte[16];
-            byte[] ct = AesGcm.Encrypt(this.key, 16, nonce, header, 5, inner, innerLen, tag);
-            if (ct == null) { return null; }
-            if (innerLen > 0) { NativeMemory.Copy(ctPtr, ct, innerLen); }
+            byte[] ct = AesGcm.Encrypt(this.key, 16, this.nonceBuf, outBuf, 5, pt, innerLen, tag);
+            if (ct == null) { return -1; }
+            NativeMemory.Copy(ptPtr, ct, innerLen);
             NativeMemory.Copy(tagPtr, tag, 16);
         }
 
         this.seq = this.seq + 1;
-        return record;
+        return totalRecLen;
     }
 
     byte[] DecryptTls13(byte[] header, byte[] payload, int pOffset, int pLen, List<int> outContentType) {
@@ -261,12 +302,10 @@ class TlsCipherState {
         int ctLen = pLen - 16;
 
         // 1. 构造 12 字节 Nonce
-        byte[] nonce = new byte[12];
-        NativeMemory.Copy(nonce, this.iv, 12);
-        byte[] seqBytes = new byte[8];
-        TlsRecord.WriteSeq64(seqBytes, 0, this.seq);
+        NativeMemory.Copy(this.nonceBuf, this.iv, 12);
+        TlsRecord.WriteSeq64(this.seqBuf, 0, this.seq);
         for (int i = 0; i < 8; i = i + 1) {
-            nonce[4 + i] = (byte)((nonce[4 + i] & 255) ^ (seqBytes[i] & 255));
+            this.nonceBuf[4 + i] = (byte)((this.nonceBuf[4 + i] & 255) ^ (this.seqBuf[i] & 255));
         }
 
         // 2. 提取 ct 与 tag 指针并一体化解密
@@ -274,7 +313,12 @@ class TlsCipherState {
         nint tagPtr = ctPtr + (nint)ctLen;
 
         byte[] inner = new byte[ctLen];
-        long hwRes = NativeMemory.AesGcmDecrypt(this.key, 128, nonce, header, 5, ctPtr, (long)ctLen, tagPtr, inner);
+        long hwRes = -1;
+        if (this.hasCtx) {
+            hwRes = NativeMemory.AesGcmDecryptCtx(this.gcmCtx, this.nonceBuf, header, 5, ctPtr, (long)ctLen, tagPtr, inner);
+        } else {
+            hwRes = NativeMemory.AesGcmDecrypt(this.key, 128, this.nonceBuf, header, 5, ctPtr, (long)ctLen, tagPtr, inner);
+        }
         if (hwRes < 0) {
             if (hwRes == -2) { return null; }
             byte[] ct = new byte[ctLen];
@@ -282,7 +326,7 @@ class TlsCipherState {
             byte[] tag = new byte[16];
             NativeMemory.Copy(tag, tagPtr, 16);
             List<int> ok = new List<int>(); ok.Add(0);
-            inner = AesGcm.Decrypt(this.key, 16, nonce, header, 5, ct, ctLen, tag, ok);
+            inner = AesGcm.Decrypt(this.key, 16, this.nonceBuf, header, 5, ct, ctLen, tag, ok);
             if (inner == null || ok[0] != -1) { return null; }
         }
 

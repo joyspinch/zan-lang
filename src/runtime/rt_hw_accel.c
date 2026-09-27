@@ -1843,42 +1843,164 @@ int64_t zan_hw_ghash_update(const uint8_t *h16, const uint8_t *data, int64_t len
     return -1;
 }
 
-int64_t zan_hw_aes_gcm_encrypt(const uint8_t *key, int keybits,
-                               const uint8_t *iv12,
-                               const uint8_t *aad, int64_t aadLen,
-                               const uint8_t *in, int64_t inLen,
-                               uint8_t *out, uint8_t *tag16) {
-    if (!key || !iv12 || !tag16) return -1;
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("aes,sse4.1")))
+static void zan_aes_ecb_block_rk(const uint8_t rkb[15][16], int nr, const uint8_t *in16, uint8_t *out16) {
+    __m128i b = _mm_loadu_si128((const __m128i*)in16);
+    b = _mm_xor_si128(b, _mm_loadu_si128((const __m128i*)rkb[0]));
+    for (int r = 1; r < nr; r++) {
+        b = _mm_aesenc_si128(b, _mm_loadu_si128((const __m128i*)rkb[r]));
+    }
+    b = _mm_aesenclast_si128(b, _mm_loadu_si128((const __m128i*)rkb[nr]));
+    _mm_storeu_si128((__m128i*)out16, b);
+}
+
+__attribute__((target("aes,sse4.1")))
+static void zan_aes_ctr_ni_4way(const uint8_t rkb[15][16], int nr,
+                                const uint8_t *in, int64_t len,
+                                uint8_t *counter16, uint8_t *out) {
+    __m128i rk[15];
+    for (int i = 0; i <= nr; i++) rk[i] = _mm_loadu_si128((const __m128i*)rkb[i]);
+
+    uint8_t ctr0[16], ctr1[16], ctr2[16], ctr3[16];
+    memcpy(ctr0, counter16, 16);
+    int64_t off = 0;
+
+    while (off + 64 <= len) {
+        memcpy(ctr1, ctr0, 16);
+        for (int j = 15; j >= 0; j--) { if (++ctr1[j] != 0) break; }
+        memcpy(ctr2, ctr1, 16);
+        for (int j = 15; j >= 0; j--) { if (++ctr2[j] != 0) break; }
+        memcpy(ctr3, ctr2, 16);
+        for (int j = 15; j >= 0; j--) { if (++ctr3[j] != 0) break; }
+
+        __m128i ks0 = _mm_xor_si128(_mm_loadu_si128((const __m128i*)ctr0), rk[0]);
+        __m128i ks1 = _mm_xor_si128(_mm_loadu_si128((const __m128i*)ctr1), rk[0]);
+        __m128i ks2 = _mm_xor_si128(_mm_loadu_si128((const __m128i*)ctr2), rk[0]);
+        __m128i ks3 = _mm_xor_si128(_mm_loadu_si128((const __m128i*)ctr3), rk[0]);
+
+        for (int r = 1; r < nr; r++) {
+            ks0 = _mm_aesenc_si128(ks0, rk[r]);
+            ks1 = _mm_aesenc_si128(ks1, rk[r]);
+            ks2 = _mm_aesenc_si128(ks2, rk[r]);
+            ks3 = _mm_aesenc_si128(ks3, rk[r]);
+        }
+        ks0 = _mm_aesenclast_si128(ks0, rk[nr]);
+        ks1 = _mm_aesenclast_si128(ks1, rk[nr]);
+        ks2 = _mm_aesenclast_si128(ks2, rk[nr]);
+        ks3 = _mm_aesenclast_si128(ks3, rk[nr]);
+
+        __m128i in0 = _mm_loadu_si128((const __m128i*)(in + off));
+        __m128i in1 = _mm_loadu_si128((const __m128i*)(in + off + 16));
+        __m128i in2 = _mm_loadu_si128((const __m128i*)(in + off + 32));
+        __m128i in3 = _mm_loadu_si128((const __m128i*)(in + off + 48));
+
+        _mm_storeu_si128((__m128i*)(out + off), _mm_xor_si128(in0, ks0));
+        _mm_storeu_si128((__m128i*)(out + off + 16), _mm_xor_si128(in1, ks1));
+        _mm_storeu_si128((__m128i*)(out + off + 32), _mm_xor_si128(in2, ks2));
+        _mm_storeu_si128((__m128i*)(out + off + 48), _mm_xor_si128(in3, ks3));
+
+        memcpy(ctr0, ctr3, 16);
+        for (int j = 15; j >= 0; j--) { if (++ctr0[j] != 0) break; }
+        off += 64;
+    }
+
+    while (off < len) {
+        __m128i ks = _mm_loadu_si128((const __m128i*)ctr0);
+        ks = _mm_xor_si128(ks, rk[0]);
+        for (int r = 1; r < nr; r++) ks = _mm_aesenc_si128(ks, rk[r]);
+        ks = _mm_aesenclast_si128(ks, rk[nr]);
+
+        int avail = (int)(len - off);
+        if (avail >= 16) {
+            __m128i blk = _mm_loadu_si128((const __m128i*)(in + off));
+            _mm_storeu_si128((__m128i*)(out + off), _mm_xor_si128(blk, ks));
+        } else {
+            uint8_t tmpIn[16] = {0};
+            memcpy(tmpIn, in + off, (size_t)avail);
+            __m128i blk = _mm_loadu_si128((const __m128i*)tmpIn);
+            __m128i o = _mm_xor_si128(blk, ks);
+            uint8_t tmpOut[16];
+            _mm_storeu_si128((__m128i*)tmpOut, o);
+            memcpy(out + off, tmpOut, (size_t)avail);
+        }
+        for (int j = 15; j >= 0; j--) { if (++ctr0[j] != 0) break; }
+        off += 16;
+    }
+    memcpy(counter16, ctr0, 16);
+}
+#endif
+
+int64_t zan_hw_aes_gcm_init(uint8_t *ctxBuf, int64_t ctxLen, const uint8_t *key, int keybits) {
+    if (!ctxBuf || ctxLen < (int64_t)sizeof(zan_gcm_ctx_t) || !key) return -1;
+    if (keybits != 128 && keybits != 192 && keybits != 256) return -1;
+
+    zan_gcm_ctx_t *ctx = (zan_gcm_ctx_t*)ctxBuf;
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->magic = 0x47434D31;
+    ctx->keybits = keybits;
+
+    zan_aes_expand_key(key, keybits, ctx->rkb, &ctx->nr);
+
+    /* Compute H = E_K(0) */
+    uint8_t zero16[16] = {0};
+    if (zan_hw_aes_ecb_block(key, keybits, zero16, ctx->h16) != 0) return -1;
+
+    for (int i = 0; i < 16; i++) {
+        ctx->h_bswap[i] = ctx->h16[15 - i];
+    }
+    return 0;
+}
+
+int64_t zan_hw_aes_gcm_encrypt_ctx(const uint8_t *ctxBuf,
+                                   const uint8_t *iv12,
+                                   const uint8_t *aad, int64_t aadLen,
+                                   const uint8_t *in, int64_t inLen,
+                                   uint8_t *out, uint8_t *tag16) {
+    if (!ctxBuf || !iv12 || !tag16) return -1;
+    const zan_gcm_ctx_t *ctx = (const zan_gcm_ctx_t*)ctxBuf;
+    if (ctx->magic != 0x47434D31) return -1;
     if (aadLen < 0 || inLen < 0) return -1;
     if (aadLen > 0 && !aad) return -1;
     if (inLen > 0 && (!in || !out)) return -1;
-    if (keybits != 128 && keybits != 192 && keybits != 256) return -1;
-
-    uint8_t zero16[16] = {0};
-    uint8_t h16[16];
-    if (zan_hw_aes_ecb_block(key, keybits, zero16, h16) != 0) return -1;
 
     uint8_t j0[16] = {0};
     memcpy(j0, iv12, 12);
     j0[15] = 1;
 
     uint8_t ej0[16];
-    if (zan_hw_aes_ecb_block(key, keybits, j0, ej0) != 0) return -1;
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
+    if (g_gate_aes == 1 || zan_hw_gate(&g_gate_aes, zan_hw_has_aesni(), zan_aes_kat)) {
+        zan_aes_ecb_block_rk(ctx->rkb, ctx->nr, j0, ej0);
+    } else {
+        if (zan_hw_aes_ecb_block(ctx->rkb[0], ctx->keybits, j0, ej0) != 0) return -1;
+    }
+#else
+    if (zan_hw_aes_ecb_block(ctx->rkb[0], ctx->keybits, j0, ej0) != 0) return -1;
+#endif
 
     uint8_t ctr[16];
     memcpy(ctr, j0, 16);
     ctr[15] = 2;
 
     if (inLen > 0) {
-        if (zan_hw_aes_ctr_crypt(in, inLen, key, keybits, ctr, out) != inLen) return -1;
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
+        if (g_gate_aes == 1 || zan_hw_gate(&g_gate_aes, zan_hw_has_aesni(), zan_aes_kat)) {
+            zan_aes_ctr_ni_4way(ctx->rkb, ctx->nr, in, inLen, ctr, out);
+        } else {
+            if (zan_hw_aes_ctr_crypt(in, inLen, ctx->rkb[0], ctx->keybits, ctr, out) != inLen) return -1;
+        }
+#else
+        if (zan_hw_aes_ctr_crypt(in, inLen, ctx->rkb[0], ctx->keybits, ctr, out) != inLen) return -1;
+#endif
     }
 
     uint8_t y16[16] = {0};
     if (aadLen > 0) {
-        if (zan_hw_ghash_update(h16, aad, aadLen, y16) != 0) return -1;
+        if (zan_hw_ghash_update(ctx->h16, aad, aadLen, y16) != 0) return -1;
     }
     if (inLen > 0) {
-        if (zan_hw_ghash_update(h16, out, inLen, y16) != 0) return -1;
+        if (zan_hw_ghash_update(ctx->h16, out, inLen, y16) != 0) return -1;
     }
 
     uint8_t lenBlock[16];
@@ -1888,7 +2010,7 @@ int64_t zan_hw_aes_gcm_encrypt(const uint8_t *key, int keybits,
         lenBlock[i] = (uint8_t)((aadBits >> (8 * (7 - i))) & 0xFF);
         lenBlock[8 + i] = (uint8_t)((inBits >> (8 * (7 - i))) & 0xFF);
     }
-    if (zan_hw_ghash_update(h16, lenBlock, 16, y16) != 0) return -1;
+    if (zan_hw_ghash_update(ctx->h16, lenBlock, 16, y16) != 0) return -1;
 
     for (int i = 0; i < 16; i++) {
         tag16[i] = y16[i] ^ ej0[i];
@@ -1896,34 +2018,39 @@ int64_t zan_hw_aes_gcm_encrypt(const uint8_t *key, int keybits,
     return inLen;
 }
 
-int64_t zan_hw_aes_gcm_decrypt(const uint8_t *key, int keybits,
-                               const uint8_t *iv12,
-                               const uint8_t *aad, int64_t aadLen,
-                               const uint8_t *in, int64_t inLen,
-                               const uint8_t *tag16, uint8_t *out) {
-    if (!key || !iv12 || !tag16) return -1;
+int64_t zan_hw_aes_gcm_decrypt_ctx(const uint8_t *ctxBuf,
+                                   const uint8_t *iv12,
+                                   const uint8_t *aad, int64_t aadLen,
+                                   const uint8_t *in, int64_t inLen,
+                                   const uint8_t *tag16, uint8_t *out) {
+    if (!ctxBuf || !iv12 || !tag16) return -1;
+    const zan_gcm_ctx_t *ctx = (const zan_gcm_ctx_t*)ctxBuf;
+    if (ctx->magic != 0x47434D31) return -1;
     if (aadLen < 0 || inLen < 0) return -1;
     if (aadLen > 0 && !aad) return -1;
     if (inLen > 0 && (!in || !out)) return -1;
-    if (keybits != 128 && keybits != 192 && keybits != 256) return -1;
-
-    uint8_t zero16[16] = {0};
-    uint8_t h16[16];
-    if (zan_hw_aes_ecb_block(key, keybits, zero16, h16) != 0) return -1;
 
     uint8_t j0[16] = {0};
     memcpy(j0, iv12, 12);
     j0[15] = 1;
 
     uint8_t ej0[16];
-    if (zan_hw_aes_ecb_block(key, keybits, j0, ej0) != 0) return -1;
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
+    if (g_gate_aes == 1 || zan_hw_gate(&g_gate_aes, zan_hw_has_aesni(), zan_aes_kat)) {
+        zan_aes_ecb_block_rk(ctx->rkb, ctx->nr, j0, ej0);
+    } else {
+        if (zan_hw_aes_ecb_block(ctx->rkb[0], ctx->keybits, j0, ej0) != 0) return -1;
+    }
+#else
+    if (zan_hw_aes_ecb_block(ctx->rkb[0], ctx->keybits, j0, ej0) != 0) return -1;
+#endif
 
     uint8_t y16[16] = {0};
     if (aadLen > 0) {
-        if (zan_hw_ghash_update(h16, aad, aadLen, y16) != 0) return -1;
+        if (zan_hw_ghash_update(ctx->h16, aad, aadLen, y16) != 0) return -1;
     }
     if (inLen > 0) {
-        if (zan_hw_ghash_update(h16, in, inLen, y16) != 0) return -1;
+        if (zan_hw_ghash_update(ctx->h16, in, inLen, y16) != 0) return -1;
     }
 
     uint8_t lenBlock[16];
@@ -1933,7 +2060,7 @@ int64_t zan_hw_aes_gcm_decrypt(const uint8_t *key, int keybits,
         lenBlock[i] = (uint8_t)((aadBits >> (8 * (7 - i))) & 0xFF);
         lenBlock[8 + i] = (uint8_t)((inBits >> (8 * (7 - i))) & 0xFF);
     }
-    if (zan_hw_ghash_update(h16, lenBlock, 16, y16) != 0) return -1;
+    if (zan_hw_ghash_update(ctx->h16, lenBlock, 16, y16) != 0) return -1;
 
     int diff = 0;
     for (int i = 0; i < 16; i++) {
@@ -1948,9 +2075,37 @@ int64_t zan_hw_aes_gcm_decrypt(const uint8_t *key, int keybits,
     ctr[15] = 2;
 
     if (inLen > 0) {
-        if (zan_hw_aes_ctr_crypt(in, inLen, key, keybits, ctr, out) != inLen) return -1;
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
+        if (g_gate_aes == 1 || zan_hw_gate(&g_gate_aes, zan_hw_has_aesni(), zan_aes_kat)) {
+            zan_aes_ctr_ni_4way(ctx->rkb, ctx->nr, in, inLen, ctr, out);
+        } else {
+            if (zan_hw_aes_ctr_crypt(in, inLen, ctx->rkb[0], ctx->keybits, ctr, out) != inLen) return -1;
+        }
+#else
+        if (zan_hw_aes_ctr_crypt(in, inLen, ctx->rkb[0], ctx->keybits, ctr, out) != inLen) return -1;
+#endif
     }
     return inLen;
+}
+
+int64_t zan_hw_aes_gcm_encrypt(const uint8_t *key, int keybits,
+                               const uint8_t *iv12,
+                               const uint8_t *aad, int64_t aadLen,
+                               const uint8_t *in, int64_t inLen,
+                               uint8_t *out, uint8_t *tag16) {
+    zan_gcm_ctx_t ctx;
+    if (zan_hw_aes_gcm_init((uint8_t*)&ctx, sizeof(ctx), key, keybits) != 0) return -1;
+    return zan_hw_aes_gcm_encrypt_ctx((const uint8_t*)&ctx, iv12, aad, aadLen, in, inLen, out, tag16);
+}
+
+int64_t zan_hw_aes_gcm_decrypt(const uint8_t *key, int keybits,
+                               const uint8_t *iv12,
+                               const uint8_t *aad, int64_t aadLen,
+                               const uint8_t *in, int64_t inLen,
+                               const uint8_t *tag16, uint8_t *out) {
+    zan_gcm_ctx_t ctx;
+    if (zan_hw_aes_gcm_init((uint8_t*)&ctx, sizeof(ctx), key, keybits) != 0) return -1;
+    return zan_hw_aes_gcm_decrypt_ctx((const uint8_t*)&ctx, iv12, aad, aadLen, in, inLen, tag16, out);
 }
 
 int64_t zan_hw_crc32c_update(uint32_t crc, const uint8_t *p, int64_t len) {

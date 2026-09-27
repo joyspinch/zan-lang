@@ -14,6 +14,9 @@ class Socket {
     [DllImport("crt", EntryPoint = "zan_io_socket_send")]
     static extern long ReactorSend(nint sock, string buf, long len, int flags);
 
+    [DllImport("crt", EntryPoint = "zan_io_socket_send")]
+    static extern long ReactorSendPtr(nint sock, nint buf, long len, int flags);
+
     [DllImport("crt", EntryPoint = "zan_io_socket_recv")]
     static extern long ReactorRecv(nint sock, string buf, long len, int flags);
 
@@ -830,30 +833,41 @@ class Socket {
     /// 且无需挂起，省去每条消息一次 reactor 往返。</summary>
     static async int SendAsync(nint sock, string data, int len) {
         int totalSent = 0;
-        string cur = data;
-        int curLen = len;
         while (totalSent < len) {
-            int sent = (int)ReactorSend(sock, cur, curLen, 0);
+            int sent = (int)ReactorSendPtr(sock, (nint)data + (nint)totalSent, (long)(len - totalSent), 0);
             if (sent > 0) {
                 totalSent = totalSent + sent;
-                if (totalSent < len) {
-                    int remaining = len - totalSent;
-                    byte[] tail = new byte[remaining + 1];
-                    for (int j = 0; j < remaining; j = j + 1) {
-                        tail[j] = (byte)data[totalSent + j];
-                    }
-                    cur = tail;
-                    curLen = remaining;
-                }
             } else if (sent == 0) {
                 return totalSent;
             } else if (sent == -1) {
                 // 会阻塞：等待套接字可写后重试。
                 await Socket.WriteReady(sock);
             } else {
-                // 致命错误（对端重置/中止、broken pipe 等）。该套接字将
-                // 不会再变为可写，所以停止等待，
-                // 而是报告实际已发送的字节数。
+                // 致命错误（对端重置/中止、broken pipe 等）。
+                return totalSent;
+            }
+        }
+        return totalSent;
+    }
+
+    /// <summary>异步发送字节数组切片。零堆内存分配与零额外拷贝。</summary>
+    static async int SendAsync(nint sock, byte[] data, int len) {
+        return await Socket.SendBytesAsync(sock, data, 0, len);
+    }
+
+    /// <summary>异步发送字节数组指定偏移和长度的切片。零堆内存分配与零额外拷贝。</summary>
+    static async int SendBytesAsync(nint sock, byte[] data, int offset, int len) {
+        if (data == null || offset < 0 || len <= 0 || offset + len > data.Length) { return 0; }
+        int totalSent = 0;
+        while (totalSent < len) {
+            int sent = (int)ReactorSendPtr(sock, (nint)data + (nint)offset + (nint)totalSent, (long)(len - totalSent), 0);
+            if (sent > 0) {
+                totalSent = totalSent + sent;
+            } else if (sent == 0) {
+                return totalSent;
+            } else if (sent == -1) {
+                await Socket.WriteReady(sock);
+            } else {
                 return totalSent;
             }
         }
@@ -876,6 +890,14 @@ class Socket {
     /// <summary>同步接收数据。</summary>
     static int Recv(nint sock, string buf, int bufSize) {
         return (int)ReactorRecv(sock, buf, bufSize, 0);
+    }
+
+    /// <summary>异步接收数据到字节数组，避免中间字符串分配与拷贝。正常读到返回实际字节数，对端关闭返回 0。</summary>
+    static async int RecvBytesAsync(nint sock, byte[] buf, int maxLen) {
+        if (buf == null || maxLen <= 0) { return 0; }
+        int n = await Socket.RecvOv(sock, buf, maxLen);
+        if (n < 0) { return 0; }
+        return n;
     }
 
     /// <summary>在 IO reactor 上挂起直到可读，然后最多接收

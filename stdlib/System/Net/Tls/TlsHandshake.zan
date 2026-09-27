@@ -62,53 +62,67 @@ class TlsByteReader {
 
 /// <summary>
 /// 动态字节数组构建器。
+/// <summary>
+/// 动态字节数组构建器（带双指针滑动窗口，消除高频前缀消费带来的 O(N) 内存拷贝开销）。
 /// </summary>
 class TlsByteWriter {
     byte[] buf;
+    int head;
     int len;
 
     TlsByteWriter() {
         this.buf = new byte[256];
+        this.head = 0;
         this.len = 0;
     }
 
     void EnsureCap(int extra) {
         int need = this.len + extra;
-        if (need <= this.buf.Length) { return; }
+        // 如果尾部空间不够，但 head 前面积压了空隙，先原地位移滑动窗口
+        if (this.head > 0 && this.head + need > this.buf.Length) {
+            if (this.len > 0) {
+                NativeMemory.Copy(this.buf, (nint)this.buf + (nint)this.head, this.len);
+            }
+            this.head = 0;
+        }
+        if (this.head + need <= this.buf.Length) { return; }
         int newCap = this.buf.Length * 2;
-        if (newCap < need) { newCap = need + 128; }
+        if (newCap < need) { newCap = need + 256; }
         byte[] n = new byte[newCap];
         if (this.len > 0) {
-            NativeMemory.Copy(n, this.buf, this.len);
+            NativeMemory.Copy(n, (nint)this.buf + (nint)this.head, this.len);
         }
         this.buf = n;
+        this.head = 0;
     }
 
     void WriteU8(int v) {
         this.EnsureCap(1);
-        this.buf[this.len] = (byte)(v & 255);
+        this.buf[this.head + this.len] = (byte)(v & 255);
         this.len = this.len + 1;
     }
 
     void WriteU16(int v) {
         this.EnsureCap(2);
-        this.buf[this.len] = (byte)((v >> 8) & 255);
-        this.buf[this.len + 1] = (byte)(v & 255);
+        int pos = this.head + this.len;
+        this.buf[pos] = (byte)((v >> 8) & 255);
+        this.buf[pos + 1] = (byte)(v & 255);
         this.len = this.len + 2;
     }
 
     void WriteU24(int v) {
         this.EnsureCap(3);
-        this.buf[this.len] = (byte)((v >> 16) & 255);
-        this.buf[this.len + 1] = (byte)((v >> 8) & 255);
-        this.buf[this.len + 2] = (byte)(v & 255);
+        int pos = this.head + this.len;
+        this.buf[pos] = (byte)((v >> 16) & 255);
+        this.buf[pos + 1] = (byte)((v >> 8) & 255);
+        this.buf[pos + 2] = (byte)(v & 255);
         this.len = this.len + 3;
     }
 
     void WriteBytes(byte[] b, int offset, int count) {
         if (b == null || count <= 0) { return; }
         this.EnsureCap(count);
-        NativeMemory.Copy((nint)this.buf + (nint)this.len, (nint)b + (nint)offset, count);
+        NativeMemory.Copy((nint)this.buf + (nint)(this.head + this.len), (nint)b + (nint)offset, count);
         this.len = this.len + count;
     }
 
@@ -118,23 +132,30 @@ class TlsByteWriter {
     }
 
     int Length() { return this.len; }
-
+    int Head() { return this.head; }
     byte[] Buffer() { return this.buf; }
+
+    void Advance(int count) {
+        if (count > 0) {
+            this.len = this.len + count;
+        }
+    }
 
     int PeekU8(int off) {
         if (off < 0 || off >= this.len) { return -1; }
-        return (int)(this.buf[off] & 255);
+        return (int)(this.buf[this.head + off] & 255);
     }
 
     int PeekU16(int off) {
         if (off < 0 || off + 1 >= this.len) { return -1; }
-        return ((int)(this.buf[off] & 255) << 8) | (int)(this.buf[off + 1] & 255);
+        int pos = this.head + off;
+        return ((int)(this.buf[pos] & 255) << 8) | (int)(this.buf[pos + 1] & 255);
     }
 
     byte[] ToArray() {
         byte[] res = new byte[this.len];
         if (this.len > 0) {
-            NativeMemory.Copy(res, this.buf, this.len);
+            NativeMemory.Copy(res, (nint)this.buf + (nint)this.head, this.len);
         }
         return res;
     }
@@ -142,12 +163,15 @@ class TlsByteWriter {
     void RemovePrefix(int count) {
         if (count <= 0) { return; }
         if (count >= this.len) {
+            this.head = 0;
             this.len = 0;
             return;
         }
-        int rem = this.len - count;
-        NativeMemory.Copy(this.buf, (nint)this.buf + (nint)count, rem);
-        this.len = rem;
+        this.head = this.head + count;
+        this.len = this.len - count;
+        if (this.len == 0) {
+            this.head = 0;
+        }
     }
 }
 
@@ -246,6 +270,8 @@ class TlsEngine {
     TlsByteWriter inNet;      // 接收到的网络原始密文
     TlsByteWriter outNet;     // 待发送到网络的密文记录
     TlsByteWriter appReadBuf; // 已解密的应用层明文
+    byte[] recHeader;
+    List<int> recType;
 
     TlsEngine(string host, bool disableVerify, bool disableTls13, List<string> pins, bool pinRequired, CertPolicyFn certPolicy, List<X509Certificate> trustedCerts, bool isServer, string certFile, string keyFile) {
         this.host = host;
@@ -274,7 +300,15 @@ class TlsEngine {
         this.inNet = new TlsByteWriter();
         this.outNet = new TlsByteWriter();
         this.appReadBuf = new TlsByteWriter();
+        this.recHeader = new byte[5];
+        this.recType = new List<int>();
+        this.recType.Add(0);
     }
+
+    int OutNetLength() { return this.outNet.Length(); }
+    byte[] OutNetBuffer() { return this.outNet.Buffer(); }
+    int OutNetHead() { return this.outNet.Head(); }
+    void DropOutNet(int count) { this.outNet.RemovePrefix(count); }
 
     bool IsConnected() { return this.state == StateConnected; }
     bool IsClosed() { return this.state == StateClosed || this.state == StateFailed; }
@@ -364,19 +398,16 @@ class TlsEngine {
                 return this.state == StateConnected ? 1 : 0;
             }
 
-            // 零额外中转拷贝，直接从 inNet 内部缓冲区切出 header 与 payload
+            // 零额外中转拷贝，直接从 inNet 内部滑动缓冲区切出 header 与 payload
             byte[] inBuf = this.inNet.Buffer();
-            byte[] header = new byte[5];
-            NativeMemory.Copy(header, inBuf, 5);
-            byte[] payload = new byte[rlen];
-            if (rlen > 0) {
-                NativeMemory.Copy(payload, (nint)inBuf + 5, rlen);
-            }
+            int inHead = this.inNet.Head();
+            NativeMemory.Copy(this.recHeader, (nint)inBuf + (nint)inHead, 5);
 
+            int pOffset = inHead + 5;
             this.inNet.RemovePrefix(5 + rlen);
 
             int prevState = this.state;
-            int res = this.ProcessRecord(ctype, header, payload);
+            int res = this.ProcessRecord(ctype, this.recHeader, inBuf, pOffset, rlen);
             if (res < 0) { return -1; }
             if (prevState != StateConnected && this.state == StateConnected) {
                 // 刚完成握手，立即返回 1 提示调用方握手完毕
@@ -387,12 +418,12 @@ class TlsEngine {
         return this.state == StateConnected ? 1 : 0;
     }
 
-    int ProcessRecord(int ctype, byte[] header, byte[] payload) {
+    int ProcessRecord(int ctype, byte[] header, byte[] inBuf, int pOffset, int pLen) {
         // 1. Alert 处理
         if (ctype == TlsRecord.ContentTypeAlert && this.readCipher == null) {
-            if (payload.Length >= 2) {
-                int level = payload[0] & 255;
-                int desc = payload[1] & 255;
+            if (pLen >= 2) {
+                int level = inBuf[pOffset] & 255;
+                int desc = inBuf[pOffset + 1] & 255;
                 if (desc == TlsRecord.AlertCloseNotify) {
                     this.state = StateClosed;
                     return 0;
@@ -422,16 +453,16 @@ class TlsEngine {
             }
         }
 
-        // 3. 加密记录解密 (readCipher != null)
+        // 3. 加密记录解密 (readCipher != null) - 零切片分配，直接传入底层滑动窗口指针与偏移
         if (this.readCipher != null) {
-            List<int> realType = new List<int>(); realType.Add(0);
-            byte[] pt = this.readCipher.Decrypt(header, payload, 0, payload.Length, realType);
+            this.recType[0] = 0;
+            byte[] pt = this.readCipher.Decrypt(header, inBuf, pOffset, pLen, this.recType);
             if (pt == null) {
                 this.Fail("TLS 记录 AEAD 解密或 MAC 校验失败");
                 return -1;
             }
 
-            int innerType = realType[0];
+            int innerType = this.recType[0];
             if (innerType == TlsRecord.ContentTypeAlert) {
                 if (pt.Length >= 2 && (pt[1] & 255) == TlsRecord.AlertCloseNotify) {
                     this.state = StateClosed;
@@ -450,6 +481,10 @@ class TlsEngine {
 
         // 4. 明文 Handshake 记录
         if (ctype == TlsRecord.ContentTypeHandshake) {
+            byte[] payload = new byte[pLen];
+            if (pLen > 0) {
+                NativeMemory.Copy(payload, (nint)inBuf + (nint)pOffset, pLen);
+            }
             return this.ProcessHandshakePayload(payload);
         }
 
@@ -1346,19 +1381,46 @@ class TlsEngine {
 
     /* ---- 数据收发 (Application Data) ---- */
 
-    /// <summary>加密应用数据并放入待发网络缓冲区。</summary>
-    int SendAppData(byte[] data, int offset, int len) {
+    /// <summary>加密应用数据指针并零拷贝直写到待发网络缓冲区，按 16KB 分片封装为 TLS 记录。</summary>
+    int SendAppData(nint dataPtr, int len) {
         if (this.state != StateConnected || this.writeCipher == null) {
             this.Fail("TLS 连接未就绪，无法发送数据");
             return -1;
         }
-        byte[] record = this.writeCipher.Encrypt(TlsRecord.ContentTypeApplicationData, data, offset, len);
-        if (record == null) {
-            this.Fail("应用数据记录加密失败");
-            return -1;
+        if (len <= 0) { return 0; }
+        int sent = 0;
+        while (sent < len) {
+            int chunk = len - sent;
+            if (chunk > 16384) { chunk = 16384; }
+            int recLen = this.writeCipher.RecordLen(chunk);
+            this.outNet.EnsureCap(recLen);
+            int encLen = this.writeCipher.EncryptToBuf(
+                TlsRecord.ContentTypeApplicationData,
+                dataPtr + (nint)sent,
+                chunk,
+                this.outNet.Buffer(),
+                this.outNet.Head() + this.outNet.Length()
+            );
+            if (encLen <= 0) {
+                this.Fail("应用数据记录加密失败");
+                return -1;
+            }
+            this.outNet.Advance(encLen);
+            sent = sent + chunk;
         }
-        this.outNet.WriteBytes(record);
-        return len;
+        return sent;
+    }
+
+    /// <summary>加密应用数据字节数组并放入待发网络缓冲区。</summary>
+    int SendAppData(byte[] data, int offset, int len) {
+        if (data == null || offset < 0 || len < 0 || offset + len > data.Length) { return -1; }
+        return this.SendAppData((nint)data + (nint)offset, len);
+    }
+
+    /// <summary>加密应用数据字符串并放入待发网络缓冲区。</summary>
+    int SendAppData(string data, int offset, int len) {
+        if (data == null || offset < 0 || len < 0 || offset + len > data.Length) { return -1; }
+        return this.SendAppData((nint)data + (nint)offset, len);
     }
 
     /// <summary>从已解密的应用缓冲区提取明文数据到字节数组。</summary>
@@ -1370,7 +1432,7 @@ class TlsEngine {
         int toRead = this.appReadBuf.Length();
         if (toRead > maxLen) { toRead = maxLen; }
         if (toRead > 0 && outBuf != null) {
-            NativeMemory.Copy((nint)outBuf + (nint)offset, this.appReadBuf.Buffer(), toRead);
+            NativeMemory.Copy((nint)outBuf + (nint)offset, (nint)this.appReadBuf.Buffer() + (nint)this.appReadBuf.Head(), toRead);
         }
         this.appReadBuf.RemovePrefix(toRead);
         return toRead;
@@ -1385,7 +1447,7 @@ class TlsEngine {
         int toRead = this.appReadBuf.Length();
         if (toRead > maxLen) { toRead = maxLen; }
         if (toRead > 0 && outBuf != null) {
-            NativeMemory.Copy((nint)outBuf + (nint)offset, this.appReadBuf.Buffer(), toRead);
+            NativeMemory.Copy((nint)outBuf + (nint)offset, (nint)this.appReadBuf.Buffer() + (nint)this.appReadBuf.Head(), toRead);
         }
         this.appReadBuf.RemovePrefix(toRead);
         return toRead;

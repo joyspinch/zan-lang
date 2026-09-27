@@ -994,6 +994,64 @@ static bool emit_native_memory_call(zan_irgen_t *g, zan_ast_node_t *expr,
             nm_addr(g, outBuf, zero64) }, 9, "nm.aes_gcm_dec");
         return true;
     }
+    if (is_call_to(expr, "NativeMemory", "AesGcmInit") && expr->call.args.count == 4) {
+        LLVMValueRef ctxBuf = nm_arg(g, expr, 0, locals);
+        LLVMValueRef ctxLen = coerce_int_to(g, nm_arg(g, expr, 1, locals), i64t);
+        LLVMValueRef key = nm_arg(g, expr, 2, locals);
+        LLVMValueRef keybits = coerce_int_to(g, nm_arg(g, expr, 3, locals), i32t);
+        LLVMTypeRef ty = LLVMFunctionType(i64t,
+            (LLVMTypeRef[]){ i8ptr, i64t, i8ptr, i32t }, 4, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_aes_gcm_init");
+        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_aes_gcm_init", ty);
+        *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
+            nm_addr(g, ctxBuf, zero64), ctxLen,
+            nm_addr(g, key, zero64), keybits }, 4, "nm.aes_gcm_init");
+        return true;
+    }
+    if (is_call_to(expr, "NativeMemory", "AesGcmEncryptCtx") && expr->call.args.count == 8) {
+        LLVMValueRef ctxBuf = nm_arg(g, expr, 0, locals);
+        LLVMValueRef iv = nm_arg(g, expr, 1, locals);
+        LLVMValueRef aad = nm_arg(g, expr, 2, locals);
+        LLVMValueRef aadLen = coerce_int_to(g, nm_arg(g, expr, 3, locals), i64t);
+        LLVMValueRef inBuf = nm_arg(g, expr, 4, locals);
+        LLVMValueRef inLen = coerce_int_to(g, nm_arg(g, expr, 5, locals), i64t);
+        LLVMValueRef outBuf = nm_arg(g, expr, 6, locals);
+        LLVMValueRef tag16 = nm_arg(g, expr, 7, locals);
+        LLVMTypeRef ty = LLVMFunctionType(i64t,
+            (LLVMTypeRef[]){ i8ptr, i8ptr, i8ptr, i64t, i8ptr, i64t, i8ptr, i8ptr }, 8, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_aes_gcm_encrypt_ctx");
+        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_aes_gcm_encrypt_ctx", ty);
+        *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
+            nm_addr(g, ctxBuf, zero64),
+            nm_addr(g, iv, zero64),
+            nm_addr(g, aad, zero64), aadLen,
+            nm_addr(g, inBuf, zero64), inLen,
+            nm_addr(g, outBuf, zero64),
+            nm_addr(g, tag16, zero64) }, 8, "nm.aes_gcm_enc_ctx");
+        return true;
+    }
+    if (is_call_to(expr, "NativeMemory", "AesGcmDecryptCtx") && expr->call.args.count == 8) {
+        LLVMValueRef ctxBuf = nm_arg(g, expr, 0, locals);
+        LLVMValueRef iv = nm_arg(g, expr, 1, locals);
+        LLVMValueRef aad = nm_arg(g, expr, 2, locals);
+        LLVMValueRef aadLen = coerce_int_to(g, nm_arg(g, expr, 3, locals), i64t);
+        LLVMValueRef inBuf = nm_arg(g, expr, 4, locals);
+        LLVMValueRef inLen = coerce_int_to(g, nm_arg(g, expr, 5, locals), i64t);
+        LLVMValueRef tag16 = nm_arg(g, expr, 6, locals);
+        LLVMValueRef outBuf = nm_arg(g, expr, 7, locals);
+        LLVMTypeRef ty = LLVMFunctionType(i64t,
+            (LLVMTypeRef[]){ i8ptr, i8ptr, i8ptr, i64t, i8ptr, i64t, i8ptr, i8ptr }, 8, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_aes_gcm_decrypt_ctx");
+        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_aes_gcm_decrypt_ctx", ty);
+        *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
+            nm_addr(g, ctxBuf, zero64),
+            nm_addr(g, iv, zero64),
+            nm_addr(g, aad, zero64), aadLen,
+            nm_addr(g, inBuf, zero64), inLen,
+            nm_addr(g, tag16, zero64),
+            nm_addr(g, outBuf, zero64) }, 8, "nm.aes_gcm_dec_ctx");
+        return true;
+    }
     if (is_call_to(expr, "NativeMemory", "GhashBlock") && expr->call.args.count == 3) {
         LLVMValueRef h = nm_arg(g, expr, 0, locals);
         LLVMValueRef x = nm_arg(g, expr, 1, locals);

@@ -317,26 +317,27 @@ class TlsStream {
 
     async int FlushOutAsync() {
         if (!this.open || this.engine == null) { return -1; }
-        byte[] pending = this.engine.DrainNetwork();
-        while (pending != null && pending.Length > 0) {
-            string s = pending.ToStr(0, pending.Length);
-            int sent = Norm(await Socket.SendAsync(this.sock, s, pending.Length));
+        while (this.engine.OutNetLength() > 0) {
+            int toSend = this.engine.OutNetLength();
+            int sent = Norm(await Socket.SendBytesAsync(
+                this.sock,
+                this.engine.OutNetBuffer(),
+                this.engine.OutNetHead(),
+                toSend
+            ));
             if (!this.open) { return -1; }
-            if (sent != pending.Length) { return -1; }
-            pending = this.engine.DrainNetwork();
+            if (sent <= 0) { return -1; }
+            this.engine.DropOutNet(sent);
         }
         return 0;
     }
 
     async int PumpInAsync() {
         if (!this.open || this.engine == null) { return -1; }
-        string chunk = await Socket.RecvAsync(this.sock, SCRATCH);
-        if (chunk == null) { return -1; }
-        int n = chunk.Length;
+        int n = await Socket.RecvBytesAsync(this.sock, this.scratch, SCRATCH);
+        if (n < 0) { return -1; }
         if (n == 0) { return 0; }
-        byte[] b = new byte[n];
-        NativeMemory.Copy(b, chunk, n);
-        this.engine.FeedNetwork(b, 0, n);
+        this.engine.FeedNetwork(this.scratch, 0, n);
         return n;
     }
 
@@ -439,18 +440,58 @@ class TlsStream {
         return -1;
     }
 
-    /// <summary>加密并发送 len 字节。成功返回明文字节数，失败返回 -1。</summary>
+    /// <summary>接收解密后的字节到调用方提供的字节数组。正常关闭返回 0，出错返回 -1。</summary>
+    async int RecvBytesAsync(byte[] buf, int offset, int max) {
+        if (!this.open || this.engine == null || buf == null) { return -1; }
+        while (true) {
+            int step = this.engine.Step();
+            if (step < 0) { return -1; }
+
+            int avail = this.engine.AvailableAppData();
+            if (avail > 0) {
+                int toRead = avail > max ? max : avail;
+                int read = this.engine.RecvAppData(buf, offset, toRead);
+                if (read > 0) {
+                    return read;
+                }
+            }
+
+            if (this.engine.IsClosed()) { return 0; }
+
+            int flushed = await this.FlushOutAsync();
+            if (flushed < 0) { return -1; }
+
+            int got = await this.PumpInAsync();
+            if (got == 0) { return 0; }
+            if (got < 0) { return -1; }
+        }
+        return -1;
+    }
+
+    /// <summary>加密并发送 len 字节字符串数据。零中间分配直达底层网络缓冲。成功返回明文字节数，失败返回 -1。</summary>
     async int SendAsync(string data, int len) {
         if (!this.open || this.engine == null) { return -1; }
-        byte[] b = new byte[len];
-        if (len > 0) {
-            NativeMemory.Copy(b, data, len);
-        }
-        int r = this.engine.SendAppData(b, 0, len);
+        int r = this.engine.SendAppData(data, 0, len);
         if (r < 0) { return -1; }
         int flushed = await this.FlushOutAsync();
         if (flushed < 0) { return -1; }
         return len;
+    }
+
+    /// <summary>加密并发送字节数组切片。零中间分配直达底层网络缓冲。成功返回明文字节数，失败返回 -1。</summary>
+    async int SendBytesAsync(byte[] data, int offset, int len) {
+        if (!this.open || this.engine == null) { return -1; }
+        int r = this.engine.SendAppData(data, offset, len);
+        if (r < 0) { return -1; }
+        int flushed = await this.FlushOutAsync();
+        if (flushed < 0) { return -1; }
+        return len;
+    }
+
+    /// <summary>加密并发送完整字节数组。</summary>
+    async int SendBytesAsync(byte[] data) {
+        if (data == null) { return -1; }
+        return await this.SendBytesAsync(data, 0, data.Length);
     }
 
     /// <summary>发送整个字符串（其 .Length 个字节）。</summary>
