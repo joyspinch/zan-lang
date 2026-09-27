@@ -84,6 +84,9 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   Acquire 全部挂满超时，全站 503/无响应（客户端只见偶发 000）；而
   `base.` 这类静态引用仍能打中新槽位，半通半不通最迷惑。排查定式：
   池 acq/rel 计数失配 + 钩子首行日志打不出来 = 槽位没接上。
+  2026-09-28 起 zanc 对该形状直接告警（`--deny-warnings` 升级为编译
+  失败），diag_virtual_hides_inherited_virtual 用例锁定，合法重载与
+  真 override 不误报。
 - **声明驱动的 CRUD 定式（ListPage/Crud，2026-09-25 落地）**：一屏一个
   `ScreenDef()` 静态声明（列 Col/Tag/Flag、行内操作 Ops、筛选、工具栏、
   `Table/EditFields` 写白名单），渲染 `Screen()` 整段产出 screenHtml

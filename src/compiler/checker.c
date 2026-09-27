@@ -4330,6 +4330,81 @@ static void check_all_struct_cycles(zan_checker_t *c, zan_ast_node_t *unit) {
     }
 }
 
+/* ---- `virtual` that hides an inherited virtual ---------------------------
+ * `virtual` on a derived method OPENS A NEW SLOT (it hides the base
+ * implementation); it does not fill it. Dispatch through a reference
+ * statically typed as an ancestor keeps hitting the base slot, so the
+ * derived body silently never runs for those calls -- the classic shape is
+ * a framework lifecycle hook declared `virtual` instead of `override`,
+ * whose cleanup (returning a pooled connection, flushing state) then never
+ * executes while the happy paths keep working. `override` is what fills
+ * the base slot. Warn when a `virtual` declaration matches a slot-defining
+ * virtual somewhere up the base chain -- same (name, declared arity) key
+ * the vtable itself uses to identify slots. */
+
+/* Declared parameter count of a method symbol, -1 for non-method decls. */
+static int checker_method_param_count(zan_symbol_t *m) {
+    if (!m || !m->decl || m->decl->kind != AST_METHOD_DECL) return -1;
+    return m->decl->method_decl.params.count;
+}
+
+static bool checker_base_has_virtual_slot(zan_symbol_t *base_sym,
+                                          zan_istr_t name, int arity,
+                                          int depth) {
+    if (!base_sym || depth > CHECKER_DERIVES_MAX_DEPTH) return false;
+    for (int i = 0; i < base_sym->member_count; i++) {
+        zan_symbol_t *m = base_sym->members[i];
+        if (m && m->kind == SYM_METHOD &&
+            (m->modifiers & MOD_VIRTUAL) &&
+            !(m->modifiers & MOD_OVERRIDE) &&
+            m->name.len == name.len &&
+            memcmp(m->name.str, name.str, (size_t)name.len) == 0 &&
+            checker_method_param_count(m) == arity)
+            return true;
+    }
+    return checker_base_has_virtual_slot(
+        (base_sym->type && base_sym->type->base_type)
+            ? base_sym->type->base_type->sym : NULL,
+        name, arity, depth + 1);
+}
+
+static void check_virtual_shadows_base(zan_checker_t *c, zan_ast_node_t *decl) {
+    zan_symbol_t *ts = c->current_type_sym;
+    if (!ts || !ts->type || !ts->type->base_type || !ts->type->base_type->sym)
+        return;
+    for (int j = 0; j < decl->type_decl.members.count; j++) {
+        zan_ast_node_t *member = decl->type_decl.members.items[j];
+        if (member->kind != AST_METHOD_DECL) continue;
+        int want = member->method_decl.params.count;
+        /* the binder prefixes inherited members, so this type's own match is
+           the last same-name member; (name, declared arity) picks the right
+           overload symbol */
+        zan_symbol_t *sym = NULL;
+        for (int i = 0; i < ts->member_count; i++) {
+            zan_symbol_t *m = ts->members[i];
+            if (m && m->kind == SYM_METHOD &&
+                m->name.len == member->method_decl.name.len &&
+                memcmp(m->name.str, member->method_decl.name.str,
+                       (size_t)member->method_decl.name.len) == 0 &&
+                checker_method_param_count(m) == want)
+                sym = m;
+        }
+        if (!sym || !(sym->modifiers & MOD_VIRTUAL) ||
+            (sym->modifiers & MOD_OVERRIDE))
+            continue;
+        if (checker_base_has_virtual_slot(ts->type->base_type->sym,
+                                          sym->name, want, 0)) {
+            zan_diag_emit(c->diag, DIAG_WARNING, member->loc,
+                "'%.*s' is declared 'virtual' but hides an inherited virtual "
+                "with the same name and arity; calls through base-class "
+                "references will run the base implementation -- "
+                "use 'override' to replace it",
+                (int)member->method_decl.name.len,
+                member->method_decl.name.str);
+        }
+    }
+}
+
 void zan_checker_check(zan_checker_t *c, zan_ast_node_t *unit) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
 
@@ -4343,6 +4418,9 @@ void zan_checker_check(zan_checker_t *c, zan_ast_node_t *unit) {
         }
 
         c->current_type_sym = zan_binder_lookup(c->binder, decl->type_decl.name);
+        if (decl->kind == AST_CLASS_DECL) {
+            check_virtual_shadows_base(c, decl);
+        }
         for (int j = 0; j < decl->type_decl.members.count; j++) {
             zan_ast_node_t *member = decl->type_decl.members.items[j];
             check_weak_member(c, decl, member);

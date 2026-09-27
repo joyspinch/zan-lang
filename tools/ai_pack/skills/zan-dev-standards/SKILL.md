@@ -82,7 +82,9 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   是基类空实现——每请求借出的资源从此不还，池扩张到上限后全部挂满
   超时，全站 503/无响应（客户端只见偶发失败）；而 `base.` 这类静态
   引用仍能打中新槽位，半通半不通最迷惑。排查定式：资源池借还计数
-  失配 + 钩子首行日志打不出来 = 槽位没接上。
+  失配 + 钩子首行日志打不出来 = 槽位没接上。SDK 新版编译器对该形状
+  直接告警（`--deny-warnings` 可升级为编译失败），合法重载与真
+  override 不误报。
 - **声明驱动的 CRUD 定式（ListPage/Crud，2026-09-25 落地）**：一屏一个
   `ScreenDef()` 静态声明（列 Col/Tag/Flag、行内操作 Ops、筛选、工具栏、
   `Table/EditFields` 写白名单），渲染 `Screen()` 整段产出 screenHtml
