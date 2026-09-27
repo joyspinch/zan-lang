@@ -147,6 +147,18 @@ URL 首段决定动作的声明区：`/admin/*` 只能声明在 `Controller/Admi
 ZanTable 硬约定优先）。方法名不得与在用的类型同名（Blog 回复端点 URL
 取 `/blog/{id}/reply` 而非把方法改成与 Comment 实体同名）。
 
+### 表名同构（实体 = 表，路由可推表）
+
+实体类名蛇形化即表名：`SysWikiDoc` → `sys_wiki_doc`、`Post` →
+`blog_post`。前缀即域——`sys_` 框架内置（用户/角色/字典/任务/日志/
+ wiki/媒体/代码生成），`blog_` 业务示例域，`metrics_` 指标域；域内
+不再发明第二套前缀。CRUD 屏的复数 slug 与表单数互推
+（`users` ↔ `sys_user`、`posts` ↔ `blog_post`、`dicts` ↔
+`sys_dict_type`）；工具/聚合屏按功能命名不挂实体表
+（`dev/coder` 管生成器表 `sys_gen_table`、`monitor/data` 聚合
+`metrics_*`）。踩过的坑：`SysSiteSetting` 的表曾是 `sys_setting`
+——实体、Dao、文件名都带 site，表名漏了，四元同构断一环。
+
 ### 数据库降级与投影样板
 
 - 屏面动作的降级出口是 `PageReady(d)`（置 dbDown 徽章渲染本屏）、数据
