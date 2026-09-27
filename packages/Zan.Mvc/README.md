@@ -70,8 +70,8 @@ wwwroot/                唯一 Web 可达目录，挂载在 /static（css/js/ven
    （路由控制器与控制器基座）进 `Controller/`，其余类型（声明、实体、
    DAO、视图助手）不进——判定看类声明的继承链，不看是否自带路由属性。
 
-视图键由 `View.LoadRec` 按目录路径推导（`views/Admin/System/SysUsers.Index.html`
-→ `Admin.System.SysUsers.Index`），与控制器命名空间同构——看到路径即知键名。
+视图键由 `View.LoadRec` 按目录路径推导（`views/Admin/System/SysUsersController.Index.html`
+→ `Admin.System.SysUsersController.Index`），与控制器命名空间同构——看到路径即知键名。
 
 ## 代码规范
 
@@ -92,12 +92,14 @@ URL 族：`Controller/Admin/Content/Categories.zan` ↔ `ZanWeb.Admin.Content` �
 偏离 URL，权限码与菜单就失去锚点——不存在第二份要维护的映射表。
 
 **视图键同理**：`View.LoadRec` 按目录路径推导
-（`views/Admin/System/SysUsers.Index.html` → `Admin.System.SysUsers.Index`）。
+（`views/Admin/System/SysUsersController.Index.html` → `Admin.System.SysUsersController.Index`）。
 显式 `ViewOf/FragmentOf` 的键必须等于某个文件的真实键——查不到时
 HTTP 仍是 200，页面渲染成 `<!-- view not found -->` 注释，冒烟只看
 状态码是假绿（本轮踩过：key 改了、views 资产目录没跟着挪）。
 
-**屏 slug 与类名同构**：URL 末段（屏 slug）= 类名去 `Sys` 前缀小写
+**控制器一律 `XxxController`**：类名与文件名都带 `Controller` 后缀（`LoginController.zan`/`class LoginController`），一眼分清控制器；URL 不带——约定模板禁用 `[controller]`（类名进了 URL：类加后缀 URL 就跟着烂），一律写显式前缀（`api/data/[action]`）。视图键由类名派生，类加后缀=视图资产同提交改名。
+
+**屏 slug 与类名同构**：URL 末段（屏 slug）= 类名去 `Sys` 前缀与 `Controller` 后缀小写
 （`SysUsers`→`users`）；模块自名屏类名 = 目录名（`Admin/Media/Media.zan`
 ↔ `/admin/media`）。类名同时锚定文件名与视图文件名——改一处必须四处
 （文件、类、视图资产、引用）同一提交搬完。不同构时**改类名就 URL**：

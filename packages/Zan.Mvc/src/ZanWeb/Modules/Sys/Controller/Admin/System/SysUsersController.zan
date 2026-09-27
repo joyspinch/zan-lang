@@ -1,0 +1,492 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Security.Cryptography;
+using System.Web;
+using System.Json;
+using ZanWeb.Core;
+using ZanWeb.Dao;
+using ZanWeb.Model;
+using ZanWeb.Security;
+using ZanWeb.Web;
+
+namespace ZanWeb.Admin.System;
+
+/* /admin/system/users 账号管理：搜索、建、编、删、改密、分角色、启禁、强制下线；列表为投影，永非实体——不把密码散列与盐放进行，避免模板失手泄露凭证材料；禁用与强制下线有意分为两键——status=0 阻断后续登录、改 tokenVersion 使已持令牌失效，禁用两者都做，因放行已开会话的禁令不算禁令。 */
+[Route("admin/system/users/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("账号管理")]
+class SysUsersController : AdminController {
+    /* 本屏唯一声明：列、筛选、工具栏、行内操作、通用写动作白名单同源。
+       Index 渲染、CrudOps.Field/Batch/Delete 的白名单与 conf 端点的表格
+       配置都从这里派生——加一列或开放一个可编辑字段，只改这里。 */
+    private static ListPage ScreenDef() {
+        return ListPage.Of()
+            .Col("id", "ID", "num", "56px")
+            .Col("username", "账号", "text", "130px")
+            .Flag("superTag", "", "64px")
+            .Col("nickname", "姓名", "text", "110px")
+            .Col("email", "邮箱", "muted", "170px")
+            .Col("mobile", "手机", "muted", "120px")
+            .Col("dept", "部门", "text", "110px")
+            .Col("roles", "角色", "text", "")
+            .Col("createdAt", "创建日期", "time", "130px")
+            .Tag("status", "状态", "1=启用|ok,0=禁用|off", "88px")
+            .OpsEdit("/admin/system/users/form")
+            .Ops("角色", "/admin/system/users/roles", "", "", "u")
+            .Ops("密码", "/admin/system/users/passwordform", "", "", "u")
+            .Ops("{toggleLabel}", "/admin/system/users/status", "",
+                 "id={id}&status={nextStatus}", "u")
+            .Ops("下线", "/admin/system/users/kick",
+                 "强制下线后该账号需要重新登录，确定吗？", "id={id}", "u")
+            .OpsDel("/admin/system/users/delete", "删除后不可恢复，确定删除该账号吗？")
+            .Text("账号 / 姓名 / 邮箱", "kw", "t.username|t.nickname|t.email", "搜索账号 / 姓名 / 邮箱")
+            .Select("状态", "status", "t.status", "1=启用,0=禁用")
+            .Time("创建日期", "createdAt", "t.createdAt")
+            .TbarAdd("新增账号", "/admin/system/users/form")
+            .TbarReload()
+            .TbarSep()
+            .TbarEnable("/admin/system/users/batchstatus")
+            .TbarDisable("/admin/system/users/batchstatus")
+            .TbarDelete("/admin/system/users/batchdelete")
+            .Table("sys_user")
+            .EditFields("nickname:text,email:text,mobile:text,departmentId:int,status:int");
+    }
+
+    [HttpGet]
+    [Route("/admin/system/users")]
+    [Custom(IsMenu = true, Icon = "mdi:account", Perm = PermBit.View)]
+    [Description("账号管理")]
+    async void Index() {
+        ViewData d = await this.Layout("账号管理");
+        if (!this.PageReady(d)) { return; }
+
+        ListPage lp = SysUsersController.ScreenDef();
+        List<OrmCond> conds = lp.Collect(this);
+
+        ListQuery q = this.Paged("id", 20);
+
+        /* 该账号角色允许可见的行，与声明条件同链。 */
+        DataScope sc = await this.Scope();
+        List<int> scoped = sc.Depts();
+        int mine = sc.UserId();
+
+        int total = await new SysUserDao(this).CountBy(
+            conds, sc.ByDept(), scoped, sc.Mine(), mine);
+        List<SysUser> rows = await new SysUserDao(this).PagedListBy(
+            conds, sc.ByDept(), scoped, sc.Mine(), mine, q.Skip(), q.Limit());
+
+        List<SysDepartment> depts = await new SysDepartmentDao(this).All();
+        List<SysRole> roles = await new SysRoleDao(this).All();
+        List<SysUserRole> links = await new SysUserRoleDao(this).All();
+
+        /* 行投影只出原始值与衍生键：展示格式化（状态徽章、日期、空值 —）
+           由列声明在 TableHtml 里发生；投影列（部门名/角色名）与脱敏
+           （邮箱/手机）是业务语义，留在控制器。 */
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            SysUser u = rows[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(u.id));
+            row.Set("username", u.username);
+            if (u.isSuper == 1) { row.Set("superTag", "超管|warn"); }
+            row.Set("nickname", u.nickname);
+            row.Set("email", Fmt.MaskEmail(u.email));
+            row.Set("mobile", Fmt.MaskMobile(u.mobile));
+            row.Set("dept", SysUsersController.DeptName(depts, u.departmentId));
+            row.Set("roles", SysUsersController.RoleNames(roles, links, u.id));
+            row.Set("status", Convert.ToString(u.status));
+            row.Set("nextStatus", u.status == 1 ? "0" : "1");
+            row.Set("toggleLabel", u.status == 1 ? "禁用" : "启用");
+            items.Add(row);
+        }
+        string path = this.Ctx().path;
+        bool canUpdate = await this.Can(PermBit.Update);
+        bool canDelete = await this.Can(PermBit.Delete);
+        lp.Screen(this, d, path, "/admin/system/users", conds, q, total, items,
+            canUpdate, canDelete);
+        this.Page(d);
+    }
+
+    /* adminUI ZanTable 的表格配置契约：本屏声明 → ListConfData JSON。 */
+    [HttpGet]
+    [Custom(Perm = PermBit.View)]
+    [Description("账号表格配置")]
+    void Conf() {
+        CrudOps.Conf(this, SysUsersController.ScreenDef());
+    }
+
+    /* 单行单字段编辑（conf 契约的 field 端点）：行级授权走 Reach（越权
+       与不存在同答 404），列白名单出自 EditFields——密码散列、token
+       版本等凭证材料不在名单，永远无法经此篡改。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("编辑账号字段")]
+    async void Field() {
+        int id = this.InInt("id", 0);
+        SysUser u = await this.Reach(id);
+        List<int> allowed = new List<int>();
+        allowed.Add(u.id);
+        await CrudOps.Field(this, SysUsersController.ScreenDef(), "账号",
+            this.In("field").Trim(), this.In("value"), allowed);
+    }
+
+    /* 新建/编辑对话框；片段非页，列表不动、对话框覆盖其上。 */
+    /* 一份声明：Form 渲染与 Save 校验同源（新增/编辑屏 = 声明 + 两动作）。
+       部门选项由调用方查询传入（Save 校验用不到，传空列表即可）。 */
+    static FormPage UserForm(List<StrMap> deptRows) {
+        return FormPage.Of("/admin/system/users/save")
+            .Text("账号", "username").Req().Max(32).Ph("登录名")
+            .Text("姓名", "nickname").Max(32)
+            .Text("邮箱", "email").Max(64)
+            .Text("手机", "mobile").Max(20)
+            .SelectList("部门", "departmentId", deptRows).Blank("未分配")
+            .Select("状态", "status", "1=启用,0=禁用").Val("1")
+            .Pass("初始密码", "password").Min(8).Req().Ph("至少 8 位").OnlyNew()
+            .Hint("修改密码请在列表中使用「重置密码」。").OnlyEdit();
+    }
+
+    [HttpGet]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("账号表单")]
+    async void Form() {
+        int id = this.InInt("id", 0);
+        /* 仅该账号可写部门入选，使对话框无法提议 Save 随后拒绝的迁移；仅本人 scope 一处都不可写。 */
+        DataScope sc = await this.Scope();
+        List<SysDepartment> depts = await new SysDepartmentDao(this).Scoped(
+            sc.ByDept(), sc.Depts(), sc.Mine());
+        List<StrMap> deptRows = new List<StrMap>();
+        for (int i = 0; i < depts.Count; i = i + 1) {
+            StrMap o = new StrMap();
+            o.Set("id", Convert.ToString(depts[i].id));
+            o.Set("name", depts[i].name);
+            deptRows.Add(o);
+        }
+        FormPage fp = SysUsersController.UserForm(deptRows);
+        ViewData d = new ViewData();
+        d.Set("dialogTitle", id > 0 ? "编辑账号" : "新增账号");
+        if (id > 0) {
+            SysUser u = await this.Reach(id);
+            fp.Id(Convert.ToString(id));
+            fp.Field("username").Val(u.username);
+            fp.Field("nickname").Val(u.nickname);
+            fp.Field("email").Val(u.email);
+            fp.Field("mobile").Val(u.mobile);
+            fp.Field("departmentId").Val(Convert.ToString(u.departmentId));
+            fp.Field("status").Val(u.status == 1 ? "1" : "0");
+        }
+        fp.Render(d);
+        this.FormDialog(d);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("保存账号")]
+    async void Save() {
+        int id = this.InInt("id", 0);
+        /* 声明即校验：与 Form 渲染同一份约束（required/min/max），
+           初始密码规则（新增才必填、至少 8 位）也出自声明。 */
+        FormPage fp = SysUsersController.UserForm(new List<StrMap>());
+        fp.Id(Convert.ToString(id));
+        string invalid = fp.Validate(this);
+        if (invalid.Length > 0) { this.Fail(400, "0004", invalid); }
+        string username = this.Need("username", "账号");
+        string nickname = this.In("nickname");
+        string email = this.In("email");
+        string mobile = this.In("mobile");
+        int departmentId = this.InInt("departmentId", 0);
+        int status = this.InInt("status", 1);
+        string password = this.In("password");
+        if (status != 1) { status = 0; }
+
+        SysUser clash = await new SysUserDao(this).ByUsername(username);
+        if (clash != null && clash.id != id) {
+            this.Fail(400, "0004", "账号 " + username + " 已存在");
+        }
+        /* 两端皆校验：被编账号在 scope 内、归档到的部门也在——否则仅看一部门的操作员可将账号移出自己范围。 */
+        if (id > 0) { SysUser _t = await this.Reach(id); }
+        await this.Reachable(departmentId);
+
+        if (id > 0) {
+            SysUserDao userDao = new SysUserDao(this);
+            int n = await userDao.UpdateProfile(id, username, nickname, email, mobile, departmentId, status, WebApp.NowSeconds());
+            /* 禁用账号须使其已持会话失效，否则禁令只对下次登录生效。 */
+            if (status == 0) { await this.Revoke(id); }
+            AuthUser.Forget(Convert.ToString(id));
+            await this.Note("编辑账号", "#" + Convert.ToString(id)
+                + " " + username, n > 0, "");
+            this.Saved("账号已保存");
+            return;
+        }
+
+        string salt = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
+        SysUser u = new SysUser();
+        u.username = username;
+        u.nickname = nickname;
+        u.email = email;
+        u.mobile = mobile;
+        u.departmentId = departmentId;
+        u.passwordSalt = salt;
+        u.passwordHash = AuthUser.PasswordHash(password, salt);
+        u.status = status;
+        u.isSuper = 0;
+        u.tokenVersion = 1;
+        u.createdAt = WebApp.NowSeconds();
+        u.updatedAt = u.createdAt;
+        SysUserDao userDao = new SysUserDao(this);
+        int newId = await userDao.Insert(u);
+        await this.Note("新增账号",
+            "#" + Convert.ToString(newId) + " " + username, newId > 0, "");
+        this.Saved("账号已创建");
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Delete)]
+    [Description("删除账号")]
+    async void Delete() {
+        int id = this.InInt("id", 0);
+        SysUser u = await this.Reach(id);
+        if (u.isSuper == 1) {
+            this.Fail(400, "0004", "超级管理员账号不能删除");
+        }
+        SysUser me = await this.Admin();
+        if (me != null && me.id == id) {
+            this.Fail(400, "0004", "不能删除当前登录的账号");
+        }
+        SysUserDao userDao = new SysUserDao(this);
+        int n = await userDao.Delete(id);
+        int _r = await new SysUserRoleDao(this).DeleteByUserId(id);
+        AuthUser.Forget(Convert.ToString(id));
+        await this.Note("删除账号",
+            "#" + Convert.ToString(id) + " " + u.username, n > 0, "");
+        this.Saved("账号已删除");
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("启用或禁用账号")]
+    async void Status() {
+        int id = this.InInt("id", 0);
+        int status = this.InInt("status", 1);
+        if (status != 1) { status = 0; }
+        SysUser u = await this.Reach(id);
+        if (u.isSuper == 1 && status == 0) {
+            this.Fail(400, "0004", "超级管理员账号不能禁用");
+        }
+        SysUserDao userDao = new SysUserDao(this);
+        int n = await userDao.SetStatus(id, status);
+        if (status == 0) { await this.Revoke(id); }
+        AuthUser.Forget(Convert.ToString(id));
+        await this.Note("启用或禁用账号",
+            "#" + Convert.ToString(id) + " " + u.username, n > 0,
+            Fmt.EnabledText(status));
+        if (status == 1) { this.Saved("账号已启用"); return; }
+        this.Saved("账号已禁用，其登录状态同时失效");
+    }
+
+    /* 批量启禁：工具栏对勾选行一次提交（ids=1,2,3）。越权行零容忍——
+       名单里有超管或（禁用时的）本人即整体拒绝，不做"能做多少做多少"
+       的部分成功，避免操作者误以为全部生效。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("批量启禁账号")]
+    async void BatchStatus() {
+        List<int> ids = this.Ids("ids");
+        if (ids.Count == 0) { this.Fail(400, "0004", "未选择账号"); return; }
+        int status = this.InInt("value", 1);
+        if (status != 1) { status = 0; }
+        List<SysUser> rows = await new SysUserDao(this).ByIds(ids);
+        if (rows.Count == 0) { this.Fail(400, "0004", "所选账号不存在"); return; }
+        SysUser me = await this.Admin();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            if (rows[i].isSuper == 1) {
+                this.Fail(400, "0004", "所选账号包含超级管理员，不能批量操作");
+                return;
+            }
+            if (status == 0 && me != null && rows[i].id == me.id) {
+                this.Fail(400, "0004", "所选账号包含当前登录账号，不能批量禁用");
+                return;
+            }
+        }
+        /* 通用批量写动作：白名单（sys_user.status:int）与参数化 SQL 由
+           声明供给；禁用会话失效与缓存失效是业务语义，留在屏内。 */
+        await CrudOps.Batch(this, SysUsersController.ScreenDef(), "status",
+            status == 1 ? "1" : "0", ids, "批量启禁账号");
+        if (status == 0) {
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                await this.Revoke(rows[i].id);
+                AuthUser.Forget(Convert.ToString(rows[i].id));
+            }
+        }
+    }
+
+    /* 批量删除：同零容忍口径。主行删除走通用动作；连带清角色关联并
+       失效其会话是业务语义，留在屏内。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.Delete)]
+    [Description("批量删除账号")]
+    async void BatchDelete() {
+        List<int> ids = this.Ids("ids");
+        if (ids.Count == 0) { this.Fail(400, "0004", "未选择账号"); return; }
+        List<SysUser> rows = await new SysUserDao(this).ByIds(ids);
+        if (rows.Count == 0) { this.Fail(400, "0004", "所选账号不存在"); return; }
+        SysUser me = await this.Admin();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            if (rows[i].isSuper == 1) {
+                this.Fail(400, "0004", "所选账号包含超级管理员，不能批量删除");
+                return;
+            }
+            if (me != null && rows[i].id == me.id) {
+                this.Fail(400, "0004", "所选账号包含当前登录账号，不能批量删除");
+                return;
+            }
+        }
+        await CrudOps.Delete(this, SysUsersController.ScreenDef(), ids, "批量删除账号");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            int _r = await new SysUserRoleDao(this).DeleteByUserId(rows[i].id);
+            AuthUser.Forget(Convert.ToString(rows[i].id));
+        }
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("强制下线")]
+    async void Kick() {
+        int id = this.InInt("id", 0);
+        SysUser u = await this.Reach(id);
+        await this.Revoke(id);
+        await this.Note("强制下线",
+            "#" + Convert.ToString(id) + " " + u.username, true, "");
+        this.Saved("该账号的登录状态已全部失效");
+    }
+
+    /* 重置密码对话框；绝不显示当前密码——无可读内容。 */
+    [HttpGet]
+    [Custom(Perm = PermBit.Update)]
+    [Description("重置密码表单")]
+    async void PasswordForm() {
+        int id = this.InInt("id", 0);
+        SysUser u = await this.Reach(id);
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("username", u.username);
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("重置密码")]
+    async void Password() {
+        int id = this.InInt("id", 0);
+        string password = this.Need("password", "新密码");
+        if (password.Length < 8) {
+            this.Fail(400, "0004", "密码至少 8 位");
+        }
+        SysUser u = await this.Reach(id);
+        SysUserDao userDao = new SysUserDao(this);
+        int n = await userDao.ResetPassword(id, "", AuthUser.NewHash(password),
+            u.tokenVersion + 1, WebApp.NowSeconds());
+        await this.Note("重置密码",
+            "#" + Convert.ToString(id) + " " + u.username, n > 0, "");
+        this.Saved("密码已重置，该账号需要重新登录");
+    }
+
+    /* 分配角色对话框：所有角色、已持者打勾。 */
+    [HttpGet]
+    [Custom(Perm = PermBit.Update)]
+    [Description("分配角色")]
+    async void Roles() {
+        int id = this.InInt("id", 0);
+        SysUser u = await this.Reach(id);
+        ViewData d = new ViewData();
+        d.Set("id", Convert.ToString(id));
+        d.Set("username", u.username);
+        List<SysRole> roles = await new SysRoleDao(this).All();
+        List<SysUserRole> mine = await new SysUserRoleDao(this).ByUserId(id);
+        List<StrMap> rows = d.AddList("roles");
+        for (int i = 0; i < roles.Count; i = i + 1) {
+            SysRole r = roles[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(r.id));
+            row.Set("name", r.name);
+            row.Set("code", r.code);
+            row.Set("description", r.description);
+            for (int j = 0; j < mine.Count; j = j + 1) {
+                if (mine[j].roleId == r.id) { row.Set("checked", "checked"); }
+            }
+            rows.Add(row);
+        }
+        this.Dialog(d);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("保存角色分配")]
+    async void RolesSave() {
+        int id = this.InInt("id", 0);
+        SysUser u = await this.Reach(id);
+        string picked = this.In("roleIds");
+        SysUserRoleDao urDao = new SysUserRoleDao(this);
+        int _cleared = await urDao.DeleteByUserId(id);
+        List<SysRole> roles = await new SysRoleDao(this).All();
+        int granted = 0;
+        for (int i = 0; i < roles.Count; i = i + 1) {
+            if (!AuthUser.Holds(picked, Convert.ToString(roles[i].id))) { continue; }
+            SysUserRole link = new SysUserRole();
+            link.userId = id;
+            link.roleId = roles[i].id;
+            int _n = await urDao.Insert(link);
+            granted = granted + 1;
+        }
+        AuthUser.Forget(Convert.ToString(id));
+        await this.Note("分配角色",
+            "#" + Convert.ToString(id) + " " + u.username, true,
+            Convert.ToString(granted) + " 个角色");
+        this.Saved("角色已保存");
+    }
+
+    /* 请求有权操作的账号；超调用方数据 scope 的答与不存在的行同 404——无法列表的账号不得在对话框或 POST 中确认其存在。 */
+    private async SysUser Reach(int id) {
+        SysUser u = await new SysUserDao(this).ById(id);
+        if (u == null) { this.Fail(404, "0404", "账号不存在"); }
+        DataScope sc = await this.Scope();
+        if (!sc.Covers(u.id, u.departmentId)) {
+            this.Fail(404, "0404", "账号不存在");
+        }
+        return u;
+    }
+
+    /* 拒绝不可写入的部门，使账号无法被建入或移至操作员不可见的部门。 */
+    private async void Reachable(int departmentId) {
+        DataScope sc = await this.Scope();
+        if (sc.Covers(0, departmentId)) { return; }
+        this.Fail(403, "0403", "数据权限不允许操作该部门的账号");
+    }
+
+    /* 使该账号已发的所有令牌失效。 */
+    private async void Revoke(int id) {
+        int _n = await new SysUserDao(this).BumpTokenVersion(id);
+    }
+
+    static string DeptName(List<SysDepartment> depts, int id) {
+        for (int i = 0; i < depts.Count; i = i + 1) {
+            if (depts[i].id == id) { return depts[i].name; }
+        }
+        return "—";
+    }
+
+    static string RoleNames(List<SysRole> roles, List<SysUserRole> links, int userId) {
+        string names = "";
+        for (int i = 0; i < links.Count; i = i + 1) {
+            if (links[i].userId != userId) { continue; }
+            for (int j = 0; j < roles.Count; j = j + 1) {
+                if (roles[j].id != links[i].roleId) { continue; }
+                if (names.Length > 0) { names = names + "、"; }
+                names = names + roles[j].name;
+            }
+        }
+        if (names.Length == 0) { return "—"; }
+        return names;
+    }
+
+}

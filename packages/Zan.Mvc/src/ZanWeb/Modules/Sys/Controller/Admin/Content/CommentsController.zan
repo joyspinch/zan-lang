@@ -1,0 +1,103 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using ZanWeb.Core;
+using ZanWeb.Security;
+using ZanWeb.Web;
+using ZanWeb.Model.Blog;
+
+namespace ZanWeb.Admin.Content;
+
+/* /admin/content/comments 评论审核：读者评论以 status=0 存储，在此处通过后方可见，开放表单无法自行发布。 */
+[Route("admin/content/comments/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("评论管理")]
+class CommentsController : AdminController {
+    [HttpGet]
+    [Route("/admin/content/comments")]
+    [Custom(IsMenu = true, Icon = "mdi:comment-multiple", Perm = PermBit.View)]
+    [Description("评论管理")]
+    async void Index() {
+        ViewData d = await this.Layout("评论管理");
+        if (!this.PageReady(d)) { return; }
+
+        ListQuery q = this.Paged("id", 20);
+        int status = this.InInt("status", -1);
+        if (status == 0) { d.Set("statusPending", "selected"); }
+        if (status == 1) { d.Set("statusOk", "selected"); }
+        if (status == 2) { d.Set("statusNo", "selected"); }
+
+        int total = await this.Comment
+            .WhereIf(status >= 0, a => a.status == status).CountAsync();
+        List<Comment> rows = await this.Comment
+            .WhereIf(status >= 0, a => a.status == status)
+            .OrderByDescending(a => a.id)
+            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        List<Post> posts = await this.Post.ToListAsync();
+
+        /* 通过/拒绝为同一写操作、同一权限位；行自身的 status 只决定哪一侧值得提供。 */
+        bool mayReview = await this.Can((int)PermBit.Update);
+
+        List<StrMap> items = d.AddList("rows");
+        Rows.Of<Comment>(rows, delegate(Comment c, StrMap row) {
+            row.Set("id", Convert.ToString(c.id));
+            row.Set("author", Fmt.Dash(c.author));
+            row.Set("content", c.content);
+            row.Set("post", CommentsController.PostTitle(posts, c.postId));
+            row.Set("postId", Convert.ToString(c.postId));
+            row.Set("ip", Fmt.Dash(c.ip));
+            row.Set("createdAt", Fmt.Stamp(c.createdAt));
+            row.Set("statusText", Fmt.ReviewText(c.status));
+            row.Set("statusClass", Fmt.ReviewClass(c.status));
+            if (mayReview && c.status != 1) { row.Set("canApprove", "1"); }
+            if (mayReview && c.status != 2) { row.Set("canReject", "1"); }
+        }, items);
+        int pending = await this.Comment.Where(a => a.status == 0).CountAsync();
+        d.Set("pending", Convert.ToString(pending));
+        this.Pager(d, q, total);
+        this.Page(d);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("审核评论")]
+    async void Review() {
+        int id = this.InInt("id", 0);
+        int status = this.InInt("status", 1);
+        if (status != 1 && status != 2) { status = 0; }
+        Comment c = await this.Comment.ById(id);
+        if (c == null) { this.Fail(404, "0404", "评论不存在"); }
+        int n = await this.Comment.Update()
+            .Set(a => a.status, status)
+            .Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+        await this.Note("审核评论",
+            "#" + Convert.ToString(id), n > 0, Fmt.ReviewText(status));
+        if (status == 1) { this.Saved("评论已通过，前台可见"); return; }
+        this.Saved("评论已驳回");
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Delete)]
+    [Description("删除评论")]
+    async void Delete() {
+        int id = this.InInt("id", 0);
+        Comment c = await this.Comment.ById(id);
+        if (c == null) { this.Fail(404, "0404", "评论不存在"); }
+        int n = await this.Comment.Delete().Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+        await this.Note("删除评论",
+            "#" + Convert.ToString(id), n > 0, "");
+        this.Saved("评论已删除");
+    }
+
+    static string PostTitle(List<Post> posts, int id) {
+        for (int i = 0; i < posts.Count; i = i + 1) {
+            if (posts[i].id == id) { return posts[i].title; }
+        }
+        return "—";
+    }
+
+
+}

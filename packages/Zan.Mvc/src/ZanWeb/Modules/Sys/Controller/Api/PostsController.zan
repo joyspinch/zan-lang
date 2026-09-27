@@ -1,0 +1,220 @@
+using System;
+using ZanWeb.Core;
+using ZanWeb.Model;
+using ZanWeb.Security;
+using ZanWeb.Services;
+using ZanWeb.Web;
+using System.Web;
+using System.Json;
+using ZanWeb.Model.Blog;
+
+namespace ZanWeb.Api;
+
+/* 文章 CRUD 的 JSON 端点。
+   更新带乐观并发控制：表单携带打开时的 updatedAt，与库中当前值
+   比对——不一致答 409/1005，绝不静默覆盖他人改动。version 比对
+   与写入跑在同一请求连接上，无事务也不丢判：读与写之间没有让出
+   点，worker 单线程事件循环内不存在并发插入。 */
+[Route("api/admin/posts/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("文章接口")]
+class PostsController : AdminController {
+    [HttpGet]
+    [Custom(Perm = PermBit.View)]
+    [Description("文章列表")]
+    async void List() {
+        ListQuery q = this.Paged("id", 20);
+        string kw = q.Kw();
+        int state = this.InInt("state", -1);
+
+        int total = await this.Post
+            .WhereIf(kw.Length > 0, a => a.title.Contains(kw))
+            .WhereIf(state == 1, a => a.published == 1)
+            .WhereIf(state == 0, a => a.published == 0)
+            .CountAsync();
+        List<Post> rows = await this.Post
+            .WhereIf(kw.Length > 0, a => a.title.Contains(kw))
+            .WhereIf(state == 1, a => a.published == 1)
+            .WhereIf(state == 0, a => a.published == 0)
+            .OrderByDescending(a => a.id)
+            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        List<Category> cats = await this.Category.OrderBy(a => a.sortOrder).ToListAsync();
+
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            arr.Append(PostsController.RowJson(rows[i], cats));
+        }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("items", arr);
+        o.Put("total", JsonValue.NewInt(total));
+        o.Put("page", JsonValue.NewInt(q.Page()));
+        o.Put("limit", JsonValue.NewInt(q.Limit()));
+        o.Put("pages", JsonValue.NewInt(q.Pages(total)));
+        this.Ok(o.ToJson());
+    }
+
+    [HttpGet]
+    [Custom(Perm = PermBit.View)]
+    [Description("文章详情")]
+    async void Get() {
+        int id = this.InInt("id", 0);
+        Post p = await this.Post.ById(id);
+        if (p == null) { this.Fail(404, "0404", "文章不存在"); }
+        JsonValue o = PostsController.PostJson(p);
+        /* 编辑表单需要回填正文，列表行不需要，故只放在详情里。 */
+        o.Put("body", JsonValue.NewStr(p.body));
+        List<Category> cats = await this.Category.OrderBy(a => a.sortOrder).ToListAsync();
+        JsonValue carr = JsonValue.NewArray();
+        for (int i = 0; i < cats.Count; i = i + 1) {
+            JsonValue c = JsonValue.NewObject();
+            c.Put("id", JsonValue.NewInt(cats[i].id));
+            c.Put("name", JsonValue.NewStr(cats[i].name));
+            carr.Append(c);
+        }
+        o.Put("categories", carr);
+        this.Ok(o.ToJson());
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Create)]
+    [Description("新建文章")]
+    async void Create() {
+        Post p = await this.ReadForm(0);
+        p.createdAt = WebApp.NowSeconds();
+        p.updatedAt = p.createdAt;
+        int newId = await this.Post.Insert(p).ExecuteIdentityAsync();
+        await this.Bust();
+        await this.Note("新增文章", p.title, newId > 0, "");
+        JsonValue o = JsonValue.NewObject();
+        o.Put("id", JsonValue.NewInt(newId));
+        this.Ok(o.ToJson());
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("更新文章")]
+    async void Update() {
+        int id = this.NeedInt("id", "文章");
+        long version = this.InLong("version", -1);
+        Post cur = await this.Post.ById(id);
+        if (cur == null) { this.Fail(404, "0404", "文章不存在"); }
+        if (version >= 0 && version != cur.updatedAt) {
+            this.Fail(409, "1005", "记录已被他人修改，请刷新后重试");
+        }
+        Post p = await this.ReadForm(id);
+        p.updatedAt = WebApp.NowSeconds();
+        int n = await this.Post.Update()
+            .Set(a => a.title, p.title)
+            .Set(a => a.summary, p.summary)
+            .Set(a => a.body, p.body)
+            .Set(a => a.tags, p.tags)
+            .Set(a => a.cover, p.cover)
+            .Set(a => a.author, p.author)
+            .Set(a => a.categoryId, p.categoryId)
+            .Set(a => a.published, p.published)
+            .Set(a => a.top, p.top)
+            .Set(a => a.updatedAt, p.updatedAt)
+            .Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+        await this.Bust();
+        await this.Note("编辑文章", p.title, n > 0, "");
+        JsonValue o = JsonValue.NewObject();
+        o.Put("id", JsonValue.NewInt(id));
+        o.Put("version", JsonValue.NewInt(p.updatedAt));
+        this.Ok(o.ToJson());
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("发布或下架")]
+    async void Publish() {
+        int id = this.NeedInt("id", "文章");
+        int published = this.InInt("published", 1);
+        if (published != 1) { published = 0; }
+        Post p = await this.Post.ById(id);
+        if (p == null) { this.Fail(404, "0404", "文章不存在"); }
+        int n = await this.Post.Update()
+            .Set(a => a.published, published)
+            .Set(a => a.updatedAt, WebApp.NowSeconds())
+            .Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+        await this.Bust();
+        await this.Note("发布或下架文章", p.title, n > 0,
+            published == 1 ? "发布" : "下架");
+        this.Ok("{\"id\":" + Convert.ToString(id) + "}");
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Delete)]
+    [Description("删除文章")]
+    async void Delete() {
+        int id = this.NeedInt("id", "文章");
+        Post p = await this.Post.ById(id);
+        if (p == null) { this.Fail(404, "0404", "文章不存在"); }
+        int n = await this.Post.Delete().Where(a => a.id == id)
+            .ExecuteAffrowsAsync();
+        int _c = await this.Comment.Delete().Where(a => a.postId == id)
+            .ExecuteAffrowsAsync();
+        await this.Bust();
+        await this.Note("删除文章", p.title, n > 0, "");
+        this.Ok("{\"id\":" + Convert.ToString(id) + "}");
+    }
+
+    /* 表单 → 实体。id 由调用方决定（新建 0，更新为路由 id）。 */
+    private async Post ReadForm(int id) {
+        Post p = new Post();
+        p.id = id;
+        p.title = this.Need("title", "标题");
+        p.body = this.NeedText("body", "正文");
+        p.summary = this.InText("summary");
+        if (p.summary.Length == 0) { p.summary = Prose.Excerpt(p.body, 120); }
+        p.tags = this.In("tags");
+        p.cover = this.In("cover");
+        p.author = this.In("author");
+        SysUser me = await this.Admin();
+        if (p.author.Length == 0) { p.author = me.username; }
+        p.categoryId = this.InInt("categoryId", 0);
+        int published = this.InInt("published", 1);
+        p.published = published == 1 ? 1 : 0;
+        int top = this.InInt("top", 0);
+        p.top = top == 1 ? 1 : 0;
+        p.views = 0;
+        return p;
+    }
+
+    private async void Bust() {
+        CacheContext cache = this.Cache();
+        if (cache == null) { return; }
+        await cache.DelAsync("blog:list");
+    }
+
+    static JsonValue RowJson(Post p, List<Category> cats) {
+        JsonValue o = PostsController.PostJson(p);
+        o.Put("category", JsonValue.NewStr(PostsController.CategoryName(cats, p.categoryId)));
+        return o;
+    }
+
+    static JsonValue PostJson(Post p) {
+        JsonValue o = JsonValue.NewObject();
+        o.Put("id", JsonValue.NewInt(p.id));
+        o.Put("title", JsonValue.NewStr(p.title));
+        o.Put("summary", JsonValue.NewStr(p.summary));
+        o.Put("author", JsonValue.NewStr(p.author));
+        o.Put("tags", JsonValue.NewStr(p.tags));
+        o.Put("cover", JsonValue.NewStr(p.cover));
+        o.Put("categoryId", JsonValue.NewInt(p.categoryId));
+        o.Put("published", JsonValue.NewInt(p.published));
+        o.Put("top", JsonValue.NewInt(p.top));
+        /* updatedAt 兼作乐观锁版本号：读时带给表单，写时校验。 */
+        o.Put("version", JsonValue.NewInt(p.updatedAt));
+        o.Put("createdAt", JsonValue.NewInt(p.createdAt));
+        return o;
+    }
+
+    static string CategoryName(List<Category> cats, int id) {
+        for (int i = 0; i < cats.Count; i = i + 1) {
+            if (cats[i].id == id) { return cats[i].name; }
+        }
+        return "未分类";
+    }
+}

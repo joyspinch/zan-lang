@@ -1,0 +1,788 @@
+using System;
+using System.Diagnostics;
+using System.Json;
+using System.Text;
+using System.Threading;
+using System.Web;
+using ZanWeb.Core;
+using ZanWeb.Security;
+using ZanWeb.Services;
+using ZanWeb.Web;
+
+namespace ZanWeb.Admin.MonitorController;
+
+/* /admin/monitor 服务器监控：吞吐量、错误、延迟、查询、CPU/内存，以图表呈现；页面向 /admin/monitor/stream 订阅一次，服务器经 Server-Sent Events 每几秒推一份快照——轮询等价于每 tick 每标签页一次完整请求（路由、授权解析、记日志），流只占一条连接且仅在有数据时发送，空闲时发注释行让代理不误判断连。 */
+[Route("admin/monitor/[action]")]
+[Custom(Authorization = CustomAuthorization.Grant)]
+[Description("运行监控")]
+class MonitorController : AdminController {
+    /* 流存活时长；有意的上限：标签整夜开着不应永远占协程，EventSource 会自连。 */
+    static int StreamSeconds = 1800;
+
+    [HttpGet]
+    [Route("/admin/monitor")]
+    [Custom(IsMenu = true, Icon = "mdi:chart-line", Perm = PermBit.View)]
+    [Description("运行监控")]
+    async void Index() {
+        ViewData d = await this.Layout("运行监控");
+        JsonValue m = JsonValue.ParseLenient(await MetricsCluster.SnapshotJson());
+        JsonValue req = m.Get("requests");
+        if (req == null) { req = JsonValue.NewObject(); }
+        long workers = m.Long("workers", 1);
+        d.Set("workers", Convert.ToString(workers));
+        string wl = m.Str("worker_list", "");
+        if (wl.Length == 0) { wl = Convert.ToString(m.Long("worker_id", 0)); }
+        d.Set("worker", wl);
+        d.Set("pid", Convert.ToString(m.Long("pid", 0)));
+        d.Set("slow", Fmt.Dur(req.Long("slow_threshold_us", 0)));
+
+        /* 当日四个数字随页渲出，首次绘制即为当日汇总而非本 worker 计数器（新派 worker 从 0 起），页后续由 /admin/monitor/today 保持更新。 */
+        long now = (long)WebApp.NowSeconds();
+        long today = MonitorController.Today(now);
+        long from = MonitorController.PickedDay(this.In("d"), today);
+        long to = MonitorController.DayEnd(from, today, now);
+        int _f = await MetricsStore.Flush();
+        MetricMinute day = await MetricsStore.WindowTotals(from, to, "", "");
+        d.Set("day", Fmt.Day(from));
+        d.Set("d", Fmt.Day(from));
+        if (from < today) { d.Set("past", "1"); }
+        d.Set("dayCalls", Convert.ToString(day.calls));
+        d.Set("dayErrors", Convert.ToString(day.errors));
+        d.Set("dayAvg", Fmt.Dur(MonitorController.Avg(day.totalUs, day.calls)));
+        d.Set("dayMax", Fmt.Dur(day.maxUs));
+        this.Page(d);
+    }
+
+    /* 实时快照流；非菜单项，监控页为其界面。 */
+    [HttpGet]
+    [Custom(Perm = PermBit.View)]
+    [Description("运行指标事件流")]
+    async void Stream() {
+        HttpContext ctx = this.Ctx();
+        if (!await ctx.SseOpen()) { return; }
+
+        /* 首帧携带近期历史使图表一次绘满，而非两分钟内慢慢填满；每帧为所有 live worker 的合并，非本进程自身数字。 */
+        if (!await ctx.SseSend("series", await MetricsCluster.SeriesJson(120))) {
+            return;
+        }
+
+        int elapsed = 0;
+        int sinceSeries = 0;
+        while (elapsed < MonitorController.StreamSeconds) {
+            await Task.Delay(2000);
+            elapsed = elapsed + 2;
+            sinceSeries = sinceSeries + 2;
+            if (!await ctx.SseSend("metrics",
+                    await MetricsCluster.SnapshotJson())) { return; }
+            if (sinceSeries >= 10) {
+                sinceSeries = 0;
+                if (!await ctx.SseSend("series",
+                        await MetricsCluster.SeriesJson(120))) {
+                    return;
+                }
+            }
+        }
+    }
+
+    /* 当日页面按五分钟分桶：一昼夜 288 个点，足以看见尖峰又易绘。 */
+    static long DayStep = 300;
+    /* 当日排名每个排序下展示条数。 */
+    static int DayRoutes = 20;
+
+    /* 当日（今天至此，或指定的一天完整）取自持久化的分钟行而非任一进程计数器。不用实时快照：worker 计数器于启动时归零，重启/新派会让页面总计、排名、图表反向跳变。分钟表由所有 worker 写入同一库、以分钟+接口为键，跨重启跨集群累积；本 worker 未刷出的桶先刷出，故当前分钟被纳入；as_of 报告其余 worker 最新刷出的时刻。 */
+    static async string DayJson(long from, long to) {
+        int _w = await MetricsStore.Flush();
+        MetricMinute tot = await MetricsStore.WindowTotals(from, to, "", "");
+        List<MetricMinute> rows = await MetricsStore.HistoryBuckets(from, to,
+            "", "", MonitorController.DayStep, MonitorController.MaxRows);
+        rows = MonitorController.FillGaps(rows, from, to, MonitorController.DayStep);
+
+        /* 最旧在前：图表 x 轴正向。 */
+        JsonValue pts = JsonValue.NewArray();
+        for (int i = rows.Count - 1; i >= 0; i = i - 1) {
+            MetricMinute b = rows[i];
+            JsonValue p = JsonValue.NewObject();
+            p.Put("t", MetricsCluster.Num(b.minute));
+            p.Put("calls", MetricsCluster.Num(b.calls));
+            p.Put("errors", MetricsCluster.Num(b.errors));
+            p.Put("avg_us", MetricsCluster.Num(MonitorController.Avg(b.totalUs, b.calls)));
+            p.Put("p95_us", MetricsCluster.Num(b.p95Us));
+            p.Put("max_us", MetricsCluster.Num(b.maxUs));
+            pts.Append(p);
+        }
+
+        JsonValue o = JsonValue.NewObject();
+        o.Put("day", JsonValue.NewStr(Fmt.Day(from)));
+        o.Put("from", MetricsCluster.Num(from));
+        o.Put("as_of", MetricsCluster.Num(to));
+        o.Put("step", MetricsCluster.Num(MonitorController.DayStep));
+        o.Put("calls", MetricsCluster.Num(tot.calls));
+        o.Put("errors", MetricsCluster.Num(tot.errors));
+        o.Put("avg_us", MetricsCluster.Num(MonitorController.Avg(tot.totalUs, tot.calls)));
+        o.Put("max_us", MetricsCluster.Num(tot.maxUs));
+        o.Put("total_us", MetricsCluster.Num(tot.totalUs));
+        o.Put("frames", MetricsCluster.Num(tot.frames));
+        o.Put("bytes", MetricsCluster.Num(tot.bytes));
+        o.Put("points", pts);
+        o.Put("top", await MonitorController.DayTop(from, to));
+        return o.ToJson();
+    }
+
+    /* 当日各接口一行，供操作员按所问列排序；按调用量与耗时两套排序合并取 top——吞吐最多者常非耗时最多者，单排序会隐藏另一端的领先者。 */
+    static async JsonValue DayTop(long from, long to) {
+        JsonValue arr = JsonValue.NewArray();
+        Dictionary<string,int> seen = new Dictionary<string,int>();
+        await MonitorController.AppendDayTop(arr, seen, from, to, "calls");
+        await MonitorController.AppendDayTop(arr, seen, from, to, "time");
+        return arr;
+    }
+
+    /* 追加当日按 rank（calls=频次 / time=占服务器当日时间比）排序的接口，跳过已在 arr 中的。 */
+    static async void AppendDayTop(JsonValue arr, Dictionary<string,int> seen,
+            long from, long to, string rank) {
+        List<MetricMinute> tops = await MetricsStore.RouteTotalsBy(from, to,
+            "", "", MonitorController.DayRoutes, rank);
+        for (int i = 0; i < tops.Count; i = i + 1) {
+            MetricMinute b = tops[i];
+            string req = b.method + " " + b.path;
+            if (seen.ContainsKey(req)) { continue; }
+            seen[req] = 1;
+            JsonValue o = JsonValue.NewObject();
+            o.Put("req", JsonValue.NewStr(req));
+            o.Put("calls", MetricsCluster.Num(b.calls));
+            o.Put("errors", MetricsCluster.Num(b.errors));
+            o.Put("avg_us", MetricsCluster.Num(MonitorController.Avg(b.totalUs, b.calls)));
+            o.Put("p95_us", MetricsCluster.Num(b.p95Us));
+            o.Put("max_us", MetricsCluster.Num(b.maxUs));
+            o.Put("total_us", MetricsCluster.Num(b.totalUs));
+            arr.Append(o);
+        }
+    }
+
+    /* 当日累计指标单次请求，供工具与页面首绘；d (YYYY-MM-DD) 指定日，默认今天。 */
+    [HttpGet]
+    [Custom(Perm = PermBit.View)]
+    [Description("当天累计指标")]
+    async void Today() {
+        long now = (long)WebApp.NowSeconds();
+        long today = MonitorController.Today(now);
+        long from = MonitorController.PickedDay(this.In("d"), today);
+        this.Json(await MonitorController.DayJson(from,
+            MonitorController.DayEnd(from, today, now)));
+    }
+
+    /* 今日零点秒。 */
+    static long Today(long now) { return Fmt.TodayStart(now); }
+
+    /* 屏幕所求日期：可解析且不在未来的取指定日，否则取今日；未来日无行，答空表会被读作历史丢失。 */
+    static long PickedDay(string day, long today) {
+        long start = MonitorController.DaySeconds(day);
+        if (start < 0 || start > today) { return today; }
+        return start;
+    }
+
+    /* 被读当日终点：已结束日取午夜，今日取此刻——窗跑到今夜午夜的会把尚未发生的时刻算作无流量的一日。 */
+    static long DayEnd(long from, long today, long now) {
+        if (from >= today) { return now; }
+        return from + 86399;
+    }
+
+    /* 与实时快照同一次请求，供非浏览器工具。 */
+    [HttpGet]
+    [Custom(Perm = PermBit.View)]
+    [Description("运行指标快照")]
+    async void Snapshot() {
+        this.Json(await MetricsCluster.SnapshotJson());
+    }
+
+    [HttpGet]
+    [Custom(Perm = PermBit.View)]
+    [Description("运行指标时序")]
+    async void Series() {
+        this.Json(await MetricsCluster.SeriesJson(this.InInt("sec", 120)));
+    }
+
+    /* 流无法完成的分析：哪小时/日承载多少流量、吞吐与延迟、由哪些接口承载；两表由数据库按时间桶与接口分组，非屏幕端拼分钟行。接口即 method+path；无路径的请求从未被登记，故无扫描器 URL。 */
+    [HttpGet]
+    [Route("/admin/monitor/history")]
+    [Custom(IsMenu = true, Icon = "mdi:chart-timeline-variant", Perm = PermBit.View)]
+    [Description("历史统计")]
+    async void History() {
+        ViewData d = await this.Layout("历史统计");
+        string method = this.In("m");
+        string route = this.In("route");
+        /* 两种取窗方式：h 为"过去 N 小时"，d/d2 为日历日期；日历窗两端闭合，故每次打开桶相同，滚动窗则不然。 */
+        MetricWindow w = MonitorController.Window(this.In("d"), this.In("d2"),
+            this.InInt("h", 24));
+        string gran = MonitorController.Gran(this.In("g"), w.hours);
+        long step = MonitorController.Step(gran);
+        long from = w.from;
+        long to = w.to;
+
+        /* 先刷窗，使"过去一小时"含正在填充的分钟而非止于十分钟前。 */
+        int _w = await MetricsStore.Flush();
+        List<MetricMinute> rows = await MetricsStore.HistoryBuckets(from, to,
+            method, route, step, MonitorController.MaxRows);
+        /* 两种顺序：哪个接口被调最多、哪个接口占窗内服务器时间；参数以名称切换，不进入语句。 */
+        string by = "calls";
+        if (this.In("by") == "time") { by = "time"; }
+        List<MetricMinute> tops = await MetricsStore.RouteTotalsBy(from, to,
+            method, route, MonitorController.MaxRoutes, by);
+        /* 日历窗展示其含的全部桶，含无流量者——"03:00 无数据"是事实，跳过这些小时会被误读为时间线。 */
+        if (w.dated) { rows = MonitorController.FillGaps(rows, from, to, step); }
+
+        List<StrMap> items = d.AddList("rows");
+        long calls = 0;
+        long errors = 0;
+        long peakQps10 = 0;
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            MetricMinute b = rows[i];
+            calls = calls + b.calls;
+            errors = errors + b.errors;
+            long qps10 = b.calls * 10 / step;
+            if (qps10 > peakQps10) { peakQps10 = qps10; }
+            StrMap r = new StrMap();
+            r.Set("bucket", MonitorController.BucketLabel(b.minute, gran));
+            r.Set("calls", Convert.ToString(b.calls));
+            r.Set("qps", MonitorController.Tenths(qps10));
+            r.Set("errors", Convert.ToString(b.errors));
+            r.Set("errRate", MonitorController.Rate(b.errors, b.calls));
+            r.Set("avg", Fmt.Dur(MonitorController.Avg(b.totalUs, b.calls)));
+            r.Set("p95", Fmt.Dur(b.p95Us));
+            r.Set("max", Fmt.Dur(b.maxUs));
+            r.Set("frames", Convert.ToString(b.frames));
+            r.Set("bytes", Fmt.Bytes(b.bytes));
+            items.Add(r);
+        }
+
+        List<StrMap> routes = d.AddList("routes");
+        for (int i = 0; i < tops.Count; i = i + 1) {
+            MetricMinute b = tops[i];
+            StrMap r = new StrMap();
+            /* 两格：动作与接口；为兼容未更新的视图，仍把两值拼入老 route 格。 */
+            r.Set("method", b.method);
+            r.Set("path", b.path);
+            r.Set("route", b.method + " " + b.path);
+            r.Set("calls", Convert.ToString(b.calls));
+            r.Set("share", MonitorController.Rate(b.calls, calls));
+            r.Set("errors", Convert.ToString(b.errors));
+            r.Set("errRate", MonitorController.Rate(b.errors, b.calls));
+            r.Set("avg", Fmt.Dur(MonitorController.Avg(b.totalUs, b.calls)));
+            r.Set("p95", Fmt.Dur(b.p95Us));
+            r.Set("max", Fmt.Dur(b.maxUs));
+            r.Set("total", Fmt.Dur(b.totalUs));
+            r.Set("frames", Convert.ToString(b.frames));
+            r.Set("bytes", Fmt.Bytes(b.bytes));
+            routes.Add(r);
+        }
+
+        d.Set("by", by);
+        d.Set("by_" + by, "1");
+        d.Set("hours", Convert.ToString(w.hours));
+        d.Set("m", method);
+        d.Set("route", route);
+        d.Set("g", gran);
+        d.Set("g_" + gran, "1");
+        d.Set("d", w.day);
+        d.Set("d2", w.day2);
+        d.Set("from", Fmt.Stamp(from));
+        d.Set("to", Fmt.Stamp(to));
+        if (w.dated) { d.Set("dated", "1"); }
+        if (w.invalid) { d.Set("badDate", "1"); }
+        /* 窗标签在此构建，模板无 {{else}}，故不能让 KPI 对日历查询读作"24 小时"。 */
+        string label = Convert.ToString(w.hours) + " 小时";
+        if (w.dated) {
+            label = w.day;
+            if (w.day2 != w.day) { label = label + " → " + w.day2; }
+        }
+        d.Set("window", label);
+        d.Set("calls", Convert.ToString(calls));
+        d.Set("errors", Convert.ToString(errors));
+        long windowQps10 = 0;
+        long span = to - from;
+        if (span > 0) { windowQps10 = calls * 10 / span; }
+        d.Set("avgQps", MonitorController.Tenths(windowQps10));
+        d.Set("peakQps", MonitorController.Tenths(peakQps10));
+        d.Set("shown", Convert.ToString(rows.Count));
+        if (calls == 0) { d.Set("empty", "1"); }
+        if (rows.Count >= MonitorController.MaxRows) { d.Set("capped", "1"); }
+        this.Page(d);
+    }
+
+    /* 与屏同窗的文件导出；受同条行数上限约束，一次请求无法拉出整库。 */
+    [HttpGet]
+    [Custom(Perm = PermBit.Export)]
+    [Description("导出历史统计")]
+    async void Export() {
+        string method = this.In("m");
+        string route = this.In("route");
+        MetricWindow win = MonitorController.Window(this.In("d"), this.In("d2"),
+            this.InInt("h", 24));
+        string gran = MonitorController.Gran(this.In("g"), win.hours);
+        long step = MonitorController.Step(gran);
+        long from = win.from;
+        long to = win.to;
+        int _w = await MetricsStore.Flush();
+        List<MetricMinute> rows = await MetricsStore.HistoryBuckets(from, to,
+            method, route, step, MonitorController.MaxRows);
+        if (win.dated) { rows = MonitorController.FillGaps(rows, from, to, step); }
+
+        if (this.In("format") == "json") {
+            MetricsExportDoc doc = new MetricsExportDoc();
+            doc.from = from;
+            doc.to = to;
+            doc.rows = new List<MetricsRowDoc>();
+            doc.step_seconds = step;
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                MetricMinute b = rows[i];
+                MetricsRowDoc o = new MetricsRowDoc();
+                o.bucket = b.minute;
+                o.method = method;
+                o.path = route;
+                o.calls = b.calls;
+                o.errors = b.errors;
+                o.avg_us = MonitorController.Avg(b.totalUs, b.calls);
+                o.max_us = b.maxUs;
+                o.frames = b.frames;
+                o.bytes = b.bytes;
+                doc.rows.Add(o);
+            }
+            this.Ctx().Download("metrics.json", "application/json",
+                Json.Serialize<MetricsExportDoc>(doc));
+            return;
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.Append("bucket,method,path,calls,errors,avg_us,max_us,frames,bytes\n");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            MetricMinute b = rows[i];
+            sb.Append(Convert.ToString(b.minute));
+            sb.Append(",");
+            sb.Append(MonitorController.Cell(method));
+            sb.Append(",");
+            sb.Append(MonitorController.Cell(route));
+            sb.Append(",");
+            sb.Append(Convert.ToString(b.calls));
+            sb.Append(",");
+            sb.Append(Convert.ToString(b.errors));
+            sb.Append(",");
+            sb.Append(Convert.ToString(MonitorController.Avg(b.totalUs, b.calls)));
+            sb.Append(",");
+            sb.Append(Convert.ToString(b.maxUs));
+            sb.Append(",");
+            sb.Append(Convert.ToString(b.frames));
+            sb.Append(",");
+            sb.Append(Convert.ToString(b.bytes));
+            sb.Append("\n");
+        }
+        this.Ctx().Download("metrics.csv", "text/csv; charset=utf-8",
+            sb.ToString());
+    }
+
+    /* 服务器捕获的所有错误，按分发器喂给 sink 的持久化形式；存储前已脱敏，此屏不含密钥、令牌或密码。 */
+    [HttpGet]
+    [Route("/admin/monitor/errors")]
+    [Custom(IsMenu = true, Icon = "mdi:alert-circle-outline", Perm = PermBit.View)]
+    [Description("错误日志")]
+    async void Errors() {
+        ViewData d = await this.Layout("错误日志");
+        int hours = MonitorController.Hours(this.InInt("h", 24));
+        long to = (long)WebApp.NowSeconds();
+        long from = to - (long)hours * 3600;
+        int _w = await MetricsStore.Flush();
+        List<MetricError> rows = await MetricsStore.Errors(from, to,
+            MonitorController.MaxRows);
+        List<StrMap> items = d.AddList("rows");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            MetricError e = rows[i];
+            StrMap r = new StrMap();
+            r.Set("id", Convert.ToString(e.id));
+            r.Set("ts", Fmt.Stamp(e.ts));
+            r.Set("origin", e.origin);
+            r.Set("detail", e.detail);
+            items.Add(r);
+        }
+        d.Set("hours", Convert.ToString(hours));
+        d.Set("shown", Convert.ToString(rows.Count));
+        if (rows.Count == 0) { d.Set("empty", "1"); }
+        this.Page(d);
+    }
+
+    /* SQL 模板统计屏：metrics_sql_day 的唯一读者。语句已规范化（字面量折叠，
+       不存用户输入），按天跨重启跨 worker 累积——实时面板的 top_sql 只见本
+       进程内存 ring、重启清零，隔天查慢 SQL 要看这里。 */
+    [HttpGet]
+    [Route("/admin/monitor/sql")]
+    [Custom(IsMenu = true, Icon = "mdi:database-search", Perm = PermBit.View)]
+    [Description("SQL 统计")]
+    async void Sql() {
+        ViewData d = await this.Layout("SQL 统计");
+        MetricWindow w = MonitorController.Window(this.In("d"), this.In("d2"),
+            this.InInt("h", 24));
+        /* 三种排序回答三个问题：谁被调最多、谁占用服务器最多、谁最常慢——
+           慢率高的未必慢（低频慢 query），占时多的才拖整体。 */
+        string by = "calls";
+        if (this.In("by") == "time") { by = "time"; }
+        if (this.In("by") == "slow") { by = "slow"; }
+        int _w = await MetricsStore.Flush();
+        List<MetricSql> tops = await MetricsStore.SqlTotals(w.from, w.to,
+            MonitorController.MaxRoutes, by);
+
+        List<StrMap> items = d.AddList("rows");
+        long calls = 0;
+        long slow = 0;
+        long totalUs = 0;
+        long maxUs = 0;
+        for (int i = 0; i < tops.Count; i = i + 1) {
+            MetricSql e = tops[i];
+            calls = calls + e.calls;
+            slow = slow + e.slow;
+            totalUs = totalUs + e.totalUs;
+            if (e.maxUs > maxUs) { maxUs = e.maxUs; }
+            StrMap r = new StrMap();
+            r.Set("sql", e.sql);
+            r.Set("calls", Convert.ToString(e.calls));
+            r.Set("slow", Convert.ToString(e.slow));
+            r.Set("slowRate", MonitorController.Rate(e.slow, e.calls));
+            r.Set("avg", Fmt.Dur(MonitorController.Avg(e.totalUs, e.calls)));
+            r.Set("max", Fmt.Dur(e.maxUs));
+            r.Set("total", Fmt.Dur(e.totalUs));
+            items.Add(r);
+        }
+
+        d.Set("by", by);
+        d.Set("by_" + by, "1");
+        d.Set("hours", Convert.ToString(w.hours));
+        d.Set("d", w.day);
+        d.Set("d2", w.day2);
+        /* 窗标签与历史统计同构：日历窗标日期，滚动窗标小时数。 */
+        string label = Convert.ToString(w.hours) + " 小时";
+        if (w.dated) {
+            label = w.day;
+            if (w.day2 != w.day) { label = label + " → " + w.day2; }
+        }
+        d.Set("window", label);
+        d.Set("shapes", Convert.ToString(tops.Count));
+        d.Set("calls", Convert.ToString(calls));
+        d.Set("slow", Convert.ToString(slow));
+        d.Set("slowRate", MonitorController.Rate(slow, calls));
+        d.Set("total", Fmt.Dur(totalUs));
+        d.Set("max", Fmt.Dur(maxUs));
+        if (tops.Count == 0) { d.Set("empty", "1"); }
+        if (tops.Count >= MonitorController.MaxRoutes) { d.Set("capped", "1"); }
+        this.Page(d);
+    }
+
+    /* 与屏同窗的 SQL 统计导出；同一条目上限，查询串不能一次拉走整库。 */
+    [HttpGet]
+    [Custom(Perm = PermBit.Export)]
+    [Description("导出 SQL 统计")]
+    async void SqlExport() {
+        MetricWindow win = MonitorController.Window(this.In("d"), this.In("d2"),
+            this.InInt("h", 24));
+        string by = "calls";
+        if (this.In("by") == "time") { by = "time"; }
+        if (this.In("by") == "slow") { by = "slow"; }
+        int _w = await MetricsStore.Flush();
+        List<MetricSql> tops = await MetricsStore.SqlTotals(win.from, win.to,
+            MonitorController.MaxRoutes, by);
+        StringBuilder sb = new StringBuilder();
+        sb.Append("sql,calls,slow,avg_us,max_us,total_us\n");
+        for (int i = 0; i < tops.Count; i = i + 1) {
+            MetricSql e = tops[i];
+            sb.Append(MonitorController.Cell(e.sql));
+            sb.Append(",");
+            sb.Append(Convert.ToString(e.calls));
+            sb.Append(",");
+            sb.Append(Convert.ToString(e.slow));
+            sb.Append(",");
+            sb.Append(Convert.ToString(MonitorController.Avg(e.totalUs, e.calls)));
+            sb.Append(",");
+            sb.Append(Convert.ToString(e.maxUs));
+            sb.Append(",");
+            sb.Append(Convert.ToString(e.totalUs));
+            sb.Append("\n");
+        }
+        this.Ctx().Download("sql-metrics.csv", "text/csv; charset=utf-8",
+            sb.ToString());
+    }
+
+    /* 顶栏铃铛的数据源：无状态即算即答，不存告警历史——历史是错误日志与
+       指标屏的职责，这里只回答"现在有事吗"。三信号：5 分钟窗错误率（调用量
+       达到门槛才评，避免深夜个位数请求一个 500 就是 100%）、窗内最差分钟档
+       P95 耗时、工作进程掉线（发布停止超过时效）。 */
+    static int AlertWindowSec = 300;
+
+    [HttpGet]
+    [Custom(Perm = PermBit.View)]
+    [Description("运行告警")]
+    async void Alerts() {
+        JsonValue arr = JsonValue.NewArray();
+        if (Cfg.Metrics.enabled && MetricsStore.Ready()) {
+            int _w = await MetricsStore.Flush();
+            long to = (long)WebApp.NowSeconds();
+            long from = to - MonitorController.AlertWindowSec;
+            MetricMinute tot = await MetricsStore.WindowTotals(from, to, "", "");
+            if (Cfg.Metrics.alertErrPct > 0
+                    && tot.calls >= (long)Cfg.Metrics.alertErrCalls) {
+                long rate10 = tot.errors * 1000 / tot.calls;
+                if (rate10 >= (long)Cfg.Metrics.alertErrPct * 10) {
+                    arr.Append(MonitorController.AlertMsg("近 5 分钟错误率 "
+                        + MonitorController.Tenths(rate10) + "%（"
+                        + Convert.ToString(tot.errors) + "/"
+                        + Convert.ToString(tot.calls) + "）"));
+                }
+            }
+            if (Cfg.Metrics.alertP95Ms > 0) {
+                List<MetricMinute> rows = await MetricsStore.HistoryBuckets(
+                    from, to, "", "", 60, MonitorController.MaxRows);
+                long worst = 0;
+                for (int i = 0; i < rows.Count; i = i + 1) {
+                    if (rows[i].p95Us > worst) { worst = rows[i].p95Us; }
+                }
+                if (worst >= (long)Cfg.Metrics.alertP95Ms * 1000) {
+                    arr.Append(MonitorController.AlertMsg("近 5 分钟 P95 耗时 "
+                        + Fmt.Dur(worst)));
+                }
+            }
+            if (Cfg.Worker.count > 1) {
+                List<LiveRow> lives = await MetricsCluster.LiveRows("snapshot",
+                    MetricsCluster.FreshSeconds);
+                if (lives.Count < Cfg.Worker.count) {
+                    arr.Append(MonitorController.AlertMsg("工作进程 "
+                        + Convert.ToString(lives.Count) + "/"
+                        + Convert.ToString(Cfg.Worker.count) + " 在线"));
+                }
+            }
+        }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("alerts", arr);
+        o.Put("ts", MetricsCluster.Num((long)WebApp.NowSeconds()));
+        this.Json(o.ToJson());
+    }
+
+    static JsonValue AlertMsg(string msg) {
+        JsonValue s = JsonValue.NewObject();
+        s.Put("msg", JsonValue.NewStr(msg));
+        return s;
+    }
+
+    /* 本进程映射的共享内存（只读）：每表一行，含所存内容与所耗成本；映射是预留地址空间（行可寻址但未必已占用），故创建大小与实际驻留为两列。数字按进程计：各 worker 在同驻留映射各自表。 */
+    [HttpGet]
+    [Route("/admin/monitor/tables")]
+    [Custom(IsMenu = true, Icon = "mdi:memory", Perm = PermBit.View)]
+    [Description("共享内存表")]
+    async void Tables() {
+        ViewData d = await this.Layout("共享内存表");
+        List<StrMap> items = d.AddList("rows");
+        long reserved = 0;
+        long resident = 0;
+        bool partial = false;
+        int n = SharedTable.OpenCount();
+        for (int i = 0; i < n; i = i + 1) {
+            long res = SharedTable.OpenStat(i, SharedTable.STAT_RESERVED);
+            long live = SharedTable.OpenStat(i, SharedTable.STAT_RESIDENT);
+            long cap = SharedTable.OpenStat(i, SharedTable.STAT_CAPACITY);
+            long used = SharedTable.OpenStat(i, SharedTable.STAT_COUNT);
+            StrMap r = new StrMap();
+            r.Set("name", SharedTable.OpenLabel(i));
+            r.Set("used", Convert.ToString(used));
+            r.Set("capacity", Convert.ToString(cap));
+            r.Set("fill", MonitorController.Rate(used, cap));
+            r.Set("stride", Convert.ToString(
+                SharedTable.OpenStat(i, SharedTable.STAT_ROW_STRIDE)));
+            r.Set("keySize", Convert.ToString(
+                SharedTable.OpenStat(i, SharedTable.STAT_KEY_SIZE)));
+            r.Set("columns", Convert.ToString(
+                SharedTable.OpenStat(i, SharedTable.STAT_COLUMNS)));
+            r.Set("reserved", Fmt.Bytes(res));
+            r.Set("resident", Fmt.Bytes(live));
+            items.Add(r);
+            reserved = reserved + res;
+            /* 平台不可报告驻留时答 -1；一条未知行使总数为低估而非谎言。 */
+            if (live < 0) { partial = true; } else { resident = resident + live; }
+        }
+        d.Set("count", Convert.ToString(n));
+        d.Set("reserved", Fmt.Bytes(reserved));
+        d.Set("resident", Fmt.Bytes(resident));
+        if (partial) { d.Set("partial", "1"); }
+        if (n == 0) { d.Set("empty", "1"); }
+        this.Page(d);
+    }
+
+    /* 导出与屏幕可请求的最大窗与页；查询串不得决定一次请求读取多少数据。 */
+    static int MaxRows = 5000;
+    static int MaxHours = 720;
+    static int MaxRoutes = 100;
+
+    static int Hours(int h) {
+        if (h < 1) { return 1; }
+        if (h > MonitorController.MaxHours) { return MonitorController.MaxHours; }
+        return h;
+    }
+
+    /* 屏幕所求窗：day 可解析时取日历日（或多日），否则取过去 h 小时；日历窗覆盖整日 00:00:00–23:59:59，同一日期答同桶；滚动窗同样钳到 MaxHours，查询串一次不能要一整年。 */
+    static MetricWindow Window(string day, string day2, int h) {
+        MetricWindow w = new MetricWindow();
+        w.day = "";
+        w.day2 = "";
+        w.dated = false;
+        w.invalid = false;
+        long start = MonitorController.DaySeconds(day);
+        if (day.Length > 0 && start < 0) { w.invalid = true; }
+        if (start >= 0) {
+            long end = MonitorController.DaySeconds(day2);
+            if (day2.Length > 0 && end < 0) { w.invalid = true; }
+            if (end < start) { end = start; }
+            long span = (end - start) / 3600 + 24;
+            if (span > (long)MonitorController.MaxHours) {
+                end = start + ((long)MonitorController.MaxHours - 24) * 3600;
+                span = (long)MonitorController.MaxHours;
+            }
+            w.from = start;
+            w.to = end + 86399;
+            w.hours = (int)span;
+            w.dated = true;
+            w.day = Fmt.Day(start);
+            w.day2 = Fmt.Day(end);
+            return w;
+        }
+        w.hours = MonitorController.Hours(h);
+        w.to = (long)WebApp.NowSeconds();
+        w.from = w.to - (long)w.hours * 3600;
+        return w;
+    }
+
+    /* "YYYY-MM-DD" 转该日 UTC 零点秒；不可解析为 -1；手解析不信任，因该值决定页面读哪些行。 */
+    static long DaySeconds(string s) {
+        if (s == null || s.Length != 10) { return 0 - 1; }
+        if (s.Substring(4, 1) != "-" || s.Substring(7, 1) != "-") {
+            return 0 - 1;
+        }
+        int y = MonitorController.Digits(s, 0, 4);
+        int m = MonitorController.Digits(s, 5, 2);
+        int dd = MonitorController.Digits(s, 8, 2);
+        if (y < 1970 || m < 1 || m > 12 || dd < 1) { return 0 - 1; }
+        if (dd > DateTime.DaysInMonth(y, m)) { return 0 - 1; }
+        return Fmt.LocalDayStart(y, m, dd);
+    }
+
+    /* 取 s 在 at 处 n 位数字；任一非数字返回 -1。 */
+    static int Digits(string s, int at, int n) {
+        int v = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = s[at + i] & 255;
+            if (c < 48 || c > 57) { return 0 - 1; }
+            v = v * 10 + (c - 48);
+        }
+        return v;
+    }
+
+    /* 空桶补零；使一天在屏上为 24 小时，无论有无流量；按 MaxRows 上限。 */
+    static List<MetricMinute> FillGaps(List<MetricMinute> rows, long from,
+                                       long to, long step) {
+        List<MetricMinute> outp = new List<MetricMinute>();
+        long first = (from / step) * step;
+        long last = (to / step) * step;
+        int at = 0;
+        for (long b = last; b >= first; b = b - step) {
+            if (outp.Count >= MonitorController.MaxRows) { break; }
+            if (at < rows.Count && rows[at].minute == b) {
+                outp.Add(rows[at]);
+                at = at + 1;
+                continue;
+            }
+            MetricMinute z = new MetricMinute();
+            z.minute = b;
+            z.method = "";
+            z.path = "";
+            outp.Add(z);
+        }
+        return outp;
+    }
+
+    /* 粒度校验；未设时按窗长挑选可读的粒度（≤3h 分钟，≤3d 小时，更长按日）。 */
+    static string Gran(string g, int hours) {
+        if (g == "min" || g == "hour" || g == "day") { return g; }
+        if (hours <= 3) { return "min"; }
+        if (hours <= 72) { return "hour"; }
+        return "day";
+    }
+
+    static long Step(string gran) {
+        if (gran == "min") { return 60; }
+        if (gran == "day") { return 86400; }
+        return 3600;
+    }
+
+    /* 桶按屏称呼：日按日期、小时"日期 hh:00"、分钟完整时钟。 */
+    static string BucketLabel(long sec, string gran) {
+        if (gran == "day") { return Fmt.Day(sec); }
+        string s = Fmt.Stamp(sec);
+        if (gran == "hour" && s.Length >= 3) {
+            return s.Substring(0, s.Length - 3);
+        }
+        return s;
+    }
+
+    /* 十分位计数，作 "12.3"；整数运算，仅为表格单元格而非后续数学。 */
+    static string Tenths(long v10) {
+        return Convert.ToString(v10 / 10) + "." + Convert.ToString(v10 % 10);
+    }
+
+    /* part/whole 作百分比，一位小数。 */
+    static string Rate(long part, long whole) {
+        if (whole <= 0) { return "0.0"; }
+        return MonitorController.Tenths(part * 1000 / whole);
+    }
+
+    /* 微秒均值；无调用桶答 0（补零小时无均值，除 0 会出错而非答数）。 */
+    static long Avg(long totalUs, long calls) {
+        if (calls <= 0) { return 0; }
+        return totalUs / calls;
+    }
+
+    /* CSV 单元格：加引号、内部引号翻倍，路由名永不破坏列布局。 */
+    static string Cell(string v) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("\"");
+        for (int i = 0; i < v.Length; i = i + 1) {
+            string ch = v.Substring(i, 1);
+            if ((v[i] & 255) == 34) { sb.Append("\""); }
+            sb.Append(ch);
+        }
+        sb.Append("\"");
+        return sb.ToString();
+    }
+}
+
+/* 导出答以窗口与其行；由 JSON 写出器序列化。 */
+class MetricsRowDoc {
+    long bucket;
+    string method;
+    string path;
+    long calls;
+    long errors;
+    long avg_us;
+    long max_us;
+    long frames;
+    long bytes;
+}
+
+class MetricsExportDoc {
+    long from;
+    long to;
+    long step_seconds;
+    List<MetricsRowDoc> rows;
+}
+
+/* 屏幕或导出所看的窗及取得方式；dated 区分"那一天"与"过去 N 小时"，决定空桶是否以零显示。 */
+class MetricWindow {
+    long from;
+    long to;
+    int hours;
+    bool dated;
+    bool invalid;
+    string day;
+    string day2;
+}

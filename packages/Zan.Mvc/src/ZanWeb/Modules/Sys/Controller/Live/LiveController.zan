@@ -1,0 +1,52 @@
+using System;
+using System.Web;
+using ZanWeb.Core;
+using ZanWeb.Services;
+
+namespace ZanWeb.LiveController;
+
+/* 页脚“现在在线”一行背后的公开在线事件流；一个页面在打开期间持一条连接即被计数，无需轮询，关闭标签即离场信号。各 worker 把自身槽位发布到共享缓存，每个流报告总和——数字是整个站点而非某 worker。 */
+[Route("[controller]/[action]")]
+[Custom(Authorization = CustomAuthorization.None)]
+[Description("在线人数")]
+class LiveController : Controller {
+    /* 帧间隔秒；在线变化慢，更快只会消耗空闲连接。 */
+    static int Beat = 5;
+
+    /* 单个流存活时长，到期由浏览器重连。 */
+    static int StreamSeconds = 1800;
+
+    [HttpGet]
+    [Route("/live/stream")]
+    [Description("在线人数事件流")]
+    async void Stream() {
+        HttpContext ctx = this.Ctx();
+        if (!await ctx.SseOpen()) { return; }
+        string ip = ctx.RemoteIp();
+        Presence.Enter(ip);
+        int elapsed = 0;
+        while (elapsed < LiveController.StreamSeconds) {
+            await Presence.Publish();
+            if (!await ctx.SseSend("presence", await LiveController.Frame())) { break; }
+            await Task.Delay(LiveController.Beat * 1000);
+            elapsed = elapsed + LiveController.Beat;
+        }
+        Presence.Leave(ip);
+        await Presence.Publish();
+    }
+
+    /* 与单次请求相同的数字，供非浏览器使用。 */
+    [HttpGet]
+    [Route("/live/now")]
+    [Description("在线人数快照")]
+    async void Now() {
+        this.Json(await LiveController.Frame());
+    }
+
+    static async string Frame() {
+        int pages = await Presence.Pages();
+        int visitors = await Presence.Visitors();
+        return "{\"visitors\":" + Convert.ToString(visitors)
+            + ",\"pages\":" + Convert.ToString(pages) + "}";
+    }
+}

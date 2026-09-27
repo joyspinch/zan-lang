@@ -1,0 +1,466 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Text;
+using System.Web;
+using ZanWeb.Core;
+using ZanWeb.Model;
+using ZanWeb.Security;
+using ZanWeb.Services;
+using ZanWeb.Web;
+using ZanWeb.Model.Blog;
+using ZanWeb.Dao.Blog;
+
+namespace ZanWeb.Blog;
+
+/* 公开博客：/blog 文章流，/blog/{id} 单篇；仅已发布可见，页面除评论外无可写能力——评论以未发布存储、等编辑处理。写文章是管理后台的活，非公开页面上的表单。 */
+[Route("[controller]/[action]")]
+[Custom(Authorization = CustomAuthorization.None)]
+[Description("博客")]
+class PostsController : AppController {
+    static int PageSize = 8;
+
+    [HttpGet]
+    [Route("/blog")]
+    [Description("文章列表")]
+    async void Index() {
+        if (!this.DbReady()) {
+            this.Fail(503, "2001", "服务暂时不可用，请稍后再试");
+        }
+        string kw = this.In("kw");
+        string slug = this.In("cat");
+        string tag = this.In("tag");
+        int page = this.InInt("page", 1);
+        if (page < 1) { page = 1; }
+
+        CategoryDao categoryDao = new CategoryDao(this);
+        List<Category> cats = await categoryDao.AllActive();
+        int categoryId = 0;
+        string categoryName = "";
+        for (int i = 0; i < cats.Count; i = i + 1) {
+            if (cats[i].slug == slug) {
+                categoryId = cats[i].id;
+                categoryName = cats[i].name;
+            }
+        }
+
+        List<Post> rows = new List<Post>();
+        int total = 0;
+        if (tag.Length > 0) {
+            /* 标签过滤不能下推 SQL LIKE——子串匹配会让 "arc" 命中 "search"，
+               只能整词比较；博客量级整表过滤足够快。 */
+            List<Post> all = await this.Post
+                .Where(a => a.published == 1)
+                .OrderByDescending(a => a.top).OrderByDescending(a => a.id)
+                .ToListAsync();
+            for (int i = 0; i < all.Count; i = i + 1) {
+                if (Prose.HasTag(all[i].tags, tag)) { rows.Add(all[i]); }
+            }
+            total = rows.Count;
+            int from = (page - 1) * PostsController.PageSize;
+            List<Post> slice = new List<Post>();
+            for (int i = from; i < rows.Count && i < from + PostsController.PageSize; i = i + 1) {
+                slice.Add(rows[i]);
+            }
+            rows = slice;
+        } else {
+            total = await this.Post
+                .Where(a => a.published == 1)
+                .WhereIf(kw.Length > 0, a => a.title.Contains(kw))
+                .WhereIf(categoryId > 0, a => a.categoryId == categoryId)
+                .CountAsync();
+            rows = await this.Post
+                .Where(a => a.published == 1)
+                .WhereIf(kw.Length > 0, a => a.title.Contains(kw))
+                .WhereIf(categoryId > 0, a => a.categoryId == categoryId)
+                .OrderByDescending(a => a.top)
+                .OrderByDescending(a => a.id)
+                .Skip((page - 1) * PostsController.PageSize).Take(PostsController.PageSize)
+                .ToListAsync();
+        }
+
+        ViewData d = new ViewData();
+        await Settings.Apply(d);
+        string heading = "博客";
+        if (categoryName.Length > 0) { heading = categoryName; }
+        if (tag.Length > 0) { heading = tag; }
+        d.Set("title", heading);
+        d.Set("heading", heading);
+        d.Set("navBlog", "page");
+        d.Set("kw", kw);
+        d.Set("cat", slug);
+        d.Set("tag", tag);
+        d.Set("total", Convert.ToString(total));
+
+        List<StrMap> items = d.AddList("posts");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            Post p = rows[i];
+            StrMap row = new StrMap();
+            row.Set("id", Convert.ToString(p.id));
+            row.Set("title", p.title);
+            row.Set("summary", PostsController.Summary(p));
+            row.Set("author", PostsController.Author(p));
+            row.Set("category", PostsController.CategoryName(cats, p.categoryId));
+            row.Set("createdAt", PostsController.Day(p.createdAt));
+            row.Set("minutes", Convert.ToString(Prose.Minutes(p.body)));
+            if (p.cover.Length > 0) { row.Set("cover", p.cover); }
+            if (p.top == 1) { row.Set("top", "1"); }
+            items.Add(row);
+        }
+        if (rows.Count == 0) { d.Set("empty", "1"); }
+
+        List<StrMap> nav = d.AddList("categories");
+        StrMap all = new StrMap();
+        all.Set("name", "全部");
+        all.Set("slug", "");
+        if (slug.Length == 0) { all.Set("active", "active"); }
+        nav.Add(all);
+        for (int i = 0; i < cats.Count; i = i + 1) {
+            StrMap c = new StrMap();
+            c.Set("name", cats[i].name);
+            c.Set("slug", cats[i].slug);
+            if (cats[i].slug == slug) { c.Set("active", "active"); }
+            nav.Add(c);
+        }
+
+        int pages = (total + PostsController.PageSize - 1) / PostsController.PageSize;
+        d.Set("page", Convert.ToString(page));
+        d.Set("pages", Convert.ToString(pages));
+        if (page > 1) {
+            d.Set("prev", PostsController.PageLink(kw, slug, tag, page - 1));
+        }
+        if (page < pages) {
+            d.Set("next", PostsController.PageLink(kw, slug, tag, page + 1));
+        }
+        this.View(d);
+    }
+
+    [HttpGet]
+    [Route("/blog/{id}")]
+    [Description("文章详情")]
+    async void Show() {
+        int id = this.InInt("id", 0);
+        if (id <= 0 || !this.DbReady()) {
+            this.Fail(404, "2004", "文章不存在");
+        }
+        PostDao postDao = new PostDao(this);
+        Post post = await postDao.ById(id);
+        if (post == null || post.published != 1) {
+            this.Fail(404, "2004", "文章不存在");
+        }
+        await postDao.IncViews(id, post.views);
+
+        CategoryDao categoryDao = new CategoryDao(this);
+        List<Category> cats = await categoryDao.All();
+        ViewData d = new ViewData();
+        await Settings.Apply(d);
+        /* 文章页自带 meta/OG：描述取摘要，缺摘要截正文；链接用绝对地址。 */
+        string desc = post.summary;
+        if (desc.Length == 0) { desc = Prose.Excerpt(post.body, 120); }
+        d.Set("pageDescription", desc);
+        d.Set("ogTitle", post.title);
+        string root = await PostsController.BaseUrl(this.Ctx());
+        d.Set("ogUrl", root + "/blog/" + Convert.ToString(id));
+        if (post.cover.Length > 0) {
+            d.Set("ogImage", PostsController.Absolute(root, post.cover));
+        }
+        d.Set("title", post.title);
+        d.Set("navBlog", "page");
+        d.Set("id", Convert.ToString(id));
+        d.Set("heading", post.title);
+        d.Set("author", PostsController.Author(post));
+        d.Set("category", PostsController.CategoryName(cats, post.categoryId));
+        d.Set("createdAt", PostsController.Day(post.createdAt));
+        d.Set("minutes", Convert.ToString(Prose.Minutes(post.body)));
+        d.Set("views", Convert.ToString(post.views + 1));
+        if (post.cover.Length > 0) { d.Set("cover", post.cover); }
+
+        List<StrMap> paras = d.AddList("paragraphs");
+        List<string> lines = Prose.Paragraphs(post.body);
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            StrMap row = new StrMap();
+            row.Set("text", lines[i]);
+            paras.Add(row);
+        }
+
+        List<StrMap> tags = d.AddList("tags");
+        List<string> labels = Prose.Tags(post.tags);
+        for (int i = 0; i < labels.Count; i = i + 1) {
+            StrMap row = new StrMap();
+            row.Set("name", labels[i]);
+            tags.Add(row);
+        }
+        if (labels.Count > 0) { d.Set("hasTags", "1"); }
+
+        Post prev = await this.Post
+            .Where(a => a.published == 1).Where(a => a.id < id)
+            .OrderByDescending(a => a.id).FirstAsync();
+        Post next = await this.Post
+            .Where(a => a.published == 1).Where(a => a.id > id)
+            .OrderBy(a => a.id).FirstAsync();
+        if (prev != null) {
+            d.Set("prevId", Convert.ToString(prev.id));
+            d.Set("prevTitle", prev.title);
+        }
+        if (next != null) {
+            d.Set("nextId", Convert.ToString(next.id));
+            d.Set("nextTitle", next.title);
+        }
+
+        CommentDao commentDao = new CommentDao(this);
+        List<Comment> comments = await commentDao.ByPostId(id);
+        List<StrMap> crows = d.AddList("comments");
+        for (int i = 0; i < comments.Count; i = i + 1) {
+            StrMap row = new StrMap();
+            row.Set("author", PostsController.Nickname(comments[i].author));
+            row.Set("content", comments[i].content);
+            row.Set("createdAt", PostsController.Day(comments[i].createdAt));
+            crows.Add(row);
+        }
+        d.Set("commentCount", Convert.ToString(comments.Count));
+        if (comments.Count == 0) { d.Set("noComments", "1"); }
+        /* 关闭评论时表单消失，已通过的评论仍可读——结束讨论不是删除它。 */
+        if (await Settings.On(SettingKeys.CommentEnabled, true)) { d.Set("canComment", "1"); }
+        this.View(d);
+    }
+
+    /* 接收读者评论：以未发布存储——一个能直接发布的开放表单是垃圾的靶子。 */
+    [HttpPost]
+    [Route("/blog/{id}/reply")]
+    [Description("发表评论")]
+    async void Reply() {
+        int id = this.InInt("id", 0);
+        string author = this.In("author");
+        string content = this.NeedText("content", "评论内容");
+        if (!this.DbReady()) {
+            this.Fail(503, "2001", "服务暂时不可用，请稍后再试");
+        }
+        if (!await Settings.On(SettingKeys.CommentEnabled, true)) {
+            this.Fail(403, "2003", "本站已关闭评论");
+        }
+        PostDao postDao = new PostDao(this);
+        Post post = await postDao.ById(id);
+        if (post == null || post.published != 1) {
+            this.Fail(404, "2004", "文章不存在");
+        }
+        if (author.Length == 0) { author = "访客"; }
+        Comment c = new Comment();
+        c.postId = id;
+        c.author = author;
+        c.email = this.In("email");
+        c.content = content;
+        /* 开启审核：评论等编辑处理；关闭审核：写完即公开。 */
+        c.status = 0;
+        if (!await Settings.On(SettingKeys.CommentReview, true)) { c.status = 1; }
+        c.ip = this.Ctx().RemoteIp();
+        c.createdAt = WebApp.NowSeconds();
+        CommentDao commentDao = new CommentDao(this);
+        await commentDao.Insert(c);
+        this.Ctx().Redirect("/blog/" + Convert.ToString(id) + "?commented=1");
+    }
+
+    /* ---- 公开站点的可发现性：feed、站点地图、爬虫协议 ----
+       内容全部来自已发布文章；未配置 site.url 时按请求 Host 推导绝对链接。 */
+
+    /* RSS 2.0：最新 20 篇已发布文章，pubDate 按站点时区。 */
+    [HttpGet]
+    [Route("/rss.xml")]
+    [Description("RSS 订阅")]
+    async void Rss() {
+        if (!this.DbReady()) {
+            this.Fail(503, "2001", "服务暂时不可用，请稍后再试");
+        }
+        string root = await PostsController.BaseUrl(this.Ctx());
+        CategoryDao categoryDao = new CategoryDao(this);
+        List<Category> cats = await categoryDao.All();
+        PostDao postDao = new PostDao(this);
+        List<Post> rows = await postDao.RssLatest(20);
+        string siteTitle = await Settings.Get(SettingKeys.SiteTitle, "Zan");
+        string siteDesc = await Settings.Get(SettingKeys.SiteDescription, "");
+        if (siteDesc.Length == 0) {
+            siteDesc = await Settings.Get(SettingKeys.SiteSubtitle, "");
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        sb.Append("<rss version=\"2.0\"><channel>\n");
+        sb.Append("<title>" + PostsController.Esc(siteTitle) + "</title>\n");
+        sb.Append("<link>" + PostsController.Esc(root) + "/</link>\n");
+        sb.Append("<description>" + PostsController.Esc(siteDesc) + "</description>\n");
+        sb.Append("<generator>ZanWeb</generator>\n");
+        long latest = 0;
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            if (rows[i].createdAt > latest) { latest = rows[i].createdAt; }
+        }
+        if (latest > 0) {
+            sb.Append("<lastBuildDate>" + PostsController.Rfc822(latest) + "</lastBuildDate>\n");
+        }
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            Post p = rows[i];
+            string link = root + "/blog/" + Convert.ToString(p.id);
+            sb.Append("<item>\n");
+            sb.Append("<title>" + PostsController.Esc(p.title) + "</title>\n");
+            sb.Append("<link>" + PostsController.Esc(link) + "</link>\n");
+            sb.Append("<guid isPermaLink=\"true\">" + PostsController.Esc(link) + "</guid>\n");
+            sb.Append("<pubDate>" + PostsController.Rfc822(p.createdAt) + "</pubDate>\n");
+            sb.Append("<description>" + PostsController.Esc(PostsController.Summary(p)) + "</description>\n");
+            string cat = PostsController.CategoryName(cats, p.categoryId);
+            if (cat != "未分类") {
+                sb.Append("<category>" + PostsController.Esc(cat) + "</category>\n");
+            }
+            sb.Append("</item>\n");
+        }
+        sb.Append("</channel></rss>\n");
+        byte[] bytes = Encoding.GetBytes(sb.ToString());
+        this.Ctx().Binary("application/rss+xml; charset=utf-8", bytes, bytes.Length);
+    }
+
+    /* sitemap 协议：首页、博客列表与每篇已发布文章，lastmod 取更新日期。 */
+    [HttpGet]
+    [Route("/sitemap.xml")]
+    [Description("站点地图")]
+    async void Sitemap() {
+        if (!this.DbReady()) {
+            this.Fail(503, "2001", "服务暂时不可用，请稍后再试");
+        }
+        string root = await PostsController.BaseUrl(this.Ctx());
+        List<Post> rows = await this.Post
+            .Where(a => a.published == 1)
+            .OrderByDescending(a => a.top).OrderByDescending(a => a.id)
+            .ToListAsync();
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        sb.Append("<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n");
+        sb.Append("<url><loc>" + PostsController.Esc(root) + "/</loc></url>\n");
+        sb.Append("<url><loc>" + PostsController.Esc(root) + "/blog</loc></url>\n");
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            string lastmod = "";
+            string day = PostsController.Day(rows[i].updatedAt);
+            if (day.Length > 0) { lastmod = "<lastmod>" + day + "</lastmod>"; }
+            sb.Append("<url><loc>" + PostsController.Esc(root) + "/blog/"
+                + Convert.ToString(rows[i].id) + "</loc>" + lastmod + "</url>\n");
+        }
+        sb.Append("</urlset>\n");
+        byte[] bytes = Encoding.GetBytes(sb.ToString());
+        this.Ctx().Binary("application/xml; charset=utf-8", bytes, bytes.Length);
+    }
+
+    /* robots.txt：公开面放行、后台拒绝，给爬虫指路 sitemap。无 DB 依赖。 */
+    [HttpGet]
+    [Route("/robots.txt")]
+    [Description("爬虫协议")]
+    async void Robots() {
+        string root = await PostsController.BaseUrl(this.Ctx());
+        StringBuilder sb = new StringBuilder();
+        sb.Append("User-agent: *\n");
+        sb.Append("Allow: /\n");
+        sb.Append("Disallow: /admin/\n");
+        sb.Append("Sitemap: " + root + "/sitemap.xml\n");
+        this.Ctx().Text(sb.ToString());
+    }
+
+    /* 站点绝对地址：site.url 设置优先（反代与自定义域名下唯一可靠），
+       未配置时用请求 Host 头推导；Host 来自客户端，只保留 URL 合法字符。 */
+    static async string BaseUrl(HttpContext ctx) {
+        string configured = (await Settings.Get(SettingKeys.SiteUrl, "")).Trim();
+        if (configured.Length > 0) {
+            while (configured.Length > 0
+                    && (configured[configured.Length - 1] & 255) == 47) {
+                configured = configured.Substring(0, configured.Length - 1);
+            }
+            if (configured.Length > 0) { return configured; }
+        }
+        string host = PostsController.UrlClean(ctx.Header("Host"));
+        if (host.Length == 0) { host = "localhost"; }
+        return "http://" + host;
+    }
+
+    /* 只留 scheme/host/port/path 合法字符，挡掉注入头与杂质的 Host。 */
+    static string UrlClean(string s) {
+        StringBuilder outp = new StringBuilder();
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            bool ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90)
+                || (c >= 97 && c <= 122) || c == 46 || c == 45 || c == 58
+                || c == 91 || c == 93;
+            if (ok) { outp.Append(s.Substring(i, 1)); }
+        }
+        return outp.ToString();
+    }
+
+    /* 相对路径补绝对前缀，已是绝对的原样返回。 */
+    static string Absolute(string root, string url) {
+        if (url.Length == 0) { return url; }
+        if ((url[0] & 255) == 47) { return root + url; }
+        return url;
+    }
+
+    /* XML 文本转义并把换行折叠成空格——XML 1.0 不收 0x00-0x1F。 */
+    static string Esc(string s) {
+        string flat = s.Replace("\r", " ").Replace("\n", " ").Replace("\t", " ");
+        return flat.Replace("&", "&amp;").Replace("<", "&lt;")
+            .Replace(">", "&gt;").Replace("\"", "&quot;");
+    }
+
+    static string WeekNames = "SunMonTueWedThuFriSat";
+    static string MonthNames = "JanFebMarAprMayJunJulAugSepOctNovDec";
+
+    /* RFC-822 时刻：Thu, 17 Sep 2026 09:15:00 +0800——按站点时区展开，
+       偏移量与文章列表显示保持同源（site.timezone）。 */
+    static string Rfc822(long seconds) {
+        if (seconds <= 0) { return ""; }
+        DateTime t = DateTime.FromUnixSeconds(seconds);
+        int off = Fmt.OffsetMinutes();
+        string sign = "+";
+        if (off < 0) { sign = "-"; off = 0 - off; }
+        return PostsController.WeekNames.Substring(t.dayOfWeek * 3, 3) + ", "
+            + PostsController.Pad2(t.day) + " "
+            + PostsController.MonthNames.Substring((t.month - 1) * 3, 3) + " "
+            + Convert.ToString(t.year) + " "
+            + PostsController.Pad2(t.hour) + ":" + PostsController.Pad2(t.minute) + ":"
+            + PostsController.Pad2(t.second) + " " + sign + PostsController.Pad2(off / 60)
+            + PostsController.Pad2(off % 60);
+    }
+
+    static string Pad2(int v) {
+        if (v >= 10) { return Convert.ToString(v); }
+        return "0" + Convert.ToString(v);
+    }
+
+    static string PageLink(string kw, string slug, string tag, int page) {
+        string q = "/blog?page=" + Convert.ToString(page);
+        if (kw.Length > 0) { q = q + "&kw=" + Encoding.UrlEncode(kw); }
+        if (slug.Length > 0) { q = q + "&cat=" + Encoding.UrlEncode(slug); }
+        if (tag.Length > 0) { q = q + "&tag=" + Encoding.UrlEncode(tag); }
+        return q;
+    }
+
+    static string Summary(Post p) {
+        if (p.summary.Length > 0) { return p.summary; }
+        return Prose.Excerpt(p.body, 120);
+    }
+
+    static string Author(Post p) {
+        if (p.author.Length > 0) { return p.author; }
+        return "编辑部";
+    }
+
+    static string Nickname(string author) {
+        if (author.Length > 0) { return author; }
+        return "访客";
+    }
+
+    static string CategoryName(List<Category> cats, int id) {
+        for (int i = 0; i < cats.Count; i = i + 1) {
+            if (cats[i].id == id) { return cats[i].name; }
+        }
+        return "未分类";
+    }
+
+    static string Day(long seconds) {
+        if (seconds <= 0) { return ""; }
+        string s = DateTime.FromUnixSeconds(seconds).ToString();
+        int sp = s.IndexOf(" ");
+        if (sp > 0) { return s.Substring(0, sp); }
+        return s;
+    }
+}

@@ -1,0 +1,115 @@
+using System;
+using System.Data;
+using System.Json;
+using System.Web;
+using ZanWeb.Core;
+using ZanWeb.Dao;
+using ZanWeb.Model;
+using ZanWeb.Security;
+using ZanWeb.Web;
+using ZanWeb.Dao.Blog;
+
+namespace ZanWeb.Admin;
+
+/* /admin 仪表盘：系统当前持有的内容与运行状态；实时数字与监控同取一份快照，经 metrics 事件流推送，避免定时重载。 */
+[Route("admin/[controller]/[action]")]
+[Custom(Authorization = CustomAuthorization.Login)]
+[Description("仪表盘")]
+class DashboardController : AdminController {
+    /* 侧边栏条目即此属性——见 AdminController.Layout，向 MenuBuilder 询问该账号可到达的项。 */
+    [HttpGet]
+    [Route("/admin")]
+    [Custom(IsMenu = true, Icon = "mdi:gauge")]
+    [Description("仪表盘")]
+    async void Index() {
+        ViewData d = await this.Layout("仪表盘");
+
+        JsonValue m = JsonValue.ParseLenient(WebHost.Current().MetricsJson());
+        JsonValue req = m.Get("requests");
+        if (req == null) { req = JsonValue.NewObject(); }
+
+        d.Set("requests", Convert.ToString(req.Long("count", 0)));
+        d.Set("errors", Convert.ToString(req.Long("errors", 0)));
+        d.Set("avg", Fmt.Dur(req.Long("avg_us", 0)));
+        d.Set("uptime", Fmt.Uptime(m.Long("uptime_ms", 0)));
+
+        d.Set("users", "—");
+        d.Set("posts", "—");
+        d.Set("published", "—");
+        d.Set("drafts", "—");
+        d.Set("comments", "—");
+        d.Set("pending", "—");
+        if (this.DbReady()) {
+            DataScope sc = await this.Scope();
+            List<int> scoped = sc.Depts();
+            int mine = sc.UserId();
+            IDbConnection held = this.Held();
+            SysUserDao userDao = new SysUserDao(held);
+            PostDao postDao = new PostDao(held);
+            CommentDao commentDao = new CommentDao(held);
+
+            int users = await userDao.CountScoped(sc.ByDept(), scoped, sc.Mine(), mine);
+            int posts = await postDao.CountAll();
+            int published = await postDao.CountPublished();
+            int comments = await commentDao.Count();
+            int pending = await commentDao.CountPending();
+            d.Set("users", Convert.ToString(users));
+            d.Set("posts", Convert.ToString(posts));
+            d.Set("published", Convert.ToString(published));
+            d.Set("drafts", Convert.ToString(posts - published));
+            d.Set("comments", Convert.ToString(comments));
+            d.Set("pending", Convert.ToString(pending));
+
+            List<ZanWeb.Model.Blog.Post> recent = await postDao.AllRecent(8, "");
+            List<StrMap> rows = d.AddList("recent");
+            for (int i = 0; i < recent.Count; i = i + 1) {
+                ZanWeb.Model.Blog.Post p = recent[i];
+                StrMap row = new StrMap();
+                row.Set("id", Convert.ToString(p.id));
+                row.Set("title", p.title);
+                row.Set("author", Fmt.Dash(p.author));
+                row.Set("createdAt", Fmt.Day(p.createdAt));
+                row.Set("stateText", Fmt.PublishedText(p.published));
+                row.Set("stateClass", Fmt.PublishedClass(p.published));
+                rows.Add(row);
+            }
+            if (recent.Count == 0) { d.Set("noRecent", "1"); }
+
+            /* 登录记录按用户名匹配（非归属）：一条登录行写于对应账号确认之前，故用本 scope 覆盖的用户名匹配——与登录日志屏同一规则。 */
+            List<string> names = new List<string>();
+            if (!sc.Any()) {
+                List<ZanWeb.Model.SysUser> members = await this.SysUser
+                    .WhereIf(sc.ByDept(), a => scoped.Contains(a.departmentId))
+                    .WhereIf(sc.Mine(), a => a.id == mine).ToListAsync();
+                for (int k = 0; k < members.Count; k = k + 1) {
+                    names.Add(members[k].username);
+                }
+            }
+            bool byName = !sc.Any() && names.Count > 0;
+            bool nothing = !sc.Any() && names.Count == 0;
+            List<ZanWeb.Model.SysLoginLog> logins = await this.SysLoginLog
+                .WhereIf(byName, a => names.Contains(a.username))
+                .WhereIf(nothing, a => a.id < 0)
+                .OrderByDescending(a => a.id).Take(8).ToListAsync();
+            List<StrMap> lrows = d.AddList("logins");
+            for (int i = 0; i < logins.Count; i = i + 1) {
+                ZanWeb.Model.SysLoginLog l = logins[i];
+                StrMap row = new StrMap();
+                row.Set("username", Fmt.Dash(l.username));
+                row.Set("ip", Fmt.Dash(l.ip));
+                row.Set("createdAt", Fmt.Stamp(l.createdAt));
+                row.Set("okText", Fmt.OkText(l.ok));
+                row.Set("okClass", Fmt.OkClass(l.ok));
+                lrows.Add(row);
+            }
+            if (logins.Count == 0) { d.Set("noLogins", "1"); }
+        } else {
+            d.Set("dbDown", "1");
+        }
+        this.Page(d);
+    }
+
+
+
+
+}
