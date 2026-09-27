@@ -87,6 +87,7 @@ class TlsCipherState {
     byte[] nonceBuf;
     byte[] seqBuf;
     byte[] aadBuf;
+    byte[] decBuf;
 
     TlsCipherState(int version, byte[] key, byte[] iv) {
         this.version = version;
@@ -97,6 +98,7 @@ class TlsCipherState {
         this.nonceBuf = new byte[12];
         this.seqBuf = new byte[8];
         this.aadBuf = new byte[13];
+        this.decBuf = new byte[18432];
         long initRes = NativeMemory.AesGcmInit(this.gcmCtx, 384, key, 128);
         this.hasCtx = (initRes == 0);
     }
@@ -312,7 +314,11 @@ class TlsCipherState {
         nint ctPtr = (nint)payload + (nint)pOffset;
         nint tagPtr = ctPtr + (nint)ctLen;
 
-        byte[] inner = new byte[ctLen];
+        byte[] inner = this.decBuf;
+        if (inner == null || inner.Length < ctLen) {
+            inner = new byte[ctLen + 1024];
+            this.decBuf = inner;
+        }
         long hwRes = -1;
         if (this.hasCtx) {
             hwRes = NativeMemory.AesGcmDecryptCtx(this.gcmCtx, this.nonceBuf, header, 5, ctPtr, (long)ctLen, tagPtr, inner);
@@ -326,12 +332,13 @@ class TlsCipherState {
             byte[] tag = new byte[16];
             NativeMemory.Copy(tag, tagPtr, 16);
             List<int> ok = new List<int>(); ok.Add(0);
-            inner = AesGcm.Decrypt(this.key, 16, this.nonceBuf, header, 5, ct, ctLen, tag, ok);
-            if (inner == null || ok[0] != -1) { return null; }
+            byte[] decSoftware = AesGcm.Decrypt(this.key, 16, this.nonceBuf, header, 5, ct, ctLen, tag, ok);
+            if (decSoftware == null || ok[0] != -1) { return null; }
+            if (ctLen > 0) { NativeMemory.Copy(inner, decSoftware, ctLen); }
         }
 
         // 3. 剥离尾部填充 0x00，定位真实 ContentType
-        int realTypeIdx = inner.Length - 1;
+        int realTypeIdx = ctLen - 1;
         while (realTypeIdx >= 0 && (inner[realTypeIdx] & 255) == 0) {
             realTypeIdx = realTypeIdx - 1;
         }
