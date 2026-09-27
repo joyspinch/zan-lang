@@ -4060,13 +4060,24 @@ add_custom_command(OUTPUT ${_dap_dbg}
 # suffix that collides with the custom command's output file (see the zanfmt
 # comment above).
 add_custom_target(dap_debug_target ALL DEPENDS ${_dap_dbg})
+# Second target for the pause / hit-count / logpoint scenarios: one function
+# burns CPU for a few seconds so `pause` has a real window, and a loop with a
+# known crossing count anchors the hit-count assertion.
+set(_dap_burn ${CMAKE_BINARY_DIR}/dbgtarget_burn${_exe_ext})
+add_custom_command(OUTPUT ${_dap_burn}
+    COMMAND $<TARGET_FILE:zanc> ${CMAKE_SOURCE_DIR}/tests/dap/dbgtarget_burn.zan
+            -g --auto-stdlib -o ${_dap_burn}
+    DEPENDS zanc ${CMAKE_SOURCE_DIR}/tests/dap/dbgtarget_burn.zan)
+add_custom_target(dap_debug_burn_target ALL DEPENDS ${_dap_burn})
 # The harness FAILS unless a real gdb debug session happens; environments
 # without gdb must opt out via ZAN_ALLOW_SKIP_DAP=1, which exits 77. CTest
 # then reports the run as "skipped" (not "passed") via SKIP_RETURN_CODE.
 add_test(NAME dap_integration
   COMMAND dap_integration_test $<TARGET_FILE:zan-dap> ${_dap_dbg}
-                              ${CMAKE_SOURCE_DIR}/tests/dap/dbgtarget.zan)
-set_tests_properties(dap_integration PROPERTIES SKIP_RETURN_CODE 77)
+                              ${CMAKE_SOURCE_DIR}/tests/dap/dbgtarget.zan
+                              ${_dap_burn}
+                              ${CMAKE_SOURCE_DIR}/tests/dap/dbgtarget_burn.zan)
+set_tests_properties(dap_integration PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 
 # ---- LSP integration test (real zan-lsp over stdio; A5 UTF-16 positions) ----
 add_executable(lsp_integration_test

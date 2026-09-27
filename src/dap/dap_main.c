@@ -14,8 +14,11 @@
  *
  * Enhanced features:
  *   - Conditional breakpoints with expression evaluation
- *   - Hit-count breakpoints
- *   - Logpoints (tracepoints)
+ *   - Hit-count breakpoints (gdb ignore-count: "==K"/">=K" stop on the Kth hit)
+ *   - Logpoints (tracepoints): log and continue without stopping
+ *   - Real pause: the running inferior is interrupted (DebugBreakProcess /
+ *     SIGINT) while the adapter pumps gdb output; pending client requests are
+ *     serviced through the debugger wait hook — no second thread needed
  *   - Watch expression evaluation
  *   - Variable modification (setVariable)
  *   - Multiple scopes (Locals, Watch)
@@ -179,6 +182,8 @@ static void dap_terminate_with_code(dap_t *d, int exit_code) {
 /* Map a gdb/MI stop reason to a DAP `stopped` reason. */
 static const char *dap_stop_reason(const char *mi) {
     if (!mi || !mi[0]) return "breakpoint";
+    if (strcmp(mi, "pause") == 0) return "pause";
+    if (strcmp(mi, "signal-received") == 0) return "pause"; /* manual interrupt */
     if (strncmp(mi, "breakpoint", 10) == 0) return "breakpoint";
     if (strstr(mi, "stepping-range") || strstr(mi, "finished")) return "step";
     if (strstr(mi, "watchpoint")) return "data breakpoint";
@@ -187,9 +192,83 @@ static const char *dap_stop_reason(const char *mi) {
     return "breakpoint";
 }
 
-/* After an execution command: report the resulting stop or termination. */
+/* Basename of a path (both slash flavours) — mirrors the engine's matching,
+ * which compares gdb-reported locations against client paths by basename. */
+static const char *dap_basename(const char *path) {
+    const char *b = path;
+    for (const char *p = path; *p; p++)
+        if (*p == '/' || *p == '\\') b = p + 1;
+    return b;
+}
+
+/* The logpoint stopped at (basename + line match), or NULL. A location that
+ * also carries a stopping breakpoint wins over the logpoint. */
+static dbg_breakpoint_t *dap_logpoint_here(dap_t *d) {
+    if (d->dbg.state != DBG_PAUSED) return NULL;
+    dbg_breakpoint_t *lp = NULL;
+    for (int i = 0; i < d->dbg.bp_count; i++) {
+        dbg_breakpoint_t *bp = &d->dbg.breakpoints[i];
+        if (!bp->enabled) continue;
+        if (bp->line != d->dbg.current_line) continue;
+        if (strcmp(dap_basename(bp->file), dap_basename(d->dbg.current_file)) != 0)
+            continue;
+        if (bp->type == BP_LOGPOINT) lp = bp;
+        else return NULL; /* a real breakpoint shares the line: it decides */
+    }
+    return lp;
+}
+
+/* Interpolate a DAP logMessage: "{expr}" segments are evaluated in the
+ * current frame; everything else is copied verbatim. Appends a newline. */
+static void dap_format_log(dap_t *d, const char *msg, char *out, int cap) {
+    int o = 0;
+    for (int i = 0; msg[i]; i++) {
+        if (msg[i] != '{') {
+            if (o < cap - 1) out[o++] = msg[i];
+            continue;
+        }
+        const char *close = strchr(msg + i + 1, '}');
+        if (!close) {
+            if (o < cap - 1) out[o++] = msg[i];
+            continue;
+        }
+        char expr[192];
+        int el = (int)(close - (msg + i + 1));
+        if (el > (int)sizeof(expr) - 1) el = (int)sizeof(expr) - 1;
+        memcpy(expr, msg + i + 1, (size_t)el);
+        expr[el] = '\0';
+        i = (int)(close - msg);
+        char val[256];
+        if (el > 0 && dbg_evaluate(&d->dbg, expr, val, sizeof(val)))
+            o += snprintf(out + o, (size_t)(cap - o > 0 ? cap - o : 0), "%s", val);
+        else
+            o += snprintf(out + o, (size_t)(cap - o > 0 ? cap - o : 0), "<%s>",
+                          expr[0] ? expr : "?");
+        if (o >= cap - 1) break;
+    }
+    out[o < cap - 1 ? o : cap - 1] = '\0';
+    size_t l = strlen(out);
+    if (l == 0 || out[l - 1] != '\n') {
+        out[l < cap - 1 ? l : cap - 1] = '\n';
+        out[l < cap - 1 ? l + 1 : cap - 1] = '\0';
+    }
+}
+
+/* After an execution command: report the resulting stop or termination. A
+ * stop on a logpoint is not surfaced: the message is emitted and the target
+ * resumes, until a real stop or exit is reached. */
 static void dap_report_stop(dap_t *d) {
     dap_flush_output(d);
+    int guard = 0;
+    while (d->dbg.state == DBG_PAUSED && guard++ < 64) {
+        dbg_breakpoint_t *lp = dap_logpoint_here(d);
+        if (!lp) break;
+        char text[1024];
+        dap_format_log(d, lp->log_message, text, sizeof(text));
+        dap_output(d, "stdout", text);
+        dbg_continue(&d->dbg);
+        dap_flush_output(d);
+    }
     if (d->dbg.state == DBG_PAUSED)
         dap_send_stopped(d, dap_stop_reason(d->dbg.stop_reason));
     else
@@ -255,6 +334,7 @@ static void handle_set_breakpoints(dap_t *d, json_value *request) {
         const char *cond = json_get_str(json_obj_get(bp, "condition"));
         const char *hit_cond = json_get_str(json_obj_get(bp, "hitCondition"));
         const char *log_msg = json_get_str(json_obj_get(bp, "logMessage"));
+        const char *reject = NULL; /* why this breakpoint was not placed */
 
         int id = -1;
         if (path) {
@@ -262,12 +342,24 @@ static void handle_set_breakpoints(dap_t *d, json_value *request) {
                 /* Logpoint */
                 id = dbg_add_logpoint(&d->dbg, path, line, log_msg);
             } else if (hit_cond && hit_cond[0]) {
-                /* Hit-count breakpoint */
-                int count = atoi(hit_cond);
-                if (count > 0)
+                /* Hit-count breakpoint. DAP forms: "K", "==K", ">=K" (map
+                 * onto a gdb ignore-count of K-1); "%K" has no ignore-count
+                 * equivalent and is honestly rejected rather than silently
+                 * mis-honoured. */
+                const char *h = hit_cond;
+                while (*h == ' ') h++;
+                bool modulo = (h[0] == '%');
+                if (strncmp(h, "==", 2) == 0 || strncmp(h, ">=", 2) == 0) h += 2;
+                int count = atoi(h);
+                if (count > 0 && !modulo) {
                     id = dbg_add_hitcount_bp(&d->dbg, path, line, count);
-                else
-                    id = dbg_add_breakpoint(&d->dbg, path, line);
+                } else {
+                    char why[192];
+                    snprintf(why, sizeof(why),
+                             "unsupported hitCondition '%s' (use K, ==K or >=K)",
+                             hit_cond);
+                    reject = why;
+                }
             } else if (cond && cond[0]) {
                 /* Conditional breakpoint */
                 id = dbg_add_conditional_bp(&d->dbg, path, line, cond);
@@ -283,6 +375,8 @@ static void handle_set_breakpoints(dap_t *d, json_value *request) {
         json_obj_set(out, "line", json_new_num(line));
         if (cond && cond[0])
             json_obj_set(out, "message", json_new_str(cond));
+        else if (reject)
+            json_obj_set(out, "message", json_new_str(reject));
         json_arr_add(verified, out);
     }
 
@@ -545,10 +639,21 @@ static void handle_step_out(dap_t *d, json_value *request) {
     dap_report_stop(d);
 }
 
+/* Pause the running target. The normal path is the wait hook (the request is
+ * consumed while the adapter pumps gdb output during a run); if it lands here
+ * with the target running (e.g. a console stdin that cannot be polled), the
+ * interrupt + wait still happen synchronously. */
 static void handle_pause(dap_t *d, json_value *request) {
+    if (d->dbg.state != DBG_RUNNING) {
+        json_value *body = json_new_obj();
+        json_obj_set(body, "error", json_new_str("target is not running"));
+        dap_send_response(d, request, false, body);
+        return;
+    }
     dap_send_response(d, request, true, NULL);
-    /* Synchronous MI backend has no async-interrupt path yet; acknowledge. */
-    dap_send_stopped(d, "pause");
+    if (dbg_interrupt(&d->dbg))
+        dbg_wait_stop(&d->dbg);
+    dap_report_stop(d);
 }
 
 static void handle_disconnect(dap_t *d, json_value *request) {
@@ -597,6 +702,103 @@ static void handle_select_thread(dap_t *d, json_value *request) {
     int tid = (int)json_get_num(json_obj_get(args, "threadId"), 0);
     if (tid > 0) dbg_select_thread(&d->dbg, tid);
     dap_send_response(d, request, true, NULL);
+}
+
+/* ---- input polling: service client requests while the target runs ----
+ *
+ * The adapter is single-threaded by design. While an execution command pumps
+ * gdb output (mi_wait_stopped), the wait hook below runs whenever gdb output
+ * goes quiet: it checks the client transport for a pending request, answers
+ * `pause` right away (triggering the inferior interrupt) and parks any other
+ * request until the current handler settles.
+ *
+ * stdin is read through the raw fd (not stdio), so "bytes available at the OS
+ * level" is exactly "the next message arrived" — nothing is ever buffered
+ * out of sight of the pending check. */
+
+static dap_t *g_dap;
+
+#define DAP_PARK_MAX 64
+static char *g_parked[DAP_PARK_MAX];
+static int   g_parked_head;
+static int   g_parked_tail;
+
+static char *take_parked(void) {
+    if (g_parked_head == g_parked_tail) return NULL;
+    char *body = g_parked[g_parked_head++];
+    if (g_parked_head == g_parked_tail) g_parked_head = g_parked_tail = 0;
+    return body;
+}
+
+#ifdef _WIN32
+static bool rd_input_pending(dap_t *d) {
+    if (d->use_sock) {
+        u_long n = 0;
+        if (ioctlsocket(d->sock, FIONREAD, &n) != 0) return false;
+        return n > 0;
+    }
+    HANDLE h = (HANDLE)_get_osfhandle(0);
+    DWORD avail = 0;
+    /* console stdin has no pipe to peek: pause then only works through the
+     * synchronous handle_pause path */
+    return h != INVALID_HANDLE_VALUE && h != NULL &&
+           PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL) && avail > 0;
+}
+
+/* rpc reader over the raw stdin fd */
+static int rd_reader(void *ctx, char *buf, int n) {
+    (void)ctx;
+    DWORD r = 0;
+    if (!ReadFile((HANDLE)_get_osfhandle(0), buf, (DWORD)n, &r, NULL)) return 0;
+    return (int)r;
+}
+#else
+static bool rd_input_pending(dap_t *d) {
+    if (d->use_sock) {
+        char b;
+        return recv(d->sock, &b, 1, MSG_PEEK | MSG_DONTWAIT) > 0;
+    }
+    struct timeval tv = {0, 0};
+    fd_set rf;
+    FD_ZERO(&rf);
+    FD_SET(0, &rf);
+    return select(1, &rf, NULL, NULL, &tv) > 0;
+}
+
+static int rd_reader(void *ctx, char *buf, int n) {
+    (void)ctx;
+    return (int)read(0, buf, (size_t)n);
+}
+#endif
+
+/* Runs inside the debugger's stop-wait loop when gdb output goes quiet. */
+static void dap_wait_hook(void *user) {
+    dap_t *d = user;
+    if (!rd_input_pending(d)) return;
+    char *body = d->use_sock
+        ? rpc_read_message_sock(d->sock)
+        : rpc_read_message_cb(rd_reader, NULL, RPC_MAX_MESSAGE);
+    if (!body) return; /* client went away mid-run */
+    json_value *msg = json_parse(body);
+    if (!msg) {
+        free(body);
+        return;
+    }
+    const char *cmd = json_get_str(json_obj_get(msg, "command"));
+    if (cmd && strcmp(cmd, "pause") == 0) {
+        /* acknowledge now; the resulting stop is reported by whichever
+         * handler is pumping the target (it owns dap_report_stop) */
+        dap_send_response(d, msg, true, NULL);
+        json_free(msg);
+        free(body);
+        dbg_interrupt(&d->dbg);
+    } else if (g_parked_tail < DAP_PARK_MAX) {
+        g_parked[g_parked_tail++] = body; /* main loop takes ownership */
+        json_free(msg);
+    } else {
+        json_free(msg);
+        free(body); /* overloaded client: drop */
+    }
 }
 
 /* ============================== dispatch ============================= */
@@ -675,6 +877,8 @@ int main(int argc, char **argv) {
     dbg_init(&d.dbg);
     d.out = stdout;
     d.seq = 1;
+    g_dap = &d;
+    dbg_set_wait_hook(&d.dbg, dap_wait_hook, &d);
 
     if (port > 0) {
         d.sock = dap_listen_accept(port);
@@ -691,8 +895,10 @@ int main(int argc, char **argv) {
     }
 
     for (;;) {
-        char *body = d.use_sock ? rpc_read_message_sock(d.sock)
-                                : rpc_read_message(stdin);
+        char *body = take_parked();
+        if (!body)
+            body = d.use_sock ? rpc_read_message_sock(d.sock)
+                              : rpc_read_message_cb(rd_reader, NULL, RPC_MAX_MESSAGE);
         if (!body) break;
 
         json_value *msg = json_parse(body);

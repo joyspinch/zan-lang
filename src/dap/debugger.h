@@ -182,6 +182,18 @@ typedef struct {
     int             mi_buf_len;
     int             last_exit_code;
 
+    /* async interruption: the inferior's pid (from the
+     * =thread-group-started notify) and whether the client asked us to pause
+     * the run — the next *stopped is then reported as a pause, not a signal */
+    long            inferior_pid;
+    bool            interrupt_requested;
+
+    /* Called (from the stop-wait loop) whenever gdb output goes quiet, so a
+     * single-threaded adapter can service client requests — notably `pause` —
+     * while the target runs. */
+    void          (*wait_hook)(void *user);
+    void           *wait_hook_user;
+
     /* settings */
     bool            break_on_entry;     /* pause at program start */
     bool            break_on_exception; /* pause on unhandled exceptions */
@@ -222,6 +234,21 @@ void dbg_stop(debugger_t *dbg);
 
 /* Continue execution */
 void dbg_continue(debugger_t *dbg);
+
+/* Register a callback invoked from the stop-wait loop whenever gdb output
+ * goes quiet. The adapter uses it to read pending client requests (a `pause`
+ * while the target runs) without a second thread. */
+void dbg_set_wait_hook(debugger_t *dbg, void (*fn)(void *user), void *user);
+
+/* Interrupt the running inferior (DebugBreakProcess on Windows, SIGINT on
+ * POSIX). Returns true when the interrupt was actually requested — the stop
+ * then arrives as a normal *stopped record and is reported with the DAP
+ * reason "pause". */
+bool dbg_interrupt(debugger_t *dbg);
+
+/* Wait synchronously for the running target to stop and refresh the paused
+ * view (threads, stack, locals, watches). No-op when not running. */
+void dbg_wait_stop(debugger_t *dbg);
 
 /* Stepping */
 void dbg_step_over(debugger_t *dbg);

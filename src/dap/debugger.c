@@ -83,43 +83,92 @@ static void mi_raw_write(debugger_t *dbg, const char *s) {
 #endif
 }
 
-/* Read a single '\n'-terminated line (newline stripped) from gdb's stdout.
- * Buffers surplus bytes in dbg->mi_buf. Returns false at EOF. */
-static bool mi_read_line(debugger_t *dbg, char *out, int out_size) {
-    int len = 0;
+/* Read a single '\n'-terminated line from gdb's stdout into `out` (newline
+ * stripped, surplus bytes stay buffered in mi_buf). With `poll` the call does
+ * not block: it waits up to ~15ms for gdb output, gives the registered wait
+ * hook a chance to run (so a single-threaded adapter can service client
+ * requests — `pause` — while the target runs), and returns 0 when no complete
+ * line is available yet.
+ * Returns 1 = line delivered, 0 = nothing yet (only in poll mode), -1 = EOF.
+ * A partial line still pending at EOF is delivered as a final line. */
+static int mi_read_line_ex(debugger_t *dbg, char *out, int out_size, bool poll) {
     for (;;) {
+        /* flush a complete line already buffered */
         for (int i = 0; i < dbg->mi_buf_len; i++) {
-            char c = dbg->mi_buf[i];
-            if (c == '\n') {
-                int rest = dbg->mi_buf_len - (i + 1);
-                memmove(dbg->mi_buf, dbg->mi_buf + i + 1, (size_t)rest);
-                dbg->mi_buf_len = rest;
-                if (len > 0 && out[len - 1] == '\r') len--;
-                out[len < out_size ? len : out_size - 1] = '\0';
-                return true;
-            }
-            if (len < out_size - 1) out[len++] = c;
+            if (dbg->mi_buf[i] != '\n') continue;
+            int len = i;
+            if (len > 0 && dbg->mi_buf[len - 1] == '\r') len--;
+            if (len > out_size - 1) len = out_size - 1;
+            memcpy(out, dbg->mi_buf, (size_t)len);
+            out[len] = '\0';
+            int rest = dbg->mi_buf_len - (i + 1);
+            memmove(dbg->mi_buf, dbg->mi_buf + i + 1, (size_t)rest);
+            dbg->mi_buf_len = rest;
+            return 1;
         }
-        dbg->mi_buf_len = 0;
+        if (dbg->mi_buf_len >= (int)sizeof(dbg->mi_buf)) {
+            /* buffer full with no newline: drop and resync — the record was
+             * longer than any caller's line buffer anyway */
+            dbg->mi_buf_len = 0;
+        }
         char chunk[4096];
+        int got = 0;
 #ifdef _WIN32
-        DWORD got = 0;
-        if (!ReadFile((HANDLE)dbg->gdb_out_r, chunk, sizeof(chunk), &got, NULL) || got == 0) {
-            if (len > 0) { out[len < out_size ? len : out_size - 1] = '\0'; return true; }
-            return false;
+        if (poll) {
+            DWORD avail = 0;
+            if (!PeekNamedPipe((HANDLE)dbg->gdb_out_r, NULL, 0, NULL, &avail, NULL))
+                got = -1;                  /* broken pipe */
+            else if (avail == 0) {
+                if (dbg->wait_hook) dbg->wait_hook(dbg->wait_hook_user);
+                Sleep(10);
+                continue;
+            }
+        }
+        if (got == 0) {
+            DWORD gotw = 0;
+            if (!ReadFile((HANDLE)dbg->gdb_out_r, chunk, sizeof(chunk), &gotw, NULL))
+                got = -1;
+            else
+                got = (int)gotw;
         }
 #else
-        ssize_t got = read(dbg->gdb_out_fd, chunk, sizeof(chunk));
-        if (got <= 0) {
-            if (len > 0) { out[len < out_size ? len : out_size - 1] = '\0'; return true; }
-            return false;
+        if (poll) {
+            fd_set rf;
+            FD_ZERO(&rf);
+            FD_SET(dbg->gdb_out_fd, &rf);
+            struct timeval tv = {0, 15000};
+            if (select(dbg->gdb_out_fd + 1, &rf, NULL, NULL, &tv) <= 0) {
+                if (dbg->wait_hook) dbg->wait_hook(dbg->wait_hook_user);
+                continue;
+            }
         }
+        ssize_t r = read(dbg->gdb_out_fd, chunk, sizeof(chunk));
+        got = r > 0 ? (int)r : -1;
 #endif
-        int n = (int)got;
-        if (n > (int)sizeof(dbg->mi_buf)) n = (int)sizeof(dbg->mi_buf);
-        memcpy(dbg->mi_buf, chunk, (size_t)n);
-        dbg->mi_buf_len = n;
+        if (got <= 0) {
+            /* EOF: a partial line still pending is delivered as the last one */
+            if (dbg->mi_buf_len > 0) {
+                int len = dbg->mi_buf_len;
+                if (len > out_size - 1) len = out_size - 1;
+                memcpy(out, dbg->mi_buf, (size_t)len);
+                out[len] = '\0';
+                dbg->mi_buf_len = 0;
+                return 1;
+            }
+            return -1;
+        }
+        int n = got;
+        int cap = (int)sizeof(dbg->mi_buf) - dbg->mi_buf_len;
+        if (n > cap) n = cap;
+        if (n <= 0) continue;
+        memcpy(dbg->mi_buf + dbg->mi_buf_len, chunk, (size_t)n);
+        dbg->mi_buf_len += n;
     }
+}
+
+/* Blocking line read (command round-trips). */
+static bool mi_read_line(debugger_t *dbg, char *out, int out_size) {
+    return mi_read_line_ex(dbg, out, out_size, false) == 1;
 }
 
 /* Forward an MI stream record body (a c-string like  "text\n" ) to output. */
@@ -150,12 +199,21 @@ static void mi_handle_stopped(debugger_t *dbg, const char *rec) {
         char ec[16] = "";
         dbg->last_exit_code = mi_field(rec, "exit-code", ec, sizeof(ec))
                               ? (int)strtol(ec, NULL, 0) : 0;
+        dbg->interrupt_requested = false;
         dbg->state = DBG_TERMINATED;
         return;
     }
     dbg->state = DBG_PAUSED;
     if (reason[0])
         snprintf(dbg->stop_reason, sizeof(dbg->stop_reason), "%s", reason);
+    else
+        /* an interrupt stop often carries no reason at all */
+        snprintf(dbg->stop_reason, sizeof(dbg->stop_reason), "signal-received");
+    if (dbg->interrupt_requested) {
+        /* we asked for this one: it is a pause, not a signal hit */
+        snprintf(dbg->stop_reason, sizeof(dbg->stop_reason), "pause");
+        dbg->interrupt_requested = false;
+    }
     char file[512] = "", line[16] = "";
     if (mi_field(rec, "fullname", file, sizeof(file)) ||
         mi_field(rec, "file", file, sizeof(file)))
@@ -169,8 +227,16 @@ static void mi_dispatch_line(debugger_t *dbg, const char *line) {
         if (strncmp(line + 1, "stopped", 7) == 0) mi_handle_stopped(dbg, line);
     } else if (line[0] == '@') {
         mi_forward_stream(dbg, line + 1);
+    } else if (line[0] == '=') {
+        /* =thread-group-started,id="i1",pid="4242": remember the inferior so
+         * dbg_interrupt can reach the debuggee, not gdb itself */
+        if (strncmp(line + 1, "thread-group-started", 20) == 0) {
+            char pid[32] = "";
+            if (mi_field(line, "pid", pid, sizeof(pid)))
+                dbg->inferior_pid = atoi(pid);
+        }
     }
-    /* '~' console, '&' log, '=' notify, '+' status: ignored as gdb chatter */
+    /* '~' console, '&' log, '+' status: ignored as gdb chatter */
 }
 
 /* Pump gdb output until the result record for `token` arrives, copying it into
@@ -187,8 +253,11 @@ static bool mi_pump(debugger_t *dbg, int token, char *result, int result_size) {
             if (result) { strncpy(result, line, (size_t)result_size - 1); result[result_size - 1] = '\0'; }
             return true;
         }
-        if (line[0] == '*' || line[0] == '@') { mi_dispatch_line(dbg, line); continue; }
-        if (line[0] == '~' || line[0] == '&' || line[0] == '=' || line[0] == '+') continue;
+        if (line[0] == '*' || line[0] == '@' || line[0] == '=') {
+            mi_dispatch_line(dbg, line);
+            continue;
+        }
+        if (line[0] == '~' || line[0] == '&' || line[0] == '+' || line[0] == '^') continue;
         if (strncmp(line, "(gdb)", 5) == 0) continue;
         /* Unrecognised line: inferior stdout (local gdb does not wrap it). */
         { char buf[8200]; snprintf(buf, sizeof(buf), "%s\n", line); dbg_append_output(dbg, buf); }
@@ -206,10 +275,17 @@ static bool mi_command(debugger_t *dbg, const char *cmd, char *result, int resul
     return mi_pump(dbg, tok, result, result_size);
 }
 
-/* Read until the next `*stopped` (or EOF/termination). */
+/* Read until the next `*stopped` (or EOF/termination). Polls gdb output so
+ * the adapter's wait hook runs while the target runs. */
 static bool mi_wait_stopped(debugger_t *dbg) {
     char line[8192];
-    while (mi_read_line(dbg, line, sizeof(line))) {
+    for (;;) {
+        int r = mi_read_line_ex(dbg, line, sizeof(line), true);
+        if (r < 0) {
+            dbg->state = DBG_TERMINATED;
+            return false;
+        }
+        if (r == 0) continue;   /* hook already had its chance */
         if (line[0] == '*' || line[0] == '@') {
             mi_dispatch_line(dbg, line);
             if (line[0] == '*' && strncmp(line + 1, "stopped", 7) == 0) return true;
@@ -222,8 +298,74 @@ static bool mi_wait_stopped(debugger_t *dbg) {
         }
         if (dbg->state == DBG_TERMINATED) return true;
     }
-    dbg->state = DBG_TERMINATED;
+}
+
+/* True when at least one stack frame carries DWARF source info from a Zan
+ * source, i.e. the selected thread is stopped in program code rather than in
+ * CRT/system code (the mingw CRT contributes source-bearing frames too, but
+ * they are all .c files). */
+static bool mi_zan_frame(debugger_t *dbg) {
+    for (int i = 0; i < dbg->callstack_depth; i++) {
+        const char *f = dbg->callstack[i].file;
+        size_t n = strlen(f);
+        if (n < 4) continue;
+        const char *s = f + n - 4;
+        if (s[0] == '.' && (s[1] == 'z' || s[1] == 'Z') &&
+            (s[2] == 'a' || s[2] == 'A') && (s[3] == 'n' || s[3] == 'N'))
+            return true;
+    }
     return false;
+}
+
+/* A pause (DebugBreakProcess / SIGINT) can stop on an injected or foreign
+ * thread whose stack has no Zan frames. Walk the thread list and settle on
+ * the first thread stopped in Zan code so the pause shows the program's own
+ * location. */
+static void mi_pick_zan_thread(debugger_t *dbg) {
+    if (mi_zan_frame(dbg)) return; /* already stopped in program code */
+    int saved = dbg->current_thread;
+    for (int i = 0; i < dbg->thread_count; i++) {
+        int tid = dbg->threads[i].id;
+        if (tid == dbg->current_thread || tid <= 0) continue;
+        char cmd[48], res[512] = "";
+        snprintf(cmd, sizeof(cmd), "-thread-select %d", tid);
+        if (!mi_command(dbg, cmd, res, sizeof(res)) || strstr(res, "^error"))
+            continue;
+        dbg->current_thread = tid;
+        dbg_refresh_callstack(dbg);
+        if (mi_zan_frame(dbg)) return;
+    }
+    dbg->current_thread = saved;
+}
+
+/* Refresh the paused view after a stop: threads, stack, locals, watches —
+ * and untangle compiler-emitted exception-hook frames (a stop inside
+ * __zan_eh_* is an exception, not an ordinary breakpoint). */
+static void mi_after_stop(debugger_t *dbg) {
+    dbg_refresh_threads(dbg);
+    dbg_refresh_callstack(dbg);
+    if (dbg->thread_count > 1) mi_pick_zan_thread(dbg);
+    dbg->active_frame = 0;
+    if (dbg->callstack_depth > 0 &&
+        strncmp(dbg->callstack[0].function_name, "__zan_eh_", 9) == 0) {
+        bool unhandled = strstr(dbg->callstack[0].function_name,
+                                "unhandled") != NULL;
+        snprintf(dbg->stop_reason, sizeof(dbg->stop_reason), "%s",
+                 unhandled ? "unhandled exception" : "exception thrown");
+        for (int i = 1; i < dbg->callstack_depth; i++)
+            dbg->callstack[i - 1] = dbg->callstack[i];
+        dbg->callstack_depth--;
+        if (dbg->callstack_depth > 0) {
+            snprintf(dbg->current_file, sizeof(dbg->current_file), "%s",
+                     dbg->callstack[0].file);
+            dbg->current_line = dbg->callstack[0].line;
+        }
+        char sel[64], tmp[512];
+        snprintf(sel, sizeof(sel), "-stack-select-frame 1");
+        mi_command(dbg, sel, tmp, sizeof(tmp));
+    }
+    dbg_refresh_locals(dbg);
+    dbg_evaluate_watches(dbg);
 }
 
 /* Run an execution command (-exec-continue/next/step/finish), wait for the
@@ -243,34 +385,8 @@ static void mi_exec(debugger_t *dbg, const char *cmd) {
         return;
     }
     mi_wait_stopped(dbg);
-    if (dbg->state == DBG_PAUSED) {
-        dbg_refresh_threads(dbg);
-        dbg_refresh_callstack(dbg);
-        dbg->active_frame = 0;
-        /* Stopping inside a compiler-emitted hook means the stop is an
-         * exception, not an ordinary breakpoint; report it as one and hide
-         * the hook frame from the reported stack. */
-        if (dbg->callstack_depth > 0 &&
-            strncmp(dbg->callstack[0].function_name, "__zan_eh_", 9) == 0) {
-            bool unhandled = strstr(dbg->callstack[0].function_name,
-                                    "unhandled") != NULL;
-            snprintf(dbg->stop_reason, sizeof(dbg->stop_reason), "%s",
-                     unhandled ? "unhandled exception" : "exception thrown");
-            for (int i = 1; i < dbg->callstack_depth; i++)
-                dbg->callstack[i - 1] = dbg->callstack[i];
-            dbg->callstack_depth--;
-            if (dbg->callstack_depth > 0) {
-                snprintf(dbg->current_file, sizeof(dbg->current_file), "%s",
-                         dbg->callstack[0].file);
-                dbg->current_line = dbg->callstack[0].line;
-            }
-            char sel[64], tmp[512];
-            snprintf(sel, sizeof(sel), "-stack-select-frame 1");
-            mi_command(dbg, sel, tmp, sizeof(tmp));
-        }
-        dbg_refresh_locals(dbg);
-        dbg_evaluate_watches(dbg);
-    }
+    if (dbg->state == DBG_PAUSED)
+        mi_after_stop(dbg);
 }
 
 /* Directory holding the running executable (zan-dap), with no trailing sep. */
@@ -693,6 +809,8 @@ bool dbg_start(debugger_t *dbg, const char *program, const char *args) {
         dbg->state = DBG_TERMINATED;
         return false;
     }
+    dbg->inferior_pid = 0;
+    dbg->interrupt_requested = false;
 
     char res[1024];
     /* Synchronous stepping; suppress pagination/confirmation chatter. */
@@ -721,6 +839,18 @@ bool dbg_start(debugger_t *dbg, const char *program, const char *args) {
         else
             snprintf(cmd, sizeof(cmd), "-break-insert \"%s:%d\"", base, bp->line);
         bp->verified = mi_command(dbg, cmd, r, sizeof(r)) && strstr(r, "^done") != NULL;
+        /* Hit-count: gdb's ignore-count makes the breakpoint skip its first
+         * N hits, so "== K" / ">= K" ignore K-1 and take effect on the Kth
+         * hit. The DAP layer already rejected unsupported forms. */
+        if (bp->verified && bp->type == BP_HITCOUNT && bp->hit_count_target > 1) {
+            char num[16] = "";
+            if (mi_field(r, "number", num, sizeof(num))) {
+                char acmd[64], ar[512] = "";
+                snprintf(acmd, sizeof(acmd), "-break-after %s %d",
+                         num, bp->hit_count_target - 1);
+                mi_command(dbg, acmd, ar, sizeof(ar));
+            }
+        }
     }
 
     dbg->state = DBG_RUNNING;
@@ -755,6 +885,8 @@ bool dbg_attach(debugger_t *dbg, const char *program, int pid) {
         dbg->state = DBG_TERMINATED;
         return false;
     }
+    dbg->inferior_pid = 0;
+    dbg->interrupt_requested = false;
     char res[2048] = "";
     mi_command(dbg, "-gdb-set mi-async off", res, sizeof(res));
     mi_command(dbg, "-gdb-set confirm off", res, sizeof(res));
@@ -789,6 +921,15 @@ bool dbg_attach(debugger_t *dbg, const char *program, int pid) {
         else
             snprintf(bcmd, sizeof(bcmd), "-break-insert -f \"%s:%d\"", base, bp->line);
         bp->verified = mi_command(dbg, bcmd, r, sizeof(r)) && strstr(r, "^done") != NULL;
+        if (bp->verified && bp->type == BP_HITCOUNT && bp->hit_count_target > 1) {
+            char num[16] = "";
+            if (mi_field(r, "number", num, sizeof(num))) {
+                char acmd[64], ar[512] = "";
+                snprintf(acmd, sizeof(acmd), "-break-after %s %d",
+                         num, bp->hit_count_target - 1);
+                mi_command(dbg, acmd, ar, sizeof(ar));
+            }
+        }
     }
     dbg->exc_bp_throw = -1;
     dbg->exc_bp_unhandled = -1;
@@ -820,6 +961,52 @@ void dbg_continue(debugger_t *dbg) {
     if (dbg->state != DBG_PAUSED) return;
     dbg_append_output(dbg, "[DBG] Continuing...\n");
     mi_exec(dbg, "-exec-continue");
+}
+
+/* --- pause support (real interruption of the running target) --- */
+
+void dbg_set_wait_hook(debugger_t *dbg, void (*fn)(void *user), void *user) {
+    dbg->wait_hook = fn;
+    dbg->wait_hook_user = user;
+}
+
+bool dbg_interrupt(debugger_t *dbg) {
+    if (!mi_active(dbg) || dbg->state != DBG_RUNNING || dbg->inferior_pid <= 0)
+        return false;
+    dbg->interrupt_requested = true;
+    dbg_append_output(dbg, "[DBG] Interrupt requested\n");
+#ifdef _WIN32
+    HANDLE h = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
+                               PROCESS_VM_OPERATION | PROCESS_VM_READ |
+                               PROCESS_VM_WRITE,
+                           FALSE, (DWORD)dbg->inferior_pid);
+    if (!h) {
+        dbg->interrupt_requested = false;
+        dbg_append_output(dbg, "[DBG] Interrupt failed: cannot open process\n");
+        return false;
+    }
+    bool ok = DebugBreakProcess(h) != 0;
+    CloseHandle(h);
+    if (!ok) {
+        dbg->interrupt_requested = false;
+        dbg_append_output(dbg, "[DBG] Interrupt failed: DebugBreakProcess\n");
+    }
+    return ok;
+#else
+    if (kill((pid_t)dbg->inferior_pid, SIGINT) != 0) {
+        dbg->interrupt_requested = false;
+        dbg_append_output(dbg, "[DBG] Interrupt failed: kill\n");
+        return false;
+    }
+    return true;
+#endif
+}
+
+void dbg_wait_stop(debugger_t *dbg) {
+    if (dbg->state != DBG_RUNNING) return;
+    mi_wait_stopped(dbg);
+    if (dbg->state == DBG_PAUSED)
+        mi_after_stop(dbg);
 }
 
 void dbg_step_over(debugger_t *dbg) {

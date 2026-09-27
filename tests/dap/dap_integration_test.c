@@ -253,18 +253,43 @@ static void json_escape(const char *in, char *out, size_t cap) {
     out[j] = '\0';
 }
 
-int main(int argc, char **argv) {
-    if (argc < 4) {
-        fprintf(stderr, "usage: %s <zan-dap> <target-exe> <source>\n", argv[0]);
-        return 2;
-    }
-    const char *dap_exe = argv[1];
-    char target[1024], source[1024];
-    json_escape(argv[2], target, sizeof(target));
-    json_escape(argv[3], source, sizeof(source));
+/* ---- shared handshake helpers ---- */
 
-    setvbuf(stdout, NULL, _IONBF, 0);
+static void handshake(child_t *c, const char *program, char *body, char *msg,
+                      size_t cap) {
+    snprintf(body, cap,
+             "{\"seq\":%d,\"type\":\"request\",\"command\":\"initialize\","
+             "\"arguments\":{\"clientID\":\"itest\",\"adapterID\":\"zan\"}}", ++g_seq);
+    dap_send(c, body);
+    (void)wait_response(c, "initialize", msg, (int)cap);
+    (void)wait_event(c, "initialized", msg, (int)cap);
 
+    snprintf(body, cap,
+             "{\"seq\":%d,\"type\":\"request\",\"command\":\"launch\","
+             "\"arguments\":{\"program\":\"%s\",\"stopOnEntry\":false}}",
+             ++g_seq, program);
+    dap_send(c, body);
+    (void)wait_response(c, "launch", msg, (int)cap);
+}
+
+static void send_configuration_done(child_t *c, char *body, char *msg, size_t cap) {
+    snprintf(body, cap,
+             "{\"seq\":%d,\"type\":\"request\",\"command\":\"configurationDone\"}",
+             ++g_seq);
+    dap_send(c, body);
+    (void)wait_response(c, "configurationDone", msg, (int)cap);
+}
+
+static void send_disconnect(child_t *c, char *body, char *msg, size_t cap) {
+    (void)msg;
+    snprintf(body, cap,
+             "{\"seq\":%d,\"type\":\"request\",\"command\":\"disconnect\"}", ++g_seq);
+    dap_send(c, body);
+}
+
+/* ---- scenario: the original breakpoint/stack/locals/step session ---- */
+static int run_basic(const char *dap_exe, const char *target, const char *source) {
+    g_seq = 0;
     child_t c;
     memset(&c, 0, sizeof(c));
 #ifndef _WIN32
@@ -278,21 +303,7 @@ int main(int argc, char **argv) {
     char body[65536];
     char msg[65536];
 
-    /* initialize */
-    snprintf(body, sizeof(body),
-             "{\"seq\":%d,\"type\":\"request\",\"command\":\"initialize\","
-             "\"arguments\":{\"clientID\":\"itest\",\"adapterID\":\"zan\"}}", ++g_seq);
-    dap_send(&c, body);
-    check(wait_response(&c, "initialize", msg, sizeof(msg)), "initialize response");
-    check(wait_event(&c, "initialized", msg, sizeof(msg)), "initialized event");
-
-    /* launch */
-    snprintf(body, sizeof(body),
-             "{\"seq\":%d,\"type\":\"request\",\"command\":\"launch\","
-             "\"arguments\":{\"program\":\"%s\",\"stopOnEntry\":false}}",
-             ++g_seq, target);
-    dap_send(&c, body);
-    check(wait_response(&c, "launch", msg, sizeof(msg)), "launch response");
+    handshake(&c, target, body, msg, sizeof(body));
 
     /* setBreakpoints (lines 11 and 17 of the target) */
     snprintf(body, sizeof(body),
@@ -304,11 +315,7 @@ int main(int argc, char **argv) {
     check(wait_response(&c, "setBreakpoints", msg, sizeof(msg)), "setBreakpoints response");
     bool verified = strstr(msg, "\"verified\":true") != NULL;
 
-    /* configurationDone -> launches inferior under gdb */
-    snprintf(body, sizeof(body),
-             "{\"seq\":%d,\"type\":\"request\",\"command\":\"configurationDone\"}", ++g_seq);
-    dap_send(&c, body);
-    (void)wait_response(&c, "configurationDone", msg, sizeof(msg));
+    send_configuration_done(&c, body, msg, sizeof(body));
 
     /* Either we stop at a breakpoint (gdb present) or the session ends
      * without ever stopping (no gdb / broken adapter). An end without a stop
@@ -394,12 +401,201 @@ int main(int argc, char **argv) {
     }
     check(exited, "exited event");
 
-    /* disconnect */
-    snprintf(body, sizeof(body),
-             "{\"seq\":%d,\"type\":\"request\",\"command\":\"disconnect\"}", ++g_seq);
-    dap_send(&c, body);
+    send_disconnect(&c, body, msg, sizeof(body));
 
     child_close(&c);
+    return 0;
+}
+
+/* ---- scenario: hit-count breakpoint "==1000" stops on the 1000th hit ----
+ * Spin() crosses line 15 exactly 3000 times, so with a gdb ignore-count of
+ * 999 the first stop lands on hit #1000 with i == 999. The session ends by
+ * disconnect right after: gdb's ignore-count is exhausted at that point and
+ * would stop on every later hit, which the drain would have to walk. */
+static int run_hitcount(const char *dap_exe, const char *burn, const char *burn_src) {
+    g_seq = 0;
+    child_t c;
+    memset(&c, 0, sizeof(c));
+#ifndef _WIN32
+    c.in_w = -1; c.out_r = -1;
+#endif
+    if (!child_spawn(&c, dap_exe)) return 77;
+    char body[65536], msg[65536];
+
+    handshake(&c, burn, body, msg, sizeof(body));
+
+    snprintf(body, sizeof(body),
+             "{\"seq\":%d,\"type\":\"request\",\"command\":\"setBreakpoints\","
+             "\"arguments\":{\"source\":{\"path\":\"%s\"},"
+             "\"breakpoints\":[{\"line\":15,\"hitCondition\":\"==1000\"}]}}",
+             ++g_seq, burn_src);
+    dap_send(&c, body);
+    check(wait_response(&c, "setBreakpoints", msg, sizeof(msg)),
+          "hitcount: setBreakpoints response");
+    check(strstr(msg, "\"verified\":true") != NULL, "hitcount: breakpoint verified");
+
+    send_configuration_done(&c, body, msg, sizeof(body));
+
+    if (!wait_stopped_or_ended(&c, msg, sizeof(msg))) {
+        check(false, "hitcount: no stop on the counted hit");
+        child_close(&c);
+        return 1;
+    }
+    check(strstr(msg, "\"reason\":\"breakpoint\"") != NULL,
+          "hitcount: stopped on the 1000th hit");
+
+    snprintf(body, sizeof(body),
+             "{\"seq\":%d,\"type\":\"request\",\"command\":\"stackTrace\","
+             "\"arguments\":{\"threadId\":1}}", ++g_seq);
+    dap_send(&c, body);
+    (void)wait_response(&c, "stackTrace", msg, sizeof(msg));
+    long frame_id = json_num(msg, "id", -1);
+
+    /* i must be 999 (zero-based counter) on the 1000th crossing */
+    snprintf(body, sizeof(body),
+             "{\"seq\":%d,\"type\":\"request\",\"command\":\"evaluate\","
+             "\"arguments\":{\"expression\":\"i\",\"frameId\":%ld,\"context\":\"watch\"}}",
+             ++g_seq, frame_id);
+    dap_send(&c, body);
+    check(wait_response(&c, "evaluate", msg, sizeof(msg)), "hitcount: evaluate response");
+    check(strstr(msg, "999") != NULL, "hitcount: loop counter is 999 at the stop");
+
+    send_disconnect(&c, body, msg, sizeof(body));
+    child_close(&c);
+    return 0;
+}
+
+/* ---- scenario: logpoint logs and continues, never stops ----
+ * Line 30 is crossed 20 times; with a logMessage the adapter must emit an
+ * output event per crossing (with {outer} interpolated) and run the target
+ * to completion without ever surfacing a stopped event. */
+static int run_logpoint(const char *dap_exe, const char *burn, const char *burn_src) {
+    g_seq = 0;
+    child_t c;
+    memset(&c, 0, sizeof(c));
+#ifndef _WIN32
+    c.in_w = -1; c.out_r = -1;
+#endif
+    if (!child_spawn(&c, dap_exe)) return 77;
+    char body[65536], msg[65536];
+
+    handshake(&c, burn, body, msg, sizeof(body));
+
+    snprintf(body, sizeof(body),
+             "{\"seq\":%d,\"type\":\"request\",\"command\":\"setBreakpoints\","
+             "\"arguments\":{\"source\":{\"path\":\"%s\"},"
+             "\"breakpoints\":[{\"line\":30,\"logMessage\":\"tick outer={outer}\"}]}}",
+             ++g_seq, burn_src);
+    dap_send(&c, body);
+    check(wait_response(&c, "setBreakpoints", msg, sizeof(msg)),
+          "logpoint: setBreakpoints response");
+    check(strstr(msg, "\"verified\":true") != NULL, "logpoint: breakpoint verified");
+
+    send_configuration_done(&c, body, msg, sizeof(body));
+
+    bool exited = false, stopped = false;
+    int logs = 0;
+    for (int i = 0; i < 800 && !exited && !stopped; i++) {
+        if (!dap_recv(&c, msg, sizeof(msg))) break;
+        if (strstr(msg, "\"event\":\"exited\"")) { exited = true; break; }
+        if (strstr(msg, "\"type\":\"event\"") && strstr(msg, "\"event\":\"stopped\"")) {
+            stopped = true;
+            break;
+        }
+        if (strstr(msg, "\"event\":\"output\"") && strstr(msg, "tick outer="))
+            logs++;
+    }
+    check(logs >= 1, "logpoint: log output events seen");
+    check(strstr(msg, "tick outer=") != NULL || logs > 0,
+          "logpoint: {outer} interpolation in output");
+    check(!stopped, "logpoint: never reported a stop");
+    check(exited, "logpoint: target ran to exit");
+
+    send_disconnect(&c, body, msg, sizeof(body));
+    child_close(&c);
+    return 0;
+}
+
+/* ---- scenario: pause really interrupts the running target ----
+ * No breakpoints: after configurationDone the target burns CPU for seconds
+ * inside Burn(). The harness waits a second so the run is well inside the
+ * burn loop, then sends `pause` while the adapter is pumping gdb output —
+ * the wait-hook path. The stop must carry reason "pause" and a frame inside
+ * the burn target's source. */
+static int run_pause(const char *dap_exe, const char *burn, const char *burn_src) {
+    (void)burn_src;
+    g_seq = 0;
+    child_t c;
+    memset(&c, 0, sizeof(c));
+#ifndef _WIN32
+    c.in_w = -1; c.out_r = -1;
+#endif
+    if (!child_spawn(&c, dap_exe)) return 77;
+    char body[65536], msg[65536];
+
+    handshake(&c, burn, body, msg, sizeof(body));
+
+    send_configuration_done(&c, body, msg, sizeof(body));
+
+    /* let the target get deep into Burn()'s burn loop */
+#ifdef _WIN32
+    Sleep(1000);
+#else
+    sleep(1);
+#endif
+
+    snprintf(body, sizeof(body),
+             "{\"seq\":%d,\"type\":\"request\",\"command\":\"pause\"}", ++g_seq);
+    dap_send(&c, body);
+    check(wait_response(&c, "pause", msg, sizeof(msg)), "pause: response");
+
+    if (!wait_stopped_or_ended(&c, msg, sizeof(msg))) {
+        check(false, "pause: no stopped event");
+        child_close(&c);
+        return 1;
+    }
+    check(strstr(msg, "\"reason\":\"pause\"") != NULL, "pause: stopped reason=pause");
+
+    snprintf(body, sizeof(body),
+             "{\"seq\":%d,\"type\":\"request\",\"command\":\"stackTrace\","
+             "\"arguments\":{\"threadId\":1}}", ++g_seq);
+    dap_send(&c, body);
+    check(wait_response(&c, "stackTrace", msg, sizeof(msg)),
+          "pause: stackTrace response");
+    check(json_num(msg, "totalFrames", 0) >= 1, "pause: call stack available");
+    check(strstr(msg, "dbgtarget_burn") != NULL,
+          "pause: stopped inside the burn target");
+
+    send_disconnect(&c, body, msg, sizeof(body));
+    child_close(&c);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 4) {
+        fprintf(stderr, "usage: %s <zan-dap> <target-exe> <source> "
+                        "[<burn-exe> <burn-source>]\n", argv[0]);
+        return 2;
+    }
+    const char *dap_exe = argv[1];
+    char target[1024], source[1024];
+    json_escape(argv[2], target, sizeof(target));
+    json_escape(argv[3], source, sizeof(source));
+
+    setvbuf(stdout, NULL, _IONBF, 0);
+
+    int r = run_basic(dap_exe, target, source);
+    if (r != 0) return r; /* skip (77) or basic failure: gdb absent/broken */
+
+    if (argc >= 6) {
+        char burn[1024], burn_src[1024];
+        json_escape(argv[4], burn, sizeof(burn));
+        json_escape(argv[5], burn_src, sizeof(burn_src));
+        r = run_hitcount(dap_exe, burn, burn_src);
+        if (r == 0) r = run_logpoint(dap_exe, burn, burn_src);
+        if (r == 0) r = run_pause(dap_exe, burn, burn_src);
+    }
+
     printf("\n%d failure(s)\n", g_fails);
     return g_fails ? 1 : 0;
 }
