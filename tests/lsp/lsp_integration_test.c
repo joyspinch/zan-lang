@@ -437,6 +437,133 @@ static int run_extended_checks(child_t *child) {
     return ext_fails ? 1 : 0;
 }
 
+/* --------- scope-aware rename/references + engine cache (B-ID3/B-ID5) ---- */
+
+#define SC_URI "file:///lsp_scope_test.zan"
+/* Two methods each with a local `count`: scope-aware rename of the one in
+ * Add() (line 4) must not touch the unrelated one in Other() (line 8). */
+static const char *SC_DOC =
+    "class S {\n"
+    "    int total = 0;\n"
+    "    static void Add() {\n"
+    "        int count = 1;\n"       /* line 3 */
+    "        count = count + 1;\n"   /* line 4: rename target */
+    "        Console.WriteLine(count);\n" /* line 5 */
+    "    }\n"
+    "    static void Other() {\n"
+    "        int count = 9;\n"       /* line 8: must stay untouched */
+    "        Console.WriteLine(count);\n" /* line 9: must stay untouched */
+    "    }\n"
+    "}\n";
+
+static void scope_open(child_t *child) {
+    json_value *td = json_new_obj();
+    json_obj_set(td, "uri", json_new_str(SC_URI));
+    json_obj_set(td, "languageId", json_new_str("zan"));
+    json_obj_set(td, "version", json_new_num(1));
+    json_obj_set(td, "text", json_new_str(SC_DOC));
+    json_value *params = json_new_obj();
+    json_obj_set(params, "textDocument", td);
+    send_message(child, mk_request(-1, "textDocument/didOpen", params));
+}
+
+static json_value *scope_position(int line, int character) {
+    json_value *pos = json_new_obj();
+    json_obj_set(pos, "line", json_new_num(line));
+    json_obj_set(pos, "character", json_new_num(character));
+    return pos;
+}
+
+static int run_scope_checks(child_t *child) {
+    scope_open(child);
+
+    /* rename the local `count` in Add() (line 4, char 8) -> "tally" */
+    {
+        json_value *td = json_new_obj();
+        json_obj_set(td, "uri", json_new_str(SC_URI));
+        json_value *params = json_new_obj();
+        json_obj_set(params, "textDocument", td);
+        json_obj_set(params, "position", scope_position(4, 8));
+        json_obj_set(params, "newName", json_new_str("tally"));
+        send_message(child, mk_request(20, "textDocument/rename", params));
+        char *r = recv_until_id(child, 20);
+        if (r) {
+            int hits = 0;
+            for (const char *p = r; (p = strstr(p, "\"newText\":\"tally\"")) != NULL; p++) hits++;
+            ext_check(hits == 4, "rename: local renamed 4 times inside Add() only");
+            ext_check(strstr(r, SC_URI) != NULL, "rename: edits target the scope doc");
+            ext_check(strstr(r, "\"line\":8") == NULL && strstr(r, "\"line\":9") == NULL,
+                      "rename: Other()'s same-named local untouched");
+        } else {
+            ext_check(false, "rename: no response");
+        }
+        free(r);
+    }
+
+    /* references on Other()'s own `count` (line 8; "int " occupies chars
+     * 8..11, the identifier starts at char 12) */
+    {
+        json_value *td = json_new_obj();
+        json_obj_set(td, "uri", json_new_str(SC_URI));
+        json_value *params = json_new_obj();
+        json_obj_set(params, "textDocument", td);
+        json_obj_set(params, "position", scope_position(8, 12));
+        send_message(child, mk_request(21, "textDocument/references", params));
+        char *r = recv_until_id(child, 21);
+        if (r) {
+            int locs = 0;
+            for (const char *p = r; (p = strstr(p, "\"uri\":\"file:///lsp_scope_test.zan\"")) != NULL; p++)
+                locs++;
+            ext_check(locs == 2, "references: local reports only its own method (2)");
+        } else {
+            ext_check(false, "references: no response");
+        }
+        free(r);
+    }
+
+    /* engine cache: symbols -> definition on another doc -> symbols again.
+     * Each switch must rebuild on the uri change and still answer right. */
+    {
+        json_value *td = json_new_obj();
+        json_obj_set(td, "uri", json_new_str(SC_URI));
+        json_value *params = json_new_obj();
+        json_obj_set(params, "textDocument", td);
+        send_message(child, mk_request(22, "textDocument/documentSymbol", params));
+        char *r = recv_until_id(child, 22);
+        ext_check(r && strstr(r, "\"name\":\"Add\"") && strstr(r, "\"name\":\"Other\""),
+                  "cache: documentSymbol on scope doc lists methods");
+        ext_check(r && strstr(r, "\"name\":\"count\"") == NULL,
+                  "cache: documentSymbol excludes locals");
+        free(r);
+    }
+    {
+        json_value *td = json_new_obj();
+        json_obj_set(td, "uri", json_new_str(TEST_URI));
+        json_value *params = json_new_obj();
+        json_obj_set(params, "textDocument", td);
+        json_obj_set(params, "position", scope_position(4, 39));
+        send_message(child, mk_request(23, "textDocument/definition", params));
+        char *r = recv_until_id(child, 23);
+        ext_check(r && strstr(r, "\"character\":31") != NULL,
+                  "cache: definition still exact after uri switch");
+        free(r);
+    }
+    {
+        json_value *td = json_new_obj();
+        json_obj_set(td, "uri", json_new_str(SC_URI));
+        json_value *params = json_new_obj();
+        json_obj_set(params, "textDocument", td);
+        send_message(child, mk_request(24, "textDocument/documentSymbol", params));
+        char *r = recv_until_id(child, 24);
+        ext_check(r && strstr(r, "\"name\":\"Add\"") != NULL,
+                  "cache: switching back rebuilds the scope doc");
+        free(r);
+    }
+
+    printf("\n%d scope failure(s)\n", ext_fails);
+    return ext_fails ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: lsp_integration_test <zan-lsp>\n");
@@ -540,6 +667,9 @@ int main(int argc, char **argv) {
 
     if (rc == 0)
         rc = run_extended_checks(&child);
+
+    if (rc == 0)
+        rc = run_scope_checks(&child);
 
     child_close(&child);
     return rc;

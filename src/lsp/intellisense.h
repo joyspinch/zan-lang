@@ -60,6 +60,15 @@ typedef struct {
     int         param_count;        /* number of parameters (methods) */
 } isym_t;
 
+/* A method body extent (for scope-aware rename/references of locals). */
+typedef struct {
+    char        name[128];
+    char        parent[128];        /* enclosing class */
+    char        file[512];
+    int         start_line;         /* 0-based line of the body '{' */
+    int         end_line;           /* 0-based line of the matching '}' */
+} imethod_t;
+
 /* Autocomplete suggestion */
 typedef struct {
     char        label[128];         /* display text */
@@ -114,6 +123,10 @@ typedef struct {
     isym_t      *symbols;           /* grown by intel_parse_file */
     int         symbol_count;
     int         symbol_cap;
+
+    imethod_t   *methods;           /* method body extents, grown alongside */
+    int         method_count;
+    int         method_cap;
 
     completion_t completions[INTEL_MAX_COMPLETIONS];
     int          completion_count;
@@ -202,6 +215,16 @@ void intel_register_snippets(intellisense_t *is);
 /* Find all references to a symbol */
 int intel_find_references(intellisense_t *is, const char *word,
                           goto_def_t *results, int max_results);
+
+/* Scope-aware lookup: if `word` names a local variable or parameter declared
+ * inside the method whose body encloses `line` (all 0-based), return true and
+ * set the enclosing method's inclusive body extent plus the symbol's
+ * declaration line (parameters may sit above the body's '{' on a multi-line
+ * signature; either pointer may be NULL). False when the word is not a local
+ * of that method (callers fall back to document-wide scans). */
+bool intel_local_extent(intellisense_t *is, const char *word, int line,
+                        int *out_start_line, int *out_end_line,
+                        int *out_decl_line);
 
 /* Resolve the type of a variable name from context */
 const char *intel_resolve_type(intellisense_t *is, const char *var_name);

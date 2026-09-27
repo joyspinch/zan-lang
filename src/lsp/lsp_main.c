@@ -1560,15 +1560,18 @@ static bool uri_is_open(lsp_server_t *s, const char *uri) {
     return false;
 }
 
-/* One Location per whole-word occurrence of `word` in `text`. Returns the
- * number appended to `arr`. */
+/* One Location per whole-word occurrence of `word` in `text`. `lo`/`hi` bound
+ * the reported lines inclusively (-1/-1 = unbounded). Returns the number
+ * appended to `arr`. */
 static int add_locations(json_value *arr, const char *uri,
-                         const char *text, const char *word) {
+                         const char *text, const char *word,
+                         int lo, int hi) {
     size_t offsets[512];
     int n = find_text_references(text, word, offsets, 512);
     for (int i = 0; i < n; i++) {
         int rl, rc;
         offset_to_linecol(text, (int)offsets[i], &rl, &rc);
+        if (lo >= 0 && (rl < lo || rl > hi)) continue;
         json_value *loc = json_new_obj();
         json_obj_set(loc, "uri", json_new_str(uri));
         json_value *range = json_new_obj();
@@ -1615,7 +1618,7 @@ typedef struct {
 
 static void refs_visit(void *ctx, const char *uri, const char *text) {
     refs_ctx_t *rc = (refs_ctx_t *)ctx;
-    add_locations(rc->arr, uri, text, rc->word);
+    add_locations(rc->arr, uri, text, rc->word, -1, -1);
 }
 
 /* Find all references, project-wide: every open document plus every indexed
@@ -1635,9 +1638,22 @@ static void handle_references(lsp_server_t *s, json_value *id, json_value *param
     word_at(doc->text, off, word, sizeof(word));
     if (!word[0]) { send_response(s, id, json_new_arr()); return; }
 
+    /* scope-aware fast path: a local/parameter cannot escape its method body,
+     * so references are bounded to it — same-named identifiers in other
+     * methods or files are unrelated */
+    int ms = -1, me = -1, dl = -1;
+    intellisense_t *is = doc_intel_for(s, uri);
+    if (is && intel_local_extent(is, word, line, &ms, &me, &dl)) {
+        json_value *arr = json_new_arr();
+        add_locations(arr, uri, doc->text, word,
+                      ms < dl ? ms : dl, me);
+        send_response(s, id, arr);
+        return;
+    }
+
     json_value *arr = json_new_arr();
     for (int d = 0; d < s->doc_count; d++)
-        add_locations(arr, s->docs[d].uri, s->docs[d].text, word);
+        add_locations(arr, s->docs[d].uri, s->docs[d].text, word, -1, -1);
     refs_ctx_t rc; rc.arr = arr; rc.word = word;
     for_each_unopened_project_file(s, &rc, refs_visit);
     send_response(s, id, arr);
@@ -1752,9 +1768,10 @@ static void handle_document_symbol(lsp_server_t *s, json_value *id, json_value *
 }
 
 /* One TextEdit per whole-word occurrence of `word`, or NULL when there is
- * none in this text. */
+ * none in this text. `lo`/`hi` bound the edited lines inclusively
+ * (-1/-1 = unbounded). */
 static json_value *rename_edits_for(const char *text, const char *word,
-                                    const char *new_name) {
+                                    const char *new_name, int lo, int hi) {
     size_t offsets[512];
     int n = find_text_references(text, word, offsets, 512);
     if (n == 0) return NULL;
@@ -1762,6 +1779,7 @@ static json_value *rename_edits_for(const char *text, const char *word,
     for (int i = 0; i < n; i++) {
         int rl, rc;
         offset_to_linecol(text, (int)offsets[i], &rl, &rc);
+        if (lo >= 0 && (rl < lo || rl > hi)) continue;
         json_value *edit = json_new_obj();
         json_value *range = json_new_obj();
         json_value *start = json_new_obj();
@@ -1787,7 +1805,7 @@ typedef struct {
 
 static void rename_visit(void *ctx, const char *uri, const char *text) {
     rename_ctx_t *rc = (rename_ctx_t *)ctx;
-    json_value *edits = rename_edits_for(text, rc->word, rc->new_name);
+    json_value *edits = rename_edits_for(text, rc->word, rc->new_name, -1, -1);
     if (edits) json_obj_set(rc->changes, uri, edits);
 }
 
@@ -1816,12 +1834,28 @@ static void handle_rename(lsp_server_t *s, json_value *id, json_value *params) {
     word_at(doc->text, off, word, sizeof(word));
     if (!word[0]) { send_response(s, id, json_new_null()); return; }
 
+    /* scope-aware fast path: renaming a local/parameter only touches its own
+     * method body — the whole-project textual rename would wrongly rename
+     * unrelated same-named identifiers everywhere */
+    int ms = -1, me = -1, dl = -1;
+    intellisense_t *is = doc_intel_for(s, uri);
+    if (is && intel_local_extent(is, word, line, &ms, &me, &dl)) {
+        json_value *changes = json_new_obj();
+        json_value *edits = rename_edits_for(doc->text, word, new_name,
+                                             ms < dl ? ms : dl, me);
+        if (edits) json_obj_set(changes, uri, edits);
+        json_value *we = json_new_obj();
+        json_obj_set(we, "changes", changes);
+        send_response(s, id, we);
+        return;
+    }
+
     /* Every open document (their unsaved text wins) plus every indexed project
      * file on disk, so a rename also lands in files the editor never opened. */
     json_value *changes = json_new_obj();
     for (int d = 0; d < s->doc_count; d++) {
         lsp_doc_t *dd = &s->docs[d];
-        json_value *edits = rename_edits_for(dd->text, word, new_name);
+        json_value *edits = rename_edits_for(dd->text, word, new_name, -1, -1);
         if (edits) json_obj_set(changes, dd->uri, edits);
     }
     rename_ctx_t rctx;
@@ -2059,11 +2093,19 @@ static void handle_document_highlight(lsp_server_t *s, json_value *id, json_valu
             char word[128];
             word_at(doc->text, off, word, sizeof(word));
             if (word[0]) {
+                /* scope-aware bound: a local/parameter only highlights inside
+                 * its own method body */
+                int lo = -1, hi = -1;
+                intellisense_t *is = doc_intel_for(s, uri);
+                int ms = -1, me = -1, dl = -1;
+                if (is && intel_local_extent(is, word, line, &ms, &me, &dl))
+                    { lo = ms < dl ? ms : dl; hi = me; }
                 size_t offs[512];
                 int n = find_text_references(doc->text, word, offs, 512);
                 for (int i = 0; i < n; i++) {
                     int rl, rc;
                     offset_to_linecol(doc->text, (int)offs[i], &rl, &rc);
+                    if (lo >= 0 && (rl < lo || rl > hi)) continue;
                     json_value *hl = json_new_obj();
                     json_value *range = json_new_obj();
                     json_value *start = json_new_obj();

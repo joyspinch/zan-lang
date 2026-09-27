@@ -151,6 +151,30 @@ static bool reserve_symbols(intellisense_t *is, int need) {
     return true;
 }
 
+/* Lowercase builtin type keywords a local declaration can start with. */
+static bool is_builtin_type_word(const char *w) {
+    static const char *const words[] = {
+        "var", "int", "long", "short", "byte", "sbyte", "bool", "char",
+        "float", "double", "decimal", "string", "object",
+        "uint", "ulong", "ushort", NULL
+    };
+    for (int i = 0; words[i]; i++)
+        if (strcmp(w, words[i]) == 0) return true;
+    return false;
+}
+
+/* Grows the method-extent table to hold at least `need` entries. */
+static bool reserve_methods(intellisense_t *is, int need) {
+    if (need <= is->method_cap) return true;
+    int cap = is->method_cap ? is->method_cap * 2 : 64;
+    while (cap < need) cap *= 2;
+    imethod_t *p = (imethod_t *)realloc(is->methods, (size_t)cap * sizeof(imethod_t));
+    if (!p) return false;
+    is->methods = p;
+    is->method_cap = cap;
+    return true;
+}
+
 /* Grows the indexed-file list to hold at least `need` paths. */
 static bool reserve_files(intellisense_t *is, int need) {
     if (need <= is->indexed_file_cap) return true;
@@ -171,6 +195,7 @@ void intel_init(intellisense_t *is) {
 
 void intel_clear(intellisense_t *is) {
     is->symbol_count = 0;
+    is->method_count = 0;
     is->indexed_file_count = 0;
 }
 
@@ -178,10 +203,14 @@ void intel_free(intellisense_t *is) {
     if (!is) return;
     free(is->symbols);
     free(is->indexed_files);
+    free(is->methods);
     is->symbols = NULL;
     is->indexed_files = NULL;
+    is->methods = NULL;
     is->symbol_count = 0;
     is->symbol_cap = 0;
+    is->method_count = 0;
+    is->method_cap = 0;
     is->indexed_file_count = 0;
     is->indexed_file_cap = 0;
 }
@@ -563,6 +592,16 @@ void intel_parse_file(intellisense_t *is, const char *filepath,
     }
     is->symbol_count = dst;
 
+    /* same for the method-extent table */
+    int mdst = 0;
+    for (int i = 0; i < is->method_count; i++) {
+        if (strcmp(is->methods[i].file, filepath) != 0) {
+            if (mdst != i) is->methods[mdst] = is->methods[i];
+            mdst++;
+        }
+    }
+    is->method_count = mdst;
+
     /* track this file as indexed */
     bool already_indexed = false;
     for (int i = 0; i < is->indexed_file_count; i++) {
@@ -599,6 +638,13 @@ void intel_parse_file(intellisense_t *is, const char *filepath,
     int brace_depth = 0;
     int class_brace = -1;
     int line_num = 0;
+
+    /* Method-body extent tracking. A method's body '{' is the first brace
+     * after its signature; it opens exactly one level deeper than the class
+     * body, and its matching '}' returns to the class level. Zan has no
+     * nested methods, so one open-body slot suffices. */
+    char pending_method[128] = {0};
+    int open_method = -1;   /* index into is->methods of the open body */
 
     const char *p = content;
     const char *end = content + len;
@@ -640,12 +686,39 @@ void intel_parse_file(intellisense_t *is, const char *filepath,
         }
 
         /* track braces */
-        if (*p == '{') { brace_depth++; p++; continue; }
+        if (*p == '{') {
+            brace_depth++;
+            if (pending_method[0] && class_brace >= 0 &&
+                brace_depth == class_brace + 2) {
+                /* this brace opened the pending method's body */
+                if (reserve_methods(is, is->method_count + 1)) {
+                    imethod_t *m = &is->methods[is->method_count++];
+                    snprintf(m->name, sizeof(m->name), "%s", pending_method);
+                    snprintf(m->parent, sizeof(m->parent), "%s", current_class);
+                    snprintf(m->file, sizeof(m->file), "%s", filepath);
+                    m->start_line = line_num;
+                    m->end_line = line_num;
+                    open_method = is->method_count - 1;
+                }
+                pending_method[0] = '\0';
+            } else if (brace_depth != class_brace + 2) {
+                pending_method[0] = '\0';   /* bodyless method (iface/extern) */
+            }
+            p++;
+            continue;
+        }
         if (*p == '}') {
             brace_depth--;
+            if (open_method >= 0 && class_brace >= 0 &&
+                brace_depth == class_brace + 1) {
+                is->methods[open_method].end_line = line_num;
+                open_method = -1;
+            }
             if (brace_depth == class_brace) {
                 current_class[0] = '\0';
                 class_brace = -1;
+                open_method = -1;
+                pending_method[0] = '\0';
             }
             p++;
             continue;
@@ -667,6 +740,18 @@ void intel_parse_file(intellisense_t *is, const char *filepath,
             while (p < end && *p != '"') {
                 if (*p == '\\' && p + 1 < end) p++;
                 if (*p == '{') { while (p < end && *p != '}') p++; }
+                if (*p == '\n') line_num++;
+                p++;
+            }
+            if (p < end) p++;
+            continue;
+        }
+        /* skip char literals ('{', '\n', ...) so they don't skew the brace
+         * depth that method-body extents depend on */
+        if (*p == '\'') {
+            p++;
+            while (p < end && *p != '\'') {
+                if (*p == '\\' && p + 1 < end) p++;
                 if (*p == '\n') line_num++;
                 p++;
             }
@@ -872,6 +957,8 @@ void intel_parse_file(intellisense_t *is, const char *filepath,
                                      ISYM_METHOD, line_num,
                                      (int)(name_start - content),
                                      is_static_m, param_count);
+                        /* the body '{' (if any) follows the signature */
+                        snprintf(pending_method, sizeof(pending_method), "%s", method_name);
 
                         /* Also extract parameters as symbols */
                         /* Parse params_buf: "Type1 name1, Type2 name2" */
@@ -940,10 +1027,14 @@ void intel_parse_file(intellisense_t *is, const char *filepath,
                 (void)is_override;
             }
 
-            /* Track local variable declarations: var x = ..., Type x = ... */
+            /* Track local variable declarations: var x = ..., Type x = ...
+             * Lowercase builtin types (int count = 1;, string s = ...;) count
+             * too — without them most locals would be invisible to
+             * scope-aware rename/references. */
             if (brace_depth > class_brace + 1 && current_class[0]) {
                 /* Inside a method body */
-                if (strcmp(word, "var") == 0 || isupper((unsigned char)word[0])) {
+                if (strcmp(word, "var") == 0 || isupper((unsigned char)word[0]) ||
+                    is_builtin_type_word(word)) {
                     const char *peek = p;
                     char vtype[64];
                     snprintf(vtype, sizeof(vtype), "%s", word);
@@ -1529,6 +1620,46 @@ int intel_find_references(intellisense_t *is, const char *word,
         }
     }
     return count;
+}
+
+bool intel_local_extent(intellisense_t *is, const char *word, int line,
+                        int *out_start_line, int *out_end_line,
+                        int *out_decl_line) {
+    if (!is || !word || !word[0]) return false;
+    /* find the method whose body encloses the cursor line */
+    int m = -1;
+    for (int i = 0; i < is->method_count; i++) {
+        if (line >= is->methods[i].start_line && line <= is->methods[i].end_line) {
+            m = i;
+            break;
+        }
+    }
+    if (m < 0) return false;
+    /* `word` is a local of THAT method when a variable/parameter symbol with
+     * this name is declared inside its body. Locals cannot escape the body,
+     * so the extent is a sound bound for rename/references edits. */
+    for (int i = 0; i < is->symbol_count; i++) {
+        isym_t *sym = &is->symbols[i];
+        if (strcmp(sym->name, word) != 0) continue;
+        if (sym->kind == ISYM_VARIABLE) {
+            /* a local belongs to the method whose body contains its line —
+             * a same-named local of a sibling method must not match here */
+            if (sym->line < is->methods[m].start_line ||
+                sym->line > is->methods[m].end_line) continue;
+        } else if (sym->kind == ISYM_PARAMETER) {
+            /* parameters are recorded on their signature line, which sits
+             * above the body '{' for multi-line signatures */
+            if (sym->line > is->methods[m].end_line) continue;
+            if (sym->line < is->methods[m].start_line - 16) continue;
+        } else {
+            continue;
+        }
+        *out_start_line = is->methods[m].start_line;
+        *out_end_line = is->methods[m].end_line;
+        if (out_decl_line) *out_decl_line = sym->line;
+        return true;
+    }
+    return false;
 }
 
 const char *intel_accept(intellisense_t *is) {
