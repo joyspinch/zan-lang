@@ -2878,6 +2878,20 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_design_palette${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # The alert-banner family: the palette's serialized kind "Alert"
+  # (FormField ftype 28) and the real control kind "AlertBox" must both
+  # project to Gui.Widget.AlertBox — legacy designs carry "Alert", and
+  # before AlertBox existed that field generated a nonexistent class.
+  # The host also drives the type prop channel (word ↔ enum index).
+  add_test(NAME conformance_gui_design_alert
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/design_alert_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/design_alert.html;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_design_alert.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_design_alert${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # A primary design document supplies only a fallback entry point. When a
   # later Zan input declares Main, that explicit entry must win regardless of
   # response-file order (large designed applications depend on this shape).
