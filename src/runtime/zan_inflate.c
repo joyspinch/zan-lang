@@ -13,7 +13,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "miniz.h"
+/* Unity-include the tinfl implementation: the object must stay a single
+ * self-contained TU (it is staged as one file next to zanc and linked
+ * straight into user programs). miniz_tinfl.c pulls in miniz.h. */
+#include "miniz_tinfl.c"
 
 /* Raw length: first 4 bytes of the baked payload. `len` is the runtime's
  * ARC-tagged byte count; the tag bit only says the pointer is a managed

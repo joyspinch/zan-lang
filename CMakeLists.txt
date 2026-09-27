@@ -134,8 +134,12 @@ add_executable(zanc
     src/compiler/ipa.c
     src/compiler/builtin_api.c
     src/compiler/symbols.c
+    # compressor side of embedded resources (embedres.c embed_maybe_compress)
+    src/common/miniz.c
+    src/common/miniz_tinfl.c
+    src/common/miniz_tdef.c
 )
-target_include_directories(zanc PRIVATE src/compiler ${LLVM_INCLUDE_DIRS})
+target_include_directories(zanc PRIVATE src/compiler src/common ${LLVM_INCLUDE_DIRS})
 if(MSVC)
     target_link_libraries(zanc PRIVATE ${LLVM_LIBS} winhttp)
 elseif(WIN32)
@@ -1512,9 +1516,12 @@ foreach(_src ${_conf_srcs})
   # arc_net_publish 有专属档（run_arcnet.cmake，--publish + 网静默
   # 契约，见 3691 行的手工登记），四个 GLOB 孪生档全部跳过它，
   # 否则 add_test 撞名配置失败。
+  # embed_compress 同理（run_embed_compress.cmake：--embed 压缩烘焙 +
+  # 明文断言 + 净目录运行，手工登记在 arc net 之后）。
   # genform_click_test 同理：期望输出是 genform_click.out（与
   # <名>_test.zan 同目录不同名），3043 行的手工登记按真实文件名注册。
-  if(_name STREQUAL "arc_net_publish" OR _name STREQUAL "genform_click_test")
+  if(_name STREQUAL "arc_net_publish" OR _name STREQUAL "genform_click_test"
+     OR _name STREQUAL "embed_compress")
     continue()
   endif()
   zan_uses_gui_driver(${_src} _needs_gui_driver)
@@ -4001,6 +4008,21 @@ add_test(NAME conformance_arc_net_publish COMMAND ${CMAKE_COMMAND}
   -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_arc_net_publish${_exe_ext}
   -P ${CMAKE_SOURCE_DIR}/tests/run_arcnet.cmake)
 set_tests_properties(conformance_arc_net_publish PROPERTIES TIMEOUT 120)
+
+# ---- --embed deflate compression ----
+# A 1200-byte repetitive asset bakes raw-deflate (embedres.c embed_maybe_compress)
+# with the len sign bit set and decodes lazily on first read; a 96-byte one
+# stays raw. The runner also fails the test if the asset's plaintext survives
+# in the image, and runs the program from a directory without the assets so
+# the reads exercise the embedded copies, not the disk fallback.
+add_test(NAME conformance_embed_compress COMMAND ${CMAKE_COMMAND}
+  -DZANC=$<TARGET_FILE:zanc>
+  -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/embed_compress.zan
+  -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/embed_compress.out
+  -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_embed_compress${_exe_ext}
+  -DWORKDIR=${CMAKE_BINARY_DIR}
+  -P ${CMAKE_SOURCE_DIR}/tests/run_embed_compress.cmake)
+set_tests_properties(conformance_embed_compress PROPERTIES TIMEOUT 180)
 
 # ---- Published-size budgets (docs/archive/embedded_runtime_assessment.md) ----
 # A minimal --publish build must stay small: a reintroduced fixed static

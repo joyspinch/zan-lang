@@ -7,10 +7,20 @@
  * no file on disk. Generating the data straight into the module keeps this
  * working for every target and needs no external C compiler -- unlike the
  * scripts/gen_embed.ps1 route, which compiles a generated .c with clang.
+ *
+ * Payloads at or above ZAN_EMBED_COMPRESS_MIN bytes are baked
+ * deflate-compressed ([u32 raw_len][u32 comp_len][raw deflate], the format
+ * src/runtime/zan_inflate.c zan_embed_decode consumes): skins, icon packs and
+ * the pinyin table shrink to a fraction and stop showing up in a plain
+ * `strings` dump of the executable. The emitted read API decodes an entry on
+ * first hit and patches the table slot in place, so repeat reads stay
+ * allocation-free.
  */
 
 #include "embedres.h"
 #include "win_utf8.h"
+#include "miniz.h"
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -104,7 +114,7 @@ static int embed_add_file(zan_embed_list_t *l, const char *path,
  * default Windows stack at ~350 levels. A depth cap turns a crafted tree
  * into a diagnosable error instead of a crash; 32 is far beyond any real
  * resource layout (stdlib skins: 3). */
-#define EMBED_WALK_MAX_DEPTH 32
+#define EMBED_WALK_MAX_DEPTH 128
 
 static void embed_walk_impl(zan_embed_list_t *l, const char *dir, const char *name, int depth) {
     if (depth > EMBED_WALK_MAX_DEPTH) return;
@@ -270,6 +280,40 @@ static const char *embed_basename(const char *path) {
     return sep ? sep + 1 : path;
 }
 
+/* Entries at or above this size are baked compressed; smaller ones gain less
+ * than the 8-byte header costs. */
+#define ZAN_EMBED_COMPRESS_MIN 512
+/* len high bit marks a compressed payload; the emitted read API tests it and
+ * decodes on first hit. */
+#define ZAN_EMBED_COMPRESSED 0x8000000000000000ULL
+
+/* Returns a malloc'd [u32 raw_len][u32 comp_len][raw deflate] payload with
+ * *out_len set to its byte count, or NULL when compression does not pay (the
+ * resource is kept raw then). Raw deflate -- no zlib header -- is exactly what
+ * zan_embed_decode (src/runtime/zan_inflate.c) consumes. tdefl is
+ * deterministic, so a rebuild of the same sources bakes the same image. */
+static unsigned char *embed_maybe_compress(const unsigned char *data,
+                                           long long len, long long *out_len) {
+    if (len < ZAN_EMBED_COMPRESS_MIN) return NULL;
+    int flags = tdefl_create_comp_flags_from_zip_params(MZ_DEFAULT_LEVEL,
+                                                        -MZ_DEFAULT_WINDOW_BITS,
+                                                        0);
+    size_t comp_len = 0;
+    void *comp = tdefl_compress_mem_to_heap(data, (size_t)len, &comp_len,
+                                            flags);
+    if (!comp) return NULL;
+    if ((long long)comp_len + 8 >= len) { free(comp); return NULL; }
+    unsigned char *out = (unsigned char *)malloc((size_t)comp_len + 8);
+    if (!out) { free(comp); return NULL; }
+    uint32_t raw32 = (uint32_t)len, c32 = (uint32_t)comp_len;
+    memcpy(out, &raw32, 4);
+    memcpy(out + 4, &c32, 4);
+    memcpy(out + 8, comp, comp_len);
+    free(comp);
+    *out_len = (long long)comp_len + 8;
+    return out;
+}
+
 /* A private constant holding `len` bytes plus a trailing NUL, so text
  * resources round-trip as C strings while `len` stays the true size. */
 static LLVMValueRef embed_bytes_global(zan_irgen_t *g, const char *label,
@@ -428,8 +472,91 @@ static LLVMValueRef embed_emit_find(zan_irgen_t *g, struct embed_api_ctx *c) {
     return fn;
 }
 
+/* i8* zan.embed.unzip(i8* ent): a compressed entry (flag bit in len, payload
+ * [u32 raw_len][u32 comp_len][raw deflate]) is decoded on first hit and the
+ * slot patched in place -- repeat reads and zan_embed_has then see plain
+ * data. Raw entries pass through untouched. Decode failure (corrupt bake)
+ * reads as a missing resource rather than garbage bytes. Two threads hitting
+ * the same entry before either stores can decode twice; the loser's buffer
+ * is simply dropped -- bounded, rare, and the slot still ends up decoded. */
+static LLVMValueRef embed_emit_unzip(zan_irgen_t *g, struct embed_api_ctx *c) {
+    LLVMTypeRef args[] = { c->i8p };
+    LLVMTypeRef fty = LLVMFunctionType(c->i8p, args, 1, 0);
+    LLVMValueRef fn = LLVMAddFunction(g->mod, "zan.embed.unzip", fty);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+    LLVMTypeRef dargs[] = { c->i8p, c->i64 };
+    LLVMTypeRef dty;
+    LLVMValueRef dec = embed_libc(g, "zan_embed_decode", c->i8p, dargs, 2,
+                                  &dty);
+    LLVMBuilderRef b = LLVMCreateBuilderInContext(g->ctx);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMBasicBlockRef raw = LLVMAppendBasicBlockInContext(g->ctx, fn, "raw");
+    LLVMBasicBlockRef comp = LLVMAppendBasicBlockInContext(g->ctx, fn, "comp");
+    LLVMBasicBlockRef ok = LLVMAppendBasicBlockInContext(g->ctx, fn, "ok");
+    LLVMBasicBlockRef bad = LLVMAppendBasicBlockInContext(g->ctx, fn, "bad");
+    LLVMPositionBuilderAtEnd(b, entry);
+    LLVMValueRef e = LLVMGetParam(fn, 0);
+    LLVMValueRef lp = LLVMBuildStructGEP2(b, c->ent_ty, e, 2, "lp");
+    LLVMValueRef len = LLVMBuildLoad2(b, c->i64, lp, "l");
+    LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntSLT, len,
+        LLVMConstInt(c->i64, 0, 0), "flag"), comp, raw);
+    LLVMPositionBuilderAtEnd(b, raw);
+    LLVMValueRef dp0 = LLVMBuildStructGEP2(b, c->ent_ty, e, 1, "dp0");
+    LLVMBuildRet(b, LLVMBuildLoad2(b, c->i8p, dp0, "d0"));
+    LLVMPositionBuilderAtEnd(b, comp);
+    LLVMValueRef dp = LLVMBuildStructGEP2(b, c->ent_ty, e, 1, "dp");
+    LLVMValueRef d = LLVMBuildLoad2(b, c->i8p, dp, "d");
+    /* zan_embed_decode demands the ARC array-header tag on `len` (it masks
+     * the byte count out of a tagged size); supply it on top of the payload
+     * size with the compressed flag cleared. */
+    LLVMValueRef plain = LLVMBuildOr(b,
+        LLVMBuildAnd(b, len,
+            LLVMConstInt(c->i64, 0x7FFFFFFFFFFFFFFFULL, 0), "pl0"),
+        LLVMConstInt(c->i64, 0x4000000000000000ULL, 0), "plain");
+    LLVMValueRef cargs[] = { d, plain };
+    LLVMValueRef out = LLVMBuildCall2(b, dty, dec, cargs, 2, "out");
+    LLVMBuildCondBr(b, LLVMBuildIsNull(b, out, "fail"), bad, ok);
+    LLVMPositionBuilderAtEnd(b, bad);
+    LLVMBuildRet(b, LLVMConstNull(c->i8p));
+    LLVMPositionBuilderAtEnd(b, ok);
+    /* raw_len is the payload's first u32: deref the payload ADDRESS (d),
+     * not the field slot -- dp is &entry.data and still holds the old
+     * pointer at this point; loading through it baked the pointer's low
+     * half into entry.len and every consumer read a 2 GiB size. The
+     * decoded buffer is already NUL-terminated at raw_len, so the slot
+     * ends up exactly as a raw bake. */
+    LLVMValueRef rl = LLVMBuildLoad2(b, c->i32, d, "rawlen");
+    LLVMValueRef rl64 = LLVMBuildZExt(b, rl, c->i64, "raw64");
+    LLVMBuildStore(b, out, dp);
+    LLVMBuildStore(b, rl64, lp);
+    LLVMBuildRet(b, out);
+    LLVMDisposeBuilder(b);
+    return fn;
+}
+
+/* i8* zan.embed.pass(i8* ent): the no-compression stand-in for unzip. A
+ * program that only CALLS the embed API (uses_embed_api, empty own table)
+ * must not drag a zan_embed_decode extern into its object -- nothing sets
+ * the compressed flag, so a passthrough keeps read/bytes' bodies shared
+ * without creating an undefined reference the link would reject. */
+static LLVMValueRef embed_emit_passthrough(zan_irgen_t *g,
+                                           struct embed_api_ctx *c) {
+    LLVMTypeRef args[] = { c->i8p };
+    LLVMTypeRef fty = LLVMFunctionType(c->i8p, args, 1, 0);
+    LLVMValueRef fn = LLVMAddFunction(g->mod, "zan.embed.pass", fty);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+    LLVMBuilderRef b = LLVMCreateBuilderInContext(g->ctx);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMPositionBuilderAtEnd(b, entry);
+    LLVMValueRef e = LLVMGetParam(fn, 0);
+    LLVMValueRef dp = LLVMBuildStructGEP2(b, c->ent_ty, e, 1, "dp");
+    LLVMBuildRet(b, LLVMBuildLoad2(b, c->i8p, dp, "d"));
+    LLVMDisposeBuilder(b);
+    return fn;
+}
+
 static void embed_emit_read_has_bytes(zan_irgen_t *g, struct embed_api_ctx *c,
-                                      LLVMValueRef find) {
+                                      LLVMValueRef find, LLVMValueRef unzip) {
     LLVMTypeRef find_args[] = { c->i8p };
     LLVMTypeRef find_ty = LLVMFunctionType(c->i8p, find_args, 1, 0);
     LLVMBuilderRef b = LLVMCreateBuilderInContext(g->ctx);
@@ -446,8 +573,11 @@ static void embed_emit_read_has_bytes(zan_irgen_t *g, struct embed_api_ctx *c,
     LLVMValueRef re = LLVMBuildCall2(b, find_ty, find, &ra, 1, "e");
     LLVMBuildCondBr(b, LLVMBuildIsNull(b, re, "none"), rnil, rgot);
     LLVMPositionBuilderAtEnd(b, rgot);
-    LLVMValueRef rdp = LLVMBuildStructGEP2(b, c->ent_ty, re, 1, "dp");
-    LLVMBuildRet(b, LLVMBuildLoad2(b, c->i8p, rdp, "d"));
+    LLVMValueRef rd = LLVMBuildCall2(b, find_ty, unzip, &re, 1, "d");
+    LLVMBasicBlockRef rgot2 = LLVMAppendBasicBlockInContext(g->ctx, rfn, "dec");
+    LLVMBuildCondBr(b, LLVMBuildIsNull(b, rd, "undec"), rnil, rgot2);
+    LLVMPositionBuilderAtEnd(b, rgot2);
+    LLVMBuildRet(b, rd);
     LLVMPositionBuilderAtEnd(b, rnil);
     LLVMBuildRet(b, c->empty);
 
@@ -488,6 +618,10 @@ static void embed_emit_read_has_bytes(zan_irgen_t *g, struct embed_api_ctx *c,
     LLVMValueRef be = LLVMBuildCall2(b, find_ty, find, &ba, 1, "e");
     LLVMBuildCondBr(b, LLVMBuildIsNull(b, be, "none"), bnil, bgot);
     LLVMPositionBuilderAtEnd(b, bgot);
+    LLVMValueRef bdu = LLVMBuildCall2(b, find_ty, unzip, &be, 1, "d");
+    LLVMBasicBlockRef bdec = LLVMAppendBasicBlockInContext(g->ctx, bfn, "dec");
+    LLVMBuildCondBr(b, LLVMBuildIsNull(b, bdu, "undec"), bnil, bdec);
+    LLVMPositionBuilderAtEnd(b, bdec);
     LLVMBuildCondBr(b, LLVMBuildIsNull(b, bo, "noout"), bdg, bsg);
     LLVMPositionBuilderAtEnd(b, bsg);
     LLVMValueRef blp = LLVMBuildStructGEP2(b, c->ent_ty, be, 2, "lp");
@@ -816,6 +950,33 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
             return -1;
         }
     }
+    /* Deflate the payloads that gain from it (skins/icons/pinyin arrive as
+     * multi-hundred-KB plaintext otherwise) and mark them via the len sign
+     * bit; the emitted read API decodes lazily on first hit. */
+    unsigned char *compressed = (unsigned char *)calloc(
+        (size_t)(files.n > 0 ? files.n : 1), 1);
+    if (!compressed) {
+        for (int f = 0; f < files.n; f++) {
+            free(files.v[f].name);
+            free(files.v[f].data);
+        }
+        free(files.v);
+        return -1;
+    }
+    int any_compressed = 0;
+    for (int i = 0; i < files.n; i++) {
+        long long clen = 0;
+        unsigned char *cbuf = embed_maybe_compress(files.v[i].data,
+                                                   files.v[i].len, &clen);
+        if (!cbuf) continue;
+        free(files.v[i].data);
+        files.v[i].data = cbuf;
+        files.v[i].len = clen;
+        compressed[i] = 1;
+        any_compressed = 1;
+    }
+    /* link zan_inflate.o (zan_embed_decode) only when a payload compressed */
+    if (any_compressed) g->uses_inflate = true;
     LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef fields[] = { i8p, i8p, i64 };
@@ -840,6 +1001,7 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
              * remaining entry (name + data) or a ≥4 GiB resource aborts with
              * the whole list still held. */
             free(ents);
+            free(compressed);
             for (int f = 0; f < files.n; f++) {
                 free(files.v[f].name);
                 free(files.v[f].data);
@@ -847,8 +1009,9 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
             free(files.v);
             return -1;
         }
-        LLVMValueRef vals[] = { name, data,
-            LLVMConstInt(i64, (unsigned long long)files.v[i].len, 0) };
+        unsigned long long lval = (unsigned long long)files.v[i].len;
+        if (compressed[i]) lval |= ZAN_EMBED_COMPRESSED;
+        LLVMValueRef vals[] = { name, data, LLVMConstInt(i64, lval, 0) };
         ents[i] = LLVMConstNamedStruct(ent_ty, vals, 3);
     }
     LLVMValueRef nulls[] = { LLVMConstNull(i8p), LLVMConstNull(i8p),
@@ -866,7 +1029,8 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
         LLVMSetInitializer(tbl,
             LLVMConstArray(ent_ty, ents, (unsigned)files.n + 1));
         LLVMSetLinkage(tbl, LLVMPrivateLinkage);
-        LLVMSetGlobalConstant(tbl, 1);
+        /* NOT constant: zan.embed.unzip patches compressed slots in place on
+         * first read, so repeat reads see the decoded payload. */
         LLVMValueRef zero = LLVMConstInt(i64, 0, 0);
         LLVMValueRef idx[] = { zero, zero };
         tbl0 = LLVMConstInBoundsGEP2(tbl_ty, tbl, idx, 2);
@@ -900,7 +1064,9 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
 
     embed_emit_register(g, &c);
     LLVMValueRef find = embed_emit_find(g, &c);
-    embed_emit_read_has_bytes(g, &c, find);
+    LLVMValueRef unzip = any_compressed ? embed_emit_unzip(g, &c)
+                                        : embed_emit_passthrough(g, &c);
+    embed_emit_read_has_bytes(g, &c, find, unzip);
     embed_emit_list(g, &c);
 
     /* The API is defined right here, so the shipped zan_embed_api object must
@@ -914,5 +1080,6 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
         free(files.v[i].data);
     }
     free(files.v);
+    free(compressed);
     return n;
 }

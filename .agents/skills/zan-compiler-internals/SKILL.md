@@ -2124,3 +2124,34 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   ——仲裁者只能是 OpenSSL/发布向量这类外部实现。另外经
   `wsl.exe bash -c "<heredoc>"` 内联喂脚本有被引号损坏的风险，一律写成
   文件再执行。
+
+## 嵌入资源压缩侧接线：LLVM GEP 槽误读、ARC tag 契约与空表直通替身（2026-09-27）
+
+`--embed` 资源 ≥512B 且省 ≥8B 时烘焙 raw-deflate（`[u32 raw_len][u32 comp_len][deflate]`），
+len 置符号位为旗标，读 API 惰性解码并原位修补表槽（表不可 LLVMSetGlobalConstant）。
+接线当天踩出的三个真坑，全有汇编级实锤：
+
+- **LLVMBuildLoad2(GEP 槽) 载入的是字段槽自身的字节，不是它指向的内存**：
+  `dp = StructGEP(e,1)` 是 &entry.data；`BuildLoad2(b, i32, dp)` 生成
+  `load i32, ptr %dp`＝读出旧指针的低 32 位（汇编 `movl 0x8(%rsi),%ecx`，
+  对比解引用应为 `mov (%rdx),%ecx`）。要读 payload[0] 必须**先 load 出指
+  针、再对指针二次 load**。实测症状：entry.len 被写成 2.3 GB，落盘副本爆
+  量失败——而 zan_embed_read 反而"正常"（见下条），不对照 bytes 路径根本
+  看不出来。
+- **跨运行时边界的长度带 ARC tag 位**：`zan_embed_decode(payload, len)`
+  契约是 len 为 ARC 数组头尺寸（`0x4000000000000000` 位有效，decode 自己
+  剥 tag 取字节数）。编译器侧裸传长度直接 NULL——且 read 路径会**假性通
+  过**：decode 失败 → 槽未修补/len 恰为正 → raw 分支返回已修补 data。修
+  法：`(len & 0x7FFF…) | TAG`，LLVM 会把 and+or 折叠成一条 bextr。
+- **uses_embed_api-only（空表）程序不得引用 zan_embed_decode**：程序仅
+  声明 embed API（stdlib File.zan 即然）时也走 emit 路径但零资源；unzip
+  无条件声明 decode extern → undefined reference，而 uses_inflate 仍为
+  false 不会链 zan_inflate.obj。生成器嵌套构建（`--auto-stdlib --no-gen`）
+  当场炸链。修法：真压缩过才发 unzip，否则发同签名 passthrough（只 load
+  entry.data），`uses_inflate` 只在确有压缩时置位。
+- **验证纪律：磁盘回退会吞掉嵌入路径的全部回归**。File.ReadAllText 磁盘
+  优先、找不到才回退嵌入副本——探针若在有 assets 的目录里跑，read 全走磁
+  盘，压缩链路坏了也全绿。必须把 exe 复制到**不含资产的净目录**运行；另
+  断言 exe 里资源**内容**明文零命中（资源**名**如 `skins/base/skin.css`
+  是查找键，明文属设计）。字符数≠字节数：UTF-8 资产用 Python 写入时
+  `len(str)` 是字符数，golden 长度断言要按字节重算。
