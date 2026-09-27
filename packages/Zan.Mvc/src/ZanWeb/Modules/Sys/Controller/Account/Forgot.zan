@@ -1,0 +1,90 @@
+using System;
+using System.Data.Orm;
+using System.Security.Cryptography;
+using System.Web;
+using ZanWeb.Core;
+using ZanWeb.Dao;
+using ZanWeb.Model;
+using ZanWeb.Security;
+using ZanWeb.Services;
+using ZanWeb.Web;
+
+namespace ZanWeb.Account;
+
+/* 找回密码（/forgot）：与注册共用同一卡片外壳与发码通道（Register 的
+   static Page/SendCode，先例同 Login 的共享 static），独立成类是因为
+   屏即类——/forgot 路由曾声明在 Register 里，找找回密码的人不会想到去
+   注册类翻代码。流程开关（auth.reset.enabled）关闭时以重定向登录页作
+   答；重设成功同时升 tokenVersion，使旧密码开启的会话整体失效。 */
+[Route("[controller]/[action]")]
+[Custom(Authorization = CustomAuthorization.None)]
+[Description("找回密码")]
+class Forgot : AppController {
+    static string Tpl = "Account.Forgot.Index";
+
+    [HttpGet]
+    [Route("/forgot")]
+    [Description("找回密码")]
+    async void Index() {
+        if (!await Settings.On(SettingKeys.ResetEnabled, true)) {
+            this.Ctx().Redirect(Routes.SignIn);
+            return;
+        }
+        this.ViewOf(Forgot.Tpl, await Register.Page("找回密码", "", "", "", this.In("email")));
+    }
+
+    [HttpPost]
+    [Route("/forgot")]
+    [Description("重设密码")]
+    async void Submit() {
+        if (!await Settings.On(SettingKeys.ResetEnabled, true)) {
+            this.Ctx().Redirect(Routes.SignIn);
+            return;
+        }
+        string email = this.In("email");
+        string pass = this.In("pass");
+        string code = this.In("code");
+        if (pass.Length < 8) {
+            this.ViewOf(Forgot.Tpl, await Register.Page("找回密码", "新密码至少 8 位", "", "", email));
+            return;
+        }
+        if (!await VerifyCode.Accept("reset", email, code)) {
+            this.ViewOf(Forgot.Tpl,
+                await Register.Page("找回密码", "验证码不正确或已过期", "", "", email));
+            return;
+        }
+
+        if (!this.DbReady()) {
+            this.ViewOf(Forgot.Tpl,
+                await Register.Page("找回密码", "数据库不可用，请稍后再试", "", "", email));
+            return;
+        }
+        bool done = false;
+        SysUserDao userDao = new SysUserDao(this);
+        SysUser u = await userDao.ByEmail(email);
+        if (u != null) {
+            int id = u.id;
+            /* 改密码须同时让旧密码开启的会话失效，否则找回的账号仍处于共享状态。 */
+            int n = await userDao.ResetPassword(id, "", AuthUser.NewHash(pass),
+                u.tokenVersion + 1, WebApp.NowSeconds());
+            done = n > 0;
+        }
+        if (!done) {
+            this.ViewOf(Forgot.Tpl,
+                await Register.Page("找回密码", "该邮箱没有对应的账号", "", "", email));
+            return;
+        }
+        this.ViewOf(Forgot.Tpl,
+            await Register.Page("找回密码", "", "密码已重设，请用新密码登录", "", ""));
+    }
+
+    [HttpPost]
+    [Route("/forgot/code")]
+    [Description("发送找回密码验证码")]
+    async void Code() {
+        if (!await Settings.On(SettingKeys.ResetEnabled, true)) {
+            this.Fail(403, "0403", "找回密码未开放");
+        }
+        await Register.SendCode(this, "reset", this.In("email"), "重设密码验证码");
+    }
+}

@@ -97,6 +97,15 @@ URL 族：`Controller/Admin/Content/Categories.zan` ↔ `ZanWeb.Admin.Content` �
 HTTP 仍是 200，页面渲染成 `<!-- view not found -->` 注释，冒烟只看
 状态码是假绿（本轮踩过：key 改了、views 资产目录没跟着挪）。
 
+**屏 slug 与类名同构**：URL 末段（屏 slug）= 类名去 `Sys` 前缀小写
+（`SysUsers`→`users`）；模块自名屏类名 = 目录名（`Admin/Media/Media.zan`
+↔ `/admin/media`）。类名同时锚定文件名与视图文件名——改一处必须四处
+（文件、类、视图资产、引用）同一提交搬完。不同构时**改类名就 URL**：
+URL 是对外契约且 adminUI JS 硬编码引用（`wwwroot/js/admin.js`）；
+URL 本身错置的（assistant 曾挂 `admin/dev/ai`）才 URL+JS 同提交改。
+屏类不得与共享服务类重名——语言层简单名只一个赢家，`Ai` 服务类被
+多个控制器以 `Ai.` 简名调用，助手屏叫 `Assistant` 就是在让位。
+
 ### Controller/ 纯净与端点纪律
 
 `Controller/` 路径下**只允许控制器类**（成员资格看继承链，不变式 3），

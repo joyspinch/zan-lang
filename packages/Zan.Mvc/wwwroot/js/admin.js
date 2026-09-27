@@ -359,7 +359,7 @@
       if (!url || !url.value.trim()) { Layer.msg('请先填写接口地址'); return; }
       btn.disabled = true;
       btn.textContent = '获取中…';
-      fetch('/admin/dev/ai/models', {
+      fetch('/admin/dev/assistant/models', {
         method: 'POST', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams({ baseUrl: url.value.trim(),
@@ -2217,7 +2217,7 @@
         Layer.confirm('确认执行下面的建表语句？\n\n' + sql, function () {
           btn.disabled = true;
           btn.textContent = '执行中…';
-          fetch('/admin/dev/ai/apply', {
+          fetch('/admin/dev/assistant/apply', {
             method: 'POST', credentials: 'same-origin',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
             body: new URLSearchParams({ sql: sql, confirm: '1' }).toString()
@@ -2261,7 +2261,7 @@
       for (var i = 0; i < msgs.length - 1; i++) {
         history.push({ role: msgs[i].who === 'me' ? 'user' : 'assistant', content: msgs[i].text });
       }
-      // The answer is streamed: /admin/dev/ai/stream replies with a
+      // The answer is streamed: /admin/dev/assistant/stream replies with a
       // text/event-stream and the bubble grows as the deltas land, so the
       // operator sees the model writing instead of a spinner. The stream is
       // read with fetch (not EventSource) because the request is a POST that
@@ -2282,7 +2282,7 @@
         persist();
         renderLog();
       }
-      fetch('/admin/dev/ai/stream', {
+      fetch('/admin/dev/assistant/stream', {
         method: 'POST', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: body
@@ -2290,7 +2290,7 @@
         if (!r.body || !r.body.getReader) {
           // No streaming in this browser: the non-streaming endpoint answers
           // the same conversation in one shot.
-          return fetch('/admin/dev/ai/chat', {
+          return fetch('/admin/dev/assistant/chat', {
             method: 'POST', credentials: 'same-origin',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
             body: body
@@ -2363,7 +2363,7 @@
     function hide() { if (state.dock) { state.dock.classList.remove('on'); } }
 
     function refresh() {
-      return fetch('/admin/dev/ai/state', { credentials: 'same-origin' })
+      return fetch('/admin/dev/assistant/state', { credentials: 'same-origin' })
         .then(function (r) { return r.json(); })
         .then(function (j) {
           if (j && j.code === '0000' && j.data) {
