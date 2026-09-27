@@ -26,18 +26,26 @@ Capabilities advertised on `initialize`:
 | Signature help                   | `textDocument/signatureHelp`    |
 | Go to definition                 | `textDocument/definition`       |
 | Find references                  | `textDocument/references`       |
-| Rename                           | `textDocument/rename`           |
+| Rename (with prepare)            | `textDocument/rename`, `textDocument/prepareRename` |
+| Document highlight               | `textDocument/documentHighlight` |
+| Folding ranges                   | `textDocument/foldingRange`     |
+| Formatting                       | `textDocument/formatting`, `textDocument/rangeFormatting` |
 | Workspace symbols                | `workspace/symbol`              |
 | Document symbols (outline)       | `textDocument/documentSymbol`   |
 | Code actions / quick fixes       | `textDocument/codeAction`       |
 | Commands                         | `workspace/executeCommand`      |
 
-Not yet implemented: semantic tokens, inlay hints, incremental document sync.
-
-Diagnostics are produced by running the real compiler front-end
-(lexer → parser → binder → checker) and mapping each `zan_diag_t` entry to an
-LSP `Diagnostic` with a severity and range. Completion understands both a bare
-identifier prefix and `Type.member` context (trigger character `.`).
+Diagnostics run the real compiler front-end (lexer → parser → binder →
+checker) and map each `zan_diag_t` entry to an LSP `Diagnostic` whose range
+covers the whole flagged token (identifiers extend, punctuation stays one
+character). Folding ranges come from a brace scan that ignores braces inside
+strings and comments; formatting mirrors `zanfmt` semantics (4-space indents,
+trailing-whitespace trim, blank-line collapse) with the same string/comment
+awareness — `rangeFormatting` edits only the leading whitespace of lines in
+range, so it never touches untouched lines. Rename/references are
+text-based (whole-word), not binder-backed: they cannot see scope. Not yet
+implemented: semantic tokens, inlay hints, incremental document sync,
+binder-backed rename/references.
 
 ### VS Code client stub
 

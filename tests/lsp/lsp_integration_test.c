@@ -241,6 +241,202 @@ static json_value *mk_text_document(void) {
     return td;
 }
 
+/* --------- extended capability checks (formatting/highlight/fold) ------- */
+
+/* Second document with an intentional syntax error on line 1 (the compiler
+ * accepts unknown symbols in field initializers, so the error must be a
+ * parser one: "int q = ;" fails at 1-based 2:13, i.e. 0-based line 1 char 12
+ * with the ';' as a one-character token range). */
+#define BAD_URI "file:///lsp_diag_range_test.zan"
+static const char *BAD_DOC =
+    "class P {\n"
+    "    int q = ;\n"
+    "}\n";
+
+static int ext_fails = 0;
+
+static void ext_check(bool cond, const char *msg) {
+    printf("%s: %s\n", cond ? "PASS" : "FAIL", msg);
+    if (!cond) ext_fails++;
+}
+
+/* Build one request message with the given id/method/params. */
+static json_value *mk_request(int id, const char *method, json_value *params) {
+    json_value *msg = json_new_obj();
+    json_obj_set(msg, "jsonrpc", json_new_str("2.0"));
+    json_obj_set(msg, "id", json_new_num(id));
+    json_obj_set(msg, "method", json_new_str(method));
+    json_obj_set(msg, "params", params);
+    return msg;
+}
+
+/* Does an array-valued JSON fragment (raw text) contain a folding range
+ * start->end? Parsed with the shared json parser on a synthesized object. */
+static bool fold_contains(const char *body, int s0, int e0) {
+    char pat[96];
+    snprintf(pat, sizeof(pat), "\"startLine\":%d,\"endLine\":%d", s0, e0);
+    return strstr(body, pat) != NULL;
+}
+
+static int run_extended_checks(child_t *child) {
+    /* open the intentionally-broken second document: didOpen publishes its
+     * diagnostics synchronously */
+    {
+        json_value *td = json_new_obj();
+        json_obj_set(td, "uri", json_new_str(BAD_URI));
+        json_obj_set(td, "languageId", json_new_str("zan"));
+        json_obj_set(td, "version", json_new_num(1));
+        json_obj_set(td, "text", json_new_str(BAD_DOC));
+        json_value *params = json_new_obj();
+        json_obj_set(params, "textDocument", td);
+        send_message(child, mk_request(-1, "textDocument/didOpen", params));
+    }
+
+    /* foldingRange (id 10) */
+    {
+        json_value *td = json_new_obj();
+        json_obj_set(td, "uri", json_new_str(TEST_URI));
+        json_value *params = json_new_obj();
+        json_obj_set(params, "textDocument", td);
+        send_message(child, mk_request(10, "textDocument/foldingRange", params));
+    }
+    /* documentHighlight on Helper (id 11) */
+    {
+        json_value *td = json_new_obj();
+        json_obj_set(td, "uri", json_new_str(TEST_URI));
+        json_value *pos = json_new_obj();
+        json_obj_set(pos, "line", json_new_num(4));
+        json_obj_set(pos, "character", json_new_num(39));
+        json_value *params = json_new_obj();
+        json_obj_set(params, "textDocument", td);
+        json_obj_set(params, "position", pos);
+        send_message(child, mk_request(11, "textDocument/documentHighlight", params));
+    }
+    /* prepareRename on Helper (id 12) */
+    {
+        json_value *td = json_new_obj();
+        json_obj_set(td, "uri", json_new_str(TEST_URI));
+        json_value *pos = json_new_obj();
+        json_obj_set(pos, "line", json_new_num(4));
+        json_obj_set(pos, "character", json_new_num(39));
+        json_value *params = json_new_obj();
+        json_obj_set(params, "textDocument", td);
+        json_obj_set(params, "position", pos);
+        send_message(child, mk_request(12, "textDocument/prepareRename", params));
+    }
+    /* formatting (id 13) and rangeFormatting over already-clean lines (id 14) */
+    {
+        json_value *td = json_new_obj();
+        json_obj_set(td, "uri", json_new_str(TEST_URI));
+        json_value *params = json_new_obj();
+        json_obj_set(params, "textDocument", td);
+        json_value *opts = json_new_obj();
+        json_obj_set(params, "options", opts);
+        send_message(child, mk_request(13, "textDocument/formatting", params));
+    }
+    {
+        json_value *td = json_new_obj();
+        json_obj_set(td, "uri", json_new_str(TEST_URI));
+        json_value *rg = json_new_obj();
+        json_value *s = json_new_obj();
+        json_obj_set(s, "line", json_new_num(4));
+        json_obj_set(s, "character", json_new_num(0));
+        json_value *e = json_new_obj();
+        json_obj_set(e, "line", json_new_num(6));
+        json_obj_set(e, "character", json_new_num(0));
+        json_obj_set(rg, "start", s);
+        json_obj_set(rg, "end", e);
+        json_value *params = json_new_obj();
+        json_obj_set(params, "textDocument", td);
+        json_obj_set(params, "range", rg);
+        json_obj_set(params, "options", json_new_obj());
+        send_message(child, mk_request(14, "textDocument/rangeFormatting", params));
+    }
+
+    /* drain: collect the five responses and the second doc's diagnostics */
+    char *r[6] = {0};       /* by id: 10..14 */
+    char *diag_bad = NULL;  /* publishDiagnostics for BAD_URI */
+    for (int i = 0; i < 300 && ext_fails == 0; i++) {
+        char buf[131072];
+        if (!lsp_recv(child, buf, sizeof(buf))) break;
+        if (strstr(buf, "\"textDocument/publishDiagnostics\"") && strstr(buf, BAD_URI)) {
+            free(diag_bad);
+            diag_bad = strdup(buf);
+        }
+        json_value *root = json_parse(buf);
+        if (!root) continue;
+        long id = (long)json_get_num(json_obj_get(root, "id"), -1);
+        json_free(root);
+        if (id >= 10 && id <= 14) {
+            free(r[id - 10]);
+            r[id - 10] = strdup(buf);
+        }
+        bool done = r[0] && r[1] && r[2] && r[3] && r[4];
+        if (done && diag_bad) break;
+    }
+
+    /* foldingRange: class block and Main's block, same-line Helper braces excluded */
+    if (r[0]) {
+        ext_check(fold_contains(r[0], 1, 6), "foldingRange: class block 1..6");
+        ext_check(fold_contains(r[0], 3, 5), "foldingRange: Main block 3..5");
+        ext_check(strstr(r[0], "\"startLine\":2,") == NULL,
+                  "foldingRange: same-line braces produce no range");
+    } else {
+        ext_check(false, "foldingRange: no response");
+    }
+
+    /* documentHighlight: every whole-word occurrence of Helper */
+    if (r[1]) {
+        int hits = 0;
+        for (const char *p = r[1]; (p = strstr(p, "\"kind\":1")) != NULL; p++) hits++;
+        ext_check(hits >= 2, "documentHighlight: >= 2 occurrences highlighted");
+    } else {
+        ext_check(false, "documentHighlight: no response");
+    }
+
+    /* prepareRename: exact word range + placeholder */
+    if (r[2]) {
+        ext_check(strstr(r[2], "\"placeholder\":\"Helper\"") != NULL,
+                  "prepareRename: placeholder is Helper");
+        ext_check(strstr(r[2], "\"character\":39") != NULL,
+                  "prepareRename: range starts at UTF-16 col 39");
+    } else {
+        ext_check(false, "prepareRename: no response");
+    }
+
+    /* formatting: already-clean document comes back unchanged in one edit */
+    if (r[3]) {
+        ext_check(strstr(r[3], "\"newText\":\"using System;\\nclass Program {\\n") != NULL,
+                  "formatting: stable on formatted input");
+    } else {
+        ext_check(false, "formatting: no response");
+    }
+
+    /* rangeFormatting over clean lines: zero edits (idempotence) */
+    if (r[4]) {
+        ext_check(strstr(r[4], "\"result\":[]") != NULL,
+                  "rangeFormatting: no spurious edits on clean lines");
+    } else {
+        ext_check(false, "rangeFormatting: no response");
+    }
+
+    /* diagnostics: the broken expression is flagged with its real extent
+     * (';' at 0-based char 12, one character wide) */
+    if (diag_bad) {
+        ext_check(strstr(diag_bad, "\"start\":{\"line\":1,\"character\":12}") != NULL,
+                  "diagnostics: error reported at line 1 char 12");
+        ext_check(strstr(diag_bad, "\"end\":{\"line\":1,\"character\":13}") != NULL,
+                  "diagnostics: token range covers ';' (12..13)");
+    } else {
+        ext_check(false, "diagnostics: none published for the broken doc");
+    }
+
+    for (int i = 0; i < 5; i++) free(r[i]);
+    free(diag_bad);
+    printf("\n%d extended failure(s)\n", ext_fails);
+    return ext_fails ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: lsp_integration_test <zan-lsp>\n");
@@ -300,9 +496,9 @@ int main(int argc, char **argv) {
     }
 
     char *def = recv_until_id(&child, 3);
-    child_close(&child);
     if (!def) {
         fprintf(stderr, "FAIL: no definition response\n");
+        child_close(&child);
         return 1;
     }
 
@@ -311,6 +507,7 @@ int main(int argc, char **argv) {
     json_free(def);
     if (!root) {
         fprintf(stderr, "FAIL: unparseable definition response\n");
+        child_close(&child);
         return 1;
     }
 
@@ -321,6 +518,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "FAIL: definition came back null (wrong position "
                         "encoding? expected a Location at line 2 col 31)\n");
         json_free(root);
+        child_close(&child);
         return 1;
     }
 
@@ -339,5 +537,10 @@ int main(int argc, char **argv) {
     }
 
     json_free(root);
+
+    if (rc == 0)
+        rc = run_extended_checks(&child);
+
+    child_close(&child);
     return rc;
 }

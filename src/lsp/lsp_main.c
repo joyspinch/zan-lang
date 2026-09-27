@@ -355,9 +355,27 @@ static size_t pos_to_offset(const char *text, int line, int character) {
     return off;
 }
 
+/* Start of the given 0-based line (walks to the line's first byte). */
+static const char *line_start_at(const char *text, int line0) {
+    const char *ls = text;
+    int ln = 0;
+    while (ln < line0 && *ls) {
+        if (*ls == '\n') ln++;
+        ls++;
+    }
+    return ls;
+}
+
 static bool is_ident_char(char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
            (c >= '0' && c <= '9') || c == '_';
+}
+
+/* Length in bytes of the identifier starting at `s` (0 when none). */
+static int ident_len_at(const char *s) {
+    int n = 0;
+    while (is_ident_char(s[n])) n++;
+    return n;
 }
 
 /* Extract the identifier that spans byte `offset` (cursor may sit anywhere
@@ -702,6 +720,22 @@ static void publish_diagnostics(lsp_server_t *s, const char *uri, const char *te
          * units, so convert (a diagnostic on a line with non-ASCII text before
          * it would otherwise land on the wrong character). */
         int col  = byte_col_to_utf16_char(text, line, (int)e->loc.col);
+        /* Underline the whole token when the diagnostic lands on an
+         * identifier, not just its first character. */
+        int end_char = col + 1;
+        {
+            const char *ls = line_start_at(text, line);
+            const char *le = strchr(ls, '\n');
+            if (!le) le = ls + strlen(ls);
+            int skip = (int)e->loc.col - 1;
+            if (skip < 0) skip = 0;
+            if (ls + skip > le) skip = (int)(le - ls);
+            const char *tok = ls + skip;
+            int tlen = ident_len_at(tok);
+            if (tok + tlen > le) tlen = (int)(le - tok);
+            if (tlen > 0)
+                end_char = utf16_units_range(ls, tok + tlen);
+        }
 
         json_value *d = json_new_obj();
         json_value *range = json_new_obj();
@@ -710,7 +744,7 @@ static void publish_diagnostics(lsp_server_t *s, const char *uri, const char *te
         json_obj_set(start, "line", json_new_num(line));
         json_obj_set(start, "character", json_new_num(col));
         json_obj_set(endp, "line", json_new_num(line));
-        json_obj_set(endp, "character", json_new_num(col + 1));
+        json_obj_set(endp, "character", json_new_num(end_char));
         json_obj_set(range, "start", start);
         json_obj_set(range, "end", endp);
         json_obj_set(d, "range", range);
@@ -854,8 +888,16 @@ static void handle_initialize(lsp_server_t *s, json_value *id, json_value *param
     json_obj_set(caps, "definitionProvider", json_new_bool(true));
     json_obj_set(caps, "referencesProvider", json_new_bool(true));
     json_obj_set(caps, "documentSymbolProvider", json_new_bool(true));
-    json_obj_set(caps, "renameProvider", json_new_bool(true));
     json_obj_set(caps, "workspaceSymbolProvider", json_new_bool(true));
+    /* rename goes through prepareRename first, so clients can validate the
+     * target word before sending the edit */
+    json_value *rename = json_new_obj();
+    json_obj_set(rename, "prepareProvider", json_new_bool(true));
+    json_obj_set(caps, "renameProvider", rename);
+    json_obj_set(caps, "documentHighlightProvider", json_new_bool(true));
+    json_obj_set(caps, "foldingRangeProvider", json_new_bool(true));
+    json_obj_set(caps, "documentFormattingProvider", json_new_bool(true));
+    json_obj_set(caps, "documentRangeFormattingProvider", json_new_bool(true));
 
     /* Code actions (organize usings, etc.) */
     json_value *code_action = json_new_obj();
@@ -1772,6 +1814,356 @@ static void handle_rename(lsp_server_t *s, json_value *id, json_value *params) {
     send_response(s, id, we);
 }
 
+/* ============================ formatting ============================= */
+
+/* The same line-based formatter semantics as the zanfmt tool: 4 spaces per
+ * brace level, a line whose first character is '}' drops one level before
+ * emitting, a line whose last character is '{' bumps the level after,
+ * trailing whitespace stripped, blank runs collapsed to one, final newline.
+ * Unlike zanfmt the brace detection here is string/comment aware — a '{'
+ * inside a literal or a trailing // comment no longer shifts the indent.
+ * Both stay line-based: nothing inside a line is ever re-spaced. */
+
+typedef struct {
+    bool in_str;    /* inside a "..." literal (carries over lines) */
+    bool in_block;  /* inside a block comment (carries over lines) */
+} fmt_scan_t;
+
+typedef struct {
+    int  level;            /* indent level for this line */
+    int  lead;             /* original leading whitespace, in bytes */
+    const char *content;   /* leading/trailing whitespace stripped */
+    int  content_len;
+    bool blank;
+} fmt_line_t;
+
+typedef struct { char *buf; size_t len, cap; } txtbuf_t;
+
+static bool txtbuf_put(txtbuf_t *b, const char *s, size_t n) {
+    if (b->len + n + 1 > b->cap) {
+        size_t nc = b->cap ? b->cap * 2 : 8192;
+        while (nc < b->len + n + 1) nc *= 2;
+        char *nb = (char *)realloc(b->buf, nc);
+        if (!nb) return false;
+        b->buf = nb;
+        b->cap = nc;
+    }
+    memcpy(b->buf + b->len, s, n);
+    b->len += n;
+    b->buf[b->len] = '\0';
+    return true;
+}
+
+static bool txtbuf_spaces(txtbuf_t *b, int n) {
+    static const char pad[32] = "                                ";
+    while (n > 0) {
+        int k = n < 32 ? n : 32;
+        if (!txtbuf_put(b, pad, (size_t)k)) return false;
+        n -= k;
+    }
+    return true;
+}
+
+/* Scan the document into per-line records, tracking the brace depth. The
+ * string/block-comment state lives in `st` and carries across lines, so a
+ * caller can resume. Returns a malloc'd array of *out_count records, NULL on
+ * OOM. */
+static fmt_line_t *fmt_scan(const char *text, int *out_count, fmt_scan_t *st) {
+    int nlines = 1;
+    for (const char *p = text; *p; p++)
+        if (*p == '\n') nlines++;
+    fmt_line_t *lines = (fmt_line_t *)malloc(sizeof(fmt_line_t) * (size_t)nlines);
+    if (!lines) return NULL;
+
+    int depth = 0;
+    const char *p = text;
+    int count = 0;
+    while (*p) {
+        fmt_line_t *L = &lines[count++];
+        L->lead = 0;
+        while (*p == ' ' || *p == '\t') { L->lead++; p++; }
+        const char *cs = p;
+        const char *le = strchr(p, '\n');
+        if (!le) le = p + strlen(p);
+        const char *ce = le;
+        while (ce > cs && (ce[-1] == ' ' || ce[-1] == '\t' || ce[-1] == '\r')) ce--;
+        L->content = cs;
+        L->content_len = (int)(ce - cs);
+        L->blank = L->content_len == 0;
+
+        /* does the trimmed line end with a '{' that is outside strings and
+         * comments? (a '}' at the line start never needs this check) */
+        bool ends_open = false;
+        for (const char *q = cs; q < ce; ) {
+            char c = *q;
+            if (st->in_block) {
+                if (c == '*' && q + 1 < ce && q[1] == '/') { st->in_block = false; q += 2; }
+                else q++;
+                continue;
+            }
+            if (st->in_str) {
+                if (c == '\\') { q += 2; continue; }
+                if (c == '"') st->in_str = false;
+                q++;
+                continue;
+            }
+            if (c == '"') { st->in_str = true; q++; continue; }
+            if (c == '/' && q + 1 < ce && q[1] == '/') break; /* line comment */
+            if (c == '/' && q + 1 < ce && q[1] == '*') { st->in_block = true; q += 2; continue; }
+            ends_open = (c == '{');
+            q++;
+        }
+
+        if (!L->blank && L->content[0] == '}') {
+            depth--;
+            if (depth < 0) depth = 0;
+        }
+        L->level = depth;
+        if (ends_open) depth++;
+
+        p = (*le == '\n') ? le + 1 : le;
+    }
+    *out_count = count;
+    return lines;
+}
+
+/* Whole-document formatting: one TextEdit replacing everything. */
+static void handle_formatting(lsp_server_t *s, json_value *id, json_value *params) {
+    json_value *td = json_obj_get(params, "textDocument");
+    const char *uri = json_get_str(json_obj_get(td, "uri"));
+    lsp_doc_t *doc = uri ? lsp_find_doc(s, uri) : NULL;
+    json_value *result = json_new_arr();
+    if (doc && doc->text && doc->text[0]) {
+        fmt_scan_t st = {false, false};
+        int count = 0;
+        fmt_line_t *lines = fmt_scan(doc->text, &count, &st);
+        if (lines) {
+            txtbuf_t out = {0};
+            bool ok = true;
+            int blanks = 0;
+            for (int i = 0; i < count && ok; i++) {
+                fmt_line_t *L = &lines[i];
+                if (L->blank) {
+                    blanks++;
+                    if (blanks <= 1) ok = txtbuf_put(&out, "\n", 1);
+                    continue;
+                }
+                blanks = 0;
+                ok = txtbuf_spaces(&out, L->level * 4) &&
+                     txtbuf_put(&out, L->content, (size_t)L->content_len) &&
+                     txtbuf_put(&out, "\n", 1);
+            }
+            if (ok && out.len > 0) {
+                int el, ec;
+                offset_to_linecol(doc->text, (int)strlen(doc->text), &el, &ec);
+                json_value *edit = json_new_obj();
+                json_value *range = json_new_obj();
+                json_value *start = json_new_obj();
+                json_value *endp = json_new_obj();
+                json_obj_set(start, "line", json_new_num(0));
+                json_obj_set(start, "character", json_new_num(0));
+                json_obj_set(endp, "line", json_new_num(el));
+                json_obj_set(endp, "character", json_new_num(ec));
+                json_obj_set(range, "start", start);
+                json_obj_set(range, "end", endp);
+                json_obj_set(edit, "range", range);
+                json_obj_set(edit, "newText", json_new_str(out.buf));
+                json_arr_add(result, edit);
+            }
+            free(out.buf);
+            free(lines);
+        }
+    }
+    send_response(s, id, result);
+}
+
+/* Range formatting: re-indent only the touched lines (blank-run collapsing is
+ * deliberately left out — it would reach outside the requested range). */
+static void handle_range_formatting(lsp_server_t *s, json_value *id, json_value *params) {
+    json_value *td = json_obj_get(params, "textDocument");
+    const char *uri = json_get_str(json_obj_get(td, "uri"));
+    lsp_doc_t *doc = uri ? lsp_find_doc(s, uri) : NULL;
+    json_value *result = json_new_arr();
+    if (doc && doc->text && doc->text[0]) {
+        json_value *rg = json_obj_get(params, "range");
+        int l0 = (int)json_get_num(json_obj_get(json_obj_get(rg, "start"), "line"), 0);
+        int l1 = (int)json_get_num(json_obj_get(json_obj_get(rg, "end"), "line"), l0);
+        if (l1 < l0) { int t = l0; l0 = l1; l1 = t; }
+
+        fmt_scan_t st = {false, false};
+        int count = 0;
+        fmt_line_t *lines = fmt_scan(doc->text, &count, &st);
+        if (lines) {
+            if (l1 > count - 1) l1 = count - 1;
+            for (int i = l0; i <= l1; i++) {
+                fmt_line_t *L = &lines[i];
+                if (L->blank) continue;
+                int want = L->level * 4;
+                if (want == L->lead) continue; /* already indented right */
+                json_value *edit = json_new_obj();
+                json_value *range = json_new_obj();
+                json_value *start = json_new_obj();
+                json_value *endp = json_new_obj();
+                json_obj_set(start, "line", json_new_num(i));
+                json_obj_set(start, "character", json_new_num(0));
+                json_obj_set(endp, "line", json_new_num(i));
+                /* leading whitespace is ASCII: bytes == UTF-16 units */
+                json_obj_set(endp, "character", json_new_num(L->lead));
+                json_obj_set(range, "start", start);
+                json_obj_set(range, "end", endp);
+                json_obj_set(edit, "range", range);
+                char pad[128];
+                int nsp = want < 120 ? want : 120;
+                memset(pad, ' ', (size_t)nsp);
+                pad[nsp] = '\0';
+                json_obj_set(edit, "newText", json_new_str(pad));
+                json_arr_add(result, edit);
+            }
+            free(lines);
+        }
+    }
+    send_response(s, id, result);
+}
+
+/* =================== documentHighlight / folding ===================== */
+
+static void handle_document_highlight(lsp_server_t *s, json_value *id, json_value *params) {
+    const char *uri;
+    int line, character;
+    json_value *result = json_new_arr();
+    if (get_position(params, &uri, &line, &character)) {
+        lsp_doc_t *doc = lsp_find_doc(s, uri);
+        if (doc) {
+            size_t off = pos_to_offset(doc->text, line, character);
+            char word[128];
+            word_at(doc->text, off, word, sizeof(word));
+            if (word[0]) {
+                size_t offs[512];
+                int n = find_text_references(doc->text, word, offs, 512);
+                for (int i = 0; i < n; i++) {
+                    int rl, rc;
+                    offset_to_linecol(doc->text, (int)offs[i], &rl, &rc);
+                    json_value *hl = json_new_obj();
+                    json_value *range = json_new_obj();
+                    json_value *start = json_new_obj();
+                    json_value *endp = json_new_obj();
+                    json_obj_set(start, "line", json_new_num(rl));
+                    json_obj_set(start, "character", json_new_num(rc));
+                    json_obj_set(endp, "line", json_new_num(rl));
+                    json_obj_set(endp, "character", json_new_num(rc + (int)strlen(word)));
+                    json_obj_set(range, "start", start);
+                    json_obj_set(range, "end", endp);
+                    json_obj_set(hl, "range", range);
+                    json_obj_set(hl, "kind", json_new_num(1)); /* Text */
+                    json_arr_add(result, hl);
+                }
+            }
+        }
+    }
+    send_response(s, id, result);
+}
+
+/* Brace pairs outside strings/comments become folding ranges; the closing
+ * line stays visible (endLine = line of '}' minus one). */
+static void handle_folding_range(lsp_server_t *s, json_value *id, json_value *params) {
+    json_value *td = json_obj_get(params, "textDocument");
+    const char *uri = json_get_str(json_obj_get(td, "uri"));
+    lsp_doc_t *doc = uri ? lsp_find_doc(s, uri) : NULL;
+    json_value *result = json_new_arr();
+    if (doc && doc->text) {
+        fmt_scan_t st = {false, false};
+        int starts[1024];
+        int sp = 0;
+        const char *p = doc->text;
+        int line = 0;
+        while (*p) {
+            const char *le = strchr(p, '\n');
+            if (!le) le = p + strlen(p);
+            for (const char *q = p; q < le; ) {
+                char c = *q;
+                if (st.in_block) {
+                    if (c == '*' && q + 1 < le && q[1] == '/') { st.in_block = false; q += 2; }
+                    else q++;
+                    continue;
+                }
+                if (st.in_str) {
+                    if (c == '\\') { q += 2; continue; }
+                    if (c == '"') st.in_str = false;
+                    q++;
+                    continue;
+                }
+                if (c == '"') { st.in_str = true; q++; continue; }
+                if (c == '/' && q + 1 < le && q[1] == '/') break;
+                if (c == '/' && q + 1 < le && q[1] == '*') { st.in_block = true; q += 2; continue; }
+                if (c == '{') {
+                    if (sp < (int)(sizeof(starts) / sizeof(starts[0]))) starts[sp] = line;
+                    if (sp < (int)(sizeof(starts) / sizeof(starts[0]))) sp++;
+                } else if (c == '}') {
+                    if (sp > 0) {
+                        sp--;
+                        int s0 = starts[sp];
+                        if (line - 1 > s0) {
+                            json_value *fr = json_new_obj();
+                            json_obj_set(fr, "startLine", json_new_num(s0));
+                            json_obj_set(fr, "endLine", json_new_num(line - 1));
+                            json_arr_add(result, fr);
+                        }
+                    }
+                }
+                q++;
+            }
+            if (*le == '\n') { line++; p = le + 1; }
+            else break;
+        }
+    }
+    send_response(s, id, result);
+}
+
+/* ========================== prepareRename ============================ */
+
+/* Prepare gives clients the exact range to rename plus a placeholder, and a
+ * null reply for positions that hold no word (the actual rename stays a
+ * textual whole-word edit until the binder's scopes back it). */
+static void handle_prepare_rename(lsp_server_t *s, json_value *id, json_value *params) {
+    const char *uri;
+    int line, character;
+    if (!get_position(params, &uri, &line, &character)) {
+        send_response(s, id, json_new_null());
+        return;
+    }
+    lsp_doc_t *doc = lsp_find_doc(s, uri);
+    if (!doc) { send_response(s, id, json_new_null()); return; }
+
+    size_t off = pos_to_offset(doc->text, line, character);
+    size_t start = off;
+    while (start > 0 && is_ident_char(doc->text[start - 1])) start--;
+    size_t end = off;
+    while (doc->text[end] && is_ident_char(doc->text[end])) end++;
+    if (end == start) { send_response(s, id, json_new_null()); return; }
+
+    int rl, rc;
+    offset_to_linecol(doc->text, (int)start, &rl, &rc);
+    char word[128];
+    size_t n = end - start;
+    if (n >= sizeof(word)) n = sizeof(word) - 1;
+    memcpy(word, doc->text + start, n);
+    word[n] = '\0';
+
+    json_value *result = json_new_obj();
+    json_value *range = json_new_obj();
+    json_value *startp = json_new_obj();
+    json_value *endp = json_new_obj();
+    json_obj_set(startp, "line", json_new_num(rl));
+    json_obj_set(startp, "character", json_new_num(rc));
+    json_obj_set(endp, "line", json_new_num(rl));
+    json_obj_set(endp, "character", json_new_num(rc + (int)n));
+    json_obj_set(range, "start", startp);
+    json_obj_set(range, "end", endp);
+    json_obj_set(result, "range", range);
+    json_obj_set(result, "placeholder", json_new_str(word));
+    send_response(s, id, result);
+}
+
 /* Case-insensitive substring match (workspace/symbol query filter). */
 static bool name_matches_query(const char *name, const char *query) {
     if (!query || !query[0]) return true;
@@ -2193,6 +2585,16 @@ static void dispatch(lsp_server_t *s, json_value *msg) {
         handle_document_symbol(s, id, params);
     } else if (strcmp(method, "textDocument/rename") == 0) {
         handle_rename(s, id, params);
+    } else if (strcmp(method, "textDocument/prepareRename") == 0) {
+        handle_prepare_rename(s, id, params);
+    } else if (strcmp(method, "textDocument/documentHighlight") == 0) {
+        handle_document_highlight(s, id, params);
+    } else if (strcmp(method, "textDocument/foldingRange") == 0) {
+        handle_folding_range(s, id, params);
+    } else if (strcmp(method, "textDocument/formatting") == 0) {
+        handle_formatting(s, id, params);
+    } else if (strcmp(method, "textDocument/rangeFormatting") == 0) {
+        handle_range_formatting(s, id, params);
     } else if (strcmp(method, "workspace/symbol") == 0) {
         handle_workspace_symbol(s, id, params);
     } else if (strcmp(method, "textDocument/codeAction") == 0) {

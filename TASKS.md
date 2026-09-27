@@ -62,3 +62,40 @@
   编写 `scripts/build_linux_gui_static.sh`（支持 x64/arm64，单 TU 编译 gui_runtime.c 并提取
   系统 libX11.a/libXau.a/libxcb.a 静态库合并封装），并在 `.github/workflows/drivers.yml` 的
   linux 构建流水线中挂接该步骤与产物回填。
+
+---
+
+## 2026-09-27 IDE/LSP/DAP 假实现清账（IDE · 设计器 · 代码编辑器审计）
+
+审计 src/ide_zan 与 zan-lsp/zan-dap：可当场修的已闭账，大件立账如下。
+
+- [x] **B-ID1** zan-dap 三假声明：pause / hit-count / logpoint 只在 initialize
+  能力里宣告、请求到达后不实现。已修（提交 589e6183，2026-09-27）：pause 真
+  打断运行中 inferior（Windows DebugBreakProcess 注入断入线程后按 .zan 栈挑
+  线程，POSIX SIGINT；单线程适配器用 wait-hook 在等 gdb 输出的空窗消费客户端
+  pause）；hitCondition `==K`/`>=K` 映射 gdb `-break-after`（`%K` 明确拒绝不
+  假装支持）；logpoint 命中时插值 `{expr}` 打 output 并自动续跑。集成测试
+  tests/dap/dap_integration_test.c 四场景（basic/hitcount/logpoint/pause，
+  燃烧目标 tests/dap/dbgtarget_burn.zan），ctest dap_integration 绿。
+- [x] **B-ID2** zan-lsp 五个硬缺口一次补齐（2026-09-27）：formatting /
+  rangeFormatting（zanfmt 同语义 + 字符串/注释感知；range 只改行首空白）、
+  documentHighlight、foldingRange（花括号扫描，串/注释感知）、prepareRename
+  （renameProvider 升级为 {prepareProvider}）、publishDiagnostics 范围从 1 字符
+  扩到整 token（标识符延展、标点 1 字符）。lsp_integration_test 扩展 9 项断言
+  全绿；能力清单见 docs/TOOLING.md。
+- [ ] **B-ID3** rename/references 是整词文本匹配，非 binder 支撑：跨作用域会
+  误伤同名符号。需把 intellisense 符号表接入 rename/references 做作用域感知。
+- [ ] **B-ID4** semanticTokens / inlay hints 未实现。
+- [ ] **B-ID5** intellisense 每次补全 ~2MB malloc、全量重建符号表；大文档补全
+  卡顿，需增量更新与复用。
+- [ ] **B-ID6** zan-lsp 诊断在 worker 线程但请求处理单线程串行：前端跑诊断时
+  跳转/补全排队，需请求级并发或 $/cancelRequest。
+- [ ] **B-ID7** 设计器三条构建路径（IDE 内预览 / 直接运行 / --publish）行为
+  不一致；控件事件缺 sender 参数，事件处理无法区分来源控件。
+- [ ] **B-ID8** 六个控件的属性表为空，属性面板只覆盖常用控件子集。
+- [ ] **B-ID9** IDE 代码编辑器没有折叠 UI——LSP foldingRange 已就绪，前端未接。
+- [ ] **B-ID10** git 面板只有 add/commit/push/pull，缺 branch/merge/stash。
+- [ ] **B-ID11** IDE 无 UI e2e 验证闭环（截图锚定 + 探针断言未自动化），回归
+  靠手测。
+- [ ] **B-ID12** IDE「新建项目」模板无 capabilities= 维度（GUI/网络/加密等
+  预勾选缺失）。
