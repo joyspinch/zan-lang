@@ -2,7 +2,7 @@ using System;
 using Gui;
 using Gui.Widget;
 
-/// GIT 面板：仓库状态 + 暂存 / 提交 / 同步。
+/// GIT 面板：仓库状态 + 暂存 / 提交 / 同步 / 分支（建、切、并）/ 贮藏。
 ///
 /// 界面在 `GitPanel.html` 里声明：分支行、两排命令按钮、变更文件
 /// 列表、底部的提交信息行；空仓库时只显示提示和「初始化仓库」。
@@ -27,9 +27,17 @@ partial class GitPanel {
         this.LogBtn.SetProp("text", ZanIDE.T("History", "历史"));
         this.PullBtn.SetProp("text", ZanIDE.T("Pull", "拉取"));
         this.PushBtn.SetProp("text", ZanIDE.T("Push", "推送"));
+        this.BranchNewBtn.SetProp("text", ZanIDE.T("Branch", "建分支"));
+        this.BranchSwitchBtn.SetProp("text", ZanIDE.T("Switch", "切换"));
+        this.MergeBtn.SetProp("text", ZanIDE.T("Merge", "合并"));
+        this.StashBtn.SetProp("text", ZanIDE.T("Stash", "贮藏"));
+        this.StashPopBtn.SetProp("text", ZanIDE.T("Unstash", "弹出"));
+        this.StashListBtn.SetProp("text", ZanIDE.T("Stash list", "贮藏列表"));
         this.CommitBtn.SetProp("text", ZanIDE.T("Commit", "提交"));
         this.Message.SetProp("placeholder",
             ZanIDE.T("Commit message...", "提交信息..."));
+        this.BranchName.SetProp("placeholder",
+            ZanIDE.T("Branch name...", "分支名..."));
     }
 
     /// 把设计里的 `onClick` 名字接到本面板的处理器上。
@@ -43,6 +51,12 @@ partial class GitPanel {
         form.On("gitLog", GitPanel.OnHistory);
         form.On("gitPull", GitPanel.OnPull);
         form.On("gitPush", GitPanel.OnPush);
+        form.On("gitBranchNew", GitPanel.OnBranchNew);
+        form.On("gitBranchSwitch", GitPanel.OnBranchSwitch);
+        form.On("gitMerge", GitPanel.OnMerge);
+        form.On("gitStash", GitPanel.OnStash);
+        form.On("gitStashPop", GitPanel.OnStashPop);
+        form.On("gitStashList", GitPanel.OnStashList);
         form.On("gitCommit", GitPanel.OnCommit);
     }
 
@@ -65,6 +79,7 @@ partial class GitPanel {
         this.Branch.SetShown(repo);
         this.Row1.SetShown(repo);
         this.Row2.SetShown(repo);
+        this.BranchRow.SetShown(repo);
         this.CommitRow.SetShown(repo);
         this.Files.SetShown(repo);
         if (repo) {
@@ -219,6 +234,103 @@ partial class GitPanel {
         if (ide.gitJob == 0) {
             ide.log.Add("> git push ...");
             ZanIDE.GitBegin(ide.root, "push");
+            ide.gitJob = 2;
+        }
+        ide.dock.Focus("output");
+    }
+
+    /// 分支行输入框里的名字（去掉首尾空白）。
+    static string BranchInput(ZanIDE ide) {
+        if (ide == null || ide.gitPanel == null) { return ""; }
+        return ide.gitPanel.BranchName.GetText().Trim();
+    }
+
+    /// 建分支：`checkout -b <名>`，建好即切过去。
+    static void OnBranchNew() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null) { return; }
+        string name = GitPanel.BranchInput(ide);
+        if (name == "") {
+            ide.log.Add(ZanIDE.T("> Enter a branch name first.",
+                "> 请先输入分支名。"));
+        } else if (ide.gitJob == 0) {
+            name = ZanIDE.GitEscape(name);
+            ZanIDE.GitBegin(ide.root, "checkout -b \"" + name + "\"");
+            ide.gitJob = 2;
+            ide.log.Add("> git checkout -b \"" + name + "\" ...");
+            ide.gitPanel.BranchName.SetText("");
+        }
+        ide.dock.Focus("output");
+    }
+
+    /// 切分支：`checkout <名>`（不用 `switch`，它要求 git ≥ 2.23）；
+    /// 名字不存在时 git 的报错原样回显。
+    static void OnBranchSwitch() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null) { return; }
+        string name = GitPanel.BranchInput(ide);
+        if (name == "") {
+            ide.log.Add(ZanIDE.T("> Enter a branch name first.",
+                "> 请先输入分支名。"));
+        } else if (ide.gitJob == 0) {
+            name = ZanIDE.GitEscape(name);
+            ZanIDE.GitBegin(ide.root, "checkout \"" + name + "\"");
+            ide.gitJob = 2;
+            ide.log.Add("> git checkout \"" + name + "\" ...");
+            ide.gitPanel.BranchName.SetText("");
+        }
+        ide.dock.Focus("output");
+    }
+
+    /// 合并：把输入框里的分支并进当前分支。
+    static void OnMerge() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null) { return; }
+        string name = GitPanel.BranchInput(ide);
+        if (name == "") {
+            ide.log.Add(ZanIDE.T("> Enter a branch name to merge first.",
+                "> 请先输入要合并的分支名。"));
+        } else if (ide.gitJob == 0) {
+            name = ZanIDE.GitEscape(name);
+            ZanIDE.GitBegin(ide.root, "merge \"" + name + "\"");
+            ide.gitJob = 2;
+            ide.log.Add("> git merge \"" + name + "\" ...");
+            ide.gitPanel.BranchName.SetText("");
+        }
+        ide.dock.Focus("output");
+    }
+
+    /// 贮藏：把工作区改动收进 stash，工作区恢复干净。
+    static void OnStash() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null) { return; }
+        if (ide.gitJob == 0) {
+            ide.log.Add("> git stash ...");
+            ZanIDE.GitBegin(ide.root, "stash");
+            ide.gitJob = 2;
+        }
+        ide.dock.Focus("output");
+    }
+
+    /// 弹出最近一次贮藏。
+    static void OnStashPop() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null) { return; }
+        if (ide.gitJob == 0) {
+            ide.log.Add("> git stash pop ...");
+            ZanIDE.GitBegin(ide.root, "stash pop");
+            ide.gitJob = 2;
+        }
+        ide.dock.Focus("output");
+    }
+
+    /// 贮藏列表：列出所有 stash 供 pop 前确认。
+    static void OnStashList() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null) { return; }
+        if (ide.gitJob == 0) {
+            ide.log.Add("> git stash list ...");
+            ZanIDE.GitBegin(ide.root, "stash list");
             ide.gitJob = 2;
         }
         ide.dock.Focus("output");
