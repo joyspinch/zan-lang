@@ -10,32 +10,12 @@ using ZanWeb.Web;
 
 namespace ZanWeb.Account;
 
-/* 管理员登录屏：与 POST /api/auth/login 发出同一 cookie（AuthUser.Login → AuthToken.Issue），浏览器会话与 API 令牌为同一机制；此处不关心密码如何加盐或令牌如何签名。独立模块以取得独立外壳（Account/layout.html 为居中卡片，非管理后台外壳——尚未可用的页面放侧边栏是噪声）。两动作都答 /admin/login（GET 渲染，POST 校验），失败重渲染 GET 视图，理由就在用户正看的页面上。 */
+/* 登录屏（前台 /login）：与 POST /api/auth/login 发出同一 cookie（AuthUser.Login → AuthToken.Issue），浏览器会话与 API 令牌为同一机制；此处不关心密码如何加盐或令牌如何签名。独立模块以取得独立外壳（Account/layout.html 为居中卡片，非管理后台外壳——尚未可用的页面放侧边栏是噪声）。管理台端点 /admin/login 与 /admin/logout 的声明区在 Admin/Login.zan（URL 区籍：admin 前缀端点只能由 Admin 区声明），校验流 Attempt 在本类 static 共享、两壳复用，失败重渲染卡片，理由就在用户正看的页面上。 */
 [Route("[controller]/[action]")]
 [Custom(Authorization = CustomAuthorization.None)]
 [Description("登录")]
 class Login : AppController {
     static string Tpl = "Account.Login.Index";
-
-    [HttpGet]
-    [Route("/admin/login")]
-    [Description("登录")]
-    async void Index() {
-        if (this.IsLogin()) {
-            this.Ctx().Redirect(Routes.Admin);
-            return;
-        }
-        string site = await Settings.Get(SettingKeys.SiteTitle, "ZanWeb");
-        this.ViewOf(Login.Tpl, await Login.Form(site, "", this.In("user"),
-            "/admin/login", "管理后台", true, false));
-    }
-
-    [HttpPost]
-    [Route("/admin/login")]
-    [Description("登录提交")]
-    async void Submit() {
-        await this.Attempt("/admin/login", "管理后台", true, false, "/admin");
-    }
 
     /* 前台登录：同一机制与卡片，自有外壳与目的地——普通成员回站点首页（/），而非一个可能无权进入的管理后台。 */
     [HttpGet]
@@ -55,22 +35,22 @@ class Login : AppController {
     [Route("/login")]
     [Description("登录提交")]
     async void FrontSubmit() {
-        await this.Attempt("/login", "登录", false, true, "/");
+        await Login.Attempt(this, "/login", "登录", false, true, "/");
     }
 
-    /* 两张卡片共用一条登录路径：action/heading/demo/home 只塑造重渲的表单，redirectTo 是成功后的去向；失败重渲同卡片，理由留在用户正看的页面上。 */
-    async void Attempt(string action, string heading, bool demo, bool home,
-                       string redirectTo) {
+    /* 两张卡片共用一条登录路径：action/heading/demo/home 只塑造重渲的表单，redirectTo 是成功后的去向；失败重渲同卡片，理由留在用户正看的页面上。static 供 Admin/Login.zan 薄壳转发（/admin/login 的声明区在 Admin 区）。 */
+    static async void Attempt(AppController c, string action, string heading,
+                              bool demo, bool home, string redirectTo) {
         string site = await Settings.Get(SettingKeys.SiteTitle, "ZanWeb");
-        string user = this.In("user");
-        string pass = this.In("pass");
+        string user = c.In("user");
+        string pass = c.In("pass");
         if (user.Length == 0 || pass.Length == 0) {
-            this.ViewOf(Login.Tpl, await Login.Form(site, "请输入账号和密码",
+            c.ViewOf(Login.Tpl, await Login.Form(site, "请输入账号和密码",
                 user, action, heading, demo, home));
             return;
         }
         if (user.Length > 32 || pass.Length > 64) {
-            this.ViewOf(Login.Tpl, await Login.Form(site, "账号或密码超出长度限制",
+            c.ViewOf(Login.Tpl, await Login.Form(site, "账号或密码超出长度限制",
                 "", action, heading, demo, home));
             return;
         }
@@ -81,34 +61,26 @@ class Login : AppController {
         if (token.Length == 0) {
             string reason = LoginThrottle.Blocked(user)
                 ? "尝试过于频繁，请稍后再试" : "账号或密码不正确";
-            await this.Record(this.Ctx(), user, false, reason);
+            await Login.Record(c, c.Ctx(), user, false, reason);
             if (!AuthToken.Ready()) {
-                this.ViewOf(Login.Tpl, await Login.Form(site,
+                c.ViewOf(Login.Tpl, await Login.Form(site,
                     "服务端未配置会话密钥：请在 config/app.json 的 [auth].secret（或环境变量 ZAN_AUTH_SECRET）填入至少 32 字符",
                     user, action, heading, demo, home));
                 return;
             }
-            this.ViewOf(Login.Tpl, await Login.Form(site, reason,
+            c.ViewOf(Login.Tpl, await Login.Form(site, reason,
                 user, action, heading, demo, home));
             return;
         }
-        await this.Record(this.Ctx(), user, true, "");
-        this.Ctx().SetCookie("zsession", token, 864000);
-        this.Ctx().Redirect(redirectTo);
+        await Login.Record(c, c.Ctx(), user, true, "");
+        c.Ctx().SetCookie("zsession", token, 864000);
+        c.Ctx().Redirect(redirectTo);
     }
 
-    [HttpGet]
-    [Route("/admin/logout")]
-    [Description("退出登录")]
-    void Out() {
-        /* 让 cookie 过期足以使本浏览器失效；使所有已发令牌整体失效的是 SysUserDao.BumpTokenVersion。 */
-        this.Ctx().SetCookie("zsession", "", 0);
-        this.Ctx().Redirect(Routes.Login);
-    }
-
-    /* 每次尝试都入 sys_login_log，失败也记：猜测密码的记录只在失败留存时才可追溯。 */
-    async void Record(HttpContext ctx, string user, bool ok, string message) {
-        if (!this.DbReady()) { return; }
+    /* 每次尝试都入 sys_login_log，失败也记：猜测密码的记录只在失败留存时才可追溯。static 供两壳复用。 */
+    static async void Record(AppController c, HttpContext ctx, string user,
+                             bool ok, string message) {
+        if (c.__Conn() == null) { return; }
         SysLoginLog row = new SysLoginLog();
         row.userId = 0;
         row.username = user;
@@ -118,7 +90,7 @@ class Login : AppController {
         if (ok) { row.ok = 1; }
         row.message = message;
         row.createdAt = WebApp.NowSeconds();
-        int _id = await new SysLoginLogDao(this).Insert(row);
+        int _id = await new SysLoginLogDao(c).Insert(row);
     }
 
     static ViewData Page(string site, string error, string user) {

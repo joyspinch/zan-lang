@@ -115,6 +115,27 @@ HTTP 仍是 200，页面渲染成 `<!-- view not found -->` 注释，冒烟只�
 前台博客、API 文档与演示口）。匿名面必须逐动作复核——公开控制器里
 新增动作不标档即匿名。
 
+### 路由区籍
+
+URL 首段决定动作的声明区：`/admin/*` 只能声明在 `Controller/Admin/`
+下的控制器（ns `ZanWeb.Admin`），`/api/*` 只能在 `Api/`，`/login` 等
+前台端点在各自区。会话机制可以跨区共享（`Account.Login` 的 static
+`Attempt`/`Record` 供 `Admin/Login` 薄壳转发），**URL 不行**——曾因
+`/admin/logout` 声明在 Account 区控制器被判为维护性事故：找 /admin
+端点的人按目录找，不会想到去 Account 里翻。
+
+### 数据库降级与投影样板
+
+- 屏面动作的降级出口是 `PageReady(d)`（置 dbDown 徽章渲染本屏）、数据
+  动作是 `DataReady()`（答 503）——动作内禁止再手写 DbReady 三行样板，
+  dbDown 的呈现只住在 AdminController。
+- 模板按名绑定、值恒为字符串（ViewData/List&lt;StrMap&gt; 契约，Zan 编译期
+  静态、无运行时按名字段访问），查出的实体必须投影成行才能进模板。
+  投影统一走 `Rows.Of&lt;T&gt;(rows, delegate(T c, StrMap row) { … }, items)`
+  （Framework/Rows），字段格式化（Fmt.*）与行内徽章（canXxx）在委托内
+  完成——for/索引/Add 样板不再出现在控制器里。"查出实体直接进模板"
+  需要编译期字段表 + 引擎按名取值，属引擎演进项，当前不做手工绕道。
+
 ### 呈现格式化一律 Fmt.*
 
 状态→文案/徽章样式只住在 `Framework/Fmt`（`Published*` 发布态、
