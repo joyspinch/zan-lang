@@ -282,53 +282,66 @@ DAO）解析请求连接，控制器内部不用它。（为什么：五个口�
 大多数管理屏只有"一张表的增删改查"：`Modules/Crud` 把这一层做成引擎——
 子类写一份 `CrudConf` 声明 + 约三十行属性壳，即得到列表、表单、保存、
 删除、批量启停/删除、行内修改、表格配置（adminUI conf 契约）、远程选项
-（data-pick 契约）八个端点，共享一份视图。声明即白名单：搜索、保存、
-行内修改只收声明过的列名，值一律占位符参数，审计与权限位与手写屏同一
-机制。`ZanWeb.Admin.Content.Categories` 是完整的示范屏（配置 + 三个钩子）。
+（data-pick 契约）等端点，共享一份视图。声明即白名单：搜索、保存、行内
+修改只收声明过的列名，值一律占位符参数，审计与权限位与手写屏同一机制。
+现网跑在引擎上的屏：`Categories`（示范屏）、`Comments`（审核=状态列的
+Opts+Inline 行内修改，文章列是 OnRows 投影的虚拟列，零自写端点）、
+`Jobs`（执行/历史/清空三个特有动作按动词表豁免，JobHost 镜像重读全走
+写后钩子）。`Gen` 生成的新屏同样落在引擎上。仍手写的屏各有引擎外语义：
+`Users`（超管/本人零容忍守卫）、`Dicts`/`Departments`（双资源与树）、
+`Roles`（权限矩阵）、`Media`（上传）、`Posts`（表单侧动态选项是引擎
+缺口，`Pick` 支持表单选项后即可迁移——挂账）。
 
 ```zan
-[Route("admin/shop/goods/[action]")]
+[Route("admin/content/comments/[action]")]
 [Custom(Authorization = CustomAuthorization.Grant)]
-[Description("商品管理")]
-class Goods : CrudScreenController {
+class CommentsController : CrudScreenController {
     override CrudConf Def() {
-        return CrudConf.Of("shop_goods", "商品管理", "admin/shop/goods")
-            .Col("id", "ID", "num", "70px")
-            .Col("name", "名称", "text", "")
-            .Tag("status", "状态", "1=上架|ok,0=下架|off", "90px")
-            .Text("名称", "kw", "name", "搜索名称")
-            .TbarAdd("新增商品").TbarEnable().TbarDisable()
-            .OpsEdit().OpsDel("确认删除该商品吗？")
-            .EditFields("name:text,price:int,stock:int,status:int")
-            .Inline("stock:int,status:int")          /* 行内只放行库存与状态 */
-            .Unique("name", "商品名已存在")
-            .FormText("名称", "name").Req().Max(64)
-            .FormText("价格", "price").Req()
-            .Created("createdAt").Updated("updatedAt")
-            .Label("name").Toggle("status")
-            .Order("id", true);
+        return CrudConf.Of("blog_comment", "评论管理", "admin/content/comments")
+            .Order("id", true).Label("author")
+
+            .Col("id", "ID").Int().W("70px").Ro()
+            .Col("post", "文章").V().W("240px")      /* 虚拟列：OnRows 投影 */
+            .Col("author", "作者").W("110px").Max(32)
+            .Col("content", "内容").Area().Max(500)
+            .Col("status", "状态")
+                .Opts("0=待审|muted,1=通过|ok,2=驳回|err")
+                .W("90px").Inline().Search("按状态筛选")
+            .Col("createdAt", "时间").Time().W("150px").Ro()
+
+            .TbarReload().TbarDelete()
+            .OpsDel("删除后不可恢复，确认删除该评论吗？")
+            .Created("createdAt");
     }
-    [HttpGet] [Route("/admin/shop/goods")]
-    [Custom(IsMenu = true, Icon = "mdi:package", Perm = PermBit.View)]
-    [Description("商品管理")]
+    [HttpGet] [Route("/admin/content/comments")]
+    [Custom(IsMenu = true, Icon = "mdi:comment-multiple", Perm = PermBit.View)]
     async void Index() { await this.DoList(); }
-    /* ...其余属性壳同样只转发：Conf/Form/Save/Delete/Batch/Field/Options */
+    /* Conf/ListData/Edit/FormConf/Form/Save/Delete/Batch/Field/Options
+       同为单行转发壳；审核即状态列的行内修改，没有一个自写端点。 */
 }
 ```
 
-超出声明的业务语义经四个钩子注入（按需覆写，不必全写）：
+超出声明的业务语义经七个钩子注入（按需覆写，不必全写）：
 
 | 钩子 | 时机 | 典型用途 |
 |---|---|---|
 | `OnSaving(row, isNew)` | 保存前 | 派生字段、规整化，返回错误文案可拒绝 |
 | `OnDeleting(id)` | 删除前 | 占用检查（如分类下还有文章则拒绝） |
-| `OnRows(rows)` | 列表取数后 | 投影计数列、关联名、衍生徽章 |
-| `OnSaved(isNew)` | 保存后 | 缓存失效、联动重算 |
+| `OnRows(rows)` | 列表取数后 | 投影计数列、关联名、衍生徽章（虚拟列 `.V()`） |
+| `OnSaved(isNew)` | 保存后 | 缓存失效、联动重算、镜像重读 |
+| `OnFielded(field, id)` | 行内写后 | 同上（行内通道） |
+| `OnBatched(field, value, ids)` | 批量启停后 | 同上（批量通道） |
+| `OnDeleted(id)` | 单行删除后 | 子表级联、镜像重读 |
+
+行内/批量写值统一过 `CheckValue`：select 列查选项白名单、int 列查
+Min/Max **数值**界限——`FormField.type` 区分数值与长度语义（int 列的
+Min/Max 是值界限，文本列才是长度，表单渲染分别出 min/max 与
+minlength/maxlength）。声明即约束，不因走行内/批量通道而放宽。
 
 边界约定：`EditFields` 是保存可写的全集，`Inline` 收窄行内/批量启停的
 子集；唯一约束用 `Unique()` 声明（写前检查、排除自身行）；**有子记录的
 表不要声明批量删除**——批量删不过行级占用钩子（Categories 即如此：只有
-行删带占用检查）。
+行删带占用检查；Jobs 的级联在 OnDeleted，因此也不声明批量删）。
 
 ### 与 OneAdmin/adminUI 的对照（借鉴结论）
 

@@ -9,81 +9,102 @@ using ZanWeb.Model.Blog;
 
 namespace ZanWeb.Admin.Content;
 
-/* /admin/content/comments 评论审核：读者评论以 status=0 存储，在此处通过后方可见，开放表单无法自行发布。 */
+/* /admin/content/comments 评论审核——配置驱动屏。读者评论以 status=0
+   存储，通过后方在前台可见；待审/通过/驳回由 status 列的 Opts+Inline
+   声明供给：行内下拉即审核，通过与拒绝是同一写操作、同一权限位。
+   文章列是虚拟列（OnRows 投影），其余全部零编码。 */
 [Route("admin/content/comments/[action]")]
 [Custom(Authorization = CustomAuthorization.Grant)]
 [Description("评论管理")]
-class CommentsController : AdminController {
+class CommentsController : CrudScreenController {
+    protected override CrudConf Def() {
+        return CrudConf.Of("blog_comment", "评论管理", "admin/content/comments")
+            .Order("id", true)
+            .Label("author")
+
+            .Col("id", "ID").Int().W("70px").Ro()
+            .Col("post", "文章").V().W("240px")
+            .Col("author", "作者").W("110px").Max(32)
+            .Col("content", "内容").Area().Max(500)
+            .Col("ip", "IP").W("130px").Ro()
+            .Col("status", "状态").Opts("0=待审|muted,1=通过|ok,2=驳回|err")
+                .W("90px").Def("0").Inline().Search("按状态筛选")
+            .Col("createdAt", "时间").Time().W("150px").Ro()
+
+            .TbarReload()
+            .TbarDelete()
+            .OpsDel("删除后不可恢复，确认删除该评论吗？")
+            .Created("createdAt");
+    }
+
     [HttpGet]
     [Route("/admin/content/comments")]
     [Custom(IsMenu = true, Icon = "mdi:comment-multiple", Perm = PermBit.View)]
     [Description("评论管理")]
-    async void Index() {
-        ViewData d = await this.Layout("评论管理");
-        if (!this.PageReady(d)) { return; }
+    async void Index() { await this.DoList(); }
 
-        ListQuery q = this.Paged("id", 20);
-        int status = this.InInt("status", -1);
-        if (status == 0) { d.Set("statusPending", "selected"); }
-        if (status == 1) { d.Set("statusOk", "selected"); }
-        if (status == 2) { d.Set("statusNo", "selected"); }
+    [HttpPut]
+    [Custom(Perm = PermBit.View)]
+    [Description("评论表格配置")]
+    void Conf() { this.DoConf(); }
 
-        int total = await this.Comment
-            .WhereIf(status >= 0, a => a.status == status).CountAsync();
-        List<Comment> rows = await this.Comment
-            .WhereIf(status >= 0, a => a.status == status)
-            .OrderByDescending(a => a.id)
-            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
-        List<Post> posts = await this.Post.ToListAsync();
+    /* adminUI 数据契约：POST {api}/list 以 JSON {page,pageSize,...筛选}
+       取分页行；方法名带 Data 避开与列表屏路由撞名，显式 Route 归位。 */
+    [HttpPost]
+    [Route("/admin/content/comments/list")]
+    [Custom(Perm = PermBit.View)]
+    [Description("评论数据")]
+    async void ListData() { await this.DoListData(); }
 
-        /* 通过/拒绝为同一写操作、同一权限位；行自身的 status 只决定哪一侧值得提供。 */
-        bool mayReview = await this.Can((int)PermBit.Update);
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("评论行数据")]
+    async void Edit() { await this.DoEdit(); }
 
-        List<StrMap> items = d.AddList("rows");
-        Rows.Project(rows, items);
-        for (int i = 0; i < rows.Count; i = i + 1) {
-            items[i].Set("post",
-                CommentsController.PostTitle(posts, rows[i].postId));
-            if (mayReview && rows[i].status != 1) { items[i].Set("canApprove", "1"); }
-            if (mayReview && rows[i].status != 2) { items[i].Set("canReject", "1"); }
-        }
-        int pending = await this.Comment.Where(a => a.status == 0).CountAsync();
-        d.Set("pending", Convert.ToString(pending));
-        this.Pager(d, q, total);
-        this.Page(d);
-    }
+    [HttpPut]
+    [Custom(Perm = PermBit.View)]
+    [Description("评论表单配置")]
+    void FormConf() { this.DoFormConf(); }
+
+    [HttpGet]
+    [Custom(Perm = PermBit.Update)]
+    [Description("评论表单")]
+    async void Form() { await this.DoForm(); }
 
     [HttpPost]
     [Custom(Perm = PermBit.Update)]
-    [Description("审核评论")]
-    async void Review() {
-        int id = this.InInt("id", 0);
-        int status = this.InInt("status", 1);
-        if (status != 1 && status != 2) { status = 0; }
-        Comment c = await this.Comment.ById(id);
-        if (c == null) { this.Fail(404, "0404", "评论不存在"); }
-        int n = await this.Comment.Update()
-            .Set(a => a.status, status)
-            .Where(a => a.id == id)
-            .ExecuteAffrowsAsync();
-        await this.Note("审核评论",
-            "#" + Convert.ToString(id), n > 0, Fmt.ReviewText(status));
-        if (status == 1) { this.Saved("评论已通过，前台可见"); return; }
-        this.Saved("评论已驳回");
-    }
+    [Description("保存评论")]
+    async void Save() { await this.DoSave(); }
 
     [HttpPost]
     [Custom(Perm = PermBit.Delete)]
     [Description("删除评论")]
-    async void Delete() {
-        int id = this.InInt("id", 0);
-        Comment c = await this.Comment.ById(id);
-        if (c == null) { this.Fail(404, "0404", "评论不存在"); }
-        int n = await this.Comment.Delete().Where(a => a.id == id)
-            .ExecuteAffrowsAsync();
-        await this.Note("删除评论",
-            "#" + Convert.ToString(id), n > 0, "");
-        this.Saved("评论已删除");
+    async void Delete() { await this.DoDelete(); }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("评论批量操作")]
+    async void Batch() { await this.DoBatch(); }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("评论行内修改")]
+    async void Field() { await this.DoField(); }
+
+    [HttpGet]
+    [Custom(Perm = PermBit.View)]
+    [Description("评论选项")]
+    async void Options() { await this.DoOptions(); }
+
+    /* 投影：文章列。每页至多 20 行，整表载入后按 id 匹配即可。 */
+    protected override async List<StrMap> OnRows(List<StrMap> rows) {
+        if (rows.Count == 0) { return rows; }
+        List<Post> posts = await this.Post.ToListAsync();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            int pid = (int)Filter.ToLong(rows[i].Get("postId"), 0);
+            rows[i].Set("post", CommentsController.PostTitle(posts, pid));
+        }
+        return rows;
     }
 
     static string PostTitle(List<Post> posts, int id) {
@@ -92,6 +113,4 @@ class CommentsController : AdminController {
         }
         return "—";
     }
-
-
 }

@@ -247,6 +247,7 @@ class CrudScreenController : AdminController {
         List<int> allowed = new List<int>();
         allowed.Add(id);
         await CrudOps.Delete(this, lp, allowed, conf.title + "·删除");
+        await this.OnDeleted(id);
     }
 
     /* 批量：value 为空 → 批量删除；否则写 toggleField（批量启停等
@@ -262,7 +263,10 @@ class CrudScreenController : AdminController {
             await CrudOps.Delete(this, lp, ids, conf.title + "·批量删除");
             return;
         }
+        string bad = this.CheckValue(conf, conf.toggleField, value);
+        if (bad.Length > 0) { this.Fail(400, "0004", bad); }
         await CrudOps.Batch(this, lp, conf.toggleField, value, ids, conf.title + "·批量");
+        await this.OnBatched(conf.toggleField, value, ids);
     }
 
     /* 行内单字段修改：field 必须在行内白名单内，行必须存在。 */
@@ -287,9 +291,12 @@ class CrudScreenController : AdminController {
         ListPage lp = conf.Build(true);
         DbResult r = await DbTable.Of(this.Held(), conf.table).ReadAsync("id", id);
         if (r == null || r.RowCount() == 0) { this.Fail(404, "0404", "记录不存在"); }
+        string bad = this.CheckValue(conf, field, value);
+        if (bad.Length > 0) { this.Fail(400, "0004", bad); }
         List<int> allowed = new List<int>();
         allowed.Add(id);
         await CrudOps.Field(this, lp, conf.title, field, value, allowed);
+        await this.OnFielded(field, id);
     }
 
     /* 选项端点（data-pick 契约）：?id= 单条回显、?kw= 文案包含匹配，
@@ -343,6 +350,56 @@ class CrudScreenController : AdminController {
 
     /* 保存后副作用（缓存失效、联动重算）。 */
     virtual async Task OnSaved(bool isNew) { }
+
+    /* 行内单字段写后副作用（镜像重读、公开缓存失效）。 */
+    virtual async Task OnFielded(string field, long id) { }
+
+    /* 批量启停写后副作用（OnFielded 的批量版；批量删除是表级清选，
+       不逐行走 OnDeleted——有子记录的表不应声明批量删）。 */
+    virtual async Task OnBatched(string field, string value, List<int> ids) { }
+
+    /* 单行删除后副作用（子表级联、镜像重读；占用检查在 OnDeleting）。 */
+    protected virtual async Task OnDeleted(long id) { }
+
+    /* 行内/批量写值校验：select 列查选项白名单，int 列查 Min/Max 界限
+       ——声明即约束，不因走行内/批量通道而绕过表单同款的界限。 */
+    string CheckValue(CrudConf conf, string field, string value) {
+        for (int i = 0; i < conf.forms.Count; i = i + 1) {
+            FormField f = conf.forms[i];
+            if (f.name != field) { continue; }
+            if (f.kind == "select" && f.options.Length > 0) {
+                string rest = f.options;
+                while (rest.Length > 0) {
+                    string one = rest;
+                    int comma = rest.IndexOf(",");
+                    if (comma >= 0) {
+                        one = rest.Substring(0, comma);
+                        rest = rest.Substring(comma + 1);
+                    } else { rest = ""; }
+                    int eq = one.IndexOf("=");
+                    if ((eq > 0 ? one.Substring(0, eq) : one) == value) {
+                        return "";
+                    }
+                }
+                return "值不在可选项内";
+            }
+            if (f.type == "int") {
+                long n = Filter.ToLong(value, 0);
+                if (f.min > 0 && n < f.min) {
+                    return "不能小于 " + Convert.ToString(f.min);
+                }
+                if (f.max > 0 && n > f.max) {
+                    return "不能大于 " + Convert.ToString(f.max);
+                }
+                return "";
+            }
+            if (f.max > 0 && value.Length > f.max) {
+                return "不能超过 " + Convert.ToString(f.max) + " 个字符";
+            }
+            return "";
+        }
+        return "";
+    }
 
     /* ---- 内部 ---------------------------------------------------- */
 
