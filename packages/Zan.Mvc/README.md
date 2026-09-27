@@ -122,7 +122,10 @@ URL 首段决定动作的声明区：`/admin/*` 只能声明在 `Controller/Admi
 前台端点在各自区。会话机制可以跨区共享（`Account.Login` 的 static
 `Attempt`/`Record` 供 `Admin/Login` 薄壳转发），**URL 不行**——曾因
 `/admin/logout` 声明在 Account 区控制器被判为维护性事故：找 /admin
-端点的人按目录找，不会想到去 Account 里翻。
+端点的人按目录找，不会想到去 Account 里翻。类约定路由
+（`api/[controller]/[action]`）之外的**绝对 Route 覆盖同受区籍约束**：
+无区前缀的根 URL（如曾经的 `[Route("/upload")]` 挂在 Api 区）属于越界
+声明，一律删覆盖、落回类约定归位——根路径是前台区的地盘。
 
 ### 数据库降级与投影样板
 
