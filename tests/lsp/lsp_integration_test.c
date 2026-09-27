@@ -564,6 +564,66 @@ static int run_scope_checks(child_t *child) {
     return ext_fails ? 1 : 0;
 }
 
+/* --------- semanticTokens and inlay hints checks (B-ID4) --------- */
+#define HINT_URI "file:///lsp_hint_test.zan"
+static const char *HINT_DOC =
+    "class Greeter {\n"
+    "    static void Hello(string name, int age) {\n"
+    "    }\n"
+    "    static void Run() {\n"
+    "        var x = 100;\n"
+    "        Hello(\"world\", 42);\n"
+    "    }\n"
+    "}\n";
+
+static int run_semantic_and_hint_checks(child_t *child) {
+    /* open HINT_DOC */
+    {
+        json_value *td = json_new_obj();
+        json_obj_set(td, "uri", json_new_str(HINT_URI));
+        json_obj_set(td, "languageId", json_new_str("zan"));
+        json_obj_set(td, "version", json_new_num(1));
+        json_obj_set(td, "text", json_new_str(HINT_DOC));
+        json_value *params = json_new_obj();
+        json_obj_set(params, "textDocument", td);
+        send_message(child, mk_request(-1, "textDocument/didOpen", params));
+    }
+
+    /* textDocument/inlayHint (id 30) */
+    {
+        json_value *td = json_new_obj();
+        json_obj_set(td, "uri", json_new_str(HINT_URI));
+        json_value *params = json_new_obj();
+        json_obj_set(params, "textDocument", td);
+        send_message(child, mk_request(30, "textDocument/inlayHint", params));
+        char *r = recv_until_id(child, 30);
+        ext_check(r && strstr(r, ": int") != NULL,
+                  "inlayHint: inferred type ': int' emitted for var x");
+        ext_check(r && strstr(r, "name:") != NULL && strstr(r, "age:") != NULL,
+                  "inlayHint: parameter names 'name:' and 'age:' emitted for call");
+        free(r);
+    }
+
+    /* textDocument/semanticTokens/full (id 31) */
+    {
+        json_value *td = json_new_obj();
+        json_obj_set(td, "uri", json_new_str(HINT_URI));
+        json_value *params = json_new_obj();
+        json_obj_set(params, "textDocument", td);
+        send_message(child, mk_request(31, "textDocument/semanticTokens/full", params));
+        char *r = recv_until_id(child, 31);
+        ext_check(r && strstr(r, "\"data\":[") != NULL,
+                  "semanticTokens: returned data array");
+        /* ensure data array is non-empty */
+        ext_check(r && strstr(r, "\"data\":[]") == NULL,
+                  "semanticTokens: non-empty token data returned");
+        free(r);
+    }
+
+    printf("\n%d semantic/hint failure(s)\n", ext_fails);
+    return ext_fails ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: lsp_integration_test <zan-lsp>\n");
@@ -670,6 +730,9 @@ int main(int argc, char **argv) {
 
     if (rc == 0)
         rc = run_scope_checks(&child);
+
+    if (rc == 0)
+        rc = run_semantic_and_hint_checks(&child);
 
     child_close(&child);
     return rc;

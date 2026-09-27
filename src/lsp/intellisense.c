@@ -1067,6 +1067,7 @@ void intel_parse_file(intellisense_t *is, const char *filepath,
                         while (peek < end && (isalnum((unsigned char)*peek) || *peek == '_')) peek++;
                         while (peek < end && (*peek == ' ' || *peek == '\t')) peek++;
                         if (peek < end && (*peek == '=' || *peek == ';')) {
+                            bool has_init = (*peek == '=');
                             int vn_len = (int)(peek - vn);
                             /* back up to remove trailing spaces */
                             while (vn_len > 0 && (vn[vn_len-1] == ' ' || vn[vn_len-1] == '\t')) vn_len--;
@@ -1074,6 +1075,40 @@ void intel_parse_file(intellisense_t *is, const char *filepath,
                                 char vname[128];
                                 memcpy(vname, vn, (size_t)vn_len);
                                 vname[vn_len] = '\0';
+
+                                /* If declared as 'var' and initialized, attempt simple type inference */
+                                if (strcmp(vtype, "var") == 0 && has_init) {
+                                    const char *ie = peek + 1;
+                                    while (ie < end && (*ie == ' ' || *ie == '\t')) ie++;
+                                    if (ie < end) {
+                                        if (*ie == '"' || (*ie == '$' && ie + 1 < end && ie[1] == '"')) {
+                                            snprintf(vtype, sizeof(vtype), "string");
+                                        } else if (*ie == '\'') {
+                                            snprintf(vtype, sizeof(vtype), "char");
+                                        } else if (isdigit((unsigned char)*ie)) {
+                                            const char *np = ie;
+                                            bool has_dot = false;
+                                            while (np < end && (isalnum((unsigned char)*np) || *np == '.')) {
+                                                if (*np == '.') has_dot = true;
+                                                np++;
+                                            }
+                                            snprintf(vtype, sizeof(vtype), has_dot ? "double" : "int");
+                                        } else if (strncmp(ie, "true", 4) == 0 || strncmp(ie, "false", 5) == 0) {
+                                            snprintf(vtype, sizeof(vtype), "bool");
+                                        } else if (strncmp(ie, "new ", 4) == 0) {
+                                            const char *nt = ie + 4;
+                                            while (nt < end && (*nt == ' ' || *nt == '\t')) nt++;
+                                            const char *nte = nt;
+                                            while (nte < end && (isalnum((unsigned char)*nte) || *nte == '_' || *nte == '<' || *nte == '>')) nte++;
+                                            int ntl = (int)(nte - nt);
+                                            if (ntl > 0 && ntl < 63) {
+                                                memcpy(vtype, nt, (size_t)ntl);
+                                                vtype[ntl] = '\0';
+                                            }
+                                        }
+                                    }
+                                }
+
                                 add_symbol(is, vname, vtype, current_class, NULL,
                                           filepath, ISYM_VARIABLE, line_num,
                                           (int)(vn - content));
@@ -2470,3 +2505,186 @@ char *intel_organize_usings(intellisense_t *is, const char *content, size_t len,
     *out_len = buf_len;
     return buf;
 }
+
+/* --- Inlay hints collection ---
+ * 1. Type hints for 'var': if variable declaration uses 'var x = ...',
+ *    infer the type and emit ': Type' after the variable name.
+ * 2. Parameter hints for call sites: func(a, b) -> func(param1: a, param2: b). */
+int intel_collect_inlay_hints(intellisense_t *is, const char *content, size_t len,
+                             intel_inlay_hint_t *hints, int max_hints) {
+    if (!content || len == 0 || !hints || max_hints <= 0) return 0;
+    int count = 0;
+
+    /* First pass: emit type hints for 'var' variables recorded in is->symbols */
+    if (is) {
+        for (int i = 0; i < is->symbol_count && count < max_hints; i++) {
+            isym_t *sym = &is->symbols[i];
+            if (sym->kind == ISYM_VARIABLE && sym->type_name[0] &&
+                strcmp(sym->type_name, "var") != 0 && strcmp(sym->type_name, "void") != 0) {
+                /* Find this symbol's line in content */
+                int cur_line = 0;
+                const char *p = content;
+                const char *end = content + len;
+                while (p < end && cur_line < sym->line) {
+                    if (*p == '\n') cur_line++;
+                    p++;
+                }
+                if (p < end && cur_line == sym->line) {
+                    const char *le = p;
+                    while (le < end && *le != '\n') le++;
+                    /* Check if the line has 'var ' */
+                    const char *var_pos = strstr(p, "var ");
+                    if (var_pos && var_pos < le) {
+                        /* Check if sym->name is on this line after var */
+                        const char *name_pos = strstr(var_pos + 4, sym->name);
+                        if (name_pos && name_pos < le) {
+                            /* Found declaration of var <name> */
+                            int col = (int)(name_pos - p) + (int)strlen(sym->name);
+                            intel_inlay_hint_t *h = &hints[count++];
+                            h->line = sym->line;
+                            h->col = col;
+                            h->kind = 1; /* Type hint */
+                            snprintf(h->label, sizeof(h->label), ": %s", sym->type_name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /* Second pass: Parameter hints at call sites */
+    if (is && count < max_hints) {
+        const char *p = content;
+        const char *end = content + len;
+        int line_num = 0;
+        const char *line_start = p;
+
+        while (p < end && count < max_hints) {
+            if (*p == '\n') {
+                line_num++;
+                p++;
+                line_start = p;
+                continue;
+            }
+            if (*p == '"') {
+                p++;
+                while (p < end && *p != '"') {
+                    if (*p == '\\' && p + 1 < end) p++;
+                    if (*p == '\n') { line_num++; line_start = p + 1; }
+                    p++;
+                }
+                if (p < end) p++;
+                continue;
+            }
+            if (*p == '/' && p + 1 < end && p[1] == '/') {
+                while (p < end && *p != '\n') p++;
+                continue;
+            }
+
+            /* Identify potential function call: word followed by '(' */
+            if (isalpha((unsigned char)*p) || *p == '_') {
+                const char *w_start = p;
+                while (p < end && (isalnum((unsigned char)*p) || *p == '_')) p++;
+                int w_len = (int)(p - w_start);
+                char fn_name[128];
+                if (w_len < 127) {
+                    memcpy(fn_name, w_start, (size_t)w_len);
+                    fn_name[w_len] = '\0';
+                } else {
+                    continue;
+                }
+
+                const char *peek = p;
+                while (peek < end && (*peek == ' ' || *peek == '\t')) peek++;
+                if (peek < end && *peek == '(') {
+                    /* Exclude control keywords */
+                    if (strcmp(fn_name, "if") == 0 || strcmp(fn_name, "while") == 0 ||
+                        strcmp(fn_name, "for") == 0 || strcmp(fn_name, "foreach") == 0 ||
+                        strcmp(fn_name, "switch") == 0 || strcmp(fn_name, "catch") == 0) {
+                        p = peek + 1;
+                        continue;
+                    }
+
+                    /* Find method symbol in is->symbols */
+                    isym_t *method_sym = NULL;
+                    for (int s = 0; s < is->symbol_count; s++) {
+                        if (is->symbols[s].kind == ISYM_METHOD &&
+                            strcmp(is->symbols[s].name, fn_name) == 0 &&
+                            is->symbols[s].param_count > 0) {
+                            method_sym = &is->symbols[s];
+                            break;
+                        }
+                    }
+
+                    if (method_sym && method_sym->signature[0]) {
+                        /* Extract parameter names from signature: "...(Type1 name1, Type2 name2)" */
+                        const char *sig_paren = strchr(method_sym->signature, '(');
+                        if (sig_paren) {
+                            sig_paren++;
+                            char pnames[8][64];
+                            int pcount = 0;
+                            const char *sp = sig_paren;
+                            while (*sp && *sp != ')' && pcount < 8) {
+                                while (*sp == ' ' || *sp == '\t') sp++;
+                                if (!*sp || *sp == ')') break;
+                                /* skip type */
+                                while (*sp && *sp != ' ' && *sp != ')' && *sp != ',') sp++;
+                                while (*sp == ' ' || *sp == '\t') sp++;
+                                const char *pn_s = sp;
+                                while (*sp && *sp != ',' && *sp != ')' && *sp != ' ') sp++;
+                                int pnl = (int)(sp - pn_s);
+                                if (pnl > 0 && pnl < 63) {
+                                    memcpy(pnames[pcount], pn_s, (size_t)pnl);
+                                    pnames[pcount][pnl] = '\0';
+                                    pcount++;
+                                }
+                                while (*sp && *sp != ',' && *sp != ')') sp++;
+                                if (*sp == ',') sp++;
+                            }
+
+                            /* Now step through argument expressions in '(' ... ')' */
+                            const char *arg_p = peek + 1;
+                            int arg_idx = 0;
+                            int paren_lvl = 1;
+                            while (arg_p < end && paren_lvl > 0 && arg_idx < pcount && count < max_hints) {
+                                while (arg_p < end && (*arg_p == ' ' || *arg_p == '\t')) arg_p++;
+                                if (arg_p >= end || *arg_p == ')') break;
+
+                                /* Emit inlay hint for parameter arg_idx */
+                                int arg_col = (int)(arg_p - line_start);
+                                intel_inlay_hint_t *h = &hints[count++];
+                                h->line = line_num;
+                                h->col = arg_col;
+                                h->kind = 2; /* Parameter hint */
+                                snprintf(h->label, sizeof(h->label), "%s:", pnames[arg_idx]);
+                                arg_idx++;
+
+                                /* Skip to next argument comma at paren_lvl == 1 */
+                                while (arg_p < end && paren_lvl > 0) {
+                                    if (*arg_p == '(') paren_lvl++;
+                                    else if (*arg_p == ')') {
+                                        paren_lvl--;
+                                        if (paren_lvl == 0) break;
+                                    } else if (*arg_p == ',' && paren_lvl == 1) {
+                                        arg_p++;
+                                        break;
+                                    } else if (*arg_p == '\n') {
+                                        line_num++;
+                                        line_start = arg_p + 1;
+                                    }
+                                    arg_p++;
+                                }
+                            }
+                            p = arg_p;
+                            continue;
+                        }
+                    }
+                }
+            }
+            p++;
+        }
+    }
+
+    return count;
+}
+

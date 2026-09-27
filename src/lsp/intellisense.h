@@ -287,6 +287,18 @@ void intel_format_using(const char *namespace_name, char *out, size_t out_cap);
 char *intel_organize_usings(intellisense_t *is, const char *content, size_t len,
                             size_t *out_len);
 
+/* --- Inlay hints --- */
+typedef struct {
+    int  line;          /* 0-based line */
+    int  col;           /* 0-based UTF-16 character/column */
+    char label[64];     /* display label (e.g. ": int" or "count:") */
+    int  kind;          /* 1 = Type, 2 = Parameter */
+} intel_inlay_hint_t;
+
+/* Collect inlay hints (inferred types for var, parameter names at call sites) */
+int intel_collect_inlay_hints(intellisense_t *is, const char *content, size_t len,
+                             intel_inlay_hint_t *hints, int max_hints);
+
 #ifdef __cplusplus
 }
 #endif

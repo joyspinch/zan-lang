@@ -88,7 +88,12 @@
   对局部与参数把编辑/引用限定在所属方法体内，同名局部不再跨方法误伤；集成
   测试 19 断言绿。余量：字段/方法等成员级仍整词文本匹配，binder 支撑的成员
   rename 待立新账（量大，见 docs/TOOLING.md 已述限制）。
-- [ ] **B-ID4** semanticTokens / inlay hints 未实现。
+- [x] **B-ID4** semanticTokens 与 inlay hints 协议能力端到端落地（2026-09-27）：
+  initialize 响应声明 inlayHintProvider 与 semanticTokensProvider（15 类 tokenTypes
+  + 空 modifiers）；新增 textDocument/inlayHint 支持：var 推导类型提示与调用端实参形参名提示
+  （intel_collect_inlay_hints，复用符号表无大 AST 重建开销）；新增 textDocument/semanticTokens/full
+  支持：基于 zan_lexer 与符号表发射 5 元组差分高亮流；lsp_integration_test 扩展 4 个断言（类型/形参
+  hints、非空 tokens 数据）全绿回归通过。
 - [x] **B-ID5** intellisense 每请求 ~2MB malloc + 全量重建（c83ea8f0，2026-09-27）：
   五个 handler 改 (uri,version) 单槽缓存复用引擎，didClose 失效、uri 切换重建；
   大文档连续补全/hover 不再重复解析。

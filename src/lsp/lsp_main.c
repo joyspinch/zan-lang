@@ -906,6 +906,42 @@ static void handle_initialize(lsp_server_t *s, json_value *id, json_value *param
     json_obj_set(code_action, "codeActionKinds", ca_kinds);
     json_obj_set(caps, "codeActionProvider", code_action);
 
+    /* Inlay hints (inferred types for var, parameter names at call sites) */
+    json_value *inlay_hint = json_new_obj();
+    json_obj_set(inlay_hint, "resolveProvider", json_new_bool(false));
+    json_obj_set(caps, "inlayHintProvider", inlay_hint);
+
+    /* Semantic tokens provider */
+    {
+        json_value *sem_tokens = json_new_obj();
+        json_value *legend = json_new_obj();
+        json_value *token_types = json_new_arr();
+        /* Legend matches semantic token types:
+         * 0: namespace, 1: type, 2: class, 3: enum, 4: interface, 5: struct,
+         * 6: parameter, 7: variable, 8: property, 9: function, 10: method,
+         * 11: keyword, 12: string, 13: number, 14: operator */
+        json_arr_add(token_types, json_new_str("namespace"));
+        json_arr_add(token_types, json_new_str("type"));
+        json_arr_add(token_types, json_new_str("class"));
+        json_arr_add(token_types, json_new_str("enum"));
+        json_arr_add(token_types, json_new_str("interface"));
+        json_arr_add(token_types, json_new_str("struct"));
+        json_arr_add(token_types, json_new_str("parameter"));
+        json_arr_add(token_types, json_new_str("variable"));
+        json_arr_add(token_types, json_new_str("property"));
+        json_arr_add(token_types, json_new_str("function"));
+        json_arr_add(token_types, json_new_str("method"));
+        json_arr_add(token_types, json_new_str("keyword"));
+        json_arr_add(token_types, json_new_str("string"));
+        json_arr_add(token_types, json_new_str("number"));
+        json_arr_add(token_types, json_new_str("operator"));
+        json_obj_set(legend, "tokenTypes", token_types);
+        json_obj_set(legend, "tokenModifiers", json_new_arr());
+        json_obj_set(sem_tokens, "legend", legend);
+        json_obj_set(sem_tokens, "full", json_new_bool(true));
+        json_obj_set(caps, "semanticTokensProvider", sem_tokens);
+    }
+
     /* Execute-command: memory leak check */
     json_value *exec_cmd = json_new_obj();
     json_value *cmd_list = json_new_arr();
@@ -2430,6 +2466,256 @@ static void handle_code_action(lsp_server_t *s, json_value *id, json_value *para
     send_response(s, id, actions);
 }
 
+/* Inlay hint handler */
+static void handle_inlay_hint(lsp_server_t *s, json_value *id, json_value *params) {
+    json_value *td = json_obj_get(params, "textDocument");
+    const char *uri = json_get_str(json_obj_get(td, "uri"));
+    if (!uri) { send_response(s, id, json_new_arr()); return; }
+
+    lsp_doc_t *doc = lsp_find_doc(s, uri);
+    if (!doc || !doc->text) { send_response(s, id, json_new_arr()); return; }
+
+    intellisense_t *is = doc_intel_for(s, uri);
+    intel_inlay_hint_t hints[256];
+    int count = intel_collect_inlay_hints(is, doc->text, strlen(doc->text), hints, 256);
+
+    json_value *arr = json_new_arr();
+    for (int i = 0; i < count; i++) {
+        json_value *item = json_new_obj();
+        json_value *pos = json_new_obj();
+        json_obj_set(pos, "line", json_new_num(hints[i].line));
+        json_obj_set(pos, "character", json_new_num(hints[i].col));
+        json_obj_set(item, "position", pos);
+        json_obj_set(item, "label", json_new_str(hints[i].label));
+        json_obj_set(item, "kind", json_new_num(hints[i].kind));
+        if (hints[i].kind == 1) {
+            json_obj_set(item, "paddingLeft", json_new_bool(true));
+        } else if (hints[i].kind == 2) {
+            json_obj_set(item, "paddingRight", json_new_bool(true));
+        }
+        json_arr_add(arr, item);
+    }
+    send_response(s, id, arr);
+}
+
+/* Semantic tokens full handler */
+/* Legend index mappings:
+ * 0: namespace, 1: type, 2: class, 3: enum, 4: interface, 5: struct,
+ * 6: parameter, 7: variable, 8: property, 9: function, 10: method,
+ * 11: keyword, 12: string, 13: number, 14: operator */
+static int map_token_type(zan_token_kind_t tk) {
+    switch (tk) {
+    case TK_CLASS:
+    case TK_STRUCT:
+    case TK_INTERFACE:
+    case TK_ENUM:
+    case TK_NAMESPACE:
+    case TK_USING:
+    case TK_PUBLIC:
+    case TK_PRIVATE:
+    case TK_PROTECTED:
+    case TK_INTERNAL:
+    case TK_STATIC:
+    case TK_READONLY:
+    case TK_CONST:
+    case TK_VIRTUAL:
+    case TK_OVERRIDE:
+    case TK_ABSTRACT:
+    case TK_SEALED:
+    case TK_ASYNC:
+    case TK_AWAIT:
+    case TK_IF:
+    case TK_ELSE:
+    case TK_WHILE:
+    case TK_DO:
+    case TK_FOR:
+    case TK_FOREACH:
+    case TK_IN:
+    case TK_SWITCH:
+    case TK_CASE:
+    case TK_DEFAULT:
+    case TK_BREAK:
+    case TK_CONTINUE:
+    case TK_RETURN:
+    case TK_TRY:
+    case TK_CATCH:
+    case TK_FINALLY:
+    case TK_THROW:
+    case TK_NEW:
+    case TK_THIS:
+    case TK_BASE:
+    case TK_TYPEOF:
+    case TK_SIZEOF:
+    case TK_IS:
+    case TK_AS:
+    case TK_NULL:
+    case TK_TRUE:
+    case TK_FALSE:
+    case TK_OPERATOR:
+    case TK_DELEGATE:
+    case TK_LOCK:
+    case TK_FIXED:
+    case TK_UNSAFE:
+    case TK_GOTO:
+    case TK_WHEN:
+    case TK_WHERE:
+    case TK_DEFER:
+    case TK_LET:
+        return 11; /* keyword */
+
+    case TK_INT:
+    case TK_LONG:
+    case TK_SHORT:
+    case TK_BYTE:
+    case TK_SBYTE:
+    case TK_UINT:
+    case TK_ULONG:
+    case TK_USHORT:
+    case TK_FLOAT:
+    case TK_DOUBLE:
+    case TK_DECIMAL:
+    case TK_BOOL:
+    case TK_CHAR:
+    case TK_STRING:
+    case TK_OBJECT:
+    case TK_VOID:
+    case TK_VAR:
+    case TK_NINT:
+        return 1; /* type */
+
+    case TK_STRING_LIT:
+    case TK_CHAR_LIT:
+    case TK_INTERP_START:
+    case TK_INTERP_MID:
+    case TK_INTERP_END:
+        return 12; /* string */
+
+    case TK_INT_LIT:
+    case TK_FLOAT_LIT:
+        return 13; /* number */
+
+    default:
+        return -1;
+    }
+}
+
+static void handle_semantic_tokens_full(lsp_server_t *s, json_value *id, json_value *params) {
+    json_value *td = json_obj_get(params, "textDocument");
+    const char *uri = json_get_str(json_obj_get(td, "uri"));
+    if (!uri) {
+        json_value *empty_res = json_new_obj();
+        json_obj_set(empty_res, "data", json_new_arr());
+        send_response(s, id, empty_res);
+        return;
+    }
+
+    lsp_doc_t *doc = lsp_find_doc(s, uri);
+    if (!doc || !doc->text) {
+        json_value *empty_res = json_new_obj();
+        json_obj_set(empty_res, "data", json_new_arr());
+        send_response(s, id, empty_res);
+        return;
+    }
+
+    intellisense_t *is = doc_intel_for(s, uri);
+
+    /* Tokenize document with zan_lexer */
+    zan_arena_t *arena = zan_arena_new();
+    zan_diag_t *diag = zan_diag_new(arena);
+    zan_diag_set_capture(diag, true);
+
+    zan_lexer_t lex;
+    zan_lexer_init(&lex, doc->text, strlen(doc->text), 0, arena, diag);
+
+    /* Collect semantic tokens: array of integers (5 ints per token) */
+    json_value *data = json_new_arr();
+    int prev_line = 0;
+    int prev_char = 0;
+
+    zan_token_t tok;
+    while ((tok = zan_lexer_next(&lex)).kind != TK_EOF && tok.kind != TK_INVALID) {
+        int token_type = -1;
+        int tlen = 0;
+
+        if (tok.kind == TK_IDENT) {
+            const char *ident_str = tok.str_val.str;
+            tlen = (int)tok.str_val.len;
+
+            /* Check against intellisense symbols */
+            if (is) {
+                for (int si = 0; si < is->symbol_count; si++) {
+                    if ((int)strlen(is->symbols[si].name) == tlen &&
+                        strncmp(is->symbols[si].name, ident_str, (size_t)tlen) == 0) {
+                        isym_kind_t sk = is->symbols[si].kind;
+                        if (sk == ISYM_CLASS) token_type = 2; /* class */
+                        else if (sk == ISYM_STRUCT) token_type = 5; /* struct */
+                        else if (sk == ISYM_ENUM) token_type = 3; /* enum */
+                        else if (sk == ISYM_INTERFACE) token_type = 4; /* interface */
+                        else if (sk == ISYM_METHOD) token_type = 10; /* method */
+                        else if (sk == ISYM_PROPERTY) token_type = 8; /* property */
+                        else if (sk == ISYM_PARAMETER) token_type = 6; /* parameter */
+                        else if (sk == ISYM_VARIABLE) token_type = 7; /* variable */
+                        else if (sk == ISYM_NAMESPACE) token_type = 0; /* namespace */
+                        break;
+                    }
+                }
+            }
+            if (token_type == -1) {
+                /* If not matched in symbols, check naming convention or default to variable */
+                if (tlen > 0 && isupper((unsigned char)ident_str[0])) {
+                    token_type = 1; /* type */
+                } else {
+                    token_type = 7; /* variable */
+                }
+            }
+        } else {
+            token_type = map_token_type(tok.kind);
+            if (tok.kind == TK_STRING_LIT || tok.kind == TK_CHAR_LIT) {
+                tlen = (int)tok.str_val.len;
+            } else {
+                /* For keywords/numbers, compute length from line text */
+                const char *ls = line_start_at(doc->text, (int)tok.loc.line - 1);
+                if (ls) {
+                    const char *p = ls + (tok.loc.col - 1);
+                    const char *pe = p;
+                    while (*pe && !isspace((unsigned char)*pe) && *pe != ';' &&
+                           *pe != '(' && *pe != ')' && *pe != '{' && *pe != '}' &&
+                           *pe != '[' && *pe != ']' && *pe != ',' && *pe != '.') pe++;
+                    tlen = (int)(pe - p);
+                    if (tlen <= 0) tlen = 1;
+                } else {
+                    tlen = 1;
+                }
+            }
+        }
+
+        if (token_type >= 0 && tlen > 0) {
+            int line = (int)tok.loc.line - 1;
+            if (line < 0) line = 0;
+            int col = byte_col_to_utf16_char(doc->text, line, (int)tok.loc.col);
+
+            int delta_line = line - prev_line;
+            int delta_start = (delta_line == 0) ? (col - prev_char) : col;
+
+            json_arr_add(data, json_new_num(delta_line));
+            json_arr_add(data, json_new_num(delta_start));
+            json_arr_add(data, json_new_num(tlen));
+            json_arr_add(data, json_new_num(token_type));
+            json_arr_add(data, json_new_num(0)); /* tokenModifiers: none */
+
+            prev_line = line;
+            prev_char = col;
+        }
+    }
+
+    zan_diag_free_buffers(diag);
+    zan_arena_free(arena);
+
+    json_value *result = json_new_obj();
+    json_obj_set(result, "data", data);
+    send_response(s, id, result);
+}
+
 /* ========================= leak checking ============================ */
 
 /* Convert a file:// URI to a native filesystem path. */
@@ -2662,6 +2948,10 @@ static void dispatch(lsp_server_t *s, json_value *msg) {
         handle_workspace_symbol(s, id, params);
     } else if (strcmp(method, "textDocument/codeAction") == 0) {
         handle_code_action(s, id, params);
+    } else if (strcmp(method, "textDocument/inlayHint") == 0) {
+        handle_inlay_hint(s, id, params);
+    } else if (strcmp(method, "textDocument/semanticTokens/full") == 0) {
+        handle_semantic_tokens_full(s, id, params);
     } else if (strcmp(method, "workspace/executeCommand") == 0) {
         handle_execute_command(s, id, params);
     } else if (strcmp(method, "shutdown") == 0) {
