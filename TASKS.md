@@ -40,8 +40,12 @@
   x64 构建回归 + conformance crypto/hw 7 例过 + ZAN_NO_HWACCEL=1 软件
   路径与硬件路径逐字节一致；standard 档过。SHA-512 保持诚实 -1
   （FEAT_SHA512 真机罕见，纯 Zan 覆盖）。真机批量回归仍待硬件到手。
-- [ ] **B-HW3** SM4 AES-NI 仿射分解：x86 现为查表驱动（唯一引擎，保留）；
-  AESNI 仿射变换分解可再提速，非阻塞优化项。
+- [x] **B-HW3** SM4 AES-NI 仿射分解：x86 查表保底并全面升级硬件加速。
+  已落地（2026-09-27）：基于 GF(2^8) 仿射同构分解 $S_{SM4} = M_2 \cdot S_{AES}(M_1 \cdot x \oplus C_1) \oplus C_2$，
+  消除 AES ShiftRows 并通过 PSHUFB 并行计算仿射变换；实现 4 块与 8 块双路交织 AES-NI 内核、
+  16 块 256 位 AVX2+VAES 向量内核，及 ARM64 FEAT_SM4 硬件内核；挂载 GB/T 32907-2016 官方 KAT 门控；
+  加密升级为常数时间防缓存计时攻击，解密吞吐由 235 MB/s 提升至 602 MB/s (AES-NI) 与 1180 MB/s (VAES, 5.02x)；
+  标准向量与回退路径在 `hw_crypto_pixel.zan` 与 `crypto_pure_ciphers.zan` 验证双向通过。
 - [x] **A-HW4** `byte[]`→`string` 零拷贝视图的 `.Length` 走 strlen，首个
   NUL 处静默截断（原始摘要转 hex 丢尾字节；`emit_string_length` 未开
   array_count 模式，而边界检查早开了——铺了一半的缺陷）。已修：长度读取

@@ -14,6 +14,7 @@ int zan_hw_has_lzcnt(void);
 int zan_hw_has_sse42(void);
 int zan_hw_has_avx2(void);
 int zan_hw_has_aesni(void);
+int zan_hw_has_vaes(void);
 int zan_hw_has_neon(void);
 int zan_hw_has_shani(void);
 int zan_hw_has_pclmul(void);
@@ -37,8 +38,10 @@ int64_t zan_hw_sha512(const uint8_t *data, int64_t len, uint8_t out[64]);
 int64_t zan_hw_sm3(const uint8_t *data, int64_t len, uint8_t out[32]);
 
 /* SM4 Block Cipher CBC mode with PKCS#7 padding (GB/T 32907-2016).
- * Returns produced/plaintext length or -1. On ARM with FEAT_SM4 this is the
- * sm4e instruction pipeline; elsewhere the maintained table driver. */
+ * Returns produced/plaintext length or -1. On x86_64, uses AES-NI affine
+ * decomposition and AVX2+VAES multi-block pipelined vector instructions;
+ * on ARM with FEAT_SM4 uses sm4e instructions; falls back to the T-table
+ * driver when hardware extensions are absent. */
 int64_t zan_hw_sm4_cbc_encrypt(const uint8_t *in, int64_t len,
                                const uint8_t *key, const uint8_t *iv,
                                uint8_t *out);
