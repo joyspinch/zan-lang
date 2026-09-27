@@ -76,6 +76,14 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   取值编译不过，必须拆两条语句；
   ③ async 方法同一表达式里 await 前不得再求值带副作用的调用
   （`this.Ctx().path` 要先赋局部变量），编译期强制。
+- **语言事实第四则（2026-09-27 全站假死排查踩出）**：`virtual` 在派生类
+  里是**新开槽位**（隐藏基类实现），不是覆盖——挂接框架钩子必须写
+  `override`。AppController 曾把 `OnBeforeAsync/OnAfterAsync` 声明成
+  `virtual`：路由蹦床经 `Controller` 静态类型的槽位派发，新槽位永远
+  打不中，跑的是基类空实现——请求租约借了不还，池按需扩张到上限后
+  Acquire 全部挂满超时，全站 503/无响应（客户端只见偶发 000）；而
+  `base.` 这类静态引用仍能打中新槽位，半通半不通最迷惑。排查定式：
+  池 acq/rel 计数失配 + 钩子首行日志打不出来 = 槽位没接上。
 - **声明驱动的 CRUD 定式（ListPage/Crud，2026-09-25 落地）**：一屏一个
   `ScreenDef()` 静态声明（列 Col/Tag/Flag、行内操作 Ops、筛选、工具栏、
   `Table/EditFields` 写白名单），渲染 `Screen()` 整段产出 screenHtml
