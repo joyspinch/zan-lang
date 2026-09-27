@@ -605,7 +605,7 @@ static char *parse_json_string(const char **p, const char *end, size_t *out_len)
 /* Nesting cap for the recursive-descent JSON reader: the input ultimately
  * comes from the network, so an adversarial `[[[[[...` must fail cleanly
  * instead of exhausting the C stack. */
-#define ZAN_JSON_MAX_DEPTH 512
+#define ZAN_JSON_MAX_DEPTH 2048
 
 static zan_json_value_t *parse_json_value(const char **p, const char *end,
                                           int depth) {

@@ -119,7 +119,7 @@ typedef struct { ucontext_t ctx; char *stack; } posix_fiber_t;
  * allocation per coroutine. Each stack has a PROT_NONE guard page at its low
  * end, so an overflow faults immediately instead of corrupting adjacent
  * memory. The scheduler is single-threaded (M:1), so the pool needs no lock. */
-#define ZAN_CO_STACK_POOL_MAX 64
+#define ZAN_CO_STACK_POOL_MAX 256
 
 static void *g_stack_pool;
 static int g_stack_pool_n;

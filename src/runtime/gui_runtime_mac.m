@@ -71,7 +71,7 @@ i32 zan_gui_wake(void);
  * One process can drive several top-level windows. Each keeps its own view
  * (which owns its last-presented image) and size. g_mwins[0] is the primary
  * window used for the handle-less size queries. */
-#define ZAN_MAX_WINDOWS 16
+#define ZAN_MAX_WINDOWS 256
 typedef struct {
     NSWindow *window;
     NSView   *view;
@@ -1436,7 +1436,7 @@ EXPORT void zan_gui_set_ime_pos(i32 x, i32 y) {
  * by spinning the run loop (with a timeout) rather than blocking on a
  * semaphore, which would deadlock the main queue.
  * ======================================================================== */
-#define ZAN_MAX_WEBVIEWS 32
+#define ZAN_MAX_WEBVIEWS 128
 
 @class ZanWebViewDelegate;
 

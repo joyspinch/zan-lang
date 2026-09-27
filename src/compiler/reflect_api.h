@@ -175,9 +175,9 @@ static inline bool zan_refl_member_takes_arg(int code) {
 
 /* How many arguments the member accepts at most: two for `(index, index)` and
  * `(name, value)` shaped members, one for the `(name)` / `(index)` ones.
- * Method calls accept a method name plus up to 16 arguments (17 total).
- * Constructor calls take up to 16 arguments. */
-#define ZAN_REFL_MAX_ARGS 17
+ * Method calls accept a method name plus up to 64 arguments (65 total).
+ * Constructor calls take up to 64 arguments. */
+#define ZAN_REFL_MAX_ARGS 65
 
 static inline int zan_refl_member_max_args(int code) {
     switch (code) {
@@ -186,9 +186,9 @@ static inline int zan_refl_member_max_args(int code) {
     case ZAN_REFL_M_ILONG:
     case ZAN_REFL_M_IDOUBLE:
     case ZAN_REFL_M_ISTRING:
-        return 17;
+        return 65;
     case ZAN_REFL_M_CNEW:
-        return 16;
+        return 64;
     case ZAN_REFL_M_MPTYPE:
     case ZAN_REFL_M_CPTYPE:
     case ZAN_REFL_M_SETINT:

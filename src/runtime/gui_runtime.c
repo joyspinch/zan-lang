@@ -1328,7 +1328,7 @@ EXPORT void zan_gui_blur_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 ra
  * cached pixels with a plain copy instead of recomputing the blur. The caller
  * passes dirty==1 whenever the content behind the glass may have changed
  * (input, scroll, resize, theme) and a stable slot id per glass surface. */
-#define ZAN_BLUR_CACHE_SLOTS 64
+#define ZAN_BLUR_CACHE_SLOTS 256
 typedef struct {
     int valid;
     int sid; /* owning surface: slots are shared across windows, so a slot
@@ -3553,7 +3553,7 @@ EXPORT void zan_gui_release_window(void *native_window) {
 #include "libwebp/src/utils/utils.c"
 #include "gui_image_svg.c"
 
-#define ZAN_IMG_CACHE_CAP 64
+#define ZAN_IMG_CACHE_CAP 1024
 /* Byte budget on top of the entry cap: an entry is w*h*4 decoded at source
  * resolution, so a few phone-camera photos outrun the desktop-tuned entry
  * count by hundreds of MB. 0 keeps the desktop behavior (entry cap only);
@@ -3581,7 +3581,7 @@ static zan_img_t *zan_img_find(const char *path) {
 }
 /* Paths that failed to decode. Without this a broken or unsupported image is
  * re-decoded on every frame that paints the wallpaper. */
-#define ZAN_IMG_BAD_CAP 16
+#define ZAN_IMG_BAD_CAP 256
 static char g_img_bad[ZAN_IMG_BAD_CAP][512];
 static int  g_img_bad_n = 0;
 static int zan_img_is_bad(const char *path) {
@@ -3609,7 +3609,7 @@ static void zan_img_mark_bad(const char *path) {
  * through to the file path (and never marks them bad), so a key that is
  * not registered is simply absent and the Zan side re-registers on
  * demand. Only ever touched from the UI thread, like g_imgs. */
-#define ZAN_IMG_MEM_CAP 64
+#define ZAN_IMG_MEM_CAP 1024
 static zan_img_t g_mem_imgs[ZAN_IMG_MEM_CAP];
 static int       g_mem_img_n = 0;
 
@@ -3856,7 +3856,7 @@ EXPORT i32 zan_gui_image_load_svg(const char *key, const char *text, i32 len,
  * crosses the FFI once per (layer, atlas). Handles index this registry of
  * keys; the decode cache stays free to evict (a sprite whose image was
  * evicted re-decodes on next use, same key -> same pixels -> same texture). */
-#define ZAN_SPRITE_CAP 256
+#define ZAN_SPRITE_CAP 4096
 typedef struct {
     char key[512];       /* path or "mem:" key, resolved via zan_img_load */
     unsigned int tex;    /* GL texture; 0 until the GPU backend uploads it */
@@ -4145,7 +4145,7 @@ EXPORT i32 zan_gui_draw3d(
  * client pixels of one window, re-registered by the app every frame; they are
  * kept per window because sibling windows register overlapping offsets.
  */
-#define ZAN_GUI_MAX_HIT_GUARDS 64
+#define ZAN_GUI_MAX_HIT_GUARDS 1024
 static int g_hit_guards[ZAN_GUI_MAX_HIT_GUARDS][4];
 static iptr g_hit_guard_win[ZAN_GUI_MAX_HIT_GUARDS];
 static int g_hit_guard_count;

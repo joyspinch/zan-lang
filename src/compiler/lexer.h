@@ -7,7 +7,7 @@
 #include "token.h"
 
 /* ---- Preprocessor defines ---- */
-#define ZAN_PP_MAX_DEFINES 512
+#define ZAN_PP_MAX_DEFINES 2048
 #define ZAN_PP_MAX_COND_DEPTH 64
 
 typedef struct {
@@ -32,7 +32,7 @@ struct zan_token {
     };
 };
 
-#define ZAN_MAX_INTERP_DEPTH 32
+#define ZAN_MAX_INTERP_DEPTH 512
 
 /* Bracket nesting inside one interpolation hole, so that a `}` is told apart
  * from the one that closes the hole and a `:` from a conditional's colon. */

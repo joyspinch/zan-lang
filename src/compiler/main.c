@@ -62,14 +62,14 @@
  * linked, a `-L` the linker never sees -- and the build then failed with an
  * unresolved symbol far from the cause. They are sized for real projects and
  * every site reports instead of truncating (see link_cap_exceeded). */
-#define ZAN_LINK_MAX_ARGV        512
-#define ZAN_LINK_MAX_LIBS        128
-#define ZAN_LINK_MAX_DIRS         64
-#define ZAN_MAX_USED_DRIVERS      64
-#define ZAN_MAX_STATIC_DRV_LIBS  128
+#define ZAN_LINK_MAX_ARGV        8192
+#define ZAN_LINK_MAX_LIBS        2048
+#define ZAN_LINK_MAX_DIRS        1024
+#define ZAN_MAX_USED_DRIVERS     1024
+#define ZAN_MAX_STATIC_DRV_LIBS  2048
 /* Argv slots the tail of each link line still needs after the loops that fill
  * it (terminator, --end-group, the final inputs). */
-#define ZAN_LINK_ARGV_TAIL        16
+#define ZAN_LINK_ARGV_TAIL        32
 
 static void link_cap_exceeded(const char *what, int cap) {
     fprintf(stderr,
@@ -545,12 +545,12 @@ static int glob_stdlib_dir(const char *stdlib_root, const char *subdir,
 static int auto_include_namespace(const char *stdlib_root, const char *subdir,
                                   const char ***files, int *count, int *cap) {
     int found = glob_stdlib_dir(stdlib_root, subdir, files, count, cap);
-    char package_dirs[32][1024];
+    char package_dirs[128][1024];
     int package_count = zan_pkg_find_namespace(package_project_root, subdir,
-                                                   package_dirs, 32);
-    if (package_count >= 32)
-        fprintf(stderr, "warning: namespace '%s' is provided by 32 or more "
-                        "installed packages; only the first 32 are compiled\n",
+                                                   package_dirs, 128);
+    if (package_count >= 128)
+        fprintf(stderr, "warning: namespace '%s' is provided by 128 or more "
+                        "installed packages; only the first 128 are compiled\n",
                 subdir);
     for (int i = 0; i < package_count; i++) {
         int before = *count;
@@ -720,9 +720,9 @@ static void resolve_package_project_root(const char *input) {
 static char proj_android_package[256];
 static char proj_android_label[256];
 static bool proj_android_keys_ok = true;
-static char proj_android_perms[16][128];
+static char proj_android_perms[128][128];
 static int proj_android_perm_count = 0;
-static char proj_skin_names[16][64];
+static char proj_skin_names[128][64];
 static int proj_skin_name_count = 0;
 static bool proj_skins_enabled = false;
 static bool load_proj_android_keys_done = false;
@@ -778,9 +778,9 @@ static void load_proj_android_keys(void) {
             while (tok) {
                 char *p = proj_trim(tok);
                 if (*p) {
-                    if (proj_android_perm_count >= 16) {
+                    if (proj_android_perm_count >= 128) {
                         fprintf(stderr, "error: zan.proj androidPermissions: "
-                                "more than 16 entries\n");
+                                "more than 128 entries\n");
                         proj_android_keys_ok = false;
                         break;
                     }
@@ -801,7 +801,7 @@ static void load_proj_android_keys(void) {
         } else if (strcmp(key, "skinlist") == 0) {
             char *save = NULL;
             char *tok = strtok_r(val, ",", &save);
-            while (tok && proj_skin_name_count < 16) {
+            while (tok && proj_skin_name_count < 128) {
                 char *p = proj_trim(tok);
                 if (*p && strcmp(p, "-") != 0) {
                     snprintf(proj_skin_names[proj_skin_name_count],
@@ -1011,15 +1011,15 @@ static const char *pi_stdlib_root_buf;
  * through the same-directory glob. Walk up to the stdlib root's leaf name
  * to recover the 'A/B/C' subdir. */
 static int pi_reach_input_dir(const char *file) {
-    char comps[32][64];
+    char comps[64][256];
     int n = 0;
     size_t len = strlen(file);
     size_t i = 0;
-    while (i < len && n < 32) {
+    while (i < len && n < 64) {
         size_t start = i;
         while (i < len && file[i] != '/' && file[i] != 92) i++;
         size_t cl = i - start;
-        if (cl > 0 && cl < 64) {
+        if (cl > 0 && cl < 256) {
             memcpy(comps[n], file + start, cl);
             comps[n][cl] = 0;
             n++;
@@ -2050,12 +2050,12 @@ static void pi_process_dir(pi_dir_t *d, const char *stdlib_root) {
     int before = d->file_count;
     pi_glob_into(d, stdlib_root, d->subdir);
     if (d->file_count != before) found = 1;
-    char package_dirs[32][1024];
+    char package_dirs[128][1024];
     int package_count = zan_pkg_find_namespace(package_project_root, d->subdir,
-                                               package_dirs, 32);
-    if (package_count >= 32)
-        fprintf(stderr, "warning: namespace '%s' is provided by 32 or more "
-                        "installed packages; only the first 32 are compiled\n",
+                                               package_dirs, 128);
+    if (package_count >= 128)
+        fprintf(stderr, "warning: namespace '%s' is provided by 128 or more "
+                        "installed packages; only the first 128 are compiled\n",
                 d->subdir);
     for (int i = 0; i < package_count; i++) {
         before = d->file_count;
@@ -2843,7 +2843,7 @@ static bool zan_win_system_lib(const char *lib, int lib_len) {
  * is simply the directory that contains that `drivers/` folder, so its bundle
  * lives at <stdlib_root>/<module>/drivers/<target-sub>/ and travels with
  * stdlib. Adding a new native module therefore needs no compiler change. */
-#define ZAN_MAX_DRIVERS 32
+#define ZAN_MAX_DRIVERS 1024
 typedef struct {
     char lib[64];      /* normalized -l basename, e.g. "sqlite3", "zan_sdl3" */
     char module[512];  /* owning module path relative to stdlib root, '/'-sep */
@@ -3574,7 +3574,10 @@ int main(int argc, char **argv) {
     bool do_deny_warnings = false;
     zan_pkg_scope_t package_scope = ZAN_PKG_SCOPE_PROJECT;
     int opt_level = -1; /* -1 = auto (O0 default, O2 for publish) */
-    const char *pp_defines[64];
+#define ZAN_MAX_PP_DEFINES 1024
+#define ZAN_MAX_LINK_INPUTS 1024
+#define ZAN_MAX_EMBED_SPECS 1024
+    const char *pp_defines[ZAN_MAX_PP_DEFINES];
     int pp_define_count = 0;
     const char *target_name = NULL; /* --target <name|triple>; NULL = host */
     bool link_static_drivers = false; /* --link-mode static; default shared */
@@ -3594,8 +3597,8 @@ int main(int argc, char **argv) {
     const char *ipa_path = NULL;    /* --emit-ipa <file.ipa>: package iOS App Bundle */
     const char *ipa_bundle_id = NULL; /* --ipa-bundle-id <id>: override CFBundleIdentifier */
     const char *ipa_name = NULL;    /* --ipa-name <name>: override CFBundleDisplayName */
-    const char *extra_link_inputs[32]; int extra_link_input_count = 0;
-    const char *embed_specs[64]; int embed_spec_count = 0;
+    const char *extra_link_inputs[ZAN_MAX_LINK_INPUTS]; int extra_link_input_count = 0;
+    const char *embed_specs[ZAN_MAX_EMBED_SPECS]; int embed_spec_count = 0;
     const char *extra_link_libs[ZAN_LINK_MAX_LIBS]; int extra_link_lib_count = 0;
     const char *extra_lib_paths[ZAN_LINK_MAX_DIRS]; int extra_lib_path_count = 0;
     /* Resolved stdlib root, hoisted so the native-driver block (which lives
@@ -3725,11 +3728,11 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--icon") == 0 && i + 1 < argc) {
             icon_path = argv[++i];
         } else if (strcmp(argv[i], "--embed") == 0 && i + 1 < argc) {
-            if (embed_spec_count < 64) embed_specs[embed_spec_count++] = argv[++i];
-            else { fprintf(stderr, "error: too many --embed (max 64)\n"); return 1; }
+            if (embed_spec_count < ZAN_MAX_EMBED_SPECS) embed_specs[embed_spec_count++] = argv[++i];
+            else { fprintf(stderr, "error: too many --embed (max %d)\n", ZAN_MAX_EMBED_SPECS); return 1; }
         } else if (strcmp(argv[i], "--link-input") == 0 && i + 1 < argc) {
-            if (extra_link_input_count < 32) extra_link_inputs[extra_link_input_count++] = argv[++i];
-            else { fprintf(stderr, "error: too many --link-input (max 32)\n"); return 1; }
+            if (extra_link_input_count < ZAN_MAX_LINK_INPUTS) extra_link_inputs[extra_link_input_count++] = argv[++i];
+            else { fprintf(stderr, "error: too many --link-input (max %d)\n", ZAN_MAX_LINK_INPUTS); return 1; }
         } else if (strcmp(argv[i], "--link-lib") == 0 && i + 1 < argc) {
             if (extra_link_lib_count < ZAN_LINK_MAX_LIBS)
                 extra_link_libs[extra_link_lib_count++] = argv[++i];
@@ -3746,8 +3749,8 @@ int main(int argc, char **argv) {
             else { fprintf(stderr, "error: too many -L dirs (max %d)\n",
                            ZAN_LINK_MAX_DIRS); return 1; }
         } else if (strncmp(argv[i], "-D", 2) == 0 && argv[i][2] != '\0') {
-            if (pp_define_count < 64) pp_defines[pp_define_count++] = argv[i] + 2;
-            else { fprintf(stderr, "error: too many -D defines (max 64)\n");
+            if (pp_define_count < ZAN_MAX_PP_DEFINES) pp_defines[pp_define_count++] = argv[i] + 2;
+            else { fprintf(stderr, "error: too many -D defines (max %d)\n", ZAN_MAX_PP_DEFINES);
                    return 1; }
         } else if (argv[i][0] != '-') {
             input_files_push(&input_files, &input_count, &input_cap, argv[i]);
@@ -4952,15 +4955,15 @@ int main(int argc, char **argv) {
          * static mode its DLL travels as an embedded resource and the owning
          * module writes it out before LoadLibrary. Only the wrapper is
          * embedded; what it in turn loads (the CEF runtime) stays external. */
-        char embed_driver_specs[8][1300];
+        char embed_driver_specs[128][1300];
         int embed_driver_spec_count = 0;
         if (target.os == ZAN_OS_WINDOWS && link_static_drivers) {
             for (int d = 0; d < used_driver_count; d++) {
                 if (!used_driver_runtime[d] || !driver_dirs[d][0]) continue;
-                if (embed_driver_spec_count >= 8)
-                    link_cap_exceeded("embedded driver DLLs", 8);
-                if (embed_spec_count >= 64)
-                    link_cap_exceeded("--embed resources", 64);
+                if (embed_driver_spec_count >= 128)
+                    link_cap_exceeded("embedded driver DLLs", 128);
+                if (embed_spec_count >= ZAN_MAX_EMBED_SPECS)
+                    link_cap_exceeded("--embed resources", ZAN_MAX_EMBED_SPECS);
                 char drv[64];
                 snprintf(drv, sizeof(drv), "%.*s", used_driver_len[d],
                          used_drivers[d]);
@@ -5107,7 +5110,7 @@ int main(int argc, char **argv) {
                      * zan_embed_list("icons/") prefix scan */
                     snprintf(icon_spec, strlen(icons_dir) + 32,
                              "%s=icons", icons_dir);
-                    if (embed_spec_count < 64) {
+                    if (embed_spec_count < ZAN_MAX_EMBED_SPECS) {
                         embed_specs[embed_spec_count++] = icon_spec;
                     } else {
                         fprintf(stderr, "warning: cannot auto-embed Gui icon "
@@ -5139,7 +5142,7 @@ int main(int argc, char **argv) {
                      * File.EmbedExists("text/pinyin.txt") lookup */
                     snprintf(pinyin_spec, strlen(pinyin_path) + 32,
                              "%s=text/pinyin.txt", pinyin_path);
-                    if (embed_spec_count < 64) {
+                    if (embed_spec_count < ZAN_MAX_EMBED_SPECS) {
                         embed_specs[embed_spec_count++] = pinyin_spec;
                     } else {
                         fprintf(stderr, "warning: cannot auto-embed the "
@@ -5282,7 +5285,7 @@ int main(int argc, char **argv) {
                     if (theme_spec) {
                         snprintf(theme_spec, strlen(themes_dir) + 32,
                                  "%s=chartthemes", themes_dir);
-                        if (embed_spec_count < 64) {
+                        if (embed_spec_count < ZAN_MAX_EMBED_SPECS) {
                             embed_specs[embed_spec_count++] = theme_spec;
                         } else {
                             fprintf(stderr, "warning: cannot auto-embed chart "
@@ -5383,7 +5386,7 @@ int main(int argc, char **argv) {
                     /* resource names "assets/<file>" match the reader's
                      * File.EmbedExists("assets/<file>") lookups */
                     snprintf(assets_spec, strlen(adir) + 32, "%s=assets", adir);
-                    if (embed_spec_count < 64) {
+                    if (embed_spec_count < ZAN_MAX_EMBED_SPECS) {
                         embed_specs[embed_spec_count++] = assets_spec;
                     } else {
                         fprintf(stderr, "warning: cannot auto-embed the "
@@ -5452,10 +5455,10 @@ int main(int argc, char **argv) {
                                                   icon_obj, arm64);
             if (ires != 0) {
                 icon_obj[0] = '\0';
-            } else if (extra_link_input_count < 32) {
+            } else if (extra_link_input_count < ZAN_MAX_LINK_INPUTS) {
                 extra_link_inputs[extra_link_input_count++] = icon_obj;
             } else {
-                link_cap_exceeded("link inputs", 32);
+                link_cap_exceeded("link inputs", ZAN_MAX_LINK_INPUTS);
             }
         }
 
@@ -8090,11 +8093,11 @@ int main(int argc, char **argv) {
                 if (d2 && strcmp(d2, ".zan") == 0) *d2 = 0; }
             }
             /* bundled driver libs to carry inside lib/<abi>/ */
-            char *extras[64]; int nextra = 0;
+            char *extras[256]; int nextra = 0;
             { char outdir_a[1024]; snprintf(outdir_a, sizeof(outdir_a), "%s", obj_path);
               { char *s1 = strrchr(outdir_a, '/'); char *s2 = strrchr(outdir_a, '\\');
                 char *s = (s1 > s2) ? s1 : s2; if (s) *s = 0; }
-              for (int d = 0; d < used_driver_count && nextra < 64; d++) {
+              for (int d = 0; d < used_driver_count && nextra < 256; d++) {
                   const char *dd = driver_dirs[d];
                   if (!dd[0]) continue;
                   char drv[64];
@@ -8104,12 +8107,12 @@ int main(int argc, char **argv) {
                   FILE *mf = fopen(manifest_p, "rb");
                   if (!mf) continue;
                   char line[128];
-                  while (fgets(line, sizeof(line), mf) && nextra < 64) {
+                  while (fgets(line, sizeof(line), mf) && nextra < 256) {
                       size_t l = strlen(line);
                       while (l > 0 && (line[l-1]=='\n'||line[l-1]=='\r'||line[l-1]==' '||line[l-1]=='\t')) line[--l]=0;
                       if (l == 0) continue;
                       if (!strstr(line, ".so")) continue;
-                      static char names[64][128];
+                      static char names[256][128];
                       snprintf(names[nextra], sizeof(names[0]), "%s/%s", dd, line);
                       extras[nextra] = names[nextra];
                       nextra++;

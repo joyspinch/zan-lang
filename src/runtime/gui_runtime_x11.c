@@ -38,7 +38,7 @@ static int g_metrics_ready_linux = 0;
 /* Per-window state so one process can drive several top-level windows. The
  * globals above still track the primary window for process-wide operations
  * (clipboard, cursor, input method) and single-window size queries. */
-#define ZAN_MAX_WINDOWS 16
+#define ZAN_MAX_WINDOWS 256
 typedef struct {
     Window xid;
     GC gc;

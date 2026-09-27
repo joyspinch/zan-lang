@@ -1353,8 +1353,8 @@ static zan_symbol_t *find_extension_method(zan_irgen_t *g, zan_type_t *recv_ty,
  * startup, leaving only a log line behind). A constant width is therefore
  * judged where it is written. The ceilings mirror ZAN_TABLE_MAX_* in
  * src/runtime/rt_sync.c. */
-#define IRGEN_SHARED_MAX_STRING 65536
-#define IRGEN_SHARED_MAX_KEY 256
+#define IRGEN_SHARED_MAX_STRING 1048576
+#define IRGEN_SHARED_MAX_KEY 1024
 
 static void check_shared_table_width(zan_irgen_t *g, zan_symbol_t *type_sym,
                                      zan_istr_t name, zan_ast_node_t *call) {
@@ -1546,7 +1546,7 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
  * depend on the emit context (the locals in scope, the active specialization
  * and `this`), so they are memoized per AST node and the whole table is dropped
  * whenever that context changes. */
-#define INFER_CACHE_SLOTS 8192   /* power of two */
+#define INFER_CACHE_SLOTS 65536   /* power of two */
 
 typedef struct {
     zan_ast_node_t *node;

@@ -159,7 +159,7 @@ int zan_utf8_argv(int *argc, char ***argv) {
  * use stdio and the environment freely -- but it must never itself abort:
  * every allocation/open failure silently degrades to "no log entry". */
 
-#define ZAN_SOFT_MAX_SITES 256
+#define ZAN_SOFT_MAX_SITES 1024
 
 static char *g_soft_seen[ZAN_SOFT_MAX_SITES];
 static int g_soft_seen_count;

@@ -26,7 +26,7 @@
 #include "diag.h"
 #include "token.h"
 
-#define DA_MAX_LOCALS 1024
+#define DA_MAX_LOCALS 16384
 #define DA_WORDS ((DA_MAX_LOCALS + 63) / 64)
 
 typedef struct {

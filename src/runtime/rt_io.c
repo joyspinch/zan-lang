@@ -1846,7 +1846,7 @@ static int syncfast_on(void) {
  * Shard 0 is g_iocp, and shards exist only while the worker pool runs: a port
  * nobody waits on would strand its completions, so anything that runs outside
  * the pool (or ZAN_IO_SHARDS=1) keeps using the single port it used before. */
-#define ZAN_IO_MAXSHARD 64
+#define ZAN_IO_MAXSHARD 256
 static HANDLE        g_shard[ZAN_IO_MAXSHARD];
 static volatile LONG g_shards = 1;
 
@@ -2981,14 +2981,14 @@ static zan_blocking_job_t *g_blocking_queued;  /* accepted, awaiting worker */
 static int32_t g_blocking_queued_n;            /* length of g_blocking_queued */
 static int32_t g_blocking_active;
 
-#define ZAN_BLOCKING_MAX_ACTIVE 64
+#define ZAN_BLOCKING_MAX_ACTIVE 256
 /* Worker-pool queue cap: once all workers are busy and this many jobs are
  * parked, new submissions fail fast (result 0) instead of queueing without
  * bound. A dead resolver otherwise turns steady Host.Resolve traffic into
  * ~370 bytes of pinned job per request at 10s apiece with no backpressure
  * signal, and both the append walk and the timeout scan are O(queue) per
  * operation -- quadratic exactly while the resolver is down. */
-#define ZAN_BLOCKING_MAX_QUEUED 1024
+#define ZAN_BLOCKING_MAX_QUEUED 16384
 
 static int64_t dns_now_ms(void) {
 #if defined(_WIN32)
@@ -3898,7 +3898,7 @@ typedef void* HANDLE;
  * queued frames and a linear scan of the frames a shard was running.
  * ----------------------------------------------------------------------- */
 
-#define ZAN_CO_MAXW      64
+#define ZAN_CO_MAXW      256
 #define ZAN_LQ_CAP       256u        /* per-worker ring slots, power of two */
 #define ZAN_LQ_MASK      (ZAN_LQ_CAP - 1u)
 #define ZAN_LIFO_BUDGET  3           /* consecutive LIFO-cell resumes */

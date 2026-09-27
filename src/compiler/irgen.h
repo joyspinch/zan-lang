@@ -70,17 +70,17 @@ static inline bool zan_tab_reserve(void **items, int *cap, size_t elem,
  * re-enters itself through member access and overload scoring, so a cycle or a
  * pathological nesting used to spin the compiler with no output at all; past
  * this it reports where it gave up instead. Matches ZAN_PARSER_MAX_BINOP_CHAIN. */
-#define ZAN_MAX_INFER_DEPTH 2048
+#define ZAN_MAX_INFER_DEPTH 16384
 
 /* Nesting depth of try/finally regions a single function body may be inside. */
-#define ZAN_MAX_FINALLY_DEPTH 32
+#define ZAN_MAX_FINALLY_DEPTH 256
 
 /* Armed try handlers tracked at once. Nested bodies (lambdas, async $resume)
  * stack their own entries on top of the enclosing body's, so this is deeper
  * than the per-body try nesting; overflowing it drops the extra entries, so an
  * early exit out of those levels falls back to the old grow-only behaviour --
  * it never restores a wrong depth. */
-#define ZAN_MAX_ARMED_TRY 128
+#define ZAN_MAX_ARMED_TRY 1024
 
 struct zan_irgen {
     zan_arena_t *arena;

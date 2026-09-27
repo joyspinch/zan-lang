@@ -31,7 +31,7 @@
 #define ZAN_TRAY_MENU_MAX  8192
 #define ZAN_TRAY_PATH_MAX  1024
 #define ZAN_TRAY_QCAP      64
-#define ZAN_TRAY_ITEM_MAX  64
+#define ZAN_TRAY_ITEM_MAX  256
 
 /* SYSTEM_TRAY_REQUEST_DOCK, per the freedesktop system tray spec. */
 #define ZAN_TRAY_OPCODE_DOCK 0

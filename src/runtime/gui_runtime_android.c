@@ -36,7 +36,7 @@ static jobject  zan_anw_bridge_activity(void);
     __android_log_print(ANDROID_LOG_INFO, "zan_awv", __VA_ARGS__)
 
 #ifndef ZAN_ANDROID_WV_MAX
-#define ZAN_ANDROID_WV_MAX 32
+#define ZAN_ANDROID_WV_MAX 128
 #endif
 #define ZAN_AWV_MSG_MAX 128     /* queued "<handler>\t<body>" entries */
 #define ZAN_AWV_EVAL_TIMEOUT 3  /* seconds, matching the macOS spin */

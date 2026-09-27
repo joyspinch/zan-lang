@@ -379,7 +379,7 @@ static void pp_read_ident(zan_lexer_t *lex, char *buf, int maxlen) {
    `#if !!!!!!!!!...` is attacker-controlled source text and would otherwise
    exhaust the C stack before any diagnostic fires. */
 static int pp_eval_expr(zan_lexer_t *lex, int depth);
-#define ZAN_PP_EVAL_MAX_DEPTH 200
+#define ZAN_PP_EVAL_MAX_DEPTH 2048
 
 static int pp_eval_atom(zan_lexer_t *lex, int depth) {
     pp_skip_hspaces(lex);

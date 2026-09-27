@@ -9,17 +9,15 @@
  * converts to the device mix format.
  *
  * Platforms:
- *   Windows   WASAPI shared mode, event-driven, Windows 7+ (COM
- *             activation only -- no mmdevapi.lib import, ole32 was
- *             already linked for the shell).
- *   Android   AAudio (API 26+): the stream builder hands us the
- *             platform's own callback thread, so there is no mixer
- *             thread of ours to manage -- open()/close() just start
- *             and stop the stream around the shared voice table.
- *   Others    stub until their backends land (CoreAudio / ALSA /
- *             OH Audio); every entry returns 0 and
- *             zan_audio_last_error() says so, mirroring how the GL
- *             backend falls back instead of failing hard.
+ *   Windows       WASAPI shared mode, event-driven, Windows 7+ (COM
+ *                 activation only -- no mmdevapi.lib import, ole32 was
+ *                 already linked for the shell).
+ *   Android       AAudio (API 26+): the stream builder hands us the
+ *                 platform's own callback thread, so there is no mixer
+ *                 thread of ours to manage.
+ *   Linux         ALSA (libasound.so.2 dynamic loading with worker thread).
+ *   macOS         CoreAudio AudioUnit (AudioToolbox framework dynamic loading).
+ *   OpenHarmony   OH Audio (libohaudio.so dynamic loading via OH_AudioStreamBuilder).
  *
  * Voice handles carry a generation number like the SDL bridge did:
  * a Zan AudioVoice outliving its sound answers "not playing" instead
@@ -90,7 +88,7 @@
 #include "stb_vorbis.c"
 
 #ifndef ZAN_VOICE_SLOTS
-#define ZAN_VOICE_SLOTS 64
+#define ZAN_VOICE_SLOTS 256
 #endif
 /* Upper bound of one mixer fill in device frames; larger availabilities
  * are filled in chunks of at most this. */
@@ -1203,6 +1201,125 @@ static void zan_coreaudio_stop(void) {
 }
 #endif /* __APPLE__ */
 
+#if defined(__OHOS__)
+
+typedef void *zan_oh_stream_builder_t;
+typedef void *zan_oh_renderer_t;
+
+typedef struct {
+    int32_t (*OnWriteData)(zan_oh_renderer_t renderer, void *userData, void *buffer, int32_t length);
+    int32_t (*OnStreamEvent)(zan_oh_renderer_t renderer, void *userData, int32_t event);
+    int32_t (*OnInterruptEvent)(zan_oh_renderer_t renderer, void *userData, int32_t interruptType, int32_t interruptHint);
+    int32_t (*OnError)(zan_oh_renderer_t renderer, void *userData, int32_t error);
+} zan_oh_renderer_callbacks_t;
+
+typedef struct {
+    void *handle;
+    int32_t (*Builder_Create)(zan_oh_stream_builder_t *builder, int32_t type);
+    int32_t (*Builder_Destroy)(zan_oh_stream_builder_t builder);
+    int32_t (*Builder_SetSamplingRate)(zan_oh_stream_builder_t builder, int32_t rate);
+    int32_t (*Builder_SetChannelCount)(zan_oh_stream_builder_t builder, int32_t channelCount);
+    int32_t (*Builder_SetSampleFormat)(zan_oh_stream_builder_t builder, int32_t format);
+    int32_t (*Builder_SetRendererCallback)(zan_oh_stream_builder_t builder, zan_oh_renderer_callbacks_t callbacks, void *userData);
+    int32_t (*Builder_GenerateRenderer)(zan_oh_stream_builder_t builder, zan_oh_renderer_t *renderer);
+    int32_t (*Renderer_Start)(zan_oh_renderer_t renderer);
+    int32_t (*Renderer_Stop)(zan_oh_renderer_t renderer);
+    int32_t (*Renderer_Release)(zan_oh_renderer_t renderer);
+} zan_ohos_audio_api_t;
+
+static zan_ohos_audio_api_t zan_ohaudio;
+static zan_oh_renderer_t zan_ohaudio_renderer = NULL;
+
+static int32_t zan_ohaudio_on_write(zan_oh_renderer_t renderer, void *userData, void *buffer, int32_t length) {
+    (void)renderer; (void)userData;
+    int frames = length / (2 * (int)sizeof(short));
+    if (frames > ZAN_AUDIO_MAX_FILL) frames = ZAN_AUDIO_MAX_FILL;
+    pthread_mutex_lock(&zan_audio_mutex);
+    if (!zan_audio_ready) {
+        pthread_mutex_unlock(&zan_audio_mutex);
+        memset(buffer, 0, (size_t)length);
+        return 0;
+    }
+    zan_audio_mix_s16((unsigned char *)buffer, frames, zan_audio_dev_channels);
+    pthread_mutex_unlock(&zan_audio_mutex);
+    return 0;
+}
+
+static int zan_ohaudio_init(void) {
+    if (zan_ohaudio.handle) return 1;
+    zan_ohaudio.handle = dlopen("libohaudio.so", RTLD_NOW | RTLD_LOCAL);
+    if (!zan_ohaudio.handle) {
+        zan_audio_set_err("OH Audio driver: libohaudio.so not found");
+        return 0;
+    }
+    zan_ohaudio.Builder_Create = (int32_t (*)(zan_oh_stream_builder_t *, int32_t))dlsym(zan_ohaudio.handle, "OH_AudioStreamBuilder_Create");
+    zan_ohaudio.Builder_Destroy = (int32_t (*)(zan_oh_stream_builder_t))dlsym(zan_ohaudio.handle, "OH_AudioStreamBuilder_Destroy");
+    zan_ohaudio.Builder_SetSamplingRate = (int32_t (*)(zan_oh_stream_builder_t, int32_t))dlsym(zan_ohaudio.handle, "OH_AudioStreamBuilder_SetSamplingRate");
+    zan_ohaudio.Builder_SetChannelCount = (int32_t (*)(zan_oh_stream_builder_t, int32_t))dlsym(zan_ohaudio.handle, "OH_AudioStreamBuilder_SetChannelCount");
+    zan_ohaudio.Builder_SetSampleFormat = (int32_t (*)(zan_oh_stream_builder_t, int32_t))dlsym(zan_ohaudio.handle, "OH_AudioStreamBuilder_SetSampleFormat");
+    zan_ohaudio.Builder_SetRendererCallback = (int32_t (*)(zan_oh_stream_builder_t, zan_oh_renderer_callbacks_t, void *))dlsym(zan_ohaudio.handle, "OH_AudioStreamBuilder_SetRendererCallback");
+    zan_ohaudio.Builder_GenerateRenderer = (int32_t (*)(zan_oh_stream_builder_t, zan_oh_renderer_t *))dlsym(zan_ohaudio.handle, "OH_AudioStreamBuilder_GenerateRenderer");
+    zan_ohaudio.Renderer_Start = (int32_t (*)(zan_oh_renderer_t))dlsym(zan_ohaudio.handle, "OH_AudioRenderer_Start");
+    zan_ohaudio.Renderer_Stop = (int32_t (*)(zan_oh_renderer_t))dlsym(zan_ohaudio.handle, "OH_AudioRenderer_Stop");
+    zan_ohaudio.Renderer_Release = (int32_t (*)(zan_oh_renderer_t))dlsym(zan_ohaudio.handle, "OH_AudioRenderer_Release");
+
+    if (!zan_ohaudio.Builder_Create || !zan_ohaudio.Builder_Destroy ||
+        !zan_ohaudio.Builder_SetSamplingRate || !zan_ohaudio.Builder_SetChannelCount ||
+        !zan_ohaudio.Builder_SetSampleFormat || !zan_ohaudio.Builder_SetRendererCallback ||
+        !zan_ohaudio.Builder_GenerateRenderer || !zan_ohaudio.Renderer_Start ||
+        !zan_ohaudio.Renderer_Release) {
+        dlclose(zan_ohaudio.handle);
+        zan_ohaudio.handle = NULL;
+        zan_audio_set_err("OH Audio driver: missing required symbols in libohaudio");
+        return 0;
+    }
+    return 1;
+}
+
+static int zan_ohaudio_start(void) {
+    if (!zan_ohaudio_init()) return 0;
+    zan_oh_stream_builder_t builder = NULL;
+    if (zan_ohaudio.Builder_Create(&builder, 1 /* AUDIOSTREAM_TYPE_RENDERER */) != 0 || !builder) {
+        zan_audio_set_err("OH Audio driver: OH_AudioStreamBuilder_Create failed");
+        return 0;
+    }
+    zan_audio_dev_freq = 48000;
+    zan_audio_dev_channels = 2;
+    zan_ohaudio.Builder_SetSamplingRate(builder, zan_audio_dev_freq);
+    zan_ohaudio.Builder_SetChannelCount(builder, zan_audio_dev_channels);
+    zan_ohaudio.Builder_SetSampleFormat(builder, 1 /* AUDIOSTREAM_SAMPLE_S16LE */);
+
+    zan_oh_renderer_callbacks_t cbs;
+    memset(&cbs, 0, sizeof(cbs));
+    cbs.OnWriteData = zan_ohaudio_on_write;
+    zan_ohaudio.Builder_SetRendererCallback(builder, cbs, NULL);
+
+    if (zan_ohaudio.Builder_GenerateRenderer(builder, &zan_ohaudio_renderer) != 0 || !zan_ohaudio_renderer) {
+        zan_ohaudio.Builder_Destroy(builder);
+        zan_audio_set_err("OH Audio driver: OH_AudioStreamBuilder_GenerateRenderer failed");
+        return 0;
+    }
+    zan_ohaudio.Builder_Destroy(builder);
+
+    if (zan_ohaudio.Renderer_Start(zan_ohaudio_renderer) != 0) {
+        zan_ohaudio.Renderer_Release(zan_ohaudio_renderer);
+        zan_ohaudio_renderer = NULL;
+        zan_audio_set_err("OH Audio driver: OH_AudioRenderer_Start failed");
+        return 0;
+    }
+    return 1;
+}
+
+static void zan_ohaudio_stop(void) {
+    if (zan_ohaudio_renderer) {
+        if (zan_ohaudio.Renderer_Stop) zan_ohaudio.Renderer_Stop(zan_ohaudio_renderer);
+        if (zan_ohaudio.Renderer_Release) zan_ohaudio.Renderer_Release(zan_ohaudio_renderer);
+        zan_ohaudio_renderer = NULL;
+    }
+}
+
+#endif /* __OHOS__ */
+
 /* ------------------------------------------------------------------
  * Exported API. Signatures match the original audio bridge's
  * audio entries so the Zan-side Audio module is a drop-in swap of the
@@ -1309,6 +1426,18 @@ open_fail:
     zan_audio_ready = 1;
     pthread_mutex_unlock(&zan_audio_mutex);
     return 1;
+#elif defined(__OHOS__)
+    if (zan_audio_ready) return 1;
+    zan_audio_set_err(NULL);
+    if (!zan_ohaudio_start()) {
+        if (zan_audio_err[0] == 0) zan_audio_set_err("OH Audio device open failed");
+        return 0;
+    }
+    pthread_mutex_lock(&zan_audio_mutex);
+    for (int i = 0; i < ZAN_VOICE_SLOTS; i++) zan_voice_reset(&zan_voices[i]);
+    zan_audio_ready = 1;
+    pthread_mutex_unlock(&zan_audio_mutex);
+    return 1;
 #else
     zan_audio_set_err("audio backend not available on this platform yet (planned: OH Audio / OpenSL)");
     return 0;
@@ -1362,6 +1491,14 @@ EXPORT void zan_audio_close(void) {
     pthread_mutex_lock(&zan_audio_mutex);
     for (int i = 0; i < ZAN_VOICE_SLOTS; i++) zan_voice_reset(&zan_voices[i]);
     pthread_mutex_unlock(&zan_audio_mutex);
+#elif defined(__OHOS__)
+    pthread_mutex_lock(&zan_audio_mutex);
+    zan_audio_ready = 0;
+    pthread_mutex_unlock(&zan_audio_mutex);
+    zan_ohaudio_stop();
+    pthread_mutex_lock(&zan_audio_mutex);
+    for (int i = 0; i < ZAN_VOICE_SLOTS; i++) zan_voice_reset(&zan_voices[i]);
+    pthread_mutex_unlock(&zan_audio_mutex);
 #else
     zan_audio_ready = 0;
 #endif
@@ -1389,6 +1526,8 @@ EXPORT const char *zan_audio_driver_name(void) {
     return zan_audio_ready ? "alsa" : "";
 #elif defined(__APPLE__)
     return zan_audio_ready ? "coreaudio" : "";
+#elif defined(__OHOS__)
+    return zan_audio_ready ? "ohaudio" : "";
 #else
     return "";
 #endif

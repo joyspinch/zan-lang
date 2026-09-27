@@ -84,17 +84,17 @@ static int zan_android_shm_unlink(const char *name) {
 #endif
 
 #define ZAN_TABLE_MAGIC UINT64_C(0x5a414e54424c3031)
-/* Version 4: Expanded ZAN_TABLE_MAX_COLUMNS from 16 to 32, expanding header to 1600 bytes.
- * Older mappings (version <= 3) are rejected on Open/Attach to prevent row offset shifts. */
-#define ZAN_TABLE_VERSION 4
-#define ZAN_TABLE_MAX_COLUMNS 32
+/* Version 5: Expanded ZAN_TABLE_MAX_COLUMNS from 32 to 64, expanding header to 3136 bytes.
+ * Older mappings (version <= 4) are rejected on Open/Attach to prevent row offset shifts. */
+#define ZAN_TABLE_VERSION 5
+#define ZAN_TABLE_MAX_COLUMNS 64
 #define ZAN_TABLE_COLUMN_NAME 32
 /* Schema ceilings. The checker rejects a constant width past these where it
  * is declared (checker.c: CHECKER_SHARED_MAX_*), so raising one here means
  * raising it there. */
-#define ZAN_TABLE_MAX_KEY 256
-#define ZAN_TABLE_MAX_STRING 65536
-#define ZAN_TABLE_MAX_CAPACITY (UINT64_C(1) << 20)
+#define ZAN_TABLE_MAX_KEY 1024
+#define ZAN_TABLE_MAX_STRING 1048576
+#define ZAN_TABLE_MAX_CAPACITY (UINT64_C(1) << 30)
 #define ZAN_TABLE_INT 1
 #define ZAN_TABLE_STRING 2
 #define ZAN_TABLE_FLOAT 3
@@ -140,7 +140,7 @@ typedef struct {
 typedef struct {
     zan_shared_header *header;
     size_t mapped_size;
-    char map_name[96];
+    char map_name[256];
     /* Anonymous tables have no name at all: they are reached through an
      * inherited descriptor, so map_name stays empty and there is
      * nothing for destroy to unlink. */
@@ -332,13 +332,13 @@ static int zan_parse_schema(
     return count > 0;
 }
 
-static void zan_make_names(const char *name, char map_name[96]) {
+static void zan_make_names(const char *name, char map_name[256]) {
     unsigned long long hash = (unsigned long long)zan_hash_bytes(name);
 #ifdef _WIN32
-    snprintf(map_name, 96, "Local\\zan_table_%016llx", hash);
+    snprintf(map_name, 256, "Local\\zan_table_%016llx", hash);
 #else
     snprintf(
-        map_name, 96, "/tmp/zan_table_%lu_%016llx.shm",
+        map_name, 256, "/tmp/zan_table_%lu_%016llx.shm",
         (unsigned long)getuid(), hash);
 #endif
 }
@@ -2647,7 +2647,7 @@ typedef struct {
     int fd;
     int owner;         /* 1 = this handle created the region: only its close
                         * (or an explicit Unlink) may shm_unlink the name */
-    char name[64];     /* shm name (kept for shm_unlink), or "" for file-backed */
+    char name[256];    /* shm name (kept for shm_unlink), or "" for file-backed */
 } zan_mmap_handle;
 #endif
 
@@ -2676,7 +2676,7 @@ long long zan_mmap_create(const char *name, long long size) {
     }
     return (long long)(intptr_t)named;
 #else
-    char shm_name[96];
+    char shm_name[256];
     snprintf(shm_name, sizeof(shm_name), "/%s", name);
     int fd = shm_open(shm_name, O_CREAT | O_EXCL | O_RDWR, 0600);
     if (fd < 0) return 0;
@@ -2709,7 +2709,7 @@ long long zan_mmap_open(const char *name, long long size) {
     if (!h) return 0;
     return (long long)(intptr_t)h;
 #else
-    char shm_name[96];
+    char shm_name[256];
     snprintf(shm_name, sizeof(shm_name), "/%s", name);
     int fd = shm_open(shm_name, O_RDWR, 0600);
     if (fd < 0) return 0;
@@ -2833,7 +2833,7 @@ long long zan_mmap_unlink(const char *name) {
     (void)name;
     return 1;
 #else
-    char shm_name[96];
+    char shm_name[256];
     snprintf(shm_name, sizeof(shm_name), "/%s", name);
     return shm_unlink(shm_name) == 0 ? 1 : 0;
 #endif

@@ -70,7 +70,7 @@ static zan_type_t *builtin_call_result_type(zan_checker_t *c,
 /* Depth cap for every walk that follows base_type / interface chains. The
  * binder rejects cyclic inheritance outright (binder.c resolve_bases), but a
  * stray ring must never turn a checker pass into an infinite loop. */
-#define CHECKER_DERIVES_MAX_DEPTH 1024
+#define CHECKER_DERIVES_MAX_DEPTH 8192
 
 void zan_checker_init(zan_checker_t *c, zan_binder_t *binder,
                       zan_arena_t *arena, zan_diag_t *diag) {
@@ -3124,8 +3124,8 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
          * both lists are checked by the same loop below. */
         int ctor_argc = (!factory_init && !expr->new_expr.is_array && type && type->sym)
             ? ctor_arg_count(c, expr, type->sym) : 0;
-        zan_type_t *ctor_arg_types[64];
-        if (ctor_argc > 64) ctor_argc = 64;
+        zan_type_t *ctor_arg_types[256];
+        if (ctor_argc > 256) ctor_argc = 256;
         for (int k = 0; k < ctor_argc; k++) ctor_arg_types[k] = NULL;
 
         zan_ast_list_t *init_lists[2] = { &expr->new_expr.args,
@@ -4278,7 +4278,7 @@ static void check_method_body(zan_checker_t *c, zan_ast_node_t *method) {
 static bool check_struct_cycle_dfs(zan_checker_t *c, zan_ast_node_t *struct_decl,
                                    zan_ast_node_t **stack, int depth) {
     if (!struct_decl || struct_decl->kind != AST_STRUCT_DECL) return false;
-    if (depth >= 64) {
+    if (depth >= 512) {
         zan_diag_emit(c->diag, DIAG_ERROR, struct_decl->loc,
                       "struct '%.*s' exceeds maximum nesting depth",
                       (int)struct_decl->type_decl.name.len,
@@ -4324,7 +4324,7 @@ static void check_all_struct_cycles(zan_checker_t *c, zan_ast_node_t *unit) {
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {
         zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
         if (decl && decl->kind == AST_STRUCT_DECL) {
-            zan_ast_node_t *stack[64];
+            zan_ast_node_t *stack[512];
             check_struct_cycle_dfs(c, decl, stack, 0);
         }
     }

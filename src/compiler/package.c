@@ -815,7 +815,7 @@ typedef struct {
     char plugin_id[64];
 } zan_usage_seen_t;
 
-static zan_usage_seen_t zan_usage_seen[64];
+static zan_usage_seen_t zan_usage_seen[1024];
 static int zan_usage_seen_count;
 
 void zan_pkg_note_usage(const char *store, const char *package_name) {

@@ -144,7 +144,7 @@ i64 zan_monotonic_ns(void) {
 
 /* ---- shared table (cross-process; impossible here -> graceful stubs) ----- */
 
-#define ZAN_TABLE_MAX_STRING 65536
+#define ZAN_TABLE_MAX_STRING 1048576
 
 static char g_wasm_shared_string[ZAN_TABLE_MAX_STRING + 1];
 

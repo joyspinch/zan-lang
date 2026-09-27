@@ -90,7 +90,7 @@
 #define ZAN_REFL_VK_PTR      2   /* a string / reference, as an integer */
 
 /* the maximum number of arguments a reflected call can pack */
-#define ZAN_REFL_ARG_SLOTS   16
+#define ZAN_REFL_ARG_SLOTS   64
 
 /* type kinds */
 #define ZAN_REFL_TK_CLASS     1

@@ -437,7 +437,7 @@ zan_type_t *zan_binder_make_tuple_type(zan_binder_t *b, zan_type_t **elems,
                                        int count) {
     if (!b || !elems || count <= 0) return b ? b->type_error : NULL;
     /* canonical signature: "__tuple<N>:<sig1>,<sig2>,..." */
-    char sig[512];
+    char sig[4096];
     snprintf(sig, sizeof sig, "__tuple%d:", count);
     bool complete = true;
     for (int i = 0; i < count; i++) {
