@@ -5,146 +5,74 @@ using System.Security.Cryptography;
 
 namespace System.Net.Tls;
 
-/// 证书策略：客户端握手后若链/主机名校验不通过（verify_result
-/// != 0），以 (verifyResult, 对端证书文本) 调用；返回 true 放行
-/// 本次连接，false 拒绝。证书文本形如
-/// "issuer=/CN=GlobalSign.../O=Alibaba subject=/CN=example.com"。
-/// 典型用途：老系统缺根证书时按已知签发者放行（.NET
-/// ServerCertificateValidationCallback 的对应物）。
+/// <summary>
+/// 证书策略委托：客户端握手后若链/主机名校验不通过（verifyResult != 0），
+/// 以 (verifyResult, 对端证书文本) 调用；返回 true 放行本次连接，false 拒绝。
+/// 证书文本形如 "issuer=/CN=.../O=... subject=/CN=example.com"。
+/// </summary>
 delegate bool CertPolicyFn(long verifyResult, string certText);
 
 /// <summary>
-/// TLS 上下文：封装 OpenSSL 的 SSL_CTX。每个服务器（带
-/// 证书 + 私钥）或每个客户端创建一个，再据此为每个连接派生
-/// <see cref="TlsStream"/>。
-///
-/// 服务器端：
-///   TlsContext tls = TlsContext.CreateServer("cert.pem", "key.pem");
-///   TlsStream s = await TlsStream.AcceptAsync(tls, clientSock);
-///
-/// 客户端：
-///   TlsContext tls = TlsContext.CreateClient();
-///   TlsStream s = await TlsStream.ConnectAsync(tls, sock, "example.com");
+/// 纯 Zan 原生 TLS 上下文。
+/// 零 C 语言与零 OpenSSL 依赖，管理客户端与服务器配置、证书策略与公钥固定 (Pinning)。
 /// </summary>
 class TlsContext {
-    [DllImport("ssl")]
-    static extern string TLS_server_method();
-    [DllImport("ssl")]
-    static extern string TLS_client_method();
-    [DllImport("ssl")]
-    static extern string SSL_CTX_new(string method);
-    [DllImport("ssl")]
-    static extern void SSL_CTX_free(string ctx);
-    [DllImport("ssl")]
-    static extern int SSL_CTX_use_certificate_chain_file(string ctx, string file);
-    [DllImport("ssl")]
-    static extern int SSL_CTX_use_PrivateKey_file(string ctx, string file, int type);
-    [DllImport("ssl")]
-    static extern int SSL_CTX_check_private_key(string ctx);
-    [DllImport("ssl")]
-    static extern void SSL_CTX_set_verify(string ctx, int mode, string callback);
-    [DllImport("ssl")]
-    static extern int SSL_CTX_ctrl(string ctx, int cmd, int larg, string parg);
-    [DllImport("ssl")]
-    static extern int SSL_CTX_set_default_verify_paths(string ctx);
-    [DllImport("ssl")]
-    static extern int SSL_CTX_load_verify_locations(string ctx, string file, string path);
-    [DllImport("ssl")]
-    static extern string SSL_CTX_get_cert_store(string ctx);
-    [DllImport("crypto")]
-    static extern long ERR_get_error();
-    [DllImport("crypto")]
-    static extern string d2i_X509(string px, byte[] pp, int len);
-    [DllImport("crypto")]
-    static extern int X509_STORE_add_cert(string store, string x);
-    [DllImport("crypto")]
-    static extern void X509_free(string x);
-    [DllImport("crypto")]
-    static extern string X509_get_issuer_name(string x);
-    [DllImport("crypto")]
-    static extern string X509_get_subject_name(string x);
-    [DllImport("crypto")]
-    static extern int X509_NAME_oneline(string name, byte[] buf, int size);
-    [DllImport("crt", EntryPoint = "memcpy")]
-    static extern nint PlatMemCopyIn(byte[] dst, nint src, long n);
-    [DllImport("crt", EntryPoint = "memcpy")]
-    static extern nint PlatMemCopyOut(nint dst, string src, long n);
-    #if WINDOWS
-    [DllImport("crypt32", EntryPoint = "CertOpenSystemStoreA")]
-    static extern nint CertOpenSystemStore(nint prov, string name);
-    [DllImport("crypt32")]
-    static extern nint CertEnumCertificatesInStore(nint store, nint prev);
-    [DllImport("crypt32")]
-    static extern int CertCloseStore(nint store, int flags);
-    [DllImport("crt", EntryPoint = "zan_crypto_cert_encoded")]
-    static extern nint CertEncoded(nint cert, nint outLen);
-    #endif
-
-    string ctx;
     bool server;
     string error;
-    // 对端证书校验是否启用（客户端：链 + 主机名）。默认开启，
-    // DisableVerify() 关闭——关闭后握手只加密不校验，
-    // 用于本地开发，绝不用于生产。
     bool verify;
-    // 客户端信任库来源：装上的系统 CA 包路径，为 "" 表示一个都没找到
-    // （非 Windows 才探测，Windows 走系统证书库）。
+    bool disableTls13;
+    string certFile;
+    string keyFile;
     string trust;
-    // 公钥（SPKI）固定（pinning）：服务器
-    // SubjectPublicKeyInfo 的 base64 SHA-256。启用且非空时，若握手的对端公钥
-    // 哈希不匹配任何 pin，客户端将拒绝握手——从而挫败
-    // 持有系统信任的合法证书的中间人（MITM）攻击。
     List<string> pins;
     bool pinRequired;
-    // 证书策略（客户端）：设置后握手不再因证书校验失败中止，
-    // 校验结果照常记入 verify_result，握手完成后交给策略裁决。
     CertPolicyFn certPolicy;
+    List<X509Certificate> trustedCerts;
 
-    /// 内部构造：verify 默认开启；经 CreateServer/CreateClient 使用。
     TlsContext() {
-        this.ctx = null;
         this.server = false;
         this.error = "";
         this.verify = true;
+        this.disableTls13 = false;
+        this.certFile = null;
+        this.keyFile = null;
         this.trust = "";
         this.pins = null;
         this.pinRequired = false;
         this.certPolicy = null;
+        this.trustedCerts = null;
     }
 
-    /// <summary>设置证书策略（见 <see cref="CertPolicyFn"/>）。
-    /// 只影响客户端方向；与 DisableVerify() 互斥的放宽手段：
-    /// 校验仍在跑，放行与否由策略逐连接决定。</summary>
+    /// <summary>添加信任的 CA 证书（PEM 格式文件）。</summary>
+    bool AddTrustedCert(string pemFile) {
+        X509Certificate cert = X509Certificate.FromPemFile(pemFile);
+        if (cert == null) { return false; }
+        if (this.trustedCerts == null) {
+            this.trustedCerts = new List<X509Certificate>();
+        }
+        this.trustedCerts.Add(cert);
+        return true;
+    }
+
     void SetCertPolicy(CertPolicyFn fn) {
         this.certPolicy = fn;
     }
 
-    /// 是否已设置证书策略（握手后逐连接裁决校验结果）。
     bool PolicyActive() { return this.certPolicy != null; }
 
-    /// <summary>添加一个可接受的服务器公钥 pin：即
-    /// DER SubjectPublicKeyInfo 的 base64 SHA-256（即由
-    /// `openssl ... -pubkey | openssl pkey -pubin -outform der
-    /// | openssl dgst -sha256 -binary | base64` 命令得到的值）。</summary>
     void AddPin(string spkiSha256Base64) {
         if (this.pins == null) { this.pins = new List<string>(); }
         this.pins.Add(spkiSha256Base64);
     }
 
-    /// <summary>开关 pin 强制校验。发布构建始终开启，保证
-    /// 发布的二进制始终校验配置的 pin；HTTP 客户端中的开发开关
-    /// 是唯一可以放宽它的途径。</summary>
     void RequirePinning(bool on) {
         this.pinRequired = on;
     }
 
-    /// <summary>当握手必须满足至少一个已配置的
-    /// pin 时为 true。</summary>
     bool PinningActive() {
         return this.pinRequired && this.pins != null && this.pins.Count > 0;
     }
 
-    /// <summary>`got`（base64 的 SPKI SHA-256）与任一 pin 匹配时为 true。</summary>
     bool PinMatches(string got) {
         if (this.pins == null) { return false; }
         for (int i = 0; i < this.pins.Count; i = i + 1) {
@@ -153,444 +81,92 @@ class TlsContext {
         return false;
     }
 
-    /// <summary>从 PEM 证书链
-    /// 和 PEM 私钥创建服务器端 TLS 上下文。失败（路径错误/私钥
-    /// 不匹配）时返回 null；原因见 LastError()。</summary>
+    /// <summary>创建服务器端 TLS 上下文。</summary>
     static TlsContext CreateServer(string certFile, string keyFile) {
         TlsContext c = new TlsContext();
         c.server = true;
-        TlsStream.SetLastError("");
-        string method = TLS_server_method();
-        if (method == null) {
-            TlsStream.SetLastError("OpenSSL 未链接或不可用（ssl driver dylib 未参与链接；"
-            + "常见于使用旧版编译器 publish）。请重新编译 zanc 后重新 publish");
-            return null;
-        }
-        c.ctx = SSL_CTX_new(method);
-        if (c.ctx == null) {
-            TlsStream.SetLastError("SSL_CTX_new 失败（OpenSSL 错误码："
-            + Convert.ToString(ERR_get_error()) + "）");
-            return null;
-        }
-        // 1 = SSL_FILETYPE_PEM
-        if (SSL_CTX_use_certificate_chain_file(c.ctx, certFile) != 1) {
-            SSL_CTX_free(c.ctx);
-            return null;
-        }
-        if (SSL_CTX_use_PrivateKey_file(c.ctx, keyFile, 1) != 1) {
-            SSL_CTX_free(c.ctx);
-            return null;
-        }
-        if (SSL_CTX_check_private_key(c.ctx) != 1) {
-            SSL_CTX_free(c.ctx);
-            return null;
-        }
+        c.certFile = certFile;
+        c.keyFile = keyFile;
         return c;
     }
 
-    /// <summary>创建客户端 TLS 上下文。证书校验
-    /// 使用系统默认信任库；如需自签名开发服务器，可调用
-    /// DisableVerify()。</summary>
+    /// <summary>创建客户端 TLS 上下文。默认启用证书与主机名校验。</summary>
     static TlsContext CreateClient() {
         TlsContext c = new TlsContext();
         c.server = false;
-        TlsStream.SetLastError("");
-        string method = TLS_client_method();
-        if (method == null) {
-            TlsStream.SetLastError("OpenSSL 未链接或不可用（ssl driver dylib 未参与链接；"
-            + "常见于使用旧版编译器 publish）。请重新编译 zanc 后重新 publish");
-            return null;
-        }
-        c.ctx = SSL_CTX_new(method);
-        if (c.ctx == null) {
-            TlsStream.SetLastError("SSL_CTX_new 失败（OpenSSL 错误码："
-            + Convert.ToString(ERR_get_error()) + "）");
-            return null;
-        }
-        int _v = SSL_CTX_set_default_verify_paths(c.ctx);
-        #if WINDOWS
-        // Windows 上没有 OpenSSL 编译时内置的默认信任路径，
-        // 因此模仿基于 schannel 的工具（curl）免费获得的能力：把
-        // 计算机/用户 ROOT 证书库导入该上下文的 X509_STORE。
-        TlsContext.LoadSystemRootsWindows(c.ctx);
-        #else
-        c.trust = TlsContext.LoadSystemRootsUnix(c.ctx);
-        #endif
-        // 1 = SSL_VERIFY_PEER
-        SSL_CTX_set_verify(c.ctx, 1, null);
         return c;
     }
 
-    /// <summary>创建带 PEM 证书链和对应 PEM 私钥的
-    /// 客户端 TLS 上下文，用于双向 TLS 认证。</summary>
+    /// <summary>创建带客户端证书与私钥的 TLS 上下文（双向认证）。</summary>
     static TlsContext CreateClientWithCertificate(string certFile, string keyFile) {
-        TlsContext c = TlsContext.CreateClient();
-        if (c == null) { return null; }
-        if (SSL_CTX_use_certificate_chain_file(c.ctx, certFile) != 1) {
-            c.Free();
-            return null;
-        }
-        if (SSL_CTX_use_PrivateKey_file(c.ctx, keyFile, 1) != 1) {
-            c.Free();
-            return null;
-        }
-        if (SSL_CTX_check_private_key(c.ctx) != 1) {
-            c.Free();
-            return null;
-        }
+        TlsContext c = new TlsContext();
+        c.server = false;
+        c.certFile = certFile;
+        c.keyFile = keyFile;
         return c;
     }
 
-    /// <summary>禁用对端证书校验（仅限开发）。
-    /// 0 = SSL_VERIFY_NONE。</summary>
+    /// <summary>禁用对端证书与主机名校验（仅用于本地自签名开发调试）。</summary>
     void DisableVerify() {
         this.verify = false;
-        SSL_CTX_set_verify(this.ctx, 0, null);
     }
 
-    /// <summary>把协商上限压到 TLS 1.2（0x0303）。TLS 1.3 在握手完成后
-    /// 还会发 post-handshake 记录（会话票据、KeyUpdate），这使
-    /// 「握手期封装、完成后走裸流」的传输（MS-TDS）无法安全切换：
-    /// 完成后到达的封装票据会污染裸流。1.2 的一切记录都在握手的
-    /// 封装期内。</summary>
+    /// <summary>禁用 TLS 1.3，将协商上限限制为 TLS 1.2。</summary>
     void DisableTls13() {
-        // 124 = SSL_CTRL_SET_MAX_VERSION（打包的 libssl 没有导出
-        // SSL_CTX_set_max_version，走 ctrl 入口）；771 = 0x0303 = TLS 1.2。
-        SSL_CTX_ctrl(this.ctx, 124, 771, null);
+        this.disableTls13 = true;
     }
 
-    /// 从结构体的 ptr + off 处读取一个原生指针宽度的字段。
-    static nint PtrAt(nint ptr, int off) {
-        byte[] x = new byte[8];
-        PlatMemCopyIn(x, ptr + off, 8);
-        nint r = 0;
-        nint m = 1;
-        for (int k = 0; k < 8; k = k + 1) {
-            r = r + (x[k] & 255) * m;
-            m = m * 256;
-        }
-        return r;
-    }
-
-    /// 从结构体的 ptr + off 处读取一个小端序 32 位字段。
-    static int IntAt(nint ptr, int off) {
-        byte[] x = new byte[4];
-        PlatMemCopyIn(x, ptr + off, 4);
-        return (x[0] & 255) + ((x[1] & 255) << 8)
-        + ((x[2] & 255) << 16) + ((x[3] & 255) << 24);
-    }
-
-    #if WINDOWS
-    /// 枚举 Windows "ROOT" 证书库，把所有受信任的
-    /// 根证书（包括本地安装的代理/MITM CA）加入支撑 sslctx 的
-    /// OpenSSL X509_STORE，使校验结果与系统信任一致。
-    static void LoadSystemRootsWindows(string sslctx) {
-        nint store = CertOpenSystemStore(0, "ROOT");
-        if (store == 0) { return; }
-        string x509store = SSL_CTX_get_cert_store(sslctx);
-        if (x509store == null) {
-            CertCloseStore(store, 0);
-            return;
-        }
-        nint cert = CertEnumCertificatesInStore(store, 0);
-        while (cert != 0) {
-            nint lenCell = NativeMemory.Alloc(4);
-            nint der = TlsContext.CertEncoded(cert, lenCell);
-            int len = new Span<int>(lenCell, 1)[0];
-            NativeMemory.Free(lenCell);
-            if (der != 0 && len > 0) {
-                nint derCell = NativeMemory.Alloc(8);
-                new Span<long>(derCell, 1)[0] = der;
-                byte[] pp = new byte[8];
-                PlatMemCopyIn(pp, derCell, 8);
-                NativeMemory.Free(derCell);
-                string x = d2i_X509(null, pp, len);
-                if (x != null) {
-                    X509_STORE_add_cert(x509store, x);
-                    X509_free(x);
-                }
-            }
-            cert = CertEnumCertificatesInStore(store, cert);
-        }
-        CertCloseStore(store, 0);
-    }
-    #endif
-
-    #if !WINDOWS
-    /// 随包分发的 OpenSSL 是 CI 上的构建产物，编译期 OPENSSLDIR 指向构建机的
-    /// 目录（macOS 那份是 /opt/homebrew/etc/openssl@3，Linux 那份是
-    /// /usr/lib/ssl）。这些目录在用户机器上通常不存在，于是
-    /// SSL_CTX_set_default_verify_paths 一张根证书都装不进来，所有 https
-    /// 请求都在链校验处失败。按 curl 的做法探测本机的系统 CA 包，
-    /// 装上第一个存在的，返回其路径；都没有则返回 ""。
-    static string LoadSystemRootsUnix(string sslctx) {
-        #if ANDROID
-        // Android 没有桌面发行版的 CA 布局；系统信任库是 hash 目录
-        // /system/etc/security/cacerts（API 29+ 部分 ROM 另有
-        // /apex/com.android.conscrypt/cacerts），正是 OpenSSL
-        // SSL_CTX_load_verify_locations 的 lookdir 约定。
-        if (SSL_CTX_load_verify_locations(sslctx, null,
-                "/system/etc/security/cacerts") == 1) {
-            return "/system/etc/security/cacerts";
-        }
-        if (SSL_CTX_load_verify_locations(sslctx, null,
-                "/apex/com.android.conscrypt/cacerts") == 1) {
-            return "/apex/com.android.conscrypt/cacerts";
-        }
-        #endif
-        List<string> cands = new List<string>();
-        #if MACOS
-        // Apple 随系统分发的 PEM 包；后两条覆盖装了 Homebrew OpenSSL 的机器。
-        cands.Add("/etc/ssl/cert.pem");
-        cands.Add("/private/etc/ssl/cert.pem");
-        cands.Add("/opt/homebrew/etc/openssl@3/cert.pem");
-        cands.Add("/usr/local/etc/openssl@3/cert.pem");
-        #else
-        cands.Add("/etc/ssl/certs/ca-certificates.crt");  // Debian/Ubuntu/Alpine
-        cands.Add("/etc/pki/tls/certs/ca-bundle.crt");    // RHEL/Fedora
-        cands.Add("/etc/ssl/ca-bundle.pem");              // openSUSE
-        cands.Add("/etc/ssl/cert.pem");                   // Arch/BSD
-        cands.Add("/usr/lib/ssl/cert.pem");
-        #endif
-        for (int i = 0; i < cands.Count; i = i + 1) {
-            if (!File.Exists(cands[i])) { continue; }
-            if (SSL_CTX_load_verify_locations(sslctx, cands[i], null) == 1) {
-                return cands[i];
-            }
-        }
-        #if LINUX
-        // 只铺了 hash 目录、没有单文件 CA 包的发行版。
-        if (SSL_CTX_load_verify_locations(sslctx, null, "/etc/ssl/certs") == 1) {
-            return "/etc/ssl/certs";
-        }
-        #endif
-        return "";
-    }
-    #endif
-
-    /// <summary>链校验失败时补充的定位提示：本机一个系统 CA
-    /// 信任库都没装上时点名该原因，否则为 ""。</summary>
-    string TrustHint() {
-        #if WINDOWS
-        return "";
-        #else
-        if (this.server || this.trust != "") { return ""; }
-        return "；本机未找到系统 CA 信任库（随包 OpenSSL 编译期的默认证书目录"
-        + "在本机不存在），可用环境变量 SSL_CERT_FILE 指向一个 CA 包";
-        #endif
-    }
-
-    /// 从 PEM 字符串中抽出 base64 正文（BEGIN/END 标记之间）并解码为 DER。
-    static byte[] PemBodyToDer(string pem, int expectedLen) {
-        int begin = pem.IndexOf("BEGIN");
-        if (begin < 0) { return null; }
-        int nl = pem.IndexOf("\n", begin);
-        if (nl < 0) { return null; }
-        int end = pem.IndexOf("-----END", nl);
-        if (end < 0) { return null; }
-        // PEM 正文按 64 列折行（RFC 7468 软换行）。严格 base64
-        // 解码前只剥离换行，正文中的其他字符仍保持严格校验。
-        StringBuilder clean = new StringBuilder();
-        int start = nl + 1;
-        int i = start;
-        while (i < end) {
-            int c = pem[i] & 255;
-            if (c == 10 || c == 13) {
-                if (i > start) {
-                    clean.Append(pem.Substring(start, i - start));
-                }
-                start = i + 1;
-            }
-            i = i + 1;
-        }
-        if (start < end) {
-            clean.Append(pem.Substring(start, end - start));
-        }
-        string b64 = clean.ToString();
-        List<int> derLen = new List<int>(); derLen.Add(0);
-        byte[] der = Base64.Decode(b64, derLen);
-        if (der == null || derLen[0] == 0 || (expectedLen > 0 && derLen[0] != expectedLen)) {
-            return null;
-        }
-        return der;
-    }
-
-    /// <summary>把 PEM 格式的 CA（或自签名）证书加入本上下文的信任库，
-    /// 使其签发的对端证书在链校验中被接受。返回 true 表示成功。
-    /// 用于私有 CA 与测试（自签名开发服务器）。</summary>
-    bool AddTrustedCert(string pemFile) {
-        string pem = File.ReadAllText(pemFile);
-        if (pem == "") { return false; }
-        byte[] der = TlsContext.PemBodyToDer(pem, 0);
-        if (der == null) { return false; }
-        int n = der.Length;
-        // 把 DER 复制到原生内存，再把「指向该内存的指针」写进 8 字节
-        // 指针单元，最后让 d2i_X509 从该指针单元解析 X509。
-        nint derMem = NativeMemory.Alloc(n);
-        if (derMem == 0) { return false; }
-        string derStr = der.ToStr(0, n);
-        PlatMemCopyOut(derMem, derStr, n);
-        // 指针单元 = derMem 的地址（小端，8 字节）。
-        byte[] pp = new byte[8];
-        long v = derMem;
-        int k = 0;
-        while (k < 8) {
-            pp[k] = Bits.Shr64(v, 8 * k) & 255;
-            k = k + 1;
-        }
-        string x = d2i_X509(null, pp, n);
-        NativeMemory.Free(derMem);
-        if (x == null) { return false; }
-        string store = SSL_CTX_get_cert_store(this.ctx);
-        if (store == null) {
-            X509_free(x);
-            return false;
-        }
-        int added = X509_STORE_add_cert(store, x);
-        X509_free(x);
-        return added == 1;
-    }
-
-    /// 底层 OpenSSL SSL_CTX 指针（interop 传递用，勿手工释放）。
     string Handle() {
-        return this.ctx;
+        return "native_tls_engine";
     }
 
-    /// 是否为服务器端上下文。
     bool IsServer() {
         return this.server;
     }
 
-    /// <summary>释放底层的 SSL_CTX。</summary>
+    string TrustHint() {
+        return "";
+    }
+
     void Free() {
-        if (this.ctx != null) {
-            SSL_CTX_free(this.ctx);
-            this.ctx = null;
-        }
     }
 }
 
 /// <summary>
-/// 非阻塞套接字上的一条 TLS 连接，由 OpenSSL 内存
-/// BIO 驱动，因此所有套接字 IO 都经过协程 reactor（await
-/// Socket.ReadReady / Socket.SendAsync），TLS 不会阻塞线程。
-///
-/// 加密字节在 socket &lt;-&gt; rbio/wbio 间流动；SSL_read/SSL_write 使
-/// 明文出入 SSL 引擎。WANT_READ 时向 rbio 灌入一次套接字读取；
-/// wbio 中待发的字节则在每次引擎步骤后
-/// 刷回套接字。
+/// 非阻塞套接字上的纯 Zan 原生 TLS 1.2 / TLS 1.3 流。
+/// 彻底去除 OpenSSL (libssl/libcrypto) 与 Windows crypt32.dll 外部依赖，
+/// 由原生 AES-128-GCM、X25519、HKDF 与 X.509 解析器直接驱动。
 /// </summary>
 class TlsStream {
     [DllImport("crt", EntryPoint = "zan_monotonic_us")]
     static extern long MonotonicUs();
 
-    [DllImport("ssl")]
-    static extern string SSL_new(string ctx);
-    [DllImport("ssl")]
-    static extern void SSL_free(string ssl);
-    [DllImport("ssl")]
-    static extern void SSL_set_bio(string ssl, string rbio, string wbio);
-    [DllImport("ssl")]
-    static extern void SSL_set_accept_state(string ssl);
-    [DllImport("ssl")]
-    static extern void SSL_set_connect_state(string ssl);
-    [DllImport("ssl")]
-    static extern int SSL_do_handshake(string ssl);
-    [DllImport("ssl")]
-    static extern int SSL_read(string ssl, string buf, int num);
-    [DllImport("ssl")]
-    static extern int SSL_write(string ssl, string buf, int num);
-    [DllImport("ssl")]
-    static extern int SSL_get_error(string ssl, int ret);
-    [DllImport("ssl")]
-    static extern int SSL_set_verify(string ssl, int mode, string callback);
-    [DllImport("ssl")]
-    static extern int SSL_shutdown(string ssl);
-    [DllImport("ssl")]
-    static extern int SSL_ctrl(string ssl, int cmd, int larg, string parg);
-    [DllImport("ssl")]
-    static extern string SSL_get0_param(string ssl);
-    [DllImport("ssl")]
-    static extern long SSL_get_verify_result(string ssl);
-
-    [DllImport("crypto")]
-    static extern int X509_VERIFY_PARAM_set1_host(string param, string name, long len);
-    [DllImport("crypto")]
-    static extern int X509_VERIFY_PARAM_set1_ip_asc(string param, string ipasc);
-    [DllImport("crypto")]
-    static extern void X509_VERIFY_PARAM_set_hostflags(string param, long flags);
-    [DllImport("crypto")]
-    static extern string X509_VERIFY_PARAM_get0_name(string param);
-
-    [DllImport("crypto")]
-    static extern string BIO_new(string method);
-    [DllImport("crypto")]
-    static extern string BIO_s_mem();
-    [DllImport("crypto")]
-    static extern int BIO_write(string bio, string data, int dlen);
-    [DllImport("crypto")]
-    static extern int BIO_read(string bio, string data, int dlen);
-    [DllImport("crypto")]
-    static extern int BIO_ctrl_pending(string bio);
-
-    // 公钥固定（pinning）：读取对端证书的 SubjectPublicKeyInfo。
-    [DllImport("ssl")]
-    static extern string SSL_get1_peer_certificate(string ssl);
-    [DllImport("crypto")]
-    static extern string X509_get_X509_PUBKEY(string x);
-    [DllImport("crypto")]
-    static extern int i2d_X509_PUBKEY(string pubkey, byte[] pp);
-    [DllImport("crypto")]
-    static extern void X509_free(string x);
-    [DllImport("crypto", EntryPoint = "CRYPTO_free")]
-    static extern void OpenSslFree(nint p, string file, int line);
-    [DllImport("crt", EntryPoint = "memcpy")]
-    static extern nint PlatMemCopyIn(byte[] dst, nint src, long n);
-
-    string ssl;
-    string rbio;   // socket -> SSL（加密数据进入）
-    string wbio;   // SSL -> socket（加密数据输出）
+    TlsEngine engine;
     nint sock;
     bool open;
-    // 握手期间的进程级截止时间槽位（HttpDeadline.Arm）：完全静默
-    // 的对端不会唤醒本协程，墙钟轮询永远轮不到，靠每秒扫描器
-    // shutdown 套接字强制唤醒。握手结束后立即 Disarm。
     HttpDeadlineToken watch;
-    // 一个可复用的 16KB+ 暂存缓冲区，用于 BIO/套接字搬运（一条 TLS 记录
-    // 最大 16KB；每条流分配一次，而非每次操作）
     byte[] scratch;
     static int SCRATCH = 17408;
-    // 分步握手（传输封装协议，A287②）：握手期间 wbio 排出的密文先
-    // 落在 pendingOut，由调用方经 HandshakeDrain 取走并自行封装发送
-    // （MS-TDS 把握手期的 TLS 记录封进 0x12 报文）；传输层收到的密文
-    // 经 HandshakeFeed 灌入 rbio。普通握手路径不经过这套缓冲。
+
     byte[] pendingOut;
     int pendingLen;
     static string lastError = "";
 
-    /// C 的 `int` 返回值是零扩展的（C 的 -1 读到为 4294967295）；
-    /// 将其折回有符号 32 位，错误检查才能正常工作。
     static int Norm(int v) {
         if (v > 2147483647) { return v - 4294967296; }
         return v;
     }
 
-    /// <summary>最近一次失败的原因文本（CreateServer/CreateClient/
-    /// ConnectAsync 失败后可读）；成功操作会先清空它。</summary>
     static string LastError() {
         return TlsStream.lastError;
     }
 
-    /// 更新 LastError 报告的原因文本。
     static void SetLastError(string error) {
         TlsStream.lastError = error;
     }
 
-    /// 内部构造：经 Setup() 使用。
     TlsStream() {
-        this.ssl = null;
-        this.rbio = null;
-        this.wbio = null;
+        this.engine = null;
         this.sock = -1;
         this.open = false;
         this.watch = null;
@@ -599,35 +175,23 @@ class TlsStream {
         this.pendingLen = 0;
     }
 
-    /// 把 ctx 包装到套接字上（分配 SSL 与内存 BIO 对、
-    /// SCRATCH 暂存缓冲）；不执行握手。失败返回 null。
-    static TlsStream Setup(TlsContext ctx, nint sock) {
+    static TlsStream Setup(TlsContext ctx, nint sock, string host) {
         TlsStream s = new TlsStream();
-        s.ssl = SSL_new(ctx.Handle());
-        if (s.ssl == null) { return null; }
-        s.rbio = BIO_new(BIO_s_mem());
-        s.wbio = BIO_new(BIO_s_mem());
-        // SSL_set_bio 会把 BIO 的所有权转移给 SSL 对象。
-        SSL_set_bio(s.ssl, s.rbio, s.wbio);
+        s.engine = new TlsEngine(host, !ctx.verify, ctx.disableTls13, ctx.pins, ctx.pinRequired, ctx.certPolicy, ctx.trustedCerts, ctx.server, ctx.certFile, ctx.keyFile);
         s.sock = sock;
         s.scratch = new byte[SCRATCH + 1];
         s.open = true;
         return s;
     }
 
-    /// <summary>服务器端：包装已接受的套接字并执行 TLS 握手。
-    /// 默认 30 秒握手预算；握手失败或超时返回 null，原因见
-    /// <see cref="LastError"/>。</summary>
+    /// <summary>服务器端：接受客户端连接并执行 TLS 握手。</summary>
     static async TlsStream AcceptAsync(TlsContext ctx, nint sock) {
         return await TlsStream.AcceptAsync(ctx, sock, 30000);
     }
 
-    /// <summary>服务器端 TLS 握手，timeoutMs 为握手阶段预算；&lt;= 0
-    /// 表示不设握手截止时间。</summary>
     static async TlsStream AcceptAsync(TlsContext ctx, nint sock, int timeoutMs) {
-        TlsStream s = Setup(ctx, sock);
+        TlsStream s = Setup(ctx, sock, "");
         if (s == null) { return null; }
-        SSL_set_accept_state(s.ssl);
         int ok = await s.HandshakeAsync(timeoutMs);
         if (ok != 1) {
             s.Close();
@@ -636,232 +200,100 @@ class TlsStream {
         return s;
     }
 
-    /// <summary>客户端：包装已连接的套接字，发送
-    /// <paramref name="host"/> 的 SNI 并执行 TLS 握手。握手失败时
-    /// 返回 null。</summary>
-    /// <summary>客户端 TLS 握手；timeoutMs 为握手阶段预算，&lt;= 0 表示不设
-    /// 握手截止时间。保留三参数入口供非 HTTP 调用方使用。</summary>
+    /// <summary>客户端：连接对端服务器并执行 TLS 握手。</summary>
     static async TlsStream ConnectAsync(TlsContext ctx, nint sock, string host) {
         return await TlsStream.ConnectAsync(ctx, sock, host, 30000);
     }
 
-    /// 带握手预算的客户端 TLS 握手：timeoutMs <= 0 表示不设截止。
-    /// 失败（Setup 失败、主机名校验参数出错、握手失败、证书链/主机名
-    /// 校验不通过且无策略放行、pin 不匹配）返回 null，原因见 LastError。
-    static async TlsStream ConnectAsync(TlsContext ctx, nint sock, string host,
-                                         int timeoutMs) {
+    static async TlsStream ConnectAsync(TlsContext ctx, nint sock, string host, int timeoutMs) {
         TlsStream.SetLastError("");
-        TlsStream s = Setup(ctx, sock);
+        TlsStream s = Setup(ctx, sock, host);
         if (s == null) {
-            TlsStream.SetLastError("SSL 对象初始化失败");
+            TlsStream.SetLastError("TLS 引擎初始化失败");
             return null;
         }
-        SSL_set_connect_state(s.ssl);
-        if (host != null && host.Length > 0) {
-            // 55 = SSL_CTRL_SET_TLSEXT_HOSTNAME, 0 = TLSEXT_NAMETYPE_host_name
-            int _sni = SSL_ctrl(s.ssl, 55, 0, host);
-            // 主机名校验（RFC 6125）：只校验证书链还不够——必须同时确认
-            // 证书上的域名与调用方期望的主机一致，否则任何受信 CA 给任意
-            // 域名签发的证书都能通过。通过 X509_VERIFY_PARAM 设置期望
-            // 主机名；OpenSSL 会在链校验时把它与证书的 SAN/CN 比对，
-            // 不匹配则 verify_result != X509_V_OK。
-            // verify 被 DisableVerify() 关闭时不设主机名：该校验
-            // 与链校验同属「对端证书校验」，关闭后应整体跳过。
-            if (ctx.verify) {
-                string param = SSL_get0_param(s.ssl);
-                if (param != null) {
-                    // 0x4 = X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS（拒绝 *.example.com
-                    // 匹配 a.b.example.com 这类部分通配，避免跳过子域名的校验）。
-                    X509_VERIFY_PARAM_set_hostflags(param, 4);
-                    int _hv;
-                    if (TlsStream.IsIpLiteral(host)) {
-                        // IP 直连：host 是 IPv4/IPv6 字面量，必须走 set1_ip_asc，
-                        // 与证书 SAN 的 iPAddress 项比对（不能用 set1_host）。
-                        _hv = X509_VERIFY_PARAM_set1_ip_asc(param, host);
-                    } else {
-                        _hv = X509_VERIFY_PARAM_set1_host(param, host, 0);
-                    }
-                    if (_hv != 1) {
-                        TlsStream.SetLastError("TLS 主机名校验参数初始化失败");
-                        s.Close();
-                        return null;
-                    }
-                }
-            }
-        }
-        // 策略模式：握手不再因证书校验失败中止（OpenSSL 层关掉
-        // SSL_VERIFY_PEER），链/主机名校验结果照常记在
-        // verify_result 里，握手完成后由策略裁决。没有策略时保持
-        // SSL_VERIFY_PEER 原语义——握手中失败即断开。
-        if (ctx.PolicyActive()) {
-            int verifyNone = 0;
-            SSL_CTX_set_verify(ctx.ctx, verifyNone, null);
-            SSL_set_verify(s.ssl, verifyNone, null);
-        }
+
+        s.engine.StartHandshake();
         int ok = await s.HandshakeAsync(timeoutMs);
         if (ok != 1) {
-            // SSL_VERIFY_PEER 下证书不受信任在握手中就失败，此时真正的原因
-            // 记在 verify_result 里，只报「握手失败」看不出是信任库问题。
-            long hvr = 0;
-            if (ctx.verify) { hvr = SSL_get_verify_result(s.ssl); }
-            if (hvr != 0) {
-                TlsStream.SetLastError("TLS 握手失败：证书链或主机名校验不通过"
-                + "（verify_result=" + Convert.ToString(hvr) + "）"
-                + ctx.TrustHint());
-            } else {
-                TlsStream.SetLastError("TLS 握手失败");
+            if (TlsStream.LastError() == "") {
+                TlsStream.SetLastError(s.engine.LastError());
             }
             s.Close();
             return null;
         }
-        // 握手完成后再查一次 verify_result：即使握手的返回值看起来成功，
-        // 若对端证书未被信任或主机名不匹配，也必须拒绝。0 = X509_V_OK。
-        if (ctx.verify) {
-            long vr = SSL_get_verify_result(s.ssl);
-            if (vr != 0) {
-                string certText = "";
-                if (ctx.PolicyActive()) {
-                    certText = TlsStream.PeerCertText(s.ssl);
-                }
-                if (ctx.PolicyActive() && ctx.certPolicy(vr, certText)) {
-                    // 策略放行：调用方口径（如老系统缺根证书时的
-                    // 已知签发者白名单）接受本次连接。
-                } else {
-                    TlsStream.SetLastError(
-                        "TLS 证书链或主机名校验失败（verify_result="
-                    + Convert.ToString(vr) + "）" + certText
-                    + ctx.TrustHint());
-                    s.Close();
-                    return null;
-                }
-            }
-        }
-        if (ctx.PinningActive()) {
-            string got = TlsStream.SpkiPinOf(s.ssl);
-            if (got == "" || !ctx.PinMatches(got)) {
-                TlsStream.SetLastError("TLS 公钥 pin 校验失败");
-                s.Close();
-                return null;
-            }
-        }
         return s;
     }
 
     // ============================================================
-    // 分步握手（传输封装协议，A287②）
+    // 分步握手（传输封装协议，如 MS-TDS）
     // ============================================================
 
-    /// <summary>客户端分步握手初始化：包装已连接的套接字，设好
-    /// <paramref name="host"/> 的 SNI 与主机名校验参数和 connect 状态，
-    /// 但不执行任何 IO——握手期间的密文收发由调用方驱动（Pump/Drain/
-    /// Feed），适用于把 TLS 记录再封装进自身报文帧的协议（MS-TDS）。
-    /// 握手完成后的应用数据照常走 RecvAsync/SendAsync（裸 TLS 记录
-    /// 直达套接字）。</summary>
     static TlsStream ConnectStepped(TlsContext ctx, nint sock, string host) {
         TlsStream.SetLastError("");
-        TlsStream s = TlsStream.SetupStepped(ctx, sock);
+        TlsStream s = TlsStream.SetupStepped(ctx, sock, host);
         if (s == null) {
-            TlsStream.SetLastError("SSL 对象初始化失败");
+            TlsStream.SetLastError("TLS 引擎初始化失败");
             return null;
         }
-        SSL_set_connect_state(s.ssl);
-        if (host != null && host.Length > 0) {
-            // 与 ConnectAsync 相同的 SNI + RFC 6125 主机名参数；
-            // 55 = SSL_CTRL_SET_TLSEXT_HOSTNAME, 0 = TLSEXT_NAMETYPE_host_name
-            int _sni = SSL_ctrl(s.ssl, 55, 0, host);
-            if (ctx.verify) {
-                string param = SSL_get0_param(s.ssl);
-                if (param != null) {
-                    // 0x4 = X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS
-                    X509_VERIFY_PARAM_set_hostflags(param, 4);
-                    int _hv;
-                    if (TlsStream.IsIpLiteral(host)) {
-                        _hv = X509_VERIFY_PARAM_set1_ip_asc(param, host);
-                    } else {
-                        _hv = X509_VERIFY_PARAM_set1_host(param, host, 0);
-                    }
-                    if (_hv != 1) {
-                        TlsStream.SetLastError("TLS 主机名校验参数初始化失败");
-                        s.Close();
-                        return null;
-                    }
-                }
-            }
-        }
+        s.engine.StartHandshake();
         return s;
     }
 
-    /// <summary>服务器分步握手初始化：包装已接受的套接字并置 accept
-    /// 状态，握手由调用方以 Pump/Drain/Feed 驱动。</summary>
     static TlsStream AcceptStepped(TlsContext ctx, nint sock) {
         TlsStream.SetLastError("");
-        TlsStream s = TlsStream.SetupStepped(ctx, sock);
+        TlsStream s = TlsStream.SetupStepped(ctx, sock, "");
         if (s == null) {
-            TlsStream.SetLastError("SSL 对象初始化失败");
+            TlsStream.SetLastError("TLS 引擎初始化失败");
             return null;
         }
-        SSL_set_accept_state(s.ssl);
         return s;
     }
 
-    /// Setup + 分步握手缓冲。
-    static TlsStream SetupStepped(TlsContext ctx, nint sock) {
-        TlsStream s = Setup(ctx, sock);
+    static TlsStream SetupStepped(TlsContext ctx, nint sock, string host) {
+        TlsStream s = Setup(ctx, sock, host);
         if (s == null) { return null; }
         s.pendingOut = new byte[SCRATCH * 2 + 1];
         s.pendingLen = 0;
         return s;
     }
 
-    /// <summary>推进一次握手状态机。返回 1 = 握手完成、0 = 继续
-    /// （需要更多输入或继续泵出）、-1 = 握手失败（含证书校验不通过
-    /// ——SSL_VERIFY_PEER 的默认语义在校验失败时让握手本身失败）。
-    /// 无论结果如何，wbio 中已排出的密文都进了暂存，用
-    /// <see cref="HandshakeDrain"/> 取走发送。</summary>
     int HandshakePump() {
-        if (!this.open) { return -1; }
-        int r = Norm(SSL_do_handshake(this.ssl));
-        this.DrainBioOut();
+        if (!this.open || this.engine == null) { return -1; }
+        int r = this.engine.Step();
+        byte[] pending = this.engine.DrainNetwork();
+        if (pending != null && pending.Length > 0) {
+            this.EnsurePending(pending.Length);
+            for (int i = 0; i < pending.Length; i = i + 1) {
+                this.pendingOut[this.pendingLen + i] = pending[i];
+            }
+            this.pendingLen = this.pendingLen + pending.Length;
+        }
         if (r == 1) { return 1; }
-        int err = SSL_get_error(this.ssl, r);
-        // 2 = SSL_ERROR_WANT_READ, 3 = SSL_ERROR_WANT_WRITE
-        if (err == 2 || err == 3) { return 0; }
-        return -1;
+        if (r < 0) { return -1; }
+        return 0;
     }
 
-    /// <summary>取走排出的待发密文（二进制安全字符串；可为空串），
-    /// 暂存清零。</summary>
     string HandshakeDrain() {
+        if (this.pendingOut == null || this.pendingLen <= 0) { return ""; }
         string out1 = this.pendingOut.ToStr(0, this.pendingLen);
         this.pendingLen = 0;
         return out1;
     }
 
-    /// <summary>把传输层收到的密文灌入 rbio（握手状态机的输入）。</summary>
     void HandshakeFeed(string data) {
-        int n = data.Length;
-        if (n > 0 && this.open) { BIO_write(this.rbio, data, n); }
+        if (data == null || data.Length == 0 || !this.open || this.engine == null) { return; }
+        byte[] b = new byte[data.Length];
+        for (int i = 0; i < data.Length; i = i + 1) { b[i] = (byte)(data[i] & 255); }
+        this.engine.FeedNetwork(b, 0, b.Length);
     }
 
-    /// 把 wbio 中已排出的握手密文搬进 pendingOut。
-    void DrainBioOut() {
-        while (true) {
-            int pending = BIO_ctrl_pending(this.wbio);
-            if (pending <= 0) { break; }
-            int chunk = pending;
-            if (chunk > SCRATCH) { chunk = SCRATCH; }
-            int n = Norm(BIO_read(this.wbio, this.scratch, chunk));
-            if (n <= 0) { break; }
-            this.EnsurePending(n);
-            for (int i = 0; i < n; i = i + 1) {
-                this.pendingOut[this.pendingLen + i] = this.scratch[i];
-            }
-            this.pendingLen = this.pendingLen + n;
-        }
-    }
-
-    /// 保证 pendingOut 容得下再追加 extra 字节。
     void EnsurePending(int extra) {
+        if (this.pendingOut == null) {
+            this.pendingOut = new byte[extra + 256];
+            this.pendingLen = 0;
+            return;
+        }
         if (this.pendingLen + extra <= this.pendingOut.Length) { return; }
         int size = this.pendingOut.Length * 2;
         while (this.pendingLen + extra > size) { size = size * 2; }
@@ -870,261 +302,156 @@ class TlsStream {
         this.pendingOut = nb;
     }
 
-    /// host 是否为 IP 字面量（IPv4 点分十进制或 IPv6 含冒号）：
-    /// 是则主机名校验走 set1_ip_asc，否则走 set1_host。
-    static bool IsIpLiteral(string host) {
-        if (host == null || host.Length == 0) { return false; }
-        bool hasColon = false;
-        bool onlyDigitDot = true;
-        int i = 0;
-        while (i < host.Length) {
-            int c = host[i] & 255;
-            if (c == 58) { hasColon = true; }
-            if (!((c >= 48 && c <= 57) || c == 46 || c == 58)) { onlyDigitDot = false; }
-            i = i + 1;
-        }
-        return hasColon || onlyDigitDot;
-    }
-
-    /// 对端证书的可读文本："issuer=... subject=..."；无对端证书
-    /// 时返回 ""。证书策略回调与错误报告共用。
-    static string PeerCertText(string ssl) {
-        string cert = SSL_get1_peer_certificate(ssl);
-        if (cert == null) { return ""; }
-        string text = "issuer=" + TlsStream.NameText(
-                          X509_get_issuer_name(cert))
-                      + " subject=" + TlsStream.NameText(
-                          X509_get_subject_name(cert));
-        X509_free(cert);
-        return text;
-    }
-
     /// <summary>获取当前连接对端证书的描述文本（形如 issuer=... subject=...）。</summary>
     string PeerCertificateText() {
-        if (this.ssl == null) { return ""; }
-        return TlsStream.PeerCertText(this.ssl);
+        if (this.engine == null) { return ""; }
+        return this.engine.PeerCertificateText();
     }
 
-    /// X509_NAME → 单行可读文本（X509_NAME_oneline 形式）。
-    static string NameText(string name) {
-        if (name == null) { return ""; }
-        byte[] buf = new byte[600];
-        int cap = 600;
-        int n = X509_NAME_oneline(name, buf, cap);
-        if (n <= 0) { return ""; }
-        int end = -1;
-        for (int i = 0; i < 600; i = i + 1) {
-            if (buf[i] == 0) { end = i; break; }
-        }
-        if (end <= 0) { return ""; }
-        return buf.ToStr(0, end);
-    }
-
-    /// <summary>对端证书 DER
-    /// SubjectPublicKeyInfo 的 base64 SHA-256（即通过 TlsContext.AddPin 固定的值），
-    /// 没有对端证书/编码时返回 ""。</summary>
-    static string SpkiPinOf(string ssl) {
-        string cert = SSL_get1_peer_certificate(ssl);
+    static string SpkiPinOf(TlsStream stream) {
+        if (stream == null || stream.engine == null) { return ""; }
+        X509Certificate cert = stream.engine.PeerCertificate();
         if (cert == null) { return ""; }
-        string pubkey = X509_get_X509_PUBKEY(cert);
-        if (pubkey == null) {
-            X509_free(cert);
-            return "";
-        }
-        // 指针单元清零表示 *out == NULL，因此 i2d 会自行分配 DER
-        // 缓冲区，并把指针写回 `cell`。
-        byte[] cell = new byte[8];
-        int len = Norm(i2d_X509_PUBKEY(pubkey, cell));
-        X509_free(cert);
-        if (len <= 0) { return ""; }
-        nint der = 0;
-        nint mul = 1;
-        for (int k = 0; k < 8; k = k + 1) {
-            der = der + (cell[k] & 255) * mul;
-            mul = mul * 256;
-        }
-        if (der == 0) { return ""; }
-        byte[] spki = new byte[len];
-        PlatMemCopyIn(spki, der, len);
-        OpenSslFree(der, null, 0);
-        string spkiStr = spki.ToStr(0, len);
-        byte[] digest = Sha256.Hash(spkiStr, len);
-        if (digest == null) { return ""; }
-        string dstr = digest.ToStr(0, 32);
-        return Base64.Encode(dstr, 32);
+        return cert.SpkiSha256Pin();
     }
 
-    /// 把 wbio 中待发的加密输出字节刷到套接字。
-    /// 必须保证 BIO 中读出的每一块都完整发出；否则截断的 TLS
-    /// 记录会导致握手/数据损坏。Socket.SendAsync 在内部已经循环
-    /// 重发，因此其返回值应等于请求发送的字节数；若不相等则
-    /// 视为连接已不可用。
     async int FlushOutAsync() {
-        int pending = BIO_ctrl_pending(this.wbio);
-        while (pending > 0) {
-            int chunk = pending;
-            if (chunk > SCRATCH) { chunk = SCRATCH; }
-            int n = Norm(BIO_read(this.wbio, this.scratch, chunk));
-            if (n <= 0) { return -1; }
-            int sent = Norm(await Socket.SendAsync(this.sock, this.scratch, n));
-            // 驻车期间另一协程可能 Close()：SSL_free 连带释放了
-            // rbio/wbio，回到这里先按 open 退出，绝不再碰 BIO。
+        if (!this.open || this.engine == null) { return -1; }
+        byte[] pending = this.engine.DrainNetwork();
+        while (pending != null && pending.Length > 0) {
+            string s = pending.ToStr(0, pending.Length);
+            int sent = Norm(await Socket.SendAsync(this.sock, s, pending.Length));
             if (!this.open) { return -1; }
-            if (sent != n) { return -1; }
-            pending = BIO_ctrl_pending(this.wbio);
+            if (sent != pending.Length) { return -1; }
+            pending = this.engine.DrainNetwork();
         }
         return 0;
     }
 
-    // 从套接字读取一块加密字节到 rbio。
-    // 返回字节数，对端关闭时为 0，出错时为 -1。
-    /// <summary>从套接字读一块加密字节灌入 rbio。返回字节数，
-    /// 对端关闭为 0，出错为 -1；无可读数据时挂起等待。</summary>
     async int PumpInAsync() {
-        while (true) {
-            await Socket.ReadReady(this.sock);
-            // 驻车期间另一协程可能 Close()：scratch 已置空、rbio 已随
-            // SSL_free 释放，先按 open 退出。
-            if (!this.open) { return -1; }
-            int n = Norm(Socket.Recv(this.sock, this.scratch, SCRATCH));
-            if (n == 0) { return 0; }
-            if (n > 0) {
-                int w = Norm(BIO_write(this.rbio, this.scratch, n));
-                if (w != n) { return -1; }
-                return n;
-            }
-            // n < 0：传输错误（对端 shutdown / CancelIoEx 唤醒后的
-            // WSAESHUTDOWN 等）。必须返回 -1 让 HandshakeAsync/Recv 的
-            // 截止路径收尾；若当作"再等一次"继续 await ReadReady，
-            // shutdown 后 readiness 是一次性的，第二次挂起永远无人唤醒
-            // ——HttpDeadline 扫描器只 shutdown 一次，握手就此挂死。
-            return -1;
-        }
-        return -1;
+        if (!this.open || this.engine == null) { return -1; }
+        string chunk = await Socket.RecvAsync(this.sock, SCRATCH);
+        if (chunk == null) { return -1; }
+        int n = chunk.Length;
+        if (n == 0) { return 0; }
+        byte[] b = new byte[n];
+        for (int i = 0; i < n; i = i + 1) { b[i] = (byte)(chunk[i] & 255); }
+        this.engine.FeedNetwork(b, 0, n);
+        return n;
     }
 
-    /// <summary>驱动 TLS 握手直至完成。成功返回 1。
-    /// 整个握手有 30 秒硬截止：对端每 30 秒滴一字节的慢速攻击
-    /// 此前会无限循环 WANT_READ，钉死一个协程 + SSL + BIO + 17KB
-    /// 暂存缓冲——面向公网的服务器这样被逐个耗干。超时返回 -2，
-    /// 调用方照常关闭连接。
-    ///
-    /// 截止检查是墙钟轮询，仅在本协程被唤醒时执行；完全静默的
-    /// 对端不会唤醒任何东西，所以另外武装进程级 HttpDeadline
-    /// 扫描器（每秒唤醒，超时 shutdown 套接字）——被 shutdown
-    /// 唤醒的 PumpInAsync 读到 0 按对端关闭返回 -1，走正常清理。
-    /// await ReadReady 自身没有计时能力，这是唯一能让"静默对端"
-    /// 也吃到期满的办法。</summary>
     async int HandshakeAsync(int timeoutMs) {
         if (timeoutMs > 0) {
             this.watch = HttpDeadline.Arm(this.sock, timeoutMs);
         }
         long deadlineUs = 0;
-        if (timeoutMs > 0) { deadlineUs = MonotonicUs() + timeoutMs * 1000; }
+        if (timeoutMs > 0) { deadlineUs = MonotonicUs() + (long)timeoutMs * 1000; }
+
         while (true) {
-            int r = Norm(SSL_do_handshake(this.ssl));
-            int flushed = await FlushOutAsync();
+            int flushed = await this.FlushOutAsync();
             if (flushed < 0) { return this.EndHandshakeWatch(-1); }
+
+            int r = this.engine.Step();
+            flushed = await this.FlushOutAsync();
+            if (flushed < 0) { return this.EndHandshakeWatch(-1); }
+
             if (r == 1) { return this.EndHandshakeWatch(1); }
+            if (r < 0) {
+                TlsStream.SetLastError(this.engine.LastError());
+                return this.EndHandshakeWatch(-1);
+            }
             if (timeoutMs > 0 && MonotonicUs() >= deadlineUs) {
+                TlsStream.SetLastError("TLS 握手超时");
                 return this.EndHandshakeWatch(-2);
             }
-            int err = SSL_get_error(this.ssl, r);
-            // 2 = SSL_ERROR_WANT_READ, 3 = SSL_ERROR_WANT_WRITE
-            if (err == 2) {
-                int n = await PumpInAsync();
-                if (n <= 0) { return this.EndHandshakeWatch(-1); }
-            } else if (err != 3) {
+
+            int n = await this.PumpInAsync();
+            if (n <= 0) {
+                if (n == 0) { TlsStream.SetLastError("对端在握手期间关闭了连接"); }
                 return this.EndHandshakeWatch(-1);
             }
         }
         return -1;
     }
 
-    /// 握手结束时释放 deadline 槽位（服务器的连接循环随后会按
-    /// 每请求节奏重新 Arm）。result 原样返回。
     int EndHandshakeWatch(int result) {
         HttpDeadline.Disarm(this.watch);
         this.watch = null;
         return result;
     }
 
-    /// <summary>接收解密后的应用字节（最多
-    /// <paramref name="max"/>，最多一个暂存缓冲区）。正常关闭或出错时
-    /// 返回 ""。</summary>
+    /// <summary>接收解密后的应用字节（最多 max）。正常关闭或出错时返回空串。</summary>
     async string RecvAsync(int max) {
-        if (!this.open) { return ""; }
+        if (!this.open || this.engine == null) { return ""; }
         int want = max;
         if (want > SCRATCH) { want = SCRATCH; }
+
         while (true) {
-            int n = Norm(SSL_read(this.ssl, this.scratch, want));
-            if (n > 0) {
-                return this.scratch.ToStr(0, n);
+            int step = this.engine.Step();
+            if (step < 0) { return ""; }
+
+            int avail = this.engine.AvailableAppData();
+            if (avail > 0) {
+                int toRead = avail > want ? want : avail;
+                byte[] b = new byte[toRead];
+                int read = this.engine.RecvAppData(b, 0, toRead);
+                if (read > 0) {
+                    return b.ToStr(0, read);
+                }
             }
-            int err = SSL_get_error(this.ssl, n);
-            int flushed = await FlushOutAsync();
+
+            if (this.engine.IsClosed()) { return ""; }
+
+            int flushed = await this.FlushOutAsync();
             if (flushed < 0) { return ""; }
-            if (err == 2) {
-                int got = await PumpInAsync();
-                if (got <= 0) { return ""; }
-            } else if (err != 3) {
-                return "";
-            }
+
+            int got = await this.PumpInAsync();
+            if (got <= 0) { return ""; }
         }
         return "";
     }
 
-    /// <summary>接收解密后的字节到调用方提供的缓冲区
-    /// （二进制安全：返回字节数，不做 NUL 截断）。
-    /// 正常关闭返回 0，出错返回 -1。</summary>
+    /// <summary>接收解密后的字节到调用方提供的缓冲区。正常关闭返回 0，出错返回 -1。</summary>
     async int RecvIntoAsync(string buf, int max) {
-        if (!this.open) { return -1; }
+        if (!this.open || this.engine == null) { return -1; }
         while (true) {
-            int n = Norm(SSL_read(this.ssl, buf, max));
-            if (n > 0) { return n; }
-            int err = SSL_get_error(this.ssl, n);
-            int flushed = await FlushOutAsync();
-            if (flushed < 0) { return -1; }
-            if (err == 2) {
-                int got = await PumpInAsync();
-                if (got == 0) { return 0; }
-                if (got < 0) { return -1; }
-            } else if (err != 3) {
-                return -1;
+            int step = this.engine.Step();
+            if (step < 0) { return -1; }
+
+            int avail = this.engine.AvailableAppData();
+            if (avail > 0) {
+                int toRead = avail > max ? max : avail;
+                byte[] tmp = new byte[toRead];
+                int read = this.engine.RecvAppData(tmp, 0, toRead);
+                if (read > 0) {
+                    for (int i = 0; i < read; i = i + 1) {
+                        buf[i] = (char)(tmp[i] & 255);
+                    }
+                    return read;
+                }
             }
+
+            if (this.engine.IsClosed()) { return 0; }
+
+            int flushed = await this.FlushOutAsync();
+            if (flushed < 0) { return -1; }
+
+            int got = await this.PumpInAsync();
+            if (got == 0) { return 0; }
+            if (got < 0) { return -1; }
         }
         return -1;
     }
 
-    /// <summary>加密并发送 <paramref name="len"/> 字节。成功返回
-    /// 明文字节数，失败返回 -1。</summary>
+    /// <summary>加密并发送 len 字节。成功返回明文字节数，失败返回 -1。</summary>
     async int SendAsync(string data, int len) {
-        if (!this.open) { return -1; }
-        int off = 0;
-        while (off < len) {
-            int chunk = len - off;
-            if (chunk > 16384) { chunk = 16384; }
-            string part = data;
-            if (off > 0 || chunk < len) {
-                part = data.Substring(off, chunk);
-            }
-            int n = Norm(SSL_write(this.ssl, part, chunk));
-            if (n <= 0) {
-                int err = SSL_get_error(this.ssl, n);
-                int flushed = await FlushOutAsync();
-                if (flushed < 0) { return -1; }
-                if (err == 2) {
-                    int got = await PumpInAsync();
-                    if (got <= 0) { return -1; }
-                } else if (err != 3) {
-                    return -1;
-                }
-            } else {
-                off = off + n;
-                int flushed = await FlushOutAsync();
-                if (flushed < 0) { return -1; }
-            }
-        }
+        if (!this.open || this.engine == null) { return -1; }
+        byte[] b = new byte[len];
+        for (int i = 0; i < len; i = i + 1) { b[i] = (byte)(data[i] & 255); }
+        int r = this.engine.SendAppData(b, 0, len);
+        if (r < 0) { return -1; }
+        int flushed = await this.FlushOutAsync();
+        if (flushed < 0) { return -1; }
         return len;
     }
 
@@ -1133,42 +460,11 @@ class TlsStream {
         return await SendAsync(data, data.Length);
     }
 
-    /// <summary>发送 TLS close_notify 并释放 SSL 引擎与 BIO 所有权；
-    /// 底层套接字仍归调用方所有（且必须由其关闭）。Close 后继续
-    /// 调用安全：所有方法按未打开处理。
-    ///
-    /// 并发安全（A76-①）：Close 同步执行、无 await，唯一的竞争窗口
-    /// 是另一个协程正驻车在 FlushOutAsync/PumpInAsync 的套接字 await
-    /// 上。因此 open 先于 SSL_free 翻转——恢复出的协程重查 open
-    /// 即按未打开退出，不再触碰已释放的 ssl/rbio/wbio（SSL_set_bio
-    /// 已把 BIO 所有权移给 SSL，SSL_free 连带释放；Zan 侧字段只是
-    /// 借用指针，free 后置空以绝悬垂）。</summary>
+    /// <summary>关闭 TLS 连接。</summary>
     void Close() {
-        // 异常路径可能跳过 EndHandshakeWatch：这里兜底释放槽位，
-        // 防止扫描器拿着已关闭套接字的槽位 shutdown 一个复用 fd。
         HttpDeadline.Disarm(this.watch);
         this.watch = null;
-        bool wasOpen = this.open;
         this.open = false;
-        if (this.ssl != null) {
-            if (wasOpen) {
-                int _s = SSL_shutdown(this.ssl);
-                // 尽力把 close_notify 全部发出；每次从 BIO 读出后
-                // 循环发送直到这块字节写完或出错，避免截断 TLS 记录。
-                int pending = BIO_ctrl_pending(this.wbio);
-                while (pending > 0 && pending <= SCRATCH) {
-                    int n = BIO_read(this.wbio, this.scratch, pending);
-                    if (n <= 0) { break; }
-                    int sent = Socket.Send(this.sock, this.scratch, n);
-                    if (sent <= 0) { break; }
-                    pending = BIO_ctrl_pending(this.wbio);
-                }
-            }
-            SSL_free(this.ssl);
-            this.ssl = null;
-        }
-        this.rbio = null;
-        this.wbio = null;
-        this.scratch = null;
+        this.engine = null;
     }
 }

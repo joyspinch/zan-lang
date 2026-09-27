@@ -68,6 +68,11 @@ int64_t zan_hw_aes_ctr_crypt(const uint8_t *in, int64_t len,
  * GF(2^128). All three point at 16-byte blocks. 0 or -1. */
 int64_t zan_hw_ghash_block(const uint8_t *h16, const uint8_t *x16, uint8_t *y16);
 
+/* RFC 7748 X25519 constant-time Diffie-Hellman scalar multiplication:
+ * computes scalar * point -> out (all 32 bytes little-endian).
+ * Clamping of scalar is performed internally. Returns 0 on success. */
+int64_t zan_hw_x25519(const uint8_t *scalar, const uint8_t *point, uint8_t *out);
+
 /* CRC-32C (Castagnoli, poly 0x82F63B78) continuation: returns the updated
  * CRC of `crc` extended with len bytes at p, or -1 when no hardware path
  * exists (SSE4.2 crc32 / ARMv8 CRC instructions). */

@@ -961,6 +961,19 @@ static bool emit_native_memory_call(zan_irgen_t *g, zan_ast_node_t *expr,
             nm_addr(g, y, zero64) }, 3, "nm.ghash");
         return true;
     }
+    if (is_call_to(expr, "NativeMemory", "X25519") && expr->call.args.count == 3) {
+        LLVMValueRef scalar = nm_arg(g, expr, 0, locals);
+        LLVMValueRef point = nm_arg(g, expr, 1, locals);
+        LLVMValueRef out_buf = nm_arg(g, expr, 2, locals);
+        LLVMTypeRef ty = LLVMFunctionType(i64t,
+            (LLVMTypeRef[]){ i8ptr, i8ptr, i8ptr }, 3, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_x25519");
+        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_x25519", ty);
+        *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
+            nm_addr(g, scalar, zero64), nm_addr(g, point, zero64),
+            nm_addr(g, out_buf, zero64) }, 3, "nm.x25519");
+        return true;
+    }
     if (is_call_to(expr, "NativeMemory", "Crc32CUpdate") && expr->call.args.count == 3) {
         LLVMValueRef crc = nm_arg(g, expr, 0, locals);
         LLVMValueRef p = nm_arg(g, expr, 1, locals);

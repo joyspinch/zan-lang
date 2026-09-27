@@ -1,0 +1,289 @@
+using System;
+using System.Security.Cryptography;
+
+namespace System.Net.Tls;
+
+/// <summary>
+/// TLS 记录层协议常量。
+/// </summary>
+class TlsRecord {
+    // 记录内容类型 (ContentType)
+    static int ContentTypeChangeCipherSpec = 20; // 0x14
+    static int ContentTypeAlert = 21;            // 0x15
+    static int ContentTypeHandshake = 22;        // 0x16
+    static int ContentTypeApplicationData = 23;  // 0x17
+
+    // 协议版本 (ProtocolVersion)
+    static int VersionTls10 = 769; // 0x0301
+    static int VersionTls11 = 770; // 0x0302
+    static int VersionTls12 = 771; // 0x0303
+    static int VersionTls13 = 772; // 0x0304
+
+    // 握手类型 (HandshakeType)
+    static int HandshakeHelloRequest = 0;
+    static int HandshakeClientHello = 1;
+    static int HandshakeServerHello = 2;
+    static int HandshakeNewSessionTicket = 4;
+    static int HandshakeEndOfEarlyData = 5;
+    static int HandshakeEncryptedExtensions = 8;
+    static int HandshakeCertificate = 11;
+    static int HandshakeServerKeyExchange = 12;
+    static int HandshakeCertificateRequest = 13;
+    static int HandshakeServerHelloDone = 14;
+    static int HandshakeCertificateVerify = 15;
+    static int HandshakeClientKeyExchange = 16;
+    static int HandshakeFinished = 20;
+    static int HandshakeKeyUpdate = 24;
+
+    // 告警级别与类型 (Alert)
+    static int AlertLevelWarning = 1;
+    static int AlertLevelFatal = 2;
+    static int AlertCloseNotify = 0;
+    static int AlertUnexpectedMessage = 10;
+    static int AlertBadRecordMac = 20;
+    static int AlertHandshakeFailure = 40;
+    static int AlertBadCertificate = 42;
+    static int AlertIllegalParameter = 47;
+    static int AlertDecodeError = 50;
+    static int AlertDecryptError = 51;
+    static int AlertInternalError = 80;
+    static int AlertUnrecognizedName = 112;
+
+    /// <summary>构造明文 TLS 记录包（用于握手未加密阶段）。</summary>
+    static byte[] FormatPlaintext(int contentType, int version, byte[] data, int offset, int len) {
+        if (data == null || offset < 0 || len < 0 || offset + len > data.Length) { return null; }
+        byte[] record = new byte[5 + len];
+        record[0] = (byte)(contentType & 255);
+        record[1] = (byte)((version >> 8) & 255);
+        record[2] = (byte)(version & 255);
+        record[3] = (byte)((len >> 8) & 255);
+        record[4] = (byte)(len & 255);
+        for (int i = 0; i < len; i = i + 1) {
+            record[5 + i] = (byte)(data[offset + i] & 255);
+        }
+        return record;
+    }
+
+    /// <summary>将 64 位无符号序列号按大端写入缓冲区。</summary>
+    static void WriteSeq64(byte[] buf, int offset, long seq) {
+        for (int i = 0; i < 8; i = i + 1) {
+            buf[offset + i] = (byte)(Bits.Shr64(seq, 8 * (7 - i)) & 255);
+        }
+    }
+}
+
+/// <summary>
+/// TLS 记录层 AEAD (AES-128-GCM) 密码状态机。
+/// 支持 TLS 1.2 与 TLS 1.3 双版本单向记录加密与解密。
+/// 零 C 语言与零 OpenSSL 依赖，100% Zan 原生实现。
+/// </summary>
+class TlsCipherState {
+    int version;
+    byte[] key;
+    byte[] iv;
+    long seq;
+
+    TlsCipherState(int version, byte[] key, byte[] iv) {
+        this.version = version;
+        this.key = key;
+        this.iv = iv;
+        this.seq = 0;
+    }
+
+    int Version() { return this.version; }
+    long SequenceNumber() { return this.seq; }
+
+    /// <summary>加密明文负载并封装为完整 TLS 记录（含 5 字节记录头）。</summary>
+    byte[] Encrypt(int contentType, byte[] data, int offset, int len) {
+        if (data == null || offset < 0 || len < 0 || offset + len > data.Length) { return null; }
+        if (this.version == TlsRecord.VersionTls13) {
+            return this.EncryptTls13(contentType, data, offset, len);
+        } else {
+            return this.EncryptTls12(contentType, data, offset, len);
+        }
+    }
+
+    /// <summary>解密 TLS 记录密文负载，剥离认证标签与填充，产出原始明文与真实 ContentType。</summary>
+    byte[] Decrypt(byte[] header, byte[] payload, int pOffset, int pLen, List<int> outContentType) {
+        if (header == null || header.Length < 5 || payload == null || pOffset < 0 || pLen < 0 || pOffset + pLen > payload.Length) {
+            return null;
+        }
+        if (this.version == TlsRecord.VersionTls13) {
+            return this.DecryptTls13(header, payload, pOffset, pLen, outContentType);
+        } else {
+            return this.DecryptTls12(header, payload, pOffset, pLen, outContentType);
+        }
+    }
+
+    /* ---- TLS 1.2 记录层加解密 (RFC 5246 / RFC 5288) ---- */
+
+    byte[] EncryptTls12(int contentType, byte[] data, int offset, int len) {
+        // 1. 生成 8 字节 explicit_nonce (采用大端序列号)
+        byte[] explicitNonce = new byte[8];
+        TlsRecord.WriteSeq64(explicitNonce, 0, this.seq);
+
+        // 2. 构造 12 字节 Nonce: 4 字节 implicit_iv || 8 字节 explicit_nonce
+        byte[] nonce = new byte[12];
+        for (int i = 0; i < 4; i = i + 1) { nonce[i] = (byte)(this.iv[i] & 255); }
+        for (int i = 0; i < 8; i = i + 1) { nonce[4 + i] = (byte)(explicitNonce[i] & 255); }
+
+        // 3. 构造 13 字节 AAD: seq(8) || type(1) || 0x03, 0x03 || len(2)
+        byte[] aad = new byte[13];
+        TlsRecord.WriteSeq64(aad, 0, this.seq);
+        aad[8] = (byte)(contentType & 255);
+        aad[9] = 3;
+        aad[10] = 3;
+        aad[11] = (byte)((len >> 8) & 255);
+        aad[12] = (byte)(len & 255);
+
+        // 4. 明文切片
+        byte[] pt = new byte[len];
+        for (int i = 0; i < len; i = i + 1) { pt[i] = (byte)(data[offset + i] & 255); }
+
+        // 5. AES-128-GCM 加密
+        byte[] tag = new byte[16];
+        byte[] ct = AesGcm.Encrypt(this.key, 16, nonce, aad, 13, pt, len, tag);
+        if (ct == null) { return null; }
+
+        // 6. 组装 TLS 1.2 记录: header(5) || explicitNonce(8) || ct(len) || tag(16)
+        int payloadLen = 8 + len + 16;
+        byte[] record = new byte[5 + payloadLen];
+        record[0] = (byte)(contentType & 255);
+        record[1] = 3;
+        record[2] = 3;
+        record[3] = (byte)((payloadLen >> 8) & 255);
+        record[4] = (byte)(payloadLen & 255);
+
+        for (int i = 0; i < 8; i = i + 1) { record[5 + i] = (byte)(explicitNonce[i] & 255); }
+        for (int i = 0; i < len; i = i + 1) { record[13 + i] = (byte)(ct[i] & 255); }
+        for (int i = 0; i < 16; i = i + 1) { record[13 + len + i] = (byte)(tag[i] & 255); }
+
+        this.seq = this.seq + 1;
+        return record;
+    }
+
+    byte[] DecryptTls12(byte[] header, byte[] payload, int pOffset, int pLen, List<int> outContentType) {
+        // 负载结构: explicitNonce(8) || ct(ctLen) || tag(16)
+        if (pLen < 24) { return null; }
+        int ctLen = pLen - 24;
+
+        // 1. 提取 8 字节 explicit_nonce
+        byte[] nonce = new byte[12];
+        for (int i = 0; i < 4; i = i + 1) { nonce[i] = (byte)(this.iv[i] & 255); }
+        for (int i = 0; i < 8; i = i + 1) { nonce[4 + i] = (byte)(payload[pOffset + i] & 255); }
+
+        // 2. 构造 13 字节 AAD
+        byte[] aad = new byte[13];
+        TlsRecord.WriteSeq64(aad, 0, this.seq);
+        aad[8] = (byte)(header[0] & 255);
+        aad[9] = 3;
+        aad[10] = 3;
+        aad[11] = (byte)((ctLen >> 8) & 255);
+        aad[12] = (byte)(ctLen & 255);
+
+        // 3. 提取 ct 与 tag
+        byte[] ct = new byte[ctLen];
+        for (int i = 0; i < ctLen; i = i + 1) { ct[i] = (byte)(payload[pOffset + 8 + i] & 255); }
+        byte[] tag = new byte[16];
+        for (int i = 0; i < 16; i = i + 1) { tag[i] = (byte)(payload[pOffset + 8 + ctLen + i] & 255); }
+
+        // 4. AES-128-GCM 解密
+        List<int> ok = new List<int>(); ok.Add(0);
+        byte[] pt = AesGcm.Decrypt(this.key, 16, nonce, aad, 13, ct, ctLen, tag, ok);
+        if (pt == null || ok[0] != -1) { return null; }
+
+        outContentType[0] = header[0] & 255;
+        this.seq = this.seq + 1;
+        return pt;
+    }
+
+    /* ---- TLS 1.3 记录层加解密 (RFC 8446 §5.2 / §5.3) ---- */
+
+    byte[] EncryptTls13(int contentType, byte[] data, int offset, int len) {
+        // 1. 构造内部明文: plaintext || real_content_type
+        int innerLen = len + 1;
+        byte[] inner = new byte[innerLen];
+        for (int i = 0; i < len; i = i + 1) { inner[i] = (byte)(data[offset + i] & 255); }
+        inner[len] = (byte)(contentType & 255);
+
+        // 2. 构造 12 字节 Nonce: 12 字节 IV ^ (64 位大端 seq 放在低 8 字节)
+        byte[] nonce = new byte[12];
+        for (int i = 0; i < 12; i = i + 1) { nonce[i] = (byte)(this.iv[i] & 255); }
+        byte[] seqBytes = new byte[8];
+        TlsRecord.WriteSeq64(seqBytes, 0, this.seq);
+        for (int i = 0; i < 8; i = i + 1) {
+            nonce[4 + i] = (byte)((nonce[4 + i] & 255) ^ (seqBytes[i] & 255));
+        }
+
+        // 3. 构造 5 字节外部记录头与 AAD: 0x17, 0x03, 0x03, (innerLen + 16)
+        int payloadLen = innerLen + 16;
+        byte[] header = new byte[5];
+        header[0] = (byte)TlsRecord.ContentTypeApplicationData; // 23
+        header[1] = 3;
+        header[2] = 3;
+        header[3] = (byte)((payloadLen >> 8) & 255);
+        header[4] = (byte)(payloadLen & 255);
+
+        // 4. AES-128-GCM 加密 (AAD 为 5 字节 header)
+        byte[] tag = new byte[16];
+        byte[] ct = AesGcm.Encrypt(this.key, 16, nonce, header, 5, inner, innerLen, tag);
+        if (ct == null) { return null; }
+
+        // 5. 组装外层记录
+        byte[] record = new byte[5 + payloadLen];
+        for (int i = 0; i < 5; i = i + 1) { record[i] = (byte)(header[i] & 255); }
+        for (int i = 0; i < innerLen; i = i + 1) { record[5 + i] = (byte)(ct[i] & 255); }
+        for (int i = 0; i < 16; i = i + 1) { record[5 + innerLen + i] = (byte)(tag[i] & 255); }
+
+        this.seq = this.seq + 1;
+        return record;
+    }
+
+    byte[] DecryptTls13(byte[] header, byte[] payload, int pOffset, int pLen, List<int> outContentType) {
+        // 负载结构: ct(ctLen) || tag(16)
+        if (pLen < 17) { return null; }
+        int ctLen = pLen - 16;
+
+        // 1. 构造 12 字节 Nonce
+        byte[] nonce = new byte[12];
+        for (int i = 0; i < 12; i = i + 1) { nonce[i] = (byte)(this.iv[i] & 255); }
+        byte[] seqBytes = new byte[8];
+        TlsRecord.WriteSeq64(seqBytes, 0, this.seq);
+        for (int i = 0; i < 8; i = i + 1) {
+            nonce[4 + i] = (byte)((nonce[4 + i] & 255) ^ (seqBytes[i] & 255));
+        }
+
+        // 2. 提取 ct 与 tag
+        byte[] ct = new byte[ctLen];
+        for (int i = 0; i < ctLen; i = i + 1) { ct[i] = (byte)(payload[pOffset + i] & 255); }
+        byte[] tag = new byte[16];
+        for (int i = 0; i < 16; i = i + 1) { tag[i] = (byte)(payload[pOffset + ctLen + i] & 255); }
+
+        // 3. AAD 为 5 字节 header
+        byte[] aad = new byte[5];
+        for (int i = 0; i < 5; i = i + 1) { aad[i] = (byte)(header[i] & 255); }
+
+        // 4. AES-128-GCM 解密
+        List<int> ok = new List<int>(); ok.Add(0);
+        byte[] inner = AesGcm.Decrypt(this.key, 16, nonce, aad, 5, ct, ctLen, tag, ok);
+        if (inner == null || ok[0] != -1) { return null; }
+
+        // 5. 剥离尾部填充 0x00，定位真实 ContentType
+        int realTypeIdx = inner.Length - 1;
+        while (realTypeIdx >= 0 && (inner[realTypeIdx] & 255) == 0) {
+            realTypeIdx = realTypeIdx - 1;
+        }
+        if (realTypeIdx < 0) { return null; } // 全是 0x00，无真实 ContentType
+
+        int realType = inner[realTypeIdx] & 255;
+        outContentType[0] = realType;
+
+        byte[] pt = new byte[realTypeIdx];
+        for (int i = 0; i < realTypeIdx; i = i + 1) {
+            pt[i] = (byte)(inner[i] & 255);
+        }
+
+        this.seq = this.seq + 1;
+        return pt;
+    }
+}

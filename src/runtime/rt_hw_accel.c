@@ -2967,3 +2967,286 @@ int64_t zan_hw_json_scan_string(const uint8_t *buf, int64_t pos, int64_t len) {
     return len;
 }
 
+/* =====================================================================
+ * RFC 7748 Curve25519 (X25519) Constant-Time Key Exchange
+ * ===================================================================== */
+#if defined(__SIZEOF_INT128__) || (defined(__clang__) || defined(__GNUC__))
+typedef unsigned __int128 zan_fe_u128;
+#else
+typedef struct { uint64_t lo, hi; } zan_fe_u128;
+#endif
+
+typedef uint64_t zan_fe[5];
+
+static inline uint64_t zan_fe_load64_le(const uint8_t *s) {
+    return ((uint64_t)s[0]) | (((uint64_t)s[1]) << 8) |
+           (((uint64_t)s[2]) << 16) | (((uint64_t)s[3]) << 24) |
+           (((uint64_t)s[4]) << 32) | (((uint64_t)s[5]) << 40) |
+           (((uint64_t)s[6]) << 48) | (((uint64_t)s[7]) << 56);
+}
+
+static inline void zan_fe_frombytes(zan_fe h, const uint8_t *s) {
+    uint64_t mask51 = 0x7ffffffffffffULL;
+    h[0] = zan_fe_load64_le(s) & mask51;
+    h[1] = (zan_fe_load64_le(s + 6) >> 3) & mask51;
+    h[2] = (zan_fe_load64_le(s + 12) >> 6) & mask51;
+    h[3] = (zan_fe_load64_le(s + 19) >> 1) & mask51;
+    h[4] = (zan_fe_load64_le(s + 24) >> 12) & mask51;
+}
+
+static inline void zan_fe_carry(zan_fe h) {
+    uint64_t mask51 = (1ULL << 51) - 1;
+    for (int iter = 0; iter < 2; iter++) {
+        uint64_t c0 = h[0] >> 51; h[0] &= mask51; h[1] += c0;
+        uint64_t c1 = h[1] >> 51; h[1] &= mask51; h[2] += c1;
+        uint64_t c2 = h[2] >> 51; h[2] &= mask51; h[3] += c2;
+        uint64_t c3 = h[3] >> 51; h[3] &= mask51; h[4] += c3;
+        uint64_t c4 = h[4] >> 51; h[4] &= mask51; h[0] += c4 * 19;
+    }
+}
+
+static inline void zan_fe_tobytes(uint8_t *s, const zan_fe h) {
+    zan_fe t;
+    memcpy(t, h, sizeof(t));
+    zan_fe_carry(t);
+    uint64_t r[5];
+    r[0] = t[0] + 19;
+    uint64_t c = r[0] >> 51; r[0] &= (1ULL << 51) - 1;
+    r[1] = t[1] + c; c = r[1] >> 51; r[1] &= (1ULL << 51) - 1;
+    r[2] = t[2] + c; c = r[2] >> 51; r[2] &= (1ULL << 51) - 1;
+    r[3] = t[3] + c; c = r[3] >> 51; r[3] &= (1ULL << 51) - 1;
+    r[4] = t[4] + c;
+    uint64_t mask = 0 - (r[4] >> 51);
+    r[4] &= (1ULL << 51) - 1;
+    for (int i = 0; i < 5; i++) {
+        t[i] ^= mask & (t[i] ^ r[i]);
+    }
+    uint64_t w0 = t[0] | (t[1] << 51);
+    uint64_t w1 = (t[1] >> 13) | (t[2] << 38);
+    uint64_t w2 = (t[2] >> 26) | (t[3] << 25);
+    uint64_t w3 = (t[3] >> 39) | (t[4] << 12);
+    for (int i = 0; i < 8; i++) s[i] = (uint8_t)(w0 >> (i * 8));
+    for (int i = 0; i < 8; i++) s[8 + i] = (uint8_t)(w1 >> (i * 8));
+    for (int i = 0; i < 8; i++) s[16 + i] = (uint8_t)(w2 >> (i * 8));
+    for (int i = 0; i < 8; i++) s[24 + i] = (uint8_t)(w3 >> (i * 8));
+}
+
+static inline void zan_fe_add(zan_fe r, const zan_fe a, const zan_fe b) {
+    for (int i = 0; i < 5; i++) r[i] = a[i] + b[i];
+    zan_fe_carry(r);
+}
+
+static inline void zan_fe_sub(zan_fe r, const zan_fe a, const zan_fe b) {
+    uint64_t two_p0 = 2 * ((1ULL << 51) - 19);
+    uint64_t two_p14 = 2 * ((1ULL << 51) - 1);
+    r[0] = (a[0] + two_p0) - b[0];
+    r[1] = (a[1] + two_p14) - b[1];
+    r[2] = (a[2] + two_p14) - b[2];
+    r[3] = (a[3] + two_p14) - b[3];
+    r[4] = (a[4] + two_p14) - b[4];
+    zan_fe_carry(r);
+}
+
+static inline void zan_fe_mul(zan_fe r, const zan_fe a, const zan_fe b) {
+    uint64_t mask51 = (1ULL << 51) - 1;
+    zan_fe_u128 r0 = (zan_fe_u128)a[0] * b[0] +
+                    (zan_fe_u128)a[1] * ((zan_fe_u128)b[4] * 19) +
+                    (zan_fe_u128)a[2] * ((zan_fe_u128)b[3] * 19) +
+                    (zan_fe_u128)a[3] * ((zan_fe_u128)b[2] * 19) +
+                    (zan_fe_u128)a[4] * ((zan_fe_u128)b[1] * 19);
+
+    zan_fe_u128 r1 = (zan_fe_u128)a[0] * b[1] +
+                    (zan_fe_u128)a[1] * b[0] +
+                    (zan_fe_u128)a[2] * ((zan_fe_u128)b[4] * 19) +
+                    (zan_fe_u128)a[3] * ((zan_fe_u128)b[3] * 19) +
+                    (zan_fe_u128)a[4] * ((zan_fe_u128)b[2] * 19);
+
+    zan_fe_u128 r2 = (zan_fe_u128)a[0] * b[2] +
+                    (zan_fe_u128)a[1] * b[1] +
+                    (zan_fe_u128)a[2] * b[0] +
+                    (zan_fe_u128)a[3] * ((zan_fe_u128)b[4] * 19) +
+                    (zan_fe_u128)a[4] * ((zan_fe_u128)b[3] * 19);
+
+    zan_fe_u128 r3 = (zan_fe_u128)a[0] * b[3] +
+                    (zan_fe_u128)a[1] * b[2] +
+                    (zan_fe_u128)a[2] * b[1] +
+                    (zan_fe_u128)a[3] * b[0] +
+                    (zan_fe_u128)a[4] * ((zan_fe_u128)b[4] * 19);
+
+    zan_fe_u128 r4 = (zan_fe_u128)a[0] * b[4] +
+                    (zan_fe_u128)a[1] * b[3] +
+                    (zan_fe_u128)a[2] * b[2] +
+                    (zan_fe_u128)a[3] * b[1] +
+                    (zan_fe_u128)a[4] * b[0];
+
+    uint64_t c0 = (uint64_t)(r0 >> 51); r0 &= mask51; r1 += c0;
+    uint64_t c1 = (uint64_t)(r1 >> 51); r1 &= mask51; r2 += c1;
+    uint64_t c2 = (uint64_t)(r2 >> 51); r2 &= mask51; r3 += c2;
+    uint64_t c3 = (uint64_t)(r3 >> 51); r3 &= mask51; r4 += c3;
+    uint64_t c4 = (uint64_t)(r4 >> 51); r4 &= mask51;
+    r0 += (zan_fe_u128)c4 * 19;
+    c0 = (uint64_t)(r0 >> 51); r0 &= mask51; r1 += c0;
+
+    r[0] = (uint64_t)r0;
+    r[1] = (uint64_t)r1;
+    r[2] = (uint64_t)r2;
+    r[3] = (uint64_t)r3;
+    r[4] = (uint64_t)r4;
+    zan_fe_carry(r);
+}
+
+static inline void zan_fe_sqr(zan_fe r, const zan_fe a) {
+    zan_fe_mul(r, a, a);
+}
+
+static inline void zan_fe_mul121665(zan_fe r, const zan_fe a) {
+    uint64_t mask51 = (1ULL << 51) - 1;
+    zan_fe_u128 r0 = (zan_fe_u128)a[0] * 121665;
+    zan_fe_u128 r1 = (zan_fe_u128)a[1] * 121665;
+    zan_fe_u128 r2 = (zan_fe_u128)a[2] * 121665;
+    zan_fe_u128 r3 = (zan_fe_u128)a[3] * 121665;
+    zan_fe_u128 r4 = (zan_fe_u128)a[4] * 121665;
+
+    uint64_t c0 = (uint64_t)(r0 >> 51); r0 &= mask51; r1 += c0;
+    uint64_t c1 = (uint64_t)(r1 >> 51); r1 &= mask51; r2 += c1;
+    uint64_t c2 = (uint64_t)(r2 >> 51); r2 &= mask51; r3 += c2;
+    uint64_t c3 = (uint64_t)(r3 >> 51); r3 &= mask51; r4 += c3;
+    uint64_t c4 = (uint64_t)(r4 >> 51); r4 &= mask51;
+    r0 += (zan_fe_u128)c4 * 19;
+    c0 = (uint64_t)(r0 >> 51); r0 &= mask51; r1 += c0;
+
+    r[0] = (uint64_t)r0;
+    r[1] = (uint64_t)r1;
+    r[2] = (uint64_t)r2;
+    r[3] = (uint64_t)r3;
+    r[4] = (uint64_t)r4;
+    zan_fe_carry(r);
+}
+
+static inline void zan_fe_cswap(zan_fe a, zan_fe b, uint64_t swap) {
+    uint64_t mask = 0 - swap;
+    for (int i = 0; i < 5; i++) {
+        uint64_t x = mask & (a[i] ^ b[i]);
+        a[i] ^= x;
+        b[i] ^= x;
+    }
+}
+
+static void zan_fe_invert(zan_fe out, const zan_fe z) {
+    zan_fe t0, t1, t2, t3;
+    /* z^2 */
+    zan_fe_sqr(t0, z);
+    /* z^4 */
+    zan_fe_sqr(t1, t0);
+    /* z^8 */
+    zan_fe_sqr(t1, t1);
+    /* z^9 */
+    zan_fe_mul(t1, t1, z);
+    /* z^11 */
+    zan_fe_mul(t0, t0, t1);
+    /* z^22 */
+    zan_fe_sqr(t2, t0);
+    /* z^31 = z^(2^5 - 1) */
+    zan_fe_mul(t1, t2, t1);
+    /* z^(2^10 - 2^5) */
+    zan_fe_sqr(t2, t1);
+    for (int i = 1; i < 5; i++) zan_fe_sqr(t2, t2);
+    /* z^(2^10 - 1) */
+    zan_fe_mul(t1, t2, t1);
+    /* z^(2^20 - 2^10) */
+    zan_fe_sqr(t2, t1);
+    for (int i = 1; i < 10; i++) zan_fe_sqr(t2, t2);
+    /* z^(2^20 - 1) */
+    zan_fe_mul(t2, t2, t1);
+    /* z^(2^40 - 2^20) */
+    zan_fe_sqr(t3, t2);
+    for (int i = 1; i < 20; i++) zan_fe_sqr(t3, t3);
+    /* z^(2^40 - 1) */
+    zan_fe_mul(t2, t3, t2);
+    /* z^(2^50 - 2^10) */
+    zan_fe_sqr(t2, t2);
+    for (int i = 1; i < 10; i++) zan_fe_sqr(t2, t2);
+    /* z^(2^50 - 1) */
+    zan_fe_mul(t1, t2, t1);
+    /* z^(2^100 - 2^50) */
+    zan_fe_sqr(t2, t1);
+    for (int i = 1; i < 50; i++) zan_fe_sqr(t2, t2);
+    /* z^(2^100 - 1) */
+    zan_fe_mul(t2, t2, t1);
+    /* z^(2^200 - 2^100) */
+    zan_fe_sqr(t3, t2);
+    for (int i = 1; i < 100; i++) zan_fe_sqr(t3, t3);
+    /* z^(2^200 - 1) */
+    zan_fe_mul(t2, t3, t2);
+    /* z^(2^250 - 2^50) */
+    zan_fe_sqr(t2, t2);
+    for (int i = 1; i < 50; i++) zan_fe_sqr(t2, t2);
+    /* z^(2^250 - 1) */
+    zan_fe_mul(t1, t2, t1);
+    /* z^(2^255 - 2^5) */
+    zan_fe_sqr(t1, t1);
+    for (int i = 1; i < 5; i++) zan_fe_sqr(t1, t1);
+    /* z^(2^255 - 21) */
+    zan_fe_mul(out, t1, t0);
+}
+
+int64_t zan_hw_x25519(const uint8_t *scalar, const uint8_t *point, uint8_t *out) {
+    if (!scalar || !point || !out) return -1;
+
+    uint8_t k[32];
+    memcpy(k, scalar, 32);
+    k[0] &= 248;
+    k[31] &= 127;
+    k[31] |= 64;
+
+    zan_fe x1;
+    zan_fe_frombytes(x1, point);
+
+    zan_fe x2 = {1, 0, 0, 0, 0};
+    zan_fe z2 = {0, 0, 0, 0, 0};
+    zan_fe x3;
+    memcpy(x3, x1, sizeof(zan_fe));
+    zan_fe z3 = {1, 0, 0, 0, 0};
+
+    uint64_t swap = 0;
+    for (int t = 254; t >= 0; t--) {
+        uint64_t kt = (k[t / 8] >> (t % 8)) & 1;
+        swap ^= kt;
+        zan_fe_cswap(x2, x3, swap);
+        zan_fe_cswap(z2, z3, swap);
+        swap = kt;
+
+        zan_fe A, B, AA, BB, E, C, D, DA, CB;
+        zan_fe_add(A, x2, z2);
+        zan_fe_sqr(AA, A);
+        zan_fe_sub(B, x2, z2);
+        zan_fe_sqr(BB, B);
+        zan_fe_sub(E, AA, BB);
+        zan_fe_add(C, x3, z3);
+        zan_fe_sub(D, x3, z3);
+        zan_fe_mul(DA, D, A);
+        zan_fe_mul(CB, C, B);
+
+        zan_fe t0, t1;
+        zan_fe_add(t0, DA, CB);
+        zan_fe_sqr(x3, t0);
+        zan_fe_sub(t1, DA, CB);
+        zan_fe_sqr(t1, t1);
+        zan_fe_mul(z3, x1, t1);
+
+        zan_fe_mul(x2, AA, BB);
+        zan_fe_mul121665(t0, E);
+        zan_fe_add(t0, AA, t0);
+        zan_fe_mul(z2, E, t0);
+    }
+    zan_fe_cswap(x2, x3, swap);
+    zan_fe_cswap(z2, z3, swap);
+
+    zan_fe z2_inv;
+    zan_fe_invert(z2_inv, z2);
+    zan_fe res;
+    zan_fe_mul(res, x2, z2_inv);
+    zan_fe_tobytes(out, res);
+    return 0;
+}
+

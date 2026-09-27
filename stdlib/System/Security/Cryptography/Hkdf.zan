@@ -39,4 +39,104 @@ class Hkdf {
         byte[] prk = Extract(salt, saltLen, ikm, ikmLen);
         return Expand(prk, info, infoLen, outLen);
     }
+
+    /// <summary>HKDF-Extract（字节数组重载）。</summary>
+    static byte[] Extract(byte[] salt, byte[] ikm) {
+        int sLen = (salt == null) ? 0 : salt.Length;
+        int iLen = (ikm == null) ? 0 : ikm.Length;
+        return Hmac.Sha256(salt, sLen, ikm, iLen);
+    }
+
+    /// <summary>HKDF-Expand（字节数组重载）。</summary>
+    static byte[] Expand(byte[] prk, byte[] info, int outLen) {
+        byte[] outb = new byte[outLen];
+        byte[] t = null;
+        int tLen = 0;
+        int pos = 0;
+        int counter = 1;
+        int infoLen = (info == null) ? 0 : info.Length;
+        int prkLen = (prk == null) ? 0 : prk.Length;
+        while (pos < outLen) {
+            byte[] msg = new byte[tLen + infoLen + 1];
+            int i = 0;
+            for (; i < tLen; i = i + 1) { msg[i] = t[i] & 255; }
+            i = 0;
+            while (i < infoLen) { msg[tLen + i] = info[i] & 255; i = i + 1; }
+            msg[tLen + infoLen] = counter & 255;
+            t = Hmac.Sha256(prk, prkLen, msg, tLen + infoLen + 1);
+            tLen = 32;
+            for (int j = 0; j < 32 && pos < outLen; j = j + 1) { outb[pos] = t[j] & 255; pos = pos + 1; }
+            counter = counter + 1;
+        }
+        return outb;
+    }
+
+    /// <summary>RFC 8446 TLS 1.3 HKDF-Expand-Label。
+    /// 标签自动追加 "tls13 " 前缀并按 uint16 length + opaque label + opaque context 编码。</summary>
+    static byte[] ExpandLabel(byte[] secret, string label, byte[] context, int length) {
+        string prefix = "tls13 ";
+        int labelLen = prefix.Length + ((label == null) ? 0 : label.Length);
+        int ctxLen = (context == null) ? 0 : context.Length;
+        byte[] hkdfLabel = new byte[2 + 1 + labelLen + 1 + ctxLen];
+
+        hkdfLabel[0] = (byte)((length >> 8) & 255);
+        hkdfLabel[1] = (byte)(length & 255);
+        hkdfLabel[2] = (byte)(labelLen & 255);
+
+        for (int i = 0; i < prefix.Length; i = i + 1) {
+            hkdfLabel[3 + i] = (byte)(prefix[i] & 255);
+        }
+        if (label != null) {
+            for (int i = 0; i < label.Length; i = i + 1) {
+                hkdfLabel[3 + prefix.Length + i] = (byte)(label[i] & 255);
+            }
+        }
+        int off = 3 + labelLen;
+        hkdfLabel[off] = (byte)(ctxLen & 255);
+        off = off + 1;
+        if (context != null) {
+            for (int i = 0; i < ctxLen; i = i + 1) {
+                hkdfLabel[off + i] = (byte)(context[i] & 255);
+            }
+        }
+
+        return Expand(secret, hkdfLabel, length);
+    }
+
+    /// <summary>RFC 5246 TLS 1.2 PRF-SHA256 伪随机函数：
+    /// P_SHA256(secret, label + seed)，派生 <paramref name="outLen"/> 字节。</summary>
+    static byte[] Tls12Prf(byte[] secret, string label, byte[] seed, int outLen) {
+        int labelLen = (label == null) ? 0 : label.Length;
+        int seedLen = (seed == null) ? 0 : seed.Length;
+        byte[] seedTotal = new byte[labelLen + seedLen];
+        for (int i = 0; i < labelLen; i = i + 1) {
+            seedTotal[i] = (byte)(label[i] & 255);
+        }
+        for (int i = 0; i < seedLen; i = i + 1) {
+            seedTotal[labelLen + i] = (byte)(seed[i] & 255);
+        }
+
+        byte[] outb = new byte[outLen];
+        int secLen = (secret == null) ? 0 : secret.Length;
+        byte[] a = Hmac.Sha256(secret, secLen, seedTotal, seedTotal.Length); // A(1) = HMAC(secret, seed)
+        int pos = 0;
+
+        while (pos < outLen) {
+            // A(i) + seedTotal
+            byte[] blockInput = new byte[a.Length + seedTotal.Length];
+            for (int i = 0; i < a.Length; i = i + 1) { blockInput[i] = a[i]; }
+            for (int i = 0; i < seedTotal.Length; i = i + 1) { blockInput[a.Length + i] = seedTotal[i]; }
+
+            byte[] p = Hmac.Sha256(secret, secLen, blockInput, blockInput.Length);
+            for (int i = 0; i < p.Length && pos < outLen; i = i + 1) {
+                outb[pos] = p[i];
+                pos = pos + 1;
+            }
+
+            // A(i+1) = HMAC(secret, A(i))
+            a = Hmac.Sha256(secret, secLen, a, a.Length);
+        }
+
+        return outb;
+    }
 }
