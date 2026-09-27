@@ -36,9 +36,9 @@ class PostsController : AdminController {
             .TbarAdd("写文章", "/admin/content/posts/form")
             .TbarReload()
             .TbarSep()
-            .TbarBatch("发布", "/admin/content/posts/batchpublish", "1", "确认发布所选文章吗？")
-            .TbarBatch("转草稿", "/admin/content/posts/batchpublish", "0", "")
-            .TbarDelete("/admin/content/posts/batchdelete");
+            .TbarBatch("发布", "/admin/content/posts/batch", "1", "确认发布所选文章吗？")
+            .TbarBatch("转草稿", "/admin/content/posts/batch", "0", "")
+            .TbarDelete("/admin/content/posts/batch");
         List<OrmCond> conds = lp.Collect(this);
         lp.Search(this, d, "/admin/content/posts");
         lp.Toolbar(d);
@@ -108,41 +108,38 @@ class PostsController : AdminController {
         this.Ctx().Api(Codes.Ok, "ok", arr.ToJson());
     }
 
-    /* 批量发布/转草稿（value=1/0）。写后清公开列表缓存，前台立即生效。 */
+    /* 批量操作：value 空=删除、1/0=发布/转草稿——与框架网关同一个
+       batch 端点、同一线缆契约；入口放宽为 Update|Delete，分支内复核
+       各自的权限位。写后清公开列表缓存，前台立即生效。 */
     [HttpPost]
-    [Custom(Perm = PermBit.Update)]
-    [Description("批量发布或转草稿")]
-    async void BatchPublish() {
+    [Custom(Perm = PermBit.Update | PermBit.Delete)]
+    [Description("文章批量操作（发布/删除）")]
+    async void Batch() {
         List<int> ids = this.Ids("ids");
         if (ids.Count == 0) { this.Fail(400, "0004", "未选择文章"); return; }
-        int state = this.InInt("value", 1);
-        if (state != 1) { state = 0; }
-        int n = await new PostDao(this).SetPublishedByIds(ids, state);
+        string value = this.In("value");
         CacheContext cache = this.Cache();
+        if (value.Length == 0) {
+            if (!await this.Can(PermBit.Delete)) { this.Fail(403, "0403", "无删除权限"); return; }
+            int n = await new PostDao(this).DeleteByIds(ids);
+            for (int i = 0; i < ids.Count; i = i + 1) {
+                int _c = await this.Comment.Delete().Where(a => a.postId == ids[i])
+                    .ExecuteAffrowsAsync();
+            }
+            if (cache != null) { await cache.DelAsync("blog:list"); }
+            await this.Note("批量删除文章",
+                Convert.ToString(ids.Count) + " 篇文章", n > 0, "");
+            this.Saved("已删除 " + Convert.ToString(n) + " 篇文章");
+            return;
+        }
+        if (!await this.Can(PermBit.Update)) { this.Fail(403, "0403", "无编辑权限"); return; }
+        int state = value == "1" ? 1 : 0;
+        int m = await new PostDao(this).SetPublishedByIds(ids, state);
         if (cache != null) { await cache.DelAsync("blog:list"); }
         await this.Note("批量改发布状态",
-            Convert.ToString(ids.Count) + " 篇文章", n > 0,
+            Convert.ToString(ids.Count) + " 篇文章", m > 0,
             state == 1 ? "发布" : "转草稿");
-        this.Saved("已" + (state == 1 ? "发布" : "转草稿") + " " + Convert.ToString(n) + " 篇文章");
-    }
-
-    /* 批量删除；连带清评论与缓存，口径与单篇删除一致。 */
-    [HttpPost]
-    [Custom(Perm = PermBit.Delete)]
-    [Description("批量删除文章")]
-    async void BatchDelete() {
-        List<int> ids = this.Ids("ids");
-        if (ids.Count == 0) { this.Fail(400, "0004", "未选择文章"); return; }
-        int n = await new PostDao(this).DeleteByIds(ids);
-        for (int i = 0; i < ids.Count; i = i + 1) {
-            int _c = await this.Comment.Delete().Where(a => a.postId == ids[i])
-                .ExecuteAffrowsAsync();
-        }
-        CacheContext cache = this.Cache();
-        if (cache != null) { await cache.DelAsync("blog:list"); }
-        await this.Note("批量删除文章",
-            Convert.ToString(ids.Count) + " 篇文章", n > 0, "");
-        this.Saved("已删除 " + Convert.ToString(n) + " 篇文章");
+        this.Saved("已" + (state == 1 ? "发布" : "转草稿") + " " + Convert.ToString(m) + " 篇文章");
     }
 
     /* 一份声明：Form 渲染与 Save 校验同源。分类选项由调用方查询传入
@@ -261,41 +258,37 @@ class PostsController : AdminController {
 
     [HttpPost]
     [Custom(Perm = PermBit.Update)]
-    [Description("发布或下架文章")]
-    async void Publish() {
+    [Description("行内更新文章属性（发布/置顶）")]
+    async void Field() {
         int id = this.InInt("id", 0);
-        int published = this.InInt("published", 1);
-        if (published != 1) { published = 0; }
+        string field = this.Need("field", "属性");
+        string value = this.In("value");
+        if (field != "published" && field != "top") {
+            this.Fail(400, "0004", "不支持的属性");
+        }
+        int on = value == "0" ? 0 : 1;
         Post p = await this.Post.ById(id);
         if (p == null) { this.Fail(404, "0404", "文章不存在"); }
-        int n = await this.Post.Update()
-            .Set(a => a.published, published)
-            .Set(a => a.updatedAt, WebApp.NowSeconds())
+        if (field == "published") {
+            int n = await this.Post.Update()
+                .Set(a => a.published, on)
+                .Set(a => a.updatedAt, WebApp.NowSeconds())
+                .Where(a => a.id == id)
+                .ExecuteAffrowsAsync();
+            await this.Bust();
+            await this.Note("发布或下架文章", p.title, n > 0,
+                Fmt.PublishedText(on));
+            if (on == 1) { this.Saved("文章已发布"); return; }
+            this.Saved("文章已下架");
+            return;
+        }
+        int m = await this.Post.Update()
+            .Set(a => a.top, on)
             .Where(a => a.id == id)
             .ExecuteAffrowsAsync();
         await this.Bust();
-        await this.Note("发布或下架文章", p.title, n > 0,
-            Fmt.PublishedText(published));
-        if (published == 1) { this.Saved("文章已发布"); return; }
-        this.Saved("文章已下架");
-    }
-
-    [HttpPost]
-    [Custom(Perm = PermBit.Update)]
-    [Description("置顶文章")]
-    async void Top() {
-        int id = this.InInt("id", 0);
-        int top = this.InInt("top", 1);
-        if (top != 1) { top = 0; }
-        Post p = await this.Post.ById(id);
-        if (p == null) { this.Fail(404, "0404", "文章不存在"); }
-        int n = await this.Post.Update()
-            .Set(a => a.top, top)
-            .Where(a => a.id == id)
-            .ExecuteAffrowsAsync();
-        await this.Bust();
-        await this.Note("置顶文章", p.title, n > 0, "");
-        if (top == 1) { this.Saved("文章已置顶"); return; }
+        await this.Note("置顶文章", p.title, m > 0, "");
+        if (on == 1) { this.Saved("文章已置顶"); return; }
         this.Saved("已取消置顶");
     }
 

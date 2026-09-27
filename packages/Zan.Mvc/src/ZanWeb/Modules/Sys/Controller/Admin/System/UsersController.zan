@@ -46,9 +46,9 @@ class UsersController : AdminController {
             .TbarAdd("新增账号", "/admin/system/users/form")
             .TbarReload()
             .TbarSep()
-            .TbarEnable("/admin/system/users/batchstatus")
-            .TbarDisable("/admin/system/users/batchstatus")
-            .TbarDelete("/admin/system/users/batchdelete")
+            .TbarEnable("/admin/system/users/batch")
+            .TbarDisable("/admin/system/users/batch")
+            .TbarDelete("/admin/system/users/batch")
             .Table("sys_user")
             .EditFields("nickname:text,email:text,mobile:text,departmentId:int,status:int");
     }
@@ -275,17 +275,42 @@ class UsersController : AdminController {
     /* 批量启禁：工具栏对勾选行一次提交（ids=1,2,3）。越权行零容忍——
        名单里有超管或（禁用时的）本人即整体拒绝，不做"能做多少做多少"
        的部分成功，避免操作者误以为全部生效。 */
+    /* 批量操作：工具栏对勾选行一次提交（ids=1,2,3），value 空=删除、
+       1/0=启禁——与框架网关同一个 batch 端点、同一线缆契约。入口放宽为
+       Update|Delete，分支内复核各自的权限位。越权行零容忍——名单里有
+       超管或（禁用/删除时的）本人即整体拒绝，不做"能做多少做多少"
+       的部分成功，避免操作者误以为全部生效。 */
     [HttpPost]
-    [Custom(Perm = PermBit.Update)]
-    [Description("批量启禁账号")]
-    async void BatchStatus() {
+    [Custom(Perm = PermBit.Update | PermBit.Delete)]
+    [Description("账号批量操作（启禁/删除）")]
+    async void Batch() {
         List<int> ids = this.Ids("ids");
         if (ids.Count == 0) { this.Fail(400, "0004", "未选择账号"); return; }
-        int status = this.InInt("value", 1);
-        if (status != 1) { status = 0; }
+        string value = this.In("value");
+        int status = value == "1" ? 1 : 0;
         List<SysUser> rows = await new SysUserDao(this).ByIds(ids);
         if (rows.Count == 0) { this.Fail(400, "0004", "所选账号不存在"); return; }
         SysUser me = await this.Admin();
+        if (value.Length == 0) {
+            if (!await this.Can(PermBit.Delete)) { this.Fail(403, "0403", "无删除权限"); return; }
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                if (rows[i].isSuper == 1) {
+                    this.Fail(400, "0004", "所选账号包含超级管理员，不能批量删除");
+                    return;
+                }
+                if (me != null && rows[i].id == me.id) {
+                    this.Fail(400, "0004", "所选账号包含当前登录账号，不能批量删除");
+                    return;
+                }
+            }
+            await CrudOps.Delete(this, UsersController.ScreenDef(), ids, "批量删除账号");
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                int _r = await new SysUserRoleDao(this).DeleteByUserId(rows[i].id);
+                AuthUser.Forget(Convert.ToString(rows[i].id));
+            }
+            return;
+        }
+        if (!await this.Can(PermBit.Update)) { this.Fail(403, "0403", "无编辑权限"); return; }
         for (int i = 0; i < rows.Count; i = i + 1) {
             if (rows[i].isSuper == 1) {
                 this.Fail(400, "0004", "所选账号包含超级管理员，不能批量操作");
@@ -305,34 +330,6 @@ class UsersController : AdminController {
                 await this.Revoke(rows[i].id);
                 AuthUser.Forget(Convert.ToString(rows[i].id));
             }
-        }
-    }
-
-    /* 批量删除：同零容忍口径。主行删除走通用动作；连带清角色关联并
-       失效其会话是业务语义，留在屏内。 */
-    [HttpPost]
-    [Custom(Perm = PermBit.Delete)]
-    [Description("批量删除账号")]
-    async void BatchDelete() {
-        List<int> ids = this.Ids("ids");
-        if (ids.Count == 0) { this.Fail(400, "0004", "未选择账号"); return; }
-        List<SysUser> rows = await new SysUserDao(this).ByIds(ids);
-        if (rows.Count == 0) { this.Fail(400, "0004", "所选账号不存在"); return; }
-        SysUser me = await this.Admin();
-        for (int i = 0; i < rows.Count; i = i + 1) {
-            if (rows[i].isSuper == 1) {
-                this.Fail(400, "0004", "所选账号包含超级管理员，不能批量删除");
-                return;
-            }
-            if (me != null && rows[i].id == me.id) {
-                this.Fail(400, "0004", "所选账号包含当前登录账号，不能批量删除");
-                return;
-            }
-        }
-        await CrudOps.Delete(this, UsersController.ScreenDef(), ids, "批量删除账号");
-        for (int i = 0; i < rows.Count; i = i + 1) {
-            int _r = await new SysUserRoleDao(this).DeleteByUserId(rows[i].id);
-            AuthUser.Forget(Convert.ToString(rows[i].id));
         }
     }
 

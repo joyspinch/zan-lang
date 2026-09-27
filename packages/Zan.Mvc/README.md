@@ -209,12 +209,34 @@ adminUI（JSON 体）两套前端同动作双兼容靠它。成员按所在层�
 `In/InAny`、`InInt/InAnyInt`、`Ids/IdsAny`、`Paged/PagedAny` 全对齐；
 写下来之后"乱"变"规则"。）
 
-**动作词表。** 自有动作与前端合同动作分列；合同词由前端源码钉死，改词
-即断前端，改动前必须对照 adminUI：
+**动作词表。** 同质端点一律同名：线缆形状（参数、语义）相同的动作在
+任何控制器里用同一个词，前端封装只写一次、全站通吃。合同词由前端源码
+钉死，改词即断前端，改动前必须对照 adminUI：
 
-- 自有：`index` `form` `save` `delete` `batch` `field` `options`
-- adminUI 合同：`conf`(PUT 配置下发) · `list`(POST JSON 筛选列表) ·
-  `edit`(POST 单行回显——合同词，读语义) · `formconf`(PUT 表单配置)
+| 动词       | 契约                       | 语义                              |
+|------------|----------------------------|-----------------------------------|
+| `index`    | GET                        | 屏壳                              |
+| `conf`     | PUT（adminUI 合同词）      | 表格配置下发                      |
+| `list`     | POST（adminUI 合同词）     | 行数据：自有壳分页表单与 adminUI JSON 筛选同端点，In/InAny 双兼容 |
+| `form`     | GET                        | 表单对话框                        |
+| `formconf` | PUT（adminUI 合同词）      | 表单配置下发                      |
+| `edit`     | POST id（adminUI 合同词）  | 单行回显——读语义                  |
+| `save`     | POST                       | 保存                              |
+| `delete`   | POST id/ids                | 删除                              |
+| `field`    | POST id+field+value        | 行内单字段改，field 白名单        |
+| `batch`    | POST ids+value             | 批量操作：value 空=删除，非空=切换，动作内按值分支 |
+| `options`  | GET/POST                   | 下拉选项                          |
+
+一个资源只有一份"批量"与"行内改"端点：`batchstatus`/`batchdelete`/
+`batchpublish` 这类按方向拆名是历史形态，现都并进 `batch`，方向由
+`value` 编码；`quick`/`itemquick`/`columnquick`/`publish`/`top` 同理
+并入 `field`，字段由 `field` 白名单。多资源屏加名词前缀保持同构：
+`itemfield` `typeform` `columnsave` `spaceremove`……规则是
+"前缀=资源、尾词=标准动词"，不发明新尾词。
+
+**特有操作豁免**：没有同质兄弟的业务动作用自己的词（`kick` `grant`
+`review` `upload` `run` `rollback` `mailtest`）。判断标准是"换个控制器
+还存在吗"——存在就必须同名，不存在就自由命名，不为凑统一而扭曲语义。
 
 **`Crud*` 语义前缀**只有三类角色，新增类型先对号入座：
 
