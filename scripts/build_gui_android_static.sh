@@ -35,7 +35,9 @@ if [ ! -f "$FT_CUSTOM_INC/freetype/config/ftmodule.h" ]; then
     "$FT/include/freetype/config/ftmodule.h" > "$FT_CUSTOM_INC/freetype/config/ftmodule.h"
 fi
 
-COMMON="-O2 -g0 -fPIC -std=c11 -DFT2_BUILD_LIBRARY -I$FT_CUSTOM_INC -I$FT/include -I$REPO/src/runtime"
+# -DNDEBUG drops the vendored libs' assert() strings (their __FILE__ would
+# leak build-machine paths into every static publish).
+COMMON="-O2 -g0 -DNDEBUG -fPIC -std=c11 -DFT2_BUILD_LIBRARY -I$FT_CUSTOM_INC -I$FT/include -I$REPO/src/runtime"
 
 # FreeType modules: the member list the committed archives carry (base set +
 # gzip + synth + mm + stroke; no bzip2/lzw/png/zlib, no cache).

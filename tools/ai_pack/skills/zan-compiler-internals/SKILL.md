@@ -90,6 +90,21 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   接后 obj_tmp 会删）→ `llvm-ar x` → 用 build/ld.exe（PE）或 ld.lld
   （ELF）手动重链，加 `--print-gc-sections`；缺驱动符号时补
   `-z undefs --noinhibit-exec`（ELF）即可只量回收不产出可执行。
+- **PE 的真按需粒度 = 归档成员，不是 gc**（2026-09-27 落地）：既然
+  .pdata/.xdata 钉死分节回收，PE 上想要"用到才导入"就把子系统拆成静态
+  归档的独立成员——GNU ld 按符号需求拉成员，无需 gc。zan_audio（+
+  stb_vorbis，unity 尾部 `#include`）拆成 `libzan_gui.a` 独立成员后，不用
+  stdlib/System/Media 的程序静态发布实测 −103KB、vorbis/OggS 字符串
+  清零；音频程序（Audio.zan 引 zan_audio_*）成员照常拉入、WASAPI 实开
+  验证通过。共享 DLL 保持 unity。函数分节在 PE 上白给 BSS +133KB（每节
+  对齐垫），别顺手加。
+- **发布档必须 `-DNDEBUG`（2026-09-27）**：vendored C 库（libwebp/stb）
+  的 `assert()` 把 `__FILE__` 编进 .rdata，每个发布 exe 泄漏几十处构建机
+  路径；NDEBUG 后字符串清零且无行为风险（运行时自身零 assert）。
+- **提交态归档会过期，重建时连环炸**：静态驱动归档落后源码时（如
+  dwrite TU 未入归档、`.libs` 清单落后人工补过的提交版），下一次重编
+  归档才爆 undefined reference；先 `git show HEAD:<归档路径>` 对比成员
+  与 `nm` 旧符号，再对齐脚本与提交态清单。
 
 ## auto-stdlib 拉入的真实语义与重臂注册制（2026-09-16 落地）
 

@@ -40,7 +40,10 @@ AR="${AR:-ar}"
 # FreeType include paths (system pkg-config or fallback)
 FT_CFLAGS="$(pkg-config --cflags freetype2 2>/dev/null || echo "-I/usr/include/freetype2")"
 
-$CC -O2 -g0 -fPIC -std=c11 \
+# -DNDEBUG drops the vendored libs' assert() strings (their __FILE__ would
+# leak build-machine paths into every static publish); -ffunction-sections
+# pairs with the publish link's --gc-sections, which on ELF really prunes.
+$CC -O2 -g0 -DNDEBUG -ffunction-sections -fdata-sections -fPIC -std=c11 \
     -DZAN_GUI_STATIC -DZAN_GUI_FREETYPE \
     $FT_CFLAGS \
     -I"$ROOT/src/runtime" \

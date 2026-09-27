@@ -36,6 +36,17 @@
 #include <string.h>
 #include <math.h>
 
+/* Standalone-TU compile (the static driver archive builds this file as its
+ * own member so the linker drops it for programs that never touch audio):
+ * provide the two things the single-TU host used to supply. windows.h is
+ * idempotent, so re-including it after the host is harmless. */
+#ifdef _WIN32
+#include <windows.h>
+#endif
+#ifndef EXPORT
+#define EXPORT
+#endif
+
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN

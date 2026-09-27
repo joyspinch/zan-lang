@@ -4343,8 +4343,16 @@ const zan_gui_backend zan_cpu_backend = {
 /* ---- native audio ------------------------------------------------------
  * WASAPI/AAudio-based clip/voice mixer (see zan_audio.c): zero-dependency
  * native audio runtime (WASAPI/AAudio/...), exported from this same DLL so
- * the existing driver bundles carry it without new build machinery. */
+ * the existing driver bundles carry it without new build machinery.
+ * ZAN_GUI_AUDIO_SEPARATE (static win-x64 driver archive) builds zan_audio.c
+ * as its own archive member instead: GNU ld pulls archive members by symbol
+ * demand, so programs whose stdlib pull-in never references zan_audio_*
+ * (everything that does not use stdlib/System/Media) leave the whole mixer
+ * plus stb_vorbis out of the executable. --gc-sections cannot do this here:
+ * the PE link keeps .text$-grouped sections regardless. */
+#if !defined(ZAN_GUI_AUDIO_SEPARATE)
 #include "zan_audio.c"
+#endif
 
 /* Which rasterizer this *application* draws with: 0 = software, 1 = GPU,
  * 2 = GPU when this machine can provide it (Auto). Returns what is actually

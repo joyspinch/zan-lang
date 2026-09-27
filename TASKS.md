@@ -17,6 +17,8 @@
 ## C 类 · 文档 / 工程规范
 
 - [x] **C-1** `scripts/build_mge.ps1`、`build_glassprobe.ps1`、`build_gui.ps1`、`build_jsonbind.ps1` 的手工 mingw GUI 归档缺 `gui_runtime_dwrite.o`：gui_runtime.c 只声明 `zan_dw_render`，实现拆在 `gui_runtime_dwrite.cpp`（b674314a 拆分引入），IDE 与 gallery 脚本已补（2026-09-26），这四个跑 `--link` 会报 undefined reference。已修复：clang++ `-fno-exceptions -fno-rtti` 编译 dwrite.cpp 进归档并打包入库。2026-09-27。
+- [x] **C-2** 提交态静态驱动归档（win-x64）陈旧叠加，静态发布泄漏构建机路径：`libzan_gui.a` 无 NDEBUG，vendored 库 assert 的 `__FILE__` 把 31 处 `D:\<repo>\src\runtime\...` 路径编进每个单文件发布 exe；且静态脚本漏编 dwrite TU（C-1 同族）、重写 `zan_gui.libs` 时丢失人工维护的 ole32/shcore。修复：`build_win_static_drivers.ps1` 加 `-DNDEBUG`、补编 dwrite 成员、`.libs` 合并为超集，归档重建后发布 exe 路径字符串清零。2026-09-27。
+- [x] **C-3** PE 静态发布按需导入：`--gc-sections` 在 PE 上对 `.text$` 分组节无效（.pdata 钉活，实测 .pdata 只减 4 项），unity 尾部 `#include "zan_audio.c"` 让 WASAPI+stb_vorbis 进每个 GUI 单文件 exe。修复：`ZAN_GUI_AUDIO_SEPARATE` 下 zan_audio.c 独立编为 `libzan_gui.a` 第三成员，ld 按符号需求拉成员——不用音频的程序 −103KB（vorbis/OggS 字符串清零），音频程序照常拉入（audioprobe 实开 WASAPI 验证）。共享 DLL 保持 unity、103 导出零漂移。linux/android/ohos 静态驱动脚本同批加 NDEBUG（提交态归档待各自平台重跑换血）。2026-09-27。
 
 ---
 

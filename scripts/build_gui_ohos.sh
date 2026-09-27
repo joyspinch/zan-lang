@@ -23,7 +23,9 @@ FT=/d/project/firefox/modules/freetype2
 OUT="$REPO/_scratch/ft-ohos"
 DRV="$REPO/stdlib/Gui/drivers/ohos-x64"
 
-COMMON="-O2 -fPIC -g0 -std=c11 -D_GNU_SOURCE -DZAN_GUI_OHOS -DZAN_GUI_FREETYPE -DFT2_BUILD_LIBRARY"
+# -DNDEBUG drops the vendored libs' assert() strings (their __FILE__ would
+# leak build-machine paths into published artifacts).
+COMMON="-O2 -fPIC -g0 -DNDEBUG -std=c11 -D_GNU_SOURCE -DZAN_GUI_OHOS -DZAN_GUI_FREETYPE -DFT2_BUILD_LIBRARY"
 INC="-I$FT/include -I$REPO/src/runtime"
 
 echo "== ohos-x64: compile gui_runtime.c"
