@@ -319,6 +319,44 @@ static LLVMValueRef route_generic_method(zan_irgen_t *g, zan_type_t *recv_ty,
     return erased_fn;
 }
 
+/* Devirtualization: check if any class in the module inherits from target. */
+static bool class_has_derived_in_module(zan_irgen_t *g, zan_symbol_t *target) {
+    if (!g || !target) return false;
+    for (int i = 0; i < g->struct_type_count; i++) {
+        zan_symbol_t *cur = g->struct_types[i].sym;
+        if (!cur || cur == target) continue;
+        for (zan_type_t *bt = (cur->type ? cur->type->base_type : NULL); bt; bt = bt->base_type) {
+            if (bt->sym == target) return true;
+        }
+    }
+    return false;
+}
+
+/* Check if any derived class of static_sym actually overrides method_sym. */
+static bool hierarchy_has_subclass_override(zan_irgen_t *g, zan_symbol_t *static_sym, zan_symbol_t *method_sym) {
+    if (!g || !static_sym || !method_sym) return false;
+    int want_params = method_declared_param_count(method_sym);
+    for (int i = 0; i < g->struct_type_count; i++) {
+        zan_symbol_t *cur = g->struct_types[i].sym;
+        if (!cur || cur == static_sym) continue;
+        bool is_sub = false;
+        for (zan_type_t *bt = (cur->type ? cur->type->base_type : NULL); bt; bt = bt->base_type) {
+            if (bt->sym == static_sym) { is_sub = true; break; }
+        }
+        if (!is_sub) continue;
+        for (int m = 0; m < cur->member_count; m++) {
+            zan_symbol_t *mem = cur->members[m];
+            if (mem && mem->kind == SYM_METHOD && (mem->modifiers & MOD_OVERRIDE)) {
+                if (member_name_is(mem, method_sym->name) &&
+                    method_declared_param_count(mem) == want_params) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 /* Emit a call that dispatches through the object's vtable when the target is a
  * virtual/override method invoked on a class instance; otherwise a plain
  * static call. `static_sym` is the receiver's *declared* type. */
@@ -330,26 +368,37 @@ static LLVMValueRef emit_dispatch_call(zan_irgen_t *g, zan_symbol_t *static_sym,
         (method_sym->modifiers & (MOD_VIRTUAL | MOD_OVERRIDE)) &&
         class_has_virtual_methods(static_sym) && argc >= 1 && call_args[0] &&
         LLVMGetTypeKind(LLVMTypeOf(call_args[0])) == LLVMPointerTypeKind) {
-        /* the slot key includes the resolved overload's declared arity:
-         * overloaded virtuals occupy one slot per distinct declaration, so
-         * matching the name alone dispatched every same-named call through
-         * the first-declared overload's slot (x.F(1,2,3,4) ran the 2-param
-         * F's body; the extra args were silently dropped by the bitcast). */
-        int slot = get_virtual_method_index(static_sym, method_sym);
-        LLVMTypeRef st = get_struct_llvm_type(g, static_sym);
-        if (slot >= 0 && st) {
-            LLVMBuilderRef b = g->builder;
-            LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-            LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-            LLVMValueRef thisp = LLVMBuildBitCast(b, call_args[0], LLVMPointerType(st, 0), "vthis");
-            LLVMValueRef vpf = LLVMBuildStructGEP2(b, st, thisp, 0, "vpf");
-            LLVMValueRef vt8 = LLVMBuildLoad2(b, i8ptr, vpf, "vt8");
-            LLVMValueRef vt = LLVMBuildBitCast(b, vt8, LLVMPointerType(i8ptr, 0), "vt");
-            LLVMValueRef sidx = LLVMConstInt(i64, (unsigned long long)slot, 0);
-            LLVMValueRef sp = LLVMBuildGEP2(b, i8ptr, vt, &sidx, 1, "vsp");
-            LLVMValueRef fn8 = LLVMBuildLoad2(b, i8ptr, sp, "vfn8");
-            LLVMValueRef fnp = LLVMBuildBitCast(b, fn8, LLVMPointerType(fn_type, 0), "vfnp");
-            return zan_call2(b, fn_type, fnp, call_args, (unsigned)argc, cn);
+
+        /* Devirtualization: if the class or method is sealed, or if no class in
+         * the module derives from static_sym, or if no derived class overrides
+         * this method, the call is monomorphic and can be emitted statically. */
+        bool devirt = ((static_sym->modifiers & MOD_SEALED) != 0) ||
+                      ((method_sym->modifiers & MOD_SEALED) != 0) ||
+                      !class_has_derived_in_module(g, static_sym) ||
+                      !hierarchy_has_subclass_override(g, static_sym, method_sym);
+
+        if (!devirt) {
+            /* the slot key includes the resolved overload's declared arity:
+             * overloaded virtuals occupy one slot per distinct declaration, so
+             * matching the name alone dispatched every same-named call through
+             * the first-declared overload's slot (x.F(1,2,3,4) ran the 2-param
+             * F's body; the extra args were silently dropped by the bitcast). */
+            int slot = get_virtual_method_index(static_sym, method_sym);
+            LLVMTypeRef st = get_struct_llvm_type(g, static_sym);
+            if (slot >= 0 && st) {
+                LLVMBuilderRef b = g->builder;
+                LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+                LLVMValueRef thisp = LLVMBuildBitCast(b, call_args[0], LLVMPointerType(st, 0), "vthis");
+                LLVMValueRef vpf = LLVMBuildStructGEP2(b, st, thisp, 0, "vpf");
+                LLVMValueRef vt8 = LLVMBuildLoad2(b, i8ptr, vpf, "vt8");
+                LLVMValueRef vt = LLVMBuildBitCast(b, vt8, LLVMPointerType(i8ptr, 0), "vt");
+                LLVMValueRef sidx = LLVMConstInt(i64, (unsigned long long)slot, 0);
+                LLVMValueRef sp = LLVMBuildGEP2(b, i8ptr, vt, &sidx, 1, "vsp");
+                LLVMValueRef fn8 = LLVMBuildLoad2(b, i8ptr, sp, "vfn8");
+                LLVMValueRef fnp = LLVMBuildBitCast(b, fn8, LLVMPointerType(fn_type, 0), "vfnp");
+                return zan_call2(b, fn_type, fnp, call_args, (unsigned)argc, cn);
+            }
         }
     }
     return zan_call2(g->builder, fn_type, static_fn, call_args, (unsigned)argc, cn);

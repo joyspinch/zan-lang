@@ -1893,6 +1893,37 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMConstNull(LLVMTypeOf(s)), "subnull");
                     s = emit_soft_base_select(g, s, snull, expr->loc);
                 }
+
+                LLVMContextRef c = g->ctx;
+                LLVMBasicBlockRef bb_slice = LLVMAppendBasicBlockInContext(c, g->current_fn, "sub.slice");
+                LLVMBasicBlockRef bb_full = total ? LLVMAppendBasicBlockInContext(c, g->current_fn, "sub.full") : NULL;
+                LLVMBasicBlockRef bb_empty = LLVMAppendBasicBlockInContext(c, g->current_fn, "sub.empty");
+                LLVMBasicBlockRef bb_join = LLVMAppendBasicBlockInContext(c, g->current_fn, "sub.join");
+
+                LLVMValueRef is_empty = zan_icmp(g->builder, LLVMIntEQ, slen, LLVMConstInt(i64, 0, 0), "sub.isz");
+                if (total) {
+                    LLVMValueRef is_st0 = zan_icmp(g->builder, LLVMIntEQ, start, LLVMConstInt(i64, 0, 0), "sub.st0");
+                    LLVMValueRef is_len_all = zan_icmp(g->builder, LLVMIntEQ, slen, total, "sub.lall");
+                    LLVMValueRef is_full = zan_and(g->builder, is_st0, is_len_all, "sub.isfull");
+                    LLVMBasicBlockRef bb_chk_full = LLVMAppendBasicBlockInContext(c, g->current_fn, "sub.chkfull");
+                    LLVMBuildCondBr(g->builder, is_empty, bb_empty, bb_chk_full);
+
+                    LLVMPositionBuilderAtEnd(g->builder, bb_chk_full);
+                    LLVMBuildCondBr(g->builder, is_full, bb_full, bb_slice);
+
+                    LLVMPositionBuilderAtEnd(g->builder, bb_full);
+                    LLVMTypeRef str_rel_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), (LLVMTypeRef[]){ i8ptr }, 1, 0);
+                    zan_call2(g->builder, str_rel_type, g->rt_str_retain, &s, 1, "");
+                    LLVMBuildBr(g->builder, bb_join);
+                } else {
+                    LLVMBuildCondBr(g->builder, is_empty, bb_empty, bb_slice);
+                }
+
+                LLVMPositionBuilderAtEnd(g->builder, bb_empty);
+                LLVMValueRef empty_str = zan_irgen_intern_string(g, "");
+                LLVMBuildBr(g->builder, bb_join);
+
+                LLVMPositionBuilderAtEnd(g->builder, bb_slice);
                 LLVMValueRef bufsz = zan_add(g->builder, slen, LLVMConstInt(i64, 1, 0), "bsz");
                 LLVMValueRef buf = emit_string_alloc_rc(g, bufsz);
                 LLVMValueRef srcp = LLVMBuildGEP2(g->builder, i8, s, &start, 1, "srcp");
@@ -1910,8 +1941,22 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 /* the slice was cut inside a NUL-free range, so `slen` is the
                  * result's own length */
                 emit_string_len_set(g, buf, slen);
+                LLVMBuildBr(g->builder, bb_join);
+
+                LLVMPositionBuilderAtEnd(g->builder, bb_join);
+                LLVMValueRef phi = LLVMBuildPhi(g->builder, i8ptr, "sub.res");
+                LLVMValueRef phi_in_vals[3];
+                LLVMBasicBlockRef phi_in_bbs[3];
+                int np = 0;
+                phi_in_vals[np] = empty_str; phi_in_bbs[np] = bb_empty; np++;
+                if (total) {
+                    phi_in_vals[np] = s; phi_in_bbs[np] = bb_full; np++;
+                }
+                phi_in_vals[np] = buf; phi_in_bbs[np] = bb_slice; np++;
+                LLVMAddIncoming(phi, phi_in_vals, phi_in_bbs, (unsigned)np);
+
                 emit_release_owned_call_temp(g, sc->member.object, s, locals);
-                return buf;
+                return phi;
             }
         }
 
@@ -4944,6 +4989,58 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         n_eh_args += emit_call_arg_eh_push(g, expr->call.args.items[k],
                                                           avals[k], locals);
                     }
+                    /* Devirtualization / monomorphic check: count classes that implement this interface */
+                    int impl_count = 0;
+                    zan_symbol_t *single_cls = NULL;
+                    zan_symbol_t *single_m = NULL;
+                    LLVMValueRef single_fn = NULL;
+                    LLVMTypeRef single_fnty = NULL;
+
+                    for (int si = 0; si < g->struct_type_count; si++) {
+                        zan_symbol_t *cls = g->struct_types[si].sym;
+                        if (!cls || !class_implements_iface(cls, iface)) continue;
+                        zan_symbol_t *impl_m = resolve_overload(cls, callee->member.name, uargc);
+                        if (!impl_m) continue;
+                        LLVMValueRef ifn = NULL; LLVMTypeRef ifnty = NULL;
+                        for (int fi = irgen_find_function(g, impl_m); fi >= 0; fi = -1)
+                            if (g->functions[fi].sym == impl_m) {
+                                ifn = g->functions[fi].fn; ifnty = g->functions[fi].fn_type; break;
+                            }
+                        if (!ifn || !ifnty) continue;
+                        impl_count++;
+                        single_cls = cls;
+                        single_m = impl_m;
+                        single_fn = ifn;
+                        single_fnty = ifnty;
+                    }
+
+                    if (impl_count == 1 && single_cls && single_m && single_fn && single_fnty) {
+                        /* Monomorphic interface call: exactly one class implements this interface */
+                        unsigned npar = LLVMCountParamTypes(single_fnty);
+                        LLVMTypeRef *pts = (LLVMTypeRef *)calloc((size_t)(npar > 0 ? npar : 1), sizeof(LLVMTypeRef));
+                        LLVMGetParamTypes(single_fnty, pts);
+                        int cargc = uargc + 1;
+                        LLVMValueRef *ca = (LLVMValueRef *)calloc((size_t)cargc, sizeof(LLVMValueRef));
+                        ca[0] = (npar > 0) ? LLVMBuildBitCast(g->builder, recv, pts[0], "ifc.this") : recv;
+                        for (int k = 0; k < uargc; k++)
+                            ca[k + 1] = (k + 1 < (int)npar)
+                                ? emit_boundary_coerce(g, avals[k], pts[k + 1]) : avals[k];
+                        const char *cn = has_res ? "ifccall" : "";
+                        LLVMValueRef r = emit_dispatch_call(g, single_cls, single_m, single_fn, single_fnty, ca, cargc, cn);
+                        if (has_res) {
+                            r = emit_boundary_coerce(g, r, res_ty);
+                        } else {
+                            r = LLVMConstInt(LLVMInt32TypeInContext(c), 0, 0);
+                        }
+                        for (int k = 0; k < n_eh_args; k++)
+                            emit_eh_tmp_pop(g);
+                        for (int k = 0; k < uargc; k++)
+                            emit_release_owned_call_temp(g, expr->call.args.items[k], avals[k], locals);
+                        emit_release_owned_call_temp(g, callee->member.object, recv, locals);
+                        free(ca); free(pts); free(avals);
+                        return r;
+                    }
+
                     LLVMValueRef recv_pp = LLVMBuildBitCast(g->builder, recv,
                                               LLVMPointerType(i8ptr, 0), "ifc.recvpp");
                     LLVMValueRef tag = LLVMBuildLoad2(g->builder, i8ptr, recv_pp, "ifc.tag");

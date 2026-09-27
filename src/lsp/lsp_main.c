@@ -1135,11 +1135,50 @@ static void handle_did_change(lsp_server_t *s, json_value *params) {
     update_project_index(s, uri, d->text);
 }
 
+/* Per-document engine cache. Handlers used to malloc a ~2 MB intellisense_t
+ * and re-scan the whole document on EVERY completion/hover/definition/
+ * signature/symbols request. One slot serves the active document; the key is
+ * (uri, doc version) — didChange bumps the version, didClose invalidates.
+ * intel_clear keeps the grown symbol arrays, so successive rebuilds of the
+ * same document reuse their capacity instead of re-fattening the heap. */
+static intellisense_t *g_doc_intel = NULL;
+static char g_doc_intel_uri[512] = "";
+static long g_doc_intel_version = -1;
+
+/* Returns the cached engine for `uri`'s current text, rebuilding it when the
+ * uri or version differs from what is cached. The returned pointer is owned
+ * by the cache — handlers must not free it. */
+static intellisense_t *doc_intel_for(lsp_server_t *s, const char *uri) {
+    lsp_doc_t *doc = lsp_find_doc(s, uri);
+    if (!doc) return NULL;
+    if (g_doc_intel && strcmp(g_doc_intel_uri, uri) == 0 &&
+        g_doc_intel_version == doc->version)
+        return g_doc_intel;
+    if (!g_doc_intel) {
+        g_doc_intel = (intellisense_t *)malloc(sizeof(*g_doc_intel));
+        if (!g_doc_intel) return NULL;
+        intel_init(g_doc_intel);
+    }
+    intel_clear(g_doc_intel);
+    intel_parse_file(g_doc_intel, uri, doc->text, strlen(doc->text));
+    snprintf(g_doc_intel_uri, sizeof(g_doc_intel_uri), "%s", uri);
+    g_doc_intel_version = doc->version;
+    return g_doc_intel;
+}
+
+static void doc_intel_invalidate(const char *uri) {
+    if (uri && strcmp(g_doc_intel_uri, uri) == 0) {
+        g_doc_intel_uri[0] = '\0';
+        g_doc_intel_version = -1;
+    }
+}
+
 static void handle_did_close(lsp_server_t *s, json_value *params) {
     json_value *td = json_obj_get(params, "textDocument");
     const char *uri = json_get_str(json_obj_get(td, "uri"));
     if (!uri) return;
     lsp_remove_doc(s, uri);
+    doc_intel_invalidate(uri);
     /* clear diagnostics */
     publish_diagnostics(s, uri, "");
 }
@@ -1210,11 +1249,11 @@ static void handle_completion(lsp_server_t *s, json_value *id, json_value *param
     prefix_before(doc->text, off, prefix, sizeof(prefix));
     member_context(doc->text, off, context, sizeof(context));
 
-    /* intellisense_t is large (~2 MB); keep it off the stack. */
-    intellisense_t *is = (intellisense_t *)malloc(sizeof(*is));
+    /* intellisense_t is large (~2 MB); keep it off the stack. The engine is
+     * cached per (uri, doc version) and reused across requests instead of
+     * being malloc'd and the document re-scanned on every keystroke. */
+    intellisense_t *is = doc_intel_for(s, uri);
     if (!is) { send_response(s, id, json_new_arr()); return; }
-    intel_init(is);
-    intel_parse_file(is, uri, doc->text, strlen(doc->text));
 
     const char *effective = prefix[0] ? prefix : "";
     int count = 0;
@@ -1342,8 +1381,6 @@ static void handle_completion(lsp_server_t *s, json_value *id, json_value *param
 
         json_arr_add(items, item);
     }
-    intel_free(is);
-    free(is);
     send_response(s, id, items);
 }
 
@@ -1361,17 +1398,13 @@ static void handle_hover(lsp_server_t *s, json_value *id, json_value *params) {
     word_at(doc->text, off, word, sizeof(word));
     if (!word[0]) { send_response(s, id, json_new_null()); return; }
 
-    intellisense_t *is = (intellisense_t *)malloc(sizeof(*is));
+    intellisense_t *is = doc_intel_for(s, uri);
     if (!is) { send_response(s, id, json_new_null()); return; }
-    intel_init(is);
-    intel_parse_file(is, uri, doc->text, strlen(doc->text));
     hover_info_t h = intel_hover(is, word);
     /* cross-file symbols (e.g. a design-doc-projected widget field referenced
      * from the business file) live in the project index */
     if (!h.valid && g_project_intel)
         h = intel_hover(g_project_intel, word);
-    intel_free(is);
-    free(is);
     if (!h.valid) { send_response(s, id, json_new_null()); return; }
 
     char md[1024];
@@ -1402,15 +1435,11 @@ static void handle_definition(lsp_server_t *s, json_value *id, json_value *param
     word_at(doc->text, off, word, sizeof(word));
     if (!word[0]) { send_response(s, id, json_new_null()); return; }
 
-    intellisense_t *is = (intellisense_t *)malloc(sizeof(*is));
+    intellisense_t *is = doc_intel_for(s, uri);
     if (!is) { send_response(s, id, json_new_null()); return; }
-    intel_init(is);
-    intel_parse_file(is, uri, doc->text, strlen(doc->text));
     goto_def_t g = intel_goto_def(is, word);
     if (!g.found && g_project_intel)
         g = intel_goto_def(g_project_intel, word);
-    intel_free(is);
-    free(is);
     if (!g.found) { send_response(s, id, json_new_null()); return; }
 
     int dl, dc;
@@ -1633,15 +1662,11 @@ static void handle_signature_help(lsp_server_t *s, json_value *id, json_value *p
 
     if (!method_name[0]) { send_response(s, id, json_new_null()); return; }
 
-    intellisense_t *is = (intellisense_t *)malloc(sizeof(*is));
+    intellisense_t *is = doc_intel_for(s, uri);
     if (!is) { send_response(s, id, json_new_null()); return; }
-    intel_init(is);
-    intel_parse_file(is, uri, doc->text, strlen(doc->text));
 
     signature_info_t sig = intel_signature_help(is, method_name,
                                                  class_context[0] ? class_context : NULL);
-    intel_free(is);
-    free(is);
 
     if (!sig.valid) { send_response(s, id, json_new_null()); return; }
 
@@ -1690,10 +1715,8 @@ static void handle_document_symbol(lsp_server_t *s, json_value *id, json_value *
     lsp_doc_t *doc = lsp_find_doc(s, uri);
     if (!doc) { send_response(s, id, json_new_arr()); return; }
 
-    intellisense_t *is = (intellisense_t *)malloc(sizeof(*is));
+    intellisense_t *is = doc_intel_for(s, uri);
     if (!is) { send_response(s, id, json_new_arr()); return; }
-    intel_init(is);
-    intel_parse_file(is, uri, doc->text, strlen(doc->text));
 
     json_value *arr = json_new_arr();
     for (int i = 0; i < is->symbol_count; i++) {
@@ -1725,8 +1748,6 @@ static void handle_document_symbol(lsp_server_t *s, json_value *id, json_value *
         json_obj_set(sinfo, "location", loc);
         json_arr_add(arr, sinfo);
     }
-    intel_free(is);
-    free(is);
     send_response(s, id, arr);
 }
 
