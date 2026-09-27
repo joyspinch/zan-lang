@@ -42,6 +42,8 @@ src/ZanWeb/             包源码。目录是工程组织（Framework/Modules �
       Model/  Dao/          数据层：sys_* 实体与 DAO（DAO 只放跨表 JOIN/聚合/
                             复杂动态条件，单表读写走实体链，见「代码规范」）；
                             Model/Blog/、Dao/Blog/ 为示例模块
+      Services/             模块内非控制器业务件（业务种子 BlogSeed 等），
+                            不进 Controller/，见「Controller/ 纯净与端点纪律」
     Crud/                   配置驱动管理屏引擎
       Controller/Admin/       CrudScreenController.zan——管理屏基座（ns
                               ZanWeb.Admin，与 Dashboard/Profile 同族；
@@ -94,6 +96,32 @@ URL 族：`Controller/Admin/Content/Categories.zan` ↔ `ZanWeb.Admin.Content` �
 显式 `ViewOf/FragmentOf` 的键必须等于某个文件的真实键——查不到时
 HTTP 仍是 200，页面渲染成 `<!-- view not found -->` 注释，冒烟只看
 状态码是假绿（本轮踩过：key 改了、views 资产目录没跟着挪）。
+
+### Controller/ 纯净与端点纪律
+
+`Controller/` 路径下**只允许控制器类**（成员资格看继承链，不变式 3），
+且控制器文件里**不得混入非控制器类型**——数据形状进 `Model/`（如
+`Model/Dev/AiAgentDoc.zan`），业务种子等非控制器业务件进模块的
+`Services/`（如 `Services/BlogSeed.zan`）。
+
+**非端点方法必须显式 `private`/`protected`。** Zan 成员默认公有，而类级
+`[Route(".../[action]")]` 的约定展开会把**每一个公有方法**变成可达端点
+并计入权限码空间——`Def()`/`OnDeleting()`/`Bust()` 这类钩子与内部助手
+曾因此生成 21 个假 action。启动日志 `[rbac] ... 未标注 Perm，已拒绝授权`
+一旦出现，就是在提示有方法收错了可见性：清零为准，不留假端点。
+
+**权限三档**，新动作先选档再写码：`Grant`（管理屏，授权位驱动）/
+`Login`（登录即可：个人中心、菜单 JSON）/`None`（登录注册页、健康检查、
+前台博客、API 文档与演示口）。匿名面必须逐动作复核——公开控制器里
+新增动作不标档即匿名。
+
+### 呈现格式化一律 Fmt.*
+
+状态→文案/徽章样式只住在 `Framework/Fmt`（`Published*` 发布态、
+`Review*` 审核态、`Enabled*` 启停态、`Ok*` 成败、`LoginText` 登录成败，
+各一对 Text/Class），控制器**禁止手写**同名 helper——此前 8 个文件各写
+一遍，文案漂移（"停用"vs"禁用"）与样式漂移（ok/off vs ok/bad）随之
+而来。新状态族先进 Fmt 再使用。
 
 ### 命名词表
 
