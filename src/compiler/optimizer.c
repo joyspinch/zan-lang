@@ -306,120 +306,6 @@ zan_devirt_stats_t zan_opt_devirtualize(zan_irgen_t *g, zan_binder_t *binder) {
     return stats;
 }
 
-/* ---- Escape analysis ---- */
-
-static bool value_escapes(LLVMValueRef alloc, LLVMValueRef fn) {
-    (void)fn;
-    LLVMUseRef use = LLVMGetFirstUse(alloc);
-    while (use) {
-        LLVMValueRef user = LLVMGetUser(use);
-        unsigned opcode = LLVMGetInstructionOpcode(user);
-
-        switch (opcode) {
-        case LLVMStore:
-            if (LLVMGetOperand(user, 0) == alloc) {
-                LLVMValueRef dest = LLVMGetOperand(user, 1);
-                if (!LLVMIsAAllocaInst(dest)) return true;
-            }
-            break;
-        case LLVMCall: {
-            LLVMValueRef callee = LLVMGetCalledValue(user);
-            const char *name = callee ? LLVMGetValueName(callee) : NULL;
-            if (name && (strcmp(name, "zan_retain") == 0 ||
-                         strcmp(name, "zan_rt_retain") == 0 ||
-                         strcmp(name, "zan_release") == 0 ||
-                         strcmp(name, "zan_rt_release") == 0 ||
-                         strcmp(name, "zan_rt_release_dyn") == 0 ||
-                         strcmp(name, "zan_rt_str_retain") == 0 ||
-                         strcmp(name, "zan_rt_str_release") == 0))
-                break;
-            return true;
-        }
-        case LLVMRet:
-            return true;
-        case LLVMGetElementPtr:
-        case LLVMBitCast:
-            if (value_escapes(user, fn)) return true;
-            break;
-        default:
-            break;
-        }
-        use = LLVMGetNextUse(use);
-    }
-    return false;
-}
-
-zan_escape_stats_t zan_opt_escape_analysis(zan_irgen_t *g) {
-    zan_escape_stats_t stats = {0, 0};
-
-    LLVMModuleRef mod = g->mod;
-    LLVMValueRef fn = LLVMGetFirstFunction(mod);
-
-    while (fn) {
-        LLVMBasicBlockRef entry_bb = LLVMGetEntryBasicBlock(fn);
-        if (!entry_bb) {
-            fn = LLVMGetNextFunction(fn);
-            continue;
-        }
-
-        LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn);
-        while (bb) {
-            LLVMValueRef inst = LLVMGetFirstInstruction(bb);
-            while (inst) {
-                LLVMValueRef next = LLVMGetNextInstruction(inst);
-                if (LLVMGetInstructionOpcode(inst) == LLVMCall) {
-                    LLVMValueRef callee = LLVMGetCalledValue(inst);
-                    const char *name = callee ? LLVMGetValueName(callee) : NULL;
-                    if (name && (strcmp(name, "zan_alloc") == 0 || strcmp(name, "zan_rt_alloc") == 0)) {
-                        if (!value_escapes(inst, fn)) {
-                            LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-                            LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
-                            LLVMValueRef sz_val = LLVMGetOperand(inst, 0);
-
-                            LLVMValueRef first_inst = LLVMGetFirstInstruction(entry_bb);
-                            LLVMBuilderRef b = g->builder;
-                            if (first_inst) {
-                                LLVMPositionBuilderBefore(b, first_inst);
-                            } else {
-                                LLVMPositionBuilderAtEnd(b, entry_bb);
-                            }
-                            LLVMValueRef total_sz = LLVMBuildAdd(b, sz_val, LLVMConstInt(i64, 16, 0), "stk.sz");
-                            LLVMValueRef raw_alloca = LLVMBuildArrayAlloca(b, i8, total_sz, "stk.raw");
-
-                            LLVMPositionBuilderBefore(b, inst);
-                            LLVMValueRef rc_ptr = LLVMBuildBitCast(b, raw_alloca, LLVMPointerType(i64, 0), "stk.rcp");
-                            LLVMBuildStore(b, LLVMConstInt(i64, 1000000, 0), rc_ptr);
-
-                            if (LLVMGetNumOperands(inst) >= 2) {
-                                LLVMValueRef site_val = LLVMGetOperand(inst, 1);
-                                LLVMValueRef eight = LLVMConstInt(i64, 8, 0);
-                                LLVMValueRef site_gep = LLVMBuildGEP2(b, i8, raw_alloca, &eight, 1, "stk.sp");
-                                LLVMValueRef site_ptr = LLVMBuildBitCast(b, site_gep, LLVMPointerType(LLVMTypeOf(site_val), 0), "stk.sip");
-                                LLVMBuildStore(b, site_val, site_ptr);
-                            }
-
-                            LLVMValueRef sixteen = LLVMConstInt(i64, 16, 0);
-                            LLVMValueRef payload = LLVMBuildGEP2(b, i8, raw_alloca, &sixteen, 1, "stk.payload");
-
-                            LLVMReplaceAllUsesWith(inst, payload);
-                            LLVMInstructionEraseFromParent(inst);
-
-                            stats.objects_stack_allocated++;
-                            inst = next;
-                            continue;
-                        }
-                    }
-                }
-                inst = next;
-            }
-            bb = LLVMGetNextBasicBlock(bb);
-        }
-        fn = LLVMGetNextFunction(fn);
-    }
-
-    return stats;
-}
-
 /* ---- Constant folding ---- */
 
 zan_constfold_stats_t zan_opt_const_fold(zan_irgen_t *g) {
@@ -648,7 +534,6 @@ zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder, zan_opt_leve
     zan_opt_early_mem2reg(g);
     report.arc = zan_opt_arc(g, level);
     report.devirt = zan_opt_devirtualize(g, binder);
-    report.escape = zan_opt_escape_analysis(g);
     report.constfold = zan_opt_const_fold(g);
     report.dce = zan_opt_dce(g);
     report.inlining = zan_opt_inline(g, level);
@@ -667,8 +552,6 @@ void zan_opt_report_print(const zan_opt_report_t *report) {
         fprintf(stderr, "  ARC: %d retain/release pairs elided\n", report->arc.pairs_elided);
     if (report->devirt.calls_devirtualized > 0)
         fprintf(stderr, "  Devirt: %d virtual calls resolved\n", report->devirt.calls_devirtualized);
-    if (report->escape.objects_stack_allocated > 0)
-        fprintf(stderr, "  Escape: %d objects stack-allocated\n", report->escape.objects_stack_allocated);
     if (report->constfold.constants_folded > 0)
         fprintf(stderr, "  Const: %d expressions folded\n", report->constfold.constants_folded);
     if (report->dce.dead_stores > 0)

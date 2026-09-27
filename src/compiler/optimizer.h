@@ -36,14 +36,6 @@ typedef struct {
 
 zan_devirt_stats_t zan_opt_devirtualize(zan_irgen_t *g, zan_binder_t *binder);
 
-/* ---- Escape analysis ---- */
-typedef struct {
-    int objects_stack_allocated;
-    int allocations_eliminated;
-} zan_escape_stats_t;
-
-zan_escape_stats_t zan_opt_escape_analysis(zan_irgen_t *g);
-
 /* ---- Constant folding ---- */
 typedef struct {
     int constants_folded;
@@ -74,7 +66,6 @@ zan_inline_stats_t zan_opt_inline(zan_irgen_t *g, zan_opt_level_t level);
 typedef struct {
     zan_arc_opt_stats_t arc;
     zan_devirt_stats_t devirt;
-    zan_escape_stats_t escape;
     zan_constfold_stats_t constfold;
     zan_dce_stats_t dce;
     zan_inline_stats_t inlining;

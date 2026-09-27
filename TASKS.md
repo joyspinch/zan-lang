@@ -110,6 +110,12 @@
   新增 conformance_gui_design_alert 回归。其余五个查实为如实空：AlarmBanner/
   AlarmList 数据源驱动（Props() 显式声明空），ListView/Dropdown 条目走已建模
   options 键，Ellipsis 是画布渲染器非 Control——空表是如实反映非缺失。
+  补遗（同日，policy 档两测暴露收编残留，已修）：zform.controls.txt 未重生成
+  缺 AlertBox；"Alert" 双注册撞 policy_control_factory 的"一类一个 Kind()
+  持久化标签"查重。修法：legacy 别名退出 Make 分支与 Names 名单，改走
+  HeavyControls.RegisterAlias 归一化（读侧 Create 先归一再查表，palette 只列
+  现行 kind），manifest 重生成；design_alert/design_palette/designer_html
+  回归全绿。
 - [ ] **B-ID9** IDE 代码编辑器没有折叠 UI——LSP foldingRange 已就绪，前端未接。
 - [x] **B-ID10** git 面板补齐分支与暂存（19a7cc2b，2026-09-27）：新建/切换
   分支、merge、stash/pop/list 六操作落 BranchRow，走 gitJob 后台作业通道与
@@ -124,9 +130,33 @@
 - [x] **B-ID12** 模板 caps= 维度端到端落地（e10e064d，2026-09-27）：manifest
   新增 caps= 键，33 个模板按真实 using/依赖逐一标注，WizardTemplate 链式
   Caps() 在向导右栏渲染能力行，AddDiskTemplate/WizTemplates 全链路接线。
-- [ ] **B-ID13**（新立）本机 ZanIDE.exe 启动即 0xC0000005（2026-09-27 发现）：
-  沙箱内外、干净 profile 均复现；HEAD 各批改动均无法在启动路径执行到（AlertBox
-  仅在告警件使用、Wizard 仅建项目对话框、Git 面板新按钮仅点击触达），嫌疑在
-  启动链路的更早环节（候选：发布优化扫描与 dwrite/CEF 依赖的组合、或其他会话
-  今日对 GUI 链路的变更），待用干净 worktree 二分定位。在它修好前 frame-budget
-  e2e 在本机不可用（harness 本身在缺 exe 时正确跳过，链路完好）。
+- [x] **B-ID13** 本机 ZanIDE.exe 启动即 0xC0000005——根因 6e2d70f9 的
+  `zan_opt_escape_analysis` 不完备，已删（2026-09-27）：逃逸判定只看 zan_alloc
+  返回值的**直接** use——指针经 phi/select（循环携带变量）、从地址被取的局部槽
+  load 出来再外传、以及一切非 {store,call,ret,gep,bitcast} 的 use 落在
+  `default: break` 里统统判为"未逃逸"；对象被搬进栈 alloca（RC 预置 1000000），
+  定义帧一返回，仍被容器/全局持有的引用即指向死栈，之后虚调用读到旧栈上的垃圾
+  vtable → `call rip=0x2`、`rdx=0x5a414e4152524101`（栈复用残留的 ZANARRA 数组头
+  魔数）。归因法：环境二分——O0 正常 / O1、O2、Os（--publish）必崩；关逃逸分析
+  （ZAN_NO_ESCAPE=1）+ O2 → 正常；两条去虚化路径单独关掉仍崩、开启+关逃逸正常
+  → 去虚化无责，逃逸分析独罪。修法：整个 pass 删除（value_escapes +
+  zan_opt_escape_analysis + 管线调用 + 报表行 + optimizer.h 统计结构）——不完备
+  是构造性的，局部补丁补不回完备性，重立须先有跟踪内存/phi 的健全设计再落地。
+  验证：默认 --publish 构建 IDE 启动 IDE_RUNNING_OK（修复前同配置 100% 崩），
+  standard 档除三条与本修无关的既有红（见 B-ID15）外全绿；连带走通的 B-ID11
+  遗留"直启 0xC0000005"即本案。
+- [ ] **B-ID15**（新立）standard 档三条既有红（2026-09-27 定责，均先于 B-ID13
+  修复存在、与其无关）：① policy_gallery_coverage——gallery 种子第 25 项引用
+  `templates/server/server-mvc/src/main.zan`，该模板目录已不存在，种子与模板
+  重组脱节（归模板 lane）；② conformance_wasm32_file_io_in_try——编译期 ABI
+  诊断 "extern 'Create' passes a struct by value, which has no C ABI
+  classification for wasm32-unknown-wasi"（归编译器 ABI lane）；③
+  conformance_win_automation_smoke——无桌面会话环境失败（沙箱限制，本机桌面
+  手工验证不受影响）。另 standard 全量并行跑时有 4 测偶红（async_try_exit_depth/
+  mqtt_loopback/win_tray_screen_smoke/gui_datatable_ctxmenu_selection），单测
+  复跑双配置均绿，判并行资源抖动非回归。
+- [ ] **B-ID14**（新立）zanc 自身对 IDE 全量输入加 `-g` 编译时崩溃（2026-09-27）：
+  `ZAN_IDE_ZANC_ARGS="-g" scripts/build_ide.ps1` 报 IDE_LINK_FAILED，zanc 退出码
+  -1073741819（0xC0000005）；gallery 312 文件同参 `--no-check-leaks` 后可过
+  （IDE 输入 >4096 个 ARC 分配点必须加），故与规模/特定输入相关。影响：符号级
+  崩溃日志（DWARF 行号）暂不可用。待独立定位，与 B-ID13 无关（后者已修）。
