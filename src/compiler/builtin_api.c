@@ -167,6 +167,8 @@ static const zan_builtin_member_t members_nativemem[] = {
     { "AesCbcDecrypt", 'M', "long AesCbcDecrypt(nint dst, nint src, long size, nint key, int keybits, nint iv)" },
     { "AesEcbBlock",   'M', "long AesEcbBlock(nint key, int keybits, nint in16, nint out16)" },
     { "AesCtrCrypt",   'M', "long AesCtrCrypt(nint dst, nint src, long size, nint key, int keybits, nint counter)" },
+    { "AesGcmEncrypt", 'M', "long AesGcmEncrypt(nint key, int keybits, nint iv, nint aad, long aadLen, nint inBuf, long inLen, nint outBuf, nint tag16)" },
+    { "AesGcmDecrypt", 'M', "long AesGcmDecrypt(nint key, int keybits, nint iv, nint aad, long aadLen, nint inBuf, long inLen, nint tag16, nint outBuf)" },
     { "GhashBlock",    'M', "long GhashBlock(nint h, nint x, nint y)" },
     { "GhashUpdate",   'M', "long GhashUpdate(nint h, nint data, long len, nint y)" },
     { "RsaModPow",     'M', "long RsaModPow(nint baseVal, long bLen, nint exp, long eLen, nint mod, long mLen, nint outBuf)" },

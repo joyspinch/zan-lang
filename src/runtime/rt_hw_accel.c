@@ -1843,6 +1843,116 @@ int64_t zan_hw_ghash_update(const uint8_t *h16, const uint8_t *data, int64_t len
     return -1;
 }
 
+int64_t zan_hw_aes_gcm_encrypt(const uint8_t *key, int keybits,
+                               const uint8_t *iv12,
+                               const uint8_t *aad, int64_t aadLen,
+                               const uint8_t *in, int64_t inLen,
+                               uint8_t *out, uint8_t *tag16) {
+    if (!key || !iv12 || !tag16) return -1;
+    if (aadLen < 0 || inLen < 0) return -1;
+    if (aadLen > 0 && !aad) return -1;
+    if (inLen > 0 && (!in || !out)) return -1;
+    if (keybits != 128 && keybits != 192 && keybits != 256) return -1;
+
+    uint8_t zero16[16] = {0};
+    uint8_t h16[16];
+    if (zan_hw_aes_ecb_block(key, keybits, zero16, h16) != 0) return -1;
+
+    uint8_t j0[16] = {0};
+    memcpy(j0, iv12, 12);
+    j0[15] = 1;
+
+    uint8_t ej0[16];
+    if (zan_hw_aes_ecb_block(key, keybits, j0, ej0) != 0) return -1;
+
+    uint8_t ctr[16];
+    memcpy(ctr, j0, 16);
+    ctr[15] = 2;
+
+    if (inLen > 0) {
+        if (zan_hw_aes_ctr_crypt(in, inLen, key, keybits, ctr, out) != inLen) return -1;
+    }
+
+    uint8_t y16[16] = {0};
+    if (aadLen > 0) {
+        if (zan_hw_ghash_update(h16, aad, aadLen, y16) != 0) return -1;
+    }
+    if (inLen > 0) {
+        if (zan_hw_ghash_update(h16, out, inLen, y16) != 0) return -1;
+    }
+
+    uint8_t lenBlock[16];
+    uint64_t aadBits = (uint64_t)aadLen * 8;
+    uint64_t inBits = (uint64_t)inLen * 8;
+    for (int i = 0; i < 8; i++) {
+        lenBlock[i] = (uint8_t)((aadBits >> (8 * (7 - i))) & 0xFF);
+        lenBlock[8 + i] = (uint8_t)((inBits >> (8 * (7 - i))) & 0xFF);
+    }
+    if (zan_hw_ghash_update(h16, lenBlock, 16, y16) != 0) return -1;
+
+    for (int i = 0; i < 16; i++) {
+        tag16[i] = y16[i] ^ ej0[i];
+    }
+    return inLen;
+}
+
+int64_t zan_hw_aes_gcm_decrypt(const uint8_t *key, int keybits,
+                               const uint8_t *iv12,
+                               const uint8_t *aad, int64_t aadLen,
+                               const uint8_t *in, int64_t inLen,
+                               const uint8_t *tag16, uint8_t *out) {
+    if (!key || !iv12 || !tag16) return -1;
+    if (aadLen < 0 || inLen < 0) return -1;
+    if (aadLen > 0 && !aad) return -1;
+    if (inLen > 0 && (!in || !out)) return -1;
+    if (keybits != 128 && keybits != 192 && keybits != 256) return -1;
+
+    uint8_t zero16[16] = {0};
+    uint8_t h16[16];
+    if (zan_hw_aes_ecb_block(key, keybits, zero16, h16) != 0) return -1;
+
+    uint8_t j0[16] = {0};
+    memcpy(j0, iv12, 12);
+    j0[15] = 1;
+
+    uint8_t ej0[16];
+    if (zan_hw_aes_ecb_block(key, keybits, j0, ej0) != 0) return -1;
+
+    uint8_t y16[16] = {0};
+    if (aadLen > 0) {
+        if (zan_hw_ghash_update(h16, aad, aadLen, y16) != 0) return -1;
+    }
+    if (inLen > 0) {
+        if (zan_hw_ghash_update(h16, in, inLen, y16) != 0) return -1;
+    }
+
+    uint8_t lenBlock[16];
+    uint64_t aadBits = (uint64_t)aadLen * 8;
+    uint64_t inBits = (uint64_t)inLen * 8;
+    for (int i = 0; i < 8; i++) {
+        lenBlock[i] = (uint8_t)((aadBits >> (8 * (7 - i))) & 0xFF);
+        lenBlock[8 + i] = (uint8_t)((inBits >> (8 * (7 - i))) & 0xFF);
+    }
+    if (zan_hw_ghash_update(h16, lenBlock, 16, y16) != 0) return -1;
+
+    int diff = 0;
+    for (int i = 0; i < 16; i++) {
+        diff |= (y16[i] ^ ej0[i]) ^ tag16[i];
+    }
+    if (diff != 0) {
+        return -2;
+    }
+
+    uint8_t ctr[16];
+    memcpy(ctr, j0, 16);
+    ctr[15] = 2;
+
+    if (inLen > 0) {
+        if (zan_hw_aes_ctr_crypt(in, inLen, key, keybits, ctr, out) != inLen) return -1;
+    }
+    return inLen;
+}
+
 int64_t zan_hw_crc32c_update(uint32_t crc, const uint8_t *p, int64_t len) {
     if (len < 0 || !p) return -1;
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
@@ -3435,11 +3545,15 @@ int64_t zan_hw_rsa_mod_pow(const uint8_t *base, int64_t bLen,
         }
     }
 
-    uint64_t baseM[66] = {0};
-    zan_mont_mul_core(g, x, n, n0_inv, k, baseM);
-
-    uint64_t result[66] = {0};
-    for (int i = 0; i < k; i++) result[i] = r_mod_n[i];
+    /* Table for 4-bit window: table[w] = baseM^w in Montgomery form */
+    uint64_t table[16][66];
+    for (int i = 0; i < k; i++) {
+        table[0][i] = r_mod_n[i];
+    }
+    zan_mont_mul_core(g, x, n, n0_inv, k, table[1]);
+    for (int w = 2; w < 16; w++) {
+        zan_mont_mul_core(table[w - 1], table[1], n, n0_inv, k, table[w]);
+    }
 
     /* Find bit length of exponent */
     int bitlen = 0;
@@ -3450,11 +3564,36 @@ int64_t zan_hw_rsa_mod_pow(const uint8_t *base, int64_t bLen,
         }
     }
 
-    for (int i = bitlen - 1; i >= 0; i--) {
-        zan_mont_mul_core(result, result, n, n0_inv, k, result);
-        if ((e[i / 64] >> (i % 64)) & 1) {
-            zan_mont_mul_core(result, baseM, n, n0_inv, k, result);
+    uint64_t result[66] = {0};
+    int started = 0;
+    int top_window = (bitlen + 3) / 4 - 1;
+    for (int w_idx = top_window; w_idx >= 0; w_idx--) {
+        int bit_pos = w_idx * 4;
+        int limb_idx = bit_pos / 64;
+        int bit_offset = bit_pos % 64;
+        uint32_t val = (uint32_t)((e[limb_idx] >> bit_offset) & 0xF);
+        if (bit_offset > 60 && limb_idx + 1 < e_k) {
+            val |= (uint32_t)((e[limb_idx + 1] << (64 - bit_offset)) & 0xF);
         }
+
+        if (started) {
+            zan_mont_mul_core(result, result, n, n0_inv, k, result);
+            zan_mont_mul_core(result, result, n, n0_inv, k, result);
+            zan_mont_mul_core(result, result, n, n0_inv, k, result);
+            zan_mont_mul_core(result, result, n, n0_inv, k, result);
+            if (val > 0) {
+                zan_mont_mul_core(result, table[val], n, n0_inv, k, result);
+            }
+        } else {
+            if (val > 0) {
+                for (int i = 0; i < k; i++) result[i] = table[val][i];
+                started = 1;
+            }
+        }
+    }
+
+    if (!started) {
+        for (int i = 0; i < k; i++) result[i] = r_mod_n[i];
     }
 
     uint64_t one[66] = {0};

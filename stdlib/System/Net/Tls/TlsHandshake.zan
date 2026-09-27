@@ -119,6 +119,18 @@ class TlsByteWriter {
 
     int Length() { return this.len; }
 
+    byte[] Buffer() { return this.buf; }
+
+    int PeekU8(int off) {
+        if (off < 0 || off >= this.len) { return -1; }
+        return (int)(this.buf[off] & 255);
+    }
+
+    int PeekU16(int off) {
+        if (off < 0 || off + 1 >= this.len) { return -1; }
+        return ((int)(this.buf[off] & 255) << 8) | (int)(this.buf[off + 1] & 255);
+    }
+
     byte[] ToArray() {
         byte[] res = new byte[this.len];
         if (this.len > 0) {
@@ -332,31 +344,34 @@ class TlsEngine {
         }
 
         while (true) {
-            if (this.inNet.Length() < 5) {
+            int netLen = this.inNet.Length();
+            if (netLen < 5) {
                 // 不足一个 TLS 记录头
                 return this.state == StateConnected ? 1 : 0;
             }
 
-            byte[] inBytes = this.inNet.ToArray();
-            int ctype = inBytes[0] & 255;
-            int rver = ((inBytes[1] & 255) << 8) | (inBytes[2] & 255);
-            int rlen = ((inBytes[3] & 255) << 8) | (inBytes[4] & 255);
+            int ctype = this.inNet.PeekU8(0);
+            int rver = this.inNet.PeekU16(1);
+            int rlen = this.inNet.PeekU16(3);
 
             if (rlen < 0 || rlen > 20000) {
                 this.Fail("非法 TLS 记录长度: " + rlen);
                 return -1;
             }
 
-            if (inBytes.Length < 5 + rlen) {
+            if (netLen < 5 + rlen) {
                 // 记录尚未接收完整，等待网络灌入更多字节
                 return this.state == StateConnected ? 1 : 0;
             }
 
-            // 提取完整记录
+            // 零额外中转拷贝，直接从 inNet 内部缓冲区切出 header 与 payload
+            byte[] inBuf = this.inNet.Buffer();
             byte[] header = new byte[5];
-            for (int i = 0; i < 5; i = i + 1) { header[i] = inBytes[i]; }
+            NativeMemory.Copy(header, inBuf, 5);
             byte[] payload = new byte[rlen];
-            for (int i = 0; i < rlen; i = i + 1) { payload[i] = inBytes[5 + i]; }
+            if (rlen > 0) {
+                NativeMemory.Copy(payload, (nint)inBuf + 5, rlen);
+            }
 
             this.inNet.RemovePrefix(5 + rlen);
 
@@ -1346,17 +1361,31 @@ class TlsEngine {
         return len;
     }
 
-    /// <summary>从已解密的应用缓冲区提取明文数据。</summary>
+    /// <summary>从已解密的应用缓冲区提取明文数据到字节数组。</summary>
     int RecvAppData(byte[] outBuf, int offset, int maxLen) {
         if (this.appReadBuf.Length() == 0) {
             if (this.state == StateClosed) { return 0; }
             return 0; // 无数据可读
         }
-        byte[] all = this.appReadBuf.ToArray();
-        int toRead = all.Length;
+        int toRead = this.appReadBuf.Length();
         if (toRead > maxLen) { toRead = maxLen; }
-        if (toRead > 0) {
-            NativeMemory.Copy((nint)outBuf + (nint)offset, all, toRead);
+        if (toRead > 0 && outBuf != null) {
+            NativeMemory.Copy((nint)outBuf + (nint)offset, this.appReadBuf.Buffer(), toRead);
+        }
+        this.appReadBuf.RemovePrefix(toRead);
+        return toRead;
+    }
+
+    /// <summary>从已解密的应用缓冲区提取明文数据到原生字符串/内存切片。</summary>
+    int RecvAppData(string outBuf, int offset, int maxLen) {
+        if (this.appReadBuf.Length() == 0) {
+            if (this.state == StateClosed) { return 0; }
+            return 0; // 无数据可读
+        }
+        int toRead = this.appReadBuf.Length();
+        if (toRead > maxLen) { toRead = maxLen; }
+        if (toRead > 0 && outBuf != null) {
+            NativeMemory.Copy((nint)outBuf + (nint)offset, this.appReadBuf.Buffer(), toRead);
         }
         this.appReadBuf.RemovePrefix(toRead);
         return toRead;

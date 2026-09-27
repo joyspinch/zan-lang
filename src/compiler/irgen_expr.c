@@ -934,9 +934,9 @@ static bool emit_native_memory_call(zan_irgen_t *g, zan_ast_node_t *expr,
     if (is_call_to(expr, "NativeMemory", "AesCtrCrypt") && expr->call.args.count == 6) {
         LLVMValueRef dst = nm_arg(g, expr, 0, locals);
         LLVMValueRef src = nm_arg(g, expr, 1, locals);
-        LLVMValueRef size = nm_arg(g, expr, 2, locals);
+        LLVMValueRef size = coerce_int_to(g, nm_arg(g, expr, 2, locals), i64t);
         LLVMValueRef key = nm_arg(g, expr, 3, locals);
-        LLVMValueRef keybits = nm_arg(g, expr, 4, locals);
+        LLVMValueRef keybits = coerce_int_to(g, nm_arg(g, expr, 4, locals), i32t);
         LLVMValueRef counter = nm_arg(g, expr, 5, locals);
         LLVMTypeRef ty = LLVMFunctionType(i64t,
             (LLVMTypeRef[]){ i8ptr, i64t, i8ptr, i32t, i8ptr, i8ptr }, 6, 0);
@@ -944,8 +944,54 @@ static bool emit_native_memory_call(zan_irgen_t *g, zan_ast_node_t *expr,
         if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_aes_ctr_crypt", ty);
         *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
             nm_addr(g, src, zero64), size, nm_addr(g, key, zero64),
-            coerce_int_to(g, keybits, i32t), nm_addr(g, counter, zero64),
+            keybits, nm_addr(g, counter, zero64),
             nm_addr(g, dst, zero64) }, 6, "nm.aes_ctr");
+        return true;
+    }
+    if (is_call_to(expr, "NativeMemory", "AesGcmEncrypt") && expr->call.args.count == 9) {
+        LLVMValueRef key = nm_arg(g, expr, 0, locals);
+        LLVMValueRef keybits = coerce_int_to(g, nm_arg(g, expr, 1, locals), i32t);
+        LLVMValueRef iv = nm_arg(g, expr, 2, locals);
+        LLVMValueRef aad = nm_arg(g, expr, 3, locals);
+        LLVMValueRef aadLen = coerce_int_to(g, nm_arg(g, expr, 4, locals), i64t);
+        LLVMValueRef inBuf = nm_arg(g, expr, 5, locals);
+        LLVMValueRef inLen = coerce_int_to(g, nm_arg(g, expr, 6, locals), i64t);
+        LLVMValueRef outBuf = nm_arg(g, expr, 7, locals);
+        LLVMValueRef tag16 = nm_arg(g, expr, 8, locals);
+        LLVMTypeRef ty = LLVMFunctionType(i64t,
+            (LLVMTypeRef[]){ i8ptr, i32t, i8ptr, i8ptr, i64t, i8ptr, i64t, i8ptr, i8ptr }, 9, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_aes_gcm_encrypt");
+        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_aes_gcm_encrypt", ty);
+        *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
+            nm_addr(g, key, zero64), keybits,
+            nm_addr(g, iv, zero64),
+            nm_addr(g, aad, zero64), aadLen,
+            nm_addr(g, inBuf, zero64), inLen,
+            nm_addr(g, outBuf, zero64),
+            nm_addr(g, tag16, zero64) }, 9, "nm.aes_gcm_enc");
+        return true;
+    }
+    if (is_call_to(expr, "NativeMemory", "AesGcmDecrypt") && expr->call.args.count == 9) {
+        LLVMValueRef key = nm_arg(g, expr, 0, locals);
+        LLVMValueRef keybits = coerce_int_to(g, nm_arg(g, expr, 1, locals), i32t);
+        LLVMValueRef iv = nm_arg(g, expr, 2, locals);
+        LLVMValueRef aad = nm_arg(g, expr, 3, locals);
+        LLVMValueRef aadLen = coerce_int_to(g, nm_arg(g, expr, 4, locals), i64t);
+        LLVMValueRef inBuf = nm_arg(g, expr, 5, locals);
+        LLVMValueRef inLen = coerce_int_to(g, nm_arg(g, expr, 6, locals), i64t);
+        LLVMValueRef tag16 = nm_arg(g, expr, 7, locals);
+        LLVMValueRef outBuf = nm_arg(g, expr, 8, locals);
+        LLVMTypeRef ty = LLVMFunctionType(i64t,
+            (LLVMTypeRef[]){ i8ptr, i32t, i8ptr, i8ptr, i64t, i8ptr, i64t, i8ptr, i8ptr }, 9, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_aes_gcm_decrypt");
+        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_aes_gcm_decrypt", ty);
+        *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
+            nm_addr(g, key, zero64), keybits,
+            nm_addr(g, iv, zero64),
+            nm_addr(g, aad, zero64), aadLen,
+            nm_addr(g, inBuf, zero64), inLen,
+            nm_addr(g, tag16, zero64),
+            nm_addr(g, outBuf, zero64) }, 9, "nm.aes_gcm_dec");
         return true;
     }
     if (is_call_to(expr, "NativeMemory", "GhashBlock") && expr->call.args.count == 3) {

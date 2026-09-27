@@ -70,6 +70,19 @@ int64_t zan_hw_ghash_block(const uint8_t *h16, const uint8_t *x16, uint8_t *y16)
 /* Streamed GHASH: updates y with len bytes of data, zero-padding final block if needed. */
 int64_t zan_hw_ghash_update(const uint8_t *h16, const uint8_t *data, int64_t len, uint8_t *y16);
 
+/* High-throughput integrated AES-GCM (NIST SP 800-38D, RFC 5288/8446) with hardware AES-NI & PCLMUL.
+ * Returns inLen on success, -1 on unsupported/invalid args, or -2 on tag mismatch (decrypt). */
+int64_t zan_hw_aes_gcm_encrypt(const uint8_t *key, int keybits,
+                               const uint8_t *iv12,
+                               const uint8_t *aad, int64_t aadLen,
+                               const uint8_t *in, int64_t inLen,
+                               uint8_t *out, uint8_t *tag16);
+int64_t zan_hw_aes_gcm_decrypt(const uint8_t *key, int keybits,
+                               const uint8_t *iv12,
+                               const uint8_t *aad, int64_t aadLen,
+                               const uint8_t *in, int64_t inLen,
+                               const uint8_t *tag16, uint8_t *out);
+
 /* Modular exponentiation: base^exp mod n for RSA/DH (up to 4096-bit odd modulus).
  * All inputs and outputs are big-endian byte buffers. Returns 0 on success, -1 otherwise. */
 int64_t zan_hw_rsa_mod_pow(const uint8_t *base, int64_t bLen,
