@@ -43,10 +43,13 @@ src/ZanWeb/             包源码。目录是工程组织（Framework/Modules �
                             复杂动态条件，单表读写走实体链，见「代码规范」）；
                             Model/Blog/、Dao/Blog/ 为示例模块
     Crud/                   配置驱动管理屏引擎
-      Controller/             CrudScreenController.zan——接入层基座（继承
-                              AppController 即控制器，无论是否自带路由）
-      Model/                  CrudConf.zan——屏面声明模型（描述字段/表单/
-                              校验的数据模型，非表实体）
+      Controller/Admin/       CrudScreenController.zan——管理屏基座（ns
+                              ZanWeb.Admin，与 Dashboard/Profile 同族；
+                              继承 AppController 即控制器，无论是否
+                              自带路由）
+      Model/                  CrudConf.zan——屏面声明模型（ns ZanWeb.Model，
+                              与 Model/ 目录镜像；描述字段/表单/校验，
+                              非表实体）
 views/                  页面模板，按控制器模块分目录（随包资产）
   layout.html             全站布局；模块自有 layout.html 仅覆盖本模块
 wwwroot/                唯一 Web 可达目录，挂载在 /static（css/js/vendor/i18n）
@@ -70,7 +73,27 @@ wwwroot/                唯一 Web 可达目录，挂载在 /static（css/js/ven
 
 ## 代码规范
 
-词表化命名 + 三种 DB 形态各管一摊。规则全部机械可查；每条带"为什么"。
+目录、namespace、命名、DB 四件事全部机械可查；每条规则带"为什么"。
+
+### 目录 ↔ namespace ↔ URL 三者同构
+
+`Modules/<模块>/Controller/` 以下的目录 == namespace（`ZanWeb.` 以下）==
+URL 族：`Controller/Admin/Content/Categories.zan` ↔ `ZanWeb.Admin.Content` ↔
+`/admin/content/*`。`Model/`、`Dao/` 层段保留在 namespace
+（`ZanWeb.Model[.子族]`、`ZanWeb.Dao[.子族]`）。模块目录名（Sys、Crud）
+是纯物理分组——不入 namespace、不入 URL。
+
+为什么：RBAC 权限码就是 `namespace.Class.Action`
+（`Admin.Content.Categories.Def`），多级菜单分组就是 URL 第一段
+（`MenuBuilder.Section("content", "内容管理")` 注册段名，`ForUser` 从
+路由表推导、可见性与放行走同一个权限解析器）。namespace 或目录一旦
+偏离 URL，权限码与菜单就失去锚点——不存在第二份要维护的映射表。
+
+**视图键同理**：`View.LoadRec` 按目录路径推导
+（`views/Admin/System/SysUsers.Index.html` → `Admin.System.SysUsers.Index`）。
+显式 `ViewOf/FragmentOf` 的键必须等于某个文件的真实键——查不到时
+HTTP 仍是 200，页面渲染成 `<!-- view not found -->` 注释，冒烟只看
+状态码是假绿（本轮踩过：key 改了、views 资产目录没跟着挪）。
 
 ### 命名词表
 
@@ -99,11 +122,11 @@ adminUI（JSON 体）两套前端同动作双兼容靠它。成员按所在层�
 
 **`Crud*` 语义前缀**只有三类角色，新增类型先对号入座：
 
-| 类型                  | 位置                          | 角色                         |
-|-----------------------|-------------------------------|------------------------------|
-| `CrudConf`            | Modules/Crud/Model/           | 屏面声明（描述字段/表单/校验）|
-| `CrudScreenController`| Modules/Crud/Controller/      | 屏引擎基座                   |
-| `CrudOps`             | Framework/                    | 声明驱动的通用写动作与 conf 投影网关 |
+| 类型                  | 位置                                        | 角色                         |
+|-----------------------|---------------------------------------------|------------------------------|
+| `CrudConf`            | Modules/Crud/Model/（ns `ZanWeb.Model`）    | 屏面声明（描述字段/表单/校验）|
+| `CrudScreenController`| Modules/Crud/Controller/Admin/（ns `ZanWeb.Admin`） | 屏引擎基座            |
+| `CrudOps`             | Framework/（ns `ZanWeb.Web`）               | 声明驱动的通用写动作与 conf 投影网关 |
 
 （为什么：曾有静态网关 `class Crud` 与模块命名空间 `ZanWeb.Crud` 撞名，
 看名字分不清角色——已更名 `CrudOps`。）
