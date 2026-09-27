@@ -72,6 +72,7 @@ struct zan_lexer {
      * entries are always [0, define_count)). */
     zan_pp_define_t *defines;
     int define_count;
+    int define_cap;
     /* Conditional compilation stack: 1=active, 0=skipping */
     int cond_stack[ZAN_PP_MAX_COND_DEPTH];
     int cond_depth;

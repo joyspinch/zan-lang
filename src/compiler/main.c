@@ -36,6 +36,7 @@
 #include <sys/stat.h>
 #ifdef _WIN32
 #include <windows.h>
+#include <psapi.h>
 #include <process.h>
 #define fopen zan_utf8_fopen
 #define remove zan_utf8_remove
@@ -96,12 +97,24 @@ static double now_ms(void) {
 #endif
 }
 
+static zan_arena_t *g_main_arena = NULL;
+
 /* Closes the phase opened by the previous call and reports how long it ran. */
 static void phase(const char *name) {
     if (!g_time_phases) return;
     double t = now_ms();
+    size_t mem_mb = 0, ws_mb = 0;
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS pmc;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        mem_mb = pmc.PagefileUsage / (1024 * 1024);
+        ws_mb = pmc.WorkingSetSize / (1024 * 1024);
+    }
+#endif
+    size_t ar_mb = g_main_arena ? (zan_arena_total_bytes(g_main_arena) / (1024 * 1024)) : 0;
     if (g_phase_start > 0.0)
-        fprintf(stderr, "%10.1f ms  %s\n", t - g_phase_start, name);
+        fprintf(stderr, "%10.1f ms  [Commit: %4zu MB, WS: %4zu MB, Arena: %4zu MB]  %s\n",
+                t - g_phase_start, mem_mb, ws_mb, ar_mb, name);
     g_phase_start = t;
 }
 
@@ -4064,6 +4077,7 @@ int main(int argc, char **argv) {
 
     /* parse */
     zan_arena_t *arena = zan_arena_new();
+    g_main_arena = arena;
     zan_diag_t *diag = zan_diag_new(arena);
     zan_diag_set_deny_warnings(diag, do_deny_warnings);
 
@@ -4182,6 +4196,7 @@ int main(int argc, char **argv) {
     free(design_outs); /* entries were moved into `source`/the arena */
 
     phase("parse");
+    if (g_time_phases) zan_arena_dump_stats();
 
     if (!zan_diag_has_errors(diag)) {
         zan_compile_trace("flatten nested types");
@@ -4490,6 +4505,7 @@ int main(int argc, char **argv) {
     }
 
     phase("irgen");
+    if (g_time_phases) zan_arena_dump_stats();
 
     /* ---- optimize ---- */
     zan_opt_level_t effective_opt = ZAN_OPT_NONE;

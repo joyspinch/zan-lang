@@ -206,12 +206,11 @@ void zan_lexer_init(zan_lexer_t *lex, const char *source, size_t len,
     lex->arena = arena;
     lex->diag = diag;
     lex->at_line_start = 1;
-    /* No arena means no #define table; every lookup below is bounded by
-     * define_count, which stays 0, so a NULL table is simply an empty one. */
-    lex->defines = arena
-        ? (zan_pp_define_t *)zan_arena_alloc(
-              arena, sizeof(zan_pp_define_t) * ZAN_PP_MAX_DEFINES)
-        : NULL;
+    /* Lazily allocated on the first #define: allocating 640 KB eagerly per
+     * lexer invocation across thousands of files/passes burned >1.5 GB of arena. */
+    lex->defines = NULL;
+    lex->define_count = 0;
+    lex->define_cap = 0;
 }
 
 static inline bool lexer_at_end(zan_lexer_t *lex) {
@@ -267,7 +266,20 @@ static inline bool lexer_match(zan_lexer_t *lex, char expected) {
 /* ---- Preprocessor ---- */
 
 void zan_lexer_define(zan_lexer_t *lex, const char *name, const char *value) {
-    if (!lex->defines || lex->define_count >= ZAN_PP_MAX_DEFINES) return;
+    if (!name || !lex->arena) return;
+    if (lex->define_count >= lex->define_cap) {
+        int new_cap = lex->define_cap == 0 ? 16 : lex->define_cap * 2;
+        if (new_cap > ZAN_PP_MAX_DEFINES) new_cap = ZAN_PP_MAX_DEFINES;
+        if (lex->define_count >= new_cap) return;
+        zan_pp_define_t *new_defs = (zan_pp_define_t *)zan_arena_alloc(
+            lex->arena, sizeof(zan_pp_define_t) * (size_t)new_cap);
+        if (!new_defs) return;
+        if (lex->defines && lex->define_count > 0) {
+            memcpy(new_defs, lex->defines, sizeof(zan_pp_define_t) * (size_t)lex->define_count);
+        }
+        lex->defines = new_defs;
+        lex->define_cap = new_cap;
+    }
     zan_pp_define_t *d = &lex->defines[lex->define_count++];
     strncpy(d->name, name, 63); d->name[63] = '\0';
     if (value) { strncpy(d->value, value, 255); d->value[255] = '\0'; }
@@ -275,13 +287,16 @@ void zan_lexer_define(zan_lexer_t *lex, const char *name, const char *value) {
 }
 
 static int pp_is_defined(zan_lexer_t *lex, const char *name) {
+    if (!lex->defines || !name) return 0;
     for (int i = 0; i < lex->define_count; i++) {
         if (strcmp(lex->defines[i].name, name) == 0) return 1;
     }
     return 0;
 }
 
+static const char *pp_get_value(zan_lexer_t *lex, const char *name) __attribute__((unused));
 static const char *pp_get_value(zan_lexer_t *lex, const char *name) {
+    if (!lex->defines || !name) return NULL;
     for (int i = 0; i < lex->define_count; i++) {
         if (strcmp(lex->defines[i].name, name) == 0) return lex->defines[i].value;
     }
@@ -289,6 +304,7 @@ static const char *pp_get_value(zan_lexer_t *lex, const char *name) {
 }
 
 static void pp_undef(zan_lexer_t *lex, const char *name) {
+    if (!lex->defines || !name) return;
     for (int i = 0; i < lex->define_count; i++) {
         if (strcmp(lex->defines[i].name, name) == 0) {
             lex->defines[i] = lex->defines[--lex->define_count];
