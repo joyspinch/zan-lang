@@ -136,6 +136,17 @@ URL 首段决定动作的声明区：`/admin/*` 只能声明在 `Controller/Admi
 无区前缀的根 URL（如曾经的 `[Route("/upload")]` 挂在 Api 区）属于越界
 声明，一律删覆盖、落回类约定归位——根路径是前台区的地盘。
 
+### 动作段 = 方法名（路由可寻到代码）
+
+显式 Route 的 URL 必须能逐段寻到代码，末段动作位尤其如此：GET 表单走
+默认动作 `Index`（URL 无动作段），POST 提交显式带 `/submit` 段、方法名
+`Submit`（`POST /register` 曾挂在 Submit 上——URL 里寻不到 submit，从
+路由表、权限码或日志反查代码就断了；`/admin/logout` 的方法曾叫 `Out`，
+已改 `Logout` 就段）。豁免：`{id}` 详情（`Show`）、文件型端点
+（`rss.xml` 等）、adminUI 前端契约段（`POST …/list` ↔ `ListData`，前端
+ZanTable 硬约定优先）。方法名不得与在用的类型同名（Blog 回复端点 URL
+取 `/blog/{id}/reply` 而非把方法改成与 Comment 实体同名）。
+
 ### 数据库降级与投影样板
 
 - 屏面动作的降级出口是 `PageReady(d)`（置 dbDown 徽章渲染本屏）、数据
