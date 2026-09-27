@@ -52,40 +52,28 @@ class AesGcm {
         return gfmul(x, H);
     }
 
-    /// GHASH 硬件快路径（PCLMUL/PMULL 单步内核 y=(y^x)*h）：AAD 块、密文块
-    /// 再接长度块逐块累乘。任一步报告无硬件即返回 null，由调用方整体落回
-    /// 纯 Zan 位循环——不混用两条路径的中间状态。
+    /// GHASH 硬件快路径（PCLMUL/PMULL 流式内核）：AAD 段、密文段
+    /// 再接长度块在 C 端 SIMD 寄存器流水线一次性完成，避免逐块跨语言与内存拷贝。
     static List<long> hwGhash(List<long> H, string aad, int aadLen, string data, int dataLen) {
         byte[] hBlk = new byte[16];
         store64(hBlk, 0, H[0]);
         store64(hBlk, 8, H[1]);
         string hStr = hBlk;
         byte[] yb = new byte[16];
-        byte[] xb = new byte[16];
         string yStr = yb;
-        string xStr = xb;
-        int p = 0;
-        while (p < aadLen) {
-            int avail = aadLen - p; if (avail > 16) { avail = 16; }
-            for (int i = 0; i < 16; i = i + 1) {
-                if (i < avail) { xb[i] = (byte)(aad[p + i] & 255); } else { xb[i] = 0; }
-            }
-            if (NativeMemory.GhashBlock(hStr, xStr, yStr) != 0) { return null; }
-            p = p + 16;
+
+        if (aadLen > 0) {
+            if (NativeMemory.GhashUpdate(hStr, aad, (long)aadLen, yStr) != 0) { return null; }
         }
-        p = 0;
-        while (p < dataLen) {
-            int avail = dataLen - p; if (avail > 16) { avail = 16; }
-            for (int i = 0; i < 16; i = i + 1) {
-                if (i < avail) { xb[i] = (byte)(data[p + i] & 255); } else { xb[i] = 0; }
-            }
-            if (NativeMemory.GhashBlock(hStr, xStr, yStr) != 0) { return null; }
-            p = p + 16;
+        if (dataLen > 0) {
+            if (NativeMemory.GhashUpdate(hStr, data, (long)dataLen, yStr) != 0) { return null; }
         }
         // 长度块：[aadBits(64) | dataBits(64)]
+        byte[] xb = new byte[16];
         store64(xb, 0, (long)aadLen * 8);
         store64(xb, 8, (long)dataLen * 8);
-        if (NativeMemory.GhashBlock(hStr, xStr, yStr) != 0) { return null; }
+        string xStr = xb;
+        if (NativeMemory.GhashUpdate(hStr, xStr, 16, yStr) != 0) { return null; }
         List<long> r = new List<long>(); r.Add(load64(yStr, 0)); r.Add(load64(yStr, 8));
         return r;
     }
@@ -139,7 +127,7 @@ class AesGcm {
             byte[] cnt = new byte[16];
             for (int i = 0; i < 16; i = i + 1) { cnt[i] = (byte)(ctr[i] & 255); }
             string cntStr = cnt;
-            long got = NativeMemory.AesCtrCrypt(outb, data, (long)dataLen, key, keyLen, cntStr);
+            long got = NativeMemory.AesCtrCrypt(outb, data, (long)dataLen, key, keyLen * 8, cntStr);
             if (got >= 0) { return; }
         }
 

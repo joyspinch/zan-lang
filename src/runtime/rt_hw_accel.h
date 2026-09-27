@@ -67,6 +67,15 @@ int64_t zan_hw_aes_ctr_crypt(const uint8_t *in, int64_t len,
 /* GHASH universal hash step (GCM, NIST SP 800-38D): y = (y ^ x) * h in
  * GF(2^128). All three point at 16-byte blocks. 0 or -1. */
 int64_t zan_hw_ghash_block(const uint8_t *h16, const uint8_t *x16, uint8_t *y16);
+/* Streamed GHASH: updates y with len bytes of data, zero-padding final block if needed. */
+int64_t zan_hw_ghash_update(const uint8_t *h16, const uint8_t *data, int64_t len, uint8_t *y16);
+
+/* Modular exponentiation: base^exp mod n for RSA/DH (up to 4096-bit odd modulus).
+ * All inputs and outputs are big-endian byte buffers. Returns 0 on success, -1 otherwise. */
+int64_t zan_hw_rsa_mod_pow(const uint8_t *base, int64_t bLen,
+                           const uint8_t *exp, int64_t eLen,
+                           const uint8_t *mod, int64_t mLen,
+                           uint8_t *out);
 
 /* RFC 7748 X25519 constant-time Diffie-Hellman scalar multiplication:
  * computes scalar * point -> out (all 32 bytes little-endian).

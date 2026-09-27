@@ -961,6 +961,39 @@ static bool emit_native_memory_call(zan_irgen_t *g, zan_ast_node_t *expr,
             nm_addr(g, y, zero64) }, 3, "nm.ghash");
         return true;
     }
+    if (is_call_to(expr, "NativeMemory", "GhashUpdate") && expr->call.args.count == 4) {
+        LLVMValueRef h = nm_arg(g, expr, 0, locals);
+        LLVMValueRef data = nm_arg(g, expr, 1, locals);
+        LLVMValueRef len = coerce_int_to(g, nm_arg(g, expr, 2, locals), i64t);
+        LLVMValueRef y = nm_arg(g, expr, 3, locals);
+        LLVMTypeRef ty = LLVMFunctionType(i64t,
+            (LLVMTypeRef[]){ i8ptr, i8ptr, i64t, i8ptr }, 4, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_ghash_update");
+        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_ghash_update", ty);
+        *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
+            nm_addr(g, h, zero64), nm_addr(g, data, zero64), len,
+            nm_addr(g, y, zero64) }, 4, "nm.ghash_upd");
+        return true;
+    }
+    if (is_call_to(expr, "NativeMemory", "RsaModPow") && expr->call.args.count == 7) {
+        LLVMValueRef base = nm_arg(g, expr, 0, locals);
+        LLVMValueRef bLen = coerce_int_to(g, nm_arg(g, expr, 1, locals), i64t);
+        LLVMValueRef expVal = nm_arg(g, expr, 2, locals);
+        LLVMValueRef eLen = coerce_int_to(g, nm_arg(g, expr, 3, locals), i64t);
+        LLVMValueRef mod = nm_arg(g, expr, 4, locals);
+        LLVMValueRef mLen = coerce_int_to(g, nm_arg(g, expr, 5, locals), i64t);
+        LLVMValueRef outBuf = nm_arg(g, expr, 6, locals);
+        LLVMTypeRef ty = LLVMFunctionType(i64t,
+            (LLVMTypeRef[]){ i8ptr, i64t, i8ptr, i64t, i8ptr, i64t, i8ptr }, 7, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_rsa_mod_pow");
+        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_rsa_mod_pow", ty);
+        *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
+            nm_addr(g, base, zero64), bLen,
+            nm_addr(g, expVal, zero64), eLen,
+            nm_addr(g, mod, zero64), mLen,
+            nm_addr(g, outBuf, zero64) }, 7, "nm.rsa_mod_pow");
+        return true;
+    }
     if (is_call_to(expr, "NativeMemory", "X25519") && expr->call.args.count == 3) {
         LLVMValueRef scalar = nm_arg(g, expr, 0, locals);
         LLVMValueRef point = nm_arg(g, expr, 1, locals);
