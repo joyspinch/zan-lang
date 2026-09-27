@@ -9,7 +9,9 @@ Set-Location $root
 Write-Output "[1/4] Compiling native GUI runtime (static)..."
 clang -O2 -DZAN_GUI_STATIC -c src\runtime\gui_runtime.c -o build\zan_gui_static.obj
 if ($LASTEXITCODE -ne 0) { throw "runtime compile failed" }
-llvm-lib /out:build\zan_gui.lib build\zan_gui_static.obj | Out-Null
+clang -O2 -DZAN_GUI_STATIC -fno-exceptions -fno-rtti -c src\runtime\gui_runtime_dwrite.cpp -o build\zan_gui_dwrite_static.obj
+if ($LASTEXITCODE -ne 0) { throw "runtime dwrite compile failed" }
+llvm-lib /out:build\zan_gui.lib build\zan_gui_static.obj build\zan_gui_dwrite_static.obj | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "llvm-lib failed" }
 
 Write-Output "[2/4] Compiling app icon resource..."

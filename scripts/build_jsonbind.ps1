@@ -6,7 +6,9 @@ Set-Location $root
 
 clang -O2 -DZAN_GUI_STATIC -c src\runtime\gui_runtime.c -o build\zan_gui_static.obj
 if ($LASTEXITCODE -ne 0) { throw "runtime compile failed" }
-llvm-lib /out:build\zan_gui.lib build\zan_gui_static.obj | Out-Null
+clang -O2 -DZAN_GUI_STATIC -fno-exceptions -fno-rtti -c src\runtime\gui_runtime_dwrite.cpp -o build\zan_gui_dwrite_static.obj
+if ($LASTEXITCODE -ne 0) { throw "runtime dwrite compile failed" }
+llvm-lib /out:build\zan_gui.lib build\zan_gui_static.obj build\zan_gui_dwrite_static.obj | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "llvm-lib failed" }
 clang -O2 -std=c11 -I src\runtime -c src\runtime\rt_sync.c -o build\zanrt_sync_jsonbind.obj
 if ($LASTEXITCODE -ne 0) { throw "rt_sync compile failed" }

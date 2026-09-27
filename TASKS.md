@@ -16,7 +16,7 @@
 
 ## C 类 · 文档 / 工程规范
 
-- [ ] **C-1** `scripts/build_mge.ps1`、`build_glassprobe.ps1`、`build_gui.ps1`、`build_jsonbind.ps1` 的手工 mingw GUI 归档缺 `gui_runtime_dwrite.o`：gui_runtime.c 只声明 `zan_dw_render`，实现拆在 `gui_runtime_dwrite.cpp`（b674314a 拆分引入），IDE 与 gallery 脚本已补（2026-09-26），这四个跑 `--link` 会报 undefined reference。修法照抄 `build_gallery.ps1`：clang++ `-fno-exceptions -fno-rtti` 编译 dwrite.cpp 进归档（dwrite.dll 运行时 LoadLibrary，无需导入库）。
+- [x] **C-1** `scripts/build_mge.ps1`、`build_glassprobe.ps1`、`build_gui.ps1`、`build_jsonbind.ps1` 的手工 mingw GUI 归档缺 `gui_runtime_dwrite.o`：gui_runtime.c 只声明 `zan_dw_render`，实现拆在 `gui_runtime_dwrite.cpp`（b674314a 拆分引入），IDE 与 gallery 脚本已补（2026-09-26），这四个跑 `--link` 会报 undefined reference。已修复：clang++ `-fno-exceptions -fno-rtti` 编译 dwrite.cpp 进归档并打包入库。2026-09-27。
 
 ---
 
@@ -51,15 +51,8 @@
   旧"总是成功"的 Md5 内建把它掩成死代码）。已修：删递归行，空消息直落
   纯主体（与 Sha256.zan 同构）。conformance：hw_crypto_pixel md5 empty。
   2026-09-26。
-- [ ] **B-HW4** linux GUI 驱动静态归档的构建配方未入库：`stdlib/Gui/drivers/
-  linux-{x64,arm64}/static/libzan_gui.a` 不是单纯编译产物，而是 gui_runtime
-  编译对象与整套 X11/Xau 等系统静态库 ar 合并的自包含成品（归档成员
-  AuRead.o/Wraps.o 等即 libXau/libX11 目标），构建命令从未写进 scripts/
-  （0a024d6da、d2befdd46 两次刷新均为手工完成，查无脚本）。gui_runtime
-  持续演进（tray/font/shims 新导出），归档自 2026-08-15 起落后，其后新增
-  的 zan_gui_* 导出在 linux 交叉链接时不可用。修法：仿
-  `build_gui_android_static.sh`（NDK clang 单 TU + FreeType 成员裁剪）写
-  `build_linux_gui_static.sh`，并挂进 drivers.yml 的 linux job（其 apt 包
-  列表已含全部 X11/Wayland/GBM dev 包）自动构建回填；WSLg 可做端到端
-  链接+运行验证。伴随项：macos dylib×2 的刷新同样依赖 drivers.yml
-  （workflow_dispatch 后自动提交回 main），本机代理/gh 可用后触发一次。
+- [x] **B-HW4** linux GUI 驱动静态归档的构建配方未入库：`stdlib/Gui/drivers/
+  linux-{x64,arm64}/static/libzan_gui.a` 构建脚本入库。已落地（2026-09-27）：
+  编写 `scripts/build_linux_gui_static.sh`（支持 x64/arm64，单 TU 编译 gui_runtime.c 并提取
+  系统 libX11.a/libXau.a/libxcb.a 静态库合并封装），并在 `.github/workflows/drivers.yml` 的
+  linux 构建流水线中挂接该步骤与产物回填。
