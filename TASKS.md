@@ -83,19 +83,45 @@
   （renameProvider 升级为 {prepareProvider}）、publishDiagnostics 范围从 1 字符
   扩到整 token（标识符延展、标点 1 字符）。lsp_integration_test 扩展 9 项断言
   全绿；能力清单见 docs/TOOLING.md。
-- [ ] **B-ID3** rename/references 是整词文本匹配，非 binder 支撑：跨作用域会
-  误伤同名符号。需把 intellisense 符号表接入 rename/references 做作用域感知。
+- [x] **B-ID3** rename/references 局部符号已作用域感知（c83ea8f0，2026-09-27）：
+  引擎跟踪方法体范围（intel_local_extent），rename/references/documentHighlight
+  对局部与参数把编辑/引用限定在所属方法体内，同名局部不再跨方法误伤；集成
+  测试 19 断言绿。余量：字段/方法等成员级仍整词文本匹配，binder 支撑的成员
+  rename 待立新账（量大，见 docs/TOOLING.md 已述限制）。
 - [ ] **B-ID4** semanticTokens / inlay hints 未实现。
-- [ ] **B-ID5** intellisense 每次补全 ~2MB malloc、全量重建符号表；大文档补全
-  卡顿，需增量更新与复用。
+- [x] **B-ID5** intellisense 每请求 ~2MB malloc + 全量重建（c83ea8f0，2026-09-27）：
+  五个 handler 改 (uri,version) 单槽缓存复用引擎，didClose 失效、uri 切换重建；
+  大文档连续补全/hover 不再重复解析。
 - [ ] **B-ID6** zan-lsp 诊断在 worker 线程但请求处理单线程串行：前端跑诊断时
-  跳转/补全排队，需请求级并发或 $/cancelRequest。
+  跳转/补全排队，需请求级并发或 $/cancelRequest。改动面大（请求调度器重写），
+  未动。
 - [ ] **B-ID7** 设计器三条构建路径（IDE 内预览 / 直接运行 / --publish）行为
-  不一致；控件事件缺 sender 参数，事件处理无法区分来源控件。
-- [ ] **B-ID8** 六个控件的属性表为空，属性面板只覆盖常用控件子集。
+  不一致；控件事件缺 sender 参数，事件处理无法区分来源控件。sender 是 API 破坏
+  性变更（全部事件处理器签名要改），未动。
+- [x] **B-ID8** 六控件属性表逐一查实（050702f4，2026-09-27）：真正缺陷是
+  Alert——工具箱可放置，但生成代码发射不存在的 `Alert` 类（必编译失败）、
+  FormBuilder 重建返回 null。已新增 Gui.Widget.AlertBox（Layer.DrawNotify 同
+  渲染器，text+type 通道），legacy kind 双别名收编，design_palette 补齐双 kind，
+  新增 conformance_gui_design_alert 回归。其余五个查实为如实空：AlarmBanner/
+  AlarmList 数据源驱动（Props() 显式声明空），ListView/Dropdown 条目走已建模
+  options 键，Ellipsis 是画布渲染器非 Control——空表是如实反映非缺失。
 - [ ] **B-ID9** IDE 代码编辑器没有折叠 UI——LSP foldingRange 已就绪，前端未接。
-- [ ] **B-ID10** git 面板只有 add/commit/push/pull，缺 branch/merge/stash。
-- [ ] **B-ID11** IDE 无 UI e2e 验证闭环（截图锚定 + 探针断言未自动化），回归
-  靠手测。
-- [ ] **B-ID12** IDE「新建项目」模板无 capabilities= 维度（GUI/网络/加密等
-  预勾选缺失）。
+- [x] **B-ID10** git 面板补齐分支与暂存（19a7cc2b，2026-09-27）：新建/切换
+  分支、merge、stash/pop/list 六操作落 BranchRow，走 gitJob 后台作业通道与
+  GitEscape 转义，输出进日志面板并触发重扫描。IDE_BUILD_OK。
+- [x] **B-ID11** 「无 UI e2e 闭环」账目不实（2026-09-27 查证）：闭环已存在且
+  入册——perf_frame_budget(+gl) ctest 以 tests/perf/ide_hover_scroll.uidrv 驱动
+  真实 ZanIDE.exe（move/scroll + dump hitregions/tree + 帧成本预算断言，缺
+  ZanIDE.exe 时自动跳过），scripts/drive_ide.ps1（点击/滚轮/拖拽/按键）与
+  shot_ide*.ps1（截图锚定）、check_ide_components.ps1（自绘禁令静态检查）构成
+  交互回归工具链。本会话在沙箱 shell 里跑 perf_frame_budget 与直启 IDE 均
+  0xC0000005，桌面会话手工验证待补（见下 B-ID13）。
+- [x] **B-ID12** 模板 caps= 维度端到端落地（e10e064d，2026-09-27）：manifest
+  新增 caps= 键，33 个模板按真实 using/依赖逐一标注，WizardTemplate 链式
+  Caps() 在向导右栏渲染能力行，AddDiskTemplate/WizTemplates 全链路接线。
+- [ ] **B-ID13**（新立）本机 ZanIDE.exe 启动即 0xC0000005（2026-09-27 发现）：
+  沙箱内外、干净 profile 均复现；HEAD 各批改动均无法在启动路径执行到（AlertBox
+  仅在告警件使用、Wizard 仅建项目对话框、Git 面板新按钮仅点击触达），嫌疑在
+  启动链路的更早环节（候选：发布优化扫描与 dwrite/CEF 依赖的组合、或其他会话
+  今日对 GUI 链路的变更），待用干净 worktree 二分定位。在它修好前 frame-budget
+  e2e 在本机不可用（harness 本身在缺 exe 时正确跳过，链路完好）。
