@@ -646,7 +646,14 @@ class HttpForwarder {
 
         // 请求体：Content-Length 精确搬运，chunked 逐块搬运，
         // 都不等整体到齐（上传大文件/流式请求同样是流式的）。
-        await HttpForwarder.PumpBody(creader, up, head, true, this.chunkBytes);
+        long reqBodyMoved = await HttpForwarder.PumpBody(creader, up, head, true, this.chunkBytes);
+        bool reqComplete = true;
+        if (HttpForwarder.HeadIsChunked(head)) {
+            if (reqBodyMoved < 0) { reqComplete = false; }
+        } else {
+            long reqCl = HttpForwarder.ContentLengthOf(head);
+            if (reqCl > 0 && reqBodyMoved != reqCl) { reqComplete = false; }
+        }
 
         FwdReader ureader = new FwdReader(up, this.chunkBytes);
         string rhead = await ureader.ReadHeadAsync(this.maxHeadBytes);
@@ -700,9 +707,10 @@ class HttpForwarder {
             moved = await HttpForwarder.PumpBody(ureader, client, rhead, false,
                                                  this.chunkBytes);
         }
-        // 只有"响应结尾能被帧格式确定 + 链路上没有剩余字节"时才归还：
-        // 否则下一个请求会读到上一条响应的尾巴（响应走私）。
+        // 只有"请求体完整发出 + 响应结尾能被帧格式确定 + 链路上没有剩余字节"时才归还：
+        // 否则下一个请求会读到上一条响应的尾巴或与上游未完成的请求脱节（请求/响应走私）。
         bool reusable = this.pool != null && !up.IsClosed()
+            && reqComplete
             && HttpForwarder.RespKeepsAlive(rhead)
             && (noBody || HttpForwarder.RespSelfDelimited(rhead))
             && ureader.Drained();
@@ -1106,9 +1114,15 @@ class HttpForwarder {
     /// 按 RFC 7230，只有列表最后一项严格等于 "chunked" 时才成立，
     /// 且 "chunked" 之后不能再有其他编码。</summary>
     static bool HeadIsChunked(string head) {
-        string te = HttpForwarder.Lower(
-            HttpForwarder.HeaderValue(head, "transfer-encoding"));
-        List<string> parts = HttpForwarder.SplitCsv(te);
+        List<string> lines = HttpForwarder.HeadLines(head);
+        string lastVal = "";
+        for (int i = 1; i < lines.Count; i = i + 1) {
+            if (HttpForwarder.LowerName(lines[i]) == "transfer-encoding") {
+                lastVal = HttpForwarder.HeaderValueOfLine(lines[i]);
+            }
+        }
+        if (lastVal.Length == 0) { return false; }
+        List<string> parts = HttpForwarder.SplitCsv(HttpForwarder.Lower(lastVal));
         if (parts.Count == 0) { return false; }
         string last = HttpForwarder.Trim(parts[parts.Count - 1]);
         return last == "chunked";
@@ -1138,10 +1152,12 @@ class HttpForwarder {
         List<string> lines = HttpForwarder.HeadLines(head);
         int clCount = 0;
         string clValue = "";
+        string combinedTe = "";
+        bool hasTe = false;
         for (int i = 1; i < lines.Count; i = i + 1) {
             string line = lines[i];
             int colon = HttpForwarder.IndexOf(line, ":", 0);
-            if (colon <= 0) { continue; }
+            if (colon <= 0) { return false; }
             // 混淆字段名："Transfer-Encoding :" 这类冒号前带空白的行
             // 不匹配任何已知名，此前会绕过全部判定后被原样转发，
             // 由容忍该空格的上游按 TE 解析——走私。RFC 要求拒收。
@@ -1157,8 +1173,14 @@ class HttpForwarder {
                 clValue = HttpForwarder.Trim(
                     line.Substring(colon + 1, line.Length - colon - 1));
             } else if (name == "transfer-encoding") {
-                // 空白分隔的值变体（值内 tab）同样不参与下面的
-                // 严格解析——统一 trim 后再判。
+                hasTe = true;
+                string v = HttpForwarder.Trim(
+                    line.Substring(colon + 1, line.Length - colon - 1));
+                if (combinedTe.Length > 0) {
+                    combinedTe = combinedTe + ", " + v;
+                } else {
+                    combinedTe = v;
+                }
             }
         }
         // 多个 Content-Length 行：即使值相同也拒绝（RFC 允许合并，
@@ -1166,12 +1188,10 @@ class HttpForwarder {
         // 一旦分歧就是请求走私）。
         if (clCount > 1) { return false; }
 
-        string teValue = HttpForwarder.Lower(
-            HttpForwarder.HeaderValue(head, "transfer-encoding"));
-        bool hasTe = teValue.Length > 0;
         bool hasCl = clCount == 1;
         if (hasTe && hasCl) { return false; }
         if (hasTe) {
+            string teValue = HttpForwarder.Lower(combinedTe);
             List<string> parts = HttpForwarder.SplitCsv(teValue);
             for (int i = 0; i < parts.Count; i = i + 1) {
                 string enc = HttpForwarder.Trim(parts[i]);
