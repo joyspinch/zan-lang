@@ -1098,6 +1098,35 @@ static bool emit_native_memory_call(zan_irgen_t *g, zan_ast_node_t *expr,
             nm_addr(g, outBuf, zero64) }, 7, "nm.rsa_mod_pow");
         return true;
     }
+    if (is_call_to(expr, "NativeMemory", "RsaCrtModPow") && expr->call.args.count == 14) {
+        LLVMValueRef msg = nm_arg(g, expr, 0, locals);
+        LLVMValueRef mLen = coerce_int_to(g, nm_arg(g, expr, 1, locals), i64t);
+        LLVMValueRef p = nm_arg(g, expr, 2, locals);
+        LLVMValueRef pLen = coerce_int_to(g, nm_arg(g, expr, 3, locals), i64t);
+        LLVMValueRef q = nm_arg(g, expr, 4, locals);
+        LLVMValueRef qLen = coerce_int_to(g, nm_arg(g, expr, 5, locals), i64t);
+        LLVMValueRef dp = nm_arg(g, expr, 6, locals);
+        LLVMValueRef dpLen = coerce_int_to(g, nm_arg(g, expr, 7, locals), i64t);
+        LLVMValueRef dq = nm_arg(g, expr, 8, locals);
+        LLVMValueRef dqLen = coerce_int_to(g, nm_arg(g, expr, 9, locals), i64t);
+        LLVMValueRef qinv = nm_arg(g, expr, 10, locals);
+        LLVMValueRef qinvLen = coerce_int_to(g, nm_arg(g, expr, 11, locals), i64t);
+        LLVMValueRef outBuf = nm_arg(g, expr, 12, locals);
+        LLVMValueRef outLen = coerce_int_to(g, nm_arg(g, expr, 13, locals), i64t);
+        LLVMTypeRef ty = LLVMFunctionType(i64t,
+            (LLVMTypeRef[]){ i8ptr, i64t, i8ptr, i64t, i8ptr, i64t, i8ptr, i64t, i8ptr, i64t, i8ptr, i64t, i8ptr, i64t }, 14, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_rsa_crt");
+        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_rsa_crt", ty);
+        *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
+            nm_addr(g, msg, zero64), mLen,
+            nm_addr(g, p, zero64), pLen,
+            nm_addr(g, q, zero64), qLen,
+            nm_addr(g, dp, zero64), dpLen,
+            nm_addr(g, dq, zero64), dqLen,
+            nm_addr(g, qinv, zero64), qinvLen,
+            nm_addr(g, outBuf, zero64), outLen }, 14, "nm.rsa_crt");
+        return true;
+    }
     if (is_call_to(expr, "NativeMemory", "X25519") && expr->call.args.count == 3) {
         LLVMValueRef scalar = nm_arg(g, expr, 0, locals);
         LLVMValueRef point = nm_arg(g, expr, 1, locals);

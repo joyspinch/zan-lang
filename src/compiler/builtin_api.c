@@ -175,6 +175,7 @@ static const zan_builtin_member_t members_nativemem[] = {
     { "GhashBlock",    'M', "long GhashBlock(nint h, nint x, nint y)" },
     { "GhashUpdate",   'M', "long GhashUpdate(nint h, nint data, long len, nint y)" },
     { "RsaModPow",     'M', "long RsaModPow(nint baseVal, long bLen, nint exp, long eLen, nint mod, long mLen, nint outBuf)" },
+    { "RsaCrtModPow",  'M', "long RsaCrtModPow(nint msg, long mLen, nint p, long pLen, nint q, long qLen, nint dp, long dpLen, nint dq, long dqLen, nint qinv, long qinvLen, nint outBuf, long outLen)" },
     { "Sm3",              'M', "string Sm3(nint ptr, long size)" },
     { "Sm4CbcEncrypt",    'M', "long Sm4CbcEncrypt(nint dst, nint src, long size, nint key, nint iv)" },
     { "Sm4CbcDecrypt",    'M', "long Sm4CbcDecrypt(nint dst, nint src, long size, nint key, nint iv)" },

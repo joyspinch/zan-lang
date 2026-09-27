@@ -1304,15 +1304,7 @@ static const uint64_t g_ghash_s_table[64] = {
 };
 
 __attribute__((target("pclmul,sse4.1")))
-static inline __m128i zan_ghash_step_clmul(__m128i y, __m128i x, __m128i b) {
-    __m128i a = _mm_xor_si128(y, x);
-    __m128i m0 = _mm_clmulepi64_si128(a, b, 0x00);
-    __m128i m3 = _mm_clmulepi64_si128(a, b, 0x11);
-    __m128i mid = _mm_xor_si128(_mm_clmulepi64_si128(a, b, 0x10),
-                                _mm_clmulepi64_si128(a, b, 0x01));
-    __m128i lo = _mm_xor_si128(m0, _mm_slli_si128(mid, 8));
-    __m128i hi = _mm_xor_si128(m3, _mm_srli_si128(mid, 8));
-
+static inline __m128i zan_ghash_reduce(__m128i lo, __m128i hi) {
     __m128i hi_mask = _mm_set_epi64x((long long)0x8000000000000000ULL, 0);
     __m128i bit127_hi = _mm_and_si128(lo, hi_mask);
     __m128i bit127_lo = _mm_srli_si128(_mm_srli_epi64(bit127_hi, 63), 8);
@@ -1324,6 +1316,58 @@ static inline __m128i zan_ghash_step_clmul(__m128i y, __m128i x, __m128i b) {
     uint64_t s = g_ghash_s_table[low6];
     __m128i direct = _mm_xor_si128(ZAN_XSHIFT_L(hi, 1), bit127_lo);
     return _mm_xor_si128(F, _mm_xor_si128(direct, _mm_set_epi64x((long long)s, 0)));
+}
+
+__attribute__((target("pclmul,sse4.1")))
+static inline __m128i zan_ghash_step_clmul(__m128i y, __m128i x, __m128i b) {
+    __m128i a = _mm_xor_si128(y, x);
+    __m128i m0 = _mm_clmulepi64_si128(a, b, 0x00);
+    __m128i m3 = _mm_clmulepi64_si128(a, b, 0x11);
+    __m128i mid = _mm_xor_si128(_mm_clmulepi64_si128(a, b, 0x10),
+                                _mm_clmulepi64_si128(a, b, 0x01));
+    __m128i lo = _mm_xor_si128(m0, _mm_slli_si128(mid, 8));
+    __m128i hi = _mm_xor_si128(m3, _mm_srli_si128(mid, 8));
+    return zan_ghash_reduce(lo, hi);
+}
+
+__attribute__((target("pclmul,sse4.1")))
+static inline __m128i zan_ghash_4blocks_clmul(__m128i y,
+                                              __m128i x0, __m128i x1,
+                                              __m128i x2, __m128i x3,
+                                              __m128i h1, __m128i h2,
+                                              __m128i h3, __m128i h4) {
+    __m128i a0 = _mm_xor_si128(y, x0);
+    __m128i a1 = x1;
+    __m128i a2 = x2;
+    __m128i a3 = x3;
+
+    __m128i m0_0 = _mm_clmulepi64_si128(a0, h4, 0x00);
+    __m128i m3_0 = _mm_clmulepi64_si128(a0, h4, 0x11);
+    __m128i mid_0 = _mm_xor_si128(_mm_clmulepi64_si128(a0, h4, 0x10),
+                                  _mm_clmulepi64_si128(a0, h4, 0x01));
+
+    __m128i m0_1 = _mm_clmulepi64_si128(a1, h3, 0x00);
+    __m128i m3_1 = _mm_clmulepi64_si128(a1, h3, 0x11);
+    __m128i mid_1 = _mm_xor_si128(_mm_clmulepi64_si128(a1, h3, 0x10),
+                                  _mm_clmulepi64_si128(a1, h3, 0x01));
+
+    __m128i m0_2 = _mm_clmulepi64_si128(a2, h2, 0x00);
+    __m128i m3_2 = _mm_clmulepi64_si128(a2, h2, 0x11);
+    __m128i mid_2 = _mm_xor_si128(_mm_clmulepi64_si128(a2, h2, 0x10),
+                                  _mm_clmulepi64_si128(a2, h2, 0x01));
+
+    __m128i m0_3 = _mm_clmulepi64_si128(a3, h1, 0x00);
+    __m128i m3_3 = _mm_clmulepi64_si128(a3, h1, 0x11);
+    __m128i mid_3 = _mm_xor_si128(_mm_clmulepi64_si128(a3, h1, 0x10),
+                                  _mm_clmulepi64_si128(a3, h1, 0x01));
+
+    __m128i m0 = _mm_xor_si128(_mm_xor_si128(m0_0, m0_1), _mm_xor_si128(m0_2, m0_3));
+    __m128i m3 = _mm_xor_si128(_mm_xor_si128(m3_0, m3_1), _mm_xor_si128(m3_2, m3_3));
+    __m128i mid = _mm_xor_si128(_mm_xor_si128(mid_0, mid_1), _mm_xor_si128(mid_2, mid_3));
+
+    __m128i lo = _mm_xor_si128(m0, _mm_slli_si128(mid, 8));
+    __m128i hi = _mm_xor_si128(m3, _mm_srli_si128(mid, 8));
+    return zan_ghash_reduce(lo, hi);
 }
 
 __attribute__((target("pclmul,sse4.1")))
@@ -1953,12 +1997,16 @@ static void zan_aes_ctr_ni_4way(const uint8_t rkb[15][16], int nr,
 
 __attribute__((target("aes,pclmul,sse4.1")))
 static void zan_aes_gcm_encrypt_ni_fused(const uint8_t rkb[15][16], int nr,
-                                         const uint8_t h16[16],
+                                         const uint8_t h_powers[8][16],
                                          const uint8_t *in, int64_t inLen,
                                          uint8_t counter16[16],
                                          uint8_t *out, uint8_t y16[16]) {
     const __m128i BSWAP = ZAN_BSWAP128;
-    __m128i b = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)h16), BSWAP);
+    __m128i b = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)h_powers[0]), BSWAP);
+    __m128i h1 = b;
+    __m128i h2 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)h_powers[1]), BSWAP);
+    __m128i h3 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)h_powers[2]), BSWAP);
+    __m128i h4 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)h_powers[3]), BSWAP);
     __m128i y = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)y16), BSWAP);
 
     __m128i rk[15];
@@ -2020,10 +2068,12 @@ static void zan_aes_gcm_encrypt_ni_fused(const uint8_t rkb[15][16], int nr,
         _mm_storeu_si128((__m128i*)(out + off + 32), ct2);
         _mm_storeu_si128((__m128i*)(out + off + 48), ct3);
 
-        y = zan_ghash_step_clmul(y, _mm_shuffle_epi8(ct0, BSWAP), b);
-        y = zan_ghash_step_clmul(y, _mm_shuffle_epi8(ct1, BSWAP), b);
-        y = zan_ghash_step_clmul(y, _mm_shuffle_epi8(ct2, BSWAP), b);
-        y = zan_ghash_step_clmul(y, _mm_shuffle_epi8(ct3, BSWAP), b);
+        y = zan_ghash_4blocks_clmul(y,
+                                    _mm_shuffle_epi8(ct0, BSWAP),
+                                    _mm_shuffle_epi8(ct1, BSWAP),
+                                    _mm_shuffle_epi8(ct2, BSWAP),
+                                    _mm_shuffle_epi8(ct3, BSWAP),
+                                    h1, h2, h3, h4);
 
         off += 64;
     }
@@ -2066,12 +2116,16 @@ static void zan_aes_gcm_encrypt_ni_fused(const uint8_t rkb[15][16], int nr,
 
 __attribute__((target("aes,pclmul,sse4.1")))
 static void zan_aes_gcm_decrypt_ni_fused(const uint8_t rkb[15][16], int nr,
-                                         const uint8_t h16[16],
+                                         const uint8_t h_powers[8][16],
                                          const uint8_t *in, int64_t inLen,
                                          uint8_t counter16[16],
                                          uint8_t *out, uint8_t y16[16]) {
     const __m128i BSWAP = ZAN_BSWAP128;
-    __m128i b = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)h16), BSWAP);
+    __m128i b = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)h_powers[0]), BSWAP);
+    __m128i h1 = b;
+    __m128i h2 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)h_powers[1]), BSWAP);
+    __m128i h3 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)h_powers[2]), BSWAP);
+    __m128i h4 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)h_powers[3]), BSWAP);
     __m128i y = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)y16), BSWAP);
 
     __m128i rk[15];
@@ -2128,10 +2182,12 @@ static void zan_aes_gcm_decrypt_ni_fused(const uint8_t rkb[15][16], int nr,
         __m128i in2 = _mm_loadu_si128((const __m128i*)(in + off + 32));
         __m128i in3 = _mm_loadu_si128((const __m128i*)(in + off + 48));
 
-        y = zan_ghash_step_clmul(y, _mm_shuffle_epi8(in0, BSWAP), b);
-        y = zan_ghash_step_clmul(y, _mm_shuffle_epi8(in1, BSWAP), b);
-        y = zan_ghash_step_clmul(y, _mm_shuffle_epi8(in2, BSWAP), b);
-        y = zan_ghash_step_clmul(y, _mm_shuffle_epi8(in3, BSWAP), b);
+        y = zan_ghash_4blocks_clmul(y,
+                                    _mm_shuffle_epi8(in0, BSWAP),
+                                    _mm_shuffle_epi8(in1, BSWAP),
+                                    _mm_shuffle_epi8(in2, BSWAP),
+                                    _mm_shuffle_epi8(in3, BSWAP),
+                                    h1, h2, h3, h4);
 
         _mm_storeu_si128((__m128i*)(out + off), _mm_xor_si128(in0, t0));
         _mm_storeu_si128((__m128i*)(out + off + 16), _mm_xor_si128(in1, t1));
@@ -2193,6 +2249,16 @@ int64_t zan_hw_aes_gcm_init(uint8_t *ctxBuf, int64_t ctxLen, const uint8_t *key,
     for (int i = 0; i < 16; i++) {
         ctx->h_bswap[i] = ctx->h16[15 - i];
     }
+
+    /* Precompute H^1 ... H^8 powers for parallel GHASH */
+    memcpy(ctx->h_powers[0], ctx->h16, 16);
+    for (int p = 1; p < 8; p++) {
+        uint8_t zero16_t[16] = {0};
+        uint8_t next[16];
+        memcpy(next, ctx->h_powers[p - 1], 16);
+        zan_hw_ghash_block(ctx->h16, zero16_t, next);
+        memcpy(ctx->h_powers[p], next, 16);
+    }
     return 0;
 }
 
@@ -2236,7 +2302,7 @@ int64_t zan_hw_aes_gcm_encrypt_ctx(const uint8_t *ctxBuf,
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
         if ((g_gate_aes == 1 || zan_hw_gate(&g_gate_aes, zan_hw_has_aesni(), zan_aes_kat)) &&
             (g_gate_ghash == 1 || zan_hw_gate(&g_gate_ghash, zan_hw_has_pclmul(), zan_ghash_kat))) {
-            zan_aes_gcm_encrypt_ni_fused(ctx->rkb, ctx->nr, ctx->h16, in, inLen, ctr, out, y16);
+            zan_aes_gcm_encrypt_ni_fused(ctx->rkb, ctx->nr, ctx->h_powers, in, inLen, ctr, out, y16);
         } else if (g_gate_aes == 1 || zan_hw_gate(&g_gate_aes, zan_hw_has_aesni(), zan_aes_kat)) {
             zan_aes_ctr_ni_4way(ctx->rkb, ctx->nr, in, inLen, ctr, out);
             if (zan_hw_ghash_update(ctx->h16, out, inLen, y16) != 0) return -1;
@@ -2306,7 +2372,7 @@ int64_t zan_hw_aes_gcm_decrypt_ctx(const uint8_t *ctxBuf,
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
         if ((g_gate_aes == 1 || zan_hw_gate(&g_gate_aes, zan_hw_has_aesni(), zan_aes_kat)) &&
             (g_gate_ghash == 1 || zan_hw_gate(&g_gate_ghash, zan_hw_has_pclmul(), zan_ghash_kat))) {
-            zan_aes_gcm_decrypt_ni_fused(ctx->rkb, ctx->nr, ctx->h16, in, inLen, ctr, out, y16);
+            zan_aes_gcm_decrypt_ni_fused(ctx->rkb, ctx->nr, ctx->h_powers, in, inLen, ctr, out, y16);
             did_fused = 1;
         } else {
             if (zan_hw_ghash_update(ctx->h16, in, inLen, y16) != 0) return -1;
@@ -3904,40 +3970,35 @@ static void zan_mont_mul_core(const uint64_t *a, const uint64_t *b, const uint64
     }
 }
 
-int64_t zan_hw_rsa_mod_pow(const uint8_t *base, int64_t bLen,
-                           const uint8_t *exp, int64_t eLen,
-                           const uint8_t *mod, int64_t mLen,
-                           uint8_t *out) {
-    if (!base || !exp || !mod || !out) return -1;
-    if (mLen <= 0 || mLen > 512) return -1;
-    if ((mod[mLen - 1] & 1) == 0) return -1; /* Modulus must be odd */
+typedef struct {
+    int k;
+    uint64_t n[66];
+    uint64_t n0_inv;
+    uint64_t r_mod_n[66];
+    uint64_t r2_mod_n[66];
+} zan_mont_ctx_t;
 
+static int zan_mont_ctx_init(zan_mont_ctx_t *ctx, const uint8_t *mod, int64_t mLen) {
+    if (!ctx || !mod || mLen <= 0 || mLen > 512) return -1;
+    if ((mod[mLen - 1] & 1) == 0) return -1; /* Modulus must be odd */
     int k = (int)((mLen + 7) / 8);
     if (k <= 0 || k > 64) return -1;
+    ctx->k = k;
+    memset(ctx->n, 0, sizeof(ctx->n));
+    memset(ctx->r_mod_n, 0, sizeof(ctx->r_mod_n));
+    memset(ctx->r2_mod_n, 0, sizeof(ctx->r2_mod_n));
+    zan_load_be64_limbs(mod, mLen, ctx->n, k);
 
-    uint64_t n[66] = {0};
-    uint64_t g[66] = {0};
-    uint64_t e[66] = {0};
-    zan_load_be64_limbs(mod, mLen, n, k);
-    zan_load_be64_limbs(base, bLen, g, k);
-
-    int e_k = (int)((eLen + 7) / 8);
-    if (e_k > 64) e_k = 64;
-    zan_load_be64_limbs(exp, eLen, e, e_k);
-
-    /* Montgomery n0_inv = -n[0]^{-1} mod 2^64 */
     uint64_t inv = 1;
-    uint64_t n0 = n[0];
+    uint64_t n0 = ctx->n[0];
     for (int i = 0; i < 6; i++) {
         inv = inv * (2 - n0 * inv);
     }
-    uint64_t n0_inv = (uint64_t)(-(int64_t)inv);
+    ctx->n0_inv = (uint64_t)(-(int64_t)inv);
 
-    /* Compute R mod n and R^2 mod n via repeated doubling */
     uint64_t x[66] = {0};
     x[0] = 1;
     int total_doubles = 64 * k * 2;
-    uint64_t r_mod_n[66] = {0};
     for (int d = 1; d <= total_doubles; d++) {
         uint64_t carry = 0;
         for (int i = 0; i < k; i++) {
@@ -3948,7 +4009,7 @@ int64_t zan_hw_rsa_mod_pow(const uint8_t *base, int64_t bLen,
         uint64_t borrow = 0;
         uint64_t sub[66];
         for (int i = 0; i < k; i++) {
-            zan_u128_t ni_b = (zan_u128_t)n[i] + borrow;
+            zan_u128_t ni_b = (zan_u128_t)ctx->n[i] + borrow;
             borrow = (x[i] < ni_b) ? 1 : 0;
             sub[i] = (uint64_t)(x[i] - ni_b);
         }
@@ -3956,25 +4017,28 @@ int64_t zan_hw_rsa_mod_pow(const uint8_t *base, int64_t bLen,
             for (int i = 0; i < k; i++) x[i] = sub[i];
         }
         if (d == 64 * k) {
-            for (int i = 0; i < k; i++) r_mod_n[i] = x[i];
+            for (int i = 0; i < k; i++) ctx->r_mod_n[i] = x[i];
         }
     }
+    for (int i = 0; i < k; i++) ctx->r2_mod_n[i] = x[i];
+    return 0;
+}
 
-    /* Table for 4-bit window: table[w] = baseM^w in Montgomery form */
+static void zan_mont_exp_ctx(const zan_mont_ctx_t *ctx, const uint64_t *base_limbs,
+                             const uint64_t *exp_limbs, int e_k, uint64_t *out_limbs) {
+    int k = ctx->k;
     uint64_t table[16][66];
-    for (int i = 0; i < k; i++) {
-        table[0][i] = r_mod_n[i];
-    }
-    zan_mont_mul_core(g, x, n, n0_inv, k, table[1]);
+    for (int i = 0; i < k; i++) table[0][i] = ctx->r_mod_n[i];
+
+    zan_mont_mul_core(base_limbs, ctx->r2_mod_n, ctx->n, ctx->n0_inv, k, table[1]);
     for (int w = 2; w < 16; w++) {
-        zan_mont_mul_core(table[w - 1], table[1], n, n0_inv, k, table[w]);
+        zan_mont_mul_core(table[w - 1], table[1], ctx->n, ctx->n0_inv, k, table[w]);
     }
 
-    /* Find bit length of exponent */
     int bitlen = 0;
     for (int i = e_k - 1; i >= 0; i--) {
-        if (e[i] != 0) {
-            bitlen = i * 64 + (64 - __builtin_clzll(e[i]));
+        if (exp_limbs[i] != 0) {
+            bitlen = i * 64 + (64 - __builtin_clzll(exp_limbs[i]));
             break;
         }
     }
@@ -3986,18 +4050,18 @@ int64_t zan_hw_rsa_mod_pow(const uint8_t *base, int64_t bLen,
         int bit_pos = w_idx * 4;
         int limb_idx = bit_pos / 64;
         int bit_offset = bit_pos % 64;
-        uint32_t val = (uint32_t)((e[limb_idx] >> bit_offset) & 0xF);
+        uint32_t val = (uint32_t)((exp_limbs[limb_idx] >> bit_offset) & 0xF);
         if (bit_offset > 60 && limb_idx + 1 < e_k) {
-            val |= (uint32_t)((e[limb_idx + 1] << (64 - bit_offset)) & 0xF);
+            val |= (uint32_t)((exp_limbs[limb_idx + 1] << (64 - bit_offset)) & 0xF);
         }
 
         if (started) {
-            zan_mont_mul_core(result, result, n, n0_inv, k, result);
-            zan_mont_mul_core(result, result, n, n0_inv, k, result);
-            zan_mont_mul_core(result, result, n, n0_inv, k, result);
-            zan_mont_mul_core(result, result, n, n0_inv, k, result);
+            zan_mont_mul_core(result, result, ctx->n, ctx->n0_inv, k, result);
+            zan_mont_mul_core(result, result, ctx->n, ctx->n0_inv, k, result);
+            zan_mont_mul_core(result, result, ctx->n, ctx->n0_inv, k, result);
+            zan_mont_mul_core(result, result, ctx->n, ctx->n0_inv, k, result);
             if (val > 0) {
-                zan_mont_mul_core(result, table[val], n, n0_inv, k, result);
+                zan_mont_mul_core(result, table[val], ctx->n, ctx->n0_inv, k, result);
             }
         } else {
             if (val > 0) {
@@ -4008,14 +4072,181 @@ int64_t zan_hw_rsa_mod_pow(const uint8_t *base, int64_t bLen,
     }
 
     if (!started) {
-        for (int i = 0; i < k; i++) result[i] = r_mod_n[i];
+        for (int i = 0; i < k; i++) result[i] = ctx->r_mod_n[i];
     }
 
     uint64_t one[66] = {0};
     one[0] = 1;
-    zan_mont_mul_core(result, one, n, n0_inv, k, result);
+    zan_mont_mul_core(result, one, ctx->n, ctx->n0_inv, k, out_limbs);
+}
+
+int64_t zan_hw_rsa_mod_pow(const uint8_t *base, int64_t bLen,
+                           const uint8_t *exp, int64_t eLen,
+                           const uint8_t *mod, int64_t mLen,
+                           uint8_t *out) {
+    if (!base || !exp || !mod || !out) return -1;
+    zan_mont_ctx_t ctx;
+    if (zan_mont_ctx_init(&ctx, mod, mLen) != 0) return -1;
+    int k = ctx.k;
+
+    uint64_t g[66] = {0};
+    zan_load_be64_limbs(base, bLen, g, k);
+
+    int e_k = (int)((eLen + 7) / 8);
+    if (e_k > 64) e_k = 64;
+    uint64_t e[66] = {0};
+    zan_load_be64_limbs(exp, eLen, e, e_k);
+
+    uint64_t result[66] = {0};
+    zan_mont_exp_ctx(&ctx, g, e, e_k, result);
 
     zan_store_be64_limbs(result, k, out, mLen);
+    return 0;
+}
+
+static int zan_limbs_cmp(const uint64_t *a, const uint64_t *b, int k) {
+    for (int i = k - 1; i >= 0; i--) {
+        if (a[i] > b[i]) return 1;
+        if (a[i] < b[i]) return -1;
+    }
+    return 0;
+}
+
+static uint64_t zan_limbs_sub(uint64_t *res, const uint64_t *a, const uint64_t *b, int k) {
+    uint64_t borrow = 0;
+    for (int i = 0; i < k; i++) {
+        zan_u128_t bi = (zan_u128_t)b[i] + borrow;
+        borrow = (a[i] < bi) ? 1 : 0;
+        res[i] = (uint64_t)(a[i] - bi);
+    }
+    return borrow;
+}
+
+static uint64_t zan_limbs_add(uint64_t *res, const uint64_t *a, const uint64_t *b, int k) {
+    uint64_t carry = 0;
+    for (int i = 0; i < k; i++) {
+        zan_u128_t sum = (zan_u128_t)a[i] + b[i] + carry;
+        res[i] = (uint64_t)sum;
+        carry = (uint64_t)(sum >> 64);
+    }
+    return carry;
+}
+
+int64_t zan_hw_rsa_crt(const uint8_t *msg, int64_t mLen,
+                       const uint8_t *p, int64_t pLen,
+                       const uint8_t *q, int64_t qLen,
+                       const uint8_t *dp, int64_t dpLen,
+                       const uint8_t *dq, int64_t dqLen,
+                       const uint8_t *qinv, int64_t qinvLen,
+                       uint8_t *out, int64_t outLen) {
+    if (!msg || !p || !q || !dp || !dq || !qinv || !out) return -1;
+    if (mLen <= 0 || pLen <= 0 || qLen <= 0) return -1;
+    if (pLen > 256 || qLen > 256) return -1;
+
+    zan_mont_ctx_t ctx_p, ctx_q;
+    if (zan_mont_ctx_init(&ctx_p, p, pLen) != 0) return -1;
+    if (zan_mont_ctx_init(&ctx_q, q, qLen) != 0) return -1;
+
+    int k = ctx_p.k;
+    if (ctx_q.k != k) return -1;
+
+    // Load 2k limbs of msg
+    uint64_t m_limbs[66] = {0};
+    zan_load_be64_limbs(msg, mLen, m_limbs, 2 * k);
+
+    const uint64_t *m_low = m_limbs;
+    const uint64_t *m_high = m_limbs + k;
+
+    // m_p = (m_high * R + m_low) mod p
+    uint64_t t1[66] = {0};
+    zan_mont_mul_core(m_high, ctx_p.r2_mod_n, ctx_p.n, ctx_p.n0_inv, k, t1);
+    uint64_t m_p[66] = {0};
+    uint64_t carry_p = zan_limbs_add(m_p, t1, m_low, k);
+    if (carry_p > 0) {
+        zan_limbs_add(m_p, m_p, ctx_p.r_mod_n, k);
+    }
+    while (zan_limbs_cmp(m_p, ctx_p.n, k) >= 0) {
+        zan_limbs_sub(m_p, m_p, ctx_p.n, k);
+    }
+
+    // m_q = (m_high * R + m_low) mod q
+    zan_mont_mul_core(m_high, ctx_q.r2_mod_n, ctx_q.n, ctx_q.n0_inv, k, t1);
+    uint64_t m_q[66] = {0};
+    uint64_t carry_q = zan_limbs_add(m_q, t1, m_low, k);
+    if (carry_q > 0) {
+        zan_limbs_add(m_q, m_q, ctx_q.r_mod_n, k);
+    }
+    while (zan_limbs_cmp(m_q, ctx_q.n, k) >= 0) {
+        zan_limbs_sub(m_q, m_q, ctx_q.n, k);
+    }
+
+    // s1 = m_p^dp mod p
+    int dp_k = (int)((dpLen + 7) / 8);
+    if (dp_k > 64) dp_k = 64;
+    uint64_t dp_limbs[66] = {0};
+    zan_load_be64_limbs(dp, dpLen, dp_limbs, dp_k);
+    uint64_t s1[66] = {0};
+    zan_mont_exp_ctx(&ctx_p, m_p, dp_limbs, dp_k, s1);
+
+    // s2 = m_q^dq mod q
+    int dq_k = (int)((dqLen + 7) / 8);
+    if (dq_k > 64) dq_k = 64;
+    uint64_t dq_limbs[66] = {0};
+    zan_load_be64_limbs(dq, dqLen, dq_limbs, dq_k);
+    uint64_t s2[66] = {0};
+    zan_mont_exp_ctx(&ctx_q, m_q, dq_limbs, dq_k, s2);
+
+    // Garner recombination:
+    // s2_p = s2 mod p
+    uint64_t s2_p[66];
+    for (int i = 0; i < k; i++) s2_p[i] = s2[i];
+    if (zan_limbs_cmp(s2_p, ctx_p.n, k) >= 0) {
+        zan_limbs_sub(s2_p, s2_p, ctx_p.n, k);
+    }
+
+    // diff = (s1 - s2_p) mod p
+    uint64_t diff[66];
+    if (zan_limbs_cmp(s1, s2_p, k) >= 0) {
+        zan_limbs_sub(diff, s1, s2_p, k);
+    } else {
+        zan_limbs_sub(diff, s2_p, s1, k);
+        zan_limbs_sub(diff, ctx_p.n, diff, k);
+    }
+
+    // h = (diff * qinv) mod p
+    uint64_t qinv_limbs[66] = {0};
+    zan_load_be64_limbs(qinv, qinvLen, qinv_limbs, k);
+
+    uint64_t tmp[66] = {0};
+    zan_mont_mul_core(diff, qinv_limbs, ctx_p.n, ctx_p.n0_inv, k, tmp);
+    uint64_t h[66] = {0};
+    zan_mont_mul_core(tmp, ctx_p.r2_mod_n, ctx_p.n, ctx_p.n0_inv, k, h);
+
+    // s = s2 + h * q
+    uint64_t s[66] = {0};
+    for (int i = 0; i < k; i++) {
+        uint64_t hi = h[i];
+        uint64_t carry = 0;
+        for (int j = 0; j < k; j++) {
+            zan_u128_t prod = (zan_u128_t)s[i + j] + (zan_u128_t)hi * ctx_q.n[j] + carry;
+            s[i + j] = (uint64_t)prod;
+            carry = (uint64_t)(prod >> 64);
+        }
+        s[i + k] += carry;
+    }
+    uint64_t carry = 0;
+    for (int i = 0; i < k; i++) {
+        zan_u128_t sum = (zan_u128_t)s[i] + s2[i] + carry;
+        s[i] = (uint64_t)sum;
+        carry = (uint64_t)(sum >> 64);
+    }
+    for (int i = k; carry > 0 && i < 2 * k; i++) {
+        zan_u128_t sum = (zan_u128_t)s[i] + carry;
+        s[i] = (uint64_t)sum;
+        carry = (uint64_t)(sum >> 64);
+    }
+
+    zan_store_be64_limbs(s, 2 * k, out, outLen);
     return 0;
 }
 

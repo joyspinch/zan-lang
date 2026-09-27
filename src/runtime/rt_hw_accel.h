@@ -78,6 +78,7 @@ typedef struct {
     uint8_t h16[16];
     uint8_t rkb[15][16];
     uint8_t h_bswap[16];
+    uint8_t h_powers[8][16]; /* H^1, H^2, H^3, H^4, H^5, H^6, H^7, H^8 */
 } zan_gcm_ctx_t;
 #pragma pack(pop)
 
@@ -112,6 +113,18 @@ int64_t zan_hw_rsa_mod_pow(const uint8_t *base, int64_t bLen,
                            const uint8_t *exp, int64_t eLen,
                            const uint8_t *mod, int64_t mLen,
                            uint8_t *out);
+
+/* RSA Chinese Remainder Theorem (CRT) modular exponentiation:
+ * evaluates s1 = m^dp mod p, s2 = m^dq mod q, and recombines via Garner's algorithm:
+ * h = (s1 - s2) * qinv mod p, s = s2 + h * q.
+ * Returns 0 on success, -1 otherwise. */
+int64_t zan_hw_rsa_crt(const uint8_t *msg, int64_t mLen,
+                       const uint8_t *p, int64_t pLen,
+                       const uint8_t *q, int64_t qLen,
+                       const uint8_t *dp, int64_t dpLen,
+                       const uint8_t *dq, int64_t dqLen,
+                       const uint8_t *qinv, int64_t qinvLen,
+                       uint8_t *out, int64_t outLen);
 
 /* RFC 7748 X25519 constant-time Diffie-Hellman scalar multiplication:
  * computes scalar * point -> out (all 32 bytes little-endian).

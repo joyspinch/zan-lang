@@ -13,23 +13,47 @@ class RsaKey {
     byte[] modulus;
     byte[] publicExponent;
     byte[] privateExponent;
+    byte[] prime1;
+    byte[] prime2;
+    byte[] exponent1;
+    byte[] exponent2;
+    byte[] coefficient;
     int modulusLength;
     int publicExponentLength;
     int privateExponentLength;
+    int prime1Length;
+    int prime2Length;
+    int exponent1Length;
+    int exponent2Length;
+    int coefficientLength;
+    bool hasCrt;
 
     RsaKey() {
         this.modulus = null;
         this.publicExponent = null;
         this.privateExponent = null;
+        this.prime1 = null;
+        this.prime2 = null;
+        this.exponent1 = null;
+        this.exponent2 = null;
+        this.coefficient = null;
         this.modulusLength = 0;
         this.publicExponentLength = 0;
         this.privateExponentLength = 0;
+        this.prime1Length = 0;
+        this.prime2Length = 0;
+        this.exponent1Length = 0;
+        this.exponent2Length = 0;
+        this.coefficientLength = 0;
+        this.hasCrt = false;
     }
 
     /// 模数长度（字节），即签名/密文长度。
     int ModulusLength() { return this.modulusLength; }
     /// 是否含私钥指数（public key 时为 false，不能 Sign/Decrypt）。
     bool HasPrivateKey() { return this.privateExponentLength > 0; }
+    /// 是否具有完整 CRT 分量（p, q, dp, dq, qinv），可走 4 倍硬件加速模幂。
+    bool HasCrt() { return this.hasCrt; }
 
     /// 从 `from` 起查找子串首次出现，找不到返回 -1。
     static int Find(string hay, string needle, int from) {
@@ -118,7 +142,7 @@ class RsaKey {
         return bytes;
     }
 
-    /// 解析 PKCS#1 RSAPrivateKey（读 version/n/e/d；CRT 分量不读取）。
+    /// 解析 PKCS#1 RSAPrivateKey（包含 version/n/e/d 及 CRT 分量 p/q/dp/dq/qinv）。
     /// 结构不符返回 null。
     static RsaKey ParsePkcs1Private(string der, int offset) {
         List<int> c = new List<int>(); c.Add(offset);
@@ -135,6 +159,22 @@ class RsaKey {
         key.privateExponentLength = len[0];
         if (key.modulus == null || key.publicExponent == null
             || key.privateExponent == null) { return null; }
+
+        // 解析 CRT 五分量（若存在）
+        key.prime1 = RsaKey.ReadIntegerSafe(der, c, len);
+        key.prime1Length = len[0];
+        key.prime2 = RsaKey.ReadIntegerSafe(der, c, len);
+        key.prime2Length = len[0];
+        key.exponent1 = RsaKey.ReadIntegerSafe(der, c, len);
+        key.exponent1Length = len[0];
+        key.exponent2 = RsaKey.ReadIntegerSafe(der, c, len);
+        key.exponent2Length = len[0];
+        key.coefficient = RsaKey.ReadIntegerSafe(der, c, len);
+        key.coefficientLength = len[0];
+        if (key.prime1 != null && key.prime2 != null && key.exponent1 != null
+            && key.exponent2 != null && key.coefficient != null) {
+            key.hasCrt = true;
+        }
         return key;
     }
 
@@ -237,8 +277,19 @@ class RsaKey {
     }
 
     /// RSA PKCS#1 v1.5 SHA-256 签名，返回原始字节数组。无私钥时返回 null。
+    /// 当私钥包含 CRT 分量时自动走 4 倍硬件加速模幂。
     byte[] SignSha256Raw(string message) {
         if (!this.HasPrivateKey()) { return null; }
+        if (this.hasCrt) {
+            return Rsa.SignPkcs1Sha256Crt(message, message.Length,
+                this.modulus, this.modulusLength,
+                this.privateExponent, this.privateExponentLength,
+                this.prime1, this.prime1Length,
+                this.prime2, this.prime2Length,
+                this.exponent1, this.exponent1Length,
+                this.exponent2, this.exponent2Length,
+                this.coefficient, this.coefficientLength);
+        }
         return Rsa.SignPkcs1Sha256(message, message.Length,
             this.modulus, this.modulusLength,
             this.privateExponent, this.privateExponentLength);
@@ -247,9 +298,8 @@ class RsaKey {
     /// RSA PKCS#1 v1.5 SHA-256 签名，返回 Base64。无私钥时返回空串。
     string SignSha256(string message) {
         if (!this.HasPrivateKey()) { return ""; }
-        byte[] sig = Rsa.SignPkcs1Sha256(message, message.Length,
-            this.modulus, this.modulusLength,
-            this.privateExponent, this.privateExponentLength);
+        byte[] sig = this.SignSha256Raw(message);
+        if (sig == null) { return ""; }
         return Base64.Encode(sig, this.modulusLength);
     }
 
