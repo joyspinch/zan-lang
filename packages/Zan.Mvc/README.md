@@ -168,10 +168,20 @@ ZanTable 硬约定优先）。方法名不得与在用的类型同名（Blog 回
   dbDown 的呈现只住在 AdminController。
 - 模板按名绑定、值恒为字符串（ViewData/List&lt;StrMap&gt; 契约，Zan 编译期
   静态、无运行时按名字段访问），查出的实体必须投影成行才能进模板。
-  投影统一走 `Rows.Of&lt;T&gt;(rows, delegate(T c, StrMap row) { … }, items)`
-  （Framework/Rows），字段格式化（Fmt.*）与行内徽章（canXxx）在委托内
-  完成——for/索引/Add 样板不再出现在控制器里。"查出实体直接进模板"
-  需要编译期字段表 + 引擎按名取值，属引擎演进项，当前不做手工绕道。
+  但投影**不随查询点重复**：字段→键的映射在实体上声明一次——实体实现
+  `RowView.ToRow(StrMap)`（Zan 泛型约束 `where T : RowView`），
+  控制器一行 `Rows.Project(rows, items)` 成行（Framework/Rows）。
+  键的归属三层判定：
+  1. **实体键进 ToRow**——自有字段、确定性呈现（Fmt.* 格式化、状态
+     文案、`nextXxx` 翻转键、勾选态、空值 —）；同类屏共用同一键集并集。
+  2. **跨表组合与请求键留控制器**——部门名/角色名/计数等他表数据、
+     权限位（`canXxx`）、当前选中（`active`）在 Project 之后补
+     `row.Set`；需要覆写链路键（如修订行回链文档 id）时显式 Set 覆盖。
+  3. **没有实体的行是构造不是转换**——下拉选项、聚合行、权限矩阵、
+     文档路由表直接 `new StrMap()` 字面构造，不设实体不进 ToRow。
+  表设计器生成的实体由 `Gen.ModelSource` 直接产出 `RowView.ToRow`，
+  生成控制器同样一行 Project。"实体直接进模板"的引擎化（编译期字段表
+  + 引擎按名取值）仍是演进项，当前契约以实体自述投影为终点。
 
 ### 呈现格式化一律 Fmt.*
 

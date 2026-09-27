@@ -70,10 +70,10 @@ class Gen {
     /* 生成实体类源码。 */
     static string ModelSource(SysGenTable t, List<SysGenColumn> cols) {
         StringBuilder b = new StringBuilder();
-        b.Append("using System.Data.Orm;\n\nnamespace ZanWeb.Model.Gen;\n\n");
+        b.Append("using System;\nusing System.Data.Orm;\nusing ZanWeb.Web;\n\nnamespace ZanWeb.Model.Gen;\n\n");
         b.Append("/// <summary>" + t.title + "。由表设计器生成，可直接修改。</summary>\n");
         b.Append("[Table(Name = \"" + t.tableName + "\")]\n");
-        b.Append("class " + t.entityName + " {\n");
+        b.Append("class " + t.entityName + " : RowView {\n");
         b.Append("    [Column(IsIdentity = true)]\n    int id;\n");
         for (int i = 0; i < cols.Count; i = i + 1) {
             SysGenColumn c = cols[i];
@@ -88,6 +88,36 @@ class Gen {
             }
             b.Append("    " + Gen.ZanType(c.kind) + " " + c.name + ";\n");
         }
+        /* 视图行自述投影：管理列表与前台列表的键集并集，datetime 出人读日。 */
+        b.Append("\n    public void ToRow(StrMap row) {\n");
+        b.Append("        row.Set(\"id\", Convert.ToString(this.id));\n");
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            SysGenColumn c = cols[i];
+            if (c.name == "id" || c.inList != 1) { continue; }
+            if (c.kind == "datetime") {
+                b.Append("        row.Set(\"" + c.name
+                    + "\", Fmt.Day(this." + c.name + "));\n");
+            } else if (c.kind == "bool") {
+                b.Append("        if (this." + c.name
+                    + " == 1) { row.Set(\"" + c.name + "\", \"1\"); }\n");
+            } else if (Gen.ZanType(c.kind) == "string") {
+                b.Append("        row.Set(\"" + c.name + "\", this."
+                    + c.name + ");\n");
+            } else {
+                b.Append("        row.Set(\"" + c.name
+                    + "\", Convert.ToString(this." + c.name + "));\n");
+            }
+        }
+        /* 第一个 text/长文本出摘要；没有就不出。 */
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            SysGenColumn c = cols[i];
+            if (c.kind == "text" && c.name != "id") {
+                b.Append("        row.Set(\"summary\", Prose.Excerpt(this."
+                    + c.name + ", 120));\n");
+                break;
+            }
+        }
+        b.Append("    }\n");
         b.Append("}\n");
         return b.ToString();
     }
@@ -169,21 +199,7 @@ class Gen {
         b.Append("            .OrderByDescending(a => a.id)\n");
         b.Append("            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();\n");
         b.Append("        List<StrMap> items = d.AddList(\"rows\");\n");
-        b.Append("        for (int i = 0; i < rows.Count; i = i + 1) {\n");
-        b.Append("            " + mdl + " e = rows[i];\n");
-        b.Append("            StrMap row = new StrMap();\n");
-        b.Append("            row.Set(\"id\", Convert.ToString(e.id));\n");
-        for (int i = 0; i < cols.Count; i = i + 1) {
-            SysGenColumn c = cols[i];
-            if (c.name == "id" || c.inList != 1) { continue; }
-            if (Gen.ZanType(c.kind) == "string") {
-                b.Append("            row.Set(\"" + c.name + "\", e." + c.name + ");\n");
-            } else {
-                b.Append("            row.Set(\"" + c.name
-                    + "\", Convert.ToString(e." + c.name + "));\n");
-            }
-        }
-        b.Append("            items.Add(row);\n        }\n");
+        b.Append("        Rows.Project(rows, items);\n");
         b.Append("        string path = this.Ctx().path;\n");
         b.Append("        bool canUpdate = await this.Can(PermBit.Update);\n");
         b.Append("        bool canDelete = await this.Can(PermBit.Delete);\n");
@@ -482,38 +498,7 @@ class Gen {
         b.Append("        d.Set(\"kw\", kw);\n");
         b.Append("        d.Set(\"total\", Convert.ToString(total));\n");
         b.Append("        List<StrMap> items = d.AddList(\"rows\");\n");
-        b.Append("        for (int i = 0; i < rows.Count; i = i + 1) {\n");
-        b.Append("            " + mdl + " e = rows[i];\n");
-        b.Append("            StrMap row = new StrMap();\n");
-        b.Append("            row.Set(\"id\", Convert.ToString(e.id));\n");
-        for (int i = 0; i < cols.Count; i = i + 1) {
-            SysGenColumn c = cols[i];
-            if (c.name == "id" || c.inList != 1
-                || !Gen.FrontTextual(c.kind)) { continue; }
-            if (c.kind == "datetime") {
-                b.Append("            row.Set(\"" + c.name
-                    + "\", Fmt.Day(e." + c.name + "));\n");
-            } else if (c.kind == "bool") {
-                b.Append("            if (e." + c.name
-                    + " == 1) { row.Set(\"" + c.name + "\", \"1\"); }\n");
-            } else if (Gen.ZanType(c.kind) == "string") {
-                b.Append("            row.Set(\"" + c.name + "\", e."
-                    + c.name + ");\n");
-            } else {
-                b.Append("            row.Set(\"" + c.name
-                    + "\", Convert.ToString(e." + c.name + "));\n");
-            }
-        }
-        /* 第一个 text/长文本列出摘要；没有就不出。 */
-        for (int i = 0; i < cols.Count; i = i + 1) {
-            SysGenColumn c = cols[i];
-            if (c.kind == "text" && c.name != "id") {
-                b.Append("            row.Set(\"summary\", Prose.Excerpt(e."
-                    + c.name + ", 120));\n");
-                break;
-            }
-        }
-        b.Append("            items.Add(row);\n        }\n");
+        b.Append("        Rows.Project(rows, items);\n");
         b.Append("        if (rows.Count == 0) { d.Set(\"empty\", \"1\"); }\n");
         b.Append("        int pages = (total + " + cls
             + ".PageSize - 1) / " + cls + ".PageSize;\n");
