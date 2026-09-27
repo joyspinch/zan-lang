@@ -99,7 +99,7 @@ HTTP 仍是 200，页面渲染成 `<!-- view not found -->` 注释，冒烟只�
 
 **控制器一律 `XxxController`**：类名与文件名都带 `Controller` 后缀（`LoginController.zan`/`class LoginController`），一眼分清控制器；URL 不带——约定模板禁用 `[controller]`（类名进了 URL：类加后缀 URL 就跟着烂），一律写显式前缀（`api/data/[action]`）。视图键由类名派生，类加后缀=视图资产同提交改名。
 
-**屏 slug 与类名同构**：URL 末段（屏 slug）= 类名去 `Sys` 前缀与 `Controller` 后缀小写
+**屏 slug 与类名直译**：URL 末段（屏 slug）= 类名去 `Controller` 后缀小写，无任何前缀换算——域语义由 URL 的模块段承担（`system/jobs` ↔ `System/JobsController`），控制器类名不再叠 `Sys` 前缀；`sys_`/`blog_` 域前缀只属于数据层（实体/Dao/表），不上屏
 （`SysUsers`→`users`）；模块自名屏类名 = 目录名（`Admin/Media/Media.zan`
 ↔ `/admin/media`）。类名同时锚定文件名与视图文件名——改一处必须四处
 （文件、类、视图资产、引用）同一提交搬完。不同构时**改类名就 URL**：
