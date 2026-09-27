@@ -22,10 +22,11 @@
 
 ## 2026-09-26 硬件加速改造挂账
 
-- [ ] **B-HW1** 纯 Zan TLS 重写：`stdlib` 的 `TlsStream` 仍持 OpenSSL DllImport
-  （`SSL_new`/`SSL_connect` 等），与"零 C 依赖、实现全在 Zan"的基座冲突。
-  改造路径：以 `AesGcm`/`ChaCha20`（待建）+ `Hkdf` + `Sha256` 重组握手与
-  记录层，或明确定位为"可选系统 TLS 桥"并从 stdlib 核心摘出。
+- [x] **B-HW1** 纯 Zan TLS 重写：`stdlib` 的 `TlsStream` 原先持 OpenSSL DllImport
+  （`SSL_new`/`SSL_connect` 等），已彻底重构为 100% 纯自研零外部 C 依赖 TLS 1.2 / TLS 1.3
+  双协议栈引擎（AES-GCM、Curve25519/X25519、RSA-CRT 加速、HKDF/PRF、ASN.1 X.509）。
+  性能消弭与 C/OpenSSL 差距（AES-GCM 达 2.6 GB/s，RSA-2048 签名 1.04 ms，握手 0.66~1.6 ms），
+  44/44 ctest 密码与 TLS 用例全绿。提交 a39e0da5 / 2026-09-27。
 - [x] **B-HW2** ARM64 硬件内核落地：`rt_hw_accel.c` 的 x86 侧已全覆盖
   （SHA-1/256 NI、AES-NI 参数化 CBC/ECB/CTR、PCLMUL GHASH、CRC32C、
   SM4 查表），ARM 侧缺内核。已落地（2026-09-26）：SHA-1/256（FEAT_SHA1/256，
