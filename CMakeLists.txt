@@ -847,6 +847,36 @@ add_test(NAME diag_void_value
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_void_value PROPERTIES TIMEOUT 60)
 
+# `virtual` on a derived method opens a NEW slot (it hides the base body):
+# dispatch through a base-typed reference keeps running the base
+# implementation, so a framework hook declared `virtual` instead of
+# `override` silently never runs (the never-released-pool-lease site-wide
+# hang shape). The checker warns; --deny-warnings turns the warning into
+# this case's compile failure.
+add_test(NAME diag_virtual_hides_inherited_virtual
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/virtual_hides_inherited_virtual.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_virtual_hides_inherited_virtual${_exe_ext}
+    "-DZANC_ARGS=--deny-warnings"
+    "-DEXPECT_REGEX=hides an inherited virtual"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_virtual_hides_inherited_virtual PROPERTIES TIMEOUT 60)
+
+# The positive face of the same rule: `override` fills the base slot and a
+# same-name different-arity method is a plain overload -- neither may trip
+# the hidden-virtual warning, so this compiles and runs even under
+# --deny-warnings.
+add_test(NAME diag_virtual_override_overload_clean
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/virtual_override_overload_clean.zan
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/diag/virtual_override_overload_clean.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_virtual_override_overload_clean${_exe_ext}
+    "-DZANC_ARGS=--deny-warnings"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(diag_virtual_override_overload_clean PROPERTIES TIMEOUT 60)
+
 # A complete object initializer builds the object itself, so it may stand in
 # for the parameterless constructor the class does not have; a partial one
 # leaves the members it skips zero-filled and must still be rejected.
