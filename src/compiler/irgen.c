@@ -3267,6 +3267,10 @@ void zan_irgen_destroy(zan_irgen_t *g) {
     free(g->extern_fns);
     g->extern_fns = NULL;
     g->extern_fn_count = g->extern_fn_cap = 0;
+    for (int i = 0; i < g->abi_pending_count; i++) free(g->abi_pending[i]);
+    free(g->abi_pending);
+    g->abi_pending = NULL;
+    g->abi_pending_count = g->abi_pending_cap = 0;
     free(g->obf_literals);
     g->obf_literals = NULL;
     g->obf_literal_count = g->obf_literal_cap = 0;

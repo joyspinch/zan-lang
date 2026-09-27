@@ -897,6 +897,21 @@ add_test(NAME diag_async_aggregate_return
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_async_aggregate_return PROPERTIES TIMEOUT 60)
 
+# wasm32 has no C ABI classification for aggregates crossing an extern
+# boundary. Declaring one must stay legal (stdlib SIMD headers get pulled
+# into compiles that never call them -- the declaration used to hard-error
+# and broke conformance_wasm32_file_io_in_try); only a real CALL is the
+# reportable offense (abi_pending_report in irgen_abi.c).
+add_test(NAME diag_wasm32_struct_extern_call
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/wasm32_struct_extern_call.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_wasm32_struct_extern_call
+    "-DZANC_ARGS=--target;wasm32"
+    "-DEXPECT_REGEX=call to extern 'Load' passes a struct by value, which has no C ABI classification"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_wasm32_struct_extern_call PROPERTIES TIMEOUT 120)
+
 # Regression (A276): a class with no constructor silently discarded the
 # arguments of `new C(args)` instead of reporting the arity mismatch.
 add_test(NAME diag_ctor_arg_count

@@ -720,6 +720,14 @@ struct zan_irgen {
     } *extern_fns;
     int extern_fn_count;
     int extern_fn_cap;
+    /* FFI on targets with no aggregate C ABI classification (wasm32 etc.):
+     * externs whose Zan signature carries a struct are declared plain and
+     * remembered here; only a real CALL errors (abi_pending_report in
+     * irgen_abi.c) -- merely pulling a stdlib file that declares one must
+     * not fail the whole compile. */
+    char **abi_pending;
+    int abi_pending_count;
+    int abi_pending_cap;
 
     /* Per-thread exception-handling state (see irgen_builtins.c). The block
      * pointer and the field addresses derived from it are materialized once

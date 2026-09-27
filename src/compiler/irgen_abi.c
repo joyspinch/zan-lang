@@ -391,6 +391,50 @@ static LLVMValueRef abi_byte_ptr(zan_irgen_t *g, LLVMValueRef base,
 /* Declare `name` with the platform C signature and wrap it in an internal
  * thunk that keeps the Zan-level signature `zan_ft`. Returns NULL when no
  * struct crosses the boundary (the plain declaration is then correct). */
+/* Names of externs declared plain because this target has no aggregate C ABI
+ * classification. Declaration alone is not a use: pulling in a stdlib file
+ * that merely declares such an extern must not fail the compile, so the
+ * error moves to abi_pending_report() which fires only at a real call. */
+static void abi_pending_add(zan_irgen_t *g, const char *name) {
+    for (int i = 0; i < g->abi_pending_count; i++)
+        if (strcmp(g->abi_pending[i], name) == 0) return;
+    if (!ZAN_TAB_ENSURE(g->abi_pending, g->abi_pending_count,
+                        g->abi_pending_cap, 8)) return;
+    size_t n = strlen(name) + 1;
+    char *copy = (char *)malloc(n);
+    if (!copy) return;
+    memcpy(copy, name, n);
+    g->abi_pending[g->abi_pending_count++] = copy;
+}
+
+static void abi_pending_report(zan_irgen_t *g) {
+    if (g->abi_pending_count == 0) return;
+    for (LLVMValueRef f = LLVMGetFirstFunction(g->mod); f;
+         f = LLVMGetNextFunction(f)) {
+        if (LLVMCountBasicBlocks(f) == 0) continue;
+        for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(f); bb;
+             bb = LLVMGetNextBasicBlock(bb)) {
+            for (LLVMValueRef inst = LLVMGetFirstInstruction(bb); inst;
+                 inst = LLVMGetNextInstruction(inst)) {
+                unsigned op = LLVMGetInstructionOpcode(inst);
+                if (op != LLVMCall && op != LLVMInvoke) continue;
+                LLVMValueRef callee = LLVMGetCalledValue(inst);
+                const char *name = callee ? LLVMGetValueName(callee) : NULL;
+                if (!name || !name[0]) continue;
+                for (int i = 0; i < g->abi_pending_count; i++) {
+                    if (strcmp(g->abi_pending[i], name) != 0) continue;
+                    zan_diag_emit(g->diag, DIAG_ERROR, zan_loc(0, 0, 0, 0),
+                                  "call to extern '%s' passes a struct by value, "
+                                  "which has no C ABI classification for target '%s'",
+                                  name,
+                                  g->target_triple[0] ? g->target_triple : "host");
+                    break;
+                }
+            }
+        }
+    }
+}
+
 static LLVMValueRef abi_extern_thunk(zan_irgen_t *g, const char *name,
                                      LLVMTypeRef zan_ft) {
     unsigned pc = LLVMCountParamTypes(zan_ft);
@@ -410,10 +454,11 @@ static LLVMValueRef abi_extern_thunk(zan_irgen_t *g, const char *name,
 
     abi_target_t tgt = abi_target_of(g);
     if (tgt == ABI_TARGET_UNSUPPORTED) {
-        zan_diag_emit(g->diag, DIAG_ERROR, zan_loc(0, 0, 0, 0),
-                      "extern '%s' passes a struct by value, which has no C ABI "
-                      "classification for target '%s'", name,
-                      g->target_triple[0] ? g->target_triple : "host");
+        /* Not an error here: a declaration alone is not a use, and stdlib
+         * files full of SIMD intrinsics get pulled into compiles that never
+         * call them. Declare plain, remember the name, and let
+         * abi_pending_report() flag a real call. */
+        abi_pending_add(g, name);
         free(zan_params);
         return NULL;
     }

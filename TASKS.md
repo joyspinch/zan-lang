@@ -145,18 +145,37 @@
   验证：默认 --publish 构建 IDE 启动 IDE_RUNNING_OK（修复前同配置 100% 崩），
   standard 档除三条与本修无关的既有红（见 B-ID15）外全绿；连带走通的 B-ID11
   遗留"直启 0xC0000005"即本案。
-- [ ] **B-ID15**（新立）standard 档三条既有红（2026-09-27 定责，均先于 B-ID13
+- [ ] **B-ID14** zanc 对 IDE 全量输入加 `-g` 编译失败（2026-09-27 定位，未修，
+  编译器 lane）：符号构建 `ZAN_IDE_ZANC_ARGS="-g" scripts/build_ide.ps1` 挂，两种
+  独立症状——① `-g`（zanc 注记 "-g forces -O0"）+ IDE 全量输入（418 文件）在
+  codegen 阶段 AV 0xC0000005（~4s，早于链接）：崩溃点在 LLVM codegen 读已释放堆
+  （`cmp byte ptr [rdx],11h`、rdx=0xFEEEFEEEFEEEFEEE，cdb 最近符号
+  CoalescingBitVector::find / MachineInstr::getRestoreSize 随二进制漂移，MinGW
+  PDB 栈回溯不可靠）；阈值=设计文档总数：31 份（entry+30）必崩、30 份不崩；
+  ddmin 压不掉任何一份真设计，但 31 份合成迷你设计+最小 code-behind 不崩 → 与
+  设计**内容/总量**相关非纯计数。② `-g`+`--publish`：编译过、GNU ld 链接失败
+  "relocation truncated to fit: IMAGE_REL_AMD64_REL32 against .rdata$rterr.1276"
+  （13MB .o 内的 .text→.rdata 引用，非 2GB 距离问题；.rdata$rterr.* 是
+  zan_irgen_intern_string 的 per-site 哨兵串私有全局，疑似 GNU ld 对海量小节
+  在 DWARF 布局下的排序/COMDAT 处理问题，可试 lld 或改单节放哨兵串）。
+  无 `-g` 的全部配置（dev O0 与 publish Os）均正常，IDE 发布/开发链路不受影响；
+  gallery 312 文件 `-g` 可过（需 --no-check-leaks，IDE 输入 >4096 ARC 分配点）。
+  复现：见 _scratch/ide_input_list.txt 生成法（build_ide.ps1 的输入清单 +
+  `build/zanc.exe -g <清单> --no-arc-guard --no-check-leaks -o x.exe --subsystem
+  windows`）。
+- [x] **B-ID15** standard 档三条既有红定责与处置（2026-09-27，均先于 B-ID13
   修复存在、与其无关）：① policy_gallery_coverage——gallery 种子第 25 项引用
-  `templates/server/server-mvc/src/main.zan`，该模板目录已不存在，种子与模板
-  重组脱节（归模板 lane）；② conformance_wasm32_file_io_in_try——编译期 ABI
-  诊断 "extern 'Create' passes a struct by value, which has no C ABI
-  classification for wasm32-unknown-wasi"（归编译器 ABI lane）；③
-  conformance_win_automation_smoke——无桌面会话环境失败（沙箱限制，本机桌面
-  手工验证不受影响）。另 standard 全量并行跑时有 4 测偶红（async_try_exit_depth/
-  mqtt_loopback/win_tray_screen_smoke/gui_datatable_ctxmenu_selection），单测
-  复跑双配置均绿，判并行资源抖动非回归。
-- [ ] **B-ID14**（新立）zanc 自身对 IDE 全量输入加 `-g` 编译时崩溃（2026-09-27）：
-  `ZAN_IDE_ZANC_ARGS="-g" scripts/build_ide.ps1` 报 IDE_LINK_FAILED，zanc 退出码
-  -1073741819（0xC0000005）；gallery 312 文件同参 `--no-check-leaks` 后可过
-  （IDE 输入 >4096 个 ARC 分配点必须加），故与规模/特定输入相关。影响：符号级
-  崩溃日志（DWARF 行号）暂不可用。待独立定位，与 B-ID13 无关（后者已修）。
+  已迁走的 `templates/server/server-mvc`（3959170f 整体迁为 packages/Zan.Mvc），
+  已修：种子改指包内真实文件（Framework/AppController.zan、Account/
+  LoginController.zan、zan.pkg），policy 测试绿。②
+  conformance_wasm32_file_io_in_try——真因是 8c9c7188 的 ASCII SIMD 扫描把
+  Vector128/256.Create/Load 拉进每个含 IO 的编译图，而 wasm32 无聚合 C ABI
+  分类时**声明即硬错**；已修（声明不再错、改挂 pending 名单，真实调用点才报
+  "call to extern … no C ABI classification"，abi_pending_report 挂
+  zan_irgen_write_obj 顶部；native 分类恒成功零影响），新增
+  diag_wasm32_struct_extern_call 回归（声明合法+调用必错双侧钉死），
+  wasm32 档全绿。③ conformance_win_automation_smoke——测试本体 CreateWindowEx
+  需交互式 window station，沙箱无桌面必红，属环境限制非缺陷（基线与修复后
+  同红；桌面会话不受影响）；不改测试语义让它无桌面假绿。另 standard 全量
+  并行跑时有 4 测偶红（async_try_exit_depth/mqtt_loopback/win_tray_screen_smoke/
+  gui_datatable_ctxmenu_selection），单测复跑双配置均绿，判并行资源抖动非回归。

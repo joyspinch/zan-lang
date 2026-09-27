@@ -3115,6 +3115,10 @@ void zan_irgen_bind_target(zan_irgen_t *g) {
 }
 
 zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
+    /* Targets with no aggregate C ABI classification only remember
+     * struct-carrying externs at declaration time; a real call is the
+     * reportable offense. No-op on classified targets. */
+    abi_pending_report(g);
     /* wasm32 / riscv32: libc size_t/long are 32-bit but the IR declares these
      * libc functions with i64 sizes (Zan int). Redirect the declarations to
      * per-call-site adapters that truncate/extend and forward to the real
